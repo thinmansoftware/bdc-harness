@@ -151,7 +151,12 @@ nodes:
     load_bearing: true
     bash: |
       set -euo pipefail
-      SPEC_TEXT=$read-spec.output
+      RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"
+      if [ ! -s "$RUN_AUTHORITY_SPEC" ]; then
+        echo "ERROR: scope_authority_missing: $RUN_AUTHORITY_SPEC" >&2
+        exit 1
+      fi
+      SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")
       SPEC_REPAIR_PR=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #\([0-9][0-9]*\)[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
       SPEC_REPAIR_BRANCH=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #[0-9][0-9]*[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
       if [ -z "$SPEC_REPAIR_PR" ] || [ -z "$SPEC_REPAIR_BRANCH" ]; then
@@ -223,6 +228,7 @@ nodes:
       # (default /proc).
       rtw_refuse() {
         printf 'repair_target_branch_held: %s is checked out by %s; not reclaimed: %s\n' "$branch" "$holder" "$1"
+        printf 'repair_target_branch_held: %s is checked out by %s; not reclaimed: %s\n' "$branch" "$holder" "$1" >&2
         rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
         return 1
       }
@@ -317,11 +323,6 @@ nodes:
           if ! row_epoch=$(date -u -d "$row_completed" +%s 2>/dev/null); then
             rtw_refuse "completed_at unparseable" || return
           fi
-          now_epoch=$(date -u +%s)
-          row_age=$((now_epoch - row_epoch))
-          if [ "$row_age" -lt "$min_age" ]; then
-            rtw_refuse "completed_at is only ${row_age}s old" || return
-          fi
           if [ "$row_epoch" -gt "$best_epoch" ]; then
             best_epoch=$row_epoch
             best_id=$row_id
@@ -331,6 +332,14 @@ nodes:
         done < "$rtw_db_out"
         if [ "$row_seen" -eq 0 ]; then
           rtw_refuse "no run row for holder" || return
+        fi
+        now_epoch=$(date -u +%s)
+        row_age=$((now_epoch - best_epoch))
+        if [ "$row_age" -lt "$min_age" ]; then
+          case "$best_status" in
+            escalated|failed|cancelled) ;;
+            *) rtw_refuse "completed_at is only ${row_age}s old" || return ;;
+          esac
         fi
         proc_root="${RTW_PROC_ROOT:-/proc}"
         if [ ! -d "$proc_root" ]; then
@@ -390,6 +399,14 @@ nodes:
       }
       # ---- END rtw core ----
       rtw_checkout_repair_branch "$SPEC_REPAIR_BRANCH"
+      git fetch origin "+refs/heads/${SPEC_REPAIR_BRANCH}:refs/remotes/origin/${SPEC_REPAIR_BRANCH}"
+      git branch --set-upstream-to="origin/${SPEC_REPAIR_BRANCH}" "${SPEC_REPAIR_BRANCH}"
+      REPAIR_UPSTREAM_OID=$(git rev-parse '@{upstream}')
+      if [ "$REPAIR_UPSTREAM_OID" != "$REPAIR_TARGET_LIVE_OID" ]; then
+        echo "ERROR: repair_target_upstream_mismatch: upstream=${REPAIR_UPSTREAM_OID} live=${REPAIR_TARGET_LIVE_OID}" >&2
+        exit 1
+      fi
+      echo "REPAIR_TARGET_UPSTREAM=origin/${SPEC_REPAIR_BRANCH}"
       echo "REPAIR_TARGET=#${SPEC_REPAIR_PR}"
       echo "REPAIR_TARGET_BRANCH=${SPEC_REPAIR_BRANCH}"
       echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LIVE_OID}"
@@ -581,11 +598,12 @@ nodes:
     # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
     # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
     # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
-    provider: codex
+    provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: war-council-architect-opr
     depends_on: [plan, checkout-repair-target]
     trigger_rule: all_done
-    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
+    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true' && $checkout-repair-target.output != ''"
     task_class: medium_work
     loop:
       fresh_context: true
@@ -626,6 +644,7 @@ nodes:
         3. Unsafe assumptions -- "assume X exists" without verification.
         4. Rule 20 staging gate -- if target repo is lspro-react / shopops-storefront /
            shopops, plan MUST require --base staging. If not those, must NOT.
+        A repair-target declaration counts only when the first non-whitespace text on its line is the header `Repair target:`. A mention inside backticks, a table cell, prose, or a test description is not a declaration.
         4b. Repair target -- when the spec declares `Repair target: PR #N (branch X)`,
            parse REPAIR_TARGET and REPAIR_TARGET_BRANCH from the lane-verified repair-target record supplied above. When both the PR number and the branch
            match, that match is self-authorizing: preserve it in the approved plan,
@@ -691,6 +710,80 @@ nodes:
           LAST_REVIEW_FINDINGS=<exact bullets>
           SINGLE_DECISION_NEEDED=<one sentence John can answer>
           SAFE_STATE=<nothing committed/pushed; plan stage only>
+
+  - id: repair-gate
+    depends_on: [checkout-repair-target, plan-review]
+    trigger_rule: all_done
+    bash: |
+      set -euo pipefail
+      RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"
+      if [ ! -s "$RUN_AUTHORITY_SPEC" ]; then
+        echo "ERROR: scope_authority_missing: $RUN_AUTHORITY_SPEC" >&2
+        exit 1
+      fi
+      SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")
+      SPEC_REPAIR_PR=$(printf '%s\n' "${SPEC_TEXT-}" | sed -n 's/^[[:space:]]*Repair target:[[:space:]]*PR #\([0-9][0-9]*\)[[:space:]]*(branch \([^[:space:]]*\))[[:space:]]*$/\1/p' | head -n 1)
+      if [ -z "$SPEC_REPAIR_PR" ]; then
+        printf '%s\n' '{"REPAIR_GATE":"n/a","REPAIR_GATE_ALLOW":"yes"}'
+        exit 0
+      fi
+      CHECKOUT_OUT_FILE="${ARCHON_NODE_OUT:-}/checkout-repair-target.out"
+      PLAN_OUT_FILE="${ARCHON_NODE_OUT:-}/plan-review.out"
+      CHECKOUT_OUT=""
+      PLAN_OUT=""
+      if [ -f "$CHECKOUT_OUT_FILE" ]; then
+        CHECKOUT_OUT=$(cat "$CHECKOUT_OUT_FILE")
+      fi
+      if [ -f "$PLAN_OUT_FILE" ]; then
+        PLAN_OUT=$(cat "$PLAN_OUT_FILE")
+      fi
+      checkout_ok=0
+      if [ -s "$CHECKOUT_OUT_FILE" ] && printf '%s\n' "$CHECKOUT_OUT" | grep -qxF "REPAIR_TARGET=#${SPEC_REPAIR_PR}"; then
+        checkout_ok=1
+      fi
+      if [ "$checkout_ok" -ne 1 ]; then
+        echo "REPAIR_GATE_REASON=checkout_failed" >&2
+        printf '%s\n' '{"REPAIR_GATE":"closed","REPAIR_GATE_ALLOW":"no","REPAIR_GATE_REASON":"checkout_failed"}'
+        exit 0
+      fi
+      if [ ! -s "$PLAN_OUT_FILE" ]; then
+        echo "REPAIR_GATE_REASON=plan_review_skipped" >&2
+        printf '%s\n' '{"REPAIR_GATE":"closed","REPAIR_GATE_ALLOW":"no","REPAIR_GATE_REASON":"plan_review_skipped"}'
+        exit 0
+      fi
+      last_verdict=$(printf '%s\n' "$PLAN_OUT" | grep -xE 'PLAN_REVIEW_PASS=(true|false)' | tail -n 1 || true)
+      false_present=0
+      if printf '%s\n' "$PLAN_OUT" | grep -xF 'PLAN_REVIEW_PASS=false' >/dev/null; then
+        false_present=1
+      fi
+      if [ "$false_present" -eq 1 ] || [ "$last_verdict" != "PLAN_REVIEW_PASS=true" ]; then
+        echo "REPAIR_GATE_REASON=plan_review_not_approved" >&2
+        printf '%s\n' '{"REPAIR_GATE":"closed","REPAIR_GATE_ALLOW":"no","REPAIR_GATE_REASON":"plan_review_not_approved"}'
+        exit 0
+      fi
+      printf '%s\n' '{"REPAIR_GATE":"open","REPAIR_GATE_ALLOW":"yes"}'
+
+  - id: repair-gate-fail
+    depends_on: [repair-gate]
+    trigger_rule: all_done
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW != 'yes'"
+    bash: |
+      set -euo pipefail
+      GATE_OUT_FILE="${ARCHON_NODE_OUT:-}/repair-gate.out"
+      GATE_OUT=""
+      if [ -f "$GATE_OUT_FILE" ]; then
+        GATE_OUT=$(cat "$GATE_OUT_FILE")
+      fi
+      REASON=""
+      if [ -n "$GATE_OUT" ]; then
+        REASON=$(printf '%s\n' "$GATE_OUT" | sed -n 's/.*"REPAIR_GATE_REASON":"\([^"]*\)".*/\1/p' | head -n 1)
+      fi
+      if [ -z "$REASON" ]; then
+        echo "repair_gate_closed: gate_output_missing" >&2
+        exit 1
+      fi
+      echo "repair_gate_closed: ${REASON}" >&2
+      exit 1
 
   - id: capture-run-scope
     persona: major-build
@@ -788,9 +881,9 @@ nodes:
     idle_timeout: 600000
     provider: codex
     model: gpt-5.6-sol
-    depends_on: [prep-dependencies]
+    depends_on: [prep-dependencies, repair-gate]
     trigger_rule: all_done
-    when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
     wall_timeout_ms: 1800000
     loop:
@@ -956,7 +1049,8 @@ nodes:
   # WO-HARNESS-IMPLEMENT-CHECKPOINT-PUSH-01
   - id: checkpoint-push
     persona: overseer
-    depends_on: [implement]
+    depends_on: [implement, repair-gate]
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'"
     trigger_rule: all_done
     bash: |
       set -uo pipefail
@@ -997,7 +1091,7 @@ nodes:
       Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>" \
         2>/dev/null || { echo "WARN: checkpoint commit failed -- continuing" >&2; exit 0; }
 
-      if git push -u origin "HEAD:${WIP_BRANCH}" 2>/dev/null; then
+      if git push origin "HEAD:${WIP_BRANCH}" 2>/dev/null; then
         echo "checkpoint-push: WIP branch pushed -- ${WIP_BRANCH}"
         echo "CHECKPOINT_BRANCH=${WIP_BRANCH}"
         echo "CHECKPOINT_SHA=$(git rev-parse HEAD)"
@@ -1471,10 +1565,63 @@ nodes:
   # inside the run worktree and emits the OBSERVED pass/total. It never trusts a builder
   # or validator claim. Always exits 0; the validator quotes TESTS_* as ground truth and
   # stamp-manifest-evidence writes TESTS_LINE into the manifest "Tests:" line.
-  - id: run-stop-tests
+  - id: resolve-test-command
     persona: major-build
     load_bearing: true
     depends_on: [format-autofix]
+    task_class: clerical
+    timeout: 60000
+    bash: |
+      set -uo pipefail
+      ORIGIN="$(git remote get-url origin 2>/dev/null || true)"
+      if ! MAP_RESPONSE="$(timeout 30 gh api 'repos/thinmansoftware/bdc-xo/contents/scripts/cauldron/cauldron-projects.json?ref=main' 2>/dev/null)"; then
+        printf 'TEST_COMMAND_SOURCE=wo-spec\nTEST_COMMAND_FALLBACK=unavailable\nTEST_COMMAND_MAP_SHA=\nTEST_COMMAND_B64=\n'
+        exit 0
+      fi
+      # Structured data only: no shell evaluation or command execution here.
+      python3 -c '
+      import base64, json, re, sys
+      def normalize(value, allow_slug=False):
+          if not isinstance(value, str):
+              return None
+          prefix = r"(?:https://github[.]com/|git@github[.]com:)"
+          if allow_slug:
+              prefix += "?"
+          match = re.fullmatch(prefix + r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:[.]git)?/?", value, re.I)
+          return match.group(1).lower() if match else None
+      reason = "malformed"
+      sha = ""
+      command = ""
+      try:
+          envelope = json.load(sys.stdin)
+          revision = envelope.get("sha", "")
+          if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+              raise ValueError("invalid map revision")
+          sha = revision.lower()
+          content = base64.b64decode("".join(envelope["content"].split()), validate=True)
+          projects = json.loads(content)
+          if not isinstance(projects, dict):
+              raise ValueError("invalid project map")
+          slug = normalize(sys.argv[1])
+          matches = [value for value in projects.values() if isinstance(value, dict) and slug is not None and normalize(value.get("repo"), True) == slug]
+          reason = "invalid-origin" if slug is None else "missing" if not matches else "ambiguous" if len(matches) != 1 else "invalid-command"
+          if len(matches) == 1:
+              candidate = matches[0].get("test_command")
+              if isinstance(candidate, str) and candidate.strip() and len(candidate) <= 4096 and "\n" not in candidate and "\r" not in candidate and "\x00" not in candidate:
+                  command = candidate
+                  reason = ""
+      except (ValueError, TypeError, KeyError, AttributeError):
+          reason = "malformed"
+      print("TEST_COMMAND_SOURCE=" + ("project-map" if command else "wo-spec"))
+      print("TEST_COMMAND_FALLBACK=" + reason)
+      print("TEST_COMMAND_MAP_SHA=" + sha)
+      print("TEST_COMMAND_B64=" + base64.b64encode(command.encode()).decode())
+      ' "$ORIGIN" <<< "$MAP_RESPONSE"
+
+  - id: run-stop-tests
+    persona: major-build
+    load_bearing: true
+    depends_on: [format-autofix, resolve-test-command]
     task_class: clerical
     timeout: 1800000
     bash: |
@@ -1734,7 +1881,8 @@ nodes:
       rst_parse_counts() {
         local esc raw counts
         esc="$(printf '\033')"
-        raw="$(sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g")"
+        # Bun --filter prefixes each workspace test line; normalize parser input only.
+        raw="$(sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g" | sed -E 's/^(@[A-Za-z0-9_-][A-Za-z0-9_.-]*\/)?[A-Za-z0-9_-][A-Za-z0-9_.-]*:test[[:blank:]]+\|[[:blank:]]*//')"
         counts="$(printf '%s\n' "$raw" | awk '
           /^[ \t]*Passed: [0-9]+[ \t]+Failed: [0-9]+[ \t]+Total: [0-9]+/ { p += $2; t += $6; hit = 1; next }
           /^[ \t]*Tests: [0-9]+\/[0-9]+[ \t]*$/ { split($2, a, "/"); p += a[1]; t += a[2]; hit = 1; next }
@@ -1956,6 +2104,25 @@ nodes:
       $(printf '%s\n' "$SPEC" | rst_extract_commands)
       EOF_CMDS
       [ -s "$CMDS" ] && SOURCE="spec_declared"
+      RESOLUTION="$(cat <<'BDC_TEST_COMMAND_RESOLUTION' | capture_node_output
+      $resolve-test-command.output
+      BDC_TEST_COMMAND_RESOLUTION
+      )"
+      MAP_SOURCE="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_SOURCE=//p' | head -1)"
+      MAP_SHA="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_MAP_SHA=//p' | head -1)"
+      MAP_FALLBACK="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_FALLBACK=//p' | head -1)"
+      MAP_COMMAND="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_B64=//p' | head -1 | base64 --decode 2>/dev/null || true)"
+      SELECTED_SOURCE="spec_declared"
+      if [ "$MAP_SOURCE" = "project-map" ] && [ -n "$MAP_COMMAND" ]; then
+        if rst_command_looks_runnable "$MAP_COMMAND"; then
+          printf '%s\n' "$MAP_COMMAND" > "$CMDS"
+          SELECTED_SOURCE="project-map"
+        else
+          MAP_FALLBACK="unsafe-command"
+        fi
+      fi
+      echo "TESTS_MAP_SHA=$MAP_SHA"
+      echo "TESTS_MAP_FALLBACK=$MAP_FALLBACK"
       EXIT_CODE=0
       COUNTS=""
       CMD_JOINED=""
@@ -1980,7 +2147,7 @@ nodes:
         (
           cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && dprep_ensure_js_deps
         ) >&2
-        if ! rst_try "spec_declared"; then
+        if ! rst_try "$SELECTED_SOURCE" && [ "$SELECTED_SOURCE" != "project-map" ]; then
           if [ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]; then
             TRIED="spec_declared command(s) exited $EXIT_CODE with no parseable counts: $CMD_JOINED"
           else
@@ -2015,7 +2182,13 @@ nodes:
       echo "TESTS_EXIT=$EXIT_CODE"
       echo "TESTS_PASSED=${COUNTS%% *}"
       echo "TESTS_TOTAL=${COUNTS##* }"
-      rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS"
+      if [ "$SOURCE" = "project-map" ]; then
+        SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/"
+      else
+        REPORT_SOURCE="${SOURCE%% *}"
+        if [ "$REPORT_SOURCE" = "spec_declared" ]; then REPORT_SOURCE="wo-spec"; fi
+        rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
+      fi
       echo "TESTS_LOG=$LOG"
       if [ -s "$LOG" ]; then
         echo "--- last 80 lines of test output ---"
@@ -2407,7 +2580,8 @@ nodes:
     # required because persona model WINS over node model on provider claude
     # (persona pin law, wiki doctrine/archon-yaml-authoring 2026-07-02).
     # Superseded by the apex-rung WO (bdc-xo issue #575) when it lands.
-    provider: codex
+    provider: codex-native-strict
+    model: gpt-5.6-terra
     persona: captain-ci-validator-codex
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
@@ -2485,7 +2659,12 @@ nodes:
     depends_on: [read-spec]
     bash: |
       set -uo pipefail
-      SPEC_TEXT=$read-spec.output
+      RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"
+      if [ ! -s "$RUN_AUTHORITY_SPEC" ]; then
+        echo "ERROR: scope_authority_missing: $RUN_AUTHORITY_SPEC" >&2
+        exit 1
+      fi
+      SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")
       # Same 3 patterns decide-push-target's Base Branch Override section already
       # documents (plain header, markdown-bold, YAML field), in priority order.
       DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '^Base branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^Base branch:[[:space:]]*//')
@@ -2545,7 +2724,8 @@ nodes:
 
   - id: diff-review
     persona: codex-adversarial-reviewer
-    provider: codex
+    provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -2602,9 +2782,11 @@ nodes:
   - id: diff-repair
     provider: codex
     model: gpt-5.6-sol
-    depends_on: [diff-review, classify-diff-review, resolve-review-base]
-    when: "$classify-diff-review.output.verdict == 'needs_revision'"
+    depends_on: [diff-review, classify-diff-review, resolve-review-base, repair-gate]
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
+    idle_timeout: 570000
+    wall_timeout_ms: 1230000
     loop:
       fresh_context: true
       # NF3 + schema fix: the loader REQUIRES loop.until (schemas/loop.ts:11,
@@ -2717,7 +2899,8 @@ nodes:
   # judged the stale committed HEAD at 11 locations, block-classify->BLOCKED, and the fix
   # was lost. WO-HARNESS-DIFF-REPAIR-COMMITS-BEFORE-FINAL-REVIEW-01.
   - id: checkpoint-diff-repair
-    depends_on: [diff-repair]
+    depends_on: [diff-repair, repair-gate]
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'"
     trigger_rule: all_done
     bash: |
       set -uo pipefail
@@ -2797,7 +2980,8 @@ nodes:
 
   - id: diff-review-final
     persona: codex-adversarial-reviewer
-    provider: codex
+    provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -2903,8 +3087,8 @@ nodes:
   - id: opus-repair
     provider: codex
     model: gpt-5.6-sol
-    depends_on: [block-classify]
-    when: "$block-classify.output.status == 'BLOCKED'"
+    depends_on: [block-classify, repair-gate]
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $block-classify.output.status == 'BLOCKED'"
     prompt: |
       The bdc-feature-development run is BLOCKED before the irreversible commit. Before a
       human is paused, you get ONE autonomous repair pass. Diagnose and, if you can,
@@ -2962,7 +3146,8 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     persona: codex-adversarial-reviewer
-    provider: codex
+    provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -3180,7 +3365,8 @@ nodes:
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
     persona: xo-opr
-    provider: codex
+    provider: codex-native-strict
+    model: gpt-5.6-terra
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -3275,9 +3461,9 @@ nodes:
     provider: codex
     effort: xhigh
     context: fresh
-    depends_on: [pause-gate]
+    depends_on: [pause-gate, repair-gate]
     trigger_rule: all_done
-    when: "$pause-gate.output.decision_verb == 'approve_with_fix'"
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $pause-gate.output.decision_verb == 'approve_with_fix'"
     prompt: |
       The operator authorized specific fixes at the approval gate. Apply ONLY the fixes whose
       ids appear in authorized_fix_ids. Do NOT apply any other finding.
@@ -3308,7 +3494,8 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     persona: codex-adversarial-reviewer
-    provider: codex
+    provider: codex-native-strict
+    model: gpt-5.6-terra
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
@@ -3375,6 +3562,7 @@ nodes:
       $plan-review.output
 
       ## Branch Name Derivation Rules (F-6A prevention)
+      A repair-target declaration counts only when the first non-whitespace text on its line is the header `Repair target:`. A mention inside backticks, a table cell, prose, or a test description is not a declaration.
       First check for `Repair target: PR #N (branch X)` in the spec. Verify it with
       `gh pr view N --repo <target-repo> --json state,headRefName`: state must be OPEN
       and headRefName must equal X. On success, emit the normal fields below plus
@@ -3488,9 +3676,10 @@ nodes:
   # backoff) and node fails closed if all attempts fail.
   - id: commit-and-push
     persona: overseer
-    depends_on: [decide-push-target, classify-apply-review, classify-opus-rereview]
+    depends_on: [decide-push-target, classify-apply-review, classify-opus-rereview, repair-gate]
     trigger_rule: all_done
-    when: "$block-reclassify.output.status == 'PROCEED' || $classify-apply-review.output.verdict == 'satisfied' || $classify-opus-rereview.output.verdict == 'satisfied'"
+    when: >-
+      $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $block-reclassify.output.status == 'PROCEED' || $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-apply-review.output.verdict == 'satisfied' || $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-opus-rereview.output.verdict == 'satisfied'
     load_bearing: true
     bash: |
       set -euo pipefail
@@ -3499,19 +3688,23 @@ nodes:
       # creates `"'multiline\nagent\noutput'"` which bash mis-tokenizes - line 2+ of
       # the agent output becomes bare commands. Assign directly to bash vars, then
       # quote the var reference. Engine-level fix tracked in WO-HARNESS-NODE-OUTPUT-BASH-QUOTING-01.
-      DECIDE_OUTPUT=$(cat <<'BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013'
-      $decide-push-target.output
-      BDC_FEATURE_DEV_DECIDE_OUTPUT_DECIDE_PUSH_TARGET_20260719_013
-      )
+      DECIDE_OUT_FILE="$ARCHON_NODE_OUT/decide-push-target.out"
+      if [ ! -s "$DECIDE_OUT_FILE" ]; then
+        echo "ERROR: commit-and-push: decide-push-target node-output file missing or empty: $DECIDE_OUT_FILE" >&2
+        exit 1
+      fi
+      DECIDE_OUTPUT=$(cat "$DECIDE_OUT_FILE")
       # plan-review emits a fenced output. Extract ONLY the approved-plan block so the
       # changed-file allowlist + commit message never ingest reviewer critique (F8 fix).
       # Must be the revised plan (not pre-review) or a plan-review scope change would be
       # rejected by the allowlist. FAIL CLOSED if the fence is absent (NF1): never fall
       # back to raw output, or PLAN_REVIEW_FINDINGS critique would poison the allowlist.
-      PLAN_REVIEW_RAW=$(cat <<'BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_014'
-      $plan-review.output
-      BDC_FEATURE_DEV_PLAN_REVIEW_RAW_PLAN_REVIEW_20260719_014
-      )
+      PLAN_REVIEW_OUT_FILE="$ARCHON_NODE_OUT/plan-review.out"
+      if [ ! -s "$PLAN_REVIEW_OUT_FILE" ]; then
+        echo "ERROR: commit-and-push: plan-review node-output file missing or empty: $PLAN_REVIEW_OUT_FILE" >&2
+        exit 1
+      fi
+      PLAN_REVIEW_RAW=$(cat "$PLAN_REVIEW_OUT_FILE")
       # Extract APPROVED_PLAN (single-line-safe; open-model canary 3604d5bcc7b2).
       PLAN_OUTPUT=$(printf '%s\n' "$PLAN_REVIEW_RAW" | python3 -c 'import sys,re;t=sys.stdin.read();m=re.search(r"===\s*APPROVED_PLAN_BEGIN\s*===(.*?)===\s*APPROVED_PLAN_END\s*===",t,re.S|re.I);body=(m.group(1).strip() if m else "");body=re.sub(r"(?<!\n)(##)",r"\n\1",body);body=re.sub(r"(?<!\n)(```)",r"\n\1",body);print(body)')
       if [ -z "$PLAN_OUTPUT" ]; then
@@ -3662,10 +3855,14 @@ nodes:
         echo "ERROR: refusing to push -- derived THREAD_ID '${THREAD_ID}' is not a bare [A-Za-z0-9_-] token (would create a malformed branch)." >&2
         exit 1
       fi
-      # Direct assignment, never a heredoc: the executor substitutes $read-spec.output
-      # shellQuote-wrapped (single-quoted, embedded quotes escaped), so untrusted spec
-      # text can neither terminate a delimiter nor be evaluated by this shell.
-      SPEC_TEXT=$read-spec.output
+      # Hash-verified authority spec on disk. Do not assign read-spec output here;
+      # quotes in the spec must stay data and must not be shell-evaluated.
+      RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"
+      if [ ! -s "$RUN_AUTHORITY_SPEC" ]; then
+        echo "ERROR: scope_authority_missing: $RUN_AUTHORITY_SPEC" >&2
+        exit 1
+      fi
+      SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")
       CHECKOUT_OUTPUT=$checkout-repair-target.output
       REPAIR_TARGET_BRANCH=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_branch:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
       REPAIR_TARGET_PR=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repair_target_pr:[[:space:]]*#\{0,1\}\([0-9][0-9]*\)[[:space:]]*$/\1/p' | head -n 1)
@@ -3731,12 +3928,14 @@ nodes:
           done
           if [ "$begin_count" -ne 1 ] || [ "$end_count" -ne 1 ] || [ "$begin_idx" -lt 0 ] || [ "$end_idx" -lt 0 ] || [ "$begin_idx" -ge "$end_idx" ]; then
             printf 'repair_target_plan_authorization_refused: fence_count\n'
+            printf 'repair_target_plan_authorization_refused: fence_count\n' >&2
             return 1
           fi
           for ((i=0; i<end_idx; i++)); do
             line="${lines[$i]}"
             if [ "$i" -eq "$begin_idx" ] && [ "$in_code" -eq 1 ]; then
               printf 'repair_target_plan_authorization_refused: no_standalone_field\n'
+              printf 'repair_target_plan_authorization_refused: no_standalone_field\n' >&2
               return 1
             fi
             if [[ "$line" =~ $fence_re ]]; then
@@ -3761,25 +3960,49 @@ nodes:
           done
           if [ "$field_count" -eq 0 ] || [ "$in_code" -eq 1 ]; then
             printf 'repair_target_plan_authorization_refused: no_standalone_field\n'
+            printf 'repair_target_plan_authorization_refused: no_standalone_field\n' >&2
             return 1
           fi
           if [ "$field_count" -gt 1 ]; then
             printf 'repair_target_plan_authorization_refused: multiple_fields\n'
+            printf 'repair_target_plan_authorization_refused: multiple_fields\n' >&2
             return 1
           fi
           if [ "$captured" != "$want_pr" ]; then
             printf 'repair_target_plan_authorization_refused: pr_mismatch\n'
+            printf 'repair_target_plan_authorization_refused: pr_mismatch\n' >&2
             return 1
           fi
           printf 'repair_target_plan_authorization: ok #%s\n' "$captured"
           return 0
         }
         # ---- END rta core ----
-        if [ "$REPAIR_TARGET_AUTHORIZED_PRESENT" != true ] || [ "$REPAIR_TARGET_AUTHORIZED" != "#${REPAIR_TARGET_PR}" ] || [ "$SPEC_REPAIR_PR" != "$REPAIR_TARGET_PR" ] || [ "$SPEC_REPAIR_BRANCH" != "$REPAIR_TARGET_BRANCH" ] || ! rta_plan_authorizes "$PLAN_REVIEW_RAW" "$REPAIR_TARGET_PR"; then
+        if [ "$REPAIR_TARGET_AUTHORIZED_PRESENT" != true ]; then
           echo "repair_target_unauthorized"
-          echo "ERROR: repair_target_unauthorized: refusing to select an existing branch without a spec-bound authorization matching PR #${REPAIR_TARGET_PR} branch ${REPAIR_TARGET_BRANCH}" >&2
+          echo "ERROR: repair_target_unauthorized: condition=decide_authorized_missing" >&2
           exit 1
         fi
+        if [ "$REPAIR_TARGET_AUTHORIZED" != "#${REPAIR_TARGET_PR}" ]; then
+          echo "repair_target_unauthorized"
+          echo "ERROR: repair_target_unauthorized: condition=decide_authorized_pr_mismatch REPAIR_TARGET_AUTHORIZED=${REPAIR_TARGET_AUTHORIZED} expected=#${REPAIR_TARGET_PR}" >&2
+          exit 1
+        fi
+        if [ "$SPEC_REPAIR_PR" != "$REPAIR_TARGET_PR" ]; then
+          echo "repair_target_unauthorized"
+          echo "ERROR: repair_target_unauthorized: condition=spec_pr_mismatch SPEC_REPAIR_PR=${SPEC_REPAIR_PR} REPAIR_TARGET_PR=${REPAIR_TARGET_PR}" >&2
+          exit 1
+        fi
+        if [ "$SPEC_REPAIR_BRANCH" != "$REPAIR_TARGET_BRANCH" ]; then
+          echo "repair_target_unauthorized"
+          echo "ERROR: repair_target_unauthorized: condition=spec_branch_mismatch SPEC_REPAIR_BRANCH=${SPEC_REPAIR_BRANCH} REPAIR_TARGET_BRANCH=${REPAIR_TARGET_BRANCH}" >&2
+          exit 1
+        fi
+        rta_reason=$(rta_plan_authorizes "$PLAN_REVIEW_RAW" "$REPAIR_TARGET_PR") || {
+          echo "repair_target_unauthorized"
+          echo "ERROR: repair_target_unauthorized: condition=plan_authorization ${rta_reason}" >&2
+          exit 1
+        }
+        printf '%s\n' "$rta_reason"
         REPO_FOR_CHECK=$(printf '%s\n' "$DECIDE_OUTPUT_CLEAN" | sed -n 's/^[[:space:]]*repo:[[:space:]]*\([^[:space:]]*\)[[:space:]]*$/\1/p' | head -n 1)
         if ! printf '%s\n' "$REPO_FOR_CHECK" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'; then
           echo "ERROR: invalid or missing repo for repair target verification" >&2
@@ -3828,9 +4051,18 @@ nodes:
         fi
         CHECKOUT_LEASE_SHA=$(printf '%s\n' "${CHECKOUT_OUTPUT-}" | sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1)
         if [ -n "$CHECKOUT_LEASE_SHA" ] && [ "$REPAIR_TARGET_LIVE_OID" != "$CHECKOUT_LEASE_SHA" ]; then
-          echo "repair_target_head_moved"
-          echo "ERROR: repair_target_head_moved: live ${REPAIR_TARGET_LIVE_OID} != checkout ${CHECKOUT_LEASE_SHA}" >&2
-          exit 1
+          # WO-HARNESS-REPAIR-PATH-HOTFIX-01 (F2/1f): the live PR head advanced past the
+          # checkout lease. If the live head is already an ancestor of HEAD -- this run
+          # pushed its own commit mid-run, so HEAD already contains the live head -- adopt
+          # the live OID as the lease and continue. Refuse only when the live head is NOT
+          # an ancestor of HEAD (a foreign commit this run would clobber on force-push).
+          if git merge-base --is-ancestor "$REPAIR_TARGET_LIVE_OID" HEAD; then
+            CHECKOUT_LEASE_SHA="$REPAIR_TARGET_LIVE_OID"
+          else
+            echo "repair_target_head_moved"
+            echo "ERROR: repair_target_head_moved: live ${REPAIR_TARGET_LIVE_OID} != checkout ${CHECKOUT_LEASE_SHA}" >&2
+            exit 1
+          fi
         fi
         REPAIR_TARGET_LEASE_SHA="${CHECKOUT_LEASE_SHA:-$REPAIR_TARGET_LIVE_OID}"
         echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LEASE_SHA}"
@@ -4009,7 +4241,8 @@ nodes:
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
     persona: major-build
-    depends_on: [commit-and-push]
+    depends_on: [commit-and-push, repair-gate]
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'"
     task_class: clerical
     load_bearing: true
     bash: |
@@ -4181,6 +4414,39 @@ nodes:
       # run a0dae1f8. Now: look for an existing PR BEFORE attempting create, and
       # re-check after each create attempt so a non-zero-exit-but-created PR is
       # caught instead of triggering a spurious failure.
+      # WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01: builders build, the reviewer
+      # reviews. Refuse to open a PR when the gh identity we are about to use is the
+      # reviewer identity. Incident 2026-10-20: lanes with no builder App opened
+      # shopops #887/#888/#889 as thinman-overseer[bot]; Overseer refused each with
+      # custody_conflict. Fail closed if the acting login cannot be resolved at all.
+      REVIEWER_LOGIN="${OVERSEER_REVIEW_IDENTITY:-thinman-overseer[bot]}"
+      resolve_acting_login() {
+        if [ -f /app/scripts/github-service-login.ts ]; then
+          bun /app/scripts/github-service-login.ts "${ARCHON_GITHUB_SERVICE:-run_nodes}" 2>/dev/null
+        else
+          gh api user --jq .login 2>/dev/null
+        fi
+      }
+      normalize_login() {
+        printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's#^app/##;s/\[bot\]$//'
+      }
+      ACTING_LOGIN="$(resolve_acting_login | head -n 1 | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+      if [ -z "$ACTING_LOGIN" ]; then
+        echo "ERROR: acting_login_unresolved: cannot determine the GitHub identity for gh pr create" >&2
+        exit 1
+      fi
+      if [ "$(normalize_login "$ACTING_LOGIN")" = "$(normalize_login "$REVIEWER_LOGIN")" ]; then
+        echo "ERROR: builder_is_reviewer: acting login ${ACTING_LOGIN} equals reviewer identity ${REVIEWER_LOGIN} -- builders build, the reviewer reviews (bdc-xo WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01)" >&2
+        exit 1
+      fi
+      # The builder identity is confirmed distinct from the reviewer. Disable the
+      # github-service-exec permission fallback so an App 403 on gh pr create fails
+      # closed instead of silently retrying with the reviewer/user PAT fallback
+      # (ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN/GH_TOKEN/GITHUB_TOKEN). Without this
+      # a distinct builder App could pass the guard and still open the PR as the
+      # reviewer via the fallback token.
+      export ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1
+      echo "acting_login=${ACTING_LOGIN}"
       PR_OK=false
       EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
         --json url --jq '.[0].url // empty' 2>/dev/null || true)
@@ -4850,7 +5116,7 @@ nodes:
   - id: patch-pr-body
     persona: major-build
     depends_on: [build-manifest, verify-manifest-assertions, stamp-manifest-pr, manifest-consistency-check, manifest-evidence-check]
-    when: "$manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'OK'"
+    when: "$manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'OK' && $open-pr-if-needed.output != ''"
     trigger_rule: all_done
     task_class: clerical
     bash: |

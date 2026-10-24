@@ -232,7 +232,7 @@ describe('bundled-defaults', () => {
         'bdc-feature-development-zero-open',
         'bdc-feature-development-zero',
       ];
-      const OUT_OF_SCOPE_NODES = ['opus-repair', 'diff-review', 'diff-review-final', 'diff-repair'];
+      const OUT_OF_SCOPE_NODES = ['opus-repair', 'diff-review', 'diff-review-final'];
 
       for (const name of REASONING_BOUND) {
         it(`${name} applies the 10-minute idle timeout to plan-review and implement`, () => {
@@ -252,8 +252,14 @@ describe('bundled-defaults', () => {
         });
       }
 
+      // WO-HARNESS-REPAIR-PATH-HOTFIX-01 item 1c: the grok lane pins the implement
+      // loop to a 570s idle ceiling (grok goes silent >3min during installs/tests;
+      // finding F4). Its plan-review still keeps the default, and every other
+      // open-model lane keeps the default on both nodes.
+      const IMPLEMENT_IDLE_PINNED = new Set(['bdc-feature-development-grok']);
+
       for (const name of OPEN_MODEL) {
-        it(`${name} keeps the default loop idle timeout on plan-review and implement`, () => {
+        it(`${name} keeps the default loop idle timeout on plan-review`, () => {
           withDefaultLoopIterationIdleEnv(() => {
             const content = BUNDLED_WORKFLOWS[name];
             const workflow = parseBundledWorkflow(name);
@@ -263,15 +269,23 @@ describe('bundled-defaults', () => {
             const implementNode = getWorkflowNode(workflow, 'implement');
 
             expect(planReview).not.toContain('idle_timeout: 600000');
-            expect(implement).not.toContain('idle_timeout: 600000');
             expect(planReviewNode.idle_timeout).toBeUndefined();
-            expect(implementNode.idle_timeout).toBeUndefined();
             expect(resolveLoopIterationIdleTimeoutMs(planReviewNode.idle_timeout)).toBe(
               LOOP_ITERATION_IDLE_TIMEOUT_MS
             );
-            expect(resolveLoopIterationIdleTimeoutMs(implementNode.idle_timeout)).toBe(
-              LOOP_ITERATION_IDLE_TIMEOUT_MS
-            );
+
+            expect(implement).not.toContain('idle_timeout: 600000');
+            if (IMPLEMENT_IDLE_PINNED.has(name)) {
+              expect(implement).toContain('idle_timeout: 570000');
+              expect(implementNode.idle_timeout).toBe(570000);
+              expect(resolveLoopIterationIdleTimeoutMs(implementNode.idle_timeout)).toBe(570000);
+            } else {
+              expect(implement).not.toContain('idle_timeout: 570000');
+              expect(implementNode.idle_timeout).toBeUndefined();
+              expect(resolveLoopIterationIdleTimeoutMs(implementNode.idle_timeout)).toBe(
+                LOOP_ITERATION_IDLE_TIMEOUT_MS
+              );
+            }
           });
         });
       }
@@ -293,6 +307,21 @@ describe('bundled-defaults', () => {
             });
           });
         }
+      }
+
+      for (const name of [...REASONING_BOUND, ...OPEN_MODEL]) {
+        it(`${name} diffRepairIdleCeiling sets the diff-repair idle and wall ceilings`, () => {
+          const content = BUNDLED_WORKFLOWS[name];
+          const nodeSource = extractWorkflowNode(content, 'diff-repair');
+          const workflow = parseBundledWorkflow(name);
+          const node = getWorkflowNode(workflow, 'diff-repair');
+
+          expect(nodeSource).not.toContain('idle_timeout: 600000');
+          expect(nodeSource).toContain('idle_timeout: 570000');
+          expect(nodeSource).toContain('wall_timeout_ms: 1230000');
+          expect(node.idle_timeout).toBe(570000);
+          expect(node.wall_timeout_ms).toBe(1230000);
+        });
       }
     });
 

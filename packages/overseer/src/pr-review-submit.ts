@@ -61,6 +61,8 @@ export interface ReviewerVerdict {
    * fixes). The worker releases and retries the item on a later tick.
    */
   checksPending?: boolean;
+  /** Names of checks still awaited when `checksPending` is true. */
+  pendingChecks?: readonly string[];
   /**
    * Set when the required status-check contexts could not be read after the
    * configured attempt bound (#775). TERMINAL and NON-APPROVING: unlike
@@ -207,6 +209,8 @@ export interface SubmitOutcome {
    * `rate_limited` as the duration form of `retryAfter`.
    */
   retryAfterMs?: number;
+  /** Names of checks still awaited on a checks-pending deferral. */
+  pendingChecks?: readonly string[];
 }
 
 export interface SubmitDeps {
@@ -407,6 +411,7 @@ export async function runAndSubmitReview(
     return finish(deps, work, work.headSha, {
       disposition: 'checks_pending',
       reason: 'checks_not_terminal',
+      ...(verdict.pendingChecks ? { pendingChecks: verdict.pendingChecks } : {}),
     });
   }
 

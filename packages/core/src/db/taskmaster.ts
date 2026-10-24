@@ -19,6 +19,9 @@ import {
 } from './overseer-control-plane-sqlite';
 
 const log = createLogger('db/taskmaster');
+// Pending fire rows may already own provider work; reset must preserve custody.
+const EXPIRE_UNSENT_PROPOSALS =
+  "outcome = 'parked' OR (outcome = 'pending' AND action_type <> 'fire_cauldron')";
 
 export type TmActionType =
   | 'deliver_ruling'
@@ -213,7 +216,7 @@ export async function listExpectations(filter: {
   }
   const where = clauses.length ? ` WHERE ${clauses.join(' AND ')}` : '';
   const db = getDatabase();
-  const total = await db.query<{ count: number }>(
+  const total = await db.query<{ count: number | string }>(
     `SELECT COUNT(*) AS count FROM tm_expectations${where}`,
     params
   );
@@ -224,7 +227,7 @@ export async function listExpectations(filter: {
   );
   return {
     rows: rows.rows.map(normalizeExpectation),
-    total: total.rows[0]?.count ?? 0,
+    total: Number(total.rows[0]?.count ?? 0),
   };
 }
 
@@ -246,11 +249,11 @@ export async function listExpectations(filter: {
  * supervisor's own headroom, nor the supervisor the front door's.
  */
 export async function countExternalExpectationsSince(since: string): Promise<number> {
-  const result = await getDatabase().query<{ count: number }>(
+  const result = await getDatabase().query<{ count: number | string }>(
     "SELECT COUNT(*) AS count FROM tm_expectations WHERE registration_key LIKE 'ext:%' AND created_at >= $1",
     [since]
   );
-  return result.rows[0]?.count ?? 0;
+  return Number(result.rows[0]?.count ?? 0);
 }
 
 /**
@@ -363,6 +366,15 @@ export async function registerExpectation(data: {
   if (!existingRow)
     throw new Error('tm_expectations registration conflict without an existing row');
   return existingRow.id;
+}
+
+/** Exact readback for idempotent internal registration; no replacement of old evidence. */
+export async function getExpectationByRegistrationKey(key: string): Promise<TmExpectation | null> {
+  const result = await getDatabase().query<TmExpectation>(
+    'SELECT * FROM tm_expectations WHERE registration_key = $1',
+    [key]
+  );
+  return result.rows[0] ? normalizeExpectation(result.rows[0]) : null;
 }
 
 /**
@@ -972,7 +984,7 @@ export async function resetTaskmaster(data: { actor: string; reason: string | nu
     if (!previousRow) throw new Error('tm_control singleton missing during reset');
     const previous = normalizeControl(previousRow);
     const expired = await query(
-      "UPDATE tm_journal SET outcome = 'expired' WHERE outcome IN ('parked', 'pending')"
+      `UPDATE tm_journal SET outcome = 'expired' WHERE ${EXPIRE_UNSENT_PROPOSALS}`
     );
     const transition = await query(
       `UPDATE tm_control SET pause_state = 'RUNNING', epoch = epoch + 1, updated_at = $1
@@ -1015,6 +1027,29 @@ export async function getActionByIdempotencyKey(key: string): Promise<TmJournalE
   );
   const row = result.rows[0];
   return row ? normalizeJournal(row) : null;
+}
+
+/** Unresolved fire custody has no age cutoff: elapsed time does not prove no fire. */
+export async function listPendingFireActions(): Promise<TmJournalEntry[]> {
+  const result = await getDatabase().query<TmJournalRow>(
+    "SELECT * FROM tm_journal WHERE action_type = 'fire_cauldron' AND outcome = 'pending' ORDER BY created_at ASC"
+  );
+  return result.rows.map(normalizeJournal);
+}
+
+/** Conditional custody transition; stale reconciliations cannot overwrite newer truth. */
+export async function transitionPendingFireAction(
+  id: string,
+  expectedProposalJson: string,
+  outcome: 'pending' | 'sent' | 'expired',
+  proposalJson: string
+): Promise<boolean> {
+  const result = await getDatabase().query(
+    `UPDATE tm_journal SET outcome = $1, proposal_json = $2
+     WHERE id = $3 AND action_type = 'fire_cauldron' AND outcome = 'pending' AND proposal_json = $4`,
+    [outcome, proposalJson, id, expectedProposalJson]
+  );
+  return result.rowCount === 1;
 }
 
 /**
@@ -1084,12 +1119,10 @@ export async function getActionsSince(
 export async function expireParkedActions(): Promise<number> {
   const db = getDatabase();
   const pending = await db.query<{ id: string }>(
-    "SELECT id FROM tm_journal WHERE outcome IN ('parked', 'pending')"
+    `SELECT id FROM tm_journal WHERE ${EXPIRE_UNSENT_PROPOSALS}`
   );
   if (pending.rows.length === 0) return 0;
-  await db.query(
-    "UPDATE tm_journal SET outcome = 'expired' WHERE outcome IN ('parked', 'pending')"
-  );
+  await db.query(`UPDATE tm_journal SET outcome = 'expired' WHERE ${EXPIRE_UNSENT_PROPOSALS}`);
   return pending.rows.length;
 }
 

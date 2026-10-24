@@ -236,19 +236,22 @@ describe('entry headroom', () => {
     expect(coolCursor.changed).toBe(false);
 
     const billingPick = pickEntryTier({ woClass: 'CODE', tags: ['billing'] }, ruleset);
-    expect(billingPick).toBe('claude');
+    expect(billingPick).toBe('cursor');
     const billingEntry = chooseHeadroomEntry({
       picked: billingPick,
       tiers,
       refusedTiers,
       premiumTiers,
-      usage: HOT_CODEX_COOL_CLAUDE,
+      usage: {
+        cursor: { limit_source: 'measured', windows: [{ name: 'primary', used_percent: 20 }] },
+      },
       thresholdPercent: 80,
       pinned: false,
     });
-    expect(billingEntry.entry).toBe('claude');
+    expect(billingEntry.picked).toBe('cursor');
+    expect(billingEntry.entry).toBe('cursor');
     expect(billingEntry.changed).toBe(false);
-    expect(billingEntry.reason).toBe('seat_ok:claude:45');
+    expect(billingEntry.reason).toBe('seat_ok:cursor:20');
   });
 
   test('node-models-extracted-from-events', () => {

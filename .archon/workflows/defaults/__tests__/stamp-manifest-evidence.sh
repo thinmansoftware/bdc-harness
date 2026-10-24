@@ -141,10 +141,18 @@ OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c 
 assert_contains "VALIDATION: FAIL on grep mismatch" "VALIDATION: FAIL" "$OUT"
 assert_contains "audit line says greps=mismatch" "greps=mismatch" "$OUT"
 
-echo "--- Test 3b: incomplete greps flip VALIDATION to FAIL ---"
-OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c "a" b => 1; 1/2 declared grep assertions executed' incomplete)"
-assert_contains "VALIDATION: FAIL on incomplete greps" "VALIDATION: FAIL" "$OUT"
+# PR #876 / bdc-xo #2221 deliberately admits partial grep evidence when
+# at least one assertion executes without mismatch; mec_check enforces counts.
+echo "--- Test 3b: admitted incomplete greps preserve PASS and disclose omissions ---"
+OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c "a" b => 1; UNVERIFIED (unparsed): missing-rule' incomplete 1)"
+assert_contains "VALIDATION stays PASS for admitted partial evidence" "VALIDATION: PASS" "$OUT"
+assert_contains "omissions remain visible" "greps=incomplete; unparsed=missing-rule; dropped=1" "$OUT"
 assert_contains "audit line says greps=incomplete" "greps=incomplete" "$OUT"
+
+echo "--- Test 3c: all dropped greps remain failed ---"
+OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'UNVERIFIED (unparsed): missing-rule' all_dropped 2)"
+assert_contains "VALIDATION fails when no grep executed" "VALIDATION: FAIL" "$OUT"
+assert_not_contains "all-dropped never preserves PASS" "VALIDATION: PASS" "$OUT"
 
 echo "--- Test 4: short ALREADY_SATISFIED manifest passes through untouched ---"
 SHORT='WO: WO-X

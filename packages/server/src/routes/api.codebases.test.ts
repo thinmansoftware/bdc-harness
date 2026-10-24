@@ -23,6 +23,7 @@ const mockGetCodebase = mock(
       name: string;
       repository_url: string | null;
       default_cwd: string;
+      default_branch: string | null;
       ai_assistant_type: string;
       commands: Record<string, unknown> | string;
       created_at: string;
@@ -30,7 +31,12 @@ const mockGetCodebase = mock(
     }
 );
 const mockListCodebases = mock(async () => [] as (typeof MOCK_CODEBASE)[]);
+const mockUpdateCodebase = mock(async (_id: string, _data: Record<string, unknown>) => {});
 const mockDeleteCodebase = mock(async (_id: string) => {});
+const mockGitHubFetch = mock(
+  async (_options: { service: string; url: string }) => new Response('{}')
+);
+const mockLogInfo = mock(() => undefined);
 const mockCloneRepository = mock(async (_url: string) => ({
   codebaseId: 'clone-uuid-1',
   alreadyExisted: false,
@@ -61,7 +67,7 @@ mock.module('@archon/core', () => ({
     fatal: mock(() => undefined),
     error: mock(() => undefined),
     warn: mock(() => undefined),
-    info: mock(() => undefined),
+    info: mockLogInfo,
     debug: mock(() => undefined),
     trace: mock(() => undefined),
     child: mock(function (this: unknown) {
@@ -78,7 +84,7 @@ mock.module('@archon/paths', () => ({
     fatal: mock(() => undefined),
     error: mock(() => undefined),
     warn: mock(() => undefined),
-    info: mock(() => undefined),
+    info: mockLogInfo,
     debug: mock(() => undefined),
     trace: mock(() => undefined),
     child: mock(function (this: unknown) {
@@ -124,7 +130,12 @@ mock.module('@archon/core/db/conversations', () => ({
 mock.module('@archon/core/db/codebases', () => ({
   listCodebases: mockListCodebases,
   getCodebase: mockGetCodebase,
+  updateCodebase: mockUpdateCodebase,
   deleteCodebase: mockDeleteCodebase,
+}));
+
+mock.module('@archon/core/github/request', () => ({
+  serviceGitHubFetchWithPermissionFallback: mockGitHubFetch,
 }));
 
 mock.module('@archon/core/db/isolation-environments', () => ({
@@ -176,6 +187,7 @@ const MOCK_CODEBASE = {
   name: 'my-project',
   repository_url: 'https://github.com/user/repo',
   default_cwd: '/home/user/projects/my-project',
+  default_branch: 'main',
   ai_assistant_type: 'claude',
   commands: {},
   created_at: new Date().toISOString(),
@@ -200,7 +212,9 @@ const MOCK_ENV = {
   updated_at: new Date().toISOString(),
 };
 
-function makeApp(): OpenAPIHono {
+function makeApp(token?: string): OpenAPIHono {
+  if (token) process.env.ARCHON_OPERATOR_TOKEN = token;
+  else delete process.env.ARCHON_OPERATOR_TOKEN;
   const app = new OpenAPIHono({ defaultHook: validationErrorHook });
   const mockWebAdapter = {
     setConversationDbId: mock((_platformId: string, _dbId: string) => {}),
@@ -502,6 +516,181 @@ describe('POST /api/codebases', () => {
 
     const body = (await response.json()) as { error: string };
     expect(body.error).toContain('authentication required');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests: PATCH /api/codebases/:id
+// ---------------------------------------------------------------------------
+
+describe('PATCH /api/codebases/:id', () => {
+  beforeEach(() => {
+    delete process.env.ARCHON_OPERATOR_TOKEN;
+    mockGetCodebase.mockReset();
+    mockUpdateCodebase.mockReset();
+    mockGitHubFetch.mockReset();
+    mockLogInfo.mockReset();
+  });
+
+  test('edits default_branch after verifying it on GitHub', async () => {
+    mockGetCodebase
+      .mockImplementationOnce(async () => MOCK_CODEBASE)
+      .mockImplementationOnce(async () => ({ ...MOCK_CODEBASE, default_branch: 'staging' }));
+    mockGitHubFetch.mockImplementationOnce(async () => new Response('{}', { status: 200 }));
+
+    const response = await makeApp().request('/api/codebases/codebase-uuid-1', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ default_branch: 'staging' }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockUpdateCodebase).toHaveBeenCalledTimes(1);
+    expect(mockUpdateCodebase).toHaveBeenCalledWith('codebase-uuid-1', {
+      default_branch: 'staging',
+    });
+    expect(mockGitHubFetch).toHaveBeenCalledWith({
+      service: 'smart_cauldron',
+      url: 'https://api.github.com/repos/user/repo/branches/staging',
+    });
+    const body = (await response.json()) as { id: string; default_branch: string };
+    expect(body.id).toBe('codebase-uuid-1');
+    expect(body.default_branch).toBe('staging');
+  });
+
+  test('rejects a branch that does not exist on the remote', async () => {
+    mockGetCodebase.mockImplementationOnce(async () => MOCK_CODEBASE);
+    mockGitHubFetch.mockImplementationOnce(async () => new Response('{}', { status: 404 }));
+
+    const response = await makeApp().request('/api/codebases/codebase-uuid-1', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ default_branch: 'nope' }),
+    });
+
+    expect(response.status).toBe(422);
+    expect(((await response.json()) as { error: string }).error).toContain(
+      'branch_not_found_on_remote'
+    );
+    expect(mockUpdateCodebase).not.toHaveBeenCalled();
+  });
+
+  test('rejects unknown fields before verification or mutation', async () => {
+    const response = await makeApp().request('/api/codebases/codebase-uuid-1', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ default_branch: 'staging', ai_assistant_type: 'codex' }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(mockGitHubFetch).not.toHaveBeenCalled();
+    expect(mockUpdateCodebase).not.toHaveBeenCalled();
+  });
+
+  test('refuses a credential in repository_url', async () => {
+    mockGetCodebase.mockImplementationOnce(async () => MOCK_CODEBASE);
+
+    const response = await makeApp().request('/api/codebases/codebase-uuid-1', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        repository_url: 'https://x-access-token:abc@github.com/user/repo.git',
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(((await response.json()) as { error: string }).error).toContain(
+      'repository_url_contains_credential'
+    );
+    expect(mockUpdateCodebase).not.toHaveBeenCalled();
+  });
+
+  test('requires the configured operator token', async () => {
+    try {
+      const response = await makeApp('secret-token').request('/api/codebases/codebase-uuid-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ default_branch: 'staging' }),
+      });
+
+      expect(response.status).toBe(401);
+      expect(mockGetCodebase).not.toHaveBeenCalled();
+      expect(mockUpdateCodebase).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.ARCHON_OPERATOR_TOKEN;
+    }
+  });
+
+  test('returns 404 for an unknown codebase', async () => {
+    mockGetCodebase.mockImplementationOnce(async () => null);
+
+    const response = await makeApp().request('/api/codebases/missing-id', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ default_branch: 'staging' }),
+    });
+
+    expect(response.status).toBe(404);
+    expect(mockGitHubFetch).not.toHaveBeenCalled();
+    expect(mockUpdateCodebase).not.toHaveBeenCalled();
+  });
+
+  test('rejects an empty edit', async () => {
+    const response = await makeApp().request('/api/codebases/codebase-uuid-1', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+
+    expect(response.status).toBe(400);
+    expect(mockUpdateCodebase).not.toHaveBeenCalled();
+  });
+
+  test('blocks the write when branch verification is unavailable', async () => {
+    mockGetCodebase.mockImplementationOnce(async () => MOCK_CODEBASE);
+    mockGitHubFetch.mockImplementationOnce(async () => new Response('{}', { status: 503 }));
+
+    const response = await makeApp().request('/api/codebases/codebase-uuid-1', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ default_branch: 'staging' }),
+    });
+
+    expect(response.status).toBe(502);
+    expect(((await response.json()) as { error: string }).error).toContain(
+      'branch_verification_unavailable'
+    );
+    expect(mockUpdateCodebase).not.toHaveBeenCalled();
+  });
+
+  test('sanitizes a credential-bearing stored URL in the audit log', async () => {
+    mockGetCodebase
+      .mockImplementationOnce(async () => ({
+        ...MOCK_CODEBASE,
+        repository_url: 'https://x-access-token:ghoFAKE123@github.com/user/repo.git',
+      }))
+      .mockImplementationOnce(async () => ({
+        ...MOCK_CODEBASE,
+        repository_url: 'https://github.com/user/repo.git',
+      }));
+
+    const response = await makeApp().request('/api/codebases/codebase-uuid-1', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ repository_url: 'https://github.com/user/repo.git' }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockUpdateCodebase).toHaveBeenCalledWith('codebase-uuid-1', {
+      repository_url: 'https://github.com/user/repo.git',
+    });
+    expect(mockLogInfo).toHaveBeenCalledWith(expect.any(Object), 'codebase_updated');
+    const loggedArguments = JSON.stringify(mockLogInfo.mock.calls.map(call => call[0]));
+    expect(loggedArguments).not.toContain('ghoFAKE123');
+    expect(loggedArguments).toContain('[REDACTED]');
+    expect(((await response.json()) as { repository_url: string }).repository_url).toBe(
+      'https://github.com/user/repo.git'
+    );
   });
 });
 

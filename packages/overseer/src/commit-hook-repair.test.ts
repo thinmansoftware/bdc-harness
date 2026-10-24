@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { parse } from 'yaml';
 import { classifyError } from './classify';
 import { decide } from './decide';
+import { evaluateCondition } from '../../workflows/src/condition-evaluator';
 
 const root = join(import.meta.dir, '../../..');
 const read = (path: string): string => readFileSync(join(root, path), 'utf8');
@@ -318,6 +319,46 @@ describe('commit hook repair contract', () => {
     expect(lane).toContain('NOT pushed');
   });
 
+  test('hook recovery preserves the repair authorization gate for every outcome', () => {
+    const lane = parse(read('.archon/workflows/defaults/bdc-feature-development-codex.yaml')) as {
+      nodes: { id: string; depends_on?: string[]; when?: string }[];
+    };
+    for (const id of [
+      'commit-hook-repair',
+      'classify-commit-hook-repair',
+      'commit-and-push-retry',
+      'commit-hook-terminal',
+      'open-pr-if-needed',
+    ]) {
+      const node = lane.nodes.find(item => item.id === id)!;
+      expect(node.depends_on).toContain('repair-gate');
+      for (const allow of [undefined, 'malformed', 'no', 'yes']) {
+        for (const verdict of [undefined, 'fixed', 'already_satisfied', 'needs_human', 'unknown']) {
+          const outputs = new Map([
+            [
+              'classify-commit-hook-repair',
+              { state: 'completed' as const, output: JSON.stringify({ verdict }) },
+            ],
+          ]);
+          if (allow !== undefined) {
+            outputs.set('repair-gate', {
+              state: 'completed',
+              output: allow === 'malformed' ? '{' : JSON.stringify({ REPAIR_GATE_ALLOW: allow }),
+            });
+          }
+          const result = evaluateCondition(node.when ?? '', outputs);
+          expect(result.parsed).toBe(true);
+          expect(result.result).toBe(
+            allow === 'yes' &&
+              (id !== 'commit-and-push-retry' ||
+                verdict === 'fixed' ||
+                verdict === 'already_satisfied')
+          );
+        }
+      }
+    }
+  });
+
   for (const repairState of [
     'needs_human',
     'classification_failed',
@@ -337,9 +378,10 @@ describe('commit hook repair contract', () => {
       };
       const terminal = lane.nodes.find(node => node.id === 'commit-hook-terminal');
       expect(terminal?.trigger_rule).toBe('all_done');
-      expect(terminal?.when).toBeUndefined();
+      expect(terminal?.when).toBe("$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'");
       expect(lane.nodes.find(node => node.id === 'open-pr-if-needed')?.depends_on).toEqual([
         'commit-hook-terminal',
+        'repair-gate',
       ]);
       const directory = mkdtempSync(join(tmpdir(), 'hook-terminal-'));
       const unixDirectory = directory.replaceAll('\\', '/');

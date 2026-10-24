@@ -1,4 +1,4 @@
-import { describe, test, expect, mock, afterEach } from 'bun:test';
+import { describe, test, expect, mock, afterEach, spyOn } from 'bun:test';
 import {
   withIdleTimeout,
   STEP_IDLE_TIMEOUT_MS,
@@ -170,6 +170,148 @@ describe('withIdleTimeout', () => {
     }
 
     expect(result).toEqual(messages);
+  });
+
+  test('does not count consumer processing as provider silence', async () => {
+    const onTimeout = mock(() => {});
+    const result: number[] = [];
+
+    for await (const value of withIdleTimeout(fromValues([1, 2], 20), 100, onTimeout)) {
+      result.push(value);
+      // The provider cannot yield again until the consumer requests next().
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+
+    expect(result).toEqual([1, 2]);
+    expect(onTimeout).not.toHaveBeenCalled();
+  });
+
+  test('excludes consumer processing even when the event does not reset idle', async () => {
+    const onTimeout = mock(() => {});
+    const result: number[] = [];
+
+    for await (const value of withIdleTimeout(
+      fromValues([1, 2], 20),
+      100,
+      onTimeout,
+      () => false
+    )) {
+      result.push(value);
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+
+    expect(result).toEqual([1, 2]);
+    expect(onTimeout).not.toHaveBeenCalled();
+  });
+
+  test('filtered events still consume one cumulative provider wait budget', async () => {
+    const onTimeout = mock(() => {});
+    const result: number[] = [];
+    let providerClockMs = 0;
+    const clock = spyOn(performance, 'now').mockImplementation(() => providerClockMs);
+    // Observe real timers: only elapsed provider wait is controlled, so Windows
+    // scheduling cannot decide how many values fit in a 20ms timing margin.
+    const timers = spyOn(globalThis, 'setTimeout');
+    async function* filteredStream(): AsyncGenerator<number> {
+      for (const value of [1, 2]) {
+        providerClockMs += 40;
+        yield value;
+      }
+      await new Promise<void>(() => {});
+    }
+
+    try {
+      for await (const value of withIdleTimeout(filteredStream(), 100, onTimeout, () => false)) {
+        result.push(value);
+      }
+
+      expect(result).toEqual([1, 2]);
+      expect(timers.mock.calls.map(([, delay]) => delay)).toEqual([100, 60, 20]);
+      expect(onTimeout).toHaveBeenCalledTimes(1);
+    } finally {
+      timers.mockRestore();
+      clock.mockRestore();
+    }
+  });
+
+  test('stops an immediately resolving filtered stream when its budget is spent', async () => {
+    const onTimeout = mock(() => {});
+    let cleanedUp = false;
+    async function* filteredStream(): AsyncGenerator<number> {
+      try {
+        for (let value = 0; value < 50; value++) {
+          const started = performance.now();
+          while (performance.now() - started < 2) {
+            // Model synchronous work before an immediately resolved next().
+          }
+          yield value;
+        }
+      } finally {
+        cleanedUp = true;
+      }
+    }
+
+    const result: number[] = [];
+    for await (const value of withIdleTimeout(filteredStream(), 20, onTimeout, () => false)) {
+      result.push(value);
+    }
+
+    expect(result.length).toBeLessThan(50);
+    expect(onTimeout).toHaveBeenCalledTimes(1);
+    expect(cleanedUp).toBe(true);
+  });
+
+  test('cleans up the pending timer and abort listener when next rejects', async () => {
+    const controller = new AbortController();
+    const removeListener = spyOn(controller.signal, 'removeEventListener');
+    const clearTimer = spyOn(globalThis, 'clearTimeout');
+    const failure = new Error('provider rejected next');
+    const onTimeout = mock(() => {});
+    async function* rejectedStream(): AsyncGenerator<number> {
+      throw failure;
+    }
+    const wrapped = withIdleTimeout(
+      rejectedStream(),
+      60_000,
+      onTimeout,
+      undefined,
+      controller.signal
+    );
+    try {
+      await expect(wrapped.next()).rejects.toBe(failure);
+      expect(clearTimer).toHaveBeenCalledTimes(1);
+      expect(removeListener).toHaveBeenCalledTimes(1);
+      expect(onTimeout).not.toHaveBeenCalled();
+    } finally {
+      removeListener.mockRestore();
+      clearTimer.mockRestore();
+    }
+  });
+
+  test('abort while consumer holds a value prevents another provider request', async () => {
+    const controller = new AbortController();
+    const onTimeout = mock(() => {});
+    let requests = 0;
+    async function* countedStream(): AsyncGenerator<number> {
+      requests++;
+      yield 1;
+      requests++;
+      yield 2;
+    }
+    const result: number[] = [];
+    for await (const value of withIdleTimeout(
+      countedStream(),
+      100,
+      onTimeout,
+      undefined,
+      controller.signal
+    )) {
+      result.push(value);
+      controller.abort();
+    }
+    expect(result).toEqual([1]);
+    expect(requests).toBe(1);
+    expect(onTimeout).not.toHaveBeenCalled();
   });
 
   test('consumer breaking out cleans up normally', async () => {

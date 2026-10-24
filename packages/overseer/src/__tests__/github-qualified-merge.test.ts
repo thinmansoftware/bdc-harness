@@ -142,9 +142,15 @@ describe('real GitHub deps', () => {
       state: 'all',
       per_page: 5,
     });
-    expect(search).toHaveBeenCalledWith({
-      q: 'repo:thinmansoftware/bdc-harness is:pr is:open "WO-42"',
-      per_page: 5,
+    expect(search).not.toHaveBeenCalled();
+    expect(list).toHaveBeenCalledWith({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      state: 'open',
+      per_page: 100,
+      page: 1,
+      sort: 'created',
+      direction: 'asc',
     });
     expect(result).toMatchObject({
       exists: true,
@@ -162,15 +168,20 @@ describe('real GitHub deps', () => {
       data: {
         number: 77,
         title: 'WO-FALLBACK-77',
+        body: null,
         state: 'open',
         mergeable: true,
         html_url: 'https://github.test/pull/77',
         changed_files: 1,
-        head: { sha: 'b'.repeat(40) },
+        head: { sha: 'b'.repeat(40), ref: 'fix/fallback' },
       },
     }));
     const octokit = createOctokitMock({
-      pulls: { ...createOctokitMock().pulls, get },
+      pulls: {
+        ...createOctokitMock().pulls,
+        get,
+        list: async request => ({ data: request.head ? [] : [(await get()).data] }),
+      },
       search: { issuesAndPullRequests: search },
     });
 
@@ -181,10 +192,7 @@ describe('real GitHub deps', () => {
       woId: 'WO-FALLBACK-77',
     });
 
-    expect(search).toHaveBeenCalledWith({
-      q: 'repo:thinmansoftware/bdc-harness is:pr is:open "WO-FALLBACK-77"',
-      per_page: 5,
-    });
+    expect(search).not.toHaveBeenCalled();
     expect(get).toHaveBeenCalledWith({
       owner: 'thinmansoftware',
       repo: 'bdc-harness',

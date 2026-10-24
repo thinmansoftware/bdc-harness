@@ -43,7 +43,7 @@ jobs:
         run: bun run format:check
 
       - name: GitHub service command and credential routing regressions
-        run: bun test ./scripts/github-service-exec.test.ts packages/overseer/src/__tests__/github-command-durable-metering.test.ts ./scripts/github-service-token.test.ts ./scripts/container/gh-merge-guard.test.ts
+        run: bun test ./scripts/github-service-exec.test.ts packages/overseer/src/__tests__/github-command-durable-metering.test.ts ./scripts/github-service-token.test.ts ./scripts/container/gh-merge-guard.test.ts ./scripts/container/docker-entrypoint-app-helper.test.ts ./scripts/github-service-login.test.ts
 
       - name: Run tests
         if: runner.os != 'Windows'
@@ -108,11 +108,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Smoke test -- packaged GitHub helper dependency closure
+        run: |
+          docker run --rm --network none --user appuser --entrypoint bun archon-ci:test build \
+            /app/scripts/github-service-token.ts /app/scripts/github-service-exec.ts \
+            --target=bun --outdir /tmp/archon-github-helper-smoke
+
       - name: Smoke test -- container starts and serves /api/health
         run: |
           docker run -d --name archon-smoke -e PORT=3000 -e CLAUDE_USE_GLOBAL_AUTH=true -p 3000:3000 archon-ci:test
           sleep 5
           curl --fail --retry 10 --retry-delay 3 --retry-all-errors http://localhost:3000/api/health
+
+      - name: Smoke test -- lane toolchain as application user
+        run: |
+          docker exec --user appuser archon-smoke sh -ec 'node --version && npm --version && npx --version && pytest --version'
 
       - name: Dump container logs on failure
         if: failure()

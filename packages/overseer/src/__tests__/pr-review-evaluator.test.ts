@@ -14,6 +14,7 @@ import {
   checksAreTerminal,
   evaluatePullRequest,
   parseReviewVerdict,
+  partitionChecksByRequired,
   runReviewModelProcess,
   DEFAULT_CURSOR_JUDGE_MODEL,
   type PrReviewDeps,
@@ -215,7 +216,7 @@ describe('governed PR-code reviewer', () => {
       deps({
         fetchEvidence: async () => ({
           diff: '+ change',
-          checks: [{ name: 'unit', status: 'completed', conclusion: 'failure' }],
+          checks: [{ name: 'test', status: 'completed', conclusion: 'failure' }],
         }),
         invokeModel: async (_binary, value) => {
           prompt = value;
@@ -241,7 +242,7 @@ describe('governed PR-code reviewer', () => {
     const prompt = buildReviewPrompt({
       request: input,
       diff: '+ code',
-      checks: [],
+      checkPartition: partitionChecksByRequired([], []),
       acceptanceCriteria: 'must pass',
     });
     expect(prompt).toContain('code diff');
@@ -366,6 +367,72 @@ describe('governed PR-code reviewer', () => {
       checksAreTerminal([{ name: 'test', status: 'completed', conclusion: 'success' }], null)
     ).toBe(false);
     expect(checksAreTerminal([], null)).toBe(false);
+  });
+
+  test('crossAppRequiredContext pending app before completed app is non-terminal', () => {
+    expect(
+      checksAreTerminal(
+        [
+          {
+            name: 'test',
+            status: 'in_progress',
+            conclusion: null,
+            app: { slug: 'app-a' },
+          },
+          {
+            name: 'test',
+            status: 'completed',
+            conclusion: 'success',
+            app: { slug: 'app-b' },
+          },
+        ],
+        ['test']
+      )
+    ).toBe(false);
+  });
+
+  test('crossAppRequiredContext completed app before pending app is non-terminal', () => {
+    expect(
+      checksAreTerminal(
+        [
+          {
+            name: 'test',
+            status: 'completed',
+            conclusion: 'success',
+            app: { slug: 'app-b' },
+          },
+          {
+            name: 'test',
+            status: 'in_progress',
+            conclusion: null,
+            app: { slug: 'app-a' },
+          },
+        ],
+        ['test']
+      )
+    ).toBe(false);
+  });
+
+  test('crossAppRequiredContext is terminal when every apps latest run completed', () => {
+    expect(
+      checksAreTerminal(
+        [
+          {
+            name: 'test',
+            status: 'completed',
+            conclusion: 'success',
+            app: { slug: 'app-a' },
+          },
+          {
+            name: 'test',
+            status: 'completed',
+            conclusion: 'success',
+            app: { slug: 'app-b' },
+          },
+        ],
+        ['test']
+      )
+    ).toBe(true);
   });
 
   test('16 a completed reported check with a required context still absent defers to CHECKS_PENDING', async () => {
@@ -580,6 +647,57 @@ describe('governed PR-code reviewer', () => {
     expect(result.verdict).toBe('CHECKS_PENDING');
     expect(result.error).toBe('checks_pending');
     expect(modelInvoked).toBe(false);
+  });
+
+  test('required checks use normalized latest names and optional pending checks do not block', async () => {
+    let prompt = '';
+    let modelInvocations = 0;
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        fetchEvidence: async () => ({
+          diff: '+ change',
+          requiredContexts: ['docker-build', 'test (ubuntu-latest)'],
+          checks: [
+            { name: 'Docker-Build', status: 'completed', conclusion: 'success' },
+            { name: ' test (ubuntu-latest) ', status: 'completed', conclusion: 'success' },
+            { name: 'test (windows-latest)', status: 'in_progress', conclusion: null },
+          ],
+        }),
+        invokeModel: async (_binary, value) => {
+          modelInvocations += 1;
+          prompt = value;
+          return { exitCode: 0, timedOut: false, stdout: output('APPROVE') };
+        },
+      })
+    );
+    expect(result.verdict).toBe('APPROVE');
+    expect(modelInvocations).toBe(1);
+    expect(prompt).toContain('test (windows-latest)');
+  });
+
+  test('CHECKS_PENDING identifies running required checks but not absent ones', async () => {
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        fetchEvidence: async () => ({
+          diff: '+ change',
+          requiredContexts: ['docker-build', 'test (ubuntu-latest)'],
+          checks: [
+            { name: 'docker-build', status: 'completed', conclusion: 'success' },
+            { name: 'test (ubuntu-latest)', status: 'in_progress', conclusion: null },
+          ],
+        }),
+      })
+    );
+    expect(result.verdict).toBe('CHECKS_PENDING');
+    expect(result.pendingChecks).toEqual(['test (ubuntu-latest)']);
+    expect(
+      checksAreTerminal(
+        [{ name: 'docker-build', status: 'completed', conclusion: 'success' }],
+        null
+      )
+    ).toBe(false);
   });
 });
 

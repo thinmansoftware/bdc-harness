@@ -33,6 +33,7 @@ import {
   summarizeChecks,
 } from './adapters/github-real-deps';
 import type { ExactHeadPullRequestEvidence } from './adapters/github-real-deps.ts';
+import { UNPROTECTED_BASE_NO_CHECKS_REASON } from './adapters/required-contexts';
 import {
   MAX_REREVIEW_ATTEMPTS_ENV,
   MAX_TOTAL_REREVIEWS_ENV,
@@ -907,6 +908,9 @@ const INDETERMINATE_REVIEW_SUMMARY =
  * and NOT approved, so nobody reads a comment-only review as a soft pass.
  */
 export function buildRequiredContextsBlockedSummary(error: string | undefined): string {
+  if (error?.startsWith(UNPROTECTED_BASE_NO_CHECKS_REASON)) {
+    return 'Review blocked, not approved: the base has no branch protection and no CI reported on this head; protect the base or add CI.';
+  }
   const attemptsMatch = /attempts=(\d+)/.exec(error ?? '');
   const attempts = attemptsMatch?.[1] ?? 'the configured number of';
   const reasonMatch = /reason=(permission|transient)/.exec(error ?? '');
@@ -1006,6 +1010,7 @@ export function createRealSubmitDeps(
           summary: '',
           reviewedHeadSha: result.reviewed_head_sha,
           checksPending: true,
+          ...(result.pendingChecks ? { pendingChecks: result.pendingChecks } : {}),
         };
       }
       // CHECKS_UNAVAILABLE (#775): terminal, never approving. Carries its own

@@ -1,5 +1,10 @@
-import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
+import { getDatabase } from '@archon/core/db/connection';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
 import {
@@ -10,6 +15,7 @@ import {
 import {
   githubIssueInAllowList,
   githubNudgeEnabled,
+  postGithubIssueComment,
   startDutyOfficerClock,
   stopDutyOfficerClock,
   tickDutyOfficerClock,
@@ -140,16 +146,154 @@ function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
   };
 }
 
+function relayRecoveryFixture(
+  failure:
+    | 'before-write'
+    | 'after-write'
+    | 'stale-fence'
+    | 'completion-before-write'
+    | 'completion-after-write'
+) {
+  const source = message({ id: 'generic-relay' });
+  const neighbor = message({
+    id: 'healthy-mailbox',
+    sender: 'taskmaster',
+    sender_principal_id: 'system:taskmaster',
+    task_type: 'agent_message',
+    idempotency_key: 'tm:digest:2026-10-18',
+    subject_key: 'digest:2026-10-18',
+    body: 'sent=0, parked=0',
+  });
+  const rows = [source, neighbor];
+  const relays = new Map<string, { id: string }>();
+  const deps = fakeDeps(rows);
+  deps.listMessages = mock(async ({ recipient, status }) =>
+    rows
+      .filter(row => row.recipient === recipient && row.status === status)
+      .map(row => ({ ...row }))
+  );
+  deps.claimMessage = mock(async (input: Parameters<DutyOfficerClockDeps['claimMessage']>[0]) => {
+    const row = rows.find(item => item.id === input.id);
+    if (
+      !row ||
+      row.status !== 'queued' ||
+      (row.not_before !== null && Date.parse(row.not_before) > Date.now())
+    ) {
+      return null;
+    }
+    row.status = 'claimed';
+    row.lease_owner = input.worker_id;
+    row.fencing_token++;
+    return { ...row };
+  });
+  deps.releaseMessage = mock(
+    async (input: Parameters<DutyOfficerClockDeps['releaseMessage']>[0]) => {
+      const row = rows.find(item => item.id === input.id);
+      if (
+        !row ||
+        row.status !== 'claimed' ||
+        row.lease_owner !== input.worker_id ||
+        row.fencing_token !== input.fencing_token
+      ) {
+        return null;
+      }
+      row.status = 'queued';
+      row.lease_owner = null;
+      row.not_before = input.not_before ?? null;
+      return { ...row };
+    }
+  );
+  let completionAttempted = false;
+  deps.postResult = mock(async (input: Parameters<DutyOfficerClockDeps['postResult']>[0]) => {
+    const row = rows.find(item => item.id === input.id);
+    if (
+      !row ||
+      row.status !== 'claimed' ||
+      row.lease_owner !== input.worker_id ||
+      row.fencing_token !== input.fencing_token
+    ) {
+      return null;
+    }
+    const firstSourceCompletion = row.id === source.id && !completionAttempted;
+    if (firstSourceCompletion) {
+      completionAttempted = true;
+      if (failure === 'completion-before-write') throw new Error('completion database unavailable');
+    }
+    row.status = input.status ?? 'done';
+    row.task_outcome = input.task_outcome ?? null;
+    row.result_body = input.result_body;
+    if (firstSourceCompletion && failure === 'completion-after-write') {
+      throw new Error('completion acknowledgement lost after write');
+    }
+    return { ...row };
+  });
+  let attempted = false;
+  deps.createAuthenticatedMessage = mock(async (_context, data) => {
+    if (!attempted) {
+      attempted = true;
+      if (failure === 'stale-fence') {
+        source.fencing_token++;
+        source.lease_owner = 'new-worker';
+      }
+      if (failure === 'before-write' || failure === 'stale-fence') {
+        throw new Error('relay database unavailable');
+      }
+      if (failure === 'after-write') {
+        relays.set(data.idempotency_key, { id: 'durable-xo-relay' });
+        throw new Error('relay acknowledgement lost after write');
+      }
+    }
+    if (!relays.has(data.idempotency_key)) {
+      relays.set(data.idempotency_key, { id: 'durable-xo-relay' });
+    }
+    return relays.get(data.idempotency_key);
+  });
+  return { deps, source, neighbor, relays };
+}
+
+const dutyOfficerProcessEnvKeys = ['DUTY_OFFICER_GH_NUDGE', 'GH_TOKEN', 'GITHUB_TOKEN'] as const;
+
+type DutyOfficerProcessEnvKey = (typeof dutyOfficerProcessEnvKeys)[number];
+
+function readDutyOfficerProcessEnv(): Record<DutyOfficerProcessEnvKey, string | undefined> {
+  return {
+    DUTY_OFFICER_GH_NUDGE: process.env.DUTY_OFFICER_GH_NUDGE,
+    GH_TOKEN: process.env.GH_TOKEN,
+    GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+  };
+}
+
+function writeDutyOfficerProcessEnv(
+  prior: Record<DutyOfficerProcessEnvKey, string | undefined>
+): void {
+  for (const key of dutyOfficerProcessEnvKeys) {
+    const value = prior[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+// Shared by beforeEach and afterEach. A finally inside one test cannot stick:
+// this hook used to delete the three keys after every test and wipe values
+// that were already set for the Bun process.
+let dutyOfficerProcessEnvSnapshot: Record<DutyOfficerProcessEnvKey, string | undefined> = {
+  DUTY_OFFICER_GH_NUDGE: undefined,
+  GH_TOKEN: undefined,
+  GITHUB_TOKEN: undefined,
+};
+
+beforeEach(() => {
+  dutyOfficerProcessEnvSnapshot = readDutyOfficerProcessEnv();
+});
+
 afterEach(() => {
   stopDutyOfficerClock();
   resetSecurityDetectorStateForTests();
   delete process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS;
   delete process.env.DUTY_OFFICER_CLOCK_ENABLED;
-  delete process.env.DUTY_OFFICER_GH_NUDGE;
+  writeDutyOfficerProcessEnv(dutyOfficerProcessEnvSnapshot);
   delete process.env.DUTY_OFFICER_GH_REPO;
-  delete process.env.GH_TOKEN;
-  delete process.env.GITHUB_TOKEN;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS;
   delete process.env.ARCHON_BUILD_SHA;
 });
@@ -181,7 +325,322 @@ async function seedDetector(): Promise<DutyOfficerClockDeps> {
   return deps;
 }
 
+describe('duty officer nudge delivery evidence', () => {
+  test.each([
+    'missing-subject',
+    'malformed-subject',
+    'disabled',
+    'missing-identity',
+    'foreign-repository',
+    'adapter-refused',
+    'adapter-unconfirmed',
+  ])('generic nudge %s is held without a success receipt', async scenario => {
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GH_TOKEN = 'synthetic-pat';
+    delete process.env.GITHUB_TOKEN;
+    const item = message({
+      id: 'nudge-refusal',
+      task_type: 'agent_message',
+      subject_key: 'gh:thinmansoftware/bdc-xo#2274',
+      body: JSON.stringify({ next_step: 'continue existing work' }),
+    });
+    const deps = fakeDeps([item]);
+    deps.judge = mock(async () => ({
+      status: 'ok' as const,
+      action: 'nudge' as const,
+      reason: 'next_step_known',
+      body: '',
+      failures: [],
+    }));
+    deps.listStaleIssues = mock(async () => []);
+    deps.postIssueComment = mock(async () => true);
+    if (scenario === 'missing-subject') item.subject_key = null;
+    if (scenario === 'malformed-subject') item.subject_key = 'gh:invalid';
+    if (scenario === 'disabled') process.env.DUTY_OFFICER_GH_NUDGE = 'false';
+    if (scenario === 'missing-identity') delete process.env.GH_TOKEN;
+    if (scenario === 'foreign-repository') item.subject_key = 'gh:foreign/repository#1';
+    if (scenario === 'adapter-refused') deps.postIssueComment = mock(async () => false);
+    if (scenario === 'adapter-unconfirmed') {
+      // Deliberately inject a legacy void adapter to verify fail-closed handling.
+      deps.postIssueComment = mock(
+        async () => undefined
+      ) as unknown as DutyOfficerClockDeps['postIssueComment'];
+    }
+
+    await tickDutyOfficerClock(deps);
+    expect(deps.postResult).not.toHaveBeenCalled();
+    expect(deps.releaseMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: item.id,
+        worker_id: 'duty-officer-clock',
+        fencing_token: 1,
+        not_before: expect.any(String),
+      })
+    );
+    expect(deps.postIssueComment).toHaveBeenCalledTimes(scenario.startsWith('adapter-') ? 1 : 0);
+  });
+
+  test('generic nudge records success only after an explicitly confirmed cue', async () => {
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GH_TOKEN = 'synthetic-pat';
+    const deps = fakeDeps([
+      message({
+        id: 'confirmed-nudge',
+        task_type: 'agent_message',
+        subject_key: 'gh:thinmansoftware/bdc-xo#2274',
+      }),
+    ]);
+    deps.judge = mock(async () => ({
+      status: 'ok' as const,
+      action: 'nudge' as const,
+      reason: 'next_step_known',
+      body: '',
+      failures: [],
+    }));
+    deps.listStaleIssues = mock(async () => []);
+    let confirmed = false;
+    deps.postIssueComment = mock(async () => {
+      expect(deps.postResult).not.toHaveBeenCalled();
+      confirmed = true;
+      return true;
+    });
+    await tickDutyOfficerClock(deps);
+    expect(confirmed).toBe(true);
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+    expect(deps.postResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'done',
+        task_outcome: 'succeeded',
+        result_body: JSON.stringify({ disposition: 'cued', transport: null }),
+      })
+    );
+  });
+
+  test('refused generic nudge cannot release a newer claim', async () => {
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GH_TOKEN = 'synthetic-pat';
+    const item = message({ id: 'moved-nudge', subject_key: 'gh:thinmansoftware/bdc-xo#2274' });
+    const deps = fakeDeps([item]);
+    deps.judge = mock(async () => ({
+      status: 'ok' as const,
+      action: 'nudge' as const,
+      reason: 'next_step_known',
+      body: '',
+      failures: [],
+    }));
+    deps.listStaleIssues = mock(async () => []);
+    deps.postIssueComment = mock(async () => {
+      item.status = 'claimed';
+      item.fencing_token = 2;
+      item.lease_owner = 'new-worker';
+      return false;
+    });
+    deps.releaseMessage = mock(async input => {
+      if (input.fencing_token !== item.fencing_token || input.worker_id !== item.lease_owner)
+        return null;
+      item.status = 'queued';
+      return { ...item };
+    });
+    await tickDutyOfficerClock(deps);
+    expect(deps.releaseMessage).toHaveBeenCalledWith(expect.objectContaining({ fencing_token: 1 }));
+    expect(item.status).toBe('claimed');
+    expect(item.lease_owner).toBe('new-worker');
+    expect(item.fencing_token).toBe(2);
+    expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  test('ambiguous GitHub nudge failure produces neither success nor automatic retry', async () => {
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GH_TOKEN = 'synthetic-pat';
+    const item = message({ id: 'ambiguous-nudge', subject_key: 'gh:thinmansoftware/bdc-xo#2274' });
+    const deps = fakeDeps([item]);
+    deps.listMessages = mock(async ({ recipient }) =>
+      recipient === 'duty-officer' && item.status === 'queued' ? [{ ...item }] : []
+    );
+    deps.claimMessage = mock(async ({ worker_id }) => {
+      item.status = 'claimed';
+      item.lease_owner = worker_id;
+      item.fencing_token = 1;
+      return { ...item };
+    });
+    deps.judge = mock(async () => ({
+      status: 'ok' as const,
+      action: 'nudge' as const,
+      reason: 'next_step_known',
+      body: '',
+      failures: [],
+    }));
+    deps.listStaleIssues = mock(async () => []);
+    deps.postIssueComment = mock(async () => {
+      throw new Error('GitHub response lost after possible write');
+    });
+    await tickDutyOfficerClock(deps);
+    await tickDutyOfficerClock(deps);
+    expect(item.status).toBe('claimed');
+    expect(deps.postIssueComment).toHaveBeenCalledTimes(1);
+    expect(deps.postResult).not.toHaveBeenCalled();
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
+  });
+
+  test.each([false, true])(
+    'real nudge adapter confirms delivery or an existing marker: %s',
+    async existing => {
+      process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+      process.env.GH_TOKEN = 'synthetic-pat';
+      const methods: string[] = [];
+      const fetchStub = spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+        const method = options?.method ?? 'GET';
+        methods.push(method);
+        return new Response(
+          JSON.stringify(
+            method === 'POST'
+              ? { id: 1 }
+              : existing
+                ? [{ body: '<!-- duty-officer-nudge -->' }]
+                : []
+          ),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          }
+        );
+      });
+      try {
+        expect(
+          await postGithubIssueComment(
+            { owner: 'thinmansoftware', repo: 'bdc-xo', number: 2274 },
+            'cue'
+          )
+        ).toBe(true);
+        expect(methods).toEqual(existing ? ['GET'] : ['GET', 'POST']);
+      } finally {
+        fetchStub.mockRestore();
+      }
+    }
+  );
+
+  test('real nudge adapter refuses disabled and foreign repository requests before fetch', async () => {
+    process.env.GH_TOKEN = 'synthetic-pat';
+    const fetchStub = spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      throw new Error('network_must_not_run');
+    });
+    try {
+      expect(
+        await postGithubIssueComment(
+          { owner: 'thinmansoftware', repo: 'bdc-xo', number: 2274 },
+          'cue'
+        )
+      ).toBe(false);
+      process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+      expect(
+        await postGithubIssueComment({ owner: 'foreign', repo: 'repository', number: 1 }, 'cue')
+      ).toBe(false);
+      expect(fetchStub).not.toHaveBeenCalled();
+    } finally {
+      fetchStub.mockRestore();
+    }
+  });
+
+  test.each(['disabled', 'identity-revoked', 'repository-changed'])(
+    'real nudge adapter rechecks authorization before POST: %s',
+    async revoked => {
+      process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+      process.env.GH_TOKEN = 'synthetic-pat';
+      delete process.env.GITHUB_TOKEN;
+      const methods: string[] = [];
+      const fetchStub = spyOn(globalThis, 'fetch').mockImplementation(async (_url, options) => {
+        methods.push(options?.method ?? 'GET');
+        if (revoked === 'disabled') process.env.DUTY_OFFICER_GH_NUDGE = 'false';
+        if (revoked === 'identity-revoked') delete process.env.GH_TOKEN;
+        if (revoked === 'repository-changed')
+          process.env.DUTY_OFFICER_GH_REPO = 'foreign/repository';
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      });
+      try {
+        expect(
+          await postGithubIssueComment(
+            { owner: 'thinmansoftware', repo: 'bdc-xo', number: 2274 },
+            'cue'
+          )
+        ).toBe(false);
+        expect(methods).toEqual(['GET']);
+      } finally {
+        fetchStub.mockRestore();
+      }
+    }
+  );
+});
+
 describe('duty officer clock', () => {
+  test.each(['before-write', 'after-write', 'completion-before-write'] as const)(
+    'generic relay failure %s is held, respects backoff and retries without duplicate delivery',
+    async failure => {
+      const { deps, source, neighbor, relays } = relayRecoveryFixture(failure);
+      const started = Date.now();
+      await tickDutyOfficerClock(deps);
+
+      expect(source.status).toBe('queued');
+      expect(Date.parse(source.not_before!)).toBeGreaterThanOrEqual(started + 60_000);
+      expect(source.task_outcome).toBeNull();
+      expect(neighbor.status).toBe('done');
+      expect(deps.postResult).toHaveBeenCalledTimes(failure === 'completion-before-write' ? 2 : 1);
+      expect(deps.releaseMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: source.id,
+          worker_id: 'duty-officer-clock',
+          fencing_token: 1,
+        })
+      );
+      expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+      await tickDutyOfficerClock(deps);
+      expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+
+      // Advance the held fixture's eligibility without changing global clocks.
+      source.not_before = new Date(Date.now() - 1).toISOString();
+      await tickDutyOfficerClock(deps);
+      expect(source.status).toBe('done');
+      expect(source.task_outcome).toBe('succeeded');
+      expect(source.fencing_token).toBe(2);
+      expect(relays.size).toBe(1);
+      expect([...relays.keys()]).toEqual([`do-clock-escalation:${source.id}`]);
+      expect(JSON.parse(source.result_body!).disposition).toBe('escalated_to_xo');
+      await tickDutyOfficerClock(deps);
+      expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(2);
+    }
+  );
+
+  test('generic relay completion acknowledgement failure cannot reopen completed work', async () => {
+    const { deps, source, neighbor, relays } = relayRecoveryFixture('completion-after-write');
+    await tickDutyOfficerClock(deps);
+    expect(deps.releaseMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: source.id, worker_id: 'duty-officer-clock', fencing_token: 1 })
+    );
+    expect(source.status).toBe('done');
+    expect(source.task_outcome).toBe('succeeded');
+    expect(source.not_before).toBeNull();
+    expect(neighbor.status).toBe('done');
+    expect(relays.size).toBe(1);
+    await tickDutyOfficerClock(deps);
+    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+    expect(deps.postResult).toHaveBeenCalledTimes(2);
+  });
+
+  test('generic relay failure cannot release a newer claim or report success', async () => {
+    const { deps, source, neighbor, relays } = relayRecoveryFixture('stale-fence');
+    await tickDutyOfficerClock(deps);
+    expect(deps.releaseMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ id: source.id, fencing_token: 1 })
+    );
+    expect(source.status).toBe('claimed');
+    expect(source.lease_owner).toBe('new-worker');
+    expect(source.fencing_token).toBe(2);
+    expect(source.task_outcome).toBeNull();
+    expect(source.result_body).toBeNull();
+    expect(neighbor.status).toBe('done');
+    expect(relays.size).toBe(0);
+    expect(deps.postResult).toHaveBeenCalledTimes(1);
+  });
+
   test('fresh deps each tick preserve detector throttle and verdict until the interval expires', async () => {
     resetSecurityDetectorStateForTests();
     process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
@@ -522,7 +981,7 @@ describe('duty officer clock', () => {
     deps.listStaleIssues = mock(async () => [
       { owner: 'thinmansoftware', repo: 'bdc-xo', number: 12 },
     ]);
-    deps.postIssueComment = mock(async () => {});
+    deps.postIssueComment = mock(async () => true);
     process.env.DUTY_OFFICER_GH_NUDGE = 'true';
     process.env.GITHUB_TOKEN = 'ghs_test';
 
@@ -776,4 +1235,74 @@ describe('duty officer clock', () => {
     ).mock.calls.find(c => (c[0] as { id: string }).id === 'br-2')![0] as { result_body: string };
     expect(JSON.parse(br2Finish.result_body).disposition).toBe('taskmaster_blocker_report_relayed');
   });
+});
+
+test('dutyOfficerSqliteRaceIsolation', async () => {
+  const prior = readDutyOfficerProcessEnv();
+  let fetchStub: { mockRestore: () => void } | null = null;
+  const home = mkdtempSync(join(tmpdir(), 'duty-officer-sqlite-race-'));
+  const parentHandle = getDatabase();
+  try {
+    expect(parentHandle.dialect).toBe('sqlite');
+    await parentHandle.query('SELECT 1');
+
+    const connectionUrl = JSON.stringify(
+      pathToFileURL(resolve(import.meta.dir, '../../../core/src/db/connection.ts')).href
+    );
+    const script = `
+      const { getDatabase, closeDatabase } = await import(${connectionUrl});
+      try {
+        const db = getDatabase();
+        if (db.dialect !== 'sqlite') throw new Error('isolated_sqlite_required');
+        await db.query('SELECT 1');
+      } finally {
+        await closeDatabase();
+      }
+    `;
+    const scriptPath = join(home, 'close-isolated-database.ts');
+    writeFileSync(scriptPath, script);
+    const env: NodeJS.ProcessEnv = { ...process.env, ARCHON_HOME: home };
+    delete env.DATABASE_URL;
+    const proc = Bun.spawnSync([process.execPath, 'run', scriptPath], {
+      env,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 45_000,
+    });
+    expect(
+      proc.exitCode,
+      `isolated SQLite close exited ${proc.exitCode}: ${proc.stderr.toString()} ${proc.stdout.toString()}`
+    ).toBe(0);
+    await parentHandle.query('SELECT 1');
+
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    process.env.GH_TOKEN = 'synthetic-pat';
+    delete process.env.GITHUB_TOKEN;
+    const bodies = ['[]', JSON.stringify({ id: 1 })];
+    let fetchCalls = 0;
+    fetchStub = spyOn(globalThis, 'fetch').mockImplementation(async () => {
+      const body = bodies[Math.min(fetchCalls, bodies.length - 1)] ?? '[]';
+      fetchCalls += 1;
+      return new Response(body, {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    });
+
+    // postGithubIssueComment reads pool state through the singleton. If that
+    // call receives closedHandle, the closed-database query rejects and this fails.
+    expect(
+      await postGithubIssueComment(
+        { owner: 'thinmansoftware', repo: 'bdc-xo', number: 2274 },
+        'cue'
+      )
+    ).toBe(true);
+
+    expect(getDatabase()).toBe(parentHandle);
+    await parentHandle.query('SELECT 1');
+  } finally {
+    fetchStub?.mockRestore();
+    writeDutyOfficerProcessEnv(prior);
+    rmSync(home, { recursive: true, force: true });
+  }
 });
