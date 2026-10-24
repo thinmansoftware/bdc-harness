@@ -96,14 +96,26 @@ async function fireBudgetRefusal(
     [day]
   );
   if (unknownHistory.rowCount) return 'daily_cap_legacy_history_unknown';
-  const legacy = await query<{ id: string }>(
-    `SELECT j.id FROM tm_journal j LEFT JOIN tm_fire_admissions a
+  const legacy = await query<{ outcome: string; proposal_json: string }>(
+    `SELECT j.outcome,j.proposal_json FROM tm_journal j LEFT JOIN tm_fire_admissions a
        ON a.action_key=j.idempotency_key
      WHERE j.action_type='fire_cauldron' AND j.created_at >= $1
-       AND j.outcome IN ('sent','failed','expired') AND a.action_key IS NULL LIMIT 1`,
+       AND j.outcome IN ('sent','failed','expired') AND a.action_key IS NULL`,
     [`${day}T00:00:00.000Z`]
   );
-  if (legacy.rowCount) return 'daily_cap_legacy_history_unknown';
+  for (const row of legacy.rows) {
+    // Reconciliation skips this explicit pre-effect expiration. Match it here
+    // without weakening sent/failed history or relying on dialect JSON casts.
+    if (row.outcome === 'expired') {
+      try {
+        const proposal = JSON.parse(row.proposal_json) as { reason?: unknown } | null;
+        if (proposal?.reason === 'stale_epoch_before_effect') continue;
+      } catch {
+        // Malformed history is unknown, never proof that no effect occurred.
+      }
+    }
+    return 'daily_cap_legacy_history_unknown';
+  }
   const count = await query<{ total: number | string }>(
     `SELECT COUNT(*) AS total FROM tm_fire_admissions
      WHERE (state IN ('reserved','unknown') OR (state='admitted' AND utc_day=$1))

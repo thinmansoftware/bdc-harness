@@ -233,6 +233,59 @@ test('unreconciled legacy fire journal blocks fresh budget', async () => {
   expect((await tm.reserveAutomaticFire(await request('new'), db)).allowed).toBe(false);
 });
 
+test('proven pre-effect expiration permits fresh reservation and authorization', async () => {
+  await request('stale-before-effect');
+  await db.query("UPDATE tm_journal SET outcome='expired',proposal_json=$1 WHERE id=$2", [
+    JSON.stringify({ reason: 'stale_epoch_before_effect' }),
+    'stale-before-effect',
+  ]);
+  const input = await request('after-stale');
+  expect(await tm.reserveAutomaticFire(input, other)).toEqual({ allowed: true });
+  expect((await tm.authorizeAutomaticFire(input, db)).allowed).toBe(true);
+  expect((await tm.listAutomaticFireAdmissions(db)).map(row => row.action_key)).toEqual([
+    input.actionKey,
+  ]);
+});
+
+test.each([
+  ['expired', '{}'],
+  ['expired', '{bad-json'],
+  ['expired', 'null'],
+  ['expired', JSON.stringify({ reason: 'other_expiration' })],
+  ['sent', JSON.stringify({ reason: 'stale_epoch_before_effect' })],
+  ['failed', JSON.stringify({ reason: 'stale_epoch_before_effect' })],
+])('unknown legacy history stays blocked: outcome=%s proposal=%s', async (outcome, proposal) => {
+  const input = await request('reserved-before-history');
+  expect((await tm.reserveAutomaticFire(input, db)).allowed).toBe(true);
+  for (const [key, value] of [
+    ['proven-first', JSON.stringify({ reason: 'stale_epoch_before_effect' })],
+    ['unknown-after', proposal],
+  ] as const) {
+    await request(key);
+    await db.query('UPDATE tm_journal SET outcome=$1,proposal_json=$2 WHERE id=$3', [
+      key === 'proven-first' ? 'expired' : outcome,
+      value,
+      key,
+    ]);
+  }
+  const refused = { allowed: false, reason: 'daily_cap_legacy_history_unknown' };
+  expect(await tm.reserveAutomaticFire(await request('new-after-history'), other)).toEqual(refused);
+  expect(await tm.authorizeAutomaticFire(input, db)).toEqual(refused);
+});
+
+test('pre-effect label cannot refund an existing committed permission', async () => {
+  const input = { ...(await request('committed')), limit: 1 };
+  await tm.reserveAutomaticFire(input, db);
+  await tm.authorizeAutomaticFire(input, db);
+  await db.query("UPDATE tm_journal SET outcome='expired',proposal_json=$1 WHERE id=$2", [
+    JSON.stringify({ reason: 'stale_epoch_before_effect' }),
+    input.journalId,
+  ]);
+  expect(
+    await tm.reserveAutomaticFire({ ...(await request('still-charged')), limit: 1 }, other)
+  ).toEqual({ allowed: false, reason: 'daily_cap_exhausted' });
+});
+
 test('proved legacy settlement preserves journal supervision and legacy attribution', async () => {
   const input = await request('proved-legacy');
   const deadline = '2026-10-18T23:00:00.000Z';

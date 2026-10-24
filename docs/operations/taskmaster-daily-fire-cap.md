@@ -225,6 +225,20 @@ required; no deployed behavior or registry correction follows from local proof.
 
 ## Publication and rollout
 
+### App review correction (2026-10-24)
+
+The legacy-history budget gate excludes only expired journal rows whose parsed
+proposal reason is exactly `stale_epoch_before_effect`, matching the loop's
+proven pre-effect reconciliation exclusion. Sent/failed rows, other expirations,
+missing reasons and malformed JSON still block as unknown legacy history. Every
+matching history row is checked, so one excluded row cannot hide another unknown
+row. Existing ledger reservations and committed permissions remain charged.
+
+Regression invocation: `bun test --timeout 30000 src/db/taskmaster-fire-cap.test.ts`
+from `packages/core`. The PostgreSQL counterpart is in
+`src/db/taskmaster-fire-cap.postgres.test.ts` and requires the documented isolated
+test fixture. This source correction does not change a live database or runtime.
+
 Migration `063_tm_fire_admissions.sql` is additive PostgreSQL DDL; SQLite has an
 equivalent additive bootstrap table. Existing journal rows and unrelated work are
 preserved. Source review and both dialect tests precede acceptance. A separate

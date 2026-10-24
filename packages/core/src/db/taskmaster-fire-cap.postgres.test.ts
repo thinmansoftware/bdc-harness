@@ -137,6 +137,23 @@ test('PostgreSQL epoch fence and definitive no-permission release preserve unkno
   expect(await releaseAutomaticFire(input, first)).toBe(true);
 });
 
+test('PostgreSQL excludes only proven pre-effect expirations from legacy history', async () => {
+  const expired = await request('stale-before-effect');
+  await first!.query("UPDATE tm_journal SET outcome='expired',proposal_json=$1 WHERE id=$2", [
+    JSON.stringify({ reason: 'stale_epoch_before_effect' }),
+    expired.journalId,
+  ]);
+  const input = await request('fresh-after-expiration');
+  expect(await reserveAutomaticFire(input, second)).toEqual({ allowed: true });
+  expect((await authorizeAutomaticFire(input, first)).allowed).toBe(true);
+  const unknown = await request('unknown-expiration');
+  await first!.query("UPDATE tm_journal SET outcome='expired' WHERE id=$1", [unknown.journalId]);
+  expect(await reserveAutomaticFire(await request('blocked-by-unknown'), second)).toEqual({
+    allowed: false,
+    reason: 'daily_cap_legacy_history_unknown',
+  });
+});
+
 test('PostgreSQL unowned settlement never releases reserved or committed permission', async () => {
   const input = { ...(await request('settlement-refund')), limit: 1 };
   await reserveAutomaticFire(input, first);
