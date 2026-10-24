@@ -182,6 +182,27 @@ interface GhSearchRow {
   body?: string;
 }
 
+function validPrState(value: unknown): value is LanePrState {
+  return value === 'OPEN' || value === 'CLOSED' || value === 'MERGED';
+}
+
+function canonicalPrUrl(value: unknown, repo: string, number: number): value is string {
+  if (typeof value !== 'string') return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.origin === 'https://github.com' &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash &&
+      url.pathname.toLowerCase() === `/${repo}/pull/${number}`.toLowerCase()
+    );
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Build the real lookup. Uses gh for the OPEN search and the per-number REST
  * re-read, and lane-pr-registry for attribution. The GitHub PR fetcher the
@@ -211,22 +232,37 @@ export function createDefaultOpenPrGuardLookup(
         ],
         { timeout: 30000 }
       );
-      const parsed = JSON.parse(stdout || '[]') as GhSearchRow[];
-      if (!Array.isArray(parsed)) return [];
+      const parsed: unknown = JSON.parse(stdout);
+      if (!Array.isArray(parsed)) throw new Error('open_pr_lookup_invalid');
       const slash = repo.indexOf('/');
       const owner = slash === -1 ? repo : repo.slice(0, slash);
       const shortRepo = slash === -1 ? repo : repo.slice(slash + 1);
       const out: OpenPrSearchRow[] = [];
-      for (const row of parsed) {
-        if (typeof row.number !== 'number') continue;
+      for (const entry of parsed) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry))
+          throw new Error('open_pr_lookup_invalid');
+        const row = entry as GhSearchRow;
+        if (
+          typeof row.number !== 'number' ||
+          !Number.isSafeInteger(row.number) ||
+          row.number <= 0 ||
+          !validPrState(row.state) ||
+          typeof row.headRefName !== 'string' ||
+          !row.headRefName.trim() ||
+          typeof row.title !== 'string' ||
+          !row.title.trim() ||
+          (typeof row.body !== 'string' && row.body !== null) ||
+          !canonicalPrUrl(row.url, repo, row.number)
+        )
+          throw new Error('open_pr_lookup_invalid');
         out.push({
           owner,
           repo: shortRepo,
           prNumber: row.number,
-          state: row.state ?? '',
-          headRef: row.headRefName ?? '',
-          url: row.url ?? '',
-          title: row.title ?? '',
+          state: row.state,
+          headRef: row.headRefName,
+          url: row.url,
+          title: row.title,
           body: row.body ?? '',
         });
       }
@@ -253,19 +289,27 @@ export function createDefaultOpenPrGuardLookup(
           '--repo',
           `${owner}/${repo}`,
           '--json',
-          'state,headRefName,url',
+          'number,state,headRefName,url',
         ],
         { timeout: 30000 }
       );
-      const parsed = JSON.parse(stdout || '{}') as {
+      const parsed = JSON.parse(stdout) as {
+        number?: number;
         state?: string;
         headRefName?: string;
         url?: string;
       };
-      const stateRaw = (parsed.state ?? '').toUpperCase();
-      const state: LanePrState | '' =
-        stateRaw === 'OPEN' || stateRaw === 'CLOSED' || stateRaw === 'MERGED' ? stateRaw : '';
-      return { state, headRef: parsed.headRefName ?? '', url: parsed.url ?? '' };
+      if (
+        !parsed ||
+        Array.isArray(parsed) ||
+        parsed.number !== prNumber ||
+        !validPrState(parsed.state) ||
+        typeof parsed.headRefName !== 'string' ||
+        !parsed.headRefName.trim() ||
+        !canonicalPrUrl(parsed.url, `${owner}/${repo}`, prNumber)
+      )
+        throw new Error('open_pr_lookup_invalid');
+      return { state: parsed.state, headRef: parsed.headRefName, url: parsed.url };
     },
   };
 }
@@ -280,6 +324,7 @@ interface GhPrViewRow {
   isCrossRepository?: boolean;
   title?: string;
   body?: string;
+  url?: string;
 }
 
 /**
@@ -299,12 +344,32 @@ export function createGhLanePrFetcher(execFn: typeof execFileAsync = execFileAsy
         '--repo',
         `${owner}/${repo}`,
         '--json',
-        'number,state,reviewDecision,createdAt,headRefName,headRefOid,isCrossRepository,title,body',
+        'number,state,reviewDecision,createdAt,headRefName,headRefOid,isCrossRepository,title,body,url',
       ],
       { timeout: 30000 }
     );
-    const row = JSON.parse(stdout || '{}') as GhPrViewRow;
-    if (row.number !== prNumber) throw new Error('lane_pr_lookup_invalid');
+    const row = JSON.parse(stdout) as GhPrViewRow;
+    if (
+      !row ||
+      Array.isArray(row) ||
+      row.number !== prNumber ||
+      !canonicalPrUrl(row.url, `${owner}/${repo}`, prNumber) ||
+      typeof row.isCrossRepository !== 'boolean' ||
+      !validPrState(row.state) ||
+      typeof row.headRefOid !== 'string' ||
+      !/^[a-f0-9]{40}$/i.test(row.headRefOid) ||
+      typeof row.headRefName !== 'string' ||
+      !row.headRefName.trim() ||
+      typeof row.title !== 'string' ||
+      !row.title.trim() ||
+      (typeof row.body !== 'string' && row.body !== null) ||
+      typeof row.createdAt !== 'string' ||
+      !Number.isFinite(Date.parse(row.createdAt)) ||
+      (row.reviewDecision !== null &&
+        row.reviewDecision !== '' &&
+        !['APPROVED', 'CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(row.reviewDecision ?? ''))
+    )
+      throw new Error('lane_pr_lookup_invalid');
     const stateRaw = (row.state ?? '').toUpperCase();
     if (!['OPEN', 'CLOSED', 'MERGED'].includes(stateRaw)) throw new Error('lane_pr_lookup_invalid');
     const state: LanePrState =
@@ -313,7 +378,8 @@ export function createGhLanePrFetcher(execFn: typeof execFileAsync = execFileAsy
     return {
       number: row.number,
       state,
-      reviewDecision: row.reviewDecision ?? null,
+      // Empty review metadata is absence of approval, never a positive ruling.
+      reviewDecision: row.reviewDecision === '' ? null : (row.reviewDecision ?? null),
       createdAt: row.createdAt ?? '',
       headRefName: row.headRefName ?? '',
       headSha: row.headRefOid ?? '',

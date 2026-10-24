@@ -1,4 +1,5 @@
-import { mock, describe, test, expect, beforeEach } from 'bun:test';
+import { mock, describe, test, expect, beforeEach, spyOn } from 'bun:test';
+import * as repairSource from '../workflows/work-order-source';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
 import { createQueryResult, mockPostgresDialect } from '../test/mocks/database';
@@ -2094,8 +2095,38 @@ describe('Smart Cauldron reliability persistence', () => {
       );
       const repair = { ...authority, runId: firstRunId, dispatchId: `repair:${candidateId}` };
 
-      // A missing workflow FK must roll back mailbox consumption too.
-      await expect(createRunAuthority({ ...repair, runId: crypto.randomUUID() })).rejects.toThrow();
+      // The SAME real ordinary operation starts at validation in both async and
+      // sync paths. A missing workflow FK must roll back only authority work.
+      await sqlite.query('CREATE TABLE repair_sibling_write (id TEXT PRIMARY KEY)');
+      let ordinaryWrite: ReturnType<typeof sqlite.query> | undefined;
+      const validate = repairSource.validateRepairAttemptRow;
+      const validationSpy = spyOn(repairSource, 'validateRepairAttemptRow').mockImplementation(
+        (...args) => {
+          const result = validate(...args);
+          ordinaryWrite = sqlite.query("INSERT INTO repair_sibling_write (id) VALUES ('ordinary')");
+          return result;
+        }
+      );
+      try {
+        let failure: unknown;
+        try {
+          await createRunAuthority({ ...repair, runId: crypto.randomUUID() });
+        } catch (error) {
+          failure = error;
+        }
+        expect(failure).toBeDefined();
+        expect(ordinaryWrite).toBeDefined();
+        expect((await ordinaryWrite!).rowCount).toBe(1);
+        expect(
+          (
+            await sqlite.query<{ count: number }>(
+              'SELECT count(*) AS count FROM repair_sibling_write'
+            )
+          ).rows[0].count
+        ).toBe(1);
+      } finally {
+        validationSpy.mockRestore();
+      }
       const unconsumed = await sqlite.query<{ addressed_at: string | null }>(
         'SELECT addressed_at FROM agent_dispatch_messages WHERE id=$1',
         [candidateId]

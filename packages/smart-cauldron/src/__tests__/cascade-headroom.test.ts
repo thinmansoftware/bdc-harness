@@ -56,8 +56,12 @@ async function withDefaultThreshold<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-function claimStubs(): Pick<CascadeDeps, 'findWoClaim' | 'acquireWoLock' | 'releaseWoLock'> {
+function claimStubs(): Pick<
+  CascadeDeps,
+  'findWoClaim' | 'acquireWoLock' | 'releaseWoLock' | 'findBlockingOpenPrs'
+> {
   return {
+    findBlockingOpenPrs: async () => [],
     findWoClaim: async () => null,
     acquireWoLock: async (woId, project, cascadeId) => ({
       acquired: true,

@@ -2,7 +2,7 @@
  * Database operations for workflow runs
  */
 import { pool, getDatabase, getDialect, getDatabaseType } from './connection';
-import type { IDatabase } from './adapters/types';
+import type { IDatabase, RunAuthoritySyncQuery } from './adapters/types';
 import type {
   WorkflowRun,
   WorkflowRunStatus,
@@ -26,10 +26,7 @@ import type {
 } from '@archon/workflows/reliability/types';
 import { createLogger } from '@archon/paths';
 import { validateRepairAttemptRow, type RepairAttemptRow } from '../workflows/work-order-source';
-import {
-  withOverseerControlPlaneImmediateTransaction,
-  type OverseerControlPlaneQuery,
-} from './overseer-control-plane-sqlite';
+import type { OverseerControlPlaneQuery } from './overseer-control-plane-sqlite';
 
 /**
  * workflow_name of the synthetic terminal parent rows minted for discovery-sourced
@@ -448,6 +445,14 @@ export async function createRunAuthority(
     throw new Error('authority_conflict: repair_attempt id');
   }
   const database = getDatabase();
+  if (database.dialect === 'sqlite') {
+    if (!database.withImmediateRunAuthorityTransaction) {
+      throw new Error('run_authority_sync_transaction_unsupported');
+    }
+    return database.withImmediateRunAuthorityTransaction(query =>
+      consumeRepairAuthoritySqlite(authority, attemptId, query)
+    );
+  }
   const consume = async (query: OverseerControlPlaneQuery): Promise<'created' | 'unchanged'> => {
     const existing = await query<RunAuthorityRow>(
       'SELECT * FROM remote_agent_run_authorities WHERE run_id = $1',
@@ -492,17 +497,10 @@ export async function createRunAuthority(
     // A conflicting insert throws, rolling back the mailbox CAS in the same transaction.
     return insertRunAuthority(authority, query);
   };
-  return database.dialect === 'sqlite'
-    ? withOverseerControlPlaneImmediateTransaction(database, consume)
-    : database.withTransaction(consume);
+  return database.withTransaction(consume);
 }
 
-async function insertRunAuthority(
-  authority: RunAuthorityRecord,
-  query: OverseerControlPlaneQuery
-): Promise<'created' | 'unchanged'> {
-  const result = await query<RunAuthorityRow>(
-    `INSERT INTO remote_agent_run_authorities
+const RUN_AUTHORITY_INSERT_SQL = `INSERT INTO remote_agent_run_authorities
      (run_id, dispatch_id, wo_id, spec_source, spec_revision, spec_hash,
       workflow_name, codebase_id, canonical_remote, base_branch, base_sha,
       run_scope_sha, head_branch, worktree_path, workflow_revision, bundle_revision,
@@ -510,28 +508,91 @@ async function insertRunAuthority(
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
              $15, $16, $17, $18, $19)
      ON CONFLICT DO NOTHING
-     RETURNING *`,
-    [
-      authority.runId,
-      authority.dispatchId,
-      authority.woId,
-      authority.specSource,
-      authority.specRevision,
-      authority.specHash,
-      authority.workflowName,
-      authority.codebaseId,
-      authority.canonicalRemote,
-      authority.baseBranch,
-      authority.baseSha,
-      authority.runScopeSha,
-      authority.headBranch,
-      authority.worktreePath,
-      authority.workflowRevision,
-      authority.bundleRevision,
-      authority.engineRevision,
-      authority.runtimeImageRevision,
-      authority.createdAt,
-    ]
+     RETURNING *`;
+
+function runAuthorityParameters(authority: RunAuthorityRecord): unknown[] {
+  return [
+    authority.runId,
+    authority.dispatchId,
+    authority.woId,
+    authority.specSource,
+    authority.specRevision,
+    authority.specHash,
+    authority.workflowName,
+    authority.codebaseId,
+    authority.canonicalRemote,
+    authority.baseBranch,
+    authority.baseSha,
+    authority.runScopeSha,
+    authority.headBranch,
+    authority.worktreePath,
+    authority.workflowRevision,
+    authority.bundleRevision,
+    authority.engineRevision,
+    authority.runtimeImageRevision,
+    authority.createdAt,
+  ];
+}
+
+/** SQLite repair validation/consumption/insertion must never yield inside BEGIN. */
+function consumeRepairAuthoritySqlite(
+  authority: RunAuthorityRecord,
+  attemptId: string,
+  query: RunAuthoritySyncQuery
+): 'created' | 'unchanged' {
+  const existing = query<RunAuthorityRow>(
+    'SELECT * FROM remote_agent_run_authorities WHERE run_id = $1',
+    [authority.runId]
+  );
+  if (existing.rows[0]) {
+    if (runAuthoritiesEqual(normalizeRunAuthority(existing.rows[0]), authority)) return 'unchanged';
+    throw new Error('authority_conflict: repair_attempt immutable authority changed');
+  }
+  const candidate = query<RepairAttemptRow>('SELECT * FROM agent_dispatch_messages WHERE id = $1', [
+    attemptId,
+  ]).rows[0];
+  if (!candidate) throw new Error('authority_conflict: repair_attempt row not found');
+  validateRepairAttemptRow(candidate, authority.woId, authority.canonicalRemote);
+  const consumed = query(
+    `UPDATE agent_dispatch_messages SET addressed_at=$2, addressed_by='taskmaster'
+     WHERE id=$1 AND body=$3 AND acknowledged_at=$4
+       AND acknowledged_by='taskmaster' AND sender='overseer'
+       AND sender_principal_id='system:overseer' AND recipient='taskmaster'
+       AND status='queued' AND addressed_at IS NULL AND addressed_by IS NULL
+       AND route_disposition IS NULL`,
+    [attemptId, new Date().toISOString(), candidate.body, candidate.acknowledged_at]
+  );
+  if (consumed.rowCount !== 1)
+    throw new Error('authority_conflict: repair_attempt consumed or changed');
+  const inserted = query<RunAuthorityRow>(
+    RUN_AUTHORITY_INSERT_SQL,
+    runAuthorityParameters(authority)
+  );
+  if (inserted.rows[0]) return 'created';
+  const bound = query<RunAuthorityRow>(
+    'SELECT * FROM remote_agent_run_authorities WHERE run_id=$1',
+    [authority.runId]
+  ).rows[0];
+  if (bound && runAuthoritiesEqual(normalizeRunAuthority(bound), authority)) return 'unchanged';
+  const dispatch = query<RunAuthorityRow>(
+    'SELECT * FROM remote_agent_run_authorities WHERE dispatch_id=$1',
+    [authority.dispatchId]
+  ).rows[0];
+  if (dispatch && dispatch.run_id !== authority.runId) {
+    throw new Error(
+      `dispatch_conflict: dispatch ${authority.dispatchId} already belongs to run ${dispatch.run_id}`
+    );
+  }
+  throw new Error(`authority_conflict: immutable authority differs for run ${authority.runId}`);
+}
+
+async function insertRunAuthority(
+  authority: RunAuthorityRecord,
+  query: OverseerControlPlaneQuery
+): Promise<'created' | 'unchanged'> {
+  const result = await query<RunAuthorityRow>(
+    RUN_AUTHORITY_INSERT_SQL,
+    runAuthorityParameters(authority)
   );
   if (result.rows[0]) return 'created';
 

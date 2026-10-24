@@ -106,9 +106,9 @@ export interface CascadeDeps {
    * Open-PR climb guard (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01). Returns the
    * OPEN PRs for this WO that must stop a climb. Called at the top of every
    * climb WHETHER OR NOT allowClaimed is set. The default binds the real gh +
-   * lane-pr-registry lookup and fails-open only when GitHub credentials are
-   * absent (tests / dev); with credentials it fails CLOSED (throws) on a lookup
-   * error, which the cascade maps to a refusal.
+   * lane-pr-registry lookup and fails CLOSED on a lookup error, including
+   * missing credentials. The cascade maps an exhausted lookup to a refusal;
+   * isolated tests supply an explicit lookup dependency.
    */
   findBlockingOpenPrs?: (input: {
     woId: string;
@@ -1341,13 +1341,9 @@ function extractStatusCode(infraError: string): number | undefined {
 /**
  * Default open-PR climb guard. Binds the real gh + lane-pr-registry lookup.
  *
- * FAIL-OPEN ONLY WHEN THERE IS NO GITHUB ACCESS AT ALL. The guard's fail-CLOSED
- * throw semantics apply to a real lookup ERROR, not to an environment that
- * simply cannot read GitHub (tests, dev). With no credentials -- or in hermetic
- * mode -- return [] so an ordinary cascade is not forced to refuse; this
- * mirrors already-satisfied's gh search, which also returns [] without access.
- * In production (GH_TOKEN present) the real guard runs and throws on error, and
- * the cascade maps that throw to an open-pr-lookup-failed refusal.
+ * Unknown access is not proof of no blocking PR. Existing GitHub identities
+ * may work without user-token env variables; failed reads refuse the climb.
+ * Hermetic callers inject their explicit lookup result through CascadeDeps.
  */
 async function defaultFindBlockingOpenPrs(input: {
   woId: string;
@@ -1355,8 +1351,6 @@ async function defaultFindBlockingOpenPrs(input: {
   attemptRunIds: string[];
   excludePrNumber?: number;
 }): Promise<BlockingOpenPr[]> {
-  if (process.env.SMART_CAULDRON_HERMETIC === '1') return [];
-  if (!process.env.GH_TOKEN && !process.env.GITHUB_TOKEN) return [];
   const lookup = createDefaultOpenPrGuardLookup(createGhLanePrFetcher());
   return findBlockingOpenPrs({ ...input, lookup });
 }

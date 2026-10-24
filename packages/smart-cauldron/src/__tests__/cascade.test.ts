@@ -102,6 +102,7 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
     project: 'test-project',
     ...options,
     deps: {
+      findBlockingOpenPrs: async () => [],
       findWoClaim: async () => null,
       acquireWoLock: async (woId, project, cascadeId) => ({
         acquired: true,

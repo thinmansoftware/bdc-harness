@@ -1,27 +1,72 @@
 /**
  * Taskmaster loop tests -- Section 11 scenarios 1, 3, 4, 5 plus the
  * auto-circuit. Everything is dependency-injected (fake clock, fake DAL,
- * fake dispatch); no mock.module.
+ * fake dispatch). A separate fail-closed preload catches undeclared defaults.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { Database } from 'bun:sqlite';
-import { readFileSync, unlinkSync } from 'fs';
+import { readFileSync } from 'fs';
 import { join } from 'path';
-import {
-  listWosWithMultipleLanePrs,
-  type LanePrRegistryDb,
-} from '@archon/core/db/lane-pr-registry';
-import { rootLogger } from '@archon/paths';
-import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
-import {
-  setSeatUsageReaderForTests,
-  unknownSeatReading,
+import type { DispatchDeliveryMode } from '@archon/core/db/dispatch';
+import type { ThreadSnapshot } from './rules';
+import type {
+  TmActionOutcome,
+  TmActionType,
+  TmControlState,
+  TmGrade,
+  TmJournalEntry,
+} from '@archon/core/db/taskmaster';
+import type { HeadroomReading } from './ledger';
+import type { LanePrRegistryDb } from '@archon/core/db/lane-pr-registry';
+import type {
+  TaskmasterDeps,
+  ListedThread,
+  GithubIssueEvidence,
+  AdoptionRefreshResult,
+} from './loop';
+import type { PrRepairQueuedMessage, PrRepairOwnerDeps } from './pr-repair-owner';
+import type { EscalationDeliveryDeps, EscalationIssueComment } from './escalation-delivery';
+import type { ActionProposal } from './rules';
+import type { TmExpectation, TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
+import type {
+  SeatUsageReader,
+  SeatReading,
+  SeatId,
 } from '@archon/workflows/reliability/seat-usage';
 
-// A synthetic exhausted response belongs to its test, never the next caller.
-beforeEach(resetGitHubApiMeterForTests);
-afterEach(resetGitHubApiMeterForTests);
-import {
+if (Reflect.get(globalThis, Symbol.for('bdc.pr-detection-isolated')) !== true) {
+  throw new Error('PR_DETECTION_ISOLATION_PRELOAD_REQUIRED');
+}
+const guardedConnection = await import('@archon/core/db/connection');
+const canonicalConnection = await import('../../../core/src/db/connection');
+if (
+  Reflect.get(guardedConnection, '__PR_DETECTION_GUARD__') !== true ||
+  Reflect.get(canonicalConnection, '__PR_DETECTION_GUARD__') !== true ||
+  guardedConnection.getDatabase !== canonicalConnection.getDatabase
+) {
+  throw new Error('PR_DETECTION_CONNECTION_GUARD_REQUIRED');
+}
+const { takeDeniedFallbacks } =
+  await import('../../../smart-cauldron/src/__tests__/pr-detection-isolation.preload');
+afterEach(() => expect(takeDeniedFallbacks()).toEqual([]));
+
+const { listWosWithMultipleLanePrs } = await import('@archon/core/db/lane-pr-registry');
+const { rootLogger } = await import('@archon/paths');
+const githubMeter = await import('@archon/core/github/metering');
+const { resetGitHubApiMeterForTests } = githubMeter;
+const { setSeatUsageReaderForTests, unknownSeatReading } =
+  await import('@archon/workflows/reliability/seat-usage');
+const fixtureSeatUsage: SeatUsageReader = async seats => {
+  const readings: Partial<Record<SeatId, SeatReading>> = {};
+  for (const seat of seats) readings[seat] = unknownSeatReading(seat, 'synthetic loop fixture');
+  return readings;
+};
+// Install before the loop graph and every test: native seat readers load auth
+// files before network, so denying fetch alone does not isolate these fixtures.
+setSeatUsageReaderForTests(fixtureSeatUsage);
+beforeEach(() => setSeatUsageReaderForTests(fixtureSeatUsage));
+afterEach(() => setSeatUsageReaderForTests(fixtureSeatUsage));
+const {
   createTaskmasterState,
   createGhLaneFetcher,
   createRealPrRepairOwnerDeps,
@@ -43,49 +88,23 @@ import {
   TM_REPEAT_REASON_BY_TYPE,
   isPostCutoverReceipt,
   digestProposal,
-  type TaskmasterDeps,
-  type ListedThread,
-  type GithubIssueEvidence,
-  type AdoptionRefreshResult,
-} from './loop';
-import { checkEvidence, checkExpectations } from './expectations';
-import {
-  runPrRepairOwner,
-  type PrRepairQueuedMessage,
-  type PrRepairOwnerDeps,
-} from './pr-repair-owner';
-import {
-  TASKMASTER_ESCALATION_MARKER,
-  TASKMASTER_ESCALATION_COOLDOWN_MS,
-  type EscalationDeliveryDeps,
-  type EscalationIssueComment,
-} from './escalation-delivery';
-import type { DispatchDeliveryMode } from '@archon/core/db/dispatch';
-import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
-import {
-  classifyThread,
-  computeNextAction,
-  MAX_INTERVENTIONS_PER_ITEM_24H,
-  NUDGE_CLOCK_MS,
-  type ActionProposal,
-} from './rules';
-import {
-  expectationRegistrationKey,
-  type TmExpectation,
-  type TmAdoptionRow,
-  type TmSuppressionRow,
-} from '@archon/core/db/taskmaster';
-import type { ThreadSnapshot } from './rules';
-import type {
-  TmActionOutcome,
-  TmActionType,
-  TmControlState,
-  TmGrade,
-  TmJournalEntry,
-} from '@archon/core/db/taskmaster';
-import type { HeadroomReading } from './ledger';
-import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
-import * as fireBudgetDb from '@archon/core/db/taskmaster';
+} = await import('./loop');
+const { checkEvidence, checkExpectations } = await import('./expectations');
+const { runPrRepairOwner } = await import('./pr-repair-owner');
+const { TASKMASTER_ESCALATION_MARKER, TASKMASTER_ESCALATION_COOLDOWN_MS } =
+  await import('./escalation-delivery');
+const { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } =
+  await import('./guard');
+const { classifyThread, computeNextAction, MAX_INTERVENTIONS_PER_ITEM_24H, NUDGE_CLOCK_MS } =
+  await import('./rules');
+const { expectationRegistrationKey } = await import('@archon/core/db/taskmaster');
+const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
+const fireBudgetDb = await import('@archon/core/db/taskmaster');
+type SqliteAdapter = InstanceType<typeof SqliteAdapter>;
+
+// Synthetic exhausted responses belong to one test.
+beforeEach(resetGitHubApiMeterForTests);
+afterEach(resetGitHubApiMeterForTests);
 
 describe('Taskmaster reset visibility and canary', () => {
   test('legacy_unverified receipts are never post-cutover evidence', () => {
@@ -530,6 +549,15 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
       prOpened: false,
     }),
     getDispatchReceiptCutoverAt: async () => new Date(T0 - 86_400_000).toISOString(),
+    // A fake DAL must not fall through to the singleton operational database.
+    // Tests of lane health override this with their explicit fixture samples.
+    getHealthSample: async () => null,
+    getFireRunEvidence: async () => null,
+    checkFireEligibility: async () => ({ eligible: false, reason: 'fixture_no_automatic_fire' }),
+    runCascade: async () => {
+      throw new Error('unexpected fixture cascade');
+    },
+    escalationDelivery: makeIssueCommentSink(world).delivery,
     headroom: async () => okHeadroom,
     createTask: (async (
       _context: unknown,
@@ -1834,7 +1862,7 @@ describe('fire_cauldron loop', () => {
         ).toContain(`on ${testCase.lane} lane`);
       }
     } finally {
-      setSeatUsageReaderForTests(null);
+      setSeatUsageReaderForTests(fixtureSeatUsage);
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
     }
@@ -3869,6 +3897,24 @@ describe('interval env parsing', () => {
 });
 
 describe('defaultListThreads -- GitHub work-SOR read', () => {
+  // This group tests the real HTTP adapter over synthetic responses, not the
+  // shared quota database. Isolate persistence before its default DB argument
+  // can be evaluated; keep in-memory metering and response policy unchanged.
+  let restorePersistence = (): void => {};
+  beforeEach(() => {
+    const quota = spyOn(githubMeter, 'assertPersistedGitHubPoolAvailable').mockImplementation(
+      async (poolId, resources) => {
+        for (const resource of resources) githubMeter.assertGitHubPoolAvailable(poolId, resource);
+      }
+    );
+    const flush = spyOn(githubMeter, 'flushGitHubApiMeter').mockImplementation(async () => {});
+    restorePersistence = () => {
+      resetGitHubApiMeterForTests();
+      flush.mockRestore();
+      quota.mockRestore();
+    };
+  });
+  afterEach(() => restorePersistence());
   // Pin the repo list so an operator env var cannot skew the assertions.
   const priorRepos = process.env.TASKMASTER_GH_REPOS;
   process.env.TASKMASTER_GH_REPOS = 'thinmansoftware/bdc-harness';
@@ -4862,8 +4908,7 @@ describe('M-155 exception push (loop)', () => {
     // The map structure exists and every entry points at 'xo', so widening it
     // later is a data change rather than a code change.
     expect(Object.keys(OWNER_RECIPIENT_MAP).length).toBeGreaterThan(0);
-    const dbPath = join(import.meta.dir, `.test-taskmaster-principals-${Date.now()}.db`);
-    const principalDb = new SqliteAdapter(dbPath);
+    const principalDb = new SqliteAdapter(':memory:');
     try {
       for (const target of Object.values(OWNER_RECIPIENT_MAP)) {
         expect(TM_ALLOWED_RECIPIENTS).toContain(target);
@@ -4876,13 +4921,6 @@ describe('M-155 exception push (loop)', () => {
       }
     } finally {
       await principalDb.close();
-      for (const suffix of ['', '-wal', '-shm']) {
-        try {
-          unlinkSync(dbPath + suffix);
-        } catch {
-          // SQLite may not create sidecars for this read-only fixture.
-        }
-      }
     }
   });
 

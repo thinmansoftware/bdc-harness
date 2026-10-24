@@ -10,12 +10,12 @@
  *
  * All injected: no network, no real GitHub, no DB.
  */
-import { describe, test, expect, afterAll, spyOn } from 'bun:test';
+import { describe, test, expect, spyOn } from 'bun:test';
 import * as registry from '@archon/core/db/lane-pr-registry';
+import * as openPrGuard from '../open-pr-guard';
 import { randomUUID } from 'crypto';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { rm } from 'fs/promises';
 import { runCascade } from '../cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import type { FireResult, PollResult, GateVerdict } from '../types.js';
@@ -64,9 +64,7 @@ test('production registry fetch errors retry once and refuse the climb', async (
 });
 
 const testOutRoot = join(tmpdir(), `oguard-${randomUUID()}`);
-afterAll(async () => {
-  await rm(testOutRoot, { recursive: true, force: true });
-});
+// Record and lock writes are injected below; this path is an identity only.
 
 function fireOk(runId: string): FireResult {
   return { ok: true, runId, conversationId: 'c', infraError: null };
@@ -114,8 +112,13 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
     outDir: join(testOutRoot, randomUUID()),
     token: 'test-token',
     project: 'bdc-xo',
+    apiBaseUrl: 'http://archon.test',
     ...options,
     deps: {
+      fetchNodeTimeouts: async () => ({}),
+      cancel: async () => {
+        throw new Error('unexpected fixture cancellation');
+      },
       findWoClaim: async () => null,
       acquireWoLock: async (woId, project, cascadeId) => ({
         acquired: true,
@@ -130,6 +133,7 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
         },
       }),
       releaseWoLock: async () => {},
+      findBlockingOpenPrs: async () => [],
       writeRecord: async () => '/tmp/rec.json',
       escalate: async () => {},
       ...deps,
@@ -148,6 +152,46 @@ function blockingPr(prNumber: number, headRef = `feat/x-${prNumber}`): BlockingO
 }
 
 describe('open-PR climb guard', () => {
+  for (const mode of ['missing-token', 'hermetic'] as const) {
+    test(`production default refuses unknown blockers under ${mode} instead of climbing`, async () => {
+      delete process.env.GH_TOKEN;
+      delete process.env.GITHUB_TOKEN;
+      const previous = process.env.SMART_CAULDRON_HERMETIC;
+      if (mode === 'hermetic') process.env.SMART_CAULDRON_HERMETIC = '1';
+      else delete process.env.SMART_CAULDRON_HERMETIC;
+      let lookups = 0,
+        fires = 0;
+      const lookupSpy = spyOn(openPrGuard, 'createDefaultOpenPrGuardLookup').mockReturnValue({
+        searchOpenPrs: async () => {
+          lookups++;
+          throw new Error('fixture_read_unavailable');
+        },
+        registryAttributedPrs: async () => [],
+        readPr: async () => null,
+      });
+      try {
+        const options = baseOpts({
+          entryOverride: 'codex',
+          allowClaimed: true,
+          deps: {
+            fire: async () => fireOk(`run-${++fires}`),
+            poll: async () => pollResult(),
+            judge: () => failVerdict(),
+          },
+        });
+        delete options.deps!.findBlockingOpenPrs;
+        const result = await runCascade(options);
+        expect(result.refusalReason?.reason).toBe('open-pr-lookup-failed');
+        expect(fires).toBe(1);
+        expect(lookups).toBe(2);
+      } finally {
+        lookupSpy.mockRestore();
+        if (previous === undefined) delete process.env.SMART_CAULDRON_HERMETIC;
+        else process.env.SMART_CAULDRON_HERMETIC = previous;
+      }
+    });
+  }
+
   test('Test 3: open_pr_blocks_new_tier (runs even under allowClaimed)', async () => {
     const fires: string[] = [];
     const record = await runCascade(

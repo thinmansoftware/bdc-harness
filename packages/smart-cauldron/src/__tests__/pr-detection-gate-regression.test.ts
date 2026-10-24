@@ -34,18 +34,36 @@
  *              (fail-closed; the fix must NOT fail-open).
  */
 
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 
-import { ghPrListForBranchDefault, pollForTerminal } from '../poll.js';
-import { judgeGate } from '../judge.js';
-import { runCascade } from '../cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import type { FireResult } from '../types.js';
 
-const originalFetch = globalThis.fetch;
+if (Reflect.get(globalThis, Symbol.for('bdc.pr-detection-isolated')) !== true) {
+  throw new Error('PR_DETECTION_ISOLATION_PRELOAD_REQUIRED');
+}
+const guardedConnection = await import('@archon/core/db/connection');
+const canonicalConnection = await import('../../../core/src/db/connection');
+if (
+  Reflect.get(guardedConnection, '__PR_DETECTION_GUARD__') !== true ||
+  Reflect.get(canonicalConnection, '__PR_DETECTION_GUARD__') !== true ||
+  guardedConnection.getDatabase !== canonicalConnection.getDatabase
+) {
+  throw new Error('PR_DETECTION_CONNECTION_GUARD_REQUIRED');
+}
+const { ghPrListForBranchDefault, pollForTerminal } = await import('../poll.js');
+const { judgeGate } = await import('../judge.js');
+const { runCascade } = await import('../cascade.js');
 
+const { setSyntheticResponse, takeDeniedFallbacks } =
+  await import('./pr-detection-isolation.preload');
+const { resetGitHubApiMeterForTests } = await import('@archon/core/github/metering');
+
+beforeEach(resetGitHubApiMeterForTests);
 afterEach(() => {
-  globalThis.fetch = originalFetch;
+  resetGitHubApiMeterForTests();
+  setSyntheticResponse();
+  expect(takeDeniedFallbacks()).toEqual([]);
 });
 
 // A completed-run API response carrying the given events.
@@ -120,14 +138,15 @@ function simulateEventualConsistency(emptyResponses: number, url: string) {
 describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
   test('reads an explicit PR_URL from node_output', async () => {
     const url = 'https://github.com/thinmansoftware/bdc-harness/pull/900';
-    globalThis.fetch = (async () =>
+    setSyntheticResponse(() =>
       completedRun([
         {
           event_type: 'node_completed',
           step_name: 'open-pr-if-needed',
           data: { node_output: `PR_URL=${url}` },
         },
-      ])) as unknown as typeof fetch;
+      ])
+    );
 
     const result = await pollForTerminal({
       runId: 'run-node-output-explicit',
@@ -139,7 +158,7 @@ describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
   });
 
   test('reads the live bare GitHub pull URL shape from node_output', async () => {
-    globalThis.fetch = (async () => completedRun([liveOpenPrEvent])) as unknown as typeof fetch;
+    setSyntheticResponse(() => completedRun([liveOpenPrEvent]));
 
     const result = await pollForTerminal({
       runId: 'run-node-output-bare',
@@ -151,7 +170,7 @@ describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
   });
 
   test('ignores non-GitHub URLs and GitHub pull URLs from non-PR nodes', async () => {
-    globalThis.fetch = (async () =>
+    setSyntheticResponse(() =>
       completedRun([
         {
           event_type: 'node_completed',
@@ -163,12 +182,14 @@ describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
           step_name: 'publish-result',
           data: { node_output: 'https://github.com/thinmansoftware/bdc-harness/pull/898' },
         },
-      ])) as unknown as typeof fetch;
+      ])
+    );
 
     let ghCalls = 0;
     const result = await pollForTerminal({
       runId: 'run-decoys',
       apiBaseUrl: 'http://archon.test',
+      checkPrMergeable: async () => true,
       prRetryAttempts: 0,
       ghPrListForBranch: async () => {
         ghCalls++;
@@ -185,8 +206,7 @@ describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
     // Run completed, pushed its branch, but opened no open-pr NODE event and the
     // gh pr list REST path is briefly empty. The event-feed retries find nothing;
     // the branch lookup must retry and then succeed.
-    globalThis.fetch = (async () =>
-      completedRun([commitPushEvent(UNIQUE_BRANCH)])) as unknown as typeof fetch;
+    setSyntheticResponse(() => completedRun([commitPushEvent(UNIQUE_BRANCH)]));
 
     const prUrl = 'https://github.com/thinmansoftware/lspro-react/pull/515';
     const gh = simulateEventualConsistency(1, prUrl);
@@ -201,6 +221,7 @@ describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
       prBranchLookupAttempts: 3,
       prBranchLookupDelayMs: 1,
       ghPrListForBranch: gh.lookup,
+      checkPrMergeable: async () => true,
     });
 
     expect(result.prUrl).toBe(prUrl);
@@ -211,8 +232,7 @@ describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
   });
 
   test('Scenario 3: PR attributed to the run via the pushed unique_branch value', async () => {
-    globalThis.fetch = (async () =>
-      completedRun([commitPushEvent(UNIQUE_BRANCH)])) as unknown as typeof fetch;
+    setSyntheticResponse(() => completedRun([commitPushEvent(UNIQUE_BRANCH)]));
 
     const prUrl = 'https://github.com/thinmansoftware/lspro-react/pull/513';
     const gh = simulateEventualConsistency(0, prUrl);
@@ -227,6 +247,7 @@ describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
       prBranchLookupAttempts: 3,
       prBranchLookupDelayMs: 1,
       ghPrListForBranch: gh.lookup,
+      checkPrMergeable: async () => true,
     });
 
     expect(result.prUrl).toBe(prUrl);
@@ -236,8 +257,7 @@ describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
   });
 
   test('Scenario 4: genuine no-PR after retries exhausted -> verdict stays no-PR (fail-closed)', async () => {
-    globalThis.fetch = (async () =>
-      completedRun([commitPushEvent(UNIQUE_BRANCH)])) as unknown as typeof fetch;
+    setSyntheticResponse(() => completedRun([commitPushEvent(UNIQUE_BRANCH)]));
 
     // gh pr list is empty on EVERY attempt -- the run really opened no PR.
     let calls = 0;
@@ -256,6 +276,7 @@ describe('findExistingPrForBranch retry/backoff (issue #1502)', () => {
       prBranchLookupAttempts: 3,
       prBranchLookupDelayMs: 1,
       ghPrListForBranch: lookup,
+      checkPrMergeable: async () => true,
     });
 
     expect(result.prUrl).toBeNull();
@@ -279,7 +300,8 @@ describe('default gh branch lookup', () => {
       async (command, args) => {
         invocation = { command, args };
         return { stdout: `${url}\n`, stderr: '' };
-      }
+      },
+      async () => ({ env: {}, poolId: 'test:synthetic' })
     );
 
     expect(result).toBe(url);
@@ -327,7 +349,29 @@ function baseOpts(deps: CascadeDeps): RunCascadeOptions {
     outDir: '/tmp/smart-cauldron-1502-test-runs',
     token: 'test-token',
     project: 'lspro-react',
-    deps,
+    apiBaseUrl: 'http://archon.test',
+    deps: {
+      fetchNodeTimeouts: async () => ({}),
+      cancel: async () => {
+        throw new Error('unexpected fixture cancellation');
+      },
+      findWoClaim: async () => null,
+      acquireWoLock: async (woId, project, cascadeId) => ({
+        acquired: true,
+        path: 'in-memory-fixture',
+        record: {
+          woId,
+          project,
+          cascadeId,
+          status: 'running',
+          createdAt: new Date(0).toISOString(),
+          updatedAt: new Date(0).toISOString(),
+        },
+      }),
+      releaseWoLock: async () => {},
+      findBlockingOpenPrs: async () => [],
+      ...deps,
+    },
   };
 }
 
@@ -351,12 +395,13 @@ function realPollDep(ghLookup: (branch: string) => Promise<string | null>): Casc
       prBranchLookupAttempts: 3,
       prBranchLookupDelayMs: 1,
       ghPrListForBranch: ghLookup,
+      checkPrMergeable: async () => true,
     });
 }
 
 describe('cascade does not climb when the completed run landed a PR (issue #1502)', () => {
   test('Scenario 1: PR present on the run event feed -> wins on entry tier, no climb', async () => {
-    globalThis.fetch = (async () => completedRun([openPrEvent])) as unknown as typeof fetch;
+    setSyntheticResponse(() => completedRun([openPrEvent]));
 
     let fireCalls = 0;
     const deps: CascadeDeps = {
@@ -378,11 +423,7 @@ describe('cascade does not climb when the completed run landed a PR (issue #1502
   });
 
   test('live node_output event shape wins on entry tier without climbing', async () => {
-    globalThis.fetch = (async () =>
-      completedRun([
-        liveCommitPushEvent(UNIQUE_BRANCH),
-        liveOpenPrEvent,
-      ])) as unknown as typeof fetch;
+    setSyntheticResponse(() => completedRun([liveCommitPushEvent(UNIQUE_BRANCH), liveOpenPrEvent]));
 
     let fireCalls = 0;
     const deps: CascadeDeps = {
@@ -404,8 +445,7 @@ describe('cascade does not climb when the completed run landed a PR (issue #1502
   });
 
   test('Scenario 2: PR found only after the branch-lookup retry -> still wins on entry tier, no climb', async () => {
-    globalThis.fetch = (async () =>
-      completedRun([commitPushEvent(UNIQUE_BRANCH)])) as unknown as typeof fetch;
+    setSyntheticResponse(() => completedRun([commitPushEvent(UNIQUE_BRANCH)]));
 
     // Eventual consistency: gh pr list is empty on the first call, then finds the PR.
     const gh = simulateEventualConsistency(
@@ -433,8 +473,7 @@ describe('cascade does not climb when the completed run landed a PR (issue #1502
   });
 
   test('Scenario 4: genuine no-PR -> ladder climbs (fail-closed, true negative preserved)', async () => {
-    globalThis.fetch = (async () =>
-      completedRun([commitPushEvent(UNIQUE_BRANCH)])) as unknown as typeof fetch;
+    setSyntheticResponse(() => completedRun([commitPushEvent(UNIQUE_BRANCH)]));
 
     let fireCalls = 0;
     const deps: CascadeDeps = {
