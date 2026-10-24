@@ -40,6 +40,47 @@ const reviewIds = [
 const bindingKeys = new Set(['provider', 'model', 'persona', 'agent']);
 const withoutBindings = (node: Node): Record<string, unknown> =>
   Object.fromEntries(Object.entries(node).filter(([key]) => !bindingKeys.has(key)));
+const codexOnlyRecoveryIds = new Set([
+  'commit-hook-repair',
+  'classify-commit-hook-repair',
+  'commit-and-push-retry',
+  'commit-hook-terminal',
+]);
+const baselineNodesForAstra = baseline.nodes
+  .filter(node => !codexOnlyRecoveryIds.has(node.id))
+  .map(node => {
+    if (node.id === 'open-pr-if-needed' && typeof node.bash === 'string') {
+      // Astra has no Codex-only hook retry. Normalize only that exact consumer
+      // delta; all other opener behavior and gates still compare byte-for-byte.
+      return {
+        ...node,
+        depends_on: ['commit-and-push', 'repair-gate'],
+        bash: node.bash
+          .replace(
+            '# The first hook failure has no branch output; the successful bounded\n# retry owns the final branch and refreshed remote lease.\n',
+            ''
+          )
+          .replace(
+            /if \[ -f "\$ARCHON_NODE_OUT\/commit-and-push-retry.out" \]; then\n  COMMIT_PUSH_OUTPUT=.*\nfi\n/,
+            ''
+          )
+          .replace(
+            "| sed -n 's/^unique_branch=//p' | tail -n 1)",
+            "| sed -n 's/^unique_branch=//p' | head -n 1)"
+          ),
+      };
+    }
+    if (node.id === 'commit-and-push' && typeof node.bash === 'string') {
+      return {
+        ...node,
+        bash: node.bash.replace(
+          /git status --short\nWO_ID=.*?bash "\$ARTIFACTS_DIR\/commit-and-push\.sh" 1\nexit 0\nDIRTY=/s,
+          'git status --short\nDIRTY='
+        ),
+      };
+    }
+    return node;
+  });
 // Only model attribution text may differ inside a prompt or shell body.
 const attributionChanges = [
   [
@@ -70,7 +111,7 @@ describe('Astra build / Fable review lane', () => {
     expect(parsed.error).toBeNull();
     expect(parsed.workflow).toBeDefined();
     const expected = JSON.parse(
-      JSON.stringify(baseline.nodes.map(withoutBindings)),
+      JSON.stringify(baselineNodesForAstra.map(withoutBindings)),
       (_key, value: unknown) =>
         typeof value === 'string'
           ? attributionChanges.reduce(

@@ -39,6 +39,10 @@ export interface DecisionResult {
   reason: string;
   /** Suggested backoff in ms if decision is retry */
   backoffMs?: number;
+  /** The lane may consume its single bounded repair pass for this failure. */
+  repairableOnce?: boolean;
+  /** The failure requires XO visibility in addition to Duty Officer notification. */
+  blocker?: boolean;
   /**
    * Optional structured payload for the escalation handler. Populated for the
    * silent-dead-end classes (implement_loop_no_output, validator_feedback_not_applied,
@@ -87,6 +91,19 @@ export function decide(input: DecideInput): DecisionResult {
   const { errorClass, attempt, hasOutput, validatorOutput, woId, nodeId } = input;
 
   switch (errorClass) {
+    // commit_hook_lint_failure is deliberately still an escalate decision: the
+    // lane consumes the one repair marker while Dispatch retains visibility.
+    case 'commit_hook_lint_failure':
+      return {
+        decision: 'escalate',
+        reason:
+          attempt >= 2
+            ? 'pre-commit lint or format hook failed after the single repair pass'
+            : 'pre-commit lint or format hook failed; one bounded repair pass is available',
+        repairableOnce: attempt < 2,
+        blocker: attempt >= 2,
+      };
+
     case 'rate_limit_exceeded':
       if (attempt < 3) {
         return {

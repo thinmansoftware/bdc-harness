@@ -40,7 +40,7 @@ const windowsFailure: PrReviewCheck = {
 };
 
 function modelOutput(verdict: 'APPROVE' | 'REQUEST_CHANGES', findings: unknown[] = []): string {
-  return JSON.stringify({ verdict, findings, reviewed_head_sha: HEAD });
+  return JSON.stringify({ verdict, verification: 'verified', findings, reviewed_head_sha: HEAD });
 }
 
 function deps(

@@ -17,7 +17,13 @@
  */
 import { randomUUID } from 'node:crypto';
 import * as dispatch from '@archon/core/db/dispatch';
-import { claimOverseerVerdict, finalizeOverseerVerdict } from '@archon/core/db/overseer';
+import {
+  claimOverseerVerdict,
+  finalizeOverseerVerdict,
+  reviseOverseerReviewVerdict,
+  recordUnverifiedApprovalEvidence,
+  resolveUnverifiedApprovalEvidence,
+} from '@archon/core/db/overseer';
 import { createLogger } from '@archon/paths';
 import {
   createRealFetchExactHeadPullRequestEvidence,
@@ -47,6 +53,7 @@ import {
 import { createJudgeLadderBreaker, recordJudgeRungOutage } from './judge-ladder-health';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
+import { redactFailureText } from './node-failure-notify';
 import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
 import {
   countPriorRemediationAttempts,
@@ -80,35 +87,81 @@ export function reviewRecordsVerdictEnabled(
 interface ReviewApprovalVerdictDeps {
   claimVerdict: typeof claimOverseerVerdict;
   finalizeVerdict: typeof finalizeOverseerVerdict;
+  reviseVerdict?: typeof reviseOverseerReviewVerdict;
+  persistUnverifiedEvidence: typeof recordUnverifiedApprovalEvidence;
+  resolveUnverifiedEvidence: typeof resolveUnverifiedApprovalEvidence;
 }
 
 export async function recordReviewApprovalVerdict(
-  input: { owner: string; repo: string; prNumber: number; headSha: string; model?: string },
+  input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    messageId?: string;
+    model?: string;
+    disposition?: string;
+    verification?: 'verified' | 'unverified';
+  },
   deps: ReviewApprovalVerdictDeps = {
     claimVerdict: claimOverseerVerdict,
     finalizeVerdict: finalizeOverseerVerdict,
+    reviseVerdict: reviseOverseerReviewVerdict,
+    persistUnverifiedEvidence: recordUnverifiedApprovalEvidence,
+    resolveUnverifiedEvidence: resolveUnverifiedApprovalEvidence,
   }
 ): Promise<void> {
   const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}`;
+  const prUrl = `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`;
+  const evidence = { runId, headSha: input.headSha, prUrl, reviewId: input.messageId };
+  // A positive string alone must never clear a hold or create merge authority.
+  // Legacy or injected approvals without explicit verification fail closed.
+  if (
+    input.disposition &&
+    input.disposition !== 'approved' &&
+    input.disposition !== 'approved_unverified'
+  )
+    return;
+  const unverified =
+    input.disposition === 'approved_unverified' || input.verification !== 'verified';
+  if (
+    unverified &&
+    !(await deps.persistUnverifiedEvidence({
+      ...evidence,
+      reviewId: input.messageId ?? 'legacy',
+    }))
+  )
+    return;
+  const resolved = !unverified ? await deps.resolveUnverifiedEvidence(evidence) : 0;
   const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
-  if (!claim.claimed || !claim.verdictId) return;
+  if (!claim.claimed || !claim.verdictId) {
+    await deps.reviseVerdict?.({
+      runId,
+      headSha: input.headSha,
+      unverified,
+      allowUnverifiedResolution: resolved > 0,
+    });
+    return;
+  }
   await deps.finalizeVerdict({
     verdictId: claim.verdictId,
     status: 'verdict',
-    verdict: 'merge_candidate',
-    proposedAction: 'flag_merge_ready',
+    verdict: unverified ? 'approved_unverified' : 'merge_candidate',
+    proposedAction: unverified ? 'none' : 'flag_merge_ready',
     model: input.model,
-    prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
+    prUrl,
   });
 }
 
 export async function maybeRecordReviewApprovalVerdict(
   input: {
     disposition: string;
+    verification?: 'verified' | 'unverified';
     owner: string;
     repo: string;
     prNumber: number;
     headSha: string;
+    messageId?: string;
     model?: string;
   },
   options: {
@@ -117,7 +170,11 @@ export async function maybeRecordReviewApprovalVerdict(
     onError?: (error: unknown) => void;
   } = {}
 ): Promise<void> {
-  if (input.disposition !== 'approved' || !reviewRecordsVerdictEnabled(options.env)) return;
+  if (
+    (input.disposition !== 'approved' && input.disposition !== 'approved_unverified') ||
+    !reviewRecordsVerdictEnabled(options.env)
+  )
+    return;
   try {
     await (options.record ?? recordReviewApprovalVerdict)(input);
   } catch (error) {
@@ -1029,6 +1086,9 @@ export function createRealSubmitDeps(
         result.verdict === 'INDETERMINATE' ? reviewErrorCode(result.error) : null;
       return {
         approved: result.verdict === 'APPROVE',
+        approvedUnverified: result.verdict === 'APPROVE_UNVERIFIED',
+        ...(result.verification ? { verification: result.verification } : {}),
+        ...(result.verification_reason ? { verificationReason: result.verification_reason } : {}),
         summary,
         reviewedHeadSha: result.reviewed_head_sha,
         // Structured findings ride alongside the flattened summary so
@@ -1037,6 +1097,14 @@ export function createRealSubmitDeps(
         findings: result.findings,
         ...(indeterminateCode ? { reasonCode: indeterminateCode } : {}),
       };
+    },
+    async recordUnverifiedApproval(work): Promise<void> {
+      await (overrides.recordApprovalVerdict ?? recordReviewApprovalVerdict)({
+        ...work,
+        disposition: 'approved_unverified',
+        verification: 'unverified',
+        model: modelReviewer.model,
+      });
     },
     submitReview: createRealSubmitPullRequestReview(octokit),
     async currentHeadSha(input): Promise<string> {
@@ -1053,6 +1121,85 @@ export function createRealSubmitDeps(
       // additionally logs at error level and marks the body `needsOperator` so
       // a blocked-for-permissions PR is not just one more receipt in the list.
       const blocked = input.disposition === 'blocked_required_contexts_unavailable';
+      if (input.disposition === 'approved_unverified') {
+        log.warn(
+          {
+            owner: input.owner,
+            repo: input.repo,
+            pr: input.prNumber,
+            headSha: input.headSha,
+            reason: input.reason,
+          },
+          'overseer.review.approved_unverified'
+        );
+        const subjectKey = reviewSubjectKey(input.owner, input.repo, input.prNumber);
+        const prior = await dispatch.listMessages({
+          recipient: 'operator',
+          subject_key: subjectKey,
+        });
+        const priorUnverified = prior.filter(message => {
+          try {
+            const body = JSON.parse(message.body) as { disposition?: unknown; headSha?: unknown };
+            return body.disposition === 'approved_unverified' && body.headSha === input.headSha;
+          } catch {
+            return false;
+          }
+        });
+        const safeReason = redactFailureText(input.reason ?? 'verification unavailable').slice(
+          0,
+          300
+        );
+        if (priorUnverified.length === 0) {
+          await dispatch.createAuthenticatedMessage(
+            { kind: 'system', sender: REVIEW_SENDER },
+            {
+              correlation_id: input.headSha,
+              idempotency_key: `overseer-review-unverified-retry:${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}`,
+              task_type: 'run_review',
+              recipient: 'overseer-reviewer',
+              subject_key: subjectKey,
+              repeat_reason: 'unverified_approval_retry',
+              body: JSON.stringify({
+                owner: input.owner,
+                repo: input.repo,
+                prNumber: input.prNumber,
+                headSha: input.headSha,
+                baseRef: '',
+                author: '',
+                headCiGreen: true,
+              }),
+            }
+          );
+        } else {
+          let firstReason = 'verification unavailable';
+          try {
+            const body = JSON.parse(priorUnverified[0].body) as { reason?: unknown };
+            if (typeof body.reason === 'string') firstReason = body.reason;
+          } catch {
+            // Keep the safe fallback; malformed historical receipts cannot block escalation.
+          }
+          try {
+            await dispatch.createAuthenticatedMessage(
+              { kind: 'system', sender: REVIEW_SENDER },
+              {
+                correlation_id: input.headSha,
+                idempotency_key: `overseer-review-unverified:${input.owner}/${input.repo}#${input.prNumber}:${input.headSha}`,
+                repeat_reason: 'unverified_approval_retry_exhausted',
+                task_type: 'agent_message',
+                recipient: 'duty-officer',
+                priority: 'normal',
+                subject_key: subjectKey,
+                body: `Repeated unverified approval for ${input.owner}/${input.repo} PR #${input.prNumber} at ${input.headSha}. First: ${redactFailureText(firstReason).slice(0, 300)}. Retry: ${safeReason}.`,
+              }
+            );
+          } catch (error) {
+            log.error(
+              { error, pr: input.prNumber, headSha: input.headSha },
+              'overseer.review.unverified_notify_failed'
+            );
+          }
+        }
+      }
       await maybeRecordReviewApprovalVerdict(
         { ...input, model: modelReviewer.model },
         {

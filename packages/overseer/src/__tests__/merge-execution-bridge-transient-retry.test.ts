@@ -44,6 +44,7 @@ function makeHarness(rows: OverseerVerdictRow[], evidence: () => PullRequestEvid
   const releases: string[] = [];
   let merges = 0;
   const store: MergeExecutionBridgeStore = {
+    hasUnverifiedApprovalForHead: async () => false,
     listUnactionedVerdicts: async () =>
       rows.filter(
         row =>

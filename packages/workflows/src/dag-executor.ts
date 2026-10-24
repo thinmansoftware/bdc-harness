@@ -72,6 +72,7 @@ import type { GateResult } from './event-emitter';
 import type { IWorkflowStore } from './store';
 import { detectSilentFailure } from './silent-failure-detector';
 import { handleNodeFailure } from './overseer-bridge';
+import { classifyError as classifyOverseerError } from '@archon/overseer';
 import { evaluateCondition } from './condition-evaluator';
 import {
   logNodeStart,
@@ -808,7 +809,7 @@ function isTransientNodeError(errorMessage: string): boolean {
  * True when a node error message is the SDK success-contradiction
  * (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01). The throw site formats it as
  * `Node '<id>' failed: SDK returned success...`; the outer retry loop uses this
- * to grant the node exactly one extra re-run, independent of the transient budget.
+ * to apply the bounded contradiction retry policy separately from transient retries.
  */
 function isSdkSuccessContradiction(errorMessage: string): boolean {
   return /failed: SDK returned success\b/.test(errorMessage);
@@ -994,6 +995,14 @@ function getTokenTotal(tokens: TokenUsage | undefined): number | undefined {
 function hasPositiveUsage(tokens: TokenUsage | undefined, cost: number | undefined): boolean {
   const tokenTotal = getTokenTotal(tokens);
   return (tokenTotal !== undefined && tokenTotal > 0) || (cost !== undefined && cost > 0);
+}
+
+export const SDK_CONTRADICTION_BACKOFF_MAX_TOTAL_MS = 240_000;
+const SDK_CONTRADICTION_BACKOFFS_MS = [30_000, 120_000] as const;
+
+function sdkContradictionWaitMs(baseMs: number, random: () => number): number {
+  const factor = Math.min(1.2, Math.max(0.8, 0.8 + random() * 0.4));
+  return Math.round(baseMs * factor);
 }
 
 function stringifySdkFields(msg: {
@@ -3196,7 +3205,8 @@ async function executeBashNode(
   nodeOutputs: Map<string, NodeOutput>,
   issueContext?: string,
   envVars?: Record<string, string>,
-  resolvedInputs?: Record<string, string>
+  resolvedInputs?: Record<string, string>,
+  hookRecoveryInvocationId?: string
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3273,6 +3283,12 @@ async function executeBashNode(
     ARCHON_NODE_OUT: join(artifactsDir || tmpdir(), 'node-out'),
     ...inputEnvVars,
     ...(envVars ?? {}),
+    ...(hookRecoveryInvocationId
+      ? {
+          HARNESS_HOOK_RECOVERY_RUN_ID: workflowRun.id,
+          HARNESS_HOOK_RECOVERY_INVOCATION_ID: hookRecoveryInvocationId,
+        }
+      : {}),
   };
 
   const safeNodeId = node.id.replace(/[^A-Za-z0-9._-]/g, '_');
@@ -5539,6 +5555,9 @@ async function executeDagWorkflowInternal(
   };
   const layers = buildTopologicalLayers(workflow.nodes);
   const nodeOutputs = new Map<string, NodeOutput>();
+  const hookRecoveryInvocationId =
+    workflow.name === 'bdc-feature-development-codex' ? randomUUID() : undefined;
+  const freshHookBashNodes = new Set<string>();
 
   // Pre-populate nodeOutputs from prior run so already-completed nodes are
   // treated as done for trigger-rule and $nodeId.output substitution purposes.
@@ -5811,6 +5830,12 @@ async function executeDagWorkflowInternal(
 
           // 3a. Bash node dispatch -- no AI, no session
           if (isBashNode(node)) {
+            const hookInvocation =
+              hookRecoveryInvocationId &&
+              ['commit-and-push', 'commit-and-push-retry', 'commit-hook-terminal'].includes(node.id)
+                ? hookRecoveryInvocationId
+                : undefined;
+            if (hookInvocation) freshHookBashNodes.add(node.id);
             const output = await executeBashNode(
               deps,
               platform,
@@ -5825,7 +5850,8 @@ async function executeDagWorkflowInternal(
               nodeOutputs,
               issueContext,
               config.envVars,
-              resolvedInputs
+              resolvedInputs,
+              hookInvocation
             );
             return { nodeId: node.id, output };
           }
@@ -6093,16 +6119,19 @@ async function executeDagWorkflowInternal(
           };
 
           // SDK success-contradiction (isError=true AND errorSubtype='success')
-          // earns exactly one extra whole-node re-run, independent of the
-          // transient-retry budget (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01).
+          // gets a separate bounded budget: up to two delayed retries for
+          // positive-token truncated output, or the existing one immediate
+          // retry for zero-token contradictions.
           // The transient loop below explicitly excludes the contradiction from
           // its budget (see `isContradiction`), so regardless of the node's
           // on_error setting this outer re-entry is the ONLY thing that retries
-          // it -- exactly once. A contradiction whose errors[] text also matches
+          // it. A contradiction whose errors[] text also matches
           // a FATAL pattern (auth/permission/credit-balance) is NOT re-run: the
           // FATAL guard on the outer check below preserves the "FATAL is never
           // retried" invariant.
-          let sdkContradictionRetryUsed = false;
+          let sdkContradictionExecutions = 1;
+          let sdkContradictionBackoffRetries = 0;
+          let sdkContradictionBackoffTotalMs = 0;
           sdkContradictionRetry: for (;;) {
             for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
               output = await executeNodeInternal(
@@ -6142,10 +6171,9 @@ async function executeDagWorkflowInternal(
               const isQuotaExhausted = output.quotaExhausted !== undefined;
               // SDK success-contradictions are NEVER retried by this transient
               // budget -- the outer `sdkContradictionRetry` loop grants them
-              // exactly one whole-node re-run. Without this exclusion,
+              // its separate bounded retries. Without this exclusion,
               // on_error:'all' would retry the contradiction maxRetries times
-              // here AND trigger the outer re-run, doubling the promised single
-              // extra execution to up to 2*(maxRetries+1) node runs.
+              // here AND trigger the outer retries, multiplying both budgets.
               const isContradiction = output.error
                 ? isSdkSuccessContradiction(output.error)
                 : false;
@@ -6184,19 +6212,69 @@ async function executeDagWorkflowInternal(
 
             if (
               output.state === 'failed' &&
-              !sdkContradictionRetryUsed &&
               output.error !== undefined &&
               isSdkSuccessContradiction(output.error) &&
               // FATAL errors (auth/permission/credit-balance) are never retried,
               // even when they arrive dressed as a success-contradiction.
               classifyError(new Error(output.error)) !== 'FATAL'
             ) {
-              sdkContradictionRetryUsed = true;
-              getLog().warn({ nodeId: node.id }, 'dag.sdk_contradiction_retry');
+              const tokens = output.tokens;
+              const positiveTokens = (tokens?.input ?? 0) + (tokens?.output ?? 0) > 0;
+              if (positiveTokens) {
+                if (sdkContradictionBackoffRetries >= SDK_CONTRADICTION_BACKOFFS_MS.length) break;
+                const baseMs = SDK_CONTRADICTION_BACKOFFS_MS[sdkContradictionBackoffRetries];
+                const jittered = sdkContradictionWaitMs(baseMs, deps.random ?? Math.random);
+                const remaining =
+                  SDK_CONTRADICTION_BACKOFF_MAX_TOTAL_MS - sdkContradictionBackoffTotalMs;
+                if (remaining <= 0) break;
+                const waitMs = Math.min(jittered, remaining);
+                sdkContradictionBackoffRetries += 1;
+                sdkContradictionBackoffTotalMs += waitMs;
+                getLog().warn(
+                  {
+                    nodeId: node.id,
+                    class: 'truncated_nonzero',
+                    tokens: { input: tokens?.input ?? 0, output: tokens?.output ?? 0 },
+                    waitMs,
+                    retryIndex: sdkContradictionBackoffRetries,
+                  },
+                  'dag.sdk_contradiction_backoff'
+                );
+                let waitRemaining = waitMs;
+                let cancelled = false;
+                while (waitRemaining > 0) {
+                  const slice = Math.min(waitRemaining, 1000);
+                  await (
+                    deps.sleep ??
+                    ((ms: number): Promise<void> =>
+                      new Promise(resolve => {
+                        setTimeout(resolve, ms);
+                      }))
+                  )(slice);
+                  waitRemaining -= slice;
+                  if (
+                    deps.isRunLeaseValid?.() === false ||
+                    (await deps.store.getWorkflowRunStatus(workflowRun.id)) === 'cancelled'
+                  ) {
+                    cancelled = true;
+                    break;
+                  }
+                }
+                if (cancelled) break;
+              } else {
+                // Preserve the historical one immediate retry only when the first
+                // execution itself had the zero-token engine-dark signature.
+                if (sdkContradictionExecutions !== 1) break;
+                getLog().warn(
+                  { nodeId: node.id, class: 'zero_token' },
+                  'dag.sdk_contradiction_retry'
+                );
+              }
+              sdkContradictionExecutions += 1;
               await safeSendMessage(
                 platform,
                 conversationId,
-                `! Node \`${node.id}\` hit an SDK success-contradiction (isError + subtype 'success'); retrying once.`,
+                `! Node \`${node.id}\` hit an SDK success-contradiction (isError + subtype 'success'); retrying within the bounded policy.`,
                 { workflowId: workflowRun.id, nodeName: node.id }
               );
               continue sdkContradictionRetry;
@@ -6496,7 +6574,133 @@ async function executeDagWorkflowInternal(
     else if (o.state === 'skipped') nodeCounts.skipped++;
   }
   const anyCompleted = nodeCounts.completed > 0;
-  const anyFailed = nodeCounts.failed > 0;
+  const failedNodeIds = [...nodeOutputs.entries()]
+    .filter(([, output]) => output.state === 'failed')
+    .map(([id]) => id);
+
+  // Keep historical failures intact. Only the exact Codex hook-recovery chain
+  // can satisfy its sole initial failure with fresh mechanical push evidence.
+  const hookRecovery = ((): {
+    node_id: 'commit-and-push';
+    retry_node_id: 'commit-and-push-retry';
+    terminal_node_id: 'commit-hook-terminal';
+    run_id: string;
+    invocation_id: string;
+    branch: string;
+    head_sha: string;
+  } | null => {
+    if (
+      !hookRecoveryInvocationId ||
+      failedNodeIds.length !== 1 ||
+      failedNodeIds[0] !== 'commit-and-push'
+    )
+      return null;
+    const initial = nodeOutputs.get('commit-and-push');
+    const retry = nodeOutputs.get('commit-and-push-retry');
+    const terminal = nodeOutputs.get('commit-hook-terminal');
+    const repairVerdict = evaluateCondition(
+      "$classify-commit-hook-repair.output.verdict == 'fixed' || $classify-commit-hook-repair.output.verdict == 'already_satisfied'",
+      nodeOutputs
+    );
+    const repairAuthorization = evaluateCondition(
+      "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'",
+      nodeOutputs
+    );
+    if (
+      initial?.state !== 'failed' ||
+      retry?.state !== 'completed' ||
+      terminal?.state !== 'completed' ||
+      classifyOverseerError({ nodeId: 'commit-and-push', message: initial.error }) !==
+        'commit_hook_lint_failure' ||
+      !['commit-and-push', 'commit-and-push-retry', 'commit-hook-terminal'].every(id =>
+        freshHookBashNodes.has(id)
+      ) ||
+      nodeOutputs.get('commit-hook-repair')?.state !== 'completed' ||
+      nodeOutputs.get('classify-commit-hook-repair')?.state !== 'completed' ||
+      !repairVerdict.parsed ||
+      !repairVerdict.result ||
+      !repairAuthorization.parsed ||
+      !repairAuthorization.result
+    )
+      return null;
+    for (const [id, parent] of [
+      ['commit-and-push-retry', 'classify-commit-hook-repair'],
+      ['commit-hook-terminal', 'commit-and-push-retry'],
+    ] as const) {
+      const node = workflow.nodes.find(candidate => candidate.id === id);
+      if (
+        !node ||
+        !isBashNode(node) ||
+        !node.depends_on?.includes(parent) ||
+        !node.depends_on.includes('repair-gate')
+      )
+        return null;
+    }
+    for (const [id, parent] of [
+      ['commit-hook-repair', 'commit-and-push'],
+      ['classify-commit-hook-repair', 'commit-hook-repair'],
+    ] as const) {
+      const node = workflow.nodes.find(candidate => candidate.id === id);
+      if (!node?.depends_on?.includes(parent) || !node.depends_on.includes('repair-gate'))
+        return null;
+    }
+    const proof = new Map<string, string>();
+    const fields = [
+      'RUN_ID',
+      'INVOCATION_ID',
+      'ATTEMPT',
+      'ELIGIBILITY',
+      'BRANCH',
+      'HEAD_SHA',
+      'VERIFIED',
+    ];
+    for (const line of terminal.output.split(/\r?\n/)) {
+      if (!line.startsWith('HOOK_RECOVERY_')) continue;
+      const match = /^HOOK_RECOVERY_([A-Z_]+)=(.*)$/.exec(line);
+      if (!match || !fields.includes(match[1]) || proof.has(match[1])) return null;
+      proof.set(match[1], match[2]);
+    }
+    const branch = proof.get('BRANCH');
+    const sha = proof.get('HEAD_SHA');
+    if (
+      proof.size !== fields.length ||
+      proof.get('RUN_ID') !== workflowRun.id ||
+      proof.get('INVOCATION_ID') !== hookRecoveryInvocationId ||
+      proof.get('ATTEMPT') !== '2' ||
+      proof.get('ELIGIBILITY') !== 'consumed' ||
+      proof.get('VERIFIED') !== 'yes' ||
+      !branch ||
+      /\s/.test(branch) ||
+      !sha ||
+      !/^[0-9a-f]{40}$/.test(sha)
+    )
+      return null;
+    const retryLines = retry.output.split(/\r?\n/);
+    if (
+      retryLines.filter(line => line.startsWith('unique_branch=')).length !== 1 ||
+      !retryLines.includes(`unique_branch=${branch}`) ||
+      retryLines.filter(line => line.startsWith('VERIFIED: origin/')).length !== 1 ||
+      !retryLines.includes(`VERIFIED: origin/${branch} == local HEAD (${sha})`)
+    )
+      return null;
+    return {
+      node_id: 'commit-and-push',
+      retry_node_id: 'commit-and-push-retry',
+      terminal_node_id: 'commit-hook-terminal',
+      run_id: workflowRun.id,
+      invocation_id: hookRecoveryInvocationId,
+      branch,
+      head_sha: sha,
+    };
+  })();
+  const anyFailed = nodeCounts.failed > 0 && hookRecovery === null;
+  const recoveryMetadata = hookRecovery
+    ? {
+        recovered_failed_nodes: ['commit-and-push'],
+        effective_failed_node_count: 0,
+        hook_recovery: hookRecovery,
+      }
+    : {};
 
   const pushArtifactPresent = [...nodeOutputs.values()].some(o => hasPushArtifact(o.output));
   const hasMechanicalEvidenceNode = workflow.nodes.some(isEvidenceNode);
@@ -6522,10 +6726,17 @@ async function executeDagWorkflowInternal(
       executionState,
       deliverableState,
       validationState,
-      recoveryState: executionState === 'failed' ? 'recoverable' : 'not_needed',
+      recoveryState:
+        executionState === 'failed' ? 'recoverable' : hookRecovery ? 'recovered' : 'not_needed',
       routeState: existing?.routeState ?? 'current',
       primaryReason,
-      reasonCodes: [...new Set([primaryReason, ...(existing?.reasonCodes ?? [])])],
+      reasonCodes: [
+        ...new Set([
+          primaryReason,
+          ...(hookRecovery ? ['recovery_completed' as const] : []),
+          ...(existing?.reasonCodes ?? []),
+        ]),
+      ],
       evidenceRefs: [...new Set([`run:${workflowRun.id}`, ...(existing?.evidenceRefs ?? [])])],
     };
   }
@@ -6679,9 +6890,6 @@ async function executeDagWorkflowInternal(
     // failure class tracked in bdc-harness#344. If EITHER condition is false
     // (a non-paperwork node failed, or no artifact exists) the run fails exactly
     // as before -- unchanged behavior.
-    const failedNodeIds = [...nodeOutputs.entries()]
-      .filter(([, o]) => o.state === 'failed')
-      .map(([id]) => id);
     const allFailuresArePaperwork = failedNodeIds.every(id => isPaperworkNode(id));
     if (!hasMechanicalEvidenceNode && allFailuresArePaperwork && pushArtifactPresent) {
       getLog().warn(
@@ -6807,6 +7015,8 @@ async function executeDagWorkflowInternal(
       workflowRun.id,
       {
         node_counts: nodeCounts,
+        ...recoveryMetadata,
+        ...(hookRecovery ? { terminal_cause: 'commit_hook_recovered' } : {}),
         // totalCostUsd starts at 0; only write metadata when at least one node reported cost
         ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
         // totalTokens starts at 0; only write metadata when at least one node reported tokens
@@ -6828,7 +7038,8 @@ async function executeDagWorkflowInternal(
         eventData: {
           duration_ms: duration,
           node_counts: nodeCounts,
-          terminal_cause: 'all_nodes_satisfied',
+          terminal_cause: hookRecovery ? 'commit_hook_recovered' : 'all_nodes_satisfied',
+          ...recoveryMetadata,
         },
       }
     );

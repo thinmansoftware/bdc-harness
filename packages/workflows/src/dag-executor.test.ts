@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, mock, spyOn, type Mock } f
 import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { spawnSync } from 'node:child_process';
 import * as git from '@archon/git';
 
 const isWindows = process.platform === 'win32';
@@ -63,6 +64,7 @@ import { parseWorkflow } from './loader';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import { getWorkflowEventEmitter } from './event-emitter';
+import * as runLease from './run-lease';
 import type { GateResult } from './gate-result';
 
 // --- Mock helpers ---
@@ -8428,6 +8430,8 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
 
     const store = createMockStore();
     const deps = createMockDeps(store);
+    deps.sleep = async (): Promise<void> => undefined;
+    deps.random = (): number => 0.5;
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('validator-failure-run');
 
@@ -14148,6 +14152,319 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
     );
   }
 
+  async function runCommitHookRecoveryScenario(scenario = 'verified'): Promise<{
+    store: IWorkflowStore;
+    events: EventCall[];
+    runGit: (...args: string[]) => string;
+  }> {
+    const repo = join(testDir, 'repo');
+    const remote = join(testDir, 'origin.git');
+    await mkdir(repo);
+    const runGit = (...args: string[]): string => {
+      const result = spawnSync('git', args, {
+        cwd: repo,
+        encoding: 'utf8',
+        windowsHide: true,
+        timeout: 10000,
+      });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout.trim();
+    };
+    runGit('init', '--bare', remote);
+    runGit('init');
+    runGit('config', 'user.name', 'Harness recovery fixture');
+    runGit('config', 'user.email', 'fixture@example.invalid');
+    runGit('remote', 'add', 'origin', remote);
+    await writeFile(join(repo, 'fixture.txt'), 'broken\n');
+    // A real Git pre-commit failure. No external linter or model is needed to
+    // exercise executor finalization; the hook roundtrip suite tests ESLint.
+    await writeFile(
+      join(repo, '.git', 'hooks', 'pre-commit'),
+      '#!/bin/sh\nif [ "$(cat fixture.txt)" != fixed ]; then\n' +
+        "  printf '%s\\n' 'husky - pre-commit script failed' >&2\n  exit 1\nfi\n",
+      { mode: 0o755 }
+    );
+    const lanePath = join(
+      import.meta.dir,
+      '../../../.archon/workflows/defaults/bdc-feature-development-codex.yaml'
+    );
+    const parsed = parseWorkflow(await readFile(lanePath, 'utf8'), lanePath);
+    if (!parsed.workflow) throw new Error(JSON.stringify(parsed.error));
+    const retry = parsed.workflow.nodes?.find(n => n.id === 'commit-and-push-retry');
+    const terminal = parsed.workflow.nodes?.find(n => n.id === 'commit-hook-terminal');
+    if (!retry || !terminal) throw new Error('Hook recovery nodes missing');
+    const helper = join(import.meta.dir, '../../../.archon/scripts/commit-and-push.sh').replaceAll(
+      '\\',
+      '/'
+    );
+    const artifacts = join(testDir, 'artifacts').replaceAll('\\', '/');
+    await mkdir(artifacts);
+    await writeFile(join(artifacts, 'commit-and-push.sh'), await readFile(helper, 'utf8'));
+    let store = createMockStore();
+    const run = makeWorkflowRun();
+    if (!('bash' in terminal)) throw new Error('Terminal is not Bash');
+    let terminalBash = terminal.bash;
+    if (scenario === 'wrong_run')
+      terminalBash = terminalBash.replace(
+        'HOOK_RECOVERY_RUN_ID=$HARNESS_HOOK_RECOVERY_RUN_ID',
+        'HOOK_RECOVERY_RUN_ID=foreign-run'
+      );
+    if (scenario === 'wrong_invocation')
+      terminalBash = terminalBash.replace(
+        'HOOK_RECOVERY_INVOCATION_ID=$HARNESS_HOOK_RECOVERY_INVOCATION_ID',
+        'HOOK_RECOVERY_INVOCATION_ID=old-invocation'
+      );
+    if (scenario === 'wrong_branch')
+      terminalBash = terminalBash.replace(
+        'HOOK_RECOVERY_BRANCH=$UNIQUE_BRANCH',
+        'HOOK_RECOVERY_BRANCH=foreign-branch'
+      );
+    if (scenario === 'wrong_sha')
+      terminalBash = terminalBash.replace(
+        'HOOK_RECOVERY_HEAD_SHA=$LOCAL_HEAD',
+        `HOOK_RECOVERY_HEAD_SHA=${'0'.repeat(40)}`
+      );
+    if (scenario === 'duplicate_proof') terminalBash += "\nprintf 'HOOK_RECOVERY_VERIFIED=yes\\n'";
+    if (scenario === 'malformed_proof') terminalBash += "\nprintf 'HOOK_RECOVERY_BROKEN\\n'";
+    if (scenario === 'missing_proof')
+      terminalBash = `RECOVERY_OUTPUT=$(\n${terminalBash}\n)\nprintf 'terminal checked\\n'`;
+    if (scenario === 'failed_terminal') terminalBash += '\nexit 1';
+    if (scenario === 'mismatched_success_marker')
+      terminalBash = `printf 'stale-sha\\n' > "$ARTIFACTS_DIR/commit-and-push.succeeded"\n${terminalBash}`;
+    if (scenario === 'unconsumed_eligibility')
+      terminalBash = `printf 'yes\\n' > "$ARTIFACTS_DIR/commit-hook-repair-eligible"\n${terminalBash}`;
+    if (scenario === 'wrong_binding')
+      terminalBash = `printf 'old-run\\nold-invocation\\nfixture\\n' > "$ARTIFACTS_DIR/commit-hook-recovery-binding"\n${terminalBash}`;
+    const bypassConditions = scenario.startsWith('valid_proof_');
+    const gateOutput =
+      scenario === 'valid_proof_gate_malformed'
+        ? 'not-json'
+        : JSON.stringify({
+            REPAIR_GATE_ALLOW:
+              scenario === 'denied_gate' || scenario === 'valid_proof_gate_denied' ? 'no' : 'yes',
+          });
+    const verdictOutput =
+      scenario === 'valid_proof_verdict_malformed'
+        ? 'not-json'
+        : JSON.stringify({
+            verdict: scenario === 'valid_proof_verdict_denied' ? 'needs_human' : 'fixed',
+          });
+    const nodes: DagNode[] = [
+      {
+        id: 'repair-gate',
+        bash: `printf '%s\\n' '${gateOutput}'`,
+      },
+      {
+        id: 'commit-and-push',
+        bash:
+          scenario === 'non_hook_failure'
+            ? 'echo disk-full >&2; exit 1'
+            : `export UNIQUE_BRANCH=fixture\nbash '${helper}' 1`,
+        depends_on: ['repair-gate'],
+      },
+      {
+        id: 'commit-hook-repair',
+        bash: `printf '${scenario === 'second_hook_failure' ? 'broken' : 'fixed'}\\n' > fixture.txt`,
+        depends_on: ['commit-and-push', 'repair-gate'],
+        trigger_rule: 'all_done',
+      },
+      {
+        id: 'classify-commit-hook-repair',
+        bash:
+          `printf 'UNIQUE_BRANCH=fixture\\n' > "$ARTIFACTS_DIR/commit-and-push.env"\n` +
+          (scenario === 'stale_success_marker'
+            ? `printf 'old-sha\\n' > "$ARTIFACTS_DIR/commit-and-push.succeeded"\n`
+            : '') +
+          `printf '%s\\n' '${verdictOutput}'`,
+        depends_on: ['commit-hook-repair', 'repair-gate'],
+        trigger_rule: 'all_done',
+      },
+      { ...retry, persona: undefined, when: bypassConditions ? undefined : retry.when },
+      {
+        ...terminal,
+        persona: undefined,
+        bash: terminalBash,
+        when: bypassConditions ? undefined : terminal.when,
+      },
+    ];
+    if (scenario === 'missing_terminal') nodes.pop();
+    if (scenario === 'additional_failure')
+      nodes.push({
+        id: 'build-manifest',
+        bash: 'exit 1',
+        depends_on: ['commit-hook-terminal'],
+        trigger_rule: 'all_done',
+      });
+    const workflow = { name: parsed.workflow.name, nodes };
+    const execute = async (prior?: Map<string, string>): Promise<void> => {
+      const deps = createMockDeps(store);
+      let terminalSeen = false;
+      if (scenario === 'cancelled' || scenario === 'lease_lost') {
+        const persist = store.createWorkflowEvent;
+        store.createWorkflowEvent = mock(async event => {
+          if (event.event_type === 'node_completed' && event.step_name === 'commit-hook-terminal')
+            terminalSeen = true;
+          return persist(event);
+        });
+        if (scenario === 'cancelled')
+          store.getWorkflowRunStatus = mock(async () => (terminalSeen ? 'cancelled' : 'running'));
+      }
+      if (scenario === 'persist_failure')
+        (store.completeWorkflowRun as ReturnType<typeof mock>).mockRejectedValueOnce(
+          new Error('terminal write failed')
+        );
+      const leaseSpy =
+        scenario === 'lease_lost'
+          ? spyOn(runLease, 'withRunLease').mockImplementation(async (_store, _runId, operation) =>
+              operation(() => !terminalSeen)
+            )
+          : undefined;
+      try {
+        await executeDagWorkflow(
+          deps,
+          createMockPlatform(),
+          'conv-hook-recovery',
+          repo,
+          workflow,
+          run,
+          'codex',
+          undefined,
+          artifacts,
+          join(testDir, 'logs'),
+          'dev',
+          'docs/',
+          minimalConfig,
+          undefined,
+          undefined,
+          prior
+        );
+      } finally {
+        leaseSpy?.mockRestore();
+      }
+    };
+    if (scenario === 'resumed_old_success') {
+      await execute();
+      expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+      const prior = new Map<string, string>();
+      for (const [event] of eventCalls(store)) {
+        if (
+          event.event_type === 'node_completed' &&
+          event.step_name &&
+          typeof event.data?.node_output === 'string'
+        )
+          prior.set(event.step_name, event.data.node_output);
+      }
+      // Same run, old retry/terminal successes, but a fresh failing commit attempt.
+      prior.delete('commit-and-push');
+      await writeFile(join(repo, 'fixture.txt'), 'broken\n');
+      store = createMockStore();
+      await execute(prior);
+    } else await execute();
+    return { store, events: eventCalls(store), runGit };
+  }
+
+  it('verified hook recovery finalizes completed without erasing the failed commit', async () => {
+    const { store, events, runGit } = await runCommitHookRecoveryScenario();
+    expect(
+      events.find(
+        c => c[0].event_type === 'node_completed' && c[0].step_name === 'commit-and-push-retry'
+      ),
+      JSON.stringify(events)
+    ).toBeDefined();
+    const remoteHead = runGit('ls-remote', 'origin', 'refs/heads/fixture').split(/\s/)[0];
+    expect(remoteHead).toBe(runGit('rev-parse', 'HEAD'));
+    expect(
+      events.filter(c => c[0].event_type === 'node_failed' && c[0].step_name === 'commit-and-push')
+    ).toHaveLength(1);
+    expect(
+      events.find(
+        c => c[0].event_type === 'node_completed' && c[0].step_name === 'commit-hook-terminal'
+      )
+    ).toBeDefined();
+    expect(store.failWorkflowRun).toHaveBeenCalledTimes(0);
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+    const completed = (store.completeWorkflowRun as ReturnType<typeof mock>).mock.calls[0] as [
+      string,
+      Record<string, unknown>,
+      { eventData: Record<string, unknown> },
+    ];
+    expect(completed[1].node_counts).toMatchObject({ failed: 1 });
+    expect(completed[1].recovered_failed_nodes).toEqual(['commit-and-push']);
+    expect(completed[2].eventData.recovered_failed_nodes).toEqual(['commit-and-push']);
+    expect(completed[2].eventData.terminal_cause).toBe('commit_hook_recovered');
+    expect(completed[1].effective_failed_node_count).toBe(0);
+    expect(completed[2]).toMatchObject({
+      outcome: {
+        executionState: 'completed',
+        recoveryState: 'recovered',
+        reasonCodes: expect.arrayContaining(['recovery_completed']),
+      },
+    });
+  });
+
+  for (const scenario of [
+    'second_hook_failure',
+    'non_hook_failure',
+    'denied_gate',
+    'missing_terminal',
+    'failed_terminal',
+    'additional_failure',
+    'wrong_run',
+    'wrong_invocation',
+    'wrong_branch',
+    'wrong_sha',
+    'duplicate_proof',
+    'malformed_proof',
+    'missing_proof',
+    'mismatched_success_marker',
+    'unconsumed_eligibility',
+    'wrong_binding',
+    'stale_success_marker',
+    'resumed_old_success',
+  ]) {
+    it(`hook recovery refuses ${scenario}`, async () => {
+      const { store, events } = await runCommitHookRecoveryScenario(scenario);
+      expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
+      expect(store.completeWorkflowRun).toHaveBeenCalledTimes(0);
+      expect(
+        events.filter(
+          c => c[0].event_type === 'node_failed' && c[0].step_name === 'commit-and-push'
+        )
+      ).toHaveLength(1);
+    });
+  }
+
+  for (const scenario of [
+    'valid_proof_gate_denied',
+    'valid_proof_gate_malformed',
+    'valid_proof_verdict_denied',
+    'valid_proof_verdict_malformed',
+  ]) {
+    it(`hook recovery refuses ${scenario} even when YAML conditions are absent`, async () => {
+      const { store, events } = await runCommitHookRecoveryScenario(scenario);
+      const completed = events.filter(c => c[0].event_type === 'node_completed');
+      expect(completed.find(c => c[0].step_name === 'commit-and-push-retry')).toBeDefined();
+      const terminal = completed.find(c => c[0].step_name === 'commit-hook-terminal');
+      expect(terminal?.[0].data?.node_output).toContain('HOOK_RECOVERY_VERIFIED=yes');
+      expect(store.failWorkflowRun).toHaveBeenCalledTimes(1);
+      expect(store.completeWorkflowRun).toHaveBeenCalledTimes(0);
+    });
+  }
+
+  for (const scenario of ['cancelled', 'lease_lost', 'persist_failure']) {
+    it(`hook recovery does not publish success after ${scenario}`, async () => {
+      const { store } = await runCommitHookRecoveryScenario(scenario);
+      if (scenario === 'persist_failure') {
+        expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+        expect(store.updateWorkflowRun).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({ status: 'interrupted' })
+        );
+      } else expect(store.completeWorkflowRun).toHaveBeenCalledTimes(0);
+      expect(store.failWorkflowRun).toHaveBeenCalledTimes(0);
+    });
+  }
+
   it('artifact-truth: paperwork-only failure after a PR artifact finalizes as completed+degraded', async () => {
     const mockStore = createMockStore();
     const mockDeps = createMockDeps(mockStore);
@@ -14286,6 +14603,140 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
 
     expect((mockStore.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(1);
     expect((mockStore.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length).toBe(0);
+  });
+
+  async function runBackoffScenario(
+    options: {
+      random?: number;
+      zeroTokens?: boolean;
+      zeroTokensAfterFirst?: boolean;
+      cancelDuringSleep?: boolean;
+      deferSleep?: (milliseconds: number) => Promise<void>;
+    } = {}
+  ): Promise<{ starts: number[]; waits: number[]; failed: number; completed: number }> {
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    let clock = 0;
+    let cancelled = false;
+    const starts: number[] = [];
+    const waits: number[] = [];
+    deps.random = () => options.random ?? 0.5;
+    (store.getWorkflowRunStatus as ReturnType<typeof mock>).mockImplementation(async () =>
+      cancelled ? 'cancelled' : 'running'
+    );
+    deps.sleep = async milliseconds => {
+      const attempt = starts.length - 1;
+      if (waits[attempt] === undefined) {
+        waits[attempt] = 0;
+        await options.deferSleep?.(milliseconds);
+      }
+      waits[attempt] += milliseconds;
+      clock += milliseconds;
+      if (options.cancelDuringSleep) cancelled = true;
+    };
+    mockSendQueryDag.mockImplementation(function* () {
+      starts.push(clock);
+      yield {
+        type: 'result',
+        isError: true,
+        errorSubtype: 'success',
+        tokens:
+          options.zeroTokens || (options.zeroTokensAfterFirst && starts.length > 1)
+            ? { input: 0, output: 0 }
+            : { input: 105, output: 700 },
+      };
+    });
+    await executeDagWorkflow(
+      deps,
+      createMockPlatform(),
+      'backoff-test',
+      testDir,
+      { name: 'backoff-test', nodes: [{ id: 'work', prompt: 'work' }] },
+      makeWorkflowRun(),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    return {
+      starts,
+      waits,
+      failed: (store.failWorkflowRun as ReturnType<typeof mock>).mock.calls.length,
+      completed: (store.completeWorkflowRun as ReturnType<typeof mock>).mock.calls.length,
+    };
+  }
+
+  it('truncated_nonzero_contradiction_waits_backoff_with_fake_clock', async () => {
+    const release: (() => void)[] = [];
+    const pending = runBackoffScenario({
+      deferSleep: () =>
+        new Promise<void>(resolve => {
+          release.push(resolve);
+        }),
+    });
+    for (let ticks = 0; release.length < 1 && ticks < 1000; ticks += 1) await Bun.sleep(1);
+    expect(mockSendQueryDag.mock.calls).toHaveLength(1);
+    expect(release).toHaveLength(1);
+    release[0]();
+    for (let ticks = 0; release.length < 2 && ticks < 1000; ticks += 1) await Bun.sleep(1);
+    expect(mockSendQueryDag.mock.calls).toHaveLength(2);
+    expect(release).toHaveLength(2);
+    release[1]();
+    const result = await pending;
+    expect(result.starts).toEqual([0, 30000, 150000]);
+    expect(result.waits).toEqual([30000, 120000]);
+    expect(result.failed).toBe(1);
+  });
+
+  it('zero_token_contradiction_keeps_existing_path', async () => {
+    const result = await runBackoffScenario({ zeroTokens: true });
+    expect(result.starts).toEqual([0, 0]);
+    expect(result.waits).toEqual([]);
+    expect(result.failed).toBe(1);
+    const mixed = await runBackoffScenario({ zeroTokensAfterFirst: true });
+    expect(mixed.starts).toEqual([0, 30000]);
+    expect(mixed.waits).toEqual([30000]);
+    expect(mixed.failed).toBe(1);
+    expect(mixed.completed).toBe(0);
+  });
+
+  it('backoff_is_jittered_bounded_and_cancellable', async () => {
+    expect((await runBackoffScenario({ random: 0 })).waits).toEqual([24000, 96000]);
+    expect((await runBackoffScenario({ random: 1 })).waits).toEqual([36000, 144000]);
+    const result = await runBackoffScenario({ cancelDuringSleep: true });
+    expect(result.starts).toEqual([0]);
+    expect(result.waits).toEqual([1000]);
+    expect(result.completed).toBe(0);
+  });
+
+  it('backoff_log_line_records_class_tokens_and_wait', async () => {
+    mockLogFn.mockClear();
+    await runBackoffScenario();
+    const entries = mockLogFn.mock.calls as unknown as [Record<string, unknown>, string][];
+    expect(entries.filter(([, message]) => message === 'dag.sdk_contradiction_backoff')).toEqual([
+      [
+        expect.objectContaining({
+          nodeId: 'work',
+          class: 'truncated_nonzero',
+          tokens: { input: 105, output: 700 },
+          waitMs: 30000,
+          retryIndex: 1,
+        }),
+        'dag.sdk_contradiction_backoff',
+      ],
+      [
+        expect.objectContaining({
+          nodeId: 'work',
+          class: 'truncated_nonzero',
+          waitMs: 120000,
+          retryIndex: 2,
+        }),
+        'dag.sdk_contradiction_backoff',
+      ],
+    ]);
   });
 
   it('contradiction retry: retries once and completes; one sdk-contradiction-dump event exists', async () => {

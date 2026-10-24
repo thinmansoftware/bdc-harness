@@ -101,6 +101,7 @@ function mapSubmitOutcome(
     // leaves no head unreviewed. TERMINAL, and `succeeded` rather than
     // `blocked` because supersession is the system working, not a failure.
     case 'approved':
+    case 'approved_unverified':
     case 'changes_requested':
     case 'stale_head':
     case 'superseded_head':

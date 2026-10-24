@@ -4099,6 +4099,138 @@ nodes:
         UNIQUE_BRANCH="${BRANCH}-thread-${THREAD_ID}"
       fi
       git status --short
+      WO_ID="${WO_ID:-$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'WO-[A-Z0-9-]+' | head -n 1 || true)}"
+      COMMIT_MESSAGE="feat: ${WO_ID} implementation"
+      export UNIQUE_BRANCH COMMIT_MESSAGE REPAIR_TARGET_LEASE_SHA
+      mkdir -p "$ARTIFACTS_DIR"
+      printf 'UNIQUE_BRANCH=%q\nCOMMIT_MESSAGE=%q\nREPAIR_TARGET_LEASE_SHA=%q\n' \
+        "$UNIQUE_BRANCH" "$COMMIT_MESSAGE" "${REPAIR_TARGET_LEASE_SHA:-}" \
+        > "$ARTIFACTS_DIR/commit-and-push.env"
+      # Freeze the public helper in run artifacts: the target project need not
+      # contain the Harness repository's .archon/scripts directory.
+      cat > "$ARTIFACTS_DIR/commit-and-push.sh" <<'BDC_COMMIT_PUSH_HELPER'
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      attempt="${1:?attempt number required}"
+      unique_branch="${UNIQUE_BRANCH:?UNIQUE_BRANCH required}"
+      artifacts_dir="${ARTIFACTS_DIR:?ARTIFACTS_DIR required}"
+      message="${COMMIT_MESSAGE:-feat: ${WO_ID:-work order} implementation}"
+      mkdir -p "$artifacts_dir"
+      staged_paths_file="$artifacts_dir/commit-hook-staged-paths.nul"
+      eligibility_file="$artifacts_dir/commit-hook-repair-eligible"
+      binding_file="$artifacts_dir/commit-hook-recovery-binding"
+      recovery_binding=$(printf '%s\n' "${HARNESS_HOOK_RECOVERY_RUN_ID:-}" "${HARNESS_HOOK_RECOVERY_INVOCATION_ID:-}" "$unique_branch")
+      if [ "$attempt" = 1 ]; then
+        rm -f "$artifacts_dir/commit-and-push.succeeded"
+        rm -f "$binding_file"
+        if [ -n "${HARNESS_HOOK_RECOVERY_RUN_ID:-}${HARNESS_HOOK_RECOVERY_INVOCATION_ID:-}" ]; then
+          : "${HARNESS_HOOK_RECOVERY_RUN_ID:?recovery run required}" "${HARNESS_HOOK_RECOVERY_INVOCATION_ID:?recovery invocation required}"
+          printf '%s\n' "$recovery_binding" > "$binding_file"
+        fi
+        printf 'no\n' > "$eligibility_file"
+      elif [ "$attempt" = 2 ]; then
+        if [ -f "$artifacts_dir/commit-and-push.succeeded" ]; then exit 0; fi
+        if [ ! -f "$staged_paths_file" ]; then
+          echo "ERROR: initial path record missing; refusing retry" >&2
+          exit 1
+        fi
+        if [ "$(cat "$eligibility_file" 2>/dev/null || true)" != yes ]; then
+          echo "ERROR: no eligible initial hook failure; refusing retry" >&2
+          exit 1
+        fi
+        if [ -f "$binding_file" ] || [ -n "${HARNESS_HOOK_RECOVERY_RUN_ID:-}${HARNESS_HOOK_RECOVERY_INVOCATION_ID:-}" ]; then
+          : "${HARNESS_HOOK_RECOVERY_RUN_ID:?recovery run required}" "${HARNESS_HOOK_RECOVERY_INVOCATION_ID:?recovery invocation required}"
+          if [ "$(cat "$binding_file" 2>/dev/null || true)" != "$recovery_binding" ]; then
+            echo "ERROR: recovery binding changed; refusing retry" >&2
+            exit 1
+          fi
+        fi
+        printf 'consumed\n' > "$eligibility_file"
+      else
+        echo "ERROR: only initial attempt and one hook retry are allowed" >&2
+        exit 1
+      fi
+      printf '%s\n' "$attempt" > "$artifacts_dir/commit-hook-attempt.txt"
+
+      if [ "$attempt" = 1 ]; then
+        {
+          git diff --no-renames --name-only -z
+          git diff --cached --no-renames --name-only -z
+          git ls-files --others --exclude-standard -z
+        } | LC_ALL=C sort -zu > "$staged_paths_file"
+      fi
+      worktree_paths_file="$artifacts_dir/commit-hook-worktree-paths.nul"
+      restage_paths_file="$artifacts_dir/commit-hook-restage-paths.nul"
+      {
+        git diff --no-renames --name-only -z
+        git ls-files --others --exclude-standard -z
+      } | LC_ALL=C sort -zu > "$worktree_paths_file"
+      # Index-only changes, especially already-staged deletions, need no git add.
+      # Restage only current working changes within the original full scope.
+      LC_ALL=C comm -z -12 "$staged_paths_file" "$worktree_paths_file" > "$restage_paths_file"
+      if [ -s "$restage_paths_file" ]; then
+        git add --pathspec-from-file="$restage_paths_file" --pathspec-file-nul
+      fi
+      # A repair may stage additional paths itself. Check the entire index without
+      # resetting or discarding any of that work before committing the frozen scope.
+      index_paths_file="$artifacts_dir/commit-hook-index-paths.nul"
+      outside_paths_file="$artifacts_dir/commit-hook-outside-paths.nul"
+      git diff --cached --no-renames --name-only -z | LC_ALL=C sort -zu > "$index_paths_file"
+      LC_ALL=C comm -z -23 "$index_paths_file" "$staged_paths_file" > "$outside_paths_file"
+      if [ -s "$outside_paths_file" ]; then
+        echo "ERROR: staged paths outside initial repair scope; refusing commit" >&2
+        exit 1
+      fi
+      if ! git diff --cached --quiet; then
+        hook_output="$artifacts_dir/commit-hook-output.txt"
+        if ! git commit -m "$message" >"$hook_output" 2>&1; then
+          if [ "$attempt" = 1 ] && (
+            shopt -s nocasematch
+            hook_text=$(cat "$hook_output")
+            [[ "$hook_text" == *'husky - pre-commit script failed'* ||
+               ( "$hook_text" == *'lint-staged'* && "$hook_text" == *'[FAILED]'* ) ]]
+          ); then
+            printf 'yes\n' > "$eligibility_file"
+          fi
+          cat "$hook_output" >&2
+          exit 1
+        fi
+      fi
+
+      push_ok=false
+      for push_attempt in 1 2 3; do
+        if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
+          if git push --force-with-lease="refs/heads/${unique_branch}:${REPAIR_TARGET_LEASE_SHA}" origin "HEAD:${unique_branch}"; then
+            push_ok=true
+            break
+          fi
+        elif git push origin "HEAD:${unique_branch}"; then
+          push_ok=true
+          break
+        fi
+        sleep $((push_attempt * 5))
+      done
+      [ "$push_ok" = true ] || { echo "ERROR: git push failed after 3 attempts" >&2; exit 1; }
+
+      remote_head="$(git ls-remote origin "refs/heads/${unique_branch}" | awk '{print $1}')"
+      local_head="$(git rev-parse HEAD)"
+      [ "$remote_head" = "$local_head" ] || {
+        echo "FATAL: canonical branch ${unique_branch} not durably pushed" >&2
+        exit 1
+      }
+      echo "VERIFIED: origin/${unique_branch} == local HEAD (${local_head})"
+      printf '%s\n' "$local_head" > "$artifacts_dir/commit-and-push.succeeded"
+      echo "unique_branch=${unique_branch}"
+
+      # A leased repair push advanced the remote. Downstream retry consumers must
+      # use its new head for any bounded visibility re-push.
+      if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
+        echo "REPAIR_TARGET_LEASE_SHA=${local_head}"
+      fi
+      BDC_COMMIT_PUSH_HELPER
+      bash "$ARTIFACTS_DIR/commit-and-push.sh" 1
+      exit 0
       DIRTY=$(git status --porcelain)
       if [ -z "$DIRTY" ]; then
         # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: do NOT exit 0 here on the
@@ -4250,10 +4382,104 @@ nodes:
       echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"
       echo "unique_branch=${UNIQUE_BRANCH}"
 
+  - id: commit-hook-repair
+    agent: major-build
+    depends_on: [commit-and-push, repair-gate]
+    trigger_rule: all_done
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'"
+    task_class: medium_work
+    prompt: |
+      The commit-and-push node may have failed a pre-commit lint or format hook.
+      Read $ARTIFACTS_DIR/commit-hook-output.txt. If it does not contain a Husky
+      pre-commit failure or a lint-staged [FAILED] marker, make no changes and emit
+      OPUS_REPAIR=already-satisfied. Otherwise fix only the files and exact lint or
+      format errors reported there; do not touch unrelated files. Run the narrow
+      checks needed to confirm the correction. Emit exactly one final sentinel:
+      OPUS_REPAIR=fixed, OPUS_REPAIR=already-satisfied, or OPUS_REPAIR=needs-human.
+
+  - id: classify-commit-hook-repair
+    depends_on: [commit-hook-repair, repair-gate]
+    trigger_rule: all_done
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'"
+    output_format:
+      type: object
+      properties:
+        verdict:
+          type: string
+          enum: [fixed, already_satisfied, needs_human]
+      required: [verdict]
+    prompt: |
+      Classify the repair output. OPUS_REPAIR=fixed is fixed,
+      OPUS_REPAIR=already-satisfied is already_satisfied, and every other result
+      is needs_human. Return only the requested object.
+      $commit-hook-repair.output
+
+  - id: commit-and-push-retry
+    persona: overseer
+    depends_on: [classify-commit-hook-repair, repair-gate]
+    trigger_rule: all_done
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-commit-hook-repair.output.verdict == 'fixed' || $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-commit-hook-repair.output.verdict == 'already_satisfied'"
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if [ -f "$ARTIFACTS_DIR/commit-and-push.succeeded" ]; then
+        exit 0
+      fi
+      if [ "$(cat "$ARTIFACTS_DIR/commit-hook-repair-eligible" 2>/dev/null || true)" != yes ]; then
+        echo "ERROR: no eligible initial hook failure; refusing retry" >&2
+        exit 1
+      fi
+      source "$ARTIFACTS_DIR/commit-and-push.env"
+      export UNIQUE_BRANCH COMMIT_MESSAGE REPAIR_TARGET_LEASE_SHA
+      bash "$ARTIFACTS_DIR/commit-and-push.sh" 2
+
+  - id: commit-hook-terminal
+    persona: overseer
+    depends_on: [commit-and-push-retry, repair-gate]
+    trigger_rule: all_done
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'"
+    load_bearing: true
+    bash: |
+      set -euo pipefail
+      if [ ! -f "$ARTIFACTS_DIR/commit-and-push.env" ]; then
+        echo "ERROR: commit state missing; push has not been verified." >&2
+        exit 1
+      fi
+      source "$ARTIFACTS_DIR/commit-and-push.env"
+      REMOTE_HEAD=$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" | awk '{print $1}')
+      LOCAL_HEAD=$(git rev-parse HEAD)
+      if [ "$REMOTE_HEAD" != "$LOCAL_HEAD" ] || ! git diff --quiet || ! git diff --cached --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+        REPO=$(git remote get-url origin | sed -E 's#(git@github.com:|https://github.com/)##; s#\.git$##')
+        PR=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        if [ -n "$PR" ]; then
+          gh pr ready "$PR" --repo "$REPO" --undo || true
+          UNRESOLVED=$(grep '^UNRESOLVED' "$ARCHON_NODE_OUT/diff-review-final.out" 2>/dev/null || true)
+          gh pr comment "$PR" --repo "$REPO" --body "Run repair delta was NOT pushed; in-run review findings remain unresolved.\n${UNRESOLVED}" || true
+        fi
+        exit 1
+      fi
+      # Only a current invocation's consumed hook retry can recover the original
+      # failed node. Ordinary successful pushes do not emit recovery evidence.
+      if [ "$(cat "$ARTIFACTS_DIR/commit-hook-attempt.txt" 2>/dev/null || true)" = 2 ]; then
+        : "${HARNESS_HOOK_RECOVERY_RUN_ID:?recovery run required}" "${HARNESS_HOOK_RECOVERY_INVOCATION_ID:?recovery invocation required}"
+        EXPECTED_BINDING=$(printf '%s\n' "$HARNESS_HOOK_RECOVERY_RUN_ID" "$HARNESS_HOOK_RECOVERY_INVOCATION_ID" "$UNIQUE_BRANCH")
+        if [ "$(cat "$ARTIFACTS_DIR/commit-hook-recovery-binding" 2>/dev/null || true)" != "$EXPECTED_BINDING" ] ||
+           [ "$(cat "$ARTIFACTS_DIR/commit-hook-repair-eligible" 2>/dev/null || true)" != consumed ] ||
+           [ "$(cat "$ARTIFACTS_DIR/commit-and-push.succeeded" 2>/dev/null || true)" != "$LOCAL_HEAD" ]; then
+          echo "ERROR: current hook recovery proof missing or mismatched" >&2
+          exit 1
+        fi
+        printf '%s\n' "HOOK_RECOVERY_RUN_ID=$HARNESS_HOOK_RECOVERY_RUN_ID" \
+          "HOOK_RECOVERY_INVOCATION_ID=$HARNESS_HOOK_RECOVERY_INVOCATION_ID" \
+          'HOOK_RECOVERY_ATTEMPT=2' 'HOOK_RECOVERY_ELIGIBILITY=consumed' \
+          "HOOK_RECOVERY_BRANCH=$UNIQUE_BRANCH" "HOOK_RECOVERY_HEAD_SHA=$LOCAL_HEAD" \
+          'HOOK_RECOVERY_VERIFIED=yes'
+      fi
+
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
     persona: major-build
-    depends_on: [commit-and-push, repair-gate]
+    depends_on: [commit-hook-terminal, repair-gate]
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'"
     task_class: clerical
     load_bearing: true
@@ -4282,7 +4508,12 @@ nodes:
       $war-council-validator.output
       BDC_FEATURE_DEV_VALIDATOR_OUTPUT_WAR_COUNCIL_VALIDATOR_20260719_023
       )
+      # The first hook failure has no branch output; the successful bounded
+      # retry owns the final branch and refreshed remote lease.
       COMMIT_PUSH_OUTPUT=$(cat "$ARCHON_NODE_OUT/commit-and-push.out")
+      if [ -f "$ARCHON_NODE_OUT/commit-and-push-retry.out" ]; then
+        COMMIT_PUSH_OUTPUT=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT"; cat "$ARCHON_NODE_OUT/commit-and-push-retry.out")
+      fi
       if ! printf '%s\n' "$DECIDE_OUTPUT" | grep -q '^pr_required: true'; then
         echo "PR not required; skipping."
         exit 0
@@ -4290,7 +4521,7 @@ nodes:
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: read the unique
       # remote branch the commit-and-push node pushed to; gh pr create must use
       # --head to target that branch rather than the (local) archon/thread-<hash>.
-      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | head -n 1)
+      UNIQUE_BRANCH=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^unique_branch=//p' | tail -n 1)
       if [ -z "$UNIQUE_BRANCH" ]; then
         echo "UNIQUE_BRANCH not found in commit-and-push output." >&2
         exit 1

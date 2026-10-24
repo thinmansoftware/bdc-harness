@@ -40,6 +40,7 @@ function makeDeps(overrides: Partial<SubmitDeps> = {}): { deps: SubmitDeps; rec:
     reviewerIdentity: REVIEWER,
     runReviewer: async () => ({
       approved: true,
+      verification: 'verified',
       summary: 'All stop conditions verified.',
       reviewedHeadSha: HEAD,
     }),
@@ -119,7 +120,7 @@ describe('custody conflict', () => {
     const { deps } = makeDeps({
       runReviewer: async () => {
         reviewerRan = true;
-        return { approved: true, summary: 'x', reviewedHeadSha: HEAD };
+        return { approved: true, verification: 'verified', summary: 'x', reviewedHeadSha: HEAD };
       },
     });
     await runAndSubmitReview({ ...WORK, author: REVIEWER }, deps);
@@ -203,7 +204,7 @@ describe('merge-custody conflict (M-153, RULED 2026-08-24)', () => {
     const { deps } = makeDeps({
       runReviewer: async () => {
         reviewerRan = true;
-        return { approved: true, summary: 'x', reviewedHeadSha: HEAD };
+        return { approved: true, verification: 'verified', summary: 'x', reviewedHeadSha: HEAD };
       },
     });
     await runAndSubmitReview(WORK, deps);
@@ -420,6 +421,7 @@ describe('exact-head binding', () => {
     const { deps, rec } = makeDeps({
       runReviewer: async () => ({
         approved: true,
+        verification: 'verified',
         summary: 'looks fine',
         reviewedHeadSha: NEW_HEAD,
       }),

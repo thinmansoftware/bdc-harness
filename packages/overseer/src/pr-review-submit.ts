@@ -36,6 +36,10 @@ import {
 export interface ReviewerVerdict {
   /** true -> APPROVE; false -> REQUEST_CHANGES. */
   approved: boolean;
+  /** Approval judgment that could not verify the exact head; never mergeable. */
+  approvedUnverified?: boolean;
+  verification?: 'verified' | 'unverified';
+  verificationReason?: string;
   /** Evidence. REQUIRED (non-empty) when approved === false. */
   summary: string;
   /** The head the reviewer actually examined. Must match the work item. */
@@ -110,6 +114,7 @@ export interface ReviewWorkItem {
 
 export type SubmitDisposition =
   | 'approved'
+  | 'approved_unverified'
   | 'changes_requested'
   | 'custody_conflict'
   | 'merge_custody_conflict'
@@ -166,6 +171,7 @@ export type SubmitDisposition =
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
+  verification?: 'verified' | 'unverified';
   reason?: string;
   event?: OverseerReviewEvent;
   /**
@@ -213,6 +219,8 @@ export interface SubmitDeps {
   reviewerIdentity: string;
   /** Runs the governed reviewer against an exact head. */
   runReviewer(work: ReviewWorkItem): Promise<ReviewerVerdict>;
+  /** Mandatory nonmergeable evidence, persisted before any GitHub delivery. */
+  recordUnverifiedApproval(work: ReviewWorkItem): Promise<void>;
   /** The existing Overseer App adapter's general review submission. */
   submitReview(input: SubmitPullRequestReviewInput): Promise<SubmitPullRequestReviewResult>;
   /**
@@ -228,6 +236,7 @@ export interface SubmitDeps {
     prNumber: number;
     headSha: string;
     disposition: SubmitDisposition;
+    verification?: 'verified' | 'unverified';
     event?: OverseerReviewEvent;
     reason?: string;
     /**
@@ -499,6 +508,51 @@ export async function runAndSubmitReview(
     });
   }
 
+  if (verdict.approvedUnverified || (verdict.approved && verdict.verification !== 'verified')) {
+    verdict.verification = 'unverified';
+    const reason =
+      verdict.verificationReason?.trim() || verdict.summary.trim() || 'verification unavailable';
+    try {
+      await deps.recordUnverifiedApproval(work);
+    } catch {
+      return finish(deps, work, work.headSha, {
+        disposition: 'submission_failed',
+        reason: 'unverified_approval_persistence_failed',
+        event: 'COMMENT',
+      });
+    }
+    let submission: SubmitPullRequestReviewResult;
+    try {
+      submission = await deps.submitReview({
+        owner: work.owner,
+        repo: work.repo,
+        number: work.prNumber,
+        event: 'COMMENT',
+        body: `UNVERIFIED approval -- not mergeable: ${reason}`,
+        commitId: work.headSha,
+      });
+    } catch (error) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'submission_failed',
+        reason: `submit_threw:${errorCode(error)}`,
+        event: 'COMMENT',
+      });
+    }
+    if (!submission.submitted) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'submission_failed',
+        reason: submission.message ?? 'submit_rejected',
+        event: 'COMMENT',
+      });
+    }
+    return finish(deps, work, work.headSha, {
+      disposition: 'approved_unverified',
+      reason,
+      event: 'COMMENT',
+      ...summaryField(verdict),
+    });
+  }
+
   const event: OverseerReviewEvent = verdict.approved ? 'APPROVE' : 'REQUEST_CHANGES';
   const body = buildReviewBody(work, verdict);
 
@@ -644,9 +698,14 @@ async function handBackToTaskmaster(
  * spread form keeps every terminal branch's shape identical to what it was
  * before this field existed when there is nothing to carry.
  */
-function summaryField(verdict: ReviewerVerdict): { summary?: string } {
+function summaryField(verdict: ReviewerVerdict): Pick<SubmitOutcome, 'summary' | 'verification'> {
   const summary = verdict.summary?.trim() ?? '';
-  return summary.length > 0 ? { summary } : {};
+  return {
+    ...(summary.length > 0 ? { summary } : {}),
+    ...(verdict.verification === 'verified' || verdict.verification === 'unverified'
+      ? { verification: verdict.verification }
+      : {}),
+  };
 }
 
 function errorCode(error: unknown): string {
@@ -669,6 +728,7 @@ async function finish(
       prNumber: work.prNumber,
       headSha,
       disposition: outcome.disposition,
+      ...(outcome.verification ? { verification: outcome.verification } : {}),
       ...(outcome.event ? { event: outcome.event } : {}),
       ...(outcome.reason ? { reason: outcome.reason } : {}),
       ...(outcome.remediation ? { remediation: outcome.remediation } : {}),

@@ -26,6 +26,15 @@ export type { ErrorClass, ClassifyInput } from './classify';
 
 export { decide } from './decide';
 export type { Decision, DecideInput, DecisionResult } from './decide';
+export {
+  buildNodeFailureNoticeBody,
+  firstSafeErrorLine,
+  isNodeFailureBlocker,
+  NODE_FAILURE_BLOCKER_CLASSES,
+  notifyNodeFailure,
+  redactFailureText,
+} from './node-failure-notify';
+export type { NodeFailureNoticeInput } from './node-failure-notify';
 
 export { runAuthorizedEscalation } from './authorized-escalation';
 export { parseM31ActionPermit, permitFromMetadata } from './permit';

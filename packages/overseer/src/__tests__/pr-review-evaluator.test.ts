@@ -47,7 +47,13 @@ function output(
   findings: unknown[] = [],
   head = HEAD_A
 ): string {
-  return JSON.stringify({ verdict, findings, reviewed_head_sha: head });
+  return JSON.stringify({
+    verdict,
+    verification: 'verified',
+    verification_reason: '',
+    findings,
+    reviewed_head_sha: head,
+  });
 }
 
 function deps(overrides: Partial<PrReviewDeps> = {}): PrReviewDeps {

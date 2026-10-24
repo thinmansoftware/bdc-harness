@@ -47,6 +47,7 @@ export type ErrorClass =
   | 'validator_rejected' // war-council-validator stdout begins with REJECT/BLOCK/FAIL
   | 'implement_loop_skipped' // commit-and-push: thread branch HEAD-only, agent never wrote to disk
   | 'validator_sdk_contradiction' // non-loop node (e.g. war-council-validator): Anthropic SDK returned isError=true + errorSubtype='success' (bdc-harness#344), previously fell through to unknown with no escalation
+  | 'commit_hook_lint_failure' // commit-and-push: pre-commit lint/format hook rejected the staged repair
   // Fallback
   | 'unknown';
 
@@ -94,6 +95,17 @@ export function classifyError(input: ClassifyInput): ErrorClass {
   const status = input.statusCode;
   const exit = input.exitCode;
   const validatorText = input.validatorOutput ?? '';
+
+  // A hook failure is repairable only at the commit boundary. Similar text in a
+  // builder or validation node is ordinary command output and must not trigger
+  // the bounded commit repair path.
+  if (
+    input.nodeId === 'commit-and-push' &&
+    (/husky - pre-commit script failed/i.test(rawMessage) ||
+      (/lint-staged/i.test(rawMessage) && /\[FAILED\]/i.test(rawMessage)))
+  ) {
+    return 'commit_hook_lint_failure';
+  }
 
   // --- Silent-dead-end classes (BDC-specific, 2026-05-18 Wave A anchor incidents) ---
   //
