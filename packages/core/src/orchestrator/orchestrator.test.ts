@@ -29,6 +29,11 @@ mock.module('../db/conversations', () => ({
   touchConversation: mockTouchConversation,
 }));
 
+const mockGetPausedWorkflowRun = mock(() => Promise.resolve(null));
+mock.module('../db/workflows', () => ({
+  getPausedWorkflowRun: mockGetPausedWorkflowRun,
+}));
+
 const mockGetCodebase = mock(() => Promise.resolve(null));
 const mockListCodebases = mock(() => Promise.resolve([]));
 const mockCreateCodebase = mock(() => Promise.resolve({ id: 'new-codebase-id' }));
