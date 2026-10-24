@@ -56,6 +56,21 @@ export interface RejectionOperationResult {
 // Helpers
 // ---------------------------------------------------------------------------
 
+const CODEX_ONLY_CONTINUATION_ERROR =
+  'Codex-only continuation is not supported by shared workflow operations.';
+
+function isCodexOnlyRun(run: WorkflowRun): boolean {
+  try {
+    return (
+      run.workflow_name === 'bdc-feature-development-codex-only' ||
+      Object.prototype.hasOwnProperty.call(run.metadata ?? {}, 'codex_only_dispatch')
+    );
+  } catch {
+    // An unreadable restriction cannot authorize shared continuation.
+    throw new Error(CODEX_ONLY_CONTINUATION_ERROR);
+  }
+}
+
 async function getRunOrThrow(runId: string, logEvent: string): Promise<WorkflowRun> {
   let run: WorkflowRun | null;
   try {
@@ -92,6 +107,7 @@ export async function getWorkflowStatus(): Promise<WorkflowStatusData> {
  */
 export async function resumeWorkflow(runId: string): Promise<WorkflowRun> {
   const run = await getRunOrThrow(runId, 'operations.workflow_resume_lookup_failed');
+  if (isCodexOnlyRun(run)) throw new Error(CODEX_ONLY_CONTINUATION_ERROR);
   if (!RESUMABLE_WORKFLOW_STATUSES.includes(run.status)) {
     throw new Error(
       `Cannot resume run with status '${run.status}'. Only failed or paused runs can be resumed.`
@@ -133,6 +149,7 @@ export async function approveWorkflow(
   comment?: string
 ): Promise<ApprovalOperationResult> {
   const run = await getRunOrThrow(runId, 'operations.workflow_approve_lookup_failed');
+  if (isCodexOnlyRun(run)) throw new Error(CODEX_ONLY_CONTINUATION_ERROR);
   if (run.status !== 'paused') {
     throw new Error(
       `Cannot approve run with status '${run.status}'. Only paused runs can be approved.`
@@ -230,13 +247,27 @@ export async function rejectWorkflow(
       `Cannot reject run with status '${run.status}'. Only paused runs can be rejected.`
     );
   }
-  const rawApproval = run.metadata.approval;
-  const approval: ApprovalContext | undefined = isApprovalContext(rawApproval)
-    ? rawApproval
-    : undefined;
+  const restricted = isCodexOnlyRun(run);
+  let approval: ApprovalContext | undefined;
+  let currentCount: number;
+  let maxAttempts: number;
+  let restrictedAtLimit = false;
+  try {
+    const rawApproval = run.metadata.approval;
+    approval = isApprovalContext(rawApproval) ? rawApproval : undefined;
+    currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
+    maxAttempts = approval?.onRejectMaxAttempts ?? 3;
+    if (restricted && approval?.onRejectPrompt !== undefined) {
+      // Preserve the existing inclusive comparison, including NaN/coercion behavior.
+      // Freeze the permitted cancellation decision before the first evidence write.
+      restrictedAtLimit = currentCount + 1 >= maxAttempts;
+      if (!restrictedAtLimit) throw new Error(CODEX_ONLY_CONTINUATION_ERROR);
+    }
+  } catch (error) {
+    if (restricted) throw new Error(CODEX_ONLY_CONTINUATION_ERROR);
+    throw error;
+  }
   const rejectReason = reason ?? 'Rejected';
-  const currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
-  const maxAttempts = approval?.onRejectMaxAttempts ?? 3;
 
   try {
     await workflowEventDb.createWorkflowEvent({
@@ -246,8 +277,8 @@ export async function rejectWorkflow(
       data: { decision: 'rejected', reason: rejectReason },
     });
 
-    if (approval?.onRejectPrompt !== undefined) {
-      if (currentCount + 1 >= maxAttempts) {
+    if (restricted ? restrictedAtLimit : approval?.onRejectPrompt !== undefined) {
+      if (restricted || currentCount + 1 >= maxAttempts) {
         await workflowDb.cancelWorkflowRun(runId);
         return {
           workflowName: run.workflow_name,

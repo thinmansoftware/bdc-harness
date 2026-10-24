@@ -13,10 +13,11 @@
 
 import { describe, test, expect, afterAll } from 'bun:test';
 import { createHash, randomUUID } from 'crypto';
-import { mkdtemp, readFile, rm } from 'fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { runCascade } from '../cascade.js';
+import { pathToFileURL } from 'url';
+import { runCascade, CODEX_ONLY_DISPATCH_CAPABILITY } from '../cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import type { FireResult, PollResult, GateVerdict, CascadeRunRecord } from '../types.js';
 import { loadLadder, loadRefusedTiers } from '../ladder.js';
@@ -30,6 +31,8 @@ function loadLiveTiers() {
 }
 import { loadRuleset } from '../conductor.js';
 import { TimeoutError } from '../poll.js';
+import { resumeFrontierTier } from '../frontier-approval.js';
+import type { CodexOnlyDispatchBinding } from '../../../workflows/src/reliability/dispatch-binding.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -120,6 +123,530 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
     },
   };
 }
+
+describe('binding-v2 durable replay foundation', () => {
+  function binding(): CodexOnlyDispatchBinding {
+    return {
+      version: 'codex-only-v2',
+      project: 'test-project',
+      codebaseId: 'owned-codebase',
+      codebaseName: 'test-project',
+      defaultCwd: '/owned/registered/project',
+      workflowName: 'bdc-feature-development-codex-only',
+      workflowSha256: 'a'.repeat(64),
+    };
+  }
+
+  function options(): RunCascadeOptions {
+    return baseOpts({
+      dispatchId: randomUUID(),
+      codexOnly: true,
+      dispatchBinding: binding(),
+      entryOverride: 'codex',
+      dryRun: true,
+    });
+  }
+
+  function recordPath(opts: RunCascadeOptions): string {
+    const digest = createHash('sha256').update(opts.dispatchId!).digest('hex').slice(0, 24);
+    return join(opts.outDir!, `dispatch-${digest}`, 'cascade-record.json');
+  }
+
+  test('persists the complete comparison snapshot before admission callback', async () => {
+    const opts = options();
+    const admissions: boolean[] = [];
+    opts.onAdmission = (record, created) => {
+      expect(record.request.dispatchBinding).toEqual(binding());
+      admissions.push(created);
+    };
+    const record = await runCascade(opts);
+    expect(record.status).toBe('planned');
+    expect(record.request).toEqual({
+      woClass: 'CODE',
+      tags: ['mechanical'],
+      entryOverride: 'codex',
+      codexOnly: true,
+      dispatchBinding: binding(),
+      dryRun: true,
+    });
+    expect(JSON.parse(await readFile(recordPath(opts), 'utf8'))).toEqual(record);
+    expect(admissions).toEqual([true]);
+  });
+
+  test('reordered identical binding replays without overwrite or successor', async () => {
+    const opts = options();
+    const admissions: boolean[] = [];
+    let fires = 0;
+    opts.onAdmission = (_record, created) => admissions.push(created);
+    opts.deps!.fire = async () => {
+      fires++;
+      return makeFireOk('must-not-fire');
+    };
+    const first = await runCascade(opts);
+    const bytes = await readFile(recordPath(opts), 'utf8');
+    const reordered = Object.fromEntries(
+      Object.entries(binding()).reverse()
+    ) as CodexOnlyDispatchBinding;
+    const replay = await runCascade({ ...opts, dispatchBinding: reordered });
+    expect(replay).toEqual(first);
+    expect(await readFile(recordPath(opts), 'utf8')).toBe(bytes);
+    expect(admissions).toEqual([true, false]);
+    expect(fires).toBe(0);
+    expect(Object.keys(first.request.dispatchBinding!)).toEqual(Object.keys(binding()));
+  });
+
+  test('caller mutation cannot change the parsed durable snapshot', async () => {
+    const opts = options();
+    const pending = runCascade(opts);
+    opts.dispatchBinding!.codebaseId = 'caller-replacement';
+    const record = await pending;
+    expect(record.request.dispatchBinding).toEqual(binding());
+    expect(JSON.parse(await readFile(recordPath(opts), 'utf8'))).toEqual(record);
+  });
+
+  test('changed comparison fields conflict without replacing the existing record', async () => {
+    const opts = options();
+    let admissions = 0;
+    opts.onAdmission = () => {
+      admissions++;
+    };
+    await runCascade(opts);
+    const bytes = await readFile(recordPath(opts), 'utf8');
+    for (const change of [
+      { codebaseId: 'replacement-id' },
+      { codebaseName: 'replacement-name' },
+      { defaultCwd: '/replacement/registered/project' },
+      { workflowSha256: 'b'.repeat(64) },
+      { project: 'replacement-project' },
+    ]) {
+      await expect(
+        runCascade({
+          ...opts,
+          project: change.project ?? opts.project,
+          dispatchBinding: { ...binding(), ...change },
+        })
+      ).rejects.toThrow('dispatch identity conflict');
+      expect(await readFile(recordPath(opts), 'utf8')).toBe(bytes);
+    }
+    for (const codexOnly of [true, undefined, false]) {
+      await expect(runCascade({ ...opts, codexOnly, dispatchBinding: undefined })).rejects.toThrow(
+        'dispatch identity conflict'
+      );
+      expect(await readFile(recordPath(opts), 'utf8')).toBe(bytes);
+    }
+    expect(admissions).toBe(1);
+  });
+
+  test.each(['absent', 'codex-only-v1', 'codex-only-v99'])(
+    'historical %s binding cannot replay as the same v2 dispatch',
+    async version => {
+      const opts = options();
+      const historical = await runCascade({ ...opts, dispatchBinding: undefined });
+      if (version !== 'absent') {
+        historical.request.dispatchBinding = { ...binding(), version } as CodexOnlyDispatchBinding;
+        await writeFile(recordPath(opts), JSON.stringify(historical, null, 2) + '\n');
+      }
+      const bytes = await readFile(recordPath(opts), 'utf8');
+      await expect(runCascade(opts)).rejects.toThrow('dispatch identity conflict');
+      expect(await readFile(recordPath(opts), 'utf8')).toBe(bytes);
+    }
+  );
+
+  test('malformed or contradictory bindings refuse before reads or admission', async () => {
+    const previous = globalThis.fetch;
+    let effects = 0;
+    globalThis.fetch = (async () => {
+      effects++;
+      throw new Error('must not read');
+    }) as typeof fetch;
+    try {
+      for (const invalid of [
+        { ...binding(), version: 'codex-only-v1' },
+        { ...binding(), version: 'codex-only-v99' },
+        { ...binding(), workflowName: 'ordinary-workflow' },
+        { ...binding(), project: 'other-project' },
+        { ...binding(), defaultCwd: 'relative/project' },
+        { ...binding(), extra: true },
+        null,
+      ]) {
+        const opts = options();
+        opts.dispatchBinding = invalid as CodexOnlyDispatchBinding;
+        opts.onAdmission = () => {
+          effects++;
+        };
+        opts.deps!.createRecord = async () => {
+          effects++;
+          throw new Error('must not admit');
+        };
+        await expect(runCascade(opts)).rejects.toThrow('codex_only_invalid_options');
+      }
+      for (const codexOnly of [undefined, false]) {
+        const opts = { ...options(), codexOnly };
+        opts.onAdmission = () => {
+          effects++;
+        };
+        opts.deps!.createRecord = async () => {
+          effects++;
+          throw new Error('must not admit');
+        };
+        await expect(runCascade(opts)).rejects.toThrow('codex_only_invalid_options');
+      }
+      expect(effects).toBe(0);
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  test('bound live options fail closed until execution propagation is implemented', async () => {
+    const previous = globalThis.fetch;
+    let effects = 0;
+    globalThis.fetch = (async () => {
+      effects++;
+      throw new Error('must not read');
+    }) as typeof fetch;
+    try {
+      for (const dryRun of [undefined, false, 'true' as unknown as boolean]) {
+        const opts = { ...options(), dryRun };
+        opts.onAdmission = () => {
+          effects++;
+        };
+        opts.deps!.acquireWoLock = async () => {
+          effects++;
+          throw new Error('must not lock');
+        };
+        opts.deps!.createRecord = async () => {
+          effects++;
+          throw new Error('must not admit');
+        };
+        opts.deps!.fire = async () => {
+          effects++;
+          throw new Error('must not fire');
+        };
+        await expect(runCascade(opts)).rejects.toThrow('codex_only_binding_not_supported');
+      }
+      expect(effects).toBe(0);
+      expect(CODEX_ONLY_DISPATCH_CAPABILITY).toBe('codex-only-v1');
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  test('ordinary absent and false plans omit both restricted request fields', async () => {
+    for (const codexOnly of [undefined, false]) {
+      const record = await runCascade({ ...options(), codexOnly, dispatchBinding: undefined });
+      expect('codexOnly' in record.request).toBe(false);
+      expect('dispatchBinding' in record.request).toBe(false);
+    }
+  });
+});
+
+describe('bounded supervised Codex-only dispatch', () => {
+  async function withRegistration(work: () => Promise<void>): Promise<void> {
+    const prior = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request) =>
+      String(input).endsWith('/api/codebases')
+        ? Response.json([{ id: 'target', name: 'test-project', default_cwd: '/isolated/project' }])
+        : Response.json({
+            filename: 'bdc-feature-development-codex-only.yaml',
+            source: 'bundled',
+            workflow: {
+              name: 'bdc-feature-development-codex-only',
+              description: 'Harmless test workflow',
+              provider: 'codex',
+              nodes: [{ id: 'build', prompt: 'Build' }],
+            },
+          })) as typeof fetch;
+    try {
+      await work();
+    } finally {
+      globalThis.fetch = prior;
+    }
+  }
+
+  test('exports the exact capability and refuses invalid variants before admission', async () => {
+    expect(CODEX_ONLY_DISPATCH_CAPABILITY).toBe('codex-only-v1');
+    for (const entryOverride of [undefined, 'claude', 'frontier']) {
+      let admitted = 0;
+      await expect(
+        runCascade(
+          baseOpts({
+            codexOnly: true,
+            entryOverride,
+            deps: {
+              createRecord: async () => {
+                admitted++;
+                throw new Error('must not admit');
+              },
+            },
+          })
+        )
+      ).rejects.toThrow('codex_only_invalid_options');
+      expect(admitted).toBe(0);
+    }
+  });
+
+  test('failed provider preflight reaches neither ownership, admission nor fire', async () => {
+    const previous = globalThis.fetch;
+    let effects = 0;
+    globalThis.fetch = (async () => new Response('secret-body', { status: 503 })) as typeof fetch;
+    try {
+      await expect(
+        runCascade(
+          baseOpts({
+            codexOnly: true,
+            entryOverride: 'codex',
+            onAdmission: () => {
+              effects++;
+            },
+            deps: {
+              acquireWoLock: async () => {
+                effects++;
+                throw new Error('must not lock');
+              },
+              createRecord: async () => {
+                effects++;
+                throw new Error('must not admit');
+              },
+              fire: async () => {
+                effects++;
+                throw new Error('must not fire');
+              },
+            },
+          })
+        )
+      ).rejects.toThrow('codex_only_preflight_http');
+      expect(effects).toBe(0);
+    } finally {
+      globalThis.fetch = previous;
+    }
+  });
+
+  test('dry-run, claim refusal and ownership denial preserve explicit variant', async () =>
+    withRegistration(async () => {
+      const dry = await runCascade(
+        baseOpts({ codexOnly: true, entryOverride: 'codex', dryRun: true })
+      );
+      expect(dry.request.codexOnly).toBe(true);
+      expect(dry.status).toBe('planned');
+      const refused = await runCascade(
+        baseOpts({
+          codexOnly: true,
+          entryOverride: 'codex',
+          deps: {
+            findWoClaim: async () => ({
+              number: 1,
+              state: 'MERGED',
+              url: 'https://github.com/org/repo/pull/1',
+            }),
+          },
+        })
+      );
+      expect(refused.request.codexOnly).toBe(true);
+      expect(refused.status).toBe('refused');
+      expect(refused.attempts).toHaveLength(0);
+      const blocked = await runCascade(
+        baseOpts({
+          codexOnly: true,
+          entryOverride: 'codex',
+          deps: {
+            acquireWoLock: async () => ({
+              acquired: false,
+              path: 'memory',
+              record: {
+                woId: 'WO-TEST-001',
+                project: 'test-project',
+                cascadeId: 'another-owner',
+                status: 'running',
+                createdAt: new Date(0).toISOString(),
+                updatedAt: new Date(0).toISOString(),
+              },
+            }),
+          },
+        })
+      );
+      expect(blocked.request.codexOnly).toBe(true);
+      expect(blocked.status).toBe('blocked');
+      expect(blocked.attempts).toHaveLength(0);
+    }));
+
+  test('durable replay cannot duplicate fire or change the variant identity', async () =>
+    withRegistration(async () => {
+      let fires = 0;
+      const opts = baseOpts({
+        dispatchId: randomUUID(),
+        codexOnly: true,
+        entryOverride: 'codex',
+        deps: {
+          fire: async () => {
+            fires++;
+            return makeFireOk('owned-run');
+          },
+          poll: async () => makePollResult(),
+          judge: () => makePassVerdict(),
+          fetchNodeTimeouts: async () => ({}),
+        },
+      });
+      const first = await runCascade(opts);
+      const replay = await runCascade(opts);
+      expect(replay).toEqual(first);
+      expect(fires).toBe(1);
+      await expect(runCascade({ ...opts, codexOnly: false })).rejects.toThrow();
+      expect(fires).toBe(1);
+    }));
+
+  test('legacy absent and false requests omit the variant field', async () => {
+    for (const codexOnly of [undefined, false]) {
+      const record = await runCascade(
+        baseOpts({ codexOnly, dryRun: true, entryOverride: 'codex' })
+      );
+      expect('codexOnly' in record.request).toBe(false);
+      expect(record.providerBoundary).toBeUndefined();
+    }
+  });
+
+  test('premium next tiers and refused-tier skipping cannot escape the boundary', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'codex-only-tier-boundary-'));
+    const cascadeUrl = pathToFileURL(join(import.meta.dir, '../cascade.ts')).href;
+    const ladderUrl = pathToFileURL(join(import.meta.dir, '../ladder.ts')).href;
+    const pollUrl = pathToFileURL(join(import.meta.dir, '../poll.ts')).href;
+    try {
+      for (const [refused, premium, nextTier] of [
+        [[], ['claude'], 'claude'],
+        [['claude'], ['frontier'], 'frontier'],
+        [['claude', 'frontier'], ['frontier'], null],
+      ] as const) {
+        const script = join(directory, 'fixture.mjs');
+        await writeFile(
+          script,
+          `
+          import {mock} from 'bun:test';
+          const ladder = await import(${JSON.stringify(ladderUrl)});
+          const tiers = ladder.loadLadder();
+          const retired = ladder.loadRefusedTiers().filter(tier => tier !== 'claude' && tier !== 'frontier');
+          mock.module(${JSON.stringify(ladderUrl)}, () => ({
+            loadLadder: () => tiers, loadRefusedTiers: () => [...retired, ...${JSON.stringify(refused)}],
+            loadPremiumTiers: () => ${JSON.stringify(premium)}
+          }));
+          const {runCascade} = await import(${JSON.stringify(cascadeUrl)});
+          const {TimeoutError} = await import(${JSON.stringify(pollUrl)});
+          globalThis.fetch = async url => String(url).endsWith('/api/codebases')
+            ? Response.json([{id:'target',name:'test-project',default_cwd:'/isolated'}])
+            : Response.json({filename:'bdc-feature-development-codex-only.yaml',source:'bundled',workflow:{
+              name:'bdc-feature-development-codex-only',description:'Test',provider:'codex',nodes:[{id:'build',prompt:'Build'}]}});
+          let fires = 0, cancels = 0;
+          const record = await runCascade({woId:'TEST',project:'test-project',token:'test',entryOverride:'codex',codexOnly:true,
+            deps:{findWoClaim:async()=>null,acquireWoLock:async()=>({acquired:true}),releaseWoLock:async()=>{},
+              createRecord:async record=>({created:true,path:'memory',record}),writeRecord:async()=> 'memory',
+              fire:async()=>{fires++;return {ok:true,runId:'owned-run',conversationId:'test',infraError:null}},
+              fetchNodeTimeouts:async()=>({}),poll:async()=>{throw new TimeoutError('stalled')},
+              cancel:async()=>{cancels++;return {ok:true,error:null}}}});
+          console.log('EVIDENCE='+JSON.stringify({record,fires,cancels}));
+        `
+        );
+        const child = Bun.spawn([process.execPath, script], {
+          stdout: 'pipe',
+          stderr: 'pipe',
+          env: { ...process.env, SMART_CAULDRON_HERMETIC: '1' },
+        });
+        const [output, errors, exit] = await Promise.all([
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+          child.exited,
+        ]);
+        expect(exit, errors).toBe(0);
+        const evidence = JSON.parse(output.split('EVIDENCE=')[1]);
+        expect(evidence.fires).toBe(1);
+        expect(evidence.cancels).toBe(1);
+        expect(evidence.record.status).toBe('blocked');
+        expect(evidence.record.telemetry.climbCount).toBe(0);
+        expect(evidence.record.providerBoundary.nextTier).toBe(nextTier);
+        expect(evidence.record.frontierApproval).toBeUndefined();
+      }
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  for (const mode of [
+    'won',
+    'gate',
+    'timeout-ack',
+    'timeout-reject',
+    'timeout-throw',
+    'infra',
+    'cancelled',
+  ] as const) {
+    test(`${mode} uses one Codex attempt and preserves truthful outcome`, async () =>
+      withRegistration(async () => {
+        const fired: string[] = [];
+        let admitted: CascadeRunRecord | undefined;
+        const record = await runCascade(
+          baseOpts({
+            codexOnly: true,
+            entryOverride: 'codex',
+            deps: {
+              createRecord: async value => {
+                admitted = structuredClone(value);
+                return { created: true, path: 'memory', record: value };
+              },
+              writeRecord: async () => 'memory',
+              fetchNodeTimeouts: async () => ({}),
+              fire: async opts => {
+                fired.push(opts.workflowName);
+                return mode === 'infra' ? makeFireError('unavailable') : makeFireOk('owned-run');
+              },
+              poll: async () => {
+                if (mode.startsWith('timeout')) throw new TimeoutError('stalled');
+                return makePollResult();
+              },
+              judge: () =>
+                mode === 'won'
+                  ? makePassVerdict()
+                  : { ...makeFailVerdict('revision needed'), cancelled: mode === 'cancelled' },
+              cancel: async () => {
+                if (mode === 'timeout-throw') throw new Error('secret error');
+                return { ok: mode === 'timeout-ack', error: 'secret error' };
+              },
+              escalate: async () => {},
+            },
+          })
+        );
+        expect(admitted?.request.codexOnly).toBe(true);
+        expect(fired).toEqual(['bdc-feature-development-codex-only']);
+        expect(record.attempts[0]?.workflowName).toBe(fired[0]);
+        expect(record.telemetry.climbCount).toBe(0);
+        expect(record.frontierApproval).toBeUndefined();
+        expect(record.status).toBe(
+          mode === 'won'
+            ? 'won'
+            : mode === 'infra'
+              ? 'infra-alert'
+              : mode === 'cancelled'
+                ? 'cancelled'
+                : 'blocked'
+        );
+        if (record.status === 'blocked') {
+          await expect(resumeFrontierTier(record)).rejects.toThrow('no frontierApproval packet');
+          expect(record.winningTier).toBeNull();
+          expect(record.providerBoundary).toMatchObject({
+            reason: 'codex-only-capacity',
+            nextTier: 'frontier',
+            sourceEventId: record.attempts[0]?.sourceEventId,
+            sourceEventAt: record.attempts[0]?.sourceEventAt,
+          });
+        }
+        if (mode.startsWith('timeout')) {
+          expect(record.providerBoundary?.cancellation).toMatchObject({
+            runId: 'owned-run',
+            attempted: true,
+            result: mode === 'timeout-ack' ? 'acknowledged' : 'failed',
+            runStopVerified: false,
+          });
+          expect(JSON.stringify(record.providerBoundary)).not.toContain('secret error');
+        }
+      }));
+  }
+});
 
 test('cascade preserves the eligibility identity on every attempted lane', async () => {
   const expectedSpec = {

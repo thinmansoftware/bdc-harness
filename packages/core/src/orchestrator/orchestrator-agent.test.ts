@@ -137,10 +137,11 @@ mock.module('../workflows/store-adapter', () => ({
 
 const mockGetPausedWorkflowRun = mock(() => Promise.resolve(null as unknown));
 const mockFindResumableRunByParentConversation = mock(() => Promise.resolve(null as unknown));
+const mockNaturalApprovalUpdate = mock(() => Promise.resolve());
 mock.module('../db/workflows', () => ({
   getPausedWorkflowRun: mockGetPausedWorkflowRun,
   findResumableRunByParentConversation: mockFindResumableRunByParentConversation,
-  updateWorkflowRun: mock(() => Promise.resolve()),
+  updateWorkflowRun: mockNaturalApprovalUpdate,
 }));
 
 const mockCreateWorkflowEvent = mock(() => Promise.resolve());
@@ -152,8 +153,9 @@ mock.module('../config/config-loader', () => ({
   loadConfig: mockLoadConfig,
 }));
 
+const mockGenerateAndSetTitle = mock(() => Promise.resolve());
 mock.module('../services/title-generator', () => ({
-  generateAndSetTitle: mock(() => Promise.resolve()),
+  generateAndSetTitle: mockGenerateAndSetTitle,
 }));
 
 const mockDispatchBackgroundWorkflow = mock(() => Promise.resolve());
@@ -202,8 +204,9 @@ mock.module('@archon/isolation', () => ({
   },
 }));
 
+const mockSyncArchonToWorktree = mock(() => Promise.resolve());
 mock.module('../utils/worktree-sync', () => ({
-  syncArchonToWorktree: mock(() => Promise.resolve()),
+  syncArchonToWorktree: mockSyncArchonToWorktree,
 }));
 
 mock.module('@archon/git', () => ({
@@ -1374,10 +1377,13 @@ describe('natural-language approval routing', () => {
   }
 
   beforeEach(() => {
+    mockGenerateAndSetTitle.mockClear();
+    mockLogger.error.mockClear();
     mockGetPausedWorkflowRun.mockReset();
     mockGetPausedWorkflowRun.mockImplementation(() => Promise.resolve(null));
     mockCreateWorkflowEvent.mockReset();
     mockCreateWorkflowEvent.mockImplementation(() => Promise.resolve());
+    mockNaturalApprovalUpdate.mockClear();
     mockGetOrCreateConversation.mockReset();
     mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(null));
     mockGetCodebase.mockReset();
@@ -1405,6 +1411,22 @@ describe('natural-language approval routing', () => {
 
     // Approval events should be written
     expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(2);
+    expect(mockCreateWorkflowEvent).toHaveBeenNthCalledWith(1, {
+      workflow_run_id: 'run-1',
+      event_type: 'node_completed',
+      step_name: 'gate-1',
+      data: { node_output: '', approval_decision: 'approved' },
+    });
+    expect(mockCreateWorkflowEvent).toHaveBeenNthCalledWith(2, {
+      workflow_run_id: 'run-1',
+      event_type: 'approval_received',
+      step_name: 'gate-1',
+      data: { decision: 'approved', comment: 'looks good, proceed with implementation' },
+    });
+    expect(mockNaturalApprovalUpdate).toHaveBeenCalledWith('run-1', {
+      status: 'failed',
+      metadata: { approval_response: 'approved', rejection_reason: '', rejection_count: 0 },
+    });
     // Resuming message sent
     expect(platform.sendMessage).toHaveBeenCalledWith(
       'conv-1',
@@ -1506,6 +1528,665 @@ describe('natural-language approval routing', () => {
       'conv-1',
       expect.stringContaining('Approval failed')
     );
+  });
+
+  describe('UNKNOWN paused-route boundary', () => {
+    const privateInput = 'owned persisted payload must not escape';
+
+    function prepareUnknown(result: unknown) {
+      const conversation = makeConversation({ title: null, codebase_id: null });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetPausedWorkflowRun.mockReturnValueOnce(Promise.resolve(result));
+      for (const effect of [
+        mockGenerateAndSetTitle,
+        mockNaturalApprovalUpdate,
+        mockCreateWorkflowEvent,
+        mockGetCodebase,
+        mockListCodebases,
+        mockDiscoverWorkflowsWithConfig,
+        mockSyncWorkspace,
+        mockValidateAndResolveIsolation,
+        mockLaunchSession,
+        mockFindResumableRunByParentConversation,
+        mockExecuteWorkflow,
+        mockDispatchBackgroundWorkflow,
+        mockSendQuery,
+        mockHandleCommand,
+        mockUpdateConversation,
+      ])
+        effect.mockClear();
+      return makePlatform();
+    }
+
+    function expectStopped(platform: IPlatformAdapter) {
+      // Conversation lookup/creation already happened before this boundary.
+      expect(mockGetOrCreateConversation).toHaveBeenCalledWith(
+        'web',
+        'conv-1',
+        undefined,
+        undefined
+      );
+      expect(mockGetPausedWorkflowRun).toHaveBeenCalledTimes(1);
+      for (const effect of [
+        mockGenerateAndSetTitle,
+        mockNaturalApprovalUpdate,
+        mockCreateWorkflowEvent,
+        mockGetCodebase,
+        mockListCodebases,
+        mockDiscoverWorkflowsWithConfig,
+        mockSyncWorkspace,
+        mockValidateAndResolveIsolation,
+        mockLaunchSession,
+        mockFindResumableRunByParentConversation,
+        mockExecuteWorkflow,
+        mockDispatchBackgroundWorkflow,
+        mockSendQuery,
+        mockHandleCommand,
+        mockUpdateConversation,
+      ])
+        expect(effect).not.toHaveBeenCalled();
+      expect(platform.sendMessage).toHaveBeenCalledWith(
+        'conv-1',
+        'Error: Paused workflow continuation could not be verified'
+      );
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conversationId: 'conv-1',
+          err: expect.objectContaining({
+            message: 'Paused workflow continuation could not be verified',
+          }),
+        }),
+        'orchestrator_message_failed'
+      );
+      for (const [fields] of mockLogger.error.mock.calls) {
+        const error = (fields as { err?: Error }).err;
+        if (error) {
+          expect(error.message).not.toContain(privateInput);
+          expect(error.cause).toBeUndefined();
+        }
+        expect(JSON.stringify(fields)).not.toContain(privateInput);
+      }
+      expect(
+        JSON.stringify((platform.sendMessage as ReturnType<typeof mock>).mock.calls)
+      ).not.toContain(privateInput);
+    }
+
+    for (const [label, result] of [
+      ['undefined', undefined],
+      ['false', false],
+      ['zero', 0],
+      ['string', privateInput],
+      ['array', []],
+      ['missing workflow name', { id: 'run-1', metadata: {} }],
+      ['nonstring workflow name', makePausedRun({ workflow_name: 123 })],
+      ['missing used ID', { workflow_name: 'prd', metadata: {} }],
+      ['nonstring used ID', makePausedRun({ id: 123 })],
+      ['string metadata', makePausedRun({ metadata: privateInput })],
+      ['false metadata', makePausedRun({ metadata: false })],
+      ['zero metadata', makePausedRun({ metadata: 0 })],
+      ['array metadata', makePausedRun({ metadata: [] })],
+    ] as const) {
+      test('stops ' + label + ' before title and continuation effects', async () => {
+        const platform = prepareUnknown(result);
+        await handleMessage(platform, 'conv-1', 'owned continuation request');
+        expectStopped(platform);
+      });
+    }
+
+    test('stops a rejected lookup without leaking its native cause', async () => {
+      const platform = prepareUnknown(null);
+      mockGetPausedWorkflowRun.mockReset();
+      mockGetPausedWorkflowRun.mockRejectedValueOnce(
+        new Error(privateInput, { cause: { metadata: privateInput } })
+      );
+      await handleMessage(platform, 'conv-1', 'owned continuation request');
+      expectStopped(platform);
+    });
+
+    for (const field of ['workflow_name', 'id', 'metadata'] as const) {
+      test('stops throwing ' + field + ' evaluation before title', async () => {
+        const run = makePausedRun();
+        Object.defineProperty(run, field, {
+          get() {
+            throw new Error(privateInput);
+          },
+        });
+        const platform = prepareUnknown(run);
+        await handleMessage(platform, 'conv-1', 'owned continuation request');
+        expectStopped(platform);
+      });
+    }
+
+    test('stops unreadable marker presence before title', async () => {
+      const metadata = new Proxy(
+        {},
+        {
+          getOwnPropertyDescriptor() {
+            throw new Error(privateInput);
+          },
+        }
+      );
+      const platform = prepareUnknown(makePausedRun({ metadata }));
+      await handleMessage(platform, 'conv-1', 'owned continuation request');
+      expectStopped(platform);
+    });
+
+    for (const field of ['approval', 'nodeId', 'type', 'captureResponse'] as const) {
+      test('stops throwing approval ' + field + ' evaluation before title', async () => {
+        const approval = { nodeId: 'gate-1' };
+        const metadata = { approval };
+        Object.defineProperty(field === 'approval' ? metadata : approval, field, {
+          get() {
+            throw new Error(privateInput);
+          },
+        });
+        const platform = prepareUnknown(makePausedRun({ metadata }));
+        await handleMessage(platform, 'conv-1', 'owned continuation request');
+        expectStopped(platform);
+      });
+    }
+
+    test('notification failure cannot restart title or continuation work', async () => {
+      const platform = prepareUnknown(undefined);
+      platform.sendMessage = mock(() => Promise.reject(new Error('owned send failure')));
+      await handleMessage(platform, 'conv-1', 'owned continuation request');
+      expectStopped(platform);
+      expect(platform.sendMessage).toHaveBeenCalledTimes(1);
+      expect(mockLogger.error).toHaveBeenCalledWith(
+        expect.objectContaining({ conversationId: 'conv-1' }),
+        'error_notification_failed'
+      );
+    });
+
+    test('awaits successful actual null before launching the existing title and normal response', async () => {
+      const platform = prepareUnknown(null);
+      let releaseLookup!: (value: unknown) => void;
+      let enteredLookup!: () => void;
+      const lookupEntered = new Promise<void>(resolve => {
+        enteredLookup = resolve;
+      });
+      const lookup = new Promise<unknown>(resolve => {
+        releaseLookup = resolve;
+      });
+      mockGetPausedWorkflowRun.mockReset();
+      mockGetPausedWorkflowRun.mockImplementationOnce(() => {
+        enteredLookup();
+        return lookup;
+      });
+      const pending = handleMessage(platform, 'conv-1', 'owned normal request');
+      await lookupEntered;
+      expect(mockGenerateAndSetTitle).not.toHaveBeenCalled();
+      expect(mockSendQuery).not.toHaveBeenCalled();
+      releaseLookup(null);
+      await pending;
+      expect(mockGenerateAndSetTitle).toHaveBeenCalledWith(
+        'conv-1',
+        'owned normal request',
+        'claude',
+        '/home/test/.archon/workspaces'
+      );
+      expect(mockSendQuery).toHaveBeenCalledTimes(1);
+      expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', 'test response');
+      expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+      expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+    });
+
+    for (const metadata of [null, undefined, {}]) {
+      test(
+        'keeps ordinary missing-context guidance with metadata ' + String(metadata),
+        async () => {
+          const platform = prepareUnknown(makePausedRun({ metadata }));
+          await handleMessage(platform, 'conv-1', 'owned continuation request');
+          expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+          expect(platform.sendMessage).toHaveBeenCalledWith(
+            'conv-1',
+            'A workflow is paused but its approval context is missing. ' +
+              'Use `/workflow approve run-1` or `/workflow reject run-1`.'
+          );
+          expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+          expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+          expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+          expect(mockSendQuery).not.toHaveBeenCalled();
+        }
+      );
+    }
+
+    test('keeps an ordinary empty string run ID usable for guidance', async () => {
+      const platform = prepareUnknown(makePausedRun({ id: '', metadata: {} }));
+      await handleMessage(platform, 'conv-1', 'owned continuation request');
+      expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+      expect(platform.sendMessage).toHaveBeenCalledWith(
+        'conv-1',
+        'A workflow is paused but its approval context is missing. ' +
+          'Use `/workflow approve ` or `/workflow reject `.'
+      );
+    });
+
+    test('keeps an untitled slash command outside paused lookup and title generation', async () => {
+      const platform = prepareUnknown(undefined);
+      mockParseCommand.mockReturnValueOnce({ command: 'status', args: [] });
+      mockHandleCommand.mockReturnValueOnce(
+        Promise.resolve({ success: true, message: 'owned status response', workflow: undefined })
+      );
+      await handleMessage(platform, 'conv-1', '/status');
+      expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', 'owned status response');
+      expect(mockHandleCommand).toHaveBeenCalledTimes(1);
+      expect(mockGetPausedWorkflowRun).not.toHaveBeenCalled();
+      expect(mockGenerateAndSetTitle).not.toHaveBeenCalled();
+    });
+
+    test('keeps captured standard approval payloads with empty string run and node IDs', async () => {
+      const platform = prepareUnknown(
+        makePausedRun({
+          id: '',
+          metadata: { approval: { nodeId: '', captureResponse: true } },
+        })
+      );
+      await handleMessage(platform, 'conv-1', 'owned captured approval');
+      expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+      expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(2);
+      expect(mockCreateWorkflowEvent).toHaveBeenNthCalledWith(1, {
+        workflow_run_id: '',
+        event_type: 'node_completed',
+        step_name: '',
+        data: { node_output: 'owned captured approval', approval_decision: 'approved' },
+      });
+      expect(mockCreateWorkflowEvent).toHaveBeenNthCalledWith(2, {
+        workflow_run_id: '',
+        event_type: 'approval_received',
+        step_name: '',
+        data: { decision: 'approved', comment: 'owned captured approval' },
+      });
+      expect(mockNaturalApprovalUpdate).toHaveBeenCalledWith('', {
+        status: 'failed',
+        metadata: { approval_response: 'approved', rejection_reason: '', rejection_count: 0 },
+      });
+    });
+
+    test('does not evaluate unused captureResponse for interactive loop approval', async () => {
+      const approval = { nodeId: 'loop-1', type: 'interactive_loop' };
+      const readUnusedCapture = mock(() => {
+        throw new Error(privateInput);
+      });
+      Object.defineProperty(approval, 'captureResponse', { get: readUnusedCapture });
+      const platform = prepareUnknown(makePausedRun({ metadata: { approval } }));
+      await handleMessage(platform, 'conv-1', 'owned next loop input');
+      expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+      expect(readUnusedCapture).not.toHaveBeenCalled();
+      expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(1);
+      expect(mockCreateWorkflowEvent).toHaveBeenCalledWith({
+        workflow_run_id: 'run-1',
+        event_type: 'approval_received',
+        step_name: 'loop-1',
+        data: { decision: 'approved', comment: 'owned next loop input' },
+      });
+      expect(mockNaturalApprovalUpdate).toHaveBeenCalledWith('run-1', {
+        status: 'failed',
+        metadata: { loop_user_input: 'owned next loop input' },
+      });
+    });
+
+    test('does not treat an inherited marker as an own restriction', async () => {
+      const metadata = Object.create({ codex_only_dispatch: null });
+      const platform = prepareUnknown(makePausedRun({ metadata }));
+      await handleMessage(platform, 'conv-1', 'owned continuation request');
+      expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+      expect(platform.sendMessage).toHaveBeenCalledWith(
+        'conv-1',
+        'A workflow is paused but its approval context is missing. ' +
+          'Use `/workflow approve run-1` or `/workflow reject run-1`.'
+      );
+      expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+      expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+    });
+
+    describe('classified field snapshots', () => {
+      for (const field of ['id', 'workflow_name'] as const) {
+        for (const laterRead of ['throws', 'changes'] as const) {
+          test('uses first ' + field + ' when a later read ' + laterRead, async () => {
+            const first = field === 'id' ? 'run-1' : 'prd';
+            const run = makePausedRun();
+            let reads = 0;
+            Object.defineProperty(run, field, {
+              get() {
+                reads++;
+                if (reads === 1) return first;
+                if (laterRead === 'throws') throw new Error(privateInput);
+                return field === 'id' ? 'unclassified-run' : 'unclassified-workflow';
+              },
+            });
+            const platform = prepareUnknown(run);
+            mockLogger.info.mockClear();
+            mockGetOrCreateConversation.mockReset();
+            mockGetOrCreateConversation.mockResolvedValueOnce(
+              makeConversation({
+                title: null,
+                codebase_id: 'codebase-1',
+                cwd: '/repos/test-repo',
+              })
+            );
+            mockGetCodebase.mockImplementation(() => Promise.resolve(makeApprovalCodebase()));
+            mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+              Promise.resolve({
+                workflows: [{ workflow: approvalWorkflow }],
+                errors: [],
+              })
+            );
+
+            await handleMessage(platform, 'conv-1', 'owned snapshot approval');
+
+            expect(reads).toBe(1);
+            expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+            expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(2);
+            expect(mockCreateWorkflowEvent).toHaveBeenNthCalledWith(1, {
+              workflow_run_id: 'run-1',
+              event_type: 'node_completed',
+              step_name: 'gate-1',
+              data: { node_output: '', approval_decision: 'approved' },
+            });
+            expect(mockCreateWorkflowEvent).toHaveBeenNthCalledWith(2, {
+              workflow_run_id: 'run-1',
+              event_type: 'approval_received',
+              step_name: 'gate-1',
+              data: { decision: 'approved', comment: 'owned snapshot approval' },
+            });
+            expect(mockNaturalApprovalUpdate).toHaveBeenCalledWith('run-1', {
+              status: 'failed',
+              metadata: { approval_response: 'approved', rejection_reason: '', rejection_count: 0 },
+            });
+            expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+            expect(mockExecuteWorkflow.mock.calls[0][4]).toBe(approvalWorkflow);
+            expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', ' Resuming **prd**...');
+            expect(mockLogger.info).toHaveBeenCalledWith(
+              {
+                conversationId: 'conv-1',
+                workflowRunId: 'run-1',
+                nodeId: 'gate-1',
+                workflowName: 'prd',
+              },
+              'orchestrator.natural_language_approval_started'
+            );
+            expect(mockLogger.info).toHaveBeenCalledWith(
+              { conversationId: 'conv-1', workflowRunId: 'run-1', workflowName: 'prd' },
+              'orchestrator.natural_language_approval_completed'
+            );
+            expect(mockLogger.error).not.toHaveBeenCalled();
+          });
+        }
+      }
+
+      test('uses the first run ID in missing approval guidance', async () => {
+        const run = makePausedRun({ metadata: {} });
+        let reads = 0;
+        Object.defineProperty(run, 'id', {
+          get() {
+            if (++reads === 1) return 'run-1';
+            throw new Error(privateInput);
+          },
+        });
+        const platform = prepareUnknown(run);
+        await handleMessage(platform, 'conv-1', 'owned snapshot guidance');
+        expect(reads).toBe(1);
+        expect(mockGenerateAndSetTitle).toHaveBeenCalledTimes(1);
+        expect(platform.sendMessage).toHaveBeenCalledWith(
+          'conv-1',
+          'A workflow is paused but its approval context is missing. ' +
+            'Use `/workflow approve run-1` or `/workflow reject run-1`.'
+        );
+        expect(mockLogger.error).not.toHaveBeenCalled();
+        expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+      });
+
+      test('uses the first run ID in existing approval failure logging and guidance', async () => {
+        const run = makePausedRun();
+        let reads = 0;
+        Object.defineProperty(run, 'id', {
+          get() {
+            return ++reads === 1 ? 'run-1' : 'unclassified-run';
+          },
+        });
+        const platform = prepareUnknown(run);
+        mockCreateWorkflowEvent.mockRejectedValueOnce(new Error('owned event failure'));
+        await handleMessage(platform, 'conv-1', 'owned snapshot error guidance');
+        expect(reads).toBe(1);
+        expect(platform.sendMessage).toHaveBeenCalledWith(
+          'conv-1',
+          'Approval failed: owned event failure. Try again or use `/workflow approve run-1` explicitly.'
+        );
+        expect(mockLogger.error).toHaveBeenCalledWith(
+          expect.objectContaining({ workflowRunId: 'run-1', conversationId: 'conv-1' }),
+          'orchestrator.natural_language_approval_failed'
+        );
+        expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+        expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+      });
+
+      for (const restrictedBy of ['reserved name', 'own marker'] as const) {
+        test('does not consume the unused ID for ' + restrictedBy, async () => {
+          const run = makePausedRun(
+            restrictedBy === 'reserved name'
+              ? { workflow_name: 'bdc-feature-development-codex-only' }
+              : { metadata: { codex_only_dispatch: undefined } }
+          );
+          const readId = mock(() => {
+            throw new Error(privateInput);
+          });
+          Object.defineProperty(run, 'id', { get: readId });
+          const platform = prepareUnknown(run);
+          await handleMessage(platform, 'conv-1', 'owned restricted snapshot');
+          expect(readId).not.toHaveBeenCalled();
+          expect(platform.sendMessage).toHaveBeenCalledWith(
+            'conv-1',
+            'Codex-only continuation is not available; the paused run was left unchanged.'
+          );
+          expect(mockGenerateAndSetTitle).not.toHaveBeenCalled();
+          expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+          expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+          expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+          expect(mockLogger.error).not.toHaveBeenCalled();
+        });
+      }
+    });
+
+    test('refuses an own marker without evaluating its value', async () => {
+      const metadata = {};
+      const readMarker = mock(() => {
+        throw new Error(privateInput);
+      });
+      Object.defineProperty(metadata, 'codex_only_dispatch', { get: readMarker });
+      const platform = prepareUnknown(makePausedRun({ metadata }));
+      await handleMessage(platform, 'conv-1', 'owned continuation request');
+      expect(platform.sendMessage).toHaveBeenCalledWith(
+        'conv-1',
+        'Codex-only continuation is not available; the paused run was left unchanged.'
+      );
+      expect(readMarker).not.toHaveBeenCalled();
+      expect(mockGenerateAndSetTitle).not.toHaveBeenCalled();
+      expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+      expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('binding-v2 natural-language continuation closed gate', () => {
+    const reserved = 'bdc-feature-development-codex-only';
+    const refusal = 'Codex-only continuation is not available; the paused run was left unchanged.';
+
+    function prepare(run: ReturnType<typeof makePausedRun>) {
+      const conversation = makeConversation({
+        codebase_id: 'codebase-1',
+        cwd: '/repos/test-repo',
+        title: null,
+      });
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+      mockGetPausedWorkflowRun.mockReturnValueOnce(Promise.resolve(run));
+      mockGetCodebase.mockImplementation(() => Promise.resolve(makeApprovalCodebase()));
+      mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+        Promise.resolve({
+          workflows: [{ workflow: approvalWorkflow }],
+          errors: [],
+        })
+      );
+      for (const effect of [
+        mockGenerateAndSetTitle,
+        mockNaturalApprovalUpdate,
+        mockCreateWorkflowEvent,
+        mockGetCodebase,
+        mockListCodebases,
+        mockDiscoverWorkflowsWithConfig,
+        mockSyncWorkspace,
+        mockValidateAndResolveIsolation,
+        mockLaunchSession,
+        mockFindResumableRunByParentConversation,
+        mockExecuteWorkflow,
+        mockDispatchBackgroundWorkflow,
+        mockSendQuery,
+        mockHandleCommand,
+        mockUpdateConversation,
+      ])
+        effect.mockClear();
+      return { conversation, platform: makePlatform() };
+    }
+
+    function expectNoApprovalWork() {
+      for (const effect of [
+        mockGenerateAndSetTitle,
+        mockNaturalApprovalUpdate,
+        mockCreateWorkflowEvent,
+        mockGetCodebase,
+        mockListCodebases,
+        mockDiscoverWorkflowsWithConfig,
+        mockSyncWorkspace,
+        mockValidateAndResolveIsolation,
+        mockLaunchSession,
+        mockFindResumableRunByParentConversation,
+        mockExecuteWorkflow,
+        mockDispatchBackgroundWorkflow,
+        mockSendQuery,
+        mockHandleCommand,
+        mockUpdateConversation,
+      ])
+        expect(effect).not.toHaveBeenCalled();
+    }
+
+    for (const kind of ['standard', 'interactive_loop'] as const) {
+      for (const [label, marker] of [
+        ['null', null],
+        ['undefined', undefined],
+        ['false', false],
+        ['corrupt', 'corrupt'],
+        ['v1', { version: 'codex-only-v1' }],
+        ['v2', { version: 'codex-only-v2' }],
+        ['unknown', { version: 'codex-only-v999' }],
+      ] as const) {
+        test(
+          'refuses ' + kind + ' with own ' + label + ' marker before approval work',
+          async () => {
+            const run = makePausedRun({
+              metadata: {
+                approval: { nodeId: 'gate-1', type: kind },
+                codex_only_dispatch: marker,
+              },
+            });
+            const before = structuredClone(run);
+            const { platform } = prepare(run);
+            await handleMessage(platform, 'conv-1', 'owned synthetic approval');
+            expect(platform.sendMessage).toHaveBeenCalledTimes(1);
+            expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+            expect(run).toEqual(before);
+            expectNoApprovalWork();
+          }
+        );
+      }
+      test('refuses ' + kind + ' reserved name without marker before approval work', async () => {
+        const run = makePausedRun({
+          workflow_name: reserved,
+          metadata: { approval: { nodeId: 'gate-1', type: kind } },
+        });
+        const before = structuredClone(run);
+        const { platform } = prepare(run);
+        await handleMessage(platform, 'conv-1', 'owned synthetic approval');
+        expect(platform.sendMessage).toHaveBeenCalledTimes(1);
+        expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+        expect(run).toEqual(before);
+        expectNoApprovalWork();
+      });
+    }
+
+    for (const [label, extra] of [
+      ['missing approval', { metadata: { codex_only_dispatch: null } }],
+      ['corrupt approval', { metadata: { codex_only_dispatch: false, approval: 'bad' } }],
+      ['reserved null metadata', { workflow_name: reserved, metadata: null }],
+    ] as const) {
+      test('refuses restricted ' + label + ' without suggesting a resume bypass', async () => {
+        const run = makePausedRun(extra);
+        const before = structuredClone(run);
+        const { platform } = prepare(run);
+        await handleMessage(platform, 'conv-1', 'owned synthetic approval');
+        expect(platform.sendMessage).toHaveBeenCalledTimes(1);
+        expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+        expect(run).toEqual(before);
+        expectNoApprovalWork();
+      });
+    }
+
+    test('failed refusal notification performs no approval or fallback work', async () => {
+      const run = makePausedRun({ workflow_name: reserved });
+      const before = structuredClone(run);
+      const { platform } = prepare(run);
+      platform.sendMessage = mock(() => Promise.resolve());
+      (platform.sendMessage as ReturnType<typeof mock>).mockRejectedValueOnce(
+        new Error('owned notification failure')
+      );
+      await handleMessage(platform, 'conv-1', 'owned synthetic approval');
+      expect(platform.sendMessage).toHaveBeenCalledTimes(2);
+      expect(platform.sendMessage).toHaveBeenNthCalledWith(1, 'conv-1', refusal);
+      expect(platform.sendMessage).toHaveBeenNthCalledWith(
+        2,
+        'conv-1',
+        'Error: owned notification failure'
+      );
+      expect(run).toEqual(before);
+      expectNoApprovalWork();
+    });
+
+    test('ordinary interactive loop retains input event update and dispatch', async () => {
+      const run = makePausedRun({
+        metadata: { approval: { nodeId: 'loop-1', type: 'interactive_loop' } },
+      });
+      const { platform } = prepare(run);
+      await handleMessage(platform, 'conv-1', 'owned next loop input');
+      expect(mockCreateWorkflowEvent).toHaveBeenCalledTimes(1);
+      expect(mockCreateWorkflowEvent).toHaveBeenCalledWith({
+        workflow_run_id: 'run-1',
+        event_type: 'approval_received',
+        step_name: 'loop-1',
+        data: { decision: 'approved', comment: 'owned next loop input' },
+      });
+      expect(mockNaturalApprovalUpdate).toHaveBeenCalledTimes(1);
+      expect(mockNaturalApprovalUpdate).toHaveBeenCalledWith('run-1', {
+        status: 'failed',
+        metadata: { loop_user_input: 'owned next loop input' },
+      });
+      expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    });
+
+    test('explicit cancel command bypasses NL interception without asserting real cancellation', async () => {
+      const run = makePausedRun({ workflow_name: reserved });
+      const { platform, conversation } = prepare(run);
+      mockGetPausedWorkflowRun.mockReset();
+      mockGetPausedWorkflowRun.mockImplementation(() => Promise.resolve(null));
+      mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['cancel', 'run-1'] });
+      mockHandleCommand.mockReturnValueOnce(
+        Promise.resolve({ success: true, message: 'owned cancel requested', workflow: undefined })
+      );
+      await handleMessage(platform, 'conv-1', '/workflow cancel run-1');
+      expect(mockGetPausedWorkflowRun).not.toHaveBeenCalled();
+      expect(mockHandleCommand).toHaveBeenCalledWith(conversation, '/workflow cancel run-1');
+      expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+      expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    });
   });
 });
 
@@ -2162,4 +2843,518 @@ describe('dispatchOrchestratorWorkflow -- default isolation key (Gap #2)', () =>
     expect(hints.workflowType).toBe('thread');
     expect(hints.workflowId).toBe('conv-1');
   });
+});
+
+describe('binding-v2 parent closed admission', () => {
+  const reserved = 'bdc-feature-development-codex-only';
+
+  beforeEach(() => {
+    mockGetOrCreateConversation.mockReset();
+    mockGetCodebase.mockReset();
+    mockListCodebases.mockReset();
+    mockParseCommand.mockReset();
+    mockHandleCommand.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockUpdateConversation.mockClear();
+    mockValidateAndResolveIsolation.mockClear();
+    mockExecuteWorkflow.mockClear();
+    mockDispatchBackgroundWorkflow.mockClear();
+    mockSendQuery.mockClear();
+    mockFindResumableRunByParentConversation.mockReset();
+    mockFindResumableRunByParentConversation.mockImplementation(() => Promise.resolve(null));
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(null));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+    mockListCodebases.mockImplementation(() => Promise.resolve([]));
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [], errors: [] })
+    );
+    mockValidateAndResolveIsolation.mockImplementation(() =>
+      Promise.resolve({ status: 'new', cwd: '/worktrees/conv-1' })
+    );
+  });
+
+  function setup(mode: string, actualName = reserved, userMessage = 'WO-parent-gate') {
+    const codebase = makeCodebaseForSync();
+    const scoped = mode === 'scoped';
+    const conversation = makeConversation({ codebase_id: scoped ? codebase.id : null });
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+    const codebases = mode === 'multiple' ? [codebase, makeCodebase('other-project')] : [codebase];
+    mockListCodebases.mockImplementation(() => Promise.resolve(codebases));
+    const requestName = mode === 'case-alias' ? actualName.toUpperCase() : actualName;
+    const args = ['run', requestName, userMessage];
+    if (mode === 'multiple') args.push('--project', codebase.name);
+    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args });
+    const workflow = makeTestWorkflowWithSource({
+      name: actualName,
+      interactive: mode === 'interactive',
+    });
+    let discoveries = 0;
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() => {
+      discoveries += 1;
+      const fallback = mode === 'repository' || mode === 'multiple';
+      return Promise.resolve({
+        workflows: fallback && discoveries === 1 ? [] : [workflow],
+        errors: [],
+      });
+    });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({
+        success: true,
+        message: 'ok',
+        workflow: { definition: workflow.workflow, args: userMessage },
+      })
+    );
+    if (mode === 'resumable') {
+      mockFindResumableRunByParentConversation.mockImplementation(() =>
+        Promise.resolve({
+          id: 'prior-run',
+          working_path: '/worktrees/prior-run',
+          status: 'failed',
+        })
+      );
+    }
+    const platform = makePlatform();
+    if (mode === 'non-web') platform.getPlatformType = mock(() => 'slack' as const);
+    return { platform, command: `/workflow run ${requestName} ${userMessage}` };
+  }
+
+  function expectClosed(platform: IPlatformAdapter) {
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('no workflow was started')
+    );
+    expect(platform.sendMessage).not.toHaveBeenCalledWith(
+      'conv-1',
+      expect.stringContaining('Starting workflow:')
+    );
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+    expect(mockValidateAndResolveIsolation).not.toHaveBeenCalled();
+    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    expect(mockSendQuery).not.toHaveBeenCalled();
+  }
+
+  test.each([
+    'global',
+    'case-alias',
+    'repository',
+    'multiple',
+    'interactive',
+    'resumable',
+    'non-web',
+    'scoped',
+  ])('refuses actual reserved definition at parent boundary: %s', async mode => {
+    const { platform, command } = setup(mode);
+    await handleMessage(platform, 'conv-1', command);
+    expectClosed(platform);
+  });
+
+  test('failed global refusal notification cannot search or dispatch a replacement', async () => {
+    const { platform, command } = setup('global');
+    const messages: string[] = [];
+    platform.sendMessage = mock(async (_id: string, text: string) => {
+      messages.push(text);
+      if (messages.length === 1) throw new Error('parent refusal delivery failed');
+    });
+    await handleMessage(platform, 'conv-1', command);
+    expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(1);
+    expect(messages[0]).toContain('no workflow was started');
+    expect(messages).not.toContain(`Starting workflow: \`${reserved}\``);
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+    expect(mockValidateAndResolveIsolation).not.toHaveBeenCalled();
+    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    expect(mockSendQuery).not.toHaveBeenCalled();
+  });
+
+  test.each(['global', 'repository', 'multiple'])(
+    'ordinary %s keeps exact Starting message before attachment despite reserved message text',
+    async mode => {
+      const { platform, command } = setup(mode, 'assist', `Discuss ${reserved}`);
+      const order: string[] = [];
+      const send = platform.sendMessage;
+      platform.sendMessage = mock(async (id: string, text: string) => {
+        order.push(text);
+        await send(id, text);
+      });
+      mockUpdateConversation.mockImplementation(async () => {
+        order.push('attach');
+      });
+      await handleMessage(platform, 'conv-1', command);
+      expect(order[0]).toBe('Starting workflow: `assist`');
+      expect(order[1]).toBe('attach');
+      expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+      mockUpdateConversation.mockImplementation(() => Promise.resolve());
+    }
+  );
+
+  test('ordinary global discovery error still uses repository fallback', async () => {
+    const { platform, command } = setup('repository', 'assist');
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({
+        workflows: [makeTestWorkflowWithSource({ name: 'assist' })],
+        errors: [],
+      })
+    );
+    mockDiscoverWorkflowsWithConfig.mockImplementationOnce(() =>
+      Promise.reject(new Error('global unavailable'))
+    );
+    await handleMessage(platform, 'conv-1', command);
+    expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(2);
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+    expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', 'Starting workflow: `assist`');
+  });
+});
+
+describe('binding-v2 foreground resume closed gate', () => {
+  const reserved = 'bdc-feature-development-codex-only';
+  const refusal = 'Codex-only continuation is not available; the prior run was left unchanged.';
+  const unverified = 'Workflow continuation could not be verified; no workflow was started.';
+
+  beforeEach(() => {
+    mockGetOrCreateConversation.mockReset();
+    mockGetCodebase.mockReset();
+    mockListCodebases.mockReset();
+    mockParseCommand.mockReset();
+    mockHandleCommand.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockFindResumableRunByParentConversation.mockReset();
+    mockUpdateConversation.mockClear();
+    mockValidateAndResolveIsolation.mockClear();
+    mockExecuteWorkflow.mockClear();
+    mockDispatchBackgroundWorkflow.mockClear();
+    mockSendQuery.mockClear();
+    mockNaturalApprovalUpdate.mockClear();
+    mockCreateWorkflowEvent.mockClear();
+  });
+
+  function setup(mode: string, row: unknown, interactive = false) {
+    const codebase = makeCodebaseForSync();
+    const conversation = makeConversation({ codebase_id: mode === 'scoped' ? codebase.id : null });
+    const workflow = makeTestWorkflowWithSource({ name: 'assist', interactive });
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(conversation));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+    mockListCodebases.mockImplementation(() => Promise.resolve([codebase]));
+    mockParseCommand.mockReturnValueOnce({
+      command: 'workflow',
+      args: ['run', 'assist', 'WO-guard'],
+    });
+    mockHandleCommand.mockImplementation(() =>
+      Promise.resolve({
+        success: true,
+        message: 'ok',
+        workflow: { definition: workflow.workflow, args: 'WO-guard' },
+      })
+    );
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [workflow], errors: [] })
+    );
+    mockFindResumableRunByParentConversation.mockImplementation(() => Promise.resolve(row));
+    return makePlatform();
+  }
+
+  function row(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'prior-run',
+      workflow_name: 'assist',
+      parent_conversation_id: 'conv-1',
+      status: 'failed',
+      working_path: '/worktrees/prior-run',
+      metadata: {},
+      ...overrides,
+    };
+  }
+
+  function expectNoDispatch() {
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+    expect(mockValidateAndResolveIsolation).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    expect(mockSendQuery).not.toHaveBeenCalled();
+    expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+    expect(mockFindResumableRunByParentConversation).toHaveBeenCalledTimes(1);
+    expect(mockFindResumableRunByParentConversation).toHaveBeenCalledWith('assist', 'conv-1');
+  }
+
+  for (const mode of ['global', 'scoped']) {
+    const markers: [string, unknown][] = [
+      ['null', null],
+      ['undefined', undefined],
+      ['false', false],
+      ['corrupt', 'bad'],
+      ['v1', { version: 'codex-only-v1' }],
+      ['v2', { version: 'codex-only-v2' }],
+      ['unknown', { version: 'future' }],
+    ];
+    for (const [index, [label, marker]] of markers.entries()) {
+      test(`${mode} refuses persisted ${label} marker before resume or replacement`, async () => {
+        const prior = row({
+          metadata: { codex_only_dispatch: marker },
+          status: index % 2 ? 'paused' : 'failed',
+          working_path: index % 2 ? null : '/worktrees/prior-run',
+        });
+        const before = structuredClone(prior);
+        const platform = setup(mode, prior, index % 2 === 0);
+        await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+        expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+        expect(platform.sendMessage).not.toHaveBeenCalledWith(
+          'conv-1',
+          expect.stringContaining('Starting workflow:')
+        );
+        expectNoDispatch();
+        expect(prior).toEqual(before);
+        expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(mode === 'global' ? 1 : 0);
+      });
+    }
+
+    test.each([undefined, null])(
+      `${mode} refuses reserved persisted name with metadata %s and no working path`,
+      async metadata => {
+        const prior = row({ workflow_name: reserved, metadata, working_path: null });
+        const before = structuredClone(prior);
+        const platform = setup(mode, prior);
+        await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+        expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+        expectNoDispatch();
+        expect(prior).toEqual(before);
+      }
+    );
+
+    test(`${mode} lookup error cannot rediscover or dispatch a replacement`, async () => {
+      const platform = setup(mode, null);
+      mockFindResumableRunByParentConversation.mockRejectedValueOnce(
+        new Error('lookup unavailable')
+      );
+      await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+      expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', unverified);
+      expectNoDispatch();
+      expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(mode === 'global' ? 1 : 0);
+    });
+
+    const malformed: [string, unknown][] = [
+      ['undefined', undefined],
+      ['primitive', false],
+      ['array', []],
+      ['missing name', {}],
+      ['bad name', row({ workflow_name: 3 })],
+      ['metadata string', row({ metadata: 'bad' })],
+      ['metadata array', row({ metadata: [] })],
+      ['bad path', row({ working_path: 3 })],
+    ];
+    test.each(malformed)(
+      `${mode} malformed %s output cannot start a replacement`,
+      async (_label, output) => {
+        const platform = setup(mode, output);
+        await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+        expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', unverified);
+        expectNoDispatch();
+        expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(mode === 'global' ? 1 : 0);
+      }
+    );
+
+    test(`${mode} both refusal notification failures cannot reach discovery fallback`, async () => {
+      const platform = setup(mode, row({ metadata: { codex_only_dispatch: false } }));
+      const messages: string[] = [];
+      platform.sendMessage = mock(async (_id: string, text: string) => {
+        if (text === 'ok') return;
+        messages.push(text);
+        throw new Error('notification unavailable');
+      });
+      await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+      expect(messages).toEqual([refusal, unverified]);
+      expectNoDispatch();
+      expect(mockDiscoverWorkflowsWithConfig).toHaveBeenCalledTimes(mode === 'global' ? 1 : 0);
+    });
+  }
+
+  test.each([false, true])(
+    'ordinary web interactive=%s preserves foreground cwd and parent identity',
+    async interactive => {
+      const platform = setup('scoped', row({ metadata: null }), interactive);
+      await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+      expect(mockFindResumableRunByParentConversation).toHaveBeenCalledTimes(1);
+      expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockExecuteWorkflow.mock.calls[0][3]).toBe('/worktrees/prior-run');
+      expect(mockExecuteWorkflow.mock.calls[0][10]).toBe('conv-1');
+      expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+      expect(mockValidateAndResolveIsolation).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  test.each([null, undefined, ''])(
+    'ordinary missing path %s retains background replacement behavior',
+    async working_path => {
+      const platform = setup('scoped', row({ working_path, metadata: undefined }));
+      await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+      expect(mockFindResumableRunByParentConversation).toHaveBeenCalledTimes(1);
+      expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    }
+  );
+
+  test('ordinary non-web dispatch retains no parent resume lookup', async () => {
+    const platform = setup('scoped', null, true);
+    platform.getPlatformType = mock(() => 'slack' as const);
+    await handleMessage(platform, 'conv-1', '/workflow run assist WO-guard');
+    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+  });
+});
+
+describe('binding-v2 generic result closed admission', () => {
+  const reserved = 'bdc-feature-development-codex-only';
+  const refusal = 'Codex-only dispatch is not available yet; no workflow was started.';
+
+  beforeEach(() => {
+    mockGetOrCreateConversation.mockReset();
+    mockGetCodebase.mockReset();
+    mockListCodebases.mockReset();
+    mockParseCommand.mockReset();
+    mockHandleCommand.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockFindResumableRunByParentConversation.mockReset();
+    mockFindResumableRunByParentConversation.mockImplementation(() => Promise.resolve(null));
+    mockUpdateConversation.mockReset();
+    mockUpdateConversation.mockImplementation(() => Promise.resolve());
+    mockSyncArchonToWorktree.mockClear();
+    mockSyncWorkspace.mockClear();
+    mockValidateAndResolveIsolation.mockClear();
+    mockExecuteWorkflow.mockClear();
+    mockDispatchBackgroundWorkflow.mockClear();
+    mockSendQuery.mockClear();
+    mockNaturalApprovalUpdate.mockClear();
+    mockCreateWorkflowEvent.mockClear();
+  });
+
+  function setup(scoped: boolean, actualName: string, projectCount = 1, interactive = false) {
+    const codebase = makeCodebaseForSync();
+    const conversation = makeConversation({ codebase_id: scoped ? codebase.id : null });
+    const workflow = makeTestWorkflowWithSource({ name: actualName, interactive });
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(conversation));
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+    mockListCodebases.mockImplementation(() =>
+      Promise.resolve(projectCount === 1 ? [codebase] : [codebase, makeCodebase('other-project')])
+    );
+    mockParseCommand.mockReturnValueOnce({
+      command: 'workflow',
+      args: ['run', actualName, 'WO-generic-result'],
+    });
+    mockHandleCommand.mockImplementation(() =>
+      Promise.resolve({
+        success: true,
+        message: `Starting workflow: \`${actualName}\``,
+        workflow: { definition: workflow.workflow, args: 'WO-generic-result' },
+      })
+    );
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [workflow], errors: [] })
+    );
+    return { platform: makePlatform(), command: `/workflow run ${actualName} WO-generic-result` };
+  }
+
+  function expectNoDelegation() {
+    expect(mockUpdateConversation).not.toHaveBeenCalled();
+    expect(mockSyncArchonToWorktree).not.toHaveBeenCalled();
+    expect(mockSyncWorkspace).not.toHaveBeenCalled();
+    expect(mockValidateAndResolveIsolation).not.toHaveBeenCalled();
+    expect(mockFindResumableRunByParentConversation).not.toHaveBeenCalled();
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    expect(mockSendQuery).not.toHaveBeenCalled();
+    expect(mockNaturalApprovalUpdate).not.toHaveBeenCalled();
+    expect(mockCreateWorkflowEvent).not.toHaveBeenCalled();
+  }
+
+  for (const mode of ['background', 'interactive', 'non-web']) {
+    test(`scoped ${mode} refuses selected reserved result before announcing or delegating`, async () => {
+      const { platform, command } = setup(true, reserved, 1, mode === 'interactive');
+      if (mode === 'non-web') platform.getPlatformType = mock(() => 'slack' as const);
+      await handleMessage(platform, 'conv-1', command);
+      expect(mockHandleCommand).toHaveBeenCalledTimes(1);
+      expect(platform.sendMessage).toHaveBeenCalledTimes(1);
+      expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+      expect(platform.sendMessage).not.toHaveBeenCalledWith(
+        'conv-1',
+        `Starting workflow: \`${reserved}\``
+      );
+      expect(mockDiscoverWorkflowsWithConfig).not.toHaveBeenCalled();
+      expectNoDelegation();
+    });
+  }
+
+  test('scoped refusal notification failure never delegates or retries the handler', async () => {
+    const { platform, command } = setup(true, reserved);
+    const messages: string[] = [];
+    platform.sendMessage = mock(async (_id: string, text: string) => {
+      messages.push(text);
+      if (text === refusal) throw new Error('owned refusal output failure');
+    });
+    await handleMessage(platform, 'conv-1', command);
+    expect(mockHandleCommand).toHaveBeenCalledTimes(1);
+    expect(messages[0]).toBe(refusal);
+    expect(messages).not.toContain(`Starting workflow: \`${reserved}\``);
+    expectNoDelegation();
+  });
+
+  test('ordinary selected definition preserves handler message despite reserved words', async () => {
+    const { platform, command } = setup(true, 'assist');
+    const message = `Starting workflow: \`assist\`; discuss ${reserved}`;
+    mockHandleCommand.mockImplementation(() =>
+      Promise.resolve({
+        success: true,
+        message,
+        workflow: { definition: makeTestWorkflow({ name: 'assist' }), args: 'WO-generic-result' },
+      })
+    );
+    await handleMessage(platform, 'conv-1', command);
+    expect(mockHandleCommand).toHaveBeenCalledTimes(1);
+    expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', message);
+    expect(platform.sendMessage).not.toHaveBeenCalledWith('conv-1', refusal);
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+    expect(mockDispatchBackgroundWorkflow.mock.calls[0][1].name).toBe('assist');
+    expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+  });
+
+  test('generic non-workflow result preserves the original response', async () => {
+    const { platform, command } = setup(true, 'assist');
+    const message = `No execution requested for ${reserved}`;
+    mockHandleCommand.mockImplementation(() =>
+      Promise.resolve({ success: true, message, workflow: undefined })
+    );
+    await handleMessage(platform, 'conv-1', command);
+    expect(mockHandleCommand).toHaveBeenCalledTimes(1);
+    expect(platform.sendMessage).toHaveBeenCalledTimes(1);
+    expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', message);
+    expectNoDelegation();
+  });
+
+  for (const projectCount of [1, 2]) {
+    test(`unscoped ${projectCount}-project reserved direct slash never uses generic handler`, async () => {
+      const { platform, command } = setup(false, reserved, projectCount);
+      await handleMessage(platform, 'conv-1', command);
+      expect(mockHandleCommand).not.toHaveBeenCalled();
+      expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', refusal);
+      expect(platform.sendMessage).not.toHaveBeenCalledWith(
+        'conv-1',
+        `Starting workflow: \`${reserved}\``
+      );
+      expectNoDelegation();
+    });
+
+    test(`unscoped ${projectCount}-project ordinary direct slash keeps original dispatch`, async () => {
+      const { platform, command } = setup(false, 'assist', projectCount);
+      await handleMessage(platform, 'conv-1', command);
+      expect(mockHandleCommand).not.toHaveBeenCalled();
+      expect(platform.sendMessage).toHaveBeenCalledWith('conv-1', 'Starting workflow: `assist`');
+      expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockDispatchBackgroundWorkflow.mock.calls[0][1].name).toBe('assist');
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+    });
+  }
 });

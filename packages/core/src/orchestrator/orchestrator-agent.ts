@@ -248,8 +248,75 @@ async function dispatchOrchestratorWorkflow(
   workflow: WorkflowDefinition,
   userMessage: string,
   isolationHints?: HandleMessageContext['isolationHints'],
-  modelOverride?: ModelOverride
+  modelOverride?: ModelOverride,
+  announceStart = false
 ): Promise<void> {
+  if (workflow.name === 'bdc-feature-development-codex-only') {
+    await platform.sendMessage(
+      conversationId,
+      'Codex-only dispatch is not available yet; no workflow was started.'
+    );
+    return;
+  }
+
+  let resumableRun: Awaited<ReturnType<typeof workflowDb.findResumableRunByParentConversation>> =
+    null;
+  if (platform.getPlatformType() === 'web') {
+    try {
+      resumableRun = await workflowDb.findResumableRunByParentConversation(
+        workflow.name,
+        conversation.id
+      );
+      if (resumableRun !== null) {
+        if (
+          typeof resumableRun !== 'object' ||
+          Array.isArray(resumableRun) ||
+          typeof resumableRun.workflow_name !== 'string'
+        ) {
+          throw new Error('Invalid foreground resume lookup result');
+        }
+        if (
+          resumableRun.workflow_name === 'bdc-feature-development-codex-only' ||
+          Object.prototype.hasOwnProperty.call(resumableRun.metadata ?? {}, 'codex_only_dispatch')
+        ) {
+          await platform.sendMessage(
+            conversationId,
+            'Codex-only continuation is not available; the prior run was left unchanged.'
+          );
+          return;
+        }
+        if (
+          (resumableRun.metadata != null &&
+            (typeof resumableRun.metadata !== 'object' || Array.isArray(resumableRun.metadata))) ||
+          (resumableRun.working_path != null && typeof resumableRun.working_path !== 'string')
+        ) {
+          throw new Error('Invalid foreground resume lookup fields');
+        }
+      }
+    } catch {
+      getLog().warn(
+        { conversationId, workflowName: workflow.name },
+        'orchestrator.foreground_resume_precheck_failed'
+      );
+      try {
+        await platform.sendMessage(
+          conversationId,
+          'Workflow continuation could not be verified; no workflow was started.'
+        );
+      } catch {
+        getLog().warn(
+          { conversationId, workflowName: workflow.name },
+          'orchestrator.foreground_resume_refusal_notification_failed'
+        );
+      }
+      return;
+    }
+  }
+
+  if (announceStart) {
+    await platform.sendMessage(conversationId, `Starting workflow: \`${workflow.name}\``);
+  }
+
   // Auto-attach project to conversation
   await db.updateConversation(conversation.id, {
     codebase_id: codebase.id,
@@ -310,10 +377,6 @@ async function dispatchOrchestratorWorkflow(
     // Check for a resumable run from a prior dispatch (e.g. approved approval gate).
     // A new background dispatch would create a new worker conversation and never find
     // the prior run's worktree. Execute in foreground to reuse the original working path.
-    const resumableRun = await workflowDb.findResumableRunByParentConversation(
-      workflow.name,
-      conversation.id
-    );
     if (resumableRun?.working_path) {
       getLog().info(
         {
@@ -622,6 +685,73 @@ export async function handleMessage(
       conversationId
     );
 
+    // Check paused continuation before any title-provider or approval effects.
+    // Conversation creation and thread inheritance have already happened above.
+    let pausedRun: Awaited<ReturnType<typeof workflowDb.getPausedWorkflowRun>> = null;
+    let restrictedPausedRun = false;
+    let pausedWorkflowName: string | undefined;
+    let pausedWorkflowRunId: string | undefined;
+    let approvalNodeId: string | undefined;
+    let approvalType: ApprovalContext['type'];
+    let captureResponse: ApprovalContext['captureResponse'];
+    if (!message.startsWith('/')) {
+      try {
+        pausedRun = await workflowDb.getPausedWorkflowRun(conversation.id);
+        if (pausedRun !== null) {
+          if (typeof pausedRun !== 'object' || Array.isArray(pausedRun)) {
+            throw new Error('Invalid paused workflow lookup result');
+          }
+          pausedWorkflowName = pausedRun.workflow_name;
+          if (typeof pausedWorkflowName !== 'string') {
+            throw new Error('Invalid paused workflow lookup name');
+          }
+          if (pausedWorkflowName === 'bdc-feature-development-codex-only') {
+            restrictedPausedRun = true;
+          } else {
+            const metadata = pausedRun.metadata;
+            restrictedPausedRun = Object.prototype.hasOwnProperty.call(
+              metadata ?? {},
+              'codex_only_dispatch'
+            );
+            if (!restrictedPausedRun) {
+              if (metadata != null && (typeof metadata !== 'object' || Array.isArray(metadata))) {
+                throw new Error('Invalid paused workflow lookup fields');
+              }
+              pausedWorkflowRunId = pausedRun.id;
+              if (typeof pausedWorkflowRunId !== 'string') {
+                throw new Error('Invalid paused workflow lookup ID');
+              }
+              const approvalRaw = metadata?.approval;
+              if (
+                approvalRaw != null &&
+                typeof approvalRaw === 'object' &&
+                'nodeId' in approvalRaw
+              ) {
+                const nodeId = (approvalRaw as Record<string, unknown>).nodeId;
+                if (typeof nodeId === 'string') {
+                  approvalNodeId = nodeId;
+                  approvalType = (approvalRaw as ApprovalContext).type;
+                  if (approvalType !== 'interactive_loop') {
+                    captureResponse = (approvalRaw as ApprovalContext).captureResponse;
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // Native lookup/parser/getter errors may contain persisted payloads.
+        throw new Error('Paused workflow continuation could not be verified');
+      }
+      if (restrictedPausedRun) {
+        await platform.sendMessage(
+          conversationId,
+          'Codex-only continuation is not available; the paused run was left unchanged.'
+        );
+        return;
+      }
+    }
+
     // 1c. Auto-generate title for untitled conversations (fire-and-forget)
     if (!conversation.title && !message.startsWith('/')) {
       void generateAndSetTitle(
@@ -635,33 +765,28 @@ export async function handleMessage(
     // Natural-language approval routing -- if a workflow is paused in this
     // conversation, treat any non-slash message as the approval response.
     if (!message.startsWith('/')) {
-      const pausedRun = await workflowDb.getPausedWorkflowRun(conversation.id);
-      if (pausedRun) {
-        const approvalRaw = pausedRun.metadata.approval;
-        const hasValidApproval =
-          approvalRaw != null &&
-          typeof approvalRaw === 'object' &&
-          'nodeId' in approvalRaw &&
-          typeof (approvalRaw as Record<string, unknown>).nodeId === 'string';
-
-        if (!hasValidApproval) {
+      if (
+        pausedRun !== null &&
+        pausedWorkflowName !== undefined &&
+        pausedWorkflowRunId !== undefined
+      ) {
+        if (approvalNodeId === undefined) {
           // Paused run exists but approval context is missing or corrupt --
           // tell the user so they can use explicit commands instead.
           await platform.sendMessage(
             conversationId,
             'A workflow is paused but its approval context is missing. ' +
-              `Use \`/workflow approve ${pausedRun.id}\` or \`/workflow reject ${pausedRun.id}\`.`
+              `Use \`/workflow approve ${pausedWorkflowRunId}\` or \`/workflow reject ${pausedWorkflowRunId}\`.`
           );
           return;
         }
 
-        const approval = approvalRaw as ApprovalContext;
         getLog().info(
           {
             conversationId,
-            workflowRunId: pausedRun.id,
-            nodeId: approval.nodeId,
-            workflowName: pausedRun.workflow_name,
+            workflowRunId: pausedWorkflowRunId,
+            nodeId: approvalNodeId,
+            workflowName: pausedWorkflowName,
           },
           'orchestrator.natural_language_approval_started'
         );
@@ -669,28 +794,28 @@ export async function handleMessage(
         try {
           // Write approval events -- for interactive loops, do NOT write node_completed
           // (the executor writes it when the AI emits the completion signal on actual exit).
-          if (approval.type !== 'interactive_loop') {
-            const nodeOutput = approval.captureResponse === true ? message : '';
+          if (approvalType !== 'interactive_loop') {
+            const nodeOutput = captureResponse === true ? message : '';
             await workflowEventDb.createWorkflowEvent({
-              workflow_run_id: pausedRun.id,
+              workflow_run_id: pausedWorkflowRunId,
               event_type: 'node_completed',
-              step_name: approval.nodeId,
+              step_name: approvalNodeId,
               data: { node_output: nodeOutput, approval_decision: 'approved' },
             });
           }
           await workflowEventDb.createWorkflowEvent({
-            workflow_run_id: pausedRun.id,
+            workflow_run_id: pausedWorkflowRunId,
             event_type: 'approval_received',
-            step_name: approval.nodeId,
+            step_name: approvalNodeId,
             data: { decision: 'approved', comment: message },
           });
           // For interactive loops, store user input; for standard approvals, mark as approved
           // and clear any rejection state.
           const metadataUpdate: Record<string, unknown> =
-            approval.type === 'interactive_loop'
+            approvalType === 'interactive_loop'
               ? { loop_user_input: message }
               : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
-          await workflowDb.updateWorkflowRun(pausedRun.id, {
+          await workflowDb.updateWorkflowRun(pausedWorkflowRunId, {
             status: 'failed',
             metadata: metadataUpdate,
           });
@@ -698,11 +823,11 @@ export async function handleMessage(
           // Discover workflow and resume
           const { workflows: discoveredWorkflows } = await discoverAllWorkflows(conversation);
           const allWorkflows: WorkflowDefinition[] = discoveredWorkflows.map(w => w.workflow);
-          const workflow = findWorkflow(pausedRun.workflow_name, allWorkflows);
+          const workflow = findWorkflow(pausedWorkflowName, allWorkflows);
           if (!workflow) {
             await platform.sendMessage(
               conversationId,
-              `Approved, but workflow \`${pausedRun.workflow_name}\` not found. ` +
+              `Approved, but workflow \`${pausedWorkflowName}\` not found. ` +
                 'The approval was recorded -- use `/workflow list` to check available workflows.'
             );
             return;
@@ -729,18 +854,22 @@ export async function handleMessage(
             isolationHints
           );
           getLog().info(
-            { conversationId, workflowRunId: pausedRun.id, workflowName: pausedRun.workflow_name },
+            {
+              conversationId,
+              workflowRunId: pausedWorkflowRunId,
+              workflowName: pausedWorkflowName,
+            },
             'orchestrator.natural_language_approval_completed'
           );
         } catch (error) {
           getLog().error(
-            { err: error as Error, workflowRunId: pausedRun.id, conversationId },
+            { err: error as Error, workflowRunId: pausedWorkflowRunId, conversationId },
             'orchestrator.natural_language_approval_failed'
           );
           await platform.sendMessage(
             conversationId,
             `Approval failed: ${(error as Error).message}. ` +
-              `Try again or use \`/workflow approve ${pausedRun.id}\` explicitly.`
+              `Try again or use \`/workflow approve ${pausedWorkflowRunId}\` explicitly.`
           );
         }
         return;
@@ -802,6 +931,13 @@ export async function handleMessage(
 
         getLog().debug({ command, conversationId }, 'deterministic_command');
         const result = await commandHandler.handleCommand(conversation, message);
+        if (result.workflow?.definition.name === 'bdc-feature-development-codex-only') {
+          await platform.sendMessage(
+            conversationId,
+            'Codex-only dispatch is not available yet; no workflow was started.'
+          );
+          return;
+        }
         await platform.sendMessage(conversationId, result.message);
 
         if (result.workflow) {
@@ -1812,13 +1948,14 @@ async function handleWorkflowRunSlashCommand(
     return true;
   }
 
+  let globalWorkflow: WorkflowDefinition | undefined;
   try {
     const globalDiscovery = await discoverWorkflowsWithConfig(
       getArchonWorkspacesPath(),
       loadConfig
     );
     const globalWorkflows = globalDiscovery.workflows.map(w => w.workflow);
-    const globalWorkflow = resolveWorkflowByName(workflowName, globalWorkflows);
+    globalWorkflow = resolveWorkflowByName(workflowName, globalWorkflows);
     if (globalWorkflow) {
       const binding = resolveBoundCodebase({
         workflowName,
@@ -1831,7 +1968,6 @@ async function handleWorkflowRunSlashCommand(
         { workflowName, boundCodebase: codebase.name, source: binding.source },
         'workflow_codebase_bound'
       );
-      await platform.sendMessage(conversationId, `Starting workflow: \`${globalWorkflow.name}\``);
       await dispatchOrchestratorWorkflow(
         platform,
         conversationId,
@@ -1840,11 +1976,15 @@ async function handleWorkflowRunSlashCommand(
         globalWorkflow,
         binding.userMessage,
         isolationHints,
-        modelOverride
+        modelOverride,
+        true
       );
       return true;
     }
   } catch (error) {
+    if (globalWorkflow?.name === 'bdc-feature-development-codex-only') {
+      throw error;
+    }
     getLog().warn({ err: error as Error, workflowName }, 'global_workflow_run_discovery_failed');
   }
 
@@ -1878,7 +2018,6 @@ async function handleWorkflowRunSlashCommand(
       { workflowName: workflow.name, boundCodebase: codebase.name, source: binding.source },
       'workflow_codebase_bound'
     );
-    await platform.sendMessage(conversationId, `Starting workflow: \`${workflow.name}\``);
     await dispatchOrchestratorWorkflow(
       platform,
       conversationId,
@@ -1887,7 +2026,8 @@ async function handleWorkflowRunSlashCommand(
       workflow,
       binding.userMessage,
       isolationHints,
-      modelOverride
+      modelOverride,
+      true
     );
     return true;
   }
@@ -1910,7 +2050,6 @@ async function handleWorkflowRunSlashCommand(
           },
           'workflow_codebase_bound'
         );
-        await platform.sendMessage(conversationId, `Starting workflow: \`${match.workflow.name}\``);
         await dispatchOrchestratorWorkflow(
           platform,
           conversationId,
@@ -1919,7 +2058,8 @@ async function handleWorkflowRunSlashCommand(
           match.workflow,
           binding.userMessage,
           isolationHints,
-          modelOverride
+          modelOverride,
+          true
         );
         return true;
       }

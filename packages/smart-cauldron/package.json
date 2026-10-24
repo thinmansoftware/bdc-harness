@@ -24,7 +24,8 @@
   },
   "dependencies": {
     "@archon/overseer": "workspace:*",
-    "@archon/paths": "workspace:*"
+    "@archon/paths": "workspace:*",
+    "@archon/providers": "workspace:*"
   },
   "devDependencies": {
     "@archon/core": "workspace:*"

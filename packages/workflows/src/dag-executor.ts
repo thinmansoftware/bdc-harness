@@ -8,6 +8,7 @@
 import { existsSync } from 'fs';
 import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
+import { isDeepStrictEqual } from 'util';
 import { tmpdir } from 'os';
 import {
   isAbsolute,
@@ -115,7 +116,7 @@ import {
   selectQuotaExhaustionRoute,
 } from './node-failover';
 import { loadAgentRegistry, resolveAgent } from './agents/registry';
-import type { AgentRegistry } from './agents/registry';
+import type { AgentRegistry, AgentPersona } from './agents/registry';
 import { loadContext } from '@archon/persona-context-loader';
 import { deriveEntryRung, computeFrontierCost } from './model-rates';
 import {
@@ -134,6 +135,10 @@ import type {
   TerminalWorkflowPersistence,
 } from './reliability/types';
 import { withRunLease } from './run-lease';
+import {
+  isCodexOnlyV2ProviderId,
+  type CodexOnlyV2ProviderId,
+} from './reliability/dispatch-binding';
 
 function cancellationPersistence(
   runId: string,
@@ -573,6 +578,15 @@ function resolveFailoverTarget(
     provider,
     model: ref.failover_model ?? workflowLevelOptions.failoverModel,
     agent: ref.failover_agent,
+  };
+}
+
+function buildApprovalRejectionNode(node: ApprovalNode, prompt: string): PromptNode {
+  return {
+    id: `${node.id}:on_reject`,
+    prompt,
+    ...(node.depends_on ? { depends_on: node.depends_on } : {}),
+    ...(node.idle_timeout ? { idle_timeout: node.idle_timeout } : {}),
   };
 }
 
@@ -1697,6 +1711,490 @@ export function substituteNodeOutputRefs(
 // buildSDKHooksFromYAML moved to @archon/providers/src/claude/provider.ts
 // loadMcpConfig moved to @archon/providers/src/claude/provider.ts
 
+/** The existing DAG execution input, shared with invocation binding preparation. */
+export type DagBindingWorkflow = {
+  name: string;
+  nodes: readonly DagNode[];
+  inputs?: Record<string, { default: string }>;
+  interactive?: boolean;
+  // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: workflow-root failover defaults
+  // (snake_case YAML field names on WorkflowDefinition).
+  failover_provider?: string;
+  failover_model?: string;
+} & WorkflowLevelOptions;
+
+interface DagNodeBindingInput {
+  node: DagNode;
+  workflowProvider: string;
+  workflowModel: string | undefined;
+  config: WorkflowConfig;
+  workflowLevelOptions?: WorkflowLevelOptions;
+  modelOverride?: ModelOverride;
+  // Selected loop failovers already own a provider/model pair; never reapply overrides.
+  kind: 'prompt' | 'loop' | 'selected-loop';
+  // Ordinary loops capture options before the awaited persona-registry read.
+  loopOptions?: SendQueryOptions;
+  // Ordinary prompt/command fields are captured before awaiting the registry.
+  promptFields?: {
+    systemPrompt: string | undefined;
+    allowedTools: string[] | undefined;
+  };
+}
+
+interface DagBindingBase {
+  declaredProvider: string;
+  provider: string;
+  model: string | undefined;
+  assistantModels: Record<string, string | undefined>;
+}
+
+function resolveDagBindingBase(input: DagNodeBindingInput): DagBindingBase {
+  const { node, workflowProvider, workflowModel, config, modelOverride } = input;
+  const assistantModels =
+    input.kind === 'selected-loop'
+      ? {}
+      : Object.fromEntries(
+          Object.entries(config.assistants).map(([providerId, assistant]) => [
+            providerId,
+            assistant?.model as string | undefined,
+          ])
+        );
+  const resolved =
+    input.kind === 'selected-loop'
+      ? { provider: workflowProvider, model: workflowModel }
+      : resolveModelForNode({
+          nodeId: node.id,
+          nodeProvider: node.provider,
+          nodeModel: node.model,
+          workflowProvider,
+          workflowModel,
+          assistantModels,
+          modelOverride,
+        });
+  // Selected-loop pairs were checked by the caller's existing dispatch path.
+  if (input.kind !== 'selected-loop' && !isRegisteredProvider(resolved.provider)) {
+    throw new Error(
+      `Node '${node.id}': unknown provider '${resolved.provider}'. Registered: ${getRegisteredProviders()
+        .map(p => p.id)
+        .join(', ')}`
+    );
+  }
+  return { declaredProvider: node.provider ?? workflowProvider, ...resolved, assistantModels };
+}
+
+interface DagBindingResult {
+  base: DagBindingBase;
+  provider: string;
+  factoryProvider: string;
+  model: string | undefined;
+  declaredModelId: string | undefined;
+  options: SendQueryOptions;
+  persona: AgentPersona | undefined;
+}
+
+// Computation only apart from the existing resolver's diagnostic logs.
+// No provider, context, platform, execution-store or filesystem work occurs here.
+function finishDagPersonaBinding(
+  input: DagNodeBindingInput,
+  base: DagBindingBase,
+  persona: AgentPersona | undefined
+): DagBindingResult {
+  const { node, config } = input;
+  const { provider, model } = base;
+  if (input.kind !== 'prompt') {
+    const options =
+      input.loopOptions ??
+      buildLoopNodeOptions(node as LoopNode, provider, model, config, input.workflowLevelOptions);
+    if (persona) {
+      const resolution = resolveAgentPersona(persona, options.model, provider);
+      // Keep the explicit undefined model property produced by ordinary Codex personas.
+      options.model = resolution.model;
+      options.systemPrompt = options.systemPrompt
+        ? `${resolution.systemPrompt}\n\n${options.systemPrompt}`
+        : resolution.systemPrompt;
+    }
+    return {
+      base,
+      provider: resolveProviderId(provider),
+      factoryProvider: provider,
+      model: options.model,
+      declaredModelId: model,
+      options,
+      persona,
+    };
+  }
+  const promptBinding = resolveDagPromptPersonaBinding(input, base, persona);
+  return completeDagPromptBinding(input, base, promptBinding, promptBinding.systemPrompt);
+}
+
+interface DagPromptPersonaBinding {
+  model: string | undefined;
+  systemPrompt: string | undefined;
+  allowedTools: string[] | undefined;
+  persona: AgentPersona | undefined;
+}
+
+function resolveDagPromptPersonaBinding(
+  input: DagNodeBindingInput,
+  base: DagBindingBase,
+  persona: AgentPersona | undefined
+): DagPromptPersonaBinding {
+  const { node, workflowProvider, workflowModel, modelOverride } = input;
+  const { provider, model, assistantModels } = base;
+  let effectiveModel = model;
+  const promptFields = input.promptFields ?? {
+    systemPrompt: node.systemPrompt,
+    allowedTools: node.allowed_tools,
+  };
+  let effectiveSystemPrompt = promptFields.systemPrompt;
+  let effectiveAllowedTools = promptFields.allowedTools;
+  if (persona) {
+    // A per-node override owns the binding completely. It must not be rejected
+    // because the persona pins a different provider's model, or because a
+    // Claude-targeted override is paired with a persona that has no model.
+    // Retain the persona prompt/tools while replacing its model binding with
+    // the override for Claude (whose persona resolver requires a model) and
+    // removing it for providers whose persona resolver does not.
+    const nodeBindingOverride = modelOverride?.nodes?.[node.id];
+    const personaForResolution = nodeBindingOverride
+      ? { ...persona, model: provider === 'claude' ? model : undefined }
+      : persona;
+    const personaResolution = resolveAgentPersona(personaForResolution, effectiveModel, provider);
+    effectiveModel = resolveModelForNode({
+      nodeId: node.id,
+      nodeProvider: node.provider,
+      nodeModel: node.model,
+      personaModel: personaResolution.model,
+      workflowProvider,
+      workflowModel,
+      assistantModels,
+      modelOverride,
+    }).model;
+    // Prepend agent system prompt (agent role comes before node task)
+    effectiveSystemPrompt = effectiveSystemPrompt
+      ? `${personaResolution.systemPrompt}\n\n${effectiveSystemPrompt}`
+      : personaResolution.systemPrompt;
+    // Agent tools only apply when node doesn't already restrict tools
+    if (personaResolution.allowedTools && !effectiveAllowedTools) {
+      effectiveAllowedTools = personaResolution.allowedTools;
+    }
+  }
+
+  return {
+    model: effectiveModel,
+    systemPrompt: effectiveSystemPrompt,
+    allowedTools: effectiveAllowedTools,
+    persona,
+  };
+}
+
+// Ordinary execution calls this after awaited context loading. Keep live option,
+// assistant and declared-telemetry reads here, after persona/model selection.
+function completeDagPromptBinding(
+  input: DagNodeBindingInput,
+  base: DagBindingBase,
+  personaBinding: DagPromptPersonaBinding,
+  effectiveSystemPrompt: string | undefined
+): DagBindingResult {
+  const { node, config, modelOverride } = input;
+  const workflowLevelOptions = input.workflowLevelOptions ?? {};
+  const { provider, model } = base;
+  const { model: effectiveModel, allowedTools: effectiveAllowedTools, persona } = personaBinding;
+  // Build universal base options
+  const baseOptions: SendQueryOptions = {};
+  if (effectiveModel) baseOptions.model = effectiveModel;
+  if (config.envVars && Object.keys(config.envVars).length > 0) {
+    baseOptions.env = config.envVars;
+  }
+  if (effectiveSystemPrompt !== undefined) baseOptions.systemPrompt = effectiveSystemPrompt;
+  if (node.maxBudgetUsd !== undefined) baseOptions.maxBudgetUsd = node.maxBudgetUsd;
+  const fb = node.fallbackModel ?? workflowLevelOptions.fallbackModel;
+  if (fb) baseOptions.fallbackModel = fb;
+  if (node.output_format) {
+    baseOptions.outputFormat = { type: 'json_schema', schema: node.output_format };
+  }
+
+  // Build raw nodeConfig -- provider translates internally
+  const nodeConfig: NodeConfig = {
+    mcp: node.mcp,
+    hooks: node.hooks,
+    skills: node.skills,
+    agents: node.agents,
+    allowed_tools: effectiveAllowedTools,
+    denied_tools: node.denied_tools,
+    effort: node.effort ?? workflowLevelOptions.effort,
+    thinking: node.thinking ?? workflowLevelOptions.thinking,
+    sandbox: node.sandbox ?? workflowLevelOptions.sandbox,
+    betas: node.betas ?? workflowLevelOptions.betas,
+    output_format: node.output_format,
+    maxBudgetUsd: node.maxBudgetUsd,
+    systemPrompt: effectiveSystemPrompt,
+    fallbackModel: fb,
+  };
+
+  // Assistant config stays keyed by the id as written (assistants.grok still applies).
+  const assistantConfig = config.assistants[provider] ?? {};
+  const canonicalProvider = resolveProviderId(provider);
+
+  const options: SendQueryOptions = {
+    ...baseOptions,
+    nodeConfig,
+    assistantConfig,
+  };
+
+  return {
+    base,
+    provider: canonicalProvider,
+    factoryProvider: canonicalProvider,
+    model: effectiveModel,
+    options,
+    persona,
+    declaredModelId: modelOverride?.nodes?.[node.id]?.model ?? model,
+  };
+}
+
+function dagWorkflowLevelOptions(workflow: DagBindingWorkflow): WorkflowLevelOptions {
+  return {
+    effort: workflow.effort,
+    thinking: workflow.thinking,
+    fallbackModel: workflow.fallbackModel,
+    betas: workflow.betas,
+    sandbox: workflow.sandbox,
+    // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: workflow-level failover defaults.
+    failoverProvider: workflow.failover_provider,
+    failoverModel: workflow.failover_model,
+  };
+}
+
+declare const preparedDagBindingsBrand: unique symbol;
+/** Opaque invocation-owned binding handle, never an admission or dispatch authority. */
+export interface PreparedDagBindings {
+  readonly [preparedDagBindingsBrand]: true;
+}
+
+type DagBindingRole = 'primary' | 'availability' | 'quota' | 'approval-rejection';
+interface PreparedDagBindingState {
+  identityPolicy: 'codex-only-v2' | undefined;
+  inputs: {
+    cwd: string;
+    workflow: DagBindingWorkflow;
+    workflowProvider: string;
+    workflowModel: string | undefined;
+    config: WorkflowConfig;
+    modelOverride: ModelOverride | undefined;
+  };
+  registry: AgentRegistry;
+  // Owner index is independent of synthetic IDs, which can collide with real node IDs.
+  bindings: Map<number, Map<DagBindingRole, DagBindingResult>>;
+}
+const preparedDagBindingStates = new WeakMap<PreparedDagBindings, PreparedDagBindingState>();
+
+function assertPreparedCodexProvider(provider: string | undefined): void {
+  if (provider !== undefined && provider !== 'codex') {
+    throw new Error('prepared_dag_bindings: restricted bindings require exact logical codex');
+  }
+}
+
+export async function prepareDagBindings(
+  cwd: string,
+  workflow: DagBindingWorkflow,
+  workflowProvider: string,
+  workflowModel: string | undefined,
+  config: WorkflowConfig,
+  modelOverride?: ModelOverride,
+  identityPolicy?: 'codex-only-v2'
+): Promise<PreparedDagBindings> {
+  if (identityPolicy !== undefined && identityPolicy !== 'codex-only-v2') {
+    throw new Error('prepared_dag_bindings: invalid identity_policy');
+  }
+  const inputs = structuredClone({
+    cwd,
+    workflow,
+    workflowProvider,
+    workflowModel,
+    config,
+    modelOverride,
+  });
+  const assertProvider = (provider: unknown): void => {
+    if (identityPolicy === 'codex-only-v2') {
+      if (provider !== undefined && !isCodexOnlyV2ProviderId(provider)) {
+        throw new Error('prepared_dag_bindings: v2 requires literal Codex provider identity');
+      }
+    } else {
+      assertPreparedCodexProvider(provider as string | undefined);
+    }
+  };
+  assertProvider(inputs.workflowProvider);
+  assertProvider(inputs.workflow.failover_provider);
+  assertProvider(inputs.modelOverride?.workflow?.provider);
+  if (identityPolicy === 'codex-only-v2') {
+    // The public execution shape omits the raw root provider; do not lose its declaration.
+    assertProvider((inputs.workflow as DagBindingWorkflow & { provider?: unknown }).provider);
+    for (const node of inputs.workflow.nodes) {
+      assertProvider(node.provider);
+      assertProvider(node.failover_provider);
+    }
+    for (const override of Object.values(inputs.modelOverride?.nodes ?? {})) {
+      assertProvider(override.provider);
+    }
+  }
+  const registry = structuredClone(await loadAgentRegistry(join(cwd, '.archon', 'agents')));
+  const state: PreparedDagBindingState = { identityPolicy, inputs, registry, bindings: new Map() };
+  const defaults = dagWorkflowLevelOptions(inputs.workflow);
+  for (const [index, owner] of inputs.workflow.nodes.entries()) {
+    const records = new Map<DagBindingRole, DagBindingResult>();
+    state.bindings.set(index, records);
+    const prepare = (
+      node: DagNode,
+      role: DagBindingRole,
+      selected?: { provider: string; model: string | undefined }
+    ): DagBindingResult => {
+      const input: DagNodeBindingInput = {
+        node,
+        workflowProvider: selected?.provider ?? inputs.workflowProvider,
+        workflowModel: selected ? selected.model : inputs.workflowModel,
+        config: inputs.config,
+        modelOverride: inputs.modelOverride,
+        workflowLevelOptions: defaults,
+        kind: selected ? 'selected-loop' : isLoopNode(node) ? 'loop' : 'prompt',
+      };
+      assertProvider(node.provider);
+      assertProvider(node.failover_provider);
+      assertProvider(input.modelOverride?.nodes?.[node.id]?.provider);
+      const base = resolveDagBindingBase(input);
+      assertProvider(base.declaredProvider);
+      assertProvider(base.provider);
+      const ref = node as { agent?: string; persona?: string };
+      const agentName = ref.agent ?? ref.persona;
+      if (agentName && !registry.has(agentName)) {
+        throw new Error(`prepared_dag_bindings: agent_not_found for node '${node.id}'`);
+      }
+      const persona = agentName ? resolveAgent(agentName, registry) : undefined;
+      const result = finishDagPersonaBinding(input, base, persona);
+      assertProvider(result.provider);
+      assertProvider(result.factoryProvider);
+      records.set(role, result);
+      return result;
+    };
+    if (isApprovalNode(owner)) {
+      if (owner.approval.on_reject)
+        prepare(
+          buildApprovalRejectionNode(owner, owner.approval.on_reject.prompt),
+          'approval-rejection'
+        );
+      continue;
+    }
+    if (isBashNode(owner) || isCancelNode(owner) || isScriptNode(owner) || isEvidenceNode(owner))
+      continue;
+    const primary = prepare(owner, 'primary');
+    const availability = resolveFailoverTarget(owner, defaults);
+    const quota = selectQuotaExhaustionRoute(primary.factoryProvider, owner, defaults);
+    for (const [role, target] of [
+      ['availability', availability],
+      ['quota', quota.kind === 'failover' ? { ...quota, agent: owner.failover_agent } : null],
+    ] as const) {
+      if (!target) continue;
+      const selected = isLoopNode(owner)
+        ? {
+            provider: target.provider,
+            model:
+              target.model ??
+              (inputs.config.assistants[target.provider]?.model as string | undefined),
+          }
+        : undefined;
+      prepare(
+        buildFailoverNode(owner, selected ? { ...target, ...selected } : target),
+        role,
+        selected
+      );
+    }
+  }
+  const handle = Object.freeze({}) as PreparedDagBindings;
+  preparedDagBindingStates.set(handle, state);
+  return handle;
+}
+
+export type PreparedDagModelEvidence =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'undefined' }
+  | { readonly kind: 'value'; readonly value: string };
+
+export interface PreparedDagBindingEvidence {
+  readonly ownerIndex: number;
+  readonly ownerNodeId: string;
+  readonly role: 'primary' | 'availability' | 'quota' | 'approval-rejection';
+  readonly declaredProvider: CodexOnlyV2ProviderId;
+  readonly effectiveProvider: CodexOnlyV2ProviderId;
+  readonly canonicalProvider: CodexOnlyV2ProviderId;
+  readonly factoryRequestedProvider: CodexOnlyV2ProviderId;
+  readonly logicalProvider: 'codex';
+  readonly requiredTransport: 'codex-native-strict';
+  readonly prePersonaModel: PreparedDagModelEvidence;
+  readonly resolvedModel: PreparedDagModelEvidence;
+  readonly declaredModel: PreparedDagModelEvidence;
+  readonly requestModel: PreparedDagModelEvidence;
+}
+
+function preparedDagModelEvidence(record: object, key: string): PreparedDagModelEvidence {
+  if (!Object.hasOwn(record, key)) return Object.freeze({ kind: 'absent' });
+  const value = (record as Record<string, unknown>)[key];
+  if (value === undefined) return Object.freeze({ kind: 'undefined' });
+  if (typeof value !== 'string') {
+    throw new Error('prepared_dag_bindings: evidence model must be a string or undefined');
+  }
+  return Object.freeze({ kind: 'value', value });
+}
+
+function preparedDagEvidenceProvider(provider: string): CodexOnlyV2ProviderId {
+  if (!isCodexOnlyV2ProviderId(provider)) {
+    throw new Error('prepared_dag_bindings: evidence requires literal Codex provider identity');
+  }
+  return provider;
+}
+
+/** Captured binding evidence only; requiredTransport is a future enforcement requirement. */
+export function describePreparedDagBindings(
+  handle: PreparedDagBindings
+): readonly PreparedDagBindingEvidence[] {
+  const state = preparedDagBindingStates.get(handle);
+  if (state?.identityPolicy !== 'codex-only-v2') {
+    throw new Error('prepared_dag_bindings: evidence requires a recognized v2 handle');
+  }
+  const rows: PreparedDagBindingEvidence[] = [];
+  const roles: readonly DagBindingRole[] = [
+    'primary',
+    'availability',
+    'quota',
+    'approval-rejection',
+  ];
+  for (const [ownerIndex, records] of [...state.bindings.entries()].sort(
+    ([left], [right]) => left - right
+  )) {
+    for (const role of roles) {
+      const result = records.get(role);
+      if (!result) continue;
+      rows.push(
+        Object.freeze({
+          ownerIndex,
+          ownerNodeId: state.inputs.workflow.nodes[ownerIndex].id,
+          role,
+          declaredProvider: preparedDagEvidenceProvider(result.base.declaredProvider),
+          effectiveProvider: preparedDagEvidenceProvider(result.base.provider),
+          canonicalProvider: preparedDagEvidenceProvider(result.provider),
+          factoryRequestedProvider: preparedDagEvidenceProvider(result.factoryProvider),
+          logicalProvider: 'codex',
+          requiredTransport: 'codex-native-strict',
+          prePersonaModel: preparedDagModelEvidence(result.base, 'model'),
+          resolvedModel: preparedDagModelEvidence(result, 'model'),
+          declaredModel: preparedDagModelEvidence(result, 'declaredModelId'),
+          requestModel: preparedDagModelEvidence(result.options, 'model'),
+        })
+      );
+    }
+  }
+  return Object.freeze(rows);
+}
+
 /**
  * Resolve per-node provider and model.
  * Node-level overrides take precedence over workflow defaults.
@@ -1715,7 +2213,8 @@ async function resolveNodeProviderAndModel(
   workflowRunId: string,
   cwd: string,
   workflowLevelOptions: WorkflowLevelOptions,
-  modelOverride?: ModelOverride
+  modelOverride?: ModelOverride,
+  preparedBinding?: DagBindingResult
 ): Promise<{
   provider: string;
   model: string | undefined;
@@ -1741,34 +2240,17 @@ async function resolveNodeProviderAndModel(
    */
   personaContextState: string;
 }> {
-  // Provider is explicit: node.provider ?? workflow.provider. Model never
-  // influences provider selection. Model strings pass through to the SDK.
-  const assistantModels = Object.fromEntries(
-    Object.entries(config.assistants).map(([providerId, assistant]) => [
-      providerId,
-      assistant?.model as string | undefined,
-    ])
-  );
-  const resolvedBinding = resolveModelForNode({
-    nodeId: node.id,
-    nodeProvider: node.provider,
-    nodeModel: node.model,
+  const bindingInput: DagNodeBindingInput = {
+    node,
     workflowProvider,
     workflowModel,
-    assistantModels,
+    config,
+    workflowLevelOptions,
     modelOverride,
-  });
-  const provider = resolvedBinding.provider;
-  if (!isRegisteredProvider(provider)) {
-    throw new Error(
-      `Node '${node.id}': unknown provider '${provider}'. ` +
-        `Registered: ${getRegisteredProviders()
-          .map(p => p.id)
-          .join(', ')}`
-    );
-  }
-
-  const model = resolvedBinding.model;
+    kind: 'prompt',
+  };
+  const base = preparedBinding?.base ?? resolveDagBindingBase(bindingInput);
+  const { provider } = base;
 
   // Get provider capabilities for capability warnings (static lookup, no instantiation)
   const caps = getProviderCapabilities(provider);
@@ -1839,124 +2321,71 @@ async function resolveNodeProviderAndModel(
   // The persona's model overrides the node-resolved model; its system prompt is
   // prepended to any node-level systemPrompt; its tools list (if present) is
   // used as allowed_tools (node-level allowed_tools take precedence if set).
-  let effectiveModel = model;
-  let effectiveSystemPrompt = node.systemPrompt;
-  let effectiveAllowedTools = node.allowed_tools;
-  // Persona wiki/oracle context-load state, forwarded to the contradiction dump.
-  let personaContextState = 'none';
-
+  if (!preparedBinding) {
+    bindingInput.promptFields = {
+      systemPrompt: node.systemPrompt,
+      allowedTools: node.allowed_tools,
+    };
+  }
   const nodeAgentRef = node as { agent?: string; persona?: string };
   const agentName = nodeAgentRef.agent ?? nodeAgentRef.persona;
-  if (agentName) {
-    const registry = await getAgentRegistry(cwd);
-    const persona = resolveAgent(agentName, registry);
-    if (persona) {
-      // A per-node override owns the binding completely. It must not be rejected
-      // because the persona pins a different provider's model, or because a
-      // Claude-targeted override is paired with a persona that has no model.
-      // Retain the persona prompt/tools while replacing its model binding with
-      // the override for Claude (whose persona resolver requires a model) and
-      // removing it for providers whose persona resolver does not.
-      const nodeBindingOverride = modelOverride?.nodes?.[node.id];
-      const personaForResolution = nodeBindingOverride
-        ? { ...persona, model: provider === 'claude' ? model : undefined }
-        : persona;
-      const personaResolution = resolveAgentPersona(personaForResolution, effectiveModel, provider);
-      effectiveModel = resolveModelForNode({
-        nodeId: node.id,
-        nodeProvider: node.provider,
-        nodeModel: node.model,
-        personaModel: personaResolution.model,
-        workflowProvider,
-        workflowModel,
-        assistantModels,
-        modelOverride,
-      }).model;
-      // Prepend agent system prompt (agent role comes before node task)
-      effectiveSystemPrompt = effectiveSystemPrompt
-        ? `${personaResolution.systemPrompt}\n\n${effectiveSystemPrompt}`
-        : personaResolution.systemPrompt;
-      // Agent tools only apply when node doesn't already restrict tools
-      if (personaResolution.allowedTools && !effectiveAllowedTools) {
-        effectiveAllowedTools = personaResolution.allowedTools;
-      }
-
-      // Load persona context (wiki + oracle) and prepend to system prompt.
-      // Paperwork/tail nodes (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01) run
-      // with a bare model -- skip the live wiki/oracle fetch entirely. Every
-      // failing tail node in the 2026-07-06 incident carried persona: xo and a
-      // context load; skipping it removes that failure surface. Model/system
-      // prompt/tools are still resolved above; only the context fetch is skipped.
-      if (persona.context) {
-        if (isPaperworkNode(node.id)) {
-          personaContextState = 'skipped';
-          getLog().debug({ nodeId: node.id, agentName }, 'dag.persona_context_skipped_paperwork');
-        } else {
-          const contextBlock = await loadContext(persona).catch((err: unknown) => {
-            getLog().warn({ agentName, err: (err as Error).message }, 'agent.context_load_failed');
-            personaContextState = 'failed';
-            return '';
-          });
-          if (contextBlock) {
-            personaContextState = 'loaded';
-            effectiveSystemPrompt = effectiveSystemPrompt
-              ? `${contextBlock}\n\n${effectiveSystemPrompt}`
-              : contextBlock;
-          } else if (personaContextState !== 'failed') {
-            personaContextState = 'empty';
-          }
+  const persona = preparedBinding
+    ? structuredClone(preparedBinding.persona)
+    : agentName
+      ? resolveAgent(agentName, await getAgentRegistry(cwd))
+      : undefined;
+  const preparedResult = preparedBinding ? structuredClone(preparedBinding) : undefined;
+  const promptBinding = preparedResult
+    ? undefined
+    : resolveDagPromptPersonaBinding(bindingInput, base, persona);
+  let effectiveSystemPrompt = preparedResult
+    ? preparedResult.options.systemPrompt
+    : promptBinding?.systemPrompt;
+  let personaContextState = 'none';
+  if (persona) {
+    // Load persona context (wiki + oracle) and prepend to system prompt.
+    // Paperwork/tail nodes (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01) run
+    // with a bare model -- skip the live wiki/oracle fetch entirely. Every
+    // failing tail node in the 2026-07-06 incident carried persona: xo and a
+    // context load; skipping it removes that failure surface. Model/system
+    // prompt/tools are still resolved above; only the context fetch is skipped.
+    if (persona.context) {
+      if (isPaperworkNode(node.id)) {
+        personaContextState = 'skipped';
+        getLog().debug({ nodeId: node.id, agentName }, 'dag.persona_context_skipped_paperwork');
+      } else {
+        const contextBlock = await loadContext(persona).catch((err: unknown) => {
+          getLog().warn({ agentName, err: (err as Error).message }, 'agent.context_load_failed');
+          personaContextState = 'failed';
+          return '';
+        });
+        if (contextBlock) {
+          personaContextState = 'loaded';
+          effectiveSystemPrompt = effectiveSystemPrompt
+            ? `${contextBlock}\n\n${effectiveSystemPrompt}`
+            : contextBlock;
+        } else if (personaContextState !== 'failed') {
+          personaContextState = 'empty';
         }
       }
     }
   }
-
-  // Build universal base options
-  const baseOptions: SendQueryOptions = {};
-  if (effectiveModel) baseOptions.model = effectiveModel;
-  if (config.envVars && Object.keys(config.envVars).length > 0) {
-    baseOptions.env = config.envVars;
+  let binding = preparedResult;
+  if (!binding) {
+    if (!promptBinding) throw new Error('dag_prompt_binding_missing');
+    binding = completeDagPromptBinding(bindingInput, base, promptBinding, effectiveSystemPrompt);
   }
-  if (effectiveSystemPrompt !== undefined) baseOptions.systemPrompt = effectiveSystemPrompt;
-  if (node.maxBudgetUsd !== undefined) baseOptions.maxBudgetUsd = node.maxBudgetUsd;
-  const fb = node.fallbackModel ?? workflowLevelOptions.fallbackModel;
-  if (fb) baseOptions.fallbackModel = fb;
-  if (node.output_format) {
-    baseOptions.outputFormat = { type: 'json_schema', schema: node.output_format };
+  const options = binding.options;
+  if (preparedResult) {
+    // Only decorate execution-local copies. Captured static bindings never change.
+    if (effectiveSystemPrompt !== undefined) options.systemPrompt = effectiveSystemPrompt;
+    if (options.nodeConfig) options.nodeConfig.systemPrompt = effectiveSystemPrompt;
   }
-
-  // Build raw nodeConfig -- provider translates internally
-  const nodeConfig: NodeConfig = {
-    mcp: node.mcp,
-    hooks: node.hooks,
-    skills: node.skills,
-    agents: node.agents,
-    allowed_tools: effectiveAllowedTools,
-    denied_tools: node.denied_tools,
-    effort: node.effort ?? workflowLevelOptions.effort,
-    thinking: node.thinking ?? workflowLevelOptions.thinking,
-    sandbox: node.sandbox ?? workflowLevelOptions.sandbox,
-    betas: node.betas ?? workflowLevelOptions.betas,
-    output_format: node.output_format,
-    maxBudgetUsd: node.maxBudgetUsd,
-    systemPrompt: effectiveSystemPrompt,
-    fallbackModel: fb,
-  };
-
-  // Assistant config stays keyed by the id as written (assistants.grok still applies).
-  const assistantConfig = config.assistants[provider] ?? {};
-  const canonicalProvider = resolveProviderId(provider);
-
-  const options: SendQueryOptions = {
-    ...baseOptions,
-    nodeConfig,
-    assistantConfig,
-  };
-
   return {
-    provider: canonicalProvider,
-    model: effectiveModel,
+    provider: binding.provider,
+    model: binding.model,
     options,
-    declaredModelId: modelOverride?.nodes?.[node.id]?.model ?? model,
+    declaredModelId: binding.declaredModelId,
     personaContextState,
   };
 }
@@ -3899,7 +4328,8 @@ async function executeLoopNode(
   nodeOutputs: Map<string, NodeOutput>,
   config: WorkflowConfig,
   issueContext?: string,
-  workflowLevelOptions?: WorkflowLevelOptions
+  workflowLevelOptions?: WorkflowLevelOptions,
+  preparedBinding?: DagBindingResult
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3940,42 +4370,28 @@ async function executeLoopNode(
   // node's node_completed event represents its final iteration.
   let loopServedModelId: string | null | undefined;
   let loopServedMissingReason: string | undefined;
-  const resolvedOptions = buildLoopNodeOptions(
+  const loopInput: DagNodeBindingInput = {
     node,
     workflowProvider,
     workflowModel,
     config,
-    workflowLevelOptions
-  );
-
-  // Resolve agent persona for loop node (if `agent:` or `persona:` is declared).
-  // `persona:` is the human-facing alias for `agent:` -- both resolve identically.
-  // Applied to every iteration -- same semantics as prompt/command nodes:
-  // persona model overrides the loop-resolved model; persona system prompt is
-  // prepended to any node-level systemPrompt.
-  // Note: the loop path does NOT call loadContext (wiki + oracle) today;
-  // that pre-existing gap is tracked separately and is out of scope for the
-  // persona-alias WO (preserve current loop behavior identically).
+    workflowLevelOptions,
+    kind: 'selected-loop',
+    loopOptions: preparedBinding
+      ? undefined
+      : buildLoopNodeOptions(node, workflowProvider, workflowModel, config, workflowLevelOptions),
+  };
   const loopAgentRef = node as { agent?: string; persona?: string };
   const loopAgentName = loopAgentRef.agent ?? loopAgentRef.persona;
-  if (loopAgentName) {
-    const registry = await getAgentRegistry(cwd);
-    const persona = resolveAgent(loopAgentName, registry);
-    if (persona) {
-      // workflowProvider here is already the per-node provider (the outer
-      // dispatch resolves node.provider ?? workflowProvider before calling
-      // executeLoopNode), so a codex loop node is correctly recognized.
-      const personaResolution = resolveAgentPersona(
-        persona,
-        resolvedOptions.model,
-        workflowProvider
-      );
-      resolvedOptions.model = personaResolution.model;
-      resolvedOptions.systemPrompt = resolvedOptions.systemPrompt
-        ? `${personaResolution.systemPrompt}\n\n${resolvedOptions.systemPrompt}`
-        : personaResolution.systemPrompt;
-    }
-  }
+  const loopPersona = preparedBinding
+    ? undefined
+    : loopAgentName
+      ? resolveAgent(loopAgentName, await getAgentRegistry(cwd))
+      : undefined;
+  // No prompt override pass, persona tool inheritance or context loading on loops.
+  const resolvedOptions = preparedBinding
+    ? structuredClone(preparedBinding.options)
+    : finishDagPersonaBinding(loopInput, resolveDagBindingBase(loopInput), loopPersona).options;
 
   // Helper to log event store errors consistently
   const logEventStoreError = (err: Error, iteration: number): void => {
@@ -5191,7 +5607,8 @@ async function executeApprovalNode(
   workflowInteractive: boolean | undefined,
   configuredCommandFolder?: string,
   issueContext?: string,
-  modelOverride?: ModelOverride
+  modelOverride?: ModelOverride,
+  preparedBinding?: DagBindingResult
 ): Promise<NodeOutput> {
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
 
@@ -5263,12 +5680,10 @@ async function executeApprovalNode(
     // execution view during an on_reject cycle. This is cosmetic-only -- the approval gate
     // still re-presents correctly and the human gate contract is preserved. A follow-up can
     // filter synthetic `:on_reject` IDs from the UI's nodeMap if needed.
-    const syntheticNode: PromptNode = {
-      id: `${node.id}:on_reject`,
-      prompt: substituteNodeOutputRefs(substitutedPrompt, nodeOutputs),
-      ...(node.depends_on ? { depends_on: node.depends_on } : {}),
-      ...(node.idle_timeout ? { idle_timeout: node.idle_timeout } : {}),
-    };
+    const syntheticNode = buildApprovalRejectionNode(
+      node,
+      substituteNodeOutputRefs(substitutedPrompt, nodeOutputs)
+    );
 
     const {
       provider,
@@ -5285,7 +5700,8 @@ async function executeApprovalNode(
       workflowRun.id,
       cwd,
       workflowLevelOptions,
-      modelOverride
+      modelOverride,
+      preparedBinding
     );
 
     const output = await executeNodeInternal(
@@ -5497,16 +5913,7 @@ async function executeDagWorkflowInternal(
   platform: IWorkflowPlatform,
   conversationId: string,
   cwd: string,
-  workflow: {
-    name: string;
-    nodes: readonly DagNode[];
-    inputs?: Record<string, { default: string }>;
-    interactive?: boolean;
-    // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: workflow-root failover defaults
-    // (snake_case YAML field names on WorkflowDefinition).
-    failover_provider?: string;
-    failover_model?: string;
-  } & WorkflowLevelOptions,
+  workflow: DagBindingWorkflow,
   workflowRun: WorkflowRun,
   workflowProvider: string,
   workflowModel: string | undefined,
@@ -5518,8 +5925,18 @@ async function executeDagWorkflowInternal(
   configuredCommandFolder?: string,
   issueContext?: string,
   priorCompletedNodes?: Map<string, string>,
-  modelOverride?: ModelOverride
+  modelOverride?: ModelOverride,
+  preparedBindings?: PreparedDagBindings
 ): Promise<string | undefined> {
+  const preparedState = preparedBindings
+    ? preparedDagBindingStates.get(preparedBindings)
+    : undefined;
+  const bindingFor = (node: DagNode, role: DagBindingRole): DagBindingResult | undefined => {
+    if (!preparedState) return undefined;
+    const binding = preparedState.bindings.get(workflow.nodes.indexOf(node))?.get(role);
+    if (!binding) throw new Error('prepared_dag_bindings: missing selected branch');
+    return binding;
+  };
   const dagStartTime = Date.now();
 
   // Resolve workflow inputs: extract defaults from the `inputs:` section.
@@ -5527,16 +5944,7 @@ async function executeDagWorkflowInternal(
   const resolvedInputs: Record<string, string> = workflow.inputs
     ? Object.fromEntries(Object.entries(workflow.inputs).map(([k, v]) => [k, v.default]))
     : {};
-  const workflowLevelOptions: WorkflowLevelOptions = {
-    effort: workflow.effort,
-    thinking: workflow.thinking,
-    fallbackModel: workflow.fallbackModel,
-    betas: workflow.betas,
-    sandbox: workflow.sandbox,
-    // WO-HARNESS-NODE-PROVIDER-FAILOVER-01: workflow-level failover defaults.
-    failoverProvider: workflow.failover_provider,
-    failoverModel: workflow.failover_model,
-  };
+  const workflowLevelOptions = dagWorkflowLevelOptions(workflow);
   const layers = buildTopologicalLayers(workflow.nodes);
   const nodeOutputs = new Map<string, NodeOutput>();
 
@@ -5837,28 +6245,19 @@ async function executeDagWorkflowInternal(
             // unknown provider so the outer catch below emits the standard
             // node_failed event + user-facing message -- the same path
             // resolveNodeProviderAndModel uses for non-loop nodes.
-            const loopBinding = resolveModelForNode({
-              nodeId: node.id,
-              nodeProvider: node.provider,
-              nodeModel: node.model,
-              workflowProvider,
-              workflowModel,
-              assistantModels: Object.fromEntries(
-                Object.entries(config.assistants).map(([providerId, assistant]) => [
-                  providerId,
-                  assistant?.model as string | undefined,
-                ])
-              ),
-              modelOverride,
-            });
+            const preparedLoopBinding = bindingFor(node, 'primary');
+            const loopBinding =
+              preparedLoopBinding?.base ??
+              resolveDagBindingBase({
+                node,
+                workflowProvider,
+                workflowModel,
+                config,
+                workflowLevelOptions,
+                modelOverride,
+                kind: 'loop',
+              });
             const loopProvider = loopBinding.provider;
-            if (!isRegisteredProvider(loopProvider)) {
-              throw new Error(
-                `Node '${node.id}': unknown provider '${loopProvider}'. Registered: ${getRegisteredProviders()
-                  .map(p => p.id)
-                  .join(', ')}`
-              );
-            }
             const loopModel = loopBinding.model;
 
             assertProviderCanExecuteNode(loopProvider, node);
@@ -5878,7 +6277,8 @@ async function executeDagWorkflowInternal(
               nodeOutputs,
               config,
               issueContext,
-              workflowLevelOptions
+              workflowLevelOptions,
+              preparedLoopBinding
             );
 
             // AVAILABILITY failover for loop nodes (WO-HARNESS-NODE-PROVIDER-FAILOVER-01).
@@ -5917,6 +6317,10 @@ async function executeDagWorkflowInternal(
                   model: loopFailoverModel,
                 });
                 assertProviderCanExecuteNode(loopFailoverTarget.provider, loopFailoverNode);
+                const preparedFailover = bindingFor(
+                  node,
+                  loopQuotaRoute?.kind === 'failover' ? 'quota' : 'availability'
+                );
                 emitNodeFailover(
                   deps,
                   workflowRun.id,
@@ -5950,7 +6354,8 @@ async function executeDagWorkflowInternal(
                   nodeOutputs,
                   config,
                   issueContext,
-                  workflowLevelOptions
+                  workflowLevelOptions,
+                  preparedFailover
                 );
               } catch (loopFailoverErr) {
                 const fe = loopFailoverErr as Error;
@@ -6002,7 +6407,8 @@ async function executeDagWorkflowInternal(
               workflow.interactive,
               configuredCommandFolder,
               issueContext,
-              modelOverride
+              modelOverride,
+              node.approval.on_reject ? bindingFor(node, 'approval-rejection') : undefined
             );
             return { nodeId: node.id, output };
           }
@@ -6074,7 +6480,8 @@ async function executeDagWorkflowInternal(
             workflowRun.id,
             cwd,
             workflowLevelOptions,
-            modelOverride
+            modelOverride,
+            bindingFor(node, 'primary')
           );
           assertProviderCanExecuteNode(provider, node);
 
@@ -6255,7 +6662,8 @@ async function executeDagWorkflowInternal(
                 workflowRun.id,
                 cwd,
                 workflowLevelOptions,
-                modelOverride
+                modelOverride,
+                bindingFor(node, quotaRoute?.kind === 'failover' ? 'quota' : 'availability')
               );
               emitNodeFailover(
                 deps,
@@ -6860,13 +7268,55 @@ async function executeDagWorkflowInternal(
   return terminalOutput;
 }
 
-export const executeDagWorkflow: typeof executeDagWorkflowInternal = (...args) => {
-  const [deps, , , , , workflowRun] = args;
+export const executeDagWorkflow: typeof executeDagWorkflowInternal = async (...args) => {
+  const [
+    deps,
+    ,
+    ,
+    cwd,
+    workflow,
+    workflowRun,
+    workflowProvider,
+    workflowModel,
+    ,
+    ,
+    ,
+    ,
+    config,
+    ,
+    ,
+    ,
+    modelOverride,
+    preparedBindings,
+  ] = args;
+  if (preparedBindings !== undefined) {
+    const state = preparedDagBindingStates.get(preparedBindings);
+    if (
+      !state ||
+      !isDeepStrictEqual(state.inputs, {
+        cwd,
+        workflow,
+        workflowProvider,
+        workflowModel,
+        config,
+        modelOverride,
+      })
+    ) {
+      throw new Error('prepared_dag_bindings: unrecognized handle or changed inputs');
+    }
+    // Execute isolated input copies so caller mutation during lease acquisition cannot
+    // change the inspected workflow or provider configuration after validation.
+    const execution = structuredClone(state.inputs);
+    args[4] = execution.workflow;
+    args[12] = execution.config;
+    args[16] = execution.modelOverride;
+  }
   const [, ...executionArgs] = args;
   return withRunLease(deps.store, workflowRun.id, isRunLeaseValid =>
     executeDagWorkflowInternal({ ...deps, isRunLeaseValid }, ...executionArgs)
   );
 };
+
 interface BunRuntimeResolutionOptions {
   readonly execPath?: string;
   readonly platform?: NodeJS.Platform;

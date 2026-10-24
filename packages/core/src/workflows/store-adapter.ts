@@ -29,6 +29,7 @@ function getLog(): ReturnType<typeof createLogger> {
 export function createWorkflowStore(): IWorkflowStore {
   return {
     createWorkflowRun: workflowDb.createWorkflowRun,
+    activatePendingWorkflowRun: workflowDb.activatePendingWorkflowRun,
     getWorkflowRun: workflowDb.getWorkflowRun,
     getActiveWorkflowRunByPath: workflowDb.getActiveWorkflowRunByPath,
     findResumableRun: workflowDb.findResumableRun,

@@ -14,9 +14,190 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { loadLadder, loadPremiumTiers, loadRefusedTiers } from '../ladder.js';
 import { loadRuleset, pickEntryTier } from '../conductor.js';
-import { runCascade } from '../cascade.js';
+import { CODEX_ONLY_DISPATCH_CAPABILITY, runCascade } from '../cascade.js';
+import { preflightCodexOnly } from '../fire.js';
 import type { CascadeDeps } from '../cascade.js';
 import type { FireResult, GateVerdict, PollResult } from '../types.js';
+
+import { parse } from 'yaml';
+import { readFile } from 'fs/promises';
+import { selectQuotaExhaustionRoute } from '../../../workflows/src/node-failover.js';
+import { dagNodeSchema } from '../../../workflows/src/schemas/dag-node.js';
+
+test('bounded same-provider targets cannot route quota to another provider', () => {
+  for (const failover_provider of [undefined, 'codex']) {
+    const node = dagNodeSchema.parse({
+      id: 'implement',
+      prompt: 'Build',
+      provider: 'codex',
+      ...(failover_provider ? { failover_provider } : {}),
+    });
+    expect(selectQuotaExhaustionRoute('codex', node, {})).toEqual({ kind: 'wait' });
+    expect(selectQuotaExhaustionRoute('codex', node, { failoverProvider: 'codex' })).toEqual({
+      kind: 'wait',
+    });
+  }
+});
+
+test('actual availability executor dispatches only declared targets and never an implicit successor', async () => {
+  // Reuse the existing hermetic DAG/provider fixture in its required isolated
+  // process, rather than copy its store, provider and executor scaffolding.
+  const fixture = new URL('../../../workflows/src/node-failover.test.ts', import.meta.url);
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      'test',
+      fixture.pathname.replace(/^\/(.:\/)/, '$1'),
+      '--test-name-pattern',
+      'Scenario 1: availability error|Scenario 4e: no failover fields',
+    ],
+    {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...process.env, SMART_CAULDRON_HERMETIC: '1' },
+    }
+  );
+  const [stdout, stderr, exit] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited,
+  ]);
+  expect(exit, stdout + stderr).toBe(0);
+  expect(stdout + stderr).toContain('2 pass');
+  expect(stdout + stderr).toContain('Scenario 1: availability error');
+  expect(stdout + stderr).toContain('Scenario 4e: no failover fields');
+});
+
+test('current parsed Codex-only lane is refused before admission and leaves global ladder unchanged', async () => {
+  const path = new URL(
+    '../../../../.archon/workflows/defaults/bdc-feature-development-codex-only.yaml',
+    import.meta.url
+  );
+  const workflow = parse(await readFile(path, 'utf8'));
+  expect(workflow.provider).toBe('codex');
+  expect(workflow.name).toBe('bdc-feature-development-codex-only');
+  expect(workflow.failover_provider).toBeUndefined();
+  const prompts = workflow.nodes.filter(
+    (node: Record<string, unknown>) => node.prompt || node.loop
+  );
+  expect(prompts.length).toBeGreaterThan(0);
+  const strictSlots = [
+    'plan-review',
+    'war-council-validator',
+    'diff-review',
+    'diff-review-final',
+    'opus-rereview',
+    'findings-consolidate',
+    'apply-diff-review-final',
+  ];
+  expect(
+    workflow.nodes
+      .filter((node: Record<string, unknown>) => node.provider === 'codex-native-strict')
+      .map((node: Record<string, unknown>) => node.id)
+      .sort()
+  ).toEqual([...strictSlots].sort());
+  for (const node of workflow.nodes) {
+    expect(node.provider ?? workflow.provider).toBe(
+      strictSlots.includes(node.id) ? 'codex-native-strict' : 'codex'
+    );
+    expect(node.failover_provider).toBeUndefined();
+  }
+  const before = loadLadder();
+  const originalFetch = globalThis.fetch;
+  const calls: { url: string; method: string; token: string | null }[] = [];
+  const expectedUrls = [
+    'http://archon.test/api/codebases',
+    'http://archon.test/api/workflows/bdc-feature-development-codex-only?cwd=%2Fwork%2Fharness%20space',
+  ];
+  const effects = {
+    ownership: 0,
+    claim: 0,
+    lock: 0,
+    release: 0,
+    admission: 0,
+    create: 0,
+    write: 0,
+    fire: 0,
+  };
+  const forbidden = (key: keyof typeof effects): never => {
+    effects[key]++;
+    throw new Error(`Unexpected downstream effect: ${key}`);
+  };
+  try {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      calls.push({ url, method, token: new Headers(init?.headers).get('x-archon-operator-token') });
+      if (method !== 'GET') throw new Error('Unexpected synthetic write');
+      if (url === expectedUrls[0]) {
+        return Response.json([
+          { id: 'target', name: 'bdc-harness', default_cwd: '/work/harness space' },
+        ]);
+      }
+      if (url === expectedUrls[1]) {
+        return Response.json({
+          workflow,
+          filename: 'bdc-feature-development-codex-only.yaml',
+          source: 'bundled',
+        });
+      }
+      throw new Error('Unexpected synthetic request');
+    }) as typeof globalThis.fetch;
+    await expect(
+      preflightCodexOnly('bdc-harness', 'http://archon.test', 'synthetic-token')
+    ).rejects.toThrow('codex_only_provider_forbidden');
+    expect(calls.map(call => call.url)).toEqual(expectedUrls);
+    expect(calls.every(call => call.method === 'GET' && call.token === 'synthetic-token')).toBe(
+      true
+    );
+    expect(calls.filter(call => call.method === 'POST')).toHaveLength(0);
+    calls.length = 0;
+    await expect(
+      runCascade({
+        woId: 'WO-TEST-CURRENT-LANE-REFUSAL-01',
+        project: 'bdc-harness',
+        entryOverride: 'codex',
+        codexOnly: true,
+        dryRun: false,
+        apiBaseUrl: 'http://archon.test',
+        token: 'synthetic-token',
+        onAdmission: () => forbidden('admission'),
+        deps: {
+          preflight: async () => forbidden('ownership'),
+          findWoClaim: async () => forbidden('claim'),
+          acquireWoLock: async () => forbidden('lock'),
+          releaseWoLock: async () => forbidden('release'),
+          createRecord: async () => forbidden('create'),
+          writeRecord: async () => forbidden('write'),
+          fire: async () => forbidden('fire'),
+        },
+      })
+    ).rejects.toThrow('codex_only_provider_forbidden');
+    expect(calls.map(call => call.url)).toEqual(expectedUrls);
+    expect(calls.every(call => call.method === 'GET' && call.token === 'synthetic-token')).toBe(
+      true
+    );
+    expect(calls.filter(call => call.method === 'POST')).toHaveLength(0);
+    expect(effects).toEqual({
+      ownership: 0,
+      claim: 0,
+      lock: 0,
+      release: 0,
+      admission: 0,
+      create: 0,
+      write: 0,
+      fire: 0,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  expect(globalThis.fetch).toBe(originalFetch);
+  expect(loadLadder()).toEqual(before);
+  expect(CODEX_ONLY_DISPATCH_CAPABILITY).toBe('codex-only-v1');
+  expect(loadLadder().find(tier => tier.name === 'codex')?.workflowName).toBe(
+    'bdc-feature-development-codex'
+  );
+});
 
 describe('live ladder SOR', () => {
   // 'cursor' inserted below codex by WO-HARNESS-CURSOR-BUILD-SEAT-01; flipped

@@ -2609,6 +2609,13 @@ export function registerApiRoutes(
     return c.json({ error: message, ...(detail ? { detail } : {}) }, status);
   }
 
+  function isCodexOnlyContinuation(run: WorkflowRun): boolean {
+    return (
+      run.workflow_name === 'bdc-feature-development-codex-only' ||
+      Object.prototype.hasOwnProperty.call(run.metadata ?? {}, 'codex_only_dispatch')
+    );
+  }
+
   function isBoardPrincipalAuthError(error: unknown): boolean {
     return error instanceof Error && error.message.startsWith('board_principal_auth_');
   }
@@ -3081,9 +3088,10 @@ export function registerApiRoutes(
    * no run row was ever created). Validate the name synchronously here and
    * reject BEFORE accepting the dispatch.
    *
-   * Fails open on discovery errors -- a broken YAML tree is surfaced by the
-   * command handler in-conversation; only a definitive "no such workflow"
-   * (or ambiguous name) is rejected at the API boundary.
+   * Ordinary discovery errors degrade to in-conversation reporting. The reserved
+   * Codex-only token remains closed before discovery, and an actually resolved
+   * reserved definition is refused before dispatch-auth checks. Unknown and
+   * ambiguous names remain rejected at this API boundary.
    */
   const WORKFLOW_RUN_COMMAND = /^\/workflow\s+run\s+(\S+)/;
   const DEFAULT_BUILDER_MONITOR_URL =
@@ -3189,6 +3197,9 @@ export function registerApiRoutes(
     const match = WORKFLOW_RUN_COMMAND.exec(message.trim());
     if (!match) return { valid: true };
     const workflowName = match[1];
+    if (workflowName.toLowerCase() === 'bdc-feature-development-codex-only') {
+      return { valid: false, error: 'Codex-only dispatch is not available yet.' };
+    }
 
     // Parse and validate the optional atomic `--from origin/<branch>` override
     // BEFORE resolving the workflow so malformed/unsafe input fails closed even
@@ -3246,6 +3257,9 @@ export function registerApiRoutes(
         valid: false,
         error: `Workflow "${workflowName}" not found. Use GET /api/workflows to list available workflows.`,
       };
+    }
+    if (workflow.name === 'bdc-feature-development-codex-only') {
+      return { valid: false, error: 'Codex-only dispatch is not available yet.' };
     }
     const xaiRefusal = openRouterXaiRefusalForRun(workflow, modelOverride);
     if (xaiRefusal) {
@@ -3385,6 +3399,7 @@ export function registerApiRoutes(
     run: WorkflowRun,
     action: 'approve' | 'reject' | 'provider_wait'
   ): Promise<boolean> {
+    if (isCodexOnlyContinuation(run)) return false;
     if (!run.parent_conversation_id) return false;
     if (!run.conversation_id || !run.working_path) return false;
     // Literal event names per action -- greppable for ops tooling. Keeping the
@@ -6654,6 +6669,9 @@ export function registerApiRoutes(
       if (!run) {
         return apiError(c, 404, 'Workflow run not found');
       }
+      if (isCodexOnlyContinuation(run)) {
+        return apiError(c, 400, 'codex_only_resume_unsupported');
+      }
       if (!RESUMABLE_WORKFLOW_STATUSES.includes(run.status)) {
         return apiError(c, 400, `Cannot resume workflow in '${run.status}' status`);
       }
@@ -6719,6 +6737,9 @@ export function registerApiRoutes(
         // into a fact in the archon logs.
         getLog().info({ runId }, 'api.workflow_run_approve_not_found');
         return apiError(c, 404, 'Workflow run not found');
+      }
+      if (isCodexOnlyContinuation(run)) {
+        return apiError(c, 400, 'codex_only_resume_unsupported');
       }
       // WO-MC-APPROVE-GATE-RELIABILITY-01: idempotency. Users re-click Approve
       // when the UI looks stuck. Once the gate is approved the route flips the
@@ -6851,6 +6872,13 @@ export function registerApiRoutes(
       const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
       const reason = body.reason ?? 'Rejected';
       const approval = run.metadata.approval as ApprovalContext | undefined;
+      const hasOnReject = approval?.onRejectPrompt !== undefined;
+      const currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
+      const maxAttempts = approval?.onRejectMaxAttempts ?? 3;
+      const atLimit = currentCount + 1 >= maxAttempts;
+      if (isCodexOnlyContinuation(run) && hasOnReject && !atLimit) {
+        return apiError(c, 400, 'codex_only_resume_unsupported');
+      }
       await workflowEventDb.createWorkflowEvent({
         workflow_run_id: runId,
         event_type: 'approval_received',
@@ -6858,11 +6886,8 @@ export function registerApiRoutes(
         data: { decision: 'rejected', reason },
       });
 
-      const hasOnReject = approval?.onRejectPrompt !== undefined;
       if (hasOnReject) {
-        const currentCount = (run.metadata.rejection_count as number | undefined) ?? 0;
-        const maxAttempts = approval?.onRejectMaxAttempts ?? 3;
-        if (currentCount + 1 >= maxAttempts) {
+        if (atLimit) {
           await workflowDb.cancelWorkflowRun(runId);
           return c.json({
             success: true,

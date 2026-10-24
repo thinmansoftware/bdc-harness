@@ -8,6 +8,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { createHash } from 'node:crypto';
+import { inspect } from 'node:util';
 
 // --- Mock logger ---
 const mockLogFn = mock(() => {});
@@ -704,6 +705,192 @@ describe('executeWorkflow', () => {
   // Resume orphan cleanup
   // -------------------------------------------------------------------------
 
+  describe('binding-v2 common execution closed gate', () => {
+    const reserved = 'bdc-feature-development-codex-only';
+    const markers = [
+      null,
+      undefined,
+      false,
+      'corrupt',
+      { version: 'codex-only-v1' },
+      { version: 'codex-only-v2' },
+    ];
+
+    function expectNoExecution(deps: WorkflowDeps, store: IWorkflowStore): void {
+      expect(deps.getAgentProvider).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+      expect(store.getCompletedDagNodeOutputs).not.toHaveBeenCalled();
+      expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+      expect(store.updateWorkflowRun).not.toHaveBeenCalled();
+      expect(store.failWorkflowRun).not.toHaveBeenCalled();
+      expect(store.createWorkflowEvent).not.toHaveBeenCalled();
+      expect(mockEmitter.registerRun).not.toHaveBeenCalled();
+    }
+
+    function entryDeps(store: IWorkflowStore): WorkflowDeps {
+      const deps = makeDeps(store);
+      deps.loadConfig = mock(async (): Promise<WorkflowConfig> => {
+        throw new Error('closed gate must precede config');
+      });
+      return deps;
+    }
+
+    it('refuses the actual reserved definition before config or store access', async () => {
+      const store = makeStore();
+      const deps = entryDeps(store);
+      const platform = makePlatform();
+      const result = await executeWorkflow(
+        deps,
+        platform,
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ name: reserved }),
+        '/workflow run operator-alias',
+        'db-conv-1',
+        'codebase-id'
+      );
+      expect(result).toEqual({ success: false, error: 'codex_only_binding_required' });
+      expect(deps.loadConfig).not.toHaveBeenCalled();
+      expect(store.getCodebaseEnvVars).not.toHaveBeenCalled();
+      expect(store.findResumableRun).not.toHaveBeenCalled();
+      expect(platform.sendMessage).not.toHaveBeenCalled();
+      expectNoExecution(deps, store);
+    });
+
+    it.each(markers)(
+      'refuses a precreated provider wait with marker %j without activation',
+      async marker => {
+        const run = makeRun({
+          id: 'restricted-wait',
+          status: 'waiting_provider',
+          metadata: { codex_only_dispatch: marker },
+        });
+        const before = structuredClone(run);
+        const store = makeStore();
+        const deps = entryDeps(store);
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow(),
+          'resume',
+          'db-conv-1',
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          run
+        );
+        expect(result).toEqual({ success: false, error: 'codex_only_resume_unsupported' });
+        expect(deps.loadConfig).not.toHaveBeenCalled();
+        expect(store.findResumableRun).not.toHaveBeenCalled();
+        expectNoExecution(deps, store);
+        expect(run).toEqual(before);
+      }
+    );
+
+    it('refuses a named restricted precreated run whose marker is missing', async () => {
+      const run = makeRun({ workflow_name: reserved, status: 'paused', metadata: {} });
+      const before = structuredClone(run);
+      const store = makeStore();
+      const deps = entryDeps(store);
+      const result = await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ name: reserved }),
+        'resume',
+        'db-conv-1',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        run
+      );
+      expect(result).toEqual({ success: false, error: 'codex_only_resume_unsupported' });
+      expect(deps.loadConfig).not.toHaveBeenCalled();
+      expectNoExecution(deps, store);
+      expect(run).toEqual(before);
+    });
+
+    it.each(markers)(
+      'refuses a looked-up restricted run with marker %j before outputs or replacement',
+      async marker => {
+        const run = makeRun({
+          id: 'restricted-prior',
+          status: 'failed',
+          metadata: { codex_only_dispatch: marker, approval: { type: 'interactive_loop' } },
+        });
+        const before = structuredClone(run);
+        const store = makeStore({
+          findResumableRun: mock(async () => run),
+          getCompletedDagNodeOutputs: mock(async (): Promise<Map<string, string>> => {
+            throw new Error('must not degrade restricted output failure into a fresh run');
+          }),
+        });
+        const deps = makeDeps(store);
+        const result = await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow(),
+          'generic resume',
+          'db-conv-1'
+        );
+        expect(result).toEqual({ success: false, error: 'codex_only_resume_unsupported' });
+        expect(store.findResumableRun).toHaveBeenCalledTimes(1);
+        expectNoExecution(deps, store);
+        expect(run).toEqual(before);
+      }
+    );
+
+    it('does not cancel an ordinary pending claim when a restricted named prior run is found', async () => {
+      const prior = makeRun({ id: 'restricted-prior', workflow_name: reserved, status: 'failed' });
+      const claim = makeRun({ id: 'ordinary-claim', status: 'pending' });
+      const snapshots = structuredClone([prior, claim]);
+      const store = makeStore({ findResumableRun: mock(async () => prior) });
+      const deps = makeDeps(store);
+      const result = await executeWorkflow(
+        deps,
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'generic resume',
+        'db-conv-1',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        claim
+      );
+      expect(result).toEqual({ success: false, error: 'codex_only_resume_unsupported' });
+      expectNoExecution(deps, store);
+      expect([prior, claim]).toEqual(snapshots);
+    });
+
+    it('preserves ordinary execution and model selection without a restriction marker', async () => {
+      const store = makeStore();
+      const result = await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow({ provider: 'codex', model: 'gpt-5.6-sol' }),
+        'ordinary',
+        'db-conv-1'
+      );
+      expect(result.workflowRunId).toBe('run-123');
+      expect(mockExecuteDagWorkflow).toHaveBeenCalledTimes(1);
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[6]).toBe('codex');
+      expect(mockExecuteDagWorkflow.mock.calls[0]?.[7]).toBe('gpt-5.6-sol');
+    });
+  });
+
   describe('resume orphan cleanup', () => {
     it('cancels orphaned pre-created row when resume activates', async () => {
       // Orchestrator dispatched and pre-created this row before resume
@@ -1076,7 +1263,7 @@ describe('executeWorkflow', () => {
       expect(result.workflowRunId).toBe('run-123');
     });
 
-    it('starts fresh run when findResumableRun throws', async () => {
+    it('stops without creating a run when findResumableRun throws', async () => {
       const store = makeStore({
         findResumableRun: mock(async () => {
           throw new Error('DB error');
@@ -1092,9 +1279,8 @@ describe('executeWorkflow', () => {
         'test message',
         'db-conv-1'
       );
-      // Should fall back to creating a fresh run
-      expect(store.createWorkflowRun).toHaveBeenCalledTimes(1);
-      expect(result.workflowRunId).toBe('run-123');
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+      expect(result.success).toBe(false);
     });
 
     it('starts fresh run when prior run has 0 completed nodes', async () => {
@@ -1146,6 +1332,487 @@ describe('executeWorkflow', () => {
   // -------------------------------------------------------------------------
   // Summary propagation
   // -------------------------------------------------------------------------
+
+  describe('UNKNOWN continuation boundary', () => {
+    const sentinel = 'synthetic-persisted-payload-must-stay-private';
+
+    async function invoke(store: IWorkflowStore, supplied?: WorkflowRun) {
+      const deps = makeDeps(store);
+      const platform = makePlatform();
+      const result = await executeWorkflow(
+        deps,
+        platform,
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'continue',
+        'db-conv-1',
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        supplied
+      );
+      return { result, deps, platform };
+    }
+
+    describe('consumed-value snapshots', () => {
+      function changingProperty<T extends object>(
+        target: T,
+        key: string,
+        first: unknown,
+        later: () => unknown
+      ): () => number {
+        let reads = 0;
+        Object.defineProperty(target, key, {
+          get() {
+            reads += 1;
+            return reads === 1 ? first : later();
+          },
+        });
+        return () => reads;
+      }
+
+      function laterValue(mode: string): unknown {
+        if (mode === 'throw') throw new Error(sentinel);
+        return 'different-value';
+      }
+
+      function expectPrivate(outcome: Awaited<ReturnType<typeof invoke>>): void {
+        expect(
+          inspect([outcome.result, outcome.platform.sendMessage.mock.calls, mockLogFn.mock.calls], {
+            depth: 8,
+          })
+        ).not.toContain(sentinel);
+      }
+
+      it.each(['throw', 'change'])(
+        'uses the first reserved name without reading its unused ID (%s)',
+        async mode => {
+          const prior = makeRun();
+          const nameReads = changingProperty(
+            prior,
+            'workflow_name',
+            'bdc-feature-development-codex-only',
+            () => laterValue(mode)
+          );
+          const idReads = changingProperty(prior, 'id', 'unused', () => {
+            throw new Error(sentinel);
+          });
+          const store = makeStore({ findResumableRun: mock(async () => prior) });
+          const outcome = await invoke(store);
+          expectStopped(store, outcome);
+          expect(outcome.result.error).toBe('codex_only_resume_unsupported');
+          expect(nameReads()).toBe(1);
+          expect(idReads()).toBe(0);
+        }
+      );
+
+      for (const waiting of [false, true]) {
+        it.each(['throw', 'change'])(
+          `uses original selected identity and name through recovery/CAS (waiting=${waiting}, %s)`,
+          async mode => {
+            const prior = makeRun({ status: waiting ? 'waiting_provider' : 'failed' });
+            const idReads = changingProperty(prior, 'id', 'selected-first', () => laterValue(mode));
+            const nameReads = changingProperty(prior, 'workflow_name', 'ordinary-first', () =>
+              laterValue(mode)
+            );
+            const claim = makeRun({ status: 'pending' });
+            const claimReads = changingProperty(claim, 'id', 'claim-first', () => laterValue(mode));
+            const order: string[] = [];
+            const outputs = new Map([['node', 'output']]);
+            const store = makeStore({
+              findResumableRun: mock(async () => prior),
+              getCompletedDagNodeOutputs: mock(async id => {
+                order.push(`read:${id}`);
+                return outputs;
+              }),
+              resumeWorkflowRun: mock(async id => {
+                order.push(`resume:${id}`);
+                return makeRun({ id });
+              }),
+            });
+            const outcome = await invoke(store, waiting ? prior : claim);
+            expect(outcome.result.success).toBe(true);
+            expect(order).toEqual(['read:selected-first', 'resume:selected-first']);
+            expect(idReads()).toBe(1);
+            expect(nameReads()).toBe(1);
+            expect(store.createWorkflowRun).not.toHaveBeenCalled();
+            expect(store.failWorkflowRun).not.toHaveBeenCalled();
+            if (waiting) {
+              expect(store.findResumableRun).not.toHaveBeenCalled();
+              expect(store.updateWorkflowRun).not.toHaveBeenCalled();
+            } else {
+              expect(claimReads()).toBe(1);
+              expect(store.updateWorkflowRun).toHaveBeenCalledTimes(1);
+              expect(store.updateWorkflowRun).toHaveBeenCalledWith('claim-first', {
+                status: 'cancelled',
+              });
+            }
+            expect(mockExecuteDagWorkflow.mock.calls[0]?.[15]).toBe(outputs);
+            expectPrivate(outcome);
+          }
+        );
+      }
+
+      it('uses one supplied ID when actual null leaves the precreated ordinary run selected', async () => {
+        const claim = makeRun();
+        const idReads = changingProperty(claim, 'id', '', () => {
+          throw new Error(sentinel);
+        });
+        const store = makeStore();
+        const outcome = await invoke(store, claim);
+        expect(outcome.result.success).toBe(true);
+        expect(outcome.result.workflowRunId).toBe('');
+        expect(idReads()).toBe(1);
+        expect(store.createWorkflowRun).not.toHaveBeenCalled();
+        expect(store.failWorkflowRun).not.toHaveBeenCalled();
+        expectPrivate(outcome);
+      });
+
+      for (const waiting of [false, true]) {
+        for (const firstCount of [0, 1]) {
+          it.each(['throw', 'change', 'throw after branch'])(
+            `consumes the original recovered count once (waiting=${waiting}, count=${firstCount}, %s)`,
+            async mode => {
+              const prior = makeRun({
+                id: 'count-prior',
+                status: waiting ? 'waiting_provider' : 'failed',
+              });
+              const claim = makeRun({ id: 'count-claim' });
+              const outputs = new Map(firstCount ? [['node', 'output']] : []);
+              let reads = 0;
+              Object.defineProperty(outputs, 'size', {
+                get() {
+                  reads += 1;
+                  if (reads === 1 || (mode === 'throw after branch' && reads === 2))
+                    return firstCount;
+                  if (mode !== 'change') throw new Error(sentinel);
+                  return firstCount ? 0 : 1;
+                },
+              });
+              const store = makeStore({
+                findResumableRun: mock(async () => prior),
+                getCompletedDagNodeOutputs: mock(async () => outputs),
+                resumeWorkflowRun: mock(async id => makeRun({ id })),
+              });
+              const outcome = await invoke(store, waiting ? prior : claim);
+              expect(outcome.result.success).toBe(true);
+              expect(reads).toBe(1);
+              expect(store.failWorkflowRun).not.toHaveBeenCalled();
+              expectPrivate(outcome);
+              if (waiting || firstCount) {
+                expect(store.resumeWorkflowRun).toHaveBeenCalledTimes(1);
+                expect(store.resumeWorkflowRun).toHaveBeenCalledWith('count-prior');
+                expect(mockExecuteDagWorkflow.mock.calls[0]?.[15]).toBe(outputs);
+                const resumeLog = mockLogFn.mock.calls.find(
+                  call =>
+                    call[1] ===
+                    (waiting ? 'workflow.provider_wait_resuming' : 'workflow.dag_resuming')
+                );
+                expect(resumeLog?.[0]).toEqual(
+                  expect.objectContaining({ priorCompletedCount: firstCount })
+                );
+                if (!waiting)
+                  expect(inspect(outcome.platform.sendMessage.mock.calls)).toContain(
+                    'skipping 1 already-completed node'
+                  );
+              } else {
+                expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+                expect(store.createWorkflowRun).not.toHaveBeenCalled();
+              }
+              if (waiting) expect(store.updateWorkflowRun).not.toHaveBeenCalled();
+              else {
+                expect(store.updateWorkflowRun).toHaveBeenCalledTimes(1);
+                expect(store.updateWorkflowRun).toHaveBeenCalledWith('count-claim', {
+                  status: firstCount ? 'cancelled' : 'running',
+                });
+              }
+            }
+          );
+        }
+      }
+    });
+
+    function expectStopped(
+      store: IWorkflowStore,
+      outcome: Awaited<ReturnType<typeof invoke>>
+    ): void {
+      expect(outcome.result.success).toBe(false);
+      expect(store.createWorkflowRun).not.toHaveBeenCalled();
+      expect(store.updateWorkflowRun).not.toHaveBeenCalled();
+      expect(store.failWorkflowRun).not.toHaveBeenCalled();
+      expect(store.failOrphanedRuns).not.toHaveBeenCalled();
+      expect(store.createWorkflowEvent).not.toHaveBeenCalled();
+      expect(outcome.deps.getAgentProvider).not.toHaveBeenCalled();
+      expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+      expect(mockEmitter.registerRun).not.toHaveBeenCalled();
+      expect(
+        inspect([outcome.result, outcome.platform.sendMessage.mock.calls, mockLogFn.mock.calls], {
+          depth: 8,
+        })
+      ).not.toContain(sentinel);
+    }
+
+    const malformedRows: [string, unknown][] = [
+      ['undefined', undefined],
+      ['false', false],
+      ['zero', 0],
+      ['string', 'row'],
+      ['array', []],
+      ['empty object', {}],
+      ['nonstring name', { workflow_name: 4 }],
+      ['missing ID', { workflow_name: 'ordinary' }],
+      ['nonstring ID', { workflow_name: 'ordinary', id: 4 }],
+      ...['', 'bad-json', 0, false, []].map((metadata, index): [string, unknown] => [
+        `metadata ${index}`,
+        makeRun({ metadata: metadata as WorkflowRun['metadata'] }),
+      ]),
+      [
+        'throwing name',
+        Object.defineProperty(makeRun(), 'workflow_name', {
+          get() {
+            throw new Error(sentinel);
+          },
+        }),
+      ],
+      [
+        'throwing metadata',
+        Object.defineProperty(makeRun(), 'metadata', {
+          get() {
+            throw new Error(sentinel);
+          },
+        }),
+      ],
+      [
+        'throwing marker presence',
+        makeRun({
+          metadata: new Proxy(
+            {},
+            {
+              getOwnPropertyDescriptor() {
+                throw new Error(sentinel);
+              },
+            }
+          ),
+        }),
+      ],
+    ];
+
+    it.each(malformedRows)(
+      'refuses looked-up %s without mutation or delegation',
+      async (_name, row) => {
+        const claim = makeRun({ id: 'existing-claim', status: 'pending' });
+        const before = structuredClone(claim);
+        const store = makeStore({ findResumableRun: mock(async () => row as WorkflowRun) });
+        expectStopped(store, await invoke(store, claim));
+        expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+        expect(store.getCompletedDagNodeOutputs).not.toHaveBeenCalled();
+        expect(claim).toEqual(before);
+      }
+    );
+
+    it.each(malformedRows.filter(([name]) => name !== 'undefined'))(
+      'refuses supplied %s before lookup',
+      async (_name, row) => {
+        const store = makeStore();
+        expectStopped(store, await invoke(store, row as WorkflowRun));
+        expect(store.findResumableRun).not.toHaveBeenCalled();
+        expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+      }
+    );
+
+    it('refuses supplied null instead of treating it as absence', async () => {
+      const store = makeStore();
+      expectStopped(store, await invoke(store, null as unknown as WorkflowRun));
+      expect(store.findResumableRun).not.toHaveBeenCalled();
+    });
+
+    it('repeated lookup failure preserves the supplied claim and hides native payload text', async () => {
+      const claim = makeRun({ id: 'claim', status: 'pending' });
+      const store = makeStore({
+        findResumableRun: mock(async () => {
+          throw new Error(sentinel);
+        }),
+      });
+      expectStopped(store, await invoke(store, claim));
+      expectStopped(store, await invoke(store, claim));
+      expect(claim.status).toBe('pending');
+      expect(store.findResumableRun).toHaveBeenCalledTimes(2);
+      expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+    });
+
+    const badOutputs: [string, () => unknown][] = [
+      [
+        'query or parser failure',
+        () => {
+          throw new Error(sentinel);
+        },
+      ],
+      ['undefined', () => undefined],
+      ['null', () => null],
+      ['object', () => ({})],
+      ['array', () => []],
+      ['string', () => sentinel],
+      [
+        'unreadable Map',
+        () =>
+          Object.defineProperty(new Map(), 'size', {
+            get() {
+              throw new Error(sentinel);
+            },
+          }),
+      ],
+    ];
+    for (const waiting of [false, true]) {
+      it.each(badOutputs)(
+        `refuses %s recovery before activation (waiting=${waiting})`,
+        async (_name, read) => {
+          const prior = makeRun({
+            id: 'exact-prior',
+            status: waiting ? 'waiting_provider' : 'failed',
+          });
+          const before = structuredClone(prior);
+          const store = makeStore({
+            findResumableRun: mock(async () => prior),
+            getCompletedDagNodeOutputs: mock(async () => read() as Map<string, string>),
+          });
+          expectStopped(store, await invoke(store, waiting ? prior : undefined));
+          expect(store.getCompletedDagNodeOutputs).toHaveBeenCalledWith('exact-prior');
+          expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+          expect(prior).toEqual(before);
+          if (waiting) expect(store.findResumableRun).not.toHaveBeenCalled();
+        }
+      );
+    }
+
+    it('stops on unreadable interactive classification before resume or claim cleanup', async () => {
+      const metadata = Object.defineProperty({}, 'approval', {
+        get() {
+          throw new Error(sentinel);
+        },
+      });
+      const store = makeStore({
+        findResumableRun: mock(async () => makeRun({ metadata })),
+        getCompletedDagNodeOutputs: mock(async () => new Map([['done', 'out']])),
+      });
+      expectStopped(store, await invoke(store, makeRun({ id: 'claim' })));
+      expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+    });
+
+    it('stops on unreadable supplied status before lookup or mutation', async () => {
+      const supplied = Object.defineProperty(makeRun(), 'status', {
+        get() {
+          throw new Error(sentinel);
+        },
+      });
+      const store = makeStore();
+      expectStopped(store, await invoke(store, supplied));
+      expect(store.findResumableRun).not.toHaveBeenCalled();
+      expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      new Map<string, string>(),
+      new Map([
+        ['', ''],
+        ['done', 'out'],
+      ]),
+    ])(
+      'recovers before exact waiting CAS and never absorbs a historical same-path row (%j)',
+      async outputs => {
+        const order: string[] = [];
+        const prior = makeRun({ id: 'selected-wait', status: 'waiting_provider' });
+        const store = makeStore({
+          findResumableRun: mock(async () =>
+            makeRun({ id: 'historical-failed', status: 'failed' })
+          ),
+          getCompletedDagNodeOutputs: mock(async id => {
+            order.push(`recover:${id}`);
+            return outputs;
+          }),
+          resumeWorkflowRun: mock(async id => {
+            order.push(`resume:${id}`);
+            return makeRun({ id, status: 'running' });
+          }),
+        });
+        const outcome = await invoke(store, prior);
+        expect(outcome.result.success).toBe(true);
+        expect(order).toEqual(['recover:selected-wait', 'resume:selected-wait']);
+        expect(store.findResumableRun).not.toHaveBeenCalled();
+        expect(store.resumeWorkflowRun).toHaveBeenCalledTimes(1);
+        expect(store.createWorkflowRun).not.toHaveBeenCalled();
+        expect(store.updateWorkflowRun).not.toHaveBeenCalledWith('selected-wait', {
+          status: 'cancelled',
+        });
+        expect(mockExecuteDagWorkflow.mock.calls[0]?.[5]).toEqual(
+          expect.objectContaining({ id: 'selected-wait' })
+        );
+        expect(mockExecuteDagWorkflow.mock.calls[0]?.[15]).toBe(outputs);
+      }
+    );
+
+    it('returns bounded failure after uncertain waiting CAS without retry or terminalization', async () => {
+      const order: string[] = [];
+      const supplied = makeRun({ id: 'selected-wait', status: 'waiting_provider' });
+      let durableStatus = 'waiting_provider';
+      const store = makeStore({
+        getCompletedDagNodeOutputs: mock(async id => {
+          order.push(`recover:${id}`);
+          return new Map();
+        }),
+        resumeWorkflowRun: mock(async id => {
+          order.push(`resume:${id}`);
+          durableStatus = 'running';
+          throw new Error(sentinel);
+        }),
+      });
+      const outcome = await invoke(store, supplied);
+      expectStopped(store, outcome);
+      expect(durableStatus).toBe('running');
+      expect(order).toEqual(['recover:selected-wait', 'resume:selected-wait']);
+      expect(store.resumeWorkflowRun).toHaveBeenCalledTimes(1);
+      expect(store.findResumableRun).not.toHaveBeenCalled();
+      expect(outcome.result.error).toMatch(/uncertain|could not confirm/i);
+    });
+
+    it.each([null, undefined, {}])(
+      'preserves legacy metadata %j on ordinary null-finder precreation',
+      async metadata => {
+        const supplied = makeRun({ id: '', metadata: metadata as WorkflowRun['metadata'] });
+        const store = makeStore({ findResumableRun: mock(async () => null) });
+        const outcome = await invoke(store, supplied);
+        expect(outcome.result.success).toBe(true);
+        expect(store.createWorkflowRun).not.toHaveBeenCalled();
+        expect(mockExecuteDagWorkflow.mock.calls[0]?.[5]).toBe(supplied);
+        expect(supplied.metadata).toBe(metadata);
+      }
+    );
+
+    it.each([null, undefined, {}, { approval: { type: 'interactive_loop' } }])(
+      'preserves ordinary successful empty recovery branches with metadata %j',
+      async metadata => {
+        const prior = makeRun({
+          id: 'ordinary-prior',
+          status: 'failed',
+          metadata: metadata as WorkflowRun['metadata'],
+        });
+        const store = makeStore({
+          findResumableRun: mock(async () => prior),
+          resumeWorkflowRun: mock(async () => makeRun({ id: 'ordinary-prior' })),
+        });
+        const outcome = await invoke(store);
+        expect(outcome.result.success).toBe(true);
+        if (metadata?.approval) {
+          expect(store.resumeWorkflowRun).toHaveBeenCalledWith('ordinary-prior');
+          expect(store.createWorkflowRun).not.toHaveBeenCalled();
+        } else {
+          expect(store.resumeWorkflowRun).not.toHaveBeenCalled();
+          expect(store.createWorkflowRun).toHaveBeenCalledTimes(1);
+        }
+      }
+    );
+  });
 
   describe('summary propagation', () => {
     it('passes dag summary from executeDagWorkflow into WorkflowExecutionResult', async () => {
