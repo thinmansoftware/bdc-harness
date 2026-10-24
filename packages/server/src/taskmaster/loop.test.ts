@@ -45,7 +45,11 @@ import {
   type AdoptionRefreshResult,
 } from './loop';
 import { checkEvidence } from './expectations';
-import { runPrRepairOwner, type PrRepairQueuedMessage } from './pr-repair-owner';
+import {
+  runPrRepairOwner,
+  type PrRepairQueuedMessage,
+  type PrRepairOwnerDeps,
+} from './pr-repair-owner';
 import {
   TASKMASTER_ESCALATION_MARKER,
   TASKMASTER_ESCALATION_COOLDOWN_MS,
@@ -5013,17 +5017,357 @@ describe('production repair-owner GitHub fetcher', () => {
 });
 
 describe('PR repair owner shared effect contracts', () => {
-  test('owner_effects_are_journaled_counted_and_budgeted', () => {
-    expect(MAX_EFFECTS_PER_TICK).toBe(10);
-    expect(TM_ALLOWED_ACTION_TYPES).toContain('pr_repair');
+  function fixture(ids: string[]) {
+    const world = makeWorld();
+    const addressed = new Set<string>();
+    const acknowledged: string[] = [];
+    const queued = ids.map(
+      (id, index): PrRepairQueuedMessage => ({
+        id,
+        body: JSON.stringify({
+          kind: 'overseer_remediation_exhausted',
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          prNumber: index + 1,
+          headSha: `head-${id}`,
+          woId: `WO-REPAIR-NOTICE-${index + 10}`,
+          reason: 'attempt_cap',
+          buildLine: 'outside',
+        }),
+        sender: 'overseer',
+        sender_principal_id: 'system:overseer',
+        recipient: 'taskmaster',
+        resolved_recipient: null,
+        status: 'queued',
+        addressed_at: null,
+        addressed_by: null,
+        route_disposition: null,
+        acknowledged_at: null,
+        acknowledged_by: null,
+      })
+    );
+    const owner: PrRepairOwnerDeps = {
+      now: () => world.nowMs,
+      planEffects: true,
+      fetchPr: async () => null,
+      listWosWithMultipleLanePrs: async () => ({ groups: [], unresolved: [] }),
+      listLanePrsForWo: async () => [],
+      listQueuedTaskmasterMessages: async () => queued.filter(row => !addressed.has(row.id)),
+      acknowledgeRow: async id => {
+        acknowledged.push(id);
+      },
+      addressRow: async id => {
+        addressed.add(id);
+      },
+      closePr: async () => {
+        throw new Error('No closure planned');
+      },
+      hasRunningRunForWo: async () => false,
+      listOwnerIssues: async () => [],
+    };
+    const stored = new Map<string, { id: string; body: string; status: string }>();
+    const deps = makeDeps(world);
+    // Actual owner and actual tick execute; only external effects are faked.
+    Object.assign(deps, { prRepairOwnerDeps: owner });
+    deps.createTask = (async (_context, data) => {
+      const existing = stored.get(data.idempotency_key);
+      if (existing) return existing;
+      const message = { id: `stored-${stored.size + 1}`, body: data.body, status: 'queued' };
+      stored.set(data.idempotency_key, message);
+      world.sentMessages.push({
+        idempotency_key: data.idempotency_key,
+        recipient: data.recipient,
+        body: data.body,
+        createdAt: new Date(world.nowMs).toISOString(),
+      });
+      return message;
+    }) as TaskmasterDeps['createTask'];
+    return { world, owner, deps, queued, addressed, acknowledged, stored };
+  }
+
+  function duplicateGroup(h: ReturnType<typeof fixture>, count = 4) {
+    const woId = 'WO-REPAIR-DEDUPE-01';
+    const prs = Array.from({ length: count }, (_, index) => ({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: index + 1,
+      headRef: `feat/repair-${index + 1}`,
+      headSha: `sha-${index + 1}`,
+      state: 'OPEN' as 'OPEN' | 'CLOSED',
+      reviewDecision: 'CHANGES_REQUESTED',
+      createdAt: new Date(T0 - 10_000 + index).toISOString(),
+      runId: `run-${index + 1}`,
+      workflowName: 'bdc-feature-development-codex',
+    }));
+    const closed: number[] = [];
+    h.owner.listWosWithMultipleLanePrs = async () => ({
+      groups:
+        prs.filter(pr => pr.state === 'OPEN').length >= 2
+          ? [{ woId, prs: prs.map(pr => ({ ...pr })) }]
+          : [],
+      unresolved: [],
+    });
+    h.owner.fetchPr = async (_owner, _repo, number) => {
+      const pr = prs.find(pr => pr.prNumber === number);
+      return pr
+        ? {
+            number,
+            state: pr.state,
+            reviewDecision: pr.reviewDecision,
+            createdAt: pr.createdAt,
+            headRefName: pr.headRef,
+            headSha: pr.headSha,
+            headRepoFullName: 'thinmansoftware/bdc-harness',
+            baseRepoFullName: 'thinmansoftware/bdc-harness',
+            title: woId,
+            body: '',
+          }
+        : null;
+    };
+    h.owner.closePr = async ({ prNumber }) => {
+      closed.push(prNumber);
+      prs.find(pr => pr.prNumber === prNumber)!.state = 'CLOSED';
+    };
+    return { prs, closed };
+  }
+
+  test('three closes and an owner nudge share the last two tick slots and resume', async () => {
+    const h = fixture(['owner-notice']);
+    const { closed } = duplicateGroup(h);
+    const nudges: string[] = [];
+    h.owner.listOwnerIssues = async () => [
+      {
+        title: 'WO-REPAIR-NOTICE-10',
+        state: 'open',
+        labels: ['owner:major-build'],
+        ownerLogin: null,
+      },
+    ];
+    h.owner.createOwnerNudge = async input => {
+      nudges.push(input.recipient);
+      return { body: input.body };
+    };
+    h.deps.listUndeliveredRulings = async () =>
+      Array.from({ length: 8 }, (_, i) =>
+        ruling({ ref: `dispatch:ruling-${i}`, undeliveredRulingId: `ruling-${i}` })
+      );
+    h.deps.runCascade = (async () => {
+      throw new Error('Repair must not fire a cascade');
+    }) as TaskmasterDeps['runCascade'];
+    const state = createTaskmasterState(60_000);
+    const first = await tick(state, h.deps);
+    expect(first.effects).toBe(10);
+    expect(closed).toHaveLength(2);
+    expect(nudges).toEqual([]);
+    expect(
+      h.world.journal.filter(row => row.action_type === 'pr_repair' && row.outcome === 'sent')
+    ).toHaveLength(2);
+    expect(
+      h.world.journal.filter(row => row.action_type === 'pr_repair' && row.outcome === 'deferred')
+    ).toHaveLength(2);
+    h.world.nowMs += 60_000;
+    const second = await tick(state, h.deps);
+    expect(second.effects).toBe(3);
+    expect(closed).toHaveLength(3);
+    expect(nudges).toEqual(['major-build']);
+    expect(
+      h.world.journal.filter(row => row.action_type === 'pr_repair' && row.outcome === 'sent')
+    ).toHaveLength(4);
   });
 
-  test('digest_retry_addresses_only_notices_in_the_persisted_body', () => {
-    const n1 = 'thinmansoftware/bdc-xo#1 WO-ONE-TEST-01 repair_owner_unresolved:attempt_cap';
-    const n3 = 'thinmansoftware/bdc-xo#3 WO-THREE-TEST-03 repair_owner_unresolved:outside_cauldron';
-    const proposal = digestProposal([], makeWorld().control, T0, undefined, [], undefined, [n1]);
-    expect(proposal.body.includes(n1)).toBe(true);
-    expect(proposal.body.includes(n3)).toBe(false);
+  test('paused dedupe closes and owner nudges are journaled parked without effects', async () => {
+    const h = fixture(['owner-notice']);
+    const { closed } = duplicateGroup(h);
+    let nudges = 0;
+    h.owner.listOwnerIssues = async () => [
+      {
+        title: 'WO-REPAIR-NOTICE-10',
+        state: 'open',
+        labels: ['owner:major-build'],
+        ownerLogin: null,
+      },
+    ];
+    h.owner.createOwnerNudge = async () => {
+      nudges++;
+      return {};
+    };
+    h.world.control = { ...h.world.control, pause_state: 'SOFT_PAUSE', pause_scope: 'effects' };
+    const result = await tick(createTaskmasterState(60_000), h.deps);
+    expect(result.parked).toBe(4);
+    expect(closed).toEqual([]);
+    expect(nudges).toBe(0);
+    expect(
+      h.world.journal.filter(row => row.action_type === 'pr_repair' && row.outcome === 'parked')
+    ).toHaveLength(4);
+    expect(h.addressed.size).toBe(0);
+  });
+
+  for (const failure of ['eligibility', 'fetch-error'] as const) {
+    test(`apply-time ${failure} records the actual non-effect and preserves retry semantics`, async () => {
+      const h = fixture([]);
+      const { prs, closed } = duplicateGroup(h, 2);
+      const fetch = h.owner.fetchPr;
+      let failRead = false;
+      h.owner.fetchPr = async (...args) => {
+        if (failRead) throw new Error('synthetic GitHub read failure');
+        return fetch(...args);
+      };
+      h.deps.listUndeliveredRulings = async () => [ruling()];
+      const createTask = h.deps.createTask!;
+      h.deps.createTask = (async (...args) => {
+        if (args[1].idempotency_key.startsWith('tm:deliver_ruling:')) {
+          if (failure === 'eligibility') prs[0].reviewDecision = 'APPROVED';
+          else failRead = true;
+        }
+        return createTask(...args);
+      }) as TaskmasterDeps['createTask'];
+      const state = createTaskmasterState(60_000);
+      const first = await tick(state, h.deps);
+      expect(closed).toEqual([]);
+      expect(first.effects).toBe(2); // ruling + ordinary digest, no close
+      const repair = h.world.journal.find(row => row.action_type === 'pr_repair')!;
+      expect(repair.outcome).toBe(failure === 'eligibility' ? 'expired' : 'failed');
+      if (failure === 'eligibility')
+        expect(JSON.parse(repair.proposal_json).suppressed).toBe('pr_eligibility_changed');
+      else {
+        failRead = false;
+        h.world.nowMs += 60_000;
+        await tick(state, h.deps);
+        expect(closed).toEqual([1]);
+        expect(repair.outcome).toBe('sent');
+      }
+    });
+  }
+
+  test('a prior admitted notice cannot bypass a newly paused repair-delivery gate', async () => {
+    const h = fixture(['prior-admission']);
+    const create = h.deps.createTask!;
+    let failDigest = true;
+    h.deps.createTask = (async (...args) => {
+      if (failDigest) throw new Error('synthetic persistence failure');
+      return create(...args);
+    }) as TaskmasterDeps['createTask'];
+    const state = createTaskmasterState(60_000);
+    await tick(state, h.deps);
+    expect(h.addressed.size).toBe(0);
+    failDigest = false;
+    h.world.control = {
+      ...h.world.control,
+      pause_state: 'SOFT_PAUSE',
+      pause_scope: 'effects',
+      epoch: 1,
+    };
+    h.world.nowMs += 60_000;
+    await tick(state, h.deps);
+    expect(h.world.sentMessages.at(-1)?.body).not.toContain('repair_owner_unresolved');
+    expect(h.addressed.size).toBe(0);
+  });
+
+  test.each(['before_hash', 'thread_ref', 'action_type'] as const)(
+    'a mismatched SENT %s is not admission evidence',
+    async field => {
+      const h = fixture(['bad-admission']);
+      const create = h.deps.createTask!;
+      let fail = true;
+      h.deps.createTask = (async (...args) => {
+        if (fail) throw new Error('synthetic persistence failure');
+        return create(...args);
+      }) as TaskmasterDeps['createTask'];
+      const state = createTaskmasterState(60_000);
+      await tick(state, h.deps);
+      const row = h.world.journal.find(row => row.action_type === 'pr_repair')!;
+      Object.assign(row, { [field]: 'mismatched' });
+      fail = false;
+      h.world.nowMs += 60_000;
+      await tick(state, h.deps);
+      expect(h.world.sentMessages.at(-1)?.body).not.toContain('repair_owner_unresolved');
+      expect(h.addressed.size).toBe(0);
+    }
+  );
+
+  test('a paused repair notice cannot ride the exempt ordinary digest', async () => {
+    const h = fixture(['paused-notice']);
+    h.world.control = { ...h.world.control, pause_state: 'SOFT_PAUSE', pause_scope: 'effects' };
+    const result = await tick(createTaskmasterState(60_000), h.deps);
+    expect(result.parked).toBeGreaterThanOrEqual(1);
+    const digest = h.world.sentMessages.find(row => row.idempotency_key.startsWith('tm:digest:'));
+    expect(digest).toBeDefined();
+    expect(digest!.body).not.toContain('repair_owner_unresolved');
+    expect(h.addressed.size).toBe(0);
+    expect(h.acknowledged).toEqual([]);
+  });
+
+  test('repair item admission precedes actual daily digest rendering', async () => {
+    const h = fixture(['admitted-notice']);
+    const createTask = h.deps.createTask!;
+    h.deps.createTask = (async (...args) => {
+      if (args[1].idempotency_key.startsWith('tm:digest:')) {
+        expect(
+          h.world.journal.some(row => row.action_type === 'pr_repair' && row.outcome === 'sent')
+        ).toBe(true);
+        expect(args[1].body).toContain('repair_owner_unresolved');
+      }
+      return createTask(...args);
+    }) as TaskmasterDeps['createTask'];
+    const result = await tick(createTaskmasterState(60_000), h.deps);
+    expect(result.effects).toBe(2);
+    expect(h.addressed.has('admitted-notice')).toBe(true);
+  });
+
+  test('owner_effects_are_journaled_counted_and_budgeted', async () => {
+    const h = fixture(Array.from({ length: 12 }, (_, i) => `notice-${i}`));
+    const state = createTaskmasterState(60_000);
+    const first = await tick(state, h.deps);
+    expect(first.effects).toBe(MAX_EFFECTS_PER_TICK);
+    expect(
+      h.world.journal.filter(row => row.action_type === 'pr_repair' && row.outcome === 'sent')
+    ).toHaveLength(10);
+    expect(
+      h.world.journal.filter(row => row.action_type === 'pr_repair' && row.outcome === 'deferred')
+    ).toHaveLength(2);
+    expect(h.addressed.size).toBe(0);
+    h.world.nowMs += 60_000;
+    const second = await tick(state, h.deps);
+    expect(second.effects).toBe(3);
+    expect(h.addressed.size).toBe(12);
+    expect(h.world.journal.some(row => row.action_type === 'fire_cauldron')).toBe(false);
+  });
+
+  test('digest_retry_addresses_only_notices_in_the_persisted_body', async () => {
+    const h = fixture(['N1', 'N2', 'N3']);
+    const n3 = h.queued.pop()!;
+    let failOnce = true;
+    h.deps.db!.registerExpectation = async () => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('synthetic expectation failure after persistence');
+      }
+      return 'expectation';
+    };
+    const state = createTaskmasterState(60_000);
+    await tick(state, h.deps);
+    h.queued.push(n3);
+    h.world.nowMs += 60_000;
+    await tick(state, h.deps);
+    expect(h.addressed.has('N1')).toBe(true);
+    expect(h.addressed.has('N2')).toBe(true);
+    expect(h.addressed.has('N3')).toBe(false);
+    h.world.nowMs += 24 * 60 * 60_000;
+    await tick(state, h.deps);
+    expect(h.addressed.has('N3')).toBe(true);
+  });
+
+  test('rejected repair text never rides the ordinary digest', async () => {
+    const h = fixture(['rejected-notice']);
+    const data = JSON.parse(h.queued[0].body);
+    h.queued[0].body = JSON.stringify({ ...data, woId: null, reason: 'deploy production' });
+    // no_wo is canonicalized by the owner; use the validated PR slug to exercise content guard.
+    h.queued[0].body = JSON.stringify({ ...data, owner: 'deploy production' });
+    await tick(createTaskmasterState(60_000), h.deps);
+    expect(h.addressed.size).toBe(0);
+    expect(h.world.sentMessages.every(row => !row.body.includes('repair_owner_unresolved'))).toBe(
+      true
+    );
   });
 });
 

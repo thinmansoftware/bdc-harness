@@ -165,6 +165,20 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
     };
   }
 
+  // R8 repair handoffs use existing owners or the Duty Officer digest, never
+  // the John-facing XO/operator drains. Other verbs retain their own pairs.
+  if (
+    proposal.type === 'pr_repair' &&
+    !['major-build', 'captain-ci', 'duty-officer'].includes(proposal.recipient)
+  ) {
+    return {
+      allowed: false,
+      forbiddenEffect: true,
+      reason:
+        'pr_repair_recipient_invalid: repair work must address its existing owner or duty-officer.',
+    };
+  }
+
   // blocker_report <-> duty-officer is an exclusive pairing (M-blocker-report):
   // blocker_report may ONLY address 'duty-officer', and 'duty-officer' may ONLY
   // receive a blocker_report. Any other pairing is a forbidden EFFECT (the DO

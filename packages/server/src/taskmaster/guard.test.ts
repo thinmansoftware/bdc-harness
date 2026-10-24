@@ -57,14 +57,44 @@ describe('validateProposal', () => {
   });
 
   test('every Slice 1 verb passes the action-type allowlist', () => {
-    expect(TM_ALLOWED_ACTION_TYPES).toHaveLength(6);
+    expect(TM_ALLOWED_ACTION_TYPES).toEqual([
+      'deliver_ruling',
+      'nudge',
+      'escalate_p0',
+      'digest',
+      'fire_cauldron',
+      'blocker_report',
+      'pr_repair',
+    ]);
     for (const type of TM_ALLOWED_ACTION_TYPES) {
       // fire_cauldron needs mechanical evidence and blocker_report needs the
       // duty-officer recipient + its own body shape; both are asserted in their
       // own tests below. Every other verb passes with the default nudge body.
-      if (type !== 'fire_cauldron' && type !== 'blocker_report')
+      if (type !== 'fire_cauldron' && type !== 'blocker_report' && type !== 'pr_repair')
         expect(validateProposal(proposal({ type })).allowed).toBe(true);
     }
+  });
+
+  test('repair proposals admit only existing repair-owner and digest seats', () => {
+    for (const recipient of ['major-build', 'captain-ci', 'duty-officer']) {
+      expect(validateProposal(proposal({ type: 'pr_repair', recipient })).allowed).toBe(true);
+    }
+    for (const recipient of ['xo', 'operator', 'board', 'customer']) {
+      expect(validateProposal(proposal({ type: 'pr_repair', recipient }))).toMatchObject({
+        allowed: false,
+        forbiddenEffect: true,
+      });
+    }
+    expect(
+      validateProposal(
+        proposal({ type: 'pr_repair', recipient: 'major-build', body: 'Deploy production now' })
+      ).allowed
+    ).toBe(false);
+    expect(
+      validateProposal(
+        proposal({ type: 'pr_repair', recipient: 'major-build', idempotencyKey: '' })
+      ).allowed
+    ).toBe(false);
   });
 
   test('unauthorized action type is a forbidden effect', () => {

@@ -1223,7 +1223,10 @@ export function createRealSubmitDeps(
             ? 'MERGED'
             : (d.state ?? '').toUpperCase() === 'CLOSED'
               ? 'CLOSED'
-              : 'OPEN';
+              : (d.state ?? '').toUpperCase() === 'OPEN'
+                ? 'OPEN'
+                : null;
+          if (!stateRaw) return null;
           identity = {
             number: d.number,
             state: stateRaw,
@@ -1232,7 +1235,7 @@ export function createRealSubmitDeps(
             headRefName: d.head?.ref ?? '',
             headSha: d.head?.sha ?? '',
             headRepoFullName: d.head?.repo?.full_name ?? null,
-            baseRepoFullName: d.base?.repo?.full_name ?? `${prOwner}/${prRepo}`,
+            baseRepoFullName: d.base?.repo?.full_name ?? '',
             title: d.title ?? '',
             body: d.body ?? '',
           };
@@ -1242,12 +1245,27 @@ export function createRealSubmitDeps(
         }
       };
       try {
+        // Outside-Cauldron PRs have no lane citations, but still need a bound
+        // identity for their owner handoff. Fetch once independently of proof.
+        const prIdentity = await fetchPr(input.owner, input.repo, input.prNumber);
+        const canonicalRepo = `${input.owner}/${input.repo}`.toLowerCase();
+        if (
+          prIdentity?.number !== input.prNumber ||
+          prIdentity.state !== 'OPEN' ||
+          prIdentity.headSha !== input.headSha ||
+          prIdentity.baseRepoFullName?.toLowerCase() !== canonicalRepo ||
+          prIdentity.headRepoFullName?.toLowerCase() !== canonicalRepo
+        )
+          return null;
         const attribution = await attributeLanePr(
           { owner: input.owner, repo: input.repo, prNumber: input.prNumber },
-          { fetchPr }
+          {
+            fetchPr: async (owner, repo, number) =>
+              owner === input.owner && repo === input.repo && number === input.prNumber
+                ? prIdentity
+                : null,
+          }
         );
-        if (!identity) return null;
-        const prIdentity = identity as LanePrGithubInfo;
         return {
           laneRepair: attribution
             ? {

@@ -97,6 +97,150 @@ function harness(queued: PrRepairQueuedMessage[], laneByWo: Record<string, LaneP
 }
 
 describe('repair owner routing', () => {
+  test('unresolved candidate remains queued until its exact line is in the persisted digest', async () => {
+    const target = pr(1120);
+    const row = message('unresolved-candidate', {
+      kind: 'overseer_remediation_candidate',
+      owner: target.owner,
+      repo: target.repo,
+      prNumber: target.prNumber,
+      headSha: target.headSha,
+      woId: WO,
+      headRef: target.headRef,
+      findingClasses: ['lane_repair'],
+      verdictBody: 'Fix it.',
+    });
+    const h = harness([row], { [WO]: [target] });
+    h.deps.listOwnerIssues = async () => [];
+    const result = await runPrRepairOwner(h.deps);
+    expect(result.digestItems).toHaveLength(1);
+    expect(h.acknowledged).toEqual([]);
+    expect(h.addressed).toEqual([]);
+    await result.commitDigestLines(
+      'A previously persisted digest without this notice.',
+      new Set([result.effects[0].proposal.idempotencyKey])
+    );
+    expect(h.addressed).toEqual([]);
+    await result.commitDigestLines(
+      result.digestItems[0],
+      new Set([result.effects[0].proposal.idempotencyKey])
+    );
+    expect(h.acknowledged).toEqual(['unresolved-candidate']);
+    expect(h.addressed).toEqual([['unresolved-candidate', 'owner_unresolved']]);
+  });
+
+  test('an identical persisted line cannot consume an unadmitted sibling row', async () => {
+    const body = {
+      kind: 'overseer_remediation_exhausted',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 8,
+      headSha: 'head',
+      woId: null,
+      reason: 'outside_cauldron',
+    };
+    const h = harness([message('admitted', body), message('withheld', body)]);
+    const result = await runPrRepairOwner(h.deps);
+    expect(result.digestItems[0]).toBe(result.digestItems[1]);
+    const admitted = result.effects.find(effect => effect.sourceRowId === 'admitted')!;
+    await result.commitDigestLines(
+      result.digestItems[0],
+      new Set([admitted.proposal.idempotencyKey])
+    );
+    expect(h.addressed).toEqual([['admitted', 'digested']]);
+  });
+
+  test('non-consuming diagnostic lines all use the same digest-item admission seam', async () => {
+    const first = { ...pr(1), reviewDecision: 'APPROVED' as const };
+    const second = { ...pr(2), reviewDecision: 'APPROVED' as const };
+    const invalid = message('invalid-ack', {
+      kind: 'overseer_remediation_candidate',
+      owner: first.owner,
+      repo: first.repo,
+      prNumber: 1,
+      headSha: first.headSha,
+      headRef: first.headRef,
+      woId: WO,
+      findingClasses: ['lane_repair'],
+      verdictBody: 'Fix it.',
+    });
+    invalid.acknowledged_by = 'foreign';
+    invalid.acknowledged_at = new Date(NOW).toISOString();
+    const h = harness([invalid], { [WO]: [first, second] });
+    h.deps.listWosWithMultipleLanePrs = async () => ({
+      groups: [{ woId: WO, prs: [first, second] }],
+      unresolved: [],
+    });
+    const result = await runPrRepairOwner(h.deps);
+    expect(result.digestItems).toHaveLength(2);
+    expect(
+      result.effects
+        .filter(effect => effect.kind === 'digest_item')
+        .map(effect => effect.digestLine)
+    ).toEqual(result.digestItems);
+    await result.commitDigestLines(
+      result.digestItems.join('\n'),
+      new Set(result.effects.map(effect => effect.proposal.idempotencyKey))
+    );
+    expect(h.acknowledged).toEqual([]);
+  });
+
+  test('deferred successful closure reports its actual completed count', async () => {
+    const older = pr(1),
+      newer = pr(2);
+    const h = harness([], { [WO]: [older, newer] });
+    h.deps.listWosWithMultipleLanePrs = async () => ({
+      groups: [{ woId: WO, prs: [older, newer] }],
+      unresolved: [],
+    });
+    const result = await runPrRepairOwner(h.deps);
+    expect(result.closedPrs).toBe(0);
+    await result.effects.find(effect => effect.kind === 'dedupe_close')!.apply();
+    expect(h.closed).toEqual([1]);
+    expect(result.closedPrs).toBe(1);
+  });
+
+  for (const change of [
+    'victim-approved',
+    'survivor-closed',
+    'victim-head',
+    'victim-branch',
+    'survivor-head',
+    'missing-victim',
+  ] as const) {
+    test(`deferred close rechecks ${change} immediately before its effect`, async () => {
+      const older = pr(1),
+        newer = pr(2);
+      const h = harness([], { [WO]: [older, newer] });
+      h.deps.listWosWithMultipleLanePrs = async () => ({
+        groups: [{ woId: WO, prs: [older, newer] }],
+        unresolved: [],
+      });
+      const fetchPr = h.deps.fetchPr;
+      let changed = false;
+      h.deps.fetchPr = async (owner, repo, number) => {
+        const live = await fetchPr(owner, repo, number);
+        if (!changed || !live) return live;
+        if (number === 1 && change === 'victim-approved')
+          return { ...live, reviewDecision: 'APPROVED' };
+        if (number === 2 && change === 'survivor-closed') return { ...live, state: 'CLOSED' };
+        if (number === 1 && change === 'victim-head') return { ...live, headSha: 'new-head' };
+        if (number === 1 && change === 'victim-branch')
+          return { ...live, headRefName: 'other-branch' };
+        if (number === 2 && change === 'survivor-head') return { ...live, headSha: 'new-head' };
+        if (number === 1 && change === 'missing-victim') return null;
+        return live;
+      };
+      const result = await runPrRepairOwner(h.deps);
+      const effect = result.effects.find(value => value.kind === 'dedupe_close');
+      expect(effect).toBeDefined();
+      changed = true;
+      expect(await effect!.apply()).toEqual({ applied: false });
+      expect(h.closed).toEqual([]);
+      expect(result.closedPrs).toBe(0);
+    });
+  }
+
   test('interim_cauldron_built_candidate_routes_to_owner_never_fires', async () => {
     const target = pr(1120),
       row = message('candidate-1', {

@@ -1,14 +1,14 @@
 /**
- * pr-repair-owner.ts -- the owner that decides WHEN a lane-built PR is repaired
- * in place, collapses duplicate lane PRs to a single survivor, and surfaces
+ * pr-repair-owner.ts -- route rejected PRs to their existing repair owners,
+ * collapse duplicate lane PRs to a single survivor, and surface
  * exhausted/judgment cases as one Duty Officer digest line.
  *
  * WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01.
  *
  * John's 2026-08-28 ruling: the Overseer JUDGES a rejected PR and hands it back;
- * TASKMASTER decides what actually fires. This module is that decision. It runs
- * once per Taskmaster tick (only while pause_state is RUNNING) and performs
- * three bounded steps:
+ * Taskmaster routes it to its owner under R6-R10; it never fires a repair
+ * cascade. This module plans three bounded steps, whose effects are admitted
+ * by the existing tick pause, budget, epoch and journal controls:
  *
  *  (1) DEDUPE SWEEP. Over at most MAX_DEDUPE_WOS_PER_TICK work orders that have
  *      two or more lane-created PRs within PR_REPAIR_DEDUPE_WINDOW_HOURS, choose
@@ -20,12 +20,12 @@
  *  (2) REPAIR. Read queued lane_repair candidate rows addressed to Taskmaster.
  *      For at most MAX_REPAIR_FIRES_PER_TICK of them, re-prove the LANE PR RULE,
  *      refuse a non-survivor, require the PR OPEN at the reviewed head, skip while
- *      a run for the WO is still running, then fire exactly ONE bounded repair
- *      cascade on the PR's own branch.
+ *      a run for the WO is still running, then route the repair to its existing
+ *      owner or admit an unresolved-owner digest line.
  *
  *  (3) EXHAUSTED. Turn each queued overseer_remediation_exhausted row into one
  *      digest line; the caller addresses those rows AFTER the digest carrying
- *      them is sent (commitExhausted), so a failed digest never loses the line.
+ *      them is persisted (commitDigestLines), so a failed digest never loses the line.
  *
  * Every external effect is an INJECTED seam, so the owner's whole decision tree
  * runs in tests with no network and no real GitHub writes.
@@ -132,7 +132,8 @@ export interface PrRepairEffect {
   kind: 'dedupe_close' | 'owner_nudge' | 'digest_item';
   sourceRowId?: string;
   digestLine?: string;
-  apply: () => Promise<{ body?: string } | undefined>;
+  addressNote?: 'digested' | 'owner_unresolved';
+  apply: () => Promise<{ body?: string; applied?: false } | undefined>;
 }
 
 export interface PrRepairOwnerDeps {
@@ -203,7 +204,10 @@ export interface PrRepairOwnerResult {
    * caller invokes this ONLY after the digest is sent, so a failed digest never
    * drops the line (the row stays queued for the next tick). Idempotent.
    */
-  commitDigestLines: (persistedBody: string) => Promise<void>;
+  commitDigestLines: (
+    persistedBody: string,
+    admittedItemKeys: ReadonlySet<string>
+  ) => Promise<void>;
 }
 
 const FORBIDDEN_REPAIR_RECIPIENTS = new Set(['xo', 'operator', 'duty-officer']);
@@ -385,14 +389,41 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
   const effects: PrRepairEffect[] = [];
   const exhaustedRowIds: string[] = [];
 
+  const addDigestItem = (
+    line: string,
+    key: string,
+    sourceRowId?: string,
+    addressNote: 'digested' | 'owner_unresolved' = 'digested'
+  ): void => {
+    const idempotencyKey = `tm:repair-digest-item:${key}`;
+    if (effects.some(effect => effect.proposal.idempotencyKey === idempotencyKey)) return;
+    digestItems.push(line);
+    effects.push({
+      kind: 'digest_item',
+      sourceRowId,
+      digestLine: line,
+      addressNote,
+      proposal: {
+        type: 'pr_repair',
+        threadRef: `pr-repair:${key}`,
+        recipient: 'duty-officer',
+        body: line,
+        idempotencyKey,
+        actsImmediately: true,
+      },
+      apply: async () => undefined,
+    });
+  };
+
   const closePlan = async (woId: string, plan: DedupePlan): Promise<void> => {
-    if (!plan.survivor) return;
+    const plannedSurvivor = plan.survivor;
+    if (!plannedSurvivor) return;
     for (const victim of plan.toClose) {
       try {
         const survivor = await deps.fetchPr(
-          plan.survivor.owner,
-          plan.survivor.repo,
-          plan.survivor.prNumber
+          plannedSurvivor.owner,
+          plannedSurvivor.repo,
+          plannedSurvivor.prNumber
         );
         const current = await deps.fetchPr(victim.owner, victim.repo, victim.prNumber);
         const unchanged = (live: typeof current, prior: LanePr): boolean =>
@@ -402,12 +433,12 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
           live.headRefName === prior.headRef &&
           live.reviewDecision === prior.reviewDecision;
         if (
-          !unchanged(survivor, plan.survivor) ||
+          !unchanged(survivor, plannedSurvivor) ||
           !unchanged(current, victim) ||
           (current?.reviewDecision ?? '').toUpperCase() === 'APPROVED'
         )
           continue;
-        const comment = buildSupersededComment(plan.survivor.prNumber, woId);
+        const comment = buildSupersededComment(plannedSurvivor.prNumber, woId);
         const effect: PrRepairEffect = {
           kind: 'dedupe_close',
           proposal: {
@@ -415,10 +446,25 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
             threadRef: `pr-repair:${victim.owner}/${victim.repo}#${victim.prNumber}`,
             recipient: 'duty-officer',
             body: `Close duplicate lane PR ${victim.owner}/${victim.repo}#${victim.prNumber}. ${comment}`,
-            idempotencyKey: `tm:pr-dedupe:${woId}:${victim.owner.toLowerCase()}/${victim.repo.toLowerCase()}#${victim.prNumber}:survivor-${plan.survivor.prNumber}`,
+            idempotencyKey: `tm:pr-dedupe:${woId}:${victim.owner.toLowerCase()}/${victim.repo.toLowerCase()}#${victim.prNumber}:survivor-${plannedSurvivor.prNumber}`,
             actsImmediately: true,
           },
           apply: async () => {
+            // Planning is not execution authority: discovery and earlier effects
+            // may have allowed either PR's eligibility to change in the meantime.
+            const liveSurvivor = await deps.fetchPr(
+              plannedSurvivor.owner,
+              plannedSurvivor.repo,
+              plannedSurvivor.prNumber
+            );
+            const liveVictim = await deps.fetchPr(victim.owner, victim.repo, victim.prNumber);
+            if (
+              !unchanged(liveSurvivor, plannedSurvivor) ||
+              !unchanged(liveVictim, victim) ||
+              (liveVictim?.reviewDecision ?? '').toUpperCase() === 'APPROVED'
+            ) {
+              return { applied: false };
+            }
             await deps.closePr({
               owner: victim.owner,
               repo: victim.repo,
@@ -491,9 +537,10 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
       if (!plan.survivor) continue;
       await closePlan(entry.woId, plan);
       for (const approved of plan.approvedNonSurvivors) {
-        digestItems.push(
+        addDigestItem(
           `${slug(approved.owner, approved.repo, approved.prNumber)} ${entry.woId} ` +
-            `dedupe_needs_human (survivor #${plan.survivor.prNumber})`
+            `dedupe_needs_human (survivor #${plan.survivor.prNumber})`,
+          `dedupe:${entry.woId}:${slug(approved.owner, approved.repo, approved.prNumber)}:survivor-${plan.survivor.prNumber}`
         );
       }
     }
@@ -510,8 +557,9 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     const candidate = parseLaneRepairCandidate(message.body);
     if (candidate) {
       if (!repairAcknowledgmentEligible(message, now())) {
-        digestItems.push(
-          `${slug(candidate.owner, candidate.repo, candidate.prNumber)} ${candidate.woId} repair_acknowledgment_invalid`
+        addDigestItem(
+          `${slug(candidate.owner, candidate.repo, candidate.prNumber)} ${candidate.woId} repair_acknowledgment_invalid`,
+          `acknowledgment-invalid:${message.id}`
         );
         continue;
       }
@@ -626,7 +674,7 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     );
     if (otherOpen) {
       const line = `${candidateSlug} ${candidate.woId} repair_waiting_for_dedupe`;
-      if (!digestItems.includes(line)) digestItems.push(line);
+      addDigestItem(line, `waiting-for-dedupe:${id}`);
       continue;
     }
 
@@ -704,35 +752,30 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     }
     const reason = row.woId ? row.reason : 'no_wo';
     const line = `${slug(row.owner, row.repo, row.prNumber)} ${row.woId ?? 'no-wo'} repair_owner_unresolved:${reason}`;
-    digestItems.push(line);
     exhaustedRowIds.push(id);
-    effects.push({
-      kind: 'digest_item',
-      sourceRowId: id,
-      digestLine: line,
-      proposal: {
-        type: 'pr_repair',
-        threadRef: `pr-repair:${id}`,
-        recipient: 'duty-officer',
-        body: line,
-        idempotencyKey: `tm:repair-digest-item:${id}`,
-        actsImmediately: true,
-      },
-      apply: async () => undefined,
-    });
-    if (row.reason === 'cauldron_repair_pending') {
-      await deps.acknowledgeRow(id);
-      await deps.addressRow(id, 'owner_unresolved');
-    }
+    addDigestItem(
+      line,
+      id,
+      id,
+      row.reason === 'cauldron_repair_pending' ? 'owner_unresolved' : 'digested'
+    );
   }
 
-  const commitDigestLines = async (persistedBody: string): Promise<void> => {
+  const commitDigestLines = async (
+    persistedBody: string,
+    admittedItemKeys: ReadonlySet<string>
+  ): Promise<void> => {
     for (const effect of effects.filter(value => value.kind === 'digest_item')) {
-      if (!effect.sourceRowId || !effect.digestLine || !persistedBody.includes(effect.digestLine))
+      if (
+        !admittedItemKeys.has(effect.proposal.idempotencyKey) ||
+        !effect.sourceRowId ||
+        !effect.digestLine ||
+        !persistedBody.includes(effect.digestLine)
+      )
         continue;
       try {
         await deps.acknowledgeRow(effect.sourceRowId);
-        await deps.addressRow(effect.sourceRowId, 'digested');
+        await deps.addressRow(effect.sourceRowId, effect.addressNote ?? 'digested');
       } catch (error) {
         log('pr_repair.exhausted_address_failed', {
           id: effect.sourceRowId,
@@ -742,7 +785,16 @@ export async function runPrRepairOwner(deps: PrRepairOwnerDeps): Promise<PrRepai
     }
   };
 
-  return { digestItems, closedPrs, effects, repairsFired: 0, exhaustedRowIds, commitDigestLines };
+  return {
+    digestItems,
+    get closedPrs(): number {
+      return closedPrs;
+    },
+    effects,
+    repairsFired: 0,
+    exhaustedRowIds,
+    commitDigestLines,
+  };
 }
 
 async function addressRefusal(

@@ -217,6 +217,8 @@ export interface GithubIssueEvidence {
 export interface TaskmasterDeps {
   now?: () => Date;
   db?: TaskmasterDal;
+  /** Same repair owner with isolated external seams; production uses its existing factory. */
+  prRepairOwnerDeps?: PrRepairOwnerDeps;
   createTask?: typeof createAuthenticatedMessage;
   listUndeliveredRulings?: () => Promise<ThreadSnapshot[]>;
   listThreads?: () => Promise<ThreadSnapshot[] | ListedThreadResult>;
@@ -1917,21 +1919,23 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     log.warn({ err: error as Error }, 'taskmaster.expectation_counts_failed');
   }
   // PR repair owner (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01): collapse
-  // duplicate lane PRs, fire at most one bounded in-place repair, and gather the
-  // exhausted/judgment lines for THIS tick's digest. Runs only while RUNNING and
-  // only against live infrastructure (skipped when a fake DAL is injected, where
-  // the owner is exercised directly in pr-repair-owner.test.ts). It must never
-  // break the tick: any failure degrades to "no items this tick".
-  let prRepairItems: string[] = [];
-  let commitPrRepairDigestLines: ((body: string) => Promise<void>) | null = null;
+  // duplicate lane PRs, route repairs to their owner, and plan digest items.
+  // The ordinary effect path owns admission, including paused-item withholding.
+  // Production uses its existing factory; isolated tests may inject its seams.
+  // Discovery failure must not break the rest of the tick.
+  const admittedPrRepairItems = new Map<string, string>();
+  let commitPrRepairDigestLines:
+    | ((body: string, admittedItemKeys: ReadonlySet<string>) => Promise<void>)
+    | null = null;
   const prRepairEffects = new Map<
     string,
     Awaited<ReturnType<typeof runPrRepairOwner>>['effects'][number]
   >();
-  if (!deps.db) {
+  if (deps.prRepairOwnerDeps || !deps.db) {
     try {
-      const owner = await runPrRepairOwner(createRealPrRepairOwnerDeps(nowMs, epoch));
-      prRepairItems = owner.digestItems;
+      const owner = await runPrRepairOwner(
+        deps.prRepairOwnerDeps ?? createRealPrRepairOwnerDeps(nowMs, epoch)
+      );
       commitPrRepairDigestLines = owner.commitDigestLines;
       for (const effect of owner.effects) {
         prRepairEffects.set(effect.proposal.idempotencyKey, effect);
@@ -1955,8 +1959,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     nowMs,
     expectationCounts,
     unlabelledPriorityTriage,
-    githubDigest,
-    prRepairItems
+    githubDigest
   );
   proposals.push(digest);
 
@@ -1971,6 +1974,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
     if (proposal.type === 'nudge') return 6;
     if (proposal.type === 'blocker_report') return 7;
+    if (proposal.type === 'digest') return 9;
     return 8;
   };
   proposals.sort((a, b) => {
@@ -1991,6 +1995,19 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   let persistedDigestBody: string | null = null;
 
   for (const proposal of proposals) {
+    // Every repair admission has priority over rendering the watching digest.
+    // A planned, parked, rejected or deferred line is not delivered content.
+    if (proposal.type === 'digest') {
+      proposal.body = digestProposal(
+        actions24h,
+        control,
+        nowMs,
+        expectationCounts,
+        unlabelledPriorityTriage,
+        githubDigest,
+        [...admittedPrRepairItems.values()]
+      ).body;
+    }
     const canonicalProposalRef = canonicalizeThreadRef(proposal.threadRef);
     if (proposal.type === 'escalate_p0' && recentEscalateP0ByThread.has(canonicalProposalRef)) {
       continue;
@@ -1999,6 +2016,23 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       actionsByKey.get(proposal.idempotencyKey) ??
       (await dal.getActionByIdempotencyKey(proposal.idempotencyKey));
     if (existingAction) actionsByKey.set(proposal.idempotencyKey, existingAction);
+
+    const plannedRepair = prRepairEffects.get(proposal.idempotencyKey);
+    if (
+      plannedRepair?.kind === 'digest_item' &&
+      plannedRepair.digestLine &&
+      existingAction?.outcome === 'sent' &&
+      existingAction.action_type === proposal.type &&
+      existingAction.thread_ref === proposal.threadRef &&
+      existingAction.idempotency_key === proposal.idempotencyKey &&
+      existingAction.before_hash === sha256(proposal.body) &&
+      validateProposal(proposal).allowed
+    ) {
+      const fresh = await dal.getPauseState();
+      if (fresh.epoch === epoch && fresh.pause_state === 'RUNNING') {
+        admittedPrRepairItems.set(proposal.idempotencyKey, plannedRepair.digestLine);
+      }
+    }
 
     if (
       existingAction &&
@@ -2163,8 +2197,21 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           ? parseGithubThreadRef(proposal.threadRef)
           : null;
       if (repairEffect) {
-        await repairEffect.apply();
+        const applied = await repairEffect.apply();
+        if (applied?.applied === false) {
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'expired',
+            JSON.stringify({ ...proposal, suppressed: 'pr_eligibility_changed' })
+          );
+          journalRow.outcome = 'expired';
+          result.expired += 1;
+          continue;
+        }
         await dal.updateActionOutcome(journalRow.id, 'sent');
+        if (repairEffect.kind === 'digest_item' && repairEffect.digestLine) {
+          admittedPrRepairItems.set(proposal.idempotencyKey, repairEffect.digestLine);
+        }
       } else if (escalationIssue) {
         // WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01: deliver the escalation as
         // a GitHub issue comment (where the owner and Duty Officer look), not to
@@ -2361,7 +2408,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   // next tick instead of marking it delivered and dropping the line.
   if (commitPrRepairDigestLines && persistedDigestBody !== null) {
     try {
-      await commitPrRepairDigestLines(persistedDigestBody);
+      await commitPrRepairDigestLines(persistedDigestBody, new Set(admittedPrRepairItems.keys()));
     } catch (error) {
       log.warn({ err: error as Error }, 'taskmaster.pr_repair_commit_failed');
     }
