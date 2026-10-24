@@ -111,7 +111,7 @@ export async function recordReviewApprovalVerdict(
 ): Promise<void> {
   const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}`;
   const prUrl = `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`;
-  const evidence = { runId, headSha: input.headSha, prUrl };
+  const evidence = { runId, headSha: input.headSha, prUrl, reviewId: input.messageId };
   const unverified = input.disposition === 'approved_unverified';
   if (
     unverified &&
@@ -121,14 +121,15 @@ export async function recordReviewApprovalVerdict(
     }))
   )
     return;
+  const resolved = !unverified ? await deps.resolveUnverifiedEvidence(evidence) : 0;
   const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
   if (!claim.claimed || !claim.verdictId) {
     await deps.reviseVerdict?.({
       runId,
       headSha: input.headSha,
       unverified: input.disposition === 'approved_unverified',
+      allowUnverifiedResolution: resolved > 0,
     });
-    if (!unverified) await deps.resolveUnverifiedEvidence(evidence);
     return;
   }
   await deps.finalizeVerdict({
@@ -140,7 +141,6 @@ export async function recordReviewApprovalVerdict(
     model: input.model,
     prUrl,
   });
-  if (!unverified) await deps.resolveUnverifiedEvidence(evidence);
 }
 
 export async function maybeRecordReviewApprovalVerdict(

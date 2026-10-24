@@ -425,6 +425,7 @@ export async function reviseOverseerReviewVerdict(input: {
   runId: string;
   headSha: string;
   unverified: boolean;
+  allowUnverifiedResolution?: boolean;
 }): Promise<void> {
   await getDatabase().query(
     `UPDATE overseer_verdicts
@@ -433,6 +434,7 @@ export async function reviseOverseerReviewVerdict(input: {
      WHERE run_id = $1 AND head_sha = $2 AND status = 'verdict'
        AND verdict IN ('approved_unverified', 'merge_candidate')
        AND verdict <> $3
+       AND (verdict <> 'approved_unverified' OR $6 = true)
        AND (mutation_sent IS NULL OR mutation_sent = false)
        AND (action_reason IS NULL OR action_reason <> 'processing')`,
     [
@@ -441,6 +443,7 @@ export async function reviseOverseerReviewVerdict(input: {
       input.unverified ? 'approved_unverified' : 'merge_candidate',
       input.unverified ? 'none' : 'flag_merge_ready',
       new Date().toISOString(),
+      input.unverified || input.allowUnverifiedResolution === true,
     ]
   );
 }
@@ -487,15 +490,116 @@ export async function resolveUnverifiedApprovalEvidence(input: {
   runId: string;
   headSha: string;
   prUrl: string;
-}): Promise<void> {
+  reviewId?: string;
+}): Promise<number> {
+  const scope = /^pr-discovery:([^/:#]+)\/([^/:#]+)#([1-9]\d*)$/.exec(input.runId);
+  if (
+    !scope ||
+    !input.reviewId ||
+    !/^[a-f0-9]{40}$/.test(input.headSha) ||
+    input.prUrl !== `https://github.com/${scope[1]}/${scope[2]}/pull/${scope[3]}` ||
+    !Number.isSafeInteger(Number(scope[3]))
+  )
+    return 0;
+  const db = getDatabase();
+  interface ReviewRequest {
+    id: string;
+    body: string;
+    seq: string | number;
+    task_type: string;
+    recipient: string;
+  }
+  const request = async (id: string): Promise<ReviewRequest | null> => {
+    const result = await db.query<ReviewRequest>(
+      'SELECT id,body,seq,task_type,recipient FROM agent_dispatch_messages WHERE id=$1',
+      [id]
+    );
+    const row = result.rows[0];
+    if (
+      row?.task_type !== 'run_review' ||
+      row.recipient !== 'overseer-reviewer' ||
+      !(
+        (typeof row.seq === 'number' && Number.isSafeInteger(row.seq) && row.seq > 0) ||
+        (typeof row.seq === 'string' && /^[1-9]\d*$/.test(row.seq))
+      )
+    )
+      return null;
+    try {
+      const body = JSON.parse(row.body) as Record<string, unknown> | null;
+      return body &&
+        !Array.isArray(body) &&
+        body.owner === scope[1] &&
+        body.repo === scope[2] &&
+        body.prNumber === Number(scope[3]) &&
+        body.headSha === input.headSha
+        ? row
+        : null;
+    } catch {
+      return null;
+    }
+  };
+  const verified = await request(input.reviewId);
+  if (!verified) return 0;
   const prefix = `${input.runId}:unverified:`;
-  await getDatabase().query(
-    `UPDATE overseer_verdicts SET verdict='approval_verified', updated_at=$4
+  const negatives = await db.query<{ id: string; run_id: string; evidence: string | null }>(
+    `SELECT id,run_id,evidence FROM overseer_verdicts
      WHERE substr(run_id,1,length($1))=$1 AND head_sha=$2 AND pr_url=$3
-       AND status='verdict' AND verdict='approved_unverified'
+       AND status='verdict' AND verdict IN ('approved_unverified','approval_verified')
        AND proposed_action='none'`,
-    [prefix, input.headSha, input.prUrl, new Date().toISOString()]
+    [prefix, input.headSha, input.prUrl]
   );
+  let resolved = 0;
+  for (const negative of negatives.rows) {
+    let evidence: Record<string, unknown>;
+    try {
+      evidence = JSON.parse(negative.evidence ?? '') as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (
+      !evidence ||
+      Array.isArray(evidence) ||
+      evidence.disposition !== 'approved_unverified' ||
+      typeof evidence.reviewId !== 'string' ||
+      evidence.headSha !== input.headSha ||
+      evidence.prUrl !== input.prUrl ||
+      negative.run_id !== prefix + evidence.reviewId
+    )
+      continue;
+    const older = await request(evidence.reviewId);
+    if (!older || BigInt(older.seq) >= BigInt(verified.seq)) continue;
+    // Only this inspected observation can be resolved. Already resolved rows
+    // remain durable eligibility proof if a later claim/revision was interrupted.
+    // Recheck immutable request
+    // identity, payload and strict database order in the update itself; never
+    // sweep a newer negative that arrived after the SELECT above.
+    const result = await db.query(
+      `UPDATE overseer_verdicts SET verdict='approval_verified', updated_at=$10
+       WHERE id=$1 AND run_id=$2 AND head_sha=$3 AND pr_url=$4 AND evidence=$5
+         AND status='verdict' AND verdict IN ('approved_unverified','approval_verified')
+         AND proposed_action='none'
+         AND EXISTS (SELECT 1 FROM agent_dispatch_messages n
+           JOIN agent_dispatch_messages v ON v.id=$7
+           WHERE n.id=$6 AND n.seq < v.seq
+             AND n.task_type='run_review' AND v.task_type='run_review'
+             AND n.recipient='overseer-reviewer' AND v.recipient='overseer-reviewer'
+             AND n.body=$8 AND v.body=$9)`,
+      [
+        negative.id,
+        negative.run_id,
+        input.headSha,
+        input.prUrl,
+        negative.evidence,
+        older.id,
+        verified.id,
+        older.body,
+        verified.body,
+        new Date().toISOString(),
+      ]
+    );
+    resolved += result.rowCount;
+  }
+  return resolved;
 }
 
 export async function deferVerdictClaimForMergeExecution(

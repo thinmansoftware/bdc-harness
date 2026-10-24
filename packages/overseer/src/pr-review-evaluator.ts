@@ -182,7 +182,7 @@ interface ParsedReviewVerdict {
 
 const FINDING_SEVERITIES = new Set(['blocker', 'major', 'minor', 'note']);
 const UNVERIFIED_EVIDENCE =
-  /sandbox|could not be independently verified|unavailable because|unable to (?:run|inspect|verify)|checkout (?:failed|unavailable)|execution (?:failed|unavailable)|exact head .*(?:not|unable|failed)|tools? (?:failed|unavailable)/i;
+  /\b(?:sandbox|checkout|execution|tools?)(?:\s+(?:startup|initialization))?(?:\s+(?:was|were|is|are|has|have|had))?\s+(?:failed|unavailable|unusable|not available|could not (?:start|run)|did not (?:start|run))\b|could not be independently verified|unable to (?:run|inspect|verify)|could not (?:run|inspect|verify)|(?:inspection|test execution) (?:was|were) unavailable|exact head .*(?:not|unable|failed)/i;
 
 function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;

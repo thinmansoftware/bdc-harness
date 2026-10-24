@@ -5,6 +5,7 @@ import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import * as verdictStore from '@archon/core/db/overseer';
 import { createRealSubmitDeps, recordReviewApprovalVerdict } from './pr-review-wiring';
 import { runAndSubmitReview, type SubmitDeps } from './pr-review-submit';
+import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
 import {
   runMergeExecutionBridgeOnce,
   type MergeExecutionBridgeStore,
@@ -45,6 +46,18 @@ describe('unverified approvals', () => {
     ];
     expect(parseReviewVerdict(output({ findings }))?.verdict).toBe('APPROVE_UNVERIFIED');
   });
+  test('positive sandbox findings do not invalidate a verified approval', () => {
+    for (const summary of [
+      'Sandbox isolation tests passed at the exact head',
+      'The sandbox started and all required tests passed',
+    ]) {
+      expect(
+        parseReviewVerdict(
+          output({ findings: [{ scope: 'Validation', severity: 'note', summary }] })
+        )?.verdict
+      ).toBe('APPROVE');
+    }
+  });
 });
 
 describe('unverified approval persistence and execution', () => {
@@ -74,6 +87,22 @@ describe('unverified approval persistence and execution', () => {
     mock.restore();
     await db.close();
   });
+
+  async function reviewRequest(label: string): Promise<typeof work> {
+    const message = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'overseer' },
+      {
+        task_type: 'run_review',
+        recipient: 'overseer-reviewer',
+        subject_key: 'gh:thinmansoftware/bdc-harness#55',
+        repeat_reason: 'test_review_order',
+        correlation_id: head,
+        idempotency_key: `test-review-request:${label}`,
+        body: JSON.stringify({ ...work, headCiGreen: true }),
+      }
+    );
+    return { ...work, messageId: message.id };
+  }
 
   const realSubmit = (): SubmitDeps =>
     createRealSubmitDeps('thinman-overseer[bot]', {
@@ -241,8 +270,10 @@ describe('unverified approval persistence and execution', () => {
   });
 
   test('verified_approval_still_merges_as_before', async () => {
-    await recordReviewApprovalVerdict({ ...work, disposition: 'approved_unverified' });
-    await recordReviewApprovalVerdict({ ...work, disposition: 'approved' });
+    const negative = await reviewRequest('initial-unverified');
+    await recordReviewApprovalVerdict({ ...negative, disposition: 'approved_unverified' });
+    const retry = await reviewRequest('verified-retry');
+    await recordReviewApprovalVerdict({ ...retry, disposition: 'approved' });
     const result = await bridge();
     expect(result.merges).toBe(1);
     const rows = await db.query<{ mutation_sent: number }>(
@@ -250,15 +281,175 @@ describe('unverified approval persistence and execution', () => {
     );
     expect(rows.rows[0].mutation_sent).toBe(1);
   });
+  test('old verified approval redelivery cannot clear a newer unverified review', async () => {
+    const older = await reviewRequest('old-verified');
+    await recordReviewApprovalVerdict({ ...older, disposition: 'approved' });
+    const negative = await reviewRequest('new-unverified');
+    await recordReviewApprovalVerdict({ ...negative, disposition: 'approved_unverified' });
+    await recordReviewApprovalVerdict({ ...older, disposition: 'approved' });
+    expect((await bridge()).merges).toBe(0);
+    const holds = await db.query<{ id: string }>(
+      "SELECT id FROM overseer_verdicts WHERE verdict='approved_unverified'"
+    );
+    expect(holds.rowCount).toBeGreaterThan(0);
+  });
+
+  test('verified redelivery finishes an interrupted evidence-resolution transition', async () => {
+    const negative = await reviewRequest('negative-before-interruption');
+    await recordReviewApprovalVerdict({ ...negative, disposition: 'approved_unverified' });
+    const retry = await reviewRequest('verified-before-interruption');
+    let failed = false;
+    try {
+      await recordReviewApprovalVerdict(
+        { ...retry, disposition: 'approved' },
+        {
+          persistUnverifiedEvidence: verdictStore.recordUnverifiedApprovalEvidence,
+          resolveUnverifiedEvidence: verdictStore.resolveUnverifiedApprovalEvidence,
+          finalizeVerdict: verdictStore.finalizeOverseerVerdict,
+          reviseVerdict: verdictStore.reviseOverseerReviewVerdict,
+          claimVerdict: async () => {
+            throw new Error('synthetic interruption after resolution');
+          },
+        }
+      );
+    } catch (error) {
+      failed = true;
+      expect((error as Error).message).toBe('synthetic interruption after resolution');
+    }
+    expect(failed).toBe(true);
+    const evidence = await db.query<{ verdict: string }>(
+      "SELECT verdict FROM overseer_verdicts WHERE run_id LIKE '%:unverified:%'"
+    );
+    expect(evidence.rows[0].verdict).toBe('approval_verified');
+    await recordReviewApprovalVerdict({ ...retry, disposition: 'approved' });
+    expect((await bridge()).merges).toBe(1);
+  });
+
+  test('same or missing review identity cannot resolve an unverified observation', async () => {
+    const negative = await reviewRequest('negative-identity');
+    await recordReviewApprovalVerdict({ ...negative, disposition: 'approved_unverified' });
+    for (const messageId of [negative.messageId, 'missing-review-request']) {
+      await recordReviewApprovalVerdict({ ...work, messageId, disposition: 'approved' });
+      expect((await bridge()).merges).toBe(0);
+    }
+  });
+
+  test.each([
+    'negative-task',
+    'verified-recipient',
+    'negative-null-seq',
+    'verified-null-seq',
+    'equal-order',
+    'malformed-payload',
+    'foreign-owner',
+    'foreign-repo',
+    'foreign-pr',
+    'foreign-head',
+    'malformed-evidence',
+    'foreign-evidence-id',
+    'foreign-evidence-head',
+    'foreign-evidence-url',
+  ])('invalid %s cannot clear negative evidence', async fault => {
+    const negative = await reviewRequest('negative');
+    await recordReviewApprovalVerdict({ ...negative, disposition: 'approved_unverified' });
+    const retry = await reviewRequest('retry');
+    const evidenceRun = `pr-discovery:thinmansoftware/bdc-harness#55:unverified:${negative.messageId}`;
+    if (fault === 'negative-task') {
+      await db.query("UPDATE agent_dispatch_messages SET task_type='agent_message' WHERE id=$1", [
+        negative.messageId,
+      ]);
+    } else if (fault === 'verified-recipient') {
+      await db.query("UPDATE agent_dispatch_messages SET recipient='operator' WHERE id=$1", [
+        retry.messageId,
+      ]);
+    } else if (fault.endsWith('null-seq')) {
+      await db.query('UPDATE agent_dispatch_messages SET seq=NULL WHERE id=$1', [
+        fault === 'negative-null-seq' ? negative.messageId : retry.messageId,
+      ]);
+    } else if (fault === 'equal-order') {
+      await db.query(
+        'UPDATE agent_dispatch_messages SET seq=(SELECT seq FROM agent_dispatch_messages WHERE id=$1) WHERE id=$2',
+        [negative.messageId, retry.messageId]
+      );
+    } else if (fault === 'malformed-evidence' || fault.startsWith('foreign-evidence')) {
+      const evidence = {
+        disposition: 'approved_unverified',
+        reviewId: negative.messageId,
+        headSha: head,
+        prUrl,
+        ...(fault === 'foreign-evidence-id' ? { reviewId: retry.messageId } : {}),
+        ...(fault === 'foreign-evidence-head' ? { headSha: 'b'.repeat(40) } : {}),
+        ...(fault === 'foreign-evidence-url' ? { prUrl: prUrl + '0' } : {}),
+      };
+      await db.query('UPDATE overseer_verdicts SET evidence=$1 WHERE run_id=$2', [
+        fault === 'malformed-evidence' ? '{}' : JSON.stringify(evidence),
+        evidenceRun,
+      ]);
+    } else {
+      const body = {
+        ...work,
+        ...(fault === 'foreign-owner' ? { owner: 'foreign' } : {}),
+        ...(fault === 'foreign-repo' ? { repo: 'foreign' } : {}),
+        ...(fault === 'foreign-pr' ? { prNumber: 56 } : {}),
+        ...(fault === 'foreign-head' ? { headSha: 'b'.repeat(40) } : {}),
+      };
+      await db.query('UPDATE agent_dispatch_messages SET body=$1 WHERE id=$2', [
+        fault === 'malformed-payload' ? '{}' : JSON.stringify(body),
+        retry.messageId,
+      ]);
+    }
+    await recordReviewApprovalVerdict({ ...retry, disposition: 'approved' });
+    expect((await bridge()).merges).toBe(0);
+    const rows = await db.query<{ verdict: string }>(
+      'SELECT verdict FROM overseer_verdicts WHERE run_id=$1',
+      [evidenceRun]
+    );
+    expect(rows.rows[0].verdict).toBe('approved_unverified');
+  });
+
+  test('legacy negative without ordered evidence cannot become merge ready', async () => {
+    await recordReviewApprovalVerdict({ ...work, disposition: 'approved_unverified' });
+    await db.query("DELETE FROM overseer_verdicts WHERE run_id LIKE '%:unverified:%'");
+    const retry = await reviewRequest('retry-after-legacy');
+    await recordReviewApprovalVerdict({ ...retry, disposition: 'approved' });
+    expect((await bridge()).merges).toBe(0);
+  });
+
+  test('a newer negative arriving during resolution is never swept', async () => {
+    const negative = await reviewRequest('before-retry');
+    await recordReviewApprovalVerdict({ ...negative, disposition: 'approved_unverified' });
+    const retry = await reviewRequest('verified-retry');
+    const query = db.query.bind(db);
+    let injected = false;
+    spyOn(db, 'query').mockImplementation(async <T>(sql: string, params?: unknown[]) => {
+      const result = await query<T>(sql, params);
+      if (!injected && sql.includes('SELECT id,run_id,evidence FROM overseer_verdicts')) {
+        injected = true;
+        const later = await reviewRequest('arrived-during-resolution');
+        await recordReviewApprovalVerdict({ ...later, disposition: 'approved_unverified' });
+      }
+      return result;
+    });
+    await recordReviewApprovalVerdict({ ...retry, disposition: 'approved' });
+    expect(injected).toBe(true);
+    expect((await bridge()).merges).toBe(0);
+    const negatives = await db.query<{ verdict: string }>(
+      "SELECT verdict FROM overseer_verdicts WHERE run_id LIKE '%:unverified:%'"
+    );
+    expect(negatives.rows.map(row => row.verdict).sort()).toEqual([
+      'approval_verified',
+      'approved_unverified',
+    ]);
+  });
   test('unverified evidence survives a processing merge claim and a verified retry resolves it', async () => {
     await recordReviewApprovalVerdict({ ...work, disposition: 'approved' });
     const candidate = await db.query<{ id: string }>(
       "SELECT id FROM overseer_verdicts WHERE proposed_action='flag_merge_ready'"
     );
     expect(await verdictStore.claimVerdictForMergeExecution(candidate.rows[0].id)).toBe(true);
+    const negative = await reviewRequest('processing-negative');
     await recordReviewApprovalVerdict({
-      ...work,
-      messageId: 'negative-review',
+      ...negative,
       disposition: 'approved_unverified',
     });
     const claimed = await db.query<{ action_reason: string }>(
@@ -274,15 +465,14 @@ describe('unverified approval persistence and execution', () => {
     expect(await verdictStore.hasUnverifiedApprovalForHead(original)).toBe(true);
     await verdictStore.releaseVerdictClaimForMergeExecution(candidate.rows[0].id, 'test_release');
     expect((await bridge()).merges).toBe(0);
+    const retry = await reviewRequest('processing-verified-retry');
     await recordReviewApprovalVerdict({
-      ...work,
-      messageId: 'verified-retry',
+      ...retry,
       disposition: 'approved',
     });
     expect(await verdictStore.hasUnverifiedApprovalForHead(original)).toBe(false);
     await recordReviewApprovalVerdict({
-      ...work,
-      messageId: 'negative-review',
+      ...negative,
       disposition: 'approved_unverified',
     });
     expect(await verdictStore.hasUnverifiedApprovalForHead(original)).toBe(false);
