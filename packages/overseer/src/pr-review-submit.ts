@@ -32,6 +32,10 @@ import {
   type RemediationRefusalReason,
 } from './remediation-candidate';
 
+function extractRepairWoId(text: string | null | undefined): string | null {
+  return text?.match(/\bWO-(?:[A-Z0-9]+-)+\d{2,}\b/)?.[0] ?? null;
+}
+
 /** What the governed reviewer returns. */
 export interface ReviewerVerdict {
   /** true -> APPROVE; false -> REQUEST_CHANGES. */
@@ -270,6 +274,49 @@ export interface SubmitDeps {
    * be told a fix was queued when this verdict queued nothing.
    */
   emitRemediationCandidate?(body: RemediationCandidateBody): Promise<RemediationEmitResult>;
+
+  /**
+   * Resolve the structural lane-repair context for this PR
+   * (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01). Returns {woId, headRef,
+   * workflowName} when the event store proves the PR was lane-created for a WO,
+   * else null. This is the structured eligibility signal decideRemediation
+   * needs to hand a lane PR back WITHOUT a prose class match. OPTIONAL: when
+   * absent, no PR is treated as lane-created and the hand-back behaves exactly
+   * as before (fail-closed -- a non-lane PR is never auto-repaired).
+   */
+  resolveLaneRepairContext?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+  }): Promise<
+    | { woId: string; headRef: string; workflowName: string }
+    | {
+        laneRepair: { woId: string; headRef: string; workflowName: string } | null;
+        identity: { title: string; body: string; headRef: string; prUrl: string };
+      }
+    | null
+  >;
+
+  /**
+   * Emit the one-per-PR exhausted/judgment hand-off to Taskmaster's digest when
+   * a LANE PR's repair is refused with attempt_cap or non_auto_finding. Keyed
+   * `overseer-remediation-exhausted:<owner>/<repo>#<N>` (no head) so it is sent
+   * at most once per PR ever and is NOT counted as a remediation attempt.
+   */
+  emitRemediationExhausted?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    woId: string | null;
+    reason: 'attempt_cap' | 'non_auto_finding' | 'outside_cauldron';
+    prUrl: string;
+    headRef: string;
+    owningLane: string | null;
+    buildLine: 'cauldron' | 'outside';
+    lastVerdictSummary: string;
+  }): Promise<void>;
 }
 
 /** What the remediation hand-back did, recorded on the receipt. */
@@ -586,8 +633,56 @@ async function handBackToTaskmaster(
   verdict: ReviewerVerdict,
   deps: SubmitDeps
 ): Promise<RemediationOutcome> {
+  if (verdict.reasonCode) return { emitted: false, reason: 'remediation_not_configured' };
   if (!deps.emitRemediationCandidate || !deps.countPriorRemediationAttempts) {
     return { emitted: false, reason: 'remediation_not_configured' };
+  }
+
+  // Structural lane-repair proof (never prose): is this PR lane-created, and for
+  // which WO/branch? A failure to resolve degrades to "not lane-created", which
+  // routes to a human -- the fail-closed direction.
+  let laneRepair: { woId: string; headRef: string; workflowName: string } | undefined;
+  let identity: { title: string; body: string; headRef: string; prUrl: string } | undefined;
+  if (deps.resolveLaneRepairContext) {
+    try {
+      const resolved = await deps.resolveLaneRepairContext({
+        owner: work.owner,
+        repo: work.repo,
+        prNumber: work.prNumber,
+        headSha: work.headSha,
+      });
+      if (resolved && 'laneRepair' in resolved) {
+        laneRepair = resolved.laneRepair ?? undefined;
+        identity = resolved.identity;
+      } else laneRepair = resolved ?? undefined;
+    } catch {
+      laneRepair = undefined;
+    }
+  }
+
+  if (!laneRepair && identity && deps.emitRemediationExhausted) {
+    const woId =
+      extractRepairWoId(identity.title) ??
+      extractRepairWoId(identity.body) ??
+      extractRepairWoId(identity.headRef);
+    try {
+      await deps.emitRemediationExhausted({
+        owner: work.owner,
+        repo: work.repo,
+        prNumber: work.prNumber,
+        headSha: work.headSha,
+        woId,
+        reason: 'outside_cauldron',
+        prUrl: identity.prUrl,
+        headRef: identity.headRef,
+        owningLane: null,
+        buildLine: 'outside',
+        lastVerdictSummary: buildReviewBody(work, verdict).slice(0, 600),
+      });
+    } catch {
+      // Best effort: the already-submitted review remains authoritative.
+    }
+    return { emitted: false, reason: 'no_blocking_findings' };
   }
 
   let priorAttempts: number;
@@ -613,9 +708,45 @@ async function handBackToTaskmaster(
     verdictBody: buildReviewBody(work, verdict),
     priorAttempts,
     owningLane: work.author || null,
+    ...(laneRepair ? { woId: laneRepair.woId, laneRepair } : {}),
   });
 
-  if (!decision.emit) return { emitted: false, reason: decision.reason };
+  if (!decision.emit) {
+    // A lane PR whose repair is exhausted or needs human judgment surfaces ONCE
+    // in the Duty Officer digest, not silently. Keyed per-PR (no head), so a
+    // replayed verdict adds nothing; never counted as an attempt. Never throws.
+    if (
+      laneRepair &&
+      deps.emitRemediationExhausted &&
+      (decision.reason === 'remediation_attempts_exhausted' ||
+        decision.reason === 'non_auto_finding_present')
+    ) {
+      try {
+        await deps.emitRemediationExhausted({
+          owner: work.owner,
+          repo: work.repo,
+          prNumber: work.prNumber,
+          headSha: work.headSha,
+          woId: laneRepair.woId,
+          reason:
+            decision.reason === 'remediation_attempts_exhausted'
+              ? 'attempt_cap'
+              : 'non_auto_finding',
+          prUrl:
+            identity?.prUrl ??
+            `https://github.com/${work.owner}/${work.repo}/pull/${work.prNumber}`,
+          headRef: laneRepair.headRef,
+          owningLane: laneRepair.workflowName,
+          buildLine: 'cauldron',
+          lastVerdictSummary: buildReviewBody(work, verdict).slice(0, 600),
+        });
+      } catch {
+        // The exhausted hand-off is best-effort: a failure here must never
+        // convert a submitted review into a failed submission.
+      }
+    }
+    return { emitted: false, reason: decision.reason };
+  }
 
   let result: RemediationEmitResult;
   try {

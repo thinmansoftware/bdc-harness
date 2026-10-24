@@ -87,6 +87,7 @@ describe('cascade entry override and refuse', () => {
     try {
       let fireCalled = false;
       const deps: CascadeDeps = {
+        findBlockingOpenPrs: async () => [],
         fire: async () => {
           fireCalled = true;
           return { ok: false, runId: null, conversationId: null, infraError: 'should-not-fire' };
@@ -123,6 +124,7 @@ describe('cascade entry override and refuse', () => {
   test('dark lane glm is refused and does not fire', async () => {
     let fireCalled = false;
     const deps: CascadeDeps = {
+      findBlockingOpenPrs: async () => [],
       fire: async () => {
         fireCalled = true;
         return { ok: false, runId: null, conversationId: null, infraError: 'should-not-fire' };
@@ -151,6 +153,7 @@ describe('cascade entry override and refuse', () => {
     const firedWorkflows: string[] = [];
     try {
       const deps: CascadeDeps = {
+        findBlockingOpenPrs: async () => [],
         fire: async opts => {
           firedWorkflows.push(opts.workflowName);
           return makeFireOk(`run-${firedWorkflows.length}`);
@@ -190,6 +193,7 @@ describe('cascade entry override and refuse', () => {
     let judgeCall = 0;
     try {
       const deps: CascadeDeps = {
+        findBlockingOpenPrs: async () => [],
         fire: async opts => {
           firedWorkflows.push(opts.workflowName);
           return makeFireOk(`run-${firedWorkflows.length}`);
@@ -230,6 +234,7 @@ describe('cascade entry override and refuse', () => {
   test('entry override claude is refused and does not fire', async () => {
     let fireCalled = false;
     const deps: CascadeDeps = {
+      findBlockingOpenPrs: async () => [],
       fire: async () => {
         fireCalled = true;
         return { ok: false, runId: null, conversationId: null, infraError: 'should-not-fire' };

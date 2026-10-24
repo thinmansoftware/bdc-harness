@@ -441,7 +441,7 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
 
   /**
    * REGRESSION -- PR #740 round 7 [major] (2026-10-05). ascii_violation kept a
-   * BARE first alternative -- /(?:non-ascii|ascii-only)/ with no failure
+   * BARE first alternative -- /\b(?:non-ascii|ascii-only)\b/ with no failure
    * requirement -- so any finding that merely said "Non-ASCII" classified as
    * auto-fixable. The gate's example is a data-disclosure defect:
    * "Non-ASCII tenant names collide, allowing one customer to read another
@@ -654,17 +654,21 @@ describe('scenario 7: an APPROVED verdict never remediates', () => {
   });
 });
 
-describe('scenario 8: Taskmaster refusal (consumer not yet built)', () => {
-  // SKIPPED WITH REASON, per the spec.
-  //
-  // The freeze is OVER: PR #669 (M-129 Phase 1.5) merged 2026-08-30, so
-  // packages/server/src/taskmaster/* is editable again. What is still missing
-  // is the consumer itself -- nothing in packages/server/src/taskmaster/ reads
-  // `overseer_remediation_candidate`, so there is no budget/pause/eligibility
-  // refusal to assert against. Building that consumer is follow-on work
-  // (tracked separately); this test unskips when it lands.
-  test.skip('a candidate arriving while paused or over budget is not fired', () => {
-    throw new Error('unreachable: Taskmaster remediation consumer not yet built');
+describe('scenario 8: consumer now exists (lane-repair hand-back contract)', () => {
+  // The Taskmaster consumer is built (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01:
+  // packages/server/src/taskmaster/pr-repair-owner.ts reads
+  // `overseer_remediation_candidate`). The hand-back is still gated: a verdict
+  // only becomes a candidate when the PR is PROVEN lane-created (the structural
+  // laneRepair signal). A NON-lane PR -- the common case -- still hands back
+  // nothing, exactly as before, because decideRemediation sees no laneRepair and
+  // AUTO_FIXABLE_CLASSES is empty.
+  test('a non-lane PR hands back nothing even with the consumer present', () => {
+    const decision = decideRemediation(baseInput());
+    expect(decision.emit).toBe(false);
+    if (decision.emit) throw new Error('unreachable');
+    // No laneRepair signal + empty class table -> the blocking finding is
+    // treated as non-auto and goes to a human.
+    expect(decision.reason).toBe('non_auto_finding_present');
   });
 });
 
@@ -906,6 +910,148 @@ describe('submit path hands a rejected verdict back to Taskmaster', () => {
     expect(decision.body.headSha).toBe('f868542e0000000000000000000000000000abcd');
     expect(decision.body.owningLane).toBe('cauldron-lane-a');
     expect(decision.body.findingClasses).toEqual(['migration_ordering']);
+  });
+});
+
+/**
+ * WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01: the lane-repair hand-back. The PR
+ * is PROVEN lane-created (resolveLaneRepairContext returns a context), so a
+ * CHANGES_REQUESTED verdict with a non-vetoed blocking finding is handed back
+ * as a findingClasses:['lane_repair'] candidate WITHOUT any positive class
+ * match -- AUTO_FIXABLE_CLASSES stays empty.
+ */
+describe('lane-repair hand-back (overseer side)', () => {
+  const LANE_HEAD = 'feat/wo-xo-ce-health-digest-01-thread-f7a2e0ec';
+  const LANE_WO = 'WO-XO-CE-HEALTH-DIGEST-01';
+  const HEAD_SHA = 'aaaa1111bbbb2222cccc3333dddd4444eeee5555';
+
+  function laneWork(): ReviewWorkItem {
+    return {
+      correlationId: 'corr-lane',
+      messageId: 'msg-lane',
+      owner: 'thinmansoftware',
+      repo: 'bdc-xo',
+      prNumber: 3171,
+      headSha: HEAD_SHA,
+      author: 'bluedevilcollectibles',
+    };
+  }
+
+  const MECHANICAL_FINDING: IndependentReviewFinding = {
+    scope: 'packages/server/src/x.ts',
+    severity: 'major',
+    summary: 'The test fails: expected 200 but received 500.',
+  };
+  const DISCLOSURE_FINDING: IndependentReviewFinding = {
+    scope: 'packages/server/src/invoices.ts',
+    severity: 'major',
+    summary: "Endpoint returns every customer's invoices to any caller.",
+  };
+
+  function laneDeps(
+    opts: {
+      priorAttempts?: number;
+      findings?: readonly IndependentReviewFinding[];
+      lane?: Awaited<ReturnType<NonNullable<SubmitDeps['resolveLaneRepairContext']>>>;
+    } = {}
+  ) {
+    const candidates: unknown[] = [];
+    const exhausted = new Map<string, { reason: string; buildLine: string }>();
+    const base: SubmitDeps = {
+      reviewerIdentity: 'thinman-overseer[bot]',
+      runReviewer: async () => ({
+        approved: false,
+        summary: 'Repairable finding.',
+        reviewedHeadSha: HEAD_SHA,
+        findings: opts.findings ?? [MECHANICAL_FINDING],
+      }),
+      submitReview: async () => ({ submitted: true }),
+      currentHeadSha: async () => HEAD_SHA,
+      recordReceipt: async () => {},
+      countPriorRemediationAttempts: async () => opts.priorAttempts ?? 0,
+      emitRemediationCandidate: async body => {
+        candidates.push(body);
+        return { claimed: true, attempt: body.attempt };
+      },
+      resolveLaneRepairContext: async () =>
+        opts.lane === undefined
+          ? { woId: LANE_WO, headRef: LANE_HEAD, workflowName: 'bdc-feature-development-codex' }
+          : opts.lane,
+      emitRemediationExhausted: async input => {
+        // Model ON CONFLICT DO NOTHING: one row per PR ever.
+        const key = `${input.owner}/${input.repo}#${input.prNumber}`;
+        if (!exhausted.has(key))
+          exhausted.set(key, { reason: input.reason, buildLine: input.buildLine });
+      },
+    };
+    return { deps: base, candidates, exhausted };
+  }
+
+  test('Test 1: changes_requested_fires_one_repair_on_same_branch', async () => {
+    const { deps, candidates } = laneDeps({ priorAttempts: 0 });
+    const outcome = await runAndSubmitReview(laneWork(), deps);
+
+    expect(outcome.disposition).toBe('changes_requested');
+    expect(outcome.remediation?.emitted).toBe(true);
+    expect(candidates).toHaveLength(1);
+    const body = candidates[0] as {
+      findingClasses: string[];
+      attempt: number;
+      headRef: string | null;
+      woId: string | null;
+    };
+    expect(body.findingClasses).toEqual(['lane_repair']);
+    expect(body.attempt).toBe(1);
+    expect(body.headRef).toBe(LANE_HEAD);
+    expect(body.woId).toBe(LANE_WO);
+  });
+
+  test('Test 2: second_changes_requested_respects_cap', async () => {
+    const { deps, candidates, exhausted } = laneDeps({ priorAttempts: MAX_REMEDIATION_ATTEMPTS });
+    const first = await runAndSubmitReview(laneWork(), deps);
+    expect(first.remediation?.emitted).toBe(false);
+    expect(first.remediation?.reason).toBe('remediation_attempts_exhausted');
+    expect(candidates).toHaveLength(0);
+    expect(exhausted.size).toBe(1);
+    expect([...exhausted.values()][0]?.reason).toBe('attempt_cap');
+
+    // Replay the same verdict -> nothing new (one exhausted row per PR ever).
+    await runAndSubmitReview(laneWork(), deps);
+    expect(candidates).toHaveLength(0);
+    expect(exhausted.size).toBe(1);
+  });
+
+  test('Test 10: vetoed_finding_on_lane_pr_goes_to_digest_not_repair', async () => {
+    const { deps, candidates, exhausted } = laneDeps({ findings: [DISCLOSURE_FINDING] });
+    const outcome = await runAndSubmitReview(laneWork(), deps);
+
+    expect(outcome.remediation?.emitted).toBe(false);
+    expect(candidates).toHaveLength(0);
+    expect(exhausted.size).toBe(1);
+    expect([...exhausted.values()][0]?.reason).toBe('non_auto_finding');
+  });
+
+  test('build_line_split_never_both', async () => {
+    const { deps, candidates, exhausted } = laneDeps({
+      lane: {
+        laneRepair: null,
+        identity: {
+          title: `Repair ${LANE_WO}`,
+          body: '',
+          headRef: 'feat/hand-built-fix',
+          prUrl: 'https://github.com/thinmansoftware/bdc-xo/pull/3171',
+        },
+      },
+    });
+    const outcome = await runAndSubmitReview(laneWork(), deps);
+
+    expect(outcome.remediation?.emitted).toBe(false);
+    expect(candidates).toHaveLength(0);
+    expect(exhausted.size).toBe(1);
+    expect([...exhausted.values()][0]).toEqual({
+      reason: 'outside_cauldron',
+      buildLine: 'outside',
+    });
   });
 });
 

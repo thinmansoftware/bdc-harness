@@ -13,7 +13,33 @@ import * as envVarDb from '../db/env-vars';
 import { getAgentProvider } from '@archon/providers';
 import { loadConfig as loadMergedConfig } from '../config/config-loader';
 import { createLogger } from '@archon/paths';
-import { freezeWorkOrderSource } from './work-order-source';
+import { freezeWorkOrderSource, type RepairAttemptRow } from './work-order-source';
+import { getMessage } from '../db/dispatch';
+
+/**
+ * Repair-attempt row lookup backed by the EXISTING dispatch.getMessage
+ * (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01). Read-only reuse -- dispatch.ts is
+ * not modified. freezeWorkOrderSource validates this row before any repair
+ * target text may enter the frozen spec.
+ */
+export function createRepairAttemptLookup(): (id: string) => Promise<RepairAttemptRow | null> {
+  return async (id: string): Promise<RepairAttemptRow | null> => {
+    const row = await getMessage(id);
+    if (!row) return null;
+    return {
+      sender: row.sender,
+      sender_principal_id: row.sender_principal_id,
+      recipient: row.recipient,
+      body: row.body,
+      status: row.status,
+      addressed_at: row.addressed_at,
+      addressed_by: row.addressed_by,
+      route_disposition: row.route_disposition,
+      acknowledged_by: row.acknowledged_by,
+      acknowledged_at: row.acknowledged_at,
+    };
+  };
+}
 
 // Compile-time assertion: MergedConfig must remain a structural subtype of WorkflowConfig.
 // If MergedConfig drifts from WorkflowConfig, this line becomes a type error.
@@ -102,10 +128,12 @@ export function createWorkflowStore(): IWorkflowStore {
  * Single construction point -- avoids duplicating the wiring across callers.
  */
 export function createWorkflowDeps(): WorkflowDeps {
+  const lookupRepairAttempt = createRepairAttemptLookup();
   return {
     store: createWorkflowStore(),
     getAgentProvider,
     loadConfig: loadMergedConfig,
-    freezeWorkOrderSource,
+    freezeWorkOrderSource: (policy, userMessage, targetRepository) =>
+      freezeWorkOrderSource(policy, userMessage, { lookupRepairAttempt, targetRepository }),
   };
 }

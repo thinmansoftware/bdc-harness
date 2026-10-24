@@ -49,13 +49,17 @@ import { createIsolationStore } from '../db/isolation-environments';
 import { toError } from '../utils/error';
 import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
-import { parseDeclaredBaseBranch } from '@archon/workflows/reliability/run-authority';
+import {
+  frozenSourceDispatchId,
+  parseDeclaredBaseBranch,
+} from '@archon/workflows/reliability/run-authority';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import type { ModelOverride } from '@archon/workflows/model-override';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createWorkflowDeps } from '../workflows/store-adapter';
 import { freezeWorkOrderSource } from '../workflows/work-order-source';
+import { createRepairAttemptLookup } from '../workflows/store-adapter';
 import {
   cleanupToMakeRoom,
   getWorktreeStatusBreakdown,
@@ -289,8 +293,15 @@ export async function dispatchBackgroundWorkflow(
     prBranch?: string;
   }
 ): Promise<void> {
+  const resolvedCodebase = ctx.codebaseId ? await getCodebase(ctx.codebaseId) : null;
   const frozenSpecSource = workflow.run_authority?.required
-    ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage)
+    ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage, {
+        // Repair-attempt authority (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01):
+        // a trusted taskmaster-acknowledged dispatch row is required before any
+        // "Repair target: PR #N" line can enter the frozen spec.
+        lookupRepairAttempt: createRepairAttemptLookup(),
+        targetRepository: resolvedCodebase?.repository_url,
+      })
     : undefined;
 
   // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): resolve the WO's
@@ -303,7 +314,10 @@ export async function dispatchBackgroundWorkflow(
   // 1. Generate worker conversation ID
   const workerPlatformId = `web-worker-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
   const authoritySource = frozenSpecSource
-    ? { ...frozenSpecSource, dispatchId: workerPlatformId }
+    ? {
+        ...frozenSpecSource,
+        dispatchId: frozenSourceDispatchId(frozenSpecSource, workerPlatformId),
+      }
     : undefined;
 
   // 2. Create worker conversation in DB
@@ -318,7 +332,7 @@ export async function dispatchBackgroundWorkflow(
   // Isolation failure is fatal -- never run a workflow in a shared/parent worktree.
   let workerCwd: string;
   if (ctx.codebaseId) {
-    const codebase = await getCodebase(ctx.codebaseId);
+    const codebase = resolvedCodebase;
     if (!codebase) {
       throw new Error(
         `Cannot dispatch workflow "${workflow.name}": codebase ${ctx.codebaseId} not found`

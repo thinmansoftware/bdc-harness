@@ -102,6 +102,7 @@ mock.module('@archon/isolation', () => ({
 }));
 
 mock.module('../workflows/store-adapter', () => ({
+  createRepairAttemptLookup: () => async () => null,
   createWorkflowDeps: mock(() => ({
     store: { createWorkflowRun: mock(() => Promise.resolve({ id: 'run-1' })) },
     getAgentProvider: () => ({}),

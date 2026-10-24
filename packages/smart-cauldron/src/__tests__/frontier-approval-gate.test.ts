@@ -88,6 +88,7 @@ function baseOpts(partial: Partial<RunCascadeOptions>): RunCascadeOptions {
     token: 'test-token',
     project: 'test-project',
     ...partial,
+    deps: { findBlockingOpenPrs: async () => [], ...partial.deps },
   };
 }
 

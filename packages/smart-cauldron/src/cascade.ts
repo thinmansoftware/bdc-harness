@@ -34,6 +34,12 @@ export { readCascadeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
 import { cancelRun } from './cancel.js';
 import { findWoClaim, resolveGithubRepo, type WoClaim } from './already-satisfied.js';
+import {
+  findBlockingOpenPrs,
+  createDefaultOpenPrGuardLookup,
+  createGhLanePrFetcher,
+  type BlockingOpenPr,
+} from './open-pr-guard.js';
 import { acquireWoLock, releaseWoLock } from './wo-lock.js';
 import { classifyError, type ErrorClass } from '@archon/overseer/classify';
 import { runAuthorizedEscalation } from '@archon/overseer/authorized-escalation';
@@ -86,9 +92,30 @@ export interface CascadeDeps {
   superviseFailure?: (context: SupervisorFailureContext) => Promise<SupervisorFailureResult>;
   /**
    * Already-satisfied / claim check (bdc-xo#1546, M-123 Q5). Returns an open or
-   * merged PR that already owns this WO, or null when none / unknown.
+   * merged PR that already owns this WO, or null when none / unknown. The
+   * optional `ignore` predicate drops claims BEFORE the MERGED-first selection;
+   * the cascade supplies it ONLY in repair mode to exempt the repair target and
+   * the author-wo.sh spec PR.
    */
-  findWoClaim?: (woId: string, project: string) => Promise<WoClaim | null>;
+  findWoClaim?: (
+    woId: string,
+    project: string,
+    ignore?: (claim: WoClaim) => boolean
+  ) => Promise<WoClaim | null>;
+  /**
+   * Open-PR climb guard (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01). Returns the
+   * OPEN PRs for this WO that must stop a climb. Called at the top of every
+   * climb WHETHER OR NOT allowClaimed is set. The default binds the real gh +
+   * lane-pr-registry lookup and fails CLOSED on a lookup error, including
+   * missing credentials. The cascade maps an exhausted lookup to a refusal;
+   * isolated tests supply an explicit lookup dependency.
+   */
+  findBlockingOpenPrs?: (input: {
+    woId: string;
+    project: string;
+    attemptRunIds: string[];
+    excludePrNumber?: number;
+  }) => Promise<BlockingOpenPr[]>;
   /** Exclusive active-cascade lock per woId+project. */
   acquireWoLock?: typeof acquireWoLock;
   releaseWoLock?: typeof releaseWoLock;
@@ -251,6 +278,18 @@ export interface RunCascadeOptions {
    * CLI --allow-satisfied flag wires here explicitly).
    */
   allowClaimed?: boolean;
+  /**
+   * Repair mode (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01). When set, the
+   * cascade fires EXACTLY ONE attempt on the entry tier and NEVER climbs
+   * (climbCount stays 0 whatever the outcome). The open-PR climb guard excludes
+   * `prNumber` so a repair never refuses on its own target, and the three
+   * already-satisfied checks exempt the target PR and the author-wo.sh spec PR
+   * (every other open/merged claim still refuses). `attemptId` is inserted into
+   * the fire message as `repair_attempt=<id>` (line 2), which run authority
+   * validates against a trusted dispatch row before any repair target text can
+   * enter the frozen spec.
+   */
+  repair?: { prNumber: number; headRef: string; attemptId: string };
 }
 
 // ---------------------------------------------------------------------------
@@ -307,8 +346,18 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const superviseFailureImpl = opts.deps?.superviseFailure;
   const findWoClaimImpl =
     opts.deps?.findWoClaim ??
-    ((id: string, proj: string): Promise<WoClaim | null> =>
-      findWoClaim({ woId: id, project: proj }));
+    ((id: string, proj: string, ignore?: (claim: WoClaim) => boolean): Promise<WoClaim | null> =>
+      findWoClaim({ woId: id, project: proj, ignore }));
+  const findBlockingOpenPrsImpl = opts.deps?.findBlockingOpenPrs ?? defaultFindBlockingOpenPrs;
+  // Repair mode exempts exactly the repair target's own OPEN PR and the
+  // author-wo.sh spec PR (head wo/<woId>) from the already-satisfied checks;
+  // every other open or merged claim still refuses the repair cascade.
+  const repairForIgnore = opts.repair;
+  const repairIgnore: ((claim: WoClaim) => boolean) | undefined = repairForIgnore
+    ? (claim: WoClaim): boolean =>
+        (claim.state === 'OPEN' && claim.number === repairForIgnore.prNumber) ||
+        (claim.headRefName ?? '').toLowerCase() === `wo/${woId.toLowerCase()}`
+    : undefined;
   const acquireWoLockImpl = opts.deps?.acquireWoLock ?? acquireWoLock;
   const releaseWoLockImpl = opts.deps?.releaseWoLock ?? releaseWoLock;
   const allowClaimed =
@@ -464,7 +513,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
   // Already-satisfied / claim check before any provider spend (M-123 Q5 / #1546).
   if (!allowClaimed) {
-    const existingClaim = await findWoClaimImpl(woId, project);
+    const existingClaim = await findWoClaimImpl(woId, project, repairIgnore);
     if (existingClaim) {
       console.log(
         `[smart-cauldron] ALREADY SATISFIED woId=${woId}: PR #${existingClaim.number} ` +
@@ -606,6 +655,69 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       failReason: string,
       runId: string | null
     ): Promise<boolean> {
+      // OPEN-PR CLIMB GUARD (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01). Before
+      // any frontier / spec-repair / tier advance, refuse to climb a NEW tier
+      // while an open PR for this WO already exists. Runs WHETHER OR NOT
+      // allowClaimed is set -- this is the guard the -AllowSatisfied override
+      // must not be able to disable. Fail-closed: a lookup throw refuses rather
+      // than climbing blind. In repair mode the target PR is excluded so a
+      // repair never refuses on itself.
+      const attemptRunIds = attempts
+        .map(a => a.runId)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0);
+      let blocking: BlockingOpenPr[];
+      try {
+        blocking = await findBlockingOpenPrsImpl({
+          woId,
+          project: project ?? '',
+          attemptRunIds,
+          ...(opts.repair ? { excludePrNumber: opts.repair.prNumber } : {}),
+        });
+      } catch {
+        status = 'refused';
+        winningTier = null;
+        refusalReason = {
+          reason: 'open-pr-lookup-failed',
+          prNumber: opts.repair?.prNumber ?? 0,
+          prState: 'OPEN',
+          prUrl: '',
+          checkedAtTier: currentTier.name,
+        };
+        console.log(
+          `[smart-cauldron] OPEN-PR GUARD lookup failed for woId=${woId} ` +
+            '-- refusing the climb (fail-closed)'
+        );
+        return true;
+      }
+      if (blocking.length > 0) {
+        const pr = blocking[0];
+        status = 'refused';
+        winningTier = null;
+        refusalReason = {
+          reason: 'open-pr-exists',
+          prNumber: pr.prNumber,
+          prState: 'OPEN',
+          prUrl: pr.prUrl,
+          checkedAtTier: currentTier.name,
+        };
+        console.log(
+          `[smart-cauldron] OPEN-PR GUARD: open PR #${pr.prNumber} for woId=${woId} ` +
+            `(${pr.prUrl}) -- NOT climbing (refused, not won)`
+        );
+        return true;
+      }
+
+      // Repair mode fires exactly ONE attempt and never climbs: the guard above
+      // ran (and excluded the target), so stop here with climbCount unchanged.
+      if (opts.repair) {
+        status = 'blocked';
+        console.log(
+          `[smart-cauldron] REPAIR mode: single bounded attempt for woId=${woId} ` +
+            `did not pass the gate (${failReason}) -- not climbing`
+        );
+        return true;
+      }
+
       if (currentTier.isFrontier) {
         if (superviseFailureImpl) {
           const recovery = await superviseFailureImpl({
@@ -847,7 +959,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       // Re-check claim before each provider fire (another cascade or human may
       // have landed a PR while we were climbing).
       if (!allowClaimed) {
-        const claimBeforeFire = await findWoClaimImpl(woId, project);
+        const claimBeforeFire = await findWoClaimImpl(woId, project, repairIgnore);
         if (claimBeforeFire) {
           console.log(
             `[smart-cauldron] ALREADY SATISFIED before tier=${tier.name}: PR #${claimBeforeFire.number} ` +
@@ -875,7 +987,13 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         workflowName: tier.workflowName,
         woId,
         project,
-        message: buildFireMessage(woId, project, priorContext ?? undefined, opts.expectedSpec),
+        message: buildFireMessage(
+          woId,
+          project,
+          priorContext ?? undefined,
+          opts.expectedSpec,
+          opts.repair?.attemptId
+        ),
         apiBaseUrl,
         token,
       });
@@ -1108,7 +1226,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       // Before climbing, re-check whether the work already landed under another
       // branch/PR the per-run event feed missed (the classic 5-tier burn).
       if (!allowClaimed) {
-        const claimBeforeClimb = await findWoClaimImpl(woId, project);
+        const claimBeforeClimb = await findWoClaimImpl(woId, project, repairIgnore);
         if (claimBeforeClimb) {
           console.log(
             `[smart-cauldron] ALREADY SATISFIED after gate-fail on tier=${tier.name}: ` +
@@ -1218,6 +1336,23 @@ function extractStatusCode(infraError: string): number | undefined {
     return isNaN(code) ? undefined : code;
   }
   return undefined;
+}
+
+/**
+ * Default open-PR climb guard. Binds the real gh + lane-pr-registry lookup.
+ *
+ * Unknown access is not proof of no blocking PR. Existing GitHub identities
+ * may work without user-token env variables; failed reads refuse the climb.
+ * Hermetic callers inject their explicit lookup result through CascadeDeps.
+ */
+async function defaultFindBlockingOpenPrs(input: {
+  woId: string;
+  project: string;
+  attemptRunIds: string[];
+  excludePrNumber?: number;
+}): Promise<BlockingOpenPr[]> {
+  const lookup = createDefaultOpenPrGuardLookup(createGhLanePrFetcher());
+  return findBlockingOpenPrs({ ...input, lookup });
 }
 
 /**

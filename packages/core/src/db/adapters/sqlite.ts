@@ -4,7 +4,7 @@
 import { Database, type SQLQueryBindings } from 'bun:sqlite';
 import { existsSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
-import type { IDatabase, QueryResult, SqlDialect } from './types';
+import type { IDatabase, QueryResult, SqlDialect, RunAuthoritySyncQuery } from './types';
 import { createLogger } from '@archon/paths';
 import { installM31TargetV2Sqlite } from '../m31-target-v2-sqlite';
 import { installOverseerControlPlaneSqlite } from '../overseer-control-plane-sqlite';
@@ -218,6 +218,72 @@ export class SqliteAdapter implements IDatabase {
       const err = error as Error;
       getLog().error({ err, sql: convertedSql, params }, 'db.sqlite_query_failed');
       throw error;
+    }
+  }
+
+  async withImmediateRunAuthorityTransaction<T>(
+    fn: (query: RunAuthoritySyncQuery) => T
+  ): Promise<T> {
+    // Check both call-time nesting and a transaction opened during schema wait.
+    // Never roll back a transaction this invocation did not successfully begin.
+    if (this.db.inTransaction) throw new Error('run_authority_transaction_already_active');
+    await this.ensureWave2Schemas();
+    if (this.db.inTransaction) throw new Error('run_authority_transaction_already_active');
+    let began = false;
+    let active = false;
+    const query: RunAuthoritySyncQuery = <U>(
+      sql: string,
+      params: unknown[] = []
+    ): QueryResult<U> => {
+      if (!active) throw new Error('run_authority_query_expired');
+      if (!/^\s*(SELECT|INSERT|UPDATE)\b/i.test(sql))
+        throw new Error('run_authority_query_unsupported');
+      const converted = this.convertPlaceholders(sql, params);
+      const statement = this.db.prepare(converted.sql);
+      try {
+        if (/^\s*SELECT\b/i.test(sql) || /\bRETURNING\b/i.test(sql)) {
+          const rows = statement.all(...(converted.params as SQLQueryBindings[])) as U[];
+          return { rows, rowCount: rows.length };
+        }
+        return {
+          rows: [],
+          rowCount: statement.run(...(converted.params as SQLQueryBindings[])).changes,
+        };
+      } finally {
+        statement.finalize();
+      }
+    };
+    try {
+      this.db.run('BEGIN IMMEDIATE');
+      began = true;
+      active = true;
+      const result = fn(query);
+      if (
+        result !== null &&
+        (typeof result === 'object' || typeof result === 'function') &&
+        typeof (result as { then?: unknown }).then === 'function'
+      ) {
+        // Consume an async callback's eventual rejection after its capability
+        // expires; it must neither commit nor produce an unhandled rejection.
+        void Promise.resolve(result).catch(() => undefined);
+        throw new Error('run_authority_callback_must_be_synchronous');
+      }
+      active = false;
+      this.db.run('COMMIT');
+      began = false;
+      return result;
+    } catch (error) {
+      active = false;
+      if (began) {
+        try {
+          this.db.run('ROLLBACK');
+        } catch {
+          /* Preserve the original failure. */
+        }
+      }
+      throw error;
+    } finally {
+      active = false;
     }
   }
 

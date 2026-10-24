@@ -330,7 +330,8 @@ export type TmActionType =
   | 'escalate_p0'
   | 'digest'
   | 'fire_cauldron'
-  | 'blocker_report';
+  | 'blocker_report'
+  | 'pr_repair';
 export type TmActionOutcome =
   | 'pending'
   | 'sent'

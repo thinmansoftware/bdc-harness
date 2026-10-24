@@ -969,6 +969,8 @@ export async function listMessagesBySeqCursor(filters: {
 
 export async function listMessages(filters: {
   recipient?: string;
+  sender?: string;
+  sender_principal_id?: string;
   status?: DispatchMessageStatus;
   limit?: number;
   allowBoardAlias?: boolean;
@@ -977,6 +979,14 @@ export async function listMessages(filters: {
 }): Promise<DispatchMessage[]> {
   const clauses: string[] = [];
   const params: unknown[] = [];
+  if (filters.sender !== undefined) {
+    params.push(filters.sender);
+    clauses.push(`sender = $${params.length}`);
+  }
+  if (filters.sender_principal_id !== undefined) {
+    params.push(filters.sender_principal_id);
+    clauses.push(`sender_principal_id = $${params.length}`);
+  }
   if (filters.recipient) {
     const canonicalRecipient = canonicalizePrincipal(filters.recipient);
     params.push(canonicalRecipient);
