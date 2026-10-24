@@ -130,6 +130,116 @@ function hookFixture(options: { pushFails?: boolean } = {}): {
 const hookFailure = `lint-staged\n[FAILED] eslint\npackages/server/src/taskmaster/loop.ts 1419:19 error Missing return type on function @typescript-eslint/explicit-function-return-type\nhusky - pre-commit script failed`;
 
 describe('commit hook repair contract', () => {
+  for (const caller of ['standalone', 'embedded'] as const) {
+    test(`already-staged deletion survives ${caller} initial staging`, () => {
+      const fixture = hookFixture();
+      try {
+        writeFileSync(
+          join(fixture.repo, 'fixture.ts'),
+          'export function value(): number { return 1; }\n'
+        );
+        writeFileSync(join(fixture.repo, 'obsolete file.txt'), 'old content\n');
+        const seeded = fixture.run(1);
+        expect(seeded.status, seeded.stderr).toBe(0);
+        const removed = spawnSync('git', ['rm', '--', 'obsolete file.txt'], {
+          cwd: fixture.repo,
+          encoding: 'utf8',
+          windowsHide: true,
+          timeout: 10000,
+        });
+        expect(removed.status, removed.stderr).toBe(0);
+        expect(existsSync(join(fixture.repo, 'obsolete file.txt'))).toBe(false);
+        const result = caller === 'standalone' ? fixture.run(1) : fixture.runInitialNode();
+        expect(result.status, result.stderr).toBe(0);
+        const committed = spawnSync('git', ['show', '--format=', '--name-status', 'HEAD'], {
+          cwd: fixture.repo,
+          encoding: 'utf8',
+          windowsHide: true,
+          timeout: 10000,
+        });
+        expect(committed.status, committed.stderr).toBe(0);
+        expect(committed.stdout).toContain('D\tobsolete file.txt');
+      } finally {
+        rmSync(fixture.directory, { recursive: true, force: true });
+      }
+    });
+  }
+  for (const scenario of ['mixed', 'unstaged_deletion', 'hook_retry', 'changed_rename'] as const) {
+    test(`frozen staging preserves ${scenario} without losing index changes`, () => {
+      const fixture = hookFixture();
+      const git = (...args: string[]): string => {
+        const result = spawnSync('git', args, {
+          cwd: fixture.repo,
+          encoding: 'utf8',
+          windowsHide: true,
+          timeout: 10000,
+        });
+        expect(result.status, result.stderr).toBe(0);
+        return result.stdout;
+      };
+      try {
+        writeFileSync(
+          join(fixture.repo, 'fixture.ts'),
+          'export function value(): number { return 1; }\n'
+        );
+        writeFileSync(join(fixture.repo, 'obsolete file.txt'), 'old content\n');
+        writeFileSync(join(fixture.repo, 'staged.txt'), 'original staged\n');
+        writeFileSync(join(fixture.repo, 'unstaged.txt'), 'original unstaged\n');
+        const seeded = fixture.run(1);
+        expect(seeded.status, seeded.stderr).toBe(0);
+        if (scenario === 'unstaged_deletion') rmSync(join(fixture.repo, 'obsolete file.txt'));
+        else if (scenario === 'changed_rename') {
+          git('mv', '--', 'obsolete file.txt', 'renamed file.txt');
+          writeFileSync(
+            join(fixture.repo, 'renamed file.txt'),
+            'completely different repaired contents\n'
+          );
+        } else git('rm', '--', 'obsolete file.txt');
+        if (scenario === 'mixed') {
+          writeFileSync(join(fixture.repo, 'staged.txt'), 'kept staged modification\n');
+          git('add', '--', 'staged.txt');
+          writeFileSync(join(fixture.repo, 'unstaged.txt'), 'included working modification\n');
+          writeFileSync(join(fixture.repo, 'new file.txt'), 'included new file\n');
+        }
+        if (scenario === 'hook_retry') {
+          writeFileSync(
+            join(fixture.repo, 'fixture.ts'),
+            'export function value() { return 2; }\n'
+          );
+          const first = fixture.runInitialNode();
+          expect(first.status, first.stderr).toBe(1);
+          expect(first.stderr).toContain('husky - pre-commit script failed');
+          expect(git('diff', '--cached', '--no-renames', '--name-status')).toContain(
+            'D\tobsolete file.txt'
+          );
+          writeFileSync(
+            join(fixture.repo, 'fixture.ts'),
+            'export function value(): number { return 2; }\n'
+          );
+          const retry = fixture.runRetryNode();
+          expect(retry.status, retry.stderr).toBe(0);
+        } else {
+          const committed = fixture.run(1);
+          expect(committed.status, committed.stderr).toBe(0);
+        }
+        expect(git('show', '--format=', '--no-renames', '--name-status', 'HEAD')).toContain(
+          'D\tobsolete file.txt'
+        );
+        expect(git('status', '--porcelain')).toBe('');
+        if (scenario === 'mixed') {
+          expect(git('show', 'HEAD:staged.txt')).toBe('kept staged modification\n');
+          expect(git('show', 'HEAD:unstaged.txt')).toBe('included working modification\n');
+          expect(git('show', 'HEAD:new file.txt')).toBe('included new file\n');
+        }
+        if (scenario === 'changed_rename')
+          expect(git('show', 'HEAD:renamed file.txt')).toBe(
+            'completely different repaired contents\n'
+          );
+      } finally {
+        rmSync(fixture.directory, { recursive: true, force: true });
+      }
+    });
+  }
   for (const changedField of ['runId', 'invocationId'] as const) {
     test(`bound hook retry refuses changed ${changedField} without consuming eligibility`, () => {
       const fixture = hookFixture();

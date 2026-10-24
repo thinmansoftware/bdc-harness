@@ -44,19 +44,28 @@ printf '%s\n' "$attempt" > "$artifacts_dir/commit-hook-attempt.txt"
 
 if [ "$attempt" = 1 ]; then
   {
-    git diff --name-only -z
-    git diff --cached --name-only -z
+    git diff --no-renames --name-only -z
+    git diff --cached --no-renames --name-only -z
     git ls-files --others --exclude-standard -z
   } | LC_ALL=C sort -zu > "$staged_paths_file"
 fi
-if [ -s "$staged_paths_file" ]; then
-  git add --pathspec-from-file="$staged_paths_file" --pathspec-file-nul
+worktree_paths_file="$artifacts_dir/commit-hook-worktree-paths.nul"
+restage_paths_file="$artifacts_dir/commit-hook-restage-paths.nul"
+{
+  git diff --no-renames --name-only -z
+  git ls-files --others --exclude-standard -z
+} | LC_ALL=C sort -zu > "$worktree_paths_file"
+# Index-only changes, especially already-staged deletions, need no git add.
+# Restage only current working changes within the original full scope.
+LC_ALL=C comm -z -12 "$staged_paths_file" "$worktree_paths_file" > "$restage_paths_file"
+if [ -s "$restage_paths_file" ]; then
+  git add --pathspec-from-file="$restage_paths_file" --pathspec-file-nul
 fi
 # A repair may stage additional paths itself. Check the entire index without
 # resetting or discarding any of that work before committing the frozen scope.
 index_paths_file="$artifacts_dir/commit-hook-index-paths.nul"
 outside_paths_file="$artifacts_dir/commit-hook-outside-paths.nul"
-git diff --cached --name-only -z | LC_ALL=C sort -zu > "$index_paths_file"
+git diff --cached --no-renames --name-only -z | LC_ALL=C sort -zu > "$index_paths_file"
 LC_ALL=C comm -z -23 "$index_paths_file" "$staged_paths_file" > "$outside_paths_file"
 if [ -s "$outside_paths_file" ]; then
   echo "ERROR: staged paths outside initial repair scope; refusing commit" >&2
