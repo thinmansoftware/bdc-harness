@@ -17,10 +17,12 @@ import {
   partitionChecksByRequired,
   runReviewModelProcess,
   DEFAULT_CURSOR_JUDGE_MODEL,
+  invokeConfiguredReviewModel,
   type PrReviewDeps,
   type PrReviewInput,
   type ReviewModelSpawn,
 } from '../pr-review-evaluator.ts';
+import { acceptedPrReviewExecution, PrReviewExecutionRefused } from '../judge-transport.ts';
 
 // The required-contexts resolver counts CONSECUTIVE unknown attempts per
 // owner/repo@base+head in module scope, and degrades to the reported-checks
@@ -71,6 +73,56 @@ function deps(overrides: Partial<PrReviewDeps> = {}): PrReviewDeps {
 }
 
 describe('governed PR-code reviewer', () => {
+  test('missing execution context does not spawn and does not approve', async () => {
+    let spawned = false;
+    await expect(
+      invokeConfiguredReviewModel('grok', 'prompt', null, undefined, 1000, () => {
+        spawned = true;
+        throw new Error('spawned');
+      })
+    ).rejects.toBeInstanceOf(PrReviewExecutionRefused);
+    expect(spawned).toBe(false);
+
+    const result = await evaluatePullRequest(
+      input,
+      deps({
+        invokeModel: invokeConfiguredReviewModel,
+      })
+    );
+    expect(result.verdict).toBe('APPROVE_UNVERIFIED');
+    expect(result.verification).toBe('unverified');
+    expect(result.verification_reason).toBe('execution_context_missing');
+  });
+
+  test('a permitted contract spawns only the bound rung', async () => {
+    const bound = acceptedPrReviewExecution('grok');
+    let argv: string[] = [];
+    const result = await invokeConfiguredReviewModel(
+      'grok',
+      'prompt',
+      bound.execution,
+      bound.subject,
+      1000,
+      captured => {
+        argv = captured;
+        return {
+          stdin: { write: async () => {}, end: async () => {} },
+          stdout: new Response('{"verdict":"APPROVE"}').body,
+          stderr: new Response('').body,
+          exited: Promise.resolve(0),
+          kill: () => {},
+        };
+      }
+    );
+    expect(argv[0]).toBe('grok');
+    expect(result.exitCode).toBe(0);
+    await expect(
+      invokeConfiguredReviewModel('codex', 'prompt', bound.execution, bound.subject, 1000, () => {
+        throw new Error('fallback spawned');
+      })
+    ).rejects.toThrow('execution_rung_mismatch');
+  });
+
   test('1 clean diff yields APPROVE with exact head and reviewer identity', async () => {
     const result = await evaluatePullRequest(input, deps());
     expect(result.verdict).toBe('APPROVE');
@@ -720,7 +772,13 @@ describe('cursor judge rung', () => {
     delete process.env.OVERSEER_CURSOR_JUDGE_MODEL;
     try {
       const prompt = `review this ${'x'.repeat(150_000)}`;
-      const transport = await buildReviewModelTransport('cursor', prompt);
+      const bound = acceptedPrReviewExecution('cursor');
+      const transport = await buildReviewModelTransport(
+        'cursor',
+        prompt,
+        bound.execution,
+        bound.subject
+      );
       expect(DEFAULT_CURSOR_JUDGE_MODEL).toBe('grok-4.7-high');
       expect(transport.argv).toEqual([
         'cursor-agent',
@@ -748,11 +806,17 @@ describe('cursor judge rung', () => {
   test('24 transport honours OVERSEER_CURSOR_JUDGE_MODEL and ignores a blank value', async () => {
     try {
       process.env.OVERSEER_CURSOR_JUDGE_MODEL = 'gpt-5.6-sol-high';
-      const configured = await buildReviewModelTransport('cursor', 'p');
+      const bound = acceptedPrReviewExecution('cursor');
+      const configured = await buildReviewModelTransport(
+        'cursor',
+        'p',
+        bound.execution,
+        bound.subject
+      );
       expect(configured.argv.slice(-2)).toEqual(['--model', 'gpt-5.6-sol-high']);
 
       process.env.OVERSEER_CURSOR_JUDGE_MODEL = '   ';
-      const blank = await buildReviewModelTransport('cursor', 'p');
+      const blank = await buildReviewModelTransport('cursor', 'p', bound.execution, bound.subject);
       expect(blank.argv.slice(-2)).toEqual(['--model', DEFAULT_CURSOR_JUDGE_MODEL]);
     } finally {
       restoreEnv();

@@ -45,7 +45,7 @@ describe('createRealSubmitPullRequestReview', () => {
         return { data: { id: 1, state: 'APPROVED' } };
       })
     );
-    expect(await submit({ ...REF, event: 'APPROVE' })).toEqual({ submitted: true });
+    expect(await submit({ ...REF, event: 'APPROVE' })).toEqual({ submitted: true, reviewId: 1 });
     expect(calls[0]).toMatchObject({ event: 'APPROVE', pull_number: 673, commit_id: HEAD_SHA });
   });
 
@@ -62,7 +62,7 @@ describe('createRealSubmitPullRequestReview', () => {
       event: 'REQUEST_CHANGES',
       body: 'Stop condition 3 fails.',
     });
-    expect(result).toEqual({ submitted: true });
+    expect(result).toEqual({ submitted: true, reviewId: 2 });
     expect(calls[0]?.event).toBe('REQUEST_CHANGES');
     expect(calls[0]?.body).toBe('Stop condition 3 fails.');
     expect((calls[0] as unknown as { commit_id?: string })?.commit_id).toBe(HEAD_SHA);
@@ -102,7 +102,7 @@ describe('createRealSubmitPullRequestReview', () => {
     const submit = createRealSubmitPullRequestReview(
       fakeOctokit(async () => ({ data: { id: 4, state: 'APPROVED' } }))
     );
-    expect(await submit({ ...REF, event: 'APPROVE' })).toEqual({ submitted: true });
+    expect(await submit({ ...REF, event: 'APPROVE' })).toEqual({ submitted: true, reviewId: 4 });
   });
 
   test('an unexpected returned state is reported, not assumed successful', async () => {

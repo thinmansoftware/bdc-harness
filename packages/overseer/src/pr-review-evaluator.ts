@@ -5,14 +5,17 @@ import { classifyJudgeOutage, type JudgeOutage } from './judge-ladder-health';
 import { conclusionIsPassing, latestAttemptPerCheck } from './pr-review-check-ingest';
 import { createLogger } from '@archon/paths';
 import {
-  buildJudgeTransport,
+  buildPrReviewJudgeTransport,
   defaultJudgeChildSpawn,
   deliverStdin,
   destroyStdin,
+  PrReviewExecutionRefused,
   removeJudgeTransportFiles,
   type JudgeChild,
   type JudgeChildSpawn,
   type JudgeTransport,
+  type PrReviewExecutionContract,
+  type PrReviewExecutionSubject,
 } from './judge-transport';
 
 /**
@@ -174,7 +177,17 @@ export interface PrReviewDeps {
     input: PrReviewInput
   ): Promise<{ diff: string; checks: PrReviewCheck[]; requiredContexts?: string[] | null }>;
   fetchAcceptanceCriteria(woId: string): Promise<string | null>;
-  invokeModel(binary: string, prompt: string): Promise<PrReviewModelResult>;
+  /**
+   * Present only when a request-bound enforced checkout was actually supplied.
+   * Absent means the production path must refuse before spawn.
+   */
+  execution?: PrReviewExecutionContract | null;
+  invokeModel(
+    binary: string,
+    prompt: string,
+    execution?: PrReviewExecutionContract | null,
+    subject?: PrReviewExecutionSubject
+  ): Promise<PrReviewModelResult>;
   ladder?: readonly string[];
   /**
    * Per-rung outage seam (#847). Called with the classified quota / credit /
@@ -713,7 +726,12 @@ export async function evaluatePullRequest(
       'judge_rung_started'
     );
     try {
-      const result = await deps.invokeModel(binary, prompt);
+      const result = await deps.invokeModel(binary, prompt, deps.execution, {
+        owner: input.owner,
+        repo: input.repo,
+        prNumber: input.pr_number,
+        headSha: input.head_sha,
+      });
       const rungMs = Date.now() - rungStartedAt;
       if (result.timedOut) {
         // A timeout is transport, not judgment: the process started but never
@@ -768,6 +786,18 @@ export async function evaluatePullRequest(
         acceptance_criteria_available: acceptanceCriteriaAvailable,
       };
     } catch (error) {
+      if (error instanceof PrReviewExecutionRefused) {
+        return {
+          verdict: 'APPROVE_UNVERIFIED',
+          findings: [],
+          reviewed_head_sha: input.head_sha,
+          reviewer: deps.reviewer,
+          acceptance_criteria_available: acceptanceCriteriaAvailable,
+          verification: 'unverified',
+          verification_reason: error.reason,
+          error: error.message,
+        };
+      }
       const rungMs = Date.now() - rungStartedAt;
       // A rate limit raised by the model seam (the judge CLIs read GitHub too)
       // is the same deferral, and must abandon the ladder immediately: walking
@@ -867,22 +897,25 @@ export { DEFAULT_CURSOR_JUDGE_MODEL, resolveCursorJudgeModel } from './judge-tra
 /** Exported for the permission test; not part of the review API surface. */
 export async function buildReviewModelTransport(
   binary: string,
-  prompt: string
+  prompt: string,
+  execution?: PrReviewExecutionContract | null,
+  subject?: PrReviewExecutionSubject
 ): Promise<JudgeTransport> {
-  return buildJudgeTransport(binary, prompt);
+  return buildPrReviewJudgeTransport(execution, subject, binary, prompt);
 }
 
 export async function invokeConfiguredReviewModel(
   binary: string,
   prompt: string,
-  timeoutMs = resolveReviewModelTimeoutMs()
+  execution?: PrReviewExecutionContract | null,
+  subject?: PrReviewExecutionSubject,
+  timeoutMs = resolveReviewModelTimeoutMs(),
+  spawn: ReviewModelSpawn = defaultJudgeChildSpawn
 ): Promise<PrReviewModelResult> {
-  const transport = await buildReviewModelTransport(binary, prompt);
+  const transport = await buildReviewModelTransport(binary, prompt, execution, subject);
   try {
-    return await runReviewModelProcess(transport, binary, timeoutMs);
+    return await runReviewModelProcess(transport, binary, timeoutMs, spawn);
   } finally {
-    // Always in a finally: the prompt holds the private diff, so it must not
-    // outlive the judge process on any path -- success, throw, or timeout.
     await removeJudgeTransportFiles(transport);
   }
 }

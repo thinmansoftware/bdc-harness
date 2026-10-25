@@ -142,7 +142,7 @@ describe('unverified approval persistence and execution', () => {
     deps.currentHeadSha = async () => head;
     deps.submitReview = async input => {
       submitted.push(input.event);
-      return { submitted: true };
+      return { submitted: true, reviewId: 1, commitId: input.commitId };
     };
     return { deps, submitted };
   }
@@ -268,7 +268,7 @@ describe('unverified approval persistence and execution', () => {
           await verdictStore.hasUnverifiedApprovalForHead({ head_sha: head, pr_url: prUrl })
         ).toBe(true);
         event = input.event;
-        return { submitted: true };
+        return { submitted: true, reviewId: 1, commitId: input.commitId };
       };
       const result = await runAndSubmitReview(request, deps);
       expect(event).toBe('COMMENT');
@@ -372,7 +372,7 @@ describe('unverified approval persistence and execution', () => {
     });
     deps.submitReview = async input => {
       submitted.push(input.event);
-      return { submitted: true };
+      return { submitted: true, reviewId: 1, commitId: input.commitId };
     };
     const result = await runAndSubmitReview(work, deps);
     expect(result.disposition).toBe('approved_unverified');
@@ -456,9 +456,9 @@ describe('unverified approval persistence and execution', () => {
       throw new Error('synthetic storage failure');
     };
     let submissions = 0;
-    deps.submitReview = async () => {
+    deps.submitReview = async input => {
       submissions += 1;
-      return { submitted: true };
+      return { submitted: true, reviewId: 1, commitId: input.commitId };
     };
     const result = await runAndSubmitReview(work, deps);
     expect(result.reason).toBe('unverified_approval_persistence_failed');

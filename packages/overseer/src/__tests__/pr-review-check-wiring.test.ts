@@ -72,7 +72,7 @@ async function persistedResultBody(
   const deps: SubmitDeps = {
     reviewerIdentity: REVIEWER,
     runReviewer: async () => verdict,
-    submitReview: async () => ({ submitted: true }),
+    submitReview: async input => ({ submitted: true, reviewId: 1, commitId: input.commitId }),
     currentHeadSha: async () => HEAD,
     recordReceipt: async () => {},
     ...overrides,

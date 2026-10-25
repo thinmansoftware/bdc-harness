@@ -46,7 +46,7 @@ function makeDeps(overrides: Partial<SubmitDeps> = {}): { deps: SubmitDeps; rec:
     }),
     submitReview: async input => {
       rec.submitted.push(input);
-      return { submitted: true };
+      return { submitted: true, reviewId: 1, commitId: input.commitId };
     },
     currentHeadSha: async () => HEAD,
     recordReceipt: async input => {
@@ -498,7 +498,23 @@ describe('failure handling', () => {
       },
     });
     const outcome = await runAndSubmitReview(WORK, deps);
-    expect(outcome.disposition).toBe('approved');
+    expect(outcome.disposition).toBe('approved_unverified');
+    expect(outcome.reason).toBe('receipt_write_failed');
+    expect(outcome.verification).toBe('unverified');
+  });
+
+  test('a GitHub success without response identity does not approve or post twice', async () => {
+    let calls = 0;
+    const { deps } = makeDeps({
+      submitReview: async () => {
+        calls += 1;
+        return { submitted: true };
+      },
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(calls).toBe(1);
+    expect(outcome.disposition).toBe('approved_unverified');
+    expect(outcome.reason).toBe('github_review_response_identity_missing');
   });
 });
 

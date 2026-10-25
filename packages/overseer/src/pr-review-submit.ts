@@ -174,6 +174,12 @@ export interface SubmitOutcome {
   verification?: 'verified' | 'unverified';
   reason?: string;
   event?: OverseerReviewEvent;
+  /** Actual createReview id. Absent means the approval is not qualified. */
+  reviewId?: number;
+  /** Actual createReview html_url. Never copied from the request. */
+  reviewUrl?: string;
+  /** Commit id returned by GitHub, not the commit id we asked for. */
+  responseCommitId?: string;
   /**
    * Present only on a changes_requested disposition. Reports whether the
    * verdict was handed back to Taskmaster and, when it was not, why it stopped
@@ -239,6 +245,9 @@ export interface SubmitDeps {
     verification?: 'verified' | 'unverified';
     event?: OverseerReviewEvent;
     reason?: string;
+    reviewId?: number;
+    reviewUrl?: string;
+    responseCommitId?: string;
     /**
      * Carried onto the operator card so a human reading the escalation can
      * tell "handed back to Taskmaster, attempt 1" from "stopped here because a
@@ -601,9 +610,26 @@ export async function runAndSubmitReview(
     // round 6 [minor]), which silently removed the reviewer's text from every
     // successful approval outcome -- the same text #782 added so the same-head
     // recheck path can tell a CHECK-caused verdict from a CODE finding.
+    //
+    // A GitHub body that omits the response id or returns a different commit
+    // is not qualified. Do not POST again.
+    const identityMatches =
+      typeof submission.reviewId === 'number' && submission.commitId === work.headSha;
+    if (!identityMatches) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'approved_unverified',
+        verification: 'unverified',
+        reason: 'github_review_response_identity_missing',
+        event,
+        ...summaryField({ ...verdict, verification: 'unverified' }),
+      });
+    }
     return finish(deps, work, work.headSha, {
       disposition: 'approved',
       event,
+      reviewId: submission.reviewId,
+      ...(submission.reviewUrl ? { reviewUrl: submission.reviewUrl } : {}),
+      responseCommitId: submission.commitId,
       ...summaryField(verdict),
     });
   }
@@ -731,10 +757,22 @@ async function finish(
       ...(outcome.verification ? { verification: outcome.verification } : {}),
       ...(outcome.event ? { event: outcome.event } : {}),
       ...(outcome.reason ? { reason: outcome.reason } : {}),
+      ...(outcome.reviewId !== undefined ? { reviewId: outcome.reviewId } : {}),
+      ...(outcome.reviewUrl ? { reviewUrl: outcome.reviewUrl } : {}),
+      ...(outcome.responseCommitId ? { responseCommitId: outcome.responseCommitId } : {}),
       ...(outcome.remediation ? { remediation: outcome.remediation } : {}),
     });
   } catch {
-    // Receipt failure never converts a classified outcome into a throw.
+    // A failed receipt cannot qualify an approval. Do not throw, and do not
+    // POST the review again from this path.
+    if (outcome.disposition === 'approved') {
+      return {
+        ...outcome,
+        disposition: 'approved_unverified',
+        verification: 'unverified',
+        reason: 'receipt_write_failed',
+      };
+    }
   }
   // The retry instant is part of the outcome, not the receipt: the worker reads
   // it off the return value to schedule the deferral.
