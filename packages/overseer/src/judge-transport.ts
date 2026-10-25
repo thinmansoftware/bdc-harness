@@ -59,6 +59,113 @@ export interface JudgeTransport {
   promptDir?: string;
 }
 
+/** PR subject the execution contract must match. Not taken from model JSON. */
+export interface PrReviewExecutionSubject {
+  readonly owner: string;
+  readonly repo: string;
+  readonly prNumber: number;
+  readonly headSha: string;
+}
+
+/**
+ * Request-bound review execution. `enforcement: 'enforced'` is only valid when
+ * a real checkout and sandbox were actually supplied. Production has no such
+ * adapter, so a missing or unmatched contract refuses before spawn.
+ */
+export interface PrReviewExecutionContract {
+  readonly requestId: string;
+  readonly owner: string;
+  readonly repo: string;
+  readonly prNumber: number;
+  readonly headSha: string;
+  readonly treeSha: string;
+  readonly bundleId: string;
+  readonly rung: string;
+  readonly requestedProvider: string;
+  readonly requestedModel: string;
+  readonly observedProvider: string;
+  readonly observedModel: string;
+  readonly enforcement: 'enforced';
+  readonly checkoutVerified: true;
+}
+
+export class PrReviewExecutionRefused extends Error {
+  readonly reason: string;
+
+  constructor(reason: string) {
+    super(`pr_review_execution_refused:${reason}`);
+    this.name = 'PrReviewExecutionRefused';
+    this.reason = reason;
+  }
+}
+
+function filled(value: string | undefined): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+export function acceptPrReviewExecution(
+  execution: PrReviewExecutionContract | null | undefined,
+  subject: PrReviewExecutionSubject | undefined
+): { ok: true; execution: PrReviewExecutionContract } | { ok: false; reason: string } {
+  if (!execution || !subject) return { ok: false, reason: 'execution_context_missing' };
+  if (execution.enforcement !== 'enforced' || !execution.checkoutVerified) {
+    return { ok: false, reason: 'execution_enforcement_missing' };
+  }
+  if (
+    execution.owner !== subject.owner ||
+    execution.repo !== subject.repo ||
+    execution.prNumber !== subject.prNumber ||
+    execution.headSha !== subject.headSha
+  ) {
+    return { ok: false, reason: 'execution_subject_mismatch' };
+  }
+  if (
+    !filled(execution.requestId) ||
+    !filled(execution.treeSha) ||
+    !filled(execution.bundleId) ||
+    !filled(execution.rung) ||
+    !filled(execution.requestedProvider) ||
+    !filled(execution.requestedModel)
+  ) {
+    return { ok: false, reason: 'execution_identity_incomplete' };
+  }
+  if (
+    execution.observedProvider !== execution.requestedProvider ||
+    execution.observedModel !== execution.requestedModel
+  ) {
+    return { ok: false, reason: 'execution_identity_fallback' };
+  }
+  return { ok: true, execution };
+}
+
+/** A contract a test can pass when it is exercising a permitted spawn. */
+export function acceptedPrReviewExecution(
+  rung: string,
+  subject: PrReviewExecutionSubject = {
+    owner: 'thinmansoftware',
+    repo: 'bdc-harness',
+    prNumber: 1127,
+    headSha: 'a'.repeat(40),
+  }
+): { execution: PrReviewExecutionContract; subject: PrReviewExecutionSubject } {
+  return {
+    subject,
+    execution: {
+      ...subject,
+      requestId: 'request-bound',
+      treeSha: 'b'.repeat(40),
+      bundleId: 'bundle-bound',
+      rung,
+      requestedProvider: 'codex',
+      requestedModel: 'gpt-5.6-sol',
+      observedProvider: 'codex',
+      observedModel: 'gpt-5.6-sol',
+      enforcement: 'enforced',
+      checkoutVerified: true,
+    },
+  };
+}
+
 /** Owner-only directory (rwx------). */
 const PROMPT_DIR_MODE = 0o700;
 /** Owner-only file (rw-------). */
@@ -105,6 +212,25 @@ export function resolveCursorJudgeModel(
   return typeof configured === 'string' && configured.trim().length > 0
     ? configured.trim()
     : DEFAULT_CURSOR_JUDGE_MODEL;
+}
+
+/**
+ * PR-review spawn. Refuses before any prompt file or argv is built when the
+ * contract is missing, for the wrong subject, or for a different ladder rung.
+ * judge-first and second-opinion keep `buildJudgeTransport`.
+ */
+export async function buildPrReviewJudgeTransport(
+  execution: PrReviewExecutionContract | null | undefined,
+  subject: PrReviewExecutionSubject | undefined,
+  binary: string,
+  prompt: string
+): Promise<JudgeTransport> {
+  const accepted = acceptPrReviewExecution(execution, subject);
+  if (!accepted.ok) throw new PrReviewExecutionRefused(accepted.reason);
+  if (binary !== accepted.execution.rung) {
+    throw new PrReviewExecutionRefused('execution_rung_mismatch');
+  }
+  return buildJudgeTransport(binary, prompt);
 }
 
 /** argv plus prompt delivery for one ladder rung. The prompt is never in argv. */

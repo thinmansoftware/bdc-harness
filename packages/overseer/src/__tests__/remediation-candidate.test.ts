@@ -760,7 +760,7 @@ describe('submit path hands a rejected verdict back to Taskmaster', () => {
         reviewedHeadSha: 'f868542e0000000000000000000000000000abcd',
         findings: [MIGRATION_ORDERING_FINDING],
       }),
-      submitReview: async () => ({ submitted: true }),
+      submitReview: async input => ({ submitted: true, reviewId: 1, commitId: input.commitId }),
       currentHeadSha: async () => 'f868542e0000000000000000000000000000abcd',
       recordReceipt: async input => {
         receipts.push(input as unknown as Record<string, unknown>);

@@ -290,7 +290,7 @@ function submitDeps(
     },
     async submitReview() {
       recorded.submitted += 1;
-      return { submitted: true };
+      return { submitted: true, reviewId: 1, commitId: WORK.headSha };
     },
     async currentHeadSha() {
       return WORK.headSha;

@@ -13,9 +13,11 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { rm, stat } from 'node:fs/promises';
+import { acceptedPrReviewExecution } from '../judge-transport.ts';
 import {
   buildReviewModelTransport,
   evaluatePullRequest,
+  invokeConfiguredReviewModel,
   isTransportError,
   resolveReviewModelTimeoutMs,
   reviewErrorCode,
@@ -426,7 +428,13 @@ describe('#789 -- the timeout bounds stdin delivery, not just model thinking', (
 
 describe('#789 -- the prompt file is not world-readable', () => {
   test('grok prompts live in a 0700 dir as a 0600 file, removed after the run', async () => {
-    const transport = await buildReviewModelTransport('grok', 'private diff contents');
+    const bound = acceptedPrReviewExecution('grok');
+    const transport = await buildReviewModelTransport(
+      'grok',
+      'private diff contents',
+      bound.execution,
+      bound.subject
+    );
     expect(transport.promptFile).toBeDefined();
     expect(transport.promptDir).toBeDefined();
     // The prompt travels as a short PATH argument, never as the prompt itself.
@@ -449,7 +457,13 @@ describe('#789 -- the prompt file is not world-readable', () => {
   });
 
   test('codex uses stdin and writes no prompt file at all', async () => {
-    const transport = await buildReviewModelTransport('codex', 'private diff contents');
+    const bound = acceptedPrReviewExecution('codex');
+    const transport = await buildReviewModelTransport(
+      'codex',
+      'private diff contents',
+      bound.execution,
+      bound.subject
+    );
     expect(transport.stdinPrompt).toBe('private diff contents');
     expect(transport.promptFile).toBeUndefined();
     expect(transport.promptDir).toBeUndefined();
@@ -458,9 +472,10 @@ describe('#789 -- the prompt file is not world-readable', () => {
   });
 
   test('two concurrent prompts never share a path', async () => {
+    const bound = acceptedPrReviewExecution('grok');
     const [a, b] = await Promise.all([
-      buildReviewModelTransport('grok', 'a'),
-      buildReviewModelTransport('grok', 'b'),
+      buildReviewModelTransport('grok', 'a', bound.execution, bound.subject),
+      buildReviewModelTransport('grok', 'b', bound.execution, bound.subject),
     ]);
     expect(a.promptDir).not.toBe(b.promptDir);
     expect(await Bun.file(a.promptFile!).text()).toBe('a');
@@ -554,7 +569,7 @@ describe('#789 -- submit defers a transport error instead of posting', () => {
       }),
       submitReview: async submission => {
         submitted.push(submission);
-        return { submitted: true };
+        return { submitted: true, reviewId: 1, commitId: submission.commitId };
       },
       currentHeadSha: async () => HEAD,
       recordReceipt: async receipt => {

@@ -217,7 +217,9 @@ export interface RealGitHubOctokitLike {
       event: 'APPROVE' | 'REQUEST_CHANGES' | 'COMMENT';
       body?: string;
       commit_id: string;
-    }): Promise<{ data: { id: number; state: string } }>;
+    }): Promise<{
+      data: { id?: number; state: string; html_url?: string; commit_id?: string };
+    }>;
     listReviews?(input: {
       owner: string;
       repo: string;
@@ -1319,6 +1321,12 @@ export interface SubmitPullRequestReviewInput extends PullRequestRef {
 export interface SubmitPullRequestReviewResult {
   submitted: boolean;
   message?: string;
+  /** Present only when createReview returned a numeric id. */
+  reviewId?: number;
+  /** Present only when createReview returned a non-empty html_url. */
+  reviewUrl?: string;
+  /** Present only when createReview returned commit_id. Not the request commit. */
+  commitId?: string;
 }
 
 /**
@@ -1372,7 +1380,21 @@ export function createRealSubmitPullRequestReview(
           message: `github_review_unexpected_state_${response.data.state}`,
         };
       }
-      return { submitted: true };
+      const reviewId = typeof response.data.id === 'number' ? response.data.id : undefined;
+      const reviewUrl =
+        typeof response.data.html_url === 'string' && response.data.html_url.length > 0
+          ? response.data.html_url
+          : undefined;
+      const commitId =
+        typeof response.data.commit_id === 'string' && response.data.commit_id.length > 0
+          ? response.data.commit_id
+          : undefined;
+      return {
+        submitted: true,
+        ...(reviewId !== undefined ? { reviewId } : {}),
+        ...(reviewUrl ? { reviewUrl } : {}),
+        ...(commitId ? { commitId } : {}),
+      };
     } catch (error) {
       const status =
         typeof error === 'object' && error !== null && 'status' in error
