@@ -230,7 +230,7 @@ nodes:
         local checkout_code=0 retry_code=0 ancestor_code=0 rtw_db_code=0 row_seen=0
         local holder="" rtw_top="" rtw_db="" min_age="" proc_root=""
         local best_id="" best_status="" best_ts="" best_epoch=-1
-        local holder_sha="" backup_ref="" sha7="" stamp="" id8=""
+        local holder_sha="" holder_sha_after="" backup_ref="" sha7="" stamp="" id8=""
         local row_id="" row_status="" row_completed="" row_epoch="" now_epoch="" row_age=0
         local resolved="" cwdlink=""
         err_file=$(mktemp)
@@ -366,6 +366,13 @@ nodes:
           if ! git push origin "${holder_sha}:${backup_ref}"; then
             rtw_refuse "backup push failed" || return
           fi
+        fi
+        holder_sha_after=$(git -C "$holder" rev-parse HEAD)
+        if [ "$holder_sha_after" != "$holder_sha" ]; then
+          rtw_refuse "holder tip changed during backup" || return
+        fi
+        if [ -n "$(git -C "$holder" status --porcelain)" ]; then
+          rtw_refuse "worktree became dirty during backup" || return
         fi
         if ! git worktree remove "$holder"; then
           rtw_refuse "worktree remove failed" || return

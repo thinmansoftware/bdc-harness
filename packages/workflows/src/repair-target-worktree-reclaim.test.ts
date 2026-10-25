@@ -180,6 +180,57 @@ afterEach(() => {
 });
 
 describe('repair-target worktree reclaim', () => {
+  it('preserves a resumed writer commit made during backup before reclaim', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    writeFileSync(join(holder, 'before-backup.txt'), 'unpushed before backup\n');
+    git(['add', 'before-backup.txt'], holder);
+    git(['commit', '-m', 'before backup'], holder);
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'failed',
+        working_path: holder,
+        completed_at: utcMinutesAgo(20),
+      },
+    ]);
+    git(['fetch', 'origin', 'refs/heads/feat/x'], fixture.caller);
+    const script = `set -euo pipefail
+${RTW_CORE}
+git() {
+  command git "$@"
+  local rc=$?
+  if [ "$rc" -eq 0 ] && [ "\${1:-}" = "push" ]; then
+    case "\${3:-}" in
+      *:refs/heads/backup/*)
+        printf 'committed after backup snapshot\\n' > "$RTW_RACE_HOLDER/resumed.txt"
+        command git -C "$RTW_RACE_HOLDER" add resumed.txt
+        command git -C "$RTW_RACE_HOLDER" commit -m 'resumed writer'
+        command git -C "$RTW_RACE_HOLDER" rev-parse HEAD > "$RTW_RACE_LATEST"
+        ;;
+    esac
+  fi
+  return "$rc"
+}
+rtw_checkout_repair_branch "$1"
+`;
+    const latestPath = join(fixture.root, 'latest-sha.txt');
+    const result = bash(script, fixture.caller, ['feat/x'], {
+      RTW_RUNS_DB: fixture.dbPath,
+      RTW_PROC_ROOT: fixture.procRoot,
+      RTW_RACE_HOLDER: holder,
+      RTW_RACE_LATEST: latestPath,
+      GIT_AUTHOR_NAME: 'Test',
+      GIT_AUTHOR_EMAIL: 'test@test.com',
+      GIT_COMMITTER_NAME: 'Test',
+      GIT_COMMITTER_EMAIL: 'test@test.com',
+    });
+    const latest = readFileSync(latestPath, 'utf8').trim();
+    const reachable = git(['rev-list', '--all'], fixture.caller).split(/\r?\n/);
+    expect(reachable, `resumed commit lost from all refs after ${show(result)}`).toContain(latest);
+  }, 30_000);
+
   it('Test 6: a dead holder worktree is reclaimed once', () => {
     const fixture = makeFixture({ hold: true, withOther: false });
     roots.push(fixture.root);
