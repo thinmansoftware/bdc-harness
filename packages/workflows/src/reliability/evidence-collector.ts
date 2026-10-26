@@ -59,6 +59,7 @@ export interface MechanicalEvidenceInput {
   readonly pullRequest: PullRequestEvidence | null;
   readonly gates: readonly GateEvidence[];
   readonly verifiedNoop?: boolean;
+  readonly acceptAdvancedBase?: boolean;
 }
 
 export interface CollectedMechanicalEvidence extends MechanicalEvidenceInput {
@@ -317,27 +318,40 @@ export async function collectRuntimeEvidence(
   // event that must never fail a run). Fall back to the authority's base BRANCH
   // lane (origin/<baseBranch>), which shares true history with HEAD, before giving
   // up. The fallback's own failure (genuinely disjoint lane) still throws.
-  let mergeBaseSha = '';
+  //
+  // When the pinned base is reachable but origin has moved forward
+  // (WO-HARNESS-MANIFEST-STALE-BASE-DIFF-01), file changes and merge ancestors
+  // follow that live lane merge-base only if the frozen run scope is an ancestor
+  // of it. A disjoint or rewritten scope fails closed before any diff.
+  let pinnedMergeBase = '';
   try {
-    mergeBaseSha = await git(['merge-base', authority.baseSha, headSha]);
+    pinnedMergeBase = await git(['merge-base', authority.baseSha, headSha]);
   } catch {
-    mergeBaseSha = '';
+    pinnedMergeBase = '';
   }
-  if (!mergeBaseSha) {
-    mergeBaseSha = await git([
-      'merge-base',
-      `refs/remotes/origin/${authority.baseBranch}`,
-      headSha,
-    ]);
+  const originRef = `refs/remotes/origin/${authority.baseBranch}`;
+  let mergeBaseSha = '';
+  let acceptAdvancedBase = false;
+  if (!pinnedMergeBase) {
+    mergeBaseSha = await git(['merge-base', originRef, headSha]);
+  } else {
+    const laneMergeBase = await git(['merge-base', originRef, headSha]);
+    try {
+      await git(['merge-base', '--is-ancestor', authority.runScopeSha, laneMergeBase]);
+    } catch {
+      throw new Error(
+        'gate_scope_mismatch: run scope is not an ancestor of the base-lane merge-base'
+      );
+    }
+    mergeBaseSha = laneMergeBase;
+    if (laneMergeBase !== authority.baseSha) {
+      acceptAdvancedBase = true;
+    }
   }
-  const behindRaw = await git([
-    'rev-list',
-    '--count',
-    `${headSha}..refs/remotes/origin/${authority.baseBranch}`,
-  ]);
+  const behindRaw = await git(['rev-list', '--count', `${headSha}..${originRef}`]);
   if (!/^\d+$/.test(behindRaw)) throw new Error('gate_scope_mismatch: invalid behind count');
   const changes = parseGitNameStatus(
-    await git(['diff', '--name-status', `${authority.runScopeSha}..${headSha}`])
+    await git(['diff', '--name-status', `${mergeBaseSha}..${headSha}`])
   );
   const repository = repositoryFromRemote(authority.canonicalRemote);
   let pullRequest: PullRequestEvidence | null = null;
@@ -385,6 +399,7 @@ export async function collectRuntimeEvidence(
     },
     pullRequest,
     gates,
+    ...(acceptAdvancedBase ? { acceptAdvancedBase: true } : {}),
   });
 }
 
@@ -400,7 +415,7 @@ export function collectMechanicalEvidence(
     pullRequestIdentityMatches(pullRequest, input.authority.canonicalRemote) &&
     pathsEqual(pullRequest.files, diffPaths);
   const scopeValid =
-    input.git.mergeBaseSha === input.authority.baseSha &&
+    (input.git.mergeBaseSha === input.authority.baseSha || input.acceptAdvancedBase === true) &&
     normalizedRemote(input.git.originRemote) ===
       normalizedRemote(input.authority.canonicalRemote) &&
     (input.git.headBranch === input.authority.headBranch || prCorroborates) &&
