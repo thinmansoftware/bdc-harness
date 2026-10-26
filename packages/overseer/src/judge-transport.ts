@@ -85,6 +85,11 @@ export async function buildPrReviewTransport(
       '@openai/codex@0.153.3',
       '--enable',
       'use_legacy_landlock',
+      // Codex 0.153.3's strict config schema supports the top-level
+      // web_search mode: live|indexed|cached|disabled. PR review must never
+      // attempt unauthenticated model-side retrieval of private repository data.
+      '-c',
+      'web_search="disabled"',
       'exec',
       '--json',
       '--sandbox',

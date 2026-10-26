@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps';
 import { createRealSubmitDeps, observeReviewExecution } from '../pr-review-wiring';
+import { buildPrReviewTransport } from '../judge-transport';
 import {
   runAndSubmitReview,
   type ReviewExecutionContext,
@@ -104,6 +105,16 @@ function deps(executionProof?: ReviewExecutionProof): {
 }
 
 describe('sandbox-qualified submit', () => {
+  test('PR transport disables model-side web retrieval with the pinned supported setting', async () => {
+    const transport = await buildPrReviewTransport('codex', 'review', {
+      kind: 'pr-review',
+      cwd: '/tmp/checkout',
+      expectedHeadSha: head,
+      nativePolicy: 'codex_legacy_landlock',
+    });
+    expect(transport.argv).toContain('web_search="disabled"');
+    expect(transport.argv).toContain('--json');
+  });
   test('durable exact-head proof permits one approval with response identity', async () => {
     const d = deps(proof);
     const result = await runAndSubmitReview(work, d.value);
@@ -118,6 +129,19 @@ describe('sandbox-qualified submit', () => {
     expect(result.disposition).toBe('review_incomplete');
     expect(d.posts).toEqual(['COMMENT']);
     expect(result.summary?.startsWith('Review incomplete:')).toBe(true);
+  });
+  test('credential-shaped review body fails closed before approval', async () => {
+    const d = deps(proof);
+    d.value.runReviewer = async () => ({
+      approved: true,
+      summary: `leaked ghp_${'x'.repeat(32)}`,
+      reviewedHeadSha: head,
+      executionProof: proof,
+    });
+    const result = await runAndSubmitReview(work, d.value);
+    expect(result.disposition).toBe('review_incomplete');
+    expect(result.reason).toBe('review_body_credential_leak');
+    expect(d.posts).toEqual(['COMMENT']);
   });
 });
 

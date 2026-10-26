@@ -197,7 +197,11 @@ jobs:
 
       - name: Smoke test -- container starts and serves /api/health
         run: |
-          docker run -d --name archon-smoke -e PORT=3000 -e CLAUDE_USE_GLOBAL_AUTH=true -p 3000:3000 archon-ci:test
+          mkdir -p "$RUNNER_TEMP/overseer-secrets"
+          printf 'synthetic-ci-canary\n' > "$RUNNER_TEMP/overseer-secrets/thinman-overseer.pem"
+          chmod 0644 "$RUNNER_TEMP/overseer-secrets/thinman-overseer.pem"
+          docker run -d --name archon-smoke -e PORT=3000 -e CLAUDE_USE_GLOBAL_AUTH=true -p 3000:3000 \
+            -v "$RUNNER_TEMP/overseer-secrets/thinman-overseer.pem:/run/secrets/thinman-overseer.pem:ro" archon-ci:test
           sleep 5
           curl --fail --retry 10 --retry-delay 3 --retry-all-errors http://localhost:3000/api/health
 
@@ -207,7 +211,13 @@ jobs:
 
       - name: Smoke test -- Overseer native review sandbox as application user
         run: |
+          test "$(docker exec --user reviewer archon-smoke id -u)" = 1002
+          ! docker exec --user reviewer archon-smoke cat /run/secrets/thinman-overseer.pem
+          ! docker exec --user reviewer archon-smoke sh -c 'ls /.archon/workspaces'
+          ! docker exec --user reviewer archon-smoke sh -c 'cat /home/appuser/.codex/auth.json'
+          ! docker exec --user reviewer archon-smoke sh -c 'cat /proc/1/environ'
           docker exec --user appuser archon-smoke bun run scripts/overseer-review-sandbox-smoke.ts
+          test "$(docker inspect archon-smoke --format '{{.HostConfig.Privileged}} {{json .HostConfig.CapAdd}}')" = 'false null'
 
       - name: Dump container logs on failure
         if: failure()

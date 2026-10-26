@@ -172,12 +172,20 @@ RUN mkdir -p /opt/cursor-agent \
 
 # Create non-root user for running Claude Code
 # Claude Code refuses to run with --dangerously-skip-permissions as root for security
-RUN useradd -m -u 1001 -s /bin/bash appuser \
+RUN groupadd --gid 1002 reviewer \
+    && useradd --create-home --uid 1002 --gid 1002 --shell /usr/sbin/nologin reviewer \
+    && useradd -m -u 1001 -s /bin/bash appuser \
+    && usermod --append --groups reviewer appuser \
     && chown -R appuser:appuser /app
 
 # Create Archon directories
-RUN mkdir -p /.archon/workspaces /.archon/worktrees \
-    && chown -R appuser:appuser /.archon
+RUN mkdir -p /.archon/workspaces /.archon/worktrees /run/secrets /var/lib/overseer-review \
+    && chown -R appuser:appuser /.archon \
+    && chmod 0750 /.archon /.archon/workspaces \
+    && chown root:appuser /run/secrets \
+    && chmod 0750 /run/secrets \
+    && chown appuser:reviewer /var/lib/overseer-review \
+    && chmod 2770 /var/lib/overseer-review
 
 # Copy root package files and lockfile
 COPY package.json bun.lock ./
@@ -237,18 +245,22 @@ COPY tsconfig*.json ./
 
 # Entrypoints used by the container GitHub transport and credential preflight.
 COPY scripts/github-service-token.ts scripts/github-service-exec.ts scripts/github-service-login.ts ./scripts/
-COPY scripts/overseer-review-sandbox-smoke.ts ./scripts/
+COPY scripts/overseer-review-sandbox-smoke.ts scripts/overseer-reviewer-broker.ts ./scripts/
 
 # Fix permissions for appuser
 RUN chown -R appuser:appuser /app
 
 # Create .codex directory for Codex authentication
-RUN mkdir -p /home/appuser/.codex && chown appuser:appuser /home/appuser/.codex
+RUN mkdir -p /home/appuser/.codex /home/appuser/.config/gh \
+    && chown -R appuser:appuser /home/appuser \
+    && chmod 0750 /home/appuser \
+    && chmod 0700 /home/appuser/.codex /home/appuser/.config/gh
 
 # Create .cursor directory for cursor-agent authentication. Populated at startup
 # from the read-only host mount /run/secrets/cursor-config (docker-entrypoint.sh)
 # or left empty when CURSOR_API_KEY is used instead.
-RUN mkdir -p /home/appuser/.cursor && chown appuser:appuser /home/appuser/.cursor
+RUN mkdir -p /home/appuser/.cursor && chown appuser:appuser /home/appuser/.cursor \
+    && chmod 0700 /home/appuser/.cursor
 
 # Configure git to trust all directories for both root and appuser.
 # Uses the git-native '*' wildcard (standalone token, not a shell glob) which
@@ -257,7 +269,8 @@ RUN mkdir -p /home/appuser/.cursor && chown appuser:appuser /home/appuser/.curso
 # git only matches them as literal strings, not as filesystem globs. The wildcard
 # covers worktrees created at arbitrary depths after container startup.
 RUN git config --global --add safe.directory '*' && \
-    gosu appuser git config --global --add safe.directory '*'
+    gosu appuser git config --global --add safe.directory '*' && \
+    gosu reviewer git config --global --add safe.directory '*'
 
 # Fail the image build if the final runtime loses a lane test runner.
 RUN gosu appuser node --version \

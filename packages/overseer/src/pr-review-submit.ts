@@ -21,6 +21,7 @@ import type {
   SubmitPullRequestReviewInput,
   SubmitPullRequestReviewResult,
 } from './adapters/github-real-deps.ts';
+import { readFile } from 'node:fs/promises';
 import { hasDistinctMergeIdentity } from './adapters/github-real-deps';
 import { classifyRateLimitError } from './github-rate-limit';
 import { resolveMergeManagerMode } from './merge-manager';
@@ -569,6 +570,10 @@ export async function runAndSubmitReview(
   const event: OverseerReviewEvent = verdict.approved ? 'APPROVE' : 'REQUEST_CHANGES';
   const body = buildReviewBody(work, verdict);
 
+  if (work.executionContext && (await reviewBodyContainsCredential(body))) {
+    return submitIncomplete(work, deps, 'review_body_credential_leak');
+  }
+
   if (work.executionContext && verdict.approved) {
     if (!deps.recordExecutionProof || !verdict.executionProof) {
       return submitIncomplete(work, deps, 'execution_proof_store_unavailable');
@@ -670,6 +675,39 @@ export async function runAndSubmitReview(
       ? { reason: `indeterminate:${verdict.reasonCode}` }
       : {}),
   });
+}
+
+const GENERIC_CREDENTIAL_SHAPE =
+  /(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|Bearer\s+[A-Za-z0-9._~+/-]{20,})/i;
+
+function collectLongStrings(value: unknown, into: string[]): void {
+  if (typeof value === 'string') {
+    if (value.length >= 20) into.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectLongStrings(item, into);
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const item of Object.values(value as Record<string, unknown>))
+      collectLongStrings(item, into);
+  }
+}
+
+/** Parent-only final egress guard for the reviewer's accepted residual-risk login. */
+async function reviewBodyContainsCredential(body: string): Promise<boolean> {
+  if (GENERIC_CREDENTIAL_SHAPE.test(body)) return true;
+  try {
+    const login = JSON.parse(await readFile('/home/appuser/.codex/auth.json', 'utf8')) as unknown;
+    const values: string[] = [];
+    collectLongStrings(login, values);
+    return values.some(value => body.includes(value));
+  } catch {
+    // Missing reviewer auth is handled by the broker. The generic shape guard
+    // remains active for test and bootstrap environments without this file.
+    return false;
+  }
 }
 
 function qualifiesExecution(
