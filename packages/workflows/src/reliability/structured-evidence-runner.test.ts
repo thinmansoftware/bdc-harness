@@ -279,6 +279,22 @@ describe('canonical-stage-authority', () => {
       targetBranch: 'main',
     });
     expect(mismatch.ok).toBe(false);
+    const crossRepo = scopeEvidence(marked, {
+      stageId: 'api',
+      repo: 'thinmansoftware/lspro',
+    });
+    expect(crossRepo.ok).toBe(false);
+    if (!crossRepo.ok) expect(crossRepo.message).toContain('repo');
+    const bound = scopeEvidence(marked, {
+      stageId: 'web',
+      repo: 'git@github.com:thinmansoftware/lspro.git',
+    });
+    expect(bound.ok).toBe(true);
+    if (bound.ok) {
+      expect(bound.scope.stageId).toBe('web');
+      expect(bound.scope.commands).toEqual(['bash ./web.sh']);
+      expect(bound.scope.otherStage).toEqual(['bash ./api.sh']);
+    }
     const none = scopeEvidence('WO Class: CODE\n', {});
     expect(none.ok).toBe(true);
     if (none.ok) expect(none.scope.stageId).toBeNull();
@@ -286,6 +302,85 @@ describe('canonical-stage-authority', () => {
       `\`\`\`yaml\n${stageBody(shop)}\n\`\`\`\n\n\`\`\`yaml\n${stageBody(web)}\n\`\`\`\n`
     );
     expect('ok' in multi && multi.ok === false).toBe(true);
+  });
+
+  it('persists other-stage commands as OTHER_STAGE members and does not execute them', () => {
+    const cwd = tempDir('ser-other-stage-');
+    const artifacts = join(cwd, 'artifacts');
+    mkdirSync(artifacts, { recursive: true });
+    writeExec(join(cwd, 'api.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+    writeExec(join(cwd, 'web.sh'), `#!/bin/sh\ntouch '${join(cwd, 'sentinel')}'\n`);
+    const shop = oneStage('api', 'thinmansoftware/shopops', 'bash ./api.sh');
+    const web = oneStage('web', 'thinmansoftware/lspro', 'bash ./web.sh');
+    const specPath = join(cwd, 'spec.md');
+    writeFileSync(
+      specPath,
+      `<!-- canonical-stages -->\n\`\`\`yaml\n${stageBody(`${shop}\n${web}`)}\n\`\`\`\n`
+    );
+    const env = {
+      ...process.env,
+      HARNESS_ROOT_OVERRIDE: ROOT,
+      ARTIFACTS_DIR: artifacts,
+      SER_STAGE_ID: 'api',
+      SER_REPO: 'https://github.com/thinmansoftware/shopops.git',
+    };
+    const scoped = spawnSync('bun', [RUNNER, 'scope-evidence', '--spec', specPath], {
+      cwd,
+      env,
+      encoding: 'utf8',
+    });
+    expect(scoped.status).toBe(0);
+    expect(scoped.stdout).toContain('OTHER_STAGE=bash ./web.sh');
+    expect(scoped.stdout).toContain('COMMAND=bash ./api.sh');
+    const attempts = join(artifacts, 'evidence', 'attempts');
+    const inventoryId = readFileSync(join(attempts, 'inventory-other-stage'), 'utf8').trim();
+    const inventory = JSON.parse(readFileSync(join(attempts, `${inventoryId}.json`), 'utf8')) as {
+      members: { rawCommand: string; status: string; scope: string; exitCode: number | null }[];
+    };
+    expect(inventory.members).toEqual([
+      expect.objectContaining({
+        rawCommand: 'bash ./web.sh',
+        status: 'OTHER_STAGE',
+        scope: 'other_stage',
+        exitCode: null,
+      }),
+    ]);
+    writeFileSync(join(cwd, 'cmds'), 'bash ./api.sh\n');
+    const ran = spawnSync(
+      'bun',
+      [RUNNER, 'run-tests', '--commands', join(cwd, 'cmds'), '--log', join(artifacts, 'stop.log')],
+      { cwd, env, encoding: 'utf8' }
+    );
+    expect(ran.status).toBe(0);
+    expect(existsSync(join(cwd, 'sentinel'))).toBe(false);
+    const testId = readFileSync(join(attempts, 'current-tests'), 'utf8').trim();
+    const recorded = JSON.parse(readFileSync(join(attempts, `${testId}.json`), 'utf8')) as {
+      aggregate: string;
+      members: { rawCommand: string; status: string; scope: string }[];
+    };
+    expect(recorded.aggregate).toBe('PASSED');
+    expect(recorded.members).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          rawCommand: 'bash ./api.sh',
+          status: 'PASSED',
+          scope: 'selected',
+        }),
+        expect.objectContaining({
+          rawCommand: 'bash ./web.sh',
+          status: 'OTHER_STAGE',
+          scope: 'other_stage',
+        }),
+      ])
+    );
+    const refused = spawnSync('bun', [RUNNER, 'scope-evidence', '--spec', specPath], {
+      cwd,
+      env: { ...env, SER_REPO: 'thinmansoftware/lspro' },
+      encoding: 'utf8',
+    });
+    expect(refused.status).toBe(3);
+    expect(refused.stderr).toContain('repo');
+    rmSync(cwd, { recursive: true, force: true });
   });
 });
 
@@ -512,6 +607,62 @@ describe('hermetic-fresh-attempt', () => {
     expect(body.members[0]?.status).toBe('INCOMPLETE');
     expect(body.aggregate).toBe('INCOMPLETE');
     rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it('validates explicit test and grep attempt ids after greps replace current', () => {
+    const cwd = tempDir('ser-bind-');
+    initRepo(cwd);
+    writeFileSync(join(cwd, 'src.js'), 'v1\n');
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+    const artifacts = join(cwd, 'artifacts');
+    mkdirSync(artifacts, { recursive: true });
+    const savedArtifacts = process.env.ARTIFACTS_DIR;
+    process.env.ARTIFACTS_DIR = artifacts;
+    const env = {
+      ...process.env,
+      HARNESS_ROOT_OVERRIDE: ROOT,
+      ARTIFACTS_DIR: artifacts,
+    };
+    try {
+      const summary = runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
+      const before = spawnSync('bun', [RUNNER, 'run-greps'], {
+        cwd,
+        env,
+        encoding: 'utf8',
+        input: 'grep -c base README\neq\t1\nDECLARED\t1\n',
+      });
+      expect(before.status).toBe(0);
+      const attempts = join(artifacts, 'evidence', 'attempts');
+      const grepId = readFileSync(join(attempts, 'current-greps'), 'utf8').trim();
+      const current = readFileSync(join(attempts, 'current'), 'utf8').trim();
+      expect(current).toBe(grepId);
+      expect(grepId).not.toBe(summary.attempt.attemptId);
+      expect(readFileSync(join(attempts, 'current-tests'), 'utf8').trim()).toBe(
+        summary.attempt.attemptId
+      );
+      const fresh = spawnSync(
+        'bun',
+        [RUNNER, 'check-attempt', '--tests', summary.attempt.attemptId, '--greps', grepId],
+        { cwd, env, encoding: 'utf8' }
+      );
+      expect(fresh.status).toBe(0);
+      expect(fresh.stdout).toContain('OK');
+      writeFileSync(join(cwd, 'src.js'), 'v2\n');
+      const stale = spawnSync('bun', [RUNNER, 'check-attempt'], { cwd, env, encoding: 'utf8' });
+      expect(stale.status).not.toBe(0);
+      expect(stale.stderr).toContain('REFUSED tests:');
+      const grepOnly = spawnSync('bun', [RUNNER, 'check-attempt', '--greps', grepId], {
+        cwd,
+        env: { ...env, SER_TEST_ATTEMPT_ID: '' },
+        encoding: 'utf8',
+      });
+      expect(grepOnly.status).not.toBe(0);
+      expect(grepOnly.stderr).toContain('REFUSED tests:');
+    } finally {
+      if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = savedArtifacts;
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });
 

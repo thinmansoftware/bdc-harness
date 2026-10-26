@@ -430,11 +430,24 @@ function authorityFromEnv(cwd: string): EvidenceAuthority {
   };
 }
 
-function newAttemptId(): string {
-  if (process.env.SER_ATTEMPT_ID && process.env.SER_ATTEMPT_ID.length > 0) {
-    return process.env.SER_ATTEMPT_ID;
+function newAttemptId(kind: EvidenceAttempt['kind']): string {
+  const pinned = process.env.SER_ATTEMPT_ID ?? '';
+  if (pinned.length > 0) {
+    // A shared pin must not let greps overwrite the test attempt file.
+    if (kind === 'tests') return pinned;
+    return `${pinned}-${kind}`;
   }
   return `ser-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function kindPointer(kind: EvidenceAttempt['kind']): string {
+  if (kind === 'tests') return 'current-tests';
+  if (kind === 'greps') return 'current-greps';
+  return 'current-assertions';
+}
+
+function safeAttemptId(id: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(id);
 }
 
 function writeAtomic(path: string, body: string): void {
@@ -449,8 +462,54 @@ export function persistAttempt(cwd: string, attempt: EvidenceAttempt): string {
   mkdirSync(dir, { recursive: true });
   const file = join(dir, `${attempt.attemptId}.json`);
   writeAtomic(file, `${JSON.stringify(attempt, null, 2)}\n`);
+  writeAtomic(join(dir, kindPointer(attempt.kind)), `${attempt.attemptId}\n`);
+  // `current` stays the last writer. The manifest gate must not use it alone.
   writeAtomic(join(dir, 'current'), `${attempt.attemptId}\n`);
   return file;
+}
+
+function otherStagePlanPath(cwd: string): string {
+  return join(attemptsDirectory(cwd), 'other-stage.json');
+}
+
+function recordOtherStagePlan(cwd: string, commands: readonly string[]): void {
+  writeAtomic(otherStagePlanPath(cwd), `${JSON.stringify([...commands])}\n`);
+}
+
+function readOtherStagePlan(cwd: string): string[] {
+  const path = otherStagePlanPath(cwd);
+  if (!existsSync(path)) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    throw new Error('malformed other-stage inventory');
+  }
+  if (!Array.isArray(parsed)) throw new Error('malformed other-stage inventory');
+  const commands: string[] = [];
+  for (const item of parsed as unknown[]) {
+    if (typeof item !== 'string') throw new Error('malformed other-stage inventory');
+    commands.push(item);
+  }
+  return commands;
+}
+
+export function persistOtherStageInventory(
+  cwd: string,
+  commands: readonly string[]
+): EvidenceAttempt {
+  const members = commands.map(command => otherStageMember(command, cwd, ''));
+  const attempt = shellAttempt(cwd, 'tests', 'other-stage', members);
+  attempt.aggregate = aggregateOf(members);
+  if (!attempt.attemptId.endsWith('-other-stage')) {
+    attempt.attemptId = `${attempt.attemptId}-other-stage`;
+  }
+  const dir = attemptsDirectory(cwd);
+  mkdirSync(dir, { recursive: true });
+  writeAtomic(join(dir, `${attempt.attemptId}.json`), `${JSON.stringify(attempt, null, 2)}\n`);
+  writeAtomic(join(dir, 'inventory-other-stage'), `${attempt.attemptId}\n`);
+  recordOtherStagePlan(cwd, commands);
+  return attempt;
 }
 
 function blankMember(raw: string, cwd: string, logPath: string): AttemptMember {
@@ -473,6 +532,34 @@ function blankMember(raw: string, cwd: string, logPath: string): AttemptMember {
     scope: 'selected',
     chain: [],
   };
+}
+
+function otherStageMember(raw: string, cwd: string, logPath: string): AttemptMember {
+  const member = blankMember(raw, cwd, logPath);
+  member.status = 'OTHER_STAGE';
+  member.reason = 'other-stage';
+  member.scope = 'other_stage';
+  return member;
+}
+
+function appendOtherStageMembers(
+  members: AttemptMember[],
+  commands: readonly string[],
+  cwd: string,
+  logPath: string
+): void {
+  const seen = new Set(members.map(member => member.rawCommand));
+  for (const command of commands) {
+    const trimmed = command.trim();
+    if (trimmed.length === 0 || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    members.push(otherStageMember(trimmed, cwd, logPath));
+  }
+}
+
+function stagedOtherStageCommands(cwd: string, explicit: readonly string[]): string[] {
+  if (explicit.length > 0) return [...explicit];
+  return readOtherStagePlan(cwd);
 }
 
 function aggregateOf(members: readonly AttemptMember[]): EvidenceStatus {
@@ -507,7 +594,7 @@ function shellAttempt(
 ): EvidenceAttempt {
   return {
     schemaVersion: 1,
-    attemptId: newAttemptId(),
+    attemptId: newAttemptId(kind),
     kind,
     source: recordedSource(source),
     span: process.env.SER_SPAN ?? kind,
@@ -519,16 +606,66 @@ function shellAttempt(
   };
 }
 
-export function readCurrentAttempt(cwd: string): EvidenceAttempt | null {
-  const dir = attemptsDirectory(cwd);
-  const pointer = join(dir, 'current');
+export function readAttemptById(cwd: string, attemptId: string): EvidenceAttempt | null {
+  if (!safeAttemptId(attemptId)) return null;
+  const file = join(attemptsDirectory(cwd), `${attemptId}.json`);
+  if (!existsSync(file)) return null;
+  try {
+    const parsed = evidenceAttemptSchema.safeParse(JSON.parse(readFileSync(file, 'utf8')));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+function readPointerAttempt(cwd: string, pointerName: string): EvidenceAttempt | null {
+  const pointer = join(attemptsDirectory(cwd), pointerName);
   if (!existsSync(pointer)) return null;
   const id = readFileSync(pointer, 'utf8').trim();
-  if (!id) return null;
-  const file = join(dir, `${id}.json`);
-  if (!existsSync(file)) return null;
-  const parsed = evidenceAttemptSchema.safeParse(JSON.parse(readFileSync(file, 'utf8')));
-  return parsed.success ? parsed.data : null;
+  if (!safeAttemptId(id)) return null;
+  return readAttemptById(cwd, id);
+}
+
+export function readCurrentAttempt(cwd: string): EvidenceAttempt | null {
+  return readPointerAttempt(cwd, 'current');
+}
+
+export function readKindAttempt(
+  cwd: string,
+  kind: EvidenceAttempt['kind']
+): EvidenceAttempt | null {
+  return readPointerAttempt(cwd, kindPointer(kind));
+}
+
+export function checkBoundAttempts(
+  cwd: string,
+  liveAuthority: EvidenceAuthority,
+  binding: { testAttemptId: string | null; grepAttemptId: string | null }
+): { ok: true } | { ok: false; reason: string } {
+  if (!binding.testAttemptId && !binding.grepAttemptId) {
+    return { ok: false, reason: 'missing-attempt' };
+  }
+  // Fresh grep evidence must not satisfy the gate without its test attempt.
+  if (binding.grepAttemptId && !binding.testAttemptId) {
+    return { ok: false, reason: 'missing-test-attempt' };
+  }
+  if (binding.testAttemptId) {
+    const attempt = readAttemptById(cwd, binding.testAttemptId);
+    if (!attempt) return { ok: false, reason: 'missing-test-attempt' };
+    if (attempt.kind !== 'tests' || attempt.source === 'other-stage') {
+      return { ok: false, reason: 'test-attempt-kind' };
+    }
+    const verdict = checkAttemptRecord(attempt, cwd, liveAuthority);
+    if (!verdict.ok) return { ok: false, reason: `tests:${verdict.reason}` };
+  }
+  if (binding.grepAttemptId) {
+    const attempt = readAttemptById(cwd, binding.grepAttemptId);
+    if (!attempt) return { ok: false, reason: 'missing-grep-attempt' };
+    if (attempt.kind !== 'greps') return { ok: false, reason: 'grep-attempt-kind' };
+    const verdict = checkAttemptRecord(attempt, cwd, liveAuthority);
+    if (!verdict.ok) return { ok: false, reason: `greps:${verdict.reason}` };
+  }
+  return { ok: true };
 }
 
 function samePathSet(a: TreeIdentity, b: TreeIdentity): boolean {
@@ -1290,7 +1427,8 @@ export interface TestRunSummary {
 export function runTestCommands(
   commands: readonly string[],
   cwd: string,
-  logPath: string
+  logPath: string,
+  otherStage: readonly string[] = []
 ): TestRunSummary {
   if (!trustedSelfMatches(cwd) && !trustedSelfMatches(process.cwd())) {
     mkdirSync(dirname(logPath), { recursive: true });
@@ -1300,6 +1438,7 @@ export function runTestCommands(
       member.reason = 'missing-trusted-runner';
       return member;
     });
+    appendOtherStageMembers(members, stagedOtherStageCommands(cwd, otherStage), cwd, logPath);
     const attempt = shellAttempt(cwd, 'tests', process.env.SER_SOURCE ?? 'tests', members);
     attempt.aggregate = 'INCOMPLETE';
     try {
@@ -1321,6 +1460,7 @@ export function runTestCommands(
   const members = commands
     .filter(command => command.trim().length > 0)
     .map(command => blankMember(command.trim(), cwd, logPath));
+  appendOtherStageMembers(members, stagedOtherStageCommands(cwd, otherStage), cwd, logPath);
   const attempt = shellAttempt(cwd, 'tests', process.env.SER_SOURCE ?? 'tests', members);
   persistAttempt(cwd, attempt);
   const env = scrubEnv(process.env);
@@ -1333,6 +1473,7 @@ export function runTestCommands(
   let testFailed = false;
   mkdirSync(dirname(logPath), { recursive: true });
   for (const member of members) {
+    if (member.scope !== 'selected') continue;
     const output: string[] = [];
     appendFileSync(logPath, `### run-stop-tests: ${member.rawCommand}\n`);
     member.startedAt = new Date().toISOString();
@@ -1928,7 +2069,12 @@ export function scopeEvidence(
   if (authority.stageId) {
     const matches = stages.filter(stage => stage.id === authority.stageId);
     if (matches.length !== 1) return { ok: false, message: 'FAIL: stage id is not unique\n' };
-    chosen = matches[0];
+    const match = matches[0];
+    if (!match) return { ok: false, message: 'FAIL: stage id is not unique\n' };
+    if (authority.repo && repoSlug(authority.repo) !== repoSlug(match.repo)) {
+      return { ok: false, message: 'FAIL: authority repo does not match stage id\n' };
+    }
+    chosen = match;
   } else if (authority.repo) {
     const want = repoSlug(authority.repo);
     const matches = stages.filter(stage => repoSlug(stage.repo) === want);
@@ -1994,6 +2140,14 @@ function flagValue(args: readonly string[], name: string): string | null {
   const idx = args.indexOf(name);
   if (idx < 0) return null;
   return args[idx + 1] ?? null;
+}
+
+function explicitAttemptId(args: readonly string[], flag: string, envName: string): string | null {
+  const flagged = flagValue(args, flag);
+  if (flagged && flagged.length > 0 && !flagged.startsWith('--')) return flagged;
+  const fromEnv = process.env[envName];
+  if (fromEnv && fromEnv.length > 0) return fromEnv;
+  return null;
 }
 
 function requireTrustedCli(): boolean {
@@ -2076,6 +2230,7 @@ function runCli(): number {
       }
       const commands = readFileSync(commandsPath, 'utf8').split('\n');
       const summary = runTestCommands(commands, process.cwd(), resolve(logPath));
+      process.stderr.write(`SER_TEST_ATTEMPT_ID=${summary.attempt.attemptId}\n`);
       process.stdout.write(summary.line);
       return 0;
     }
@@ -2182,6 +2337,7 @@ function runCli(): number {
       if (mismatch > 0 || (executed === 0 && declared > 0))
         attempt.aggregate = mismatch > 0 ? 'FAILED' : 'INCOMPLETE';
       persistAttempt(process.cwd(), attempt);
+      process.stderr.write(`SER_GREP_ATTEMPT_ID=${attempt.attemptId}\n`);
       process.stdout.write(
         `GREP_DECLARED=${declared}\nGREP_EXECUTED=${executed}\nGREP_DROPPED=${dropped}\nGREP_UNPARSED=${unparsed}\nGREP_MISMATCH=${mismatch}\nGREP_STATUS=${status}\nGREP_LINE=${out}\n`
       );
@@ -2258,6 +2414,13 @@ function runCli(): number {
         process.stderr.write(scope.message);
         return 3;
       }
+      if (scope.scope.mode === 'stage') {
+        if (scope.scope.otherStage.length > 0) {
+          persistOtherStageInventory(process.cwd(), scope.scope.otherStage);
+        } else {
+          recordOtherStagePlan(process.cwd(), []);
+        }
+      }
       process.stdout.write(`MODE=${scope.scope.mode}\n`);
       if (scope.scope.stageId) process.stdout.write(`STAGE_ID=${scope.scope.stageId}\n`);
       for (const line of scope.scope.commands) process.stdout.write(`COMMAND=${line}\n`);
@@ -2267,12 +2430,15 @@ function runCli(): number {
     }
     if (command === 'check-attempt') {
       if (!requireTrustedCli()) return 1;
-      const current = readCurrentAttempt(process.cwd());
-      if (!current) {
-        process.stderr.write('REFUSED missing attempt\n');
-        return 1;
-      }
-      const verdict = checkAttemptRecord(current, process.cwd(), authorityFromEnv(process.cwd()));
+      const cwd = process.cwd();
+      const explicitTests = explicitAttemptId(args, '--tests', 'SER_TEST_ATTEMPT_ID');
+      const explicitGreps = explicitAttemptId(args, '--greps', 'SER_GREP_ATTEMPT_ID');
+      const testAttemptId = explicitTests ?? readKindAttempt(cwd, 'tests')?.attemptId ?? null;
+      const grepAttemptId = explicitGreps ?? readKindAttempt(cwd, 'greps')?.attemptId ?? null;
+      const verdict = checkBoundAttempts(cwd, authorityFromEnv(cwd), {
+        testAttemptId,
+        grepAttemptId,
+      });
       if (!verdict.ok) {
         process.stderr.write(`REFUSED ${verdict.reason}\n`);
         return 1;
