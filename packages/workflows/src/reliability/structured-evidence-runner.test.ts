@@ -169,6 +169,10 @@ describe('unsafe-and-decode-bypasses', () => {
     const cwd = tempDir('ser-find-');
     writeFileSync(join(cwd, 'keep.txt'), 'stay\n');
     const marker = join(cwd, 'marker');
+    const spawned = join(cwd, 'find-spawned');
+    const bin = join(cwd, 'bin');
+    mkdirSync(bin);
+    writeExec(join(bin, 'find'), `#!/bin/sh\ntouch '${spawned}'\nexit 0\n`);
     const commands = [
       'find -- . -delete',
       'find -- . -exec touch marker',
@@ -179,16 +183,28 @@ describe('unsafe-and-decode-bypasses', () => {
       'find -- . -fls marker',
       "find -- . '-delete'",
       "find -- . '-fprint' marker",
+      "find -- . '-de\\lete'",
+      "find -- . '-ex\\ec' touch marker",
+      "find -- . '-fp\\rint' marker",
     ];
-    for (const command of commands) {
-      const allowed = allowAssertion(command);
-      expect(allowed.ok).toBe(false);
-      if (!allowed.ok) expect(allowed.reason).toBe('find-flag');
-      const ran = execAssertion(command, cwd);
-      expect(ran.reason).toBe('find-flag');
-      expect(ran.stdout).toBe('');
-      expect(existsSync(join(cwd, 'keep.txt'))).toBe(true);
-      expect(existsSync(marker)).toBe(false);
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${bin}:${savedPath ?? ''}`;
+    try {
+      for (const command of commands) {
+        const allowed = allowAssertion(command);
+        expect(allowed.ok).toBe(false);
+        if (!allowed.ok) expect(allowed.reason).toBe('find-flag');
+        const ran = execAssertion(command, cwd);
+        expect(ran.reason).toBe('find-flag');
+        expect(ran.stdout).toBe('');
+        expect(ran.steps).toEqual([]);
+        expect(existsSync(join(cwd, 'keep.txt'))).toBe(true);
+        expect(existsSync(marker)).toBe(false);
+        expect(existsSync(spawned)).toBe(false);
+      }
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
     }
     const sortPath = allowAssertion("sort -- '--output=glob'");
     expect(sortPath.ok).toBe(true);
@@ -291,6 +307,7 @@ describe('partial-failure-and-compatibility', () => {
     writeExec(join(cwd, 'nocount.sh'), '#!/bin/sh\necho "no counts here"\nexit 0\n');
     writeExec(join(cwd, 'zero.sh'), '#!/bin/sh\necho "Tests: 0/0"\nexit 0\n');
     writeExec(join(cwd, 'impossible.sh'), '#!/bin/sh\necho "Tests: 4/3"\nexit 0\n');
+    writeExec(join(cwd, 'negative.sh'), '#!/bin/sh\necho "Tests: -1/-1"\nexit 0\n');
     const saved = process.env.ARTIFACTS_DIR;
     process.env.ARTIFACTS_DIR = artifacts;
     try {
@@ -336,6 +353,18 @@ describe('partial-failure-and-compatibility', () => {
       expect(impossible.exitCode).not.toBe(0);
       expect(impossible.attempt.members[0]?.status).toBe('FAILED');
       expect(checkAttemptRecord(impossible.attempt, cwd, authority(cwd)).ok).toBe(false);
+
+      const negative = runTestCommands(
+        ['bash ./ok.sh', 'bash ./negative.sh'],
+        cwd,
+        join(artifacts, 'negative.log')
+      );
+      expect(negative.line).toBe('0  ');
+      expect(negative.passed).toBeNull();
+      expect(negative.total).toBeNull();
+      expect(negative.attempt.aggregate).toBe('COUNTS_UNPARSED');
+      expect(negative.attempt.members[1]?.status).toBe('COUNTS_UNPARSED');
+      expect(checkAttemptRecord(negative.attempt, cwd, authority(cwd)).ok).toBe(false);
     } finally {
       if (saved === undefined) delete process.env.ARTIFACTS_DIR;
       else process.env.ARTIFACTS_DIR = saved;
