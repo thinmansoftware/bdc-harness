@@ -510,8 +510,7 @@ export async function dispatchBackgroundWorkflow(
   } catch (error) {
     const err = error as Error;
     getLog().error({ err, workflowName: workflow.name }, 'pre_create_workflow_run_failed');
-    // Non-fatal: executeWorkflow creates the successor row. handoffRecords is
-    // forwarded below so that fallback insert keeps escalation_handoff.
+    // Non-fatal: executeWorkflow will create its own row as fallback
   }
 
   // 9. Fire-and-forget: run workflow in background
@@ -532,8 +531,7 @@ export async function dispatchBackgroundWorkflow(
           ctx.conversationDbId,
           preCreatedRun,
           authoritySource,
-          ctx.modelOverride,
-          handoffRecords
+          ctx.modelOverride
         );
         // Surface workflow output to parent conversation as a result card
         if ('paused' in result) {

@@ -525,10 +525,6 @@ export async function resolveExecutorLane(opts: {
  *   - Used to substitute $CONTEXT, $EXTERNAL_CONTEXT, $ISSUE_CONTEXT variables in prompts
  *   - Appended to prompts if no context variables are present (to ensure AI receives context)
  *   Expected format: Markdown with issue title, author, labels, and body
- * @param escalationHandoff - Successor handoff records. Persisted as
- *   metadata.escalation_handoff when this call creates the run row because
- *   the orchestrator pre-create failed or was not used. Opaque to the engine;
- *   the caller owns the record shape.
  */
 export async function executeWorkflow(
   deps: WorkflowDeps,
@@ -549,8 +545,7 @@ export async function executeWorkflow(
   parentConversationId?: string,
   preCreatedRun?: WorkflowRun,
   authoritySource?: RunAuthorityDispatch,
-  modelOverride?: ModelOverride,
-  escalationHandoff?: readonly unknown[]
+  modelOverride?: ModelOverride
 ): Promise<WorkflowExecutionResult> {
   // Load config once for the entire workflow execution
   const fileConfig = await deps.loadConfig(cwd);
@@ -748,9 +743,6 @@ export async function executeWorkflow(
         metadata: {
           ...(issueContext ? { github_context: issueContext } : {}),
           ...(modelOverride ? { model_override: modelOverride } : {}),
-          // Match the orchestrator pre-create. This insert is the successor
-          // row when that pre-create failed and dispatch continued.
-          ...(escalationHandoff !== undefined ? { escalation_handoff: escalationHandoff } : {}),
         },
         parent_conversation_id: parentConversationId,
       });

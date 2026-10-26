@@ -100,10 +100,9 @@ mock.module('@archon/isolation', () => ({
   getIsolationProvider: mock(() => ({})),
 }));
 
-const mockCreateWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
 mock.module('../workflows/store-adapter', () => ({
   createWorkflowDeps: mock(() => ({
-    store: { createWorkflowRun: mockCreateWorkflowRun },
+    store: { createWorkflowRun: mock(() => Promise.resolve({ id: 'run-1' })) },
     getAgentProvider: () => ({}),
     loadConfig: async () => ({}),
   })),
@@ -120,30 +119,20 @@ mock.module('../services/cleanup-service', () => ({
   STALE_THRESHOLD_DAYS: 7,
 }));
 
-const mockExecuteWorkflow = mock(() =>
-  Promise.resolve({ success: true, summary: '', workflowRunId: 'run-1' })
-);
 mock.module('@archon/workflows/executor', () => ({
-  executeWorkflow: mockExecuteWorkflow,
+  executeWorkflow: mock(() =>
+    Promise.resolve({ success: true, summary: '', workflowRunId: 'run-1' })
+  ),
 }));
 
 // Dynamic imports inside dispatchBackgroundWorkflow (escalation linker).
-const mockPrepareDispatchWithEscalation = mock((userMessage: string) =>
-  Promise.resolve({
-    userMessage,
-    link: { woId: undefined, escalatedRunIds: [], packet: '' },
-  })
-);
-const mockListPredecessorRuns = mock(() => Promise.resolve([]));
-const mockReleasePredecessorBranchHolds = mock(() =>
-  Promise.resolve({ records: [] as ReadonlyArray<Record<string, unknown>>, skipped: [] })
-);
-const mockFormatHandoffLines = mock(() => '');
 mock.module('../escalation', () => ({
-  prepareDispatchWithEscalation: mockPrepareDispatchWithEscalation,
-  listPredecessorRuns: mockListPredecessorRuns,
-  releasePredecessorBranchHolds: mockReleasePredecessorBranchHolds,
-  formatHandoffLines: mockFormatHandoffLines,
+  prepareDispatchWithEscalation: mock((userMessage: string) =>
+    Promise.resolve({
+      userMessage,
+      link: { woId: undefined, escalatedRunIds: [], packet: '' },
+    })
+  ),
 }));
 mock.module('../db/workflows', () => ({
   listWorkflowRuns: mock(() => Promise.resolve([])),
@@ -191,27 +180,6 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
     mockUpdateConversation.mockClear();
     mockFreeze.mockClear();
     mockGetCodebase.mockClear();
-    mockCreateWorkflowRun.mockReset();
-    mockCreateWorkflowRun.mockImplementation(() => Promise.resolve({ id: 'run-1' }));
-    mockExecuteWorkflow.mockReset();
-    mockExecuteWorkflow.mockImplementation(() =>
-      Promise.resolve({ success: true, summary: '', workflowRunId: 'run-1' })
-    );
-    mockPrepareDispatchWithEscalation.mockReset();
-    mockPrepareDispatchWithEscalation.mockImplementation((userMessage: string) =>
-      Promise.resolve({
-        userMessage,
-        link: { woId: undefined, escalatedRunIds: [], packet: '' },
-      })
-    );
-    mockListPredecessorRuns.mockReset();
-    mockListPredecessorRuns.mockImplementation(() => Promise.resolve([]));
-    mockReleasePredecessorBranchHolds.mockReset();
-    mockReleasePredecessorBranchHolds.mockImplementation(() =>
-      Promise.resolve({ records: [], skipped: [] })
-    );
-    mockFormatHandoffLines.mockReset();
-    mockFormatHandoffLines.mockImplementation(() => '');
     mockResolve.mockImplementation((_input: unknown) => {
       callOrder.push('resolve');
       return Promise.resolve({ status: 'none' as const, cwd: '/workspace/worker' });
@@ -386,58 +354,4 @@ describe('dispatchBackgroundWorkflow (real implementation)', () => {
     expect(mockUpdateConversation).toHaveBeenCalledTimes(0);
     expect(mockResolve).toHaveBeenCalledTimes(0);
   });
-
-  test('pre-created successor row stores escalation_handoff and forwards it', async () => {
-    const records = [handoffRecord()];
-    mockListPredecessorRuns.mockImplementation(() => Promise.resolve([{ id: 'pred-1' }]));
-    mockReleasePredecessorBranchHolds.mockImplementation(() =>
-      Promise.resolve({ records, skipped: [] })
-    );
-    mockFormatHandoffLines.mockImplementation(() => 'ESCALATION_HANDOFF run=pred-1');
-
-    await dispatchBackgroundWorkflow(makeCtx() as never, makeWorkflow());
-
-    expect(mockCreateWorkflowRun).toHaveBeenCalledTimes(1);
-    const created = mockCreateWorkflowRun.mock.calls[0]?.[0] as {
-      metadata: Record<string, unknown>;
-      user_message: string;
-    };
-    expect(created.metadata.escalation_handoff).toEqual(records);
-    expect(created.user_message).toContain('ESCALATION_HANDOFF run=pred-1');
-    expect(mockExecuteWorkflow.mock.calls[0]?.[11]).toEqual(
-      expect.objectContaining({ id: 'run-1' })
-    );
-    expect(mockExecuteWorkflow.mock.calls[0]?.[14]).toEqual(records);
-  });
-
-  test('pre-create failure still forwards escalation_handoff to the fallback row', async () => {
-    const records = [handoffRecord()];
-    mockListPredecessorRuns.mockImplementation(() => Promise.resolve([{ id: 'pred-1' }]));
-    mockReleasePredecessorBranchHolds.mockImplementation(() =>
-      Promise.resolve({ records, skipped: [] })
-    );
-    mockFormatHandoffLines.mockImplementation(() => 'ESCALATION_HANDOFF run=pred-1');
-    mockCreateWorkflowRun.mockImplementation(() => Promise.reject(new Error('insert failed')));
-
-    await dispatchBackgroundWorkflow(makeCtx() as never, makeWorkflow());
-
-    expect(mockCreateWorkflowRun).toHaveBeenCalledTimes(1);
-    expect(mockExecuteWorkflow).toHaveBeenCalledTimes(1);
-    expect(mockExecuteWorkflow.mock.calls[0]?.[11]).toBeUndefined();
-    expect(mockExecuteWorkflow.mock.calls[0]?.[14]).toEqual(records);
-    const userMessage = String(mockExecuteWorkflow.mock.calls[0]?.[5]);
-    expect(userMessage).toContain('ESCALATION_HANDOFF run=pred-1');
-  });
 });
-
-function handoffRecord(): Record<string, unknown> {
-  return {
-    runId: 'pred-1',
-    repository: 'https://github.com/example/repo.git',
-    branch: 'feat/wo-1',
-    localHead: 'a'.repeat(40),
-    evidenceRunId: 'pred-1',
-    pushedHead: 'b'.repeat(40),
-    remoteHead: null,
-  };
-}
