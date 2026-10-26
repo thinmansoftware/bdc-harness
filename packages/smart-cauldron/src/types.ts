@@ -161,7 +161,13 @@ export interface CascadeRunRecord {
    * and no tier ever ran.
    */
   refusalReason?: {
-    reason: 'already-satisfied';
+    // 'already-satisfied': a landed/claimed PR already owns this WO (bdc-xo#2140).
+    // 'open-pr-exists': the open-PR climb guard found an open PR for this WO and
+    //   refused to climb a new tier over it (WO-HARNESS-PR-REPAIR-OWNER-AND-
+    //   DEDUPE-01); runs whether or not allowClaimed is set.
+    // 'open-pr-lookup-failed': the open-PR guard's lookup threw after one retry;
+    //   fail-closed (do not climb over a PR we could not read).
+    reason: 'already-satisfied' | 'open-pr-exists' | 'open-pr-lookup-failed';
     prNumber: number;
     prState: string;
     prUrl: string;

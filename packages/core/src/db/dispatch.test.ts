@@ -318,6 +318,35 @@ describe('dispatch db', () => {
     }
   });
 
+  test('sender filters apply before the bounded mailbox page', async () => {
+    for (let index = 0; index < 102; index += 1) {
+      await db.query(
+        `INSERT INTO agent_dispatch_messages
+         (id, correlation_id, idempotency_key, task_type, sender, sender_principal_id,
+          recipient, body, status, created_at, priority, fencing_token)
+         VALUES ($1, $1, $1, 'agent_message', $2, $3, 'taskmaster', '{}',
+          'queued', '2026-10-14T00:00:00Z', $4, 0)`,
+        [
+          `repair-page-${index}`,
+          index === 101 ? 'overseer' : index === 100 ? 'claude' : 'overseer',
+          index >= 100 ? 'system:overseer' : 'spoof:overseer',
+          index === 101 ? 'normal' : 'blocker',
+        ]
+      );
+    }
+    const unfiltered = await listMessages({ recipient: 'taskmaster', status: 'queued' });
+    expect(unfiltered).toHaveLength(100);
+    expect(unfiltered.some(row => row.id === 'repair-page-101')).toBe(false);
+    const trusted = await listMessages({
+      recipient: 'taskmaster',
+      status: 'queued',
+      sender: 'overseer',
+      sender_principal_id: 'system:overseer',
+    });
+    expect(trusted.map(row => row.id)).toEqual(['repair-page-101']);
+    expect(trusted[0]?.sender_principal_id).toBe('system:overseer');
+  });
+
   test('deduplicates repeated idempotency_key posts', async () => {
     const first = await createMessage({
       correlation_id: 'corr-1',

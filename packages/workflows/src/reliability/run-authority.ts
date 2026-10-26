@@ -10,6 +10,12 @@ export interface FrozenSpecSource {
   readonly specSource: string;
   readonly specRevision: string;
   readonly specBytes: Uint8Array;
+  /** Trusted candidate id; unique dispatch authority consumes it for one run. */
+  readonly repairAttemptId?: string;
+}
+
+export function frozenSourceDispatchId(source: FrozenSpecSource, fallback: string): string {
+  return source.repairAttemptId ? `repair:${source.repairAttemptId}` : fallback;
 }
 
 export interface RunAuthorityDispatch extends FrozenSpecSource {

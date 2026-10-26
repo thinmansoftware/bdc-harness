@@ -10,10 +10,15 @@ export interface QueryResult<T> {
   readonly rowCount: number;
 }
 
+/** Scoped synchronous SQL used only by atomic SQLite repair-authority consumption. */
+export type RunAuthoritySyncQuery = <T>(sql: string, params?: unknown[]) => QueryResult<T>;
+
 /**
  * Minimal database interface that both PostgreSQL and SQLite implement
  */
 export interface IDatabase {
+  /** Optional SQLite-only boundary; no callback work may yield or outlive it. */
+  withImmediateRunAuthorityTransaction?<T>(fn: (query: RunAuthoritySyncQuery) => T): Promise<T>;
   /**
    * Execute a SQL query with parameters
    * @param sql - SQL query string with $1, $2, etc. placeholders

@@ -98,6 +98,7 @@ async function producePausedRecord(
   binding: Partial<RunCascadeOptions> = {}
 ): Promise<CascadeRunRecord> {
   const deps: CascadeDeps = {
+    findBlockingOpenPrs: async () => [],
     fire: async opts => makeFireOk(`run-${opts.workflowName}`),
     poll: async () => makeFailPoll(),
     judge: () => makeFailVerdict('validator: needs_revision'),
@@ -131,6 +132,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
       resumeFrontierTier(paused, {
         outDir,
         deps: {
+          findBlockingOpenPrs: async () => [],
           fire: async () => {
             fires++;
             return makeFireOk('must-not-fire');
@@ -160,6 +162,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
     await resumeFrontierTier(persisted!, {
       outDir,
       deps: {
+        findBlockingOpenPrs: async () => [],
         fire: async options => {
           messages.push(options.message);
           return makeFireOk('bound-resume');
@@ -265,6 +268,7 @@ describe('frontier-approval reject + direct-entry bypass (Test 3)', () => {
     const outDir = await makeOutDir();
     const firedWorkflows: string[] = [];
     const deps: CascadeDeps = {
+      findBlockingOpenPrs: async () => [],
       fire: async opts => {
         firedWorkflows.push(opts.workflowName);
         return makeFireOk(`direct-run-${firedWorkflows.length}`);

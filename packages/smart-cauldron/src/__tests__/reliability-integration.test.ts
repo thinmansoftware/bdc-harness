@@ -44,6 +44,7 @@ async function persistedRecord(dir: string): Promise<CascadeRunRecord> {
 
 function winningDeps(fire: ReturnType<typeof mock>): CascadeDeps {
   return {
+    findBlockingOpenPrs: async () => [],
     preflight: async () => undefined,
     fire,
     poll: async options => ({
@@ -83,7 +84,7 @@ describe('Smart Cauldron restart integration fixtures', () => {
       tags: ['mechanical'],
       dryRun: true,
       outDir: dir,
-      deps: { fire },
+      deps: { findBlockingOpenPrs: async () => [], fire },
     });
     const persisted = await persistedRecord(dir);
 
@@ -135,6 +136,7 @@ describe('Smart Cauldron restart integration fixtures', () => {
       token: 'fixture-token',
       outDir: dir,
       deps: {
+        findBlockingOpenPrs: async () => [],
         ...winningDeps(fire),
         poll: async () => {
           throw new PollTransportError('HTTP 503');

@@ -17,9 +17,12 @@ import { createHash, randomUUID } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { getDatabase } from '@archon/core';
+import { createGhLanePrFetcher } from '@archon/smart-cauldron/open-pr-guard';
 import { readCascadeRecord, runCascade } from '@archon/smart-cauldron/cascade';
 import { bindingUsedPercent, resolveEntryThreshold } from '@archon/smart-cauldron/headroom';
 import {
+  acknowledgeMessage,
+  addressMessage,
   assessDispatchRecipient,
   createAuthenticatedMessage,
   getMessage,
@@ -28,6 +31,15 @@ import {
   type DispatchMessage,
   type DispatchRecipientAssessment,
 } from '@archon/core/db/dispatch';
+import { listLanePrsForWo, listWosWithMultipleLanePrs } from '@archon/core/db/lane-pr-registry';
+import { execFileAsync } from '@archon/git';
+import {
+  runPrRepairOwner,
+  resolvePrRepairDedupeWindowHours,
+  type PrRepairOwnerDeps,
+  type PrRepairQueuedMessage,
+  type RepairOwnerIssue,
+} from './pr-repair-owner';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
   adoptionContentHash,
@@ -225,6 +237,8 @@ export interface TaskmasterDeps {
   readFireCascade?: typeof readCascadeRecord;
   now?: () => Date;
   db?: TaskmasterDal;
+  /** Same repair owner with isolated external seams; production uses its existing factory. */
+  prRepairOwnerDeps?: PrRepairOwnerDeps;
   createTask?: typeof createAuthenticatedMessage;
   listUndeliveredRulings?: () => Promise<ThreadSnapshot[]>;
   listThreads?: () => Promise<ThreadSnapshot[] | ListedThreadResult>;
@@ -440,6 +454,7 @@ export const TM_REPEAT_REASON_BY_TYPE: Record<TmActionType, string> = {
   digest: 'tm:digest:repeated',
   fire_cauldron: 'tm:fire_cauldron:repeated',
   blocker_report: 'tm:blocker_report:repeated',
+  pr_repair: 'tm:pr_repair:repeated',
 };
 
 /** Listed work-SOR thread with optional adoption fields carried from the issue payload. */
@@ -821,6 +836,101 @@ export function buildSelfPauseNotice(
   };
 }
 
+/** Reuse the conductor's fail-closed numbered PR lookup for repair ownership. */
+export const createGhLaneFetcher = createGhLanePrFetcher;
+
+/**
+ * Bind the PR repair owner to live infrastructure: the event store
+ * (lane-pr-registry), the dispatch mailbox (taskmaster rows), gh (PR close +
+ * read), the ladder (workflow_name -> entry tier) and runCascade. Pure in tests
+ * -- this factory is NEVER called when a fake DAL is injected.
+ */
+export function createRealPrRepairOwnerDeps(
+  nowMs: number,
+  _expectedEpoch: number,
+  _getControl: typeof taskmasterDb.getPauseState = taskmasterDb.getPauseState
+): PrRepairOwnerDeps {
+  const fetchPr = createGhLaneFetcher();
+  return {
+    now: () => nowMs,
+    fetchPr,
+    dedupeWindowHours: resolvePrRepairDedupeWindowHours(process.env.PR_REPAIR_DEDUPE_WINDOW_HOURS),
+    planEffects: true,
+    canApplyEffect: async (): Promise<boolean> => {
+      const fresh = await _getControl();
+      return fresh.pause_state === 'RUNNING' && fresh.epoch === _expectedEpoch;
+    },
+    listWosWithMultipleLanePrs: opts => listWosWithMultipleLanePrs(opts),
+    listLanePrsForWo: (woId, opts) => listLanePrsForWo(woId, opts),
+    async listQueuedTaskmasterMessages(): Promise<PrRepairQueuedMessage[]> {
+      return listMessages({
+        recipient: 'taskmaster',
+        status: 'queued',
+        sender: 'overseer',
+        sender_principal_id: 'system:overseer',
+      });
+    },
+    async acknowledgeRow(id): Promise<void> {
+      const result = await acknowledgeMessage({ id, principal_id: 'taskmaster' });
+      if (!result.ok) throw new Error(`pr_repair_acknowledgement_refused:${result.reason}`);
+    },
+    async addressRow(id, note): Promise<void> {
+      const result = await addressMessage({ id, principal_id: 'taskmaster' });
+      if (!result.ok) throw new Error(`pr_repair_address_refused:${result.reason}`);
+      log.info({ id, note }, 'taskmaster.pr_repair_row_addressed');
+    },
+    async closePr(input): Promise<void> {
+      // `gh pr close` with --comment; NO --delete-branch (the branch is kept so
+      // the dedupe is reversible and the survivor can cherry-pick if needed).
+      await execFileAsync(
+        'gh',
+        [
+          'pr',
+          'close',
+          String(input.prNumber),
+          '--repo',
+          `${input.owner}/${input.repo}`,
+          '--comment',
+          input.comment,
+        ],
+        { timeout: 30000 }
+      );
+    },
+    async hasRunningRunForWo(woId): Promise<boolean> {
+      const result = await getDatabase().query<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM remote_agent_workflow_runs
+         WHERE user_message LIKE $1 AND status IN ('pending', 'running')`,
+        [`%${woId}%`]
+      );
+      return (result.rows[0]?.n ?? 0) > 0;
+    },
+    async listOwnerIssues(): Promise<RepairOwnerIssue[]> {
+      const issues = await defaultListThreads();
+      return issues.map(issue => ({
+        title: issue.title ?? '',
+        state: 'open',
+        labels: issue.labels ?? [],
+        ownerLogin: issue.ownerLogin ?? null,
+      }));
+    },
+    resolveRecipient,
+    async createOwnerNudge(input): Promise<DispatchMessage> {
+      return createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        {
+          correlation_id: input.idempotencyKey,
+          idempotency_key: input.idempotencyKey,
+          task_type: 'agent_message',
+          recipient: input.recipient,
+          body: input.body,
+          subject_key: input.subjectKey,
+          repeat_reason: 'PR repair owner follow-up.',
+        }
+      );
+    },
+  };
+}
+
 /*
  * RETIREMENT: The daily canary retires when the Taskmaster has run 30 consecutive days with at least
  * one `outcome='sent'` row per day and zero self-pause events in that window. Retirement is
@@ -877,7 +987,8 @@ export function digestProposal(
   nowMs: number,
   expectationCounts?: Record<taskmasterDb.TmExpectationStatus, number>,
   unlabelledPriorityTriage: string[] = [],
-  github?: GitHubDigestData
+  github?: GitHubDigestData,
+  prRepairItems: string[] = []
 ): ActionProposal {
   const dateKey = new Date(nowMs).toISOString().slice(0, 10);
   const digestActions = actions24h.filter(action => action.thread_ref !== 'taskmaster:reset');
@@ -902,6 +1013,12 @@ export function digestProposal(
     : '';
   const triageSummary = unlabelledPriorityTriage.length
     ? ` Needs priority triage: ${unlabelledPriorityTriage.join(', ')}.`
+    : '';
+  // PR repair owner ride-along (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01): the
+  // exhausted/judgment and approved-non-survivor cases a human must look at,
+  // on the same single daily message. Nothing here writes to xo or operator.
+  const prRepairSummary = prRepairItems.length
+    ? ` PR repair needs a person: ${prRepairItems.join('; ')}.`
     : '';
   const githubUsage =
     github?.usage
@@ -930,7 +1047,7 @@ export function digestProposal(
       `Taskmaster daily canary for ${dateKey}: state=${control.pause_state}, ` +
       `scope=${control.pause_scope ?? 'none'}, actor=${control.pause_actor ?? 'none'}, ` +
       `updated_at=${control.updated_at}; ${summary}; ${pauseDetail}.` +
-      `${expectationSummary}${triageSummary} ${githubUsage} ${githubPools} ` +
+      `${expectationSummary}${triageSummary}${prRepairSummary} ${githubUsage} ${githubPools} ` +
       'Pause/resume/status runbook: xo-wiki/wiki/tools/taskmaster/_index.md.',
     idempotencyKey: `tm:digest:${dateKey}`,
     actsImmediately: true,
@@ -2128,6 +2245,34 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   } catch (error) {
     log.warn({ err: error as Error }, 'taskmaster.expectation_counts_failed');
   }
+  // PR repair owner (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01): collapse
+  // duplicate lane PRs, route repairs to their owner, and plan digest items.
+  // The ordinary effect path owns admission, including paused-item withholding.
+  // Production uses its existing factory; isolated tests may inject its seams.
+  // Discovery failure must not break the rest of the tick.
+  const admittedPrRepairItems = new Map<string, string>();
+  let commitPrRepairDigestLines:
+    | ((body: string, admittedItemKeys: ReadonlySet<string>) => Promise<void>)
+    | null = null;
+  const prRepairEffects = new Map<
+    string,
+    Awaited<ReturnType<typeof runPrRepairOwner>>['effects'][number]
+  >();
+  if (deps.prRepairOwnerDeps || !deps.db) {
+    try {
+      const owner = await runPrRepairOwner(
+        deps.prRepairOwnerDeps ?? createRealPrRepairOwnerDeps(nowMs, epoch)
+      );
+      commitPrRepairDigestLines = owner.commitDigestLines;
+      for (const effect of owner.effects) {
+        prRepairEffects.set(effect.proposal.idempotencyKey, effect);
+        proposals.push(effect.proposal);
+      }
+    } catch (error) {
+      log.warn({ err: error as Error }, 'taskmaster.pr_repair_owner_failed');
+    }
+  }
+
   if (!deps.db) {
     try {
       githubDigest = await loadGitHubDigestData(nowMs);
@@ -2156,6 +2301,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
     if (proposal.type === 'nudge') return 6;
     if (proposal.type === 'blocker_report') return 7;
+    if (proposal.type === 'digest') return 9;
     return 8;
   };
   proposals.sort((a, b) => {
@@ -2169,8 +2315,27 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   let firesThisTick = 0;
   let unconfirmedFireReservations = 0;
   let blockerReportsThisTick = 0;
+  // Did THIS tick's digest actually land as a sent effect? The PR-repair
+  // exhausted rows ride this tick's digest; we must only mark them delivered
+  // once the digest itself was successfully sent (not deduped/skipped,
+  // deferred, parked, rejected, or failed). See the commitPrRepairExhausted
+  // gate after the proposal loop.
+  let persistedDigestBody: string | null = null;
 
   for (const proposal of proposals) {
+    // Every repair admission has priority over rendering the watching digest.
+    // A planned, parked, rejected or deferred line is not delivered content.
+    if (proposal.type === 'digest') {
+      proposal.body = digestProposal(
+        actions24h,
+        control,
+        nowMs,
+        expectationCounts,
+        unlabelledPriorityTriage,
+        githubDigest,
+        [...admittedPrRepairItems.values()]
+      ).body;
+    }
     const canonicalProposalRef = canonicalizeThreadRef(proposal.threadRef);
     if (proposal.type === 'escalate_p0' && recentEscalateP0ByThread.has(canonicalProposalRef)) {
       continue;
@@ -2189,6 +2354,23 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     ) {
       result.deferred += 1;
       continue;
+    }
+
+    const plannedRepair = prRepairEffects.get(proposal.idempotencyKey);
+    if (
+      plannedRepair?.kind === 'digest_item' &&
+      plannedRepair.digestLine &&
+      existingAction?.outcome === 'sent' &&
+      existingAction.action_type === proposal.type &&
+      existingAction.thread_ref === proposal.threadRef &&
+      existingAction.idempotency_key === proposal.idempotencyKey &&
+      existingAction.before_hash === sha256(proposal.body) &&
+      validateProposal(proposal).allowed
+    ) {
+      const fresh = await dal.getPauseState();
+      if (fresh.epoch === epoch && fresh.pause_state === 'RUNNING') {
+        admittedPrRepairItems.set(proposal.idempotencyKey, plannedRepair.digestLine);
+      }
     }
 
     if (
@@ -2356,11 +2538,28 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
 
     try {
+      const repairEffect = prRepairEffects.get(proposal.idempotencyKey);
       const escalationIssue =
         proposal.type === 'escalate_p0' && resolveEscalateToIssueEnabled()
           ? parseGithubThreadRef(proposal.threadRef)
           : null;
-      if (escalationIssue) {
+      if (repairEffect) {
+        const applied = await repairEffect.apply();
+        if (applied?.applied === false) {
+          await dal.updateActionOutcome(
+            journalRow.id,
+            'expired',
+            JSON.stringify({ ...proposal, suppressed: 'pr_eligibility_changed' })
+          );
+          journalRow.outcome = 'expired';
+          result.expired += 1;
+          continue;
+        }
+        await dal.updateActionOutcome(journalRow.id, 'sent');
+        if (repairEffect.kind === 'digest_item' && repairEffect.digestLine) {
+          admittedPrRepairItems.set(proposal.idempotencyKey, repairEffect.digestLine);
+        }
+      } else if (escalationIssue) {
         // WO-HARNESS-TASKMASTER-ESCALATE-TO-ISSUE-01: deliver the escalation as
         // a GitHub issue comment (where the owner and Duty Officer look), not to
         // the operator dispatch mailbox (a drain_on_start principal with no
@@ -2602,6 +2801,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
           }
         );
+        if (proposal.type === 'digest') persistedDigestBody = dispatched.body;
         const registerExpectation =
           dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
         await registerExpectation?.({
@@ -2648,6 +2848,20 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       journalRow.outcome = 'failed';
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');
+    }
+  }
+
+  // PR repair owner (WO-HARNESS-PR-REPAIR-OWNER-AND-DEDUPE-01): the
+  // exhausted/judgment lines rode this tick's daily digest above; address their
+  // queued rows ONLY now that the digest effect was successfully SENT this tick.
+  // If the digest was deduped/skipped, deferred, parked, rejected, or failed,
+  // the exhausted line never reached a person -- leave the row queued for the
+  // next tick instead of marking it delivered and dropping the line.
+  if (commitPrRepairDigestLines && persistedDigestBody !== null) {
+    try {
+      await commitPrRepairDigestLines(persistedDigestBody, new Set(admittedPrRepairItems.keys()));
+    } catch (error) {
+      log.warn({ err: error as Error }, 'taskmaster.pr_repair_commit_failed');
     }
   }
 

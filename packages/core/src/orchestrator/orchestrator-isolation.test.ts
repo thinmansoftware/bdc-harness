@@ -56,6 +56,7 @@ mock.module('@archon/providers', () => ({
 }));
 
 mock.module('../workflows/store-adapter', () => ({
+  createRepairAttemptLookup: () => async () => null,
   createWorkflowDeps: mock(() => ({
     store: {},
     getAgentProvider: () => ({}),

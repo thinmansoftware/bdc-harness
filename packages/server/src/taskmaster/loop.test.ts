@@ -1,23 +1,75 @@
 /**
  * Taskmaster loop tests -- Section 11 scenarios 1, 3, 4, 5 plus the
  * auto-circuit. Everything is dependency-injected (fake clock, fake DAL,
- * fake dispatch); no mock.module.
+ * fake dispatch). A separate fail-closed preload catches undeclared defaults.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { readFileSync, unlinkSync } from 'fs';
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { Database } from 'bun:sqlite';
+import { readFileSync } from 'fs';
 import { join } from 'path';
-import { rootLogger } from '@archon/paths';
-import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
-import {
-  setSeatUsageReaderForTests,
-  unknownSeatReading,
+import type { DispatchDeliveryMode } from '@archon/core/db/dispatch';
+import type { ThreadSnapshot } from './rules';
+import type {
+  TmActionOutcome,
+  TmActionType,
+  TmControlState,
+  TmGrade,
+  TmJournalEntry,
+} from '@archon/core/db/taskmaster';
+import type { HeadroomReading } from './ledger';
+import type { LanePrRegistryDb } from '@archon/core/db/lane-pr-registry';
+import type {
+  TaskmasterDeps,
+  ListedThread,
+  GithubIssueEvidence,
+  AdoptionRefreshResult,
+} from './loop';
+import type { PrRepairQueuedMessage, PrRepairOwnerDeps } from './pr-repair-owner';
+import type { EscalationDeliveryDeps, EscalationIssueComment } from './escalation-delivery';
+import type { ActionProposal } from './rules';
+import type { TmExpectation, TmAdoptionRow, TmSuppressionRow } from '@archon/core/db/taskmaster';
+import type {
+  SeatUsageReader,
+  SeatReading,
+  SeatId,
 } from '@archon/workflows/reliability/seat-usage';
 
-// A synthetic exhausted response belongs to its test, never the next caller.
-beforeEach(resetGitHubApiMeterForTests);
-afterEach(resetGitHubApiMeterForTests);
-import {
+if (Reflect.get(globalThis, Symbol.for('bdc.pr-detection-isolated')) !== true) {
+  throw new Error('PR_DETECTION_ISOLATION_PRELOAD_REQUIRED');
+}
+const guardedConnection = await import('@archon/core/db/connection');
+const canonicalConnection = await import('../../../core/src/db/connection');
+if (
+  Reflect.get(guardedConnection, '__PR_DETECTION_GUARD__') !== true ||
+  Reflect.get(canonicalConnection, '__PR_DETECTION_GUARD__') !== true ||
+  guardedConnection.getDatabase !== canonicalConnection.getDatabase
+) {
+  throw new Error('PR_DETECTION_CONNECTION_GUARD_REQUIRED');
+}
+const { takeDeniedFallbacks } =
+  await import('../../../smart-cauldron/src/__tests__/pr-detection-isolation.preload');
+afterEach(() => expect(takeDeniedFallbacks()).toEqual([]));
+
+const { listWosWithMultipleLanePrs } = await import('@archon/core/db/lane-pr-registry');
+const { rootLogger } = await import('@archon/paths');
+const githubMeter = await import('@archon/core/github/metering');
+const { resetGitHubApiMeterForTests } = githubMeter;
+const { setSeatUsageReaderForTests, unknownSeatReading } =
+  await import('@archon/workflows/reliability/seat-usage');
+const fixtureSeatUsage: SeatUsageReader = async seats => {
+  const readings: Partial<Record<SeatId, SeatReading>> = {};
+  for (const seat of seats) readings[seat] = unknownSeatReading(seat, 'synthetic loop fixture');
+  return readings;
+};
+// Install before the loop graph and every test: native seat readers load auth
+// files before network, so denying fetch alone does not isolate these fixtures.
+setSeatUsageReaderForTests(fixtureSeatUsage);
+beforeEach(() => setSeatUsageReaderForTests(fixtureSeatUsage));
+afterEach(() => setSeatUsageReaderForTests(fixtureSeatUsage));
+const {
   createTaskmasterState,
+  createGhLaneFetcher,
+  createRealPrRepairOwnerDeps,
   defaultFindEffectByIdempotencyKey,
   defaultGetGithubIssueEvidence,
   defaultListThreads,
@@ -35,44 +87,24 @@ import {
   isPauseEffectsExempt,
   TM_REPEAT_REASON_BY_TYPE,
   isPostCutoverReceipt,
-  type TaskmasterDeps,
-  type ListedThread,
-  type GithubIssueEvidence,
-  type AdoptionRefreshResult,
-} from './loop';
-import { checkEvidence, checkExpectations } from './expectations';
-import {
-  TASKMASTER_ESCALATION_MARKER,
-  TASKMASTER_ESCALATION_COOLDOWN_MS,
-  type EscalationDeliveryDeps,
-  type EscalationIssueComment,
-} from './escalation-delivery';
-import type { DispatchDeliveryMode } from '@archon/core/db/dispatch';
-import { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } from './guard';
-import {
-  classifyThread,
-  computeNextAction,
-  MAX_INTERVENTIONS_PER_ITEM_24H,
-  NUDGE_CLOCK_MS,
-  type ActionProposal,
-} from './rules';
-import {
-  expectationRegistrationKey,
-  type TmExpectation,
-  type TmAdoptionRow,
-  type TmSuppressionRow,
-} from '@archon/core/db/taskmaster';
-import type { ThreadSnapshot } from './rules';
-import type {
-  TmActionOutcome,
-  TmActionType,
-  TmControlState,
-  TmGrade,
-  TmJournalEntry,
-} from '@archon/core/db/taskmaster';
-import type { HeadroomReading } from './ledger';
-import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
-import * as fireBudgetDb from '@archon/core/db/taskmaster';
+  digestProposal,
+} = await import('./loop');
+const { checkEvidence, checkExpectations } = await import('./expectations');
+const { runPrRepairOwner } = await import('./pr-repair-owner');
+const { TASKMASTER_ESCALATION_MARKER, TASKMASTER_ESCALATION_COOLDOWN_MS } =
+  await import('./escalation-delivery');
+const { validateProposal, TM_ALLOWED_ACTION_TYPES, TM_ALLOWED_RECIPIENTS } =
+  await import('./guard');
+const { classifyThread, computeNextAction, MAX_INTERVENTIONS_PER_ITEM_24H, NUDGE_CLOCK_MS } =
+  await import('./rules');
+const { expectationRegistrationKey } = await import('@archon/core/db/taskmaster');
+const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
+const fireBudgetDb = await import('@archon/core/db/taskmaster');
+type SqliteAdapter = InstanceType<typeof SqliteAdapter>;
+
+// Synthetic exhausted responses belong to one test.
+beforeEach(resetGitHubApiMeterForTests);
+afterEach(resetGitHubApiMeterForTests);
 
 describe('Taskmaster reset visibility and canary', () => {
   test('legacy_unverified receipts are never post-cutover evidence', () => {
@@ -517,6 +549,15 @@ function makeDeps(world: FakeWorld, overrides: Partial<TaskmasterDeps> = {}): Ta
       prOpened: false,
     }),
     getDispatchReceiptCutoverAt: async () => new Date(T0 - 86_400_000).toISOString(),
+    // A fake DAL must not fall through to the singleton operational database.
+    // Tests of lane health override this with their explicit fixture samples.
+    getHealthSample: async () => null,
+    getFireRunEvidence: async () => null,
+    checkFireEligibility: async () => ({ eligible: false, reason: 'fixture_no_automatic_fire' }),
+    runCascade: async () => {
+      throw new Error('unexpected fixture cascade');
+    },
+    escalationDelivery: makeIssueCommentSink(world).delivery,
     headroom: async () => okHeadroom,
     createTask: (async (
       _context: unknown,
@@ -1821,7 +1862,7 @@ describe('fire_cauldron loop', () => {
         ).toContain(`on ${testCase.lane} lane`);
       }
     } finally {
-      setSeatUsageReaderForTests(null);
+      setSeatUsageReaderForTests(fixtureSeatUsage);
       if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
     }
@@ -3856,6 +3897,24 @@ describe('interval env parsing', () => {
 });
 
 describe('defaultListThreads -- GitHub work-SOR read', () => {
+  // This group tests the real HTTP adapter over synthetic responses, not the
+  // shared quota database. Isolate persistence before its default DB argument
+  // can be evaluated; keep in-memory metering and response policy unchanged.
+  let restorePersistence = (): void => {};
+  beforeEach(() => {
+    const quota = spyOn(githubMeter, 'assertPersistedGitHubPoolAvailable').mockImplementation(
+      async (poolId, resources) => {
+        for (const resource of resources) githubMeter.assertGitHubPoolAvailable(poolId, resource);
+      }
+    );
+    const flush = spyOn(githubMeter, 'flushGitHubApiMeter').mockImplementation(async () => {});
+    restorePersistence = () => {
+      resetGitHubApiMeterForTests();
+      flush.mockRestore();
+      quota.mockRestore();
+    };
+  });
+  afterEach(() => restorePersistence());
   // Pin the repo list so an operator env var cannot skew the assertions.
   const priorRepos = process.env.TASKMASTER_GH_REPOS;
   process.env.TASKMASTER_GH_REPOS = 'thinmansoftware/bdc-harness';
@@ -4849,8 +4908,7 @@ describe('M-155 exception push (loop)', () => {
     // The map structure exists and every entry points at 'xo', so widening it
     // later is a data change rather than a code change.
     expect(Object.keys(OWNER_RECIPIENT_MAP).length).toBeGreaterThan(0);
-    const dbPath = join(import.meta.dir, `.test-taskmaster-principals-${Date.now()}.db`);
-    const principalDb = new SqliteAdapter(dbPath);
+    const principalDb = new SqliteAdapter(':memory:');
     try {
       for (const target of Object.values(OWNER_RECIPIENT_MAP)) {
         expect(TM_ALLOWED_RECIPIENTS).toContain(target);
@@ -4863,13 +4921,6 @@ describe('M-155 exception push (loop)', () => {
       }
     } finally {
       await principalDb.close();
-      for (const suffix of ['', '-wal', '-shm']) {
-        try {
-          unlinkSync(dbPath + suffix);
-        } catch {
-          // SQLite may not create sidecars for this read-only fixture.
-        }
-      }
     }
   });
 
@@ -5045,6 +5096,7 @@ describe('M-155 exception push (loop)', () => {
       'digest',
       'fire_cauldron',
       'blocker_report',
+      'pr_repair',
     ]);
     expect([...TM_ALLOWED_RECIPIENTS]).toEqual([
       'xo',
@@ -5908,4 +5960,494 @@ describe('blocker_report loop (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', 
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorFire;
     }
   });
+});
+
+describe('production repair-owner GitHub fetcher', () => {
+  test('propagates read failures rather than hiding an unresolved PR', async () => {
+    const fetcher = createGhLaneFetcher((async () => {
+      throw new Error('github_transient_failure');
+    }) as Parameters<typeof createGhLaneFetcher>[0]);
+    let caught: unknown;
+    try {
+      await fetcher('thinmansoftware', 'bdc-harness', 1120);
+    } catch (error) {
+      caught = error;
+    }
+    expect((caught as Error)?.message).toBe('github_transient_failure');
+  });
+
+  test('a throwing fetcher for one citation does not throw the owner tick', async () => {
+    const woId = 'WO-HARNESS-LOOP-ISO-01';
+    const { db, sqlite } = makeLoopRegistryDb();
+    sqlite.run(
+      `INSERT INTO remote_agent_workflow_runs
+         (id, workflow_name, status, started_at, completed_at, user_message)
+       VALUES ('run-loop-iso', 'bdc-feature-development', 'completed', ?, ?, ?)`,
+      ['2026-10-14T01:00:00Z', '2026-10-14T02:00:00Z', `WO_ID=${woId} --project bdc-xo`]
+    );
+    sqlite.run(
+      `INSERT INTO remote_agent_workflow_events
+         (id, workflow_run_id, event_type, step_index, step_name, data, created_at)
+       VALUES ('evt-loop-iso', 'run-loop-iso', 'node_completed', 0, 'implement', ?, ?)`,
+      [
+        JSON.stringify({
+          output: 'opened https://github.com/thinmansoftware/bdc-xo/pull/1120',
+        }),
+        '2026-10-14T01:00:00Z',
+      ]
+    );
+    let fetches = 0;
+    const fetcher = createGhLaneFetcher((async () => {
+      fetches += 1;
+      throw new Error('github_transient_failure');
+    }) as Parameters<typeof createGhLaneFetcher>[0]);
+    const exhausted: PrRepairQueuedMessage = {
+      id: 'ex-loop',
+      body: JSON.stringify({
+        kind: 'overseer_remediation_exhausted',
+        owner: 'thinmansoftware',
+        repo: 'shopops',
+        prNumber: 873,
+        headSha: 'sha-exhausted',
+        woId: 'WO-SHOPOPS-STRIPE-ORPHANED-INVOICE-ATTRIBUTION-01',
+        reason: 'attempt_cap',
+      }),
+      sender: 'overseer',
+      sender_principal_id: 'system:overseer',
+      recipient: 'taskmaster',
+      resolved_recipient: null,
+      status: 'queued',
+      addressed_at: null,
+      addressed_by: null,
+      route_disposition: null,
+      acknowledged_at: null,
+      acknowledged_by: null,
+    };
+    try {
+      const result = await runPrRepairOwner({
+        now: () => Date.parse('2026-10-14T12:00:00Z'),
+        fetchPr: fetcher,
+        canApplyEffect: async () => true,
+        listWosWithMultipleLanePrs: opts => listWosWithMultipleLanePrs({ ...opts, db }),
+        listLanePrsForWo: async () => [],
+        listQueuedTaskmasterMessages: async () => [exhausted],
+        acknowledgeRow: async () => undefined,
+        addressRow: async () => undefined,
+        closePr: async () => undefined,
+        hasRunningRunForWo: async () => false,
+        fireRepairCascade: async () => ({ cascadeId: 'unused', status: 'won' }),
+      });
+      expect(fetches).toBe(1);
+      expect(result.digestItems).toEqual([
+        'thinmansoftware/shopops#873 WO-SHOPOPS-STRIPE-ORPHANED-INVOICE-ATTRIBUTION-01 repair_owner_unresolved:attempt_cap',
+      ]);
+    } finally {
+      sqlite.close();
+    }
+  });
+});
+
+describe('PR repair owner shared effect contracts', () => {
+  function fixture(ids: string[]) {
+    const world = makeWorld();
+    const addressed = new Set<string>();
+    const acknowledged: string[] = [];
+    const queued = ids.map(
+      (id, index): PrRepairQueuedMessage => ({
+        id,
+        body: JSON.stringify({
+          kind: 'overseer_remediation_exhausted',
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          prNumber: index + 1,
+          headSha: `head-${id}`,
+          woId: `WO-REPAIR-NOTICE-${index + 10}`,
+          reason: 'attempt_cap',
+          buildLine: 'outside',
+        }),
+        sender: 'overseer',
+        sender_principal_id: 'system:overseer',
+        recipient: 'taskmaster',
+        resolved_recipient: null,
+        status: 'queued',
+        addressed_at: null,
+        addressed_by: null,
+        route_disposition: null,
+        acknowledged_at: null,
+        acknowledged_by: null,
+      })
+    );
+    const owner: PrRepairOwnerDeps = {
+      now: () => world.nowMs,
+      planEffects: true,
+      fetchPr: async () => null,
+      listWosWithMultipleLanePrs: async () => ({ groups: [], unresolved: [] }),
+      listLanePrsForWo: async () => [],
+      listQueuedTaskmasterMessages: async () => queued.filter(row => !addressed.has(row.id)),
+      acknowledgeRow: async id => {
+        acknowledged.push(id);
+      },
+      addressRow: async id => {
+        addressed.add(id);
+      },
+      closePr: async () => {
+        throw new Error('No closure planned');
+      },
+      hasRunningRunForWo: async () => false,
+      listOwnerIssues: async () => [],
+    };
+    const stored = new Map<string, { id: string; body: string; status: string }>();
+    const deps = makeDeps(world);
+    // Actual owner and actual tick execute; only external effects are faked.
+    Object.assign(deps, { prRepairOwnerDeps: owner });
+    deps.createTask = (async (_context, data) => {
+      const existing = stored.get(data.idempotency_key);
+      if (existing) return existing;
+      const message = { id: `stored-${stored.size + 1}`, body: data.body, status: 'queued' };
+      stored.set(data.idempotency_key, message);
+      world.sentMessages.push({
+        idempotency_key: data.idempotency_key,
+        recipient: data.recipient,
+        body: data.body,
+        createdAt: new Date(world.nowMs).toISOString(),
+      });
+      return message;
+    }) as TaskmasterDeps['createTask'];
+    return { world, owner, deps, queued, addressed, acknowledged, stored };
+  }
+
+  function duplicateGroup(h: ReturnType<typeof fixture>, count = 4) {
+    const woId = 'WO-REPAIR-DEDUPE-01';
+    const prs = Array.from({ length: count }, (_, index) => ({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: index + 1,
+      headRef: `feat/repair-${index + 1}`,
+      headSha: `sha-${index + 1}`,
+      state: 'OPEN' as 'OPEN' | 'CLOSED',
+      reviewDecision: 'CHANGES_REQUESTED',
+      createdAt: new Date(T0 - 10_000 + index).toISOString(),
+      runId: `run-${index + 1}`,
+      workflowName: 'bdc-feature-development-codex',
+    }));
+    const closed: number[] = [];
+    h.owner.listWosWithMultipleLanePrs = async () => ({
+      groups:
+        prs.filter(pr => pr.state === 'OPEN').length >= 2
+          ? [{ woId, prs: prs.map(pr => ({ ...pr })) }]
+          : [],
+      unresolved: [],
+    });
+    h.owner.fetchPr = async (_owner, _repo, number) => {
+      const pr = prs.find(pr => pr.prNumber === number);
+      return pr
+        ? {
+            number,
+            state: pr.state,
+            reviewDecision: pr.reviewDecision,
+            createdAt: pr.createdAt,
+            headRefName: pr.headRef,
+            headSha: pr.headSha,
+            headRepoFullName: 'thinmansoftware/bdc-harness',
+            baseRepoFullName: 'thinmansoftware/bdc-harness',
+            title: woId,
+            body: '',
+          }
+        : null;
+    };
+    h.owner.closePr = async ({ prNumber }) => {
+      closed.push(prNumber);
+      prs.find(pr => pr.prNumber === prNumber)!.state = 'CLOSED';
+    };
+    return { prs, closed };
+  }
+
+  test('three closes and an owner nudge share the last two tick slots and resume', async () => {
+    const h = fixture(['owner-notice']);
+    const { closed } = duplicateGroup(h);
+    const nudges: string[] = [];
+    h.owner.listOwnerIssues = async () => [
+      {
+        title: 'WO-REPAIR-NOTICE-10',
+        state: 'open',
+        labels: ['owner:major-build'],
+        ownerLogin: null,
+      },
+    ];
+    h.owner.createOwnerNudge = async input => {
+      nudges.push(input.recipient);
+      return { body: input.body };
+    };
+    h.deps.listUndeliveredRulings = async () =>
+      Array.from({ length: 8 }, (_, i) =>
+        ruling({ ref: `dispatch:ruling-${i}`, undeliveredRulingId: `ruling-${i}` })
+      );
+    h.deps.runCascade = (async () => {
+      throw new Error('Repair must not fire a cascade');
+    }) as TaskmasterDeps['runCascade'];
+    const state = createTaskmasterState(60_000);
+    const first = await tick(state, h.deps);
+    expect(first.effects).toBe(10);
+    expect(closed).toHaveLength(2);
+    expect(nudges).toEqual([]);
+    expect(
+      h.world.journal.filter(row => row.action_type === 'pr_repair' && row.outcome === 'sent')
+    ).toHaveLength(2);
+    expect(
+      h.world.journal.filter(row => row.action_type === 'pr_repair' && row.outcome === 'deferred')
+    ).toHaveLength(2);
+    h.world.nowMs += 60_000;
+    const second = await tick(state, h.deps);
+    expect(second.effects).toBe(3);
+    expect(closed).toHaveLength(3);
+    expect(nudges).toEqual(['major-build']);
+    expect(
+      h.world.journal.filter(row => row.action_type === 'pr_repair' && row.outcome === 'sent')
+    ).toHaveLength(4);
+  });
+
+  test('paused dedupe closes and owner nudges are journaled parked without effects', async () => {
+    const h = fixture(['owner-notice']);
+    const { closed } = duplicateGroup(h);
+    let nudges = 0;
+    h.owner.listOwnerIssues = async () => [
+      {
+        title: 'WO-REPAIR-NOTICE-10',
+        state: 'open',
+        labels: ['owner:major-build'],
+        ownerLogin: null,
+      },
+    ];
+    h.owner.createOwnerNudge = async () => {
+      nudges++;
+      return {};
+    };
+    h.world.control = { ...h.world.control, pause_state: 'SOFT_PAUSE', pause_scope: 'effects' };
+    const result = await tick(createTaskmasterState(60_000), h.deps);
+    expect(result.parked).toBe(4);
+    expect(closed).toEqual([]);
+    expect(nudges).toBe(0);
+    expect(
+      h.world.journal.filter(row => row.action_type === 'pr_repair' && row.outcome === 'parked')
+    ).toHaveLength(4);
+    expect(h.addressed.size).toBe(0);
+  });
+
+  for (const failure of ['eligibility', 'fetch-error'] as const) {
+    test(`apply-time ${failure} records the actual non-effect and preserves retry semantics`, async () => {
+      const h = fixture([]);
+      const { prs, closed } = duplicateGroup(h, 2);
+      const fetch = h.owner.fetchPr;
+      let failRead = false;
+      h.owner.fetchPr = async (...args) => {
+        if (failRead) throw new Error('synthetic GitHub read failure');
+        return fetch(...args);
+      };
+      h.deps.listUndeliveredRulings = async () => [ruling()];
+      const createTask = h.deps.createTask!;
+      h.deps.createTask = (async (...args) => {
+        if (args[1].idempotency_key.startsWith('tm:deliver_ruling:')) {
+          if (failure === 'eligibility') prs[0].reviewDecision = 'APPROVED';
+          else failRead = true;
+        }
+        return createTask(...args);
+      }) as TaskmasterDeps['createTask'];
+      const state = createTaskmasterState(60_000);
+      const first = await tick(state, h.deps);
+      expect(closed).toEqual([]);
+      expect(first.effects).toBe(2); // ruling + ordinary digest, no close
+      const repair = h.world.journal.find(row => row.action_type === 'pr_repair')!;
+      expect(repair.outcome).toBe(failure === 'eligibility' ? 'expired' : 'failed');
+      if (failure === 'eligibility')
+        expect(JSON.parse(repair.proposal_json).suppressed).toBe('pr_eligibility_changed');
+      else {
+        failRead = false;
+        h.world.nowMs += 60_000;
+        await tick(state, h.deps);
+        expect(closed).toEqual([1]);
+        expect(repair.outcome).toBe('sent');
+      }
+    });
+  }
+
+  test('a prior admitted notice cannot bypass a newly paused repair-delivery gate', async () => {
+    const h = fixture(['prior-admission']);
+    const create = h.deps.createTask!;
+    let failDigest = true;
+    h.deps.createTask = (async (...args) => {
+      if (failDigest) throw new Error('synthetic persistence failure');
+      return create(...args);
+    }) as TaskmasterDeps['createTask'];
+    const state = createTaskmasterState(60_000);
+    await tick(state, h.deps);
+    expect(h.addressed.size).toBe(0);
+    failDigest = false;
+    h.world.control = {
+      ...h.world.control,
+      pause_state: 'SOFT_PAUSE',
+      pause_scope: 'effects',
+      epoch: 1,
+    };
+    h.world.nowMs += 60_000;
+    await tick(state, h.deps);
+    expect(h.world.sentMessages.at(-1)?.body).not.toContain('repair_owner_unresolved');
+    expect(h.addressed.size).toBe(0);
+  });
+
+  test.each(['before_hash', 'thread_ref', 'action_type'] as const)(
+    'a mismatched SENT %s is not admission evidence',
+    async field => {
+      const h = fixture(['bad-admission']);
+      const create = h.deps.createTask!;
+      let fail = true;
+      h.deps.createTask = (async (...args) => {
+        if (fail) throw new Error('synthetic persistence failure');
+        return create(...args);
+      }) as TaskmasterDeps['createTask'];
+      const state = createTaskmasterState(60_000);
+      await tick(state, h.deps);
+      const row = h.world.journal.find(row => row.action_type === 'pr_repair')!;
+      Object.assign(row, { [field]: 'mismatched' });
+      fail = false;
+      h.world.nowMs += 60_000;
+      await tick(state, h.deps);
+      expect(h.world.sentMessages.at(-1)?.body).not.toContain('repair_owner_unresolved');
+      expect(h.addressed.size).toBe(0);
+    }
+  );
+
+  test('a paused repair notice cannot ride the exempt ordinary digest', async () => {
+    const h = fixture(['paused-notice']);
+    h.world.control = { ...h.world.control, pause_state: 'SOFT_PAUSE', pause_scope: 'effects' };
+    const result = await tick(createTaskmasterState(60_000), h.deps);
+    expect(result.parked).toBeGreaterThanOrEqual(1);
+    const digest = h.world.sentMessages.find(row => row.idempotency_key.startsWith('tm:digest:'));
+    expect(digest).toBeDefined();
+    expect(digest!.body).not.toContain('repair_owner_unresolved');
+    expect(h.addressed.size).toBe(0);
+    expect(h.acknowledged).toEqual([]);
+  });
+
+  test('repair item admission precedes actual daily digest rendering', async () => {
+    const h = fixture(['admitted-notice']);
+    const createTask = h.deps.createTask!;
+    h.deps.createTask = (async (...args) => {
+      if (args[1].idempotency_key.startsWith('tm:digest:')) {
+        expect(
+          h.world.journal.some(row => row.action_type === 'pr_repair' && row.outcome === 'sent')
+        ).toBe(true);
+        expect(args[1].body).toContain('repair_owner_unresolved');
+      }
+      return createTask(...args);
+    }) as TaskmasterDeps['createTask'];
+    const result = await tick(createTaskmasterState(60_000), h.deps);
+    expect(result.effects).toBe(2);
+    expect(h.addressed.has('admitted-notice')).toBe(true);
+  });
+
+  test('owner_effects_are_journaled_counted_and_budgeted', async () => {
+    const h = fixture(Array.from({ length: 12 }, (_, i) => `notice-${i}`));
+    const state = createTaskmasterState(60_000);
+    const first = await tick(state, h.deps);
+    expect(first.effects).toBe(MAX_EFFECTS_PER_TICK);
+    expect(
+      h.world.journal.filter(row => row.action_type === 'pr_repair' && row.outcome === 'sent')
+    ).toHaveLength(10);
+    expect(
+      h.world.journal.filter(row => row.action_type === 'pr_repair' && row.outcome === 'deferred')
+    ).toHaveLength(2);
+    expect(h.addressed.size).toBe(0);
+    h.world.nowMs += 60_000;
+    const second = await tick(state, h.deps);
+    expect(second.effects).toBe(3);
+    expect(h.addressed.size).toBe(12);
+    expect(h.world.journal.some(row => row.action_type === 'fire_cauldron')).toBe(false);
+  });
+
+  test('digest_retry_addresses_only_notices_in_the_persisted_body', async () => {
+    const h = fixture(['N1', 'N2', 'N3']);
+    const n3 = h.queued.pop()!;
+    let failOnce = true;
+    h.deps.db!.registerExpectation = async () => {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error('synthetic expectation failure after persistence');
+      }
+      return 'expectation';
+    };
+    const state = createTaskmasterState(60_000);
+    await tick(state, h.deps);
+    h.queued.push(n3);
+    h.world.nowMs += 60_000;
+    await tick(state, h.deps);
+    expect(h.addressed.has('N1')).toBe(true);
+    expect(h.addressed.has('N2')).toBe(true);
+    expect(h.addressed.has('N3')).toBe(false);
+    h.world.nowMs += 24 * 60 * 60_000;
+    await tick(state, h.deps);
+    expect(h.addressed.has('N3')).toBe(true);
+  });
+
+  test('rejected repair text never rides the ordinary digest', async () => {
+    const h = fixture(['rejected-notice']);
+    const data = JSON.parse(h.queued[0].body);
+    h.queued[0].body = JSON.stringify({ ...data, woId: null, reason: 'deploy production' });
+    // no_wo is canonicalized by the owner; use the validated PR slug to exercise content guard.
+    h.queued[0].body = JSON.stringify({ ...data, owner: 'deploy production' });
+    await tick(createTaskmasterState(60_000), h.deps);
+    expect(h.addressed.size).toBe(0);
+    expect(h.world.sentMessages.every(row => !row.body.includes('repair_owner_unresolved'))).toBe(
+      true
+    );
+  });
+});
+
+function makeLoopRegistryDb(): { db: LanePrRegistryDb; sqlite: Database } {
+  const sqlite = new Database(':memory:');
+  sqlite.run(
+    `CREATE TABLE remote_agent_workflow_runs (
+       id TEXT PRIMARY KEY,
+       workflow_name TEXT,
+       status TEXT,
+       started_at TEXT,
+       completed_at TEXT,
+       user_message TEXT
+     )`
+  );
+  sqlite.run(
+    `CREATE TABLE remote_agent_workflow_events (
+       id TEXT PRIMARY KEY,
+       workflow_run_id TEXT,
+       event_type TEXT,
+       step_index INTEGER,
+       step_name TEXT,
+       data TEXT,
+       created_at TEXT
+     )`
+  );
+  const db: LanePrRegistryDb = {
+    async query<T>(sql: string, params: unknown[] = []): Promise<{ rows: T[]; rowCount: number }> {
+      const translated = sql.replace(/\$\d+/g, '?');
+      const rows = sqlite.query(translated).all(...(params as never[])) as T[];
+      return { rows, rowCount: rows.length };
+    },
+  };
+  return { db, sqlite };
+}
+
+test('production repair-owner effect gate reads fresh pause and captured epoch', async () => {
+  let epoch = 5;
+  let pause_state: 'RUNNING' | 'PAUSED' = 'RUNNING';
+  let reads = 0;
+  const deps = createRealPrRepairOwnerDeps(T0, 5, async () => {
+    reads++;
+    return { epoch, pause_state } as never;
+  });
+  expect(await deps.canApplyEffect()).toBe(true);
+  pause_state = 'PAUSED';
+  expect(await deps.canApplyEffect()).toBe(false);
+  pause_state = 'RUNNING';
+  epoch = 6;
+  expect(await deps.canApplyEffect()).toBe(false);
+  expect(reads).toBe(3);
 });

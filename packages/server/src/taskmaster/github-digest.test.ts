@@ -31,8 +31,10 @@ describe('Test 7: GitHub quota digest', () => {
           ['app-y', ['merge_manager', 'taskmaster']],
           ['app-x', ['overseer']],
         ]),
-      }
+      },
+      ['thinmansoftware/bdc-xo#99 WO-REPAIR awaiting review']
     ).body;
+    expect(body).toContain('thinmansoftware/bdc-xo#99 WO-REPAIR awaiting review');
     expect(body).toContain('GitHub API last 24h by service: merge_manager');
     expect(body).toContain('app-y/core 900/15000');
     expect(body).toContain('GITHUB-QUOTA-LOW app-y/core (merge_manager, taskmaster)');

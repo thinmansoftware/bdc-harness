@@ -56,6 +56,7 @@ import {
   REMEDIATION_SENDER,
 } from './remediation-candidate';
 import type { RemediationEmitResult } from './remediation-candidate';
+import { attributeLanePr, type LanePrGithubInfo } from '@archon/core/db/lane-pr-registry';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
@@ -1194,6 +1195,140 @@ export function createRealSubmitDeps(
         ...(result.slot !== null ? { attempt: result.slot } : {}),
         ...(result.reason ? { reason: result.reason } : {}),
       };
+    },
+
+    /**
+     * Structural lane-repair proof: one targeted event-store read
+     * (attributeLanePr) plus one GitHub PR read. Returns {woId, headRef,
+     * workflowName} only when the LANE PR RULE proves this PR was built by the
+     * lane for that WO; null otherwise (a human PR, a fork, or the spec branch).
+     */
+    async resolveLaneRepairContext(input): Promise<{
+      laneRepair: { woId: string; headRef: string; workflowName: string } | null;
+      identity: { title: string; body: string; headRef: string; prUrl: string };
+    } | null> {
+      let identity: LanePrGithubInfo | null = null;
+      const fetchPr = async (
+        prOwner: string,
+        prRepo: string,
+        prNumber: number
+      ): Promise<LanePrGithubInfo | null> => {
+        try {
+          const pr = await octokit.pulls.get({
+            owner: prOwner,
+            repo: prRepo,
+            pull_number: prNumber,
+          });
+          const d = pr.data as typeof pr.data & {
+            body?: string | null;
+            head: { sha: string; ref?: string; repo?: { full_name?: string } };
+            base?: { sha: string; ref?: string; repo?: { full_name?: string } };
+          };
+          const stateRaw = d.merged
+            ? 'MERGED'
+            : (d.state ?? '').toUpperCase() === 'CLOSED'
+              ? 'CLOSED'
+              : (d.state ?? '').toUpperCase() === 'OPEN'
+                ? 'OPEN'
+                : null;
+          if (!stateRaw) return null;
+          identity = {
+            number: d.number,
+            state: stateRaw,
+            reviewDecision: null,
+            createdAt: d.created_at ?? '',
+            headRefName: d.head?.ref ?? '',
+            headSha: d.head?.sha ?? '',
+            headRepoFullName: d.head?.repo?.full_name ?? null,
+            baseRepoFullName: d.base?.repo?.full_name ?? '',
+            title: d.title ?? '',
+            body: d.body ?? '',
+          };
+          return identity;
+        } catch {
+          return null;
+        }
+      };
+      try {
+        // Outside-Cauldron PRs have no lane citations, but still need a bound
+        // identity for their owner handoff. Fetch once independently of proof.
+        const prIdentity = await fetchPr(input.owner, input.repo, input.prNumber);
+        const canonicalRepo = `${input.owner}/${input.repo}`.toLowerCase();
+        if (
+          prIdentity?.number !== input.prNumber ||
+          prIdentity.state !== 'OPEN' ||
+          prIdentity.headSha !== input.headSha ||
+          prIdentity.baseRepoFullName?.toLowerCase() !== canonicalRepo ||
+          prIdentity.headRepoFullName?.toLowerCase() !== canonicalRepo
+        )
+          return null;
+        const attribution = await attributeLanePr(
+          { owner: input.owner, repo: input.repo, prNumber: input.prNumber },
+          {
+            fetchPr: async (owner, repo, number) =>
+              owner === input.owner && repo === input.repo && number === input.prNumber
+                ? prIdentity
+                : null,
+          }
+        );
+        return {
+          laneRepair: attribution
+            ? {
+                woId: attribution.woId,
+                headRef: attribution.lane.headRef,
+                workflowName: attribution.lane.workflowName,
+              }
+            : null,
+          identity: {
+            title: prIdentity.title,
+            body: prIdentity.body,
+            headRef: prIdentity.headRefName,
+            prUrl: `https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`,
+          },
+        };
+      } catch {
+        return null;
+      }
+    },
+
+    /**
+     * One-per-PR exhausted/judgment hand-off to Taskmaster. Keyed
+     * overseer-remediation-exhausted:<owner>/<repo>#<N> (no head) so ON CONFLICT
+     * DO NOTHING makes it idempotent -- sent at most once per PR ever -- and it
+     * carries kind `overseer_remediation_exhausted` that Taskmaster's PR repair
+     * owner turns into a single Duty Officer digest line.
+     */
+    async emitRemediationExhausted(input): Promise<void> {
+      const slug = `${input.owner.toLowerCase()}/${input.repo.toLowerCase()}#${input.prNumber}`;
+      const key =
+        input.buildLine === 'outside'
+          ? `overseer-repair-to-owner:${slug}:${input.headSha}`
+          : `overseer-remediation-exhausted:${slug}`;
+      await (overrides.createReceiptMessage ?? dispatch.createAuthenticatedMessage)(
+        { kind: 'system', sender: REMEDIATION_SENDER },
+        {
+          correlation_id: key,
+          idempotency_key: key,
+          task_type: 'run_review',
+          recipient: REMEDIATION_RECIPIENT,
+          subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
+          repeat_reason: `lane-repair exhausted (${input.reason}) for ${slug}`,
+          body: JSON.stringify({
+            kind: 'overseer_remediation_exhausted',
+            owner: input.owner,
+            repo: input.repo,
+            prNumber: input.prNumber,
+            headSha: input.headSha,
+            headRef: input.headRef,
+            woId: input.woId,
+            prUrl: input.prUrl,
+            owningLane: input.owningLane,
+            buildLine: input.buildLine,
+            reason: input.reason,
+            lastVerdictSummary: input.lastVerdictSummary,
+          }),
+        }
+      );
     },
   };
 }
