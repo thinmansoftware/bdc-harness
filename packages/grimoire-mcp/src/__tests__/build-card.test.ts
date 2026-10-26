@@ -144,11 +144,15 @@ describe('card composition', () => {
   });
   test('9 request cap degrades without an eleventh request', async () => {
     const calls: string[] = [];
+    const getOnly = async <T>(method: string, path: string, response: () => T): Promise<T> => {
+      if (method !== 'GET') throw new Error(`Octokit fake rejects non-GET ${method} ${path}`);
+      calls.push(`${method} ${path}`);
+      return response();
+    };
     const client: any = {
       pulls: {
-        get: async () => {
-          calls.push('GET pull');
-          return {
+        get: async () =>
+          getOnly('GET', 'pull', () => ({
             data: {
               ...fixture,
               html_url: fixture.url,
@@ -156,18 +160,13 @@ describe('card composition', () => {
               base: { ref: 'dev' },
               user: { login: 'author' },
             },
-          };
-        },
-        listReviews: async () => {
-          calls.push('GET reviews');
-          return { data: Array.from({ length: 100 }, () => approved) };
-        },
+          })),
+        listReviews: async () =>
+          getOnly('GET', 'reviews', () => ({
+            data: Array.from({ length: 100 }, () => approved),
+          })),
       },
     };
-    const result = await readGitHub('thinmansoftware', 'bdc-harness', 1, client);
-    expect(calls).toHaveLength(10);
-    expect(calls.every(call => call.startsWith('GET '))).toBe(true);
-    expect(result.status).toContain('request cap exceeded');
 
     const statements: string[] = [];
     const database: any = {
@@ -178,12 +177,24 @@ describe('card composition', () => {
         return { rows: [] };
       },
     };
-    const events = await readEventStore(
-      { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1, headRef: 'repair/ref' },
-      database
-    );
-    expect(events).toEqual({ runs: [], status: 'ok' });
+    const card = await buildBlockedPrCard('thinmansoftware/bdc-harness#1', {
+      github: (owner, repo, number) => readGitHub(owner, repo, number, client),
+      eventStore: input => readEventStore(input, database),
+      taskmaster: async () => ({ recipient: null, status: 'ok' }),
+      now: () => new Date('2026-01-01T00:00:00Z'),
+    });
+
+    expect(calls).toHaveLength(10);
+    expect(calls.every(call => call.startsWith('GET '))).toBe(true);
+    expect(card.sources.github).toContain('request cap exceeded');
+    expect(card.sources.event_store).toBe('ok');
+    expect(card.blocker_class).not.toBe('merge_ready');
+    expect(card.cauldron_runs).toEqual([]);
     expect(statements).toHaveLength(1);
     expect(statements[0]?.toUpperCase().startsWith('SELECT')).toBe(true);
+
+    await expect(getOnly('POST', 'pulls/1/merge', () => ({ data: {} }))).rejects.toThrow(
+      'Octokit fake rejects non-GET'
+    );
   });
 });
