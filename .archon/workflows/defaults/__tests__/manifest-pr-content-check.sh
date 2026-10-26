@@ -2,7 +2,7 @@
 # manifest-pr-content-check.sh -- T1 fixture for PR-file vs manifest claim check
 # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
 #
-# Scoped to the 10 lanes with manifest-consistency-check.
+# Scoped to the 12 lanes with manifest-consistency-check.
 # Run: bash .archon/workflows/defaults/__tests__/manifest-pr-content-check.sh
 
 set -uo pipefail
@@ -36,11 +36,15 @@ assert_nonzero() {
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$DEFAULTS_DIR/../../.." && pwd)"
+export BDC_PR_FILES_HELPER="$REPO_ROOT/scripts/gh-pr-files.sh"
 
 MCC_SISTER=(
   bdc-feature-development.yaml
+  bdc-feature-development-astra.yaml
   bdc-feature-development-codex.yaml
   bdc-feature-development-codex-only.yaml
+  bdc-feature-development-cursor.yaml
   bdc-feature-development-fusion-cx-qwen.yaml
   bdc-feature-development-zero.yaml
   bdc-feature-development-zero-open.yaml
@@ -58,7 +62,7 @@ extract_pr_block() {
   ' "$1" | sed 's/^      //'
 }
 
-echo "--- Parity: 10 manifest-pr-content-check blocks byte-identical ---"
+echo "--- Parity: 12 manifest-pr-content-check blocks byte-identical ---"
 REF=""
 REF_NAME=""
 for f in "${MCC_SISTER[@]}"; do
@@ -96,23 +100,11 @@ run_pr_check() {
   local script bin out code
   script=$(mktemp)
   bin=$(mktemp -d)
-  # stub gh
-  cat > "$bin/gh" <<EOF
-#!/usr/bin/env bash
-# minimal gh stub for pr view --json files
-if printf '%s\n' "\$*" | grep -q -- '--json files'; then
-  # emit paths one per line like jq '.files[].path'
-  printf '%s\n' '$pr_files_payload'
-  exit 0
-fi
-echo "gh stub: unexpected args: \$*" >&2
-exit 1
-EOF
-  # Fix: pr_files_payload may have newlines - use a file instead
-  rm -f "$bin/gh"
   cat > "$bin/gh" <<'GHEOF'
 #!/usr/bin/env bash
-if printf '%s\n' "$*" | grep -q -- '--json files'; then
+if [ "$#" -eq 5 ] && [ "$1" = "api" ] && [ "$2" = "--paginate" ] &&
+   printf '%s\n' "$3" | grep -Eq '^repos/[^/]+/[^/]+/pulls/[0-9]+/files$' &&
+   [ "$4" = "--jq" ] && [ "$5" = ".[].filename" ]; then
   cat "$GH_PR_FILES_FIXTURE"
   exit 0
 fi
@@ -230,6 +222,51 @@ if printf '%s\n' "$OUT" | grep -q '^OK$'; then
 else
   FAIL=$((FAIL + 1))
   echo "FAIL: 'no files' leaked as a claimed path or otherwise tripped the check"
+  echo "$OUT"
+fi
+
+echo "--- Test: 156 claimed paths all present -> OK ---"
+PR_FILES_156=""
+CLAIMS_156=""
+i=1
+while [ "$i" -le 156 ]; do
+  path=$(printf 'src/large-pr/file-%03d.ts' "$i")
+  PR_FILES_156="${PR_FILES_156}${path}"$'\n'
+  if [ -n "$CLAIMS_156" ]; then
+    CLAIMS_156="${CLAIMS_156}, "
+  fi
+  CLAIMS_156="${CLAIMS_156}${path}"
+  i=$((i + 1))
+done
+PR_FILES_156=${PR_FILES_156%$'\n'}
+MANIFEST=$(printf 'Files created: %s\nFiles modified: none\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/908' "$CLAIMS_156")
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/908" "$MANIFEST" "$PR_FILES_156")
+CODE=$?
+set -e
+if [ "$CODE" -eq 0 ] && printf '%s\n' "$OUT" | grep -q '^OK$'; then
+  PASS=$((PASS + 1))
+  echo "PASS: over_100_files_all_claimed_passes"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: over_100_files_all_claimed_passes"
+  echo "$OUT"
+fi
+
+echo "--- Test: claimed path beyond position 100 missing -> fail ---"
+MISSING_PATH="src/large-pr/file-156.ts"
+PR_FILES_155=$(printf '%s\n' "$PR_FILES_156" | sed '$d')
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/908" "$MANIFEST" "$PR_FILES_155")
+CODE=$?
+set -e
+if [ "$CODE" -ne 0 ] && printf '%s\n' "$OUT" | grep -q 'PR_CONTENT_ERROR' &&
+   printf '%s\n' "$OUT" | grep -Fq "$MISSING_PATH"; then
+  PASS=$((PASS + 1))
+  echo "PASS: over_100_files_one_missing_fails"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: over_100_files_one_missing_fails"
   echo "$OUT"
 fi
 
