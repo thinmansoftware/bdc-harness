@@ -115,12 +115,16 @@ describe('repair-target lane wiring', () => {
     expect(rtwRef).toContain('RTW_RUNS_DB');
     expect(rtwRef).toContain('RTW_MIN_AGE_SECONDS');
     expect(rtwRef).toContain('RTW_PROC_ROOT');
+    expect(rtwRef).toContain('flock');
+    expect(rtwRef).toContain('archon-worktree-ownership');
     for (const file of EXPECTED_LANES) {
       const yaml = readLane(file);
       expect(yaml.split('# ---- BEGIN rtw core').length - 1, file).toBe(1);
       expect(yaml.split('# ---- BEGIN rta core').length - 1, file).toBe(1);
       expect(rawCore(yaml, 'rtw'), file).toBe(rtwRef);
       expect(rawCore(yaml, 'rta'), file).toBe(rtaRef);
+      expect(rawCore(yaml, 'rtw'), file).toContain('flock');
+      expect(rawCore(yaml, 'rtw'), file).toContain('archon-worktree-ownership');
       const commit = nodeOf(nodesOf(file), 'commit-and-push', file);
       expect(commit.bash ?? '', file).toContain('rta_plan_authorizes');
       expect(commit.bash ?? '', file).toContain('PLAN_REVIEW_RAW');

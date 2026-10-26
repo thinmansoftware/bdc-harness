@@ -5,9 +5,18 @@
  */
 import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { createHash } from 'node:crypto';
+// Distinct specifier so mock.module('@archon/git') does not alias this module.
+// Pointing the mock back at its own export recurses.
+import {
+  acquireWorktreeOwnershipLock as realAcquireWorktreeOwnershipLock,
+  isWorktreeOwnershipLockHeldByThisProcess as realIsWorktreeOwnershipLockHeld,
+  releaseWorktreeOwnershipLock as realReleaseWorktreeOwnershipLock,
+  WorktreeOwnershipLockBusyError,
+} from '../../git/src/worktree-ownership-lock.ts?unmocked';
 
 // --- Mock logger ---
 const mockLogFn = mock(() => {});
@@ -33,11 +42,25 @@ mock.module('@archon/paths', () => ({
 // --- Mock git ---
 const mockGetRemoteUrl = mock(async (): Promise<string | null> => null);
 const mockExecFileAsync = mock(async () => ({ stdout: '', stderr: '' }));
+const ownershipLockTest: {
+  acquire: (worktreePath: string) => Promise<void>;
+  release: (worktreePath: string) => Promise<void>;
+  isHeld: (worktreePath: string) => Promise<boolean>;
+} = {
+  acquire: async () => {},
+  release: async () => {},
+  isHeld: async () => false,
+};
 mock.module('@archon/git', () => ({
   execFileAsync: mockExecFileAsync,
   getDefaultBranch: mock(async () => 'main'),
   getRemoteUrl: mockGetRemoteUrl,
   toRepoPath: mock((p: string) => p),
+  acquireWorktreeOwnershipLock: (worktreePath: string) => ownershipLockTest.acquire(worktreePath),
+  releaseWorktreeOwnershipLock: (worktreePath: string) => ownershipLockTest.release(worktreePath),
+  isWorktreeOwnershipLockHeldByThisProcess: (worktreePath: string) =>
+    ownershipLockTest.isHeld(worktreePath),
+  WorktreeOwnershipLockBusyError,
 }));
 
 // --- Mock dag-executor ---
@@ -73,6 +96,12 @@ import { markEngineDarkIfZeroUsage, resetEngineAvailabilityForTests } from './en
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import type { WorkflowDefinition, WorkflowRun } from './schemas';
+
+beforeEach(() => {
+  ownershipLockTest.acquire = async () => {};
+  ownershipLockTest.release = async () => {};
+  ownershipLockTest.isHeld = async () => false;
+});
 
 // --- Helpers ---
 
@@ -143,6 +172,79 @@ function makeRun(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
     started_at: new Date().toISOString(),
     metadata: {},
     ...overrides,
+  };
+}
+
+function runGit(cwd: string, args: string[]): void {
+  const result = Bun.spawnSync(['git', ...args], {
+    cwd,
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'Test',
+      GIT_AUTHOR_EMAIL: 'test@test.com',
+      GIT_COMMITTER_NAME: 'Test',
+      GIT_COMMITTER_EMAIL: 'test@test.com',
+    },
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`git ${args.join(' ')} failed: ${result.stderr.toString()}`);
+  }
+}
+
+async function makeLockWorktree(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), 'exec-lock-'));
+  const main = join(root, 'main');
+  const worktree = join(root, 'wt');
+  await mkdir(main, { recursive: true });
+  runGit(root, ['init', '-b', 'main', main]);
+  runGit(main, ['config', 'user.email', 'test@test.com']);
+  runGit(main, ['config', 'user.name', 'Test']);
+  await writeFile(join(main, 'README.md'), 'init\n');
+  runGit(main, ['add', 'README.md']);
+  runGit(main, ['commit', '-m', 'init']);
+  runGit(main, ['worktree', 'add', '-b', 'feat', worktree]);
+  return worktree;
+}
+
+async function holdOwnershipLock(worktreePath: string): Promise<{ release: () => Promise<void> }> {
+  const modulePath = join(import.meta.dir, '..', '..', 'git', 'src', 'worktree-ownership-lock.ts');
+  const readyPath = `${worktreePath}.lock-ready`;
+  const script = `
+    const mod = await import(${JSON.stringify(modulePath)});
+    const fs = await import('node:fs');
+    await mod.acquireWorktreeOwnershipLock(process.argv[1]);
+    fs.writeFileSync(process.argv[2], 'HELD\\n');
+    const chunks = [];
+    for await (const chunk of process.stdin) chunks.push(chunk);
+    await mod.releaseWorktreeOwnershipLock(process.argv[1]);
+  `;
+  const proc = Bun.spawn(['bun', '-e', script, worktreePath, readyPath], {
+    stdin: 'pipe',
+    stdout: 'ignore',
+    stderr: 'ignore',
+  });
+  const deadline = Date.now() + 10000;
+  while (!existsSync(readyPath)) {
+    if (proc.exitCode !== null) {
+      throw new Error(`lock holder exited ${proc.exitCode} before ready`);
+    }
+    if (Date.now() > deadline) {
+      proc.kill();
+      await proc.exited;
+      throw new Error('lock holder failed to start');
+    }
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+  return {
+    release: async (): Promise<void> => {
+      proc.stdin.end();
+      const code = await proc.exited;
+      if (code !== 0) {
+        throw new Error(`lock holder exited ${code}`);
+      }
+    },
   };
 }
 
@@ -381,6 +483,104 @@ describe('executeWorkflow', () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain('already active');
     });
+
+    it.skipIf(process.platform === 'win32')(
+      'cancels and skips the DAG when another process holds the ownership lock',
+      async () => {
+        const worktree = await makeLockWorktree();
+        const holder = await holdOwnershipLock(worktree);
+        ownershipLockTest.acquire = realAcquireWorktreeOwnershipLock;
+        ownershipLockTest.release = realReleaseWorktreeOwnershipLock;
+        ownershipLockTest.isHeld = realIsWorktreeOwnershipLockHeld;
+        const updateSpy = mock(async () => {});
+        const sendMessageSpy = mock(async () => {});
+        const store = makeStore({
+          createWorkflowRun: mock(async () => makeRun({ id: 'self-run-lock' })),
+          updateWorkflowRun: updateSpy,
+        });
+        const platform = {
+          sendMessage: sendMessageSpy,
+          getPlatformType: mock(() => 'test' as const),
+        } as unknown as IWorkflowPlatform;
+        try {
+          const result = await executeWorkflow(
+            makeDeps(store),
+            platform,
+            'conv-1',
+            worktree,
+            makeWorkflow(),
+            'test message',
+            'db-conv-1'
+          );
+          expect(result.success).toBe(false);
+          expect(result.error).toContain('ownership lock held');
+          expect(result.error).toContain('already active');
+          expect(updateSpy).toHaveBeenCalledWith('self-run-lock', { status: 'cancelled' });
+          expect(sendMessageSpy).toHaveBeenCalled();
+          const sentMessage = (sendMessageSpy.mock.calls[0] as [string, string])[1];
+          expect(sentMessage).toContain('This worktree is in use');
+          expect(sentMessage).toContain('/workflow status');
+          expect(sentMessage).toContain('--branch');
+          expect(mockExecuteDagWorkflow).not.toHaveBeenCalled();
+        } finally {
+          await holder.release();
+          await rm(dirname(worktree), { recursive: true, force: true });
+        }
+      }
+    );
+
+    it('treats a same-process hold as the run lease and releases it once', async () => {
+      let acquired = 0;
+      let released = 0;
+      ownershipLockTest.isHeld = async () => true;
+      ownershipLockTest.acquire = async () => {
+        acquired += 1;
+      };
+      ownershipLockTest.release = async () => {
+        released += 1;
+      };
+      const result = await executeWorkflow(
+        makeDeps(),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1'
+      );
+      expect(result.workflowRunId).toBe('run-123');
+      expect(mockExecuteDagWorkflow).toHaveBeenCalled();
+      expect(acquired).toBe(0);
+      expect(released).toBe(1);
+    });
+
+    it.skipIf(process.platform === 'win32')(
+      'releases an ownership lock acquired for the run so another process can take it',
+      async () => {
+        const worktree = await makeLockWorktree();
+        ownershipLockTest.acquire = realAcquireWorktreeOwnershipLock;
+        ownershipLockTest.release = realReleaseWorktreeOwnershipLock;
+        ownershipLockTest.isHeld = realIsWorktreeOwnershipLockHeld;
+        try {
+          const result = await executeWorkflow(
+            makeDeps(),
+            makePlatform(),
+            'conv-1',
+            worktree,
+            makeWorkflow(),
+            'test message',
+            'db-conv-1'
+          );
+          expect(result.success).toBe(true);
+          expect(mockExecuteDagWorkflow).toHaveBeenCalled();
+          expect(await realIsWorktreeOwnershipLockHeld(worktree)).toBe(false);
+          await realAcquireWorktreeOwnershipLock(worktree);
+          await realReleaseWorktreeOwnershipLock(worktree);
+        } finally {
+          await rm(dirname(worktree), { recursive: true, force: true });
+        }
+      }
+    );
   });
 
   describe('run authority', () => {

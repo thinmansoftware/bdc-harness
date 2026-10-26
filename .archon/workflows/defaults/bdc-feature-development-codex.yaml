@@ -219,9 +219,19 @@ nodes:
       # Then remove that worktree once and retry the checkout once. Anything else is
       # refused. Never removes any other worktree. Env overrides: RTW_RUNS_DB
       # (default /.archon/archon.db), RTW_MIN_AGE_SECONDS (default 600), RTW_PROC_ROOT
-      # (default /proc).
+      # (default /proc). The shared ownership lock
+      # <git-common-dir>/archon-worktree-ownership/<sha256 of the canonical holder>.lock
+      # is taken after the self-worktree refusal and held through backup, removal,
+      # and checkout. A busy lock is refused with "ownership lock held".
+      rtw_close_ownership_lock() {
+        if [ -n "${rtw_lock_fd:-}" ]; then
+          exec {rtw_lock_fd}>&-
+          rtw_lock_fd=""
+        fi
+      }
       rtw_refuse() {
         printf 'repair_target_branch_held: %s is checked out by %s; not reclaimed: %s\n' "$branch" "$holder" "$1"
+        rtw_close_ownership_lock
         rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
         return 1
       }
@@ -234,6 +244,8 @@ nodes:
         local holder_sha="" holder_sha_after="" backup_ref="" sha7="" stamp="" id8=""
         local row_id="" row_status="" row_completed="" row_epoch="" now_epoch="" row_age=0
         local resolved="" cwdlink=""
+        local rtw_holder_canon="" rtw_common_raw="" rtw_common="" rtw_lock_dir=""
+        local rtw_digest="" rtw_lock_path="" rtw_lock_fd=""
         err_file=$(mktemp)
         rtw_query=$(mktemp)
         rtw_db_out=$(mktemp)
@@ -260,6 +272,22 @@ nodes:
         rtw_top=$(git rev-parse --show-toplevel)
         if [ "$holder" = "$rtw_top" ]; then
           rtw_refuse "holder is this worktree" || return
+        fi
+        rtw_holder_canon=$(readlink -f "$holder")
+        rtw_common_raw=$(git -C "$rtw_holder_canon" rev-parse --git-common-dir)
+        case "$rtw_common_raw" in
+          /*) rtw_common=$rtw_common_raw ;;
+          *) rtw_common=$(readlink -f "${rtw_holder_canon}/${rtw_common_raw}") ;;
+        esac
+        rtw_lock_dir="${rtw_common}/archon-worktree-ownership"
+        mkdir -p "$rtw_lock_dir"
+        rtw_digest=$(printf '%s' "$rtw_holder_canon" | sha256sum | awk '{print $1}')
+        rtw_lock_path="${rtw_lock_dir}/${rtw_digest}.lock"
+        exec {rtw_lock_fd}>>"$rtw_lock_path"
+        if ! flock -n "$rtw_lock_fd"; then
+          exec {rtw_lock_fd}>&-
+          rtw_lock_fd=""
+          rtw_refuse "ownership lock held" || return
         fi
         rtw_db="${RTW_RUNS_DB:-/.archon/archon.db}"
         min_age="${RTW_MIN_AGE_SECONDS:-600}"
@@ -385,11 +413,13 @@ nodes:
           printf 'backup_branch: %s\n' "$backup_ref"
         fi
         if git checkout -B "$branch" FETCH_HEAD 2>"$err_file"; then
+          rtw_close_ownership_lock
           rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
           return 0
         else
           retry_code=$?
           cat "$err_file" >&2
+          rtw_close_ownership_lock
           rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
           return "$retry_code"
         fi

@@ -15,6 +15,8 @@ import {
   toBranchName,
   isAncestorOf,
   verifyWorktreeOwnership,
+  isWorktreeOwnershipLockHeldByThisProcess,
+  releaseWorktreeOwnershipLock,
 } from '@archon/git';
 import type { RepoPath, BranchName, WorktreePath } from '@archon/git';
 
@@ -36,6 +38,18 @@ let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('isolation.resolver');
   return cachedLog;
+}
+
+async function releaseProviderOwnershipLease(worktreePath: string): Promise<void> {
+  try {
+    if (await isWorktreeOwnershipLockHeldByThisProcess(worktreePath)) {
+      await releaseWorktreeOwnershipLock(worktreePath);
+    }
+  } catch (error) {
+    const err = error as NodeJS.ErrnoException;
+    if (err.code === 'ENOENT') return;
+    getLog().error({ err, worktreePath }, 'isolation.ownership_lock_release_failed');
+  }
 }
 
 /**
@@ -545,6 +559,8 @@ export class IsolationResolver {
           },
           'isolation_orphan_cleanup_failed'
         );
+      } finally {
+        await releaseProviderOwnershipLease(isolatedEnv.workingPath);
       }
 
       throw err; // Re-throw original store error -- this is an unexpected failure

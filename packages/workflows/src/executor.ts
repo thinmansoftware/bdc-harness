@@ -7,7 +7,16 @@ import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps, WorkflowConfig } from './deps';
 import * as archonPaths from '@archon/paths';
 import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/paths';
-import { execFileAsync, getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
+import {
+  execFileAsync,
+  getDefaultBranch,
+  getRemoteUrl,
+  toRepoPath,
+  acquireWorktreeOwnershipLock,
+  releaseWorktreeOwnershipLock,
+  isWorktreeOwnershipLockHeldByThisProcess,
+  WorktreeOwnershipLockBusyError,
+} from '@archon/git';
 import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from './schemas';
 import { executeDagWorkflow } from './dag-executor';
 import { resolveModelForNode, type ModelOverride } from './model-override';
@@ -814,6 +823,12 @@ export async function executeWorkflow(
   // older-wins tiebreaker. The query treats `pending` rows older than 5 min
   // as orphaned, so leaks from crashed dispatches or resume orphans don't
   // permanently block the path.
+  //
+  // After the database check, the same checkout takes the shared ownership
+  // lock used by worktree adoption and repair-target reclaim. A hold already
+  // taken in this process (provider create/adopt) is this run's lease and is
+  // released once when the run leaves the executor.
+  let releaseOwnershipLease = false;
   if (workflow.mutates_checkout !== false) {
     try {
       const activeWorkflow = await deps.store.getActiveWorkflowRunByPath(cwd, {
@@ -897,282 +912,65 @@ export async function executeWorkflow(
       );
       return { success: false, error: 'Database error checking for active workflow' };
     }
-  }
 
-  // Rule 28: target_repo pre-flight guard (anchor: 2026-05-16 cross-repo incident).
-  // Verifies the worktree's git origin matches the workflow's declared target_repo
-  // before any nodes run. Fails fast with a dag_workflow_failed event on mismatch.
-  if (workflow.target_repo) {
-    let actualRemote: string | null = null;
-    try {
-      actualRemote = await getRemoteUrl(toRepoPath(cwd));
-    } catch (err) {
-      getLog().warn(
-        { err, cwd, targetRepo: workflow.target_repo },
-        'workflow.target_repo_remote_check_failed'
-      );
-    }
-    const normalizedActual = actualRemote ? normalizeRemoteToOwnerRepo(actualRemote) : null;
-    const normalizedExpected = workflow.target_repo.toLowerCase();
-    if (normalizedActual !== normalizedExpected) {
-      const reason = `target_repo_mismatch: expected ${normalizedExpected}, got ${normalizedActual ?? '(no remote)'}`;
-      await deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'dag_workflow_failed',
-          data: {
-            reason: 'target_repo_mismatch',
-            expected: normalizedExpected,
-            actual: normalizedActual,
-          },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'dag_workflow_failed' },
-            'workflow_event_persist_failed'
+    const ownershipHeld = await isWorktreeOwnershipLockHeldByThisProcess(cwd);
+    if (!ownershipHeld) {
+      try {
+        await acquireWorktreeOwnershipLock(cwd);
+      } catch (error) {
+        if (error instanceof WorktreeOwnershipLockBusyError) {
+          await deps.store
+            .updateWorkflowRun(workflowRun.id, { status: 'cancelled' })
+            .catch((cleanupErr: Error) => {
+              getLog().warn(
+                { err: cleanupErr, workflowRunId: workflowRun?.id, cwd },
+                'workflow.guard_self_cancel_failed'
+              );
+            });
+          await sendCriticalMessage(
+            platform,
+            conversationId,
+            '[ ] **This worktree is in use** (ownership lock held).\n' +
+              '- Wait for it to finish: `/workflow status`\n' +
+              '- Use a different branch: `--branch <other>`'
           );
-        });
-      await deps.store.failWorkflowRun(workflowRun.id, reason);
-      await sendCriticalMessage(
-        platform,
-        conversationId,
-        `**Workflow blocked**: \`${workflow.name}\` declares \`target_repo: ${workflow.target_repo}\` but this worktree's origin points at \`${actualRemote ?? '(no remote)'}\`.\n\nSelect the correct codebase (\`${workflow.target_repo}\`) and retry.`
-      );
-      return { success: false, workflowRunId: workflowRun.id, error: reason };
+          return {
+            success: false,
+            error: 'Workflow already active on this path (ownership lock held)',
+          };
+        }
+        throw error;
+      }
     }
+    releaseOwnershipLease = true;
   }
 
-  // Resolve external artifact and log directories
-  const { artifactsDir, logDir } = await resolveProjectPaths(deps, cwd, workflowRun.id, codebaseId);
-
-  // Pre-create the artifacts directory so commands can write to it immediately
   try {
-    await mkdir(artifactsDir, { recursive: true });
-  } catch (error) {
-    const err = error as NodeJS.ErrnoException;
-    getLog().error(
-      { err, artifactsDir, workflowRunId: workflowRun.id },
-      'workflow.artifacts_dir_create_failed'
-    );
-    await deps.store
-      .failWorkflowRun(workflowRun.id, `Artifacts directory creation failed: ${err.message}`)
-      .catch((dbErr: Error) => {
-        getLog().error(
-          { err: dbErr, workflowRunId: workflowRun.id },
-          'workflow.artifacts_dir_fail_db_record_failed'
-        );
-      });
-    await sendCriticalMessage(
-      platform,
-      conversationId,
-      `[ ] **Workflow failed**: Could not create artifacts directory \`${artifactsDir}\`: ${err.message}`
-    );
-    return {
-      success: false,
-      workflowRunId: workflowRun.id,
-      error: `Artifacts directory creation failed: ${err.message}`,
-    };
-  }
-  getLog().debug({ artifactsDir, logDir }, 'workflow_paths_resolved');
-
-  // Wrap execution in try-catch to ensure workflow is marked as failed on any error
-  try {
-    if (workflow.run_authority?.required) {
-      let effectiveAuthoritySource = authoritySource;
-      const existingAuthority = effectiveAuthoritySource
-        ? null
-        : await deps.store.getRunAuthority(workflowRun.id);
-      if (!effectiveAuthoritySource && !existingAuthority) {
-        if (!deps.freezeWorkOrderSource) {
-          throw new Error('scope_authority_missing: frozen dispatch source');
-        }
-        const frozen = await deps.freezeWorkOrderSource(workflow.run_authority, userMessage);
-        effectiveAuthoritySource = { ...frozen, dispatchId: conversationId };
-      }
-      if (effectiveAuthoritySource) {
-        // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): the WO's
-        // declared "Base branch:" overrides the auto-detected repo default so the
-        // pinned authority triple (base_branch/base_sha/run_scope_sha) AND the
-        // BASE_BRANCH env threaded to every downstream node describe ONE lane. The
-        // worktree was already allocated from origin/<declared> at dispatch, so the
-        // remote-tracking ref exists locally; captureRunAuthorityInput validates it
-        // when it resolves refs/remotes/origin/<baseBranch>.
-        const declaredBase = parseDeclaredBaseBranch(effectiveAuthoritySource.specBytes);
-        if (declaredBase && declaredBase !== baseBranch) {
-          getLog().info(
-            { runId: workflowRun.id, declaredBase, previousBaseBranch: baseBranch },
-            'workflow.base_branch_authority_override'
-          );
-          baseBranch = declaredBase;
-        }
-        const authorityInput = await captureRunAuthorityInput(
-          cwd,
-          workflow,
-          workflowRun,
-          codebaseId,
-          baseBranch,
-          effectiveAuthoritySource
-        );
-        await persistRunAuthority(deps.store, artifactsDir, authorityInput);
-      } else {
-        if (!existingAuthority) {
-          throw new Error('scope_authority_missing: frozen dispatch source');
-        }
-        if (
-          existingAuthority.workflowName !== workflow.name ||
-          existingAuthority.codebaseId !== codebaseId ||
-          resolve(existingAuthority.worktreePath) !== resolve(cwd)
-        ) {
-          throw new Error(`authority_conflict: run ${workflowRun.id}`);
-        }
-        // Resume path (WO-HARNESS-BASE-LANE-AUTHORITY-01): on any resume of a
-        // run-authority-required workflow (workflow resume/approve/reject,
-        // foreground_resume_detected) no authoritySource is passed, so the
-        // fresh-dispatch override above never runs. Rehydrate baseBranch from
-        // the persisted authority so the BASE_BRANCH threaded to every
-        // downstream node describes the SAME single lane the run was pinned to
-        // at dispatch -- not the stale/empty value getDefaultBranch(cwd) or
-        // config.baseBranch produced at load time (empty when cwd is a worktree
-        // whose repo default differs, or not a git repo at all).
-        if (existingAuthority.baseBranch && existingAuthority.baseBranch !== baseBranch) {
-          getLog().info(
-            {
-              runId: workflowRun.id,
-              persistedBaseBranch: existingAuthority.baseBranch,
-              previousBaseBranch: baseBranch,
-            },
-            'workflow.base_branch_authority_rehydrated'
-          );
-          baseBranch = existingAuthority.baseBranch;
-        }
-      }
-    }
-
-    // BDC patch: load policyFile if specified and inject as systemPrompt for all prompt nodes.
-    const executableWorkflow = await applyWorkflowPolicyFile(workflow, cwd);
-
-    const probeDecision = await runFireTimeProbe(deps, {
-      workflow: executableWorkflow,
-      workflowProvider: writtenProvider,
-      workflowModel: resolvedModel,
-      config,
-      cwd,
-      source: 'fire_probe',
-      allowFireReprobeClear: true,
-      modelOverride,
-    });
-    for (const warning of probeDecision.warnings) {
-      if (!warning.ok) {
-        await pageCanaryTelegram(
-          renderCanaryProbeWarn({
-            workflowName: executableWorkflow.name,
-            providerId: warning.binding.providerId,
-            modelId: warning.binding.modelId,
-            errorClass: warning.classification.errorClass,
-          }),
-          {
-            workflowName: executableWorkflow.name,
-            providerId: warning.binding.providerId,
-            modelId: warning.binding.modelId,
-            errorClass: warning.classification.errorClass,
-          }
-        );
+    // Rule 28: target_repo pre-flight guard (anchor: 2026-05-16 cross-repo incident).
+    // Verifies the worktree's git origin matches the workflow's declared target_repo
+    // before any nodes run. Fails fast with a dag_workflow_failed event on mismatch.
+    if (workflow.target_repo) {
+      let actualRemote: string | null = null;
+      try {
+        actualRemote = await getRemoteUrl(toRepoPath(cwd));
+      } catch (err) {
         getLog().warn(
-          {
-            workflowName: executableWorkflow.name,
-            providerId: warning.binding.providerId,
-            modelId: warning.binding.modelId,
-            errorClass: warning.classification.errorClass,
-            httpStatus: warning.classification.httpStatus,
-          },
-          'workflow.canary_probe_warn'
+          { err, cwd, targetRepo: workflow.target_repo },
+          'workflow.target_repo_remote_check_failed'
         );
       }
-    }
-    if (probeDecision.blocked) {
-      const reason = formatProbeBlock(probeDecision);
-      if (probeDecision.blockedResult && !probeDecision.blockedResult.ok) {
-        await pageCanaryTelegram(
-          renderCanaryProbeRed({
-            workflowName: executableWorkflow.name,
-            providerId: probeDecision.blockedResult.binding.providerId,
-            modelId: probeDecision.blockedResult.binding.modelId,
-            errorClass: probeDecision.blockedResult.classification.errorClass,
-          }),
-          {
-            workflowName: executableWorkflow.name,
-            providerId: probeDecision.blockedResult.binding.providerId,
-            modelId: probeDecision.blockedResult.binding.modelId,
-            errorClass: probeDecision.blockedResult.classification.errorClass,
-          }
-        );
-      }
-      await deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'dag_workflow_failed',
-          data: {
-            reason: 'canary_probe_blocked',
-            detail: reason,
-          },
-        })
-        .catch((err: Error) => {
-          getLog().error(
-            { err, workflowRunId: workflowRun.id, eventType: 'dag_workflow_failed' },
-            'workflow_event_persist_failed'
-          );
-        });
-      await deps.store.failWorkflowRun(workflowRun.id, reason);
-      await sendCriticalMessage(platform, conversationId, `[ ] **Workflow blocked**: ${reason}`);
-      return { success: false, workflowRunId: workflowRun.id, error: reason };
-    }
-
-    // Seat gate: always on (John Ranson, 2026-09-24). There is no off switch.
-    const seatIds = seatsForBindings(probeDecision.bindings);
-    if (seatIds.length > 0) {
-      const readings = await readBoundSeats(seatIds);
-      const cutoff = getSeatCutoff();
-      const seatDecision = decideSeatGate(probeDecision.bindings, readings, cutoff.percent);
-      // UNKNOWN never refuses on its own (a broken probe must not stop all
-      // work), and it is never silent either: log + alert for every bound
-      // seat that could not be measured, regardless of whether ANOTHER seat
-      // in this same run causes a refusal below.
-      for (const seat of seatDecision.unknownSeats) {
-        const note = readings[seat]?.note ?? 'UNKNOWN';
-        getLog().warn(
-          {
-            workflowName: executableWorkflow.name,
-            workflowRunId: workflowRun.id,
-            seat,
-            note,
-          },
-          'workflow.seat_usage_unknown'
-        );
-        await alertUnknownSeat(seat, note, {
-          workflowName: executableWorkflow.name,
-          workflowRunId: workflowRun.id,
-        });
-      }
-      if (seatDecision.refused) {
-        const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}`;
-        getLog().warn(
-          {
-            workflowName: executableWorkflow.name,
-            workflowRunId: workflowRun.id,
-            seat: seatDecision.seat,
-            window: seatDecision.window,
-            usedPercent: seatDecision.usedPercent,
-            cutoffPercent: seatDecision.cutoffPercent,
-          },
-          'workflow.seat_usage_refused'
-        );
+      const normalizedActual = actualRemote ? normalizeRemoteToOwnerRepo(actualRemote) : null;
+      const normalizedExpected = workflow.target_repo.toLowerCase();
+      if (normalizedActual !== normalizedExpected) {
+        const reason = `target_repo_mismatch: expected ${normalizedExpected}, got ${normalizedActual ?? '(no remote)'}`;
         await deps.store
           .createWorkflowEvent({
             workflow_run_id: workflowRun.id,
             event_type: 'dag_workflow_failed',
             data: {
-              reason: 'seat_usage_refused',
-              detail,
+              reason: 'target_repo_mismatch',
+              expected: normalizedExpected,
+              actual: normalizedActual,
             },
           })
           .catch((err: Error) => {
@@ -1181,265 +979,529 @@ export async function executeWorkflow(
               'workflow_event_persist_failed'
             );
           });
-        await deps.store.failWorkflowRun(workflowRun.id, detail);
+        await deps.store.failWorkflowRun(workflowRun.id, reason);
         await sendCriticalMessage(
           platform,
           conversationId,
-          `Workflow refused: seat ${seatDecision.seat} at ${String(seatDecision.usedPercent)}% of ${seatDecision.window} (cutoff ${String(seatDecision.cutoffPercent)}%)`
+          `**Workflow blocked**: \`${workflow.name}\` declares \`target_repo: ${workflow.target_repo}\` but this worktree's origin points at \`${actualRemote ?? '(no remote)'}\`.\n\nSelect the correct codebase (\`${workflow.target_repo}\`) and retry.`
         );
-        return { success: false, workflowRunId: workflowRun.id, error: detail };
+        return { success: false, workflowRunId: workflowRun.id, error: reason };
       }
     }
 
-    getLog().info(
-      {
-        workflowName: executableWorkflow.name,
-        workflowRunId: workflowRun.id,
-        hasIssueContext: !!issueContext,
-        issueContextLength: issueContext?.length ?? 0,
-      },
-      'workflow_starting'
-    );
-    await logWorkflowStart(logDir, workflowRun.id, executableWorkflow.name, userMessage);
-
-    // Register run with emitter and emit workflow_started
-    const emitter = getWorkflowEventEmitter();
-    emitter.registerRun(workflowRun.id, conversationId);
-
-    emitter.emit({
-      type: 'workflow_started',
-      runId: workflowRun.id,
-      workflowName: executableWorkflow.name,
-      conversationId: conversationDbId,
-    });
-
-    // Fire-and-forget anonymous usage telemetry. No PII: only workflow name +
-    // description (authored by the user in their YAML) + platform + version.
-    // Opt out via ARCHON_TELEMETRY_DISABLED=1 or DO_NOT_TRACK=1.
-    captureWorkflowInvoked({
-      workflowName: executableWorkflow.name,
-      workflowDescription: executableWorkflow.description,
-      platform: platform.getPlatformType(),
-      archonVersion: BUNDLED_VERSION,
-    });
-    deps.store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRun.id,
-        event_type: 'workflow_started',
-        data: { workflowName: executableWorkflow.name },
-      })
-      .catch((err: Error) => {
-        getLog().error(
-          { err, workflowRunId: workflowRun.id, eventType: 'workflow_started' },
-          'workflow_event_persist_failed'
-        );
-      });
-
-    // Set status to running now that execution has started (skip for resumed runs -- already running)
-    if (!dagPriorCompletedNodes) {
-      try {
-        await deps.store.updateWorkflowRun(workflowRun.id, { status: 'running' });
-      } catch (dbError) {
-        getLog().error(
-          { err: dbError as Error, workflowRunId: workflowRun.id },
-          'db_workflow_status_update_failed'
-        );
-        await sendCriticalMessage(
-          platform,
-          conversationId,
-          'Workflow blocked: Unable to update status. Please try again.'
-        );
-        return { success: false, error: 'Database error setting workflow to running' };
-      }
-    }
-
-    // Context for error logging
-    const workflowContext: SendMessageContext = {
-      workflowId: workflowRun.id,
-    };
-
-    // Build startup message
-    let startupMessage = '';
-
-    // Add isolation context to startup message
-    if (isolationContext) {
-      const { isPrReview, prSha, prBranch, branchName } = isolationContext;
-
-      if (isPrReview && prSha && prBranch) {
-        startupMessage += `Reviewing PR at commit \`${prSha.substring(0, 7)}\` (branch: \`${prBranch}\`)\n\n`;
-      } else if (branchName) {
-        const repoName = cwd.split(/[/\\]/).pop() || 'repository';
-        await sendCriticalMessage(
-          platform,
-          conversationId,
-          ` ${repoName} @ \`${branchName}\``,
-          workflowContext,
-          2,
-          { category: 'isolation_context', segment: 'new' }
-        );
-      } else {
-        getLog().warn(
-          {
-            workflowId: workflowRun.id,
-            hasFields: {
-              isPrReview: !!isPrReview,
-              prSha: !!prSha,
-              prBranch: !!prBranch,
-              branchName: !!branchName,
-            },
-          },
-          'isolation_context_incomplete'
-        );
-      }
-    }
-
-    // Add workflow start message (step details omitted from text notification)
-    // Strip routing metadata from description (Use when:, Handles:, NOT for:, Capability:, Triggers:)
-    const cleanDescription = (executableWorkflow.description ?? '')
-      .split('\n')
-      .filter(
-        line =>
-          !/^\s*(Use when|Handles|NOT for|Capability|Triggers)[:\s]/i.test(line) && line.trim()
-      )
-      .join('\n')
-      .trim();
-    const descriptionText = cleanDescription || executableWorkflow.name;
-    startupMessage += ` **Starting workflow**: \`${executableWorkflow.name}\`\n\n> ${descriptionText}`;
-
-    // Send consolidated message - use critical send with limited retries (1 retry max)
-    // to avoid blocking workflow execution while still catching transient failures
-    const startupSent = await sendCriticalMessage(
-      platform,
-      conversationId,
-      startupMessage,
-      workflowContext,
-      2, // maxRetries=2 means 2 total attempts (1 initial + 1 retry), 1s max delay
-      { category: 'workflow_status', segment: 'new' }
-    );
-    if (!startupSent) {
-      getLog().error(
-        { workflowId: workflowRun.id, conversationId },
-        'startup_message_delivery_failed'
-      );
-      // Continue anyway - workflow is already recorded in database
-    }
-
-    // Execute the DAG workflow
-    const dagSummary = await executeDagWorkflow(
+    // Resolve external artifact and log directories
+    const { artifactsDir, logDir } = await resolveProjectPaths(
       deps,
-      platform,
-      conversationId,
       cwd,
-      executableWorkflow,
-      workflowRun,
-      writtenProvider,
-      resolvedModel,
-      artifactsDir,
-      logDir,
-      baseBranch,
-      docsDir,
-      config,
-      configuredCommandFolder,
-      issueContext,
-      dagPriorCompletedNodes,
-      modelOverride
+      workflowRun.id,
+      codebaseId
     );
 
-    // executeDagWorkflow throws on fatal errors; check DB status for result
-    const finalStatus = await deps.store.getWorkflowRun(workflowRun.id);
-    if (finalStatus?.status === 'completed') {
-      return { success: true, workflowRunId: workflowRun.id, summary: dagSummary };
-    } else if (finalStatus?.status === 'paused') {
-      return { success: true, paused: true, workflowRunId: workflowRun.id };
-    } else {
+    // Pre-create the artifacts directory so commands can write to it immediately
+    try {
+      await mkdir(artifactsDir, { recursive: true });
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      getLog().error(
+        { err, artifactsDir, workflowRunId: workflowRun.id },
+        'workflow.artifacts_dir_create_failed'
+      );
+      await deps.store
+        .failWorkflowRun(workflowRun.id, `Artifacts directory creation failed: ${err.message}`)
+        .catch((dbErr: Error) => {
+          getLog().error(
+            { err: dbErr, workflowRunId: workflowRun.id },
+            'workflow.artifacts_dir_fail_db_record_failed'
+          );
+        });
+      await sendCriticalMessage(
+        platform,
+        conversationId,
+        `[ ] **Workflow failed**: Could not create artifacts directory \`${artifactsDir}\`: ${err.message}`
+      );
       return {
         success: false,
         workflowRunId: workflowRun.id,
-        error: 'Workflow did not complete successfully',
+        error: `Artifacts directory creation failed: ${err.message}`,
       };
     }
-  } catch (error) {
-    // Top-level error handler: ensure workflow is marked as failed
-    const err = error as Error;
-    getLog().error(
-      { err, workflowName: workflow.name, workflowId: workflowRun.id },
-      'workflow_execution_unhandled_error'
-    );
+    getLog().debug({ artifactsDir, logDir }, 'workflow_paths_resolved');
 
-    // Record failure in database (non-blocking - log but don't re-throw on DB error)
+    // Wrap execution in try-catch to ensure workflow is marked as failed on any error
     try {
-      await deps.store.failWorkflowRun(workflowRun.id, err.message);
-    } catch (dbError) {
-      getLog().error(
-        { err: dbError as Error, workflowId: workflowRun.id, originalError: err.message },
-        'db_record_failure_failed'
-      );
-    }
+      if (workflow.run_authority?.required) {
+        let effectiveAuthoritySource = authoritySource;
+        const existingAuthority = effectiveAuthoritySource
+          ? null
+          : await deps.store.getRunAuthority(workflowRun.id);
+        if (!effectiveAuthoritySource && !existingAuthority) {
+          if (!deps.freezeWorkOrderSource) {
+            throw new Error('scope_authority_missing: frozen dispatch source');
+          }
+          const frozen = await deps.freezeWorkOrderSource(workflow.run_authority, userMessage);
+          effectiveAuthoritySource = { ...frozen, dispatchId: conversationId };
+        }
+        if (effectiveAuthoritySource) {
+          // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): the WO's
+          // declared "Base branch:" overrides the auto-detected repo default so the
+          // pinned authority triple (base_branch/base_sha/run_scope_sha) AND the
+          // BASE_BRANCH env threaded to every downstream node describe ONE lane. The
+          // worktree was already allocated from origin/<declared> at dispatch, so the
+          // remote-tracking ref exists locally; captureRunAuthorityInput validates it
+          // when it resolves refs/remotes/origin/<baseBranch>.
+          const declaredBase = parseDeclaredBaseBranch(effectiveAuthoritySource.specBytes);
+          if (declaredBase && declaredBase !== baseBranch) {
+            getLog().info(
+              { runId: workflowRun.id, declaredBase, previousBaseBranch: baseBranch },
+              'workflow.base_branch_authority_override'
+            );
+            baseBranch = declaredBase;
+          }
+          const authorityInput = await captureRunAuthorityInput(
+            cwd,
+            workflow,
+            workflowRun,
+            codebaseId,
+            baseBranch,
+            effectiveAuthoritySource
+          );
+          await persistRunAuthority(deps.store, artifactsDir, authorityInput);
+        } else {
+          if (!existingAuthority) {
+            throw new Error('scope_authority_missing: frozen dispatch source');
+          }
+          if (
+            existingAuthority.workflowName !== workflow.name ||
+            existingAuthority.codebaseId !== codebaseId ||
+            resolve(existingAuthority.worktreePath) !== resolve(cwd)
+          ) {
+            throw new Error(`authority_conflict: run ${workflowRun.id}`);
+          }
+          // Resume path (WO-HARNESS-BASE-LANE-AUTHORITY-01): on any resume of a
+          // run-authority-required workflow (workflow resume/approve/reject,
+          // foreground_resume_detected) no authoritySource is passed, so the
+          // fresh-dispatch override above never runs. Rehydrate baseBranch from
+          // the persisted authority so the BASE_BRANCH threaded to every
+          // downstream node describes the SAME single lane the run was pinned to
+          // at dispatch -- not the stale/empty value getDefaultBranch(cwd) or
+          // config.baseBranch produced at load time (empty when cwd is a worktree
+          // whose repo default differs, or not a git repo at all).
+          if (existingAuthority.baseBranch && existingAuthority.baseBranch !== baseBranch) {
+            getLog().info(
+              {
+                runId: workflowRun.id,
+                persistedBaseBranch: existingAuthority.baseBranch,
+                previousBaseBranch: baseBranch,
+              },
+              'workflow.base_branch_authority_rehydrated'
+            );
+            baseBranch = existingAuthority.baseBranch;
+          }
+        }
+      }
 
-    // Log to file (separate from database - non-blocking)
-    try {
-      await logWorkflowError(logDir, workflowRun.id, err.message);
-    } catch (logError) {
-      getLog().error(
-        { err: logError as Error, workflowId: workflowRun.id },
-        'workflow_error_log_write_failed'
-      );
-    }
+      // BDC patch: load policyFile if specified and inject as systemPrompt for all prompt nodes.
+      const executableWorkflow = await applyWorkflowPolicyFile(workflow, cwd);
 
-    // Emit workflow_failed event
-    const emitter = getWorkflowEventEmitter();
-    emitter.emit({
-      type: 'workflow_failed',
-      runId: workflowRun.id,
-      workflowName: workflow.name,
-      error: err.message,
-    });
-    deps.store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRun.id,
-        event_type: 'workflow_failed',
-        data: { error: err.message },
-      })
-      .catch((err: Error) => {
+      const probeDecision = await runFireTimeProbe(deps, {
+        workflow: executableWorkflow,
+        workflowProvider: writtenProvider,
+        workflowModel: resolvedModel,
+        config,
+        cwd,
+        source: 'fire_probe',
+        allowFireReprobeClear: true,
+        modelOverride,
+      });
+      for (const warning of probeDecision.warnings) {
+        if (!warning.ok) {
+          await pageCanaryTelegram(
+            renderCanaryProbeWarn({
+              workflowName: executableWorkflow.name,
+              providerId: warning.binding.providerId,
+              modelId: warning.binding.modelId,
+              errorClass: warning.classification.errorClass,
+            }),
+            {
+              workflowName: executableWorkflow.name,
+              providerId: warning.binding.providerId,
+              modelId: warning.binding.modelId,
+              errorClass: warning.classification.errorClass,
+            }
+          );
+          getLog().warn(
+            {
+              workflowName: executableWorkflow.name,
+              providerId: warning.binding.providerId,
+              modelId: warning.binding.modelId,
+              errorClass: warning.classification.errorClass,
+              httpStatus: warning.classification.httpStatus,
+            },
+            'workflow.canary_probe_warn'
+          );
+        }
+      }
+      if (probeDecision.blocked) {
+        const reason = formatProbeBlock(probeDecision);
+        if (probeDecision.blockedResult && !probeDecision.blockedResult.ok) {
+          await pageCanaryTelegram(
+            renderCanaryProbeRed({
+              workflowName: executableWorkflow.name,
+              providerId: probeDecision.blockedResult.binding.providerId,
+              modelId: probeDecision.blockedResult.binding.modelId,
+              errorClass: probeDecision.blockedResult.classification.errorClass,
+            }),
+            {
+              workflowName: executableWorkflow.name,
+              providerId: probeDecision.blockedResult.binding.providerId,
+              modelId: probeDecision.blockedResult.binding.modelId,
+              errorClass: probeDecision.blockedResult.classification.errorClass,
+            }
+          );
+        }
+        await deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'dag_workflow_failed',
+            data: {
+              reason: 'canary_probe_blocked',
+              detail: reason,
+            },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'dag_workflow_failed' },
+              'workflow_event_persist_failed'
+            );
+          });
+        await deps.store.failWorkflowRun(workflowRun.id, reason);
+        await sendCriticalMessage(platform, conversationId, `[ ] **Workflow blocked**: ${reason}`);
+        return { success: false, workflowRunId: workflowRun.id, error: reason };
+      }
+
+      // Seat gate: always on (John Ranson, 2026-09-24). There is no off switch.
+      const seatIds = seatsForBindings(probeDecision.bindings);
+      if (seatIds.length > 0) {
+        const readings = await readBoundSeats(seatIds);
+        const cutoff = getSeatCutoff();
+        const seatDecision = decideSeatGate(probeDecision.bindings, readings, cutoff.percent);
+        // UNKNOWN never refuses on its own (a broken probe must not stop all
+        // work), and it is never silent either: log + alert for every bound
+        // seat that could not be measured, regardless of whether ANOTHER seat
+        // in this same run causes a refusal below.
+        for (const seat of seatDecision.unknownSeats) {
+          const note = readings[seat]?.note ?? 'UNKNOWN';
+          getLog().warn(
+            {
+              workflowName: executableWorkflow.name,
+              workflowRunId: workflowRun.id,
+              seat,
+              note,
+            },
+            'workflow.seat_usage_unknown'
+          );
+          await alertUnknownSeat(seat, note, {
+            workflowName: executableWorkflow.name,
+            workflowRunId: workflowRun.id,
+          });
+        }
+        if (seatDecision.refused) {
+          const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}`;
+          getLog().warn(
+            {
+              workflowName: executableWorkflow.name,
+              workflowRunId: workflowRun.id,
+              seat: seatDecision.seat,
+              window: seatDecision.window,
+              usedPercent: seatDecision.usedPercent,
+              cutoffPercent: seatDecision.cutoffPercent,
+            },
+            'workflow.seat_usage_refused'
+          );
+          await deps.store
+            .createWorkflowEvent({
+              workflow_run_id: workflowRun.id,
+              event_type: 'dag_workflow_failed',
+              data: {
+                reason: 'seat_usage_refused',
+                detail,
+              },
+            })
+            .catch((err: Error) => {
+              getLog().error(
+                { err, workflowRunId: workflowRun.id, eventType: 'dag_workflow_failed' },
+                'workflow_event_persist_failed'
+              );
+            });
+          await deps.store.failWorkflowRun(workflowRun.id, detail);
+          await sendCriticalMessage(
+            platform,
+            conversationId,
+            `Workflow refused: seat ${seatDecision.seat} at ${String(seatDecision.usedPercent)}% of ${seatDecision.window} (cutoff ${String(seatDecision.cutoffPercent)}%)`
+          );
+          return { success: false, workflowRunId: workflowRun.id, error: detail };
+        }
+      }
+
+      getLog().info(
+        {
+          workflowName: executableWorkflow.name,
+          workflowRunId: workflowRun.id,
+          hasIssueContext: !!issueContext,
+          issueContextLength: issueContext?.length ?? 0,
+        },
+        'workflow_starting'
+      );
+      await logWorkflowStart(logDir, workflowRun.id, executableWorkflow.name, userMessage);
+
+      // Register run with emitter and emit workflow_started
+      const emitter = getWorkflowEventEmitter();
+      emitter.registerRun(workflowRun.id, conversationId);
+
+      emitter.emit({
+        type: 'workflow_started',
+        runId: workflowRun.id,
+        workflowName: executableWorkflow.name,
+        conversationId: conversationDbId,
+      });
+
+      // Fire-and-forget anonymous usage telemetry. No PII: only workflow name +
+      // description (authored by the user in their YAML) + platform + version.
+      // Opt out via ARCHON_TELEMETRY_DISABLED=1 or DO_NOT_TRACK=1.
+      captureWorkflowInvoked({
+        workflowName: executableWorkflow.name,
+        workflowDescription: executableWorkflow.description,
+        platform: platform.getPlatformType(),
+        archonVersion: BUNDLED_VERSION,
+      });
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'workflow_started',
+          data: { workflowName: executableWorkflow.name },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'workflow_started' },
+            'workflow_event_persist_failed'
+          );
+        });
+
+      // Set status to running now that execution has started (skip for resumed runs -- already running)
+      if (!dagPriorCompletedNodes) {
+        try {
+          await deps.store.updateWorkflowRun(workflowRun.id, { status: 'running' });
+        } catch (dbError) {
+          getLog().error(
+            { err: dbError as Error, workflowRunId: workflowRun.id },
+            'db_workflow_status_update_failed'
+          );
+          await sendCriticalMessage(
+            platform,
+            conversationId,
+            'Workflow blocked: Unable to update status. Please try again.'
+          );
+          return { success: false, error: 'Database error setting workflow to running' };
+        }
+      }
+
+      // Context for error logging
+      const workflowContext: SendMessageContext = {
+        workflowId: workflowRun.id,
+      };
+
+      // Build startup message
+      let startupMessage = '';
+
+      // Add isolation context to startup message
+      if (isolationContext) {
+        const { isPrReview, prSha, prBranch, branchName } = isolationContext;
+
+        if (isPrReview && prSha && prBranch) {
+          startupMessage += `Reviewing PR at commit \`${prSha.substring(0, 7)}\` (branch: \`${prBranch}\`)\n\n`;
+        } else if (branchName) {
+          const repoName = cwd.split(/[/\\]/).pop() || 'repository';
+          await sendCriticalMessage(
+            platform,
+            conversationId,
+            ` ${repoName} @ \`${branchName}\``,
+            workflowContext,
+            2,
+            { category: 'isolation_context', segment: 'new' }
+          );
+        } else {
+          getLog().warn(
+            {
+              workflowId: workflowRun.id,
+              hasFields: {
+                isPrReview: !!isPrReview,
+                prSha: !!prSha,
+                prBranch: !!prBranch,
+                branchName: !!branchName,
+              },
+            },
+            'isolation_context_incomplete'
+          );
+        }
+      }
+
+      // Add workflow start message (step details omitted from text notification)
+      // Strip routing metadata from description (Use when:, Handles:, NOT for:, Capability:, Triggers:)
+      const cleanDescription = (executableWorkflow.description ?? '')
+        .split('\n')
+        .filter(
+          line =>
+            !/^\s*(Use when|Handles|NOT for|Capability|Triggers)[:\s]/i.test(line) && line.trim()
+        )
+        .join('\n')
+        .trim();
+      const descriptionText = cleanDescription || executableWorkflow.name;
+      startupMessage += ` **Starting workflow**: \`${executableWorkflow.name}\`\n\n> ${descriptionText}`;
+
+      // Send consolidated message - use critical send with limited retries (1 retry max)
+      // to avoid blocking workflow execution while still catching transient failures
+      const startupSent = await sendCriticalMessage(
+        platform,
+        conversationId,
+        startupMessage,
+        workflowContext,
+        2, // maxRetries=2 means 2 total attempts (1 initial + 1 retry), 1s max delay
+        { category: 'workflow_status', segment: 'new' }
+      );
+      if (!startupSent) {
         getLog().error(
-          { err, workflowRunId: workflowRun.id, eventType: 'workflow_failed' },
-          'workflow_event_persist_failed'
+          { workflowId: workflowRun.id, conversationId },
+          'startup_message_delivery_failed'
+        );
+        // Continue anyway - workflow is already recorded in database
+      }
+
+      // Execute the DAG workflow
+      const dagSummary = await executeDagWorkflow(
+        deps,
+        platform,
+        conversationId,
+        cwd,
+        executableWorkflow,
+        workflowRun,
+        writtenProvider,
+        resolvedModel,
+        artifactsDir,
+        logDir,
+        baseBranch,
+        docsDir,
+        config,
+        configuredCommandFolder,
+        issueContext,
+        dagPriorCompletedNodes,
+        modelOverride
+      );
+
+      // executeDagWorkflow throws on fatal errors; check DB status for result
+      const finalStatus = await deps.store.getWorkflowRun(workflowRun.id);
+      if (finalStatus?.status === 'completed') {
+        return { success: true, workflowRunId: workflowRun.id, summary: dagSummary };
+      } else if (finalStatus?.status === 'paused') {
+        return { success: true, paused: true, workflowRunId: workflowRun.id };
+      } else {
+        return {
+          success: false,
+          workflowRunId: workflowRun.id,
+          error: 'Workflow did not complete successfully',
+        };
+      }
+    } catch (error) {
+      // Top-level error handler: ensure workflow is marked as failed
+      const err = error as Error;
+      getLog().error(
+        { err, workflowName: workflow.name, workflowId: workflowRun.id },
+        'workflow_execution_unhandled_error'
+      );
+
+      // Record failure in database (non-blocking - log but don't re-throw on DB error)
+      try {
+        await deps.store.failWorkflowRun(workflowRun.id, err.message);
+      } catch (dbError) {
+        getLog().error(
+          { err: dbError as Error, workflowId: workflowRun.id, originalError: err.message },
+          'db_record_failure_failed'
+        );
+      }
+
+      // Log to file (separate from database - non-blocking)
+      try {
+        await logWorkflowError(logDir, workflowRun.id, err.message);
+      } catch (logError) {
+        getLog().error(
+          { err: logError as Error, workflowId: workflowRun.id },
+          'workflow_error_log_write_failed'
+        );
+      }
+
+      // Emit workflow_failed event
+      const emitter = getWorkflowEventEmitter();
+      emitter.emit({
+        type: 'workflow_failed',
+        runId: workflowRun.id,
+        workflowName: workflow.name,
+        error: err.message,
+      });
+      deps.store
+        .createWorkflowEvent({
+          workflow_run_id: workflowRun.id,
+          event_type: 'workflow_failed',
+          data: { error: err.message },
+        })
+        .catch((err: Error) => {
+          getLog().error(
+            { err, workflowRunId: workflowRun.id, eventType: 'workflow_failed' },
+            'workflow_event_persist_failed'
+          );
+        });
+      emitter.unregisterRun(workflowRun.id);
+
+      // Notify user about the failure
+      const delivered = await sendCriticalMessage(
+        platform,
+        conversationId,
+        `[ ] **Workflow failed**: ${err.message}`
+      );
+      if (!delivered) {
+        getLog().error(
+          { workflowId: workflowRun.id, originalError: err.message },
+          'user_failure_notification_failed'
+        );
+      }
+      // Return failure result instead of re-throwing
+      return { success: false, workflowRunId: workflowRun.id, error: err.message };
+    } finally {
+      // Defensive backstop: if the workflow run is still 'running' after all
+      // normal and exceptional code paths, flip it to 'failed' to prevent zombie
+      // accumulation. Guards against any future code path that exits without
+      // calling failWorkflowRun (e.g. a generator cleanup that exits without
+      // throwing). Only fires when the process stays alive long enough to run
+      // this finally -- see #1561 for the originating zombie-state incident.
+      if (workflowRun) {
+        const runId = workflowRun.id;
+        const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
+        if (backstopStatus === 'running') {
+          getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
+          await deps.store
+            .failWorkflowRun(runId, 'Workflow exited without finalizing -- see logs')
+            .catch((err: unknown) => {
+              getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
+            });
+        }
+      }
+    }
+  } finally {
+    if (releaseOwnershipLease) {
+      await releaseWorktreeOwnershipLock(cwd).catch((releaseErr: unknown) => {
+        getLog().warn(
+          { err: releaseErr, cwd, workflowRunId: workflowRun?.id },
+          'workflow.ownership_lock_release_failed'
         );
       });
-    emitter.unregisterRun(workflowRun.id);
-
-    // Notify user about the failure
-    const delivered = await sendCriticalMessage(
-      platform,
-      conversationId,
-      `[ ] **Workflow failed**: ${err.message}`
-    );
-    if (!delivered) {
-      getLog().error(
-        { workflowId: workflowRun.id, originalError: err.message },
-        'user_failure_notification_failed'
-      );
-    }
-    // Return failure result instead of re-throwing
-    return { success: false, workflowRunId: workflowRun.id, error: err.message };
-  } finally {
-    // Defensive backstop: if the workflow run is still 'running' after all
-    // normal and exceptional code paths, flip it to 'failed' to prevent zombie
-    // accumulation. Guards against any future code path that exits without
-    // calling failWorkflowRun (e.g. a generator cleanup that exits without
-    // throwing). Only fires when the process stays alive long enough to run
-    // this finally -- see #1561 for the originating zombie-state incident.
-    if (workflowRun) {
-      const runId = workflowRun.id;
-      const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
-      if (backstopStatus === 'running') {
-        getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
-        await deps.store
-          .failWorkflowRun(runId, 'Workflow exited without finalizing -- see logs')
-          .catch((err: unknown) => {
-            getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
-          });
-      }
     }
   }
 }

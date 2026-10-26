@@ -1,6 +1,8 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn, mock, type Mock } from 'bun:test';
 import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
 // Fixed test home -- path assertions use this constant; no duplication of production isDocker() logic.
 const TEST_ARCHON_HOME = '/test/.archon';
@@ -45,6 +47,10 @@ mock.module('node:fs/promises', () => ({
 
 import { WorktreeProvider } from './worktree';
 
+const realAcquireWorktreeOwnershipLock = git.acquireWorktreeOwnershipLock;
+const realReleaseWorktreeOwnershipLock = git.releaseWorktreeOwnershipLock;
+const realIsWorktreeOwnershipLockHeld = git.isWorktreeOwnershipLockHeldByThisProcess;
+
 describe('WorktreeProvider', () => {
   let provider: WorktreeProvider;
   let mockConfigLoader: RepoConfigLoader;
@@ -54,6 +60,9 @@ describe('WorktreeProvider', () => {
   let listWorktreesSpy: Mock<typeof git.listWorktrees>;
   let findWorktreeByBranchSpy: Mock<typeof git.findWorktreeByBranch>;
   let getCanonicalRepoPathSpy: Mock<typeof git.getCanonicalRepoPath>;
+  let acquireLockSpy: Mock<typeof git.acquireWorktreeOwnershipLock>;
+  let releaseLockSpy: Mock<typeof git.releaseWorktreeOwnershipLock>;
+  let lockHeldSpy: Mock<typeof git.isWorktreeOwnershipLockHeldByThisProcess>;
 
   beforeEach(() => {
     mockConfigLoader = async () => ({ baseBranch: 'main' });
@@ -64,6 +73,9 @@ describe('WorktreeProvider', () => {
     listWorktreesSpy = spyOn(git, 'listWorktrees');
     findWorktreeByBranchSpy = spyOn(git, 'findWorktreeByBranch');
     getCanonicalRepoPathSpy = spyOn(git, 'getCanonicalRepoPath');
+    acquireLockSpy = spyOn(git, 'acquireWorktreeOwnershipLock').mockResolvedValue(undefined);
+    releaseLockSpy = spyOn(git, 'releaseWorktreeOwnershipLock').mockResolvedValue(undefined);
+    lockHeldSpy = spyOn(git, 'isWorktreeOwnershipLockHeldByThisProcess').mockResolvedValue(false);
     getDefaultBranchSpy = spyOn(git, 'getDefaultBranch');
     syncWorkspaceSpy = spyOn(git, 'syncWorkspace');
 
@@ -106,6 +118,9 @@ describe('WorktreeProvider', () => {
     listWorktreesSpy.mockRestore();
     findWorktreeByBranchSpy.mockRestore();
     getCanonicalRepoPathSpy.mockRestore();
+    acquireLockSpy.mockRestore();
+    releaseLockSpy.mockRestore();
+    lockHeldSpy.mockRestore();
     getDefaultBranchSpy.mockRestore();
     syncWorkspaceSpy.mockRestore();
     mockAccess.mockClear();
@@ -3064,6 +3079,144 @@ describe('WorktreeProvider', () => {
 
       // healthCheck wraps the path in toWorktreePath before calling worktreeExists
       expect(worktreeExistsSpy).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe.skipIf(process.platform === 'win32')('ownership lock', () => {
+    function useRealOwnershipLock(): void {
+      acquireLockSpy.mockImplementation((path: string) => realAcquireWorktreeOwnershipLock(path));
+      releaseLockSpy.mockImplementation((path: string) => realReleaseWorktreeOwnershipLock(path));
+      lockHeldSpy.mockImplementation((path: string) => realIsWorktreeOwnershipLockHeld(path));
+    }
+
+    function runGit(cwd: string, args: string[]): void {
+      const result = Bun.spawnSync(['git', ...args], {
+        cwd,
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: 'Test',
+          GIT_AUTHOR_EMAIL: 'test@test.com',
+          GIT_COMMITTER_NAME: 'Test',
+          GIT_COMMITTER_EMAIL: 'test@test.com',
+        },
+      });
+      if (result.exitCode !== 0) {
+        throw new Error(`git ${args.join(' ')} failed: ${result.stderr.toString()}`);
+      }
+    }
+
+    function makeHolder(): { root: string; worktree: string } {
+      const root = mkdtempSync(join(tmpdir(), 'iso-lock-'));
+      const main = join(root, 'main');
+      const worktree = join(root, 'wt');
+      runGit(root, ['init', '-b', 'main', main]);
+      runGit(main, ['config', 'user.email', 'test@test.com']);
+      runGit(main, ['config', 'user.name', 'Test']);
+      writeFileSync(join(main, 'README.md'), 'init\n');
+      runGit(main, ['add', 'README.md']);
+      runGit(main, ['commit', '-m', 'init']);
+      runGit(main, ['worktree', 'add', '-b', 'feat', worktree]);
+      return { root, worktree };
+    }
+
+    async function holdLock(worktreePath: string): Promise<{ release: () => Promise<void> }> {
+      const modulePath = join(
+        import.meta.dir,
+        '..',
+        '..',
+        '..',
+        'git',
+        'src',
+        'worktree-ownership-lock.ts'
+      );
+      const script = `
+        const mod = await import(${JSON.stringify(modulePath)});
+        await mod.acquireWorktreeOwnershipLock(process.argv[1]);
+        process.stdout.write('HELD\\n');
+        const chunks = [];
+        for await (const chunk of process.stdin) chunks.push(chunk);
+        await mod.releaseWorktreeOwnershipLock(process.argv[1]);
+      `;
+      const proc = Bun.spawn(['bun', '-e', script, worktreePath], {
+        stdin: 'pipe',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const reader = proc.stdout.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (!buf.includes('HELD\n')) {
+        const next = await reader.read();
+        if (next.done) {
+          const stderr = await new Response(proc.stderr).text();
+          throw new Error(`lock holder failed: ${stderr || buf}`);
+        }
+        buf += decoder.decode(next.value, { stream: true });
+      }
+      return {
+        release: async (): Promise<void> => {
+          proc.stdin.end();
+          await proc.exited;
+        },
+      };
+    }
+
+    test('adopt refuses while another process holds the ownership lock', async () => {
+      const fixture = makeHolder();
+      const holder = await holdLock(fixture.worktree);
+      useRealOwnershipLock();
+      worktreeExistsSpy.mockResolvedValue(true);
+      getCanonicalRepoPathSpy.mockResolvedValue(fixture.worktree);
+      listWorktreesSpy.mockResolvedValue([{ path: fixture.worktree, branch: 'feat' }]);
+      try {
+        await expect(provider.adopt(fixture.worktree)).rejects.toThrow(/ownership lock held/);
+      } finally {
+        await holder.release();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    });
+
+    test('create refuses find-existing adoption while another process holds the lock', async () => {
+      const fixture = makeHolder();
+      const holder = await holdLock(fixture.worktree);
+      useRealOwnershipLock();
+      const verifySpy = spyOn(git, 'verifyWorktreeOwnership').mockResolvedValue(undefined);
+      spyOn(provider, 'getWorktreePath').mockReturnValue(fixture.worktree);
+      worktreeExistsSpy.mockResolvedValue(true);
+      const request: IsolationRequest = {
+        codebaseId: 'cb-123',
+        canonicalRepoPath: '/workspace/repo',
+        workflowType: 'issue',
+        identifier: '42',
+      };
+      try {
+        await expect(provider.create(request)).rejects.toThrow(/ownership lock held/);
+      } finally {
+        verifySpy.mockRestore();
+        await holder.release();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    });
+
+    test('destroy does not remove a worktree another process owns', async () => {
+      const fixture = makeHolder();
+      const holder = await holdLock(fixture.worktree);
+      useRealOwnershipLock();
+      try {
+        const result = await provider.destroy(fixture.worktree);
+        expect(result.worktreeRemoved).toBe(false);
+        expect(result.warnings.join('\n')).toContain('ownership lock held');
+        const removeCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+          const args = call[1] as string[];
+          return args.includes('remove') && args.includes('worktree');
+        });
+        expect(removeCalls).toHaveLength(0);
+      } finally {
+        await holder.release();
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
     });
   });
 });

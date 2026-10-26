@@ -158,6 +158,40 @@ function runCheckout(fixture: Fixture, dbPath: string): RunResult {
   });
 }
 
+async function holdOwnershipLock(worktreePath: string): Promise<{ release: () => Promise<void> }> {
+  const modulePath = join(import.meta.dir, '..', '..', 'git', 'src', 'worktree-ownership-lock.ts');
+  const script = `
+    const mod = await import(${JSON.stringify(modulePath)});
+    await mod.acquireWorktreeOwnershipLock(process.argv[1]);
+    process.stdout.write('HELD\\n');
+    const chunks = [];
+    for await (const chunk of process.stdin) chunks.push(chunk);
+    await mod.releaseWorktreeOwnershipLock(process.argv[1]);
+  `;
+  const proc = Bun.spawn(['bun', '-e', script, worktreePath], {
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const reader = proc.stdout.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (!buf.includes('HELD\n')) {
+    const next = await reader.read();
+    if (next.done) {
+      const stderr = await new Response(proc.stderr).text();
+      throw new Error(`lock holder failed: ${stderr || buf}`);
+    }
+    buf += decoder.decode(next.value, { stream: true });
+  }
+  return {
+    release: async (): Promise<void> => {
+      proc.stdin.end();
+      await proc.exited;
+    },
+  };
+}
+
 function worktrees(cwd: string): string {
   return git(['worktree', 'list'], cwd);
 }
@@ -179,7 +213,7 @@ afterEach(() => {
   }
 });
 
-describe('repair-target worktree reclaim', () => {
+describe.skipIf(process.platform === 'win32')('repair-target worktree reclaim', () => {
   it('preserves a resumed writer commit made during backup before reclaim', () => {
     const fixture = makeFixture({ hold: true, withOther: false });
     roots.push(fixture.root);
@@ -387,5 +421,121 @@ rtw_checkout_repair_branch "$1"
     expect(first.stdout).not.toContain('repair_target_worktree_reclaimed:');
     expect(second.stdout).not.toContain('repair_target_worktree_reclaimed:');
     expect(worktrees(fixture.caller)).toContain(other);
+  }, 30000);
+
+  it('refuses reclaim when another process holds the ownership lock and keeps that commit reachable', async () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'failed',
+        working_path: holder,
+        completed_at: utcMinutesAgo(20),
+      },
+    ]);
+    const lockHolder = await holdOwnershipLock(holder);
+    try {
+      writeFileSync(join(holder, 'under-lock.txt'), 'kept\n');
+      git(['add', 'under-lock.txt'], holder);
+      git(['commit', '-m', 'commit under ownership lock'], holder);
+      const kept = git(['rev-parse', 'HEAD'], holder).trim();
+      const result = runCheckout(fixture, fixture.dbPath);
+      expect(result.exitCode, show(result)).toBe(1);
+      expect(result.stdout).toContain('ownership lock held');
+      expect(worktrees(fixture.caller)).toContain(holder);
+      const reachable = git(['rev-list', '--all'], fixture.caller);
+      expect(reachable).toContain(kept);
+    } finally {
+      await lockHolder.release();
+    }
+  }, 30000);
+
+  it('a lock-honoring writer cannot commit between the SHA recheck and worktree remove', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'failed',
+        working_path: holder,
+        completed_at: utcMinutesAgo(20),
+      },
+    ]);
+    git(['fetch', 'origin', 'refs/heads/feat/x'], fixture.caller);
+    const fetchHead = git(['rev-parse', 'FETCH_HEAD'], fixture.caller).trim();
+    const writerOut = join(fixture.root, 'writer-out.txt');
+    const writerErr = join(fixture.root, 'writer-err.txt');
+    const lockModule = join(
+      import.meta.dir,
+      '..',
+      '..',
+      'git',
+      'src',
+      'worktree-ownership-lock.ts'
+    );
+    const script = `set -euo pipefail
+${RTW_CORE}
+git() {
+  if [ "\${1:-}" = "worktree" ] && [ "\${2:-}" = "remove" ]; then
+    bun -e '
+      const mod = await import(process.env.RTW_LOCK_MODULE);
+      try {
+        await mod.acquireWorktreeOwnershipLock(process.env.RTW_RACE_HOLDER);
+        await mod.releaseWorktreeOwnershipLock(process.env.RTW_RACE_HOLDER);
+        process.stdout.write("ACQUIRED\\n");
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        process.stdout.write(message + "\\n");
+        process.exit(2);
+      }
+    ' > "$RTW_WRITER_OUT" 2> "$RTW_WRITER_ERR" || true
+  fi
+  command git "$@"
+  local rc=$?
+  return "$rc"
+}
+rtw_checkout_repair_branch "$1"
+`;
+    const result = bash(script, fixture.caller, ['feat/x'], {
+      RTW_RUNS_DB: fixture.dbPath,
+      RTW_PROC_ROOT: fixture.procRoot,
+      RTW_RACE_HOLDER: holder,
+      RTW_WRITER_OUT: writerOut,
+      RTW_WRITER_ERR: writerErr,
+      RTW_LOCK_MODULE: lockModule,
+    });
+    if (result.exitCode !== 0) throw new Error(show(result));
+    const writer = readFileSync(writerOut, 'utf8');
+    expect(writer, readFileSync(writerErr, 'utf8')).toContain('ownership lock held');
+    expect(writer).not.toContain('ACQUIRED');
+    expect(git(['rev-parse', 'HEAD'], fixture.caller).trim()).toBe(fetchHead);
+    expect(worktrees(fixture.caller)).not.toContain(holder);
+    const refs = git(['show-ref'], fixture.origin);
+    expect(refs).not.toContain('lock-honoring writer');
+    const messages = git(['log', '--all', '--format=%s'], fixture.caller);
+    expect(messages).not.toContain('lock-honoring writer');
+  }, 30000);
+
+  it('dead-holder reclaim still finishes at FETCH_HEAD', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'failed',
+        working_path: holder,
+        completed_at: utcMinutesAgo(20),
+      },
+    ]);
+    git(['fetch', 'origin', 'refs/heads/feat/x'], fixture.caller);
+    const fetchHead = git(['rev-parse', 'FETCH_HEAD'], fixture.caller).trim();
+    const result = runCheckout(fixture, fixture.dbPath);
+    if (result.exitCode !== 0) throw new Error(show(result));
+    expect(git(['rev-parse', 'HEAD'], fixture.caller).trim()).toBe(fetchHead);
+    expect(worktrees(fixture.caller)).not.toContain(holder);
   }, 30000);
 });

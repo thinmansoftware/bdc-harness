@@ -23,6 +23,10 @@ import {
   toRepoPath,
   toWorktreePath,
   toBranchName,
+  acquireWorktreeOwnershipLock,
+  releaseWorktreeOwnershipLock,
+  isWorktreeOwnershipLockHeldByThisProcess,
+  WorktreeOwnershipLockBusyError,
 } from '@archon/git';
 import type { WorktreeBaseOverride } from '@archon/git';
 import { getArchonWorkspacesPath } from '@archon/paths';
@@ -218,12 +222,14 @@ export class WorktreeProvider implements IIsolationProvider {
     // Check for existing worktree (adoption)
     const existing = await this.findExisting(request, branchName, worktreePath);
     if (existing) {
+      await acquireWorktreeOwnershipLock(existing.workingPath);
       return existing;
     }
 
     // Create new worktree (re-uses the already-loaded repoConfig -- no double load).
     const { warnings } = await this.createWorktree(request, worktreePath, branchName, repoConfig);
     await this.writeWorktreeIdentity(request, worktreePath, branchName);
+    await acquireWorktreeOwnershipLock(worktreePath);
 
     return {
       id: envId,
@@ -297,6 +303,9 @@ export class WorktreeProvider implements IIsolationProvider {
 
     // Only attempt worktree removal if path exists
     if (pathExists) {
+      if (await this.ownershipLockBlocksRemoval(worktreePath, result)) {
+        return result;
+      }
       const gitArgs = ['-C', repoPath, 'worktree', 'remove'];
       if (options?.force) {
         gitArgs.push('--force');
@@ -592,6 +601,7 @@ export class WorktreeProvider implements IIsolationProvider {
     }
 
     getLog().info({ path, branchName: wt.branch }, 'worktree_adopted');
+    await acquireWorktreeOwnershipLock(path);
     return {
       id: path,
       provider: 'worktree',
@@ -1316,6 +1326,31 @@ export class WorktreeProvider implements IIsolationProvider {
       const detail = err.stderr?.trim() || err.message;
       throw new Error(`Submodule initialization failed: ${detail}`);
     }
+  }
+
+  /**
+   * Release this process's ownership hold before removal. If another process
+   * holds the lock, leave the worktree in place.
+   */
+  private async ownershipLockBlocksRemoval(
+    worktreePath: string,
+    result: DestroyResult
+  ): Promise<boolean> {
+    if (await isWorktreeOwnershipLockHeldByThisProcess(worktreePath)) {
+      await releaseWorktreeOwnershipLock(worktreePath);
+      return false;
+    }
+    try {
+      await acquireWorktreeOwnershipLock(worktreePath);
+    } catch (error) {
+      if (error instanceof WorktreeOwnershipLockBusyError) {
+        result.warnings.push(`ownership lock held: ${worktreePath}`);
+        return true;
+      }
+      throw error;
+    }
+    await releaseWorktreeOwnershipLock(worktreePath);
+    return false;
   }
 
   /**

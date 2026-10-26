@@ -1,4 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import * as git from '@archon/git';
 
 // Mock logger to suppress noisy output
@@ -561,6 +564,80 @@ describe('IsolationResolver', () => {
     expect(destroyCalled).toBe(true);
     expect(destroyCalledWithForce).toBe(true);
   });
+
+  test.skipIf(process.platform === 'win32')(
+    'store.create() failure releases a same-process ownership lock when destroy fails',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'resolver-lock-'));
+      const main = join(root, 'main');
+      const gitRun = (cwd: string, args: string[]): void => {
+        const result = Bun.spawnSync(['git', ...args], {
+          cwd,
+          stdout: 'pipe',
+          stderr: 'pipe',
+          env: {
+            ...process.env,
+            GIT_AUTHOR_NAME: 'Test',
+            GIT_AUTHOR_EMAIL: 'test@test.com',
+            GIT_COMMITTER_NAME: 'Test',
+            GIT_COMMITTER_EMAIL: 'test@test.com',
+          },
+        });
+        if (result.exitCode !== 0) {
+          throw new Error(`git ${args.join(' ')} failed: ${result.stderr.toString()}`);
+        }
+      };
+      gitRun(root, ['init', '-b', 'main', main]);
+      gitRun(main, ['config', 'user.email', 'test@test.com']);
+      gitRun(main, ['config', 'user.name', 'Test']);
+      writeFileSync(join(main, 'README.md'), 'init\n');
+      gitRun(main, ['add', 'README.md']);
+      gitRun(main, ['commit', '-m', 'init']);
+
+      const resolver = createResolver({
+        provider: {
+          ...makeMockProvider(),
+          create: async () => {
+            await git.acquireWorktreeOwnershipLock(main);
+            return {
+              id: main,
+              provider: 'worktree' as const,
+              workingPath: main,
+              branchName: 'main',
+              status: 'active' as const,
+              createdAt: new Date(),
+              metadata: { adopted: false },
+            };
+          },
+          destroy: async () => {
+            throw new Error('cleanup failed');
+          },
+        },
+        store: makeMockStore({
+          create: async () => {
+            throw new Error('DB constraint violation');
+          },
+        }),
+      });
+
+      try {
+        await expect(
+          resolver.resolve({
+            existingEnvId: null,
+            codebase: defaultCodebase,
+            hints: { workflowType: 'issue', workflowId: '604' },
+            platformType: 'web',
+          })
+        ).rejects.toThrow('DB constraint violation');
+        expect(await git.isWorktreeOwnershipLockHeldByThisProcess(main)).toBe(false);
+      } finally {
+        if (await git.isWorktreeOwnershipLockHeldByThisProcess(main).catch(() => false)) {
+          await git.releaseWorktreeOwnershipLock(main);
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  );
 
   test('store.create() failure still rethrows when orphan cleanup also fails', async () => {
     const resolver = createResolver({

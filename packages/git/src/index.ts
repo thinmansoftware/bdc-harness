@@ -28,6 +28,13 @@ export {
 } from './worktree';
 export type { WorktreeLayout, WorktreeBaseOverride } from './worktree';
 
+export {
+  acquireWorktreeOwnershipLock,
+  releaseWorktreeOwnershipLock,
+  isWorktreeOwnershipLockHeldByThisProcess,
+  WorktreeOwnershipLockBusyError,
+} from './worktree-ownership-lock';
+
 // Branch operations
 export {
   getDefaultBranch,
