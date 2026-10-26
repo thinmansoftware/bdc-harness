@@ -65,7 +65,7 @@ describe('multi-stage workflow lifecycle guards', () => {
   });
 
   test('pins the builder seat to claude-haiku-5-5 and leaves bash gates unbound', () => {
-    const raw = readFileSync(workflowPath, 'utf8');
+    const raw = readFileSync(workflowPath, 'utf8').replace(/\r\n/g, '\n');
     const modelLines = raw.split('\n').filter(line => line === 'model: claude-haiku-5-5');
     expect(modelLines).toHaveLength(1);
     expect(raw.includes('model: sonnet')).toBe(false);
