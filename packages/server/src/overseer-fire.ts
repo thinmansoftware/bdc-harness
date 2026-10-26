@@ -1,4 +1,4 @@
-import { findCodebaseByName } from '@archon/core/db/codebases';
+import { listCodebases } from '@archon/core/db/codebases';
 import { listWorkflowRuns } from '@archon/core/db/workflows';
 import { findLiveRunsForWo } from './routes/wo-fire-guard';
 
@@ -16,19 +16,20 @@ export function createOverseerFireWorkflowRun(config: {
   port: number;
   operatorToken: string;
   fetch?: typeof fetch;
-  findCodebase?: typeof findCodebaseByName;
+  listCodebases?: typeof listCodebases;
   findLiveRuns?: typeof findLiveRunsForWo;
   discoverRuns?: typeof listWorkflowRuns;
   discoverTimeoutMs?: number;
   discoverIntervalMs?: number;
 }): (input: OverseerFireInput) => Promise<OverseerFireResult> {
   const request = config.fetch ?? fetch;
-  const findCodebase = config.findCodebase ?? findCodebaseByName;
+  const findCodebases = config.listCodebases ?? listCodebases;
   const findLiveRuns = config.findLiveRuns ?? findLiveRunsForWo;
   const discoverRuns = config.discoverRuns ?? listWorkflowRuns;
   return async input => {
-    const codebase = await findCodebase(input.project);
-    if (!codebase) return { ok: false, error: 'project_not_unique' };
+    const matches = (await findCodebases()).filter(codebase => codebase.name === input.project);
+    if (matches.length !== 1) return { ok: false, error: 'project_not_unique' };
+    const codebase = matches[0];
     if ((await findLiveRuns(input.woId)).length > 0)
       return { ok: false, error: 'duplicate_wo_live' };
     const message = `/workflow run ${input.workflowName} WO_ID=${input.woId} --project ${input.project} --fired_by=overseer-refire --refire_of=${input.runId}`;

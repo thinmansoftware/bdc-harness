@@ -8,7 +8,7 @@ describe('overseer fire loopback', () => {
       port: 3090,
       operatorToken: 'secret',
       fetch: request as never,
-      findCodebase: async () => ({ id: 'c1' }) as never,
+      listCodebases: async () => [{ id: 'c1', name: 'bdc-harness' }] as never,
       findLiveRuns: async () => [{ id: 'live', status: 'running', workflow_name: 'lane' }],
     });
     expect(
@@ -30,7 +30,7 @@ describe('overseer fire loopback', () => {
       port: 3090,
       operatorToken: 'secret',
       fetch: request as never,
-      findCodebase: async () => ({ id: 'c1' }) as never,
+      listCodebases: async () => [{ id: 'c1', name: 'bdc-harness' }] as never,
       findLiveRuns: async () => [],
       discoverRuns: async () =>
         [
@@ -40,5 +40,22 @@ describe('overseer fire loopback', () => {
     expect(
       await fire({ workflowName: 'lane', woId: 'WO-X-01', project: 'bdc-harness', runId: 'r1' })
     ).toEqual({ ok: true, runId: 'r2', conversationId: 'web-1' });
+  });
+  test('refuses duplicate project shortnames without POST', async () => {
+    const request = mock(async () => new Response());
+    const fire = createOverseerFireWorkflowRun({
+      port: 3090,
+      operatorToken: 'secret',
+      fetch: request as never,
+      listCodebases: async () =>
+        [
+          { id: 'c1', name: 'bdc-harness' },
+          { id: 'c2', name: 'bdc-harness' },
+        ] as never,
+    });
+    expect(
+      await fire({ workflowName: 'lane', woId: 'WO-X-01', project: 'bdc-harness', runId: 'r1' })
+    ).toEqual({ ok: false, error: 'project_not_unique' });
+    expect(request).not.toHaveBeenCalled();
   });
 });

@@ -109,12 +109,7 @@ export function classifyEvidenceFailure(events: readonly EvidenceEvent[]): Evide
   }
   if (source && !source.startsWith('spec_declared')) return 'spec_tests_line_defect';
   if (source?.startsWith('spec_declared') && status === 'failed') return 'real_test_failure';
-  const evidenceMessage = events
-    .map(event =>
-      [event.data.error, event.data.message, event.data.stderr].find(v => typeof v === 'string')
-    )
-    .find(value => typeof value === 'string' && value.startsWith('EVIDENCE_ERROR:'));
-  return typeof evidenceMessage === 'string' && evidenceMessage.includes('grep_status')
+  return text.includes('EVIDENCE_ERROR:') && text.includes('grep_status')
     ? 'grep_evidence'
     : 'unknown';
 }

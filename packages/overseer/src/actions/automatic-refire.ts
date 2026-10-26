@@ -30,6 +30,10 @@ export interface AutomaticRefireDeps {
     record: WatchedRunRecord,
     events: OverseerWorkflowEvent[]
   ): Promise<OverseerSalvageReceiptV1 | null>;
+  releaseTerminalWorktree?(
+    record: WatchedRunRecord,
+    events: OverseerWorkflowEvent[]
+  ): Promise<{ ok: true } | { ok: false; reason: string }>;
 }
 
 export type AutomaticRefireResult =
@@ -52,6 +56,12 @@ export async function executeAutomaticRefire(
     return { status: 'refused', reason: 'evidence_incomplete' };
   const salvage = await deps.salvage(record, events);
   if (!salvage) return { status: 'refused', reason: 'salvage_missing' };
+  if (record.errorClass === 'worktree_collision') {
+    if (!deps.releaseTerminalWorktree)
+      return { status: 'refused', reason: 'worktree_release_not_wired' };
+    const release = await deps.releaseTerminalWorktree(record, events);
+    if (!release.ok) return { status: 'refused', reason: release.reason };
+  }
   const fire = async (): Promise<FirstRefireOnRampResultV1> => {
     const result = await deps.fireWorkflowRun({
       workflowName,
