@@ -17,8 +17,12 @@
  * No hardcoded model names or workflow names in this file -- all in config.
  */
 
-import { randomUUID } from 'crypto';
-import type { ExpectedSpecIdentity } from '@archon/core/workflows/work-order-source';
+import { createHash, randomUUID } from 'crypto';
+import {
+  freezeWorkOrderSource,
+  type ExpectedSpecIdentity,
+} from '@archon/core/workflows/work-order-source';
+import { readSpecClass, validateCanonicalStages } from './canonical-stages.js';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
@@ -52,6 +56,90 @@ import type {
 } from './types.js';
 
 const execFileAsync = promisify(execFile);
+
+/** Explicit supervised lane. Not an alias for a feature-tier workflow. */
+const MULTI_STAGE_WORKFLOW = 'bdc-multi-stage-development';
+
+const FEATURE_LANE_FALLBACKS: ReadonlySet<string> = new Set([
+  'bdc-feature-development-cursor',
+  'bdc-feature-development-codex',
+  'bdc-feature-development-fable',
+]);
+
+const MULTI_STAGE_RUN_AUTHORITY = {
+  required: true,
+  spec_repository: 'thinmansoftware/bdc-xo',
+  spec_revision: 'main',
+  spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
+  allow_issue_fallback: true,
+};
+
+type ExplicitLane =
+  | { readonly kind: 'default' }
+  | { readonly kind: 'alias'; readonly tierName: string }
+  | { readonly kind: 'multi-stage'; readonly fireWorkflow: string };
+
+function laneBinding(tier: LadderTier): string | null {
+  const value = tier.laneWorkflows?.[MULTI_STAGE_WORKFLOW];
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+/**
+ * A compatible multi-stage seat is a non-empty lane binding that is neither the
+ * workflow already fired nor that tier's feature workflow.
+ */
+function compatibleLaneBinding(tier: LadderTier, previouslyFired: string): string | null {
+  const binding = laneBinding(tier);
+  if (!binding) return null;
+  if (binding === previouslyFired || binding === tier.workflowName) return null;
+  if (FEATURE_LANE_FALLBACKS.has(binding)) return null;
+  return binding;
+}
+
+function resolveExplicitWorkflow(workflow: string | undefined, tiers: LadderTier[]): ExplicitLane {
+  if (workflow === undefined) return { kind: 'default' };
+  if (workflow === MULTI_STAGE_WORKFLOW) {
+    return { kind: 'multi-stage', fireWorkflow: MULTI_STAGE_WORKFLOW };
+  }
+  const byName = tiers.find(tier => tier.name === workflow);
+  if (byName) return { kind: 'alias', tierName: byName.name };
+  const byWorkflow = tiers.find(tier => tier.workflowName === workflow);
+  if (byWorkflow) return { kind: 'alias', tierName: byWorkflow.name };
+  const byLane = tiers.find(tier => laneBinding(tier) === workflow);
+  if (byLane) return { kind: 'multi-stage', fireWorkflow: workflow };
+  throw new Error(
+    `[smart-cauldron/cascade] Unknown workflow "${workflow}". ` +
+      `Known tiers: ${tiers.map(tier => tier.name).join(', ')}.`
+  );
+}
+
+function withCompatibilityReason(failReason: string): string {
+  if (failReason.includes('compatible-escalation-unavailable')) return failReason;
+  return `${failReason}; compatible-escalation-unavailable`;
+}
+
+function frozenExpectedSpec(source: {
+  specSource: string;
+  specRevision: string;
+  specBytes: Uint8Array;
+}): ExpectedSpecIdentity {
+  return {
+    specSource: source.specSource,
+    specRevision: source.specRevision,
+    specHash: `sha256:${createHash('sha256').update(source.specBytes).digest('hex')}`,
+  };
+}
+
+function multiStageFreezeMessage(
+  woId: string,
+  project: string | undefined,
+  expectedSpec: ExpectedSpecIdentity | undefined
+): string {
+  if (!expectedSpec) return `WO_ID=${woId}`;
+  const projectToken = project && /^[A-Za-z0-9_.-]+$/.test(project) ? project : 'dry-run';
+  const encoded = Buffer.from(JSON.stringify(expectedSpec)).toString('base64url');
+  return `WO_ID=${woId} --project ${projectToken} --expected-spec=${encoded}`;
+}
 
 // ---------------------------------------------------------------------------
 // Dependency injection interface (for testability)
@@ -100,6 +188,18 @@ export interface CascadeDeps {
    * entryOverride is set (that already skips the conductor).
    */
   ruleset?: ConductorRuleset;
+  /** Ladder override. Production loads config/ladder.config.json. */
+  tiers?: LadderTier[];
+  /** Refused-tier override. Production loads the ladder refusedTiers list. */
+  refusedTiers?: string[];
+  /** Premium-tier override. Production loads the ladder premiumTiers list. */
+  premiumTiers?: string[];
+  /**
+   * Canonical spec freezer. Production calls freezeWorkOrderSource. Tests inject
+   * a hermetic resolver; the supplied expected identity is still placed on the
+   * freezer message so verification stays on that path.
+   */
+  freezeWorkOrderSource?: typeof freezeWorkOrderSource;
   /**
    * Live subscription-seat snapshot. Absent means headroom routing is skipped.
    * A rejection or timeout fails open (usage null) and never holds the fire.
@@ -212,6 +312,11 @@ export interface RunCascadeOptions {
   /** Override the entry tier (skips conductor ruleset). */
   entryOverride?: TierName;
   /**
+   * Explicit workflow lane. Omitted preserves the selected tier's workflowName.
+   * `bdc-multi-stage-development` is a supervised lane, not a feature alias.
+   */
+  workflow?: string;
+  /**
    * Seed the informed-climb context of the FIRST attempt. Used only when
    * resuming an approved frontier-approval pause (WO-HARNESS-FRONTIER-CLIMB-
    * APPROVAL-GATE-01): the preserved packet's priorContext is replayed in so the
@@ -270,7 +375,6 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     onAdmission,
     woClass,
     tags,
-    entryOverride,
     dryRun = false,
     outDir = './cascade-runs',
     pollTimeoutMs = 14_400_000,
@@ -279,6 +383,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     token,
     project,
   } = opts;
+  let entryOverride = opts.entryOverride;
 
   const apiBaseUrl = opts.apiBaseUrl ?? process.env.ARCHON_API_BASE_URL ?? 'http://localhost:3090';
 
@@ -317,10 +422,56 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       process.env.SMART_CAULDRON_ALLOW_CLAIMED === 'true');
 
   // Load config from files (never from inline constants)
-  const tiers = loadLadder();
+  const tiers = opts.deps?.tiers ?? loadLadder();
   const ruleset = opts.deps?.ruleset ?? loadRuleset();
-  const refusedTiers = loadRefusedTiers();
-  const premiumTiers = loadPremiumTiers();
+  const refusedTiers = opts.deps?.refusedTiers ?? loadRefusedTiers();
+  const premiumTiers = opts.deps?.premiumTiers ?? loadPremiumTiers();
+  const freezeImpl = opts.deps?.freezeWorkOrderSource ?? freezeWorkOrderSource;
+
+  // Explicit lane resolution happens before lock, admission, records, and fire.
+  // Unknown names throw here. A tier name or feature workflow follows --entry.
+  const lane = resolveExplicitWorkflow(opts.workflow, tiers);
+  if (lane.kind === 'alias') {
+    if (entryOverride !== undefined && entryOverride !== lane.tierName) {
+      throw new Error(
+        `[smart-cauldron/cascade] Workflow "${opts.workflow ?? ''}" resolves to tier ` +
+          `"${lane.tierName}" which does not match --entry "${entryOverride}".`
+      );
+    }
+    entryOverride = lane.tierName;
+  }
+  let fireWorkflowName: string | null = lane.kind === 'multi-stage' ? lane.fireWorkflow : null;
+  let fireExpectedSpec = opts.expectedSpec;
+  if (lane.kind === 'multi-stage') {
+    if (woClass !== undefined && woClass !== 'MIXED') {
+      throw new Error(
+        '[smart-cauldron/cascade] explicit multi-stage requires class MIXED when --class is set'
+      );
+    }
+    const frozen = await freezeImpl(
+      MULTI_STAGE_RUN_AUTHORITY,
+      multiStageFreezeMessage(woId, project, opts.expectedSpec)
+    );
+    const specText = Buffer.from(frozen.specBytes).toString('utf8');
+    if (readSpecClass(specText) !== 'MIXED') {
+      throw new Error(
+        '[smart-cauldron/cascade] explicit multi-stage requires frozen spec class MIXED'
+      );
+    }
+    validateCanonicalStages(specText);
+    fireExpectedSpec = frozenExpectedSpec(frozen);
+  }
+
+  function cascadeRequest(isDryRun: boolean): CascadeRunRecord['request'] {
+    const request: CascadeRunRecord['request'] = {
+      woClass: woClass ?? null,
+      tags: [...(tags ?? [])].sort(),
+      entryOverride: entryOverride ?? null,
+      dryRun: isDryRun,
+    };
+    if (opts.workflow !== undefined) request.workflow = opts.workflow;
+    return request;
+  }
 
   // Conductor: pick entry tier (ruleset), or honor explicit --entry override
   let entryTierName = entryOverride ?? pickEntryTier({ woClass, tags }, ruleset);
@@ -389,21 +540,17 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   if (dryRun) {
     const selectedTier = tiers[currentIndex];
     if (selectedTier) {
+      const dryRunWorkflow = fireWorkflowName ?? selectedTier.workflowName;
       console.log(
         `[smart-cauldron] DRY RUN: woId=${woId} entry=${selectedTier.name} ` +
-          `workflow=${selectedTier.workflowName}`
+          `workflow=${dryRunWorkflow}`
       );
     }
     const record: CascadeRunRecord = {
       cascadeId,
       woId,
       project: project ?? null,
-      request: {
-        woClass: woClass ?? null,
-        tags: [...(tags ?? [])].sort(),
-        entryOverride: entryOverride ?? null,
-        dryRun: true,
-      },
+      request: cascadeRequest(true),
       createdAt,
       status: 'planned',
       winningTier: null,
@@ -440,12 +587,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       cascadeId,
       woId,
       project,
-      request: {
-        woClass: woClass ?? null,
-        tags: [...(tags ?? [])].sort(),
-        entryOverride: entryOverride ?? null,
-        dryRun: false,
-      },
+      request: cascadeRequest(false),
       createdAt,
       status: 'blocked',
       winningTier: null,
@@ -474,12 +616,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         cascadeId,
         woId,
         project,
-        request: {
-          woClass: woClass ?? null,
-          tags: [...(tags ?? [])].sort(),
-          entryOverride: entryOverride ?? null,
-          dryRun: false,
-        },
+        request: cascadeRequest(false),
         createdAt,
         status: 'refused',
         winningTier: null,
@@ -545,12 +682,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(automaticFireAdmission ? { automaticFireAdmission } : {}),
         woId,
         project: project ?? null,
-        request: {
-          woClass: woClass ?? null,
-          tags: [...(tags ?? [])].sort(),
-          entryOverride: entryOverride ?? null,
-          dryRun: false,
-        },
+        request: cascadeRequest(false),
         createdAt,
         status,
         winningTier,
@@ -601,11 +733,48 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
      * @returns true if the cascade loop should stop (caller must break), false
      *          to keep climbing.
      */
+    function peekNextClimb(fromIndex: number): { index: number; tier: LadderTier } | null {
+      let idx = fromIndex + 1;
+      while (idx < tiers.length && refusedTiers.includes(tiers[idx]?.name ?? '')) idx += 1;
+      const tier = tiers[idx];
+      if (!tier || idx >= tiers.length) return null;
+      return { index: idx, tier };
+    }
+
     async function climbOrStop(
       currentTier: LadderTier,
       failReason: string,
       runId: string | null
     ): Promise<boolean> {
+      if (fireWorkflowName !== null) {
+        const previous = attempts.at(-1)?.workflowName ?? fireWorkflowName;
+        const next = peekNextClimb(currentIndex);
+        const binding = next ? compatibleLaneBinding(next.tier, previous) : null;
+        if (binding && next && !currentTier.isFrontier) {
+          fireWorkflowName = binding;
+          currentIndex = next.index;
+          climbCount += 1;
+          console.log(
+            `[smart-cauldron] Climbing to tier=${next.tier.name} ` +
+              `workflow=${binding} (climb #${climbCount})`
+          );
+          return false;
+        }
+        if (!binding) {
+          const reason = withCompatibilityReason(failReason);
+          const currentAttempt = attempts.at(-1);
+          if (currentAttempt) currentAttempt.gateFailReason = reason;
+          if (!currentTier.isFrontier) {
+            status = 'blocked';
+            console.log(
+              `[smart-cauldron] BLOCKED: compatible-escalation-unavailable for woId=${woId}`
+            );
+            return true;
+          }
+          failReason = reason;
+        }
+      }
+
       if (currentTier.isFrontier) {
         if (superviseFailureImpl) {
           const recovery = await superviseFailureImpl({
@@ -632,7 +801,11 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         // Emit a SPEC-REPAIR escalation: post the failure evidence + a concrete
         // "what must change in the spec" statement to the WO's GitHub issue (comment
         // + status:blocked label) so the WO re-enters at the authoring layer.
-        const evidence = buildSpecRepairEvidence(currentTier, failReason, runId, attempts);
+        const evidenceTier: LadderTier = {
+          ...currentTier,
+          workflowName: attempts.at(-1)?.workflowName ?? currentTier.workflowName,
+        };
+        const evidence = buildSpecRepairEvidence(evidenceTier, failReason, runId, attempts);
         const whatMustChange = buildWhatMustChange(currentTier, failReason);
 
         let result: SpecRepairResult;
@@ -724,7 +897,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
      */
     async function pauseForFrontierApproval(
       premiumTier: LadderTier,
-      runId: string | null
+      runId: string | null,
+      workflowName: string = premiumTier.workflowName
     ): Promise<void> {
       const pausedAt = new Date().toISOString();
       let notifiedAt: string | null = null;
@@ -734,11 +908,16 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           woId,
           reason:
             'PENDING FRONTIER APPROVAL -- auto-climb reached premium tier ' +
-            `"${premiumTier.name}" (workflow ${premiumTier.workflowName}) for ${woId}. Not fired. ` +
+            `"${premiumTier.name}" (workflow ${workflowName}) for ${woId}. Not fired. ` +
             'Approve to resume, or reject to send to needs-human. ' +
             `Approve: POST /api/cascades/${cascadeId}/approve-frontier ; ` +
             `Reject: POST /api/cascades/${cascadeId}/reject-frontier`,
-          remediation: buildFrontierApprovalRemediation(cascadeId, premiumTier, attempts),
+          remediation: buildFrontierApprovalRemediation(
+            cascadeId,
+            premiumTier,
+            attempts,
+            workflowName
+          ),
           runId: runId ?? attempts.at(-1)?.runId ?? null,
           overseerPermit: opts.overseerPermit,
         });
@@ -751,9 +930,9 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       }
 
       frontierApprovalRecord = {
-        ...(opts.expectedSpec ? { expectedSpec: opts.expectedSpec } : {}),
+        ...(fireExpectedSpec ? { expectedSpec: fireExpectedSpec } : {}),
         tierName: premiumTier.name,
-        workflowName: premiumTier.workflowName,
+        workflowName,
         priorContext,
         project: project ?? null,
         woId,
@@ -796,16 +975,21 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       // auto-fire. An explicit --entry override onto this tier is human-typed and
       // bypasses the gate (the operator already chose to spend on it).
       if (premiumTiers.includes(tier.name) && tier.name !== entryOverride) {
-        await pauseForFrontierApproval(tier, attempts.at(-1)?.runId ?? null);
+        await pauseForFrontierApproval(
+          tier,
+          attempts.at(-1)?.runId ?? null,
+          fireWorkflowName ?? tier.workflowName
+        );
         break;
       }
 
       const attemptStartedAt = new Date().toISOString();
+      const attemptWorkflowName = fireWorkflowName ?? tier.workflowName;
       const attempt: CascadeAttempt = {
         sourceEventId: `${cascadeId}:attempt:${attempts.length + 1}`,
         sourceEventAt: attemptStartedAt,
         tier: tier.name,
-        workflowName: tier.workflowName,
+        workflowName: attemptWorkflowName,
         runId: null,
         outcome: 'running',
         gateFailReason: null,
@@ -841,7 +1025,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
       console.log(
         `[smart-cauldron] Firing woId=${woId} on tier=${tier.name} ` +
-          `workflow=${tier.workflowName} (attempt ${attempts.length})`
+          `workflow=${attemptWorkflowName} (attempt ${attempts.length})`
       );
 
       // Re-check claim before each provider fire (another cascade or human may
@@ -872,10 +1056,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
       // Fire the WO on this tier
       const fireResult: FireResult = await fireImpl({
-        workflowName: tier.workflowName,
+        workflowName: attemptWorkflowName,
         woId,
         project,
-        message: buildFireMessage(woId, project, priorContext ?? undefined, opts.expectedSpec),
+        message: buildFireMessage(woId, project, priorContext ?? undefined, fireExpectedSpec),
         apiBaseUrl,
         token,
       });
@@ -947,14 +1131,14 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       let nodeTimeoutsMs: Record<string, number> = {};
       try {
         nodeTimeoutsMs = await fetchNodeTimeoutsImpl({
-          workflowName: tier.workflowName,
+          workflowName: attemptWorkflowName,
           apiBaseUrl,
           token,
           floorMs: DEFAULT_OPEN_NODE_BUDGET_MS,
         });
       } catch (err) {
         console.log(
-          `[smart-cauldron] node-timeout resolution failed for workflow ${tier.workflowName} ` +
+          `[smart-cauldron] node-timeout resolution failed for workflow ${attemptWorkflowName} ` +
             `(${(err as Error).message}); open nodes use the ` +
             `${String(DEFAULT_OPEN_NODE_BUDGET_MS)}ms default`
         );
@@ -992,11 +1176,17 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           // Pause for approval and leave the run RUNNING.
           if (!tier.isFrontier) {
             const nextTier = peekNextClimbTier(currentIndex);
-            if (
-              nextTier &&
+            const nextBinding =
+              nextTier && fireWorkflowName !== null
+                ? compatibleLaneBinding(nextTier, attemptWorkflowName)
+                : null;
+            const pauseForPremium =
+              nextTier !== null &&
+              nextTier !== undefined &&
               premiumTiers.includes(nextTier.name) &&
-              nextTier.name !== entryOverride
-            ) {
+              nextTier.name !== entryOverride &&
+              (fireWorkflowName === null || nextBinding !== null);
+            if (pauseForPremium && nextTier) {
               attempt.outcome = 'progress-timeout';
               attempt.gateFailReason = timeoutReason;
               attempt.completedAt = new Date().toISOString();
@@ -1009,7 +1199,11 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
                   `${nextTier.name} requires approval -- pausing for frontier approval and ` +
                   'leaving the run running (no cancel-to-nowhere)'
               );
-              await pauseForFrontierApproval(nextTier, fireResult.runId);
+              await pauseForFrontierApproval(
+                nextTier,
+                fireResult.runId,
+                nextBinding ?? nextTier.workflowName
+              );
               break;
             }
           }
@@ -1256,10 +1450,11 @@ async function defaultEscalate(ctx: EscalationCallContext): Promise<void> {
 function buildFrontierApprovalRemediation(
   cascadeId: string,
   tier: LadderTier,
-  attempts: CascadeAttempt[]
+  attempts: CascadeAttempt[],
+  workflowName: string = tier.workflowName
 ): string[] {
   const lines: string[] = [
-    `Premium tier "${tier.name}" (workflow ${tier.workflowName}) was reached by an ` +
+    `Premium tier "${tier.name}" (workflow ${workflowName}) was reached by an ` +
       'automatic climb and was NOT fired -- awaiting operator approval.',
     `Approve (resume + fire the premium tier): POST /api/cascades/${cascadeId}/approve-frontier`,
     `Reject (terminate as needs-human, no fire): POST /api/cascades/${cascadeId}/reject-frontier`,

@@ -23,6 +23,12 @@ export interface LadderTier {
   workflowName: string; // e.g. "bdc-feature-development-codex"
   isFrontier: boolean; // true = top rung; gate-fail here = BLOCKED
   costPerRunUsd: number | null; // null = unknown; populated from run metadata post-hoc
+  /**
+   * Optional explicit lane bindings keyed by workflow name. Absent unless the
+   * ladder entry declares a non-empty string map. A multi-stage climb may use
+   * only a binding that is distinct from the tier's feature workflowName.
+   */
+  laneWorkflows?: Readonly<Record<string, string>>;
 }
 
 export interface ConductorRuleset {
@@ -122,6 +128,8 @@ export interface CascadeRunRecord {
     tags: string[];
     entryOverride: TierName | null;
     dryRun: boolean;
+    /** Present only when the caller supplied an explicit workflow lane. */
+    workflow?: string;
   };
   createdAt: string;
   status: CascadeStatus;

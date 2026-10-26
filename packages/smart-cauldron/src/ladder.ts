@@ -18,6 +18,16 @@ interface RawTier {
   workflowName: string;
   isFrontier: boolean;
   costPerRunUsdEstimate: number | null;
+  laneWorkflows?: unknown;
+}
+
+function readLaneWorkflows(value: unknown): Readonly<Record<string, string>> | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const laneWorkflows: Record<string, string> = {};
+  for (const [key, binding] of Object.entries(value)) {
+    if (typeof binding === 'string' && binding.length > 0) laneWorkflows[key] = binding;
+  }
+  return Object.keys(laneWorkflows).length > 0 ? laneWorkflows : undefined;
 }
 
 interface RawLadderConfig {
@@ -92,12 +102,16 @@ export function loadLadder(configPath?: string): LadderTier[] {
     }
   }
 
-  return config.tiers.map(t => ({
-    name: t.name,
-    workflowName: t.workflowName,
-    isFrontier: t.isFrontier,
-    costPerRunUsd: t.costPerRunUsdEstimate ?? null,
-  }));
+  return config.tiers.map(t => {
+    const laneWorkflows = readLaneWorkflows(t.laneWorkflows);
+    return {
+      name: t.name,
+      workflowName: t.workflowName,
+      isFrontier: t.isFrontier,
+      costPerRunUsd: t.costPerRunUsdEstimate ?? null,
+      ...(laneWorkflows ? { laneWorkflows } : {}),
+    };
+  });
 }
 
 /**

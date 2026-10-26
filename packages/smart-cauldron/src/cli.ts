@@ -9,6 +9,7 @@
  *   --class CODE|INFRA|MIXED   WO class for conductor ruleset
  *   --tags tag1,tag2           Comma-separated tags
  *   --entry qwen|codex|claude|frontier  Override entry tier (skips conductor)
+ *   --workflow <name>          Explicit workflow lane. Omitted keeps the tier binding.
  *   --out-dir <path>           cascade-runs output dir (default: ./cascade-runs)
  *   --dry-run                  Print which tier would be picked, do not fire
  *   --api-url <url>            Archon API base (default: ARCHON_API_BASE_URL or http://localhost:3090)
@@ -91,6 +92,8 @@ interface CliArgs {
   woClass?: string;
   tags?: string[];
   entry?: string;
+  /** Undefined when --workflow was omitted. */
+  workflow?: string;
   outDir: string;
   dryRun: boolean;
   apiUrl?: string;
@@ -115,6 +118,7 @@ Options:
   --class <CLASS>    WO class for conductor ruleset (CODE, INFRA, MIXED)
   --tags <tags>      Comma-separated tags (e.g. mechanical,auth)
   --entry <tier>     Override entry tier (zero, qwen, codex, claude, frontier)
+  --workflow <name>  Explicit workflow lane (omitted keeps the selected tier workflow)
   --out-dir <path>   Output directory for cascade records (default: ./cascade-runs)
   --dry-run          Print entry tier selection only; do not fire
   --api-url <url>    Archon API base URL (default: ARCHON_API_BASE_URL env or http://localhost:3090)
@@ -164,6 +168,9 @@ export function parseArgs(argv: string[]): CliArgs {
       i += 2;
     } else if (arg === '--entry' && i + 1 < args.length) {
       result.entry = args[i + 1];
+      i += 2;
+    } else if (arg === '--workflow' && i + 1 < args.length) {
+      result.workflow = args[i + 1];
       i += 2;
     } else if (arg === '--out-dir' && i + 1 < args.length) {
       result.outDir = args[i + 1] ?? './cascade-runs';
@@ -287,6 +294,7 @@ async function main(): Promise<void> {
   if (args.tags && args.tags.length > 0)
     console.log(`[smart-cauldron]   tags=${args.tags.join(',')}`);
   if (args.entry) console.log(`[smart-cauldron]   entry override=${args.entry}`);
+  if (args.workflow) console.log(`[smart-cauldron]   workflow=${args.workflow}`);
   if (args.dryRun) console.log('[smart-cauldron]   DRY RUN mode');
   if (args.pollTimeoutMs !== undefined)
     console.log(`[smart-cauldron]   poll timeout override=${args.pollTimeoutMs}ms`);
@@ -302,6 +310,7 @@ async function main(): Promise<void> {
     woClass: args.woClass,
     tags: args.tags,
     entryOverride: args.entry,
+    ...(args.workflow !== undefined ? { workflow: args.workflow } : {}),
     outDir: args.outDir,
     dryRun: args.dryRun,
     apiBaseUrl: args.apiUrl,
