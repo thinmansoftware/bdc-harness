@@ -4882,9 +4882,15 @@ nodes:
           if [ -n "$REPO" ] && [ -n "$PR_NUM" ]; then
             PR_FILES_HELPER="${BDC_PR_FILES_HELPER:-/app/scripts/gh-pr-files.sh}"
             if [ -f "$PR_FILES_HELPER" ]; then
-              PR_FILES=$(bash "$PR_FILES_HELPER" "$REPO" "$PR_NUM" 2>/dev/null || true)
+              if ! PR_FILES=$(bash "$PR_FILES_HELPER" "$REPO" "$PR_NUM"); then
+                echo "PR_CONTENT_ERROR: failed to list PR files via $PR_FILES_HELPER for $REPO#$PR_NUM" >&2
+                exit 1
+              fi
             else
-              PR_FILES=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/files" --jq '.[].filename' 2>/dev/null || true)
+              if ! PR_FILES=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/files" --jq '.[].filename'); then
+                echo "PR_CONTENT_ERROR: failed to list PR files via GitHub API for $REPO#$PR_NUM" >&2
+                exit 1
+              fi
             fi
             if [ -n "$CLAIMED_PATHS" ]; then
               MISSING=""

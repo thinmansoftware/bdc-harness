@@ -48,7 +48,8 @@ The current working directory IS the feature branch (worktree). Read each change
 ```bash
 PR_NUMBER=$(cat $ARTIFACTS_DIR/.pr-number | tr -d '\n')
 # List changed files
-gh api --paginate "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --jq '.[].filename'
+REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename'
 ```
 
 For each file, read the full file in the current working directory to understand the complete context, not just the diff hunks.

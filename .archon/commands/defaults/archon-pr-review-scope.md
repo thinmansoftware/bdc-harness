@@ -208,7 +208,8 @@ Store this for reference - parallel agents will re-fetch as needed.
 ### 3.2 List Changed Files by Type
 
 ```bash
-gh api --paginate "repos/{owner}/{repo}/pulls/{number}/files" --jq '.[].filename'
+REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner')
+gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename'
 ```
 
 **Categorize files:**
