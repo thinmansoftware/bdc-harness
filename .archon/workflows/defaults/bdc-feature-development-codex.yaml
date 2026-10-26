@@ -4424,11 +4424,18 @@ nodes:
           if [ "${grep_dropped:-0}" -gt 0 ]; then
             verdict="fail"
           fi
+          case "$grep_line" in
+            N/A*|n/a*) verdict="fail" ;;
+          esac
         fi
         if [ "${SER_REQUIRE_ATTEMPT:-}" = "1" ]; then
           case "$tests_status" in
             passed|failed|counts_unparsed)
-              ser_runner check-attempt >/dev/null 2>&1 || verdict="fail"
+              local attempt_err
+              attempt_err="$(ser_runner check-attempt 2>&1 >/dev/null)" || {
+                verdict="fail"
+                printf '%s\n' "$attempt_err" >&2
+              }
               ;;
           esac
         fi
@@ -4568,6 +4575,10 @@ nodes:
           echo "EVIDENCE_ERROR: run-stop-greps produced no output (grep_status=missing). Grep evidence is required before manifest evidence can be published (bdc-xo #1940)." >&2
           return 1
         fi
+        if [ "$grep_status" = "incomplete" ] && [ "${grep_declared:-0}" -eq 0 ] 2>/dev/null; then
+          echo "EVIDENCE_ERROR: grep_status=incomplete with grep_declared=0. Unresolved required assertions cannot be published as a pass (bdc-xo #1940)." >&2
+          return 1
+        fi
         if [ "$grep_declared" -gt 0 ] 2>/dev/null; then
           case "$grep_status" in
             passed) ;;
@@ -4606,8 +4617,9 @@ nodes:
         if [ "${SER_REQUIRE_ATTEMPT:-}" = "1" ]; then
           case "$tests_status" in
             passed|failed|counts_unparsed)
-              if ! ser_runner check-attempt >/dev/null 2>&1; then
-                echo "REFUSED missing or stale attempt" >&2
+              local attempt_err
+              if ! attempt_err="$(ser_runner check-attempt 2>&1 >/dev/null)"; then
+                printf '%s\n' "${attempt_err:-REFUSED missing or stale attempt}" >&2
                 return 1
               fi
               ;;

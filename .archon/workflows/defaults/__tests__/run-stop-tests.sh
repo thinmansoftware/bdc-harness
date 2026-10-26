@@ -823,6 +823,58 @@ assert_eq "t6 repeated scrub identical" "same=yes" "$(printf '%s\n' "$T6" | sed 
 assert_eq "t6 dprep skip rc" "dprep_rc=0" "$(printf '%s\n' "$T6" | sed -n '4p')"
 assert_contains "t6 dprep skip path" "dprep: no package.json with a bun lockfile, skipping" "$(printf '%s\n' "$T6" | sed -n '5p')"
 
+echo "--- pass plus no-count or zero-count never reports passed ---"
+MIX="$(mktemp -d)"
+cat > "$MIX/ok.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+cat > "$MIX/nocount.sh" <<'EOF'
+#!/bin/sh
+echo "no counts here"
+exit 0
+EOF
+cat > "$MIX/zero.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 0/0"
+exit 0
+EOF
+cat > "$MIX/impossible.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 4/3"
+exit 0
+EOF
+chmod +x "$MIX/ok.sh" "$MIX/nocount.sh" "$MIX/zero.sh" "$MIX/impossible.sh"
+printf 'bash ./ok.sh\nbash ./nocount.sh\n' > "$MIX/cmds"
+mix_nc="$(cd "$MIX" && rst_run_commands ./cmds ./log-nc)"
+assert_eq "pass plus no-count is blank counts" "0  " "$mix_nc"
+assert_contains "pass plus no-count keeps the passing command" "### run-stop-tests: bash ./ok.sh" "$(cat "$MIX/log-nc")"
+assert_contains "pass plus no-count keeps the blank command" "### run-stop-tests: bash ./nocount.sh" "$(cat "$MIX/log-nc")"
+nc_exit="${mix_nc%% *}"
+nc_counts="$(printf '%s' "${mix_nc#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+nc_report="$(SOURCE=spec_declared rst_report CODE 'bash ./ok.sh; bash ./nocount.sh' "$nc_exit" "$nc_counts")"
+assert_contains "pass plus no-count is counts_unparsed" "TESTS_STATUS=counts_unparsed" "$nc_report"
+assert_not_contains "pass plus no-count is not passed" "TESTS_STATUS=passed" "$nc_report"
+printf 'bash ./ok.sh\nbash ./zero.sh\n' > "$MIX/cmds"
+mix_z="$(cd "$MIX" && rst_run_commands ./cmds ./log-z)"
+assert_eq "pass plus 0/0 publishes 0 0 0" "0 0 0" "$mix_z"
+assert_contains "pass plus 0/0 keeps the zero member" "### run-stop-tests: bash ./zero.sh" "$(cat "$MIX/log-z")"
+z_exit="${mix_z%% *}"
+z_counts="$(printf '%s' "${mix_z#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+z_report="$(rst_report CODE 'bash ./ok.sh; bash ./zero.sh' "$z_exit" "$z_counts")"
+assert_contains "pass plus 0/0 is failed" "TESTS_STATUS=failed" "$z_report"
+assert_not_contains "pass plus 0/0 is not passed" "TESTS_STATUS=passed" "$z_report"
+printf 'bash ./impossible.sh\n' > "$MIX/cmds"
+mix_i="$(cd "$MIX" && rst_run_commands ./cmds ./log-i)"
+i_exit="${mix_i%% *}"
+i_counts="$(printf '%s' "${mix_i#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+assert_eq "impossible 4/3 uses a nonzero exit" "1" "$i_exit"
+assert_eq "impossible 4/3 blanks counts" "" "$i_counts"
+i_report="$(SOURCE=spec_declared rst_report CODE 'bash ./impossible.sh' "$i_exit" "$i_counts")"
+assert_not_contains "impossible 4/3 is not passed" "TESTS_STATUS=passed" "$i_report"
+rm -rf "$MIX"
+
 unset RST_NPX_BIN RST_NPM_BIN GH_TOKEN
 unset TELEGRAM_BOT_TOKEN TELEGRAM_STREAMING_MODE TELEGRAM_APPROVAL_CHAT_ID TELEGRAM_ALLOWED_USER_IDS TELEGRAM_TEST_FIXTURE
 export PATH="$ORIG_PATH"

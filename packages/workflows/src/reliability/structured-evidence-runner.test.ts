@@ -17,6 +17,7 @@ import {
   allowAssertion,
   allowTestCommand,
   checkAttemptRecord,
+  checkBoundAttempts,
   displayCommands,
   execAssertion,
   extractTestCommands,
@@ -163,6 +164,36 @@ describe('unsafe-and-decode-bypasses', () => {
     expect(existsSync(sentinel)).toBe(false);
     rmSync(cwd, { recursive: true, force: true });
   });
+
+  it('refuses find predicates after -- without spawning or writing', () => {
+    const cwd = tempDir('ser-find-');
+    writeFileSync(join(cwd, 'keep.txt'), 'stay\n');
+    const marker = join(cwd, 'marker');
+    const commands = [
+      'find -- . -delete',
+      'find -- . -exec touch marker',
+      'find -- . -execdir touch marker',
+      'find -- . -ok touch marker',
+      'find -- . -okdir touch marker',
+      'find -- . -fprint marker',
+      'find -- . -fls marker',
+      "find -- . '-delete'",
+      "find -- . '-fprint' marker",
+    ];
+    for (const command of commands) {
+      const allowed = allowAssertion(command);
+      expect(allowed.ok).toBe(false);
+      if (!allowed.ok) expect(allowed.reason).toBe('find-flag');
+      const ran = execAssertion(command, cwd);
+      expect(ran.reason).toBe('find-flag');
+      expect(ran.stdout).toBe('');
+      expect(existsSync(join(cwd, 'keep.txt'))).toBe(true);
+      expect(existsSync(marker)).toBe(false);
+    }
+    const sortPath = allowAssertion("sort -- '--output=glob'");
+    expect(sortPath.ok).toBe(true);
+    rmSync(cwd, { recursive: true, force: true });
+  });
 });
 
 describe('git-and-pipeline-safety', () => {
@@ -220,6 +251,66 @@ describe('partial-failure-and-compatibility', () => {
     }
     expect(allowTestCommand("python -c 'print(1)'")).toBe(false);
     rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it('does not publish a pass when a later required member has no counts or zero counts', () => {
+    const cwd = tempDir('ser-mixed-counts-');
+    const artifacts = join(cwd, 'artifacts');
+    mkdirSync(artifacts, { recursive: true });
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\nexit 0\n');
+    writeExec(join(cwd, 'nocount.sh'), '#!/bin/sh\necho "no counts here"\nexit 0\n');
+    writeExec(join(cwd, 'zero.sh'), '#!/bin/sh\necho "Tests: 0/0"\nexit 0\n');
+    writeExec(join(cwd, 'impossible.sh'), '#!/bin/sh\necho "Tests: 4/3"\nexit 0\n');
+    const saved = process.env.ARTIFACTS_DIR;
+    process.env.ARTIFACTS_DIR = artifacts;
+    try {
+      const unparsed = runTestCommands(
+        ['bash ./ok.sh', 'bash ./nocount.sh'],
+        cwd,
+        join(artifacts, 'nocount.log')
+      );
+      expect(unparsed.line).toBe('0  ');
+      expect(unparsed.passed).toBeNull();
+      expect(unparsed.total).toBeNull();
+      expect(unparsed.attempt.aggregate).toBe('COUNTS_UNPARSED');
+      expect(unparsed.attempt.members.map(member => member.status)).toEqual([
+        'PASSED',
+        'COUNTS_UNPARSED',
+      ]);
+      const unparsedVerdict = checkAttemptRecord(unparsed.attempt, cwd, authority(cwd));
+      expect(unparsedVerdict.ok).toBe(false);
+      if (!unparsedVerdict.ok) expect(unparsedVerdict.reason).toContain('nocount.sh');
+
+      const zero = runTestCommands(
+        ['bash ./ok.sh', 'bash ./zero.sh'],
+        cwd,
+        join(artifacts, 'zero.log')
+      );
+      expect(zero.line).toBe('0 0 0');
+      expect(zero.attempt.aggregate).toBe('FAILED');
+      expect(zero.attempt.members[1]?.status).toBe('FAILED');
+      expect(zero.attempt.members[1]?.reason).toBe('zero-count');
+      expect(zero.attempt.members[1]?.passed).toBe(0);
+      expect(zero.attempt.members[1]?.total).toBe(0);
+      const zeroVerdict = checkAttemptRecord(zero.attempt, cwd, authority(cwd));
+      expect(zeroVerdict.ok).toBe(false);
+
+      const impossible = runTestCommands(
+        ['bash ./impossible.sh'],
+        cwd,
+        join(artifacts, 'impossible.log')
+      );
+      expect(impossible.line.startsWith('0 ')).toBe(false);
+      expect(impossible.passed).toBeNull();
+      expect(impossible.total).toBeNull();
+      expect(impossible.exitCode).not.toBe(0);
+      expect(impossible.attempt.members[0]?.status).toBe('FAILED');
+      expect(checkAttemptRecord(impossible.attempt, cwd, authority(cwd)).ok).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = saved;
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });
 
@@ -629,7 +720,7 @@ describe('hermetic-fresh-attempt', () => {
         cwd,
         env,
         encoding: 'utf8',
-        input: 'grep -c base README\neq\t1\nDECLARED\t1\n',
+        input: 'grep -c base README\teq\t1\nDECLARED\t1\n',
       });
       expect(before.status).toBe(0);
       const attempts = join(artifacts, 'evidence', 'attempts');
@@ -661,6 +752,132 @@ describe('hermetic-fresh-attempt', () => {
     } finally {
       if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
       else process.env.ARTIFACTS_DIR = savedArtifacts;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses stale tests, cross-run ids, wrong kinds, and incomplete members', () => {
+    const cwd = tempDir('ser-bind-gate-');
+    initRepo(cwd);
+    writeFileSync(join(cwd, 'src.js'), 'v1\n');
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+    const artifacts = join(cwd, 'artifacts');
+    mkdirSync(artifacts, { recursive: true });
+    const savedArtifacts = process.env.ARTIFACTS_DIR;
+    const savedRun = process.env.SER_RUN_ID;
+    const savedRepo = process.env.SER_REPO;
+    process.env.ARTIFACTS_DIR = artifacts;
+    process.env.SER_RUN_ID = 'run-a';
+    process.env.SER_REPO = 'thinmansoftware/bdc-harness';
+    const env = {
+      ...process.env,
+      HARNESS_ROOT_OVERRIDE: ROOT,
+      ARTIFACTS_DIR: artifacts,
+      SER_RUN_ID: 'run-a',
+      SER_REPO: 'thinmansoftware/bdc-harness',
+    };
+    try {
+      const summary = runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
+      const greps = spawnSync('bun', [RUNNER, 'run-greps'], {
+        cwd,
+        env,
+        encoding: 'utf8',
+        input: 'grep -c base README\teq\t1\nDECLARED\t1\n',
+      });
+      expect(greps.status).toBe(0);
+      const attempts = join(artifacts, 'evidence', 'attempts');
+      const grepId = readFileSync(join(attempts, 'current-greps'), 'utf8').trim();
+      const live = authority(cwd);
+      live.repo = 'thinmansoftware/bdc-harness';
+      expect(
+        checkBoundAttempts(
+          cwd,
+          { ...live, repo: '' },
+          {
+            testAttemptId: summary.attempt.attemptId,
+            grepAttemptId: grepId,
+          }
+        ).ok
+      ).toBe(true);
+      const wrongRepo = checkBoundAttempts(
+        cwd,
+        { ...live, repo: 'thinmansoftware/other' },
+        {
+          testAttemptId: summary.attempt.attemptId,
+          grepAttemptId: grepId,
+        }
+      );
+      expect(wrongRepo.ok).toBe(false);
+      if (!wrongRepo.ok) expect(wrongRepo.reason).toContain('authority-repo');
+
+      git(cwd, ['add', 'src.js', 'ok.sh']);
+      git(cwd, ['commit', '-qm', 'identical tested bytes']);
+      expect(
+        checkBoundAttempts(cwd, live, {
+          testAttemptId: summary.attempt.attemptId,
+          grepAttemptId: grepId,
+        }).ok
+      ).toBe(true);
+
+      process.env.SER_RUN_ID = 'run-b';
+      const crossRun = checkBoundAttempts(cwd, live, {
+        testAttemptId: summary.attempt.attemptId,
+        grepAttemptId: grepId,
+      });
+      expect(crossRun.ok).toBe(false);
+      if (!crossRun.ok) expect(crossRun.reason).toContain('run-id');
+      process.env.SER_RUN_ID = 'run-a';
+
+      const wrongKind = checkBoundAttempts(cwd, live, {
+        testAttemptId: grepId,
+        grepAttemptId: summary.attempt.attemptId,
+      });
+      expect(wrongKind.ok).toBe(false);
+      if (!wrongKind.ok) expect(wrongKind.reason).toContain('attempt-kind');
+
+      const incomplete = structuredClone(summary.attempt);
+      const selected = incomplete.members.find(member => member.scope === 'selected');
+      if (!selected) throw new Error('missing selected member');
+      selected.status = 'INCOMPLETE';
+      selected.reason = 'planned';
+      incomplete.aggregate = 'INCOMPLETE';
+      writeFileSync(
+        join(attempts, `${summary.attempt.attemptId}.json`),
+        `${JSON.stringify(incomplete, null, 2)}\n`
+      );
+      const incompleteVerdict = checkBoundAttempts(cwd, live, {
+        testAttemptId: summary.attempt.attemptId,
+        grepAttemptId: null,
+      });
+      expect(incompleteVerdict.ok).toBe(false);
+      if (!incompleteVerdict.ok) expect(incompleteVerdict.reason.startsWith('tests:')).toBe(true);
+
+      writeFileSync(
+        join(attempts, `${summary.attempt.attemptId}.json`),
+        `${JSON.stringify(summary.attempt, null, 2)}\n`
+      );
+      writeFileSync(join(cwd, 'src.js'), 'v2\n');
+      const laterGrep = spawnSync('bun', [RUNNER, 'run-greps'], {
+        cwd,
+        env: { ...env, SER_RUN_ID: 'run-a' },
+        encoding: 'utf8',
+        input: 'grep -c base README\teq\t1\nDECLARED\t1\n',
+      });
+      expect(laterGrep.status).toBe(0);
+      const freshGrepId = readFileSync(join(attempts, 'current-greps'), 'utf8').trim();
+      const stale = checkBoundAttempts(cwd, live, {
+        testAttemptId: summary.attempt.attemptId,
+        grepAttemptId: freshGrepId,
+      });
+      expect(stale.ok).toBe(false);
+      if (!stale.ok) expect(stale.reason.startsWith('tests:')).toBe(true);
+    } finally {
+      if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = savedArtifacts;
+      if (savedRun === undefined) delete process.env.SER_RUN_ID;
+      else process.env.SER_RUN_ID = savedRun;
+      if (savedRepo === undefined) delete process.env.SER_REPO;
+      else process.env.SER_REPO = savedRepo;
       rmSync(cwd, { recursive: true, force: true });
     }
   });

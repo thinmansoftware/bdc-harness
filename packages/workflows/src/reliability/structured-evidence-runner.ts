@@ -637,6 +637,14 @@ export function readKindAttempt(
   return readPointerAttempt(cwd, kindPointer(kind));
 }
 
+function liveBoundRunId(): string | null {
+  const ser = process.env.SER_RUN_ID ?? '';
+  if (ser.length > 0) return ser;
+  const workflow = process.env.WORKFLOW_RUN_ID ?? '';
+  if (workflow.length > 0) return workflow;
+  return null;
+}
+
 export function checkBoundAttempts(
   cwd: string,
   liveAuthority: EvidenceAuthority,
@@ -649,21 +657,35 @@ export function checkBoundAttempts(
   if (binding.grepAttemptId && !binding.testAttemptId) {
     return { ok: false, reason: 'missing-test-attempt' };
   }
+  let testAttempt: EvidenceAttempt | null = null;
+  let grepAttempt: EvidenceAttempt | null = null;
   if (binding.testAttemptId) {
-    const attempt = readAttemptById(cwd, binding.testAttemptId);
-    if (!attempt) return { ok: false, reason: 'missing-test-attempt' };
-    if (attempt.kind !== 'tests' || attempt.source === 'other-stage') {
+    testAttempt = readAttemptById(cwd, binding.testAttemptId);
+    if (!testAttempt) return { ok: false, reason: 'missing-test-attempt' };
+    if (testAttempt.kind !== 'tests' || testAttempt.source === 'other-stage') {
       return { ok: false, reason: 'test-attempt-kind' };
     }
-    const verdict = checkAttemptRecord(attempt, cwd, liveAuthority);
+    const verdict = checkAttemptRecord(testAttempt, cwd, liveAuthority);
     if (!verdict.ok) return { ok: false, reason: `tests:${verdict.reason}` };
   }
   if (binding.grepAttemptId) {
-    const attempt = readAttemptById(cwd, binding.grepAttemptId);
-    if (!attempt) return { ok: false, reason: 'missing-grep-attempt' };
-    if (attempt.kind !== 'greps') return { ok: false, reason: 'grep-attempt-kind' };
-    const verdict = checkAttemptRecord(attempt, cwd, liveAuthority);
+    grepAttempt = readAttemptById(cwd, binding.grepAttemptId);
+    if (!grepAttempt) return { ok: false, reason: 'missing-grep-attempt' };
+    if (grepAttempt.kind !== 'greps') return { ok: false, reason: 'grep-attempt-kind' };
+    const verdict = checkAttemptRecord(grepAttempt, cwd, liveAuthority);
     if (!verdict.ok) return { ok: false, reason: `greps:${verdict.reason}` };
+  }
+  if (testAttempt && grepAttempt && testAttempt.runId !== grepAttempt.runId) {
+    return { ok: false, reason: 'run-id-mismatch' };
+  }
+  const liveRun = liveBoundRunId();
+  if (liveRun) {
+    if (testAttempt && testAttempt.runId !== liveRun) {
+      return { ok: false, reason: 'tests:run-id' };
+    }
+    if (grepAttempt && grepAttempt.runId !== liveRun) {
+      return { ok: false, reason: 'greps:run-id' };
+    }
   }
   return { ok: true };
 }
@@ -685,6 +707,22 @@ function fileHash(cwd: string, path: string): string {
   } catch {
     return 'missing';
   }
+}
+
+function attemptCompletionVerdict(
+  recorded: EvidenceAttempt
+): { ok: true } | { ok: false; reason: string } {
+  const selected = recorded.members.filter(member => member.scope === 'selected');
+  if (recorded.aggregate === 'NOT_APPLICABLE' && selected.length === 0) return { ok: true };
+  for (const member of selected) {
+    if (member.status !== 'PASSED') {
+      return { ok: false, reason: `member-not-passed:${member.rawCommand}` };
+    }
+  }
+  if (recorded.aggregate !== 'PASSED') {
+    return { ok: false, reason: `aggregate-${recorded.aggregate}` };
+  }
+  return { ok: true };
 }
 
 export function checkAttemptRecord(
@@ -734,11 +772,13 @@ export function checkAttemptRecord(
   if (live.method === 'not-a-git-worktree' || recorded.tree.method === 'not-a-git-worktree') {
     return recorded.tree.contentDigest === live.contentDigest &&
       recorded.tree.headSha === live.headSha
-      ? { ok: true }
+      ? attemptCompletionVerdict(recorded)
       : { ok: false, reason: 'tree' };
   }
   if (live.headSha === recorded.tree.headSha) {
-    return samePathSet(live, recorded.tree) ? { ok: true } : { ok: false, reason: 'dirty-bytes' };
+    return samePathSet(live, recorded.tree)
+      ? attemptCompletionVerdict(recorded)
+      : { ok: false, reason: 'dirty-bytes' };
   }
   const ancestor = gitCapture(cwd, [
     'merge-base',
@@ -776,7 +816,7 @@ export function checkAttemptRecord(
     const previous = recorded.tree.paths.find(row => row.path === item.path);
     if (previous?.sha256 !== item.sha256) return { ok: false, reason: 'new-dirty' };
   }
-  return { ok: true };
+  return attemptCompletionVerdict(recorded);
 }
 
 function rejectControls(command: string): string | null {
@@ -959,6 +999,12 @@ function optionTokens(argv: readonly string[]): string[] {
   return out;
 }
 
+// find keeps interpreting expression predicates after `--`. Every decoded
+// token after the runner name is an expression, including -delete/-exec/-fprint.
+function findExpressionTokens(argv: readonly string[]): string[] {
+  return argv.slice(1);
+}
+
 function allowGitArgv(
   argv: readonly string[]
 ): { ok: true; wrapped: string[] } | { ok: false; reason: string } {
@@ -1037,13 +1083,16 @@ export function allowAssertion(
       segments.push({ argv: git.wrapped, locale: peeled.env });
       continue;
     }
-    const options = optionTokens(peeled.argv);
     if (GREP_RUNNERS.has(runner)) {
-      if (options.some(forbiddenGrepFlag)) return { ok: false, reason: 'grep-flag' };
+      if (optionTokens(peeled.argv).some(forbiddenGrepFlag))
+        return { ok: false, reason: 'grep-flag' };
     } else if (runner === 'find') {
-      if (options.some(forbiddenFindFlag)) return { ok: false, reason: 'find-flag' };
+      if (findExpressionTokens(peeled.argv).some(forbiddenFindFlag)) {
+        return { ok: false, reason: 'find-flag' };
+      }
     } else if (runner === 'sort') {
-      if (options.some(forbiddenSortFlag)) return { ok: false, reason: 'sort-flag' };
+      if (optionTokens(peeled.argv).some(forbiddenSortFlag))
+        return { ok: false, reason: 'sort-flag' };
     } else if (!ASSERT_SIMPLE.has(runner)) {
       return { ok: false, reason: 'runner' };
     }
@@ -1424,6 +1473,51 @@ export interface TestRunSummary {
   readonly attempt: EvidenceAttempt;
 }
 
+function publishTestSummary(
+  members: readonly AttemptMember[],
+  aggregate: EvidenceStatus,
+  exitCode: number,
+  hit: boolean,
+  passed: number,
+  total: number
+): { line: string; exitCode: number; passed: number | null; total: number | null } {
+  const selected = members.filter(member => member.scope === 'selected');
+  const allPassed =
+    exitCode === 0 &&
+    aggregate === 'PASSED' &&
+    selected.length > 0 &&
+    selected.every(member => member.status === 'PASSED') &&
+    hit &&
+    passed === total &&
+    total > 0;
+  if (allPassed) {
+    return { line: `${exitCode} ${passed} ${total}`, exitCode, passed, total };
+  }
+  const impossible = selected.some(
+    member =>
+      member.passed !== null &&
+      member.total !== null &&
+      (member.passed > member.total || member.passed < 0 || member.total < 0)
+  );
+  if (impossible) {
+    const publishedExit = exitCode === 0 ? 1 : exitCode;
+    return { line: `${publishedExit}  `, exitCode: publishedExit, passed: null, total: null };
+  }
+  const passedMember = selected.some(member => member.status === 'PASSED');
+  const zeroCount = selected.some(member => member.reason === 'zero-count');
+  if (passedMember && zeroCount && exitCode === 0) {
+    return { line: '0 0 0', exitCode: 0, passed: 0, total: 0 };
+  }
+  const unparsed = selected.some(member => member.status === 'COUNTS_UNPARSED');
+  if (passedMember && unparsed && exitCode === 0) {
+    return { line: `${exitCode}  `, exitCode, passed: null, total: null };
+  }
+  if (hit) {
+    return { line: `${exitCode} ${passed} ${total}`, exitCode, passed, total };
+  }
+  return { line: `${exitCode}  `, exitCode, passed: null, total: null };
+}
+
 export function runTestCommands(
   commands: readonly string[],
   cwd: string,
@@ -1622,12 +1716,12 @@ export function runTestCommands(
   }
   attempt.aggregate = aggregateOf(members);
   persistAttempt(cwd, attempt);
-  const line = hit ? `${exitCode} ${passed} ${total}` : `${exitCode}  `;
+  const published = publishTestSummary(members, attempt.aggregate, exitCode, hit, passed, total);
   return {
-    line,
-    exitCode,
-    passed: hit ? passed : null,
-    total: hit ? total : null,
+    line: published.line,
+    exitCode: published.exitCode,
+    passed: published.passed,
+    total: published.total,
     failStep,
     failDir,
     attempt,

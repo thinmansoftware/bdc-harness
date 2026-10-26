@@ -42,6 +42,7 @@ DEFAULTS="$HERE/.."
 export HARNESS_ROOT_OVERRIDE="$(cd "$HERE/../../../.." && pwd)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
+bdc-feature-development-astra.yaml
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
 bdc-feature-development-cursor.yaml
@@ -73,7 +74,7 @@ for fn in rsg_extract rsg_tokens_safe rsg_argv_looks_readonly rsg_allow_cmd rsg_
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: rsg core byte-identical across all 12 lanes (parity-all-12-lanes) ---"
+echo "--- Parity: rsg core byte-identical across all 13 lanes (parity-all-13-lanes) ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$RSG_CORE" "$(extract_core "$DEFAULTS/$lane" rsg)"
 done
@@ -261,6 +262,50 @@ assert_contains "execdir is all_dropped" "GREP_STATUS=all_dropped" "$OUT"
 assert_eq "execdir did not write pwned-rsg-execdir.txt" "0" "$(test -e pwned-rsg-execdir.txt && echo 1 || echo 0)"
 assert_eq "observe execdir is ERR and does not run" "ERR" "$(rsg_observe 'find . -execdir sh evil.sh \;')"
 assert_eq "observe still did not write pwned-rsg-execdir.txt" "0" "$(test -e pwned-rsg-execdir.txt && echo 1 || echo 0)"
+
+echo "--- find predicates after -- are NEVER_RAN and do not touch the tree ---"
+printf 'stay\n' > keep.txt
+FIND_ART="$(mktemp -d)"
+export ARTIFACTS_DIR="$FIND_ART"
+for cmd in \
+  "find -- . -delete" \
+  "find -- . -exec touch marker-exec" \
+  "find -- . -execdir touch marker-execdir" \
+  "find -- . -ok touch marker-ok" \
+  "find -- . -okdir touch marker-okdir" \
+  "find -- . -fprint marker-fprint" \
+  "find -- . -fls marker-fls" \
+  "find -- . '-delete'" \
+  "find -- . '-fprint' marker-qfprint"
+do
+  obs="$(rsg_observe "$cmd")"
+  assert_eq "observe refuses $cmd" "ERR" "$obs"
+  rc=0
+  rsg_exec_pipeline "$cmd" >/dev/null 2>&1 || rc=$?
+  assert_eq "exec refuses $cmd" "127" "$rc"
+  if rsg_allow_cmd "$cmd"; then
+    FAIL=$((FAIL + 1)); echo "FAIL: allow admitted $cmd"
+  else
+    PASS=$((PASS + 1)); echo "PASS: allow refuses $cmd"
+  fi
+done
+OUT="$(printf 'find -- . -delete\teq\t0\nUNPARSED\t0\nDECLARED\t1\n' | rsg_run)"
+assert_contains "post-terminator delete is dropped" "GREP_DROPPED=1" "$OUT"
+assert_contains "post-terminator delete is not executed" "GREP_EXECUTED=0" "$OUT"
+attempt_json="$(find "$FIND_ART/evidence/attempts" -name '*.json' -print -quit)"
+assert_contains "post-terminator delete is NEVER_RAN" '"status": "NEVER_RAN"' "$(cat "$attempt_json")"
+assert_contains "post-terminator delete reason is find-flag" '"reason": "find-flag"' "$(cat "$attempt_json")"
+assert_eq "keep.txt survived find -- -delete" "stay" "$(cat keep.txt)"
+for marker in marker-exec marker-execdir marker-ok marker-okdir marker-fprint marker-fls marker-qfprint; do
+  assert_eq "no $marker" "0" "$(test -e "$marker" && echo 1 || echo 0)"
+done
+if rsg_allow_cmd "sort -- '--output=glob'"; then
+  PASS=$((PASS + 1)); echo "PASS: sort path after -- stays allowed"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL: sort path after -- was refused"
+fi
+unset ARTIFACTS_DIR
+rm -rf "$FIND_ART"
 
 cd "$HERE"
 rm -rf "$TMP"
