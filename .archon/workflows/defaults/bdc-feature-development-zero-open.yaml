@@ -1682,127 +1682,6 @@ nodes:
           *) printf 'CODE' ;;
         esac
       }
-      # inline-flag rejection: -c -e --eval -p --print -r --require -i -m
-      rst_has_inline_flag() {
-        local t
-        for t in "$@"; do
-          case "$t" in
-            -c|-e|--eval|-p|--print|-r|--require|-i|-m|-c=*|-e=*|--eval=*|-p=*|--print=*|-r=*|--require=*|-i=*|-m=*) return 0 ;;
-          esac
-        done
-        return 1
-      }
-      rst_tokens_safe() {
-        local t
-        for t in "$@"; do
-          printf '%s' "$t" | grep -qE '^[A-Za-z0-9@%+=:,./_-]+$' || return 1
-        done
-        return 0
-      }
-      rst_is_repo_script() {
-        local p="$1" oldifs seg
-        case "$p" in /*|-*) return 1 ;; esac
-        case "$p" in *.js|*.mjs|*.cjs|*.ts|*.tsx|*.py|*.sh) ;; *) return 1 ;; esac
-        oldifs="$IFS"; IFS=/; set -f; set -- $p; set +f; IFS="$oldifs"
-        for seg in "$@"; do
-          [ "$seg" = ".." ] && return 1
-        done
-        return 0
-      }
-      rst_argv_looks_runnable() {
-        local runner segment="$1"
-        set -f
-        set -- $segment
-        set +f
-        [ $# -ge 2 ] || return 1
-        runner="$1"
-        shift
-        rst_tokens_safe "$runner" "$@" || return 1
-        case "$runner" in
-          node|npm|npx|bun|bunx|pytest|python|python3|go|cargo|bash|sh|make) ;;
-          *) return 1 ;;
-        esac
-        case "$runner" in
-          python|python3)
-            if [ "$1" = "-m" ] && { [ "${2:-}" = "pytest" ] || [ "${2:-}" = "unittest" ]; }; then
-              shift 2
-              rst_has_inline_flag "$@" && return 1
-              return 0
-            fi
-            rst_is_repo_script "$1" || return 1
-            rst_has_inline_flag "$@" && return 1
-            return 0
-            ;;
-          node|bash|sh)
-            rst_is_repo_script "$1" || return 1
-            rst_has_inline_flag "$@" && return 1
-            return 0
-            ;;
-          bun)
-            if [ "$1" = "test" ] || [ "$1" = "run" ]; then
-              if [ "$1" = "run" ]; then
-                [ -n "${2:-}" ] || return 1
-                printf '%s' "$2" | grep -qE '^[A-Za-z0-9:_.-]+$' || return 1
-              fi
-              rst_has_inline_flag "$@" && return 1
-              return 0
-            fi
-            rst_is_repo_script "$1" || return 1
-            rst_has_inline_flag "$@" && return 1
-            return 0
-            ;;
-          npm)
-            [ "$1" = "test" ] || [ "$1" = "run" ] || return 1
-            if [ "$1" = "run" ]; then
-              [ -n "${2:-}" ] || return 1
-              printf '%s' "$2" | grep -qE '^[A-Za-z0-9:_.-]+$' || return 1
-            fi
-            rst_has_inline_flag "$@" && return 1
-            return 0
-            ;;
-          npx|bunx)
-            printf '%s' "$1" | grep -qE '^[A-Za-z0-9@/._-]+$' || return 1
-            rst_has_inline_flag "$@" && return 1
-            return 0
-            ;;
-          pytest|go|cargo|make)
-            rst_has_inline_flag "$@" && return 1
-            return 0
-            ;;
-        esac
-        return 1
-      }
-      # rst_command_looks_runnable <cmd>   (rc 0 when the line tokenizes -- whitespace
-      #   split, no shell -- to an allowlisted runner FOLLOWED BY AN ARGUMENT -- a bare
-      #   "node" or "bun" mentioned in prose is not a command (live false positive, run
-      #   f4dabd76) -- with no inline interpreter modes, and is not a dependency-install
-      #   step). Interpreters (node|bun|python|python3|bash|sh) must take a relative
-      #   repo script path (.js .mjs .cjs .ts .tsx .py .sh), not -c/-e/--eval. python -m
-      #   pytest|unittest is the only -m exception. Round-4 metacharacter rejection
-      #   still applies.
-      rst_command_looks_runnable() {
-        local cmd="$1"
-        case "$cmd" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1 ;; esac
-        # Preserve an optional "cd safe/subdir &&" prefix and declared chains of
-        # test runners. Every remaining && segment must itself be argv-runnable.
-        if printf '%s\n' "$cmd" | grep -qE '^[ ]*cd[ ]+[A-Za-z0-9_./-]+[ ]+&&[ ]+'; then
-          cmd="$(printf '%s\n' "$cmd" | sed -E 's/^[ ]*cd[ ]+[A-Za-z0-9_.\/-]+[ ]+&&[ ]+//')"
-        fi
-        case "${cmd//&&/}" in *'&'*) return 1 ;; esac
-        while :; do
-          local segment
-          case "$cmd" in
-            *'&&'*) segment="${cmd%%&&*}"; cmd="${cmd#*&&}" ;;
-            *) segment="$cmd"; cmd='' ;;
-          esac
-          if printf '%s\n' "$segment" | grep -qE '(^|[ ;])(npm|npm\.cmd|pnpm|yarn|bun)[ ]+(ci|install|i|add)([ ]|$)'; then
-            return 1
-          fi
-          rst_argv_looks_runnable "$segment" || return 1
-          [ -z "$cmd" ] && break
-        done
-        return 0
-      }
       # rst_extract_commands   (spec on stdin -> one declared test command per line, deduped,
       #   first 8). Ladder, in document order:
       #     A. the template "Stop N (test suite|tests|unit tests|suite ...)" block(s): the
@@ -1816,15 +1695,27 @@ nodes:
         awk -v RUNNER='(^|[ /&|;(])(node|bun|bunx|npm|npm[.]cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)( |$)' '
           function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
           function emit(c) { c = clean(c); if (c != "" && !(c in seen)) { seen[c] = 1; print c } }
+          tstate == 2 {
+            line = clean($0)
+            if (line == "") next
+            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { tstate = 0 }
+            else if (line ~ RUNNER) { tcmd = line; sub(/[ \t]*\\$/, "", tcmd); tstate = 1; next }
+            else if (line ~ /^[Ee]xpected:/) { print "MALFORMED:expected-without-command"; next }
+            else { tstate = 0 }
+          }
           tstate == 1 {
             if ($0 ~ /^[ \t]*```/) next
             line = clean($0)
             if (line == "") next
-            if (line ~ /^[Ee]xpected:/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0; next }
+            if (line ~ /^[Ee]xpected:/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 2; next }
             if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0 }
             else { tcmd = (tcmd == "" ? line : tcmd " " line); sub(/[ \t]*\\$/, "", tcmd); next }
           }
-          tstate == 0 && /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Tt]est|[Uu]nit|[Ss]uite)/ { tstate = 1; tcmd = ""; next }
+          tstate == 0 && /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(/ {
+            low = tolower($0)
+            if (low ~ /(^|[^a-z])(grep|assert|ascii)([^a-z]|$)/) next
+            if (low ~ /(^|[^a-z])(tests|test|suites|suite|unit)([^a-z]|$)/) { tstate = 1; tcmd = ""; next }
+          }
           /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition|[Ss]top [Pp]oint|[Tt]est [Ss]cenario|[Tt]est [Pp]lan|[Vv]erification/) ? 1 : 0 }
           insec || $0 ~ /^[ \t]*-?[ \t]*[*]*[Ww]hen[*]*:/ {
             s = $0
@@ -1959,88 +1850,72 @@ nodes:
           esac
         done
       }
-      # rst_run_commands <commands-file> <log>   (runs each command line in the CWD under a
-      #   1500 s budget as tokenized argv -- no bash -c -- appends every command's output
-      #   to <log> under a "### run-stop-tests:" header, and prints "<exit> <passed>
-      #   <total>" -- exit is the first nonzero exit, counts are summed across commands;
-      #   "<exit>  " (empty counts) when nothing parsed). Optional "cd <dir> &&" is
-      #   performed in-process; remaining && segments run sequentially. pipefail is
-      #   unused (pipes are already rejected).
-      rst_run_commands() {
-        local cmds="$1" log="$2" cmd seg rc exit_code=0 p=0 t=0 hit=0 c
-        local saved_pwd work segment d
-        rst_scrub_env
-        saved_pwd="$(pwd)"
-        seg="$(mktemp)"
-        while IFS= read -r cmd; do
-          [ -z "$cmd" ] && continue
-          printf '### run-stop-tests: %s\n' "$cmd" >> "$log"
-          cd "$saved_pwd" || continue
-          : > "$seg"
-          rc=0
-          if ! rst_command_looks_runnable "$cmd"; then
-            printf 'rst_run_commands: refusing non-runnable command\n' > "$seg"
-            rc=1
-          else
-            work="$cmd"
-            if printf '%s\n' "$work" | grep -qE '^[ ]*cd[ ]+[A-Za-z0-9_./-]+[ ]+&&[ ]+'; then
-              d="$(printf '%s\n' "$work" | sed -E 's/^[ ]*cd[ ]+([A-Za-z0-9_.\/-]+)[ ]+&&[ ]+.*$/\1/')"
-              work="$(printf '%s\n' "$work" | sed -E 's/^[ ]*cd[ ]+[A-Za-z0-9_.\/-]+[ ]+&&[ ]+//')"
-              if ! cd "$d"; then
-                printf 'rst_run_commands: cd %s failed\n' "$d" > "$seg"
-                rc=1
-              fi
-            fi
-            if [ "$rc" -eq 0 ]; then
-              while :; do
-                case "$work" in
-                  *'&&'*) segment="${work%%&&*}"; work="${work#*&&}" ;;
-                  *) segment="$work"; work='' ;;
-                esac
-                set -f
-                set -- $segment
-                set +f
-                if [ $# -eq 0 ]; then rc=1; break; fi
-                # Rewrite npx/npm to bun only after the original argv passed the allowlist.
-                # When the real binary is on PATH, leave the command unchanged.
-                if [ "$1" = "npx" ] && ! command -v "${RST_NPX_BIN:-npx}" >/dev/null 2>&1; then
-                  if command -v bunx >/dev/null 2>&1; then
-                    shift
-                    set -- bunx "$@"
-                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
-                  elif command -v bun >/dev/null 2>&1; then
-                    shift
-                    set -- bun x "$@"
-                    printf 'rst_run_commands: npx not found, running as: %s\n' "$*" >> "$seg"
-                  fi
-                elif [ "$1" = "npm" ] && ! command -v "${RST_NPM_BIN:-npm}" >/dev/null 2>&1 && command -v bun >/dev/null 2>&1; then
-                  if [ "${2:-}" = "test" ]; then
-                    shift 2
-                    set -- bun run test "$@"
-                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
-                  elif [ "${2:-}" = "run" ] && [ -n "${3:-}" ]; then
-                    shift 2
-                    set -- bun run "$@"
-                    printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
-                  fi
-                fi
-                timeout 1500 "$@" >> "$seg" 2>&1 < /dev/null
-                rc=$?
-                [ "$rc" -ne 0 ] && break
-                [ -z "$work" ] && break
-              done
-            fi
+      # inline-flag rejection: -c -e --eval -p --print -r --require -i -m
+      # Tokenization, node --test admission, and subprocess spawn live in
+      # packages/workflows/src/reliability/structured-evidence-runner.ts.
+      ser_root() {
+        local c root pkg url d
+        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
+          root="$HARNESS_ROOT_OVERRIDE"
+          pkg="$root/packages/workflows/package.json"
+          if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+            printf '%s' "$root"
+            return 0
           fi
-          cat "$seg" >> "$log"
-          printf '### exit %s\n' "$rc" >> "$log"
-          [ "$rc" -ne 0 ] && [ "$exit_code" -eq 0 ] && exit_code="$rc"
-          c="$(rst_parse_counts < "$seg")"
-          if [ -n "$c" ]; then p=$((p + ${c%% *})); t=$((t + ${c##* })); hit=1; fi
-        done < "$cmds"
-        cd "$saved_pwd" || true
-        rm -f "$seg"
-        if [ "$hit" -eq 1 ]; then printf '%s %s %s' "$exit_code" "$p" "$t"; else printf '%s  ' "$exit_code"; fi
+        fi
+        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
+          pkg="$c/packages/workflows/package.json"
+          if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+            printf '%s' "$c"
+            return 0
+          fi
+        done
+        d="$(pwd)"
+        while [ -n "$d" ] && [ "$d" != "/" ]; do
+          if [ -e "$d/.git" ]; then
+            url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
+            case "$url" in
+              *github.com*thinmansoftware/bdc-harness*|*git@github.com:thinmansoftware/bdc-harness*)
+                pkg="$d/packages/workflows/package.json"
+                if [ -f "$d/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+                  printf '%s' "$d"
+                  return 0
+                fi
+                ;;
+            esac
+            break
+          fi
+          d="$(dirname "$d")"
+        done
+        return 1
       }
+      SER_BUN_BIN="${SER_BUN_BIN:-$(command -v bun || true)}"
+      ser_runner() {
+        local root bun_bin
+        root="$(ser_root)" || return 127
+        bun_bin="${SER_BUN_BIN:-}"
+        if [ -z "$bun_bin" ] || [ ! -x "$bun_bin" ]; then
+          bun_bin="$(command -v bun || true)"
+        fi
+        if [ -z "$bun_bin" ]; then
+          return 127
+        fi
+        HARNESS_ROOT_OVERRIDE="$root" "$bun_bin" "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" "$@"
+      }
+      rst_command_looks_runnable() {
+        ser_runner allow-test -- "$1" >/dev/null
+      }
+      rst_run_commands() {
+        local cmds="$1" log="$2"
+        if ! ser_root >/dev/null; then
+          mkdir -p "$(dirname "$log")" 2>/dev/null || true
+          printf 'rst_run_commands: NEVER_RAN missing trusted runner\n' >> "$log"
+          printf '127  '
+          return 0
+        fi
+        ser_runner run-tests --commands "$cmds" --log "$log"
+      }
+
       # rst_report <class> <cmd> <exit> <counts>   (-> TESTS_STATUS / TESTS_LINE lines)
       #   Status law: passed only when the command exited 0 AND passed == total > 0.
       #   Any nonzero exit, any failing test, or 0 tests ran is "failed". A
@@ -2130,18 +2005,22 @@ nodes:
       LOG="$EVIDENCE_DIR/stop-tests.log"
       CMDS="$EVIDENCE_DIR/stop-tests.commands"
       : > "$LOG"; : > "$CMDS"
+
       SOURCE="none"
+      EXPLICIT_DECL=0
+      : > "$CMDS"
       while IFS= read -r c; do
         [ -z "$c" ] && continue
+        EXPLICIT_DECL=1
         if rst_command_looks_runnable "$c"; then
           rst_rescue_subdir "$c" >> "$CMDS"; printf '\n' >> "$CMDS"
         else
-          echo "run-stop-tests: declared line is not a runnable test command, ignoring: $c" >&2
+          printf '%s\n' "$c" >> "$CMDS"
+          echo "run-stop-tests: declared line is not a runnable test command: $c" >&2
         fi
       done <<EOF_CMDS
       $(printf '%s\n' "$SPEC" | rst_extract_commands)
       EOF_CMDS
-      [ -s "$CMDS" ] && SOURCE="spec_declared"
       RESOLUTION="$(cat <<'BDC_TEST_COMMAND_RESOLUTION' | capture_node_output
       $resolve-test-command.output
       BDC_TEST_COMMAND_RESOLUTION
@@ -2150,24 +2029,85 @@ nodes:
       MAP_SHA="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_MAP_SHA=//p' | head -1)"
       MAP_FALLBACK="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_FALLBACK=//p' | head -1)"
       MAP_COMMAND="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_B64=//p' | head -1 | base64 --decode 2>/dev/null || true)"
-      SELECTED_SOURCE="spec_declared"
-      if [ "$MAP_SOURCE" = "project-map" ] && [ -n "$MAP_COMMAND" ]; then
-        if rst_command_looks_runnable "$MAP_COMMAND"; then
-          printf '%s\n' "$MAP_COMMAND" > "$CMDS"
-          SELECTED_SOURCE="project-map"
-        else
-          MAP_FALLBACK="unsafe-command"
-        fi
+      if [ "$MAP_SOURCE" = "project-map" ] && [ -n "$MAP_COMMAND" ] && ! rst_command_looks_runnable "$MAP_COMMAND"; then
+        MAP_FALLBACK="unsafe-command"
       fi
       echo "TESTS_MAP_SHA=$MAP_SHA"
       echo "TESTS_MAP_FALLBACK=$MAP_FALLBACK"
+      SCOPE_MODE="document"
+      SCOPE_OUT=""
+      SCOPE_ERR="$(mktemp)"
+      SCOPE_FILE="$(mktemp)"
+      printf '%s\n' "$SPEC" > "$SCOPE_FILE"
+      SCOPE_RC=0
+      SCOPE_OUT="$(ser_runner scope-evidence --spec "$SCOPE_FILE" 2>"$SCOPE_ERR")" || SCOPE_RC=$?
+      rm -f "$SCOPE_FILE"
+      if [ "$SCOPE_RC" -ne 0 ] && grep -q 'missing trusted' "$SCOPE_ERR"; then
+        SCOPE_RC=0
+        SCOPE_MODE="document"
+        SCOPE_OUT=""
+      fi
+      if [ "$SCOPE_RC" -ne 0 ]; then
+        echo "TESTS_CLASS=$CLASS"
+        echo "TESTS_SOURCE=stage_refused"
+        echo "TESTS_COMMAND=(none)"
+        echo "TESTS_EXIT=1"
+        echo "TESTS_PASSED="
+        echo "TESTS_TOTAL="
+        echo "TESTS_STATUS=failed"
+        echo "TESTS_LINE=N/A (stage evidence refused before spawn)"
+        cat "$SCOPE_ERR" >&2
+        rm -f "$SCOPE_ERR"
+        exit 0
+      fi
+      rm -f "$SCOPE_ERR"
+      if [ -n "$SCOPE_OUT" ]; then
+        SCOPE_MODE="$(printf '%s\n' "$SCOPE_OUT" | sed -n 's/^MODE=//p' | head -1)"
+        [ -n "$SCOPE_MODE" ] || SCOPE_MODE="document"
+        printf '%s\n' "$SCOPE_OUT" | grep '^OTHER_STAGE=' || true
+      fi
+      if [ "$SCOPE_MODE" = "stage" ]; then
+        : > "$CMDS"
+        EXPLICIT_DECL=1
+        while IFS= read -r scope_line; do
+          case "$scope_line" in
+            COMMAND=*)
+              printf '%s\n' "${scope_line#COMMAND=}" >> "$CMDS"
+              ;;
+          esac
+        done <<EOF_SCOPE
+      $SCOPE_OUT
+      EOF_SCOPE
+      fi
+      SELECTED_SOURCE="spec_declared"
+      if [ "$EXPLICIT_DECL" -eq 0 ]; then
+        : > "$CMDS"
+        RUN_START_SHA="$(cat "${ARTIFACTS_DIR:-.}/run-start-sha.txt" 2>/dev/null || true)"
+        if [ -n "$RUN_START_SHA" ] && git rev-parse --verify -q "$RUN_START_SHA" >/dev/null 2>&1; then
+          rst_tests_in_diff "$RUN_START_SHA" > "$CMDS"
+        fi
+        if [ -s "$CMDS" ]; then
+          SELECTED_SOURCE="tests_in_diff"
+        elif [ "$MAP_SOURCE" = "project-map" ] && [ -n "$MAP_COMMAND" ]; then
+          printf '%s\n' "$MAP_COMMAND" > "$CMDS"
+          SELECTED_SOURCE="project-map"
+        else
+          rst_repo_test_script > "$CMDS"
+          SELECTED_SOURCE="repo_test_script"
+        fi
+      fi
       EXIT_CODE=0
       COUNTS=""
       CMD_JOINED=""
-      # rst_try <source-label>: run whatever is in $CMDS; rc 0 when counts were parsed.
       rst_try() {
         [ -s "$CMDS" ] || return 1
-        CMD_JOINED="$(grep -v '^$' "$CMDS" | paste -sd ';' - | sed 's/;/; /g')"
+        if ser_root >/dev/null 2>&1; then
+          CMD_JOINED="$(grep -v '^$' "$CMDS" | ser_runner display-commands)"
+        else
+          CMD_JOINED="$(grep -v '^$' "$CMDS" | paste -sd ';' - | sed 's/;/; /g')"
+        fi
+        export SER_SOURCE="$1"
+        export SER_MAP_SHA="${MAP_SHA:-}"
         RESULT="$(rst_run_commands "$CMDS" "$LOG")"
         EXIT_CODE="${RESULT%% *}"
         COUNTS="${RESULT#* }"
@@ -2176,44 +2116,15 @@ nodes:
         [ -n "$COUNTS" ]
       }
       if [ "$CLASS" != "DOCUMENTATION" ] && [ "$CLASS" != "OPERATOR" ]; then
-        # Ladder: spec-declared -> test files in this run's diff -> the repo's own test
-        # script. A spec-declared command that ran and exited nonzero is failed even
-        # with no parseable counts -- do not replace it with fallback evidence. A rung
-        # that exited 0 with no parseable counts (or no command at all) falls through;
-        # the earlier attempt stays in the log and in TESTS_SOURCE.
-        TRIED=""
         (
           cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && dprep_ensure_js_deps
         ) >&2
-        if ! rst_try "$SELECTED_SOURCE" && [ "$SELECTED_SOURCE" != "project-map" ]; then
-          if [ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]; then
-            TRIED="spec_declared command(s) exited $EXIT_CODE with no parseable counts: $CMD_JOINED"
-          else
-            [ -s "$CMDS" ] && TRIED="spec_declared command(s) gave no parseable counts: $CMD_JOINED"
-            : > "$CMDS"
-            RUN_START_SHA="$(cat "${ARTIFACTS_DIR:-.}/run-start-sha.txt" 2>/dev/null || true)"
-            if [ -n "$RUN_START_SHA" ] && git rev-parse --verify -q "$RUN_START_SHA" >/dev/null 2>&1; then
-              rst_tests_in_diff "$RUN_START_SHA" > "$CMDS"
-            fi
-            if ! rst_try "tests_in_diff"; then
-              [ -s "$CMDS" ] && TRIED="${TRIED:+$TRIED; }tests_in_diff command(s) gave no parseable counts: $CMD_JOINED"
-              : > "$CMDS"
-              rst_repo_test_script > "$CMDS"
-              rst_try "repo_test_script" || true
-            fi
-          fi
-        fi
-        if [ -z "$COUNTS" ] && [ -z "$CMD_JOINED" ] && [ -n "$TRIED" ]; then
-          # every rung was empty after the first; keep the first attempt's command so
-          # the N/A line names what was actually run
-          CMD_JOINED="${TRIED##*: }"
-        fi
-        if [ -n "$TRIED" ]; then
-          if [ "$SOURCE" != "spec_declared" ] || [ "$EXIT_CODE" -eq 0 ]; then
-            SOURCE="$SOURCE (after: $TRIED)"
-          fi
+        rst_try "$SELECTED_SOURCE" || true
+        if [ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]; then
+          : # nonzero selected evidence is not absence and is not replaced
         fi
       fi
+
       echo "TESTS_CLASS=$CLASS"
       echo "TESTS_SOURCE=$SOURCE"
       echo "TESTS_COMMAND=${CMD_JOINED:-(none)}"
@@ -2326,219 +2237,80 @@ nodes:
       #   unchanged. Qualifying: begins and ends with ', length >= 3, no
       #   embedded ', inner matches ^[A-Za-z0-9@%+=:,./_*?-]+$. Callers strip
       #   before flag checks and before exec so both see the same argv.)
-      rsg_strip_arg() {
-        local t="$1" inner
-        case "$t" in
-          "'"*"'") ;;
-          *) printf '%s' "$t"; return 0 ;;
-        esac
-        if [ "${#t}" -lt 3 ]; then
-          printf '%s' "$t"
-          return 0
-        fi
-        inner="${t:1:${#t}-2}"
-        case "$inner" in
-          *"'"*) printf '%s' "$t"; return 0 ;;
-        esac
-        if printf '%s' "$inner" | grep -qE '^[A-Za-z0-9@%+=:,./_*?-]+$'; then
-          printf '%s' "$inner"
-        else
-          printf '%s' "$t"
-        fi
-      }
-      # rsg_tokens_safe <tokens...>   (rc 0 when every token is in the argv charset.
-      #   [ and ] are allowed so the test builtin can run. A single-quoted token
-      #   whose inner text matches the charset is accepted. * and ? are literal --
-      #   callers must set -f before splitting. Same shape as rst_tokens_safe.)
-      rsg_tokens_safe() {
-        local t stripped
-        for t in "$@"; do
-          case "$t" in '['|']') continue ;; esac
-          stripped="$(rsg_strip_arg "$t")"
-          if [ "$stripped" != "$t" ]; then
-            continue
+      # Bare token charset includes the historical ^[A-Za-z0-9@%+=:,./_*?-]+$ set plus ~ and ^.
+      # find -exec/-execdir/-ok/-delete and decoded sort/grep flag bypasses are refused.
+      ser_root() {
+        local c root pkg url d
+        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
+          root="$HARNESS_ROOT_OVERRIDE"
+          pkg="$root/packages/workflows/package.json"
+          if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+            printf '%s' "$root"
+            return 0
           fi
-          printf '%s' "$t" | grep -qE '^[A-Za-z0-9@%+=:,./_*?-]+$' || return 1
-        done
-        return 0
-      }
-      rsg_has_grep_flag() {
-        local t
-        for t in "$@"; do
-          case "$t" in
-            --pre|--preprocessor|-f|--file|--pre=*|--preprocessor=*|-f=*|--file=*|-f*) return 0 ;;
-          esac
-        done
-        return 1
-      }
-      rsg_has_find_flag() {
-        local t
-        for t in "$@"; do
-          case "$t" in
-            -exec|-execdir|-ok|-okdir|-delete|-fprint|-fprint0|-fprintf|-fls|-fprint*|-fls*) return 0 ;;
-          esac
-        done
-        return 1
-      }
-      rsg_has_sort_flag() {
-        local t
-        for t in "$@"; do
-          case "$t" in
-            -o|--output|-o=*|--output=*|-o*|--compress-program|--compress-program=*) return 0 ;;
-          esac
-        done
-        return 1
-      }
-      # rsg_argv_looks_readonly <segment>   (rc 0 when the segment tokenizes --
-      #   whitespace split, noglob -- to an allowlisted read-only runner with no
-      #   write/exec options. Leading LC_ALL=* / LANG=* tokens are skipped.
-      #   Qualifying single-quoted tokens are stripped before the charset check
-      #   and the flag checks, matching the argv rsg_exec_pipeline runs.)
-      rsg_argv_looks_readonly() {
-        local runner segment="$1" tok
-        local -a stripped=()
-        set -f
-        set -- $segment
-        set +f
-        while [ $# -ge 1 ]; do
-          case "$1" in
-            LC_ALL=*|LANG=*) shift ;;
-            *) break ;;
-          esac
-        done
-        [ $# -ge 1 ] || return 1
-        for tok in "$@"; do
-          stripped+=("$(rsg_strip_arg "$tok")")
-        done
-        set -- "${stripped[@]}"
-        runner="$1"
-        shift
-        rsg_tokens_safe "$runner" "$@" || return 1
-        case "$runner" in
-          grep|egrep|fgrep|rg)
-            rsg_has_grep_flag "$@" && return 1
-            return 0
-            ;;
-          find)
-            rsg_has_find_flag "$@" && return 1
-            return 0
-            ;;
-          sort)
-            rsg_has_sort_flag "$@" && return 1
-            return 0
-            ;;
-          wc|head|tail|cut|tr|uniq|cat|ls|test|'[')
-            return 0
-            ;;
-        esac
-        return 1
-      }
-      # rsg_allow_cmd <command>   (fail-closed read-only allowlist: reject shell
-      #   operators except |, split on | only, whitespace-tokenize each segment,
-      #   reject write/exec options as whole tokens. awk/sed/xargs and anything
-      #   not listed are rejected. A single quote is not rejected here;
-      #   only a fully quoted charset token is accepted later. Double quote,
-      #   backslash, and every other metacharacter stay rejected.)
-      rsg_allow_cmd() {
-        local c="$1" work segment
-        case "$c" in
-          *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*|*'"'*|*'\\'*|*'||'*) return 1 ;;
-        esac
-        work="$c"
-        while :; do
-          case "$work" in
-            *'|'*) segment="${work%%|*}"; work="${work#*|}" ;;
-            *) segment="$work"; work='' ;;
-          esac
-          rsg_argv_looks_readonly "$segment" || return 1
-          [ -z "$work" ] && break
-        done
-        return 0
-      }
-      # rsg_exec_pipeline <command>   (prints stdout of the last | segment; rc of
-      #   the last segment. Intermediate segments are connected with temp files,
-      #   not a shell pipe. Tokenized argv; never a shell -c of the spec string.
-      #   Qualifying single-quoted tokens are stripped the same way as
-      #   rsg_argv_looks_readonly before the runner is invoked.
-      #   Intermediate nonzero exits do not abort -- matches bash -c without
-      #   pipefail, so grep-no-match | wc -l still yields a count.)
-      rsg_exec_pipeline() {
-        local cmd="$1" work segment tmpdir_p="" tmp_in="/dev/null" tmp_out raw="" rc=0
-        local env_lc env_lang tok
-        local -a stripped=()
-        if ! rsg_allow_cmd "$cmd"; then
-          return 127
         fi
-        work="$cmd"
-        while :; do
-          case "$work" in
-            *'|'*) segment="${work%%|*}"; work="${work#*|}" ;;
-            *) segment="$work"; work='' ;;
-          esac
-          set -f
-          set -- $segment
-          set +f
-          env_lc=""; env_lang=""
-          while [ $# -ge 1 ]; do
-            case "$1" in
-              LC_ALL=*) env_lc="${1#LC_ALL=}"; shift ;;
-              LANG=*) env_lang="${1#LANG=}"; shift ;;
-              *) break ;;
+        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
+          pkg="$c/packages/workflows/package.json"
+          if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+            printf '%s' "$c"
+            return 0
+          fi
+        done
+        d="$(pwd)"
+        while [ -n "$d" ] && [ "$d" != "/" ]; do
+          if [ -e "$d/.git" ]; then
+            url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
+            case "$url" in
+              *github.com*thinmansoftware/bdc-harness*|*git@github.com:thinmansoftware/bdc-harness*)
+                pkg="$d/packages/workflows/package.json"
+                if [ -f "$d/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+                  printf '%s' "$d"
+                  return 0
+                fi
+                ;;
             esac
-          done
-          if [ $# -eq 0 ]; then
-            rc=127
             break
           fi
-          stripped=()
-          for tok in "$@"; do
-            stripped+=("$(rsg_strip_arg "$tok")")
-          done
-          set -- "${stripped[@]}"
-          if [ -n "$work" ]; then
-            [ -n "$tmpdir_p" ] || tmpdir_p="$(mktemp -d)"
-            tmp_out="$tmpdir_p/out"
-            (
-              [ -n "$env_lc" ] && export LC_ALL="$env_lc"
-              [ -n "$env_lang" ] && export LANG="$env_lang"
-              "$@" < "$tmp_in" > "$tmp_out" 2>/dev/null
-            )
-            rc=$?
-            tmp_in="$tmpdir_p/in"
-            mv "$tmp_out" "$tmp_in"
-          else
-            raw="$(
-              [ -n "$env_lc" ] && export LC_ALL="$env_lc"
-              [ -n "$env_lang" ] && export LANG="$env_lang"
-              "$@" < "$tmp_in" 2>/dev/null
-            )"
-            rc=$?
-          fi
-          [ -z "$work" ] && break
+          d="$(dirname "$d")"
         done
-        [ -n "$tmpdir_p" ] && rm -rf "$tmpdir_p"
-        printf '%s' "$raw"
+        return 1
+      }
+      SER_BUN_BIN="${SER_BUN_BIN:-$(command -v bun || true)}"
+      ser_runner() {
+        local root bun_bin
+        root="$(ser_root)" || return 127
+        bun_bin="${SER_BUN_BIN:-}"
+        if [ -z "$bun_bin" ] || [ ! -x "$bun_bin" ]; then
+          bun_bin="$(command -v bun || true)"
+        fi
+        if [ -z "$bun_bin" ]; then
+          return 127
+        fi
+        HARNESS_ROOT_OVERRIDE="$root" "$bun_bin" "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" "$@"
+      }
+      rsg_tokens_safe() {
+        ser_runner tokens-safe -- "$@" >/dev/null
+      }
+      rsg_argv_looks_readonly() {
+        rsg_allow_cmd "$1"
+      }
+      rsg_allow_cmd() {
+        ser_runner allow-assertion -- "$1" >/dev/null
+      }
+      rsg_exec_pipeline() {
+        local out rc
+        out="$(ser_runner exec-assertion -- "$1")"
+        rc=$?
+        printf '%s' "$out"
         return "$rc"
       }
-      # rsg_observe <command>   (-> observed count, or "ERR" on a hard command failure
-      #   or a non-allowlisted line). Tokenized argv via rsg_exec_pipeline.
       rsg_observe() {
-        local raw rawtrim rc
-        if ! rsg_allow_cmd "$1"; then
+        if ! ser_root >/dev/null; then
           printf 'ERR'
           return 0
         fi
-        raw="$(rsg_exec_pipeline "$1")"; rc=$?
-        rawtrim="$(printf '%s' "$raw" | tr -d '[:space:]')"
-        if printf '%s' "$rawtrim" | grep -qE '^[0-9]+$'; then
-          printf '%s' "$rawtrim"
-        elif [ -z "$rawtrim" ]; then
-          if [ "$rc" -le 1 ]; then printf '0'; else printf 'ERR'; fi
-        else
-          printf '%s\n' "$raw" | grep -c . || true
-        fi
+        ser_runner observe-assertion -- "$1"
       }
-      # rsg_compare <op> <expected> <observed>   (rc 0 when the stop condition holds)
       rsg_compare() {
         case "$1" in
           ge) [ "$3" -ge "$2" ] ;;
@@ -2546,71 +2318,37 @@ nodes:
           *) [ "$3" -eq "$2" ] ;;
         esac
       }
-      # rsg_run   (extracted TSV on stdin -> GREP_* summary lines + per-assertion detail)
       rsg_run() {
-        local line cmd op n obs declared=0 executed=0 dropped=0 unparsed=0 unparsed_names="" mismatch=0 out="" detail="" status tab
-        tab="$(printf '\t')"
-        while IFS= read -r line; do
-          case "$line" in
-            DECLARED*) declared="${line#DECLARED*"$tab"}"; continue ;;
-            UNPARSED*)
-              line="${line#UNPARSED*"$tab"}"
-              unparsed="${line%%"$tab"*}"
-              if [ "$line" != "$unparsed" ]; then unparsed_names="${line#*"$tab"}"; fi
-              continue
-              ;;
-            "") continue ;;
-          esac
-          cmd="${line%%"$tab"*}"; line="${line#*"$tab"}"; op="${line%%"$tab"*}"; n="${line#*"$tab"}"
-          if ! rsg_allow_cmd "$cmd"; then
-            dropped=$((dropped + 1))
-            detail="${detail}DROPPED (not on read-only allowlist; not executed): $cmd => expected $op $n"$'\n'
-            out="${out:+$out; }UNVERIFIED (dropped): $cmd"
-            continue
-          fi
-          obs="$(rsg_observe "$cmd")"
-          if [ "$obs" = "ERR" ]; then
-            dropped=$((dropped + 1))
-            detail="${detail}DROPPED (command errored): $cmd => expected $op $n"$'\n'
-            out="${out:+$out; }UNVERIFIED (errored): $cmd"
-            continue
-          fi
-          executed=$((executed + 1))
-          if rsg_compare "$op" "$n" "$obs"; then
-            detail="${detail}OK: $cmd => $obs (expected $op $n)"$'\n'
-          else
-            mismatch=$((mismatch + 1))
-            detail="${detail}MISMATCH: $cmd => $obs (expected $op $n)"$'\n'
-          fi
-          out="${out:+$out; }$cmd => $obs"
-        done
-        if [ "$declared" -eq 0 ]; then
-          status="none_declared"; out="N/A (spec declares no grep stop conditions)"
-        elif [ "$executed" -eq 0 ]; then
-          status="all_dropped"; out="N/A ($declared declared grep stop condition(s) but none executable under the read-only allowlist)"
-          if [ "$unparsed" -gt 0 ]; then
-            out="${out}; UNVERIFIED (unparsed): ${unparsed_names:-$unparsed unnamed assertion(s)}"
-          fi
-        elif [ "$mismatch" -gt 0 ]; then
-          status="mismatch"
-        elif [ "$executed" -ne "$declared" ] || [ "$dropped" -gt 0 ] || [ "$unparsed" -gt 0 ]; then
-          status="incomplete"
-          if [ "$unparsed" -gt 0 ]; then
-            out="${out:+$out; }UNVERIFIED (unparsed): ${unparsed_names:-$unparsed unnamed assertion(s)}"
-          fi
-        else
-          status="passed"
+        if ! ser_root >/dev/null; then
+          printf 'GREP_DECLARED=0\nGREP_EXECUTED=0\nGREP_DROPPED=0\nGREP_UNPARSED=0\nGREP_MISMATCH=0\nGREP_STATUS=incomplete\nGREP_LINE=N/A (missing trusted structured-evidence-runner)\n'
+          return 0
         fi
-        printf 'GREP_DECLARED=%s\nGREP_EXECUTED=%s\nGREP_DROPPED=%s\nGREP_UNPARSED=%s\nGREP_MISMATCH=%s\nGREP_STATUS=%s\nGREP_LINE=%s\n' "$declared" "$executed" "$dropped" "$unparsed" "$mismatch" "$status" "$out"
-        if [ -n "$detail" ]; then
-          printf -- '--- per-assertion detail ---\n%s' "$detail"
-        fi
+        ser_runner run-greps
       }
+
       # ---- END rsg core ----
 
+
       SPEC=$read-spec.output
+      SCOPE_MODE="document"
+      SCOPE_OUT=""
+      SCOPE_ERR="$(mktemp)"
+      SCOPE_FILE="$(mktemp)"
+      printf '%s\n' "$SPEC" > "$SCOPE_FILE"
+      SCOPE_RC=0
+      SCOPE_OUT="$(ser_runner scope-evidence --spec "$SCOPE_FILE" 2>"$SCOPE_ERR")" || SCOPE_RC=$?
+      rm -f "$SCOPE_FILE" "$SCOPE_ERR"
+      if [ "$SCOPE_RC" -eq 0 ] && [ -n "$SCOPE_OUT" ]; then
+        SCOPE_MODE="$(printf '%s\n' "$SCOPE_OUT" | sed -n 's/^MODE=//p' | head -1)"
+      fi
+      if [ "$SCOPE_MODE" = "stage" ] && printf '%s\n' "$SCOPE_OUT" | grep -q '^UNRESOLVED_GLOBAL=1$'; then
+        printf '%s\n' "$SCOPE_OUT" | grep '^OTHER_STAGE=' || true
+        printf 'GREP_DECLARED=0\nGREP_EXECUTED=0\nGREP_DROPPED=0\nGREP_UNPARSED=1\nGREP_MISMATCH=0\nGREP_STATUS=incomplete\nGREP_LINE=N/A (required grep stops are not uniquely inside the selected stage)\n'
+        exit 0
+      fi
       printf '%s\n' "$SPEC" | rsg_extract | rsg_run
       exit 0
+
 
   - id: war-council-validator
     # DeepSeek judge through the repository-capable OpenRouter tool loop.
@@ -4631,6 +4369,55 @@ nodes:
       }
 
       # ---- BEGIN sme core (byte-identical across lanes; extracted by unit test) ----
+      ser_root() {
+        local c root pkg url d
+        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
+          root="$HARNESS_ROOT_OVERRIDE"
+          pkg="$root/packages/workflows/package.json"
+          if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+            printf '%s' "$root"
+            return 0
+          fi
+        fi
+        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
+          pkg="$c/packages/workflows/package.json"
+          if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+            printf '%s' "$c"
+            return 0
+          fi
+        done
+        d="$(pwd)"
+        while [ -n "$d" ] && [ "$d" != "/" ]; do
+          if [ -e "$d/.git" ]; then
+            url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
+            case "$url" in
+              *github.com*thinmansoftware/bdc-harness*|*git@github.com:thinmansoftware/bdc-harness*)
+                pkg="$d/packages/workflows/package.json"
+                if [ -f "$d/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+                  printf '%s' "$d"
+                  return 0
+                fi
+                ;;
+            esac
+            break
+          fi
+          d="$(dirname "$d")"
+        done
+        return 1
+      }
+      SER_BUN_BIN="${SER_BUN_BIN:-$(command -v bun || true)}"
+      ser_runner() {
+        local root bun_bin
+        root="$(ser_root)" || return 127
+        bun_bin="${SER_BUN_BIN:-}"
+        if [ -z "$bun_bin" ] || [ ! -x "$bun_bin" ]; then
+          bun_bin="$(command -v bun || true)"
+        fi
+        if [ -z "$bun_bin" ]; then
+          return 127
+        fi
+        HARNESS_ROOT_OVERRIDE="$root" "$bun_bin" "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" "$@"
+      }
       # sme_field <KEY> <node-output>   (-> value of the first "KEY=..." line, or empty)
       sme_field() {
         printf '%s\n' "$2" | grep -E "^${1}=" | head -1 | sed "s/^${1}=//" || true
@@ -4661,6 +4448,16 @@ nodes:
         fi
         if [ "$grep_status" = "incomplete" ]; then
           stop_detail="; unparsed=$(printf '%s\n' "$grep_line" | sed -n 's/.*UNVERIFIED (unparsed): //p'); dropped=${grep_dropped:-0}"
+          if [ "${grep_dropped:-0}" -gt 0 ]; then
+            verdict="fail"
+          fi
+        fi
+        if [ "${SER_REQUIRE_ATTEMPT:-}" = "1" ]; then
+          case "$tests_status" in
+            passed|failed|counts_unparsed)
+              ser_runner check-attempt >/dev/null 2>&1 || verdict="fail"
+              ;;
+          esac
         fi
         printf '%s\n' "$manifest" | T_LINE="Tests: ${tests_line}" G_LINE="Grep assertions: ${grep_line}" S_LINE="Stop conditions: tests=${tests_status}; greps=${grep_status}${stop_detail} (observed by run-stop-tests / run-stop-greps in the run worktree)" VERDICT="$verdict" awk '
           !ts && /^Tests:/ { print ENVIRON["T_LINE"]; ts = 1; next }
@@ -4688,6 +4485,7 @@ nodes:
       $build-manifest.output
       BDC_NODE_OUTPUT_MANIFEST
       )
+      SER_REQUIRE_ATTEMPT=1
       printf '%s\n' "$MANIFEST_OUT" | sme_process \
         "$(sme_field TESTS_LINE "$TESTS_OUT")" "$(sme_field TESTS_STATUS "$TESTS_OUT")" \
         "$(sme_field GREP_LINE "$GREPS_OUT")" "$(sme_field GREP_STATUS "$GREPS_OUT")" \
@@ -4712,6 +4510,55 @@ nodes:
       }
 
       # ---- BEGIN mec core (byte-identical across lanes; extracted by unit test) ----
+      ser_root() {
+        local c root pkg url d
+        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
+          root="$HARNESS_ROOT_OVERRIDE"
+          pkg="$root/packages/workflows/package.json"
+          if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+            printf '%s' "$root"
+            return 0
+          fi
+        fi
+        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
+          pkg="$c/packages/workflows/package.json"
+          if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+            printf '%s' "$c"
+            return 0
+          fi
+        done
+        d="$(pwd)"
+        while [ -n "$d" ] && [ "$d" != "/" ]; do
+          if [ -e "$d/.git" ]; then
+            url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
+            case "$url" in
+              *github.com*thinmansoftware/bdc-harness*|*git@github.com:thinmansoftware/bdc-harness*)
+                pkg="$d/packages/workflows/package.json"
+                if [ -f "$d/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+                  printf '%s' "$d"
+                  return 0
+                fi
+                ;;
+            esac
+            break
+          fi
+          d="$(dirname "$d")"
+        done
+        return 1
+      }
+      SER_BUN_BIN="${SER_BUN_BIN:-$(command -v bun || true)}"
+      ser_runner() {
+        local root bun_bin
+        root="$(ser_root)" || return 127
+        bun_bin="${SER_BUN_BIN:-}"
+        if [ -z "$bun_bin" ] || [ ! -x "$bun_bin" ]; then
+          bun_bin="$(command -v bun || true)"
+        fi
+        if [ -z "$bun_bin" ]; then
+          return 127
+        fi
+        HARNESS_ROOT_OVERRIDE="$root" "$bun_bin" "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" "$@"
+      }
       # mec_field <KEY> <node-output>   (-> value of the first "KEY=..." line, or empty)
       mec_field() {
         printf '%s\n' "$2" | grep -E "^${1}=" | head -1 | sed "s/^${1}=//" || true
@@ -4752,6 +4599,10 @@ nodes:
           case "$grep_status" in
             passed) ;;
             incomplete)
+              if [ "${grep_dropped:-0}" -gt 0 ]; then
+                echo "STOP_GREP_REJECTED: ${grep_declared} grep stop condition(s) were incomplete with dropped=${grep_dropped:-0}. A dropped required assertion cannot be published as a pass (bdc-xo #1940)." >&2
+                return 1
+              fi
               if ! [ "${grep_executed:-0}" -gt 0 ] 2>/dev/null || [ "${grep_mismatch:-0}" -gt 0 ] 2>/dev/null; then
                 echo "EVIDENCE_ERROR: ${grep_declared} grep stop condition(s) reported incomplete with grep_executed=${grep_executed:-0} and grep_mismatch=${grep_mismatch:-0}. Incomplete evidence is admissible only after at least one grep executes with no mismatch (bdc-xo #1940)." >&2
                 return 1
@@ -4779,6 +4630,16 @@ nodes:
             return 1
           fi
         fi
+        if [ "${SER_REQUIRE_ATTEMPT:-}" = "1" ]; then
+          case "$tests_status" in
+            passed|failed|counts_unparsed)
+              if ! ser_runner check-attempt >/dev/null 2>&1; then
+                echo "REFUSED missing or stale attempt" >&2
+                return 1
+              fi
+              ;;
+          esac
+        fi
         echo "OK"
         return 0
       }
@@ -4801,6 +4662,7 @@ nodes:
       $stamp-manifest-evidence.output
       BDC_NODE_OUTPUT_MANIFEST
       )
+      SER_REQUIRE_ATTEMPT=1
       printf '%s\n' "$MANIFEST_OUT" | mec_check "$STATUS" \
         "$(mec_field TESTS_CLASS "$TESTS_OUT")" "$(mec_field TESTS_STATUS "$TESTS_OUT")" \
         "$(mec_field GREP_DECLARED "$GREPS_OUT")" "$(mec_field GREP_STATUS "$GREPS_OUT")" \

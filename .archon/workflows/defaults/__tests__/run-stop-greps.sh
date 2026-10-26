@@ -39,6 +39,7 @@ assert_contains() {
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
+export HARNESS_ROOT_OVERRIDE="$(cd "$HERE/../../../.." && pwd)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-codex-only.yaml
@@ -161,7 +162,10 @@ c='grep -c "needle" fixture.txt'
 if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: double-quoted-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: double-quoted-still-dropped: $c"; fi
 
 echo "--- unsafe-quoted-content-still-dropped ---"
-for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f" "grep '--file=/etc/passwd' x" "find . '-exec' rm" "sort '-o' out"; do
+for c in "grep -c 'needle' fixture.txt" "grep -c 'a b' f" "grep -c '^x' f"; do
+  if rsg_allow_cmd "$c"; then PASS=$((PASS+1)); echo "PASS: quoted literal allowed: $c"; else FAIL=$((FAIL+1)); echo "FAIL: quoted literal allowed: $c"; fi
+done
+for c in "grep -c '\$(id)' f" "grep -c 'x f" "grep -c '' f" "grep '--file=/etc/passwd' x" "find . '-exec' rm" "sort '-o' out"; do
   if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: unsafe-quoted-content-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: unsafe-quoted-content-still-dropped: $c"; fi
 done
 
@@ -241,7 +245,7 @@ assert_contains "double-quoted-still-dropped" "GREP_DROPPED=1" "$OUT"
 assert_contains "double-quoted-still-dropped not executed" "GREP_EXECUTED=0" "$OUT"
 
 echo "--- unsafe-quoted-content-still-dropped (run) ---"
-for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f"; do
+for c in "grep -c '\$(id)' f" "grep -c 'x f" "grep -c '' f"; do
   OUT="$(printf '%s\teq\t1\nUNPARSED\t0\nDECLARED\t1\n' "$c" | rsg_run)"
   assert_contains "unsafe-quoted-content-still-dropped: $c" "DROPPED (not on read-only allowlist; not executed): $c" "$OUT"
   assert_contains "unsafe-quoted-content-still-dropped not executed: $c" "GREP_EXECUTED=0" "$OUT"

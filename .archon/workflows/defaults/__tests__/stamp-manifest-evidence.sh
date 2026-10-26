@@ -46,6 +46,7 @@ assert_not_contains() {
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
+export HARNESS_ROOT_OVERRIDE="$(cd "$HERE/../../../.." && pwd)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-codex-only.yaml
@@ -143,9 +144,10 @@ assert_contains "audit line says greps=mismatch" "greps=mismatch" "$OUT"
 
 # PR #876 / bdc-xo #2221 deliberately admits partial grep evidence when
 # at least one assertion executes without mismatch; mec_check enforces counts.
-echo "--- Test 3b: admitted incomplete greps preserve PASS and disclose omissions ---"
+echo "--- Test 3b: incomplete evidence with a dropped assertion fails validation ---"
 OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c "a" b => 1; UNVERIFIED (unparsed): missing-rule' incomplete 1)"
-assert_contains "VALIDATION stays PASS for admitted partial evidence" "VALIDATION: PASS" "$OUT"
+assert_contains "VALIDATION: FAIL when dropped=1" "VALIDATION: FAIL" "$OUT"
+assert_not_contains "dropped incomplete is not a pass" "VALIDATION: PASS" "$OUT"
 assert_contains "omissions remain visible" "greps=incomplete; unparsed=missing-rule; dropped=1" "$OUT"
 assert_contains "audit line says greps=incomplete" "greps=incomplete" "$OUT"
 

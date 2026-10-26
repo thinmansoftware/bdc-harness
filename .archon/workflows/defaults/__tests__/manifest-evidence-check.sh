@@ -44,6 +44,7 @@ assert_not_contains() {
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
+export HARNESS_ROOT_OVERRIDE="$(cd "$HERE/../../../.." && pwd)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-codex-only.yaml
@@ -167,9 +168,10 @@ echo "--- Test 7: no greps declared, Grep assertions: N/A -> OK ---"
 R="$(run_check "$NA_GREPS" PROCEED CODE passed 0 none_declared)"
 assert_eq "rc 0 / OK" "0|OK|" "$R"
 
-echo "--- Test 7b: declared greps with incomplete execution -> admitted ---"
+echo "--- Test 7b: incomplete evidence with dropped=2 is refused ---"
 R="$(run_check "$GOOD" PROCEED CODE passed 5 incomplete 0 2 2 1 0)"
-assert_eq "incomplete greps admitted" "0|OK|" "$R"
+assert_eq "dropped incomplete rc 1" "1" "${R%%|*}"
+assert_contains "STOP_GREP_REJECTED names the drop" "STOP_GREP_REJECTED:" "$R"
 
 echo "--- Test 7c: declared greps with a mismatch -> error ---"
 R="$(run_check "$GOOD" PROCEED CODE passed 5 mismatch 0 5 0 0 1)"
