@@ -135,14 +135,47 @@ export async function maybeRecordReviewApprovalVerdict(
 
 export const REVIEW_RECIPIENT = 'overseer-reviewer';
 
+const NATIVE_EXECUTION_INCOMPLETE_SUMMARY =
+  'Native sandbox inspection or declared checks did not complete.';
+
+/** Git config that disables external diff helpers and fsmonitor hooks. */
+const GIT_CONFIG_ARGS = ['-c', 'diff.external=', '-c', 'core.fsmonitor=false'] as const;
+
+/**
+ * Explicit environment for repository-controlled git, inspection, and checks.
+ * PATH is the only inherited value. Credentials in the parent environment are
+ * not forwarded. Model authentication stays on the trusted judge spawn path.
+ */
+interface UntrustedExecutionEnv {
+  PATH: string;
+  HOME: string;
+  CODEX_HOME: string;
+  TMPDIR: string;
+}
+
+interface CheckoutFingerprint {
+  headSha: string;
+  treeSha: string;
+  cwd: string;
+}
+
+function commandOutputEmpty(output: string): boolean {
+  return output.trim().length === 0;
+}
+
 async function spawnCaptured(
   argv: readonly string[],
   cwd: string,
-  env?: Record<string, string>
+  env: UntrustedExecutionEnv
 ): Promise<{ exitCode: number; output: string }> {
   const child = Bun.spawn([...argv], {
     cwd,
-    env: { ...process.env, ...env },
+    env: {
+      PATH: env.PATH,
+      HOME: env.HOME,
+      CODEX_HOME: env.CODEX_HOME,
+      TMPDIR: env.TMPDIR,
+    },
     stdout: 'pipe',
     stderr: 'pipe',
   });
@@ -154,6 +187,76 @@ async function spawnCaptured(
   return { exitCode, output: `${stdout}\n${stderr}`.slice(0, 128 * 1024) };
 }
 
+async function withUntrustedScratch<T>(
+  run: (env: UntrustedExecutionEnv) => Promise<T>
+): Promise<T | undefined> {
+  const pathValue = process.env.PATH;
+  if (!pathValue) return undefined;
+  const scratch = await mkdtemp(join(tmpdir(), 'overseer-review-state-'));
+  try {
+    return await run({
+      PATH: pathValue,
+      HOME: scratch,
+      CODEX_HOME: scratch,
+      TMPDIR: scratch,
+    });
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Commit identity plus a real cleanliness check. HEAD and HEAD^{tree} alone do
+ * not detect tracked edits or untracked files, so both are required.
+ */
+async function readCheckoutFingerprint(
+  checkoutPath: string,
+  expectedHeadSha: string,
+  env: UntrustedExecutionEnv
+): Promise<CheckoutFingerprint | undefined> {
+  let cwd: string;
+  try {
+    cwd = await realpath(checkoutPath);
+  } catch {
+    return undefined;
+  }
+  const git = (args: readonly string[]): Promise<{ exitCode: number; output: string }> =>
+    spawnCaptured(['git', ...GIT_CONFIG_ARGS, ...args], cwd, env);
+
+  const head = await git(['rev-parse', 'HEAD']);
+  if (head.exitCode !== 0 || head.output.trim() !== expectedHeadSha) return undefined;
+
+  const top = await git(['rev-parse', '--show-toplevel']);
+  if (top.exitCode !== 0) return undefined;
+  let topReal: string;
+  try {
+    topReal = await realpath(top.output.trim());
+  } catch {
+    return undefined;
+  }
+  if (topReal !== cwd) return undefined;
+
+  const unstaged = await git(['diff', '--quiet', 'HEAD']);
+  if (unstaged.exitCode !== 0) return undefined;
+  const staged = await git(['diff', '--cached', '--quiet']);
+  if (staged.exitCode !== 0) return undefined;
+
+  const status = await git([
+    'status',
+    '--porcelain=v1',
+    '--untracked-files=all',
+    '--ignored=matching',
+  ]);
+  if (status.exitCode !== 0 || !commandOutputEmpty(status.output)) return undefined;
+
+  const others = await git(['ls-files', '--others', '-z']);
+  if (others.exitCode !== 0 || !commandOutputEmpty(others.output)) return undefined;
+
+  const tree = await git(['rev-parse', 'HEAD^{tree}']);
+  if (tree.exitCode !== 0 || tree.output.trim().length === 0) return undefined;
+  return { headSha: head.output.trim(), treeSha: tree.output.trim(), cwd };
+}
+
 /** Server-observed native execution. No model field can manufacture this proof. */
 export async function observeReviewExecution(
   context: ReviewExecutionContext
@@ -161,64 +264,55 @@ export async function observeReviewExecution(
   if (process.platform !== 'linux' || !context.checkoutPath || context.checkPlan.length === 0)
     return undefined;
   const startedAt = new Date().toISOString();
-  let cwd: string;
-  try {
-    cwd = await realpath(context.checkoutPath);
-  } catch {
-    return undefined;
-  }
-  const git = async (...args: string[]): Promise<string | undefined> => {
-    const result = await spawnCaptured(['git', ...args], cwd);
-    return result.exitCode === 0 ? result.output.trim() : undefined;
-  };
-  const headBefore = await git('rev-parse', 'HEAD');
-  const treeBefore = await git('rev-parse', 'HEAD^{tree}');
-  const repository = await git('rev-parse', '--show-toplevel');
-  if (headBefore !== context.headSha || !treeBefore || repository !== cwd) return undefined;
-
-  const state = await mkdtemp(join(tmpdir(), 'overseer-review-state-'));
-  const checks: ReviewExecutionProof['checks'][number][] = [];
-  try {
+  return withUntrustedScratch(async env => {
+    const before = await readCheckoutFingerprint(context.checkoutPath, context.headSha, env);
+    if (!before) return undefined;
     const sandboxPrefix = [
       join(process.cwd(), 'node_modules/.bin/codex'),
       '--enable',
       'use_legacy_landlock',
       '-C',
-      cwd,
+      before.cwd,
       'sandbox',
       '--',
     ];
     // A real repository read inside the same native boundary is the supervisor
     // inspection event. It catches a reviewer that only received a supplied diff.
     const inspection = await spawnCaptured(
-      [...sandboxPrefix, 'git', 'show', '--stat', '--oneline', context.headSha],
-      cwd,
-      { CODEX_HOME: state }
+      [...sandboxPrefix, 'git', ...GIT_CONFIG_ARGS, 'show', '--stat', '--oneline', context.headSha],
+      before.cwd,
+      env
     );
     if (inspection.exitCode !== 0 || inspection.output.trim().length === 0) return undefined;
+    const checks: ReviewExecutionProof['checks'][number][] = [];
     for (const argv of context.checkPlan) {
       if (argv.length === 0 || argv.some(value => !value || value.includes('\0'))) return undefined;
       const checkStarted = new Date().toISOString();
-      const result = await spawnCaptured([...sandboxPrefix, ...argv], cwd, { CODEX_HOME: state });
+      const result = await spawnCaptured([...sandboxPrefix, ...argv], before.cwd, env);
       const checkEnded = new Date().toISOString();
       checks.push({
         argv: [...argv],
-        cwd,
+        cwd: before.cwd,
         exitCode: result.exitCode,
         outputDigest: `sha256:${createHash('sha256').update(result.output).digest('hex')}`,
         startedAt: checkStarted,
         endedAt: checkEnded,
       });
       if (result.exitCode !== 0) return undefined;
+      const after = await readCheckoutFingerprint(context.checkoutPath, context.headSha, env);
+      if (
+        after?.headSha !== before.headSha ||
+        after?.treeSha !== before.treeSha ||
+        after?.cwd !== before.cwd
+      ) {
+        return undefined;
+      }
     }
-    const headAfter = await git('rev-parse', 'HEAD');
-    const treeAfter = await git('rev-parse', 'HEAD^{tree}');
-    if (headAfter !== headBefore || treeAfter !== treeBefore) return undefined;
     return {
       requestId: context.requestId,
-      headSha: headBefore,
-      treeSha: treeBefore,
-      cwd,
+      headSha: before.headSha,
+      treeSha: before.treeSha,
+      cwd: before.cwd,
       nativePolicy: 'codex_legacy_landlock',
       nativeVersion: '0.153.3',
       runtimeUid: process.getuid?.() ?? -1,
@@ -227,9 +321,7 @@ export async function observeReviewExecution(
       startedAt,
       endedAt: new Date().toISOString(),
     };
-  } finally {
-    await rm(state, { recursive: true, force: true });
-  }
+  });
 }
 
 export interface ReviewRouteConfig {
@@ -1038,7 +1130,7 @@ export function createRealSubmitDeps(
       if (work.executionContext && !executionProof) {
         return {
           approved: false,
-          summary: 'Native sandbox inspection or declared checks did not complete.',
+          summary: NATIVE_EXECUTION_INCOMPLETE_SUMMARY,
           reviewedHeadSha: work.headSha,
         };
       }
@@ -1077,6 +1169,20 @@ export function createRealSubmitDeps(
           recordRungOutage: recordJudgeRungOutage,
         }
       );
+      if (work.executionContext) {
+        const checkoutPath = work.executionContext.checkoutPath;
+        const expectedHead = work.executionContext.headSha;
+        const stillQualified = await withUntrustedScratch(env =>
+          readCheckoutFingerprint(checkoutPath, expectedHead, env)
+        );
+        if (!stillQualified) {
+          return {
+            approved: false,
+            summary: NATIVE_EXECUTION_INCOMPLETE_SUMMARY,
+            reviewedHeadSha: work.headSha,
+          };
+        }
+      }
       // CHECKS_PENDING is a non-terminal defer, NOT a verdict. Surface it as a
       // distinct signal so the submit path can release-and-retry rather than
       // fall through to the summary/`approved` mapping below, which would
