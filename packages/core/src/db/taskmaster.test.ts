@@ -398,6 +398,7 @@ describe('tm_expectations DAL', () => {
     });
   });
 
+  // Windows CI measured this case at 59656 ms against the prior 30000 ms budget.
   test('give-up transition and aggregate counts include every status', async () => {
     const id = await registerExpectation({
       dispatch_ref: 'dispatch-give-up',
@@ -414,7 +415,7 @@ describe('tm_expectations DAL', () => {
     expect(counts.met).toBe(0);
     expect(counts.failed).toBe(0);
     expect(counts.escalated).toBe(0);
-  });
+  }, 120_000);
 
   test('two concurrent claims on the same attempt: exactly one wins', async () => {
     const id = await registerExpectation({
