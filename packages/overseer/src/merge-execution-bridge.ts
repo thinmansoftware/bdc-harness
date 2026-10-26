@@ -657,7 +657,7 @@ async function mergeClaimedVerdict(
     return undefined;
   }
   if (
-    options.hasQualifiedReview &&
+    !options.hasQualifiedReview ||
     !(await options.hasQualifiedReview({
       owner: pr.pr.owner,
       repo: pr.pr.repo,

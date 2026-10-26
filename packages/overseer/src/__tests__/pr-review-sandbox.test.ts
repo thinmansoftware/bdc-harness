@@ -1,11 +1,21 @@
 import { describe, expect, test } from 'bun:test';
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import {
+  access,
+  appendFile,
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps';
 import { createRealSubmitDeps, observeReviewExecution } from '../pr-review-wiring';
 import { buildPrReviewTransport } from '../judge-transport';
-import { runBrokerProcess } from '../../../../scripts/overseer-reviewer-broker';
+import { processJob, runBrokerProcess } from '../../../../scripts/overseer-reviewer-broker';
 import {
   runAndSubmitReview,
   type ReviewExecutionContext,
@@ -147,6 +157,39 @@ describe('sandbox-qualified submit', () => {
 });
 
 describe('bounded broker process capture', () => {
+  test('real broker rejects a substituted model argv instead of executing it', async () => {
+    const spool = await mkdtemp(join(tmpdir(), 'overseer-real-broker-'));
+    const checkout = join(spool, 'checkout');
+    await mkdir(checkout);
+    await runGit(checkout, ['init', '-q']);
+    await runGit(checkout, ['config', 'user.email', 'smoke@example.invalid']);
+    await runGit(checkout, ['config', 'user.name', 'smoke']);
+    await writeFile(join(checkout, 'allowed.txt'), 'allowed\n');
+    await runGit(checkout, ['add', 'allowed.txt']);
+    await runGit(checkout, ['commit', '-qm', 'fixture']);
+    const expectedHead = await runGit(checkout, ['rev-parse', 'HEAD']);
+    const request = join(spool, 'bad-model.request.json');
+    await writeFile(
+      request,
+      JSON.stringify({
+        version: 1,
+        id: 'bad-model',
+        checkout,
+        expectedHead,
+        argv: ['/bin/true'],
+        prompt: 'review',
+      })
+    );
+    try {
+      const result = await processJob(request, spool);
+      expect(result.ok).toBe(false);
+      expect(result.reason).toBe('model_argv_invalid');
+      expect(result.uid).toBe(process.getuid?.());
+    } finally {
+      await rm(spool, { recursive: true, force: true });
+    }
+  });
+
   test('terminates a hanging descendant within the deadline', async () => {
     const started = Date.now();
     const result = await runBrokerProcess(
@@ -240,13 +283,27 @@ async function runGit(cwd: string, args: string[]): Promise<string> {
 }
 
 async function initCheckout(): Promise<{ dir: string; head: string }> {
-  const dir = await mkdtemp(join(tmpdir(), 'overseer-review-checkout-'));
+  const productionSpool = '/var/lib/overseer-review';
+  let parent = tmpdir();
+  try {
+    await access(join(productionSpool, 'ready'));
+    parent = join(productionSpool, 'test-checkouts');
+    await mkdir(parent, { recursive: true });
+  } catch {
+    // Developer tests run without the production UID-1002 broker.
+  }
+  const dir = await mkdtemp(join(parent, 'overseer-review-checkout-'));
   await runGit(dir, ['init', '-q']);
   await runGit(dir, ['config', 'user.email', 'smoke@example.invalid']);
   await runGit(dir, ['config', 'user.name', 'smoke']);
   await writeFile(join(dir, 'allowed.txt'), 'allowed\n');
   await runGit(dir, ['add', 'allowed.txt']);
   await runGit(dir, ['commit', '-qm', 'fixture']);
+  if (parent !== tmpdir()) {
+    const permissions = Bun.spawn(['/bin/chmod', '-R', 'g+rwX', dir]);
+    if ((await permissions.exited) !== 0) throw new Error('checkout_permission_setup_failed');
+    await chmod(dir, 0o770);
+  }
   return { dir, head: await runGit(dir, ['rev-parse', 'HEAD']) };
 }
 
@@ -268,7 +325,20 @@ function approveResult(headSha: string): {
 
 const stubOctokit = { pulls: {} } as unknown as RealGitHubOctokitLike;
 
-async function startFakeBroker(): Promise<{ stop: () => Promise<void> }> {
+async function startBrokerHarness(): Promise<{ stop: () => Promise<void> }> {
+  try {
+    await access('/var/lib/overseer-review/ready');
+    const previous = process.env.OVERSEER_REVIEW_SPOOL;
+    process.env.OVERSEER_REVIEW_SPOOL = '/var/lib/overseer-review';
+    return {
+      async stop() {
+        if (previous === undefined) delete process.env.OVERSEER_REVIEW_SPOOL;
+        else process.env.OVERSEER_REVIEW_SPOOL = previous;
+      },
+    };
+  } catch {
+    // The in-process protocol stand-in remains for non-container unit runs.
+  }
   const spool = await mkdtemp(join(tmpdir(), 'overseer-review-spool-'));
   await writeFile(join(spool, 'ready'), 'test\n');
   const previous = process.env.OVERSEER_REVIEW_SPOOL;
@@ -304,7 +374,14 @@ async function startFakeBroker(): Promise<{ stop: () => Promise<void> }> {
         }
         await writeFile(
           join(spool, `${job.id}.result.json`),
-          JSON.stringify({ id: job.id, ok: exitCode === 0, exitCode, stdout, stderr, uid: 1002 })
+          JSON.stringify({
+            id: job.id,
+            ok: exitCode === 0,
+            exitCode,
+            stdout,
+            stderr,
+            uid: process.getuid?.() ?? -1,
+          })
         );
         await rm(join(spool, name), { force: true });
       }
@@ -329,7 +406,7 @@ async function reviewObservedCheckout(input: {
   evaluate?: () => Promise<ReturnType<typeof approveResult>>;
   broker?: boolean;
 }): Promise<{ disposition: string; posts: string[]; proofRecords: number; evaluated: boolean }> {
-  const broker = input.broker === false ? undefined : await startFakeBroker();
+  const broker = input.broker === false ? undefined : await startBrokerHarness();
   const posts: string[] = [];
   let proofRecords = 0;
   let evaluated = false;
@@ -547,7 +624,7 @@ describe.serial('observed checkout integrity and check environment', () => {
       for (const [key, value] of Object.entries(CANARIES)) process.env[key] = value;
       process.env.PATH = `${binDir}:${saved.PATH ?? ''}`;
       const during = Object.entries(process.env).map(([key, value]) => `${key}=${value ?? ''}`);
-      const broker = await startFakeBroker();
+      const broker = await startBrokerHarness();
       await observeReviewExecution({
         requestId: 'request-1',
         workerId: 'worker-1',

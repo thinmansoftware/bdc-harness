@@ -39,6 +39,7 @@ interface BrokerResult {
 
 const OUTPUT_LIMIT = 128 * 1024;
 const EXECUTION_TIMEOUT_MS = 60_000;
+const PINNED_CODEX_PREFIX = ['bunx', '--offline', `@openai/codex@${CODEX_VERSION}`];
 
 function inside(path: string, root: string): boolean {
   return path === root || path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
@@ -160,19 +161,41 @@ export async function runBrokerProcess(
   return { exitCode, stdout, stderr, outputTruncated, timedOut };
 }
 
-async function processJob(path: string): Promise<BrokerResult> {
+export async function processJob(path: string, spool = SPOOL): Promise<BrokerResult> {
   const id = basename(path, '.request.json');
   try {
     const raw = JSON.parse(await readFile(path, 'utf8')) as unknown;
     if (!validJob(raw) || raw.id !== id) throw new Error('invalid_job');
     const job = raw;
-    const spoolReal = await realpath(SPOOL);
+    const spoolReal = await realpath(spool);
     const checkout = await realpath(job.checkout);
     if (!inside(checkout, spoolReal)) throw new Error('checkout_outside_spool');
     const info = await stat(checkout);
     if (!info.isDirectory()) throw new Error('checkout_invalid');
+    if (
+      job.prompt !== undefined &&
+      JSON.stringify(job.argv) !==
+        JSON.stringify([
+          ...PINNED_CODEX_PREFIX,
+          '--enable',
+          'use_legacy_landlock',
+          '-c',
+          'web_search="disabled"',
+          'exec',
+          '--json',
+          '--sandbox',
+          'workspace-write',
+          '-c',
+          'sandbox_workspace_write.network_access=false',
+          '--skip-git-repo-check',
+          '--cd',
+          checkout,
+        ])
+    ) {
+      throw new Error('model_argv_invalid');
+    }
 
-    const scratch = join(SPOOL, `${id}.scratch`);
+    const scratch = join(spool, `${id}.scratch`);
     const codexHome = join(scratch, 'codex');
     const temp = join(scratch, 'tmp');
     await mkdir(codexHome, { recursive: true, mode: 0o700 });
@@ -202,27 +225,42 @@ async function processJob(path: string): Promise<BrokerResult> {
     if (head.exitCode !== 0 || head.stdout.trim() !== job.expectedHead)
       throw new Error('checkout_identity_failure');
 
-    const codex = '/app/node_modules/.bin/codex';
     const command =
       job.prompt === undefined
-        ? [codex, '--enable', 'use_legacy_landlock', '-C', checkout, 'sandbox', '--', ...job.argv]
-        : [
-            codex,
+        ? [
+            ...PINNED_CODEX_PREFIX,
             '--enable',
             'use_legacy_landlock',
-            '-c',
-            'web_search="disabled"',
-            'exec',
-            '--json',
-            '--sandbox',
-            'workspace-write',
-            '-c',
-            'sandbox_workspace_write.network_access=false',
-            '--skip-git-repo-check',
-            '--cd',
+            '-C',
             checkout,
-          ];
-    const version = await runBrokerProcess([codex, '--version'], checkout, env);
+            'sandbox',
+            '--',
+            ...job.argv,
+          ]
+        : job.argv;
+    if (
+      job.prompt !== undefined &&
+      JSON.stringify(command) !==
+        JSON.stringify([
+          ...PINNED_CODEX_PREFIX,
+          '--enable',
+          'use_legacy_landlock',
+          '-c',
+          'web_search="disabled"',
+          'exec',
+          '--json',
+          '--sandbox',
+          'workspace-write',
+          '-c',
+          'sandbox_workspace_write.network_access=false',
+          '--skip-git-repo-check',
+          '--cd',
+          checkout,
+        ])
+    ) {
+      throw new Error('model_argv_invalid');
+    }
+    const version = await runBrokerProcess([...PINNED_CODEX_PREFIX, '--version'], checkout, env);
     if (version.exitCode !== 0 || !version.stdout.includes(CODEX_VERSION))
       throw new Error('landlock_unsupported');
     const result = await runBrokerProcess(command, checkout, env, job.prompt);

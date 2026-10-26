@@ -964,10 +964,10 @@ export async function discoverMergeCandidates(
       }
 
       // GitHub's aggregate APPROVED bit is not merge authority. Production
-      // callers supply the receipt-backed guard; test/legacy compositions may
-      // omit the optional seam until they are migrated.
+      // callers must supply the receipt-backed guard. Missing qualification
+      // authority fails closed just like an explicit negative result.
       if (
-        deps.hasQualifiedReview &&
+        !deps.hasQualifiedReview ||
         !(await deps.hasQualifiedReview({
           owner: pr.owner,
           repo: pr.repo,
