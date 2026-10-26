@@ -86,6 +86,8 @@ import {
 import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
 import { createMergeManager } from '@archon/overseer/merge-manager';
 import { resolveDefaultDeps } from '@archon/overseer/service';
+import { countOverseerAutomaticRecoveryAttempts } from '@archon/core/db/overseer';
+import { createOverseerFireWorkflowRun } from './overseer-fire';
 import { ingestPullRequestEvent } from '@archon/overseer/pr-review-ingest';
 import { createRealIngestDeps, resolveReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
 import { ingestCheckCompletionEvent } from '@archon/overseer/pr-review-check-ingest';
@@ -193,7 +195,7 @@ function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
-function startOverseerRuntimeWithRealMergeManager(): void {
+function startOverseerRuntimeWithRealMergeManager(port: number): void {
   const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
   const realAdapterRequested =
     !envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) && token.length > 0;
@@ -203,8 +205,18 @@ function startOverseerRuntimeWithRealMergeManager(): void {
   }
   const deps = resolveDefaultDeps();
   const mergeManager = createMergeManager(deps);
+  const fireWorkflowRun = createOverseerFireWorkflowRun({
+    port,
+    operatorToken: process.env.ARCHON_OPERATOR_TOKEN ?? '',
+  });
   startOverseerRuntime({
-    serviceOptions: { deps, mergeCoordinator: mergeManager, mergeBridgeEnabled: true },
+    serviceOptions: {
+      deps,
+      mergeCoordinator: mergeManager,
+      mergeBridgeEnabled: true,
+      fireWorkflowRun,
+      countAutomaticAttempts: countOverseerAutomaticRecoveryAttempts,
+    },
   });
 }
 
@@ -302,8 +314,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().fatal({ err: error }, 'startup_running_reconciliation_failed');
     process.exit(1);
   }
-
-  startOverseerRuntimeWithRealMergeManager();
 
   const config = await loadConfig();
   logConfig(config);
@@ -812,6 +822,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     port,
     idleTimeout: 255, // Max value (seconds) - prevents SSE connections from being killed
   });
+  startOverseerRuntimeWithRealMergeManager(server.port ?? port);
   getLog().info({ port: server.port, hostname }, 'server_listening');
   startDispatchEscalationClock();
 
