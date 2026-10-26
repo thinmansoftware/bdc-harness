@@ -2578,6 +2578,40 @@ describe('CodexProvider capacity failover', () => {
     expect(failbackFactory).not.toHaveBeenCalled();
   });
 
+  test('CapacitySwitchFromUnpinnedModelReportsResolvedDefault', async () => {
+    mockRunStreamed
+      .mockRejectedValueOnce(capacityError)
+      .mockRejectedValueOnce(capacityError)
+      .mockRejectedValueOnce(capacityError)
+      .mockRejectedValueOnce(capacityError)
+      .mockResolvedValueOnce({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+    const provider = new CodexProvider({ retryBaseDelayMs: 0 });
+    const chunks = [];
+    for await (const chunk of provider.sendQuery('test', '/workspace', undefined, {
+      fallbackModel: 'gpt-5.6-terra',
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(mockStartThread.mock.calls[0]?.[0]?.model).toBe('gpt-5.6-sol');
+    expect(chunks.filter(chunk => chunk.type === 'provider_route')).toEqual([
+      {
+        type: 'provider_route',
+        route: 'failover',
+        fromProvider: 'codex',
+        fromModel: 'gpt-5.6-sol',
+        toProvider: 'codex',
+        toModel: 'gpt-5.6-terra',
+        reasonCode: 'provider_model_capacity',
+      },
+    ]);
+  });
+
   test('SwitchResumesSameThread', async () => {
     mockRunStreamed.mockRejectedValue(capacityError);
     const successfulFallbackThread = createMockThread('fallback-thread');

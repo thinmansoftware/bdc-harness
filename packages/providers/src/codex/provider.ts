@@ -792,9 +792,9 @@ export class CodexProvider implements IAgentProvider {
 
     // 1. Initialize SDK and build thread options
     const codex = await this.createCodexClient(codexConfig.codexBinaryPath, requestOptions?.env);
-    const originalModel = requestOptions?.model;
     let activeRequestOptions = requestOptions ? { ...requestOptions } : undefined;
     let activeThreadOptions = buildThreadOptions(cwd, activeRequestOptions?.model, assistantConfig);
+    const originalModel = activeThreadOptions.model;
 
     if (requestOptions?.abortSignal?.aborted) {
       throw new Error('Query aborted');
