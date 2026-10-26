@@ -86,6 +86,8 @@ describe('already-satisfied lane wiring', () => {
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
       'bdc-feature-development-kimi-k3.yaml',
+      'bdc-feature-development-open-a.yaml',
+      'bdc-feature-development-open-b.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
@@ -207,7 +209,9 @@ describe('already-satisfied lane wiring', () => {
       expect(gate?.bash).toBeString();
       const forceBuild =
         file === 'bdc-feature-development-zero.yaml' ||
-        file === 'bdc-feature-development-zero-open.yaml';
+        file === 'bdc-feature-development-zero-open.yaml' ||
+        file === 'bdc-feature-development-open-a.yaml' ||
+        file === 'bdc-feature-development-open-b.yaml';
 
       const already = await runGateScript(
         gate?.bash ?? '',
@@ -258,7 +262,9 @@ describe('already-satisfied lane wiring', () => {
       expect(gate?.bash).not.toContain('BDC_CHECK_ALREADY_SATISFIED_OUTPUT');
       const forceBuild =
         file === 'bdc-feature-development-zero.yaml' ||
-        file === 'bdc-feature-development-zero-open.yaml';
+        file === 'bdc-feature-development-zero-open.yaml' ||
+        file === 'bdc-feature-development-open-a.yaml' ||
+        file === 'bdc-feature-development-open-b.yaml';
 
       const evidence = [
         "branch contains quoted value 'already done'",
