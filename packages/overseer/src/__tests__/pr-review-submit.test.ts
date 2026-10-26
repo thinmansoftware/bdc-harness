@@ -489,14 +489,15 @@ describe('failure handling', () => {
     expect(outcome.reason).toContain('submit_threw');
   });
 
-  test('a receipt failure does not convert an outcome into a throw', async () => {
+  test('an approval receipt failure is nonthrowing but nonqualifying', async () => {
     const { deps } = makeDeps({
       recordReceipt: async () => {
         throw new Error('receipt_down');
       },
     });
     const outcome = await runAndSubmitReview(WORK, deps);
-    expect(outcome.disposition).toBe('approved');
+    expect(outcome.disposition).toBe('review_incomplete');
+    expect(outcome.reason).toBe('github_approval_response_receipt_failed');
   });
 });
 

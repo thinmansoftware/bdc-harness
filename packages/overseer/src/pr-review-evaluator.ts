@@ -6,6 +6,7 @@ import { conclusionIsPassing, latestAttemptPerCheck } from './pr-review-check-in
 import { createLogger } from '@archon/paths';
 import {
   buildJudgeTransport,
+  buildPrReviewTransport,
   defaultJudgeChildSpawn,
   deliverStdin,
   destroyStdin,
@@ -13,6 +14,7 @@ import {
   type JudgeChild,
   type JudgeChildSpawn,
   type JudgeTransport,
+  type PrReviewTransportContext,
 } from './judge-transport';
 
 /**
@@ -170,7 +172,13 @@ export interface PrReviewDeps {
     input: PrReviewInput
   ): Promise<{ diff: string; checks: PrReviewCheck[]; requiredContexts?: string[] | null }>;
   fetchAcceptanceCriteria(woId: string): Promise<string | null>;
-  invokeModel(binary: string, prompt: string): Promise<PrReviewModelResult>;
+  invokeModel(
+    binary: string,
+    prompt: string,
+    context?: PrReviewTransportContext
+  ): Promise<PrReviewModelResult>;
+  /** Server-created context only. Its absence preserves legacy/test callers. */
+  executionContext?: PrReviewTransportContext;
   ladder?: readonly string[];
   /**
    * Per-rung outage seam (#847). Called with the classified quota / credit /
@@ -678,7 +686,7 @@ export async function evaluatePullRequest(
       'judge_rung_started'
     );
     try {
-      const result = await deps.invokeModel(binary, prompt);
+      const result = await deps.invokeModel(binary, prompt, deps.executionContext);
       const rungMs = Date.now() - rungStartedAt;
       if (result.timedOut) {
         // A timeout is transport, not judgment: the process started but never
@@ -832,17 +840,21 @@ export { DEFAULT_CURSOR_JUDGE_MODEL, resolveCursorJudgeModel } from './judge-tra
 /** Exported for the permission test; not part of the review API surface. */
 export async function buildReviewModelTransport(
   binary: string,
-  prompt: string
+  prompt: string,
+  context?: PrReviewTransportContext
 ): Promise<JudgeTransport> {
-  return buildJudgeTransport(binary, prompt);
+  return context
+    ? buildPrReviewTransport(binary, prompt, context)
+    : buildJudgeTransport(binary, prompt);
 }
 
 export async function invokeConfiguredReviewModel(
   binary: string,
   prompt: string,
+  context?: PrReviewTransportContext,
   timeoutMs = resolveReviewModelTimeoutMs()
 ): Promise<PrReviewModelResult> {
-  const transport = await buildReviewModelTransport(binary, prompt);
+  const transport = await buildReviewModelTransport(binary, prompt, context);
   try {
     return await runReviewModelProcess(transport, binary, timeoutMs);
   } finally {

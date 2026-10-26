@@ -95,6 +95,43 @@ export interface ReviewerVerdict {
   reasonCode?: string;
   /** Milliseconds to wait before the item becomes claimable again. */
   retryAfterMs?: number;
+  /** Supervisor-observed native execution evidence. Model output cannot populate this. */
+  executionProof?: ReviewExecutionProof;
+}
+
+export interface ReviewExecutionContext {
+  readonly requestId: string;
+  readonly workerId: string;
+  readonly fencingToken: number;
+  readonly owner: string;
+  readonly repo: string;
+  readonly prNumber: number;
+  readonly headSha: string;
+  readonly checkoutPath: string;
+  readonly reviewerIdentity: string;
+  readonly rung: string;
+  readonly checkPlan: readonly (readonly string[])[];
+}
+
+export interface ReviewExecutionProof {
+  readonly requestId: string;
+  readonly headSha: string;
+  readonly treeSha: string;
+  readonly cwd: string;
+  readonly nativePolicy: 'codex_legacy_landlock';
+  readonly nativeVersion: string;
+  readonly runtimeUid: number;
+  readonly inspectionObserved: boolean;
+  readonly checks: readonly {
+    readonly argv: readonly string[];
+    readonly cwd: string;
+    readonly exitCode: number;
+    readonly outputDigest: string;
+    readonly startedAt: string;
+    readonly endedAt: string;
+  }[];
+  readonly startedAt: string;
+  readonly endedAt: string;
 }
 
 export interface ReviewWorkItem {
@@ -106,6 +143,8 @@ export interface ReviewWorkItem {
   /** The exact head this work item is bound to. */
   headSha: string;
   author: string;
+  /** Present on dispatch-worker work only; constructed from the live claim, never its body. */
+  executionContext?: ReviewExecutionContext;
 }
 
 export type SubmitDisposition =
@@ -162,12 +201,15 @@ export type SubmitDisposition =
    * transport failure only has a fixed backoff, and the two are worth telling
    * apart in the receipt when diagnosing why a review did not land.
    */
-  | 'rate_limited';
+  | 'rate_limited'
+  | 'review_incomplete';
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
   reason?: string;
   event?: OverseerReviewEvent;
+  executionProof?: ReviewExecutionProof;
+  githubReview?: SubmitPullRequestReviewResult['review'];
   /**
    * Present only on a changes_requested disposition. Reports whether the
    * verdict was handed back to Taskmaster and, when it was not, why it stopped
@@ -236,6 +278,17 @@ export interface SubmitDeps {
      * blocking finding needs your judgment".
      */
     remediation?: RemediationOutcome;
+    executionProof?: ReviewExecutionProof;
+    githubReview?: SubmitPullRequestReviewResult['review'];
+  }): Promise<void>;
+
+  /** Revalidates the dispatch fence. Required for execution-context work. */
+  hasCustody?(context: ReviewExecutionContext): Promise<boolean>;
+
+  /** Durable pre-publication write. Approval is refused if this write fails. */
+  recordExecutionProof?(input: {
+    work: ReviewWorkItem;
+    proof: ReviewExecutionProof;
   }): Promise<void>;
 
   /**
@@ -409,6 +462,10 @@ export async function runAndSubmitReview(
     });
   }
 
+  if (work.executionContext && !qualifiesExecution(work.executionContext, verdict.executionProof)) {
+    return submitIncomplete(work, deps, 'sandbox_execution_proof_missing_or_invalid');
+  }
+
   // EXACT-HEAD BINDING: the reviewer must have examined the bound head.
   //
   // Both head gates run BEFORE the required-contexts block below. A blocked
@@ -466,6 +523,16 @@ export async function runAndSubmitReview(
     });
   }
 
+  if (work.executionContext) {
+    const ownsFence = deps.hasCustody ? await deps.hasCustody(work.executionContext) : false;
+    if (!ownsFence) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'custody_conflict',
+        reason: 'dispatch_fence_lost_before_publication',
+      });
+    }
+  }
+
   // REQUIRED CONTEXTS UNAVAILABLE (#775): bounded deferral has been exhausted,
   // and the head the reviewer evaluated is confirmed to still be the live head.
   // Post a COMMENT so the PR itself says why it is blocked, then finish with a
@@ -501,6 +568,24 @@ export async function runAndSubmitReview(
 
   const event: OverseerReviewEvent = verdict.approved ? 'APPROVE' : 'REQUEST_CHANGES';
   const body = buildReviewBody(work, verdict);
+
+  if (work.executionContext && verdict.approved) {
+    if (!deps.recordExecutionProof || !verdict.executionProof) {
+      return submitIncomplete(work, deps, 'execution_proof_store_unavailable');
+    }
+    try {
+      await deps.recordExecutionProof({ work, proof: verdict.executionProof });
+    } catch (error) {
+      return submitIncomplete(work, deps, `execution_proof_store_failed:${errorCode(error)}`);
+    }
+    const ownsFence = deps.hasCustody ? await deps.hasCustody(work.executionContext) : false;
+    if (!ownsFence) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'custody_conflict',
+        reason: 'dispatch_fence_lost_immediately_before_post',
+      });
+    }
+  }
 
   // A rejection with no evidence is not actionable; refuse before the call.
   if (!verdict.approved && verdict.summary.trim().length === 0) {
@@ -541,6 +626,19 @@ export async function runAndSubmitReview(
     });
   }
 
+  if (
+    work.executionContext &&
+    verdict.approved &&
+    (submission.review?.state !== 'APPROVED' || submission.review.commitSha !== work.headSha)
+  ) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'review_incomplete',
+      reason: 'github_approval_response_unqualified',
+      event: 'APPROVE',
+      executionProof: verdict.executionProof,
+    });
+  }
+
   if (verdict.approved) {
     // summaryField is REQUIRED here, not optional polish. Splitting the
     // approved branch out of the shared terminal return dropped it (PR #740
@@ -550,6 +648,8 @@ export async function runAndSubmitReview(
     return finish(deps, work, work.headSha, {
       disposition: 'approved',
       event,
+      executionProof: verdict.executionProof,
+      githubReview: submission.review,
       ...summaryField(verdict),
     });
   }
@@ -569,6 +669,52 @@ export async function runAndSubmitReview(
     ...(!verdict.approved && verdict.reasonCode
       ? { reason: `indeterminate:${verdict.reasonCode}` }
       : {}),
+  });
+}
+
+function qualifiesExecution(
+  context: ReviewExecutionContext,
+  proof: ReviewExecutionProof | undefined
+): proof is ReviewExecutionProof {
+  if (proof?.requestId !== context.requestId || proof.headSha !== context.headSha) return false;
+  if (!proof.inspectionObserved || proof.nativePolicy !== 'codex_legacy_landlock') return false;
+  if (!Number.isInteger(proof.runtimeUid) || proof.runtimeUid === 0 || !proof.treeSha || !proof.cwd)
+    return false;
+  if (context.checkPlan.length === 0 || proof.checks.length !== context.checkPlan.length)
+    return false;
+  return proof.checks.every(
+    (check, index) =>
+      check.exitCode === 0 &&
+      check.outputDigest.length > 0 &&
+      JSON.stringify(check.argv) === JSON.stringify(context.checkPlan[index])
+  );
+}
+
+async function submitIncomplete(
+  work: ReviewWorkItem,
+  deps: SubmitDeps,
+  reason: string
+): Promise<SubmitOutcome> {
+  const body = `Review incomplete: ${reason}. No approval was recorded.`;
+  let suffix = '';
+  try {
+    const result = await deps.submitReview({
+      owner: work.owner,
+      repo: work.repo,
+      number: work.prNumber,
+      event: 'COMMENT',
+      body,
+      commitId: work.headSha,
+    });
+    if (!result.submitted) suffix = `:comment_failed:${result.message ?? 'unknown'}`;
+  } catch (error) {
+    suffix = `:comment_failed:${errorCode(error)}`;
+  }
+  return finish(deps, work, work.headSha, {
+    disposition: 'review_incomplete',
+    reason: `${reason}${suffix}`,
+    event: 'COMMENT',
+    summary: body,
   });
 }
 
@@ -672,9 +818,19 @@ async function finish(
       ...(outcome.event ? { event: outcome.event } : {}),
       ...(outcome.reason ? { reason: outcome.reason } : {}),
       ...(outcome.remediation ? { remediation: outcome.remediation } : {}),
+      ...(outcome.executionProof ? { executionProof: outcome.executionProof } : {}),
+      ...(outcome.githubReview ? { githubReview: outcome.githubReview } : {}),
     });
   } catch {
-    // Receipt failure never converts a classified outcome into a throw.
+    // A posted approval whose actual response cannot be made durable is
+    // unknown and must never be presented to downstream code as qualified.
+    if (outcome.disposition === 'approved') {
+      return {
+        ...outcome,
+        disposition: 'review_incomplete',
+        reason: 'github_approval_response_receipt_failed',
+      };
+    }
   }
   // The retry instant is part of the outcome, not the receipt: the worker reads
   // it off the return value to schedule the deferral.
