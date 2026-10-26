@@ -181,6 +181,7 @@ function buildModelAccessMessage(model?: string): string {
 const MAX_SUBPROCESS_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2000;
 const RATE_LIMIT_PATTERNS = ['rate limit', 'too many requests', '429', 'overloaded'];
+const CAPACITY_PATTERNS = ['at capacity', 'try a different model'];
 // AUTH_PATTERNS is shared with claude/provider.ts and orchestrator-agent.ts via
 // packages/providers/src/auth-refresh/auth-patterns.ts. Edit that file (not here)
 // to add new auth-error markers.
@@ -239,13 +240,14 @@ function isAuthFailureError(errorMessage: string | undefined): boolean {
 
 function classifyCodexError(
   errorMessage: string
-): 'rate_limit' | 'auth' | 'crash' | 'model_access' | 'unknown' {
+): 'rate_limit' | 'capacity' | 'auth' | 'crash' | 'model_access' | 'unknown' {
   if (isModelAccessError(errorMessage)) return 'model_access';
   const m = errorMessage.toLowerCase();
   // Rollout/resume failures are crash-class (retryable with a fresh thread).
   // Check BEFORE AUTH_PATTERNS so a future auth-pattern broadening cannot
   // spuriously misclassify a thread-resume failure as auth.
   if (ROLLOUT_MISSING_PATTERNS.some(p => m.includes(p))) return 'crash';
+  if (CAPACITY_PATTERNS.every(p => m.includes(p))) return 'capacity';
   if (RATE_LIMIT_PATTERNS.some(p => m.includes(p))) return 'rate_limit';
   if (AUTH_PATTERNS.some(p => m.includes(p))) return 'auth';
   if (SUBPROCESS_CRASH_PATTERNS.some(p => m.includes(p))) return 'crash';
@@ -681,7 +683,8 @@ function classifyAndEnrichCodexError(
 
   const enrichedError = new Error(`Codex ${errorClass}: ${error.message}`);
   enrichedError.cause = error;
-  const shouldRetry = errorClass === 'rate_limit' || errorClass === 'crash';
+  const shouldRetry =
+    errorClass === 'rate_limit' || errorClass === 'crash' || errorClass === 'capacity';
   return { enrichedError, errorClass, shouldRetry };
 }
 
@@ -789,7 +792,9 @@ export class CodexProvider implements IAgentProvider {
 
     // 1. Initialize SDK and build thread options
     const codex = await this.createCodexClient(codexConfig.codexBinaryPath, requestOptions?.env);
-    const threadOptions = buildThreadOptions(cwd, requestOptions?.model, assistantConfig);
+    const originalModel = requestOptions?.model;
+    let activeRequestOptions = requestOptions ? { ...requestOptions } : undefined;
+    let activeThreadOptions = buildThreadOptions(cwd, activeRequestOptions?.model, assistantConfig);
 
     if (requestOptions?.abortSignal?.aborted) {
       throw new Error('Query aborted');
@@ -804,7 +809,7 @@ export class CodexProvider implements IAgentProvider {
           prompt,
           cwd,
           undefined,
-          buildFailbackOptions(requestOptions)
+          buildFailbackOptions(activeRequestOptions)
         );
       } catch (failbackError) {
         // WO-HARNESS-CODEX-PROVIDER-CRASH-ISOLATION-01: keep auth failback/abort
@@ -819,15 +824,15 @@ export class CodexProvider implements IAgentProvider {
     if (resumeSessionId) {
       getLog().debug({ sessionId: resumeSessionId }, 'resuming_thread');
       try {
-        thread = codex.resumeThread(resumeSessionId, threadOptions);
+        thread = codex.resumeThread(resumeSessionId, activeThreadOptions);
       } catch (error) {
         getLog().error({ err: error, sessionId: resumeSessionId }, 'resume_thread_failed');
         try {
-          thread = codex.startThread(threadOptions);
+          thread = codex.startThread(activeThreadOptions);
         } catch (startError) {
           const err = startError as Error;
           if (isModelAccessError(err.message)) {
-            throw new Error(buildModelAccessMessage(requestOptions?.model));
+            throw new Error(buildModelAccessMessage(activeRequestOptions?.model));
           }
           throw new Error(`Codex query failed: ${err.message}`);
         }
@@ -836,11 +841,11 @@ export class CodexProvider implements IAgentProvider {
     } else {
       getLog().debug({ cwd }, 'starting_new_thread');
       try {
-        thread = codex.startThread(threadOptions);
+        thread = codex.startThread(activeThreadOptions);
       } catch (error) {
         const err = error as Error;
         if (isModelAccessError(err.message)) {
-          throw new Error(buildModelAccessMessage(requestOptions?.model));
+          throw new Error(buildModelAccessMessage(activeRequestOptions?.model));
         }
         throw new Error(`Codex query failed: ${err.message}`);
       }
@@ -854,7 +859,7 @@ export class CodexProvider implements IAgentProvider {
     }
 
     // 3. Build turn options
-    const { turnOptions, hasOutputFormat } = buildTurnOptions(requestOptions);
+    const { turnOptions, hasOutputFormat } = buildTurnOptions(activeRequestOptions);
     let lastError: Error | undefined;
     // Runtime rollout-missing self-heal flag. Fires at most ONCE per sendQuery
     // call -- prevents an infinite resume loop if the rollout-missing error
@@ -863,6 +868,7 @@ export class CodexProvider implements IAgentProvider {
     // WO-HARNESS-CODEX-AUTH-FAILBACK-01: single-shot guard for auth-class failback.
     // Mirrors rolloutRestartUsed -- fires at most once per sendQuery.
     let authFailbackUsed = false;
+    let capacitySwitchUsed = false;
 
     for (let attempt = 0; attempt <= MAX_SUBPROCESS_RETRIES; attempt++) {
       if (requestOptions?.abortSignal?.aborted) {
@@ -872,11 +878,11 @@ export class CodexProvider implements IAgentProvider {
       if (attempt > 0) {
         getLog().debug({ cwd, attempt }, 'starting_new_thread');
         try {
-          thread = codex.startThread(threadOptions);
+          thread = codex.startThread(activeThreadOptions);
         } catch (startError) {
           const err = startError as Error;
           if (isModelAccessError(err.message)) {
-            throw new Error(buildModelAccessMessage(requestOptions?.model));
+            throw new Error(buildModelAccessMessage(activeRequestOptions?.model));
           }
           throw new Error(`Codex query failed: ${err.message}`);
         }
@@ -891,7 +897,7 @@ export class CodexProvider implements IAgentProvider {
           result.events as AsyncIterable<Record<string, unknown>>,
           hasOutputFormat,
           thread.id,
-          requestOptions?.abortSignal
+          activeRequestOptions?.abortSignal
         );
         return;
       } catch (error) {
@@ -929,11 +935,11 @@ export class CodexProvider implements IAgentProvider {
           // (context-loss is logged via the [WARNING] chunk above).
           rolloutRestartUsed = true;
           try {
-            thread = codex.startThread(threadOptions);
+            thread = codex.startThread(activeThreadOptions);
           } catch (startError) {
             const startErr = startError as Error;
             if (isModelAccessError(startErr.message)) {
-              throw new Error(buildModelAccessMessage(requestOptions?.model));
+              throw new Error(buildModelAccessMessage(activeRequestOptions?.model));
             }
             throw new Error(`Codex query failed: ${startErr.message}`);
           }
@@ -975,7 +981,7 @@ export class CodexProvider implements IAgentProvider {
 
         const { enrichedError, errorClass, shouldRetry } = classifyAndEnrichCodexError(
           err,
-          requestOptions?.model
+          activeRequestOptions?.model
         );
 
         getLog().error(
@@ -1009,6 +1015,53 @@ export class CodexProvider implements IAgentProvider {
         }
 
         if (!shouldRetry || attempt >= MAX_SUBPROCESS_RETRIES) {
+          if (errorClass === 'capacity' && requestOptions?.fallbackModel && !capacitySwitchUsed) {
+            capacitySwitchUsed = true;
+            const fallbackModel = requestOptions.fallbackModel;
+            activeRequestOptions = {
+              ...requestOptions,
+              model: fallbackModel,
+            };
+            activeThreadOptions = buildThreadOptions(cwd, fallbackModel, assistantConfig);
+
+            let fallbackResumeFailed = false;
+            if (thread.id) {
+              try {
+                thread = codex.resumeThread(thread.id, activeThreadOptions);
+              } catch (resumeError) {
+                getLog().error(
+                  { err: resumeError, sessionId: thread.id },
+                  'capacity_fallback_resume_failed'
+                );
+                fallbackResumeFailed = true;
+              }
+            } else {
+              fallbackResumeFailed = true;
+            }
+
+            if (fallbackResumeFailed) {
+              thread = codex.startThread(activeThreadOptions);
+              yield {
+                type: 'system',
+                content:
+                  '[WARNING] Could not resume previous session. Starting fresh conversation.',
+              };
+            }
+
+            yield {
+              type: 'provider_route',
+              route: 'failover',
+              fromProvider: 'codex',
+              ...(originalModel ? { fromModel: originalModel } : {}),
+              toProvider: 'codex',
+              toModel: fallbackModel,
+              reasonCode: 'provider_model_capacity',
+            };
+            lastError = enrichedError;
+            attempt = -1;
+            continue;
+          }
+
           // WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01: Claude failback.
           // When Codex is terminally unavailable AND a failback provider is
           // wired, delegate the query to it rather than throwing. The
@@ -1032,7 +1085,7 @@ export class CodexProvider implements IAgentProvider {
               type: 'provider_route',
               route: 'failback',
               fromProvider: 'codex',
-              ...(requestOptions?.model ? { fromModel: requestOptions.model } : {}),
+              ...(activeRequestOptions?.model ? { fromModel: activeRequestOptions.model } : {}),
               toProvider: failbackProvider.getType(),
               reasonCode: 'provider_unavailable',
             };
@@ -1069,7 +1122,7 @@ export class CodexProvider implements IAgentProvider {
         type: 'provider_route',
         route: 'failback',
         fromProvider: 'codex',
-        ...(requestOptions?.model ? { fromModel: requestOptions.model } : {}),
+        ...(activeRequestOptions?.model ? { fromModel: activeRequestOptions.model } : {}),
         toProvider: failbackProvider.getType(),
         reasonCode: 'provider_unavailable',
       };

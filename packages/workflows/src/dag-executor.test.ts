@@ -8197,6 +8197,109 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     );
   });
 
+  it('ExecutorRecordsBothModels', async () => {
+    const routedQuery = mock(function* () {
+      yield {
+        type: 'provider_route',
+        route: 'failover',
+        fromProvider: 'codex',
+        fromModel: 'gpt-5.6-terra',
+        toProvider: 'codex',
+        toModel: 'gpt-5.6-sol',
+        reasonCode: 'provider_model_capacity',
+      };
+      yield { type: 'assistant', content: 'Recovered on the fallback model.' };
+      yield { type: 'result' };
+    });
+    mockGetAgentProviderDag.mockReturnValue({
+      sendQuery: routedQuery,
+      getType: () => 'codex',
+      getCapabilities: mockCodexCapabilities,
+    });
+
+    const attempts: Array<Parameters<IWorkflowStore['createProviderAttempt']>[0]> = [];
+    const store = createMockStore();
+    (store.listProviderAttempts as Mock<() => Promise<typeof attempts>>).mockImplementation(
+      async () => attempts
+    );
+    (store.createProviderAttempt as Mock<() => Promise<boolean>>).mockImplementation(
+      async attempt => {
+        attempts.push(attempt as (typeof attempts)[number]);
+        return true;
+      }
+    );
+    const platform = createMockPlatform();
+
+    await executeDagWorkflow(
+      createMockDeps(store),
+      platform,
+      'conv-capacity-route',
+      testDir,
+      {
+        name: 'capacity-route-test',
+        nodes: [
+          {
+            id: 'review',
+            prompt: 'Review this change.',
+            provider: 'codex',
+            model: 'gpt-5.6-terra',
+            fallbackModel: 'gpt-5.6-sol',
+          },
+        ],
+      },
+      makeWorkflowRun('capacity-route-run'),
+      'codex',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      { ...minimalConfig, assistant: 'codex' }
+    );
+
+    expect(
+      attempts.map(attempt => [attempt.attemptNumber, attempt.provider, attempt.model])
+    ).toEqual([
+      [1, 'codex', 'gpt-5.6-terra'],
+      [2, 'codex', 'gpt-5.6-sol'],
+    ]);
+    expect(store.completeProviderAttempt).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        attemptId: attempts[0]?.attemptId,
+        outcomeClass: 'availability',
+        reasonCode: 'provider_model_capacity',
+      })
+    );
+    expect(store.completeProviderAttempt).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        attemptId: attempts[1]?.attemptId,
+        outcomeClass: 'success',
+      })
+    );
+    expect(store.createWorkflowEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event_type: 'node_failover',
+        data: expect.objectContaining({
+          attempt_id: attempts[0]?.attemptId,
+          route: 'failover',
+          from_provider: 'codex',
+          from_model: 'gpt-5.6-terra',
+          to_provider: 'codex',
+          to_model: 'gpt-5.6-sol',
+          reason_code: 'provider_model_capacity',
+        }),
+      })
+    );
+    const messages = (platform.sendMessage as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[1] as string
+    );
+    expect(
+      messages.some(message => message.includes('fallbackModel') && message.includes('unsupported'))
+    ).toBe(false);
+  });
+
   it('enforces one total provider-call ceiling across composed retry policies', async () => {
     const store = createMockStore();
     const priorAttempt = {
