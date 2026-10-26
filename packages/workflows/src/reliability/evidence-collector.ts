@@ -317,27 +317,42 @@ export async function collectRuntimeEvidence(
   // event that must never fail a run). Fall back to the authority's base BRANCH
   // lane (origin/<baseBranch>), which shares true history with HEAD, before giving
   // up. The fallback's own failure (genuinely disjoint lane) still throws.
-  let mergeBaseSha = '';
+  //
+  // When the pinned base is reachable but origin has moved forward
+  // (WO-HARNESS-MANIFEST-STALE-BASE-DIFF-01), file changes and merge ancestors
+  // follow that live lane merge-base only if the frozen run scope is an ancestor
+  // of it. A disjoint or rewritten scope fails closed before any diff.
+  let pinnedMergeBase = '';
   try {
-    mergeBaseSha = await git(['merge-base', authority.baseSha, headSha]);
+    pinnedMergeBase = await git(['merge-base', authority.baseSha, headSha]);
   } catch {
-    mergeBaseSha = '';
+    pinnedMergeBase = '';
   }
-  if (!mergeBaseSha) {
-    mergeBaseSha = await git([
-      'merge-base',
-      `refs/remotes/origin/${authority.baseBranch}`,
-      headSha,
-    ]);
+  const originRef = `refs/remotes/origin/${authority.baseBranch}`;
+  let mergeBaseSha = '';
+  // Set only to the lane merge-base SHA after `merge-base --is-ancestor` succeeds
+  // in this function. Never taken from the caller.
+  let verifiedLaneMergeBase: string | null = null;
+  if (!pinnedMergeBase) {
+    mergeBaseSha = await git(['merge-base', originRef, headSha]);
+  } else {
+    const laneMergeBase = await git(['merge-base', originRef, headSha]);
+    try {
+      await git(['merge-base', '--is-ancestor', authority.runScopeSha, laneMergeBase]);
+    } catch {
+      throw new Error(
+        'gate_scope_mismatch: run scope is not an ancestor of the base-lane merge-base'
+      );
+    }
+    mergeBaseSha = laneMergeBase;
+    if (laneMergeBase !== authority.baseSha) {
+      verifiedLaneMergeBase = laneMergeBase;
+    }
   }
-  const behindRaw = await git([
-    'rev-list',
-    '--count',
-    `${headSha}..refs/remotes/origin/${authority.baseBranch}`,
-  ]);
+  const behindRaw = await git(['rev-list', '--count', `${headSha}..${originRef}`]);
   if (!/^\d+$/.test(behindRaw)) throw new Error('gate_scope_mismatch: invalid behind count');
   const changes = parseGitNameStatus(
-    await git(['diff', '--name-status', `${authority.runScopeSha}..${headSha}`])
+    await git(['diff', '--name-status', `${mergeBaseSha}..${headSha}`])
   );
   const repository = repositoryFromRemote(authority.canonicalRemote);
   let pullRequest: PullRequestEvidence | null = null;
@@ -370,26 +385,51 @@ export async function collectRuntimeEvidence(
   }
   const events = await store.listWorkflowEvents(request.runId);
   const gates = request.requiredGateIds.map(id => gateFromEvents(id, events));
-  return collectMechanicalEvidence({
-    authority,
-    executionState: request.executionState,
-    recoveryState: request.recoveryState,
-    routeState: request.routeState,
-    git: {
-      headSha,
-      headBranch,
-      originRemote,
-      mergeBaseSha,
-      behindBy: Number.parseInt(behindRaw, 10),
-      changes,
+  return reduceCollectedEvidence(
+    {
+      authority,
+      executionState: request.executionState,
+      recoveryState: request.recoveryState,
+      routeState: request.routeState,
+      git: {
+        headSha,
+        headBranch,
+        originRemote,
+        mergeBaseSha,
+        behindBy: Number.parseInt(behindRaw, 10),
+        changes,
+      },
+      pullRequest,
+      gates,
     },
-    pullRequest,
-    gates,
-  });
+    verifiedLaneMergeBase
+  );
+}
+
+function dropCallerAdvancedBase(input: MechanicalEvidenceInput): MechanicalEvidenceInput {
+  if (!('acceptAdvancedBase' in input)) return input;
+  const fields = { ...input } as MechanicalEvidenceInput & { acceptAdvancedBase?: unknown };
+  delete fields.acceptAdvancedBase;
+  return fields;
+}
+
+function mergeBaseInFrozenScope(
+  input: MechanicalEvidenceInput,
+  verifiedLaneMergeBase: string | null
+): boolean {
+  if (input.git.mergeBaseSha === input.authority.baseSha) return true;
+  return verifiedLaneMergeBase !== null && input.git.mergeBaseSha === verifiedLaneMergeBase;
 }
 
 export function collectMechanicalEvidence(
   input: MechanicalEvidenceInput
+): CollectedMechanicalEvidence {
+  return reduceCollectedEvidence(dropCallerAdvancedBase(input), null);
+}
+
+function reduceCollectedEvidence(
+  input: MechanicalEvidenceInput,
+  verifiedLaneMergeBase: string | null
 ): CollectedMechanicalEvidence {
   const diffPaths = input.git.changes.map(change => change.path);
   const pullRequest = input.pullRequest;
@@ -399,8 +439,11 @@ export function collectMechanicalEvidence(
     pullRequest.headSha === input.git.headSha &&
     pullRequestIdentityMatches(pullRequest, input.authority.canonicalRemote) &&
     pathsEqual(pullRequest.files, diffPaths);
+  // Direct callers must match the frozen base SHA. A newer base-lane merge-base
+  // is accepted only when it is the exact SHA collectRuntimeEvidence just proved
+  // with `merge-base --is-ancestor`. That proof is not a caller input.
   const scopeValid =
-    input.git.mergeBaseSha === input.authority.baseSha &&
+    mergeBaseInFrozenScope(input, verifiedLaneMergeBase) &&
     normalizedRemote(input.git.originRemote) ===
       normalizedRemote(input.authority.canonicalRemote) &&
     (input.git.headBranch === input.authority.headBranch || prCorroborates) &&

@@ -120,6 +120,22 @@ describe('collectMechanicalEvidence', () => {
     expect(result.outcome.primaryReason).toBe('gate_scope_mismatch');
   });
 
+  it('rejects a caller-supplied advanced-base override without verified ancestry', () => {
+    const original = input();
+    const forged = {
+      ...input({ git: { ...original.git, mergeBaseSha: 'a'.repeat(40) } }),
+      acceptAdvancedBase: true,
+    };
+
+    const result = collectMechanicalEvidence(forged);
+
+    expect(result.scopeValid).toBe(false);
+    expect(result.pullRequestReady).toBe(false);
+    expect(result.outcome.validationState).toBe('failed');
+    expect(result.outcome.primaryReason).toBe('gate_scope_mismatch');
+    expect(result).not.toHaveProperty('acceptAdvancedBase');
+  });
+
   it('fails closed when the worktree branch or origin remote drifts', () => {
     const original = input();
     const wrongBranch = collectMechanicalEvidence(
@@ -143,14 +159,26 @@ describe('collectMechanicalEvidence', () => {
 // collector must NOT die; it falls back to merge-base(origin/<baseBranch>, HEAD).
 describe('collectRuntimeEvidence merge-base squash fallback', () => {
   const headSha = '7'.repeat(40);
-  const baseShaMergeBase = 'b'.repeat(40);
   const originMergeBase = 'a'.repeat(40);
+  const laneSha = 'b'.repeat(40);
+  const originRef = `refs/remotes/origin/${authority.baseBranch}`;
 
-  function makeRunner(opts: { baseShaReachable: boolean }): {
+  function makeRunner(opts: {
+    baseShaReachable: boolean;
+    originStdout?: string;
+    ancestryThrows?: boolean;
+    diffStdout?: string | ((range: string) => string);
+  }): {
     run: (command: string, args: readonly string[], cwd: string) => Promise<EvidenceCommandResult>;
     mergeBaseCalls: string[];
+    isAncestorCalls: string[];
+    diffRanges: string[];
   } {
     const mergeBaseCalls: string[] = [];
+    const isAncestorCalls: string[] = [];
+    const diffRanges: string[] = [];
+    const originStdout =
+      opts.originStdout ?? (opts.baseShaReachable ? authority.baseSha : originMergeBase);
     const run = async (
       command: string,
       args: readonly string[]
@@ -165,26 +193,45 @@ describe('collectRuntimeEvidence merge-base squash fallback', () => {
         case 'remote':
           return { stdout: `${authority.canonicalRemote}\n` };
         case 'merge-base': {
-          const operand = args[3];
+          if (args[3] === '--is-ancestor') {
+            isAncestorCalls.push(`${String(args[4] ?? '')} ${String(args[5] ?? '')}`);
+            if (opts.ancestryThrows) throw new Error('fatal: not an ancestor');
+            return { stdout: '\n' };
+          }
+          const operand = args[3] ?? '';
           mergeBaseCalls.push(operand);
           if (operand === authority.baseSha) {
             if (!opts.baseShaReachable) {
               throw new Error('fatal: Not a valid object name');
             }
-            return { stdout: `${baseShaMergeBase}\n` };
+            return { stdout: `${authority.baseSha}\n` };
           }
-          // Fallback: merge-base(refs/remotes/origin/<baseBranch>, HEAD)
-          return { stdout: `${originMergeBase}\n` };
+          // Origin lane: merge-base(refs/remotes/origin/<baseBranch>, HEAD)
+          if (operand === originRef) return { stdout: `${originStdout}\n` };
+          throw new Error(`unexpected merge-base operand ${operand}`);
         }
         case 'rev-list':
           return { stdout: '0\n' };
-        case 'diff':
-          return { stdout: '' };
+        case 'diff': {
+          const range = args[4] ?? '';
+          diffRanges.push(range);
+          if (typeof opts.diffStdout === 'function') return { stdout: opts.diffStdout(range) };
+          return { stdout: opts.diffStdout ?? '' };
+        }
         default:
           throw new Error(`unexpected git subcommand: ${String(sub)}`);
       }
     };
-    return { run, mergeBaseCalls };
+    return { run, mergeBaseCalls, isAncestorCalls, diffRanges };
+  }
+
+  function newerBaseRunner(): ReturnType<typeof makeRunner> {
+    return makeRunner({
+      baseShaReachable: true,
+      originStdout: laneSha,
+      diffStdout: range =>
+        range === `${laneSha}..${headSha}` ? 'A\tsrc/run-only.ts\n' : 'M\tdocs/unrelated-base.ts\n',
+    });
   }
 
   const store = {
@@ -201,23 +248,62 @@ describe('collectRuntimeEvidence merge-base squash fallback', () => {
   };
 
   it('falls back to origin/<baseBranch> when baseSha is unreachable (squash-pruned)', async () => {
-    const { run, mergeBaseCalls } = makeRunner({ baseShaReachable: false });
+    const { run, mergeBaseCalls, isAncestorCalls } = makeRunner({ baseShaReachable: false });
 
     const evidence = await collectRuntimeEvidence(store, run, request);
 
     // It did NOT throw, and the fallback merge-base was invoked with the origin ref.
     expect(mergeBaseCalls[0]).toBe(authority.baseSha);
-    expect(mergeBaseCalls[1]).toBe(`refs/remotes/origin/${authority.baseBranch}`);
+    expect(mergeBaseCalls[1]).toBe(originRef);
+    expect(isAncestorCalls).toEqual([]);
     expect(evidence.git.mergeBaseSha).toBe(originMergeBase);
   });
 
-  it('uses the pinned baseSha merge-base directly when it is reachable', async () => {
-    const { run, mergeBaseCalls } = makeRunner({ baseShaReachable: true });
+  it('reports the shared merge-base when the pinned base matches the origin lane', async () => {
+    const { run, mergeBaseCalls, isAncestorCalls } = makeRunner({ baseShaReachable: true });
 
     const evidence = await collectRuntimeEvidence(store, run, request);
 
-    expect(mergeBaseCalls).toEqual([authority.baseSha]);
-    expect(evidence.git.mergeBaseSha).toBe(baseShaMergeBase);
+    expect(mergeBaseCalls).toEqual([authority.baseSha, originRef]);
+    expect(isAncestorCalls).toEqual([`${authority.runScopeSha} ${authority.baseSha}`]);
+    expect(evidence.git.mergeBaseSha).toBe(authority.baseSha);
+  });
+
+  it('newer-base-diff-lists-only-run-commits', async () => {
+    const { run } = newerBaseRunner();
+
+    const evidence = await collectRuntimeEvidence(store, run, request);
+
+    expect(evidence.git.changes.map(change => change.path)).toEqual(['src/run-only.ts']);
+    expect(evidence.authority.runScopeSha).toBe(authority.baseSha);
+    expect(evidence.git.mergeBaseSha).toBe(laneSha);
+    expect(evidence.scopeValid).toBe(true);
+    expect(evidence.outcome.primaryReason).not.toBe('gate_scope_mismatch');
+  });
+
+  it('newer-base-merge-ancestors-line', async () => {
+    const { run } = newerBaseRunner();
+
+    const evidence = await collectRuntimeEvidence(store, run, request);
+    const manifest = renderManifestV2(evidence);
+
+    expect(manifest).toContain(`Merge ancestors: ${laneSha}...${headSha} (behind_by=0)`);
+    expect(manifest).not.toContain(`Merge ancestors: ${authority.baseSha}...`);
+  });
+
+  it('disjoint-scope-still-fails-closed', async () => {
+    const { run, mergeBaseCalls, diffRanges } = makeRunner({
+      baseShaReachable: true,
+      originStdout: laneSha,
+      ancestryThrows: true,
+      diffStdout: 'M\tsrc/should-not-diff.ts\n',
+    });
+
+    await expect(collectRuntimeEvidence(store, run, request)).rejects.toThrow(
+      'gate_scope_mismatch: run scope is not an ancestor of the base-lane merge-base'
+    );
+    expect(mergeBaseCalls).toEqual([authority.baseSha, originRef]);
+    expect(diffRanges).toEqual([]);
   });
 });
 
