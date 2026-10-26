@@ -33,9 +33,10 @@ function latestOverseer(reviews: RawReview[]): RawReview | undefined {
 }
 function findings(reviews: RawReview[], head: string): string[] {
   const review = reviews
-    .filter(r => r.user?.login === OVERSEER_BOT && r.commit_id === head && r.state !== 'APPROVED')
+    .filter(r => r.user?.login === OVERSEER_BOT && r.commit_id === head)
     .sort((a, b) => (a.submitted_at ?? '').localeCompare(b.submitted_at ?? ''))
     .at(-1);
+  if (review?.state === 'APPROVED') return [];
   return (review?.body ?? '')
     .split(/\r?\n/)
     .filter(line => /^(- |\d+\.\s)/.test(line))

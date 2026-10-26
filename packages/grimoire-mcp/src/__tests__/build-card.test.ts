@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { buildBlockedPrCard } from '../build-card';
 import type { GitHubSnapshot } from '../sources/github';
 import { readGitHub } from '../sources/github';
+import { readEventStore } from '../sources/event-store';
 import fixture from './fixtures/base.json';
 
 const approved = {
@@ -62,6 +63,27 @@ describe('card composition', () => {
     );
     expect(card.findings).toEqual(['- one', '2. two']);
   });
+  test('findings are empty when a later exact-head review approves', async () => {
+    const requested = {
+      ...approved,
+      state: 'CHANGES_REQUESTED',
+      submitted_at: '1',
+      body: '- stale finding',
+    };
+    const card = await buildBlockedPrCard(
+      'thinmansoftware/bdc-harness#1',
+      deps({ reviews: [requested, approved] })
+    );
+    expect(card.blocker_class).toBe('merge_ready');
+    expect(card.findings).toEqual([]);
+  });
+  test('pending commit status is checks pending', async () => {
+    const card = await buildBlockedPrCard(
+      'thinmansoftware/bdc-harness#1',
+      deps({ checkRuns: [], statuses: [{ context: 'deploy', state: 'pending' }] })
+    );
+    expect(card.blocker_class).toBe('checks_pending');
+  });
   test('11 event store unavailable degrades', async () => {
     const card = await buildBlockedPrCard(
       'thinmansoftware/bdc-harness#1',
@@ -72,12 +94,60 @@ describe('card composition', () => {
   });
   test('bad ref rejects', () =>
     expect(buildBlockedPrCard('bad', deps())).rejects.toThrow('owner/repo#N'));
+  test('check runs and commit statuses are paginated', async () => {
+    const client: any = {
+      pulls: {
+        get: async () => ({
+          data: {
+            ...fixture,
+            body: 'closes #1',
+            html_url: fixture.url,
+            head: { sha: fixture.head_sha, ref: fixture.head_ref },
+            base: { ref: 'dev' },
+            user: { login: 'author' },
+          },
+        }),
+        listReviews: async () => ({ data: [] }),
+      },
+      checks: {
+        listForRef: async ({ page }: { page: number }) => ({
+          data: {
+            check_runs:
+              page === 1
+                ? Array.from({ length: 100 }, (_, index) => ({
+                    name: `check-${index}`,
+                    status: 'completed',
+                    conclusion: 'success',
+                  }))
+                : [{ name: 'late-failure', status: 'completed', conclusion: 'failure' }],
+          },
+        }),
+      },
+      repos: {
+        listCommitStatusesForRef: async ({ page }: { page: number }) => ({
+          data:
+            page === 1
+              ? Array.from({ length: 100 }, (_, index) => ({
+                  context: `status-${index}`,
+                  state: 'success',
+                }))
+              : [{ context: 'late-pending', state: 'pending' }],
+        }),
+        getAllStatusCheckContexts: async () => ({ data: [] }),
+      },
+      issues: { get: async () => ({ data: {} }) },
+    };
+    const result = await readGitHub('thinmansoftware', 'bdc-harness', 1, client);
+    expect(result.status).toBe('ok');
+    expect(result.checkRuns.some(check => check.name === 'late-failure')).toBe(true);
+    expect(result.statuses.some(status => status.context === 'late-pending')).toBe(true);
+  });
   test('9 request cap degrades without an eleventh request', async () => {
-    let calls = 0;
+    const calls: string[] = [];
     const client: any = {
       pulls: {
         get: async () => {
-          calls += 1;
+          calls.push('GET pull');
           return {
             data: {
               ...fixture,
@@ -89,13 +159,31 @@ describe('card composition', () => {
           };
         },
         listReviews: async () => {
-          calls += 1;
+          calls.push('GET reviews');
           return { data: Array.from({ length: 100 }, () => approved) };
         },
       },
     };
     const result = await readGitHub('thinmansoftware', 'bdc-harness', 1, client);
-    expect(calls).toBe(10);
+    expect(calls).toHaveLength(10);
+    expect(calls.every(call => call.startsWith('GET '))).toBe(true);
     expect(result.status).toContain('request cap exceeded');
+
+    const statements: string[] = [];
+    const database: any = {
+      query: async (sql: string) => {
+        statements.push(sql.trim());
+        if (!sql.trimStart().toUpperCase().startsWith('SELECT'))
+          throw new Error('database fake permits SELECT only');
+        return { rows: [] };
+      },
+    };
+    const events = await readEventStore(
+      { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1, headRef: 'repair/ref' },
+      database
+    );
+    expect(events).toEqual({ runs: [], status: 'ok' });
+    expect(statements).toHaveLength(1);
+    expect(statements[0]?.toUpperCase().startsWith('SELECT')).toBe(true);
   });
 });

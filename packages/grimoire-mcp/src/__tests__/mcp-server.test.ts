@@ -38,7 +38,18 @@ test('10 MCP exposes exactly read-only pr_card and handles invalid refs', async 
   await client.close();
   await server.close();
 });
-test('13 input schema requires a string pr', async () => {
-  const server: any = createGrimoireServer();
-  expect(server).toBeTruthy();
+test('13 CLI bad reference exits 2 with the required diagnostic', async () => {
+  const process = Bun.spawn(
+    ['bun', 'run', new URL('../cli.ts', import.meta.url).pathname, 'card', 'nope'],
+    {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    }
+  );
+  const [exitCode, stderr] = await Promise.all([
+    process.exited,
+    new Response(process.stderr).text(),
+  ]);
+  expect(exitCode).toBe(2);
+  expect(stderr.trim()).toBe('expected PR reference in owner/repo#N form');
 });

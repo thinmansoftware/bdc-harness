@@ -82,6 +82,7 @@ export function decideBlocker(
     input.checksVerdict !== OK &&
     !input.checksVerdict.includes('in_progress') &&
     !input.checksVerdict.includes('queued') &&
+    !input.checksVerdict.includes('=pending') &&
     input.checksVerdict !== 'no checks reported for head'
   )
     kind = 'checks_red';

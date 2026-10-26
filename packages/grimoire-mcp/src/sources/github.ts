@@ -63,14 +63,31 @@ export async function readGitHub(
       reviews.push(...response.data);
       if (response.data.length < 100) break;
     }
-    const checksResponse: any = await call('check runs', () =>
-      client.checks.listForRef({ owner, repo, ref: head, per_page: 100, filter: 'latest' })
-    );
-    const statusesResponse: any = await call('statuses', () =>
-      client.repos.listCommitStatusesForRef({ owner, repo, ref: head, per_page: 100 })
-    );
-    const checkRuns = latestAttemptPerCheck(checksResponse.data.check_runs as RawCheckRun[]);
-    const statuses = statusesResponse.data as RawStatus[];
+    const allCheckRuns: RawCheckRun[] = [];
+    for (let page = 1; ; page += 1) {
+      const response: any = await call('check runs', () =>
+        client.checks.listForRef({
+          owner,
+          repo,
+          ref: head,
+          per_page: 100,
+          page,
+          filter: 'latest',
+        })
+      );
+      const pageRuns = response.data.check_runs as RawCheckRun[];
+      allCheckRuns.push(...pageRuns);
+      if (pageRuns.length < 100) break;
+    }
+    const statuses: RawStatus[] = [];
+    for (let page = 1; ; page += 1) {
+      const response: any = await call('statuses', () =>
+        client.repos.listCommitStatusesForRef({ owner, repo, ref: head, per_page: 100, page })
+      );
+      statuses.push(...(response.data as RawStatus[]));
+      if (response.data.length < 100) break;
+    }
+    const checkRuns = latestAttemptPerCheck(allCheckRuns);
     let required: Set<string> | null = null;
     try {
       const resolution = await resolveRequiredContexts({
