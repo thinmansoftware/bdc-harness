@@ -27,6 +27,7 @@ import { mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
 import { runCascade } from './cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from './cascade.js';
+import { loadLadder } from './ladder.js';
 import { writeRecord } from './recorder.js';
 import type { CascadeRunRecord } from './types.js';
 
@@ -196,11 +197,14 @@ export async function resumeFrontierTier(
   // Stable id for the resumed cascade so the back-reference is deterministic and
   // the resumed fire is itself idempotent under replay (dispatchId).
   const resumeCascadeId = randomUUID();
+  const featureBinding = loadLadder().find(tier => tier.name === packet.tierName)?.workflowName;
+  const workflow = packet.workflowName === featureBinding ? undefined : packet.workflowName;
   const result = await runCascade({
     woId: packet.woId,
     woClass: packet.woClass ?? undefined,
     tags: packet.tags,
     entryOverride: packet.tierName,
+    ...(workflow !== undefined ? { workflow } : {}),
     initialPriorContext: packet.priorContext,
     expectedSpec: packet.expectedSpec,
     apiBaseUrl: opts.apiBaseUrl ?? packet.apiBaseUrl,
