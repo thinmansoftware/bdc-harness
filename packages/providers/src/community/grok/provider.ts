@@ -348,25 +348,36 @@ export class GrokAgentProvider implements IAgentProvider {
         return;
       }
       if (!response.ok) {
-        throw new Error(`openrouter_responses_http_${response.status}`);
+        const subtype = `openrouter_responses_http_${response.status}`;
+        yield errorResult(subtype, subtype);
+        return;
       }
       let native: NativeResponse;
       try {
         native = (await response.json()) as NativeResponse;
       } catch {
-        throw new Error('openrouter_responses_malformed');
+        yield errorResult('openrouter_responses_malformed', 'openrouter_responses_malformed');
+        return;
       }
       if (native.model !== requestedModel) {
-        throw new Error(`openrouter_served_model_mismatch: ${native.model ?? 'missing'}`);
+        yield errorResult(
+          'openrouter_served_model_mismatch',
+          `openrouter_served_model_mismatch: ${native.model ?? 'missing'}`
+        );
+        return;
       }
       servedModelId = native.model;
-      if (!native.usage) throw new Error('openrouter_usage_missing');
-      const cost = native.usage.cost;
-      if (typeof cost !== 'number' || !Number.isFinite(cost) || cost < 0) {
-        throw new Error('openrouter_cost_missing');
+      if (!native.usage) {
+        yield errorResult('openrouter_usage_missing', 'openrouter_usage_missing');
+        return;
       }
+      const cost = native.usage.cost;
       totalIn += native.usage.input_tokens ?? 0;
       totalOut += native.usage.output_tokens ?? 0;
+      if (typeof cost !== 'number' || !Number.isFinite(cost) || cost < 0) {
+        yield errorResult('openrouter_cost_missing', 'openrouter_cost_missing');
+        return;
+      }
       totalCost += cost;
       const budget = options?.maxBudgetUsd;
       if (budget !== undefined && totalCost >= budget) {

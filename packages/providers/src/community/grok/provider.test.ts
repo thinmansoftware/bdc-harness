@@ -591,7 +591,7 @@ describe('GrokAgentProvider', () => {
         usage: { input_tokens: 1, output_tokens: 1, cost: 0.01 },
         output: [],
       },
-      /openrouter_served_model_mismatch/,
+      'openrouter_served_model_mismatch',
     ],
     [
       {
@@ -600,25 +600,51 @@ describe('GrokAgentProvider', () => {
         usage: { input_tokens: 1, output_tokens: 1 },
         output: [],
       },
-      /openrouter_cost_missing/,
+      'openrouter_cost_missing',
     ],
-  ])('native Responses rejects served-model mismatch and missing cost', async (payload, error) => {
-    process.env.GLM_API_KEY = 'test-key';
-    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
-      async () => new Response(JSON.stringify(payload))
-    );
-    try {
-      await expect(async () => {
-        for await (const _ of new GrokAgentProvider().sendQuery('inspect', '/tmp', undefined, {
+  ])(
+    'native Responses preserves prior usage for served-model mismatch and missing cost',
+    async (payload, subtype) => {
+      process.env.GLM_API_KEY = 'test-key';
+      const fetchSpy = spyOn(globalThis, 'fetch')
+        .mockImplementationOnce(
+          async () =>
+            new Response(
+              JSON.stringify({
+                model: 'openai/gpt-6.1-terra',
+                status: 'completed',
+                usage: { input_tokens: 6, output_tokens: 2, cost: 0.09 },
+                output: [
+                  { type: 'function_call', call_id: 'list-1', name: 'list_dir', arguments: '{}' },
+                ],
+              })
+            )
+        )
+        .mockImplementationOnce(async () => new Response(JSON.stringify(payload)));
+      try {
+        const chunks = [];
+        for await (const chunk of new GrokAgentProvider().sendQuery('inspect', '/tmp', undefined, {
           model: 'openai/gpt-6.1-terra',
+          nodeConfig: { allowed_tools: ['list_dir'] },
         })) {
-          /* consume */
+          chunks.push(chunk);
         }
-      }).toThrow(error);
-    } finally {
-      fetchSpy.mockRestore();
+        expect(fetchSpy).toHaveBeenCalledTimes(2);
+        expect(chunks.at(-1)).toMatchObject({
+          type: 'result',
+          isError: true,
+          errorSubtype: subtype,
+          cost: 0.09,
+          tokens:
+            subtype === 'openrouter_cost_missing'
+              ? { input: 7, output: 3, total: 10 }
+              : { input: 6, output: 2, total: 8 },
+        });
+      } finally {
+        fetchSpy.mockRestore();
+      }
     }
-  });
+  );
 
   test('native Responses reports turn exhaustion with accumulated usage', async () => {
     process.env.GLM_API_KEY = 'test-key';
