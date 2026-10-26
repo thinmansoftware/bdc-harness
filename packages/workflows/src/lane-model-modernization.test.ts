@@ -14,6 +14,7 @@ type Node = {
   id: string;
   provider?: string;
   model?: string;
+  failover_model?: string;
   persona?: string;
   prompt?: string;
   loop?: unknown;
@@ -48,12 +49,17 @@ describe('feature-development lane model modernization', () => {
     ]);
     for (const file of files) {
       const lane = load(file);
-      const models = [{ id: '<root>', model: lane.model }, ...(lane.nodes ?? [])];
+      const models: Array<{ id: string; model?: string; failover_model?: string }> = [
+        { id: '<root>', model: lane.model },
+        ...(lane.nodes ?? []),
+      ];
       for (const entry of models) {
-        if (!entry.model?.startsWith('gpt-5.')) continue;
-        expect(file).toBe('bdc-feature-development-codex.yaml');
-        expect(entry.model).toBe('gpt-5.6-terra');
-        expect(exceptionIds.has(entry.id)).toBe(true);
+        for (const model of [entry.model, entry.failover_model]) {
+          if (!model?.startsWith('gpt-5.')) continue;
+          expect(file, `${entry.id}:${model}`).toBe('bdc-feature-development-codex.yaml');
+          expect(model, `${file}:${entry.id}`).toBe('gpt-5.6-terra');
+          expect(exceptionIds.has(entry.id), `${file}:${entry.id}`).toBe(true);
+        }
       }
     }
     const codex = load('bdc-feature-development-codex.yaml');
@@ -71,9 +77,11 @@ describe('feature-development lane model modernization', () => {
       'claude-haiku-5-5',
       'claude-fable-5',
     ]);
-    for (const file of files.filter(
-      candidate => candidate !== 'bdc-feature-development-astra.yaml'
-    )) {
+    const fableLanes = new Set([
+      'bdc-feature-development-fable.yaml',
+      'bdc-feature-development-astra.yaml',
+    ]);
+    for (const file of files) {
       const lane = load(file);
       for (const entry of [{ id: '<root>', model: lane.model }, ...(lane.nodes ?? [])]) {
         if (
@@ -83,9 +91,13 @@ describe('feature-development lane model modernization', () => {
           continue;
         expect(approved.has(entry.model ?? ''), `${file}:${entry.id}`).toBe(true);
         if (entry.model === 'claude-fable-5')
-          expect(file).toBe('bdc-feature-development-fable.yaml');
+          expect(fableLanes.has(file), `${file}:${entry.id}`).toBe(true);
       }
     }
+    const astraManifest = node(load('bdc-feature-development-astra.yaml'), 'build-manifest');
+    expect(approved.has(astraManifest?.model ?? ''), 'astra:build-manifest').toBe(true);
+    expect(astraManifest?.model).toBe('claude-opus-5-5');
+    expect(astraManifest?.model).not.toBe('opus[1m]');
   });
 
   it('Test 3: pins Grok check to medium and all other Cursor nodes to high', () => {

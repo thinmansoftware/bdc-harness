@@ -163,6 +163,25 @@ describe.skipIf(process.platform === 'win32')('worktree ownership lock', () => {
     await releaseWorktreeOwnershipLock(worktree);
   });
 
+  test('release closes the lock after the worktree directory is removed', async () => {
+    const worktree = makeWorktree();
+    const main = join(worktree, '..', 'main');
+    await acquireWorktreeOwnershipLock(worktree);
+    try {
+      rmSync(worktree, { recursive: true, force: true });
+      expect(await isWorktreeOwnershipLockHeldByThisProcess(worktree)).toBe(true);
+      await releaseWorktreeOwnershipLock(worktree);
+      runGit(main, ['worktree', 'prune']);
+      runGit(main, ['worktree', 'add', worktree, 'feat']);
+      await acquireWorktreeOwnershipLock(worktree);
+      await releaseWorktreeOwnershipLock(worktree);
+    } finally {
+      if (await isWorktreeOwnershipLockHeldByThisProcess(worktree).catch(() => false)) {
+        await releaseWorktreeOwnershipLock(worktree);
+      }
+    }
+  });
+
   test('a separate process holding the helper blocks a bash flock of the same canonical path', async () => {
     const worktree = makeWorktree();
     const holder = await holdLockInOtherProcess(worktree);

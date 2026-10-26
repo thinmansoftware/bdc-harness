@@ -22,6 +22,8 @@ export class WorktreeOwnershipLockBusyError extends Error {
 interface HeldLock {
   fd: number;
   refcount: number;
+  /** Caller path spellings captured while the directory still exists. */
+  aliases: Set<string>;
 }
 
 const heldByCanonicalPath = new Map<string, HeldLock>();
@@ -45,6 +47,48 @@ function enqueue<T>(canonical: string, operation: () => Promise<T>): Promise<T> 
 
 function canonicalWorktreePath(worktreePath: string): string {
   return realpathSync(worktreePath);
+}
+
+function rememberAliases(held: HeldLock, worktreePath: string, canonical: string): void {
+  held.aliases.add(canonical);
+  held.aliases.add(worktreePath);
+  held.aliases.add(resolve(worktreePath));
+}
+
+function realpathErrno(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
+  const code = error.code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+function rethrowRealpathFailure(error: unknown): never {
+  if (error instanceof Error) throw error;
+  throw new Error('realpath failed', { cause: error });
+}
+
+/**
+ * Resolve a held lock after `git worktree remove` deletes the directory.
+ * `realpath` cannot see a removed path, so match the spellings captured at acquire.
+ * Only ENOENT and ENOTDIR are tolerated; any other realpath failure is rethrown.
+ */
+function canonicalHeldWorktreePath(worktreePath: string): string {
+  try {
+    return realpathSync(worktreePath);
+  } catch (error) {
+    const code = realpathErrno(error);
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      const resolved = resolve(worktreePath);
+      for (const [canonical, held] of heldByCanonicalPath) {
+        if (
+          held.refcount > 0 &&
+          (canonical === resolved || held.aliases.has(worktreePath) || held.aliases.has(resolved))
+        ) {
+          return canonical;
+        }
+      }
+    }
+    rethrowRealpathFailure(error);
+  }
 }
 
 const execGit = promisify(execFile);
@@ -113,6 +157,7 @@ export async function acquireWorktreeOwnershipLock(worktreePath: string): Promis
     const existing = heldByCanonicalPath.get(canonical);
     if (existing && existing.refcount > 0) {
       existing.refcount += 1;
+      rememberAliases(existing, worktreePath, canonical);
       return;
     }
 
@@ -133,12 +178,14 @@ export async function acquireWorktreeOwnershipLock(worktreePath: string): Promis
       closeSync(fd);
       throw new WorktreeOwnershipLockBusyError(canonical);
     }
-    heldByCanonicalPath.set(canonical, { fd, refcount: 1 });
+    const held: HeldLock = { fd, refcount: 1, aliases: new Set() };
+    rememberAliases(held, worktreePath, canonical);
+    heldByCanonicalPath.set(canonical, held);
   });
 }
 
 export async function releaseWorktreeOwnershipLock(worktreePath: string): Promise<void> {
-  const canonical = canonicalWorktreePath(worktreePath);
+  const canonical = canonicalHeldWorktreePath(worktreePath);
   await enqueue(canonical, async () => {
     const held = heldByCanonicalPath.get(canonical);
     if (!held) return;
@@ -152,7 +199,7 @@ export async function releaseWorktreeOwnershipLock(worktreePath: string): Promis
 export async function isWorktreeOwnershipLockHeldByThisProcess(
   worktreePath: string
 ): Promise<boolean> {
-  const canonical = canonicalWorktreePath(worktreePath);
+  const canonical = canonicalHeldWorktreePath(worktreePath);
   return enqueue(canonical, async () => {
     const held = heldByCanonicalPath.get(canonical);
     return held !== undefined && held.refcount > 0;

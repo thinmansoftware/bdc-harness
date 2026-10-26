@@ -3200,6 +3200,118 @@ describe('WorktreeProvider', () => {
       }
     });
 
+    async function probeLock(worktreePath: string): Promise<'busy' | 'free'> {
+      const modulePath = join(
+        import.meta.dir,
+        '..',
+        '..',
+        '..',
+        'git',
+        'src',
+        'worktree-ownership-lock.ts'
+      );
+      const script = `
+        const mod = await import(${JSON.stringify(modulePath)});
+        try {
+          await mod.acquireWorktreeOwnershipLock(process.argv[1]);
+          await mod.releaseWorktreeOwnershipLock(process.argv[1]);
+          process.stdout.write('FREE\\n');
+        } catch (err) {
+          if (err instanceof mod.WorktreeOwnershipLockBusyError) {
+            process.stdout.write('BUSY\\n');
+          } else {
+            const detail = err instanceof Error ? (err.stack || err.message) : String(err);
+            process.stderr.write(detail);
+            process.exit(1);
+          }
+        }
+      `;
+      const proc = Bun.spawn(['bun', '-e', script, worktreePath], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
+      if (code !== 0) throw new Error(`lock probe failed: ${stderr || stdout}`);
+      if (stdout.includes('BUSY')) return 'busy';
+      if (stdout.includes('FREE')) return 'free';
+      throw new Error(`lock probe unexpected output: ${stdout}`);
+    }
+
+    test('destroy holds a reclaimer lock until worktree removal finishes', async () => {
+      const fixture = makeHolder();
+      useRealOwnershipLock();
+      let heldDuringRemove = false;
+      execSpy.mockImplementation(async (_command: string, args: string[]) => {
+        if (args.includes('worktree') && args.includes('remove')) {
+          heldDuringRemove = (await probeLock(fixture.worktree)) === 'busy';
+        }
+        return { stdout: '', stderr: '' };
+      });
+      try {
+        const result = await provider.destroy(fixture.worktree);
+        expect(result.worktreeRemoved).toBe(true);
+        expect(heldDuringRemove).toBe(true);
+        expect(await realIsWorktreeOwnershipLockHeld(fixture.worktree)).toBe(false);
+        await realAcquireWorktreeOwnershipLock(fixture.worktree);
+        await realReleaseWorktreeOwnershipLock(fixture.worktree);
+      } finally {
+        if (await realIsWorktreeOwnershipLockHeld(fixture.worktree).catch(() => false)) {
+          await realReleaseWorktreeOwnershipLock(fixture.worktree);
+        }
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    });
+
+    test('destroy holds an inherited ownership lock until worktree removal finishes', async () => {
+      const fixture = makeHolder();
+      useRealOwnershipLock();
+      await realAcquireWorktreeOwnershipLock(fixture.worktree);
+      let heldDuringRemove = false;
+      execSpy.mockImplementation(async (_command: string, args: string[]) => {
+        if (args.includes('worktree') && args.includes('remove')) {
+          heldDuringRemove = (await probeLock(fixture.worktree)) === 'busy';
+        }
+        return { stdout: '', stderr: '' };
+      });
+      try {
+        const result = await provider.destroy(fixture.worktree);
+        expect(result.worktreeRemoved).toBe(true);
+        expect(heldDuringRemove).toBe(true);
+        expect(await realIsWorktreeOwnershipLockHeld(fixture.worktree)).toBe(false);
+      } finally {
+        if (await realIsWorktreeOwnershipLockHeld(fixture.worktree).catch(() => false)) {
+          await realReleaseWorktreeOwnershipLock(fixture.worktree);
+        }
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    });
+
+    test('destroy releases the reclaimer lock when removal throws', async () => {
+      const fixture = makeHolder();
+      useRealOwnershipLock();
+      execSpy.mockImplementation(async (_command: string, args: string[]) => {
+        if (args.includes('worktree') && args.includes('remove')) {
+          throw new Error('remove failed');
+        }
+        return { stdout: '', stderr: '' };
+      });
+      try {
+        await expect(provider.destroy(fixture.worktree)).rejects.toThrow('remove failed');
+        expect(await realIsWorktreeOwnershipLockHeld(fixture.worktree)).toBe(false);
+        await realAcquireWorktreeOwnershipLock(fixture.worktree);
+        await realReleaseWorktreeOwnershipLock(fixture.worktree);
+      } finally {
+        if (await realIsWorktreeOwnershipLockHeld(fixture.worktree).catch(() => false)) {
+          await realReleaseWorktreeOwnershipLock(fixture.worktree);
+        }
+        rmSync(fixture.root, { recursive: true, force: true });
+      }
+    });
+
     test('destroy does not remove a worktree another process owns', async () => {
       const fixture = makeHolder();
       const holder = await holdLock(fixture.worktree);

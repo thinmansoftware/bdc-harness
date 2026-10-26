@@ -59,6 +59,12 @@ function getLog(): ReturnType<typeof createLogger> {
  */
 const GIT_OPERATION_TIMEOUT_MS = 5 * 60 * 1000;
 
+function toWorktreeRemovalError(cause: unknown): Error {
+  if (cause instanceof Error) return cause;
+  if (typeof cause === 'string' && cause.trim() !== '') return new Error(cause.trim());
+  return new Error('worktree removal failed', { cause });
+}
+
 interface WorktreeIdentityRecord {
   version: 1;
   worktreePath: string;
@@ -306,42 +312,66 @@ export class WorktreeProvider implements IIsolationProvider {
       if (await this.ownershipLockBlocksRemoval(worktreePath, result)) {
         return result;
       }
-      const gitArgs = ['-C', repoPath, 'worktree', 'remove'];
-      if (options?.force) {
-        gitArgs.push('--force');
-      }
-      gitArgs.push(worktreePath);
-
+      let removalThrew = false;
+      let removalError: unknown;
       try {
-        await execFileAsync('git', gitArgs, { timeout: GIT_OPERATION_TIMEOUT_MS });
-        result.worktreeRemoved = true;
-      } catch (error) {
-        if (!this.isWorktreeMissingError(error)) {
-          throw error;
+        const gitArgs = ['-C', repoPath, 'worktree', 'remove'];
+        if (options?.force) {
+          gitArgs.push('--force');
         }
-        getLog().debug({ worktreePath }, 'worktree_already_removed');
-        result.worktreeRemoved = true;
-        // Continue to branch deletion below - branch may still exist
-      }
+        gitArgs.push(worktreePath);
 
-      // Ensure directory is fully removed (git may leave untracked files like .archon/)
-      const dirExists = await this.directoryExists(worktreePath);
-      if (dirExists) {
-        getLog().debug({ worktreePath }, 'cleaning_remaining_directory');
         try {
-          await rm(worktreePath, { recursive: true, force: true });
-          getLog().debug({ worktreePath }, 'remaining_directory_cleaned');
-          result.directoryClean = true;
+          await execFileAsync('git', gitArgs, { timeout: GIT_OPERATION_TIMEOUT_MS });
+          result.worktreeRemoved = true;
         } catch (error) {
-          const err = error as NodeJS.ErrnoException;
-          const warning = `Failed to clean remaining directory at ${worktreePath}: ${err.message}`;
-          getLog().error({ err: error, worktreePath }, 'remaining_directory_cleanup_failed');
-          result.warnings.push(warning);
-          // directoryClean stays false
+          if (!this.isWorktreeMissingError(error)) {
+            throw error;
+          }
+          getLog().debug({ worktreePath }, 'worktree_already_removed');
+          result.worktreeRemoved = true;
+          // Continue to branch deletion below - branch may still exist
         }
-      } else {
-        result.directoryClean = true;
+
+        // Ensure directory is fully removed (git may leave untracked files like .archon/)
+        const dirExists = await this.directoryExists(worktreePath);
+        if (dirExists) {
+          getLog().debug({ worktreePath }, 'cleaning_remaining_directory');
+          try {
+            await rm(worktreePath, { recursive: true, force: true });
+            getLog().debug({ worktreePath }, 'remaining_directory_cleaned');
+            result.directoryClean = true;
+          } catch (error) {
+            const err = error as NodeJS.ErrnoException;
+            const warning = `Failed to clean remaining directory at ${worktreePath}: ${err.message}`;
+            getLog().error({ err: error, worktreePath }, 'remaining_directory_cleanup_failed');
+            result.warnings.push(warning);
+            // directoryClean stays false
+          }
+        } else {
+          result.directoryClean = true;
+        }
+      } catch (error) {
+        removalThrew = true;
+        removalError = error;
+      } finally {
+        // Hold the reclaimer or inherited lock through git worktree remove.
+        // Releasing earlier lets a lock-honoring writer enter and be deleted mid-write.
+        try {
+          await releaseWorktreeOwnershipLock(worktreePath);
+        } catch (releaseError) {
+          if (removalThrew) {
+            getLog().error(
+              { err: releaseError, worktreePath },
+              'worktree.ownership_lock_release_failed'
+            );
+          } else {
+            removalThrew = true;
+            removalError = releaseError;
+          }
+        }
       }
+      if (removalThrew) throw toWorktreeRemovalError(removalError);
     }
 
     // Prune stale worktree references -- runs even when path is already gone,
@@ -1329,15 +1359,16 @@ export class WorktreeProvider implements IIsolationProvider {
   }
 
   /**
-   * Release this process's ownership hold before removal. If another process
-   * holds the lock, leave the worktree in place.
+   * Claim a reclaimer lock that the caller holds until removal finishes.
+   * An inherited hold is kept. A free worktree gets a new hold. Another
+   * process's hold blocks removal.
+   * Returns true when removal must not proceed.
    */
   private async ownershipLockBlocksRemoval(
     worktreePath: string,
     result: DestroyResult
   ): Promise<boolean> {
     if (await isWorktreeOwnershipLockHeldByThisProcess(worktreePath)) {
-      await releaseWorktreeOwnershipLock(worktreePath);
       return false;
     }
     try {
@@ -1349,7 +1380,6 @@ export class WorktreeProvider implements IIsolationProvider {
       }
       throw error;
     }
-    await releaseWorktreeOwnershipLock(worktreePath);
     return false;
   }
 
