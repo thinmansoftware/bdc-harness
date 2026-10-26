@@ -4889,8 +4889,8 @@ nodes:
 
   - id: flip-notion
     persona: xo
-    depends_on: [stamp-manifest-evidence, manifest-consistency-check]
-    when: "$manifest-consistency-check.output == 'OK'"
+    depends_on: [stamp-manifest-evidence, manifest-consistency-check, manifest-evidence-check]
+    when: "$manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'OK'"
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -4944,6 +4944,18 @@ nodes:
         exit 0
       fi
 
+      # ---- BEGIN review-label gate ----
+      EVIDENCE=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST_EVIDENCE'
+      $manifest-evidence-check.output
+      BDC_NODE_OUTPUT_MANIFEST_EVIDENCE
+      )
+      EVIDENCE=$(printf '%s' "$EVIDENCE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      if [ "$EVIDENCE" != "OK" ]; then
+        echo "flip-notion: manifest-evidence-check=${EVIDENCE:-<none>} -- not marking issue status:review."
+        exit 0
+      fi
+      # ---- END review-label gate ----
+
       gh label create status:review --repo "$ISSUE_REPO" --color 0E8A16 --description "BDC workflow is ready for review" 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:building 2>/dev/null || true
       gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --remove-label status:blocked 2>/dev/null || true
@@ -4960,7 +4972,8 @@ nodes:
       echo "flip-notion: $ISSUE_REPO#$ISSUE_NUM -> status:review"
   - id: flip-notion-on-failure
     persona: xo
-    depends_on: [war-council-validator, flip-notion]
+    depends_on: [war-council-validator, flip-notion, manifest-evidence-check]
+    when: "$manifest-evidence-check.output == 'OK'"
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -4969,6 +4982,18 @@ nodes:
       capture_node_output() {
         python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
       }
+
+      # ---- BEGIN review-label gate ----
+      EVIDENCE=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST_EVIDENCE'
+      $manifest-evidence-check.output
+      BDC_NODE_OUTPUT_MANIFEST_EVIDENCE
+      )
+      EVIDENCE=$(printf '%s' "$EVIDENCE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      if [ "$EVIDENCE" != "OK" ]; then
+        echo "flip-notion-on-failure: manifest-evidence-check=${EVIDENCE:-<none>} -- not marking issue status:review."
+        exit 0
+      fi
+      # ---- END review-label gate ----
 
       FLIP_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_FLIP'
       $flip-notion.output
