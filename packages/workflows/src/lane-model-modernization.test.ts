@@ -51,7 +51,7 @@ describe('feature-development lane model modernization', () => {
     for (const file of files) {
       const lane = load(file);
       const models: Array<{ id: string; model?: string; failover_model?: string }> = [
-        { id: '<root>', model: lane.model },
+        { id: '<root>', model: lane.model, failover_model: lane.failover_model },
         ...(lane.nodes ?? []),
       ];
       for (const entry of models) {
@@ -64,11 +64,21 @@ describe('feature-development lane model modernization', () => {
       }
     }
     const codex = load('bdc-feature-development-codex.yaml');
-    const observedExceptionIds = (codex.nodes ?? [])
-      .filter(entry => entry.model === 'gpt-5.6-terra')
-      .map(entry => entry.id)
+    // Field-qualified inventory. A primary `model: gpt-5.6-terra` on an allowed
+    // seat must not hide an additional `failover_model: gpt-5.6-terra`, and a
+    // root-level Terra fallback must not sit outside the exception set.
+    const observedTerraBindings = [
+      { id: '<root>', model: codex.model, failover_model: codex.failover_model },
+      ...(codex.nodes ?? []),
+    ]
+      .flatMap(entry => {
+        const bindings: string[] = [];
+        if (entry.model === 'gpt-5.6-terra') bindings.push(`${entry.id}:model`);
+        if (entry.failover_model === 'gpt-5.6-terra') bindings.push(`${entry.id}:failover_model`);
+        return bindings;
+      })
       .sort();
-    expect(observedExceptionIds).toEqual([...exceptionIds].sort());
+    expect(observedTerraBindings).toEqual([...exceptionIds].map(id => `${id}:model`).sort());
   });
 
   it('Test 2: rejects Claude aliases and confines approved Claude ids', () => {
