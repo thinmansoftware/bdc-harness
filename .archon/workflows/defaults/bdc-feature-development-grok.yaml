@@ -4789,9 +4789,11 @@ nodes:
           REPO=$(printf '%s\n' "$PR_URL" | sed -n 's|https://github.com/\([^/]*/[^/]*\)/pull/.*|\1|p' | head -1)
           PR_NUM=$(printf '%s\n' "$PR_URL" | sed -n 's|.*/pull/\([0-9][0-9]*\).*|\1|p' | head -1)
           if [ -n "$REPO" ] && [ -n "$PR_NUM" ]; then
-            PR_FILES=$(gh pr view "$PR_NUM" --repo "$REPO" --json files --jq '.files[].path' 2>/dev/null || true)
-            if [ -z "$PR_FILES" ]; then
-              PR_FILES=$(gh pr view "$PR_URL" --json files --jq '.files[].path' 2>/dev/null || true)
+            PR_FILES_HELPER="${BDC_PR_FILES_HELPER:-/app/scripts/gh-pr-files.sh}"
+            if [ -f "$PR_FILES_HELPER" ]; then
+              PR_FILES=$(bash "$PR_FILES_HELPER" "$REPO" "$PR_NUM" 2>/dev/null || true)
+            else
+              PR_FILES=$(gh api --paginate "repos/$REPO/pulls/$PR_NUM/files" --jq '.[].filename' 2>/dev/null || true)
             fi
             if [ -n "$CLAIMED_PATHS" ]; then
               MISSING=""

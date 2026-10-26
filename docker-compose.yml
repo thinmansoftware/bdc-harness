@@ -139,6 +139,8 @@ services:
       - 8.8.4.4
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=1
+    security_opt:
+      - seccomp=./docker/seccomp-archon.json
 
   # -------------------------------------------------------------------------
   # PostgreSQL (optional: --profile with-db)
