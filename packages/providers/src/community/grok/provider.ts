@@ -310,6 +310,16 @@ export class GrokAgentProvider implements IAgentProvider {
     let totalOut = 0;
     let totalCost = 0;
     let finalText = '';
+    let servedModelId: string | undefined;
+    const errorResult = (errorSubtype: string, message: string): MessageChunk => ({
+      type: 'result',
+      isError: true,
+      errorSubtype,
+      errors: [message],
+      cost: totalCost,
+      tokens: { input: totalIn, output: totalOut, total: totalIn + totalOut },
+      ...(servedModelId !== undefined ? { servedModelId } : {}),
+    });
 
     for (let turn = 0; turn < this.maxTurns; turn++) {
       let response: Response;
@@ -331,7 +341,11 @@ export class GrokAgentProvider implements IAgentProvider {
         });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        throw new Error(`openrouter_unknown_send_no_replay: ${message}`);
+        yield errorResult(
+          'openrouter_unknown_send_no_replay',
+          `openrouter_unknown_send_no_replay: ${message}`
+        );
+        return;
       }
       if (!response.ok) {
         throw new Error(`openrouter_responses_http_${response.status}`);
@@ -345,6 +359,7 @@ export class GrokAgentProvider implements IAgentProvider {
       if (native.model !== requestedModel) {
         throw new Error(`openrouter_served_model_mismatch: ${native.model ?? 'missing'}`);
       }
+      servedModelId = native.model;
       if (!native.usage) throw new Error('openrouter_usage_missing');
       const cost = native.usage.cost;
       if (typeof cost !== 'number' || !Number.isFinite(cost) || cost < 0) {
@@ -366,7 +381,13 @@ export class GrokAgentProvider implements IAgentProvider {
         };
         return;
       }
-      if (!Array.isArray(native.output)) throw new Error('openrouter_responses_malformed_output');
+      if (!Array.isArray(native.output)) {
+        yield errorResult(
+          'openrouter_responses_malformed_output',
+          'openrouter_responses_malformed_output'
+        );
+        return;
+      }
       input.push(...native.output);
       const calls = native.output.filter(item => item.type === 'function_call');
       for (const item of native.output) {
@@ -379,7 +400,9 @@ export class GrokAgentProvider implements IAgentProvider {
         }
       }
       if (native.status !== 'completed') {
-        throw new Error(`openrouter_responses_terminal_${native.status ?? 'malformed'}`);
+        const subtype = `openrouter_responses_terminal_${native.status ?? 'malformed'}`;
+        yield errorResult(subtype, subtype);
+        return;
       }
       if (calls.length === 0) {
         let structuredOutput: unknown;
@@ -400,17 +423,31 @@ export class GrokAgentProvider implements IAgentProvider {
         };
         return;
       }
+      const validatedCalls: {
+        callId: string;
+        name: string;
+        args: string;
+        toolInput: Record<string, unknown>;
+      }[] = [];
+      const batchCallIds = new Set<string>();
+      let validationError: string | undefined;
       for (const call of calls) {
         const callId = call.call_id;
         const name = call.name;
         const args = call.arguments;
-        if (typeof callId !== 'string' || !callId || completedCalls.has(callId)) {
-          throw new Error('openrouter_responses_duplicate_or_missing_call_id');
+        if (
+          typeof callId !== 'string' ||
+          !callId ||
+          completedCalls.has(callId) ||
+          batchCallIds.has(callId)
+        ) {
+          validationError = 'openrouter_responses_duplicate_or_missing_call_id';
+          break;
         }
         if (typeof name !== 'string' || !allowed.has(name) || typeof args !== 'string') {
-          throw new Error('openrouter_responses_unsupported_or_malformed_tool');
+          validationError = 'openrouter_responses_unsupported_or_malformed_tool';
+          break;
         }
-        completedCalls.add(callId);
         let toolInput: Record<string, unknown>;
         try {
           const parsed = JSON.parse(args) as unknown;
@@ -418,8 +455,18 @@ export class GrokAgentProvider implements IAgentProvider {
             throw new Error();
           toolInput = parsed as Record<string, unknown>;
         } catch {
-          throw new Error('openrouter_responses_malformed_tool_arguments');
+          validationError = 'openrouter_responses_malformed_tool_arguments';
+          break;
         }
+        batchCallIds.add(callId);
+        validatedCalls.push({ callId, name, args, toolInput });
+      }
+      if (validationError) {
+        yield errorResult(validationError, validationError);
+        return;
+      }
+      for (const { callId, name, args, toolInput } of validatedCalls) {
+        completedCalls.add(callId);
         yield { type: 'tool', toolName: name, toolInput, toolCallId: callId };
         const result = await executeGrokTool(cwd, name, args, {
           bashTimeoutMs: this.bashTimeoutMs,
@@ -428,11 +475,19 @@ export class GrokAgentProvider implements IAgentProvider {
               ? options.nodeConfig.artifacts_dir
               : undefined,
         });
-        if (result.startsWith('ERROR'))
-          throw new Error(`openrouter_responses_tool_failed: ${name}`);
+        if (result.startsWith('ERROR')) {
+          yield errorResult(
+            'openrouter_responses_tool_failed',
+            `openrouter_responses_tool_failed: ${name}`
+          );
+          return;
+        }
         input.push({ type: 'function_call_output', call_id: callId, output: result });
       }
     }
-    throw new Error('openrouter_responses_tool_turn_exhausted');
+    yield errorResult(
+      'openrouter_responses_tool_turn_exhausted',
+      'openrouter_responses_tool_turn_exhausted'
+    );
   }
 }

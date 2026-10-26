@@ -404,14 +404,251 @@ describe('GrokAgentProvider', () => {
       async () => new Response(JSON.stringify(payload))
     );
     try {
+      const chunks = [];
+      for await (const chunk of new GrokAgentProvider().sendQuery('inspect', '/tmp', undefined, {
+        model: 'openai/gpt-6.1-terra',
+        nodeConfig: { allowed_tools: ['list_dir'] },
+      }))
+        chunks.push(chunk);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(chunks.at(-1)).toMatchObject({
+        type: 'result',
+        isError: true,
+        errorSubtype: 'openrouter_responses_duplicate_or_missing_call_id',
+        cost: 0.02,
+      });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test('native Responses validates every call before executing the batch', async () => {
+    process.env.GLM_API_KEY = 'test-key';
+    const cwd = mkdtempSync(join(tmpdir(), 'openrouter-native-batch-'));
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            model: 'openai/gpt-6.1-terra',
+            status: 'completed',
+            usage: { input_tokens: 2, output_tokens: 1, cost: 0.04 },
+            output: [
+              {
+                type: 'function_call',
+                call_id: 'write-1',
+                name: 'write_file',
+                arguments: '{"path":"proof.txt","content":"changed"}',
+              },
+              { type: 'function_call', call_id: 'write-1', name: 'write_file', arguments: '{}' },
+            ],
+          })
+        )
+    );
+    try {
+      const chunks = [];
+      for await (const chunk of new GrokAgentProvider().sendQuery('build', cwd, undefined, {
+        model: 'openai/gpt-6.1-terra',
+        nodeConfig: { allowed_tools: ['write_file'] },
+      }))
+        chunks.push(chunk);
+      expect(existsSync(join(cwd, 'proof.txt'))).toBe(false);
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toMatchObject({
+        isError: true,
+        errorSubtype: 'openrouter_responses_duplicate_or_missing_call_id',
+        cost: 0.04,
+      });
+    } finally {
+      fetchSpy.mockRestore();
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test.each(['incomplete', 'refused', 'error'])(
+    'native Responses preserves usage for %s status',
+    async status => {
+      process.env.GLM_API_KEY = 'test-key';
+      const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
+        async () =>
+          new Response(
+            JSON.stringify({
+              model: 'openai/gpt-6.1-terra',
+              status,
+              usage: { input_tokens: 5, output_tokens: 3, cost: 0.07 },
+              output: [],
+            })
+          )
+      );
+      try {
+        const chunks = [];
+        for await (const chunk of new GrokAgentProvider().sendQuery('inspect', '/tmp', undefined, {
+          model: 'openai/gpt-6.1-terra',
+        }))
+          chunks.push(chunk);
+        expect(chunks.at(-1)).toMatchObject({
+          type: 'result',
+          isError: true,
+          errorSubtype: `openrouter_responses_terminal_${status}`,
+          cost: 0.07,
+          tokens: { input: 5, output: 3, total: 8 },
+        });
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    }
+  );
+
+  test('native Responses reports malformed output and tool failures with incurred usage', async () => {
+    process.env.GLM_API_KEY = 'test-key';
+    const responses = [
+      {
+        model: 'openai/gpt-6.1-terra',
+        status: 'completed',
+        usage: { input_tokens: 1, output_tokens: 2, cost: 0.03 },
+        output: null,
+      },
+      {
+        model: 'openai/gpt-6.1-terra',
+        status: 'completed',
+        usage: { input_tokens: 2, output_tokens: 2, cost: 0.05 },
+        output: [
+          {
+            type: 'function_call',
+            call_id: 'read-1',
+            name: 'read_file',
+            arguments: '{"path":"missing.txt"}',
+          },
+        ],
+      },
+    ];
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
+      async () => new Response(JSON.stringify(responses.shift()))
+    );
+    try {
+      for (const expected of [
+        ['openrouter_responses_malformed_output', 0.03],
+        ['openrouter_responses_tool_failed', 0.05],
+      ] as const) {
+        const chunks = [];
+        for await (const chunk of new GrokAgentProvider().sendQuery('inspect', '/tmp', undefined, {
+          model: 'openai/gpt-6.1-terra',
+          nodeConfig: { allowed_tools: ['read_file'] },
+        }))
+          chunks.push(chunk);
+        expect(chunks.at(-1)).toMatchObject({
+          isError: true,
+          errorSubtype: expected[0],
+          cost: expected[1],
+        });
+      }
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test('native Responses preserves prior usage when a later send outcome is unknown', async () => {
+    process.env.GLM_API_KEY = 'test-key';
+    const fetchSpy = spyOn(globalThis, 'fetch')
+      .mockImplementationOnce(
+        async () =>
+          new Response(
+            JSON.stringify({
+              model: 'openai/gpt-6.1-terra',
+              status: 'completed',
+              usage: { input_tokens: 6, output_tokens: 2, cost: 0.09 },
+              output: [
+                { type: 'function_call', call_id: 'list-1', name: 'list_dir', arguments: '{}' },
+              ],
+            })
+          )
+      )
+      .mockImplementationOnce(async () => {
+        throw new Error('socket closed');
+      });
+    try {
+      const chunks = [];
+      for await (const chunk of new GrokAgentProvider().sendQuery('inspect', '/tmp', undefined, {
+        model: 'openai/gpt-6.1-terra',
+        nodeConfig: { allowed_tools: ['list_dir'] },
+      }))
+        chunks.push(chunk);
+      expect(chunks.at(-1)).toMatchObject({
+        isError: true,
+        errorSubtype: 'openrouter_unknown_send_no_replay',
+        cost: 0.09,
+        tokens: { input: 6, output: 2, total: 8 },
+      });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test.each([
+    [
+      {
+        model: 'openai/gpt-6.1-terra-preview',
+        status: 'completed',
+        usage: { input_tokens: 1, output_tokens: 1, cost: 0.01 },
+        output: [],
+      },
+      /openrouter_served_model_mismatch/,
+    ],
+    [
+      {
+        model: 'openai/gpt-6.1-terra',
+        status: 'completed',
+        usage: { input_tokens: 1, output_tokens: 1 },
+        output: [],
+      },
+      /openrouter_cost_missing/,
+    ],
+  ])('native Responses rejects served-model mismatch and missing cost', async (payload, error) => {
+    process.env.GLM_API_KEY = 'test-key';
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
+      async () => new Response(JSON.stringify(payload))
+    );
+    try {
       await expect(async () => {
         for await (const _ of new GrokAgentProvider().sendQuery('inspect', '/tmp', undefined, {
           model: 'openai/gpt-6.1-terra',
-          nodeConfig: { allowed_tools: ['list_dir'] },
         })) {
           /* consume */
         }
-      }).toThrow(/duplicate_or_missing_call_id/);
+      }).toThrow(error);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  test('native Responses reports turn exhaustion with accumulated usage', async () => {
+    process.env.GLM_API_KEY = 'test-key';
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            model: 'openai/gpt-6.1-terra',
+            status: 'completed',
+            usage: { input_tokens: 3, output_tokens: 4, cost: 0.06 },
+            output: [
+              { type: 'function_call', call_id: 'list-1', name: 'list_dir', arguments: '{}' },
+            ],
+          })
+        )
+    );
+    try {
+      const provider = new GrokAgentProvider({ assistantConfig: { maxTurns: 1 } });
+      const chunks = [];
+      for await (const chunk of provider.sendQuery('inspect', '/tmp', undefined, {
+        model: 'openai/gpt-6.1-terra',
+        nodeConfig: { allowed_tools: ['list_dir'] },
+      }))
+        chunks.push(chunk);
+      expect(chunks.at(-1)).toMatchObject({
+        isError: true,
+        errorSubtype: 'openrouter_responses_tool_turn_exhausted',
+        cost: 0.06,
+        tokens: { input: 3, output: 4, total: 7 },
+      });
     } finally {
       fetchSpy.mockRestore();
     }
