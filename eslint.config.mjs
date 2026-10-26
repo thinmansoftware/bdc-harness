@@ -21,8 +21,6 @@ export default tseslint.config(
       '**/*.generated.ts', // Auto-generated source files (content inlined via JSON.stringify)
       '**/*.js',
       '*.mjs',
-      'scripts/verify-seccomp-userns.mjs',
-      'scripts/verify-seccomp-userns.test.mjs',
       '**/*.test.ts',
       '**/src/test/**', // Test helper files (mock factories, fixtures)
       '*.d.ts', // Root-level declaration files (not in tsconfig project scope)
@@ -39,6 +37,20 @@ export default tseslint.config(
   ...tseslint.configs.recommendedTypeChecked,
   ...tseslint.configs.strictTypeChecked,
   ...tseslint.configs.stylisticTypeChecked,
+
+  // Untyped Node ESM: lint these two scripts without type-aware rules.
+  {
+    files: ['scripts/verify-seccomp-userns.mjs', 'scripts/verify-seccomp-userns.test.mjs'],
+    extends: [tseslint.configs.disableTypeChecked],
+    languageOptions: {
+      globals: {
+        URL: 'readonly',
+        console: 'readonly',
+        process: 'readonly',
+        structuredClone: 'readonly',
+      },
+    },
+  },
 
   // Prettier integration
   prettierConfig,
