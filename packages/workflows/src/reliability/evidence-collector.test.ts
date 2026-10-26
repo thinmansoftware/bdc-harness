@@ -120,6 +120,22 @@ describe('collectMechanicalEvidence', () => {
     expect(result.outcome.primaryReason).toBe('gate_scope_mismatch');
   });
 
+  it('rejects a caller-supplied advanced-base override without verified ancestry', () => {
+    const original = input();
+    const forged = {
+      ...input({ git: { ...original.git, mergeBaseSha: 'a'.repeat(40) } }),
+      acceptAdvancedBase: true,
+    };
+
+    const result = collectMechanicalEvidence(forged);
+
+    expect(result.scopeValid).toBe(false);
+    expect(result.pullRequestReady).toBe(false);
+    expect(result.outcome.validationState).toBe('failed');
+    expect(result.outcome.primaryReason).toBe('gate_scope_mismatch');
+    expect(result).not.toHaveProperty('acceptAdvancedBase');
+  });
+
   it('fails closed when the worktree branch or origin remote drifts', () => {
     const original = input();
     const wrongBranch = collectMechanicalEvidence(
