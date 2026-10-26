@@ -28,6 +28,18 @@ const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
 const DEFAULT_MAX_TURNS = 40;
 
 type ChatMessage = OpenAI.Chat.ChatCompletionMessageParam;
+type ResponseItem = Record<string, unknown> & { type?: string };
+
+interface NativeResponse {
+  id?: string;
+  model?: string;
+  status?: string;
+  output?: ResponseItem[];
+  usage?: { input_tokens?: number; output_tokens?: number; cost?: number };
+  error?: unknown;
+}
+
+const TERRA_RESPONSES_MODEL = 'openai/gpt-6.1-terra';
 
 export class GrokAgentProvider implements IAgentProvider {
   private readonly model: string | undefined;
@@ -79,21 +91,40 @@ export class GrokAgentProvider implements IAgentProvider {
       throw new Error('provider:openrouter requires a non-empty cwd (worktree path)');
     }
 
+    if (resolvedModel === TERRA_RESPONSES_MODEL) {
+      yield* this.sendNativeResponses(prompt, cwd, apiKey, resolvedModel, options);
+      return;
+    }
+
     const client = new OpenAI({
       apiKey,
       baseURL: this.baseURL,
       defaultHeaders: {
         'HTTP-Referer': 'https://bluedevilcollectibles.com',
-        'X-Title': 'BDC Archon Grok Agent',
+        'X-Title': 'BDC Archon OpenRouter Agent',
       },
     });
 
+    const configuredTools = options?.nodeConfig?.allowed_tools;
+    const deniedTools = new Set(options?.nodeConfig?.denied_tools ?? []);
+    const tools = GROK_AGENT_TOOLS.filter(
+      tool =>
+        (tool.function.name !== 'read_artifact' || configuredTools?.includes('read_artifact')) &&
+        (configuredTools === undefined || configuredTools.includes(tool.function.name)) &&
+        !deniedTools.has(tool.function.name)
+    );
+    const allowedToolNames = new Set(tools.map(tool => tool.function.name));
+    const hasWriteTools = ['bash', 'write_file', 'edit_file'].some(name =>
+      allowedToolNames.has(name)
+    );
     const messages: ChatMessage[] = [];
     const systemParts: string[] = [
-      'You are a coding agent with tools (bash, read_file, write_file, edit_file, list_dir).',
-      'You MUST use tools to inspect and modify the worktree. Do not claim you lack shell access.',
+      hasWriteTools
+        ? 'You are a coding agent with the listed worktree tools.'
+        : 'You are a read-only reviewer. Do not modify files or run shell commands.',
+      `Available tools: ${tools.map(tool => tool.function.name).join(', ') || '(none)'}`,
       `Working directory: ${cwd}`,
-      'Prefer small surgical edits. Use ASCII only in source files.',
+      'Prefer small surgical changes when writing is allowed. Use ASCII only in source files.',
       'When the task is done, stop calling tools and print a short summary plus any required sentinels (e.g. COMPLETE).',
     ];
     if (options?.systemPrompt) {
@@ -112,6 +143,12 @@ export class GrokAgentProvider implements IAgentProvider {
 
     let totalIn = 0;
     let totalOut = 0;
+    let totalCost = 0;
+    let costReported = true;
+    const budgetUsd = options?.maxBudgetUsd;
+    if (budgetUsd !== undefined && (!Number.isFinite(budgetUsd) || budgetUsd <= 0)) {
+      throw new Error('openrouter_invalid_node_budget');
+    }
     let servedModelId: string | undefined;
     let finalText = '';
 
@@ -122,8 +159,10 @@ export class GrokAgentProvider implements IAgentProvider {
           {
             model: resolvedModel,
             messages,
-            tools: GROK_AGENT_TOOLS,
-            tool_choice: 'auto',
+            ...(budgetUsd !== undefined ? { max_tokens: 2048, usage: { include: true } } : {}),
+            ...(tools.length > 0
+              ? { tools, tool_choice: 'auto' as const }
+              : { tool_choice: 'none' as const }),
           },
           { signal: options?.abortSignal }
         );
@@ -138,6 +177,29 @@ export class GrokAgentProvider implements IAgentProvider {
       if (completion.usage) {
         totalIn += completion.usage.prompt_tokens ?? 0;
         totalOut += completion.usage.completion_tokens ?? 0;
+        const cost = (completion.usage as { cost?: unknown }).cost;
+        if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) {
+          totalCost += cost;
+        } else {
+          costReported = false;
+        }
+      } else {
+        costReported = false;
+      }
+      if (budgetUsd !== undefined) {
+        if (!costReported) throw new Error('openrouter_cost_missing_for_budgeted_node');
+        if (totalCost >= budgetUsd) {
+          yield {
+            type: 'result',
+            isError: true,
+            errorSubtype: 'error_max_budget_usd',
+            errors: [`openrouter_node_budget_reached: ${totalCost} >= ${budgetUsd}`],
+            cost: totalCost,
+            tokens: { input: totalIn, output: totalOut, total: totalIn + totalOut },
+            ...(servedModelId !== undefined ? { servedModelId } : {}),
+          };
+          return;
+        }
       }
 
       const choice = completion.choices[0];
@@ -167,6 +229,9 @@ export class GrokAgentProvider implements IAgentProvider {
       for (const call of toolCalls) {
         if (call.type !== 'function') continue;
         const name = call.function.name;
+        if (!allowedToolNames.has(name)) {
+          throw new Error(`openrouter_tool_refused: ${name}`);
+        }
         const args = call.function.arguments ?? '{}';
         let toolInput: Record<string, unknown>;
         try {
@@ -186,6 +251,10 @@ export class GrokAgentProvider implements IAgentProvider {
         };
         const result = await executeGrokTool(cwd, name, args, {
           bashTimeoutMs: this.bashTimeoutMs,
+          artifactsDir:
+            typeof options?.nodeConfig?.artifacts_dir === 'string'
+              ? options.nodeConfig.artifacts_dir
+              : undefined,
         });
         messages.push({
           role: 'tool',
@@ -212,9 +281,224 @@ export class GrokAgentProvider implements IAgentProvider {
     yield {
       type: 'result',
       tokens,
+      ...(costReported ? { cost: totalCost } : {}),
       stopReason: 'stop',
       structuredOutput,
       ...(servedModelId !== undefined ? { servedModelId } : {}),
     };
+  }
+
+  private async *sendNativeResponses(
+    prompt: string,
+    cwd: string,
+    apiKey: string,
+    requestedModel: string,
+    options?: SendQueryOptions
+  ): AsyncGenerator<MessageChunk> {
+    const configuredTools = options?.nodeConfig?.allowed_tools;
+    const deniedTools = new Set(options?.nodeConfig?.denied_tools ?? []);
+    const tools = GROK_AGENT_TOOLS.filter(
+      tool =>
+        (tool.function.name !== 'read_artifact' || configuredTools?.includes('read_artifact')) &&
+        (configuredTools === undefined || configuredTools.includes(tool.function.name)) &&
+        !deniedTools.has(tool.function.name)
+    );
+    const allowed = new Set(tools.map(tool => tool.function.name));
+    const input: unknown[] = [{ role: 'user', content: prompt }];
+    const completedCalls = new Set<string>();
+    let totalIn = 0;
+    let totalOut = 0;
+    let totalCost = 0;
+    let finalText = '';
+    let servedModelId: string | undefined;
+    const errorResult = (errorSubtype: string, message: string): MessageChunk => ({
+      type: 'result',
+      isError: true,
+      errorSubtype,
+      errors: [message],
+      cost: totalCost,
+      tokens: { input: totalIn, output: totalOut, total: totalIn + totalOut },
+      ...(servedModelId !== undefined ? { servedModelId } : {}),
+    });
+
+    for (let turn = 0; turn < this.maxTurns; turn++) {
+      let response: Response;
+      try {
+        response = await fetch(`${this.baseURL}/responses`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://bluedevilcollectibles.com',
+            'X-Title': 'BDC Archon OpenRouter Agent',
+          },
+          body: JSON.stringify({
+            model: requestedModel,
+            input,
+            tools: tools.map(tool => ({ type: 'function', ...tool.function })),
+          }),
+          signal: options?.abortSignal,
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        yield errorResult(
+          'openrouter_unknown_send_no_replay',
+          `openrouter_unknown_send_no_replay: ${message}`
+        );
+        return;
+      }
+      if (!response.ok) {
+        const subtype = `openrouter_responses_http_${response.status}`;
+        yield errorResult(subtype, subtype);
+        return;
+      }
+      let native: NativeResponse;
+      try {
+        native = (await response.json()) as NativeResponse;
+      } catch {
+        yield errorResult('openrouter_responses_malformed', 'openrouter_responses_malformed');
+        return;
+      }
+      if (native.model !== requestedModel) {
+        yield errorResult(
+          'openrouter_served_model_mismatch',
+          `openrouter_served_model_mismatch: ${native.model ?? 'missing'}`
+        );
+        return;
+      }
+      servedModelId = native.model;
+      if (!native.usage) {
+        yield errorResult('openrouter_usage_missing', 'openrouter_usage_missing');
+        return;
+      }
+      const cost = native.usage.cost;
+      totalIn += native.usage.input_tokens ?? 0;
+      totalOut += native.usage.output_tokens ?? 0;
+      if (typeof cost !== 'number' || !Number.isFinite(cost) || cost < 0) {
+        yield errorResult('openrouter_cost_missing', 'openrouter_cost_missing');
+        return;
+      }
+      totalCost += cost;
+      const budget = options?.maxBudgetUsd;
+      if (budget !== undefined && totalCost >= budget) {
+        yield {
+          type: 'result',
+          isError: true,
+          errorSubtype: 'error_max_budget_usd',
+          errors: [`openrouter_node_budget_reached: ${totalCost} >= ${budget}`],
+          cost: totalCost,
+          tokens: { input: totalIn, output: totalOut, total: totalIn + totalOut },
+          servedModelId: native.model,
+        };
+        return;
+      }
+      if (!Array.isArray(native.output)) {
+        yield errorResult(
+          'openrouter_responses_malformed_output',
+          'openrouter_responses_malformed_output'
+        );
+        return;
+      }
+      input.push(...native.output);
+      const calls = native.output.filter(item => item.type === 'function_call');
+      for (const item of native.output) {
+        if (item.type !== 'message' || !Array.isArray(item.content)) continue;
+        for (const part of item.content as Record<string, unknown>[]) {
+          if (part.type === 'output_text' && typeof part.text === 'string') {
+            finalText += part.text;
+            yield { type: 'assistant', content: part.text };
+          }
+        }
+      }
+      if (native.status !== 'completed') {
+        const subtype = `openrouter_responses_terminal_${native.status ?? 'malformed'}`;
+        yield errorResult(subtype, subtype);
+        return;
+      }
+      if (calls.length === 0) {
+        let structuredOutput: unknown;
+        if (options?.outputFormat?.type === 'json_schema' && finalText) {
+          try {
+            structuredOutput = JSON.parse(finalText);
+          } catch {
+            structuredOutput = undefined;
+          }
+        }
+        yield {
+          type: 'result',
+          stopReason: 'stop',
+          cost: totalCost,
+          tokens: { input: totalIn, output: totalOut, total: totalIn + totalOut },
+          structuredOutput,
+          servedModelId: native.model,
+        };
+        return;
+      }
+      const validatedCalls: {
+        callId: string;
+        name: string;
+        args: string;
+        toolInput: Record<string, unknown>;
+      }[] = [];
+      const batchCallIds = new Set<string>();
+      let validationError: string | undefined;
+      for (const call of calls) {
+        const callId = call.call_id;
+        const name = call.name;
+        const args = call.arguments;
+        if (
+          typeof callId !== 'string' ||
+          !callId ||
+          completedCalls.has(callId) ||
+          batchCallIds.has(callId)
+        ) {
+          validationError = 'openrouter_responses_duplicate_or_missing_call_id';
+          break;
+        }
+        if (typeof name !== 'string' || !allowed.has(name) || typeof args !== 'string') {
+          validationError = 'openrouter_responses_unsupported_or_malformed_tool';
+          break;
+        }
+        let toolInput: Record<string, unknown>;
+        try {
+          const parsed = JSON.parse(args) as unknown;
+          if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed))
+            throw new Error();
+          toolInput = parsed as Record<string, unknown>;
+        } catch {
+          validationError = 'openrouter_responses_malformed_tool_arguments';
+          break;
+        }
+        batchCallIds.add(callId);
+        validatedCalls.push({ callId, name, args, toolInput });
+      }
+      if (validationError) {
+        yield errorResult(validationError, validationError);
+        return;
+      }
+      for (const { callId, name, args, toolInput } of validatedCalls) {
+        completedCalls.add(callId);
+        yield { type: 'tool', toolName: name, toolInput, toolCallId: callId };
+        const result = await executeGrokTool(cwd, name, args, {
+          bashTimeoutMs: this.bashTimeoutMs,
+          artifactsDir:
+            typeof options?.nodeConfig?.artifacts_dir === 'string'
+              ? options.nodeConfig.artifacts_dir
+              : undefined,
+        });
+        if (result.startsWith('ERROR')) {
+          yield errorResult(
+            'openrouter_responses_tool_failed',
+            `openrouter_responses_tool_failed: ${name}`
+          );
+          return;
+        }
+        input.push({ type: 'function_call_output', call_id: callId, output: result });
+      }
+    }
+    yield errorResult(
+      'openrouter_responses_tool_turn_exhausted',
+      'openrouter_responses_tool_turn_exhausted'
+    );
   }
 }

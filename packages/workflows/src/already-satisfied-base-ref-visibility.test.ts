@@ -40,6 +40,8 @@ const EXPECTED_PRECHECK_LANES = [
   'bdc-feature-development-fusion-cx-qwen.yaml',
   'bdc-feature-development-grok.yaml',
   'bdc-feature-development-kimi-k3.yaml',
+  'bdc-feature-development-open-a.yaml',
+  'bdc-feature-development-open-b.yaml',
   'bdc-feature-development-zero-claude.yaml',
   'bdc-feature-development-zero-open.yaml',
   'bdc-feature-development-zero.yaml',
@@ -254,6 +256,8 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
       'bdc-feature-development-kimi-k3.yaml',
+      'bdc-feature-development-open-a.yaml',
+      'bdc-feature-development-open-b.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
@@ -269,7 +273,9 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
       it('local-absent/base-present -> skip with already-merged-on-base', async () => {
         const forceBuild =
           file === 'bdc-feature-development-zero.yaml' ||
-          file === 'bdc-feature-development-zero-open.yaml';
+          file === 'bdc-feature-development-zero-open.yaml' ||
+          file === 'bdc-feature-development-open-a.yaml' ||
+          file === 'bdc-feature-development-open-b.yaml';
         const { stdout, stderr, exitCode } = await runGate(
           file,
           [
@@ -302,7 +308,9 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
       it('both-absent -> needs-build', async () => {
         const forceBuild =
           file === 'bdc-feature-development-zero.yaml' ||
-          file === 'bdc-feature-development-zero-open.yaml';
+          file === 'bdc-feature-development-zero-open.yaml' ||
+          file === 'bdc-feature-development-open-a.yaml' ||
+          file === 'bdc-feature-development-open-b.yaml';
         const { stdout, stderr, exitCode } = await runGate(file, 'ALREADY_SATISFIED=false');
         expect(exitCode).toBe(0);
         expect(JSON.parse(stdout)).toEqual({
@@ -321,7 +329,9 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
       it('local-present -> retains the already-satisfied fast path', async () => {
         const forceBuild =
           file === 'bdc-feature-development-zero.yaml' ||
-          file === 'bdc-feature-development-zero-open.yaml';
+          file === 'bdc-feature-development-zero-open.yaml' ||
+          file === 'bdc-feature-development-open-a.yaml' ||
+          file === 'bdc-feature-development-open-b.yaml';
         const { stdout, stderr, exitCode } = await runGate(
           file,
           ['ALREADY_SATISFIED=true', 'SATISFIED_EVIDENCE=present in this worktree HEAD'].join('\n')
@@ -370,7 +380,9 @@ describe('gate-already-satisfied disposition (behavioral)', () => {
     ].join('\n');
     const forceBuild = (file: string): boolean =>
       file === 'bdc-feature-development-zero.yaml' ||
-      file === 'bdc-feature-development-zero-open.yaml';
+      file === 'bdc-feature-development-zero-open.yaml' ||
+      file === 'bdc-feature-development-open-a.yaml' ||
+      file === 'bdc-feature-development-open-b.yaml';
     for (let round = 0; round < 5; round++) {
       const results = await Promise.all(
         JSON_GATE_FEATURE_LANES.map(async (file: string) => ({

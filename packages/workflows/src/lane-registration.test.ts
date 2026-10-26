@@ -85,6 +85,8 @@ describe('lane registration and war-council-validator pin', () => {
       'bdc-feature-development-fusion-cx-qwen.yaml',
       'bdc-feature-development-grok.yaml',
       'bdc-feature-development-kimi-k3.yaml',
+      'bdc-feature-development-open-a.yaml',
+      'bdc-feature-development-open-b.yaml',
       'bdc-feature-development-zero-claude.yaml',
       'bdc-feature-development-zero-open.yaml',
       'bdc-feature-development-zero.yaml',
@@ -107,6 +109,25 @@ describe('lane registration and war-council-validator pin', () => {
 
       if (!wcv) {
         // Some lanes may not have the validator (skip gracefully)
+        return;
+      }
+
+      if (file === 'bdc-feature-development-open-a.yaml') {
+        expect(wcv.provider).toBe('openrouter');
+        expect(wcv.model).toBe('moonshotai/kimi-k3');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-open-b.yaml') {
+        expect(wcv.provider).toBe('openrouter');
+        expect(wcv.model).toBe('z-ai/glm-5.3');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-kimi-k3.yaml') {
+        expect(wcv.provider).toBe('openrouter');
+        expect(wcv.model).toBe('deepseek/deepseek-v4-pro-0813');
+        expect(wcv.agent).toBeUndefined();
         return;
       }
 
@@ -134,10 +155,7 @@ describe('lane registration and war-council-validator pin', () => {
         return;
       }
 
-      if (
-        file === 'bdc-feature-development-fusion-cx-kimi.yaml' ||
-        file === 'bdc-feature-development-kimi-k3.yaml'
-      ) {
+      if (file === 'bdc-feature-development-fusion-cx-kimi.yaml') {
         // Kimi canary lanes (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01, 2026-07-20).
         // Both are clones of fusion-cx-qwen with the BUILDER seats swapped to
         // Kimi K3; the judge seat is deliberately unchanged, so they inherit the
