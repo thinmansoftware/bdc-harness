@@ -64,6 +64,7 @@ import {
   REMEDIATION_SENDER,
 } from './remediation-candidate';
 import type { RemediationEmitResult } from './remediation-candidate';
+import { submitReviewerBrokerJob } from './reviewer-broker-client';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
@@ -168,7 +169,7 @@ async function spawnCaptured(
   cwd: string,
   env: UntrustedExecutionEnv
 ): Promise<{ exitCode: number; output: string }> {
-  const child = Bun.spawn([...argv], {
+  const child = Bun.spawn(['setsid', '--', ...argv], {
     cwd,
     env: {
       PATH: env.PATH,
@@ -179,12 +180,51 @@ async function spawnCaptured(
     stdout: 'pipe',
     stderr: 'pipe',
   });
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ]);
-  return { exitCode, output: `${stdout}\n${stderr}`.slice(0, 128 * 1024) };
+  const cap = 128 * 1024;
+  let retained = '';
+  const consume = async (stream: ReadableStream<Uint8Array> | null): Promise<void> => {
+    if (!stream) return;
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (retained.length < cap)
+          retained += decoder.decode(value, { stream: true }).slice(0, cap - retained.length);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  };
+  const output = Promise.all([consume(child.stdout), consume(child.stderr)]);
+  let timer: Timer | undefined;
+  const timeout = new Promise<number>(resolve => {
+    timer = setTimeout(() => {
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch {
+        child.kill('SIGTERM');
+      }
+      setTimeout(() => {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+        } catch {
+          child.kill('SIGKILL');
+        }
+      }, 250).unref?.();
+      resolve(124);
+    }, 30_000);
+  });
+  const completed = (async (): Promise<number> => {
+    const code = await child.exited;
+    await output;
+    return code;
+  })();
+  const exitCode = await Promise.race([completed, timeout]);
+  if (timer) clearTimeout(timer);
+  if (exitCode === 124) await Promise.race([output, Bun.sleep(1_000)]);
+  return { exitCode, output: retained };
 }
 
 async function withUntrustedScratch<T>(
@@ -264,64 +304,66 @@ export async function observeReviewExecution(
   if (process.platform !== 'linux' || !context.checkoutPath || context.checkPlan.length === 0)
     return undefined;
   const startedAt = new Date().toISOString();
-  return withUntrustedScratch(async env => {
-    const before = await readCheckoutFingerprint(context.checkoutPath, context.headSha, env);
-    if (!before) return undefined;
-    const sandboxPrefix = [
-      join(process.cwd(), 'node_modules/.bin/codex'),
-      '--enable',
-      'use_legacy_landlock',
-      '-C',
-      before.cwd,
-      'sandbox',
-      '--',
-    ];
-    // A real repository read inside the same native boundary is the supervisor
-    // inspection event. It catches a reviewer that only received a supplied diff.
-    const inspection = await spawnCaptured(
-      [...sandboxPrefix, 'git', ...GIT_CONFIG_ARGS, 'show', '--stat', '--oneline', context.headSha],
-      before.cwd,
-      env
-    );
-    if (inspection.exitCode !== 0 || inspection.output.trim().length === 0) return undefined;
-    const checks: ReviewExecutionProof['checks'][number][] = [];
-    for (const argv of context.checkPlan) {
-      if (argv.length === 0 || argv.some(value => !value || value.includes('\0'))) return undefined;
-      const checkStarted = new Date().toISOString();
-      const result = await spawnCaptured([...sandboxPrefix, ...argv], before.cwd, env);
-      const checkEnded = new Date().toISOString();
-      checks.push({
-        argv: [...argv],
-        cwd: before.cwd,
-        exitCode: result.exitCode,
-        outputDigest: `sha256:${createHash('sha256').update(result.output).digest('hex')}`,
-        startedAt: checkStarted,
-        endedAt: checkEnded,
+  try {
+    return await withUntrustedScratch(async env => {
+      const before = await readCheckoutFingerprint(context.checkoutPath, context.headSha, env);
+      if (!before) return undefined;
+      // A real repository read inside the same native boundary is the supervisor
+      // inspection event. It catches a reviewer that only received a supplied diff.
+      const inspection = await submitReviewerBrokerJob({
+        checkout: before.cwd,
+        expectedHead: context.headSha,
+        argv: ['git', ...GIT_CONFIG_ARGS, 'show', '--stat', '--oneline', context.headSha],
       });
-      if (result.exitCode !== 0) return undefined;
-      const after = await readCheckoutFingerprint(context.checkoutPath, context.headSha, env);
-      if (
-        after?.headSha !== before.headSha ||
-        after?.treeSha !== before.treeSha ||
-        after?.cwd !== before.cwd
-      ) {
-        return undefined;
+      if (!inspection.ok || inspection.stdout.trim().length === 0) return undefined;
+      const checks: ReviewExecutionProof['checks'][number][] = [];
+      for (const argv of context.checkPlan) {
+        if (argv.length === 0 || argv.some(value => !value || value.includes('\0')))
+          return undefined;
+        const checkStarted = new Date().toISOString();
+        const result = await submitReviewerBrokerJob({
+          checkout: before.cwd,
+          expectedHead: context.headSha,
+          argv,
+        });
+        const checkEnded = new Date().toISOString();
+        checks.push({
+          argv: [...argv],
+          cwd: before.cwd,
+          exitCode: result.exitCode,
+          outputDigest: `sha256:${createHash('sha256').update(`${result.stdout}\n${result.stderr}`).digest('hex')}`,
+          startedAt: checkStarted,
+          endedAt: checkEnded,
+        });
+        if (!result.ok || result.outputTruncated || result.timedOut) return undefined;
+        const after = await readCheckoutFingerprint(context.checkoutPath, context.headSha, env);
+        if (
+          after?.headSha !== before.headSha ||
+          after?.treeSha !== before.treeSha ||
+          after?.cwd !== before.cwd
+        ) {
+          return undefined;
+        }
       }
-    }
-    return {
-      requestId: context.requestId,
-      headSha: before.headSha,
-      treeSha: before.treeSha,
-      cwd: before.cwd,
-      nativePolicy: 'codex_legacy_landlock',
-      nativeVersion: '0.153.3',
-      runtimeUid: process.getuid?.() ?? -1,
-      inspectionObserved: true,
-      checks,
-      startedAt,
-      endedAt: new Date().toISOString(),
-    };
-  });
+      return {
+        requestId: context.requestId,
+        headSha: before.headSha,
+        treeSha: before.treeSha,
+        cwd: before.cwd,
+        nativePolicy: 'codex_legacy_landlock',
+        nativeVersion: '0.153.3',
+        runtimeUid: inspection.uid,
+        inspectionObserved: true,
+        checks,
+        startedAt,
+        endedAt: new Date().toISOString(),
+      };
+    });
+  } catch {
+    // Broker absence, malformed responses, and broker deadlines are all the
+    // same fail-closed execution-unavailable state at this boundary.
+    return undefined;
+  }
 }
 
 export interface ReviewRouteConfig {
@@ -1233,6 +1275,13 @@ export function createRealSubmitDeps(
       // INDETERMINATE summary below. The retry delay travels with it so the
       // worker requeues instead of spinning.
       if (result.verdict === 'TRANSPORT_ERROR') {
+        if (work.executionContext) {
+          return {
+            approved: false,
+            summary: NATIVE_EXECUTION_INCOMPLETE_SUMMARY,
+            reviewedHeadSha: work.headSha,
+          };
+        }
         const reasonCode = reviewErrorCode(result.error);
         return {
           approved: false,

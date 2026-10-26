@@ -57,6 +57,8 @@ export interface JudgeTransport {
   promptFile?: string;
   /** Private 0700 directory containing `promptFile`; removed with it. */
   promptDir?: string;
+  /** PR review jobs are submitted to the UID-1002 broker, never spawned here. */
+  brokerJob?: { checkout: string; expectedHead: string; argv: string[]; prompt: string };
 }
 
 export interface PrReviewTransportContext {
@@ -78,27 +80,32 @@ export async function buildPrReviewTransport(
   if (!context.cwd || !context.expectedHeadSha) {
     throw new Error('pr_review_native_sandbox_context_invalid');
   }
+  const argv = [
+    'bunx',
+    '--offline',
+    '@openai/codex@0.153.3',
+    '--enable',
+    'use_legacy_landlock',
+    '-c',
+    'web_search="disabled"',
+    'exec',
+    '--json',
+    '--sandbox',
+    'workspace-write',
+    '-c',
+    'sandbox_workspace_write.network_access=false',
+    '--skip-git-repo-check',
+    '--cd',
+    context.cwd,
+  ];
   return {
-    argv: [
-      'bunx',
-      '--offline',
-      '@openai/codex@0.153.3',
-      '--enable',
-      'use_legacy_landlock',
-      // Codex 0.153.3's strict config schema supports the top-level
-      // web_search mode: live|indexed|cached|disabled. PR review must never
-      // attempt unauthenticated model-side retrieval of private repository data.
-      '-c',
-      'web_search="disabled"',
-      'exec',
-      '--json',
-      '--sandbox',
-      'workspace-write',
-      '--skip-git-repo-check',
-      '--cd',
-      context.cwd,
-    ],
-    stdinPrompt: prompt,
+    argv,
+    brokerJob: {
+      checkout: context.cwd,
+      expectedHead: context.expectedHeadSha,
+      argv,
+      prompt,
+    },
   };
 }
 

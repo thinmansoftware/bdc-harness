@@ -33,7 +33,12 @@ interface BrokerResult {
   stderr: string;
   uid: number;
   reason?: string;
+  outputTruncated?: boolean;
+  timedOut?: boolean;
 }
+
+const OUTPUT_LIMIT = 128 * 1024;
+const EXECUTION_TIMEOUT_MS = 60_000;
 
 function inside(path: string, root: string): boolean {
   return path === root || path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
@@ -62,26 +67,96 @@ async function run(
   cwd: string,
   env: Record<string, string>,
   prompt?: string
-): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-  const child = Bun.spawn(argv, {
+): Promise<{
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  outputTruncated: boolean;
+  timedOut: boolean;
+}> {
+  const child = Bun.spawn(['setsid', '--', ...argv], {
     cwd,
     env,
     stdin: prompt === undefined ? 'ignore' : 'pipe',
     stdout: 'pipe',
     stderr: 'pipe',
   });
+  let stdout = '';
+  let stderr = '';
+  let outputTruncated = false;
+  const consume = async (
+    stream: ReadableStream<Uint8Array> | null,
+    append: (chunk: string) => void
+  ): Promise<void> => {
+    if (!stream) return;
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        append(decoder.decode(value, { stream: true }));
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  };
+  const appendStdout = (chunk: string): void => {
+    const remaining = OUTPUT_LIMIT - stdout.length - stderr.length;
+    if (remaining <= 0) outputTruncated = true;
+    else {
+      stdout += chunk.slice(0, remaining);
+      if (chunk.length > remaining) outputTruncated = true;
+    }
+  };
+  const appendStderr = (chunk: string): void => {
+    const remaining = OUTPUT_LIMIT - stdout.length - stderr.length;
+    if (remaining <= 0) outputTruncated = true;
+    else {
+      stderr += chunk.slice(0, remaining);
+      if (chunk.length > remaining) outputTruncated = true;
+    }
+  };
+  const capture = Promise.all([
+    consume(child.stdout, appendStdout),
+    consume(child.stderr, appendStderr),
+  ]);
   if (prompt !== undefined) {
     const stdin = child.stdin;
     if (!stdin) throw new Error('broker_stdin_unavailable');
-    stdin.write(prompt);
-    stdin.end();
+    void Promise.resolve(stdin.write(prompt))
+      .then(() => stdin.end())
+      .catch(() => undefined);
   }
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-  ]);
-  return { exitCode, stdout: stdout.slice(0, 128 * 1024), stderr: stderr.slice(0, 128 * 1024) };
+  let timer: Timer | undefined;
+  let timedOut = false;
+  const timeout = new Promise<number>(resolveTimeout => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch {
+        child.kill('SIGTERM');
+      }
+      setTimeout(() => {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+        } catch {
+          child.kill('SIGKILL');
+        }
+      }, 250).unref?.();
+      resolveTimeout(124);
+    }, EXECUTION_TIMEOUT_MS);
+  });
+  const completed = (async (): Promise<number> => {
+    const code = await child.exited;
+    await capture;
+    return code;
+  })();
+  const exitCode = await Promise.race([completed, timeout]);
+  if (timer) clearTimeout(timer);
+  if (exitCode === 124) await Promise.race([capture, Bun.sleep(1_000)]);
+  return { exitCode, stdout, stderr, outputTruncated, timedOut };
 }
 
 async function processJob(path: string): Promise<BrokerResult> {
@@ -151,7 +226,14 @@ async function processJob(path: string): Promise<BrokerResult> {
       throw new Error('landlock_unsupported');
     const result = await run(command, checkout, env, job.prompt);
     await rm(scratch, { recursive: true, force: true });
-    return { id, ok: result.exitCode === 0, ...result, uid: process.getuid?.() ?? -1 };
+    return {
+      id,
+      ok: result.exitCode === 0 && !result.outputTruncated && !result.timedOut,
+      ...result,
+      uid: process.getuid?.() ?? -1,
+      ...(result.timedOut ? { reason: 'execution_timeout' } : {}),
+      ...(result.outputTruncated ? { reason: 'output_limit_exceeded' } : {}),
+    };
   } catch (error) {
     return {
       id,

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps';
@@ -239,12 +239,68 @@ function approveResult(headSha: string): {
 
 const stubOctokit = { pulls: {} } as unknown as RealGitHubOctokitLike;
 
+async function startFakeBroker(): Promise<{ stop: () => Promise<void> }> {
+  const spool = await mkdtemp(join(tmpdir(), 'overseer-review-spool-'));
+  await writeFile(join(spool, 'ready'), 'test\n');
+  const previous = process.env.OVERSEER_REVIEW_SPOOL;
+  process.env.OVERSEER_REVIEW_SPOOL = spool;
+  let busy = false;
+  const timer = setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try {
+      const requests = (await readdir(spool)).filter(name => name.endsWith('.request.json'));
+      for (const name of requests) {
+        const job = JSON.parse(await readFile(join(spool, name), 'utf8')) as {
+          id: string;
+          checkout: string;
+          argv: string[];
+          prompt?: string;
+        };
+        let exitCode = 0;
+        let stdout = '';
+        let stderr = '';
+        if (job.prompt === undefined) {
+          const child = Bun.spawn(job.argv, {
+            cwd: job.checkout,
+            env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: spool, TMPDIR: spool },
+            stdout: 'pipe',
+            stderr: 'pipe',
+          });
+          [exitCode, stdout, stderr] = await Promise.all([
+            child.exited,
+            new Response(child.stdout).text(),
+            new Response(child.stderr).text(),
+          ]);
+        }
+        await writeFile(
+          join(spool, `${job.id}.result.json`),
+          JSON.stringify({ id: job.id, ok: exitCode === 0, exitCode, stdout, stderr, uid: 1002 })
+        );
+        await rm(join(spool, name), { force: true });
+      }
+    } finally {
+      busy = false;
+    }
+  }, 5);
+  return {
+    async stop() {
+      clearInterval(timer);
+      if (previous === undefined) delete process.env.OVERSEER_REVIEW_SPOOL;
+      else process.env.OVERSEER_REVIEW_SPOOL = previous;
+      await rm(spool, { recursive: true, force: true });
+    },
+  };
+}
+
 async function reviewObservedCheckout(input: {
   dir: string;
   head: string;
   checkPlan: ReadonlyArray<readonly string[]>;
   evaluate?: () => Promise<ReturnType<typeof approveResult>>;
+  broker?: boolean;
 }): Promise<{ disposition: string; posts: string[]; proofRecords: number; evaluated: boolean }> {
+  const broker = input.broker === false ? undefined : await startFakeBroker();
   const posts: string[] = [];
   let proofRecords = 0;
   let evaluated = false;
@@ -279,33 +335,58 @@ async function reviewObservedCheckout(input: {
       return input.evaluate ? input.evaluate() : approveResult(input.head);
     },
   });
-  const result = await runAndSubmitReview(item, {
-    ...wired,
-    currentHeadSha: async () => input.head,
-    hasCustody: async () => true,
-    recordExecutionProof: async () => {
-      proofRecords += 1;
-    },
-    submitReview: async review => {
-      posts.push(review.event);
-      return review.event === 'APPROVE'
-        ? {
-            submitted: true,
-            review: {
-              id: 9,
-              url: 'https://example.invalid/9',
-              commitSha: input.head,
-              state: 'APPROVED',
-            },
-          }
-        : { submitted: true };
-    },
-    recordReceipt: async () => undefined,
-  });
-  return { disposition: result.disposition, posts, proofRecords, evaluated };
+  try {
+    const result = await runAndSubmitReview(item, {
+      ...wired,
+      currentHeadSha: async () => input.head,
+      hasCustody: async () => true,
+      recordExecutionProof: async () => {
+        proofRecords += 1;
+      },
+      submitReview: async review => {
+        posts.push(review.event);
+        return review.event === 'APPROVE'
+          ? {
+              submitted: true,
+              review: {
+                id: 9,
+                url: 'https://example.invalid/9',
+                commitSha: input.head,
+                state: 'APPROVED',
+              },
+            }
+          : { submitted: true };
+      },
+      recordReceipt: async () => undefined,
+    });
+    return { disposition: result.disposition, posts, proofRecords, evaluated };
+  } finally {
+    await broker?.stop();
+  }
 }
 
 describe.serial('observed checkout integrity and check environment', () => {
+  test('reviewer_broker_unavailable fails closed with a Review incomplete comment', async () => {
+    const checkout = await initCheckout();
+    const previous = process.env.OVERSEER_REVIEW_SPOOL;
+    process.env.OVERSEER_REVIEW_SPOOL = join(checkout.dir, 'missing-spool');
+    try {
+      const result = await reviewObservedCheckout({
+        dir: checkout.dir,
+        head: checkout.head,
+        checkPlan: [['/usr/bin/true']],
+        broker: false,
+      });
+      expect(result.evaluated).toBe(false);
+      expect(result.disposition).toBe('review_incomplete');
+      expect(result.posts).toEqual(['COMMENT']);
+    } finally {
+      if (previous === undefined) delete process.env.OVERSEER_REVIEW_SPOOL;
+      else process.env.OVERSEER_REVIEW_SPOOL = previous;
+      await rm(checkout.dir, { recursive: true, force: true });
+    }
+  });
+
   test('tracked modification prevents sandbox spawn and approval', async () => {
     const checkout = await initCheckout();
     const tracker = installSandboxSimulation(false);
@@ -382,7 +463,7 @@ describe.serial('observed checkout integrity and check environment', () => {
         head: checkout.head,
         checkPlan: [['/bin/sh', '-c', 'printf x >> allowed.txt']],
       });
-      expect(tracker.sandboxSpawns.length).toBeGreaterThan(0);
+      expect(tracker.sandboxSpawns).toHaveLength(0);
       expect(await readFile(join(checkout.dir, 'allowed.txt'), 'utf8')).toContain('x');
       expect(result.evaluated).toBe(false);
       expect(result.proofRecords).toBe(0);
@@ -437,6 +518,7 @@ describe.serial('observed checkout integrity and check environment', () => {
       for (const [key, value] of Object.entries(CANARIES)) process.env[key] = value;
       process.env.PATH = `${binDir}:${saved.PATH ?? ''}`;
       const during = Object.entries(process.env).map(([key, value]) => `${key}=${value ?? ''}`);
+      const broker = await startFakeBroker();
       await observeReviewExecution({
         requestId: 'request-1',
         workerId: 'worker-1',
@@ -450,11 +532,12 @@ describe.serial('observed checkout integrity and check environment', () => {
         rung: 'pr-review',
         checkPlan: [['git', 'rev-parse', 'HEAD']],
       });
+      await broker.stop();
       const after = Object.entries(process.env).map(([key, value]) => `${key}=${value ?? ''}`);
-      expect(after).toEqual(during);
+      expect(after.sort()).toEqual(during.sort());
       const recorded = await readFile(recordPath, 'utf8');
       expect(recorded.length).toBeGreaterThan(0);
-      expect(tracker.sandboxSpawns.length).toBeGreaterThan(0);
+      expect(tracker.sandboxSpawns).toHaveLength(0);
       for (const [key, value] of Object.entries(CANARIES)) {
         expect(recorded.includes(`${key}=`)).toBe(false);
         expect(recorded.includes(value)).toBe(false);

@@ -16,6 +16,7 @@ import {
   type JudgeTransport,
   type PrReviewTransportContext,
 } from './judge-transport';
+import { submitReviewerBrokerJob } from './reviewer-broker-client';
 
 /**
  * Observability gap found 2026-09-17: this ladder loop classifies a per-rung
@@ -856,6 +857,15 @@ export async function invokeConfiguredReviewModel(
 ): Promise<PrReviewModelResult> {
   const transport = await buildReviewModelTransport(binary, prompt, context);
   try {
+    if (context) {
+      if (!transport.brokerJob) throw new Error('reviewer_broker_unavailable');
+      const result = await submitReviewerBrokerJob(transport.brokerJob);
+      return {
+        exitCode: result.exitCode,
+        stdout: result.stdout.trim().length > 0 ? result.stdout : result.stderr,
+        timedOut: result.timedOut === true,
+      };
+    }
     return await runReviewModelProcess(transport, binary, timeoutMs);
   } finally {
     // Always in a finally: the prompt holds the private diff, so it must not
