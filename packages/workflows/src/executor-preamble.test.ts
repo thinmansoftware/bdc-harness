@@ -37,8 +37,14 @@ mock.module('@archon/paths', () => ({
 // ---------------------------------------------------------------------------
 
 mock.module('@archon/git', () => ({
+  execFileAsync: mock(async () => ({ stdout: '', stderr: '' })),
   getDefaultBranch: mock(async () => 'main'),
+  getRemoteUrl: mock(async (): Promise<string | null> => null),
   toRepoPath: mock((p: string) => p),
+  // Preamble fixtures pass /tmp. These authority calls must not invoke Git there.
+  acquireWorktreeOwnershipLock: mock(async () => {}),
+  releaseWorktreeOwnershipLock: mock(async () => {}),
+  isWorktreeOwnershipLockHeldByThisProcess: mock(async () => false),
 }));
 
 // ---------------------------------------------------------------------------

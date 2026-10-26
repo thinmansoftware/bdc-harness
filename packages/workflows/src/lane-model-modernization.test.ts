@@ -27,6 +27,7 @@ type Lane = {
   name: string;
   provider?: string;
   model?: string;
+  failover_model?: string;
   nodes?: Node[];
   run_authority?: unknown;
 };
@@ -81,17 +82,21 @@ describe('feature-development lane model modernization', () => {
       'bdc-feature-development-fable.yaml',
       'bdc-feature-development-astra.yaml',
     ]);
+    const claudeAliases = ['sonnet', 'opus', 'haiku', 'opus[1m]', 'sonnet[1m]'];
     for (const file of files) {
       const lane = load(file);
-      for (const entry of [{ id: '<root>', model: lane.model }, ...(lane.nodes ?? [])]) {
-        if (
-          !entry.model?.startsWith('claude') &&
-          !['sonnet', 'opus', 'haiku', 'opus[1m]', 'sonnet[1m]'].includes(entry.model ?? '')
-        )
-          continue;
-        expect(approved.has(entry.model ?? ''), `${file}:${entry.id}`).toBe(true);
-        if (entry.model === 'claude-fable-5')
-          expect(fableLanes.has(file), `${file}:${entry.id}`).toBe(true);
+      const entries: Array<{ id: string; model?: string; failover_model?: string }> = [
+        { id: '<root>', model: lane.model, failover_model: lane.failover_model },
+        ...(lane.nodes ?? []),
+      ];
+      for (const entry of entries) {
+        for (const field of ['model', 'failover_model'] as const) {
+          const value = entry[field];
+          if (!value?.startsWith('claude') && !claudeAliases.includes(value ?? '')) continue;
+          expect(approved.has(value), `${file}:${entry.id}:${field}`).toBe(true);
+          if (value === 'claude-fable-5')
+            expect(fableLanes.has(file), `${file}:${entry.id}:${field}`).toBe(true);
+        }
       }
     }
     const astraManifest = node(load('bdc-feature-development-astra.yaml'), 'build-manifest');
@@ -120,9 +125,12 @@ describe('feature-development lane model modernization', () => {
     for (const model of ['claude-haiku-5-5', 'gpt-6-astra']) {
       expect(Object.hasOwn(MODEL_RATES, model)).toBe(true);
       const rates = getModelRates(model);
-      expect(rates).toBeDefined();
-      expect((rates?.input ?? 0) + (rates?.output ?? 0)).toBeGreaterThanOrEqual(0);
+      // Documented-zero exception: these subscription-backed ids are listed at
+      // { input: 0, output: 0 } until billable list rates are verified.
+      // Table membership is the exception. An unknown id is not a zero rate.
+      expect(rates).toEqual({ input: 0, output: 0 });
     }
+    expect(getModelRates('not-a-documented-model')).toBeUndefined();
   });
 
   it('Test 5: assigns every Haiku lane role its required provider and model', () => {
