@@ -7,19 +7,42 @@ import { removeTempDirWithRetry } from './temp-dir';
 test('preload scrub preserves test fixtures and removes inherited production credentials and switches', () => {
   const dir = mkdtempSync(join(tmpdir(), 'archon-preload-scrub-'));
   const childTest = join(dir, 'preload-scrub.test.ts');
-  writeFileSync(
-    childTest,
-    [
-      "import { expect, test } from 'bun:test';",
-      "test('scrubbed', () => {",
-      '  expect(process.env.MERGE_MANAGER_GH_TOKEN).toBeUndefined();',
-      '  expect(process.env.GH_TOKEN).toBeUndefined();',
-      "  expect(process.env.DISPATCH_POSTGRES_PHASE15_TEST_URL).toBe('postgresql://localhost/phase15');",
-      '  expect(process.env.OVERSEER_MAX_REREVIEW_ATTEMPTS).toBeUndefined();',
-      '  expect(process.env.BOARD_PRINCIPALS_JSON).toBeUndefined();',
-      '});',
-    ].join('\n')
+  const parentTelegram = {
+    TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
+    TELEGRAM_STREAMING_MODE: process.env.TELEGRAM_STREAMING_MODE,
+    TELEGRAM_APPROVAL_CHAT_ID: process.env.TELEGRAM_APPROVAL_CHAT_ID,
+    TELEGRAM_ALLOWED_USER_IDS: process.env.TELEGRAM_ALLOWED_USER_IDS,
+    TELEGRAM_TEST_FIXTURE: process.env.TELEGRAM_TEST_FIXTURE,
+  };
+  const childLines = [
+    "import { expect, test } from 'bun:test';",
+    "test('scrubbed', () => {",
+    '  expect(process.env.MERGE_MANAGER_GH_TOKEN).toBeUndefined();',
+    '  expect(process.env.GH_TOKEN).toBeUndefined();',
+    "  expect(process.env.DISPATCH_POSTGRES_PHASE15_TEST_URL).toBe('postgresql://localhost/phase15');",
+    '  expect(process.env.OVERSEER_MAX_REREVIEW_ATTEMPTS).toBeUndefined();',
+    '  expect(process.env.BOARD_PRINCIPALS_JSON).toBeUndefined();',
+    '  expect(process.env.TELEGRAM_BOT_TOKEN).toBeUndefined();',
+    '  expect(process.env.TELEGRAM_STREAMING_MODE).toBeUndefined();',
+    '  expect(process.env.TELEGRAM_APPROVAL_CHAT_ID).toBeUndefined();',
+    '  expect(process.env.TELEGRAM_ALLOWED_USER_IDS).toBeUndefined();',
+    "  expect(process.env.TELEGRAM_TEST_FIXTURE).toBe('fixture-value');",
+    `  expect(process.env.PATH).toBe(${JSON.stringify(process.env.PATH)});`,
+    `  expect(process.env.HOME).toBe(${JSON.stringify(process.env.HOME)});`,
+  ];
+  if (process.env.TMPDIR !== undefined) {
+    childLines.push(`  expect(process.env.TMPDIR).toBe(${JSON.stringify(process.env.TMPDIR)});`);
+  }
+  childLines.push(
+    '  const isolatedHome = process.env.ARCHON_HOME;',
+    '  expect(isolatedHome).toBeDefined();',
+    "  expect(isolatedHome).not.toBe('/operational/archon-home-sentinel');",
+    "  expect(isolatedHome).toContain('archon-test-home-');",
+    "  process.env.TELEGRAM_BOT_TOKEN = 'in-test-fake';",
+    "  expect(process.env.TELEGRAM_BOT_TOKEN).toBe('in-test-fake');",
+    '});'
   );
+  writeFileSync(childTest, childLines.join('\n'));
 
   try {
     const child = Bun.spawnSync(['bun', 'test', childTest], {
@@ -31,12 +54,24 @@ test('preload scrub preserves test fixtures and removes inherited production cre
         DISPATCH_POSTGRES_PHASE15_TEST_URL: 'postgresql://localhost/phase15',
         OVERSEER_MAX_REREVIEW_ATTEMPTS: '3',
         BOARD_PRINCIPALS_JSON: '{"production":"principal"}',
+        TELEGRAM_BOT_TOKEN: 'production-shaped-test-value',
+        TELEGRAM_STREAMING_MODE: 'production-shaped-test-value',
+        TELEGRAM_APPROVAL_CHAT_ID: 'production-shaped-test-value',
+        TELEGRAM_ALLOWED_USER_IDS: 'production-shaped-test-value',
+        TELEGRAM_TEST_FIXTURE: 'fixture-value',
+        ARCHON_HOME: '/operational/archon-home-sentinel',
       },
       stdout: 'pipe',
       stderr: 'pipe',
     });
-    expect(new TextDecoder().decode(child.stderr)).toContain('1 pass');
+    const stderr = new TextDecoder().decode(child.stderr);
+    expect(stderr).toContain('1 pass');
     expect(child.exitCode).toBe(0);
+    expect(process.env.TELEGRAM_BOT_TOKEN).toBe(parentTelegram.TELEGRAM_BOT_TOKEN);
+    expect(process.env.TELEGRAM_STREAMING_MODE).toBe(parentTelegram.TELEGRAM_STREAMING_MODE);
+    expect(process.env.TELEGRAM_APPROVAL_CHAT_ID).toBe(parentTelegram.TELEGRAM_APPROVAL_CHAT_ID);
+    expect(process.env.TELEGRAM_ALLOWED_USER_IDS).toBe(parentTelegram.TELEGRAM_ALLOWED_USER_IDS);
+    expect(process.env.TELEGRAM_TEST_FIXTURE).toBe(parentTelegram.TELEGRAM_TEST_FIXTURE);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

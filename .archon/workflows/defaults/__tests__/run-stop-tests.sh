@@ -126,7 +126,7 @@ for lane in $LANES; do
     hit && $0 ~ /^    depends_on:/ { print; exit }
     hit && $0 ~ /^  - id: / { exit }
   ' "$DEFAULTS/$lane")"
-  assert_eq "implement depends_on $lane" "    depends_on: [prep-dependencies]" "$impl_dep"
+  assert_eq "implement depends_on $lane" "    depends_on: [prep-dependencies, repair-gate]" "$impl_dep"
 done
 
 echo "--- rst_class ---"
@@ -421,6 +421,34 @@ assert_eq "scrub removes MERGE_MANAGER_ prefix" "unset" "${MERGE_MANAGER_GH_TOKE
 assert_eq "scrub removes BOARD_ prefix" "unset" "${BOARD_PRINCIPALS_JSON:-unset}"
 assert_eq "scrub removes exact GH_TOKEN" "unset" "${GH_TOKEN:-unset}"
 assert_eq "scrub preserves disposable test fixtures" "postgresql://localhost/phase15" "${DISPATCH_POSTGRES_PHASE15_TEST_URL:-unset}"
+echo "--- telegram operational names are scrubbed; fixtures and runtime basics remain ---"
+T2_SNAP="$(
+  export TELEGRAM_BOT_TOKEN=production-shaped-test-value
+  export TELEGRAM_STREAMING_MODE=production-shaped-test-value
+  export TELEGRAM_APPROVAL_CHAT_ID=production-shaped-test-value
+  export TELEGRAM_ALLOWED_USER_IDS=production-shaped-test-value
+  export TELEGRAM_TEST_FIXTURE=fixture-value
+  export DISPATCH_POSTGRES_PHASE15_TEST_URL=postgresql://localhost/phase15
+  path_before="$PATH"
+  home_before="$HOME"
+  rst_scrub_env
+  printf 'BOT=%s\n' "${TELEGRAM_BOT_TOKEN-unset}"
+  printf 'MODE=%s\n' "${TELEGRAM_STREAMING_MODE-unset}"
+  printf 'CHAT=%s\n' "${TELEGRAM_APPROVAL_CHAT_ID-unset}"
+  printf 'USERS=%s\n' "${TELEGRAM_ALLOWED_USER_IDS-unset}"
+  printf 'FIX=%s\n' "${TELEGRAM_TEST_FIXTURE-unset}"
+  printf 'URL=%s\n' "${DISPATCH_POSTGRES_PHASE15_TEST_URL-unset}"
+  if [ "$PATH" = "$path_before" ]; then printf 'PATH=same\n'; else printf 'PATH=changed\n'; fi
+  if [ "$HOME" = "$home_before" ]; then printf 'HOME=same\n'; else printf 'HOME=changed\n'; fi
+)"
+assert_eq "t2 TELEGRAM_BOT_TOKEN removed" "BOT=unset" "$(printf '%s\n' "$T2_SNAP" | sed -n '1p')"
+assert_eq "t2 TELEGRAM_STREAMING_MODE removed" "MODE=unset" "$(printf '%s\n' "$T2_SNAP" | sed -n '2p')"
+assert_eq "t2 TELEGRAM_APPROVAL_CHAT_ID removed" "CHAT=unset" "$(printf '%s\n' "$T2_SNAP" | sed -n '3p')"
+assert_eq "t2 TELEGRAM_ALLOWED_USER_IDS removed" "USERS=unset" "$(printf '%s\n' "$T2_SNAP" | sed -n '4p')"
+assert_eq "t2 TELEGRAM_TEST_FIXTURE kept" "FIX=fixture-value" "$(printf '%s\n' "$T2_SNAP" | sed -n '5p')"
+assert_eq "t2 DISPATCH test url kept" "URL=postgresql://localhost/phase15" "$(printf '%s\n' "$T2_SNAP" | sed -n '6p')"
+assert_eq "t2 PATH kept" "PATH=same" "$(printf '%s\n' "$T2_SNAP" | sed -n '7p')"
+assert_eq "t2 HOME kept" "HOME=same" "$(printf '%s\n' "$T2_SNAP" | sed -n '8p')"
 TMP="$(mktemp -d)"
 cat > "$TMP/ok.sh" <<'EOF'
 #!/usr/bin/env bash
@@ -455,12 +483,22 @@ cat > "$BIN/bun" <<EOF
 printf '%s\\n' "\$*" >> "$REC"
 printf 'GH_TOKEN=%s\\n' "\${GH_TOKEN-unset}" >> "$ENVREC"
 printf 'TEST_URL=%s\\n' "\${DISPATCH_POSTGRES_PHASE15_TEST_URL-unset}" >> "$ENVREC"
+printf 'BOT=%s\\n' "\${TELEGRAM_BOT_TOKEN-unset}" >> "$ENVREC"
+printf 'MODE=%s\\n' "\${TELEGRAM_STREAMING_MODE-unset}" >> "$ENVREC"
+printf 'CHAT=%s\\n' "\${TELEGRAM_APPROVAL_CHAT_ID-unset}" >> "$ENVREC"
+printf 'USERS=%s\\n' "\${TELEGRAM_ALLOWED_USER_IDS-unset}" >> "$ENVREC"
+printf 'FIX=%s\\n' "\${TELEGRAM_TEST_FIXTURE-unset}" >> "$ENVREC"
 mkdir -p node_modules
 EOF
 chmod +x "$BIN/bun"
 export PATH="$BIN:/usr/bin:/bin"
 export GH_TOKEN=production-shaped-test-value
 export DISPATCH_POSTGRES_PHASE15_TEST_URL=postgresql://localhost/phase15
+export TELEGRAM_BOT_TOKEN=production-shaped-test-value
+export TELEGRAM_STREAMING_MODE=production-shaped-test-value
+export TELEGRAM_APPROVAL_CHAT_ID=production-shaped-test-value
+export TELEGRAM_ALLOWED_USER_IDS=production-shaped-test-value
+export TELEGRAM_TEST_FIXTURE=fixture-value
 TMP="$(mktemp -d)"
 printf '{}\n' > "$TMP/package.json"
 : > "$TMP/bun.lock"
@@ -472,7 +510,59 @@ assert_contains "test1 install ok" "dprep: install ok (" "$out"
 assert_eq "test1 argv" "install --frozen-lockfile" "$(cat "$REC")"
 assert_eq "test1 scrubbed GH_TOKEN" "GH_TOKEN=unset" "$(head -1 "$ENVREC")"
 assert_eq "test1 kept TEST_URL" "TEST_URL=postgresql://localhost/phase15" "$(sed -n '2p' "$ENVREC")"
+assert_eq "test1 scrubbed TELEGRAM_BOT_TOKEN" "BOT=unset" "$(sed -n '3p' "$ENVREC")"
+assert_eq "test1 scrubbed TELEGRAM_STREAMING_MODE" "MODE=unset" "$(sed -n '4p' "$ENVREC")"
+assert_eq "test1 scrubbed TELEGRAM_APPROVAL_CHAT_ID" "CHAT=unset" "$(sed -n '5p' "$ENVREC")"
+assert_eq "test1 scrubbed TELEGRAM_ALLOWED_USER_IDS" "USERS=unset" "$(sed -n '6p' "$ENVREC")"
+assert_eq "test1 kept TELEGRAM_TEST_FIXTURE" "FIX=fixture-value" "$(sed -n '7p' "$ENVREC")"
+assert_not_contains "test1 stdout has no sentinel" "production-shaped-test-value" "$out"
+assert_eq "test1 parent TELEGRAM_BOT_TOKEN remains" "production-shaped-test-value" "${TELEGRAM_BOT_TOKEN-unset}"
 if [ -d "$TMP/node_modules" ]; then PASS=$((PASS + 1)); echo "PASS: test1 node_modules exists"; else FAIL=$((FAIL + 1)); echo "FAIL: test1 node_modules exists"; fi
+
+echo "--- dprep copy 2: second extracted core scrubs telegram the same way ---"
+C2BIN="$(mktemp -d)"
+C2REC="$C2BIN/argv.txt"
+C2ENV="$C2BIN/env.txt"
+cat > "$C2BIN/bun" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$C2REC"
+printf 'GH_TOKEN=%s\\n' "\${GH_TOKEN-unset}" >> "$C2ENV"
+printf 'TEST_URL=%s\\n' "\${DISPATCH_POSTGRES_PHASE15_TEST_URL-unset}" >> "$C2ENV"
+printf 'BOT=%s\\n' "\${TELEGRAM_BOT_TOKEN-unset}" >> "$C2ENV"
+printf 'MODE=%s\\n' "\${TELEGRAM_STREAMING_MODE-unset}" >> "$C2ENV"
+printf 'CHAT=%s\\n' "\${TELEGRAM_APPROVAL_CHAT_ID-unset}" >> "$C2ENV"
+printf 'USERS=%s\\n' "\${TELEGRAM_ALLOWED_USER_IDS-unset}" >> "$C2ENV"
+printf 'FIX=%s\\n' "\${TELEGRAM_TEST_FIXTURE-unset}" >> "$C2ENV"
+mkdir -p node_modules
+EOF
+chmod +x "$C2BIN/bun"
+C2TMP="$(mktemp -d)"
+printf '{}\n' > "$C2TMP/package.json"
+: > "$C2TMP/bun.lock"
+c2_out="$(
+  eval "$(extract_core_nth "$CANONICAL_YAML" dprep 2)"
+  cd "$C2TMP" || exit 1
+  export PATH="$C2BIN:/usr/bin:/bin"
+  export GH_TOKEN=production-shaped-test-value
+  export DISPATCH_POSTGRES_PHASE15_TEST_URL=postgresql://localhost/phase15
+  export TELEGRAM_BOT_TOKEN=production-shaped-test-value
+  export TELEGRAM_STREAMING_MODE=production-shaped-test-value
+  export TELEGRAM_APPROVAL_CHAT_ID=production-shaped-test-value
+  export TELEGRAM_ALLOWED_USER_IDS=production-shaped-test-value
+  export TELEGRAM_TEST_FIXTURE=fixture-value
+  dprep_ensure_js_deps
+)"
+c2_rc=$?
+assert_eq "copy2 rc" "0" "$c2_rc"
+assert_eq "copy2 argv" "install --frozen-lockfile" "$(cat "$C2REC")"
+assert_eq "copy2 scrubbed TELEGRAM_BOT_TOKEN" "BOT=unset" "$(sed -n '3p' "$C2ENV")"
+assert_eq "copy2 scrubbed TELEGRAM_STREAMING_MODE" "MODE=unset" "$(sed -n '4p' "$C2ENV")"
+assert_eq "copy2 scrubbed TELEGRAM_APPROVAL_CHAT_ID" "CHAT=unset" "$(sed -n '5p' "$C2ENV")"
+assert_eq "copy2 scrubbed TELEGRAM_ALLOWED_USER_IDS" "USERS=unset" "$(sed -n '6p' "$C2ENV")"
+assert_eq "copy2 kept TELEGRAM_TEST_FIXTURE" "FIX=fixture-value" "$(sed -n '7p' "$C2ENV")"
+assert_not_contains "copy2 stdout has no sentinel" "production-shaped-test-value" "$c2_out"
+assert_eq "copy2 parent TELEGRAM_BOT_TOKEN remains" "production-shaped-test-value" "${TELEGRAM_BOT_TOKEN-unset}"
+rm -rf "$C2BIN" "$C2TMP"
 
 echo "--- test 2: prep is idempotent and skips when not applicable ---"
 out="$(cd "$TMP" && dprep_ensure_js_deps)"
@@ -637,9 +727,105 @@ else
   PASS=$((PASS + 1)); echo "PASS: test7 stub was not invoked"
 fi
 
+echo "--- repeated scrub is stable and a child export does not touch the parent ---"
+telegram_scrub_snapshot() {
+  export TELEGRAM_BOT_TOKEN=production-shaped-test-value
+  export TELEGRAM_STREAMING_MODE=production-shaped-test-value
+  export TELEGRAM_APPROVAL_CHAT_ID=production-shaped-test-value
+  export TELEGRAM_ALLOWED_USER_IDS=production-shaped-test-value
+  export TELEGRAM_TEST_FIXTURE=fixture-value
+  export DISPATCH_POSTGRES_PHASE15_TEST_URL=postgresql://localhost/phase15
+  rst_scrub_env
+  if [ "${1:-}" = "twice" ]; then rst_scrub_env; fi
+  printf 'BOT=%s\nMODE=%s\nCHAT=%s\nUSERS=%s\nFIX=%s\nURL=%s\n' \
+    "${TELEGRAM_BOT_TOKEN-unset}" \
+    "${TELEGRAM_STREAMING_MODE-unset}" \
+    "${TELEGRAM_APPROVAL_CHAT_ID-unset}" \
+    "${TELEGRAM_ALLOWED_USER_IDS-unset}" \
+    "${TELEGRAM_TEST_FIXTURE-unset}" \
+    "${DISPATCH_POSTGRES_PHASE15_TEST_URL-unset}"
+}
+parent_bot_before="${TELEGRAM_BOT_TOKEN-unset}"
+ONCE_SNAP="$(telegram_scrub_snapshot)"
+TWICE_SNAP="$(telegram_scrub_snapshot twice)"
+assert_eq "t3 two scrubs match one" "$ONCE_SNAP" "$TWICE_SNAP"
+assert_eq "t3 scrub subshell leaves parent token" "$parent_bot_before" "${TELEGRAM_BOT_TOKEN-unset}"
+export TELEGRAM_BOT_TOKEN=production-shaped-test-value
+bash -c 'export TELEGRAM_BOT_TOKEN=in-test-fake'
+assert_eq "t3 child export leaves parent token" "production-shaped-test-value" "${TELEGRAM_BOT_TOKEN-unset}"
+
+echo "--- rst_run_commands child boundary removes operational telegram names ---"
+RST_TG="$(mktemp -d)"
+cat > "$RST_TG/probe.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'BOT=%s\n' "${TELEGRAM_BOT_TOKEN-unset}"
+printf 'MODE=%s\n' "${TELEGRAM_STREAMING_MODE-unset}"
+printf 'CHAT=%s\n' "${TELEGRAM_APPROVAL_CHAT_ID-unset}"
+printf 'USERS=%s\n' "${TELEGRAM_ALLOWED_USER_IDS-unset}"
+printf 'FIX=%s\n' "${TELEGRAM_TEST_FIXTURE-unset}"
+printf 'Tests: 1/1\n'
+EOF
+chmod +x "$RST_TG/probe.sh"
+printf 'bash ./probe.sh\n' > "$RST_TG/cmds"
+export TELEGRAM_BOT_TOKEN=production-shaped-test-value
+export TELEGRAM_STREAMING_MODE=production-shaped-test-value
+export TELEGRAM_APPROVAL_CHAT_ID=production-shaped-test-value
+export TELEGRAM_ALLOWED_USER_IDS=production-shaped-test-value
+export TELEGRAM_TEST_FIXTURE=fixture-value
+rst_summary="$(cd "$RST_TG" && rst_run_commands ./cmds ./log)"
+assert_eq "t4 rst child exit and counts" "0 1 1" "$rst_summary"
+assert_eq "t4 child TELEGRAM_BOT_TOKEN unset" "BOT=unset" "$(grep -x 'BOT=unset' "$RST_TG/log" | head -1)"
+assert_eq "t4 child TELEGRAM_STREAMING_MODE unset" "MODE=unset" "$(grep -x 'MODE=unset' "$RST_TG/log" | head -1)"
+assert_eq "t4 child TELEGRAM_APPROVAL_CHAT_ID unset" "CHAT=unset" "$(grep -x 'CHAT=unset' "$RST_TG/log" | head -1)"
+assert_eq "t4 child TELEGRAM_ALLOWED_USER_IDS unset" "USERS=unset" "$(grep -x 'USERS=unset' "$RST_TG/log" | head -1)"
+assert_eq "t4 child TELEGRAM_TEST_FIXTURE kept" "FIX=fixture-value" "$(grep -x 'FIX=fixture-value' "$RST_TG/log" | head -1)"
+assert_contains "t4 log keeps original command" "### run-stop-tests: bash ./probe.sh" "$(cat "$RST_TG/log")"
+assert_not_contains "t4 log has no sentinel" "production-shaped-test-value" "$(cat "$RST_TG/log")"
+assert_eq "t4 parent TELEGRAM_BOT_TOKEN unchanged" "production-shaped-test-value" "${TELEGRAM_BOT_TOKEN-unset}"
+
+echo "--- genuine failing counts stay blocking ---"
+T5="$(mktemp -d)"
+cat > "$T5/fail.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'Tests: 0/1\n'
+exit 1
+EOF
+chmod +x "$T5/fail.sh"
+printf 'bash ./fail.sh\n' > "$T5/cmds"
+t5_result="$(cd "$T5" && rst_run_commands ./cmds ./log)"
+assert_eq "t5 rst_run_commands exit and counts" "1 0 1" "$t5_result"
+t5_exit="${t5_result%% *}"
+t5_counts="${t5_result#* }"
+t5_report="$(rst_report CODE 'bash ./fail.sh' "$t5_exit" "$t5_counts")"
+assert_contains "t5 TESTS_STATUS failed" "TESTS_STATUS=failed" "$t5_report"
+assert_contains "t5 TESTS_LINE has 0/1" "0/1" "$t5_report"
+assert_contains "t5 TESTS_LINE has FAILED" "FAILED" "$t5_report"
+
+echo "--- absent telegram names stay a no-op ---"
+T6_EMPTY="$(mktemp -d)"
+T6="$(
+  unset TELEGRAM_BOT_TOKEN TELEGRAM_STREAMING_MODE TELEGRAM_APPROVAL_CHAT_ID TELEGRAM_ALLOWED_USER_IDS
+  rst_scrub_env
+  printf 'rc1=%s\n' "$?"
+  s1="$(printf '%s\n' "${TELEGRAM_BOT_TOKEN-absent}" "${TELEGRAM_STREAMING_MODE-absent}" "${TELEGRAM_APPROVAL_CHAT_ID-absent}" "${TELEGRAM_ALLOWED_USER_IDS-absent}" "${PATH}" "${HOME}")"
+  rst_scrub_env
+  printf 'rc2=%s\n' "$?"
+  s2="$(printf '%s\n' "${TELEGRAM_BOT_TOKEN-absent}" "${TELEGRAM_STREAMING_MODE-absent}" "${TELEGRAM_APPROVAL_CHAT_ID-absent}" "${TELEGRAM_ALLOWED_USER_IDS-absent}" "${PATH}" "${HOME}")"
+  if [ "$s1" = "$s2" ]; then printf 'same=yes\n'; else printf 'same=no\n'; fi
+  dprep_out="$(cd "$T6_EMPTY" && dprep_ensure_js_deps)"
+  printf 'dprep_rc=%s\n' "$?"
+  printf 'dprep_out=%s\n' "$dprep_out"
+)"
+assert_eq "t6 first scrub rc" "rc1=0" "$(printf '%s\n' "$T6" | sed -n '1p')"
+assert_eq "t6 second scrub rc" "rc2=0" "$(printf '%s\n' "$T6" | sed -n '2p')"
+assert_eq "t6 repeated scrub identical" "same=yes" "$(printf '%s\n' "$T6" | sed -n '3p')"
+assert_eq "t6 dprep skip rc" "dprep_rc=0" "$(printf '%s\n' "$T6" | sed -n '4p')"
+assert_contains "t6 dprep skip path" "dprep: no package.json with a bun lockfile, skipping" "$(printf '%s\n' "$T6" | sed -n '5p')"
+
 unset RST_NPX_BIN RST_NPM_BIN GH_TOKEN
+unset TELEGRAM_BOT_TOKEN TELEGRAM_STREAMING_MODE TELEGRAM_APPROVAL_CHAT_ID TELEGRAM_ALLOWED_USER_IDS TELEGRAM_TEST_FIXTURE
 export PATH="$ORIG_PATH"
-rm -rf "$BIN" "$TMP" "$TMP2" "$TMP3" "$TMP4" "$TMP5" "$TMP6" "$TMP7"
+rm -rf "$BIN" "$TMP" "$TMP2" "$TMP3" "$TMP4" "$TMP5" "$TMP6" "$TMP7" "$RST_TG" "$T5" "$T6_EMPTY"
 
 echo
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"
