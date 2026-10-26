@@ -5349,6 +5349,7 @@ nodes:
         python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
       }
 
+      # ---- BEGIN rig core (byte-identical across lanes; extracted by unit test) ----
       RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
       $block-reclassify.output
       BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
@@ -5358,6 +5359,16 @@ nodes:
         echo "review-issue: status=$STATUS -- not marking issue status:review."
         exit 0
       fi
+      EVIDENCE=$(capture_node_output <<'BDC_NODE_OUTPUT_MANIFEST_EVIDENCE'
+      $manifest-evidence-check.output
+      BDC_NODE_OUTPUT_MANIFEST_EVIDENCE
+      )
+      EVIDENCE=$(printf '%s' "$EVIDENCE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+      if [ "$EVIDENCE" != "OK" ]; then
+        echo "review-issue: manifest-evidence-check=${EVIDENCE:-<none>} -- not marking issue status:review."
+        exit 0
+      fi
+      # ---- END rig core ----
 
       READ_SPEC_OUT=$read-spec.output
       ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
