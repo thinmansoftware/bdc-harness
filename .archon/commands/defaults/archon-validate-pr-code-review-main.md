@@ -58,7 +58,7 @@ Get the list of changed files from the PR diff, then read those **same files on 
 
 ```bash
 PR_NUMBER=$(cat $ARTIFACTS_DIR/.pr-number | tr -d '\n')
-gh pr view "$PR_NUMBER" --json files -q '.files[].path'
+gh api --paginate "repos/{owner}/{repo}/pulls/$PR_NUMBER/files" --jq '.[].filename'
 ```
 
 **CRITICAL**: Read the files from the **canonical repo** (main branch), NOT from the current worktree (feature branch). The canonical repo path is in `$ARTIFACTS_DIR/.canonical-repo`.

@@ -14,6 +14,7 @@ mock.module('@archon/paths', () => ({
     fatal: () => {},
     child: () => ({}),
   }),
+  BUNDLED_IS_BINARY: false,
 }));
 
 import {
@@ -23,6 +24,7 @@ import {
   parseFrontmatter,
   AgentRegistryError,
 } from './registry';
+import { resolveAgentPersona } from '../executor-shared';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -203,6 +205,38 @@ Prompt.
     const filePath = await writeAgent('opus-55.md', content);
     const persona = await loadAgentFile(filePath);
     expect(persona.model).toBe('claude-opus-5-5');
+  });
+
+  test('claude-haiku-5-5 is a known model and does not raise agent_invalid_model', async () => {
+    const content = `---
+name: haiku-55
+model: claude-haiku-5-5
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('haiku-55.md', content);
+    const persona = await loadAgentFile(filePath);
+    expect(persona.model).toBe('claude-haiku-5-5');
+  });
+
+  test('agent_invalid_model: claude-haiku-5 is not the exact allowlisted ID', async () => {
+    const content = `---
+name: haiku-bare
+model: claude-haiku-5
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('haiku-bare.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_model');
   });
 
   test('agent_invalid_model: model alias not in known set', async () => {
@@ -431,6 +465,31 @@ describe('parseFrontmatter nested context:', () => {
 // ---------------------------------------------------------------------------
 // loadAgentFile -- context validation (agent_invalid_context)
 // ---------------------------------------------------------------------------
+
+describe('tracked major-build-haiku persona', () => {
+  test('loads the repo persona and resolves it over a sonnet workflow model', async () => {
+    const repoRoot = join(import.meta.dir, '..', '..', '..', '..');
+    const registry = await loadAgentRegistry(join(repoRoot, '.archon', 'agents'));
+    const haiku = resolveAgent('major-build-haiku', registry);
+    const original = resolveAgent('major-build', registry);
+
+    expect(haiku).toBeDefined();
+    expect(original).toBeDefined();
+    if (haiku === undefined || original === undefined) {
+      throw new Error('major-build personas missing from .archon/agents');
+    }
+
+    expect(haiku.model).toBe('claude-haiku-5-5');
+    expect(haiku.systemPrompt).toBe(original.systemPrompt);
+    expect(haiku.tools).toEqual(original.tools);
+    expect(haiku.context).toEqual(original.context);
+
+    const resolved = resolveAgentPersona(haiku, 'sonnet', 'claude');
+    expect(resolved.model).toBe('claude-haiku-5-5');
+    expect(resolved.systemPrompt).toBe(original.systemPrompt);
+    expect(resolved.allowedTools).toEqual(original.tools);
+  });
+});
 
 describe('loadAgentFile context validation', () => {
   test('loads agent with valid context block', async () => {

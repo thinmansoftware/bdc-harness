@@ -29,7 +29,7 @@ description: |
 
 policyFile: harness/policies/agent-behavior.md
 provider: claude
-model: sonnet
+model: claude-haiku-5-5
 
 nodes:
   # ---------------------------------------------------------------------------
@@ -622,9 +622,9 @@ nodes:
   - id: implement-pipeline
     # CI-green gate waits exceed the 180 s default (run ce159483).
     idle_timeout: 1800000
-    persona: major-build
+    persona: major-build-haiku
     depends_on: [allocate-stage-worktrees]
-    agent: major-build
+    agent: major-build-haiku
     task_class: heavy_work
     loop:
       until: __NEVER_EMIT_USE_UNTIL_BASH__
