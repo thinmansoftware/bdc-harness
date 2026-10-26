@@ -11,7 +11,7 @@ behind_by: 2 (d8bb42a4, 9f918e79). Not rebased and not merged.
 Files modified:
 
 - packages/overseer/src/pr-review-wiring.ts
-- packages/overseer/src/**tests**/pr-review-sandbox.test.ts
+- `packages/overseer/src/__tests__/pr-review-sandbox.test.ts`
 - scripts/overseer-review-sandbox-smoke.ts
 
 Files created:
@@ -45,7 +45,7 @@ Command: grep -c 'review_incomplete' packages/overseer/src/pr-review-submit.ts
 Result: 4 (at least 1)
 
 Stop 2:
-Command: bun test --timeout 60000 packages/overseer/src/**tests**/pr-review-sandbox.test.ts packages/overseer/src/**tests**/pr-review-sandbox-merge-qualification.test.ts packages/server/src/dispatch/review-worker-sandbox.test.ts
+Command: `bun test --timeout 60000 packages/overseer/src/__tests__/pr-review-sandbox.test.ts packages/overseer/src/__tests__/pr-review-sandbox-merge-qualification.test.ts packages/server/src/dispatch/review-worker-sandbox.test.ts`
 Result: 12 pass / 12 total, 0 fail, 0 skip
 
 - pr-review-sandbox.test.ts: 8 pass (2 existing hand-built approval tests plus 6 caller tests)
@@ -58,14 +58,15 @@ Caller proof behavior:
 - A declared check that appends to a tracked file and exits 0 produces no execution proof and does not qualify the head. The spawn wrapper is test simulation, not native enforcement.
 - A non-mutating check can reach the model, and an evaluate override that then appends to a tracked file and returns APPROVE does not qualify the head. Proof is discarded.
 - Synthetic canaries BDC_REVIEW_CANARY, GH_TOKEN, GITHUB_TOKEN, OPENAI_API_KEY, GITHUB_APP_PRIVATE_KEY, and OVERSEER_REVIEW_WEBHOOK_SECRET are absent from recorded git environments and from captured Codex spawn environments. The parent environment is unchanged afterward.
-  Untrusted git, inspection, and check subprocesses receive only PATH copied from the parent plus HOME, CODEX_HOME, and TMPDIR set to a private mkdtemp scratch. Model authentication is unchanged.
+
+Untrusted git, inspection, and check subprocesses receive only PATH copied from the parent plus HOME, CODEX_HOME, and TMPDIR set to a private mkdtemp scratch. Model authentication is unchanged.
 
 Stop 3:
 Command: LC_ALL=C grep -n '[^ -~]' on judge-transport.ts, pr-review-evaluator.ts, pr-review-wiring.ts, pr-review-submit.ts, github-real-deps.ts, review-worker-clock.ts, pr-review-sandbox.test.ts, and scripts/overseer-review-sandbox-smoke.ts
 Result: no output, exit 1
 
 Stop 5:
-Command: bun test --timeout 60000 packages/overseer/src/**tests**/judge-transport.test.ts
+Command: `bun test --timeout 60000 packages/overseer/src/__tests__/judge-transport.test.ts`
 Result: 14 pass / 14 total, 0 fail. Non-PR buildJudgeTransport behavior preserved.
 
 Stop 6:
