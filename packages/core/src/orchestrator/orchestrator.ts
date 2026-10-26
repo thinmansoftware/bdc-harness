@@ -52,6 +52,7 @@ import { executeWorkflow } from '@archon/workflows/executor';
 import { parseDeclaredBaseBranch } from '@archon/workflows/reliability/run-authority';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import type { ModelOverride } from '@archon/workflows/model-override';
+import type { HandoffRecord } from '../escalation';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createWorkflowDeps } from '../workflows/store-adapter';
@@ -420,10 +421,21 @@ export async function dispatchBackgroundWorkflow(
   // inject an escalation packet into this successor's user_message so the
   // higher tier sees the rejection context. Best-effort -- never blocks
   // dispatch.
+  // Branch handoff (WO-HARNESS-ESCALATION-BRANCH-HANDOFF-01) shares that
+  // setup, then detaches terminal predecessor repair branches and appends
+  // the predecessor's own push evidence. Setup failure logs
+  // orchestrator.escalation_link_failed and continues without handoff
+  // metadata. The linker catch and the handoff catch stay independent.
   const workflowDeps = createWorkflowDeps();
   let effectiveUserMessage = ctx.originalMessage;
+  let handoffRecords: HandoffRecord[] | undefined;
   try {
-    const { prepareDispatchWithEscalation } = await import('../escalation');
+    const {
+      prepareDispatchWithEscalation,
+      listPredecessorRuns,
+      releasePredecessorBranchHolds,
+      formatHandoffLines,
+    } = await import('../escalation');
     const workflowDb = await import('../db/workflows');
     const workflowEventDb = await import('../db/workflow-events');
     const linkerStore = {
@@ -431,25 +443,50 @@ export async function dispatchBackgroundWorkflow(
       listWorkflowEvents: workflowEventDb.listWorkflowEvents,
       updateWorkflowRun: workflowDb.updateWorkflowRun,
     };
-    const prepared = await prepareDispatchWithEscalation(ctx.originalMessage, linkerStore);
-    effectiveUserMessage = prepared.userMessage;
-    if (prepared.link.escalatedRunIds.length > 0) {
-      getLog().info(
-        {
-          woId: prepared.link.woId,
-          escalatedRunIds: prepared.link.escalatedRunIds,
-          packetChars: prepared.link.packet.length,
-          workflowName: workflow.name,
-        },
-        'orchestrator.escalation_linked'
+    try {
+      const prepared = await prepareDispatchWithEscalation(ctx.originalMessage, linkerStore);
+      effectiveUserMessage = prepared.userMessage;
+      if (prepared.link.escalatedRunIds.length > 0) {
+        getLog().info(
+          {
+            woId: prepared.link.woId,
+            escalatedRunIds: prepared.link.escalatedRunIds,
+            packetChars: prepared.link.packet.length,
+            workflowName: workflow.name,
+          },
+          'orchestrator.escalation_linked'
+        );
+      }
+    } catch (error) {
+      getLog().warn(
+        { err: toError(error), workflowName: workflow.name },
+        'orchestrator.escalation_link_failed'
       );
+      // Non-fatal: proceed with original message
+    }
+
+    try {
+      // Original dispatch message, not the packet-prepended successor message.
+      const predecessors = await listPredecessorRuns(ctx.originalMessage, linkerStore);
+      const released = await releasePredecessorBranchHolds(predecessors);
+      const handoffLines = formatHandoffLines(released.records);
+      if (handoffLines) {
+        effectiveUserMessage = `${effectiveUserMessage}\n\n${handoffLines}`;
+      }
+      handoffRecords = released.records;
+    } catch (error) {
+      getLog().warn(
+        { err: toError(error), workflowName: workflow.name },
+        'orchestrator.escalation_handoff_failed'
+      );
+      // Non-fatal: leave the successor message and metadata unchanged
     }
   } catch (error) {
     getLog().warn(
       { err: toError(error), workflowName: workflow.name },
       'orchestrator.escalation_link_failed'
     );
-    // Non-fatal: proceed with original message
+    // Non-fatal: proceed with original message and no handoff metadata
   }
 
   // 8. Pre-create workflow run row so the UI can fetch it immediately.
@@ -466,6 +503,7 @@ export async function dispatchBackgroundWorkflow(
       metadata: {
         ...(ctx.issueContext ? { github_context: ctx.issueContext } : {}),
         ...(ctx.modelOverride ? { model_override: ctx.modelOverride } : {}),
+        ...(handoffRecords !== undefined ? { escalation_handoff: handoffRecords } : {}),
       },
       parent_conversation_id: ctx.conversationDbId,
     });
