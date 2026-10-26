@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps';
 import { createRealSubmitDeps, observeReviewExecution } from '../pr-review-wiring';
 import { buildPrReviewTransport } from '../judge-transport';
+import { runBrokerProcess } from '../../../../scripts/overseer-reviewer-broker';
 import {
   runAndSubmitReview,
   type ReviewExecutionContext,
@@ -142,6 +143,34 @@ describe('sandbox-qualified submit', () => {
     expect(result.disposition).toBe('review_incomplete');
     expect(result.reason).toBe('review_body_credential_leak');
     expect(d.posts).toEqual(['COMMENT']);
+  });
+});
+
+describe('bounded broker process capture', () => {
+  test('terminates a hanging descendant within the deadline', async () => {
+    const started = Date.now();
+    const result = await runBrokerProcess(
+      ['/bin/sh', '-c', '(sleep 30) & exit 0'],
+      process.cwd(),
+      { PATH: '/usr/bin:/bin' },
+      undefined,
+      { timeoutMs: 100 }
+    );
+    expect(result.timedOut).toBe(true);
+    expect(result.exitCode).toBe(124);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  test('bounds an output flood and makes it nonqualifying', async () => {
+    const result = await runBrokerProcess(
+      ['/bin/sh', '-c', 'yes x | head -c 1048576'],
+      process.cwd(),
+      { PATH: '/usr/bin:/bin' },
+      undefined,
+      { timeoutMs: 2_000, outputLimit: 1024 }
+    );
+    expect(result.outputTruncated).toBe(true);
+    expect(result.stdout.length + result.stderr.length).toBeLessThanOrEqual(1024);
   });
 });
 

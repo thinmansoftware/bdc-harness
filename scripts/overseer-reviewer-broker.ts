@@ -62,11 +62,12 @@ function validJob(value: unknown): value is BrokerJob {
   );
 }
 
-async function run(
+export async function runBrokerProcess(
   argv: string[],
   cwd: string,
   env: Record<string, string>,
-  prompt?: string
+  prompt?: string,
+  options: { timeoutMs?: number; outputLimit?: number } = {}
 ): Promise<{
   exitCode: number;
   stdout: string;
@@ -102,7 +103,7 @@ async function run(
     }
   };
   const appendStdout = (chunk: string): void => {
-    const remaining = OUTPUT_LIMIT - stdout.length - stderr.length;
+    const remaining = (options.outputLimit ?? OUTPUT_LIMIT) - stdout.length - stderr.length;
     if (remaining <= 0) outputTruncated = true;
     else {
       stdout += chunk.slice(0, remaining);
@@ -110,7 +111,7 @@ async function run(
     }
   };
   const appendStderr = (chunk: string): void => {
-    const remaining = OUTPUT_LIMIT - stdout.length - stderr.length;
+    const remaining = (options.outputLimit ?? OUTPUT_LIMIT) - stdout.length - stderr.length;
     if (remaining <= 0) outputTruncated = true;
     else {
       stderr += chunk.slice(0, remaining);
@@ -146,7 +147,7 @@ async function run(
         }
       }, 250).unref?.();
       resolveTimeout(124);
-    }, EXECUTION_TIMEOUT_MS);
+    }, options.timeoutMs ?? EXECUTION_TIMEOUT_MS);
   });
   const completed = (async (): Promise<number> => {
     const code = await child.exited;
@@ -193,7 +194,7 @@ async function processJob(path: string): Promise<BrokerResult> {
     };
     if (Object.keys(env).some(name => FORBIDDEN_ENV.test(name)))
       throw new Error('unsafe_environment');
-    const head = await run(
+    const head = await runBrokerProcess(
       ['git', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'],
       checkout,
       env
@@ -221,10 +222,10 @@ async function processJob(path: string): Promise<BrokerResult> {
             '--cd',
             checkout,
           ];
-    const version = await run([codex, '--version'], checkout, env);
+    const version = await runBrokerProcess([codex, '--version'], checkout, env);
     if (version.exitCode !== 0 || !version.stdout.includes(CODEX_VERSION))
       throw new Error('landlock_unsupported');
-    const result = await run(command, checkout, env, job.prompt);
+    const result = await runBrokerProcess(command, checkout, env, job.prompt);
     await rm(scratch, { recursive: true, force: true });
     return {
       id,
@@ -247,23 +248,27 @@ async function processJob(path: string): Promise<BrokerResult> {
   }
 }
 
-if (process.platform !== 'linux' || process.getuid?.() !== 1002)
-  throw new Error('reviewer_identity_invalid');
-await mkdir(SPOOL, { recursive: true });
-await writeFile(join(SPOOL, 'ready.tmp'), `${process.pid}\n`, { mode: 0o640 });
-await rename(join(SPOOL, 'ready.tmp'), join(SPOOL, 'ready'));
+async function main(): Promise<never> {
+  if (process.platform !== 'linux' || process.getuid?.() !== 1002)
+    throw new Error('reviewer_identity_invalid');
+  await mkdir(SPOOL, { recursive: true });
+  await writeFile(join(SPOOL, 'ready.tmp'), `${process.pid}\n`, { mode: 0o640 });
+  await rename(join(SPOOL, 'ready.tmp'), join(SPOOL, 'ready'));
 
-for (;;) {
-  const names = (await readdir(SPOOL)).filter(name => name.endsWith('.request.json')).sort();
-  for (const name of names) {
-    const path = resolve(SPOOL, name);
-    if (!inside(path, resolve(SPOOL))) continue;
-    const result = await processJob(path);
-    await writeFile(join(SPOOL, `${result.id}.result.tmp`), JSON.stringify(result), {
-      mode: 0o640,
-    });
-    await rename(join(SPOOL, `${result.id}.result.tmp`), join(SPOOL, `${result.id}.result.json`));
-    await rm(path, { force: true });
+  for (;;) {
+    const names = (await readdir(SPOOL)).filter(name => name.endsWith('.request.json')).sort();
+    for (const name of names) {
+      const path = resolve(SPOOL, name);
+      if (!inside(path, resolve(SPOOL))) continue;
+      const result = await processJob(path);
+      await writeFile(join(SPOOL, `${result.id}.result.tmp`), JSON.stringify(result), {
+        mode: 0o640,
+      });
+      await rename(join(SPOOL, `${result.id}.result.tmp`), join(SPOOL, `${result.id}.result.json`));
+      await rm(path, { force: true });
+    }
+    await Bun.sleep(25);
   }
-  await Bun.sleep(25);
 }
+
+if (import.meta.main) await main();
