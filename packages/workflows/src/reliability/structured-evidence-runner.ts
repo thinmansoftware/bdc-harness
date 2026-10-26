@@ -733,40 +733,36 @@ export function checkAttemptRecord(
   const parsed = evidenceAttemptSchema.safeParse(recorded);
   if (!parsed.success) return { ok: false, reason: 'malformed' };
   if (recorded.schemaVersion !== 1) return { ok: false, reason: 'schema' };
-  if (
-    liveAuthority.repo &&
-    recorded.authority.repo &&
-    liveAuthority.repo.toLowerCase() !== recorded.authority.repo.toLowerCase()
-  ) {
-    return { ok: false, reason: 'authority-repo' };
+  if (liveAuthority.repo) {
+    if (liveAuthority.repo.toLowerCase() !== recorded.authority.repo?.toLowerCase()) {
+      return { ok: false, reason: 'authority-repo' };
+    }
   }
-  if (
-    liveAuthority.stageId &&
-    recorded.authority.stageId &&
-    liveAuthority.stageId !== recorded.authority.stageId
-  ) {
-    return { ok: false, reason: 'authority-stage' };
+  if (liveAuthority.stageId) {
+    if (!recorded.authority.stageId || liveAuthority.stageId !== recorded.authority.stageId) {
+      return { ok: false, reason: 'authority-stage' };
+    }
   }
-  if (
-    liveAuthority.targetBranch &&
-    recorded.authority.targetBranch &&
-    liveAuthority.targetBranch !== recorded.authority.targetBranch
-  ) {
-    return { ok: false, reason: 'authority-branch' };
+  if (liveAuthority.targetBranch) {
+    if (
+      !recorded.authority.targetBranch ||
+      liveAuthority.targetBranch !== recorded.authority.targetBranch
+    ) {
+      return { ok: false, reason: 'authority-branch' };
+    }
   }
-  if (
-    liveAuthority.baseSha &&
-    recorded.authority.baseSha &&
-    liveAuthority.baseSha !== recorded.authority.baseSha
-  ) {
-    return { ok: false, reason: 'authority-base' };
+  if (liveAuthority.baseSha) {
+    if (!recorded.authority.baseSha || liveAuthority.baseSha !== recorded.authority.baseSha) {
+      return { ok: false, reason: 'authority-base' };
+    }
   }
-  if (
-    liveAuthority.worktree &&
-    recorded.authority.worktree &&
-    resolve(liveAuthority.worktree) !== resolve(recorded.authority.worktree)
-  ) {
-    return { ok: false, reason: 'authority-worktree' };
+  if (liveAuthority.worktree) {
+    if (
+      !recorded.authority.worktree ||
+      resolve(liveAuthority.worktree) !== resolve(recorded.authority.worktree)
+    ) {
+      return { ok: false, reason: 'authority-worktree' };
+    }
   }
   const live = testedTreeIdentity(cwd);
   if (live.method === 'not-a-git-worktree' || recorded.tree.method === 'not-a-git-worktree') {
@@ -822,7 +818,6 @@ export function checkAttemptRecord(
 function rejectControls(command: string): string | null {
   for (let i = 0; i < command.length; i += 1) {
     const code = command.charCodeAt(i);
-    if (code === 0x09) continue;
     if (code < 0x20 || code > 0x7e) return code < 0x20 ? 'control' : 'non-ascii';
   }
   return null;
@@ -1101,26 +1096,42 @@ export function allowAssertion(
   return { ok: true, segments };
 }
 
+export interface AssertionStep {
+  readonly argv: readonly string[];
+  readonly exitCode: number;
+  readonly signal: string | null;
+}
+
 export interface AssertionExec {
   readonly stdout: string;
   readonly code: number;
   readonly upstreamError: boolean;
   readonly reason: string;
   readonly segments: PlannedSegment[];
+  readonly steps: readonly AssertionStep[];
 }
 
 export function execAssertion(command: string, cwd: string): AssertionExec {
   const allowed = allowAssertion(command);
   if (!allowed.ok) {
-    return { stdout: '', code: 127, upstreamError: true, reason: allowed.reason, segments: [] };
+    return {
+      stdout: '',
+      code: 127,
+      upstreamError: true,
+      reason: allowed.reason,
+      segments: [],
+      steps: [],
+    };
   }
   const baseEnv = scrubEnv(process.env);
   let input = Buffer.alloc(0);
   let code = 0;
   let upstreamError = false;
+  const steps: AssertionStep[] = [];
   for (const segment of allowed.segments) {
     const env = { ...baseEnv, ...segment.locale };
     const result = runArgv(segment.argv, cwd, env, input);
+    steps.push({ argv: segment.argv, exitCode: result.code, signal: result.signal });
     const runner = segment.argv[0] ?? '';
     const benignGrep =
       GREP_RUNNERS.has(runner) && result.code === 1 && !result.timedOut && !result.missing;
@@ -1139,6 +1150,7 @@ export function execAssertion(command: string, cwd: string): AssertionExec {
       upstreamError: true,
       reason: 'upstream-error',
       segments: allowed.segments,
+      steps,
     };
   }
   return {
@@ -1147,17 +1159,23 @@ export function execAssertion(command: string, cwd: string): AssertionExec {
     upstreamError: false,
     reason: 'executed',
     segments: allowed.segments,
+    steps,
   };
 }
 
-export function observeAssertion(command: string, cwd: string): string {
-  const result = execAssertion(command, cwd);
-  if (!allowAssertion(command).ok || result.upstreamError) return 'ERR';
+function assertionCount(result: AssertionExec): string {
+  if (result.upstreamError) return 'ERR';
   const trimmed = result.stdout.replace(/\s/g, '');
   if (/^[0-9]+$/.test(trimmed)) return trimmed;
   if (trimmed.length === 0) return result.code <= 1 ? '0' : 'ERR';
   const lines = result.stdout.split('\n').filter(line => line.length > 0);
   return String(lines.length);
+}
+
+export function observeAssertion(command: string, cwd: string): string {
+  const result = execAssertion(command, cwd);
+  if (!allowAssertion(command).ok || result.upstreamError) return 'ERR';
+  return assertionCount(result);
 }
 
 function isInlineFlag(token: string): boolean {
@@ -2374,10 +2392,22 @@ function runCli(): number {
         }
         member.argv = allowed.segments[0]?.argv ?? [];
         member.startedAt = new Date().toISOString();
-        const observed = observeAssertion(cmd, process.cwd());
+        const ran = execAssertion(cmd, process.cwd());
         member.endedAt = new Date().toISOString();
-        member.resolvedArgv = allowed.segments[0]?.argv ?? [];
+        member.chain = ran.steps.map(step => ({
+          argv: [...step.argv],
+          resolvedArgv: [...step.argv],
+          exitCode: step.exitCode,
+          signal: step.signal,
+        }));
+        const last = member.chain[member.chain.length - 1];
+        member.resolvedArgv = last ? [...last.resolvedArgv] : [];
         member.resolvedExecutable = member.resolvedArgv[0] ?? '';
+        if (last) {
+          member.exitCode = last.exitCode;
+          member.signal = last.signal;
+        }
+        const observed = assertionCount(ran);
         if (observed === 'ERR') {
           dropped += 1;
           member.status = 'FAILED';

@@ -194,6 +194,36 @@ describe('unsafe-and-decode-bypasses', () => {
     expect(sortPath.ok).toBe(true);
     rmSync(cwd, { recursive: true, force: true });
   });
+
+  it('rejects tab controls in the assertion runner before execution', () => {
+    const cwd = tempDir('ser-tab-');
+    const sentinel = join(cwd, 'pwned');
+    const bin = join(cwd, 'bin');
+    mkdirSync(bin);
+    writeExec(join(bin, 'grep'), `#!/bin/sh\ntouch '${sentinel}'\nexit 0\n`);
+    const command = 'grep\t-c\tbase\tREADME';
+    const allowed = allowAssertion(command);
+    expect(allowed.ok).toBe(false);
+    if (!allowed.ok) expect(allowed.reason).toBe('control');
+    const direct = execAssertion(command, cwd);
+    expect(direct.reason).toBe('control');
+    expect(direct.stdout).toBe('');
+    expect(direct.steps).toEqual([]);
+    const ran = spawnSync('bun', [RUNNER, 'exec-assertion', '--', command], {
+      cwd,
+      env: {
+        ...process.env,
+        HARNESS_ROOT_OVERRIDE: ROOT,
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+      },
+      encoding: 'utf8',
+    });
+    expect(ran.stderr ?? '').not.toContain('NEVER_RAN missing trusted');
+    expect(ran.status).toBe(127);
+    expect(ran.stdout ?? '').toBe('');
+    expect(existsSync(sentinel)).toBe(false);
+    rmSync(cwd, { recursive: true, force: true });
+  });
 });
 
 describe('git-and-pipeline-safety', () => {
@@ -871,6 +901,46 @@ describe('hermetic-fresh-attempt', () => {
       });
       expect(stale.ok).toBe(false);
       if (!stale.ok) expect(stale.reason.startsWith('tests:')).toBe(true);
+
+      const matched = structuredClone(summary.attempt);
+      const required: EvidenceAuthority = {
+        repo: 'ThinManSoftware/BDC-Harness',
+        stageId: 'api',
+        targetBranch: 'dev',
+        worktree: cwd,
+        baseSha: 'deadbeef',
+      };
+      matched.authority = {
+        repo: 'thinmansoftware/bdc-harness',
+        stageId: 'api',
+        targetBranch: 'dev',
+        worktree: cwd,
+        baseSha: 'deadbeef',
+      };
+      writeFileSync(join(cwd, 'src.js'), 'v1\n');
+      expect(checkAttemptRecord(matched, cwd, required).ok).toBe(true);
+      const blanks: {
+        field: 'repo' | 'stageId' | 'targetBranch' | 'baseSha' | 'worktree';
+        value: string | null;
+        reason: string;
+      }[] = [
+        { field: 'repo', value: '', reason: 'authority-repo' },
+        { field: 'stageId', value: null, reason: 'authority-stage' },
+        { field: 'targetBranch', value: null, reason: 'authority-branch' },
+        { field: 'baseSha', value: '', reason: 'authority-base' },
+        { field: 'worktree', value: '', reason: 'authority-worktree' },
+      ];
+      for (const blank of blanks) {
+        const replay = structuredClone(matched);
+        if (blank.field === 'stageId' || blank.field === 'targetBranch') {
+          replay.authority[blank.field] = blank.value;
+        } else {
+          replay.authority[blank.field] = blank.value ?? '';
+        }
+        const verdict = checkAttemptRecord(replay, cwd, required);
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) expect(verdict.reason).toBe(blank.reason);
+      }
     } finally {
       if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
       else process.env.ARTIFACTS_DIR = savedArtifacts;
@@ -880,6 +950,55 @@ describe('hermetic-fresh-attempt', () => {
       else process.env.SER_REPO = savedRepo;
       rmSync(cwd, { recursive: true, force: true });
     }
+  });
+
+  it('persists every executed grep pipeline segment in the attempt chain', () => {
+    const cwd = tempDir('ser-grep-chain-');
+    initRepo(cwd);
+    const artifacts = join(cwd, 'artifacts');
+    mkdirSync(artifacts, { recursive: true });
+    const ran = spawnSync('bun', [RUNNER, 'run-greps'], {
+      cwd,
+      env: {
+        ...process.env,
+        HARNESS_ROOT_OVERRIDE: ROOT,
+        ARTIFACTS_DIR: artifacts,
+      },
+      encoding: 'utf8',
+      input: 'grep -c base README | wc -l\teq\t1\nDECLARED\t1\n',
+    });
+    expect(ran.status).toBe(0);
+    expect(ran.stdout).toContain('GREP_STATUS=passed');
+    const attempts = join(artifacts, 'evidence', 'attempts');
+    const grepId = readFileSync(join(attempts, 'current-greps'), 'utf8').trim();
+    const body = JSON.parse(readFileSync(join(attempts, `${grepId}.json`), 'utf8')) as {
+      members: {
+        argv: string[];
+        chain: {
+          argv: string[];
+          resolvedArgv: string[];
+          exitCode: number | null;
+          signal: string | null;
+        }[];
+      }[];
+    };
+    const member = body.members[0];
+    expect(member?.argv).toEqual(['grep', '-c', 'base', 'README']);
+    expect(member?.chain).toEqual([
+      {
+        argv: ['grep', '-c', 'base', 'README'],
+        resolvedArgv: ['grep', '-c', 'base', 'README'],
+        exitCode: 0,
+        signal: null,
+      },
+      {
+        argv: ['wc', '-l'],
+        resolvedArgv: ['wc', '-l'],
+        exitCode: 0,
+        signal: null,
+      },
+    ]);
+    rmSync(cwd, { recursive: true, force: true });
   });
 });
 
