@@ -3,7 +3,8 @@ WO: WO-HARNESS-OVERSEER-REVIEW-SANDBOX-01
 Builder: Any
 Repair target: PR #1290 (feat/wo-harness-overseer-review-sandbox-01-repair). No new PR. Not merged.
 Pre-repair head: 1f547dd5cd191f91979c5df9655dde82b9071b3e
-Candidate SHA: RECORDED_AFTER_COMMIT
+Candidate SHA: 5bb0c6f169503719b8e40da6d11f9bd0c04ca68b
+Manifest binding commit records that SHA and does not change source. Its parent is the candidate.
 origin/dev: 9f918e79dddca71b060e691d4a96be66576633a8
 behind_by: 2 (d8bb42a4, 9f918e79). Not rebased and not merged.
 
