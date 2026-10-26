@@ -14,6 +14,7 @@
     "dispatch-worker/**/*.ts",
     "staging/**/*.ts",
     "taskmaster/**/*.ts",
-    "mta/**/*.ts"
+    "mta/**/*.ts",
+    "windows-ci/**/*.ts"
   ]
 }
