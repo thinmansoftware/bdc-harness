@@ -1,5 +1,6 @@
 import {
   claimMessage,
+  createAuthenticatedMessage,
   deferMessage,
   heartbeatWorker,
   listMessages,
@@ -26,6 +27,7 @@ import {
   createRealSubmitDeps,
   parseReviewWorkBody,
   REVIEW_RECIPIENT,
+  REVIEW_SENDER,
   type ReviewRouteConfig,
 } from '@archon/overseer/pr-review-wiring';
 import {
@@ -64,6 +66,15 @@ export interface ReviewWorkerDeps {
    * `releaseMessage`, which already carries the required fencing guards.
    */
   deferMessage: typeof deferMessage;
+  /**
+   * One operator Dispatch notice. Correlation id equals the idempotency key.
+   * Required so a DIRTY PR cannot be deferred without naming it.
+   */
+  sendDispatchNotice(input: {
+    idempotencyKey: string;
+    subjectKey: string;
+    body: string;
+  }): Promise<void>;
   runAndSubmitReview: typeof runAndSubmitReview;
   createSubmitDeps: (reviewerIdentity: string) => ReturnType<typeof createRealSubmitDeps>;
   /** Optional logger seam for deterministic observability tests. */
@@ -88,7 +99,10 @@ interface ResultMapping {
 }
 
 function mapSubmitOutcome(
-  disposition: Exclude<SubmitDisposition, 'checks_pending' | 'transport_error' | 'rate_limited'>
+  disposition: Exclude<
+    SubmitDisposition,
+    'checks_pending' | 'transport_error' | 'rate_limited' | 'pr_conflicting'
+  >
 ): ResultMapping {
   switch (disposition) {
     // `stale_head` and `superseded_head` both mean the head this item is BOUND
@@ -136,6 +150,20 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     postResult,
     releaseMessage,
     deferMessage,
+    sendDispatchNotice: async (input): Promise<void> => {
+      await createAuthenticatedMessage(
+        { kind: 'system', sender: REVIEW_SENDER },
+        {
+          correlation_id: input.idempotencyKey,
+          idempotency_key: input.idempotencyKey,
+          task_type: 'agent_message',
+          recipient: 'operator',
+          priority: 'normal',
+          subject_key: input.subjectKey,
+          body: input.body,
+        }
+      );
+    },
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
     staleVerdictSweep: config =>
@@ -219,9 +247,8 @@ export async function tickReviewWorkerClock(
           work,
           deps.createSubmitDeps(config.reviewerIdentity)
         );
-        // CHECKS PENDING is the ONLY non-terminal disposition: the bound head is
-        // still live and CI on it has simply not concluded, so releasing the
-        // claim with a backoff retries the SAME head productively.
+        // CHECKS PENDING and PR CONFLICTING are non-terminal: the bound head is
+        // still live, so the claim is deferred and the same head is retried.
         //
         // `superseded_head` is deliberately NOT released here. Its bound head is
         // dead, the payload still names that dead SHA, and a release would spin
@@ -250,6 +277,39 @@ export async function tickReviewWorkerClock(
             worker_id: REVIEW_WORKER_ID,
             fencing_token: claimed.fencing_token,
             defer_until: deferUntil,
+          });
+          continue;
+        }
+        // DIRTY: name the conflicting PR, notify the operator once, and defer.
+        // Never a silent deferral and never a terminal result.
+        if (outcome.disposition === 'pr_conflicting') {
+          const idempotencyKey = `pr-conflicting:${work.owner}/${work.repo}#${work.prNumber}@${work.headSha}`;
+          const subjectKey = `gh:${work.owner}/${work.repo}#${work.prNumber}`;
+          const noticeBody = `PR ${work.owner}/${work.repo}#${work.prNumber} head ${work.headSha} is DIRTY`;
+          (deps.logger ?? log).warn(
+            {
+              messageId: claimed.id,
+              owner: work.owner,
+              repo: work.repo,
+              prNumber: work.prNumber,
+              headSha: work.headSha,
+              mergeStateStatus: 'DIRTY',
+            },
+            'overseer_review_pr_conflicting'
+          );
+          await deps.sendDispatchNotice({
+            idempotencyKey,
+            subjectKey,
+            body: noticeBody,
+          });
+          const conflictingDeferUntil = new Date(
+            Date.now() + CHECKS_PENDING_BACKOFF_MS
+          ).toISOString();
+          await deps.deferMessage({
+            id: claimed.id,
+            worker_id: REVIEW_WORKER_ID,
+            fencing_token: claimed.fencing_token,
+            defer_until: conflictingDeferUntil,
           });
           continue;
         }

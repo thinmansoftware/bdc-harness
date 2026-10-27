@@ -18,7 +18,7 @@ const CONFIG: ReviewRouteConfig = {
   reviewerIdentity: 'thinman-overseer[bot]',
 };
 
-function message(id: string, headSha = `head-${id}`): DispatchMessage {
+function message(id: string, headSha = `head-${id}`, prNumber = 730): DispatchMessage {
   return {
     id,
     correlation_id: `correlation-${id}`,
@@ -29,7 +29,7 @@ function message(id: string, headSha = `head-${id}`): DispatchMessage {
     body: JSON.stringify({
       owner: 'thinmansoftware',
       repo: 'bdc-harness',
-      prNumber: 730,
+      prNumber,
       headSha,
       baseRef: 'dev',
       author: 'contributor',
@@ -111,6 +111,7 @@ function fakeDeps(
     // calls the deferral by its WO name. It delegates to releaseMessage, so the
     // fencing guards asserted below are unchanged.
     deferMessage: mock(async () => null),
+    sendDispatchNotice: mock(async () => undefined),
     runAndSubmitReview: mock(async work => outcomeFor(work.messageId)),
     createSubmitDeps: mock(() => ({ reviewerIdentity: CONFIG.reviewerIdentity }) as SubmitDeps),
   };
@@ -265,6 +266,47 @@ describe('review worker clock', () => {
     ]);
     // A defer is not a terminal result.
     expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  test('names a DIRTY PR as pr_conflicting, notifies once, and defers', async () => {
+    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
+    const notices: Array<{ idempotencyKey: string; subjectKey: string; body: string }> = [];
+    const deps = fakeDeps([message('conflict', 'd4a35ab6', 1315)], () => ({
+      disposition: 'pr_conflicting',
+      reason: 'merge_state_dirty',
+    }));
+    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
+    deps.sendDispatchNotice = mock(async input => {
+      notices.push(input);
+    });
+
+    const before = Date.now();
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(warnings).toEqual([
+      expect.objectContaining({
+        message: 'overseer_review_pr_conflicting',
+        data: expect.objectContaining({
+          prNumber: 1315,
+          headSha: 'd4a35ab6',
+          mergeStateStatus: 'DIRTY',
+        }),
+      }),
+    ]);
+    expect(notices).toEqual([
+      {
+        idempotencyKey: 'pr-conflicting:thinmansoftware/bdc-harness#1315@d4a35ab6',
+        subjectKey: 'gh:thinmansoftware/bdc-harness#1315',
+        body: 'PR thinmansoftware/bdc-harness#1315 head d4a35ab6 is DIRTY',
+      },
+    ]);
+    expect(deps.deferMessage).toHaveBeenCalledTimes(1);
+    const deferArg = (deps.deferMessage as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+      defer_until: string;
+    };
+    expect(new Date(deferArg.defer_until).getTime()).toBeGreaterThan(before);
+    expect(deps.postResult).not.toHaveBeenCalled();
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
   });
 
   test('logs no_checks_reported when a checks-pending outcome has no names', async () => {
@@ -479,6 +521,7 @@ describe('invalid review work against isolated real SQLite', () => {
               return result;
             },
             runAndSubmitReview: async () => { reviews++; return { disposition: 'approved' }; },
+            sendDispatchNotice: async () => undefined,
             createSubmitDeps: () => { constructions++; return { reviewerIdentity: 'fixture-reviewer' }; },
           };
           await tickReviewWorkerClock({ webhookSecret: 'fixture', reviewerIdentity: 'fixture-reviewer' }, deps);

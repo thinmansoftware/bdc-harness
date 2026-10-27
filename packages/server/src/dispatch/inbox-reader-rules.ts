@@ -113,7 +113,9 @@ export function classifyInboxMessage(message: InboxMessage): InboxClassification
     }
     if (
       body.kind === 'pr_review_submit_receipt' &&
-      ['checks_pending', 'stale_head', 'superseded_head'].includes(String(body.disposition))
+      ['checks_pending', 'stale_head', 'superseded_head', 'pr_conflicting'].includes(
+        String(body.disposition)
+      )
     ) {
       return result(
         'INFO_DUPLICATE',

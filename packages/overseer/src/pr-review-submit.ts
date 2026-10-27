@@ -25,6 +25,7 @@ import { hasDistinctMergeIdentity } from './adapters/github-real-deps';
 import { classifyRateLimitError } from './github-rate-limit';
 import { resolveMergeManagerMode } from './merge-manager';
 import type { IndependentReviewFinding } from './independent-review-evidence.ts';
+import type { PullRequestMergeability } from './pr-review-ingest.ts';
 import {
   decideRemediation,
   type RemediationCandidateBody,
@@ -162,7 +163,14 @@ export type SubmitDisposition =
    * transport failure only has a fixed backoff, and the two are worth telling
    * apart in the receipt when diagnosing why a review did not land.
    */
-  | 'rate_limited';
+  | 'rate_limited'
+  /**
+   * NON-TERMINAL. GitHub reports mergeStateStatus DIRTY (mergeable CONFLICTING)
+   * for the PR under review. No reviewer runs and nothing is submitted. The
+   * worker names the PR, sends one operator notice, and defers the claim so
+   * the same head is re-evaluated after the branch incorporates the base.
+   */
+  | 'pr_conflicting';
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
@@ -220,6 +228,18 @@ export interface SubmitDeps {
    * must never land on a head the reviewer did not examine.
    */
   currentHeadSha(input: { owner: string; repo: string; prNumber: number }): Promise<string>;
+  /**
+   * Live GitHub mergeability via `pulls.get`. Optional so existing dependency
+   * doubles keep compiling. A lookup throw is ignored. `mergeableState` equal
+   * to `dirty` in any letter case finishes as `pr_conflicting` before the
+   * reviewer runs. Any other value, including `unknown` or a missing
+   * dependency, keeps the previous review path.
+   */
+  fetchPullRequestMergeability?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+  }): Promise<PullRequestMergeability>;
   recordReceipt(input: {
     correlationId: string;
     messageId: string;
@@ -344,6 +364,28 @@ export async function runAndSubmitReview(
       disposition: 'merge_custody_conflict',
       reason: 'merge_manager_shares_reviewer_identity_m153',
     });
+  }
+
+  // DIRTY: a content conflict with the current base. Reviewing this head
+  // cannot make the PR mergeable. A fetch error is not evidence of a conflict.
+  if (deps.fetchPullRequestMergeability) {
+    let mergeableState: string | undefined;
+    try {
+      const live = await deps.fetchPullRequestMergeability({
+        owner: work.owner,
+        repo: work.repo,
+        prNumber: work.prNumber,
+      });
+      mergeableState = live.mergeableState;
+    } catch {
+      // Ignore. `unknown` and a failed lookup both continue into review.
+    }
+    if (mergeableState?.toLowerCase() === 'dirty') {
+      return finish(deps, work, work.headSha, {
+        disposition: 'pr_conflicting',
+        reason: 'merge_state_dirty',
+      });
+    }
   }
 
   let verdict: ReviewerVerdict;

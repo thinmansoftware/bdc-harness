@@ -3464,6 +3464,68 @@ nodes:
       if [ "$CHANGED" -gt 0 ]; then
         echo "SALVAGE=preserved_uncommitted:${CHANGED}"
       fi
+      # Node isolation: bash nodes do not share function definitions. This bdc_base_merge_first body must match the marked definition.
+      bdc_base_merge_first() {
+        local base="${1:-}"
+        local paths="" head="" pr_number="" repo=""
+        case "$base" in
+          ''|*' '*)
+            echo "ERROR: base_merge_failed: invalid base name" >&2
+            return 1
+            ;;
+        esac
+        if ! git check-ref-format --branch "$base" >/dev/null 2>&1; then
+          echo "ERROR: base_merge_failed: invalid base name" >&2
+          return 1
+        fi
+        if [ -z "${ARTIFACTS_DIR:-}" ]; then
+          echo "ERROR: base_merge_failed: ARTIFACTS_DIR is required" >&2
+          return 1
+        fi
+        mkdir -p "$ARTIFACTS_DIR" || {
+          echo "ERROR: base_merge_failed: ARTIFACTS_DIR is not writable" >&2
+          return 1
+        }
+        rm -f "$ARTIFACTS_DIR/base-merge-conflict.txt"
+        if ! git fetch origin "$base"; then
+          echo "ERROR: base_merge_fetch_failed: could not fetch origin/${base}" >&2
+          return 1
+        fi
+        if ! git merge --no-ff --no-edit "origin/${base}"; then
+          paths="$(git diff --name-only --diff-filter=U 2>/dev/null | awk 'NR > 1 { printf "," } { printf "%s", $0 }' || true)"
+          if git rev-parse --verify --quiet MERGE_HEAD >/dev/null 2>&1; then
+            if ! git merge --abort; then
+              echo "ERROR: base_merge_failed: merge abort failed" >&2
+              return 1
+            fi
+          fi
+          if [ -n "$paths" ]; then
+            printf 'base_merge_conflict=%s\n' "$paths" > "$ARTIFACTS_DIR/base-merge-conflict.txt"
+            printf 'base_merge_conflict=%s\n' "$paths"
+            pr_number="${REPAIR_TARGET_PR:-${PR_NUMBER:-}}"
+            if [ -n "$pr_number" ] && command -v gh >/dev/null 2>&1; then
+              repo="${REPO:-}"
+              if [ -z "$repo" ]; then
+                repo="$(git config --get remote.origin.url 2>/dev/null | sed -E 's#.*github.com[:/]##; s#\.git$##' || true)"
+              fi
+              if [ -n "$repo" ]; then
+                gh pr comment "$pr_number" --repo "$repo" --body "base_merge_conflict=${paths}" >/dev/null 2>&1 || true
+              fi
+            fi
+            echo "ERROR: base_merge_conflict" >&2
+            return 1
+          fi
+          echo "ERROR: base_merge_failed" >&2
+          return 1
+        fi
+        head="$(git rev-parse HEAD)"
+        printf '%s\n' "$head" > "$ARTIFACTS_DIR/base-merged-sha.txt"
+        export base_merged_sha="$head"
+        printf 'base_merged_sha=%s\n' "$head"
+        return 0
+      }
+
+      bdc_base_merge_first "${BASE_BRANCH:-dev}" || exit 1
       if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
         REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
         PR_URL=$(gh pr create --repo "$REPO" --head "$BR" --base "${BASE_BRANCH:-dev}" \
@@ -4304,6 +4366,117 @@ nodes:
         git commit -m "$COMMIT_MESSAGE"
       fi
 
+      # ---- BEGIN base-merge-first ----
+      # Merge origin/<base> into HEAD before push. Merge commit only.
+      # A conflict aborts, records paths, and returns nonzero before any push.
+      bdc_base_merge_first() {
+        local base="${1:-}"
+        local paths="" head="" pr_number="" repo=""
+        case "$base" in
+          ''|*' '*)
+            echo "ERROR: base_merge_failed: invalid base name" >&2
+            return 1
+            ;;
+        esac
+        if ! git check-ref-format --branch "$base" >/dev/null 2>&1; then
+          echo "ERROR: base_merge_failed: invalid base name" >&2
+          return 1
+        fi
+        if [ -z "${ARTIFACTS_DIR:-}" ]; then
+          echo "ERROR: base_merge_failed: ARTIFACTS_DIR is required" >&2
+          return 1
+        fi
+        mkdir -p "$ARTIFACTS_DIR" || {
+          echo "ERROR: base_merge_failed: ARTIFACTS_DIR is not writable" >&2
+          return 1
+        }
+        rm -f "$ARTIFACTS_DIR/base-merge-conflict.txt"
+        if ! git fetch origin "$base"; then
+          echo "ERROR: base_merge_fetch_failed: could not fetch origin/${base}" >&2
+          return 1
+        fi
+        if ! git merge --no-ff --no-edit "origin/${base}"; then
+          paths="$(git diff --name-only --diff-filter=U 2>/dev/null | awk 'NR > 1 { printf "," } { printf "%s", $0 }' || true)"
+          if git rev-parse --verify --quiet MERGE_HEAD >/dev/null 2>&1; then
+            if ! git merge --abort; then
+              echo "ERROR: base_merge_failed: merge abort failed" >&2
+              return 1
+            fi
+          fi
+          if [ -n "$paths" ]; then
+            printf 'base_merge_conflict=%s\n' "$paths" > "$ARTIFACTS_DIR/base-merge-conflict.txt"
+            printf 'base_merge_conflict=%s\n' "$paths"
+            pr_number="${REPAIR_TARGET_PR:-${PR_NUMBER:-}}"
+            if [ -n "$pr_number" ] && command -v gh >/dev/null 2>&1; then
+              repo="${REPO:-}"
+              if [ -z "$repo" ]; then
+                repo="$(git config --get remote.origin.url 2>/dev/null | sed -E 's#.*github.com[:/]##; s#\.git$##' || true)"
+              fi
+              if [ -n "$repo" ]; then
+                gh pr comment "$pr_number" --repo "$repo" --body "base_merge_conflict=${paths}" >/dev/null 2>&1 || true
+              fi
+            fi
+            echo "ERROR: base_merge_conflict" >&2
+            return 1
+          fi
+          echo "ERROR: base_merge_failed" >&2
+          return 1
+        fi
+        head="$(git rev-parse HEAD)"
+        printf '%s\n' "$head" > "$ARTIFACTS_DIR/base-merged-sha.txt"
+        export base_merged_sha="$head"
+        printf 'base_merged_sha=%s\n' "$head"
+        return 0
+      }
+
+      bdc_run_changed_paths() {
+        local merged="" start=""
+        if [ -n "${ARTIFACTS_DIR:-}" ] && [ -s "${ARTIFACTS_DIR}/base-merged-sha.txt" ]; then
+          merged="$(tr -d '[:space:]' < "${ARTIFACTS_DIR}/base-merged-sha.txt")"
+        fi
+        if [ -n "$merged" ] && git rev-parse --verify --quiet "${merged}^2^{commit}" >/dev/null 2>&1; then
+          git diff --name-only "${merged}^2" HEAD
+          return $?
+        fi
+        if [ -n "${ARTIFACTS_DIR:-}" ] && [ -s "${ARTIFACTS_DIR}/run-start-sha.txt" ]; then
+          start="$(tr -d '[:space:]' < "${ARTIFACTS_DIR}/run-start-sha.txt")"
+        fi
+        if [ -z "$start" ]; then
+          echo "ERROR: base_merge_failed: run-start-sha missing" >&2
+          return 1
+        fi
+        git diff --name-only "$start" HEAD
+      }
+      # ---- END base-merge-first ----
+
+      # Resolve the base branch before push. Override, then staging, otherwise the lane base.
+      INCOMING_BASE="${BASE_BRANCH:-dev}"
+      STAGING_GATE=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
+      BASE_BRANCH_OVERRIDE=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      STAGING_GATE="${STAGING_GATE:-0}"
+      if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
+        case "$BASE_BRANCH_OVERRIDE" in
+          unknown|UNKNOWN|"<"*">"*|*"e.g."*)
+            echo "ERROR: decide-push-target emitted an invalid base_branch_override value: ${BASE_BRANCH_OVERRIDE}" >&2
+            exit 1
+            ;;
+        esac
+        if printf '%s' "$BASE_BRANCH_OVERRIDE" | grep -q '[[:space:]]'; then
+          echo "ERROR: decide-push-target emitted an invalid base_branch_override value with whitespace: ${BASE_BRANCH_OVERRIDE}" >&2
+          exit 1
+        fi
+        if ! git check-ref-format --branch "$BASE_BRANCH_OVERRIDE" >/dev/null 2>&1; then
+          echo "ERROR: decide-push-target emitted an invalid base branch override ref name: ${BASE_BRANCH_OVERRIDE}" >&2
+          exit 1
+        fi
+        MERGE_BASE="$BASE_BRANCH_OVERRIDE"
+      elif [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
+        MERGE_BASE="staging"
+      else
+        MERGE_BASE="$INCOMING_BASE"
+      fi
+      bdc_base_merge_first "$MERGE_BASE" || exit 1
+
       # WO-169: real retry guard. 3 attempts, 5s/10s/15s backoff, fail closed.
       # No `|| echo 'STATUS=*_failed'` swallow -- this node is load_bearing.
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: push via refspec
@@ -4403,6 +4576,67 @@ nodes:
         exit 1
       fi
       REPAIR_TARGET_LEASE_SHA=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1)
+
+      # Node isolation: bash nodes do not share function definitions. This bdc_base_merge_first body must match the marked definition.
+      bdc_base_merge_first() {
+        local base="${1:-}"
+        local paths="" head="" pr_number="" repo=""
+        case "$base" in
+          ''|*' '*)
+            echo "ERROR: base_merge_failed: invalid base name" >&2
+            return 1
+            ;;
+        esac
+        if ! git check-ref-format --branch "$base" >/dev/null 2>&1; then
+          echo "ERROR: base_merge_failed: invalid base name" >&2
+          return 1
+        fi
+        if [ -z "${ARTIFACTS_DIR:-}" ]; then
+          echo "ERROR: base_merge_failed: ARTIFACTS_DIR is required" >&2
+          return 1
+        fi
+        mkdir -p "$ARTIFACTS_DIR" || {
+          echo "ERROR: base_merge_failed: ARTIFACTS_DIR is not writable" >&2
+          return 1
+        }
+        rm -f "$ARTIFACTS_DIR/base-merge-conflict.txt"
+        if ! git fetch origin "$base"; then
+          echo "ERROR: base_merge_fetch_failed: could not fetch origin/${base}" >&2
+          return 1
+        fi
+        if ! git merge --no-ff --no-edit "origin/${base}"; then
+          paths="$(git diff --name-only --diff-filter=U 2>/dev/null | awk 'NR > 1 { printf "," } { printf "%s", $0 }' || true)"
+          if git rev-parse --verify --quiet MERGE_HEAD >/dev/null 2>&1; then
+            if ! git merge --abort; then
+              echo "ERROR: base_merge_failed: merge abort failed" >&2
+              return 1
+            fi
+          fi
+          if [ -n "$paths" ]; then
+            printf 'base_merge_conflict=%s\n' "$paths" > "$ARTIFACTS_DIR/base-merge-conflict.txt"
+            printf 'base_merge_conflict=%s\n' "$paths"
+            pr_number="${REPAIR_TARGET_PR:-${PR_NUMBER:-}}"
+            if [ -n "$pr_number" ] && command -v gh >/dev/null 2>&1; then
+              repo="${REPO:-}"
+              if [ -z "$repo" ]; then
+                repo="$(git config --get remote.origin.url 2>/dev/null | sed -E 's#.*github.com[:/]##; s#\.git$##' || true)"
+              fi
+              if [ -n "$repo" ]; then
+                gh pr comment "$pr_number" --repo "$repo" --body "base_merge_conflict=${paths}" >/dev/null 2>&1 || true
+              fi
+            fi
+            echo "ERROR: base_merge_conflict" >&2
+            return 1
+          fi
+          echo "ERROR: base_merge_failed" >&2
+          return 1
+        fi
+        head="$(git rev-parse HEAD)"
+        printf '%s\n' "$head" > "$ARTIFACTS_DIR/base-merged-sha.txt"
+        export base_merged_sha="$head"
+        printf 'base_merged_sha=%s\n' "$head"
+        return 0
+      }
       # WO-HARNESS-OPEN-PR-ORIGIN-WAIT-01: tolerate delayed origin visibility,
       # then re-push and re-verify before failing the PR-open precondition.
       LOCAL_HEAD="$(git rev-parse HEAD)"
@@ -4422,6 +4656,43 @@ nodes:
       }
 
       if ! wait_match; then
+        # Repeat decide-push-target base resolution before the origin re-push.
+        REPO=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^repo: //p' | head -n 1)
+        if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
+          echo "ERROR: decide-push-target did not emit a valid 'repo: <owner>/<repo>'." >&2
+          echo "Fix the spec to include 'target_repo:' or '**Target repo:**' and re-run." >&2
+          exit 1
+        fi
+        INCOMING_BASE="${BASE_BRANCH:-dev}"
+        STAGING_GATE=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' 2>/dev/null || true)
+        BASE_BRANCH_OVERRIDE=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        STAGING_GATE="${STAGING_GATE:-0}"
+        if [ -n "$BASE_BRANCH_OVERRIDE" ]; then
+          case "$BASE_BRANCH_OVERRIDE" in
+            unknown|UNKNOWN|"<"*">"*|*"e.g."*)
+              echo "ERROR: decide-push-target emitted an invalid base_branch_override value: ${BASE_BRANCH_OVERRIDE}" >&2
+              exit 1
+              ;;
+          esac
+          if printf '%s' "$BASE_BRANCH_OVERRIDE" | grep -q '[[:space:]]'; then
+            echo "ERROR: decide-push-target emitted an invalid base_branch_override value with whitespace: ${BASE_BRANCH_OVERRIDE}" >&2
+            exit 1
+          fi
+          if ! git check-ref-format --branch "$BASE_BRANCH_OVERRIDE" >/dev/null 2>&1; then
+            echo "ERROR: decide-push-target emitted an invalid base branch override ref name: ${BASE_BRANCH_OVERRIDE}" >&2
+            exit 1
+          fi
+          if ! git ls-remote --exit-code "https://github.com/${REPO}.git" "refs/heads/${BASE_BRANCH_OVERRIDE}" >/dev/null 2>&1; then
+            echo "ERROR: base branch override ${BASE_BRANCH_OVERRIDE} does not exist on ${REPO}; refusing to open PR against an unverified base." >&2
+            exit 1
+          fi
+          MERGE_BASE="$BASE_BRANCH_OVERRIDE"
+        elif [ "$STAGING_GATE" -ge 1 ] 2>/dev/null; then
+          MERGE_BASE="staging"
+        else
+          MERGE_BASE="$INCOMING_BASE"
+        fi
+        bdc_base_merge_first "$MERGE_BASE" || exit 1
         echo "WARN: origin still missing/mismatched after wait -- re-pushing HEAD:${UNIQUE_BRANCH}" >&2
         PUSH_OK=false
         for attempt in 1 2 3; do

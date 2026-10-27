@@ -32,17 +32,26 @@ const WORK: ReviewWorkItem = {
 interface Recorded {
   submitted: Parameters<SubmitDeps['submitReview']>[0][];
   receipts: Parameters<SubmitDeps['recordReceipt']>[0][];
+  reviewerCalls: number;
 }
 
 function makeDeps(overrides: Partial<SubmitDeps> = {}): { deps: SubmitDeps; rec: Recorded } {
-  const rec: Recorded = { submitted: [], receipts: [] };
+  const rec: Recorded = { submitted: [], receipts: [], reviewerCalls: 0 };
+  const runReviewer: SubmitDeps['runReviewer'] = overrides.runReviewer
+    ? async work => {
+        rec.reviewerCalls += 1;
+        return overrides.runReviewer!(work);
+      }
+    : async () => {
+        rec.reviewerCalls += 1;
+        return {
+          approved: true,
+          summary: 'All stop conditions verified.',
+          reviewedHeadSha: HEAD,
+        };
+      };
   const deps: SubmitDeps = {
     reviewerIdentity: REVIEWER,
-    runReviewer: async () => ({
-      approved: true,
-      summary: 'All stop conditions verified.',
-      reviewedHeadSha: HEAD,
-    }),
     submitReview: async input => {
       rec.submitted.push(input);
       return { submitted: true };
@@ -52,6 +61,7 @@ function makeDeps(overrides: Partial<SubmitDeps> = {}): { deps: SubmitDeps; rec:
       rec.receipts.push(input);
     },
     ...overrides,
+    runReviewer,
   };
   return { deps, rec };
 }
@@ -530,5 +540,53 @@ describe('buildReviewBody', () => {
       reviewedHeadSha: HEAD,
     });
     expect(body.length).toBeLessThanOrEqual(60_000);
+  });
+});
+
+describe('pr_conflicting', () => {
+  test.each(['dirty', 'DIRTY', 'Dirty'])(
+    'mergeableState %s finishes pr_conflicting without review or submit',
+    async state => {
+      const { deps, rec } = makeDeps({
+        fetchPullRequestMergeability: async () => ({ mergeableState: state }),
+      });
+      const outcome = await runAndSubmitReview(WORK, deps);
+      expect(outcome.disposition).toBe('pr_conflicting');
+      expect(outcome.reason).toBe('merge_state_dirty');
+      expect(rec.reviewerCalls).toBe(0);
+      expect(rec.submitted).toHaveLength(0);
+      expect(rec.receipts[0]?.disposition).toBe('pr_conflicting');
+    }
+  );
+
+  test('unknown mergeableState continues to approval', async () => {
+    const { deps, rec } = makeDeps({
+      fetchPullRequestMergeability: async () => ({ mergeableState: 'unknown' }),
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('approved');
+    expect(rec.reviewerCalls).toBe(1);
+    expect(rec.submitted).toHaveLength(1);
+  });
+
+  test('a missing mergeability dependency continues to approval', async () => {
+    const { deps, rec } = makeDeps();
+    expect(deps.fetchPullRequestMergeability).toBeUndefined();
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('approved');
+    expect(rec.reviewerCalls).toBe(1);
+    expect(rec.submitted).toHaveLength(1);
+  });
+
+  test('a thrown mergeability lookup continues to approval', async () => {
+    const { deps, rec } = makeDeps({
+      fetchPullRequestMergeability: async () => {
+        throw new Error('github down');
+      },
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('approved');
+    expect(rec.reviewerCalls).toBe(1);
+    expect(rec.submitted).toHaveLength(1);
   });
 });
