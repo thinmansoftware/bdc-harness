@@ -34,7 +34,10 @@
  *              (fail-closed; the fix must NOT fail-open).
  */
 
-import { afterEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { ghPrListForBranchDefault, pollForTerminal } from '../poll.js';
 import { judgeGate } from '../judge.js';
@@ -43,9 +46,19 @@ import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import type { FireResult } from '../types.js';
 
 const originalFetch = globalThis.fetch;
+let cascadeDirectory = '';
+
+beforeEach(() => {
+  cascadeDirectory = mkdtempSync(join(tmpdir(), 'smart-cauldron-1502-'));
+});
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  // Own fixture only: never reuse or remove another run's C:\tmp lock on Windows.
+  if (!cascadeDirectory.startsWith(join(tmpdir(), 'smart-cauldron-1502-'))) {
+    throw new Error('Invalid cascade fixture directory');
+  }
+  rmSync(cascadeDirectory, { recursive: true, force: true });
 });
 
 // A completed-run API response carrying the given events.
@@ -324,7 +337,7 @@ function baseOpts(deps: CascadeDeps): RunCascadeOptions {
     woId: 'WO-TEST-1502-PR-DETECTION-REGRESSION',
     woClass: 'CODE',
     tags: ['mechanical'],
-    outDir: '/tmp/smart-cauldron-1502-test-runs',
+    outDir: cascadeDirectory,
     token: 'test-token',
     project: 'lspro-react',
     deps,
