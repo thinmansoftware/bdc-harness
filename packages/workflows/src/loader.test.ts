@@ -3,6 +3,17 @@ import { mkdir, writeFile, rm } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
+// dag-executor.test.ts may already have cached a logger bridge in this process.
+// Point that bridge at this file's mockLogger before each test so warn
+// assertions observe this mock. Absent when this file runs alone.
+const WORKFLOW_TEST_LOGGER_SLOT = '__archonWorkflowTestLoggerSlot';
+
+function adoptWorkflowTestLogger(logger: object): void {
+  const bag = globalThis as unknown as Record<string, { current: object } | undefined>;
+  const slot = bag[WORKFLOW_TEST_LOGGER_SLOT];
+  if (slot) slot.current = logger;
+}
+
 const isWindows = process.platform === 'win32';
 
 // Inline mock logger to suppress noisy output during tests
@@ -25,7 +36,13 @@ const mockLogger = {
 const realArchonPaths = await import('@archon/paths');
 mock.module('@archon/paths', () => ({
   ...realArchonPaths,
-  createLogger: mock(() => mockLogger),
+  createLogger: mock(() => {
+    const bag = globalThis as unknown as Record<string, { bridge?: typeof mockLogger } | undefined>;
+    const bridge = bag[WORKFLOW_TEST_LOGGER_SLOT]?.bridge;
+    // Same object dag-executor.test.ts caches, so this file's beforeEach
+    // can retarget warn() without a production logger-cache reset.
+    return bridge ?? mockLogger;
+  }),
 }));
 
 // Bootstrap provider registry (needed by isRegisteredProvider checks at load time)
@@ -42,6 +59,10 @@ import { discoverWorkflows } from './workflow-discovery';
 import { getLoaderErrors, parseWorkflow } from './loader';
 import { isBashNode, isCancelNode, isLoopNode } from './schemas';
 import * as bundledDefaults from './defaults/bundled-defaults';
+
+beforeEach(() => {
+  adoptWorkflowTestLogger(mockLogger);
+});
 
 describe('Workflow Loader', () => {
   let testDir: string;
