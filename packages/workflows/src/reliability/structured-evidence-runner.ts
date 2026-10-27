@@ -2182,10 +2182,13 @@ export function selectStagesBlock(
 }
 
 const YAML_TO_JSON = `
-import json, os, sys, site
+import json, os, sys
 
 # Drop empty sys.path entries (python -c searches cwd) and the parser cwd
 # before import. A product-worktree yaml.py must not satisfy "import yaml".
+# python3 -I already omits the user site. Never put it back: user-site
+# packages are user-writable, so importing yaml from there executes
+# untrusted code. Fail closed when the trusted interpreter has no PyYAML.
 _cwd = os.path.abspath(os.getcwd())
 _kept = []
 for _entry in sys.path:
@@ -2198,25 +2201,8 @@ sys.path[:] = _kept
 try:
     import yaml
 except ImportError:
-    # python3 -I hides user-site packages. Re-add only an absolute user site
-    # that is not the parser cwd and is not a relative entry.
-    yaml = None
-    user_site = site.getusersitepackages()
-    if (
-        isinstance(user_site, str)
-        and user_site
-        and os.path.isabs(user_site)
-        and os.path.isdir(user_site)
-        and os.path.abspath(user_site) != _cwd
-    ):
-        sys.path.append(os.path.abspath(user_site))
-        try:
-            import yaml
-        except ImportError:
-            yaml = None
-    if yaml is None:
-        sys.stderr.write("FAIL: python yaml module unavailable; cannot parse stages.\\n")
-        sys.exit(1)
+    sys.stderr.write("FAIL: python yaml module unavailable; cannot parse stages.\\n")
+    sys.exit(1)
 text = open(sys.argv[1], encoding="utf-8").read()
 try:
     data = yaml.safe_load(text)

@@ -134,6 +134,19 @@ function oneStage(id: string, repo: string, command: string, branch = 'dev'): st
   ].join('\n');
 }
 
+let systemYamlProbe: boolean | undefined;
+
+function systemPyYamlAvailable(): boolean {
+  if (systemYamlProbe !== undefined) return systemYamlProbe;
+  const python = existsSync('/usr/bin/python3') ? '/usr/bin/python3' : 'python3';
+  const result = spawnSync(python, ['-I', '-c', 'import yaml'], {
+    encoding: 'utf8',
+    env: { PATH: '/usr/bin:/bin' },
+  });
+  systemYamlProbe = result.status === 0;
+  return systemYamlProbe;
+}
+
 describe('quoted-argv-historical-replays', () => {
   it('keeps quoted historical tokens literal and does not split an in-quote pipe', () => {
     const samples = [
@@ -508,13 +521,19 @@ describe('canonical-stage-authority', () => {
     const shop = oneStage('api', 'thinmansoftware/shopops', 'bash ./api.sh');
     const web = oneStage('web', 'thinmansoftware/lspro', 'bash ./web.sh');
     const marked = `<!-- canonical-stages -->\n\`\`\`yaml\n${stageBody(`${shop}\n${web}`)}\n\`\`\`\n`;
+    const yamlReady = systemPyYamlAvailable();
     const selected = scopeEvidence(marked, { repo: 'thinmansoftware/shopops' });
-    expect(selected.ok).toBe(true);
-    if (selected.ok) {
-      expect(selected.scope.stageId).toBe('api');
-      expect(selected.scope.commands).toEqual(['bash ./api.sh']);
-      expect(selected.scope.otherStage).toEqual(['bash ./web.sh']);
-      expect(selected.scope.unresolved).toBe(false);
+    if (!yamlReady) {
+      expect(selected.ok).toBe(false);
+      if (!selected.ok) expect(selected.message).toContain('python yaml module unavailable');
+    } else {
+      expect(selected.ok).toBe(true);
+      if (selected.ok) {
+        expect(selected.scope.stageId).toBe('api');
+        expect(selected.scope.commands).toEqual(['bash ./api.sh']);
+        expect(selected.scope.otherStage).toEqual(['bash ./web.sh']);
+        expect(selected.scope.unresolved).toBe(false);
+      }
     }
     const dup = scopeEvidence(
       `\`\`\`yaml\n${stageBody(`${shop}\n${oneStage('api', 'thinmansoftware/other', 'bash ./x.sh')}`)}\n\`\`\`\n`,
@@ -538,16 +557,23 @@ describe('canonical-stage-authority', () => {
       repo: 'thinmansoftware/lspro',
     });
     expect(crossRepo.ok).toBe(false);
-    if (!crossRepo.ok) expect(crossRepo.message).toContain('repo');
+    if (!crossRepo.ok) {
+      expect(crossRepo.message).toContain(yamlReady ? 'repo' : 'python yaml module unavailable');
+    }
     const bound = scopeEvidence(marked, {
       stageId: 'web',
       repo: 'git@github.com:thinmansoftware/lspro.git',
     });
-    expect(bound.ok).toBe(true);
-    if (bound.ok) {
-      expect(bound.scope.stageId).toBe('web');
-      expect(bound.scope.commands).toEqual(['bash ./web.sh']);
-      expect(bound.scope.otherStage).toEqual(['bash ./api.sh']);
+    if (!yamlReady) {
+      expect(bound.ok).toBe(false);
+      if (!bound.ok) expect(bound.message).toContain('python yaml module unavailable');
+    } else {
+      expect(bound.ok).toBe(true);
+      if (bound.ok) {
+        expect(bound.scope.stageId).toBe('web');
+        expect(bound.scope.commands).toEqual(['bash ./web.sh']);
+        expect(bound.scope.otherStage).toEqual(['bash ./api.sh']);
+      }
     }
     const none = scopeEvidence('WO Class: CODE\n', {});
     expect(none.ok).toBe(true);
@@ -583,6 +609,12 @@ describe('canonical-stage-authority', () => {
       env,
       encoding: 'utf8',
     });
+    if (!systemPyYamlAvailable()) {
+      expect(scoped.status).toBe(3);
+      expect(scoped.stderr ?? '').toContain('python yaml module unavailable');
+      rmSync(cwd, { recursive: true, force: true });
+      return;
+    }
     expect(scoped.status).toBe(0);
     expect(scoped.stdout).toContain('OTHER_STAGE=bash ./web.sh');
     expect(scoped.stdout).toContain('COMMAND=bash ./api.sh');
@@ -760,7 +792,12 @@ describe('canonical-stage-authority', () => {
       expect(existsSync(recordedCwd)).toBe(false);
       expect(process.env.BDC_PARSER_SECRET).toBe(secret);
       expect(process.env.CLAUDE_API_KEY).toBe('bdc-claude-round12');
-      expect({ ok: parsedOk, error: parseError }).toEqual({ ok: true, error: '' });
+      if (systemPyYamlAvailable()) {
+        expect({ ok: parsedOk, error: parseError }).toEqual({ ok: true, error: '' });
+      } else {
+        expect(parsedOk).toBe(false);
+        expect(parseError).toContain('python yaml module unavailable');
+      }
     } finally {
       process.chdir(previousCwd);
       for (const key of envKeys) {
@@ -769,6 +806,133 @@ describe('canonical-stage-authority', () => {
         else process.env[key] = value;
       }
       rmSync(cwd, { recursive: true, force: true });
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a hostile user-site yaml when system PyYAML is unavailable', () => {
+    const cwd = tempDir('ser-yaml-usersite-cwd-');
+    const home = tempDir('ser-yaml-usersite-home-');
+    const shimDir = tempDir('ser-yaml-usersite-shim-');
+    const sentinel = join(cwd, 'user-site-yaml-sentinel');
+    const argvLog = join(cwd, 'argv.log');
+    const savedPath = process.env.PATH;
+    try {
+      const probedPython = spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], {
+        encoding: 'utf8',
+      });
+      if (probedPython.status !== 0 || !probedPython.stdout) {
+        throw new Error(probedPython.stderr || 'python3 executable probe failed');
+      }
+      const realPython = probedPython.stdout.trim();
+      const probedSite = spawnSync(
+        realPython,
+        ['-I', '-c', 'import site; print(site.getusersitepackages())'],
+        { encoding: 'utf8', env: { HOME: home, PATH: '/usr/bin:/bin' } }
+      );
+      if (probedSite.status !== 0 || !probedSite.stdout.trim()) {
+        throw new Error(probedSite.stderr || 'user site probe failed');
+      }
+      const userSite = probedSite.stdout.trim();
+      expect(userSite.startsWith(`${home}/`)).toBe(true);
+      mkdirSync(userSite, { recursive: true });
+      writeFileSync(
+        join(userSite, 'yaml.py'),
+        [
+          'import os',
+          `sentinel = ${JSON.stringify(sentinel)}`,
+          'handle = open(sentinel, "w")',
+          'handle.write("imported\\n")',
+          'handle.close()',
+          'def safe_load(text):',
+          '    return {',
+          '        "stages": [{',
+          '            "id": "pwned",',
+          '            "repo": "evil/evil",',
+          '            "target_branch": "dev",',
+          '            "in_scope_files": ["README"],',
+          '            "verify_commands": ["bash ./pwned.sh"],',
+          '            "readiness_bar": {',
+          '                "pr_open": True,',
+          '                "ci_green": True,',
+          '                "diff_review_clean": True,',
+          '                "mergeable": True,',
+          '            },',
+          '        }]',
+          '    }',
+          '',
+        ].join('\n')
+      );
+      const wrapper = join(shimDir, 'hide-system-yaml.py');
+      writeFileSync(
+        wrapper,
+        [
+          'import os, sys',
+          '',
+          'def entry_has_yaml(entry):',
+          '    if not entry or not os.path.isdir(entry):',
+          '        return False',
+          '    if os.path.isfile(os.path.join(entry, "yaml.py")):',
+          '        return True',
+          '    return os.path.isdir(os.path.join(entry, "yaml"))',
+          '',
+          'args = sys.argv[1:]',
+          'script = None',
+          'file_arg = None',
+          'index = 0',
+          'while index < len(args):',
+          '    arg = args[index]',
+          '    if arg == "-c" and index + 1 < len(args):',
+          '        script = args[index + 1]',
+          '        index += 2',
+          '        continue',
+          '    if arg.startswith("-"):',
+          '        index += 1',
+          '        continue',
+          '    file_arg = arg',
+          '    index += 1',
+          'if script is None or file_arg is None:',
+          '    sys.stderr.write("FAIL: parser wrapper missing -c script\\n")',
+          '    sys.exit(2)',
+          '# Drop trusted PyYAML so this case is "system module unavailable".',
+          '# Leave the user site off sys.path; python -I already omitted it.',
+          'sys.path[:] = [entry for entry in sys.path if not entry_has_yaml(entry)]',
+          'sys.argv = ["-c", file_arg]',
+          'exec(compile(script, "<stages-parser>", "exec"), {"__name__": "__main__"})',
+          '',
+        ].join('\n')
+      );
+      writeExec(
+        join(shimDir, 'python3'),
+        [
+          '#!/bin/sh',
+          `HOME='${home}'`,
+          'export HOME',
+          `ARGV_LOG='${argvLog}'`,
+          `REAL_PYTHON='${realPython}'`,
+          `WRAPPER='${wrapper}'`,
+          ': > "$ARGV_LOG"',
+          'for arg in "$@"; do',
+          '  printf \'%s\\0\' "$arg" >> "$ARGV_LOG"',
+          'done',
+          'exec "$REAL_PYTHON" -I "$WRAPPER" "$@"',
+          '',
+        ].join('\n')
+      );
+      process.env.PATH = `${shimDir}:${savedPath ?? ''}`;
+      const parsed = parseStagesYaml(
+        stageBody(oneStage('api', 'thinmansoftware/shopops', 'bash ./ok.sh'))
+      );
+      expect(existsSync(sentinel)).toBe(false);
+      expect(parsed.ok).toBe(false);
+      if (!parsed.ok) expect(parsed.message).toContain('python yaml module unavailable');
+      const argvItems = readFileSync(argvLog).toString('utf8').split('\0');
+      expect(argvItems).toContain('-I');
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true });
       rmSync(shimDir, { recursive: true, force: true });
     }
   });
