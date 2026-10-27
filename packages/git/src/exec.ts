@@ -50,6 +50,11 @@ export interface OwnedGroupExecOptions {
    * await. The pid is the process-group id on POSIX detached spawn.
    */
   onSpawn?: (pgid: number) => void;
+  /**
+   * Called after the owned group has exited, including a timeout whose tree
+   * was ended. Not called when the tree survives (treeSurvived).
+   */
+  onExit?: (pgid: number) => void;
 }
 
 export interface OwnedGroupExecResult {
@@ -83,6 +88,15 @@ export function isTreeSurvivedError(err: unknown): err is TreeSurvivedError {
     err !== null &&
     (err as { treeSurvived?: unknown }).treeSurvived === true
   );
+}
+
+function notifyOwnedExit(options: OwnedGroupExecOptions, pid: number): void {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  try {
+    options.onExit?.(pid);
+  } catch {
+    // Retirement must not replace the command result.
+  }
 }
 
 function treeSurvivedError(pid: number): TreeSurvivedError {
@@ -245,6 +259,9 @@ export async function execOwnedProcessGroup(
       finish(() => {
         try {
           const pgid = knownPid > 0 ? knownPid : (child.pid ?? -1);
+          // Retire only after the group is gone. A background child keeps the
+          // group alive after the root closes, and teardown still owns it.
+          if (pgid > 0 && !processGroupExists(pgid)) notifyOwnedExit(options, pgid);
           resolve(settleOwnedClose(cmd, pgid, { code, signal }, snapshot(), maxBuffer));
         } catch (err) {
           reject(err instanceof Error ? err : new Error(String(err)));
@@ -266,8 +283,10 @@ export async function execOwnedProcessGroup(
       void (async (): Promise<void> => {
         try {
           await endProcessGroup(pid);
+          notifyOwnedExit(options, pid);
         } catch {
           // The callback error is the execution failure either way.
+          // A surviving group stays recorded.
         }
         finish(() => {
           reject(failure);
@@ -290,9 +309,13 @@ export async function execOwnedProcessGroup(
       child.stderr?.destroy();
       void (async (): Promise<void> => {
         try {
-          await endProcessGroup(pid);
+          if (child.exitCode === null && child.signalCode === null) {
+            await endProcessGroup(pid);
+          }
+          notifyOwnedExit(options, pid);
         } catch {
           // The output-limit error still wins when the group cannot be ended.
+          // A surviving group stays recorded.
         }
         const text = snapshot();
         finish(() => {
@@ -333,7 +356,12 @@ export async function execOwnedProcessGroup(
       void (async (): Promise<void> => {
         if (options.endTreeOnTimeout !== false) {
           try {
-            await endProcessGroup(pid);
+            // An already-closed handle must not be taskkilled. Windows
+            // taskkill runs inside endProcessGroup; skip it once close fired.
+            if (child.exitCode === null && child.signalCode === null) {
+              await endProcessGroup(pid);
+            }
+            notifyOwnedExit(options, pid);
           } catch (err) {
             const text = snapshot();
             if (isTreeSurvivedError(err)) {

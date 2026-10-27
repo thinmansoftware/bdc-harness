@@ -34,6 +34,7 @@ import {
   recordOwnedProcessGroupForTests,
   recordTeardownBeforeStatus,
   resetRunTeardownStateForTests,
+  setTeardownProcRootForTests,
   teardownTerminalMetadata,
 } from './dag-executor';
 
@@ -722,8 +723,15 @@ describe.serial('repair holder teardown', () => {
   it('Test 3: uncommitted changes are preserved as a patch before reclaim', () => {
     const saved = makeFixture();
     const holder = holderPath(saved.holder);
+    const originalBin = Buffer.from([0x10, 0x20, 0x30, 0x40]);
+    const editedBin = Buffer.from([0x10, 0x20, 0x99, 0xff]);
+    writeFileSync(join(holder, 'tracked.bin'), originalBin);
+    git(['add', 'tracked.bin'], holder);
+    git(['commit', '-m', 'track binary'], holder);
+    git(['push', 'origin', 'HEAD:feat/x'], holder);
     const head = git(['rev-parse', 'HEAD'], holder).trim();
     writeFileSync(join(holder, 'README.md'), 'changed\n');
+    writeFileSync(join(holder, 'tracked.bin'), editedBin);
     writeFileSync(join(holder, 'notes.txt'), 'untracked\n');
     writeFileSync(join(holder, 'blob.bin'), Buffer.from([0x00, 0x01, 0x02, 0xff]));
     writeRuns(saved.dbPath, [terminalRow(holder)]);
@@ -731,32 +739,45 @@ describe.serial('repair holder teardown', () => {
     mkdirSync(artifacts);
     const result = runCore(saved, { ARTIFACTS_DIR: artifacts });
     expect(result.exitCode, show(result)).toBe(0);
-    const match = result.stdout.match(/holder_patch_saved: (\S+) sha256 ([0-9a-f]{64})/);
-    expect(match, show(result)).not.toBeNull();
-    const patchPath = match?.[1] ?? '';
-    const printed = match?.[2] ?? '';
-    expect(patchPath).toContain(`${join('reclaimed-holder', 'abcd1234')}`);
-    expect(createHash('sha256').update(readFileSync(patchPath)).digest('hex')).toBe(printed);
-    expect(
-      readFileSync(join(artifacts, 'reclaimed-holder', 'abcd1234', 'git-status.porcelain'), 'utf8')
-    ).toContain('notes.txt');
+    const savedDir = join(artifacts, 'reclaimed-holder', 'abcd1234');
+    const lines = [...result.stdout.matchAll(/holder_patch_saved: (\S+) sha256 ([0-9a-f]{64})/g)];
+    expect(lines.length, show(result)).toBeGreaterThanOrEqual(4);
+    for (const line of lines) {
+      const savedPath = line[1] ?? '';
+      const printed = line[2] ?? '';
+      expect(savedPath.startsWith(savedDir)).toBe(true);
+      expect(createHash('sha256').update(readFileSync(savedPath)).digest('hex')).toBe(printed);
+    }
+    expect(readFileSync(join(savedDir, 'git-status.porcelain'), 'utf8')).toContain('notes.txt');
+    const worktreePatch = join(savedDir, 'worktree.patch');
     const fresh = join(saved.root, 'fresh');
     git(['worktree', 'add', '--detach', fresh, head], join(saved.root, 'main'));
-    const check = Bun.spawnSync(['git', 'apply', '--check', patchPath], {
+    const check = Bun.spawnSync(['git', 'apply', '--check', worktreePatch], {
       cwd: fresh,
       stdout: 'pipe',
       stderr: 'pipe',
     });
     expect(check.exitCode, check.stderr.toString()).toBe(0);
-    const applied = Bun.spawnSync(['git', 'apply', patchPath], {
+    const applied = Bun.spawnSync(['git', 'apply', worktreePatch], {
       cwd: fresh,
       stdout: 'pipe',
       stderr: 'pipe',
     });
     expect(applied.exitCode, applied.stderr.toString()).toBe(0);
     expect(readFileSync(join(fresh, 'README.md'), 'utf8')).toBe('changed\n');
-    expect(readFileSync(join(fresh, 'notes.txt'), 'utf8')).toBe('untracked\n');
-    expect(readFileSync(join(fresh, 'blob.bin'))).toEqual(Buffer.from([0x00, 0x01, 0x02, 0xff]));
+    expect(readFileSync(join(fresh, 'tracked.bin'))).toEqual(editedBin);
+    const unpacked = join(saved.root, 'unpacked');
+    mkdirSync(unpacked);
+    const extracted = Bun.spawnSync(
+      ['tar', '-xf', join(savedDir, 'untracked.tar'), '-C', unpacked],
+      {
+        stdout: 'pipe',
+        stderr: 'pipe',
+      }
+    );
+    expect(extracted.exitCode, extracted.stderr.toString()).toBe(0);
+    expect(readFileSync(join(unpacked, 'notes.txt'), 'utf8')).toBe('untracked\n');
+    expect(readFileSync(join(unpacked, 'blob.bin'))).toEqual(Buffer.from([0x00, 0x01, 0x02, 0xff]));
     expect(worktrees(saved.caller)).not.toContain(holder);
 
     const refused = makeFixture();
@@ -768,6 +789,44 @@ describe.serial('repair holder teardown', () => {
     expect(refusedResult.exitCode, show(refusedResult)).not.toBe(0);
     expect(`${refusedResult.stdout}\n${refusedResult.stderr}`).toContain('worktree is dirty');
     expect(worktrees(refused.caller)).toContain(dirtyHolder);
+  });
+
+  it('preserves staged index content when the worktree file matches HEAD', () => {
+    const saved = makeFixture();
+    const holder = holderPath(saved.holder);
+    const head = git(['rev-parse', 'HEAD'], holder).trim();
+    writeFileSync(join(holder, 'README.md'), 'staged-only\n');
+    git(['add', 'README.md'], holder);
+    writeFileSync(join(holder, 'README.md'), 'init\n');
+    const cachedBefore = git(['diff', '--cached', '--binary'], holder);
+    expect(cachedBefore).toContain('staged-only');
+    expect(readFileSync(join(holder, 'README.md'), 'utf8')).toBe('init\n');
+    writeRuns(saved.dbPath, [terminalRow(holder)]);
+    const artifacts = join(saved.root, 'artifacts');
+    mkdirSync(artifacts);
+    const result = runCore(saved, { ARTIFACTS_DIR: artifacts });
+    expect(result.exitCode, show(result)).toBe(0);
+    const stagedPath = join(artifacts, 'reclaimed-holder', 'abcd1234', 'staged.patch');
+    const staged = readFileSync(stagedPath, 'utf8');
+    expect(staged.length).toBeGreaterThan(0);
+    expect(staged).toBe(cachedBefore);
+    const fresh = join(saved.root, 'fresh-staged');
+    git(['worktree', 'add', '--detach', fresh, head], join(saved.root, 'main'));
+    const check = Bun.spawnSync(['git', 'apply', '--check', stagedPath], {
+      cwd: fresh,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(check.exitCode, check.stderr.toString()).toBe(0);
+    const applied = Bun.spawnSync(['git', 'apply', '--cached', stagedPath], {
+      cwd: fresh,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(applied.exitCode, applied.stderr.toString()).toBe(0);
+    expect(git(['diff', '--cached'], fresh)).toContain('staged-only');
+    expect(readFileSync(join(fresh, 'README.md'), 'utf8')).toBe('init\n');
+    expect(worktrees(saved.caller)).not.toContain(holder);
   });
 
   it('Test 4: the conductor polls prior teardown before the next fire', async () => {
@@ -1265,6 +1324,33 @@ describe.serial('repair holder teardown', () => {
     }
   });
 
+  it('does not signal a reused pgid whose start ticks no longer match', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rht-reuse-pgid-'));
+    roots.push(dir);
+    const procRoot = join(dir, 'proc');
+    const pidDir = join(procRoot, '4242');
+    mkdirSync(pidDir, { recursive: true });
+    const statFor = (ticks: string): string =>
+      `4242 (sleep) S 1 4242 4242 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 ${ticks}\n`;
+    writeFileSync(join(pidDir, 'stat'), statFor('100'));
+    setTeardownProcRootForTests(procRoot);
+    recordOwnedProcessGroupForTests('run-reuse-pgid', 4242);
+    writeFileSync(join(pidDir, 'stat'), statFor('999'));
+    let signals = 0;
+    setProcessGroupControlForTests({
+      signal() {
+        signals += 1;
+        return true;
+      },
+      groupExists() {
+        return true;
+      },
+    });
+    const report = await endRunProcessTree('run-reuse-pgid', dir);
+    expect(signals).toBe(0);
+    expect(report.survivors.some(item => item.pid === 4242)).toBe(false);
+  });
+
   it('does not confirm when a group registers during the last scan', async () => {
     const metadata = teardownTerminalMetadata({ confirmedAt: null, survivors: [] });
     expect(metadata).toEqual({ teardown_survivors: [] });
@@ -1273,6 +1359,13 @@ describe.serial('repair holder teardown', () => {
     registerBuiltinProviders();
     const fixture = makeFixture();
     const runId = 'run-epoch-race';
+    const epochProc = join(fixture.root, 'epoch-proc');
+    mkdirSync(join(epochProc, '424242'), { recursive: true });
+    writeFileSync(
+      join(epochProc, '424242', 'stat'),
+      '424242 (sleep) S 1 424242 424242 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100\n'
+    );
+    setTeardownProcRootForTests(epochProc);
     recordOwnedProcessGroupForTests(runId, 424242);
     setProcessGroupControlForTests({
       signal() {

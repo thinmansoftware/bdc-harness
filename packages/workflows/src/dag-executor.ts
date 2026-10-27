@@ -3194,18 +3194,69 @@ interface TeardownReport {
   survivors: TeardownSurvivor[];
 }
 
-const ownedProcessGroups = new Map<string, number[]>();
+/** pgid plus /proc stat field 22 (starttime). A reused number fails this check. */
+interface OwnedProcessGroup {
+  pgid: number;
+  startTicks: string | null;
+}
+
+const ownedProcessGroups = new Map<string, OwnedProcessGroup[]>();
 const teardownReports = new Map<string, TeardownReport>();
 const teardownEpoch = new Map<string, number>();
 const runAbortLatches = new Set<string>();
 const nodeFailureStderr = new Map<string, string>();
+let teardownProcRoot = '/proc';
+
+/** Test seam. Production reads /proc. Reset by resetRunTeardownStateForTests. */
+export function setTeardownProcRootForTests(root: string): void {
+  teardownProcRoot = root;
+}
+
+function readProcStartTicks(pid: number): string | null {
+  if (process.platform === 'win32') return null;
+  try {
+    const stat = readFileSync(`${teardownProcRoot}/${String(pid)}/stat`, 'utf8');
+    const after = stat
+      .slice(stat.lastIndexOf(')') + 1)
+      .trim()
+      .split(/\s+/);
+    // Field 22 of /proc/<pid>/stat is the 20th field after the comm parenthesis.
+    const ticks = after[19] ?? '';
+    return /^\d+$/.test(ticks) ? ticks : null;
+  } catch {
+    return null;
+  }
+}
+
+function ownedIdentityMatches(entry: OwnedProcessGroup): 'match' | 'mismatch' | 'leader-gone' {
+  if (process.platform === 'win32') {
+    // Still recorded means the spawn handle has not closed. onExit retires it,
+    // so a closed handle is never taskkilled.
+    return 'match';
+  }
+  if (entry.startTicks === null) return 'mismatch';
+  const current = readProcStartTicks(entry.pgid);
+  if (current === null) return 'leader-gone';
+  return current === entry.startTicks ? 'match' : 'mismatch';
+}
+
+function retireOwnedProcessGroup(runId: string, pgid: number): void {
+  const list = ownedProcessGroups.get(runId);
+  if (!list) return;
+  const next = list.filter(entry => entry.pgid !== pgid);
+  if (next.length === 0) ownedProcessGroups.delete(runId);
+  else ownedProcessGroups.set(runId, next);
+}
 
 function recordOwnedProcessGroup(runId: string, pgid: number | undefined): void {
   if (typeof pgid !== 'number' || !Number.isInteger(pgid) || pgid <= 0) return;
   const list = ownedProcessGroups.get(runId) ?? [];
-  if (!list.includes(pgid)) list.push(pgid);
-  ownedProcessGroups.set(runId, list);
+  if (!list.some(entry => entry.pgid === pgid)) {
+    list.push({ pgid, startTicks: readProcStartTicks(pgid) });
+    ownedProcessGroups.set(runId, list);
+  }
   // A group that registers after a scan must not inherit that scan's confirmation.
+  // A duplicate record still bumps the epoch: the scan must not confirm over it.
   teardownReports.delete(runId);
   teardownEpoch.set(runId, (teardownEpoch.get(runId) ?? 0) + 1);
 }
@@ -3214,29 +3265,61 @@ function isRunAbortLatched(runId: string): boolean {
   return runAbortLatches.has(runId);
 }
 
-/** Latch first, then end only groups already recorded for this run. */
+async function endRecordedGroup(
+  runId: string,
+  entry: OwnedProcessGroup
+): Promise<'ended' | 'survived' | 'retired'> {
+  const current = (ownedProcessGroups.get(runId) ?? []).find(item => item.pgid === entry.pgid);
+  if (!current) return 'retired';
+  const identity = ownedIdentityMatches(current);
+  // A different starttime means this pid was reused. Do not signal it.
+  // A missing leader is safe to signal only while its original group still
+  // has members: the pid itself is not a live process, so kill(-pgid) cannot
+  // hit a reuse. An empty group is retired with no signal.
+  if (identity === 'mismatch' || (identity === 'leader-gone' && !processGroupExists(entry.pgid))) {
+    retireOwnedProcessGroup(runId, entry.pgid);
+    return 'retired';
+  }
+  const epoch = teardownEpoch.get(runId) ?? 0;
+  try {
+    await endProcessGroup(entry.pgid);
+    // A registration during the stop keeps the newest record. Retiring here
+    // would let the next scan confirm over that registration.
+    if ((teardownEpoch.get(runId) ?? 0) === epoch) {
+      retireOwnedProcessGroup(runId, entry.pgid);
+    }
+    return 'ended';
+  } catch (err) {
+    if (isTreeSurvivedError(err) || processGroupExists(entry.pgid)) return 'survived';
+    retireOwnedProcessGroup(runId, entry.pgid);
+    return 'retired';
+  }
+}
+
+/** Latch first, then end only groups whose recorded identity still matches. */
 async function abortOwnedGroups(runId: string): Promise<void> {
   runAbortLatches.add(runId);
   const groups = [...(ownedProcessGroups.get(runId) ?? [])];
-  await Promise.all(
-    groups.map(async pgid => {
-      try {
-        await endProcessGroup(pgid);
-      } catch {
-        // The terminal scan records a group that is still present.
-      }
-    })
-  );
+  await Promise.all(groups.map(entry => endRecordedGroup(runId, entry)));
 }
 
-function ownedSpawnHooks(runId: string): { onSpawn: (pgid: number) => void } {
+function ownedSpawnHooks(runId: string): {
+  onSpawn: (pgid: number) => void;
+  onExit: (pgid: number) => void;
+} {
   return {
     onSpawn(pgid: number): void {
       recordOwnedProcessGroup(runId, pgid);
       if (!runAbortLatches.has(runId)) return;
-      void endProcessGroup(pgid).catch(() => {
+      void endRecordedGroup(runId, {
+        pgid,
+        startTicks: readProcStartTicks(pgid),
+      }).catch(() => {
         // Terminal teardown reports a survivor if this group is still present.
       });
+    },
+    onExit(pgid: number): void {
+      retireOwnedProcessGroup(runId, pgid);
     },
   };
 }
@@ -3340,7 +3423,7 @@ function readProcPgrp(pid: number): number | null {
   }
 }
 
-/** A cwd match is owned only when its pid or pgrp is a recorded group for this run. */
+/** A cwd match is owned only when its pid or pgrp is a still-matching recorded group. */
 function verifiedOwnedPgid(pid: number, owned: Set<number>): number | null {
   if (owned.has(pid)) return pid;
   const pgrp = readProcPgrp(pid);
@@ -3353,17 +3436,18 @@ async function collectTeardownReport(
   workingPath: string | null | undefined
 ): Promise<TeardownReport> {
   const survivors: TeardownSurvivor[] = [];
-  const ownedList = ownedProcessGroups.get(runId) ?? [];
-  const owned = new Set(ownedList);
-  for (const pgid of ownedList) {
-    try {
-      await endProcessGroup(pgid);
-    } catch (err) {
-      if (isTreeSurvivedError(err) || processGroupExists(pgid)) {
-        survivors.push({ pid: pgid, comm: readProcComm(pgid) });
-      }
+  const ownedList = [...(ownedProcessGroups.get(runId) ?? [])];
+  for (const entry of ownedList) {
+    const outcome = await endRecordedGroup(runId, entry);
+    if (outcome === 'survived') {
+      survivors.push({ pid: entry.pgid, comm: readProcComm(entry.pgid) });
     }
   }
+  const owned = new Set(
+    (ownedProcessGroups.get(runId) ?? [])
+      .filter(entry => ownedIdentityMatches(entry) === 'match')
+      .map(entry => entry.pgid)
+  );
   if (workingPath) {
     const skip = ancestorPids(process.pid);
     for (const item of foreignCwdPids(workingPath, skip)) {
@@ -3375,12 +3459,10 @@ async function collectTeardownReport(
         continue;
       }
       if (!pidAlive(item.pid)) continue;
-      try {
-        await endProcessGroup(pgid);
-      } catch {
-        // Recorded below when the process is still present.
-      }
-      if (pidAlive(item.pid)) {
+      const recorded = (ownedProcessGroups.get(runId) ?? []).find(entry => entry.pgid === pgid);
+      if (!recorded) continue;
+      const outcome = await endRecordedGroup(runId, recorded);
+      if (outcome === 'survived' || pidAlive(item.pid)) {
         survivors.push({ pid: item.pid, comm: readProcComm(item.pid) });
       }
     }
@@ -3460,6 +3542,7 @@ export function resetRunTeardownStateForTests(): void {
   teardownEpoch.clear();
   runAbortLatches.clear();
   nodeFailureStderr.clear();
+  teardownProcRoot = '/proc';
 }
 
 /** Test seam. Registration bumps the teardown epoch and drops a cached report. */
@@ -3607,7 +3690,6 @@ async function executeBashNode(
       });
       stdout = owned.stdout;
       stderr = owned.stderr;
-      recordOwnedProcessGroup(workflowRun.id, owned.pgid);
     } finally {
       try {
         await unlink(scriptFile);
@@ -3745,7 +3827,6 @@ async function executeBashNode(
       treeSurvived?: boolean;
       pgid?: number;
     };
-    recordOwnedProcessGroup(workflowRun.id, err.pgid);
     noteNodeStderr(
       workflowRun.id,
       node.id,
@@ -4002,7 +4083,6 @@ async function executeScriptNode(
       endTreeOnTimeout: true,
       ...ownedSpawnHooks(workflowRun.id),
     });
-    recordOwnedProcessGroup(workflowRun.id, owned.pgid);
     const stdout = owned.stdout;
     const stderr = owned.stderr;
 
@@ -4130,7 +4210,6 @@ async function executeScriptNode(
       treeSurvived?: boolean;
       pgid?: number;
     };
-    recordOwnedProcessGroup(workflowRun.id, err.pgid);
     noteNodeStderr(
       workflowRun.id,
       node.id,

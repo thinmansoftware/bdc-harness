@@ -189,6 +189,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Probe packaged pnpm offline
+        run: |
+          docker run --rm --network none --user appuser --entrypoint sh archon-ci:test -ec '
+            scratch=$(mktemp -d)
+            cd "$scratch"
+            printf "%s\n" "{\"packageManager\":\"pnpm@12.14.0\"}" > package.json
+            for attempt in 1 2; do
+              test "$(pnpm --version)" = "12.14.0"
+              test "$(pnpm exec node --version)" = "v26.12.1"
+            done
+            test "$(cat package.json)" = "{\"packageManager\":\"pnpm@12.14.0\"}"
+            case "$(node --version)" in v26*) exit 1 ;; esac
+            test "$(bun --version)" = "1.3.11"
+          '
+
       - name: Smoke test -- packaged GitHub helper dependency closure
         run: |
           docker run --rm --network none --user appuser --entrypoint bun archon-ci:test build \

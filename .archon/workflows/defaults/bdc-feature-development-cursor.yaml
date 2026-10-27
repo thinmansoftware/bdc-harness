@@ -290,7 +290,19 @@ nodes:
         done
       }
       rtw_save_dirty_patch() {
-        local porcelain="" dest="" patch_path="" sum="" id8_local=""
+        local porcelain="" dest="" sum="" id8_local=""
+        local staged_path="" worktree_path="" untracked_list="" tar_path=""
+        rtw_emit_saved() {
+          local saved_path="$1"
+          if ! sum=$(sha256sum "$saved_path" | awk '{print $1}'); then
+            return 1
+          fi
+          if ! printf '%s\n' "$sum" | grep -Eq '^[0-9a-f]{64}$'; then
+            return 1
+          fi
+          printf 'holder_patch_saved: %s sha256 %s\n' "$saved_path" "$sum"
+          return 0
+        }
         if ! porcelain=$(git -C "$holder" status --porcelain); then
           rtw_refuse "worktree is dirty" || return 1
         fi
@@ -308,19 +320,40 @@ nodes:
         if ! printf '%s\n' "$porcelain" > "${dest}/git-status.porcelain"; then
           rtw_refuse "worktree is dirty" || return 1
         fi
-        patch_path="${dest}/git-diff-HEAD.patch"
-        if ! (
-          git -C "$holder" add -A && git -C "$holder" diff --cached --binary HEAD
-        ) > "$patch_path"; then
+        if ! rtw_emit_saved "${dest}/git-status.porcelain"; then
           rtw_refuse "worktree is dirty" || return 1
         fi
-        if ! sum=$(sha256sum "$patch_path" | awk '{print $1}'); then
+        staged_path="${dest}/staged.patch"
+        if ! git -C "$holder" diff --cached --binary > "$staged_path"; then
           rtw_refuse "worktree is dirty" || return 1
         fi
-        if ! printf '%s\n' "$sum" | grep -Eq '^[0-9a-f]{64}$'; then
+        if ! rtw_emit_saved "$staged_path"; then
           rtw_refuse "worktree is dirty" || return 1
         fi
-        printf 'holder_patch_saved: %s sha256 %s\n' "$patch_path" "$sum"
+        worktree_path="${dest}/worktree.patch"
+        if ! git -C "$holder" diff --binary > "$worktree_path"; then
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        if ! rtw_emit_saved "$worktree_path"; then
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        untracked_list=$(mktemp)
+        if ! git -C "$holder" ls-files --others --exclude-standard > "$untracked_list"; then
+          rm -f "$untracked_list"
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        if [ -s "$untracked_list" ]; then
+          tar_path="${dest}/untracked.tar"
+          if ! tar -C "$holder" -cf "$tar_path" -T "$untracked_list"; then
+            rm -f "$untracked_list"
+            rtw_refuse "worktree is dirty" || return 1
+          fi
+          if ! rtw_emit_saved "$tar_path"; then
+            rm -f "$untracked_list"
+            rtw_refuse "worktree is dirty" || return 1
+          fi
+        fi
+        rm -f "$untracked_list"
         return 0
       }
       rtw_checkout_repair_branch() {
@@ -888,9 +921,72 @@ nodes:
       # pinned at allocation). When origin/$BASE_BRANCH exists locally, a missing
       # merge-base means this worktree was cut from a disjoint lane -- fail HERE,
       # before implement, instead of at a tail node after a PR was already opened.
+      # ---- BEGIN bmd core (byte-identical across lanes; extracted by unit test) ----
+      bmd_resolve_merge_base() {
+        local base_ref="$1" head_ref="$2" merge_base shallow deepened=0 increment
+        local step="${BMD_DEEPEN_STEP:-200}" cap="${BMD_DEEPEN_CAP:-1000}"
+        local base_branch upstream upstream_remote upstream_branch fetch_err
+
+        merge_base=$(git merge-base "$base_ref" "$head_ref" 2>/dev/null) && {
+          printf '%s\n' "$merge_base"
+          return 0
+        }
+
+        shallow=$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false')
+        case "$step" in ''|*[!0-9]*|0) echo "worktree_not_on_declared_base_lane: invalid BMD_DEEPEN_STEP: $step" >&2; return 1 ;; esac
+        case "$cap" in ''|*[!0-9]*|0) echo "worktree_not_on_declared_base_lane: invalid BMD_DEEPEN_CAP: $cap" >&2; return 1 ;; esac
+        base_branch=${base_ref#refs/remotes/origin/}
+
+        if [ "$shallow" = "true" ]; then
+          upstream=$(git rev-parse --abbrev-ref --symbolic-full-name "${head_ref}@{upstream}" 2>/dev/null || true)
+          if [ -n "$upstream" ] && [ "$upstream" != "$head_ref@{upstream}" ]; then
+            upstream_remote=${upstream%%/*}
+            upstream_branch=${upstream#*/}
+          fi
+
+          while [ "$deepened" -lt "$cap" ]; do
+            increment=$step
+            if [ "$increment" -gt $((cap - deepened)) ]; then
+              increment=$((cap - deepened))
+            fi
+            if ! fetch_err=$(git fetch "--deepen=$increment" origin "$base_branch" 2>&1 >/dev/null); then
+              echo "worktree_not_on_declared_base_lane: merge_base_fetch_failed: $(printf '%s\n' "$fetch_err" | head -n 1)" >&2
+              return 1
+            fi
+            if [ -n "${upstream_remote:-}" ]; then
+              if ! fetch_err=$(git fetch "--deepen=$increment" "$upstream_remote" "$upstream_branch" 2>&1 >/dev/null); then
+                echo "worktree_not_on_declared_base_lane: merge_base_fetch_failed: $(printf '%s\n' "$fetch_err" | head -n 1)" >&2
+                return 1
+              fi
+            fi
+            deepened=$((deepened + increment))
+            merge_base=$(git merge-base "$base_ref" "$head_ref" 2>/dev/null) && {
+              printf '%s\n' "$merge_base"
+              return 0
+            }
+            shallow=$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false')
+            [ "$shallow" = "true" ] || break
+          done
+
+          if [ "$shallow" = "true" ]; then
+            if ! fetch_err=$(git fetch --unshallow origin 2>&1 >/dev/null); then
+              echo "worktree_not_on_declared_base_lane: merge_base_fetch_failed: $(printf '%s\n' "$fetch_err" | head -n 1)" >&2
+              return 1
+            fi
+            shallow=$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false')
+            merge_base=$(git merge-base "$base_ref" "$head_ref" 2>/dev/null) && {
+              printf '%s\n' "$merge_base"
+              return 0
+            }
+          fi
+        fi
+
+        echo "worktree_not_on_declared_base_lane: no_common_history: HEAD shares no history with origin/${base_branch} (shallow=${shallow}, deepened=${deepened})" >&2
+        return 1
+      }
+      # ---- END bmd core ----
       if [ -n "${BASE_BRANCH:-}" ] && git rev-parse --verify "refs/remotes/origin/${BASE_BRANCH}^{commit}" >/dev/null 2>&1; then
-        if ! git merge-base "refs/remotes/origin/${BASE_BRANCH}" HEAD >/dev/null 2>&1; then
-          echo "worktree_not_on_declared_base_lane: HEAD shares no history with origin/${BASE_BRANCH}" >&2
+        if ! RUN_SCOPE_MERGE_BASE=$(bmd_resolve_merge_base "refs/remotes/origin/${BASE_BRANCH}" HEAD); then
           exit 1
         fi
       fi
@@ -900,6 +996,10 @@ nodes:
       }
       mkdir -p "$ARTIFACTS_DIR"
       printf '%s\n' "$RUN_SCOPE_SHA" > "$ARTIFACTS_DIR/run-scope-sha.txt"
+      if [ -n "${RUN_SCOPE_MERGE_BASE:-}" ]; then
+        printf '%s\n' "$RUN_SCOPE_MERGE_BASE" > "$ARTIFACTS_DIR/run-scope-merge-base.txt"
+        echo "RUN_SCOPE_MERGE_BASE=$RUN_SCOPE_MERGE_BASE"
+      fi
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
 
   - id: prep-dependencies
@@ -911,13 +1011,13 @@ nodes:
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
       cd "$WT"
       # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
-      # dprep_ensure_js_deps installs bun-lockfile JavaScript dependencies when
+      # dprep_ensure_js_deps installs bun-lockfile or pnpm-lockfile JavaScript dependencies when
       # node_modules is absent. prep-dependencies calls it before implement, and
       # run-stop-tests calls it before the first rst_try. Always returns 0. The
       # install subshell unsets the same credential families as rst_scrub_env and
       # keeps *_TEST_* names. node_modules is never symlinked or copied.
       dprep_ensure_js_deps() {
-        if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ]; }; then
+        if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ] && { [ ! -f pnpm-lock.yaml ] || ! command -v pnpm >/dev/null 2>&1; }; }; then
           printf 'dprep: no package.json with a bun lockfile, skipping\n'
           return 0
         fi
@@ -925,13 +1025,37 @@ nodes:
           printf 'dprep: node_modules present, skipping\n'
           return 0
         fi
-        if ! command -v bun >/dev/null 2>&1; then
-          printf 'dprep: bun not found, skipping\n'
+        if [ -f bun.lock ] || [ -f bun.lockb ]; then
+          if ! command -v bun >/dev/null 2>&1; then
+            printf 'dprep: bun not found, skipping\n'
+            return 0
+          fi
+          local start now elapsed rc=0
+          start="$(date +%s)"
+          printf 'dprep: installing JS dependencies (bun install --frozen-lockfile) in %s\n' "$(pwd)"
+          (
+            for name in $(env | sed -n 's/=.*//p'); do
+              case "$name" in
+                *_TEST_*) continue ;;
+                OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL|TELEGRAM_*)
+                  unset "$name"
+                  ;;
+              esac
+            done
+            timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
+          ) || rc=$?
+          now="$(date +%s)"
+          elapsed=$((now - start))
+          if [ "$rc" -eq 0 ]; then
+            printf 'dprep: install ok (%ss)\n' "$elapsed"
+          else
+            printf 'dprep: install failed rc=%s (continuing; run-stop-tests reports the real result)\n' "$rc"
+          fi
           return 0
         fi
         local start now elapsed rc=0
         start="$(date +%s)"
-        printf 'dprep: installing JS dependencies (bun install --frozen-lockfile) in %s\n' "$(pwd)"
+        printf 'dprep: installing JS dependencies (pnpm, frozen lockfile) in %s\n' "$PWD"
         (
           for name in $(env | sed -n 's/=.*//p'); do
             case "$name" in
@@ -941,7 +1065,7 @@ nodes:
                 ;;
             esac
           done
-          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
+          timeout "${DPREP_TIMEOUT_SECONDS:-600}" pnpm install --frozen-lockfile < /dev/null
         ) || rc=$?
         now="$(date +%s)"
         elapsed=$((now - start))
@@ -2169,13 +2293,13 @@ nodes:
       # ---- END rst core ----
 
       # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
-      # dprep_ensure_js_deps installs bun-lockfile JavaScript dependencies when
+      # dprep_ensure_js_deps installs bun-lockfile or pnpm-lockfile JavaScript dependencies when
       # node_modules is absent. prep-dependencies calls it before implement, and
       # run-stop-tests calls it before the first rst_try. Always returns 0. The
       # install subshell unsets the same credential families as rst_scrub_env and
       # keeps *_TEST_* names. node_modules is never symlinked or copied.
       dprep_ensure_js_deps() {
-        if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ]; }; then
+        if [ ! -f package.json ] || { [ ! -f bun.lock ] && [ ! -f bun.lockb ] && { [ ! -f pnpm-lock.yaml ] || ! command -v pnpm >/dev/null 2>&1; }; }; then
           printf 'dprep: no package.json with a bun lockfile, skipping\n'
           return 0
         fi
@@ -2183,13 +2307,37 @@ nodes:
           printf 'dprep: node_modules present, skipping\n'
           return 0
         fi
-        if ! command -v bun >/dev/null 2>&1; then
-          printf 'dprep: bun not found, skipping\n'
+        if [ -f bun.lock ] || [ -f bun.lockb ]; then
+          if ! command -v bun >/dev/null 2>&1; then
+            printf 'dprep: bun not found, skipping\n'
+            return 0
+          fi
+          local start now elapsed rc=0
+          start="$(date +%s)"
+          printf 'dprep: installing JS dependencies (bun install --frozen-lockfile) in %s\n' "$(pwd)"
+          (
+            for name in $(env | sed -n 's/=.*//p'); do
+              case "$name" in
+                *_TEST_*) continue ;;
+                OVERSEER_*|MERGE_MANAGER_*|ARCHON_*|DUTY_OFFICER_*|TASKMASTER_*|DISPATCH_*|SMART_CAULDRON_*|BOARD_*|GITHUB_APP_*|GH_TOKEN|GITHUB_TOKEN|GH_AUTH_TOKEN_INTERNAL|TELEGRAM_*)
+                  unset "$name"
+                  ;;
+              esac
+            done
+            timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
+          ) || rc=$?
+          now="$(date +%s)"
+          elapsed=$((now - start))
+          if [ "$rc" -eq 0 ]; then
+            printf 'dprep: install ok (%ss)\n' "$elapsed"
+          else
+            printf 'dprep: install failed rc=%s (continuing; run-stop-tests reports the real result)\n' "$rc"
+          fi
           return 0
         fi
         local start now elapsed rc=0
         start="$(date +%s)"
-        printf 'dprep: installing JS dependencies (bun install --frozen-lockfile) in %s\n' "$(pwd)"
+        printf 'dprep: installing JS dependencies (pnpm, frozen lockfile) in %s\n' "$PWD"
         (
           for name in $(env | sed -n 's/=.*//p'); do
             case "$name" in
@@ -2199,7 +2347,7 @@ nodes:
                 ;;
             esac
           done
-          timeout "${DPREP_TIMEOUT_SECONDS:-600}" bun install --frozen-lockfile < /dev/null
+          timeout "${DPREP_TIMEOUT_SECONDS:-600}" pnpm install --frozen-lockfile < /dev/null
         ) || rc=$?
         now="$(date +%s)"
         elapsed=$((now - start))
@@ -5020,11 +5168,12 @@ nodes:
       # ---- BEGIN manifest-pr-content-check ----
       # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
       # Fail closed when build-manifest claims paths absent from the real PR file list.
+      # BRACKET_SAFE_CLAIMED_PATHS
       if [ -n "$PR_URL" ]; then
         FILES_CREATED_LINE=$(extract "Files created")
         FILES_MODIFIED_LINE=$(extract "Files modified")
         CLAIMED_RAW=$(printf '%s\n%s\n' "$FILES_CREATED_LINE" "$FILES_MODIFIED_LINE")
-        CLAIMED_PATHS=$(printf '%s\n' "$CLAIMED_RAW" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -E '^[A-Za-z0-9_./-]+' | grep -v -E '^(none|n/a|N/A|no files|already.satisfied|ALREADY_SATISFIED|BLOCKED)$' | sed -E 's|^([A-Za-z0-9_./-]+).*|\1|' || true)
+        CLAIMED_PATHS=$(printf '%s\n' "$CLAIMED_RAW" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -E '^[A-Za-z0-9_./-]+' | grep -v -E '^(none|n/a|N/A|no files|already.satisfied|ALREADY_SATISFIED|BLOCKED)$' || true)
         SKIP_PR_FILES=false
         COMBINED_LOWER=$(printf '%s\n' "$CLAIMED_RAW" "$PRS_LINE" "$MANIFEST_OUT" | tr '[:upper:]' '[:lower:]')
         if printf '%s\n' "$COMBINED_LOWER" | grep -Eq 'already_satisfied|already satisfied|no files|files created: none|files modified: none|outcome: blocked|blocked'; then
@@ -5045,23 +5194,47 @@ nodes:
             if [ -n "$CLAIMED_PATHS" ]; then
               MISSING=""
               MATCH=0
+              set -f
               while IFS= read -r p; do
                 [ -z "$p" ] && continue
-                if printf '%s\n' "$PR_FILES" | grep -Fxq "$p"; then
+                if printf '%s\n' "$PR_FILES" | grep -Fxq -- "$p"; then
+                  MATCH=$((MATCH + 1))
+                  continue
+                fi
+                candidate="$p"
+                paren_stripped=$(printf '%s\n' "$candidate" | sed -E 's/[[:space:]]*\([^)]*\)[[:space:]]*$//')
+                if [ "$paren_stripped" != "$candidate" ]; then
+                  candidate="$paren_stripped"
+                else
+                  while printf '%s\n' "$candidate" | grep -Eq '^(.*/)?[^/]*[[:space:]]+[A-Za-z][A-Za-z0-9_-]*$'; do
+                    next=$(printf '%s\n' "$candidate" | sed -E 's/[[:space:]]+[A-Za-z][A-Za-z0-9_-]*$//')
+                    [ "$next" = "$candidate" ] && break
+                    candidate="$next"
+                  done
+                fi
+                if [ "$candidate" != "$p" ] && printf '%s\n' "$PR_FILES" | grep -Fxq -- "$candidate"; then
                   MATCH=$((MATCH + 1))
                 else
-                  MISSING="${MISSING}${p} "
+                  MISSING="${MISSING}${p}"$'\n'
                 fi
               done < <(printf '%s\n' "$CLAIMED_PATHS")
+              set +f
               if [ -n "$MISSING" ]; then
-                echo "PR_CONTENT_ERROR: claimed path(s) absent from PR file list: ${MISSING}" >&2
+                echo "PR_CONTENT_ERROR: claimed path(s) absent from PR file list:" >&2
+                echo "CLAIMED_PATHS" >&2
+                printf '%s\n' "$CLAIMED_PATHS" >&2
                 echo "PR_URL=${PR_URL}" >&2
-                echo "PR_FILES=$(printf '%s' "$PR_FILES" | tr '\n' ' ')" >&2
+                echo "PR_FILES" >&2
+                printf '%s\n' "$PR_FILES" >&2
                 exit 1
               fi
               if [ -n "$PR_FILES" ] && [ "$MATCH" -eq 0 ]; then
                 echo "PR_CONTENT_ERROR: PR has files but zero claimed manifest paths match (wrong-content PR)." >&2
+                echo "CLAIMED_PATHS" >&2
+                printf '%s\n' "$CLAIMED_PATHS" >&2
                 echo "PR_URL=${PR_URL}" >&2
+                echo "PR_FILES" >&2
+                printf '%s\n' "$PR_FILES" >&2
                 exit 1
               fi
             fi
