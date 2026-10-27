@@ -8,3 +8,8 @@ export {
   type CursorAgentSpawn,
 } from './provider';
 export { registerCursorAgentProvider } from './registration';
+export {
+  CursorCloudAgentProvider,
+  cursorCloudAgentId,
+  setCursorCloudRunMetadataRecorder,
+} from './cloud-provider';

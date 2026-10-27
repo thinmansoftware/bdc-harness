@@ -42,6 +42,12 @@ const PROBE_TIMEOUT_MS = 10_000;
 const CLAUDE_ENDPOINT = 'https://api.anthropic.com/api/oauth/usage';
 const CODEX_ENDPOINT = 'https://chatgpt.com/backend-api/wham/usage';
 const CURSOR_ENDPOINT = 'https://cursor.com/api/usage-summary';
+const CURSOR_AGENTS_ENDPOINT = 'https://api.cursor.com/v1/agents';
+const CURSOR_CLOUD_SPEND_NOTE =
+  'basis: harness cloud-agent spend vs FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS; IDE and CLI usage are not visible to a user API key';
+const CURSOR_NO_ACCOUNT_USAGE_NOTE =
+  'Cursor has no account-usage route for a user API key (Admin API /teams/* returns 401 Invalid Team API Key; /v0/usage and /v1/usage are 404); set FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS (John decision) to gate on harness cloud-agent spend';
+const CURSOR_AGENT_PAGE_CAP = 100;
 const CLAUDE_BETA = 'oauth-2025-04-20';
 const CURSOR_COOKIE = 'WorkosCursorSessionToken';
 const CODEX_SEVEN_DAY_SECONDS = 604800;
@@ -165,7 +171,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function seatForProvider(providerId: string): SeatId | null {
   if (providerId === 'codex-native-strict') return 'codex';
-  if (providerId === 'claude' || providerId === 'codex' || providerId === 'cursor') {
+  if (providerId === 'cursor' || providerId === 'cursor-cloud') return 'cursor';
+  if (providerId === 'claude' || providerId === 'codex') {
     return providerId;
   }
   return null;
@@ -180,7 +187,12 @@ export function seatsForBindings(bindings: readonly { providerId: string }[]): S
   return seats;
 }
 
-export function unknownSeatReading(seat: SeatId, note: string, httpStatus?: number): SeatReading {
+export function unknownSeatReading(
+  seat: SeatId,
+  note: string,
+  httpStatus?: number,
+  endpoint?: string
+): SeatReading {
   return {
     seat,
     limit_source: 'UNKNOWN',
@@ -189,7 +201,7 @@ export function unknownSeatReading(seat: SeatId, note: string, httpStatus?: numb
     gate_windows: [...GATE_WINDOWS[seat]],
     note,
     probed_at: new Date().toISOString(),
-    endpoint: ENDPOINTS[seat],
+    endpoint: endpoint ?? ENDPOINTS[seat],
     ...(httpStatus !== undefined ? { http_status: httpStatus } : {}),
   };
 }
@@ -217,7 +229,13 @@ function sevenDayFromWindows(seat: SeatId, windows: readonly SeatWindow[]): Seve
 function measuredReading(
   seat: SeatId,
   windows: SeatWindow[],
-  extra: { plan?: string; allowed?: boolean; limit_reached?: boolean },
+  extra: {
+    plan?: string;
+    allowed?: boolean;
+    limit_reached?: boolean;
+    note?: string;
+    endpoint?: string;
+  },
   deps?: SeatReadDeps
 ): SeatReading {
   return {
@@ -227,9 +245,9 @@ function measuredReading(
     windows,
     seven_day: sevenDayFromWindows(seat, windows),
     gate_windows: [...GATE_WINDOWS[seat]],
-    note: '',
+    note: extra.note ?? '',
     probed_at: new Date(nowMs(deps)).toISOString(),
-    endpoint: ENDPOINTS[seat],
+    endpoint: extra.endpoint ?? ENDPOINTS[seat],
     ...(extra.allowed !== undefined ? { allowed: extra.allowed } : {}),
     ...(extra.limit_reached !== undefined ? { limit_reached: extra.limit_reached } : {}),
   };
@@ -425,11 +443,146 @@ function cursorCookie(token: string): { cookie: string } | { error: string } {
   }
 }
 
+function positiveInt(raw: string | undefined): number | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!/^[1-9]\d*$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value) || value <= 0) return null;
+  return value;
+}
+
+function cursorBasicAuth(key: string): string {
+  return `Basic ${Buffer.from(`${key}:`, 'utf8').toString('base64')}`;
+}
+
+function inCurrentUtcMonth(iso: string, now: number): boolean {
+  const created = new Date(iso);
+  if (Number.isNaN(created.getTime())) return false;
+  const current = new Date(now);
+  return (
+    created.getUTCFullYear() === current.getUTCFullYear() &&
+    created.getUTCMonth() === current.getUTCMonth()
+  );
+}
+
+function nextUtcMonthStart(now: number): string {
+  const current = new Date(now);
+  return new Date(Date.UTC(current.getUTCFullYear(), current.getUTCMonth() + 1, 1)).toISOString();
+}
+
+function cursorSpendUnknown(note: string, httpStatus?: number): SeatReading {
+  return unknownSeatReading('cursor', note, httpStatus, CURSOR_AGENTS_ENDPOINT);
+}
+
+async function probeCursorCloudSpend(
+  key: string,
+  budgetCents: number,
+  deps?: SeatReadDeps
+): Promise<SeatReading> {
+  const headers = {
+    Authorization: cursorBasicAuth(key),
+    Accept: 'application/json',
+  };
+  const now = nowMs(deps);
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+  const agentIds: string[] = [];
+  for (let page = 0; page < CURSOR_AGENT_PAGE_CAP; page += 1) {
+    const url = cursor
+      ? `${CURSOR_AGENTS_ENDPOINT}?cursor=${encodeURIComponent(cursor)}`
+      : CURSOR_AGENTS_ENDPOINT;
+    let listed: Awaited<ReturnType<typeof fetchJson>>;
+    try {
+      listed = await fetchJson(url, headers, deps);
+    } catch {
+      return cursorSpendUnknown('Cursor cloud-agent spend probe failed');
+    }
+    if (!listed.ok) {
+      return cursorSpendUnknown(
+        `Cursor cloud-agent spend probe failed (HTTP ${listed.status})`,
+        listed.status
+      );
+    }
+    if (!isRecord(listed.body) || !Array.isArray(listed.body.items)) {
+      return cursorSpendUnknown('unrecognized Cursor agents payload');
+    }
+    for (const item of listed.body.items) {
+      if (!isRecord(item)) continue;
+      const name = typeof item.name === 'string' ? item.name : '';
+      const createdAt = typeof item.createdAt === 'string' ? item.createdAt : '';
+      const id = typeof item.id === 'string' ? item.id : '';
+      if (!name.startsWith('Cauldron ') || !inCurrentUtcMonth(createdAt, now)) continue;
+      if (!id) return cursorSpendUnknown('unrecognized Cursor agents payload');
+      agentIds.push(id);
+    }
+    const nextCursor = listed.body.nextCursor;
+    if (typeof nextCursor !== 'string' || nextCursor.length === 0) {
+      cursor = undefined;
+      break;
+    }
+    if (seenCursors.has(nextCursor)) {
+      return cursorSpendUnknown('Cursor agents list repeated a page cursor');
+    }
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+  if (cursor) {
+    return cursorSpendUnknown('Cursor agents list exceeded page cap');
+  }
+
+  let spend = 0;
+  for (const id of agentIds) {
+    let usage: Awaited<ReturnType<typeof fetchJson>>;
+    try {
+      usage = await fetchJson(
+        `${CURSOR_AGENTS_ENDPOINT}/${encodeURIComponent(id)}/usage`,
+        headers,
+        deps
+      );
+    } catch {
+      return cursorSpendUnknown('Cursor cloud-agent spend probe failed');
+    }
+    if (!usage.ok) {
+      return cursorSpendUnknown(
+        `Cursor cloud-agent spend probe failed (HTTP ${usage.status})`,
+        usage.status
+      );
+    }
+    const cost = isRecord(usage.body) && isRecord(usage.body.cost) ? usage.body.cost : null;
+    const raw = cost?.rawCostCents;
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+      return cursorSpendUnknown('Cursor cloud-agent spend probe missing rawCostCents');
+    }
+    spend += raw;
+  }
+
+  const used = clampPercent((spend / budgetCents) * 100);
+  return measuredReading(
+    'cursor',
+    [
+      {
+        name: 'monthly',
+        used_percent: round2(used),
+        remaining_percent: round2(100 - used),
+        resets_at: nextUtcMonthStart(now),
+      },
+    ],
+    { note: CURSOR_CLOUD_SPEND_NOTE, endpoint: CURSOR_AGENTS_ENDPOINT },
+    deps
+  );
+}
+
 async function probeCursor(deps?: SeatReadDeps): Promise<SeatReading> {
   const raw = envOf(deps, 'FUELGLASS_CURSOR_SESSION_TOKEN');
   const token = typeof raw === 'string' ? raw.trim() : '';
   if (!token) {
-    return unknownSeatReading('cursor', 'no Cursor session credential in this environment');
+    const apiKey = (envOf(deps, 'CURSOR_API_KEY') ?? '').trim();
+    const budget = positiveInt(envOf(deps, 'FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS'));
+    if (apiKey && budget !== null) {
+      return probeCursorCloudSpend(apiKey, budget, deps);
+    }
+    return unknownSeatReading('cursor', CURSOR_NO_ACCOUNT_USAGE_NOTE);
   }
   const cookie = cursorCookie(token);
   if ('error' in cookie) return unknownSeatReading('cursor', cookie.error);

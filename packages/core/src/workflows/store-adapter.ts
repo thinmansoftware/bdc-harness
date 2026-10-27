@@ -11,6 +11,7 @@ import * as workflowEventDb from '../db/workflow-events';
 import * as codebaseDb from '../db/codebases';
 import * as envVarDb from '../db/env-vars';
 import { getAgentProvider } from '@archon/providers';
+import { setCursorCloudRunMetadataRecorder } from '@archon/providers/community/cursor';
 import { loadConfig as loadMergedConfig } from '../config/config-loader';
 import { createLogger } from '@archon/paths';
 import { freezeWorkOrderSource } from './work-order-source';
@@ -102,6 +103,12 @@ export function createWorkflowStore(): IWorkflowStore {
  * Single construction point -- avoids duplicating the wiring across callers.
  */
 export function createWorkflowDeps(): WorkflowDeps {
+  setCursorCloudRunMetadataRecorder(async (runId, metadata) => {
+    const merged: Record<string, unknown> = {
+      cursor_cloud_agent: metadata.cursor_cloud_agent,
+    };
+    await workflowDb.updateWorkflowRun(runId, { metadata: merged });
+  });
   return {
     store: createWorkflowStore(),
     getAgentProvider,
