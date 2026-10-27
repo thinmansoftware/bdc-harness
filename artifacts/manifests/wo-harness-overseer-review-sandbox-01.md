@@ -2,12 +2,12 @@ Manifest-Version: 2
 WO: WO-HARNESS-OVERSEER-REVIEW-SANDBOX-01
 Builder: Codex
 Repair target: PR #1290, feat/wo-harness-overseer-review-sandbox-01-repair
-Functional candidate SHA: 8eac623da75746e767acc8448bf91b4dd4cf9c08
+Functional candidate SHA: 944a60d6e9f34ddf01aceeb68606c1c68c0df7d3
 Fetched origin/dev: 7a4b6438fc16696707b736cd160cc1861d7ffacb
 Merge base: 7a4b6438fc16696707b736cd160cc1861d7ffacb
 Persisted runScopeSha: 7a4b6438fc16696707b736cd160cc1861d7ffacb
 Authority proof: git merge-base --is-ancestor runScopeSha merge-base exited 0
-Custody: local HEAD, remote repair branch, and live PR #1290 head matched f7c932ba99c9fa13cd1e17ac6c60a746c3d05bb3 before implementation; exactly one open PR used the branch and its base was dev.
+Custody: local HEAD, remote repair branch, and live PR #1290 head matched a8fd831bed348b21f8de34848fa5a09141e66929 before this repair iteration; exactly one open PR used the branch and its base was dev.
 
 Files modified:
 
@@ -42,6 +42,7 @@ Validation:
 - Stop 13: all three named regressions collected and passed; g+rwX count 0.
 - Stop 14 source assertions: workflow contains false []; this manifest names the functional candidate.
 - Extended merge/worker/sandbox regression command passed with zero failures.
+- Full Ubuntu CI exposed a legacy-body compatibility regression; the functional candidate preserves an absent optional baseSha and its focused regression passes.
 
 Native binding required in final-image CI: UID 1002, Codex 0.153.3, use_legacy_landlock, no added privileges, and the real broker smoke. No native result is fabricated by this manifest.
 Runtime verification: post-activation Stop 9 not run; activation was not authorized.
