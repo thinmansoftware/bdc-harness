@@ -827,6 +827,84 @@ describe('seat usage', () => {
     });
     expect(calls).toBe(0);
   });
+
+  test('pushed_reading_above_cutoff_blocks_before_cache_expiry', async () => {
+    const now = Date.parse('2026-10-27T13:05:11.000Z');
+    const row = {
+      used_percent: 35.28,
+      remaining_percent: 64.72,
+      resets_at: '2026-11-13T16:33:08.000Z',
+      observed_at: '2026-10-27T13:00:11.000Z',
+      source: 'desktop-fuelglass',
+    };
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls += 1;
+      throw new Error('direct probe must not run');
+    };
+    const deps = {
+      now: () => now,
+      env: {},
+      fetch: fetchImpl,
+      loadPushedReading: async () => row,
+    };
+    const first = await readSeat('cursor', deps);
+    expect(first.limit_source).toBe('measured');
+    expect(first.windows.find(window => window.name === 'monthly')?.used_percent).toBe(35.28);
+    row.used_percent = 91;
+    row.remaining_percent = 9;
+    const second = await readSeat('cursor', deps);
+    expect(decideSeatGate([{ providerId: 'cursor' }], { cursor: second }, 90)).toEqual({
+      refused: true,
+      seat: 'cursor',
+      window: 'monthly',
+      usedPercent: 91,
+      cutoffPercent: 90,
+      unknownSeats: [],
+    });
+    expect(calls).toBe(0);
+  });
+
+  test('pushed_reading_freshness_rechecked_inside_cache_ttl', async () => {
+    const observedAt = '2026-10-27T13:00:00.000Z';
+    const observedMs = Date.parse(observedAt);
+    let now = observedMs + 50_000;
+    process.env.FUELGLASS_PUSHED_READING_MAX_AGE_MINUTES = '1';
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls += 1;
+      throw new Error('direct probe must not run');
+    };
+    const deps = {
+      now: () => now,
+      env: { FUELGLASS_PUSHED_READING_MAX_AGE_MINUTES: '1' },
+      fetch: fetchImpl,
+      loadPushedReading: async () => ({
+        used_percent: 35.28,
+        remaining_percent: 64.72,
+        resets_at: '2026-11-13T16:33:08.000Z',
+        observed_at: observedAt,
+        source: 'desktop-fuelglass',
+      }),
+    };
+    try {
+      const first = await readSeat('cursor', deps);
+      expect(first.limit_source).toBe('measured');
+      expect(first.windows.find(window => window.name === 'monthly')?.used_percent).toBe(35.28);
+      now = observedMs + 70_000;
+      const second = await readSeat('cursor', deps);
+      expect(second.limit_source).toBe('UNKNOWN');
+      expect(second.reading_source).toBe('pushed');
+      expect(second.note.startsWith('reading_stale')).toBe(true);
+      expect(decideSeatGate([{ providerId: 'cursor' }], { cursor: second }, 90)).toEqual({
+        refused: false,
+        unknownSeats: ['cursor'],
+      });
+      expect(calls).toBe(0);
+    } finally {
+      delete process.env.FUELGLASS_PUSHED_READING_MAX_AGE_MINUTES;
+    }
+  });
 });
 
 describe('persisted operator cutoff', () => {

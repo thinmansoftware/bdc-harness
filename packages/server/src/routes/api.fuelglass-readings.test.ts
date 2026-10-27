@@ -146,6 +146,11 @@ mock.module('@archon/core/utils/commands', () => ({
 
 import { closeDatabase, resetDatabase } from '@archon/core/db/connection';
 import { getLatestSeatUsageReading } from '@archon/core/db/seat-usage-readings';
+import {
+  decideSeatGate,
+  readSeat,
+  resetSeatUsageCacheForTests,
+} from '@archon/workflows/reliability/seat-usage';
 import { registerApiRoutes } from './api';
 
 const OPERATOR_TOKEN = 'test-operator-token';
@@ -370,5 +375,29 @@ describe('fuelglass pushed readings', () => {
     expect(body.age_seconds).toBeGreaterThanOrEqual(0);
     expect(body.age_seconds).toBeLessThanOrEqual(60);
     expect(body.max_age_minutes).toBe(30);
+  });
+
+  test('above-cutoff push blocks the next gate decision before cache expiry', async () => {
+    resetSeatUsageCacheForTests();
+    const firstPost = await postReading(sixFields(), OPERATOR_TOKEN);
+    expect(firstPost.status).toBe(200);
+    const first = await readSeat('cursor');
+    expect(first.limit_source).toBe('measured');
+    expect(first.windows.find(window => window.name === 'monthly')?.used_percent).toBe(35.28);
+
+    const secondPost = await postReading(
+      sixFields({ used_percent: 91, remaining_percent: 9 }),
+      OPERATOR_TOKEN
+    );
+    expect(secondPost.status).toBe(200);
+    const next = await readSeat('cursor');
+    expect(decideSeatGate([{ providerId: 'cursor' }], { cursor: next }, 90)).toEqual({
+      refused: true,
+      seat: 'cursor',
+      window: 'monthly',
+      usedPercent: 91,
+      cutoffPercent: 90,
+      unknownSeats: [],
+    });
   });
 });

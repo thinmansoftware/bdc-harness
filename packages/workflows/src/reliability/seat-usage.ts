@@ -581,8 +581,6 @@ async function cursorFromPushedReading(deps?: SeatReadDeps): Promise<SeatReading
 async function probeSeat(seat: SeatId, deps?: SeatReadDeps): Promise<SeatReading> {
   if (seat === 'claude') return probeClaude(deps);
   if (seat === 'codex') return probeCodex(deps);
-  const pushed = await cursorFromPushedReading(deps);
-  if (pushed) return pushed;
   return probeCursor(deps);
 }
 
@@ -608,6 +606,13 @@ export function resolvePushedReadingMaxAgeMinutes(deps?: SeatReadDeps): number {
 }
 
 export async function readSeat(seat: SeatId, deps?: SeatReadDeps): Promise<SeatReading> {
+  // A pushed Cursor row is reloaded on every decision so a newer or newly
+  // stale reading is honored inside the 55s probe-cache window. It is not
+  // written into the cache; only a direct probe (no pushed row) is.
+  if (seat === 'cursor') {
+    const pushed = await cursorFromPushedReading(deps);
+    if (pushed) return pushed;
+  }
   const now = nowMs(deps);
   const hit = cache.get(seat);
   if (hit && now - hit.at < CACHE_TTL_MS) return hit.reading;
@@ -661,6 +666,12 @@ export async function readAllSeats(deps?: SeatReadDeps): Promise<Record<SeatId, 
 
 export function setSeatAlertSendForTests(send: SeatAlertSend | null): void {
   alertSend = send ?? defaultAlertSend;
+}
+
+/** Drop one seat's cached reading and in-flight probe. Leaves alerts and cutoff alone. */
+export function invalidateSeatUsageCache(seat: SeatId): void {
+  cache.delete(seat);
+  inflight.delete(seat);
 }
 
 export function resetSeatUsageCacheForTests(): void {

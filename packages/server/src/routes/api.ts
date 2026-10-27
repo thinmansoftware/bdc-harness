@@ -65,6 +65,7 @@ import { processDueProviderWaits } from '@archon/workflows/reliability/wait-sche
 import {
   FUELGLASS_SEAT_CUTOFF_SETTING_KEY,
   getSeatCutoff,
+  invalidateSeatUsageCache,
   isValidSeatCutoff,
   readAllSeats,
   resolvePushedReadingMaxAgeMinutes,
@@ -6846,6 +6847,7 @@ export function registerApiRoutes(
       });
       const stored = await getLatestSeatUsageReading('cursor');
       if (!stored) return apiError(c, 500, 'Failed to store seat reading');
+      invalidateSeatUsageCache('cursor');
       return c.json({ success: true, reading: pushedReadingView(stored) });
     } catch (error) {
       getLog().error({ err: error }, 'fuelglass_reading_push_failed');
