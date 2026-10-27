@@ -278,6 +278,31 @@ async function getDispatchPrincipal(
   return result.rows[0] ?? null;
 }
 
+interface DispatchPrincipalListRow extends DispatchPrincipalRow {
+  display_name: string;
+}
+
+export interface DispatchPrincipalListing {
+  principal_id: string;
+  display_name: string;
+  delivery_mode: DispatchDeliveryMode;
+  active: boolean;
+}
+
+export async function listDispatchPrincipals(
+  query: DispatchQueryExecutor = (sql, params) => getDatabase().query(sql, params)
+): Promise<DispatchPrincipalListing[]> {
+  const result = await query<DispatchPrincipalListRow>(
+    'SELECT principal_id, display_name, delivery_mode, active FROM dispatch_principals ORDER BY principal_id ASC'
+  );
+  return result.rows.map(row => ({
+    principal_id: row.principal_id,
+    display_name: row.display_name,
+    delivery_mode: row.delivery_mode,
+    active: isActivePrincipal(row),
+  }));
+}
+
 export async function assessDispatchRecipient(
   recipient: string
 ): Promise<DispatchRecipientAssessment> {

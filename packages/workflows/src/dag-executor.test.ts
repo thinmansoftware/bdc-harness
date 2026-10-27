@@ -7,6 +7,35 @@ import * as git from '@archon/git';
 const isWindows = process.platform === 'win32';
 
 // --- Mock logger (MUST come before imports of modules under test) ---
+//
+// mock.module() is process-global and mock.restore() does not undo it.
+// Stop 6 runs this file in one bun test process with loader.test.ts. Loader
+// and discovery cache the first logger createLogger() returns, so a later
+// file's createLogger mock never receives warn() calls.
+//
+// createLogger() therefore returns one stable bridge. Method calls forward
+// to whichever test file currently owns the slot (this file by default;
+// loader.test.ts adopts the slot in its beforeEach). No production reset
+// hook is required.
+
+type WorkflowTestLogFn = (...args: unknown[]) => unknown;
+
+interface WorkflowTestLogger {
+  info: WorkflowTestLogFn;
+  warn: WorkflowTestLogFn;
+  error: WorkflowTestLogFn;
+  debug: WorkflowTestLogFn;
+  trace: WorkflowTestLogFn;
+  fatal: WorkflowTestLogFn;
+  child: WorkflowTestLogFn;
+}
+
+interface WorkflowTestLoggerSlot {
+  current: WorkflowTestLogger;
+  bridge: WorkflowTestLogger;
+}
+
+const WORKFLOW_TEST_LOGGER_SLOT = '__archonWorkflowTestLoggerSlot';
 
 const mockLogFn = mock(() => {});
 const mockLogger = {
@@ -18,8 +47,44 @@ const mockLogger = {
   fatal: mockLogFn,
   child: mock(() => mockLogger),
 };
+
+// Test loggers are bun mocks. The cast only selects the methods the bridge forwards.
+function asWorkflowTestLogger(logger: object): WorkflowTestLogger {
+  return logger as WorkflowTestLogger;
+}
+
+function installWorkflowTestLoggerSlot(initial: WorkflowTestLogger): WorkflowTestLoggerSlot {
+  const slot: WorkflowTestLoggerSlot = {
+    current: initial,
+    bridge: undefined as unknown as WorkflowTestLogger,
+  };
+  const forward = (method: keyof WorkflowTestLogger): WorkflowTestLogFn => {
+    return (...args: unknown[]): unknown => {
+      const fn = slot.current[method];
+      return fn(...args);
+    };
+  };
+  slot.bridge = {
+    info: forward('info'),
+    warn: forward('warn'),
+    error: forward('error'),
+    debug: forward('debug'),
+    trace: forward('trace'),
+    fatal: forward('fatal'),
+    child: (...args: unknown[]): unknown => {
+      slot.current.child(...args);
+      return slot.bridge;
+    },
+  };
+  (globalThis as unknown as Record<string, WorkflowTestLoggerSlot>)[WORKFLOW_TEST_LOGGER_SLOT] =
+    slot;
+  return slot;
+}
+
+const workflowTestLoggerSlot = installWorkflowTestLoggerSlot(asWorkflowTestLogger(mockLogger));
+
 mock.module('@archon/paths', () => ({
-  createLogger: mock(() => mockLogger),
+  createLogger: mock(() => workflowTestLoggerSlot.bridge),
   getCommandFolderSearchPaths: (folder?: string) => {
     const paths = ['.archon/commands'];
     if (folder) paths.unshift(folder);
@@ -277,6 +342,10 @@ function mockBashExecWithScriptCapture(
 // bash-capture mock silently feeds canned output to unrelated tests and fails
 // bun-spawning script nodes). mock.restore() only restores spies, not
 // mock.module registrations.
+beforeEach(() => {
+  workflowTestLoggerSlot.current = asWorkflowTestLogger(mockLogger);
+});
+
 afterEach(() => {
   mock.restore();
 });
@@ -1362,6 +1431,224 @@ describe('executeDagWorkflow -- loop idle ceiling override', () => {
     } finally {
       if (prevIdle === undefined) delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
       else process.env.ARCHON_LOOP_ITERATION_IDLE_MS = prevIdle;
+    }
+  });
+
+  async function* streamActivityThenComplete(): AsyncGenerator<{
+    type: string;
+    content?: string;
+    sessionId?: string;
+  }> {
+    const started = Date.now();
+    while (Date.now() - started < 400) {
+      await new Promise<void>(resolve => setTimeout(resolve, 20));
+      yield { type: 'assistant', content: 'still working\n' };
+    }
+    yield { type: 'assistant', content: 'COMPLETE\n' };
+    yield { type: 'result', sessionId: 'wall-activity-session' };
+  }
+
+  function restoreLoopTimerEnv(prevWall: string | undefined, prevIdle: string | undefined): void {
+    if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    else process.env.ARCHON_LOOP_ITERATION_WALL_MS = prevWall;
+    if (prevIdle === undefined) delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    else process.env.ARCHON_LOOP_ITERATION_IDLE_MS = prevIdle;
+  }
+
+  it('still-producing iteration survives until its wall', async () => {
+    const prevWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    try {
+      mockSendQueryDag.mockImplementation(streamActivityThenComplete);
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('productive-wall-survive-run');
+      const artifactsDir = join(testDir, 'artifacts-productive-wall');
+      const logDir = join(testDir, 'logs-productive-wall');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'productive-wall-survive',
+          nodes: [
+            {
+              id: 'implement',
+              idle_timeout: 100,
+              wall_timeout_ms: 1000,
+              loop: {
+                prompt: 'implement the plan',
+                until: 'COMPLETE',
+                max_iterations: 1,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+      );
+      expect(events.some(e => e.event_type === 'node_wall_breach')).toBe(false);
+      const recordedErrors = events.map(e => String(e.data?.error ?? '')).join('\n');
+      expect(recordedErrors).not.toMatch(/wall timeout/i);
+      expect(recordedErrors).not.toMatch(/idle timeout/i);
+      expect(
+        events.some(e => e.event_type === 'node_completed' && e.step_name === 'implement')
+      ).toBe(true);
+    } finally {
+      restoreLoopTimerEnv(prevWall, prevIdle);
+    }
+  });
+
+  it('still-producing iteration records attempt-1 wall breach when the wall is shorter than the stream', async () => {
+    const prevWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    try {
+      mockSendQueryDag.mockImplementation(streamActivityThenComplete);
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('productive-wall-breach-run');
+      const artifactsDir = join(testDir, 'artifacts-productive-breach');
+      const logDir = join(testDir, 'logs-productive-breach');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'productive-wall-breach',
+          nodes: [
+            {
+              id: 'implement',
+              idle_timeout: 100,
+              wall_timeout_ms: 150,
+              loop: {
+                prompt: 'implement the plan',
+                until: 'COMPLETE',
+                max_iterations: 1,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+      );
+      const attemptOneBreaches = events.filter(
+        e =>
+          e.event_type === 'node_wall_breach' &&
+          e.step_name === 'implement' &&
+          e.data?.attempt === 1
+      );
+      expect(attemptOneBreaches).toHaveLength(1);
+      const failed = events.filter(
+        e => e.event_type === 'loop_iteration_failed' && e.step_name === 'implement'
+      );
+      expect(failed).toHaveLength(1);
+      expect(String(failed[0]?.data?.error ?? '')).toMatch(/wall timeout twice/i);
+      expect(
+        events.some(e => e.event_type === 'node_completed' && e.step_name === 'implement')
+      ).toBe(false);
+    } finally {
+      restoreLoopTimerEnv(prevWall, prevIdle);
+    }
+  });
+
+  it('silent iteration still dies at idle before the wall', async () => {
+    const prevWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    try {
+      mockSendQueryDag.mockImplementation(async function* () {
+        await new Promise<void>(() => {});
+        yield { type: 'assistant', content: 'never' };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('silent-idle-before-wall-run');
+      const artifactsDir = join(testDir, 'artifacts-silent-idle');
+      const logDir = join(testDir, 'logs-silent-idle');
+
+      const startedAt = Date.now();
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'silent-idle-before-wall',
+          nodes: [
+            {
+              id: 'implement',
+              idle_timeout: 100,
+              wall_timeout_ms: 5000,
+              loop: {
+                prompt: 'implement the plan',
+                until: 'COMPLETE',
+                max_iterations: 1,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+      const elapsedMs = Date.now() - startedAt;
+
+      const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+      );
+      const failed = events.filter(
+        e => e.event_type === 'node_failed' && e.step_name === 'implement'
+      );
+      expect(failed).toHaveLength(1);
+      const errText = String(failed[0]?.data?.error ?? '');
+      expect(errText).toContain('exceeded idle timeout (100ms)');
+      expect(errText).not.toMatch(/wall timeout/i);
+      expect(elapsedMs).toBeLessThan(5000);
+    } finally {
+      restoreLoopTimerEnv(prevWall, prevIdle);
     }
   });
 });
