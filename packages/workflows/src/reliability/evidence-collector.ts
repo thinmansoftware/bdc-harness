@@ -367,8 +367,9 @@ export async function collectRuntimeEvidence(
   // unreachable after the base branch is squash-merged and gc-pruned (a ROUTINE
   // event that must never fail a run). Fall back to the authority's base BRANCH
   // lane (origin/<baseBranch>), which shares true history with HEAD, before giving
-  // up. The fallback's own failure (genuinely disjoint lane) still throws.
-  // That fallback does not consult repair events.
+  // up. A genuinely disjoint lane has no merge-base with HEAD. Normalize that
+  // git failure to gate_scope_mismatch before any diff. The fallback does not
+  // consult repair events.
   //
   // When the pinned base is reachable but origin has moved forward
   // (WO-HARNESS-MANIFEST-STALE-BASE-DIFF-01), file changes and merge ancestors
@@ -391,15 +392,26 @@ export async function collectRuntimeEvidence(
   }
   const events = await store.listWorkflowEvents(request.runId);
   const originRef = `refs/remotes/origin/${authority.baseBranch}`;
+  const baseLaneScopeMismatch =
+    'gate_scope_mismatch: run scope is not an ancestor of the base-lane merge-base';
+  // HEAD disjoint from the base lane makes `git merge-base` exit non-zero with
+  // a raw git error. Callers require the exact gate_scope_mismatch string.
+  const originLaneMergeBase = async (): Promise<string> => {
+    try {
+      return await git(['merge-base', originRef, headSha]);
+    } catch {
+      throw new Error(baseLaneScopeMismatch);
+    }
+  };
   let mergeBaseSha = '';
   let acceptAdvancedBase = false;
   let repairScopeReanchored = false;
   let repairLeaseSha = '';
   let repairPullNumber = 0;
   if (!pinnedMergeBase) {
-    mergeBaseSha = await git(['merge-base', originRef, headSha]);
+    mergeBaseSha = await originLaneMergeBase();
   } else {
-    const laneMergeBase = await git(['merge-base', originRef, headSha]);
+    const laneMergeBase = await originLaneMergeBase();
     let runScopeIsAncestor = false;
     try {
       await git(['merge-base', '--is-ancestor', authority.runScopeSha, laneMergeBase]);
@@ -420,9 +432,7 @@ export async function collectRuntimeEvidence(
         (await gitAncestor(git, repair.leaseSha, headSha)) &&
         (await gitAncestor(git, laneMergeBase, authority.baseSha));
       if (!reanchored || repair === null) {
-        throw new Error(
-          'gate_scope_mismatch: run scope is not an ancestor of the base-lane merge-base'
-        );
+        throw new Error(baseLaneScopeMismatch);
       }
       mergeBaseSha = laneMergeBase;
       repairScopeReanchored = true;
