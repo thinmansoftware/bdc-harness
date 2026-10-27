@@ -333,10 +333,17 @@ function upwardHarnessRoot(cwd: string): string | null {
 export function resolveTrustedRunnerFile(cwd: string): string | null {
   const candidates: string[] = [];
   const override = process.env.HARNESS_ROOT_OVERRIDE;
-  if (override && isHarnessOrigin(gitOrigin(override))) candidates.push(override);
+  const selfRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
+  if (override) {
+    try {
+      if (realpathSync(override) === realpathSync(selfRoot)) candidates.push(override);
+    } catch {
+      // An absent or non-canonical override is never a trust source.
+    }
+  }
   candidates.push('/app');
   candidates.push('/.archon/workspaces/thinmansoftware/bdc-harness/source');
-  const archonHome = process.env.ARCHON_HOME ?? join(homedir(), '.archon');
+  const archonHome = join(homedir(), '.archon');
   candidates.push(join(archonHome, 'workspaces/thinmansoftware/bdc-harness/source'));
   const walked = upwardHarnessRoot(cwd);
   if (walked) candidates.push(walked);

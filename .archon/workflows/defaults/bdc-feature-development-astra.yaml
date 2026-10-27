@@ -1819,14 +1819,19 @@ nodes:
       # Tokenization, node --test admission, and subprocess spawn live in
       # packages/workflows/src/reliability/structured-evidence-runner.ts.
       ser_root() {
-        local c root pkg url d
-        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ] && url="$(git -C "$HARNESS_ROOT_OVERRIDE" remote get-url origin 2>/dev/null || true)" && printf '%s\n' "$url" | grep -Eq '^(https?://github\.com/|ssh://git@github\.com/|git@github\.com:)thinmansoftware/bdc-harness(\.git)?/?$'; then
-          root="$HARNESS_ROOT_OVERRIDE"
-          pkg="$root/packages/workflows/package.json"
-          if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-            printf '%s' "$root"
-            return 0
-          fi
+        local c root pkg url d override_real
+        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
+          override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE" 2>/dev/null && pwd -P || true)"
+          case "$override_real" in
+            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/*)
+              root="$override_real"
+              pkg="$root/packages/workflows/package.json"
+              if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+                printf '%s' "$root"
+                return 0
+              fi
+              ;;
+          esac
         fi
         for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
           pkg="$c/packages/workflows/package.json"
@@ -2205,14 +2210,19 @@ nodes:
       # Bare token charset includes the historical ^[A-Za-z0-9@%+=:,./_*?-]+$ set plus ~ and ^.
       # find -exec/-execdir/-ok/-delete and decoded sort/grep flag bypasses are refused.
       ser_root() {
-        local c root pkg url d
-        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ] && url="$(git -C "$HARNESS_ROOT_OVERRIDE" remote get-url origin 2>/dev/null || true)" && printf '%s\n' "$url" | grep -Eq '^(https?://github\.com/|ssh://git@github\.com/|git@github\.com:)thinmansoftware/bdc-harness(\.git)?/?$'; then
-          root="$HARNESS_ROOT_OVERRIDE"
-          pkg="$root/packages/workflows/package.json"
-          if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-            printf '%s' "$root"
-            return 0
-          fi
+        local c root pkg url d override_real
+        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
+          override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE" 2>/dev/null && pwd -P || true)"
+          case "$override_real" in
+            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/*)
+              root="$override_real"
+              pkg="$root/packages/workflows/package.json"
+              if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+                printf '%s' "$root"
+                return 0
+              fi
+              ;;
+          esac
         fi
         for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
           pkg="$c/packages/workflows/package.json"
@@ -4334,14 +4344,19 @@ nodes:
 
       # ---- BEGIN sme core (byte-identical across lanes; extracted by unit test) ----
       ser_root() {
-        local c root pkg url d
-        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ] && url="$(git -C "$HARNESS_ROOT_OVERRIDE" remote get-url origin 2>/dev/null || true)" && printf '%s\n' "$url" | grep -Eq '^(https?://github\.com/|ssh://git@github\.com/|git@github\.com:)thinmansoftware/bdc-harness(\.git)?/?$'; then
-          root="$HARNESS_ROOT_OVERRIDE"
-          pkg="$root/packages/workflows/package.json"
-          if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-            printf '%s' "$root"
-            return 0
-          fi
+        local c root pkg url d override_real
+        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
+          override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE" 2>/dev/null && pwd -P || true)"
+          case "$override_real" in
+            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/*)
+              root="$override_real"
+              pkg="$root/packages/workflows/package.json"
+              if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+                printf '%s' "$root"
+                return 0
+              fi
+              ;;
+          esac
         fi
         for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
           pkg="$c/packages/workflows/package.json"
@@ -4482,14 +4497,19 @@ nodes:
 
       # ---- BEGIN mec core (byte-identical across lanes; extracted by unit test) ----
       ser_root() {
-        local c root pkg url d
-        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ] && url="$(git -C "$HARNESS_ROOT_OVERRIDE" remote get-url origin 2>/dev/null || true)" && printf '%s\n' "$url" | grep -Eq '^(https?://github\.com/|ssh://git@github\.com/|git@github\.com:)thinmansoftware/bdc-harness(\.git)?/?$'; then
-          root="$HARNESS_ROOT_OVERRIDE"
-          pkg="$root/packages/workflows/package.json"
-          if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-            printf '%s' "$root"
-            return 0
-          fi
+        local c root pkg url d override_real
+        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
+          override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE" 2>/dev/null && pwd -P || true)"
+          case "$override_real" in
+            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/*)
+              root="$override_real"
+              pkg="$root/packages/workflows/package.json"
+              if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+                printf '%s' "$root"
+                return 0
+              fi
+              ;;
+          esac
         fi
         for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
           pkg="$c/packages/workflows/package.json"
@@ -4680,14 +4700,19 @@ nodes:
       #   fragmented by the ';'-split below and each fragment fails this gate
       #   rather than executing.
       ser_root() {
-        local c root pkg url d
-        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ] && url="$(git -C "$HARNESS_ROOT_OVERRIDE" remote get-url origin 2>/dev/null || true)" && printf '%s\n' "$url" | grep -Eq '^(https?://github\.com/|ssh://git@github\.com/|git@github\.com:)thinmansoftware/bdc-harness(\.git)?/?$'; then
-          root="$HARNESS_ROOT_OVERRIDE"
-          pkg="$root/packages/workflows/package.json"
-          if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-            printf '%s' "$root"
-            return 0
-          fi
+        local c root pkg url d override_real
+        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
+          override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE" 2>/dev/null && pwd -P || true)"
+          case "$override_real" in
+            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/*)
+              root="$override_real"
+              pkg="$root/packages/workflows/package.json"
+              if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
+                printf '%s' "$root"
+                return 0
+              fi
+              ;;
+          esac
         fi
         for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
           pkg="$c/packages/workflows/package.json"
