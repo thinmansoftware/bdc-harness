@@ -29,6 +29,7 @@ import { fireTier, buildFireMessage } from './fire.js';
 import { pollForTerminal, TimeoutError, DEFAULT_OPEN_NODE_BUDGET_MS } from './poll.js';
 import { fetchNodeTimeoutsMs } from './node-timeouts.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
+import { classifyGateMisfire } from './gate-misfire.js';
 import { createRecord, writeRecord } from './recorder.js';
 export { readCascadeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
@@ -641,6 +642,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
     let frontierApprovalRecord: CascadeRunRecord['frontierApproval'];
     let refusalReason: CascadeRunRecord['refusalReason'];
+    let gateMisfireRecord: CascadeRunRecord['gateMisfire'];
     let automaticPreflightTier: string | null = null;
 
     function buildCurrentRecord(): CascadeRunRecord {
@@ -672,7 +674,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
         ...(frontierApprovalRecord ? { frontierApproval: frontierApprovalRecord } : {}),
         ...(refusalReason ? { refusalReason } : {}),
-        entrySelection,
+        ...(gateMisfireRecord ? { gateMisfire: gateMisfireRecord } : {}),
+        ...(entrySelection ? { entrySelection } : {}),
       };
     }
 
@@ -1226,6 +1229,42 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         console.log(`[smart-cauldron] CANCELLED on tier=${tier.name}: ${verdict.reason}`);
         await checkpoint();
         break;
+      }
+
+      // Harness gate misfire: the gate failed for a harness-side reason, not
+      // because the implement tier produced bad work. Stop on this tier with
+      // one Dispatch notice. Do not climb and do not post SPEC-REPAIR.
+      if (outcome === 'gate-failed') {
+        const misfire = classifyGateMisfire(pollResult);
+        if (misfire) {
+          attempt.outcome = 'gate-misfire';
+          attempt.gateFailReason = `${misfire.kind}: ${misfire.reason}`;
+          status = 'gate-misfire';
+          winningTier = null;
+          gateMisfireRecord = {
+            kind: misfire.kind,
+            gateNode: misfire.gateNode,
+            failedNodes: misfire.failedNodes,
+            reason: misfire.reason,
+            runId: fireResult.runId,
+            tier: tier.name,
+          };
+          await emitEscalation({
+            errorClass: 'harness_gate_misfire',
+            woId,
+            reason:
+              `GATE MISFIRE (no climb): ${misfire.kind} at ${misfire.gateNode} ` +
+              `on tier ${tier.name} -- ${misfire.reason}`,
+            remediation: [
+              'Fix owner: harness gate (sibling gate WOs, bdc-xo#3743, or bdc-xo#3737). Do not treat this as an implement failure.',
+              'Re-fire the same tier after the harness fix lands; do not escalate',
+            ],
+            runId: fireResult.runId,
+            overseerPermit: opts.overseerPermit,
+          });
+          await checkpoint();
+          break;
+        }
       }
 
       // Gate failed

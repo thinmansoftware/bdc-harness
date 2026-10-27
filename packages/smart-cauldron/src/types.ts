@@ -5,6 +5,7 @@
  * WO: WO-HARNESS-SMART-CAULDRON-V1-PER-RUN-CASCADE-01
  */
 
+import type { GateMisfire } from './gate-misfire.js';
 import type { EntrySelection } from './headroom.js';
 
 export type TierName = string; // e.g. "zero", "qwen", "codex", "claude", "frontier"
@@ -16,6 +17,7 @@ export type TierOutcome =
   | 'infra-error' // auth/transport failure -- alert, do not count as "too hard"
   | 'progress-timeout' // poll watchdog kill -- run never reached terminal; climb like gate-failed
   | 'cancelled' // externally cancelled; stop, do not climb
+  | 'gate-misfire' // harness gate misfire; stop on this tier, do not climb
   | 'refused'; // already-satisfied guard refused to fire this attempt; distinct from won (bdc-xo#2140)
 
 export interface LadderTier {
@@ -65,6 +67,7 @@ export type CascadeStatus =
   | 'frontier-rejected' // operator rejected the premium-tier climb; terminated as needs-human, no fire
   | 'frontier-approved' // operator approved the premium climb; original record handed off to the resumed cascade (resumeCascadeId)
   | 'cancelled' // an attempt was externally cancelled; cascade stopped
+  | 'gate-misfire' // harness gate misfire; stopped on this tier with one notice, no climb
   | 'refused'; // the already-satisfied guard refused to fire (WO already has a landed PR); attempts stays 0. Distinct from 'won': no tier ran, no gate passed --
 // a refusal is not a win and must never be reported as one (bdc-xo#2140).
 
@@ -166,6 +169,14 @@ export interface CascadeRunRecord {
     prState: string;
     prUrl: string;
     checkedAtTier: TierName | null;
+  };
+  /**
+   * Populated ONLY when status === 'gate-misfire': a harness-side gate misfire
+   * ended the cascade on this tier. No climb and no SPEC-REPAIR.
+   */
+  gateMisfire?: GateMisfire & {
+    runId: string | null;
+    tier: TierName;
   };
   supervisorRecovery?: {
     ownerId: string;
