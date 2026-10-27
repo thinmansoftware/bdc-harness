@@ -221,6 +221,7 @@ import {
   DispatchNonSystemCapability,
   DispatchPrincipalAuthError,
   authenticateDispatchPrincipal,
+  parseDispatchPrincipalsRegistry,
   type DispatchSenderAuthMode,
 } from '../auth/dispatch-principal';
 import { createLogger as createDispatchRouteLogger } from '@archon/paths';
@@ -325,6 +326,7 @@ import {
   dispatchMessageSchema,
   dispatchSenderBodySchema,
   dispatchWorkerSchema,
+  dispatchPrincipalsResponseSchema,
   dispatchStatusQuerySchema,
   dispatchStatusResponseSchema,
   executionHandoffBodySchema,
@@ -950,6 +952,37 @@ const getDispatchStatusRoute = createRoute({
     200: {
       content: { 'application/json': { schema: dispatchStatusResponseSchema } },
       description: 'Dispatch status',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+function dispatchPrincipalAckPath(
+  principalId: string,
+  deliveryMode: dispatchDb.DispatchDeliveryMode,
+  credentialConfigured: boolean
+): 'xo_lease' | 'operator_token' | 'principal_credential' | 'worker_claim' | 'none' {
+  if (principalId === 'xo') return 'xo_lease';
+  if (principalId === 'operator') return 'operator_token';
+  if (deliveryMode === 'worker_poll') return 'worker_claim';
+  if (
+    credentialConfigured &&
+    (deliveryMode === 'drain_on_start' || deliveryMode === 'notify_only')
+  ) {
+    return 'principal_credential';
+  }
+  return 'none';
+}
+
+const getDispatchPrincipalsRoute = createRoute({
+  method: 'get',
+  path: '/api/dispatch/principals',
+  tags: ['Dispatch'],
+  summary: 'List dispatch principals and the ack path each one has',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchPrincipalsResponseSchema } },
+      description: 'Dispatch principals',
     },
     500: jsonError('Server error'),
   },
@@ -4745,6 +4778,49 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'dispatch_status_failed');
       return apiError(c, 500, 'Failed to get dispatch status');
+    }
+  });
+
+  registerOpenApiRoute(getDispatchPrincipalsRoute, async c => {
+    try {
+      const rawRegistry = process.env.DISPATCH_PRINCIPALS_JSON;
+      let records: { principal_id: string; receive_as: readonly string[] }[] = [];
+      if (rawRegistry !== undefined && rawRegistry !== '') {
+        try {
+          records = parseDispatchPrincipalsRegistry(rawRegistry).map(record => ({
+            principal_id: record.principal_id,
+            receive_as: record.receive_as,
+          }));
+        } catch (error) {
+          const authMapped = mapDispatchPrincipalAuthError(c, error);
+          if (authMapped) return authMapped;
+          getLog().error({ err: error }, 'dispatch_principals_registry_invalid');
+          return apiError(c, 500, 'dispatch_principal_config_invalid');
+        }
+      }
+      const rows = await dispatchDb.listDispatchPrincipals();
+      const principals = rows.map(row => {
+        const credentialConfigured = records.some(
+          record =>
+            record.principal_id === row.principal_id || record.receive_as.includes(row.principal_id)
+        );
+        return {
+          principal_id: row.principal_id,
+          display_name: row.display_name,
+          delivery_mode: row.delivery_mode,
+          active: row.active,
+          credential_configured: credentialConfigured,
+          ack_path: dispatchPrincipalAckPath(
+            row.principal_id,
+            row.delivery_mode,
+            credentialConfigured
+          ),
+        };
+      });
+      return c.json({ principals });
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_principals_failed');
+      return apiError(c, 500, 'Failed to list dispatch principals');
     }
   });
 

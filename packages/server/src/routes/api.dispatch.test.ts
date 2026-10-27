@@ -2002,4 +2002,121 @@ describe('dispatch API', () => {
       ).toBe(0);
     });
   });
+
+  test('lists every dispatch principal with its ack path and no token material', async () => {
+    await db.query('DELETE FROM dispatch_principals');
+    await db.query(
+      `INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
+       VALUES
+         ('codex', 'Codex', 'worker_poll', 1),
+         ('john', 'John', 'notify_only', 0),
+         ('operator', 'Operator', 'drain_on_start', 1),
+         ('xo', 'XO', 'drain_on_start', 1),
+         ('xo-fable', 'XO Fable', 'drain_on_start', 1)`
+    );
+    const secret = 'tok-TESTSECRET-3';
+    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+      {
+        credential_id: 'codex-mcp-receive',
+        principal_id: 'codex-mcp',
+        token_sha256: sha(secret),
+        status: 'active',
+        send_as: ['codex-mcp'],
+        receive_as: [],
+        roles: ['receive'],
+      },
+    ]);
+    const response = await makeApp('secret-token').request('/api/dispatch/principals', {
+      headers: { 'x-archon-operator-token': 'secret-token' },
+    });
+    const text = await response.text();
+    expect(response.status).toBe(200);
+    const body = JSON.parse(text) as {
+      principals: Array<{
+        principal_id: string;
+        display_name: string;
+        delivery_mode: string;
+        active: boolean;
+        credential_configured: boolean;
+        ack_path: string;
+      }>;
+    };
+    expect(body.principals.map(entry => entry.principal_id)).toEqual([
+      'codex',
+      'john',
+      'operator',
+      'xo',
+      'xo-fable',
+    ]);
+    expect(body.principals.map(entry => entry.ack_path)).toEqual([
+      'worker_claim',
+      'none',
+      'operator_token',
+      'xo_lease',
+      'none',
+    ]);
+    expect(body.principals.map(entry => entry.credential_configured)).toEqual([
+      false,
+      false,
+      false,
+      false,
+      false,
+    ]);
+    expect(body.principals.map(entry => entry.active)).toEqual([true, false, true, true, true]);
+    for (const entry of body.principals) {
+      expect(Object.keys(entry).sort()).toEqual([
+        'ack_path',
+        'active',
+        'credential_configured',
+        'delivery_mode',
+        'display_name',
+        'principal_id',
+      ]);
+    }
+    expect(text).not.toContain(secret);
+    expect(text).not.toContain(sha(secret));
+    expect(text).not.toContain('token_sha256');
+  });
+
+  test('principals listing requires the operator token', async () => {
+    const response = await makeApp('secret-token').request('/api/dispatch/principals');
+    expect(response.status).toBe(401);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty('principals');
+  });
+
+  test('principals listing fails closed when the registry is malformed', async () => {
+    process.env.DISPATCH_PRINCIPALS_JSON = '{not json';
+    const response = await makeApp('secret-token').request('/api/dispatch/principals', {
+      headers: { 'x-archon-operator-token': 'secret-token' },
+    });
+    expect(response.status).toBe(500);
+    const body = (await response.json()) as Record<string, unknown>;
+    expect(body.error).toBe('dispatch_principal_config_invalid');
+    expect(body).not.toHaveProperty('principals');
+  });
+
+  test('operator token cannot acknowledge an xo mailbox row', async () => {
+    const message = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'xo-operator-cannot-ack',
+      recipient: 'xo',
+    });
+    const response = await makeApp('secret-token').request(
+      `/api/dispatch/messages/${message.id}/ack`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-archon-operator-token': 'secret-token',
+        },
+        body: JSON.stringify({ principal_id: 'xo' }),
+      }
+    );
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as { error: string }).error).toBe('actor_mismatch');
+    const stored = await storedReceipt(message.id);
+    expect(stored.acknowledged_at).toBeNull();
+    expect(stored.acknowledged_by).toBeNull();
+  });
 });
