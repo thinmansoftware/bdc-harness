@@ -822,8 +822,12 @@ nodes:
                 if [ -n "$sha" ]; then
                   break
                 fi
+                shallow=$(git rev-parse --is-shallow-repository 2>/dev/null || printf '%s' false)
+                if [ "$shallow" != "true" ]; then
+                  break
+                fi
               done
-              if [ -z "$sha" ]; then
+              if [ -z "$sha" ] && [ "$shallow" = "true" ]; then
                 err=$(mktemp)
                 if ! git fetch --quiet --unshallow origin 2>"$err"; then
                   line=$(head -n 1 "$err" || true)
