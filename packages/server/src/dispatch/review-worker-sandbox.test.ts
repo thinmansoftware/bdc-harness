@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { chmod, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readTrustedCheckPlan, sealReviewCheckout } from './review-worker-clock';
@@ -28,18 +28,22 @@ test('checkout_sealed_not_group_writable and does not follow symlinks', async ()
     await chmod(outside, 0o666);
     await symlink(outside, join(checkout, 'outside-link'));
     await sealReviewCheckout(checkout);
-    expect((await lstat(checkout)).mode & 0o022).toBe(0);
-    expect((await lstat(nested)).mode & 0o022).toBe(0);
-    expect((await lstat(join(nested, 'file'))).mode & 0o022).toBe(0);
-    expect((await lstat(outside)).mode & 0o777).toBe(0o666);
+    if (process.platform !== 'win32') {
+      expect((await lstat(checkout)).mode & 0o022).toBe(0);
+      expect((await lstat(nested)).mode & 0o022).toBe(0);
+      expect((await lstat(join(nested, 'file'))).mode & 0o022).toBe(0);
+      expect((await lstat(outside)).mode & 0o777).toBe(0o666);
+    }
+    expect((await lstat(join(checkout, 'outside-link'))).isSymbolicLink()).toBe(true);
+    expect(await readFile(outside, 'utf8')).toBe('outside');
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
 test('negative_probe_success_fails_closed', async () => {
-  const script = "if /bin/true; then echo 'FAIL: forbidden probe succeeded'; exit 1; fi";
-  const child = Bun.spawn(['/bin/sh', '-c', script], { stdout: 'pipe', stderr: 'pipe' });
+  const script = "console.log('FAIL: forbidden probe succeeded'); process.exit(1)";
+  const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe' });
   const output = await new Response(child.stdout).text();
   expect(await child.exited).not.toBe(0);
   expect(output).toContain('FAIL: forbidden probe succeeded');

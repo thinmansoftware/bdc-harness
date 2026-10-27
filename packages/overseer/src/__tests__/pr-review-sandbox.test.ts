@@ -63,7 +63,7 @@ const proof: ReviewExecutionProof = {
 
 test('negative_probe_success_fails_closed', async () => {
   const child = Bun.spawn(
-    ['/bin/sh', '-c', "if /bin/true; then echo 'FAIL: forbidden probe succeeded'; exit 1; fi"],
+    [process.execPath, '-e', "console.log('FAIL: forbidden probe succeeded'); process.exit(1)"],
     { stdout: 'pipe', stderr: 'pipe' }
   );
   const output = await new Response(child.stdout).text();
