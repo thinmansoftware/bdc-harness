@@ -2078,6 +2078,93 @@ describe('dispatch API', () => {
     expect(text).not.toContain('token_sha256');
   });
 
+  test('credential_configured is true via principal_id or receive_as and selects principal_credential', async () => {
+    await db.query('DELETE FROM dispatch_principals');
+    await db.query(
+      `INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
+       VALUES
+         ('codex', 'Codex', 'worker_poll', 1),
+         ('john', 'John', 'notify_only', 1),
+         ('operator', 'Operator', 'drain_on_start', 1),
+         ('xo', 'XO', 'drain_on_start', 1),
+         ('xo-fable', 'XO Fable', 'drain_on_start', 1)`
+    );
+    const principalSecret = 'tok-TESTSECRET-4';
+    const receiveSecret = 'tok-TESTSECRET-5';
+    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+      {
+        credential_id: 'xo-fable-receive',
+        principal_id: 'xo-fable',
+        token_sha256: sha(principalSecret),
+        status: 'active',
+        send_as: ['xo-fable'],
+        receive_as: [],
+        roles: ['receive'],
+      },
+      {
+        credential_id: 'desk-alias-receive',
+        principal_id: 'desk-alias',
+        token_sha256: sha(receiveSecret),
+        status: 'active',
+        send_as: ['desk-alias'],
+        receive_as: ['john'],
+        roles: ['receive'],
+      },
+    ]);
+    const response = await makeApp('secret-token').request('/api/dispatch/principals', {
+      headers: { 'x-archon-operator-token': 'secret-token' },
+    });
+    const text = await response.text();
+    expect(response.status).toBe(200);
+    const body = JSON.parse(text) as {
+      principals: Array<{
+        principal_id: string;
+        display_name: string;
+        delivery_mode: string;
+        active: boolean;
+        credential_configured: boolean;
+        ack_path: string;
+      }>;
+    };
+    expect(body.principals.map(entry => entry.principal_id)).toEqual([
+      'codex',
+      'john',
+      'operator',
+      'xo',
+      'xo-fable',
+    ]);
+    const byId = new Map(body.principals.map(entry => [entry.principal_id, entry]));
+    expect(byId.get('xo-fable')).toMatchObject({
+      credential_configured: true,
+      ack_path: 'principal_credential',
+      delivery_mode: 'drain_on_start',
+    });
+    expect(byId.get('john')).toMatchObject({
+      credential_configured: true,
+      ack_path: 'principal_credential',
+      delivery_mode: 'notify_only',
+    });
+    expect(byId.get('codex')).toMatchObject({
+      credential_configured: false,
+      ack_path: 'worker_claim',
+    });
+    expect(byId.get('operator')).toMatchObject({
+      credential_configured: false,
+      ack_path: 'operator_token',
+    });
+    expect(byId.get('xo')).toMatchObject({
+      credential_configured: false,
+      ack_path: 'xo_lease',
+    });
+    expect(text).not.toContain('desk-alias');
+    expect(text).not.toContain(principalSecret);
+    expect(text).not.toContain(receiveSecret);
+    expect(text).not.toContain(sha(principalSecret));
+    expect(text).not.toContain(sha(receiveSecret));
+    expect(text).not.toContain('token_sha256');
+    expect(text).not.toContain('credential_id');
+  });
+
   test('principals listing requires the operator token', async () => {
     const response = await makeApp('secret-token').request('/api/dispatch/principals');
     expect(response.status).toBe(401);

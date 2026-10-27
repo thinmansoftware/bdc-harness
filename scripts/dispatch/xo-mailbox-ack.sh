@@ -127,11 +127,27 @@ fi
 
 redact_detail() {
   local detail="$1"
+  local holder_sha detail_fold
   if [[ "$detail" == *"$BOARD_PRINCIPAL_TOKEN"* || "$detail" == *"$XO_HOLDER_TOKEN"* ]]; then
     printf 'error\n'
     return
   fi
   if [[ -n "${ARCHON_OPERATOR_TOKEN:-}" && "$detail" == *"$ARCHON_OPERATOR_TOKEN"* ]]; then
+    printf 'error\n'
+    return
+  fi
+  # Hash the exact token bytes. A trailing newline would not match the server digest.
+  holder_sha="$(
+    printf '%s' "$XO_HOLDER_TOKEN" |
+      python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())' 2>/dev/null ||
+      true
+  )"
+  if [[ ! "$holder_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'error\n'
+    return
+  fi
+  detail_fold="$(printf '%s' "$detail" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$detail_fold" == *"$holder_sha"* ]]; then
     printf 'error\n'
     return
   fi
