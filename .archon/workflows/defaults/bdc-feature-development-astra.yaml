@@ -2462,7 +2462,7 @@ nodes:
       # rst_format_compared_line <p> <t> <cmd> <exit> <bp> <bt> <sha8> <newly> <names> <failed-form> <suffix> <unexplained>
       rst_format_compared_line() {
         local p="$1" t="$2" cmd="$3" exit_code="$4" bp="$5" bt="$6" sha8="$7" newly="$8" names="$9"
-        local failed_form="${10}" suffix="${11}" unexplained="${12}" body namepart=""
+        local failed_form="${10}" suffix="${11}" unexplained="${12}" regress="${13:-}" body namepart=""
         if [ -n "$names" ]; then
           namepart=" (${names})"
         fi
@@ -2473,6 +2473,9 @@ nodes:
         fi
         if [ "$unexplained" = "1" ]; then
           body="${body} unexplained head exit ${exit_code}"
+        fi
+        if [ -n "$regress" ]; then
+          body="${body} ${regress}"
         fi
         if [ -n "$suffix" ]; then
           printf '%s %s' "$body" "$suffix"
@@ -2519,11 +2522,95 @@ nodes:
           END { print c+0 }
         '
       }
+      # rst_segment_count <log> -> number of "### run-stop-tests:" command segments.
+      rst_segment_count() {
+        [ -f "$1" ] || { printf '0'; return 0; }
+        grep -c '^### run-stop-tests: ' "$1" 2>/dev/null || printf '0'
+      }
+      # rst_segment_outcomes <log> -> one line per command segment, in order:
+      #   "<exit>|<passed> <total>" (counts empty when the segment parsed none). A
+      #   segment runs from a "### run-stop-tests:" header to its "### exit" marker.
+      rst_segment_outcomes() {
+        local log="$1" n i body exitc counts
+        n="$(rst_segment_count "$log")"
+        i=1
+        while [ "$i" -le "$n" ]; do
+          body="$(awk -v w="$i" '
+            /^### run-stop-tests: / { s++; inb=(s==w); next }
+            /^### exit / { if (s==w) inb=0; next }
+            inb && !/^### / { print }
+          ' "$log")"
+          exitc="$(awk -v w="$i" '
+            /^### run-stop-tests: / { s++; next }
+            /^### exit / { if (s==w) { print $3; exit } }
+          ' "$log")"
+          counts="$(printf '%s\n' "$body" | rst_parse_counts)"
+          printf '%s|%s\n' "${exitc:-none}" "$counts"
+          i=$((i + 1))
+        done
+      }
+      # rst_cmd_regression <head-log> <base-log> -> "1" when any single command's head
+      #   outcome is worse than the same command on the base, else "0" (bdc-xo #1940,
+      #   round 3). Commands are matched by position: the head log's last N segments
+      #   (N = base segment count) so ladder fall-through rungs are ignored. "Worse" =
+      #   base passed but head did not, base produced counts but head lost them (crash
+      #   or kill mid-run), a new timeout/kill (124/137/143), or strictly more failing
+      #   tests in that one command. A command equally broken on both sides is not a
+      #   regression. This keeps the verdict blocking when a new per-command failure
+      #   would otherwise be masked by matching identities elsewhere.
+      rst_cmd_regression() {
+        local head_log="$1" base_log="$2"
+        local base_lines head_lines k htotal start i hl bl he be hc bc
+        local hzero bzero hhc bhc hp ht bp bt hf bf
+        base_lines="$(rst_segment_outcomes "$base_log")"
+        head_lines="$(rst_segment_outcomes "$head_log")"
+        k="$(printf '%s\n' "$base_lines" | grep -c . || true)"
+        if [ "${k:-0}" -lt 1 ]; then printf '0'; return 0; fi
+        htotal="$(printf '%s\n' "$head_lines" | grep -c . || true)"
+        start=$((htotal - k + 1))
+        [ "$start" -lt 1 ] && start=1
+        head_lines="$(printf '%s\n' "$head_lines" | sed -n "${start},\$p")"
+        i=1
+        while [ "$i" -le "$k" ]; do
+          hl="$(printf '%s\n' "$head_lines" | sed -n "${i}p")"
+          bl="$(printf '%s\n' "$base_lines" | sed -n "${i}p")"
+          he="${hl%%|*}"; hc="${hl#*|}"
+          be="${bl%%|*}"; bc="${bl#*|}"
+          hzero=0; [ "$he" = "0" ] && hzero=1
+          bzero=0; [ "$be" = "0" ] && bzero=1
+          hhc=0; [ -n "$hc" ] && hhc=1
+          bhc=0; [ -n "$bc" ] && bhc=1
+          if [ "$bzero" = "1" ] && [ "$hzero" = "0" ]; then printf '1'; return 0; fi
+          if [ "$bhc" = "1" ] && [ "$hhc" = "0" ]; then printf '1'; return 0; fi
+          case "$he" in
+            124|137|143)
+              case "$be" in
+                124|137|143) ;;
+                *) printf '1'; return 0 ;;
+              esac
+              ;;
+          esac
+          if [ "$hhc" = "1" ] && [ "$bhc" = "1" ]; then
+            hp="${hc%% *}"; ht="${hc##* }"; bp="${bc%% *}"; bt="${bc##* }"
+            if rst_is_uint "$hp" && rst_is_uint "$ht" && rst_is_uint "$bp" && rst_is_uint "$bt"; then
+              hf=$((ht - hp)); bf=$((bt - bp))
+              [ "$hf" -lt 0 ] && hf=0
+              [ "$bf" -lt 0 ] && bf=0
+              if [ "$hf" -gt "$bf" ]; then printf '1'; return 0; fi
+            fi
+          fi
+          i=$((i + 1))
+        done
+        printf '0'
+      }
       # rst_apply_verdict <class> <cmd> <exit> <counts> <log> <head_status> <head_line> <review_base_output> <cmds_file>
       #   Runs only after the head ladder. Skips the base pass for DOCUMENTATION /
       #   OPERATOR, an empty command, head status passed / counts_unparsed /
       #   no_command_declared, and head exit 127. Otherwise compares failing
-      #   identities to the merge-base (fallback: run-start-sha.txt).
+      #   identities to the merge-base (fallback: run-start-sha.txt). A per-command
+      #   regression (rst_cmd_regression) forces a blocking verdict even when the
+      #   aggregate identities match; count-only evidence yields baseline_red only when
+      #   neither side observed a failing test.
       rst_apply_verdict() {
         local class="$1" cmd="$2" exit_code="$3" counts="$4" log="$5"
         local head_status="$6" head_line="$7" review_out="$8" cmds="$9"
@@ -2565,9 +2652,10 @@ nodes:
         cmds="$(rst_abs_path "$cmds")"
         local base_log="${log}.base" base_result="" base_exit="" base_counts=""
         local bp="" bt="" sha8="" evidence="no" bstatus="failed" mode="n/a" newly="none"
-        local head_src="$log" head_cmp="" head_records="" base_records=""
+        local head_cmp="" head_records="" base_records=""
         local suffix="" final_line="" shown="" failed_form=1 unexplained=0
         local hp="" ht="" names_h="" names_b="" only="" hf="" bf=""
+        local cmd_regression=0 regress_note=""
         sha8="$(printf '%s' "$base_sha" | cut -c1-8)"
         : > "$base_log" 2>/dev/null || true
         base_result="$(rst_base_pass "$base_sha" "$cmds" "$base_log")"
@@ -2600,18 +2688,30 @@ nodes:
         hp="${counts%% *}"
         ht="${counts##* }"
         unset RST_CMD_BUDGET_SECONDS
+        # Head identities come from the original run's log first (the same execution the
+        # head exit and counts were computed from). When the command uses a vitest/jest
+        # reporter, a supplemental reporter pass ADDS its per-test JSON identities; it
+        # never replaces the original run's identities, and its exit/counts are
+        # discarded (bdc-xo #1940, round 3). File identities stay from the original run
+        # only, so the reporter pass cannot double-count a file header.
+        head_records="$(rst_failing_names < "$log")"
         if rst_cmds_need_reporter "$cmds"; then
           head_cmp="$(mktemp)"
           rst_compare_commands "$cmds" "$head_cmp" >/dev/null
-          head_src="$head_cmp"
-        fi
-        head_records="$(rst_failing_names < "$head_src")"
-        base_records="$(rst_failing_names < "$base_log")"
-        rst_drop_json_reports "$head_src"
-        rst_drop_json_reports "$base_log"
-        if [ -n "$head_cmp" ]; then
+          head_records="$(
+            {
+              printf '%s\n' "$head_records"
+              rst_failing_names < "$head_cmp" | awk -F '\t' '$1 == "T"'
+            } | awk -F '\t' '
+              $1 == "T" { id = substr($0, 3); if (!(id in seen)) { seen[id] = 1; print } next }
+              $1 == "F" { print }
+            '
+          )"
+          rst_drop_json_reports "$head_cmp"
           rm -f "$head_cmp"
         fi
+        base_records="$(rst_failing_names < "$base_log")"
+        rst_drop_json_reports "$base_log"
         if [ "$base_exit" -ne 0 ] || printf '%s\n' "$base_records" | awk -F '\t' '$1=="T" || $1=="F" { found=1 } END { exit found ? 0 : 1 }' || [ "$bp" -lt "$bt" ]; then
           evidence="yes"
         fi
@@ -2626,6 +2726,10 @@ nodes:
           rst_emit_verdict "$base_sha" "$bstatus" "$bp" "$bt" 0 n/a "$base_exit" no "$base_log" failed "$final_line"
           return 0
         fi
+        # Per-command regression gate (bdc-xo #1940 round 3): a command that got worse
+        # at head (new failing exit, lost counts, new timeout, or more failures in that
+        # one command) blocks even when the aggregate identities match.
+        cmd_regression="$(rst_cmd_regression "$log" "$base_log")"
         local ht_n bt_n hf_n bf_n hf_sum bf_sum head_obs base_obs names_complete=0 file_cover=0
         head_obs=$((ht - hp))
         base_obs=$((bt - bp))
@@ -2687,7 +2791,11 @@ nodes:
           newly=$((head_obs - base_obs))
           if [ "$newly" -lt 0 ]; then newly=0; fi
           shown=""
-          if [ "$newly" -eq 0 ] && [ "$ht_n" -eq 0 ] && [ "$bt_n" -eq 0 ] && [ "$hf_n" -eq 0 ] && [ "$bf_n" -eq 0 ]; then
+          # bdc-xo #1940 round 3: counts alone never prove a head failure existed at
+          # base. baseline_red here is allowed only when neither side observed a
+          # failing test (an exit-code-only failure present on both sides); any
+          # observed failure without identities stays blocking.
+          if [ "$head_obs" -eq 0 ] && [ "$base_obs" -eq 0 ] && [ "$ht_n" -eq 0 ] && [ "$bt_n" -eq 0 ] && [ "$hf_n" -eq 0 ] && [ "$bf_n" -eq 0 ]; then
             head_status="baseline_red"
             failed_form=0
           else
@@ -2695,7 +2803,14 @@ nodes:
             failed_form=1
           fi
         fi
-        final_line="$(rst_format_compared_line "$hp" "$ht" "$cmd" "$exit_code" "$bp" "$bt" "$sha8" "$newly" "$shown" "$failed_form" "$suffix" 0)"
+        # A per-command regression overrides a would-be baseline_red: the aggregate
+        # identities matched, but one command got worse at head.
+        if [ "$cmd_regression" = "1" ] && [ "$head_status" = "baseline_red" ]; then
+          head_status="failed"
+          failed_form=1
+          regress_note="command regression at head"
+        fi
+        final_line="$(rst_format_compared_line "$hp" "$ht" "$cmd" "$exit_code" "$bp" "$bt" "$sha8" "$newly" "$shown" "$failed_form" "$suffix" 0 "$regress_note")"
         rst_emit_verdict "$base_sha" "$bstatus" "$bp" "$bt" "$newly" "$mode" "$base_exit" yes "$base_log" "$head_status" "$final_line"
       }
       # ---- END rst core ----

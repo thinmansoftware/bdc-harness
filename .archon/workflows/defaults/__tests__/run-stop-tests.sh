@@ -1195,10 +1195,22 @@ T5A="$(rst_count_case "Tests: 3/4" "Tests: 2/4")"
 assert_eq "t5a mode" "count" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T5A")"
 assert_eq "t5a newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T5A")"
 assert_eq "t5a status" "failed" "$(rst_out_field TESTS_STATUS "$T5A")"
+# Round-3 finding #1: when failure identities are unavailable on both sides, an equal
+# failure count does NOT prove the head failures existed at base (base fails A, head
+# fixes A and fails B leaves the count unchanged). Count mode stays blocking; it was
+# baseline_red before this fix.
 T5B="$(rst_count_case "Tests: 2/4" "Tests: 2/4")"
 assert_eq "t5b mode" "count" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T5B")"
 assert_eq "t5b newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T5B")"
-assert_eq "t5b status" "baseline_red" "$(rst_out_field TESTS_STATUS "$T5B")"
+assert_eq "t5b status" "failed" "$(rst_out_field TESTS_STATUS "$T5B")"
+assert_not_contains "t5b not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T5B")"
+# Round-3 finding #1 (lower-count clause): fewer head failures than base still cannot
+# prove zero newly failing when identities are unavailable; it stays blocking.
+T5C="$(rst_count_case "Tests: 1/4" "Tests: 2/4")"
+assert_eq "t5c mode" "count" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T5C")"
+assert_eq "t5c newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T5C")"
+assert_eq "t5c status" "failed" "$(rst_out_field TESTS_STATUS "$T5C")"
+assert_not_contains "t5c not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T5C")"
 
 echo "--- Test 7: baseline_red without a zero count is refused ---"
 T7_MAN="$(printf '%s\n' "$RST_MANIFEST" | sed 's|^Tests:.*|Tests: 2/3 (cmd) -- head 2/3; base 2/3 at abcdef01; newly failing: 2|')"
@@ -1465,6 +1477,93 @@ assert_not_contains "t12 unparsed extra not baseline_red" "baseline_red" "$(rst_
 assert_eq "t12 unparsed extra newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T12_BAD")"
 export PATH="$ORIG_PATH"
 rm -rf "$V12"
+
+echo "--- Test 13: a new per-command failure blocks even when identities elsewhere match (round 3 #2) ---"
+# command 1 fails the same named test at base and head; command 2 passes at base and
+# crashes without counts at head. The aggregate identities match (only the shared
+# failure is named), so without the per-command gate this is baseline_red.
+T13="$(mktemp -d)"
+rst_git_init "$T13"
+cat > "$T13/one.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) shared > kept"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+cat > "$T13/two.sh" <<'EOF'
+#!/bin/bash
+echo "1 pass"
+echo "0 fail"
+exit 0
+EOF
+printf 'base\n' > "$T13/note.txt"
+rst_commit "$T13" base
+git -C "$T13" update-ref refs/remotes/origin/dev "$(git -C "$T13" rev-parse HEAD)"
+cat > "$T13/two.sh" <<'EOF'
+#!/bin/bash
+echo "boom"
+exit 1
+EOF
+printf 'head\n' > "$T13/note.txt"
+rst_commit "$T13" head
+T13_CMD="$(printf '%s\n' 'bash ./one.sh' 'bash ./two.sh')"
+T13_OUT="$(rst_verdict_for "$T13" "$T13_CMD" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t13 status" "failed" "$(rst_out_field TESTS_STATUS "$T13_OUT")"
+assert_not_contains "t13 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T13_OUT")"
+# The helper passes the raw multi-line command list through to the Tests line; the
+# real node semicolon-joins it. Assert against the whole output so the note (on a
+# later physical line of the Tests line here) is still found.
+assert_contains "t13 names the regression" "command regression at head" "$T13_OUT"
+rm -rf "$T13"
+
+echo "--- Test 14: reporter rerun identities are unioned, never replace the original run (round 3 #3) ---"
+# The original head run (no --outputFile) fails test X; the reporter rerun (and the
+# base) fail baseline test Y with the same count. Replacing the original identities
+# with the rerun's would drop X and emit baseline_red; the union keeps X and blocks.
+V14="$(mktemp -d)"
+cat > "$V14/npx" <<'EOF'
+#!/bin/bash
+if [ "$1" = "vitest" ]; then
+  shift
+  exec "$(dirname "$0")/vitest" "$@"
+fi
+echo "npx stub unsupported: $*" >&2
+exit 127
+EOF
+cat > "$V14/vitest" <<'EOF'
+#!/bin/bash
+out=""
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    --outputFile) out="$a" ;;
+  esac
+  case "$a" in
+    --outputFile=*) out="${a#--outputFile=}" ;;
+  esac
+  prev="$a"
+done
+file="$(jq -r '.file' fixture.json)"
+x="$(jq -r '.x' fixture.json)"
+y="$(jq -r '.y' fixture.json)"
+if [ -n "$out" ]; then
+  echo "FAIL $file > $y"
+  jq -n --arg f "$file" --arg n "$y" '{testResults:[{name:$f, assertionResults:[{fullName:$n, status:"failed"}]}]}' > "$out"
+else
+  echo "FAIL $file > $x"
+fi
+echo "Tests: 1 failed, 0 passed, 1 total"
+exit 1
+EOF
+chmod +x "$V14/npx" "$V14/vitest"
+export PATH="$V14:$ORIG_PATH"
+T14_FIX='{"file":"a.test.ts","x":"new x","y":"old y"}'
+T14_OUT="$(rst_vitest_case "$T14_FIX" "$T14_FIX")"
+assert_eq "t14 status" "failed" "$(rst_out_field TESTS_STATUS "$T14_OUT")"
+assert_not_contains "t14 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T14_OUT")"
+export PATH="$ORIG_PATH"
+rm -rf "$V14"
 
 echo
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"
