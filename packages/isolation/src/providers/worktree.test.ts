@@ -482,6 +482,88 @@ describe('WorktreeProvider', () => {
       );
     });
 
+    test('same-repo PR fetch places -- before origin and the branch', async () => {
+      execSpy.mockClear();
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '7',
+        prBranch: 'feat/x',
+        isForkPR: false,
+      };
+
+      await provider.create(request);
+
+      const fetchCall = execSpy.mock.calls.find((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('fetch') && args.includes('feat/x');
+      });
+      const args = fetchCall?.[1] as string[];
+      const dash = args.indexOf('--');
+      expect(dash).toBeGreaterThanOrEqual(0);
+      expect(args[dash + 1]).toBe('origin');
+      expect(args[dash + 2]).toBe('feat/x');
+    });
+
+    test('rejects a same-repo PR branch that starts with - before any exec', async () => {
+      execSpy.mockClear();
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'pr',
+        identifier: '8',
+        prBranch: '--upload-pack=x',
+        isForkPR: false,
+      };
+
+      await expect(provider.create(request)).rejects.toThrow('unsupported branch');
+      expect(execSpy).not.toHaveBeenCalled();
+    });
+
+    test('worktree add places -- before the path and a valid start point', async () => {
+      execSpy.mockClear();
+      const request: IsolationRequest = {
+        ...baseRequest,
+        workflowType: 'task',
+        identifier: 'start-ok',
+        fromBranch: 'feature/a',
+      };
+
+      await provider.create(request);
+
+      const addCall = execSpy.mock.calls.find((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('worktree') && args.includes('add');
+      });
+      const args = addCall?.[1] as string[];
+      const branch = 'archon/task-start-ok';
+      const path = args[args.indexOf('--') + 1];
+      expect(args).toEqual([
+        '-C',
+        '/workspace/repo',
+        'worktree',
+        'add',
+        '-b',
+        branch,
+        '--',
+        path,
+        'feature/a',
+      ]);
+    });
+
+    test('rejects start points -x and a;b before any exec', async () => {
+      for (const fromBranch of ['-x', 'a;b']) {
+        execSpy.mockClear();
+        const request: IsolationRequest = {
+          ...baseRequest,
+          workflowType: 'task',
+          identifier: 'start-bad',
+          fromBranch,
+        };
+        await expect(provider.create(request)).rejects.toThrow('unsupported start point');
+        expect(execSpy).not.toHaveBeenCalled();
+      }
+    });
+
     test('creates worktree for fork PR with SHA (reproducible reviews)', async () => {
       const request: IsolationRequest = {
         ...baseRequest,

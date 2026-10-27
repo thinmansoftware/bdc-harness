@@ -1087,8 +1087,12 @@ export class WorktreeProvider implements IIsolationProvider {
     worktreePath: string,
     prBranch: string
   ): Promise<void> {
-    // Fetch the PR's actual branch
-    await execFileAsync('git', ['-C', repoPath, 'fetch', 'origin', prBranch], {
+    if (prBranch.startsWith('-')) {
+      throw new Error(`unsupported branch: ${prBranch}`);
+    }
+
+    // Fetch the PR's actual branch. `--` keeps the ref from being read as an option.
+    await execFileAsync('git', ['-C', repoPath, 'fetch', '--', 'origin', prBranch], {
       timeout: GIT_OPERATION_TIMEOUT_MS,
     });
 
@@ -1211,6 +1215,10 @@ export class WorktreeProvider implements IIsolationProvider {
         ? request.fromBranch
         : `origin/${baseBranch}`;
 
+    if (startPoint.startsWith('-') || !/^[A-Za-z0-9._/-]+$/.test(startPoint)) {
+      throw new Error(`unsupported start point: ${startPoint}`);
+    }
+
     // Atomic web/API fires request a REMOTE start ref shaped "origin/<branch>".
     // The pre-create sync only fetched the configured/default base, so the
     // requested remote ref may be stale (or absent) locally. Fetch it now with
@@ -1246,7 +1254,7 @@ export class WorktreeProvider implements IIsolationProvider {
       // Try to create with new branch
       await execFileAsync(
         'git',
-        ['-C', repoPath, 'worktree', 'add', worktreePath, '-b', branchName, startPoint],
+        ['-C', repoPath, 'worktree', 'add', '-b', branchName, '--', worktreePath, startPoint],
         {
           timeout: GIT_OPERATION_TIMEOUT_MS,
         }
