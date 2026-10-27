@@ -6,7 +6,8 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Install dependencies
 # ---------------------------------------------------------------------------
-FROM oven/bun:1.3.11-slim AS deps
+FROM node:24.22.1-bookworm-slim AS node-toolchain
+FROM oven/bun:1.4.4-slim AS deps
 
 WORKDIR /app
 
@@ -58,7 +59,7 @@ RUN bun run build:web && \
 # ---------------------------------------------------------------------------
 # Stage 3: Production image
 # ---------------------------------------------------------------------------
-FROM oven/bun:1.3.11-slim AS production
+FROM oven/bun:1.4.4-slim AS production
 
 # OCI Labels for GHCR
 LABEL org.opencontainers.image.source="https://github.com/coleam00/Archon"
@@ -135,8 +136,11 @@ RUN curl -fsSLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${T
 # - Keep nodejs/npm: WO tests require npm and npx at runtime.
 # - The npm entry point is a Node.js wrapper; the native binary works standalone
 # - agent-browser auto-detects Docker (via /.dockerenv) and adds --no-sandbox to Chromium
-RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
-    && npm install -g agent-browser@0.22.1 \
+COPY --from=node-toolchain /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-toolchain /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && npm install -g agent-browser@0.39.4 \
     && NATIVE_BIN=$(find /usr/local/lib/node_modules/agent-browser -name 'agent-browser-*' -type f -executable 2>/dev/null | head -1) \
     && if [ -n "$NATIVE_BIN" ]; then \
          cp "$NATIVE_BIN" /usr/local/bin/agent-browser-native \

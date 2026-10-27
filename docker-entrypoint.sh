@@ -155,4 +155,6 @@ $RUNNER bun run setup-auth
 # any 401 that slips through.
 $RUNNER bun run verify-auth || true
 
-exec $RUNNER bun run start
+# Keep the server as PID 1 after gosu, without nested package-script runners.
+# Docker's SIGTERM must reach the server's graceful-shutdown handler directly.
+exec $RUNNER bun packages/server/src/index.ts
