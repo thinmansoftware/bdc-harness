@@ -376,6 +376,45 @@ function excludedIdentityPath(path: string): boolean {
   return false;
 }
 
+function hashFailedIdentity(headSha: string): TreeIdentity {
+  return { method: 'hash-failed', headSha, paths: [], contentDigest: '' };
+}
+
+// git status -z records are "XY path\0". Renames and copies are "XY dest\0source\0".
+function parsePorcelainZ(
+  stdout: string
+): { ok: true; entries: { status: string; path: string }[] } | { ok: false } {
+  const entries: { status: string; path: string }[] = [];
+  let index = 0;
+  while (index < stdout.length) {
+    const end = stdout.indexOf('\0', index);
+    if (end < 0) return { ok: false };
+    const header = stdout.slice(index, end);
+    index = end + 1;
+    if (header.length === 0) continue;
+    if (header.length < 4 || header[2] !== ' ') return { ok: false };
+    const status = header.slice(0, 2);
+    const path = header.slice(3);
+    if (status.includes('R') || status.includes('C')) {
+      const sourceEnd = stdout.indexOf('\0', index);
+      if (sourceEnd < 0) return { ok: false };
+      index = sourceEnd + 1;
+    }
+    entries.push({ status, path });
+  }
+  return { ok: true, entries };
+}
+
+function hashWorktreeBytes(cwd: string, status: string, path: string): string | null {
+  const abs = join(cwd, path);
+  try {
+    return createHash('sha256').update(readFileSync(abs)).digest('hex');
+  } catch {
+    if (status.includes('D') && !existsSync(abs)) return 'missing';
+    return null;
+  }
+}
+
 export function testedTreeIdentity(cwd: string): TreeIdentity {
   const head = gitCapture(cwd, ['rev-parse', 'HEAD']);
   if (!head.ok) {
@@ -386,33 +425,24 @@ export function testedTreeIdentity(cwd: string): TreeIdentity {
       contentDigest: '',
     };
   }
-  const status = gitCapture(cwd, ['status', '--porcelain=v1', '-uall']);
+  const headSha = head.stdout.trim();
+  const status = gitCapture(cwd, ['status', '--porcelain=v1', '-z', '-uall']);
   const paths: { path: string; sha256: string }[] = [];
   if (status.ok) {
-    for (const line of status.stdout.split('\n')) {
-      if (line.length < 4) continue;
-      let path = line.slice(3);
-      if (path.includes(' -> ')) {
-        const parts = path.split(' -> ');
-        path = parts[parts.length - 1] ?? path;
-      }
-      if (path.startsWith('"') && path.endsWith('"')) path = path.slice(1, -1);
-      if (excludedIdentityPath(path)) continue;
-      const abs = join(cwd, path);
-      let sha256 = 'missing';
-      try {
-        sha256 = createHash('sha256').update(readFileSync(abs)).digest('hex');
-      } catch {
-        sha256 = 'missing';
-      }
-      paths.push({ path, sha256 });
+    const parsed = parsePorcelainZ(status.stdout);
+    if (!parsed.ok) return hashFailedIdentity(headSha);
+    for (const entry of parsed.entries) {
+      if (excludedIdentityPath(entry.path)) continue;
+      const sha256 = hashWorktreeBytes(cwd, entry.status, entry.path);
+      if (sha256 === null) return hashFailedIdentity(headSha);
+      paths.push({ path: entry.path, sha256 });
     }
   }
   paths.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const contentDigest = createHash('sha256').update(JSON.stringify(paths)).digest('hex');
   return {
     method: 'sha256-worktree-bytes-v1',
-    headSha: head.stdout.trim(),
+    headSha,
     paths,
     contentDigest,
   };
@@ -781,6 +811,9 @@ export function checkAttemptRecord(
     }
   }
   const live = testedTreeIdentity(cwd);
+  if (live.method === 'hash-failed' || recorded.tree.method === 'hash-failed') {
+    return { ok: false, reason: 'hash-failed' };
+  }
   if (live.method === 'not-a-git-worktree' || recorded.tree.method === 'not-a-git-worktree') {
     return recorded.tree.contentDigest === live.contentDigest &&
       recorded.tree.headSha === live.headSha
@@ -801,6 +834,7 @@ export function checkAttemptRecord(
   if (!ancestor.ok) return { ok: false, reason: 'ancestry' };
   const diff = gitCapture(cwd, [
     'diff',
+    '-z',
     '--no-ext-diff',
     '--no-textconv',
     '--name-only',
@@ -808,12 +842,11 @@ export function checkAttemptRecord(
     live.headSha,
   ]);
   if (!diff.ok) return { ok: false, reason: 'diff' };
-  const changed = new Set(
-    diff.stdout
-      .split('\n')
-      .map(line => line.trim())
-      .filter(Boolean)
-  );
+  const changed = new Set<string>();
+  for (const path of diff.stdout.split('\0')) {
+    if (path.length === 0) continue;
+    changed.add(path);
+  }
   const recordedPaths = new Set(recorded.tree.paths.map(item => item.path));
   for (const path of changed) {
     if (excludedIdentityPath(path)) continue;

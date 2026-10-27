@@ -1634,7 +1634,7 @@ nodes:
             if ($0 ~ /^[ \t]*```/) next
             line = clean($0)
             if (line == "") next
-            if (line ~ /^[Ee]xpected:/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 2; next }
+            if (line ~ /^[Ee]xpected:/) { if (tcmd != "") emit(tcmd); else emit("MALFORMED:expected-without-command"); tcmd = ""; tstate = 2; next }
             if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0 }
             else { tcmd = (tcmd == "" ? line : tcmd " " line); sub(/[ \t]*\\$/, "", tcmd); next }
           }
@@ -1861,6 +1861,46 @@ nodes:
         fi
         printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\n' "$status" "$line"
       }
+      # rst_load_explicit <cmds-file>  (spec on stdin -> writes the command file and
+      #   prints 1 when any explicit declaration is present, else 0). A malformed
+      #   Expected without a command is an explicit declaration, not absence.
+      rst_load_explicit() {
+        local cmds="$1" c decl=0
+        : > "$cmds"
+        while IFS= read -r c; do
+          [ -z "$c" ] && continue
+          decl=1
+          if rst_command_looks_runnable "$c"; then
+            rst_rescue_subdir "$c" >> "$cmds"
+            printf '\n' >> "$cmds"
+          else
+            printf '%s\n' "$c" >> "$cmds"
+            echo "run-stop-tests: declared line is not a runnable test command: $c" >&2
+          fi
+        done <<EOF_CMDS
+      $(rst_extract_commands)
+      EOF_CMDS
+        printf '%s\n' "$decl"
+      }
+      # rst_apply_fallback <cmds-file> <run-start-sha> <map-source> <map-command>
+      #   prints tests_in_diff, project-map, or repo_test_script. Called only when
+      #   no explicit declaration remains.
+      rst_apply_fallback() {
+        local cmds="$1" run_start_sha="$2" map_source="$3" map_command="$4"
+        : > "$cmds"
+        if [ -n "$run_start_sha" ] && git rev-parse --verify -q "$run_start_sha" >/dev/null 2>&1; then
+          rst_tests_in_diff "$run_start_sha" > "$cmds"
+        fi
+        if [ -s "$cmds" ]; then
+          printf 'tests_in_diff\n'
+        elif [ "$map_source" = "project-map" ] && [ -n "$map_command" ]; then
+          printf '%s\n' "$map_command" > "$cmds"
+          printf 'project-map\n'
+        else
+          rst_repo_test_script > "$cmds"
+          printf 'repo_test_script\n'
+        fi
+      }
       # ---- END rst core ----
 
       # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
@@ -1916,20 +1956,7 @@ nodes:
       : > "$LOG"; : > "$CMDS"
 
       SOURCE="none"
-      EXPLICIT_DECL=0
-      : > "$CMDS"
-      while IFS= read -r c; do
-        [ -z "$c" ] && continue
-        EXPLICIT_DECL=1
-        if rst_command_looks_runnable "$c"; then
-          rst_rescue_subdir "$c" >> "$CMDS"; printf '\n' >> "$CMDS"
-        else
-          printf '%s\n' "$c" >> "$CMDS"
-          echo "run-stop-tests: declared line is not a runnable test command: $c" >&2
-        fi
-      done <<EOF_CMDS
-      $(printf '%s\n' "$SPEC" | rst_extract_commands)
-      EOF_CMDS
+      EXPLICIT_DECL="$(printf '%s\n' "$SPEC" | rst_load_explicit "$CMDS")"
       RESOLUTION="$(cat <<'BDC_TEST_COMMAND_RESOLUTION' | capture_node_output
       $resolve-test-command.output
       BDC_TEST_COMMAND_RESOLUTION
@@ -1990,20 +2017,8 @@ nodes:
       fi
       SELECTED_SOURCE="spec_declared"
       if [ "$EXPLICIT_DECL" -eq 0 ]; then
-        : > "$CMDS"
         RUN_START_SHA="$(cat "${ARTIFACTS_DIR:-.}/run-start-sha.txt" 2>/dev/null || true)"
-        if [ -n "$RUN_START_SHA" ] && git rev-parse --verify -q "$RUN_START_SHA" >/dev/null 2>&1; then
-          rst_tests_in_diff "$RUN_START_SHA" > "$CMDS"
-        fi
-        if [ -s "$CMDS" ]; then
-          SELECTED_SOURCE="tests_in_diff"
-        elif [ "$MAP_SOURCE" = "project-map" ] && [ -n "$MAP_COMMAND" ]; then
-          printf '%s\n' "$MAP_COMMAND" > "$CMDS"
-          SELECTED_SOURCE="project-map"
-        else
-          rst_repo_test_script > "$CMDS"
-          SELECTED_SOURCE="repo_test_script"
-        fi
+        SELECTED_SOURCE="$(rst_apply_fallback "$CMDS" "$RUN_START_SHA" "$MAP_SOURCE" "$MAP_COMMAND")"
       fi
       EXIT_CODE=0
       COUNTS=""

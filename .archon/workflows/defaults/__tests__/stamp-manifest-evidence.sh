@@ -331,6 +331,105 @@ OUT="$(
 )"
 assert_contains "pass plus 0/0 stamps FAIL" "VALIDATION: FAIL" "$OUT"
 assert_not_contains "pass plus 0/0 is not PASS" "VALIDATION: PASS" "$OUT"
+echo "--- round-9 byte identity and explicit Expected through stamp ---"
+eval "$(extract_core "$CANONICAL_YAML" rst)"
+NA="$(mktemp -d)"
+NA_ART="$(mktemp -d)"
+git -C "$NA" init -q
+git -C "$NA" config user.email t@example.com
+git -C "$NA" config user.name Test
+printf 'base\n' > "$NA/README"
+printf 'v1\n' > "$NA/src.js"
+python3 - "$NA" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+(root / "caf\u00e9.js").write_text("v1\n")
+PY
+git -C "$NA" add -A
+git -C "$NA" commit -qm base
+cat > "$NA/ok.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+chmod +x "$NA/ok.sh"
+printf 'bash ./ok.sh\n' > "$NA/cmds"
+(
+  cd "$NA" || exit 1
+  ARTIFACTS_DIR="$NA_ART" SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness \
+    ser_runner run-tests --commands ./cmds --log "$NA_ART/stop-tests.log" >/dev/null
+  ARTIFACTS_DIR="$NA_ART" SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness \
+    printf 'grep -c base README\teq\t1\nDECLARED\t1\n' | ser_runner run-greps >/dev/null
+)
+python3 - "$NA" <<'PY'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+(root / "caf\u00e9.js").write_text("v2\n")
+PY
+OUT="$(sme_at "$NA" "$NA_ART" run-a thinmansoftware/bdc-harness passed "$ERRF")"
+assert_contains "stale non-ASCII bytes stamp FAIL" "VALIDATION: FAIL" "$OUT"
+assert_not_contains "stale non-ASCII bytes are not PASS" "VALIDATION: PASS" "$OUT"
+
+BAD="$(mktemp -d)"
+BAD_ART="$(mktemp -d)"
+cat > "$BAD/ok.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+chmod +x "$BAD/ok.sh"
+printf 'MALFORMED:expected-without-command\nbash ./ok.sh\n' > "$BAD/cmds"
+( cd "$BAD" && ARTIFACTS_DIR="$BAD_ART" SER_RUN_ID=run-bad ser_runner run-tests --commands ./cmds --log "$BAD_ART/stop-tests.log" >/dev/null )
+OUT="$(
+  cd "$BAD" || exit 1
+  export ARTIFACTS_DIR="$BAD_ART" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID=run-bad
+  unset SER_REPO
+  printf '%s\n' "$ENGINE_MANIFEST" | sme_process "1/1 (bash ./ok.sh)" passed "N/A (spec declares no grep stop conditions)" none_declared 0
+)"
+assert_contains "malformed explicit member stamps FAIL" "VALIDATION: FAIL" "$OUT"
+assert_not_contains "malformed explicit member is not PASS" "VALIDATION: PASS" "$OUT"
+
+MAP="$(mktemp -d)"
+MAP_ART="$(mktemp -d)"
+git -C "$MAP" init -q
+git -C "$MAP" config user.email t@example.com
+git -C "$MAP" config user.name Test
+printf 'base\n' > "$MAP/README"
+git -C "$MAP" add README
+git -C "$MAP" commit -qm base
+cat > "$MAP/map-pass.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+chmod +x "$MAP/map-pass.sh"
+MAP_SPEC="$(printf '%s\n' 'Stop 1 (grep assertion):' '  grep -c base README' '  Expected: 1')"
+MAP_CMDS="$MAP/cmds"
+MAP_DECL="$(
+  cd "$MAP" || exit 1
+  printf '%s\n' "$MAP_SPEC" | rst_load_explicit "$MAP_CMDS"
+)"
+assert_eq "stamp absence declaration flag" "0" "$MAP_DECL"
+MAP_SRC="$(
+  cd "$MAP" || exit 1
+  rst_apply_fallback "$MAP_CMDS" "" project-map "bash ./map-pass.sh"
+)"
+assert_eq "stamp absence selects project-map" "project-map" "$MAP_SRC"
+(
+  cd "$MAP" || exit 1
+  ARTIFACTS_DIR="$MAP_ART" SER_RUN_ID=run-map \
+    ser_runner run-tests --commands "$MAP_CMDS" --log "$MAP_ART/stop-tests.log" >/dev/null
+)
+OUT="$(
+  cd "$MAP" || exit 1
+  export ARTIFACTS_DIR="$MAP_ART" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID=run-map
+  unset SER_REPO
+  printf '%s\n' "$ENGINE_MANIFEST" | sme_process "1/1 (bash ./map-pass.sh)" passed "N/A (spec declares no grep stop conditions)" none_declared 0
+)"
+assert_contains "true-absence project-map stamps PASS" "VALIDATION: PASS" "$OUT"
+assert_not_contains "true-absence project-map is not FAIL" "VALIDATION: FAIL" "$OUT"
+rm -rf "$NA" "$NA_ART" "$BAD" "$BAD_ART" "$MAP" "$MAP_ART"
+
 unset SER_REQUIRE_ATTEMPT ARTIFACTS_DIR SER_RUN_ID SER_REPO SER_TEST_ATTEMPT_ID SER_GREP_ATTEMPT_ID
 rm -rf "$BIND" "$BIND_ART" "$MIX" "$MIX_ART" "$ERRF"
 

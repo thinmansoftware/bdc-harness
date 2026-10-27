@@ -876,6 +876,130 @@ i_report="$(SOURCE=spec_declared rst_report CODE 'bash ./impossible.sh' "$i_exit
 assert_not_contains "impossible 4/3 is not passed" "TESTS_STATUS=passed" "$i_report"
 rm -rf "$MIX"
 
+echo "--- leading Expected without a command is explicit, not absence ---"
+MAL_SPEC="$(printf '%s\n' \
+  'Stop 1 (test suite):' \
+  '  Expected: all passing' \
+  '' \
+  'Stop 2 (test suite):' \
+  '  bash ./ok.sh' \
+  '  Expected: 1')"
+MAL_EXTRACT="$(printf '%s\n' "$MAL_SPEC" | rst_extract_commands)"
+assert_eq "leading Expected keeps malformed and later command" "$(printf '%s\n' 'MALFORMED:expected-without-command' 'bash ./ok.sh')" "$MAL_EXTRACT"
+MAL="$(mktemp -d)"
+(
+  cd "$MAL" || exit 1
+  cat > ok.sh <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+  cat > map-pass.sh <<'EOF'
+#!/bin/sh
+echo MAP_SENTINEL
+echo "Tests: 1/1"
+exit 0
+EOF
+  chmod +x ok.sh map-pass.sh
+  printf '%s\n' '{"scripts":{"test":"echo REPO_SENTINEL"}}' > package.json
+  touch bun.lock
+)
+MAL_CMDS="$MAL/cmds"
+MAL_DECL="$(
+  cd "$MAL" || exit 1
+  printf '%s\n' "$MAL_SPEC" | rst_load_explicit "$MAL_CMDS"
+)"
+assert_eq "malformed explicit declaration flag" "1" "$MAL_DECL"
+if [ "$MAL_DECL" -eq 0 ]; then
+  (
+    cd "$MAL" || exit 1
+    rst_apply_fallback "$MAL_CMDS" "" project-map "bash ./map-pass.sh" >/dev/null
+  )
+fi
+MAL_BODY="$(cat "$MAL_CMDS")"
+assert_contains "malformed member stays in the command file" "MALFORMED:expected-without-command" "$MAL_BODY"
+assert_contains "later command stays in the command file" "bash ./ok.sh" "$MAL_BODY"
+assert_not_contains "malformed member does not select project-map" "map-pass" "$MAL_BODY"
+assert_not_contains "malformed member does not select repo script" "bun run test" "$MAL_BODY"
+MAL_RUN="$(cd "$MAL" && rst_run_commands "$MAL_CMDS" "$MAL/log")"
+MAL_EXIT="${MAL_RUN%% *}"
+MAL_COUNTS="$(printf '%s' "${MAL_RUN#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+MAL_REPORT="$(SOURCE=spec_declared rst_report CODE 'MALFORMED:expected-without-command; bash ./ok.sh' "$MAL_EXIT" "$MAL_COUNTS")"
+assert_not_contains "malformed explicit member is not passed" "TESTS_STATUS=passed" "$MAL_REPORT"
+assert_not_contains "map sentinel did not run" "MAP_SENTINEL" "$(cat "$MAL/log")"
+assert_not_contains "repo sentinel did not run" "REPO_SENTINEL" "$(cat "$MAL/log")"
+
+echo "--- true absence selects project-map, then the repo script, ahead of neither for diff tests ---"
+ABS="$(mktemp -d)"
+(
+  cd "$ABS" || exit 1
+  cat > map-pass.sh <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+  chmod +x map-pass.sh
+  printf '%s\n' '{"scripts":{"test":"echo 1"}}' > package.json
+)
+ABS_SPEC="$(printf '%s\n' 'Stop 1 (grep assertion):' '  grep -c base README' '  Expected: 1')"
+ABS_CMDS="$ABS/cmds"
+ABS_DECL="$(
+  cd "$ABS" || exit 1
+  printf '%s\n' "$ABS_SPEC" | rst_load_explicit "$ABS_CMDS"
+)"
+assert_eq "grep-only spec declares no tests" "0" "$ABS_DECL"
+ABS_SRC="$(
+  cd "$ABS" || exit 1
+  rst_apply_fallback "$ABS_CMDS" "" project-map "bash ./map-pass.sh"
+)"
+assert_eq "absence with a map command selects project-map" "project-map" "$ABS_SRC"
+assert_eq "project-map command file" "bash ./map-pass.sh" "$(cat "$ABS_CMDS")"
+ABS_RUN="$(cd "$ABS" && rst_run_commands "$ABS_CMDS" "$ABS/map.log")"
+assert_eq "project-map executes 1/1" "0 1 1" "$ABS_RUN"
+ABS_EXIT="${ABS_RUN%% *}"
+ABS_COUNTS="$(printf '%s' "${ABS_RUN#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+ABS_REPORT="$(rst_report CODE 'bash ./map-pass.sh' "$ABS_EXIT" "$ABS_COUNTS")"
+assert_contains "project-map pass is published" "TESTS_STATUS=passed" "$ABS_REPORT"
+REPO_SRC="$(
+  cd "$ABS" || exit 1
+  rm -f bun.lock bun.lockb
+  rst_apply_fallback "$ABS_CMDS" "" wo-spec ""
+)"
+assert_eq "absent map without a bun lock selects repo_test_script" "repo_test_script" "$REPO_SRC"
+assert_eq "repo script without a bun lock is npm test" "npm test" "$(cat "$ABS_CMDS")"
+touch "$ABS/bun.lock"
+REPO_BUN="$(
+  cd "$ABS" || exit 1
+  rst_apply_fallback "$ABS_CMDS" "" wo-spec ""
+)"
+assert_eq "absent map with a bun lock selects repo_test_script" "repo_test_script" "$REPO_BUN"
+assert_eq "repo script with a bun lock is bun run test" "bun run test" "$(cat "$ABS_CMDS")"
+
+DIFF="$(mktemp -d)"
+git -C "$DIFF" init -q
+git -C "$DIFF" config user.email t@example.com
+git -C "$DIFF" config user.name Test
+printf 'base\n' > "$DIFF/README"
+git -C "$DIFF" add README
+git -C "$DIFF" commit -qm base
+printf 'test("x", () => {})\n' > "$DIFF/sample.test.js"
+DIFF_SHA="$(git -C "$DIFF" rev-parse HEAD)"
+DIFF_CMDS="$DIFF/cmds"
+DIFF_SRC="$(
+  cd "$DIFF" || exit 1
+  rst_apply_fallback "$DIFF_CMDS" "$DIFF_SHA" project-map "bash ./map-pass.sh"
+)"
+assert_eq "untracked test file selects tests_in_diff ahead of the map" "tests_in_diff" "$DIFF_SRC"
+assert_contains "diff command names the untracked test" "sample.test.js" "$(cat "$DIFF_CMDS")"
+assert_not_contains "diff selection does not use the map command" "map-pass" "$(cat "$DIFF_CMDS")"
+
+echo "--- all 13 lanes invoke the shared explicit loader and fallback ---"
+for lane in $LANES; do
+  assert_eq "rst_load_explicit call $lane" "1" "$(grep -F -c 'rst_load_explicit "$CMDS"' "$DEFAULTS/$lane")"
+  assert_eq "rst_apply_fallback call $lane" "1" "$(grep -F -c 'rst_apply_fallback "$CMDS"' "$DEFAULTS/$lane")"
+done
+rm -rf "$MAL" "$ABS" "$DIFF"
+
 unset RST_NPX_BIN RST_NPM_BIN GH_TOKEN
 unset TELEGRAM_BOT_TOKEN TELEGRAM_STREAMING_MODE TELEGRAM_APPROVAL_CHAT_ID TELEGRAM_ALLOWED_USER_IDS TELEGRAM_TEST_FIXTURE
 export PATH="$ORIG_PATH"

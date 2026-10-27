@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
@@ -28,6 +29,8 @@ import {
   scopeEvidence,
   scrubEnv,
   selectStagesBlock,
+  testedTreeIdentity,
+  type EvidenceAttempt,
   type EvidenceAuthority,
 } from './structured-evidence-runner';
 
@@ -750,6 +753,109 @@ describe('hermetic-fresh-attempt', () => {
     } finally {
       if (saved === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
       else process.env.TELEGRAM_BOT_TOKEN = saved;
+      if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = savedArtifacts;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('hashes real porcelain paths and refuses stale or unreadable bytes', () => {
+    const cwd = tempDir('ser-bytes-');
+    initRepo(cwd);
+    const accent = String.fromCharCode(0xe9);
+    const nonAscii = `caf${accent}.js`;
+    const quoted = 'a"b.js';
+    const arrow = 'old -> new.js';
+    writeFileSync(join(cwd, 'src.js'), 'v1\n');
+    writeFileSync(join(cwd, quoted), 'v1\n');
+    writeFileSync(join(cwd, arrow), 'v1\n');
+    writeFileSync(join(cwd, nonAscii), 'v1\n');
+    writeFileSync(join(cwd, 'gone.js'), 'v1\n');
+    git(cwd, ['add', '--', 'src.js', quoted, arrow, nonAscii, 'gone.js']);
+    git(cwd, ['commit', '-qm', 'sources']);
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+    const artifacts = join(cwd, 'artifacts');
+    mkdirSync(artifacts);
+    const savedArtifacts = process.env.ARTIFACTS_DIR;
+    process.env.ARTIFACTS_DIR = artifacts;
+    const cliEnv = {
+      ...process.env,
+      HARNESS_ROOT_OVERRIDE: ROOT,
+      ARTIFACTS_DIR: artifacts,
+      NODE_ENV: 'test',
+      SER_TEST_TRUSTED_ROOT: ROOT,
+    };
+    const refuse = (attempt: EvidenceAttempt, reason: string): void => {
+      const verdict = checkAttemptRecord(attempt, cwd, authority(cwd));
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toBe(reason);
+      const cli = spawnSync('bun', [RUNNER, 'check-attempt'], {
+        cwd,
+        env: cliEnv,
+        encoding: 'utf8',
+      });
+      expect(cli.status).not.toBe(0);
+      expect(cli.stderr).toContain(reason);
+    };
+    try {
+      const summary = runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      const freshCli = spawnSync('bun', [RUNNER, 'check-attempt'], {
+        cwd,
+        env: cliEnv,
+        encoding: 'utf8',
+      });
+      expect(freshCli.status).toBe(0);
+      const mutate = (name: string): void => {
+        writeFileSync(join(cwd, name), 'v2\n');
+        refuse(summary.attempt, 'dirty-bytes');
+        writeFileSync(join(cwd, name), 'v1\n');
+        expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      };
+      mutate('src.js');
+      mutate(quoted);
+      mutate(arrow);
+      mutate(nonAscii);
+      writeFileSync(join(cwd, 'leaf.js'), 'untracked\n');
+      refuse(summary.attempt, 'dirty-bytes');
+      rmSync(join(cwd, 'leaf.js'));
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      const attempts = join(artifacts, 'evidence', 'attempts');
+      writeFileSync(join(attempts, 'extra.txt'), 'generated\n');
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      git(cwd, ['mv', 'src.js', 'src-renamed.js']);
+      const renamed = testedTreeIdentity(cwd);
+      expect(renamed.method).toBe('sha256-worktree-bytes-v1');
+      const renamedBody = readFileSync(join(cwd, 'src-renamed.js'));
+      expect(renamed.paths.find(item => item.path === 'src-renamed.js')?.sha256).toBe(
+        createHash('sha256').update(renamedBody).digest('hex')
+      );
+      expect(renamed.paths.some(item => item.path === 'src.js')).toBe(false);
+      git(cwd, ['reset', '--hard', 'HEAD']);
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      rmSync(join(cwd, 'gone.js'));
+      const deleted = testedTreeIdentity(cwd);
+      expect(deleted.method).toBe('sha256-worktree-bytes-v1');
+      expect(deleted.paths.find(item => item.path === 'gone.js')?.sha256).toBe('missing');
+      refuse(summary.attempt, 'dirty-bytes');
+      git(cwd, ['checkout', '--', 'gone.js']);
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      git(cwd, ['add', 'ok.sh']);
+      git(cwd, ['commit', '-qm', 'identical tested bytes']);
+      expect(summary.attempt.tree.headSha).not.toBe(testedTreeIdentity(cwd).headSha);
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      const sameCli = spawnSync('bun', [RUNNER, 'check-attempt'], {
+        cwd,
+        env: cliEnv,
+        encoding: 'utf8',
+      });
+      expect(sameCli.status).toBe(0);
+      symlinkSync('missing-target', join(cwd, 'broken-link'));
+      expect(testedTreeIdentity(cwd).method).toBe('hash-failed');
+      refuse(summary.attempt, 'hash-failed');
+      rmSync(join(cwd, 'broken-link'));
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+    } finally {
       if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
       else process.env.ARTIFACTS_DIR = savedArtifacts;
       rmSync(cwd, { recursive: true, force: true });
