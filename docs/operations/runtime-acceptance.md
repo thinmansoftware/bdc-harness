@@ -8,6 +8,19 @@ runs the same gate used on the Docker Desktop staging laptop:
 bun scripts/staging/verify-runtime.ts --image <candidate-image> --source-sha <full-commit> --output-dir <new-evidence-directory>
 ```
 
+On the staging laptop, build and verify in one unattended command from a clean
+candidate worktree:
+
+```powershell
+pwsh -NoProfile -File scripts/staging/build-and-verify.ps1 -SourceSha <full-commit> -OutputDirectory <new-evidence-directory>
+```
+
+The launcher rejects dirty or mismatched source, chooses a unique image tag,
+and writes build and acceptance logs. It uses an isolated anonymous Docker
+client configuration for public base-image pulls, so Windows credential-helper
+logon sessions are not required over SSH. It does not change the normal Docker
+client configuration, copy account credentials or restart the engine.
+
 The gate needs only Bun and a working Docker CLI/engine on the operator host.
 It runs all application tools inside the candidate image. No operator has to
 log in, supply provider credentials, invoke a workflow, inspect logs manually,
