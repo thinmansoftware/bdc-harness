@@ -48,6 +48,11 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
+/** Drop the cached logger so a later test file's createLogger mock is observed. */
+export function resetLoaderLoggerForTests(): void {
+  cachedLog = undefined;
+}
+
 export function classifyLoaderError(error: WorkflowLoadError): LoaderErrorType {
   if (error.errorType === 'parse_error') return 'parse_error';
 

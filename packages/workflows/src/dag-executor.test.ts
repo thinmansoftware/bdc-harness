@@ -1,12 +1,31 @@
-import { describe, it, expect, beforeEach, afterEach, mock, spyOn, type Mock } from 'bun:test';
+import {
+  afterAll,
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  mock,
+  spyOn,
+  type Mock,
+} from 'bun:test';
 import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
+import * as realPaths from '@archon/paths';
 
 const isWindows = process.platform === 'win32';
 
 // --- Mock logger (MUST come before imports of modules under test) ---
+//
+// mock.module() is process-global and mock.restore() does not undo it.
+// Stop 6 runs this file in one bun test process with loader.test.ts. A
+// wholesale replacement leaks this createLogger into that file and the
+// loader's cached logger never sees the warnings its tests assert on.
+// Snapshot the real exports, override only what this file drives, and
+// reinstall the snapshots in afterAll (registered after the loader imports
+// below) so the next file can install its own mock.
 
 const mockLogFn = mock(() => {});
 const mockLogger = {
@@ -18,7 +37,11 @@ const mockLogger = {
   fatal: mockLogFn,
   child: mock(() => mockLogger),
 };
+const originalCreateLogger = realPaths.createLogger;
+const originalGetCommandFolderSearchPaths = realPaths.getCommandFolderSearchPaths;
+const originalGetDefaultCommandsPath = realPaths.getDefaultCommandsPath;
 mock.module('@archon/paths', () => ({
+  ...realPaths,
   createLogger: mock(() => mockLogger),
   getCommandFolderSearchPaths: (folder?: string) => {
     const paths = ['.archon/commands'];
@@ -58,8 +81,8 @@ import {
 import { loadMcpConfig } from '@archon/providers/claude/provider';
 import { resolveLoopIterationIdleTimeoutMs } from './utils/idle-timeout';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
-import { discoverWorkflows } from './workflow-discovery';
-import { parseWorkflow } from './loader';
+import { discoverWorkflows, resetDiscoveryLoggerForTests } from './workflow-discovery';
+import { parseWorkflow, resetLoaderLoggerForTests } from './loader';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import { getWorkflowEventEmitter } from './event-emitter';
@@ -279,6 +302,20 @@ function mockBashExecWithScriptCapture(
 // mock.module registrations.
 afterEach(() => {
   mock.restore();
+});
+
+afterAll(() => {
+  mock.module('@archon/paths', () => ({
+    ...realPaths,
+    createLogger: originalCreateLogger,
+    getCommandFolderSearchPaths: originalGetCommandFolderSearchPaths,
+    getDefaultCommandsPath: originalGetDefaultCommandsPath,
+  }));
+  // Modules already imported above may have cached the mock logger.
+  // Drop those caches so the next file's createLogger mock is the one
+  // that records calls.
+  resetLoaderLoggerForTests();
+  resetDiscoveryLoggerForTests();
 });
 
 describe('buildTopologicalLayers', () => {

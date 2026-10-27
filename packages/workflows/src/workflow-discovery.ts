@@ -36,6 +36,11 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
+/** Drop the cached logger so a later test file's createLogger mock is observed. */
+export function resetDiscoveryLoggerForTests(): void {
+  cachedLog = undefined;
+}
+
 /**
  * One-time deprecation warning for the pre-refactor `~/.archon/.archon/workflows/`
  * location. Scoped to the process so the warning fires exactly once regardless

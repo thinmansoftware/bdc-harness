@@ -38,8 +38,15 @@ clearRegistry();
 registerBuiltinProviders();
 registerCommunityProviders();
 
-import { discoverWorkflows } from './workflow-discovery';
-import { getLoaderErrors, parseWorkflow } from './loader';
+import { discoverWorkflows, resetDiscoveryLoggerForTests } from './workflow-discovery';
+import { getLoaderErrors, parseWorkflow, resetLoaderLoggerForTests } from './loader';
+
+// Earlier files in a combined bun test process (dag-executor.test.ts) may
+// have already cached a logger from their own @archon/paths mock. This
+// file's createLogger mock is installed above; drop those caches so warn
+// assertions observe this mockLogger.
+resetLoaderLoggerForTests();
+resetDiscoveryLoggerForTests();
 import { isBashNode, isCancelNode, isLoopNode } from './schemas';
 import * as bundledDefaults from './defaults/bundled-defaults';
 
