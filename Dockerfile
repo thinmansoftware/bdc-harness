@@ -70,6 +70,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 ARG ARCHON_BUILD_SHA=unknown
 ENV ARCHON_BUILD_SHA=${ARCHON_BUILD_SHA}
 ARG TERRAFORM_VERSION=1.8.5
+ARG NODE26_VERSION=26.12.1
+ARG NODE26_SHA256=6170b2d474e1c626f43cff3adc118df9fe3b573258a4fc3d850c8dbc6b079bbd
+ARG PNPM_VERSION=12.14.0
+ARG PNPM_SHA256=ea206e35474bf87be9564a85ca70ed1c8ebdc45da55aafb0a3bf09d1ba69b179
 
 WORKDIR /app
 
@@ -148,6 +152,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
     && npm cache clean --force \
     && rm -rf /usr/local/lib/node_modules/agent-browser \
     && rm -rf /var/lib/apt/lists/*
+
+# Node 26.12.1 and pnpm 12.14.0 sit beside Debian nodejs. /opt/node26/bin is
+# not on the global PATH. /usr/local/bin/pnpm selects this pair per project.
+RUN apt-get update && apt-get install -y --no-install-recommends xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSLo /tmp/node26.tar.xz "https://nodejs.org/dist/v${NODE26_VERSION}/node-v${NODE26_VERSION}-linux-x64.tar.xz" \
+    && echo "${NODE26_SHA256}  /tmp/node26.tar.xz" | sha256sum -c - \
+    && mkdir -p /opt/node26 \
+    && tar -xJf /tmp/node26.tar.xz -C /opt/node26 --strip-components=1 \
+    && rm -f /tmp/node26.tar.xz \
+    && curl -fsSLo /tmp/pnpm.tgz "https://registry.npmjs.org/pnpm/-/pnpm-${PNPM_VERSION}.tgz" \
+    && echo "${PNPM_SHA256}  /tmp/pnpm.tgz" | sha256sum -c - \
+    && mkdir -p "/opt/pnpm-${PNPM_VERSION}" \
+    && tar -xzf /tmp/pnpm.tgz -C "/opt/pnpm-${PNPM_VERSION}" --strip-components=1 \
+    && rm -f /tmp/pnpm.tgz \
+    && chmod -R a+rX /opt/node26 "/opt/pnpm-${PNPM_VERSION}"
 
 # Point agent-browser to system Chromium (avoids ~400MB Chrome for Testing download)
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
@@ -258,11 +278,31 @@ RUN mkdir -p /home/appuser/.cursor && chown appuser:appuser /home/appuser/.curso
 RUN git config --global --add safe.directory '*' && \
     gosu appuser git config --global --add safe.directory '*'
 
+COPY scripts/container/project-pnpm.sh /usr/local/bin/pnpm
+RUN sed -i 's/\r$//' /usr/local/bin/pnpm && chmod 755 /usr/local/bin/pnpm
+
 # Fail the image build if the final runtime loses a lane test runner.
 RUN gosu appuser node --version \
     && gosu appuser npm --version \
     && gosu appuser npx --version \
     && gosu appuser pytest --version
+
+# pnpm@12.14.0 must report pnpm 12.14.0 and Node v26.12.1. Default node and bun stay put.
+RUN set -eu; \
+    scratch="$(mktemp -d)"; \
+    printf '%s\n' '{"packageManager":"pnpm@12.14.0"}' > "$scratch/package.json"; \
+    chown -R appuser:appuser "$scratch"; \
+    pnpm_ver="$(gosu appuser sh -c "cd '$scratch' && pnpm --version")"; \
+    node26_ver="$(gosu appuser sh -c "cd '$scratch' && pnpm exec node --version")"; \
+    default_node="$(gosu appuser node --version)"; \
+    bun_ver="$(gosu appuser bun --version)"; \
+    test "$pnpm_ver" = "12.14.0"; \
+    test "$node26_ver" = "v26.12.1"; \
+    case "$default_node" in \
+      v26*) echo "default node unexpectedly $default_node" >&2; exit 1 ;; \
+    esac; \
+    test "$bun_ver" = "1.3.11"; \
+    rm -rf "$scratch"
 
 # Copy entrypoint script (fixes volume permissions, drops to appuser)
 # sed strips Windows CRLF in case .gitattributes eol=lf was bypassed

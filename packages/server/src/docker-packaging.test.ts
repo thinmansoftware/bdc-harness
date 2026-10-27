@@ -48,4 +48,22 @@ describe('production Docker packaging', () => {
       expect(runtime).toContain(probe);
     }
   });
+
+  it('pins Node 26 and pnpm 12.14.0 off the global PATH', async () => {
+    const dockerfile = await readFile(
+      join(import.meta.dir, '..', '..', '..', 'Dockerfile'),
+      'utf8'
+    );
+    const runtime = dockerfile.split('AS production')[1] ?? '';
+
+    expect(runtime).toContain('NODE26_VERSION=26.12.1');
+    expect(runtime).toContain('PNPM_VERSION=12.14.0');
+    expect(runtime).toContain('6170b2d474e1c626f43cff3adc118df9fe3b573258a4fc3d850c8dbc6b079bbd');
+    expect(runtime).toContain('ea206e35474bf87be9564a85ca70ed1c8ebdc45da55aafb0a3bf09d1ba69b179');
+    expect(runtime).toContain('sha256sum -c');
+    expect(runtime).toContain('COPY scripts/container/project-pnpm.sh /usr/local/bin/pnpm');
+    expect(runtime).toContain('pnpm exec node --version');
+    expect(runtime).toContain('ENTRYPOINT ["docker-entrypoint.sh"]');
+    expect(runtime).not.toMatch(/ENV PATH=.*node26/);
+  });
 });
