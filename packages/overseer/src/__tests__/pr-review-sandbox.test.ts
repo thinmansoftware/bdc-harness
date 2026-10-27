@@ -36,6 +36,7 @@ const context = {
   checkoutPath: '/tmp/checkout',
   reviewerIdentity: 'bot',
   rung: 'pr-review',
+  checkPlanStatus: 'present',
   checkPlan: [['bun', 'test']] as const,
 };
 const proof: ReviewExecutionProof = {
@@ -47,6 +48,7 @@ const proof: ReviewExecutionProof = {
   nativeVersion: '0.153.3',
   runtimeUid: 1001,
   inspectionObserved: true,
+  check_plan: 'present',
   startedAt: '2026-01-01T00:00:00.000Z',
   endedAt: '2026-01-01T00:00:01.000Z',
   checks: [
@@ -195,6 +197,56 @@ describe('bounded broker process capture', () => {
       expect(result.ok).toBe(false);
       expect(result.reason).toBe('model_argv_invalid');
       expect(result.uid).toBe(process.getuid?.());
+    } finally {
+      await rm(spool, { recursive: true, force: true });
+    }
+  });
+
+  test('broker removes per-request scratch after a post-allocation failure', async () => {
+    const spool = await mkdtemp(join(tmpdir(), 'overseer-broker-cleanup-'));
+    const checkout = join(spool, 'checkout');
+    await mkdir(checkout);
+    await runGit(checkout, ['init', '-q']);
+    await runGit(checkout, ['config', 'user.email', 'smoke@example.invalid']);
+    await runGit(checkout, ['config', 'user.name', 'smoke']);
+    await writeFile(join(checkout, 'allowed.txt'), 'allowed\n');
+    await runGit(checkout, ['add', 'allowed.txt']);
+    await runGit(checkout, ['commit', '-qm', 'fixture']);
+    const expectedHead = await runGit(checkout, ['rev-parse', 'HEAD']);
+    const id = 'cleanup-after-failure';
+    const request = join(spool, `${id}.request.json`);
+    await writeFile(
+      request,
+      JSON.stringify({
+        version: 1,
+        id,
+        checkout,
+        expectedHead,
+        argv: [
+          'bunx',
+          '--offline',
+          '@openai/codex@0.153.3',
+          '--enable',
+          'use_legacy_landlock',
+          '-c',
+          'web_search="disabled"',
+          'exec',
+          '--json',
+          '--sandbox',
+          'workspace-write',
+          '-c',
+          'sandbox_workspace_write.network_access=false',
+          '--skip-git-repo-check',
+          '--cd',
+          checkout,
+        ],
+        prompt: 'review',
+      })
+    );
+    try {
+      const result = await processJob(request, spool);
+      expect(result.ok).toBe(false);
+      await expect(access(join(spool, `${id}.scratch`))).rejects.toThrow();
     } finally {
       await rm(spool, { recursive: true, force: true });
     }
@@ -415,7 +467,13 @@ async function reviewObservedCheckout(input: {
   checkPlan: ReadonlyArray<readonly string[]>;
   evaluate?: () => Promise<ReturnType<typeof approveResult>>;
   broker?: boolean;
-}): Promise<{ disposition: string; posts: string[]; proofRecords: number; evaluated: boolean }> {
+}): Promise<{
+  disposition: string;
+  reason?: string;
+  posts: string[];
+  proofRecords: number;
+  evaluated: boolean;
+}> {
   const broker = input.broker === false ? undefined : await startBrokerHarness();
   const posts: string[] = [];
   let proofRecords = 0;
@@ -431,6 +489,7 @@ async function reviewObservedCheckout(input: {
     checkoutPath: input.dir,
     reviewerIdentity: 'bot',
     rung: 'pr-review',
+    checkPlanStatus: input.checkPlan.length === 0 ? 'absent' : 'present',
     checkPlan: input.checkPlan,
   };
   const item: ReviewWorkItem = {
@@ -475,7 +534,13 @@ async function reviewObservedCheckout(input: {
       },
       recordReceipt: async () => undefined,
     });
-    return { disposition: result.disposition, posts, proofRecords, evaluated };
+    return {
+      disposition: result.disposition,
+      reason: result.reason,
+      posts,
+      proofRecords,
+      evaluated,
+    };
   } finally {
     await broker?.stop();
   }
@@ -483,22 +548,77 @@ async function reviewObservedCheckout(input: {
 
 describe.serial('observed checkout integrity and check environment', () => {
   test('real_broker_process_chain reviewer_broker_unavailable fails closed with a Review incomplete comment', async () => {
-    const checkout = await initCheckout();
+    const spool = await mkdtemp(join(tmpdir(), 'overseer-real-process-'));
+    const checkout = join(spool, 'checkout');
+    await mkdir(checkout);
+    await runGit(checkout, ['init', '-q']);
+    await runGit(checkout, ['config', 'user.email', 'smoke@example.invalid']);
+    await runGit(checkout, ['config', 'user.name', 'smoke']);
+    await writeFile(join(checkout, 'allowed.txt'), 'allowed\n');
+    await runGit(checkout, ['add', 'allowed.txt']);
+    await runGit(checkout, ['commit', '-qm', 'fixture']);
+    const checkoutHead = await runGit(checkout, ['rev-parse', 'HEAD']);
     const previous = process.env.OVERSEER_REVIEW_SPOOL;
-    process.env.OVERSEER_REVIEW_SPOOL = join(checkout.dir, 'missing-spool');
+    process.env.OVERSEER_REVIEW_SPOOL = spool;
+    const broker = Bun.spawn([process.execPath, 'run', 'scripts/overseer-reviewer-broker.ts'], {
+      cwd: process.cwd(),
+      env: { ...process.env, OVERSEER_REVIEW_SPOOL: spool },
+      stdout: 'ignore',
+      stderr: 'ignore',
+    });
     try {
+      // This suite normally runs as appuser, so the real broker must reject the
+      // launch. In the UID-1002 final image it starts, and is explicitly killed.
+      if (process.getuid?.() === 1002) {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          try {
+            await access(join(spool, 'ready'));
+            break;
+          } catch {
+            await Bun.sleep(10);
+          }
+        }
+        broker.kill('SIGTERM');
+        await broker.exited;
+      } else {
+        expect(await broker.exited).not.toBe(0);
+      }
       const result = await reviewObservedCheckout({
-        dir: checkout.dir,
-        head: checkout.head,
+        dir: checkout,
+        head: checkoutHead,
         checkPlan: [['/usr/bin/true']],
         broker: false,
       });
       expect(result.evaluated).toBe(false);
       expect(result.disposition).toBe('review_incomplete');
+      expect(result.reason).toBe('reviewer_broker_unavailable');
       expect(result.posts).toEqual(['COMMENT']);
     } finally {
+      broker.kill('SIGTERM');
       if (previous === undefined) delete process.env.OVERSEER_REVIEW_SPOOL;
       else process.env.OVERSEER_REVIEW_SPOOL = previous;
+      await rm(spool, { recursive: true, force: true });
+    }
+  });
+
+  test('absent source-controlled check plan completes inspection and records check_plan=absent', async () => {
+    const checkout = await initCheckout();
+    const broker = await startBrokerHarness();
+    const tracker = installSandboxSimulation(true);
+    try {
+      const proof = await observeReviewExecution({
+        ...context,
+        checkoutPath: checkout.dir,
+        headSha: checkout.head,
+        checkPlanStatus: 'absent',
+        checkPlan: [],
+      });
+      expect(proof?.inspectionObserved).toBe(true);
+      expect(proof?.check_plan).toBe('absent');
+      expect(proof?.checks).toEqual([]);
+    } finally {
+      tracker.restore();
+      await broker.stop();
       await rm(checkout.dir, { recursive: true, force: true });
     }
   });

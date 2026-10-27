@@ -111,6 +111,7 @@ export interface ReviewExecutionContext {
   readonly checkoutPath: string;
   readonly reviewerIdentity: string;
   readonly rung: string;
+  readonly checkPlanStatus: 'absent' | 'present' | 'unsafe';
   readonly checkPlan: readonly (readonly string[])[];
 }
 
@@ -123,6 +124,8 @@ export interface ReviewExecutionProof {
   readonly nativeVersion: string;
   readonly runtimeUid: number;
   readonly inspectionObserved: boolean;
+  /** Durable receipt marker required when the exact-head repository declares no plan. */
+  readonly check_plan: 'absent' | 'present';
   readonly checks: readonly {
     readonly argv: readonly string[];
     readonly cwd: string;
@@ -464,7 +467,11 @@ export async function runAndSubmitReview(
   }
 
   if (work.executionContext && !qualifiesExecution(work.executionContext, verdict.executionProof)) {
-    return submitIncomplete(work, deps, 'sandbox_execution_proof_missing_or_invalid');
+    return submitIncomplete(
+      work,
+      deps,
+      verdict.reasonCode ?? 'sandbox_execution_proof_missing_or_invalid'
+    );
   }
 
   // EXACT-HEAD BINDING: the reviewer must have examined the bound head.
@@ -718,8 +725,9 @@ function qualifiesExecution(
   if (!proof.inspectionObserved || proof.nativePolicy !== 'codex_legacy_landlock') return false;
   if (!Number.isInteger(proof.runtimeUid) || proof.runtimeUid === 0 || !proof.treeSha || !proof.cwd)
     return false;
-  if (context.checkPlan.length === 0 || proof.checks.length !== context.checkPlan.length)
-    return false;
+  if (context.checkPlanStatus === 'unsafe') return false;
+  if (proof.check_plan !== context.checkPlanStatus) return false;
+  if (proof.checks.length !== context.checkPlan.length) return false;
   return proof.checks.every(
     (check, index) =>
       check.exitCode === 0 &&

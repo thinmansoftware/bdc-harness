@@ -35,8 +35,8 @@ import {
   type SubmitDisposition,
   type SubmitOutcome,
 } from '@archon/overseer/pr-review-submit';
-import { chmod, lstat, mkdir, opendir, realpath, rename, rm } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { chmod, lstat, mkdir, opendir, readFile, realpath, rename, rm } from 'node:fs/promises';
+import { dirname, join, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const log = createLogger('dispatch/review-worker-clock');
@@ -51,13 +51,17 @@ const CHECKS_PENDING_BACKOFF_MS = Math.max(
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
 
-export function readTrustedCheckPlan(
-  raw: string | undefined = process.env.OVERSEER_REVIEW_CHECK_PLAN_JSON
-): readonly (readonly string[])[] {
-  if (!raw) return [];
+export const REVIEW_CHECK_PLAN_PATH = '.github/overseer-review-check-plan.json';
+
+export type TrustedCheckPlan =
+  | { status: 'absent'; commands: readonly (readonly string[])[] }
+  | { status: 'present'; commands: readonly (readonly string[])[] }
+  | { status: 'unsafe'; commands: readonly (readonly string[])[] };
+
+export function parseTrustedCheckPlan(raw: string): TrustedCheckPlan {
   try {
     const value = JSON.parse(raw) as unknown;
-    if (!Array.isArray(value) || value.length === 0) return [];
+    if (!Array.isArray(value) || value.length === 0) return { status: 'unsafe', commands: [] };
     if (
       !value.every(
         command =>
@@ -73,11 +77,32 @@ export function readTrustedCheckPlan(
           )
       )
     ) {
-      return [];
+      return { status: 'unsafe', commands: [] };
     }
-    return value as string[][];
+    return { status: 'present', commands: value as string[][] };
   } catch {
-    return [];
+    return { status: 'unsafe', commands: [] };
+  }
+}
+
+export async function readTrustedCheckPlan(checkoutPath: string): Promise<TrustedCheckPlan> {
+  const planPath = join(checkoutPath, REVIEW_CHECK_PLAN_PATH);
+  try {
+    const [checkoutReal, planReal, info] = await Promise.all([
+      realpath(checkoutPath),
+      realpath(planPath),
+      lstat(planPath),
+    ]);
+    if (
+      !info.isFile() ||
+      !planReal.startsWith(checkoutReal.endsWith(sep) ? checkoutReal : `${checkoutReal}${sep}`)
+    )
+      return { status: 'unsafe', commands: [] };
+    return parseTrustedCheckPlan(await readFile(planReal, 'utf8'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+      return { status: 'absent', commands: [] };
+    return { status: 'unsafe', commands: [] };
   }
 }
 
@@ -262,6 +287,7 @@ export async function tickReviewWorkerClock(
               baseSha: body.baseSha ?? '',
             })
           : resolveTrustedCheckoutPath(body.owner, body.repo, body.headSha);
+        const checkPlan = await readTrustedCheckPlan(checkoutPath);
         const work: ReviewWorkItem = {
           correlationId: claimed.correlation_id,
           messageId: claimed.id,
@@ -281,7 +307,8 @@ export async function tickReviewWorkerClock(
             checkoutPath,
             reviewerIdentity: config.reviewerIdentity,
             rung: 'pr-review',
-            checkPlan: Object.freeze(readTrustedCheckPlan()),
+            checkPlanStatus: checkPlan.status,
+            checkPlan: Object.freeze(checkPlan.commands),
           }),
         };
         const renew = deps.renewMessageLease;

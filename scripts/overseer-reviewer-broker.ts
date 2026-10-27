@@ -163,6 +163,7 @@ export async function runBrokerProcess(
 
 export async function processJob(path: string, spool = SPOOL): Promise<BrokerResult> {
   const id = basename(path, '.request.json');
+  const scratch = join(spool, `${id}.scratch`);
   try {
     const raw = JSON.parse(await readFile(path, 'utf8')) as unknown;
     if (!validJob(raw) || raw.id !== id) throw new Error('invalid_job');
@@ -195,7 +196,6 @@ export async function processJob(path: string, spool = SPOOL): Promise<BrokerRes
       throw new Error('model_argv_invalid');
     }
 
-    const scratch = join(spool, `${id}.scratch`);
     const codexHome = join(scratch, 'codex');
     const temp = join(scratch, 'tmp');
     await mkdir(codexHome, { recursive: true, mode: 0o700 });
@@ -264,7 +264,6 @@ export async function processJob(path: string, spool = SPOOL): Promise<BrokerRes
     if (version.exitCode !== 0 || !version.stdout.includes(CODEX_VERSION))
       throw new Error('landlock_unsupported');
     const result = await runBrokerProcess(command, checkout, env, job.prompt);
-    await rm(scratch, { recursive: true, force: true });
     return {
       id,
       ok: result.exitCode === 0 && !result.outputTruncated && !result.timedOut,
@@ -283,6 +282,8 @@ export async function processJob(path: string, spool = SPOOL): Promise<BrokerRes
       uid: process.getuid?.() ?? -1,
       reason: error instanceof Error ? error.message : 'broker_failure',
     };
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
   }
 }
 

@@ -2,17 +2,39 @@ import { describe, expect, test } from 'bun:test';
 import { chmod, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readTrustedCheckPlan, sealReviewCheckout } from './review-worker-clock';
+import {
+  parseTrustedCheckPlan,
+  readTrustedCheckPlan,
+  REVIEW_CHECK_PLAN_PATH,
+  sealReviewCheckout,
+} from './review-worker-clock';
 
 describe('trusted review check plan', () => {
   test('accepts only nonempty argv arrays', () => {
-    expect(readTrustedCheckPlan('[[' + '"bun","test"' + ']]')).toEqual([['bun', 'test']]);
-    expect(readTrustedCheckPlan('[]')).toEqual([]);
-    expect(readTrustedCheckPlan('[["sh","-c","touch /tmp/pwned"]]')).toEqual([]);
+    expect(parseTrustedCheckPlan('[[' + '"bun","test"' + ']]')).toEqual({
+      status: 'present',
+      commands: [['bun', 'test']],
+    });
+    expect(parseTrustedCheckPlan('[]').status).toBe('unsafe');
+    expect(parseTrustedCheckPlan('[["sh","-c","touch /tmp/pwned"]]').status).toBe('unsafe');
   });
   test('rejects malformed and NUL-bearing plans', () => {
-    expect(readTrustedCheckPlan('not-json')).toEqual([]);
-    expect(readTrustedCheckPlan('[["bun","a\\u0000b"]]')).toEqual([]);
+    expect(parseTrustedCheckPlan('not-json').status).toBe('unsafe');
+    expect(parseTrustedCheckPlan('[["bun","a\\u0000b"]]').status).toBe('unsafe');
+  });
+  test('reads only the source-controlled exact-head plan and distinguishes absence', async () => {
+    const checkout = await mkdtemp(join(tmpdir(), 'review-plan-'));
+    try {
+      expect(await readTrustedCheckPlan(checkout)).toEqual({ status: 'absent', commands: [] });
+      await mkdir(join(checkout, '.github'));
+      await writeFile(join(checkout, REVIEW_CHECK_PLAN_PATH), '[["bun","test"]]');
+      expect(await readTrustedCheckPlan(checkout)).toEqual({
+        status: 'present',
+        commands: [['bun', 'test']],
+      });
+    } finally {
+      await rm(checkout, { recursive: true, force: true });
+    }
   });
 });
 

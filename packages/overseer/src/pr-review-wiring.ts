@@ -64,7 +64,11 @@ import {
   REMEDIATION_SENDER,
 } from './remediation-candidate';
 import type { RemediationEmitResult } from './remediation-candidate';
-import { submitReviewerBrokerJob } from './reviewer-broker-client';
+import {
+  REVIEWER_BROKER_UNAVAILABLE,
+  ReviewerBrokerError,
+  submitReviewerBrokerJob,
+} from './reviewer-broker-client';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
@@ -301,8 +305,9 @@ async function readCheckoutFingerprint(
 export async function observeReviewExecution(
   context: ReviewExecutionContext
 ): Promise<ReviewExecutionProof | undefined> {
-  if (process.platform !== 'linux' || !context.checkoutPath || context.checkPlan.length === 0)
+  if (process.platform !== 'linux' || !context.checkoutPath || context.checkPlanStatus === 'unsafe')
     return undefined;
+  const checkPlanStatus = context.checkPlanStatus;
   const startedAt = new Date().toISOString();
   try {
     return await withUntrustedScratch(async env => {
@@ -354,14 +359,16 @@ export async function observeReviewExecution(
         nativeVersion: '0.153.3',
         runtimeUid: inspection.uid,
         inspectionObserved: true,
+        check_plan: checkPlanStatus,
         checks,
         startedAt,
         endedAt: new Date().toISOString(),
       };
     });
-  } catch {
+  } catch (error) {
     // Broker absence, malformed responses, and broker deadlines are all the
     // same fail-closed execution-unavailable state at this boundary.
+    if (error instanceof ReviewerBrokerError) throw error;
     return undefined;
   }
 }
@@ -1169,9 +1176,22 @@ export function createRealSubmitDeps(
   return {
     reviewerIdentity,
     async runReviewer(work): Promise<ReviewerVerdict> {
-      const executionProof = work.executionContext
-        ? await observeReviewExecution(work.executionContext)
-        : undefined;
+      let executionProof: ReviewExecutionProof | undefined;
+      try {
+        executionProof = work.executionContext
+          ? await observeReviewExecution(work.executionContext)
+          : undefined;
+      } catch (error) {
+        if (error instanceof ReviewerBrokerError) {
+          return {
+            approved: false,
+            summary: NATIVE_EXECUTION_INCOMPLETE_SUMMARY,
+            reviewedHeadSha: work.headSha,
+            reasonCode: REVIEWER_BROKER_UNAVAILABLE,
+          };
+        }
+        throw error;
+      }
       if (work.executionContext && !executionProof) {
         return {
           approved: false,
