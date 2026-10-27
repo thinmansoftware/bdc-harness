@@ -8,7 +8,7 @@
  *   4. dark lane (glm / refusedTiers) is hard-refused
  */
 
-import { describe, test, expect } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -149,6 +149,10 @@ describe('cascade entry override and refuse', () => {
   test('climb from codex skips claude; next tier is frontier', async () => {
     const outDir = await mkdtemp(join(tmpdir(), 'sc-ladder-codex-frontier-'));
     const firedWorkflows: string[] = [];
+    const thresholdEnv = 'SMART_CAULDRON_HEADROOM_THRESHOLD_PERCENT';
+    const previousThreshold = process.env[thresholdEnv];
+    delete process.env[thresholdEnv];
+    const log = spyOn(console, 'log').mockImplementation(() => undefined);
     try {
       const deps: CascadeDeps = {
         fire: async opts => {
@@ -185,7 +189,14 @@ describe('cascade entry override and refuse', () => {
       expect(record.frontierApproval?.workflowName).toBe('bdc-feature-development-fable');
       expect(record.attempts.map(a => a.tier)).toEqual(['codex']);
       expect(loadPremiumTiers()).toContain('frontier');
+      const overThresholdLogs = log.mock.calls.filter(call =>
+        String(call[0]).includes('claude_seat_over_threshold:91:80')
+      );
+      expect(overThresholdLogs).toHaveLength(1);
     } finally {
+      log.mockRestore();
+      if (previousThreshold === undefined) delete process.env[thresholdEnv];
+      else process.env[thresholdEnv] = previousThreshold;
       await rm(outDir, { recursive: true, force: true });
     }
   });
