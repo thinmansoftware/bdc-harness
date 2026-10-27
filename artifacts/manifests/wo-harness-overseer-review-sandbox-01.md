@@ -2,7 +2,7 @@ Manifest-Version: 2
 WO: WO-HARNESS-OVERSEER-REVIEW-SANDBOX-01
 Builder: Codex
 Repair target: PR #1290, feat/wo-harness-overseer-review-sandbox-01-repair
-Functional candidate SHA: 964659653c8c6beaf7bcdf0a8233abd96f551500
+Functional candidate SHA: c0dcb58be46dc8751f0ee7768abc27882c5d4a3a
 Fetched origin/dev: 7a4b6438fc16696707b736cd160cc1861d7ffacb
 Merge base: 7a4b6438fc16696707b736cd160cc1861d7ffacb
 Persisted runScopeSha: 7a4b6438fc16696707b736cd160cc1861d7ffacb
@@ -34,7 +34,7 @@ Validation:
 - Stop 4: not run outside the final image; the required broker is intentionally unavailable here.
 - Stop 5: 14 pass / 14 total, zero failures.
 - Stop 6: type-check exited 0.
-- Stop 7: pending final-image CI; this builder has no Docker executable and records no substitute evidence.
+- Stop 7 native smoke: final-image CI printed `uid=1002 codex=0.153.3 policy=use_legacy_landlock`; the final CapAdd literal assertion was corrected to use the required plain Docker template rendering.
 - Stop 8: focused review_incomplete tests passed.
 - Stop 10: no errexit-exempt negative probes found.
 - Stop 11: negative_probe_success_fails_closed collected and passed.
