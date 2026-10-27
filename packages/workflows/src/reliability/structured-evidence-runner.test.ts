@@ -1195,6 +1195,158 @@ describe('hermetic-fresh-attempt', () => {
     ]);
     rmSync(cwd, { recursive: true, force: true });
   });
+
+  it('returns hash-failed when git status fails or exceeds the capture limit', () => {
+    const cwd = tempDir('ser-status-');
+    initRepo(cwd);
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+    const artifacts = join(cwd, 'artifacts');
+    const bin = join(cwd, 'bin');
+    mkdirSync(artifacts);
+    mkdirSync(bin);
+    const located = spawnSync('bash', ['-lc', 'command -v git'], { encoding: 'utf8' });
+    if (located.status !== 0 || located.stdout.trim().length === 0) {
+      throw new Error('git not found');
+    }
+    const realGit = located.stdout.trim();
+    const savedPath = process.env.PATH ?? '';
+    const savedArtifacts = process.env.ARTIFACTS_DIR;
+    process.env.ARTIFACTS_DIR = artifacts;
+    const writeShim = (mode: 'fail' | 'huge'): void => {
+      const body =
+        mode === 'fail'
+          ? 'echo forced-status-failure >&2\nexit 7'
+          : 'head -c 17825792 /dev/zero\nexit 0';
+      writeExec(
+        join(bin, 'git'),
+        [
+          '#!/bin/sh',
+          `real='${realGit}'`,
+          'for arg in "$@"; do',
+          '  if [ "$arg" = "status" ]; then',
+          body,
+          '  fi',
+          'done',
+          'exec "$real" "$@"',
+          '',
+        ].join('\n')
+      );
+    };
+    const refuse = (attempt: EvidenceAttempt, reason: string): void => {
+      const verdict = checkAttemptRecord(attempt, cwd, authority(cwd));
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toBe(reason);
+    };
+    try {
+      const summary = runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      writeShim('fail');
+      process.env.PATH = `${bin}:${savedPath}`;
+      expect(testedTreeIdentity(cwd).method).toBe('hash-failed');
+      refuse(summary.attempt, 'hash-failed');
+      writeShim('huge');
+      expect(testedTreeIdentity(cwd).method).toBe('hash-failed');
+      refuse(summary.attempt, 'hash-failed');
+      rmSync(bin, { recursive: true, force: true });
+      process.env.PATH = savedPath;
+      expect(testedTreeIdentity(cwd).method).toBe('sha256-worktree-bytes-v1');
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+    } finally {
+      process.env.PATH = savedPath;
+      if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = savedArtifacts;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('admits passing grep evidence with unparsed prose and refuses other incomplete greps', () => {
+    const cwd = tempDir('ser-fp4-');
+    initRepo(cwd);
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+    const artifacts = join(cwd, 'artifacts');
+    mkdirSync(artifacts, { recursive: true });
+    const attempts = join(artifacts, 'evidence', 'attempts');
+    const savedArtifacts = process.env.ARTIFACTS_DIR;
+    const savedRun = process.env.SER_RUN_ID;
+    process.env.ARTIFACTS_DIR = artifacts;
+    process.env.SER_RUN_ID = 'run-fp4';
+    const env = {
+      ...process.env,
+      HARNESS_ROOT_OVERRIDE: ROOT,
+      ARTIFACTS_DIR: artifacts,
+      NODE_ENV: 'test',
+      SER_TEST_TRUSTED_ROOT: ROOT,
+      SER_RUN_ID: 'run-fp4',
+    };
+    const runGreps = (input: string): ReturnType<typeof spawnSync> =>
+      spawnSync('bun', [RUNNER, 'run-greps'], { cwd, env, encoding: 'utf8', input });
+    const readGrep = (): EvidenceAttempt => {
+      const id = readFileSync(join(attempts, 'current-greps'), 'utf8').trim();
+      return JSON.parse(readFileSync(join(attempts, `${id}.json`), 'utf8')) as EvidenceAttempt;
+    };
+    const checkCli = (): ReturnType<typeof spawnSync> =>
+      spawnSync('bun', [RUNNER, 'check-attempt'], { cwd, env, encoding: 'utf8' });
+    try {
+      const summary = runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
+      expect(summary.attempt.aggregate).toBe('PASSED');
+      expect(summary.attempt.runId).toBe('run-fp4');
+      const admitted = runGreps('grep -c base README\teq\t1\nUNPARSED\t1\tprose\nDECLARED\t2\n');
+      expect(admitted.status).toBe(0);
+      expect(admitted.stdout).toContain('GREP_STATUS=incomplete');
+      expect(admitted.stdout).toContain('UNVERIFIED (unparsed)');
+      const grepAttempt = readGrep();
+      expect(grepAttempt.aggregate).toBe('INCOMPLETE');
+      expect(grepAttempt.grepExecuted).toBe(1);
+      expect(grepAttempt.grepDropped).toBe(0);
+      expect(grepAttempt.grepUnparsed).toBe(1);
+      expect(grepAttempt.grepMismatch).toBe(0);
+      expect(checkAttemptRecord(grepAttempt, cwd, authority(cwd)).ok).toBe(true);
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      const admittedCli = checkCli();
+      expect(admittedCli.status).toBe(0);
+      expect(admittedCli.stdout).toContain('OK');
+
+      const dropped = runGreps('grep -c base README\teq\t1\necho unsafe\teq\t0\nDECLARED\t2\n');
+      expect(dropped.status).toBe(0);
+      expect(dropped.stdout).toContain('GREP_DROPPED=1');
+      expect(checkAttemptRecord(readGrep(), cwd, authority(cwd)).ok).toBe(false);
+      expect(checkCli().status).not.toBe(0);
+
+      const mismatch = runGreps('grep -c base README\teq\t9\nDECLARED\t1\n');
+      expect(mismatch.status).toBe(0);
+      expect(mismatch.stdout).toContain('GREP_MISMATCH=1');
+      expect(checkAttemptRecord(readGrep(), cwd, authority(cwd)).ok).toBe(false);
+      expect(checkCli().status).not.toBe(0);
+
+      const proseOnly = runGreps('UNPARSED\t1\tprose\nDECLARED\t1\n');
+      expect(proseOnly.status).toBe(0);
+      expect(proseOnly.stdout).toContain('GREP_EXECUTED=0');
+      expect(proseOnly.stdout).toContain('GREP_UNPARSED=1');
+      expect(checkAttemptRecord(readGrep(), cwd, authority(cwd)).ok).toBe(false);
+      expect(checkCli().status).not.toBe(0);
+
+      const restored = runGreps('grep -c base README\teq\t1\nUNPARSED\t1\tprose\nDECLARED\t2\n');
+      expect(restored.status).toBe(0);
+      const stripped = readGrep();
+      expect(stripped.grepExecuted).toBe(1);
+      delete stripped.grepExecuted;
+      delete stripped.grepDropped;
+      delete stripped.grepUnparsed;
+      delete stripped.grepMismatch;
+      const strippedId = readFileSync(join(attempts, 'current-greps'), 'utf8').trim();
+      writeFileSync(join(attempts, `${strippedId}.json`), `${JSON.stringify(stripped, null, 2)}\n`);
+      const missingCounters = checkAttemptRecord(stripped, cwd, authority(cwd));
+      expect(missingCounters.ok).toBe(false);
+      if (!missingCounters.ok) expect(missingCounters.reason).toBe('aggregate-INCOMPLETE');
+      expect(checkCli().status).not.toBe(0);
+    } finally {
+      if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = savedArtifacts;
+      if (savedRun === undefined) delete process.env.SER_RUN_ID;
+      else process.env.SER_RUN_ID = savedRun;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('parity-stage-and-bundle', () => {

@@ -202,9 +202,40 @@ done
 
 OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed "N/A (spec declares no grep stop conditions)" none_declared 0)"
 assert_contains "none_declared zero declarations stay PASS" "VALIDATION: PASS" "$OUT"
-OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "8/8 (x)" passed 'grep -c x f => 1; UNVERIFIED (unparsed): prose' incomplete 0)"
+FP4="$(mktemp -d)"
+FP4_ART="$(mktemp -d)"
+git -C "$FP4" init -q
+git -C "$FP4" config user.email t@example.com
+git -C "$FP4" config user.name Test
+printf 'base\n' > "$FP4/README"
+git -C "$FP4" add README
+git -C "$FP4" commit -qm base
+cat > "$FP4/ok.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+chmod +x "$FP4/ok.sh"
+printf 'bash ./ok.sh\n' > "$FP4/cmds"
+OUT="$(
+  cd "$FP4" || exit 1
+  export ARTIFACTS_DIR="$FP4_ART" SER_RUN_ID=run-fp4 SER_REPO=thinmansoftware/bdc-harness
+  ser_runner run-tests --commands ./cmds --log "$FP4_ART/stop-tests.log" >/dev/null
+  printf 'grep -c base README\teq\t1\nUNPARSED\t1\tprose\nDECLARED\t2\n' | ser_runner run-greps >/dev/null
+  export SER_REQUIRE_ATTEMPT=1
+  printf '%s\n' "$ENGINE_MANIFEST" | sme_process "1/1 (bash ./ok.sh)" passed 'grep -c base README => 1; UNVERIFIED (unparsed): prose' incomplete 0
+)"
+assert_eq "FP-4 test attempt recorded" "yes" "$(
+  id="$(tr -d '[:space:]' < "$FP4_ART/evidence/attempts/current-tests")"
+  [ -n "$id" ] && [ -s "$FP4_ART/evidence/attempts/${id}.json" ] && echo yes || echo no
+)"
+assert_eq "FP-4 grep attempt recorded" "yes" "$(
+  id="$(tr -d '[:space:]' < "$FP4_ART/evidence/attempts/current-greps")"
+  [ -n "$id" ] && [ -s "$FP4_ART/evidence/attempts/${id}.json" ] && echo yes || echo no
+)"
 assert_contains "FP-4 real incomplete line stays PASS" "VALIDATION: PASS" "$OUT"
 assert_not_contains "FP-4 real incomplete line is not FAIL" "VALIDATION: FAIL" "$OUT"
+rm -rf "$FP4" "$FP4_ART"
 
 prepare_passing_attempt() {
   local repo="$1" art="$2" run_id="$3"
@@ -224,10 +255,9 @@ EOF
   printf 'bash ./ok.sh\n' > "$repo/cmds"
   (
     cd "$repo" || exit 1
-    ARTIFACTS_DIR="$art" SER_RUN_ID="$run_id" SER_REPO="thinmansoftware/bdc-harness" \
-      ser_runner run-tests --commands ./cmds --log "$art/stop-tests.log" >/dev/null
-    ARTIFACTS_DIR="$art" SER_RUN_ID="$run_id" SER_REPO="thinmansoftware/bdc-harness" \
-      printf 'grep -c base README\teq\t1\nDECLARED\t1\n' | ser_runner run-greps >/dev/null
+    export ARTIFACTS_DIR="$art" SER_RUN_ID="$run_id" SER_REPO="thinmansoftware/bdc-harness"
+    ser_runner run-tests --commands ./cmds --log "$art/stop-tests.log" >/dev/null
+    printf 'grep -c base README\teq\t1\nDECLARED\t1\n' | ser_runner run-greps >/dev/null
   )
 }
 
@@ -245,6 +275,14 @@ echo "--- attempt binding and mixed counts through stamp ---"
 BIND="$(mktemp -d)"
 BIND_ART="$(mktemp -d)"
 prepare_passing_attempt "$BIND" "$BIND_ART" run-a
+assert_eq "current-tests record exists" "yes" "$(
+  id="$(tr -d '[:space:]' < "$BIND_ART/evidence/attempts/current-tests")"
+  [ -n "$id" ] && [ -s "$BIND_ART/evidence/attempts/${id}.json" ] && echo yes || echo no
+)"
+assert_eq "current-greps record exists" "yes" "$(
+  id="$(tr -d '[:space:]' < "$BIND_ART/evidence/attempts/current-greps")"
+  [ -n "$id" ] && [ -s "$BIND_ART/evidence/attempts/${id}.json" ] && echo yes || echo no
+)"
 ERRF="$(mktemp)"
 OUT="$(sme_at "$BIND" "$BIND_ART" run-a "" passed "$ERRF")"
 assert_contains "blank live repo stays PASS" "VALIDATION: PASS" "$OUT"
@@ -284,12 +322,16 @@ OUT="$(sme_at "$BIND" "$BIND_ART" run-a thinmansoftware/bdc-harness passed "$ERR
 assert_contains "incomplete test member stamps FAIL" "VALIDATION: FAIL" "$OUT"
 assert_not_contains "incomplete test member is not PASS" "VALIDATION: PASS" "$OUT"
 assert_contains "incomplete test member reason prefixed tests:" "tests:" "$(cat "$ERRF")"
+PRIOR_GREP="$(tr -d '[:space:]' < "$BIND_ART/evidence/attempts/current-greps")"
 printf 'v2\n' > "$BIND/src.js"
 (
   cd "$BIND" || exit 1
-  ARTIFACTS_DIR="$BIND_ART" SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness \
-    printf 'grep -c base README\teq\t1\nDECLARED\t1\n' | ser_runner run-greps >/dev/null
+  export ARTIFACTS_DIR="$BIND_ART" SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness
+  printf 'grep -c base README\teq\t1\nDECLARED\t1\n' | ser_runner run-greps >/dev/null
 )
+NEW_GREP="$(tr -d '[:space:]' < "$BIND_ART/evidence/attempts/current-greps")"
+assert_eq "later greps pointer changed" "yes" "$([ -n "$PRIOR_GREP" ] && [ "$PRIOR_GREP" != "$NEW_GREP" ] && echo yes || echo no)"
+assert_eq "later greps json stays in artifact dir" "yes" "$([ -n "$NEW_GREP" ] && [ -s "$BIND_ART/evidence/attempts/${NEW_GREP}.json" ] && echo yes || echo no)"
 OUT="$(sme_at "$BIND" "$BIND_ART" run-a thinmansoftware/bdc-harness passed "$ERRF")"
 assert_contains "stale tests plus later greps stamp FAIL" "VALIDATION: FAIL" "$OUT"
 assert_not_contains "stale tests plus later greps are not PASS" "VALIDATION: PASS" "$OUT"
@@ -356,10 +398,9 @@ chmod +x "$NA/ok.sh"
 printf 'bash ./ok.sh\n' > "$NA/cmds"
 (
   cd "$NA" || exit 1
-  ARTIFACTS_DIR="$NA_ART" SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness \
-    ser_runner run-tests --commands ./cmds --log "$NA_ART/stop-tests.log" >/dev/null
-  ARTIFACTS_DIR="$NA_ART" SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness \
-    printf 'grep -c base README\teq\t1\nDECLARED\t1\n' | ser_runner run-greps >/dev/null
+  export ARTIFACTS_DIR="$NA_ART" SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness
+  ser_runner run-tests --commands ./cmds --log "$NA_ART/stop-tests.log" >/dev/null
+  printf 'grep -c base README\teq\t1\nDECLARED\t1\n' | ser_runner run-greps >/dev/null
 )
 python3 - "$NA" <<'PY'
 import pathlib, sys

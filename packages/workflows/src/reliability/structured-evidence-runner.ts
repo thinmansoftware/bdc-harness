@@ -96,6 +96,10 @@ export const evidenceAttemptSchema = z.object({
   tree: treeIdentitySchema,
   members: z.array(attemptMemberSchema),
   aggregate: evidenceStatusSchema,
+  grepExecuted: z.number().int().nonnegative().optional(),
+  grepDropped: z.number().int().nonnegative().optional(),
+  grepUnparsed: z.number().int().nonnegative().optional(),
+  grepMismatch: z.number().int().nonnegative().optional(),
 });
 
 export type EvidenceAttempt = z.infer<typeof evidenceAttemptSchema>;
@@ -267,7 +271,7 @@ function gitCapture(cwd: string, args: readonly string[]): { ok: boolean; stdout
       maxBuffer: 16 * 1024 * 1024,
     }
   );
-  if (result.status !== 0) return { ok: false, stdout: result.stdout ?? '' };
+  if (result.error || result.status !== 0) return { ok: false, stdout: result.stdout ?? '' };
   return { ok: true, stdout: result.stdout ?? '' };
 }
 
@@ -427,16 +431,15 @@ export function testedTreeIdentity(cwd: string): TreeIdentity {
   }
   const headSha = head.stdout.trim();
   const status = gitCapture(cwd, ['status', '--porcelain=v1', '-z', '-uall']);
+  if (!status.ok) return hashFailedIdentity(headSha);
+  const parsed = parsePorcelainZ(status.stdout);
+  if (!parsed.ok) return hashFailedIdentity(headSha);
   const paths: { path: string; sha256: string }[] = [];
-  if (status.ok) {
-    const parsed = parsePorcelainZ(status.stdout);
-    if (!parsed.ok) return hashFailedIdentity(headSha);
-    for (const entry of parsed.entries) {
-      if (excludedIdentityPath(entry.path)) continue;
-      const sha256 = hashWorktreeBytes(cwd, entry.status, entry.path);
-      if (sha256 === null) return hashFailedIdentity(headSha);
-      paths.push({ path: entry.path, sha256 });
-    }
+  for (const entry of parsed.entries) {
+    if (excludedIdentityPath(entry.path)) continue;
+    const sha256 = hashWorktreeBytes(cwd, entry.status, entry.path);
+    if (sha256 === null) return hashFailedIdentity(headSha);
+    paths.push({ path: entry.path, sha256 });
   }
   paths.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const contentDigest = createHash('sha256').update(JSON.stringify(paths)).digest('hex');
@@ -760,6 +763,26 @@ function attemptCompletionVerdict(
     if (member.status !== 'PASSED') {
       return { ok: false, reason: `member-not-passed:${member.rawCommand}` };
     }
+  }
+  // Legacy FP-4: passing assertions plus unparsed prose, with nothing dropped
+  // or mismatched, stay admissible without labeling the aggregate PASSED.
+  const executed = recorded.grepExecuted;
+  const dropped = recorded.grepDropped;
+  const unparsed = recorded.grepUnparsed;
+  const mismatch = recorded.grepMismatch;
+  if (
+    recorded.kind === 'greps' &&
+    recorded.aggregate === 'INCOMPLETE' &&
+    executed !== undefined &&
+    dropped !== undefined &&
+    unparsed !== undefined &&
+    mismatch !== undefined &&
+    executed > 0 &&
+    dropped === 0 &&
+    mismatch === 0 &&
+    unparsed > 0
+  ) {
+    return { ok: true };
   }
   if (recorded.aggregate !== 'PASSED') {
     return { ok: false, reason: `aggregate-${recorded.aggregate}` };
@@ -2566,6 +2589,10 @@ function runCli(): number {
             : 'INCOMPLETE';
       if (mismatch > 0 || (executed === 0 && declared > 0))
         attempt.aggregate = mismatch > 0 ? 'FAILED' : 'INCOMPLETE';
+      attempt.grepExecuted = executed;
+      attempt.grepDropped = dropped;
+      attempt.grepUnparsed = unparsed;
+      attempt.grepMismatch = mismatch;
       persistAttempt(process.cwd(), attempt);
       process.stderr.write(`SER_GREP_ATTEMPT_ID=${attempt.attemptId}\n`);
       process.stdout.write(
