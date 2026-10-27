@@ -6061,6 +6061,7 @@ export function registerApiRoutes(
         const cascadeOptions = {
           woId: conductor.woId,
           woClass: conductor.woClass,
+          workflow: workflowName,
           tags: conductor.tags,
           entryOverride: conductor.entryOverride,
           dispatchId: conductor.idempotencyKey,

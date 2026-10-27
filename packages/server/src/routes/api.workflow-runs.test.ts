@@ -490,6 +490,10 @@ describe('POST /api/workflows/:name/run', () => {
         { workflow: { name: 'deploy' } as never, source: 'project' as const },
         { workflow: { name: 'test-suite' } as never, source: 'project' as const },
         {
+          workflow: { name: 'bdc-multi-stage-development' } as never,
+          source: 'project' as const,
+        },
+        {
           workflow: { name: 'codex-lane', nodes: [{ provider: 'codex' }] } as never,
           source: 'project' as const,
         },
@@ -744,6 +748,35 @@ describe('POST /api/workflows/:name/run', () => {
         dryRun: false,
       })
     );
+  });
+
+  test('preserves the requested workflow lane for a supervised conductor dispatch', async () => {
+    process.env.ARCHON_SMART_CAULDRON_DISPATCH_ENABLED = 'true';
+    const { app } = makeApp();
+    const response = await app.request('/api/workflows/bdc-multi-stage-development/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        conversationId: 'web-test-abc',
+        message: 'WO-TEST-001',
+        conductor: {
+          enabled: true,
+          woId: 'WO-TEST-001',
+          project: 'test-project',
+          woClass: 'CODE',
+          idempotencyKey: 'dispatch-multi-stage',
+        },
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(mockRunCascade).toHaveBeenCalledWith(
+      expect.objectContaining({
+        dispatchId: 'dispatch-multi-stage',
+        workflow: 'bdc-multi-stage-development',
+      })
+    );
+    expect(mockHandleMessage).not.toHaveBeenCalled();
   });
 
   test('rejects new workflow dispatch while draining without touching in-flight work', async () => {
