@@ -3,20 +3,19 @@
  * auto-circuit. Everything is dependency-injected (fake clock, fake DAL,
  * fake dispatch); no mock.module.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { rootLogger } from '@archon/paths';
-import { getDatabase } from '@archon/core/db';
-import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
+import * as githubMetering from '@archon/core/github/metering';
 import {
   setSeatUsageReaderForTests,
   unknownSeatReading,
 } from '@archon/workflows/reliability/seat-usage';
 
 // A synthetic exhausted response belongs to its test, never the next caller.
-beforeEach(resetGitHubApiMeterForTests);
-afterEach(resetGitHubApiMeterForTests);
+beforeEach(githubMetering.resetGitHubApiMeterForTests);
+afterEach(githubMetering.resetGitHubApiMeterForTests);
 import {
   createTaskmasterState,
   defaultFindEffectByIdempotencyKey,
@@ -4336,13 +4335,19 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
       chunks.push(String(chunk));
       return true;
     };
+    // The 403 is a metered search backoff. Keep it in memory for this test
+    // only -- flushing would publish backoff:search into the shared pool table.
+    const flushSpy = spyOn(githubMetering, 'flushGitHubApiMeter').mockResolvedValue(undefined);
     try {
       const threads = await defaultListThreads(fetchImpl);
+      expect(flushSpy).toHaveBeenCalledTimes(1);
       expect(threads).toHaveLength(1);
       expect(threads[0]?.isUnclaimed).toBe(true);
       expect(threads[0]?.isUnclaimedP0).toBe(true);
       expect(chunks.join('')).toContain('taskmaster.pr_claim_lookup_failed');
     } finally {
+      githubMetering.resetGitHubApiMeterForTests();
+      flushSpy.mockRestore();
       stream.write = originalWrite;
     }
   });
@@ -4385,12 +4390,16 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
   });
 
   test('unlabelled_unassigned_issue_stays_unclaimed', async () => {
-    // pr_lookup_fails_open flushes a search-pool backoff into github_api_pool_state.
-    // The in-memory meter reset does not remove that row, so the next lookup
-    // refuses before fetch. Drop only that backoff so this claim search runs.
-    await getDatabase().query('DELETE FROM github_api_pool_state WHERE resource = $1', [
-      'backoff:search',
-    ]);
+    // Search backoff lives in the shared github_api_pool_state table. Ignore it
+    // for this claim lookup so the test does not delete or depend on that row.
+    const originalAssert = githubMetering.assertPersistedGitHubPoolAvailable;
+    const gate = spyOn(githubMetering, 'assertPersistedGitHubPoolAvailable').mockImplementation(
+      async (poolId, resources, db, now) => {
+        const rest = resources.filter(resource => resource !== 'search');
+        if (rest.length === 0) return;
+        await originalAssert(poolId, rest, db, now);
+      }
+    );
     const urls: string[] = [];
     const fetchImpl = (async (input: string | URL | Request) => {
       const url = String(input);
@@ -4416,12 +4425,16 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
       });
     }) as typeof fetch;
 
-    const threads = await defaultListThreads(fetchImpl);
-    expect(threads).toHaveLength(1);
-    expect(threads[0]?.ownerLogin).toBeNull();
-    expect(threads[0]?.isUnclaimed).toBe(true);
-    expect(threads[0]?.isUnclaimedP0).toBe(true);
-    expect(urls.filter(url => url.includes('/search/issues'))).toHaveLength(1);
+    try {
+      const threads = await defaultListThreads(fetchImpl);
+      expect(threads).toHaveLength(1);
+      expect(threads[0]?.ownerLogin).toBeNull();
+      expect(threads[0]?.isUnclaimed).toBe(true);
+      expect(threads[0]?.isUnclaimedP0).toBe(true);
+      expect(urls.filter(url => url.includes('/search/issues'))).toHaveLength(1);
+    } finally {
+      gate.mockRestore();
+    }
   });
 
   test('assignee_wins_and_invalid_owner_label_is_ignored', async () => {

@@ -7,6 +7,35 @@ import * as git from '@archon/git';
 const isWindows = process.platform === 'win32';
 
 // --- Mock logger (MUST come before imports of modules under test) ---
+//
+// mock.module() is process-global and mock.restore() does not undo it.
+// Stop 6 runs this file in one bun test process with loader.test.ts. Loader
+// and discovery cache the first logger createLogger() returns, so a later
+// file's createLogger mock never receives warn() calls.
+//
+// createLogger() therefore returns one stable bridge. Method calls forward
+// to whichever test file currently owns the slot (this file by default;
+// loader.test.ts adopts the slot in its beforeEach). No production reset
+// hook is required.
+
+type WorkflowTestLogFn = (...args: unknown[]) => unknown;
+
+interface WorkflowTestLogger {
+  info: WorkflowTestLogFn;
+  warn: WorkflowTestLogFn;
+  error: WorkflowTestLogFn;
+  debug: WorkflowTestLogFn;
+  trace: WorkflowTestLogFn;
+  fatal: WorkflowTestLogFn;
+  child: WorkflowTestLogFn;
+}
+
+interface WorkflowTestLoggerSlot {
+  current: WorkflowTestLogger;
+  bridge: WorkflowTestLogger;
+}
+
+const WORKFLOW_TEST_LOGGER_SLOT = '__archonWorkflowTestLoggerSlot';
 
 const mockLogFn = mock(() => {});
 const mockLogger = {
@@ -18,8 +47,44 @@ const mockLogger = {
   fatal: mockLogFn,
   child: mock(() => mockLogger),
 };
+
+// Test loggers are bun mocks. The cast only selects the methods the bridge forwards.
+function asWorkflowTestLogger(logger: object): WorkflowTestLogger {
+  return logger as WorkflowTestLogger;
+}
+
+function installWorkflowTestLoggerSlot(initial: WorkflowTestLogger): WorkflowTestLoggerSlot {
+  const slot: WorkflowTestLoggerSlot = {
+    current: initial,
+    bridge: undefined as unknown as WorkflowTestLogger,
+  };
+  const forward = (method: keyof WorkflowTestLogger): WorkflowTestLogFn => {
+    return (...args: unknown[]): unknown => {
+      const fn = slot.current[method];
+      return fn(...args);
+    };
+  };
+  slot.bridge = {
+    info: forward('info'),
+    warn: forward('warn'),
+    error: forward('error'),
+    debug: forward('debug'),
+    trace: forward('trace'),
+    fatal: forward('fatal'),
+    child: (...args: unknown[]): unknown => {
+      slot.current.child(...args);
+      return slot.bridge;
+    },
+  };
+  (globalThis as unknown as Record<string, WorkflowTestLoggerSlot>)[WORKFLOW_TEST_LOGGER_SLOT] =
+    slot;
+  return slot;
+}
+
+const workflowTestLoggerSlot = installWorkflowTestLoggerSlot(asWorkflowTestLogger(mockLogger));
+
 mock.module('@archon/paths', () => ({
-  createLogger: mock(() => mockLogger),
+  createLogger: mock(() => workflowTestLoggerSlot.bridge),
   getCommandFolderSearchPaths: (folder?: string) => {
     const paths = ['.archon/commands'];
     if (folder) paths.unshift(folder);
@@ -277,6 +342,10 @@ function mockBashExecWithScriptCapture(
 // bash-capture mock silently feeds canned output to unrelated tests and fails
 // bun-spawning script nodes). mock.restore() only restores spies, not
 // mock.module registrations.
+beforeEach(() => {
+  workflowTestLoggerSlot.current = asWorkflowTestLogger(mockLogger);
+});
+
 afterEach(() => {
   mock.restore();
 });
