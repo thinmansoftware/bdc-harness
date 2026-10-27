@@ -1,11 +1,9 @@
 # Bun configuration for Remote Agentic Coding Platform
 
 [test]
-# Repo root, not ./packages. A filter without a leading ./ only matches files
-# under root, and scripts/dispatch/xo-mailbox-ack.test.ts has to match
-# `bun test scripts/dispatch/xo-mailbox-ack.test.ts`. Package test scripts set
-# their own cwd, so they still read the package bunfig and do not inherit this.
-root = "."
+# Only discover tests in packages/ - prevents finding duplicates in workspace/worktrees
+root = "./packages"
+# Run preload script before tests (now in @archon/core)
 preload = ["./packages/core/src/test/setup.ts"]
 # Coverage output
 coverage = true
