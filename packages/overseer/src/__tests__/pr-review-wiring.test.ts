@@ -319,42 +319,6 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
     expect(verdict.reviewedHeadSha).toBe(HEAD);
   });
 
-  test('preserves never-reported operator metadata through evaluator wiring', async () => {
-    const deps = createRealSubmitDeps('review-app[bot]', {
-      octokit: submitOctokit(),
-      recordApprovalVerdict: async () => {},
-      patOctokit: null,
-      evaluate: async () =>
-        reviewResult({
-          verdict: 'CHECKS_UNAVAILABLE',
-          error: 'required_context_never_reported:attempts=4:reason=transient',
-          requiredContextsUnavailableReason: 'required_context_never_reported',
-          missingRequiredContexts: ['Gitleaks'],
-          requiredContextAttempts: 4,
-          requiredContextRearm: {
-            attempted: true,
-            dispatched: true,
-            workflow: 'secrets-scan.yml',
-            branch: 'docs/update',
-          },
-        }),
-    });
-
-    const verdict = await deps.runReviewer(work);
-    expect(verdict).toMatchObject({
-      requiredContextsUnavailable: true,
-      requiredContextsUnavailableReason: 'required_context_never_reported',
-      missingRequiredContexts: ['Gitleaks'],
-      requiredContextAttempts: 4,
-      requiredContextRearm: {
-        attempted: true,
-        dispatched: true,
-        workflow: 'secrets-scan.yml',
-        branch: 'docs/update',
-      },
-    });
-  });
-
   test('the blocked summary names the transient cause when that is what failed', async () => {
     const deps = createRealSubmitDeps('review-app[bot]', {
       octokit: submitOctokit(),

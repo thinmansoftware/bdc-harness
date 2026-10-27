@@ -964,7 +964,6 @@ export function createRealSubmitDeps(
           reviewedHeadSha: result.reviewed_head_sha,
           checksPending: true,
           ...(result.pendingChecks ? { pendingChecks: result.pendingChecks } : {}),
-          ...(result.pendingRequiredContexts ? { pendingRequiredContexts: true } : {}),
         };
       }
       // CHECKS_UNAVAILABLE (#775): terminal, never approving. Carries its own
@@ -976,18 +975,6 @@ export function createRealSubmitDeps(
           summary: buildRequiredContextsBlockedSummary(result.error),
           reviewedHeadSha: result.reviewed_head_sha,
           requiredContextsUnavailable: true,
-          ...(result.requiredContextsUnavailableReason
-            ? { requiredContextsUnavailableReason: result.requiredContextsUnavailableReason }
-            : {}),
-          ...(result.missingRequiredContexts
-            ? { missingRequiredContexts: result.missingRequiredContexts }
-            : {}),
-          ...(typeof result.requiredContextAttempts === 'number'
-            ? { requiredContextAttempts: result.requiredContextAttempts }
-            : {}),
-          ...(result.requiredContextRearm
-            ? { requiredContextRearm: result.requiredContextRearm }
-            : {}),
         };
       }
       // RATE_LIMITED (#782 part 2) is a deferral for the same reason

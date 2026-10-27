@@ -574,7 +574,9 @@ function checksPending(
     acceptance_criteria_available: false,
     error: 'checks_pending',
     ...(pendingChecks.length === 0 ? {} : { pendingChecks }),
-    ...(requiredContexts && requiredContexts.length > 0 ? { pendingRequiredContexts: true } : {}),
+    ...(requiredContexts && requiredContexts.length > 0 && pendingChecks.length > 0
+      ? { pendingRequiredContexts: true }
+      : {}),
   };
 }
 

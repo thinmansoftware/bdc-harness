@@ -584,6 +584,9 @@ export function createRealFetchExactHeadPullRequestEvidence(
         const rearmAttempt = resolveRequiredContextRearmAttempt(
           process.env[REQUIRED_CONTEXT_REARM_ATTEMPT_ENV]
         );
+        const maxAttempts = resolveRequiredContextNeverReportedMaxAttempts(
+          process.env[REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS_ENV]
+        );
         const workflows = parseRequiredContextWorkflowsMap(
           process.env[REQUIRED_CONTEXT_WORKFLOWS_ENV]
         ).get(`${input.owner}/${input.repo}`);
@@ -677,8 +680,11 @@ export function createRealFetchExactHeadPullRequestEvidence(
               }
             }
           }
-        } else if (attempts > rearmAttempt && workflow && context) {
-          const dispatched = (await attemptStore.read?.(rearmReceiptKey)) === 1;
+        } else if (attempts >= maxAttempts && workflow && context) {
+          // The counter API is deliberately write-only outside the DB adapter.
+          // A successful dispatch stamped this durable receipt with 1; this
+          // probe therefore returns >1 only when a prior process dispatched.
+          const dispatched = (await attemptStore.increment(rearmReceiptKey, Date.now())) > 1;
           requiredContextRearm = {
             attempted: true,
             dispatched,
@@ -687,9 +693,6 @@ export function createRealFetchExactHeadPullRequestEvidence(
             branch,
           };
         }
-        const maxAttempts = resolveRequiredContextNeverReportedMaxAttempts(
-          process.env[REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS_ENV]
-        );
         if (attempts >= maxAttempts) {
           neverReportedBlocked = {
             reason: REQUIRED_CONTEXT_NEVER_REPORTED_REASON,

@@ -282,8 +282,6 @@ export interface AttemptCounterStore {
    * BLOCK on someone's PR.
    */
   increment(key: AttemptCounterKey, now: number): Promise<number>;
-  /** Read the current total without changing it. */
-  read?(key: AttemptCounterKey): Promise<number>;
   /** Forget this key's counter -- and ONLY this key's -- after a lookup answers. */
   clear(key: AttemptCounterKey): Promise<void>;
 }
@@ -369,9 +367,6 @@ export const inMemoryAttemptCounterStore: AttemptCounterStore = {
     const attempts = (unknownAttempts.get(counterKey)?.attempts ?? 0) + 1;
     unknownAttempts.set(counterKey, { attempts, touchedAt: now });
     return Promise.resolve(attempts);
-  },
-  read(key) {
-    return Promise.resolve(unknownAttempts.get(counterKeyOf(key))?.attempts ?? 0);
   },
   clear(key) {
     unknownAttempts.delete(counterKeyOf(key));
