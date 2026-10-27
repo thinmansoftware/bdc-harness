@@ -18,6 +18,7 @@ import {
   loadPersistedSeatCutoff,
   readAllSeats,
   readSeat,
+  resolvePushedReadingMaxAgeMinutes,
   resetSeatUsageCacheForTests,
   restoreSeatCutoffOverride,
   seatsForBindings,
@@ -681,6 +682,51 @@ describe('seat usage', () => {
       1
     );
     expect(getSeatCutoff()).toEqual({ percent: 90, source: 'default' });
+  });
+
+  test('invalid_pushed_max_age_falls_back_to_30_and_logs_once', () => {
+    expect(resolvePushedReadingMaxAgeMinutes({ env: {} })).toBe(30);
+    expect(
+      resolvePushedReadingMaxAgeMinutes({
+        env: { FUELGLASS_PUSHED_READING_MAX_AGE_MINUTES: '   ' },
+      })
+    ).toBe(30);
+    expect(
+      logs.filter(entry => entry.msg === 'fuelglass.pushed_reading_max_age_env_invalid')
+    ).toHaveLength(0);
+
+    for (const raw of ['abc', '0', '1441', '-5', '1.5', 'NaN']) {
+      expect(
+        resolvePushedReadingMaxAgeMinutes({
+          env: { FUELGLASS_PUSHED_READING_MAX_AGE_MINUTES: raw },
+        })
+      ).toBe(30);
+    }
+    const invalidLogs = logs.filter(
+      entry => entry.msg === 'fuelglass.pushed_reading_max_age_env_invalid'
+    );
+    expect(invalidLogs).toHaveLength(1);
+    expect(invalidLogs[0]?.obj).toEqual({ raw: 'abc' });
+
+    expect(
+      resolvePushedReadingMaxAgeMinutes({
+        env: { FUELGLASS_PUSHED_READING_MAX_AGE_MINUTES: 'nope' },
+      })
+    ).toBe(30);
+    expect(
+      logs.filter(entry => entry.msg === 'fuelglass.pushed_reading_max_age_env_invalid')
+    ).toHaveLength(1);
+
+    expect(
+      resolvePushedReadingMaxAgeMinutes({
+        env: { FUELGLASS_PUSHED_READING_MAX_AGE_MINUTES: '1' },
+      })
+    ).toBe(1);
+    expect(
+      resolvePushedReadingMaxAgeMinutes({
+        env: { FUELGLASS_PUSHED_READING_MAX_AGE_MINUTES: '1440' },
+      })
+    ).toBe(1440);
   });
 
   test('pushed_reading_fresh_wins_over_direct_probe', async () => {

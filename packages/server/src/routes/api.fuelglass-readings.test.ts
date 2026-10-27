@@ -352,6 +352,24 @@ describe('fuelglass pushed readings', () => {
     expect(listedBody.reading).toBeNull();
   });
 
+  test('unparseable timestamps are rejected and store nothing', async () => {
+    const cases = [
+      sixFields({ resets_at: 'not-a-time' }),
+      sixFields({ observed_at: 'not-a-time' }),
+    ];
+    for (const body of cases) {
+      const res = await postReading(body, OPERATOR_TOKEN);
+      expect(res.status).toBe(400);
+      const payload = (await res.json()) as { error: string };
+      expect(payload.error).toBe('timestamp_unparseable');
+      expect(JSON.stringify(payload)).not.toContain('not-a-time');
+    }
+    const listed = await getReading();
+    const listedBody = (await listed.json()) as { reading: unknown };
+    expect(listedBody.reading).toBeNull();
+    expect(await getLatestSeatUsageReading('cursor')).toBeNull();
+  });
+
   test('GET freshness reports a just-pushed cursor reading', async () => {
     const posted = await postReading(sixFields(), OPERATOR_TOKEN);
     expect(posted.status).toBe(200);
