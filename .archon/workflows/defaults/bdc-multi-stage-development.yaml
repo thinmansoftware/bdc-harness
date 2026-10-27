@@ -125,7 +125,7 @@ nodes:
       # Canonical stage-block selection is implemented by structured-evidence-runner.ts.
       ser_root() {
         local c root pkg url d
-        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
+        if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ] && url="$(git -C "$HARNESS_ROOT_OVERRIDE" remote get-url origin 2>/dev/null || true)" && printf '%s\n' "$url" | grep -Eq '^(https?://github\.com/|ssh://git@github\.com/|git@github\.com:)thinmansoftware/bdc-harness(\.git)?/?$'; then
           root="$HARNESS_ROOT_OVERRIDE"
           pkg="$root/packages/workflows/package.json"
           if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then

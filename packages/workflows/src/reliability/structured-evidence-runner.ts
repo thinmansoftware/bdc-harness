@@ -268,7 +268,9 @@ function gitCapture(cwd: string, args: readonly string[]): { ok: boolean; stdout
 }
 
 function isHarnessOrigin(url: string): boolean {
-  return /(?:github\.com[:/])thinmansoftware\/bdc-harness(?:\.git)?\/?$/i.test(url.trim());
+  return /^(?:https?:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)thinmansoftware\/bdc-harness(?:\.git)?\/?$/i.test(
+    url.trim()
+  );
 }
 
 export function isHarnessRoot(root: string): boolean {
@@ -331,7 +333,7 @@ function upwardHarnessRoot(cwd: string): string | null {
 export function resolveTrustedRunnerFile(cwd: string): string | null {
   const candidates: string[] = [];
   const override = process.env.HARNESS_ROOT_OVERRIDE;
-  if (override) candidates.push(override);
+  if (override && isHarnessOrigin(gitOrigin(override))) candidates.push(override);
   candidates.push('/app');
   candidates.push('/.archon/workspaces/thinmansoftware/bdc-harness/source');
   const archonHome = process.env.ARCHON_HOME ?? join(homedir(), '.archon');
@@ -2391,6 +2393,7 @@ function runCli(): number {
           continue;
         }
         member.argv = allowed.segments[0]?.argv ?? [];
+        member.declaredExecutable = member.argv[0] ?? '';
         member.startedAt = new Date().toISOString();
         const ran = execAssertion(cmd, process.cwd());
         member.endedAt = new Date().toISOString();
