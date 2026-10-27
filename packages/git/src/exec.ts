@@ -99,6 +99,32 @@ function notifyOwnedExit(options: OwnedGroupExecOptions, pid: number): void {
   }
 }
 
+/**
+ * Timeout and output-limit handlers share this so group termination and
+ * ownership retirement cannot drift.
+ *
+ * POSIX may already have a root exit code while descendants still hold the
+ * output pipes. Always terminate and verify the group, and retire only after
+ * it is gone. A treeSurvived throw leaves ownership recorded.
+ *
+ * Windows cannot verify the tree. A still-running root is taskkilled and then
+ * retired. An already-closed root is left recorded for terminal teardown.
+ */
+async function endOwnedGroupForHandler(
+  child: { exitCode: number | null; signalCode: NodeJS.Signals | null },
+  pid: number,
+  options: OwnedGroupExecOptions
+): Promise<void> {
+  if (process.platform === 'win32') {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    await endProcessGroup(pid);
+    notifyOwnedExit(options, pid);
+    return;
+  }
+  await endProcessGroup(pid);
+  if (!processGroupExists(pid)) notifyOwnedExit(options, pid);
+}
+
 function treeSurvivedError(pid: number): TreeSurvivedError {
   return Object.assign(
     new Error('Detached workflow process group ' + String(pid) + ' is still running'),
@@ -309,10 +335,7 @@ export async function execOwnedProcessGroup(
       child.stderr?.destroy();
       void (async (): Promise<void> => {
         try {
-          if (child.exitCode === null && child.signalCode === null) {
-            await endProcessGroup(pid);
-          }
-          notifyOwnedExit(options, pid);
+          await endOwnedGroupForHandler(child, pid, options);
         } catch {
           // The output-limit error still wins when the group cannot be ended.
           // A surviving group stays recorded.
@@ -356,12 +379,11 @@ export async function execOwnedProcessGroup(
       void (async (): Promise<void> => {
         if (options.endTreeOnTimeout !== false) {
           try {
-            // An already-closed handle must not be taskkilled. Windows
-            // taskkill runs inside endProcessGroup; skip it once close fired.
-            if (child.exitCode === null && child.signalCode === null) {
-              await endProcessGroup(pid);
-            }
-            notifyOwnedExit(options, pid);
+            // POSIX may have a set root exit code while descendants still
+            // retain pipes, so always terminate and verify the group before
+            // retirement. Windows skips an already-closed root and leaves it
+            // recorded because it cannot verify the tree.
+            await endOwnedGroupForHandler(child, pid, options);
           } catch (err) {
             const text = snapshot();
             if (isTreeSurvivedError(err)) {

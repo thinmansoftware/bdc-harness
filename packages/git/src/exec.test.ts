@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { spawn } from 'child_process';
-import { readFileSync } from 'fs';
+import { mkdtempSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { execOwnedProcessGroup } from './exec';
@@ -230,4 +230,54 @@ describe('execOwnedProcessGroup output bound', () => {
       process.off('unhandledRejection', onRejection);
     }
   });
+});
+
+describe('execOwnedProcessGroup timeout descendants', () => {
+  test.skipIf(process.platform === 'win32')(
+    'timeout ends descendants after the root exits and retires ownership only then',
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'archon-owned-desc-'));
+      const pidFile = join(dir, 'desc.pid');
+      let exitCalls = 0;
+      let descendantPid = 0;
+      try {
+        const err = await execOwnedProcessGroup(
+          'bash',
+          ['-c', 'sleep 300 & echo $! > "$DESC_PID"; exit 0'],
+          {
+            timeout: 500,
+            env: { ...process.env, DESC_PID: pidFile },
+            onSpawn(pgid: number): void {
+              remember(pgid);
+            },
+            onExit(): void {
+              const parsed = Number(readFileSync(pidFile, 'utf8').trim());
+              if (!Number.isInteger(parsed) || parsed <= 0) {
+                throw new Error('descendant pid missing');
+              }
+              descendantPid = parsed;
+              remember(descendantPid);
+              exitCalls += 1;
+              // Retirement runs only after the group is gone, so the
+              // descendant must already be dead inside this callback.
+              expect(processAlive(descendantPid)).toBe(false);
+            },
+          }
+        ).then(
+          () => {
+            throw new Error('descendant timeout resolved');
+          },
+          (caught: Error & { killed?: boolean; treeSurvived?: boolean }) => caught
+        );
+        expect(err.killed).toBe(true);
+        expect(err.treeSurvived).toBe(false);
+        expect(err.message).toContain('Command timed out');
+        expect(exitCalls).toBe(1);
+        expect(descendantPid).toBeGreaterThan(0);
+        expect(processAlive(descendantPid)).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  );
 });
