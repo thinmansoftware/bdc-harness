@@ -323,14 +323,6 @@ function pathUnder(file: string, top: string): boolean {
 
 export function resolveTrustedRunnerFile(cwd: string): string | null {
   const candidates: string[] = [];
-  // Unit tests need to exercise the real CLI before it has been installed at a
-  // production path. This fixture is deliberately separate from
-  // HARNESS_ROOT_OVERRIDE, which is workflow-user-controlled and is never a
-  // source of trust.
-  const testRoot = process.env.SER_TEST_TRUSTED_ROOT;
-  if (process.env.NODE_ENV === 'test' && testRoot) {
-    candidates.push(testRoot);
-  }
   candidates.push('/app');
   candidates.push('/.archon/workspaces/thinmansoftware/bdc-harness/source');
   const archonHome = join(homedir(), '.archon');
@@ -356,22 +348,20 @@ export function trustedSelfMatches(cwd: string): boolean {
   }
 }
 
-const generatedIdentityPaths = new Set<string>();
+const generatedAttemptDirectories = new Set<string>();
 
-function registerGeneratedPath(cwd: string, path: string): void {
-  const directory = /[\\/]$/.test(path);
+function registerGeneratedAttemptDirectory(cwd: string, path: string): void {
   const rel = relative(cwd, resolve(path)).replace(/\\/g, '/');
   if (rel && rel !== '..' && !rel.startsWith('../')) {
-    generatedIdentityPaths.add(directory ? `${rel}/` : rel);
+    generatedAttemptDirectories.add(`${rel}/`);
   }
 }
 
 function excludedIdentityPath(path: string): boolean {
   const norm = path.replace(/\\/g, '/');
   if (norm === '.ser-attempts' || norm.startsWith('.ser-attempts/')) return true;
-  if (generatedIdentityPaths.has(norm)) return true;
-  for (const generated of generatedIdentityPaths) {
-    if (generated.endsWith('/') && norm.startsWith(generated)) return true;
+  for (const generated of generatedAttemptDirectories) {
+    if (norm.startsWith(generated)) return true;
   }
   return false;
 }
@@ -422,7 +412,7 @@ function attemptsDirectory(cwd: string): string {
   const base = process.env.ARTIFACTS_DIR;
   if (base && base.length > 0) {
     const directory = join(base, 'evidence', 'attempts');
-    registerGeneratedPath(cwd, `${directory}/`);
+    registerGeneratedAttemptDirectory(cwd, directory);
     return directory;
   }
   return join(
@@ -743,9 +733,6 @@ export function checkAttemptRecord(
   liveAuthority: EvidenceAuthority
 ): { ok: true } | { ok: false; reason: string } {
   attemptsDirectory(cwd);
-  for (const member of recorded.members) {
-    if (member.logPath) registerGeneratedPath(cwd, member.logPath);
-  }
   const parsed = evidenceAttemptSchema.safeParse(recorded);
   if (!parsed.success) return { ok: false, reason: 'malformed' };
   if (recorded.schemaVersion !== 1) return { ok: false, reason: 'schema' };
@@ -1558,8 +1545,26 @@ export function runTestCommands(
   logPath: string,
   otherStage: readonly string[] = []
 ): TestRunSummary {
-  registerGeneratedPath(cwd, logPath);
-  if (!trustedSelfMatches(cwd) && !trustedSelfMatches(process.cwd())) {
+  return runTestCommandsInternal(commands, cwd, logPath, otherStage, false);
+}
+
+export function runTestCommandsForTesting(
+  commands: readonly string[],
+  cwd: string,
+  logPath: string,
+  otherStage: readonly string[] = []
+): TestRunSummary {
+  return runTestCommandsInternal(commands, cwd, logPath, otherStage, true);
+}
+
+function runTestCommandsInternal(
+  commands: readonly string[],
+  cwd: string,
+  logPath: string,
+  otherStage: readonly string[],
+  trustedInProcessTestCall: boolean
+): TestRunSummary {
+  if (!trustedInProcessTestCall && !trustedSelfMatches(cwd) && !trustedSelfMatches(process.cwd())) {
     mkdirSync(dirname(logPath), { recursive: true });
     const members = commands.map(command => {
       const member = blankMember(command, cwd, logPath);
@@ -2412,10 +2417,6 @@ function runCli(): number {
     }
     if (command === 'run-greps') {
       if (!requireTrustedCli()) return 127;
-      const priorTests = readKindAttempt(process.cwd(), 'tests');
-      for (const member of priorTests?.members ?? []) {
-        if (member.logPath) registerGeneratedPath(process.cwd(), member.logPath);
-      }
       const lines = readStdin().split('\n');
       let declared = 0;
       let executed = 0;

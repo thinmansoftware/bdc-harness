@@ -24,7 +24,7 @@ import {
   normalizeTestCommand,
   observeAssertion,
   resolveTrustedRunnerFile,
-  runTestCommands,
+  runTestCommandsForTesting as runTestCommands,
   scopeEvidence,
   scrubEnv,
   selectStagesBlock,
@@ -34,7 +34,6 @@ import {
 const ROOT = join(import.meta.dir, '..', '..', '..', '..');
 process.env.HARNESS_ROOT_OVERRIDE = ROOT;
 process.env.NODE_ENV = 'test';
-process.env.SER_TEST_TRUSTED_ROOT = ROOT;
 const RUNNER = join(ROOT, 'packages/workflows/src/reliability/structured-evidence-runner.ts');
 
 function tempDir(prefix: string): string {
@@ -92,7 +91,6 @@ it('rejects an executable runner copied into a spoofed writable harness checkout
       env: {
         ...process.env,
         NODE_ENV: 'production',
-        SER_TEST_TRUSTED_ROOT: '',
         HARNESS_ROOT_OVERRIDE: fakeHarness,
       },
       encoding: 'utf8',
@@ -323,6 +321,25 @@ describe('git-and-pipeline-safety', () => {
 });
 
 describe('partial-failure-and-compatibility', () => {
+  it('cannot hide a tracked source file by supplying it as the test log', () => {
+    const cwd = tempDir('ser-log-identity-');
+    initRepo(cwd);
+    mkdirSync(join(cwd, 'src/evidence'), { recursive: true });
+    const source = join(cwd, 'src/evidence/check.ts');
+    writeFileSync(source, 'export const evidence = true;\n');
+    git(cwd, ['add', 'src/evidence/check.ts']);
+    git(cwd, ['commit', '-qm', 'add evidence source']);
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+
+    const summary = runTestCommands(['bash ./ok.sh'], cwd, source);
+
+    expect(summary.attempt.aggregate).toBe('PASSED');
+    const verdict = checkAttemptRecord(summary.attempt, cwd, authority(cwd));
+    expect(verdict.ok).toBe(false);
+    if (!verdict.ok) expect(verdict.reason).toBe('dirty-bytes');
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
   it('does not label zero, impossible, negative, or unparsed counts as passed', () => {
     const cwd = tempDir('ser-counts-');
     const cases: { body: string; status: string; reason: string }[] = [
@@ -376,6 +393,19 @@ describe('partial-failure-and-compatibility', () => {
       expect(unparsedVerdict.ok).toBe(false);
       if (!unparsedVerdict.ok) expect(unparsedVerdict.reason).toContain('nocount.sh');
 
+      const unparsedChain = runTestCommands(
+        ['bash ./ok.sh && bash ./nocount.sh'],
+        cwd,
+        join(artifacts, 'nocount-chain.log')
+      );
+      expect(unparsedChain.attempt.members).toHaveLength(1);
+      expect(unparsedChain.attempt.members[0]?.chain.map(segment => segment.status)).toEqual([
+        'PASSED',
+        'COUNTS_UNPARSED',
+      ]);
+      expect(unparsedChain.attempt.members[0]?.status).toBe('COUNTS_UNPARSED');
+      expect(checkAttemptRecord(unparsedChain.attempt, cwd, authority(cwd)).ok).toBe(false);
+
       const zero = runTestCommands(
         ['bash ./ok.sh', 'bash ./zero.sh'],
         cwd,
@@ -389,6 +419,19 @@ describe('partial-failure-and-compatibility', () => {
       expect(zero.attempt.members[1]?.total).toBe(0);
       const zeroVerdict = checkAttemptRecord(zero.attempt, cwd, authority(cwd));
       expect(zeroVerdict.ok).toBe(false);
+
+      const zeroChain = runTestCommands(
+        ['bash ./ok.sh && bash ./zero.sh'],
+        cwd,
+        join(artifacts, 'zero-chain.log')
+      );
+      expect(zeroChain.attempt.members).toHaveLength(1);
+      expect(zeroChain.attempt.members[0]?.chain.map(segment => segment.status)).toEqual([
+        'PASSED',
+        'FAILED',
+      ]);
+      expect(zeroChain.attempt.members[0]?.status).toBe('FAILED');
+      expect(checkAttemptRecord(zeroChain.attempt, cwd, authority(cwd)).ok).toBe(false);
 
       const impossible = runTestCommands(
         ['bash ./impossible.sh'],
@@ -1125,9 +1168,7 @@ describe('installed-helper-resolution', () => {
       '{"name":"@archon/workflows"}\n'
     );
     const saved = process.env.HARNESS_ROOT_OVERRIDE;
-    const savedTestRoot = process.env.SER_TEST_TRUSTED_ROOT;
     process.env.HARNESS_ROOT_OVERRIDE = product;
-    delete process.env.SER_TEST_TRUSTED_ROOT;
     try {
       expect(resolveTrustedRunnerFile(product)).toBeNull();
       const missing = spawnSync('bun', [RUNNER, 'allow-test', '--', 'bash ./x.sh'], {
@@ -1135,7 +1176,6 @@ describe('installed-helper-resolution', () => {
         env: {
           ...process.env,
           NODE_ENV: 'production',
-          SER_TEST_TRUSTED_ROOT: '',
           HARNESS_ROOT_OVERRIDE: product,
         },
         encoding: 'utf8',
@@ -1144,11 +1184,10 @@ describe('installed-helper-resolution', () => {
       expect(missing.stdout).not.toContain('product-helper');
     } finally {
       process.env.HARNESS_ROOT_OVERRIDE = saved;
-      process.env.SER_TEST_TRUSTED_ROOT = savedTestRoot;
     }
     process.env.HARNESS_ROOT_OVERRIDE = ROOT;
     const trusted = resolveTrustedRunnerFile(product);
-    expect(trusted).toBe(RUNNER);
+    expect(trusted).toBeNull();
     rmSync(product, { recursive: true, force: true });
   });
 });
