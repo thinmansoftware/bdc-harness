@@ -77,7 +77,7 @@ const MULTI_STAGE_RUN_AUTHORITY = {
 type ExplicitLane =
   | { readonly kind: 'default' }
   | { readonly kind: 'alias'; readonly tierName: string }
-  | { readonly kind: 'multi-stage'; readonly fireWorkflow: string };
+  | { readonly kind: 'multi-stage'; readonly fireWorkflow: string; readonly tierName?: string };
 
 function laneBinding(tier: LadderTier): string | null {
   const value = tier.laneWorkflows?.[MULTI_STAGE_WORKFLOW];
@@ -106,7 +106,7 @@ function resolveExplicitWorkflow(workflow: string | undefined, tiers: LadderTier
   const byWorkflow = tiers.find(tier => tier.workflowName === workflow);
   if (byWorkflow) return { kind: 'alias', tierName: byWorkflow.name };
   const byLane = tiers.find(tier => laneBinding(tier) === workflow);
-  if (byLane) return { kind: 'multi-stage', fireWorkflow: workflow };
+  if (byLane) return { kind: 'multi-stage', fireWorkflow: workflow, tierName: byLane.name };
   throw new Error(
     `[smart-cauldron/cascade] Unknown workflow "${workflow}". ` +
       `Known tiers: ${tiers.map(tier => tier.name).join(', ')}.`
@@ -147,7 +147,7 @@ function multiStageFreezeMessage(
 
 export interface CascadeDeps {
   /** Verify that the selected workflow lane is available before any provider fire. */
-  preflight?: (tier: LadderTier) => Promise<void>;
+  preflight?: (tier: LadderTier, workflowName: string) => Promise<void>;
   fire?: typeof fireTier;
   poll?: typeof pollForTerminal;
   /**
@@ -439,6 +439,14 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       );
     }
     entryOverride = lane.tierName;
+  } else if (lane.kind === 'multi-stage' && lane.tierName !== undefined) {
+    if (entryOverride !== undefined && entryOverride !== lane.tierName) {
+      throw new Error(
+        `[smart-cauldron/cascade] Workflow "${opts.workflow ?? ''}" resolves to tier ` +
+          `"${lane.tierName}" which does not match --entry "${entryOverride}".`
+      );
+    }
+    entryOverride = lane.tierName;
   }
   let fireWorkflowName: string | null = lane.kind === 'multi-stage' ? lane.fireWorkflow : null;
   let fireExpectedSpec = opts.expectedSpec;
@@ -711,7 +719,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     if (opts.beforeAdmission && preflightImpl) {
       const firstTier = tiers[currentIndex];
       if (!firstTier) throw new Error('automatic_fire_entry_tier_missing');
-      await preflightImpl(firstTier);
+      await preflightImpl(firstTier, fireWorkflowName ?? firstTier.workflowName);
       automaticPreflightTier = firstTier.name;
     }
     const automaticFireAdmission = await opts.beforeAdmission?.();
@@ -974,7 +982,12 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       // An AUTOMATIC climb into a premium tier (default ['frontier']) must NEVER
       // auto-fire. An explicit --entry override onto this tier is human-typed and
       // bypasses the gate (the operator already chose to spend on it).
-      if (premiumTiers.includes(tier.name) && tier.name !== entryOverride) {
+      if (
+        premiumTiers.includes(tier.name) &&
+        (lane.kind === 'multi-stage' && lane.tierName !== undefined
+          ? tier.name !== opts.entryOverride
+          : tier.name !== entryOverride)
+      ) {
         await pauseForFrontierApproval(
           tier,
           attempts.at(-1)?.runId ?? null,
@@ -1004,7 +1017,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
       if (preflightImpl && !(attempts.length === 1 && automaticPreflightTier === tier.name)) {
         try {
-          await preflightImpl(tier);
+          await preflightImpl(tier, attemptWorkflowName);
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error);
           attempt.outcome = 'infra-error';

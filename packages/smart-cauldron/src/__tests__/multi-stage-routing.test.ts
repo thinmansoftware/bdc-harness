@@ -292,6 +292,133 @@ describe('explicit multi-stage happy path', () => {
   });
 });
 
+describe('lane binding ownership', () => {
+  const ownedWorkflow = 'bdc-multi-stage-development-codex';
+  const cursor = tier('cursor', 'bdc-feature-development-cursor');
+  const codex = tier('codex', 'bdc-feature-development-codex', {
+    laneWorkflows: { [MULTI_STAGE_WORKFLOW]: ownedWorkflow },
+  });
+
+  test('routes through the owning tier and records its entry telemetry', async () => {
+    const { opts, state } = options(
+      TWO_STAGE_SPEC,
+      { workflow: ownedWorkflow },
+      { tiers: [cursor, codex], refusedTiers: [], premiumTiers: [] }
+    );
+    const record = await runCascade(opts);
+    expect(state.fires.map(fire => fire.workflowName)).toEqual([ownedWorkflow]);
+    expect(record.attempts.map(attempt => attempt.tier)).toEqual(['codex']);
+    expect(record.telemetry.entryTier).toBe('codex');
+    expect(record.request.entryOverride).toBe('codex');
+  });
+
+  test('rejects a conflicting explicit entry before provider fire', async () => {
+    const { opts, state } = options(
+      TWO_STAGE_SPEC,
+      { workflow: ownedWorkflow, entryOverride: 'cursor' },
+      { tiers: [cursor, codex], refusedTiers: [], premiumTiers: [] }
+    );
+    await expect(runCascade(opts)).rejects.toThrow(/does not match --entry/);
+    expect(state.fires).toHaveLength(0);
+    expect(state.locks).toBe(0);
+  });
+
+  test('rejects a lane binding owned by a refused tier before admission', async () => {
+    const { opts, state } = options(
+      TWO_STAGE_SPEC,
+      { workflow: ownedWorkflow },
+      { tiers: [cursor, codex], refusedTiers: ['codex'], premiumTiers: [] }
+    );
+    await expect(runCascade(opts)).rejects.toThrow(/Refused dark\/retired entry tier "codex"/);
+    expect(state.fires).toHaveLength(0);
+    expect(state.locks).toBe(0);
+  });
+
+  test('pauses a premium owning tier for approval without auto-firing', async () => {
+    const frontier = tier('frontier', 'bdc-feature-development-fable', {
+      isFrontier: true,
+      laneWorkflows: { [MULTI_STAGE_WORKFLOW]: 'bdc-multi-stage-development-fable' },
+    });
+    const { opts, state } = options(
+      TWO_STAGE_SPEC,
+      { workflow: 'bdc-multi-stage-development-fable' },
+      { tiers: [cursor, frontier], refusedTiers: [], premiumTiers: ['frontier'] }
+    );
+    const record = await runCascade(opts);
+    expect(record.status).toBe('pending-frontier-approval');
+    expect(record.telemetry.entryTier).toBe('frontier');
+    expect(record.frontierApproval?.tierName).toBe('frontier');
+    expect(record.frontierApproval?.workflowName).toBe('bdc-multi-stage-development-fable');
+    expect(state.fires).toHaveLength(0);
+  });
+});
+
+describe('effective workflow preflight', () => {
+  test('checks the explicit lane instead of an unavailable tier default', async () => {
+    const seen: Array<{ tier: string; workflowName: string }> = [];
+    const unavailable = tier('cursor', 'unavailable');
+    const { opts, state } = options(
+      TWO_STAGE_SPEC,
+      {},
+      {
+        tiers: [unavailable],
+        refusedTiers: [],
+        premiumTiers: [],
+        preflight: async (selectedTier, workflowName) => {
+          seen.push({ tier: selectedTier.name, workflowName });
+          if (workflowName === 'unavailable') throw new Error('workflow unavailable');
+        },
+      }
+    );
+    const record = await runCascade(opts);
+    expect(record.status).toBe('won');
+    expect(seen).toEqual([{ tier: 'cursor', workflowName: MULTI_STAGE_WORKFLOW }]);
+    expect(state.fires.map(fire => fire.workflowName)).toEqual([MULTI_STAGE_WORKFLOW]);
+  });
+
+  test('checks each effective binding across a compatible climb', async () => {
+    const initialWorkflow = 'bdc-multi-stage-development-cursor';
+    const climbedWorkflow = 'bdc-multi-stage-development-codex';
+    const cursor = tier('cursor', 'unavailable-initial', {
+      laneWorkflows: { [MULTI_STAGE_WORKFLOW]: initialWorkflow },
+    });
+    const codex = tier('codex', 'unavailable-climbed', {
+      laneWorkflows: { [MULTI_STAGE_WORKFLOW]: climbedWorkflow },
+    });
+    const seen: Array<{ tier: string; workflowName: string }> = [];
+    let polls = 0;
+    const { opts, state } = options(
+      TWO_STAGE_SPEC,
+      { workflow: initialWorkflow },
+      {
+        tiers: [cursor, codex],
+        refusedTiers: [],
+        premiumTiers: [],
+        preflight: async (selectedTier, workflowName) => {
+          seen.push({ tier: selectedTier.name, workflowName });
+          if (workflowName.startsWith('unavailable-')) throw new Error('workflow unavailable');
+        },
+        poll: async () => {
+          polls += 1;
+          if (polls === 1) throw new TimeoutError('stalled');
+          return pollOk('run-2');
+        },
+      }
+    );
+    const record = await runCascade(opts);
+    expect(record.status).toBe('won');
+    expect(state.cancels).toEqual(['run-1']);
+    expect(seen).toEqual([
+      { tier: 'cursor', workflowName: initialWorkflow },
+      { tier: 'codex', workflowName: climbedWorkflow },
+    ]);
+    expect(record.attempts.map(attempt => attempt.workflowName)).toEqual(
+      seen.map(item => item.workflowName)
+    );
+    expect(state.fires.map(fire => fire.workflowName)).toEqual([initialWorkflow, climbedWorkflow]);
+  });
+});
+
 describe('invalid spec rejects before provider side effects', () => {
   async function expectZeroFire(spec: string, woClass?: string): Promise<void> {
     const { opts, state } = options(spec, woClass === undefined ? {} : { woClass });

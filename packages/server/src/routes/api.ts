@@ -6092,9 +6092,9 @@ export function registerApiRoutes(
         const cascadePromise = runCascade({
           ...cascadeOptions,
           deps: {
-            preflight: async tier => {
+            preflight: async (_tier, workflowName) => {
               const check = await validateWorkflowRunTarget(
-                `/workflow run ${tier.workflowName}`,
+                `/workflow run ${workflowName}`,
                 conv?.codebase_id
               );
               if (!check.valid) throw new Error(check.error);
