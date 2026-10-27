@@ -206,6 +206,24 @@ else
   echo "$OUT"
 fi
 
+# Regression: PR #1345 round-1. Trailing-word strip must apply to
+# root-level paths with no slash (package.json updated).
+echo "--- Test: root-level annotated path (no slash) present -> OK ---"
+MANIFEST=$'Files created: none\nFiles modified: package.json updated\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/999'
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/999" "$MANIFEST" "package.json")
+CODE=$?
+set -e
+assert_eq "root-level annotation match exit 0" "0" "$CODE"
+if printf '%s\n' "$OUT" | grep -q '^OK$'; then
+  PASS=$((PASS + 1))
+  echo "PASS: OK when root-level annotated path resolves to present file"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: expected OK for root-level annotated present path"
+  echo "$OUT"
+fi
+
 # Regression (ordering lock): the exclusion filter must run BEFORE the new
 # leading-path truncation, so multi-word sentinel tokens like "no files" are
 # still fully excluded and do NOT leak through truncated to a bogus "no" path.

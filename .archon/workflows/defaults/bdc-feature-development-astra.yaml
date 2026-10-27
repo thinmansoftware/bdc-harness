@@ -5151,7 +5151,7 @@ nodes:
                 if [ "$paren_stripped" != "$candidate" ]; then
                   candidate="$paren_stripped"
                 else
-                  while printf '%s\n' "$candidate" | grep -Eq '^.*/[^/]*[[:space:]]+[A-Za-z][A-Za-z0-9_-]*$'; do
+                  while printf '%s\n' "$candidate" | grep -Eq '^(.*/)?[^/]*[[:space:]]+[A-Za-z][A-Za-z0-9_-]*$'; do
                     next=$(printf '%s\n' "$candidate" | sed -E 's/[[:space:]]+[A-Za-z][A-Za-z0-9_-]*$//')
                     [ "$next" = "$candidate" ] && break
                     candidate="$next"
