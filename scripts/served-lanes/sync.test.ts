@@ -2,7 +2,7 @@ import { afterAll, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
 import { mkdtempSync } from 'fs';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { createCodebase } from '../../packages/core/src/db/codebases';
@@ -11,7 +11,7 @@ import { getDefaultWorkflowsPath } from '../../packages/paths/src/archon-paths';
 import { discoverWorkflowsWithConfig } from '../../packages/workflows/src/workflow-discovery';
 import { committedBlobHashes, renderHistory, renderHistoryJson } from './generate-history';
 import { computeDrift, notifyServedLaneUniqueEdits, reconcileServedLanes } from './sync';
-import type { ServedLaneHistory } from './sync';
+import type { DriftLane, ServedLaneHistory } from './sync';
 
 delete process.env.ARCHON_OPERATOR_TOKEN;
 delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
@@ -117,9 +117,17 @@ describe('served lanes', () => {
       const steadyBefore = await stat(join(volumeDir, 'steady.yaml'));
 
       const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+      const lanePath = join(volumeDir, 'lane.yaml');
+      await chmod(lanePath, 0o640);
+      const laneBefore = await stat(lanePath);
       const result = await reconcileServedLanes({ volumeDir, bakedDir, history, now: NOW });
 
-      expect(sha256Hex(await readFile(join(volumeDir, 'lane.yaml')))).toBe(sha256Hex(baked));
+      expect(sha256Hex(await readFile(lanePath))).toBe(sha256Hex(baked));
+      const laneAfter = await stat(lanePath);
+      expect(laneAfter.ino).toBe(laneBefore.ino);
+      expect(laneAfter.uid).toBe(laneBefore.uid);
+      expect(laneAfter.gid).toBe(laneBefore.gid);
+      expect(laneAfter.mode).toBe(laneBefore.mode);
       const backupDir = `${volumeDir}.bak-${backupStamp(NOW)}`;
       expect(result.backup_path).toBe(backupDir);
       expect(result.replaced).toEqual(['lane.yaml']);
@@ -181,6 +189,54 @@ describe('served lanes', () => {
       );
       expect(messages.rows.length).toBe(1);
       expect(messages.rows[0]?.body ?? '').toContain('lane.yaml');
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('an edit between classify and replace is preserved', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const edited = Buffer.from(laneYaml('EDITED-BETWEEN'));
+      const volumePath = join(volumeDir, 'lane.yaml');
+      await writeFile(volumePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+      let capturedMtime = '';
+
+      const result = await reconcileServedLanes({
+        volumeDir,
+        bakedDir,
+        history,
+        now: NOW,
+        beforeReplace: async () => {
+          await writeFile(volumePath, edited);
+          const info = await stat(volumePath);
+          capturedMtime = info.mtime.toISOString();
+        },
+      });
+
+      const liveBytes = await readFile(volumePath);
+      expect(Buffer.compare(liveBytes, edited)).toBe(0);
+      expect(result.replaced).toEqual([]);
+      expect(result.backup_path).toBeNull();
+      const parentNames = await readdir(parent);
+      expect(parentNames.some(name => name.includes('.bak-'))).toBe(false);
+      const uniqueEdit = {
+        filename: 'lane.yaml',
+        sha256: sha256Hex(edited),
+        mtime: capturedMtime,
+      };
+      expect(result.unique_edit).toEqual([uniqueEdit]);
+
+      const report = JSON.parse(
+        await readFile(join(parent, 'served-lanes-report.json'), 'utf8')
+      ) as {
+        unique_edit: Array<{ filename: string; sha256: string; mtime: string }>;
+      };
+      expect(report.unique_edit).toEqual([uniqueEdit]);
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
@@ -250,6 +306,110 @@ describe('served lanes', () => {
       await rm(parent, { recursive: true, force: true });
     }
   });
+
+  test('a missing volume is empty drift, not an error', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'served-lanes-missing-volume-'));
+    const volumeDir = join(parent, 'absent-workflows');
+    const bakedDir = join(parent, 'baked');
+    const emptyHome = await mkdtemp(join(tmpdir(), 'served-lanes-empty-home-'));
+    const previousHome = process.env.ARCHON_HOME;
+    const previousNodeEnv = process.env.NODE_ENV;
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    const previousAccessHosts = process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+    const previousEmails = process.env.ARCHON_OPERATOR_EMAILS;
+    try {
+      await mkdir(bakedDir);
+      const baked = laneYaml('MISSING-VOLUME');
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      const bakedBefore = await snapFiles(bakedDir);
+
+      const drift = await computeDrift({ volumeDir, bakedDir, history: {} });
+      expect(drift.lanes).toEqual([
+        {
+          filename: 'lane.yaml',
+          state: 'missing_in_volume',
+          served_sha256: null,
+          baked_sha256: sha256Hex(baked),
+        },
+      ]);
+      expect(await snapFiles(bakedDir)).toEqual(bakedBefore);
+      await expect(stat(volumeDir)).rejects.toThrow();
+
+      const bakedNames = (await readdir(getDefaultWorkflowsPath(), { withFileTypes: true }))
+        .filter(entry => entry.isFile() && entry.name.endsWith('.yaml'))
+        .map(entry => entry.name)
+        .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+      const childEnv: Record<string, string> = {};
+      for (const [key, value] of Object.entries(process.env)) {
+        if (value !== undefined) childEnv[key] = value;
+      }
+      childEnv.ARCHON_HOME = emptyHome;
+      const driftProc = Bun.spawn({
+        cmd: ['bun', 'run', 'scripts/served-lanes/cli.ts', '--drift'],
+        cwd: REPO_ROOT,
+        env: childEnv,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const driftCode = await driftProc.exited;
+      const driftOut = await new Response(driftProc.stdout).text();
+      const driftErr = await new Response(driftProc.stderr).text();
+      expect(driftCode, `${driftErr}\n${driftOut}`).toBe(0);
+      const cliBody = JSON.parse(driftOut) as { lanes: DriftLane[] };
+      expect(cliBody.lanes.map(lane => lane.filename)).toEqual(bakedNames);
+      expect(new Set(cliBody.lanes.map(lane => lane.filename)).size).toBe(cliBody.lanes.length);
+      for (const lane of cliBody.lanes) {
+        expect(lane.state).toBe('missing_in_volume');
+        expect(lane.served_sha256).toBeNull();
+        expect(lane.baked_sha256).toMatch(/^[0-9a-f]{64}$/);
+      }
+      await expect(stat(join(emptyHome, 'workflows'))).rejects.toThrow();
+      await expect(stat(join(emptyHome, 'served-lanes-report.json'))).rejects.toThrow();
+
+      process.env.ARCHON_HOME = emptyHome;
+      process.env.NODE_ENV = 'production';
+      process.env.ARCHON_OPERATOR_TOKEN = OPERATOR_TOKEN;
+      process.env.TASKMASTER_INTERVAL_MS = '0';
+      process.env.TASKMASTER_DEADMAN_INTERVAL_MS = '0';
+      process.env.INBOX_READER_INTERVAL_MS = '0';
+      process.env.OPERATOR_INBOX_INTERVAL_MS = '0';
+      process.env.INBOX_READER_OPERATOR_OWNER = 'reader';
+
+      const { validationErrorHook } =
+        await import('../../packages/server/src/routes/openapi-defaults');
+      const apiFile = resolve(import.meta.dir, '../../packages/server/src/routes/api.ts');
+      const honoPath = Bun.resolveSync('@hono/zod-openapi', apiFile);
+      const { OpenAPIHono } = await import(honoPath);
+      const { registerApiRoutes } = await import('../../packages/server/src/routes/api');
+      const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+      registerApiRoutes(app, {} as never, {} as never);
+
+      const response = await app.request('/api/served-lanes/drift', {
+        headers: { 'x-archon-operator-token': OPERATOR_TOKEN },
+      });
+      expect(response.status).toBe(200);
+      const apiBody = (await response.json()) as { lanes: DriftLane[] };
+      expect(apiBody.lanes).toEqual(cliBody.lanes);
+    } finally {
+      if (previousHome === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = previousHome;
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+      if (previousToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
+      else process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+      if (previousAccessHosts === undefined) delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+      else process.env.ARCHON_OPERATOR_ACCESS_HOSTS = previousAccessHosts;
+      if (previousEmails === undefined) delete process.env.ARCHON_OPERATOR_EMAILS;
+      else process.env.ARCHON_OPERATOR_EMAILS = previousEmails;
+      delete process.env.TASKMASTER_INTERVAL_MS;
+      delete process.env.TASKMASTER_DEADMAN_INTERVAL_MS;
+      delete process.env.INBOX_READER_INTERVAL_MS;
+      delete process.env.OPERATOR_INBOX_INTERVAL_MS;
+      delete process.env.INBOX_READER_OPERATOR_OWNER;
+      await rm(parent, { recursive: true, force: true });
+      await rm(emptyHome, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   test('restart is not required for discovery', async () => {
     const savedHome = process.env.ARCHON_HOME;

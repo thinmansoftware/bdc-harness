@@ -7,9 +7,17 @@
  */
 import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
-import { mkdir, readFile, readdir, stat, writeFile } from 'fs/promises';
+import { mkdir, open, readFile, readdir, stat, writeFile, type FileHandle } from 'fs/promises';
 import { join, resolve } from 'path';
 import { createLogger } from '../../packages/paths/src/logger';
+
+const LOCK_EX = 2;
+const LOCK_UN = 8;
+
+type FlockFn = (fd: number, operation: number) => number;
+
+let flockLibrary: { close(): void } | null = null;
+let flockFn: FlockFn | null = null;
 
 const log = createLogger('served-lanes');
 
@@ -79,6 +87,53 @@ function isEnoent(error: unknown): boolean {
 
 export function sha256Hex(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
+}
+
+async function loadFlock(): Promise<FlockFn> {
+  if (flockFn !== null && flockLibrary !== null) return flockFn;
+  const ffi = await import('bun:ffi');
+  const libc = ffi.dlopen('libc.so.6', {
+    flock: {
+      args: [ffi.FFIType.i32, ffi.FFIType.i32],
+      returns: ffi.FFIType.i32,
+    },
+  });
+  flockLibrary = libc;
+  const bound = libc.symbols.flock;
+  flockFn = (fd: number, operation: number): number => bound(fd, operation);
+  return flockFn;
+}
+
+async function readFromStart(handle: FileHandle): Promise<Buffer> {
+  const info = await handle.stat();
+  const size = info.size;
+  const buffer = Buffer.alloc(size);
+  let offset = 0;
+  while (offset < size) {
+    const { bytesRead } = await handle.read(buffer, offset, size - offset, offset);
+    if (bytesRead === 0) {
+      throw new Error('Unexpected end of file while rereading a served lane');
+    }
+    offset += bytesRead;
+  }
+  return buffer;
+}
+
+async function replaceOnHandle(handle: FileHandle, bakedBytes: Buffer): Promise<void> {
+  await handle.truncate(bakedBytes.length);
+  let offset = 0;
+  while (offset < bakedBytes.length) {
+    const { bytesWritten } = await handle.write(
+      bakedBytes,
+      offset,
+      bakedBytes.length - offset,
+      offset
+    );
+    if (bytesWritten === 0) {
+      throw new Error('Short write while replacing a served lane');
+    }
+    offset += bytesWritten;
+  }
 }
 
 function emptyResult(): ReconcileResult {
@@ -152,7 +207,13 @@ async function classifyAll(input: {
   bakedDir: string;
   history: ServedLaneHistory;
 }): Promise<ClassifiedLane[]> {
-  const volumeNames = new Set(await listYamlNames(input.volumeDir));
+  let volumeNames: Set<string>;
+  try {
+    volumeNames = new Set(await listYamlNames(input.volumeDir));
+  } catch (error) {
+    if (!isEnoent(error)) throw error;
+    volumeNames = new Set();
+  }
   const bakedNames = new Set(await listYamlNames(input.bakedDir));
   const names = [...new Set([...volumeNames, ...bakedNames])].sort(compareAscii);
   const lanes: ClassifiedLane[] = [];
@@ -241,6 +302,7 @@ export async function reconcileServedLanes(input: {
   bakedDir: string;
   history: ServedLaneHistory;
   now: Date;
+  beforeReplace?: () => Promise<void> | void;
 }): Promise<ReconcileResult> {
   const reportPath = reportPathFor(input.volumeDir);
   const volumePresence = await directoryPresence(input.volumeDir);
@@ -270,25 +332,62 @@ export async function reconcileServedLanes(input: {
       }
     }
 
+    await input.beforeReplace?.();
+
     const replacements = lanes.filter(lane => lane.state === 'stale_replaceable');
-    if (replacements.length > 0) {
-      const backupDir = `${input.volumeDir}.bak-${backupStamp(input.now)}`;
-      await mkdir(backupDir);
-      result.backup_path = backupDir;
-      for (const lane of replacements) {
-        if (lane.bakedBytes === null) {
-          throw new Error(`Missing baked bytes for replacement: ${lane.filename}`);
-        }
-        const livePath = join(input.volumeDir, lane.filename);
-        const backupFile = join(backupDir, lane.filename);
-        if (await pathExists(backupFile)) {
-          throw new Error(`Backup target already exists: ${backupFile}`);
-        }
-        const current = await readFile(livePath);
-        await writeFile(backupFile, current);
-        await writeFile(livePath, lane.bakedBytes);
-        result.replaced.push(lane.filename);
+    for (const lane of replacements) {
+      if (lane.bakedBytes === null) {
+        throw new Error(`Missing baked bytes for replacement: ${lane.filename}`);
       }
+      const livePath = join(input.volumeDir, lane.filename);
+      const handle = await open(livePath, 'r+');
+      let locked = false;
+      let flock: FlockFn | null = null;
+      let unlockError: Error | null = null;
+      try {
+        flock = await loadFlock();
+        const lockStatus = flock(handle.fd, LOCK_EX);
+        if (lockStatus !== 0) {
+          throw new Error(`flock LOCK_EX failed for ${livePath}: ${lockStatus}`);
+        }
+        locked = true;
+
+        if (lane.servedSha256 === null) {
+          throw new Error(`Missing classified hash for replacement: ${lane.filename}`);
+        }
+        const current = await readFromStart(handle);
+        const currentHash = sha256Hex(current);
+        if (currentHash !== lane.servedSha256) {
+          const info = await handle.stat();
+          result.unique_edit.push({
+            filename: lane.filename,
+            sha256: currentHash,
+            mtime: info.mtime.toISOString(),
+          });
+        } else {
+          if (result.backup_path === null) {
+            const backupDir = `${input.volumeDir}.bak-${backupStamp(input.now)}`;
+            await mkdir(backupDir);
+            result.backup_path = backupDir;
+          }
+          const backupFile = join(result.backup_path, lane.filename);
+          if (await pathExists(backupFile)) {
+            throw new Error(`Backup target already exists: ${backupFile}`);
+          }
+          await writeFile(backupFile, current);
+          await replaceOnHandle(handle, lane.bakedBytes);
+          result.replaced.push(lane.filename);
+        }
+      } finally {
+        if (locked && flock !== null) {
+          const unlockStatus = flock(handle.fd, LOCK_UN);
+          if (unlockStatus !== 0) {
+            unlockError = new Error(`flock LOCK_UN failed for ${livePath}: ${unlockStatus}`);
+          }
+        }
+        await handle.close();
+      }
+      if (unlockError) throw unlockError;
     }
 
     await writeReport(reportPath, result);
