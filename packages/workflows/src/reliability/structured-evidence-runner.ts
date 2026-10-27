@@ -154,6 +154,15 @@ const ASSERT_SIMPLE = new Set([
   '[',
 ]);
 const GREP_RUNNERS = new Set(['grep', 'egrep', 'fgrep', 'rg']);
+// Every runner allowAssertion can accept. FP-4 prose admission must refuse
+// all of these, including malformed invocations, not only grep-like rows.
+const ASSERTION_RUNNERS = new Set<string>([
+  'git',
+  'find',
+  'sort',
+  ...GREP_RUNNERS,
+  ...ASSERT_SIMPLE,
+]);
 const RUNNER_REL = 'packages/workflows/src/reliability/structured-evidence-runner.ts';
 
 export interface CommandResult {
@@ -759,17 +768,40 @@ function splitUnparsedNames(names: string): string[] {
     .filter(part => part.length > 0);
 }
 
+function tokenStartsAssertionRunner(token: string): boolean {
+  const peeled = token.replace(/^['"]+/, '').replace(/['"]+$/, '');
+  for (const runner of ASSERTION_RUNNERS) {
+    if (peeled === runner) return true;
+    if (!peeled.startsWith(runner)) continue;
+    const next = peeled.charAt(runner.length);
+    if (next.length > 0 && !/[A-Za-z0-9_]/.test(next)) return true;
+  }
+  return false;
+}
+
+// Command-shaped means any pipe segment whose first real token is a supported
+// assertion runner, after optional LC_ALL/LANG assignments. A malformed
+// canonical git, sort, find, or simple read-only tool is not prose.
+function isCommandShapedDeclaration(name: string): boolean {
+  for (const segment of name.split('|')) {
+    const tokens = segment
+      .trim()
+      .split(/[ \t]+/)
+      .filter(token => token.length > 0);
+    let index = 0;
+    while (index < tokens.length && /^(?:LC_ALL|LANG)=/.test(tokens[index] ?? '')) index += 1;
+    if (tokenStartsAssertionRunner(tokens[index] ?? '')) return true;
+  }
+  return false;
+}
+
 function isProseOnlyDeclaration(name: string): boolean {
   const trimmed = name.trim().replace(/^[-*]+[ \t]*/, '');
   if (trimmed.length === 0) return false;
   if (trimmed === 'unnamed grep stop condition') return false;
   if (/^[0-9]+ unnamed assertion\(s\)$/.test(trimmed)) return false;
   if (/^Stop[ \t]+[0-9A-Za-z.]+\b/i.test(trimmed)) return false;
-  if (
-    /^(?:(?:LC_ALL=C|LANG=C) )?(?:grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)\b/.test(trimmed)
-  ) {
-    return false;
-  }
+  if (isCommandShapedDeclaration(trimmed)) return false;
   return true;
 }
 
@@ -777,7 +809,8 @@ function isProseOnlyDeclaration(name: string): boolean {
 // declarations stay aggregate INCOMPLETE and are still admissible. The runner
 // writes this shape only when executed + unparsed === declared, nothing was
 // dropped, and nothing mismatched. A required canonical assertion that failed
-// to parse is never given this reason.
+// to parse is never given this reason, for every supported runner (git, sort,
+// find, grep, and the simple read-only tools), not only malformed grep rows.
 function legacyFp4GrepAdmissible(recorded: EvidenceAttempt): boolean {
   if (recorded.kind !== 'greps' || recorded.aggregate !== 'INCOMPLETE') return false;
   const selected = recorded.members.filter(member => member.scope === 'selected');

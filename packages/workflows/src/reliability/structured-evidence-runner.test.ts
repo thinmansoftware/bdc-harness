@@ -1288,6 +1288,29 @@ describe('hermetic-fresh-attempt', () => {
       expect(forgedVerdict.ok).toBe(false);
       if (!forgedVerdict.ok) expect(forgedVerdict.reason).toBe('aggregate-INCOMPLETE');
 
+      for (const command of [
+        'git diff --stat',
+        'git commit -m x',
+        'sort --output=glob',
+        'LC_ALL=C LANG=C git diff --numstat',
+        'find . -delete',
+        'cut -d: -f1',
+        'tr a-z A-Z',
+        'uniq -c',
+        'ls -la',
+        '[ -f README ]',
+        'echo kept | sort --output=glob',
+        "'git' diff --stat",
+      ]) {
+        const shaped = structuredClone(admittedAttempt);
+        const member = shaped.members.find(row => row.reason === 'prose-only-unparsed');
+        if (!member) throw new Error('missing prose member');
+        member.rawCommand = command;
+        const shapedVerdict = checkAttemptRecord(shaped, cwd, shaped.authority);
+        expect(shapedVerdict.ok).toBe(false);
+        if (!shapedVerdict.ok) expect(shapedVerdict.reason).toBe('aggregate-INCOMPLETE');
+      }
+
       const hole = structuredClone(admittedAttempt);
       hole.members = hole.members.filter(member => member.reason !== 'prose-only-unparsed');
       const holeVerdict = checkAttemptRecord(hole, cwd, hole.authority);
@@ -1359,6 +1382,106 @@ describe('hermetic-fresh-attempt', () => {
       expect(twoProse.stdout).toContain('GREP_STATUS=incomplete');
       expect(twoProse.stdout).toContain(
         'UNVERIFIED (unparsed): prose condition one; prose condition two'
+      );
+      expect(run(['check-attempt'], '').status).toBe(0);
+
+      const commandShaped = [
+        'git commit -m x',
+        'sort --output=glob',
+        'LC_ALL=C LANG=C git diff --numstat',
+        'find . -delete',
+        'cut -d: -f1',
+        'tr a-z A-Z',
+        'uniq -c',
+        'ls -la',
+        '[ -f README ]',
+        'echo kept | sort --output=glob',
+      ];
+      for (const command of commandShaped) {
+        const row = run(
+          ['run-greps'],
+          `grep -c base README\teq\t1\nUNPARSED\t1\t${command}\nDECLARED\t2\n`
+        );
+        expect(row.stdout).toContain('GREP_STATUS=incomplete');
+        const attempt = readGrep();
+        expect(attempt.members).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              rawCommand: command,
+              status: 'INCOMPLETE',
+              reason: 'malformed-canonical',
+            }),
+          ])
+        );
+        expect(attempt.members.some(member => member.reason === 'prose-only-unparsed')).toBe(false);
+        expect(run(['check-attempt'], '').status).not.toBe(0);
+      }
+
+      const shapedSpec = [
+        'Stop 1 (grep assertion):',
+        '  grep -c base README',
+        '  Expected: 1',
+        'Stop 2 (assert):',
+        '  git commit -m x',
+        '  Expected: many',
+        'Stop 3 (assert):',
+        '  sort --output=glob',
+        '  Expected: many',
+        '',
+      ].join('\n');
+      const shapedRun = run(['run-greps'], run(['extract-greps'], shapedSpec).stdout);
+      expect(shapedRun.stdout).toContain('GREP_STATUS=incomplete');
+      expect(shapedRun.stdout).toContain('GREP_UNPARSED=2');
+      const shapedAttempt = readGrep();
+      expect(shapedAttempt.members).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            rawCommand: 'git commit -m x',
+            reason: 'malformed-canonical',
+          }),
+          expect.objectContaining({
+            rawCommand: 'sort --output=glob',
+            reason: 'malformed-canonical',
+          }),
+        ])
+      );
+      expect(shapedAttempt.members.some(member => member.reason === 'prose-only-unparsed')).toBe(
+        false
+      );
+      expect(run(['check-attempt'], '').status).not.toBe(0);
+
+      const mixed = run(
+        ['run-greps'],
+        'grep -c base README\teq\t1\nUNPARSED\t2\tprose condition one; git diff --stat\nDECLARED\t3\n'
+      );
+      expect(mixed.stdout).toContain('GREP_STATUS=incomplete');
+      const mixedAttempt = readGrep();
+      expect(mixedAttempt.members.some(member => member.reason === 'prose-only-unparsed')).toBe(
+        false
+      );
+      expect(mixedAttempt.members).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            rawCommand: 'git diff --stat',
+            reason: 'malformed-canonical',
+          }),
+        ])
+      );
+      expect(run(['check-attempt'], '').status).not.toBe(0);
+
+      const mentioned = run(
+        ['run-greps'],
+        'grep -c base README\teq\t1\nUNPARSED\t1\treviewers read the git diff and do not sort files\nDECLARED\t2\n'
+      );
+      expect(mentioned.stdout).toContain('GREP_STATUS=incomplete');
+      expect(readGrep().members).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            rawCommand: 'reviewers read the git diff and do not sort files',
+            status: 'NOT_APPLICABLE',
+            reason: 'prose-only-unparsed',
+          }),
+        ])
       );
       expect(run(['check-attempt'], '').status).toBe(0);
     } finally {
