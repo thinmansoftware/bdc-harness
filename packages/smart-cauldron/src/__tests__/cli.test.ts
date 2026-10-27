@@ -85,6 +85,7 @@ describe('statusToExitCode', () => {
       'infra-alert',
       'cancelled',
       'refused',
+      'stopped_spec_error',
     ];
     for (const status of statuses) {
       expect(Number.isInteger(statusToExitCode(status))).toBe(true);
@@ -95,6 +96,11 @@ describe('statusToExitCode', () => {
     const code = statusToExitCode('refused');
     expect(code).not.toBe(0);
     expect(code).not.toBe(statusToExitCode('won'));
+  });
+
+  test('stopped_spec_error maps to 11 and is not success', () => {
+    expect(statusToExitCode('stopped_spec_error')).toBe(11);
+    expect(statusToExitCode('stopped_spec_error')).not.toBe(0);
   });
 });
 

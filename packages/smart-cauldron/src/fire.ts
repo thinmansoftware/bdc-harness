@@ -5,6 +5,8 @@
  * resolved codebaseId and the /workflow run command. The response must prove
  * dispatched:true. The resulting run is discovered by the returned parent
  * conversation database id; no conversation identity is fabricated locally.
+ * While that poll is empty, the parent platform conversation is read for a
+ * pre_dispatch_refusal marker so a spec error stops the cascade immediately.
  *
  * Secret boundary: apiBaseUrl and token come from the caller or environment.
  */
@@ -205,8 +207,9 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
     };
   }
 
-  const runId = await discoverRunId({
+  const discovered = await discoverRunId({
     parentConversationId,
+    platformConversationId: conversationId,
     workflowName,
     codebaseId: binding.codebaseId,
     apiBaseUrl,
@@ -214,7 +217,7 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
     intervalMs: discoverIntervalMs,
     token,
   });
-  if (runId === null) {
+  if (discovered === null) {
     return {
       ok: false,
       runId: null,
@@ -222,19 +225,70 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
       infraError: `run discovery timeout after ${discoverTimeoutMs}ms for parent conversation ${parentConversationId}`,
     };
   }
+  if (discovered.kind === 'spec_error') {
+    return {
+      ok: false,
+      runId: null,
+      conversationId,
+      infraError: discovered.reason,
+      errorClass: 'spec_error',
+    };
+  }
 
-  return { ok: true, runId, conversationId, infraError: null };
+  return { ok: true, runId: discovered.runId, conversationId, infraError: null };
+}
+
+const PRE_DISPATCH_REFUSAL_PREFIX = 'pre_dispatch_refusal:';
+
+type DiscoveryOutcome = { kind: 'run'; runId: string } | { kind: 'spec_error'; reason: string };
+
+function messageContent(message: unknown): string | null {
+  if (typeof message !== 'object' || message === null || !('content' in message)) return null;
+  const content = (message as { content?: unknown }).content;
+  return typeof content === 'string' ? content : null;
+}
+
+/** Text after the first pre_dispatch_refusal marker, or null when none is present. */
+function refusalReasonFromMessages(body: unknown): string | null {
+  if (!Array.isArray(body)) return null;
+  for (const message of body) {
+    const content = messageContent(message);
+    if (content === null) continue;
+    const at = content.indexOf(PRE_DISPATCH_REFUSAL_PREFIX);
+    if (at === -1) continue;
+    return content.slice(at + PRE_DISPATCH_REFUSAL_PREFIX.length).trim();
+  }
+  return null;
+}
+
+async function readPreDispatchRefusal(opts: {
+  platformConversationId: string;
+  apiBaseUrl: string;
+  token: string;
+}): Promise<string | null> {
+  try {
+    const response = await fetch(
+      `${opts.apiBaseUrl}/api/conversations/${encodeURIComponent(opts.platformConversationId)}/messages`,
+      { headers: authHeaders(opts.token) }
+    );
+    // A non-OK messages read is not itself a refusal. Keep polling.
+    if (!response.ok) return null;
+    return refusalReasonFromMessages(await response.json());
+  } catch {
+    return null;
+  }
 }
 
 async function discoverRunId(opts: {
   parentConversationId: string;
+  platformConversationId: string;
   workflowName: string;
   codebaseId: string;
   apiBaseUrl: string;
   timeoutMs: number;
   intervalMs: number;
   token: string;
-}): Promise<string | null> {
+}): Promise<DiscoveryOutcome | null> {
   const deadline = Date.now() + opts.timeoutMs;
   const query = new URLSearchParams({ codebaseId: opts.codebaseId, limit: '50' });
 
@@ -252,11 +306,14 @@ async function discoverRunId(opts: {
             candidate.codebase_id === opts.codebaseId &&
             typeof candidate.id === 'string'
         );
-        if (run?.id) return run.id;
+        if (run?.id) return { kind: 'run', runId: run.id };
       }
     } catch {
       // A transient discovery read does not invalidate the proven dispatch.
     }
+
+    const refusal = await readPreDispatchRefusal(opts);
+    if (refusal !== null) return { kind: 'spec_error', reason: refusal };
 
     await new Promise<void>(resolve => setTimeout(resolve, opts.intervalMs));
   }
