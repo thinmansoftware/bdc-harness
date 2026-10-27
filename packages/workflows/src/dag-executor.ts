@@ -3197,12 +3197,39 @@ interface TeardownReport {
 const ownedProcessGroups = new Map<string, number[]>();
 const teardownReports = new Map<string, TeardownReport>();
 const nodeFailureStderr = new Map<string, string>();
+const runAbortRequested = new Set<string>();
 
 function recordOwnedProcessGroup(runId: string, pgid: number | undefined): void {
   if (typeof pgid !== 'number' || !Number.isInteger(pgid) || pgid <= 0) return;
   const list = ownedProcessGroups.get(runId) ?? [];
   if (!list.includes(pgid)) list.push(pgid);
   ownedProcessGroups.set(runId, list);
+}
+
+/** Register the process group at spawn. 'abort' ends a group that started after the run abort. */
+function trackOwnedGroup(runId: string): (pgid: number) => 'abort' | undefined {
+  return (pgid: number): 'abort' | undefined => {
+    recordOwnedProcessGroup(runId, pgid);
+    if (runAbortRequested.has(runId)) return 'abort';
+    return undefined;
+  };
+}
+
+/**
+ * Kill process groups already recorded for an abort_run_on_failure.
+ * Does not cache the teardown report: the terminal path still scans cwd
+ * after every in-flight node has observed the kill.
+ */
+async function stopOwnedGroupsForAbort(runId: string): Promise<void> {
+  runAbortRequested.add(runId);
+  const pgids = [...(ownedProcessGroups.get(runId) ?? [])];
+  for (const pgid of pgids) {
+    try {
+      await endProcessGroup(pgid);
+    } catch (err) {
+      getLog().warn({ err, workflowRunId: runId, pgid }, 'workflow.abort_process_group_failed');
+    }
+  }
 }
 
 function noteNodeStderr(runId: string, nodeId: string, stderr: string | undefined): void {
@@ -3393,6 +3420,7 @@ export function resetRunTeardownStateForTests(): void {
   ownedProcessGroups.clear();
   teardownReports.clear();
   nodeFailureStderr.clear();
+  runAbortRequested.clear();
 }
 
 function firstRepairFailureLine(stderr: string): string | undefined {
@@ -3528,6 +3556,7 @@ async function executeBashNode(
         timeout,
         env: subprocessEnv,
         endTreeOnTimeout: true,
+        onSpawn: trackOwnedGroup(workflowRun.id),
       });
       stdout = owned.stdout;
       stderr = owned.stderr;
@@ -3912,6 +3941,7 @@ async function executeScriptNode(
       timeout,
       env: subprocessEnv,
       endTreeOnTimeout: true,
+      onSpawn: trackOwnedGroup(workflowRun.id),
     });
     recordOwnedProcessGroup(workflowRun.id, owned.pgid);
     const stdout = owned.stdout;
@@ -6094,6 +6124,9 @@ async function executeDagWorkflowInternal(
               config.envVars,
               resolvedInputs
             );
+            if (output.state === 'failed' && node.abort_run_on_failure === true) {
+              await stopOwnedGroupsForAbort(workflowRun.id);
+            }
             return { nodeId: node.id, output };
           }
 
@@ -6322,6 +6355,9 @@ async function executeDagWorkflowInternal(
               issueContext,
               config.envVars
             );
+            if (output.state === 'failed' && node.abort_run_on_failure === true) {
+              await stopOwnedGroupsForAbort(workflowRun.id);
+            }
             return { nodeId: node.id, output };
           }
 
@@ -6588,6 +6624,9 @@ async function executeDagWorkflowInternal(
             );
           }
 
+          if (output.state === 'failed' && node.abort_run_on_failure === true) {
+            await stopOwnedGroupsForAbort(workflowRun.id);
+          }
           return { nodeId: node.id, output };
         } catch (error) {
           const err = error as Error;
@@ -6628,6 +6667,9 @@ async function executeDagWorkflowInternal(
             workflowId: workflowRun.id,
             nodeName: node.id,
           });
+          if (node.abort_run_on_failure === true) {
+            await stopOwnedGroupsForAbort(workflowRun.id);
+          }
           return {
             nodeId: node.id,
             output: { state: 'failed' as const, output: '', error: failMessage },

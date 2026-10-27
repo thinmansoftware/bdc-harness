@@ -45,6 +45,11 @@ export interface OwnedGroupExecOptions {
   maxBuffer?: number;
   /** When true (the DAG default), a deadline ends the process group, not only the root. */
   endTreeOnTimeout?: boolean;
+  /**
+   * Called synchronously once the child pid is known, before any await.
+   * Return 'abort' to end the process group immediately.
+   */
+  onSpawn?: (pgid: number) => 'abort' | undefined;
 }
 
 export interface OwnedGroupExecResult {
@@ -178,10 +183,17 @@ export async function endProcessGroup(pid: number): Promise<void> {
   }
 }
 
+type OwnedWait =
+  | { kind: 'close'; outcome: { code: number | null; signal: NodeJS.Signals | null } }
+  | { kind: 'timeout'; timeoutMs: number }
+  | { kind: 'overflow' };
+
 /**
  * Spawn a command as the leader of its own process group (POSIX detached).
  * Does not unref the child. On timeout with endTreeOnTimeout, the group is
  * ended; a group that survives is rejected with treeSurvived and is not a timeout.
+ * stdout and stderr are capped at maxBuffer while the child is still running.
+ * Crossing the cap ends the process group instead of waiting for exit.
  */
 export async function execOwnedProcessGroup(
   cmd: string,
@@ -201,13 +213,40 @@ export async function execOwnedProcessGroup(
     throw Object.assign(new Error(`spawn failed for ${cmd}`), { code: 'ENOENT' });
   }
 
-  let stdout = '';
-  let stderr = '';
+  const stdoutChunks: Buffer[] = [];
+  const stderrChunks: Buffer[] = [];
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  let overflowedFlag = false;
+  let markOverflow: (() => void) | undefined;
+  const overflowed = new Promise<void>(resolve => {
+    markOverflow = resolve;
+  });
+
+  // Pipe errors are expected when the group is killed for maxBuffer or abort.
+  // The child close or error event settles the result.
+  child.stdout?.on('error', () => undefined);
+  child.stderr?.on('error', () => undefined);
+
   const onChunk =
     (which: 'stdout' | 'stderr') =>
     (buf: Buffer): void => {
-      if (which === 'stdout') stdout += buf.toString();
-      else stderr += buf.toString();
+      if (overflowedFlag) return;
+      const used = which === 'stdout' ? stdoutBytes : stderrBytes;
+      if (used + buf.length > maxBuffer) {
+        overflowedFlag = true;
+        child.stdout?.pause();
+        child.stderr?.pause();
+        markOverflow?.();
+        return;
+      }
+      if (which === 'stdout') {
+        stdoutBytes += buf.length;
+        stdoutChunks.push(buf);
+      } else {
+        stderrBytes += buf.length;
+        stderrChunks.push(buf);
+      }
     };
   child.stdout?.on('data', onChunk('stdout'));
   child.stderr?.on('data', onChunk('stderr'));
@@ -221,32 +260,118 @@ export async function execOwnedProcessGroup(
     }
   );
 
+  const captured = (): { stdout: string; stderr: string } => ({
+    stdout: Buffer.concat(stdoutChunks).toString(),
+    stderr: Buffer.concat(stderrChunks).toString(),
+  });
+
+  const endOrThrow = async (): Promise<void> => {
+    const streams = captured();
+    try {
+      await endProcessGroup(pgid);
+    } catch (err) {
+      if (isTreeSurvivedError(err)) {
+        throw Object.assign(err, {
+          pgid,
+          stdout: streams.stdout,
+          stderr: streams.stderr,
+          killed: false,
+          treeSurvived: true,
+        });
+      }
+      throw Object.assign(err as Error, { pgid, stdout: streams.stdout, stderr: streams.stderr });
+    }
+  };
+
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    if (options.timeout === undefined) {
+    let spawnSignal: 'abort' | undefined;
+    try {
+      spawnSignal = options.onSpawn?.(pgid);
+    } catch (err) {
+      try {
+        await endProcessGroup(pgid);
+      } catch (killErr) {
+        if (isTreeSurvivedError(killErr)) throw killErr;
+      }
+      throw err;
+    }
+
+    if (spawnSignal === 'abort') {
+      await endOrThrow();
       const outcome = await closed;
-      return settleOwnedClose(cmd, pgid, outcome, stdout, stderr, maxBuffer);
+      const streams = captured();
+      return settleOwnedClose(
+        cmd,
+        pgid,
+        outcome,
+        streams.stdout,
+        streams.stderr,
+        stdoutBytes,
+        stderrBytes,
+        maxBuffer
+      );
     }
-    const timeoutMs = options.timeout;
-    const winner = await Promise.race([
+
+    const racers: Promise<OwnedWait>[] = [
       closed.then(outcome => ({ kind: 'close' as const, outcome })),
-      new Promise<{ kind: 'timeout' }>(resolve => {
-        timer = setTimeout(() => {
-          resolve({ kind: 'timeout' });
-        }, timeoutMs);
-      }),
-    ]);
-    if (winner.kind === 'close') {
-      return settleOwnedClose(cmd, pgid, winner.outcome, stdout, stderr, maxBuffer);
+      overflowed.then(() => ({ kind: 'overflow' as const })),
+    ];
+    if (options.timeout !== undefined) {
+      const timeoutMs = options.timeout;
+      racers.push(
+        new Promise<OwnedWait>(resolve => {
+          timer = setTimeout(() => {
+            resolve({ kind: 'timeout', timeoutMs });
+          }, timeoutMs);
+        })
+      );
     }
+    const winner = await Promise.race(racers);
+    if (overflowedFlag || winner.kind === 'overflow') {
+      await endOrThrow();
+      await closed.then(() => undefined).catch(() => undefined);
+      const streams = captured();
+      throw Object.assign(new Error(`Command failed: ${cmd}`), {
+        code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+        stdout: streams.stdout,
+        stderr: streams.stderr,
+        killed: false,
+        pgid,
+      });
+    }
+    const streams = captured();
+    if (winner.kind === 'close') {
+      return settleOwnedClose(
+        cmd,
+        pgid,
+        winner.outcome,
+        streams.stdout,
+        streams.stderr,
+        stdoutBytes,
+        stderrBytes,
+        maxBuffer
+      );
+    }
+    const timeoutMs = winner.timeoutMs;
     if (options.endTreeOnTimeout !== false) {
       try {
         await endProcessGroup(pgid);
       } catch (err) {
         if (isTreeSurvivedError(err)) {
-          throw Object.assign(err, { pgid, stdout, stderr, killed: false, treeSurvived: true });
+          throw Object.assign(err, {
+            pgid,
+            stdout: streams.stdout,
+            stderr: streams.stderr,
+            killed: false,
+            treeSurvived: true,
+          });
         }
-        throw Object.assign(err as Error, { pgid, stdout, stderr });
+        throw Object.assign(err as Error, {
+          pgid,
+          stdout: streams.stdout,
+          stderr: streams.stderr,
+        });
       }
     } else {
       try {
@@ -261,16 +386,18 @@ export async function execOwnedProcessGroup(
         setTimeout(resolve, TERMINATION_CONFIRM_MS);
       }),
     ]);
+    const after = captured();
     throw Object.assign(new Error(`Command timed out after ${String(timeoutMs)}ms`), {
       killed: true,
       code: null,
-      stdout,
-      stderr,
+      stdout: after.stdout,
+      stderr: after.stderr,
       pgid,
       treeSurvived: false,
     });
   } finally {
     if (timer) clearTimeout(timer);
+    void closed.catch(() => undefined);
   }
 }
 
@@ -280,9 +407,11 @@ function settleOwnedClose(
   outcome: { code: number | null; signal: NodeJS.Signals | null },
   stdout: string,
   stderr: string,
+  stdoutBytes: number,
+  stderrBytes: number,
   maxBuffer: number
 ): OwnedGroupExecResult {
-  if (stdout.length > maxBuffer || stderr.length > maxBuffer) {
+  if (stdoutBytes > maxBuffer || stderrBytes > maxBuffer) {
     throw Object.assign(new Error(`Command failed: ${cmd}`), {
       code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
       stdout,

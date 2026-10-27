@@ -783,4 +783,56 @@ describe.serial('repair holder teardown', () => {
     });
     expect(checked.exitCode, `${checked.stdout.toString()}\n${checked.stderr.toString()}`).toBe(0);
   }, 120000);
+
+  it('Test 11: concurrent abort kills a child that left the worktree', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rht-abort-tree-'));
+    const outside = mkdtempSync(join(tmpdir(), 'rht-outside-'));
+    roots.push(dir, outside);
+    const sibling = [
+      'set -u',
+      `outside=${JSON.stringify(outside)}`,
+      'bash -c \'cd "$1" && pwd > "$1/cwd.txt" && echo $$ > "$2/child.pid" && exec sleep 300\' _ "$outside" "$PWD" &',
+      'i=0',
+      'while [ "$i" -lt 50 ]; do',
+      '  if [ -s child.pid ]; then break; fi',
+      '  i=$((i + 1))',
+      '  sleep 0.05',
+      'done',
+      'if [ ! -s child.pid ]; then echo "child pid missing" >&2; exit 1; fi',
+      'echo ready > ready.flag',
+      'exec sleep 300',
+    ].join('\n');
+    const abort = [
+      'i=0',
+      'while [ "$i" -lt 100 ]; do',
+      '  if [ -s ready.flag ]; then break; fi',
+      '  i=$((i + 1))',
+      '  sleep 0.05',
+      'done',
+      'echo "repair_target_branch_held: feat/x is checked out" >&2',
+      'exit 1',
+    ].join('\n');
+    const started = Date.now();
+    const result = await runDag(dir, 'run-abort-tree', [
+      { id: 'sibling', bash: sibling },
+      {
+        id: 'checkout-repair-target',
+        abort_run_on_failure: true,
+        bash: abort,
+      },
+    ]);
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(20000);
+    const childPid = Number(readFileSync(join(dir, 'child.pid'), 'utf8').trim());
+    expect(childPid).toBeGreaterThan(1);
+    expect(readFileSync(join(outside, 'cwd.txt'), 'utf8').trim()).toBe(outside);
+    expect(pidIsLive(childPid)).toBe(false);
+    expect(pidsIn(outside)).toEqual([]);
+    expect(pidsIn(dir)).toEqual([]);
+    expect(result.order).toContain('fail');
+    const failCalls = (result.store.failWorkflowRun as ReturnType<typeof mock>).mock.calls as Array<
+      [string, string, { metadata?: { terminal_cause?: string } }]
+    >;
+    expect(failCalls[0]?.[2]?.metadata?.terminal_cause).toBe('repair_checkout_failed');
+  }, 30000);
 });
