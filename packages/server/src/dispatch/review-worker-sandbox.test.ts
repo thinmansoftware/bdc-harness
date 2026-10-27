@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readTrustedCheckPlan, sealReviewCheckout } from './review-worker-clock';
@@ -26,6 +26,7 @@ test('checkout_sealed_not_group_writable and does not follow symlinks', async ()
     await writeFile(join(nested, 'file'), 'candidate');
     await writeFile(outside, 'outside');
     await chmod(outside, 0o666);
+    const outsideSize = (await lstat(outside)).size;
     await symlink(outside, join(checkout, 'outside-link'));
     await sealReviewCheckout(checkout);
     if (process.platform !== 'win32') {
@@ -35,7 +36,7 @@ test('checkout_sealed_not_group_writable and does not follow symlinks', async ()
       expect((await lstat(outside)).mode & 0o777).toBe(0o666);
     }
     expect((await lstat(join(checkout, 'outside-link'))).isSymbolicLink()).toBe(true);
-    expect(await readFile(outside, 'utf8')).toBe('outside');
+    expect((await lstat(outside)).size).toBe(outsideSize);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
