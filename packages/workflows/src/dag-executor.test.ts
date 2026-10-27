@@ -1364,6 +1364,224 @@ describe('executeDagWorkflow -- loop idle ceiling override', () => {
       else process.env.ARCHON_LOOP_ITERATION_IDLE_MS = prevIdle;
     }
   });
+
+  async function* streamActivityThenComplete(): AsyncGenerator<{
+    type: string;
+    content?: string;
+    sessionId?: string;
+  }> {
+    const started = Date.now();
+    while (Date.now() - started < 400) {
+      await new Promise<void>(resolve => setTimeout(resolve, 20));
+      yield { type: 'assistant', content: 'still working\n' };
+    }
+    yield { type: 'assistant', content: 'COMPLETE\n' };
+    yield { type: 'result', sessionId: 'wall-activity-session' };
+  }
+
+  function restoreLoopTimerEnv(prevWall: string | undefined, prevIdle: string | undefined): void {
+    if (prevWall === undefined) delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    else process.env.ARCHON_LOOP_ITERATION_WALL_MS = prevWall;
+    if (prevIdle === undefined) delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    else process.env.ARCHON_LOOP_ITERATION_IDLE_MS = prevIdle;
+  }
+
+  it('still-producing iteration survives until its wall', async () => {
+    const prevWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    try {
+      mockSendQueryDag.mockImplementation(streamActivityThenComplete);
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('productive-wall-survive-run');
+      const artifactsDir = join(testDir, 'artifacts-productive-wall');
+      const logDir = join(testDir, 'logs-productive-wall');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'productive-wall-survive',
+          nodes: [
+            {
+              id: 'implement',
+              idle_timeout: 100,
+              wall_timeout_ms: 1000,
+              loop: {
+                prompt: 'implement the plan',
+                until: 'COMPLETE',
+                max_iterations: 1,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+      );
+      expect(events.some(e => e.event_type === 'node_wall_breach')).toBe(false);
+      const recordedErrors = events.map(e => String(e.data?.error ?? '')).join('\n');
+      expect(recordedErrors).not.toMatch(/wall timeout/i);
+      expect(recordedErrors).not.toMatch(/idle timeout/i);
+      expect(
+        events.some(e => e.event_type === 'node_completed' && e.step_name === 'implement')
+      ).toBe(true);
+    } finally {
+      restoreLoopTimerEnv(prevWall, prevIdle);
+    }
+  });
+
+  it('still-producing iteration records attempt-1 wall breach when the wall is shorter than the stream', async () => {
+    const prevWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    try {
+      mockSendQueryDag.mockImplementation(streamActivityThenComplete);
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('productive-wall-breach-run');
+      const artifactsDir = join(testDir, 'artifacts-productive-breach');
+      const logDir = join(testDir, 'logs-productive-breach');
+
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'productive-wall-breach',
+          nodes: [
+            {
+              id: 'implement',
+              idle_timeout: 100,
+              wall_timeout_ms: 150,
+              loop: {
+                prompt: 'implement the plan',
+                until: 'COMPLETE',
+                max_iterations: 1,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+
+      const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+      );
+      const attemptOneBreaches = events.filter(
+        e =>
+          e.event_type === 'node_wall_breach' &&
+          e.step_name === 'implement' &&
+          e.data?.attempt === 1
+      );
+      expect(attemptOneBreaches).toHaveLength(1);
+      const failed = events.filter(
+        e => e.event_type === 'loop_iteration_failed' && e.step_name === 'implement'
+      );
+      expect(failed).toHaveLength(1);
+      expect(String(failed[0]?.data?.error ?? '')).toMatch(/wall timeout twice/i);
+      expect(
+        events.some(e => e.event_type === 'node_completed' && e.step_name === 'implement')
+      ).toBe(false);
+    } finally {
+      restoreLoopTimerEnv(prevWall, prevIdle);
+    }
+  });
+
+  it('silent iteration still dies at idle before the wall', async () => {
+    const prevWall = process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    const prevIdle = process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_WALL_MS;
+    delete process.env.ARCHON_LOOP_ITERATION_IDLE_MS;
+    try {
+      mockSendQueryDag.mockImplementation(async function* () {
+        await new Promise<void>(() => {});
+        yield { type: 'assistant', content: 'never' };
+      });
+
+      const store = createMockStore();
+      const mockDeps = createMockDeps(store);
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('silent-idle-before-wall-run');
+      const artifactsDir = join(testDir, 'artifacts-silent-idle');
+      const logDir = join(testDir, 'logs-silent-idle');
+
+      const startedAt = Date.now();
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-dag',
+        testDir,
+        {
+          name: 'silent-idle-before-wall',
+          nodes: [
+            {
+              id: 'implement',
+              idle_timeout: 100,
+              wall_timeout_ms: 5000,
+              loop: {
+                prompt: 'implement the plan',
+                until: 'COMPLETE',
+                max_iterations: 1,
+              },
+            },
+          ],
+        },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        logDir,
+        'main',
+        'docs/',
+        minimalConfig
+      );
+      const elapsedMs = Date.now() - startedAt;
+
+      const events = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+        call =>
+          call[0] as { event_type: string; step_name?: string; data?: Record<string, unknown> }
+      );
+      const failed = events.filter(
+        e => e.event_type === 'node_failed' && e.step_name === 'implement'
+      );
+      expect(failed).toHaveLength(1);
+      const errText = String(failed[0]?.data?.error ?? '');
+      expect(errText).toContain('exceeded idle timeout (100ms)');
+      expect(errText).not.toMatch(/wall timeout/i);
+      expect(elapsedMs).toBeLessThan(5000);
+    } finally {
+      restoreLoopTimerEnv(prevWall, prevIdle);
+    }
+  });
 });
 
 describe('DAG Loader -- cycle detection', () => {

@@ -870,7 +870,7 @@ nodes:
     trigger_rule: all_done
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     task_class: medium_work
-    wall_timeout_ms: 1800000
+    wall_timeout_ms: 3600000
     loop:
       prompt: |
         Implement the approved plan for this BDC feature Work Order.
@@ -924,6 +924,7 @@ nodes:
         - Stop and report a blocker if the spec is ambiguous or a needed source of truth is missing.
 
         ## Commit-and-push BEFORE exit (Patch 2, 2026-05-16)
+        Do not wait on remote CI: never loop on gh run view, gh run watch or gh pr checks inside implement. Run the tests locally, commit, push, emit the completion sentinels and exit; remote CI is judged after the PR opens.
         When your implementation is complete, BEFORE emitting the sentinel below, run:
 
         ```bash
