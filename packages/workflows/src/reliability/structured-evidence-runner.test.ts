@@ -59,6 +59,40 @@ function initRepo(cwd: string): void {
   git(cwd, ['commit', '-qm', 'base']);
 }
 
+it('rejects a harness root override with a lookalike harness git origin', () => {
+  const fakeHarness = tempDir('ser-untrusted-harness-');
+  const product = tempDir('ser-product-');
+  const saved = process.env.HARNESS_ROOT_OVERRIDE;
+  try {
+    mkdirSync(join(fakeHarness, 'packages/workflows/src/reliability'), { recursive: true });
+    writeFileSync(
+      join(fakeHarness, 'packages/workflows/package.json'),
+      JSON.stringify({ name: '@archon/workflows' })
+    );
+    writeFileSync(
+      join(fakeHarness, 'packages/workflows/src/reliability/structured-evidence-runner.ts'),
+      'throw new Error("must not execute");\n'
+    );
+    initRepo(fakeHarness);
+    git(fakeHarness, [
+      'remote',
+      'add',
+      'origin',
+      'https://evilgithub.com/thinmansoftware/bdc-harness.git',
+    ]);
+    initRepo(product);
+    process.env.HARNESS_ROOT_OVERRIDE = fakeHarness;
+    expect(resolveTrustedRunnerFile(product)).not.toBe(
+      join(fakeHarness, 'packages/workflows/src/reliability/structured-evidence-runner.ts')
+    );
+  } finally {
+    if (saved === undefined) delete process.env.HARNESS_ROOT_OVERRIDE;
+    else process.env.HARNESS_ROOT_OVERRIDE = saved;
+    rmSync(fakeHarness, { recursive: true, force: true });
+    rmSync(product, { recursive: true, force: true });
+  }
+});
+
 function authority(cwd: string): EvidenceAuthority {
   return { repo: '', stageId: null, targetBranch: null, worktree: cwd, baseSha: '' };
 }
@@ -1003,6 +1037,8 @@ describe('hermetic-fresh-attempt', () => {
     const body = JSON.parse(readFileSync(join(attempts, `${grepId}.json`), 'utf8')) as {
       members: {
         argv: string[];
+        declaredExecutable: string;
+        resolvedExecutable: string;
         chain: {
           argv: string[];
           resolvedArgv: string[];
@@ -1013,6 +1049,8 @@ describe('hermetic-fresh-attempt', () => {
     };
     const member = body.members[0];
     expect(member?.argv).toEqual(['grep', '-c', 'base', 'README']);
+    expect(member?.declaredExecutable).toBe('grep');
+    expect(member?.resolvedExecutable).toBe('wc');
     expect(member?.chain).toEqual([
       {
         argv: ['grep', '-c', 'base', 'README'],
