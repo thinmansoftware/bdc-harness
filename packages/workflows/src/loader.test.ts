@@ -1663,6 +1663,58 @@ nodes:
       expect(result.errors[0].error).toMatch(/wall_timeout_ms.*60000.*3600000/i);
     });
 
+    it('should parse wall_timeout_ms at the schema maximum', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'wall-timeout-max.yaml'),
+        `
+name: wall-timeout-max
+description: Loop node at the wall timeout cap
+nodes:
+  - id: implement
+    wall_timeout_ms: 3600000
+    loop:
+      prompt: "do something slow"
+      until: COMPLETE
+      max_iterations: 1
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(0);
+      const wf = result.workflows.find(w => w.workflow.name === 'wall-timeout-max')?.workflow;
+      expect(wf).toBeDefined();
+      if (!wf) throw new Error('wall-timeout-max workflow was not discovered');
+      expect(wf.nodes).toBeDefined();
+      expect(wf.nodes[0].wall_timeout_ms).toBe(3600000);
+    });
+
+    it('should reject wall_timeout_ms above the schema maximum', async () => {
+      const workflowDir = join(testDir, '.archon', 'workflows');
+      await mkdir(workflowDir, { recursive: true });
+
+      await writeFile(
+        join(workflowDir, 'bad-wall-timeout-max.yaml'),
+        `
+name: bad-wall-timeout-max
+description: Wall timeout above the schema cap
+nodes:
+  - id: implement
+    wall_timeout_ms: 3600001
+    loop:
+      prompt: "do something"
+      until: COMPLETE
+      max_iterations: 1
+`
+      );
+
+      const result = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0].error).toMatch(/wall_timeout_ms.*60000.*3600000/i);
+    });
+
     it('should parse idle_timeout on bash node', async () => {
       const workflowDir = join(testDir, '.archon', 'workflows');
       await mkdir(workflowDir, { recursive: true });
