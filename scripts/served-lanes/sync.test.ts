@@ -242,6 +242,61 @@ describe('served lanes', () => {
     }
   });
 
+  test('an edit after the final verification read is preserved', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const edited = Buffer.from(laneYaml('EDITED-AT-FINAL-VERIFY'));
+      const volumePath = join(volumeDir, 'lane.yaml');
+      await writeFile(volumePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+      let capturedMtime = '';
+      let injected = false;
+
+      const result = await reconcileServedLanes({
+        volumeDir,
+        bakedDir,
+        history,
+        now: NOW,
+        // Fires per-lane immediately before the final hash/mtime/ino read,
+        // after the backup has already been staged. The edit must be caught
+        // by the final verification and preserved, never overwritten.
+        beforeFinalVerify: async filename => {
+          if (filename !== 'lane.yaml') return;
+          await writeFile(volumePath, edited);
+          const info = await stat(volumePath);
+          capturedMtime = info.mtime.toISOString();
+          injected = true;
+        },
+      });
+
+      expect(injected).toBe(true);
+      const liveBytes = await readFile(volumePath);
+      expect(Buffer.compare(liveBytes, edited)).toBe(0);
+      expect(result.replaced).toEqual([]);
+      expect(result.backup_path).toBeNull();
+      const parentNames = await readdir(parent);
+      expect(parentNames.some(name => name.includes('.bak-'))).toBe(false);
+      const uniqueEdit = {
+        filename: 'lane.yaml',
+        sha256: sha256Hex(edited),
+        mtime: capturedMtime,
+      };
+      expect(result.unique_edit).toEqual([uniqueEdit]);
+
+      const report = JSON.parse(
+        await readFile(join(parent, 'served-lanes-report.json'), 'utf8')
+      ) as {
+        unique_edit: Array<{ filename: string; sha256: string; mtime: string }>;
+      };
+      expect(report.unique_edit).toEqual([uniqueEdit]);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
   test('the drift report lists the right files and writes nothing', async () => {
     const { parent, volumeDir, bakedDir } = await makeTree();
     try {

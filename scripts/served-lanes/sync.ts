@@ -7,17 +7,9 @@
  */
 import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
-import { mkdir, open, readFile, readdir, stat, writeFile, type FileHandle } from 'fs/promises';
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
 import { join, resolve } from 'path';
 import { createLogger } from '../../packages/paths/src/logger';
-
-const LOCK_EX = 2;
-const LOCK_UN = 8;
-
-type FlockFn = (fd: number, operation: number) => number;
-
-let flockLibrary: { close(): void } | null = null;
-let flockFn: FlockFn | null = null;
 
 const log = createLogger('served-lanes');
 
@@ -87,53 +79,6 @@ function isEnoent(error: unknown): boolean {
 
 export function sha256Hex(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
-}
-
-async function loadFlock(): Promise<FlockFn> {
-  if (flockFn !== null && flockLibrary !== null) return flockFn;
-  const ffi = await import('bun:ffi');
-  const libc = ffi.dlopen('libc.so.6', {
-    flock: {
-      args: [ffi.FFIType.i32, ffi.FFIType.i32],
-      returns: ffi.FFIType.i32,
-    },
-  });
-  flockLibrary = libc;
-  const bound = libc.symbols.flock;
-  flockFn = (fd: number, operation: number): number => bound(fd, operation);
-  return flockFn;
-}
-
-async function readFromStart(handle: FileHandle): Promise<Buffer> {
-  const info = await handle.stat();
-  const size = info.size;
-  const buffer = Buffer.alloc(size);
-  let offset = 0;
-  while (offset < size) {
-    const { bytesRead } = await handle.read(buffer, offset, size - offset, offset);
-    if (bytesRead === 0) {
-      throw new Error('Unexpected end of file while rereading a served lane');
-    }
-    offset += bytesRead;
-  }
-  return buffer;
-}
-
-async function replaceOnHandle(handle: FileHandle, bakedBytes: Buffer): Promise<void> {
-  await handle.truncate(bakedBytes.length);
-  let offset = 0;
-  while (offset < bakedBytes.length) {
-    const { bytesWritten } = await handle.write(
-      bakedBytes,
-      offset,
-      bakedBytes.length - offset,
-      offset
-    );
-    if (bytesWritten === 0) {
-      throw new Error('Short write while replacing a served lane');
-    }
-    offset += bytesWritten;
-  }
 }
 
 function emptyResult(): ReconcileResult {
@@ -303,6 +248,7 @@ export async function reconcileServedLanes(input: {
   history: ServedLaneHistory;
   now: Date;
   beforeReplace?: () => Promise<void> | void;
+  beforeFinalVerify?: (filename: string) => Promise<void> | void;
 }): Promise<ReconcileResult> {
   const reportPath = reportPathFor(input.volumeDir);
   const volumePresence = await directoryPresence(input.volumeDir);
@@ -339,55 +285,79 @@ export async function reconcileServedLanes(input: {
       if (lane.bakedBytes === null) {
         throw new Error(`Missing baked bytes for replacement: ${lane.filename}`);
       }
-      const livePath = join(input.volumeDir, lane.filename);
-      const handle = await open(livePath, 'r+');
-      let locked = false;
-      let flock: FlockFn | null = null;
-      let unlockError: Error | null = null;
-      try {
-        flock = await loadFlock();
-        const lockStatus = flock(handle.fd, LOCK_EX);
-        if (lockStatus !== 0) {
-          throw new Error(`flock LOCK_EX failed for ${livePath}: ${lockStatus}`);
-        }
-        locked = true;
-
-        if (lane.servedSha256 === null) {
-          throw new Error(`Missing classified hash for replacement: ${lane.filename}`);
-        }
-        const current = await readFromStart(handle);
-        const currentHash = sha256Hex(current);
-        if (currentHash !== lane.servedSha256) {
-          const info = await handle.stat();
-          result.unique_edit.push({
-            filename: lane.filename,
-            sha256: currentHash,
-            mtime: info.mtime.toISOString(),
-          });
-        } else {
-          if (result.backup_path === null) {
-            const backupDir = `${input.volumeDir}.bak-${backupStamp(input.now)}`;
-            await mkdir(backupDir);
-            result.backup_path = backupDir;
-          }
-          const backupFile = join(result.backup_path, lane.filename);
-          if (await pathExists(backupFile)) {
-            throw new Error(`Backup target already exists: ${backupFile}`);
-          }
-          await writeFile(backupFile, current);
-          await replaceOnHandle(handle, lane.bakedBytes);
-          result.replaced.push(lane.filename);
-        }
-      } finally {
-        if (locked && flock !== null) {
-          const unlockStatus = flock(handle.fd, LOCK_UN);
-          if (unlockStatus !== 0) {
-            unlockError = new Error(`flock LOCK_UN failed for ${livePath}: ${unlockStatus}`);
-          }
-        }
-        await handle.close();
+      if (lane.servedSha256 === null) {
+        throw new Error(`Missing classified hash for replacement: ${lane.filename}`);
       }
-      if (unlockError) throw unlockError;
+      const livePath = join(input.volumeDir, lane.filename);
+
+      // Observe the live file once at replace time. mtime and inode are
+      // captured here so the final verification below can detect any edit.
+      const preBytes = await readFile(livePath);
+      const preStat = await stat(livePath);
+      const preHash = sha256Hex(preBytes);
+      if (preHash !== lane.servedSha256) {
+        // Changed since classification: preserve it, overwrite nothing.
+        result.unique_edit.push({
+          filename: lane.filename,
+          sha256: preHash,
+          mtime: preStat.mtime.toISOString(),
+        });
+        continue;
+      }
+
+      // Stage the backup (the exact bytes about to be replaced) BEFORE the
+      // final verification, to a temp path that is never the official backup
+      // directory, so an abandoned replacement leaves no stray .bak- directory
+      // and no awaited backup operation sits between the final read and the
+      // write.
+      const stagedBackup = `${livePath}.served-lanes-bak-staging`;
+      await writeFile(stagedBackup, preBytes);
+
+      // Test seam: a per-lane edit injected here must be caught by the final
+      // verification below and preserved, never overwritten.
+      await input.beforeFinalVerify?.(lane.filename);
+
+      // Final verification: re-read the bytes AND re-stat (mtime + inode) and
+      // compare against the pre-observation. No awaited operation runs between
+      // the last read here and the in-place write, so a concurrent edit can
+      // only land before this check (where it is detected) -- never in an
+      // unobserved gap before the overwrite.
+      const finalBytes = await readFile(livePath);
+      const finalStat = await stat(livePath);
+      const finalHash = sha256Hex(finalBytes);
+      if (
+        finalHash !== preHash ||
+        finalStat.ino !== preStat.ino ||
+        finalStat.mtimeMs !== preStat.mtimeMs
+      ) {
+        result.unique_edit.push({
+          filename: lane.filename,
+          sha256: finalHash,
+          mtime: finalStat.mtime.toISOString(),
+        });
+        await rm(stagedBackup, { force: true });
+        continue;
+      }
+
+      // Verified unchanged: overwrite in place. writeFile on an existing path
+      // truncates and reuses the inode, preserving uid, gid and mode. This is
+      // a single awaited write glued to the verification above.
+      await writeFile(livePath, lane.bakedBytes);
+
+      // Promote the staged backup into the official directory, created lazily
+      // so a run that replaces nothing creates no backup directory. The backup
+      // therefore holds exactly the bytes that were replaced.
+      if (result.backup_path === null) {
+        const backupDir = `${input.volumeDir}.bak-${backupStamp(input.now)}`;
+        await mkdir(backupDir);
+        result.backup_path = backupDir;
+      }
+      const backupFile = join(result.backup_path, lane.filename);
+      if (await pathExists(backupFile)) {
+        throw new Error(`Backup target already exists: ${backupFile}`);
+      }
+      await rename(stagedBackup, backupFile);
+      result.replaced.push(lane.filename);
     }
 
     await writeReport(reportPath, result);
