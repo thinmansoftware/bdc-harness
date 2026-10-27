@@ -441,6 +441,7 @@ describe('partial-failure-and-compatibility', () => {
       summary.total > 0;
     try {
       const zero = runTestCommands(['bash ./ok.sh && bash ./zero.sh'], cwd, join(cwd, 'zero.log'));
+      expect(zero.line).not.toBe('0 1 1');
       expect(zero.line).toBe('0 0 0');
       expect(zero.passed).toBe(0);
       expect(zero.total).toBe(0);
@@ -454,6 +455,7 @@ describe('partial-failure-and-compatibility', () => {
         cwd,
         join(cwd, 'nocount.log')
       );
+      expect(unparsed.line).not.toBe('0 1 1');
       expect(unparsed.line).toBe('0  ');
       expect(unparsed.passed).toBeNull();
       expect(unparsed.total).toBeNull();
@@ -640,12 +642,14 @@ describe('canonical-stage-authority', () => {
     const shimDir = tempDir('ser-yaml-shim-');
     const argvLog = join(cwd, 'argv.log');
     const envLog = join(cwd, 'env.log');
+    const cwdLog = join(cwd, 'cwd.log');
     const sentinel = join(cwd, 'yaml-import-sentinel');
     const previousCwd = process.cwd();
     const envKeys = [
       'PATH',
       'BDC_PARSER_SECRET',
       'GH_TOKEN',
+      'CLAUDE_API_KEY',
       'ANTHROPIC_API_KEY',
       'OPENAI_API_KEY',
       'CURSOR_API_KEY',
@@ -682,12 +686,14 @@ describe('canonical-stage-authority', () => {
           '#!/bin/sh',
           `ARGV_LOG='${argvLog}'`,
           `ENV_LOG='${envLog}'`,
+          `CWD_LOG='${cwdLog}'`,
           `REAL_PYTHON='${realPython}'`,
           `SHIM_DIR='${shimDir}'`,
           ': > "$ARGV_LOG"',
           'for arg in "$@"; do',
           '  printf \'%s\\0\' "$arg" >> "$ARGV_LOG"',
           'done',
+          'pwd > "$CWD_LOG"',
           '/usr/bin/env > "$ENV_LOG"',
           'CLEAN_PATH=',
           'OLD_IFS=$IFS',
@@ -711,6 +717,7 @@ describe('canonical-stage-authority', () => {
       );
       process.env.BDC_PARSER_SECRET = secret;
       process.env.GH_TOKEN = 'bdc-gh-token-round12';
+      process.env.CLAUDE_API_KEY = 'bdc-claude-round12';
       process.env.ANTHROPIC_API_KEY = 'bdc-anthropic-round12';
       process.env.OPENAI_API_KEY = 'bdc-openai-round12';
       process.env.CURSOR_API_KEY = 'bdc-cursor-round12';
@@ -735,6 +742,7 @@ describe('canonical-stage-authority', () => {
         secret,
         'PYTHONPATH',
         'GH_TOKEN',
+        'CLAUDE_API_KEY',
         'ANTHROPIC_API_KEY',
         'OPENAI_API_KEY',
         'CURSOR_API_KEY',
@@ -744,7 +752,14 @@ describe('canonical-stage-authority', () => {
       }
       const argvItems = readFileSync(argvLog).toString('utf8').split('\0');
       expect(argvItems).toContain('-I');
+      const recordedCwd = readFileSync(cwdLog, 'utf8').trim();
+      expect(recordedCwd).not.toBe(cwd);
+      expect(recordedCwd.startsWith(`${cwd}/`)).toBe(false);
+      expect(recordedCwd.startsWith(`${tmpdir()}/ser-stages-`)).toBe(true);
+      expect(argvItems).toContain(join(recordedCwd, 'stages.yaml'));
+      expect(existsSync(recordedCwd)).toBe(false);
       expect(process.env.BDC_PARSER_SECRET).toBe(secret);
+      expect(process.env.CLAUDE_API_KEY).toBe('bdc-claude-round12');
       expect({ ok: parsedOk, error: parseError }).toEqual({ ok: true, error: '' });
     } finally {
       process.chdir(previousCwd);

@@ -9,9 +9,11 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
@@ -1626,6 +1628,24 @@ function publishTestSummary(
     return { line: '0 0 0', exitCode: 0, passed: 0, total: 0 };
   }
   if (hit) {
+    // Counts summed across a chain can look like a pass (exit 0, passed == total > 0)
+    // even when a later step is zero-count, unparsed, or otherwise not PASSED.
+    const looksPassed = exitCode === 0 && passed === total && total > 0;
+    if (looksPassed) {
+      const steps = selected.flatMap(member => member.chain);
+      const nonPassing =
+        selected.some(member => member.status !== 'PASSED') ||
+        steps.some(step => step.status !== 'PASSED');
+      if (nonPassing) {
+        const stepZeroCount =
+          selected.some(member => member.reason === 'zero-count') ||
+          steps.some(step => step.reason === 'zero-count');
+        if (stepZeroCount) {
+          return { line: '0 0 0', exitCode: 0, passed: 0, total: 0 };
+        }
+        return { line: `${exitCode}  `, exitCode, passed: null, total: null };
+      }
+    }
     return { line: `${exitCode} ${passed} ${total}`, exitCode, passed, total };
   }
   return { line: `${exitCode}  `, exitCode, passed: null, total: null };
@@ -2163,22 +2183,37 @@ export function selectStagesBlock(
 
 const YAML_TO_JSON = `
 import json, os, sys, site
+
+# Drop empty sys.path entries (python -c searches cwd) and the parser cwd
+# before import. A product-worktree yaml.py must not satisfy "import yaml".
+_cwd = os.path.abspath(os.getcwd())
+_kept = []
+for _entry in sys.path:
+    if _entry in ("", None):
+        continue
+    if os.path.abspath(_entry) == _cwd:
+        continue
+    _kept.append(_entry)
+sys.path[:] = _kept
 try:
     import yaml
 except ImportError:
-    # python3 -I drops cwd and PYTHONPATH, and also hides user-site packages.
-    # Re-add only the absolute user site when it is not the working directory
-    # so a product yaml.py cannot satisfy "import yaml".
+    # python3 -I hides user-site packages. Re-add only an absolute user site
+    # that is not the parser cwd and is not a relative entry.
+    yaml = None
     user_site = site.getusersitepackages()
-    cwd = os.path.abspath(os.getcwd())
-    if user_site and os.path.isdir(user_site) and os.path.abspath(user_site) != cwd:
+    if (
+        isinstance(user_site, str)
+        and user_site
+        and os.path.isabs(user_site)
+        and os.path.isdir(user_site)
+        and os.path.abspath(user_site) != _cwd
+    ):
         sys.path.append(os.path.abspath(user_site))
         try:
             import yaml
         except ImportError:
             yaml = None
-    else:
-        yaml = None
     if yaml is None:
         sys.stderr.write("FAIL: python yaml module unavailable; cannot parse stages.\\n")
         sys.exit(1)
@@ -2276,21 +2311,30 @@ function parserChildEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 export function parseStagesYaml(
   yamlText: string
 ): { ok: true; stages: StageContract[] } | { ok: false; message: string } {
-  const file = join(tmpdir(), `ser-stages-${process.pid}.yaml`);
-  writeFileSync(file, yamlText);
-  const result = spawnSync('python3', ['-I', '-c', YAML_TO_JSON, file], {
-    shell: false,
-    encoding: 'utf8',
-    timeout: 30_000,
-    env: parserChildEnv(process.env),
-  });
-  if (result.status !== 0) {
-    return { ok: false, message: result.stderr || 'FAIL: stages YAML parse error\n' };
-  }
+  const dir = mkdtempSync(join(tmpdir(), 'ser-stages-'));
   try {
-    return validateStages(JSON.parse(result.stdout || 'null'));
-  } catch (error) {
-    return { ok: false, message: `FAIL: stages YAML parse error: ${(error as Error).message}\n` };
+    const file = join(dir, 'stages.yaml');
+    writeFileSync(file, yamlText);
+    const result = spawnSync('python3', ['-I', '-c', YAML_TO_JSON, file], {
+      cwd: dir,
+      shell: false,
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: parserChildEnv(process.env),
+    });
+    if (result.status !== 0) {
+      return { ok: false, message: result.stderr || 'FAIL: stages YAML parse error\n' };
+    }
+    try {
+      return validateStages(JSON.parse(result.stdout || 'null'));
+    } catch (error) {
+      return {
+        ok: false,
+        message: `FAIL: stages YAML parse error: ${(error as Error).message}\n`,
+      };
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 }
 
