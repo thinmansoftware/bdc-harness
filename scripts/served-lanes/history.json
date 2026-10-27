@@ -7,7 +7,9 @@
     "2140b8c4560d833c7f12eba7f5fd58a8d09955bc71db0b7047bb944ca407c404",
     "8bc107096b5a3eff604f089258945f136f6fea291be81e4670facef966b77fe3"
   ],
-  "archon-assist.yaml": ["5ff2a1d736bec35f43c7325ac171c426887cdc1f7d6bda36ec99162c0fd35435"],
+  "archon-assist.yaml": [
+    "5ff2a1d736bec35f43c7325ac171c426887cdc1f7d6bda36ec99162c0fd35435"
+  ],
   "archon-comprehensive-pr-review.yaml": [
     "f20b394e33fdd5a25d689485e868f52e8ae4c407e3f09b87dd5bba0650fbcf0b"
   ],
@@ -64,7 +66,9 @@
     "b6442cc1f1ac03b9f5bda8427e7e7ac7bb20cc898e1e908655d9e2d1f7f471f5",
     "f97793a8d27baf69e3427f477c90452f03d0a57a8c9428139de93017c610740f"
   ],
-  "archon-test-loop-dag.yaml": ["60c5b145d3f116e24455a175cec42d2c6d2d9ec2af72a3ea60f3389b27785174"],
+  "archon-test-loop-dag.yaml": [
+    "60c5b145d3f116e24455a175cec42d2c6d2d9ec2af72a3ea60f3389b27785174"
+  ],
   "archon-validate-pr.yaml": [
     "6e87d00646504c68c358c548bc1bc3ba2048ee96d6b414865dfe9734d5d6da11",
     "80eb0e62d5766f0b3b7ed91016fffb660a6bac284ed2c9b760c5cef3d269a3b4"
@@ -1338,7 +1342,9 @@
     "75c5e1f2819187a187668d6b8f7c459f8e8983b60a268af252bec3088116e383",
     "d139984dbc5632f684cdf77fe6bbccfe4e728a59d264c45f8c4bb3bc7f856a47"
   ],
-  "test-approve-resume.yaml": ["df332aa0e70be5a55eef4ee1f8ec0cb56c0c6314a0dc9fbddbcedc7e66324467"],
+  "test-approve-resume.yaml": [
+    "df332aa0e70be5a55eef4ee1f8ec0cb56c0c6314a0dc9fbddbcedc7e66324467"
+  ],
   "thinman-deploy-factory-plan-only.yaml": [
     "016f9712c4e6865f240525025e5f47dd8bde7ed575d5923d9a717f05d2888042",
     "71645919f32004d98d625d689da87dd7baeddddca36236fcc825ae1b445401be",

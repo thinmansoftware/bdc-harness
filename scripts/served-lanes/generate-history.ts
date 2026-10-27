@@ -2,8 +2,10 @@
  * Build scripts/served-lanes/history.json from committed blob hashes.
  *
  * For each top-level .archon/workflows/defaults/*.yaml, record the sha256 of
- * every added or modified ancestor blob. Output is sorted, one hash per line,
- * so a merge conflict stays trivial to resolve.
+ * every added or modified ancestor blob, including a version that survived
+ * only on one side of a merge. Output is sorted, one hash per line, so a
+ * merge conflict stays trivial to resolve. The renderer is written as-is:
+ * Prettier's JSON printer collapses a one-hash list onto a single line.
  *
  *   bun run scripts/served-lanes/generate-history.ts
  *   bun run scripts/served-lanes/generate-history.ts --check
@@ -17,7 +19,6 @@ import { createHash } from 'crypto';
 import { execFile } from 'node:child_process';
 import { readFile, readdir, writeFile } from 'fs/promises';
 import { join, resolve } from 'path';
-import prettier from 'prettier';
 
 const REPO_ROOT = resolve(import.meta.dir, '../..');
 const DEFAULTS_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
@@ -49,13 +50,16 @@ interface GitFailure extends Error {
   stderr?: Buffer;
 }
 
-function runGit(args: readonly string[]): Promise<{ stdout: Buffer; stderr: Buffer }> {
+function runGit(
+  args: readonly string[],
+  repoRoot: string = REPO_ROOT
+): Promise<{ stdout: Buffer; stderr: Buffer }> {
   return new Promise((resolveGit, reject) => {
     execFile(
       'git',
       [...args],
       {
-        cwd: REPO_ROOT,
+        cwd: repoRoot,
         maxBuffer: 64 * 1024 * 1024,
         encoding: 'buffer',
       },
@@ -113,15 +117,27 @@ async function mapPool<T, R>(
   return results;
 }
 
-async function committedBlobHashes(relativePath: string, head: string): Promise<string[]> {
-  const log = await runGit([
-    '--no-pager',
-    'log',
-    '--format=%H',
-    '--diff-filter=AM',
-    '--',
-    relativePath,
-  ]);
+export async function committedBlobHashes(
+  relativePath: string,
+  head: string,
+  repoRoot: string = REPO_ROOT
+): Promise<string[]> {
+  // Default path-limited log prunes a merge parent whose blob did not win.
+  // --full-history walks every parent so each committed ancestor version
+  // still contributes its sha256.
+  const log = await runGit(
+    [
+      '--no-pager',
+      'log',
+      '--full-history',
+      '--format=%H',
+      '--diff-filter=AM',
+      head,
+      '--',
+      relativePath,
+    ],
+    repoRoot
+  );
   const revisions = new Set(
     log.stdout
       .toString('utf8')
@@ -133,7 +149,7 @@ async function committedBlobHashes(relativePath: string, head: string): Promise<
   const hashes = new Set<string>();
   for (const revision of revisions) {
     try {
-      const blob = await runGit(['--no-pager', 'show', `${revision}:${relativePath}`]);
+      const blob = await runGit(['--no-pager', 'show', `${revision}:${relativePath}`], repoRoot);
       hashes.add(sha256Hex(blob.stdout));
     } catch (error) {
       if (isMissingBlob(error)) continue;
@@ -143,7 +159,7 @@ async function committedBlobHashes(relativePath: string, head: string): Promise<
   return [...hashes].sort(compareAscii);
 }
 
-function renderHistoryJson(history: Readonly<Record<string, readonly string[]>>): string {
+export function renderHistoryJson(history: Readonly<Record<string, readonly string[]>>): string {
   const keys = Object.keys(history).sort(compareAscii);
   if (keys.length === 0) return '{}\n';
   const lines: string[] = ['{'];
@@ -180,9 +196,7 @@ export async function renderHistory(): Promise<string> {
   filenames.forEach((filename, index) => {
     history[filename] = hashLists[index] ?? [];
   });
-  const rendered = renderHistoryJson(history);
-  const config = (await prettier.resolveConfig(OUTPUT_PATH)) ?? {};
-  return prettier.format(rendered, { ...config, parser: 'json' });
+  return renderHistoryJson(history);
 }
 
 async function main(): Promise<void> {

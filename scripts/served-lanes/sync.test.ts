@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, test } from 'bun:test';
+import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
 import { mkdtempSync } from 'fs';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'fs/promises';
@@ -8,7 +9,7 @@ import { createCodebase } from '../../packages/core/src/db/codebases';
 import { closeDatabase, getDatabase, resetDatabase } from '../../packages/core/src/db/connection';
 import { getDefaultWorkflowsPath } from '../../packages/paths/src/archon-paths';
 import { discoverWorkflowsWithConfig } from '../../packages/workflows/src/workflow-discovery';
-import { renderHistory } from './generate-history';
+import { committedBlobHashes, renderHistory, renderHistoryJson } from './generate-history';
 import { computeDrift, notifyServedLaneUniqueEdits, reconcileServedLanes } from './sync';
 import type { ServedLaneHistory } from './sync';
 
@@ -34,6 +35,28 @@ function sha256Hex(bytes: Buffer | string): string {
 
 function laneYaml(description: string): string {
   return `name: lane\ndescription: ${description}\nnodes:\n  - id: note\n    prompt: Say hello.\n`;
+}
+
+function gitIn(repo: string, args: readonly string[]): string {
+  return execFileSync(
+    'git',
+    [
+      '-c',
+      'user.email=served-lanes@example.com',
+      '-c',
+      'user.name=Served Lanes',
+      '-c',
+      'commit.gpgsign=false',
+      '-c',
+      'core.hooksPath=/dev/null',
+      '-c',
+      'core.autocrlf=false',
+      '-c',
+      'safe.directory=*',
+      ...args,
+    ],
+    { cwd: repo, encoding: 'utf8' }
+  );
 }
 
 function backupStamp(now: Date): string {
@@ -368,6 +391,20 @@ describe('served lanes', () => {
     const second = await renderHistory();
     expect(first).toBe(second);
 
+    const oneHash = 'a'.repeat(64);
+    expect(renderHistoryJson({ 'lane.yaml': [oneHash] })).toBe(
+      `{\n  "lane.yaml": [\n    "${oneHash}"\n  ]\n}\n`
+    );
+    expect(first).not.toMatch(/: \["[0-9a-f]{64}"\]/);
+    const parsed = JSON.parse(first) as Record<string, string[]>;
+    for (const hashes of Object.values(parsed)) {
+      for (const hash of hashes) {
+        expect(first).toContain(`\n    "${hash}"`);
+      }
+    }
+    const committed = await readFile(join(import.meta.dir, 'history.json'), 'utf8');
+    expect(committed).toBe(first);
+
     const check = Bun.spawn({
       cmd: ['bun', 'run', 'scripts/served-lanes/generate-history.ts', '--check'],
       cwd: REPO_ROOT,
@@ -415,4 +452,51 @@ describe('served lanes', () => {
       await rm(parent, { recursive: true, force: true });
     }
   }, 120_000);
+
+  test('history retains a merge-side blob dropped by default simplification', async () => {
+    const repo = await mkdtemp(join(tmpdir(), 'served-lanes-git-'));
+    try {
+      gitIn(repo, ['init', '-b', 'main']);
+      const rel = '.archon/workflows/defaults/lane.yaml';
+      await mkdir(join(repo, '.archon/workflows/defaults'), { recursive: true });
+      const file = join(repo, rel);
+      const rootBytes = 'name: lane\nversion: root\n';
+      const sideBytes = 'name: lane\nversion: side-only\n';
+      const mainBytes = 'name: lane\nversion: main-only\n';
+      await writeFile(file, rootBytes);
+      gitIn(repo, ['add', rel]);
+      gitIn(repo, ['commit', '-m', 'root']);
+      gitIn(repo, ['checkout', '-b', 'side']);
+      await writeFile(file, sideBytes);
+      gitIn(repo, ['add', rel]);
+      gitIn(repo, ['commit', '-m', 'side']);
+      const sideCommit = gitIn(repo, ['rev-parse', 'HEAD']).trim();
+      gitIn(repo, ['checkout', 'main']);
+      await writeFile(file, mainBytes);
+      gitIn(repo, ['add', rel]);
+      gitIn(repo, ['commit', '-m', 'main']);
+      gitIn(repo, ['merge', '-X', 'ours', '-m', 'merge side keeping main', 'side']);
+
+      const simplified = gitIn(repo, [
+        '--no-pager',
+        'log',
+        '--format=%H',
+        '--diff-filter=AM',
+        '--',
+        rel,
+      ])
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0);
+      expect(simplified).not.toContain(sideCommit);
+
+      const head = gitIn(repo, ['rev-parse', 'HEAD']).trim();
+      const hashes = await committedBlobHashes(rel, head, repo);
+      expect(hashes).toContain(sha256Hex(rootBytes));
+      expect(hashes).toContain(sha256Hex(sideBytes));
+      expect(hashes).toContain(sha256Hex(mainBytes));
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
 });
