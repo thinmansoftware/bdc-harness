@@ -809,11 +809,85 @@ nodes:
       # pinned at allocation). When origin/$BASE_BRANCH exists locally, a missing
       # merge-base means this worktree was cut from a disjoint lane -- fail HERE,
       # before implement, instead of at a tail node after a PR was already opened.
+      BMD_SHA=""
       if [ -n "${BASE_BRANCH:-}" ] && git rev-parse --verify "refs/remotes/origin/${BASE_BRANCH}^{commit}" >/dev/null 2>&1; then
-        if ! git merge-base "refs/remotes/origin/${BASE_BRANCH}" HEAD >/dev/null 2>&1; then
-          echo "worktree_not_on_declared_base_lane: HEAD shares no history with origin/${BASE_BRANCH}" >&2
+        # ---- BEGIN bmd core (byte-identical across lanes; extracted by unit test) ----
+        bmd_resolve_merge_base() {
+          local base_ref head_ref lane sha shallow deepened step cap this remain err line upstream up_branch
+          base_ref="$1"
+          head_ref="$2"
+          lane="${base_ref#refs/remotes/origin/}"
+          sha=$(git merge-base "$base_ref" "$head_ref" 2>/dev/null) || sha=""
+          if [ -z "$sha" ]; then
+            shallow=$(git rev-parse --is-shallow-repository 2>/dev/null || printf '%s' false)
+            deepened=0
+            if [ "$shallow" = "true" ]; then
+              step=${BMD_DEEPEN_STEP:-200}
+              cap=${BMD_DEEPEN_CAP:-1000}
+              while [ "$deepened" -lt "$cap" ]; do
+                this=$step
+                remain=$((cap - deepened))
+                if [ "$this" -gt "$remain" ]; then
+                  this=$remain
+                fi
+                deepened=$((deepened + this))
+                err=$(mktemp)
+                if ! git fetch --quiet --deepen="$this" origin "$lane" 2>"$err"; then
+                  line=$(head -n 1 "$err" || true)
+                  rm -f "$err"
+                  printf 'worktree_not_on_declared_base_lane: merge_base_fetch_failed: %s\n' "$line" >&2
+                  exit 1
+                fi
+                rm -f "$err"
+                upstream=$(git rev-parse --abbrev-ref "${head_ref}@{upstream}" 2>/dev/null) || upstream=""
+                case "$upstream" in
+                  origin/*)
+                    up_branch="${upstream#origin/}"
+                    if [ "$up_branch" != "$lane" ]; then
+                      err=$(mktemp)
+                      if ! git fetch --quiet --deepen="$this" origin "$up_branch" 2>"$err"; then
+                        line=$(head -n 1 "$err" || true)
+                        rm -f "$err"
+                        printf 'worktree_not_on_declared_base_lane: merge_base_fetch_failed: %s\n' "$line" >&2
+                        exit 1
+                      fi
+                      rm -f "$err"
+                    fi
+                    ;;
+                esac
+                sha=$(git merge-base "$base_ref" "$head_ref" 2>/dev/null) || sha=""
+                if [ -n "$sha" ]; then
+                  break
+                fi
+              done
+              if [ -z "$sha" ]; then
+                err=$(mktemp)
+                if ! git fetch --quiet --unshallow origin 2>"$err"; then
+                  line=$(head -n 1 "$err" || true)
+                  rm -f "$err"
+                  printf 'worktree_not_on_declared_base_lane: merge_base_fetch_failed: %s\n' "$line" >&2
+                  exit 1
+                fi
+                rm -f "$err"
+                shallow=$(git rev-parse --is-shallow-repository 2>/dev/null || printf '%s' false)
+                sha=$(git merge-base "$base_ref" "$head_ref" 2>/dev/null) || sha=""
+              fi
+            else
+              shallow=false
+              deepened=0
+            fi
+          fi
+          if [ -n "$sha" ]; then
+            mkdir -p "$ARTIFACTS_DIR"
+            printf '%s\n' "$sha" > "$ARTIFACTS_DIR/run-scope-merge-base.txt"
+            printf '%s\n' "$sha"
+            return 0
+          fi
+          printf 'worktree_not_on_declared_base_lane: no_common_history: HEAD shares no history with origin/%s (shallow=%s, deepened=%s)\n' "$lane" "$shallow" "$deepened" >&2
           exit 1
-        fi
+        }
+        # ---- END bmd core ----
+        BMD_SHA=$(bmd_resolve_merge_base "refs/remotes/origin/${BASE_BRANCH}" HEAD) || exit $?
       fi
       RUN_SCOPE_SHA=$(git rev-parse --verify 'HEAD^{commit}') || {
         echo "scope_authority_missing: HEAD is not a commit" >&2
@@ -822,6 +896,9 @@ nodes:
       mkdir -p "$ARTIFACTS_DIR"
       printf '%s\n' "$RUN_SCOPE_SHA" > "$ARTIFACTS_DIR/run-scope-sha.txt"
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
+      if [ -n "${BMD_SHA:-}" ]; then
+        echo "RUN_SCOPE_MERGE_BASE=$BMD_SHA"
+      fi
 
   - id: prep-dependencies
     depends_on: [capture-run-scope]
@@ -1287,7 +1364,8 @@ nodes:
         echo "scope_authority_missing: run scope SHA is not a commit" >&2
         exit 1
       fi
-      if ! git merge-base --is-ancestor "$SCOPE_SHA" HEAD; then
+      if ! git \
+        merge-base --is-ancestor "$SCOPE_SHA" HEAD; then
         BASE_REF="${BASE_BRANCH:-dev}"
         RECOVERED_SCOPE_SHA=""
         for CANDIDATE_REF in "origin/$BASE_REF" "$BASE_REF"; do
@@ -4115,7 +4193,8 @@ nodes:
         fi
         REPAIR_TARGET_LEASE_SHA="${CHECKOUT_LEASE_SHA:-$REPAIR_TARGET_LIVE_OID}"
         echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LEASE_SHA}"
-        if ! git merge-base --is-ancestor "$REPAIR_TARGET_LEASE_SHA" HEAD; then
+        if ! git \
+          merge-base --is-ancestor "$REPAIR_TARGET_LEASE_SHA" HEAD; then
           echo "repair_target_base_not_incorporated"
           echo "ERROR: repair_target_base_not_incorporated: HEAD does not contain repair-target lease ${REPAIR_TARGET_LEASE_SHA}" >&2
           exit 1
