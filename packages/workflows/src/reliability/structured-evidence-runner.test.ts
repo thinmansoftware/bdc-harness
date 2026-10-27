@@ -2011,6 +2011,70 @@ describe('lane-adapter-trusted-root', () => {
       rmSync(work, { recursive: true, force: true });
     }
   });
+
+  it('never resolves the runner from a product checkout or HARNESS_ROOT_OVERRIDE', () => {
+    // Overseer PR #1286 f13d909f + f2c57648: the HARNESS_ROOT_OVERRIDE branch and
+    // the CWD walk-up trusted a checkout-controlled origin + package name. A
+    // product repo can spoof both, so the adapter must fail closed instead.
+    const laneDir = join(ROOT, '.archon/workflows/defaults');
+    const lanes = readdirSync(laneDir).filter(name => name.endsWith('.yaml'));
+    const product = tempDir('ser-spoof-checkout-');
+    initRepo(product);
+    git(product, ['remote', 'add', 'origin', 'https://github.com/thinmansoftware/bdc-harness.git']);
+    plantSpoofRunner(product);
+    const sentinel = join(product, 'sentinel');
+    const hide = [
+      'hide_fixed_root() {',
+      '  case "$1" in',
+      '    /app|/app/*|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/source/*)',
+      '      return 0 ;;',
+      '  esac',
+      '  return 1',
+      '}',
+      '[() {',
+      '  if builtin [ "$#" -ge 2 ] && builtin [ "$1" = -f ] && hide_fixed_root "$2"; then',
+      '    return 1',
+      '  fi',
+      '  builtin [ "$@"',
+      '}',
+    ].join('\n');
+    let adapters = 0;
+    try {
+      for (const lane of lanes) {
+        const text = readFileSync(join(laneDir, lane), 'utf8');
+        if (!text.includes('ser_root()')) continue;
+        for (const block of extractSerAdapters(text)) {
+          adapters += 1;
+          expect(block.includes('HARNESS_ROOT_OVERRIDE:-')).toBe(false);
+          expect(block.includes('d="$(pwd)"')).toBe(false);
+          const script = [
+            hide,
+            block,
+            'if root="$(ser_root)"; then printf \'ROOT=%s\n\' "$root"; else printf \'ROOT_MISSING\n\'; fi',
+            "ser_runner allow-test -- 'true' || true",
+            '',
+          ].join('\n');
+          const ran = spawnSync('bash', ['-c', script], {
+            cwd: product,
+            env: {
+              PATH: process.env.PATH ?? '',
+              SENTINEL: sentinel,
+              HARNESS_ROOT_OVERRIDE: product,
+              NODE_ENV: 'production',
+            },
+            encoding: 'utf8',
+          });
+          expect(ran.status).toBe(0);
+          expect(ran.stdout).toContain('ROOT_MISSING');
+          expect(ran.stdout).not.toContain('ATTACKER_HELPER_EXECUTED');
+          expect(existsSync(sentinel)).toBe(false);
+        }
+      }
+      expect(adapters).toBeGreaterThan(10);
+    } finally {
+      rmSync(product, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('stale-source-log-exclusion', () => {

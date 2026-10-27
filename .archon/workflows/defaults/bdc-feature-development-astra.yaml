@@ -4754,23 +4754,6 @@ nodes:
             return 0
           fi
         done
-        d="$(pwd)"
-        while [ -n "$d" ] && [ "$d" != "/" ]; do
-          if [ -e "$d/.git" ]; then
-            url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
-            case "$url" in
-              *github.com*thinmansoftware/bdc-harness*|*git@github.com:thinmansoftware/bdc-harness*)
-                pkg="$d/packages/workflows/package.json"
-                if [ -f "$d/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-                  printf '%s' "$d"
-                  return 0
-                fi
-                ;;
-            esac
-            break
-          fi
-          d="$(dirname "$d")"
-        done
         return 1
       }
       SER_BUN_BIN="${SER_BUN_BIN:-$(command -v bun || true)}"
