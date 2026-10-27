@@ -2,7 +2,7 @@ Manifest-Version: 2
 WO: WO-HARNESS-OVERSEER-REVIEW-SANDBOX-01
 Builder: Codex
 Repair target: PR #1290, feat/wo-harness-overseer-review-sandbox-01-repair
-Functional candidate SHA: 78a25934a46e93a28219c6b874fcd0f6672badad
+Functional candidate SHA: 964659653c8c6beaf7bcdf0a8233abd96f551500
 Fetched origin/dev: 7a4b6438fc16696707b736cd160cc1861d7ffacb
 Merge base: 7a4b6438fc16696707b736cd160cc1861d7ffacb
 Persisted runScopeSha: 7a4b6438fc16696707b736cd160cc1861d7ffacb
@@ -44,6 +44,7 @@ Validation:
 - Extended merge/worker/sandbox regression command passed with zero failures.
 - Full Ubuntu CI exposed a legacy-body compatibility regression; the functional candidate preserves an absent optional baseSha and its focused regression passes.
 - Merge-bridge retry fixtures now supply the mandatory qualification dependency; 7/7 retry tests and the missing-dependency fail-closed regression pass.
+- Final-image diagnostics proved loopback denial; the smoke accepts curl's `Could not connect to server` spelling as the required refused-or-blocked result.
 
 Native binding required in final-image CI: UID 1002, Codex 0.153.3, use_legacy_landlock, no added privileges, and the real broker smoke. No native result is fabricated by this manifest.
 Runtime verification: post-activation Stop 9 not run; activation was not authorized.
