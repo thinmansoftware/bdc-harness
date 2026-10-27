@@ -47,7 +47,9 @@ assert_not_contains() {
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 export NODE_ENV=test
-export SER_TEST_TRUSTED_ROOT="$(cd "$HERE/../../../.." && pwd)"
+TEST_REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
+TEST_RUNNER="$TEST_REPO_ROOT/packages/workflows/src/reliability/structured-evidence-runner-cli.test-adapter.ts"
+TEST_BUN="$(command -v bun)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-astra.yaml
@@ -78,6 +80,7 @@ if [ -z "$SME_CORE" ]; then
   echo "FATAL: could not extract sme core from $CANONICAL_YAML"; exit 1
 fi
 eval "$SME_CORE"
+ser_runner() { "$TEST_BUN" "$TEST_RUNNER" "$@"; }
 for fn in sme_field sme_process; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done

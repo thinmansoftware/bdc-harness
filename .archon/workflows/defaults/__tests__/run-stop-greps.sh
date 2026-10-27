@@ -40,7 +40,9 @@ assert_contains() {
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 export NODE_ENV=test
-export SER_TEST_TRUSTED_ROOT="$(cd "$HERE/../../../.." && pwd)"
+TEST_REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
+TEST_RUNNER="$TEST_REPO_ROOT/packages/workflows/src/reliability/structured-evidence-runner-cli.test-adapter.ts"
+TEST_BUN="$(command -v bun)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-astra.yaml
@@ -71,6 +73,8 @@ if [ -z "$RSG_CORE" ]; then
   echo "FATAL: could not extract rsg core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RSG_CORE"
+ser_root() { printf '%s' "$TEST_REPO_ROOT"; }
+ser_runner() { "$TEST_BUN" "$TEST_RUNNER" "$@"; }
 for fn in rsg_extract rsg_tokens_safe rsg_argv_looks_readonly rsg_allow_cmd rsg_exec_pipeline rsg_observe rsg_compare rsg_run; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done

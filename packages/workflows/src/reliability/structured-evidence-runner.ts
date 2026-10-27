@@ -2331,7 +2331,10 @@ function explicitAttemptId(args: readonly string[], flag: string, envName: strin
   return null;
 }
 
+let trustedTestAdapterCall = false;
+
 function requireTrustedCli(): boolean {
+  if (trustedTestAdapterCall) return true;
   if (trustedSelfMatches(process.cwd())) return true;
   process.stderr.write('NEVER_RAN missing trusted structured-evidence-runner\n');
   return false;
@@ -2410,7 +2413,9 @@ function runCli(): number {
         return 0;
       }
       const commands = readFileSync(commandsPath, 'utf8').split('\n');
-      const summary = runTestCommands(commands, process.cwd(), resolve(logPath));
+      const summary = trustedTestAdapterCall
+        ? runTestCommandsForTesting(commands, process.cwd(), resolve(logPath))
+        : runTestCommands(commands, process.cwd(), resolve(logPath));
       process.stderr.write(`SER_TEST_ATTEMPT_ID=${summary.attempt.attemptId}\n`);
       process.stdout.write(summary.line);
       return 0;
@@ -2651,6 +2656,16 @@ function runCli(): number {
   } catch (error) {
     process.stderr.write(`${(error as Error).message}\n`);
     return 1;
+  }
+}
+
+/** Test-only CLI entry point. Production execution never imports this adapter. */
+export function runCliForTesting(): number {
+  trustedTestAdapterCall = true;
+  try {
+    return runCli();
+  } finally {
+    trustedTestAdapterCall = false;
   }
 }
 

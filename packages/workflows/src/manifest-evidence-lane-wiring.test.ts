@@ -98,6 +98,23 @@ function coreOf(bash: string, marker: string): string {
   return bash.slice(begin, end);
 }
 
+// Production nodes may only resolve the runner from fixed installed harness roots.
+// Behavioral tests inject the checkout runner after the production core has been
+// parsed, so test convenience can never become a workflow-controlled trust path.
+function injectTestRunner(bash: string, marker: string): string {
+  const end = `# ---- END ${marker} core ----`;
+  const runner = JSON.stringify(
+    join(
+      REPO_ROOT,
+      'packages/workflows/src/reliability/structured-evidence-runner-cli.test-adapter.ts'
+    )
+  );
+  return bash.replace(
+    end,
+    `${end}\nser_root() { printf '%s' ${JSON.stringify(REPO_ROOT)}; }\nser_runner() { bun ${runner} "$@"; }`
+  );
+}
+
 describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
   it('never treats the workflow-user-controlled harness root override as trust', () => {
     const lanes = EXPECTED_LANES.map(file => readFileSync(join(LANES_DIR, file), 'utf8'));
@@ -109,6 +126,7 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
       expect(content).not.toContain(
         'git -C "$HARNESS_ROOT_OVERRIDE" remote get-url origin 2>/dev/null'
       );
+      expect(content).not.toContain('SER_TEST_TRUSTED_ROOT');
     }
   });
 
@@ -280,13 +298,16 @@ function runStopTestsNode(opts: {
       'canonical'
     ).bash;
     if (!bash) throw new Error('run-stop-tests has no bash');
-    const rendered = substituteNodeOutputRefs(
-      bash,
-      new Map([
-        ['read-spec', { state: 'completed' as const, output: opts.spec }],
-        ['resolve-test-command', { state: 'completed' as const, output: opts.resolution ?? '' }],
-      ]),
-      true
+    const rendered = injectTestRunner(
+      substituteNodeOutputRefs(
+        bash,
+        new Map([
+          ['read-spec', { state: 'completed' as const, output: opts.spec }],
+          ['resolve-test-command', { state: 'completed' as const, output: opts.resolution ?? '' }],
+        ]),
+        true
+      ),
+      'rst'
     );
     writeFileSync(join(cwd, 'run-stop-tests.sh'), rendered);
     const proc = Bun.spawnSync(['bash', './run-stop-tests.sh'], {
@@ -295,7 +316,6 @@ function runStopTestsNode(opts: {
         ...process.env,
         ARTIFACTS_DIR: artifacts,
         NODE_ENV: 'test',
-        SER_TEST_TRUSTED_ROOT: REPO_ROOT,
       },
       stdout: 'pipe',
       stderr: 'pipe',
@@ -560,14 +580,17 @@ function runStopGrepsNode(opts: {
       'canonical'
     ).bash;
     if (!bash) throw new Error('run-stop-greps has no bash');
-    const rendered = substituteNodeOutputRefs(
-      bash,
-      new Map([['read-spec', { state: 'completed' as const, output: opts.spec }]]),
-      true
+    const rendered = injectTestRunner(
+      substituteNodeOutputRefs(
+        bash,
+        new Map([['read-spec', { state: 'completed' as const, output: opts.spec }]]),
+        true
+      ),
+      'rsg'
     );
     const proc = Bun.spawnSync(['bash', '-c', rendered], {
       cwd,
-      env: { ...process.env, NODE_ENV: 'test', SER_TEST_TRUSTED_ROOT: REPO_ROOT },
+      env: { ...process.env, NODE_ENV: 'test' },
       stdout: 'pipe',
       stderr: 'pipe',
     });

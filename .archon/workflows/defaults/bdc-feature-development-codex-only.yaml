@@ -1817,13 +1817,6 @@ nodes:
       # packages/workflows/src/reliability/structured-evidence-runner.ts.
       ser_root() {
         local c root pkg
-        if [ "${NODE_ENV:-}" = test ]; then
-          root="${SER_TEST_TRUSTED_ROOT:-}"
-          if [ -n "$root" ] && [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$root/packages/workflows/package.json" ]; then
-            printf '%s' "$root"
-            return 0
-          fi
-        fi
         for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
           pkg="$c/packages/workflows/package.json"
           if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
@@ -2185,13 +2178,6 @@ nodes:
       # find -exec/-execdir/-ok/-delete and decoded sort/grep flag bypasses are refused.
       ser_root() {
         local c root pkg
-        if [ "${NODE_ENV:-}" = test ]; then
-          root="${SER_TEST_TRUSTED_ROOT:-}"
-          if [ -n "$root" ] && [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$root/packages/workflows/package.json" ]; then
-            printf '%s' "$root"
-            return 0
-          fi
-        fi
         for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
           pkg="$c/packages/workflows/package.json"
           if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
@@ -4292,13 +4278,6 @@ nodes:
       # ---- BEGIN sme core (byte-identical across lanes; extracted by unit test) ----
       ser_root() {
         local c root pkg
-        if [ "${NODE_ENV:-}" = test ]; then
-          root="${SER_TEST_TRUSTED_ROOT:-}"
-          if [ -n "$root" ] && [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$root/packages/workflows/package.json" ]; then
-            printf '%s' "$root"
-            return 0
-          fi
-        fi
         for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
           pkg="$c/packages/workflows/package.json"
           if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
@@ -4422,13 +4401,6 @@ nodes:
       # ---- BEGIN mec core (byte-identical across lanes; extracted by unit test) ----
       ser_root() {
         local c root pkg
-        if [ "${NODE_ENV:-}" = test ]; then
-          root="${SER_TEST_TRUSTED_ROOT:-}"
-          if [ -n "$root" ] && [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$root/packages/workflows/package.json" ]; then
-            printf '%s' "$root"
-            return 0
-          fi
-        fi
         for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
           pkg="$c/packages/workflows/package.json"
           if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
@@ -4602,13 +4574,6 @@ nodes:
       #   rather than executing.
       ser_root() {
         local c root pkg
-        if [ "${NODE_ENV:-}" = test ]; then
-          root="${SER_TEST_TRUSTED_ROOT:-}"
-          if [ -n "$root" ] && [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$root/packages/workflows/package.json" ]; then
-            printf '%s' "$root"
-            return 0
-          fi
-        fi
         for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
           pkg="$c/packages/workflows/package.json"
           if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then

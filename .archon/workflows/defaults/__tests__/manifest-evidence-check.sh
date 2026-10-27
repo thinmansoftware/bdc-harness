@@ -45,7 +45,9 @@ assert_not_contains() {
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 export NODE_ENV=test
-export SER_TEST_TRUSTED_ROOT="$(cd "$HERE/../../../.." && pwd)"
+TEST_REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
+TEST_RUNNER="$TEST_REPO_ROOT/packages/workflows/src/reliability/structured-evidence-runner-cli.test-adapter.ts"
+TEST_BUN="$(command -v bun)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-astra.yaml
@@ -86,6 +88,9 @@ if [ -z "$MEC_CORE" ]; then
 fi
 eval "$MEC_CORE"
 eval "$SME_CORE"
+# Test-only dependency injection: production ser_root remains fixed to installed
+# harness locations and never consumes a caller-controlled checkout path.
+ser_runner() { "$TEST_BUN" "$TEST_RUNNER" "$@"; }
 for fn in mec_field mec_check sme_field sme_process; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
@@ -389,32 +394,40 @@ echo "Tests: 0/0"
 exit 0
 EOF
 chmod +x "$MIX/ok.sh" "$MIX/nocount.sh" "$MIX/zero.sh"
-printf 'bash ./ok.sh\nbash ./nocount.sh\n' > "$MIX/cmds"
+printf 'bash ./ok.sh && bash ./nocount.sh\n' > "$MIX/cmds"
 ( cd "$MIX" && ARTIFACTS_DIR="$MIX_ART" ser_runner run-tests --commands ./cmds --log "$MIX_ART/nc.log" >/dev/null )
+MIX_ATTEMPT_ID="$(cat "$MIX_ART/evidence/attempts/current-tests")"
+MIX_CHAIN_STATUSES="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(",".join(x["status"] for x in d["members"][0]["chain"]))' "$MIX_ART/evidence/attempts/$MIX_ATTEMPT_ID.json")"
+assert_eq "real chained attempt persists both segment statuses" "PASSED,COUNTS_UNPARSED" "$MIX_CHAIN_STATUSES"
 R="$(
   cd "$MIX" || exit 1
   export ARTIFACTS_DIR="$MIX_ART" SER_REQUIRE_ATTEMPT=1
   err="$(mktemp)"
-  out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE counts_unparsed 0 none_declared 0 0 0 0 0 2>"$err")"
+  stamped="$(printf '%s\n' "$GOOD" | sme_process 'N/A (real chained command had an unparsed required segment)' counts_unparsed 'N/A (spec declares no grep stop conditions)' none_declared 0)"
+  out="$(printf '%s\n' "$stamped" | mec_check PROCEED CODE counts_unparsed 0 none_declared 0 0 0 0 0 2>"$err")"
   rc=$?
   printf '%s|%s|%s' "$rc" "$out" "$(cat "$err")"
   rm -f "$err"
 )"
-assert_eq "pass plus no-count rc" "1" "${R%%|*}"
-assert_not_contains "pass plus no-count is not OK" "OK" "$R"
-printf 'bash ./ok.sh\nbash ./zero.sh\n' > "$MIX/cmds"
+assert_eq "stamp plus manifest gate refuses real pass-and-no-count chain" "1" "${R%%|*}"
+assert_not_contains "real pass-and-no-count chain is not OK" "OK" "$R"
+printf 'bash ./ok.sh && bash ./zero.sh\n' > "$MIX/cmds"
 ( cd "$MIX" && ARTIFACTS_DIR="$MIX_ART" ser_runner run-tests --commands ./cmds --log "$MIX_ART/zero.log" >/dev/null )
+MIX_ATTEMPT_ID="$(cat "$MIX_ART/evidence/attempts/current-tests")"
+MIX_CHAIN_STATUSES="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(",".join(x["status"] for x in d["members"][0]["chain"]))' "$MIX_ART/evidence/attempts/$MIX_ATTEMPT_ID.json")"
+assert_eq "real zero-count chain persists both segment statuses" "PASSED,FAILED" "$MIX_CHAIN_STATUSES"
 R="$(
   cd "$MIX" || exit 1
   export ARTIFACTS_DIR="$MIX_ART" SER_REQUIRE_ATTEMPT=1
   err="$(mktemp)"
-  out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE passed 0 none_declared 0 0 0 0 0 2>"$err")"
+  stamped="$(printf '%s\n' "$GOOD" | sme_process '0/0 (bash ./ok.sh && bash ./zero.sh) -- FAILED, exit 0' failed 'N/A (spec declares no grep stop conditions)' none_declared 0)"
+  out="$(printf '%s\n' "$stamped" | mec_check PROCEED CODE failed 0 none_declared 0 0 0 0 0 2>"$err")"
   rc=$?
   printf '%s|%s|%s' "$rc" "$out" "$(cat "$err")"
   rm -f "$err"
 )"
-assert_eq "pass plus 0/0 rc" "1" "${R%%|*}"
-assert_not_contains "pass plus 0/0 is not OK" "OK" "$R"
+assert_eq "stamp plus manifest gate refuses real pass-and-zero chain" "1" "${R%%|*}"
+assert_not_contains "real pass-and-zero chain is not OK" "OK" "$R"
 unset SER_REQUIRE_ATTEMPT ARTIFACTS_DIR SER_RUN_ID SER_REPO SER_TEST_ATTEMPT_ID SER_GREP_ATTEMPT_ID
 rm -rf "$BIND" "$BIND_ART" "$MIX" "$MIX_ART"
 
