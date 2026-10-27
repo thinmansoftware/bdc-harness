@@ -119,7 +119,14 @@ for lane in $LANES; do
     hit && $0 ~ /^    depends_on:/ { print; exit }
     hit && $0 ~ /^  - id: / { exit }
   ' "$DEFAULTS/$lane")"
-  assert_eq "run-stop-tests depends_on $lane" "    depends_on: [format-autofix, resolve-test-command, resolve-review-base]" "$rst_dep"
+  expected_dep="    depends_on: [format-autofix, resolve-test-command, resolve-review-base]"
+  case "$lane" in
+    bdc-feature-development-fusion-cx-kimi.yaml|bdc-feature-development-kimi-k3.yaml|bdc-feature-development-zero-claude.yaml)
+      # These lanes must not declare resolve-review-base. Base SHA falls back to run-start-sha.txt.
+      expected_dep="    depends_on: [format-autofix, resolve-test-command]"
+      ;;
+  esac
+  assert_eq "run-stop-tests depends_on $lane" "$expected_dep" "$rst_dep"
   rst_timeout="$(awk '
     $0 ~ /^  - id: run-stop-tests$/ { hit = 1; next }
     hit && $0 ~ /^    timeout:/ { print; exit }
@@ -1274,10 +1281,15 @@ for a in "$@"; do
 done
 mode="$(jq -r '.mode' fixture.json)"
 file="$(jq -r '.file' fixture.json)"
-if [ "$mode" = "json" ]; then
+if [ "$mode" = "json" ] || [ "$mode" = "abs" ]; then
   echo "FAIL $file"
   if [ -n "$out" ]; then
-    jq -n --slurpfile f fixture.json '{testResults:[{name:$f[0].file, assertionResults:[($f[0].names[] | {fullName:., status:"failed"})]}]}' > "$out"
+    if [ "$mode" = "abs" ]; then
+      name="$PWD/$file"
+    else
+      name="$file"
+    fi
+    jq -n --arg name "$name" --slurpfile f fixture.json '{testResults:[{name:$name, assertionResults:[($f[0].names[] | {fullName:., status:"failed"})]}]}' > "$out"
   fi
   n="$(jq -r '.names | length' fixture.json)"
   echo "Tests: $n failed, 0 passed, $n total"
@@ -1321,8 +1333,74 @@ assert_eq "t9b mode" "file-count" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T9
 assert_eq "t9b newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T9B")"
 assert_eq "t9b status" "failed" "$(rst_out_field TESTS_STATUS "$T9B")"
 assert_not_contains "t9b not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T9B")"
+echo "--- Test 9c: absolute JSON paths from different checkouts are the same failure ---"
+T9C="$(rst_vitest_case '{"mode":"abs","file":"X","names":["same test"]}' '{"mode":"abs","file":"X","names":["same test"]}')"
+assert_eq "t9c status" "baseline_red" "$(rst_out_field TESTS_STATUS "$T9C")"
+assert_eq "t9c newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T9C")"
+assert_eq "t9c mode" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T9C")"
+assert_not_contains "t9c not a new absolute path" "/X::same test" "$(rst_out_field TESTS_LINE "$T9C")"
 export PATH="$ORIG_PATH"
 rm -rf "$VBIN"
+
+echo "--- Test 10: FAIL headers that do not cover the failure count stay blocking ---"
+T10="$(mktemp -d)"
+rst_git_init "$T10"
+cat > "$T10/t.sh" <<'EOF'
+#!/bin/bash
+echo "FAIL X"
+echo "Tests: 2/3"
+exit 1
+EOF
+printf 'base\n' > "$T10/note.txt"
+rst_commit "$T10" base
+git -C "$T10" update-ref refs/remotes/origin/dev "$(git -C "$T10" rev-parse HEAD)"
+cat > "$T10/t.sh" <<'EOF'
+#!/bin/bash
+echo "FAIL X"
+echo "Tests: 1/3"
+exit 1
+EOF
+printf 'head\n' > "$T10/note.txt"
+rst_commit "$T10" head
+T10_OUT="$(rst_verdict_for "$T10" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t10 status" "failed" "$(rst_out_field TESTS_STATUS "$T10_OUT")"
+assert_not_contains "t10 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T10_OUT")"
+assert_eq "t10 mode" "count" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T10_OUT")"
+assert_eq "t10 newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T10_OUT")"
+rm -rf "$T10"
+
+echo "--- Test 11: an unparsed failure beside a known one stays blocking ---"
+T11="$(mktemp -d)"
+rst_git_init "$T11"
+cat > "$T11/one.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) stale > kept"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+cat > "$T11/two.sh" <<'EOF'
+#!/bin/bash
+echo "1 pass"
+echo "0 fail"
+exit 0
+EOF
+printf 'base\n' > "$T11/note.txt"
+rst_commit "$T11" base
+git -C "$T11" update-ref refs/remotes/origin/dev "$(git -C "$T11" rev-parse HEAD)"
+cat > "$T11/two.sh" <<'EOF'
+#!/bin/bash
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'head\n' > "$T11/note.txt"
+rst_commit "$T11" head
+T11_CMD="$(printf '%s\n' 'bash ./one.sh' 'bash ./two.sh')"
+T11_OUT="$(rst_verdict_for "$T11" "$T11_CMD" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t11 status" "failed" "$(rst_out_field TESTS_STATUS "$T11_OUT")"
+assert_not_contains "t11 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T11_OUT")"
+rm -rf "$T11"
 
 echo
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"

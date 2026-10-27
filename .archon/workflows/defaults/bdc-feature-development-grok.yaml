@@ -2207,6 +2207,9 @@ nodes:
             rm -f "$json"
           fi
         done < "$jsonlist"
+        # Record the checkout that produced this log before any base worktree is removed.
+        # JSON file paths are stripped against this exact prefix plus a slash.
+        printf '### checkout-root: %s\n' "$PWD" >> "$log"
         rm -f "$aug" "$jsonlist"
         printf '%s' "$result"
       }
@@ -2230,8 +2233,9 @@ nodes:
       #   directly under a bare FAIL header. A bare "FAIL <file>" is a file identity
       #   only (one count per matching line), never a test identity. Reporter JSON
       #   ("### json-report: <path>", testResults[].assertionResults[] status=failed)
-      #   contributes "<file>::<fullName>" and, when any exist, replaces text test
-      #   identities. File counts are still reported.
+      #   contributes "<file>::<fullName>" after stripping a "### checkout-root: <pwd>"
+      #   prefix only when that exact prefix plus a slash is present. JSON identities
+      #   are added to text identities; they never replace them. File counts stay separate.
       rst_failing_names() {
         local text text_out json_out esc
         text="$(cat)"
@@ -2249,6 +2253,7 @@ nodes:
             if (s != "" && !(s in seen)) { seen[s] = 1; print "T\t" s }
           }
           /^### json-report: / { next }
+          /^### checkout-root: / { next }
           /^[ \t]*\(fail\)[ \t]+/ {
             line = $0
             sub(/^[ \t]*\(fail\)[ \t]+/, "", line)
@@ -2302,16 +2307,44 @@ nodes:
             for (f in files) print "F\t" f "\t" files[f]
           }
         ')"
-        json_out="$(printf '%s\n' "$text" | sed -n 's/^### json-report: //p' | while IFS= read -r jp || [ -n "$jp" ]; do
-          [ -s "$jp" ] || continue
-          jq -r '.testResults[]? | .name as $f | .assertionResults[]? | select(.status == "failed") | "\($f)::\(.fullName)"' "$jp" 2>/dev/null || true
-        done)"
-        if printf '%s\n' "$json_out" | grep -q .; then
-          printf '%s\n' "$json_out" | awk 'NF { print "T\t" $0 }'
-          printf '%s\n' "$text_out" | awk -F '\t' '$1 == "F" { print }'
-        else
+        json_out="$(
+          root="$(printf '%s\n' "$text" | sed -n 's/^### checkout-root: //p' | head -n 1)"
+          root="$(printf '%s' "$root" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s:/*$::')"
+          printf '%s\n' "$text" | sed -n 's/^### json-report: //p' | while IFS= read -r jp || [ -n "$jp" ]; do
+            [ -s "$jp" ] || continue
+            jq -r '.testResults[]? | .name as $f | .assertionResults[]? | select(.status == "failed") | [$f, (.fullName // "")] | @tsv' "$jp" 2>/dev/null | while IFS="$(printf '\t')" read -r file full || [ -n "${file:-}" ]; do
+              [ -n "${file:-}" ] || continue
+              rel="$file"
+              if [ -n "$root" ]; then
+                case "$rel" in
+                  "$root"/*) rel="${rel#"$root"/}" ;;
+                esac
+              fi
+              rel="$(printf '%s' "$rel" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+              full="$(printf '%s' "${full:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+              printf '%s::%s\n' "$rel" "$full"
+            done
+          done
+        )"
+        {
           printf '%s\n' "$text_out"
-        fi
+          printf '%s\n' "$json_out" | awk '
+            NF {
+              s = $0
+              sub(/\r$/, "", s)
+              sub(/^[ \t]+/, "", s)
+              sub(/[ \t]+$/, "", s)
+              if (s != "") print "T\t" s
+            }
+          '
+        } | awk -F '\t' '
+          $1 == "T" {
+            id = substr($0, 3)
+            if (!(id in seen)) { seen[id] = 1; print }
+            next
+          }
+          $1 == "F" { print }
+        '
       }
       # rst_base_pass <base-sha> <commands-file> <base-log>
       #   Detached temporary worktree at <base-sha>. Never checks the base out in the
@@ -2492,12 +2525,24 @@ nodes:
           rst_emit_verdict "$base_sha" "$bstatus" "$bp" "$bt" 0 n/a "$base_exit" no "$base_log" failed "$final_line"
           return 0
         fi
-        local ht_n bt_n hf_n bf_n
+        local ht_n bt_n hf_n bf_n hf_sum bf_sum head_obs base_obs names_complete=0 file_cover=0
+        head_obs=$((ht - hp))
+        base_obs=$((bt - bp))
+        if [ "$head_obs" -lt 0 ]; then head_obs=0; fi
+        if [ "$base_obs" -lt 0 ]; then base_obs=0; fi
         ht_n="$(printf '%s\n' "$head_records" | awk -F '\t' '$1=="T"{c++} END{print c+0}')"
         bt_n="$(printf '%s\n' "$base_records" | awk -F '\t' '$1=="T"{c++} END{print c+0}')"
         hf_n="$(printf '%s\n' "$head_records" | awk -F '\t' '$1=="F"{c++} END{print c+0}')"
         bf_n="$(printf '%s\n' "$base_records" | awk -F '\t' '$1=="F"{c++} END{print c+0}')"
-        if [ "$ht_n" -gt 0 ] && [ "$bt_n" -gt 0 ]; then
+        hf_sum="$(printf '%s\n' "$head_records" | awk -F '\t' '$1=="F"{s+=$3} END{print s+0}')"
+        bf_sum="$(printf '%s\n' "$base_records" | awk -F '\t' '$1=="F"{s+=$3} END{print s+0}')"
+        if [ "$ht_n" -ge 1 ] && [ "$bt_n" -ge 1 ] && [ "$ht_n" -ge "$head_obs" ] && [ "$bt_n" -ge "$base_obs" ]; then
+          names_complete=1
+        fi
+        if [ "$hf_n" -ge 1 ] && [ "$bf_n" -ge 1 ] && [ "$hf_sum" -ge "$head_obs" ] && [ "$bf_sum" -ge "$base_obs" ]; then
+          file_cover=1
+        fi
+        if [ "$names_complete" -eq 1 ]; then
           mode="names"
           names_h="$(mktemp)"
           names_b="$(mktemp)"
@@ -2507,12 +2552,17 @@ nodes:
           if [ -z "$only" ]; then
             newly=0
             shown="$(LC_ALL=C comm -12 "$names_h" "$names_b" | head -n 5 | paste -sd ',' - | sed 's/,/, /g')"
+            head_status="baseline_red"
+            failed_form=0
           else
             newly="$(printf '%s\n' "$only" | grep -c . || true)"
             shown="$(printf '%s\n' "$only" | head -n 5 | paste -sd ',' - | sed 's/,/, /g')"
+            head_status="failed"
+            failed_form=1
           fi
           rm -f "$names_h" "$names_b"
-        elif [ "$hf_n" -gt 0 ] && [ "$bf_n" -gt 0 ]; then
+        elif [ "$file_cover" -eq 1 ]; then
+          # File headers never authorize baseline_red, including a zero delta.
           mode="file-count"
           newly="$(awk -F '\t' '
             NR==FNR && $1=="F" { b[$2]=$3; next }
@@ -2528,20 +2578,20 @@ nodes:
             }
           ' <(printf '%s\n' "$base_records") <(printf '%s\n' "$head_records"))"
           shown=""
-        else
-          mode="count"
-          hf=$((ht - hp))
-          bf=$((bt - bp))
-          newly=$((hf - bf))
-          if [ "$newly" -lt 0 ]; then newly=0; fi
-          shown=""
-        fi
-        if [ "$newly" -eq 0 ]; then
-          head_status="baseline_red"
-          failed_form=0
-        else
           head_status="failed"
           failed_form=1
+        else
+          mode="count"
+          newly=$((head_obs - base_obs))
+          if [ "$newly" -lt 0 ]; then newly=0; fi
+          shown=""
+          if [ "$newly" -eq 0 ] && [ "$ht_n" -eq 0 ] && [ "$bt_n" -eq 0 ] && [ "$hf_n" -eq 0 ] && [ "$bf_n" -eq 0 ]; then
+            head_status="baseline_red"
+            failed_form=0
+          else
+            head_status="failed"
+            failed_form=1
+          fi
         fi
         final_line="$(rst_format_compared_line "$hp" "$ht" "$cmd" "$exit_code" "$bp" "$bt" "$sha8" "$newly" "$shown" "$failed_form" "$suffix" 0)"
         rst_emit_verdict "$base_sha" "$bstatus" "$bp" "$bt" "$newly" "$mode" "$base_exit" yes "$base_log" "$head_status" "$final_line"
