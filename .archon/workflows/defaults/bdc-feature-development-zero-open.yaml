@@ -773,9 +773,72 @@ nodes:
       # pinned at allocation). When origin/$BASE_BRANCH exists locally, a missing
       # merge-base means this worktree was cut from a disjoint lane -- fail HERE,
       # before implement, instead of at a tail node after a PR was already opened.
+      # ---- BEGIN bmd core (byte-identical across lanes; extracted by unit test) ----
+      bmd_resolve_merge_base() {
+        local base_ref="$1" head_ref="$2" merge_base shallow deepened=0 increment
+        local step="${BMD_DEEPEN_STEP:-200}" cap="${BMD_DEEPEN_CAP:-1000}"
+        local base_branch upstream upstream_remote upstream_branch fetch_err
+
+        merge_base=$(git merge-base "$base_ref" "$head_ref" 2>/dev/null) && {
+          printf '%s\n' "$merge_base"
+          return 0
+        }
+
+        shallow=$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false')
+        case "$step" in ''|*[!0-9]*|0) echo "worktree_not_on_declared_base_lane: invalid BMD_DEEPEN_STEP: $step" >&2; return 1 ;; esac
+        case "$cap" in ''|*[!0-9]*|0) echo "worktree_not_on_declared_base_lane: invalid BMD_DEEPEN_CAP: $cap" >&2; return 1 ;; esac
+        base_branch=${base_ref#refs/remotes/origin/}
+
+        if [ "$shallow" = "true" ]; then
+          upstream=$(git rev-parse --abbrev-ref --symbolic-full-name "${head_ref}@{upstream}" 2>/dev/null || true)
+          if [ -n "$upstream" ] && [ "$upstream" != "$head_ref@{upstream}" ]; then
+            upstream_remote=${upstream%%/*}
+            upstream_branch=${upstream#*/}
+          fi
+
+          while [ "$deepened" -lt "$cap" ]; do
+            increment=$step
+            if [ "$increment" -gt $((cap - deepened)) ]; then
+              increment=$((cap - deepened))
+            fi
+            if ! fetch_err=$(git fetch "--deepen=$increment" origin "$base_branch" 2>&1 >/dev/null); then
+              echo "worktree_not_on_declared_base_lane: merge_base_fetch_failed: $(printf '%s\n' "$fetch_err" | head -n 1)" >&2
+              return 1
+            fi
+            if [ -n "${upstream_remote:-}" ]; then
+              if ! fetch_err=$(git fetch "--deepen=$increment" "$upstream_remote" "$upstream_branch" 2>&1 >/dev/null); then
+                echo "worktree_not_on_declared_base_lane: merge_base_fetch_failed: $(printf '%s\n' "$fetch_err" | head -n 1)" >&2
+                return 1
+              fi
+            fi
+            deepened=$((deepened + increment))
+            merge_base=$(git merge-base "$base_ref" "$head_ref" 2>/dev/null) && {
+              printf '%s\n' "$merge_base"
+              return 0
+            }
+            shallow=$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false')
+            [ "$shallow" = "true" ] || break
+          done
+
+          if [ "$shallow" = "true" ]; then
+            if ! fetch_err=$(git fetch --unshallow origin 2>&1 >/dev/null); then
+              echo "worktree_not_on_declared_base_lane: merge_base_fetch_failed: $(printf '%s\n' "$fetch_err" | head -n 1)" >&2
+              return 1
+            fi
+            shallow=$(git rev-parse --is-shallow-repository 2>/dev/null || printf 'false')
+            merge_base=$(git merge-base "$base_ref" "$head_ref" 2>/dev/null) && {
+              printf '%s\n' "$merge_base"
+              return 0
+            }
+          fi
+        fi
+
+        echo "worktree_not_on_declared_base_lane: no_common_history: HEAD shares no history with origin/${base_branch} (shallow=${shallow}, deepened=${deepened})" >&2
+        return 1
+      }
+      # ---- END bmd core ----
       if [ -n "${BASE_BRANCH:-}" ] && git rev-parse --verify "refs/remotes/origin/${BASE_BRANCH}^{commit}" >/dev/null 2>&1; then
-        if ! git merge-base "refs/remotes/origin/${BASE_BRANCH}" HEAD >/dev/null 2>&1; then
-          echo "worktree_not_on_declared_base_lane: HEAD shares no history with origin/${BASE_BRANCH}" >&2
+        if ! RUN_SCOPE_MERGE_BASE=$(bmd_resolve_merge_base "refs/remotes/origin/${BASE_BRANCH}" HEAD); then
           exit 1
         fi
       fi
@@ -785,6 +848,10 @@ nodes:
       }
       mkdir -p "$ARTIFACTS_DIR"
       printf '%s\n' "$RUN_SCOPE_SHA" > "$ARTIFACTS_DIR/run-scope-sha.txt"
+      if [ -n "${RUN_SCOPE_MERGE_BASE:-}" ]; then
+        printf "%s\n" "$RUN_SCOPE_MERGE_BASE" > "$ARTIFACTS_DIR/run-scope-merge-base.txt"
+        echo "RUN_SCOPE_MERGE_BASE=$RUN_SCOPE_MERGE_BASE"
+      fi
       echo "RUN_SCOPE_SHA=$RUN_SCOPE_SHA"
 
   - id: prep-dependencies
