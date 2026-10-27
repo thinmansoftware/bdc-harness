@@ -212,12 +212,17 @@ jobs:
       - name: Smoke test -- Overseer native review sandbox as application user
         run: |
           test "$(docker exec --user reviewer archon-smoke id -u)" = 1002
-          ! docker exec --user reviewer archon-smoke cat /run/secrets/thinman-overseer.pem
-          ! docker exec --user reviewer archon-smoke sh -c 'ls /.archon/workspaces'
-          ! docker exec --user reviewer archon-smoke sh -c 'cat /home/appuser/.codex/auth.json'
-          ! docker exec --user reviewer archon-smoke sh -c 'cat /proc/1/environ'
+          assert_denied() {
+            name="$1"; shift
+            if output=$("$@" 2>&1); then echo "FAIL: $name succeeded"; exit 1; fi
+            echo "$output" | grep -Eqi 'Permission denied|Operation not permitted|EACCES' || { echo "FAIL: $name failed for an unexpected reason: $output"; exit 1; }
+          }
+          assert_denied secret_read docker exec --user reviewer archon-smoke cat /run/secrets/thinman-overseer.pem
+          assert_denied workspaces_read docker exec --user reviewer archon-smoke sh -c 'ls /.archon/workspaces'
+          assert_denied appuser_auth_read docker exec --user reviewer archon-smoke sh -c 'cat /home/appuser/.codex/auth.json'
+          assert_denied parent_environment_read docker exec --user reviewer archon-smoke sh -c 'cat /proc/1/environ'
           docker exec --user appuser archon-smoke bun run scripts/overseer-review-sandbox-smoke.ts
-          test "$(docker inspect archon-smoke --format '{{.HostConfig.Privileged}} {{json .HostConfig.CapAdd}}')" = 'false null'
+          test "$(docker inspect archon-smoke --format '{{.HostConfig.Privileged}} {{json .HostConfig.CapAdd}}')" = 'false []'
 
       - name: Dump container logs on failure
         if: failure()

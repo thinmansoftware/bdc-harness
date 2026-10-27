@@ -427,6 +427,7 @@ export interface IngestDeps {
     prNumber: number;
     headSha: string;
     baseRef: string;
+    baseSha?: string;
     author: string;
     repeatReason: string | null;
     headCiGreen: boolean;
@@ -638,6 +639,7 @@ export async function ingestPullRequestEvent(
   const prNumber = payload.pull_request?.number ?? payload.number ?? 0;
   const headSha = payload.pull_request?.head?.sha ?? '';
   const baseRef = payload.pull_request?.base?.ref ?? '';
+  let baseSha = payload.pull_request?.base?.sha ?? '';
   const author = payload.pull_request?.user?.login ?? '';
 
   if (!owner || !repo || !prNumber || !headSha) {
@@ -808,12 +810,13 @@ export async function ingestPullRequestEvent(
   if (deps.fetchPullRequestMergeability) {
     let mergeableState: string | undefined;
     let liveBaseRef = baseRef;
-    let liveBaseSha = payload.pull_request?.base?.sha ?? '';
+    let liveBaseSha = baseSha;
     try {
       const live = await deps.fetchPullRequestMergeability({ owner, repo, prNumber });
       mergeableState = live.mergeableState;
       if (live.baseRef) liveBaseRef = live.baseRef;
       if (live.baseSha) liveBaseSha = live.baseSha;
+      baseSha = liveBaseSha;
     } catch {
       // GitHub returns `unknown` while it is still computing mergeability.
       // A fetch error is the same class: not evidence of a conflict. Blocking
@@ -959,6 +962,7 @@ export async function ingestPullRequestEvent(
       prNumber,
       headSha,
       baseRef,
+      baseSha,
       author,
       repeatReason,
       headCiGreen,

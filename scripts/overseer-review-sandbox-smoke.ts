@@ -68,15 +68,16 @@ try {
 
   const probe = [
     'set -eu',
+    'assert_denied() { name="$1"; shift; output="$("$@" 2>&1)" && { echo "FAIL: $name succeeded"; exit 1; }; printf "%s" "$output" | grep -Eqi "Permission denied|Operation not permitted|Landlock|EACCES|Connection refused|Network is unreachable|blocked" || { echo "FAIL: $name failed for an unexpected reason: $output"; exit 1; }; }',
     'test "$(id -u)" = 1002',
     'test "$(cat allowed.txt)" = allowed',
-    '! cat /run/secrets/thinman-overseer.pem >/dev/null 2>&1',
-    '! cat /home/appuser/.codex/auth.json >/dev/null 2>&1',
-    '! ls /.archon/workspaces >/dev/null 2>&1',
-    '! cat /proc/1/environ >/dev/null 2>&1',
-    `! sh -c 'printf changed >> "$1"' write ${JSON.stringify(outside)}`,
-    `! curl -fsS ${JSON.stringify(url)} >/dev/null 2>&1`,
-    "! env | grep -Eq '^(GITHUB_|GH_|ARCHON_)|(_TOKEN|_KEY|_SECRET)='",
+    'assert_denied secret_read cat /run/secrets/thinman-overseer.pem',
+    'assert_denied appuser_auth_read cat /home/appuser/.codex/auth.json',
+    'assert_denied other_worktrees_read ls /.archon/workspaces',
+    'assert_denied parent_environment_read cat /proc/1/environ',
+    `assert_denied outside_write sh -c 'printf changed >> "$1"' write ${JSON.stringify(outside)}`,
+    `assert_denied loopback_network curl -fsS ${JSON.stringify(url)}`,
+    "if env | grep -Eq '^(GITHUB_|GH_|ARCHON_)|(_TOKEN|_KEY|_SECRET)='; then echo 'FAIL: credential environment succeeded'; exit 1; fi",
   ].join('\n');
   await writeFile(
     `${request}.tmp`,

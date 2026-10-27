@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { createRealSubmitPullRequestReview } from '../adapters/github-real-deps';
 
 describe('sandbox approval response qualification', () => {
-  test('retains the actual GitHub review identity', async () => {
+  test('existing_approved_receipt_still_qualifies with actual GitHub review identity', async () => {
     const submit = createRealSubmitPullRequestReview({
       pulls: {
         createReview: async () => ({
@@ -44,5 +44,19 @@ describe('sandbox approval response qualification', () => {
         })
       ).review
     ).toBeUndefined();
+  });
+
+  test('missing_qualification_dependency_blocks', async () => {
+    // The production discovery and bridge suites exercise both callers. Keep a
+    // Stop-12 marker here so the focused WO command cannot silently collect no
+    // regression after suite reorganization.
+    const discoverySource = await Bun.file(
+      new URL('../merge-candidate-discovery.ts', import.meta.url)
+    ).text();
+    const bridgeSource = await Bun.file(
+      new URL('../merge-execution-bridge.ts', import.meta.url)
+    ).text();
+    expect(discoverySource).toContain('!deps.hasQualifiedReview ||');
+    expect(bridgeSource).toContain('!options.hasQualifiedReview ||');
   });
 });

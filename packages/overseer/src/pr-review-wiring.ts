@@ -406,6 +406,7 @@ export interface ReviewWorkBody {
   prNumber: number;
   headSha: string;
   baseRef: string;
+  baseSha?: string;
   author: string;
   headCiGreen: boolean;
 }
@@ -427,6 +428,7 @@ export function parseReviewWorkBody(body: string): ReviewWorkBody | null {
       prNumber: value.prNumber,
       headSha: value.headSha,
       baseRef: typeof value.baseRef === 'string' ? value.baseRef : '',
+      baseSha: typeof value.baseSha === 'string' ? value.baseSha : '',
       author: typeof value.author === 'string' ? value.author : '',
       headCiGreen: value.headCiGreen === true,
     };
@@ -1013,6 +1015,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
         prNumber: input.prNumber,
         headSha: input.headSha,
         baseRef: input.baseRef,
+        baseSha: input.baseSha ?? '',
         author: input.author,
         headCiGreen: input.headCiGreen,
       };
