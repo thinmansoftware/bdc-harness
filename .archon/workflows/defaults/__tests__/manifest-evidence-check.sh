@@ -44,8 +44,10 @@ assert_not_contains() {
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
+export HARNESS_ROOT_OVERRIDE="$(cd "$HERE/../../../.." && pwd)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
+bdc-feature-development-astra.yaml
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
 bdc-feature-development-cursor.yaml
@@ -87,17 +89,17 @@ for fn in mec_field mec_check sme_field sme_process; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: mec core byte-identical across all 12 lanes ---"
+echo "--- Parity: mec core byte-identical across all 13 lanes ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$MEC_CORE" "$(extract_core "$DEFAULTS/$lane" mec)"
 done
 
-echo "--- Parity: sme core byte-identical across all 12 lanes ---"
+echo "--- Parity: sme core byte-identical across all 13 lanes ---"
 for lane in $LANES; do
   assert_eq "sme parity $lane" "$SME_CORE" "$(extract_core "$DEFAULTS/$lane" sme)"
 done
 
-echo "--- Parity: evidence call sites byte-identical across all 12 lanes ---"
+echo "--- Parity: evidence call sites byte-identical across all 13 lanes ---"
 SME_CALL="$(extract_call "$CANONICAL_YAML" sme_process)"
 MEC_CALL="$(extract_call "$CANONICAL_YAML" mec_check)"
 for lane in $LANES; do
@@ -167,9 +169,10 @@ echo "--- Test 7: no greps declared, Grep assertions: N/A -> OK ---"
 R="$(run_check "$NA_GREPS" PROCEED CODE passed 0 none_declared)"
 assert_eq "rc 0 / OK" "0|OK|" "$R"
 
-echo "--- Test 7b: declared greps with incomplete execution -> admitted ---"
+echo "--- Test 7b: incomplete evidence with dropped=2 is refused ---"
 R="$(run_check "$GOOD" PROCEED CODE passed 5 incomplete 0 2 2 1 0)"
-assert_eq "incomplete greps admitted" "0|OK|" "$R"
+assert_eq "dropped incomplete rc 1" "1" "${R%%|*}"
+assert_contains "STOP_GREP_REJECTED names the drop" "STOP_GREP_REJECTED:" "$R"
 
 echo "--- Test 7c: declared greps with a mismatch -> error ---"
 R="$(run_check "$GOOD" PROCEED CODE passed 5 mismatch 0 5 0 0 1)"
@@ -230,7 +233,7 @@ assert_contains "FP-6 mismatch evidence error" "EVIDENCE_ERROR:" "$R"
 if printf '%s\n' "$R" | grep -Fq 'SPEC_DEFECT'; then FAIL=$((FAIL + 1)); echo "FAIL: FP-6 must not be SPEC_DEFECT"; else PASS=$((PASS + 1)); echo "PASS: FP-6 must not be SPEC_DEFECT"; fi
 
 echo "--- Test FP-7: lane parity is deterministic ---"
-assert_eq "FP-7 lane count" "12" "$(printf '%s\n' $LANES | grep -c .)"
+assert_eq "FP-7 lane count" "13" "$(printf '%s\n' $LANES | grep -c .)"
 
 echo "--- Test 9: non-PROCEED paths are not gated ---"
 R="$(run_check "$NA_TESTS" ALREADY_SATISFIED CODE "" 0 "")"
@@ -248,6 +251,171 @@ echo "--- mec_field ---"
 assert_eq "TESTS_CLASS" "CODE" "$(mec_field TESTS_CLASS "$(printf 'TESTS_CLASS=CODE\nTESTS_STATUS=passed')")"
 assert_eq "GREP_DECLARED" "9" "$(mec_field GREP_DECLARED "$(printf 'GREP_DECLARED=9\nGREP_STATUS=passed')")"
 assert_eq "missing -> empty" "" "$(mec_field GREP_DECLARED "")"
+
+echo "--- unresolved selected-stage greps fail closed in every mec core ---"
+for lane in $LANES; do
+  if (
+    unset SER_REQUIRE_ATTEMPT
+    eval "$(extract_core "$DEFAULTS/$lane" mec)"
+    err="$(mktemp)"
+    out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE passed 0 incomplete 0 0 0 1 0 2>"$err")"
+    rc=$?
+    printf '%s' "$out" | grep -q OK && exit 1
+    [ "$rc" -eq 1 ] || exit 1
+    grep -q 'EVIDENCE_ERROR' "$err" || exit 1
+    rm -f "$err"
+  ); then
+    PASS=$((PASS + 1)); echo "PASS: unresolved mec $lane"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL: unresolved mec $lane"
+  fi
+done
+
+R="$(run_check "$NA_GREPS" PROCEED CODE passed 0 none_declared)"
+assert_eq "none_declared zero declarations stay OK" "0|OK|" "$R"
+
+prepare_passing_attempt() {
+  local repo="$1" art="$2" run_id="$3"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email t@example.com
+  git -C "$repo" config user.name Test
+  printf 'base\n' > "$repo/README"
+  printf 'v1\n' > "$repo/src.js"
+  git -C "$repo" add README src.js
+  git -C "$repo" commit -qm base
+  cat > "$repo/ok.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+  chmod +x "$repo/ok.sh"
+  printf 'bash ./ok.sh\n' > "$repo/cmds"
+  (
+    cd "$repo" || exit 1
+    ARTIFACTS_DIR="$art" SER_RUN_ID="$run_id" SER_REPO="thinmansoftware/bdc-harness" \
+      ser_runner run-tests --commands ./cmds --log "$art/stop-tests.log" >/dev/null
+    ARTIFACTS_DIR="$art" SER_RUN_ID="$run_id" SER_REPO="thinmansoftware/bdc-harness" \
+      printf 'grep -c base README\teq\t1\nDECLARED\t1\n' | ser_runner run-greps >/dev/null
+  )
+}
+
+mec_at() {
+  local repo="$1" art="$2" run_id="$3" repo_name="$4"
+  (
+    cd "$repo" || exit 1
+    export ARTIFACTS_DIR="$art" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID="$run_id"
+    if [ -n "$repo_name" ]; then export SER_REPO="$repo_name"; else unset SER_REPO; fi
+    err="$(mktemp)"
+    out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE passed 0 none_declared 0 0 0 0 0 2>"$err")"
+    rc=$?
+    printf '%s|%s|%s' "$rc" "$out" "$(cat "$err")"
+    rm -f "$err"
+  )
+}
+
+echo "--- attempt binding and mixed counts through manifest gate ---"
+BIND="$(mktemp -d)"
+BIND_ART="$(mktemp -d)"
+prepare_passing_attempt "$BIND" "$BIND_ART" run-a
+R="$(mec_at "$BIND" "$BIND_ART" run-a "")"
+assert_eq "blank live repo stays OK" "0|OK|" "$R"
+R="$(mec_at "$BIND" "$BIND_ART" run-a thinmansoftware/other)"
+assert_eq "conflicting SER_REPO rc" "1" "${R%%|*}"
+assert_not_contains "conflicting SER_REPO is not OK" "OK" "$R"
+assert_contains "conflicting SER_REPO names authority" "authority-repo" "$R"
+git -C "$BIND" commit --allow-empty -qm "identical tested bytes"
+R="$(mec_at "$BIND" "$BIND_ART" run-a thinmansoftware/bdc-harness)"
+assert_eq "identical-tree descendant stays OK" "0|OK|" "$R"
+R="$(mec_at "$BIND" "$BIND_ART" run-b thinmansoftware/bdc-harness)"
+assert_eq "cross-run replay rc" "1" "${R%%|*}"
+assert_not_contains "cross-run replay is not OK" "OK" "$R"
+assert_contains "cross-run replay names run-id" "run-id" "$R"
+TEST_ID="$(tr -d '[:space:]' < "$BIND_ART/evidence/attempts/current-tests")"
+GREP_ID="$(tr -d '[:space:]' < "$BIND_ART/evidence/attempts/current-greps")"
+R="$(
+  cd "$BIND" || exit 1
+  export ARTIFACTS_DIR="$BIND_ART" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness
+  export SER_TEST_ATTEMPT_ID="$GREP_ID" SER_GREP_ATTEMPT_ID="$TEST_ID"
+  err="$(mktemp)"
+  out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE passed 0 none_declared 0 0 0 0 0 2>"$err")"
+  rc=$?
+  printf '%s|%s|%s' "$rc" "$out" "$(cat "$err")"
+  rm -f "$err"
+)"
+assert_eq "wrong-kind ids rc" "1" "${R%%|*}"
+assert_contains "wrong-kind ids name kind" "attempt-kind" "$R"
+python3 - "$BIND_ART" <<'PY'
+import json, pathlib, sys
+art = pathlib.Path(sys.argv[1]) / "evidence" / "attempts"
+tid = (art / "current-tests").read_text().strip()
+path = art / f"{tid}.json"
+data = json.loads(path.read_text())
+data["members"][0]["status"] = "INCOMPLETE"
+data["members"][0]["reason"] = "planned"
+data["aggregate"] = "INCOMPLETE"
+path.write_text(json.dumps(data))
+PY
+R="$(mec_at "$BIND" "$BIND_ART" run-a thinmansoftware/bdc-harness)"
+assert_eq "incomplete test member rc" "1" "${R%%|*}"
+assert_not_contains "incomplete test member is not OK" "OK" "$R"
+assert_contains "incomplete test member reason prefixed tests:" "tests:" "$R"
+printf 'v2\n' > "$BIND/src.js"
+(
+  cd "$BIND" || exit 1
+  ARTIFACTS_DIR="$BIND_ART" SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness \
+    printf 'grep -c base README\teq\t1\nDECLARED\t1\n' | ser_runner run-greps >/dev/null
+)
+R="$(mec_at "$BIND" "$BIND_ART" run-a thinmansoftware/bdc-harness)"
+assert_eq "stale tests plus later greps rc" "1" "${R%%|*}"
+assert_not_contains "stale tests plus later greps are not OK" "OK" "$R"
+assert_contains "stale tests reason prefixed tests:" "tests:" "$R"
+
+MIX="$(mktemp -d)"
+MIX_ART="$(mktemp -d)"
+cat > "$MIX/ok.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+cat > "$MIX/nocount.sh" <<'EOF'
+#!/bin/sh
+echo "no counts here"
+exit 0
+EOF
+cat > "$MIX/zero.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 0/0"
+exit 0
+EOF
+chmod +x "$MIX/ok.sh" "$MIX/nocount.sh" "$MIX/zero.sh"
+printf 'bash ./ok.sh\nbash ./nocount.sh\n' > "$MIX/cmds"
+( cd "$MIX" && ARTIFACTS_DIR="$MIX_ART" ser_runner run-tests --commands ./cmds --log "$MIX_ART/nc.log" >/dev/null )
+R="$(
+  cd "$MIX" || exit 1
+  export ARTIFACTS_DIR="$MIX_ART" SER_REQUIRE_ATTEMPT=1
+  err="$(mktemp)"
+  out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE counts_unparsed 0 none_declared 0 0 0 0 0 2>"$err")"
+  rc=$?
+  printf '%s|%s|%s' "$rc" "$out" "$(cat "$err")"
+  rm -f "$err"
+)"
+assert_eq "pass plus no-count rc" "1" "${R%%|*}"
+assert_not_contains "pass plus no-count is not OK" "OK" "$R"
+printf 'bash ./ok.sh\nbash ./zero.sh\n' > "$MIX/cmds"
+( cd "$MIX" && ARTIFACTS_DIR="$MIX_ART" ser_runner run-tests --commands ./cmds --log "$MIX_ART/zero.log" >/dev/null )
+R="$(
+  cd "$MIX" || exit 1
+  export ARTIFACTS_DIR="$MIX_ART" SER_REQUIRE_ATTEMPT=1
+  err="$(mktemp)"
+  out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE passed 0 none_declared 0 0 0 0 0 2>"$err")"
+  rc=$?
+  printf '%s|%s|%s' "$rc" "$out" "$(cat "$err")"
+  rm -f "$err"
+)"
+assert_eq "pass plus 0/0 rc" "1" "${R%%|*}"
+assert_not_contains "pass plus 0/0 is not OK" "OK" "$R"
+unset SER_REQUIRE_ATTEMPT ARTIFACTS_DIR SER_RUN_ID SER_REPO SER_TEST_ATTEMPT_ID SER_GREP_ATTEMPT_ID
+rm -rf "$BIND" "$BIND_ART" "$MIX" "$MIX_ART"
 
 echo
 echo "manifest-evidence-check.sh: $PASS passed, $FAIL failed"

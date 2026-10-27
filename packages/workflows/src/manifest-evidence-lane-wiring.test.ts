@@ -99,6 +99,20 @@ function coreOf(bash: string, marker: string): string {
 }
 
 describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
+  it('only honors harness root overrides at canonical harness install locations', () => {
+    const lanes = EXPECTED_LANES.map(file => readFileSync(join(LANES_DIR, file), 'utf8'));
+    expect(lanes.length).toBeGreaterThan(0);
+    for (const content of lanes) {
+      expect(content).toContain('override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE"');
+      expect(content).toContain(
+        '/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/*)'
+      );
+      expect(content).not.toContain(
+        'git -C "$HARNESS_ROOT_OVERRIDE" remote get-url origin 2>/dev/null'
+      );
+    }
+  });
+
   it('every lane with an evidence: manifest_v2 build-manifest is in the expected list', () => {
     expect(MANIFEST_V2_LANES).toEqual(EXPECTED_LANES);
   });
@@ -129,13 +143,12 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         const n = node(nodes, 'run-stop-tests', file);
         expect(n.depends_on).toEqual(['format-autofix', 'resolve-test-command']);
         expect(n.timeout).toBe(1800000);
-        expect(n.bash).toContain(
-          "case \"$cmd\" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1"
-        );
+        expect(n.bash).toContain('structured-evidence-runner.ts');
+        expect(n.bash).toContain('allow-test');
+        expect(n.bash).toContain('run-tests');
         expect(n.bash).toContain(
           'inline-flag rejection: -c -e --eval -p --print -r --require -i -m'
         );
-        expect(n.bash).toContain('timeout 1500 "$@"');
         expect(n.bash).toContain('[ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]');
       });
 
@@ -233,6 +246,16 @@ function rstSpec(command: string): string {
   ].join('\n');
 }
 
+function rstGrepOnlySpec(): string {
+  return [
+    'WO Class: CODE',
+    '',
+    'Stop 1 (grep assertion):',
+    '  grep -c needle fixture.txt',
+    '  Expected: 0',
+  ].join('\n');
+}
+
 function runStopTestsNode(opts: {
   readonly spec: string;
   readonly resolution?: string;
@@ -269,7 +292,7 @@ function runStopTestsNode(opts: {
     writeFileSync(join(cwd, 'run-stop-tests.sh'), rendered);
     const proc = Bun.spawnSync(['bash', './run-stop-tests.sh'], {
       cwd,
-      env: { ...process.env, ARTIFACTS_DIR: artifacts },
+      env: { ...process.env, ARTIFACTS_DIR: artifacts, HARNESS_ROOT_OVERRIDE: REPO_ROOT },
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -310,17 +333,17 @@ describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral
     expect(stdout).not.toContain('repo_test_script');
   });
 
-  it('a spec-declared command that exits 0 with no counts still falls through to repo_test_script', () => {
+  it('a spec-declared command that exits 0 with no counts stays counts_unparsed', () => {
     const { stdout, log } = runStopTestsNode({
       spec: rstSpec('bash ./noop.sh'),
       files: { 'noop.sh': 'exit 0\n' },
     });
-    expect(rstField(stdout, 'TESTS_STATUS')).toBe('passed');
-    expect(rstField(stdout, 'TESTS_SOURCE')).toContain('repo_test_script');
-    expect(rstField(stdout, 'TESTS_SOURCE')).toContain('after: spec_declared');
+    expect(rstField(stdout, 'TESTS_STATUS')).toBe('counts_unparsed');
+    expect(rstField(stdout, 'TESTS_SOURCE')).toBe('spec_declared');
     expect(log).toContain('### run-stop-tests: bash ./noop.sh');
-    expect(log).toContain('### run-stop-tests: bun run test');
-    expect(rstField(stdout, 'TESTS_LINE')).toBe('1/1 (bun run test) [source: repo_test_script]');
+    expect(log).not.toContain('### run-stop-tests: bun run test');
+    expect(rstField(stdout, 'TESTS_LINE')).toContain('bash ./noop.sh');
+    expect(rstField(stdout, 'TESTS_LINE')).toContain('[source: wo-spec]');
   });
 
   it('parsed passing counts from a spec-declared command still report passed', () => {
@@ -347,17 +370,14 @@ describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral
     expect(log).not.toContain('### run-stop-tests: bun run test');
   });
 
-  it('a spec-declared python -c line is not runnable and is never executed', () => {
+  it('a spec-declared python -c line is refused and is not replaced', () => {
     const { stdout, log } = runStopTestsNode({
       spec: rstSpec("python -c 'print(1)'"),
     });
-    expect(rstField(stdout, 'TESTS_STATUS')).toBe('passed');
-    expect(rstField(stdout, 'TESTS_SOURCE')).toContain('repo_test_script');
-    expect(rstField(stdout, 'TESTS_LINE')).toBe('1/1 (bun run test) [source: repo_test_script]');
-    expect(stdout).not.toContain('python -c');
-    expect(log).not.toContain('python -c');
-    expect(log).not.toContain('### run-stop-tests: python');
-    expect(log).toContain('### run-stop-tests: bun run test');
+    expect(rstField(stdout, 'TESTS_STATUS')).toBe('failed');
+    expect(rstField(stdout, 'TESTS_SOURCE')).toBe('spec_declared');
+    expect(log).toContain('refusing non-runnable command');
+    expect(log).not.toContain('### run-stop-tests: bun run test');
   });
 });
 
@@ -487,7 +507,7 @@ describe('project-map runner failure preservation', () => {
   }, 30_000);
   it('unparseable successful map output cannot be replaced with passing fallback evidence', () => {
     const { stdout, log } = runStopTestsNode({
-      spec: rstSpec('bash ./repo-pass.sh'),
+      spec: rstGrepOnlySpec(),
       resolution: `TEST_COMMAND_SOURCE=project-map\nTEST_COMMAND_B64=${Buffer.from('bash ./map-empty.sh').toString('base64')}`,
       files: { 'map-empty.sh': 'echo "No test counts"\n' },
     });
@@ -499,7 +519,7 @@ describe('project-map runner failure preservation', () => {
 
   it('never replaces a failing selected map command with a passing spec or repository script', () => {
     const { stdout, log } = runStopTestsNode({
-      spec: rstSpec('bash ./repo-pass.sh'),
+      spec: rstGrepOnlySpec(),
       resolution: `TEST_COMMAND_SOURCE=project-map\nTEST_COMMAND_MAP_SHA=${'a'.repeat(40)}\nTEST_COMMAND_B64=${Buffer.from('bash ./map-fail.sh').toString('base64')}`,
       files: { 'map-fail.sh': 'exit 3\n' },
     });
@@ -543,7 +563,7 @@ function runStopGrepsNode(opts: {
     );
     const proc = Bun.spawnSync(['bash', '-c', rendered], {
       cwd,
-      env: { ...process.env },
+      env: { ...process.env, HARNESS_ROOT_OVERRIDE: REPO_ROOT },
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -602,7 +622,7 @@ describe('Bun workspace test evidence', () => {
           `import { test, expect } from 'bun:test';\ntest('fixture', () => expect(1).toBe(${failing && name === 'b' ? 2 : 1}));\n`;
       }
       const { stdout, log } = runStopTestsNode({
-        spec: rstSpec('bash ./repo-pass.sh'),
+        spec: rstGrepOnlySpec(),
         resolution: `TEST_COMMAND_SOURCE=project-map\nTEST_COMMAND_B64=${Buffer.from('bun run test').toString('base64')}`,
         files,
       });
@@ -625,7 +645,7 @@ describe('Bun workspace test evidence', () => {
   ]) {
     it(`does not normalize unrelated prefix ${prefix}`, () => {
       const { stdout } = runStopTestsNode({
-        spec: rstSpec('bash ./repo-pass.sh'),
+        spec: rstGrepOnlySpec(),
         resolution: `TEST_COMMAND_SOURCE=project-map\nTEST_COMMAND_B64=${Buffer.from('bash ./prefixed.sh').toString('base64')}`,
         files: { 'prefixed.sh': `printf '%s\\n' '${prefix} 2 pass' '${prefix} 0 fail'\n` },
       });
