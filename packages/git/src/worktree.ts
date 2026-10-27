@@ -275,6 +275,16 @@ export async function removeWorktree(
   });
 }
 
+/** Remove a terminal worktree after its dirty state has been salvaged by the caller. */
+export async function removeWorktreeForce(
+  repoPath: RepoPath,
+  worktreePath: WorktreePath
+): Promise<void> {
+  await execFileAsync('git', ['-C', repoPath, 'worktree', 'remove', '--force', worktreePath], {
+    timeout: 30000,
+  });
+}
+
 /**
  * Get canonical repo path from a worktree path
  * If already canonical, returns the same path

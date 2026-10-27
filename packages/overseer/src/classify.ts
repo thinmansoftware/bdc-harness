@@ -30,6 +30,8 @@ export type ErrorClass =
   | 'npm_not_found' // bun-only container, npm/npx/pnpm/yarn missing
   | 'verify_pre_existing' // verify-* failed on rot unrelated to WO diff
   | 'worktree_collision' // git: branch already used by another worktree
+  | 'bash_node_timeout'
+  | 'evidence_check_failed'
   // Failure Classes E-J (2026-07-17): six doctrine classes split into eight code values
   | 'scope_dirty_at_capture'
   | 'commit_blocked_no_authorization'
@@ -79,6 +81,37 @@ export interface ClassifyInput {
    * `implement_loop_skipped` (origin branch missing AND no commits anywhere -- agent never wrote).
    */
   hasOriginBranch?: boolean;
+}
+
+export type EvidenceFailureSignal =
+  | 'spec_tests_line_defect'
+  | 'real_test_failure'
+  | 'grep_evidence'
+  | 'unknown';
+
+interface EvidenceEvent {
+  event_type: string;
+  step_name: string | null;
+  data: Record<string, unknown>;
+}
+
+/** Classify manifest evidence failures from the run-stop-tests contract only. */
+export function classifyEvidenceFailure(events: readonly EvidenceEvent[]): EvidenceFailureSignal {
+  const output = [...events]
+    .reverse()
+    .find(event => event.event_type === 'node_completed' && event.step_name === 'run-stop-tests')
+    ?.data.node_output;
+  const text = typeof output === 'string' ? output : '';
+  const status = /^TESTS_STATUS=(.*)$/m.exec(text)?.[1]?.trim();
+  const source = /^TESTS_SOURCE=(.*)$/m.exec(text)?.[1]?.trim();
+  if (status === 'no_command_declared' || status === 'counts_unparsed') {
+    return 'spec_tests_line_defect';
+  }
+  if (source && !source.startsWith('spec_declared')) return 'spec_tests_line_defect';
+  if (source?.startsWith('spec_declared') && status === 'failed') return 'real_test_failure';
+  return text.includes('EVIDENCE_ERROR:') && text.includes('grep_status')
+    ? 'grep_evidence'
+    : 'unknown';
 }
 
 /**
@@ -168,6 +201,11 @@ export function classifyError(input: ClassifyInput): ErrorClass {
     return 'worktree_collision';
   }
 
+  // Exact DAG executor timeout shape. Keep ahead of loop timeouts.
+  if (/^Bash node '[^']+' timed out after \d+ms/.test(rawMessage)) {
+    return 'bash_node_timeout';
+  }
+
   // Branch ref missing: master/main hardcoded but doesn't exist
   if (/fatal: couldn't find remote ref/i.test(rawMessage)) {
     return 'branch_ref_missing';
@@ -220,6 +258,11 @@ export function classifyError(input: ClassifyInput): ErrorClass {
 
   if (/Loop '[^']+' iteration \d+ exceeded (idle|wall) timeout/.test(rawMessage)) {
     return 'loop_idle_timeout';
+  }
+
+  // Manifest evidence errors are semantic evidence failures, not verify rot.
+  if (input.nodeId === 'manifest-evidence-check' || rawMessage.startsWith('EVIDENCE_ERROR:')) {
+    return 'evidence_check_failed';
   }
 
   // Spec lookup failed

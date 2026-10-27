@@ -1,7 +1,12 @@
 import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import { createLogger } from '@archon/paths';
-import { classifyError } from './classify';
+import {
+  classifyError,
+  classifyEvidenceFailure,
+  type EvidenceFailureSignal,
+  type ErrorClass,
+} from './classify';
 import { decide } from './decide';
 import { isPrMergeReady, isPrGreen, judgePullRequest } from './judge-pr';
 import {
@@ -31,6 +36,25 @@ export const DEFAULT_WATCH_MAX_RUNS_PER_TICK = 25;
 // retry the same rows forever. A single watcher evaluates every terminal row
 // once before beginning another pass.
 const evaluatedRunIdsThisPass = new Set<string>();
+
+export function planRecovery(
+  errorClass: ErrorClass,
+  evidenceSubSignal: EvidenceFailureSignal = 'unknown'
+): NonNullable<WatchedRunRecord['recovery']> {
+  if (errorClass === 'loop_idle_timeout' || errorClass === 'bash_node_timeout') {
+    return { plan: 'refire', reason: errorClass };
+  }
+  if (errorClass === 'worktree_collision') {
+    return { plan: 'refire', reason: errorClass, precondition: 'release_terminal_worktree' };
+  }
+  if (errorClass === 'evidence_check_failed' && evidenceSubSignal === 'spec_tests_line_defect') {
+    return { plan: 'operator_card', reason: 'spec_tests_line_defect' };
+  }
+  return {
+    plan: 'none',
+    reason: evidenceSubSignal === 'real_test_failure' ? 'real_test_failure' : errorClass,
+  };
+}
 
 export function resolveWatchMaxRunsPerTick(
   raw = process.env.OVERSEER_WATCH_MAX_RUNS_PER_TICK
@@ -271,6 +295,7 @@ async function assessRun(
     prEvidence,
     decision,
     lastEvent,
+    recovery: planRecovery(errorClass, classifyEvidenceFailure(events)),
   };
 }
 

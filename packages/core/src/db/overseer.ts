@@ -217,6 +217,7 @@ const TERMINAL_OVERSEER_ACTIONS = [
   'escalation_denied',
   'tier_refused',
   'comment_findings',
+  'repair_refire',
 ] as const;
 
 export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
@@ -256,6 +257,38 @@ export async function getOverseerWatchRunById(runId: string): Promise<OverseerWa
     [runId]
   );
   return result.rows[0] ? normalizeRun(result.rows[0]) : null;
+}
+
+export async function getOverseerWatchRunByWorkingPath(
+  path: string
+): Promise<OverseerWatchRun | null> {
+  const result = await getDatabase().query<WorkflowRunRow>(
+    `SELECT r.id, r.status, r.metadata, r.user_message, r.working_path,
+            c.name AS codebase_name
+     FROM remote_agent_workflow_runs r
+     LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
+     WHERE r.working_path = $1
+     ORDER BY COALESCE(r.completed_at, r.last_activity_at, r.started_at) DESC
+     LIMIT 1`,
+    [path]
+  );
+  return result.rows[0] ? normalizeRun(result.rows[0]) : null;
+}
+
+export async function countOverseerAutomaticRecoveryAttempts(woId: string): Promise<number> {
+  const db = getDatabase();
+  const cutoff =
+    db.dialect === 'postgres'
+      ? "now() - interval '24 hours'"
+      : "strftime('%Y-%m-%dT%H:%M:%fZ','now','-24 hours')";
+  const result = await db.query<{ attempt_count: number | string }>(
+    `SELECT COUNT(*) AS attempt_count FROM overseer_actions
+     WHERE wo_id = $1 AND action = 'repair_refire'
+       AND (result LIKE 'fired:%' OR result LIKE 'indeterminate:%')
+       AND created_at >= ${cutoff}`,
+    [woId]
+  );
+  return Number(result.rows[0]?.attempt_count ?? 0);
 }
 
 /**
