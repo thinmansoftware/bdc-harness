@@ -49,6 +49,7 @@ if (
 
 import { registerBuiltinProviders, registerCommunityProviders } from '@archon/providers';
 import { loadAgentRegistry } from '@archon/workflows/agents/registry';
+import { reconcileStaleWoLocks } from '@archon/smart-cauldron/wo-lock';
 
 // Bootstrap provider registry before any provider lookups
 registerBuiltinProviders();
@@ -301,6 +302,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   } catch (error) {
     getLog().fatal({ err: error }, 'startup_running_reconciliation_failed');
     process.exit(1);
+  }
+
+  try {
+    const woLockReconcile = await reconcileStaleWoLocks('./cascade-runs', {
+      apiBaseUrl: process.env.ARCHON_API_BASE_URL,
+      token: process.env.ARCHON_OPERATOR_TOKEN,
+    });
+    getLog().info(woLockReconcile, 'startup_wo_lock_reconciliation_completed');
+  } catch (error) {
+    getLog().warn({ err: error }, 'startup_wo_lock_reconciliation_failed');
   }
 
   startOverseerRuntimeWithRealMergeManager();
