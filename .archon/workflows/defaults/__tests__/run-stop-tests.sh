@@ -120,12 +120,6 @@ for lane in $LANES; do
     hit && $0 ~ /^  - id: / { exit }
   ' "$DEFAULTS/$lane")"
   expected_dep="    depends_on: [format-autofix, resolve-test-command, resolve-review-base]"
-  case "$lane" in
-    bdc-feature-development-fusion-cx-kimi.yaml|bdc-feature-development-kimi-k3.yaml|bdc-feature-development-zero-claude.yaml)
-      # These lanes must not declare resolve-review-base. Base SHA falls back to run-start-sha.txt.
-      expected_dep="    depends_on: [format-autofix, resolve-test-command]"
-      ;;
-  esac
   assert_eq "run-stop-tests depends_on $lane" "$expected_dep" "$rst_dep"
   rst_timeout="$(awk '
     $0 ~ /^  - id: run-stop-tests$/ { hit = 1; next }
