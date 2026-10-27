@@ -57,6 +57,30 @@ export function seatForTier(tierName: string): SeatId | null {
   return null;
 }
 
+export type ClaudeTierAdmission =
+  | { admitted: true; reason: `claude_seat_ok:${number}:${number}` }
+  | {
+      admitted: false;
+      reason: `claude_seat_over_threshold:${number}:${number}` | 'claude_seat_unknown';
+    };
+
+/** Decide whether the Claude ladder tier may use the Claude subscription seat. */
+export function admitClaudeTier(input: {
+  usage: SeatUsageSnapshot | null;
+  thresholdPercent: number;
+}): ClaudeTierAdmission {
+  const seat = seatForTier('claude');
+  const used = seat === null || input.usage === null ? null : bindingUsedPercent(input.usage[seat]);
+  if (used === null) return { admitted: false, reason: 'claude_seat_unknown' };
+  if (used >= input.thresholdPercent) {
+    return {
+      admitted: false,
+      reason: `claude_seat_over_threshold:${used}:${input.thresholdPercent}`,
+    };
+  }
+  return { admitted: true, reason: `claude_seat_ok:${used}:${input.thresholdPercent}` };
+}
+
 export interface EntrySelection {
   picked: string;
   entry: string;

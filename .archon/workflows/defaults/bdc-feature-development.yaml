@@ -14,11 +14,11 @@ run_authority:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
-# Main Claude build lane: model: sonnet is CORRECT here -- this lane IS the Claude lane.
+# Main Claude build lane: the pinned Sonnet 5.5 model is intentional for this Claude lane.
 # All build + review nodes are intentionally Claude. Do NOT change this to a cheaper model.
 # See Ambiguity 1 resolution in WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
 provider: claude
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -2694,7 +2694,7 @@ nodes:
     # Pin to claude/sonnet: the trusted judge must always be Claude regardless of
     # the lane's top-level default. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     persona: captain-ci-validator
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
