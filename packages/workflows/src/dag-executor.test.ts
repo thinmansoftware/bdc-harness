@@ -1,31 +1,41 @@
-import {
-  afterAll,
-  describe,
-  it,
-  expect,
-  beforeEach,
-  afterEach,
-  mock,
-  spyOn,
-  type Mock,
-} from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock, spyOn, type Mock } from 'bun:test';
 import { mkdir, readFile, rm, stat, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import * as git from '@archon/git';
-import * as realPaths from '@archon/paths';
 
 const isWindows = process.platform === 'win32';
 
 // --- Mock logger (MUST come before imports of modules under test) ---
 //
 // mock.module() is process-global and mock.restore() does not undo it.
-// Stop 6 runs this file in one bun test process with loader.test.ts. A
-// wholesale replacement leaks this createLogger into that file and the
-// loader's cached logger never sees the warnings its tests assert on.
-// Snapshot the real exports, override only what this file drives, and
-// reinstall the snapshots in afterAll (registered after the loader imports
-// below) so the next file can install its own mock.
+// Stop 6 runs this file in one bun test process with loader.test.ts. Loader
+// and discovery cache the first logger createLogger() returns, so a later
+// file's createLogger mock never receives warn() calls.
+//
+// createLogger() therefore returns one stable bridge. Method calls forward
+// to whichever test file currently owns the slot (this file by default;
+// loader.test.ts adopts the slot in its beforeEach). No production reset
+// hook is required.
+
+type WorkflowTestLogFn = (...args: unknown[]) => unknown;
+
+interface WorkflowTestLogger {
+  info: WorkflowTestLogFn;
+  warn: WorkflowTestLogFn;
+  error: WorkflowTestLogFn;
+  debug: WorkflowTestLogFn;
+  trace: WorkflowTestLogFn;
+  fatal: WorkflowTestLogFn;
+  child: WorkflowTestLogFn;
+}
+
+interface WorkflowTestLoggerSlot {
+  current: WorkflowTestLogger;
+  bridge: WorkflowTestLogger;
+}
+
+const WORKFLOW_TEST_LOGGER_SLOT = '__archonWorkflowTestLoggerSlot';
 
 const mockLogFn = mock(() => {});
 const mockLogger = {
@@ -37,12 +47,44 @@ const mockLogger = {
   fatal: mockLogFn,
   child: mock(() => mockLogger),
 };
-const originalCreateLogger = realPaths.createLogger;
-const originalGetCommandFolderSearchPaths = realPaths.getCommandFolderSearchPaths;
-const originalGetDefaultCommandsPath = realPaths.getDefaultCommandsPath;
+
+// Test loggers are bun mocks. The cast only selects the methods the bridge forwards.
+function asWorkflowTestLogger(logger: object): WorkflowTestLogger {
+  return logger as WorkflowTestLogger;
+}
+
+function installWorkflowTestLoggerSlot(initial: WorkflowTestLogger): WorkflowTestLoggerSlot {
+  const slot: WorkflowTestLoggerSlot = {
+    current: initial,
+    bridge: undefined as unknown as WorkflowTestLogger,
+  };
+  const forward = (method: keyof WorkflowTestLogger): WorkflowTestLogFn => {
+    return (...args: unknown[]): unknown => {
+      const fn = slot.current[method];
+      return fn(...args);
+    };
+  };
+  slot.bridge = {
+    info: forward('info'),
+    warn: forward('warn'),
+    error: forward('error'),
+    debug: forward('debug'),
+    trace: forward('trace'),
+    fatal: forward('fatal'),
+    child: (...args: unknown[]): unknown => {
+      slot.current.child(...args);
+      return slot.bridge;
+    },
+  };
+  (globalThis as unknown as Record<string, WorkflowTestLoggerSlot>)[WORKFLOW_TEST_LOGGER_SLOT] =
+    slot;
+  return slot;
+}
+
+const workflowTestLoggerSlot = installWorkflowTestLoggerSlot(asWorkflowTestLogger(mockLogger));
+
 mock.module('@archon/paths', () => ({
-  ...realPaths,
-  createLogger: mock(() => mockLogger),
+  createLogger: mock(() => workflowTestLoggerSlot.bridge),
   getCommandFolderSearchPaths: (folder?: string) => {
     const paths = ['.archon/commands'];
     if (folder) paths.unshift(folder);
@@ -81,8 +123,8 @@ import {
 import { loadMcpConfig } from '@archon/providers/claude/provider';
 import { resolveLoopIterationIdleTimeoutMs } from './utils/idle-timeout';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
-import { discoverWorkflows, resetDiscoveryLoggerForTests } from './workflow-discovery';
-import { parseWorkflow, resetLoaderLoggerForTests } from './loader';
+import { discoverWorkflows } from './workflow-discovery';
+import { parseWorkflow } from './loader';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
 import type { IWorkflowStore } from './store';
 import { getWorkflowEventEmitter } from './event-emitter';
@@ -300,22 +342,12 @@ function mockBashExecWithScriptCapture(
 // bash-capture mock silently feeds canned output to unrelated tests and fails
 // bun-spawning script nodes). mock.restore() only restores spies, not
 // mock.module registrations.
-afterEach(() => {
-  mock.restore();
+beforeEach(() => {
+  workflowTestLoggerSlot.current = asWorkflowTestLogger(mockLogger);
 });
 
-afterAll(() => {
-  mock.module('@archon/paths', () => ({
-    ...realPaths,
-    createLogger: originalCreateLogger,
-    getCommandFolderSearchPaths: originalGetCommandFolderSearchPaths,
-    getDefaultCommandsPath: originalGetDefaultCommandsPath,
-  }));
-  // Modules already imported above may have cached the mock logger.
-  // Drop those caches so the next file's createLogger mock is the one
-  // that records calls.
-  resetLoaderLoggerForTests();
-  resetDiscoveryLoggerForTests();
+afterEach(() => {
+  mock.restore();
 });
 
 describe('buildTopologicalLayers', () => {
