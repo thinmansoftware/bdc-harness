@@ -7,6 +7,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:tes
 import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { rootLogger } from '@archon/paths';
+import { getDatabase } from '@archon/core/db';
 import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
 import {
   setSeatUsageReaderForTests,
@@ -4344,6 +4345,135 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     } finally {
       stream.write = originalWrite;
     }
+  });
+
+  test('owner_label_makes_unassigned_issue_claimed', async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes('/search/issues')) {
+        return new Response(JSON.stringify({ items: [{ title: 'WO-HARNESS-OWNER-LABEL-01' }] }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'x-ratelimit-remaining': '100',
+          },
+        });
+      }
+      const label = new URL(url).searchParams.get('labels') ?? '';
+      const issues =
+        label === 'wo'
+          ? [ghIssue(1538, ['prio:P0', 'owner:cursor'], { title: 'WO-HARNESS-OWNER-LABEL-01' })]
+          : [];
+      return new Response(JSON.stringify(issues), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads).toHaveLength(1);
+    expect(threads[0]?.ownerLogin).toBe('cursor');
+    expect(threads[0]?.isUnclaimed).toBe(false);
+    expect(threads[0]?.isUnclaimedP0).toBe(false);
+    expect(threads[0]?.recipient).toBe('xo');
+    expect(urls.some(url => url.includes('/search/issues'))).toBe(false);
+  });
+
+  test('unlabelled_unassigned_issue_stays_unclaimed', async () => {
+    // pr_lookup_fails_open flushes a search-pool backoff into github_api_pool_state.
+    // The in-memory meter reset does not remove that row, so the next lookup
+    // refuses before fetch. Drop only that backoff so this claim search runs.
+    await getDatabase().query('DELETE FROM github_api_pool_state WHERE resource = $1', [
+      'backoff:search',
+    ]);
+    const urls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes('/search/issues')) {
+        return new Response(JSON.stringify({ items: [] }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'x-ratelimit-remaining': '100',
+          },
+        });
+      }
+      const label = new URL(url).searchParams.get('labels') ?? '';
+      const issues =
+        label === 'wo' ? [ghIssue(1539, ['prio:P0'], { title: 'WO-HARNESS-OWNER-LABEL-02' })] : [];
+      return new Response(JSON.stringify(issues), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads).toHaveLength(1);
+    expect(threads[0]?.ownerLogin).toBeNull();
+    expect(threads[0]?.isUnclaimed).toBe(true);
+    expect(threads[0]?.isUnclaimedP0).toBe(true);
+    expect(urls.filter(url => url.includes('/search/issues'))).toHaveLength(1);
+  });
+
+  test('assignee_wins_and_invalid_owner_label_is_ignored', async () => {
+    const { fetchImpl } = fakeGithubFetch({
+      wo: [
+        ghIssue(1540, ['prio:P0', 'owner:cursor'], { assignees: [{ login: 'jdoe' }] }),
+        ghIssue(1541, ['prio:P0', 'owner:user @team']),
+        ghIssue(1542, ['prio:P0', 'owner:']),
+      ],
+    });
+
+    const threads = await defaultListThreads(fetchImpl);
+    const byNumber = new Map(threads.map(thread => [Number(thread.ref.split('#')[1]), thread]));
+    expect(byNumber.get(1540)?.ownerLogin).toBe('jdoe');
+    expect(byNumber.get(1541)?.ownerLogin).toBeNull();
+    expect(byNumber.get(1541)?.isUnclaimed).toBe(true);
+    expect(byNumber.get(1542)?.ownerLogin).toBeNull();
+    expect(byNumber.get(1542)?.isUnclaimed).toBe(true);
+  });
+
+  test('evidence_owner_uses_owner_label_fallback', async () => {
+    const bodies = [
+      {
+        number: 1543,
+        state: 'open',
+        updated_at: new Date(T0).toISOString(),
+        labels: [{ name: 'owner:codex' }],
+        assignees: [],
+        title: 'labelled',
+      },
+      [],
+      [],
+    ];
+    let call = 0;
+    const fetchImpl = (async () => {
+      const body = bodies[call] ?? [];
+      call += 1;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    const evidence = await defaultGetGithubIssueEvidence(
+      'gh:thinmansoftware/bdc-harness#1543',
+      new Date(T0).toISOString(),
+      fetchImpl
+    );
+    expect(evidence?.ownerLogin).toBe('codex');
   });
 });
 

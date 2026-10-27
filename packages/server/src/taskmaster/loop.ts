@@ -200,7 +200,7 @@ export interface GithubIssueEvidence {
   assignedAt: string | null;
   activeStatusAt: string | null;
   progressRecordedAt: string | null;
-  /** First assignee login; null when unassigned (UNKNOWN -- never guessed). */
+  /** First assignee login, else a valid owner label, else null. */
   ownerLogin: string | null;
   latestMarkerKind: 'PROGRESS' | 'BLOCKED' | null;
   /** Marker comment body, trimmed, capped at 500 chars. */
@@ -538,8 +538,10 @@ export async function defaultListThreads(
         const hasClaimStatus = normalizedLabels.some(label =>
           ['status:building', 'status:review'].includes(label)
         );
-        const ownerLogin = issue.assignees?.[0]?.login ?? null;
-        let isUnclaimed = (issue.assignees ?? []).length === 0 && !hasClaimStatus;
+        const ownerFromLabel = parseOwnerLabel(JSON.stringify(labels));
+        const ownerLogin = issue.assignees?.[0]?.login ?? ownerFromLabel;
+        let isUnclaimed =
+          (issue.assignees ?? []).length === 0 && !hasClaimStatus && ownerFromLabel === null;
         const woId = issue.title?.match(WO_ID_RE)?.[0];
         if (isUnclaimed && woId !== undefined && prClaimLookups < PR_CLAIM_LOOKUP_CAP) {
           prClaimLookups += 1;
@@ -786,16 +788,19 @@ export async function defaultGetGithubIssueEvidence(
     adoptionActiveStatusAt,
     adoptionProgressAt
   );
+  const labels = issue.labels.map(label =>
+    typeof label === 'string' ? label : (label.name ?? '')
+  );
   return {
     state: issue.state,
     updatedAt: issue.updated_at,
-    labels: issue.labels.map(label => (typeof label === 'string' ? label : (label.name ?? ''))),
+    labels,
     assigneeCount: issue.assignees?.length ?? 0,
     closedAt,
     assignedAt,
     activeStatusAt,
     progressRecordedAt,
-    ownerLogin: issue.assignees?.[0]?.login ?? null,
+    ownerLogin: issue.assignees?.[0]?.login ?? parseOwnerLabel(JSON.stringify(labels)),
     latestMarkerKind: latestMarker ? markerKindFromBody(latestMarker.body) : null,
     latestMarkerText: latestMarker ? truncateMarkerText(latestMarker.body) : null,
     latestMarkerAt: latestMarker?.created_at ?? null,
