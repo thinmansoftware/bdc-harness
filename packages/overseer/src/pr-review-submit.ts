@@ -60,6 +60,8 @@ export interface ReviewerVerdict {
   checksPending?: boolean;
   /** Names of checks still awaited when `checksPending` is true. */
   pendingChecks?: readonly string[];
+  /** True when pendingChecks specifically names required contexts. */
+  pendingRequiredContexts?: boolean;
   /**
    * Set when the required status-check contexts could not be read after the
    * configured attempt bound (#775). TERMINAL and NON-APPROVING: unlike
@@ -216,6 +218,7 @@ export interface SubmitOutcome {
   retryAfterMs?: number;
   /** Names of checks still awaited on a checks-pending deferral. */
   pendingChecks?: readonly string[];
+  pendingRequiredContexts?: boolean;
 }
 
 export interface SubmitDeps {
@@ -435,6 +438,7 @@ export async function runAndSubmitReview(
       disposition: 'checks_pending',
       reason: 'checks_not_terminal',
       ...(verdict.pendingChecks ? { pendingChecks: verdict.pendingChecks } : {}),
+      ...(verdict.pendingRequiredContexts ? { pendingRequiredContexts: true } : {}),
     });
   }
 

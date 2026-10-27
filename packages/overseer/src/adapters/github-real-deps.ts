@@ -442,6 +442,7 @@ export interface ExactHeadPullRequestEvidence {
     dispatched: boolean;
     context?: string;
     workflow?: string;
+    branch?: string;
   };
 }
 
@@ -583,12 +584,17 @@ export function createRealFetchExactHeadPullRequestEvidence(
         const rearmAttempt = resolveRequiredContextRearmAttempt(
           process.env[REQUIRED_CONTEXT_REARM_ATTEMPT_ENV]
         );
+        const workflows = parseRequiredContextWorkflowsMap(
+          process.env[REQUIRED_CONTEXT_WORKFLOWS_ENV]
+        ).get(`${input.owner}/${input.repo}`);
+        const context = missingRequiredContexts.find(name => workflows?.has(name));
+        const workflow = context ? workflows?.get(context) : undefined;
+        const branch = pr.data.head.ref ?? input.headSha;
+        const rearmReceiptKey: AttemptCounterKey = {
+          ...missingKey,
+          baseRef: `rearm-dispatched:${baseRef ?? ''}`,
+        };
         if (attempts === rearmAttempt) {
-          const workflows = parseRequiredContextWorkflowsMap(
-            process.env[REQUIRED_CONTEXT_WORKFLOWS_ENV]
-          ).get(`${input.owner}/${input.repo}`);
-          const context = missingRequiredContexts.find(name => workflows?.has(name));
-          const workflow = context ? workflows?.get(context) : undefined;
           if (!workflow || !context) {
             requiredContextRearm = { attempted: false, dispatched: false };
             log.warn(
@@ -628,7 +634,14 @@ export function createRealFetchExactHeadPullRequestEvidence(
                   workflow_id: workflow,
                   ref: pr.data.head.ref ?? input.headSha,
                 });
-                requiredContextRearm = { attempted: true, dispatched: true, context, workflow };
+                await attemptStore.increment(rearmReceiptKey, Date.now());
+                requiredContextRearm = {
+                  attempted: true,
+                  dispatched: true,
+                  context,
+                  workflow,
+                  branch,
+                };
                 log.info(
                   {
                     owner: input.owner,
@@ -641,7 +654,13 @@ export function createRealFetchExactHeadPullRequestEvidence(
                   'overseer_required_context_rearm_dispatched'
                 );
               } catch (error) {
-                requiredContextRearm = { attempted: true, dispatched: false, context, workflow };
+                requiredContextRearm = {
+                  attempted: true,
+                  dispatched: false,
+                  context,
+                  workflow,
+                  branch,
+                };
                 log.warn(
                   {
                     err: error,
@@ -658,6 +677,15 @@ export function createRealFetchExactHeadPullRequestEvidence(
               }
             }
           }
+        } else if (attempts > rearmAttempt && workflow && context) {
+          const dispatched = (await attemptStore.read?.(rearmReceiptKey)) === 1;
+          requiredContextRearm = {
+            attempted: true,
+            dispatched,
+            context,
+            workflow,
+            branch,
+          };
         }
         const maxAttempts = resolveRequiredContextNeverReportedMaxAttempts(
           process.env[REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS_ENV]

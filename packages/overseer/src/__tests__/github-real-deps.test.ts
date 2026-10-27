@@ -16,6 +16,7 @@ import {
 } from '../adapters/github-real-deps.ts';
 import type { AttemptCounterKey, AttemptCounterStore } from '../adapters/required-contexts.ts';
 import type { PullRequestRef } from '../types.ts';
+import { evaluatePullRequest } from '../pr-review-evaluator.ts';
 
 // WO-HARNESS-OVERSEER-APP-AUTH-01: Overseer authenticates as the Thinman Overseer
 // GitHub App (App ID 4574893, installation 153295654) so it can APPROVE pull
@@ -155,6 +156,7 @@ describe('required context never reported', () => {
   test('dispatches a mapped workflow once and blocks at the configured bound', async () => {
     const headSha = 'd'.repeat(40);
     const dispatches: unknown[] = [];
+    let checkRuns: Array<Record<string, unknown>> = [];
     const counts = new Map<string, number>();
     const store: AttemptCounterStore = {
       increment: async key => {
@@ -164,6 +166,7 @@ describe('required context never reported', () => {
         return next;
       },
       clear: async key => void counts.delete(JSON.stringify(key)),
+      read: async key => counts.get(JSON.stringify(key)) ?? 0,
     };
     const client = {
       pulls: {
@@ -178,7 +181,7 @@ describe('required context never reported', () => {
         compareCommits: async () => ({ data: { files: [] } }),
         getAllStatusCheckContexts: async () => ({ data: ['Gitleaks'] }),
       },
-      checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+      checks: { listForRef: async () => ({ data: { check_runs: checkRuns } }) },
       actions: {
         createWorkflowDispatch: async (input: unknown) => void dispatches.push(input),
       },
@@ -201,12 +204,20 @@ describe('required context never reported', () => {
         dispatched: true,
         context: 'Gitleaks',
         workflow: 'secrets-scan.yml',
+        branch: 'docs/update',
       });
       const fourth = await fetchEvidence(input);
       expect(fourth.requiredContextsBlocked).toEqual({
         reason: 'required_context_never_reported',
         attempts: 4,
         failureKind: 'transient',
+      });
+      expect(fourth.requiredContextRearm).toEqual({
+        attempted: true,
+        dispatched: true,
+        context: 'Gitleaks',
+        workflow: 'secrets-scan.yml',
+        branch: 'docs/update',
       });
       expect(dispatches).toEqual([
         {
@@ -216,6 +227,32 @@ describe('required context never reported', () => {
           ref: 'docs/update',
         },
       ]);
+      checkRuns = [{ name: 'Gitleaks', status: 'completed', conclusion: 'success' }];
+      const evaluated = await evaluatePullRequest(
+        { owner: input.owner, repo: input.repo, pr_number: input.prNumber, head_sha: headSha },
+        {
+          reviewer: { provider: 'test', model: 'judge' },
+          fetchEvidence: request =>
+            fetchEvidence({
+              owner: request.owner,
+              repo: request.repo,
+              prNumber: request.pr_number,
+              headSha: request.head_sha,
+            }),
+          fetchAcceptanceCriteria: async () => null,
+          invokeModel: async () => ({
+            exitCode: 0,
+            timedOut: false,
+            stdout: JSON.stringify({
+              verdict: 'APPROVE',
+              findings: [],
+              reviewed_head_sha: headSha,
+            }),
+          }),
+        }
+      );
+      expect(evaluated.verdict).toBe('APPROVE');
+      expect(dispatches).toHaveLength(1);
     } finally {
       if (oldMap === undefined) delete process.env.OVERSEER_REQUIRED_CONTEXT_WORKFLOWS_JSON;
       else process.env.OVERSEER_REQUIRED_CONTEXT_WORKFLOWS_JSON = oldMap;

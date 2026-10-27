@@ -263,6 +263,7 @@ describe('review worker clock', () => {
         }),
       }),
     ]);
+    expect(warnings[0]?.data).not.toHaveProperty('missing_required_contexts');
     // A defer is not a terminal result.
     expect(deps.postResult).not.toHaveBeenCalled();
   });
@@ -298,6 +299,7 @@ describe('review worker clock', () => {
       disposition: 'checks_pending',
       reason: 'checks_not_terminal',
       pendingChecks: ['Gitleaks'],
+      pendingRequiredContexts: true,
     }));
     deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
     await tickReviewWorkerClock(CONFIG, deps);

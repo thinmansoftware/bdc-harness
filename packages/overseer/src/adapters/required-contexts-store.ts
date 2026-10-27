@@ -120,6 +120,16 @@ export function createDurableAttemptCounterStore(
       }
     },
 
+    async read(key: AttemptCounterKey): Promise<number> {
+      try {
+        const db = await loadDb();
+        return await db.readRequiredContextsAttempts(key);
+      } catch (error) {
+        log.warn({ err: error, ...key }, 'overseer.required_contexts.attempt_read_failed');
+        return 0;
+      }
+    },
+
     async clear(key: AttemptCounterKey): Promise<void> {
       try {
         const db = await loadDb();

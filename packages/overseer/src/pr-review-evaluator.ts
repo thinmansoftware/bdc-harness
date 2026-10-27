@@ -127,6 +127,16 @@ export interface PrReviewResult {
   retry_after_ms?: number;
   /** Names of checks still awaited. Set only on CHECKS_PENDING. */
   pendingChecks?: string[];
+  pendingRequiredContexts?: boolean;
+  requiredContextsUnavailableReason?: string;
+  missingRequiredContexts?: string[];
+  requiredContextAttempts?: number;
+  requiredContextRearm?: {
+    attempted: boolean;
+    dispatched: boolean;
+    workflow?: string;
+    branch?: string;
+  };
 }
 
 export interface PrReviewModelResult {
@@ -564,6 +574,7 @@ function checksPending(
     acceptance_criteria_available: false,
     error: 'checks_pending',
     ...(pendingChecks.length === 0 ? {} : { pendingChecks }),
+    ...(requiredContexts && requiredContexts.length > 0 ? { pendingRequiredContexts: true } : {}),
   };
 }
 
@@ -586,6 +597,7 @@ export async function evaluatePullRequest(
       dispatched: boolean;
       context?: string;
       workflow?: string;
+      branch?: string;
     };
   };
   try {
@@ -633,6 +645,14 @@ export async function evaluatePullRequest(
             ]
           : []),
       ].join(':'),
+      requiredContextsUnavailableReason: evidence.requiredContextsBlocked.reason,
+      requiredContextAttempts: evidence.requiredContextsBlocked.attempts,
+      ...(evidence.missingRequiredContexts
+        ? { missingRequiredContexts: evidence.missingRequiredContexts }
+        : {}),
+      ...(evidence.requiredContextRearm
+        ? { requiredContextRearm: evidence.requiredContextRearm }
+        : {}),
     };
   }
 
