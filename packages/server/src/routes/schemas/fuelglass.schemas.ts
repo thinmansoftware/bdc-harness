@@ -37,6 +37,8 @@ const seatReadingSchema = z.object({
   http_status: z.number().optional(),
   allowed: z.boolean().optional(),
   limit_reached: z.boolean().optional(),
+  reading_source: z.enum(['probe', 'pushed']).optional(),
+  observed_at: z.string().optional(),
 });
 
 const cutoffSchema = z.object({
@@ -83,3 +85,46 @@ export const fuelglassCutoffResponseSchema = z
     cutoff: cutoffSchema,
   })
   .openapi('FuelglassCutoffResponse');
+
+const READING_FIELDS = {
+  seat: z.string(),
+  used_percent: z.number(),
+  remaining_percent: z.number(),
+  resets_at: z.string(),
+  observed_at: z.string(),
+  source: z.string(),
+} as const;
+
+/**
+ * Strict six-field payload. The readings route publishes this component and
+ * does not attach it as request middleware: the handler scans the raw JSON
+ * for credentials before safeParse.
+ */
+export const fuelglassReadingPushBodySchema = z
+  .object(READING_FIELDS)
+  .strict()
+  .openapi('FuelglassReadingPushBody');
+
+export const fuelglassReadingRecordSchema = z
+  .object({
+    ...READING_FIELDS,
+    received_at: z.string(),
+  })
+  .openapi('FuelglassReadingRecord');
+
+export const fuelglassReadingPostResponseSchema = z
+  .object({
+    success: z.boolean(),
+    reading: fuelglassReadingRecordSchema,
+  })
+  .openapi('FuelglassReadingPostResponse');
+
+export const fuelglassReadingGetResponseSchema = z
+  .object({
+    success: z.boolean(),
+    reading: fuelglassReadingRecordSchema.nullable(),
+    fresh: z.boolean(),
+    age_seconds: z.number().nullable(),
+    max_age_minutes: z.number(),
+  })
+  .openapi('FuelglassReadingGetResponse');
