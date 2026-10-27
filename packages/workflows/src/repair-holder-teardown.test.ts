@@ -3,6 +3,7 @@ import { spawn } from 'child_process';
 import { Database } from 'bun:sqlite';
 import { createHash } from 'crypto';
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -312,7 +313,8 @@ function makeRun(id: string, workingPath: string): WorkflowRun {
 async function runDag(
   dir: string,
   runId: string,
-  nodes: DagNode[]
+  nodes: DagNode[],
+  platform: IWorkflowPlatform = createPlatform()
 ): Promise<{ store: IWorkflowStore; failMessage: string; order: string[] }> {
   const store = createMockStore();
   const order: string[] = [];
@@ -351,7 +353,7 @@ async function runDag(
   mkdirSync(join(dir, 'logs'), { recursive: true });
   await executeDagWorkflow(
     deps,
-    createPlatform(),
+    platform,
     'conv-teardown',
     dir,
     { name: 'teardown-fixture', nodes },
@@ -1288,6 +1290,71 @@ describe.serial('repair holder teardown', () => {
     const metadata = failCalls[0]?.[2]?.metadata;
     expect(metadata?.terminal_cause).toBe('repair_checkout_failed');
     expect(metadata?.repair_failure_reason ?? '').toStartWith('repair_target_branch_held');
+  }, 15000);
+
+  it('a pre-execution abort_run_on_failure stops a same-layer sibling before the layer finishes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rht-abort-pre-exec-'));
+    roots.push(dir);
+    const pidPath = join(dir, 'sibling.pid');
+    const platform = createPlatform();
+    (platform.sendMessage as ReturnType<typeof mock>).mockImplementation(
+      async (_conversationId: string, message: string) => {
+        // Hold the pre-execution failure until the sibling group is registered,
+        // so settlement has a live owned process to stop.
+        if (message.includes('failed before execution')) {
+          const deadline = Date.now() + 5000;
+          while (!existsSync(pidPath) && Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 20));
+          }
+        }
+      }
+    );
+    const started = Date.now();
+    const failed = await runDag(
+      dir,
+      'run-abort-pre-exec',
+      [
+        {
+          id: 'sibling',
+          bash: 'echo $$ > sibling.pid\nsleep 30\necho SIBLING_DONE\n',
+        },
+        {
+          id: 'checkout-repair-target',
+          abort_run_on_failure: true,
+          prompt: 'fail before execution',
+          provider: 'not-a-registered-provider',
+        },
+        { id: 'plan-review', depends_on: ['checkout-repair-target'], bash: 'echo PLAN_RAN\n' },
+        { id: 'implement', depends_on: ['plan-review'], bash: 'echo IMPL_RAN\n' },
+        { id: 'validation', depends_on: ['implement'], bash: 'echo VAL_RAN\n' },
+        { id: 'test', depends_on: ['validation'], bash: 'echo TEST_RAN\n' },
+      ],
+      platform
+    );
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(10000);
+    expect(eventError(failed.store, 'checkout-repair-target')).toContain('failed before execution');
+    expect(existsSync(pidPath)).toBe(true);
+    const siblingPid = Number(readFileSync(pidPath, 'utf8').trim());
+    expect(siblingPid).toBeGreaterThan(1);
+    expect(processAlive(siblingPid)).toBe(false);
+    const calls = (failed.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
+      [{ event_type?: string; step_name?: string; data?: { node_output?: string } }]
+    >;
+    const completedIds = calls
+      .filter(call => call[0]?.event_type === 'node_completed')
+      .map(call => call[0]?.step_name);
+    expect(completedIds).not.toContain('plan-review');
+    expect(completedIds).not.toContain('implement');
+    expect(completedIds).not.toContain('validation');
+    expect(completedIds).not.toContain('test');
+    const outputs = calls.map(call => call[0]?.data?.node_output ?? '').join('\n');
+    expect(outputs).not.toContain('SIBLING_DONE');
+    expect(outputs).not.toContain('PLAN_RAN');
+    const failCalls = (failed.store.failWorkflowRun as ReturnType<typeof mock>).mock.calls as Array<
+      [string, string, { metadata?: { terminal_cause?: string } }]
+    >;
+    expect(failCalls[0]?.[2]?.metadata?.terminal_cause).toBe('repair_checkout_failed');
   }, 15000);
 
   it('rescans cwd before reusing a cached confirmation', async () => {

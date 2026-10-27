@@ -3303,6 +3303,33 @@ async function abortOwnedGroups(runId: string): Promise<void> {
   await Promise.all(groups.map(entry => endRecordedGroup(runId, entry)));
 }
 
+/**
+ * Common node settlement for abort_run_on_failure.
+ * Bash and script catches abort immediately on subprocess failure. Pre-execution
+ * throws and AI/loop failures never enter those catches, so the latch also runs
+ * here, before this node's promise resolves, while sibling nodes in the layer
+ * are still in flight. A second call is safe: the latch is idempotent.
+ */
+async function abortOwnedGroupsOnFailedSettlement(
+  runId: string,
+  node: { abort_run_on_failure?: boolean },
+  output: { state: string }
+): Promise<void> {
+  if (output.state === 'failed' && node.abort_run_on_failure === true) {
+    await abortOwnedGroups(runId);
+  }
+}
+
+/** Return a layer-node result after latching abort_run_on_failure teardown. */
+async function settleLayerNode(
+  runId: string,
+  node: { id: string; abort_run_on_failure?: boolean },
+  output: NodeExecutionResult
+): Promise<{ nodeId: string; output: NodeExecutionResult }> {
+  await abortOwnedGroupsOnFailedSettlement(runId, node, output);
+  return { nodeId: node.id, output };
+}
+
 function ownedSpawnHooks(runId: string): {
   onSpawn: (pgid: number) => void;
   onExit: (pgid: number) => void;
@@ -6244,7 +6271,7 @@ async function executeDagWorkflowInternal(
           // 3. Engine-side evidence node -- facts are collected mechanically, never by AI.
           if (isEvidenceNode(node)) {
             const output = await executeEvidenceNode(deps, cwd, workflowRun, node, artifactsDir);
-            return { nodeId: node.id, output };
+            return await settleLayerNode(workflowRun.id, node, output);
           }
 
           // 3a. Bash node dispatch -- no AI, no session
@@ -6265,7 +6292,7 @@ async function executeDagWorkflowInternal(
               config.envVars,
               resolvedInputs
             );
-            return { nodeId: node.id, output };
+            return await settleLayerNode(workflowRun.id, node, output);
           }
 
           // 3b. Loop node dispatch -- manages its own AI sessions and iteration
@@ -6416,7 +6443,7 @@ async function executeDagWorkflowInternal(
               );
             }
 
-            return { nodeId: node.id, output };
+            return await settleLayerNode(workflowRun.id, node, output);
           }
 
           // 3c. Approval node dispatch -- pauses workflow for human review
@@ -6442,7 +6469,7 @@ async function executeDagWorkflowInternal(
               issueContext,
               modelOverride
             );
-            return { nodeId: node.id, output };
+            return await settleLayerNode(workflowRun.id, node, output);
           }
 
           // 3d. Cancel node dispatch -- terminates the workflow run
@@ -6493,7 +6520,7 @@ async function executeDagWorkflowInternal(
               issueContext,
               config.envVars
             );
-            return { nodeId: node.id, output };
+            return await settleLayerNode(workflowRun.id, node, output);
           }
 
           // 4. Resolve per-node provider/model/options
@@ -6759,7 +6786,7 @@ async function executeDagWorkflowInternal(
             );
           }
 
-          return { nodeId: node.id, output };
+          return await settleLayerNode(workflowRun.id, node, output);
         } catch (error) {
           const err = error as Error;
           // Infrastructure-class block: a persona/provider/config fault that no
@@ -6799,10 +6826,11 @@ async function executeDagWorkflowInternal(
             workflowId: workflowRun.id,
             nodeName: node.id,
           });
-          return {
-            nodeId: node.id,
-            output: { state: 'failed' as const, output: '', error: failMessage },
-          };
+          return await settleLayerNode(workflowRun.id, node, {
+            state: 'failed',
+            output: '',
+            error: failMessage,
+          });
         }
       })
     );
