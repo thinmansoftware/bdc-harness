@@ -926,11 +926,14 @@ rst_commit() {
 }
 
 # Run the head command, then rst_apply_verdict. ARTIFACTS_DIR is empty so
-# run-start-sha.txt is absent unless the caller planted one.
+# run-start-sha.txt is absent unless seed_sha (optional 4th arg) is set.
 rst_verdict_for() {
-  local repo="$1" cmd="$2" review="$3"
+  local repo="$1" cmd="$2" review="$3" seed_sha="${4:-}"
   local art log cmds result exit_code counts report status line out
   art="$(mktemp -d)"
+  if [ -n "$seed_sha" ]; then
+    printf '%s\n' "$seed_sha" > "$art/run-start-sha.txt"
+  fi
   log="$repo/stop-tests.log"
   cmds="$repo/stop-tests.commands"
   printf '%s\n' "$cmd" > "$cmds"
@@ -1106,6 +1109,45 @@ assert_eq "t3b mode" "n/a" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T3B_OUT")
 assert_not_contains "t3b not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T3B_OUT")"
 assert_not_contains "t3b not passed" "passed" "$(rst_out_field TESTS_STATUS "$T3B_OUT")"
 rm -rf "$T3B"
+
+echo "--- Test 3c: missing origin/<REVIEW_BASE> falls back to run-start-sha.txt ---"
+T3C="$(mktemp -d)"
+rst_git_init "$T3C"
+cat > "$T3C/t.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) stale > base is red"
+echo "2 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'base\n' > "$T3C/note.txt"
+rst_commit "$T3C" base
+T3C_BASE="$(git -C "$T3C" rev-parse HEAD)"
+printf 'head\n' > "$T3C/note.txt"
+rst_commit "$T3C" head
+if git -C "$T3C" rev-parse --verify -q 'refs/remotes/origin/dev^{commit}' >/dev/null; then
+  FAIL=$((FAIL + 1)); echo "FAIL: t3c origin/dev should be absent"
+else
+  PASS=$((PASS + 1)); echo "PASS: t3c origin/dev absent"
+fi
+T3C_OUT="$(rst_verdict_for "$T3C" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')" "$T3C_BASE")"
+assert_eq "t3c status" "baseline_red" "$(rst_out_field TESTS_STATUS "$T3C_OUT")"
+assert_eq "t3c base status" "failed" "$(rst_out_field TESTS_BASE_STATUS "$T3C_OUT")"
+assert_eq "t3c base sha" "$T3C_BASE" "$(rst_out_field TESTS_BASE_SHA "$T3C_OUT")"
+assert_eq "t3c newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T3C_OUT")"
+assert_eq "t3c mode" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T3C_OUT")"
+T3C_LINE="$(rst_out_field TESTS_LINE "$T3C_OUT")"
+T3C_SHA8="$(printf '%s' "$T3C_BASE" | cut -c1-8)"
+assert_contains "t3c dual counts" "head 2/3; base 2/3 at ${T3C_SHA8}" "$T3C_LINE"
+assert_contains "t3c shared name" "newly failing: 0 (stale > base is red)" "$T3C_LINE"
+assert_not_contains "t3c not unavailable" "unavailable" "$(rst_out_field TESTS_BASE_STATUS "$T3C_OUT")"
+if [ -f "$T3C/stop-tests.log.base" ] && grep -Fq "(fail) stale > base is red" "$T3C/stop-tests.log.base"; then
+  PASS=$((PASS + 1)); echo "PASS: t3c base pass wrote the base failure"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL: t3c base pass did not run"
+fi
+assert_eq "t3c worktree cleaned" "1" "$(git -C "$T3C" worktree list | grep -c . || true)"
+rm -rf "$T3C"
 
 echo "--- Test 4: a passing head never pays for a base pass ---"
 T4="$(mktemp -d)"
