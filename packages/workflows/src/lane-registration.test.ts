@@ -317,10 +317,15 @@ describe('lane registration and war-council-validator pin', () => {
       if (typeof candidate.model === 'string') {
         expect(candidate.model.toLowerCase(), `${candidate.id}:model`).not.toContain('fable');
       }
-      if (candidate.provider === 'cursor') {
+      if (candidate.provider === 'cursor' || candidate.provider === 'cursor-cloud') {
         expect(candidate.model?.startsWith('grok-4.7'), `${candidate.id}:model`).toBe(true);
       }
     }
+    expect(
+      nodes
+        .filter(candidate => candidate.provider === 'cursor-cloud')
+        .map(candidate => candidate.id)
+    ).toEqual(['implement']);
 
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = node(id);
@@ -337,7 +342,6 @@ describe('lane registration and war-council-validator pin', () => {
     for (const id of [
       'check-already-satisfied',
       'plan',
-      'implement',
       'diff-repair',
       'opus-repair',
       'apply-suggested-fix',
@@ -346,6 +350,8 @@ describe('lane registration and war-council-validator pin', () => {
       expect(buildNode?.provider, `${file}:${id}:provider`).toBe('cursor');
       expect(buildNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
     }
+    expect(node('implement')?.provider, `${file}:implement:provider`).toBe('cursor-cloud');
+    expect(node('implement')?.model, `${file}:implement:model`).toBe('grok-4.7-high');
     const content = readFileSync(join(LANES_DIR, file), 'utf-8');
     expect(content).not.toMatch(/^\s*provider:\s*claude\b/m);
     expect(content).not.toMatch(/^\s*provider:\s*(grok|codex-opr)\b/m);

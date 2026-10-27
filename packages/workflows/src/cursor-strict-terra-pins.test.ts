@@ -27,7 +27,6 @@ const promptIds = strictIds.slice(1);
 const cursorIds = [
   'check-already-satisfied',
   'plan',
-  'implement',
   'diff-repair',
   'opus-repair',
   'apply-suggested-fix',
@@ -125,9 +124,21 @@ describe('Cursor strict Terra model selection', () => {
     }
   });
 
-  test('actual Cursor root and all six Grok builder bindings are unchanged', () => {
+  test('actual Cursor root stays on cursor and implement alone uses cursor-cloud', () => {
     const w = workflow();
     expect([w.provider, w.model]).toEqual(['cursor', 'grok-4.7-high']);
+    const implement = w.nodes.find(node => node.id === 'implement');
+    expect(implement?.provider).toBe('cursor-cloud');
+    expect(implement?.model).toBe('grok-4.7-high');
+    expect(
+      resolveModelForNode({
+        nodeId: 'implement',
+        nodeProvider: implement?.provider,
+        nodeModel: implement?.model,
+        workflowProvider: w.provider!,
+        workflowModel: w.model,
+      })
+    ).toEqual({ provider: 'cursor-cloud', model: 'grok-4.7-high' });
     const builders = w.nodes.filter(node => node.provider === 'cursor');
     expect(builders.map(node => node.id)).toEqual(cursorIds);
     for (const node of builders) {

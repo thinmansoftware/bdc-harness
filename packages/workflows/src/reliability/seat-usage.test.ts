@@ -19,6 +19,7 @@ import {
   readAllSeats,
   readSeat,
   resetSeatUsageCacheForTests,
+  seatForProvider,
   restoreSeatCutoffOverride,
   seatsForBindings,
   setSeatAlertSendForTests,
@@ -196,7 +197,8 @@ describe('seat usage', () => {
     };
     const reading = await readSeat('cursor', { fetch: fetchImpl, env: {} });
     expect(reading.limit_source).toBe('UNKNOWN');
-    expect(reading.note.toLowerCase()).toContain('credential');
+    expect(reading.note).toContain('no account-usage route for a user API key');
+    expect(reading.note).toContain('FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS');
     expect(calls).toBe(0);
     expect(typeof reading.seven_day).toBe('string');
   });
@@ -674,6 +676,257 @@ describe('seat usage', () => {
       1
     );
     expect(getSeatCutoff()).toEqual({ percent: 90, source: 'default' });
+  });
+
+  test('cursor-cloud maps to the cursor seat', () => {
+    expect(seatForProvider('cursor-cloud')).toBe('cursor');
+    expect(seatForProvider('cursor')).toBe('cursor');
+  });
+
+  test('cursor api-key spend measures this month Cauldron agents only', async () => {
+    const key = 'cursor-seat-key-SECRET';
+    const now = Date.parse('2026-10-15T12:00:00.000Z');
+    const urls: string[] = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = String(input);
+      urls.push(url);
+      const headers = init?.headers as Record<string, string>;
+      expect(headers.Authorization?.startsWith('Basic ')).toBe(true);
+      expect(url).not.toContain(key);
+      if (url === 'https://api.cursor.com/v1/agents') {
+        return jsonResponse(
+          200,
+          JSON.stringify({
+            items: [
+              {
+                id: 'a1',
+                name: 'Cauldron WO-A run aaaaaaaa',
+                createdAt: '2026-10-03T00:00:00.000Z',
+              },
+              {
+                id: 'a2',
+                name: 'Cauldron WO-B run bbbbbbbb',
+                createdAt: '2026-10-04T00:00:00.000Z',
+              },
+              { id: 'other', name: 'ArcD scratch', createdAt: '2026-10-04T00:00:00.000Z' },
+              {
+                id: 'old',
+                name: 'Cauldron WO-OLD run cccccccc',
+                createdAt: '2026-09-01T00:00:00.000Z',
+              },
+            ],
+          })
+        );
+      }
+      if (url.endsWith('/a1/usage')) {
+        return jsonResponse(200, JSON.stringify({ cost: { rawCostCents: 2500 } }));
+      }
+      if (url.endsWith('/a2/usage')) {
+        return jsonResponse(200, JSON.stringify({ cost: { rawCostCents: 1500 } }));
+      }
+      return jsonResponse(500, JSON.stringify({ message: key }));
+    };
+    const reading = await readSeat('cursor', {
+      fetch: fetchImpl,
+      now: () => now,
+      env: { CURSOR_API_KEY: key, FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS: '10000' },
+    });
+    expect(reading.limit_source).toBe('measured');
+    expect(reading.windows[0]).toMatchObject({
+      name: 'monthly',
+      used_percent: 40,
+      remaining_percent: 60,
+      resets_at: '2026-11-01T00:00:00.000Z',
+    });
+    expect(reading.seven_day).toBe('NOT_APPLICABLE');
+    expect(reading.endpoint).toBe('https://api.cursor.com/v1/agents');
+    expect(reading.note).toContain('harness cloud-agent spend');
+    expect(reading.note).toContain('FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS');
+    expect(urls.some(url => url.includes('/other/usage') || url.includes('/old/usage'))).toBe(
+      false
+    );
+    expect(JSON.stringify(reading)).not.toContain(key);
+  });
+
+  test('cursor api key without a budget is a reasoned unknown and does not fetch', async () => {
+    const key = 'cursor-seat-key-SECRET';
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls += 1;
+      return jsonResponse(200, '{}');
+    };
+    const reading = await readSeat('cursor', {
+      fetch: fetchImpl,
+      env: { CURSOR_API_KEY: key },
+    });
+    expect(reading.limit_source).toBe('UNKNOWN');
+    expect(reading.note).toContain('no account-usage route for a user API key');
+    expect(reading.note).toContain('FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS');
+    expect(calls).toBe(0);
+    expect(JSON.stringify(reading)).not.toContain(key);
+  });
+
+  test('cursor agents HTTP 500 is unknown with the status and no key', async () => {
+    const key = 'cursor-seat-key-SECRET';
+    const fetchImpl: typeof fetch = async () => jsonResponse(500, JSON.stringify({ token: key }));
+    const reading = await readSeat('cursor', {
+      fetch: fetchImpl,
+      now: () => Date.parse('2026-10-15T12:00:00.000Z'),
+      env: { CURSOR_API_KEY: key, FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS: '10000' },
+    });
+    expect(reading.limit_source).toBe('UNKNOWN');
+    expect(reading.note).toContain('HTTP 500');
+    expect(reading.http_status).toBe(500);
+    expect(JSON.stringify(reading)).not.toContain(key);
+  });
+
+  test('cursor spend sums later agent pages and rejects a repeated cursor', async () => {
+    const key = 'cursor-seat-key-SECRET';
+    const now = Date.parse('2026-10-15T12:00:00.000Z');
+    const env = { CURSOR_API_KEY: key, FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS: '10000' };
+    const paged: typeof fetch = async input => {
+      const url = String(input);
+      if (url === 'https://api.cursor.com/v1/agents') {
+        return jsonResponse(
+          200,
+          JSON.stringify({
+            items: [
+              {
+                id: 'p1',
+                name: 'Cauldron WO-P1 run 11111111',
+                createdAt: '2026-10-02T00:00:00.000Z',
+              },
+            ],
+            nextCursor: 'page-2',
+          })
+        );
+      }
+      if (url.includes('cursor=page-2')) {
+        return jsonResponse(
+          200,
+          JSON.stringify({
+            items: [
+              {
+                id: 'p2',
+                name: 'Cauldron WO-P2 run 22222222',
+                createdAt: '2026-10-05T00:00:00.000Z',
+              },
+            ],
+          })
+        );
+      }
+      if (url.endsWith('/p1/usage') || url.endsWith('/p2/usage')) {
+        return jsonResponse(200, JSON.stringify({ cost: { rawCostCents: 1000 } }));
+      }
+      return jsonResponse(500, '{}');
+    };
+    const measuredPage = await readSeat('cursor', { fetch: paged, now: () => now, env });
+    expect(measuredPage.limit_source).toBe('measured');
+    expect(measuredPage.windows[0]?.used_percent).toBe(20);
+
+    resetSeatUsageCacheForTests();
+    const looped: typeof fetch = async input => {
+      const url = String(input);
+      if (url === 'https://api.cursor.com/v1/agents') {
+        return jsonResponse(200, JSON.stringify({ items: [], nextCursor: 'loop' }));
+      }
+      return jsonResponse(200, JSON.stringify({ items: [], nextCursor: 'loop' }));
+    };
+    const repeated = await readSeat('cursor', { fetch: looped, now: () => now, env });
+    expect(repeated.limit_source).toBe('UNKNOWN');
+    expect(repeated.note).toContain('repeated');
+    expect(JSON.stringify(repeated)).not.toContain(key);
+  });
+
+  test('cursor spend sums every agent page with no fixed page cap', async () => {
+    const key = 'cursor-seat-key-SECRET';
+    const now = Date.parse('2026-10-15T12:00:00.000Z');
+    let pages = 0;
+    const fetchImpl: typeof fetch = async input => {
+      const url = String(input);
+      if (url.includes('/usage')) {
+        return jsonResponse(200, JSON.stringify({ cost: { rawCostCents: 1 } }));
+      }
+      pages += 1;
+      const body: { items: unknown[]; nextCursor?: string } = {
+        items: [
+          {
+            id: `agent-${pages}`,
+            name: `Cauldron WO-${pages} run ${String(pages).padStart(8, '0')}`,
+            createdAt: '2026-10-02T00:00:00.000Z',
+          },
+        ],
+      };
+      if (pages < 101) body.nextCursor = `cursor-${pages}`;
+      return jsonResponse(200, JSON.stringify(body));
+    };
+    const reading = await readSeat('cursor', {
+      fetch: fetchImpl,
+      now: () => now,
+      env: { CURSOR_API_KEY: key, FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS: '10000' },
+    });
+    expect(pages).toBe(101);
+    expect(reading.limit_source).toBe('measured');
+    expect(reading.windows[0]?.used_percent).toBe(1.01);
+    expect(reading.note).not.toContain('page cap');
+    expect(JSON.stringify(reading)).not.toContain(key);
+  });
+
+  test('cursor spend is unknown when a counted rawCostCents is not finite', async () => {
+    const key = 'cursor-seat-key-SECRET';
+    const fetchImpl: typeof fetch = async input => {
+      const url = String(input);
+      if (url.endsWith('/v1/agents')) {
+        return jsonResponse(
+          200,
+          JSON.stringify({
+            items: [
+              {
+                id: 'bad',
+                name: 'Cauldron WO-BAD run 33333333',
+                createdAt: '2026-10-06T00:00:00.000Z',
+              },
+            ],
+          })
+        );
+      }
+      return jsonResponse(200, JSON.stringify({ cost: { rawCostCents: '2500' } }));
+    };
+    const reading = await readSeat('cursor', {
+      fetch: fetchImpl,
+      now: () => Date.parse('2026-10-15T12:00:00.000Z'),
+      env: { CURSOR_API_KEY: key, FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS: '10000' },
+    });
+    expect(reading.limit_source).toBe('UNKNOWN');
+    expect(reading.note).toContain('rawCostCents');
+    expect(JSON.stringify(reading)).not.toContain(key);
+  });
+
+  test('cursor session token still wins over the api-key budget path', async () => {
+    let url = '';
+    const fetchImpl: typeof fetch = async input => {
+      url = String(input);
+      return jsonResponse(
+        200,
+        JSON.stringify({
+          membershipType: 'ultra',
+          billingCycleEnd: '2026-10-13T00:00:00.000Z',
+          individualUsage: { plan: { used: 13, limit: 100 } },
+        })
+      );
+    };
+    const reading = await readSeat('cursor', {
+      fetch: fetchImpl,
+      env: {
+        FUELGLASS_CURSOR_SESSION_TOKEN: 'user_FIXTURE%3A%3Aa.b.c',
+        CURSOR_API_KEY: 'cursor-seat-key-SECRET',
+        FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS: '10000',
+      },
+    });
+    expect(reading.limit_source).toBe('measured');
+    expect(reading.windows[0]?.used_percent).toBe(13);
+    expect(url).toContain('https://cursor.com/api/usage-summary');
+    expect(reading.note).toBe('');
   });
 });
 

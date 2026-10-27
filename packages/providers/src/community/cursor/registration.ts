@@ -1,5 +1,6 @@
 import { isRegisteredProvider, registerProvider } from '../../registry';
 import { CURSOR_AGENT_CAPABILITIES } from './capabilities';
+import { CursorCloudAgentProvider } from './cloud-provider';
 import { CursorAgentProvider } from './provider';
 
 /**
@@ -11,12 +12,22 @@ import { CursorAgentProvider } from './provider';
  * bdc-feature-development-cursor lane).
  */
 export function registerCursorAgentProvider(): void {
-  if (isRegisteredProvider('cursor')) return;
-  registerProvider({
-    id: 'cursor',
-    displayName: 'Cursor agent (cursor-agent CLI, local subscription)',
-    factory: () => new CursorAgentProvider(),
-    capabilities: CURSOR_AGENT_CAPABILITIES,
-    builtIn: false,
-  });
+  if (!isRegisteredProvider('cursor')) {
+    registerProvider({
+      id: 'cursor',
+      displayName: 'Cursor agent (cursor-agent CLI, local subscription)',
+      factory: () => new CursorAgentProvider(),
+      capabilities: CURSOR_AGENT_CAPABILITIES,
+      builtIn: false,
+    });
+  }
+  if (!isRegisteredProvider('cursor-cloud')) {
+    registerProvider({
+      id: 'cursor-cloud',
+      displayName: 'Cursor Cloud Agent (Cloud Agents API)',
+      factory: () => new CursorCloudAgentProvider(),
+      capabilities: CURSOR_AGENT_CAPABILITIES,
+      builtIn: false,
+    });
+  }
 }

@@ -55,11 +55,15 @@ A percent below 1 or above 95 (for example 96 or 100) returns HTTP 400 with an e
 | Variable | Effect |
 | --- | --- |
 | `FUELGLASS_SEAT_CUTOFF_PERCENT` | Cutoff used when no operator override is set. Must be a number from 1 to 95. An invalid or out-of-range value falls back to 90 and logs `fuelglass.seat_cutoff_env_invalid` once. |
-| `FUELGLASS_CURSOR_SESSION_TOKEN` | Cursor session credential. If it is absent, the cursor seat is UNKNOWN (and alerts) and no request is made. |
+| `FUELGLASS_CURSOR_SESSION_TOKEN` | Cursor session cookie (`WorkosCursorSessionToken`). When this is non-empty, the cursor seat uses the cookie probe and does not call the Cloud Agents API. An invalid token is UNKNOWN. |
+| `CURSOR_API_KEY` | User API key. The cursor seat uses it only when `FUELGLASS_CURSOR_SESSION_TOKEN` is absent. |
+| `FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS` | Positive integer. Monthly budget in cents for harness cloud-agent spend. When the session token is absent and both this and `CURSOR_API_KEY` are set, the seat is measured: list agents whose names start with `Cauldron ` and whose `createdAt` is in the current UTC month, sum `cost.rawCostCents`, and compare that spend to this budget. IDE and CLI usage are not included. Provider `cursor-cloud` uses this same cursor seat. |
 | `FUELGLASS_CLAUDE_CREDENTIALS_FILE` | Claude credentials JSON path. Default `$HOME/.claude/.credentials.json`. |
 | `FUELGLASS_CODEX_AUTH_FILE` | Codex auth JSON path. Default `$HOME/.codex/auth.json`. |
 
 No environment variable turns the gate off.
+
+Cursor probe order: (1) a non-empty `FUELGLASS_CURSOR_SESSION_TOKEN` uses the cookie path above; (2) otherwise a non-empty `CURSOR_API_KEY` plus a positive integer `FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS` measures harness cloud-agent spend for the current UTC month (`used_percent` is spend / budget * 100, capped at 100, and `resets_at` is the first instant of the next UTC month); (3) otherwise the seat is a reasoned UNKNOWN whose note says a user API key has no account-usage route (Admin API `/teams/*` returns 401 Invalid Team API Key; `/v0/usage` and `/v1/usage` are 404) and that `FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS` is the gate. Any failure while measuring spend is UNKNOWN with the HTTP status and never includes the API key. The seat reading cache is 55 seconds and each probe request times out after 10 seconds.
 
 ## Unknown-seat operator alert
 

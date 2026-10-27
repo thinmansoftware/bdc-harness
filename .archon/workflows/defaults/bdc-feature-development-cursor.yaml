@@ -1,8 +1,9 @@
 name: bdc-feature-development-cursor
 description: |
-  Dedicated Cursor-rail lane for feature Work Orders. Planning, implementation,
-  and repair seats run through provider cursor (local cursor-agent CLI on the
-  operator's Cursor subscription) with grok-4.7-high. Every review and
+  Dedicated Cursor-rail lane for feature Work Orders. Planning and repair
+  seats run through local cursor / cursor-agent (provider cursor) with
+  grok-4.7-high. The implement step runs as a Cursor Cloud Agent
+  (provider cursor-cloud) on the same model. Every review and
   judge seat runs on provider codex-native-strict with gpt-5.6-terra, so the
   builder never grades its own output.
   Node graph,
@@ -841,9 +842,11 @@ nodes:
       exit 0
 
   - id: implement
-    # Dedicated Cursor builder seat. The provider contract supplies repository write
-    # and shell capabilities; downstream Sol seats independently review it.
-    provider: cursor
+    # Implement runs as one Cursor Cloud Agent (provider cursor-cloud).
+    # Planning and repair stay on local cursor / cursor-agent.
+    # The provider contract supplies repository write and shell capabilities;
+    # downstream Sol seats independently review it.
+    provider: cursor-cloud
     model: grok-4.7-high
     persona: major-build-opr
     depends_on: [prep-dependencies, repair-gate]

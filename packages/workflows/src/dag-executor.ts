@@ -3977,6 +3977,19 @@ async function executeLoopNode(
     }
   }
 
+  // Only the cursor-cloud implement loop receives run context. Other nodes
+  // stay on their own providers and are unchanged.
+  if (workflowProvider === 'cursor-cloud') {
+    const authority = await deps.store.getRunAuthority(workflowRun.id);
+    const cloudEnv: Record<string, string> = {
+      ARCHON_WORKFLOW_RUN_ID: workflowRun.id,
+    };
+    if (typeof authority?.woId === 'string' && authority.woId.length > 0) {
+      cloudEnv.WO_ID = authority.woId;
+    }
+    resolvedOptions.env = { ...(resolvedOptions.env ?? {}), ...cloudEnv };
+  }
+
   // Helper to log event store errors consistently
   const logEventStoreError = (err: Error, iteration: number): void => {
     getLog().error({ err, nodeId: node.id, iteration }, 'loop_node.iteration_event_failed');
