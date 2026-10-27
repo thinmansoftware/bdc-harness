@@ -1364,7 +1364,9 @@ nodes:
         echo "scope_authority_missing: run scope SHA is not a commit" >&2
         exit 1
       fi
-      if ! git merge-base --is-ancestor "$SCOPE_SHA" HEAD; then
+      if git merge-base --is-ancestor "$SCOPE_SHA" HEAD; then
+        :
+      else
         BASE_REF="${BASE_BRANCH:-dev}"
         RECOVERED_SCOPE_SHA=""
         for CANDIDATE_REF in "origin/$BASE_REF" "$BASE_REF"; do
@@ -4204,7 +4206,9 @@ nodes:
         fi
         REPAIR_TARGET_LEASE_SHA="${CHECKOUT_LEASE_SHA:-$REPAIR_TARGET_LIVE_OID}"
         echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LEASE_SHA}"
-        if ! git merge-base --is-ancestor "$REPAIR_TARGET_LEASE_SHA" HEAD; then
+        if git merge-base --is-ancestor "$REPAIR_TARGET_LEASE_SHA" HEAD; then
+          :
+        else
           echo "repair_target_base_not_incorporated"
           echo "ERROR: repair_target_base_not_incorporated: HEAD does not contain repair-target lease ${REPAIR_TARGET_LEASE_SHA}" >&2
           exit 1

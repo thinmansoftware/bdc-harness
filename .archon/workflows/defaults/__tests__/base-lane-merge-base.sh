@@ -86,14 +86,14 @@ unset -f git
 echo "--- Test 3: unrelated history reports no_common_history ---"
 R3="$TMP_ROOT/t3"; make_unrelated_origin "$R3"; shallow_repair_clone "$R3"
 ERR=$(cd "$R3/clone" && BMD_DEEPEN_STEP=5 BMD_DEEPEN_CAP=10 bmd_resolve_merge_base refs/remotes/origin/base HEAD 2>&1 >/dev/null); STATUS=$?
-if [ "$STATUS" -ne 0 ] && printf '%s' "$ERR" | grep -q no_common_history && ! printf '%s' "$ERR" | grep -q merge_base_fetch_failed; then pass "unrelated history classification"; else fail "unrelated history classification"; fi
+if [ "$STATUS" -ne 0 ] && printf '%s' "$ERR" | grep -q 'worktree_not_on_declared_base_lane: no_common_history' && ! printf '%s' "$ERR" | grep -q merge_base_fetch_failed; then pass "unrelated history classification"; else fail "unrelated history classification"; fi
 
 echo "--- Test 4: deepening is bounded ---"
 R4="$TMP_ROOT/t4"; make_unrelated_origin "$R4"; shallow_repair_clone "$R4"; FETCH_LOG="$R4/fetch.log"
 git() { [ "${1:-}" = fetch ] && printf '%s\n' "$*" >> "$FETCH_LOG"; "$REAL_GIT" "$@"; }
 ERR=$(cd "$R4/clone" && timeout 60 env BMD_DEEPEN_STEP=2 BMD_DEEPEN_CAP=6 bash -c "$(declare -f git); $(declare -f bmd_resolve_merge_base); bmd_resolve_merge_base refs/remotes/origin/base HEAD" 2>&1 >/dev/null); STATUS=$?
 DEEPENS=$(grep -c -- --deepen "$FETCH_LOG" || true); UNSHALLOWS=$(grep -c -- --unshallow "$FETCH_LOG" || true)
-if [ "$STATUS" -ne 0 ] && [ "$DEEPENS" -le 6 ] && [ "$UNSHALLOWS" -eq 1 ] && printf '%s' "$ERR" | grep -q no_common_history; then pass "bounded deepen and single unshallow"; else fail "bounded deepen and single unshallow"; fi
+if [ "$STATUS" -ne 0 ] && [ "$DEEPENS" -le 6 ] && [ "$UNSHALLOWS" -eq 1 ] && printf '%s' "$ERR" | grep -q 'worktree_not_on_declared_base_lane: no_common_history'; then pass "bounded deepen and single unshallow"; else fail "bounded deepen and single unshallow"; fi
 unset -f git
 
 echo "--- Test 5: resolvable full history performs no fetch ---"
@@ -106,7 +106,7 @@ unset -f git
 echo "--- Test 6: fetch failure has distinct classification ---"
 R6="$TMP_ROOT/t6"; make_related_origin "$R6"; shallow_repair_clone "$R6"; "$REAL_GIT" -C "$R6/clone" remote set-url origin "$R6/missing.git"
 ERR=$(cd "$R6/clone" && bmd_resolve_merge_base refs/remotes/origin/base HEAD 2>&1 >/dev/null); STATUS=$?
-if [ "$STATUS" -ne 0 ] && printf '%s' "$ERR" | grep -q merge_base_fetch_failed && ! printf '%s' "$ERR" | grep -q no_common_history; then pass "fetch failure classification"; else fail "fetch failure classification"; fi
+if [ "$STATUS" -ne 0 ] && printf '%s' "$ERR" | grep -q 'worktree_not_on_declared_base_lane: merge_base_fetch_failed' && ! printf '%s' "$ERR" | grep -q no_common_history; then pass "fetch failure classification"; else fail "fetch failure classification"; fi
 
 echo "--- Test 7: lane parity and generated defaults ---"
 LANES=(bdc-feature-development.yaml bdc-feature-development-astra.yaml bdc-feature-development-codex-only.yaml bdc-feature-development-codex.yaml bdc-feature-development-cursor.yaml bdc-feature-development-fable.yaml bdc-feature-development-fusion-cx-kimi.yaml bdc-feature-development-fusion-cx-qwen.yaml bdc-feature-development-grok.yaml bdc-feature-development-kimi-k3.yaml bdc-feature-development-zero-claude.yaml bdc-feature-development-zero-open.yaml bdc-feature-development-zero.yaml)

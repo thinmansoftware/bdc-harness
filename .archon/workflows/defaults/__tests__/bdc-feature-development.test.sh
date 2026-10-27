@@ -457,6 +457,17 @@ gh() {
 export -f gh 2>/dev/null || true
 export GH_USER_MODE
 
+# Keep identity resolution deterministic when the host happens to provide the
+# service-login helper selected by the production guard.
+bun() {
+  if [ "${1:-}" = /app/scripts/github-service-login.ts ]; then
+    gh api user --jq .login
+    return $?
+  fi
+  command bun "$@"
+}
+export -f bun 2>/dev/null || true
+
 reviewer_guard() {
   local REVIEWER_LOGIN="${OVERSEER_REVIEW_IDENTITY:-thinman-overseer[bot]}"
   resolve_acting_login() {
