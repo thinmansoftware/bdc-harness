@@ -683,6 +683,39 @@ describe('Test 4: INFRA-ERROR vs GATE-FAIL', () => {
     expect(loadLiveTiers().length).toBeGreaterThan(1);
   });
 
+  test('a database fire failure stays infra-alert and escalates instead of stopping as spec_error', async () => {
+    let fireCalls = 0;
+    let escalateCalled = false;
+
+    const deps: CascadeDeps = {
+      fire: async () => {
+        fireCalls += 1;
+        return {
+          ok: false,
+          runId: null,
+          conversationId: 'conv-db',
+          infraError: 'SQLITE_BUSY: database is locked',
+        };
+      },
+      poll: async () => makePollResult(),
+      judge: () => makePassVerdict(),
+      escalate: async () => {
+        escalateCalled = true;
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fireCalls).toBe(1);
+    expect(record.status).toBe('infra-alert');
+    expect(record.status).not.toBe('stopped_spec_error');
+    expect(record.attempts[0]?.outcome).toBe('infra-error');
+    expect(escalateCalled).toBe(true);
+    expect(record.telemetry.climbed).toBe(false);
+    expect(loadLiveTiers().length).toBeGreaterThan(1);
+  });
+
   test('network error (ECONNREFUSED) -> infra-alert; not gate-failed', async () => {
     let escalateCalled = false;
 

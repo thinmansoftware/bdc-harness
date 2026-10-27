@@ -277,12 +277,31 @@ async function originBranchExists(repoPath: string, branch: string): Promise<boo
 /** A Base branch value is exactly one branch name: no spaces, commas, or parentheses. */
 const SINGLE_BRANCH_NAME = /^[A-Za-z0-9._/-]+$/;
 
+/**
+ * Spec refusals stop the cascade. Transient DB, isolation, and network failures
+ * must not use this list. Keep in sync with smart-cauldron fire.ts.
+ */
+const SPEC_REFUSAL_PREFIXES = [
+  'base_branch_not_single:',
+  'declared_base_branch_not_found:',
+  'scope_authority_missing:',
+  'authority_conflict:',
+  'Cannot dispatch workflow ',
+] as const;
+
+function isSpecRefusalMessage(message: string): boolean {
+  return SPEC_REFUSAL_PREFIXES.some(prefix => message.startsWith(prefix));
+}
+
+/**
+ * Drop one enclosing backtick pair. Do not trim: leading or trailing whitespace
+ * is part of the raw value and must fail the single-branch check.
+ */
 function stripEnclosingBackticks(value: string): string {
-  const trimmed = value.trim();
-  if (trimmed.length >= 2 && trimmed.startsWith('`') && trimmed.endsWith('`')) {
-    return trimmed.slice(1, -1).trim();
+  if (value.length >= 2 && value.startsWith('`') && value.endsWith('`')) {
+    return value.slice(1, -1);
   }
-  return trimmed;
+  return value;
 }
 
 /**
@@ -324,23 +343,28 @@ export async function dispatchBackgroundWorkflow(
     prBranch?: string;
   }
 ): Promise<void> {
-  const frozenSpecSource = workflow.run_authority?.required
-    ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage)
-    : undefined;
-
   // 1. Generate worker conversation ID
   const workerPlatformId = `web-worker-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-  const authoritySource = frozenSpecSource
-    ? { ...frozenSpecSource, dispatchId: workerPlatformId }
-    : undefined;
 
-  // Pre-dispatch failures (bad Base branch, missing codebase, missing origin ref,
-  // isolation failure) are recorded on the parent conversation before they are
-  // rethrown. The conductor reads that marker and stops instead of timing out.
-  // The wrapper ends before the dispatch notification and createWorkflowRun.
+  // Spec refusals are marked pre_dispatch_refusal so the conductor stops.
+  // Transient DB, isolation, and network failures are marked pre_dispatch_infra
+  // so the conductor keeps the infrastructure path and does not stop as a spec error.
+  // freezeWorkOrderSource is inside this try: a synchronous spec-freeze throw
+  // still records a parent marker. The wrapper ends before the dispatch
+  // notification and createWorkflowRun.
   let workerConv: Awaited<ReturnType<typeof db.getOrCreateConversation>>;
   let workerCwd: string;
+  let authoritySource:
+    | (Awaited<ReturnType<typeof freezeWorkOrderSource>> & { dispatchId: string })
+    | undefined;
   try {
+    const frozenSpecSource = workflow.run_authority?.required
+      ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage)
+      : undefined;
+    authoritySource = frozenSpecSource
+      ? { ...frozenSpecSource, dispatchId: workerPlatformId }
+      : undefined;
+
     const rawDeclaredBaseBranch = frozenSpecSource
       ? extractRawDeclaredBaseBranch(frozenSpecSource.specBytes)
       : undefined;
@@ -432,16 +456,17 @@ export async function dispatchBackgroundWorkflow(
     }
   } catch (error) {
     const refusalError = toError(error);
+    const marker = isSpecRefusalMessage(refusalError.message)
+      ? 'pre_dispatch_refusal'
+      : 'pre_dispatch_infra';
     try {
-      await ctx.platform.sendMessage(
-        ctx.conversationId,
-        `pre_dispatch_refusal: ${refusalError.message}`
-      );
+      await ctx.platform.sendMessage(ctx.conversationId, `${marker}: ${refusalError.message}`);
     } catch (sendError) {
-      // Keep the original refusal. A failed marker send must not replace it.
+      // Keep the original error. A failed marker send must not replace it.
       getLog().error(
         {
           err: toError(sendError),
+          marker,
           refusal: refusalError.message,
           conversationId: ctx.conversationId,
         },

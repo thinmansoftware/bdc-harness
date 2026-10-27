@@ -320,6 +320,79 @@ describe('fireTier atomic conversation dispatch', () => {
     expect(result.infraError).toContain('run discovery timeout');
     expect(fetchCalls.some(call => call.url.includes('/messages'))).toBe(true);
   });
+
+  test('a database pre_dispatch_refusal is infrastructure, not a spec error', async () => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      fetchCalls.push({ url, init });
+      if (url.endsWith('/api/codebases')) return codebasesResponse();
+      if (url.endsWith('/api/conversations')) {
+        return Response.json({
+          conversationId: 'web-parent-db',
+          id: 'parent-db-busy',
+          dispatched: true,
+        });
+      }
+      if (url.includes('/messages')) {
+        return Response.json([
+          { content: 'pre_dispatch_refusal: SQLITE_BUSY: database is locked' },
+        ]);
+      }
+      return Response.json({ runs: [] });
+    }) as typeof globalThis.fetch;
+
+    const result = await fireTier({
+      workflowName: 'bdc-feature-development',
+      woId: 'WO-TEST-INFRA',
+      project: 'bdc-harness',
+      message: buildFireMessage('WO-TEST-INFRA', 'bdc-harness'),
+      apiBaseUrl: 'http://archon.test',
+      token: 'option-token',
+      discoverTimeoutMs: 5000,
+      discoverIntervalMs: 0,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.runId).toBeNull();
+    expect(result.errorClass).toBeUndefined();
+    expect(result.infraError).toContain('SQLITE_BUSY: database is locked');
+    expect(result.infraError ?? '').not.toContain('run discovery timeout');
+  });
+
+  test('a pre_dispatch_infra marker is returned immediately as infrastructure', async () => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      fetchCalls.push({ url, init });
+      if (url.endsWith('/api/codebases')) return codebasesResponse();
+      if (url.endsWith('/api/conversations')) {
+        return Response.json({
+          conversationId: 'web-parent-iso',
+          id: 'parent-db-iso',
+          dispatched: true,
+        });
+      }
+      if (url.includes('/messages')) {
+        return Response.json([{ content: 'pre_dispatch_infra: isolation provider timed out' }]);
+      }
+      return Response.json({ runs: [] });
+    }) as typeof globalThis.fetch;
+
+    const result = await fireTier({
+      workflowName: 'bdc-feature-development',
+      woId: 'WO-TEST-ISO',
+      project: 'bdc-harness',
+      message: buildFireMessage('WO-TEST-ISO', 'bdc-harness'),
+      apiBaseUrl: 'http://archon.test',
+      token: 'option-token',
+      discoverTimeoutMs: 5000,
+      discoverIntervalMs: 0,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errorClass).toBeUndefined();
+    expect(result.infraError).toContain('isolation provider timed out');
+    expect(result.infraError ?? '').not.toContain('run discovery timeout');
+  });
 });
 
 describe('buildFireMessage project binding', () => {

@@ -186,6 +186,9 @@ function freezeWithSpec(specText: string): void {
 describe('dispatchBackgroundWorkflow declared base-lane authority', () => {
   beforeEach(() => {
     mockResolve.mockClear();
+    mockResolve.mockImplementation((_input: unknown) =>
+      Promise.resolve({ status: 'none' as const, cwd: '/workspace/worker' })
+    );
     mockFreeze.mockClear();
     execFileCalls.length = 0;
     lsRemoteShouldFail = false;
@@ -267,6 +270,73 @@ describe('dispatchBackgroundWorkflow declared base-lane authority', () => {
     expect(sent).toContain('pre_dispatch_refusal:');
     expect(sent).toContain('base_branch_not_single');
     expect(sent).toContain('dev (bdc-harness), main (bdc-xo)');
+    expect(sent).not.toContain('Dispatching workflow');
+  });
+
+  test('trailing whitespace on Base branch is refused before origin lookup', async () => {
+    freezeWithSpec('Base branch: dev \n');
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
+
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
+      /base_branch_not_single/
+    );
+    expect(execFileCalls.length).toBe(0);
+    expect(mockResolve).toHaveBeenCalledTimes(0);
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).toContain('pre_dispatch_refusal:');
+    expect(sent).toContain('base_branch_not_single');
+    expect(sent).toContain('dev ');
+  });
+
+  test('whitespace inside a backtick-wrapped Base branch is refused', async () => {
+    freezeWithSpec('Base branch: ` dev`\n');
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
+
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
+      /base_branch_not_single/
+    );
+    expect(execFileCalls.length).toBe(0);
+    expect(mockResolve).toHaveBeenCalledTimes(0);
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).toContain('pre_dispatch_refusal:');
+    expect(sent).not.toContain('Dispatching workflow');
+  });
+
+  test('synchronous spec freeze failure is marked on the parent', async () => {
+    mockFreeze.mockImplementation(() => {
+      throw new Error('scope_authority_missing: canonical spec');
+    });
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
+
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
+      /scope_authority_missing: canonical spec/
+    );
+    expect(mockResolve).toHaveBeenCalledTimes(0);
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).toContain('pre_dispatch_refusal:');
+    expect(sent).toContain('scope_authority_missing: canonical spec');
+    expect(sent).not.toContain('pre_dispatch_infra:');
+    expect(sent).not.toContain('Dispatching workflow');
+  });
+
+  test('isolation failure is an infra marker, not a spec refusal', async () => {
+    freezeWithSpec('Base branch: dev\n');
+    mockResolve.mockImplementation(() =>
+      Promise.reject(new Error('SQLITE_BUSY: database is locked'))
+    );
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
+
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
+      /SQLITE_BUSY: database is locked/
+    );
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).toContain('pre_dispatch_infra:');
+    expect(sent).toContain('SQLITE_BUSY: database is locked');
+    expect(sent).not.toContain('pre_dispatch_refusal:');
     expect(sent).not.toContain('Dispatching workflow');
   });
 

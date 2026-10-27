@@ -6,7 +6,9 @@
  * dispatched:true. The resulting run is discovered by the returned parent
  * conversation database id; no conversation identity is fabricated locally.
  * While that poll is empty, the parent platform conversation is read for a
- * pre_dispatch_refusal marker so a spec error stops the cascade immediately.
+ * pre_dispatch_refusal marker (spec error: stop, do not climb) or a
+ * pre_dispatch_infra marker (infrastructure: return immediately, do not
+ * label it a spec error, and do not wait out discovery timeout).
  *
  * Secret boundary: apiBaseUrl and token come from the caller or environment.
  */
@@ -234,13 +236,42 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
       errorClass: 'spec_error',
     };
   }
+  if (discovered.kind === 'infra_error') {
+    return {
+      ok: false,
+      runId: null,
+      conversationId,
+      infraError: discovered.reason,
+    };
+  }
 
   return { ok: true, runId: discovered.runId, conversationId, infraError: null };
 }
 
 const PRE_DISPATCH_REFUSAL_PREFIX = 'pre_dispatch_refusal:';
+const PRE_DISPATCH_INFRA_PREFIX = 'pre_dispatch_infra:';
 
-type DiscoveryOutcome = { kind: 'run'; runId: string } | { kind: 'spec_error'; reason: string };
+/**
+ * Only these reasons are spec errors. Any other pre-dispatch failure, including
+ * a refusal-prefixed DB or isolation error, stays infrastructure so the cascade
+ * can escalate. Keep in sync with orchestrator SPEC_REFUSAL_PREFIXES.
+ */
+const SPEC_REFUSAL_PREFIXES = [
+  'base_branch_not_single:',
+  'declared_base_branch_not_found:',
+  'scope_authority_missing:',
+  'authority_conflict:',
+  'Cannot dispatch workflow ',
+] as const;
+
+type DiscoveryOutcome =
+  | { kind: 'run'; runId: string }
+  | { kind: 'spec_error'; reason: string }
+  | { kind: 'infra_error'; reason: string };
+
+function isSpecRefusalMessage(message: string): boolean {
+  return SPEC_REFUSAL_PREFIXES.some(prefix => message.startsWith(prefix));
+}
 
 function messageContent(message: unknown): string | null {
   if (typeof message !== 'object' || message === null || !('content' in message)) return null;
@@ -248,24 +279,37 @@ function messageContent(message: unknown): string | null {
   return typeof content === 'string' ? content : null;
 }
 
-/** Text after the first pre_dispatch_refusal marker, or null when none is present. */
-function refusalReasonFromMessages(body: unknown): string | null {
+function textAfterPrefix(content: string, prefix: string): string | null {
+  const at = content.indexOf(prefix);
+  if (at === -1) return null;
+  return content.slice(at + prefix.length).trim();
+}
+
+/**
+ * First pre-dispatch marker on the parent conversation.
+ * A refusal is a spec error only when its reason is a known spec code.
+ */
+function preDispatchOutcomeFromMessages(body: unknown): DiscoveryOutcome | null {
   if (!Array.isArray(body)) return null;
   for (const message of body) {
     const content = messageContent(message);
     if (content === null) continue;
-    const at = content.indexOf(PRE_DISPATCH_REFUSAL_PREFIX);
-    if (at === -1) continue;
-    return content.slice(at + PRE_DISPATCH_REFUSAL_PREFIX.length).trim();
+    const refusal = textAfterPrefix(content, PRE_DISPATCH_REFUSAL_PREFIX);
+    if (refusal !== null) {
+      if (isSpecRefusalMessage(refusal)) return { kind: 'spec_error', reason: refusal };
+      return { kind: 'infra_error', reason: refusal };
+    }
+    const infra = textAfterPrefix(content, PRE_DISPATCH_INFRA_PREFIX);
+    if (infra !== null) return { kind: 'infra_error', reason: infra };
   }
   return null;
 }
 
-async function readPreDispatchRefusal(opts: {
+async function readPreDispatchOutcome(opts: {
   platformConversationId: string;
   apiBaseUrl: string;
   token: string;
-}): Promise<string | null> {
+}): Promise<DiscoveryOutcome | null> {
   try {
     const response = await fetch(
       `${opts.apiBaseUrl}/api/conversations/${encodeURIComponent(opts.platformConversationId)}/messages`,
@@ -273,7 +317,7 @@ async function readPreDispatchRefusal(opts: {
     );
     // A non-OK messages read is not itself a refusal. Keep polling.
     if (!response.ok) return null;
-    return refusalReasonFromMessages(await response.json());
+    return preDispatchOutcomeFromMessages(await response.json());
   } catch {
     return null;
   }
@@ -312,8 +356,8 @@ async function discoverRunId(opts: {
       // A transient discovery read does not invalidate the proven dispatch.
     }
 
-    const refusal = await readPreDispatchRefusal(opts);
-    if (refusal !== null) return { kind: 'spec_error', reason: refusal };
+    const marker = await readPreDispatchOutcome(opts);
+    if (marker !== null) return marker;
 
     await new Promise<void>(resolve => setTimeout(resolve, opts.intervalMs));
   }
