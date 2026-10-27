@@ -32,8 +32,9 @@ Each run creates one randomly named container with no network, credentials,
 host ports or mounts. Automatic fires are disabled; Overseer remains stopped
 with its emergency stop set. The gate checks the actual packaged digest loader,
 captures installed tool versions, renders the packaged application in headless
-Chromium, and requires the server shutdown handler and database close evidence
-with exit zero. It restarts the same container/store and verifies another clean
+Chromium, and requires its actual heading and empty-store API results, rather
+than the static root element. Each shutdown requires fresh handler and database
+close events from that boot with exit zero. It restarts the same container/store and verifies another clean
 shutdown. Cleanup is limited to that run's own container.
 
 The output contains receipt.json, boot/shutdown logs and browser DOM. CI uploads
@@ -58,6 +59,32 @@ Upstream release records:
 The existing laptop Docker engine is not upgraded or restarted by this job;
 that would interrupt unrelated services. Its version is recorded in evidence.
 The gate fails closed if that engine cannot execute the required operations.
+
+Bun 1.4 changed strict SQLite close to finalize outstanding statements. The
+synthetic lifetime diagnostic asserts this documented contract on 1.4 and the
+older busy-connection contract on 1.3; application adapter behavior is unchanged.
+Reference: https://bun.com/reference/bun/sqlite/Database/close
+
+## Definition of done for this runtime repair
+
+- The real SQLite regression fails on old source and passes on the correction.
+- The normal container entrypoint handles SIGTERM, closes the database and exits
+  zero; a health-only smoke cannot qualify it.
+- CI and the laptop run the same unattended gate on an image tied to the exact
+  source SHA, recording its digest, tool versions and evidence automatically.
+- Linux/Windows package tests, PostgreSQL integrations, types, lint and format
+  remain required source checks. Deterministic workflow smoke uses the same Bun
+  version file. A skipped or failed required check is not a passing release.
+- Browser, migration/integrity/digest, restart and both shutdown checks produce
+  machine-readable failure and preserved logs, with cleanup of owned resources.
+- Final source review and CI results must correspond to the final candidate;
+  laptop evidence alone does not establish GitHub CI success.
+
+This is the runtime acceptance portion of the pipeline. A complete production
+promotion still needs an approved staging canary and tested data-compatible
+rollback, followed by its scoped production motion and post-deployment checks.
+Routine verification needs no human log inspection; production authorization
+remains a deliberate governance decision.
 
 ## Promotion boundary
 

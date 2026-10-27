@@ -38,8 +38,8 @@ function docker(...args: string[]): string {
   }).trim();
 }
 
-function containerLogs(): string {
-  const result = spawnSync('docker', ['logs', name], {
+function containerLogs(since?: string): string {
+  const result = spawnSync('docker', ['logs', ...(since ? ['--since', since] : []), name], {
     encoding: 'utf8',
     timeout: 30_000,
     maxBuffer: 16 * 1024 * 1024,
@@ -52,26 +52,28 @@ async function health(): Promise<unknown> {
   for (let attempt = 0; attempt < 30; attempt++) {
     const state = JSON.parse(docker('inspect', name))[0].State;
     if (!state.Running) throw new Error(`Container exited during boot: ${state.ExitCode}`);
+    let result;
     try {
-      const result = JSON.parse(
+      result = JSON.parse(
         docker('exec', name, 'curl', '-fsS', '--max-time', '2', 'http://127.0.0.1:3093/api/health')
       );
-      if (
-        result.status !== 'ok' ||
-        result.is_docker !== true ||
-        result.runningWorkflows !== 0 ||
-        result.concurrency.active !== 0 ||
-        result.concurrency.queuedTotal !== 0 ||
-        result.overseer.watcher !== 'stopped' ||
-        result.overseer.emergency_stop !== true
-      ) {
-        throw new Error('Unsafe or unhealthy staging state');
-      }
-      return result;
     } catch (error) {
       if (attempt === 29) throw error;
       await Bun.sleep(1000);
+      continue;
     }
+    if (
+      result.status !== 'ok' ||
+      result.is_docker !== true ||
+      result.runningWorkflows !== 0 ||
+      result.concurrency.active !== 0 ||
+      result.concurrency.queuedTotal !== 0 ||
+      result.overseer.watcher !== 'stopped' ||
+      result.overseer.emergency_stop !== true
+    ) {
+      throw new Error('Unsafe or unhealthy staging state');
+    }
+    return result;
   }
   throw new Error('Health deadline exceeded');
 }
@@ -80,7 +82,8 @@ function stopAndVerify(phase: string): void {
   docker('stop', '--time', '10', name);
   const state = JSON.parse(docker('inspect', name))[0].State;
   receipt[`${phase}Stop`] = state;
-  const logs = containerLogs();
+  // Docker retains logs across restarts; require this boot's own close events.
+  const logs = containerLogs(state.StartedAt as string);
   writeFileSync(join(output, `${phase}.log`), logs + '\n');
   if (state.Running || state.ExitCode !== 0 || state.OOMKilled) {
     throw new Error(`${phase}: unclean stop (exit ${state.ExitCode})`);
@@ -191,8 +194,14 @@ try {
     'http://127.0.0.1:3093'
   );
   writeFileSync(join(output, 'browser-dom.html'), dom);
-  if (!dom.includes('<html') || !dom.includes('id="root"')) {
-    throw new Error('Headless browser did not render the application document');
+  if (
+    !dom.includes('Workflow orchestration for real software work.') ||
+    !dom.includes('No active workflow runs right now.') ||
+    !dom.includes('Completed workflow history will appear here.') ||
+    dom.includes('Something went wrong') ||
+    dom.includes('Unable to load')
+  ) {
+    throw new Error('Headless browser did not render the application and empty-store API results');
   }
   receipt.browser = 'headless Chromium rendered the packaged application';
   stopAndVerify('initial');

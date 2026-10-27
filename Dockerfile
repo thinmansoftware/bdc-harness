@@ -68,8 +68,6 @@ LABEL org.opencontainers.image.licenses="MIT"
 
 # Prevent interactive prompts during installation
 ENV DEBIAN_FRONTEND=noninteractive
-ARG ARCHON_BUILD_SHA=unknown
-ENV ARCHON_BUILD_SHA=${ARCHON_BUILD_SHA}
 ARG TERRAFORM_VERSION=1.8.5
 
 WORKDIR /app
@@ -276,5 +274,9 @@ RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
 
 # Default port (matches .env.example PORT=3000)
 EXPOSE 3000
+
+# Source identity must not invalidate cached tool installation layers.
+ARG ARCHON_BUILD_SHA=unknown
+ENV ARCHON_BUILD_SHA=${ARCHON_BUILD_SHA}
 
 ENTRYPOINT ["docker-entrypoint.sh"]
