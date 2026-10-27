@@ -127,11 +127,18 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
 
       it('run-stop-tests runs after format-autofix and resolve-review-base with a 60-minute budget', () => {
         const n = node(nodes, 'run-stop-tests', file);
-        expect(n.depends_on).toEqual([
-          'format-autofix',
-          'resolve-test-command',
-          'resolve-review-base',
+        // These three lanes must not declare resolve-review-base (repair-run-guards).
+        // The base pass on them falls back to run-start-sha.txt.
+        const withoutReviewBase = new Set([
+          'bdc-feature-development-fusion-cx-kimi.yaml',
+          'bdc-feature-development-kimi-k3.yaml',
+          'bdc-feature-development-zero-claude.yaml',
         ]);
+        expect(n.depends_on).toEqual(
+          withoutReviewBase.has(file)
+            ? ['format-autofix', 'resolve-test-command']
+            : ['format-autofix', 'resolve-test-command', 'resolve-review-base']
+        );
         expect(n.timeout).toBe(3600000);
         expect(n.bash).toContain(
           "case \"$cmd\" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1"

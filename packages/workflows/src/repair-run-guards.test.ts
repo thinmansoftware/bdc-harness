@@ -34,6 +34,12 @@ const EXPECTED_LANES = [
   'bdc-feature-development.yaml',
 ];
 
+const NO_RESOLVE = new Set([
+  'bdc-feature-development-fusion-cx-kimi.yaml',
+  'bdc-feature-development-kimi-k3.yaml',
+  'bdc-feature-development-zero-claude.yaml',
+]);
+
 const EXAMPLE_BRANCH = 'feat/example-thread-0000000';
 const EXAMPLE_PR = '9999';
 
@@ -567,9 +573,16 @@ describe('repair run guards', () => {
           'RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"'
         );
       }
-      expect(nodeOf(nodes, 'resolve-review-base', file).bash ?? '', file).toContain(
-        'RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"'
-      );
+      if (NO_RESOLVE.has(file)) {
+        expect(
+          nodes.some(node => node.id === 'resolve-review-base'),
+          file
+        ).toBe(false);
+      } else {
+        expect(nodeOf(nodes, 'resolve-review-base', file).bash ?? '', file).toContain(
+          'RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"'
+        );
+      }
       expect(nodeOf(nodes, 'repair-gate', file).bash, file).toBe(codexGate);
       expect(nodeOf(nodes, 'repair-gate-fail', file).bash, file).toBe(codexFail);
       expect(nodeOf(nodes, 'repair-gate', file).depends_on, file).toEqual([
