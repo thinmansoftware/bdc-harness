@@ -48,6 +48,7 @@ function makeDeps(overrides: Partial<SubmitDeps> = {}): { deps: SubmitDeps; rec:
       return { submitted: true };
     },
     currentHeadSha: async () => HEAD,
+    currentPullRequestState: async () => ({ mergeStateStatus: 'CLEAN', mergeable: true }),
     recordReceipt: async input => {
       rec.receipts.push(input);
     },
@@ -57,6 +58,24 @@ function makeDeps(overrides: Partial<SubmitDeps> = {}): { deps: SubmitDeps; rec:
 }
 
 describe('approve path', () => {
+  test('a DIRTY PR is named pr_conflicting before review or submission', async () => {
+    let reviewed = false;
+    const { deps, rec } = makeDeps({
+      currentPullRequestState: async () => ({
+        mergeStateStatus: 'DIRTY',
+        mergeable: 'CONFLICTING',
+      }),
+      runReviewer: async () => {
+        reviewed = true;
+        throw new Error('must not run');
+      },
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('pr_conflicting');
+    expect(outcome.reason).toContain('DIRTY');
+    expect(reviewed).toBe(false);
+    expect(rec.submitted).toHaveLength(0);
+  });
   test('an approving verdict submits APPROVE', async () => {
     const { deps, rec } = makeDeps();
     const outcome = await runAndSubmitReview(WORK, deps);
