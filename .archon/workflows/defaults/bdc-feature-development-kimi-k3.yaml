@@ -2,7 +2,7 @@ name: bdc-feature-development-kimi-k3
 description: |
   Fusion frontier-candidate lane (Claude-free build path) -- KIMI K3 CANARY. Byte-
   level clone of bdc-feature-development-fusion-cx-qwen with the qwen builder-model
-  seats swapped to moonshotai/kimi-k3 (frontier-class, 1M ctx); every review seat
+  seats swapped to moonshotai/kimi-k3.1-pro (frontier-class, 1M ctx); every review seat
   (DeepSeek/Grok), root provider, node, edge, and bash block is identical to that
   template. Motivated by the broken bdc-feature-development-fable frontier lane
   (10/10 failures since 2026-07-19/20 on a harness model-resolution defect that
@@ -24,7 +24,7 @@ run_authority:
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
 provider: opr  # root: bare AI tails use OpenRouter, not Codex/Claude (Codex exhausted 2026-07-09)
-model: moonshotai/kimi-k3  # matches lane builder model; x-ai is refused on OpenRouter-backed providers (WO-HARNESS-OPENROUTER-PROVIDER-GUARD-01)
+model: moonshotai/kimi-k3.1-pro  # matches lane builder model; x-ai is refused on OpenRouter-backed providers (WO-HARNESS-OPENROUTER-PROVIDER-GUARD-01)
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -391,7 +391,7 @@ nodes:
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
     provider: openrouter
-    model: moonshotai/kimi-k3
+    model: moonshotai/kimi-k3.1-pro
     persona: war-council-architect-opr
     depends_on: [checkout-repair-target]
     task_class: clerical
@@ -514,9 +514,9 @@ nodes:
 
   - id: plan
     provider: opr
-    model: moonshotai/kimi-k3
+    model: moonshotai/kimi-k3.1-pro
     # WO-HARNESS-NODE-PROVIDER-FAILOVER-01: this builder-side planning node rides
-    # OpenRouter (kimi-k3). If OpenRouter throttles/drops (429/timeout/5xx/connection),
+    # OpenRouter (kimi-k3.1-pro). If OpenRouter throttles/drops (429/timeout/5xx/connection),
     # fall SIDEWAYS to Codex once rather than killing the run. The war-council-
     # architect-opr persona is model-less, so a codex failover carries no Anthropic
     # model pin (no InfrastructureClassBlock). NOTE: implement/diff-repair already
@@ -524,7 +524,7 @@ nodes:
     # diff-review*, war-council-validator) are intentionally NOT wired -- a gate
     # that silently switches models undermines gate integrity (spec doctrine).
     failover_provider: opr
-    failover_model: moonshotai/kimi-k3
+    failover_model: moonshotai/kimi-k3.1-pro
     persona: war-council-architect-opr
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -876,7 +876,7 @@ nodes:
 
   - id: implement
     provider: openrouter
-    model: moonshotai/kimi-k3
+    model: moonshotai/kimi-k3.1-pro
     persona: major-build-opr
     depends_on: [prep-dependencies, repair-gate]
     trigger_rule: all_done
@@ -2737,7 +2737,7 @@ nodes:
 
   - id: diff-repair
     provider: openrouter
-    model: moonshotai/kimi-k3
+    model: moonshotai/kimi-k3.1-pro
     persona: major-build-opr
     depends_on: [diff-review, classify-diff-review, repair-gate]
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-diff-review.output.verdict == 'needs_revision'"
@@ -3030,7 +3030,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: openrouter
-    model: moonshotai/kimi-k3
+    model: moonshotai/kimi-k3.1-pro
     persona: major-build-opr
     depends_on: [block-classify, repair-gate]
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $block-classify.output.status == 'BLOCKED'"
@@ -3402,7 +3402,7 @@ nodes:
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
     provider: openrouter
-    model: moonshotai/kimi-k3
+    model: moonshotai/kimi-k3.1-pro
     agent: overseer-opus
     effort: xhigh
     context: fresh
@@ -3488,7 +3488,7 @@ nodes:
   - id: decide-push-target
     persona: major-build-opr
     provider: opr
-    model: moonshotai/kimi-k3
+    model: moonshotai/kimi-k3.1-pro
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
@@ -4330,7 +4330,7 @@ nodes:
   - id: build-manifest
     persona: major-build-opr
     provider: opr
-    model: moonshotai/kimi-k3
+    model: moonshotai/kimi-k3.1-pro
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical
