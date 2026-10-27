@@ -822,10 +822,77 @@ assert_eq "t6 repeated scrub identical" "same=yes" "$(printf '%s\n' "$T6" | sed 
 assert_eq "t6 dprep skip rc" "dprep_rc=0" "$(printf '%s\n' "$T6" | sed -n '4p')"
 assert_contains "t6 dprep skip path" "dprep: no package.json with a bun lockfile, skipping" "$(printf '%s\n' "$T6" | sed -n '5p')"
 
+echo "--- dprep pnpm lockfile branch ---"
+PBIN="$(mktemp -d)"
+PREC="$PBIN/pnpm-argv.txt"
+PENV="$PBIN/pnpm-env.txt"
+BREC="$PBIN/bun-argv.txt"
+cat > "$PBIN/pnpm" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$PREC"
+printf 'GH_TOKEN=%s\\n' "\${GH_TOKEN-unset}" >> "$PENV"
+EOF
+cat > "$PBIN/bun" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$BREC"
+EOF
+chmod +x "$PBIN/pnpm" "$PBIN/bun"
+export GH_TOKEN=production-shaped-test-value
+
+echo "--- pnpm a: pnpm-lock.yaml and no node_modules installs frozen ---"
+: > "$PREC"
+: > "$PENV"
+: > "$BREC"
+PTMP="$(mktemp -d)"
+printf '{}\n' > "$PTMP/package.json"
+: > "$PTMP/pnpm-lock.yaml"
+pout="$(cd "$PTMP" && PATH="$PBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
+prc=$?
+assert_eq "pnpm a rc" "0" "$prc"
+assert_eq "pnpm a argv" "install --frozen-lockfile" "$(cat "$PREC")"
+assert_eq "pnpm a GH_TOKEN scrubbed" "GH_TOKEN=unset" "$(head -1 "$PENV")"
+assert_eq "pnpm a parent GH_TOKEN remains" "production-shaped-test-value" "${GH_TOKEN-unset}"
+assert_contains "pnpm a installing line" "dprep: installing JS dependencies (pnpm, frozen lockfile)" "$pout"
+if [ -s "$BREC" ]; then FAIL=$((FAIL + 1)); echo "FAIL: pnpm a bun not called"; else PASS=$((PASS + 1)); echo "PASS: pnpm a bun not called"; fi
+
+echo "--- pnpm b: empty directory does not call pnpm ---"
+: > "$PREC"
+PTMPB="$(mktemp -d)"
+poutb="$(cd "$PTMPB" && PATH="$PBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
+prcb=$?
+assert_eq "pnpm b rc" "0" "$prcb"
+assert_contains "pnpm b skip" "dprep: no package.json with a bun lockfile, skipping" "$poutb"
+if [ -s "$PREC" ]; then FAIL=$((FAIL + 1)); echo "FAIL: pnpm b stub not called"; else PASS=$((PASS + 1)); echo "PASS: pnpm b stub not called"; fi
+
+echo "--- pnpm c: bun.lock only takes the bun path ---"
+: > "$PREC"
+: > "$BREC"
+PTMPC="$(mktemp -d)"
+printf '{}\n' > "$PTMPC/package.json"
+: > "$PTMPC/bun.lock"
+poutc="$(cd "$PTMPC" && PATH="$PBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
+prcc=$?
+assert_eq "pnpm c rc" "0" "$prcc"
+assert_eq "pnpm c bun argv" "install --frozen-lockfile" "$(cat "$BREC")"
+assert_contains "pnpm c bun installing line" "dprep: installing JS dependencies (bun install --frozen-lockfile)" "$poutc"
+if [ -s "$PREC" ]; then FAIL=$((FAIL + 1)); echo "FAIL: pnpm c pnpm not called"; else PASS=$((PASS + 1)); echo "PASS: pnpm c pnpm not called"; fi
+
+echo "--- pnpm d: node_modules present skips pnpm ---"
+: > "$PREC"
+PTMPD="$(mktemp -d)"
+printf '{}\n' > "$PTMPD/package.json"
+: > "$PTMPD/pnpm-lock.yaml"
+mkdir -p "$PTMPD/node_modules"
+poutd="$(cd "$PTMPD" && PATH="$PBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
+prcd=$?
+assert_eq "pnpm d rc" "0" "$prcd"
+assert_contains "pnpm d skip" "dprep: node_modules present, skipping" "$poutd"
+if [ -s "$PREC" ]; then FAIL=$((FAIL + 1)); echo "FAIL: pnpm d stub not called"; else PASS=$((PASS + 1)); echo "PASS: pnpm d stub not called"; fi
+
 unset RST_NPX_BIN RST_NPM_BIN GH_TOKEN
 unset TELEGRAM_BOT_TOKEN TELEGRAM_STREAMING_MODE TELEGRAM_APPROVAL_CHAT_ID TELEGRAM_ALLOWED_USER_IDS TELEGRAM_TEST_FIXTURE
 export PATH="$ORIG_PATH"
-rm -rf "$BIN" "$TMP" "$TMP2" "$TMP3" "$TMP4" "$TMP5" "$TMP6" "$TMP7" "$RST_TG" "$T5" "$T6_EMPTY"
+rm -rf "$BIN" "$TMP" "$TMP2" "$TMP3" "$TMP4" "$TMP5" "$TMP6" "$TMP7" "$RST_TG" "$T5" "$T6_EMPTY" "$PBIN" "$PTMP" "$PTMPB" "$PTMPC" "$PTMPD"
 
 echo
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"
