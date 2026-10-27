@@ -238,6 +238,18 @@ const AUTHORITY_PREAMBLE = [
   'SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")',
 ].join('\n');
 
+// checkout-repair-target defines crt_emit before the authority read, and the
+// missing-spec arm emits a verdict before exit. Commit selection does not.
+const CHECKOUT_AUTHORITY_PREAMBLE = [
+  'RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"',
+  'if [ ! -s "$RUN_AUTHORITY_SPEC" ]; then',
+  '  echo "ERROR: scope_authority_missing: $RUN_AUTHORITY_SPEC" >&2',
+  '  crt_emit unavailable not_found',
+  '  exit 1',
+  'fi',
+  'SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")',
+].join('\n');
+
 function rewriteAuthorityRead(block: string, laneLabel: string): string {
   if (block.includes('SPEC_TEXT=$read-spec.output') || !block.includes(AUTHORITY_PREAMBLE)) {
     throw new Error(`authority read missing in ${laneLabel}`);
@@ -284,8 +296,8 @@ function extractCheckoutRepair(yaml: string, laneLabel: string): string {
   if (nodeStart < 0) {
     throw new Error(`checkout-repair-target missing in ${laneLabel}`);
   }
-  const startMarker =
-    '      set -euo pipefail\n      RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"';
+  // crt_emit sits between `set -euo pipefail` and RUN_AUTHORITY_SPEC.
+  const startMarker = '      set -euo pipefail\n';
   const start = yaml.indexOf(startMarker, nodeStart);
   const endMarker = '      echo "REPAIR_TARGET_LEASE_SHA=${REPAIR_TARGET_LIVE_OID}"';
   const end = start < 0 ? -1 : yaml.indexOf(endMarker, start);
@@ -293,7 +305,10 @@ function extractCheckoutRepair(yaml: string, laneLabel: string): string {
     throw new Error(`checkout bash anchors missing in ${laneLabel}`);
   }
   const raw = yaml.slice(start, end + endMarker.length).replace(/^      /gm, '');
-  return `${rewriteAuthorityRead(raw, laneLabel)}\n`;
+  if (raw.includes('SPEC_TEXT=$read-spec.output') || !raw.includes(CHECKOUT_AUTHORITY_PREAMBLE)) {
+    throw new Error(`authority read missing in ${laneLabel}`);
+  }
+  return `${raw.replace(CHECKOUT_AUTHORITY_PREAMBLE, 'SPEC_TEXT="${SPEC_TEXT-}"')}\n`;
 }
 
 function extractRepairTargetSelection(): string {

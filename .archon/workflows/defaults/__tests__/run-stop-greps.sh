@@ -422,6 +422,69 @@ for c in "grep -c 'Pullers billed' notes.txt" "grep -cE '^ +provider: codex' lan
 done
 assert_eq "glob expanded to both txt files" "2" "$(cd "$TMP3" && rsg_exec_pipeline "grep -c 'two words' g/*.txt | wc -l" | tr -d '[:space:]')"
 
+echo "--- grep pipe targets are only wc and head ---"
+pipe_deny() {
+  local c="$1"
+  if rsg_allow_cmd "$c"; then
+    FAIL=$((FAIL+1)); echo "FAIL: rsg allowed grep pipe target: $c"
+  else
+    PASS=$((PASS+1)); echo "PASS: rsg denied grep pipe target: $c"
+  fi
+}
+pipe_allow() {
+  local c="$1"
+  if rsg_allow_cmd "$c"; then
+    PASS=$((PASS+1)); echo "PASS: rsg allowed: $c"
+  else
+    FAIL=$((FAIL+1)); echo "FAIL: rsg denied allowed command: $c"
+  fi
+}
+pipe_deny "grep -c x f | cat"
+pipe_deny "grep -n x f | tail -n 1"
+pipe_deny "egrep x f | sort"
+pipe_deny "fgrep x f | uniq"
+pipe_deny "rg -c x dir | ls"
+pipe_deny "grep x f | wc -l | cat"
+pipe_allow "grep -c x f | wc -l"
+pipe_allow "grep -n x f | head -n 3"
+pipe_allow "grep x f | wc -l | head -n 1"
+pipe_allow "rg -n x dir | head -n 1"
+pipe_allow "find . -name x | cat"
+pipe_allow "cat f | head -n 1"
+VMA_PIPE="$(
+  eval "$VMA_CORE"
+  vma_check() {
+    local expect="$1" c="$2" rc=0
+    allow_cmd "$c" || rc=$?
+    if [ "$expect" = allow ] && [ "$rc" -eq 0 ]; then
+      echo "PASS: vma allowed: $c"
+    elif [ "$expect" = deny ] && [ "$rc" -ne 0 ]; then
+      echo "PASS: vma denied grep pipe target: $c"
+    else
+      echo "FAIL: vma expect $expect rc $rc: $c"
+    fi
+  }
+  vma_check deny "grep -c x f | cat"
+  vma_check deny "grep -n x f | tail -n 1"
+  vma_check deny "egrep x f | sort"
+  vma_check deny "grep x f | wc -l | cat"
+  vma_check allow "grep -c x f | wc -l"
+  vma_check allow "grep -n x f | head -n 3"
+  vma_check allow "grep x f | wc -l | head -n 1"
+  vma_check allow "find . -name x | cat"
+  vma_check allow "cat f | head -n 1"
+)"
+while IFS= read -r line; do
+  case "$line" in
+    PASS:*) PASS=$((PASS+1)); echo "$line" ;;
+    FAIL:*) FAIL=$((FAIL+1)); echo "$line" ;;
+    '') ;;
+    *) FAIL=$((FAIL+1)); echo "FAIL: unexpected vma pipe line: $line" ;;
+  esac
+done <<EOF
+$VMA_PIPE
+EOF
+
 echo "--- checkout-repair-target verdict on every path (Test 4) ---"
 extract_bash_node() {
   awk -v id="$2" '

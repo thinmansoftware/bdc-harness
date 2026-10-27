@@ -849,7 +849,9 @@ nodes:
         else
           repair_gate_detail="${crt_status}:${crt_reason}"
         fi
-        printf '%s\n' "{\"REPAIR_GATE\":\"closed\",\"REPAIR_GATE_ALLOW\":\"no\",\"REPAIR_GATE_REASON\":\"checkout_failed\",\"REPAIR_GATE_DETAIL\":\"${repair_gate_detail}\"}"
+        # JSON-escape the detail. A worktree holder path may contain quotes or backslashes.
+        repair_gate_detail_json=$(printf '%s' "$repair_gate_detail" | python3 -c 'import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))')
+        printf '%s\n' "{\"REPAIR_GATE\":\"closed\",\"REPAIR_GATE_ALLOW\":\"no\",\"REPAIR_GATE_REASON\":\"checkout_failed\",\"REPAIR_GATE_DETAIL\":${repair_gate_detail_json}}"
         exit 0
       fi
       if [ ! -s "$PLAN_OUT_FILE" ]; then
@@ -884,7 +886,7 @@ nodes:
       DETAIL=""
       if [ -n "$GATE_OUT" ]; then
         REASON=$(printf '%s\n' "$GATE_OUT" | sed -n 's/.*"REPAIR_GATE_REASON":"\([^"]*\)".*/\1/p' | head -n 1)
-        DETAIL=$(printf '%s\n' "$GATE_OUT" | sed -n 's/.*"REPAIR_GATE_DETAIL":"\([^"]*\)".*/\1/p' | head -n 1)
+        DETAIL=$(printf '%s\n' "$GATE_OUT" | python3 -c $'import json,sys\nraw=sys.stdin.read().strip()\nobj={}\ntry:\n    obj=json.loads(raw) if raw else {}\nexcept Exception:\n    obj={}\nval=obj.get("REPAIR_GATE_DETAIL") if isinstance(obj, dict) else None\nsys.stdout.write(val if isinstance(val, str) else "")')
       fi
       if [ -z "$REASON" ]; then
         echo "repair_gate_closed: gate_output_missing" >&2
@@ -2610,6 +2612,7 @@ nodes:
         set -- "${stripped[@]}"
         runner="$1"
         shift
+        RSG_SEGMENT_RUNNER="$runner"
         case "$runner" in
           grep|egrep|fgrep|rg)
             rsg_has_grep_flag "$@" && return 1
@@ -2635,9 +2638,10 @@ nodes:
       #   '|' is rejected because the split breaks the quote and rsg_split_segment
       #   then fails. Double quotes stay dropped. awk/sed/xargs and anything not
       #   listed are rejected because they are not allowlisted runners. At most
-      #   one single-quoted token is accepted per segment.
+      #   one single-quoted token is accepted per segment. A grep, egrep,
+      #   fgrep, or rg segment may be followed only by wc or head.
       rsg_allow_cmd() {
-        local c="$1" work segment
+        local c="$1" work segment grep_upstream=0
         case "$c" in
           *';'*|*'&'*|*'`'*|*'$('*|*'$'*|*'>'*|*'<'*|*$'\n'*|*'"'*|*'\\'*|*'||'*) return 1 ;;
         esac
@@ -2648,6 +2652,15 @@ nodes:
             *) segment="$work"; work='' ;;
           esac
           rsg_argv_looks_readonly "$segment" || return 1
+          if [ "$grep_upstream" -eq 1 ]; then
+            case "$RSG_SEGMENT_RUNNER" in
+              wc|head) ;;
+              *) return 1 ;;
+            esac
+          fi
+          case "$RSG_SEGMENT_RUNNER" in
+            grep|egrep|fgrep|rg) grep_upstream=1 ;;
+          esac
           [ -z "$work" ] && break
         done
         return 0

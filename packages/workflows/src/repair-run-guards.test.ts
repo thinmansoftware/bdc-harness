@@ -257,12 +257,14 @@ function gateJson(stdout: string): {
   REPAIR_GATE: string;
   REPAIR_GATE_ALLOW: string;
   REPAIR_GATE_REASON?: string;
+  REPAIR_GATE_DETAIL?: string;
 } {
   const line = stdout.trim();
   return JSON.parse(line) as {
     REPAIR_GATE: string;
     REPAIR_GATE_ALLOW: string;
     REPAIR_GATE_REASON?: string;
+    REPAIR_GATE_DETAIL?: string;
   };
 }
 
@@ -428,6 +430,40 @@ describe('repair run guards', () => {
       const failRun = runRepairGate(fail.bash ?? '', undefined, { 'repair-gate.out': closed });
       expect(failRun.exitCode, file).toBe(1);
       expect(failRun.stderr, file).toContain('repair_gate_closed: checkout_failed');
+    }
+  });
+
+  it('holder_path_in_repair_gate_detail_stays_json', () => {
+    const spec = heavySpec(repairDeclaration(EXAMPLE_PR, EXAMPLE_BRANCH));
+    const holder = '/tmp/hold"er\\path';
+    const checkout = [
+      'REPAIR_TARGET_STATUS=held',
+      'REPAIR_TARGET_REASON=branch_held',
+      `REPAIR_TARGET_HOLDER=${holder}`,
+      '',
+    ].join('\n');
+    const expected = `held:branch_held:${holder}`;
+    for (const file of EXPECTED_LANES) {
+      const nodes = nodesOf(file);
+      const gate = nodeOf(nodes, 'repair-gate', file);
+      const fail = nodeOf(nodes, 'repair-gate-fail', file);
+      const result = runRepairGate(gate.bash ?? '', spec, {
+        'checkout-repair-target.out': checkout,
+      });
+      const label = `${file}\n${result.stdout}\n${result.stderr}`;
+      expect(result.exitCode, label).toBe(0);
+      const parsed = gateJson(result.stdout);
+      expect(parsed.REPAIR_GATE, label).toBe('closed');
+      expect(parsed.REPAIR_GATE_ALLOW, label).toBe('no');
+      expect(parsed.REPAIR_GATE_REASON, label).toBe('checkout_failed');
+      expect(parsed.REPAIR_GATE_DETAIL, label).toBe(expected);
+      const failRun = runRepairGate(fail.bash ?? '', spec, {
+        'repair-gate.out': result.stdout.trim(),
+      });
+      expect(failRun.exitCode, label).toBe(1);
+      expect(failRun.stderr, label).toContain(
+        `repair_gate_closed: checkout_failed REPAIR_GATE_DETAIL=${expected}`
+      );
     }
   });
 
