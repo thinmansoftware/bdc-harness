@@ -938,3 +938,17 @@ describe('blocker_report (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', () =>
     expect(proposal?.body).not.toContain('bluedevilcollectibles');
   });
 });
+
+describe('composeNudgeBody labelled owner', () => {
+  test('nudge names the labelled owner', () => {
+    const adoption = makeAdoption({
+      title: 'M-144 support rail',
+      owner_login: 'cursor',
+      next_action: 'continue the support rail',
+    });
+    const body = composeNudgeBody(thread(), adoption, NOW_MS);
+    expect(body).not.toBeNull();
+    expect(body).toContain('owner: cursor');
+    expect(body).not.toContain('owner: UNKNOWN');
+  });
+});
