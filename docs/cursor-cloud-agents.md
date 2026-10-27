@@ -59,8 +59,8 @@ Without an abort, terminal `ERROR`, `EXPIRED`, or `CANCELLED` throws an error th
 
 When the Cursor run status is `FINISHED`:
 
-1. `git fetch origin <branch>`.
-2. Resolve `origin/<branch>`. If the fetch fails or the branch is missing, the node throws `CURSOR_CLOUD_HEAD_MISSING`.
+1. `git fetch origin +refs/heads/<branch>:refs/remotes/origin/<branch>`. The destination ref is explicit so the fetched tip is not left only in `FETCH_HEAD`.
+2. Resolve `refs/remotes/origin/<branch>` (the ref just fetched). If the fetch fails or the branch is missing, the node throws `CURSOR_CLOUD_HEAD_MISSING`.
 3. Require the pre-dispatch SHA to be an ancestor of the fetched head (`git merge-base --is-ancestor`). Otherwise throw `CURSOR_CLOUD_HEAD_DIVERGED`.
 4. `git merge --ff-only` the fetched head.
 5. Require `git rev-parse HEAD` to equal that fetched head.

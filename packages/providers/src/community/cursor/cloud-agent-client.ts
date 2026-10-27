@@ -185,10 +185,16 @@ export class CursorCloudAgentClient {
     return run;
   }
 
-  async getRun(agentId: string, runId: string): Promise<CursorCloudRunRecord> {
+  async getRun(
+    agentId: string,
+    runId: string,
+    signal?: AbortSignal
+  ): Promise<CursorCloudRunRecord> {
     const payload = await this.request(
       'GET',
-      `/v1/agents/${encodeURIComponent(agentId)}/runs/${encodeURIComponent(runId)}`
+      `/v1/agents/${encodeURIComponent(agentId)}/runs/${encodeURIComponent(runId)}`,
+      undefined,
+      signal
     );
     const run = runFrom(payload);
     if (!run) {
@@ -236,7 +242,12 @@ export class CursorCloudAgentClient {
     };
   }
 
-  private async request(method: string, path: string, body?: unknown): Promise<unknown> {
+  private async request(
+    method: string,
+    path: string,
+    body?: unknown,
+    signal?: AbortSignal
+  ): Promise<unknown> {
     const url = `${this.baseUrl}${path}`;
     const headers: Record<string, string> = {
       Authorization: this.authorization,
@@ -249,7 +260,12 @@ export class CursorCloudAgentClient {
     }
     let response: Response;
     try {
-      response = await this.fetchImpl(url, { method, headers, body: payload });
+      response = await this.fetchImpl(url, {
+        method,
+        headers,
+        body: payload,
+        ...(signal ? { signal } : {}),
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : 'cursor-cloud request failed';
       throw new Error(redact(message, this.apiKey));

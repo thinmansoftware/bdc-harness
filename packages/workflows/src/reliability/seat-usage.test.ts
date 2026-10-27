@@ -838,6 +838,40 @@ describe('seat usage', () => {
     expect(JSON.stringify(repeated)).not.toContain(key);
   });
 
+  test('cursor spend sums every agent page with no fixed page cap', async () => {
+    const key = 'cursor-seat-key-SECRET';
+    const now = Date.parse('2026-10-15T12:00:00.000Z');
+    let pages = 0;
+    const fetchImpl: typeof fetch = async input => {
+      const url = String(input);
+      if (url.includes('/usage')) {
+        return jsonResponse(200, JSON.stringify({ cost: { rawCostCents: 1 } }));
+      }
+      pages += 1;
+      const body: { items: unknown[]; nextCursor?: string } = {
+        items: [
+          {
+            id: `agent-${pages}`,
+            name: `Cauldron WO-${pages} run ${String(pages).padStart(8, '0')}`,
+            createdAt: '2026-10-02T00:00:00.000Z',
+          },
+        ],
+      };
+      if (pages < 101) body.nextCursor = `cursor-${pages}`;
+      return jsonResponse(200, JSON.stringify(body));
+    };
+    const reading = await readSeat('cursor', {
+      fetch: fetchImpl,
+      now: () => now,
+      env: { CURSOR_API_KEY: key, FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS: '10000' },
+    });
+    expect(pages).toBe(101);
+    expect(reading.limit_source).toBe('measured');
+    expect(reading.windows[0]?.used_percent).toBe(1.01);
+    expect(reading.note).not.toContain('page cap');
+    expect(JSON.stringify(reading)).not.toContain(key);
+  });
+
   test('cursor spend is unknown when a counted rawCostCents is not finite', async () => {
     const key = 'cursor-seat-key-SECRET';
     const fetchImpl: typeof fetch = async input => {

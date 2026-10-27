@@ -47,7 +47,6 @@ const CURSOR_CLOUD_SPEND_NOTE =
   'basis: harness cloud-agent spend vs FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS; IDE and CLI usage are not visible to a user API key';
 const CURSOR_NO_ACCOUNT_USAGE_NOTE =
   'Cursor has no account-usage route for a user API key (Admin API /teams/* returns 401 Invalid Team API Key; /v0/usage and /v1/usage are 404); set FUELGLASS_CURSOR_MONTHLY_BUDGET_CENTS (John decision) to gate on harness cloud-agent spend';
-const CURSOR_AGENT_PAGE_CAP = 100;
 const CLAUDE_BETA = 'oauth-2025-04-20';
 const CURSOR_COOKIE = 'WorkosCursorSessionToken';
 const CODEX_SEVEN_DAY_SECONDS = 604800;
@@ -488,7 +487,7 @@ async function probeCursorCloudSpend(
   const seenCursors = new Set<string>();
   let cursor: string | undefined;
   const agentIds: string[] = [];
-  for (let page = 0; page < CURSOR_AGENT_PAGE_CAP; page += 1) {
+  for (;;) {
     const url = cursor
       ? `${CURSOR_AGENTS_ENDPOINT}?cursor=${encodeURIComponent(cursor)}`
       : CURSOR_AGENTS_ENDPOINT;
@@ -518,7 +517,6 @@ async function probeCursorCloudSpend(
     }
     const nextCursor = listed.body.nextCursor;
     if (typeof nextCursor !== 'string' || nextCursor.length === 0) {
-      cursor = undefined;
       break;
     }
     if (seenCursors.has(nextCursor)) {
@@ -526,9 +524,6 @@ async function probeCursorCloudSpend(
     }
     seenCursors.add(nextCursor);
     cursor = nextCursor;
-  }
-  if (cursor) {
-    return cursorSpendUnknown('Cursor agents list exceeded page cap');
   }
 
   let spend = 0;

@@ -33,6 +33,7 @@ interface HarnessOptions {
   stayRunning?: boolean;
   conflict?: boolean;
   gitMode?: 'ok' | 'diverged' | 'missing' | 'detached';
+  abortOnHungGetRun?: AbortController;
   markerAlready?: boolean;
   issueCount?: number;
   cli?: CursorAgentProvider;
@@ -96,6 +97,7 @@ function makeHarness(options: HarnessOptions = {}): {
   const recorded: CursorCloudAgentMetadata[] = [];
   const gets = new Map<string, number>();
   let cancelled = false;
+  let hungGetRun = false;
   let head = PRE;
   let originStep = 0;
   const apiKey = options.apiKey === undefined ? API_KEY : options.apiKey;
@@ -144,6 +146,14 @@ function makeHarness(options: HarnessOptions = {}): {
       return jsonResponse(200, {});
     }
     if (method === 'GET' && path.includes('/runs/')) {
+      if (options.abortOnHungGetRun && !hungGetRun) {
+        hungGetRun = true;
+        expect(init?.signal).toBe(options.abortOnHungGetRun.signal);
+        options.abortOnHungGetRun.abort();
+        const abortError = new Error('The operation was aborted');
+        abortError.name = 'AbortError';
+        throw abortError;
+      }
       const runId = decodeURIComponent(path.split('/runs/')[1] ?? 'run');
       const agentId = decodeURIComponent(path.split('/')[3] ?? 'bc-test');
       if (cancelled) {
@@ -191,9 +201,16 @@ function makeHarness(options: HarnessOptions = {}): {
     if (args[0] === 'push') return ok('');
     if (args[0] === 'fetch') {
       if (options.gitMode === 'missing') return fail('remote branch missing');
+      const refspec = args[2] ?? '';
+      if (args[1] !== 'origin' || !refspec.includes(':refs/remotes/origin/')) {
+        return fail(`fetch did not write an explicit remote ref: ${args.join(' ')}`);
+      }
       return ok('');
     }
     if (args[0] === 'rev-parse' && args[1]?.startsWith('origin/')) {
+      return ok(PRE);
+    }
+    if (args[0] === 'rev-parse' && args[1]?.startsWith('refs/remotes/origin/')) {
       if (options.gitMode === 'missing') return fail('unknown revision');
       if (options.gitMode === 'diverged') return ok(DIVERGED);
       return ok(originStep === 0 ? ONE : TWO);
@@ -398,6 +415,24 @@ describe('CursorCloudAgentProvider', () => {
     expect(harness.gitArgv.some(argv => argv[1] === 'fetch')).toBe(false);
   });
 
+  test('a hung getRun is aborted with the workflow signal and still cancels', async () => {
+    const controller = new AbortController();
+    const harness = makeHarness({ abortOnHungGetRun: controller });
+    const chunks = await collect(
+      harness.provider.sendQuery('implement the work order', '/work/tree', undefined, {
+        ...queryOptions(),
+        abortSignal: controller.signal,
+      })
+    );
+    const cancels = harness.requests.filter(
+      request => request.method === 'POST' && request.url.endsWith('/cancel')
+    );
+    expect(cancels).toHaveLength(1);
+    expect(assistantText(chunks)).toContain('CURSOR_CLOUD_CANCELLED=run-1');
+    expect(assistantText(chunks)).not.toContain('CURSOR_CLOUD_HEAD_VERIFIED=');
+    expect(harness.gitArgv.some(argv => argv[1] === 'fetch')).toBe(false);
+  });
+
   test('a descendant head is fast-forwarded and verified before return', async () => {
     const harness = makeHarness();
     const chunks = await collect(
@@ -408,6 +443,22 @@ describe('CursorCloudAgentProvider', () => {
         queryOptions()
       )
     );
+    expect(
+      harness.gitArgv.some(
+        argv =>
+          argv[1] === 'fetch' &&
+          argv[2] === 'origin' &&
+          argv[3] === '+refs/heads/feature/work:refs/remotes/origin/feature/work'
+      )
+    ).toBe(true);
+    expect(
+      harness.gitArgv.some(
+        argv => argv[1] === 'rev-parse' && argv[2] === 'refs/remotes/origin/feature/work'
+      )
+    ).toBe(true);
+    expect(
+      harness.gitArgv.some(argv => argv[1] === 'rev-parse' && argv[2]?.startsWith('origin/'))
+    ).toBe(false);
     expect(
       harness.gitArgv.some(
         argv => argv[1] === 'merge' && argv[2] === '--ff-only' && argv[3] === ONE
@@ -648,7 +699,8 @@ describe('CursorCloudAgentProvider', () => {
           if (args[0] === 'rev-parse' && args[1] === '--abbrev-ref') return ok('feature/work');
           if (args[0] === 'rev-parse' && args[1] === 'HEAD') return ok(PRE);
           if (args[0] === 'push' || args[0] === 'fetch') return ok('');
-          if (args[0] === 'rev-parse' && args[1]?.startsWith('origin/')) return ok(PRE);
+          if (args[0] === 'rev-parse' && args[1]?.startsWith('refs/remotes/origin/'))
+            return ok(PRE);
           if (args[0] === 'merge-base' || args[0] === 'merge') return ok('');
           return fail(args.join(' '));
         },

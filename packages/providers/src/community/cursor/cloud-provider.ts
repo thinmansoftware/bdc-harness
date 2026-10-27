@@ -534,8 +534,12 @@ export class CursorCloudAgentProvider implements IAgentProvider {
       }
       let run: CursorCloudRunRecord;
       try {
-        run = await client.getRun(binding.agentId, cloudRunId);
+        run = await client.getRun(binding.agentId, cloudRunId, signal);
       } catch (err) {
+        if (signal?.aborted) {
+          yield* this.cancel(client, binding.agentId, cloudRunId, key);
+          return;
+        }
         throw this.fail(err instanceof Error ? err.message : 'cursor-cloud poll failed', key);
       }
       const stamp = `${run.status}\n${run.updatedAt ?? ''}`;
@@ -593,11 +597,16 @@ export class CursorCloudAgentProvider implements IAgentProvider {
     preDispatchSha: string,
     key: string
   ): Promise<string> {
-    const fetched = await this.gitResult(cwd, ['fetch', 'origin', branch]);
+    const remoteRef = `refs/remotes/origin/${branch}`;
+    const fetched = await this.gitResult(cwd, [
+      'fetch',
+      'origin',
+      `+refs/heads/${branch}:${remoteRef}`,
+    ]);
     if (fetched.code !== 0) {
       throw this.fail('CURSOR_CLOUD_HEAD_MISSING', key);
     }
-    const tip = await this.gitResult(cwd, ['rev-parse', `origin/${branch}`]);
+    const tip = await this.gitResult(cwd, ['rev-parse', remoteRef]);
     if (tip.code !== 0 || !tip.stdout) {
       throw this.fail('CURSOR_CLOUD_HEAD_MISSING', key);
     }
