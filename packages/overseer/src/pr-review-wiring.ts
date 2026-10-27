@@ -926,6 +926,20 @@ export function createRealSubmitDeps(
   const runEvaluation = overrides.evaluate ?? evaluatePullRequest;
   return {
     reviewerIdentity,
+    async fetchPullRequestMergeability(input): Promise<PullRequestMergeability> {
+      // Same REST mapping as createRealIngestDeps. Uses the submit octokit,
+      // which is already constructed for this dependency set.
+      const pr = await octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.prNumber,
+      });
+      return {
+        mergeableState: pr.data.mergeable_state,
+        baseRef: pr.data.base?.ref,
+        baseSha: pr.data.base?.sha,
+      };
+    },
     async runReviewer(work): Promise<ReviewerVerdict> {
       const result = await runEvaluation(
         {
