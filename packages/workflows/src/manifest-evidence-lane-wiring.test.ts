@@ -99,15 +99,15 @@ function coreOf(bash: string, marker: string): string {
 }
 
 describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
-  it('only honors harness root overrides whose git origin is the trusted harness repository', () => {
-    const lanes = readdirSync(LANES_DIR)
-      .filter(file => file.endsWith('.yaml'))
-      .map(file => readFileSync(join(LANES_DIR, file), 'utf8'))
-      .filter(content => content.includes('HARNESS_ROOT_OVERRIDE'));
+  it('only honors harness root overrides at canonical harness install locations', () => {
+    const lanes = EXPECTED_LANES.map(file => readFileSync(join(LANES_DIR, file), 'utf8'));
     expect(lanes.length).toBeGreaterThan(0);
     for (const content of lanes) {
-      expect(content).not.toContain('if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then');
+      expect(content).toContain('override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE"');
       expect(content).toContain(
+        '/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/*)'
+      );
+      expect(content).not.toContain(
         'git -C "$HARNESS_ROOT_OVERRIDE" remote get-url origin 2>/dev/null'
       );
     }
