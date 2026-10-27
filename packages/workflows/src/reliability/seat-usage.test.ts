@@ -179,6 +179,7 @@ describe('seat usage', () => {
     const reading = await readSeat('cursor', {
       fetch: fetchImpl,
       env: { FUELGLASS_CURSOR_SESSION_TOKEN: 'user_FIXTURE%3A%3Aa.b.c' },
+      loadPushedReading: async () => null,
     });
     expect(reading.limit_source).toBe('measured');
     expect(reading.windows[0]).toMatchObject({ name: 'monthly', used_percent: 13 });
@@ -194,7 +195,11 @@ describe('seat usage', () => {
       calls += 1;
       return jsonResponse(200, '{}');
     };
-    const reading = await readSeat('cursor', { fetch: fetchImpl, env: {} });
+    const reading = await readSeat('cursor', {
+      fetch: fetchImpl,
+      env: {},
+      loadPushedReading: async () => null,
+    });
     expect(reading.limit_source).toBe('UNKNOWN');
     expect(reading.note.toLowerCase()).toContain('credential');
     expect(calls).toBe(0);
@@ -275,6 +280,7 @@ describe('seat usage', () => {
       claudeCredentialsFile,
       codexAuthFile,
       env: { FUELGLASS_CURSOR_SESSION_TOKEN: 'user_FIXTURE%3A%3Aa.b.c' },
+      loadPushedReading: async () => null,
     };
     await Promise.all(Array.from({ length: 10 }, () => readAllSeats(deps)));
     const afterBurst = calls;
@@ -626,6 +632,7 @@ describe('seat usage', () => {
       await readSeat('cursor', {
         fetch: cursorFetch,
         env: { FUELGLASS_CURSOR_SESSION_TOKEN: 'user_FIXTURE%3A%3Aa.b.c' },
+        loadPushedReading: async () => null,
       }),
     ];
     resetSeatUsageCacheForTests();
@@ -674,6 +681,151 @@ describe('seat usage', () => {
       1
     );
     expect(getSeatCutoff()).toEqual({ percent: 90, source: 'default' });
+  });
+
+  test('pushed_reading_fresh_wins_over_direct_probe', async () => {
+    const now = Date.parse('2026-10-27T13:05:11.000Z');
+    const observedAt = '2026-10-27T13:00:11.000Z';
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls += 1;
+      throw new Error('direct probe must not run');
+    };
+    const reading = await readSeat('cursor', {
+      now: () => now,
+      env: {},
+      fetch: fetchImpl,
+      loadPushedReading: async () => ({
+        used_percent: 35.28,
+        remaining_percent: 64.72,
+        resets_at: '2026-11-13T16:33:08.000Z',
+        observed_at: observedAt,
+        source: 'desktop-fuelglass',
+      }),
+    });
+    expect(reading.limit_source).toBe('measured');
+    expect(reading.windows).toEqual([
+      {
+        name: 'monthly',
+        used_percent: 35.28,
+        remaining_percent: 64.72,
+        resets_at: '2026-11-13T16:33:08.000Z',
+      },
+    ]);
+    expect(reading.reading_source).toBe('pushed');
+    expect(reading.observed_at).toBe(observedAt);
+    expect(reading.seven_day).toBe('NOT_APPLICABLE');
+    expect(calls).toBe(0);
+  });
+
+  test('pushed_reading_stale_reading_stale_alerts_operator', async () => {
+    const now = Date.parse('2026-10-27T13:31:00.000Z');
+    const observedAt = '2026-10-27T13:00:00.000Z';
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls += 1;
+      throw new Error('direct probe must not run');
+    };
+    const reading = await readSeat('cursor', {
+      now: () => now,
+      env: { FUELGLASS_CURSOR_SESSION_TOKEN: 'user_FIXTURE%3A%3Aa.b.c' },
+      fetch: fetchImpl,
+      loadPushedReading: async () => ({
+        used_percent: 35.28,
+        remaining_percent: 64.72,
+        resets_at: '2026-11-13T16:33:08.000Z',
+        observed_at: observedAt,
+        source: 'desktop-fuelglass',
+      }),
+    });
+    expect(reading.limit_source).toBe('UNKNOWN');
+    expect(reading.note.startsWith('reading_stale')).toBe(true);
+    expect(reading.note).toContain('31');
+    expect(reading.note).toContain(observedAt);
+    expect(reading.reading_source).toBe('pushed');
+    expect(reading.observed_at).toBe(observedAt);
+    const decision = decideSeatGate([{ providerId: 'cursor' }], { cursor: reading }, 90);
+    expect(decision.refused).toBe(false);
+    expect(decision.unknownSeats).toContain('cursor');
+    for (const seat of decision.unknownSeats) {
+      await alertUnknownSeat(seat, reading.note, { now });
+    }
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]?.data.body.split('\n')[0]).toBe(
+      'Fuelglass seat gate could not measure seat cursor'
+    );
+    expect(calls).toBe(0);
+  });
+
+  test('pushed_reading_absent_uses_direct_probe', async () => {
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls += 1;
+      return jsonResponse(200, '{}');
+    };
+    const reading = await readSeat('cursor', {
+      fetch: fetchImpl,
+      env: {},
+      loadPushedReading: async () => null,
+    });
+    expect(reading.limit_source).toBe('UNKNOWN');
+    expect(reading.note).toContain('no Cursor session credential in this environment');
+    expect(reading.reading_source).toBeUndefined();
+    expect(calls).toBe(0);
+  });
+
+  test('pushed_reading_read_failed_falls_through', async () => {
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls += 1;
+      return jsonResponse(200, '{}');
+    };
+    const reading = await readSeat('cursor', {
+      fetch: fetchImpl,
+      env: {},
+      loadPushedReading: async () => {
+        throw new Error('db down');
+      },
+    });
+    expect(logs.filter(entry => entry.msg === 'fuelglass.pushed_reading_read_failed')).toHaveLength(
+      1
+    );
+    expect(reading.limit_source).toBe('UNKNOWN');
+    expect(reading.note).toContain('no Cursor session credential in this environment');
+    expect(calls).toBe(0);
+  });
+
+  test('pushed_reading_refuses_run_at_cutoff', async () => {
+    const now = Date.parse('2026-10-27T13:05:11.000Z');
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls += 1;
+      throw new Error('direct probe must not run');
+    };
+    const seats = await readAllSeats({
+      now: () => now,
+      env: {},
+      fetch: fetchImpl,
+      claudeCredentialsFile: '/tmp/seat-usage-no-such-claude.json',
+      codexAuthFile: '/tmp/seat-usage-no-such-codex.json',
+      loadPushedReading: async () => ({
+        used_percent: 91,
+        remaining_percent: 9,
+        resets_at: '2026-11-13T16:33:08.000Z',
+        observed_at: '2026-10-27T13:00:11.000Z',
+        source: 'desktop-fuelglass',
+      }),
+    });
+    const decision = decideSeatGate([{ providerId: 'cursor' }], seats, 90);
+    expect(decision).toEqual({
+      refused: true,
+      seat: 'cursor',
+      window: 'monthly',
+      usedPercent: 91,
+      cutoffPercent: 90,
+      unknownSeats: [],
+    });
+    expect(calls).toBe(0);
   });
 });
 

@@ -55,11 +55,66 @@ A percent below 1 or above 95 (for example 96 or 100) returns HTTP 400 with an e
 | Variable | Effect |
 | --- | --- |
 | `FUELGLASS_SEAT_CUTOFF_PERCENT` | Cutoff used when no operator override is set. Must be a number from 1 to 95. An invalid or out-of-range value falls back to 90 and logs `fuelglass.seat_cutoff_env_invalid` once. |
-| `FUELGLASS_CURSOR_SESSION_TOKEN` | Cursor session credential. If it is absent, the cursor seat is UNKNOWN (and alerts) and no request is made. |
+| `FUELGLASS_CURSOR_SESSION_TOKEN` | Cursor session credential. The Cursor session credential is never set on the server. Desktop pushes measure the cursor seat. When no pushed reading has arrived, or the latest push is stale, the existing direct probe runs and the cursor seat stays UNKNOWN because this variable is absent. |
+| `FUELGLASS_PUSHED_READING_MAX_AGE_MINUTES` | How long a pushed cursor reading stays fresh. Default 30. Accepted integers are 1 to 1440. An invalid value falls back to 30 and logs `fuelglass.pushed_reading_max_age_env_invalid` once. |
 | `FUELGLASS_CLAUDE_CREDENTIALS_FILE` | Claude credentials JSON path. Default `$HOME/.claude/.credentials.json`. |
 | `FUELGLASS_CODEX_AUTH_FILE` | Codex auth JSON path. Default `$HOME/.codex/auth.json`. |
 
 No environment variable turns the gate off.
+
+## Pushed readings
+
+Fuelglass on the operator desktop pushes the cursor seat. The harness stores the latest reading only and never stores a Cursor session credential.
+
+The payload is exactly these six fields:
+
+```json
+{
+  "seat": "cursor",
+  "used_percent": 35.28,
+  "remaining_percent": 64.72,
+  "resets_at": "2026-11-13T16:33:08.000Z",
+  "observed_at": "2026-10-27T13:05:11.000Z",
+  "source": "desktop-fuelglass"
+}
+```
+
+`POST /api/fuelglass/readings` accepts that payload and returns HTTP 200:
+
+```json
+{ "success": true, "reading": { "seat": "cursor", "received_at": "2026-10-27T13:05:12.000Z" } }
+```
+
+The stored reading adds `received_at`. Rejected bodies are HTTP 400. They are not logged and not echoed.
+
+| Code | When |
+| --- | --- |
+| `credential_field_rejected` | Any key at any depth whose name contains cookie, token, session, secret, credential, password, authorization, jwt, or bearer |
+| `credential_value_rejected` | Any string value contains `WorkosCursorSessionToken` or is a JWT-shaped value longer than 100 characters |
+| `unknown_field` | Any key other than the six |
+| `seat_not_pushable` | `seat` is not `cursor` |
+| `percent_out_of_range` | A percent is not a finite number from 0 to 100 |
+| `percent_mismatch` | `remaining_percent` is not `100 - used_percent` within 0.01 |
+| `timestamp_unparseable` | `resets_at` or `observed_at` is not a parseable time |
+| `observed_at_in_future` | `observed_at` is more than 5 minutes ahead. Exactly 5 minutes ahead is accepted |
+
+A pushed reading is fresh when `now - observed_at` is less than or equal to `FUELGLASS_PUSHED_READING_MAX_AGE_MINUTES`. A fresh cursor reading is measured on the `monthly` window with `reading_source` `pushed` and wins over the direct probe. A reading that is present but stale is UNKNOWN. Its note begins with `reading_stale` and names `observed_at` and the age in minutes. The existing once-per-hour operator Dispatch notice still fires. If no reading has been pushed, the direct probe runs unchanged.
+
+`GET /api/fuelglass/readings/cursor` returns:
+
+```json
+{
+  "success": true,
+  "reading": null,
+  "fresh": false,
+  "age_seconds": null,
+  "max_age_minutes": 30
+}
+```
+
+`reading` is the stored row or `null`. `fresh` uses the same maximum age as the gate. `age_seconds` is `null` when no row is stored.
+
+The Cursor session credential is never set on the server.
 
 ## Unknown-seat operator alert
 
