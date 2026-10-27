@@ -1900,7 +1900,7 @@ nodes:
             return 0
           fi
         fi
-        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
+        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source; do
           pkg="$c/packages/workflows/package.json"
           if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
             printf '%s' "$c"
@@ -2307,7 +2307,7 @@ nodes:
             return 0
           fi
         fi
-        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
+        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source; do
           pkg="$c/packages/workflows/package.json"
           if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
             printf '%s' "$c"
@@ -4412,7 +4412,7 @@ nodes:
             return 0
           fi
         fi
-        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
+        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source; do
           pkg="$c/packages/workflows/package.json"
           if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
             printf '%s' "$c"
@@ -4542,7 +4542,7 @@ nodes:
             return 0
           fi
         fi
-        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
+        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source; do
           pkg="$c/packages/workflows/package.json"
           if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
             printf '%s' "$c"

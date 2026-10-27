@@ -133,7 +133,7 @@ nodes:
             return 0
           fi
         fi
-        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source"; do
+        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source; do
           pkg="$c/packages/workflows/package.json"
           if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
             printf '%s' "$c"
@@ -350,9 +350,7 @@ nodes:
         # until the next image rebuild -- acceptable; the substrate is stable code.
         for candidate in \
           "/app" \
-          "/.archon/workspaces/thinmansoftware/bdc-harness/source" \
-          "${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source" \
-          "$HOME/.archon/workspaces/thinmansoftware/bdc-harness/source"; do
+          "/.archon/workspaces/thinmansoftware/bdc-harness/source"; do
           if root_valid "$candidate"; then HARNESS_ROOT="$candidate"; break; fi
         done
       fi

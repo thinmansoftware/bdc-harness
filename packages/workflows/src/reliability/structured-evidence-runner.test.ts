@@ -6,6 +6,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -1826,5 +1827,254 @@ describe('installed-helper-resolution', () => {
     const trusted = resolveTrustedRunnerFile(product);
     expect(trusted).toBe(RUNNER);
     rmSync(product, { recursive: true, force: true });
+  });
+
+  it('does not resolve a helper planted under ARCHON_HOME or the user home', () => {
+    const source = readFileSync(RUNNER, 'utf8');
+    const start = source.indexOf('export function resolveTrustedRunnerFile');
+    const end = source.indexOf('export function trustedSelfMatches');
+    const body = source.slice(start, end);
+    expect(body.includes('homedir(')).toBe(false);
+    expect(body.includes('process.env.ARCHON_HOME')).toBe(false);
+    expect(body.includes("'/app'")).toBe(true);
+    expect(body.includes("'/.archon/workspaces/thinmansoftware/bdc-harness/source'")).toBe(true);
+    const home = tempDir('ser-home-root-');
+    const planted = join(home, '.archon/workspaces/thinmansoftware/bdc-harness/source');
+    const plantedRunner = join(
+      planted,
+      'packages/workflows/src/reliability/structured-evidence-runner.ts'
+    );
+    mkdirSync(join(planted, 'packages/workflows/src/reliability'), { recursive: true });
+    writeFileSync(
+      join(planted, 'packages/workflows/package.json'),
+      '{"name":"@archon/workflows"}\n'
+    );
+    writeFileSync(plantedRunner, 'process.stdout.write("ATTACKER_HELPER_EXECUTED\\n");\n');
+    const product = tempDir('ser-home-product-');
+    initRepo(product);
+    const savedHome = process.env.HOME;
+    const savedArchon = process.env.ARCHON_HOME;
+    const savedNode = process.env.NODE_ENV;
+    const savedTest = process.env.SER_TEST_TRUSTED_ROOT;
+    process.env.HOME = home;
+    process.env.ARCHON_HOME = home;
+    process.env.NODE_ENV = 'production';
+    delete process.env.SER_TEST_TRUSTED_ROOT;
+    try {
+      const resolved = resolveTrustedRunnerFile(product);
+      expect(resolved).not.toBe(plantedRunner);
+      if (resolved) expect(resolved.startsWith(home)).toBe(false);
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedArchon === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = savedArchon;
+      if (savedNode === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = savedNode;
+      if (savedTest === undefined) delete process.env.SER_TEST_TRUSTED_ROOT;
+      else process.env.SER_TEST_TRUSTED_ROOT = savedTest;
+      rmSync(home, { recursive: true, force: true });
+      rmSync(product, { recursive: true, force: true });
+    }
+  });
+});
+
+function extractSerAdapters(text: string): string[] {
+  const lines = text.split('\n');
+  const blocks: string[] = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i] !== '      ser_root() {') continue;
+    let runnerAt = -1;
+    let end = -1;
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (lines[j] === '      ser_runner() {') runnerAt = j;
+      if (runnerAt >= 0 && lines[j] === '      }' && j > runnerAt) {
+        end = j;
+        break;
+      }
+    }
+    if (end < 0) continue;
+    blocks.push(
+      lines
+        .slice(i, end + 1)
+        .map(line => (line.startsWith('      ') ? line.slice(6) : line))
+        .join('\n')
+    );
+    i = end;
+  }
+  return blocks;
+}
+
+function plantSpoofRunner(root: string): void {
+  const runnerDir = join(root, 'packages/workflows/src/reliability');
+  mkdirSync(runnerDir, { recursive: true });
+  writeFileSync(join(root, 'packages/workflows/package.json'), '{"name":"@archon/workflows"}\n');
+  writeFileSync(
+    join(runnerDir, 'structured-evidence-runner.ts'),
+    [
+      "import { writeFileSync } from 'node:fs';",
+      'const sentinel = process.env.SENTINEL;',
+      "if (sentinel) writeFileSync(sentinel, 'executed\\n');",
+      "process.stdout.write('ATTACKER_HELPER_EXECUTED\\n');",
+      '',
+    ].join('\n')
+  );
+}
+
+describe('lane-adapter-trusted-root', () => {
+  it('does not execute a helper planted under a spoofed ARCHON_HOME', () => {
+    const laneDir = join(ROOT, '.archon/workflows/defaults');
+    const lanes = readdirSync(laneDir).filter(name => name.endsWith('.yaml'));
+    const archonHome = tempDir('ser-spoof-archon-');
+    const userHome = tempDir('ser-spoof-user-');
+    const work = tempDir('ser-adapter-cwd-');
+    const sentinel = join(work, 'sentinel');
+    const archonRoot = join(archonHome, 'workspaces/thinmansoftware/bdc-harness/source');
+    const homeRoot = join(userHome, '.archon/workspaces/thinmansoftware/bdc-harness/source');
+    plantSpoofRunner(archonRoot);
+    plantSpoofRunner(homeRoot);
+    const hide = [
+      'hide_fixed_root() {',
+      '  case "$1" in',
+      '    /app|/app/*|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/source/*)',
+      '      return 0 ;;',
+      '  esac',
+      '  return 1',
+      '}',
+      '[() {',
+      '  if builtin [ "$#" -ge 2 ] && builtin [ "$1" = -f ] && hide_fixed_root "$2"; then',
+      '    return 1',
+      '  fi',
+      '  builtin [ "$@"',
+      '}',
+    ].join('\n');
+    let adapters = 0;
+    try {
+      for (const lane of lanes) {
+        const text = readFileSync(join(laneDir, lane), 'utf8');
+        expect(
+          text.includes(
+            '${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source'
+          )
+        ).toBe(false);
+        expect(text.includes('$HOME/.archon/workspaces/thinmansoftware/bdc-harness/source')).toBe(
+          false
+        );
+        if (!text.includes('ser_root()')) continue;
+        const blocks = extractSerAdapters(text);
+        expect(blocks.length).toBeGreaterThan(0);
+        for (const block of blocks) {
+          adapters += 1;
+          expect(block.includes('ARCHON_HOME')).toBe(false);
+          expect(block.includes('$HOME/.archon')).toBe(false);
+          expect(
+            block.includes(
+              'for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source; do'
+            )
+          ).toBe(true);
+          const script = [
+            hide,
+            block,
+            'export ARCHON_HOME="$SPOOF_ARCHON_HOME"',
+            'export HOME="$SPOOF_USER_HOME"',
+            'root="$(ser_root)" || true',
+            'printf \'ROOT_ARCHON=%s\\n\' "$root"',
+            "ser_runner allow-test -- 'true' || true",
+            'unset ARCHON_HOME',
+            'root="$(ser_root)" || true',
+            'printf \'ROOT_HOME=%s\\n\' "$root"',
+            "ser_runner allow-test -- 'true' || true",
+            '',
+          ].join('\n');
+          const ran = spawnSync('bash', ['-c', script], {
+            cwd: work,
+            env: {
+              PATH: process.env.PATH ?? '',
+              SENTINEL: sentinel,
+              SPOOF_ARCHON_HOME: archonHome,
+              SPOOF_USER_HOME: userHome,
+              NODE_ENV: 'production',
+            },
+            encoding: 'utf8',
+          });
+          expect(ran.status).toBe(0);
+          expect(ran.stdout).not.toContain('ATTACKER_HELPER_EXECUTED');
+          expect(ran.stdout).not.toContain(archonRoot);
+          expect(ran.stdout).not.toContain(homeRoot);
+          expect(existsSync(sentinel)).toBe(false);
+        }
+      }
+      expect(adapters).toBeGreaterThan(10);
+    } finally {
+      rmSync(archonHome, { recursive: true, force: true });
+      rmSync(userHome, { recursive: true, force: true });
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('stale-source-log-exclusion', () => {
+  it('does not exclude a tracked source path named as a persisted log', () => {
+    const cwd = tempDir('ser-stale-source-');
+    initRepo(cwd);
+    mkdirSync(join(cwd, 'src/evidence'), { recursive: true });
+    const source = join(cwd, 'src/evidence/check.ts');
+    writeFileSync(source, 'export const value = 1;\n');
+    git(cwd, ['add', '--', 'src/evidence/check.ts']);
+    git(cwd, ['commit', '-qm', 'source']);
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+    const artifacts = join(cwd, 'artifacts');
+    mkdirSync(join(artifacts, 'evidence', 'attempts'), { recursive: true });
+    const savedArtifacts = process.env.ARTIFACTS_DIR;
+    process.env.ARTIFACTS_DIR = artifacts;
+    const log = join(artifacts, 'evidence', 'attempts', 'stop-tests.log');
+    const tamper = (attempt: EvidenceAttempt, logPath: string): EvidenceAttempt => {
+      const copy = JSON.parse(JSON.stringify(attempt)) as EvidenceAttempt;
+      for (const member of copy.members) member.logPath = logPath;
+      return copy;
+    };
+    try {
+      const summary = runTestCommands(['bash ./ok.sh'], cwd, log);
+      expect(summary.attempt.aggregate).toBe('PASSED');
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      const named = tamper(summary.attempt, source);
+      expect(checkAttemptRecord(named, cwd, authority(cwd)).ok).toBe(true);
+      writeFileSync(source, 'export const value = 2;\n');
+      const stale = checkAttemptRecord(named, cwd, authority(cwd));
+      expect(stale.ok).toBe(false);
+      if (!stale.ok) expect(stale.reason).toBe('dirty-bytes');
+      const prefixed = tamper(summary.attempt, `${join(cwd, 'src/evidence')}/`);
+      const prefixVerdict = checkAttemptRecord(prefixed, cwd, authority(cwd));
+      expect(prefixVerdict.ok).toBe(false);
+      if (!prefixVerdict.ok) expect(prefixVerdict.reason).toBe('dirty-bytes');
+      const recordPath = join(
+        artifacts,
+        'evidence',
+        'attempts',
+        `${summary.attempt.attemptId}.json`
+      );
+      writeFileSync(
+        recordPath,
+        `${JSON.stringify(tamper(summary.attempt, 'src/evidence/check.ts'), null, 2)}\n`
+      );
+      const cli = spawnSync('bun', [RUNNER, 'check-attempt'], {
+        cwd,
+        env: {
+          PATH: process.env.PATH ?? '',
+          HOME: process.env.HOME ?? '',
+          ARTIFACTS_DIR: artifacts,
+          NODE_ENV: 'test',
+          SER_TEST_TRUSTED_ROOT: ROOT,
+        },
+        encoding: 'utf8',
+      });
+      expect(cli.status).not.toBe(0);
+      expect(cli.stderr).toContain('dirty-bytes');
+      expect(cli.stdout).not.toContain('OK');
+    } finally {
+      if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = savedArtifacts;
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 });

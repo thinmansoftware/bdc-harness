@@ -17,7 +17,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -337,10 +337,10 @@ export function resolveTrustedRunnerFile(cwd: string): string | null {
   if (process.env.NODE_ENV === 'test' && testRoot) {
     candidates.push(testRoot);
   }
+  // Installed copies only. ARCHON_HOME, HOME, and HARNESS_ROOT_OVERRIDE are
+  // caller-controlled and are never production candidates.
   candidates.push('/app');
   candidates.push('/.archon/workspaces/thinmansoftware/bdc-harness/source');
-  const archonHome = join(homedir(), '.archon');
-  candidates.push(join(archonHome, 'workspaces/thinmansoftware/bdc-harness/source'));
   const product = productWorktreeTop(cwd);
   for (const root of candidates) {
     if (!root || !isHarnessRoot(root)) continue;
@@ -364,12 +364,71 @@ export function trustedSelfMatches(cwd: string): boolean {
 
 const generatedIdentityPaths = new Set<string>();
 
-function registerGeneratedPath(cwd: string, path: string): void {
-  const directory = /[\\/]$/.test(path);
-  const rel = relative(cwd, resolve(path)).replace(/\\/g, '/');
-  if (rel && rel !== '..' && !rel.startsWith('../')) {
-    generatedIdentityPaths.add(directory ? `${rel}/` : rel);
+function artifactRootReal(): string | null {
+  const base = process.env.ARTIFACTS_DIR;
+  if (!base || base.length === 0) return null;
+  try {
+    return realpathSync(base);
+  } catch {
+    return null;
   }
+}
+
+function insideRelative(root: string, abs: string): string | null {
+  const rel = relative(root, abs);
+  if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+  return rel.split(sep).join('/');
+}
+
+function pathLeaf(abs: string): string | null {
+  const leaf = abs.slice(Math.max(abs.lastIndexOf('/'), abs.lastIndexOf('\\')) + 1);
+  if (leaf.length === 0 || leaf === '.' || leaf === '..') return null;
+  return leaf;
+}
+
+// Persisted attempt records are untrusted. Only a real attempt tree or a log
+// file under the artifact root may be left out of tree identity.
+function verifiedGeneratedTarget(path: string): { real: string; directory: boolean } | null {
+  const root = artifactRootReal();
+  if (!root) return null;
+  const directory = /[\\/]$/.test(path);
+  const trimmed = path.replace(/[\\/]+$/, '');
+  if (trimmed.length === 0) return null;
+  const abs = resolve(trimmed);
+  let real: string;
+  try {
+    real = realpathSync(abs);
+  } catch {
+    let parent: string;
+    try {
+      parent = realpathSync(dirname(abs));
+    } catch {
+      return null;
+    }
+    if (parent !== root && insideRelative(root, parent) === null) return null;
+    const leaf = pathLeaf(abs);
+    if (!leaf) return null;
+    real = join(parent, leaf);
+  }
+  const rel = insideRelative(root, real);
+  if (!rel) return null;
+  const attempts = 'evidence/attempts';
+  const isAttempt = rel === attempts || rel.startsWith(`${attempts}/`);
+  const isLog = !directory && rel.endsWith('.log');
+  if (directory) {
+    if (!isAttempt) return null;
+  } else if (!isAttempt && !isLog) {
+    return null;
+  }
+  return { real, directory };
+}
+
+function registerGeneratedPath(cwd: string, path: string): void {
+  const verified = verifiedGeneratedTarget(path);
+  if (!verified) return;
+  const rel = insideRelative(cwd, verified.real);
+  if (!rel) return;
+  generatedIdentityPaths.add(verified.directory ? `${rel}/` : rel);
 }
 
 function excludedIdentityPath(path: string): boolean {
@@ -807,9 +866,6 @@ export function checkAttemptRecord(
   liveAuthority: EvidenceAuthority
 ): { ok: true } | { ok: false; reason: string } {
   attemptsDirectory(cwd);
-  for (const member of recorded.members) {
-    if (member.logPath) registerGeneratedPath(cwd, member.logPath);
-  }
   const parsed = evidenceAttemptSchema.safeParse(recorded);
   if (!parsed.success) return { ok: false, reason: 'malformed' };
   if (recorded.schemaVersion !== 1) return { ok: false, reason: 'schema' };
@@ -843,6 +899,9 @@ export function checkAttemptRecord(
     ) {
       return { ok: false, reason: 'authority-worktree' };
     }
+  }
+  for (const member of parsed.data.members) {
+    if (member.logPath) registerGeneratedPath(cwd, member.logPath);
   }
   const live = testedTreeIdentity(cwd);
   if (live.method === 'hash-failed' || recorded.tree.method === 'hash-failed') {
