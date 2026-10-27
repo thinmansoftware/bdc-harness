@@ -180,12 +180,18 @@ describe('board authority API', () => {
       `.test-api-board-authority-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
     );
     db = new SqliteAdapter(currentDbPath);
-    setBoardPrincipalResolverForTests(async ({ principal_token }) => ({
-      principal_id: 'xo-model',
-      seat_id: 'xo',
-      roles: ['acting_xo'],
-      principal_token,
-    }));
+    setBoardPrincipalResolverForTests(async ({ principal_token }) => {
+      if (principal_token === 'john-token') {
+        return { principal_id: 'john-operator', seat_id: 'john', roles: ['board'] };
+      }
+      if (principal_token === 'general-token') {
+        return { principal_id: 'general-model', seat_id: 'general', roles: ['board'] };
+      }
+      if (principal_token === 'xo-other-token') {
+        return { principal_id: 'xo-other', seat_id: 'xo', roles: ['acting_xo'] };
+      }
+      return { principal_id: 'xo-model', seat_id: 'xo', roles: ['acting_xo'] };
+    });
   });
 
   afterEach(async () => {
@@ -268,5 +274,164 @@ describe('board authority API', () => {
     const response = await app.request('/api/board/recipient');
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ ok: false, reason: 'no_valid_xo_lease' });
+  });
+
+  test('non-john seats cannot direct an XO lease handoff', async () => {
+    const app = makeApp('secret-token');
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-archon-operator-token': 'secret-token',
+    };
+    const acquired = await app.request('/api/board/xo-lease/acquire', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ holder_id: 'holder-1', holder_token: 'session-secret' }),
+    });
+    expect(acquired.status).toBe(200);
+
+    for (const principalToken of ['general-token', 'xo-other-token']) {
+      const response = await app.request('/api/board/xo-lease/handoff', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          principal_token: principalToken,
+          expected_fencing_token: 1,
+          successor_principal_id: 'xo-successor',
+        }),
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({ error: 'handoff_requires_john_seat' });
+    }
+
+    const current = await app.request('/api/board/xo-lease/current', { headers });
+    expect(await current.json()).toEqual(
+      expect.objectContaining({
+        principal_id: 'xo-model',
+        holder_id: 'holder-1',
+        fencing_token: 1,
+        released_at: null,
+      })
+    );
+  });
+
+  test('old holder renew and release after handoff return handed-off conflict', async () => {
+    const previous = process.env.BOARD_PRINCIPALS_JSON;
+    process.env.BOARD_PRINCIPALS_JSON = JSON.stringify([
+      {
+        principal_id: 'xo-successor',
+        seat_id: 'xo',
+        roles: ['board'],
+        token_sha256: 'a'.repeat(64),
+        status: 'active',
+      },
+    ]);
+    try {
+      const app = makeApp('secret-token');
+      const headers = {
+        'Content-Type': 'application/json',
+        'x-archon-operator-token': 'secret-token',
+      };
+      const acquired = await app.request('/api/board/xo-lease/acquire', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ holder_id: 'holder-1', holder_token: 'session-secret' }),
+      });
+      expect(acquired.status).toBe(200);
+
+      const handoff = await app.request('/api/board/xo-lease/handoff', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          principal_token: 'john-token',
+          expected_fencing_token: 1,
+          successor_principal_id: 'xo-successor',
+        }),
+      });
+      expect(handoff.status).toBe(200);
+      const handed = (await handoff.json()) as Record<string, unknown>;
+      expect(handed.reason).toBeUndefined();
+      expect(handed.fencing_token).toBe(1);
+      expect(handed.successor_principal_id).toBe('xo-successor');
+      expect(handed.handed_off_lease_id).toEqual(expect.any(String));
+      expect(handed.reserved_until).toEqual(expect.any(String));
+
+      const current = await app.request('/api/board/xo-lease/current', { headers });
+      expect(await current.json()).toBeNull();
+
+      const renew = await app.request('/api/board/xo-lease/renew', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          holder_id: 'holder-1',
+          holder_token: 'session-secret',
+          fencing_token: 1,
+        }),
+      });
+      const release = await app.request('/api/board/xo-lease/release', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          holder_id: 'holder-1',
+          holder_token: 'session-secret',
+          fencing_token: 1,
+        }),
+      });
+      expect(renew.status).toBe(409);
+      expect(await renew.json()).toEqual({ error: 'xo_lease_handed_off' });
+      expect(release.status).toBe(409);
+      expect(await release.json()).toEqual({ error: 'xo_lease_handed_off' });
+
+      const reservation = await app.request('/api/board/xo-lease/handoff', { headers });
+      expect(reservation.status).toBe(200);
+      expect(await reservation.json()).toEqual({
+        successor_principal_id: 'xo-successor',
+        reserved_until: handed.reserved_until,
+        directed_by: 'john-operator',
+      });
+
+      await db.query('UPDATE board_xo_leases SET handoff_reserved_until = $1 WHERE id = 1', [
+        '2000-01-01T00:00:00.000Z',
+      ]);
+      const expired = await app.request('/api/board/xo-lease/handoff', { headers });
+      expect(expired.status).toBe(200);
+      expect(await expired.json()).toBeNull();
+    } finally {
+      if (previous === undefined) delete process.env.BOARD_PRINCIPALS_JSON;
+      else process.env.BOARD_PRINCIPALS_JSON = previous;
+    }
+  });
+
+  test('handoff rejects unauthenticated principals and undeclared body fields', async () => {
+    const app = makeApp('secret-token');
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-archon-operator-token': 'secret-token',
+    };
+    setBoardPrincipalResolverForTests(async () => null);
+    const rejected = await app.request('/api/board/xo-lease/handoff', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        principal_token: 'john-token',
+        expected_fencing_token: 1,
+        successor_principal_id: 'xo-successor',
+      }),
+    });
+    expect(rejected.status).toBe(401);
+
+    const appWithPrincipal = makeApp('secret-token');
+    const spoofed = await appWithPrincipal.request('/api/board/xo-lease/handoff', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        principal_token: 'john-token',
+        principal_id: 'spoofed-body-principal',
+        expected_fencing_token: 1,
+        successor_principal_id: 'xo-successor',
+      }),
+    });
+    expect(spoofed.status).toBe(400);
+    const rows = await db.query('SELECT id FROM board_xo_leases');
+    expect(rows.rowCount).toBe(0);
   });
 });
