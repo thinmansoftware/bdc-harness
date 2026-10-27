@@ -1,5 +1,6 @@
 import {
   claimMessage,
+  createAuthenticatedMessage,
   deferMessage,
   heartbeatWorker,
   listMessages,
@@ -64,6 +65,7 @@ export interface ReviewWorkerDeps {
    * `releaseMessage`, which already carries the required fencing guards.
    */
   deferMessage: typeof deferMessage;
+  sendDispatchMessage: typeof createAuthenticatedMessage;
   runAndSubmitReview: typeof runAndSubmitReview;
   createSubmitDeps: (reviewerIdentity: string) => ReturnType<typeof createRealSubmitDeps>;
   /** Optional logger seam for deterministic observability tests. */
@@ -88,7 +90,10 @@ interface ResultMapping {
 }
 
 function mapSubmitOutcome(
-  disposition: Exclude<SubmitDisposition, 'checks_pending' | 'transport_error' | 'rate_limited'>
+  disposition: Exclude<
+    SubmitDisposition,
+    'checks_pending' | 'pr_conflicting' | 'transport_error' | 'rate_limited'
+  >
 ): ResultMapping {
   switch (disposition) {
     // `stale_head` and `superseded_head` both mean the head this item is BOUND
@@ -136,6 +141,7 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     postResult,
     releaseMessage,
     deferMessage,
+    sendDispatchMessage: createAuthenticatedMessage,
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
     staleVerdictSweep: config =>
@@ -244,6 +250,39 @@ export async function tickReviewWorkerClock(
               ...(outcome.pendingChecks === undefined ? { reason: 'no_checks_reported' } : {}),
             },
             'overseer_review_checks_pending_deferred'
+          );
+          await deps.deferMessage({
+            id: claimed.id,
+            worker_id: REVIEW_WORKER_ID,
+            fencing_token: claimed.fencing_token,
+            defer_until: deferUntil,
+          });
+          continue;
+        }
+        if (outcome.disposition === 'pr_conflicting') {
+          const deferUntil = new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString();
+          const idempotencyKey = `pr-conflicting:${work.owner}/${work.repo}#${work.prNumber}@${work.headSha}`;
+          (deps.logger ?? log).warn(
+            {
+              messageId: claimed.id,
+              owner: work.owner,
+              repo: work.repo,
+              prNumber: work.prNumber,
+              headSha: work.headSha,
+              defer_until: deferUntil,
+            },
+            'overseer_review_pr_conflicting'
+          );
+          await deps.sendDispatchMessage(
+            { kind: 'system', sender: 'dispatch' },
+            {
+              correlation_id: idempotencyKey,
+              idempotency_key: idempotencyKey,
+              task_type: 'agent_message',
+              recipient: 'xo',
+              subject_key: `gh:${work.owner}/${work.repo}#${work.prNumber}`,
+              body: `PR #${work.prNumber} head ${work.headSha} is DIRTY and conflicts with its base branch.`,
+            }
           );
           await deps.deferMessage({
             id: claimed.id,

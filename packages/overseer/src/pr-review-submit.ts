@@ -117,6 +117,8 @@ export type SubmitDisposition =
   | 'reviewer_failed'
   | 'submission_failed'
   | 'checks_pending'
+  /** NON-TERMINAL. GitHub reports the live PR head as conflicting/DIRTY. */
+  | 'pr_conflicting'
   /**
    * TERMINAL for THIS work item (#777 review finding, second pass). The head
    * under evaluation was superseded before a required-contexts BLOCK could be
@@ -220,6 +222,12 @@ export interface SubmitDeps {
    * must never land on a head the reviewer did not examine.
    */
   currentHeadSha(input: { owner: string; repo: string; prNumber: number }): Promise<string>;
+  /** Live GitHub merge state, checked before invoking the governed reviewer. */
+  currentPullRequestState?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+  }): Promise<{ mergeStateStatus?: string; mergeable?: boolean | string | null }>;
   recordReceipt(input: {
     correlationId: string;
     messageId: string;
@@ -317,6 +325,24 @@ export async function runAndSubmitReview(
     return finish(deps, work, work.headSha, {
       disposition: 'custody_conflict',
       reason: 'reviewer_is_pull_request_author',
+    });
+  }
+
+  const prState = deps.currentPullRequestState
+    ? await deps.currentPullRequestState({
+        owner: work.owner,
+        repo: work.repo,
+        prNumber: work.prNumber,
+      })
+    : {};
+  if (
+    prState.mergeStateStatus?.toUpperCase() === 'DIRTY' ||
+    prState.mergeable === false ||
+    (typeof prState.mergeable === 'string' && prState.mergeable.toUpperCase() === 'CONFLICTING')
+  ) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'pr_conflicting',
+      reason: 'live_pull_request_is_DIRTY_or_CONFLICTING',
     });
   }
 

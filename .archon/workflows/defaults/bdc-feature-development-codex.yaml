@@ -53,6 +53,34 @@ nodes:
       [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ] || { echo "authority_conflict: work-order.md hash mismatch" >&2; exit 1; }
       RUN_START_SHA=$(git rev-parse --verify 'HEAD^{commit}') || { echo "scope_authority_missing: HEAD" >&2; exit 1; }
       printf '%s\n' "$RUN_START_SHA" > "$ARTIFACTS_DIR/run-start-sha.txt"
+      # ---- BEGIN base-merge-first ----
+      cat > "$ARTIFACTS_DIR/base-merge-first.sh" <<'BDC_BASE_MERGE_FIRST'
+      bdc_base_merge_first() {
+        local base_branch="${1:-}" conflicts record head_sha pr_number
+        [ -n "$base_branch" ] || { echo "base_merge_first: base branch is required" >&2; return 1; }
+        [ -n "${ARTIFACTS_DIR:-}" ] || { echo "base_merge_first: ARTIFACTS_DIR is required" >&2; return 1; }
+        mkdir -p "$ARTIFACTS_DIR" || return 1
+        git fetch origin "$base_branch" || return 1
+        if ! git merge --no-edit --no-ff "origin/$base_branch"; then
+          conflicts=$(git diff --name-only --diff-filter=U | paste -sd, -)
+          if [ -n "$conflicts" ]; then
+            record="base_merge_conflict=$conflicts"
+            git merge --abort || return 1
+            printf '%s\n' "$record" | tee "$ARTIFACTS_DIR/base-merge-conflict.txt"
+            pr_number="${PR_NUMBER:-${REPAIR_TARGET_PR:-}}"
+            if [ -n "$pr_number" ]; then
+              gh pr comment "$pr_number" --body "Base merge conflict: $conflicts" >/dev/null 2>&1 || true
+            fi
+          fi
+          return 1
+        fi
+        head_sha=$(git rev-parse HEAD) || return 1
+        export base_merged_sha="$head_sha"
+        printf '%s\n' "$head_sha" > "$ARTIFACTS_DIR/base-merged-sha.txt"
+        printf 'base_merged_sha=%s\n' "$head_sha"
+      }
+      BDC_BASE_MERGE_FIRST
+      # ---- END base-merge-first ----
       printf 'WO_ID=%s\nSPEC_PATH=%s\nSPEC_REVISION=%s\nSPEC_HASH=%s\nRUN_START_SHA=%s\n\n' "$WO_ID" "$SPEC_PATH" "$SPEC_REVISION" "$EXPECTED_HASH" "$RUN_START_SHA"
       cat "$AUTHORITY_SPEC"
       exit 0
@@ -1360,6 +1388,11 @@ nodes:
       if [ "${#SCOPE_SHA}" -ne 40 ] || ! git cat-file -e "${SCOPE_SHA}^{commit}" 2>/dev/null; then
         echo "scope_authority_missing: run scope SHA is not a commit" >&2
         exit 1
+      fi
+      BASE_MERGED_SHA=$(cat "$ARTIFACTS_DIR/base-merged-sha.txt" 2>/dev/null || true)
+      if [ -n "$BASE_MERGED_SHA" ] && git rev-parse --verify "${BASE_MERGED_SHA}^2" >/dev/null 2>&1; then
+        SCOPE_SHA=$(git rev-parse "${BASE_MERGED_SHA}^2")
+        export base_merged_sha="$BASE_MERGED_SHA"
       fi
       if ! git merge-base --is-ancestor "$SCOPE_SHA" HEAD; then
         BASE_REF="${BASE_BRANCH:-dev}"
@@ -3472,6 +3505,10 @@ nodes:
       if [ "$CHANGED" -gt 0 ]; then
         echo "SALVAGE=preserved_uncommitted:${CHANGED}"
       fi
+      . "$ARTIFACTS_DIR/base-merge-first.sh"
+      BASE_BRANCH=$(sed -n 's/^[[:space:]]*Base branch:[[:space:]]*//p; s/^[[:space:]]*base_branch:[[:space:]]*//p' "$ARTIFACTS_DIR/authority/work-order.md" | head -n 1)
+      BASE_BRANCH="${BASE_BRANCH:-dev}"
+      bdc_base_merge_first "$BASE_BRANCH"
       if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
         REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
         PR_URL=$(gh pr create --repo "$REPO" --head "$BR" --base "${BASE_BRANCH:-dev}" \
@@ -4318,6 +4355,10 @@ nodes:
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: push via refspec
       # so the local archon/thread-<hash> branch lands on a unique remote name
       # (UNIQUE_BRANCH) and does not collide with other parallel runs.
+      . "$ARTIFACTS_DIR/base-merge-first.sh"
+      BASE_BRANCH=$(sed -n 's/^[[:space:]]*Base branch:[[:space:]]*//p; s/^[[:space:]]*base_branch:[[:space:]]*//p' "$ARTIFACTS_DIR/authority/work-order.md" | head -n 1)
+      BASE_BRANCH="${BASE_BRANCH:-dev}"
+      bdc_base_merge_first "$BASE_BRANCH"
       PUSH_OK=false
       for attempt in 1 2 3; do
         if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
@@ -4432,6 +4473,11 @@ nodes:
 
       if ! wait_match; then
         echo "WARN: origin still missing/mismatched after wait -- re-pushing HEAD:${UNIQUE_BRANCH}" >&2
+        . "$ARTIFACTS_DIR/base-merge-first.sh"
+        MERGE_BASE_BRANCH=$(sed -n 's/^[[:space:]]*Base branch:[[:space:]]*//p; s/^[[:space:]]*base_branch:[[:space:]]*//p' "$ARTIFACTS_DIR/authority/work-order.md" | head -n 1)
+        MERGE_BASE_BRANCH="${MERGE_BASE_BRANCH:-dev}"
+        bdc_base_merge_first "$MERGE_BASE_BRANCH"
+        LOCAL_HEAD="$(git rev-parse HEAD)"
         PUSH_OK=false
         for attempt in 1 2 3; do
           if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then

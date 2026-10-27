@@ -1039,6 +1039,19 @@ export function createRealSubmitDeps(
       };
     },
     submitReview: createRealSubmitPullRequestReview(octokit),
+    async currentPullRequestState(
+      input
+    ): Promise<{ mergeStateStatus?: string; mergeable?: boolean | null }> {
+      const pr = await octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.prNumber,
+      });
+      return {
+        mergeStateStatus: pr.data.mergeable_state,
+        mergeable: pr.data.mergeable,
+      };
+    },
     async currentHeadSha(input): Promise<string> {
       const pr = await octokit.pulls.get({
         owner: input.owner,

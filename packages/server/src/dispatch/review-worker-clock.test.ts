@@ -111,6 +111,7 @@ function fakeDeps(
     // calls the deferral by its WO name. It delegates to releaseMessage, so the
     // fencing guards asserted below are unchanged.
     deferMessage: mock(async () => null),
+    sendDispatchMessage: mock(async (_context, data) => ({ ...message('notice'), ...data })),
     runAndSubmitReview: mock(async work => outcomeFor(work.messageId)),
     createSubmitDeps: mock(() => ({ reviewerIdentity: CONFIG.reviewerIdentity }) as SubmitDeps),
   };
@@ -119,6 +120,39 @@ function fakeDeps(
 afterEach(() => stopReviewWorkerClock());
 
 describe('review worker clock', () => {
+  test('names and reports a conflicting PR before deferring it', async () => {
+    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
+    const item = message('conflicting', 'd4a35ab6');
+    item.body = JSON.stringify({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 1315,
+      headSha: 'd4a35ab6',
+      baseRef: 'dev',
+      author: 'contributor',
+    });
+    const deps = fakeDeps([item], () => ({ disposition: 'pr_conflicting', reason: 'DIRTY' }));
+    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
+    const before = Date.now();
+    await tickReviewWorkerClock(CONFIG, deps);
+    expect(warnings[0]?.message).toBe('overseer_review_pr_conflicting');
+    expect(deps.sendDispatchMessage).toHaveBeenCalledTimes(1);
+    const send = (deps.sendDispatchMessage as ReturnType<typeof mock>).mock.calls[0];
+    expect(send?.[1]).toEqual(
+      expect.objectContaining({
+        idempotency_key: 'pr-conflicting:thinmansoftware/bdc-harness#1315@d4a35ab6',
+        recipient: 'xo',
+        subject_key: 'gh:thinmansoftware/bdc-harness#1315',
+      })
+    );
+    expect(String(send?.[1]?.body)).toContain('DIRTY');
+    expect(deps.deferMessage).toHaveBeenCalledTimes(1);
+    const deferred = (deps.deferMessage as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+      defer_until: string;
+    };
+    expect(new Date(deferred.defer_until).getTime()).toBeGreaterThan(before);
+    expect(deps.postResult).not.toHaveBeenCalled();
+  });
   test('submits the queued exact head once and marks the item done', async () => {
     const queued = [message('one', 'exact-head')];
     const deps = fakeDeps(queued);
