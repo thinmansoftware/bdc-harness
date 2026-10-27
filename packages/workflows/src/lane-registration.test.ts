@@ -191,7 +191,7 @@ describe('lane registration and war-council-validator pin', () => {
       // and stays on the CLOSER rung (see the codex-lane branch above, which
       // is correct and unchanged).
       const expectedModel =
-        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5' : 'sonnet';
+        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5' : 'claude-sonnet-5-5';
       expect(wcv.provider).toBe('claude');
       expect(wcv.model).toBe(expectedModel);
     });

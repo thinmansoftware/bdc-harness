@@ -40,9 +40,9 @@ describe('live ladder SOR', () => {
     expect(refused).not.toContain('zero');
     expect(refused).toContain('qwen');
     expect(refused).toContain('glm');
-    expect(refused).toContain('claude');
+    expect(refused).not.toContain('claude');
     expect(refused).not.toContain('codex');
-    expect([...refused].sort()).toEqual(['claude', 'glm', 'qwen']);
+    expect([...refused].sort()).toEqual(['glm', 'qwen']);
     const firstLive = loadLadder().find(t => !refused.includes(t.name));
     expect(firstLive?.name).toBe('zero');
   });
@@ -159,6 +159,12 @@ describe('cascade entry override and refuse', () => {
         judge: () => makeFailVerdict('validator: needs_revision'),
         escalate: async () => undefined,
         findWoClaim: async () => null,
+        seatUsage: async () => ({
+          claude: {
+            limit_source: 'measured',
+            windows: [{ name: 'seven_day', used_percent: 91 }],
+          },
+        }),
       };
 
       const record = await runCascade({
@@ -235,6 +241,9 @@ describe('cascade entry override and refuse', () => {
         return { ok: false, runId: null, conversationId: null, infraError: 'should-not-fire' };
       },
       writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+      seatUsage: async () => ({
+        claude: { limit_source: 'UNKNOWN', windows: [] },
+      }),
     };
 
     let thrown: unknown;
@@ -255,8 +264,7 @@ describe('cascade entry override and refuse', () => {
 
     expect(thrown).toBeInstanceOf(Error);
     const message = thrown instanceof Error ? thrown.message : '';
-    expect(message).toMatch(/Refused dark\/retired entry tier "claude"/);
-    expect(message).toContain('Refused: glm, qwen, claude');
+    expect(message).toContain('claude_seat_unknown');
     expect(fireCalled).toBe(false);
   });
 });
