@@ -4468,6 +4468,11 @@ nodes:
 
       if ! wait_match; then
         echo "WARN: origin still missing/mismatched after wait -- re-pushing HEAD:${UNIQUE_BRANCH}" >&2
+        . "$ARTIFACTS_DIR/base-merge-first.sh"
+        MERGE_BASE_BRANCH=$(sed -n 's/^[[:space:]]*Base branch:[[:space:]]*//p; s/^[[:space:]]*base_branch:[[:space:]]*//p' "$ARTIFACTS_DIR/authority/work-order.md" | head -n 1)
+        MERGE_BASE_BRANCH="${MERGE_BASE_BRANCH:-dev}"
+        bdc_base_merge_first "$MERGE_BASE_BRANCH"
+        LOCAL_HEAD="$(git rev-parse HEAD)"
         PUSH_OK=false
         for attempt in 1 2 3; do
           if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then

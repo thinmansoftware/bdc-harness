@@ -4258,14 +4258,41 @@ nodes:
         exit 1
       fi
       REPAIR_TARGET_LEASE_SHA=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1)
-      # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: precondition guard. Re-verify
-      # the canonical branch is on origin at local HEAD BEFORE attempting any PR.
-      # If commit-and-push's verify passed this should always hold; failing here
-      # means the branch was lost between nodes -- abort before wasting gh retries.
-      REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
-      if [ "$REMOTE_HEAD" != "$(git rev-parse HEAD)" ]; then
-        echo "FATAL: open-pr precondition failed -- ${UNIQUE_BRANCH} not on origin at HEAD (origin=${REMOTE_HEAD:-<absent>})." >&2
-        exit 1
+      # WO-HARNESS-OPEN-PR-ORIGIN-WAIT-01: tolerate delayed origin visibility,
+      # then base-merge, re-push, and re-verify before failing the precondition.
+      LOCAL_HEAD="$(git rev-parse HEAD)"
+
+      wait_match() {
+        local attempt remote
+        for attempt in 1 2 3 4 5 6; do
+          remote="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+          if [ -n "$remote" ] && [ "$remote" = "$LOCAL_HEAD" ]; then
+            echo "ORIGIN_PRECONDITION_OK: origin/${UNIQUE_BRANCH} == ${LOCAL_HEAD} (attempt ${attempt})"
+            return 0
+          fi
+          echo "WARN: origin precondition miss attempt ${attempt} (origin=${remote:-<absent>} local=${LOCAL_HEAD}); waiting..." >&2
+          sleep $((attempt * 2))
+        done
+        return 1
+      }
+
+      if ! wait_match; then
+        echo "WARN: origin still missing/mismatched after wait -- re-pushing HEAD:${UNIQUE_BRANCH}" >&2
+        . "$ARTIFACTS_DIR/base-merge-first.sh"
+        MERGE_BASE_BRANCH=$(sed -n 's/^[[:space:]]*Base branch:[[:space:]]*//p; s/^[[:space:]]*base_branch:[[:space:]]*//p' "$ARTIFACTS_DIR/authority/work-order.md" | head -n 1)
+        MERGE_BASE_BRANCH="${MERGE_BASE_BRANCH:-dev}"
+        bdc_base_merge_first "$MERGE_BASE_BRANCH"
+        LOCAL_HEAD="$(git rev-parse HEAD)"
+        if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
+          git push --force-with-lease="refs/heads/${UNIQUE_BRANCH}:${REPAIR_TARGET_LEASE_SHA}" origin HEAD:"${UNIQUE_BRANCH}"
+        else
+          git push origin HEAD:"${UNIQUE_BRANCH}"
+        fi
+        if ! wait_match; then
+          REMOTE_HEAD="$(git ls-remote origin "refs/heads/${UNIQUE_BRANCH}" 2>/dev/null | awk '{print $1}')"
+          echo "FATAL: open-pr precondition failed after wait+re-push -- ${UNIQUE_BRANCH} not on origin at HEAD (origin=${REMOTE_HEAD:-<absent>} local=${LOCAL_HEAD})." >&2
+          exit 1
+        fi
       fi
       # Rule 29: extract explicit repo from decide-push-target output.
       # Never let gh default to the worktree's origin -- it may be bdc-harness

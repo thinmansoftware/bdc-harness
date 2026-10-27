@@ -7,6 +7,13 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 sed -n '/^      bdc_base_merge_first() {/,/^      }$/p' "$LANE" | sed 's/^      //' > "$TMP/helper.sh"
 . "$TMP/helper.sh"
+{
+  printf '%s\n' 'lane_scope() {'
+  printf '%s\n' '  cd "$WT"' '  SCOPE_SHA_FILE="$ARTIFACTS_DIR/run-scope-sha.txt"' '  LIST_FILE="$ARTIFACTS_DIR/run-changed-source-files.txt"' '  SCOPE_SHA=$(cat "$SCOPE_SHA_FILE")'
+  sed -n '/^      BASE_MERGED_SHA=$(cat "$ARTIFACTS_DIR\/base-merged-sha.txt"/,/^      echo "RUN_CHANGED_SOURCE_FILES=$COUNT"/p' "$LANE" | sed 's/^      /  /'
+  printf '%s\n' '}'
+} > "$TMP/scope.sh"
+. "$TMP/scope.sh"
 
 git_config() {
   git config user.name test
@@ -28,12 +35,12 @@ setup_repo() {
 }
 
 setup_repo clean
-echo feature > feature.txt
-git add feature.txt && git commit -m feature >/dev/null
+echo feature > feature.sh
+git add feature.sh && git commit -m feature >/dev/null
 feature_parent=$(git rev-parse HEAD)
 git checkout dev >/dev/null 2>&1
-echo base > base.txt
-git add base.txt && git commit -m base >/dev/null
+echo base > base.sh
+git add base.sh && git commit -m base >/dev/null
 base_tip=$(git rev-parse HEAD)
 git push origin dev >/dev/null
 git checkout feature >/dev/null 2>&1
@@ -64,12 +71,16 @@ test "$(git ls-remote origin refs/heads/dev | awk '{print $1}')" = "$remote_befo
 echo 'ok 2 - conflict aborts cleanly and records the path without pushing'
 
 cd "$TMP/clean"
-merge_sha=$(cat "$TMP/clean-artifacts/base-merged-sha.txt")
-git diff --name-only "${merge_sha}^2"..HEAD > "$TMP/scoped"
-grep -qx feature.txt "$TMP/scoped"
-! grep -qx base.txt "$TMP/scoped"
-run_start=$(git rev-parse "${merge_sha}^1")
-git diff --name-only "$run_start"..HEAD > "$TMP/fallback"
-grep -qx base.txt "$TMP/fallback"
-echo 'ok 3 - scope uses the base parent and retains run-start fallback'
-echo '3 passing / 3 total'
+ARTIFACTS_DIR="$TMP/clean-artifacts"; export ARTIFACTS_DIR
+printf '%s\n' "$feature_parent" > "$ARTIFACTS_DIR/run-scope-sha.txt"
+WT=$PWD lane_scope >/dev/null
+grep -qx feature.sh "$ARTIFACTS_DIR/run-changed-source-files.txt"
+! grep -qx base.sh "$ARTIFACTS_DIR/run-changed-source-files.txt"
+echo 'ok 3 - lane scope uses the recorded merge base parent'
+
+rm "$ARTIFACTS_DIR/base-merged-sha.txt"
+printf '%s\n' "$feature_parent" > "$ARTIFACTS_DIR/run-scope-sha.txt"
+WT=$PWD lane_scope >/dev/null
+grep -qx base.sh "$ARTIFACTS_DIR/run-changed-source-files.txt"
+echo 'ok 4 - lane scope falls back to run scope when merge artifact is absent'
+echo '4 passing / 4 total'
