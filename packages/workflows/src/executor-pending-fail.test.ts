@@ -34,6 +34,11 @@ mock.module('@archon/git', () => ({
 
 mock.module('./dag-executor', () => ({
   executeDagWorkflow: mock(async () => {}),
+  endRunProcessTree: async () => ({
+    confirmedAt: new Date().toISOString(),
+    survivors: [],
+  }),
+  recordTeardownBeforeStatus: async () => {},
 }));
 
 mock.module('./logger', () => ({

@@ -5,7 +5,7 @@
  * Independent nodes within the same layer run concurrently via Promise.allSettled.
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
-import { existsSync } from 'fs';
+import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'fs';
 import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { tmpdir } from 'os';
@@ -16,7 +16,13 @@ import {
   resolve as resolvePath,
   win32 as win32Path,
 } from 'path';
-import { execFileAsync } from '@archon/git';
+import {
+  execFileAsync,
+  execOwnedProcessGroup,
+  endProcessGroup,
+  isTreeSurvivedError,
+  processGroupExists,
+} from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
 import { resolveModelForNode, type ModelOverride } from './model-override';
 import type {
@@ -166,6 +172,7 @@ async function persistCancellation(
   reason: string
 ): Promise<boolean> {
   try {
+    await recordTeardownBeforeStatus(deps.store, workflowRun);
     await deps.store.cancelWorkflowRun(
       workflowRun.id,
       cancellationPersistence(workflowRun.id, reason, nodeId)
@@ -3177,6 +3184,224 @@ async function executeNodeInternal(
 /** Default timeout for subprocess nodes (bash, script): 2 minutes */
 const SUBPROCESS_DEFAULT_TIMEOUT = 120_000;
 
+interface TeardownSurvivor {
+  pid: number;
+  comm: string;
+}
+
+interface TeardownReport {
+  confirmedAt: string | null;
+  survivors: TeardownSurvivor[];
+}
+
+const ownedProcessGroups = new Map<string, number[]>();
+const teardownReports = new Map<string, TeardownReport>();
+const nodeFailureStderr = new Map<string, string>();
+
+function recordOwnedProcessGroup(runId: string, pgid: number | undefined): void {
+  if (typeof pgid !== 'number' || !Number.isInteger(pgid) || pgid <= 0) return;
+  const list = ownedProcessGroups.get(runId) ?? [];
+  if (!list.includes(pgid)) list.push(pgid);
+  ownedProcessGroups.set(runId, list);
+}
+
+function noteNodeStderr(runId: string, nodeId: string, stderr: string | undefined): void {
+  if (!stderr) return;
+  nodeFailureStderr.set(`${runId}:${nodeId}`, stderr);
+}
+
+function readProcComm(pid: number): string {
+  try {
+    const comm = readFileSync(`/proc/${pid}/comm`, 'utf8').replace(/[\r\n]/g, '');
+    return comm.length > 0 ? comm.slice(0, 64) : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function ancestorPids(startPid: number): Set<number> {
+  const skip = new Set<number>([1, startPid]);
+  let current = startPid;
+  for (let guard = 0; guard < 64; guard++) {
+    let stat = '';
+    try {
+      stat = readFileSync(`/proc/${current}/stat`, 'utf8');
+    } catch {
+      break;
+    }
+    const after = stat.slice(stat.lastIndexOf(')') + 1).trim();
+    // Fields after the final ')': state, ppid, pgrp. ppid is index 1.
+    const ppid = Number(after.split(/\s+/)[1]);
+    if (!Number.isInteger(ppid) || ppid <= 0 || skip.has(ppid)) break;
+    skip.add(ppid);
+    if (ppid === 1) break;
+    current = ppid;
+  }
+  return skip;
+}
+
+function pidAlive(pid: number): boolean {
+  if (pid <= 0 || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+async function waitPidsGone(pids: number[], ms: number): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (pids.some(pidAlive)) {
+    if (Date.now() >= deadline) return;
+    await new Promise<void>(resolve => {
+      setTimeout(resolve, 50);
+    });
+  }
+}
+
+function cwdInside(resolved: string, root: string): boolean {
+  const base = root.endsWith('/') ? root.slice(0, -1) : root;
+  return resolved === base || resolved.startsWith(`${base}/`);
+}
+
+function foreignCwdPids(workingPath: string, skip: Set<number>): TeardownSurvivor[] {
+  let entries: string[] = [];
+  try {
+    entries = readdirSync('/proc');
+  } catch {
+    return [];
+  }
+  let root = workingPath;
+  try {
+    root = realpathSync(workingPath);
+  } catch {
+    // Keep the stored path when it cannot be canonicalized.
+  }
+  const found: TeardownSurvivor[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    if (skip.has(pid) || pid <= 1) continue;
+    let link = '';
+    try {
+      link = readlinkSync(`/proc/${pid}/cwd`);
+    } catch {
+      continue;
+    }
+    const cleaned = link.replace(/ \(deleted\)$/, '');
+    let resolved = cleaned;
+    try {
+      resolved = realpathSync(cleaned);
+    } catch {
+      resolved = cleaned;
+    }
+    if (cwdInside(resolved, root)) {
+      found.push({ pid, comm: readProcComm(pid) });
+    }
+  }
+  return found;
+}
+
+async function endForeignPids(pids: TeardownSurvivor[]): Promise<TeardownSurvivor[]> {
+  const live = pids.filter(item => item.pid > 1 && item.pid !== process.pid);
+  for (const item of live) {
+    try {
+      process.kill(item.pid, 'SIGTERM');
+    } catch {
+      // Already gone, or not signalable. The confirm window records survivors.
+    }
+  }
+  await waitPidsGone(
+    live.map(item => item.pid),
+    5000
+  );
+  const afterTerm = live.filter(item => pidAlive(item.pid));
+  for (const item of afterTerm) {
+    try {
+      process.kill(item.pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
+  }
+  await waitPidsGone(
+    afterTerm.map(item => item.pid),
+    1000
+  );
+  return afterTerm
+    .filter(item => pidAlive(item.pid))
+    .map(item => ({ pid: item.pid, comm: readProcComm(item.pid) }));
+}
+
+/**
+ * End every process group recorded for the run, then any foreign process whose
+ * cwd is inside the run worktree. Idempotent: a second call returns the first
+ * report so convergent terminal paths cannot write both teardown keys.
+ */
+export async function endRunProcessTree(
+  runId: string,
+  workingPath: string | null | undefined
+): Promise<TeardownReport> {
+  const cached = teardownReports.get(runId);
+  if (cached) return cached;
+  const survivors: TeardownSurvivor[] = [];
+  for (const pgid of ownedProcessGroups.get(runId) ?? []) {
+    try {
+      await endProcessGroup(pgid);
+    } catch (err) {
+      if (isTreeSurvivedError(err) || processGroupExists(pgid)) {
+        survivors.push({ pid: pgid, comm: readProcComm(pgid) });
+      }
+    }
+  }
+  if (workingPath) {
+    const skip = ancestorPids(process.pid);
+    const foreign = foreignCwdPids(workingPath, skip).filter(
+      item => !survivors.some(existing => existing.pid === item.pid)
+    );
+    const remaining = await endForeignPids(foreign);
+    for (const item of remaining) {
+      if (!survivors.some(existing => existing.pid === item.pid)) survivors.push(item);
+    }
+  }
+  const report: TeardownReport =
+    survivors.length > 0
+      ? { confirmedAt: null, survivors }
+      : { confirmedAt: new Date().toISOString(), survivors: [] };
+  teardownReports.set(runId, report);
+  return report;
+}
+
+/** Metadata-only write. Exactly one of the two teardown keys. Never throws. */
+export async function recordTeardownBeforeStatus(
+  store: { updateWorkflowRun: WorkflowDeps['store']['updateWorkflowRun'] },
+  run: { id: string; working_path: string | null }
+): Promise<void> {
+  try {
+    const report = await endRunProcessTree(run.id, run.working_path);
+    const metadata =
+      report.survivors.length > 0
+        ? { teardown_survivors: report.survivors }
+        : { teardown_confirmed_at: report.confirmedAt ?? new Date().toISOString() };
+    await store.updateWorkflowRun(run.id, { metadata });
+  } catch (err) {
+    getLog().error({ err, workflowRunId: run.id }, 'workflow.teardown_before_terminal_failed');
+  }
+}
+
+export function resetRunTeardownStateForTests(): void {
+  ownedProcessGroups.clear();
+  teardownReports.clear();
+  nodeFailureStderr.clear();
+}
+
+function firstRepairFailureLine(stderr: string): string | undefined {
+  for (const line of stderr.split('\n')) {
+    if (/^(repair_target_|ERROR:)/.test(line)) return line;
+  }
+  return undefined;
+}
+
 /**
  * Execute a bash (shell script) DAG node.
  * Runs the script via a temp file, captures stdout as node output.
@@ -3298,11 +3523,15 @@ async function executeBashNode(
           scriptPreparationFailed: true,
         });
       }
-      ({ stdout, stderr } = await execFileAsync('bash', [scriptFile], {
+      const owned = await execOwnedProcessGroup('bash', [scriptFile], {
         cwd,
         timeout,
         env: subprocessEnv,
-      }));
+        endTreeOnTimeout: true,
+      });
+      stdout = owned.stdout;
+      stderr = owned.stderr;
+      recordOwnedProcessGroup(workflowRun.id, owned.pgid);
     } finally {
       try {
         await unlink(scriptFile);
@@ -3437,8 +3666,20 @@ async function executeBashNode(
       stderr?: string;
       scriptFile?: string;
       scriptPreparationFailed?: boolean;
+      treeSurvived?: boolean;
+      pgid?: number;
     };
-    const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
+    recordOwnedProcessGroup(workflowRun.id, err.pgid);
+    noteNodeStderr(
+      workflowRun.id,
+      node.id,
+      typeof err.stderr === 'string' ? err.stderr : undefined
+    );
+    // treeSurvived is a failed node, never a timeout, so on_timeout: skip cannot
+    // pass over a process tree that is still running.
+    const treeSurvived = err.treeSurvived === true;
+    const isTimeout =
+      !treeSurvived && (err.killed === true || (err.message ?? '').includes('timed out'));
     const label = `Bash node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
     // user-facing branch we end up in. Spawn failures can still include
@@ -3447,6 +3688,8 @@ async function executeBashNode(
     let errorMsg: string;
     if (err.scriptPreparationFailed) {
       errorMsg = `${label} failed: unable to prepare temporary script at ${err.scriptFile ?? scriptFile}`;
+    } else if (treeSurvived) {
+      errorMsg = `${label} failed: ${err.message}`;
     } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
     } else if (err.message?.includes('ENOENT')) {
@@ -3664,11 +3907,15 @@ async function executeScriptNode(
       }
     }
 
-    const { stdout, stderr } = await execFileAsync(cmd, args, {
+    const owned = await execOwnedProcessGroup(cmd, args, {
       cwd,
       timeout,
       env: subprocessEnv,
+      endTreeOnTimeout: true,
     });
+    recordOwnedProcessGroup(workflowRun.id, owned.pgid);
+    const stdout = owned.stdout;
+    const stderr = owned.stderr;
 
     // Trim trailing newline from stdout (common shell behavior)
     const output = stdout.replace(/\n$/, '');
@@ -3787,15 +4034,33 @@ async function executeScriptNode(
 
     return { state: 'completed', output };
   } catch (error) {
-    const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
-    const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
+    const err = error as Error & {
+      killed?: boolean;
+      code?: number | string;
+      stderr?: string;
+      treeSurvived?: boolean;
+      pgid?: number;
+    };
+    recordOwnedProcessGroup(workflowRun.id, err.pgid);
+    noteNodeStderr(
+      workflowRun.id,
+      node.id,
+      typeof err.stderr === 'string' ? err.stderr : undefined
+    );
+    // treeSurvived is a failed node, never a timeout, so on_timeout: skip cannot
+    // pass over a process tree that is still running.
+    const treeSurvived = err.treeSurvived === true;
+    const isTimeout =
+      !treeSurvived && (err.killed === true || (err.message ?? '').includes('timed out'));
     const label = `Script node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
     // user-facing branch we end up in -- the timeout message also contains the
     // full `Command failed: bun -e <body>` line and would otherwise leak.
     const formatted = formatSubprocessFailure(err, label);
     let errorMsg: string;
-    if (isTimeout) {
+    if (treeSurvived) {
+      errorMsg = `${label} failed: ${err.message}`;
+    } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
     } else if (err.message?.includes('ENOENT')) {
       errorMsg = `${label} failed: '${cmd}' executable not found in PATH`;
@@ -5539,6 +5804,8 @@ async function executeDagWorkflowInternal(
   };
   const layers = buildTopologicalLayers(workflow.nodes);
   const nodeOutputs = new Map<string, NodeOutput>();
+  let repairCheckoutAbort = false;
+  let repairFailureReason: string | undefined;
 
   // Pre-populate nodeOutputs from prior run so already-completed nodes are
   // treated as done for trigger-rule and $nodeId.output substitution purposes.
@@ -6408,7 +6675,18 @@ async function executeDagWorkflowInternal(
         if (output.state === 'completed' && !isParallelLayer && output.sessionId !== undefined) {
           lastSequentialSessionId = output.sessionId;
         }
-        if (output.state === 'failed') layerHadFailure = true;
+        if (output.state === 'failed') {
+          layerHadFailure = true;
+          const failedNode = workflow.nodes.find(candidate => candidate.id === nodeId);
+          if (failedNode?.abort_run_on_failure === true) {
+            repairCheckoutAbort = true;
+            const stderr = nodeFailureStderr.get(`${workflowRun.id}:${nodeId}`) ?? '';
+            const line = firstRepairFailureLine(stderr);
+            if (line !== undefined && repairFailureReason === undefined) {
+              repairFailureReason = line;
+            }
+          }
+        }
       } else {
         // Should not happen -- all errors are caught in the inner try-catch
         // Handle defensively: log the unexpected rejection
@@ -6425,6 +6703,30 @@ async function executeDagWorkflowInternal(
 
     if (layerHadFailure) {
       getLog().warn({ layerIdx, nodeCount: layer.length }, 'dag_layer_had_failures');
+    }
+
+    if (repairCheckoutAbort) {
+      for (const pending of workflow.nodes) {
+        if (nodeOutputs.has(pending.id)) continue;
+        nodeOutputs.set(pending.id, { state: 'skipped', output: '' });
+        deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'node_skipped',
+            step_name: pending.id,
+            data: { reason: 'repair_checkout_failed' },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'node_skipped' },
+              'workflow_event_persist_failed'
+            );
+          });
+      }
+      // Stop in-flight owned groups before the terminal status write. The
+      // report is cached so the later metadata write does not scan again.
+      await endRunProcessTree(workflowRun.id, workflowRun.working_path);
+      break;
     }
 
     // Check for non-running status between DAG layers (cancellation, deletion, pause)
@@ -6629,15 +6931,26 @@ async function executeDagWorkflowInternal(
       `DAG workflow '${workflow.name}' completed with no successful nodes. ` +
       'Check node conditions, trigger rules, and upstream failures.';
     const failedOutcome = await makeTerminalOutcome('failed');
+    const noSuccessCause = repairCheckoutAbort ? 'repair_checkout_failed' : 'no_successful_nodes';
+    await recordTeardownBeforeStatus(deps.store, workflowRun);
     try {
       await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
         outcome: failedOutcome,
         updatedAt: new Date().toISOString(),
-        metadata: { node_counts: nodeCounts, terminal_cause: 'no_successful_nodes' },
+        metadata: {
+          node_counts: nodeCounts,
+          terminal_cause: noSuccessCause,
+          ...(repairCheckoutAbort && repairFailureReason
+            ? { repair_failure_reason: repairFailureReason }
+            : {}),
+        },
         eventData: {
           error: failMsg,
           node_counts: nodeCounts,
-          terminal_cause: 'no_successful_nodes',
+          terminal_cause: noSuccessCause,
+          ...(repairCheckoutAbort && repairFailureReason
+            ? { repair_failure_reason: repairFailureReason }
+            : {}),
         },
       });
     } catch (dbErr) {
@@ -6683,13 +6996,19 @@ async function executeDagWorkflowInternal(
       .filter(([, o]) => o.state === 'failed')
       .map(([id]) => id);
     const allFailuresArePaperwork = failedNodeIds.every(id => isPaperworkNode(id));
-    if (!hasMechanicalEvidenceNode && allFailuresArePaperwork && pushArtifactPresent) {
+    if (
+      !repairCheckoutAbort &&
+      !hasMechanicalEvidenceNode &&
+      allFailuresArePaperwork &&
+      pushArtifactPresent
+    ) {
       getLog().warn(
         { workflowRunId: workflowRun.id, degradedPaperworkNodes: failedNodeIds },
         'dag.workflow_completed_paperwork_degraded'
       );
       const degradedDuration = Date.now() - dagStartTime;
       const degradedOutcome = await makeTerminalOutcome('completed');
+      await recordTeardownBeforeStatus(deps.store, workflowRun);
       try {
         await deps.store.completeWorkflowRun(
           workflowRun.id,
@@ -6753,20 +7072,28 @@ async function executeDagWorkflowInternal(
       .join('; ');
     const failMsg = `DAG workflow '${workflow.name}' completed with failures: ${failedNodes}`;
     const failedOutcome = await makeTerminalOutcome('failed');
+    const failureCause = repairCheckoutAbort ? 'repair_checkout_failed' : 'node_failures';
+    await recordTeardownBeforeStatus(deps.store, workflowRun);
     try {
       await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
         outcome: failedOutcome,
         updatedAt: new Date().toISOString(),
         metadata: {
           node_counts: nodeCounts,
-          terminal_cause: 'node_failures',
+          terminal_cause: failureCause,
           failed_nodes: failedNodeIds,
+          ...(repairCheckoutAbort && repairFailureReason
+            ? { repair_failure_reason: repairFailureReason }
+            : {}),
         },
         eventData: {
           error: failMsg,
           node_counts: nodeCounts,
-          terminal_cause: 'node_failures',
+          terminal_cause: failureCause,
           failed_nodes: failedNodeIds,
+          ...(repairCheckoutAbort && repairFailureReason
+            ? { repair_failure_reason: repairFailureReason }
+            : {}),
         },
       });
     } catch (dbErr) {
@@ -6802,6 +7129,7 @@ async function executeDagWorkflowInternal(
   // Persist terminal facts before publishing any terminal event.
   const duration = Date.now() - dagStartTime;
   const completedOutcome = await makeTerminalOutcome('completed');
+  await recordTeardownBeforeStatus(deps.store, workflowRun);
   try {
     await deps.store.completeWorkflowRun(
       workflowRun.id,
