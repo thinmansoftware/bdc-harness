@@ -39,8 +39,13 @@ assert_contains() {
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
+export NODE_ENV=test
+TEST_REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
+TEST_RUNNER="$TEST_REPO_ROOT/packages/workflows/src/reliability/structured-evidence-runner-cli.test-adapter.ts"
+TEST_BUN="$(command -v bun)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
+bdc-feature-development-astra.yaml
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
 bdc-feature-development-cursor.yaml
@@ -68,11 +73,13 @@ if [ -z "$RSG_CORE" ]; then
   echo "FATAL: could not extract rsg core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RSG_CORE"
+ser_root() { printf '%s' "$TEST_REPO_ROOT"; }
+ser_runner() { "$TEST_BUN" "$TEST_RUNNER" "$@"; }
 for fn in rsg_extract rsg_tokens_safe rsg_argv_looks_readonly rsg_allow_cmd rsg_exec_pipeline rsg_observe rsg_compare rsg_run; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: rsg core byte-identical across all 12 lanes (parity-all-12-lanes) ---"
+echo "--- Parity: rsg core byte-identical across all 13 lanes (parity-all-13-lanes) ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$RSG_CORE" "$(extract_core "$DEFAULTS/$lane" rsg)"
 done
@@ -161,7 +168,10 @@ c='grep -c "needle" fixture.txt'
 if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: double-quoted-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: double-quoted-still-dropped: $c"; fi
 
 echo "--- unsafe-quoted-content-still-dropped ---"
-for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f" "grep '--file=/etc/passwd' x" "find . '-exec' rm" "sort '-o' out"; do
+for c in "grep -c 'needle' fixture.txt" "grep -c 'a b' f" "grep -c '^x' f"; do
+  if rsg_allow_cmd "$c"; then PASS=$((PASS+1)); echo "PASS: quoted literal allowed: $c"; else FAIL=$((FAIL+1)); echo "FAIL: quoted literal allowed: $c"; fi
+done
+for c in "grep -c '\$(id)' f" "grep -c 'x f" "grep -c '' f" "grep '--file=/etc/passwd' x" "find . '-exec' rm" "sort '-o' out"; do
   if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: unsafe-quoted-content-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: unsafe-quoted-content-still-dropped: $c"; fi
 done
 
@@ -241,7 +251,7 @@ assert_contains "double-quoted-still-dropped" "GREP_DROPPED=1" "$OUT"
 assert_contains "double-quoted-still-dropped not executed" "GREP_EXECUTED=0" "$OUT"
 
 echo "--- unsafe-quoted-content-still-dropped (run) ---"
-for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f"; do
+for c in "grep -c '\$(id)' f" "grep -c 'x f" "grep -c '' f"; do
   OUT="$(printf '%s\teq\t1\nUNPARSED\t0\nDECLARED\t1\n' "$c" | rsg_run)"
   assert_contains "unsafe-quoted-content-still-dropped: $c" "DROPPED (not on read-only allowlist; not executed): $c" "$OUT"
   assert_contains "unsafe-quoted-content-still-dropped not executed: $c" "GREP_EXECUTED=0" "$OUT"
@@ -257,6 +267,50 @@ assert_contains "execdir is all_dropped" "GREP_STATUS=all_dropped" "$OUT"
 assert_eq "execdir did not write pwned-rsg-execdir.txt" "0" "$(test -e pwned-rsg-execdir.txt && echo 1 || echo 0)"
 assert_eq "observe execdir is ERR and does not run" "ERR" "$(rsg_observe 'find . -execdir sh evil.sh \;')"
 assert_eq "observe still did not write pwned-rsg-execdir.txt" "0" "$(test -e pwned-rsg-execdir.txt && echo 1 || echo 0)"
+
+echo "--- find predicates after -- are NEVER_RAN and do not touch the tree ---"
+printf 'stay\n' > keep.txt
+FIND_ART="$(mktemp -d)"
+export ARTIFACTS_DIR="$FIND_ART"
+for cmd in \
+  "find -- . -delete" \
+  "find -- . -exec touch marker-exec" \
+  "find -- . -execdir touch marker-execdir" \
+  "find -- . -ok touch marker-ok" \
+  "find -- . -okdir touch marker-okdir" \
+  "find -- . -fprint marker-fprint" \
+  "find -- . -fls marker-fls" \
+  "find -- . '-delete'" \
+  "find -- . '-fprint' marker-qfprint"
+do
+  obs="$(rsg_observe "$cmd")"
+  assert_eq "observe refuses $cmd" "ERR" "$obs"
+  rc=0
+  rsg_exec_pipeline "$cmd" >/dev/null 2>&1 || rc=$?
+  assert_eq "exec refuses $cmd" "127" "$rc"
+  if rsg_allow_cmd "$cmd"; then
+    FAIL=$((FAIL + 1)); echo "FAIL: allow admitted $cmd"
+  else
+    PASS=$((PASS + 1)); echo "PASS: allow refuses $cmd"
+  fi
+done
+OUT="$(printf 'find -- . -delete\teq\t0\nUNPARSED\t0\nDECLARED\t1\n' | rsg_run)"
+assert_contains "post-terminator delete is dropped" "GREP_DROPPED=1" "$OUT"
+assert_contains "post-terminator delete is not executed" "GREP_EXECUTED=0" "$OUT"
+attempt_json="$(find "$FIND_ART/evidence/attempts" -name '*.json' -print -quit)"
+assert_contains "post-terminator delete is NEVER_RAN" '"status": "NEVER_RAN"' "$(cat "$attempt_json")"
+assert_contains "post-terminator delete reason is find-flag" '"reason": "find-flag"' "$(cat "$attempt_json")"
+assert_eq "keep.txt survived find -- -delete" "stay" "$(cat keep.txt)"
+for marker in marker-exec marker-execdir marker-ok marker-okdir marker-fprint marker-fls marker-qfprint; do
+  assert_eq "no $marker" "0" "$(test -e "$marker" && echo 1 || echo 0)"
+done
+if rsg_allow_cmd "sort -- '--output=glob'"; then
+  PASS=$((PASS + 1)); echo "PASS: sort path after -- stays allowed"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL: sort path after -- was refused"
+fi
+unset ARTIFACTS_DIR
+rm -rf "$FIND_ART"
 
 cd "$HERE"
 rm -rf "$TMP"

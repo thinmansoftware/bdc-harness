@@ -53,6 +53,10 @@ assert_not_contains() {
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
+export NODE_ENV=test
+TEST_REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
+TEST_RUNNER="$TEST_REPO_ROOT/packages/workflows/src/reliability/structured-evidence-runner-cli.test-adapter.ts"
+TEST_BUN="$(command -v bun)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-astra.yaml
@@ -95,6 +99,8 @@ if [ -z "$RST_CORE" ]; then
   echo "FATAL: could not extract rst core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RST_CORE"
+ser_root() { printf '%s' "$TEST_REPO_ROOT"; }
+ser_runner() { "$TEST_BUN" "$TEST_RUNNER" "$@"; }
 for fn in rst_class rst_extract_commands rst_command_looks_runnable rst_rescue_subdir rst_tests_in_diff rst_repo_test_script rst_parse_counts rst_scrub_env rst_run_commands rst_report; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
@@ -821,6 +827,58 @@ assert_eq "t6 second scrub rc" "rc2=0" "$(printf '%s\n' "$T6" | sed -n '2p')"
 assert_eq "t6 repeated scrub identical" "same=yes" "$(printf '%s\n' "$T6" | sed -n '3p')"
 assert_eq "t6 dprep skip rc" "dprep_rc=0" "$(printf '%s\n' "$T6" | sed -n '4p')"
 assert_contains "t6 dprep skip path" "dprep: no package.json with a bun lockfile, skipping" "$(printf '%s\n' "$T6" | sed -n '5p')"
+
+echo "--- pass plus no-count or zero-count never reports passed ---"
+MIX="$(mktemp -d)"
+cat > "$MIX/ok.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+cat > "$MIX/nocount.sh" <<'EOF'
+#!/bin/sh
+echo "no counts here"
+exit 0
+EOF
+cat > "$MIX/zero.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 0/0"
+exit 0
+EOF
+cat > "$MIX/impossible.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 4/3"
+exit 0
+EOF
+chmod +x "$MIX/ok.sh" "$MIX/nocount.sh" "$MIX/zero.sh" "$MIX/impossible.sh"
+printf 'bash ./ok.sh\nbash ./nocount.sh\n' > "$MIX/cmds"
+mix_nc="$(cd "$MIX" && rst_run_commands ./cmds ./log-nc)"
+assert_eq "pass plus no-count is blank counts" "0  " "$mix_nc"
+assert_contains "pass plus no-count keeps the passing command" "### run-stop-tests: bash ./ok.sh" "$(cat "$MIX/log-nc")"
+assert_contains "pass plus no-count keeps the blank command" "### run-stop-tests: bash ./nocount.sh" "$(cat "$MIX/log-nc")"
+nc_exit="${mix_nc%% *}"
+nc_counts="$(printf '%s' "${mix_nc#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+nc_report="$(SOURCE=spec_declared rst_report CODE 'bash ./ok.sh; bash ./nocount.sh' "$nc_exit" "$nc_counts")"
+assert_contains "pass plus no-count is counts_unparsed" "TESTS_STATUS=counts_unparsed" "$nc_report"
+assert_not_contains "pass plus no-count is not passed" "TESTS_STATUS=passed" "$nc_report"
+printf 'bash ./ok.sh\nbash ./zero.sh\n' > "$MIX/cmds"
+mix_z="$(cd "$MIX" && rst_run_commands ./cmds ./log-z)"
+assert_eq "pass plus 0/0 publishes 0 0 0" "0 0 0" "$mix_z"
+assert_contains "pass plus 0/0 keeps the zero member" "### run-stop-tests: bash ./zero.sh" "$(cat "$MIX/log-z")"
+z_exit="${mix_z%% *}"
+z_counts="$(printf '%s' "${mix_z#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+z_report="$(rst_report CODE 'bash ./ok.sh; bash ./zero.sh' "$z_exit" "$z_counts")"
+assert_contains "pass plus 0/0 is failed" "TESTS_STATUS=failed" "$z_report"
+assert_not_contains "pass plus 0/0 is not passed" "TESTS_STATUS=passed" "$z_report"
+printf 'bash ./impossible.sh\n' > "$MIX/cmds"
+mix_i="$(cd "$MIX" && rst_run_commands ./cmds ./log-i)"
+i_exit="${mix_i%% *}"
+i_counts="$(printf '%s' "${mix_i#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+assert_eq "impossible 4/3 uses a nonzero exit" "1" "$i_exit"
+assert_eq "impossible 4/3 blanks counts" "" "$i_counts"
+i_report="$(SOURCE=spec_declared rst_report CODE 'bash ./impossible.sh' "$i_exit" "$i_counts")"
+assert_not_contains "impossible 4/3 is not passed" "TESTS_STATUS=passed" "$i_report"
+rm -rf "$MIX"
 
 unset RST_NPX_BIN RST_NPM_BIN GH_TOKEN
 unset TELEGRAM_BOT_TOKEN TELEGRAM_STREAMING_MODE TELEGRAM_APPROVAL_CHAT_ID TELEGRAM_ALLOWED_USER_IDS TELEGRAM_TEST_FIXTURE
