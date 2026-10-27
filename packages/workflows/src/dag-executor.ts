@@ -3230,8 +3230,9 @@ function readProcStartTicks(pid: number): string | null {
 
 function ownedIdentityMatches(entry: OwnedProcessGroup): 'match' | 'mismatch' | 'leader-gone' {
   if (process.platform === 'win32') {
-    // Still recorded means the spawn handle has not closed. onExit retires it,
-    // so a closed handle is never taskkilled.
+    // Windows has no starttime check. onExit retires a group only after the
+    // tree is verified gone, so a dead root with live descendants stays
+    // recorded and teardown still runs taskkill /T /F.
     return 'match';
   }
   if (entry.startTicks === null) return 'mismatch';

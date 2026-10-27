@@ -18,6 +18,7 @@ export {
   endProcessGroup,
   processGroupExists,
   setProcessGroupControlForTests,
+  setWindowsOwnedTreeControlForTests,
   isTreeSurvivedError,
   TERMINATION_GRACE_MS,
   TERMINATION_CONFIRM_MS,
@@ -26,6 +27,7 @@ export type {
   OwnedGroupExecOptions,
   OwnedGroupExecResult,
   ProcessGroupControl,
+  WindowsOwnedTreeControl,
   TreeSurvivedError,
 } from './exec';
 

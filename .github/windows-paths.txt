@@ -19,6 +19,9 @@ packages/core/src/workflows/recovery.ts
 # worktree.ts branches on win32.
 packages/git/src/worktree.ts
 
+# exec.ts taskkills owned Windows trees and must not retire them on root exit alone.
+packages/git/src/exec.ts
+
 # Claude binary resolution branches on win32.
 packages/providers/src/claude/binary-resolver.ts
 
