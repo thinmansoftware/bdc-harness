@@ -7,7 +7,19 @@
  */
 import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
-import { chmod, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
+import type { BigIntStats } from 'fs';
+import {
+  chmod,
+  link,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  unlink,
+  writeFile,
+} from 'fs/promises';
 import { join, resolve } from 'path';
 import { createLogger } from '../../packages/paths/src/logger';
 
@@ -251,13 +263,81 @@ async function pathExists(filePath: string): Promise<boolean> {
   }
 }
 
+/**
+ * Full identity of a served lane file at one instant: contents AND the inode
+ * that held them, plus size and nanosecond mtime.
+ *
+ * Hashing alone is not enough to decide a replacement is safe. An atomic-save
+ * editor (write temp, rename over the target) swaps in a NEW inode; if the
+ * saved bytes happen to match what we classified, a hash-only check sees "no
+ * change" and overwrites a file that a live editor is actively holding. The
+ * inode is what distinguishes "nobody touched this" from "someone replaced
+ * this with something that merely looks the same".
+ */
+interface LaneIdentity {
+  sha256: string;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+}
+
+function identityOf(bytes: Buffer, info: BigIntStats): LaneIdentity {
+  return {
+    sha256: sha256Hex(bytes),
+    ino: info.ino,
+    size: info.size,
+    mtimeNs: info.mtimeNs,
+  };
+}
+
+function sameIdentity(left: LaneIdentity, right: LaneIdentity): boolean {
+  return (
+    left.sha256 === right.sha256 &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs
+  );
+}
+
+async function identityAt(filePath: string): Promise<{ bytes: Buffer; identity: LaneIdentity }> {
+  const bytes = await readFile(filePath);
+  const info = await stat(filePath, { bigint: true });
+  return { bytes, identity: identityOf(bytes, info) };
+}
+
+/**
+ * Put a moved-aside lane back at its served path WITHOUT clobbering anything a
+ * concurrent writer may have created there in the meantime.
+ *
+ * `link()` is the atomic primitive for "create only if absent" -- it fails with
+ * EEXIST rather than overwriting, so there is no check-then-rename window. It
+ * also re-attaches the ORIGINAL inode to the served path, so an editor that is
+ * still holding a descriptor on that inode keeps writing to the served file
+ * exactly as it would have if we had never touched it.
+ */
+async function restoreAside(
+  backupFile: string,
+  livePath: string
+): Promise<'restored' | 'live_path_taken'> {
+  try {
+    await link(backupFile, livePath);
+  } catch (error) {
+    if (isEexist(error)) return 'live_path_taken';
+    throw error;
+  }
+  await unlink(backupFile);
+  return 'restored';
+}
+
 export async function reconcileServedLanes(input: {
   volumeDir: string;
   bakedDir: string;
   history: ServedLaneHistory;
   now: Date;
   beforeReplace?: () => Promise<void> | void;
+  afterObserve?: (filename: string) => Promise<void> | void;
   afterFinalVerify?: (filename: string) => Promise<void> | void;
+  afterLiveCreate?: (filename: string) => Promise<void> | void;
 }): Promise<ReconcileResult> {
   const reportPath = reportPathFor(input.volumeDir);
   const volumePresence = await directoryPresence(input.volumeDir);
@@ -299,20 +379,26 @@ export async function reconcileServedLanes(input: {
       }
       const livePath = join(input.volumeDir, lane.filename);
 
-      // Observe the live file once at replace time. If it changed since
-      // classification (a hand edit that landed between discovery and now),
-      // preserve it and overwrite nothing.
+      // Observe the live file once at replace time, capturing its FULL identity
+      // (bytes + inode + size + mtime), not just a hash. If the contents already
+      // changed since classification (a hand edit that landed between discovery
+      // and now), preserve it and overwrite nothing.
+      const preStat = await stat(livePath, { bigint: true });
       const preBytes = await readFile(livePath);
-      const preStat = await stat(livePath);
-      const preHash = sha256Hex(preBytes);
-      if (preHash !== lane.servedSha256) {
+      const preIdentity = identityOf(preBytes, preStat);
+      if (preIdentity.sha256 !== lane.servedSha256) {
         result.unique_edit.push({
           filename: lane.filename,
-          sha256: preHash,
+          sha256: preIdentity.sha256,
           mtime: preStat.mtime.toISOString(),
         });
         continue;
       }
+
+      // Test seam: an edit injected here lands between the observation above and
+      // the rename below -- including an atomic-save swap that leaves the bytes
+      // identical but installs a new inode.
+      await input.afterObserve?.(lane.filename);
 
       // Create the backup directory lazily, the first time a replacement needs
       // it, so a run that replaces nothing leaves no stray .bak- directory.
@@ -336,17 +422,37 @@ export async function reconcileServedLanes(input: {
       //   3. uid/gid of the original ride along on the moved inode.
       await rename(livePath, backupFile);
 
-      // Final verification: re-read the moved bytes. If an edit slipped in
-      // between the observation above and the rename, the backup now holds that
-      // edit rather than the classified bytes -- put it back and preserve it.
-      const movedBytes = await readFile(backupFile);
-      if (sha256Hex(movedBytes) !== lane.servedSha256) {
-        await rename(backupFile, livePath);
-        const restoredStat = await stat(livePath);
+      // FINAL VALIDATION of the moved inode: hash AND inode AND size AND mtime.
+      // A hash-only check is not sufficient here. Two distinct races both leave
+      // the bytes looking correct:
+      //   a. An atomic-save editor (write temp, rename over the target) installs
+      //      a NEW inode between the observation above and our rename. If its
+      //      bytes coincide with what we classified, a hash-only check says
+      //      "unchanged" and we move aside -- then overwrite -- a file a live
+      //      editor is holding.
+      //   b. A plain in-place write that happens to restore identical bytes
+      //      still bumps size/mtime, proving someone else is active on the path.
+      // Any identity mismatch means we are not looking at the file we vetted, so
+      // we put it back and overwrite nothing.
+      const moved = await identityAt(backupFile);
+      if (!sameIdentity(moved.identity, preIdentity)) {
+        const outcome = await restoreAside(backupFile, livePath);
+        // 'live_path_taken': a concurrent writer created a fresh file at the
+        // served path while it was free. Preserve THAT file and leave our
+        // moved-aside bytes in the backup directory -- nothing is destroyed on
+        // either side.
+        const settled = await identityAt(livePath);
+        const settledStat = await stat(livePath);
+        if (outcome === 'live_path_taken') {
+          log.warn(
+            { filename: lane.filename, backupFile },
+            'served_lanes.live_path_recreated_during_restore'
+          );
+        }
         result.unique_edit.push({
           filename: lane.filename,
-          sha256: sha256Hex(movedBytes),
-          mtime: restoredStat.mtime.toISOString(),
+          sha256: settled.identity.sha256,
+          mtime: settledStat.mtime.toISOString(),
         });
         continue;
       }
@@ -375,10 +481,46 @@ export async function reconcileServedLanes(input: {
         continue;
       }
 
+      // Test seam: an edit injected here simulates an editor that still holds a
+      // descriptor on the ORIGINAL inode. That inode now lives at the backup
+      // path, so the editor's save lands in the backup, NOT at the served path.
+      await input.afterLiveCreate?.(lane.filename);
+
+      // POST-CREATE RE-VERIFICATION. The rename above detached the original
+      // inode, but any process that opened the file BEFORE the rename still
+      // holds a descriptor straight to it -- renaming a path does not disturb an
+      // open descriptor. Such a writer can land a save on that inode after our
+      // final read, which would silently put a hand edit in the backup directory
+      // while we report the lane 'replaced'. Re-check the backup inode now: if
+      // it moved at all, roll the baked file back out and hand the served path
+      // to the edit instead.
+      const settledBackup = await identityAt(backupFile);
+      if (!sameIdentity(settledBackup.identity, preIdentity)) {
+        // rename() replaces the destination atomically, and the destination is
+        // the file WE just created under O_EXCL, so discarding it cannot race a
+        // third party. The preserved inode -- descriptor and all -- goes back to
+        // the served path.
+        await rename(backupFile, livePath);
+        const restoredStat = await stat(livePath);
+        log.warn({ filename: lane.filename }, 'served_lanes.open_descriptor_write_preserved');
+        result.unique_edit.push({
+          filename: lane.filename,
+          sha256: settledBackup.identity.sha256,
+          mtime: restoredStat.mtime.toISOString(),
+        });
+        continue;
+      }
+
+      // Residual, and bounded by design: a descriptor holder can still write to
+      // the detached inode after this check. Those bytes land on the file now
+      // sitting in the backup directory, which this routine never deletes -- so
+      // the edit is retained on disk for recovery rather than destroyed. There
+      // is no sequence on which an uncoordinated edit is lost.
+
       // Reapply the original mode onto the freshly created inode. The process
       // already shares the volume's ownership, so uid/gid are unchanged and only
       // the permission bits need to be restored explicitly.
-      await chmod(livePath, preStat.mode & 0o7777);
+      await chmod(livePath, Number(preStat.mode) & 0o7777);
       result.replaced.push(lane.filename);
     }
 

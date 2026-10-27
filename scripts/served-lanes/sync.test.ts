@@ -2,7 +2,19 @@ import { afterAll, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
 import { mkdtempSync } from 'fs';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from 'fs/promises';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { createCodebase } from '../../packages/core/src/db/codebases';
@@ -300,6 +312,136 @@ describe('served lanes', () => {
         unique_edit: Array<{ filename: string; sha256: string; mtime: string }>;
       };
       expect(report.unique_edit).toEqual([uniqueEdit]);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('an identical-bytes inode swap before the rename is preserved', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const volumePath = join(volumeDir, 'lane.yaml');
+      await writeFile(volumePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+      const originalIno = (await stat(volumePath)).ino;
+      let swappedIno = originalIno;
+
+      const result = await reconcileServedLanes({
+        volumeDir,
+        bakedDir,
+        history,
+        now: NOW,
+        // Fires per-lane AFTER the pre-replace observation and BEFORE the
+        // rename-aside. This is an atomic-save editor (write temp, rename over
+        // the target): the bytes it lands are BYTE-IDENTICAL to the classified
+        // ones and its timestamps are forced to match the observed ones, so the
+        // inode is the only signal that the served file is no longer the file
+        // that was vetted. A hash-only final check calls this "unchanged" and
+        // overwrites a file a live editor is holding.
+        afterObserve: async filename => {
+          if (filename !== 'lane.yaml') return;
+          const observed = await stat(volumePath);
+          const swap = join(volumeDir, '.lane.yaml.swp');
+          await writeFile(swap, stale);
+          await utimes(swap, observed.atime, observed.mtime);
+          swappedIno = (await stat(swap)).ino;
+          await rename(swap, volumePath);
+        },
+      });
+
+      // The swap really did install a different inode under identical bytes.
+      expect(swappedIno).not.toBe(originalIno);
+      expect(sha256Hex(await readFile(volumePath))).toBe(sha256Hex(stale));
+      // Nothing was replaced and the editor's inode still owns the served path.
+      expect(result.replaced).toEqual([]);
+      expect((await stat(volumePath)).ino).toBe(swappedIno);
+      // The pre-image was put back, so no stray .bak- directory survives.
+      expect(result.backup_path).toBeNull();
+      const parentNames = await readdir(parent);
+      expect(parentNames.some(name => name.includes('.bak-'))).toBe(false);
+      const uniqueEdit = {
+        filename: 'lane.yaml',
+        sha256: sha256Hex(stale),
+        mtime: (await stat(volumePath)).mtime.toISOString(),
+      };
+      expect(result.unique_edit).toEqual([uniqueEdit]);
+
+      const report = JSON.parse(
+        await readFile(join(parent, 'served-lanes-report.json'), 'utf8')
+      ) as {
+        unique_edit: Array<{ filename: string; sha256: string; mtime: string }>;
+      };
+      expect(report.unique_edit).toEqual([uniqueEdit]);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('a write through a descriptor held across the rename is preserved', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const edited = Buffer.from(laneYaml('EDITED-THROUGH-HELD-FD'));
+      const volumePath = join(volumeDir, 'lane.yaml');
+      await writeFile(volumePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+      let injected = false;
+
+      // A real editor holds this descriptor open across the entire reconcile.
+      // Renaming the path does NOT detach it -- it still points straight at the
+      // original inode, wherever that inode happens to be linked.
+      const handle = await open(volumePath, 'r+');
+      try {
+        const result = await reconcileServedLanes({
+          volumeDir,
+          bakedDir,
+          history,
+          now: NOW,
+          // Fires AFTER the final verification read AND after the baked file was
+          // exclusively created at the served path -- the exact window that
+          // rename-aside + O_EXCL alone still left open. The save lands on the
+          // detached inode (now the backup), so without a post-create
+          // re-verification the run reports 'replaced' and strands this edit in
+          // the backup directory, unreported.
+          afterLiveCreate: async filename => {
+            if (filename !== 'lane.yaml') return;
+            await handle.truncate(0);
+            await handle.write(edited, 0, edited.length, 0);
+            injected = true;
+          },
+        });
+
+        expect(injected).toBe(true);
+        // The hand edit owns the served path; the baked bytes were rolled back.
+        expect(result.replaced).toEqual([]);
+        const liveBytes = await readFile(volumePath);
+        expect(Buffer.compare(liveBytes, edited)).toBe(0);
+        expect(Buffer.compare(liveBytes, Buffer.from(baked))).not.toBe(0);
+        // The rollback consumed the backup, leaving no stray .bak- directory.
+        expect(result.backup_path).toBeNull();
+        const parentNames = await readdir(parent);
+        expect(parentNames.some(name => name.includes('.bak-'))).toBe(false);
+        const uniqueEdit = {
+          filename: 'lane.yaml',
+          sha256: sha256Hex(edited),
+          mtime: (await stat(volumePath)).mtime.toISOString(),
+        };
+        expect(result.unique_edit).toEqual([uniqueEdit]);
+
+        const report = JSON.parse(
+          await readFile(join(parent, 'served-lanes-report.json'), 'utf8')
+        ) as {
+          unique_edit: Array<{ filename: string; sha256: string; mtime: string }>;
+        };
+        expect(report.unique_edit).toEqual([uniqueEdit]);
+      } finally {
+        await handle.close();
+      }
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
