@@ -86,3 +86,35 @@ The WO suggested `git ls-remote origin HEAD`. Against a public repo (bdc-xo is p
 - bdc-xo#132 (persona schema): same root cause, recovered manually. This WO closes the prevention loop.
 - bdc-xo#168 (Tier 1 host-artifacts volume): a complementary fallback — when push fails for any reason, workflow bundles still land on the host via the bind-mount path. Defense in depth.
 - Cauldron-Fire skill: banned SSH-to-Hetzner-bun-CLI fire path because that path had no `GITHUB_TOKEN` either. With this WO, the canonical web/API fire path is the only path that needs to work — and it does.
+
+## gh guard: merge and review verbs
+
+Inside the build container, `/usr/local/bin/gh` is `scripts/container/gh-merge-guard.sh`. Merge verbs and PR review submission are denied. Both denials exit 86 and start stderr with `gh-merge-guard: BLOCKED.`
+
+Blocked:
+
+- `gh pr merge` in any flag order, REST paths matching `*pulls/*/merge*`, and GraphQL `mergePullRequest` / `enablePullRequestAutoMerge`.
+- `gh pr review` in any flag order, including `--approve`, `--request-changes`, `--comment`, and the short flags `-a`, `-r`, and `-c`.
+- REST writes to a path matching `*pulls/*/reviews*`: `-X POST`, `-X PUT`, `--method POST`, `--method PUT`, `--method=POST`, `--method=PUT`, `-XPOST`, `-XPUT`, and any `-f`, `-F`, `--field`, `--raw-field`, or `--input` (including `=` forms). A field flag is a write even when the same argv also has `-X GET`.
+- GraphQL mutations whose arguments contain `addPullRequestReview` or `submitPullRequestReview`.
+
+Still allowed:
+
+- GET of `*pulls/*/reviews*` with no method flag, with `-X GET` / `--method GET`, or with `--paginate`, and with no field flags.
+- `gh pr view`, `gh pr checks`, `gh pr comment`, and `gh issue comment`.
+- `gh pr create` is not blocked by the guard. The exec wrapper below keeps that authorship on one identity.
+
+Escape hatches are for a human operator debugging inside the container. Neither variable is set in workflow lanes or provider spawns.
+
+- `ARCHON_ALLOW_PR_MERGE=1` bypasses the entire shim, including review rules.
+- `ARCHON_ALLOW_PR_REVIEW=1` bypasses review rules only. Merge rules still exit 86.
+
+Permission fallback (`scripts/github-service-exec.ts`):
+
+A GitHub App HTTP 403 is retried once with the PAT for ordinary reads (`gh pr view`, `gh pr checks`, and other commands that do not change PR authorship). There is no PAT retry when the command changes PR authorship: `gh pr create`, `gh pr review`, REST POST/PUT/PATCH to a path ending in `/pulls` or `/pulls/<n>/reviews` (including field flags), and GraphQL `createPullRequest`, `addPullRequestReview`, or `submitPullRequestReview`. The App result is returned as-is, with one stderr line appended after secret redaction:
+
+```
+github_service_exec: permission fallback refused for a PR authorship command (authorship must come from one identity)
+```
+
+Reads keep the retry. Successful authorship commands and failures that are not this App 403 do not get that line. `ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1` still disables the retry for every command and does not add the line.
