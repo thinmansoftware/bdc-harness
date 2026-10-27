@@ -437,16 +437,34 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         })
       : createRecord);
   const cancelImpl = opts.deps?.cancel ?? cancelRun;
+  // Hermetic package tests set SMART_CAULDRON_HERMETIC=1 and often omit the
+  // teardown reader. A real HTTP read plus the 5s poll blows the 30s test
+  // budget on the second tier (cursor climbs to codex). An old completed row
+  // with empty metadata is already "confirmed" by the 600s pre-deploy rule,
+  // and an injected reader, sleep, or clock still wins.
+  const hermetic = process.env.SMART_CAULDRON_HERMETIC === '1';
   const readRunImpl =
     opts.deps?.readRunDetail ??
-    ((runId: string): Promise<PriorRunDetail | null> =>
-      defaultReadRunDetail(runId, apiBaseUrl, token ?? process.env.ARCHON_OPERATOR_TOKEN ?? ''));
+    (hermetic
+      ? async (): Promise<PriorRunDetail | null> => ({
+          completedAt: new Date(Date.now() - (PREDEPLOY_TEARDOWN_AGE_MS + 60_000)).toISOString(),
+          metadata: {},
+          error: null,
+        })
+      : (runId: string): Promise<PriorRunDetail | null> =>
+          defaultReadRunDetail(
+            runId,
+            apiBaseUrl,
+            token ?? process.env.ARCHON_OPERATOR_TOKEN ?? ''
+          ));
   const sleepImpl =
     opts.deps?.sleep ??
-    ((ms: number): Promise<void> =>
-      new Promise(resolve => {
-        setTimeout(resolve, ms);
-      }));
+    (hermetic
+      ? async (): Promise<void> => undefined
+      : (ms: number): Promise<void> =>
+          new Promise(resolve => {
+            setTimeout(resolve, ms);
+          }));
   const nowImpl = opts.deps?.now ?? ((): number => Date.now());
   const specRepairImpl = opts.deps?.specRepair ?? defaultSpecRepair;
   const superviseFailureImpl = opts.deps?.superviseFailure;

@@ -45,6 +45,11 @@ export interface OwnedGroupExecOptions {
   maxBuffer?: number;
   /** When true (the DAG default), a deadline ends the process group, not only the root. */
   endTreeOnTimeout?: boolean;
+  /**
+   * Called synchronously once the child pid is a positive integer, before any
+   * await. The pid is the process-group id on POSIX detached spawn.
+   */
+  onSpawn?: (pgid: number) => void;
 }
 
 export interface OwnedGroupExecResult {
@@ -183,6 +188,15 @@ export async function endProcessGroup(pid: number): Promise<void> {
  * Does not unref the child. On timeout with endTreeOnTimeout, the group is
  * ended; a group that survives is rejected with treeSurvived and is not a timeout.
  */
+function asBuffer(chunk: Buffer | string): Buffer {
+  return Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+}
+
+function boundedText(buf: Buffer, maxBuffer: number): string {
+  const capped = buf.length > maxBuffer ? buf.subarray(0, maxBuffer) : buf;
+  return capped.toString('utf8');
+}
+
 export async function execOwnedProcessGroup(
   cmd: string,
   args: string[],
@@ -196,97 +210,204 @@ export async function execOwnedProcessGroup(
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
-  const pgid = child.pid;
-  if (pgid === undefined) {
-    throw Object.assign(new Error(`spawn failed for ${cmd}`), { code: 'ENOENT' });
-  }
 
-  let stdout = '';
-  let stderr = '';
-  const onChunk =
-    (which: 'stdout' | 'stderr') =>
-    (buf: Buffer): void => {
-      if (which === 'stdout') stdout += buf.toString();
-      else stderr += buf.toString();
+  return new Promise<OwnedGroupExecResult>((resolve, reject) => {
+    let settled = false;
+    let deferredFailure = false;
+    let knownPid = -1;
+    let stdoutBuf = Buffer.alloc(0);
+    let stderrBuf = Buffer.alloc(0);
+    const timer: { id?: ReturnType<typeof setTimeout> } = {};
+
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      if (timer.id !== undefined) clearTimeout(timer.id);
+      fn();
     };
-  child.stdout?.on('data', onChunk('stdout'));
-  child.stderr?.on('data', onChunk('stderr'));
 
-  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-    (resolve, reject) => {
-      child.once('error', reject);
-      child.once('close', (code, signal) => {
-        resolve({ code, signal });
-      });
-    }
-  );
-
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    if (options.timeout === undefined) {
-      const outcome = await closed;
-      return settleOwnedClose(cmd, pgid, outcome, stdout, stderr, maxBuffer);
-    }
-    const timeoutMs = options.timeout;
-    const winner = await Promise.race([
-      closed.then(outcome => ({ kind: 'close' as const, outcome })),
-      new Promise<{ kind: 'timeout' }>(resolve => {
-        timer = setTimeout(() => {
-          resolve({ kind: 'timeout' });
-        }, timeoutMs);
-      }),
-    ]);
-    if (winner.kind === 'close') {
-      return settleOwnedClose(cmd, pgid, winner.outcome, stdout, stderr, maxBuffer);
-    }
-    if (options.endTreeOnTimeout !== false) {
-      try {
-        await endProcessGroup(pgid);
-      } catch (err) {
-        if (isTreeSurvivedError(err)) {
-          throw Object.assign(err, { pgid, stdout, stderr, killed: false, treeSurvived: true });
-        }
-        throw Object.assign(err as Error, { pgid, stdout, stderr });
-      }
-    } else {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        // The root may already be gone.
-      }
-    }
-    await Promise.race([
-      closed.then(() => undefined).catch(() => undefined),
-      new Promise<void>(resolve => {
-        setTimeout(resolve, TERMINATION_CONFIRM_MS);
-      }),
-    ]);
-    throw Object.assign(new Error(`Command timed out after ${String(timeoutMs)}ms`), {
-      killed: true,
-      code: null,
-      stdout,
-      stderr,
-      pgid,
-      treeSurvived: false,
+    const snapshot = (): { stdout: string; stderr: string } => ({
+      stdout: boundedText(stdoutBuf, maxBuffer),
+      stderr: boundedText(stderrBuf, maxBuffer),
     });
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+
+    // Attach before reading pid. A missing executable or a bad cwd emits
+    // 'error' on a later turn, including when pid is still undefined, and an
+    // unhandled error event would take down the server.
+    child.once('error', (err: Error) => {
+      if (settled || deferredFailure) return;
+      finish(() => {
+        reject(err);
+      });
+    });
+    child.once('close', (code, signal) => {
+      if (settled || deferredFailure) return;
+      finish(() => {
+        try {
+          const pgid = knownPid > 0 ? knownPid : (child.pid ?? -1);
+          resolve(settleOwnedClose(cmd, pgid, { code, signal }, snapshot(), maxBuffer));
+        } catch (err) {
+          reject(err instanceof Error ? err : new Error(String(err)));
+        }
+      });
+    });
+
+    const pid = child.pid;
+    if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) {
+      return;
+    }
+    knownPid = pid;
+
+    try {
+      options.onSpawn?.(pid);
+    } catch (callbackErr) {
+      deferredFailure = true;
+      const failure = callbackErr instanceof Error ? callbackErr : new Error(String(callbackErr));
+      void (async (): Promise<void> => {
+        try {
+          await endProcessGroup(pid);
+        } catch {
+          // The callback error is the execution failure either way.
+        }
+        finish(() => {
+          reject(failure);
+        });
+      })();
+      return;
+    }
+
+    const beginOverflow = (which: 'stdout' | 'stderr', chunk: Buffer): void => {
+      if (settled || deferredFailure) return;
+      deferredFailure = true;
+      const current = which === 'stdout' ? stdoutBuf : stderrBuf;
+      const room = Math.max(0, maxBuffer - current.length);
+      const retained = Buffer.concat([current, chunk.subarray(0, room)]);
+      if (which === 'stdout') stdoutBuf = retained;
+      else stderrBuf = retained;
+      if (stdoutBuf.length > maxBuffer) stdoutBuf = stdoutBuf.subarray(0, maxBuffer);
+      if (stderrBuf.length > maxBuffer) stderrBuf = stderrBuf.subarray(0, maxBuffer);
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      void (async (): Promise<void> => {
+        try {
+          await endProcessGroup(pid);
+        } catch {
+          // The output-limit error still wins when the group cannot be ended.
+        }
+        const text = snapshot();
+        finish(() => {
+          reject(
+            Object.assign(new Error(`Command failed: ${cmd}`), {
+              code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
+              stdout: text.stdout,
+              stderr: text.stderr,
+              killed: false,
+              pgid: pid,
+            })
+          );
+        });
+      })();
+    };
+
+    const onChunk =
+      (which: 'stdout' | 'stderr') =>
+      (chunk: Buffer | string): void => {
+        if (settled || deferredFailure) return;
+        const buf = asBuffer(chunk);
+        const current = which === 'stdout' ? stdoutBuf : stderrBuf;
+        if (current.length + buf.length > maxBuffer) {
+          beginOverflow(which, buf);
+          return;
+        }
+        if (which === 'stdout') stdoutBuf = Buffer.concat([stdoutBuf, buf]);
+        else stderrBuf = Buffer.concat([stderrBuf, buf]);
+      };
+    child.stdout?.on('data', onChunk('stdout'));
+    child.stderr?.on('data', onChunk('stderr'));
+
+    if (options.timeout === undefined) return;
+    const timeoutMs = options.timeout;
+    timer.id = setTimeout(() => {
+      if (settled || deferredFailure) return;
+      deferredFailure = true;
+      void (async (): Promise<void> => {
+        if (options.endTreeOnTimeout !== false) {
+          try {
+            await endProcessGroup(pid);
+          } catch (err) {
+            const text = snapshot();
+            if (isTreeSurvivedError(err)) {
+              finish(() => {
+                reject(
+                  Object.assign(err, {
+                    pgid: pid,
+                    stdout: text.stdout,
+                    stderr: text.stderr,
+                    killed: false,
+                    treeSurvived: true,
+                  })
+                );
+              });
+              return;
+            }
+            finish(() => {
+              reject(
+                Object.assign(err as Error, { pgid: pid, stdout: text.stdout, stderr: text.stderr })
+              );
+            });
+            return;
+          }
+        } else {
+          try {
+            child.kill('SIGKILL');
+          } catch {
+            // The root may already be gone.
+          }
+        }
+        if (child.exitCode === null && child.signalCode === null) {
+          await Promise.race([
+            new Promise<void>(done => {
+              child.once('close', () => {
+                done();
+              });
+            }),
+            new Promise<void>(done => {
+              setTimeout(done, TERMINATION_CONFIRM_MS);
+            }),
+          ]);
+        }
+        const text = snapshot();
+        finish(() => {
+          reject(
+            Object.assign(new Error(`Command timed out after ${String(timeoutMs)}ms`), {
+              killed: true,
+              code: null,
+              stdout: text.stdout,
+              stderr: text.stderr,
+              pgid: pid,
+              treeSurvived: false,
+            })
+          );
+        });
+      })();
+    }, timeoutMs);
+  });
 }
 
 function settleOwnedClose(
   cmd: string,
   pgid: number,
   outcome: { code: number | null; signal: NodeJS.Signals | null },
-  stdout: string,
-  stderr: string,
+  text: { stdout: string; stderr: string },
   maxBuffer: number
 ): OwnedGroupExecResult {
-  if (stdout.length > maxBuffer || stderr.length > maxBuffer) {
+  const stdout = text.stdout;
+  const stderr = text.stderr;
+  if (Buffer.byteLength(stdout) > maxBuffer || Buffer.byteLength(stderr) > maxBuffer) {
     throw Object.assign(new Error(`Command failed: ${cmd}`), {
       code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER',
-      stdout,
-      stderr,
+      stdout: boundedText(Buffer.from(stdout), maxBuffer),
+      stderr: boundedText(Buffer.from(stderr), maxBuffer),
       killed: false,
       pgid,
     });

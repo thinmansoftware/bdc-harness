@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, mock } from 'bun:test';
+import { spawn } from 'child_process';
 import { Database } from 'bun:sqlite';
 import { createHash } from 'crypto';
 import {
@@ -18,7 +19,11 @@ import type { DagNode, WorkflowRun } from './schemas';
 import type { IWorkflowPlatform, WorkflowConfig, WorkflowDeps } from './deps';
 import type { IWorkflowStore } from './store';
 import { parseWorkflow } from './loader';
-import { executeDagWorkflow, resetRunTeardownStateForTests } from './dag-executor';
+import {
+  endRunProcessTree,
+  executeDagWorkflow,
+  resetRunTeardownStateForTests,
+} from './dag-executor';
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
 const DEFAULTS = join(REPO_ROOT, '.archon/workflows/defaults');
@@ -357,6 +362,63 @@ function eventError(store: IWorkflowStore, nodeId: string): string {
     call => call[0]?.event_type === 'node_failed' && call[0]?.step_name === nodeId
   );
   return match?.[0]?.data?.error ?? '';
+}
+
+function processAlive(pid: number): boolean {
+  if (pid <= 0) return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const state =
+      stat
+        .slice(stat.lastIndexOf(')') + 1)
+        .trim()
+        .split(/\s+/)[0] ?? '';
+    return state !== '' && state !== 'Z' && state !== 'X';
+  } catch {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code === 'EPERM';
+    }
+  }
+}
+
+function stopPid(pid: number): void {
+  if (pid <= 0) return;
+  try {
+    if (process.platform === 'win32') {
+      spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+      return;
+    }
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      process.kill(pid, 'SIGKILL');
+    }
+  } catch {
+    // Already gone.
+  }
+}
+
+function procScanAvailable(): boolean {
+  try {
+    readdirSync('/proc');
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function startForeignSleeper(cwd: string): number {
+  const child = spawn('bash', ['-c', 'sleep 60'], {
+    cwd,
+    detached: true,
+    stdio: 'ignore',
+  });
+  const pid = child.pid ?? 0;
+  child.unref();
+  return pid;
 }
 
 function pidIsLive(pid: number): boolean {
@@ -783,4 +845,104 @@ describe.serial('repair holder teardown', () => {
     });
     expect(checked.exitCode, `${checked.stdout.toString()}\n${checked.stderr.toString()}`).toBe(0);
   }, 120000);
+
+  it('does not signal an unrelated cwd holder when the run owns no process', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rht-foreign-only-'));
+    roots.push(dir);
+    const foreignPid = startForeignSleeper(dir);
+    try {
+      expect(foreignPid).toBeGreaterThan(1);
+      expect(processAlive(foreignPid)).toBe(true);
+      const report = await endRunProcessTree('run-no-owned-foreign', dir);
+      expect(processAlive(foreignPid)).toBe(true);
+      if (procScanAvailable()) {
+        expect(report.confirmedAt).toBeNull();
+        expect(report.survivors.some(item => item.pid === foreignPid)).toBe(true);
+      }
+    } finally {
+      stopPid(foreignPid);
+    }
+  });
+
+  it('terminates a verified owned child and leaves a foreign holder alive', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rht-owned-foreign-'));
+    roots.push(dir);
+    const foreignPid = startForeignSleeper(dir);
+    try {
+      expect(foreignPid).toBeGreaterThan(1);
+      const result = await runDag(dir, 'run-owned-and-foreign', [
+        {
+          id: 'bg',
+          bash: 'sleep 300 >/dev/null 2>&1 &\necho $! > owned.pid\necho done\n',
+        },
+      ]);
+      const ownedPid = Number(readFileSync(join(dir, 'owned.pid'), 'utf8').trim());
+      expect(ownedPid).toBeGreaterThan(1);
+      expect(processAlive(ownedPid)).toBe(false);
+      expect(processAlive(foreignPid)).toBe(true);
+      if (procScanAvailable()) {
+        expect(result.order).toContain('teardown_survivors');
+        expect(result.order).not.toContain('teardown_confirmed_at');
+        const updates = (result.store.updateWorkflowRun as ReturnType<typeof mock>).mock
+          .calls as Array<[string, { metadata?: { teardown_survivors?: Array<{ pid: number }> } }]>;
+        const survivors = updates.flatMap(call => call[1]?.metadata?.teardown_survivors ?? []);
+        expect(survivors.some(item => item.pid === foreignPid)).toBe(true);
+        expect(survivors.some(item => item.pid === ownedPid)).toBe(false);
+      }
+    } finally {
+      stopPid(foreignPid);
+    }
+  });
+
+  it('a failed repair checkout stops a same-layer sibling before the layer finishes', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rht-abort-sibling-'));
+    roots.push(dir);
+    const started = Date.now();
+    const failed = await runDag(dir, 'run-abort-sibling', [
+      {
+        id: 'sibling',
+        bash: 'echo $$ > sibling.pid\nsleep 30\necho SIBLING_DONE\n',
+      },
+      {
+        id: 'checkout-repair-target',
+        abort_run_on_failure: true,
+        bash: [
+          'for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do',
+          '  if [ -f sibling.pid ]; then break; fi',
+          '  sleep 0.05',
+          'done',
+          'echo "repair_target_branch_held: feat/x is checked out" >&2',
+          'exit 1',
+        ].join('\n'),
+      },
+      { id: 'plan-review', depends_on: ['checkout-repair-target'], bash: 'echo PLAN_RAN\n' },
+      { id: 'implement', depends_on: ['plan-review'], bash: 'echo IMPL_RAN\n' },
+      { id: 'validation', depends_on: ['implement'], bash: 'echo VAL_RAN\n' },
+      { id: 'test', depends_on: ['validation'], bash: 'echo TEST_RAN\n' },
+    ]);
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(10000);
+    const siblingPid = Number(readFileSync(join(dir, 'sibling.pid'), 'utf8').trim());
+    expect(siblingPid).toBeGreaterThan(1);
+    expect(processAlive(siblingPid)).toBe(false);
+    const calls = (failed.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls as Array<
+      [{ event_type?: string; step_name?: string; data?: { node_output?: string } }]
+    >;
+    const completedIds = calls
+      .filter(call => call[0]?.event_type === 'node_completed')
+      .map(call => call[0]?.step_name);
+    expect(completedIds).not.toContain('plan-review');
+    expect(completedIds).not.toContain('implement');
+    expect(completedIds).not.toContain('validation');
+    expect(completedIds).not.toContain('test');
+    const outputs = calls.map(call => call[0]?.data?.node_output ?? '').join('\n');
+    expect(outputs).not.toContain('SIBLING_DONE');
+    expect(outputs).not.toContain('PLAN_RAN');
+    const failCalls = (failed.store.failWorkflowRun as ReturnType<typeof mock>).mock.calls as Array<
+      [string, string, { metadata?: { terminal_cause?: string; repair_failure_reason?: string } }]
+    >;
+    const metadata = failCalls[0]?.[2]?.metadata;
+    expect(metadata?.terminal_cause).toBe('repair_checkout_failed');
+    expect(metadata?.repair_failure_reason ?? '').toStartWith('repair_target_branch_held');
+  }, 15000);
 });

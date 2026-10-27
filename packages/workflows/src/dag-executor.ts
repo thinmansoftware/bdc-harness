@@ -3196,6 +3196,8 @@ interface TeardownReport {
 
 const ownedProcessGroups = new Map<string, number[]>();
 const teardownReports = new Map<string, TeardownReport>();
+const teardownEpoch = new Map<string, number>();
+const runAbortLatches = new Set<string>();
 const nodeFailureStderr = new Map<string, string>();
 
 function recordOwnedProcessGroup(runId: string, pgid: number | undefined): void {
@@ -3203,6 +3205,40 @@ function recordOwnedProcessGroup(runId: string, pgid: number | undefined): void 
   const list = ownedProcessGroups.get(runId) ?? [];
   if (!list.includes(pgid)) list.push(pgid);
   ownedProcessGroups.set(runId, list);
+  // A group that registers after a scan must not inherit that scan's confirmation.
+  teardownReports.delete(runId);
+  teardownEpoch.set(runId, (teardownEpoch.get(runId) ?? 0) + 1);
+}
+
+function isRunAbortLatched(runId: string): boolean {
+  return runAbortLatches.has(runId);
+}
+
+/** Latch first, then end only groups already recorded for this run. */
+async function abortOwnedGroups(runId: string): Promise<void> {
+  runAbortLatches.add(runId);
+  const groups = [...(ownedProcessGroups.get(runId) ?? [])];
+  await Promise.all(
+    groups.map(async pgid => {
+      try {
+        await endProcessGroup(pgid);
+      } catch {
+        // The terminal scan records a group that is still present.
+      }
+    })
+  );
+}
+
+function ownedSpawnHooks(runId: string): { onSpawn: (pgid: number) => void } {
+  return {
+    onSpawn(pgid: number): void {
+      recordOwnedProcessGroup(runId, pgid);
+      if (!runAbortLatches.has(runId)) return;
+      void endProcessGroup(pgid).catch(() => {
+        // Terminal teardown reports a survivor if this group is still present.
+      });
+    },
+  };
 }
 
 function noteNodeStderr(runId: string, nodeId: string, stderr: string | undefined): void {
@@ -3250,16 +3286,6 @@ function pidAlive(pid: number): boolean {
   }
 }
 
-async function waitPidsGone(pids: number[], ms: number): Promise<void> {
-  const deadline = Date.now() + ms;
-  while (pids.some(pidAlive)) {
-    if (Date.now() >= deadline) return;
-    await new Promise<void>(resolve => {
-      setTimeout(resolve, 50);
-    });
-  }
-}
-
 function cwdInside(resolved: string, root: string): boolean {
   const base = root.endsWith('/') ? root.slice(0, -1) : root;
   return resolved === base || resolved.startsWith(`${base}/`);
@@ -3303,49 +3329,33 @@ function foreignCwdPids(workingPath: string, skip: Set<number>): TeardownSurvivo
   return found;
 }
 
-async function endForeignPids(pids: TeardownSurvivor[]): Promise<TeardownSurvivor[]> {
-  const live = pids.filter(item => item.pid > 1 && item.pid !== process.pid);
-  for (const item of live) {
-    try {
-      process.kill(item.pid, 'SIGTERM');
-    } catch {
-      // Already gone, or not signalable. The confirm window records survivors.
-    }
+function readProcPgrp(pid: number): number | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const after = stat.slice(stat.lastIndexOf(')') + 1).trim();
+    const pgrp = Number(after.split(/\s+/)[2]);
+    return Number.isInteger(pgrp) && pgrp > 0 ? pgrp : null;
+  } catch {
+    return null;
   }
-  await waitPidsGone(
-    live.map(item => item.pid),
-    5000
-  );
-  const afterTerm = live.filter(item => pidAlive(item.pid));
-  for (const item of afterTerm) {
-    try {
-      process.kill(item.pid, 'SIGKILL');
-    } catch {
-      // Already gone.
-    }
-  }
-  await waitPidsGone(
-    afterTerm.map(item => item.pid),
-    1000
-  );
-  return afterTerm
-    .filter(item => pidAlive(item.pid))
-    .map(item => ({ pid: item.pid, comm: readProcComm(item.pid) }));
 }
 
-/**
- * End every process group recorded for the run, then any foreign process whose
- * cwd is inside the run worktree. Idempotent: a second call returns the first
- * report so convergent terminal paths cannot write both teardown keys.
- */
-export async function endRunProcessTree(
+/** A cwd match is owned only when its pid or pgrp is a recorded group for this run. */
+function verifiedOwnedPgid(pid: number, owned: Set<number>): number | null {
+  if (owned.has(pid)) return pid;
+  const pgrp = readProcPgrp(pid);
+  if (pgrp !== null && owned.has(pgrp)) return pgrp;
+  return null;
+}
+
+async function collectTeardownReport(
   runId: string,
   workingPath: string | null | undefined
 ): Promise<TeardownReport> {
-  const cached = teardownReports.get(runId);
-  if (cached) return cached;
   const survivors: TeardownSurvivor[] = [];
-  for (const pgid of ownedProcessGroups.get(runId) ?? []) {
+  const ownedList = ownedProcessGroups.get(runId) ?? [];
+  const owned = new Set(ownedList);
+  for (const pgid of ownedList) {
     try {
       await endProcessGroup(pgid);
     } catch (err) {
@@ -3356,18 +3366,56 @@ export async function endRunProcessTree(
   }
   if (workingPath) {
     const skip = ancestorPids(process.pid);
-    const foreign = foreignCwdPids(workingPath, skip).filter(
-      item => !survivors.some(existing => existing.pid === item.pid)
-    );
-    const remaining = await endForeignPids(foreign);
-    for (const item of remaining) {
-      if (!survivors.some(existing => existing.pid === item.pid)) survivors.push(item);
+    for (const item of foreignCwdPids(workingPath, skip)) {
+      if (survivors.some(existing => existing.pid === item.pid)) continue;
+      const pgid = verifiedOwnedPgid(item.pid, owned);
+      if (pgid === null) {
+        // Unrelated or unproven. Report it and do not signal it.
+        survivors.push(item);
+        continue;
+      }
+      if (!pidAlive(item.pid)) continue;
+      try {
+        await endProcessGroup(pgid);
+      } catch {
+        // Recorded below when the process is still present.
+      }
+      if (pidAlive(item.pid)) {
+        survivors.push({ pid: item.pid, comm: readProcComm(item.pid) });
+      }
     }
   }
-  const report: TeardownReport =
-    survivors.length > 0
-      ? { confirmedAt: null, survivors }
-      : { confirmedAt: new Date().toISOString(), survivors: [] };
+  return survivors.length > 0
+    ? { confirmedAt: null, survivors }
+    : { confirmedAt: new Date().toISOString(), survivors: [] };
+}
+
+/**
+ * End every process group recorded for this run. A cwd under the worktree is
+ * signaled only when it is one of those groups (pid or pgrp). Every other cwd
+ * match is a blocker: it is reported and teardown_confirmed_at stays unset.
+ * Idempotent once a report is cached, unless a later registration clears it.
+ */
+export async function endRunProcessTree(
+  runId: string,
+  workingPath: string | null | undefined
+): Promise<TeardownReport> {
+  const cached = teardownReports.get(runId);
+  if (cached) return cached;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const epoch = teardownEpoch.get(runId) ?? 0;
+    const report = await collectTeardownReport(runId, workingPath);
+    if ((teardownEpoch.get(runId) ?? 0) === epoch) {
+      teardownReports.set(runId, report);
+      return report;
+    }
+  }
+  const epoch = teardownEpoch.get(runId) ?? 0;
+  const report = await collectTeardownReport(runId, workingPath);
+  if ((teardownEpoch.get(runId) ?? 0) !== epoch) {
+    // A registration landed during the last scan. Do not cache a confirmation.
+    return { confirmedAt: null, survivors: report.survivors };
+  }
   teardownReports.set(runId, report);
   return report;
 }
@@ -3380,9 +3428,9 @@ export async function recordTeardownBeforeStatus(
   try {
     const report = await endRunProcessTree(run.id, run.working_path);
     const metadata =
-      report.survivors.length > 0
-        ? { teardown_survivors: report.survivors }
-        : { teardown_confirmed_at: report.confirmedAt ?? new Date().toISOString() };
+      report.confirmedAt !== null && report.survivors.length === 0
+        ? { teardown_confirmed_at: report.confirmedAt }
+        : { teardown_survivors: report.survivors };
     await store.updateWorkflowRun(run.id, { metadata });
   } catch (err) {
     getLog().error({ err, workflowRunId: run.id }, 'workflow.teardown_before_terminal_failed');
@@ -3392,6 +3440,8 @@ export async function recordTeardownBeforeStatus(
 export function resetRunTeardownStateForTests(): void {
   ownedProcessGroups.clear();
   teardownReports.clear();
+  teardownEpoch.clear();
+  runAbortLatches.clear();
   nodeFailureStderr.clear();
 }
 
@@ -3523,11 +3573,15 @@ async function executeBashNode(
           scriptPreparationFailed: true,
         });
       }
+      if (isRunAbortLatched(workflowRun.id)) {
+        return { state: 'skipped', output: '' };
+      }
       const owned = await execOwnedProcessGroup('bash', [scriptFile], {
         cwd,
         timeout,
         env: subprocessEnv,
         endTreeOnTimeout: true,
+        ...ownedSpawnHooks(workflowRun.id),
       });
       stdout = owned.stdout;
       stderr = owned.stderr;
@@ -3675,6 +3729,9 @@ async function executeBashNode(
       node.id,
       typeof err.stderr === 'string' ? err.stderr : undefined
     );
+    if (node.abort_run_on_failure === true) {
+      await abortOwnedGroups(workflowRun.id);
+    }
     // treeSurvived is a failed node, never a timeout, so on_timeout: skip cannot
     // pass over a process tree that is still running.
     const treeSurvived = err.treeSurvived === true;
@@ -3862,6 +3919,9 @@ async function executeScriptNode(
             );
           });
 
+        if (node.abort_run_on_failure === true) {
+          await abortOwnedGroups(workflowRun.id);
+        }
         return { state: 'failed', output: '', error: errorMsg };
       }
       const scriptDef = scripts.get(finalScript);
@@ -3893,6 +3953,9 @@ async function executeScriptNode(
             );
           });
 
+        if (node.abort_run_on_failure === true) {
+          await abortOwnedGroups(workflowRun.id);
+        }
         return { state: 'failed', output: '', error: errorMsg };
       }
 
@@ -3907,11 +3970,15 @@ async function executeScriptNode(
       }
     }
 
+    if (isRunAbortLatched(workflowRun.id)) {
+      return { state: 'skipped', output: '' };
+    }
     const owned = await execOwnedProcessGroup(cmd, args, {
       cwd,
       timeout,
       env: subprocessEnv,
       endTreeOnTimeout: true,
+      ...ownedSpawnHooks(workflowRun.id),
     });
     recordOwnedProcessGroup(workflowRun.id, owned.pgid);
     const stdout = owned.stdout;
@@ -4047,6 +4114,9 @@ async function executeScriptNode(
       node.id,
       typeof err.stderr === 'string' ? err.stderr : undefined
     );
+    if (node.abort_run_on_failure === true) {
+      await abortOwnedGroups(workflowRun.id);
+    }
     // treeSurvived is a failed node, never a timeout, so on_timeout: skip cannot
     // pass over a process tree that is still running.
     const treeSurvived = err.treeSurvived === true;
