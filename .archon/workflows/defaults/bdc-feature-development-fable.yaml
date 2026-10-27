@@ -355,6 +355,9 @@ nodes:
       rtw_save_dirty_patch() {
         local porcelain="" dest="" sum="" id8_local=""
         local staged_path="" worktree_path="" untracked_list="" tar_path=""
+        local scratch_dir="" verify_ok=0 uf=""
+        local unmerged_list="" stages_dir="" wtfiles_dir="" um_ok=0
+        local um_entry="" um_meta="" um_path="" um_sha="" um_blob="" um_recomputed=""
         rtw_emit_saved() {
           local saved_path="$1"
           if ! sum=$(sha256sum "$saved_path" | awk '{print $1}'); then
@@ -400,20 +403,111 @@ nodes:
         if ! rtw_emit_saved "$worktree_path"; then
           rtw_refuse "worktree is dirty" || return 1
         fi
+        # Round-6 finding 2: an unmerged index is NOT recoverable from the staged/
+        # worktree binary diffs above -- for unmerged paths those collapse to a
+        # combined diff and emit unmerged-path notices rather than recoverable index
+        # stages. Preserve every index stage blob (stage 1/2/3) and the working-tree
+        # copy for each unmerged path, and verify each is restorable, BEFORE any
+        # forced worktree removal. If preservation or verification fails, refuse and
+        # leave the holder in place.
+        unmerged_list=$(mktemp)
+        if ! git -C "$holder" ls-files -u -z > "$unmerged_list"; then
+          rm -f "$unmerged_list"
+          rtw_refuse "unmerged index unverified" || return 1
+        fi
+        if [ -s "$unmerged_list" ]; then
+          stages_dir="${dest}/index-stages"
+          wtfiles_dir="${dest}/worktree-files"
+          if ! mkdir -p "$stages_dir" "$wtfiles_dir"; then
+            rm -f "$unmerged_list"
+            rtw_refuse "unmerged index unverified" || return 1
+          fi
+          if ! git -C "$holder" ls-files -u > "${dest}/ls-files-u.txt"; then
+            rm -f "$unmerged_list"
+            rtw_refuse "unmerged index unverified" || return 1
+          fi
+          um_ok=1
+          while IFS= read -r -d '' um_entry; do
+            [ -n "$um_entry" ] || continue
+            um_meta=${um_entry%%$'\t'*}
+            um_path=${um_entry#*$'\t'}
+            um_sha=$(printf '%s' "$um_meta" | awk '{print $2}')
+            if [ -z "$um_sha" ]; then
+              um_ok=0
+              break
+            fi
+            um_blob="${stages_dir}/${um_sha}.blob"
+            if [ ! -f "$um_blob" ]; then
+              if ! git -C "$holder" cat-file blob "$um_sha" > "$um_blob"; then
+                um_ok=0
+                break
+              fi
+              um_recomputed=$(git -C "$holder" hash-object "$um_blob" 2>/dev/null || true)
+              if [ "$um_recomputed" != "$um_sha" ]; then
+                um_ok=0
+                break
+              fi
+            fi
+            if [ -e "${holder}/${um_path}" ]; then
+              if ! mkdir -p "$(dirname "${wtfiles_dir}/${um_path}")"; then
+                um_ok=0
+                break
+              fi
+              if ! cp "${holder}/${um_path}" "${wtfiles_dir}/${um_path}"; then
+                um_ok=0
+                break
+              fi
+              if ! cmp -s "${holder}/${um_path}" "${wtfiles_dir}/${um_path}"; then
+                um_ok=0
+                break
+              fi
+            fi
+          done < "$unmerged_list"
+          if [ "$um_ok" -ne 1 ]; then
+            rm -f "$unmerged_list"
+            rtw_refuse "unmerged index unverified" || return 1
+          fi
+        fi
+        rm -f "$unmerged_list"
+        # Round-5 finding 1: archive untracked files with NUL-delimited, literal
+        # (verbatim) names via `git ls-files -z` piped into `tar --null
+        # --verbatim-files-from` so leading/trailing whitespace and option-like
+        # names (e.g. a file named '--version') are not stripped or interpreted by
+        # tar, then verify every untracked file restores byte-for-byte BEFORE any
+        # forced worktree removal. On any mismatch, refuse.
         untracked_list=$(mktemp)
-        if ! git -C "$holder" ls-files --others --exclude-standard > "$untracked_list"; then
+        if ! git -C "$holder" ls-files -z --others --exclude-standard > "$untracked_list"; then
           rm -f "$untracked_list"
           rtw_refuse "worktree is dirty" || return 1
         fi
         if [ -s "$untracked_list" ]; then
           tar_path="${dest}/untracked.tar"
-          if ! tar -C "$holder" -cf "$tar_path" -T "$untracked_list"; then
+          if ! tar -C "$holder" --null --verbatim-files-from -cf "$tar_path" -T "$untracked_list"; then
             rm -f "$untracked_list"
             rtw_refuse "worktree is dirty" || return 1
           fi
           if ! rtw_emit_saved "$tar_path"; then
             rm -f "$untracked_list"
             rtw_refuse "worktree is dirty" || return 1
+          fi
+          scratch_dir=$(mktemp -d)
+          if ! tar -C "$scratch_dir" -xf "$tar_path"; then
+            rm -rf "$scratch_dir"
+            rm -f "$untracked_list"
+            rtw_refuse "untracked backup unverified" || return 1
+          fi
+          verify_ok=1
+          while IFS= read -r -d '' uf; do
+            [ -n "$uf" ] || continue
+            if ! cmp -s "${holder}/${uf}" "${scratch_dir}/${uf}"; then
+              verify_ok=0
+              break
+            fi
+          done < "$untracked_list"
+          rm -rf "$scratch_dir"
+          if [ "$verify_ok" -ne 1 ]; then
+            rm -f "$untracked_list"
+            rtw_refuse "untracked backup unverified" || return 1
           fi
         fi
         rm -f "$untracked_list"
