@@ -1611,6 +1611,20 @@ function publishTestSummary(
   if (passedMember && unparsed && exitCode === 0) {
     return { line: `${exitCode}  `, exitCode, passed: null, total: null };
   }
+  // A passing segment must not hide a later zero-count or unparsed segment
+  // in the same && chain. Member status alone misses that when counts were summed.
+  const chainUnparsed =
+    exitCode === 0 &&
+    selected.some(member => member.chain.some(step => step.status === 'COUNTS_UNPARSED'));
+  if (chainUnparsed) {
+    return { line: `${exitCode}  `, exitCode, passed: null, total: null };
+  }
+  const chainZero =
+    exitCode === 0 &&
+    selected.some(member => member.chain.some(step => step.reason === 'zero-count'));
+  if (chainZero) {
+    return { line: '0 0 0', exitCode: 0, passed: 0, total: 0 };
+  }
   if (hit) {
     return { line: `${exitCode} ${passed} ${total}`, exitCode, passed, total };
   }
@@ -2148,12 +2162,26 @@ export function selectStagesBlock(
 }
 
 const YAML_TO_JSON = `
-import json, sys
+import json, os, sys, site
 try:
     import yaml
 except ImportError:
-    sys.stderr.write("FAIL: python yaml module unavailable; cannot parse stages.\\n")
-    sys.exit(1)
+    # python3 -I drops cwd and PYTHONPATH, and also hides user-site packages.
+    # Re-add only the absolute user site when it is not the working directory
+    # so a product yaml.py cannot satisfy "import yaml".
+    user_site = site.getusersitepackages()
+    cwd = os.path.abspath(os.getcwd())
+    if user_site and os.path.isdir(user_site) and os.path.abspath(user_site) != cwd:
+        sys.path.append(os.path.abspath(user_site))
+        try:
+            import yaml
+        except ImportError:
+            yaml = None
+    else:
+        yaml = None
+    if yaml is None:
+        sys.stderr.write("FAIL: python yaml module unavailable; cannot parse stages.\\n")
+        sys.exit(1)
 text = open(sys.argv[1], encoding="utf-8").read()
 try:
     data = yaml.safe_load(text)
@@ -2235,15 +2263,26 @@ function validateStages(
   return { ok: true, stages: out };
 }
 
+function parserChildEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  if (source.PATH !== undefined) out.PATH = source.PATH;
+  if (source.LANG !== undefined) out.LANG = source.LANG;
+  for (const [key, value] of Object.entries(source)) {
+    if (value !== undefined && key.startsWith('LC_')) out[key] = value;
+  }
+  return out;
+}
+
 export function parseStagesYaml(
   yamlText: string
 ): { ok: true; stages: StageContract[] } | { ok: false; message: string } {
   const file = join(tmpdir(), `ser-stages-${process.pid}.yaml`);
   writeFileSync(file, yamlText);
-  const result = spawnSync('python3', ['-c', YAML_TO_JSON, file], {
+  const result = spawnSync('python3', ['-I', '-c', YAML_TO_JSON, file], {
     shell: false,
     encoding: 'utf8',
     timeout: 30_000,
+    env: parserChildEnv(process.env),
   });
   if (result.status !== 0) {
     return { ok: false, message: result.stderr || 'FAIL: stages YAML parse error\n' };

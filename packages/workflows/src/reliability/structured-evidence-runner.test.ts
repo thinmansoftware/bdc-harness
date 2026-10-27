@@ -24,6 +24,7 @@ import {
   extractTestCommands,
   normalizeTestCommand,
   observeAssertion,
+  parseStagesYaml,
   resolveTrustedRunnerFile,
   runTestCommands,
   scopeEvidence,
@@ -422,6 +423,56 @@ describe('partial-failure-and-compatibility', () => {
       rmSync(cwd, { recursive: true, force: true });
     }
   });
+
+  it('does not publish a passed summary for a chained zero-count or unparsed segment', () => {
+    const cwd = tempDir('ser-chain-summary-');
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\nexit 0\n');
+    writeExec(join(cwd, 'zero.sh'), '#!/bin/sh\necho "Tests: 0/0"\nexit 0\n');
+    writeExec(join(cwd, 'nocount.sh'), '#!/bin/sh\necho "no counts here"\nexit 0\n');
+    const countsPass = (summary: {
+      exitCode: number;
+      passed: number | null;
+      total: number | null;
+    }): boolean =>
+      summary.exitCode === 0 &&
+      summary.passed !== null &&
+      summary.total !== null &&
+      summary.passed === summary.total &&
+      summary.total > 0;
+    try {
+      const zero = runTestCommands(['bash ./ok.sh && bash ./zero.sh'], cwd, join(cwd, 'zero.log'));
+      expect(zero.line).toBe('0 0 0');
+      expect(zero.passed).toBe(0);
+      expect(zero.total).toBe(0);
+      expect(zero.attempt.aggregate).not.toBe('PASSED');
+      expect(zero.attempt.members[0]?.chain.map(step => step.status)).toEqual(['PASSED', 'FAILED']);
+      expect(zero.attempt.members[0]?.chain[1]?.reason).toBe('zero-count');
+      expect(countsPass(zero)).toBe(false);
+
+      const unparsed = runTestCommands(
+        ['bash ./ok.sh && bash ./nocount.sh'],
+        cwd,
+        join(cwd, 'nocount.log')
+      );
+      expect(unparsed.line).toBe('0  ');
+      expect(unparsed.passed).toBeNull();
+      expect(unparsed.total).toBeNull();
+      expect(unparsed.attempt.aggregate).not.toBe('PASSED');
+      expect(unparsed.attempt.members[0]?.chain[1]?.status).toBe('COUNTS_UNPARSED');
+      expect(countsPass(unparsed)).toBe(false);
+
+      const control = runTestCommands(
+        ['bash ./ok.sh && bash ./ok.sh'],
+        cwd,
+        join(cwd, 'control.log')
+      );
+      expect(control.line).toBe('0 2 2');
+      expect(control.attempt.members[0]?.status).toBe('PASSED');
+      expect(countsPass(control)).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('precedence-no-fallback-laundering', () => {
@@ -582,6 +633,129 @@ describe('canonical-stage-authority', () => {
     expect(refused.status).toBe(3);
     expect(refused.stderr).toContain('repo');
     rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it('parses stage YAML in isolated mode without product imports or secrets', () => {
+    const cwd = tempDir('ser-yaml-isolate-');
+    const shimDir = tempDir('ser-yaml-shim-');
+    const argvLog = join(cwd, 'argv.log');
+    const envLog = join(cwd, 'env.log');
+    const sentinel = join(cwd, 'yaml-import-sentinel');
+    const previousCwd = process.cwd();
+    const envKeys = [
+      'PATH',
+      'BDC_PARSER_SECRET',
+      'GH_TOKEN',
+      'ANTHROPIC_API_KEY',
+      'OPENAI_API_KEY',
+      'CURSOR_API_KEY',
+      'PYTHONPATH',
+    ] as const;
+    const savedEnv: Partial<Record<(typeof envKeys)[number], string | undefined>> = {};
+    for (const key of envKeys) savedEnv[key] = process.env[key];
+    const secret = 'bdc-parser-secret-round12';
+    try {
+      initRepo(cwd);
+      writeFileSync(
+        join(cwd, 'yaml.py'),
+        [
+          'import os',
+          'sentinel = os.path.join(os.path.dirname(os.path.abspath(__file__)), "yaml-import-sentinel")',
+          'handle = open(sentinel, "w")',
+          'handle.write(os.environ.get("BDC_PARSER_SECRET", ""))',
+          'handle.close()',
+          '',
+        ].join('\n')
+      );
+      git(cwd, ['add', 'yaml.py']);
+      git(cwd, ['commit', '-qm', 'hostile yaml']);
+      const probed = spawnSync('python3', ['-c', 'import sys; print(sys.executable)'], {
+        encoding: 'utf8',
+      });
+      if (probed.status !== 0 || !probed.stdout) {
+        throw new Error(probed.stderr || 'python3 executable probe failed');
+      }
+      const realPython = probed.stdout.trim();
+      writeExec(
+        join(shimDir, 'python3'),
+        [
+          '#!/bin/sh',
+          `ARGV_LOG='${argvLog}'`,
+          `ENV_LOG='${envLog}'`,
+          `REAL_PYTHON='${realPython}'`,
+          `SHIM_DIR='${shimDir}'`,
+          ': > "$ARGV_LOG"',
+          'for arg in "$@"; do',
+          '  printf \'%s\\0\' "$arg" >> "$ARGV_LOG"',
+          'done',
+          '/usr/bin/env > "$ENV_LOG"',
+          'CLEAN_PATH=',
+          'OLD_IFS=$IFS',
+          'IFS=:',
+          'for dir in $PATH; do',
+          '  if [ "$dir" = "$SHIM_DIR" ]; then',
+          '    continue',
+          '  fi',
+          '  if [ -z "$CLEAN_PATH" ]; then',
+          '    CLEAN_PATH=$dir',
+          '  else',
+          '    CLEAN_PATH="$CLEAN_PATH:$dir"',
+          '  fi',
+          'done',
+          'IFS=$OLD_IFS',
+          'PATH=$CLEAN_PATH',
+          'export PATH',
+          'exec "$REAL_PYTHON" "$@"',
+          '',
+        ].join('\n')
+      );
+      process.env.BDC_PARSER_SECRET = secret;
+      process.env.GH_TOKEN = 'bdc-gh-token-round12';
+      process.env.ANTHROPIC_API_KEY = 'bdc-anthropic-round12';
+      process.env.OPENAI_API_KEY = 'bdc-openai-round12';
+      process.env.CURSOR_API_KEY = 'bdc-cursor-round12';
+      process.env.PYTHONPATH = cwd;
+      process.env.PATH = `${shimDir}:${savedEnv.PATH ?? ''}`;
+      process.chdir(cwd);
+      let parsedOk = false;
+      let parseError = '';
+      try {
+        const parsed = parseStagesYaml(
+          stageBody(oneStage('api', 'thinmansoftware/shopops', 'bash ./ok.sh'))
+        );
+        parsedOk = parsed.ok;
+        if (!parsed.ok) parseError = parsed.message;
+      } catch (error) {
+        parseError = error instanceof Error ? error.message : String(error);
+      }
+      expect(existsSync(sentinel)).toBe(false);
+      expect(existsSync(envLog)).toBe(true);
+      const envText = readFileSync(envLog, 'utf8');
+      for (const forbidden of [
+        secret,
+        'PYTHONPATH',
+        'GH_TOKEN',
+        'ANTHROPIC_API_KEY',
+        'OPENAI_API_KEY',
+        'CURSOR_API_KEY',
+        'BDC_PARSER_SECRET',
+      ]) {
+        expect(envText).not.toContain(forbidden);
+      }
+      const argvItems = readFileSync(argvLog).toString('utf8').split('\0');
+      expect(argvItems).toContain('-I');
+      expect(process.env.BDC_PARSER_SECRET).toBe(secret);
+      expect({ ok: parsedOk, error: parseError }).toEqual({ ok: true, error: '' });
+    } finally {
+      process.chdir(previousCwd);
+      for (const key of envKeys) {
+        const value = savedEnv[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(shimDir, { recursive: true, force: true });
+    }
   });
 });
 
