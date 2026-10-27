@@ -588,10 +588,12 @@ export async function executeWorkflow(
   async function teardownBeforeTerminalStatus(run: WorkflowRun): Promise<void> {
     try {
       const report = await endRunProcessTree(run.id, run.working_path);
+      // confirmedAt null with an empty survivor list is still unconfirmed.
+      // Do not invent a timestamp: a group may have registered during the scan.
       const metadata =
-        report.survivors.length > 0
-          ? { teardown_survivors: report.survivors }
-          : { teardown_confirmed_at: report.confirmedAt ?? new Date().toISOString() };
+        report.confirmedAt !== null && report.survivors.length === 0
+          ? { teardown_confirmed_at: report.confirmedAt }
+          : { teardown_survivors: report.survivors };
       await deps.store.updateWorkflowRun(run.id, { metadata });
     } catch (err) {
       getLog().error({ err, workflowRunId: run.id }, 'workflow.teardown_before_terminal_failed');

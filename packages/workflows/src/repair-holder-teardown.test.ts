@@ -15,14 +15,26 @@ import {
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { setProcessGroupControlForTests } from '@archon/git';
+import { registerBuiltinProviders } from '@archon/providers';
+import { runCascade } from '../../smart-cauldron/src/cascade';
+import type {
+  CascadeDeps,
+  PriorRunDetail,
+  RunCascadeOptions,
+} from '../../smart-cauldron/src/cascade';
+import type { FireResult, GateVerdict, PollResult } from '../../smart-cauldron/src/types';
 import type { DagNode, WorkflowRun } from './schemas';
 import type { IWorkflowPlatform, WorkflowConfig, WorkflowDeps } from './deps';
 import type { IWorkflowStore } from './store';
 import { parseWorkflow } from './loader';
+import { executeWorkflow } from './executor';
 import {
   endRunProcessTree,
   executeDagWorkflow,
+  recordOwnedProcessGroupForTests,
+  recordTeardownBeforeStatus,
   resetRunTeardownStateForTests,
+  teardownTerminalMetadata,
 } from './dag-executor';
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
@@ -435,6 +447,154 @@ function pidIsLive(pid: number): boolean {
   }
 }
 
+function hasSleepChild(parentPid: number): boolean {
+  let entries: string[] = [];
+  try {
+    entries = readdirSync('/proc');
+  } catch {
+    return false;
+  }
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    let stat = '';
+    try {
+      stat = readFileSync(`/proc/${entry}/stat`, 'utf8');
+    } catch {
+      continue;
+    }
+    const after = stat
+      .slice(stat.lastIndexOf(')') + 1)
+      .trim()
+      .split(/\s+/);
+    if (Number(after[1]) !== parentPid) continue;
+    try {
+      if (readFileSync(`/proc/${entry}/comm`, 'utf8').trim() === 'sleep') return true;
+    } catch {
+      // The child exited between stat and comm.
+    }
+  }
+  return false;
+}
+
+async function waitForSleepChild(parentPid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (hasSleepChild(parentPid)) return true;
+    await Bun.sleep(50);
+  }
+  return false;
+}
+
+async function waitForCwdLink(pid: number): Promise<void> {
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    try {
+      readlinkSync(`/proc/${pid}/cwd`);
+      return;
+    } catch {
+      await Bun.sleep(20);
+    }
+  }
+  throw new Error(`cwd link for ${pid} did not appear`);
+}
+
+function virtualClock(): { now: () => number; sleep: (ms: number) => Promise<void> } {
+  let t = 0;
+  return {
+    now: () => t,
+    sleep: async (ms: number) => {
+      t += ms;
+    },
+  };
+}
+
+function makePollResult(overrides?: Partial<PollResult>): PollResult {
+  return {
+    runId: 'run-stub',
+    terminalStatus: 'completed',
+    validatorVerdict: 'satisfied',
+    prUrl: null,
+    prMergeable: null,
+    servedModelId: null,
+    rawMetadata: {},
+    ...overrides,
+  };
+}
+
+function makeFireOk(runId: string): FireResult {
+  return { ok: true, runId, conversationId: 'conv-stub', infraError: null };
+}
+
+function makePassVerdict(): GateVerdict {
+  return {
+    pass: true,
+    reason: 'all gate conditions passed',
+    cancelled: false,
+    validatorVerdict: 'satisfied',
+    prOpened: true,
+    prMergeable: true,
+    terminalStatus: 'completed',
+  };
+}
+
+function makeFailVerdict(reason: string): GateVerdict {
+  return {
+    pass: false,
+    reason,
+    cancelled: false,
+    validatorVerdict: 'needs_revision',
+    prOpened: false,
+    prMergeable: null,
+    terminalStatus: 'failed',
+  };
+}
+
+function cascadeOpts(deps: CascadeDeps): RunCascadeOptions {
+  const outDir = mkdtempSync(join(tmpdir(), 'rht-cascade-'));
+  roots.push(outDir);
+  return {
+    woId: 'WO-RHT-001',
+    woClass: 'CODE',
+    tags: ['mechanical'],
+    entryOverride: 'cursor',
+    outDir,
+    token: 'test-token',
+    project: 'test-project',
+    deps: {
+      findWoClaim: async () => null,
+      acquireWoLock: async (woId, project, cascadeId) => ({
+        acquired: true,
+        path: 'in-memory-test-lock',
+        record: {
+          woId,
+          project,
+          cascadeId,
+          status: 'running',
+          createdAt: new Date(0).toISOString(),
+          updatedAt: new Date(0).toISOString(),
+        },
+      }),
+      releaseWoLock: async () => {},
+      writeRecord: async () => 'record.json',
+      fetchNodeTimeouts: async () => ({}),
+      sleep: async () => {},
+      now: () => Date.now(),
+      ...deps,
+    },
+  };
+}
+
+async function withTeardownWait<T>(waitMs: string, body: () => Promise<T>): Promise<T> {
+  const previous = process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS;
+  process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS = waitMs;
+  try {
+    return await body();
+  } finally {
+    if (previous === undefined) delete process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS;
+    else process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS = previous;
+  }
+}
+
 function pidsIn(dir: string): number[] {
   const found: number[] = [];
   let entries: string[] = [];
@@ -491,7 +651,6 @@ describe.serial('repair holder teardown', () => {
       RTW_HOLDER_WAIT_SECONDS: '20',
     };
     delete env.ARTIFACTS_DIR;
-    const started = Date.now();
     const proc = Bun.spawn(['bash', scriptPath, 'feat/x'], {
       cwd: fixture.caller,
       env,
@@ -499,14 +658,14 @@ describe.serial('repair holder teardown', () => {
       stderr: 'pipe',
     });
     try {
-      await Bun.sleep(5500);
+      const bashPid = proc.pid ?? 0;
+      const waiting = await waitForSleepChild(bashPid, 15000);
+      expect(waiting).toBe(true);
       expect(worktrees(fixture.caller)).toContain(holder);
       rmSync(pidDir, { recursive: true, force: true });
       const exitCode = await proc.exited;
       const stdout = await new Response(proc.stdout).text();
       const stderr = await new Response(proc.stderr).text();
-      const elapsed = Date.now() - started;
-      expect(elapsed, `${stdout}\n${stderr}`).toBeGreaterThanOrEqual(6000);
       expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
       expect(stdout).toContain('repair_target_worktree_reclaimed:');
       expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], fixture.caller).trim()).toBe('feat/x');
@@ -611,11 +770,104 @@ describe.serial('repair holder teardown', () => {
     expect(worktrees(refused.caller)).toContain(dirtyHolder);
   });
 
-  it('Test 4: waitForPriorTeardown is the conductor retry gate', () => {
-    const source = readFileSync(join(REPO_ROOT, 'packages/smart-cauldron/src/cascade.ts'), 'utf8');
-    expect(source).toContain('export async function waitForPriorTeardown');
-    expect(source).toContain('teardown_unconfirmed');
-    expect(source).toContain('SMART_CAULDRON_TEARDOWN_WAIT_MS');
+  it('Test 4: the conductor polls prior teardown before the next fire', async () => {
+    const emptyDetail: PriorRunDetail = {
+      completedAt: '2026-10-27T00:00:00.000Z',
+      metadata: {},
+      error: null,
+    };
+
+    await withTeardownWait('20000', async () => {
+      const clock = virtualClock();
+      let reads = 0;
+      const fireAtRead: number[] = [];
+      const record = await runCascade(
+        cascadeOpts({
+          readRunDetail: async () => {
+            reads += 1;
+            if (reads >= 3) {
+              return {
+                completedAt: '2026-10-27T00:00:00.000Z',
+                metadata: { teardown_confirmed_at: '2026-10-27T00:00:01.000Z' },
+                error: null,
+              };
+            }
+            return emptyDetail;
+          },
+          sleep: clock.sleep,
+          now: clock.now,
+          fire: async () => {
+            fireAtRead.push(reads);
+            return makeFireOk(`run-${fireAtRead.length}`);
+          },
+          poll: async () => makePollResult(),
+          judge: () =>
+            fireAtRead.length === 1 ? makeFailVerdict('needs revision') : makePassVerdict(),
+          escalate: async () => undefined,
+        })
+      );
+      expect(fireAtRead).toEqual([0, 3]);
+      expect(record.status).toBe('won');
+      expect(record.attempts).toHaveLength(2);
+    });
+
+    await withTeardownWait('20000', async () => {
+      const clock = virtualClock();
+      let fires = 0;
+      const reasons: string[] = [];
+      const record = await runCascade(
+        cascadeOpts({
+          readRunDetail: async () => emptyDetail,
+          sleep: clock.sleep,
+          now: clock.now,
+          fire: async () => {
+            fires += 1;
+            return makeFireOk(`run-${fires}`);
+          },
+          poll: async () => makePollResult({ terminalStatus: 'failed' }),
+          judge: () => makeFailVerdict('needs revision'),
+          escalate: async ctx => {
+            reasons.push(ctx.reason);
+          },
+        })
+      );
+      expect(fires).toBe(1);
+      expect(record.status).toBe('blocked');
+      expect(record.attempts[1]?.gateFailReason).toBe('teardown_unconfirmed');
+      expect(reasons).toHaveLength(1);
+      expect(reasons[0]).toContain('teardown_unconfirmed');
+    });
+
+    await withTeardownWait('20000', async () => {
+      const clock = virtualClock();
+      let fires = 0;
+      const reasons: string[] = [];
+      const record = await runCascade(
+        cascadeOpts({
+          readRunDetail: async () => ({
+            completedAt: '2026-10-27T00:00:00.000Z',
+            metadata: { teardown_survivors: [{ pid: 9, comm: 'sleep' }] },
+            error: null,
+          }),
+          sleep: clock.sleep,
+          now: clock.now,
+          fire: async () => {
+            fires += 1;
+            return makeFireOk(`run-${fires}`);
+          },
+          poll: async () => makePollResult({ terminalStatus: 'failed' }),
+          judge: () => makeFailVerdict('needs revision'),
+          escalate: async ctx => {
+            reasons.push(ctx.reason);
+          },
+        })
+      );
+      expect(fires).toBe(1);
+      expect(record.status).toBe('blocked');
+      expect(record.attempts[1]?.gateFailReason).toBe('teardown_unconfirmed');
+      expect(reasons).toHaveLength(1);
+      expect(reasons[0]).toContain('teardown_unconfirmed');
+    });
   });
 
   it('Test 5: a terminal run ends its process tree before release', async () => {
@@ -804,12 +1056,45 @@ describe.serial('repair holder teardown', () => {
     }
   });
 
-  it('Test 8: checkout_failed_no_climb is the conductor stop', () => {
-    const source = readFileSync(join(REPO_ROOT, 'packages/smart-cauldron/src/cascade.ts'), 'utf8');
-    expect(source).toContain('checkout_failed_no_climb');
-    expect(source).toContain('repair_checkout_failed');
-    expect(source).toContain('repair_gate_closed: checkout_failed');
-    expect(source).toContain('repair_target_branch_held');
+  it('Test 8: a two-tier cascade fires once when repair checkout fails', async () => {
+    let fires = 0;
+    const fired: string[] = [];
+    const reasons: string[] = [];
+    const record = await runCascade(
+      cascadeOpts({
+        readRunDetail: async () => ({
+          completedAt: '2026-10-27T00:00:00.000Z',
+          metadata: { teardown_confirmed_at: '2026-10-27T00:00:01.000Z' },
+          error: null,
+        }),
+        fire: async opts => {
+          fires += 1;
+          fired.push(opts.workflowName);
+          return makeFireOk('run-repair');
+        },
+        poll: async () =>
+          makePollResult({
+            terminalStatus: 'failed',
+            rawMetadata: {
+              terminal_cause: 'repair_checkout_failed',
+              error: 'repair_target_branch_held: feat/x is checked out',
+            },
+          }),
+        judge: () => makeFailVerdict('validator needs revision'),
+        escalate: async ctx => {
+          reasons.push(ctx.reason);
+        },
+      })
+    );
+    expect(fires).toBe(1);
+    expect(fired).toEqual(['bdc-feature-development-cursor']);
+    expect(record.status).toBe('blocked');
+    expect(record.attempts).toHaveLength(1);
+    expect(record.attempts[0]?.gateFailReason).toBe('checkout_failed_no_climb');
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toContain('checkout_failed_no_climb');
+    expect(reasons[0]).toContain('run-repair');
+    expect(reasons[0]).toContain('repair_target_branch_held');
   });
 
   it('Test 9: a holder that never exits is refused after the bounded wait', () => {
@@ -945,4 +1230,107 @@ describe.serial('repair holder teardown', () => {
     expect(metadata?.terminal_cause).toBe('repair_checkout_failed');
     expect(metadata?.repair_failure_reason ?? '').toStartWith('repair_target_branch_held');
   }, 15000);
+
+  it('rescans cwd before reusing a cached confirmation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rht-cache-race-'));
+    roots.push(dir);
+    const runId = 'run-cache-race';
+    const first = await endRunProcessTree(runId, dir);
+    expect(first.confirmedAt).not.toBeNull();
+    expect(first.survivors).toEqual([]);
+    if (!procScanAvailable()) return;
+    const foreignPid = startForeignSleeper(dir);
+    try {
+      expect(foreignPid).toBeGreaterThan(1);
+      await waitForCwdLink(foreignPid);
+      const updates: Array<{ metadata?: Record<string, unknown> }> = [];
+      await recordTeardownBeforeStatus(
+        {
+          updateWorkflowRun: async (_id, patch) => {
+            updates.push(patch);
+          },
+        },
+        { id: runId, working_path: dir }
+      );
+      expect(processAlive(foreignPid)).toBe(true);
+      const metadata = updates[0]?.metadata ?? {};
+      expect(Object.prototype.hasOwnProperty.call(metadata, 'teardown_confirmed_at')).toBe(false);
+      const survivors = metadata.teardown_survivors;
+      expect(Array.isArray(survivors)).toBe(true);
+      expect((survivors as Array<{ pid: number }>).some(item => item.pid === foreignPid)).toBe(
+        true
+      );
+    } finally {
+      stopPid(foreignPid);
+    }
+  });
+
+  it('does not confirm when a group registers during the last scan', async () => {
+    const metadata = teardownTerminalMetadata({ confirmedAt: null, survivors: [] });
+    expect(metadata).toEqual({ teardown_survivors: [] });
+    expect(Object.prototype.hasOwnProperty.call(metadata, 'teardown_confirmed_at')).toBe(false);
+
+    registerBuiltinProviders();
+    const fixture = makeFixture();
+    const runId = 'run-epoch-race';
+    recordOwnedProcessGroupForTests(runId, 424242);
+    setProcessGroupControlForTests({
+      signal() {
+        recordOwnedProcessGroupForTests(runId, 424242);
+        return true;
+      },
+      groupExists() {
+        return false;
+      },
+    });
+    const store = createMockStore();
+    const updates: Array<{ metadata?: Record<string, unknown> }> = [];
+    (store.updateWorkflowRun as ReturnType<typeof mock>).mockImplementation(
+      async (_id: string, patch: { metadata?: Record<string, unknown> }) => {
+        if (patch.metadata) updates.push(patch);
+      }
+    );
+    const deps = {
+      store,
+      getAgentProvider: mock(() => {
+        throw new Error('provider must not be called');
+      }),
+      loadConfig: mock(async () => minimalConfig),
+    } as unknown as WorkflowDeps;
+    const result = await executeWorkflow(
+      deps,
+      createPlatform(),
+      'conv-teardown',
+      fixture.caller,
+      {
+        name: 'teardown-executor',
+        description: 'teardown executor',
+        nodes: [],
+        provider: 'claude',
+        mutates_checkout: false,
+        target_repo: 'not/this-repo',
+      },
+      'teardown',
+      'conv-db',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      makeRun(runId, fixture.caller)
+    );
+    expect(result.success).toBe(false);
+    const teardownUpdates = updates.filter(
+      patch =>
+        patch.metadata !== undefined &&
+        (Object.prototype.hasOwnProperty.call(patch.metadata, 'teardown_confirmed_at') ||
+          Object.prototype.hasOwnProperty.call(patch.metadata, 'teardown_survivors'))
+    );
+    expect(teardownUpdates.length).toBeGreaterThan(0);
+    for (const patch of teardownUpdates) {
+      expect(Object.prototype.hasOwnProperty.call(patch.metadata, 'teardown_confirmed_at')).toBe(
+        false
+      );
+      expect(patch.metadata?.teardown_survivors).toEqual([]);
+    }
+  });
 });

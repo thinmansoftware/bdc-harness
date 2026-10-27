@@ -3394,14 +3394,20 @@ async function collectTeardownReport(
  * End every process group recorded for this run. A cwd under the worktree is
  * signaled only when it is one of those groups (pid or pgrp). Every other cwd
  * match is a blocker: it is reported and teardown_confirmed_at stays unset.
- * Idempotent once a report is cached, unless a later registration clears it.
+ * An unconfirmed report stays cached. A confirmation does not: the abort path
+ * caches one before the terminal write, so the confirming call scans cwd again.
  */
 export async function endRunProcessTree(
   runId: string,
   workingPath: string | null | undefined
 ): Promise<TeardownReport> {
   const cached = teardownReports.get(runId);
-  if (cached) return cached;
+  if (cached && (cached.confirmedAt === null || cached.survivors.length > 0)) {
+    return cached;
+  }
+  // Drop a stale confirmation before the rescan. A throw or a registration
+  // during the scan must not leave that confirmation in place.
+  if (cached) teardownReports.delete(runId);
   for (let attempt = 0; attempt < 4; attempt++) {
     const epoch = teardownEpoch.get(runId) ?? 0;
     const report = await collectTeardownReport(runId, workingPath);
@@ -3414,10 +3420,24 @@ export async function endRunProcessTree(
   const report = await collectTeardownReport(runId, workingPath);
   if ((teardownEpoch.get(runId) ?? 0) !== epoch) {
     // A registration landed during the last scan. Do not cache a confirmation.
+    teardownReports.delete(runId);
     return { confirmedAt: null, survivors: report.survivors };
   }
   teardownReports.set(runId, report);
   return report;
+}
+
+/**
+ * Exactly one teardown key. confirmedAt null is unconfirmed even when the
+ * survivor list is empty: a group may have registered during the scan.
+ */
+export function teardownTerminalMetadata(
+  report: TeardownReport
+): { teardown_confirmed_at: string } | { teardown_survivors: TeardownSurvivor[] } {
+  if (report.confirmedAt !== null && report.survivors.length === 0) {
+    return { teardown_confirmed_at: report.confirmedAt };
+  }
+  return { teardown_survivors: report.survivors };
 }
 
 /** Metadata-only write. Exactly one of the two teardown keys. Never throws. */
@@ -3427,10 +3447,7 @@ export async function recordTeardownBeforeStatus(
 ): Promise<void> {
   try {
     const report = await endRunProcessTree(run.id, run.working_path);
-    const metadata =
-      report.confirmedAt !== null && report.survivors.length === 0
-        ? { teardown_confirmed_at: report.confirmedAt }
-        : { teardown_survivors: report.survivors };
+    const metadata = teardownTerminalMetadata(report);
     await store.updateWorkflowRun(run.id, { metadata });
   } catch (err) {
     getLog().error({ err, workflowRunId: run.id }, 'workflow.teardown_before_terminal_failed');
@@ -3443,6 +3460,11 @@ export function resetRunTeardownStateForTests(): void {
   teardownEpoch.clear();
   runAbortLatches.clear();
   nodeFailureStderr.clear();
+}
+
+/** Test seam. Registration bumps the teardown epoch and drops a cached report. */
+export function recordOwnedProcessGroupForTests(runId: string, pgid: number): void {
+  recordOwnedProcessGroup(runId, pgid);
 }
 
 function firstRepairFailureLine(stderr: string): string | undefined {
@@ -6793,8 +6815,8 @@ async function executeDagWorkflowInternal(
             );
           });
       }
-      // Stop in-flight owned groups before the terminal status write. The
-      // report is cached so the later metadata write does not scan again.
+      // Stop in-flight owned groups before the terminal status write.
+      // The later metadata write scans cwd again before it may confirm.
       await endRunProcessTree(workflowRun.id, workflowRun.working_path);
       break;
     }
