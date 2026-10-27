@@ -55,6 +55,97 @@ curl -X POST "$ARCHON_URL/api/dispatch/messages/$MESSAGE_ID/ack" \
 
 The lease is checked again in the same transaction that writes the receipt. A bare operator
 token always binds the actor to `operator`.
+
+### Operator runbook: xo-mailbox-ack.sh
+
+The live XO seat acknowledges or addresses its mailbox with
+`scripts/dispatch/xo-mailbox-ack.sh`. Run it from a bdc-harness checkout. The production
+image does not copy `docs/` or `scripts/dispatch/`.
+
+```sh
+xo-mailbox-ack.sh <ack|address> <message-id> [message-id...]
+```
+
+`ARCHON_URL` defaults to `http://127.0.0.1:3090`.
+
+Required environment variables. The script never echoes their values:
+
+- `BOARD_PRINCIPAL_TOKEN`
+- `XO_HOLDER_TOKEN`
+
+Optional:
+
+- `XO_ACK_DRY_RUN=1` prints `POST`, the message URL, the four header names
+  (`x-board-principal-token`, `x-xo-holder-token`, `x-xo-lease-id`,
+  `x-xo-fencing-token`), and `body={}`, then exits without calling the network.
+- `ARCHON_OPERATOR_TOKEN`, when set and non-empty, is sent as
+  `x-archon-operator-token` on the lease read and on each receipt write. It is
+  never printed.
+
+The script reads `lease_id` and `fencing_token` from `GET /api/board/xo-lease/current`,
+then POSTs `{}` to `/api/dispatch/messages/<id>/<ack|address>` with the four lease
+headers. It never calls `/cancel`.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Every id returned HTTP 200, or a dry-run finished. |
+| 1 | The lease fetch failed, or at least one id did not return HTTP 200. |
+| 2 | Usage error, or a required variable is missing. The message names that variable. |
+| 3 | `no_live_xo_lease`. The current-lease route returned HTTP 200 JSON `null`, or an object with no `lease_id`. |
+
+Dry-run. The tokens below are fake and exist only in the environment assignments.
+The script must not echo them:
+
+```sh
+ARCHON_URL=http://127.0.0.1:3090 \
+BOARD_PRINCIPAL_TOKEN=bpt-example \
+XO_HOLDER_TOKEN=xht-example \
+XO_ACK_DRY_RUN=1 \
+  bash scripts/dispatch/xo-mailbox-ack.sh ack 11111111-1111-1111-1111-111111111111
+```
+
+`GET /api/dispatch/principals` (operator token) lists every `dispatch_principals` row
+and the ack path for that row. Sample:
+
+```json
+{
+  "principals": [
+    {
+      "principal_id": "codex",
+      "display_name": "Codex",
+      "delivery_mode": "worker_poll",
+      "active": true,
+      "credential_configured": false,
+      "ack_path": "worker_claim"
+    },
+    {
+      "principal_id": "operator",
+      "display_name": "Operator",
+      "delivery_mode": "drain_on_start",
+      "active": true,
+      "credential_configured": false,
+      "ack_path": "operator_token"
+    },
+    {
+      "principal_id": "xo",
+      "display_name": "XO",
+      "delivery_mode": "drain_on_start",
+      "active": true,
+      "credential_configured": false,
+      "ack_path": "xo_lease"
+    },
+    {
+      "principal_id": "xo-fable",
+      "display_name": "XO Fable",
+      "delivery_mode": "drain_on_start",
+      "active": true,
+      "credential_configured": false,
+      "ack_path": "none"
+    }
+  ]
+}
+```
+
 ## Inbox reader
 
 The inbox reader classifies the `xo` mailbox every five minutes and can optionally take ownership
