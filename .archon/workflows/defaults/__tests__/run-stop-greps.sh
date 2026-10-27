@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run-stop-greps.sh -- unit tests for the run-stop-greps node core (rsg_*) in
 # .archon/workflows/defaults/bdc-feature-development-codex.yaml and its byte-identical
-# mirrors in the other 11 bdc-feature-development lanes.
+# mirrors in the other 12 bdc-feature-development lanes.
 #
 # bdc-xo #1940: the manifest "Grep assertions:" line was stamped "N/A (no declared
 # mechanical assertions)" for every WO, including specs that declared grep stop
@@ -9,7 +9,7 @@
 # it under the read-only allowlist, and emits OBSERVED counts.
 #
 # Cores are EXTRACTED from the canonical YAML (never re-typed). A parity test asserts
-# the core is byte-identical across all 12 lanes.
+# the core is byte-identical across all 13 lanes.
 #
 # Run: bash .archon/workflows/defaults/__tests__/run-stop-greps.sh
 # Exits 0 on all-pass, 1 on any failure. ASCII only.
@@ -41,6 +41,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
+bdc-feature-development-astra.yaml
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
 bdc-feature-development-cursor.yaml
@@ -68,11 +69,11 @@ if [ -z "$RSG_CORE" ]; then
   echo "FATAL: could not extract rsg core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RSG_CORE"
-for fn in rsg_extract rsg_tokens_safe rsg_argv_looks_readonly rsg_allow_cmd rsg_exec_pipeline rsg_observe rsg_compare rsg_run; do
+for fn in rsg_extract rsg_split_segment rsg_tokens_safe rsg_argv_looks_readonly rsg_allow_cmd rsg_exec_pipeline rsg_observe rsg_compare rsg_run; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: rsg core byte-identical across all 12 lanes (parity-all-12-lanes) ---"
+echo "--- Parity: rsg core byte-identical across all 13 lanes (parity-all-13-lanes) ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$RSG_CORE" "$(extract_core "$DEFAULTS/$lane" rsg)"
 done
@@ -161,7 +162,7 @@ c='grep -c "needle" fixture.txt'
 if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: double-quoted-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: double-quoted-still-dropped: $c"; fi
 
 echo "--- unsafe-quoted-content-still-dropped ---"
-for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f" "grep '--file=/etc/passwd' x" "find . '-exec' rm" "sort '-o' out"; do
+for c in "grep -c '\$(id)' f" "grep -c 'x f" "grep -c '' f" "grep '--file=/etc/passwd' x" "find . '-exec' rm" "sort '-o' out"; do
   if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: unsafe-quoted-content-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: unsafe-quoted-content-still-dropped: $c"; fi
 done
 
@@ -241,7 +242,7 @@ assert_contains "double-quoted-still-dropped" "GREP_DROPPED=1" "$OUT"
 assert_contains "double-quoted-still-dropped not executed" "GREP_EXECUTED=0" "$OUT"
 
 echo "--- unsafe-quoted-content-still-dropped (run) ---"
-for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f"; do
+for c in "grep -c '\$(id)' f" "grep -c 'x f" "grep -c '' f"; do
   OUT="$(printf '%s\teq\t1\nUNPARSED\t0\nDECLARED\t1\n' "$c" | rsg_run)"
   assert_contains "unsafe-quoted-content-still-dropped: $c" "DROPPED (not on read-only allowlist; not executed): $c" "$OUT"
   assert_contains "unsafe-quoted-content-still-dropped not executed: $c" "GREP_EXECUTED=0" "$OUT"
@@ -327,6 +328,247 @@ assert_contains "ge 1 holds with observed 3" 'OK: grep -c gcd shopops-api/routes
 assert_contains "ASCII absence holds" 'OK: LC_ALL=C grep -n NonAscii shopops-api/routes/store.js => 0 (expected eq 0)' "$OUT"
 assert_contains "unparsed bullet assertions make evidence incomplete" "GREP_STATUS=incomplete" "$OUT"
 rm -rf "$TMP2"
+
+echo "--- spaced single-quoted pattern executes (Test 1) ---"
+TMP3="$(mktemp -d)"
+printf 'Pullers billed: 3\nPullers billed: 3\n' > "$TMP3/notes.txt"
+printf '  provider: codex\n' > "$TMP3/lane.yaml"
+SPEC_SPACED="$(cat <<'EOF'
+Stop 1 (grep assertion):
+  grep -c 'Pullers billed' notes.txt
+  Expected: 2
+Stop 2 (grep assertion):
+  grep -cE '^ +provider: codex' lane.yaml
+  Expected: 1
+EOF
+)"
+for c in "grep -c 'Pullers billed' notes.txt" "grep -cE '^ +provider: codex' lane.yaml" "grep -n 'two words' a.txt" "grep -E 'two words' a.txt" "grep -F 'two words' a.txt" "grep -i 'two words' a.txt" "grep -o 'two words' a.txt" "grep -cE 'two words' a.txt" "grep -rc 'two words' dir" "grep -ciE 'two words' a.txt" "grep -c -E 'two words' a.txt" "grep -c '^x' f" "grep -c 'a b' f"; do
+  if rsg_allow_cmd "$c"; then PASS=$((PASS+1)); echo "PASS: spaced-or-flag allow: $c"; else FAIL=$((FAIL+1)); echo "FAIL: spaced-or-flag allow: $c"; fi
+done
+OUT="$(cd "$TMP3" && printf '%s\n' "$SPEC_SPACED" | rsg_extract | rsg_run)"
+assert_contains "spaced GREP_DECLARED=2" "GREP_DECLARED=2" "$OUT"
+assert_contains "spaced GREP_EXECUTED=2" "GREP_EXECUTED=2" "$OUT"
+assert_contains "spaced GREP_DROPPED=0" "GREP_DROPPED=0" "$OUT"
+assert_contains "spaced GREP_STATUS=passed" "GREP_STATUS=passed" "$OUT"
+assert_contains "spaced GREP_LINE keeps the quoted command" "grep -c 'Pullers billed' notes.txt => 2" "$OUT"
+assert_contains "spaced OK pullers" "OK: grep -c 'Pullers billed' notes.txt => 2 (expected eq 2)" "$OUT"
+assert_contains "spaced OK provider" "OK: grep -cE '^ +provider: codex' lane.yaml => 1 (expected eq 1)" "$OUT"
+if printf '%s\n' "$OUT" | grep -q '^DROPPED'; then FAIL=$((FAIL+1)); echo "FAIL: spaced run emitted DROPPED"; else PASS=$((PASS+1)); echo "PASS: spaced run has no DROPPED line"; fi
+
+echo "--- metacharacters stay dropped (Test 2) ---"
+TMP4="$(mktemp -d)"
+UNSAFE_CMDS=(
+  'grep -c "two words" f'
+  "grep -c 'a\\.b' f"
+  "grep -c 'cost \$5' f"
+  "grep -c 'a|b' f"
+  "grep -c 'x' 'y' f"
+  "grep -c 'x; rm' f"
+  "grep -c 'x' f > out"
+  "grep -c 'x' f | xargs rm"
+  "grep -c 'un terminated f"
+  "grep -f 'list' f"
+)
+UNSAFE_TSV=""
+for c in "${UNSAFE_CMDS[@]}"; do
+  if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: unsafe allow returned 0: $c"; else PASS=$((PASS+1)); echo "PASS: unsafe allow dropped: $c"; fi
+  UNSAFE_TSV="${UNSAFE_TSV}${c}${TAB}eq${TAB}1"$'\n'
+done
+UNSAFE_TSV="${UNSAFE_TSV}UNPARSED${TAB}0"$'\n'"DECLARED${TAB}10"$'\n'
+OUT="$(cd "$TMP4" && printf '%s' "$UNSAFE_TSV" | rsg_run)"
+assert_contains "unsafe GREP_EXECUTED=0" "GREP_EXECUTED=0" "$OUT"
+assert_contains "unsafe GREP_DROPPED=10" "GREP_DROPPED=10" "$OUT"
+assert_contains "unsafe GREP_STATUS=all_dropped" "GREP_STATUS=all_dropped" "$OUT"
+assert_eq "unsafe redirect did not create out" "0" "$(test -e "$TMP4/out" && echo 1 || echo 0)"
+
+echo "--- allow and exec agree with vma (Test 3) ---"
+printf 'two words\n' > "$TMP3/a.txt"
+mkdir -p "$TMP3/g"
+printf 'two words\n' > "$TMP3/g/a.txt"
+printf 'two words\n' > "$TMP3/g/b.txt"
+VMA_CORE="$(extract_core "$CANONICAL_YAML" vma)"
+if [ -z "$VMA_CORE" ]; then
+  FAIL=$((FAIL+1)); echo "FAIL: could not extract vma core"
+else
+  PASS=$((PASS+1)); echo "PASS: extracted vma core"
+fi
+count_raw() {
+  local raw="$1" rc="$2" rawtrim
+  rawtrim="$(printf '%s' "$raw" | tr -d '[:space:]')"
+  if printf '%s' "$rawtrim" | grep -qE '^[0-9]+$'; then
+    printf '%s' "$rawtrim"
+  elif [ -z "$rawtrim" ]; then
+    if [ "$rc" -le 1 ]; then printf '0'; else printf 'ERR'; fi
+  else
+    printf '%s\n' "$raw" | grep -c . || true
+  fi
+}
+for c in "grep -c 'Pullers billed' notes.txt" "grep -cE '^ +provider: codex' lane.yaml" "grep -c 'two words' g/*.txt | wc -l" "grep -n 'two words' a.txt | head -n 3"; do
+  rsg_raw="$(cd "$TMP3" && rsg_exec_pipeline "$c")"; rsg_rc=$?
+  rsg_n="$(count_raw "$rsg_raw" "$rsg_rc")"
+  vma_err="$(mktemp)"
+  vma_out="$(
+    cd "$TMP3" && eval "$VMA_CORE"
+    vma_process_assertions "$c => 0" "" 2>"$vma_err"
+  )"
+  vma_n="$(printf '%s\n' "$vma_out" | sed -n 's/.*=> //p' | head -n 1)"
+  assert_eq "rsg/vma count: $c" "$rsg_n" "$vma_n"
+  if [ -s "$vma_err" ] && grep -q 'DROP (command not on read-only allowlist' "$vma_err"; then
+    FAIL=$((FAIL+1)); echo "FAIL: vma dropped an executed command: $c"; echo "  $vma_err"
+  else
+    PASS=$((PASS+1)); echo "PASS: vma did not drop: $c"
+  fi
+  rm -f "$vma_err"
+done
+assert_eq "glob expanded to both txt files" "2" "$(cd "$TMP3" && rsg_exec_pipeline "grep -c 'two words' g/*.txt | wc -l" | tr -d '[:space:]')"
+
+echo "--- checkout-repair-target verdict on every path (Test 4) ---"
+extract_bash_node() {
+  awk -v id="$2" '
+    $0 == "  - id: " id { c=1; next }
+    c && /^  - id: / { exit }
+    c && /^    bash: \|$/ { b=1; next }
+    b && /^      / { sub(/^      /, ""); print; next }
+    b && /^$/ { print; next }
+    b { exit }
+  ' "$1"
+}
+CHECKOUT_BASH="$(extract_bash_node "$CANONICAL_YAML" checkout-repair-target)"
+if [ -z "$CHECKOUT_BASH" ]; then
+  echo "FATAL: could not extract checkout-repair-target"; exit 1
+fi
+run_node() {
+  local script="$1" spec="$2" work="$3" art out err rc
+  art="$(mktemp -d)"
+  mkdir -p "$art/authority"
+  printf '%s\n' "$spec" > "$art/authority/work-order.md"
+  printf '%s\n' "$script" > "$art/node.sh"
+  err="$(mktemp)"
+  out="$(cd "$work" && ARTIFACTS_DIR="$art" PATH="${GHBIN:-}:$PATH" FAKE_GH_STATE="${FAKE_GH_STATE:-}" FAKE_GH_BRANCH="${FAKE_GH_BRANCH:-}" FAKE_GH_HEAD_OID="${FAKE_GH_HEAD_OID:-}" bash "$art/node.sh" 2>"$err")"
+  rc=$?
+  if [ -s "$err" ]; then
+    printf 'STDERR:%s\n' "$(cat "$err")" >&2
+  fi
+  printf '%s\n' "$rc"
+  printf '%s\n' "$out"
+  rm -rf "$art"
+  rm -f "$err"
+}
+NONE_SPEC='WO: EXAMPLE
+Objective: ordinary build with no declaration line.'
+NONE_RUN="$(run_node "$CHECKOUT_BASH" "$NONE_SPEC" "$TMP4")"
+NONE_RC="$(printf '%s\n' "$NONE_RUN" | head -n 1)"
+NONE_OUT="$(printf '%s\n' "$NONE_RUN" | tail -n +2)"
+assert_eq "none exit" "0" "$NONE_RC"
+assert_contains "none status" "REPAIR_TARGET_STATUS=none" "$NONE_OUT"
+assert_contains "none legacy line" "REPAIR_TARGET=none" "$NONE_OUT"
+INV_SPEC='Repair target: PR #1234 (branch salvage/x)'
+INV_RUN="$(run_node "$CHECKOUT_BASH" "$INV_SPEC" "$TMP4")"
+INV_RC="$(printf '%s\n' "$INV_RUN" | head -n 1)"
+INV_OUT="$(printf '%s\n' "$INV_RUN" | tail -n +2)"
+assert_eq "invalid branch exit" "1" "$INV_RC"
+assert_contains "invalid branch status" "REPAIR_TARGET_STATUS=invalid" "$INV_OUT"
+assert_contains "invalid branch reason" "REPAIR_TARGET_REASON=invalid_repair_target_branch" "$INV_OUT"
+ORIGIN="$(mktemp -d)"
+WORK="$(mktemp -d)"
+GHBIN="$(mktemp -d)"
+cat > "$GHBIN/gh" << 'EOF'
+#!/bin/sh
+printf '%s\t%s\tfalse\tthinmansoftware\tbdc-harness\t%s\n' "$FAKE_GH_STATE" "$FAKE_GH_BRANCH" "$FAKE_GH_HEAD_OID"
+EOF
+chmod 755 "$GHBIN/gh"
+git init --bare --initial-branch=main "$ORIGIN" >/dev/null
+git clone "$ORIGIN" "$WORK" >/dev/null
+git -C "$WORK" config user.email test@test.com
+git -C "$WORK" config user.name Test
+printf 'init\n' > "$WORK/README.md"
+git -C "$WORK" add README.md
+git -C "$WORK" commit -m init >/dev/null
+git -C "$WORK" push origin main >/dev/null
+printf 'tip\n' > "$WORK/tip.txt"
+git -C "$WORK" add tip.txt
+git -C "$WORK" commit -m tip >/dev/null
+git -C "$WORK" push origin 'HEAD:feat/repair-branch' >/dev/null
+REPAIR_SHA="$(git -C "$WORK" rev-parse HEAD)"
+git -C "$WORK" remote set-url origin https://github.com/thinmansoftware/bdc-harness.git
+git -C "$WORK" config --local "url.${ORIGIN}.insteadOf" https://github.com/thinmansoftware/bdc-harness.git
+OPEN_SPEC='Repair target: PR #1234 (branch feat/repair-branch)'
+FAKE_GH_STATE=MERGED
+FAKE_GH_BRANCH=feat/repair-branch
+FAKE_GH_HEAD_OID="$REPAIR_SHA"
+MERGED_RUN="$(run_node "$CHECKOUT_BASH" "$OPEN_SPEC" "$WORK")"
+MERGED_RC="$(printf '%s\n' "$MERGED_RUN" | head -n 1)"
+MERGED_OUT="$(printf '%s\n' "$MERGED_RUN" | tail -n +2)"
+assert_eq "merged exit" "1" "$MERGED_RC"
+assert_contains "merged status" "REPAIR_TARGET_STATUS=invalid" "$MERGED_OUT"
+assert_contains "merged reason" "REPAIR_TARGET_REASON=not_open" "$MERGED_OUT"
+HELD_BASH="$(printf '%s\n' "$CHECKOUT_BASH" | python3 -c '
+import sys
+text = sys.stdin.read()
+start = text.find("# ---- BEGIN rtw core")
+end = text.find("# ---- END rtw core ----")
+if start < 0 or end < 0:
+    sys.stderr.write("rtw markers missing\n")
+    sys.exit(1)
+stub = """rtw_checkout_repair_branch() {
+  printf \"repair_target_branch_held: %s is checked out by %s; not reclaimed: %s\\n\" \"$1\" \"/tmp/second-worktree\" \"holder is this worktree\"
+  printf \"repair_target_branch_held: %s is checked out by %s; not reclaimed: %s\\n\" \"$1\" \"/tmp/second-worktree\" \"holder is this worktree\" >&2
+  return 1
+}
+"""
+sys.stdout.write(text[:start] + stub + text[end + len("# ---- END rtw core ----"):])
+')"
+FAKE_GH_STATE=OPEN
+HELD_RUN="$(run_node "$HELD_BASH" "$OPEN_SPEC" "$WORK")"
+HELD_RC="$(printf '%s\n' "$HELD_RUN" | head -n 1)"
+HELD_OUT="$(printf '%s\n' "$HELD_RUN" | tail -n +2)"
+assert_eq "held exit" "1" "$HELD_RC"
+assert_contains "held status" "REPAIR_TARGET_STATUS=held" "$HELD_OUT"
+assert_contains "held reason" "REPAIR_TARGET_REASON=branch_held" "$HELD_OUT"
+assert_contains "held holder" "REPAIR_TARGET_HOLDER=/tmp/second-worktree" "$HELD_OUT"
+OK_RUN="$(run_node "$CHECKOUT_BASH" "$OPEN_SPEC" "$WORK")"
+OK_RC="$(printf '%s\n' "$OK_RUN" | head -n 1)"
+OK_OUT="$(printf '%s\n' "$OK_RUN" | tail -n +2)"
+assert_eq "success exit" "0" "$OK_RC"
+assert_contains "success status" "REPAIR_TARGET_STATUS=ok" "$OK_OUT"
+assert_contains "success upstream" "REPAIR_TARGET_UPSTREAM=origin/feat/repair-branch" "$OK_OUT"
+assert_contains "success pr" "REPAIR_TARGET=#1234" "$OK_OUT"
+assert_contains "success branch" "REPAIR_TARGET_BRANCH=feat/repair-branch" "$OK_OUT"
+assert_contains "success lease" "REPAIR_TARGET_LEASE_SHA=${REPAIR_SHA}" "$OK_OUT"
+if printf '%s\n' "$OK_OUT" | grep -q '^REPAIR_TARGET_REASON='; then FAIL=$((FAIL+1)); echo "FAIL: success printed a reason"; else PASS=$((PASS+1)); echo "PASS: success has no reason"; fi
+
+echo "--- repair-target-verdict degrades honestly (Test 6) ---"
+VERDICT_BASH="$(extract_bash_node "$CANONICAL_YAML" repair-target-verdict)"
+if [ -z "$VERDICT_BASH" ]; then echo "FATAL: verdict node missing"; exit 1; fi
+EMPTY_OUT_DIR="$(mktemp -d)"
+VERR="$(mktemp)"
+VOUT="$(ARCHON_NODE_OUT="$EMPTY_OUT_DIR" bash -c "$VERDICT_BASH" 2>"$VERR")"
+VRC=$?
+assert_eq "missing verdict file exit" "0" "$VRC"
+assert_contains "missing verdict status" "REPAIR_TARGET_STATUS=unavailable" "$VOUT"
+assert_contains "missing verdict reason" "REPAIR_TARGET_REASON=no_verdict" "$VOUT"
+HELD_DIR="$(mktemp -d)"
+printf '%s\n' "$HELD_OUT" > "$HELD_DIR/checkout-repair-target.out"
+VOUT2="$(ARCHON_NODE_OUT="$HELD_DIR" bash -c "$VERDICT_BASH" 2>"$VERR")"
+VRC2=$?
+assert_eq "held re-emit exit" "0" "$VRC2"
+assert_contains "held re-emit status" "REPAIR_TARGET_STATUS=held" "$VOUT2"
+assert_contains "held re-emit holder" "REPAIR_TARGET_HOLDER=/tmp/second-worktree" "$VOUT2"
+
+echo "--- published contract (Test 7) ---"
+MARKER_COUNT="$(grep -c 'single-quoted-pattern-may-contain-spaces' "$CANONICAL_YAML" || true)"
+if [ "$MARKER_COUNT" -ge 2 ]; then PASS=$((PASS+1)); echo "PASS: contract marker count $MARKER_COUNT"; else FAIL=$((FAIL+1)); echo "FAIL: contract marker count $MARKER_COUNT"; fi
+PROSE_COUNT="$(grep -c 'A single-quoted pattern may contain spaces' "$CANONICAL_YAML" || true)"
+if [ "$PROSE_COUNT" -ge 2 ]; then PASS=$((PASS+1)); echo "PASS: contract prose count $PROSE_COUNT"; else FAIL=$((FAIL+1)); echo "FAIL: contract prose count $PROSE_COUNT"; fi
+DROP_COUNT="$(grep -c 'second quoted argument are dropped' "$CANONICAL_YAML" || true)"
+if [ "$DROP_COUNT" -ge 2 ]; then PASS=$((PASS+1)); echo "PASS: dropped-shapes prose count $DROP_COUNT"; else FAIL=$((FAIL+1)); echo "FAIL: dropped-shapes prose count $DROP_COUNT"; fi
+LANE_VERIFIED_COUNT="$(grep -c 'lane-verified' "$CANONICAL_YAML" || true)"
+assert_eq "lane-verified absent from codex lane" "0" "$LANE_VERIFIED_COUNT"
+ASTRA_COUNT="$(grep -c 'bdc-feature-development-astra.yaml' "$HERE/run-stop-greps.sh" || true)"
+if [ "$ASTRA_COUNT" -ge 1 ]; then PASS=$((PASS+1)); echo "PASS: astra is on the parity list"; else FAIL=$((FAIL+1)); echo "FAIL: astra missing from parity list"; fi
+
+rm -rf "$TMP3" "$TMP4" "$ORIGIN" "$WORK" "$GHBIN" "$EMPTY_OUT_DIR" "$HELD_DIR"
+rm -f "$VERR"
 
 echo
 echo "run-stop-greps.sh: $PASS passed, $FAIL failed"

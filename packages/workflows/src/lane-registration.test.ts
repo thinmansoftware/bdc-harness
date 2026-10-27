@@ -544,7 +544,7 @@ const REPAIR_TARGET_LANES = [
   'bdc-feature-development-cursor.yaml',
 ] as const;
 
-const MISMATCH_REASON = 'declared repair target #N does not match the lane-verified record';
+const MISMATCH_REASON = 'declared repair target #N does not match the repair-target verdict';
 const UNVERIFIED_REASON = 'declared repair target #N was not verified by the lane';
 
 function extractStep4b(prompt: string): string {
@@ -561,14 +561,15 @@ function extractStep4b(prompt: string): string {
 
 describe('plan-review repair-target record', () => {
   for (const file of REPAIR_TARGET_LANES) {
-    it(`${file}: plan-review depends on the lane-verified checkout record`, () => {
+    it(`${file}: plan-review depends on the repair-target verdict`, () => {
       const lane = loadLane(file);
       const planReview = lane.nodes?.find(node => node.id === 'plan-review');
       const prompt = planReview?.loop?.prompt ?? '';
       const step4b = extractStep4b(prompt);
 
-      expect(planReview?.depends_on).toEqual(['plan', 'checkout-repair-target']);
-      expect(prompt).toContain('$checkout-repair-target.output');
+      expect(planReview?.depends_on).toEqual(['plan', 'repair-target-verdict']);
+      expect(prompt).toContain('$repair-target-verdict.output');
+      expect(prompt).not.toContain('lane-verified');
       expect(step4b).toContain('REPAIR_TARGET');
       expect(step4b).toContain('REPAIR_TARGET_BRANCH');
       expect(step4b).not.toContain('WebFetch');

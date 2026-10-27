@@ -289,6 +289,18 @@ OUTOK="$(vma_process_assertions "grep -c alpha $FIX/data.txt | wc -l => 1" "" 2>
 assert_eq "piped read-only command kept" "grep -c alpha $FIX/data.txt | wc -l => 1" "$OUTOK"
 
 # -----------------------------------------------------------------------------
+# Test 12: a single-quoted pattern with spaces executes and is rewritten.
+# -----------------------------------------------------------------------------
+echo "--- Test 12: spaced single-quoted pattern executes ---"
+printf 'Pullers billed: 3\nPullers billed: 3\n' > "$FIX/notes.txt"
+SPACED="grep -c 'Pullers billed' $FIX/notes.txt => 9"
+ERRLOG="$(vma_process_assertions "$SPACED" "" 2>&1 >/dev/null)"
+OUT="$(vma_process_assertions "$SPACED" "" 2>/dev/null)"
+assert_eq "spaced pattern rewritten to observed 2" "grep -c 'Pullers billed' $FIX/notes.txt => 2" "$OUT"
+assert_contains "spaced correction logged" "CORRECT (9 -> 2)" "$ERRLOG"
+assert_not_contains "spaced pattern is not an allowlist drop" "command not on read-only allowlist" "$ERRLOG"
+
+# -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
 echo ""

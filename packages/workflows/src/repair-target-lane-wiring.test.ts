@@ -88,14 +88,15 @@ describe('repair-target lane wiring', () => {
     expect(laneFiles()).toEqual(EXPECTED_LANES);
   });
 
-  it('Test 1: every lane wires the approved plan and the lane-verified record', () => {
+  it('Test 1: every lane wires the approved plan and the repair-target verdict', () => {
     for (const file of EXPECTED_LANES) {
       const nodes = nodesOf(file);
       const decide = nodeOf(nodes, 'decide-push-target', file);
       const planReview = nodeOf(nodes, 'plan-review', file);
       expect(decide.prompt ?? '', file).toContain('$plan-review.output');
-      expect(planReview.loop?.prompt ?? '', file).toContain('$checkout-repair-target.output');
-      expect(planReview.depends_on ?? [], file).toContain('checkout-repair-target');
+      expect(planReview.loop?.prompt ?? '', file).toContain('$repair-target-verdict.output');
+      expect(planReview.loop?.prompt ?? '', file).not.toContain('lane-verified');
+      expect(planReview.depends_on ?? [], file).toEqual(['plan', 'repair-target-verdict']);
     }
   });
 
@@ -104,7 +105,8 @@ describe('repair-target lane wiring', () => {
       const planReview = nodeOf(nodesOf(file), 'plan-review', file);
       const prompt = planReview.loop?.prompt ?? '';
       expect(prompt, file).not.toContain('use WebFetch to verify that PR');
-      expect(prompt, file).toContain('lane-verified repair-target record');
+      expect(prompt, file).not.toContain('lane-verified');
+      expect(prompt, file).toContain('Repair-target verdict (from repair-target-verdict):');
     }
   });
 
@@ -155,9 +157,17 @@ describe('repair-target lane wiring', () => {
       );
       expect(commitBash, file).toContain('repair_target_head_moved');
 
-      // 1b: plan-review when-guard fails a failed checkout at the real node.
+      // 1b: plan-review when-guard skips a checkout that did not produce a target.
       const planReview = nodeOf(nodes, 'plan-review', file);
-      expect(planReview.when ?? '', file).toContain("$checkout-repair-target.output != ''");
+      expect(planReview.when ?? '', file).toContain(
+        "$repair-target-verdict.output.REPAIR_TARGET_STATUS != 'held'"
+      );
+      expect(planReview.when ?? '', file).toContain(
+        "$repair-target-verdict.output.REPAIR_TARGET_STATUS != 'invalid'"
+      );
+      expect(planReview.when ?? '', file).toContain(
+        "$repair-target-verdict.output.REPAIR_TARGET_STATUS != 'unavailable'"
+      );
 
       // 1d: patch-pr-body when-guard requires an open PR.
       const patch = nodeOf(nodes, 'patch-pr-body', file);
@@ -187,6 +197,27 @@ describe('repair-target lane wiring', () => {
       expect(decide.prompt ?? '', file).toContain('repair_target_authorized_by_spec');
       expect(yaml, file).not.toContain('grep -Eq "repair_target_authorized_by_spec');
       expect(yaml, file).not.toContain('worktree prune');
+    }
+  });
+
+  it('Test 22: repair-target-verdict feeds plan-review and repair-gate stays on checkout', () => {
+    for (const file of EXPECTED_LANES) {
+      const nodes = nodesOf(file);
+      const verdict = nodeOf(nodes, 'repair-target-verdict', file);
+      expect(verdict.depends_on ?? [], file).toEqual(['checkout-repair-target']);
+      expect(verdict.trigger_rule, file).toBe('all_done');
+      expect(verdict.bash ?? '', file).toContain('REPAIR_TARGET_STATUS=unavailable');
+      expect(verdict.bash ?? '', file).toContain('REPAIR_TARGET_REASON=no_verdict');
+      const planReview = nodeOf(nodes, 'plan-review', file);
+      expect(planReview.depends_on ?? [], file).toEqual(['plan', 'repair-target-verdict']);
+      const gate = nodeOf(nodes, 'repair-gate', file);
+      expect(gate.depends_on ?? [], file).toEqual(['checkout-repair-target', 'plan-review']);
+      expect(planReview.loop?.prompt ?? '', file).toContain(
+        'never ask the lane, an operator, or GitHub to re-run or re-supply the record; the record is complete by construction.'
+      );
+      expect(planReview.loop?.prompt ?? '', file).toContain(
+        'declared repair target #N does not match the repair-target verdict'
+      );
     }
   });
 });
