@@ -72,7 +72,8 @@ assert_not_contains() {
 # -----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-export HARNESS_ROOT_OVERRIDE="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+export NODE_ENV=test
+export SER_TEST_TRUSTED_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 CANONICAL_YAML="$DEFAULTS_DIR/bdc-feature-development.yaml"
 MIRROR_YAML="$DEFAULTS_DIR/bdc-feature-development-codex.yaml"
 

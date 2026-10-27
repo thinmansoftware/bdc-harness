@@ -323,14 +323,13 @@ function pathUnder(file: string, top: string): boolean {
 
 export function resolveTrustedRunnerFile(cwd: string): string | null {
   const candidates: string[] = [];
-  const override = process.env.HARNESS_ROOT_OVERRIDE;
-  const selfRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../../..');
-  if (override) {
-    try {
-      if (realpathSync(override) === realpathSync(selfRoot)) candidates.push(override);
-    } catch {
-      // An absent or non-canonical override is never a trust source.
-    }
+  // Unit tests need to exercise the real CLI before it has been installed at a
+  // production path. This fixture is deliberately separate from
+  // HARNESS_ROOT_OVERRIDE, which is workflow-user-controlled and is never a
+  // source of trust.
+  const testRoot = process.env.SER_TEST_TRUSTED_ROOT;
+  if (process.env.NODE_ENV === 'test' && testRoot) {
+    candidates.push(testRoot);
   }
   candidates.push('/app');
   candidates.push('/.archon/workspaces/thinmansoftware/bdc-harness/source');

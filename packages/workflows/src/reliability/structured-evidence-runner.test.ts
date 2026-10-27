@@ -33,6 +33,8 @@ import {
 
 const ROOT = join(import.meta.dir, '..', '..', '..', '..');
 process.env.HARNESS_ROOT_OVERRIDE = ROOT;
+process.env.NODE_ENV = 'test';
+process.env.SER_TEST_TRUSTED_ROOT = ROOT;
 const RUNNER = join(ROOT, 'packages/workflows/src/reliability/structured-evidence-runner.ts');
 
 function tempDir(prefix: string): string {
@@ -59,7 +61,7 @@ function initRepo(cwd: string): void {
   git(cwd, ['commit', '-qm', 'base']);
 }
 
-it('rejects a harness root override with a lookalike harness git origin', () => {
+it('rejects an executable runner copied into a spoofed writable harness checkout', () => {
   const fakeHarness = tempDir('ser-untrusted-harness-');
   const product = tempDir('ser-product-');
   const saved = process.env.HARNESS_ROOT_OVERRIDE;
@@ -71,7 +73,7 @@ it('rejects a harness root override with a lookalike harness git origin', () => 
     );
     writeFileSync(
       join(fakeHarness, 'packages/workflows/src/reliability/structured-evidence-runner.ts'),
-      'throw new Error("must not execute");\n'
+      'process.stdout.write("ATTACKER_HELPER_EXECUTED\\n");\n'
     );
     initRepo(fakeHarness);
     git(fakeHarness, [
@@ -85,6 +87,18 @@ it('rejects a harness root override with a lookalike harness git origin', () => 
     expect(resolveTrustedRunnerFile(product)).not.toBe(
       join(fakeHarness, 'packages/workflows/src/reliability/structured-evidence-runner.ts')
     );
+    const trustedResolution = spawnSync('bun', [RUNNER, 'allow-test', '--', 'bash ./x.sh'], {
+      cwd: product,
+      env: {
+        ...process.env,
+        NODE_ENV: 'production',
+        SER_TEST_TRUSTED_ROOT: '',
+        HARNESS_ROOT_OVERRIDE: fakeHarness,
+      },
+      encoding: 'utf8',
+    });
+    expect(trustedResolution.stdout).not.toContain('ATTACKER_HELPER_EXECUTED');
+    expect(trustedResolution.stderr).toContain('NEVER_RAN');
   } finally {
     if (saved === undefined) delete process.env.HARNESS_ROOT_OVERRIDE;
     else process.env.HARNESS_ROOT_OVERRIDE = saved;
@@ -1111,18 +1125,26 @@ describe('installed-helper-resolution', () => {
       '{"name":"@archon/workflows"}\n'
     );
     const saved = process.env.HARNESS_ROOT_OVERRIDE;
+    const savedTestRoot = process.env.SER_TEST_TRUSTED_ROOT;
     process.env.HARNESS_ROOT_OVERRIDE = product;
+    delete process.env.SER_TEST_TRUSTED_ROOT;
     try {
       expect(resolveTrustedRunnerFile(product)).toBeNull();
       const missing = spawnSync('bun', [RUNNER, 'allow-test', '--', 'bash ./x.sh'], {
         cwd: product,
-        env: { ...process.env, HARNESS_ROOT_OVERRIDE: product },
+        env: {
+          ...process.env,
+          NODE_ENV: 'production',
+          SER_TEST_TRUSTED_ROOT: '',
+          HARNESS_ROOT_OVERRIDE: product,
+        },
         encoding: 'utf8',
       });
       expect(missing.stderr).toContain('NEVER_RAN');
       expect(missing.stdout).not.toContain('product-helper');
     } finally {
       process.env.HARNESS_ROOT_OVERRIDE = saved;
+      process.env.SER_TEST_TRUSTED_ROOT = savedTestRoot;
     }
     process.env.HARNESS_ROOT_OVERRIDE = ROOT;
     const trusted = resolveTrustedRunnerFile(product);

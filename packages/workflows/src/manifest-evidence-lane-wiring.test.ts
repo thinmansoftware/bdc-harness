@@ -99,12 +99,12 @@ function coreOf(bash: string, marker: string): string {
 }
 
 describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
-  it('only honors harness root overrides at canonical harness install locations', () => {
+  it('never treats the workflow-user-controlled harness root override as trust', () => {
     const lanes = EXPECTED_LANES.map(file => readFileSync(join(LANES_DIR, file), 'utf8'));
     expect(lanes.length).toBeGreaterThan(0);
     for (const content of lanes) {
-      expect(content).toContain('override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE"');
-      expect(content).toContain('/app|/.archon/workspaces/thinmansoftware/bdc-harness/source)');
+      expect(content).not.toContain('override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE"');
+      expect(content).toContain('/app /.archon/workspaces/thinmansoftware/bdc-harness/source');
       expect(content).not.toContain('bdc-harness/worktrees/archon/*)');
       expect(content).not.toContain(
         'git -C "$HARNESS_ROOT_OVERRIDE" remote get-url origin 2>/dev/null'
@@ -291,7 +291,12 @@ function runStopTestsNode(opts: {
     writeFileSync(join(cwd, 'run-stop-tests.sh'), rendered);
     const proc = Bun.spawnSync(['bash', './run-stop-tests.sh'], {
       cwd,
-      env: { ...process.env, ARTIFACTS_DIR: artifacts, HARNESS_ROOT_OVERRIDE: REPO_ROOT },
+      env: {
+        ...process.env,
+        ARTIFACTS_DIR: artifacts,
+        NODE_ENV: 'test',
+        SER_TEST_TRUSTED_ROOT: REPO_ROOT,
+      },
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -562,7 +567,7 @@ function runStopGrepsNode(opts: {
     );
     const proc = Bun.spawnSync(['bash', '-c', rendered], {
       cwd,
-      env: { ...process.env, HARNESS_ROOT_OVERRIDE: REPO_ROOT },
+      env: { ...process.env, NODE_ENV: 'test', SER_TEST_TRUSTED_ROOT: REPO_ROOT },
       stdout: 'pipe',
       stderr: 'pipe',
     });
