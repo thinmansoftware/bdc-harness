@@ -174,6 +174,14 @@ OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "N/A (INFRA class, no test
 assert_contains "INFRA N/A wording" "Tests: N/A (INFRA class, no test command declared)" "$OUT"
 assert_contains "VALIDATION stays PASS" "VALIDATION: PASS" "$OUT"
 
+echo "--- Test 7b: baseline_red keeps VALIDATION PASS and records the base counts ---"
+BASELINE_LINE='2/3 (bash ./t.sh) -- head 2/3; base 2/3 at abcdef01; newly failing: 0 (stale > base is red) [source: wo-spec]'
+OUT="$(printf '%s\n' "$ENGINE_MANIFEST" | sme_process "$BASELINE_LINE" baseline_red "$(sme_field GREP_LINE "$GREPS_OUT")" passed)"
+assert_contains "baseline_red Tests line kept" "Tests: 2/3 (bash ./t.sh) -- head 2/3; base 2/3 at abcdef01; newly failing: 0 (stale > base is red)" "$OUT"
+assert_contains "baseline_red keeps VALIDATION PASS" "VALIDATION: PASS" "$OUT"
+assert_not_contains "baseline_red does not flip VALIDATION" "VALIDATION: FAIL" "$OUT"
+assert_contains "baseline_red audit names the base counts" "Stop conditions: tests=baseline_red (newly failing: 0; base 2/3); greps=passed (observed by run-stop-tests / run-stop-greps in the run worktree)" "$OUT"
+
 echo "--- Test 7: manifest with Tests: but no Grep/VALIDATION lines gets both appended ---"
 OUT="$(printf 'WO: WO-X\nTests: N/A\nPRs: x\n' | sme_process "3/3 (bun test)" passed "grep -c a b => 1" passed)"
 assert_contains "Tests stamped" "Tests: 3/3 (bun test)" "$OUT"

@@ -1600,6 +1600,7 @@ nodes:
   # inside the run worktree and emits the OBSERVED pass/total. It never trusts a builder
   # or validator claim. Always exits 0; the validator quotes TESTS_* as ground truth and
   # stamp-manifest-evidence writes TESTS_LINE into the manifest "Tests:" line.
+  # A baseline-red Tests line has the shape "<p>/<t> (<cmd>) -- head <p>/<t>; base <pb>/<tb> at <sha8>; newly failing: 0" and does not make VALIDATION fail.
   - id: resolve-test-command
     persona: major-build
     load_bearing: true
@@ -1656,9 +1657,9 @@ nodes:
   - id: run-stop-tests
     persona: major-build
     load_bearing: true
-    depends_on: [format-autofix, resolve-test-command]
+    depends_on: [format-autofix, resolve-test-command, resolve-review-base]
     task_class: clerical
-    timeout: 1800000
+    timeout: 3600000
     bash: |
       set -uo pipefail
 
@@ -2021,7 +2022,11 @@ nodes:
                     printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
                   fi
                 fi
-                timeout 1500 "$@" >> "$seg" 2>&1 < /dev/null
+                if [ -n "${RST_CMD_BUDGET_SECONDS:-}" ]; then
+                  timeout "$RST_CMD_BUDGET_SECONDS" "$@" >> "$seg" 2>&1 < /dev/null
+                else
+                  timeout 1500 "$@" >> "$seg" 2>&1 < /dev/null
+                fi
                 rc=$?
                 [ "$rc" -ne 0 ] && break
                 [ -z "$work" ] && break
@@ -2073,6 +2078,473 @@ nodes:
           fi
         fi
         printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\n' "$status" "$line"
+      }
+      # Baseline comparison (WO-HARNESS-EVIDENCE-BASE-VS-HEAD-TEST-DIFF-01).
+      # A failing head suite is blocking only when the merge-base does not already
+      # explain it. Pre-existing failures are reported as baseline_red.
+      # rst_abs_path <path> -> absolute path (relative paths stay usable after cd)
+      rst_abs_path() {
+        local p="$1" dir base
+        [ -n "$p" ] || { printf '%s' "$p"; return 0; }
+        case "$p" in
+          /*) printf '%s' "$p"; return 0 ;;
+        esac
+        dir="$(dirname "$p")"
+        base="$(basename "$p")"
+        if [ -d "$dir" ]; then
+          dir="$(cd "$dir" && pwd)"
+        fi
+        printf '%s/%s' "$dir" "$base"
+      }
+      # rst_is_uint <s> -> rc 0 when s is a non-empty decimal integer
+      rst_is_uint() {
+        case "$1" in
+          ''|*[!0-9]*) return 1 ;;
+        esac
+        return 0
+      }
+      # rst_reporter_kind <cmd> -> "vitest", "jest", or empty.
+      # Matches a vitest/jest token directly or via npx, bunx, or "bun x".
+      rst_reporter_kind() {
+        local cmd="$1" kind
+        kind="$(printf '%s\n' "$cmd" | awk '
+          BEGIN { kind = "" }
+          {
+            n = split($0, parts, /&&/)
+            for (i = 1; i <= n; i++) {
+              m = split(parts[i], tok, /[ \t]+/)
+              for (j = 1; j <= m; j++) {
+                b = tok[j]
+                sub(/^.*\//, "", b)
+                if (b == "vitest") { print "vitest"; exit }
+                if (b == "jest" && kind == "") kind = "jest"
+              }
+            }
+          }
+          END { if (kind != "") print kind }
+        ')"
+        printf '%s' "$kind"
+      }
+      # rst_append_reporter <cmd> <json-path> -> command with reporter flags appended
+      # to the vitest/jest segment. Other commands are returned unchanged.
+      # Called only from the base/head comparison path, never from rst_run_commands.
+      rst_append_reporter() {
+        local cmd="$1" json="$2" kind flags prefix="" work rest segment rebuilt="" skind once=1
+        kind="$(rst_reporter_kind "$cmd")"
+        if [ -z "$kind" ]; then
+          printf '%s' "$cmd"
+          return 0
+        fi
+        if [ "$kind" = "vitest" ]; then
+          flags="--reporter=default --reporter=json --outputFile=${json}"
+        else
+          flags="--json --outputFile=${json}"
+        fi
+        work="$cmd"
+        if printf '%s\n' "$work" | grep -qE '^[ ]*cd[ ]+[A-Za-z0-9_./-]+[ ]+&&[ ]+'; then
+          prefix="$(printf '%s\n' "$work" | sed -E 's/^([ ]*cd[ ]+[A-Za-z0-9_.\/-]+[ ]+&&[ ]+).*/\1/')"
+          work="${work#"$prefix"}"
+        fi
+        rest="$work"
+        while :; do
+          case "$rest" in
+            *'&&'*) segment="${rest%%&&*}"; rest="${rest#*&&}" ;;
+            *) segment="$rest"; rest="" ;;
+          esac
+          segment="$(printf '%s' "$segment" | sed 's/^[ ]*//; s/[ ]*$//')"
+          skind="$(rst_reporter_kind "$segment")"
+          if [ "$once" -eq 1 ] && [ "$skind" = "$kind" ]; then
+            segment="${segment} ${flags}"
+            once=0
+          fi
+          if [ -z "$rebuilt" ]; then
+            rebuilt="$segment"
+          else
+            rebuilt="${rebuilt} && ${segment}"
+          fi
+          [ -z "$rest" ] && break
+        done
+        printf '%s%s' "$prefix" "$rebuilt"
+      }
+      # rst_cmds_need_reporter <commands-file> -> rc 0 when any line names vitest or jest
+      rst_cmds_need_reporter() {
+        local cmds="$1" cmd
+        [ -f "$cmds" ] || return 1
+        while IFS= read -r cmd || [ -n "$cmd" ]; do
+          [ -z "$cmd" ] && continue
+          [ -n "$(rst_reporter_kind "$cmd")" ] && return 0
+        done < "$cmds"
+        return 1
+      }
+      # rst_compare_commands <commands-file> <log>
+      #   Runs the declared commands the way rst_run_commands does, after appending a
+      #   JSON reporter for vitest/jest. Prints "<exit> <passed> <total>". Non-empty
+      #   reporter files are recorded as "### json-report: <path>" lines on the log.
+      rst_compare_commands() {
+        local cmds="$1" log="$2" aug jsonlist cmd json rewritten result kind
+        aug="$(mktemp)"
+        jsonlist="$(mktemp)"
+        : > "$aug"
+        : > "$jsonlist"
+        while IFS= read -r cmd || [ -n "$cmd" ]; do
+          [ -z "$cmd" ] && continue
+          kind="$(rst_reporter_kind "$cmd")"
+          if [ -n "$kind" ]; then
+            json="$(mktemp)"
+            printf '%s\n' "$json" >> "$jsonlist"
+            rewritten="$(rst_append_reporter "$cmd" "$json")"
+          else
+            rewritten="$cmd"
+          fi
+          printf '%s\n' "$rewritten" >> "$aug"
+        done < "$cmds"
+        result="$(rst_run_commands "$aug" "$log")"
+        while IFS= read -r json || [ -n "$json" ]; do
+          [ -z "$json" ] && continue
+          if [ -s "$json" ]; then
+            printf '### json-report: %s\n' "$json" >> "$log"
+          else
+            rm -f "$json"
+          fi
+        done < "$jsonlist"
+        rm -f "$aug" "$jsonlist"
+        printf '%s' "$result"
+      }
+      # rst_drop_json_reports <log> removes reporter files named in the log
+      rst_drop_json_reports() {
+        local log="$1" p
+        [ -f "$log" ] || return 0
+        while IFS= read -r p || [ -n "$p" ]; do
+          [ -n "$p" ] && rm -f "$p"
+        done <<EOF
+      $(sed -n 's/^### json-report: //p' "$log" 2>/dev/null || true)
+      EOF
+      }
+      # rst_failing_names (runner output on stdin)
+      #   Emits only tab-separated records:
+      #     T<TAB><trimmed test identity>
+      #     F<TAB><file><TAB><count>
+      #   Test identities: bun "(fail) <name>", TAP "not ok <n> - <name>" and
+      #   "not ok <n> <name>", pytest "FAILED <nodeid>", mocha "  <n>) <name>",
+      #   vitest/jest "FAIL <file> > <suite> > <name>", and "x <name>" / "- <name>"
+      #   directly under a bare FAIL header. A bare "FAIL <file>" is a file identity
+      #   only (one count per matching line), never a test identity. Reporter JSON
+      #   ("### json-report: <path>", testResults[].assertionResults[] status=failed)
+      #   contributes "<file>::<fullName>" and, when any exist, replaces text test
+      #   identities. File counts are still reported.
+      rst_failing_names() {
+        local text text_out json_out esc
+        text="$(cat)"
+        esc="$(printf '\033')"
+        text="$(printf '%s\n' "$text" | sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g")"
+        text_out="$(printf '%s\n' "$text" | awk '
+          function trim(s) {
+            sub(/\r$/, "", s)
+            sub(/^[ \t]+/, "", s)
+            sub(/[ \t]+$/, "", s)
+            return s
+          }
+          function emit_t(s) {
+            s = trim(s)
+            if (s != "" && !(s in seen)) { seen[s] = 1; print "T\t" s }
+          }
+          /^### json-report: / { next }
+          /^[ \t]*\(fail\)[ \t]+/ {
+            line = $0
+            sub(/^[ \t]*\(fail\)[ \t]+/, "", line)
+            emit_t(line)
+            next
+          }
+          /^[ \t]*not ok[ \t]+[0-9]+/ {
+            line = $0
+            sub(/^[ \t]*not ok[ \t]+[0-9]+[ \t]*/, "", line)
+            sub(/^-([ \t]+)?/, "", line)
+            emit_t(line)
+            next
+          }
+          /^[ \t]*FAILED[ \t]+[^ \t]/ {
+            line = $0
+            sub(/^[ \t]*FAILED[ \t]+/, "", line)
+            sub(/[ \t].*$/, "", line)
+            emit_t(line)
+            next
+          }
+          /^[ \t]*[0-9]+\)[ \t]+/ {
+            line = $0
+            sub(/^[ \t]*[0-9]+\)[ \t]+/, "", line)
+            emit_t(line)
+            next
+          }
+          /^[ \t]*FAIL[ \t]+/ {
+            line = trim($0)
+            if (index(line, " > ") > 0) {
+              in_fail = 0
+              emit_t(line)
+              next
+            }
+            sub(/^FAIL[ \t]+/, "", line)
+            sub(/[ \t].*$/, "", line)
+            if (line != "") {
+              files[line] += 1
+              in_fail = 1
+            }
+            next
+          }
+          in_fail && /^[ \t]+[x-][ \t]+/ {
+            line = $0
+            sub(/^[ \t]+[x-][ \t]+/, "", line)
+            emit_t(line)
+            next
+          }
+          /^[ \t]*$/ { in_fail = 0; next }
+          in_fail { in_fail = 0 }
+          END {
+            for (f in files) print "F\t" f "\t" files[f]
+          }
+        ')"
+        json_out="$(printf '%s\n' "$text" | sed -n 's/^### json-report: //p' | while IFS= read -r jp || [ -n "$jp" ]; do
+          [ -s "$jp" ] || continue
+          jq -r '.testResults[]? | .name as $f | .assertionResults[]? | select(.status == "failed") | "\($f)::\(.fullName)"' "$jp" 2>/dev/null || true
+        done)"
+        if printf '%s\n' "$json_out" | grep -q .; then
+          printf '%s\n' "$json_out" | awk 'NF { print "T\t" $0 }'
+          printf '%s\n' "$text_out" | awk -F '\t' '$1 == "F" { print }'
+        else
+          printf '%s\n' "$text_out"
+        fi
+      }
+      # rst_base_pass <base-sha> <commands-file> <base-log>
+      #   Detached temporary worktree at <base-sha>. Never checks the base out in the
+      #   run worktree. Runs dprep_ensure_js_deps (stdout to stderr; a failed install
+      #   still returns 0) and the same command list under RST_BASE_BUDGET_SECONDS
+      #   (default 1500). Prints "<exit> <passed> <total>" or UNAVAILABLE. Setup
+      #   failure does not change the head verdict.
+      rst_base_pass() {
+        local base_sha="$1" cmds="$2" base_log="$3"
+        local parent="" wt="" result="" wrap=0
+        parent="$(mktemp -d 2>/dev/null || true)"
+        if [ -z "$parent" ] || [ ! -d "$parent" ]; then
+          printf 'UNAVAILABLE'
+          return 0
+        fi
+        wt="${parent}/base"
+        if ! git worktree add --detach "$wt" "$base_sha" >/dev/null 2>&1; then
+          rm -rf "$parent"
+          printf 'rst_base_pass: worktree add failed\n' >&2
+          printf 'UNAVAILABLE'
+          return 0
+        fi
+        result="$(
+          cd "$wt" || exit 97
+          dprep_ensure_js_deps >&2
+          export RST_CMD_BUDGET_SECONDS="${RST_BASE_BUDGET_SECONDS:-1500}"
+          rst_compare_commands "$cmds" "$base_log"
+        )"
+        wrap=$?
+        git worktree remove --force "$wt" >/dev/null 2>&1 || true
+        rm -rf "$parent" || true
+        if [ "$wrap" -ne 0 ] || [ -z "$result" ]; then
+          printf 'rst_base_pass: command setup failed\n' >&2
+          printf 'UNAVAILABLE'
+          return 0
+        fi
+        printf '%s' "$result"
+      }
+      # rst_emit_verdict prints the base contract, then TESTS_STATUS and TESTS_LINE.
+      rst_emit_verdict() {
+        printf 'TESTS_BASE_SHA=%s\n' "$1"
+        printf 'TESTS_BASE_STATUS=%s\n' "$2"
+        printf 'TESTS_BASE_PASSED=%s\n' "$3"
+        printf 'TESTS_BASE_TOTAL=%s\n' "$4"
+        printf 'TESTS_NEWLY_FAILING=%s\n' "$5"
+        printf 'TESTS_NEWLY_FAILING_MODE=%s\n' "$6"
+        printf 'TESTS_BASE_EXIT=%s\n' "$7"
+        printf 'TESTS_BASE_EVIDENCE=%s\n' "$8"
+        printf 'TESTS_BASE_LOG=%s\n' "$9"
+        printf 'TESTS_STATUS=%s\n' "${10}"
+        printf 'TESTS_LINE=%s\n' "${11}"
+      }
+      # rst_format_compared_line <p> <t> <cmd> <exit> <bp> <bt> <sha8> <newly> <names> <failed-form> <suffix> <unexplained>
+      rst_format_compared_line() {
+        local p="$1" t="$2" cmd="$3" exit_code="$4" bp="$5" bt="$6" sha8="$7" newly="$8" names="$9"
+        local failed_form="${10}" suffix="${11}" unexplained="${12}" body namepart=""
+        if [ -n "$names" ]; then
+          namepart=" (${names})"
+        fi
+        if [ "$failed_form" = "1" ]; then
+          body="${p}/${t} (${cmd}) -- FAILED, exit ${exit_code} head ${p}/${t}; base ${bp}/${bt} at ${sha8}; newly failing: ${newly}${namepart}"
+        else
+          body="${p}/${t} (${cmd}) -- head ${p}/${t}; base ${bp}/${bt} at ${sha8}; newly failing: ${newly}${namepart}"
+        fi
+        if [ "$unexplained" = "1" ]; then
+          body="${body} unexplained head exit ${exit_code}"
+        fi
+        if [ -n "$suffix" ]; then
+          printf '%s %s' "$body" "$suffix"
+        else
+          printf '%s' "$body"
+        fi
+      }
+      # rst_apply_verdict <class> <cmd> <exit> <counts> <log> <head_status> <head_line> <review_base_output> <cmds_file>
+      #   Runs only after the head ladder. Skips the base pass for DOCUMENTATION /
+      #   OPERATOR, an empty command, head status passed / counts_unparsed /
+      #   no_command_declared, and head exit 127. Otherwise compares failing
+      #   identities to the merge-base (fallback: run-start-sha.txt).
+      rst_apply_verdict() {
+        local class="$1" cmd="$2" exit_code="$3" counts="$4" log="$5"
+        local head_status="$6" head_line="$7" review_out="$8" cmds="$9"
+        local skip=0 review_base="" base_sha="" start_sha="" start_file=""
+        case "$class" in
+          DOCUMENTATION|OPERATOR) skip=1 ;;
+        esac
+        [ -z "$cmd" ] && skip=1
+        case "$head_status" in
+          passed|counts_unparsed|no_command_declared) skip=1 ;;
+        esac
+        if [ "${exit_code:-0}" -eq 127 ] 2>/dev/null; then
+          skip=1
+        fi
+        if [ "$skip" -eq 1 ]; then
+          rst_emit_verdict none not_run none none none n/a none none none "$head_status" "$head_line"
+          return 0
+        fi
+        review_base="$(printf '%s\n' "$review_out" | sed -n 's/^REVIEW_BASE=//p' | head -n 1 | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        if [ -n "$review_base" ]; then
+          base_sha="$(git merge-base HEAD "origin/${review_base}" 2>/dev/null || true)"
+        fi
+        if [ -z "$base_sha" ]; then
+          start_file="${ARTIFACTS_DIR:-.}/run-start-sha.txt"
+          if [ -f "$start_file" ]; then
+            start_sha="$(tr -d '[:space:]' < "$start_file" 2>/dev/null || true)"
+          else
+            start_sha=""
+          fi
+          if [ -n "$start_sha" ] && git rev-parse --verify -q "${start_sha}^{commit}" >/dev/null 2>&1; then
+            base_sha="$(git rev-parse --verify "${start_sha}^{commit}" 2>/dev/null || true)"
+          fi
+        fi
+        if [ -z "$base_sha" ]; then
+          rst_emit_verdict none unavailable none none none n/a none none none "$head_status" "$head_line"
+          return 0
+        fi
+        log="$(rst_abs_path "$log")"
+        cmds="$(rst_abs_path "$cmds")"
+        local base_log="${log}.base" base_result="" base_exit="" base_counts=""
+        local bp="" bt="" sha8="" evidence="no" bstatus="failed" mode="n/a" newly="none"
+        local head_src="$log" head_cmp="" head_records="" base_records=""
+        local suffix="" final_line="" shown="" failed_form=1 unexplained=0
+        local hp="" ht="" names_h="" names_b="" only="" hf="" bf=""
+        sha8="$(printf '%s' "$base_sha" | cut -c1-8)"
+        : > "$base_log" 2>/dev/null || true
+        base_result="$(rst_base_pass "$base_sha" "$cmds" "$base_log")"
+        if [ "$base_result" = "UNAVAILABLE" ] || [ -z "$base_result" ]; then
+          rst_drop_json_reports "$base_log"
+          rm -f "$base_log"
+          rst_emit_verdict "$base_sha" unavailable none none none n/a none none none "$head_status" "$head_line"
+          return 0
+        fi
+        base_exit="${base_result%% *}"
+        base_counts="${base_result#* }"
+        base_counts="$(printf '%s' "$base_counts" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        if ! rst_is_uint "$base_exit" || [ "$base_exit" -eq 127 ] || [ -z "$base_counts" ]; then
+          rst_drop_json_reports "$base_log"
+          rst_emit_verdict "$base_sha" unavailable none none none n/a "${base_exit:-none}" none "$base_log" "$head_status" "$head_line"
+          return 0
+        fi
+        bp="${base_counts%% *}"
+        bt="${base_counts##* }"
+        if ! rst_is_uint "$bp" || ! rst_is_uint "$bt"; then
+          rst_drop_json_reports "$base_log"
+          rst_emit_verdict "$base_sha" unavailable none none none n/a "$base_exit" none "$base_log" "$head_status" "$head_line"
+          return 0
+        fi
+        if [ -z "$counts" ] || ! rst_is_uint "${counts%% *}" || ! rst_is_uint "${counts##* }"; then
+          rst_drop_json_reports "$base_log"
+          rst_emit_verdict "$base_sha" failed "$bp" "$bt" none n/a "$base_exit" none "$base_log" "$head_status" "$head_line"
+          return 0
+        fi
+        hp="${counts%% *}"
+        ht="${counts##* }"
+        unset RST_CMD_BUDGET_SECONDS
+        if rst_cmds_need_reporter "$cmds"; then
+          head_cmp="$(mktemp)"
+          rst_compare_commands "$cmds" "$head_cmp" >/dev/null
+          head_src="$head_cmp"
+        fi
+        head_records="$(rst_failing_names < "$head_src")"
+        base_records="$(rst_failing_names < "$base_log")"
+        rst_drop_json_reports "$head_src"
+        rst_drop_json_reports "$base_log"
+        if [ -n "$head_cmp" ]; then
+          rm -f "$head_cmp"
+        fi
+        if [ "$base_exit" -ne 0 ] || printf '%s\n' "$base_records" | awk -F '\t' '$1=="T" || $1=="F" { found=1 } END { exit found ? 0 : 1 }' || [ "$bp" -lt "$bt" ]; then
+          evidence="yes"
+        fi
+        if [ "$base_exit" -eq 0 ] && [ "$bt" -gt 0 ] && [ "$bp" -eq "$bt" ]; then
+          bstatus="passed"
+        else
+          bstatus="failed"
+        fi
+        suffix="$(printf '%s\n' "$head_line" | sed -n 's/.* \(\[source:.*\]\)$/\1/p')"
+        if [ "$evidence" != "yes" ]; then
+          final_line="$(rst_format_compared_line "$hp" "$ht" "$cmd" "$exit_code" "$bp" "$bt" "$sha8" 0 "" 1 "$suffix" 1)"
+          rst_emit_verdict "$base_sha" "$bstatus" "$bp" "$bt" 0 n/a "$base_exit" no "$base_log" failed "$final_line"
+          return 0
+        fi
+        local ht_n bt_n hf_n bf_n
+        ht_n="$(printf '%s\n' "$head_records" | awk -F '\t' '$1=="T"{c++} END{print c+0}')"
+        bt_n="$(printf '%s\n' "$base_records" | awk -F '\t' '$1=="T"{c++} END{print c+0}')"
+        hf_n="$(printf '%s\n' "$head_records" | awk -F '\t' '$1=="F"{c++} END{print c+0}')"
+        bf_n="$(printf '%s\n' "$base_records" | awk -F '\t' '$1=="F"{c++} END{print c+0}')"
+        if [ "$ht_n" -gt 0 ] && [ "$bt_n" -gt 0 ]; then
+          mode="names"
+          names_h="$(mktemp)"
+          names_b="$(mktemp)"
+          printf '%s\n' "$head_records" | awk -F '\t' '$1=="T"{print substr($0,3)}' | LC_ALL=C sort -u > "$names_h"
+          printf '%s\n' "$base_records" | awk -F '\t' '$1=="T"{print substr($0,3)}' | LC_ALL=C sort -u > "$names_b"
+          only="$(LC_ALL=C comm -23 "$names_h" "$names_b" || true)"
+          if [ -z "$only" ]; then
+            newly=0
+            shown="$(LC_ALL=C comm -12 "$names_h" "$names_b" | head -n 5 | paste -sd ',' - | sed 's/,/, /g')"
+          else
+            newly="$(printf '%s\n' "$only" | grep -c . || true)"
+            shown="$(printf '%s\n' "$only" | head -n 5 | paste -sd ',' - | sed 's/,/, /g')"
+          fi
+          rm -f "$names_h" "$names_b"
+        elif [ "$hf_n" -gt 0 ] && [ "$bf_n" -gt 0 ]; then
+          mode="file-count"
+          newly="$(awk -F '\t' '
+            NR==FNR && $1=="F" { b[$2]=$3; next }
+            $1=="F" { h[$2]=$3 }
+            END {
+              s = 0
+              for (f in h) {
+                bv = (f in b ? b[f] : 0)
+                d = h[f] - bv
+                if (d > 0) s += d
+              }
+              print s+0
+            }
+          ' <(printf '%s\n' "$base_records") <(printf '%s\n' "$head_records"))"
+          shown=""
+        else
+          mode="count"
+          hf=$((ht - hp))
+          bf=$((bt - bp))
+          newly=$((hf - bf))
+          if [ "$newly" -lt 0 ]; then newly=0; fi
+          shown=""
+        fi
+        if [ "$newly" -eq 0 ]; then
+          head_status="baseline_red"
+          failed_form=0
+        else
+          head_status="failed"
+          failed_form=1
+        fi
+        final_line="$(rst_format_compared_line "$hp" "$ht" "$cmd" "$exit_code" "$bp" "$bt" "$sha8" "$newly" "$shown" "$failed_form" "$suffix" 0)"
+        rst_emit_verdict "$base_sha" "$bstatus" "$bp" "$bt" "$newly" "$mode" "$base_exit" yes "$base_log" "$head_status" "$final_line"
       }
       # ---- END rst core ----
 
@@ -2185,6 +2657,7 @@ nodes:
       EXIT_CODE=0
       COUNTS=""
       CMD_JOINED=""
+      unset RST_CMD_BUDGET_SECONDS
       # rst_try <source-label>: run whatever is in $CMDS; rc 0 when counts were parsed.
       rst_try() {
         [ -s "$CMDS" ] || return 1
@@ -2242,12 +2715,20 @@ nodes:
       echo "TESTS_PASSED=${COUNTS%% *}"
       echo "TESTS_TOTAL=${COUNTS##* }"
       if [ "$SOURCE" = "project-map" ]; then
-        SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/"
+        HEAD_REPORT="$(SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/")"
       else
         REPORT_SOURCE="${SOURCE%% *}"
         if [ "$REPORT_SOURCE" = "spec_declared" ]; then REPORT_SOURCE="wo-spec"; fi
-        rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
+        HEAD_REPORT="$(rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/")"
       fi
+      HEAD_STATUS="$(printf '%s\n' "$HEAD_REPORT" | sed -n 's/^TESTS_STATUS=//p' | head -n 1)"
+      HEAD_LINE="$(printf '%s\n' "$HEAD_REPORT" | sed -n 's/^TESTS_LINE=//p' | head -n 1)"
+      REVIEW_BASE_OUTPUT="$(cat <<'RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL' | capture_node_output
+      $resolve-review-base.output
+      RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL
+      )"
+      unset RST_CMD_BUDGET_SECONDS
+      rst_apply_verdict "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$LOG" "$HEAD_STATUS" "$HEAD_LINE" "$REVIEW_BASE_OUTPUT" "$CMDS"
       echo "TESTS_LOG=$LOG"
       if [ -s "$LOG" ]; then
         echo "--- last 80 lines of test output ---"
@@ -4619,6 +5100,7 @@ nodes:
         Files created: <comma-separated list -- ONLY files added in the diff; or "none">
         Files modified: <comma-separated list -- ONLY files changed in the diff; or "none">
         Tests: <N passing / N total> or N/A (<reason>)
+        A baseline-red Tests line has the shape "<p>/<t> (<cmd>) -- head <p>/<t>; base <pb>/<tb> at <sha8>; newly failing: 0" and does not make VALIDATION fail.
         PRs: <PR URL> or N/A (ALREADY_SATISFIED or BLOCKED)
         Merge ancestors: <merge-base SHA>...<HEAD SHA> (behind_by=<N>) or N/A
         Grep assertions: <command> => <N> lines; or N/A (manifest auto-generated; see Tests)
@@ -4689,7 +5171,13 @@ nodes:
         if [ "$grep_status" = "incomplete" ]; then
           stop_detail="; unparsed=$(printf '%s\n' "$grep_line" | sed -n 's/.*UNVERIFIED (unparsed): //p'); dropped=${grep_dropped:-0}"
         fi
-        printf '%s\n' "$manifest" | T_LINE="Tests: ${tests_line}" G_LINE="Grep assertions: ${grep_line}" S_LINE="Stop conditions: tests=${tests_status}; greps=${grep_status}${stop_detail} (observed by run-stop-tests / run-stop-greps in the run worktree)" VERDICT="$verdict" awk '
+        tests_audit="tests=${tests_status}"
+        if [ "$tests_status" = "baseline_red" ]; then
+          base_pair="$(printf '%s\n' "$tests_line" | sed -n 's/.*base \([0-9][0-9]*\/[0-9][0-9]*\) at.*/\1/p' | head -n 1)"
+          [ -n "$base_pair" ] || base_pair="n/a"
+          tests_audit="tests=baseline_red (newly failing: 0; base ${base_pair})"
+        fi
+        printf '%s\n' "$manifest" | T_LINE="Tests: ${tests_line}" G_LINE="Grep assertions: ${grep_line}" S_LINE="Stop conditions: ${tests_audit}; greps=${grep_status}${stop_detail} (observed by run-stop-tests / run-stop-greps in the run worktree)" VERDICT="$verdict" awk '
           !ts && /^Tests:/ { print ENVIRON["T_LINE"]; ts = 1; next }
           !gs && /^Grep assertions:/ { print ENVIRON["G_LINE"]; gs = 1; next }
           !vs && /^VALIDATION:/ {
@@ -4765,7 +5253,12 @@ nodes:
         [ -n "$class" ] || class="CODE"
         case "$class" in
           CODE|MIXED)
-            if [ "$tests_status" = "failed" ] || { ! printf '%s\n' "$tests_line" | grep -qE '^[0-9]+/[0-9]+' && ! { [ "$tests_status" = "counts_unparsed" ] && [ "${tests_exit:-1}" -eq 0 ] 2>/dev/null; }; }; then
+            if [ "$tests_status" = "baseline_red" ]; then
+              if ! printf '%s\n' "$tests_line" | grep -qE '^[0-9]+/[0-9]+' || ! printf '%s\n' "$tests_line" | grep -qE 'newly failing: 0([^0-9]|$)'; then
+                echo "EVIDENCE_ERROR: Tests: \"${tests_line}\" on a ${class} WO (tests_status=baseline_red_without_zero_newly_failing). baseline_red is admissible only when newly failing is 0 (bdc-xo #1940)." >&2
+                return 1
+              fi
+            elif [ "$tests_status" = "failed" ] || { ! printf '%s\n' "$tests_line" | grep -qE '^[0-9]+/[0-9]+' && ! { [ "$tests_status" = "counts_unparsed" ] && [ "${tests_exit:-1}" -eq 0 ] 2>/dev/null; }; }; then
               echo "EVIDENCE_ERROR: Tests: \"${tests_line}\" on a ${class} WO (tests_status=${tests_status:-missing}). Manifest v2 / Rule 10 require \"Tests: <pass>/<total> (<command>)\" from an executed command; N/A is not admissible on a ${class} WO (bdc-xo #1940)." >&2
               return 1
             fi

@@ -240,6 +240,17 @@ assert_eq "BLOCKED OK" "0|OK|" "$R"
 R="$(run_check "$NA_TESTS" "" CODE "" 0 "")"
 assert_eq "empty status OK" "0|OK|" "$R"
 
+echo "--- Test 11: baseline_red with newly failing 0 is accepted ---"
+BASELINE_OK="$(printf '%s\n' "$GOOD" | sed 's|^Tests:.*|Tests: 2/3 (bash ./t.sh) -- head 2/3; base 2/3 at abcdef01; newly failing: 0 (stale > base is red)|')"
+R="$(run_check "$BASELINE_OK" PROCEED CODE baseline_red 0 none_declared 1)"
+assert_eq "baseline_red zero is OK" "0|OK|" "$R"
+
+echo "--- Test 12: baseline_red without a zero count is refused ---"
+BASELINE_BAD="$(printf '%s\n' "$GOOD" | sed 's|^Tests:.*|Tests: 1/3 (bash ./t.sh) -- head 1/3; base 2/3 at abcdef01; newly failing: 2 (new > head only)|')"
+R="$(run_check "$BASELINE_BAD" PROCEED CODE baseline_red 0 none_declared 1)"
+assert_eq "baseline_red nonzero rc" "1" "${R%%|*}"
+assert_contains "baseline_red refusal token" "baseline_red_without_zero_newly_failing" "$R"
+
 echo "--- Test 10: short manifest (no Tests: line) is not gated ---"
 R="$(run_check "$(printf 'WO: WO-X\nOUTCOME=ALREADY_SATISFIED\nVALIDATION: PASS')" PROCEED CODE "" 0 "")"
 assert_eq "short manifest OK" "0|OK|" "$R"
