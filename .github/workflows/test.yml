@@ -222,7 +222,7 @@ jobs:
           assert_denied appuser_auth_read docker exec --user reviewer archon-smoke sh -c 'cat /home/appuser/.codex/auth.json'
           assert_denied parent_environment_read docker exec --user reviewer archon-smoke sh -c 'cat /proc/1/environ'
           docker exec --user appuser archon-smoke bun run scripts/overseer-review-sandbox-smoke.ts
-          test "$(docker inspect archon-smoke --format '{{.HostConfig.Privileged}} {{json .HostConfig.CapAdd}}')" = 'false []'
+          test "$(docker inspect archon-smoke --format '{{.HostConfig.Privileged}} {{.HostConfig.CapAdd}}')" = 'false []'
 
       - name: Dump container logs on failure
         if: failure()
