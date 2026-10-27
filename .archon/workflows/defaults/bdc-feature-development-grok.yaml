@@ -5015,11 +5015,12 @@ nodes:
       # ---- BEGIN manifest-pr-content-check ----
       # WO-HARNESS-ZERO-OPEN-IMPLEMENT-MANIFEST-CHECKPOINT-TRUTH-01
       # Fail closed when build-manifest claims paths absent from the real PR file list.
+      # BRACKET_SAFE_CLAIMED_PATHS
       if [ -n "$PR_URL" ]; then
         FILES_CREATED_LINE=$(extract "Files created")
         FILES_MODIFIED_LINE=$(extract "Files modified")
         CLAIMED_RAW=$(printf '%s\n%s\n' "$FILES_CREATED_LINE" "$FILES_MODIFIED_LINE")
-        CLAIMED_PATHS=$(printf '%s\n' "$CLAIMED_RAW" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -E '^[A-Za-z0-9_./-]+' | grep -v -E '^(none|n/a|N/A|no files|already.satisfied|ALREADY_SATISFIED|BLOCKED)$' | sed -E 's|^([A-Za-z0-9_./-]+).*|\1|' || true)
+        CLAIMED_PATHS=$(printf '%s\n' "$CLAIMED_RAW" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -E '^[A-Za-z0-9_./-]+' | grep -v -E '^(none|n/a|N/A|no files|already.satisfied|ALREADY_SATISFIED|BLOCKED)$' || true)
         SKIP_PR_FILES=false
         COMBINED_LOWER=$(printf '%s\n' "$CLAIMED_RAW" "$PRS_LINE" "$MANIFEST_OUT" | tr '[:upper:]' '[:lower:]')
         if printf '%s\n' "$COMBINED_LOWER" | grep -Eq 'already_satisfied|already satisfied|no files|files created: none|files modified: none|outcome: blocked|blocked'; then
@@ -5040,23 +5041,47 @@ nodes:
             if [ -n "$CLAIMED_PATHS" ]; then
               MISSING=""
               MATCH=0
+              set -f
               while IFS= read -r p; do
                 [ -z "$p" ] && continue
-                if printf '%s\n' "$PR_FILES" | grep -Fxq "$p"; then
+                if printf '%s\n' "$PR_FILES" | grep -Fxq -- "$p"; then
+                  MATCH=$((MATCH + 1))
+                  continue
+                fi
+                candidate="$p"
+                paren_stripped=$(printf '%s\n' "$candidate" | sed -E 's/[[:space:]]*\([^)]*\)[[:space:]]*$//')
+                if [ "$paren_stripped" != "$candidate" ]; then
+                  candidate="$paren_stripped"
+                else
+                  while printf '%s\n' "$candidate" | grep -Eq '^(.*/)?[^/]*[[:space:]]+[A-Za-z][A-Za-z0-9_-]*$'; do
+                    next=$(printf '%s\n' "$candidate" | sed -E 's/[[:space:]]+[A-Za-z][A-Za-z0-9_-]*$//')
+                    [ "$next" = "$candidate" ] && break
+                    candidate="$next"
+                  done
+                fi
+                if [ "$candidate" != "$p" ] && printf '%s\n' "$PR_FILES" | grep -Fxq -- "$candidate"; then
                   MATCH=$((MATCH + 1))
                 else
-                  MISSING="${MISSING}${p} "
+                  MISSING="${MISSING}${p}"$'\n'
                 fi
               done < <(printf '%s\n' "$CLAIMED_PATHS")
+              set +f
               if [ -n "$MISSING" ]; then
-                echo "PR_CONTENT_ERROR: claimed path(s) absent from PR file list: ${MISSING}" >&2
+                echo "PR_CONTENT_ERROR: claimed path(s) absent from PR file list:" >&2
+                echo "CLAIMED_PATHS" >&2
+                printf '%s\n' "$CLAIMED_PATHS" >&2
                 echo "PR_URL=${PR_URL}" >&2
-                echo "PR_FILES=$(printf '%s' "$PR_FILES" | tr '\n' ' ')" >&2
+                echo "PR_FILES" >&2
+                printf '%s\n' "$PR_FILES" >&2
                 exit 1
               fi
               if [ -n "$PR_FILES" ] && [ "$MATCH" -eq 0 ]; then
                 echo "PR_CONTENT_ERROR: PR has files but zero claimed manifest paths match (wrong-content PR)." >&2
+                echo "CLAIMED_PATHS" >&2
+                printf '%s\n' "$CLAIMED_PATHS" >&2
                 echo "PR_URL=${PR_URL}" >&2
+                echo "PR_FILES" >&2
+                printf '%s\n' "$PR_FILES" >&2
                 exit 1
               fi
             fi
