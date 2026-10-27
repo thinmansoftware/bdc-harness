@@ -93,7 +93,9 @@ try {
   await command(['chgrp', 'reviewer', `${request}.tmp`]);
   await rename(`${request}.tmp`, request);
 
-  let result: { ok?: boolean; uid?: number; reason?: string; stderr?: string } | undefined;
+  let result:
+    | { ok?: boolean; uid?: number; reason?: string; stdout?: string; stderr?: string }
+    | undefined;
   for (let attempt = 0; attempt < 400; attempt += 1) {
     try {
       result = JSON.parse(await readFile(resultPath, 'utf8'));
@@ -104,7 +106,9 @@ try {
   }
   if (!result) throw new Error('reviewer_broker_unavailable');
   if (!result.ok || result.uid !== 1002)
-    throw new Error(`native_sandbox_failed:${result.reason ?? result.stderr ?? 'unknown'}`);
+    throw new Error(
+      `native_sandbox_failed:${result.reason ?? (result.stderr || result.stdout || 'unknown')}`
+    );
   if ((await readFile(outside, 'utf8')) !== 'outside-control\n')
     throw new Error('sandbox_forbidden_write_succeeded');
   console.log(

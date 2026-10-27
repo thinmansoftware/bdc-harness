@@ -428,7 +428,7 @@ export function parseReviewWorkBody(body: string): ReviewWorkBody | null {
       prNumber: value.prNumber,
       headSha: value.headSha,
       baseRef: typeof value.baseRef === 'string' ? value.baseRef : '',
-      baseSha: typeof value.baseSha === 'string' ? value.baseSha : '',
+      ...(typeof value.baseSha === 'string' ? { baseSha: value.baseSha } : {}),
       author: typeof value.author === 'string' ? value.author : '',
       headCiGreen: value.headCiGreen === true,
     };
