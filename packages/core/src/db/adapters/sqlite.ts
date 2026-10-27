@@ -547,6 +547,7 @@ export class SqliteAdapter implements IDatabase {
       'ce_scope_approval_recorded',
       'ce_scope_approval_revoked',
       'ce_scope_approval_rejected',
+      'xo_lease_handoff_directed',
     ];
     const tableSql = row.sql;
     if (!hasSubjectKey || requiredTypes.some(type => !tableSql.includes(type))) {
@@ -569,7 +570,8 @@ export class SqliteAdapter implements IDatabase {
             'motion_notification_enqueued','motion_notification_deduplicated',
             'board_alias_resolved','board_petition_delivered',
             'execution_claim_authority_rejected','manual_initiation_recorded',
-            'ce_scope_approval_recorded','ce_scope_approval_revoked','ce_scope_approval_rejected'
+            'ce_scope_approval_recorded','ce_scope_approval_revoked','ce_scope_approval_rejected',
+            'xo_lease_handoff_directed'
           )),
           actor_principal_id TEXT,
           actor_seat_id TEXT CHECK (actor_seat_id IS NULL OR actor_seat_id IN ('john','general','xo')),
@@ -610,6 +612,25 @@ export class SqliteAdapter implements IDatabase {
    */
   private migrateColumns(): void {
     this.upgradeBoardAuditEvents();
+    try {
+      const leaseCols = this.pragmaAll("PRAGMA table_info('board_xo_leases')") as {
+        name: string;
+      }[];
+      if (leaseCols.length > 0) {
+        const leaseColNames = new Set(leaseCols.map(column => column.name));
+        for (const name of [
+          'handoff_successor_principal_id',
+          'handoff_reserved_until',
+          'handoff_directed_by',
+        ]) {
+          if (!leaseColNames.has(name)) {
+            this.db.run(`ALTER TABLE board_xo_leases ADD COLUMN ${name} TEXT`);
+          }
+        }
+      }
+    } catch (e: unknown) {
+      getLog().warn({ err: e as Error }, 'db.sqlite_migration_xo_lease_handoff_columns_failed');
+    }
     // Migration 045: SQLite cannot alter CHECK constraints. Rebuild existing
     // four-verb journals transactionally before any fire_cauldron insert.
     const journalSchema = (this.pragmaAll(
@@ -1713,7 +1734,10 @@ export class SqliteAdapter implements IDatabase {
         acquired_at TEXT NOT NULL,
         renewed_at TEXT,
         expires_at TEXT NOT NULL,
-        released_at TEXT
+        released_at TEXT,
+        handoff_successor_principal_id TEXT,
+        handoff_reserved_until TEXT,
+        handoff_directed_by TEXT
       );
 
       CREATE TABLE IF NOT EXISTS board_audit_events (
@@ -1739,7 +1763,8 @@ export class SqliteAdapter implements IDatabase {
             'manual_initiation_recorded',
             'ce_scope_approval_recorded',
             'ce_scope_approval_revoked',
-            'ce_scope_approval_rejected'
+            'ce_scope_approval_rejected',
+            'xo_lease_handoff_directed'
           )
         ),
         actor_principal_id TEXT,

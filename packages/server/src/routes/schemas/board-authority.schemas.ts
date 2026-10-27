@@ -47,6 +47,34 @@ export const xoLeaseReleaseBodySchema = z
   .strict()
   .openapi('XoLeaseReleaseBody');
 
+export const xoLeaseHandoffBodySchema = z
+  .object({
+    principal_token: z.string().min(1),
+    holder_id: z.string().min(1).optional(),
+    expected_fencing_token: z.number().int().positive(),
+    successor_principal_id: z.string().min(1),
+    reservation_ms: z.number().int().positive().max(3_600_000).optional(),
+  })
+  .strict()
+  .openapi('XoLeaseHandoffBody');
+
+export const xoLeaseHandoffResponseSchema = z
+  .object({
+    handed_off_lease_id: z.string(),
+    fencing_token: z.number(),
+    successor_principal_id: z.string(),
+    reserved_until: z.string(),
+  })
+  .openapi('XoLeaseHandoffResponse');
+
+export const xoLeaseReservationSchema = z
+  .object({
+    successor_principal_id: z.string(),
+    reserved_until: z.string(),
+    directed_by: z.string(),
+  })
+  .openapi('XoLeaseReservation');
+
 export const boardRecipientResponseSchema = z
   .object({
     ok: z.boolean(),
