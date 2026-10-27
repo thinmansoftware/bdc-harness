@@ -379,6 +379,9 @@ describe('fuelglass pushed readings', () => {
 
   test('above-cutoff push blocks the next gate decision before cache expiry', async () => {
     resetSeatUsageCacheForTests();
+    const primed = await readSeat('cursor');
+    expect(primed.limit_source).toBe('UNKNOWN');
+
     const firstPost = await postReading(sixFields(), OPERATOR_TOKEN);
     expect(firstPost.status).toBe(200);
     const first = await readSeat('cursor');

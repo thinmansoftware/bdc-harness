@@ -25,6 +25,7 @@ import {
   setSeatCutoffOverride,
   setSeatUsageLogForTests,
   unknownSeatReading,
+  type PushedCursorReading,
   type SeatReading,
 } from './seat-usage';
 
@@ -830,31 +831,49 @@ describe('seat usage', () => {
 
   test('pushed_reading_above_cutoff_blocks_before_cache_expiry', async () => {
     const now = Date.parse('2026-10-27T13:05:11.000Z');
-    const row = {
-      used_percent: 35.28,
-      remaining_percent: 64.72,
+    let calls = 0;
+    const fetchImpl: typeof fetch = async () => {
+      calls += 1;
+      if (calls > 1) throw new Error('cached direct probe must not fetch again');
+      return jsonResponse(
+        200,
+        JSON.stringify({
+          membershipType: 'ultra',
+          billingCycleEnd: '2026-11-13T16:33:08.000Z',
+          individualUsage: { plan: { used: 13, limit: 100 } },
+        })
+      );
+    };
+    let pushed: PushedCursorReading | null = null;
+    const deps = {
+      now: () => now,
+      env: { FUELGLASS_CURSOR_SESSION_TOKEN: 'user_FIXTURE%3A%3Aa.b.c' },
+      fetch: fetchImpl,
+      loadPushedReading: async (): Promise<PushedCursorReading | null> => pushed,
+    };
+
+    const first = await readSeat('cursor', deps);
+    expect(first.limit_source).toBe('measured');
+    expect(first.windows.find(window => window.name === 'monthly')?.used_percent).toBe(13);
+    expect(first.reading_source).toBeUndefined();
+
+    const second = await readSeat('cursor', deps);
+    expect(second.limit_source).toBe('measured');
+    expect(second.windows.find(window => window.name === 'monthly')?.used_percent).toBe(13);
+    expect(calls).toBe(1);
+
+    pushed = {
+      used_percent: 91,
+      remaining_percent: 9,
       resets_at: '2026-11-13T16:33:08.000Z',
       observed_at: '2026-10-27T13:00:11.000Z',
       source: 'desktop-fuelglass',
     };
-    let calls = 0;
-    const fetchImpl: typeof fetch = async () => {
-      calls += 1;
-      throw new Error('direct probe must not run');
-    };
-    const deps = {
-      now: () => now,
-      env: {},
-      fetch: fetchImpl,
-      loadPushedReading: async () => row,
-    };
-    const first = await readSeat('cursor', deps);
-    expect(first.limit_source).toBe('measured');
-    expect(first.windows.find(window => window.name === 'monthly')?.used_percent).toBe(35.28);
-    row.used_percent = 91;
-    row.remaining_percent = 9;
-    const second = await readSeat('cursor', deps);
-    expect(decideSeatGate([{ providerId: 'cursor' }], { cursor: second }, 90)).toEqual({
+    const third = await readSeat('cursor', deps);
+    expect(third.limit_source).toBe('measured');
+    expect(third.reading_source).toBe('pushed');
+    expect(third.windows.find(window => window.name === 'monthly')?.used_percent).toBe(91);
+    expect(decideSeatGate([{ providerId: 'cursor' }], { cursor: third }, 90)).toEqual({
       refused: true,
       seat: 'cursor',
       window: 'monthly',
@@ -862,7 +881,13 @@ describe('seat usage', () => {
       cutoffPercent: 90,
       unknownSeats: [],
     });
-    expect(calls).toBe(0);
+    expect(calls).toBe(1);
+
+    for (const reading of [first, second, third]) {
+      const serialized = JSON.stringify(reading);
+      expect(serialized).not.toContain('user_FIXTURE');
+      expect(serialized).not.toContain('a.b.c');
+    }
   });
 
   test('pushed_reading_freshness_rechecked_inside_cache_ttl', async () => {
