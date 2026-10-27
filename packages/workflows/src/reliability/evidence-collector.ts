@@ -250,12 +250,16 @@ function parsePullRequest(json: string): PullRequestEvidence | null {
   };
 }
 
-const REPAIR_TARGET_LINE = /^REPAIR_TARGET=#([1-9][0-9]*)$/;
-const REPAIR_LEASE_LINE = /^REPAIR_TARGET_LEASE_SHA=([0-9a-fA-F]{40})$/;
+const REPAIR_TARGET_RAW_LINE = /^REPAIR_TARGET=(.*)$/;
+const REPAIR_LEASE_RAW_LINE = /^REPAIR_TARGET_LEASE_SHA=(.*)$/;
+const REPAIR_TARGET_VALUE = /^#([1-9][0-9]*)$/;
+const REPAIR_LEASE_VALUE = /^[0-9a-fA-F]{40}$/;
 
 // Latest checkout-repair-target completion in this run. Whole lines only.
-// REPAIR_TARGET=none, a non-string output, or a lease that is not 40 hex
-// yields null. The last matching line wins for each value.
+// The final REPAIR_TARGET= and REPAIR_TARGET_LEASE_SHA= lines control
+// authorization. A final REPAIR_TARGET=none, a missing lease, or a final
+// lease that is not 40 hex clears an earlier valid pair and yields null.
+// REPAIR_TARGET_UPSTREAM= and REPAIR_TARGET_BRANCH= are not targets.
 function parseRepairReanchor(
   events: readonly WorkflowEventRecord[]
 ): { readonly leaseSha: string; readonly pullNumber: number } | null {
@@ -270,14 +274,16 @@ function parseRepairReanchor(
   let pullNumber: number | null = null;
   let leaseSha: string | null = null;
   for (const line of nodeOutput.split(/\r?\n/)) {
-    const targetMatch = REPAIR_TARGET_LINE.exec(line);
-    if (targetMatch?.[1]) {
-      const parsed = Number(targetMatch[1]);
+    const targetRaw = REPAIR_TARGET_RAW_LINE.exec(line);
+    if (targetRaw) {
+      const targetValue = REPAIR_TARGET_VALUE.exec(targetRaw[1] ?? '');
+      const parsed = targetValue?.[1] === undefined ? Number.NaN : Number(targetValue[1]);
       pullNumber = Number.isSafeInteger(parsed) ? parsed : null;
     }
-    const leaseMatch = REPAIR_LEASE_LINE.exec(line);
-    if (leaseMatch?.[1]) {
-      leaseSha = leaseMatch[1];
+    const leaseRaw = REPAIR_LEASE_RAW_LINE.exec(line);
+    if (leaseRaw) {
+      const leaseValue = leaseRaw[1] ?? '';
+      leaseSha = REPAIR_LEASE_VALUE.test(leaseValue) ? leaseValue : null;
     }
   }
   if (pullNumber === null || leaseSha === null) return null;

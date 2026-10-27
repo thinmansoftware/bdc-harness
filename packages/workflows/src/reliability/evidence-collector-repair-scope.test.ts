@@ -296,6 +296,56 @@ describe('repair scope re-anchor', () => {
     });
   });
 
+  it('superseded-target-none-refuses', async () => {
+    await withRepo(async cwd => {
+      const repo = await buildBehindDevRepo(cwd);
+      const authority = authorityRecord(cwd, REPAIR_BRANCH, repo.d2, repo.d2);
+      await expectScopeMismatch(
+        collectRuntimeEvidence(
+          {
+            getRunAuthority: async () => authority,
+            listWorkflowEvents: async () => [
+              workflowEvent(
+                authority,
+                'checkout-repair-target',
+                'node_completed',
+                `${repairOutput(1280, repo.p1)}REPAIR_TARGET=none\n`,
+                'event-superseded-none'
+              ),
+            ],
+          },
+          commandRunner,
+          runtimeRequest(authority)
+        )
+      );
+    });
+  });
+
+  it('superseded-malformed-lease-refuses', async () => {
+    await withRepo(async cwd => {
+      const repo = await buildBehindDevRepo(cwd);
+      const authority = authorityRecord(cwd, REPAIR_BRANCH, repo.d2, repo.d2);
+      await expectScopeMismatch(
+        collectRuntimeEvidence(
+          {
+            getRunAuthority: async () => authority,
+            listWorkflowEvents: async () => [
+              workflowEvent(
+                authority,
+                'checkout-repair-target',
+                'node_completed',
+                `${repairOutput(1280, repo.p1)}REPAIR_TARGET_LEASE_SHA=${repo.p1.slice(0, 39)}\n`,
+                'event-superseded-lease'
+              ),
+            ],
+          },
+          commandRunner,
+          runtimeRequest(authority)
+        )
+      );
+    });
+  });
+
   it('repair run that already merged current dev passes without re-anchor', async () => {
     await withRepo(async cwd => {
       const d1 = await commitFile(cwd, 'd1.txt', 'd1\n', 'D1');
