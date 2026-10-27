@@ -120,12 +120,6 @@ for lane in $LANES; do
     hit && $0 ~ /^  - id: / { exit }
   ' "$DEFAULTS/$lane")"
   expected_dep="    depends_on: [format-autofix, resolve-test-command, resolve-review-base]"
-  case "$lane" in
-    bdc-feature-development-fusion-cx-kimi.yaml|bdc-feature-development-kimi-k3.yaml|bdc-feature-development-zero-claude.yaml)
-      # These lanes must not declare resolve-review-base. Base SHA falls back to run-start-sha.txt.
-      expected_dep="    depends_on: [format-autofix, resolve-test-command]"
-      ;;
-  esac
   assert_eq "run-stop-tests depends_on $lane" "$expected_dep" "$rst_dep"
   rst_timeout="$(awk '
     $0 ~ /^  - id: run-stop-tests$/ { hit = 1; next }
@@ -1401,6 +1395,76 @@ T11_OUT="$(rst_verdict_for "$T11" "$T11_CMD" "$(printf 'REVIEW_BASE=dev\nREVIEW_
 assert_eq "t11 status" "failed" "$(rst_out_field TESTS_STATUS "$T11_OUT")"
 assert_not_contains "t11 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T11_OUT")"
 rm -rf "$T11"
+
+echo "--- Test 12: text and JSON forms of one failure cannot hide an unparsed one ---"
+T12_DUAL="$(printf 'T\t%s\n' \
+  'FAIL src/a.test.ts > suite > old test' \
+  'src/a.test.ts::suite > old test' \
+  | rst_identity_count)"
+assert_eq "t12 arrow json counts once" "1" "$T12_DUAL"
+T12_JEST="$(printf 'T\t%s\n' \
+  'FAIL src/a.test.ts > suite > old test' \
+  'src/a.test.ts::suite old test' \
+  | rst_identity_count)"
+assert_eq "t12 space json counts once" "1" "$T12_JEST"
+T12_TWO="$(printf 'T\t%s\n' \
+  'FAIL src/a.test.ts > suite > old test' \
+  'src/a.test.ts::suite > another' \
+  | rst_identity_count)"
+assert_eq "t12 distinct names stay distinct" "2" "$T12_TWO"
+
+V12="$(mktemp -d)"
+cat > "$V12/npx" <<'EOF'
+#!/bin/bash
+if [ "$1" = "vitest" ]; then
+  shift
+  exec "$(dirname "$0")/vitest" "$@"
+fi
+echo "npx stub unsupported: $*" >&2
+exit 127
+EOF
+cat > "$V12/vitest" <<'EOF'
+#!/bin/bash
+out=""
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    --outputFile) out="$a" ;;
+  esac
+  case "$a" in
+    --outputFile=*) out="${a#--outputFile=}" ;;
+  esac
+  prev="$a"
+done
+file="$(jq -r '.file' fixture.json)"
+full="$(jq -r '.fullName' fixture.json)"
+failed="$(jq -r '.failed' fixture.json)"
+passed="$(jq -r '.passed' fixture.json)"
+total="$(jq -r '.total' fixture.json)"
+printf 'FAIL %s > %s\n' "$file" "$full"
+if [ -n "$out" ]; then
+  jq -n --arg name "$file" --arg full "$full" \
+    '{testResults:[{name:$name, assertionResults:[{fullName:$full, status:"failed"}]}]}' > "$out"
+fi
+printf 'Tests: %s failed, %s passed, %s total\n' "$failed" "$passed" "$total"
+exit 1
+EOF
+chmod +x "$V12/npx" "$V12/vitest"
+export PATH="$V12:$ORIG_PATH"
+
+T12_BASE='{"file":"src/a.test.ts","fullName":"suite > old test","failed":1,"passed":0,"total":1}'
+T12_SAME='{"file":"src/a.test.ts","fullName":"suite > old test","failed":1,"passed":0,"total":1}'
+T12_EXTRA='{"file":"src/a.test.ts","fullName":"suite > old test","failed":2,"passed":0,"total":2}'
+T12_OK="$(rst_vitest_case "$T12_BASE" "$T12_SAME")"
+assert_eq "t12 matched dual status" "baseline_red" "$(rst_out_field TESTS_STATUS "$T12_OK")"
+assert_eq "t12 matched dual newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T12_OK")"
+assert_eq "t12 matched dual mode" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T12_OK")"
+T12_BAD="$(rst_vitest_case "$T12_BASE" "$T12_EXTRA")"
+assert_eq "t12 unparsed extra status" "failed" "$(rst_out_field TESTS_STATUS "$T12_BAD")"
+assert_not_contains "t12 unparsed extra not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T12_BAD")"
+assert_eq "t12 unparsed extra newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T12_BAD")"
+export PATH="$ORIG_PATH"
+rm -rf "$V12"
 
 echo
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"

@@ -1662,7 +1662,7 @@ nodes:
   - id: run-stop-tests
     persona: major-build
     load_bearing: true
-    depends_on: [format-autofix, resolve-test-command]
+    depends_on: [format-autofix, resolve-test-command, resolve-review-base]
     task_class: clerical
     timeout: 3600000
     bash: |
@@ -2240,7 +2240,9 @@ nodes:
       #   ("### json-report: <path>", testResults[].assertionResults[] status=failed)
       #   contributes "<file>::<fullName>" after stripping a "### checkout-root: <pwd>"
       #   prefix only when that exact prefix plus a slash is present. JSON identities
-      #   are added to text identities; they never replace them. File counts stay separate.
+      #   are added to text identities; they never replace them. Coverage counts one
+      #   physical failure when "FAIL <file> > <name>" and "<file>::<name>" normalize
+      #   to the same file and name. File counts stay separate.
       rst_failing_names() {
         local text text_out json_out esc
         text="$(cat)"
@@ -2423,6 +2425,45 @@ nodes:
           printf '%s' "$body"
         fi
       }
+      # rst_identity_count (T/F records on stdin) -> physical T-record count
+      #   "FAIL <file> > <name>" and "<file>::<name>" are one failure when the
+      #   file and the normalized name match. Other identities stay distinct.
+      #   POSIX awk only (mawk): no gensub.
+      rst_identity_count() {
+        awk -F '\t' '
+          function squash(s) {
+            gsub(/ > /, " ", s)
+            gsub(/[[:space:]]+/, " ", s)
+            sub(/^ /, "", s)
+            sub(/ $/, "", s)
+            return s
+          }
+          function canon(id,   rest, file, pos) {
+            if (index(id, "FAIL ") == 1 && index(id, " > ") > 0) {
+              rest = substr(id, 6)
+              pos = index(rest, " > ")
+              file = substr(rest, 1, pos - 1)
+              sub(/^[ \t]+/, "", file)
+              sub(/[ \t]+$/, "", file)
+              rest = substr(rest, pos + 3)
+              return file SUBSEP squash(rest)
+            }
+            pos = index(id, "::")
+            if (pos > 1) {
+              file = substr(id, 1, pos - 1)
+              rest = substr(id, pos + 2)
+              return file SUBSEP squash(rest)
+            }
+            return id
+          }
+          $1 == "T" {
+            id = substr($0, 3)
+            k = canon(id)
+            if (!(k in seen)) { seen[k] = 1; c++ }
+          }
+          END { print c+0 }
+        '
+      }
       # rst_apply_verdict <class> <cmd> <exit> <counts> <log> <head_status> <head_line> <review_base_output> <cmds_file>
       #   Runs only after the head ladder. Skips the base pass for DOCUMENTATION /
       #   OPERATOR, an empty command, head status passed / counts_unparsed /
@@ -2535,13 +2576,14 @@ nodes:
         base_obs=$((bt - bp))
         if [ "$head_obs" -lt 0 ]; then head_obs=0; fi
         if [ "$base_obs" -lt 0 ]; then base_obs=0; fi
-        ht_n="$(printf '%s\n' "$head_records" | awk -F '\t' '$1=="T"{c++} END{print c+0}')"
-        bt_n="$(printf '%s\n' "$base_records" | awk -F '\t' '$1=="T"{c++} END{print c+0}')"
+        ht_n="$(printf '%s\n' "$head_records" | rst_identity_count)"
+        bt_n="$(printf '%s\n' "$base_records" | rst_identity_count)"
         hf_n="$(printf '%s\n' "$head_records" | awk -F '\t' '$1=="F"{c++} END{print c+0}')"
         bf_n="$(printf '%s\n' "$base_records" | awk -F '\t' '$1=="F"{c++} END{print c+0}')"
         hf_sum="$(printf '%s\n' "$head_records" | awk -F '\t' '$1=="F"{s+=$3} END{print s+0}')"
         bf_sum="$(printf '%s\n' "$base_records" | awk -F '\t' '$1=="F"{s+=$3} END{print s+0}')"
-        if [ "$ht_n" -ge 1 ] && [ "$bt_n" -ge 1 ] && [ "$ht_n" -ge "$head_obs" ] && [ "$bt_n" -ge "$base_obs" ]; then
+        # One physical identity per observed failure. Duplicate reporter strings are not coverage.
+        if [ "$ht_n" -ge 1 ] && [ "$bt_n" -ge 1 ] && [ "$ht_n" -eq "$head_obs" ] && [ "$bt_n" -eq "$base_obs" ]; then
           names_complete=1
         fi
         if [ "$hf_n" -ge 1 ] && [ "$bf_n" -ge 1 ] && [ "$hf_sum" -ge "$head_obs" ] && [ "$bf_sum" -ge "$base_obs" ]; then
@@ -3246,6 +3288,36 @@ nodes:
   # so it cannot run `git diff` itself (F5 fix). This bash node captures the full feature
   # diff (merge-base..HEAD plus any unstaged working-tree changes) to an artifact the
   # Codex review prompts read. Emits provenance so the reviewer knows exactly what it saw.
+  - id: resolve-review-base
+    depends_on: [read-spec]
+    bash: |
+      set -uo pipefail
+      RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"
+      if [ ! -s "$RUN_AUTHORITY_SPEC" ]; then
+        echo "ERROR: scope_authority_missing: $RUN_AUTHORITY_SPEC" >&2
+        exit 1
+      fi
+      SPEC_TEXT=$(cat "$RUN_AUTHORITY_SPEC")
+      # Same 3 patterns decide-push-target's Base Branch Override section already
+      # documents (plain header, markdown-bold, YAML field), in priority order.
+      DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '^Base branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^Base branch:[[:space:]]*//')
+      if [ -z "$DECLARED" ]; then
+        DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '\*\*Base branch:\*\*[[:space:]]*`[A-Za-z0-9_./-]+`' | sed -E 's/.*`([A-Za-z0-9_./-]+)`.*/\1/')
+      fi
+      if [ -z "$DECLARED" ]; then
+        DECLARED=$(printf '%s\n' "$SPEC_TEXT" | grep -m1 -E '^base_branch:[[:space:]]*[A-Za-z0-9_./-]+' | sed -E 's/^base_branch:[[:space:]]*//')
+      fi
+      if [ -n "$DECLARED" ] && git ls-remote --exit-code origin "refs/heads/${DECLARED}" >/dev/null 2>&1; then
+        echo "REVIEW_BASE=$DECLARED"
+        echo "REVIEW_BASE_SOURCE=declared"
+      elif [ -n "${BASE_BRANCH:-}" ]; then
+        echo "REVIEW_BASE=$BASE_BRANCH"
+        echo "REVIEW_BASE_SOURCE=env-default"
+      else
+        echo "REVIEW_BASE=master"
+        echo "REVIEW_BASE_SOURCE=fallback-master"
+      fi
+
   - id: capture-diff
     depends_on: [war-council-validator]
     bash: |
