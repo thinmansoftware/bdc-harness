@@ -1,80 +1,50 @@
 Manifest-Version: 2
 WO: WO-HARNESS-OVERSEER-REVIEW-SANDBOX-01
-Builder: Any
-Repair target: PR #1290 (feat/wo-harness-overseer-review-sandbox-01-repair). No new PR. Not merged.
-Pre-repair head: 1f547dd5cd191f91979c5df9655dde82b9071b3e
-Candidate SHA: 5bb0c6f169503719b8e40da6d11f9bd0c04ca68b
-Manifest binding commit records that SHA and does not change source. Its parent is the candidate.
-origin/dev: 9f918e79dddca71b060e691d4a96be66576633a8
-behind_by: 2 (d8bb42a4, 9f918e79). Not rebased and not merged.
+Builder: Codex
+Repair target: PR #1290, feat/wo-harness-overseer-review-sandbox-01-repair
+Functional candidate SHA: 8eac623da75746e767acc8448bf91b4dd4cf9c08
+Fetched origin/dev: 7a4b6438fc16696707b736cd160cc1861d7ffacb
+Merge base: 7a4b6438fc16696707b736cd160cc1861d7ffacb
+Persisted runScopeSha: 7a4b6438fc16696707b736cd160cc1861d7ffacb
+Authority proof: git merge-base --is-ancestor runScopeSha merge-base exited 0
+Custody: local HEAD, remote repair branch, and live PR #1290 head matched f7c932ba99c9fa13cd1e17ac6c60a746c3d05bb3 before implementation; exactly one open PR used the branch and its base was dev.
 
 Files modified:
 
+- .github/workflows/test.yml
+- packages/overseer/src/**tests**/merge-candidate-discovery.test.ts
+- packages/overseer/src/**tests**/merge-execution-bridge.test.ts
+- packages/overseer/src/**tests**/pr-review-sandbox-merge-qualification.test.ts
+- packages/overseer/src/**tests**/pr-review-sandbox.test.ts
+- packages/overseer/src/merge-candidate-discovery.ts
+- packages/overseer/src/merge-execution-bridge.ts
+- packages/overseer/src/pr-review-ingest.ts
 - packages/overseer/src/pr-review-wiring.ts
-- `packages/overseer/src/__tests__/pr-review-sandbox.test.ts`
+- packages/server/src/dispatch/review-worker-clock.ts
+- packages/server/src/dispatch/review-worker-sandbox.test.ts
 - scripts/overseer-review-sandbox-smoke.ts
-
-Files created:
-
+- scripts/overseer-reviewer-broker.ts
 - artifacts/manifests/wo-harness-overseer-review-sandbox-01.md
 
-Files intentionally unchanged:
+Validation:
 
-- packages/overseer/src/judge-transport.ts (no documented Codex 0.153.3 mode qualifies)
-- buildJudgeTransport argv unchanged
+- Stop 1: review_incomplete count 4.
+- Stop 2: 22 pass / 22 total, zero failures and zero skips.
+- Stop 3: ASCII checks produced no output.
+- Stop 4: not run outside the final image; the required broker is intentionally unavailable here.
+- Stop 5: 14 pass / 14 total, zero failures.
+- Stop 6: type-check exited 0.
+- Stop 7: pending final-image CI; this builder has no Docker executable and records no substitute evidence.
+- Stop 8: focused review_incomplete tests passed.
+- Stop 10: no errexit-exempt negative probes found.
+- Stop 11: negative_probe_success_fails_closed collected and passed.
+- Stop 12: all three named regressions collected and passed.
+- Stop 13: all three named regressions collected and passed; g+rwX count 0.
+- Stop 14 source assertions: workflow contains false []; this manifest names the functional candidate.
+- Extended merge/worker/sandbox regression command passed with zero failures.
 
-Capability blocker (nonmergeable, VALIDATION is not PASS):
-Codex CLI 0.153.3 help does not document an enforcing mode, used with --enable use_legacy_landlock, that denies unrelated filesystem reads, unrelated writes, and network without a new user namespace, extra capabilities, root, or host/container policy changes.
-codex exec --help sandbox values: read-only, workspace-write, danger-full-access. None of that text says unrelated reads fail. danger-full-access was not selected.
-codex sandbox --help documents --sandbox-state-readable-root (add a readable root to supplied state) and --sandbox-state-disable-network (requires supplied sandbox state). It does not document a self-contained profile that denies unrelated reads.
-codex features list: use_legacy_landlock deprecated false; use_linux_sandbox_bwrap removed false.
-judge-transport.ts was not changed. The negative smoke probe was not removed, skipped, or weakened.
-
-Native smoke:
-Command: bun run scripts/overseer-review-sandbox-smoke.ts
-uid: 1001 (appuser)
-Codex: 0.153.3
-Policy argv: codex --enable use_legacy_landlock -C <checkout> sandbox --
-Result: exit 1
-Error: sandbox_forbidden_read_succeeded at scripts/overseer-review-sandbox-smoke.ts:152
-Outside read, outside write, and loopback controls ran as uid 1001 before the sandbox attempts. The permitted in-sandbox git inspection and test -r allowed.txt succeeded. The unrelated read then exited 0. Unrelated reads are not confined.
-docker is not installed in this builder, so docker exec --user appuser archon-smoke could not run. The command above is the direct uid-1001 run of the same script. This is not a final-image PASS.
-
-Stop 1:
-Command: grep -c 'review_incomplete' packages/overseer/src/pr-review-submit.ts
-Result: 4 (at least 1)
-
-Stop 2:
-Command: `bun test --timeout 60000 packages/overseer/src/__tests__/pr-review-sandbox.test.ts packages/overseer/src/__tests__/pr-review-sandbox-merge-qualification.test.ts packages/server/src/dispatch/review-worker-sandbox.test.ts`
-Result: 12 pass / 12 total, 0 fail, 0 skip
-
-- pr-review-sandbox.test.ts: 8 pass (2 existing hand-built approval tests plus 6 caller tests)
-- pr-review-sandbox-merge-qualification.test.ts: 2 pass
-- review-worker-sandbox.test.ts: 2 pass
-
-Caller proof behavior:
-
-- A tracked post-commit edit, an untracked file, and a gitignored untracked file each prevent codex sandbox argv spawn, return review_incomplete, and post zero APPROVE reviews.
-- A declared check that appends to a tracked file and exits 0 produces no execution proof and does not qualify the head. The spawn wrapper is test simulation, not native enforcement.
-- A non-mutating check can reach the model, and an evaluate override that then appends to a tracked file and returns APPROVE does not qualify the head. Proof is discarded.
-- Synthetic canaries BDC_REVIEW_CANARY, GH_TOKEN, GITHUB_TOKEN, OPENAI_API_KEY, GITHUB_APP_PRIVATE_KEY, and OVERSEER_REVIEW_WEBHOOK_SECRET are absent from recorded git environments and from captured Codex spawn environments. The parent environment is unchanged afterward.
-
-Untrusted git, inspection, and check subprocesses receive only PATH copied from the parent plus HOME, CODEX_HOME, and TMPDIR set to a private mkdtemp scratch. Model authentication is unchanged.
-
-Stop 3:
-Command: LC_ALL=C grep -n '[^ -~]' on judge-transport.ts, pr-review-evaluator.ts, pr-review-wiring.ts, pr-review-submit.ts, github-real-deps.ts, review-worker-clock.ts, pr-review-sandbox.test.ts, and scripts/overseer-review-sandbox-smoke.ts
-Result: no output, exit 1
-
-Stop 5:
-Command: `bun test --timeout 60000 packages/overseer/src/__tests__/judge-transport.test.ts`
-Result: 14 pass / 14 total, 0 fail. Non-PR buildJudgeTransport behavior preserved.
-
-Stop 6:
-Command: bun run type-check
-Result: exit 0
-
-VALIDATION: FAIL
-Native uid-1001 smoke did not exit 0. Unrelated reads are not confined. Do not merge.
-Runtime verification: author ran the local uid-1001 smoke; final-image CI remains required; later activation is separate.
+Native binding required in final-image CI: UID 1002, Codex 0.153.3, use_legacy_landlock, no added privileges, and the real broker smoke. No native result is fabricated by this manifest.
+Runtime verification: post-activation Stop 9 not run; activation was not authorized.
 Vercel deployment: N/A (internal harness)
-PRs: https://github.com/thinmansoftware/bdc-harness/pull/1290
+PR: https://github.com/thinmansoftware/bdc-harness/pull/1290
+VALIDATION: PENDING FINAL-IMAGE CI
