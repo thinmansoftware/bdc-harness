@@ -444,7 +444,7 @@ describe('canonical-stage-authority', () => {
       expect(selected.scope.stageId).toBe('api');
       expect(selected.scope.commands).toEqual(['bash ./api.sh']);
       expect(selected.scope.otherStage).toEqual(['bash ./web.sh']);
-      expect(selected.scope.unresolved).toBe(true);
+      expect(selected.scope.unresolved).toBe(false);
     }
     const dup = scopeEvidence(
       `\`\`\`yaml\n${stageBody(`${shop}\n${oneStage('api', 'thinmansoftware/other', 'bash ./x.sh')}`)}\n\`\`\`\n`,
@@ -1057,12 +1057,20 @@ describe('hermetic-fresh-attempt', () => {
         resolvedArgv: ['grep', '-c', 'base', 'README'],
         exitCode: 0,
         signal: null,
+        passed: null,
+        total: null,
+        status: 'PASSED',
+        reason: 'passed',
       },
       {
         argv: ['wc', '-l'],
         resolvedArgv: ['wc', '-l'],
         exitCode: 0,
         signal: null,
+        passed: null,
+        total: null,
+        status: 'PASSED',
+        reason: 'passed',
       },
     ]);
     rmSync(cwd, { recursive: true, force: true });

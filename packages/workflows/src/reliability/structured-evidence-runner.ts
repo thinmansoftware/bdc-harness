@@ -38,6 +38,10 @@ const chainStepSchema = z.object({
   resolvedArgv: z.array(z.string()),
   exitCode: z.number().int().nullable(),
   signal: z.string().nullable(),
+  passed: z.number().int().nullable(),
+  total: z.number().int().nullable(),
+  status: evidenceStatusSchema,
+  reason: z.string(),
 });
 
 export const attemptMemberSchema = z.object({
@@ -317,19 +321,6 @@ function pathUnder(file: string, top: string): boolean {
   }
 }
 
-function upwardHarnessRoot(cwd: string): string | null {
-  let current = resolve(cwd);
-  for (;;) {
-    if (existsSync(join(current, '.git'))) {
-      const origin = gitOrigin(current);
-      if (isHarnessOrigin(origin) && isHarnessRoot(current)) return current;
-    }
-    const parent = dirname(current);
-    if (parent === current) return null;
-    current = parent;
-  }
-}
-
 export function resolveTrustedRunnerFile(cwd: string): string | null {
   const candidates: string[] = [];
   const override = process.env.HARNESS_ROOT_OVERRIDE;
@@ -345,8 +336,6 @@ export function resolveTrustedRunnerFile(cwd: string): string | null {
   candidates.push('/.archon/workspaces/thinmansoftware/bdc-harness/source');
   const archonHome = join(homedir(), '.archon');
   candidates.push(join(archonHome, 'workspaces/thinmansoftware/bdc-harness/source'));
-  const walked = upwardHarnessRoot(cwd);
-  if (walked) candidates.push(walked);
   const product = productWorktreeTop(cwd);
   for (const root of candidates) {
     if (!root || !isHarnessRoot(root)) continue;
@@ -368,12 +357,23 @@ export function trustedSelfMatches(cwd: string): boolean {
   }
 }
 
+const generatedIdentityPaths = new Set<string>();
+
+function registerGeneratedPath(cwd: string, path: string): void {
+  const directory = /[\\/]$/.test(path);
+  const rel = relative(cwd, resolve(path)).replace(/\\/g, '/');
+  if (rel && rel !== '..' && !rel.startsWith('../')) {
+    generatedIdentityPaths.add(directory ? `${rel}/` : rel);
+  }
+}
+
 function excludedIdentityPath(path: string): boolean {
   const norm = path.replace(/\\/g, '/');
   if (norm === '.ser-attempts' || norm.startsWith('.ser-attempts/')) return true;
-  if (norm.includes('/evidence/') || norm.startsWith('evidence/')) return true;
-  if (norm.includes('/artifacts/') || norm.startsWith('artifacts/')) return true;
-  if (norm.endsWith('stop-tests.log') || norm.endsWith('stop-greps.log')) return true;
+  if (generatedIdentityPaths.has(norm)) return true;
+  for (const generated of generatedIdentityPaths) {
+    if (generated.endsWith('/') && norm.startsWith(generated)) return true;
+  }
   return false;
 }
 
@@ -421,7 +421,11 @@ export function testedTreeIdentity(cwd: string): TreeIdentity {
 
 function attemptsDirectory(cwd: string): string {
   const base = process.env.ARTIFACTS_DIR;
-  if (base && base.length > 0) return join(base, 'evidence', 'attempts');
+  if (base && base.length > 0) {
+    const directory = join(base, 'evidence', 'attempts');
+    registerGeneratedPath(cwd, `${directory}/`);
+    return directory;
+  }
   return join(
     tmpdir(),
     'ser-attempts',
@@ -739,6 +743,10 @@ export function checkAttemptRecord(
   cwd: string,
   liveAuthority: EvidenceAuthority
 ): { ok: true } | { ok: false; reason: string } {
+  attemptsDirectory(cwd);
+  for (const member of recorded.members) {
+    if (member.logPath) registerGeneratedPath(cwd, member.logPath);
+  }
   const parsed = evidenceAttemptSchema.safeParse(recorded);
   if (!parsed.success) return { ok: false, reason: 'malformed' };
   if (recorded.schemaVersion !== 1) return { ok: false, reason: 'schema' };
@@ -1551,6 +1559,7 @@ export function runTestCommands(
   logPath: string,
   otherStage: readonly string[] = []
 ): TestRunSummary {
+  registerGeneratedPath(cwd, logPath);
   if (!trustedSelfMatches(cwd) && !trustedSelfMatches(process.cwd())) {
     mkdirSync(dirname(logPath), { recursive: true });
     const members = commands.map(command => {
@@ -1636,6 +1645,7 @@ export function runTestCommands(
     member.cwd = workCwd;
     let rc = 0;
     let signal: string | null = null;
+    let segmentEvidenceInvalid = false;
     for (const segment of normalized.segments) {
       if (
         segment[0] === 'node' &&
@@ -1646,7 +1656,16 @@ export function runTestCommands(
         rc = 1;
         member.status = 'NEVER_RAN';
         member.reason = 'node-test-path';
-        member.chain.push({ argv: segment, resolvedArgv: segment, exitCode: 1, signal: null });
+        member.chain.push({
+          argv: segment,
+          resolvedArgv: segment,
+          exitCode: 1,
+          signal: null,
+          passed: null,
+          total: null,
+          status: 'NEVER_RAN',
+          reason: 'node-test-path',
+        });
         break;
       }
       if (segment[0] === 'python' && !commandExists('python3', env)) {
@@ -1662,6 +1681,10 @@ export function runTestCommands(
           resolvedArgv: member.resolvedArgv,
           exitCode: 127,
           signal: null,
+          passed: null,
+          total: null,
+          status: 'NEVER_RAN',
+          reason: 'python3-unavailable',
         });
         break;
       }
@@ -1675,11 +1698,36 @@ export function runTestCommands(
       if (result.stderr.length > 0) output.push(result.stderr);
       rc = result.code;
       signal = result.signal;
+      const segmentCounts = parseCounts(`${result.stdout}${result.stderr}`);
+      let segmentStatus: EvidenceStatus = 'PASSED';
+      let segmentReason = 'passed';
+      if (result.missing) {
+        segmentStatus = 'NEVER_RAN';
+        segmentReason = 'unavailable';
+      } else if (result.timedOut || result.code !== 0 || result.signal) {
+        segmentStatus = 'FAILED';
+        segmentReason = result.timedOut ? 'timeout' : result.signal ? 'signal' : 'nonzero';
+      } else if (!segmentCounts) {
+        segmentStatus = 'COUNTS_UNPARSED';
+        segmentReason = 'counts_unparsed';
+      } else if (
+        segmentCounts.total <= 0 ||
+        segmentCounts.passed < 0 ||
+        segmentCounts.passed !== segmentCounts.total
+      ) {
+        segmentStatus = 'FAILED';
+        segmentReason = segmentCounts.total <= 0 ? 'zero-count' : 'count-mismatch';
+      }
+      if (segmentStatus !== 'PASSED') segmentEvidenceInvalid = true;
       member.chain.push({
         argv: segment,
         resolvedArgv: rewritten.argv,
         exitCode: result.code,
         signal: result.signal,
+        passed: segmentCounts?.passed ?? null,
+        total: segmentCounts?.total ?? null,
+        status: segmentStatus,
+        reason: segmentReason,
       });
       if (result.missing) {
         member.status = 'NEVER_RAN';
@@ -1713,6 +1761,10 @@ export function runTestCommands(
         member.status = 'FAILED';
         if (member.reason === 'planned') member.reason = signal ? 'signal' : 'nonzero';
         testFailed = true;
+      } else if (segmentEvidenceInvalid) {
+        const bad = member.chain.find(step => step.status !== 'PASSED');
+        member.status = bad?.status ?? 'INCOMPLETE';
+        member.reason = bad?.reason ?? 'incomplete-segment';
       } else if (!counts) {
         member.status = 'COUNTS_UNPARSED';
         member.reason = 'counts_unparsed';
@@ -2209,6 +2261,10 @@ export function scopeEvidence(
   if (authority.targetBranch && authority.targetBranch !== chosen.target_branch) {
     return { ok: false, message: 'FAIL: authority target branch mismatch\n' };
   }
+  const declaredGlobalAssertions = extractGrepAssertions(spec).some(row => {
+    const match = /^DECLARED\t(\d+)$/.exec(row);
+    return match ? Number(match[1]) > 0 : false;
+  });
   return {
     ok: true,
     scope: {
@@ -2218,7 +2274,7 @@ export function scopeEvidence(
       otherStage: stages
         .filter(stage => stage.id !== chosen?.id)
         .flatMap(stage => stage.verify_commands),
-      unresolved: stages.length > 1,
+      unresolved: stages.length > 1 && declaredGlobalAssertions,
     },
   };
 }
@@ -2357,6 +2413,10 @@ function runCli(): number {
     }
     if (command === 'run-greps') {
       if (!requireTrustedCli()) return 127;
+      const priorTests = readKindAttempt(process.cwd(), 'tests');
+      for (const member of priorTests?.members ?? []) {
+        if (member.logPath) registerGeneratedPath(process.cwd(), member.logPath);
+      }
       const lines = readStdin().split('\n');
       let declared = 0;
       let executed = 0;
@@ -2409,6 +2469,10 @@ function runCli(): number {
           resolvedArgv: [...step.argv],
           exitCode: step.exitCode,
           signal: step.signal,
+          passed: null,
+          total: null,
+          status: step.exitCode === 0 && !step.signal ? 'PASSED' : 'FAILED',
+          reason: step.exitCode === 0 && !step.signal ? 'passed' : 'assertion-error',
         }));
         const last = member.chain[member.chain.length - 1];
         member.resolvedArgv = last ? [...last.resolvedArgv] : [];

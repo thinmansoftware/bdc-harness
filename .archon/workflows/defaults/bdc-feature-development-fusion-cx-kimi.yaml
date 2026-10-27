@@ -1765,7 +1765,7 @@ nodes:
         if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
           override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE" 2>/dev/null && pwd -P || true)"
           case "$override_real" in
-            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/*)
+            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source)
               root="$override_real"
               pkg="$root/packages/workflows/package.json"
               if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
@@ -1781,23 +1781,6 @@ nodes:
             printf '%s' "$c"
             return 0
           fi
-        done
-        d="$(pwd)"
-        while [ -n "$d" ] && [ "$d" != "/" ]; do
-          if [ -e "$d/.git" ]; then
-            url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
-            case "$url" in
-              *github.com*thinmansoftware/bdc-harness*|*git@github.com:thinmansoftware/bdc-harness*)
-                pkg="$d/packages/workflows/package.json"
-                if [ -f "$d/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-                  printf '%s' "$d"
-                  return 0
-                fi
-                ;;
-            esac
-            break
-          fi
-          d="$(dirname "$d")"
         done
         return 1
       }
@@ -2156,7 +2139,7 @@ nodes:
         if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
           override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE" 2>/dev/null && pwd -P || true)"
           case "$override_real" in
-            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/*)
+            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source)
               root="$override_real"
               pkg="$root/packages/workflows/package.json"
               if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
@@ -2172,23 +2155,6 @@ nodes:
             printf '%s' "$c"
             return 0
           fi
-        done
-        d="$(pwd)"
-        while [ -n "$d" ] && [ "$d" != "/" ]; do
-          if [ -e "$d/.git" ]; then
-            url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
-            case "$url" in
-              *github.com*thinmansoftware/bdc-harness*|*git@github.com:thinmansoftware/bdc-harness*)
-                pkg="$d/packages/workflows/package.json"
-                if [ -f "$d/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-                  printf '%s' "$d"
-                  return 0
-                fi
-                ;;
-            esac
-            break
-          fi
-          d="$(dirname "$d")"
         done
         return 1
       }
@@ -4132,7 +4098,7 @@ nodes:
         if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
           override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE" 2>/dev/null && pwd -P || true)"
           case "$override_real" in
-            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/*)
+            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source)
               root="$override_real"
               pkg="$root/packages/workflows/package.json"
               if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
@@ -4148,23 +4114,6 @@ nodes:
             printf '%s' "$c"
             return 0
           fi
-        done
-        d="$(pwd)"
-        while [ -n "$d" ] && [ "$d" != "/" ]; do
-          if [ -e "$d/.git" ]; then
-            url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
-            case "$url" in
-              *github.com*thinmansoftware/bdc-harness*|*git@github.com:thinmansoftware/bdc-harness*)
-                pkg="$d/packages/workflows/package.json"
-                if [ -f "$d/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-                  printf '%s' "$d"
-                  return 0
-                fi
-                ;;
-            esac
-            break
-          fi
-          d="$(dirname "$d")"
         done
         return 1
       }
@@ -4285,7 +4234,7 @@ nodes:
         if [ -n "${HARNESS_ROOT_OVERRIDE:-}" ]; then
           override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE" 2>/dev/null && pwd -P || true)"
           case "$override_real" in
-            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/*)
+            /app|/.archon/workspaces/thinmansoftware/bdc-harness/source)
               root="$override_real"
               pkg="$root/packages/workflows/package.json"
               if [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
@@ -4301,23 +4250,6 @@ nodes:
             printf '%s' "$c"
             return 0
           fi
-        done
-        d="$(pwd)"
-        while [ -n "$d" ] && [ "$d" != "/" ]; do
-          if [ -e "$d/.git" ]; then
-            url="$(git -C "$d" remote get-url origin 2>/dev/null || true)"
-            case "$url" in
-              *github.com*thinmansoftware/bdc-harness*|*git@github.com:thinmansoftware/bdc-harness*)
-                pkg="$d/packages/workflows/package.json"
-                if [ -f "$d/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-                  printf '%s' "$d"
-                  return 0
-                fi
-                ;;
-            esac
-            break
-          fi
-          d="$(dirname "$d")"
         done
         return 1
       }

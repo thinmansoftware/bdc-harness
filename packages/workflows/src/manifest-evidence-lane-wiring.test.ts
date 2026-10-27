@@ -104,9 +104,8 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
     expect(lanes.length).toBeGreaterThan(0);
     for (const content of lanes) {
       expect(content).toContain('override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE"');
-      expect(content).toContain(
-        '/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/archon/*)'
-      );
+      expect(content).toContain('/app|/.archon/workspaces/thinmansoftware/bdc-harness/source)');
+      expect(content).not.toContain('bdc-harness/worktrees/archon/*)');
       expect(content).not.toContain(
         'git -C "$HARNESS_ROOT_OVERRIDE" remote get-url origin 2>/dev/null'
       );
