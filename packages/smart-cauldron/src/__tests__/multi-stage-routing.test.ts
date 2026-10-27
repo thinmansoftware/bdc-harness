@@ -614,9 +614,9 @@ describe('stall and compatible climb', () => {
     expect(record.attempts[0]?.gateFailReason).toContain('compatible-escalation-unavailable');
   });
 
-  test('a feature-lane binding is not a compatible seat', async () => {
+  test.each(FEATURE_WORKFLOWS)('%s binding is not a compatible seat', async featureWorkflow => {
     const featureBinding = tier('codex', 'bdc-feature-development-codex', {
-      laneWorkflows: { [MULTI_STAGE_WORKFLOW]: 'bdc-feature-development-cursor' },
+      laneWorkflows: { [MULTI_STAGE_WORKFLOW]: featureWorkflow },
     });
     const { opts, state } = options(
       TWO_STAGE_SPEC,

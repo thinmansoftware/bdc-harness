@@ -61,6 +61,8 @@ const execFileAsync = promisify(execFile);
 const MULTI_STAGE_WORKFLOW = 'bdc-multi-stage-development';
 
 const FEATURE_LANE_FALLBACKS: ReadonlySet<string> = new Set([
+  'bdc-feature-development',
+  'bdc-feature-development-zero-open',
   'bdc-feature-development-cursor',
   'bdc-feature-development-codex',
   'bdc-feature-development-fable',
