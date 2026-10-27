@@ -2634,6 +2634,17 @@ export class SqliteAdapter implements IDatabase {
         updated_by TEXT NOT NULL,
         reason TEXT
       );
+
+      -- seat usage readings (migration 064).
+      CREATE TABLE IF NOT EXISTS seat_usage_readings (
+        seat TEXT PRIMARY KEY,
+        used_percent REAL NOT NULL,
+        remaining_percent REAL NOT NULL,
+        resets_at TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        source TEXT NOT NULL,
+        received_at TEXT NOT NULL
+      );
     `);
     getLog().info('db.sqlite_schema_initialized');
   }
