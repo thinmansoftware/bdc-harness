@@ -124,7 +124,10 @@ describe('served lanes', () => {
 
       expect(sha256Hex(await readFile(lanePath))).toBe(sha256Hex(baked));
       const laneAfter = await stat(lanePath);
-      expect(laneAfter.ino).toBe(laneBefore.ino);
+      // The conflict-safe replacement moves the old file aside and writes the
+      // baked bytes to a fresh, exclusively-created inode, so the inode number
+      // changes by design. uid/gid/mode are still preserved.
+      expect(laneAfter.ino).not.toBe(laneBefore.ino);
       expect(laneAfter.uid).toBe(laneBefore.uid);
       expect(laneAfter.gid).toBe(laneBefore.gid);
       expect(laneAfter.mode).toBe(laneBefore.mode);
@@ -260,10 +263,12 @@ describe('served lanes', () => {
         bakedDir,
         history,
         now: NOW,
-        // Fires per-lane immediately before the final hash/mtime/ino read,
-        // after the backup has already been staged. The edit must be caught
-        // by the final verification and preserved, never overwritten.
-        beforeFinalVerify: async filename => {
+        // Fires per-lane AFTER the final verification and AFTER the live path
+        // was freed by the rename-aside -- i.e. in the exact window the old
+        // read-verify-then-write mechanism left exposed. Recreating the file
+        // here must NOT be clobbered: the exclusive ('wx') write must fail and
+        // the concurrent edit must be preserved.
+        afterFinalVerify: async filename => {
           if (filename !== 'lane.yaml') return;
           await writeFile(volumePath, edited);
           const info = await stat(volumePath);
@@ -273,12 +278,15 @@ describe('served lanes', () => {
       });
 
       expect(injected).toBe(true);
+      // The concurrent edit survives verbatim; the baked bytes were refused.
       const liveBytes = await readFile(volumePath);
       expect(Buffer.compare(liveBytes, edited)).toBe(0);
       expect(result.replaced).toEqual([]);
-      expect(result.backup_path).toBeNull();
-      const parentNames = await readdir(parent);
-      expect(parentNames.some(name => name.includes('.bak-'))).toBe(false);
+      // The original pre-image was moved aside before the race, so the backup
+      // directory exists and holds exactly the bytes that were removed.
+      const backupDir = `${volumeDir}.bak-${backupStamp(NOW)}`;
+      expect(result.backup_path).toBe(backupDir);
+      expect(sha256Hex(await readFile(join(backupDir, 'lane.yaml')))).toBe(sha256Hex(stale));
       const uniqueEdit = {
         filename: 'lane.yaml',
         sha256: sha256Hex(edited),
