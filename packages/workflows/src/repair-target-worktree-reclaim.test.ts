@@ -33,14 +33,22 @@ interface RunResult {
   readonly stderr: string;
 }
 
-function bash(script: string, cwd: string, args: string[], env: Record<string, string>): RunResult {
+function bash(
+  script: string,
+  cwd: string,
+  args: string[],
+  env: Record<string, string>,
+  stripArtifacts = false
+): RunResult {
   const dir = mkdtempSync(join(tmpdir(), 'rtw-sh-'));
   const scriptPath = join(dir, 'rtw.sh');
   try {
     writeFileSync(scriptPath, script);
+    const merged: Record<string, string | undefined> = { ...process.env, ...env };
+    if (stripArtifacts) delete merged.ARTIFACTS_DIR;
     const result = Bun.spawnSync(['bash', scriptPath, ...args], {
       cwd,
-      env: { ...process.env, ...env },
+      env: merged,
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -153,13 +161,24 @@ function writeRuns(
   db.close();
 }
 
-function runCheckout(fixture: Fixture, dbPath: string): RunResult {
+function runCheckout(
+  fixture: Fixture,
+  dbPath: string,
+  extraEnv: Record<string, string> = {}
+): RunResult {
   git(['fetch', 'origin', 'refs/heads/feat/x'], fixture.caller);
   const script = `set -euo pipefail\n${RTW_CORE}\nrtw_checkout_repair_branch "$1"\n`;
-  return bash(script, fixture.caller, ['feat/x'], {
-    RTW_RUNS_DB: dbPath,
-    RTW_PROC_ROOT: fixture.procRoot,
-  });
+  return bash(
+    script,
+    fixture.caller,
+    ['feat/x'],
+    {
+      RTW_RUNS_DB: dbPath,
+      RTW_PROC_ROOT: fixture.procRoot,
+      ...extraEnv,
+    },
+    !Object.prototype.hasOwnProperty.call(extraEnv, 'ARTIFACTS_DIR')
+  );
 }
 
 function worktrees(cwd: string): string {
@@ -253,7 +272,7 @@ describe('repair-target worktree reclaim', () => {
         completed_at: utcMinutesAgo(20),
       },
     ]);
-    const result = runCheckout(fixture, fixture.dbPath);
+    const result = runCheckout(fixture, fixture.dbPath, { RTW_HOLDER_WAIT_SECONDS: '1' });
     expect(result.exitCode, show(result)).toBe(1);
     expect(result.stdout).toContain('repair_target_branch_held:');
     expect(worktrees(fixture.caller)).toContain(holder);
@@ -331,7 +350,10 @@ describe('repair-target worktree reclaim', () => {
 
   it('Test 9: idempotent checkout does not reclaim and leaves the other worktree', () => {
     expect(RTW_CORE).not.toContain('worktree prune');
-    expect(RTW_CORE).not.toContain('--force');
+    const forceLines = RTW_CORE.split('\n').filter(line =>
+      line.includes('git worktree remove --force')
+    );
+    expect(forceLines).toHaveLength(1);
     const fixture = makeFixture({ hold: false, withOther: true });
     roots.push(fixture.root);
     const other = holderPath(fixture.other);
@@ -408,7 +430,7 @@ describe('repair-target worktree reclaim', () => {
         completed_at: utcSecondsAgo(15),
       },
     ]);
-    const result = runCheckout(fixture, fixture.dbPath);
+    const result = runCheckout(fixture, fixture.dbPath, { RTW_HOLDER_WAIT_SECONDS: '1' });
     expect(result.exitCode, show(result)).toBe(1);
     expect(result.stderr).toContain('live process cwd under holder');
     expect(worktrees(fixture.caller)).toContain(holder);

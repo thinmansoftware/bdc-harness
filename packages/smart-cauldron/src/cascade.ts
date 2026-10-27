@@ -105,6 +105,140 @@ export interface CascadeDeps {
    * A rejection or timeout fails open (usage null) and never holds the fire.
    */
   seatUsage?: () => Promise<SeatUsageSnapshot>;
+  /** Run-row reader for the teardown wait. Defaults to GET /api/workflows/runs/:id. */
+  readRunDetail?: (runId: string) => Promise<PriorRunDetail | null>;
+  /** Sleep used by the teardown poll. Defaults to a real timer. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Clock for the teardown deadline. Defaults to Date.now. */
+  now?: () => number;
+}
+
+export interface PriorRunDetail {
+  completedAt: string | null;
+  metadata: Record<string, unknown>;
+  error: string | null;
+}
+
+const TEARDOWN_POLL_MS = 5000;
+const PREDEPLOY_TEARDOWN_AGE_MS = 600_000;
+
+function teardownWaitMs(): number {
+  const raw = process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS;
+  if (raw === undefined || raw === '') return 180_000;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 180_000;
+}
+
+function parseTimestamp(value: string): number {
+  const direct = Date.parse(value);
+  if (!Number.isNaN(direct)) return direct;
+  const normalized = value.includes('T') ? value : `${value.replace(' ', 'T')}Z`;
+  const parsed = Date.parse(normalized);
+  return Number.isNaN(parsed) ? Number.NaN : parsed;
+}
+
+/**
+ * Wait until the previous attempt's run row has metadata.teardown_confirmed_at,
+ * or the row has no teardown key and completed_at is older than 600s.
+ * Survivors, a missing run id, failed reads through the deadline, or an
+ * expired wait all return unconfirmed.
+ */
+export async function waitForPriorTeardown(args: {
+  runId: string | null;
+  readRun: (runId: string) => Promise<PriorRunDetail | null>;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  waitMs?: number;
+  pollMs?: number;
+}): Promise<'confirmed' | 'unconfirmed'> {
+  if (!args.runId) return 'unconfirmed';
+  const waitMs = args.waitMs ?? teardownWaitMs();
+  const pollMs = args.pollMs ?? TEARDOWN_POLL_MS;
+  const deadline = args.now() + waitMs;
+  while (true) {
+    let detail: PriorRunDetail | null = null;
+    let failed = false;
+    try {
+      detail = await args.readRun(args.runId);
+    } catch {
+      failed = true;
+    }
+    if (!failed && detail) {
+      const metadata = detail.metadata ?? {};
+      if (Object.prototype.hasOwnProperty.call(metadata, 'teardown_survivors')) {
+        return 'unconfirmed';
+      }
+      const confirmed = metadata.teardown_confirmed_at;
+      if (typeof confirmed === 'string' && confirmed.length > 0) return 'confirmed';
+      const hasTeardownKey = Object.prototype.hasOwnProperty.call(
+        metadata,
+        'teardown_confirmed_at'
+      );
+      if (!hasTeardownKey && detail.completedAt) {
+        const completedMs = parseTimestamp(detail.completedAt);
+        if (!Number.isNaN(completedMs) && args.now() - completedMs > PREDEPLOY_TEARDOWN_AGE_MS) {
+          return 'confirmed';
+        }
+      }
+    }
+    const now = args.now();
+    if (now >= deadline) return 'unconfirmed';
+    const nap = Math.min(pollMs, deadline - now);
+    if (nap <= 0) return 'unconfirmed';
+    await args.sleep(nap);
+  }
+}
+
+async function defaultReadRunDetail(
+  runId: string,
+  apiBaseUrl: string,
+  token: string
+): Promise<PriorRunDetail | null> {
+  const response = await fetch(`${apiBaseUrl}/api/workflows/runs/${runId}`, {
+    headers: { 'x-archon-operator-token': token },
+  });
+  if (!response.ok) {
+    throw new Error(`run detail HTTP ${String(response.status)}`);
+  }
+  const body = (await response.json()) as {
+    run?: {
+      completed_at?: string | null;
+      metadata?: Record<string, unknown> | null;
+    };
+  };
+  if (!body.run) return null;
+  const metadata = body.run.metadata ?? {};
+  const error = typeof metadata.error === 'string' ? metadata.error : null;
+  return {
+    completedAt: body.run.completed_at ?? null,
+    metadata,
+    error,
+  };
+}
+
+function repairCheckoutReasonLine(poll: PollResult, verdict: GateVerdict): string {
+  const errorText = typeof poll.rawMetadata.error === 'string' ? poll.rawMetadata.error : '';
+  const blob = `${errorText}\n${verdict.reason}`;
+  for (const line of blob.split('\n')) {
+    if (
+      line.includes('repair_gate_closed: checkout_failed') ||
+      line.includes('repair_target_branch_held') ||
+      line.includes('repair_checkout_failed')
+    ) {
+      return line;
+    }
+  }
+  return verdict.reason;
+}
+
+function isRepairCheckoutNoClimb(poll: PollResult, verdict: GateVerdict): boolean {
+  if (poll.rawMetadata.terminal_cause === 'repair_checkout_failed') return true;
+  const errorText = typeof poll.rawMetadata.error === 'string' ? poll.rawMetadata.error : '';
+  const blob = `${errorText}\n${verdict.reason}`;
+  return (
+    blob.includes('repair_gate_closed: checkout_failed') ||
+    blob.includes('repair_target_branch_held')
+  );
 }
 
 const SEAT_USAGE_READ_TIMEOUT_MS = 5000;
@@ -303,6 +437,17 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         })
       : createRecord);
   const cancelImpl = opts.deps?.cancel ?? cancelRun;
+  const readRunImpl =
+    opts.deps?.readRunDetail ??
+    ((runId: string): Promise<PriorRunDetail | null> =>
+      defaultReadRunDetail(runId, apiBaseUrl, token ?? process.env.ARCHON_OPERATOR_TOKEN ?? ''));
+  const sleepImpl =
+    opts.deps?.sleep ??
+    ((ms: number): Promise<void> =>
+      new Promise(resolve => {
+        setTimeout(resolve, ms);
+      }));
+  const nowImpl = opts.deps?.now ?? ((): number => Date.now());
   const specRepairImpl = opts.deps?.specRepair ?? defaultSpecRepair;
   const superviseFailureImpl = opts.deps?.superviseFailure;
   const findWoClaimImpl =
@@ -870,6 +1015,31 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         }
       }
 
+      if (attempts.length > 1) {
+        const priorAttempt = attempts[attempts.length - 2];
+        const teardown = await waitForPriorTeardown({
+          runId: priorAttempt?.runId ?? null,
+          readRun: readRunImpl,
+          sleep: sleepImpl,
+          now: nowImpl,
+        });
+        if (teardown !== 'confirmed') {
+          attempt.outcome = 'gate-failed';
+          attempt.gateFailReason = 'teardown_unconfirmed';
+          attempt.completedAt = new Date().toISOString();
+          status = 'blocked';
+          await emitEscalation({
+            errorClass: 'validator_rejected',
+            woId,
+            reason: `teardown_unconfirmed: run ${priorAttempt?.runId ?? 'missing'} did not confirm teardown`,
+            overseerPermit: opts.overseerPermit,
+            runId: priorAttempt?.runId ?? null,
+          });
+          await checkpoint();
+          break;
+        }
+      }
+
       // Fire the WO on this tier
       const fireResult: FireResult = await fireImpl({
         workflowName: tier.workflowName,
@@ -1127,6 +1297,21 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           await checkpoint();
           break;
         }
+      }
+
+      if (isRepairCheckoutNoClimb(pollResult, verdict)) {
+        const reasonLine = repairCheckoutReasonLine(pollResult, verdict);
+        status = 'blocked';
+        attempt.gateFailReason = 'checkout_failed_no_climb';
+        await emitEscalation({
+          errorClass: 'validator_rejected',
+          woId,
+          reason: `checkout_failed_no_climb: run ${fireResult.runId ?? 'unknown'}: ${reasonLine}`,
+          overseerPermit: opts.overseerPermit,
+          runId: fireResult.runId,
+        });
+        await checkpoint();
+        break;
       }
 
       // Build informed-climb context for the next tier
