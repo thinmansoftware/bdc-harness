@@ -273,6 +273,39 @@ describe('dispatchBackgroundWorkflow declared base-lane authority', () => {
     expect(sent).not.toContain('Dispatching workflow');
   });
 
+  test('extra leading whitespace on Base branch is refused before origin lookup', async () => {
+    freezeWithSpec('Base branch:  dev\n');
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
+
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
+      /base_branch_not_single/
+    );
+    expect(execFileCalls.length).toBe(0);
+    expect(mockResolve).toHaveBeenCalledTimes(0);
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).toContain('pre_dispatch_refusal:');
+    expect(sent).toContain('base_branch_not_single');
+    expect(sent).toContain(' dev');
+    expect(sent).not.toContain('Dispatching workflow');
+  });
+
+  test('a tab after Base branch is refused before origin lookup', async () => {
+    freezeWithSpec('Base branch:\tdev\n');
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
+
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
+      /base_branch_not_single/
+    );
+    expect(execFileCalls.length).toBe(0);
+    expect(mockResolve).toHaveBeenCalledTimes(0);
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).toContain('pre_dispatch_refusal:');
+    expect(sent).toContain('base_branch_not_single');
+    expect(sent).not.toContain('Dispatching workflow');
+  });
+
   test('trailing whitespace on Base branch is refused before origin lookup', async () => {
     freezeWithSpec('Base branch: dev \n');
     const platform = new MockPlatformAdapter();

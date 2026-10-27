@@ -308,15 +308,17 @@ function stripEnclosingBackticks(value: string): string {
  * Full remainder of a declared base-branch line.
  * parseDeclaredBaseBranch keeps only the first token. This keeps the whole value
  * so a multi-token line is rejected before dispatch.
+ * One ASCII space after the label is the separator. Any other whitespace stays in
+ * the value, so "Base branch:  dev" fails the single-branch check.
  * Returns undefined when the spec declares no base branch.
  */
 function extractRawDeclaredBaseBranch(spec: Uint8Array): string | undefined {
   const text = new TextDecoder().decode(spec);
   if (text.length === 0) return undefined;
   const patterns = [
-    /^Base branch:[ \t]*(.*)$/m,
-    /\*\*Base branch:\*\*[ \t]*(.*)$/m,
-    /^base_branch:[ \t]*(.*)$/m,
+    /^Base branch: ?(.*)$/m,
+    /\*\*Base branch:\*\* ?(.*)$/m,
+    /^base_branch: ?(.*)$/m,
   ];
   for (const pattern of patterns) {
     const match = pattern.exec(text);
