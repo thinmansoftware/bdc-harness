@@ -323,7 +323,6 @@ import {
   fuelglassReadingGetResponseSchema,
   fuelglassReadingPostResponseSchema,
   fuelglassReadingPushBodySchema,
-  fuelglassReadingPushOpenBodySchema,
   fuelglassSeatsResponseSchema,
 } from './schemas/fuelglass.schemas';
 import {
@@ -2014,8 +2013,14 @@ const postFuelglassReadingRoute = createRoute({
   tags: ['Admin'],
   summary: 'Store a desktop-pushed cursor seat reading',
   request: {
+    // Ref, not the Zod schema: OpenAPI still publishes the strict six fields,
+    // and no body validator runs before the handler's raw credential scan.
     body: {
-      content: { 'application/json': { schema: fuelglassReadingPushOpenBodySchema } },
+      content: {
+        'application/json': {
+          schema: { $ref: '#/components/schemas/FuelglassReadingPushBody' },
+        },
+      },
       required: true,
     },
   },
@@ -2763,6 +2768,9 @@ export function registerApiRoutes(
   canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot,
   dispatchMailboxActorResolvedHook?: () => Promise<void>
 ): void {
+  // The readings route refs this component instead of validating with it.
+  app.openAPIRegistry.register('FuelglassReadingPushBody', fuelglassReadingPushBodySchema);
+
   function apiError(
     c: Context,
     // 429 is here for the expectation front door's per-registrant daily cap

@@ -377,6 +377,52 @@ describe('fuelglass pushed readings', () => {
     expect(body.max_age_minutes).toBe(30);
   });
 
+  test('OpenAPI publishes the strict six-field push schema', async () => {
+    const response = await app.request('/api/openapi.json');
+    expect(response.status).toBe(200);
+    const spec = (await response.json()) as {
+      paths: Record<
+        string,
+        {
+          post?: {
+            requestBody?: {
+              content?: Record<string, { schema?: { $ref?: string } }>;
+            };
+          };
+        }
+      >;
+      components: {
+        schemas: Record<
+          string,
+          {
+            type?: string;
+            additionalProperties?: boolean;
+            required?: string[];
+            properties?: Record<string, { type?: string }>;
+          }
+        >;
+      };
+    };
+    expect(
+      spec.paths['/api/fuelglass/readings']?.post?.requestBody?.content?.['application/json']
+        ?.schema
+    ).toEqual({ $ref: '#/components/schemas/FuelglassReadingPushBody' });
+    expect(spec.components.schemas.FuelglassReadingPushOpenBody).toBeUndefined();
+    expect(spec.components.schemas.FuelglassReadingPushBody).toEqual({
+      type: 'object',
+      additionalProperties: false,
+      required: ['seat', 'used_percent', 'remaining_percent', 'resets_at', 'observed_at', 'source'],
+      properties: {
+        seat: { type: 'string' },
+        used_percent: { type: 'number' },
+        remaining_percent: { type: 'number' },
+        resets_at: { type: 'string' },
+        observed_at: { type: 'string' },
+        source: { type: 'string' },
+      },
+    });
+  });
+
   test('above-cutoff push blocks the next gate decision before cache expiry', async () => {
     resetSeatUsageCacheForTests();
     const primed = await readSeat('cursor');

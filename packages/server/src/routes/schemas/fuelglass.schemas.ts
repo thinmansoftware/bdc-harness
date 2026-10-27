@@ -96,19 +96,14 @@ const READING_FIELDS = {
 } as const;
 
 /**
- * Strict six-field payload. The route declares a permissive body so this schema
- * runs only after the handler's raw-body checks.
+ * Strict six-field payload. The readings route publishes this component and
+ * does not attach it as request middleware: the handler scans the raw JSON
+ * for credentials before safeParse.
  */
 export const fuelglassReadingPushBodySchema = z
   .object(READING_FIELDS)
   .strict()
   .openapi('FuelglassReadingPushBody');
-
-/** Permissive OpenAPI body. Extra keys stay intact for the handler to reject. */
-export const fuelglassReadingPushOpenBodySchema = z
-  .object({})
-  .passthrough()
-  .openapi('FuelglassReadingPushOpenBody');
 
 export const fuelglassReadingRecordSchema = z
   .object({
