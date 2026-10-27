@@ -4340,6 +4340,7 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
     const flushSpy = spyOn(githubMetering, 'flushGitHubApiMeter').mockResolvedValue(undefined);
     try {
       const threads = await defaultListThreads(fetchImpl);
+      expect(flushSpy).toHaveBeenCalledTimes(1);
       expect(threads).toHaveLength(1);
       expect(threads[0]?.isUnclaimed).toBe(true);
       expect(threads[0]?.isUnclaimedP0).toBe(true);
