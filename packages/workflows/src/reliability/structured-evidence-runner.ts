@@ -751,9 +751,76 @@ function fileHash(cwd: string, path: string): string {
   }
 }
 
+function splitUnparsedNames(names: string): string[] {
+  if (names.trim().length === 0) return [];
+  return names
+    .split('; ')
+    .map(part => part.trim())
+    .filter(part => part.length > 0);
+}
+
+function isProseOnlyDeclaration(name: string): boolean {
+  const trimmed = name.trim().replace(/^[-*]+[ \t]*/, '');
+  if (trimmed.length === 0) return false;
+  if (trimmed === 'unnamed grep stop condition') return false;
+  if (/^[0-9]+ unnamed assertion\(s\)$/.test(trimmed)) return false;
+  if (/^Stop[ \t]+[0-9A-Za-z.]+\b/i.test(trimmed)) return false;
+  if (
+    /^(?:(?:LC_ALL=C|LANG=C) )?(?:grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)\b/.test(trimmed)
+  ) {
+    return false;
+  }
+  return true;
+}
+
+// FP-4 (bdc-xo #1940): matching executed greps plus prose-only unparsed
+// declarations stay aggregate INCOMPLETE and are still admissible. The runner
+// writes this shape only when executed + unparsed === declared, nothing was
+// dropped, and nothing mismatched. A required canonical assertion that failed
+// to parse is never given this reason.
+function legacyFp4GrepAdmissible(recorded: EvidenceAttempt): boolean {
+  if (recorded.kind !== 'greps' || recorded.aggregate !== 'INCOMPLETE') return false;
+  const selected = recorded.members.filter(member => member.scope === 'selected');
+  const prose = recorded.members.filter(
+    member => member.scope === 'unresolved' && member.reason === 'prose-only-unparsed'
+  );
+  if (selected.length === 0 || prose.length === 0) return false;
+  if (recorded.members.length !== selected.length + prose.length) return false;
+  if (!selected.every(member => member.status === 'PASSED')) return false;
+  return prose.every(
+    member => member.status === 'NOT_APPLICABLE' && isProseOnlyDeclaration(member.rawCommand)
+  );
+}
+
+function attachGrepUnparsedMembers(
+  members: AttemptMember[],
+  cwd: string,
+  names: readonly string[],
+  admitProse: boolean
+): void {
+  if (admitProse) {
+    for (const name of names) {
+      const member = blankMember(name, cwd, '');
+      member.scope = 'unresolved';
+      member.status = 'NOT_APPLICABLE';
+      member.reason = 'prose-only-unparsed';
+      members.push(member);
+    }
+    return;
+  }
+  for (const name of names) {
+    if (isProseOnlyDeclaration(name)) continue;
+    const member = blankMember(name, cwd, '');
+    member.status = 'INCOMPLETE';
+    member.reason = 'malformed-canonical';
+    members.push(member);
+  }
+}
+
 function attemptCompletionVerdict(
   recorded: EvidenceAttempt
 ): { ok: true } | { ok: false; reason: string } {
+  if (legacyFp4GrepAdmissible(recorded)) return { ok: true };
   const selected = recorded.members.filter(member => member.scope === 'selected');
   if (recorded.aggregate === 'NOT_APPLICABLE' && selected.length === 0) return { ok: true };
   for (const member of selected) {
@@ -2557,6 +2624,18 @@ function runCli(): number {
         if (unparsed > 0) {
           out = `${out}${out ? '; ' : ''}UNVERIFIED (unparsed): ${unparsedNames || `${unparsed} unnamed assertion(s)`}`;
         }
+      }
+      if (status === 'incomplete' && unparsed > 0) {
+        const proseNames = splitUnparsedNames(unparsedNames);
+        const admitProse =
+          executed > 0 &&
+          mismatch === 0 &&
+          dropped === 0 &&
+          executed + unparsed === declared &&
+          proseNames.length === unparsed &&
+          proseNames.every(name => isProseOnlyDeclaration(name));
+        attachGrepUnparsedMembers(members, process.cwd(), proseNames, admitProse);
+        attempt.members = members;
       }
       attempt.aggregate =
         status === 'passed'

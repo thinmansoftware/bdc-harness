@@ -428,7 +428,85 @@ OUT="$(
 )"
 assert_contains "true-absence project-map stamps PASS" "VALIDATION: PASS" "$OUT"
 assert_not_contains "true-absence project-map is not FAIL" "VALIDATION: FAIL" "$OUT"
-rm -rf "$NA" "$NA_ART" "$BAD" "$BAD_ART" "$MAP" "$MAP_ART"
+
+prepare_fp4_repo() {
+  local repo="$1"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email t@example.com
+  git -C "$repo" config user.name Test
+  printf 'base\n' > "$repo/README"
+  git -C "$repo" add README
+  git -C "$repo" commit -qm base
+  cat > "$repo/ok.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+  chmod +x "$repo/ok.sh"
+  printf 'bash ./ok.sh\n' > "$repo/cmds"
+}
+
+echo "--- FP-4 adapter: prose-only unparsed greps pass stamp check-attempt ---"
+FP4="$(mktemp -d)"
+FP4_ART="$(mktemp -d)"
+prepare_fp4_repo "$FP4"
+(
+  cd "$FP4" || exit 1
+  ARTIFACTS_DIR="$FP4_ART" SER_RUN_ID=run-fp4 \
+    ser_runner run-tests --commands ./cmds --log "$FP4_ART/stop-tests.log" >/dev/null
+)
+FP4_SPEC="$(printf '%s\n' '## Stop conditions' '- `grep -c base README` returns 1 or greater.' 'Stop 9 (grep assertion):' '  prose condition one')"
+FP4_GREP="$(
+  cd "$FP4" || exit 1
+  export ARTIFACTS_DIR="$FP4_ART" SER_RUN_ID=run-fp4
+  printf '%s\n' "$FP4_SPEC" | ser_runner extract-greps | ser_runner run-greps
+)"
+assert_contains "FP-4 adapter grep status stays incomplete" "GREP_STATUS=incomplete" "$FP4_GREP"
+assert_contains "FP-4 adapter names the prose declaration" "UNVERIFIED (unparsed): prose condition one" "$FP4_GREP"
+FP4_ERR="$(mktemp)"
+OUT="$(
+  cd "$FP4" || exit 1
+  export ARTIFACTS_DIR="$FP4_ART" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID=run-fp4
+  unset SER_REPO SER_STAGE_ID SER_TARGET_BRANCH SER_BASE_SHA SER_WORKTREE SER_TEST_ATTEMPT_ID SER_GREP_ATTEMPT_ID
+  printf '%s\n' "$ENGINE_MANIFEST" | sme_process "1/1 (bash ./ok.sh)" passed \
+    "$(sme_field GREP_LINE "$FP4_GREP")" "$(sme_field GREP_STATUS "$FP4_GREP")" \
+    "$(sme_field GREP_DROPPED "$FP4_GREP")" 2>"$FP4_ERR"
+)"
+assert_contains "FP-4 adapter stamp stays PASS" "VALIDATION: PASS" "$OUT"
+assert_not_contains "FP-4 adapter stamp is not FAIL" "VALIDATION: FAIL" "$OUT"
+assert_contains "FP-4 adapter stamp names the prose" "unparsed=prose condition one; dropped=0" "$OUT"
+assert_not_contains "FP-4 adapter stamp does not refuse the attempt" "REFUSED" "$(cat "$FP4_ERR")"
+
+echo "--- FP-4 adapter: malformed required canonical assertion stays refused ---"
+FP4_BAD="$(mktemp -d)"
+FP4_BAD_ART="$(mktemp -d)"
+prepare_fp4_repo "$FP4_BAD"
+(
+  cd "$FP4_BAD" || exit 1
+  ARTIFACTS_DIR="$FP4_BAD_ART" SER_RUN_ID=run-fp4 \
+    ser_runner run-tests --commands ./cmds --log "$FP4_BAD_ART/stop-tests.log" >/dev/null
+)
+FP4_BAD_SPEC="$(printf '%s\n' 'Stop 1 (grep assertion):' '  grep -c base README' '  Expected: 1' 'Stop 2 (grep assertion):' '  grep -c missing-token README' '  Expected: many')"
+FP4_BAD_GREP="$(
+  cd "$FP4_BAD" || exit 1
+  export ARTIFACTS_DIR="$FP4_BAD_ART" SER_RUN_ID=run-fp4
+  printf '%s\n' "$FP4_BAD_SPEC" | ser_runner extract-greps | ser_runner run-greps
+)"
+assert_contains "malformed canonical grep status stays incomplete" "GREP_STATUS=incomplete" "$FP4_BAD_GREP"
+assert_contains "malformed canonical names the command" "UNVERIFIED (unparsed): grep -c missing-token README" "$FP4_BAD_GREP"
+FP4_BAD_ERR="$(mktemp)"
+OUT="$(
+  cd "$FP4_BAD" || exit 1
+  export ARTIFACTS_DIR="$FP4_BAD_ART" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID=run-fp4
+  unset SER_REPO SER_STAGE_ID SER_TARGET_BRANCH SER_BASE_SHA SER_WORKTREE SER_TEST_ATTEMPT_ID SER_GREP_ATTEMPT_ID
+  printf '%s\n' "$ENGINE_MANIFEST" | sme_process "1/1 (bash ./ok.sh)" passed \
+    "$(sme_field GREP_LINE "$FP4_BAD_GREP")" "$(sme_field GREP_STATUS "$FP4_BAD_GREP")" \
+    "$(sme_field GREP_DROPPED "$FP4_BAD_GREP")" 2>"$FP4_BAD_ERR"
+)"
+assert_contains "malformed canonical stamp is FAIL" "VALIDATION: FAIL" "$OUT"
+assert_not_contains "malformed canonical stamp is not PASS" "VALIDATION: PASS" "$OUT"
+assert_contains "malformed canonical check-attempt refuses the member" "REFUSED greps:member-not-passed:grep -c missing-token README" "$(cat "$FP4_BAD_ERR")"
+rm -rf "$NA" "$NA_ART" "$BAD" "$BAD_ART" "$MAP" "$MAP_ART" "$FP4" "$FP4_ART" "$FP4_BAD" "$FP4_BAD_ART" "$FP4_ERR" "$FP4_BAD_ERR"
 
 unset SER_REQUIRE_ATTEMPT ARTIFACTS_DIR SER_RUN_ID SER_REPO SER_TEST_ATTEMPT_ID SER_GREP_ATTEMPT_ID
 rm -rf "$BIND" "$BIND_ART" "$MIX" "$MIX_ART" "$ERRF"

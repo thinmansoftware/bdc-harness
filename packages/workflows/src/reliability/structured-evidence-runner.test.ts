@@ -1195,6 +1195,176 @@ describe('hermetic-fresh-attempt', () => {
     ]);
     rmSync(cwd, { recursive: true, force: true });
   });
+
+  it('admits legacy FP-4 prose greps through check-attempt and refuses malformed canonical assertions', () => {
+    const cwd = tempDir('ser-fp4-');
+    initRepo(cwd);
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+    writeFileSync(join(cwd, 'cmds'), 'bash ./ok.sh\n');
+    const artifacts = join(cwd, 'artifacts');
+    mkdirSync(artifacts, { recursive: true });
+    const env = {
+      ...process.env,
+      HARNESS_ROOT_OVERRIDE: ROOT,
+      ARTIFACTS_DIR: artifacts,
+      SER_RUN_ID: 'run-fp4',
+      SER_REPO: '',
+      SER_STAGE_ID: '',
+      SER_TARGET_BRANCH: '',
+      SER_BASE_SHA: '',
+      SER_WORKTREE: '',
+      SER_TEST_ATTEMPT_ID: '',
+      SER_GREP_ATTEMPT_ID: '',
+    };
+    const proseSpec = [
+      '## Stop conditions',
+      '- `grep -c base README` returns 1 or greater.',
+      'Stop 9 (grep assertion):',
+      '  prose condition one',
+      '',
+    ].join('\n');
+    const canonicalSpec = [
+      'Stop 1 (grep assertion):',
+      '  grep -c base README',
+      '  Expected: 1',
+      'Stop 2 (grep assertion):',
+      '  grep -c missing-token README',
+      '  Expected: many',
+      '',
+    ].join('\n');
+    const run = (args: string[], input: string) =>
+      spawnSync('bun', [RUNNER, ...args], { cwd, env, encoding: 'utf8', input });
+    const readGrep = (): EvidenceAttempt => {
+      const attempts = join(artifacts, 'evidence', 'attempts');
+      const grepId = readFileSync(join(attempts, 'current-greps'), 'utf8').trim();
+      return JSON.parse(readFileSync(join(attempts, `${grepId}.json`), 'utf8')) as EvidenceAttempt;
+    };
+    try {
+      const tests = run(
+        ['run-tests', '--commands', join(cwd, 'cmds'), '--log', join(artifacts, 'stop-tests.log')],
+        ''
+      );
+      expect(tests.status).toBe(0);
+
+      const extracted = run(['extract-greps'], proseSpec);
+      expect(extracted.status).toBe(0);
+      expect(extracted.stdout).toContain('prose condition one');
+      expect(extracted.stdout).not.toContain('grep -c missing-token README');
+      const admitted = run(['run-greps'], extracted.stdout);
+      expect(admitted.status).toBe(0);
+      expect(admitted.stdout).toContain('GREP_STATUS=incomplete');
+      expect(admitted.stdout).toContain('GREP_EXECUTED=1');
+      expect(admitted.stdout).toContain('GREP_DROPPED=0');
+      expect(admitted.stdout).toContain('GREP_UNPARSED=1');
+      expect(admitted.stdout).toContain('GREP_MISMATCH=0');
+      expect(admitted.stdout).toContain('UNVERIFIED (unparsed): prose condition one');
+      const admittedAttempt = readGrep();
+      expect(admittedAttempt.aggregate).toBe('INCOMPLETE');
+      expect(admittedAttempt.members).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            rawCommand: 'grep -c base README',
+            status: 'PASSED',
+            scope: 'selected',
+          }),
+          expect.objectContaining({
+            rawCommand: 'prose condition one',
+            status: 'NOT_APPLICABLE',
+            reason: 'prose-only-unparsed',
+            scope: 'unresolved',
+          }),
+        ])
+      );
+      expect(checkAttemptRecord(admittedAttempt, cwd, admittedAttempt.authority).ok).toBe(true);
+      const admittedCli = run(['check-attempt'], '');
+      expect(admittedCli.status).toBe(0);
+      expect(admittedCli.stdout).toContain('OK');
+
+      const forged = structuredClone(admittedAttempt);
+      const prose = forged.members.find(member => member.reason === 'prose-only-unparsed');
+      if (!prose) throw new Error('missing prose member');
+      prose.rawCommand = 'grep -c missing-token README';
+      const forgedVerdict = checkAttemptRecord(forged, cwd, forged.authority);
+      expect(forgedVerdict.ok).toBe(false);
+      if (!forgedVerdict.ok) expect(forgedVerdict.reason).toBe('aggregate-INCOMPLETE');
+
+      const hole = structuredClone(admittedAttempt);
+      hole.members = hole.members.filter(member => member.reason !== 'prose-only-unparsed');
+      const holeVerdict = checkAttemptRecord(hole, cwd, hole.authority);
+      expect(holeVerdict.ok).toBe(false);
+      if (!holeVerdict.ok) expect(holeVerdict.reason).toBe('aggregate-INCOMPLETE');
+
+      const canonical = run(['run-greps'], run(['extract-greps'], canonicalSpec).stdout);
+      expect(canonical.status).toBe(0);
+      expect(canonical.stdout).toContain('GREP_STATUS=incomplete');
+      expect(canonical.stdout).toContain('UNVERIFIED (unparsed): grep -c missing-token README');
+      const canonicalAttempt = readGrep();
+      expect(canonicalAttempt.aggregate).toBe('INCOMPLETE');
+      expect(canonicalAttempt.members).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            rawCommand: 'grep -c missing-token README',
+            status: 'INCOMPLETE',
+            reason: 'malformed-canonical',
+            scope: 'selected',
+          }),
+        ])
+      );
+      const canonicalCli = run(['check-attempt'], '');
+      expect(canonicalCli.status).not.toBe(0);
+      expect(canonicalCli.stderr).toContain(
+        'REFUSED greps:member-not-passed:grep -c missing-token README'
+      );
+
+      const commandRow = run(
+        ['run-greps'],
+        'grep -c base README\teq\t1\nUNPARSED\t1\tgrep -c missing-token README\nDECLARED\t2\n'
+      );
+      expect(commandRow.stdout).toContain('GREP_STATUS=incomplete');
+      expect(readGrep().members).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            rawCommand: 'grep -c missing-token README',
+            reason: 'malformed-canonical',
+          }),
+        ])
+      );
+      expect(run(['check-attempt'], '').stderr).toContain(
+        'REFUSED greps:member-not-passed:grep -c missing-token README'
+      );
+
+      const accountingHole = run(
+        ['run-greps'],
+        'grep -c base README\teq\t1\nUNPARSED\t1\tprose condition one\nDECLARED\t1\n'
+      );
+      expect(accountingHole.stdout).toContain('GREP_STATUS=incomplete');
+      const accountingAttempt = readGrep();
+      expect(
+        accountingAttempt.members.some(member => member.reason === 'prose-only-unparsed')
+      ).toBe(false);
+      expect(run(['check-attempt'], '').status).not.toBe(0);
+
+      const dropped = run(
+        ['run-greps'],
+        'grep -c base README\teq\t1\ngrep -c "needle" README\teq\t1\nUNPARSED\t1\tprose condition one\nDECLARED\t3\n'
+      );
+      expect(dropped.stdout).toContain('GREP_DROPPED=1');
+      expect(dropped.stdout).toContain('GREP_STATUS=incomplete');
+      expect(run(['check-attempt'], '').status).not.toBe(0);
+
+      const twoProse = run(
+        ['run-greps'],
+        'grep -c base README\teq\t1\nUNPARSED\t2\tprose condition one; prose condition two\nDECLARED\t3\n'
+      );
+      expect(twoProse.stdout).toContain('GREP_STATUS=incomplete');
+      expect(twoProse.stdout).toContain(
+        'UNVERIFIED (unparsed): prose condition one; prose condition two'
+      );
+      expect(run(['check-attempt'], '').status).toBe(0);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('parity-stage-and-bundle', () => {
