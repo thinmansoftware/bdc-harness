@@ -274,6 +274,41 @@ async function originBranchExists(repoPath: string, branch: string): Promise<boo
   }
 }
 
+/** A Base branch value is exactly one branch name: no spaces, commas, or parentheses. */
+const SINGLE_BRANCH_NAME = /^[A-Za-z0-9._/-]+$/;
+
+function stripEnclosingBackticks(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2 && trimmed.startsWith('`') && trimmed.endsWith('`')) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+/**
+ * Full remainder of a declared base-branch line.
+ * parseDeclaredBaseBranch keeps only the first token. This keeps the whole value
+ * so a multi-token line is rejected before dispatch.
+ * Returns undefined when the spec declares no base branch.
+ */
+function extractRawDeclaredBaseBranch(spec: Uint8Array): string | undefined {
+  const text = new TextDecoder().decode(spec);
+  if (text.length === 0) return undefined;
+  const patterns = [
+    /^Base branch:[ \t]*(.*)$/m,
+    /\*\*Base branch:\*\*[ \t]*(.*)$/m,
+    /^base_branch:[ \t]*(.*)$/m,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (!match) continue;
+    const value = stripEnclosingBackticks((match[1] ?? '').replace(/\r$/, ''));
+    if (value.length === 0) continue;
+    return value;
+  }
+  return undefined;
+}
+
 /**
  * Dispatch a workflow to run in a background worker conversation (web platform only).
  * Creates a hidden worker conversation, sets up event bridging from worker to parent,
@@ -293,91 +328,127 @@ export async function dispatchBackgroundWorkflow(
     ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage)
     : undefined;
 
-  // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): resolve the WO's
-  // declared "Base branch:" from the frozen spec BEFORE isolation is allocated so the
-  // worker worktree is cut from origin/<declared> instead of the repo default.
-  const declaredBaseBranch = frozenSpecSource
-    ? parseDeclaredBaseBranch(frozenSpecSource.specBytes)
-    : undefined;
-
   // 1. Generate worker conversation ID
   const workerPlatformId = `web-worker-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
   const authoritySource = frozenSpecSource
     ? { ...frozenSpecSource, dispatchId: workerPlatformId }
     : undefined;
 
-  // 2. Create worker conversation in DB
-  const workerConv = await db.getOrCreateConversation('web', workerPlatformId);
-  await db.updateConversation(workerConv.id, {
-    cwd: ctx.cwd,
-    codebase_id: ctx.codebaseId ?? null,
-    hidden: true,
-  });
-
-  // 3. Resolve isolation for this worker (each background workflow gets its own worktree).
-  // Isolation failure is fatal -- never run a workflow in a shared/parent worktree.
+  // Pre-dispatch failures (bad Base branch, missing codebase, missing origin ref,
+  // isolation failure) are recorded on the parent conversation before they are
+  // rethrown. The conductor reads that marker and stops instead of timing out.
+  // The wrapper ends before the dispatch notification and createWorkflowRun.
+  let workerConv: Awaited<ReturnType<typeof db.getOrCreateConversation>>;
   let workerCwd: string;
-  if (ctx.codebaseId) {
-    const codebase = await getCodebase(ctx.codebaseId);
-    if (!codebase) {
+  try {
+    const rawDeclaredBaseBranch = frozenSpecSource
+      ? extractRawDeclaredBaseBranch(frozenSpecSource.specBytes)
+      : undefined;
+    if (rawDeclaredBaseBranch !== undefined && !SINGLE_BRANCH_NAME.test(rawDeclaredBaseBranch)) {
       throw new Error(
-        `Cannot dispatch workflow "${workflow.name}": codebase ${ctx.codebaseId} not found`
+        `base_branch_not_single: workflow "${workflow.name}" declares Base branch ` +
+          `"${rawDeclaredBaseBranch}" which is not a single branch name`
       );
     }
-    // Base-lane authority takes precedence over inherited parent hints. When the
-    // frozen WO spec declares a Base branch, resolve+pin it here so the worktree is
-    // cut from origin/<declared> and the downstream authority triple is lane-correct
-    // by construction. A declared-but-missing base is a spec error -- fail fast rather
-    // than silently allocating from the repo default (the original tail-node
-    // scope-failure bug, WO-HARNESS-BASE-LANE-AUTHORITY-01). When no base is declared,
-    // fall back to today's behavior: inherit an explicit parent task/from-branch
-    // request, else plain thread isolation.
-    const parentHints = ctx.isolationHints;
-    let workerHints: IsolationHints;
-    if (declaredBaseBranch) {
-      if (!(await originBranchExists(codebase.default_cwd, declaredBaseBranch))) {
+
+    // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): resolve the WO's
+    // declared "Base branch:" from the frozen spec BEFORE isolation is allocated so the
+    // worker worktree is cut from origin/<declared> instead of the repo default.
+    const declaredBaseBranch = frozenSpecSource
+      ? parseDeclaredBaseBranch(frozenSpecSource.specBytes)
+      : undefined;
+
+    // 2. Create worker conversation in DB
+    workerConv = await db.getOrCreateConversation('web', workerPlatformId);
+    await db.updateConversation(workerConv.id, {
+      cwd: ctx.cwd,
+      codebase_id: ctx.codebaseId ?? null,
+      hidden: true,
+    });
+
+    // 3. Resolve isolation for this worker (each background workflow gets its own worktree).
+    // Isolation failure is fatal -- never run a workflow in a shared/parent worktree.
+    if (ctx.codebaseId) {
+      const codebase = await getCodebase(ctx.codebaseId);
+      if (!codebase) {
         throw new Error(
-          `declared_base_branch_not_found: workflow "${workflow.name}" declares Base branch ` +
-            `"${declaredBaseBranch}" but origin has no refs/heads/${declaredBaseBranch}`
+          `Cannot dispatch workflow "${workflow.name}": codebase ${ctx.codebaseId} not found`
         );
       }
-      workerHints = {
-        workflowType: 'task',
-        workflowId: workerPlatformId,
-        // Branded BranchName; the worktree provider consumes the `origin/<branch>`
-        // remote start-ref form (see createNewBranch in @archon/isolation).
-        fromBranch: `origin/${declaredBaseBranch}` as IsolationHints['fromBranch'],
-      };
-      getLog().info(
-        { workerPlatformId, declaredBaseBranch, workflowName: workflow.name },
-        'orchestrator.declared_base_lane_resolved'
+      // Base-lane authority takes precedence over inherited parent hints. When the
+      // frozen WO spec declares a Base branch, resolve+pin it here so the worktree is
+      // cut from origin/<declared> and the downstream authority triple is lane-correct
+      // by construction. A declared-but-missing base is a spec error -- fail fast rather
+      // than silently allocating from the repo default (the original tail-node
+      // scope-failure bug, WO-HARNESS-BASE-LANE-AUTHORITY-01). When no base is declared,
+      // fall back to today's behavior: inherit an explicit parent task/from-branch
+      // request, else plain thread isolation.
+      const parentHints = ctx.isolationHints;
+      let workerHints: IsolationHints;
+      if (declaredBaseBranch) {
+        if (!(await originBranchExists(codebase.default_cwd, declaredBaseBranch))) {
+          throw new Error(
+            `declared_base_branch_not_found: workflow "${workflow.name}" declares Base branch ` +
+              `"${declaredBaseBranch}" but origin has no refs/heads/${declaredBaseBranch}`
+          );
+        }
+        workerHints = {
+          workflowType: 'task',
+          workflowId: workerPlatformId,
+          // Branded BranchName; the worktree provider consumes the `origin/<branch>`
+          // remote start-ref form (see createNewBranch in @archon/isolation).
+          fromBranch: `origin/${declaredBaseBranch}` as IsolationHints['fromBranch'],
+        };
+        getLog().info(
+          { workerPlatformId, declaredBaseBranch, workflowName: workflow.name },
+          'orchestrator.declared_base_lane_resolved'
+        );
+      } else if (parentHints?.workflowType === 'task') {
+        workerHints = {
+          workflowType: 'task',
+          workflowId: workerPlatformId,
+          fromBranch: parentHints.fromBranch,
+        };
+      } else {
+        workerHints = { workflowType: 'thread', workflowId: workerPlatformId };
+      }
+      const result = await validateAndResolveIsolation(
+        workerConv,
+        codebase,
+        ctx.platform,
+        workerPlatformId,
+        workerHints
       );
-    } else if (parentHints?.workflowType === 'task') {
-      workerHints = {
-        workflowType: 'task',
-        workflowId: workerPlatformId,
-        fromBranch: parentHints.fromBranch,
-      };
+      workerCwd = result.cwd;
+      await db.updateConversation(workerConv.id, { cwd: workerCwd }).catch((e: unknown) => {
+        getLog().warn(
+          { err: toError(e), workerPlatformId },
+          'orchestrator.worker_cwd_persist_failed'
+        );
+      });
     } else {
-      workerHints = { workflowType: 'thread', workflowId: workerPlatformId };
+      // No codebase -- run in parent's cwd (no isolation needed for non-repo workflows)
+      workerCwd = ctx.cwd;
     }
-    const result = await validateAndResolveIsolation(
-      workerConv,
-      codebase,
-      ctx.platform,
-      workerPlatformId,
-      workerHints
-    );
-    workerCwd = result.cwd;
-    await db.updateConversation(workerConv.id, { cwd: workerCwd }).catch((e: unknown) => {
-      getLog().warn(
-        { err: toError(e), workerPlatformId },
-        'orchestrator.worker_cwd_persist_failed'
+  } catch (error) {
+    const refusalError = toError(error);
+    try {
+      await ctx.platform.sendMessage(
+        ctx.conversationId,
+        `pre_dispatch_refusal: ${refusalError.message}`
       );
-    });
-  } else {
-    // No codebase -- run in parent's cwd (no isolation needed for non-repo workflows)
-    workerCwd = ctx.cwd;
+    } catch (sendError) {
+      // Keep the original refusal. A failed marker send must not replace it.
+      getLog().error(
+        {
+          err: toError(sendError),
+          refusal: refusalError.message,
+          conversationId: ctx.conversationId,
+        },
+        'orchestrator.pre_dispatch_refusal_notify_failed'
+      );
+    }
+    throw error;
   }
 
   // 4. Notify parent chat that workflow is dispatching

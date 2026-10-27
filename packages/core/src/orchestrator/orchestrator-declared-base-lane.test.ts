@@ -241,12 +241,33 @@ describe('dispatchBackgroundWorkflow declared base-lane authority', () => {
   test('declared base missing on origin -> fail fast, no worktree cut', async () => {
     freezeWithSpec('Base branch: release/does-not-exist\n');
     lsRemoteShouldFail = true;
-    const ctx = makeCtx({ isolationHints: undefined });
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
 
     await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
       /declared_base_branch_not_found/
     );
     expect(mockResolve).toHaveBeenCalledTimes(0);
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).toContain('pre_dispatch_refusal:');
+    expect(sent).toContain('declared_base_branch_not_found');
+  });
+
+  test('multi-token Base branch is refused before origin lookup', async () => {
+    freezeWithSpec('Base branch: dev (bdc-harness), main (bdc-xo)\n');
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
+
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
+      /base_branch_not_single/
+    );
+    expect(execFileCalls.length).toBe(0);
+    expect(mockResolve).toHaveBeenCalledTimes(0);
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).toContain('pre_dispatch_refusal:');
+    expect(sent).toContain('base_branch_not_single');
+    expect(sent).toContain('dev (bdc-harness), main (bdc-xo)');
+    expect(sent).not.toContain('Dispatching workflow');
   });
 
   test('no declared base -> preserves inherited parent task hint (no ls-remote)', async () => {

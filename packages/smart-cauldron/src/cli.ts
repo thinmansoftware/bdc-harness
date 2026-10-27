@@ -47,6 +47,8 @@ import type { CascadeStatus } from './types.js';
  *   refused                   -> 10 (already-satisfied guard declined to fire; no tier ran,
  *                                    attempts=0 -- a refusal is not a win and must never read
  *                                    as won=0 (bdc-xo#2140))
+ *   stopped_spec_error        -> 11 (spec refusal is not success; the cascade stopped
+ *                                    because the spec cannot be dispatched)
  *
  * spec-repair MUST NOT collapse to 0 -- it is a distinct, visible outcome
  * (frontier tier gate-failed) and callers key off the exit code. cancelled
@@ -76,6 +78,9 @@ export function statusToExitCode(status: CascadeStatus): number {
       return 9;
     case 'refused':
       return 10;
+    case 'stopped_spec_error':
+      // A spec refusal is not success. Do not fall through to the default exit 0.
+      return 11;
     default:
       return 0;
   }
