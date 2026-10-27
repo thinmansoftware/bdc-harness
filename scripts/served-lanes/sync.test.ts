@@ -124,7 +124,10 @@ describe('served lanes', () => {
 
       expect(sha256Hex(await readFile(lanePath))).toBe(sha256Hex(baked));
       const laneAfter = await stat(lanePath);
-      expect(laneAfter.ino).toBe(laneBefore.ino);
+      // The conflict-safe swap replaces via rename, so the inode intentionally
+      // changes (see sync.ts). Ownership and mode are carried over to the
+      // swapped-in file so the served volume keeps its permissions.
+      expect(laneAfter.ino).not.toBe(laneBefore.ino);
       expect(laneAfter.uid).toBe(laneBefore.uid);
       expect(laneAfter.gid).toBe(laneBefore.gid);
       expect(laneAfter.mode).toBe(laneBefore.mode);
@@ -242,7 +245,7 @@ describe('served lanes', () => {
     }
   });
 
-  test('an edit after the final verification read is preserved', async () => {
+  test('an edit before the final verification read is preserved', async () => {
     const { parent, volumeDir, bakedDir } = await makeTree();
     try {
       const stale = laneYaml('STALE');
@@ -260,9 +263,9 @@ describe('served lanes', () => {
         bakedDir,
         history,
         now: NOW,
-        // Fires per-lane immediately before the final hash/mtime/ino read,
-        // after the backup has already been staged. The edit must be caught
-        // by the final verification and preserved, never overwritten.
+        // Fires per-lane immediately BEFORE the final hash/mtime/ino read. The
+        // edit must be caught by the final verification and preserved, never
+        // overwritten.
         beforeFinalVerify: async filename => {
           if (filename !== 'lane.yaml') return;
           await writeFile(volumePath, edited);
@@ -279,6 +282,69 @@ describe('served lanes', () => {
       expect(result.backup_path).toBeNull();
       const parentNames = await readdir(parent);
       expect(parentNames.some(name => name.includes('.bak-'))).toBe(false);
+      const uniqueEdit = {
+        filename: 'lane.yaml',
+        sha256: sha256Hex(edited),
+        mtime: capturedMtime,
+      };
+      expect(result.unique_edit).toEqual([uniqueEdit]);
+
+      const report = JSON.parse(
+        await readFile(join(parent, 'served-lanes-report.json'), 'utf8')
+      ) as {
+        unique_edit: Array<{ filename: string; sha256: string; mtime: string }>;
+      };
+      expect(report.unique_edit).toEqual([uniqueEdit]);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('an edit after the final verification read is preserved, not lost', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const edited = Buffer.from(laneYaml('EDITED-AFTER-FINAL-VERIFY'));
+      const volumePath = join(volumeDir, 'lane.yaml');
+      await writeFile(volumePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+      let capturedMtime = '';
+      let injected = false;
+
+      const result = await reconcileServedLanes({
+        volumeDir,
+        bakedDir,
+        history,
+        now: NOW,
+        // Fires per-lane AFTER the final hash/mtime/ino read and BEFORE the
+        // swap -- the exact TOCTOU window an in-place overwrite left open. The
+        // conflict-safe swap must capture this edit atomically, restore it in
+        // place, and report it as unique_edit. It must never be overwritten by
+        // the baked bytes, and the edit must never land silently in a backup.
+        beforeReplaceWrite: async filename => {
+          if (filename !== 'lane.yaml') return;
+          await writeFile(volumePath, edited);
+          const info = await stat(volumePath);
+          capturedMtime = info.mtime.toISOString();
+          injected = true;
+        },
+      });
+
+      expect(injected).toBe(true);
+      // The racing edit survives byte for byte in the live file.
+      const liveBytes = await readFile(volumePath);
+      expect(Buffer.compare(liveBytes, edited)).toBe(0);
+      // Nothing was replaced and no backup directory was created, so the edit
+      // was never clobbered nor silently captured into a backup.
+      expect(result.replaced).toEqual([]);
+      expect(result.backup_path).toBeNull();
+      const parentNames = await readdir(parent);
+      expect(parentNames.some(name => name.includes('.bak-'))).toBe(false);
+      // No staging artifacts leak into the volume directory.
+      const volumeNames = (await readdir(volumeDir)).sort();
+      expect(volumeNames).toEqual(['lane.yaml']);
       const uniqueEdit = {
         filename: 'lane.yaml',
         sha256: sha256Hex(edited),

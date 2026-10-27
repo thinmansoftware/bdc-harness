@@ -7,7 +7,7 @@
  */
 import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
+import { chmod, chown, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
 import { join, resolve } from 'path';
 import { createLogger } from '../../packages/paths/src/logger';
 
@@ -249,6 +249,7 @@ export async function reconcileServedLanes(input: {
   now: Date;
   beforeReplace?: () => Promise<void> | void;
   beforeFinalVerify?: (filename: string) => Promise<void> | void;
+  beforeReplaceWrite?: (filename: string) => Promise<void> | void;
 }): Promise<ReconcileResult> {
   const reportPath = reportPathFor(input.volumeDir);
   const volumePresence = await directoryPresence(input.volumeDir);
@@ -305,23 +306,12 @@ export async function reconcileServedLanes(input: {
         continue;
       }
 
-      // Stage the backup (the exact bytes about to be replaced) BEFORE the
-      // final verification, to a temp path that is never the official backup
-      // directory, so an abandoned replacement leaves no stray .bak- directory
-      // and no awaited backup operation sits between the final read and the
-      // write.
-      const stagedBackup = `${livePath}.served-lanes-bak-staging`;
-      await writeFile(stagedBackup, preBytes);
-
-      // Test seam: a per-lane edit injected here must be caught by the final
-      // verification below and preserved, never overwritten.
+      // Test seam: an edit injected here lands BEFORE the final verification
+      // read and must be caught by it and preserved, never overwritten.
       await input.beforeFinalVerify?.(lane.filename);
 
       // Final verification: re-read the bytes AND re-stat (mtime + inode) and
-      // compare against the pre-observation. No awaited operation runs between
-      // the last read here and the in-place write, so a concurrent edit can
-      // only land before this check (where it is detected) -- never in an
-      // unobserved gap before the overwrite.
+      // compare against the pre-observation. An edit detected here is preserved.
       const finalBytes = await readFile(livePath);
       const finalStat = await stat(livePath);
       const finalHash = sha256Hex(finalBytes);
@@ -335,18 +325,65 @@ export async function reconcileServedLanes(input: {
           sha256: finalHash,
           mtime: finalStat.mtime.toISOString(),
         });
-        await rm(stagedBackup, { force: true });
         continue;
       }
 
-      // Verified unchanged: overwrite in place. writeFile on an existing path
-      // truncates and reuses the inode, preserving uid, gid and mode. This is
-      // a single awaited write glued to the verification above.
-      await writeFile(livePath, lane.bakedBytes);
+      // Stage the baked bytes beside the live file, carrying over the served
+      // file's permission bits (and uid/gid when permitted) so the swapped-in
+      // file keeps the volume's ownership and mode. Inode identity is NOT
+      // preserved here: a conflict-safe capture-then-replace swap (via rename)
+      // is required by the PR #1334 review to guarantee that a concurrent edit
+      // is never silently lost -- a guarantee an in-place truncating overwrite
+      // cannot provide, because the overwrite destroys any edit that lands in
+      // the unavoidable gap between the final hash read and the write.
+      const stagedNew = `${livePath}.served-lanes-new`;
+      await writeFile(stagedNew, lane.bakedBytes);
+      await chmod(stagedNew, preStat.mode & 0o7777);
+      try {
+        await chown(stagedNew, preStat.uid, preStat.gid);
+      } catch (chownError) {
+        // Non-fatal: an unprivileged process cannot chown to a different owner.
+        // The staged file already belongs to this process (the volume owner),
+        // so mode is preserved and ownership is unchanged from the live file.
+        log.warn({ err: chownError, filename: lane.filename }, 'served_lanes.chown_skipped');
+      }
 
-      // Promote the staged backup into the official directory, created lazily
-      // so a run that replaces nothing creates no backup directory. The backup
-      // therefore holds exactly the bytes that were replaced.
+      // Test seam: an edit injected HERE lands AFTER the final verification and
+      // BEFORE the swap -- the true TOCTOU window the earlier in-place write
+      // left open. The atomic capture below moves whatever bytes are live into
+      // the staging backup, so such an edit is never destroyed: it is detected
+      // and restored in place (reported as unique_edit), never overwritten.
+      await input.beforeReplaceWrite?.(lane.filename);
+
+      // Atomically move the current live file aside. rename() captures the
+      // exact bytes present at swap time as a whole -- there is no read-then-
+      // write gap in which an edit on the existing inode could be lost.
+      const stagedOld = `${livePath}.served-lanes-bak-staging`;
+      await rename(livePath, stagedOld);
+
+      // Compare what we actually captured against the verified hash. A mismatch
+      // means an edit raced in after the final verification: restore it in
+      // place and preserve it, replacing nothing.
+      const capturedBytes = await readFile(stagedOld);
+      const capturedHash = sha256Hex(capturedBytes);
+      if (capturedHash !== preHash) {
+        await rename(stagedOld, livePath);
+        await rm(stagedNew, { force: true });
+        const restoredStat = await stat(livePath);
+        result.unique_edit.push({
+          filename: lane.filename,
+          sha256: capturedHash,
+          mtime: restoredStat.mtime.toISOString(),
+        });
+        continue;
+      }
+
+      // Verified unchanged: move the staged baked file into place atomically.
+      await rename(stagedNew, livePath);
+
+      // Promote the captured old bytes into the official backup directory,
+      // created lazily so a run that replaces nothing creates no backup dir.
+      // The backup therefore holds exactly the bytes that were replaced.
       if (result.backup_path === null) {
         const backupDir = `${input.volumeDir}.bak-${backupStamp(input.now)}`;
         await mkdir(backupDir);
@@ -356,7 +393,7 @@ export async function reconcileServedLanes(input: {
       if (await pathExists(backupFile)) {
         throw new Error(`Backup target already exists: ${backupFile}`);
       }
-      await rename(stagedBackup, backupFile);
+      await rename(stagedOld, backupFile);
       result.replaced.push(lane.filename);
     }
 
