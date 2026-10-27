@@ -74,6 +74,7 @@ ARG NODE26_VERSION=26.12.1
 ARG NODE26_SHA256=6170b2d474e1c626f43cff3adc118df9fe3b573258a4fc3d850c8dbc6b079bbd
 ARG PNPM_VERSION=12.14.0
 ARG PNPM_SHA256=ea206e35474bf87be9564a85ca70ed1c8ebdc45da55aafb0a3bf09d1ba69b179
+ARG PNPM_NATIVE_SHA256=1de98ed2e9621113b0887b06322b461efb9df73d913fc1d151039b10b7117a41
 
 WORKDIR /app
 
@@ -167,6 +168,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends xz-utils \
     && mkdir -p "/opt/pnpm-${PNPM_VERSION}" \
     && tar -xzf /tmp/pnpm.tgz -C "/opt/pnpm-${PNPM_VERSION}" --strip-components=1 \
     && rm -f /tmp/pnpm.tgz \
+    && curl -fsSLo /tmp/pnpm-native.tgz "https://registry.npmjs.org/@pnpm/exe.linux-x64/-/exe.linux-x64-${PNPM_VERSION}.tgz" \
+    && echo "${PNPM_NATIVE_SHA256}  /tmp/pnpm-native.tgz" | sha256sum -c - \
+    && mkdir -p /tmp/pnpm-native \
+    && tar -xzf /tmp/pnpm-native.tgz -C /tmp/pnpm-native \
+    && install -m 755 /tmp/pnpm-native/package/pnpm "/opt/pnpm-${PNPM_VERSION}/pnpm" \
+    && rm -rf /tmp/pnpm-native /tmp/pnpm-native.tgz \
     && chmod -R a+rX /opt/node26 "/opt/pnpm-${PNPM_VERSION}"
 
 # Point agent-browser to system Chromium (avoids ~400MB Chrome for Testing download)

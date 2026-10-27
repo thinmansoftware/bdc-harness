@@ -5,18 +5,31 @@ bun 1.3.11 server runtime. Repos that do not use pnpm are unchanged.
 
 Pins and paths
 
-- Node 26.12.1 is unpacked to /opt/node26. /opt/node26 is off the global PATH.
-- pnpm 12.14.0 is unpacked to /opt/pnpm-12.14.0.
-- The selector is /usr/local/bin/pnpm, installed from scripts/container/project-pnpm.sh (project-pnpm).
+Three artifacts are downloaded at image build time and verified with sha256sum
+before they are unpacked. Nothing is downloaded again at runtime.
+
+- Node 26.12.1 comes from the official Node linux-x64 archive. NODE26_SHA256
+  verifies node-v26.12.1-linux-x64.tar.xz. It is unpacked at /opt/node26 and
+  stays off the global PATH. pnpm-spawned commands use this Node.
+- The pnpm 12.14.0 wrapper comes from the pnpm registry archive. PNPM_SHA256
+  verifies pnpm-12.14.0.tgz. It is unpacked at /opt/pnpm-12.14.0 and keeps
+  package.json and dist/.
+- The native linux-x64 pnpm comes from @pnpm/exe.linux-x64.
+  PNPM_NATIVE_SHA256 verifies exe.linux-x64-12.14.0.tgz. Only that archive's
+  package/pnpm is installed over /opt/pnpm-12.14.0/pnpm. The wrapper
+  package.json and dist/ stay in place.
+- The selector is /usr/local/bin/pnpm, installed from
+  scripts/container/project-pnpm.sh (project-pnpm).
 
 How project-pnpm selects
 
 project-pnpm walks upward from the working directory to the nearest package.json
 and reads packageManager with jq.
 
-- pnpm@12.14.0, pnpm@12.14.0 plus a +sha suffix, or no package.json / no packageManager:
-  run /opt/pnpm-12.14.0/pnpm with /opt/node26/bin/node. /opt/node26/bin is prepended
-  to PATH for that process tree only.
+- pnpm@12.14.0, pnpm@12.14.0 plus a +sha suffix, or no package.json / no
+  packageManager: /usr/local/bin/pnpm executes the native binary at
+  /opt/pnpm-12.14.0/pnpm directly. It prepends /opt/node26/bin only to that
+  process tree's PATH. It does not run pnpm through Node.
 - Any other pnpm@X: exit 1 and write
   "project-pnpm: unsupported pnpm version X (image provides 12.14.0)" to stderr.
   A +sha suffix on X is removed before the message is printed. Nothing is downloaded.
@@ -36,14 +49,22 @@ inside the same credential-scrubbed subshell as the bun branch, and it always re
 
 Bumping a version
 
-Change the version ARG and the checksum ARG together.
+Change each version and its checksum together, from the publisher checksums.
+All three version/checksum pairs are updated together.
 
 - Node checksum: the node-v<version>-linux-x64.tar.xz line in
-  https://nodejs.org/dist/v<version>/SHASUMS256.txt.
-- pnpm checksum: the SHA-256 of
-  https://registry.npmjs.org/pnpm/-/pnpm-<version>.tgz.
+  https://nodejs.org/dist/v<version>/SHASUMS256.txt (NODE26_VERSION and NODE26_SHA256).
+- pnpm wrapper checksum: the SHA-256 of
+  https://registry.npmjs.org/pnpm/-/pnpm-<version>.tgz (PNPM_VERSION and PNPM_SHA256).
+- Native pnpm checksum: the SHA-256 of
+  https://registry.npmjs.org/@pnpm/exe.linux-x64/-/exe.linux-x64-<version>.tgz
+  (PNPM_NATIVE_SHA256). The version matches PNPM_VERSION.
 
 When it goes live
 
-Merging this change does not alter the running container. The pins go live only
-on the next governed harness rebuild by the XO under Rule 11.5.
+A green docker-build check is image proof. CI builds archon-ci:test and runs the
+offline pnpm probe plus the existing smoke tests. That check does not change the
+running container.
+
+The live container changes only after the next XO-governed Rule 11.5 harness
+rebuild. Stop 9 verifies that rebuild, and it is separate from CI image proof.

@@ -11,7 +11,7 @@ exec_pinned_pnpm() {
   node_dir="$(dirname "$PROJECT_PNPM_NODE")"
   PATH="${node_dir}${PATH:+:$PATH}"
   export PATH
-  exec "$PROJECT_PNPM_NODE" "$PROJECT_PNPM_BIN" "$@"
+  exec "$PROJECT_PNPM_BIN" "$@"
 }
 
 search_dir="$PWD"
