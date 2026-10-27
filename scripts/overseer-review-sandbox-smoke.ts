@@ -68,7 +68,7 @@ try {
 
   const probe = [
     'set -eu',
-    'assert_denied() { name="$1"; shift; output="$("$@" 2>&1)" && { echo "FAIL: $name succeeded"; exit 1; }; printf "%s" "$output" | grep -Eqi "Permission denied|Operation not permitted|Landlock|EACCES|Connection refused|Network is unreachable|blocked" || { echo "FAIL: $name failed for an unexpected reason: $output"; exit 1; }; }',
+    'assert_denied() { name="$1"; shift; output="$("$@" 2>&1)" && { echo "FAIL: $name succeeded"; exit 1; }; printf "%s" "$output" | grep -Eqi "Permission denied|Operation not permitted|Landlock|EACCES|Connection refused|Could not connect to server|Network is unreachable|blocked" || { echo "FAIL: $name failed for an unexpected reason: $output"; exit 1; }; }',
     'test "$(id -u)" = 1002',
     'test "$(cat allowed.txt)" = allowed',
     'assert_denied secret_read cat /run/secrets/thinman-overseer.pem',
