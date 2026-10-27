@@ -21,6 +21,7 @@ import {
   type CreateAuthenticatedMessageData,
 } from '@archon/core/db/dispatch';
 import { getOperatorSetting } from '@archon/core/db/operator-settings';
+import { getLatestSeatUsageReading } from '@archon/core/db/seat-usage-readings';
 
 export const SEAT_IDS = ['claude', 'codex', 'cursor'] as const;
 export type SeatId = (typeof SEAT_IDS)[number];
@@ -84,6 +85,8 @@ export interface SeatReading {
   http_status?: number;
   allowed?: boolean;
   limit_reached?: boolean;
+  reading_source?: 'probe' | 'pushed';
+  observed_at?: string;
 }
 
 export interface SeatGateAllow {
@@ -105,12 +108,22 @@ export interface SeatCutoff {
   source: 'operator' | 'env' | 'default';
 }
 
+export interface PushedCursorReading {
+  used_percent: number;
+  remaining_percent: number;
+  resets_at: string;
+  observed_at: string;
+  source: string;
+}
+
 export interface SeatReadDeps {
   fetch?: typeof fetch;
   now?: () => number;
   env?: Record<string, string | undefined>;
   claudeCredentialsFile?: string;
   codexAuthFile?: string;
+  /** Cursor only. Omitted in production, which reads the latest stored row. */
+  loadPushedReading?: () => Promise<PushedCursorReading | null>;
 }
 
 export type SeatUsageReader = (
@@ -131,6 +144,11 @@ const inflight = new Map<SeatId, Promise<SeatReading>>();
 const unknownAlertBucket = new Map<SeatId, number>();
 let cutoffOverride: number | null = null;
 let invalidCutoffLogged = false;
+let invalidPushedMaxAgeLogged = false;
+
+const DEFAULT_PUSHED_READING_MAX_AGE_MINUTES = 30;
+const MIN_PUSHED_READING_MAX_AGE_MINUTES = 1;
+const MAX_PUSHED_READING_MAX_AGE_MINUTES = 1440;
 let readerOverride: SeatUsageReader | null = null;
 
 const defaultWarn: WarnLog = (obj, msg) => {
@@ -490,13 +508,111 @@ async function probeCursor(deps?: SeatReadDeps): Promise<SeatReading> {
   );
 }
 
+function pushedReadingAgeMinutes(observedAt: string, deps?: SeatReadDeps): number {
+  const observedMs = Date.parse(observedAt);
+  if (!Number.isFinite(observedMs)) return Number.POSITIVE_INFINITY;
+  return Math.floor((nowMs(deps) - observedMs) / 60_000);
+}
+
+function pushedReadingIsFresh(observedAt: string, deps?: SeatReadDeps): boolean {
+  const observedMs = Date.parse(observedAt);
+  if (!Number.isFinite(observedMs)) return false;
+  const maxAgeMs = resolvePushedReadingMaxAgeMinutes(deps) * 60_000;
+  return nowMs(deps) - observedMs <= maxAgeMs;
+}
+
+function seatReadingFromPushed(row: PushedCursorReading, deps?: SeatReadDeps): SeatReading {
+  if (!pushedReadingIsFresh(row.observed_at, deps)) {
+    const ageMinutes = pushedReadingAgeMinutes(row.observed_at, deps);
+    const ageLabel = Number.isFinite(ageMinutes) ? String(ageMinutes) : 'unknown';
+    return {
+      ...unknownSeatReading(
+        'cursor',
+        `reading_stale observed_at=${row.observed_at} age_minutes=${ageLabel}`
+      ),
+      reading_source: 'pushed',
+      observed_at: row.observed_at,
+    };
+  }
+  return {
+    ...measuredReading(
+      'cursor',
+      [
+        {
+          name: 'monthly',
+          used_percent: row.used_percent,
+          remaining_percent: row.remaining_percent,
+          resets_at: row.resets_at,
+        },
+      ],
+      {},
+      deps
+    ),
+    reading_source: 'pushed',
+    observed_at: row.observed_at,
+  };
+}
+
+async function loadProductionPushedReading(): Promise<PushedCursorReading | null> {
+  return getLatestSeatUsageReading('cursor');
+}
+
+/**
+ * Cursor prefers a desktop-pushed reading. A fresh row is measured and does
+ * not probe. A stale row is UNKNOWN. No row falls through to the direct probe.
+ * A loader failure logs once per call and falls through to the direct probe.
+ */
+async function cursorFromPushedReading(deps?: SeatReadDeps): Promise<SeatReading | null> {
+  const loader = deps?.loadPushedReading ?? loadProductionPushedReading;
+  let row: PushedCursorReading | null;
+  try {
+    row = await loader();
+  } catch (err) {
+    warnLog(
+      { error: err instanceof Error ? err.message : String(err) },
+      'fuelglass.pushed_reading_read_failed'
+    );
+    return null;
+  }
+  if (!row) return null;
+  return seatReadingFromPushed(row, deps);
+}
+
 async function probeSeat(seat: SeatId, deps?: SeatReadDeps): Promise<SeatReading> {
   if (seat === 'claude') return probeClaude(deps);
   if (seat === 'codex') return probeCodex(deps);
   return probeCursor(deps);
 }
 
+/** Minutes a pushed cursor reading stays fresh. Blank env uses 30. Invalid env uses 30 and logs once. */
+export function resolvePushedReadingMaxAgeMinutes(deps?: SeatReadDeps): number {
+  const raw = envOf(deps, 'FUELGLASS_PUSHED_READING_MAX_AGE_MINUTES');
+  if (raw === undefined || raw.trim() === '') return DEFAULT_PUSHED_READING_MAX_AGE_MINUTES;
+  const trimmed = raw.trim();
+  const parsed = Number(trimmed);
+  const valid =
+    /^\d+$/.test(trimmed) &&
+    Number.isInteger(parsed) &&
+    parsed >= MIN_PUSHED_READING_MAX_AGE_MINUTES &&
+    parsed <= MAX_PUSHED_READING_MAX_AGE_MINUTES;
+  if (!valid) {
+    if (!invalidPushedMaxAgeLogged) {
+      invalidPushedMaxAgeLogged = true;
+      warnLog({ raw }, 'fuelglass.pushed_reading_max_age_env_invalid');
+    }
+    return DEFAULT_PUSHED_READING_MAX_AGE_MINUTES;
+  }
+  return parsed;
+}
+
 export async function readSeat(seat: SeatId, deps?: SeatReadDeps): Promise<SeatReading> {
+  // A pushed Cursor row is reloaded on every decision so a newer or newly
+  // stale reading is honored inside the 55s probe-cache window. It is not
+  // written into the cache; only a direct probe (no pushed row) is.
+  if (seat === 'cursor') {
+    const pushed = await cursorFromPushedReading(deps);
+    if (pushed) return pushed;
+  }
   const now = nowMs(deps);
   const hit = cache.get(seat);
   if (hit && now - hit.at < CACHE_TTL_MS) return hit.reading;
@@ -552,12 +668,19 @@ export function setSeatAlertSendForTests(send: SeatAlertSend | null): void {
   alertSend = send ?? defaultAlertSend;
 }
 
+/** Drop one seat's cached reading and in-flight probe. Leaves alerts and cutoff alone. */
+export function invalidateSeatUsageCache(seat: SeatId): void {
+  cache.delete(seat);
+  inflight.delete(seat);
+}
+
 export function resetSeatUsageCacheForTests(): void {
   cache.clear();
   inflight.clear();
   unknownAlertBucket.clear();
   cutoffOverride = null;
   invalidCutoffLogged = false;
+  invalidPushedMaxAgeLogged = false;
   readerOverride = null;
   warnLog = defaultWarn;
   alertSend = defaultAlertSend;
