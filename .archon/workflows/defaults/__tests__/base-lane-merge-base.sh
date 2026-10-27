@@ -6,7 +6,7 @@
 # repos. A parity check asserts the core is byte-identical across all 13 lanes.
 #
 # Run: bash .archon/workflows/defaults/__tests__/base-lane-merge-base.sh
-# Exits 0 on 8/8, 1 on any failure. ASCII only.
+# Exits 0 on 7/7, 1 on any failure. ASCII only.
 
 set -uo pipefail
 
@@ -245,12 +245,7 @@ test_2() {
   fi
 }
 
-test_3() {
-  local clone="$TMP/t3" art="$TMP/art3"
-  unset BMD_DEEPEN_STEP BMD_DEEPEN_CAP BMD_USE_TIMEOUT
-  export BMD_FETCH_MODE=exec
-  shallow_clone "$ORPHAN_ORIGIN" orphan "$clone"
-  run_bmd "$clone" "$art"
+assert_no_common_history() {
   if [ "$LAST_RC" -ne 1 ]; then
     printf '  rc=%s stdout=%s stderr=%s\n' "$LAST_RC" "$LAST_OUT" "$LAST_ERR"
     return 1
@@ -266,6 +261,47 @@ test_3() {
   case "$LAST_ERR" in
     *merge_base_fetch_failed*) printf '  fetch failure class: %s\n' "$LAST_ERR"; return 1 ;;
   esac
+}
+
+test_3() {
+  local clone="$TMP/t3" art="$TMP/art3" shallow dcount ucount small
+  unset BMD_DEEPEN_STEP BMD_DEEPEN_CAP BMD_USE_TIMEOUT
+  export BMD_FETCH_MODE=exec
+  shallow_clone "$ORPHAN_ORIGIN" orphan "$clone"
+  run_bmd "$clone" "$art"
+  assert_no_common_history || return 1
+
+  # A deepen round that finishes a short unrelated history must stop before
+  # --unshallow. Git rejects --unshallow on a completed repo, which would be
+  # misreported as merge_base_fetch_failed.
+  small="$TMP/small-origin"
+  clone="$TMP/t3b"
+  art="$TMP/art3b"
+  make_orphan_origin "$small" 5
+  export BMD_DEEPEN_STEP=50 BMD_DEEPEN_CAP=1000
+  : > "$BMD_FETCH_LOG"
+  shallow_clone "$small" orphan "$clone"
+  run_bmd "$clone" "$art"
+  assert_no_common_history || return 1
+  case "$LAST_ERR" in
+    *shallow=false*) ;;
+    *) printf '  expected completed-repo marker: %s\n' "$LAST_ERR"; return 1 ;;
+  esac
+  dcount=$(grep -c -- '--deepen' "$BMD_FETCH_LOG" || true)
+  ucount=$(grep -c -- '--unshallow' "$BMD_FETCH_LOG" || true)
+  if [ "$dcount" -lt 1 ] || [ "$dcount" -gt 2 ]; then
+    printf '  deepen count %s (expected one round)\n%s\n' "$dcount" "$(cat "$BMD_FETCH_LOG")"
+    return 1
+  fi
+  if [ "$ucount" -ne 0 ]; then
+    printf '  unshallow ran after the repo completed: %s\n' "$(cat "$BMD_FETCH_LOG")"
+    return 1
+  fi
+  shallow=$(g -C "$clone" rev-parse --is-shallow-repository)
+  if [ "$shallow" != "false" ]; then
+    printf '  clone still shallow after deepen\n'
+    return 1
+  fi
 }
 
 test_4() {
@@ -345,51 +381,6 @@ test_6() {
   esac
 }
 
-test_8() {
-  local clone="$TMP/t8" art="$TMP/art8" shallow dcount ucount small
-  small="$TMP/small-origin"
-  make_orphan_origin "$small" 5
-  export BMD_DEEPEN_STEP=50 BMD_DEEPEN_CAP=1000 BMD_FETCH_MODE=exec
-  unset BMD_USE_TIMEOUT
-  : > "$BMD_FETCH_LOG"
-  shallow_clone "$small" orphan "$clone"
-  run_bmd "$clone" "$art"
-  if [ "$LAST_RC" -ne 1 ]; then
-    printf '  rc=%s stdout=%s stderr=%s\n' "$LAST_RC" "$LAST_OUT" "$LAST_ERR"
-    return 1
-  fi
-  case "$LAST_ERR" in
-    *worktree_not_on_declared_base_lane*) ;;
-    *) printf '  missing class: %s\n' "$LAST_ERR"; return 1 ;;
-  esac
-  case "$LAST_ERR" in
-    *no_common_history*) ;;
-    *) printf '  missing no_common_history: %s\n' "$LAST_ERR"; return 1 ;;
-  esac
-  case "$LAST_ERR" in
-    *merge_base_fetch_failed*) printf '  fetch failure class: %s\n' "$LAST_ERR"; return 1 ;;
-  esac
-  case "$LAST_ERR" in
-    *shallow=false*) ;;
-    *) printf '  expected completed-repo marker: %s\n' "$LAST_ERR"; return 1 ;;
-  esac
-  dcount=$(grep -c -- '--deepen' "$BMD_FETCH_LOG" || true)
-  ucount=$(grep -c -- '--unshallow' "$BMD_FETCH_LOG" || true)
-  if [ "$dcount" -lt 1 ] || [ "$dcount" -gt 2 ]; then
-    printf '  deepen count %s (expected one round)\n%s\n' "$dcount" "$(cat "$BMD_FETCH_LOG")"
-    return 1
-  fi
-  if [ "$ucount" -ne 0 ]; then
-    printf '  unshallow ran after the repo completed: %s\n' "$(cat "$BMD_FETCH_LOG")"
-    return 1
-  fi
-  shallow=$(g -C "$clone" rev-parse --is-shallow-repository)
-  if [ "$shallow" != "false" ]; then
-    printf '  clone still shallow after deepen\n'
-    return 1
-  fi
-}
-
 test_7() {
   local begin=0 lane hashes old any calls echoes
   local lane_path
@@ -450,9 +441,8 @@ scenario "4 deepen is bounded and unshallow runs once" test_4
 scenario "5 resolvable merge-base does not fetch" test_5
 scenario "6 fetch failure is its own class" test_6
 scenario "7 every lane carries the same core" test_7
-scenario "8 deepen that completes unrelated history reports no_common_history" test_8
 
-printf '%s passing / 8 total\n' "$PASS"
+printf '%s passing / 7 total\n' "$PASS"
 if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
