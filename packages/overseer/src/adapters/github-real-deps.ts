@@ -2050,12 +2050,35 @@ export function createRealGitHubClientDeps(
             executionProof?: {
               headSha?: unknown;
               inspectionObserved?: unknown;
+              check_plan?: unknown;
               checks?: unknown[];
             };
             githubReview?: { id?: unknown; commitSha?: unknown; state?: unknown };
           };
           const proof = body.executionProof;
           const review = body.githubReview;
+          const reviewMatches =
+            typeof review?.id === 'number' &&
+            review?.commitSha === input.headSha &&
+            review?.state === 'APPROVED';
+          // Receipts written before native review execution was activated did
+          // not contain executionProof. Preserve their exact-head GitHub
+          // qualification; once a receipt carries the new field, require the
+          // complete proof contract and never fall back to the legacy shape.
+          const executionQualifies =
+            proof === undefined ||
+            (proof.headSha === input.headSha &&
+              proof.inspectionObserved === true &&
+              Array.isArray(proof.checks) &&
+              ((proof.check_plan === 'absent' && proof.checks.length === 0) ||
+                (proof.check_plan === 'present' && proof.checks.length > 0)) &&
+              proof.checks.every(
+                check =>
+                  typeof check === 'object' &&
+                  check !== null &&
+                  'exitCode' in check &&
+                  check.exitCode === 0
+              ));
           return (
             body.kind === 'pr_review_submit_receipt' &&
             body.disposition === 'approved' &&
@@ -2063,20 +2086,8 @@ export function createRealGitHubClientDeps(
             body.repo === input.repo &&
             body.prNumber === input.number &&
             body.headSha === input.headSha &&
-            proof?.headSha === input.headSha &&
-            proof?.inspectionObserved === true &&
-            Array.isArray(proof?.checks) &&
-            proof.checks.length > 0 &&
-            proof.checks.every(
-              check =>
-                typeof check === 'object' &&
-                check !== null &&
-                'exitCode' in check &&
-                check.exitCode === 0
-            ) &&
-            typeof review?.id === 'number' &&
-            review?.commitSha === input.headSha &&
-            review?.state === 'APPROVED'
+            executionQualifies &&
+            reviewMatches
           );
         } catch {
           return false;

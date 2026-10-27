@@ -547,7 +547,7 @@ async function reviewObservedCheckout(input: {
 }
 
 describe.serial('observed checkout integrity and check environment', () => {
-  test('real_broker_process_chain reviewer_broker_unavailable fails closed with a Review incomplete comment', async () => {
+  test('real_broker_process_chain succeeds through the real broker then fails closed when it is killed', async () => {
     const spool = await mkdtemp(join(tmpdir(), 'overseer-real-process-'));
     const checkout = join(spool, 'checkout');
     await mkdir(checkout);
@@ -568,16 +568,29 @@ describe.serial('observed checkout integrity and check environment', () => {
     });
     try {
       // This suite normally runs as appuser, so the real broker must reject the
-      // launch. In the UID-1002 final image it starts, and is explicitly killed.
+      // launch. In the UID-1002 final image, drive the production caller through
+      // that separately running broker before killing it.
       if (process.getuid?.() === 1002) {
+        let ready = false;
         for (let attempt = 0; attempt < 100; attempt += 1) {
           try {
             await access(join(spool, 'ready'));
+            ready = true;
             break;
           } catch {
             await Bun.sleep(10);
           }
         }
+        expect(ready).toBe(true);
+        const successful = await reviewObservedCheckout({
+          dir: checkout,
+          head: checkoutHead,
+          checkPlan: [['/usr/bin/true']],
+          broker: false,
+        });
+        expect(successful.evaluated).toBe(true);
+        expect(successful.disposition).toBe('approved');
+        expect(successful.posts).toEqual(['APPROVE']);
         broker.kill('SIGTERM');
         await broker.exited;
       } else {
