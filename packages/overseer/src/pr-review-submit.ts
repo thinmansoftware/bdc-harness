@@ -162,7 +162,15 @@ export type SubmitDisposition =
    * transport failure only has a fixed backoff, and the two are worth telling
    * apart in the receipt when diagnosing why a review did not land.
    */
-  | 'rate_limited';
+  | 'rate_limited'
+  /**
+   * NON-TERMINAL. The PR head cannot merge into its base (merge state DIRTY /
+   * mergeable CONFLICTING). GitHub starts no pull_request workflow for that
+   * head, so there is nothing to review. The clock names the PR, notifies the
+   * operator once, and defers. Never a silent deferral and never terminal:
+   * terminating here would retire a head that never received a verdict.
+   */
+  | 'pr_conflicting';
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
@@ -193,9 +201,9 @@ export interface SubmitOutcome {
    * deliver.
    *
    * Deliberately NOT set on the non-terminal deferrals (`checks_pending`,
-   * `rate_limited`, `transport_error`): no verdict was formed there, their
-   * `summary` is the empty string, and `checks_pending` already authorizes a
-   * recheck on its disposition alone.
+   * `rate_limited`, `transport_error`, `pr_conflicting`): no verdict was formed
+   * there, their `summary` is the empty string, and `checks_pending` already
+   * authorizes a recheck on its disposition alone.
    */
   summary?: string;
   /** Set only on `rate_limited`: when the item should become claimable again. */
@@ -220,6 +228,18 @@ export interface SubmitDeps {
    * must never land on a head the reviewer did not examine.
    */
   currentHeadSha(input: { owner: string; repo: string; prNumber: number }): Promise<string>;
+  /**
+   * Live merge state of the PR under review. Optional: when absent, the
+   * submit path behaves exactly as it did before this read existed.
+   *
+   * `mergeableState` accepts the REST lowercase value (`dirty`) and the
+   * GraphQL enum (`DIRTY`). `mergeable` accepts the REST boolean and the
+   * GraphQL string (`CONFLICTING`). A thrown read is not a conflict.
+   */
+  readMergeState?(input: { owner: string; repo: string; prNumber: number }): Promise<{
+    mergeableState?: string | null;
+    mergeable?: boolean | string | null;
+  }>;
   recordReceipt(input: {
     correlationId: string;
     messageId: string;
@@ -300,11 +320,33 @@ export function buildReviewBody(work: ReviewWorkItem, verdict: ReviewerVerdict):
 }
 
 /**
+ * DIRTY + a conflicting or unknown mergeable flag. `unknown`, `blocked`, and
+ * `clean` are not conflicts, and a mergeable `true` / `MERGEABLE` head is not
+ * either -- GitHub can report DIRTY for reasons other than a content conflict
+ * only when mergeable says otherwise, and those stay on the review path.
+ */
+function isDirtyMergeConflict(state: {
+  mergeableState?: string | null;
+  mergeable?: boolean | string | null;
+}): boolean {
+  if (state.mergeableState !== 'dirty' && state.mergeableState !== 'DIRTY') return false;
+  const mergeable = state.mergeable;
+  return (
+    mergeable === false ||
+    mergeable === 'CONFLICTING' ||
+    mergeable === null ||
+    mergeable === undefined
+  );
+}
+
+/**
  * Run the governed reviewer for one claimed work item and submit its verdict.
  *
- * Order is deliberate: custody first (never review our own PR), then the
- * reviewer, then a head re-read (a push during review invalidates the result),
- * then submission. Every terminal branch writes a receipt.
+ * Order is deliberate: custody first (never review our own PR), then a
+ * merge-state read (a DIRTY conflicting head is named by the clock and never
+ * reviewed), then the reviewer, then a head re-read (a push during review
+ * invalidates the result), then submission. Every terminal branch writes a
+ * receipt. `pr_conflicting` does not: it is clock-owned and records no receipt.
  */
 export async function runAndSubmitReview(
   work: ReviewWorkItem,
@@ -344,6 +386,24 @@ export async function runAndSubmitReview(
       disposition: 'merge_custody_conflict',
       reason: 'merge_manager_shares_reviewer_identity_m153',
     });
+  }
+
+  // A DIRTY / CONFLICTING head never starts the pull_request test workflow.
+  // Name it and return before the reviewer. A read failure is not a conflict:
+  // GitHub being briefly unreadable must not park an otherwise reviewable PR.
+  if (deps.readMergeState) {
+    try {
+      const mergeState = await deps.readMergeState({
+        owner: work.owner,
+        repo: work.repo,
+        prNumber: work.prNumber,
+      });
+      if (isDirtyMergeConflict(mergeState)) {
+        return { disposition: 'pr_conflicting', reason: 'merge_state_dirty' };
+      }
+    } catch {
+      // Intentional: keep the existing review path when the read throws.
+    }
   }
 
   let verdict: ReviewerVerdict;

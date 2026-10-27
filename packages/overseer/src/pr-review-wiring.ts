@@ -1047,6 +1047,20 @@ export function createRealSubmitDeps(
       });
       return pr.data.head.sha;
     },
+    async readMergeState(input): Promise<{
+      mergeableState: string | null | undefined;
+      mergeable: boolean | null | undefined;
+    }> {
+      const pr = await octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.prNumber,
+      });
+      return {
+        mergeableState: pr.data.mergeable_state,
+        mergeable: pr.data.mergeable,
+      };
+    },
     async recordReceipt(input): Promise<void> {
       // This receipt IS the escalation path: every terminal disposition lands
       // in the operator dispatch inbox, which XO drains at session start. #775

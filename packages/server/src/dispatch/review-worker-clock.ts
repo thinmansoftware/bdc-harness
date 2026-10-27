@@ -1,5 +1,6 @@
 import {
   claimMessage,
+  createAuthenticatedMessage,
   deferMessage,
   heartbeatWorker,
   listMessages,
@@ -26,6 +27,8 @@ import {
   createRealSubmitDeps,
   parseReviewWorkBody,
   REVIEW_RECIPIENT,
+  REVIEW_SENDER,
+  reviewSubjectKey,
   type ReviewRouteConfig,
 } from '@archon/overseer/pr-review-wiring';
 import {
@@ -64,6 +67,11 @@ export interface ReviewWorkerDeps {
    * `releaseMessage`, which already carries the required fencing guards.
    */
   deferMessage: typeof deferMessage;
+  /**
+   * One operator notice per conflicting head. Required on the production deps;
+   * the isolated approved-path probe may omit it because that path never sends.
+   */
+  createAuthenticatedMessage: typeof createAuthenticatedMessage;
   runAndSubmitReview: typeof runAndSubmitReview;
   createSubmitDeps: (reviewerIdentity: string) => ReturnType<typeof createRealSubmitDeps>;
   /** Optional logger seam for deterministic observability tests. */
@@ -88,7 +96,10 @@ interface ResultMapping {
 }
 
 function mapSubmitOutcome(
-  disposition: Exclude<SubmitDisposition, 'checks_pending' | 'transport_error' | 'rate_limited'>
+  disposition: Exclude<
+    SubmitDisposition,
+    'checks_pending' | 'transport_error' | 'rate_limited' | 'pr_conflicting'
+  >
 ): ResultMapping {
   switch (disposition) {
     // `stale_head` and `superseded_head` both mean the head this item is BOUND
@@ -136,6 +147,7 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     postResult,
     releaseMessage,
     deferMessage,
+    createAuthenticatedMessage,
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
     staleVerdictSweep: config =>
@@ -294,6 +306,40 @@ export async function tickReviewWorkerClock(
             not_before: new Date(
               Date.now() + (outcome.retryAfterMs ?? CHECKS_PENDING_BACKOFF_MS)
             ).toISOString(),
+          });
+          continue;
+        }
+        // DIRTY / CONFLICTING: GitHub will not run pull_request workflows, so a
+        // silent checks-pending defer leaves the head unreviewed with no name.
+        // Notify the operator once for this head, then defer so a later clean
+        // merge is re-evaluated. Never postResult and never releaseMessage.
+        if (outcome.disposition === 'pr_conflicting') {
+          (deps.logger ?? log).warn(
+            {
+              messageId: claimed.id,
+              owner: work.owner,
+              repo: work.repo,
+              prNumber: work.prNumber,
+              headSha: work.headSha,
+            },
+            'overseer_review_pr_conflicting'
+          );
+          await deps.createAuthenticatedMessage(
+            { kind: 'system', sender: REVIEW_SENDER },
+            {
+              correlation_id: work.correlationId,
+              idempotency_key: `pr-conflicting:${work.owner}/${work.repo}#${work.prNumber}@${work.headSha}`,
+              task_type: 'agent_message',
+              recipient: 'operator',
+              subject_key: reviewSubjectKey(work.owner, work.repo, work.prNumber),
+              body: `PR ${work.owner}/${work.repo}#${work.prNumber} head ${work.headSha} is DIRTY`,
+            }
+          );
+          await deps.deferMessage({
+            id: claimed.id,
+            worker_id: REVIEW_WORKER_ID,
+            fencing_token: claimed.fencing_token,
+            defer_until: new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString(),
           });
           continue;
         }

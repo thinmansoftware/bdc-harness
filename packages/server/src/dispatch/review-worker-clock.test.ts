@@ -111,6 +111,9 @@ function fakeDeps(
     // calls the deferral by its WO name. It delegates to releaseMessage, so the
     // fencing guards asserted below are unchanged.
     deferMessage: mock(async () => null),
+    createAuthenticatedMessage: mock(async () => ({
+      id: 'notice',
+    })) as unknown as ReviewWorkerDeps['createAuthenticatedMessage'],
     runAndSubmitReview: mock(async work => outcomeFor(work.messageId)),
     createSubmitDeps: mock(() => ({ reviewerIdentity: CONFIG.reviewerIdentity }) as SubmitDeps),
   };
@@ -419,6 +422,76 @@ describe('review worker clock', () => {
       })
     );
     expect(deps.createSubmitDeps).toHaveBeenCalledTimes(1);
+  });
+
+  test('names a DIRTY PR as pr_conflicting, notifies once, and defers', async () => {
+    const headSha = 'd4a35ab6';
+    const base = message('conflict', headSha);
+    const queued = [
+      {
+        ...base,
+        correlation_id: 'correlation-conflict',
+        body: JSON.stringify({
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          prNumber: 1315,
+          headSha,
+          baseRef: 'dev',
+          author: 'contributor',
+        }),
+      },
+    ];
+    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
+    const deps = fakeDeps(queued, () => ({
+      disposition: 'pr_conflicting',
+      reason: 'merge_state_dirty',
+    }));
+    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
+
+    const before = Date.now();
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(warnings).toEqual([
+      expect.objectContaining({
+        message: 'overseer_review_pr_conflicting',
+        data: expect.objectContaining({
+          messageId: 'conflict',
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          prNumber: 1315,
+          headSha,
+        }),
+      }),
+    ]);
+    expect(deps.createAuthenticatedMessage).toHaveBeenCalledTimes(1);
+    expect(deps.createAuthenticatedMessage).toHaveBeenCalledWith(
+      { kind: 'system', sender: 'overseer' },
+      expect.objectContaining({
+        correlation_id: 'correlation-conflict',
+        idempotency_key: 'pr-conflicting:thinmansoftware/bdc-harness#1315@d4a35ab6',
+        task_type: 'agent_message',
+        recipient: 'operator',
+        subject_key: 'gh:thinmansoftware/bdc-harness#1315',
+      })
+    );
+    const notice = (deps.createAuthenticatedMessage as ReturnType<typeof mock>).mock
+      .calls[0]?.[1] as {
+      body: string;
+    };
+    expect(notice.body).toContain('thinmansoftware/bdc-harness#1315');
+    expect(notice.body).toContain(headSha);
+    expect(notice.body).toContain('DIRTY');
+    expect(deps.deferMessage).toHaveBeenCalledTimes(1);
+    const deferArg = (deps.deferMessage as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+      id: string;
+      fencing_token: number;
+      defer_until: string;
+    };
+    expect(deferArg.id).toBe('conflict');
+    expect(deferArg.fencing_token).toBe(1);
+    expect(new Date(deferArg.defer_until).getTime()).toBeGreaterThan(before);
+    expect(deps.postResult).not.toHaveBeenCalled();
+    expect(deps.releaseMessage).not.toHaveBeenCalled();
   });
 
   test('does not start when review route configuration is absent', async () => {

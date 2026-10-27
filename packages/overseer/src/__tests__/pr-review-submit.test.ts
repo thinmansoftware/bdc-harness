@@ -512,6 +512,88 @@ describe('receipts', () => {
   });
 });
 
+describe('conflicting pull request', () => {
+  test('a dirty conflicting head is pr_conflicting before any review', async () => {
+    let reviewerRan = false;
+    const { deps, rec } = makeDeps({
+      readMergeState: async () => ({ mergeableState: 'dirty', mergeable: false }),
+      runReviewer: async () => {
+        reviewerRan = true;
+        return { approved: true, summary: 'should not run', reviewedHeadSha: HEAD };
+      },
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome).toEqual({ disposition: 'pr_conflicting', reason: 'merge_state_dirty' });
+    expect(reviewerRan).toBe(false);
+    expect(rec.submitted).toHaveLength(0);
+    expect(rec.receipts).toHaveLength(0);
+  });
+
+  test('GraphQL DIRTY + CONFLICTING and an absent mergeable flag are conflicts', async () => {
+    for (const mergeState of [
+      { mergeableState: 'DIRTY', mergeable: 'CONFLICTING' as const },
+      { mergeableState: 'dirty', mergeable: null },
+      { mergeableState: 'DIRTY' },
+    ]) {
+      const { deps, rec } = makeDeps({
+        readMergeState: async () => mergeState,
+      });
+      const outcome = await runAndSubmitReview(WORK, deps);
+      expect(outcome.disposition).toBe('pr_conflicting');
+      expect(rec.submitted).toHaveLength(0);
+      expect(rec.receipts).toHaveLength(0);
+    }
+  });
+
+  test('unknown, blocked, clean, and a mergeable DIRTY head are not conflicts', async () => {
+    for (const mergeState of [
+      { mergeableState: 'unknown', mergeable: false },
+      { mergeableState: 'blocked', mergeable: false },
+      { mergeableState: 'clean', mergeable: true },
+      { mergeableState: 'dirty', mergeable: true },
+      { mergeableState: 'DIRTY', mergeable: 'MERGEABLE' },
+      { mergeableState: 'DIRTY', mergeable: 'UNKNOWN' },
+    ]) {
+      const { deps, rec } = makeDeps({
+        readMergeState: async () => mergeState,
+      });
+      const outcome = await runAndSubmitReview(WORK, deps);
+      expect(outcome.disposition).toBe('approved');
+      expect(rec.submitted).toHaveLength(1);
+    }
+  });
+
+  test('a merge-state read failure continues into the reviewer', async () => {
+    let reviewerRan = false;
+    const { deps, rec } = makeDeps({
+      readMergeState: async () => {
+        throw new Error('github_unavailable');
+      },
+      runReviewer: async () => {
+        reviewerRan = true;
+        return { approved: true, summary: 'reviewed', reviewedHeadSha: HEAD };
+      },
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(reviewerRan).toBe(true);
+    expect(outcome.disposition).toBe('approved');
+    expect(rec.submitted).toHaveLength(1);
+  });
+
+  test('custody still runs before the merge-state read', async () => {
+    let read = false;
+    const { deps } = makeDeps({
+      readMergeState: async () => {
+        read = true;
+        return { mergeableState: 'dirty', mergeable: false };
+      },
+    });
+    const outcome = await runAndSubmitReview({ ...WORK, author: REVIEWER }, deps);
+    expect(outcome.disposition).toBe('custody_conflict');
+    expect(read).toBe(false);
+  });
+});
+
 describe('buildReviewBody', () => {
   test('includes the head and the reviewer summary', () => {
     const body = buildReviewBody(WORK, {

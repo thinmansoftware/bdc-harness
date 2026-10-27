@@ -3464,6 +3464,59 @@ nodes:
       if [ "$CHANGED" -gt 0 ]; then
         echo "SALVAGE=preserved_uncommitted:${CHANGED}"
       fi
+      bdc_resolve_merge_base() {
+        local override="" staging=0
+        if [ -n "${DECIDE_OUTPUT:-}" ]; then
+          override=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          staging=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' || true)
+        fi
+        if [ -n "$override" ]; then
+          printf '%s\n' "$override"
+        elif [ "${staging:-0}" -ge 1 ]; then
+          printf '%s\n' "staging"
+        else
+          printf '%s\n' "${BASE_BRANCH:-dev}"
+        fi
+      }
+      bdc_base_merge_first() {
+        local base="$1" paths line pr sha
+        git fetch origin "$base"
+        if ! git merge --no-edit "origin/${base}"; then
+          paths=$(git diff --name-only --diff-filter=U | paste -sd, -)
+          git merge --abort
+          line="base_merge_conflict=${paths}"
+          mkdir -p "${ARTIFACTS_DIR:-.}"
+          printf '%s\n' "$line" > "${ARTIFACTS_DIR:-.}/base-merge-conflict.txt"
+          printf '%s\n' "$line"
+          printf '%s\n' "base_merge_conflict" >&2
+          pr=$(gh pr view --json number -q .number 2>/dev/null || true)
+          if [ -n "$pr" ]; then
+            gh pr comment "$pr" --body "$line" >/dev/null 2>&1 || true
+          fi
+          return 1
+        fi
+        sha=$(git rev-parse HEAD)
+        mkdir -p "${ARTIFACTS_DIR:-.}"
+        printf '%s\n' "$sha" > "${ARTIFACTS_DIR:-.}/base-merged-sha.txt"
+        printf 'base_merged_sha=%s\n' "$sha"
+      }
+      bdc_run_changed_paths() {
+        local sha_file="${ARTIFACTS_DIR:-.}/base-merged-sha.txt"
+        local start_file="${ARTIFACTS_DIR:-.}/run-start-sha.txt"
+        local sha start
+        if [ -s "$sha_file" ]; then
+          sha=$(tr -d '[:space:]' < "$sha_file")
+          if git rev-parse --verify --quiet "${sha}^2^{commit}" >/dev/null 2>&1; then
+            git diff --name-only "${sha}^2" HEAD
+            return 0
+          fi
+        fi
+        start=$(tr -d '[:space:]' < "$start_file")
+        git diff --name-only "$start" HEAD
+      }
+      set -e
+      bdc_base_merge_first "$(bdc_resolve_merge_base)"
+      set +e
       if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
         REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
         PR_URL=$(gh pr create --repo "$REPO" --head "$BR" --base "${BASE_BRANCH:-dev}" \
@@ -4309,6 +4362,61 @@ nodes:
       # WO-HARNESS-YAML-USE-THREAD-BRANCH-NOT-FEATURE-BRANCH-01: push via refspec
       # so the local archon/thread-<hash> branch lands on a unique remote name
       # (UNIQUE_BRANCH) and does not collide with other parallel runs.
+      # ---- BEGIN base-merge-first ----
+      bdc_resolve_merge_base() {
+        local override="" staging=0
+        if [ -n "${DECIDE_OUTPUT:-}" ]; then
+          override=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          staging=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' || true)
+        fi
+        if [ -n "$override" ]; then
+          printf '%s\n' "$override"
+        elif [ "${staging:-0}" -ge 1 ]; then
+          printf '%s\n' "staging"
+        else
+          printf '%s\n' "${BASE_BRANCH:-dev}"
+        fi
+      }
+      bdc_base_merge_first() {
+        local base="$1" paths line pr sha
+        git fetch origin "$base"
+        if ! git merge --no-edit "origin/${base}"; then
+          paths=$(git diff --name-only --diff-filter=U | paste -sd, -)
+          git merge --abort
+          line="base_merge_conflict=${paths}"
+          mkdir -p "${ARTIFACTS_DIR:-.}"
+          printf '%s\n' "$line" > "${ARTIFACTS_DIR:-.}/base-merge-conflict.txt"
+          printf '%s\n' "$line"
+          printf '%s\n' "base_merge_conflict" >&2
+          pr=$(gh pr view --json number -q .number 2>/dev/null || true)
+          if [ -n "$pr" ]; then
+            gh pr comment "$pr" --body "$line" >/dev/null 2>&1 || true
+          fi
+          return 1
+        fi
+        sha=$(git rev-parse HEAD)
+        mkdir -p "${ARTIFACTS_DIR:-.}"
+        printf '%s\n' "$sha" > "${ARTIFACTS_DIR:-.}/base-merged-sha.txt"
+        printf 'base_merged_sha=%s\n' "$sha"
+      }
+      bdc_run_changed_paths() {
+        local sha_file="${ARTIFACTS_DIR:-.}/base-merged-sha.txt"
+        local start_file="${ARTIFACTS_DIR:-.}/run-start-sha.txt"
+        local sha start
+        if [ -s "$sha_file" ]; then
+          sha=$(tr -d '[:space:]' < "$sha_file")
+          if git rev-parse --verify --quiet "${sha}^2^{commit}" >/dev/null 2>&1; then
+            git diff --name-only "${sha}^2" HEAD
+            return 0
+          fi
+        fi
+        start=$(tr -d '[:space:]' < "$start_file")
+        git diff --name-only "$start" HEAD
+      }
+      # ---- END base-merge-first ----
+      bdc_base_merge_first "$(bdc_resolve_merge_base)"
+      mkdir -p "$ARTIFACTS_DIR"
+      bdc_run_changed_paths > "$ARTIFACTS_DIR/run-changed-paths.txt"
       PUSH_OK=false
       for attempt in 1 2 3; do
         if [ -n "${REPAIR_TARGET_LEASE_SHA:-}" ]; then
@@ -4405,6 +4513,57 @@ nodes:
       REPAIR_TARGET_LEASE_SHA=$(printf '%s\n' "$COMMIT_PUSH_OUTPUT" | sed -n 's/^REPAIR_TARGET_LEASE_SHA=//p' | tail -n 1)
       # WO-HARNESS-OPEN-PR-ORIGIN-WAIT-01: tolerate delayed origin visibility,
       # then re-push and re-verify before failing the PR-open precondition.
+      bdc_resolve_merge_base() {
+        local override="" staging=0
+        if [ -n "${DECIDE_OUTPUT:-}" ]; then
+          override=$(printf '%s\n' "$DECIDE_OUTPUT" | sed -n 's/^base_branch_override: //p' | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          staging=$(printf '%s\n' "$DECIDE_OUTPUT" | grep -c '^staging_gate_required: true' || true)
+        fi
+        if [ -n "$override" ]; then
+          printf '%s\n' "$override"
+        elif [ "${staging:-0}" -ge 1 ]; then
+          printf '%s\n' "staging"
+        else
+          printf '%s\n' "${BASE_BRANCH:-dev}"
+        fi
+      }
+      bdc_base_merge_first() {
+        local base="$1" paths line pr sha
+        git fetch origin "$base"
+        if ! git merge --no-edit "origin/${base}"; then
+          paths=$(git diff --name-only --diff-filter=U | paste -sd, -)
+          git merge --abort
+          line="base_merge_conflict=${paths}"
+          mkdir -p "${ARTIFACTS_DIR:-.}"
+          printf '%s\n' "$line" > "${ARTIFACTS_DIR:-.}/base-merge-conflict.txt"
+          printf '%s\n' "$line"
+          printf '%s\n' "base_merge_conflict" >&2
+          pr=$(gh pr view --json number -q .number 2>/dev/null || true)
+          if [ -n "$pr" ]; then
+            gh pr comment "$pr" --body "$line" >/dev/null 2>&1 || true
+          fi
+          return 1
+        fi
+        sha=$(git rev-parse HEAD)
+        mkdir -p "${ARTIFACTS_DIR:-.}"
+        printf '%s\n' "$sha" > "${ARTIFACTS_DIR:-.}/base-merged-sha.txt"
+        printf 'base_merged_sha=%s\n' "$sha"
+      }
+      bdc_run_changed_paths() {
+        local sha_file="${ARTIFACTS_DIR:-.}/base-merged-sha.txt"
+        local start_file="${ARTIFACTS_DIR:-.}/run-start-sha.txt"
+        local sha start
+        if [ -s "$sha_file" ]; then
+          sha=$(tr -d '[:space:]' < "$sha_file")
+          if git rev-parse --verify --quiet "${sha}^2^{commit}" >/dev/null 2>&1; then
+            git diff --name-only "${sha}^2" HEAD
+            return 0
+          fi
+        fi
+        start=$(tr -d '[:space:]' < "$start_file")
+        git diff --name-only "$start" HEAD
+      }
+      bdc_base_merge_first "$(bdc_resolve_merge_base)"
       LOCAL_HEAD="$(git rev-parse HEAD)"
 
       wait_match() {
