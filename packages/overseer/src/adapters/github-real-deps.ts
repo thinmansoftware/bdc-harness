@@ -1,7 +1,11 @@
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
-import { resolveServiceGitHubAuth, type GitHubService } from '@archon/core/github/service-identity';
+import {
+  resolveLegacyGitHubToken,
+  resolveServiceGitHubAuth,
+  type GitHubService,
+} from '@archon/core/github/service-identity';
 import {
   assertPersistedGitHubPoolAvailable,
   flushGitHubApiMeter,
@@ -590,7 +594,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
 
 /** Resolve the GitHub token from the standard env vars. No fallback secrets. */
 export function resolveGitHubToken(): string {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
+  const token = resolveLegacyGitHubToken();
   if (!token) {
     throw new Error(
       'overseer_real_adapter_missing_github_token: set GH_TOKEN or GITHUB_TOKEN to run Overseer in real mode'
@@ -814,7 +818,7 @@ export function createRealOctokitClient(
  * identities, and nothing here widens what the PAT is used for.
  */
 export function createRealReadOnlyPatOctokitClient(): RealGitHubOctokitLike | null {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
+  const token = resolveLegacyGitHubToken();
   if (!token) return null;
   const client = new Octokit({ auth: token });
   attachGitHubQuotaHooks(client, 'overseer', 'user-pat');

@@ -3,6 +3,10 @@
  * Handles issue and PR comments with @mention detection
  */
 import { Octokit } from '@octokit/rest';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 import { checkGitHubWebhookSignature } from './webhook-signature';
 import { readdir, access } from 'fs/promises';
 import { join } from 'path';
@@ -484,7 +488,7 @@ export class GitHubAdapter implements IPlatformAdapter {
 
     // Directory doesn't exist - clone the repository
     getLog().info({ owner, repo, repoPath }, 'github.repo_cloning');
-    const ghToken = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+    const ghToken = await getServiceGitHubToken(resolveServiceGitHubAuth('overseer'));
     const repoUrl = `https://github.com/${owner}/${repo}.git`;
 
     const cloneResult = await cloneRepository(
