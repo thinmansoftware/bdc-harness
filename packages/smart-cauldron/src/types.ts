@@ -16,7 +16,8 @@ export type TierOutcome =
   | 'infra-error' // auth/transport failure -- alert, do not count as "too hard"
   | 'progress-timeout' // poll watchdog kill -- run never reached terminal; climb like gate-failed
   | 'cancelled' // externally cancelled; stop, do not climb
-  | 'refused'; // already-satisfied guard refused to fire this attempt; distinct from won (bdc-xo#2140)
+  | 'refused' // already-satisfied guard refused to fire this attempt; distinct from won (bdc-xo#2140)
+  | 'spec-error'; // synchronous spec refusal; stop, do not climb
 
 export interface LadderTier {
   name: TierName;
@@ -65,8 +66,9 @@ export type CascadeStatus =
   | 'frontier-rejected' // operator rejected the premium-tier climb; terminated as needs-human, no fire
   | 'frontier-approved' // operator approved the premium climb; original record handed off to the resumed cascade (resumeCascadeId)
   | 'cancelled' // an attempt was externally cancelled; cascade stopped
-  | 'refused'; // the already-satisfied guard refused to fire (WO already has a landed PR); attempts stays 0. Distinct from 'won': no tier ran, no gate passed --
-// a refusal is not a win and must never be reported as one (bdc-xo#2140).
+  | 'refused' // the already-satisfied guard refused to fire (WO already has a landed PR); attempts stays 0. Distinct from 'won': no tier ran, no gate passed --
+  // a refusal is not a win and must never be reported as one (bdc-xo#2140).
+  | 'stopped_spec_error'; // a pre-dispatch spec refusal was read; cascade stopped and did not climb
 
 /**
  * FrontierApprovalPacket -- the preserved escalation packet stored when an
@@ -201,7 +203,9 @@ export interface FireResult {
   ok: boolean;
   runId: string | null; // resolved via discovery poll; null only on infra-error
   conversationId: string | null; // server-issued parent platform conversation id
-  infraError: string | null; // set when HTTP != 200 or discovery times out
+  infraError: string | null; // set when HTTP != 200, discovery times out, or a spec was refused
+  /** Set only for a pre-dispatch spec refusal. Omitted on success and on infra errors. */
+  errorClass?: 'spec_error';
 }
 
 export interface PollResult {

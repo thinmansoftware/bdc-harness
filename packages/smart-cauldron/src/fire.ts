@@ -5,6 +5,10 @@
  * resolved codebaseId and the /workflow run command. The response must prove
  * dispatched:true. The resulting run is discovered by the returned parent
  * conversation database id; no conversation identity is fabricated locally.
+ * While that poll is empty, the parent platform conversation is read for a
+ * pre_dispatch_refusal marker (spec error: stop, do not climb) or a
+ * pre_dispatch_infra marker (infrastructure: return immediately, do not
+ * label it a spec error, and do not wait out discovery timeout).
  *
  * Secret boundary: apiBaseUrl and token come from the caller or environment.
  */
@@ -205,8 +209,9 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
     };
   }
 
-  const runId = await discoverRunId({
+  const discovered = await discoverRunId({
     parentConversationId,
+    platformConversationId: conversationId,
     workflowName,
     codebaseId: binding.codebaseId,
     apiBaseUrl,
@@ -214,7 +219,7 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
     intervalMs: discoverIntervalMs,
     token,
   });
-  if (runId === null) {
+  if (discovered === null) {
     return {
       ok: false,
       runId: null,
@@ -222,19 +227,112 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
       infraError: `run discovery timeout after ${discoverTimeoutMs}ms for parent conversation ${parentConversationId}`,
     };
   }
+  if (discovered.kind === 'spec_error') {
+    return {
+      ok: false,
+      runId: null,
+      conversationId,
+      infraError: discovered.reason,
+      errorClass: 'spec_error',
+    };
+  }
+  if (discovered.kind === 'infra_error') {
+    return {
+      ok: false,
+      runId: null,
+      conversationId,
+      infraError: discovered.reason,
+    };
+  }
 
-  return { ok: true, runId, conversationId, infraError: null };
+  return { ok: true, runId: discovered.runId, conversationId, infraError: null };
+}
+
+const PRE_DISPATCH_REFUSAL_PREFIX = 'pre_dispatch_refusal:';
+const PRE_DISPATCH_INFRA_PREFIX = 'pre_dispatch_infra:';
+
+/**
+ * Only these reasons are spec errors. Any other pre-dispatch failure, including
+ * a refusal-prefixed DB or isolation error, stays infrastructure so the cascade
+ * can escalate. Keep in sync with orchestrator SPEC_REFUSAL_PREFIXES.
+ */
+const SPEC_REFUSAL_PREFIXES = [
+  'base_branch_not_single:',
+  'declared_base_branch_not_found:',
+  'scope_authority_missing:',
+  'authority_conflict:',
+  'Cannot dispatch workflow ',
+] as const;
+
+type DiscoveryOutcome =
+  | { kind: 'run'; runId: string }
+  | { kind: 'spec_error'; reason: string }
+  | { kind: 'infra_error'; reason: string };
+
+function isSpecRefusalMessage(message: string): boolean {
+  return SPEC_REFUSAL_PREFIXES.some(prefix => message.startsWith(prefix));
+}
+
+function messageContent(message: unknown): string | null {
+  if (typeof message !== 'object' || message === null || !('content' in message)) return null;
+  const content = (message as { content?: unknown }).content;
+  return typeof content === 'string' ? content : null;
+}
+
+function textAfterPrefix(content: string, prefix: string): string | null {
+  const at = content.indexOf(prefix);
+  if (at === -1) return null;
+  return content.slice(at + prefix.length).trim();
+}
+
+/**
+ * First pre-dispatch marker on the parent conversation.
+ * A refusal is a spec error only when its reason is a known spec code.
+ */
+function preDispatchOutcomeFromMessages(body: unknown): DiscoveryOutcome | null {
+  if (!Array.isArray(body)) return null;
+  for (const message of body) {
+    const content = messageContent(message);
+    if (content === null) continue;
+    const refusal = textAfterPrefix(content, PRE_DISPATCH_REFUSAL_PREFIX);
+    if (refusal !== null) {
+      if (isSpecRefusalMessage(refusal)) return { kind: 'spec_error', reason: refusal };
+      return { kind: 'infra_error', reason: refusal };
+    }
+    const infra = textAfterPrefix(content, PRE_DISPATCH_INFRA_PREFIX);
+    if (infra !== null) return { kind: 'infra_error', reason: infra };
+  }
+  return null;
+}
+
+async function readPreDispatchOutcome(opts: {
+  platformConversationId: string;
+  apiBaseUrl: string;
+  token: string;
+}): Promise<DiscoveryOutcome | null> {
+  try {
+    const response = await fetch(
+      `${opts.apiBaseUrl}/api/conversations/${encodeURIComponent(opts.platformConversationId)}/messages`,
+      { headers: authHeaders(opts.token) }
+    );
+    // A non-OK messages read is not itself a refusal. Keep polling.
+    if (!response.ok) return null;
+    return preDispatchOutcomeFromMessages(await response.json());
+  } catch {
+    return null;
+  }
 }
 
 async function discoverRunId(opts: {
   parentConversationId: string;
+  platformConversationId: string;
   workflowName: string;
   codebaseId: string;
   apiBaseUrl: string;
   timeoutMs: number;
   intervalMs: number;
   token: string;
-}): Promise<string | null> {
+}): Promise<DiscoveryOutcome | null> {
   const deadline = Date.now() + opts.timeoutMs;
   const query = new URLSearchParams({ codebaseId: opts.codebaseId, limit: '50' });
 
@@ -252,11 +350,14 @@ async function discoverRunId(opts: {
             candidate.codebase_id === opts.codebaseId &&
             typeof candidate.id === 'string'
         );
-        if (run?.id) return run.id;
+        if (run?.id) return { kind: 'run', runId: run.id };
       }
     } catch {
       // A transient discovery read does not invalidate the proven dispatch.
     }
+
+    const marker = await readPreDispatchOutcome(opts);
+    if (marker !== null) return marker;
 
     await new Promise<void>(resolve => setTimeout(resolve, opts.intervalMs));
   }

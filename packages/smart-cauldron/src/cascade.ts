@@ -883,6 +883,21 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
       // Infra error: alert + stop (do NOT count as "too hard")
       if (!fireResult.ok) {
+        // A spec refusal can never start. Stop here: do not classify, escalate,
+        // supervise, or climb to another tier.
+        if (fireResult.errorClass === 'spec_error') {
+          attempt.outcome = 'spec-error';
+          attempt.infraErrorReason = fireResult.infraError;
+          attempt.completedAt = new Date().toISOString();
+          status = 'stopped_spec_error';
+          console.log(
+            `[smart-cauldron] SPEC ERROR on tier=${tier.name}: ` +
+              `${fireResult.infraError ?? 'unknown'} -- stopping cascade (no tier climb)`
+          );
+          await checkpoint();
+          break;
+        }
+
         const errorClass = classifyError({
           message: fireResult.infraError ?? '',
           statusCode: extractStatusCode(fireResult.infraError ?? ''),
