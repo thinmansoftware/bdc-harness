@@ -862,6 +862,71 @@ describe('hermetic-fresh-attempt', () => {
     }
   });
 
+  it('hashes an unborn repository and refuses changed tracked or untracked bytes', () => {
+    const plain = tempDir('ser-notgit-');
+    expect(testedTreeIdentity(plain).method).toBe('not-a-git-worktree');
+    rmSync(plain, { recursive: true, force: true });
+    const cwd = tempDir('ser-unborn-');
+    git(cwd, ['init', '-q']);
+    git(cwd, ['config', 'user.email', 't@example.com']);
+    git(cwd, ['config', 'user.name', 'Test']);
+    writeFileSync(join(cwd, 'src.js'), 'v1\n');
+    git(cwd, ['add', 'src.js']);
+    writeFileSync(join(cwd, 'extra.js'), 'u1\n');
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+    const artifacts = join(cwd, 'artifacts');
+    mkdirSync(artifacts);
+    const savedArtifacts = process.env.ARTIFACTS_DIR;
+    process.env.ARTIFACTS_DIR = artifacts;
+    const cliEnv = {
+      ...process.env,
+      HARNESS_ROOT_OVERRIDE: ROOT,
+      ARTIFACTS_DIR: artifacts,
+      NODE_ENV: 'test',
+      SER_TEST_TRUSTED_ROOT: ROOT,
+    };
+    const refuse = (attempt: EvidenceAttempt, reason: string): void => {
+      const verdict = checkAttemptRecord(attempt, cwd, authority(cwd));
+      expect(verdict.ok).toBe(false);
+      if (!verdict.ok) expect(verdict.reason).toBe(reason);
+      const cli = spawnSync('bun', [RUNNER, 'check-attempt'], {
+        cwd,
+        env: cliEnv,
+        encoding: 'utf8',
+      });
+      expect(cli.status).not.toBe(0);
+      expect(cli.stderr).toContain(reason);
+    };
+    try {
+      const summary = runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
+      const recorded = summary.attempt.tree;
+      expect(recorded.method).toBe('sha256-worktree-bytes-v1');
+      expect(recorded.headSha).toBe('');
+      expect(recorded.contentDigest.length).toBeGreaterThan(0);
+      expect(recorded.paths.some(item => item.path === 'src.js')).toBe(true);
+      expect(recorded.paths.some(item => item.path === 'extra.js')).toBe(true);
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      const freshCli = spawnSync('bun', [RUNNER, 'check-attempt'], {
+        cwd,
+        env: cliEnv,
+        encoding: 'utf8',
+      });
+      expect(freshCli.status).toBe(0);
+      writeFileSync(join(cwd, 'src.js'), 'v2\n');
+      refuse(summary.attempt, 'dirty-bytes');
+      writeFileSync(join(cwd, 'src.js'), 'v1\n');
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      writeFileSync(join(cwd, 'extra.js'), 'u2\n');
+      refuse(summary.attempt, 'dirty-bytes');
+      writeFileSync(join(cwd, 'extra.js'), 'u1\n');
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+    } finally {
+      if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = savedArtifacts;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('leaves a killed runner plan incomplete', () => {
     const cwd = tempDir('ser-kill-');
     const artifacts = join(cwd, 'artifacts');

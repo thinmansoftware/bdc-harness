@@ -384,6 +384,37 @@ function hashFailedIdentity(headSha: string): TreeIdentity {
   return { method: 'hash-failed', headSha, paths: [], contentDigest: '' };
 }
 
+function notAGitWorktree(): TreeIdentity {
+  return {
+    method: 'not-a-git-worktree',
+    headSha: '',
+    paths: [],
+    contentDigest: '',
+  };
+}
+
+function identityFromStatus(cwd: string, headSha: string): TreeIdentity {
+  const status = gitCapture(cwd, ['status', '--porcelain=v1', '-z', '-uall']);
+  if (!status.ok) return hashFailedIdentity(headSha);
+  const parsed = parsePorcelainZ(status.stdout);
+  if (!parsed.ok) return hashFailedIdentity(headSha);
+  const paths: { path: string; sha256: string }[] = [];
+  for (const entry of parsed.entries) {
+    if (excludedIdentityPath(entry.path)) continue;
+    const sha256 = hashWorktreeBytes(cwd, entry.status, entry.path);
+    if (sha256 === null) return hashFailedIdentity(headSha);
+    paths.push({ path: entry.path, sha256 });
+  }
+  paths.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  const contentDigest = createHash('sha256').update(JSON.stringify(paths)).digest('hex');
+  return {
+    method: 'sha256-worktree-bytes-v1',
+    headSha,
+    paths,
+    contentDigest,
+  };
+}
+
 // git status -z records are "XY path\0". Renames and copies are "XY dest\0source\0".
 function parsePorcelainZ(
   stdout: string
@@ -421,34 +452,12 @@ function hashWorktreeBytes(cwd: string, status: string, path: string): string | 
 
 export function testedTreeIdentity(cwd: string): TreeIdentity {
   const head = gitCapture(cwd, ['rev-parse', 'HEAD']);
-  if (!head.ok) {
-    return {
-      method: 'not-a-git-worktree',
-      headSha: '',
-      paths: [],
-      contentDigest: '',
-    };
-  }
-  const headSha = head.stdout.trim();
-  const status = gitCapture(cwd, ['status', '--porcelain=v1', '-z', '-uall']);
-  if (!status.ok) return hashFailedIdentity(headSha);
-  const parsed = parsePorcelainZ(status.stdout);
-  if (!parsed.ok) return hashFailedIdentity(headSha);
-  const paths: { path: string; sha256: string }[] = [];
-  for (const entry of parsed.entries) {
-    if (excludedIdentityPath(entry.path)) continue;
-    const sha256 = hashWorktreeBytes(cwd, entry.status, entry.path);
-    if (sha256 === null) return hashFailedIdentity(headSha);
-    paths.push({ path: entry.path, sha256 });
-  }
-  paths.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  const contentDigest = createHash('sha256').update(JSON.stringify(paths)).digest('hex');
-  return {
-    method: 'sha256-worktree-bytes-v1',
-    headSha,
-    paths,
-    contentDigest,
-  };
+  if (head.ok) return identityFromStatus(cwd, head.stdout.trim());
+  const inside = gitCapture(cwd, ['rev-parse', '--is-inside-work-tree']);
+  if (!inside.ok || inside.stdout.trim() !== 'true') return notAGitWorktree();
+  // Unborn repository: HEAD does not resolve before the first commit.
+  // Hash status paths so a later byte change cannot match an empty identity.
+  return identityFromStatus(cwd, '');
 }
 
 function attemptsDirectory(cwd: string): string {
