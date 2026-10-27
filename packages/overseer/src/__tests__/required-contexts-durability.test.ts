@@ -272,4 +272,25 @@ describe('durable attempt counters -- the count outlives the process', () => {
     await store.increment(key, 21_000);
     expect(pruneCalls).toBe(2);
   });
+
+  test('rearm_is_once_per_head_across_processes', async () => {
+    const firstHeadKey = {
+      owner: OWNER,
+      repo: REPO,
+      baseRef: `rearm:${BASE}`,
+      headSha: HEAD,
+    };
+    const observations = await Promise.all([
+      freshStore().increment(firstHeadKey, 1_000),
+      freshStore().increment(firstHeadKey, 1_000),
+    ]);
+    expect(observations.sort()).toEqual([1, 2]);
+    expect(observations.filter(attempt => attempt === 1)).toHaveLength(1);
+
+    const secondHeadAttempt = await freshStore().increment(
+      { ...firstHeadKey, headSha: OTHER_HEAD },
+      2_000
+    );
+    expect(secondHeadAttempt).toBe(1);
+  });
 });

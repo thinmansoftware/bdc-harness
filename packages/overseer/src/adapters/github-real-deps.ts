@@ -19,11 +19,19 @@ import type {
   PullRequestRef,
 } from '../types.ts';
 import {
+  REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS_ENV,
+  REQUIRED_CONTEXT_NEVER_REPORTED_REASON,
+  REQUIRED_CONTEXT_REARM_ATTEMPT_ENV,
+  REQUIRED_CONTEXT_WORKFLOWS_ENV,
   REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
   UNPROTECTED_BASE_NO_CHECKS_REASON,
+  parseRequiredContextWorkflowsMap,
   resolveMaxAttempts,
+  resolveRequiredContextNeverReportedMaxAttempts,
+  resolveRequiredContextRearmAttempt,
   resolveRequiredContexts,
 } from './required-contexts';
+import { normalizedCheckName } from '../pr-review-evaluator';
 import type {
   AttemptCounterKey,
   AttemptCounterStore,
@@ -284,6 +292,15 @@ export interface RealGitHubOctokitLike {
       };
     }>;
   };
+  /** Optional because older/narrow clients can still escalate without re-arming. */
+  actions?: {
+    createWorkflowDispatch(input: {
+      owner: string;
+      repo: string;
+      workflow_id: string;
+      ref: string;
+    }): Promise<unknown>;
+  };
   repos?: {
     compareCommits(input: {
       owner: string;
@@ -412,9 +429,19 @@ export interface ExactHeadPullRequestEvidence {
    * reported-checks heuristic.
    */
   requiredContextsBlocked?: {
-    reason: typeof REQUIRED_CONTEXTS_BLOCKED_REASON | typeof UNPROTECTED_BASE_NO_CHECKS_REASON;
+    reason:
+      | typeof REQUIRED_CONTEXTS_BLOCKED_REASON
+      | typeof UNPROTECTED_BASE_NO_CHECKS_REASON
+      | typeof REQUIRED_CONTEXT_NEVER_REPORTED_REASON;
     attempts: number;
     failureKind: RequiredContextsFailureKind;
+  };
+  missingRequiredContexts?: string[];
+  requiredContextRearm?: {
+    attempted: boolean;
+    dispatched: boolean;
+    context?: string;
+    workflow?: string;
   };
 }
 
@@ -535,6 +562,118 @@ export function createRealFetchExactHeadPullRequestEvidence(
     const requiredContexts: string[] | null =
       resolution.state === 'known' ? resolution.contexts : null;
     let noChecksBlocked: ExactHeadPullRequestEvidence['requiredContextsBlocked'];
+    let neverReportedBlocked: ExactHeadPullRequestEvidence['requiredContextsBlocked'];
+    let missingRequiredContexts: string[] | undefined;
+    let requiredContextRearm: ExactHeadPullRequestEvidence['requiredContextRearm'];
+    if (resolution.state === 'known' && resolution.contexts.length > 0) {
+      const reported = new Set(
+        checkRuns.data.check_runs.map(run => normalizedCheckName(run.name?.trim() ?? ''))
+      );
+      missingRequiredContexts = resolution.contexts.filter(
+        context => !reported.has(normalizedCheckName(context))
+      );
+      const missingKey: AttemptCounterKey = {
+        owner: input.owner,
+        repo: input.repo,
+        baseRef: `never-reported:${baseRef ?? ''}`,
+        headSha: input.headSha,
+      };
+      if (missingRequiredContexts.length > 0) {
+        const attempts = await attemptStore.increment(missingKey, Date.now());
+        const rearmAttempt = resolveRequiredContextRearmAttempt(
+          process.env[REQUIRED_CONTEXT_REARM_ATTEMPT_ENV]
+        );
+        if (attempts === rearmAttempt) {
+          const workflows = parseRequiredContextWorkflowsMap(
+            process.env[REQUIRED_CONTEXT_WORKFLOWS_ENV]
+          ).get(`${input.owner}/${input.repo}`);
+          const context = missingRequiredContexts.find(name => workflows?.has(name));
+          const workflow = context ? workflows?.get(context) : undefined;
+          if (!workflow || !context) {
+            requiredContextRearm = { attempted: false, dispatched: false };
+            log.warn(
+              {
+                owner: input.owner,
+                repo: input.repo,
+                prNumber: input.prNumber,
+                headSha: input.headSha,
+                reason: 'no_map',
+              },
+              'overseer_required_context_rearm_skipped'
+            );
+          } else if (!octokit.actions) {
+            requiredContextRearm = { attempted: false, dispatched: false, context, workflow };
+            log.warn(
+              {
+                owner: input.owner,
+                repo: input.repo,
+                prNumber: input.prNumber,
+                headSha: input.headSha,
+                context,
+                workflow,
+                reason: 'no_actions_client',
+              },
+              'overseer_required_context_rearm_skipped'
+            );
+          } else {
+            const guard = await attemptStore.increment(
+              { ...missingKey, baseRef: `rearm:${baseRef ?? ''}` },
+              Date.now()
+            );
+            if (guard === 1) {
+              try {
+                await octokit.actions.createWorkflowDispatch({
+                  owner: input.owner,
+                  repo: input.repo,
+                  workflow_id: workflow,
+                  ref: pr.data.head.ref ?? input.headSha,
+                });
+                requiredContextRearm = { attempted: true, dispatched: true, context, workflow };
+                log.info(
+                  {
+                    owner: input.owner,
+                    repo: input.repo,
+                    prNumber: input.prNumber,
+                    headSha: input.headSha,
+                    context,
+                    workflow,
+                  },
+                  'overseer_required_context_rearm_dispatched'
+                );
+              } catch (error) {
+                requiredContextRearm = { attempted: true, dispatched: false, context, workflow };
+                log.warn(
+                  {
+                    err: error,
+                    owner: input.owner,
+                    repo: input.repo,
+                    prNumber: input.prNumber,
+                    headSha: input.headSha,
+                    context,
+                    workflow,
+                    reason: 'dispatch_failed',
+                  },
+                  'overseer_required_context_rearm_skipped'
+                );
+              }
+            }
+          }
+        }
+        const maxAttempts = resolveRequiredContextNeverReportedMaxAttempts(
+          process.env[REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS_ENV]
+        );
+        if (attempts >= maxAttempts) {
+          neverReportedBlocked = {
+            reason: REQUIRED_CONTEXT_NEVER_REPORTED_REASON,
+            attempts,
+            failureKind: 'transient',
+          };
+        }
+      } else {
+        await attemptStore.clear(missingKey);
+        missingRequiredContexts = undefined;
+      }
+    }
     if (
       resolution.state === 'known' &&
       resolution.source === 'unprotected_branch' &&
@@ -571,6 +710,9 @@ export function createRealFetchExactHeadPullRequestEvidence(
           }
         : {}),
       ...(noChecksBlocked ? { requiredContextsBlocked: noChecksBlocked } : {}),
+      ...(neverReportedBlocked ? { requiredContextsBlocked: neverReportedBlocked } : {}),
+      ...(missingRequiredContexts ? { missingRequiredContexts } : {}),
+      ...(requiredContextRearm ? { requiredContextRearm } : {}),
       diff: (comparison.data.files ?? [])
         .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
         .join('\n'),
