@@ -57,7 +57,7 @@ import type {
   PrReviewResult,
   WoSpecFetch,
 } from './pr-review-evaluator';
-import { isWoSpecProvenanceLine, type ReviewerVerdict, type SubmitDeps } from './pr-review-submit';
+import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
 import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
 import {
   countPriorRemediationAttempts,
@@ -1098,15 +1098,35 @@ async function formatWoSpecProvenance(state: WoSpecProvenanceState): Promise<str
   }
 }
 
-function appendProvenance(summary: string, line: string): string {
-  // Strip every line that is itself a provenance line, then append the one
-  // line this review computed. A finding may quote those prefixes on its
-  // own line; the posted body still carries exactly one.
-  const kept = summary
+/** Same bound as MAX_EVIDENCE_BODY in pr-review-submit.ts. That file stays unchanged. */
+const MAX_POSTED_REVIEW_BODY = 60_000;
+
+function isWoSpecProvenanceLine(line: string): boolean {
+  return line.startsWith('Reviewed against ') || line.startsWith('No WO spec found');
+}
+
+/**
+ * Append the one provenance line this review computed.
+ * A finding may quote the same prefixes on its own line; those lines are
+ * dropped so the posted body still carries exactly one. Findings are clipped
+ * so the 60000-character evidence cap cannot slice this line off the review.
+ */
+function appendProvenance(summary: string, line: string, headSha: string): string {
+  const findings = summary
     .split('\n')
     .filter(existing => !isWoSpecProvenanceLine(existing))
-    .join('\n');
-  return kept.length > 0 ? `${kept}\n${line}` : line;
+    .join('\n')
+    .trim();
+  const header = `Independent review by the Overseer App at head \`${headSha}\`.`;
+  const budget = MAX_POSTED_REVIEW_BODY - header.length - '\n\n'.length;
+  if (budget <= 0) return '';
+  const combined = findings.length > 0 ? `${findings}\n${line}` : line;
+  if (combined.length <= budget) return combined;
+  const room = budget - line.length - 1;
+  if (room <= 0) return line.slice(0, budget);
+  const clipped = findings.slice(0, room).trimEnd();
+  if (clipped.length === 0) return line.slice(0, budget);
+  return `${clipped}\n${line}`;
 }
 
 /**
@@ -1181,10 +1201,7 @@ export function createRealSubmitDeps(
       if (result.verdict === 'CHECKS_UNAVAILABLE') {
         return {
           approved: false,
-          summary: appendProvenance(
-            buildRequiredContextsBlockedSummary(result.error),
-            await formatWoSpecProvenance(specState)
-          ),
+          summary: buildRequiredContextsBlockedSummary(result.error),
           reviewedHeadSha: result.reviewed_head_sha,
           requiredContextsUnavailable: true,
         };
@@ -1238,7 +1255,7 @@ export function createRealSubmitDeps(
         result.verdict === 'APPROVE' ||
         result.verdict === 'REQUEST_CHANGES' ||
         result.verdict === 'INDETERMINATE'
-          ? appendProvenance(summaryBody, await formatWoSpecProvenance(specState))
+          ? appendProvenance(summaryBody, await formatWoSpecProvenance(specState), work.headSha)
           : summaryBody;
       // #847: the INDETERMINATE reason code travels to the submit receipt as
       // well as the PR body, so the event store says WHY (usage_limit_until,

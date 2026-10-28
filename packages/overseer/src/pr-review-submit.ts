@@ -288,46 +288,15 @@ export interface RemediationOutcome {
 /** Bounds the evidence body so a runaway reviewer cannot post an essay. */
 const MAX_EVIDENCE_BODY = 60_000;
 
-const WO_SPEC_PROVENANCE_PREFIXES = ['Reviewed against ', 'No WO spec found'] as const;
-
-/** A work-order provenance line. A posted verdict body carries exactly one. */
-export function isWoSpecProvenanceLine(line: string): boolean {
-  return WO_SPEC_PROVENANCE_PREFIXES.some(prefix => line.startsWith(prefix));
-}
-
-/**
- * Keep a trailing provenance line when the evidence body is capped.
- * Findings are clipped; the provenance line stays whole at the end.
- */
-function fitBodyPreservingProvenance(header: string, findings: string, provenance: string): string {
-  const provenanceOnly = `${header}\n\n${provenance}`;
-  if (provenanceOnly.length >= MAX_EVIDENCE_BODY) {
-    const room = MAX_EVIDENCE_BODY - header.length - 2;
-    if (room <= 0) return provenanceOnly.slice(0, MAX_EVIDENCE_BODY);
-    return `${header}\n\n${provenance.slice(0, room)}`;
-  }
-  const roomForFindings = MAX_EVIDENCE_BODY - provenanceOnly.length - 1;
-  if (roomForFindings <= 0 || findings.length === 0) return provenanceOnly;
-  const kept = findings.slice(0, roomForFindings).replace(/\n+$/, '');
-  if (kept.length === 0) return provenanceOnly;
-  return `${header}\n\n${kept}\n${provenance}`;
-}
-
 /**
  * Builds the review body. Always states the exact head so the review is
- * self-evidencing about what was examined. A trailing work-order provenance
- * line survives the evidence cap; findings are what get clipped.
+ * self-evidencing about what was examined.
  */
 export function buildReviewBody(work: ReviewWorkItem, verdict: ReviewerVerdict): string {
   const header = `Independent review by the Overseer App at head \`${work.headSha}\`.`;
   const summary = verdict.summary.trim();
-  if (summary.length === 0) return header;
-  const body = `${header}\n\n${summary}`;
-  if (body.length <= MAX_EVIDENCE_BODY) return body;
-  const lines = summary.split('\n');
-  const last = lines[lines.length - 1] ?? '';
-  if (!isWoSpecProvenanceLine(last)) return body.slice(0, MAX_EVIDENCE_BODY);
-  return fitBodyPreservingProvenance(header, lines.slice(0, -1).join('\n'), last);
+  const body = summary.length > 0 ? `${header}\n\n${summary}` : header;
+  return body.length > MAX_EVIDENCE_BODY ? body.slice(0, MAX_EVIDENCE_BODY) : body;
 }
 
 /**
