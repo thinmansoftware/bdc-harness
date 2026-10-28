@@ -37,6 +37,14 @@ const seatReadingSchema = z.object({
   http_status: z.number().optional(),
   allowed: z.boolean().optional(),
   limit_reached: z.boolean().optional(),
+  credits: z
+    .object({
+      has_credits: z.boolean(),
+      unlimited: z.boolean(),
+      overage_limit_reached: z.boolean(),
+      balance: z.string().optional(),
+    })
+    .optional(),
   reading_source: z.enum(['probe', 'pushed']).optional(),
   observed_at: z.string().optional(),
 });

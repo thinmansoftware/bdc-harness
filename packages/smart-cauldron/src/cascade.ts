@@ -23,7 +23,13 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
-import { admitClaudeTier, chooseHeadroomEntry, resolveEntryThreshold } from './headroom.js';
+import {
+  admitClaudeTier,
+  chooseHeadroomEntry,
+  formatRungSeatSkip,
+  resolveEntryThreshold,
+  rungSeatSkip,
+} from './headroom.js';
 import type { EntrySelection, SeatUsageSnapshot } from './headroom.js';
 import { fireTier, buildFireMessage } from './fire.js';
 import { pollForTerminal, TimeoutError, DEFAULT_OPEN_NODE_BUDGET_MS } from './poll.js';
@@ -106,6 +112,13 @@ export interface CascadeDeps {
    * Fuelglass seats route. A rejection or timeout becomes an UNKNOWN snapshot.
    */
   seatUsage?: () => Promise<SeatUsageSnapshot>;
+  /**
+   * Run-start seat cutoff percent (the Fuelglass seats route `cutoff.percent`).
+   * When absent, the conductor uses the cutoff from its own seats read. A
+   * rejection, timeout or null means UNKNOWN: no rung is skipped on seat
+   * grounds (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01).
+   */
+  seatCutoff?: () => Promise<number | null>;
 }
 
 const SEAT_USAGE_READ_TIMEOUT_MS = 5000;
@@ -144,20 +157,43 @@ function parseFuelglassSeatUsage(value: unknown): SeatUsageSnapshot | null {
     if (reading.limit_reached !== undefined && typeof reading.limit_reached !== 'boolean') {
       return null;
     }
+    const credits = reading.credits as Record<string, unknown> | undefined;
     snapshot[seat] = {
       limit_source: reading.limit_source,
       windows: windows.filter(window => window !== null),
       ...(typeof reading.limit_reached === 'boolean'
         ? { limit_reached: reading.limit_reached }
         : {}),
+      ...(typeof credits === 'object' &&
+      credits !== null &&
+      typeof credits.has_credits === 'boolean'
+        ? {
+            credits: {
+              has_credits: credits.has_credits,
+              overage_limit_reached: credits.overage_limit_reached === true,
+            },
+          }
+        : {}),
     };
   }
   return snapshot;
 }
 
+/** The run-start cutoff from a Fuelglass seats response, or null when absent/invalid. */
+export function parseFuelglassSeatCutoff(value: unknown): number | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const cutoff = (value as { cutoff?: unknown }).cutoff;
+  if (typeof cutoff !== 'object' || cutoff === null) return null;
+  const percent = (cutoff as { percent?: unknown }).percent;
+  if (typeof percent !== 'number' || !Number.isFinite(percent)) return null;
+  if (percent < 1 || percent > 95) return null;
+  return percent;
+}
+
 function defaultFuelglassSeatReader(
   apiBaseUrl: string,
-  token: string
+  token: string,
+  onCutoff: (percent: number | null) => void = () => undefined
 ): () => Promise<SeatUsageSnapshot> {
   return async () => {
     const controller = new AbortController();
@@ -170,7 +206,9 @@ function defaultFuelglassSeatReader(
         signal: controller.signal,
       });
       if (!response.ok) return UNKNOWN_SEAT_USAGE;
-      const parsed = parseFuelglassSeatUsage(await response.json());
+      const body: unknown = await response.json();
+      const parsed = parseFuelglassSeatUsage(body);
+      if (parsed) onCutoff(parseFuelglassSeatCutoff(body));
       return parsed ?? UNKNOWN_SEAT_USAGE;
     } catch {
       return UNKNOWN_SEAT_USAGE;
@@ -428,9 +466,19 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   }
 
   const thresholdPercent = resolveEntryThreshold(process.env);
+  let seatCutoffPercent: number | null = null;
   const seatUsage = opts.deps?.seatUsage
     ? await readSeatUsageOrUnknown(opts.deps.seatUsage)
-    : await defaultFuelglassSeatReader(apiBaseUrl, operatorToken)();
+    : await defaultFuelglassSeatReader(apiBaseUrl, operatorToken, percent => {
+        seatCutoffPercent = percent;
+      })();
+  if (opts.deps?.seatCutoff) {
+    try {
+      seatCutoffPercent = await opts.deps.seatCutoff();
+    } catch {
+      seatCutoffPercent = null;
+    }
+  }
   let entrySelection: EntrySelection = chooseHeadroomEntry({
     picked: entryTierName,
     tiers,
@@ -472,6 +520,58 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       };
     } else {
       entrySelection = { ...entrySelection, reason: admission.reason };
+    }
+  }
+  // Seat-cutoff rung skip at entry (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01):
+  // a rung whose own seat is measured at or over the run-start cutoff would be
+  // refused by the gate. A pinned entry is honored (the gate decides it).
+  if (entryOverride === undefined) {
+    const skipped: string[] = [];
+    let idx = tiers.findIndex(tier => tier.name === entryTierName);
+    while (idx !== -1 && idx < tiers.length) {
+      const tier = tiers[idx];
+      if (!tier) break;
+      if (refusedTiers.includes(tier.name)) {
+        idx++;
+        continue;
+      }
+      const seatSkip = rungSeatSkip(tier.name, seatUsage, seatCutoffPercent);
+      if (seatSkip) {
+        console.log(
+          `[smart-cauldron] Skipping tier "${tier.name}" during entry: ${formatRungSeatSkip(seatSkip)}`
+        );
+        skipped.push(formatRungSeatSkip(seatSkip));
+        idx++;
+        continue;
+      }
+      if (skipped.length > 0 && tier.name === 'claude') {
+        const claudeAdmission = admitClaudeTier({ usage: seatUsage, thresholdPercent });
+        if (!claudeAdmission.admitted) {
+          console.log(
+            `[smart-cauldron] Skipping tier "claude" during entry: ${claudeAdmission.reason}`
+          );
+          skipped.push(claudeAdmission.reason);
+          idx++;
+          continue;
+        }
+      }
+      break;
+    }
+    if (skipped.length > 0) {
+      const landed = idx === -1 ? undefined : tiers[idx];
+      if (!landed) {
+        throw new Error(
+          `[smart-cauldron/cascade] Every rung from "${entryTierName}" up is over the seat ` +
+            `cutoff or denied (${skipped.join(', ')}); no rung can pass the run-start seat gate.`
+        );
+      }
+      entryTierName = landed.name;
+      entrySelection = {
+        ...entrySelection,
+        entry: landed.name,
+        changed: landed.name !== entrySelection.picked,
+        reason: skipped[0] ?? entrySelection.reason,
+      };
     }
   }
   console.log(
@@ -691,6 +791,15 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         if (refusedTiers.includes(candidate.name)) {
           console.log(
             `[smart-cauldron] Skipping refused tier "${candidate.name}" during ${context}`
+          );
+          idx++;
+          continue;
+        }
+        const seatSkip = rungSeatSkip(candidate.name, seatUsage, seatCutoffPercent);
+        if (seatSkip) {
+          console.log(
+            `[smart-cauldron] Skipping tier "${candidate.name}" during ${context}: ` +
+              formatRungSeatSkip(seatSkip)
           );
           idx++;
           continue;
@@ -1231,6 +1340,34 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         break;
       }
 
+      // Run-start seat refusal (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01):
+      // the run never dispatched a node, so this is neither a quality failure
+      // nor a gate misfire. Climb to the next rung with headroom without
+      // building informed-climb context and without SPEC-REPAIR.
+      const seatRefusal = seatRefusalDetail(pollResult);
+      if (seatRefusal) {
+        attempt.gateFailReason = `seat_refusal: ${seatRefusal}`;
+        console.log(
+          `[smart-cauldron] Seat refusal on tier=${tier.name}: ${seatRefusal} -- ` +
+            'climbing to the next rung with headroom (not a quality failure)'
+        );
+        currentIndex = tier.isFrontier
+          ? tiers.length
+          : nextAdmittedTierIndex(currentIndex, 'climb');
+        climbCount++;
+        if (currentIndex >= tiers.length) {
+          status = 'blocked';
+          console.log(
+            `[smart-cauldron] BLOCKED: no rung above tier=${tier.name} has seat headroom ` +
+              `for woId=${woId}`
+          );
+          await checkpoint();
+          break;
+        }
+        await checkpoint();
+        continue;
+      }
+
       // Harness gate misfire: the gate failed for a harness-side reason, not
       // because the implement tier produced bad work. Stop on this tier with
       // one Dispatch notice. Do not climb and do not post SPEC-REPAIR.
@@ -1317,6 +1454,18 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * The run-start seat refusal detail (`seat_usage_refused:...`) when a fired
+ * run was refused by the seat gate before any node ran, else null. The
+ * executor stores the detail as the run's metadata.error.
+ */
+export function seatRefusalDetail(poll: PollResult): string | null {
+  if (poll.terminalStatus !== 'failed') return null;
+  const error = poll.rawMetadata.error;
+  if (typeof error !== 'string' || !error.startsWith('seat_usage_refused:')) return null;
+  return error;
+}
 
 /**
  * Build informed-climb context to pass to the next tier.
