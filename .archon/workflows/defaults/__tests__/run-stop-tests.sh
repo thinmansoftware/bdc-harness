@@ -53,6 +53,7 @@ assert_not_contains() {
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
+export NODE_ENV=test
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-astra.yaml
@@ -95,6 +96,22 @@ if [ -z "$RST_CORE" ]; then
   echo "FATAL: could not extract rst core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RST_CORE"
+
+bind_worktree_runner() {
+  WORKTREE_RUNNER="$(cd "$HERE/../../../.." && pwd)/packages/workflows/src/reliability/structured-evidence-runner.ts"
+  WORKTREE_BUN="$(command -v bun)"
+  ser_root() {
+    if [ -f "$WORKTREE_RUNNER" ] && [ ! -L "$WORKTREE_RUNNER" ]; then
+      printf '%s\n' "$WORKTREE_RUNNER"
+      return 0
+    fi
+    return 1
+  }
+  ser_runner() {
+    "$WORKTREE_BUN" "$WORKTREE_RUNNER" "$@"
+  }
+}
+bind_worktree_runner
 for fn in rst_class rst_extract_commands rst_command_looks_runnable rst_rescue_subdir rst_tests_in_diff rst_repo_test_script rst_parse_counts rst_scrub_env rst_run_commands rst_report; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
@@ -822,6 +839,208 @@ assert_eq "t6 repeated scrub identical" "same=yes" "$(printf '%s\n' "$T6" | sed 
 assert_eq "t6 dprep skip rc" "dprep_rc=0" "$(printf '%s\n' "$T6" | sed -n '4p')"
 assert_contains "t6 dprep skip path" "dprep: no package.json with a bun lockfile, skipping" "$(printf '%s\n' "$T6" | sed -n '5p')"
 
+echo "--- pass plus no-count or zero-count never reports passed ---"
+MIX="$(mktemp -d)"
+cat > "$MIX/ok.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+cat > "$MIX/nocount.sh" <<'EOF'
+#!/bin/sh
+echo "no counts here"
+exit 0
+EOF
+cat > "$MIX/zero.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 0/0"
+exit 0
+EOF
+cat > "$MIX/impossible.sh" <<'EOF'
+#!/bin/sh
+echo "Tests: 4/3"
+exit 0
+EOF
+chmod +x "$MIX/ok.sh" "$MIX/nocount.sh" "$MIX/zero.sh" "$MIX/impossible.sh"
+printf 'bash ./ok.sh\nbash ./nocount.sh\n' > "$MIX/cmds"
+mix_nc="$(cd "$MIX" && rst_run_commands ./cmds ./log-nc)"
+assert_eq "pass plus no-count is blank counts" "0  " "$mix_nc"
+assert_contains "pass plus no-count keeps the passing command" "### run-stop-tests: bash ./ok.sh" "$(cat "$MIX/log-nc")"
+assert_contains "pass plus no-count keeps the blank command" "### run-stop-tests: bash ./nocount.sh" "$(cat "$MIX/log-nc")"
+nc_exit="${mix_nc%% *}"
+nc_counts="$(printf '%s' "${mix_nc#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+nc_report="$(SOURCE=spec_declared rst_report CODE 'bash ./ok.sh; bash ./nocount.sh' "$nc_exit" "$nc_counts")"
+assert_contains "pass plus no-count is counts_unparsed" "TESTS_STATUS=counts_unparsed" "$nc_report"
+assert_not_contains "pass plus no-count is not passed" "TESTS_STATUS=passed" "$nc_report"
+printf 'bash ./ok.sh\nbash ./zero.sh\n' > "$MIX/cmds"
+mix_z="$(cd "$MIX" && rst_run_commands ./cmds ./log-z)"
+assert_eq "pass plus 0/0 publishes 0 0 0" "0 0 0" "$mix_z"
+assert_contains "pass plus 0/0 keeps the zero member" "### run-stop-tests: bash ./zero.sh" "$(cat "$MIX/log-z")"
+z_exit="${mix_z%% *}"
+z_counts="$(printf '%s' "${mix_z#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+z_report="$(rst_report CODE 'bash ./ok.sh; bash ./zero.sh' "$z_exit" "$z_counts")"
+assert_contains "pass plus 0/0 is failed" "TESTS_STATUS=failed" "$z_report"
+assert_not_contains "pass plus 0/0 is not passed" "TESTS_STATUS=passed" "$z_report"
+printf 'bash ./impossible.sh\n' > "$MIX/cmds"
+mix_i="$(cd "$MIX" && rst_run_commands ./cmds ./log-i)"
+i_exit="${mix_i%% *}"
+i_counts="$(printf '%s' "${mix_i#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+assert_eq "impossible 4/3 uses a nonzero exit" "1" "$i_exit"
+assert_eq "impossible 4/3 blanks counts" "" "$i_counts"
+i_report="$(SOURCE=spec_declared rst_report CODE 'bash ./impossible.sh' "$i_exit" "$i_counts")"
+assert_not_contains "impossible 4/3 is not passed" "TESTS_STATUS=passed" "$i_report"
+
+echo "--- chained pass && zero-count or no-count never publishes 0 1 1 ---"
+printf 'bash ./ok.sh && bash ./zero.sh\n' > "$MIX/cmds"
+mix_cz="$(cd "$MIX" && rst_run_commands ./cmds ./log-cz)"
+assert_eq "chained pass && zero-count publishes 0 0 0" "0 0 0" "$mix_cz"
+assert_not_contains "chained pass && zero-count is not 0 1 1" "0 1 1" "$mix_cz"
+cz_exit="${mix_cz%% *}"
+cz_counts="$(printf '%s' "${mix_cz#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+cz_report="$(rst_report CODE 'bash ./ok.sh && bash ./zero.sh' "$cz_exit" "$cz_counts")"
+assert_contains "chained pass && zero-count is failed" "TESTS_STATUS=failed" "$cz_report"
+assert_not_contains "chained pass && zero-count is not passed" "TESTS_STATUS=passed" "$cz_report"
+printf 'bash ./ok.sh && bash ./nocount.sh\n' > "$MIX/cmds"
+mix_cn="$(cd "$MIX" && rst_run_commands ./cmds ./log-cn)"
+assert_eq "chained pass && no-count publishes blank counts" "0  " "$mix_cn"
+assert_not_contains "chained pass && no-count is not 0 1 1" "0 1 1" "$mix_cn"
+cn_exit="${mix_cn%% *}"
+cn_counts="$(printf '%s' "${mix_cn#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+cn_report="$(SOURCE=spec_declared rst_report CODE 'bash ./ok.sh && bash ./nocount.sh' "$cn_exit" "$cn_counts")"
+assert_contains "chained pass && no-count is counts_unparsed" "TESTS_STATUS=counts_unparsed" "$cn_report"
+assert_not_contains "chained pass && no-count is not passed" "TESTS_STATUS=passed" "$cn_report"
+printf 'bash ./ok.sh && bash ./ok.sh\n' > "$MIX/cmds"
+mix_cc="$(cd "$MIX" && rst_run_commands ./cmds ./log-cc)"
+assert_eq "chained two passing segments publish 0 2 2" "0 2 2" "$mix_cc"
+cc_exit="${mix_cc%% *}"
+cc_counts="$(printf '%s' "${mix_cc#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+cc_report="$(rst_report CODE 'bash ./ok.sh && bash ./ok.sh' "$cc_exit" "$cc_counts")"
+assert_contains "chained two passing segments are passed" "TESTS_STATUS=passed" "$cc_report"
+rm -rf "$MIX"
+
+echo "--- leading Expected without a command is explicit, not absence ---"
+MAL_SPEC="$(printf '%s\n' \
+  'Stop 1 (test suite):' \
+  '  Expected: all passing' \
+  '' \
+  'Stop 2 (test suite):' \
+  '  bash ./ok.sh' \
+  '  Expected: 1')"
+MAL_EXTRACT="$(printf '%s\n' "$MAL_SPEC" | rst_extract_commands)"
+assert_eq "leading Expected keeps malformed and later command" "$(printf '%s\n' 'MALFORMED:expected-without-command' 'bash ./ok.sh')" "$MAL_EXTRACT"
+MAL="$(mktemp -d)"
+(
+  cd "$MAL" || exit 1
+  cat > ok.sh <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+  cat > map-pass.sh <<'EOF'
+#!/bin/sh
+echo MAP_SENTINEL
+echo "Tests: 1/1"
+exit 0
+EOF
+  chmod +x ok.sh map-pass.sh
+  printf '%s\n' '{"scripts":{"test":"echo REPO_SENTINEL"}}' > package.json
+  touch bun.lock
+)
+MAL_CMDS="$MAL/cmds"
+MAL_DECL="$(
+  cd "$MAL" || exit 1
+  printf '%s\n' "$MAL_SPEC" | rst_load_explicit "$MAL_CMDS"
+)"
+assert_eq "malformed explicit declaration flag" "1" "$MAL_DECL"
+if [ "$MAL_DECL" -eq 0 ]; then
+  (
+    cd "$MAL" || exit 1
+    rst_apply_fallback "$MAL_CMDS" "" project-map "bash ./map-pass.sh" >/dev/null
+  )
+fi
+MAL_BODY="$(cat "$MAL_CMDS")"
+assert_contains "malformed member stays in the command file" "MALFORMED:expected-without-command" "$MAL_BODY"
+assert_contains "later command stays in the command file" "bash ./ok.sh" "$MAL_BODY"
+assert_not_contains "malformed member does not select project-map" "map-pass" "$MAL_BODY"
+assert_not_contains "malformed member does not select repo script" "bun run test" "$MAL_BODY"
+MAL_RUN="$(cd "$MAL" && rst_run_commands "$MAL_CMDS" "$MAL/log")"
+MAL_EXIT="${MAL_RUN%% *}"
+MAL_COUNTS="$(printf '%s' "${MAL_RUN#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+MAL_REPORT="$(SOURCE=spec_declared rst_report CODE 'MALFORMED:expected-without-command; bash ./ok.sh' "$MAL_EXIT" "$MAL_COUNTS")"
+assert_not_contains "malformed explicit member is not passed" "TESTS_STATUS=passed" "$MAL_REPORT"
+assert_not_contains "map sentinel did not run" "MAP_SENTINEL" "$(cat "$MAL/log")"
+assert_not_contains "repo sentinel did not run" "REPO_SENTINEL" "$(cat "$MAL/log")"
+
+echo "--- true absence selects project-map, then the repo script, ahead of neither for diff tests ---"
+ABS="$(mktemp -d)"
+(
+  cd "$ABS" || exit 1
+  cat > map-pass.sh <<'EOF'
+#!/bin/sh
+echo "Tests: 1/1"
+exit 0
+EOF
+  chmod +x map-pass.sh
+  printf '%s\n' '{"scripts":{"test":"echo 1"}}' > package.json
+)
+ABS_SPEC="$(printf '%s\n' 'Stop 1 (grep assertion):' '  grep -c base README' '  Expected: 1')"
+ABS_CMDS="$ABS/cmds"
+ABS_DECL="$(
+  cd "$ABS" || exit 1
+  printf '%s\n' "$ABS_SPEC" | rst_load_explicit "$ABS_CMDS"
+)"
+assert_eq "grep-only spec declares no tests" "0" "$ABS_DECL"
+ABS_SRC="$(
+  cd "$ABS" || exit 1
+  rst_apply_fallback "$ABS_CMDS" "" project-map "bash ./map-pass.sh"
+)"
+assert_eq "absence with a map command selects project-map" "project-map" "$ABS_SRC"
+assert_eq "project-map command file" "bash ./map-pass.sh" "$(cat "$ABS_CMDS")"
+ABS_RUN="$(cd "$ABS" && rst_run_commands "$ABS_CMDS" "$ABS/map.log")"
+assert_eq "project-map executes 1/1" "0 1 1" "$ABS_RUN"
+ABS_EXIT="${ABS_RUN%% *}"
+ABS_COUNTS="$(printf '%s' "${ABS_RUN#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+ABS_REPORT="$(rst_report CODE 'bash ./map-pass.sh' "$ABS_EXIT" "$ABS_COUNTS")"
+assert_contains "project-map pass is published" "TESTS_STATUS=passed" "$ABS_REPORT"
+REPO_SRC="$(
+  cd "$ABS" || exit 1
+  rm -f bun.lock bun.lockb
+  rst_apply_fallback "$ABS_CMDS" "" wo-spec ""
+)"
+assert_eq "absent map without a bun lock selects repo_test_script" "repo_test_script" "$REPO_SRC"
+assert_eq "repo script without a bun lock is npm test" "npm test" "$(cat "$ABS_CMDS")"
+touch "$ABS/bun.lock"
+REPO_BUN="$(
+  cd "$ABS" || exit 1
+  rst_apply_fallback "$ABS_CMDS" "" wo-spec ""
+)"
+assert_eq "absent map with a bun lock selects repo_test_script" "repo_test_script" "$REPO_BUN"
+assert_eq "repo script with a bun lock is bun run test" "bun run test" "$(cat "$ABS_CMDS")"
+
+DIFF="$(mktemp -d)"
+git -C "$DIFF" init -q
+git -C "$DIFF" config user.email t@example.com
+git -C "$DIFF" config user.name Test
+printf 'base\n' > "$DIFF/README"
+git -C "$DIFF" add README
+git -C "$DIFF" commit -qm base
+printf 'test("x", () => {})\n' > "$DIFF/sample.test.js"
+DIFF_SHA="$(git -C "$DIFF" rev-parse HEAD)"
+DIFF_CMDS="$DIFF/cmds"
+DIFF_SRC="$(
+  cd "$DIFF" || exit 1
+  rst_apply_fallback "$DIFF_CMDS" "$DIFF_SHA" project-map "bash ./map-pass.sh"
+)"
+assert_eq "untracked test file selects tests_in_diff ahead of the map" "tests_in_diff" "$DIFF_SRC"
+assert_contains "diff command names the untracked test" "sample.test.js" "$(cat "$DIFF_CMDS")"
+assert_not_contains "diff selection does not use the map command" "map-pass" "$(cat "$DIFF_CMDS")"
+
+echo "--- all 13 lanes invoke the shared explicit loader and fallback ---"
+for lane in $LANES; do
+  assert_eq "rst_load_explicit call $lane" "1" "$(grep -F -c 'rst_load_explicit "$CMDS"' "$DEFAULTS/$lane")"
+  assert_eq "rst_apply_fallback call $lane" "1" "$(grep -F -c 'rst_apply_fallback "$CMDS"' "$DEFAULTS/$lane")"
+done
+rm -rf "$MAL" "$ABS" "$DIFF"
 echo "--- dprep pnpm lockfile branch ---"
 PBIN="$(mktemp -d)"
 PREC="$PBIN/pnpm-argv.txt"

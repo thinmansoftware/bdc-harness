@@ -72,6 +72,7 @@ assert_not_contains() {
 # -----------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+export NODE_ENV=test
 CANONICAL_YAML="$DEFAULTS_DIR/bdc-feature-development.yaml"
 MIRROR_YAML="$DEFAULTS_DIR/bdc-feature-development-codex.yaml"
 
@@ -95,6 +96,22 @@ if [ -z "$VMA_CORE" ]; then
 fi
 # Define vma_process and vma_process_assertions in this shell.
 eval "$VMA_CORE"
+
+bind_worktree_runner() {
+  WORKTREE_RUNNER="$(cd "$SCRIPT_DIR/../../../.." && pwd)/packages/workflows/src/reliability/structured-evidence-runner.ts"
+  WORKTREE_BUN="$(command -v bun)"
+  ser_root() {
+    if [ -f "$WORKTREE_RUNNER" ] && [ ! -L "$WORKTREE_RUNNER" ]; then
+      printf '%s\n' "$WORKTREE_RUNNER"
+      return 0
+    fi
+    return 1
+  }
+  ser_runner() {
+    "$WORKTREE_BUN" "$WORKTREE_RUNNER" "$@"
+  }
+}
+bind_worktree_runner
 
 if ! declare -F vma_process_assertions >/dev/null || ! declare -F vma_process >/dev/null; then
   echo "FATAL: vma core functions not defined after eval"
@@ -291,6 +308,36 @@ assert_eq "piped read-only command kept" "grep -c alpha $FIX/data.txt | wc -l =>
 # -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
+echo "--- find predicates after -- do not spawn in any vma lane ---"
+for lane in bdc-feature-development.yaml bdc-feature-development-codex.yaml bdc-feature-development-codex-only.yaml bdc-feature-development-astra.yaml; do
+  if (
+    eval "$(extract_vma_core "$DEFAULTS_DIR/$lane")"
+    dir="$(mktemp -d)"
+    printf 'stay\n' > "$dir/keep.txt"
+    cd "$dir" || exit 1
+    for cmd in \
+      "find -- . -delete" \
+      "find -- . -exec touch marker-exec" \
+      "find -- . -execdir touch marker-execdir" \
+      "find -- . -ok touch marker-ok" \
+      "find -- . -okdir touch marker-okdir" \
+      "find -- . -fprint marker-fprint" \
+      "find -- . -fls marker-fls" \
+      "find -- . '-delete'" \
+      "find -- . '-fprint' marker-qfprint"
+    do
+      vma_process_assertions "$cmd => 0" "" >/dev/null 2>&1
+      [ -f keep.txt ] || exit 1
+      [ ! -e marker-exec ] && [ ! -e marker-execdir ] && [ ! -e marker-ok ] && [ ! -e marker-okdir ] && [ ! -e marker-fprint ] && [ ! -e marker-fls ] && [ ! -e marker-qfprint ] || exit 1
+    done
+    rm -rf "$dir"
+  ); then
+    PASS=$((PASS + 1)); echo "PASS: vma find sentinels $lane"
+  else
+    FAIL=$((FAIL + 1)); echo "FAIL: vma find sentinels $lane"
+  fi
+done
+
 echo ""
 echo "==== verify-manifest-assertions.sh tests ===="
 echo "passed: $PASS"
