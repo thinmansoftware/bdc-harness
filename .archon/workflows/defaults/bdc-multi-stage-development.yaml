@@ -124,27 +124,17 @@ nodes:
 
       # Canonical stage-block selection is implemented by structured-evidence-runner.ts.
       ser_root() {
-        local c root pkg
-        if [ "${NODE_ENV:-}" = test ]; then
-          root="${SER_TEST_TRUSTED_ROOT:-}"
-          if [ -n "$root" ] && [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$root/packages/workflows/package.json" ]; then
-            printf '%s' "$root"
-            return 0
-          fi
+        local runner="/app/packages/workflows/src/reliability/structured-evidence-runner.ts"
+        if [ -f "$runner" ] && [ ! -L "$runner" ]; then
+          printf '%s\n' "$runner"
+          return 0
         fi
-        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source; do
-          pkg="$c/packages/workflows/package.json"
-          if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-            printf '%s' "$c"
-            return 0
-          fi
-        done
         return 1
       }
       SER_BUN_BIN="${SER_BUN_BIN:-$(command -v bun || true)}"
       ser_runner() {
-        local root bun_bin
-        root="$(ser_root)" || return 127
+        local runner bun_bin
+        runner="$(ser_root)" || return 127
         bun_bin="${SER_BUN_BIN:-}"
         if [ -z "$bun_bin" ] || [ ! -x "$bun_bin" ]; then
           bun_bin="$(command -v bun || true)"
@@ -152,7 +142,7 @@ nodes:
         if [ -z "$bun_bin" ]; then
           return 127
         fi
-        HARNESS_ROOT_OVERRIDE="$root" "$bun_bin" "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" "$@"
+        "$bun_bin" "$runner" "$@"
       }
       OUT="$ARTIFACTS_DIR/stages.yaml"
       JSON_OUT="$ARTIFACTS_DIR/stages.json"

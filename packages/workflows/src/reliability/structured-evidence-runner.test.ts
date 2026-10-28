@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'bun:test';
 import { spawn, spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
@@ -25,8 +24,9 @@ import {
   extractTestCommands,
   normalizeTestCommand,
   observeAssertion,
+  admitPartialGrep,
   parseStagesYaml,
-  resolveTrustedRunnerFile,
+  requiredEvidenceKinds,
   runTestCommands,
   scopeEvidence,
   scrubEnv,
@@ -66,52 +66,6 @@ function initRepo(cwd: string): void {
   git(cwd, ['commit', '-qm', 'base']);
 }
 
-it('rejects an executable runner copied into a spoofed writable harness checkout', () => {
-  const fakeHarness = tempDir('ser-untrusted-harness-');
-  const product = tempDir('ser-product-');
-  const saved = process.env.HARNESS_ROOT_OVERRIDE;
-  try {
-    mkdirSync(join(fakeHarness, 'packages/workflows/src/reliability'), { recursive: true });
-    writeFileSync(
-      join(fakeHarness, 'packages/workflows/package.json'),
-      JSON.stringify({ name: '@archon/workflows' })
-    );
-    writeFileSync(
-      join(fakeHarness, 'packages/workflows/src/reliability/structured-evidence-runner.ts'),
-      'process.stdout.write("ATTACKER_HELPER_EXECUTED\\n");\n'
-    );
-    initRepo(fakeHarness);
-    git(fakeHarness, [
-      'remote',
-      'add',
-      'origin',
-      'https://evilgithub.com/thinmansoftware/bdc-harness.git',
-    ]);
-    initRepo(product);
-    process.env.HARNESS_ROOT_OVERRIDE = fakeHarness;
-    expect(resolveTrustedRunnerFile(product)).not.toBe(
-      join(fakeHarness, 'packages/workflows/src/reliability/structured-evidence-runner.ts')
-    );
-    const trustedResolution = spawnSync('bun', [RUNNER, 'allow-test', '--', 'bash ./x.sh'], {
-      cwd: product,
-      env: {
-        ...process.env,
-        NODE_ENV: 'production',
-        SER_TEST_TRUSTED_ROOT: '',
-        HARNESS_ROOT_OVERRIDE: fakeHarness,
-      },
-      encoding: 'utf8',
-    });
-    expect(trustedResolution.stdout).not.toContain('ATTACKER_HELPER_EXECUTED');
-    expect(trustedResolution.stderr).toContain('NEVER_RAN');
-  } finally {
-    if (saved === undefined) delete process.env.HARNESS_ROOT_OVERRIDE;
-    else process.env.HARNESS_ROOT_OVERRIDE = saved;
-    rmSync(fakeHarness, { recursive: true, force: true });
-    rmSync(product, { recursive: true, force: true });
-  }
-});
-
 function authority(cwd: string): EvidenceAuthority {
   return { repo: '', stageId: null, targetBranch: null, worktree: cwd, baseSha: '' };
 }
@@ -133,19 +87,6 @@ function oneStage(id: string, repo: string, command: string, branch = 'dev'): st
     '      diff_review_clean: true',
     '      mergeable: true',
   ].join('\n');
-}
-
-let systemYamlProbe: boolean | undefined;
-
-function systemPyYamlAvailable(): boolean {
-  if (systemYamlProbe !== undefined) return systemYamlProbe;
-  const python = existsSync('/usr/bin/python3') ? '/usr/bin/python3' : 'python3';
-  const result = spawnSync(python, ['-I', '-c', 'import yaml'], {
-    encoding: 'utf8',
-    env: { PATH: '/usr/bin:/bin' },
-  });
-  systemYamlProbe = result.status === 0;
-  return systemYamlProbe;
 }
 
 describe('quoted-argv-historical-replays', () => {
@@ -367,6 +308,7 @@ describe('partial-failure-and-compatibility', () => {
 
   it('does not publish a pass when a later required member has no counts or zero counts', () => {
     const cwd = tempDir('ser-mixed-counts-');
+    initRepo(cwd);
     const artifacts = join(cwd, 'artifacts');
     mkdirSync(artifacts, { recursive: true });
     writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\nexit 0\n');
@@ -460,8 +402,8 @@ describe('partial-failure-and-compatibility', () => {
       expect(zero.passed).toBe(0);
       expect(zero.total).toBe(0);
       expect(zero.attempt.aggregate).not.toBe('PASSED');
-      expect(zero.attempt.members[0]?.chain.map(step => step.status)).toEqual(['PASSED', 'FAILED']);
-      expect(zero.attempt.members[0]?.chain[1]?.reason).toBe('zero-count');
+      expect(zero.attempt.members.map(member => member.status)).toEqual(['PASSED', 'FAILED']);
+      expect(zero.attempt.members[1]?.reason).toBe('zero-count');
       expect(countsPass(zero)).toBe(false);
 
       const unparsed = runTestCommands(
@@ -474,7 +416,10 @@ describe('partial-failure-and-compatibility', () => {
       expect(unparsed.passed).toBeNull();
       expect(unparsed.total).toBeNull();
       expect(unparsed.attempt.aggregate).not.toBe('PASSED');
-      expect(unparsed.attempt.members[0]?.chain[1]?.status).toBe('COUNTS_UNPARSED');
+      expect(unparsed.attempt.members.map(member => member.status)).toEqual([
+        'PASSED',
+        'COUNTS_UNPARSED',
+      ]);
       expect(countsPass(unparsed)).toBe(false);
 
       const control = runTestCommands(
@@ -522,19 +467,13 @@ describe('canonical-stage-authority', () => {
     const shop = oneStage('api', 'thinmansoftware/shopops', 'bash ./api.sh');
     const web = oneStage('web', 'thinmansoftware/lspro', 'bash ./web.sh');
     const marked = `<!-- canonical-stages -->\n\`\`\`yaml\n${stageBody(`${shop}\n${web}`)}\n\`\`\`\n`;
-    const yamlReady = systemPyYamlAvailable();
     const selected = scopeEvidence(marked, { repo: 'thinmansoftware/shopops' });
-    if (!yamlReady) {
-      expect(selected.ok).toBe(false);
-      if (!selected.ok) expect(selected.message).toContain('python yaml module unavailable');
-    } else {
-      expect(selected.ok).toBe(true);
-      if (selected.ok) {
-        expect(selected.scope.stageId).toBe('api');
-        expect(selected.scope.commands).toEqual(['bash ./api.sh']);
-        expect(selected.scope.otherStage).toEqual(['bash ./web.sh']);
-        expect(selected.scope.unresolved).toBe(false);
-      }
+    expect(selected.ok).toBe(true);
+    if (selected.ok) {
+      expect(selected.scope.stageId).toBe('api');
+      expect(selected.scope.commands).toEqual(['bash ./api.sh']);
+      expect(selected.scope.otherStage).toEqual(['bash ./web.sh']);
+      expect(selected.scope.unresolved).toBe(false);
     }
     const dup = scopeEvidence(
       `\`\`\`yaml\n${stageBody(`${shop}\n${oneStage('api', 'thinmansoftware/other', 'bash ./x.sh')}`)}\n\`\`\`\n`,
@@ -559,22 +498,17 @@ describe('canonical-stage-authority', () => {
     });
     expect(crossRepo.ok).toBe(false);
     if (!crossRepo.ok) {
-      expect(crossRepo.message).toContain(yamlReady ? 'repo' : 'python yaml module unavailable');
+      expect(crossRepo.message).toContain('repo');
     }
     const bound = scopeEvidence(marked, {
       stageId: 'web',
       repo: 'git@github.com:thinmansoftware/lspro.git',
     });
-    if (!yamlReady) {
-      expect(bound.ok).toBe(false);
-      if (!bound.ok) expect(bound.message).toContain('python yaml module unavailable');
-    } else {
-      expect(bound.ok).toBe(true);
-      if (bound.ok) {
-        expect(bound.scope.stageId).toBe('web');
-        expect(bound.scope.commands).toEqual(['bash ./web.sh']);
-        expect(bound.scope.otherStage).toEqual(['bash ./api.sh']);
-      }
+    expect(bound.ok).toBe(true);
+    if (bound.ok) {
+      expect(bound.scope.stageId).toBe('web');
+      expect(bound.scope.commands).toEqual(['bash ./web.sh']);
+      expect(bound.scope.otherStage).toEqual(['bash ./api.sh']);
     }
     const none = scopeEvidence('WO Class: CODE\n', {});
     expect(none.ok).toBe(true);
@@ -610,12 +544,6 @@ describe('canonical-stage-authority', () => {
       env,
       encoding: 'utf8',
     });
-    if (!systemPyYamlAvailable()) {
-      expect(scoped.status).toBe(3);
-      expect(scoped.stderr ?? '').toContain('python yaml module unavailable');
-      rmSync(cwd, { recursive: true, force: true });
-      return;
-    }
     expect(scoped.status).toBe(0);
     expect(scoped.stdout).toContain('OTHER_STAGE=bash ./web.sh');
     expect(scoped.stdout).toContain('COMMAND=bash ./api.sh');
@@ -769,36 +697,11 @@ describe('canonical-stage-authority', () => {
         parseError = error instanceof Error ? error.message : String(error);
       }
       expect(existsSync(sentinel)).toBe(false);
-      expect(existsSync(envLog)).toBe(true);
-      const envText = readFileSync(envLog, 'utf8');
-      for (const forbidden of [
-        secret,
-        'PYTHONPATH',
-        'GH_TOKEN',
-        'CLAUDE_API_KEY',
-        'ANTHROPIC_API_KEY',
-        'OPENAI_API_KEY',
-        'CURSOR_API_KEY',
-        'BDC_PARSER_SECRET',
-      ]) {
-        expect(envText).not.toContain(forbidden);
-      }
-      const argvItems = readFileSync(argvLog).toString('utf8').split('\0');
-      expect(argvItems).toContain('-I');
-      const recordedCwd = readFileSync(cwdLog, 'utf8').trim();
-      expect(recordedCwd).not.toBe(cwd);
-      expect(recordedCwd.startsWith(`${cwd}/`)).toBe(false);
-      expect(recordedCwd.startsWith(`${tmpdir()}/ser-stages-`)).toBe(true);
-      expect(argvItems).toContain(join(recordedCwd, 'stages.yaml'));
-      expect(existsSync(recordedCwd)).toBe(false);
+      expect(parsedOk).toBe(true);
+      expect(parseError).toBe('');
+      expect(existsSync(envLog)).toBe(false);
       expect(process.env.BDC_PARSER_SECRET).toBe(secret);
       expect(process.env.CLAUDE_API_KEY).toBe('bdc-claude-round12');
-      if (systemPyYamlAvailable()) {
-        expect({ ok: parsedOk, error: parseError }).toEqual({ ok: true, error: '' });
-      } else {
-        expect(parsedOk).toBe(false);
-        expect(parseError).toContain('python yaml module unavailable');
-      }
     } finally {
       process.chdir(previousCwd);
       for (const key of envKeys) {
@@ -925,10 +828,8 @@ describe('canonical-stage-authority', () => {
         stageBody(oneStage('api', 'thinmansoftware/shopops', 'bash ./ok.sh'))
       );
       expect(existsSync(sentinel)).toBe(false);
-      expect(parsed.ok).toBe(false);
-      if (!parsed.ok) expect(parsed.message).toContain('python yaml module unavailable');
-      const argvItems = readFileSync(argvLog).toString('utf8').split('\0');
-      expect(argvItems).toContain('-I');
+      expect(parsed.ok).toBe(true);
+      expect(existsSync(argvLog)).toBe(false);
     } finally {
       if (savedPath === undefined) delete process.env.PATH;
       else process.env.PATH = savedPath;
@@ -1099,7 +1000,7 @@ describe('hermetic-fresh-attempt', () => {
       writeFileSync(join(cwd, 'src.js'), 'v2\n');
       expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(false);
       writeFileSync(join(cwd, 'src.js'), 'v1\n');
-      git(cwd, ['add', 'src.js']);
+      git(cwd, ['add', 'src.js', 'probe.sh']);
       git(cwd, ['commit', '-qm', 'same bytes']);
       expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
       writeFileSync(join(cwd, 'extra.js'), 'new\n');
@@ -1179,18 +1080,15 @@ describe('hermetic-fresh-attempt', () => {
       expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
       git(cwd, ['mv', 'src.js', 'src-renamed.js']);
       const renamed = testedTreeIdentity(cwd);
-      expect(renamed.method).toBe('sha256-worktree-bytes-v1');
-      const renamedBody = readFileSync(join(cwd, 'src-renamed.js'));
-      expect(renamed.paths.find(item => item.path === 'src-renamed.js')?.sha256).toBe(
-        createHash('sha256').update(renamedBody).digest('hex')
-      );
-      expect(renamed.paths.find(item => item.path === 'src.js')?.sha256).toBe('missing');
+      expect(renamed.method).toBe('git-write-tree');
+      expect(renamed.tree).toMatch(/^[0-9a-f]{40}$/);
+      expect(renamed.tree).not.toBe(summary.attempt.tree.tree);
       git(cwd, ['reset', '--hard', 'HEAD']);
       expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
       rmSync(join(cwd, 'gone.js'));
       const deleted = testedTreeIdentity(cwd);
-      expect(deleted.method).toBe('sha256-worktree-bytes-v1');
-      expect(deleted.paths.find(item => item.path === 'gone.js')?.sha256).toBe('missing');
+      expect(deleted.method).toBe('git-write-tree');
+      expect(deleted.tree).not.toBe(summary.attempt.tree.tree);
       refuse(summary.attempt, 'dirty-bytes');
       git(cwd, ['checkout', '--', 'gone.js']);
       expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
@@ -1205,8 +1103,8 @@ describe('hermetic-fresh-attempt', () => {
       });
       expect(sameCli.status).toBe(0);
       symlinkSync('missing-target', join(cwd, 'broken-link'));
-      expect(testedTreeIdentity(cwd).method).toBe('hash-failed');
-      refuse(summary.attempt, 'hash-failed');
+      expect(testedTreeIdentity(cwd).method).toBe('git-write-tree');
+      refuse(summary.attempt, 'dirty-bytes');
       rmSync(join(cwd, 'broken-link'));
       expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
     } finally {
@@ -1218,7 +1116,7 @@ describe('hermetic-fresh-attempt', () => {
 
   it('hashes an unborn repository and refuses changed tracked or untracked bytes', () => {
     const plain = tempDir('ser-notgit-');
-    expect(testedTreeIdentity(plain).method).toBe('not-a-git-worktree');
+    expect(testedTreeIdentity(plain).method).toBe('hash-failed');
     rmSync(plain, { recursive: true, force: true });
     const cwd = tempDir('ser-unborn-');
     git(cwd, ['init', '-q']);
@@ -1239,41 +1137,20 @@ describe('hermetic-fresh-attempt', () => {
       NODE_ENV: 'test',
       SER_TEST_TRUSTED_ROOT: ROOT,
     };
-    const refuse = (attempt: EvidenceAttempt, reason: string): void => {
-      const verdict = checkAttemptRecord(attempt, cwd, authority(cwd));
-      expect(verdict.ok).toBe(false);
-      if (!verdict.ok) expect(verdict.reason).toBe(reason);
-      const cli = spawnSync('bun', [RUNNER, 'check-attempt'], {
-        cwd,
-        env: cliEnv,
-        encoding: 'utf8',
-      });
-      expect(cli.status).not.toBe(0);
-      expect(cli.stderr).toContain(reason);
-    };
     try {
       const summary = runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
       const recorded = summary.attempt.tree;
-      expect(recorded.method).toBe('sha256-worktree-bytes-v1');
+      expect(recorded.method).toBe('hash-failed');
       expect(recorded.headSha).toBe('');
-      expect(recorded.contentDigest.length).toBeGreaterThan(0);
-      expect(recorded.paths.some(item => item.path === 'src.js')).toBe(true);
-      expect(recorded.paths.some(item => item.path === 'extra.js')).toBe(true);
-      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      expect(recorded.tree).toBe('');
+      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(false);
       const freshCli = spawnSync('bun', [RUNNER, 'check-attempt'], {
         cwd,
         env: cliEnv,
         encoding: 'utf8',
       });
-      expect(freshCli.status).toBe(0);
-      writeFileSync(join(cwd, 'src.js'), 'v2\n');
-      refuse(summary.attempt, 'dirty-bytes');
-      writeFileSync(join(cwd, 'src.js'), 'v1\n');
-      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
-      writeFileSync(join(cwd, 'extra.js'), 'u2\n');
-      refuse(summary.attempt, 'dirty-bytes');
-      writeFileSync(join(cwd, 'extra.js'), 'u1\n');
-      expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      expect(freshCli.status).not.toBe(0);
+      expect(freshCli.stderr).toContain('hash-failed');
     } finally {
       if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
       else process.env.ARTIFACTS_DIR = savedArtifacts;
@@ -1668,7 +1545,7 @@ describe('hermetic-fresh-attempt', () => {
       refuse(summary.attempt, 'hash-failed');
       rmSync(bin, { recursive: true, force: true });
       process.env.PATH = savedPath;
-      expect(testedTreeIdentity(cwd).method).toBe('sha256-worktree-bytes-v1');
+      expect(testedTreeIdentity(cwd).method).toBe('git-write-tree');
       expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
     } finally {
       process.env.PATH = savedPath;
@@ -1786,297 +1663,6 @@ describe('parity-stage-and-bundle', () => {
   });
 });
 
-describe('installed-helper-resolution', () => {
-  it('uses the trusted harness module and refuses a product-local helper', () => {
-    const product = tempDir('ser-product-');
-    initRepo(product);
-    git(product, ['remote', 'add', 'origin', 'https://github.com/example/product.git']);
-    const fake = join(product, 'packages/workflows/src/reliability');
-    mkdirSync(fake, { recursive: true });
-    writeFileSync(
-      join(fake, 'structured-evidence-runner.ts'),
-      'process.stderr.write("product-helper\\n"); process.exit(0)\n'
-    );
-    writeFileSync(
-      join(product, 'packages/workflows/package.json'),
-      '{"name":"@archon/workflows"}\n'
-    );
-    const saved = process.env.HARNESS_ROOT_OVERRIDE;
-    const savedTestRoot = process.env.SER_TEST_TRUSTED_ROOT;
-    process.env.HARNESS_ROOT_OVERRIDE = product;
-    delete process.env.SER_TEST_TRUSTED_ROOT;
-    try {
-      expect(resolveTrustedRunnerFile(product)).toBeNull();
-      const missing = spawnSync('bun', [RUNNER, 'allow-test', '--', 'bash ./x.sh'], {
-        cwd: product,
-        env: {
-          ...process.env,
-          NODE_ENV: 'production',
-          SER_TEST_TRUSTED_ROOT: '',
-          HARNESS_ROOT_OVERRIDE: product,
-        },
-        encoding: 'utf8',
-      });
-      expect(missing.stderr).toContain('NEVER_RAN');
-      expect(missing.stdout).not.toContain('product-helper');
-    } finally {
-      process.env.HARNESS_ROOT_OVERRIDE = saved;
-      process.env.SER_TEST_TRUSTED_ROOT = savedTestRoot;
-    }
-    process.env.HARNESS_ROOT_OVERRIDE = ROOT;
-    const trusted = resolveTrustedRunnerFile(product);
-    expect(trusted).toBe(RUNNER);
-    rmSync(product, { recursive: true, force: true });
-  });
-
-  it('does not resolve a helper planted under ARCHON_HOME or the user home', () => {
-    const source = readFileSync(RUNNER, 'utf8');
-    const start = source.indexOf('export function resolveTrustedRunnerFile');
-    const end = source.indexOf('export function trustedSelfMatches');
-    const body = source.slice(start, end);
-    expect(body.includes('homedir(')).toBe(false);
-    expect(body.includes('process.env.ARCHON_HOME')).toBe(false);
-    expect(body.includes("'/app'")).toBe(true);
-    expect(body.includes("'/.archon/workspaces/thinmansoftware/bdc-harness/source'")).toBe(true);
-    const home = tempDir('ser-home-root-');
-    const planted = join(home, '.archon/workspaces/thinmansoftware/bdc-harness/source');
-    const plantedRunner = join(
-      planted,
-      'packages/workflows/src/reliability/structured-evidence-runner.ts'
-    );
-    mkdirSync(join(planted, 'packages/workflows/src/reliability'), { recursive: true });
-    writeFileSync(
-      join(planted, 'packages/workflows/package.json'),
-      '{"name":"@archon/workflows"}\n'
-    );
-    writeFileSync(plantedRunner, 'process.stdout.write("ATTACKER_HELPER_EXECUTED\\n");\n');
-    const product = tempDir('ser-home-product-');
-    initRepo(product);
-    const savedHome = process.env.HOME;
-    const savedArchon = process.env.ARCHON_HOME;
-    const savedNode = process.env.NODE_ENV;
-    const savedTest = process.env.SER_TEST_TRUSTED_ROOT;
-    process.env.HOME = home;
-    process.env.ARCHON_HOME = home;
-    process.env.NODE_ENV = 'production';
-    delete process.env.SER_TEST_TRUSTED_ROOT;
-    try {
-      const resolved = resolveTrustedRunnerFile(product);
-      expect(resolved).not.toBe(plantedRunner);
-      if (resolved) expect(resolved.startsWith(home)).toBe(false);
-    } finally {
-      if (savedHome === undefined) delete process.env.HOME;
-      else process.env.HOME = savedHome;
-      if (savedArchon === undefined) delete process.env.ARCHON_HOME;
-      else process.env.ARCHON_HOME = savedArchon;
-      if (savedNode === undefined) delete process.env.NODE_ENV;
-      else process.env.NODE_ENV = savedNode;
-      if (savedTest === undefined) delete process.env.SER_TEST_TRUSTED_ROOT;
-      else process.env.SER_TEST_TRUSTED_ROOT = savedTest;
-      rmSync(home, { recursive: true, force: true });
-      rmSync(product, { recursive: true, force: true });
-    }
-  });
-});
-
-function extractSerAdapters(text: string): string[] {
-  const lines = text.split('\n');
-  const blocks: string[] = [];
-  for (let i = 0; i < lines.length; i += 1) {
-    if (lines[i] !== '      ser_root() {') continue;
-    let runnerAt = -1;
-    let end = -1;
-    for (let j = i + 1; j < lines.length; j += 1) {
-      if (lines[j] === '      ser_runner() {') runnerAt = j;
-      if (runnerAt >= 0 && lines[j] === '      }' && j > runnerAt) {
-        end = j;
-        break;
-      }
-    }
-    if (end < 0) continue;
-    blocks.push(
-      lines
-        .slice(i, end + 1)
-        .map(line => (line.startsWith('      ') ? line.slice(6) : line))
-        .join('\n')
-    );
-    i = end;
-  }
-  return blocks;
-}
-
-function plantSpoofRunner(root: string): void {
-  const runnerDir = join(root, 'packages/workflows/src/reliability');
-  mkdirSync(runnerDir, { recursive: true });
-  writeFileSync(join(root, 'packages/workflows/package.json'), '{"name":"@archon/workflows"}\n');
-  writeFileSync(
-    join(runnerDir, 'structured-evidence-runner.ts'),
-    [
-      "import { writeFileSync } from 'node:fs';",
-      'const sentinel = process.env.SENTINEL;',
-      "if (sentinel) writeFileSync(sentinel, 'executed\\n');",
-      "process.stdout.write('ATTACKER_HELPER_EXECUTED\\n');",
-      '',
-    ].join('\n')
-  );
-}
-
-describe('lane-adapter-trusted-root', () => {
-  it('does not execute a helper planted under a spoofed ARCHON_HOME', () => {
-    const laneDir = join(ROOT, '.archon/workflows/defaults');
-    const lanes = readdirSync(laneDir).filter(name => name.endsWith('.yaml'));
-    const archonHome = tempDir('ser-spoof-archon-');
-    const userHome = tempDir('ser-spoof-user-');
-    const work = tempDir('ser-adapter-cwd-');
-    const sentinel = join(work, 'sentinel');
-    const archonRoot = join(archonHome, 'workspaces/thinmansoftware/bdc-harness/source');
-    const homeRoot = join(userHome, '.archon/workspaces/thinmansoftware/bdc-harness/source');
-    plantSpoofRunner(archonRoot);
-    plantSpoofRunner(homeRoot);
-    const hide = [
-      'hide_fixed_root() {',
-      '  case "$1" in',
-      '    /app|/app/*|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/source/*)',
-      '      return 0 ;;',
-      '  esac',
-      '  return 1',
-      '}',
-      '[() {',
-      '  if builtin [ "$#" -ge 2 ] && builtin [ "$1" = -f ] && hide_fixed_root "$2"; then',
-      '    return 1',
-      '  fi',
-      '  builtin [ "$@"',
-      '}',
-    ].join('\n');
-    let adapters = 0;
-    try {
-      for (const lane of lanes) {
-        const text = readFileSync(join(laneDir, lane), 'utf8');
-        expect(
-          text.includes(
-            '${ARCHON_HOME:-$HOME/.archon}/workspaces/thinmansoftware/bdc-harness/source'
-          )
-        ).toBe(false);
-        expect(text.includes('$HOME/.archon/workspaces/thinmansoftware/bdc-harness/source')).toBe(
-          false
-        );
-        if (!text.includes('ser_root()')) continue;
-        const blocks = extractSerAdapters(text);
-        expect(blocks.length).toBeGreaterThan(0);
-        for (const block of blocks) {
-          adapters += 1;
-          expect(block.includes('ARCHON_HOME')).toBe(false);
-          expect(block.includes('$HOME/.archon')).toBe(false);
-          expect(
-            block.includes(
-              'for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source; do'
-            )
-          ).toBe(true);
-          const script = [
-            hide,
-            block,
-            'export ARCHON_HOME="$SPOOF_ARCHON_HOME"',
-            'export HOME="$SPOOF_USER_HOME"',
-            'root="$(ser_root)" || true',
-            'printf \'ROOT_ARCHON=%s\\n\' "$root"',
-            "ser_runner allow-test -- 'true' || true",
-            'unset ARCHON_HOME',
-            'root="$(ser_root)" || true',
-            'printf \'ROOT_HOME=%s\\n\' "$root"',
-            "ser_runner allow-test -- 'true' || true",
-            '',
-          ].join('\n');
-          const ran = spawnSync('bash', ['-c', script], {
-            cwd: work,
-            env: {
-              PATH: process.env.PATH ?? '',
-              SENTINEL: sentinel,
-              SPOOF_ARCHON_HOME: archonHome,
-              SPOOF_USER_HOME: userHome,
-              NODE_ENV: 'production',
-            },
-            encoding: 'utf8',
-          });
-          expect(ran.status).toBe(0);
-          expect(ran.stdout).not.toContain('ATTACKER_HELPER_EXECUTED');
-          expect(ran.stdout).not.toContain(archonRoot);
-          expect(ran.stdout).not.toContain(homeRoot);
-          expect(existsSync(sentinel)).toBe(false);
-        }
-      }
-      expect(adapters).toBeGreaterThan(10);
-    } finally {
-      rmSync(archonHome, { recursive: true, force: true });
-      rmSync(userHome, { recursive: true, force: true });
-      rmSync(work, { recursive: true, force: true });
-    }
-  });
-
-  it('never resolves the runner from a product checkout or HARNESS_ROOT_OVERRIDE', () => {
-    // Overseer PR #1286 f13d909f + f2c57648: the HARNESS_ROOT_OVERRIDE branch and
-    // the CWD walk-up trusted a checkout-controlled origin + package name. A
-    // product repo can spoof both, so the adapter must fail closed instead.
-    const laneDir = join(ROOT, '.archon/workflows/defaults');
-    const lanes = readdirSync(laneDir).filter(name => name.endsWith('.yaml'));
-    const product = tempDir('ser-spoof-checkout-');
-    initRepo(product);
-    git(product, ['remote', 'add', 'origin', 'https://github.com/thinmansoftware/bdc-harness.git']);
-    plantSpoofRunner(product);
-    const sentinel = join(product, 'sentinel');
-    const hide = [
-      'hide_fixed_root() {',
-      '  case "$1" in',
-      '    /app|/app/*|/.archon/workspaces/thinmansoftware/bdc-harness/source|/.archon/workspaces/thinmansoftware/bdc-harness/source/*)',
-      '      return 0 ;;',
-      '  esac',
-      '  return 1',
-      '}',
-      '[() {',
-      '  if builtin [ "$#" -ge 2 ] && builtin [ "$1" = -f ] && hide_fixed_root "$2"; then',
-      '    return 1',
-      '  fi',
-      '  builtin [ "$@"',
-      '}',
-    ].join('\n');
-    let adapters = 0;
-    try {
-      for (const lane of lanes) {
-        const text = readFileSync(join(laneDir, lane), 'utf8');
-        if (!text.includes('ser_root()')) continue;
-        for (const block of extractSerAdapters(text)) {
-          adapters += 1;
-          expect(block.includes('HARNESS_ROOT_OVERRIDE:-')).toBe(false);
-          expect(block.includes('d="$(pwd)"')).toBe(false);
-          const script = [
-            hide,
-            block,
-            'if root="$(ser_root)"; then printf \'ROOT=%s\n\' "$root"; else printf \'ROOT_MISSING\n\'; fi',
-            "ser_runner allow-test -- 'true' || true",
-            '',
-          ].join('\n');
-          const ran = spawnSync('bash', ['-c', script], {
-            cwd: product,
-            env: {
-              PATH: process.env.PATH ?? '',
-              SENTINEL: sentinel,
-              HARNESS_ROOT_OVERRIDE: product,
-              NODE_ENV: 'production',
-            },
-            encoding: 'utf8',
-          });
-          expect(ran.status).toBe(0);
-          expect(ran.stdout).toContain('ROOT_MISSING');
-          expect(ran.stdout).not.toContain('ATTACKER_HELPER_EXECUTED');
-          expect(existsSync(sentinel)).toBe(false);
-        }
-      }
-      expect(adapters).toBeGreaterThan(10);
-    } finally {
-      rmSync(product, { recursive: true, force: true });
-    }
-  });
-});
-
 describe('stale-source-log-exclusion', () => {
   it('does not exclude a tracked source path named as a persisted log', () => {
     const cwd = tempDir('ser-stale-source-');
@@ -2187,7 +1773,7 @@ describe('required-evidence-and-identity-collisions', () => {
         writeFileSync(record, '{ not json');
         const corruptRecord = check('--require', 'tests,greps');
         expect(corruptRecord.status).not.toBe(0);
-        expect(corruptRecord.stderr).toContain('REFUSED missing-grep-attempt');
+        expect(corruptRecord.stderr).toContain('REFUSED greps:malformed');
         // Even when greps are not declared, a live pointer to an unreadable
         // record is bound and refused, never silently dropped.
         expect(check('--require', 'tests').status).not.toBe(0);
@@ -2252,9 +1838,7 @@ describe('required-evidence-and-identity-collisions', () => {
       for (const line of text.split('\n')) {
         if (!line.includes('ser_runner check-attempt')) continue;
         calls += 1;
-        expect(line).toContain(
-          'check-attempt --require "$(if [ "$grep_status" = none_declared ]; then echo tests; else echo tests,greps; fi)"'
-        );
+        expect(line).toContain('check-attempt --require "$SER_REQUIRE_KINDS"');
       }
     }
     expect(calls).toBeGreaterThan(20);
@@ -2273,7 +1857,8 @@ describe('required-evidence-and-identity-collisions', () => {
       withArtifacts(cwd, artifacts => {
         git(cwd, ['mv', 'a.js', 'c.js']);
         const tested = testedTreeIdentity(cwd);
-        expect(tested.paths.find(item => item.path === 'a.js')?.sha256).toBe('missing');
+        expect(tested.method).toBe('git-write-tree');
+        expect(tested.tree).toMatch(/^[0-9a-f]{40}$/);
         const summary = runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
         expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
         git(cwd, ['reset', '-q', '--hard', 'HEAD']);
@@ -2296,14 +1881,14 @@ describe('required-evidence-and-identity-collisions', () => {
     const cwd = tempDir('ser-hidden-index-');
     initRepo(cwd);
     try {
-      expect(testedTreeIdentity(cwd).method).toBe('sha256-worktree-bytes-v1');
+      expect(testedTreeIdentity(cwd).method).toBe('git-write-tree');
       git(cwd, ['update-index', '--skip-worktree', 'README']);
-      expect(testedTreeIdentity(cwd).method).toBe('hash-failed');
+      expect(testedTreeIdentity(cwd).method).toBe('git-write-tree');
       git(cwd, ['update-index', '--no-skip-worktree', 'README']);
       git(cwd, ['update-index', '--assume-unchanged', 'README']);
-      expect(testedTreeIdentity(cwd).method).toBe('hash-failed');
+      expect(testedTreeIdentity(cwd).method).toBe('git-write-tree');
       git(cwd, ['update-index', '--no-assume-unchanged', 'README']);
-      expect(testedTreeIdentity(cwd).method).toBe('sha256-worktree-bytes-v1');
+      expect(testedTreeIdentity(cwd).method).toBe('git-write-tree');
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
@@ -2328,6 +1913,446 @@ describe('required-evidence-and-identity-collisions', () => {
       });
     } finally {
       rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+function productionResolverSource(): string {
+  const yaml = readFileSync(
+    join(ROOT, '.archon/workflows/defaults/bdc-feature-development-cursor.yaml'),
+    'utf8'
+  );
+  const start = yaml.indexOf('      ser_root() {');
+  const end = yaml.indexOf('      rst_command_looks_runnable()', start);
+  if (start < 0 || end < 0) throw new Error('production ser_root block missing');
+  return yaml.slice(start, end).replace(/^ {6}/gm, '');
+}
+
+function runResolver(
+  product: string,
+  env: NodeJS.ProcessEnv
+): { stdout: string; status: number | null } {
+  const script = [
+    productionResolverSource(),
+    'if resolved=$(ser_root); then echo "root:0"; echo "resolved:$resolved"; else echo "root:1"; fi',
+    "if ser_runner allow-test -- 'bash ./x.sh' >/dev/null; then echo 'run:0'; else echo \"run:$?\"; fi",
+  ].join('\n');
+  const result = spawnSync('bash', ['-c', script], { cwd: product, env, encoding: 'utf8' });
+  return { stdout: result.stdout ?? '', status: result.status };
+}
+
+describe('trust-boundary regressions', () => {
+  it('trust_root_only_app_path', () => {
+    const product = tempDir('ser-trust-product-');
+    const sentinel = join(product, 'sentinel');
+    const appSentinel = join(product, 'app-ran');
+    const appRunner = '/app/packages/workflows/src/reliability/structured-evidence-runner.ts';
+    const previous = existsSync(appRunner) ? readFileSync(appRunner) : null;
+    const bin = join(product, 'bin');
+    try {
+      initRepo(product);
+      git(product, [
+        'remote',
+        'add',
+        'origin',
+        'https://github.com/thinmansoftware/bdc-harness.git',
+      ]);
+      const fake = join(product, 'packages/workflows/src/reliability');
+      mkdirSync(fake, { recursive: true });
+      writeFileSync(
+        join(product, 'packages/workflows/package.json'),
+        '{"name":"@archon/workflows"}\n'
+      );
+      writeFileSync(
+        join(fake, 'structured-evidence-runner.ts'),
+        `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(sentinel)}, 'pwned\\n');\n`
+      );
+      mkdirSync(bin);
+      writeExec(
+        join(bin, 'structured-evidence-runner'),
+        `#!/bin/sh\nprintf 'pwned\\n' > ${JSON.stringify(sentinel)}\n`
+      );
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+        HARNESS_ROOT_OVERRIDE: product,
+      };
+      rmSync(appRunner, { force: true });
+      const absent = runResolver(product, env);
+      expect(existsSync(sentinel)).toBe(false);
+      expect(absent.stdout).toContain('root:1');
+      expect(absent.stdout).toContain('run:127');
+      mkdirSync(join('/app/packages/workflows/src/reliability'), { recursive: true });
+      symlinkSync(join(fake, 'structured-evidence-runner.ts'), appRunner);
+      const linked = runResolver(product, env);
+      expect(existsSync(sentinel)).toBe(false);
+      expect(linked.stdout).toContain('root:1');
+      rmSync(appRunner, { force: true });
+      writeFileSync(
+        appRunner,
+        `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(appSentinel)}, 'app\\n');\n`
+      );
+      const present = runResolver(product, env);
+      expect(existsSync(sentinel)).toBe(false);
+      expect(existsSync(appSentinel)).toBe(true);
+      expect(present.stdout).toContain('root:0');
+      expect(present.stdout).toContain(`resolved:${appRunner}`);
+      expect(present.stdout).toContain('run:0');
+    } finally {
+      if (previous === null) rmSync(appRunner, { force: true });
+      else writeFileSync(appRunner, previous);
+      rmSync(product, { recursive: true, force: true });
+      rmSync(appSentinel, { force: true });
+    }
+  });
+
+  it('stage_parse_in_process', () => {
+    const cwd = tempDir('ser-stage-parse-');
+    const sentinel = join(cwd, 'sentinel');
+    const spawnLog = join(cwd, 'spawn.log');
+    const shimDir = join(cwd, 'shims');
+    try {
+      writeFileSync(join(cwd, 'yaml.py'), 'raise SystemExit("yaml.py")\n');
+      writeFileSync(join(cwd, 'sitecustomize.py'), 'raise SystemExit("sitecustomize")\n');
+      mkdirSync(shimDir);
+      for (const name of ['python', 'python3', 'node', 'bun']) {
+        writeExec(
+          join(shimDir, name),
+          `#!/bin/sh\nprintf '%s\\n' "$0" >> ${JSON.stringify(spawnLog)}\nexit 0\n`
+        );
+      }
+      const spec = `<!-- canonical-stages -->\n\`\`\`yaml\n${stageBody(
+        `${oneStage('api', 'thinmansoftware/shopops', 'bash ./api.sh')}\n${oneStage('web', 'thinmansoftware/lspro', 'bash ./web.sh')}`
+      )}\n\`\`\`\n`;
+      const parsed = parseStagesYaml(
+        stageBody(
+          `${oneStage('api', 'thinmansoftware/shopops', 'bash ./api.sh')}\n${oneStage('web', 'thinmansoftware/lspro', 'bash ./web.sh')}`
+        )
+      );
+      expect(parsed.ok).toBe(true);
+      const scoped = scopeEvidence(spec, { repo: 'thinmansoftware/shopops' });
+      expect(scoped.ok).toBe(true);
+      const specPath = join(cwd, 'spec.md');
+      const yamlOut = join(cwd, 'stages.yaml');
+      const jsonOut = join(cwd, 'stages.json');
+      writeFileSync(specPath, spec);
+      const cli = spawnSync(
+        process.execPath,
+        [RUNNER, 'parse-stages', specPath, yamlOut, jsonOut],
+        {
+          cwd,
+          env: { ...process.env, PATH: `${shimDir}:${process.env.PATH ?? ''}` },
+          encoding: 'utf8',
+        }
+      );
+      expect(cli.status).toBe(0);
+      expect(existsSync(sentinel)).toBe(false);
+      expect(existsSync(spawnLog)).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('tree_identity_is_git_tree', () => {
+    const cafe = tempDir('ser-tree-cafe-');
+    const renamed = tempDir('ser-tree-rename-');
+    const linked = tempDir('ser-tree-link-');
+    const corrupt = tempDir('ser-tree-corrupt-');
+    const logged = tempDir('ser-tree-log-');
+    const savedArtifacts = process.env.ARTIFACTS_DIR;
+    delete process.env.ARTIFACTS_DIR;
+    try {
+      const accented = `caf${String.fromCharCode(0xe9)}.txt`;
+      initRepo(cafe);
+      writeFileSync(join(cafe, accented), 'one\n');
+      git(cafe, ['add', '--', accented]);
+      git(cafe, ['commit', '-qm', 'accent']);
+      writeFileSync(join(cafe, accented), 'two\n');
+      writeExec(join(cafe, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\nexit 0\n');
+      const cafeRun = runTestCommands(['bash ./ok.sh'], cafe, join(cafe, 'cafe.log'));
+      expect(cafeRun.attempt.tree.method).toBe('git-write-tree');
+      writeFileSync(join(cafe, accented), 'three\n');
+      expect(testedTreeIdentity(cafe).tree).not.toBe(cafeRun.attempt.tree.tree);
+      const cafeVerdict = checkAttemptRecord(cafeRun.attempt, cafe, authority(cafe));
+      expect(cafeVerdict.ok).toBe(false);
+      if (!cafeVerdict.ok) expect(cafeVerdict.reason).toBe('dirty-bytes');
+
+      initRepo(renamed);
+      writeFileSync(join(renamed, 'a.js'), 'same\n');
+      writeFileSync(join(renamed, 'b.js'), 'same\n');
+      git(renamed, ['add', 'a.js', 'b.js']);
+      git(renamed, ['commit', '-qm', 'pair']);
+      git(renamed, ['mv', 'a.js', 'c.js']);
+      writeExec(join(renamed, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\nexit 0\n');
+      const renameRun = runTestCommands(['bash ./ok.sh'], renamed, join(renamed, 'rename.log'));
+      const firstTree = renameRun.attempt.tree.tree;
+      git(renamed, ['mv', 'c.js', 'a.js']);
+      git(renamed, ['mv', 'b.js', 'c.js']);
+      expect(testedTreeIdentity(renamed).tree).not.toBe(firstTree);
+      const renameVerdict = checkAttemptRecord(renameRun.attempt, renamed, authority(renamed));
+      expect(renameVerdict.ok).toBe(false);
+      if (!renameVerdict.ok) expect(renameVerdict.reason).toBe('dirty-bytes');
+
+      initRepo(linked);
+      writeFileSync(join(linked, 'a.txt'), 'same\n');
+      writeFileSync(join(linked, 'b.txt'), 'same\n');
+      symlinkSync('a.txt', join(linked, 'link'));
+      git(linked, ['add', 'a.txt', 'b.txt', 'link']);
+      git(linked, ['commit', '-qm', 'link']);
+      writeExec(join(linked, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\nexit 0\n');
+      const linkRun = runTestCommands(['bash ./ok.sh'], linked, join(linked, 'link.log'));
+      rmSync(join(linked, 'link'));
+      symlinkSync('b.txt', join(linked, 'link'));
+      expect(testedTreeIdentity(linked).tree).not.toBe(linkRun.attempt.tree.tree);
+      const linkVerdict = checkAttemptRecord(linkRun.attempt, linked, authority(linked));
+      expect(linkVerdict.ok).toBe(false);
+      if (!linkVerdict.ok) expect(linkVerdict.reason).toBe('dirty-bytes');
+
+      initRepo(corrupt);
+      writeExec(join(corrupt, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\nexit 0\n');
+      const corruptRun = runTestCommands(['bash ./ok.sh'], corrupt, join(corrupt, 'corrupt.log'));
+      expect(corruptRun.attempt.tree.method).toBe('git-write-tree');
+      writeFileSync(join(corrupt, '.git/index'), 'not-an-index');
+      expect(testedTreeIdentity(corrupt).method).toBe('hash-failed');
+      const corruptVerdict = checkAttemptRecord(corruptRun.attempt, corrupt, authority(corrupt));
+      expect(corruptVerdict.ok).toBe(false);
+      if (!corruptVerdict.ok) expect(corruptVerdict.reason).toBe('hash-failed');
+
+      initRepo(logged);
+      mkdirSync(join(logged, 'src/evidence'), { recursive: true });
+      writeFileSync(join(logged, 'src/evidence/check.ts'), 'export const n = 1;\n');
+      git(logged, ['add', 'src/evidence/check.ts']);
+      git(logged, ['commit', '-qm', 'src']);
+      writeExec(join(logged, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\nexit 0\n');
+      const logPath = join(logged, 'evidence-run.log');
+      const logRun = runTestCommands(['bash ./ok.sh'], logged, logPath);
+      expect(logRun.attempt.tree.method).toBe('git-write-tree');
+      const loggedTree = logRun.attempt.tree.tree;
+      writeFileSync(logPath, 'edited evidence log\n');
+      expect(testedTreeIdentity(logged).tree).toBe(loggedTree);
+      writeFileSync(join(logged, 'src/evidence/check.ts'), 'export const n = 2;\n');
+      expect(testedTreeIdentity(logged).tree).not.toBe(loggedTree);
+      const logVerdict = checkAttemptRecord(logRun.attempt, logged, authority(logged));
+      expect(logVerdict.ok).toBe(false);
+      if (!logVerdict.ok) expect(logVerdict.reason).toBe('dirty-bytes');
+    } finally {
+      if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = savedArtifacts;
+      for (const dir of [cafe, renamed, linked, corrupt, logged]) {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('multistage_no_greps_not_incomplete', () => {
+    const cwd = tempDir('ser-no-grep-');
+    const artifacts = tempDir('ser-no-grep-art-');
+    const saved = process.env.ARTIFACTS_DIR;
+    process.env.ARTIFACTS_DIR = artifacts;
+    try {
+      initRepo(cwd);
+      writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\nexit 0\n');
+      const spec = [
+        '<!-- canonical-stages -->',
+        '```yaml',
+        stageBody(
+          `${oneStage('api', 'thinmansoftware/shopops', 'bash ./ok.sh')}\n${oneStage('web', 'thinmansoftware/lspro', 'bash ./web.sh')}`
+        ),
+        '```',
+        'Stop 1 (test suite):',
+        '  bash ./ok.sh',
+        '  Expected: 1',
+        '',
+      ].join('\n');
+      expect(requiredEvidenceKinds(spec)).toEqual(['tests']);
+      const tests = runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
+      expect(tests.attempt.aggregate).toBe('PASSED');
+      const greps = spawnSync(process.execPath, [RUNNER, 'run-greps'], {
+        cwd,
+        input: 'DECLARED\t0\n',
+        encoding: 'utf8',
+        env: { ...process.env, ARTIFACTS_DIR: artifacts },
+      });
+      expect(greps.status).toBe(0);
+      expect(greps.stdout).toContain('GREP_STATUS=none_declared');
+      const check = spawnSync(process.execPath, [RUNNER, 'check-attempt', '--require', 'tests'], {
+        cwd,
+        encoding: 'utf8',
+        env: { ...process.env, ARTIFACTS_DIR: artifacts },
+      });
+      expect(check.status).toBe(0);
+      expect(check.stderr ?? '').not.toContain('REFUSED');
+    } finally {
+      if (saved === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = saved;
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(artifacts, { recursive: true, force: true });
+    }
+  });
+
+  it('member_status_drives_summary', () => {
+    const cwd = tempDir('ser-members-');
+    const saved = process.env.ARTIFACTS_DIR;
+    delete process.env.ARTIFACTS_DIR;
+    try {
+      initRepo(cwd);
+      writeExec(join(cwd, 'pass.sh'), '#!/bin/sh\necho "Tests: 1/1"\nexit 0\n');
+      writeExec(join(cwd, 'zero.sh'), '#!/bin/sh\necho "Tests: 0/0"\nexit 0\n');
+      writeExec(join(cwd, 'nocount.sh'), '#!/bin/sh\necho "no counts here"\nexit 0\n');
+      const zero = runTestCommands(
+        ['bash ./pass.sh && bash ./zero.sh'],
+        cwd,
+        join(cwd, 'zero.log')
+      );
+      expect(zero.attempt.aggregate).not.toBe('PASSED');
+      expect(zero.line).not.toBe('0 1 1');
+      expect(checkAttemptRecord(zero.attempt, cwd, authority(cwd)).ok).toBe(false);
+      const unparsed = runTestCommands(
+        ['bash ./pass.sh && bash ./nocount.sh'],
+        cwd,
+        join(cwd, 'nocount.log')
+      );
+      expect(unparsed.attempt.aggregate).not.toBe('PASSED');
+      expect(unparsed.line).not.toBe('0 1 1');
+      expect(checkAttemptRecord(unparsed.attempt, cwd, authority(cwd)).ok).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = saved;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('required_kinds_enforced', () => {
+    const cwd = tempDir('ser-kinds-');
+    const artifacts = tempDir('ser-kinds-art-');
+    const saved = process.env.ARTIFACTS_DIR;
+    process.env.ARTIFACTS_DIR = artifacts;
+    try {
+      initRepo(cwd);
+      writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\nexit 0\n');
+      writeFileSync(join(cwd, 'notes.txt'), 'hello\n');
+      const tests = runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
+      expect(tests.attempt.aggregate).toBe('PASSED');
+      const greps = spawnSync(process.execPath, [RUNNER, 'run-greps'], {
+        cwd,
+        input: ['DECLARED\t1', 'grep -c hello notes.txt\teq\t1', ''].join('\n'),
+        encoding: 'utf8',
+        env: { ...process.env, ARTIFACTS_DIR: artifacts },
+      });
+      expect(greps.status).toBe(0);
+      expect(greps.stdout).toContain('GREP_STATUS=passed');
+      const attempts = join(artifacts, 'evidence', 'attempts');
+      const grepId = readFileSync(join(attempts, 'current-greps'), 'utf8').trim();
+      const grepFile = join(attempts, `${grepId}.json`);
+      const grepBody = readFileSync(grepFile);
+      const testId = readFileSync(join(attempts, 'current-tests'), 'utf8').trim();
+      const testBody = readFileSync(join(attempts, `${testId}.json`));
+      const check = (): { status: number | null; stderr: string } => {
+        const result = spawnSync(
+          process.execPath,
+          [RUNNER, 'check-attempt', '--require', 'tests,greps'],
+          {
+            cwd,
+            encoding: 'utf8',
+            env: { ...process.env, ARTIFACTS_DIR: artifacts },
+          }
+        );
+        return { status: result.status, stderr: result.stderr ?? '' };
+      };
+      rmSync(grepFile);
+      const missing = check();
+      expect(missing.status).not.toBe(0);
+      expect(missing.stderr).toContain('missing-grep-attempt');
+      writeFileSync(grepFile, '{');
+      const malformed = check();
+      expect(malformed.status).not.toBe(0);
+      expect(malformed.stderr).toContain('greps:malformed');
+      writeFileSync(grepFile, testBody);
+      const wrongKind = check();
+      expect(wrongKind.status).not.toBe(0);
+      expect(wrongKind.stderr).toContain('grep-attempt-kind');
+      writeFileSync(grepFile, grepBody);
+      const prose = spawnSync(process.execPath, [RUNNER, 'run-greps'], {
+        cwd,
+        input: [
+          'DECLARED\t2',
+          'grep -c hello notes.txt\teq\t1',
+          'UNPARSED\t1\tprose assertion',
+          '',
+        ].join('\n'),
+        encoding: 'utf8',
+        env: { ...process.env, ARTIFACTS_DIR: artifacts },
+      });
+      expect(prose.status).toBe(0);
+      expect(prose.stderr).toContain('SER_GREP_FP4=admitted');
+      const admitted = check();
+      expect(admitted.status).toBe(0);
+      const proseId = readFileSync(join(attempts, 'current-greps'), 'utf8').trim();
+      const proseAttempt = JSON.parse(readFileSync(join(attempts, `${proseId}.json`), 'utf8')) as {
+        kind: string;
+        aggregate: string;
+        grepExecuted?: number;
+        grepDropped?: number;
+        grepUnparsed?: number;
+        grepMismatch?: number;
+      };
+      expect(admitPartialGrep(proseAttempt)).toBe(true);
+    } finally {
+      if (saved === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = saved;
+      rmSync(cwd, { recursive: true, force: true });
+      rmSync(artifacts, { recursive: true, force: true });
+    }
+  });
+
+  it('find_terminator_predicates_refused', () => {
+    const cwd = tempDir('ser-find-');
+    try {
+      writeFileSync(join(cwd, 'keep'), 'stay\n');
+      const commands = ['find -- . -delete', 'find . -- -exec rm {} ;', 'find -- . -fprint out'];
+      for (const command of commands) {
+        const allowed = allowAssertion(command);
+        expect(allowed.ok).toBe(false);
+        const cli = spawnSync(process.execPath, [RUNNER, 'allow-assertion', '--', command], {
+          cwd,
+          encoding: 'utf8',
+        });
+        expect(cli.status).not.toBe(0);
+      }
+      expect(existsSync(join(cwd, 'keep'))).toBe(true);
+      expect(readFileSync(join(cwd, 'keep'), 'utf8')).toBe('stay\n');
+      expect(existsSync(join(cwd, 'out'))).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('single_extractor_parity', () => {
+    const lanes = readdirSync(join(ROOT, '.archon/workflows/defaults'))
+      .filter(name => /^bdc-feature-development.*\.yaml$/.test(name))
+      .sort();
+    expect(lanes).toHaveLength(13);
+    for (const lane of lanes) {
+      const yaml = readFileSync(join(ROOT, '.archon/workflows/defaults', lane), 'utf8');
+      const rstBegin = yaml.indexOf('# ---- BEGIN rst core');
+      const rstEnd = yaml.indexOf('# ---- END rst core');
+      const rsgBegin = yaml.indexOf('# ---- BEGIN rsg core');
+      const rsgEnd = yaml.indexOf('# ---- END rsg core');
+      expect(rstBegin).toBeGreaterThanOrEqual(0);
+      expect(rsgBegin).toBeGreaterThanOrEqual(0);
+      const rst = yaml.slice(rstBegin, rstEnd);
+      const rsg = yaml.slice(rsgBegin, rsgEnd);
+      expect(rst).toContain('ser_runner extract-tests');
+      expect(rsg).toContain('ser_runner extract-greps');
+      for (const core of [rst, rsg]) {
+        const programs = [...core.matchAll(/awk(?:\s+-v\s+\S+)*\s+'([^']*)'/g)].map(
+          match => match[1] ?? ''
+        );
+        for (const program of programs) {
+          expect(program.includes('Stop')).toBe(false);
+          expect(program.includes('Expected')).toBe(false);
+        }
+      }
     }
   });
 });

@@ -2,6 +2,7 @@
  * Shared argv evidence runner for lane test and assertion commands.
  * Tokenize once, validate the decoded argv, and spawn that argv with shell:false.
  * Never eval, never bash -c, and never re-run a rejected command through a fallback.
+ * gitignored files are outside the tested-tree identity.
  */
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -19,9 +20,9 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { z } from '@hono/zod-openapi';
+import { parse as parseYaml } from 'yaml';
 
 export const evidenceStatusSchema = z.enum([
   'PASSED',
@@ -71,8 +72,8 @@ export type AttemptMember = z.infer<typeof attemptMemberSchema>;
 export const treeIdentitySchema = z.object({
   method: z.string(),
   headSha: z.string(),
-  paths: z.array(z.object({ path: z.string(), sha256: z.string() })),
-  contentDigest: z.string(),
+  tree: z.string(),
+  excluded: z.array(z.string()),
 });
 
 export type TreeIdentity = z.infer<typeof treeIdentitySchema>;
@@ -160,8 +161,6 @@ const ASSERT_SIMPLE = new Set([
   '[',
 ]);
 const GREP_RUNNERS = new Set(['grep', 'egrep', 'fgrep', 'rg']);
-const RUNNER_REL = 'packages/workflows/src/reliability/structured-evidence-runner.ts';
-
 export interface CommandResult {
   readonly stdout: string;
   readonly stderr: string;
@@ -277,24 +276,6 @@ function gitCapture(cwd: string, args: readonly string[]): { ok: boolean; stdout
   return { ok: true, stdout: result.stdout ?? '' };
 }
 
-function isHarnessOrigin(url: string): boolean {
-  return /^(?:https?:\/\/github\.com\/|ssh:\/\/git@github\.com\/|git@github\.com:)thinmansoftware\/bdc-harness(?:\.git)?\/?$/i.test(
-    url.trim()
-  );
-}
-
-export function isHarnessRoot(root: string): boolean {
-  const runner = join(root, RUNNER_REL);
-  const pkgPath = join(root, 'packages/workflows/package.json');
-  if (!existsSync(runner) || !existsSync(pkgPath)) return false;
-  try {
-    const parsed = JSON.parse(readFileSync(pkgPath, 'utf8')) as { name?: unknown };
-    return parsed.name === '@archon/workflows';
-  } catch {
-    return false;
-  }
-}
-
 function gitOrigin(cwd: string): string {
   const result = gitCapture(cwd, ['remote', 'get-url', 'origin']);
   return result.ok ? result.stdout.trim() : '';
@@ -307,259 +288,101 @@ function gitTop(cwd: string): string | null {
   return top.length > 0 ? top : null;
 }
 
-export function productWorktreeTop(cwd: string): string | null {
-  const top = gitTop(cwd);
-  if (!top) return null;
-  const origin = gitOrigin(top);
-  if (origin && isHarnessOrigin(origin)) return null;
-  return top;
-}
+// Exact repo-relative evidence paths for this worktree. Substring names are
+// never excluded; only these paths are passed to git as :(exclude) pathspecs.
+const evidenceExclusions = new Map<string, Set<string>>();
 
-function pathUnder(file: string, top: string): boolean {
-  try {
-    const realFile = realpathSync(file);
-    const realTop = realpathSync(top);
-    return (
-      realFile === realTop || realFile.startsWith(realTop.endsWith(sep) ? realTop : realTop + sep)
-    );
-  } catch {
-    return false;
-  }
-}
-
-export function resolveTrustedRunnerFile(cwd: string): string | null {
-  const candidates: string[] = [];
-  // Unit tests need to exercise the real CLI before it has been installed at a
-  // production path. This fixture is deliberately separate from
-  // HARNESS_ROOT_OVERRIDE, which is workflow-user-controlled and is never a
-  // source of trust.
-  const testRoot = process.env.SER_TEST_TRUSTED_ROOT;
-  if (process.env.NODE_ENV === 'test' && testRoot) {
-    candidates.push(testRoot);
-  }
-  // Installed copies only. ARCHON_HOME, HOME, and HARNESS_ROOT_OVERRIDE are
-  // caller-controlled and are never production candidates.
-  candidates.push('/app');
-  candidates.push('/.archon/workspaces/thinmansoftware/bdc-harness/source');
-  const product = productWorktreeTop(cwd);
-  for (const root of candidates) {
-    if (!root || !isHarnessRoot(root)) continue;
-    const file = join(root, RUNNER_REL);
-    if (product && pathUnder(file, product)) continue;
-    return file;
-  }
-  return null;
-}
-
-export function trustedSelfMatches(cwd: string): boolean {
-  const trusted = resolveTrustedRunnerFile(cwd);
-  if (!trusted) return false;
-  try {
-    const self = realpathSync(fileURLToPath(import.meta.url));
-    return realpathSync(trusted) === self;
-  } catch {
-    return false;
-  }
-}
-
-const generatedIdentityPaths = new Set<string>();
-
-function artifactRootReal(): string | null {
-  const base = process.env.ARTIFACTS_DIR;
-  if (!base || base.length === 0) return null;
-  try {
-    return realpathSync(base);
-  } catch {
+function repoRelativePath(top: string, abs: string): string | null {
+  const rel = relative(top, abs);
+  if (rel.length === 0 || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel))
     return null;
-  }
-}
-
-function insideRelative(root: string, abs: string): string | null {
-  const rel = relative(root, abs);
-  if (rel === '' || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
   return rel.split(sep).join('/');
 }
 
-function pathLeaf(abs: string): string | null {
-  const leaf = abs.slice(Math.max(abs.lastIndexOf('/'), abs.lastIndexOf('\\')) + 1);
-  if (leaf.length === 0 || leaf === '.' || leaf === '..') return null;
-  return leaf;
-}
-
-// Persisted attempt records are untrusted. Only a real attempt tree or a log
-// file under the artifact root may be left out of tree identity.
-function verifiedGeneratedTarget(path: string): { real: string; directory: boolean } | null {
-  const root = artifactRootReal();
-  if (!root) return null;
-  const directory = /[\\/]$/.test(path);
-  const trimmed = path.replace(/[\\/]+$/, '');
-  if (trimmed.length === 0) return null;
-  const abs = resolve(trimmed);
-  let real: string;
-  try {
-    real = realpathSync(abs);
-  } catch {
-    let parent: string;
-    try {
-      parent = realpathSync(dirname(abs));
-    } catch {
-      return null;
-    }
-    if (parent !== root && insideRelative(root, parent) === null) return null;
-    const leaf = pathLeaf(abs);
-    if (!leaf) return null;
-    real = join(parent, leaf);
-  }
-  const rel = insideRelative(root, real);
-  if (!rel) return null;
-  const attempts = 'evidence/attempts';
-  const isAttempt = rel === attempts || rel.startsWith(`${attempts}/`);
-  const isLog = !directory && rel.endsWith('.log');
-  if (directory) {
-    if (!isAttempt) return null;
-  } else if (!isAttempt && !isLog) {
-    return null;
-  }
-  return { real, directory };
-}
-
 function registerGeneratedPath(cwd: string, path: string): void {
-  const verified = verifiedGeneratedTarget(path);
-  if (!verified) return;
-  const rel = insideRelative(cwd, verified.real);
+  const top = gitTop(cwd);
+  if (!top) return;
+  const trimmed = path.replace(/[\\/]+$/, '');
+  if (trimmed.length === 0) return;
+  const abs = isAbsolute(trimmed) ? trimmed : resolve(cwd, trimmed);
+  const rel = repoRelativePath(top, abs);
   if (!rel) return;
-  generatedIdentityPaths.add(verified.directory ? `${rel}/` : rel);
-}
-
-function excludedIdentityPath(path: string): boolean {
-  const norm = path.replace(/\\/g, '/');
-  if (generatedIdentityPaths.has(norm)) return true;
-  for (const generated of generatedIdentityPaths) {
-    if (generated.endsWith('/') && norm.startsWith(generated)) return true;
+  let paths = evidenceExclusions.get(top);
+  if (!paths) {
+    paths = new Set<string>();
+    evidenceExclusions.set(top, paths);
   }
-  return false;
+  paths.add(rel);
 }
 
-function hashFailedIdentity(headSha: string): TreeIdentity {
-  return { method: 'hash-failed', headSha, paths: [], contentDigest: '' };
-}
-
-function notAGitWorktree(): TreeIdentity {
-  return {
-    method: 'not-a-git-worktree',
-    headSha: '',
-    paths: [],
-    contentDigest: '',
-  };
-}
-
-// assume-unchanged (lowercase tag) and skip-worktree (S) entries are hidden
-// from git status, so their bytes could differ from what was tested.
-function hasHiddenIndexEntries(cwd: string): boolean | null {
-  const listed = gitCapture(cwd, ['ls-files', '-v', '-z']);
-  if (!listed.ok) return null;
-  for (const record of listed.stdout.split('\0')) {
-    if (record.length < 2) continue;
-    const tag = record[0] ?? '';
-    if (tag === 'S' || (tag >= 'a' && tag <= 'z')) return true;
-  }
-  return false;
-}
-
-function identityFromStatus(cwd: string, headSha: string): TreeIdentity {
-  const status = gitCapture(cwd, ['status', '--porcelain=v1', '-z', '-uall']);
-  if (!status.ok) return hashFailedIdentity(headSha);
-  const parsed = parsePorcelainZ(status.stdout);
-  if (!parsed.ok) return hashFailedIdentity(headSha);
-  if (hasHiddenIndexEntries(cwd) !== false) return hashFailedIdentity(headSha);
-  const byPath = new Map<string, string>();
-  const add = (path: string, sha256: string): boolean => {
-    const prior = byPath.get(path);
-    if (prior !== undefined && prior !== sha256) return false;
-    byPath.set(path, sha256);
-    return true;
-  };
-  for (const entry of parsed.entries) {
-    if (!excludedIdentityPath(entry.path)) {
-      const sha256 = hashWorktreeBytes(cwd, entry.status, entry.path);
-      if (sha256 === null || !add(entry.path, sha256)) return hashFailedIdentity(headSha);
+function enumeratedExclusions(cwd: string): string[] {
+  const top = gitTop(cwd);
+  const excluded = new Set<string>();
+  if (top) {
+    const artifacts = process.env.ARTIFACTS_DIR;
+    if (artifacts && artifacts.length > 0) {
+      const rel = repoRelativePath(top, resolve(artifacts));
+      if (rel) excluded.add(rel);
     }
-    // A rename or copy source is part of the tested tree: record its bytes, or
-    // 'missing' when it is gone, so a different source cannot collide.
-    if (entry.source !== null && !excludedIdentityPath(entry.source)) {
-      const sha256 = sourceBytes(cwd, entry.source);
-      if (sha256 === null || !add(entry.source, sha256)) return hashFailedIdentity(headSha);
-    }
+    for (const rel of evidenceExclusions.get(top) ?? []) excluded.add(rel);
   }
-  const paths = [...byPath.entries()].map(([path, sha256]) => ({ path, sha256 }));
-  paths.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  const contentDigest = createHash('sha256').update(JSON.stringify(paths)).digest('hex');
-  return {
-    method: 'sha256-worktree-bytes-v1',
-    headSha,
-    paths,
-    contentDigest,
-  };
+  return [...excluded].sort();
 }
 
-// git status -z records are "XY path\0". Renames and copies are "XY dest\0source\0".
-function parsePorcelainZ(
-  stdout: string
-):
-  | { ok: true; entries: { status: string; path: string; source: string | null }[] }
-  | { ok: false } {
-  const entries: { status: string; path: string; source: string | null }[] = [];
-  let index = 0;
-  while (index < stdout.length) {
-    const end = stdout.indexOf('\0', index);
-    if (end < 0) return { ok: false };
-    const header = stdout.slice(index, end);
-    index = end + 1;
-    if (header.length === 0) continue;
-    if (header.length < 4 || header[2] !== ' ') return { ok: false };
-    const status = header.slice(0, 2);
-    const path = header.slice(3);
-    let source: string | null = null;
-    if (status.includes('R') || status.includes('C')) {
-      const sourceEnd = stdout.indexOf('\0', index);
-      if (sourceEnd < 0) return { ok: false };
-      source = stdout.slice(index, sourceEnd);
-      if (source.length === 0) return { ok: false };
-      index = sourceEnd + 1;
-    }
-    entries.push({ status, path, source });
-  }
-  return { ok: true, entries };
+function hashFailedIdentity(headSha: string, excluded: readonly string[] = []): TreeIdentity {
+  return { method: 'hash-failed', headSha, tree: '', excluded: [...excluded] };
 }
 
-function hashWorktreeBytes(cwd: string, status: string, path: string): string | null {
-  const abs = join(cwd, path);
+function gitIdentity(
+  cwd: string,
+  args: readonly string[],
+  extraEnv?: Record<string, string>
+): { ok: boolean; stdout: string } {
+  const result = spawnSync(
+    'git',
+    ['-c', 'core.fsmonitor=false', '-c', 'core.quotepath=false', ...args],
+    {
+      cwd,
+      env: { ...scrubEnv(process.env), ...extraEnv },
+      shell: false,
+      encoding: 'utf8',
+      timeout: 60_000,
+      maxBuffer: 16 * 1024 * 1024,
+    }
+  );
+  if (result.error || result.status !== 0) return { ok: false, stdout: '' };
+  return { ok: true, stdout: (result.stdout ?? '').trim() };
+}
+
+export function testedTreeIdentity(cwd: string, exclusions?: readonly string[]): TreeIdentity {
+  const head = gitIdentity(cwd, ['rev-parse', 'HEAD']);
+  if (!head.ok || !/^[0-9a-f]{40}$/.test(head.stdout)) return hashFailedIdentity('');
+  // Check-time identity uses the exclusions stored on the attempt. A rewritten
+  // member log path must not drop a tracked source file from the tree.
+  const excluded = exclusions ? [...exclusions] : enumeratedExclusions(cwd);
+  // A corrupt or unreadable index fails git status. That is hash-failed, not an
+  // empty identity. The porcelain text itself is not parsed.
+  const status = gitIdentity(cwd, ['status', '--porcelain=v1', '-z']);
+  if (!status.ok) return hashFailedIdentity(head.stdout, excluded);
+  const indexDir = mkdtempSync(join(tmpdir(), 'ser-index-'));
   try {
-    return createHash('sha256').update(readFileSync(abs)).digest('hex');
+    const indexFile = join(indexDir, 'index');
+    const add = gitIdentity(
+      cwd,
+      ['add', '-A', '--', '.', ...excluded.map(path => `:(exclude)${path}`)],
+      { GIT_INDEX_FILE: indexFile }
+    );
+    if (!add.ok) return hashFailedIdentity(head.stdout, excluded);
+    const tree = gitIdentity(cwd, ['write-tree'], { GIT_INDEX_FILE: indexFile });
+    if (!tree.ok || !/^[0-9a-f]{40}$/.test(tree.stdout)) {
+      return hashFailedIdentity(head.stdout, excluded);
+    }
+    return { method: 'git-write-tree', headSha: head.stdout, tree: tree.stdout, excluded };
   } catch {
-    if (status.includes('D') && !existsSync(abs)) return 'missing';
-    return null;
+    return hashFailedIdentity(head.stdout, excluded);
+  } finally {
+    rmSync(indexDir, { recursive: true, force: true });
   }
-}
-
-function sourceBytes(cwd: string, path: string): string | null {
-  const abs = join(cwd, path);
-  if (!existsSync(abs)) return 'missing';
-  try {
-    return createHash('sha256').update(readFileSync(abs)).digest('hex');
-  } catch {
-    return null;
-  }
-}
-
-export function testedTreeIdentity(cwd: string): TreeIdentity {
-  const head = gitCapture(cwd, ['rev-parse', 'HEAD']);
-  if (head.ok) return identityFromStatus(cwd, head.stdout.trim());
-  const inside = gitCapture(cwd, ['rev-parse', '--is-inside-work-tree']);
-  if (!inside.ok || inside.stdout.trim() !== 'true') return notAGitWorktree();
-  // Unborn repository: HEAD does not resolve before the first commit.
-  // Hash status paths so a later byte change cannot match an empty identity.
-  return identityFromStatus(cwd, '');
 }
 
 function attemptsDirectory(cwd: string): string {
@@ -762,16 +585,33 @@ function shellAttempt(
   };
 }
 
-export function readAttemptById(cwd: string, attemptId: string): EvidenceAttempt | null {
-  if (!safeAttemptId(attemptId)) return null;
+function readAttemptFile(
+  cwd: string,
+  attemptId: string
+): { state: 'absent' } | { state: 'malformed' } | { state: 'ok'; attempt: EvidenceAttempt } {
+  if (!safeAttemptId(attemptId)) return { state: 'malformed' };
   const file = join(attemptsDirectory(cwd), `${attemptId}.json`);
-  if (!existsSync(file)) return null;
+  if (!existsSync(file)) return { state: 'absent' };
+  let text: string;
   try {
-    const parsed = evidenceAttemptSchema.safeParse(JSON.parse(readFileSync(file, 'utf8')));
-    return parsed.success ? parsed.data : null;
+    text = readFileSync(file, 'utf8');
   } catch {
-    return null;
+    return { state: 'malformed' };
   }
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return { state: 'malformed' };
+  }
+  const parsed = evidenceAttemptSchema.safeParse(json);
+  if (!parsed.success) return { state: 'malformed' };
+  return { state: 'ok', attempt: parsed.data };
+}
+
+export function readAttemptById(cwd: string, attemptId: string): EvidenceAttempt | null {
+  const read = readAttemptFile(cwd, attemptId);
+  return read.state === 'ok' ? read.attempt : null;
 }
 
 function readPointerAttempt(cwd: string, pointerName: string): EvidenceAttempt | null {
@@ -839,8 +679,10 @@ export function checkBoundAttempts(
   let testAttempt: EvidenceAttempt | null = null;
   let grepAttempt: EvidenceAttempt | null = null;
   if (binding.testAttemptId) {
-    testAttempt = readAttemptById(cwd, binding.testAttemptId);
-    if (!testAttempt) return { ok: false, reason: 'missing-test-attempt' };
+    const read = readAttemptFile(cwd, binding.testAttemptId);
+    if (read.state === 'absent') return { ok: false, reason: 'missing-test-attempt' };
+    if (read.state === 'malformed') return { ok: false, reason: 'tests:malformed' };
+    testAttempt = read.attempt;
     if (testAttempt.kind !== 'tests' || testAttempt.source === 'other-stage') {
       return { ok: false, reason: 'test-attempt-kind' };
     }
@@ -852,8 +694,10 @@ export function checkBoundAttempts(
     if (!verdict.ok) return { ok: false, reason: `tests:${verdict.reason}` };
   }
   if (binding.grepAttemptId) {
-    grepAttempt = readAttemptById(cwd, binding.grepAttemptId);
-    if (!grepAttempt) return { ok: false, reason: 'missing-grep-attempt' };
+    const read = readAttemptFile(cwd, binding.grepAttemptId);
+    if (read.state === 'absent') return { ok: false, reason: 'missing-grep-attempt' };
+    if (read.state === 'malformed') return { ok: false, reason: 'greps:malformed' };
+    grepAttempt = read.attempt;
     if (grepAttempt.kind !== 'greps') return { ok: false, reason: 'grep-attempt-kind' };
     if (required.greps && grepAttempt.aggregate === 'NOT_APPLICABLE') {
       return { ok: false, reason: 'greps:not-applicable' };
@@ -876,42 +720,19 @@ export function checkBoundAttempts(
   return { ok: true };
 }
 
-function samePathSet(a: TreeIdentity, b: TreeIdentity): boolean {
-  if (a.paths.length !== b.paths.length) return false;
-  for (let i = 0; i < a.paths.length; i += 1) {
-    if (a.paths[i]?.path !== b.paths[i]?.path || a.paths[i]?.sha256 !== b.paths[i]?.sha256)
-      return false;
-  }
-  return true;
-}
-
-function fileHash(cwd: string, path: string): string {
-  try {
-    return createHash('sha256')
-      .update(readFileSync(join(cwd, path)))
-      .digest('hex');
-  } catch {
-    return 'missing';
-  }
-}
-
-function attemptCompletionVerdict(
-  recorded: EvidenceAttempt
-): { ok: true } | { ok: false; reason: string } {
-  const selected = recorded.members.filter(member => member.scope === 'selected');
-  if (recorded.aggregate === 'NOT_APPLICABLE' && selected.length === 0) return { ok: true };
-  for (const member of selected) {
-    if (member.status !== 'PASSED') {
-      return { ok: false, reason: `member-not-passed:${member.rawCommand}` };
-    }
-  }
-  // Legacy FP-4: passing assertions plus unparsed prose, with nothing dropped
-  // or mismatched, stay admissible without labeling the aggregate PASSED.
+export function admitPartialGrep(recorded: {
+  kind: string;
+  aggregate: string;
+  grepExecuted?: number;
+  grepDropped?: number;
+  grepUnparsed?: number;
+  grepMismatch?: number;
+}): boolean {
   const executed = recorded.grepExecuted;
   const dropped = recorded.grepDropped;
   const unparsed = recorded.grepUnparsed;
   const mismatch = recorded.grepMismatch;
-  if (
+  return (
     recorded.kind === 'greps' &&
     recorded.aggregate === 'INCOMPLETE' &&
     executed !== undefined &&
@@ -922,8 +743,21 @@ function attemptCompletionVerdict(
     dropped === 0 &&
     mismatch === 0 &&
     unparsed > 0
-  ) {
-    return { ok: true };
+  );
+}
+
+function attemptCompletionVerdict(
+  recorded: EvidenceAttempt
+): { ok: true } | { ok: false; reason: string } {
+  const selected = recorded.members.filter(member => member.scope === 'selected');
+  if (recorded.aggregate === 'NOT_APPLICABLE' && selected.length === 0) return { ok: true };
+  // Legacy FP-4: passing assertions plus unparsed prose, with nothing dropped
+  // or mismatched, stay admissible without labeling the aggregate PASSED.
+  if (admitPartialGrep(recorded)) return { ok: true };
+  for (const member of selected) {
+    if (member.status !== 'PASSED') {
+      return { ok: false, reason: `member-not-passed:${member.rawCommand}` };
+    }
   }
   if (recorded.aggregate !== 'PASSED') {
     return { ok: false, reason: `aggregate-${recorded.aggregate}` };
@@ -971,59 +805,30 @@ export function checkAttemptRecord(
       return { ok: false, reason: 'authority-worktree' };
     }
   }
-  for (const member of parsed.data.members) {
-    if (member.logPath) registerGeneratedPath(cwd, member.logPath);
-  }
-  const live = testedTreeIdentity(cwd);
-  if (live.method === 'hash-failed' || recorded.tree.method === 'hash-failed') {
+  const live = testedTreeIdentity(cwd, recorded.tree.excluded);
+  if (
+    live.method === 'hash-failed' ||
+    recorded.tree.method === 'hash-failed' ||
+    live.tree.length === 0 ||
+    recorded.tree.tree.length === 0
+  ) {
     return { ok: false, reason: 'hash-failed' };
   }
-  if (live.method === 'not-a-git-worktree' || recorded.tree.method === 'not-a-git-worktree') {
-    return recorded.tree.contentDigest === live.contentDigest &&
-      recorded.tree.headSha === live.headSha
-      ? attemptCompletionVerdict(recorded)
-      : { ok: false, reason: 'tree' };
+  if (live.tree !== recorded.tree.tree) return { ok: false, reason: 'dirty-bytes' };
+  if (live.headSha === recorded.tree.headSha) return attemptCompletionVerdict(recorded);
+  if (!/^[0-9a-f]{40}$/.test(recorded.tree.headSha) || !/^[0-9a-f]{40}$/.test(live.headSha)) {
+    return { ok: false, reason: 'ancestry' };
   }
-  if (live.headSha === recorded.tree.headSha) {
-    return samePathSet(live, recorded.tree)
-      ? attemptCompletionVerdict(recorded)
-      : { ok: false, reason: 'dirty-bytes' };
-  }
-  const ancestor = gitCapture(cwd, [
+  const ancestor = gitIdentity(cwd, [
     'merge-base',
     '--is-ancestor',
     recorded.tree.headSha,
     live.headSha,
   ]);
   if (!ancestor.ok) return { ok: false, reason: 'ancestry' };
-  const diff = gitCapture(cwd, [
-    'diff',
-    '-z',
-    '--no-ext-diff',
-    '--no-textconv',
-    '--name-only',
-    recorded.tree.headSha,
-    live.headSha,
-  ]);
-  if (!diff.ok) return { ok: false, reason: 'diff' };
-  const changed = new Set<string>();
-  for (const path of diff.stdout.split('\0')) {
-    if (path.length === 0) continue;
-    changed.add(path);
-  }
-  const recordedPaths = new Set(recorded.tree.paths.map(item => item.path));
-  for (const path of changed) {
-    if (excludedIdentityPath(path)) continue;
-    if (!recordedPaths.has(path)) return { ok: false, reason: 'clean-file-changed' };
-    const previous = recorded.tree.paths.find(item => item.path === path);
-    if (fileHash(cwd, path) !== previous?.sha256) return { ok: false, reason: 'committed-bytes' };
-  }
-  for (const item of recorded.tree.paths) {
-    if (fileHash(cwd, item.path) !== item.sha256) return { ok: false, reason: 'worktree-bytes' };
-  }
-  for (const item of live.paths) {
-    const previous = recorded.tree.paths.find(row => row.path === item.path);
-    if (previous?.sha256 !== item.sha256) return { ok: false, reason: 'new-dirty' };
+  const headTree = gitIdentity(cwd, ['rev-parse', `${live.headSha}^{tree}`]);
+  if (!headTree.ok || headTree.stdout !== recorded.tree.tree) {
+    return { ok: false, reason: 'dirty-bytes' };
   }
   return attemptCompletionVerdict(recorded);
 }
@@ -1788,36 +1593,36 @@ export function runTestCommands(
   otherStage: readonly string[] = []
 ): TestRunSummary {
   registerGeneratedPath(cwd, logPath);
-  if (!trustedSelfMatches(cwd) && !trustedSelfMatches(process.cwd())) {
-    mkdirSync(dirname(logPath), { recursive: true });
-    const members = commands.map(command => {
-      const member = blankMember(command, cwd, logPath);
-      member.status = 'NEVER_RAN';
-      member.reason = 'missing-trusted-runner';
-      return member;
-    });
-    appendOtherStageMembers(members, stagedOtherStageCommands(cwd, otherStage), cwd, logPath);
-    const attempt = shellAttempt(cwd, 'tests', process.env.SER_SOURCE ?? 'tests', members);
-    attempt.aggregate = 'INCOMPLETE';
-    try {
-      persistAttempt(cwd, attempt);
-    } catch {
-      // evidence dir may be unwritable in a hostile cwd; the status is still NEVER_RAN
+  const members: AttemptMember[] = [];
+  const chainOf = new Map<AttemptMember, number>();
+  const chainCd = new Map<number, string | null>();
+  const logLabel = new Map<AttemptMember, string>();
+  let chainSeq = 0;
+  for (const command of commands) {
+    const trimmed = command.trim();
+    if (trimmed.length === 0) continue;
+    const chain = chainSeq;
+    chainSeq += 1;
+    const normalized = normalizeTestCommand(trimmed);
+    if (!normalized.ok) {
+      const member = blankMember(trimmed, cwd, logPath);
+      members.push(member);
+      chainOf.set(member, chain);
+      chainCd.set(chain, null);
+      continue;
     }
-    appendFileSync(logPath, 'rst_run_commands: NEVER_RAN missing trusted runner\n');
-    return {
-      line: '127  ',
-      exitCode: 127,
-      passed: null,
-      total: null,
-      failStep: null,
-      failDir: null,
-      attempt,
-    };
+    chainCd.set(chain, normalized.cd);
+    let firstSegment = true;
+    for (const segment of normalized.segments) {
+      const member = blankMember(segment.join(' '), cwd, logPath);
+      member.argv = [...segment];
+      member.declaredExecutable = segment[0] ?? '';
+      members.push(member);
+      chainOf.set(member, chain);
+      logLabel.set(member, firstSegment ? trimmed : segment.join(' '));
+      firstSegment = false;
+    }
   }
-  const members = commands
-    .filter(command => command.trim().length > 0)
-    .map(command => blankMember(command.trim(), cwd, logPath));
   appendOtherStageMembers(members, stagedOtherStageCommands(cwd, otherStage), cwd, logPath);
   const attempt = shellAttempt(cwd, 'tests', process.env.SER_SOURCE ?? 'tests', members);
   persistAttempt(cwd, attempt);
@@ -1829,11 +1634,23 @@ export function runTestCommands(
   let anyStarted = false;
   let cdFailed: string | null = null;
   let testFailed = false;
+  let activeChain = -1;
+  let chainStopped = false;
   mkdirSync(dirname(logPath), { recursive: true });
   for (const member of members) {
     if (member.scope !== 'selected') continue;
+    const chain = chainOf.get(member) ?? -1;
+    if (chain !== activeChain) {
+      activeChain = chain;
+      chainStopped = false;
+    } else if (chainStopped) {
+      member.status = 'INCOMPLETE';
+      member.reason = 'chain-stopped';
+      member.endedAt = new Date().toISOString();
+      continue;
+    }
     const output: string[] = [];
-    appendFileSync(logPath, `### run-stop-tests: ${member.rawCommand}\n`);
+    appendFileSync(logPath, `### run-stop-tests: ${logLabel.get(member) ?? member.rawCommand}\n`);
     member.startedAt = new Date().toISOString();
     const normalized = normalizeTestCommand(member.rawCommand);
     if (!normalized.ok) {
@@ -1847,25 +1664,28 @@ export function runTestCommands(
       appendFileSync(logPath, '### exit 1\n');
       attempt.aggregate = aggregateOf(members);
       persistAttempt(cwd, attempt);
+      chainStopped = true;
       continue;
     }
-    member.argv = normalized.segments[0] ?? [];
-    member.declaredExecutable = member.argv[0] ?? '';
+    member.argv = normalized.segments[0] ?? member.argv;
+    if (member.declaredExecutable.length === 0) member.declaredExecutable = member.argv[0] ?? '';
     let workCwd = cwd;
-    if (normalized.cd) {
-      const target = resolve(cwd, normalized.cd);
+    const cdDir = chainCd.get(chain) ?? normalized.cd;
+    if (cdDir) {
+      const target = resolve(cwd, cdDir);
       if (!existsSync(target)) {
-        output.push(`rst_run_commands: cd ${normalized.cd} failed\n`);
+        output.push(`rst_run_commands: cd ${cdDir} failed\n`);
         member.status = 'NEVER_RAN';
         member.reason = 'cd_failed';
         member.exitCode = 1;
         member.endedAt = new Date().toISOString();
-        cdFailed = normalized.cd;
+        cdFailed = cdDir;
         if (exitCode === 0) exitCode = 1;
         appendFileSync(logPath, output.join(''));
         appendFileSync(logPath, '### exit 1\n');
         attempt.aggregate = aggregateOf(members);
         persistAttempt(cwd, attempt);
+        chainStopped = true;
         continue;
       }
       workCwd = target;
@@ -2009,6 +1829,7 @@ export function runTestCommands(
     appendFileSync(logPath, `### exit ${rc}\n`);
     attempt.aggregate = aggregateOf(members);
     persistAttempt(cwd, attempt);
+    if (member.status !== 'PASSED') chainStopped = true;
   }
   let failStep: string | null = null;
   let failDir: string | null = null;
@@ -2311,37 +2132,6 @@ export function selectStagesBlock(
   };
 }
 
-const YAML_TO_JSON = `
-import json, os, sys
-
-# Drop empty sys.path entries (python -c searches cwd) and the parser cwd
-# before import. A product-worktree yaml.py must not satisfy "import yaml".
-# python3 -I already omits the user site. Never put it back: user-site
-# packages are user-writable, so importing yaml from there executes
-# untrusted code. Fail closed when the trusted interpreter has no PyYAML.
-_cwd = os.path.abspath(os.getcwd())
-_kept = []
-for _entry in sys.path:
-    if _entry in ("", None):
-        continue
-    if os.path.abspath(_entry) == _cwd:
-        continue
-    _kept.append(_entry)
-sys.path[:] = _kept
-try:
-    import yaml
-except ImportError:
-    sys.stderr.write("FAIL: python yaml module unavailable; cannot parse stages.\\n")
-    sys.exit(1)
-text = open(sys.argv[1], encoding="utf-8").read()
-try:
-    data = yaml.safe_load(text)
-except yaml.YAMLError as exc:
-    sys.stderr.write("FAIL: stages YAML parse error: %s\\n" % exc)
-    sys.exit(1)
-json.dump(data, sys.stdout)
-`;
-
 export interface StageContract {
   readonly id: string;
   readonly repo: string;
@@ -2414,44 +2204,19 @@ function validateStages(
   return { ok: true, stages: out };
 }
 
-function parserChildEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const out: NodeJS.ProcessEnv = {};
-  if (source.PATH !== undefined) out.PATH = source.PATH;
-  if (source.LANG !== undefined) out.LANG = source.LANG;
-  for (const [key, value] of Object.entries(source)) {
-    if (value !== undefined && key.startsWith('LC_')) out[key] = value;
-  }
-  return out;
-}
-
 export function parseStagesYaml(
   yamlText: string
 ): { ok: true; stages: StageContract[] } | { ok: false; message: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'ser-stages-'));
+  let data: unknown;
   try {
-    const file = join(dir, 'stages.yaml');
-    writeFileSync(file, yamlText);
-    const result = spawnSync('python3', ['-I', '-c', YAML_TO_JSON, file], {
-      cwd: dir,
-      shell: false,
-      encoding: 'utf8',
-      timeout: 30_000,
-      env: parserChildEnv(process.env),
-    });
-    if (result.status !== 0) {
-      return { ok: false, message: result.stderr || 'FAIL: stages YAML parse error\n' };
-    }
-    try {
-      return validateStages(JSON.parse(result.stdout || 'null'));
-    } catch (error) {
-      return {
-        ok: false,
-        message: `FAIL: stages YAML parse error: ${(error as Error).message}\n`,
-      };
-    }
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+    data = parseYaml(yamlText);
+  } catch (error) {
+    return {
+      ok: false,
+      message: `FAIL: stages YAML parse error: ${(error as Error).message}\n`,
+    };
   }
+  return validateStages(data);
 }
 
 function repoSlug(value: string): string {
@@ -2590,10 +2355,12 @@ function explicitAttemptId(args: readonly string[], flag: string, envName: strin
   return null;
 }
 
-function requireTrustedCli(): boolean {
-  if (trustedSelfMatches(process.cwd())) return true;
-  process.stderr.write('NEVER_RAN missing trusted structured-evidence-runner\n');
-  return false;
+export function requiredEvidenceKinds(spec: string): ('tests' | 'greps')[] {
+  const kinds: ('tests' | 'greps')[] = [];
+  if (extractTestCommands(spec).length > 0) kinds.push('tests');
+  const declared = extractGrepAssertions(spec).find(row => row.startsWith('DECLARED\t'));
+  if (Number(declared?.split('\t')[1] ?? '0') > 0) kinds.push('greps');
+  return kinds;
 }
 
 function runCli(): number {
@@ -2601,40 +2368,30 @@ function runCli(): number {
   const command = args[0] ?? '';
   try {
     if (command === 'allow-assertion') {
-      if (!requireTrustedCli()) return 1;
       const allowed = allowAssertion(oneCommand(args.slice(1)));
       return allowed.ok ? 0 : 1;
     }
     if (command === 'allow-test') {
-      if (!requireTrustedCli()) return 1;
       return allowTestCommand(oneCommand(args.slice(1))) ? 0 : 1;
     }
     if (command === 'exec-assertion') {
-      if (!requireTrustedCli()) return 127;
       const result = execAssertion(oneCommand(args.slice(1)), process.cwd());
       process.stdout.write(result.stdout);
       return result.upstreamError ? result.code || 2 : result.code;
     }
     if (command === 'observe-assertion') {
-      if (!requireTrustedCli()) {
-        process.stdout.write('ERR');
-        return 0;
-      }
       process.stdout.write(observeAssertion(oneCommand(args.slice(1)), process.cwd()));
       return 0;
     }
     if (command === 'tokens-safe') {
-      if (!requireTrustedCli()) return 1;
       const idx = args.indexOf('--');
       const tokens = idx >= 0 ? args.slice(idx + 1) : args.slice(1);
       return tokens.every(token => bareTokenOk(token)) ? 0 : 1;
     }
     if (command === 'argv-readonly') {
-      if (!requireTrustedCli()) return 1;
       return allowAssertion(oneCommand(args.slice(1))).ok ? 0 : 1;
     }
     if (command === 'extract-tests') {
-      if (!requireTrustedCli()) return 127;
       const spec = readStdin();
       const scope = scopeEvidence(spec, {
         stageId: process.env.SER_STAGE_ID ?? process.env.STAGE_ID ?? null,
@@ -2653,7 +2410,6 @@ function runCli(): number {
       return 0;
     }
     if (command === 'extract-greps') {
-      if (!requireTrustedCli()) return 127;
       const rows = extractGrepAssertions(readStdin());
       for (const row of rows) process.stdout.write(`${row}\n`);
       return 0;
@@ -2663,11 +2419,6 @@ function runCli(): number {
       const logPath = flagValue(args, '--log');
       if (!commandsPath || !logPath)
         throw new Error('usage: run-tests --commands <file> --log <file>');
-      if (!requireTrustedCli()) {
-        appendFileSync(logPath, 'rst_run_commands: NEVER_RAN missing trusted runner\n');
-        process.stdout.write('127  ');
-        return 0;
-      }
       const commands = readFileSync(commandsPath, 'utf8').split('\n');
       const summary = runTestCommands(commands, process.cwd(), resolve(logPath));
       process.stderr.write(`SER_TEST_ATTEMPT_ID=${summary.attempt.attemptId}\n`);
@@ -2675,7 +2426,6 @@ function runCli(): number {
       return 0;
     }
     if (command === 'run-greps') {
-      if (!requireTrustedCli()) return 127;
       const priorTests = readKindAttempt(process.cwd(), 'tests');
       for (const member of priorTests?.members ?? []) {
         if (member.logPath) registerGeneratedPath(process.cwd(), member.logPath);
@@ -2803,6 +2553,7 @@ function runCli(): number {
       attempt.grepMismatch = mismatch;
       persistAttempt(process.cwd(), attempt);
       process.stderr.write(`SER_GREP_ATTEMPT_ID=${attempt.attemptId}\n`);
+      process.stderr.write(`SER_GREP_FP4=${admitPartialGrep(attempt) ? 'admitted' : 'refused'}\n`);
       process.stdout.write(
         `GREP_DECLARED=${declared}\nGREP_EXECUTED=${executed}\nGREP_DROPPED=${dropped}\nGREP_UNPARSED=${unparsed}\nGREP_MISMATCH=${mismatch}\nGREP_STATUS=${status}\nGREP_LINE=${out}\n`
       );
@@ -2816,7 +2567,6 @@ function runCli(): number {
       return 0;
     }
     if (command === 'parse-stages') {
-      if (!requireTrustedCli()) return 1;
       const specPath = args[1];
       const yamlOut = args[2];
       const jsonOut = args[3];
@@ -2854,7 +2604,6 @@ function runCli(): number {
       return 0;
     }
     if (command === 'scope-evidence') {
-      if (!requireTrustedCli()) return 127;
       const specPath = flagValue(args, '--spec');
       if (!specPath) throw new Error('usage: scope-evidence --spec <file>');
       const spec = readFileSync(specPath, 'utf8');
@@ -2893,13 +2642,34 @@ function runCli(): number {
       if (scope.scope.unresolved) process.stdout.write('UNRESOLVED_GLOBAL=1\n');
       return 0;
     }
+    if (command === 'required-kinds') {
+      const kinds = requiredEvidenceKinds(readStdin());
+      process.stdout.write(kinds.join(','));
+      if (kinds.length > 0) process.stdout.write('\n');
+      return 0;
+    }
     if (command === 'check-attempt') {
-      if (!requireTrustedCli()) return 1;
       const cwd = process.cwd();
       const explicitTests = explicitAttemptId(args, '--tests', 'SER_TEST_ATTEMPT_ID');
       const explicitGreps = explicitAttemptId(args, '--greps', 'SER_GREP_ATTEMPT_ID');
-      const requireRaw = flagValue(args, '--require') ?? process.env.SER_REQUIRE_KINDS ?? 'tests';
-      const requireKinds = requireRaw.split(',').map(kind => kind.trim());
+      const requireIdx = args.indexOf('--require');
+      let requireRaw: string;
+      if (requireIdx >= 0) {
+        const value = args[requireIdx + 1];
+        requireRaw = value && !value.startsWith('--') ? value : '';
+      } else if (process.env.SER_REQUIRE_KINDS !== undefined) {
+        requireRaw = process.env.SER_REQUIRE_KINDS;
+      } else {
+        requireRaw = 'tests';
+      }
+      if (requireRaw.trim().length === 0) {
+        process.stderr.write('REFUSED empty-required-kinds\n');
+        return 1;
+      }
+      const requireKinds = requireRaw
+        .split(',')
+        .map(kind => kind.trim())
+        .filter(kind => kind.length > 0);
       if (requireKinds.some(kind => kind !== 'tests' && kind !== 'greps')) {
         process.stderr.write(`REFUSED unknown-required-kind:${requireRaw}\n`);
         return 1;
@@ -2935,7 +2705,7 @@ function runCli(): number {
       return 0;
     }
     process.stderr.write(
-      'usage: structured-evidence-runner.ts <parse-stages|extract-tests|extract-greps|run-tests|run-greps|allow-assertion|exec-assertion|check-attempt>\n'
+      'usage: structured-evidence-runner.ts <parse-stages|extract-tests|extract-greps|run-tests|run-greps|allow-assertion|exec-assertion|check-attempt|required-kinds>\n'
     );
     return 2;
   } catch (error) {

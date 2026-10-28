@@ -47,7 +47,6 @@ assert_not_contains() {
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 export NODE_ENV=test
-export SER_TEST_TRUSTED_ROOT="$(cd "$HERE/../../../.." && pwd)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-astra.yaml
@@ -78,6 +77,22 @@ if [ -z "$SME_CORE" ]; then
   echo "FATAL: could not extract sme core from $CANONICAL_YAML"; exit 1
 fi
 eval "$SME_CORE"
+
+bind_worktree_runner() {
+  WORKTREE_RUNNER="$(cd "$HERE/../../../.." && pwd)/packages/workflows/src/reliability/structured-evidence-runner.ts"
+  WORKTREE_BUN="$(command -v bun)"
+  ser_root() {
+    if [ -f "$WORKTREE_RUNNER" ] && [ ! -L "$WORKTREE_RUNNER" ]; then
+      printf '%s\n' "$WORKTREE_RUNNER"
+      return 0
+    fi
+    return 1
+  }
+  ser_runner() {
+    "$WORKTREE_BUN" "$WORKTREE_RUNNER" "$@"
+  }
+}
+bind_worktree_runner
 for fn in sme_field sme_process; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
@@ -222,7 +237,7 @@ OUT="$(
   export ARTIFACTS_DIR="$FP4_ART" SER_RUN_ID=run-fp4 SER_REPO=thinmansoftware/bdc-harness
   ser_runner run-tests --commands ./cmds --log "$FP4_ART/stop-tests.log" >/dev/null
   printf 'grep -c base README\teq\t1\nUNPARSED\t1\tprose\nDECLARED\t2\n' | ser_runner run-greps >/dev/null
-  export SER_REQUIRE_ATTEMPT=1
+  export SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests,greps
   printf '%s\n' "$ENGINE_MANIFEST" | sme_process "1/1 (bash ./ok.sh)" passed 'grep -c base README => 1; UNVERIFIED (unparsed): prose' incomplete 0
 )"
 assert_eq "FP-4 test attempt recorded" "yes" "$(
@@ -265,7 +280,7 @@ sme_at() {
   local repo="$1" art="$2" run_id="$3" repo_name="$4" tests_status="$5" errf="$6"
   (
     cd "$repo" || exit 1
-    export ARTIFACTS_DIR="$art" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID="$run_id"
+    export ARTIFACTS_DIR="$art" SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests,greps SER_RUN_ID="$run_id"
     if [ -n "$repo_name" ]; then export SER_REPO="$repo_name"; else unset SER_REPO; fi
     printf '%s\n' "$ENGINE_MANIFEST" | sme_process "1/1 (bash ./ok.sh)" passed "grep -c base README => 1" "$tests_status" 0 2>"$errf"
   )
@@ -290,7 +305,8 @@ OUT="$(sme_at "$BIND" "$BIND_ART" run-a thinmansoftware/other passed "$ERRF")"
 assert_contains "conflicting SER_REPO stamps FAIL" "VALIDATION: FAIL" "$OUT"
 assert_not_contains "conflicting SER_REPO is not PASS" "VALIDATION: PASS" "$OUT"
 assert_contains "conflicting SER_REPO names authority" "authority-repo" "$(cat "$ERRF")"
-git -C "$BIND" commit --allow-empty -qm "identical tested bytes"
+git -C "$BIND" add -- ok.sh cmds
+git -C "$BIND" commit -qm "identical tested bytes"
 OUT="$(sme_at "$BIND" "$BIND_ART" run-a thinmansoftware/bdc-harness passed "$ERRF")"
 assert_contains "identical-tree descendant stamps PASS" "VALIDATION: PASS" "$OUT"
 OUT="$(sme_at "$BIND" "$BIND_ART" run-b thinmansoftware/bdc-harness passed "$ERRF")"
@@ -301,7 +317,7 @@ TEST_ID="$(tr -d '[:space:]' < "$BIND_ART/evidence/attempts/current-tests")"
 GREP_ID="$(tr -d '[:space:]' < "$BIND_ART/evidence/attempts/current-greps")"
 OUT="$(
   cd "$BIND" || exit 1
-  export ARTIFACTS_DIR="$BIND_ART" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness
+  export ARTIFACTS_DIR="$BIND_ART" SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests,greps SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness
   export SER_TEST_ATTEMPT_ID="$GREP_ID" SER_GREP_ATTEMPT_ID="$TEST_ID"
   printf '%s\n' "$ENGINE_MANIFEST" | sme_process "1/1 (bash ./ok.sh)" passed "grep -c base README => 1" passed 0 2>"$ERRF"
 )"
@@ -359,7 +375,7 @@ printf 'bash ./ok.sh\nbash ./nocount.sh\n' > "$MIX/cmds"
 ( cd "$MIX" && ARTIFACTS_DIR="$MIX_ART" ser_runner run-tests --commands ./cmds --log "$MIX_ART/nc.log" >/dev/null )
 OUT="$(
   cd "$MIX" || exit 1
-  export ARTIFACTS_DIR="$MIX_ART" SER_REQUIRE_ATTEMPT=1
+  export ARTIFACTS_DIR="$MIX_ART" SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests
   printf '%s\n' "$ENGINE_MANIFEST" | sme_process "1/1 (bash ./ok.sh; bash ./nocount.sh)" counts_unparsed "N/A (spec declares no grep stop conditions)" none_declared 0
 )"
 assert_contains "pass plus no-count stamps FAIL" "VALIDATION: FAIL" "$OUT"
@@ -368,13 +384,14 @@ printf 'bash ./ok.sh\nbash ./zero.sh\n' > "$MIX/cmds"
 ( cd "$MIX" && ARTIFACTS_DIR="$MIX_ART" ser_runner run-tests --commands ./cmds --log "$MIX_ART/zero.log" >/dev/null )
 OUT="$(
   cd "$MIX" || exit 1
-  export ARTIFACTS_DIR="$MIX_ART" SER_REQUIRE_ATTEMPT=1
+  export ARTIFACTS_DIR="$MIX_ART" SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests
   printf '%s\n' "$ENGINE_MANIFEST" | sme_process "1/1 (bash ./ok.sh; bash ./zero.sh)" passed "N/A (spec declares no grep stop conditions)" none_declared 0
 )"
 assert_contains "pass plus 0/0 stamps FAIL" "VALIDATION: FAIL" "$OUT"
 assert_not_contains "pass plus 0/0 is not PASS" "VALIDATION: PASS" "$OUT"
 echo "--- round-9 byte identity and explicit Expected through stamp ---"
 eval "$(extract_core "$CANONICAL_YAML" rst)"
+bind_worktree_runner
 NA="$(mktemp -d)"
 NA_ART="$(mktemp -d)"
 git -C "$NA" init -q
@@ -423,7 +440,7 @@ printf 'MALFORMED:expected-without-command\nbash ./ok.sh\n' > "$BAD/cmds"
 ( cd "$BAD" && ARTIFACTS_DIR="$BAD_ART" SER_RUN_ID=run-bad ser_runner run-tests --commands ./cmds --log "$BAD_ART/stop-tests.log" >/dev/null )
 OUT="$(
   cd "$BAD" || exit 1
-  export ARTIFACTS_DIR="$BAD_ART" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID=run-bad
+  export ARTIFACTS_DIR="$BAD_ART" SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests SER_RUN_ID=run-bad
   unset SER_REPO
   printf '%s\n' "$ENGINE_MANIFEST" | sme_process "1/1 (bash ./ok.sh)" passed "N/A (spec declares no grep stop conditions)" none_declared 0
 )"
@@ -463,7 +480,7 @@ assert_eq "stamp absence selects project-map" "project-map" "$MAP_SRC"
 )
 OUT="$(
   cd "$MAP" || exit 1
-  export ARTIFACTS_DIR="$MAP_ART" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID=run-map
+  export ARTIFACTS_DIR="$MAP_ART" SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests SER_RUN_ID=run-map
   unset SER_REPO
   printf '%s\n' "$ENGINE_MANIFEST" | sme_process "1/1 (bash ./map-pass.sh)" passed "N/A (spec declares no grep stop conditions)" none_declared 0
 )"
@@ -471,7 +488,7 @@ assert_contains "true-absence project-map stamps PASS" "VALIDATION: PASS" "$OUT"
 assert_not_contains "true-absence project-map is not FAIL" "VALIDATION: FAIL" "$OUT"
 rm -rf "$NA" "$NA_ART" "$BAD" "$BAD_ART" "$MAP" "$MAP_ART"
 
-unset SER_REQUIRE_ATTEMPT ARTIFACTS_DIR SER_RUN_ID SER_REPO SER_TEST_ATTEMPT_ID SER_GREP_ATTEMPT_ID
+unset SER_REQUIRE_ATTEMPT SER_REQUIRE_KINDS ARTIFACTS_DIR SER_RUN_ID SER_REPO SER_TEST_ATTEMPT_ID SER_GREP_ATTEMPT_ID
 rm -rf "$BIND" "$BIND_ART" "$MIX" "$MIX_ART" "$ERRF"
 
 echo

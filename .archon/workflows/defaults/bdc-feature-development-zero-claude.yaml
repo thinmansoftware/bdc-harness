@@ -1692,47 +1692,7 @@ nodes:
       #   Callers filter with rst_command_looks_runnable (drops prose, placeholders,
       #   install steps).
       rst_extract_commands() {
-        awk -v RUNNER='(^|[ /&|;(])(node|bun|bunx|npm|npm[.]cmd|npx|pnpm|yarn|vitest|jest|mocha|pytest|python3?|go|cargo|bash|sh|make|deno|dotnet|mvn|gradle|tap)( |$)' '
-          function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
-          function emit(c) { c = clean(c); if (c != "" && !(c in seen)) { seen[c] = 1; print c } }
-          tstate == 2 {
-            line = clean($0)
-            if (line == "") next
-            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { tstate = 0 }
-            else if (line ~ RUNNER) { tcmd = line; sub(/[ \t]*\\$/, "", tcmd); tstate = 1; next }
-            else if (line ~ /^[Ee]xpected:/) { print "MALFORMED:expected-without-command"; next }
-            else { tstate = 0 }
-          }
-          tstate == 1 {
-            if ($0 ~ /^[ \t]*```/) next
-            line = clean($0)
-            if (line == "") next
-            if (line ~ /^[Ee]xpected:/) { if (tcmd != "") emit(tcmd); else emit("MALFORMED:expected-without-command"); tcmd = ""; tstate = 2; next }
-            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { if (tcmd != "") emit(tcmd); tcmd = ""; tstate = 0 }
-            else { tcmd = (tcmd == "" ? line : tcmd " " line); sub(/[ \t]*\\$/, "", tcmd); next }
-          }
-          tstate == 0 && /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(/ {
-            low = tolower($0)
-            if (low ~ /(^|[^a-z])(grep|assert|ascii)([^a-z]|$)/) next
-            if (low ~ /(^|[^a-z])(tests|test|suites|suite|unit)([^a-z]|$)/) { tstate = 1; tcmd = ""; next }
-          }
-          /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition|[Ss]top [Pp]oint|[Tt]est [Ss]cenario|[Tt]est [Pp]lan|[Vv]erification/) ? 1 : 0 }
-          insec || $0 ~ /^[ \t]*-?[ \t]*[*]*[Ww]hen[*]*:/ {
-            s = $0
-            while (match(s, /`[^`]+`/)) {
-              g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
-              if (g ~ RUNNER) emit(g)
-            }
-          }
-          /^[ \t]*Tests:[ \t]/ {
-            s = $0
-            while (match(s, /\([^)]*\)/)) {
-              g = substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH)
-              if (g ~ RUNNER) emit(g)
-            }
-          }
-          END { if (tstate == 1 && tcmd != "") emit(tcmd) }
-        ' | head -n 8
+        ser_runner extract-tests
       }
       # rst_rescue_subdir <cmd>   (-> cmd, or "cd <dir> && <cmd>" when the command's first
       #   relative path does not exist at the worktree root but exists in exactly one
@@ -1854,27 +1814,17 @@ nodes:
       # Tokenization, node --test admission, and subprocess spawn live in
       # packages/workflows/src/reliability/structured-evidence-runner.ts.
       ser_root() {
-        local c root pkg
-        if [ "${NODE_ENV:-}" = test ]; then
-          root="${SER_TEST_TRUSTED_ROOT:-}"
-          if [ -n "$root" ] && [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$root/packages/workflows/package.json" ]; then
-            printf '%s' "$root"
-            return 0
-          fi
+        local runner="/app/packages/workflows/src/reliability/structured-evidence-runner.ts"
+        if [ -f "$runner" ] && [ ! -L "$runner" ]; then
+          printf '%s\n' "$runner"
+          return 0
         fi
-        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source; do
-          pkg="$c/packages/workflows/package.json"
-          if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-            printf '%s' "$c"
-            return 0
-          fi
-        done
         return 1
       }
       SER_BUN_BIN="${SER_BUN_BIN:-$(command -v bun || true)}"
       ser_runner() {
-        local root bun_bin
-        root="$(ser_root)" || return 127
+        local runner bun_bin
+        runner="$(ser_root)" || return 127
         bun_bin="${SER_BUN_BIN:-}"
         if [ -z "$bun_bin" ] || [ ! -x "$bun_bin" ]; then
           bun_bin="$(command -v bun || true)"
@@ -1882,7 +1832,7 @@ nodes:
         if [ -z "$bun_bin" ]; then
           return 127
         fi
-        HARNESS_ROOT_OVERRIDE="$root" "$bun_bin" "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" "$@"
+        "$bun_bin" "$runner" "$@"
       }
       rst_command_looks_runnable() {
         ser_runner allow-test -- "$1" >/dev/null
@@ -2198,60 +2148,7 @@ nodes:
       #   "none" / "empty" mean eq 0. A declared assertion without a parseable
       #   expectation is counted in GREP_DECLARED but not executed.
       rsg_extract() {
-        awk '
-          function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
-          function note_unparsed(name) {
-            if (name == "") name = "unnamed grep stop condition"
-            unparsed_names = (unparsed_names == "" ? name : unparsed_names "; " name)
-          }
-          function expect(ex,   low, op, n) {
-            low = tolower(ex); op = "eq"; n = ""
-            if (low ~ /at least|>=|or more|or greater|minimum|no fewer/) op = "ge"
-            else if (low ~ /at most|<=|or fewer|or less|maximum|no more/) op = "le"
-            if (low ~ /no output|nothing|none|empty|no match/) n = "0"
-            else if (match(ex, /[0-9]+/)) n = substr(ex, RSTART, RLENGTH)
-            if (n == "") return ""
-            return op "\t" n
-          }
-          state == 1 {
-            if ($0 ~ /^[ \t]*```/) next
-            line = clean($0)
-            if (line == "") next
-            if (line ~ /^[Ee]xpected:/) {
-              ex = line; sub(/^[Ee]xpected:[ \t]*/, "", ex); e = expect(ex)
-              if (cmd != "" && e != "") { print cmd "\t" e; parsed++ }
-              else { note_unparsed(cmd != "" ? cmd : label) }
-              state = 0; cmd = ""; next
-            }
-            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { note_unparsed(cmd != "" ? cmd : label); state = 0; cmd = "" }
-            else {
-              cmd = (cmd == "" ? line : cmd " " line)
-              sub(/[ \t]*\\$/, "", cmd)
-              next
-            }
-          }
-          /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/ { state = 1; cmd = ""; label = clean($0); declared++; next }
-          /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition/) ? 1 : 0; bl = 0; next }
-          insec && /^[ \t]*[*_]*[Bb]aseline/ { bl = 1 }
-          insec && bl && (/^[ \t]*$/ || /^[ \t]*([0-9]+[.)]|[-*])[ \t]/) { bl = 0 }
-          insec && !bl && /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)( |`)/ {
-            if (tolower($0) ~ /baseline|untouched tree|before the fix|before this wo/) next
-            s = $0
-            if (match(s, /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)[^`]*`/)) {
-              g = substr(s, RSTART + 1, RLENGTH - 2); rest = substr(s, RSTART + RLENGTH)
-              declared++
-              e = expect(rest)
-              if (e != "") { print g "\t" e; parsed++ }
-              else { note_unparsed(g) }
-            }
-          }
-          END {
-            if (state == 1) note_unparsed(cmd != "" ? cmd : label)
-            if (unparsed_names != "") print "UNPARSED\t" (declared - parsed) "\t" unparsed_names
-            else print "UNPARSED\t" (declared - parsed)
-            print "DECLARED\t" (declared + 0)
-          }
-        '
+        ser_runner extract-greps
       }
       # rsg_strip_arg <token>   (prints inner text when the token is one
       #   single-quoted argv-charset string; otherwise prints the token
@@ -2261,27 +2158,17 @@ nodes:
       # Bare token charset includes the historical ^[A-Za-z0-9@%+=:,./_*?-]+$ set plus ~ and ^.
       # find -exec/-execdir/-ok/-delete and decoded sort/grep flag bypasses are refused.
       ser_root() {
-        local c root pkg
-        if [ "${NODE_ENV:-}" = test ]; then
-          root="${SER_TEST_TRUSTED_ROOT:-}"
-          if [ -n "$root" ] && [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$root/packages/workflows/package.json" ]; then
-            printf '%s' "$root"
-            return 0
-          fi
+        local runner="/app/packages/workflows/src/reliability/structured-evidence-runner.ts"
+        if [ -f "$runner" ] && [ ! -L "$runner" ]; then
+          printf '%s\n' "$runner"
+          return 0
         fi
-        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source; do
-          pkg="$c/packages/workflows/package.json"
-          if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-            printf '%s' "$c"
-            return 0
-          fi
-        done
         return 1
       }
       SER_BUN_BIN="${SER_BUN_BIN:-$(command -v bun || true)}"
       ser_runner() {
-        local root bun_bin
-        root="$(ser_root)" || return 127
+        local runner bun_bin
+        runner="$(ser_root)" || return 127
         bun_bin="${SER_BUN_BIN:-}"
         if [ -z "$bun_bin" ] || [ ! -x "$bun_bin" ]; then
           bun_bin="$(command -v bun || true)"
@@ -2289,7 +2176,7 @@ nodes:
         if [ -z "$bun_bin" ]; then
           return 127
         fi
-        HARNESS_ROOT_OVERRIDE="$root" "$bun_bin" "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" "$@"
+        "$bun_bin" "$runner" "$@"
       }
       rsg_tokens_safe() {
         ser_runner tokens-safe -- "$@" >/dev/null
@@ -4170,27 +4057,17 @@ nodes:
 
       # ---- BEGIN sme core (byte-identical across lanes; extracted by unit test) ----
       ser_root() {
-        local c root pkg
-        if [ "${NODE_ENV:-}" = test ]; then
-          root="${SER_TEST_TRUSTED_ROOT:-}"
-          if [ -n "$root" ] && [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$root/packages/workflows/package.json" ]; then
-            printf '%s' "$root"
-            return 0
-          fi
+        local runner="/app/packages/workflows/src/reliability/structured-evidence-runner.ts"
+        if [ -f "$runner" ] && [ ! -L "$runner" ]; then
+          printf '%s\n' "$runner"
+          return 0
         fi
-        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source; do
-          pkg="$c/packages/workflows/package.json"
-          if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-            printf '%s' "$c"
-            return 0
-          fi
-        done
         return 1
       }
       SER_BUN_BIN="${SER_BUN_BIN:-$(command -v bun || true)}"
       ser_runner() {
-        local root bun_bin
-        root="$(ser_root)" || return 127
+        local runner bun_bin
+        runner="$(ser_root)" || return 127
         bun_bin="${SER_BUN_BIN:-}"
         if [ -z "$bun_bin" ] || [ ! -x "$bun_bin" ]; then
           bun_bin="$(command -v bun || true)"
@@ -4198,7 +4075,7 @@ nodes:
         if [ -z "$bun_bin" ]; then
           return 127
         fi
-        HARNESS_ROOT_OVERRIDE="$root" "$bun_bin" "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" "$@"
+        "$bun_bin" "$runner" "$@"
       }
       # sme_field <KEY> <node-output>   (-> value of the first "KEY=..." line, or empty)
       sme_field() {
@@ -4241,10 +4118,15 @@ nodes:
           case "$tests_status" in
             passed|failed|counts_unparsed)
               local attempt_err
-              attempt_err="$(ser_runner check-attempt --require "$(if [ "$grep_status" = none_declared ]; then echo tests; else echo tests,greps; fi)" 2>&1 >/dev/null)" || {
+              if [ -z "${SER_REQUIRE_KINDS:-}" ]; then
                 verdict="fail"
-                printf '%s\n' "$attempt_err" >&2
-              }
+                printf '%s\n' "REFUSED empty-required-kinds" >&2
+              else
+                attempt_err="$(ser_runner check-attempt --require "$SER_REQUIRE_KINDS" 2>&1 >/dev/null)" || {
+                  verdict="fail"
+                  printf '%s\n' "$attempt_err" >&2
+                }
+              fi
               ;;
           esac
         fi
@@ -4274,6 +4156,11 @@ nodes:
       $build-manifest.output
       BDC_NODE_OUTPUT_MANIFEST
       )
+      SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      SER_REQUIRE_KINDS="$(printf '%s\n' "$SPEC_OUT" | ser_runner required-kinds | tr -d '\r')"
       SER_REQUIRE_ATTEMPT=1
       printf '%s\n' "$MANIFEST_OUT" | sme_process \
         "$(sme_field TESTS_LINE "$TESTS_OUT")" "$(sme_field TESTS_STATUS "$TESTS_OUT")" \
@@ -4300,27 +4187,17 @@ nodes:
 
       # ---- BEGIN mec core (byte-identical across lanes; extracted by unit test) ----
       ser_root() {
-        local c root pkg
-        if [ "${NODE_ENV:-}" = test ]; then
-          root="${SER_TEST_TRUSTED_ROOT:-}"
-          if [ -n "$root" ] && [ -f "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$root/packages/workflows/package.json" ]; then
-            printf '%s' "$root"
-            return 0
-          fi
+        local runner="/app/packages/workflows/src/reliability/structured-evidence-runner.ts"
+        if [ -f "$runner" ] && [ ! -L "$runner" ]; then
+          printf '%s\n' "$runner"
+          return 0
         fi
-        for c in /app /.archon/workspaces/thinmansoftware/bdc-harness/source; do
-          pkg="$c/packages/workflows/package.json"
-          if [ -f "$c/packages/workflows/src/reliability/structured-evidence-runner.ts" ] && [ -f "$pkg" ] && grep -q '"@archon/workflows"' "$pkg"; then
-            printf '%s' "$c"
-            return 0
-          fi
-        done
         return 1
       }
       SER_BUN_BIN="${SER_BUN_BIN:-$(command -v bun || true)}"
       ser_runner() {
-        local root bun_bin
-        root="$(ser_root)" || return 127
+        local runner bun_bin
+        runner="$(ser_root)" || return 127
         bun_bin="${SER_BUN_BIN:-}"
         if [ -z "$bun_bin" ] || [ ! -x "$bun_bin" ]; then
           bun_bin="$(command -v bun || true)"
@@ -4328,7 +4205,7 @@ nodes:
         if [ -z "$bun_bin" ]; then
           return 127
         fi
-        HARNESS_ROOT_OVERRIDE="$root" "$bun_bin" "$root/packages/workflows/src/reliability/structured-evidence-runner.ts" "$@"
+        "$bun_bin" "$runner" "$@"
       }
       # mec_field <KEY> <node-output>   (-> value of the first "KEY=..." line, or empty)
       mec_field() {
@@ -4409,7 +4286,11 @@ nodes:
           case "$tests_status" in
             passed|failed|counts_unparsed)
               local attempt_err
-              if ! attempt_err="$(ser_runner check-attempt --require "$(if [ "$grep_status" = none_declared ]; then echo tests; else echo tests,greps; fi)" 2>&1 >/dev/null)"; then
+              if [ -z "${SER_REQUIRE_KINDS:-}" ]; then
+                printf '%s\n' "REFUSED empty-required-kinds" >&2
+                return 1
+              fi
+              if ! attempt_err="$(ser_runner check-attempt --require "$SER_REQUIRE_KINDS" 2>&1 >/dev/null)"; then
                 printf '%s\n' "${attempt_err:-REFUSED missing or stale attempt}" >&2
                 return 1
               fi
@@ -4438,6 +4319,11 @@ nodes:
       $stamp-manifest-evidence.output
       BDC_NODE_OUTPUT_MANIFEST
       )
+      SPEC_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_READ_SPEC'
+      $read-spec.output
+      BDC_NODE_OUTPUT_READ_SPEC
+      )
+      SER_REQUIRE_KINDS="$(printf '%s\n' "$SPEC_OUT" | ser_runner required-kinds | tr -d '\r')"
       SER_REQUIRE_ATTEMPT=1
       printf '%s\n' "$MANIFEST_OUT" | mec_check "$STATUS" \
         "$(mec_field TESTS_CLASS "$TESTS_OUT")" "$(mec_field TESTS_STATUS "$TESTS_OUT")" \

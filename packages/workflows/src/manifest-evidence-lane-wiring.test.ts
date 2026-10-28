@@ -91,6 +91,19 @@ function node(nodes: readonly LaneNode[], id: string, file: string): LaneNode {
   return found;
 }
 
+function bindWorktreeRunner(bash: string): string {
+  const runner = JSON.stringify(
+    join(REPO_ROOT, 'packages/workflows/src/reliability/structured-evidence-runner.ts')
+  );
+  const bun = JSON.stringify(process.execPath);
+  return bash
+    .replace(
+      /ser_root\(\) \{[\s\S]*?\n\}/g,
+      `ser_root() {\n  printf '%s\\n' ${runner}\n  return 0\n}`
+    )
+    .replace(/ser_runner\(\) \{[\s\S]*?\n\}/g, `ser_runner() {\n  ${bun} ${runner} "$@"\n}`);
+}
+
 function coreOf(bash: string, marker: string): string {
   const begin = bash.indexOf(`# ---- BEGIN ${marker} core`);
   const end = bash.indexOf(`# ---- END ${marker} core`);
@@ -103,12 +116,13 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
     const lanes = EXPECTED_LANES.map(file => readFileSync(join(LANES_DIR, file), 'utf8'));
     expect(lanes.length).toBeGreaterThan(0);
     for (const content of lanes) {
-      expect(content).not.toContain('override_real="$(cd -- "$HARNESS_ROOT_OVERRIDE"');
-      expect(content).toContain('/app /.archon/workspaces/thinmansoftware/bdc-harness/source');
-      expect(content).not.toContain('bdc-harness/worktrees/archon/*)');
-      expect(content).not.toContain(
-        'git -C "$HARNESS_ROOT_OVERRIDE" remote get-url origin 2>/dev/null'
+      expect(content).not.toContain('HARNESS_ROOT_OVERRIDE');
+      expect(content).not.toContain('SER_TEST_TRUSTED_ROOT');
+      expect(content).not.toContain('/.archon/workspaces/thinmansoftware/bdc-harness/source');
+      expect(content).toContain(
+        '/app/packages/workflows/src/reliability/structured-evidence-runner.ts'
       );
+      expect(content).not.toContain('bdc-harness/worktrees/archon/*)');
     }
   });
 
@@ -280,13 +294,15 @@ function runStopTestsNode(opts: {
       'canonical'
     ).bash;
     if (!bash) throw new Error('run-stop-tests has no bash');
-    const rendered = substituteNodeOutputRefs(
-      bash,
-      new Map([
-        ['read-spec', { state: 'completed' as const, output: opts.spec }],
-        ['resolve-test-command', { state: 'completed' as const, output: opts.resolution ?? '' }],
-      ]),
-      true
+    const rendered = bindWorktreeRunner(
+      substituteNodeOutputRefs(
+        bash,
+        new Map([
+          ['read-spec', { state: 'completed' as const, output: opts.spec }],
+          ['resolve-test-command', { state: 'completed' as const, output: opts.resolution ?? '' }],
+        ]),
+        true
+      )
     );
     writeFileSync(join(cwd, 'run-stop-tests.sh'), rendered);
     const proc = Bun.spawnSync(['bash', './run-stop-tests.sh'], {
@@ -295,7 +311,6 @@ function runStopTestsNode(opts: {
         ...process.env,
         ARTIFACTS_DIR: artifacts,
         NODE_ENV: 'test',
-        SER_TEST_TRUSTED_ROOT: REPO_ROOT,
       },
       stdout: 'pipe',
       stderr: 'pipe',
@@ -560,14 +575,16 @@ function runStopGrepsNode(opts: {
       'canonical'
     ).bash;
     if (!bash) throw new Error('run-stop-greps has no bash');
-    const rendered = substituteNodeOutputRefs(
-      bash,
-      new Map([['read-spec', { state: 'completed' as const, output: opts.spec }]]),
-      true
+    const rendered = bindWorktreeRunner(
+      substituteNodeOutputRefs(
+        bash,
+        new Map([['read-spec', { state: 'completed' as const, output: opts.spec }]]),
+        true
+      )
     );
     const proc = Bun.spawnSync(['bash', '-c', rendered], {
       cwd,
-      env: { ...process.env, NODE_ENV: 'test', SER_TEST_TRUSTED_ROOT: REPO_ROOT },
+      env: { ...process.env, NODE_ENV: 'test' },
       stdout: 'pipe',
       stderr: 'pipe',
     });

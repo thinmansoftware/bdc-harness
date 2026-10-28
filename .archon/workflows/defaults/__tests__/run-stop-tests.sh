@@ -54,7 +54,6 @@ assert_not_contains() {
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 export NODE_ENV=test
-export SER_TEST_TRUSTED_ROOT="$(cd "$HERE/../../../.." && pwd)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-astra.yaml
@@ -97,6 +96,22 @@ if [ -z "$RST_CORE" ]; then
   echo "FATAL: could not extract rst core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RST_CORE"
+
+bind_worktree_runner() {
+  WORKTREE_RUNNER="$(cd "$HERE/../../../.." && pwd)/packages/workflows/src/reliability/structured-evidence-runner.ts"
+  WORKTREE_BUN="$(command -v bun)"
+  ser_root() {
+    if [ -f "$WORKTREE_RUNNER" ] && [ ! -L "$WORKTREE_RUNNER" ]; then
+      printf '%s\n' "$WORKTREE_RUNNER"
+      return 0
+    fi
+    return 1
+  }
+  ser_runner() {
+    "$WORKTREE_BUN" "$WORKTREE_RUNNER" "$@"
+  }
+}
+bind_worktree_runner
 for fn in rst_class rst_extract_commands rst_command_looks_runnable rst_rescue_subdir rst_tests_in_diff rst_repo_test_script rst_parse_counts rst_scrub_env rst_run_commands rst_report; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done

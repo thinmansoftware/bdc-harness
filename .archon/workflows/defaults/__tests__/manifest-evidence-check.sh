@@ -45,7 +45,6 @@ assert_not_contains() {
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 export NODE_ENV=test
-export SER_TEST_TRUSTED_ROOT="$(cd "$HERE/../../../.." && pwd)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-astra.yaml
@@ -86,6 +85,22 @@ if [ -z "$MEC_CORE" ]; then
 fi
 eval "$MEC_CORE"
 eval "$SME_CORE"
+
+bind_worktree_runner() {
+  WORKTREE_RUNNER="$(cd "$HERE/../../../.." && pwd)/packages/workflows/src/reliability/structured-evidence-runner.ts"
+  WORKTREE_BUN="$(command -v bun)"
+  ser_root() {
+    if [ -f "$WORKTREE_RUNNER" ] && [ ! -L "$WORKTREE_RUNNER" ]; then
+      printf '%s\n' "$WORKTREE_RUNNER"
+      return 0
+    fi
+    return 1
+  }
+  ser_runner() {
+    "$WORKTREE_BUN" "$WORKTREE_RUNNER" "$@"
+  }
+}
+bind_worktree_runner
 for fn in mec_field mec_check sme_field sme_process; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
@@ -238,7 +253,7 @@ assert_eq "FP-4 grep attempt recorded" "yes" "$(
 PARTIAL_LINE='grep -c base README => 1; UNVERIFIED (unparsed): prose'
 R="$(
   cd "$FP4" || exit 1
-  export ARTIFACTS_DIR="$FP4_ART" SER_RUN_ID=run-fp4 SER_REPO=thinmansoftware/bdc-harness SER_REQUIRE_ATTEMPT=1
+  export ARTIFACTS_DIR="$FP4_ART" SER_RUN_ID=run-fp4 SER_REPO=thinmansoftware/bdc-harness SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests,greps
   err="$(mktemp)"
   out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE passed 2 incomplete 0 1 0 1 0 2>"$err")"
   rc=$?
@@ -248,7 +263,7 @@ R="$(
 assert_eq "FP-4 partial greps admitted" "0|OK|" "$R"
 STAMPED="$(
   cd "$FP4" || exit 1
-  export ARTIFACTS_DIR="$FP4_ART" SER_RUN_ID=run-fp4 SER_REPO=thinmansoftware/bdc-harness SER_REQUIRE_ATTEMPT=1
+  export ARTIFACTS_DIR="$FP4_ART" SER_RUN_ID=run-fp4 SER_REPO=thinmansoftware/bdc-harness SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests,greps
   printf '%s\n' "$GOOD" | sme_process '27/27 (cmd)' passed "$PARTIAL_LINE" incomplete 0
 )"
 assert_contains "FP-4 unparsed names stamped" "unparsed=prose; dropped=0" "$STAMPED"
@@ -345,7 +360,7 @@ mec_at() {
   local repo="$1" art="$2" run_id="$3" repo_name="$4"
   (
     cd "$repo" || exit 1
-    export ARTIFACTS_DIR="$art" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID="$run_id"
+    export ARTIFACTS_DIR="$art" SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests,greps SER_RUN_ID="$run_id"
     if [ -n "$repo_name" ]; then export SER_REPO="$repo_name"; else unset SER_REPO; fi
     err="$(mktemp)"
     out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE passed 0 none_declared 0 0 0 0 0 2>"$err")"
@@ -373,7 +388,8 @@ R="$(mec_at "$BIND" "$BIND_ART" run-a thinmansoftware/other)"
 assert_eq "conflicting SER_REPO rc" "1" "${R%%|*}"
 assert_not_contains "conflicting SER_REPO is not OK" "OK" "$R"
 assert_contains "conflicting SER_REPO names authority" "authority-repo" "$R"
-git -C "$BIND" commit --allow-empty -qm "identical tested bytes"
+git -C "$BIND" add -- ok.sh cmds
+git -C "$BIND" commit -qm "identical tested bytes"
 R="$(mec_at "$BIND" "$BIND_ART" run-a thinmansoftware/bdc-harness)"
 assert_eq "identical-tree descendant stays OK" "0|OK|" "$R"
 R="$(mec_at "$BIND" "$BIND_ART" run-b thinmansoftware/bdc-harness)"
@@ -384,7 +400,7 @@ TEST_ID="$(tr -d '[:space:]' < "$BIND_ART/evidence/attempts/current-tests")"
 GREP_ID="$(tr -d '[:space:]' < "$BIND_ART/evidence/attempts/current-greps")"
 R="$(
   cd "$BIND" || exit 1
-  export ARTIFACTS_DIR="$BIND_ART" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness
+  export ARTIFACTS_DIR="$BIND_ART" SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests,greps SER_RUN_ID=run-a SER_REPO=thinmansoftware/bdc-harness
   export SER_TEST_ATTEMPT_ID="$GREP_ID" SER_GREP_ATTEMPT_ID="$TEST_ID"
   err="$(mktemp)"
   out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE passed 0 none_declared 0 0 0 0 0 2>"$err")"
@@ -446,7 +462,7 @@ printf 'bash ./ok.sh\nbash ./nocount.sh\n' > "$MIX/cmds"
 ( cd "$MIX" && ARTIFACTS_DIR="$MIX_ART" ser_runner run-tests --commands ./cmds --log "$MIX_ART/nc.log" >/dev/null )
 R="$(
   cd "$MIX" || exit 1
-  export ARTIFACTS_DIR="$MIX_ART" SER_REQUIRE_ATTEMPT=1
+  export ARTIFACTS_DIR="$MIX_ART" SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests
   err="$(mktemp)"
   out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE counts_unparsed 0 none_declared 0 0 0 0 0 2>"$err")"
   rc=$?
@@ -459,7 +475,7 @@ printf 'bash ./ok.sh\nbash ./zero.sh\n' > "$MIX/cmds"
 ( cd "$MIX" && ARTIFACTS_DIR="$MIX_ART" ser_runner run-tests --commands ./cmds --log "$MIX_ART/zero.log" >/dev/null )
 R="$(
   cd "$MIX" || exit 1
-  export ARTIFACTS_DIR="$MIX_ART" SER_REQUIRE_ATTEMPT=1
+  export ARTIFACTS_DIR="$MIX_ART" SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests
   err="$(mktemp)"
   out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE passed 0 none_declared 0 0 0 0 0 2>"$err")"
   rc=$?
@@ -470,6 +486,7 @@ assert_eq "pass plus 0/0 rc" "1" "${R%%|*}"
 assert_not_contains "pass plus 0/0 is not OK" "OK" "$R"
 echo "--- round-9 byte identity and explicit Expected through manifest gate ---"
 eval "$(extract_core "$CANONICAL_YAML" rst)"
+bind_worktree_runner
 NA="$(mktemp -d)"
 NA_ART="$(mktemp -d)"
 git -C "$NA" init -q
@@ -518,7 +535,7 @@ printf 'MALFORMED:expected-without-command\nbash ./ok.sh\n' > "$BAD/cmds"
 ( cd "$BAD" && ARTIFACTS_DIR="$BAD_ART" SER_RUN_ID=run-bad ser_runner run-tests --commands ./cmds --log "$BAD_ART/stop-tests.log" >/dev/null )
 R="$(
   cd "$BAD" || exit 1
-  export ARTIFACTS_DIR="$BAD_ART" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID=run-bad
+  export ARTIFACTS_DIR="$BAD_ART" SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests SER_RUN_ID=run-bad
   unset SER_REPO
   err="$(mktemp)"
   out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE passed 0 none_declared 0 0 0 0 0 2>"$err")"
@@ -562,7 +579,7 @@ assert_eq "manifest absence selects project-map" "project-map" "$MAP_SRC"
 )
 R="$(
   cd "$MAP" || exit 1
-  export ARTIFACTS_DIR="$MAP_ART" SER_REQUIRE_ATTEMPT=1 SER_RUN_ID=run-map
+  export ARTIFACTS_DIR="$MAP_ART" SER_REQUIRE_ATTEMPT=1 SER_REQUIRE_KINDS=tests SER_RUN_ID=run-map
   unset SER_REPO
   err="$(mktemp)"
   out="$(printf '%s\n' "$GOOD" | mec_check PROCEED CODE passed 0 none_declared 0 0 0 0 0 2>"$err")"
@@ -573,7 +590,7 @@ R="$(
 assert_eq "true-absence project-map stays OK" "0|OK|" "$R"
 rm -rf "$NA" "$NA_ART" "$BAD" "$BAD_ART" "$MAP" "$MAP_ART"
 
-unset SER_REQUIRE_ATTEMPT ARTIFACTS_DIR SER_RUN_ID SER_REPO SER_TEST_ATTEMPT_ID SER_GREP_ATTEMPT_ID
+unset SER_REQUIRE_ATTEMPT SER_REQUIRE_KINDS ARTIFACTS_DIR SER_RUN_ID SER_REPO SER_TEST_ATTEMPT_ID SER_GREP_ATTEMPT_ID
 rm -rf "$BIND" "$BIND_ART" "$MIX" "$MIX_ART"
 
 echo

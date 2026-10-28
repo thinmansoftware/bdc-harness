@@ -73,7 +73,6 @@ assert_not_contains() {
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DEFAULTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 export NODE_ENV=test
-export SER_TEST_TRUSTED_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 CANONICAL_YAML="$DEFAULTS_DIR/bdc-feature-development.yaml"
 MIRROR_YAML="$DEFAULTS_DIR/bdc-feature-development-codex.yaml"
 
@@ -97,6 +96,22 @@ if [ -z "$VMA_CORE" ]; then
 fi
 # Define vma_process and vma_process_assertions in this shell.
 eval "$VMA_CORE"
+
+bind_worktree_runner() {
+  WORKTREE_RUNNER="$(cd "$SCRIPT_DIR/../../../.." && pwd)/packages/workflows/src/reliability/structured-evidence-runner.ts"
+  WORKTREE_BUN="$(command -v bun)"
+  ser_root() {
+    if [ -f "$WORKTREE_RUNNER" ] && [ ! -L "$WORKTREE_RUNNER" ]; then
+      printf '%s\n' "$WORKTREE_RUNNER"
+      return 0
+    fi
+    return 1
+  }
+  ser_runner() {
+    "$WORKTREE_BUN" "$WORKTREE_RUNNER" "$@"
+  }
+}
+bind_worktree_runner
 
 if ! declare -F vma_process_assertions >/dev/null || ! declare -F vma_process >/dev/null; then
   echo "FATAL: vma core functions not defined after eval"

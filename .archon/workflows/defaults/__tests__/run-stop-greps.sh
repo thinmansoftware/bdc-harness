@@ -40,7 +40,6 @@ assert_contains() {
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 export NODE_ENV=test
-export SER_TEST_TRUSTED_ROOT="$(cd "$HERE/../../../.." && pwd)"
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
 bdc-feature-development-astra.yaml
@@ -71,6 +70,22 @@ if [ -z "$RSG_CORE" ]; then
   echo "FATAL: could not extract rsg core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RSG_CORE"
+
+bind_worktree_runner() {
+  WORKTREE_RUNNER="$(cd "$HERE/../../../.." && pwd)/packages/workflows/src/reliability/structured-evidence-runner.ts"
+  WORKTREE_BUN="$(command -v bun)"
+  ser_root() {
+    if [ -f "$WORKTREE_RUNNER" ] && [ ! -L "$WORKTREE_RUNNER" ]; then
+      printf '%s\n' "$WORKTREE_RUNNER"
+      return 0
+    fi
+    return 1
+  }
+  ser_runner() {
+    "$WORKTREE_BUN" "$WORKTREE_RUNNER" "$@"
+  }
+}
+bind_worktree_runner
 for fn in rsg_extract rsg_tokens_safe rsg_argv_looks_readonly rsg_allow_cmd rsg_exec_pipeline rsg_observe rsg_compare rsg_run; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
