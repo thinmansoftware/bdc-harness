@@ -209,6 +209,13 @@ export const dagNodeBaseSchema = z.object({
    * how the node was authored.
    */
   load_bearing: z.boolean().optional(),
+  /**
+   * When true, a failure of this node stops the run: nodes that have not
+   * started are skipped, in-flight owned process groups are ended, and the
+   * run fails with terminal_cause repair_checkout_failed. Non-repair exits
+   * (exit 0) are unaffected.
+   */
+  abort_run_on_failure: z.boolean().optional(),
 });
 
 export type DagNodeBase = z.infer<typeof dagNodeBaseSchema>;
@@ -718,6 +725,9 @@ export const dagNodeSchema = dagNodeBaseSchema
       ...(data.trigger_rule !== undefined ? { trigger_rule: data.trigger_rule } : {}),
       ...(data.idle_timeout !== undefined ? { idle_timeout: data.idle_timeout } : {}),
       ...(data.wall_timeout_ms !== undefined ? { wall_timeout_ms: data.wall_timeout_ms } : {}),
+      ...(data.abort_run_on_failure !== undefined
+        ? { abort_run_on_failure: data.abort_run_on_failure }
+        : {}),
     };
 
     // Shared optional fields (valid on AI and bash nodes)

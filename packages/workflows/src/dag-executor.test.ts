@@ -15,8 +15,8 @@ const isWindows = process.platform === 'win32';
 //
 // createLogger() therefore returns one stable bridge. Method calls forward
 // to whichever test file currently owns the slot (this file by default;
-// loader.test.ts adopts the slot in its beforeEach). No production reset
-// hook is required.
+// loader.test.ts adopts the slot in its beforeEach). beforeEach rebinds the
+// live createLogger export for this file only and clears the cached logger.
 
 type WorkflowTestLogFn = (...args: unknown[]) => unknown;
 
@@ -110,6 +110,7 @@ clearRegistry();
 registerBuiltinProviders();
 
 // --- Imports (after mocks) ---
+import * as archonPaths from '@archon/paths';
 import {
   buildTopologicalLayers,
   checkTriggerRule,
@@ -119,7 +120,10 @@ import {
   clearPendingGateResults,
   recordGateResult,
   resolveBunRuntimeExecutable,
+  resetDagExecutorLoggerForTests,
 } from './dag-executor';
+// Drop a logger cached while this file was loading, before beforeEach rebinds it.
+resetDagExecutorLoggerForTests();
 import { loadMcpConfig } from '@archon/providers/claude/provider';
 import { resolveLoopIterationIdleTimeoutMs } from './utils/idle-timeout';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
@@ -318,7 +322,7 @@ function mockBashExecWithScriptCapture(
   const scriptFiles: string[] = [];
   const scriptTexts: string[] = [];
   const scriptModes: string[] = [];
-  const execSpy = spyOn(git, 'execFileAsync').mockImplementation(
+  const execSpy = spyOn(git, 'execOwnedProcessGroup').mockImplementation(
     async (command: string, args: string[]) => {
       expect(command).toBe('bash');
       expect(args).toHaveLength(1);
@@ -328,7 +332,7 @@ function mockBashExecWithScriptCapture(
       scriptTexts.push(await readFile(args[0], 'utf8'));
       scriptModes.push(((await stat(args[0])).mode & 0o777).toString(8));
 
-      return { stdout, stderr };
+      return { stdout, stderr, pgid: 2147483000 };
     }
   );
 
@@ -344,6 +348,10 @@ function mockBashExecWithScriptCapture(
 // mock.module registrations.
 beforeEach(() => {
   workflowTestLoggerSlot.current = asWorkflowTestLogger(mockLogger);
+  // Rebind only for this file. Git's paths mock is process-global when Stop 13
+  // loads that file first; do not make that mock forward a shared logger slot.
+  spyOn(archonPaths, 'createLogger').mockImplementation(() => workflowTestLoggerSlot.bridge);
+  resetDagExecutorLoggerForTests();
 });
 
 afterEach(() => {
@@ -8146,8 +8154,10 @@ describe('executeDagWorkflow -- cancel node', () => {
     );
     (store.getWorkflowRunStatus as Mock<() => Promise<string>>).mockResolvedValue('running');
     let interrupted = false;
-    (store.updateWorkflowRun as Mock<() => Promise<void>>).mockImplementation(async () => {
-      interrupted = true;
+    (
+      store.updateWorkflowRun as Mock<(id: string, updates: { status?: string }) => Promise<void>>
+    ).mockImplementation(async (_id, updates) => {
+      if (updates.status === 'interrupted') interrupted = true;
     });
     (store.getWorkflowRunStatus as Mock<() => Promise<string>>).mockImplementation(async () =>
       interrupted ? 'interrupted' : 'running'
@@ -11268,7 +11278,11 @@ describe('executeDagWorkflow -- script nodes', () => {
   });
 
   it('passes config.envVars to script subprocesses', async () => {
-    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    const execSpy = spyOn(git, 'execOwnedProcessGroup').mockResolvedValue({
+      stdout: 'ok\n',
+      stderr: '',
+      pgid: 2147483000,
+    });
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('script-env-run-id');
@@ -11769,7 +11783,12 @@ describe('executeDagWorkflow -- final status derivation', () => {
       minimalConfig
     );
 
-    expect(mockStore.updateWorkflowRun).not.toHaveBeenCalled();
+    const interruptedWrites = (
+      mockStore.updateWorkflowRun as Mock<
+        (id: string, updates: { status?: string }) => Promise<void>
+      >
+    ).mock.calls.filter(call => call[1]?.status === 'interrupted');
+    expect(interruptedWrites).toHaveLength(0);
     expect(mockStore.upsertRunOutcome).not.toHaveBeenCalled();
   });
 

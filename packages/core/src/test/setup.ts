@@ -27,9 +27,14 @@ const TEST_ENV_PREFIXES = [
   'TELEGRAM_',
 ];
 const TEST_ENV_NAMES = new Set(['GH_TOKEN', 'GITHUB_TOKEN', 'GH_AUTH_TOKEN_INTERNAL']);
+// SMART_CAULDRON_HERMETIC is the package test script's mode switch, not a
+// credential. Cascade teardown waits read it so a climb stays inside the
+// test budget. The script sets it on purpose; do not scrub it back off.
+const TEST_ENV_ALLOW = new Set(['SMART_CAULDRON_HERMETIC']);
 
 for (const name of Object.keys(process.env)) {
   if (name.includes('_TEST_')) continue;
+  if (TEST_ENV_ALLOW.has(name)) continue;
   if (TEST_ENV_NAMES.has(name) || TEST_ENV_PREFIXES.some(prefix => name.startsWith(prefix))) {
     delete process.env[name];
   }

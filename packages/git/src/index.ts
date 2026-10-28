@@ -11,7 +11,25 @@ export type {
 export { toRepoPath, toBranchName, toWorktreePath } from './types';
 
 // Process and filesystem wrappers
-export { execFileAsync, mkdirAsync } from './exec';
+export {
+  execFileAsync,
+  mkdirAsync,
+  execOwnedProcessGroup,
+  endProcessGroup,
+  processGroupExists,
+  setProcessGroupControlForTests,
+  setVerifiedTeardownForTests,
+  verifiedTeardownAvailable,
+  isTreeSurvivedError,
+  TERMINATION_GRACE_MS,
+  TERMINATION_CONFIRM_MS,
+} from './exec';
+export type {
+  OwnedGroupExecOptions,
+  OwnedGroupExecResult,
+  ProcessGroupControl,
+  TreeSurvivedError,
+} from './exec';
 
 // Worktree operations
 export {

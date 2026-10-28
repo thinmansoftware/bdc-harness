@@ -47,6 +47,9 @@ function getArchonHome(): string {
   return process.env.ARCHON_HOME ?? join(homedir(), '.archon');
 }
 
+// This file's logger mock is local. It must not read another suite's global
+// logger slot: bun keeps the first mock.module, and a bridge that switches
+// identity makes later files assert against a different logger object.
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
   getArchonWorktreesPath: () => join(getArchonHome(), 'worktrees'),
@@ -59,6 +62,7 @@ mock.module('@archon/paths', () => ({
 // Import modules AFTER mocking
 // ---------------------------------------------------------------------------
 import * as git from './index';
+import { createLogger } from '@archon/paths';
 
 // ============================================================================
 // Tests
@@ -127,6 +131,25 @@ describe('git utilities', () => {
         );
       } finally {
         readFileSpy.mockRestore();
+      }
+    });
+
+    test('logger stays on this file mock when a foreign logger slot is published', () => {
+      const slot = '__archonWorkflowTestLoggerSlot';
+      const bag = globalThis as unknown as Record<string, unknown>;
+      const previous = bag[slot];
+      bag[slot] = {
+        bridge: {
+          error(): void {
+            throw new Error('foreign-logger');
+          },
+        },
+      };
+      try {
+        expect(createLogger('git')).toBe(mockLogger);
+      } finally {
+        if (previous === undefined) delete bag[slot];
+        else bag[slot] = previous;
       }
     });
   });

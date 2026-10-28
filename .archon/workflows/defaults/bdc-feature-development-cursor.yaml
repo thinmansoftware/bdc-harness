@@ -116,6 +116,7 @@ nodes:
     trigger_rule: all_done
     task_class: clerical
     load_bearing: true
+    abort_run_on_failure: true
     bash: |
       set -euo pipefail
       RUN_AUTHORITY_SPEC="$ARTIFACTS_DIR/authority/work-order.md"
@@ -184,26 +185,175 @@ nodes:
       # ---- BEGIN rtw core (byte-identical across lanes; extracted by unit test) ----
       # Reclaim a repair branch held by another worktree only when every signal says
       # the holder is dead: not this worktree; every remote_agent_workflow_runs row
-      # for that working_path is completed, failed, escalated, or cancelled with
-      # completed_at at least RTW_MIN_AGE_SECONDS old (default 600); no resolvable
-      # process cwd under RTW_PROC_ROOT (default /proc) is the holder or inside it;
-      # and git status --porcelain is empty. If the holder tip is not an ancestor of
-      # FETCH_HEAD, push it to refs/heads/backup/<branch>-<sha7>-<UTC stamp> first.
-      # Then remove that worktree once and retry the checkout once. Anything else is
-      # refused. Never removes any other worktree. Env overrides: RTW_RUNS_DB
-      # (default /.archon/archon.db), RTW_MIN_AGE_SECONDS (default 600), RTW_PROC_ROOT
-      # (default /proc).
+      # for that working_path is completed, failed, escalated, or cancelled. Only a
+      # completed holder waits RTW_MIN_AGE_SECONDS (default 600); escalated, failed,
+      # and cancelled holders do not. A terminal holder whose only blocker is a live
+      # process cwd may wait in rtw_wait_for_holder_exit for RTW_HOLDER_WAIT_SECONDS
+      # (default 120) and is reclaimed when that cwd clears. A dirty terminal holder
+      # is not removed: rtw_release_dirty_holder detaches HEAD at the same tip when
+      # ARTIFACTS_DIR is set, and leaves the index and worktree byte-identical.
+      # If the holder tip is not an ancestor of FETCH_HEAD, push it to
+      # refs/heads/backup/<branch>-<sha7>-<UTC stamp> first. Then remove that one
+      # worktree and retry the checkout once. Anything else is refused. Never removes
+      # any other worktree. Env overrides: RTW_RUNS_DB (default /.archon/archon.db),
+      # RTW_MIN_AGE_SECONDS (default 600), RTW_PROC_ROOT (default /proc),
+      # RTW_HOLDER_WAIT_SECONDS (default 120).
       rtw_refuse() {
         printf 'repair_target_branch_held: %s is checked out by %s; not reclaimed: %s\n' "$branch" "$holder" "$1"
         printf 'repair_target_branch_held: %s is checked out by %s; not reclaimed: %s\n' "$branch" "$holder" "$1" >&2
         rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
         return 1
       }
+      rtw_collect_skip_pids() {
+        rtw_skip_pids=" 1 $$ "
+        local pid="$$"
+        local guard=0
+        local stat_line="" rest="" ppid=""
+        while [ "$guard" -lt 64 ]; do
+          guard=$((guard + 1))
+          if [ ! -r "/proc/${pid}/stat" ]; then
+            break
+          fi
+          stat_line=$(cat "/proc/${pid}/stat" 2>/dev/null || true)
+          rest=${stat_line##*)}
+          # stat after the final ')': state ppid pgrp. ppid is field 2.
+          ppid=$(printf '%s\n' "$rest" | awk '{print $2}')
+          case "$ppid" in
+            ''|*[!0-9]*) break ;;
+          esac
+          case " ${rtw_skip_pids} " in
+            *" ${ppid} "*) break ;;
+          esac
+          rtw_skip_pids="${rtw_skip_pids}${ppid} "
+          if [ "$ppid" = "1" ] || [ "$ppid" = "0" ] || [ "$ppid" = "$pid" ]; then
+            break
+          fi
+          pid=$ppid
+        done
+      }
+      rtw_scan_holder_cwd() {
+        rtw_live_pid=""
+        rtw_live_comm=""
+        local cwdlink="" pid="" resolved="" comm_file=""
+        for cwdlink in "$proc_root"/*/cwd; do
+          case "$cwdlink" in
+            *'*'*) continue ;;
+          esac
+          pid=${cwdlink%/*}
+          pid=${pid##*/}
+          case "$pid" in
+            ''|*[!0-9]*) continue ;;
+          esac
+          case " ${rtw_skip_pids} " in
+            *" ${pid} "*) continue ;;
+          esac
+          [ -L "$cwdlink" ] || [ -e "$cwdlink" ] || continue
+          resolved=$(readlink -f "$cwdlink" 2>/dev/null || true)
+          if command -v cygpath >/dev/null 2>&1; then
+            resolved=$(cygpath -m "$resolved")
+          fi
+          [ -n "$resolved" ] || continue
+          if [ "$resolved" = "$holder" ] || [ "${resolved#"$holder"/}" != "$resolved" ]; then
+            rtw_live_pid=$pid
+            comm_file="${proc_root}/${pid}/comm"
+            if [ -r "$comm_file" ]; then
+              rtw_live_comm=$(tr -d '\n' < "$comm_file")
+            else
+              rtw_live_comm="unknown"
+            fi
+            return 0
+          fi
+        done
+        return 1
+      }
+      rtw_wait_for_holder_exit() {
+        local wait_seconds="${RTW_HOLDER_WAIT_SECONDS:-120}"
+        local deadline=0 now=0 left=0 sleep_for=0
+        deadline=$(( $(date -u +%s) + wait_seconds ))
+        while true; do
+          if ! rtw_scan_holder_cwd; then
+            return 0
+          fi
+          now=$(date -u +%s)
+          if [ "$now" -ge "$deadline" ]; then
+            rtw_refuse "live process cwd under holder after ${wait_seconds}s wait (pid ${rtw_live_pid} comm ${rtw_live_comm})" || return 1
+          fi
+          left=$((deadline - now))
+          if [ "$left" -gt 5 ]; then
+            sleep_for=5
+          else
+            sleep_for=$left
+          fi
+          if [ "$sleep_for" -le 0 ]; then
+            rtw_refuse "live process cwd under holder after ${wait_seconds}s wait (pid ${rtw_live_pid} comm ${rtw_live_comm})" || return 1
+          fi
+          sleep "$sleep_for"
+        done
+      }
+      rtw_release_dirty_holder() {
+        rtw_holder_released=0
+        local porcelain="" tip="" id8_local="" dest="" count=""
+        local index_path="" index_copy="" esc_holder="" esc_branch="" esc_tip=""
+        index_path=$(git -C "$holder" rev-parse --path-format=absolute --git-path index 2>/dev/null || true)
+        index_copy=$(mktemp)
+        if [ -n "$index_path" ] && [ -f "$index_path" ]; then
+          if ! cp "$index_path" "$index_copy"; then
+            rm -f "$index_copy"
+            rtw_refuse "worktree is dirty" || return 1
+          fi
+        fi
+        # Count porcelain lines against an index copy so the real index stays byte-identical.
+        if ! porcelain=$(GIT_INDEX_FILE="$index_copy" git -C "$holder" --no-optional-locks status --porcelain --untracked-files=all); then
+          rm -f "$index_copy"
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        rm -f "$index_copy"
+        if [ -z "$porcelain" ]; then
+          return 0
+        fi
+        if [ -z "${ARTIFACTS_DIR:-}" ]; then
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        if ! tip=$(git -C "$holder" rev-parse HEAD); then
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        count=$(printf '%s\n' "$porcelain" | wc -l | tr -d '[:space:]')
+        case "$count" in
+          ''|*[!0-9]*) rtw_refuse "worktree is dirty" || return 1 ;;
+        esac
+        id8_local=$(printf '%s' "$best_id" | cut -c1-8)
+        dest="${ARTIFACTS_DIR}/reclaimed-holder/${id8_local}"
+        if ! mkdir -p "$dest"; then
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        esc_holder=$(printf '%s' "$holder" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        esc_branch=$(printf '%s' "$branch" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        esc_tip=$(printf '%s' "$tip" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        # Publish released.json before detaching. A failed write or read-back
+        # leaves the branch held. Cleanup must not hide that refusal.
+        if ! printf '{"holder":"%s","branch":"%s","tip_sha":"%s","porcelain_line_count":%s}\n' \
+          "$esc_holder" "$esc_branch" "$esc_tip" "$count" > "${dest}/released.json"; then
+          rm -f "${dest}/released.json" || true
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        if ! grep -F -q -e "\"tip_sha\":\"${tip}\"" -- "${dest}/released.json"; then
+          rm -f "${dest}/released.json" || true
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        if ! git -C "$holder" update-ref --no-deref HEAD "$tip"; then
+          rm -f "${dest}/released.json" || true
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        printf 'repair_target_holder_released: %s detached at %s\n' "$holder" "$tip"
+        rtw_holder_released=1
+        return 0
+      }
       rtw_checkout_repair_branch() {
         local branch="$1"
         local err_file rtw_query rtw_db_out rtw_db_err err
         local checkout_code=0 retry_code=0 ancestor_code=0 rtw_db_code=0 row_seen=0
         local holder="" rtw_top="" rtw_db="" min_age="" proc_root=""
+        local rtw_skip_pids="" rtw_live_pid="" rtw_live_comm=""
         local best_id="" best_status="" best_ts="" best_epoch=-1
         local holder_sha="" backup_ref="" sha7="" stamp="" id8=""
         local row_id="" row_status="" row_completed="" row_epoch="" now_epoch="" row_age=0
@@ -312,23 +462,15 @@ nodes:
         if [ ! -d "$proc_root" ]; then
           rtw_refuse "process root missing" || return
         fi
-        for cwdlink in "$proc_root"/*/cwd; do
-          case "$cwdlink" in
-            *'*'*) continue ;;
-          esac
-          [ -L "$cwdlink" ] || [ -e "$cwdlink" ] || continue
-          resolved=$(readlink -f "$cwdlink" 2>/dev/null || true)
-          if command -v cygpath >/dev/null 2>&1; then
-            resolved=$(cygpath -m "$resolved")
-          fi
-          [ -n "$resolved" ] || continue
-          if [ "$resolved" = "$holder" ] || [ "${resolved#"$holder"/}" != "$resolved" ]; then
-            rtw_refuse "live process cwd under holder" || return
-          fi
-        done
-        if [ -n "$(git -C "$holder" status --porcelain)" ]; then
-          rtw_refuse "worktree is dirty" || return
+        rtw_collect_skip_pids
+        if ! rtw_wait_for_holder_exit; then
+          return 1
         fi
+        rtw_holder_released=0
+        if ! rtw_release_dirty_holder; then
+          return 1
+        fi
+        if [ "$rtw_holder_released" != "1" ]; then
         holder_sha=$(git -C "$holder" rev-parse HEAD)
         backup_ref=""
         if git merge-base --is-ancestor "$holder_sha" FETCH_HEAD; then
@@ -345,7 +487,7 @@ nodes:
             rtw_refuse "backup push failed" || return
           fi
         fi
-        if ! git worktree remove "$holder"; then
+        if ! git worktree remove --force "$holder"; then
           rtw_refuse "worktree remove failed" || return
         fi
         id8=$(printf '%s' "$best_id" | cut -c1-8)
@@ -353,6 +495,7 @@ nodes:
           "$holder" "$id8" "$best_status" "$best_ts" "$branch"
         if [ -n "$backup_ref" ]; then
           printf 'backup_branch: %s\n' "$backup_ref"
+        fi
         fi
         if git checkout -B "$branch" FETCH_HEAD 2>"$err_file"; then
           rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
@@ -730,6 +873,7 @@ nodes:
     depends_on: [repair-gate]
     trigger_rule: all_done
     when: "$repair-gate.output.REPAIR_GATE_ALLOW != 'yes'"
+    abort_run_on_failure: true
     bash: |
       set -euo pipefail
       GATE_OUT_FILE="${ARCHON_NODE_OUT:-}/repair-gate.out"

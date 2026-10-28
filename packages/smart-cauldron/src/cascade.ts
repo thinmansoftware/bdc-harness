@@ -119,6 +119,214 @@ export interface CascadeDeps {
    * grounds (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01).
    */
   seatCutoff?: () => Promise<number | null>;
+  /**
+   * Run-row reader for the teardown wait. Defaults to GET /api/workflows/runs/:id.
+   * The signal aborts when the remaining teardown deadline expires. Readers may
+   * ignore it; the wait still stops at the deadline.
+   */
+  readRunDetail?: (runId: string, signal?: AbortSignal) => Promise<PriorRunDetail | null>;
+  /** Sleep used by the teardown poll. Defaults to a real timer. */
+  sleep?: (ms: number) => Promise<void>;
+  /** Clock for the teardown deadline. Defaults to Date.now. */
+  now?: () => number;
+}
+
+export interface PriorRunDetail {
+  completedAt: string | null;
+  metadata: Record<string, unknown>;
+  error: string | null;
+}
+
+const TEARDOWN_POLL_MS = 5000;
+const PREDEPLOY_TEARDOWN_AGE_MS = 600_000;
+
+function teardownWaitMs(): number {
+  const raw = process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS;
+  if (raw === undefined || raw === '') return 180_000;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 180_000;
+}
+
+function parseTimestamp(value: string): number {
+  const direct = Date.parse(value);
+  if (!Number.isNaN(direct)) return direct;
+  const normalized = value.includes('T') ? value : `${value.replace(' ', 'T')}Z`;
+  const parsed = Date.parse(normalized);
+  return Number.isNaN(parsed) ? Number.NaN : parsed;
+}
+
+/**
+ * Wait until the previous attempt's run row has metadata.teardown_confirmed_at,
+ * or the row has no teardown key and completed_at is older than 600s.
+ * Survivors, a missing run id, failed reads through the deadline, or an
+ * expired wait all return unconfirmed.
+ */
+function isAbortError(err: unknown): boolean {
+  return (
+    typeof err === 'object' && err !== null && (err as { name?: unknown }).name === 'AbortError'
+  );
+}
+
+/**
+ * One prior-run read, aborted when the remaining deadline elapses.
+ * A stalled body loses the race and does not hold the cascade past the deadline.
+ */
+async function readRunWithinDeadline(
+  readRun: (runId: string, signal: AbortSignal) => Promise<PriorRunDetail | null>,
+  runId: string,
+  remainingMs: number
+): Promise<PriorRunDetail | null | 'failed' | 'aborted'> {
+  if (remainingMs <= 0) return 'aborted';
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<'aborted'>(resolve => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve('aborted');
+    }, remainingMs);
+  });
+  const read = readRun(runId, controller.signal).then(
+    (detail): PriorRunDetail | null => detail,
+    (err: unknown): 'failed' | 'aborted' => {
+      if (controller.signal.aborted || isAbortError(err)) return 'aborted';
+      return 'failed';
+    }
+  );
+  // Swallow a late rejection after the deadline already won the race.
+  void read.catch(() => undefined);
+  try {
+    const winner = await Promise.race([read, timeout]);
+    if (winner === 'aborted') return 'aborted';
+    return winner;
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+export async function waitForPriorTeardown(args: {
+  runId: string | null;
+  readRun: (runId: string, signal: AbortSignal) => Promise<PriorRunDetail | null>;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  waitMs?: number;
+  pollMs?: number;
+}): Promise<'confirmed' | 'unconfirmed'> {
+  if (!args.runId) return 'unconfirmed';
+  const waitMs = args.waitMs ?? teardownWaitMs();
+  const pollMs = args.pollMs ?? TEARDOWN_POLL_MS;
+  const deadline = args.now() + waitMs;
+  while (true) {
+    const remaining = deadline - args.now();
+    if (remaining <= 0) return 'unconfirmed';
+    const detail = await readRunWithinDeadline(args.readRun, args.runId, remaining);
+    if (detail === 'aborted') return 'unconfirmed';
+    if (detail === 'failed' || detail === null) {
+      // A failed or empty read keeps polling until the deadline.
+    } else {
+      const metadata = detail.metadata ?? {};
+      if (Object.prototype.hasOwnProperty.call(metadata, 'teardown_survivors')) {
+        return 'unconfirmed';
+      }
+      const confirmed = metadata.teardown_confirmed_at;
+      if (typeof confirmed === 'string' && confirmed.length > 0) return 'confirmed';
+      const hasTeardownKey = Object.prototype.hasOwnProperty.call(
+        metadata,
+        'teardown_confirmed_at'
+      );
+      if (!hasTeardownKey && detail.completedAt) {
+        const completedMs = parseTimestamp(detail.completedAt);
+        if (!Number.isNaN(completedMs) && args.now() - completedMs > PREDEPLOY_TEARDOWN_AGE_MS) {
+          return 'confirmed';
+        }
+      }
+    }
+    const now = args.now();
+    if (now >= deadline) return 'unconfirmed';
+    const nap = Math.min(pollMs, deadline - now);
+    if (nap <= 0) return 'unconfirmed';
+    await args.sleep(nap);
+  }
+}
+
+async function readBodyText(response: Response, signal: AbortSignal): Promise<string> {
+  if (signal.aborted) {
+    throw new DOMException('The operation was aborted', 'AbortError');
+  }
+  return await new Promise<string>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(new DOMException('The operation was aborted', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    response.text().then(
+      text => {
+        signal.removeEventListener('abort', onAbort);
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        resolve(text);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    );
+  });
+}
+
+async function defaultReadRunDetail(
+  runId: string,
+  apiBaseUrl: string,
+  token: string,
+  signal: AbortSignal
+): Promise<PriorRunDetail | null> {
+  const response = await fetch(`${apiBaseUrl}/api/workflows/runs/${runId}`, {
+    headers: { 'x-archon-operator-token': token },
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`run detail HTTP ${String(response.status)}`);
+  }
+  const text = await readBodyText(response, signal);
+  const body = JSON.parse(text) as {
+    run?: {
+      completed_at?: string | null;
+      metadata?: Record<string, unknown> | null;
+    };
+  };
+  if (!body.run) return null;
+  const metadata = body.run.metadata ?? {};
+  const error = typeof metadata.error === 'string' ? metadata.error : null;
+  return {
+    completedAt: body.run.completed_at ?? null,
+    metadata,
+    error,
+  };
+}
+
+function repairCheckoutReasonLine(poll: PollResult, verdict: GateVerdict): string {
+  const errorText = typeof poll.rawMetadata.error === 'string' ? poll.rawMetadata.error : '';
+  const blob = `${errorText}\n${verdict.reason}`;
+  for (const line of blob.split('\n')) {
+    if (
+      line.includes('repair_gate_closed: checkout_failed') ||
+      line.includes('repair_target_branch_held') ||
+      line.includes('repair_checkout_failed')
+    ) {
+      return line;
+    }
+  }
+  return verdict.reason;
+}
+
+function isRepairCheckoutNoClimb(poll: PollResult, verdict: GateVerdict): boolean {
+  if (poll.rawMetadata.terminal_cause === 'repair_checkout_failed') return true;
+  const errorText = typeof poll.rawMetadata.error === 'string' ? poll.rawMetadata.error : '';
+  const blob = `${errorText}\n${verdict.reason}`;
+  return (
+    blob.includes('repair_gate_closed: checkout_failed') ||
+    blob.includes('repair_target_branch_held')
+  );
 }
 
 const SEAT_USAGE_READ_TIMEOUT_MS = 5000;
@@ -413,6 +621,36 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         })
       : createRecord);
   const cancelImpl = opts.deps?.cancel ?? cancelRun;
+  // Hermetic package tests set SMART_CAULDRON_HERMETIC=1 and often omit the
+  // teardown reader. A real HTTP read plus the 5s poll blows the 30s test
+  // budget on the second tier (cursor climbs to codex). An old completed row
+  // with empty metadata is already "confirmed" by the 600s pre-deploy rule,
+  // and an injected reader, sleep, or clock still wins.
+  const hermetic = process.env.SMART_CAULDRON_HERMETIC === '1';
+  const readRunImpl =
+    opts.deps?.readRunDetail ??
+    (hermetic
+      ? async (): Promise<PriorRunDetail | null> => ({
+          completedAt: new Date(Date.now() - (PREDEPLOY_TEARDOWN_AGE_MS + 60_000)).toISOString(),
+          metadata: {},
+          error: null,
+        })
+      : (runId: string, signal: AbortSignal): Promise<PriorRunDetail | null> =>
+          defaultReadRunDetail(
+            runId,
+            apiBaseUrl,
+            token ?? process.env.ARCHON_OPERATOR_TOKEN ?? '',
+            signal
+          ));
+  const sleepImpl =
+    opts.deps?.sleep ??
+    (hermetic
+      ? async (): Promise<void> => undefined
+      : (ms: number): Promise<void> =>
+          new Promise(resolve => {
+            setTimeout(resolve, ms);
+          }));
+  const nowImpl = opts.deps?.now ?? ((): number => Date.now());
   const specRepairImpl = opts.deps?.specRepair ?? defaultSpecRepair;
   const superviseFailureImpl = opts.deps?.superviseFailure;
   const findWoClaimImpl =
@@ -1108,6 +1346,31 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         }
       }
 
+      if (attempts.length > 1) {
+        const priorAttempt = attempts[attempts.length - 2];
+        const teardown = await waitForPriorTeardown({
+          runId: priorAttempt?.runId ?? null,
+          readRun: readRunImpl,
+          sleep: sleepImpl,
+          now: nowImpl,
+        });
+        if (teardown !== 'confirmed') {
+          attempt.outcome = 'gate-failed';
+          attempt.gateFailReason = 'teardown_unconfirmed';
+          attempt.completedAt = new Date().toISOString();
+          status = 'blocked';
+          await emitEscalation({
+            errorClass: 'validator_rejected',
+            woId,
+            reason: `teardown_unconfirmed: run ${priorAttempt?.runId ?? 'missing'} did not confirm teardown`,
+            overseerPermit: opts.overseerPermit,
+            runId: priorAttempt?.runId ?? null,
+          });
+          await checkpoint();
+          break;
+        }
+      }
+
       // Fire the WO on this tier
       const fireResult: FireResult = await fireImpl({
         workflowName: tier.workflowName,
@@ -1371,7 +1634,29 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       // Harness gate misfire: the gate failed for a harness-side reason, not
       // because the implement tier produced bad work. Stop on this tier with
       // one Dispatch notice. Do not climb and do not post SPEC-REPAIR.
+      // An explicit repair-checkout failure (terminal_cause, or the checkout
+      // error with no failed_nodes list) keeps checkout_failed_no_climb.
+      // A failed_nodes list is the gate-misfire shape and is classified below.
       if (outcome === 'gate-failed') {
+        const failedNodes = pollResult.rawMetadata.failed_nodes;
+        const namedGateNodes = Array.isArray(failedNodes) && failedNodes.length > 0;
+        const checkoutFirst =
+          pollResult.rawMetadata.terminal_cause === 'repair_checkout_failed' ||
+          (!namedGateNodes && isRepairCheckoutNoClimb(pollResult, verdict));
+        if (checkoutFirst) {
+          const reasonLine = repairCheckoutReasonLine(pollResult, verdict);
+          status = 'blocked';
+          attempt.gateFailReason = 'checkout_failed_no_climb';
+          await emitEscalation({
+            errorClass: 'validator_rejected',
+            woId,
+            reason: `checkout_failed_no_climb: run ${fireResult.runId ?? 'unknown'}: ${reasonLine}`,
+            overseerPermit: opts.overseerPermit,
+            runId: fireResult.runId,
+          });
+          await checkpoint();
+          break;
+        }
         const misfire = classifyGateMisfire(pollResult);
         if (misfire) {
           attempt.outcome = 'gate-misfire';
@@ -1429,6 +1714,21 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           await checkpoint();
           break;
         }
+      }
+
+      if (isRepairCheckoutNoClimb(pollResult, verdict)) {
+        const reasonLine = repairCheckoutReasonLine(pollResult, verdict);
+        status = 'blocked';
+        attempt.gateFailReason = 'checkout_failed_no_climb';
+        await emitEscalation({
+          errorClass: 'validator_rejected',
+          woId,
+          reason: `checkout_failed_no_climb: run ${fireResult.runId ?? 'unknown'}: ${reasonLine}`,
+          overseerPermit: opts.overseerPermit,
+          runId: fireResult.runId,
+        });
+        await checkpoint();
+        break;
       }
 
       // Build informed-climb context for the next tier
