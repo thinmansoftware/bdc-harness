@@ -334,9 +334,10 @@ export async function dispatchBackgroundWorkflow(
     ? { ...frozenSpecSource, dispatchId: workerPlatformId }
     : undefined;
 
-  // Pre-dispatch failures (bad Base branch, missing codebase, missing origin ref,
-  // isolation failure) are recorded on the parent conversation before they are
-  // rethrown. The conductor reads that marker and stops instead of timing out.
+  // Known base-branch spec-validation refusals are recorded on the parent
+  // conversation before they are rethrown. Only messages that start with
+  // base_branch_not_single: or declared_base_branch_not_found: get a marker.
+  // The conductor reads that marker and stops instead of timing out.
   // The wrapper ends before the dispatch notification and createWorkflowRun.
   let workerConv: Awaited<ReturnType<typeof db.getOrCreateConversation>>;
   let workerCwd: string;
@@ -431,22 +432,24 @@ export async function dispatchBackgroundWorkflow(
       workerCwd = ctx.cwd;
     }
   } catch (error) {
-    const refusalError = toError(error);
-    try {
-      await ctx.platform.sendMessage(
-        ctx.conversationId,
-        `pre_dispatch_refusal: ${refusalError.message}`
-      );
-    } catch (sendError) {
-      // Keep the original refusal. A failed marker send must not replace it.
-      getLog().error(
-        {
-          err: toError(sendError),
-          refusal: refusalError.message,
-          conversationId: ctx.conversationId,
-        },
-        'orchestrator.pre_dispatch_refusal_notify_failed'
-      );
+    const message = toError(error).message;
+    const isKnownSpecRefusal =
+      message.startsWith('base_branch_not_single:') ||
+      message.startsWith('declared_base_branch_not_found:');
+    if (isKnownSpecRefusal) {
+      try {
+        await ctx.platform.sendMessage(ctx.conversationId, `pre_dispatch_refusal: ${message}`);
+      } catch (sendError) {
+        // Keep the original refusal. A failed marker send must not replace it.
+        getLog().error(
+          {
+            err: toError(sendError),
+            refusal: message,
+            conversationId: ctx.conversationId,
+          },
+          'orchestrator.pre_dispatch_refusal_notify_failed'
+        );
+      }
     }
     throw error;
   }

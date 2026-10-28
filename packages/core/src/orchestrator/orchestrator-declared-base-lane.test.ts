@@ -27,8 +27,16 @@ mock.module('@archon/paths', () => ({
   getArchonHome: mock(() => '/home/test/.archon'),
 }));
 
+let lsRemoteShouldFail = false;
+let dbShouldFail = false;
+let isolationShouldFail = false;
+
 mock.module('../db/conversations', () => ({
-  getOrCreateConversation: mock(() => Promise.resolve(workerConv)),
+  getOrCreateConversation: mock(() =>
+    dbShouldFail
+      ? Promise.reject(new Error('database connection failed'))
+      : Promise.resolve(workerConv)
+  ),
   getConversationByPlatformId: mock(() => Promise.resolve(null)),
   updateConversation: mock(() => Promise.resolve()),
   touchConversation: mock(() => Promise.resolve()),
@@ -69,7 +77,6 @@ mock.module('../workflows/work-order-source', () => ({
 // node:child_process execFile drives originBranchExists' `git ls-remote` check
 // (orchestrator wraps it with util.promisify). Control success/failure per test.
 type ExecCb = (err: Error | null, stdout?: string, stderr?: string) => void;
-let lsRemoteShouldFail = false;
 const execFileCalls: Array<{ file: string; args: string[] }> = [];
 mock.module('node:child_process', () => ({
   execFile: (file: string, args: string[], _options: unknown, callback: ExecCb) => {
@@ -80,7 +87,9 @@ mock.module('node:child_process', () => ({
 }));
 
 const mockResolve = mock((_input: unknown) =>
-  Promise.resolve({ status: 'none' as const, cwd: '/workspace/worker' })
+  isolationShouldFail
+    ? Promise.reject(new Error('worktree creation failed'))
+    : Promise.resolve({ status: 'none' as const, cwd: '/workspace/worker' })
 );
 class MockIsolationResolver {
   resolve = mockResolve;
@@ -189,6 +198,8 @@ describe('dispatchBackgroundWorkflow declared base-lane authority', () => {
     mockFreeze.mockClear();
     execFileCalls.length = 0;
     lsRemoteShouldFail = false;
+    dbShouldFail = false;
+    isolationShouldFail = false;
     freezeWithSpec('no base here');
   });
 
@@ -268,6 +279,34 @@ describe('dispatchBackgroundWorkflow declared base-lane authority', () => {
     expect(sent).toContain('base_branch_not_single');
     expect(sent).toContain('dev (bdc-harness), main (bdc-xo)');
     expect(sent).not.toContain('Dispatching workflow');
+  });
+
+  test('database failure is rethrown without a spec refusal marker', async () => {
+    freezeWithSpec('Base branch: dev\n');
+    dbShouldFail = true;
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
+
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
+      /database connection failed/
+    );
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).not.toContain('pre_dispatch_refusal:');
+    expect(sent).not.toContain('Dispatching workflow');
+  });
+
+  test('isolation failure is rethrown without a spec refusal marker', async () => {
+    freezeWithSpec('Base branch: dev\n');
+    isolationShouldFail = true;
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
+
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
+      /worktree creation failed/
+    );
+    expect(mockResolve).toHaveBeenCalledTimes(1);
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).not.toContain('pre_dispatch_refusal:');
   });
 
   test('no declared base -> preserves inherited parent task hint (no ls-remote)', async () => {

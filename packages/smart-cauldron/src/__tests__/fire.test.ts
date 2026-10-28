@@ -287,6 +287,115 @@ describe('fireTier atomic conversation dispatch', () => {
     ).toBe(true);
   });
 
+  test('a base_branch_not_single marker is a spec_error, not a discovery timeout', async () => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      fetchCalls.push({ url, init });
+      if (url.endsWith('/api/codebases')) return codebasesResponse();
+      if (url.endsWith('/api/conversations')) {
+        return Response.json({
+          conversationId: 'web-parent-multi',
+          id: 'parent-db-multi',
+          dispatched: true,
+        });
+      }
+      if (url.includes('/messages')) {
+        return Response.json([
+          {
+            content:
+              'pre_dispatch_refusal: base_branch_not_single: workflow "bdc-feature-development" declares Base branch "dev (bdc-harness), main (bdc-xo)" which is not a single branch name',
+          },
+        ]);
+      }
+      return Response.json({ runs: [] });
+    }) as typeof globalThis.fetch;
+
+    const result = await fireTier({
+      workflowName: 'bdc-feature-development',
+      woId: 'WO-TEST-MULTI',
+      project: 'bdc-harness',
+      message: buildFireMessage('WO-TEST-MULTI', 'bdc-harness'),
+      apiBaseUrl: 'http://archon.test',
+      token: 'option-token',
+      discoverTimeoutMs: 5000,
+      discoverIntervalMs: 0,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errorClass).toBe('spec_error');
+    expect(result.infraError).toContain('base_branch_not_single');
+    expect(result.infraError).toContain('dev (bdc-harness), main (bdc-xo)');
+    expect(result.infraError ?? '').not.toContain('run discovery timeout');
+  });
+
+  test('a database connection failed marker stays a discovery timeout', async () => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      fetchCalls.push({ url, init });
+      if (url.endsWith('/api/codebases')) return codebasesResponse();
+      if (url.endsWith('/api/conversations')) {
+        return Response.json({
+          conversationId: 'web-parent-db',
+          id: 'parent-db-fail',
+          dispatched: true,
+        });
+      }
+      if (url.includes('/messages')) {
+        return Response.json([{ content: 'pre_dispatch_refusal: database connection failed' }]);
+      }
+      return Response.json({ runs: [] });
+    }) as typeof globalThis.fetch;
+
+    const result = await fireTier({
+      workflowName: 'bdc-feature-development',
+      woId: 'WO-TEST-DB',
+      project: 'bdc-harness',
+      message: buildFireMessage('WO-TEST-DB', 'bdc-harness'),
+      apiBaseUrl: 'http://archon.test',
+      token: 'option-token',
+      discoverTimeoutMs: 40,
+      discoverIntervalMs: 0,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errorClass).toBeUndefined();
+    expect(result.infraError).toContain('run discovery timeout');
+  });
+
+  test('a worktree creation failed marker stays a discovery timeout', async () => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      fetchCalls.push({ url, init });
+      if (url.endsWith('/api/codebases')) return codebasesResponse();
+      if (url.endsWith('/api/conversations')) {
+        return Response.json({
+          conversationId: 'web-parent-iso',
+          id: 'parent-db-iso',
+          dispatched: true,
+        });
+      }
+      if (url.includes('/messages')) {
+        return Response.json([{ content: 'pre_dispatch_refusal: worktree creation failed' }]);
+      }
+      return Response.json({ runs: [] });
+    }) as typeof globalThis.fetch;
+
+    const result = await fireTier({
+      workflowName: 'bdc-feature-development',
+      woId: 'WO-TEST-ISO',
+      project: 'bdc-harness',
+      message: buildFireMessage('WO-TEST-ISO', 'bdc-harness'),
+      apiBaseUrl: 'http://archon.test',
+      token: 'option-token',
+      discoverTimeoutMs: 40,
+      discoverIntervalMs: 0,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errorClass).toBeUndefined();
+    expect(result.infraError).toContain('run discovery timeout');
+  });
+
   test('empty runs and empty messages still time out as run discovery', async () => {
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);

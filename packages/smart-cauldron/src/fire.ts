@@ -5,8 +5,9 @@
  * resolved codebaseId and the /workflow run command. The response must prove
  * dispatched:true. The resulting run is discovered by the returned parent
  * conversation database id; no conversation identity is fabricated locally.
- * While that poll is empty, the parent platform conversation is read for a
- * pre_dispatch_refusal marker so a spec error stops the cascade immediately.
+ * While that poll is empty, the parent platform conversation is read for
+ * known spec-validation markers so a spec error stops the cascade immediately.
+ * Only base_branch_not_single and declared_base_branch_not_found count.
  *
  * Secret boundary: apiBaseUrl and token come from the caller or environment.
  */
@@ -240,6 +241,16 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
 
 const PRE_DISPATCH_REFUSAL_PREFIX = 'pre_dispatch_refusal:';
 
+const KNOWN_SPEC_VALIDATION_PREFIXES = [
+  'base_branch_not_single:',
+  'declared_base_branch_not_found:',
+] as const;
+
+function isKnownSpecValidationRefusal(refusal: string): boolean {
+  const trimmed = refusal.trim();
+  return KNOWN_SPEC_VALIDATION_PREFIXES.some(prefix => trimmed.startsWith(prefix));
+}
+
 type DiscoveryOutcome = { kind: 'run'; runId: string } | { kind: 'spec_error'; reason: string };
 
 function messageContent(message: unknown): string | null {
@@ -313,7 +324,9 @@ async function discoverRunId(opts: {
     }
 
     const refusal = await readPreDispatchRefusal(opts);
-    if (refusal !== null) return { kind: 'spec_error', reason: refusal };
+    if (refusal !== null && isKnownSpecValidationRefusal(refusal)) {
+      return { kind: 'spec_error', reason: refusal };
+    }
 
     await new Promise<void>(resolve => setTimeout(resolve, opts.intervalMs));
   }
