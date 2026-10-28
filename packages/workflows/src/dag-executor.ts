@@ -1715,7 +1715,8 @@ async function resolveNodeProviderAndModel(
   workflowRunId: string,
   cwd: string,
   workflowLevelOptions: WorkflowLevelOptions,
-  modelOverride?: ModelOverride
+  modelOverride?: ModelOverride,
+  resolveGithubToken?: () => Promise<string | undefined>
 ): Promise<{
   provider: string;
   model: string | undefined;
@@ -1892,7 +1893,8 @@ async function resolveNodeProviderAndModel(
           personaContextState = 'skipped';
           getLog().debug({ nodeId: node.id, agentName }, 'dag.persona_context_skipped_paperwork');
         } else {
-          const contextBlock = await loadContext(persona).catch((err: unknown) => {
+          const githubToken = resolveGithubToken ? await resolveGithubToken() : undefined;
+          const contextBlock = await loadContext(persona, { githubToken }).catch((err: unknown) => {
             getLog().warn({ agentName, err: (err as Error).message }, 'agent.context_load_failed');
             personaContextState = 'failed';
             return '';
@@ -5285,7 +5287,8 @@ async function executeApprovalNode(
       workflowRun.id,
       cwd,
       workflowLevelOptions,
-      modelOverride
+      modelOverride,
+      deps.resolveGithubToken
     );
 
     const output = await executeNodeInternal(
@@ -6074,7 +6077,8 @@ async function executeDagWorkflowInternal(
             workflowRun.id,
             cwd,
             workflowLevelOptions,
-            modelOverride
+            modelOverride,
+            deps.resolveGithubToken
           );
           assertProviderCanExecuteNode(provider, node);
 
@@ -6255,7 +6259,8 @@ async function executeDagWorkflowInternal(
                 workflowRun.id,
                 cwd,
                 workflowLevelOptions,
-                modelOverride
+                modelOverride,
+                deps.resolveGithubToken
               );
               emitNodeFailover(
                 deps,

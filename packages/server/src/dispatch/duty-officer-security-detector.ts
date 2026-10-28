@@ -24,7 +24,7 @@ export interface SecurityDetectorReason {
 }
 export interface SecurityDetectorDeps {
   fetchImpl: typeof fetch;
-  readToken: () => string | null;
+  readToken: () => string | null | Promise<string | null>;
   writeTokenProvider: (signal: AbortSignal) => Promise<string | null>;
   signal?: AbortSignal;
   now: () => Date;
@@ -305,7 +305,7 @@ export async function runSecurityDetector(
   const evaluatedAt = now.toISOString();
   const armedAt = process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT?.trim() || '9999-12-31';
   const armed = now.getTime() >= Date.parse(`${armedAt}T00:00:00Z`);
-  const token = deps.readToken();
+  const token = await deps.readToken();
   const result: SecurityDetectorResult = {
     verdict: armed ? 'clean' : 'disarmed',
     reasons: [],

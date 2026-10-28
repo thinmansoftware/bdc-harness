@@ -1,7 +1,18 @@
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
-import { resolveServiceGitHubAuth, type GitHubService } from '@archon/core/github/service-identity';
+import {
+  resolvePatFallbackToken,
+  resolveServiceGitHubAuth,
+  type GitHubService,
+} from '@archon/core/github/service-identity';
+
+// M-153 identity separation seam: the MERGE mutation must not run as the Review
+// Gate identity ("review and merge are separate actors", John 2026-08-24). When
+// the merge-manager PAT env var is set, merges run with that PAT identity while
+// reviews keep the App identity; unset, the merge octokit falls back to the
+// shared resolution and M-153 callers must treat that as the single-identity
+// hold. The merge-manager PAT env var name is defined once in service-identity.
 import {
   assertPersistedGitHubPoolAvailable,
   flushGitHubApiMeter,
@@ -588,9 +599,14 @@ export function createRealFetchExactHeadPullRequestEvidence(
   };
 }
 
-/** Resolve the GitHub token from the standard env vars. No fallback secrets. */
+/**
+ * Resolve the overseer PAT via the shared provider. Only ever used as the PAT
+ * fallback (App identities authenticate through Octokit's createAppAuth, which
+ * mints and refreshes its own installation tokens), so this stays synchronous
+ * -- it returns the resolved PAT token and never reads process.env directly.
+ */
 export function resolveGitHubToken(): string {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
+  const token = resolvePatFallbackToken();
   if (!token) {
     throw new Error(
       'overseer_real_adapter_missing_github_token: set GH_TOKEN or GITHUB_TOKEN to run Overseer in real mode'
@@ -814,22 +830,12 @@ export function createRealOctokitClient(
  * identities, and nothing here widens what the PAT is used for.
  */
 export function createRealReadOnlyPatOctokitClient(): RealGitHubOctokitLike | null {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
+  const token = resolvePatFallbackToken();
   if (!token) return null;
   const client = new Octokit({ auth: token });
   attachGitHubQuotaHooks(client, 'overseer', 'user-pat');
   return client as unknown as RealGitHubOctokitLike;
 }
-
-/**
- * M-153 identity separation seam: the MERGE mutation must not run as the
- * Review Gate identity ("review and merge are separate actors", John
- * 2026-08-24). When MERGE_MANAGER_GH_TOKEN is set, merges are executed with
- * that PAT identity while reviews keep the App identity. When it is unset,
- * the merge octokit falls back to the shared resolution -- callers that
- * enforce M-153 must treat that as the single-identity condition and hold.
- */
-export const MERGE_MANAGER_GH_TOKEN_ENV = 'MERGE_MANAGER_GH_TOKEN' as const;
 
 export function hasDistinctMergeIdentity(): boolean {
   return resolveServiceGitHubAuth('merge_manager').distinct;

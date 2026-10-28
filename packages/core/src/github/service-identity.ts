@@ -1,5 +1,15 @@
 import { createPrivateKey, sign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { createLogger } from '@archon/paths';
+
+const log = createLogger('github/service-identity');
+
+/**
+ * The legacy merge-manager PAT env var name. Declared here (the single place
+ * allowed to name GitHub token env vars) so no other source file carries the
+ * bare `MERGE_MANAGER_GH_TOKEN` string. Exported for the merge-identity tests.
+ */
+export const MERGE_MANAGER_GH_TOKEN_ENV = 'MERGE_MANAGER_GH_TOKEN' as const;
 
 export type GitHubService =
   | 'overseer'
@@ -165,6 +175,25 @@ export function resolveServiceGitHubAuth(
 }
 
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
+// Single-flight: concurrent callers for the same App pool share one in-flight
+// mint instead of each firing their own installation-token request.
+const mintInFlight = new Map<string, Promise<string>>();
+// Refresh an installation token once fewer than this many ms of its ~1h life
+// remain, so a request never carries a token about to expire mid-flight.
+const TOKEN_REFRESH_SKEW_MS = 10 * 60_000;
+// Throttle the PAT-fallback warning to once per hour per service.
+const PAT_WARN_INTERVAL_MS = 60 * 60_000;
+const patWarnedAt = new Map<GitHubService, number>();
+
+function warnPatFallback(service: GitHubService, now: number): void {
+  const last = patWarnedAt.get(service);
+  if (last !== undefined && now - last < PAT_WARN_INTERVAL_MS) return;
+  patWarnedAt.set(service, now);
+  log.warn(
+    { service },
+    'github.pat_fallback_used: a long-lived PAT was used for GitHub auth; it cannot self-refresh and should be retired in favor of a GitHub App identity'
+  );
+}
 
 function base64Url(value: string | Uint8Array): string {
   return Buffer.from(value).toString('base64url');
@@ -194,12 +223,34 @@ export async function getServiceGitHubToken(
   identity: ServiceGitHubAuth,
   options: { fetch?: typeof fetch; apiBaseUrl?: string; now?: () => number } = {}
 ): Promise<string> {
-  if (identity.kind === 'pat') return identity.token;
-  if (identity.kind === 'none') throw new Error('github_merge_identity_not_distinct');
   const now = (options.now ?? Date.now)();
+  if (identity.kind === 'pat') {
+    warnPatFallback(identity.service, now);
+    return identity.token;
+  }
+  if (identity.kind === 'none') throw new Error('github_merge_identity_not_distinct');
   const cached = tokenCache.get(identity.poolId);
-  if (cached && cached.expiresAt - now > 5 * 60_000) return cached.token;
+  if (cached && cached.expiresAt - now > TOKEN_REFRESH_SKEW_MS) return cached.token;
 
+  // Single-flight: if a mint for this pool is already running, await it rather
+  // than launching a second installation-token request.
+  const existing = mintInFlight.get(identity.poolId);
+  if (existing) return existing;
+
+  const minting = mintInstallationToken(identity, now, options);
+  mintInFlight.set(identity.poolId, minting);
+  try {
+    return await minting;
+  } finally {
+    mintInFlight.delete(identity.poolId);
+  }
+}
+
+async function mintInstallationToken(
+  identity: GitHubAppIdentity,
+  now: number,
+  options: { fetch?: typeof fetch; apiBaseUrl?: string }
+): Promise<string> {
   const jwt = buildAppJwt(identity, now);
   const response = await (options.fetch ?? fetch)(
     `${options.apiBaseUrl ?? 'https://api.github.com'}/app/installations/${identity.installationId}/access_tokens`,
@@ -225,6 +276,47 @@ export async function getServiceGitHubToken(
 
 export function clearServiceGitHubTokenCache(): void {
   tokenCache.clear();
+  mintInFlight.clear();
+}
+
+/**
+ * Resolve and mint (or return the cached/PAT) token for a service in one call.
+ * This is the single accessor non-Octokit callers use so no file reads
+ * GH_TOKEN/GITHUB_TOKEN directly. App identities return a refreshing
+ * installation token; PAT identities return the PAT (with a throttled warning).
+ */
+export async function getGitHubTokenForService(
+  service: GitHubService,
+  env: Env = process.env
+): Promise<string> {
+  return getServiceGitHubToken(resolveServiceGitHubAuth(service, env));
+}
+
+/**
+ * The raw PAT-fallback token from the standard env vars. The ONLY place the bare
+ * GH_TOKEN/GITHUB_TOKEN env read is allowed; callers that need the legacy PAT
+ * (permission fallback, read-only required-contexts) route through here instead
+ * of reading process.env themselves. Returns '' when no PAT is configured.
+ */
+export function resolvePatFallbackToken(env: Env = process.env): string {
+  return env.GH_TOKEN ?? env.GITHUB_TOKEN ?? '';
+}
+
+/**
+ * True when a usable GitHub credential resolves for the service: an App
+ * identity, or a PAT with a non-empty token. A 'none' (held) identity, an empty
+ * PAT, or an incomplete/invalid App config all resolve to false. Used by
+ * presence checks that previously read process.env.GITHUB_TOKEN directly.
+ */
+export function hasServiceGitHubAuth(service: GitHubService, env: Env = process.env): boolean {
+  try {
+    const identity = resolveServiceGitHubAuth(service, env);
+    if (identity.kind === 'app') return true;
+    if (identity.kind === 'pat') return identity.token.trim().length > 0;
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 /** Preserve service selection and original permission fallback across a CLI shim. */

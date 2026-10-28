@@ -35,7 +35,10 @@
 import { createLogger } from '@archon/paths';
 import type { IDatabase } from '@archon/core/db/adapters/types';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
-import { githubToken } from '../dispatch/duty-officer-clock';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 
 const log = createLogger('taskmaster/escalation-delivery');
 
@@ -427,12 +430,13 @@ export function parseNextLink(linkHeader: string | null): string | null {
 }
 
 /**
- * Minimal GitHub REST helper mirroring duty-officer-clock's private githubJson
- * (kept local rather than exported from that file, which the spec limits to a
- * single githubToken() export). Reuses the shared container token accessor.
- * Takes a full URL and returns the raw Response so callers can read headers
- * (the Link header drives comment pagination). Only api.github.com URLs are
- * requested, so a Link header can never send the token to another host.
+ * Minimal GitHub REST helper mirroring duty-officer-clock's private githubJson.
+ * The token comes from the shared service-identity provider for the taskmaster
+ * identity (awaited, so an App installation token is minted and refreshed on
+ * demand) unless an explicit token is injected for tests. Takes a full URL and
+ * returns the raw Response so callers can read headers (the Link header drives
+ * comment pagination). Only api.github.com URLs are requested, so a Link header
+ * can never send the token to another host.
  */
 async function githubRequest(
   url: string,
@@ -442,7 +446,10 @@ async function githubRequest(
   if (!url.startsWith(`${GITHUB_API_ORIGIN}/`)) {
     throw new Error('taskmaster_github_url_not_api_origin');
   }
-  const token = options.token !== undefined ? options.token : githubToken();
+  const token =
+    options.token !== undefined
+      ? options.token
+      : await getServiceGitHubToken(resolveServiceGitHubAuth('taskmaster'));
   if (!token) throw new Error('taskmaster_github_token_missing');
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
@@ -527,8 +534,11 @@ function toEscalationComment(raw: unknown): EscalationIssueComment {
  */
 function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () => Promise<string> {
   let cached: { token: string | null; login: Promise<string> } | null = null;
-  return (): Promise<string> => {
-    const token = options.token !== undefined ? options.token : githubToken();
+  return async (): Promise<string> => {
+    const token =
+      options.token !== undefined
+        ? options.token
+        : await getServiceGitHubToken(resolveServiceGitHubAuth('taskmaster'));
     if (cached?.token === token) return cached.login;
     const login = (async (): Promise<string> => {
       const response = await githubRequest(`${GITHUB_API_ORIGIN}/user`, options);

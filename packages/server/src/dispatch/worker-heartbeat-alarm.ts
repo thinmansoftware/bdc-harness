@@ -7,7 +7,7 @@ import {
 } from '@archon/core/db/taskmaster';
 import { createLogger } from '@archon/paths';
 import {
-  githubToken,
+  getDutyOfficerGithubTokenOrNull,
   githubIssueInAllowList,
   parseGithubSubject,
   type DutyOfficerStaleIssue,
@@ -197,7 +197,7 @@ function parseNextLink(header: string | null): string | null {
 export async function listWorkerAlarmIssueComments(
   issue: DutyOfficerStaleIssue
 ): Promise<WorkerAlarmIssueComment[]> {
-  const token = githubToken();
+  const token = await getDutyOfficerGithubTokenOrNull();
   if (!token) throw new Error('worker_heartbeat_alarm_token_missing');
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
@@ -247,7 +247,7 @@ export async function postWorkerAlarmComment(
     log.warn({ issue }, 'worker_heartbeat_alarm_repo_refused');
     return;
   }
-  const token = githubToken();
+  const token = await getDutyOfficerGithubTokenOrNull();
   if (!token) throw new Error('worker_heartbeat_alarm_token_missing');
   const response = await fetch(
     `${GITHUB_API_ORIGIN}/repos/${encodeURIComponent(issue.owner)}/${encodeURIComponent(issue.repo)}/issues/${issue.number}/comments`,
@@ -459,7 +459,7 @@ export async function runWorkerHeartbeatAlarm(deps: WorkerHeartbeatAlarmDeps): P
     log.warn({ issue }, 'worker_heartbeat_alarm_repo_refused');
     return;
   }
-  if (!githubToken()) {
+  if (!(await getDutyOfficerGithubTokenOrNull())) {
     // Loud, not silent: without a token no comment alarm can fire.
     log.error('worker_heartbeat_alarm_no_token');
     return;

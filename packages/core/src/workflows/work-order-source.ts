@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { getGitHubTokenForService } from '../github/service-identity';
 import type { RunAuthorityPolicy } from '@archon/workflows/schemas/workflow';
 import type { FrozenSpecSource } from '@archon/workflows/reliability/run-authority';
 
@@ -136,7 +137,17 @@ async function resolveWorkOrderSource(
   }
 
   const fetcher = dependencies.fetcher ?? fetch;
-  const token = dependencies.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  let token = dependencies.githubToken;
+  if (token === undefined) {
+    // Route through the shared provider (App installation token or PAT) rather
+    // than reading process.env directly; tolerate absence so an injected test
+    // fetcher still works without any credential.
+    try {
+      token = await getGitHubTokenForService('overseer');
+    } catch {
+      token = undefined;
+    }
+  }
   if (!dependencies.fetcher && !token) {
     throw new Error('scope_authority_missing: GitHub authentication');
   }

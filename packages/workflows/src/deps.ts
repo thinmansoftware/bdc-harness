@@ -124,6 +124,13 @@ export interface WorkflowDeps {
     policy: RunAuthorityPolicy,
     userMessage: string
   ) => Promise<FrozenSpecSource>;
+  /**
+   * Resolve a GitHub token from the shared service-identity provider (App
+   * installation token or PAT), returning undefined when no credential is
+   * configured. Injected by @archon/core so the engine never reads a GitHub
+   * token from process.env. Used for persona wiki-context loading.
+   */
+  resolveGithubToken?: () => Promise<string | undefined>;
   /** Internal execution guard installed by the run-lease wrapper. */
   isRunLeaseValid?: () => boolean;
 }
