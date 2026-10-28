@@ -103,6 +103,7 @@ import {
   getPort,
 } from '@archon/core';
 import type { IPlatformAdapter } from '@archon/core';
+import { hasResolvableServiceGitHubCredential } from '@archon/core/github/service-identity';
 import {
   createLogger,
   logArchonPaths,
@@ -194,9 +195,9 @@ function envEnabled(value: string | undefined): boolean {
 }
 
 function startOverseerRuntimeWithRealMergeManager(): void {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
   const realAdapterRequested =
-    !envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) && token.length > 0;
+    !envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) &&
+    hasResolvableServiceGitHubCredential('overseer');
   if (!realAdapterRequested) {
     startOverseerRuntime();
     return;
@@ -372,7 +373,9 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     // Check that at least one platform is configured
     const hasTelegram = Boolean(process.env.TELEGRAM_BOT_TOKEN);
     const hasDiscord = Boolean(process.env.DISCORD_BOT_TOKEN);
-    const hasGitHub = Boolean(process.env.GITHUB_TOKEN && process.env.WEBHOOK_SECRET);
+    const githubWebhookSecret = process.env.WEBHOOK_SECRET;
+    const githubAuthReady = hasResolvableServiceGitHubCredential('overseer');
+    const hasGitHub = Boolean(githubWebhookSecret && githubAuthReady);
     const hasGitea = Boolean(
       process.env.GITEA_URL && process.env.GITEA_TOKEN && process.env.GITEA_WEBHOOK_SECRET
     );
@@ -383,15 +386,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     }
 
     // Initialize GitHub adapter (conditional)
-    if (process.env.GITHUB_TOKEN && process.env.WEBHOOK_SECRET) {
+    if (githubWebhookSecret && githubAuthReady) {
       const botMention =
         process.env.GITHUB_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
-      github = new GitHubAdapter(
-        process.env.GITHUB_TOKEN,
-        process.env.WEBHOOK_SECRET,
-        lockManager,
-        botMention
-      );
+      github = new GitHubAdapter('', githubWebhookSecret, lockManager, botMention, {
+        serviceAuth: 'overseer',
+      });
       await github.start();
       activePlatforms.push('GitHub');
     } else {

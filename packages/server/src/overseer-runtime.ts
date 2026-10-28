@@ -1,3 +1,4 @@
+import { hasResolvableServiceGitHubCredential } from '@archon/core/github/service-identity';
 import { createLogger } from '@archon/paths';
 import { runOverseerService } from '@archon/overseer/service';
 import type { OverseerServiceOptions, OverseerWiredAdapterKind } from '@archon/overseer/service';
@@ -66,8 +67,7 @@ function resolveAdapterKind(): OverseerAdapterKind {
   ) {
     return 'fake';
   }
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
-  return token.length > 0 ? 'real' : 'none';
+  return hasResolvableServiceGitHubCredential('overseer') ? 'real' : 'none';
 }
 
 /**

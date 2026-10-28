@@ -1,3 +1,5 @@
+import { hasResolvableServiceGitHubCredential } from '@archon/core/github/service-identity';
+
 const log: ReconcileLogger = {
   warn(fields, message) {
     console.warn('[overseer/reconcile]', message, fields);
@@ -635,13 +637,7 @@ async function hasDefaultHoldBeenNoted(input: { prRef: string; woId: string }): 
 }
 
 export function createDefaultReconcileDeps(): ReconcileDeps {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  const appConfigured = ['GITHUB_APP_', 'GITHUB_APP_OVERSEER_'].some(prefix =>
-    ['ID', 'INSTALLATION_ID', 'PRIVATE_KEY', 'PRIVATE_KEY_PATH'].some(suffix =>
-      Boolean(process.env[`${prefix}${suffix}`]?.trim())
-    )
-  );
-  if (!token && !appConfigured) {
+  if (!hasResolvableServiceGitHubCredential('overseer')) {
     return {
       readCursor: async () => null,
       searchMergedPullRequests: async (): Promise<ReconcileMergedPullRequest[]> => {

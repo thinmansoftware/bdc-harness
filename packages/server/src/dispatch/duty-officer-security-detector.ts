@@ -204,7 +204,8 @@ export async function mintAppInstallationToken(signal: AbortSignal): Promise<str
   if (identity.kind !== 'app') return null;
   // Abort before a cached installation token can be returned.
   signal.throwIfAborted();
-  const fetchWithSignal: typeof fetch = (input, init) => fetch(input, { ...init, signal });
+  const fetchWithSignal = ((input: string | URL | Request, init?: RequestInit): Promise<Response> =>
+    fetch(input, { ...init, signal })) as typeof fetch;
   return getServiceGitHubToken(identity, { fetch: fetchWithSignal });
 }
 

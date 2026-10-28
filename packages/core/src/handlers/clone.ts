@@ -17,6 +17,7 @@ import {
 } from '@archon/paths';
 import { findMarkdownFilesRecursive } from '../utils/commands';
 import { createLogger } from '@archon/paths';
+import { getServiceGitHubToken, resolveServiceGitHubAuth } from '../github/service-identity';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -243,9 +244,18 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
 
   getLog().info({ url: workingUrl, targetPath }, 'clone_started');
 
-  // Build clone command with authentication if GitHub token is available
+  // Build clone command with authentication if a GitHub credential is available.
+  // Log the original URL only; the authenticated URL contains the credential.
   let cloneUrl = workingUrl;
-  const ghToken = process.env.GH_TOKEN;
+  let ghToken = '';
+  try {
+    const identity = resolveServiceGitHubAuth('overseer');
+    if (identity.kind === 'app' || (identity.kind === 'pat' && identity.token.trim())) {
+      ghToken = await getServiceGitHubToken(identity);
+    }
+  } catch (error) {
+    if (!(error instanceof Error) || !error.message.startsWith('github_auth_missing:')) throw error;
+  }
 
   if (ghToken && workingUrl.includes('github.com')) {
     if (workingUrl.startsWith('https://github.com')) {

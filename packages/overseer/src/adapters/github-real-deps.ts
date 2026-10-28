@@ -1,7 +1,11 @@
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
-import { resolveServiceGitHubAuth, type GitHubService } from '@archon/core/github/service-identity';
+import {
+  legacyGitHubUserPat,
+  resolveServiceGitHubAuth,
+  type GitHubService,
+} from '@archon/core/github/service-identity';
 import {
   assertPersistedGitHubPoolAvailable,
   flushGitHubApiMeter,
@@ -588,15 +592,13 @@ export function createRealFetchExactHeadPullRequestEvidence(
   };
 }
 
-/** Resolve the GitHub token from the standard env vars. No fallback secrets. */
+/** Resolve a non-empty user PAT for the overseer identity. App identities are not returned here. */
 export function resolveGitHubToken(): string {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
-  if (!token) {
-    throw new Error(
-      'overseer_real_adapter_missing_github_token: set GH_TOKEN or GITHUB_TOKEN to run Overseer in real mode'
-    );
-  }
-  return token;
+  const identity = resolveServiceGitHubAuth('overseer');
+  if (identity.kind === 'pat' && identity.token.trim()) return identity.token;
+  throw new Error(
+    'overseer_real_adapter_missing_github_token: set GH_TOKEN or GITHUB_TOKEN to run Overseer in real mode'
+  );
 }
 
 /** Resolved GitHub App installation-auth configuration. */
@@ -741,7 +743,7 @@ export function resolveRealOctokitAuthOptions(): RealOctokitAuthOptions {
 /**
  * Construct a real Octokit client. Uses GitHub App installation auth when the
  * App env vars are complete (attributing API calls to thinman-overseer[bot]),
- * otherwise falls back to the GH_TOKEN/GITHUB_TOKEN PAT path unchanged.
+ * otherwise falls back to the user PAT path unchanged.
  */
 export function attachGitHubQuotaHooks(
   client: Octokit,
@@ -814,7 +816,7 @@ export function createRealOctokitClient(
  * identities, and nothing here widens what the PAT is used for.
  */
 export function createRealReadOnlyPatOctokitClient(): RealGitHubOctokitLike | null {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
+  const token = legacyGitHubUserPat();
   if (!token) return null;
   const client = new Octokit({ auth: token });
   attachGitHubQuotaHooks(client, 'overseer', 'user-pat');
@@ -824,13 +826,9 @@ export function createRealReadOnlyPatOctokitClient(): RealGitHubOctokitLike | nu
 /**
  * M-153 identity separation seam: the MERGE mutation must not run as the
  * Review Gate identity ("review and merge are separate actors", John
- * 2026-08-24). When MERGE_MANAGER_GH_TOKEN is set, merges are executed with
- * that PAT identity while reviews keep the App identity. When it is unset,
- * the merge octokit falls back to the shared resolution -- callers that
- * enforce M-153 must treat that as the single-identity condition and hold.
+ * 2026-08-24). A distinct merge identity executes merges while reviews keep
+ * their own identity. Callers that enforce M-153 hold when it is not distinct.
  */
-export const MERGE_MANAGER_GH_TOKEN_ENV = 'MERGE_MANAGER_GH_TOKEN' as const;
-
 export function hasDistinctMergeIdentity(): boolean {
   return resolveServiceGitHubAuth('merge_manager').distinct;
 }

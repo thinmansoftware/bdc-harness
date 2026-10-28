@@ -1,5 +1,6 @@
 import { createPrivateKey, sign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { createLogger } from '@archon/paths';
 
 export type GitHubService =
   | 'overseer'
@@ -164,7 +165,112 @@ export function resolveServiceGitHubAuth(
   return pat(service, token, 'user-pat', false);
 }
 
+const log = createLogger('github/service-identity');
+const TOKEN_REFRESH_WINDOW_MS = 10 * 60_000;
+const PAT_WARNING_INTERVAL_MS = 60 * 60_000;
+const CREDENTIAL_ALERT_DEDUPE_MS = 6 * 60 * 60_000;
+
+export const MERGE_MANAGER_GH_TOKEN_ENV = 'MERGE_MANAGER_GH_TOKEN' as const;
+
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
+const tokenMintInflight = new Map<string, Promise<string>>();
+const patWarningAt = new Map<string, number>();
+const credentialAlertAt = new Map<string, number>();
+
+export interface CredentialRefreshAlert {
+  service: GitHubService;
+  subjectKey: string;
+  repeatReason: 'credential_refresh_failed';
+  idempotencyKey: string;
+  body: string;
+}
+
+type CredentialAlertSink = (alert: CredentialRefreshAlert) => Promise<void>;
+
+export function legacyGitHubUserPat(env: Env = process.env): string {
+  return (env.GH_TOKEN ?? env.GITHUB_TOKEN ?? '').trim();
+}
+
+export function hasResolvableServiceGitHubCredential(
+  service: GitHubService,
+  env: Env = process.env
+): boolean {
+  try {
+    const identity = resolveServiceGitHubAuth(service, env);
+    if (identity.kind === 'app') return true;
+    if (identity.kind === 'pat') return identity.token.trim().length > 0;
+    return false;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('github_auth_missing:')) return false;
+    throw error;
+  }
+}
+
+export function credentialRefreshAlert(
+  service: GitHubService,
+  now: number = Date.now()
+): CredentialRefreshAlert {
+  const bucket = Math.floor(now / CREDENTIAL_ALERT_DEDUPE_MS);
+  return {
+    service,
+    subjectKey: `credential:${service}`,
+    repeatReason: 'credential_refresh_failed',
+    idempotencyKey: `credential:${service}:${bucket}`,
+    body: `GitHub credential refresh failed for ${service}.`,
+  };
+}
+
+async function defaultCredentialAlertSink(alert: CredentialRefreshAlert): Promise<void> {
+  const { createAuthenticatedMessage } = await import('../db/dispatch');
+  await createAuthenticatedMessage(
+    { kind: 'system', sender: 'dispatch' },
+    {
+      correlation_id: alert.idempotencyKey,
+      idempotency_key: alert.idempotencyKey,
+      task_type: 'agent_message',
+      recipient: 'operator',
+      priority: 'blocker',
+      subject_key: alert.subjectKey,
+      repeat_reason: alert.repeatReason,
+      body: alert.body,
+    }
+  );
+}
+
+let credentialAlertSink: CredentialAlertSink = defaultCredentialAlertSink;
+
+export function setGitHubCredentialAlertSinkForTests(sink: CredentialAlertSink | null): void {
+  credentialAlertSink = sink ?? defaultCredentialAlertSink;
+}
+
+export async function reportGitHubCredentialRefreshFailure(
+  service: GitHubService,
+  now: number = Date.now()
+): Promise<void> {
+  const previous = credentialAlertAt.get(service) ?? 0;
+  if (now - previous < CREDENTIAL_ALERT_DEDUPE_MS) return;
+  credentialAlertAt.set(service, now);
+  try {
+    await credentialAlertSink(credentialRefreshAlert(service, now));
+  } catch (error) {
+    log.error({ err: error, service }, 'github.credential_alert_failed');
+  }
+}
+
+function warnPatFallback(service: GitHubService, now: number): void {
+  const previous = patWarningAt.get(service) ?? 0;
+  if (now - previous < PAT_WARNING_INTERVAL_MS) return;
+  patWarningAt.set(service, now);
+  log.warn({ service }, 'github.pat_fallback');
+}
+
+export function seedServiceGitHubTokenCacheForTests(
+  poolId: string,
+  token: string,
+  expiresAt: number
+): void {
+  tokenCache.set(poolId, { token, expiresAt });
+}
 
 function base64Url(value: string | Uint8Array): string {
   return Buffer.from(value).toString('base64url');
@@ -192,14 +298,43 @@ export function buildAppJwt(identity: GitHubAppIdentity, now: number = Date.now(
 
 export async function getServiceGitHubToken(
   identity: ServiceGitHubAuth,
-  options: { fetch?: typeof fetch; apiBaseUrl?: string; now?: () => number } = {}
+  options: {
+    fetch?: typeof fetch;
+    apiBaseUrl?: string;
+    now?: () => number;
+    force?: boolean;
+  } = {}
 ): Promise<string> {
-  if (identity.kind === 'pat') return identity.token;
-  if (identity.kind === 'none') throw new Error('github_merge_identity_not_distinct');
   const now = (options.now ?? Date.now)();
-  const cached = tokenCache.get(identity.poolId);
-  if (cached && cached.expiresAt - now > 5 * 60_000) return cached.token;
+  if (identity.kind === 'pat') {
+    if (identity.token.trim()) warnPatFallback(identity.service, now);
+    return identity.token;
+  }
+  if (identity.kind === 'none') throw new Error('github_merge_identity_not_distinct');
+  if (!options.force) {
+    const cached = tokenCache.get(identity.poolId);
+    if (cached && cached.expiresAt - now > TOKEN_REFRESH_WINDOW_MS) return cached.token;
+    const pending = tokenMintInflight.get(identity.poolId);
+    if (pending) return pending;
+  }
 
+  // Store the mint promise before awaiting so concurrent callers share one flight.
+  const minting = mintInstallationToken(identity, options, now);
+  tokenMintInflight.set(identity.poolId, minting);
+  try {
+    return await minting;
+  } finally {
+    if (tokenMintInflight.get(identity.poolId) === minting) {
+      tokenMintInflight.delete(identity.poolId);
+    }
+  }
+}
+
+async function mintInstallationToken(
+  identity: GitHubAppIdentity,
+  options: { fetch?: typeof fetch; apiBaseUrl?: string },
+  now: number
+): Promise<string> {
   const jwt = buildAppJwt(identity, now);
   const response = await (options.fetch ?? fetch)(
     `${options.apiBaseUrl ?? 'https://api.github.com'}/app/installations/${identity.installationId}/access_tokens`,
@@ -213,10 +348,15 @@ export async function getServiceGitHubToken(
       },
     }
   );
-  if (!response.ok) throw new Error(`github_app_token_mint_failed:${response.status}`);
+  if (!response.ok) {
+    await reportGitHubCredentialRefreshFailure(identity.service, now);
+    throw new Error(`github_app_token_mint_failed:${response.status}`);
+  }
   const body = (await response.json()) as { token?: unknown; expires_at?: unknown };
-  if (typeof body.token !== 'string')
+  if (typeof body.token !== 'string' || !body.token) {
+    await reportGitHubCredentialRefreshFailure(identity.service, now);
     throw new Error('github_app_token_mint_failed:invalid_response');
+  }
   const expiresAt =
     typeof body.expires_at === 'string' ? Date.parse(body.expires_at) : now + 55 * 60_000;
   tokenCache.set(identity.poolId, { token: body.token, expiresAt });
@@ -225,6 +365,10 @@ export async function getServiceGitHubToken(
 
 export function clearServiceGitHubTokenCache(): void {
   tokenCache.clear();
+  tokenMintInflight.clear();
+  patWarningAt.clear();
+  credentialAlertAt.clear();
+  credentialAlertSink = defaultCredentialAlertSink;
 }
 
 /** Preserve service selection and original permission fallback across a CLI shim. */

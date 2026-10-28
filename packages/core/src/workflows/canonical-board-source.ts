@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { getServiceGitHubToken, resolveServiceGitHubAuth } from '../github/service-identity';
 
 const BDC_XO_REPOSITORY = 'thinmansoftware/bdc-xo';
 const BDC_XO_BRANCH = 'main';
@@ -62,6 +63,20 @@ const approvalSchema = z
 
 type ApprovalRecord = z.infer<typeof approvalSchema>;
 
+async function overseerProviderToken(): Promise<string | undefined> {
+  try {
+    const identity = resolveServiceGitHubAuth('overseer');
+    if (identity.kind === 'pat') return identity.token.trim() || undefined;
+    if (identity.kind !== 'app') return undefined;
+    const token = await getServiceGitHubToken(identity);
+    return token || undefined;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('github_auth_missing:'))
+      return undefined;
+    throw error;
+  }
+}
+
 function githubHeaders(token: string | undefined): Record<string, string> {
   return {
     accept: 'application/vnd.github+json',
@@ -91,7 +106,7 @@ export async function freezeCanonicalBoardMotion(
     throw new Error('authority_source_invalid: noncanonical motion path');
   }
   const fetcher = dependencies.fetcher ?? fetch;
-  const token = dependencies.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  const token = dependencies.githubToken ?? (await overseerProviderToken());
   if (!dependencies.fetcher && !token) {
     throw new Error('authority_source_missing: GitHub authentication');
   }

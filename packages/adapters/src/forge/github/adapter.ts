@@ -29,6 +29,12 @@ import {
 import * as db from '@archon/core/db/conversations';
 import * as codebaseDb from '@archon/core/db/codebases';
 import { createLogger } from '@archon/paths';
+import { serviceGitHubFetch } from '@archon/core/github/request';
+import {
+  getServiceGitHubToken,
+  legacyGitHubUserPat,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 import { parseAllowedUsers as parseGitHubAllowedUsers, isGitHubUserAuthorized } from './auth';
 import { splitIntoParagraphChunks } from '../../utils/message-splitting';
 import type { WebhookEvent } from './types';
@@ -51,6 +57,7 @@ export class GitHubAdapter implements IPlatformAdapter {
   private allowedUsers: string[];
   private botMention: string;
   private lockManager: ConversationLockManager;
+  private readonly serviceAuth?: 'overseer';
   private readonly retryDelayFn: (attempt: number) => number;
 
   constructor(
@@ -58,9 +65,20 @@ export class GitHubAdapter implements IPlatformAdapter {
     webhookSecret: string,
     lockManager: ConversationLockManager,
     botMention?: string,
-    options?: { retryDelayMs?: (attempt: number) => number }
+    options?: { retryDelayMs?: (attempt: number) => number; serviceAuth?: 'overseer' }
   ) {
-    this.octokit = new Octokit({ auth: token });
+    this.serviceAuth = options?.serviceAuth;
+    this.octokit =
+      options?.serviceAuth === 'overseer'
+        ? new Octokit({
+            request: {
+              fetch: (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+                const url = input instanceof Request ? input.url : input;
+                return serviceGitHubFetch({ service: 'overseer', url, init });
+              },
+            },
+          })
+        : new Octokit({ auth: token });
     this.webhookSecret = webhookSecret;
     this.lockManager = lockManager;
     this.botMention = botMention ?? 'Archon';
@@ -484,7 +502,7 @@ export class GitHubAdapter implements IPlatformAdapter {
 
     // Directory doesn't exist - clone the repository
     getLog().info({ owner, repo, repoPath }, 'github.repo_cloning');
-    const ghToken = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+    const ghToken = await this.cloneAuthToken();
     const repoUrl = `https://github.com/${owner}/${repo}.git`;
 
     const cloneResult = await cloneRepository(
@@ -514,6 +532,16 @@ export class GitHubAdapter implements IPlatformAdapter {
     }
 
     await addSafeDirectory(toRepoPath(repoPath));
+  }
+
+  private async cloneAuthToken(): Promise<string | undefined> {
+    if (this.serviceAuth === 'overseer') {
+      const identity = resolveServiceGitHubAuth('overseer');
+      const token = (await getServiceGitHubToken(identity)).trim();
+      return token || undefined;
+    }
+    const legacy = legacyGitHubUserPat();
+    return legacy || undefined;
   }
 
   /**

@@ -3395,6 +3395,16 @@ describe('normalizeDispatchSubjectKey', () => {
     expect(normalizeDispatchSubjectKey('digest:2026-08-25')).toBe('digest:2026-08-25');
   });
 
+  test('accepts credential subject keys', () => {
+    expect(normalizeDispatchSubjectKey('credential:taskmaster')).toBe('credential:taskmaster');
+  });
+
+  test('rejects credential keys that contain a slash', () => {
+    expect(() => normalizeDispatchSubjectKey('credential:has/slash')).toThrow(
+      'dispatch_subject_key_invalid:shape'
+    );
+  });
+
   test('rejects malformed digest and garbage shapes', () => {
     expect(() => normalizeDispatchSubjectKey('digest:2026-8-25')).toThrow(
       'dispatch_subject_key_invalid:shape'

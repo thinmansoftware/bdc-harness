@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { getServiceGitHubToken, resolveServiceGitHubAuth } from '../github/service-identity';
 import type { RunAuthorityPolicy } from '@archon/workflows/schemas/workflow';
 import type { FrozenSpecSource } from '@archon/workflows/reliability/run-authority';
 
@@ -12,6 +13,20 @@ export interface ExpectedSpecIdentity {
   readonly specSource: string;
   readonly specRevision: string;
   readonly specHash: string;
+}
+
+async function overseerProviderToken(): Promise<string | undefined> {
+  try {
+    const identity = resolveServiceGitHubAuth('overseer');
+    if (identity.kind === 'pat') return identity.token.trim() || undefined;
+    if (identity.kind !== 'app') return undefined;
+    const token = await getServiceGitHubToken(identity);
+    return token || undefined;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('github_auth_missing:'))
+      return undefined;
+    throw error;
+  }
 }
 
 function readExpectedSpecIdentity(userMessage: string): ExpectedSpecIdentity | undefined {
@@ -136,7 +151,7 @@ async function resolveWorkOrderSource(
   }
 
   const fetcher = dependencies.fetcher ?? fetch;
-  const token = dependencies.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  const token = dependencies.githubToken ?? (await overseerProviderToken());
   if (!dependencies.fetcher && !token) {
     throw new Error('scope_authority_missing: GitHub authentication');
   }

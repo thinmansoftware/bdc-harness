@@ -260,6 +260,8 @@ export function normalizeDispatchSubjectKey(value: string): string {
   const issue = gh?.[3];
   if (owner && repo && issue)
     return `gh:${owner.toLowerCase()}/${repo.toLowerCase()}#${BigInt(issue).toString()}`;
+  const credential = /^credential:([A-Za-z0-9_.-]{1,64})$/.exec(value);
+  if (credential) return `credential:${credential[1]}`;
   throw new Error('dispatch_subject_key_invalid:shape');
 }
 

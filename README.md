@@ -315,6 +315,7 @@ Full documentation is available at **[archon.diy](https://archon.diy)**.
 | [Deployment](https://archon.diy/deployment/) | Docker, VPS, production setup |
 | [Architecture](https://archon.diy/reference/architecture/) | System design and internals |
 | [Troubleshooting](https://archon.diy/reference/troubleshooting/) | Common issues and fixes |
+| [Credential inventory](docs/credentials-inventory.md) | GitHub App tokens, PAT fallbacks, and other harness credentials |
 
 ## Telemetry
 
