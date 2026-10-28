@@ -35,12 +35,6 @@ function createMockLogger(): MockLogger {
 
 const mockLogger = createMockLogger();
 
-// This file's mock.module('@archon/paths') is the one bun keeps when Stop 13
-// loads git tests before dag-executor.test.ts. Once that file publishes the
-// workflow logger slot, return its bridge so a later reset sees the same
-// object the workflow assertions record.
-const WORKFLOW_TEST_LOGGER_SLOT = '__archonWorkflowTestLoggerSlot';
-
 /** Mirror of @archon/paths getArchonHome (reads env at call-time) */
 function getArchonHome(): string {
   if (
@@ -53,12 +47,11 @@ function getArchonHome(): string {
   return process.env.ARCHON_HOME ?? join(homedir(), '.archon');
 }
 
+// This file's logger mock is local. It must not read another suite's global
+// logger slot: bun keeps the first mock.module, and a bridge that switches
+// identity makes later files assert against a different logger object.
 mock.module('@archon/paths', () => ({
-  createLogger: mock(() => {
-    const bag = globalThis as unknown as Record<string, { bridge?: MockLogger } | undefined>;
-    const bridge = bag[WORKFLOW_TEST_LOGGER_SLOT]?.bridge;
-    return bridge ?? mockLogger;
-  }),
+  createLogger: mock(() => mockLogger),
   getArchonWorktreesPath: () => join(getArchonHome(), 'worktrees'),
   getArchonWorkspacesPath: () => join(getArchonHome(), 'workspaces'),
   getProjectWorktreesPath: (owner: string, repo: string) =>
@@ -69,6 +62,7 @@ mock.module('@archon/paths', () => ({
 // Import modules AFTER mocking
 // ---------------------------------------------------------------------------
 import * as git from './index';
+import { createLogger } from '@archon/paths';
 
 // ============================================================================
 // Tests
@@ -137,6 +131,25 @@ describe('git utilities', () => {
         );
       } finally {
         readFileSpy.mockRestore();
+      }
+    });
+
+    test('logger stays on this file mock when a foreign logger slot is published', () => {
+      const slot = '__archonWorkflowTestLoggerSlot';
+      const bag = globalThis as unknown as Record<string, unknown>;
+      const previous = bag[slot];
+      bag[slot] = {
+        bridge: {
+          error(): void {
+            throw new Error('foreign-logger');
+          },
+        },
+      };
+      try {
+        expect(createLogger('git')).toBe(mockLogger);
+      } finally {
+        if (previous === undefined) delete bag[slot];
+        else bag[slot] = previous;
       }
     });
   });

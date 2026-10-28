@@ -3,7 +3,7 @@ import { spawn } from 'child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { execOwnedProcessGroup, setVerifiedTeardownForTests } from './exec';
+import { execOwnedProcessGroup, procStatInGroup, setVerifiedTeardownForTests } from './exec';
 
 const problems: unknown[] = [];
 const strayPids: number[] = [];
@@ -63,6 +63,20 @@ afterEach(() => {
     const pid = strayPids.pop();
     if (pid !== undefined) stopPid(pid);
   }
+});
+
+describe('procStatInGroup', () => {
+  test('a zombie with the owned pgrp still occupies the group', () => {
+    const zombieMember = '4243 (worker) Z 4242 4242 4242 0 -1';
+    expect(procStatInGroup(zombieMember, 4242)).toBe(true);
+  });
+
+  test('a live member occupies the group and an empty state does not', () => {
+    expect(procStatInGroup('7 (bash) S 1 99 99 0 -1', 99)).toBe(true);
+    expect(procStatInGroup('7 (bash) S 1 99 99 0 -1', 100)).toBe(false);
+    expect(procStatInGroup('7 (a) b) R 1 99 99', 99)).toBe(true);
+    expect(procStatInGroup('7 (bash)', 7)).toBe(false);
+  });
 });
 
 describe('execOwnedProcessGroup spawn errors', () => {
@@ -229,6 +243,47 @@ describe('execOwnedProcessGroup output bound', () => {
     } finally {
       process.off('uncaughtException', onUncaught);
       process.off('unhandledRejection', onRejection);
+    }
+  });
+
+  test('overflow that cannot end the group rejects treeSurvived, not max-buffer', async () => {
+    problems.length = 0;
+    process.on('uncaughtException', onUncaught);
+    process.on('unhandledRejection', onRejection);
+    let spawned = 0;
+    let exitCalls = 0;
+    try {
+      const err = await execOwnedProcessGroup(process.execPath, ['-e', writer], {
+        maxBuffer: 4,
+        verifiedTeardown: false,
+        onSpawn(pgid: number): void {
+          spawned = pgid;
+          remember(pgid);
+        },
+        onExit(): void {
+          exitCalls += 1;
+        },
+      }).then(
+        () => {
+          throw new Error('unverifiable overflow resolved');
+        },
+        (
+          caught: NodeJS.ErrnoException & {
+            treeSurvived?: boolean;
+            killed?: boolean;
+          }
+        ) => caught
+      );
+      expect(err.treeSurvived).toBe(true);
+      expect(err.killed).toBe(false);
+      expect(err.code).not.toBe('ERR_CHILD_PROCESS_STDIO_MAXBUFFER');
+      expect(exitCalls).toBe(0);
+      expect(spawned).toBeGreaterThan(0);
+      expect(problems).toEqual([]);
+    } finally {
+      process.off('uncaughtException', onUncaught);
+      process.off('unhandledRejection', onRejection);
+      stopPid(spawned);
     }
   });
 });

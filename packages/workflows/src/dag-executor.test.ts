@@ -15,8 +15,8 @@ const isWindows = process.platform === 'win32';
 //
 // createLogger() therefore returns one stable bridge. Method calls forward
 // to whichever test file currently owns the slot (this file by default;
-// loader.test.ts adopts the slot in its beforeEach). No production reset
-// hook is required.
+// loader.test.ts adopts the slot in its beforeEach). beforeEach rebinds the
+// live createLogger export for this file only and clears the cached logger.
 
 type WorkflowTestLogFn = (...args: unknown[]) => unknown;
 
@@ -110,6 +110,7 @@ clearRegistry();
 registerBuiltinProviders();
 
 // --- Imports (after mocks) ---
+import * as archonPaths from '@archon/paths';
 import {
   buildTopologicalLayers,
   checkTriggerRule,
@@ -121,7 +122,7 @@ import {
   resolveBunRuntimeExecutable,
   resetDagExecutorLoggerForTests,
 } from './dag-executor';
-// Drop a logger cached by an earlier file in this bun process (Stop 13).
+// Drop a logger cached while this file was loading, before beforeEach rebinds it.
 resetDagExecutorLoggerForTests();
 import { loadMcpConfig } from '@archon/providers/claude/provider';
 import { resolveLoopIterationIdleTimeoutMs } from './utils/idle-timeout';
@@ -347,6 +348,10 @@ function mockBashExecWithScriptCapture(
 // mock.module registrations.
 beforeEach(() => {
   workflowTestLoggerSlot.current = asWorkflowTestLogger(mockLogger);
+  // Rebind only for this file. Git's paths mock is process-global when Stop 13
+  // loads that file first; do not make that mock forward a shared logger slot.
+  spyOn(archonPaths, 'createLogger').mockImplementation(() => workflowTestLoggerSlot.bridge);
+  resetDagExecutorLoggerForTests();
 });
 
 afterEach(() => {

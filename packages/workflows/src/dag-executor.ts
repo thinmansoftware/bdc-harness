@@ -244,10 +244,8 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 /**
- * Test seam. Stop 13 loads git tests, then repair-holder tests, then this
- * module's tests in one process. The earlier file caches whatever logger
- * createLogger returned before the workflow slot existed. Clearing it lets
- * the next call bind the slot bridge.
+ * Test seam. Clears the cached workflow logger so the next call uses the
+ * createLogger binding the current test installed.
  */
 export function resetDagExecutorLoggerForTests(): void {
   cachedLog = undefined;

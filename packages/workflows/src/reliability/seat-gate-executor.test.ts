@@ -22,7 +22,17 @@ import {
 const prompts: string[] = [];
 const warnings: Array<{ obj: Record<string, unknown>; msg: string }> = [];
 const alerts: CreateAuthenticatedMessageData[] = [];
-const origChild = rootLogger.child.bind(rootLogger);
+// executor.ts caches its child on first use. Wrapping rootLogger.child here
+// misses that child when another file in this process created it first.
+// Capture the shared pino stream instead, local to this file.
+const streamSym = Object.getOwnPropertySymbols(rootLogger).find(
+  sym => sym.description === 'pino.stream'
+);
+if (!streamSym) throw new Error('pino stream symbol not found on rootLogger');
+const stream = (rootLogger as unknown as Record<symbol, { write: (chunk: string) => boolean }>)[
+  streamSym
+];
+const origWrite = stream.write.bind(stream);
 
 function reading(seat: SeatReading['seat'], windowName: string, used: number): SeatReading {
   return {
@@ -122,21 +132,22 @@ beforeEach(() => {
     return null;
   });
   delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
-  rootLogger.child = ((bindings?: object) => {
-    const child = origChild(bindings as never);
-    const origWarn = child.warn.bind(child);
-    child.warn = ((obj: unknown, msg?: string) => {
-      if (typeof msg === 'string') {
-        warnings.push({ obj: (obj ?? {}) as Record<string, unknown>, msg });
+  stream.write = (chunk: string): boolean => {
+    for (const line of String(chunk).split(String.fromCharCode(10))) {
+      if (!line.startsWith('{')) continue;
+      try {
+        const obj = JSON.parse(line) as Record<string, unknown>;
+        if (obj.level === 40 && typeof obj.msg === 'string') warnings.push({ obj, msg: obj.msg });
+      } catch {
+        // not a log line
       }
-      return origWarn(obj as never, msg as never);
-    }) as typeof child.warn;
-    return child;
-  }) as typeof rootLogger.child;
+    }
+    return origWrite(chunk);
+  };
 });
 
 afterEach(() => {
-  rootLogger.child = origChild as typeof rootLogger.child;
+  stream.write = origWrite;
   resetSeatUsageCacheForTests();
   delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
   clearRegistry();

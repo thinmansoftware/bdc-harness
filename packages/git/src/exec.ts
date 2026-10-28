@@ -142,7 +142,24 @@ function isTerminablePid(pid: number): boolean {
   return Number.isInteger(pid) && pid > 0 && pid !== process.pid;
 }
 
-/** True when any non-zombie /proc entry has pgrp == pid. null when /proc cannot be read. */
+/**
+ * True when this /proc stat line is a process whose pgrp is `pgid`.
+ * Zombies count: T2 retires a group only when NO process still has that pgrp.
+ * An empty state is an unreadable stat line, not an empty group.
+ */
+export function procStatInGroup(stat: string, pgid: number): boolean {
+  const close = stat.lastIndexOf(')');
+  if (close < 0) return false;
+  const fields = stat
+    .slice(close + 1)
+    .trim()
+    .split(/\s+/);
+  const state = fields[0] ?? '';
+  if (state === '') return false;
+  return Number(fields[2]) === pgid;
+}
+
+/** True when any /proc entry, including zombies, has pgrp == pid. null when /proc cannot be read. */
 function liveGroupMember(pid: number): boolean | null {
   let entries: string[];
   try {
@@ -158,11 +175,7 @@ function liveGroupMember(pid: number): boolean | null {
     } catch {
       continue;
     }
-    const after = stat.slice(stat.lastIndexOf(')') + 1).trim();
-    const fields = after.split(/\s+/);
-    const state = fields[0] ?? '';
-    const pgrp = Number(fields[2]);
-    if (pgrp === pid && state !== 'Z' && state !== '') return true;
+    if (procStatInGroup(stat, pid)) return true;
   }
   return false;
 }
@@ -383,9 +396,33 @@ export async function execOwnedProcessGroup(
       void (async (): Promise<void> => {
         try {
           await endOwnedGroupForHandler(child, pid, options, verified);
-        } catch {
-          // The output-limit error still wins when the group cannot be ended.
-          // A surviving group stays recorded.
+        } catch (err) {
+          const text = snapshot();
+          // A group that survives SIGKILL is treeSurvived, not a max-buffer error.
+          if (isTreeSurvivedError(err)) {
+            finish(() => {
+              reject(
+                Object.assign(err, {
+                  pgid: pid,
+                  stdout: text.stdout,
+                  stderr: text.stderr,
+                  killed: false,
+                  treeSurvived: true,
+                })
+              );
+            });
+            return;
+          }
+          finish(() => {
+            reject(
+              Object.assign(err instanceof Error ? err : new Error(String(err)), {
+                pgid: pid,
+                stdout: text.stdout,
+                stderr: text.stderr,
+              })
+            );
+          });
+          return;
         }
         const text = snapshot();
         finish(() => {
