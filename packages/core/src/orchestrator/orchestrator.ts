@@ -277,6 +277,23 @@ async function originBranchExists(repoPath: string, branch: string): Promise<boo
 /** A Base branch value is exactly one branch name: no spaces, commas, or parentheses. */
 const SINGLE_BRANCH_NAME = /^[A-Za-z0-9._/-]+$/;
 
+/**
+ * Synchronous spec and authority refusals recorded on the parent conversation
+ * before dispatch. Must match KNOWN_SPEC_VALIDATION_PREFIXES in
+ * packages/smart-cauldron/src/fire.ts. Unnamed failures (database, isolation)
+ * are not in this list, so the conductor keeps the infrastructure path.
+ */
+const PRE_DISPATCH_SPEC_REFUSAL_PREFIXES = [
+  'base_branch_not_single:',
+  'declared_base_branch_not_found:',
+  'authority_conflict:',
+  'scope_authority_missing:',
+] as const;
+
+function isPreDispatchSpecRefusal(message: string): boolean {
+  return PRE_DISPATCH_SPEC_REFUSAL_PREFIXES.some(prefix => message.startsWith(prefix));
+}
+
 function stripEnclosingBackticks(value: string): string {
   const trimmed = value.trim();
   if (trimmed.length >= 2 && trimmed.startsWith('`') && trimmed.endsWith('`')) {
@@ -324,24 +341,21 @@ export async function dispatchBackgroundWorkflow(
     prBranch?: string;
   }
 ): Promise<void> {
-  const frozenSpecSource = workflow.run_authority?.required
-    ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage)
-    : undefined;
-
   // 1. Generate worker conversation ID
   const workerPlatformId = `web-worker-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-  const authoritySource = frozenSpecSource
-    ? { ...frozenSpecSource, dispatchId: workerPlatformId }
-    : undefined;
 
-  // Known base-branch spec-validation refusals are recorded on the parent
-  // conversation before they are rethrown. Only messages that start with
-  // base_branch_not_single: or declared_base_branch_not_found: get a marker.
-  // The conductor reads that marker and stops instead of timing out.
-  // The wrapper ends before the dispatch notification and createWorkflowRun.
+  // Spec and authority refusals, including freezeWorkOrderSource, are recorded
+  // on the parent conversation before they are rethrown. The conductor reads
+  // that marker and stops instead of timing out. The wrapper ends before the
+  // dispatch notification and createWorkflowRun.
+  let frozenSpecSource: Awaited<ReturnType<typeof freezeWorkOrderSource>> | undefined;
   let workerConv: Awaited<ReturnType<typeof db.getOrCreateConversation>>;
   let workerCwd: string;
   try {
+    frozenSpecSource = workflow.run_authority?.required
+      ? await freezeWorkOrderSource(workflow.run_authority, ctx.originalMessage)
+      : undefined;
+
     const rawDeclaredBaseBranch = frozenSpecSource
       ? extractRawDeclaredBaseBranch(frozenSpecSource.specBytes)
       : undefined;
@@ -433,10 +447,7 @@ export async function dispatchBackgroundWorkflow(
     }
   } catch (error) {
     const message = toError(error).message;
-    const isKnownSpecRefusal =
-      message.startsWith('base_branch_not_single:') ||
-      message.startsWith('declared_base_branch_not_found:');
-    if (isKnownSpecRefusal) {
+    if (isPreDispatchSpecRefusal(message)) {
       try {
         await ctx.platform.sendMessage(ctx.conversationId, `pre_dispatch_refusal: ${message}`);
       } catch (sendError) {
@@ -453,6 +464,10 @@ export async function dispatchBackgroundWorkflow(
     }
     throw error;
   }
+
+  const authoritySource = frozenSpecSource
+    ? { ...frozenSpecSource, dispatchId: workerPlatformId }
+    : undefined;
 
   // 4. Notify parent chat that workflow is dispatching
   await ctx.platform.sendMessage(

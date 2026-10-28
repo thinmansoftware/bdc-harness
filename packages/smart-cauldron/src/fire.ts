@@ -6,8 +6,10 @@
  * dispatched:true. The resulting run is discovered by the returned parent
  * conversation database id; no conversation identity is fabricated locally.
  * While that poll is empty, the parent platform conversation is read for
- * known spec-validation markers so a spec error stops the cascade immediately.
- * Only base_branch_not_single and declared_base_branch_not_found count.
+ * known spec and authority refusal markers so a spec error stops the cascade
+ * immediately. base_branch_not_single, declared_base_branch_not_found,
+ * authority_conflict, and scope_authority_missing count. Other messages,
+ * including database and worktree failures, stay on the infrastructure path.
  *
  * Secret boundary: apiBaseUrl and token come from the caller or environment.
  */
@@ -241,9 +243,13 @@ export async function fireTier(opts: FireTierOptions): Promise<FireResult> {
 
 const PRE_DISPATCH_REFUSAL_PREFIX = 'pre_dispatch_refusal:';
 
+// Must match PRE_DISPATCH_SPEC_REFUSAL_PREFIXES in
+// packages/core/src/orchestrator/orchestrator.ts.
 const KNOWN_SPEC_VALIDATION_PREFIXES = [
   'base_branch_not_single:',
   'declared_base_branch_not_found:',
+  'authority_conflict:',
+  'scope_authority_missing:',
 ] as const;
 
 function isKnownSpecValidationRefusal(refusal: string): boolean {

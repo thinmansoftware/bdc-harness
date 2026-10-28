@@ -309,6 +309,54 @@ describe('dispatchBackgroundWorkflow declared base-lane authority', () => {
     expect(sent).not.toContain('pre_dispatch_refusal:');
   });
 
+  test('authority_conflict from freeze is recorded before dispatch', async () => {
+    mockFreeze.mockImplementation(() =>
+      Promise.reject(new Error('authority_conflict: canonical spec changed since eligibility'))
+    );
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
+
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
+      /authority_conflict: canonical spec changed since eligibility/
+    );
+    expect(execFileCalls.length).toBe(0);
+    expect(mockResolve).toHaveBeenCalledTimes(0);
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).toContain(
+      'pre_dispatch_refusal: authority_conflict: canonical spec changed since eligibility'
+    );
+    expect(sent).not.toContain('Dispatching workflow');
+  });
+
+  test('scope_authority_missing from freeze is recorded before dispatch', async () => {
+    mockFreeze.mockImplementation(() =>
+      Promise.reject(new Error('scope_authority_missing: canonical spec'))
+    );
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
+
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
+      /scope_authority_missing: canonical spec/
+    );
+    expect(mockResolve).toHaveBeenCalledTimes(0);
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).toContain('pre_dispatch_refusal: scope_authority_missing: canonical spec');
+    expect(sent).not.toContain('Dispatching workflow');
+  });
+
+  test('an unnamed freeze failure is rethrown without a spec refusal marker', async () => {
+    mockFreeze.mockImplementation(() => Promise.reject(new Error('socket hang up')));
+    const platform = new MockPlatformAdapter();
+    const ctx = makeCtx({ isolationHints: undefined, platform });
+
+    await expect(dispatchBackgroundWorkflow(ctx as never, makeWorkflow())).rejects.toThrow(
+      /socket hang up/
+    );
+    const sent = platform.sendMessage.mock.calls.map(call => String(call[1])).join('\n');
+    expect(sent).not.toContain('pre_dispatch_refusal:');
+    expect(sent).not.toContain('Dispatching workflow');
+  });
+
   test('no declared base -> preserves inherited parent task hint (no ls-remote)', async () => {
     freezeWithSpec('# WO-X\n\nNo base declared here.\n');
     const ctx = makeCtx({

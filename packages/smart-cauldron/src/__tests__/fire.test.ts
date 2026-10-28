@@ -328,6 +328,86 @@ describe('fireTier atomic conversation dispatch', () => {
     expect(result.infraError ?? '').not.toContain('run discovery timeout');
   });
 
+  test('an authority_conflict marker is a spec_error, not a discovery timeout', async () => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      fetchCalls.push({ url, init });
+      if (url.endsWith('/api/codebases')) return codebasesResponse();
+      if (url.endsWith('/api/conversations')) {
+        return Response.json({
+          conversationId: 'web-parent-authority',
+          id: 'parent-db-authority',
+          dispatched: true,
+        });
+      }
+      if (url.includes('/messages')) {
+        return Response.json([
+          {
+            content:
+              'pre_dispatch_refusal: authority_conflict: canonical spec changed since eligibility',
+          },
+        ]);
+      }
+      return Response.json({ runs: [] });
+    }) as typeof globalThis.fetch;
+
+    const result = await fireTier({
+      workflowName: 'bdc-feature-development',
+      woId: 'WO-TEST-AUTHORITY',
+      project: 'bdc-harness',
+      message: buildFireMessage('WO-TEST-AUTHORITY', 'bdc-harness'),
+      apiBaseUrl: 'http://archon.test',
+      token: 'option-token',
+      discoverTimeoutMs: 5000,
+      discoverIntervalMs: 0,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.runId).toBeNull();
+    expect(result.errorClass).toBe('spec_error');
+    expect(result.infraError).toContain(
+      'authority_conflict: canonical spec changed since eligibility'
+    );
+    expect(result.infraError ?? '').not.toContain('run discovery timeout');
+  });
+
+  test('a scope_authority_missing marker is a spec_error, not a discovery timeout', async () => {
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      fetchCalls.push({ url, init });
+      if (url.endsWith('/api/codebases')) return codebasesResponse();
+      if (url.endsWith('/api/conversations')) {
+        return Response.json({
+          conversationId: 'web-parent-scope',
+          id: 'parent-db-scope',
+          dispatched: true,
+        });
+      }
+      if (url.includes('/messages')) {
+        return Response.json([
+          { content: 'pre_dispatch_refusal: scope_authority_missing: canonical spec' },
+        ]);
+      }
+      return Response.json({ runs: [] });
+    }) as typeof globalThis.fetch;
+
+    const result = await fireTier({
+      workflowName: 'bdc-feature-development',
+      woId: 'WO-TEST-SCOPE',
+      project: 'bdc-harness',
+      message: buildFireMessage('WO-TEST-SCOPE', 'bdc-harness'),
+      apiBaseUrl: 'http://archon.test',
+      token: 'option-token',
+      discoverTimeoutMs: 5000,
+      discoverIntervalMs: 0,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.errorClass).toBe('spec_error');
+    expect(result.infraError).toContain('scope_authority_missing: canonical spec');
+    expect(result.infraError ?? '').not.toContain('run discovery timeout');
+  });
+
   test('a database connection failed marker stays a discovery timeout', async () => {
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);
