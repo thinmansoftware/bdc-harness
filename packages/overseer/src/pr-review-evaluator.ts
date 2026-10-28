@@ -322,15 +322,29 @@ function decodeCappedUtf8(bytes: Uint8Array): string {
   return new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, end));
 }
 
+function neutralizeAdvisoryDelimiter(text: string): string {
+  return text.split(WO_SPEC_BLOCK_END).join(WO_SPEC_BLOCK_END_QUOTED);
+}
+
+/**
+ * Whether the advisory spec inserted into the prompt was byte-capped.
+ * Quoting the closing delimiter can grow a fetch that reported
+ * `truncated: false` past WO_SPEC_MAX_BYTES. Provenance must use this
+ * answer, not the fetch flag alone.
+ */
+export function advisorySpecWasTruncated(text: string, specTruncated: boolean): boolean {
+  return capWoSpecText(neutralizeAdvisoryDelimiter(text)).truncated || specTruncated;
+}
+
 /**
  * Neutralize a closing delimiter, then cap. Quoting can grow the text, so the
  * byte cap is applied to the text that is actually inserted.
  */
 function advisorySpecBody(text: string, specTruncated: boolean): string {
-  const neutralized = text.split(WO_SPEC_BLOCK_END).join(WO_SPEC_BLOCK_END_QUOTED);
-  const capped = capWoSpecText(neutralized);
-  const retained = capped.text;
-  return capped.truncated || specTruncated ? retained + WO_SPEC_TRUNCATION_MARKER : retained;
+  const capped = capWoSpecText(neutralizeAdvisoryDelimiter(text));
+  return advisorySpecWasTruncated(text, specTruncated)
+    ? capped.text + WO_SPEC_TRUNCATION_MARKER
+    : capped.text;
 }
 
 export function buildReviewPrompt(input: {

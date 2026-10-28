@@ -531,4 +531,19 @@ describe('buildReviewBody', () => {
     });
     expect(body.length).toBeLessThanOrEqual(60_000);
   });
+
+  test('keeps a trailing provenance line when the summary is capped', () => {
+    const provenance = `Reviewed against WO-HARNESS-FOO-01 @ ${'b'.repeat(40)}`;
+    const body = buildReviewBody(WORK, {
+      approved: false,
+      summary: `${'x'.repeat(100_000)}\n${provenance}`,
+      reviewedHeadSha: HEAD,
+    });
+    expect(body.length).toBeLessThanOrEqual(60_000);
+    expect(body.endsWith(provenance)).toBe(true);
+    const lines = body
+      .split('\n')
+      .filter(line => line.startsWith('Reviewed against ') || line.startsWith('No WO spec found'));
+    expect(lines).toEqual([provenance]);
+  });
 });

@@ -42,6 +42,7 @@ import type { IngestDeps, PriorReviewWork, PullRequestMergeability } from './pr-
 import {
   configuredReviewIdentity,
   checksAreTerminal,
+  advisorySpecWasTruncated,
   capWoSpecText,
   defaultReviewLadder,
   evaluatePullRequest,
@@ -56,7 +57,7 @@ import type {
   PrReviewResult,
   WoSpecFetch,
 } from './pr-review-evaluator';
-import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
+import { isWoSpecProvenanceLine, type ReviewerVerdict, type SubmitDeps } from './pr-review-submit';
 import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
 import {
   countPriorRemediationAttempts,
@@ -1087,7 +1088,7 @@ async function formatWoSpecProvenance(state: WoSpecProvenanceState): Promise<str
   try {
     const result = await state.fetch();
     if (result.status === 'found') {
-      const suffix = result.truncated ? ' (truncated)' : '';
+      const suffix = advisorySpecWasTruncated(result.text, result.truncated) ? ' (truncated)' : '';
       return `Reviewed against ${state.woId} @ ${result.sha}${suffix}`;
     }
     if (result.status === 'not_found') return 'No WO spec found (not found on bdc-xo main)';
@@ -1098,8 +1099,14 @@ async function formatWoSpecProvenance(state: WoSpecProvenanceState): Promise<str
 }
 
 function appendProvenance(summary: string, line: string): string {
-  if (summary.split('\n').includes(line)) return summary;
-  return summary.length > 0 ? `${summary}\n${line}` : line;
+  // Strip every line that is itself a provenance line, then append the one
+  // line this review computed. A finding may quote those prefixes on its
+  // own line; the posted body still carries exactly one.
+  const kept = summary
+    .split('\n')
+    .filter(existing => !isWoSpecProvenanceLine(existing))
+    .join('\n');
+  return kept.length > 0 ? `${kept}\n${line}` : line;
 }
 
 /**
@@ -1174,7 +1181,10 @@ export function createRealSubmitDeps(
       if (result.verdict === 'CHECKS_UNAVAILABLE') {
         return {
           approved: false,
-          summary: buildRequiredContextsBlockedSummary(result.error),
+          summary: appendProvenance(
+            buildRequiredContextsBlockedSummary(result.error),
+            await formatWoSpecProvenance(specState)
+          ),
           reviewedHeadSha: result.reviewed_head_sha,
           requiredContextsUnavailable: true,
         };
