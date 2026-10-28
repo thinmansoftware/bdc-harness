@@ -486,4 +486,49 @@ describe('execOwnedProcessGroup windows descendants', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test('an unverified windows timeout rejects as treeSurvived, never a clean timeout', async () => {
+    // The root is gone by the time the scan returns, but the scan can never
+    // prove the descendant tree empty. A non-gone teardown must reject with
+    // treeSurvived so on_timeout: skip cannot proceed past descendants that
+    // were never confirmed dead. A closed root plus an unverified scan must
+    // not report treeSurvived: false.
+    setWindowsOwnedTreeControlForTests({
+      descendants(rootPid: number): Promise<number[] | null> {
+        // Close the root, then refuse to prove the tree empty.
+        try {
+          process.kill(rootPid, 'SIGKILL');
+        } catch {
+          // The root may already be gone.
+        }
+        return new Promise(resolve => {
+          setTimeout(() => resolve(null), 50);
+        });
+      },
+      taskkill(): Promise<boolean> {
+        // The scan closes the root; taskkill itself reaches nothing.
+        return Promise.resolve(false);
+      },
+    });
+    const err = await execOwnedProcessGroup(
+      process.execPath,
+      ['-e', 'setInterval(() => {}, 1000000)'],
+      {
+        timeout: 50,
+        onSpawn(pgid: number): void {
+          remember(pgid);
+        },
+      }
+    ).then(
+      () => {
+        throw new Error('unverified windows timeout resolved');
+      },
+      (caught: Error & { killed?: boolean; treeSurvived?: boolean }) => caught
+    );
+    expect(isTreeSurvivedError(err)).toBe(true);
+    expect(err.treeSurvived).toBe(true);
+    expect(err.killed).toBe(false);
+    expect(err.message).toContain('still running');
+    expect(err.message).not.toContain('Command timed out');
+  });
 });

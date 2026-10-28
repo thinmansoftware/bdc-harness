@@ -131,23 +131,24 @@ function notifyOwnedExit(options: OwnedGroupExecOptions, pid: number): void {
  *
  * Windows processGroupExists cannot see descendants after the root exits.
  * taskkill /T /F the recorded pid and any surviving descendants, and retire
- * only when a rescan proves the tree is gone. An unverified closed root
- * stays recorded for terminal teardown.
+ * only when a rescan proves the tree is gone. Any non-gone result -- survived
+ * or unverified -- throws treeSurvived and stays recorded for terminal
+ * teardown. An unverified scan may hide live descendants, so it is never
+ * reported as a clean teardown.
  */
-async function endOwnedGroupForHandler(
-  child: { exitCode: number | null; signalCode: NodeJS.Signals | null },
-  pid: number,
-  options: OwnedGroupExecOptions
-): Promise<void> {
+async function endOwnedGroupForHandler(pid: number, options: OwnedGroupExecOptions): Promise<void> {
   if (windowsTreeActive()) {
     const status = await endWindowsOwnedTree(pid);
     if (status === 'gone') {
       notifyOwnedExit(options, pid);
       return;
     }
-    const rootClosed = child.exitCode !== null || child.signalCode !== null;
-    if (status === 'survived' || !rootClosed) throw treeSurvivedError(pid);
-    return;
+    // Only a proven-gone tree is a clean teardown. 'unverified' can conceal
+    // surviving descendants, so it must throw treeSurvived exactly like
+    // 'survived'; otherwise the timeout path would reject with
+    // treeSurvived: false and let on_timeout: skip proceed past live orphans.
+    // A treeSurvived throw leaves ownership recorded for terminal teardown.
+    throw treeSurvivedError(pid);
   }
   await endProcessGroup(pid);
   if (!processGroupExists(pid)) notifyOwnedExit(options, pid);
@@ -513,8 +514,12 @@ export async function execOwnedProcessGroup(
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
-  // Assign before the child can background a grandchild. POSIX uses the
-  // process group; Windows keeps the tree in a job after the root exits.
+  // POSIX uses the detached process group. On Windows the job captures the
+  // root and every descendant it spawns after assignment, and keeps the tree
+  // recorded after the root exits. The child is already running by the time
+  // spawn() returns, so a grandchild backgrounded in the window before this
+  // assignment can still escape the job; fully closing that race needs a
+  // CREATE_SUSPENDED spawn, which child_process.spawn does not expose.
   if (typeof child.pid === 'number') trackWindowsJob(child.pid);
 
   return new Promise<OwnedGroupExecResult>((resolve, reject) => {
@@ -625,7 +630,7 @@ export async function execOwnedProcessGroup(
       child.stderr?.destroy();
       void (async (): Promise<void> => {
         try {
-          await endOwnedGroupForHandler(child, pid, options);
+          await endOwnedGroupForHandler(pid, options);
         } catch {
           // The output-limit error still wins when the group cannot be ended.
           // A surviving group stays recorded.
@@ -672,8 +677,9 @@ export async function execOwnedProcessGroup(
             // POSIX may have a set root exit code while descendants still
             // retain pipes, so always terminate and verify the group before
             // retirement. Windows taskkills the root and any detached
-            // descendants; an unverified closed root stays recorded.
-            await endOwnedGroupForHandler(child, pid, options);
+            // descendants; any non-gone result (survived or unverified)
+            // throws treeSurvived rather than reporting a clean timeout.
+            await endOwnedGroupForHandler(pid, options);
           } catch (err) {
             const text = snapshot();
             if (isTreeSurvivedError(err)) {
