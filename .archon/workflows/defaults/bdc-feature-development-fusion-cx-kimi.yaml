@@ -3358,7 +3358,20 @@ nodes:
       fi
       if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
         REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
-        PR_URL=$(gh pr create --repo "$REPO" --head "$BR" --base "${BASE_BRANCH:-dev}" \
+        RECORDED_BASE_BRANCH="${RECORDED_BASE_BRANCH:-}"
+        ATTEMPTED_BASE="${BASE_BRANCH:-}"
+        if [ -z "$RECORDED_BASE_BRANCH" ]; then
+          echo "ERROR: recorded_base_branch_missing" >&2
+          exit 1
+        fi
+        if [ -n "$ATTEMPTED_BASE" ] && [ "$ATTEMPTED_BASE" != "$RECORDED_BASE_BRANCH" ]; then
+          echo "ERROR: base_branch_mismatch: recorded=${RECORDED_BASE_BRANCH} attempted=${ATTEMPTED_BASE}" >&2
+          exit 1
+        fi
+        if [ -z "$ATTEMPTED_BASE" ]; then
+          BASE_BRANCH="$RECORDED_BASE_BRANCH"
+        fi
+        PR_URL=$(gh pr create --repo "$REPO" --head "$BR" --base "$BASE_BRANCH" \
           --title "FALLBACK: opus-repaired build needs human review" \
           --body "FALLBACK PATH: a BLOCKED build was auto-repaired by opus-repair, but the non-interactive run could not reach a human approval gate. The repair commit is pushed here for human review instead of being stranded in the worktree. See run artifacts for the original block reason." \
           2>&1 | tail -1 || true)
@@ -4291,6 +4304,20 @@ nodes:
       else
         BASE_BRANCH=""
       fi
+      # WO-HARNESS-RUN-BRANCH-IDENTITY-01: refuse a PR whose base is not the
+      # base recorded for this run. Never retarget and never invent a default.
+      RECORDED_BASE_BRANCH="${RECORDED_BASE_BRANCH:-}"
+      if [ -z "$RECORDED_BASE_BRANCH" ]; then
+        echo "ERROR: recorded_base_branch_missing" >&2
+        exit 1
+      fi
+      if [ -n "$BASE_BRANCH" ] && [ "$BASE_BRANCH" != "$RECORDED_BASE_BRANCH" ]; then
+        echo "ERROR: base_branch_mismatch: recorded=${RECORDED_BASE_BRANCH} attempted=${BASE_BRANCH}" >&2
+        exit 1
+      fi
+      if [ -z "$BASE_BRANCH" ]; then
+        BASE_BRANCH="$RECORDED_BASE_BRANCH"
+      fi
       TITLE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$TITLE" ]; then
         TITLE="BDC feature Work Order implementation"
@@ -4353,23 +4380,61 @@ nodes:
       # reviewer via the fallback token.
       export ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1
       echo "acting_login=${ACTING_LOGIN}"
+      # existing-pr-base-guard: begin
+      # Accept an existing open PR only when its real baseRefName equals the
+      # base recorded for this run. A different or missing base is a
+      # base_branch_mismatch refusal. Never retarget.
+      lookup_open_pr() {
+        local raw
+        raw=$(gh pr list --head "$UNIQUE_BRANCH" --repo "$REPO" --state open \
+          --json url,baseRefName 2>/dev/null || true)
+        OPEN_PR_RAW="$raw" python3 -c "$(cat <<'PY'
+      import json, os, sys
+      raw = os.environ.get("OPEN_PR_RAW", "").strip()
+      if not raw:
+          raise SystemExit(0)
+      try:
+          data = json.loads(raw)
+      except Exception:
+          raise SystemExit(0)
+      if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+          raise SystemExit(0)
+      item = data[0]
+      url = item.get("url") or ""
+      base = item.get("baseRefName") or ""
+      if not url:
+          raise SystemExit(0)
+      sys.stdout.write(url + "\t" + base)
+      PY
+      )"
+      }
+      accept_open_pr_or_refuse() {
+        local row url base
+        row="$1"
+        [ -n "$row" ] || return 1
+        url=$(printf '%s' "$row" | cut -f1)
+        base=$(printf '%s' "$row" | cut -f2)
+        [ -n "$url" ] || return 1
+        if [ "$base" != "$RECORDED_BASE_BRANCH" ]; then
+          echo "ERROR: base_branch_mismatch: recorded=${RECORDED_BASE_BRANCH} attempted=${base:-<unverified>}" >&2
+          exit 1
+        fi
+        EXIST="$url"
+        return 0
+      }
       PR_OK=false
-      EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
-        --json url --jq '.[0].url // empty' 2>/dev/null || true)
-      if [ -n "$EXIST" ]; then
+      if accept_open_pr_or_refuse "$(lookup_open_pr)"; then
         echo "PR_URL=$EXIST"
         echo "PR already exists (no create needed)."
         PR_OK=true
       else
         for attempt in 1 2 3; do
-          if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" ${BASE_BRANCH:+--base "$BASE_BRANCH"} 2>&1; then
+          if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" --base "$BASE_BRANCH" 2>&1; then
             PR_OK=true
             break
           fi
           # Re-check: gh pr create may have created the PR but returned non-zero.
-          EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
-            --json url --jq '.[0].url // empty' 2>/dev/null || true)
-          if [ -n "$EXIST" ]; then
+          if accept_open_pr_or_refuse "$(lookup_open_pr)"; then
             echo "PR_URL=$EXIST"
             echo "PR created despite non-zero exit (gh CLI quirk; PR confirmed via list)."
             PR_OK=true
@@ -4379,6 +4444,7 @@ nodes:
           sleep $((attempt * 5))
         done
       fi
+      # existing-pr-base-guard: end
       if [ "$PR_OK" = "false" ]; then
         # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: gh pr create failed, but the
         # canonical branch was VERIFIED on origin at HEAD above (precondition guard
@@ -4387,7 +4453,7 @@ nodes:
         # branch + SHA survive in the run output even though the worktree is cleaned.
         echo "PR_CREATE_FAILED_BUT_BRANCH_SAFE: repo=${REPO} branch=${UNIQUE_BRANCH} sha=$(git rev-parse HEAD)" >&2
         echo "ERROR: gh pr create failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
-        echo "RECOVERY: open the PR manually -> gh pr create --repo ${REPO} --head ${UNIQUE_BRANCH} ${BASE_BRANCH:+--base ${BASE_BRANCH}}" >&2
+        echo "RECOVERY: open the PR manually -> gh pr create --repo ${REPO} --head ${UNIQUE_BRANCH} --base ${BASE_BRANCH}" >&2
         exit 1
       fi
 

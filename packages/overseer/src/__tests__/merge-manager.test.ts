@@ -602,21 +602,26 @@ describe('merge manager', () => {
 
 describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
   // These exercise defaultAssembleEvidence directly (no assembleEvidence /
-  // evidenceAssemblyDeps override) because the base-branch default lived
+  // evidenceAssemblyDeps override) because the base-branch decision lives
   // there, not in any mockable seam the other describe blocks use.
-  test('run metadata WITHOUT a base branch is held, never silently defaulted to dev', async () => {
+  const headMetadata = { head_branch: 'feat/example-thread-abc' };
+
+  test('metadata and GitHub both empty is held, never silently defaulted', async () => {
     const insertOverseerAction = mock(async () => undefined);
+    const mergePullRequest = mock(async () => ({ merged: true, sha: 'f'.repeat(40) }));
+    const emptyBaseEvidence = { ...record.prEvidence, baseBranch: '' };
     const recordWithoutBase: WatchedRunRecord = {
       ...record,
-      metadata: {},
+      metadata: { ...headMetadata },
+      prEvidence: emptyBaseEvidence,
     };
 
     const manager = createMergeManager({
       mode: 'execute',
       mutationsEnabled: true,
       insertOverseerAction,
-      findPullRequest: async () => record.prEvidence,
-      mergePullRequest: async () => ({ merged: false }),
+      findPullRequest: async () => emptyBaseEvidence,
+      mergePullRequest,
       readWorktreeHeadSha,
     });
 
@@ -630,15 +635,18 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
         result: 'base_branch_missing_in_run_metadata',
       })
     );
+    expect(mergePullRequest).not.toHaveBeenCalled();
   });
 
-  test('run metadata WITH an explicit base branch merges as before (dev)', async () => {
+  test('matching metadata and GitHub base dev merges once', async () => {
     const insertOverseerAction = mock(async () => undefined);
     const judge = mock(async input => approveReceipt(input));
     const mergePullRequest = mock(async () => ({ merged: true, sha: 'f'.repeat(40) }));
+    const info = mock(() => undefined);
     const recordWithBase: WatchedRunRecord = {
       ...record,
-      metadata: { base_branch: 'dev' },
+      metadata: { base_branch: 'dev', ...headMetadata },
+      prEvidence: { ...record.prEvidence, baseBranch: 'dev' },
     };
 
     const manager = createMergeManager({
@@ -651,7 +659,8 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
       ],
       insertOverseerAction,
       judge,
-      findPullRequest: async () => record.prEvidence,
+      log: { info, warn: mock(() => undefined) },
+      findPullRequest: async () => recordWithBase.prEvidence,
       mergePullRequest,
       readWorktreeHeadSha,
     });
@@ -661,6 +670,85 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
     expect(result.status).toBe('executed');
     expect(judge).toHaveBeenCalledTimes(1);
     expect(mergePullRequest).toHaveBeenCalledTimes(1);
+    expect(info).not.toHaveBeenCalled();
+  });
+
+  test('absent metadata base falls back to the GitHub base and logs the run id', async () => {
+    const insertOverseerAction = mock(async () => undefined);
+    const judge = mock(async input => approveReceipt(input));
+    const mergePullRequest = mock(async () => ({ merged: true, sha: 'f'.repeat(40) }));
+    const info = mock(() => undefined);
+    const githubBaseEvidence = { ...record.prEvidence, baseBranch: 'dev' };
+    const recordWithoutMetadataBase: WatchedRunRecord = {
+      ...record,
+      metadata: { ...headMetadata },
+      prEvidence: githubBaseEvidence,
+    };
+
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      insertOverseerAction,
+      judge,
+      log: { info, warn: mock(() => undefined) },
+      findPullRequest: async () => githubBaseEvidence,
+      mergePullRequest,
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(recordWithoutMetadataBase);
+
+    expect(result.status).toBe('executed');
+    expect(mergePullRequest).toHaveBeenCalledTimes(1);
+    expect(info).toHaveBeenCalled();
+    const logged = info.mock.calls.some(call => {
+      const bindings = call[0] as { runId?: string } | undefined;
+      const message = String(call[1] ?? '');
+      return (
+        bindings?.runId === record.runId &&
+        message.includes('merge_manager.base_branch_github_fallback') &&
+        message.includes(`runId=${record.runId}`)
+      );
+    });
+    expect(logged).toBe(true);
+  });
+
+  test('metadata base that disagrees with the GitHub base is refused', async () => {
+    const insertOverseerAction = mock(async () => undefined);
+    const mergePullRequest = mock(async () => ({ merged: true, sha: 'f'.repeat(40) }));
+    const githubMain = { ...record.prEvidence, baseBranch: 'main' };
+    const disagreed: WatchedRunRecord = {
+      ...record,
+      metadata: { base_branch: 'dev', ...headMetadata },
+      prEvidence: githubMain,
+    };
+
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging', 'main'],
+      insertOverseerAction,
+      findPullRequest: async () => githubMain,
+      mergePullRequest,
+      readWorktreeHeadSha,
+    });
+
+    const result = await manager(disagreed);
+
+    expect(result.status).toBe('held');
+    expect(result.reason).toBe('base_branch_mismatch');
+    expect(insertOverseerAction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'merge_denied',
+        result: 'base_branch_mismatch',
+      })
+    );
+    expect(mergePullRequest).not.toHaveBeenCalled();
   });
 
   test('a production base (main/master/release-ce) is still held by the existing regex guard, base present or not', async () => {

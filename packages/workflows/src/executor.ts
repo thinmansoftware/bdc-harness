@@ -25,6 +25,16 @@ import {
   type RunAuthorityDispatch,
   type RunAuthorityInput,
 } from './reliability/run-authority';
+import {
+  decodeGitHubContentsJson,
+  parseRepairBaseStdout,
+  parseRepairTarget,
+  PROJECT_MAP_API_PATH,
+  repairBaseCommandArgs,
+  resolveRunBranchIdentity,
+  selectProjectMapBranchEntry,
+  type RunBranchIdentity,
+} from './reliability/run-branch-identity';
 import { captureRuntimeRevisions } from './reliability/runtime-revisions';
 import { formatProbeBlock, runFireTimeProbe } from './reliability/fire-time-probe';
 import {
@@ -513,6 +523,83 @@ export async function resolveExecutorLane(opts: {
   return undefined;
 }
 
+async function readCheckoutHead(cwd: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', cwd, 'symbolic-ref', '--short', 'HEAD'], {
+      timeout: 15000,
+    });
+    const branch = stdout.trim();
+    return branch.length > 0 ? branch : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readGhStdout(args: string[]): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync('gh', args, { timeout: 15000 });
+    return stdout;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readRepairBaseRefName(prNumber: number, repo: string): Promise<string | undefined> {
+  const stdout = await readGhStdout(repairBaseCommandArgs(prNumber, repo));
+  return stdout === undefined ? undefined : parseRepairBaseStdout(stdout);
+}
+
+async function readProjectMapBranchEntry(
+  repo: string
+): Promise<{ cauldron_base?: string; base_branch?: string } | undefined> {
+  const stdout = await readGhStdout(['api', PROJECT_MAP_API_PATH]);
+  if (stdout === undefined) return undefined;
+  const decoded = decodeGitHubContentsJson(stdout);
+  return decoded === undefined ? undefined : selectProjectMapBranchEntry(decoded, repo);
+}
+
+/**
+ * Target repo for a branch-identity fetch. Prefer the workflow's target_repo.
+ * Origin lookup is optional because captureRunAuthorityInput also reads origin,
+ * and that read must not be stolen by an earlier identity fetch.
+ */
+async function targetRepoForBranchIdentity(
+  workflow: WorkflowDefinition,
+  cwd: string,
+  spec: Uint8Array,
+  allowRemoteLookup: boolean
+): Promise<string | undefined> {
+  const declared = workflow.target_repo?.trim();
+  if (declared) return declared;
+  const needsFetch = Boolean(parseRepairTarget(spec)) || !parseDeclaredBaseBranch(spec);
+  if (!needsFetch || !allowRemoteLookup) return undefined;
+  try {
+    return (await getRemoteUrl(toRepoPath(cwd))) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function loadRunBranchIdentity(
+  workflow: WorkflowDefinition,
+  cwd: string,
+  spec: Uint8Array | undefined,
+  allowRemoteLookup: boolean
+): Promise<RunBranchIdentity> {
+  if (!spec || spec.byteLength === 0) return {};
+  const targetRepo = await targetRepoForBranchIdentity(workflow, cwd, spec, allowRemoteLookup);
+  const isolationBranch = await readCheckoutHead(cwd);
+  return resolveRunBranchIdentity({
+    spec,
+    isolationBranch,
+    targetRepo,
+    readers: {
+      readRepairBase: readRepairBaseRefName,
+      readProjectMap: readProjectMapBranchEntry,
+    },
+  });
+}
+
 /**
  * Execute a complete DAG-based workflow.
  *
@@ -735,9 +822,19 @@ export async function executeWorkflow(
     }
   }
 
+  let identitySpec: Uint8Array | undefined = authoritySource?.specBytes;
+
   if (!workflowRun) {
-    // Create workflow run record
+    // Create workflow run record. Remote lookup stays off here so a later
+    // authority capture can read origin itself. The post-authority stamp
+    // fills anything this pass could not resolve.
     try {
+      const createdIdentity = await loadRunBranchIdentity(
+        workflow,
+        cwd,
+        authoritySource?.specBytes,
+        false
+      );
       workflowRun = await deps.store.createWorkflowRun({
         workflow_name: workflow.name,
         conversation_id: conversationDbId,
@@ -747,6 +844,7 @@ export async function executeWorkflow(
         metadata: {
           ...(issueContext ? { github_context: issueContext } : {}),
           ...(modelOverride ? { model_override: modelOverride } : {}),
+          ...createdIdentity,
         },
         parent_conversation_id: parentConversationId,
       });
@@ -994,6 +1092,7 @@ export async function executeWorkflow(
         effectiveAuthoritySource = { ...frozen, dispatchId: conversationId };
       }
       if (effectiveAuthoritySource) {
+        identitySpec = effectiveAuthoritySource.specBytes;
         // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): the WO's
         // declared "Base branch:" overrides the auto-detected repo default so the
         // pinned authority triple (base_branch/base_sha/run_scope_sha) AND the
@@ -1049,6 +1148,23 @@ export async function executeWorkflow(
           );
           baseBranch = existingAuthority.baseBranch;
         }
+      }
+    }
+
+    // Stamp recorded base_branch / head_branch before any node runs. Orchestrator
+    // rows already exist; merge the keys onto that JSON. Executor-created rows
+    // were stamped at insert when the spec was already frozen, and this merge
+    // covers a spec that was only frozen above. Fetch misses stay misses.
+    const stampedIdentity = await loadRunBranchIdentity(workflow, cwd, identitySpec, true);
+    const stampedMetadata: Record<string, unknown> = { ...stampedIdentity };
+    if (workflowRun && Object.keys(stampedMetadata).length > 0) {
+      const currentMetadata = workflowRun.metadata ?? {};
+      const identityChanged = Object.entries(stampedMetadata).some(
+        ([key, value]) => currentMetadata[key] !== value
+      );
+      if (identityChanged) {
+        await deps.store.updateWorkflowRun(workflowRun.id, { metadata: stampedMetadata });
+        workflowRun.metadata = { ...currentMetadata, ...stampedMetadata };
       }
     }
 
