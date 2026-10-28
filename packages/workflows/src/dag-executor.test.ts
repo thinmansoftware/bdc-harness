@@ -318,7 +318,7 @@ function mockBashExecWithScriptCapture(
   const scriptFiles: string[] = [];
   const scriptTexts: string[] = [];
   const scriptModes: string[] = [];
-  const execSpy = spyOn(git, 'execFileAsync').mockImplementation(
+  const execSpy = spyOn(git, 'execOwnedProcessGroup').mockImplementation(
     async (command: string, args: string[]) => {
       expect(command).toBe('bash');
       expect(args).toHaveLength(1);
@@ -328,7 +328,7 @@ function mockBashExecWithScriptCapture(
       scriptTexts.push(await readFile(args[0], 'utf8'));
       scriptModes.push(((await stat(args[0])).mode & 0o777).toString(8));
 
-      return { stdout, stderr };
+      return { stdout, stderr, pgid: 2147483000 };
     }
   );
 
@@ -8146,8 +8146,10 @@ describe('executeDagWorkflow -- cancel node', () => {
     );
     (store.getWorkflowRunStatus as Mock<() => Promise<string>>).mockResolvedValue('running');
     let interrupted = false;
-    (store.updateWorkflowRun as Mock<() => Promise<void>>).mockImplementation(async () => {
-      interrupted = true;
+    (
+      store.updateWorkflowRun as Mock<(id: string, updates: { status?: string }) => Promise<void>>
+    ).mockImplementation(async (_id, updates) => {
+      if (updates.status === 'interrupted') interrupted = true;
     });
     (store.getWorkflowRunStatus as Mock<() => Promise<string>>).mockImplementation(async () =>
       interrupted ? 'interrupted' : 'running'
@@ -11268,7 +11270,11 @@ describe('executeDagWorkflow -- script nodes', () => {
   });
 
   it('passes config.envVars to script subprocesses', async () => {
-    const execSpy = spyOn(git, 'execFileAsync').mockResolvedValue({ stdout: 'ok\n', stderr: '' });
+    const execSpy = spyOn(git, 'execOwnedProcessGroup').mockResolvedValue({
+      stdout: 'ok\n',
+      stderr: '',
+      pgid: 2147483000,
+    });
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();
     const workflowRun = makeWorkflowRun('script-env-run-id');
@@ -11769,7 +11775,12 @@ describe('executeDagWorkflow -- final status derivation', () => {
       minimalConfig
     );
 
-    expect(mockStore.updateWorkflowRun).not.toHaveBeenCalled();
+    const interruptedWrites = (
+      mockStore.updateWorkflowRun as Mock<
+        (id: string, updates: { status?: string }) => Promise<void>
+      >
+    ).mock.calls.filter(call => call[1]?.status === 'interrupted');
+    expect(interruptedWrites).toHaveLength(0);
     expect(mockStore.upsertRunOutcome).not.toHaveBeenCalled();
   });
 

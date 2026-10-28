@@ -17,7 +17,7 @@ import { mkdtemp, readFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { runCascade } from '../cascade.js';
-import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
+import type { CascadeDeps, PriorRunDetail, RunCascadeOptions } from '../cascade.js';
 import { classifyGateMisfire } from '../gate-misfire.js';
 import type { FireResult, PollResult, GateVerdict, CascadeRunRecord } from '../types.js';
 import { loadLadder, loadRefusedTiers } from '../ladder.js';
@@ -117,6 +117,13 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
         },
       }),
       releaseWoLock: async () => {},
+      readRunDetail: async () => ({
+        completedAt: new Date(Date.now() - 700_000).toISOString(),
+        metadata: {},
+        error: null,
+      }),
+      sleep: async () => {},
+      now: () => Date.now(),
       ...deps,
     },
   };
@@ -1334,6 +1341,223 @@ describe('wo claim + single-flight (#1546)', () => {
     expect(record.attempts[0]?.outcome).toBe('refused');
     expect(record.refusalReason?.prNumber).toBe(77);
     expect(record.refusalReason?.checkedAtTier).not.toBeNull();
+  });
+});
+
+function virtualClock(): { now: () => number; sleep: (ms: number) => Promise<void> } {
+  let t = 0;
+  return {
+    now: () => t,
+    sleep: async (ms: number) => {
+      t += ms;
+    },
+  };
+}
+
+describe('Test 4: a retry waits for the prior run teardown', () => {
+  test('fires the second tier only after the third teardown poll confirms', async () => {
+    const clock = virtualClock();
+    let reads = 0;
+    const fireAtRead: number[] = [];
+    const deps: CascadeDeps = {
+      readRunDetail: async () => {
+        reads += 1;
+        if (reads >= 3) {
+          return {
+            completedAt: '2026-10-27T00:00:00.000Z',
+            metadata: { teardown_confirmed_at: '2026-10-27T00:00:01.000Z' },
+            error: null,
+          };
+        }
+        return {
+          completedAt: '2026-10-27T00:00:00.000Z',
+          metadata: {},
+          error: null,
+        };
+      },
+      sleep: clock.sleep,
+      now: clock.now,
+      fire: async () => {
+        fireAtRead.push(reads);
+        return makeFireOk(`run-${fireAtRead.length}`);
+      },
+      poll: async () => makePollResult(),
+      judge: () =>
+        fireAtRead.length === 1 ? makeFailVerdict('needs revision') : makePassVerdict(),
+      escalate: async () => undefined,
+      writeRecord: async () => {},
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fireAtRead).toEqual([0, 3]);
+    expect(record.status).toBe('won');
+    expect(record.attempts).toHaveLength(2);
+  });
+
+  test('blocks with teardown_unconfirmed when the key never appears', async () => {
+    const clock = virtualClock();
+    let fires = 0;
+    const reasons: string[] = [];
+    const deps: CascadeDeps = {
+      readRunDetail: async () => ({
+        completedAt: '2026-10-27T00:00:00.000Z',
+        metadata: {},
+        error: null,
+      }),
+      sleep: clock.sleep,
+      now: clock.now,
+      fire: async () => {
+        fires += 1;
+        return makeFireOk(`run-${fires}`);
+      },
+      poll: async () => makePollResult({ terminalStatus: 'failed' }),
+      judge: () => makeFailVerdict('needs revision'),
+      escalate: async ctx => {
+        reasons.push(ctx.reason);
+      },
+      writeRecord: async () => {},
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fires).toBe(1);
+    expect(record.status).toBe('blocked');
+    expect(record.attempts[1]?.gateFailReason).toBe('teardown_unconfirmed');
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toContain('teardown_unconfirmed');
+  });
+
+  test('blocks with teardown_unconfirmed when teardown_survivors is present', async () => {
+    const clock = virtualClock();
+    let fires = 0;
+    const reasons: string[] = [];
+    const deps: CascadeDeps = {
+      readRunDetail: async () => ({
+        completedAt: '2026-10-27T00:00:00.000Z',
+        metadata: { teardown_survivors: [{ pid: 9, comm: 'sleep' }] },
+        error: null,
+      }),
+      sleep: clock.sleep,
+      now: clock.now,
+      fire: async () => {
+        fires += 1;
+        return makeFireOk(`run-${fires}`);
+      },
+      poll: async () => makePollResult({ terminalStatus: 'failed' }),
+      judge: () => makeFailVerdict('needs revision'),
+      escalate: async ctx => {
+        reasons.push(ctx.reason);
+      },
+      writeRecord: async () => {},
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fires).toBe(1);
+    expect(record.status).toBe('blocked');
+    expect(record.attempts[1]?.gateFailReason).toBe('teardown_unconfirmed');
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toContain('teardown_unconfirmed');
+  });
+
+  test('a stalled prior-run body reaches teardown_unconfirmed by the deadline', async () => {
+    const previous = process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS;
+    process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS = '40';
+    const clock = virtualClock();
+    let fires = 0;
+    const reasons: string[] = [];
+    try {
+      const record = await runCascade(
+        baseOpts({
+          deps: {
+            readRunDetail: () => new Promise<PriorRunDetail>(() => undefined),
+            sleep: clock.sleep,
+            now: clock.now,
+            fire: async () => {
+              fires += 1;
+              return makeFireOk(`run-${fires}`);
+            },
+            poll: async () => makePollResult({ terminalStatus: 'failed' }),
+            judge: () => makeFailVerdict('needs revision'),
+            escalate: async ctx => {
+              reasons.push(ctx.reason);
+            },
+            writeRecord: async () => {},
+          },
+        })
+      );
+      expect(fires).toBe(1);
+      expect(record.status).toBe('blocked');
+      expect(record.attempts[1]?.gateFailReason).toBe('teardown_unconfirmed');
+      expect(reasons).toHaveLength(1);
+      expect(reasons[0]).toContain('teardown_unconfirmed');
+    } finally {
+      if (previous === undefined) delete process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS;
+      else process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS = previous;
+    }
+  });
+});
+
+describe('Test 8: the conductor does not escalate a failed repair checkout', () => {
+  test('terminal_cause repair_checkout_failed blocks without a second fire', async () => {
+    let fires = 0;
+    const reasons: string[] = [];
+    const deps: CascadeDeps = {
+      fire: async () => {
+        fires += 1;
+        return makeFireOk('run-repair');
+      },
+      poll: async () =>
+        makePollResult({
+          terminalStatus: 'failed',
+          rawMetadata: { terminal_cause: 'repair_checkout_failed' },
+        }),
+      judge: () => makeFailVerdict('validator needs revision'),
+      escalate: async ctx => {
+        reasons.push(ctx.reason);
+      },
+      writeRecord: async () => {},
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fires).toBe(1);
+    expect(record.status).toBe('blocked');
+    expect(record.attempts[0]?.gateFailReason).toBe('checkout_failed_no_climb');
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toContain('checkout_failed_no_climb');
+    expect(reasons[0]).toContain('run-repair');
+  });
+
+  test('repair_gate_closed checkout_failed error text blocks without a second fire', async () => {
+    let fires = 0;
+    const reasons: string[] = [];
+    const deps: CascadeDeps = {
+      fire: async () => {
+        fires += 1;
+        return makeFireOk('run-held');
+      },
+      poll: async () =>
+        makePollResult({
+          terminalStatus: 'failed',
+          rawMetadata: { error: 'repair_gate_closed: checkout_failed' },
+        }),
+      judge: () => makeFailVerdict('validator needs revision'),
+      escalate: async ctx => {
+        reasons.push(ctx.reason);
+      },
+      writeRecord: async () => {},
+    };
+
+    const record = await runCascade(baseOpts({ deps }));
+
+    expect(fires).toBe(1);
+    expect(record.status).toBe('blocked');
+    expect(record.attempts[0]?.gateFailReason).toBe('checkout_failed_no_climb');
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toContain('run-held');
+    expect(reasons[0]).toContain('repair_gate_closed: checkout_failed');
   });
 });
 

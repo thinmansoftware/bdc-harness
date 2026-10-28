@@ -9,7 +9,7 @@ import * as archonPaths from '@archon/paths';
 import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/paths';
 import { execFileAsync, getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
 import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from './schemas';
-import { executeDagWorkflow } from './dag-executor';
+import { executeDagWorkflow, endRunProcessTree } from './dag-executor';
 import { resolveModelForNode, type ModelOverride } from './model-override';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
@@ -585,6 +585,21 @@ export async function executeWorkflow(
   let dagPriorCompletedNodes: Map<string, string> | undefined;
   let workflowRun: WorkflowRun | undefined = preCreatedRun;
 
+  async function teardownBeforeTerminalStatus(run: WorkflowRun): Promise<void> {
+    try {
+      const report = await endRunProcessTree(run.id, run.working_path);
+      // confirmedAt null with an empty survivor list is still unconfirmed.
+      // Do not invent a timestamp: a group may have registered during the scan.
+      const metadata =
+        report.confirmedAt !== null && report.survivors.length === 0
+          ? { teardown_confirmed_at: report.confirmedAt }
+          : { teardown_survivors: report.survivors };
+      await deps.store.updateWorkflowRun(run.id, { metadata });
+    } catch (err) {
+      getLog().error({ err, workflowRunId: run.id }, 'workflow.teardown_before_terminal_failed');
+    }
+  }
+
   // Durable provider waits resume an exact run selected by the scheduler. Do
   // not rediscover by path: another historical failed row may exist on the same
   // worktree. The status transition is a DB compare-and-swap, so cancellation
@@ -932,6 +947,7 @@ export async function executeWorkflow(
             'workflow_event_persist_failed'
           );
         });
+      await teardownBeforeTerminalStatus(workflowRun);
       await deps.store.failWorkflowRun(workflowRun.id, reason);
       await sendCriticalMessage(
         platform,
@@ -954,6 +970,7 @@ export async function executeWorkflow(
       { err, artifactsDir, workflowRunId: workflowRun.id },
       'workflow.artifacts_dir_create_failed'
     );
+    await teardownBeforeTerminalStatus(workflowRun);
     await deps.store
       .failWorkflowRun(workflowRun.id, `Artifacts directory creation failed: ${err.message}`)
       .catch((dbErr: Error) => {
@@ -1122,6 +1139,7 @@ export async function executeWorkflow(
             'workflow_event_persist_failed'
           );
         });
+      await teardownBeforeTerminalStatus(workflowRun);
       await deps.store.failWorkflowRun(workflowRun.id, reason);
       await sendCriticalMessage(platform, conversationId, `[ ] **Workflow blocked**: ${reason}`);
       return { success: false, workflowRunId: workflowRun.id, error: reason };
@@ -1181,6 +1199,7 @@ export async function executeWorkflow(
               'workflow_event_persist_failed'
             );
           });
+        await teardownBeforeTerminalStatus(workflowRun);
         await deps.store.failWorkflowRun(workflowRun.id, detail);
         await sendCriticalMessage(
           platform,
@@ -1368,6 +1387,7 @@ export async function executeWorkflow(
 
     // Record failure in database (non-blocking - log but don't re-throw on DB error)
     try {
+      await teardownBeforeTerminalStatus(workflowRun);
       await deps.store.failWorkflowRun(workflowRun.id, err.message);
     } catch (dbError) {
       getLog().error(
@@ -1434,6 +1454,7 @@ export async function executeWorkflow(
       const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
       if (backstopStatus === 'running') {
         getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
+        await teardownBeforeTerminalStatus(workflowRun);
         await deps.store
           .failWorkflowRun(runId, 'Workflow exited without finalizing -- see logs')
           .catch((err: unknown) => {

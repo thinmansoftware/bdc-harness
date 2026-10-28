@@ -1,9 +1,9 @@
 /**
  * Tests for US-005: dependency installation (deps field) in script nodes.
  *
- * These tests mock @archon/git's execFileAsync to verify command construction
- * without actually running uv/bun, and are isolated from dag-executor.test.ts
- * to avoid mock.module() pollution.
+ * These tests mock @archon/git's execOwnedProcessGroup to verify command
+ * construction without actually running uv/bun, and are isolated from
+ * dag-executor.test.ts to avoid mock.module() pollution.
  */
 import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
 import { mkdir, rm } from 'fs/promises';
@@ -12,13 +12,24 @@ import { tmpdir } from 'os';
 
 // --- Mock @archon/git BEFORE any imports that depend on it ---
 
-const mockExecFileAsync = mock(
-  async (_cmd: string, _args: string[], _opts?: unknown) =>
-    ({ stdout: '', stderr: '' }) as { stdout: string; stderr: string }
+const mockExecOwnedProcessGroup = mock(
+  async (
+    _cmd: string,
+    _args: string[],
+    options?: { onSpawn?: (pgid: number) => void; onExit?: (pgid: number) => void }
+  ) => {
+    options?.onSpawn?.(4242);
+    options?.onExit?.(4242);
+    return { stdout: '', stderr: '', pgid: 4242 };
+  }
 );
 
 mock.module('@archon/git', () => ({
-  execFileAsync: mockExecFileAsync,
+  execFileAsync: mock(async () => ({ stdout: '', stderr: '' })),
+  execOwnedProcessGroup: mockExecOwnedProcessGroup,
+  endProcessGroup: mock(async () => undefined),
+  processGroupExists: () => false,
+  isTreeSurvivedError: () => false,
   mkdirAsync: mock(async () => undefined),
 }));
 
@@ -189,7 +200,7 @@ describe('script node deps field -- command construction', () => {
       `script-deps-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
     );
     await mkdir(testDir, { recursive: true });
-    mockExecFileAsync.mockClear();
+    mockExecOwnedProcessGroup.mockClear();
     mockSendQuery.mockClear();
     mockGetAgentProvider.mockClear();
   });
@@ -226,7 +237,7 @@ describe('script node deps field -- command construction', () => {
       minimalConfig
     );
 
-    const calls = mockExecFileAsync.mock.calls;
+    const calls = mockExecOwnedProcessGroup.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'uv');
     expect(scriptCall).toBeDefined();
     const [cmd, args] = scriptCall as [string, string[]];
@@ -265,7 +276,7 @@ describe('script node deps field -- command construction', () => {
       minimalConfig
     );
 
-    const calls = mockExecFileAsync.mock.calls;
+    const calls = mockExecOwnedProcessGroup.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'uv');
     expect(scriptCall).toBeDefined();
     const [cmd, args] = scriptCall as [string, string[]];
@@ -297,7 +308,7 @@ describe('script node deps field -- command construction', () => {
       minimalConfig
     );
 
-    const calls = mockExecFileAsync.mock.calls;
+    const calls = mockExecOwnedProcessGroup.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'uv');
     expect(scriptCall).toBeDefined();
     const [cmd, args] = scriptCall as [string, string[]];
@@ -329,7 +340,7 @@ describe('script node deps field -- command construction', () => {
       minimalConfig
     );
 
-    const calls = mockExecFileAsync.mock.calls;
+    const calls = mockExecOwnedProcessGroup.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === process.execPath);
     expect(scriptCall).toBeDefined();
     const [cmd, args] = scriptCall as [string, string[]];
@@ -363,7 +374,7 @@ describe('script node deps field -- command construction', () => {
       minimalConfig
     );
 
-    const calls = mockExecFileAsync.mock.calls;
+    const calls = mockExecOwnedProcessGroup.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === process.execPath);
     expect(scriptCall).toBeDefined();
     const [cmd, args] = scriptCall as [string, string[]];
@@ -401,7 +412,7 @@ describe('script node deps field -- command construction', () => {
       minimalConfig
     );
 
-    const calls = mockExecFileAsync.mock.calls;
+    const calls = mockExecOwnedProcessGroup.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'uv');
     expect(scriptCall).toBeDefined();
     const [cmd, args] = scriptCall as [string, string[]];
@@ -446,7 +457,7 @@ describe('script node deps field -- command construction', () => {
       minimalConfig
     );
 
-    const calls = mockExecFileAsync.mock.calls;
+    const calls = mockExecOwnedProcessGroup.mock.calls;
     const scriptCall = calls.find(c => (c[0] as string) === 'uv');
     expect(scriptCall).toBeDefined();
     const [cmd, args] = scriptCall as [string, string[]];

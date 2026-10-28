@@ -1,7 +1,15 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -33,14 +41,22 @@ interface RunResult {
   readonly stderr: string;
 }
 
-function bash(script: string, cwd: string, args: string[], env: Record<string, string>): RunResult {
+function bash(
+  script: string,
+  cwd: string,
+  args: string[],
+  env: Record<string, string>,
+  stripArtifacts = false
+): RunResult {
   const dir = mkdtempSync(join(tmpdir(), 'rtw-sh-'));
   const scriptPath = join(dir, 'rtw.sh');
   try {
     writeFileSync(scriptPath, script);
+    const merged: Record<string, string | undefined> = { ...process.env, ...env };
+    if (stripArtifacts) delete merged.ARTIFACTS_DIR;
     const result = Bun.spawnSync(['bash', scriptPath, ...args], {
       cwd,
-      env: { ...process.env, ...env },
+      env: merged,
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -71,6 +87,36 @@ function git(args: string[], cwd: string): string {
     throw new Error(`git ${args.join(' ')} failed: ${result.stderr.toString()}`);
   }
   return result.stdout.toString();
+}
+
+function gitStdin(args: string[], cwd: string, input: string): string {
+  const result = Bun.spawnSync(['git', ...args], {
+    cwd,
+    stdin: new TextEncoder().encode(input),
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'Test',
+      GIT_AUTHOR_EMAIL: 'test@test.com',
+      GIT_COMMITTER_NAME: 'Test',
+      GIT_COMMITTER_EMAIL: 'test@test.com',
+    },
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`git ${args.join(' ')} failed: ${result.stderr.toString()}`);
+  }
+  return result.stdout.toString();
+}
+
+function untar(tarPath: string, dest: string): void {
+  const result = Bun.spawnSync(['tar', '-C', dest, '-xf', tarPath], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(`tar extract failed: ${result.stderr.toString()}`);
+  }
 }
 
 function utcSecondsAgo(seconds: number): string {
@@ -153,13 +199,24 @@ function writeRuns(
   db.close();
 }
 
-function runCheckout(fixture: Fixture, dbPath: string): RunResult {
+function runCheckout(
+  fixture: Fixture,
+  dbPath: string,
+  extraEnv: Record<string, string> = {}
+): RunResult {
   git(['fetch', 'origin', 'refs/heads/feat/x'], fixture.caller);
   const script = `set -euo pipefail\n${RTW_CORE}\nrtw_checkout_repair_branch "$1"\n`;
-  return bash(script, fixture.caller, ['feat/x'], {
-    RTW_RUNS_DB: dbPath,
-    RTW_PROC_ROOT: fixture.procRoot,
-  });
+  return bash(
+    script,
+    fixture.caller,
+    ['feat/x'],
+    {
+      RTW_RUNS_DB: dbPath,
+      RTW_PROC_ROOT: fixture.procRoot,
+      ...extraEnv,
+    },
+    !Object.prototype.hasOwnProperty.call(extraEnv, 'ARTIFACTS_DIR')
+  );
 }
 
 function worktrees(cwd: string): string {
@@ -253,7 +310,7 @@ describe('repair-target worktree reclaim', () => {
         completed_at: utcMinutesAgo(20),
       },
     ]);
-    const result = runCheckout(fixture, fixture.dbPath);
+    const result = runCheckout(fixture, fixture.dbPath, { RTW_HOLDER_WAIT_SECONDS: '1' });
     expect(result.exitCode, show(result)).toBe(1);
     expect(result.stdout).toContain('repair_target_branch_held:');
     expect(worktrees(fixture.caller)).toContain(holder);
@@ -331,7 +388,10 @@ describe('repair-target worktree reclaim', () => {
 
   it('Test 9: idempotent checkout does not reclaim and leaves the other worktree', () => {
     expect(RTW_CORE).not.toContain('worktree prune');
-    expect(RTW_CORE).not.toContain('--force');
+    const forceLines = RTW_CORE.split('\n').filter(line =>
+      line.includes('git worktree remove --force')
+    );
+    expect(forceLines).toHaveLength(1);
     const fixture = makeFixture({ hold: false, withOther: true });
     roots.push(fixture.root);
     const other = holderPath(fixture.other);
@@ -408,7 +468,7 @@ describe('repair-target worktree reclaim', () => {
         completed_at: utcSecondsAgo(15),
       },
     ]);
-    const result = runCheckout(fixture, fixture.dbPath);
+    const result = runCheckout(fixture, fixture.dbPath, { RTW_HOLDER_WAIT_SECONDS: '1' });
     expect(result.exitCode, show(result)).toBe(1);
     expect(result.stderr).toContain('live process cwd under holder');
     expect(worktrees(fixture.caller)).toContain(holder);
@@ -431,5 +491,98 @@ describe('repair-target worktree reclaim', () => {
     expect(result.exitCode, show(result)).toBe(1);
     expect(result.stderr).toContain('worktree is dirty');
     expect(worktrees(fixture.caller)).toContain(holder);
+  }, 30000);
+
+  // Round-5 finding 1: the untracked-file backup must use NUL-delimited, literal
+  // (verbatim) names so leading/trailing whitespace and option-like filenames are
+  // not mangled by tar, and every untracked file must restore byte-for-byte before
+  // the holder is force-removed.
+  it('Round-5 #1: whitespace and option-like untracked files are preserved and restore byte-for-byte', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    const files: ReadonlyArray<{ name: string; body: string }> = [
+      { name: 'notes.txt', body: 'plain untracked body\n' },
+      { name: ' notes.txt', body: 'leading space untracked body\n' },
+      { name: '--version', body: 'option-like untracked body\n' },
+    ];
+    for (const f of files) writeFileSync(join(holder, f.name), f.body);
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'failed',
+        working_path: holder,
+        completed_at: utcMinutesAgo(20),
+      },
+    ]);
+    const artifacts = mkdtempSync(join(tmpdir(), 'rtw-art-'));
+    const scratch = mkdtempSync(join(tmpdir(), 'rtw-untar-'));
+    try {
+      const result = runCheckout(fixture, fixture.dbPath, { ARTIFACTS_DIR: artifacts });
+      if (result.exitCode !== 0) throw new Error(show(result));
+      expect(result.stdout).toContain('repair_target_worktree_reclaimed:');
+      expect(worktrees(fixture.caller)).not.toContain(holder);
+      const dest = join(artifacts, 'reclaimed-holder', 'abcd1234');
+      const tarPath = join(dest, 'untracked.tar');
+      expect(existsSync(tarPath), `expected untracked.tar at ${tarPath}`).toBe(true);
+      untar(tarPath, scratch);
+      for (const f of files) {
+        const restored = readFileSync(join(scratch, f.name));
+        expect(restored.equals(Buffer.from(f.body)), `mismatch for ${JSON.stringify(f.name)}`).toBe(
+          true
+        );
+      }
+    } finally {
+      rmSync(artifacts, { recursive: true, force: true });
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  }, 30000);
+
+  // Round-6 finding 2: an unmerged index is not recoverable from the staged/worktree
+  // binary diffs; every index stage blob and the working-tree copy must be preserved
+  // and verified restorable before the holder is force-removed.
+  it('Round-6 #2: an unmerged-index holder preserves every stage blob and working file before reclaim', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    const stages: ReadonlyArray<{ stage: number; body: string }> = [
+      { stage: 1, body: 'BASE stage content\n' },
+      { stage: 2, body: 'OURS stage content\n' },
+      { stage: 3, body: 'THEIRS stage content\n' },
+    ];
+    const shas = stages.map(s => gitStdin(['hash-object', '-w', '--stdin'], holder, s.body).trim());
+    const indexInfo = stages.map((s, i) => `100644 ${shas[i]} ${s.stage}\tconflict.txt\n`).join('');
+    gitStdin(['update-index', '--index-info'], holder, indexInfo);
+    const workBody =
+      '<<<<<<< ours\nOURS stage content\n=======\nTHEIRS stage content\n>>>>>>> theirs\n';
+    writeFileSync(join(holder, 'conflict.txt'), workBody);
+    // Confirm the fixture really produced an unmerged index.
+    expect(git(['ls-files', '-u'], holder)).toContain('conflict.txt');
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'failed',
+        working_path: holder,
+        completed_at: utcMinutesAgo(20),
+      },
+    ]);
+    const artifacts = mkdtempSync(join(tmpdir(), 'rtw-art-'));
+    try {
+      const result = runCheckout(fixture, fixture.dbPath, { ARTIFACTS_DIR: artifacts });
+      if (result.exitCode !== 0) throw new Error(show(result));
+      expect(result.stdout).toContain('repair_target_worktree_reclaimed:');
+      expect(worktrees(fixture.caller)).not.toContain(holder);
+      const dest = join(artifacts, 'reclaimed-holder', 'abcd1234');
+      expect(existsSync(join(dest, 'ls-files-u.txt'))).toBe(true);
+      for (let i = 0; i < stages.length; i++) {
+        const blobPath = join(dest, 'index-stages', `${shas[i]}.blob`);
+        expect(existsSync(blobPath), `expected stage blob ${blobPath}`).toBe(true);
+        expect(readFileSync(blobPath).equals(Buffer.from(stages[i].body))).toBe(true);
+      }
+      const savedWork = readFileSync(join(dest, 'worktree-files', 'conflict.txt'));
+      expect(savedWork.equals(Buffer.from(workBody))).toBe(true);
+    } finally {
+      rmSync(artifacts, { recursive: true, force: true });
+    }
   }, 30000);
 });

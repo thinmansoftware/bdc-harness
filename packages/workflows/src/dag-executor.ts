@@ -5,7 +5,7 @@
  * Independent nodes within the same layer run concurrently via Promise.allSettled.
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
-import { existsSync } from 'fs';
+import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'fs';
 import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { tmpdir } from 'os';
@@ -16,7 +16,13 @@ import {
   resolve as resolvePath,
   win32 as win32Path,
 } from 'path';
-import { execFileAsync } from '@archon/git';
+import {
+  execFileAsync,
+  execOwnedProcessGroup,
+  endProcessGroup,
+  isTreeSurvivedError,
+  processGroupExists,
+} from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
 import { resolveModelForNode, type ModelOverride } from './model-override';
 import type {
@@ -166,6 +172,7 @@ async function persistCancellation(
   reason: string
 ): Promise<boolean> {
   try {
+    await recordTeardownBeforeStatus(deps.store, workflowRun);
     await deps.store.cancelWorkflowRun(
       workflowRun.id,
       cancellationPersistence(workflowRun.id, reason, nodeId)
@@ -3177,6 +3184,407 @@ async function executeNodeInternal(
 /** Default timeout for subprocess nodes (bash, script): 2 minutes */
 const SUBPROCESS_DEFAULT_TIMEOUT = 120_000;
 
+interface TeardownSurvivor {
+  pid: number;
+  comm: string;
+}
+
+interface TeardownReport {
+  confirmedAt: string | null;
+  survivors: TeardownSurvivor[];
+}
+
+/** pgid plus /proc stat field 22 (starttime). A reused number fails this check. */
+interface OwnedProcessGroup {
+  pgid: number;
+  startTicks: string | null;
+}
+
+const ownedProcessGroups = new Map<string, OwnedProcessGroup[]>();
+const teardownReports = new Map<string, TeardownReport>();
+const teardownEpoch = new Map<string, number>();
+const runAbortLatches = new Set<string>();
+const nodeFailureStderr = new Map<string, string>();
+let teardownProcRoot = '/proc';
+
+/** Test seam. Production reads /proc. Reset by resetRunTeardownStateForTests. */
+export function setTeardownProcRootForTests(root: string): void {
+  teardownProcRoot = root;
+}
+
+function readProcStartTicks(pid: number): string | null {
+  if (process.platform === 'win32') return null;
+  try {
+    const stat = readFileSync(`${teardownProcRoot}/${String(pid)}/stat`, 'utf8');
+    const after = stat
+      .slice(stat.lastIndexOf(')') + 1)
+      .trim()
+      .split(/\s+/);
+    // Field 22 of /proc/<pid>/stat is the 20th field after the comm parenthesis.
+    const ticks = after[19] ?? '';
+    return /^\d+$/.test(ticks) ? ticks : null;
+  } catch {
+    return null;
+  }
+}
+
+function ownedIdentityMatches(entry: OwnedProcessGroup): 'match' | 'mismatch' | 'leader-gone' {
+  if (process.platform === 'win32') {
+    // Windows has no starttime check. onExit retires a group only after the
+    // tree is verified gone, so a dead root with live descendants stays
+    // recorded and teardown still runs taskkill /T /F.
+    return 'match';
+  }
+  if (entry.startTicks === null) return 'mismatch';
+  const current = readProcStartTicks(entry.pgid);
+  if (current === null) return 'leader-gone';
+  return current === entry.startTicks ? 'match' : 'mismatch';
+}
+
+function retireOwnedProcessGroup(runId: string, pgid: number): void {
+  const list = ownedProcessGroups.get(runId);
+  if (!list) return;
+  const next = list.filter(entry => entry.pgid !== pgid);
+  if (next.length === 0) ownedProcessGroups.delete(runId);
+  else ownedProcessGroups.set(runId, next);
+}
+
+function recordOwnedProcessGroup(runId: string, pgid: number | undefined): void {
+  if (typeof pgid !== 'number' || !Number.isInteger(pgid) || pgid <= 0) return;
+  const list = ownedProcessGroups.get(runId) ?? [];
+  if (!list.some(entry => entry.pgid === pgid)) {
+    list.push({ pgid, startTicks: readProcStartTicks(pgid) });
+    ownedProcessGroups.set(runId, list);
+  }
+  // A group that registers after a scan must not inherit that scan's confirmation.
+  // A duplicate record still bumps the epoch: the scan must not confirm over it.
+  teardownReports.delete(runId);
+  teardownEpoch.set(runId, (teardownEpoch.get(runId) ?? 0) + 1);
+}
+
+function isRunAbortLatched(runId: string): boolean {
+  return runAbortLatches.has(runId);
+}
+
+async function endRecordedGroup(
+  runId: string,
+  entry: OwnedProcessGroup
+): Promise<'ended' | 'survived' | 'retired'> {
+  const current = (ownedProcessGroups.get(runId) ?? []).find(item => item.pgid === entry.pgid);
+  if (!current) return 'retired';
+  const identity = ownedIdentityMatches(current);
+  // A different starttime means this pid was reused. Do not signal it.
+  // A missing leader is safe to signal only while its original group still
+  // has members: the pid itself is not a live process, so kill(-pgid) cannot
+  // hit a reuse. An empty group is retired with no signal.
+  if (identity === 'mismatch' || (identity === 'leader-gone' && !processGroupExists(entry.pgid))) {
+    retireOwnedProcessGroup(runId, entry.pgid);
+    return 'retired';
+  }
+  const epoch = teardownEpoch.get(runId) ?? 0;
+  try {
+    await endProcessGroup(entry.pgid);
+    // A registration during the stop keeps the newest record. Retiring here
+    // would let the next scan confirm over that registration.
+    if ((teardownEpoch.get(runId) ?? 0) === epoch) {
+      retireOwnedProcessGroup(runId, entry.pgid);
+    }
+    return 'ended';
+  } catch (err) {
+    if (isTreeSurvivedError(err) || processGroupExists(entry.pgid)) return 'survived';
+    retireOwnedProcessGroup(runId, entry.pgid);
+    return 'retired';
+  }
+}
+
+/** Latch first, then end only groups whose recorded identity still matches. */
+async function abortOwnedGroups(runId: string): Promise<void> {
+  runAbortLatches.add(runId);
+  const groups = [...(ownedProcessGroups.get(runId) ?? [])];
+  await Promise.all(groups.map(entry => endRecordedGroup(runId, entry)));
+}
+
+/**
+ * Common node settlement for abort_run_on_failure.
+ * Bash and script catches abort immediately on subprocess failure. Pre-execution
+ * throws and AI/loop failures never enter those catches, so the latch also runs
+ * here, before this node's promise resolves, while sibling nodes in the layer
+ * are still in flight. A second call is safe: the latch is idempotent.
+ */
+async function abortOwnedGroupsOnFailedSettlement(
+  runId: string,
+  node: { abort_run_on_failure?: boolean },
+  output: { state: string }
+): Promise<void> {
+  if (output.state === 'failed' && node.abort_run_on_failure === true) {
+    await abortOwnedGroups(runId);
+  }
+}
+
+/** Return a layer-node result after latching abort_run_on_failure teardown. */
+async function settleLayerNode(
+  runId: string,
+  node: { id: string; abort_run_on_failure?: boolean },
+  output: NodeExecutionResult
+): Promise<{ nodeId: string; output: NodeExecutionResult }> {
+  await abortOwnedGroupsOnFailedSettlement(runId, node, output);
+  return { nodeId: node.id, output };
+}
+
+function ownedSpawnHooks(runId: string): {
+  onSpawn: (pgid: number) => void;
+  onExit: (pgid: number) => void;
+} {
+  return {
+    onSpawn(pgid: number): void {
+      recordOwnedProcessGroup(runId, pgid);
+      if (!runAbortLatches.has(runId)) return;
+      void endRecordedGroup(runId, {
+        pgid,
+        startTicks: readProcStartTicks(pgid),
+      }).catch(() => {
+        // Terminal teardown reports a survivor if this group is still present.
+      });
+    },
+    onExit(pgid: number): void {
+      retireOwnedProcessGroup(runId, pgid);
+    },
+  };
+}
+
+function noteNodeStderr(runId: string, nodeId: string, stderr: string | undefined): void {
+  if (!stderr) return;
+  nodeFailureStderr.set(`${runId}:${nodeId}`, stderr);
+}
+
+function readProcComm(pid: number): string {
+  try {
+    const comm = readFileSync(`/proc/${pid}/comm`, 'utf8').replace(/[\r\n]/g, '');
+    return comm.length > 0 ? comm.slice(0, 64) : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function ancestorPids(startPid: number): Set<number> {
+  const skip = new Set<number>([1, startPid]);
+  let current = startPid;
+  for (let guard = 0; guard < 64; guard++) {
+    let stat = '';
+    try {
+      stat = readFileSync(`/proc/${current}/stat`, 'utf8');
+    } catch {
+      break;
+    }
+    const after = stat.slice(stat.lastIndexOf(')') + 1).trim();
+    // Fields after the final ')': state, ppid, pgrp. ppid is index 1.
+    const ppid = Number(after.split(/\s+/)[1]);
+    if (!Number.isInteger(ppid) || ppid <= 0 || skip.has(ppid)) break;
+    skip.add(ppid);
+    if (ppid === 1) break;
+    current = ppid;
+  }
+  return skip;
+}
+
+function pidAlive(pid: number): boolean {
+  if (pid <= 0 || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function cwdInside(resolved: string, root: string): boolean {
+  const base = root.endsWith('/') ? root.slice(0, -1) : root;
+  return resolved === base || resolved.startsWith(`${base}/`);
+}
+
+function foreignCwdPids(workingPath: string, skip: Set<number>): TeardownSurvivor[] {
+  let entries: string[] = [];
+  try {
+    entries = readdirSync('/proc');
+  } catch {
+    return [];
+  }
+  let root = workingPath;
+  try {
+    root = realpathSync(workingPath);
+  } catch {
+    // Keep the stored path when it cannot be canonicalized.
+  }
+  const found: TeardownSurvivor[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    if (skip.has(pid) || pid <= 1) continue;
+    let link = '';
+    try {
+      link = readlinkSync(`/proc/${pid}/cwd`);
+    } catch {
+      continue;
+    }
+    const cleaned = link.replace(/ \(deleted\)$/, '');
+    let resolved = cleaned;
+    try {
+      resolved = realpathSync(cleaned);
+    } catch {
+      resolved = cleaned;
+    }
+    if (cwdInside(resolved, root)) {
+      found.push({ pid, comm: readProcComm(pid) });
+    }
+  }
+  return found;
+}
+
+function readProcPgrp(pid: number): number | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const after = stat.slice(stat.lastIndexOf(')') + 1).trim();
+    const pgrp = Number(after.split(/\s+/)[2]);
+    return Number.isInteger(pgrp) && pgrp > 0 ? pgrp : null;
+  } catch {
+    return null;
+  }
+}
+
+/** A cwd match is owned only when its pid or pgrp is a still-matching recorded group. */
+function verifiedOwnedPgid(pid: number, owned: Set<number>): number | null {
+  if (owned.has(pid)) return pid;
+  const pgrp = readProcPgrp(pid);
+  if (pgrp !== null && owned.has(pgrp)) return pgrp;
+  return null;
+}
+
+async function collectTeardownReport(
+  runId: string,
+  workingPath: string | null | undefined
+): Promise<TeardownReport> {
+  const survivors: TeardownSurvivor[] = [];
+  const ownedList = [...(ownedProcessGroups.get(runId) ?? [])];
+  for (const entry of ownedList) {
+    const outcome = await endRecordedGroup(runId, entry);
+    if (outcome === 'survived') {
+      survivors.push({ pid: entry.pgid, comm: readProcComm(entry.pgid) });
+    }
+  }
+  const owned = new Set(
+    (ownedProcessGroups.get(runId) ?? [])
+      .filter(entry => ownedIdentityMatches(entry) === 'match')
+      .map(entry => entry.pgid)
+  );
+  if (workingPath) {
+    const skip = ancestorPids(process.pid);
+    for (const item of foreignCwdPids(workingPath, skip)) {
+      if (survivors.some(existing => existing.pid === item.pid)) continue;
+      const pgid = verifiedOwnedPgid(item.pid, owned);
+      if (pgid === null) {
+        // Unrelated or unproven. Report it and do not signal it.
+        survivors.push(item);
+        continue;
+      }
+      if (!pidAlive(item.pid)) continue;
+      const recorded = (ownedProcessGroups.get(runId) ?? []).find(entry => entry.pgid === pgid);
+      if (!recorded) continue;
+      const outcome = await endRecordedGroup(runId, recorded);
+      if (outcome === 'survived' || pidAlive(item.pid)) {
+        survivors.push({ pid: item.pid, comm: readProcComm(item.pid) });
+      }
+    }
+  }
+  return survivors.length > 0
+    ? { confirmedAt: null, survivors }
+    : { confirmedAt: new Date().toISOString(), survivors: [] };
+}
+
+/**
+ * End every process group recorded for this run. A cwd under the worktree is
+ * signaled only when it is one of those groups (pid or pgrp). Every other cwd
+ * match is a blocker: it is reported and teardown_confirmed_at stays unset.
+ * An unconfirmed report stays cached. A confirmation does not: the abort path
+ * caches one before the terminal write, so the confirming call scans cwd again.
+ */
+export async function endRunProcessTree(
+  runId: string,
+  workingPath: string | null | undefined
+): Promise<TeardownReport> {
+  const cached = teardownReports.get(runId);
+  if (cached && (cached.confirmedAt === null || cached.survivors.length > 0)) {
+    return cached;
+  }
+  // Drop a stale confirmation before the rescan. A throw or a registration
+  // during the scan must not leave that confirmation in place.
+  if (cached) teardownReports.delete(runId);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const epoch = teardownEpoch.get(runId) ?? 0;
+    const report = await collectTeardownReport(runId, workingPath);
+    if ((teardownEpoch.get(runId) ?? 0) === epoch) {
+      teardownReports.set(runId, report);
+      return report;
+    }
+  }
+  const epoch = teardownEpoch.get(runId) ?? 0;
+  const report = await collectTeardownReport(runId, workingPath);
+  if ((teardownEpoch.get(runId) ?? 0) !== epoch) {
+    // A registration landed during the last scan. Do not cache a confirmation.
+    teardownReports.delete(runId);
+    return { confirmedAt: null, survivors: report.survivors };
+  }
+  teardownReports.set(runId, report);
+  return report;
+}
+
+/**
+ * Exactly one teardown key. confirmedAt null is unconfirmed even when the
+ * survivor list is empty: a group may have registered during the scan.
+ */
+export function teardownTerminalMetadata(
+  report: TeardownReport
+): { teardown_confirmed_at: string } | { teardown_survivors: TeardownSurvivor[] } {
+  if (report.confirmedAt !== null && report.survivors.length === 0) {
+    return { teardown_confirmed_at: report.confirmedAt };
+  }
+  return { teardown_survivors: report.survivors };
+}
+
+/** Metadata-only write. Exactly one of the two teardown keys. Never throws. */
+export async function recordTeardownBeforeStatus(
+  store: { updateWorkflowRun: WorkflowDeps['store']['updateWorkflowRun'] },
+  run: { id: string; working_path: string | null }
+): Promise<void> {
+  try {
+    const report = await endRunProcessTree(run.id, run.working_path);
+    const metadata = teardownTerminalMetadata(report);
+    await store.updateWorkflowRun(run.id, { metadata });
+  } catch (err) {
+    getLog().error({ err, workflowRunId: run.id }, 'workflow.teardown_before_terminal_failed');
+  }
+}
+
+export function resetRunTeardownStateForTests(): void {
+  ownedProcessGroups.clear();
+  teardownReports.clear();
+  teardownEpoch.clear();
+  runAbortLatches.clear();
+  nodeFailureStderr.clear();
+  teardownProcRoot = '/proc';
+}
+
+/** Test seam. Registration bumps the teardown epoch and drops a cached report. */
+export function recordOwnedProcessGroupForTests(runId: string, pgid: number): void {
+  recordOwnedProcessGroup(runId, pgid);
+}
+
+function firstRepairFailureLine(stderr: string): string | undefined {
+  for (const line of stderr.split('\n')) {
+    if (/^(repair_target_|ERROR:)/.test(line)) return line;
+  }
+  return undefined;
+}
+
 /**
  * Execute a bash (shell script) DAG node.
  * Runs the script via a temp file, captures stdout as node output.
@@ -3298,11 +3706,18 @@ async function executeBashNode(
           scriptPreparationFailed: true,
         });
       }
-      ({ stdout, stderr } = await execFileAsync('bash', [scriptFile], {
+      if (isRunAbortLatched(workflowRun.id)) {
+        return { state: 'skipped', output: '' };
+      }
+      const owned = await execOwnedProcessGroup('bash', [scriptFile], {
         cwd,
         timeout,
         env: subprocessEnv,
-      }));
+        endTreeOnTimeout: true,
+        ...ownedSpawnHooks(workflowRun.id),
+      });
+      stdout = owned.stdout;
+      stderr = owned.stderr;
     } finally {
       try {
         await unlink(scriptFile);
@@ -3437,8 +3852,22 @@ async function executeBashNode(
       stderr?: string;
       scriptFile?: string;
       scriptPreparationFailed?: boolean;
+      treeSurvived?: boolean;
+      pgid?: number;
     };
-    const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
+    noteNodeStderr(
+      workflowRun.id,
+      node.id,
+      typeof err.stderr === 'string' ? err.stderr : undefined
+    );
+    if (node.abort_run_on_failure === true) {
+      await abortOwnedGroups(workflowRun.id);
+    }
+    // treeSurvived is a failed node, never a timeout, so on_timeout: skip cannot
+    // pass over a process tree that is still running.
+    const treeSurvived = err.treeSurvived === true;
+    const isTimeout =
+      !treeSurvived && (err.killed === true || (err.message ?? '').includes('timed out'));
     const label = `Bash node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
     // user-facing branch we end up in. Spawn failures can still include
@@ -3447,6 +3876,8 @@ async function executeBashNode(
     let errorMsg: string;
     if (err.scriptPreparationFailed) {
       errorMsg = `${label} failed: unable to prepare temporary script at ${err.scriptFile ?? scriptFile}`;
+    } else if (treeSurvived) {
+      errorMsg = `${label} failed: ${err.message}`;
     } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
     } else if (err.message?.includes('ENOENT')) {
@@ -3619,6 +4050,9 @@ async function executeScriptNode(
             );
           });
 
+        if (node.abort_run_on_failure === true) {
+          await abortOwnedGroups(workflowRun.id);
+        }
         return { state: 'failed', output: '', error: errorMsg };
       }
       const scriptDef = scripts.get(finalScript);
@@ -3650,6 +4084,9 @@ async function executeScriptNode(
             );
           });
 
+        if (node.abort_run_on_failure === true) {
+          await abortOwnedGroups(workflowRun.id);
+        }
         return { state: 'failed', output: '', error: errorMsg };
       }
 
@@ -3664,11 +4101,18 @@ async function executeScriptNode(
       }
     }
 
-    const { stdout, stderr } = await execFileAsync(cmd, args, {
+    if (isRunAbortLatched(workflowRun.id)) {
+      return { state: 'skipped', output: '' };
+    }
+    const owned = await execOwnedProcessGroup(cmd, args, {
       cwd,
       timeout,
       env: subprocessEnv,
+      endTreeOnTimeout: true,
+      ...ownedSpawnHooks(workflowRun.id),
     });
+    const stdout = owned.stdout;
+    const stderr = owned.stderr;
 
     // Trim trailing newline from stdout (common shell behavior)
     const output = stdout.replace(/\n$/, '');
@@ -3787,15 +4231,35 @@ async function executeScriptNode(
 
     return { state: 'completed', output };
   } catch (error) {
-    const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
-    const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
+    const err = error as Error & {
+      killed?: boolean;
+      code?: number | string;
+      stderr?: string;
+      treeSurvived?: boolean;
+      pgid?: number;
+    };
+    noteNodeStderr(
+      workflowRun.id,
+      node.id,
+      typeof err.stderr === 'string' ? err.stderr : undefined
+    );
+    if (node.abort_run_on_failure === true) {
+      await abortOwnedGroups(workflowRun.id);
+    }
+    // treeSurvived is a failed node, never a timeout, so on_timeout: skip cannot
+    // pass over a process tree that is still running.
+    const treeSurvived = err.treeSurvived === true;
+    const isTimeout =
+      !treeSurvived && (err.killed === true || (err.message ?? '').includes('timed out'));
     const label = `Script node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
     // user-facing branch we end up in -- the timeout message also contains the
     // full `Command failed: bun -e <body>` line and would otherwise leak.
     const formatted = formatSubprocessFailure(err, label);
     let errorMsg: string;
-    if (isTimeout) {
+    if (treeSurvived) {
+      errorMsg = `${label} failed: ${err.message}`;
+    } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
     } else if (err.message?.includes('ENOENT')) {
       errorMsg = `${label} failed: '${cmd}' executable not found in PATH`;
@@ -5539,6 +6003,8 @@ async function executeDagWorkflowInternal(
   };
   const layers = buildTopologicalLayers(workflow.nodes);
   const nodeOutputs = new Map<string, NodeOutput>();
+  let repairCheckoutAbort = false;
+  let repairFailureReason: string | undefined;
 
   // Pre-populate nodeOutputs from prior run so already-completed nodes are
   // treated as done for trigger-rule and $nodeId.output substitution purposes.
@@ -5806,7 +6272,7 @@ async function executeDagWorkflowInternal(
           // 3. Engine-side evidence node -- facts are collected mechanically, never by AI.
           if (isEvidenceNode(node)) {
             const output = await executeEvidenceNode(deps, cwd, workflowRun, node, artifactsDir);
-            return { nodeId: node.id, output };
+            return await settleLayerNode(workflowRun.id, node, output);
           }
 
           // 3a. Bash node dispatch -- no AI, no session
@@ -5827,7 +6293,7 @@ async function executeDagWorkflowInternal(
               config.envVars,
               resolvedInputs
             );
-            return { nodeId: node.id, output };
+            return await settleLayerNode(workflowRun.id, node, output);
           }
 
           // 3b. Loop node dispatch -- manages its own AI sessions and iteration
@@ -5978,7 +6444,7 @@ async function executeDagWorkflowInternal(
               );
             }
 
-            return { nodeId: node.id, output };
+            return await settleLayerNode(workflowRun.id, node, output);
           }
 
           // 3c. Approval node dispatch -- pauses workflow for human review
@@ -6004,7 +6470,7 @@ async function executeDagWorkflowInternal(
               issueContext,
               modelOverride
             );
-            return { nodeId: node.id, output };
+            return await settleLayerNode(workflowRun.id, node, output);
           }
 
           // 3d. Cancel node dispatch -- terminates the workflow run
@@ -6055,7 +6521,7 @@ async function executeDagWorkflowInternal(
               issueContext,
               config.envVars
             );
-            return { nodeId: node.id, output };
+            return await settleLayerNode(workflowRun.id, node, output);
           }
 
           // 4. Resolve per-node provider/model/options
@@ -6321,7 +6787,7 @@ async function executeDagWorkflowInternal(
             );
           }
 
-          return { nodeId: node.id, output };
+          return await settleLayerNode(workflowRun.id, node, output);
         } catch (error) {
           const err = error as Error;
           // Infrastructure-class block: a persona/provider/config fault that no
@@ -6361,10 +6827,11 @@ async function executeDagWorkflowInternal(
             workflowId: workflowRun.id,
             nodeName: node.id,
           });
-          return {
-            nodeId: node.id,
-            output: { state: 'failed' as const, output: '', error: failMessage },
-          };
+          return await settleLayerNode(workflowRun.id, node, {
+            state: 'failed',
+            output: '',
+            error: failMessage,
+          });
         }
       })
     );
@@ -6408,7 +6875,18 @@ async function executeDagWorkflowInternal(
         if (output.state === 'completed' && !isParallelLayer && output.sessionId !== undefined) {
           lastSequentialSessionId = output.sessionId;
         }
-        if (output.state === 'failed') layerHadFailure = true;
+        if (output.state === 'failed') {
+          layerHadFailure = true;
+          const failedNode = workflow.nodes.find(candidate => candidate.id === nodeId);
+          if (failedNode?.abort_run_on_failure === true) {
+            repairCheckoutAbort = true;
+            const stderr = nodeFailureStderr.get(`${workflowRun.id}:${nodeId}`) ?? '';
+            const line = firstRepairFailureLine(stderr);
+            if (line !== undefined && repairFailureReason === undefined) {
+              repairFailureReason = line;
+            }
+          }
+        }
       } else {
         // Should not happen -- all errors are caught in the inner try-catch
         // Handle defensively: log the unexpected rejection
@@ -6425,6 +6903,30 @@ async function executeDagWorkflowInternal(
 
     if (layerHadFailure) {
       getLog().warn({ layerIdx, nodeCount: layer.length }, 'dag_layer_had_failures');
+    }
+
+    if (repairCheckoutAbort) {
+      for (const pending of workflow.nodes) {
+        if (nodeOutputs.has(pending.id)) continue;
+        nodeOutputs.set(pending.id, { state: 'skipped', output: '' });
+        deps.store
+          .createWorkflowEvent({
+            workflow_run_id: workflowRun.id,
+            event_type: 'node_skipped',
+            step_name: pending.id,
+            data: { reason: 'repair_checkout_failed' },
+          })
+          .catch((err: Error) => {
+            getLog().error(
+              { err, workflowRunId: workflowRun.id, eventType: 'node_skipped' },
+              'workflow_event_persist_failed'
+            );
+          });
+      }
+      // Stop in-flight owned groups before the terminal status write.
+      // The later metadata write scans cwd again before it may confirm.
+      await endRunProcessTree(workflowRun.id, workflowRun.working_path);
+      break;
     }
 
     // Check for non-running status between DAG layers (cancellation, deletion, pause)
@@ -6629,15 +7131,26 @@ async function executeDagWorkflowInternal(
       `DAG workflow '${workflow.name}' completed with no successful nodes. ` +
       'Check node conditions, trigger rules, and upstream failures.';
     const failedOutcome = await makeTerminalOutcome('failed');
+    const noSuccessCause = repairCheckoutAbort ? 'repair_checkout_failed' : 'no_successful_nodes';
+    await recordTeardownBeforeStatus(deps.store, workflowRun);
     try {
       await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
         outcome: failedOutcome,
         updatedAt: new Date().toISOString(),
-        metadata: { node_counts: nodeCounts, terminal_cause: 'no_successful_nodes' },
+        metadata: {
+          node_counts: nodeCounts,
+          terminal_cause: noSuccessCause,
+          ...(repairCheckoutAbort && repairFailureReason
+            ? { repair_failure_reason: repairFailureReason }
+            : {}),
+        },
         eventData: {
           error: failMsg,
           node_counts: nodeCounts,
-          terminal_cause: 'no_successful_nodes',
+          terminal_cause: noSuccessCause,
+          ...(repairCheckoutAbort && repairFailureReason
+            ? { repair_failure_reason: repairFailureReason }
+            : {}),
         },
       });
     } catch (dbErr) {
@@ -6683,13 +7196,19 @@ async function executeDagWorkflowInternal(
       .filter(([, o]) => o.state === 'failed')
       .map(([id]) => id);
     const allFailuresArePaperwork = failedNodeIds.every(id => isPaperworkNode(id));
-    if (!hasMechanicalEvidenceNode && allFailuresArePaperwork && pushArtifactPresent) {
+    if (
+      !repairCheckoutAbort &&
+      !hasMechanicalEvidenceNode &&
+      allFailuresArePaperwork &&
+      pushArtifactPresent
+    ) {
       getLog().warn(
         { workflowRunId: workflowRun.id, degradedPaperworkNodes: failedNodeIds },
         'dag.workflow_completed_paperwork_degraded'
       );
       const degradedDuration = Date.now() - dagStartTime;
       const degradedOutcome = await makeTerminalOutcome('completed');
+      await recordTeardownBeforeStatus(deps.store, workflowRun);
       try {
         await deps.store.completeWorkflowRun(
           workflowRun.id,
@@ -6753,20 +7272,28 @@ async function executeDagWorkflowInternal(
       .join('; ');
     const failMsg = `DAG workflow '${workflow.name}' completed with failures: ${failedNodes}`;
     const failedOutcome = await makeTerminalOutcome('failed');
+    const failureCause = repairCheckoutAbort ? 'repair_checkout_failed' : 'node_failures';
+    await recordTeardownBeforeStatus(deps.store, workflowRun);
     try {
       await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
         outcome: failedOutcome,
         updatedAt: new Date().toISOString(),
         metadata: {
           node_counts: nodeCounts,
-          terminal_cause: 'node_failures',
+          terminal_cause: failureCause,
           failed_nodes: failedNodeIds,
+          ...(repairCheckoutAbort && repairFailureReason
+            ? { repair_failure_reason: repairFailureReason }
+            : {}),
         },
         eventData: {
           error: failMsg,
           node_counts: nodeCounts,
-          terminal_cause: 'node_failures',
+          terminal_cause: failureCause,
           failed_nodes: failedNodeIds,
+          ...(repairCheckoutAbort && repairFailureReason
+            ? { repair_failure_reason: repairFailureReason }
+            : {}),
         },
       });
     } catch (dbErr) {
@@ -6802,6 +7329,7 @@ async function executeDagWorkflowInternal(
   // Persist terminal facts before publishing any terminal event.
   const duration = Date.now() - dagStartTime;
   const completedOutcome = await makeTerminalOutcome('completed');
+  await recordTeardownBeforeStatus(deps.store, workflowRun);
   try {
     await deps.store.completeWorkflowRun(
       workflowRun.id,
