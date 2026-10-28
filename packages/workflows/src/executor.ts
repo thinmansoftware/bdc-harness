@@ -64,6 +64,11 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
+/** Test-only. Drops the cached executor logger so the next getLog() rebuilds it. */
+export function resetExecutorLogForTests(): void {
+  cachedLog = undefined;
+}
+
 async function readBoundSeats(
   seatIds: readonly SeatId[]
 ): Promise<Partial<Record<SeatId, SeatReading>>> {
