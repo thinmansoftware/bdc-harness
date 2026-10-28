@@ -95,7 +95,7 @@ if [ -z "$RST_CORE" ]; then
   echo "FATAL: could not extract rst core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RST_CORE"
-for fn in rst_class rst_extract_commands rst_command_looks_runnable rst_rescue_subdir rst_tests_in_diff rst_repo_test_script rst_parse_counts rst_scrub_env rst_run_commands rst_report; do
+for fn in rst_class rst_extract_commands rst_command_looks_runnable rst_rescue_subdir rst_tests_in_diff rst_repo_test_script rst_parse_counts rst_scrub_env rst_run_commands rst_report rst_failing_names rst_base_pass rst_apply_verdict; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
@@ -114,6 +114,19 @@ fi
 echo "--- Parity: rst core byte-identical across all 13 lanes ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$RST_CORE" "$(extract_core "$DEFAULTS/$lane" rst)"
+  rst_dep="$(awk '
+    $0 ~ /^  - id: run-stop-tests$/ { hit = 1; next }
+    hit && $0 ~ /^    depends_on:/ { print; exit }
+    hit && $0 ~ /^  - id: / { exit }
+  ' "$DEFAULTS/$lane")"
+  expected_dep="    depends_on: [format-autofix, resolve-test-command, resolve-review-base]"
+  assert_eq "run-stop-tests depends_on $lane" "$expected_dep" "$rst_dep"
+  rst_timeout="$(awk '
+    $0 ~ /^  - id: run-stop-tests$/ { hit = 1; next }
+    hit && $0 ~ /^    timeout:/ { print; exit }
+    hit && $0 ~ /^  - id: / { exit }
+  ' "$DEFAULTS/$lane")"
+  assert_eq "run-stop-tests timeout $lane" "    timeout: 3600000" "$rst_timeout"
 done
 
 echo "--- Parity: dprep core byte-identical across all 13 lanes (2 occurrences each) ---"
@@ -894,6 +907,892 @@ unset TELEGRAM_BOT_TOKEN TELEGRAM_STREAMING_MODE TELEGRAM_APPROVAL_CHAT_ID TELEG
 export PATH="$ORIG_PATH"
 rm -rf "$BIN" "$TMP" "$TMP2" "$TMP3" "$TMP4" "$TMP5" "$TMP6" "$TMP7" "$RST_TG" "$T5" "$T6_EMPTY" "$PBIN" "$PTMP" "$PTMPB" "$PTMPC" "$PTMPD"
 
+# --- baseline vs head (WO-HARNESS-EVIDENCE-BASE-VS-HEAD-TEST-DIFF-01) ---
+eval "$(extract_core "$CANONICAL_YAML" sme)"
+eval "$(extract_core "$CANONICAL_YAML" mec)"
+
+rst_out_field() {
+  printf '%s\n' "$2" | grep -E "^${1}=" | head -1 | sed "s/^${1}=//"
+}
+
+rst_git_init() {
+  git init -q "$1"
+  git -C "$1" config user.email t@t
+  git -C "$1" config user.name t
+}
+
+rst_commit() {
+  git -C "$1" add -A
+  git -C "$1" commit -qm "$2"
+}
+
+# Run the head command, then rst_apply_verdict. ARTIFACTS_DIR is empty so
+# run-start-sha.txt is absent unless seed_sha (optional 4th arg) is set.
+rst_verdict_for() {
+  local repo="$1" cmd="$2" review="$3" seed_sha="${4:-}"
+  local art log cmds result exit_code counts report status line out
+  art="$(mktemp -d)"
+  if [ -n "$seed_sha" ]; then
+    printf '%s\n' "$seed_sha" > "$art/run-start-sha.txt"
+  fi
+  log="$repo/stop-tests.log"
+  cmds="$repo/stop-tests.commands"
+  printf '%s\n' "$cmd" > "$cmds"
+  result="$(cd "$repo" && rst_run_commands "$cmds" "$log")"
+  exit_code="${result%% *}"
+  counts="${result#* }"
+  counts="$(printf '%s' "$counts" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  SOURCE=spec_declared
+  report="$(SOURCE=spec_declared rst_report CODE "$cmd" "$exit_code" "$counts")"
+  report="$(printf '%s\n' "$report" | sed 's/^TESTS_LINE=.*/& [source: wo-spec]/')"
+  status="$(printf '%s\n' "$report" | sed -n 's/^TESTS_STATUS=//p' | head -n 1)"
+  line="$(printf '%s\n' "$report" | sed -n 's/^TESTS_LINE=//p' | head -n 1)"
+  out="$(cd "$repo" && ARTIFACTS_DIR="$art" rst_apply_verdict CODE "$cmd" "$exit_code" "$counts" "$log" "$status" "$line" "$review" "$cmds")"
+  rm -rf "$art"
+  printf '%s\n' "$out"
+}
+
+RST_MANIFEST='WO: WO-X
+Tests: N/A
+Grep assertions: N/A
+VALIDATION: PASS'
+
+echo "--- rst_failing_names and reporter flags ---"
+jf="$(mktemp)"
+assert_eq "vitest reporter flags" "npx vitest run --reporter=default --reporter=json --outputFile=$jf" "$(rst_append_reporter 'npx vitest run' "$jf")"
+assert_eq "jest reporter flags" "npx jest --json --outputFile=$jf" "$(rst_append_reporter 'npx jest' "$jf")"
+assert_eq "bun x vitest reporter flags" "bun x vitest --reporter=default --reporter=json --outputFile=$jf" "$(rst_append_reporter 'bun x vitest' "$jf")"
+assert_eq "plain command unchanged" "bash ./t.sh" "$(rst_append_reporter 'bash ./t.sh' "$jf")"
+rm -f "$jf"
+NAME_SAMPLE="$(printf '%s\n' \
+  '(fail) bun name' \
+  'not ok 2 - tap name' \
+  'not ok 3 tap bare' \
+  'FAILED tests/test_a.py::test_b extra' \
+  '  1) mocha name' \
+  'FAIL file.ts > suite > vitest name' \
+  'FAIL X' \
+  '  x under fail' \
+  '  - also under' \
+  | rst_failing_names)"
+assert_contains "bun fail identity" "$(printf 'T\tbun name')" "$NAME_SAMPLE"
+assert_contains "tap dash identity" "$(printf 'T\ttap name')" "$NAME_SAMPLE"
+assert_contains "tap bare identity" "$(printf 'T\ttap bare')" "$NAME_SAMPLE"
+assert_contains "pytest identity" "$(printf 'T\ttests/test_a.py::test_b')" "$NAME_SAMPLE"
+assert_contains "mocha identity" "$(printf 'T\tmocha name')" "$NAME_SAMPLE"
+assert_contains "vitest summary identity" "$(printf 'T\tFAIL file.ts > suite > vitest name')" "$NAME_SAMPLE"
+# round 5: a child under "FAIL <file>" is qualified with that file so the same name
+# under a DIFFERENT file is a different identity.
+assert_contains "x under FAIL" "$(printf 'T\tX::under fail')" "$NAME_SAMPLE"
+assert_contains "dash under FAIL" "$(printf 'T\tX::also under')" "$NAME_SAMPLE"
+assert_contains "file identity count" "$(printf 'F\tX\t1')" "$NAME_SAMPLE"
+assert_not_contains "bare FAIL is not a test identity" "$(printf 'T\tFAIL X')" "$NAME_SAMPLE"
+# exact-record check: "T<TAB>X" must not exist as a whole record (substring matching
+# would now trip on the legitimate "T<TAB>X::under fail").
+assert_eq "bare FAIL line is not a T record" "" \
+  "$(printf '%s\n' "$NAME_SAMPLE" | awk -F '\t' '$1=="T" && $2=="X"')"
+# no bun block header in this sample, so bun/tap/mocha identities stay bare
+assert_contains "bun fail stays bare without a header" "$(printf 'T\tbun name')" "$NAME_SAMPLE"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "FATAL: jq is required for the vitest reporter scenario"
+  exit 1
+fi
+
+echo "--- Test 1: baseline red is reported, not blocking ---"
+T1="$(mktemp -d)"
+rst_git_init "$T1"
+cat > "$T1/t.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) stale > base is red"
+echo "2 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'base\n' > "$T1/note.txt"
+rst_commit "$T1" base
+git -C "$T1" update-ref refs/remotes/origin/dev "$(git -C "$T1" rev-parse HEAD)"
+printf 'head\n' > "$T1/note.txt"
+rst_commit "$T1" head
+T1_OUT="$(rst_verdict_for "$T1" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t1 status" "baseline_red" "$(rst_out_field TESTS_STATUS "$T1_OUT")"
+assert_eq "t1 base status" "failed" "$(rst_out_field TESTS_BASE_STATUS "$T1_OUT")"
+assert_eq "t1 newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T1_OUT")"
+assert_eq "t1 mode" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T1_OUT")"
+T1_LINE="$(rst_out_field TESTS_LINE "$T1_OUT")"
+case "$T1_LINE" in
+  2/3\ *) PASS=$((PASS + 1)); echo "PASS: t1 line begins 2/3" ;;
+  *) FAIL=$((FAIL + 1)); echo "FAIL: t1 line begins 2/3"; echo "  actual: [$T1_LINE]" ;;
+esac
+assert_contains "t1 dual counts" "head 2/3; base 2/3 at " "$T1_LINE"
+assert_contains "t1 shared name" "newly failing: 0 (stale > base is red)" "$T1_LINE"
+T1_STAMP="$(printf '%s\n' "$RST_MANIFEST" | sme_process "$T1_LINE" baseline_red "N/A (spec declares no grep stop conditions)" none_declared)"
+assert_contains "t1 validation pass" "VALIDATION: PASS" "$T1_STAMP"
+assert_not_contains "t1 validation not fail" "VALIDATION: FAIL" "$T1_STAMP"
+assert_contains "t1 stop line" "Stop conditions: tests=baseline_red" "$T1_STAMP"
+T1_ERR="$(mktemp)"
+T1_RC=0
+T1_MEC="$(printf '%s\n' "$T1_STAMP" | mec_check PROCEED CODE baseline_red 0 none_declared 1 2>"$T1_ERR")" || T1_RC=$?
+assert_eq "t1 mec rc" "0" "$T1_RC"
+assert_eq "t1 mec ok" "OK" "$T1_MEC"
+rm -rf "$T1" "$T1_ERR"
+
+echo "--- Test 2: a newly failing test blocks ---"
+T2="$(mktemp -d)"
+rst_git_init "$T2"
+cat > "$T2/t.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) stale > base is red"
+echo "2 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'base\n' > "$T2/note.txt"
+rst_commit "$T2" base
+git -C "$T2" update-ref refs/remotes/origin/dev "$(git -C "$T2" rev-parse HEAD)"
+cat > "$T2/t.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) stale > base is red"
+echo "(fail) new > head only"
+echo "1 pass"
+echo "2 fail"
+exit 1
+EOF
+printf 'head\n' > "$T2/note.txt"
+rst_commit "$T2" head
+T2_OUT="$(rst_verdict_for "$T2" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t2 status" "failed" "$(rst_out_field TESTS_STATUS "$T2_OUT")"
+assert_eq "t2 newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T2_OUT")"
+assert_eq "t2 mode" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T2_OUT")"
+T2_LINE="$(rst_out_field TESTS_LINE "$T2_OUT")"
+assert_contains "t2 new name" "newly failing: 1 (new > head only)" "$T2_LINE"
+assert_contains "t2 failed exit" " -- FAILED, exit " "$T2_LINE"
+T2_STAMP="$(printf '%s\n' "$RST_MANIFEST" | sme_process "$T2_LINE" failed "N/A (spec declares no grep stop conditions)" none_declared)"
+assert_contains "t2 validation fail" "VALIDATION: FAIL" "$T2_STAMP"
+T2_ERR="$(mktemp)"
+T2_RC=0
+T2_MEC="$(printf '%s\n' "$T2_STAMP" | mec_check PROCEED CODE failed 0 none_declared 1 2>"$T2_ERR")" || T2_RC=$?
+assert_eq "t2 mec rc" "1" "$T2_RC"
+assert_contains "t2 mec error" "EVIDENCE_ERROR" "$(cat "$T2_ERR")"
+rm -rf "$T2" "$T2_ERR"
+
+echo "--- Test 3: unavailable is never a pass ---"
+T3A="$(mktemp -d)"
+rst_git_init "$T3A"
+printf 'base\n' > "$T3A/note.txt"
+rst_commit "$T3A" base
+git -C "$T3A" update-ref refs/remotes/origin/dev "$(git -C "$T3A" rev-parse HEAD)"
+T3A_BEFORE="$(git -C "$T3A" worktree list | grep -c . || true)"
+T3A_OUT="$(rst_verdict_for "$T3A" "bash ./missing.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t3a status" "failed" "$(rst_out_field TESTS_STATUS "$T3A_OUT")"
+assert_eq "t3a base status" "not_run" "$(rst_out_field TESTS_BASE_STATUS "$T3A_OUT")"
+T3A_LINE="$(rst_out_field TESTS_LINE "$T3A_OUT")"
+case "$T3A_LINE" in
+  "N/A ("*) PASS=$((PASS + 1)); echo "PASS: t3a line starts N/A" ;;
+  *) FAIL=$((FAIL + 1)); echo "FAIL: t3a line starts N/A"; echo "  actual: [$T3A_LINE]" ;;
+esac
+assert_eq "t3a no extra worktree" "$T3A_BEFORE" "$(git -C "$T3A" worktree list | grep -c . || true)"
+if [ -f "$T3A/stop-tests.log.base" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL: t3a created a base log"
+else
+  PASS=$((PASS + 1)); echo "PASS: t3a no base log"
+fi
+assert_not_contains "t3a not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T3A_OUT")"
+assert_not_contains "t3a not passed" "passed" "$(rst_out_field TESTS_STATUS "$T3A_OUT")"
+rm -rf "$T3A"
+
+T3B="$(mktemp -d)"
+rst_git_init "$T3B"
+cat > "$T3B/t.sh" <<'EOF'
+#!/bin/bash
+echo "1 pass"
+echo "1 fail"
+exit 1
+EOF
+rst_commit "$T3B" head
+T3B_OUT="$(rst_verdict_for "$T3B" "bash ./t.sh" "$(printf 'REVIEW_BASE=does-not-exist\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t3b status" "failed" "$(rst_out_field TESTS_STATUS "$T3B_OUT")"
+assert_eq "t3b base status" "unavailable" "$(rst_out_field TESTS_BASE_STATUS "$T3B_OUT")"
+assert_eq "t3b mode" "n/a" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T3B_OUT")"
+assert_not_contains "t3b not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T3B_OUT")"
+assert_not_contains "t3b not passed" "passed" "$(rst_out_field TESTS_STATUS "$T3B_OUT")"
+rm -rf "$T3B"
+
+echo "--- Test 3c: missing origin/<REVIEW_BASE> falls back to run-start-sha.txt ---"
+T3C="$(mktemp -d)"
+rst_git_init "$T3C"
+cat > "$T3C/t.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) stale > base is red"
+echo "2 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'base\n' > "$T3C/note.txt"
+rst_commit "$T3C" base
+T3C_BASE="$(git -C "$T3C" rev-parse HEAD)"
+printf 'head\n' > "$T3C/note.txt"
+rst_commit "$T3C" head
+if git -C "$T3C" rev-parse --verify -q 'refs/remotes/origin/dev^{commit}' >/dev/null; then
+  FAIL=$((FAIL + 1)); echo "FAIL: t3c origin/dev should be absent"
+else
+  PASS=$((PASS + 1)); echo "PASS: t3c origin/dev absent"
+fi
+T3C_OUT="$(rst_verdict_for "$T3C" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')" "$T3C_BASE")"
+assert_eq "t3c status" "baseline_red" "$(rst_out_field TESTS_STATUS "$T3C_OUT")"
+assert_eq "t3c base status" "failed" "$(rst_out_field TESTS_BASE_STATUS "$T3C_OUT")"
+assert_eq "t3c base sha" "$T3C_BASE" "$(rst_out_field TESTS_BASE_SHA "$T3C_OUT")"
+assert_eq "t3c newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T3C_OUT")"
+assert_eq "t3c mode" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T3C_OUT")"
+T3C_LINE="$(rst_out_field TESTS_LINE "$T3C_OUT")"
+T3C_SHA8="$(printf '%s' "$T3C_BASE" | cut -c1-8)"
+assert_contains "t3c dual counts" "head 2/3; base 2/3 at ${T3C_SHA8}" "$T3C_LINE"
+assert_contains "t3c shared name" "newly failing: 0 (stale > base is red)" "$T3C_LINE"
+assert_not_contains "t3c not unavailable" "unavailable" "$(rst_out_field TESTS_BASE_STATUS "$T3C_OUT")"
+if [ -f "$T3C/stop-tests.log.base" ] && grep -Fq "(fail) stale > base is red" "$T3C/stop-tests.log.base"; then
+  PASS=$((PASS + 1)); echo "PASS: t3c base pass wrote the base failure"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL: t3c base pass did not run"
+fi
+assert_eq "t3c worktree cleaned" "1" "$(git -C "$T3C" worktree list | grep -c . || true)"
+rm -rf "$T3C"
+
+echo "--- Test 4: a passing head never pays for a base pass ---"
+T4="$(mktemp -d)"
+rst_git_init "$T4"
+cat > "$T4/t.sh" <<'EOF'
+#!/bin/bash
+echo "3 pass"
+exit 0
+EOF
+printf 'base\n' > "$T4/note.txt"
+rst_commit "$T4" base
+git -C "$T4" update-ref refs/remotes/origin/dev "$(git -C "$T4" rev-parse HEAD)"
+printf 'head\n' > "$T4/note.txt"
+rst_commit "$T4" head
+T4_OUT="$(rst_verdict_for "$T4" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t4 status" "passed" "$(rst_out_field TESTS_STATUS "$T4_OUT")"
+assert_eq "t4 base status" "not_run" "$(rst_out_field TESTS_BASE_STATUS "$T4_OUT")"
+assert_eq "t4 sha" "none" "$(rst_out_field TESTS_BASE_SHA "$T4_OUT")"
+if [ -f "$T4/stop-tests.log.base" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL: t4 created a base log"
+else
+  PASS=$((PASS + 1)); echo "PASS: t4 no base log"
+fi
+assert_eq "t4 one worktree" "1" "$(git -C "$T4" worktree list | grep -c . || true)"
+rm -rf "$T4"
+
+echo "--- Test 5: count mode when names cannot be extracted ---"
+rst_count_case() {
+  local base_line="$1" head_line="$2" repo verdict
+  repo="$(mktemp -d)"
+  rst_git_init "$repo"
+  printf '#!/bin/bash\necho "%s"\nexit 1\n' "$base_line" > "$repo/t.sh"
+  printf 'base\n' > "$repo/note.txt"
+  rst_commit "$repo" base
+  git -C "$repo" update-ref refs/remotes/origin/dev "$(git -C "$repo" rev-parse HEAD)"
+  printf '#!/bin/bash\necho "%s"\nexit 1\n' "$head_line" > "$repo/t.sh"
+  printf 'head\n' > "$repo/note.txt"
+  rst_commit "$repo" head
+  verdict="$(rst_verdict_for "$repo" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+  rm -rf "$repo"
+  printf '%s\n' "$verdict"
+}
+T5A="$(rst_count_case "Tests: 3/4" "Tests: 2/4")"
+assert_eq "t5a mode" "count" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T5A")"
+assert_eq "t5a newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T5A")"
+assert_eq "t5a status" "failed" "$(rst_out_field TESTS_STATUS "$T5A")"
+# Round-3 finding #1: when failure identities are unavailable on both sides, an equal
+# failure count does NOT prove the head failures existed at base (base fails A, head
+# fixes A and fails B leaves the count unchanged). Count mode stays blocking; it was
+# baseline_red before this fix.
+T5B="$(rst_count_case "Tests: 2/4" "Tests: 2/4")"
+assert_eq "t5b mode" "count" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T5B")"
+assert_eq "t5b newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T5B")"
+assert_eq "t5b status" "failed" "$(rst_out_field TESTS_STATUS "$T5B")"
+assert_not_contains "t5b not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T5B")"
+# Round-3 finding #1 (lower-count clause): fewer head failures than base still cannot
+# prove zero newly failing when identities are unavailable; it stays blocking.
+T5C="$(rst_count_case "Tests: 1/4" "Tests: 2/4")"
+assert_eq "t5c mode" "count" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T5C")"
+assert_eq "t5c newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T5C")"
+assert_eq "t5c status" "failed" "$(rst_out_field TESTS_STATUS "$T5C")"
+assert_not_contains "t5c not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T5C")"
+
+echo "--- Test 7: baseline_red without a zero count is refused ---"
+T7_MAN="$(printf '%s\n' "$RST_MANIFEST" | sed 's|^Tests:.*|Tests: 2/3 (cmd) -- head 2/3; base 2/3 at abcdef01; newly failing: 2|')"
+T7_ERR="$(mktemp)"
+T7_RC=0
+T7_MEC="$(printf '%s\n' "$T7_MAN" | mec_check PROCEED CODE baseline_red 0 none_declared 1 2>"$T7_ERR")" || T7_RC=$?
+assert_eq "t7 mec rc" "1" "$T7_RC"
+assert_contains "t7 token" "baseline_red_without_zero_newly_failing" "$(cat "$T7_ERR")"
+rm -f "$T7_ERR"
+
+echo "--- Test 8: an unexplained head exit stays blocking ---"
+rst_exit_case() {
+  local base_body="$1" repo verdict
+  repo="$(mktemp -d)"
+  rst_git_init "$repo"
+  printf '%s\n' "$base_body" > "$repo/t.sh"
+  printf 'base\n' > "$repo/note.txt"
+  rst_commit "$repo" base
+  git -C "$repo" update-ref refs/remotes/origin/dev "$(git -C "$repo" rev-parse HEAD)"
+  cat > "$repo/t.sh" <<'EOF'
+#!/bin/bash
+echo "3 pass"
+echo "0 fail"
+exit 1
+EOF
+  printf 'head\n' > "$repo/note.txt"
+  rst_commit "$repo" head
+  verdict="$(rst_verdict_for "$repo" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+  rm -rf "$repo"
+  printf '%s\n' "$verdict"
+}
+T8A="$(rst_exit_case "$(printf '%s\n' '#!/bin/bash' 'echo "3 pass"' 'exit 0')")"
+assert_eq "t8a status" "failed" "$(rst_out_field TESTS_STATUS "$T8A")"
+assert_eq "t8a base status" "passed" "$(rst_out_field TESTS_BASE_STATUS "$T8A")"
+assert_eq "t8a evidence" "no" "$(rst_out_field TESTS_BASE_EVIDENCE "$T8A")"
+assert_eq "t8a mode" "n/a" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T8A")"
+T8A_LINE="$(rst_out_field TESTS_LINE "$T8A")"
+assert_contains "t8a failed exit" " -- FAILED, exit 1" "$T8A_LINE"
+assert_contains "t8a unexplained" "unexplained head exit 1" "$T8A_LINE"
+T8A_STAMP="$(printf '%s\n' "$RST_MANIFEST" | sme_process "$T8A_LINE" failed "N/A (spec declares no grep stop conditions)" none_declared)"
+assert_contains "t8a validation fail" "VALIDATION: FAIL" "$T8A_STAMP"
+T8A_ERR="$(mktemp)"
+T8A_RC=0
+T8A_MEC="$(printf '%s\n' "$T8A_STAMP" | mec_check PROCEED CODE failed 0 none_declared 1 2>"$T8A_ERR")" || T8A_RC=$?
+assert_eq "t8a mec rc" "1" "$T8A_RC"
+rm -f "$T8A_ERR"
+T8B="$(rst_exit_case "$(printf '%s\n' '#!/bin/bash' 'echo "3 pass"' 'echo "0 fail"' 'exit 1')")"
+assert_eq "t8b evidence" "yes" "$(rst_out_field TESTS_BASE_EVIDENCE "$T8B")"
+assert_eq "t8b status" "baseline_red" "$(rst_out_field TESTS_STATUS "$T8B")"
+
+echo "--- Test 9: file identities are not test identities ---"
+VBIN="$(mktemp -d)"
+cat > "$VBIN/npx" <<'EOF'
+#!/bin/bash
+if [ "$1" = "vitest" ]; then
+  shift
+  exec "$(dirname "$0")/vitest" "$@"
+fi
+echo "npx stub unsupported: $*" >&2
+exit 127
+EOF
+cat > "$VBIN/vitest" <<'EOF'
+#!/bin/bash
+out=""
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    --outputFile) out="$a" ;;
+  esac
+  case "$a" in
+    --outputFile=*) out="${a#--outputFile=}" ;;
+  esac
+  prev="$a"
+done
+mode="$(jq -r '.mode' fixture.json)"
+file="$(jq -r '.file' fixture.json)"
+if [ "$mode" = "json" ] || [ "$mode" = "abs" ]; then
+  echo "FAIL $file"
+  if [ -n "$out" ]; then
+    if [ "$mode" = "abs" ]; then
+      name="$PWD/$file"
+    else
+      name="$file"
+    fi
+    jq -n --arg name "$name" --slurpfile f fixture.json '{testResults:[{name:$name, assertionResults:[($f[0].names[] | {fullName:., status:"failed"})]}]}' > "$out"
+  fi
+  n="$(jq -r '.names | length' fixture.json)"
+  echo "Tests: $n failed, 0 passed, $n total"
+  exit 1
+fi
+count="$(jq -r '.count' fixture.json)"
+i=0
+while [ "$i" -lt "$count" ]; do
+  echo "FAIL $file"
+  i=$((i + 1))
+done
+echo "Tests: $count failed, 0 passed, $count total"
+exit 1
+EOF
+chmod +x "$VBIN/npx" "$VBIN/vitest"
+export PATH="$VBIN:$ORIG_PATH"
+
+rst_vitest_case() {
+  local base_json="$1" head_json="$2" repo verdict
+  repo="$(mktemp -d)"
+  rst_git_init "$repo"
+  printf '%s\n' "$base_json" > "$repo/fixture.json"
+  printf 'base\n' > "$repo/note.txt"
+  rst_commit "$repo" base
+  git -C "$repo" update-ref refs/remotes/origin/dev "$(git -C "$repo" rev-parse HEAD)"
+  printf '%s\n' "$head_json" > "$repo/fixture.json"
+  printf 'head\n' > "$repo/note.txt"
+  rst_commit "$repo" head
+  verdict="$(rst_verdict_for "$repo" "npx vitest run" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+  rm -rf "$repo"
+  printf '%s\n' "$verdict"
+}
+T9A="$(rst_vitest_case '{"mode":"json","file":"X","names":["old test"]}' '{"mode":"json","file":"X","names":["old test","new test"]}')"
+assert_eq "t9a mode" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T9A")"
+assert_eq "t9a newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T9A")"
+assert_eq "t9a status" "failed" "$(rst_out_field TESTS_STATUS "$T9A")"
+assert_contains "t9a names the new test" "X::new test" "$(rst_out_field TESTS_LINE "$T9A")"
+assert_not_contains "t9a not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T9A")"
+T9B="$(rst_vitest_case '{"mode":"lines","file":"X","count":1}' '{"mode":"lines","file":"X","count":2}')"
+assert_eq "t9b mode" "file-count" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T9B")"
+assert_eq "t9b newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T9B")"
+assert_eq "t9b status" "failed" "$(rst_out_field TESTS_STATUS "$T9B")"
+assert_not_contains "t9b not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T9B")"
+echo "--- Test 9c: absolute JSON paths from different checkouts are the same failure ---"
+T9C="$(rst_vitest_case '{"mode":"abs","file":"X","names":["same test"]}' '{"mode":"abs","file":"X","names":["same test"]}')"
+assert_eq "t9c status" "baseline_red" "$(rst_out_field TESTS_STATUS "$T9C")"
+assert_eq "t9c newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T9C")"
+assert_eq "t9c mode" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T9C")"
+assert_not_contains "t9c not a new absolute path" "/X::same test" "$(rst_out_field TESTS_LINE "$T9C")"
+export PATH="$ORIG_PATH"
+rm -rf "$VBIN"
+
+echo "--- Test 10: FAIL headers that do not cover the failure count stay blocking ---"
+T10="$(mktemp -d)"
+rst_git_init "$T10"
+cat > "$T10/t.sh" <<'EOF'
+#!/bin/bash
+echo "FAIL X"
+echo "Tests: 2/3"
+exit 1
+EOF
+printf 'base\n' > "$T10/note.txt"
+rst_commit "$T10" base
+git -C "$T10" update-ref refs/remotes/origin/dev "$(git -C "$T10" rev-parse HEAD)"
+cat > "$T10/t.sh" <<'EOF'
+#!/bin/bash
+echo "FAIL X"
+echo "Tests: 1/3"
+exit 1
+EOF
+printf 'head\n' > "$T10/note.txt"
+rst_commit "$T10" head
+T10_OUT="$(rst_verdict_for "$T10" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t10 status" "failed" "$(rst_out_field TESTS_STATUS "$T10_OUT")"
+assert_not_contains "t10 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T10_OUT")"
+assert_eq "t10 mode" "count" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T10_OUT")"
+assert_eq "t10 newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T10_OUT")"
+rm -rf "$T10"
+
+echo "--- Test 11: an unparsed failure beside a known one stays blocking ---"
+T11="$(mktemp -d)"
+rst_git_init "$T11"
+cat > "$T11/one.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) stale > kept"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+cat > "$T11/two.sh" <<'EOF'
+#!/bin/bash
+echo "1 pass"
+echo "0 fail"
+exit 0
+EOF
+printf 'base\n' > "$T11/note.txt"
+rst_commit "$T11" base
+git -C "$T11" update-ref refs/remotes/origin/dev "$(git -C "$T11" rev-parse HEAD)"
+cat > "$T11/two.sh" <<'EOF'
+#!/bin/bash
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'head\n' > "$T11/note.txt"
+rst_commit "$T11" head
+T11_CMD="$(printf '%s\n' 'bash ./one.sh' 'bash ./two.sh')"
+T11_OUT="$(rst_verdict_for "$T11" "$T11_CMD" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t11 status" "failed" "$(rst_out_field TESTS_STATUS "$T11_OUT")"
+assert_not_contains "t11 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T11_OUT")"
+rm -rf "$T11"
+
+echo "--- Test 12: text and JSON forms of one failure cannot hide an unparsed one ---"
+T12_DUAL="$(printf 'T\t%s\n' \
+  'FAIL src/a.test.ts > suite > old test' \
+  'src/a.test.ts::suite > old test' \
+  | rst_identity_count)"
+assert_eq "t12 arrow json counts once" "1" "$T12_DUAL"
+T12_JEST="$(printf 'T\t%s\n' \
+  'FAIL src/a.test.ts > suite > old test' \
+  'src/a.test.ts::suite old test' \
+  | rst_identity_count)"
+assert_eq "t12 space json counts once" "1" "$T12_JEST"
+T12_TWO="$(printf 'T\t%s\n' \
+  'FAIL src/a.test.ts > suite > old test' \
+  'src/a.test.ts::suite > another' \
+  | rst_identity_count)"
+assert_eq "t12 distinct names stay distinct" "2" "$T12_TWO"
+
+V12="$(mktemp -d)"
+cat > "$V12/npx" <<'EOF'
+#!/bin/bash
+if [ "$1" = "vitest" ]; then
+  shift
+  exec "$(dirname "$0")/vitest" "$@"
+fi
+echo "npx stub unsupported: $*" >&2
+exit 127
+EOF
+cat > "$V12/vitest" <<'EOF'
+#!/bin/bash
+out=""
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    --outputFile) out="$a" ;;
+  esac
+  case "$a" in
+    --outputFile=*) out="${a#--outputFile=}" ;;
+  esac
+  prev="$a"
+done
+file="$(jq -r '.file' fixture.json)"
+full="$(jq -r '.fullName' fixture.json)"
+failed="$(jq -r '.failed' fixture.json)"
+passed="$(jq -r '.passed' fixture.json)"
+total="$(jq -r '.total' fixture.json)"
+printf 'FAIL %s > %s\n' "$file" "$full"
+if [ -n "$out" ]; then
+  jq -n --arg name "$file" --arg full "$full" \
+    '{testResults:[{name:$name, assertionResults:[{fullName:$full, status:"failed"}]}]}' > "$out"
+fi
+printf 'Tests: %s failed, %s passed, %s total\n' "$failed" "$passed" "$total"
+exit 1
+EOF
+chmod +x "$V12/npx" "$V12/vitest"
+export PATH="$V12:$ORIG_PATH"
+
+T12_BASE='{"file":"src/a.test.ts","fullName":"suite > old test","failed":1,"passed":0,"total":1}'
+T12_SAME='{"file":"src/a.test.ts","fullName":"suite > old test","failed":1,"passed":0,"total":1}'
+T12_EXTRA='{"file":"src/a.test.ts","fullName":"suite > old test","failed":2,"passed":0,"total":2}'
+T12_OK="$(rst_vitest_case "$T12_BASE" "$T12_SAME")"
+assert_eq "t12 matched dual status" "baseline_red" "$(rst_out_field TESTS_STATUS "$T12_OK")"
+assert_eq "t12 matched dual newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T12_OK")"
+assert_eq "t12 matched dual mode" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T12_OK")"
+T12_BAD="$(rst_vitest_case "$T12_BASE" "$T12_EXTRA")"
+assert_eq "t12 unparsed extra status" "failed" "$(rst_out_field TESTS_STATUS "$T12_BAD")"
+assert_not_contains "t12 unparsed extra not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T12_BAD")"
+assert_eq "t12 unparsed extra newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T12_BAD")"
+export PATH="$ORIG_PATH"
+rm -rf "$V12"
+
+echo "--- Test 13: a new per-command failure blocks even when identities elsewhere match (round 3 #2) ---"
+# command 1 fails the same named test at base and head; command 2 passes at base and
+# crashes without counts at head. The aggregate identities match (only the shared
+# failure is named), so without the per-command gate this is baseline_red.
+T13="$(mktemp -d)"
+rst_git_init "$T13"
+cat > "$T13/one.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) shared > kept"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+cat > "$T13/two.sh" <<'EOF'
+#!/bin/bash
+echo "1 pass"
+echo "0 fail"
+exit 0
+EOF
+printf 'base\n' > "$T13/note.txt"
+rst_commit "$T13" base
+git -C "$T13" update-ref refs/remotes/origin/dev "$(git -C "$T13" rev-parse HEAD)"
+cat > "$T13/two.sh" <<'EOF'
+#!/bin/bash
+echo "boom"
+exit 1
+EOF
+printf 'head\n' > "$T13/note.txt"
+rst_commit "$T13" head
+T13_CMD="$(printf '%s\n' 'bash ./one.sh' 'bash ./two.sh')"
+T13_OUT="$(rst_verdict_for "$T13" "$T13_CMD" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t13 status" "failed" "$(rst_out_field TESTS_STATUS "$T13_OUT")"
+assert_not_contains "t13 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T13_OUT")"
+# The helper passes the raw multi-line command list through to the Tests line; the
+# real node semicolon-joins it. Assert against the whole output so the note (on a
+# later physical line of the Tests line here) is still found.
+assert_contains "t13 names the regression" "command regression at head" "$T13_OUT"
+rm -rf "$T13"
+
+echo "--- Test 14: reporter rerun identities are unioned, never replace the original run (round 3 #3) ---"
+# The original head run (no --outputFile) fails test X; the reporter rerun (and the
+# base) fail baseline test Y with the same count. Replacing the original identities
+# with the rerun's would drop X and emit baseline_red; the union keeps X and blocks.
+V14="$(mktemp -d)"
+cat > "$V14/npx" <<'EOF'
+#!/bin/bash
+if [ "$1" = "vitest" ]; then
+  shift
+  exec "$(dirname "$0")/vitest" "$@"
+fi
+echo "npx stub unsupported: $*" >&2
+exit 127
+EOF
+cat > "$V14/vitest" <<'EOF'
+#!/bin/bash
+out=""
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    --outputFile) out="$a" ;;
+  esac
+  case "$a" in
+    --outputFile=*) out="${a#--outputFile=}" ;;
+  esac
+  prev="$a"
+done
+file="$(jq -r '.file' fixture.json)"
+x="$(jq -r '.x' fixture.json)"
+y="$(jq -r '.y' fixture.json)"
+if [ -n "$out" ]; then
+  echo "FAIL $file > $y"
+  jq -n --arg f "$file" --arg n "$y" '{testResults:[{name:$f, assertionResults:[{fullName:$n, status:"failed"}]}]}' > "$out"
+else
+  echo "FAIL $file > $x"
+fi
+echo "Tests: 1 failed, 0 passed, 1 total"
+exit 1
+EOF
+chmod +x "$V14/npx" "$V14/vitest"
+export PATH="$V14:$ORIG_PATH"
+T14_FIX='{"file":"a.test.ts","x":"new x","y":"old y"}'
+T14_OUT="$(rst_vitest_case "$T14_FIX" "$T14_FIX")"
+assert_eq "t14 status" "failed" "$(rst_out_field TESTS_STATUS "$T14_OUT")"
+assert_not_contains "t14 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T14_OUT")"
+export PATH="$ORIG_PATH"
+rm -rf "$V14"
+
+echo "--- Test 15: a bare name failing in a DIFFERENT command at head blocks (round 4 #1) ---"
+# bdc-xo #1940 round 4 finding 1: text identities omit command context, so the same
+# bare name failing in different commands at base vs head compares equal. Here two
+# files swap which command fails them: each command's failing COUNT is unchanged, so
+# the per-command count gate (rst_cmd_regression) does not fire, and the aggregate
+# name set {foo,bar} matches -- old code emitted baseline_red, masking two regressions.
+# rst_cmd_new_names qualifies by command and blocks.
+T15="$(mktemp -d)"
+rst_git_init "$T15"
+cat > "$T15/one.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) foo"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+cat > "$T15/two.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) bar"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'base\n' > "$T15/note.txt"
+rst_commit "$T15" base
+git -C "$T15" update-ref refs/remotes/origin/dev "$(git -C "$T15" rev-parse HEAD)"
+cat > "$T15/one.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) bar"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+cat > "$T15/two.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) foo"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'head\n' > "$T15/note.txt"
+rst_commit "$T15" head
+T15_CMD="$(printf '%s\n' 'bash ./one.sh' 'bash ./two.sh')"
+T15_OUT="$(rst_verdict_for "$T15" "$T15_CMD" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t15 status" "failed" "$(rst_out_field TESTS_STATUS "$T15_OUT")"
+assert_not_contains "t15 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T15_OUT")"
+assert_contains "t15 names the regression" "command regression at head" "$T15_OUT"
+rm -rf "$T15"
+
+echo "--- Test 15b: rst_cmd_new_names direct (swap blocks, identical passes) ---"
+T15B_H="$(mktemp)"; T15B_B="$(mktemp)"
+cat > "$T15B_B" <<'EOF'
+### run-stop-tests: bash ./one.sh
+(fail) foo
+### exit 1 one.sh
+### run-stop-tests: bash ./two.sh
+(fail) bar
+### exit 1 two.sh
+EOF
+cat > "$T15B_H" <<'EOF'
+### run-stop-tests: bash ./one.sh
+(fail) bar
+### exit 1 one.sh
+### run-stop-tests: bash ./two.sh
+(fail) foo
+### exit 1 two.sh
+EOF
+assert_eq "t15b swap flags new names" "1" "$(rst_cmd_new_names "$T15B_H" "$T15B_B")"
+assert_eq "t15b identical no new names" "0" "$(rst_cmd_new_names "$T15B_B" "$T15B_B")"
+rm -f "$T15B_H" "$T15B_B"
+
+echo "--- Test 16: a head-only FAIL <new-file> header is not masked by reporter names (round 4 #2) ---"
+# bdc-xo #1940 round 4 finding 2: names mode drops F records, so a head-only
+# "FAIL new.test.ts" (collection error, no per-test name) is masked when the identity
+# count is filled by named failures for OTHER (baseline) files. head and base both
+# name base.test.ts keeps+extra (count 2/2), but head additionally fails a NEW file at
+# the file level. rst_uncovered_file_count forces a fall-through off names mode so the
+# new file stays blocking.
+T16_UNC_HIDDEN="$(printf 'F\t%s\t%s\nT\t%s\nT\t%s\n' \
+  'new.test.ts' '1' 'base.test.ts::keeps' 'base.test.ts::extra' | rst_uncovered_file_count)"
+assert_eq "t16 uncovered new file counted" "1" "$T16_UNC_HIDDEN"
+T16_UNC_COVERED="$(printf 'F\t%s\t%s\nT\t%s\n' \
+  'base.test.ts' '1' 'FAIL base.test.ts > keeps' | rst_uncovered_file_count)"
+assert_eq "t16 covered file not counted" "0" "$T16_UNC_COVERED"
+T16="$(mktemp -d)"
+rst_git_init "$T16"
+cat > "$T16/t.sh" <<'EOF'
+#!/bin/bash
+echo "FAIL base.test.ts > keeps"
+echo "FAIL base.test.ts > extra"
+echo "Tests: 2 failed, 0 passed, 2 total"
+exit 1
+EOF
+printf 'base\n' > "$T16/note.txt"
+rst_commit "$T16" base
+git -C "$T16" update-ref refs/remotes/origin/dev "$(git -C "$T16" rev-parse HEAD)"
+cat > "$T16/t.sh" <<'EOF'
+#!/bin/bash
+echo "FAIL new.test.ts"
+echo "FAIL base.test.ts > keeps"
+echo "FAIL base.test.ts > extra"
+echo "Tests: 2 failed, 0 passed, 2 total"
+exit 1
+EOF
+printf 'head\n' > "$T16/note.txt"
+rst_commit "$T16" head
+T16_OUT="$(rst_verdict_for "$T16" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t16 status" "failed" "$(rst_out_field TESTS_STATUS "$T16_OUT")"
+assert_not_contains "t16 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T16_OUT")"
+assert_not_contains "t16 mode not names" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T16_OUT")"
+rm -rf "$T16"
+
 echo
+echo "--- Test 17: a bare name in a DIFFERENT file at head blocks (round 5) ---"
+# bdc-xo #1940 round 5: text identities were bare WITHIN a single command. A base
+# failure "(fail) same name" in file A and a head failure with the same name in file B
+# compared equal, satisfied names_complete, and emitted baseline_red -- masking a real
+# regression. rst_cmd_new_names only separated command segments, not files. The parser
+# now qualifies a bare name with the enclosing bun block header.
+T17_SAMPLE="$(printf '%s\n' \
+  'a.test.ts:' \
+  '(fail) same name' \
+  'b.test.ts:' \
+  '(fail) same name' \
+  | rst_failing_names)"
+assert_contains "t17 file A qualified" "$(printf 'T\ta.test.ts::same name')" "$T17_SAMPLE"
+assert_contains "t17 file B qualified" "$(printf 'T\tb.test.ts::same name')" "$T17_SAMPLE"
+assert_eq "t17 two distinct identities" "2" "$(printf '%s\n' "$T17_SAMPLE" | rst_identity_count)"
+
+echo "--- Test 17b: same command, same name, file moved -- not baseline_red (round 5) ---"
+# The reviewer's exact scenario end-to-end: ONE command, identical failing COUNT on
+# both sides, identical bare name -- only the file differs. rst_cmd_regression cannot
+# see it (counts match) and rst_cmd_new_names cannot see it (one segment), so the file
+# qualification is the only thing that keeps this blocking.
+T17B="$(mktemp -d)"
+rst_git_init "$T17B"
+cat > "$T17B/t.sh" <<'EOF'
+#!/bin/bash
+echo "a.test.ts:"
+echo "(fail) same name"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'base\n' > "$T17B/note.txt"
+rst_commit "$T17B" base
+git -C "$T17B" update-ref refs/remotes/origin/dev "$(git -C "$T17B" rev-parse HEAD)"
+cat > "$T17B/t.sh" <<'EOF'
+#!/bin/bash
+echo "b.test.ts:"
+echo "(fail) same name"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'head\n' > "$T17B/note.txt"
+rst_commit "$T17B" head
+T17B_OUT="$(rst_verdict_for "$T17B" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t17b status" "failed" "$(rst_out_field TESTS_STATUS "$T17B_OUT")"
+assert_not_contains "t17b not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T17B_OUT")"
+assert_eq "t17b newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T17B_OUT")"
+assert_contains "t17b names the new file" "b.test.ts::same name" "$(rst_out_field TESTS_LINE "$T17B_OUT")"
+rm -rf "$T17B"
+
+echo "--- Test 17c: an unmoved qualified failure is still baseline_red (round 5) ---"
+# Guard against over-blocking: qualification must not turn a genuinely red baseline
+# into a block when the SAME test in the SAME file fails on both sides.
+T17C="$(mktemp -d)"
+rst_git_init "$T17C"
+cat > "$T17C/t.sh" <<'EOF'
+#!/bin/bash
+echo "a.test.ts:"
+echo "(fail) same name"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'base\n' > "$T17C/note.txt"
+rst_commit "$T17C" base
+git -C "$T17C" update-ref refs/remotes/origin/dev "$(git -C "$T17C" rev-parse HEAD)"
+printf 'head\n' > "$T17C/note.txt"
+rst_commit "$T17C" head
+T17C_OUT="$(rst_verdict_for "$T17C" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t17c status" "baseline_red" "$(rst_out_field TESTS_STATUS "$T17C_OUT")"
+assert_eq "t17c mode" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T17C_OUT")"
+assert_eq "t17c newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T17C_OUT")"
+rm -rf "$T17C"
+
+echo "--- Test 17d: rst_identity_context_mixed fails closed on partial file context ---"
+assert_eq "t17d all bare" "0" \
+  "$(printf 'T\t%s\nT\t%s\n' 'plain one' 'plain two' | rst_identity_context_mixed)"
+assert_eq "t17d all qualified" "0" \
+  "$(printf 'T\t%s\nT\t%s\n' 'a.ts::one' 'FAIL b.ts > two' | rst_identity_context_mixed)"
+assert_eq "t17d mixed" "1" \
+  "$(printf 'T\t%s\nT\t%s\n' 'a.ts::one' 'plain two' | rst_identity_context_mixed)"
+assert_eq "t17d no identities" "0" "$(printf 'F\t%s\t%s\n' 'a.ts' '1' | rst_identity_context_mixed)"
+
+echo "--- Test 17e: mixed file context denies names mode end-to-end (round 5) ---"
+# head proves the runner CAN report a file (one qualified identity) but still emits a
+# bare name. That bare name may belong to a different file than the base's bare name
+# and nothing in the log can resolve it, so names mode must fail closed rather than
+# compare the bare names and emit baseline_red.
+T17E="$(mktemp -d)"
+rst_git_init "$T17E"
+cat > "$T17E/t.sh" <<'EOF'
+#!/bin/bash
+echo "not ok 1 - bare name"
+echo "FAILED tests/test_a.py::test_b"
+echo "0 pass"
+echo "2 fail"
+exit 1
+EOF
+printf 'base\n' > "$T17E/note.txt"
+rst_commit "$T17E" base
+git -C "$T17E" update-ref refs/remotes/origin/dev "$(git -C "$T17E" rev-parse HEAD)"
+printf 'head\n' > "$T17E/note.txt"
+rst_commit "$T17E" head
+T17E_OUT="$(rst_verdict_for "$T17E" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_not_contains "t17e mode not names" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T17E_OUT")"
+assert_not_contains "t17e not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T17E_OUT")"
+rm -rf "$T17E"
+
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

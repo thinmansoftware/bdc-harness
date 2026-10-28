@@ -1621,6 +1621,7 @@ nodes:
   # inside the run worktree and emits the OBSERVED pass/total. It never trusts a builder
   # or validator claim. Always exits 0; the validator quotes TESTS_* as ground truth and
   # stamp-manifest-evidence writes TESTS_LINE into the manifest "Tests:" line.
+  # A baseline-red Tests line has the shape "<p>/<t> (<cmd>) -- head <p>/<t>; base <pb>/<tb> at <sha8>; newly failing: 0" and does not make VALIDATION fail.
   - id: resolve-test-command
     persona: major-build
     load_bearing: true
@@ -1677,9 +1678,9 @@ nodes:
   - id: run-stop-tests
     persona: major-build
     load_bearing: true
-    depends_on: [format-autofix, resolve-test-command]
+    depends_on: [format-autofix, resolve-test-command, resolve-review-base]
     task_class: clerical
-    timeout: 1800000
+    timeout: 3600000
     bash: |
       set -uo pipefail
 
@@ -2042,7 +2043,11 @@ nodes:
                     printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
                   fi
                 fi
-                timeout 1500 "$@" >> "$seg" 2>&1 < /dev/null
+                if [ -n "${RST_CMD_BUDGET_SECONDS:-}" ]; then
+                  timeout "$RST_CMD_BUDGET_SECONDS" "$@" >> "$seg" 2>&1 < /dev/null
+                else
+                  timeout 1500 "$@" >> "$seg" 2>&1 < /dev/null
+                fi
                 rc=$?
                 [ "$rc" -ne 0 ] && break
                 [ -z "$work" ] && break
@@ -2094,6 +2099,815 @@ nodes:
           fi
         fi
         printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\n' "$status" "$line"
+      }
+      # Baseline comparison (WO-HARNESS-EVIDENCE-BASE-VS-HEAD-TEST-DIFF-01).
+      # A failing head suite is blocking only when the merge-base does not already
+      # explain it. Pre-existing failures are reported as baseline_red.
+      # rst_abs_path <path> -> absolute path (relative paths stay usable after cd)
+      rst_abs_path() {
+        local p="$1" dir base
+        [ -n "$p" ] || { printf '%s' "$p"; return 0; }
+        case "$p" in
+          /*) printf '%s' "$p"; return 0 ;;
+        esac
+        dir="$(dirname "$p")"
+        base="$(basename "$p")"
+        if [ -d "$dir" ]; then
+          dir="$(cd "$dir" && pwd)"
+        fi
+        printf '%s/%s' "$dir" "$base"
+      }
+      # rst_is_uint <s> -> rc 0 when s is a non-empty decimal integer
+      rst_is_uint() {
+        case "$1" in
+          ''|*[!0-9]*) return 1 ;;
+        esac
+        return 0
+      }
+      # rst_reporter_kind <cmd> -> "vitest", "jest", or empty.
+      # Matches a vitest/jest token directly or via npx, bunx, or "bun x".
+      rst_reporter_kind() {
+        local cmd="$1" kind
+        kind="$(printf '%s\n' "$cmd" | awk '
+          BEGIN { kind = "" }
+          {
+            n = split($0, parts, /&&/)
+            for (i = 1; i <= n; i++) {
+              m = split(parts[i], tok, /[ \t]+/)
+              for (j = 1; j <= m; j++) {
+                b = tok[j]
+                sub(/^.*\//, "", b)
+                if (b == "vitest") { print "vitest"; exit }
+                if (b == "jest" && kind == "") kind = "jest"
+              }
+            }
+          }
+          END { if (kind != "") print kind }
+        ')"
+        printf '%s' "$kind"
+      }
+      # rst_append_reporter <cmd> <json-path> -> command with reporter flags appended
+      # to the vitest/jest segment. Other commands are returned unchanged.
+      # Called only from the base/head comparison path, never from rst_run_commands.
+      rst_append_reporter() {
+        local cmd="$1" json="$2" kind flags prefix="" work rest segment rebuilt="" skind once=1
+        kind="$(rst_reporter_kind "$cmd")"
+        if [ -z "$kind" ]; then
+          printf '%s' "$cmd"
+          return 0
+        fi
+        if [ "$kind" = "vitest" ]; then
+          flags="--reporter=default --reporter=json --outputFile=${json}"
+        else
+          flags="--json --outputFile=${json}"
+        fi
+        work="$cmd"
+        if printf '%s\n' "$work" | grep -qE '^[ ]*cd[ ]+[A-Za-z0-9_./-]+[ ]+&&[ ]+'; then
+          prefix="$(printf '%s\n' "$work" | sed -E 's/^([ ]*cd[ ]+[A-Za-z0-9_.\/-]+[ ]+&&[ ]+).*/\1/')"
+          work="${work#"$prefix"}"
+        fi
+        rest="$work"
+        while :; do
+          case "$rest" in
+            *'&&'*) segment="${rest%%&&*}"; rest="${rest#*&&}" ;;
+            *) segment="$rest"; rest="" ;;
+          esac
+          segment="$(printf '%s' "$segment" | sed 's/^[ ]*//; s/[ ]*$//')"
+          skind="$(rst_reporter_kind "$segment")"
+          if [ "$once" -eq 1 ] && [ "$skind" = "$kind" ]; then
+            segment="${segment} ${flags}"
+            once=0
+          fi
+          if [ -z "$rebuilt" ]; then
+            rebuilt="$segment"
+          else
+            rebuilt="${rebuilt} && ${segment}"
+          fi
+          [ -z "$rest" ] && break
+        done
+        printf '%s%s' "$prefix" "$rebuilt"
+      }
+      # rst_cmds_need_reporter <commands-file> -> rc 0 when any line names vitest or jest
+      rst_cmds_need_reporter() {
+        local cmds="$1" cmd
+        [ -f "$cmds" ] || return 1
+        while IFS= read -r cmd || [ -n "$cmd" ]; do
+          [ -z "$cmd" ] && continue
+          [ -n "$(rst_reporter_kind "$cmd")" ] && return 0
+        done < "$cmds"
+        return 1
+      }
+      # rst_compare_commands <commands-file> <log>
+      #   Runs the declared commands the way rst_run_commands does, after appending a
+      #   JSON reporter for vitest/jest. Prints "<exit> <passed> <total>". Non-empty
+      #   reporter files are recorded as "### json-report: <path>" lines on the log.
+      rst_compare_commands() {
+        local cmds="$1" log="$2" aug jsonlist cmd json rewritten result kind
+        aug="$(mktemp)"
+        jsonlist="$(mktemp)"
+        : > "$aug"
+        : > "$jsonlist"
+        while IFS= read -r cmd || [ -n "$cmd" ]; do
+          [ -z "$cmd" ] && continue
+          kind="$(rst_reporter_kind "$cmd")"
+          if [ -n "$kind" ]; then
+            json="$(mktemp)"
+            printf '%s\n' "$json" >> "$jsonlist"
+            rewritten="$(rst_append_reporter "$cmd" "$json")"
+          else
+            rewritten="$cmd"
+          fi
+          printf '%s\n' "$rewritten" >> "$aug"
+        done < "$cmds"
+        result="$(rst_run_commands "$aug" "$log")"
+        while IFS= read -r json || [ -n "$json" ]; do
+          [ -z "$json" ] && continue
+          if [ -s "$json" ]; then
+            printf '### json-report: %s\n' "$json" >> "$log"
+          else
+            rm -f "$json"
+          fi
+        done < "$jsonlist"
+        # Record the checkout that produced this log before any base worktree is removed.
+        # JSON file paths are stripped against this exact prefix plus a slash.
+        printf '### checkout-root: %s\n' "$PWD" >> "$log"
+        rm -f "$aug" "$jsonlist"
+        printf '%s' "$result"
+      }
+      # rst_drop_json_reports <log> removes reporter files named in the log
+      rst_drop_json_reports() {
+        local log="$1" p
+        [ -f "$log" ] || return 0
+        while IFS= read -r p || [ -n "$p" ]; do
+          [ -n "$p" ] && rm -f "$p"
+        done <<EOF
+      $(sed -n 's/^### json-report: //p' "$log" 2>/dev/null || true)
+      EOF
+      }
+      # rst_failing_names (runner output on stdin)
+      #   Emits only tab-separated records:
+      #     T<TAB><trimmed test identity>
+      #     F<TAB><file><TAB><count>
+      #   Test identities: bun "(fail) <name>", TAP "not ok <n> - <name>" and
+      #   "not ok <n> <name>", pytest "FAILED <nodeid>", mocha "  <n>) <name>",
+      #   vitest/jest "FAIL <file> > <suite> > <name>", and "x <name>" / "- <name>"
+      #   directly under a bare FAIL header. A bare "FAIL <file>" is a file identity
+      #   only (one count per matching line), never a test identity.
+      #   FILE QUALIFICATION (bdc-xo #1940, round 5): a bare name carries no file, so
+      #   the same name failing in DIFFERENT files at base and head compared equal and
+      #   could emit baseline_red. When the log supplies the enclosing file -- a bun
+      #   "<path.ext>:" block header, or the "FAIL <file>" header a "x/- <name>" child
+      #   sits under -- the identity is emitted as "<file>::<name>" so those two are
+      #   distinct. Identities that already carry a file (pytest nodeids, vitest
+      #   "FAIL <file> > <name>") are never re-qualified. When the runner supplies no
+      #   file anywhere the identity stays bare; rst_identity_context_mixed then fails
+      #   names mode closed for any log that proves file context WAS available while
+      #   some identity still lacks it. Reporter JSON
+      #   ("### json-report: <path>", testResults[].assertionResults[] status=failed)
+      #   contributes "<file>::<fullName>" after stripping a "### checkout-root: <pwd>"
+      #   prefix only when that exact prefix plus a slash is present. JSON identities
+      #   are added to text identities; they never replace them. Coverage counts one
+      #   physical failure when "FAIL <file> > <name>" and "<file>::<name>" normalize
+      #   to the same file and name. File counts stay separate.
+      rst_failing_names() {
+        local text text_out json_out esc
+        text="$(cat)"
+        esc="$(printf '\033')"
+        text="$(printf '%s\n' "$text" | sed -E "s/${esc}\[[0-9;]*[A-Za-z]//g")"
+        text_out="$(printf '%s\n' "$text" | awk '
+          function trim(s) {
+            sub(/\r$/, "", s)
+            sub(/^[ \t]+/, "", s)
+            sub(/[ \t]+$/, "", s)
+            return s
+          }
+          function emit_t(s) {
+            s = trim(s)
+            if (s != "" && !(s in seen)) { seen[s] = 1; print "T\t" s }
+          }
+          # qual(s) prefixes a BARE name with the enclosing file when the log gave one.
+          # Identities that already carry a file must never reach this.
+          function qual(s,   f) {
+            s = trim(s)
+            if (s == "") return s
+            f = (fail_file != "" ? fail_file : curfile)
+            if (f == "") return s
+            return f "::" s
+          }
+          /^### json-report: / { next }
+          /^### checkout-root: / { next }
+          # bun block header: a bare "<path.ext>:" line opens a new file scope.
+          /^[ \t]*[A-Za-z0-9._\/@+-]+\.[A-Za-z0-9]+:[ \t]*\r?$/ {
+            line = trim($0)
+            sub(/:$/, "", line)
+            curfile = line
+            in_fail = 0
+            fail_file = ""
+            next
+          }
+          /^[ \t]*\(fail\)[ \t]+/ {
+            line = $0
+            sub(/^[ \t]*\(fail\)[ \t]+/, "", line)
+            emit_t(qual(line))
+            next
+          }
+          /^[ \t]*not ok[ \t]+[0-9]+/ {
+            line = $0
+            sub(/^[ \t]*not ok[ \t]+[0-9]+[ \t]*/, "", line)
+            sub(/^-([ \t]+)?/, "", line)
+            emit_t(qual(line))
+            next
+          }
+          /^[ \t]*FAILED[ \t]+[^ \t]/ {
+            line = $0
+            sub(/^[ \t]*FAILED[ \t]+/, "", line)
+            sub(/[ \t].*$/, "", line)
+            emit_t(line)
+            next
+          }
+          /^[ \t]*[0-9]+\)[ \t]+/ {
+            line = $0
+            sub(/^[ \t]*[0-9]+\)[ \t]+/, "", line)
+            emit_t(qual(line))
+            next
+          }
+          /^[ \t]*FAIL[ \t]+/ {
+            line = trim($0)
+            if (index(line, " > ") > 0) {
+              in_fail = 0
+              fail_file = ""
+              emit_t(line)
+              next
+            }
+            sub(/^FAIL[ \t]+/, "", line)
+            sub(/[ \t].*$/, "", line)
+            if (line != "") {
+              files[line] += 1
+              in_fail = 1
+              fail_file = line
+            }
+            next
+          }
+          in_fail && /^[ \t]+[x-][ \t]+/ {
+            line = $0
+            sub(/^[ \t]+[x-][ \t]+/, "", line)
+            emit_t(qual(line))
+            next
+          }
+          /^[ \t]*$/ { in_fail = 0; fail_file = ""; next }
+          in_fail { in_fail = 0; fail_file = "" }
+          END {
+            for (f in files) print "F\t" f "\t" files[f]
+          }
+        ')"
+        json_out="$(
+          root="$(printf '%s\n' "$text" | sed -n 's/^### checkout-root: //p' | head -n 1)"
+          root="$(printf '%s' "$root" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s:/*$::')"
+          printf '%s\n' "$text" | sed -n 's/^### json-report: //p' | while IFS= read -r jp || [ -n "$jp" ]; do
+            [ -s "$jp" ] || continue
+            jq -r '.testResults[]? | .name as $f | .assertionResults[]? | select(.status == "failed") | [$f, (.fullName // "")] | @tsv' "$jp" 2>/dev/null | while IFS="$(printf '\t')" read -r file full || [ -n "${file:-}" ]; do
+              [ -n "${file:-}" ] || continue
+              rel="$file"
+              if [ -n "$root" ]; then
+                case "$rel" in
+                  "$root"/*) rel="${rel#"$root"/}" ;;
+                esac
+              fi
+              rel="$(printf '%s' "$rel" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+              full="$(printf '%s' "${full:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+              printf '%s::%s\n' "$rel" "$full"
+            done
+          done
+        )"
+        {
+          printf '%s\n' "$text_out"
+          printf '%s\n' "$json_out" | awk '
+            NF {
+              s = $0
+              sub(/\r$/, "", s)
+              sub(/^[ \t]+/, "", s)
+              sub(/[ \t]+$/, "", s)
+              if (s != "") print "T\t" s
+            }
+          '
+        } | awk -F '\t' '
+          $1 == "T" {
+            id = substr($0, 3)
+            if (!(id in seen)) { seen[id] = 1; print }
+            next
+          }
+          $1 == "F" { print }
+        '
+      }
+      # rst_base_pass <base-sha> <commands-file> <base-log>
+      #   Detached temporary worktree at <base-sha>. Never checks the base out in the
+      #   run worktree. Runs dprep_ensure_js_deps (stdout to stderr; a failed install
+      #   still returns 0) and the same command list under RST_BASE_BUDGET_SECONDS
+      #   (default 1500). Prints "<exit> <passed> <total>" or UNAVAILABLE. Setup
+      #   failure does not change the head verdict.
+      rst_base_pass() {
+        local base_sha="$1" cmds="$2" base_log="$3"
+        local parent="" wt="" result="" wrap=0
+        parent="$(mktemp -d 2>/dev/null || true)"
+        if [ -z "$parent" ] || [ ! -d "$parent" ]; then
+          printf 'UNAVAILABLE'
+          return 0
+        fi
+        wt="${parent}/base"
+        if ! git worktree add --detach "$wt" "$base_sha" >/dev/null 2>&1; then
+          rm -rf "$parent"
+          printf 'rst_base_pass: worktree add failed\n' >&2
+          printf 'UNAVAILABLE'
+          return 0
+        fi
+        result="$(
+          cd "$wt" || exit 97
+          dprep_ensure_js_deps >&2
+          export RST_CMD_BUDGET_SECONDS="${RST_BASE_BUDGET_SECONDS:-1500}"
+          rst_compare_commands "$cmds" "$base_log"
+        )"
+        wrap=$?
+        git worktree remove --force "$wt" >/dev/null 2>&1 || true
+        rm -rf "$parent" || true
+        if [ "$wrap" -ne 0 ] || [ -z "$result" ]; then
+          printf 'rst_base_pass: command setup failed\n' >&2
+          printf 'UNAVAILABLE'
+          return 0
+        fi
+        printf '%s' "$result"
+      }
+      # rst_emit_verdict prints the base contract, then TESTS_STATUS and TESTS_LINE.
+      rst_emit_verdict() {
+        printf 'TESTS_BASE_SHA=%s\n' "$1"
+        printf 'TESTS_BASE_STATUS=%s\n' "$2"
+        printf 'TESTS_BASE_PASSED=%s\n' "$3"
+        printf 'TESTS_BASE_TOTAL=%s\n' "$4"
+        printf 'TESTS_NEWLY_FAILING=%s\n' "$5"
+        printf 'TESTS_NEWLY_FAILING_MODE=%s\n' "$6"
+        printf 'TESTS_BASE_EXIT=%s\n' "$7"
+        printf 'TESTS_BASE_EVIDENCE=%s\n' "$8"
+        printf 'TESTS_BASE_LOG=%s\n' "$9"
+        printf 'TESTS_STATUS=%s\n' "${10}"
+        printf 'TESTS_LINE=%s\n' "${11}"
+      }
+      # rst_format_compared_line <p> <t> <cmd> <exit> <bp> <bt> <sha8> <newly> <names> <failed-form> <suffix> <unexplained>
+      rst_format_compared_line() {
+        local p="$1" t="$2" cmd="$3" exit_code="$4" bp="$5" bt="$6" sha8="$7" newly="$8" names="$9"
+        local failed_form="${10}" suffix="${11}" unexplained="${12}" regress="${13:-}" body namepart=""
+        if [ -n "$names" ]; then
+          namepart=" (${names})"
+        fi
+        if [ "$failed_form" = "1" ]; then
+          body="${p}/${t} (${cmd}) -- FAILED, exit ${exit_code} head ${p}/${t}; base ${bp}/${bt} at ${sha8}; newly failing: ${newly}${namepart}"
+        else
+          body="${p}/${t} (${cmd}) -- head ${p}/${t}; base ${bp}/${bt} at ${sha8}; newly failing: ${newly}${namepart}"
+        fi
+        if [ "$unexplained" = "1" ]; then
+          body="${body} unexplained head exit ${exit_code}"
+        fi
+        if [ -n "$regress" ]; then
+          body="${body} ${regress}"
+        fi
+        if [ -n "$suffix" ]; then
+          printf '%s %s' "$body" "$suffix"
+        else
+          printf '%s' "$body"
+        fi
+      }
+      # rst_identity_count (T/F records on stdin) -> physical T-record count
+      #   "FAIL <file> > <name>" and "<file>::<name>" are one failure when the
+      #   file and the normalized name match. Other identities stay distinct.
+      #   POSIX awk only (mawk): no gensub.
+      rst_identity_count() {
+        awk -F '\t' '
+          function squash(s) {
+            gsub(/ > /, " ", s)
+            gsub(/[[:space:]]+/, " ", s)
+            sub(/^ /, "", s)
+            sub(/ $/, "", s)
+            return s
+          }
+          function canon(id,   rest, file, pos) {
+            if (index(id, "FAIL ") == 1 && index(id, " > ") > 0) {
+              rest = substr(id, 6)
+              pos = index(rest, " > ")
+              file = substr(rest, 1, pos - 1)
+              sub(/^[ \t]+/, "", file)
+              sub(/[ \t]+$/, "", file)
+              rest = substr(rest, pos + 3)
+              return file SUBSEP squash(rest)
+            }
+            pos = index(id, "::")
+            if (pos > 1) {
+              file = substr(id, 1, pos - 1)
+              rest = substr(id, pos + 2)
+              return file SUBSEP squash(rest)
+            }
+            return id
+          }
+          $1 == "T" {
+            id = substr($0, 3)
+            k = canon(id)
+            if (!(k in seen)) { seen[k] = 1; c++ }
+          }
+          END { print c+0 }
+        '
+      }
+      # rst_uncovered_file_count (T/F records on stdin) -> number of F-record files that
+      #   are NOT covered by any T-identity file. A T identity carries a file only in the
+      #   vitest "FAIL <file> > <name>" and JSON "<file>::<name>" forms; bare identities
+      #   (bun/tap/mocha/under-FAIL) carry none. Names mode drops F records entirely, so a
+      #   head-only file-level failure ("FAIL <new-file>" collection/import error with no
+      #   per-test name) would be masked by supplemental reporter identities for OTHER
+      #   files unless its own file is also named by a T identity. A nonzero count means
+      #   the named identities do not explain every failing file, so names mode is unsafe
+      #   and the caller must fall through to the file-count/count gate (bdc-xo #1940 r4).
+      rst_uncovered_file_count() {
+        awk -F '\t' '
+          function filepart(id,   p, f) {
+            if (index(id, "FAIL ") == 1 && index(id, " > ") > 0) {
+              f = substr(id, 6, index(id, " > ") - 6)
+              sub(/^[ \t]+/, "", f); sub(/[ \t]+$/, "", f)
+              return f
+            }
+            p = index(id, "::")
+            if (p > 1) return substr(id, 1, p - 1)
+            return ""
+          }
+          $1 == "T" { f = filepart(substr($0, 3)); if (f != "") tf[f] = 1; next }
+          $1 == "F" { ff[$2] = 1 }
+          END { n = 0; for (k in ff) if (!(k in tf)) n++; print n + 0 }
+        '
+      }
+      # rst_identity_context_mixed (T/F records on stdin) -> "1" when the stream carries
+      #   BOTH file-qualified and bare T identities, else "0" (bdc-xo #1940, round 5).
+      #   A bare identity is only safe to compare when the runner never reported a file
+      #   at all: then neither side can observe the file and the comparison is symmetric.
+      #   If the SAME log proves file context was available (some identity carries a
+      #   file) while another identity is still bare, that bare name may belong to a
+      #   different file at head than at base -- exactly the collision that lets a real
+      #   regression match a baseline name and emit baseline_red. There is no evidence
+      #   left to resolve it, so names mode fails CLOSED and the caller falls through to
+      #   the file-count/count gate, both of which stay blocking.
+      rst_identity_context_mixed() {
+        awk -F '\t' '
+          function filepart(id,   p, f) {
+            if (index(id, "FAIL ") == 1 && index(id, " > ") > 0) {
+              f = substr(id, 6, index(id, " > ") - 6)
+              sub(/^[ \t]+/, "", f); sub(/[ \t]+$/, "", f)
+              return f
+            }
+            p = index(id, "::")
+            if (p > 1) return substr(id, 1, p - 1)
+            return ""
+          }
+          $1 == "T" { if (filepart(substr($0, 3)) == "") bare = 1; else qualified = 1 }
+          END { print (bare && qualified) ? 1 : 0 }
+        '
+      }
+      # rst_segment_count <log> -> number of "### run-stop-tests:" command segments.
+      rst_segment_count() {
+        [ -f "$1" ] || { printf '0'; return 0; }
+        grep -c '^### run-stop-tests: ' "$1" 2>/dev/null || printf '0'
+      }
+      # rst_segment_outcomes <log> -> one line per command segment, in order:
+      #   "<exit>|<passed> <total>" (counts empty when the segment parsed none). A
+      #   segment runs from a "### run-stop-tests:" header to its "### exit" marker.
+      rst_segment_outcomes() {
+        local log="$1" n i body exitc counts
+        n="$(rst_segment_count "$log")"
+        i=1
+        while [ "$i" -le "$n" ]; do
+          body="$(awk -v w="$i" '
+            /^### run-stop-tests: / { s++; inb=(s==w); next }
+            /^### exit / { if (s==w) inb=0; next }
+            inb && !/^### / { print }
+          ' "$log")"
+          exitc="$(awk -v w="$i" '
+            /^### run-stop-tests: / { s++; next }
+            /^### exit / { if (s==w) { print $3; exit } }
+          ' "$log")"
+          counts="$(printf '%s\n' "$body" | rst_parse_counts)"
+          printf '%s|%s\n' "${exitc:-none}" "$counts"
+          i=$((i + 1))
+        done
+      }
+      # rst_segment_body <log> <w> -> body lines of command segment w (1-based), with the
+      #   "### " marker lines removed. Mirrors rst_segment_outcomes' per-segment slice.
+      rst_segment_body() {
+        awk -v w="$2" '
+          /^### run-stop-tests: / { s++; inb=(s==w); next }
+          /^### exit / { if (s==w) inb=0; next }
+          inb && !/^### / { print }
+        ' "$1"
+      }
+      # rst_cmd_new_names <head-log> <base-log> -> "1" when any position-aligned command
+      #   has a failing TEST-NAME identity at head that is absent from the corresponding
+      #   base command, else "0" (bdc-xo #1940, round 4). Aggregate name matching can mask
+      #   a per-command regression when the same bare name fails in DIFFERENT commands at
+      #   base and head (two files swap which command fails them): the per-command COUNT
+      #   gate (rst_cmd_regression) misses it because each command's failing count is
+      #   unchanged. Commands are matched by position like rst_cmd_regression: the head
+      #   log's last N segments (N = base segment count). Text identities only; reporter
+      #   JSON is an aggregate concern handled by rst_uncovered_file_count.
+      rst_cmd_new_names() {
+        local head_log="$1" base_log="$2" nb nh start i hn bn newn
+        nb="$(rst_segment_count "$base_log")"
+        if [ "${nb:-0}" -lt 1 ]; then printf '0'; return 0; fi
+        nh="$(rst_segment_count "$head_log")"
+        start=$((nh - nb + 1))
+        [ "$start" -lt 1 ] && start=1
+        i=0
+        while [ "$i" -lt "$nb" ]; do
+          hn="$(rst_segment_body "$head_log" $((start + i)) | rst_failing_names | awk -F '\t' '$1=="T"{print substr($0,3)}' | LC_ALL=C sort -u)"
+          bn="$(rst_segment_body "$base_log" $((1 + i)) | rst_failing_names | awk -F '\t' '$1=="T"{print substr($0,3)}' | LC_ALL=C sort -u)"
+          newn="$(LC_ALL=C comm -23 <(printf '%s\n' "$hn") <(printf '%s\n' "$bn") | grep -c . || true)"
+          if [ "${newn:-0}" -ge 1 ]; then printf '1'; return 0; fi
+          i=$((i + 1))
+        done
+        printf '0'
+      }
+      # rst_cmd_regression <head-log> <base-log> -> "1" when any single command's head
+      #   outcome is worse than the same command on the base, else "0" (bdc-xo #1940,
+      #   round 3). Commands are matched by position: the head log's last N segments
+      #   (N = base segment count) so ladder fall-through rungs are ignored. "Worse" =
+      #   base passed but head did not, base produced counts but head lost them (crash
+      #   or kill mid-run), a new timeout/kill (124/137/143), or strictly more failing
+      #   tests in that one command. A command equally broken on both sides is not a
+      #   regression. This keeps the verdict blocking when a new per-command failure
+      #   would otherwise be masked by matching identities elsewhere.
+      rst_cmd_regression() {
+        local head_log="$1" base_log="$2"
+        local base_lines head_lines k htotal start i hl bl he be hc bc
+        local hzero bzero hhc bhc hp ht bp bt hf bf
+        base_lines="$(rst_segment_outcomes "$base_log")"
+        head_lines="$(rst_segment_outcomes "$head_log")"
+        k="$(printf '%s\n' "$base_lines" | grep -c . || true)"
+        if [ "${k:-0}" -lt 1 ]; then printf '0'; return 0; fi
+        htotal="$(printf '%s\n' "$head_lines" | grep -c . || true)"
+        start=$((htotal - k + 1))
+        [ "$start" -lt 1 ] && start=1
+        head_lines="$(printf '%s\n' "$head_lines" | sed -n "${start},\$p")"
+        i=1
+        while [ "$i" -le "$k" ]; do
+          hl="$(printf '%s\n' "$head_lines" | sed -n "${i}p")"
+          bl="$(printf '%s\n' "$base_lines" | sed -n "${i}p")"
+          he="${hl%%|*}"; hc="${hl#*|}"
+          be="${bl%%|*}"; bc="${bl#*|}"
+          hzero=0; [ "$he" = "0" ] && hzero=1
+          bzero=0; [ "$be" = "0" ] && bzero=1
+          hhc=0; [ -n "$hc" ] && hhc=1
+          bhc=0; [ -n "$bc" ] && bhc=1
+          if [ "$bzero" = "1" ] && [ "$hzero" = "0" ]; then printf '1'; return 0; fi
+          if [ "$bhc" = "1" ] && [ "$hhc" = "0" ]; then printf '1'; return 0; fi
+          case "$he" in
+            124|137|143)
+              case "$be" in
+                124|137|143) ;;
+                *) printf '1'; return 0 ;;
+              esac
+              ;;
+          esac
+          if [ "$hhc" = "1" ] && [ "$bhc" = "1" ]; then
+            hp="${hc%% *}"; ht="${hc##* }"; bp="${bc%% *}"; bt="${bc##* }"
+            if rst_is_uint "$hp" && rst_is_uint "$ht" && rst_is_uint "$bp" && rst_is_uint "$bt"; then
+              hf=$((ht - hp)); bf=$((bt - bp))
+              [ "$hf" -lt 0 ] && hf=0
+              [ "$bf" -lt 0 ] && bf=0
+              if [ "$hf" -gt "$bf" ]; then printf '1'; return 0; fi
+            fi
+          fi
+          i=$((i + 1))
+        done
+        printf '0'
+      }
+      # rst_apply_verdict <class> <cmd> <exit> <counts> <log> <head_status> <head_line> <review_base_output> <cmds_file>
+      #   Runs only after the head ladder. Skips the base pass for DOCUMENTATION /
+      #   OPERATOR, an empty command, head status passed / counts_unparsed /
+      #   no_command_declared, and head exit 127. Otherwise compares failing
+      #   identities to the merge-base (fallback: run-start-sha.txt). A per-command
+      #   regression (rst_cmd_regression) forces a blocking verdict even when the
+      #   aggregate identities match; count-only evidence yields baseline_red only when
+      #   neither side observed a failing test.
+      rst_apply_verdict() {
+        local class="$1" cmd="$2" exit_code="$3" counts="$4" log="$5"
+        local head_status="$6" head_line="$7" review_out="$8" cmds="$9"
+        local skip=0 review_base="" base_sha="" start_sha="" start_file=""
+        case "$class" in
+          DOCUMENTATION|OPERATOR) skip=1 ;;
+        esac
+        [ -z "$cmd" ] && skip=1
+        case "$head_status" in
+          passed|counts_unparsed|no_command_declared) skip=1 ;;
+        esac
+        if [ "${exit_code:-0}" -eq 127 ] 2>/dev/null; then
+          skip=1
+        fi
+        if [ "$skip" -eq 1 ]; then
+          rst_emit_verdict none not_run none none none n/a none none none "$head_status" "$head_line"
+          return 0
+        fi
+        review_base="$(printf '%s\n' "$review_out" | sed -n 's/^REVIEW_BASE=//p' | head -n 1 | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        if [ -n "$review_base" ]; then
+          base_sha="$(git merge-base HEAD "origin/${review_base}" 2>/dev/null || true)"
+        fi
+        if [ -z "$base_sha" ]; then
+          start_file="${ARTIFACTS_DIR:-.}/run-start-sha.txt"
+          if [ -f "$start_file" ]; then
+            start_sha="$(tr -d '[:space:]' < "$start_file" 2>/dev/null || true)"
+          else
+            start_sha=""
+          fi
+          if [ -n "$start_sha" ] && git rev-parse --verify -q "${start_sha}^{commit}" >/dev/null 2>&1; then
+            base_sha="$(git rev-parse --verify "${start_sha}^{commit}" 2>/dev/null || true)"
+          fi
+        fi
+        if [ -z "$base_sha" ]; then
+          rst_emit_verdict none unavailable none none none n/a none none none "$head_status" "$head_line"
+          return 0
+        fi
+        log="$(rst_abs_path "$log")"
+        cmds="$(rst_abs_path "$cmds")"
+        local base_log="${log}.base" base_result="" base_exit="" base_counts=""
+        local bp="" bt="" sha8="" evidence="no" bstatus="failed" mode="n/a" newly="none"
+        local head_cmp="" head_records="" base_records=""
+        local suffix="" final_line="" shown="" failed_form=1 unexplained=0
+        local hp="" ht="" names_h="" names_b="" only="" hf="" bf=""
+        local cmd_regression=0 regress_note=""
+        sha8="$(printf '%s' "$base_sha" | cut -c1-8)"
+        : > "$base_log" 2>/dev/null || true
+        base_result="$(rst_base_pass "$base_sha" "$cmds" "$base_log")"
+        if [ "$base_result" = "UNAVAILABLE" ] || [ -z "$base_result" ]; then
+          rst_drop_json_reports "$base_log"
+          rm -f "$base_log"
+          rst_emit_verdict "$base_sha" unavailable none none none n/a none none none "$head_status" "$head_line"
+          return 0
+        fi
+        base_exit="${base_result%% *}"
+        base_counts="${base_result#* }"
+        base_counts="$(printf '%s' "$base_counts" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        if ! rst_is_uint "$base_exit" || [ "$base_exit" -eq 127 ] || [ -z "$base_counts" ]; then
+          rst_drop_json_reports "$base_log"
+          rst_emit_verdict "$base_sha" unavailable none none none n/a "${base_exit:-none}" none "$base_log" "$head_status" "$head_line"
+          return 0
+        fi
+        bp="${base_counts%% *}"
+        bt="${base_counts##* }"
+        if ! rst_is_uint "$bp" || ! rst_is_uint "$bt"; then
+          rst_drop_json_reports "$base_log"
+          rst_emit_verdict "$base_sha" unavailable none none none n/a "$base_exit" none "$base_log" "$head_status" "$head_line"
+          return 0
+        fi
+        if [ -z "$counts" ] || ! rst_is_uint "${counts%% *}" || ! rst_is_uint "${counts##* }"; then
+          rst_drop_json_reports "$base_log"
+          rst_emit_verdict "$base_sha" failed "$bp" "$bt" none n/a "$base_exit" none "$base_log" "$head_status" "$head_line"
+          return 0
+        fi
+        hp="${counts%% *}"
+        ht="${counts##* }"
+        unset RST_CMD_BUDGET_SECONDS
+        # Head identities come from the original run's log first (the same execution the
+        # head exit and counts were computed from). When the command uses a vitest/jest
+        # reporter, a supplemental reporter pass ADDS its per-test JSON identities; it
+        # never replaces the original run's identities, and its exit/counts are
+        # discarded (bdc-xo #1940, round 3). File identities stay from the original run
+        # only, so the reporter pass cannot double-count a file header.
+        head_records="$(rst_failing_names < "$log")"
+        if rst_cmds_need_reporter "$cmds"; then
+          head_cmp="$(mktemp)"
+          rst_compare_commands "$cmds" "$head_cmp" >/dev/null
+          head_records="$(
+            {
+              printf '%s\n' "$head_records"
+              rst_failing_names < "$head_cmp" | awk -F '\t' '$1 == "T"'
+            } | awk -F '\t' '
+              $1 == "T" { id = substr($0, 3); if (!(id in seen)) { seen[id] = 1; print } next }
+              $1 == "F" { print }
+            '
+          )"
+          rst_drop_json_reports "$head_cmp"
+          rm -f "$head_cmp"
+        fi
+        base_records="$(rst_failing_names < "$base_log")"
+        rst_drop_json_reports "$base_log"
+        if [ "$base_exit" -ne 0 ] || printf '%s\n' "$base_records" | awk -F '\t' '$1=="T" || $1=="F" { found=1 } END { exit found ? 0 : 1 }' || [ "$bp" -lt "$bt" ]; then
+          evidence="yes"
+        fi
+        if [ "$base_exit" -eq 0 ] && [ "$bt" -gt 0 ] && [ "$bp" -eq "$bt" ]; then
+          bstatus="passed"
+        else
+          bstatus="failed"
+        fi
+        suffix="$(printf '%s\n' "$head_line" | sed -n 's/.* \(\[source:.*\]\)$/\1/p')"
+        if [ "$evidence" != "yes" ]; then
+          final_line="$(rst_format_compared_line "$hp" "$ht" "$cmd" "$exit_code" "$bp" "$bt" "$sha8" 0 "" 1 "$suffix" 1)"
+          rst_emit_verdict "$base_sha" "$bstatus" "$bp" "$bt" 0 n/a "$base_exit" no "$base_log" failed "$final_line"
+          return 0
+        fi
+        # Per-command regression gate (bdc-xo #1940 round 3): a command that got worse
+        # at head (new failing exit, lost counts, new timeout, or more failures in that
+        # one command) blocks even when the aggregate identities match.
+        cmd_regression="$(rst_cmd_regression "$log" "$base_log")"
+        # A per-command new failing NAME is also a regression even when per-command counts
+        # match (bdc-xo #1940 round 4): aggregate name matching cannot see a name that
+        # fails in a different command at head than at base.
+        if [ "$cmd_regression" != "1" ]; then
+          cmd_regression="$(rst_cmd_new_names "$log" "$base_log")"
+        fi
+        local ht_n bt_n hf_n bf_n hf_sum bf_sum head_obs base_obs names_complete=0 file_cover=0
+        local head_f_uncovered=0 head_mixed=0 base_mixed=0
+        head_obs=$((ht - hp))
+        base_obs=$((bt - bp))
+        if [ "$head_obs" -lt 0 ]; then head_obs=0; fi
+        if [ "$base_obs" -lt 0 ]; then base_obs=0; fi
+        ht_n="$(printf '%s\n' "$head_records" | rst_identity_count)"
+        bt_n="$(printf '%s\n' "$base_records" | rst_identity_count)"
+        hf_n="$(printf '%s\n' "$head_records" | awk -F '\t' '$1=="F"{c++} END{print c+0}')"
+        bf_n="$(printf '%s\n' "$base_records" | awk -F '\t' '$1=="F"{c++} END{print c+0}')"
+        hf_sum="$(printf '%s\n' "$head_records" | awk -F '\t' '$1=="F"{s+=$3} END{print s+0}')"
+        bf_sum="$(printf '%s\n' "$base_records" | awk -F '\t' '$1=="F"{s+=$3} END{print s+0}')"
+        # Reporter identities for other files must not plug the identity count while a
+        # head-only "FAIL <new-file>" header (an F record with no per-test name) is left
+        # unexplained -- names mode would drop that F record and emit baseline_red. Require
+        # every head failing file to be named by a T identity before trusting names.
+        head_f_uncovered="$(printf '%s\n' "$head_records" | rst_uncovered_file_count)"
+        # Bare names are comparable only while NEITHER side ever reported a file. A log
+        # that qualifies some identities but leaves others bare cannot prove the bare
+        # ones came from the same file on both sides, so names mode fails closed
+        # (bdc-xo #1940 round 5).
+        head_mixed="$(printf '%s\n' "$head_records" | rst_identity_context_mixed)"
+        base_mixed="$(printf '%s\n' "$base_records" | rst_identity_context_mixed)"
+        # One physical identity per observed failure. Duplicate reporter strings are not coverage.
+        if [ "$ht_n" -ge 1 ] && [ "$bt_n" -ge 1 ] && [ "$ht_n" -eq "$head_obs" ] && [ "$bt_n" -eq "$base_obs" ] && [ "${head_f_uncovered:-0}" -eq 0 ] && [ "${head_mixed:-0}" -eq 0 ] && [ "${base_mixed:-0}" -eq 0 ]; then
+          names_complete=1
+        fi
+        if [ "$hf_n" -ge 1 ] && [ "$bf_n" -ge 1 ] && [ "$hf_sum" -ge "$head_obs" ] && [ "$bf_sum" -ge "$base_obs" ]; then
+          file_cover=1
+        fi
+        if [ "$names_complete" -eq 1 ]; then
+          mode="names"
+          names_h="$(mktemp)"
+          names_b="$(mktemp)"
+          printf '%s\n' "$head_records" | awk -F '\t' '$1=="T"{print substr($0,3)}' | LC_ALL=C sort -u > "$names_h"
+          printf '%s\n' "$base_records" | awk -F '\t' '$1=="T"{print substr($0,3)}' | LC_ALL=C sort -u > "$names_b"
+          only="$(LC_ALL=C comm -23 "$names_h" "$names_b" || true)"
+          if [ -z "$only" ]; then
+            newly=0
+            shown="$(LC_ALL=C comm -12 "$names_h" "$names_b" | head -n 5 | paste -sd ',' - | sed 's/,/, /g')"
+            head_status="baseline_red"
+            failed_form=0
+          else
+            newly="$(printf '%s\n' "$only" | grep -c . || true)"
+            shown="$(printf '%s\n' "$only" | head -n 5 | paste -sd ',' - | sed 's/,/, /g')"
+            head_status="failed"
+            failed_form=1
+          fi
+          rm -f "$names_h" "$names_b"
+        elif [ "$file_cover" -eq 1 ]; then
+          # File headers never authorize baseline_red, including a zero delta.
+          mode="file-count"
+          newly="$(awk -F '\t' '
+            NR==FNR && $1=="F" { b[$2]=$3; next }
+            $1=="F" { h[$2]=$3 }
+            END {
+              s = 0
+              for (f in h) {
+                bv = (f in b ? b[f] : 0)
+                d = h[f] - bv
+                if (d > 0) s += d
+              }
+              print s+0
+            }
+          ' <(printf '%s\n' "$base_records") <(printf '%s\n' "$head_records"))"
+          shown=""
+          head_status="failed"
+          failed_form=1
+        else
+          mode="count"
+          newly=$((head_obs - base_obs))
+          if [ "$newly" -lt 0 ]; then newly=0; fi
+          shown=""
+          # bdc-xo #1940 round 3: counts alone never prove a head failure existed at
+          # base. baseline_red here is allowed only when neither side observed a
+          # failing test (an exit-code-only failure present on both sides); any
+          # observed failure without identities stays blocking.
+          if [ "$head_obs" -eq 0 ] && [ "$base_obs" -eq 0 ] && [ "$ht_n" -eq 0 ] && [ "$bt_n" -eq 0 ] && [ "$hf_n" -eq 0 ] && [ "$bf_n" -eq 0 ]; then
+            head_status="baseline_red"
+            failed_form=0
+          else
+            head_status="failed"
+            failed_form=1
+          fi
+        fi
+        # A per-command regression overrides a would-be baseline_red: the aggregate
+        # identities matched, but one command got worse at head.
+        if [ "$cmd_regression" = "1" ] && [ "$head_status" = "baseline_red" ]; then
+          head_status="failed"
+          failed_form=1
+          regress_note="command regression at head"
+        fi
+        final_line="$(rst_format_compared_line "$hp" "$ht" "$cmd" "$exit_code" "$bp" "$bt" "$sha8" "$newly" "$shown" "$failed_form" "$suffix" 0 "$regress_note")"
+        rst_emit_verdict "$base_sha" "$bstatus" "$bp" "$bt" "$newly" "$mode" "$base_exit" yes "$base_log" "$head_status" "$final_line"
       }
       # ---- END rst core ----
 
@@ -2206,6 +3020,7 @@ nodes:
       EXIT_CODE=0
       COUNTS=""
       CMD_JOINED=""
+      unset RST_CMD_BUDGET_SECONDS
       # rst_try <source-label>: run whatever is in $CMDS; rc 0 when counts were parsed.
       rst_try() {
         [ -s "$CMDS" ] || return 1
@@ -2263,12 +3078,20 @@ nodes:
       echo "TESTS_PASSED=${COUNTS%% *}"
       echo "TESTS_TOTAL=${COUNTS##* }"
       if [ "$SOURCE" = "project-map" ]; then
-        SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/"
+        HEAD_REPORT="$(SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/")"
       else
         REPORT_SOURCE="${SOURCE%% *}"
         if [ "$REPORT_SOURCE" = "spec_declared" ]; then REPORT_SOURCE="wo-spec"; fi
-        rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
+        HEAD_REPORT="$(rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/")"
       fi
+      HEAD_STATUS="$(printf '%s\n' "$HEAD_REPORT" | sed -n 's/^TESTS_STATUS=//p' | head -n 1)"
+      HEAD_LINE="$(printf '%s\n' "$HEAD_REPORT" | sed -n 's/^TESTS_LINE=//p' | head -n 1)"
+      REVIEW_BASE_OUTPUT="$(cat <<'RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL' | capture_node_output
+      $resolve-review-base.output
+      RESOLVE_REVIEW_BASE_OUTPUT_SENTINEL
+      )"
+      unset RST_CMD_BUDGET_SECONDS
+      rst_apply_verdict "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$LOG" "$HEAD_STATUS" "$HEAD_LINE" "$REVIEW_BASE_OUTPUT" "$CMDS"
       echo "TESTS_LOG=$LOG"
       if [ -s "$LOG" ]; then
         echo "--- last 80 lines of test output ---"
@@ -4627,6 +5450,7 @@ nodes:
         Files created: <comma-separated list -- ONLY files added in the diff; or "none">
         Files modified: <comma-separated list -- ONLY files changed in the diff; or "none">
         Tests: <N passing / N total> or N/A (<reason>)
+        A baseline-red Tests line has the shape "<p>/<t> (<cmd>) -- head <p>/<t>; base <pb>/<tb> at <sha8>; newly failing: 0" and does not make VALIDATION fail.
         PRs: <PR URL> or N/A (ALREADY_SATISFIED or BLOCKED)
         Merge ancestors: <merge-base SHA>...<HEAD SHA> (behind_by=<N>) or N/A
         Grep assertions: <command> => <N> lines; or N/A (manifest auto-generated; see Tests)
@@ -4697,7 +5521,13 @@ nodes:
         if [ "$grep_status" = "incomplete" ]; then
           stop_detail="; unparsed=$(printf '%s\n' "$grep_line" | sed -n 's/.*UNVERIFIED (unparsed): //p'); dropped=${grep_dropped:-0}"
         fi
-        printf '%s\n' "$manifest" | T_LINE="Tests: ${tests_line}" G_LINE="Grep assertions: ${grep_line}" S_LINE="Stop conditions: tests=${tests_status}; greps=${grep_status}${stop_detail} (observed by run-stop-tests / run-stop-greps in the run worktree)" VERDICT="$verdict" awk '
+        tests_audit="tests=${tests_status}"
+        if [ "$tests_status" = "baseline_red" ]; then
+          base_pair="$(printf '%s\n' "$tests_line" | sed -n 's/.*base \([0-9][0-9]*\/[0-9][0-9]*\) at.*/\1/p' | head -n 1)"
+          [ -n "$base_pair" ] || base_pair="n/a"
+          tests_audit="tests=baseline_red (newly failing: 0; base ${base_pair})"
+        fi
+        printf '%s\n' "$manifest" | T_LINE="Tests: ${tests_line}" G_LINE="Grep assertions: ${grep_line}" S_LINE="Stop conditions: ${tests_audit}; greps=${grep_status}${stop_detail} (observed by run-stop-tests / run-stop-greps in the run worktree)" VERDICT="$verdict" awk '
           !ts && /^Tests:/ { print ENVIRON["T_LINE"]; ts = 1; next }
           !gs && /^Grep assertions:/ { print ENVIRON["G_LINE"]; gs = 1; next }
           !vs && /^VALIDATION:/ {
@@ -4773,7 +5603,12 @@ nodes:
         [ -n "$class" ] || class="CODE"
         case "$class" in
           CODE|MIXED)
-            if [ "$tests_status" = "failed" ] || { ! printf '%s\n' "$tests_line" | grep -qE '^[0-9]+/[0-9]+' && ! { [ "$tests_status" = "counts_unparsed" ] && [ "${tests_exit:-1}" -eq 0 ] 2>/dev/null; }; }; then
+            if [ "$tests_status" = "baseline_red" ]; then
+              if ! printf '%s\n' "$tests_line" | grep -qE '^[0-9]+/[0-9]+' || ! printf '%s\n' "$tests_line" | grep -qE 'newly failing: 0([^0-9]|$)'; then
+                echo "EVIDENCE_ERROR: Tests: \"${tests_line}\" on a ${class} WO (tests_status=baseline_red_without_zero_newly_failing). baseline_red is admissible only when newly failing is 0 (bdc-xo #1940)." >&2
+                return 1
+              fi
+            elif [ "$tests_status" = "failed" ] || { ! printf '%s\n' "$tests_line" | grep -qE '^[0-9]+/[0-9]+' && ! { [ "$tests_status" = "counts_unparsed" ] && [ "${tests_exit:-1}" -eq 0 ] 2>/dev/null; }; }; then
               echo "EVIDENCE_ERROR: Tests: \"${tests_line}\" on a ${class} WO (tests_status=${tests_status:-missing}). Manifest v2 / Rule 10 require \"Tests: <pass>/<total> (<command>)\" from an executed command; N/A is not admissible on a ${class} WO (bdc-xo #1940)." >&2
               return 1
             fi
