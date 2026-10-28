@@ -37,6 +37,7 @@ import {
 } from './pr-review-ingest';
 import type { IngestDeps, PriorReviewWork, PullRequestMergeability } from './pr-review-ingest.ts';
 import {
+  boundWoSpecText,
   configuredReviewIdentity,
   checksAreTerminal,
   defaultReviewLadder,
@@ -847,6 +848,125 @@ interface RealSubmitWiringOverrides {
   createReceiptMessage?: typeof dispatch.createAuthenticatedMessage;
 }
 
+const WO_ID_PATTERN = /WO-[A-Z0-9-]+-[0-9]+/g;
+
+export type WoIdResolution =
+  | { found: true; woId: string }
+  | { found: false; reason: 'no WO id in PR' | `ambiguous: ${string}` };
+
+export function resolveWoIdFromPullRequest(input: {
+  headRef?: string | null;
+  title?: string | null;
+  body?: string | null;
+}): WoIdResolution {
+  for (const source of [input.headRef, input.title, input.body]) {
+    const ids = [...new Set(source?.match(WO_ID_PATTERN) ?? [])];
+    if (ids.length === 1) return { found: true, woId: ids[0] };
+    if (ids.length > 1) return { found: false, reason: `ambiguous: ${ids.join(', ')}` };
+  }
+  return { found: false, reason: 'no WO id in PR' };
+}
+
+interface WoSpecOctokitLike {
+  git: {
+    getRef(input: {
+      owner: string;
+      repo: string;
+      ref: string;
+    }): Promise<{ data: { object: { sha: string } } }>;
+  };
+  repos: {
+    getContent(input: {
+      owner: string;
+      repo: string;
+      path: string;
+      ref: string;
+    }): Promise<{ data: { type?: string; content?: string; encoding?: string } }>;
+  };
+}
+
+export type WoSpecFetchResult =
+  | { found: true; text: string; provenance: { woId: string; sha: string; truncated: boolean } }
+  | { found: false; reason: 'not found on bdc-xo main' | `fetch failed (${string})` };
+
+function fetchErrorCode(error: unknown): string {
+  if (error && typeof error === 'object') {
+    const value = error as { status?: unknown; code?: unknown };
+    if (typeof value.status === 'number') return String(value.status);
+    if (typeof value.code === 'string' && /^[A-Za-z0-9_-]+$/.test(value.code)) return value.code;
+  }
+  return error instanceof Error && error.name === 'TimeoutError' ? 'timeout' : 'unknown';
+}
+
+async function withWoSpecTimeout<T>(operation: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new Error('WO spec fetch timed out');
+      error.name = 'TimeoutError';
+      reject(error);
+    }, 10_000);
+  });
+  try {
+    return await Promise.race([operation, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export async function fetchWoSpecFromBdcXo(
+  woId: string,
+  octokit: WoSpecOctokitLike
+): Promise<WoSpecFetchResult> {
+  try {
+    const { response, sha } = await withWoSpecTimeout(
+      (async (): Promise<{
+        response: { data: { type?: string; content?: string; encoding?: string } };
+        sha: string;
+      }> => {
+        const ref = await octokit.git.getRef({
+          owner: 'thinmansoftware',
+          repo: 'bdc-xo',
+          ref: 'heads/main',
+        });
+        const resolvedSha = ref.data.object.sha;
+        const content = await octokit.repos.getContent({
+          owner: 'thinmansoftware',
+          repo: 'bdc-xo',
+          path: `docs/work-orders/${woId}.md`,
+          ref: resolvedSha,
+        });
+        return { response: content, sha: resolvedSha };
+      })()
+    );
+    if (response.data.type && response.data.type !== 'file') {
+      throw Object.assign(new Error(), { code: 'invalid_content' });
+    }
+    if (response.data.encoding !== 'base64' || typeof response.data.content !== 'string') {
+      throw Object.assign(new Error(), { code: 'invalid_content' });
+    }
+    const bounded = boundWoSpecText(Buffer.from(response.data.content, 'base64').toString('utf8'));
+    return {
+      found: true,
+      text: bounded.text,
+      provenance: { woId, sha, truncated: bounded.truncated },
+    };
+  } catch (error) {
+    const code = fetchErrorCode(error);
+    return code === '404'
+      ? { found: false, reason: 'not found on bdc-xo main' }
+      : { found: false, reason: `fetch failed (${code})` };
+  }
+}
+
+type ReviewWoSpecResult = WoSpecFetchResult | Extract<WoIdResolution, { found: false }>;
+
+function woSpecProvenanceLine(result: ReviewWoSpecResult): string {
+  if (!result.found) return `No WO spec found (${result.reason})`;
+  const truncated = result.provenance.truncated ? ' (truncated)' : '';
+  return `Reviewed against ${result.provenance.woId} @ ${result.provenance.sha}${truncated}`;
+}
+
 const INDETERMINATE_REVIEW_SUMMARY =
   'The independent review could not reach a determinate verdict. No approval was issued.';
 
@@ -927,12 +1047,41 @@ export function createRealSubmitDeps(
   return {
     reviewerIdentity,
     async runReviewer(work): Promise<ReviewerVerdict> {
+      let woSpec: ReviewWoSpecResult;
+      try {
+        const pr = await octokit.pulls.get({
+          owner: work.owner,
+          repo: work.repo,
+          pull_number: work.prNumber,
+        });
+        const data = pr.data as typeof pr.data & {
+          head?: { ref?: string };
+          title?: string;
+          body?: string | null;
+        };
+        const resolution = resolveWoIdFromPullRequest({
+          headRef: data.head?.ref,
+          title: data.title,
+          body: data.body,
+        });
+        woSpec = resolution.found
+          ? patOctokit
+            ? await fetchWoSpecFromBdcXo(
+                resolution.woId,
+                patOctokit as unknown as WoSpecOctokitLike
+              )
+            : { found: false, reason: 'fetch failed (client_unavailable)' }
+          : resolution;
+      } catch (error) {
+        woSpec = { found: false, reason: `fetch failed (${fetchErrorCode(error)})` };
+      }
       const result = await runEvaluation(
         {
           owner: work.owner,
           repo: work.repo,
           pr_number: work.prNumber,
           head_sha: work.headSha,
+          ...(woSpec.found ? { wo_id: woSpec.provenance.woId } : {}),
         },
         {
           reviewer: modelReviewer,
@@ -943,9 +1092,7 @@ export function createRealSubmitDeps(
               prNumber: request.pr_number,
               headSha: request.head_sha,
             }),
-          // No authorized runtime WO-spec source exists in this repository.
-          // Missing criteria is an explicit, recorded degrade path.
-          fetchAcceptanceCriteria: async () => null,
+          fetchAcceptanceCriteria: async () => (woSpec.found ? woSpec.text : null),
           invokeModel: overrides.invokeModel ?? invokeConfiguredReviewModel,
           // #847: every rung refusal (quota, credits, auth) and every clean
           // exit is recorded so ingest can stop spawning a dead ladder.
@@ -1014,7 +1161,7 @@ export function createRealSubmitDeps(
             : {}),
         };
       }
-      const summary =
+      const baseSummary =
         result.findings.length > 0
           ? result.findings
               .map(finding => `[${finding.severity}] ${finding.scope}: ${finding.summary}`)
@@ -1022,6 +1169,7 @@ export function createRealSubmitDeps(
           : result.verdict === 'INDETERMINATE'
             ? buildIndeterminateSummary(result.error)
             : 'No blocking findings.';
+      const summary = `${baseSummary}\n\n${woSpecProvenanceLine(woSpec)}`;
       // #847: the INDETERMINATE reason code travels to the submit receipt as
       // well as the PR body, so the event store says WHY (usage_limit_until,
       // provider_credits_exhausted, auth_expired) without a container probe.
