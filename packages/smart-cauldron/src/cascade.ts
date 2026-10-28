@@ -23,12 +23,19 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
-import { chooseHeadroomEntry, resolveEntryThreshold } from './headroom.js';
+import {
+  admitClaudeTier,
+  chooseHeadroomEntry,
+  formatRungSeatSkip,
+  resolveEntryThreshold,
+  rungSeatSkip,
+} from './headroom.js';
 import type { EntrySelection, SeatUsageSnapshot } from './headroom.js';
 import { fireTier, buildFireMessage } from './fire.js';
 import { pollForTerminal, TimeoutError, DEFAULT_OPEN_NODE_BUDGET_MS } from './poll.js';
 import { fetchNodeTimeoutsMs } from './node-timeouts.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
+import { classifyGateMisfire } from './gate-misfire.js';
 import { createRecord, writeRecord } from './recorder.js';
 export { readCascadeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
@@ -101,30 +108,132 @@ export interface CascadeDeps {
    */
   ruleset?: ConductorRuleset;
   /**
-   * Live subscription-seat snapshot. Absent means headroom routing is skipped.
-   * A rejection or timeout fails open (usage null) and never holds the fire.
+   * Live subscription-seat snapshot. When absent, the conductor reads its own
+   * Fuelglass seats route. A rejection or timeout becomes an UNKNOWN snapshot.
    */
   seatUsage?: () => Promise<SeatUsageSnapshot>;
+  /**
+   * Run-start seat cutoff percent (the Fuelglass seats route `cutoff.percent`).
+   * When absent, the conductor uses the cutoff from its own seats read. A
+   * rejection, timeout or null means UNKNOWN: no rung is skipped on seat
+   * grounds (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01).
+   */
+  seatCutoff?: () => Promise<number | null>;
 }
 
 const SEAT_USAGE_READ_TIMEOUT_MS = 5000;
+const DEFAULT_FUELGLASS_TIMEOUT_MS = 12_000;
+
+const UNKNOWN_SEAT_USAGE: SeatUsageSnapshot = {
+  claude: { limit_source: 'UNKNOWN', windows: [] },
+  codex: { limit_source: 'UNKNOWN', windows: [] },
+  cursor: { limit_source: 'UNKNOWN', windows: [] },
+};
+
+function parseFuelglassSeatUsage(value: unknown): SeatUsageSnapshot | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const seats = (value as { seats?: unknown }).seats;
+  if (typeof seats !== 'object' || seats === null) return null;
+  const snapshot: SeatUsageSnapshot = {};
+  for (const seat of ['claude', 'codex', 'cursor'] as const) {
+    const raw = (seats as Record<string, unknown>)[seat];
+    if (typeof raw !== 'object' || raw === null) return null;
+    const reading = raw as Record<string, unknown>;
+    if (reading.limit_source !== 'measured' && reading.limit_source !== 'UNKNOWN') return null;
+    if (!Array.isArray(reading.windows)) return null;
+    const windows = reading.windows.map(window => {
+      if (typeof window !== 'object' || window === null) return null;
+      const candidate = window as Record<string, unknown>;
+      if (
+        typeof candidate.name !== 'string' ||
+        typeof candidate.used_percent !== 'number' ||
+        !Number.isFinite(candidate.used_percent)
+      ) {
+        return null;
+      }
+      return { name: candidate.name, used_percent: candidate.used_percent };
+    });
+    if (windows.some(window => window === null)) return null;
+    if (reading.limit_reached !== undefined && typeof reading.limit_reached !== 'boolean') {
+      return null;
+    }
+    const credits = reading.credits as Record<string, unknown> | undefined;
+    snapshot[seat] = {
+      limit_source: reading.limit_source,
+      windows: windows.filter(window => window !== null),
+      ...(typeof reading.limit_reached === 'boolean'
+        ? { limit_reached: reading.limit_reached }
+        : {}),
+      ...(typeof credits === 'object' &&
+      credits !== null &&
+      typeof credits.has_credits === 'boolean'
+        ? {
+            credits: {
+              has_credits: credits.has_credits,
+              overage_limit_reached: credits.overage_limit_reached === true,
+            },
+          }
+        : {}),
+    };
+  }
+  return snapshot;
+}
+
+/** The run-start cutoff from a Fuelglass seats response, or null when absent/invalid. */
+export function parseFuelglassSeatCutoff(value: unknown): number | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const cutoff = (value as { cutoff?: unknown }).cutoff;
+  if (typeof cutoff !== 'object' || cutoff === null) return null;
+  const percent = (cutoff as { percent?: unknown }).percent;
+  if (typeof percent !== 'number' || !Number.isFinite(percent)) return null;
+  if (percent < 1 || percent > 95) return null;
+  return percent;
+}
+
+function defaultFuelglassSeatReader(
+  apiBaseUrl: string,
+  token: string,
+  onCutoff: (percent: number | null) => void = () => undefined
+): () => Promise<SeatUsageSnapshot> {
+  return async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort();
+    }, DEFAULT_FUELGLASS_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${apiBaseUrl.replace(/\/$/, '')}/api/fuelglass/seats`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+      });
+      if (!response.ok) return UNKNOWN_SEAT_USAGE;
+      const body: unknown = await response.json();
+      const parsed = parseFuelglassSeatUsage(body);
+      if (parsed) onCutoff(parseFuelglassSeatCutoff(body));
+      return parsed ?? UNKNOWN_SEAT_USAGE;
+    } catch {
+      return UNKNOWN_SEAT_USAGE;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
 
 /**
- * Read seat usage with a fixed timeout. A rejection or timeout becomes null
+ * Read seat usage with a fixed timeout. A rejection or timeout becomes UNKNOWN
  * and logs exactly one failure line. A late reader result after timeout is ignored.
  */
-async function readSeatUsageOrNull(
+async function readSeatUsageOrUnknown(
   read: () => Promise<SeatUsageSnapshot>
-): Promise<SeatUsageSnapshot | null> {
+): Promise<SeatUsageSnapshot> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let settled = false;
   try {
-    return await new Promise<SeatUsageSnapshot | null>(resolve => {
+    return await new Promise<SeatUsageSnapshot>(resolve => {
       timer = setTimeout(() => {
         if (settled) return;
         settled = true;
         console.log('[smart-cauldron] seat usage unavailable: timeout');
-        resolve(null);
+        resolve(UNKNOWN_SEAT_USAGE);
       }, SEAT_USAGE_READ_TIMEOUT_MS);
       Promise.resolve()
         .then(() => read())
@@ -138,7 +247,7 @@ async function readSeatUsageOrNull(
             if (settled) return;
             settled = true;
             console.log('[smart-cauldron] seat usage unavailable: rejected');
-            resolve(null);
+            resolve(UNKNOWN_SEAT_USAGE);
           }
         );
     });
@@ -281,6 +390,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   } = opts;
 
   const apiBaseUrl = opts.apiBaseUrl ?? process.env.ARCHON_API_BASE_URL ?? 'http://localhost:3090';
+  const operatorToken = token ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
 
   // Inject real implementations unless overridden (for testing)
   const fireImpl = opts.deps?.fire ?? fireTier;
@@ -355,24 +465,119 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     entryTierName = promoted.name;
   }
 
-  let entrySelection: EntrySelection | undefined;
-  if (opts.deps?.seatUsage) {
-    const usage = await readSeatUsageOrNull(opts.deps.seatUsage);
-    entrySelection = chooseHeadroomEntry({
-      picked: entryTierName,
-      tiers,
-      refusedTiers,
-      premiumTiers,
-      usage,
-      thresholdPercent: resolveEntryThreshold(process.env),
-      pinned: entryOverride !== undefined,
-    });
-    entryTierName = entrySelection.entry;
-    console.log(
-      `[smart-cauldron] entry selection: ${entrySelection.reason} ` +
-        `picked=${entrySelection.picked} entry=${entrySelection.entry}`
-    );
+  const thresholdPercent = resolveEntryThreshold(process.env);
+  let seatCutoffPercent: number | null = null;
+  const seatUsage = opts.deps?.seatUsage
+    ? await readSeatUsageOrUnknown(opts.deps.seatUsage)
+    : await defaultFuelglassSeatReader(apiBaseUrl, operatorToken, percent => {
+        seatCutoffPercent = percent;
+      })();
+  if (opts.deps?.seatCutoff) {
+    try {
+      seatCutoffPercent = await opts.deps.seatCutoff();
+    } catch {
+      seatCutoffPercent = null;
+    }
   }
+  let entrySelection: EntrySelection = chooseHeadroomEntry({
+    picked: entryTierName,
+    tiers,
+    refusedTiers,
+    premiumTiers,
+    usage: seatUsage,
+    thresholdPercent,
+    pinned: entryOverride !== undefined,
+  });
+  entryTierName = entrySelection.entry;
+
+  if (entryTierName === 'claude') {
+    const admission = admitClaudeTier({ usage: seatUsage, thresholdPercent });
+    if (!admission.admitted && entryOverride === 'claude') {
+      throw new Error(
+        `[smart-cauldron/cascade] Refused Claude entry tier "claude": ${admission.reason}. ` +
+          'The Claude seat must be measured below the entry headroom threshold.'
+      );
+    }
+    if (!admission.admitted) {
+      const claudeIndex = tiers.findIndex(tier => tier.name === 'claude');
+      const promoted = tiers.slice(claudeIndex + 1).find(tier => !refusedTiers.includes(tier.name));
+      if (!promoted) {
+        throw new Error(
+          `[smart-cauldron/cascade] Claude entry denied (${admission.reason}) and no ` +
+            'admissible tier exists above it.'
+        );
+      }
+      console.log(
+        `[smart-cauldron] Skipping tier "claude" during entry: ${admission.reason}; ` +
+          `promoting to "${promoted.name}"`
+      );
+      entryTierName = promoted.name;
+      entrySelection = {
+        ...entrySelection,
+        entry: promoted.name,
+        changed: promoted.name !== entrySelection.picked,
+        reason: admission.reason,
+      };
+    } else {
+      entrySelection = { ...entrySelection, reason: admission.reason };
+    }
+  }
+  // Seat-cutoff rung skip at entry (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01):
+  // a rung whose own seat is measured at or over the run-start cutoff would be
+  // refused by the gate. A pinned entry is honored (the gate decides it).
+  if (entryOverride === undefined) {
+    const skipped: string[] = [];
+    let idx = tiers.findIndex(tier => tier.name === entryTierName);
+    while (idx !== -1 && idx < tiers.length) {
+      const tier = tiers[idx];
+      if (!tier) break;
+      if (refusedTiers.includes(tier.name)) {
+        idx++;
+        continue;
+      }
+      const seatSkip = rungSeatSkip(tier.name, seatUsage, seatCutoffPercent);
+      if (seatSkip) {
+        console.log(
+          `[smart-cauldron] Skipping tier "${tier.name}" during entry: ${formatRungSeatSkip(seatSkip)}`
+        );
+        skipped.push(formatRungSeatSkip(seatSkip));
+        idx++;
+        continue;
+      }
+      if (skipped.length > 0 && tier.name === 'claude') {
+        const claudeAdmission = admitClaudeTier({ usage: seatUsage, thresholdPercent });
+        if (!claudeAdmission.admitted) {
+          console.log(
+            `[smart-cauldron] Skipping tier "claude" during entry: ${claudeAdmission.reason}`
+          );
+          skipped.push(claudeAdmission.reason);
+          idx++;
+          continue;
+        }
+      }
+      break;
+    }
+    if (skipped.length > 0) {
+      const landed = idx === -1 ? undefined : tiers[idx];
+      if (!landed) {
+        throw new Error(
+          `[smart-cauldron/cascade] Every rung from "${entryTierName}" up is over the seat ` +
+            `cutoff or denied (${skipped.join(', ')}); no rung can pass the run-start seat gate.`
+        );
+      }
+      entryTierName = landed.name;
+      entrySelection = {
+        ...entrySelection,
+        entry: landed.name,
+        changed: landed.name !== entrySelection.picked,
+        reason: skipped[0] ?? entrySelection.reason,
+      };
+    }
+  }
+  console.log(
+    `[smart-cauldron] entry selection: ${entrySelection.reason} ` +
+      `picked=${entrySelection.picked} entry=${entrySelection.entry}`
+  );
 
   let currentIndex = tiers.findIndex(t => t.name === entryTierName);
   if (currentIndex === -1) {
@@ -415,7 +620,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         climbCount: 0,
         wonCheap: false,
       },
-      ...(entrySelection ? { entrySelection } : {}),
+      entrySelection,
     };
     const admission = await createRecordImpl(record, outDir);
     onAdmission?.(admission.record, admission.created);
@@ -457,6 +662,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         climbCount: 0,
         wonCheap: false,
       },
+      entrySelection,
     };
     onAdmission?.(blocked, false);
     return blocked;
@@ -491,6 +697,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           climbCount: 0,
           wonCheap: false,
         },
+        entrySelection,
         refusalReason: {
           reason: 'already-satisfied',
           prNumber: existingClaim.number,
@@ -535,6 +742,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
     let frontierApprovalRecord: CascadeRunRecord['frontierApproval'];
     let refusalReason: CascadeRunRecord['refusalReason'];
+    let gateMisfireRecord: CascadeRunRecord['gateMisfire'];
     let automaticPreflightTier: string | null = null;
 
     function buildCurrentRecord(): CascadeRunRecord {
@@ -566,12 +774,49 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
         ...(frontierApprovalRecord ? { frontierApproval: frontierApprovalRecord } : {}),
         ...(refusalReason ? { refusalReason } : {}),
+        ...(gateMisfireRecord ? { gateMisfire: gateMisfireRecord } : {}),
         ...(entrySelection ? { entrySelection } : {}),
       };
     }
 
     async function checkpoint(): Promise<string> {
       return writeRecordImpl(buildCurrentRecord(), outDir);
+    }
+
+    function nextAdmittedTierIndex(fromIndex: number, context: 'climb' | 'peek'): number {
+      let idx = fromIndex + 1;
+      while (idx < tiers.length) {
+        const candidate = tiers[idx];
+        if (!candidate) return tiers.length;
+        if (refusedTiers.includes(candidate.name)) {
+          console.log(
+            `[smart-cauldron] Skipping refused tier "${candidate.name}" during ${context}`
+          );
+          idx++;
+          continue;
+        }
+        const seatSkip = rungSeatSkip(candidate.name, seatUsage, seatCutoffPercent);
+        if (seatSkip) {
+          console.log(
+            `[smart-cauldron] Skipping tier "${candidate.name}" during ${context}: ` +
+              formatRungSeatSkip(seatSkip)
+          );
+          idx++;
+          continue;
+        }
+        if (candidate.name === 'claude') {
+          const admission = admitClaudeTier({ usage: seatUsage, thresholdPercent });
+          console.log(
+            `[smart-cauldron] Claude tier decision during ${context}: ${admission.reason}`
+          );
+          if (!admission.admitted) {
+            idx++;
+            continue;
+          }
+        }
+        return idx;
+      }
+      return tiers.length;
     }
 
     // Persist admission before any provider lane can be fired. A duplicate dispatch
@@ -686,14 +931,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         return true;
       }
 
-      // Climb to next tier, skipping refused (dark/retired) rungs
-      currentIndex++;
-      while (currentIndex < tiers.length && refusedTiers.includes(tiers[currentIndex].name)) {
-        console.log(
-          `[smart-cauldron] Skipping refused tier "${tiers[currentIndex].name}" during climb`
-        );
-        currentIndex++;
-      }
+      // Climb to the next admitted tier, skipping dark or headroom-denied rungs.
+      currentIndex = nextAdmittedTierIndex(currentIndex, 'climb');
       climbCount++;
 
       if (currentIndex >= tiers.length) {
@@ -782,8 +1021,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
      * Returns null when the ladder is exhausted above `fromIndex`.
      */
     function peekNextClimbTier(fromIndex: number): LadderTier | null {
-      let idx = fromIndex + 1;
-      while (idx < tiers.length && refusedTiers.includes(tiers[idx].name)) idx++;
+      const idx = nextAdmittedTierIndex(fromIndex, 'peek');
       return idx < tiers.length ? (tiers[idx] ?? null) : null;
     }
 
@@ -1102,6 +1340,70 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         break;
       }
 
+      // Run-start seat refusal (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01):
+      // the run never dispatched a node, so this is neither a quality failure
+      // nor a gate misfire. Climb to the next rung with headroom without
+      // building informed-climb context and without SPEC-REPAIR.
+      const seatRefusal = seatRefusalDetail(pollResult);
+      if (seatRefusal) {
+        attempt.gateFailReason = `seat_refusal: ${seatRefusal}`;
+        console.log(
+          `[smart-cauldron] Seat refusal on tier=${tier.name}: ${seatRefusal} -- ` +
+            'climbing to the next rung with headroom (not a quality failure)'
+        );
+        currentIndex = tier.isFrontier
+          ? tiers.length
+          : nextAdmittedTierIndex(currentIndex, 'climb');
+        climbCount++;
+        if (currentIndex >= tiers.length) {
+          status = 'blocked';
+          console.log(
+            `[smart-cauldron] BLOCKED: no rung above tier=${tier.name} has seat headroom ` +
+              `for woId=${woId}`
+          );
+          await checkpoint();
+          break;
+        }
+        await checkpoint();
+        continue;
+      }
+
+      // Harness gate misfire: the gate failed for a harness-side reason, not
+      // because the implement tier produced bad work. Stop on this tier with
+      // one Dispatch notice. Do not climb and do not post SPEC-REPAIR.
+      if (outcome === 'gate-failed') {
+        const misfire = classifyGateMisfire(pollResult);
+        if (misfire) {
+          attempt.outcome = 'gate-misfire';
+          attempt.gateFailReason = `${misfire.kind}: ${misfire.reason}`;
+          status = 'gate-misfire';
+          winningTier = null;
+          gateMisfireRecord = {
+            kind: misfire.kind,
+            gateNode: misfire.gateNode,
+            failedNodes: misfire.failedNodes,
+            reason: misfire.reason,
+            runId: fireResult.runId,
+            tier: tier.name,
+          };
+          await emitEscalation({
+            errorClass: 'harness_gate_misfire',
+            woId,
+            reason:
+              `GATE MISFIRE (no climb): ${misfire.kind} at ${misfire.gateNode} ` +
+              `on tier ${tier.name} -- ${misfire.reason}`,
+            remediation: [
+              'Fix owner: harness gate (sibling gate WOs, bdc-xo#3743, or bdc-xo#3737). Do not treat this as an implement failure.',
+              'Re-fire the same tier after the harness fix lands; do not escalate',
+            ],
+            runId: fireResult.runId,
+            overseerPermit: opts.overseerPermit,
+          });
+          await checkpoint();
+          break;
+        }
+      }
+
       // Gate failed
       console.log(`[smart-cauldron] Gate failed on tier=${tier.name}: ${verdict.reason}`);
 
@@ -1152,6 +1454,18 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * The run-start seat refusal detail (`seat_usage_refused:...`) when a fired
+ * run was refused by the seat gate before any node ran, else null. The
+ * executor stores the detail as the run's metadata.error.
+ */
+export function seatRefusalDetail(poll: PollResult): string | null {
+  if (poll.terminalStatus !== 'failed') return null;
+  const error = poll.rawMetadata.error;
+  if (typeof error !== 'string' || !error.startsWith('seat_usage_refused:')) return null;
+  return error;
+}
 
 /**
  * Build informed-climb context to pass to the next tier.

@@ -232,7 +232,7 @@ describe('strict seat model pins', () => {
       {
         file: 'bdc-feature-development.yaml',
         provider: 'claude',
-        model: 'sonnet',
+        model: 'claude-sonnet-5-5',
         plan: {},
         implement: {},
       },
