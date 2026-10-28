@@ -221,6 +221,53 @@ describe('Test 3: refresh before expiry and single-flight minting', () => {
     expect(second).toBe('tok-2');
   });
 
+  it('alerts exactly once when the installation-token mint fails, then rethrows', async () => {
+    clearServiceGitHubTokenCache();
+    const alerts: string[] = [];
+    let mints = 0;
+    const fetchImpl = (async (url: string | URL | Request): Promise<Response> => {
+      if (String(url).includes('/access_tokens')) {
+        mints += 1;
+        return new Response('nope', { status: 401 });
+      }
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch;
+    await expect(
+      getServiceGitHubToken(appIdentity(), {
+        fetch: fetchImpl,
+        alertSink: credential => {
+          alerts.push(credential);
+        },
+      })
+    ).rejects.toThrow('github_app_token_mint_failed:401');
+    expect(mints).toBe(1);
+    expect(alerts).toEqual(['app-1-2']);
+  });
+
+  it('single-flights a failed mint: both callers reject, one alert', async () => {
+    clearServiceGitHubTokenCache();
+    const alerts: string[] = [];
+    let mints = 0;
+    const fetchImpl = (async (url: string | URL | Request): Promise<Response> => {
+      if (String(url).includes('/access_tokens')) {
+        mints += 1;
+        await new Promise(resolve => setTimeout(resolve, 10));
+        return new Response('nope', { status: 500 });
+      }
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch;
+    const alertSink = (credential: string): void => {
+      alerts.push(credential);
+    };
+    const results = await Promise.allSettled([
+      getServiceGitHubToken(appIdentity(), { fetch: fetchImpl, alertSink }),
+      getServiceGitHubToken(appIdentity(), { fetch: fetchImpl, alertSink }),
+    ]);
+    expect(results.every(r => r.status === 'rejected')).toBe(true);
+    expect(mints).toBe(1);
+    expect(alerts).toEqual(['app-1-2']);
+  });
+
   it('returns the cached token when more than 10 minutes remain', async () => {
     clearServiceGitHubTokenCache();
     const base = 1_000_000_000_000;

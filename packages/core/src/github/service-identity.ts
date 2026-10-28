@@ -1,6 +1,7 @@
 import { createPrivateKey, sign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createLogger } from '@archon/paths';
+import { alertCredentialFailure } from './credential-alert';
 
 const log = createLogger('github/service-identity');
 
@@ -221,7 +222,18 @@ export function buildAppJwt(identity: GitHubAppIdentity, now: number = Date.now(
 
 export async function getServiceGitHubToken(
   identity: ServiceGitHubAuth,
-  options: { fetch?: typeof fetch; apiBaseUrl?: string; now?: () => number } = {}
+  options: {
+    fetch?: typeof fetch;
+    apiBaseUrl?: string;
+    now?: () => number;
+    /**
+     * Injected for tests; defaults to the shared credential-alert sink. Called
+     * once with the failing App pool id when an installation-token mint (initial
+     * or refresh) fails, so an unmintable credential raises the same deduped
+     * operator Dispatch alert a surviving-401 does.
+     */
+    alertSink?: (credential: string) => void | Promise<void>;
+  } = {}
 ): Promise<string> {
   const now = (options.now ?? Date.now)();
   if (identity.kind === 'pat') {
@@ -237,7 +249,24 @@ export async function getServiceGitHubToken(
   const existing = mintInFlight.get(identity.poolId);
   if (existing) return existing;
 
-  const minting = mintInstallationToken(identity, now, options);
+  // Alert once (deduped) when the mint fails, then rethrow: a credential that
+  // cannot mint an installation token is just as unusable as one whose minted
+  // token is rejected with a 401, so both must raise the operator alert. The
+  // alert is wrapped into the single-flight promise so concurrent awaiters
+  // share one alert rather than each firing their own.
+  const minting = mintInstallationToken(identity, now, options).catch(async (error: unknown) => {
+    const alert =
+      options.alertSink ??
+      (async (credential: string): Promise<void> => {
+        await alertCredentialFailure(credential);
+      });
+    try {
+      await alert(identity.poolId);
+    } catch (alertError) {
+      log.error({ err: alertError as Error, pool: identity.poolId }, 'github.mint_alert_failed');
+    }
+    throw error;
+  });
   mintInFlight.set(identity.poolId, minting);
   try {
     return await minting;

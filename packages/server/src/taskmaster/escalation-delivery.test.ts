@@ -962,4 +962,38 @@ describe('Test 1: taskmaster escalation uses the App identity via the provider',
 
     expect(authHeaders).toEqual(['Bearer minted-install-token']);
   });
+
+  test('a 401 for the App identity re-mints once and retries via the shared wrapper', async () => {
+    const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
+      .privateKey.export({ type: 'pkcs8', format: 'pem' })
+      .toString();
+    process.env.GITHUB_APP_TASKMASTER_ID = '55';
+    process.env.GITHUB_APP_TASKMASTER_INSTALLATION_ID = '66';
+    process.env.GITHUB_APP_TASKMASTER_PRIVATE_KEY = key;
+
+    let mints = 0;
+    let posts = 0;
+    const authHeaders: string[] = [];
+    const fetchImpl = async (input: string, reqInit?: RequestInit): Promise<Response> => {
+      if (input.includes('/access_tokens')) {
+        mints += 1;
+        return Response.json({
+          token: `mint-${mints}`,
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      }
+      posts += 1;
+      authHeaders.push(new Headers(reqInit?.headers).get('authorization') ?? '');
+      return new Response('{}', { status: posts === 1 ? 401 : 201 });
+    };
+    const deps = createRealEscalationDeliveryDeps({ fetchImpl });
+    await deps.postIssueComment(ISSUE, 'escalation body');
+
+    // One initial mint + one re-mint after the 401; two POST attempts, the
+    // retry carrying the freshly minted token. A raw fetch would have thrown
+    // taskmaster_github_http_401 on the first attempt with no refresh.
+    expect(mints).toBe(2);
+    expect(posts).toBe(2);
+    expect(authHeaders).toEqual(['Bearer mint-1', 'Bearer mint-2']);
+  });
 });

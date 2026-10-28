@@ -6,6 +6,7 @@ import {
   type TmActionOutcome,
 } from '@archon/core/db/taskmaster';
 import { createLogger } from '@archon/paths';
+import { serviceGitHubFetch } from '@archon/core/github/request';
 import {
   getDutyOfficerGithubTokenOrNull,
   githubIssueInAllowList,
@@ -197,11 +198,14 @@ function parseNextLink(header: string | null): string | null {
 export async function listWorkerAlarmIssueComments(
   issue: DutyOfficerStaleIssue
 ): Promise<WorkerAlarmIssueComment[]> {
-  const token = await getDutyOfficerGithubTokenOrNull();
-  if (!token) throw new Error('worker_heartbeat_alarm_token_missing');
+  // Presence guard only: a missing/unresolvable credential is a hard stop, as
+  // before. The Authorization header is set by serviceGitHubFetch from the
+  // resolved duty_officer identity, so no token is assembled here.
+  if (!(await getDutyOfficerGithubTokenOrNull())) {
+    throw new Error('worker_heartbeat_alarm_token_missing');
+  }
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
-    Authorization: `Bearer ${token}`,
     'User-Agent': 'bdc-harness-worker-heartbeat-alarm',
     'X-GitHub-Api-Version': '2022-11-28',
   };
@@ -214,7 +218,14 @@ export async function listWorkerAlarmIssueComments(
       throw new Error('worker_heartbeat_alarm_comment_pages_exceeded');
     }
     pages += 1;
-    const response: Response = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
+    // Route through the shared wrapper so a 401 for the duty_officer App
+    // identity re-mints once, retries, and raises one deduped operator alert on
+    // a surviving 401 instead of throwing on the first 401 with no refresh.
+    const response: Response = await serviceGitHubFetch({
+      service: 'duty_officer',
+      url,
+      init: { headers, signal: AbortSignal.timeout(15_000) },
+    });
     if (!response.ok) {
       throw new Error(`worker_heartbeat_alarm_http_${response.status}`);
     }
@@ -247,23 +258,28 @@ export async function postWorkerAlarmComment(
     log.warn({ issue }, 'worker_heartbeat_alarm_repo_refused');
     return;
   }
-  const token = await getDutyOfficerGithubTokenOrNull();
-  if (!token) throw new Error('worker_heartbeat_alarm_token_missing');
-  const response = await fetch(
-    `${GITHUB_API_ORIGIN}/repos/${encodeURIComponent(issue.owner)}/${encodeURIComponent(issue.repo)}/issues/${issue.number}/comments`,
-    {
+  // Presence guard only: a missing/unresolvable credential is a hard stop, as
+  // before. serviceGitHubFetch sets the Authorization header from the resolved
+  // duty_officer identity and supplies the 401 re-mint + alert behavior the
+  // prior raw POST lacked.
+  if (!(await getDutyOfficerGithubTokenOrNull())) {
+    throw new Error('worker_heartbeat_alarm_token_missing');
+  }
+  const response = await serviceGitHubFetch({
+    service: 'duty_officer',
+    url: `${GITHUB_API_ORIGIN}/repos/${encodeURIComponent(issue.owner)}/${encodeURIComponent(issue.repo)}/issues/${issue.number}/comments`,
+    init: {
       method: 'POST',
       headers: {
         Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${token}`,
         'User-Agent': 'bdc-harness-worker-heartbeat-alarm',
         'X-GitHub-Api-Version': '2022-11-28',
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({ body }),
       signal: AbortSignal.timeout(15_000),
-    }
-  );
+    },
+  });
   if (!response.ok) {
     throw new Error(`worker_heartbeat_alarm_http_${response.status}`);
   }

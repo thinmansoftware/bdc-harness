@@ -39,6 +39,7 @@ import {
   getServiceGitHubToken,
   resolveServiceGitHubAuth,
 } from '@archon/core/github/service-identity';
+import { serviceGitHubFetch } from '@archon/core/github/request';
 
 const log = createLogger('taskmaster/escalation-delivery');
 
@@ -446,14 +447,8 @@ async function githubRequest(
   if (!url.startsWith(`${GITHUB_API_ORIGIN}/`)) {
     throw new Error('taskmaster_github_url_not_api_origin');
   }
-  const token =
-    options.token !== undefined
-      ? options.token
-      : await getServiceGitHubToken(resolveServiceGitHubAuth('taskmaster'));
-  if (!token) throw new Error('taskmaster_github_token_missing');
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
-    Authorization: `Bearer ${token}`,
     'User-Agent': 'bdc-harness-taskmaster-escalation',
     'X-GitHub-Api-Version': '2022-11-28',
   };
@@ -462,14 +457,53 @@ async function githubRequest(
       headers[key] = init.extraHeaders[key];
     }
   }
-  const fetchImpl: FetchLike =
-    options.fetchImpl ?? ((input, reqInit): Promise<Response> => fetch(input, reqInit));
-  const response = await fetchImpl(url, {
+  const requestInit: RequestInit = {
     method: init?.method,
     headers,
     body: init?.body,
     signal: AbortSignal.timeout(githubTimeoutMs()),
-  });
+  };
+  // Route through the shared GitHub request wrapper (serviceGitHubFetch) so a
+  // 401 for the taskmaster App identity clears the cached installation token,
+  // re-mints exactly once, retries, and -- if a second 401 survives -- raises
+  // one deduped operator credential alert before propagating. The previous raw
+  // fetch here threw on the first 401 without ever refreshing or alerting. The
+  // wrapper sets the Authorization header itself from the resolved identity, so
+  // no token is read or assembled in this module.
+  const injected = options.fetchImpl;
+  const fetchOverride: typeof fetch | undefined = injected
+    ? (((input: string | URL | Request, reqInit?: RequestInit): Promise<Response> =>
+        injected(
+          typeof input === 'string' ? input : input instanceof URL ? input.href : input.url,
+          reqInit
+        )) as typeof fetch)
+    : undefined;
+  let response: Response;
+  if (options.token !== undefined) {
+    // An explicitly injected token (tests) bypasses the provider; an empty
+    // token is still a hard "missing credential", as before.
+    if (!options.token) throw new Error('taskmaster_github_token_missing');
+    response = await serviceGitHubFetch({
+      service: 'taskmaster',
+      url,
+      init: requestInit,
+      identity: {
+        kind: 'pat',
+        service: 'taskmaster',
+        token: options.token,
+        poolId: 'user-pat',
+        distinct: false,
+      },
+      ...(fetchOverride ? { fetch: fetchOverride } : {}),
+    });
+  } else {
+    response = await serviceGitHubFetch({
+      service: 'taskmaster',
+      url,
+      init: requestInit,
+      ...(fetchOverride ? { fetch: fetchOverride } : {}),
+    });
+  }
   if (!response.ok) {
     throw new Error(`taskmaster_github_http_${response.status}`);
   }

@@ -1,7 +1,10 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { generateKeyPairSync } from 'node:crypto';
 import type { DispatchWorker } from '@archon/core/db/dispatch';
+import { clearServiceGitHubTokenCache } from '@archon/core/github/service-identity';
 import {
   evaluateWorkerHeartbeats,
+  listWorkerAlarmIssueComments,
   runWorkerHeartbeatAlarm,
   type WorkerAlarmIssueComment,
   type WorkerHeartbeatAlarmDeps,
@@ -253,5 +256,63 @@ describe('worker heartbeat alarm inside the Duty Officer tick', () => {
     // Next tick: C is still stale and the post now succeeds.
     await expect(tickDutyOfficerClock(deps)).resolves.toBeUndefined();
     expect(downCount(alarm.comments, 'C')).toBe(1);
+  });
+});
+
+describe('worker heartbeat alarm GitHub reads route through serviceGitHubFetch', () => {
+  afterEach(() => {
+    delete process.env.GITHUB_APP_TASKMASTER_ID;
+    delete process.env.GITHUB_APP_TASKMASTER_INSTALLATION_ID;
+    delete process.env.GITHUB_APP_TASKMASTER_PRIVATE_KEY;
+    clearServiceGitHubTokenCache();
+  });
+
+  test('a 401 on the comment read re-mints once and retries instead of throwing', async () => {
+    // Regression guard (Codex diff review): the read used a raw fetch, so a 401
+    // threw worker_heartbeat_alarm_http_401 with no refresh. Routed through
+    // serviceGitHubFetch for the duty_officer App identity, a 401 now clears the
+    // cached installation token, re-mints once, and retries.
+    clearServiceGitHubTokenCache();
+    const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
+      .privateKey.export({ type: 'pkcs8', format: 'pem' })
+      .toString();
+    process.env.GITHUB_APP_TASKMASTER_ID = '77';
+    process.env.GITHUB_APP_TASKMASTER_INSTALLATION_ID = '88';
+    process.env.GITHUB_APP_TASKMASTER_PRIVATE_KEY = key;
+
+    let mints = 0;
+    let reads = 0;
+    const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async (
+      input: string | URL | Request,
+      _init?: RequestInit
+    ): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('/access_tokens')) {
+        mints += 1;
+        return Response.json({
+          token: `mint-${mints}`,
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      }
+      reads += 1;
+      // First read is a 401 (stale token); the retry after re-mint succeeds.
+      if (reads === 1) return new Response('unauthorized', { status: 401 });
+      return new Response('[]', { status: 200 });
+    }) as typeof fetch);
+
+    try {
+      const result = await listWorkerAlarmIssueComments({
+        owner: 'thinmansoftware',
+        repo: 'bdc-harness',
+        number: 1234,
+      });
+      expect(result).toEqual([]);
+      // One initial mint (presence guard), one re-mint after the 401; the read
+      // was attempted twice, the second carrying the freshly minted token.
+      expect(mints).toBe(2);
+      expect(reads).toBe(2);
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 });
