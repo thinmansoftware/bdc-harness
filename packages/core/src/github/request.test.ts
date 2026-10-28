@@ -236,4 +236,33 @@ describe('Test 4: 401 re-mints once then alerts', () => {
     expect(mints).toBe(2);
     expect(apiCalls).toBe(1);
   });
+
+  it('PAT 401 returns the response and does not alert', async () => {
+    resetGitHubApiMeterForTests();
+    clearServiceGitHubTokenCache();
+    const alerts: string[] = [];
+    let apiCalls = 0;
+    const fetchImpl = (async (): Promise<Response> => {
+      apiCalls += 1;
+      return new Response('{}', { status: 401 });
+    }) as typeof fetch;
+    const response = await serviceGitHubFetch({
+      service: 'overseer',
+      url: 'https://api.github.com/user',
+      identity: {
+        kind: 'pat',
+        service: 'overseer',
+        token: 'pat-marker',
+        poolId: 'user-pat',
+        distinct: false,
+      },
+      fetch: fetchImpl,
+      alertSink: credential => {
+        alerts.push(credential);
+      },
+    });
+    expect(response.status).toBe(401);
+    expect(apiCalls).toBe(1);
+    expect(alerts).toEqual([]);
+  });
 });

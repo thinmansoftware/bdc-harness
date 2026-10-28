@@ -1,7 +1,9 @@
+import { alertCredentialFailure } from '@archon/core/github/credential-alert';
 import {
-  resolveGitHubAppAuth,
-  resolveRealOctokitAuthOptions,
-} from '@archon/overseer/adapters/github-real-deps';
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
+import { resolveGitHubAppAuth } from '@archon/overseer/adapters/github-real-deps';
 import { createLogger } from '@archon/paths';
 
 const log = createLogger('dispatch/duty-officer-security-detector');
@@ -195,26 +197,34 @@ export function receiptValid(body: string, issueCreatedAt: string, now: Date): b
   );
 }
 
+/**
+ * Installation token for detector writes. Presence and incomplete-config errors
+ * stay on resolveGitHubAppAuth (overseer App: marker comments belong to that
+ * app). The token itself comes from the shared provider: per-pool cache,
+ * single-flight mints, and a credential alert when the mint fails. An already
+ * aborted signal is not a mint failure and does not alert.
+ */
 export async function mintAppInstallationToken(signal: AbortSignal): Promise<string | null> {
   signal.throwIfAborted();
   const config = resolveGitHubAppAuth();
   if (!config) return null;
-  const options = resolveRealOctokitAuthOptions();
-  if (!('authStrategy' in options)) return null;
-  const auth = options.authStrategy(options.auth);
-  const app = await auth({ type: 'app' });
-  signal.throwIfAborted();
-  const response = await abortable(
-    fetch(`${API}/app/installations/${config.installationId}/access_tokens`, {
-      method: 'POST',
-      signal,
-      headers: { Authorization: `Bearer ${app.token}`, Accept: 'application/vnd.github+json' },
-    }),
-    signal
-  );
-  if (!response.ok) throw new Error(`duty_officer_github_http_${response.status}`);
-  const result = (await abortable(response.json(), signal)) as { token: string };
-  return result.token;
+  const identity = resolveServiceGitHubAuth('overseer');
+  if (identity.kind !== 'app') return null;
+  try {
+    return await getServiceGitHubToken(identity, { fetch: installationTokenFetch(signal) });
+  } catch (error) {
+    if (signal.aborted) throw error;
+    await alertCredentialFailure(identity.poolId);
+    throw error;
+  }
+}
+
+function installationTokenFetch(signal: AbortSignal): typeof fetch {
+  const adapted = (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    signal.throwIfAborted();
+    return fetch(input, { ...init, signal });
+  };
+  return Object.assign(adapted, { preconnect: fetch.preconnect });
 }
 
 function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {

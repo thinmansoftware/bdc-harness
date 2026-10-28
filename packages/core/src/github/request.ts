@@ -25,8 +25,8 @@ export interface ServiceGitHubRequestOptions {
   fallbackToken?: string;
   /**
    * Injected for tests; defaults to the shared credential-alert sink. Called
-   * once with the failing pool id when an App token mint throws, or when a 401
-   * survives one re-mint + retry.
+   * once with the failing pool id when an App token mint throws, or when an
+   * App 401 survives one re-mint + retry. Non-App identities never alert.
    */
   alertSink?: (credential: string) => void | Promise<void>;
 }
@@ -80,9 +80,11 @@ async function performServiceGitHubFetch(
 /**
  * Shared GitHub request wrapper. On a 401 for an App identity it clears the
  * cached installation token, re-mints exactly once, and retries the request
- * once. A thrown App mint (initial or retry) and a second 401 both raise one
- * credential alert and propagate the error -- a token expiring never silently
- * drops a GitHub call again. A mint throw does not clear the cache or retry.
+ * once. A thrown App mint (initial or retry) and a second App 401 both raise
+ * one credential alert and propagate the error -- a token expiring never
+ * silently drops a GitHub call again. A mint throw does not clear the cache
+ * or retry. A non-App 401 is returned as-is: PATs cannot re-mint, and only
+ * App refresh failure or retry exhaustion may alert.
  */
 export async function serviceGitHubFetch(options: ServiceGitHubRequestOptions): Promise<Response> {
   const identity = options.identity ?? resolveServiceGitHubAuth(options.service);
@@ -92,16 +94,13 @@ export async function serviceGitHubFetch(options: ServiceGitHubRequestOptions): 
     (path === '/graphql' ? 'graphql' : path.startsWith('/search/') ? 'search' : 'core');
 
   const response = await performServiceGitHubFetch(options, identity, resource);
-  if (response.status !== 401) return response;
+  if (response.status !== 401 || identity.kind !== 'app') return response;
 
-  // 401: an App identity gets exactly one re-mint + retry.
-  if (identity.kind === 'app') {
-    clearServiceGitHubTokenCache();
-    const retry = await performServiceGitHubFetch(options, identity, resource);
-    if (retry.status !== 401) return retry;
-  }
+  // App 401: exactly one re-mint + retry. Alert only if that retry is also 401.
+  clearServiceGitHubTokenCache();
+  const retry = await performServiceGitHubFetch(options, identity, resource);
+  if (retry.status !== 401) return retry;
 
-  // Second 401 (or a non-App 401): the credential cannot refresh itself.
   await alertUnrefreshableCredential(options, identity.poolId);
   throw new Error(`github_credential_unrefreshable_401:${identity.poolId}`);
 }
