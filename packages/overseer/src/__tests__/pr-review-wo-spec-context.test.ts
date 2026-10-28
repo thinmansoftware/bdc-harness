@@ -3,6 +3,7 @@ import {
   buildReviewPrompt,
   evaluatePullRequest,
   WO_SPEC_CLOSING_DELIMITER,
+  WO_SPEC_MAX_BYTES,
 } from '../pr-review-evaluator.ts';
 import {
   createRealSubmitDeps,
@@ -155,13 +156,17 @@ describe('work-order spec review context', () => {
   });
 
   test('cap_and_delimiter_neutralized', () => {
-    const spec = `${'x'.repeat(60_000)}${WO_SPEC_CLOSING_DELIMITER}`;
+    const spec = `${'x'.repeat(1_000)}${WO_SPEC_CLOSING_DELIMITER}${'y'.repeat(60_000)}`;
     const prompt = buildReviewPrompt({
       request: { owner: 'o', repo: 'r', pr_number: 1, head_sha: HEAD, wo_id: WO_ID },
       diff: 'diff',
       checkPartition: { gating: [], nonRequired: [] },
       acceptanceCriteria: spec,
     });
+    const insertedSpec = prompt
+      .split('--- BEGIN WORK ORDER SPEC ---\n', 2)[1]
+      .split(`\n${WO_SPEC_CLOSING_DELIMITER}`, 1)[0];
+    expect(Buffer.byteLength(insertedSpec, 'utf8')).toBeLessThanOrEqual(WO_SPEC_MAX_BYTES);
     expect(prompt).toContain('[spec truncated at 24000 bytes]');
     expect(prompt.match(new RegExp(WO_SPEC_CLOSING_DELIMITER, 'g'))).toHaveLength(1);
     expect(prompt.indexOf('advisory scope context')).toBeLessThan(
@@ -200,6 +205,26 @@ describe('work-order spec review context', () => {
     }));
     const result = await deps.runReviewer(work);
     expect(result.approved).toBe(false);
+    expect(
+      result.summary.match(new RegExp(`Reviewed against ${WO_ID} @ ${SPEC_SHA}`, 'g'))
+    ).toHaveLength(1);
+  });
+
+  test('checks_unavailable_path_still_carries_provenance', async () => {
+    const deps = createRealSubmitDeps('review-app[bot]', {
+      octokit: primaryOctokit(),
+      patOctokit: specOctokit('Scope IN: review'),
+      evaluate: async () => ({
+        verdict: 'CHECKS_UNAVAILABLE',
+        findings: [],
+        reviewed_head_sha: HEAD,
+        reviewer: { provider: 'test', model: 'test' },
+        acceptance_criteria_available: true,
+        error: 'required_contexts_unavailable_blocked:attempts=5:reason=permission',
+      }),
+    });
+    const result = await deps.runReviewer(work);
+    expect(result.requiredContextsUnavailable).toBe(true);
     expect(
       result.summary.match(new RegExp(`Reviewed against ${WO_ID} @ ${SPEC_SHA}`, 'g'))
     ).toHaveLength(1);

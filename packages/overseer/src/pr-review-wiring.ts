@@ -1119,7 +1119,7 @@ export function createRealSubmitDeps(
       if (result.verdict === 'CHECKS_UNAVAILABLE') {
         return {
           approved: false,
-          summary: buildRequiredContextsBlockedSummary(result.error),
+          summary: `${buildRequiredContextsBlockedSummary(result.error)}\n\n${woSpecProvenanceLine(woSpec)}`,
           reviewedHeadSha: result.reviewed_head_sha,
           requiredContextsUnavailable: true,
         };
