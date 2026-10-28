@@ -243,6 +243,16 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
+/**
+ * Test seam. Stop 13 loads git tests, then repair-holder tests, then this
+ * module's tests in one process. The earlier file caches whatever logger
+ * createLogger returned before the workflow slot existed. Clearing it lets
+ * the next call bind the slot bridge.
+ */
+export function resetDagExecutorLoggerForTests(): void {
+  cachedLog = undefined;
+}
+
 // Agent registry cache: keyed by agents directory path, populated on first use.
 // One cache entry per unique repo root -- each worktree gets its own registry.
 const agentRegistryCache = new Map<string, AgentRegistry>();

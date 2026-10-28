@@ -35,6 +35,12 @@ function createMockLogger(): MockLogger {
 
 const mockLogger = createMockLogger();
 
+// This file's mock.module('@archon/paths') is the one bun keeps when Stop 13
+// loads git tests before dag-executor.test.ts. Once that file publishes the
+// workflow logger slot, return its bridge so a later reset sees the same
+// object the workflow assertions record.
+const WORKFLOW_TEST_LOGGER_SLOT = '__archonWorkflowTestLoggerSlot';
+
 /** Mirror of @archon/paths getArchonHome (reads env at call-time) */
 function getArchonHome(): string {
   if (
@@ -48,7 +54,11 @@ function getArchonHome(): string {
 }
 
 mock.module('@archon/paths', () => ({
-  createLogger: mock(() => mockLogger),
+  createLogger: mock(() => {
+    const bag = globalThis as unknown as Record<string, { bridge?: MockLogger } | undefined>;
+    const bridge = bag[WORKFLOW_TEST_LOGGER_SLOT]?.bridge;
+    return bridge ?? mockLogger;
+  }),
   getArchonWorktreesPath: () => join(getArchonHome(), 'worktrees'),
   getArchonWorkspacesPath: () => join(getArchonHome(), 'workspaces'),
   getProjectWorktreesPath: (owner: string, repo: string) =>

@@ -119,7 +119,10 @@ import {
   clearPendingGateResults,
   recordGateResult,
   resolveBunRuntimeExecutable,
+  resetDagExecutorLoggerForTests,
 } from './dag-executor';
+// Drop a logger cached by an earlier file in this bun process (Stop 13).
+resetDagExecutorLoggerForTests();
 import { loadMcpConfig } from '@archon/providers/claude/provider';
 import { resolveLoopIterationIdleTimeoutMs } from './utils/idle-timeout';
 import type { DagNode, BashNode, ScriptNode, NodeOutput, WorkflowRun } from './schemas';
