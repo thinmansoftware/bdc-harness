@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { generateKeyPairSync } from 'node:crypto';
+import { clearServiceGitHubTokenCache } from '@archon/core/github/service-identity';
 import { rootLogger } from '@archon/paths';
 import {
   resetSecurityDetectorStateForTests,
@@ -121,6 +122,7 @@ describe('duty officer security detector', () => {
   }
 
   test('App token exchange uses the deadline signal', async () => {
+    clearServiceGitHubTokenCache();
     const saved = {
       GITHUB_APP_ID: process.env.GITHUB_APP_ID,
       GITHUB_APP_INSTALLATION_ID: process.env.GITHUB_APP_INSTALLATION_ID,

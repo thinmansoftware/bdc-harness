@@ -35,7 +35,10 @@
 import { createLogger } from '@archon/paths';
 import type { IDatabase } from '@archon/core/db/adapters/types';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
-import { githubToken } from '../dispatch/duty-officer-clock';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 
 const log = createLogger('taskmaster/escalation-delivery');
 
@@ -427,9 +430,23 @@ export function parseNextLink(linkHeader: string | null): string | null {
 }
 
 /**
- * Minimal GitHub REST helper mirroring duty-officer-clock's private githubJson
- * (kept local rather than exported from that file, which the spec limits to a
- * single githubToken() export). Reuses the shared container token accessor.
+ * Explicit `options.token` stays the test seam, including an empty value that
+ * fails closed. When it is omitted, mint through the taskmaster service
+ * identity so an App installation token is not dropped.
+ */
+async function escalationGitHubToken(options: RealEscalationDeliveryOptions): Promise<string> {
+  if (options.token !== undefined) {
+    if (!options.token) throw new Error('taskmaster_github_token_missing');
+    return options.token;
+  }
+  const identity = resolveServiceGitHubAuth('taskmaster');
+  const token = await getServiceGitHubToken(identity);
+  if (!token) throw new Error('github_auth_missing: taskmaster');
+  return token;
+}
+
+/**
+ * Minimal GitHub REST helper mirroring duty-officer-clock's private githubJson.
  * Takes a full URL and returns the raw Response so callers can read headers
  * (the Link header drives comment pagination). Only api.github.com URLs are
  * requested, so a Link header can never send the token to another host.
@@ -442,8 +459,7 @@ async function githubRequest(
   if (!url.startsWith(`${GITHUB_API_ORIGIN}/`)) {
     throw new Error('taskmaster_github_url_not_api_origin');
   }
-  const token = options.token !== undefined ? options.token : githubToken();
-  if (!token) throw new Error('taskmaster_github_token_missing');
+  const token = await escalationGitHubToken(options);
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
     Authorization: `Bearer ${token}`,
@@ -527,8 +543,8 @@ function toEscalationComment(raw: unknown): EscalationIssueComment {
  */
 function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () => Promise<string> {
   let cached: { token: string | null; login: Promise<string> } | null = null;
-  return (): Promise<string> => {
-    const token = options.token !== undefined ? options.token : githubToken();
+  return async (): Promise<string> => {
+    const token = await escalationGitHubToken(options);
     if (cached?.token === token) return cached.login;
     const login = (async (): Promise<string> => {
       const response = await githubRequest(`${GITHUB_API_ORIGIN}/user`, options);
