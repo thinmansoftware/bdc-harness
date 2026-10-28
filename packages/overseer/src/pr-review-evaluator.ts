@@ -322,13 +322,28 @@ function decodeCappedUtf8(bytes: Uint8Array): string {
   return new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, end));
 }
 
+function neutralizeAdvisoryDelimiter(text: string): string {
+  return text.split(WO_SPEC_BLOCK_END).join(WO_SPEC_BLOCK_END_QUOTED);
+}
+
+/**
+ * Cap a fetched spec, then record whether delimiter quoting pushes that capped
+ * text past the same limit. The prompt applies this second cap when the text
+ * is inserted; `WoSpecFetch.truncated` must match so provenance includes
+ * " (truncated)".
+ */
+export function capFetchedWoSpec(text: string): { text: string; truncated: boolean } {
+  const capped = capWoSpecText(text);
+  const inserted = capWoSpecText(neutralizeAdvisoryDelimiter(capped.text));
+  return { text: capped.text, truncated: capped.truncated || inserted.truncated };
+}
+
 /**
  * Neutralize a closing delimiter, then cap. Quoting can grow the text, so the
  * byte cap is applied to the text that is actually inserted.
  */
 function advisorySpecBody(text: string, specTruncated: boolean): string {
-  const neutralized = text.split(WO_SPEC_BLOCK_END).join(WO_SPEC_BLOCK_END_QUOTED);
-  const capped = capWoSpecText(neutralized);
+  const capped = capWoSpecText(neutralizeAdvisoryDelimiter(text));
   const retained = capped.text;
   return capped.truncated || specTruncated ? retained + WO_SPEC_TRUNCATION_MARKER : retained;
 }

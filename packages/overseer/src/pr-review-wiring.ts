@@ -42,7 +42,7 @@ import type { IngestDeps, PriorReviewWork, PullRequestMergeability } from './pr-
 import {
   configuredReviewIdentity,
   checksAreTerminal,
-  capWoSpecText,
+  capFetchedWoSpec,
   defaultReviewLadder,
   evaluatePullRequest,
   invokeConfiguredReviewModel,
@@ -1029,7 +1029,7 @@ async function fetchWoSpec(
     }
     const text = readSpecFile(payload.data);
     if (text === null) return { status: 'fetch_failed', code: 'bad_content' };
-    const capped = capWoSpecText(text);
+    const capped = capFetchedWoSpec(text);
     return { status: 'found', text: capped.text, sha, truncated: capped.truncated };
   } catch (error) {
     return { status: 'fetch_failed', code: failureCode(error) };
@@ -1097,9 +1097,22 @@ async function formatWoSpecProvenance(state: WoSpecProvenanceState): Promise<str
   }
 }
 
+function isProvenanceLine(line: string): boolean {
+  return line.startsWith('Reviewed against ') || line.startsWith('No WO spec found');
+}
+
+/**
+ * Posted bodies carry exactly one WO-spec provenance line, and it is the line
+ * this review resolved. A model finding can contain its own provenance-prefixed
+ * line; drop every such line, then append the resolved one.
+ */
 function appendProvenance(summary: string, line: string): string {
-  if (summary.split('\n').includes(line)) return summary;
-  return summary.length > 0 ? `${summary}\n${line}` : line;
+  const kept = summary
+    .split('\n')
+    .filter(existing => !isProvenanceLine(existing))
+    .join('\n')
+    .replace(/\n+$/, '');
+  return kept.length > 0 ? `${kept}\n${line}` : line;
 }
 
 /**
@@ -1171,10 +1184,15 @@ export function createRealSubmitDeps(
       // CHECKS_UNAVAILABLE (#775): terminal, never approving. Carries its own
       // summary because a COMMENT with no body says nothing, and the whole
       // point of this path is that a human can read why the PR is stuck.
+      // The body is posted, so it gets the same single provenance line as
+      // every other posted review.
       if (result.verdict === 'CHECKS_UNAVAILABLE') {
         return {
           approved: false,
-          summary: buildRequiredContextsBlockedSummary(result.error),
+          summary: appendProvenance(
+            buildRequiredContextsBlockedSummary(result.error),
+            await formatWoSpecProvenance(specState)
+          ),
           reviewedHeadSha: result.reviewed_head_sha,
           requiredContextsUnavailable: true,
         };

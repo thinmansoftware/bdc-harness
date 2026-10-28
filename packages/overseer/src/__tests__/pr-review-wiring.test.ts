@@ -316,6 +316,11 @@ describe('createRealSubmitDeps -- evaluator binding', () => {
     expect(verdict.summary).toContain('review blocked, not approved');
     expect(verdict.summary).toContain('5 attempts');
     expect(verdict.summary).toContain('permission');
+    expect(
+      verdict.summary
+        .split('\n')
+        .filter(line => line.startsWith('Reviewed against ') || line.startsWith('No WO spec found'))
+    ).toEqual(['No WO spec found (no WO id in PR)']);
     expect(verdict.reviewedHeadSha).toBe(HEAD);
   });
 
