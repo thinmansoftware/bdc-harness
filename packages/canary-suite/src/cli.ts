@@ -8,6 +8,13 @@ import {
   type TaskmasterCanaryResult,
 } from './taskmaster-canary';
 import { runProbeBindingCommand, type ProbeBindingCommandDeps } from './probe-binding';
+import {
+  createDutyOfficerSender,
+  runOverseerLoopCanaries,
+  writeOverseerLoopArtifacts,
+  type OverseerLoopDeps,
+  type OverseerLoopReport,
+} from './overseer-loop-canary';
 
 interface CanaryCliDeps {
   readonly runner: (options: RunCanaryOptions) => Promise<RunCanaryResult>;
@@ -19,11 +26,29 @@ interface CanaryCliDeps {
     report: TaskmasterCanaryResult
   ) => Promise<readonly string[]>;
   readonly probeBinding?: ProbeBindingCommandDeps;
+  readonly overseerLoopRunner?: (options: OverseerLoopDeps) => Promise<OverseerLoopReport>;
+  readonly overseerLoopArtifactWriter?: (
+    outputRoot: string,
+    report: OverseerLoopReport
+  ) => Promise<readonly string[]>;
 }
+
+const OVERSEER_LOOP_USAGE = [
+  'Usage: archon-canary overseer-loop --db-path <sqlite> --output-root <dir> [--since-rebuild]',
+  'Daily schedule: 0 9 * * *',
+  'Post-rebuild: archon-canary overseer-loop --since-rebuild --db-path <sqlite> --output-root <dir>',
+  'Exit codes: 0 PASS or WARN, 2 FAIL, 3 invalid arguments or unreadable database.',
+].join('\n');
 
 function flag(args: readonly string[], name: string): string | undefined {
   const index = args.indexOf(name);
   return index >= 0 ? args[index + 1] : undefined;
+}
+
+function requiredFlag(args: readonly string[], name: string): string | undefined {
+  const value = flag(args, name);
+  if (!value || value.startsWith('--')) return undefined;
+  return value;
 }
 
 function exitFor(verdict: RunCanaryResult['report']['verdict']): number {
@@ -89,9 +114,54 @@ export async function runCanaryCli(
     deps.stdout(JSON.stringify(report, null, 2));
     return exitFor(report.verdict);
   }
+  if (command === 'overseer-loop') {
+    if (args.includes('--help')) {
+      deps.stdout(OVERSEER_LOOP_USAGE);
+      return 0;
+    }
+    const dbPath = requiredFlag(args, '--db-path');
+    const outputRoot = requiredFlag(args, '--output-root');
+    if (!dbPath || !outputRoot) {
+      deps.stderr('overseer_loop_missing_or_invalid_required_argument');
+      return 3;
+    }
+    const invocation = args.includes('--since-rebuild') ? 'since-rebuild' : 'daily';
+    const loopDeps: OverseerLoopDeps = {
+      dbPath,
+      invocation,
+      env,
+      operatorToken: env.ARCHON_OPERATOR_TOKEN,
+      dispatchBaseUrl: env.ARCHON_API_BASE_URL,
+      branchIdentityLanded: env.OVERSEER_CANARY_BRANCH_IDENTITY_LANDED === '1',
+      reviewSpecLanded: env.OVERSEER_CANARY_REVIEW_SPEC_LANDED === '1',
+      handbackLanded: env.OVERSEER_CANARY_HANDBACK_LANDED === '1',
+    };
+    try {
+      const usingDefault = deps.overseerLoopRunner === undefined;
+      const report = await (deps.overseerLoopRunner ?? runOverseerLoopCanaries)(
+        usingDefault
+          ? {
+              ...loopDeps,
+              outputRoot,
+              dutyOfficer: createDutyOfficerSender(loopDeps),
+            }
+          : loopDeps
+      );
+      if (!usingDefault) {
+        await (deps.overseerLoopArtifactWriter ?? writeOverseerLoopArtifacts)(outputRoot, report);
+      }
+      deps.stdout(JSON.stringify(report, null, 2));
+      return report.verdict === 'FAIL' ? 2 : 0;
+    } catch (error) {
+      deps.stderr((error as Error).message);
+      return 3;
+    }
+  }
   const level = command === 'check' ? 0 : command === 'plan' ? 1 : null;
   if (level === null) {
-    deps.stderr('Usage: archon-canary <check|plan|taskmaster|probe-binding> [options]');
+    deps.stderr(
+      'Usage: archon-canary <check|plan|taskmaster|overseer-loop|probe-binding> [options]'
+    );
     return 3;
   }
   const manifestPath = flag(args, '--manifest');
