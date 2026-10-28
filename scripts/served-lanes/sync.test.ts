@@ -1,10 +1,12 @@
-import { afterAll, describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, spyOn, test } from 'bun:test';
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
+import * as crypto from 'crypto';
 import { mkdtempSync } from 'fs';
 import {
   appendFile,
   chmod,
+  link,
   mkdir,
   mkdtemp,
   readFile,
@@ -14,6 +16,7 @@ import {
   utimes,
   writeFile,
 } from 'fs/promises';
+import * as fsPromises from 'fs/promises';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { createCodebase } from '../../packages/core/src/db/codebases';
@@ -753,6 +756,93 @@ describe('served lanes', () => {
       const names = await readdir(volumeDir);
       expect(names.some(name => name.includes('served-lanes-tmp-'))).toBe(false);
     } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('temp_name_collision_does_not_clobber_linked_bytes', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    const planned = [
+      Buffer.from('111111', 'hex'),
+      Buffer.from('222222', 'hex'),
+      Buffer.from('333333', 'hex'),
+    ];
+    let randomCalls = 0;
+    const randomSpy = spyOn(crypto, 'randomBytes').mockImplementation(size => {
+      const next = planned[randomCalls];
+      randomCalls += 1;
+      if (next === undefined || next.length !== size) {
+        throw new Error(`unexpected randomBytes(${size}) call ${randomCalls}`);
+      }
+      return next;
+    });
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const steady = laneYaml('STEADY-VICTIM');
+      const lanePath = join(volumeDir, 'lane.yaml');
+      const steadyPath = join(volumeDir, 'steady.yaml');
+      await writeFile(lanePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      await writeFile(steadyPath, steady);
+      await writeFile(join(bakedDir, 'steady.yaml'), steady);
+      const collision = join(volumeDir, `.lane.yaml.served-lanes-tmp-${process.pid}-222222`);
+      await link(steadyPath, collision);
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+
+      const result = await reconcileServedLanes({ volumeDir, bakedDir, history, now: NOW });
+
+      expect(randomCalls).toBe(3);
+      expect(sha256Hex(await readFile(steadyPath))).toBe(sha256Hex(steady));
+      expect(sha256Hex(await readFile(collision))).toBe(sha256Hex(steady));
+      expect((await stat(steadyPath)).ino).toBe((await stat(collision)).ino);
+      expect(sha256Hex(await readFile(lanePath))).toBe(sha256Hex(baked));
+      const backupFile = join(result.backup_path ?? '', 'lane.yaml');
+      expect(result.replaced).toEqual([{ filename: 'lane.yaml', backup_path: backupFile }]);
+      expect(sha256Hex(await readFile(backupFile))).toBe(sha256Hex(stale));
+      const names = await readdir(volumeDir);
+      expect(names.some(name => name.endsWith('-333333'))).toBe(false);
+      expect(names).toContain(`.lane.yaml.served-lanes-tmp-${process.pid}-222222`);
+    } finally {
+      randomSpy.mockRestore();
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('replacement_recorded_when_temp_cleanup_fails', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    const realUnlink = fsPromises.unlink.bind(fsPromises);
+    const unlinkSpy = spyOn(fsPromises, 'unlink').mockImplementation(async path => {
+      if (String(path).includes('served-lanes-tmp-')) {
+        throw Object.assign(new Error('injected temp unlink failure'), { code: 'EIO' });
+      }
+      await realUnlink(path);
+    });
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const lanePath = join(volumeDir, 'lane.yaml');
+      await writeFile(lanePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+
+      await expect(
+        reconcileServedLanes({ volumeDir, bakedDir, history, now: NOW })
+      ).rejects.toThrow('injected temp unlink failure');
+
+      expect(sha256Hex(await readFile(lanePath))).toBe(sha256Hex(baked));
+      const report = JSON.parse(
+        await readFile(join(parent, 'served-lanes-report.json'), 'utf8')
+      ) as {
+        replaced: Array<{ filename: string; backup_path: string }>;
+        backup_path: string | null;
+      };
+      expect(report.backup_path).not.toBeNull();
+      const backupFile = join(report.backup_path ?? '', 'lane.yaml');
+      expect(report.replaced).toEqual([{ filename: 'lane.yaml', backup_path: backupFile }]);
+      expect(sha256Hex(await readFile(backupFile))).toBe(sha256Hex(stale));
+    } finally {
+      unlinkSpy.mockRestore();
       await rm(parent, { recursive: true, force: true });
     }
   });

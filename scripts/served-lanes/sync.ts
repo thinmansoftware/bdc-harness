@@ -331,6 +331,36 @@ async function discardTemp(tempPath: string): Promise<void> {
   }
 }
 
+async function createExclusiveTemp(
+  volumeDir: string,
+  filename: string,
+  bytes: Buffer
+): Promise<string> {
+  for (let attempt = 0; attempt < BACKUP_RESERVE_ATTEMPTS; attempt += 1) {
+    const tempPath = join(
+      volumeDir,
+      `.${filename}.served-lanes-tmp-${process.pid}-${randomHex6()}`
+    );
+    try {
+      await writeFile(tempPath, bytes, { flag: 'wx' });
+      return tempPath;
+    } catch (error) {
+      if (isCode(error, 'EEXIST')) continue;
+      try {
+        await unlink(tempPath);
+      } catch (cleanupError) {
+        if (!isEnoent(cleanupError)) {
+          log.warn({ err: cleanupError, tempPath }, 'served_lanes.temp_cleanup_failed');
+        }
+      }
+      throw error;
+    }
+  }
+  throw new Error(
+    `Failed to create served-lanes temp file under ${volumeDir} after ${BACKUP_RESERVE_ATTEMPTS} attempts`
+  );
+}
+
 async function readLiveIdentity(filePath: string): Promise<LiveIdentity> {
   const bytes = await readFile(filePath);
   const info = await stat(filePath);
@@ -379,11 +409,7 @@ async function swapStaleLane(input: {
     const mode = preStat.mode & 0o777;
     await input.hooks?.afterFinalStat?.(livePath);
 
-    tempPath = join(
-      input.volumeDir,
-      `.${input.lane.filename}.served-lanes-tmp-${process.pid}-${randomHex6()}`
-    );
-    await writeFile(tempPath, bakedBytes);
+    tempPath = await createExclusiveTemp(input.volumeDir, input.lane.filename, bakedBytes);
     await chown(tempPath, uid, gid);
     await chmod(tempPath, mode);
 
@@ -423,12 +449,14 @@ async function swapStaleLane(input: {
       return;
     }
 
-    await discardTemp(tempPath);
-    tempPath = null;
+    // The live name is already the baked inode. Record it before temp cleanup so
+    // a failed unlink still names this replacement and its backup (I3).
     input.result.replaced.push({
       filename: input.lane.filename,
       backup_path: backupFile,
     });
+    await discardTemp(tempPath);
+    tempPath = null;
 
     await input.hooks?.afterInstall?.(livePath, backupFile);
     const postBytes = await readFile(backupFile);
