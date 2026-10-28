@@ -4612,10 +4612,50 @@ nodes:
       # reviewer via the fallback token.
       export ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1
       echo "acting_login=${ACTING_LOGIN}"
+      # existing-pr-base-guard: begin
+      # Accept an existing open PR only when its real baseRefName equals the
+      # base recorded for this run. A different or missing base is a
+      # base_branch_mismatch refusal. Never retarget.
+      lookup_open_pr() {
+        local raw
+        raw=$(gh pr list --head "$UNIQUE_BRANCH" --repo "$REPO" --state open \
+          --json url,baseRefName 2>/dev/null || true)
+        OPEN_PR_RAW="$raw" python3 -c "$(cat <<'PY'
+      import json, os, sys
+      raw = os.environ.get("OPEN_PR_RAW", "").strip()
+      if not raw:
+          raise SystemExit(0)
+      try:
+          data = json.loads(raw)
+      except Exception:
+          raise SystemExit(0)
+      if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+          raise SystemExit(0)
+      item = data[0]
+      url = item.get("url") or ""
+      base = item.get("baseRefName") or ""
+      if not url:
+          raise SystemExit(0)
+      sys.stdout.write(url + "\t" + base)
+      PY
+      )"
+      }
+      accept_open_pr_or_refuse() {
+        local row url base
+        row="$1"
+        [ -n "$row" ] || return 1
+        url=$(printf '%s' "$row" | cut -f1)
+        base=$(printf '%s' "$row" | cut -f2)
+        [ -n "$url" ] || return 1
+        if [ "$base" != "$RECORDED_BASE_BRANCH" ]; then
+          echo "ERROR: base_branch_mismatch: recorded=${RECORDED_BASE_BRANCH} attempted=${base:-<unverified>}" >&2
+          exit 1
+        fi
+        EXIST="$url"
+        return 0
+      }
       PR_OK=false
-      EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
-        --json url --jq '.[0].url // empty' 2>/dev/null || true)
-      if [ -n "$EXIST" ]; then
+      if accept_open_pr_or_refuse "$(lookup_open_pr)"; then
         echo "PR_URL=$EXIST"
         echo "PR already exists (no create needed)."
         PR_OK=true
@@ -4626,9 +4666,7 @@ nodes:
             break
           fi
           # Re-check: gh pr create may have created the PR but returned non-zero.
-          EXIST=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open \
-            --json url --jq '.[0].url // empty' 2>/dev/null || true)
-          if [ -n "$EXIST" ]; then
+          if accept_open_pr_or_refuse "$(lookup_open_pr)"; then
             echo "PR_URL=$EXIST"
             echo "PR created despite non-zero exit (gh CLI quirk; PR confirmed via list)."
             PR_OK=true
@@ -4638,6 +4676,7 @@ nodes:
           sleep $((attempt * 5))
         done
       fi
+      # existing-pr-base-guard: end
       if [ "$PR_OK" = "false" ]; then
         # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: gh pr create failed, but the
         # canonical branch was VERIFIED on origin at HEAD above (precondition guard

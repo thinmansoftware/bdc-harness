@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   assertPrBaseAllowed,
@@ -113,10 +114,231 @@ describe('cauldron lane PR open guard', () => {
       const node = openPrNode(yaml);
       expect(node).toContain('ERROR: base_branch_mismatch');
       expect(node).toContain('ERROR: recorded_base_branch_missing');
+      expect(node).toContain('# existing-pr-base-guard: begin');
+      expect(node).toContain('--json url,baseRefName');
+      expect(node).toContain('accept_open_pr_or_refuse');
       expect(node).not.toContain('gh pr edit');
+      expect(node).not.toContain('.[0].url // empty');
       expect(node).toContain('--base "$BASE_BRANCH"');
       expect(node).not.toContain('${BASE_BRANCH:+--base');
       expect(node).not.toContain('${BASE_BRANCH:-dev}');
     }
+  });
+});
+
+const GUARD_BEGIN = '# existing-pr-base-guard: begin';
+const GUARD_END = '# existing-pr-base-guard: end';
+
+const EXISTING_PR_ON_MAIN = `[
+  {
+    "baseRefName": "main",
+    "url": "https://github.com/acme/widgets/pull/55"
+  }
+]
+`;
+
+const EXISTING_PR_ON_DEV = `[
+  {
+    "baseRefName": "dev",
+    "url": "https://github.com/acme/widgets/pull/55"
+  }
+]
+`;
+
+const NO_OPEN_PR = '[]\n';
+
+const EXISTING_PR_WITHOUT_BASE = `[
+  {
+    "baseRefName": null,
+    "url": "https://github.com/acme/widgets/pull/55"
+  }
+]
+`;
+
+/**
+ * The bytes the workflow engine runs: YAML block-scalar dedent of the shipped
+ * existing-PR guard, not a retyped copy.
+ */
+function existingPrGuard(yaml: string): string {
+  const at = yaml.indexOf(GUARD_BEGIN);
+  const end = yaml.indexOf(GUARD_END);
+  if (at < 0 || end < at) {
+    throw new Error('existing-pr-base-guard markers missing');
+  }
+  const lineStart = yaml.lastIndexOf('\n', at) + 1;
+  const endLine = yaml.lastIndexOf('\n', end);
+  const chunk = yaml.slice(lineStart, endLine);
+  const lines = chunk.split('\n');
+  const widths = lines
+    .filter(line => line.trim().length > 0)
+    .map(line => line.length - line.trimStart().length);
+  const min = Math.min(...widths);
+  return lines.map(line => (line.startsWith(' '.repeat(min)) ? line.slice(min) : line)).join('\n');
+}
+
+interface GuardResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  args: string;
+  creates: number;
+}
+
+function runExistingPrGuard(
+  guard: string,
+  list1: string,
+  list2: string,
+  createRc: number
+): GuardResult {
+  const dir = mkdtempSync(join(tmpdir(), 'pr-base-guard-'));
+  try {
+    const list1Path = join(dir, 'list1.json');
+    const list2Path = join(dir, 'list2.json');
+    const argsLog = join(dir, 'args.log');
+    const listCount = join(dir, 'list.count');
+    const createCount = join(dir, 'create.count');
+    writeFileSync(list1Path, list1);
+    writeFileSync(list2Path, list2);
+    writeFileSync(argsLog, '');
+    writeFileSync(listCount, '0');
+    writeFileSync(createCount, '0');
+    const gh = join(dir, 'gh');
+    writeFileSync(
+      gh,
+      `#!/bin/bash
+printf '%s\\n' "$*" >> "$GH_ARGS_LOG"
+if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then
+  echo "unexpected retarget" >&2
+  exit 97
+fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  n=$(cat "$GH_LIST_COUNT")
+  n=$((n + 1))
+  printf '%s' "$n" > "$GH_LIST_COUNT"
+  if [ "$n" -eq 1 ]; then
+    cat "$GH_LIST_1"
+  else
+    cat "$GH_LIST_2"
+  fi
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  n=$(cat "$GH_CREATE_COUNT")
+  n=$((n + 1))
+  printf '%s' "$n" > "$GH_CREATE_COUNT"
+  echo "https://github.com/acme/widgets/pull/created"
+  exit "$GH_CREATE_RC"
+fi
+echo "unexpected gh: $*" >&2
+exit 96
+`
+    );
+    chmodSync(gh, 0o755);
+    const script = join(dir, 'guard.sh');
+    writeFileSync(script, `set -euo pipefail\n${guard}\n`);
+    const result = Bun.spawnSync(['bash', script], {
+      env: {
+        ...process.env,
+        PATH: `${dir}:${process.env.PATH ?? ''}`,
+        GH_ARGS_LOG: argsLog,
+        GH_LIST_COUNT: listCount,
+        GH_CREATE_COUNT: createCount,
+        GH_LIST_1: list1Path,
+        GH_LIST_2: list2Path,
+        GH_CREATE_RC: String(createRc),
+        RECORDED_BASE_BRANCH: 'dev',
+        UNIQUE_BRANCH: 'feat/identity-01',
+        REPO: 'acme/widgets',
+        TITLE: 't',
+        BODY_FILE: '/dev/null',
+        BASE_BRANCH: 'dev',
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    return {
+      code: result.exitCode ?? -1,
+      stdout: new TextDecoder().decode(result.stdout),
+      stderr: new TextDecoder().decode(result.stderr),
+      args: readFileSync(argsLog, 'utf8'),
+      creates: Number(readFileSync(createCount, 'utf8')),
+    };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+describe('existing PR base verification', () => {
+  test('every lane refuses a pre-existing main PR when the recorded base is dev', () => {
+    const guards = LANE_FILES.map(file =>
+      existingPrGuard(readFileSync(join(DEFAULTS_DIR, file), 'utf8'))
+    );
+    expect(guards.length).toBe(13);
+    for (const guard of guards) {
+      expect(guard).toBe(guards[0]);
+    }
+    for (const [index, file] of LANE_FILES.entries()) {
+      const guard = guards[index];
+      if (!guard) throw new Error(`missing guard for ${file}`);
+      const result = runExistingPrGuard(guard, EXISTING_PR_ON_MAIN, EXISTING_PR_ON_MAIN, 0);
+      expect(result.code, file).toBe(1);
+      expect(result.stderr).toContain('ERROR: base_branch_mismatch: recorded=dev attempted=main');
+      expect(result.stdout).not.toContain('PR already exists');
+      expect(result.stdout).not.toContain('PR_URL=');
+      expect(result.creates).toBe(0);
+      expect(result.args).toContain('--json url,baseRefName');
+      expect(result.args).toContain('--head feat/identity-01');
+      expect(result.args).not.toContain('pr edit');
+    }
+  });
+
+  test('accepts an existing PR whose real base matches the recorded base', () => {
+    const guard = existingPrGuard(
+      readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8')
+    );
+    const result = runExistingPrGuard(guard, EXISTING_PR_ON_DEV, EXISTING_PR_ON_DEV, 0);
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain('PR_URL=https://github.com/acme/widgets/pull/55');
+    expect(result.stdout).toContain('PR already exists (no create needed).');
+    expect(result.creates).toBe(0);
+    expect(result.stderr).not.toContain('base_branch_mismatch');
+  });
+
+  test('refuses an existing PR whose real base was not returned', () => {
+    const guard = existingPrGuard(
+      readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8')
+    );
+    const result = runExistingPrGuard(guard, EXISTING_PR_WITHOUT_BASE, EXISTING_PR_WITHOUT_BASE, 0);
+    expect(result.code, result.stderr).toBe(1);
+    expect(result.stderr).toContain(
+      'ERROR: base_branch_mismatch: recorded=dev attempted=<unverified>'
+    );
+    expect(result.stdout).not.toContain('PR already exists');
+    expect(result.creates).toBe(0);
+  });
+
+  test('refuses a wrong-base PR found after create returns non-zero', () => {
+    const guard = existingPrGuard(
+      readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8')
+    );
+    const result = runExistingPrGuard(guard, NO_OPEN_PR, EXISTING_PR_ON_MAIN, 1);
+    expect(result.code, result.stderr).toBe(1);
+    expect(result.stderr).toContain('ERROR: base_branch_mismatch: recorded=dev attempted=main');
+    expect(result.stdout).not.toContain('PR confirmed via list');
+    expect(result.creates).toBe(1);
+    expect(result.args).not.toContain('pr edit');
+  });
+
+  test('keeps quirk recovery when the confirmed PR base matches', () => {
+    const guard = existingPrGuard(
+      readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8')
+    );
+    const result = runExistingPrGuard(guard, NO_OPEN_PR, EXISTING_PR_ON_DEV, 1);
+    expect(result.code, result.stderr).toBe(0);
+    expect(result.stdout).toContain(
+      'PR created despite non-zero exit (gh CLI quirk; PR confirmed via list).'
+    );
+    expect(result.stdout).toContain('PR_URL=https://github.com/acme/widgets/pull/55');
+    expect(result.creates).toBe(1);
   });
 });
