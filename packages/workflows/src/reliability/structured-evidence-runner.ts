@@ -433,7 +433,6 @@ function registerGeneratedPath(cwd: string, path: string): void {
 
 function excludedIdentityPath(path: string): boolean {
   const norm = path.replace(/\\/g, '/');
-  if (norm === '.ser-attempts' || norm.startsWith('.ser-attempts/')) return true;
   if (generatedIdentityPaths.has(norm)) return true;
   for (const generated of generatedIdentityPaths) {
     if (generated.endsWith('/') && norm.startsWith(generated)) return true;
@@ -454,18 +453,45 @@ function notAGitWorktree(): TreeIdentity {
   };
 }
 
+// assume-unchanged (lowercase tag) and skip-worktree (S) entries are hidden
+// from git status, so their bytes could differ from what was tested.
+function hasHiddenIndexEntries(cwd: string): boolean | null {
+  const listed = gitCapture(cwd, ['ls-files', '-v', '-z']);
+  if (!listed.ok) return null;
+  for (const record of listed.stdout.split('\0')) {
+    if (record.length < 2) continue;
+    const tag = record[0] ?? '';
+    if (tag === 'S' || (tag >= 'a' && tag <= 'z')) return true;
+  }
+  return false;
+}
+
 function identityFromStatus(cwd: string, headSha: string): TreeIdentity {
   const status = gitCapture(cwd, ['status', '--porcelain=v1', '-z', '-uall']);
   if (!status.ok) return hashFailedIdentity(headSha);
   const parsed = parsePorcelainZ(status.stdout);
   if (!parsed.ok) return hashFailedIdentity(headSha);
-  const paths: { path: string; sha256: string }[] = [];
+  if (hasHiddenIndexEntries(cwd) !== false) return hashFailedIdentity(headSha);
+  const byPath = new Map<string, string>();
+  const add = (path: string, sha256: string): boolean => {
+    const prior = byPath.get(path);
+    if (prior !== undefined && prior !== sha256) return false;
+    byPath.set(path, sha256);
+    return true;
+  };
   for (const entry of parsed.entries) {
-    if (excludedIdentityPath(entry.path)) continue;
-    const sha256 = hashWorktreeBytes(cwd, entry.status, entry.path);
-    if (sha256 === null) return hashFailedIdentity(headSha);
-    paths.push({ path: entry.path, sha256 });
+    if (!excludedIdentityPath(entry.path)) {
+      const sha256 = hashWorktreeBytes(cwd, entry.status, entry.path);
+      if (sha256 === null || !add(entry.path, sha256)) return hashFailedIdentity(headSha);
+    }
+    // A rename or copy source is part of the tested tree: record its bytes, or
+    // 'missing' when it is gone, so a different source cannot collide.
+    if (entry.source !== null && !excludedIdentityPath(entry.source)) {
+      const sha256 = sourceBytes(cwd, entry.source);
+      if (sha256 === null || !add(entry.source, sha256)) return hashFailedIdentity(headSha);
+    }
   }
+  const paths = [...byPath.entries()].map(([path, sha256]) => ({ path, sha256 }));
   paths.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   const contentDigest = createHash('sha256').update(JSON.stringify(paths)).digest('hex');
   return {
@@ -479,8 +505,10 @@ function identityFromStatus(cwd: string, headSha: string): TreeIdentity {
 // git status -z records are "XY path\0". Renames and copies are "XY dest\0source\0".
 function parsePorcelainZ(
   stdout: string
-): { ok: true; entries: { status: string; path: string }[] } | { ok: false } {
-  const entries: { status: string; path: string }[] = [];
+):
+  | { ok: true; entries: { status: string; path: string; source: string | null }[] }
+  | { ok: false } {
+  const entries: { status: string; path: string; source: string | null }[] = [];
   let index = 0;
   while (index < stdout.length) {
     const end = stdout.indexOf('\0', index);
@@ -491,12 +519,15 @@ function parsePorcelainZ(
     if (header.length < 4 || header[2] !== ' ') return { ok: false };
     const status = header.slice(0, 2);
     const path = header.slice(3);
+    let source: string | null = null;
     if (status.includes('R') || status.includes('C')) {
       const sourceEnd = stdout.indexOf('\0', index);
       if (sourceEnd < 0) return { ok: false };
+      source = stdout.slice(index, sourceEnd);
+      if (source.length === 0) return { ok: false };
       index = sourceEnd + 1;
     }
-    entries.push({ status, path });
+    entries.push({ status, path, source });
   }
   return { ok: true, entries };
 }
@@ -507,6 +538,16 @@ function hashWorktreeBytes(cwd: string, status: string, path: string): string | 
     return createHash('sha256').update(readFileSync(abs)).digest('hex');
   } catch {
     if (status.includes('D') && !existsSync(abs)) return 'missing';
+    return null;
+  }
+}
+
+function sourceBytes(cwd: string, path: string): string | null {
+  const abs = join(cwd, path);
+  if (!existsSync(abs)) return 'missing';
+  try {
+    return createHash('sha256').update(readFileSync(abs)).digest('hex');
+  } catch {
     return null;
   }
 }
@@ -741,6 +782,23 @@ function readPointerAttempt(cwd: string, pointerName: string): EvidenceAttempt |
   return readAttemptById(cwd, id);
 }
 
+// 'absent' only when no pointer file exists. A pointer that cannot be read or
+// names an unsafe id is 'corrupt' and must never be treated as optional.
+function kindPointerId(
+  cwd: string,
+  kind: EvidenceAttempt['kind']
+): { state: 'absent' } | { state: 'corrupt' } | { state: 'id'; id: string } {
+  const pointer = join(attemptsDirectory(cwd), kindPointer(kind));
+  if (!existsSync(pointer)) return { state: 'absent' };
+  let id: string;
+  try {
+    id = readFileSync(pointer, 'utf8').trim();
+  } catch {
+    return { state: 'corrupt' };
+  }
+  return safeAttemptId(id) ? { state: 'id', id } : { state: 'corrupt' };
+}
+
 export function readCurrentAttempt(cwd: string): EvidenceAttempt | null {
   return readPointerAttempt(cwd, 'current');
 }
@@ -763,10 +821,16 @@ function liveBoundRunId(): string | null {
 export function checkBoundAttempts(
   cwd: string,
   liveAuthority: EvidenceAuthority,
-  binding: { testAttemptId: string | null; grepAttemptId: string | null }
+  binding: { testAttemptId: string | null; grepAttemptId: string | null },
+  required: { greps: boolean } = { greps: false }
 ): { ok: true } | { ok: false; reason: string } {
   if (!binding.testAttemptId && !binding.grepAttemptId) {
     return { ok: false, reason: 'missing-attempt' };
+  }
+  // Declared grep evidence is never optional: a deleted or unreadable record
+  // must not leave passing tests to satisfy the gate alone.
+  if (required.greps && !binding.grepAttemptId) {
+    return { ok: false, reason: 'missing-grep-attempt' };
   }
   // Fresh grep evidence must not satisfy the gate without its test attempt.
   if (binding.grepAttemptId && !binding.testAttemptId) {
@@ -780,6 +844,10 @@ export function checkBoundAttempts(
     if (testAttempt.kind !== 'tests' || testAttempt.source === 'other-stage') {
       return { ok: false, reason: 'test-attempt-kind' };
     }
+    // A test attempt with nothing selected proves nothing about the tree.
+    if (!testAttempt.members.some(member => member.scope === 'selected')) {
+      return { ok: false, reason: 'tests:no-selected-members' };
+    }
     const verdict = checkAttemptRecord(testAttempt, cwd, liveAuthority);
     if (!verdict.ok) return { ok: false, reason: `tests:${verdict.reason}` };
   }
@@ -787,6 +855,9 @@ export function checkBoundAttempts(
     grepAttempt = readAttemptById(cwd, binding.grepAttemptId);
     if (!grepAttempt) return { ok: false, reason: 'missing-grep-attempt' };
     if (grepAttempt.kind !== 'greps') return { ok: false, reason: 'grep-attempt-kind' };
+    if (required.greps && grepAttempt.aggregate === 'NOT_APPLICABLE') {
+      return { ok: false, reason: 'greps:not-applicable' };
+    }
     const verdict = checkAttemptRecord(grepAttempt, cwd, liveAuthority);
     if (!verdict.ok) return { ok: false, reason: `greps:${verdict.reason}` };
   }
@@ -2827,12 +2898,35 @@ function runCli(): number {
       const cwd = process.cwd();
       const explicitTests = explicitAttemptId(args, '--tests', 'SER_TEST_ATTEMPT_ID');
       const explicitGreps = explicitAttemptId(args, '--greps', 'SER_GREP_ATTEMPT_ID');
-      const testAttemptId = explicitTests ?? readKindAttempt(cwd, 'tests')?.attemptId ?? null;
-      const grepAttemptId = explicitGreps ?? readKindAttempt(cwd, 'greps')?.attemptId ?? null;
-      const verdict = checkBoundAttempts(cwd, authorityFromEnv(cwd), {
-        testAttemptId,
-        grepAttemptId,
-      });
+      const requireRaw = flagValue(args, '--require') ?? process.env.SER_REQUIRE_KINDS ?? 'tests';
+      const requireKinds = requireRaw.split(',').map(kind => kind.trim());
+      if (requireKinds.some(kind => kind !== 'tests' && kind !== 'greps')) {
+        process.stderr.write(`REFUSED unknown-required-kind:${requireRaw}\n`);
+        return 1;
+      }
+      // Bind the pointer id itself, not the parsed record, so a corrupted or
+      // deleted record behind a live pointer is refused instead of dropped.
+      const boundId = (
+        explicit: string | null,
+        kind: EvidenceAttempt['kind']
+      ): { corrupt: boolean; id: string | null } => {
+        if (explicit) return { corrupt: false, id: explicit };
+        const pointer = kindPointerId(cwd, kind);
+        if (pointer.state === 'corrupt') return { corrupt: true, id: null };
+        return { corrupt: false, id: pointer.state === 'id' ? pointer.id : null };
+      };
+      const tests = boundId(explicitTests, 'tests');
+      const greps = boundId(explicitGreps, 'greps');
+      if (tests.corrupt || greps.corrupt) {
+        process.stderr.write(`REFUSED corrupt-${tests.corrupt ? 'test' : 'grep'}-pointer\n`);
+        return 1;
+      }
+      const verdict = checkBoundAttempts(
+        cwd,
+        authorityFromEnv(cwd),
+        { testAttemptId: tests.id, grepAttemptId: greps.id },
+        { greps: requireKinds.includes('greps') }
+      );
       if (!verdict.ok) {
         process.stderr.write(`REFUSED ${verdict.reason}\n`);
         return 1;

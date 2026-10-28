@@ -1184,7 +1184,7 @@ describe('hermetic-fresh-attempt', () => {
       expect(renamed.paths.find(item => item.path === 'src-renamed.js')?.sha256).toBe(
         createHash('sha256').update(renamedBody).digest('hex')
       );
-      expect(renamed.paths.some(item => item.path === 'src.js')).toBe(false);
+      expect(renamed.paths.find(item => item.path === 'src.js')?.sha256).toBe('missing');
       git(cwd, ['reset', '--hard', 'HEAD']);
       expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
       rmSync(join(cwd, 'gone.js'));
@@ -2138,6 +2138,195 @@ describe('stale-source-log-exclusion', () => {
     } finally {
       if (savedArtifacts === undefined) delete process.env.ARTIFACTS_DIR;
       else process.env.ARTIFACTS_DIR = savedArtifacts;
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+});
+
+// Overseer PR #1286 review at c4e80205 (and the same two classes found on a
+// full read): evidence that is absent or corrupt must never pass, and the
+// tested-tree identity must not collide across different trees.
+describe('required-evidence-and-identity-collisions', () => {
+  function withArtifacts<T>(cwd: string, run: (artifacts: string) => T): T {
+    const artifacts = join(cwd, 'artifacts');
+    mkdirSync(artifacts, { recursive: true });
+    const saved = process.env.ARTIFACTS_DIR;
+    process.env.ARTIFACTS_DIR = artifacts;
+    try {
+      return run(artifacts);
+    } finally {
+      if (saved === undefined) delete process.env.ARTIFACTS_DIR;
+      else process.env.ARTIFACTS_DIR = saved;
+    }
+  }
+
+  it('refuses passing tests alone when declared grep evidence is deleted or corrupt', () => {
+    const cwd = tempDir('ser-required-greps-');
+    initRepo(cwd);
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+    try {
+      withArtifacts(cwd, artifacts => {
+        const env = { ...process.env, HARNESS_ROOT_OVERRIDE: ROOT, ARTIFACTS_DIR: artifacts };
+        const check = (...extra: string[]) =>
+          spawnSync('bun', [RUNNER, 'check-attempt', ...extra], { cwd, env, encoding: 'utf8' });
+        runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
+        const greps = spawnSync('bun', [RUNNER, 'run-greps'], {
+          cwd,
+          env,
+          encoding: 'utf8',
+          input: 'grep -c base README\teq\t1\nDECLARED\t1\n',
+        });
+        expect(greps.status).toBe(0);
+        const attempts = join(artifacts, 'evidence', 'attempts');
+        const pointer = join(attempts, 'current-greps');
+        const grepId = readFileSync(pointer, 'utf8').trim();
+        const record = join(attempts, `${grepId}.json`);
+        const body = readFileSync(record, 'utf8');
+        expect(check('--require', 'tests,greps').status).toBe(0);
+
+        writeFileSync(record, '{ not json');
+        const corruptRecord = check('--require', 'tests,greps');
+        expect(corruptRecord.status).not.toBe(0);
+        expect(corruptRecord.stderr).toContain('REFUSED missing-grep-attempt');
+        // Even when greps are not declared, a live pointer to an unreadable
+        // record is bound and refused, never silently dropped.
+        expect(check('--require', 'tests').status).not.toBe(0);
+        rmSync(record);
+        expect(check('--require', 'tests,greps').stderr).toContain('REFUSED missing-grep-attempt');
+        writeFileSync(record, body);
+
+        writeFileSync(pointer, '../escape\n');
+        const corruptPointer = check('--require', 'tests,greps');
+        expect(corruptPointer.status).not.toBe(0);
+        expect(corruptPointer.stderr).toContain('REFUSED corrupt-grep-pointer');
+
+        rmSync(pointer);
+        const deleted = check('--require', 'tests,greps');
+        expect(deleted.status).not.toBe(0);
+        expect(deleted.stderr).toContain('REFUSED missing-grep-attempt');
+        // Only an explicit "no greps declared" requirement admits tests alone.
+        expect(check('--require', 'tests').status).toBe(0);
+        expect(check('--require', 'tests,bogus').stderr).toContain('REFUSED unknown-required-kind');
+
+        const none = spawnSync('bun', [RUNNER, 'run-greps'], {
+          cwd,
+          env,
+          encoding: 'utf8',
+          input: 'DECLARED\t0\n',
+        });
+        expect(none.status).toBe(0);
+        expect(none.stdout).toContain('GREP_STATUS=none_declared');
+        const notApplicable = check('--require', 'tests,greps');
+        expect(notApplicable.status).not.toBe(0);
+        expect(notApplicable.stderr).toContain('REFUSED greps:not-applicable');
+        expect(check('--require', 'tests').status).toBe(0);
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a test attempt with no selected members', () => {
+    const cwd = tempDir('ser-empty-tests-');
+    initRepo(cwd);
+    try {
+      withArtifacts(cwd, artifacts => {
+        const summary = runTestCommands([], cwd, join(artifacts, 'stop-tests.log'));
+        const verdict = checkBoundAttempts(cwd, authority(cwd), {
+          testAttemptId: summary.attempt.attemptId,
+          grepAttemptId: null,
+        });
+        expect(verdict.ok).toBe(false);
+        if (!verdict.ok) expect(verdict.reason).toBe('tests:no-selected-members');
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('every lane check-attempt call passes the required evidence kinds', () => {
+    const laneDir = join(ROOT, '.archon/workflows/defaults');
+    let calls = 0;
+    for (const lane of readdirSync(laneDir).filter(name => name.endsWith('.yaml'))) {
+      const text = readFileSync(join(laneDir, lane), 'utf8');
+      for (const line of text.split('\n')) {
+        if (!line.includes('ser_runner check-attempt')) continue;
+        calls += 1;
+        expect(line).toContain(
+          'check-attempt --require "$(if [ "$grep_status" = none_declared ]; then echo tests; else echo tests,greps; fi)"'
+        );
+      }
+    }
+    expect(calls).toBeGreaterThan(20);
+  });
+
+  it('records rename sources so a different source cannot reuse the identity', () => {
+    const cwd = tempDir('ser-rename-source-');
+    initRepo(cwd);
+    git(cwd, ['config', 'core.autocrlf', 'false']);
+    writeFileSync(join(cwd, 'a.js'), 'same\n');
+    writeFileSync(join(cwd, 'b.js'), 'same\n');
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+    git(cwd, ['add', '--', 'a.js', 'b.js', 'ok.sh']);
+    git(cwd, ['commit', '-qm', 'identical sources']);
+    try {
+      withArtifacts(cwd, artifacts => {
+        git(cwd, ['mv', 'a.js', 'c.js']);
+        const tested = testedTreeIdentity(cwd);
+        expect(tested.paths.find(item => item.path === 'a.js')?.sha256).toBe('missing');
+        const summary = runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
+        expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+        git(cwd, ['reset', '-q', '--hard', 'HEAD']);
+        git(cwd, ['mv', 'b.js', 'c.js']);
+        const swapped = checkAttemptRecord(summary.attempt, cwd, authority(cwd));
+        expect(swapped.ok).toBe(false);
+        if (!swapped.ok) expect(swapped.reason).toBe('dirty-bytes');
+        git(cwd, ['reset', '-q', '--hard', 'HEAD']);
+        git(cwd, ['mv', 'a.js', 'c.js']);
+        expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+        git(cwd, ['commit', '-qm', 'commit the tested rename']);
+        expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+      });
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when skip-worktree or assume-unchanged hides tracked bytes', () => {
+    const cwd = tempDir('ser-hidden-index-');
+    initRepo(cwd);
+    try {
+      expect(testedTreeIdentity(cwd).method).toBe('sha256-worktree-bytes-v1');
+      git(cwd, ['update-index', '--skip-worktree', 'README']);
+      expect(testedTreeIdentity(cwd).method).toBe('hash-failed');
+      git(cwd, ['update-index', '--no-skip-worktree', 'README']);
+      git(cwd, ['update-index', '--assume-unchanged', 'README']);
+      expect(testedTreeIdentity(cwd).method).toBe('hash-failed');
+      git(cwd, ['update-index', '--no-assume-unchanged', 'README']);
+      expect(testedTreeIdentity(cwd).method).toBe('sha256-worktree-bytes-v1');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not exclude tracked product files under .ser-attempts', () => {
+    const cwd = tempDir('ser-dot-attempts-');
+    initRepo(cwd);
+    mkdirSync(join(cwd, '.ser-attempts'), { recursive: true });
+    writeFileSync(join(cwd, '.ser-attempts/lib.js'), 'v1\n');
+    writeExec(join(cwd, 'ok.sh'), '#!/bin/sh\necho "Tests: 1/1"\n');
+    git(cwd, ['add', '--', '.ser-attempts/lib.js', 'ok.sh']);
+    git(cwd, ['commit', '-qm', 'product dir']);
+    try {
+      withArtifacts(cwd, artifacts => {
+        const summary = runTestCommands(['bash ./ok.sh'], cwd, join(artifacts, 'stop-tests.log'));
+        expect(checkAttemptRecord(summary.attempt, cwd, authority(cwd)).ok).toBe(true);
+        writeFileSync(join(cwd, '.ser-attempts/lib.js'), 'v2\n');
+        const stale = checkAttemptRecord(summary.attempt, cwd, authority(cwd));
+        expect(stale.ok).toBe(false);
+        if (!stale.ok) expect(stale.reason).toBe('dirty-bytes');
+      });
+    } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
   });

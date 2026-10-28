@@ -4500,7 +4500,7 @@ nodes:
           case "$tests_status" in
             passed|failed|counts_unparsed)
               local attempt_err
-              attempt_err="$(ser_runner check-attempt 2>&1 >/dev/null)" || {
+              attempt_err="$(ser_runner check-attempt --require "$(if [ "$grep_status" = none_declared ]; then echo tests; else echo tests,greps; fi)" 2>&1 >/dev/null)" || {
                 verdict="fail"
                 printf '%s\n' "$attempt_err" >&2
               }
@@ -4668,7 +4668,7 @@ nodes:
           case "$tests_status" in
             passed|failed|counts_unparsed)
               local attempt_err
-              if ! attempt_err="$(ser_runner check-attempt 2>&1 >/dev/null)"; then
+              if ! attempt_err="$(ser_runner check-attempt --require "$(if [ "$grep_status" = none_declared ]; then echo tests; else echo tests,greps; fi)" 2>&1 >/dev/null)"; then
                 printf '%s\n' "${attempt_err:-REFUSED missing or stale attempt}" >&2
                 return 1
               fi
