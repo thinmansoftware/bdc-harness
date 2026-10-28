@@ -109,16 +109,6 @@ function gitStdin(args: string[], cwd: string, input: string): string {
   return result.stdout.toString();
 }
 
-function untar(tarPath: string, dest: string): void {
-  const result = Bun.spawnSync(['tar', '-C', dest, '-xf', tarPath], {
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  if (result.exitCode !== 0) {
-    throw new Error(`tar extract failed: ${result.stderr.toString()}`);
-  }
-}
-
 function utcSecondsAgo(seconds: number): string {
   const d = new Date(Date.now() - seconds * 1000);
   const p = (n: number): string => String(n).padStart(2, '0');
@@ -493,14 +483,12 @@ describe('repair-target worktree reclaim', () => {
     expect(worktrees(fixture.caller)).toContain(holder);
   }, 30000);
 
-  // Round-5 finding 1: the untracked-file backup must use NUL-delimited, literal
-  // (verbatim) names so leading/trailing whitespace and option-like filenames are
-  // not mangled by tar, and every untracked file must restore byte-for-byte before
-  // the holder is force-removed.
-  it('Round-5 #1: whitespace and option-like untracked files are preserved and restore byte-for-byte', () => {
+  // A dirty holder detaches HEAD and keeps every untracked byte in place. No archive.
+  it('Round-5 #1: whitespace and option-like untracked files stay in the released holder', () => {
     const fixture = makeFixture({ hold: true, withOther: false });
     roots.push(fixture.root);
     const holder = holderPath(fixture.holder);
+    const tip = git(['rev-parse', 'HEAD'], holder).trim();
     const files: ReadonlyArray<{ name: string; body: string }> = [
       { name: 'notes.txt', body: 'plain untracked body\n' },
       { name: ' notes.txt', body: 'leading space untracked body\n' },
@@ -516,32 +504,31 @@ describe('repair-target worktree reclaim', () => {
       },
     ]);
     const artifacts = mkdtempSync(join(tmpdir(), 'rtw-art-'));
-    const scratch = mkdtempSync(join(tmpdir(), 'rtw-untar-'));
     try {
       const result = runCheckout(fixture, fixture.dbPath, { ARTIFACTS_DIR: artifacts });
       if (result.exitCode !== 0) throw new Error(show(result));
-      expect(result.stdout).toContain('repair_target_worktree_reclaimed:');
-      expect(worktrees(fixture.caller)).not.toContain(holder);
+      expect(result.stdout).toContain(
+        `repair_target_holder_released: ${holder} detached at ${tip}`
+      );
+      expect(worktrees(fixture.caller)).toContain(holder);
+      expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], holder).trim()).toBe('HEAD');
+      expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], fixture.caller).trim()).toBe('feat/x');
       const dest = join(artifacts, 'reclaimed-holder', 'abcd1234');
-      const tarPath = join(dest, 'untracked.tar');
-      expect(existsSync(tarPath), `expected untracked.tar at ${tarPath}`).toBe(true);
-      untar(tarPath, scratch);
+      expect(existsSync(join(dest, 'released.json'))).toBe(true);
+      expect(existsSync(join(dest, 'untracked.tar'))).toBe(false);
       for (const f of files) {
-        const restored = readFileSync(join(scratch, f.name));
+        const restored = readFileSync(join(holder, f.name));
         expect(restored.equals(Buffer.from(f.body)), `mismatch for ${JSON.stringify(f.name)}`).toBe(
           true
         );
       }
     } finally {
       rmSync(artifacts, { recursive: true, force: true });
-      rmSync(scratch, { recursive: true, force: true });
     }
   }, 30000);
 
-  // Round-6 finding 2: an unmerged index is not recoverable from the staged/worktree
-  // binary diffs; every index stage blob and the working-tree copy must be preserved
-  // and verified restorable before the holder is force-removed.
-  it('Round-6 #2: an unmerged-index holder preserves every stage blob and working file before reclaim', () => {
+  // An unmerged index stays in the holder. Detach HEAD and remove nothing.
+  it('Round-6 #2: an unmerged-index holder keeps every stage and is not removed', () => {
     const fixture = makeFixture({ hold: true, withOther: false });
     roots.push(fixture.root);
     const holder = holderPath(fixture.holder);
@@ -568,19 +555,21 @@ describe('repair-target worktree reclaim', () => {
     ]);
     const artifacts = mkdtempSync(join(tmpdir(), 'rtw-art-'));
     try {
+      const tip = git(['rev-parse', 'HEAD'], holder).trim();
       const result = runCheckout(fixture, fixture.dbPath, { ARTIFACTS_DIR: artifacts });
       if (result.exitCode !== 0) throw new Error(show(result));
-      expect(result.stdout).toContain('repair_target_worktree_reclaimed:');
-      expect(worktrees(fixture.caller)).not.toContain(holder);
+      expect(result.stdout).toContain(
+        `repair_target_holder_released: ${holder} detached at ${tip}`
+      );
+      expect(worktrees(fixture.caller)).toContain(holder);
+      expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], holder).trim()).toBe('HEAD');
+      expect(git(['rev-parse', 'HEAD'], holder).trim()).toBe(tip);
+      expect(git(['ls-files', '-u'], holder)).toContain('conflict.txt');
+      expect(readFileSync(join(holder, 'conflict.txt')).equals(Buffer.from(workBody))).toBe(true);
       const dest = join(artifacts, 'reclaimed-holder', 'abcd1234');
-      expect(existsSync(join(dest, 'ls-files-u.txt'))).toBe(true);
-      for (let i = 0; i < stages.length; i++) {
-        const blobPath = join(dest, 'index-stages', `${shas[i]}.blob`);
-        expect(existsSync(blobPath), `expected stage blob ${blobPath}`).toBe(true);
-        expect(readFileSync(blobPath).equals(Buffer.from(stages[i].body))).toBe(true);
-      }
-      const savedWork = readFileSync(join(dest, 'worktree-files', 'conflict.txt'));
-      expect(savedWork.equals(Buffer.from(workBody))).toBe(true);
+      expect(existsSync(join(dest, 'released.json'))).toBe(true);
+      expect(existsSync(join(dest, 'ls-files-u.txt'))).toBe(false);
+      expect(existsSync(join(dest, 'index-stages'))).toBe(false);
     } finally {
       rmSync(artifacts, { recursive: true, force: true });
     }

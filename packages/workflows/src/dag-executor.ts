@@ -20,7 +20,6 @@ import {
   execFileAsync,
   execOwnedProcessGroup,
   endProcessGroup,
-  isTreeSurvivedError,
   processGroupExists,
 } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
@@ -3185,8 +3184,9 @@ async function executeNodeInternal(
 const SUBPROCESS_DEFAULT_TIMEOUT = 120_000;
 
 interface TeardownSurvivor {
-  pid: number;
-  comm: string;
+  pid?: number;
+  comm?: string;
+  reason?: 'unowned_cwd_holder' | 'teardown_unverifiable';
 }
 
 interface TeardownReport {
@@ -3194,10 +3194,9 @@ interface TeardownReport {
   survivors: TeardownSurvivor[];
 }
 
-/** pgid plus /proc stat field 22 (starttime). A reused number fails this check. */
+/** A group is owned from spawn until a /proc pgrp scan observes it empty. */
 interface OwnedProcessGroup {
   pgid: number;
-  startTicks: string | null;
 }
 
 const ownedProcessGroups = new Map<string, OwnedProcessGroup[]>();
@@ -3206,39 +3205,31 @@ const teardownEpoch = new Map<string, number>();
 const runAbortLatches = new Set<string>();
 const nodeFailureStderr = new Map<string, string>();
 let teardownProcRoot = '/proc';
+let teardownPlatformOverride: NodeJS.Platform | null = null;
 
 /** Test seam. Production reads /proc. Reset by resetRunTeardownStateForTests. */
 export function setTeardownProcRootForTests(root: string): void {
   teardownProcRoot = root;
 }
 
-function readProcStartTicks(pid: number): string | null {
-  if (process.platform === 'win32') return null;
-  try {
-    const stat = readFileSync(`${teardownProcRoot}/${String(pid)}/stat`, 'utf8');
-    const after = stat
-      .slice(stat.lastIndexOf(')') + 1)
-      .trim()
-      .split(/\s+/);
-    // Field 22 of /proc/<pid>/stat is the 20th field after the comm parenthesis.
-    const ticks = after[19] ?? '';
-    return /^\d+$/.test(ticks) ? ticks : null;
-  } catch {
-    return null;
-  }
+/** Test seam. null uses process.platform. Reset by resetRunTeardownStateForTests. */
+export function setTeardownPlatformForTests(platform: NodeJS.Platform | null): void {
+  teardownPlatformOverride = platform;
 }
 
-function ownedIdentityMatches(entry: OwnedProcessGroup): 'match' | 'mismatch' | 'leader-gone' {
-  if (process.platform === 'win32') {
-    // Windows has no starttime check. onExit retires a group only after the
-    // tree is verified gone, so a dead root with live descendants stays
-    // recorded and teardown still runs taskkill /T /F.
-    return 'match';
+function teardownPlatform(): NodeJS.Platform {
+  return teardownPlatformOverride ?? process.platform;
+}
+
+/** Linux with a readable proc root. Every other case is teardown_unverifiable. */
+function executorVerifiedTeardown(): boolean {
+  if (teardownPlatform() !== 'linux') return false;
+  try {
+    readdirSync(teardownProcRoot);
+    return true;
+  } catch {
+    return false;
   }
-  if (entry.startTicks === null) return 'mismatch';
-  const current = readProcStartTicks(entry.pgid);
-  if (current === null) return 'leader-gone';
-  return current === entry.startTicks ? 'match' : 'mismatch';
 }
 
 function retireOwnedProcessGroup(runId: string, pgid: number): void {
@@ -3253,7 +3244,7 @@ function recordOwnedProcessGroup(runId: string, pgid: number | undefined): void 
   if (typeof pgid !== 'number' || !Number.isInteger(pgid) || pgid <= 0) return;
   const list = ownedProcessGroups.get(runId) ?? [];
   if (!list.some(entry => entry.pgid === pgid)) {
-    list.push({ pgid, startTicks: readProcStartTicks(pgid) });
+    list.push({ pgid });
     ownedProcessGroups.set(runId, list);
   }
   // A group that registers after a scan must not inherit that scan's confirmation.
@@ -3272,29 +3263,20 @@ async function endRecordedGroup(
 ): Promise<'ended' | 'survived' | 'retired'> {
   const current = (ownedProcessGroups.get(runId) ?? []).find(item => item.pgid === entry.pgid);
   if (!current) return 'retired';
-  const identity = ownedIdentityMatches(current);
-  // A different starttime means this pid was reused. Do not signal it.
-  // A missing leader is safe to signal only while its original group still
-  // has members: the pid itself is not a live process, so kill(-pgid) cannot
-  // hit a reuse. An empty group is retired with no signal.
-  if (identity === 'mismatch' || (identity === 'leader-gone' && !processGroupExists(entry.pgid))) {
-    retireOwnedProcessGroup(runId, entry.pgid);
-    return 'retired';
-  }
+  if (!executorVerifiedTeardown()) return 'survived';
   const epoch = teardownEpoch.get(runId) ?? 0;
   try {
     await endProcessGroup(entry.pgid);
-    // A registration during the stop keeps the newest record. Retiring here
-    // would let the next scan confirm over that registration.
-    if ((teardownEpoch.get(runId) ?? 0) === epoch) {
-      retireOwnedProcessGroup(runId, entry.pgid);
-    }
-    return 'ended';
-  } catch (err) {
-    if (isTreeSurvivedError(err) || processGroupExists(entry.pgid)) return 'survived';
-    retireOwnedProcessGroup(runId, entry.pgid);
-    return 'retired';
+  } catch {
+    // A failed stop is not an empty scan. Keep the record.
+    return 'survived';
   }
+  // Retire only after the scan observes the group empty. A registration during
+  // the stop keeps the newest record so the next scan cannot confirm over it.
+  if (processGroupExists(entry.pgid)) return 'survived';
+  if ((teardownEpoch.get(runId) ?? 0) !== epoch) return 'ended';
+  retireOwnedProcessGroup(runId, entry.pgid);
+  return 'ended';
 }
 
 /** Latch first, then end only groups whose recorded identity still matches. */
@@ -3339,10 +3321,7 @@ function ownedSpawnHooks(runId: string): {
     onSpawn(pgid: number): void {
       recordOwnedProcessGroup(runId, pgid);
       if (!runAbortLatches.has(runId)) return;
-      void endRecordedGroup(runId, {
-        pgid,
-        startTicks: readProcStartTicks(pgid),
-      }).catch(() => {
+      void endRecordedGroup(runId, { pgid }).catch(() => {
         // Terminal teardown reports a survivor if this group is still present.
       });
     },
@@ -3359,11 +3338,42 @@ function noteNodeStderr(runId: string, nodeId: string, stderr: string | undefine
 
 function readProcComm(pid: number): string {
   try {
-    const comm = readFileSync(`/proc/${pid}/comm`, 'utf8').replace(/[\r\n]/g, '');
+    const comm = readFileSync(`${teardownProcRoot}/${String(pid)}/comm`, 'utf8').replace(
+      /[\r\n]/g,
+      ''
+    );
     return comm.length > 0 ? comm.slice(0, 64) : 'unknown';
   } catch {
     return 'unknown';
   }
+}
+
+/** Non-zombie processes whose /proc stat pgrp equals pgid. */
+function listGroupMembers(pgid: number): TeardownSurvivor[] {
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(teardownProcRoot);
+  } catch {
+    return [];
+  }
+  const members: TeardownSurvivor[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    let stat = '';
+    try {
+      stat = readFileSync(`${teardownProcRoot}/${entry}/stat`, 'utf8');
+    } catch {
+      continue;
+    }
+    const after = stat.slice(stat.lastIndexOf(')') + 1).trim();
+    const fields = after.split(/\s+/);
+    const state = fields[0] ?? '';
+    const pgrp = Number(fields[2]);
+    if (pgrp !== pgid || state === 'Z' || state === '') continue;
+    members.push({ pid, comm: readProcComm(pid) });
+  }
+  return members;
 }
 
 function ancestorPids(startPid: number): Set<number> {
@@ -3385,16 +3395,6 @@ function ancestorPids(startPid: number): Set<number> {
     current = ppid;
   }
   return skip;
-}
-
-function pidAlive(pid: number): boolean {
-  if (pid <= 0 || pid === process.pid) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'EPERM';
-  }
 }
 
 function cwdInside(resolved: string, root: string): boolean {
@@ -3459,40 +3459,43 @@ function verifiedOwnedPgid(pid: number, owned: Set<number>): number | null {
   return null;
 }
 
+function unverifiableReport(): TeardownReport {
+  return { confirmedAt: null, survivors: [{ reason: 'teardown_unverifiable' }] };
+}
+
 async function collectTeardownReport(
   runId: string,
   workingPath: string | null | undefined
 ): Promise<TeardownReport> {
+  if (!executorVerifiedTeardown()) return unverifiableReport();
   const survivors: TeardownSurvivor[] = [];
   const ownedList = [...(ownedProcessGroups.get(runId) ?? [])];
   for (const entry of ownedList) {
     const outcome = await endRecordedGroup(runId, entry);
-    if (outcome === 'survived') {
+    if (outcome !== 'survived') continue;
+    const members = listGroupMembers(entry.pgid);
+    if (members.length > 0) {
+      for (const member of members) {
+        if (survivors.some(existing => existing.pid === member.pid)) continue;
+        survivors.push(member);
+      }
+    } else {
       survivors.push({ pid: entry.pgid, comm: readProcComm(entry.pgid) });
     }
   }
-  const owned = new Set(
-    (ownedProcessGroups.get(runId) ?? [])
-      .filter(entry => ownedIdentityMatches(entry) === 'match')
-      .map(entry => entry.pgid)
-  );
+  const owned = new Set((ownedProcessGroups.get(runId) ?? []).map(entry => entry.pgid));
   if (workingPath) {
     const skip = ancestorPids(process.pid);
     for (const item of foreignCwdPids(workingPath, skip)) {
+      if (item.pid === undefined) continue;
       if (survivors.some(existing => existing.pid === item.pid)) continue;
       const pgid = verifiedOwnedPgid(item.pid, owned);
       if (pgid === null) {
-        // Unrelated or unproven. Report it and do not signal it.
-        survivors.push(item);
+        // Not a member of a live owned group. Never signal it.
+        survivors.push({ pid: item.pid, comm: item.comm, reason: 'unowned_cwd_holder' });
         continue;
       }
-      if (!pidAlive(item.pid)) continue;
-      const recorded = (ownedProcessGroups.get(runId) ?? []).find(entry => entry.pgid === pgid);
-      if (!recorded) continue;
-      const outcome = await endRecordedGroup(runId, recorded);
-      if (outcome === 'survived' || pidAlive(item.pid)) {
-        survivors.push({ pid: item.pid, comm: readProcComm(item.pid) });
-      }
+      survivors.push({ pid: item.pid, comm: item.comm });
     }
   }
   return survivors.length > 0
@@ -3502,22 +3505,20 @@ async function collectTeardownReport(
 
 /**
  * End every process group recorded for this run. A cwd under the worktree is
- * signaled only when it is one of those groups (pid or pgrp). Every other cwd
- * match is a blocker: it is reported and teardown_confirmed_at stays unset.
- * An unconfirmed report stays cached. A confirmation does not: the abort path
- * caches one before the terminal write, so the confirming call scans cwd again.
+ * A cwd holder outside a live owned group is a blocker and is never signaled.
+ * Each call rescans. A cached report is not reused across terminal writes.
  */
 export async function endRunProcessTree(
   runId: string,
   workingPath: string | null | undefined
 ): Promise<TeardownReport> {
-  const cached = teardownReports.get(runId);
-  if (cached && (cached.confirmedAt === null || cached.survivors.length > 0)) {
-    return cached;
+  // A stale report is never reused across terminal writes. Rescan cwd every time.
+  teardownReports.delete(runId);
+  if (!executorVerifiedTeardown()) {
+    const report = unverifiableReport();
+    teardownReports.set(runId, report);
+    return report;
   }
-  // Drop a stale confirmation before the rescan. A throw or a registration
-  // during the scan must not leave that confirmation in place.
-  if (cached) teardownReports.delete(runId);
   for (let attempt = 0; attempt < 4; attempt++) {
     const epoch = teardownEpoch.get(runId) ?? 0;
     const report = await collectTeardownReport(runId, workingPath);
@@ -3571,6 +3572,7 @@ export function resetRunTeardownStateForTests(): void {
   runAbortLatches.clear();
   nodeFailureStderr.clear();
   teardownProcRoot = '/proc';
+  teardownPlatformOverride = null;
 }
 
 /** Test seam. Registration bumps the teardown epoch and drops a cached report. */
@@ -3714,6 +3716,7 @@ async function executeBashNode(
         timeout,
         env: subprocessEnv,
         endTreeOnTimeout: true,
+        verifiedTeardown: executorVerifiedTeardown(),
         ...ownedSpawnHooks(workflowRun.id),
       });
       stdout = owned.stdout;
@@ -4109,6 +4112,7 @@ async function executeScriptNode(
       timeout,
       env: subprocessEnv,
       endTreeOnTimeout: true,
+      verifiedTeardown: executorVerifiedTeardown(),
       ...ownedSpawnHooks(workflowRun.id),
     });
     const stdout = owned.stdout;

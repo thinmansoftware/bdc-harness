@@ -3,13 +3,7 @@ import { spawn } from 'child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import {
-  endProcessGroup,
-  execOwnedProcessGroup,
-  isTreeSurvivedError,
-  pidsFromWindowsJobList,
-  setWindowsOwnedTreeControlForTests,
-} from './exec';
+import { execOwnedProcessGroup, setVerifiedTeardownForTests } from './exec';
 
 const problems: unknown[] = [];
 const strayPids: number[] = [];
@@ -64,7 +58,7 @@ function stopPid(pid: number): void {
 }
 
 afterEach(() => {
-  setWindowsOwnedTreeControlForTests(null);
+  setVerifiedTeardownForTests(null);
   while (strayPids.length > 0) {
     const pid = strayPids.pop();
     if (pid !== undefined) stopPid(pid);
@@ -72,7 +66,7 @@ afterEach(() => {
 });
 
 describe('execOwnedProcessGroup spawn errors', () => {
-  test('missing executable and invalid cwd reject with the original spawn error', async () => {
+  test('owned_spawn_error_rejects: missing executable and invalid cwd reject with the original error', async () => {
     problems.length = 0;
     process.on('uncaughtException', onUncaught);
     process.on('unhandledRejection', onRejection);
@@ -201,7 +195,7 @@ describe('execOwnedProcessGroup output bound', () => {
     }
   }
 
-  test('stdout past the byte cap stops the group and rejects', async () => {
+  test('owned_output_bounded_bytes: stdout past the byte cap stops the group and rejects', async () => {
     problems.length = 0;
     process.on('uncaughtException', onUncaught);
     process.on('unhandledRejection', onRejection);
@@ -287,203 +281,4 @@ describe('execOwnedProcessGroup timeout descendants', () => {
       }
     }
   );
-});
-
-// Redirected stdio so the root can exit while the child stays in the Windows
-// job. detached:true would break away from that job and escape taskkill /T.
-const orphanLauncher = [
-  "const { spawn } = require('child_process');",
-  "const fs = require('fs');",
-  'const logFd = fs.openSync(process.env.DESC_LOG, "w");',
-  'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000000)"], {',
-  "  stdio: ['ignore', logFd, logFd],",
-  '  windowsHide: true,',
-  '});',
-  'if (!child.pid) process.exit(2);',
-  'fs.writeFileSync(process.env.DESC_PID, String(child.pid));',
-  'child.unref();',
-  'process.exit(0);',
-].join('\n');
-
-describe('execOwnedProcessGroup windows descendants', () => {
-  test('job list keeps every pid and rejects a truncated snapshot', () => {
-    const buf = new Uint8Array(8 + 16);
-    const view = new DataView(buf.buffer);
-    view.setUint32(0, 2, true);
-    view.setUint32(4, 2, true);
-    view.setBigUint64(8, BigInt(10), true);
-    view.setBigUint64(16, BigInt(11), true);
-    expect(pidsFromWindowsJobList(buf)).toEqual([10, 11]);
-    expect(pidsFromWindowsJobList(new Uint8Array(8))).toEqual([]);
-    view.setUint32(0, 3, true);
-    expect(pidsFromWindowsJobList(buf)).toBeNull();
-  });
-
-  test('an unverifiable windows scan does not retire a closed root', async () => {
-    setWindowsOwnedTreeControlForTests({
-      descendants(): Promise<number[] | null> {
-        return Promise.resolve(null);
-      },
-      taskkill(): Promise<boolean> {
-        return Promise.resolve(false);
-      },
-    });
-    let exitCalls = 0;
-    const result = await execOwnedProcessGroup(process.execPath, ['-e', 'process.exit(0)'], {
-      onExit(): void {
-        exitCalls += 1;
-      },
-    });
-    expect(result.pgid).toBeGreaterThan(0);
-    expect(exitCalls).toBe(0);
-  });
-
-  test('a windows scan with no descendants retires the closed root', async () => {
-    setWindowsOwnedTreeControlForTests({
-      descendants(): Promise<number[] | null> {
-        return Promise.resolve([]);
-      },
-      taskkill(pid: number): Promise<boolean> {
-        return Promise.resolve(processAlive(pid));
-      },
-    });
-    let exitCalls = 0;
-    const result = await execOwnedProcessGroup(process.execPath, ['-e', 'process.exit(0)'], {
-      onExit(): void {
-        exitCalls += 1;
-      },
-    });
-    expect(result.pgid).toBeGreaterThan(0);
-    expect(exitCalls).toBe(1);
-  });
-
-  test('endProcessGroup keeps a surviving windows descendant as treeSurvived', async () => {
-    setWindowsOwnedTreeControlForTests({
-      descendants(): Promise<number[] | null> {
-        return Promise.resolve([424242]);
-      },
-      taskkill(): Promise<boolean> {
-        return Promise.resolve(false);
-      },
-    });
-    const err = await endProcessGroup(2147483000).then(
-      () => {
-        throw new Error('surviving windows tree returned');
-      },
-      (caught: Error) => caught
-    );
-    expect(isTreeSurvivedError(err)).toBe(true);
-  });
-
-  test('endProcessGroup returns when the windows scan proves the tree is gone', async () => {
-    setWindowsOwnedTreeControlForTests({
-      descendants(): Promise<number[] | null> {
-        return Promise.resolve([]);
-      },
-      taskkill(): Promise<boolean> {
-        return Promise.resolve(false);
-      },
-    });
-    await endProcessGroup(2147483000);
-  });
-
-  test('windows close taskkills a descendant that outlives the root before retiring', async () => {
-    let descendantAlive = true;
-    const killed: number[] = [];
-    let aliveAtExit: boolean | null = null;
-    setWindowsOwnedTreeControlForTests({
-      descendants(): Promise<number[] | null> {
-        // A root-pid check would report the tree gone here. The descendant
-        // is still alive until taskkill runs.
-        return Promise.resolve(descendantAlive ? [525252] : []);
-      },
-      taskkill(pid: number): Promise<boolean> {
-        killed.push(pid);
-        if (pid === 525252) descendantAlive = false;
-        return Promise.resolve(true);
-      },
-    });
-    let exitCalls = 0;
-    const result = await execOwnedProcessGroup(process.execPath, ['-e', 'process.exit(0)'], {
-      onExit(): void {
-        exitCalls += 1;
-        aliveAtExit = descendantAlive;
-      },
-    });
-    expect(result.pgid).toBeGreaterThan(0);
-    expect(killed).toContain(525252);
-    expect(exitCalls).toBe(1);
-    expect(aliveAtExit).toBe(false);
-  });
-
-  test('successful close taskkills a redirected descendant before retiring', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'archon-owned-win-'));
-    const pidFile = join(dir, 'desc.pid');
-    const logFile = join(dir, 'desc.log');
-    const killed: number[] = [];
-    let exitCalls = 0;
-    let descendantPid = 0;
-    let aliveAtExit: boolean | null = null;
-    const simulated = process.platform !== 'win32';
-    if (simulated) {
-      setWindowsOwnedTreeControlForTests({
-        descendants(rootPid: number): Promise<number[] | null> {
-          let parsed = 0;
-          try {
-            parsed = Number(readFileSync(pidFile, 'utf8').trim());
-          } catch {
-            return Promise.resolve(null);
-          }
-          if (!Number.isInteger(parsed) || parsed <= 0 || parsed === rootPid) {
-            return Promise.resolve([]);
-          }
-          return Promise.resolve(processAlive(parsed) ? [parsed] : []);
-        },
-        taskkill(pid: number): Promise<boolean> {
-          if (!processAlive(pid)) return Promise.resolve(false);
-          killed.push(pid);
-          try {
-            process.kill(pid, 'SIGKILL');
-            return Promise.resolve(true);
-          } catch {
-            return Promise.resolve(false);
-          }
-        },
-      });
-    }
-    try {
-      const result = await execOwnedProcessGroup(process.execPath, ['-e', orphanLauncher], {
-        env: { ...process.env, DESC_PID: pidFile, DESC_LOG: logFile },
-        onSpawn(pgid: number): void {
-          remember(pgid);
-        },
-        onExit(): void {
-          exitCalls += 1;
-          try {
-            descendantPid = Number(readFileSync(pidFile, 'utf8').trim());
-          } catch {
-            descendantPid = -1;
-          }
-          remember(descendantPid);
-          aliveAtExit = processAlive(descendantPid);
-        },
-      });
-      expect(result.pgid).toBeGreaterThan(0);
-      expect(exitCalls).toBe(1);
-      expect(descendantPid).toBeGreaterThan(1);
-      expect(aliveAtExit).toBe(false);
-      expect(processAlive(descendantPid)).toBe(false);
-      if (simulated) expect(killed).toContain(descendantPid);
-    } finally {
-      setWindowsOwnedTreeControlForTests(null);
-      let leftover = 0;
-      try {
-        leftover = Number(readFileSync(pidFile, 'utf8').trim());
-      } catch {
-        leftover = 0;
-      }
-      stopPid(leftover);
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
 });

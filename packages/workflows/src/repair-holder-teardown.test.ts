@@ -10,6 +10,7 @@ import {
   readlinkSync,
   readdirSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'fs';
@@ -35,6 +36,7 @@ import {
   recordOwnedProcessGroupForTests,
   recordTeardownBeforeStatus,
   resetRunTeardownStateForTests,
+  setTeardownPlatformForTests,
   setTeardownProcRootForTests,
   teardownTerminalMetadata,
 } from './dag-executor';
@@ -220,6 +222,26 @@ function worktrees(cwd: string): string {
 
 function show(result: RunResult): string {
   return `exit=${result.exitCode}\nSTDOUT:\n${result.stdout}\nSTDERR:\n${result.stderr}`;
+}
+
+function sha256File(path: string): string {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+function holderFileHashes(root: string): string[] {
+  const out: string[] = [];
+  const walk = (dir: string): void => {
+    for (const name of readdirSync(dir)) {
+      if (name === '.git') continue;
+      const full = join(dir, name);
+      const info = statSync(full);
+      if (info.isDirectory()) walk(full);
+      else if (info.isFile()) out.push(`${name}@${full.slice(root.length)}\t${sha256File(full)}`);
+    }
+  };
+  walk(root);
+  out.sort();
+  return out;
 }
 
 function runCore(fixture: Fixture, extraEnv: Record<string, string>, preamble = ''): RunResult {
@@ -722,65 +744,38 @@ describe.serial('repair holder teardown', () => {
     expect(readFileSync(join(mixedHolder, 'keep.txt'), 'utf8')).toBe('keep\n');
   });
 
-  it('Test 3: uncommitted changes are preserved as a patch before reclaim', () => {
+  it('Test 3: a dirty terminal holder releases the branch, not its files', () => {
     const saved = makeFixture();
     const holder = holderPath(saved.holder);
-    const originalBin = Buffer.from([0x10, 0x20, 0x30, 0x40]);
-    const editedBin = Buffer.from([0x10, 0x20, 0x99, 0xff]);
-    writeFileSync(join(holder, 'tracked.bin'), originalBin);
-    git(['add', 'tracked.bin'], holder);
-    git(['commit', '-m', 'track binary'], holder);
-    git(['push', 'origin', 'HEAD:feat/x'], holder);
-    const head = git(['rev-parse', 'HEAD'], holder).trim();
+    const tip = git(['rev-parse', 'HEAD'], holder).trim();
     writeFileSync(join(holder, 'README.md'), 'changed\n');
-    writeFileSync(join(holder, 'tracked.bin'), editedBin);
     writeFileSync(join(holder, 'notes.txt'), 'untracked\n');
-    writeFileSync(join(holder, 'blob.bin'), Buffer.from([0x00, 0x01, 0x02, 0xff]));
+    const before = holderFileHashes(holder);
+    const indexPath = git(
+      ['rev-parse', '--path-format=absolute', '--git-path', 'index'],
+      holder
+    ).trim();
+    const indexBefore = sha256File(indexPath);
     writeRuns(saved.dbPath, [terminalRow(holder)]);
     const artifacts = join(saved.root, 'artifacts');
     mkdirSync(artifacts);
     const result = runCore(saved, { ARTIFACTS_DIR: artifacts });
     expect(result.exitCode, show(result)).toBe(0);
+    expect(result.stdout).toContain(`repair_target_holder_released: ${holder} detached at ${tip}`);
+    expect(git(['rev-parse', 'HEAD'], holder).trim()).toBe(tip);
+    expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], holder).trim()).toBe('HEAD');
+    expect(holderFileHashes(holder)).toEqual(before);
+    expect(sha256File(indexPath)).toBe(indexBefore);
+    expect(readFileSync(join(holder, 'README.md'), 'utf8')).toBe('changed\n');
+    expect(readFileSync(join(holder, 'notes.txt'), 'utf8')).toBe('untracked\n');
+    expect(worktrees(saved.caller)).toContain(holder);
+    expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], saved.caller).trim()).toBe('feat/x');
     const savedDir = join(artifacts, 'reclaimed-holder', 'abcd1234');
-    const lines = [...result.stdout.matchAll(/holder_patch_saved: (\S+) sha256 ([0-9a-f]{64})/g)];
-    expect(lines.length, show(result)).toBeGreaterThanOrEqual(4);
-    for (const line of lines) {
-      const savedPath = line[1] ?? '';
-      const printed = line[2] ?? '';
-      expect(savedPath.startsWith(savedDir)).toBe(true);
-      expect(createHash('sha256').update(readFileSync(savedPath)).digest('hex')).toBe(printed);
-    }
-    expect(readFileSync(join(savedDir, 'git-status.porcelain'), 'utf8')).toContain('notes.txt');
-    const worktreePatch = join(savedDir, 'worktree.patch');
-    const fresh = join(saved.root, 'fresh');
-    git(['worktree', 'add', '--detach', fresh, head], join(saved.root, 'main'));
-    const check = Bun.spawnSync(['git', 'apply', '--check', worktreePatch], {
-      cwd: fresh,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    expect(check.exitCode, check.stderr.toString()).toBe(0);
-    const applied = Bun.spawnSync(['git', 'apply', worktreePatch], {
-      cwd: fresh,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    expect(applied.exitCode, applied.stderr.toString()).toBe(0);
-    expect(readFileSync(join(fresh, 'README.md'), 'utf8')).toBe('changed\n');
-    expect(readFileSync(join(fresh, 'tracked.bin'))).toEqual(editedBin);
-    const unpacked = join(saved.root, 'unpacked');
-    mkdirSync(unpacked);
-    const extracted = Bun.spawnSync(
-      ['tar', '-xf', join(savedDir, 'untracked.tar'), '-C', unpacked],
-      {
-        stdout: 'pipe',
-        stderr: 'pipe',
-      }
-    );
-    expect(extracted.exitCode, extracted.stderr.toString()).toBe(0);
-    expect(readFileSync(join(unpacked, 'notes.txt'), 'utf8')).toBe('untracked\n');
-    expect(readFileSync(join(unpacked, 'blob.bin'))).toEqual(Buffer.from([0x00, 0x01, 0x02, 0xff]));
-    expect(worktrees(saved.caller)).not.toContain(holder);
+    expect(existsSync(join(savedDir, 'released.json'))).toBe(true);
+    expect(
+      readdirSync(savedDir).some(name => name.endsWith('.patch') || name.endsWith('.tar'))
+    ).toBe(false);
+    expect(result.stdout).not.toContain('holder_patch_saved:');
 
     const refused = makeFixture();
     const dirtyHolder = holderPath(refused.holder);
@@ -791,45 +786,133 @@ describe.serial('repair holder teardown', () => {
     expect(refusedResult.exitCode, show(refusedResult)).not.toBe(0);
     expect(`${refusedResult.stdout}\n${refusedResult.stderr}`).toContain('worktree is dirty');
     expect(worktrees(refused.caller)).toContain(dirtyHolder);
+    expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], dirtyHolder).trim()).toBe('feat/x');
   });
 
-  it('preserves staged index content when the worktree file matches HEAD', () => {
+  it('dirty_holder_released_lossless: a dirty holder is released without touching a byte', () => {
     const saved = makeFixture();
     const holder = holderPath(saved.holder);
-    const head = git(['rev-parse', 'HEAD'], holder).trim();
-    writeFileSync(join(holder, 'README.md'), 'staged-only\n');
-    git(['add', 'README.md'], holder);
-    writeFileSync(join(holder, 'README.md'), 'init\n');
-    const cachedBefore = git(['diff', '--cached', '--binary'], holder);
-    expect(cachedBefore).toContain('staged-only');
-    expect(readFileSync(join(holder, 'README.md'), 'utf8')).toBe('init\n');
+    writeFileSync(join(holder, 'a.txt'), 'tracked\n');
+    git(['add', 'a.txt'], holder);
+    git(['commit', '-m', 'track a'], holder);
+    git(['push', 'origin', 'HEAD:feat/x'], holder);
+    const tip = git(['rev-parse', 'HEAD'], holder).trim();
+    writeFileSync(join(holder, 'a.txt'), 'staged-only\n');
+    git(['add', 'a.txt'], holder);
+    writeFileSync(join(holder, 'a.txt'), 'tracked\n');
+    writeFileSync(join(holder, 'notes.txt'), 'plain\n');
+    writeFileSync(join(holder, ' notes.txt'), 'leading space\n');
+    writeFileSync(join(holder, '--version'), 'option-like\n');
+    const before = holderFileHashes(holder);
+    const indexPath = git(
+      ['rev-parse', '--path-format=absolute', '--git-path', 'index'],
+      holder
+    ).trim();
+    const indexBefore = sha256File(indexPath);
     writeRuns(saved.dbPath, [terminalRow(holder)]);
     const artifacts = join(saved.root, 'artifacts');
     mkdirSync(artifacts);
     const result = runCore(saved, { ARTIFACTS_DIR: artifacts });
     expect(result.exitCode, show(result)).toBe(0);
-    const stagedPath = join(artifacts, 'reclaimed-holder', 'abcd1234', 'staged.patch');
-    const staged = readFileSync(stagedPath, 'utf8');
-    expect(staged.length).toBeGreaterThan(0);
-    expect(staged).toBe(cachedBefore);
-    const fresh = join(saved.root, 'fresh-staged');
-    git(['worktree', 'add', '--detach', fresh, head], join(saved.root, 'main'));
-    const check = Bun.spawnSync(['git', 'apply', '--check', stagedPath], {
-      cwd: fresh,
+    expect(result.stdout).toContain(`repair_target_holder_released: ${holder} detached at ${tip}`);
+    expect(holderFileHashes(holder)).toEqual(before);
+    expect(sha256File(indexPath)).toBe(indexBefore);
+    expect(readFileSync(join(holder, 'a.txt'))).toEqual(Buffer.from('tracked\n'));
+    expect(readFileSync(join(holder, 'notes.txt'), 'utf8')).toBe('plain\n');
+    expect(readFileSync(join(holder, ' notes.txt'), 'utf8')).toBe('leading space\n');
+    expect(readFileSync(join(holder, '--version'), 'utf8')).toBe('option-like\n');
+    expect(git(['diff', '--cached', '--', 'a.txt'], holder)).toContain('staged-only');
+    expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], holder).trim()).toBe('HEAD');
+    expect(git(['rev-parse', 'HEAD'], holder).trim()).toBe(tip);
+    const released = JSON.parse(
+      readFileSync(join(artifacts, 'reclaimed-holder', 'abcd1234', 'released.json'), 'utf8')
+    ) as Record<string, unknown>;
+    expect(Object.keys(released).sort()).toEqual([
+      'branch',
+      'holder',
+      'porcelain_line_count',
+      'tip_sha',
+    ]);
+    expect(released.holder).toBe(holder);
+    expect(released.branch).toBe('feat/x');
+    expect(released.tip_sha).toBe(tip);
+    expect(released.porcelain_line_count).toBeGreaterThan(0);
+    expect(worktrees(saved.caller)).toContain(holder);
+    expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], saved.caller).trim()).toBe('feat/x');
+    expect(result.stdout).not.toContain('holder_patch_saved:');
+
+    const conflicted = makeFixture();
+    const conflictHolder = holderPath(conflicted.holder);
+    const conflictTip = git(['rev-parse', 'HEAD'], conflictHolder).trim();
+    const stages = [
+      { stage: 1, body: 'BASE stage content\n' },
+      { stage: 2, body: 'OURS stage content\n' },
+      { stage: 3, body: 'THEIRS stage content\n' },
+    ];
+    const shas = stages.map(stage => {
+      const hashed = Bun.spawnSync(['git', 'hash-object', '-w', '--stdin'], {
+        cwd: conflictHolder,
+        stdin: Buffer.from(stage.body),
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      if (hashed.exitCode !== 0) throw new Error(hashed.stderr.toString());
+      return hashed.stdout.toString().trim();
+    });
+    const indexInfo = stages
+      .map((stage, index) => `100644 ${shas[index] ?? ''} ${String(stage.stage)}\tconflict.txt\n`)
+      .join('');
+    const updated = Bun.spawnSync(['git', 'update-index', '--index-info'], {
+      cwd: conflictHolder,
+      stdin: Buffer.from(indexInfo),
       stdout: 'pipe',
       stderr: 'pipe',
     });
-    expect(check.exitCode, check.stderr.toString()).toBe(0);
-    const applied = Bun.spawnSync(['git', 'apply', '--cached', stagedPath], {
-      cwd: fresh,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    expect(applied.exitCode, applied.stderr.toString()).toBe(0);
-    expect(git(['diff', '--cached'], fresh)).toContain('staged-only');
-    expect(readFileSync(join(fresh, 'README.md'), 'utf8')).toBe('init\n');
-    expect(worktrees(saved.caller)).not.toContain(holder);
-  });
+    if (updated.exitCode !== 0) throw new Error(updated.stderr.toString());
+    writeFileSync(
+      join(conflictHolder, 'conflict.txt'),
+      '<<<<<<< ours\nOURS stage content\n=======\nTHEIRS stage content\n>>>>>>> theirs\n'
+    );
+    const mergeHead = git(
+      ['rev-parse', '--path-format=absolute', '--git-path', 'MERGE_HEAD'],
+      conflictHolder
+    ).trim();
+    writeFileSync(mergeHead, `${conflictTip}\n`);
+    const conflictBefore = holderFileHashes(conflictHolder);
+    const conflictIndex = git(
+      ['rev-parse', '--path-format=absolute', '--git-path', 'index'],
+      conflictHolder
+    ).trim();
+    const conflictIndexBefore = sha256File(conflictIndex);
+    writeRuns(conflicted.dbPath, [terminalRow(conflictHolder)]);
+    const conflictArtifacts = join(conflicted.root, 'artifacts');
+    mkdirSync(conflictArtifacts);
+    const conflictResult = runCore(conflicted, { ARTIFACTS_DIR: conflictArtifacts });
+    expect(conflictResult.exitCode, show(conflictResult)).toBe(0);
+    expect(holderFileHashes(conflictHolder)).toEqual(conflictBefore);
+    expect(sha256File(conflictIndex)).toBe(conflictIndexBefore);
+    expect(readFileSync(mergeHead, 'utf8').trim()).toBe(conflictTip);
+    expect(git(['ls-files', '-u'], conflictHolder)).toContain('conflict.txt');
+    expect(git(['rev-parse', 'HEAD'], conflictHolder).trim()).toBe(conflictTip);
+    expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], conflictHolder).trim()).toBe('HEAD');
+    expect(worktrees(conflicted.caller)).toContain(conflictHolder);
+    expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], conflicted.caller).trim()).toBe('feat/x');
+    expect(
+      existsSync(join(conflictArtifacts, 'reclaimed-holder', 'abcd1234', 'released.json'))
+    ).toBe(true);
+    expect(conflictResult.stdout).not.toContain('holder_patch_saved:');
+
+    const refused = makeFixture();
+    const dirtyHolder = holderPath(refused.holder);
+    writeFileSync(join(dirtyHolder, 'notes.txt'), 'x\n');
+    writeFileSync(join(dirtyHolder, ' notes.txt'), 'y\n');
+    writeFileSync(join(dirtyHolder, '--version'), 'z\n');
+    writeRuns(refused.dbPath, [terminalRow(dirtyHolder)]);
+    const refusedResult = runCore(refused, {});
+    expect(refusedResult.exitCode, show(refusedResult)).not.toBe(0);
+    expect(`${refusedResult.stdout}\n${refusedResult.stderr}`).toContain('worktree is dirty');
+    expect(worktrees(refused.caller)).toContain(dirtyHolder);
+  }, 30000);
 
   it('Test 4: the conductor polls prior teardown before the next fire', async () => {
     const emptyDetail: PriorRunDetail = {
@@ -1182,7 +1265,8 @@ describe.serial('repair holder teardown', () => {
     for (const block of blocks) {
       expect(block).toBe(blocks[0]);
       expect(block).toContain('rtw_wait_for_holder_exit');
-      expect(block).toContain('rtw_save_dirty_patch');
+      expect(block).toContain('rtw_release_dirty_holder');
+      expect(block).not.toContain('rtw_save_dirty_patch');
     }
     const checked = Bun.spawnSync(['bun', 'run', 'check:bundled'], {
       cwd: REPO_ROOT,
@@ -1391,33 +1475,6 @@ describe.serial('repair holder teardown', () => {
     }
   });
 
-  it('does not signal a reused pgid whose start ticks no longer match', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'rht-reuse-pgid-'));
-    roots.push(dir);
-    const procRoot = join(dir, 'proc');
-    const pidDir = join(procRoot, '4242');
-    mkdirSync(pidDir, { recursive: true });
-    const statFor = (ticks: string): string =>
-      `4242 (sleep) S 1 4242 4242 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 ${ticks}\n`;
-    writeFileSync(join(pidDir, 'stat'), statFor('100'));
-    setTeardownProcRootForTests(procRoot);
-    recordOwnedProcessGroupForTests('run-reuse-pgid', 4242);
-    writeFileSync(join(pidDir, 'stat'), statFor('999'));
-    let signals = 0;
-    setProcessGroupControlForTests({
-      signal() {
-        signals += 1;
-        return true;
-      },
-      groupExists() {
-        return true;
-      },
-    });
-    const report = await endRunProcessTree('run-reuse-pgid', dir);
-    expect(signals).toBe(0);
-    expect(report.survivors.some(item => item.pid === 4242)).toBe(false);
-  });
-
   it('does not confirm when a group registers during the last scan', async () => {
     const metadata = teardownTerminalMetadata({ confirmedAt: null, survivors: [] });
     expect(metadata).toEqual({ teardown_survivors: [] });
@@ -1493,4 +1550,153 @@ describe.serial('repair holder teardown', () => {
       expect(patch.metadata?.teardown_survivors).toEqual([]);
     }
   });
+
+  it('exited_root_descendant_killed: a timeout ends a descendant the root already exited', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rht-exited-root-'));
+    roots.push(dir);
+    const timed = await runDag(dir, 'run-exited-root', [
+      {
+        id: 'hang',
+        bash: 'sleep 300 &\necho $! > child.pid\nexit 0\n',
+        timeout: 2000,
+      },
+    ]);
+    const childPid = Number(readFileSync(join(dir, 'child.pid'), 'utf8').trim());
+    expect(childPid).toBeGreaterThan(1);
+    expect(processAlive(childPid)).toBe(false);
+    expect(eventError(timed.store, 'hang')).toContain('timed out after 2000ms');
+    expect(timed.order).toContain('teardown_confirmed_at');
+    expect(timed.order).not.toContain('teardown_survivors');
+  }, 20000);
+
+  it('retire_only_when_empty: a group that will not empty keeps its record', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rht-retire-'));
+    roots.push(dir);
+    const procRoot = join(dir, 'proc');
+    const pidDir = join(procRoot, '4242');
+    mkdirSync(pidDir, { recursive: true });
+    writeFileSync(
+      join(pidDir, 'stat'),
+      '4242 (sleep) S 1 4242 4242 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100\n'
+    );
+    writeFileSync(join(pidDir, 'comm'), 'sleep\n');
+    setTeardownProcRootForTests(procRoot);
+    recordOwnedProcessGroupForTests('run-retire', 4242);
+    setProcessGroupControlForTests({
+      signal() {
+        return true;
+      },
+      groupExists() {
+        return true;
+      },
+    });
+    const report = await endRunProcessTree('run-retire', dir);
+    expect(report.confirmedAt).toBeNull();
+    expect(report.survivors).toEqual([{ pid: 4242, comm: 'sleep' }]);
+    const again = await endRunProcessTree('run-retire', dir);
+    expect(again.confirmedAt).toBeNull();
+    expect(again.survivors).toEqual([{ pid: 4242, comm: 'sleep' }]);
+  }, 20000);
+
+  it('unverifiable_platform_fails_closed: win32 and unreadable proc do not confirm', async () => {
+    const assertUnverifiable = async (label: string): Promise<void> => {
+      const dir = mkdtempSync(join(tmpdir(), `rht-unver-${label}-`));
+      roots.push(dir);
+      const childPath = join(dir, 'child.pid');
+      const timed = await runDag(dir, `run-unver-${label}`, [
+        {
+          id: 'hang',
+          bash: 'sleep 30 &\necho $! > child.pid\nwait\n',
+          timeout: 400,
+        },
+      ]);
+      const error = eventError(timed.store, 'hang');
+      expect(error, label).toContain('still running');
+      expect(error, label).not.toContain('timed out');
+      expect(timed.order, label).toContain('teardown_survivors');
+      expect(timed.order, label).not.toContain('teardown_confirmed_at');
+      const updates = (timed.store.updateWorkflowRun as ReturnType<typeof mock>).mock
+        .calls as Array<
+        [string, { metadata?: { teardown_survivors?: Array<{ reason?: string }> } }]
+      >;
+      const survivors = updates.flatMap(call => call[1]?.metadata?.teardown_survivors ?? []);
+      expect(survivors, label).toEqual([{ reason: 'teardown_unverifiable' }]);
+      if (existsSync(childPath)) stopPid(Number(readFileSync(childPath, 'utf8').trim()));
+    };
+
+    setTeardownPlatformForTests('win32');
+    try {
+      await assertUnverifiable('win32');
+    } finally {
+      resetRunTeardownStateForTests();
+    }
+
+    const missingProc = mkdtempSync(join(tmpdir(), 'rht-noproc-'));
+    roots.push(missingProc);
+    setTeardownProcRootForTests(join(missingProc, 'missing'));
+    try {
+      await assertUnverifiable('noproc');
+    } finally {
+      resetRunTeardownStateForTests();
+    }
+
+    await withTeardownWait('20000', async () => {
+      const clock = virtualClock();
+      let fires = 0;
+      const reasons: string[] = [];
+      const record = await runCascade(
+        cascadeOpts({
+          readRunDetail: async () => ({
+            completedAt: '2026-10-27T00:00:00.000Z',
+            metadata: { teardown_survivors: [{ reason: 'teardown_unverifiable' }] },
+            error: null,
+          }),
+          sleep: clock.sleep,
+          now: clock.now,
+          fire: async () => {
+            fires += 1;
+            return makeFireOk(`run-${String(fires)}`);
+          },
+          poll: async () => makePollResult({ terminalStatus: 'failed' }),
+          judge: () => makeFailVerdict('needs revision'),
+          escalate: async ctx => {
+            reasons.push(ctx.reason);
+          },
+        })
+      );
+      expect(fires).toBe(1);
+      expect(record.status).toBe('blocked');
+      expect(record.attempts[1]?.gateFailReason).toBe('teardown_unconfirmed');
+      expect(reasons).toHaveLength(1);
+    });
+  }, 20000);
+
+  it('setsid_escapee_is_blocker: a setsid child is never signaled', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rht-setsid-'));
+    roots.push(dir);
+    let escapee = 0;
+    try {
+      const finished = await runDag(dir, 'run-setsid', [
+        {
+          id: 'escape',
+          bash: "bash -c 'setsid sleep 300 >/dev/null 2>&1 & echo $!' > escapee.pid\necho done\n",
+        },
+      ]);
+      escapee = Number(readFileSync(join(dir, 'escapee.pid'), 'utf8').trim());
+      expect(escapee).toBeGreaterThan(1);
+      expect(processAlive(escapee)).toBe(true);
+      expect(finished.order).not.toContain('teardown_confirmed_at');
+      expect(finished.order).toContain('teardown_survivors');
+      const updates = (finished.store.updateWorkflowRun as ReturnType<typeof mock>).mock
+        .calls as Array<
+        [string, { metadata?: { teardown_survivors?: Array<{ pid?: number; reason?: string }> } }]
+      >;
+      const survivors = updates.flatMap(call => call[1]?.metadata?.teardown_survivors ?? []);
+      expect(
+        survivors.some(item => item.pid === escapee && item.reason === 'unowned_cwd_holder')
+      ).toBe(true);
+    } finally {
+      stopPid(escapee);
+    }
+  }, 20000);
 });

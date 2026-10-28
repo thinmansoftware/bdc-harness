@@ -1461,7 +1461,7 @@ describe('Test 4: a retry waits for the prior run teardown', () => {
     expect(reasons[0]).toContain('teardown_unconfirmed');
   });
 
-  test('a stalled prior-run body reaches teardown_unconfirmed by the deadline', async () => {
+  test('teardown_read_bounded: a stalled prior-run body reaches teardown_unconfirmed by the deadline', async () => {
     const previous = process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS;
     process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS = '40';
     const clock = virtualClock();

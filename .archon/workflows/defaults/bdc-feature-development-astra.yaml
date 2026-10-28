@@ -221,7 +221,8 @@ nodes:
       # and cancelled holders do not. A terminal holder whose only blocker is a live
       # process cwd may wait in rtw_wait_for_holder_exit for RTW_HOLDER_WAIT_SECONDS
       # (default 120) and is reclaimed when that cwd clears. A dirty terminal holder
-      # may be reclaimed after rtw_save_dirty_patch saves a patch under ARTIFACTS_DIR.
+      # is not removed: rtw_release_dirty_holder detaches HEAD at the same tip when
+      # ARTIFACTS_DIR is set, and leaves the index and worktree byte-identical.
       # If the holder tip is not an ancestor of FETCH_HEAD, push it to
       # refs/heads/backup/<branch>-<sha7>-<UTC stamp> first. Then remove that one
       # worktree and retry the checkout once. Anything else is refused. Never removes
@@ -320,165 +321,54 @@ nodes:
           sleep "$sleep_for"
         done
       }
-      rtw_save_dirty_patch() {
-        local porcelain="" dest="" sum="" id8_local=""
-        local staged_path="" worktree_path="" untracked_list="" tar_path=""
-        local scratch_dir="" verify_ok=0 uf=""
-        local unmerged_list="" stages_dir="" wtfiles_dir="" um_ok=0
-        local um_entry="" um_meta="" um_path="" um_sha="" um_blob="" um_recomputed=""
-        rtw_emit_saved() {
-          local saved_path="$1"
-          if ! sum=$(sha256sum "$saved_path" | awk '{print $1}'); then
-            return 1
+      rtw_release_dirty_holder() {
+        rtw_holder_released=0
+        local porcelain="" tip="" id8_local="" dest="" count=""
+        local index_path="" index_copy="" esc_holder="" esc_branch="" esc_tip=""
+        index_path=$(git -C "$holder" rev-parse --path-format=absolute --git-path index 2>/dev/null || true)
+        index_copy=$(mktemp)
+        if [ -n "$index_path" ] && [ -f "$index_path" ]; then
+          if ! cp "$index_path" "$index_copy"; then
+            rm -f "$index_copy"
+            rtw_refuse "worktree is dirty" || return 1
           fi
-          if ! printf '%s\n' "$sum" | grep -Eq '^[0-9a-f]{64}$'; then
-            return 1
-          fi
-          printf 'holder_patch_saved: %s sha256 %s\n' "$saved_path" "$sum"
-          return 0
-        }
-        if ! porcelain=$(git -C "$holder" status --porcelain); then
+        fi
+        # Count porcelain lines against an index copy so the real index stays byte-identical.
+        if ! porcelain=$(GIT_INDEX_FILE="$index_copy" git -C "$holder" --no-optional-locks status --porcelain --untracked-files=all); then
+          rm -f "$index_copy"
           rtw_refuse "worktree is dirty" || return 1
         fi
+        rm -f "$index_copy"
         if [ -z "$porcelain" ]; then
           return 0
         fi
         if [ -z "${ARTIFACTS_DIR:-}" ]; then
           rtw_refuse "worktree is dirty" || return 1
         fi
+        if ! tip=$(git -C "$holder" rev-parse HEAD); then
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        count=$(printf '%s\n' "$porcelain" | wc -l | tr -d '[:space:]')
+        case "$count" in
+          ''|*[!0-9]*) rtw_refuse "worktree is dirty" || return 1 ;;
+        esac
         id8_local=$(printf '%s' "$best_id" | cut -c1-8)
         dest="${ARTIFACTS_DIR}/reclaimed-holder/${id8_local}"
         if ! mkdir -p "$dest"; then
           rtw_refuse "worktree is dirty" || return 1
         fi
-        if ! printf '%s\n' "$porcelain" > "${dest}/git-status.porcelain"; then
+        if ! git -C "$holder" update-ref --no-deref HEAD "$tip"; then
           rtw_refuse "worktree is dirty" || return 1
         fi
-        if ! rtw_emit_saved "${dest}/git-status.porcelain"; then
+        esc_holder=$(printf '%s' "$holder" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        esc_branch=$(printf '%s' "$branch" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        esc_tip=$(printf '%s' "$tip" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        if ! printf '{"holder":"%s","branch":"%s","tip_sha":"%s","porcelain_line_count":%s}\n' \
+          "$esc_holder" "$esc_branch" "$esc_tip" "$count" > "${dest}/released.json"; then
           rtw_refuse "worktree is dirty" || return 1
         fi
-        staged_path="${dest}/staged.patch"
-        if ! git -C "$holder" diff --cached --binary > "$staged_path"; then
-          rtw_refuse "worktree is dirty" || return 1
-        fi
-        if ! rtw_emit_saved "$staged_path"; then
-          rtw_refuse "worktree is dirty" || return 1
-        fi
-        worktree_path="${dest}/worktree.patch"
-        if ! git -C "$holder" diff --binary > "$worktree_path"; then
-          rtw_refuse "worktree is dirty" || return 1
-        fi
-        if ! rtw_emit_saved "$worktree_path"; then
-          rtw_refuse "worktree is dirty" || return 1
-        fi
-        # Round-6 finding 2: an unmerged index is NOT recoverable from the staged/
-        # worktree binary diffs above -- for unmerged paths those collapse to a
-        # combined diff and emit unmerged-path notices rather than recoverable index
-        # stages. Preserve every index stage blob (stage 1/2/3) and the working-tree
-        # copy for each unmerged path, and verify each is restorable, BEFORE any
-        # forced worktree removal. If preservation or verification fails, refuse and
-        # leave the holder in place.
-        unmerged_list=$(mktemp)
-        if ! git -C "$holder" ls-files -u -z > "$unmerged_list"; then
-          rm -f "$unmerged_list"
-          rtw_refuse "unmerged index unverified" || return 1
-        fi
-        if [ -s "$unmerged_list" ]; then
-          stages_dir="${dest}/index-stages"
-          wtfiles_dir="${dest}/worktree-files"
-          if ! mkdir -p "$stages_dir" "$wtfiles_dir"; then
-            rm -f "$unmerged_list"
-            rtw_refuse "unmerged index unverified" || return 1
-          fi
-          if ! git -C "$holder" ls-files -u > "${dest}/ls-files-u.txt"; then
-            rm -f "$unmerged_list"
-            rtw_refuse "unmerged index unverified" || return 1
-          fi
-          um_ok=1
-          while IFS= read -r -d '' um_entry; do
-            [ -n "$um_entry" ] || continue
-            um_meta=${um_entry%%$'\t'*}
-            um_path=${um_entry#*$'\t'}
-            um_sha=$(printf '%s' "$um_meta" | awk '{print $2}')
-            if [ -z "$um_sha" ]; then
-              um_ok=0
-              break
-            fi
-            um_blob="${stages_dir}/${um_sha}.blob"
-            if [ ! -f "$um_blob" ]; then
-              if ! git -C "$holder" cat-file blob "$um_sha" > "$um_blob"; then
-                um_ok=0
-                break
-              fi
-              um_recomputed=$(git -C "$holder" hash-object "$um_blob" 2>/dev/null || true)
-              if [ "$um_recomputed" != "$um_sha" ]; then
-                um_ok=0
-                break
-              fi
-            fi
-            if [ -e "${holder}/${um_path}" ]; then
-              if ! mkdir -p "$(dirname "${wtfiles_dir}/${um_path}")"; then
-                um_ok=0
-                break
-              fi
-              if ! cp "${holder}/${um_path}" "${wtfiles_dir}/${um_path}"; then
-                um_ok=0
-                break
-              fi
-              if ! cmp -s "${holder}/${um_path}" "${wtfiles_dir}/${um_path}"; then
-                um_ok=0
-                break
-              fi
-            fi
-          done < "$unmerged_list"
-          if [ "$um_ok" -ne 1 ]; then
-            rm -f "$unmerged_list"
-            rtw_refuse "unmerged index unverified" || return 1
-          fi
-        fi
-        rm -f "$unmerged_list"
-        # Round-5 finding 1: archive untracked files with NUL-delimited, literal
-        # (verbatim) names via `git ls-files -z` piped into `tar --null
-        # --verbatim-files-from` so leading/trailing whitespace and option-like
-        # names (e.g. a file named '--version') are not stripped or interpreted by
-        # tar, then verify every untracked file restores byte-for-byte BEFORE any
-        # forced worktree removal. On any mismatch, refuse.
-        untracked_list=$(mktemp)
-        if ! git -C "$holder" ls-files -z --others --exclude-standard > "$untracked_list"; then
-          rm -f "$untracked_list"
-          rtw_refuse "worktree is dirty" || return 1
-        fi
-        if [ -s "$untracked_list" ]; then
-          tar_path="${dest}/untracked.tar"
-          if ! tar -C "$holder" --null --verbatim-files-from -cf "$tar_path" -T "$untracked_list"; then
-            rm -f "$untracked_list"
-            rtw_refuse "worktree is dirty" || return 1
-          fi
-          if ! rtw_emit_saved "$tar_path"; then
-            rm -f "$untracked_list"
-            rtw_refuse "worktree is dirty" || return 1
-          fi
-          scratch_dir=$(mktemp -d)
-          if ! tar -C "$scratch_dir" -xf "$tar_path"; then
-            rm -rf "$scratch_dir"
-            rm -f "$untracked_list"
-            rtw_refuse "untracked backup unverified" || return 1
-          fi
-          verify_ok=1
-          while IFS= read -r -d '' uf; do
-            [ -n "$uf" ] || continue
-            if ! cmp -s "${holder}/${uf}" "${scratch_dir}/${uf}"; then
-              verify_ok=0
-              break
-            fi
-          done < "$untracked_list"
-          rm -rf "$scratch_dir"
-          if [ "$verify_ok" -ne 1 ]; then
-            rm -f "$untracked_list"
-            rtw_refuse "untracked backup unverified" || return 1
-          fi
-        fi
-        rm -f "$untracked_list"
+        printf 'repair_target_holder_released: %s detached at %s\n' "$holder" "$tip"
+        rtw_holder_released=1
         return 0
       }
       rtw_checkout_repair_branch() {
@@ -599,9 +489,11 @@ nodes:
         if ! rtw_wait_for_holder_exit; then
           return 1
         fi
-        if ! rtw_save_dirty_patch; then
+        rtw_holder_released=0
+        if ! rtw_release_dirty_holder; then
           return 1
         fi
+        if [ "$rtw_holder_released" != "1" ]; then
         holder_sha=$(git -C "$holder" rev-parse HEAD)
         backup_ref=""
         if git merge-base --is-ancestor "$holder_sha" FETCH_HEAD; then
@@ -626,6 +518,7 @@ nodes:
           "$holder" "$id8" "$best_status" "$best_ts" "$branch"
         if [ -n "$backup_ref" ]; then
           printf 'backup_branch: %s\n' "$backup_ref"
+        fi
         fi
         if git checkout -B "$branch" FETCH_HEAD 2>"$err_file"; then
           rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
