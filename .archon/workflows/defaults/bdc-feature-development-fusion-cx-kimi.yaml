@@ -327,14 +327,22 @@ nodes:
         if ! mkdir -p "$dest"; then
           rtw_refuse "worktree is dirty" || return 1
         fi
-        if ! git -C "$holder" update-ref --no-deref HEAD "$tip"; then
-          rtw_refuse "worktree is dirty" || return 1
-        fi
         esc_holder=$(printf '%s' "$holder" | sed 's/\\/\\\\/g; s/"/\\"/g')
         esc_branch=$(printf '%s' "$branch" | sed 's/\\/\\\\/g; s/"/\\"/g')
         esc_tip=$(printf '%s' "$tip" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        # Publish released.json before detaching. A failed write or read-back
+        # leaves the branch held. Cleanup must not hide that refusal.
         if ! printf '{"holder":"%s","branch":"%s","tip_sha":"%s","porcelain_line_count":%s}\n' \
           "$esc_holder" "$esc_branch" "$esc_tip" "$count" > "${dest}/released.json"; then
+          rm -f "${dest}/released.json" || true
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        if ! grep -F -q -e "\"tip_sha\":\"${tip}\"" -- "${dest}/released.json"; then
+          rm -f "${dest}/released.json" || true
+          rtw_refuse "worktree is dirty" || return 1
+        fi
+        if ! git -C "$holder" update-ref --no-deref HEAD "$tip"; then
+          rm -f "${dest}/released.json" || true
           rtw_refuse "worktree is dirty" || return 1
         fi
         printf 'repair_target_holder_released: %s detached at %s\n' "$holder" "$tip"

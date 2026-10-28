@@ -789,6 +789,24 @@ describe.serial('repair holder teardown', () => {
     expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], dirtyHolder).trim()).toBe('feat/x');
   });
 
+  it('dirty_release_artifact_write_failure_keeps_the_branch', () => {
+    const fixture = makeFixture();
+    const holder = holderPath(fixture.holder);
+    writeFileSync(join(holder, 'README.md'), 'changed\n');
+    writeRuns(fixture.dbPath, [terminalRow(holder)]);
+    const artifacts = join(fixture.root, 'artifacts');
+    const dest = join(artifacts, 'reclaimed-holder', 'abcd1234');
+    mkdirSync(join(dest, 'released.json'), { recursive: true });
+    const result = runCore(fixture, { ARTIFACTS_DIR: artifacts });
+    const combined = `${result.stdout}\n${result.stderr}`;
+    expect(result.exitCode, show(result)).not.toBe(0);
+    expect(combined, show(result)).toContain('worktree is dirty');
+    expect(result.stdout, show(result)).not.toContain('repair_target_holder_released:');
+    expect(git(['rev-parse', '--abbrev-ref', 'HEAD'], holder).trim()).toBe('feat/x');
+    expect(worktrees(fixture.caller)).toContain(holder);
+    expect(readFileSync(join(holder, 'README.md'), 'utf8')).toBe('changed\n');
+  });
+
   it('dirty_holder_released_lossless: a dirty holder is released without touching a byte', () => {
     const saved = makeFixture();
     const holder = holderPath(saved.holder);
