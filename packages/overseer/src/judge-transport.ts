@@ -59,6 +59,49 @@ export interface JudgeTransport {
   promptDir?: string;
 }
 
+export interface PrReviewTransportContext {
+  readonly kind: 'pr-review';
+  readonly cwd: string;
+  readonly expectedHeadSha: string;
+  readonly nativePolicy: 'codex_legacy_landlock';
+}
+
+/** PR-only transport. Shared judge callers continue to use buildJudgeTransport unchanged. */
+export async function buildPrReviewTransport(
+  binary: string,
+  prompt: string,
+  context: PrReviewTransportContext
+): Promise<JudgeTransport> {
+  if (binary !== 'codex') {
+    throw new Error('pr_review_native_sandbox_unsupported_binary');
+  }
+  if (!context.cwd || !context.expectedHeadSha) {
+    throw new Error('pr_review_native_sandbox_context_invalid');
+  }
+  return {
+    argv: [
+      'bunx',
+      '--offline',
+      '@openai/codex@0.153.3',
+      '--enable',
+      'use_legacy_landlock',
+      // Codex 0.153.3's strict config schema supports the top-level
+      // web_search mode: live|indexed|cached|disabled. PR review must never
+      // attempt unauthenticated model-side retrieval of private repository data.
+      '-c',
+      'web_search="disabled"',
+      'exec',
+      '--json',
+      '--sandbox',
+      'workspace-write',
+      '--skip-git-repo-check',
+      '--cd',
+      context.cwd,
+    ],
+    stdinPrompt: prompt,
+  };
+}
+
 /** Owner-only directory (rwx------). */
 const PROMPT_DIR_MODE = 0o700;
 /** Owner-only file (rw-------). */
