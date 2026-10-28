@@ -18,6 +18,7 @@ import type {
   PullRequestEvidence,
   PullRequestRef,
 } from '../types.ts';
+import { listMessages as listDispatchMessages } from '@archon/core/db/dispatch';
 import {
   REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
   UNPROTECTED_BASE_NO_CHECKS_REASON,
@@ -1319,6 +1320,12 @@ export interface SubmitPullRequestReviewInput extends PullRequestRef {
 export interface SubmitPullRequestReviewResult {
   submitted: boolean;
   message?: string;
+  review?: {
+    id: number;
+    url: string;
+    commitSha: string;
+    state: string;
+  };
 }
 
 /**
@@ -1372,7 +1379,29 @@ export function createRealSubmitPullRequestReview(
           message: `github_review_unexpected_state_${response.data.state}`,
         };
       }
-      return { submitted: true };
+      const data = response.data as typeof response.data & {
+        id?: number;
+        html_url?: string;
+        commit_id?: string;
+      };
+      if (
+        typeof data.id !== 'number' ||
+        typeof data.html_url !== 'string' ||
+        typeof data.commit_id !== 'string'
+      ) {
+        // Compatibility for injected/non-Octokit adapters. The governed submit
+        // path still refuses to qualify an approval when this identity is absent.
+        return { submitted: true };
+      }
+      return {
+        submitted: true,
+        review: {
+          id: data.id,
+          url: data.html_url,
+          commitSha: data.commit_id,
+          state: data.state,
+        },
+      };
     } catch (error) {
       const status =
         typeof error === 'object' && error !== null && 'status' in error
@@ -2003,6 +2032,68 @@ export function createRealGitHubClientDeps(
 ): GitHubClientDeps {
   const commentAuthorLogin = resolveReviewGateLogin();
   return {
+    hasQualifiedReview: async (input): Promise<boolean> => {
+      const receipts = await listDispatchMessages({
+        recipient: 'operator',
+        subject_key: `gh:${input.owner}/${input.repo}#${input.number}`,
+        limit: 500,
+      });
+      return receipts.some(receipt => {
+        try {
+          const body = JSON.parse(receipt.body) as {
+            kind?: unknown;
+            disposition?: unknown;
+            owner?: unknown;
+            repo?: unknown;
+            prNumber?: unknown;
+            headSha?: unknown;
+            executionProof?: {
+              headSha?: unknown;
+              inspectionObserved?: unknown;
+              check_plan?: unknown;
+              checks?: unknown[];
+            };
+            githubReview?: { id?: unknown; commitSha?: unknown; state?: unknown };
+          };
+          const proof = body.executionProof;
+          const review = body.githubReview;
+          const reviewMatches =
+            typeof review?.id === 'number' &&
+            review?.commitSha === input.headSha &&
+            review?.state === 'APPROVED';
+          // Receipts written before native review execution was activated did
+          // not contain executionProof. Preserve their exact-head GitHub
+          // qualification; once a receipt carries the new field, require the
+          // complete proof contract and never fall back to the legacy shape.
+          const executionQualifies =
+            proof === undefined ||
+            (proof.headSha === input.headSha &&
+              proof.inspectionObserved === true &&
+              Array.isArray(proof.checks) &&
+              ((proof.check_plan === 'absent' && proof.checks.length === 0) ||
+                (proof.check_plan === 'present' && proof.checks.length > 0)) &&
+              proof.checks.every(
+                check =>
+                  typeof check === 'object' &&
+                  check !== null &&
+                  'exitCode' in check &&
+                  check.exitCode === 0
+              ));
+          return (
+            body.kind === 'pr_review_submit_receipt' &&
+            body.disposition === 'approved' &&
+            body.owner === input.owner &&
+            body.repo === input.repo &&
+            body.prNumber === input.number &&
+            body.headSha === input.headSha &&
+            executionQualifies &&
+            reviewMatches
+          );
+        } catch {
+          return false;
+        }
+      });
+    },
     findPullRequest: createRealFindPullRequest(octokit),
     // Merge mutations go through the distinct merge identity when configured
     // (M-153: the merger is never the reviewer).
