@@ -363,6 +363,81 @@ describe('served lanes', () => {
     }
   });
 
+  test('an edit created while the live path is vacant is preserved, not clobbered', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const edited = Buffer.from(laneYaml('EDITED-IN-VACANT-WINDOW'));
+      const volumePath = join(volumeDir, 'lane.yaml');
+      await writeFile(volumePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+      let capturedMtime = '';
+      let injected = false;
+      let vacant = false;
+
+      const result = await reconcileServedLanes({
+        volumeDir,
+        bakedDir,
+        history,
+        now: NOW,
+        // Fires per-lane inside the window where the live path is VACANT: the
+        // capture rename has already moved the old file aside and the baked
+        // bytes have not been installed yet. This is the residual TOCTOU gap a
+        // clobbering rename install left open -- an editor saving by creating
+        // (or renaming) a file at the live path here would be destroyed without
+        // detection. The install must fail closed and preserve this edit.
+        beforeStagedInstall: async filename => {
+          if (filename !== 'lane.yaml') return;
+          vacant = await (async () => {
+            try {
+              await stat(volumePath);
+              return false;
+            } catch {
+              return true;
+            }
+          })();
+          await writeFile(volumePath, edited);
+          const info = await stat(volumePath);
+          capturedMtime = info.mtime.toISOString();
+          injected = true;
+        },
+      });
+
+      expect(injected).toBe(true);
+      // Proves the seam really fires in the vacant window, not somewhere else.
+      expect(vacant).toBe(true);
+      // The racing edit survives byte for byte in the live file.
+      const liveBytes = await readFile(volumePath);
+      expect(Buffer.compare(liveBytes, edited)).toBe(0);
+      // Nothing was replaced and no backup directory was created, so the edit
+      // was never clobbered nor silently captured into a backup.
+      expect(result.replaced).toEqual([]);
+      expect(result.backup_path).toBeNull();
+      const parentNames = await readdir(parent);
+      expect(parentNames.some(name => name.includes('.bak-'))).toBe(false);
+      // No staging artifacts leak into the volume directory.
+      const volumeNames = (await readdir(volumeDir)).sort();
+      expect(volumeNames).toEqual(['lane.yaml']);
+      const uniqueEdit = {
+        filename: 'lane.yaml',
+        sha256: sha256Hex(edited),
+        mtime: capturedMtime,
+      };
+      expect(result.unique_edit).toEqual([uniqueEdit]);
+
+      const report = JSON.parse(
+        await readFile(join(parent, 'served-lanes-report.json'), 'utf8')
+      ) as {
+        unique_edit: Array<{ filename: string; sha256: string; mtime: string }>;
+      };
+      expect(report.unique_edit).toEqual([uniqueEdit]);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
   test('the drift report lists the right files and writes nothing', async () => {
     const { parent, volumeDir, bakedDir } = await makeTree();
     try {

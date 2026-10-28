@@ -7,7 +7,19 @@
  */
 import { createHash } from 'crypto';
 import { readFileSync } from 'fs';
-import { chmod, chown, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
+import {
+  chmod,
+  chown,
+  link,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  unlink,
+  writeFile,
+} from 'fs/promises';
 import { join, resolve } from 'path';
 import { createLogger } from '../../packages/paths/src/logger';
 
@@ -68,13 +80,21 @@ function compareAscii(left: string, right: string): number {
   return 0;
 }
 
-function isEnoent(error: unknown): boolean {
+function hasErrorCode(error: unknown, code: string): boolean {
   return (
     typeof error === 'object' &&
     error !== null &&
     'code' in error &&
-    (error as { code: unknown }).code === 'ENOENT'
+    (error as { code: unknown }).code === code
   );
+}
+
+function isEnoent(error: unknown): boolean {
+  return hasErrorCode(error, 'ENOENT');
+}
+
+function isEexist(error: unknown): boolean {
+  return hasErrorCode(error, 'EEXIST');
 }
 
 export function sha256Hex(bytes: Buffer): string {
@@ -250,6 +270,7 @@ export async function reconcileServedLanes(input: {
   beforeReplace?: () => Promise<void> | void;
   beforeFinalVerify?: (filename: string) => Promise<void> | void;
   beforeReplaceWrite?: (filename: string) => Promise<void> | void;
+  beforeStagedInstall?: (filename: string) => Promise<void> | void;
 }): Promise<ReconcileResult> {
   const reportPath = reportPathFor(input.volumeDir);
   const volumePresence = await directoryPresence(input.volumeDir);
@@ -331,11 +352,13 @@ export async function reconcileServedLanes(input: {
       // Stage the baked bytes beside the live file, carrying over the served
       // file's permission bits (and uid/gid when permitted) so the swapped-in
       // file keeps the volume's ownership and mode. Inode identity is NOT
-      // preserved here: a conflict-safe capture-then-replace swap (via rename)
-      // is required by the PR #1334 review to guarantee that a concurrent edit
-      // is never silently lost -- a guarantee an in-place truncating overwrite
-      // cannot provide, because the overwrite destroys any edit that lands in
-      // the unavoidable gap between the final hash read and the write.
+      // preserved here: a conflict-safe capture-then-install swap (rename to
+      // capture, link to install) is required by the PR #1334 review to
+      // guarantee that a concurrent edit is never silently lost -- a guarantee
+      // an in-place truncating overwrite cannot provide, because the overwrite
+      // destroys any edit that lands in the unavoidable gap between the final
+      // hash read and the write. Both legs are non-destructive: rename captures
+      // the live bytes whole, and link refuses to clobber a new livePath.
       const stagedNew = `${livePath}.served-lanes-new`;
       await writeFile(stagedNew, lane.bakedBytes);
       await chmod(stagedNew, preStat.mode & 0o7777);
@@ -378,8 +401,51 @@ export async function reconcileServedLanes(input: {
         continue;
       }
 
-      // Verified unchanged: move the staged baked file into place atomically.
-      await rename(stagedNew, livePath);
+      // Test seam: an edit injected HERE lands in the window where livePath is
+      // vacant (after the capture rename, before the baked bytes are installed).
+      // An editor that saves by creating/renaming a file at livePath in this
+      // window must NOT be clobbered by the install below.
+      await input.beforeStagedInstall?.(lane.filename);
+
+      // Verified unchanged: install the staged baked file. link() is used rather
+      // than rename() because rename() clobbers its destination unconditionally:
+      // livePath is vacant for the span above, so a concurrent save landing
+      // there would be silently destroyed by a rename. link() instead fails
+      // closed with EEXIST if anything now occupies livePath, letting the racing
+      // edit be detected and preserved. The subsequent unlink drops only the
+      // staging name; livePath keeps the installed inode.
+      try {
+        await link(stagedNew, livePath);
+      } catch (installError) {
+        if (!isEexist(installError)) throw installError;
+
+        // A concurrent save created a file at livePath inside the vacant window.
+        // That file is the live truth: leave it untouched, drop our staged baked
+        // bytes, and report it as a preserved edit. The captured old bytes are a
+        // known committed-history version (preHash matched), so they are
+        // discarded rather than restored -- restoring them would clobber exactly
+        // the edit this branch exists to protect. The discarded hash is logged
+        // so the decision stays auditable.
+        await rm(stagedNew, { force: true });
+        await rm(stagedOld, { force: true });
+        const racedBytes = await readFile(livePath);
+        const racedStat = await stat(livePath);
+        log.warn(
+          {
+            filename: lane.filename,
+            discardedSha256: preHash,
+            preservedSha256: sha256Hex(racedBytes),
+          },
+          'served_lanes.install_raced_edit_preserved'
+        );
+        result.unique_edit.push({
+          filename: lane.filename,
+          sha256: sha256Hex(racedBytes),
+          mtime: racedStat.mtime.toISOString(),
+        });
+        continue;
+      }
+      await unlink(stagedNew);
 
       // Promote the captured old bytes into the official backup directory,
       // created lazily so a run that replaces nothing creates no backup dir.
