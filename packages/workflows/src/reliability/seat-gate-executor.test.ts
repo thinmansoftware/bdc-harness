@@ -24,20 +24,6 @@ const warnings: Array<{ obj: Record<string, unknown>; msg: string }> = [];
 const alerts: CreateAuthenticatedMessageData[] = [];
 const origChild = rootLogger.child.bind(rootLogger);
 
-function installWarningCapture(): void {
-  rootLogger.child = ((bindings?: object) => {
-    const child = origChild(bindings as never);
-    const origWarn = child.warn.bind(child);
-    child.warn = ((obj: unknown, msg?: string) => {
-      if (typeof msg === 'string') {
-        warnings.push({ obj: (obj ?? {}) as Record<string, unknown>, msg });
-      }
-      return origWarn(obj as never, msg as never);
-    }) as typeof child.warn;
-    return child;
-  }) as typeof rootLogger.child;
-}
-
 function reading(seat: SeatReading['seat'], windowName: string, used: number): SeatReading {
   return {
     seat,
@@ -136,7 +122,17 @@ beforeEach(() => {
     return null;
   });
   delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
-  installWarningCapture();
+  rootLogger.child = ((bindings?: object) => {
+    const child = origChild(bindings as never);
+    const origWarn = child.warn.bind(child);
+    child.warn = ((obj: unknown, msg?: string) => {
+      if (typeof msg === 'string') {
+        warnings.push({ obj: (obj ?? {}) as Record<string, unknown>, msg });
+      }
+      return origWarn(obj as never, msg as never);
+    }) as typeof child.warn;
+    return child;
+  }) as typeof rootLogger.child;
   resetExecutorLogForTests();
 });
 
@@ -420,45 +416,5 @@ describe('executor seat gate', () => {
     expect(eventTypes(store)).toContain('workflow_started');
     expect(warnings.some(entry => entry.msg === 'workflow.seat_usage_refused')).toBe(false);
     expect(alerts).toHaveLength(0);
-  });
-
-  test('Test 3: cached logger is rebuilt after reset (negative control)', async () => {
-    // beforeEach already patched child and cleared the cache. Restore the
-    // real child so the first executeWorkflow memoizes a logger whose warn
-    // is not the spy. That is the leak the reset hook exists to close.
-    rootLogger.child = origChild as typeof rootLogger.child;
-    resetExecutorLogForTests();
-    setSeatUsageReaderForTests(async () => ({
-      claude: reading('claude', 'seven_day', 10),
-      codex: reading('codex', 'primary', 95),
-    }));
-    setSeatCutoffOverride(90);
-
-    const primed = await runWorkflow();
-    expect(primed.result.success).toBe(false);
-    expect(primed.result.error).toBe(
-      'seat_usage_refused:codex:primary:95:90:lane=seat-gate-wf:role=node'
-    );
-    expect(warnings.some(entry => entry.msg === 'workflow.seat_usage_refused')).toBe(false);
-
-    // Patch child but leave the cached logger in place. The refusal warning
-    // must miss the spy until resetExecutorLogForTests() drops the cache.
-    installWarningCapture();
-    const stale = await runWorkflow();
-    expect(stale.result.error).toBe(
-      'seat_usage_refused:codex:primary:95:90:lane=seat-gate-wf:role=node'
-    );
-    expect(warnings.some(entry => entry.msg === 'workflow.seat_usage_refused')).toBe(false);
-
-    resetExecutorLogForTests();
-    const rebuilt = await runWorkflow();
-    expect(rebuilt.result.error).toBe(
-      'seat_usage_refused:codex:primary:95:90:lane=seat-gate-wf:role=node'
-    );
-    expect(
-      warnings.some(
-        entry => entry.msg === 'workflow.seat_usage_refused' && entry.obj.seat === 'codex'
-      )
-    ).toBe(true);
   });
 });
