@@ -2465,6 +2465,32 @@ nodes:
           END { print c+0 }
         '
       }
+      # rst_uncovered_file_count (T/F records on stdin) -> number of F-record files that
+      #   are NOT covered by any T-identity file. A T identity carries a file only in the
+      #   vitest "FAIL <file> > <name>" and JSON "<file>::<name>" forms; bare identities
+      #   (bun/tap/mocha/under-FAIL) carry none. Names mode drops F records entirely, so a
+      #   head-only file-level failure ("FAIL <new-file>" collection/import error with no
+      #   per-test name) would be masked by supplemental reporter identities for OTHER
+      #   files unless its own file is also named by a T identity. A nonzero count means
+      #   the named identities do not explain every failing file, so names mode is unsafe
+      #   and the caller must fall through to the file-count/count gate (bdc-xo #1940 r4).
+      rst_uncovered_file_count() {
+        awk -F '\t' '
+          function filepart(id,   p, f) {
+            if (index(id, "FAIL ") == 1 && index(id, " > ") > 0) {
+              f = substr(id, 6, index(id, " > ") - 6)
+              sub(/^[ \t]+/, "", f); sub(/[ \t]+$/, "", f)
+              return f
+            }
+            p = index(id, "::")
+            if (p > 1) return substr(id, 1, p - 1)
+            return ""
+          }
+          $1 == "T" { f = filepart(substr($0, 3)); if (f != "") tf[f] = 1; next }
+          $1 == "F" { ff[$2] = 1 }
+          END { n = 0; for (k in ff) if (!(k in tf)) n++; print n + 0 }
+        '
+      }
       # rst_segment_count <log> -> number of "### run-stop-tests:" command segments.
       rst_segment_count() {
         [ -f "$1" ] || { printf '0'; return 0; }
@@ -2491,6 +2517,41 @@ nodes:
           printf '%s|%s\n' "${exitc:-none}" "$counts"
           i=$((i + 1))
         done
+      }
+      # rst_segment_body <log> <w> -> body lines of command segment w (1-based), with the
+      #   "### " marker lines removed. Mirrors rst_segment_outcomes' per-segment slice.
+      rst_segment_body() {
+        awk -v w="$2" '
+          /^### run-stop-tests: / { s++; inb=(s==w); next }
+          /^### exit / { if (s==w) inb=0; next }
+          inb && !/^### / { print }
+        ' "$1"
+      }
+      # rst_cmd_new_names <head-log> <base-log> -> "1" when any position-aligned command
+      #   has a failing TEST-NAME identity at head that is absent from the corresponding
+      #   base command, else "0" (bdc-xo #1940, round 4). Aggregate name matching can mask
+      #   a per-command regression when the same bare name fails in DIFFERENT commands at
+      #   base and head (two files swap which command fails them): the per-command COUNT
+      #   gate (rst_cmd_regression) misses it because each command's failing count is
+      #   unchanged. Commands are matched by position like rst_cmd_regression: the head
+      #   log's last N segments (N = base segment count). Text identities only; reporter
+      #   JSON is an aggregate concern handled by rst_uncovered_file_count.
+      rst_cmd_new_names() {
+        local head_log="$1" base_log="$2" nb nh start i hn bn newn
+        nb="$(rst_segment_count "$base_log")"
+        if [ "${nb:-0}" -lt 1 ]; then printf '0'; return 0; fi
+        nh="$(rst_segment_count "$head_log")"
+        start=$((nh - nb + 1))
+        [ "$start" -lt 1 ] && start=1
+        i=0
+        while [ "$i" -lt "$nb" ]; do
+          hn="$(rst_segment_body "$head_log" $((start + i)) | rst_failing_names | awk -F '\t' '$1=="T"{print substr($0,3)}' | LC_ALL=C sort -u)"
+          bn="$(rst_segment_body "$base_log" $((1 + i)) | rst_failing_names | awk -F '\t' '$1=="T"{print substr($0,3)}' | LC_ALL=C sort -u)"
+          newn="$(LC_ALL=C comm -23 <(printf '%s\n' "$hn") <(printf '%s\n' "$bn") | grep -c . || true)"
+          if [ "${newn:-0}" -ge 1 ]; then printf '1'; return 0; fi
+          i=$((i + 1))
+        done
+        printf '0'
       }
       # rst_cmd_regression <head-log> <base-log> -> "1" when any single command's head
       #   outcome is worse than the same command on the base, else "0" (bdc-xo #1940,
@@ -2673,7 +2734,14 @@ nodes:
         # at head (new failing exit, lost counts, new timeout, or more failures in that
         # one command) blocks even when the aggregate identities match.
         cmd_regression="$(rst_cmd_regression "$log" "$base_log")"
+        # A per-command new failing NAME is also a regression even when per-command counts
+        # match (bdc-xo #1940 round 4): aggregate name matching cannot see a name that
+        # fails in a different command at head than at base.
+        if [ "$cmd_regression" != "1" ]; then
+          cmd_regression="$(rst_cmd_new_names "$log" "$base_log")"
+        fi
         local ht_n bt_n hf_n bf_n hf_sum bf_sum head_obs base_obs names_complete=0 file_cover=0
+        local head_f_uncovered=0
         head_obs=$((ht - hp))
         base_obs=$((bt - bp))
         if [ "$head_obs" -lt 0 ]; then head_obs=0; fi
@@ -2684,8 +2752,13 @@ nodes:
         bf_n="$(printf '%s\n' "$base_records" | awk -F '\t' '$1=="F"{c++} END{print c+0}')"
         hf_sum="$(printf '%s\n' "$head_records" | awk -F '\t' '$1=="F"{s+=$3} END{print s+0}')"
         bf_sum="$(printf '%s\n' "$base_records" | awk -F '\t' '$1=="F"{s+=$3} END{print s+0}')"
+        # Reporter identities for other files must not plug the identity count while a
+        # head-only "FAIL <new-file>" header (an F record with no per-test name) is left
+        # unexplained -- names mode would drop that F record and emit baseline_red. Require
+        # every head failing file to be named by a T identity before trusting names.
+        head_f_uncovered="$(printf '%s\n' "$head_records" | rst_uncovered_file_count)"
         # One physical identity per observed failure. Duplicate reporter strings are not coverage.
-        if [ "$ht_n" -ge 1 ] && [ "$bt_n" -ge 1 ] && [ "$ht_n" -eq "$head_obs" ] && [ "$bt_n" -eq "$base_obs" ]; then
+        if [ "$ht_n" -ge 1 ] && [ "$bt_n" -ge 1 ] && [ "$ht_n" -eq "$head_obs" ] && [ "$bt_n" -eq "$base_obs" ] && [ "${head_f_uncovered:-0}" -eq 0 ]; then
           names_complete=1
         fi
         if [ "$hf_n" -ge 1 ] && [ "$bf_n" -ge 1 ] && [ "$hf_sum" -ge "$head_obs" ] && [ "$bf_sum" -ge "$base_obs" ]; then

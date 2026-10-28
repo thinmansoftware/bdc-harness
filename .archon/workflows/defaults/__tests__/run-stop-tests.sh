@@ -1565,6 +1565,118 @@ assert_not_contains "t14 not baseline_red" "baseline_red" "$(rst_out_field TESTS
 export PATH="$ORIG_PATH"
 rm -rf "$V14"
 
+echo "--- Test 15: a bare name failing in a DIFFERENT command at head blocks (round 4 #1) ---"
+# bdc-xo #1940 round 4 finding 1: text identities omit command context, so the same
+# bare name failing in different commands at base vs head compares equal. Here two
+# files swap which command fails them: each command's failing COUNT is unchanged, so
+# the per-command count gate (rst_cmd_regression) does not fire, and the aggregate
+# name set {foo,bar} matches -- old code emitted baseline_red, masking two regressions.
+# rst_cmd_new_names qualifies by command and blocks.
+T15="$(mktemp -d)"
+rst_git_init "$T15"
+cat > "$T15/one.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) foo"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+cat > "$T15/two.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) bar"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'base\n' > "$T15/note.txt"
+rst_commit "$T15" base
+git -C "$T15" update-ref refs/remotes/origin/dev "$(git -C "$T15" rev-parse HEAD)"
+cat > "$T15/one.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) bar"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+cat > "$T15/two.sh" <<'EOF'
+#!/bin/bash
+echo "(fail) foo"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'head\n' > "$T15/note.txt"
+rst_commit "$T15" head
+T15_CMD="$(printf '%s\n' 'bash ./one.sh' 'bash ./two.sh')"
+T15_OUT="$(rst_verdict_for "$T15" "$T15_CMD" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t15 status" "failed" "$(rst_out_field TESTS_STATUS "$T15_OUT")"
+assert_not_contains "t15 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T15_OUT")"
+assert_contains "t15 names the regression" "command regression at head" "$T15_OUT"
+rm -rf "$T15"
+
+echo "--- Test 15b: rst_cmd_new_names direct (swap blocks, identical passes) ---"
+T15B_H="$(mktemp)"; T15B_B="$(mktemp)"
+cat > "$T15B_B" <<'EOF'
+### run-stop-tests: bash ./one.sh
+(fail) foo
+### exit 1 one.sh
+### run-stop-tests: bash ./two.sh
+(fail) bar
+### exit 1 two.sh
+EOF
+cat > "$T15B_H" <<'EOF'
+### run-stop-tests: bash ./one.sh
+(fail) bar
+### exit 1 one.sh
+### run-stop-tests: bash ./two.sh
+(fail) foo
+### exit 1 two.sh
+EOF
+assert_eq "t15b swap flags new names" "1" "$(rst_cmd_new_names "$T15B_H" "$T15B_B")"
+assert_eq "t15b identical no new names" "0" "$(rst_cmd_new_names "$T15B_B" "$T15B_B")"
+rm -f "$T15B_H" "$T15B_B"
+
+echo "--- Test 16: a head-only FAIL <new-file> header is not masked by reporter names (round 4 #2) ---"
+# bdc-xo #1940 round 4 finding 2: names mode drops F records, so a head-only
+# "FAIL new.test.ts" (collection error, no per-test name) is masked when the identity
+# count is filled by named failures for OTHER (baseline) files. head and base both
+# name base.test.ts keeps+extra (count 2/2), but head additionally fails a NEW file at
+# the file level. rst_uncovered_file_count forces a fall-through off names mode so the
+# new file stays blocking.
+T16_UNC_HIDDEN="$(printf 'F\t%s\t%s\nT\t%s\nT\t%s\n' \
+  'new.test.ts' '1' 'base.test.ts::keeps' 'base.test.ts::extra' | rst_uncovered_file_count)"
+assert_eq "t16 uncovered new file counted" "1" "$T16_UNC_HIDDEN"
+T16_UNC_COVERED="$(printf 'F\t%s\t%s\nT\t%s\n' \
+  'base.test.ts' '1' 'FAIL base.test.ts > keeps' | rst_uncovered_file_count)"
+assert_eq "t16 covered file not counted" "0" "$T16_UNC_COVERED"
+T16="$(mktemp -d)"
+rst_git_init "$T16"
+cat > "$T16/t.sh" <<'EOF'
+#!/bin/bash
+echo "FAIL base.test.ts > keeps"
+echo "FAIL base.test.ts > extra"
+echo "Tests: 2 failed, 0 passed, 2 total"
+exit 1
+EOF
+printf 'base\n' > "$T16/note.txt"
+rst_commit "$T16" base
+git -C "$T16" update-ref refs/remotes/origin/dev "$(git -C "$T16" rev-parse HEAD)"
+cat > "$T16/t.sh" <<'EOF'
+#!/bin/bash
+echo "FAIL new.test.ts"
+echo "FAIL base.test.ts > keeps"
+echo "FAIL base.test.ts > extra"
+echo "Tests: 2 failed, 0 passed, 2 total"
+exit 1
+EOF
+printf 'head\n' > "$T16/note.txt"
+rst_commit "$T16" head
+T16_OUT="$(rst_verdict_for "$T16" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t16 status" "failed" "$(rst_out_field TESTS_STATUS "$T16_OUT")"
+assert_not_contains "t16 not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T16_OUT")"
+assert_not_contains "t16 mode not names" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T16_OUT")"
+rm -rf "$T16"
+
 echo
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
