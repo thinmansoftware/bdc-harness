@@ -2,16 +2,30 @@
  * Reconcile the served global workflow volume to baked defaults.
  *
  * A same-named top-level *.yaml is replaced only when its bytes match a
- * previously committed hash. Uncommitted edits and volume-only files are
- * left in place and reported. Discovery precedence is not changed here.
+ * previously committed hash. Replacement swaps the live name out of the way
+ * and links the baked bytes in; the live path is never opened for writing.
+ * Uncommitted edits and volume-only files are left in place and reported.
+ * Discovery precedence is not changed here.
  */
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { readFileSync } from 'fs';
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'fs/promises';
+import {
+  chmod,
+  chown,
+  link,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from 'fs/promises';
 import { join, resolve } from 'path';
 import { createLogger } from '../../packages/paths/src/logger';
 
 const log = createLogger('served-lanes');
+const BACKUP_RESERVE_ATTEMPTS = 16;
 
 export type ServedLaneHistory = Readonly<Record<string, readonly string[]>>;
 
@@ -32,11 +46,39 @@ export interface UniqueEdit {
   mtime: string;
 }
 
+export interface ReplacedLane {
+  filename: string;
+  backup_path: string;
+}
+
+export interface EditConflict {
+  filename: string;
+  live_path: string;
+  backup_path: string;
+  sha256: string;
+  mtime: string;
+}
+
+export interface EditAfterSwap {
+  filename: string;
+  backup_path: string;
+  sha256: string;
+  mtime: string;
+}
+
 export interface ReconcileResult {
-  replaced: string[];
+  replaced: ReplacedLane[];
   unique_edit: UniqueEdit[];
+  edit_conflict: EditConflict[];
+  edit_after_swap: EditAfterSwap[];
   volume_only: string[];
   backup_path: string | null;
+}
+
+export interface ServedLaneHooks {
+  afterFinalStat?: (path: string) => Promise<void> | void;
+  afterSwapToBackup?: (path: string, backupPath: string) => Promise<void> | void;
+  afterInstall?: (path: string, backupPath: string) => Promise<void> | void;
 }
 
 export type DriftState =
@@ -62,19 +104,28 @@ interface ClassifiedLane {
   mtime: string | null;
 }
 
+interface LiveIdentity {
+  sha256: string;
+  mtime: string;
+}
+
 function compareAscii(left: string, right: string): number {
   if (left < right) return -1;
   if (left > right) return 1;
   return 0;
 }
 
-function isEnoent(error: unknown): boolean {
+function isCode(error: unknown, code: string): boolean {
   return (
     typeof error === 'object' &&
     error !== null &&
     'code' in error &&
-    (error as { code: unknown }).code === 'ENOENT'
+    (error as { code: unknown }).code === code
   );
+}
+
+function isEnoent(error: unknown): boolean {
+  return isCode(error, 'ENOENT');
 }
 
 export function sha256Hex(bytes: Buffer): string {
@@ -85,15 +136,21 @@ function emptyResult(): ReconcileResult {
   return {
     replaced: [],
     unique_edit: [],
+    edit_conflict: [],
+    edit_after_swap: [],
     volume_only: [],
     backup_path: null,
   };
 }
 
 function sortResult(result: ReconcileResult): void {
-  result.replaced.sort(compareAscii);
+  const byFilename = (left: { filename: string }, right: { filename: string }): number =>
+    compareAscii(left.filename, right.filename);
+  result.replaced.sort(byFilename);
+  result.unique_edit.sort(byFilename);
+  result.edit_conflict.sort(byFilename);
+  result.edit_after_swap.sort(byFilename);
   result.volume_only.sort(compareAscii);
-  result.unique_edit.sort((left, right) => compareAscii(left.filename, right.filename));
 }
 
 function reportPathFor(volumeDir: string): string {
@@ -107,6 +164,8 @@ async function writeReport(reportPath: string, result: ReconcileResult): Promise
       {
         replaced: result.replaced,
         unique_edit: result.unique_edit,
+        edit_conflict: result.edit_conflict,
+        edit_after_swap: result.edit_after_swap,
         volume_only: result.volume_only,
         backup_path: result.backup_path,
       },
@@ -118,7 +177,37 @@ async function writeReport(reportPath: string, result: ReconcileResult): Promise
 
 function backupStamp(now: Date): string {
   const iso = now.toISOString();
-  return `${iso.slice(0, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}-${iso.slice(11, 13)}${iso.slice(14, 16)}`;
+  return `${iso.slice(0, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}T${iso.slice(11, 13)}${iso.slice(14, 16)}${iso.slice(17, 19)}${iso.slice(20, 23)}Z`;
+}
+
+function randomHex6(): string {
+  return randomBytes(3).toString('hex');
+}
+
+async function mkdirNewDirectory(path: string): Promise<void> {
+  await mkdir(path);
+}
+
+async function reserveBackupDir(
+  volumeDir: string,
+  now: Date,
+  mkdirExclusive: (path: string) => Promise<void>
+): Promise<string> {
+  const stamp = backupStamp(now);
+  const pid = process.pid;
+  for (let attempt = 0; attempt < BACKUP_RESERVE_ATTEMPTS; attempt += 1) {
+    const backupDir = `${volumeDir}.bak-${stamp}-${pid}-${randomHex6()}`;
+    try {
+      await mkdirExclusive(backupDir);
+      return backupDir;
+    } catch (error) {
+      if (isCode(error, 'EEXIST')) continue;
+      throw error;
+    }
+  }
+  throw new Error(
+    `Failed to reserve served-lanes backup directory under ${volumeDir} after ${BACKUP_RESERVE_ATTEMPTS} attempts`
+  );
 }
 
 async function directoryPresence(dir: string): Promise<'missing' | 'present'> {
@@ -232,12 +321,140 @@ async function classifyAll(input: {
   return lanes;
 }
 
-async function pathExists(filePath: string): Promise<boolean> {
+async function discardTemp(tempPath: string): Promise<void> {
   try {
-    await stat(filePath);
-    return true;
+    await unlink(tempPath);
   } catch (error) {
-    if (isEnoent(error)) return false;
+    if (isEnoent(error)) return;
+    log.warn({ err: error, tempPath }, 'served_lanes.temp_cleanup_failed');
+    throw error;
+  }
+}
+
+async function readLiveIdentity(filePath: string): Promise<LiveIdentity> {
+  const bytes = await readFile(filePath);
+  const info = await stat(filePath);
+  return { sha256: sha256Hex(bytes), mtime: info.mtime.toISOString() };
+}
+
+async function recordEditConflict(
+  result: ReconcileResult,
+  filename: string,
+  livePath: string,
+  backupFile: string
+): Promise<void> {
+  const live = await readLiveIdentity(livePath);
+  result.edit_conflict.push({
+    filename,
+    live_path: livePath,
+    backup_path: backupFile,
+    sha256: live.sha256,
+    mtime: live.mtime,
+  });
+}
+
+async function swapStaleLane(input: {
+  volumeDir: string;
+  backupDir: string;
+  lane: ClassifiedLane;
+  hooks: ServedLaneHooks | undefined;
+  result: ReconcileResult;
+}): Promise<void> {
+  if (input.lane.bakedBytes === null) {
+    throw new Error(`Missing baked bytes for replacement: ${input.lane.filename}`);
+  }
+  if (input.lane.servedSha256 === null) {
+    throw new Error(`Missing classified hash for replacement: ${input.lane.filename}`);
+  }
+  const bakedBytes = input.lane.bakedBytes;
+  const classifiedHash = input.lane.servedSha256;
+  const livePath = join(input.volumeDir, input.lane.filename);
+  const backupFile = join(input.backupDir, input.lane.filename);
+  let tempPath: string | null = null;
+
+  try {
+    const preStat = await stat(livePath);
+    const uid = preStat.uid;
+    const gid = preStat.gid;
+    const mode = preStat.mode & 0o777;
+    await input.hooks?.afterFinalStat?.(livePath);
+
+    tempPath = join(
+      input.volumeDir,
+      `.${input.lane.filename}.served-lanes-tmp-${process.pid}-${randomHex6()}`
+    );
+    await writeFile(tempPath, bakedBytes);
+    await chown(tempPath, uid, gid);
+    await chmod(tempPath, mode);
+
+    await rename(livePath, backupFile);
+    await input.hooks?.afterSwapToBackup?.(livePath, backupFile);
+
+    const backupBytes = await readFile(backupFile);
+    const backupHash = sha256Hex(backupBytes);
+    if (backupHash !== classifiedHash) {
+      try {
+        await link(backupFile, livePath);
+      } catch (error) {
+        if (!isCode(error, 'EEXIST')) throw error;
+        await discardTemp(tempPath);
+        tempPath = null;
+        await recordEditConflict(input.result, input.lane.filename, livePath, backupFile);
+        return;
+      }
+      const liveStat = await stat(livePath);
+      input.result.unique_edit.push({
+        filename: input.lane.filename,
+        sha256: backupHash,
+        mtime: liveStat.mtime.toISOString(),
+      });
+      await discardTemp(tempPath);
+      tempPath = null;
+      return;
+    }
+
+    try {
+      await link(tempPath, livePath);
+    } catch (error) {
+      if (!isCode(error, 'EEXIST')) throw error;
+      await discardTemp(tempPath);
+      tempPath = null;
+      await recordEditConflict(input.result, input.lane.filename, livePath, backupFile);
+      return;
+    }
+
+    await discardTemp(tempPath);
+    tempPath = null;
+    input.result.replaced.push({
+      filename: input.lane.filename,
+      backup_path: backupFile,
+    });
+
+    await input.hooks?.afterInstall?.(livePath, backupFile);
+    const postBytes = await readFile(backupFile);
+    const postHash = sha256Hex(postBytes);
+    if (postHash !== backupHash) {
+      const postStat = await stat(backupFile);
+      input.result.edit_after_swap.push({
+        filename: input.lane.filename,
+        backup_path: backupFile,
+        sha256: postHash,
+        mtime: postStat.mtime.toISOString(),
+      });
+    }
+  } catch (error) {
+    // Pre-swap ENOENT drops the temp file and rethrows. After the rename, any
+    // other error keeps the backup and rethrows; this cleanup only unlinks the
+    // temp name and never a backup.
+    if (tempPath !== null) {
+      try {
+        await unlink(tempPath);
+      } catch (cleanupError) {
+        if (!isEnoent(cleanupError)) {
+          log.warn({ err: cleanupError, tempPath }, 'served_lanes.temp_cleanup_failed');
+        }
+      }
+    }
     throw error;
   }
 }
@@ -247,8 +464,8 @@ export async function reconcileServedLanes(input: {
   bakedDir: string;
   history: ServedLaneHistory;
   now: Date;
-  beforeReplace?: () => Promise<void> | void;
-  beforeFinalVerify?: (filename: string) => Promise<void> | void;
+  mkdirExclusive?: (path: string) => Promise<void>;
+  hooks?: ServedLaneHooks;
 }): Promise<ReconcileResult> {
   const reportPath = reportPathFor(input.volumeDir);
   const volumePresence = await directoryPresence(input.volumeDir);
@@ -278,86 +495,19 @@ export async function reconcileServedLanes(input: {
       }
     }
 
-    await input.beforeReplace?.();
-
     const replacements = lanes.filter(lane => lane.state === 'stale_replaceable');
-    for (const lane of replacements) {
-      if (lane.bakedBytes === null) {
-        throw new Error(`Missing baked bytes for replacement: ${lane.filename}`);
-      }
-      if (lane.servedSha256 === null) {
-        throw new Error(`Missing classified hash for replacement: ${lane.filename}`);
-      }
-      const livePath = join(input.volumeDir, lane.filename);
-
-      // Observe the live file once at replace time. mtime and inode are
-      // captured here so the final verification below can detect any edit.
-      const preBytes = await readFile(livePath);
-      const preStat = await stat(livePath);
-      const preHash = sha256Hex(preBytes);
-      if (preHash !== lane.servedSha256) {
-        // Changed since classification: preserve it, overwrite nothing.
-        result.unique_edit.push({
-          filename: lane.filename,
-          sha256: preHash,
-          mtime: preStat.mtime.toISOString(),
+    if (replacements.length > 0) {
+      const mkdirExclusive = input.mkdirExclusive ?? mkdirNewDirectory;
+      result.backup_path = await reserveBackupDir(input.volumeDir, input.now, mkdirExclusive);
+      for (const lane of replacements) {
+        await swapStaleLane({
+          volumeDir: input.volumeDir,
+          backupDir: result.backup_path,
+          lane,
+          hooks: input.hooks,
+          result,
         });
-        continue;
       }
-
-      // Stage the backup (the exact bytes about to be replaced) BEFORE the
-      // final verification, to a temp path that is never the official backup
-      // directory, so an abandoned replacement leaves no stray .bak- directory
-      // and no awaited backup operation sits between the final read and the
-      // write.
-      const stagedBackup = `${livePath}.served-lanes-bak-staging`;
-      await writeFile(stagedBackup, preBytes);
-
-      // Test seam: a per-lane edit injected here must be caught by the final
-      // verification below and preserved, never overwritten.
-      await input.beforeFinalVerify?.(lane.filename);
-
-      // Final verification: re-read the bytes AND re-stat (mtime + inode) and
-      // compare against the pre-observation. No awaited operation runs between
-      // the last read here and the in-place write, so a concurrent edit can
-      // only land before this check (where it is detected) -- never in an
-      // unobserved gap before the overwrite.
-      const finalBytes = await readFile(livePath);
-      const finalStat = await stat(livePath);
-      const finalHash = sha256Hex(finalBytes);
-      if (
-        finalHash !== preHash ||
-        finalStat.ino !== preStat.ino ||
-        finalStat.mtimeMs !== preStat.mtimeMs
-      ) {
-        result.unique_edit.push({
-          filename: lane.filename,
-          sha256: finalHash,
-          mtime: finalStat.mtime.toISOString(),
-        });
-        await rm(stagedBackup, { force: true });
-        continue;
-      }
-
-      // Verified unchanged: overwrite in place. writeFile on an existing path
-      // truncates and reuses the inode, preserving uid, gid and mode. This is
-      // a single awaited write glued to the verification above.
-      await writeFile(livePath, lane.bakedBytes);
-
-      // Promote the staged backup into the official directory, created lazily
-      // so a run that replaces nothing creates no backup directory. The backup
-      // therefore holds exactly the bytes that were replaced.
-      if (result.backup_path === null) {
-        const backupDir = `${input.volumeDir}.bak-${backupStamp(input.now)}`;
-        await mkdir(backupDir);
-        result.backup_path = backupDir;
-      }
-      const backupFile = join(result.backup_path, lane.filename);
-      if (await pathExists(backupFile)) {
-        throw new Error(`Backup target already exists: ${backupFile}`);
-      }
-      await rename(stagedBackup, backupFile);
-      result.replaced.push(lane.filename);
     }
 
     await writeReport(reportPath, result);
@@ -420,13 +570,10 @@ function parseServedLaneHistory(raw: string, source: string): ServedLaneHistory 
   return history;
 }
 
-function readUniqueEdits(parsed: unknown): UniqueEdit[] | null {
-  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
-  if (!('unique_edit' in parsed)) return null;
-  const edits = (parsed as { unique_edit: unknown }).unique_edit;
-  if (!Array.isArray(edits)) return null;
+function noticeRowsFrom(value: unknown): UniqueEdit[] {
+  if (!Array.isArray(value)) return [];
   const valid: UniqueEdit[] = [];
-  for (const edit of edits) {
+  for (const edit of value) {
     if (edit === null || typeof edit !== 'object' || Array.isArray(edit)) continue;
     const row = edit as { filename?: unknown; sha256?: unknown; mtime?: unknown };
     if (
@@ -442,6 +589,47 @@ function readUniqueEdits(parsed: unknown): UniqueEdit[] | null {
     valid.push({ filename: row.filename, sha256: row.sha256, mtime: row.mtime });
   }
   return valid;
+}
+
+function readUniqueEdits(parsed: unknown): UniqueEdit[] | null {
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  if (!('unique_edit' in parsed)) return null;
+  const edits = (parsed as { unique_edit: unknown }).unique_edit;
+  if (!Array.isArray(edits)) return null;
+  return noticeRowsFrom(edits);
+}
+
+function readOptionalNotices(
+  parsed: object,
+  key: 'edit_conflict' | 'edit_after_swap'
+): UniqueEdit[] {
+  if (!(key in parsed)) return [];
+  return noticeRowsFrom((parsed as Record<string, unknown>)[key]);
+}
+
+async function sendDispatchNotice(
+  createAuthenticatedMessage: CreateDispatchNotice,
+  edit: UniqueEdit
+): Promise<void> {
+  const idempotencyKey = `served-lanes:${edit.filename}:${edit.sha256.slice(0, 12)}`;
+  try {
+    await createAuthenticatedMessage(
+      { kind: 'system', sender: 'dispatch' },
+      {
+        correlation_id: idempotencyKey,
+        idempotency_key: idempotencyKey,
+        task_type: 'agent_message',
+        recipient: 'xo',
+        body: JSON.stringify({
+          filename: edit.filename,
+          volume_sha256: edit.sha256,
+          mtime: edit.mtime,
+        }),
+      }
+    );
+  } catch (error) {
+    log.warn({ err: error, filename: edit.filename }, 'served_lanes.notice_failed');
+  }
 }
 
 export async function notifyServedLaneUniqueEdits(reportPath: string): Promise<void> {
@@ -466,11 +654,16 @@ export async function notifyServedLaneUniqueEdits(reportPath: string): Promise<v
   }
 
   const edits = readUniqueEdits(parsed);
-  if (edits === null) {
+  if (edits === null || parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     log.warn({ reportPath }, 'served_lanes.report_parse_failed');
     return;
   }
-  if (edits.length === 0) return;
+  const notices = [
+    ...edits,
+    ...readOptionalNotices(parsed, 'edit_conflict'),
+    ...readOptionalNotices(parsed, 'edit_after_swap'),
+  ];
+  if (notices.length === 0) return;
 
   let createAuthenticatedMessage: CreateDispatchNotice;
   try {
@@ -483,25 +676,7 @@ export async function notifyServedLaneUniqueEdits(reportPath: string): Promise<v
     return;
   }
 
-  for (const edit of edits) {
-    const idempotencyKey = `served-lanes:${edit.filename}:${edit.sha256.slice(0, 12)}`;
-    try {
-      await createAuthenticatedMessage(
-        { kind: 'system', sender: 'dispatch' },
-        {
-          correlation_id: idempotencyKey,
-          idempotency_key: idempotencyKey,
-          task_type: 'agent_message',
-          recipient: 'xo',
-          body: JSON.stringify({
-            filename: edit.filename,
-            volume_sha256: edit.sha256,
-            mtime: edit.mtime,
-          }),
-        }
-      );
-    } catch (error) {
-      log.warn({ err: error, filename: edit.filename }, 'served_lanes.notice_failed');
-    }
+  for (const edit of notices) {
+    await sendDispatchNotice(createAuthenticatedMessage, edit);
   }
 }

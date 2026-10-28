@@ -2,7 +2,18 @@ import { afterAll, describe, expect, test } from 'bun:test';
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
 import { mkdtempSync } from 'fs';
-import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'fs/promises';
+import {
+  appendFile,
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from 'fs/promises';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { createCodebase } from '../../packages/core/src/db/codebases';
@@ -61,7 +72,7 @@ function gitIn(repo: string, args: readonly string[]): string {
 
 function backupStamp(now: Date): string {
   const iso = now.toISOString();
-  return `${iso.slice(0, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}-${iso.slice(11, 13)}${iso.slice(14, 16)}`;
+  return `${iso.slice(0, 4)}${iso.slice(5, 7)}${iso.slice(8, 10)}T${iso.slice(11, 13)}${iso.slice(14, 16)}${iso.slice(17, 19)}${iso.slice(20, 23)}Z`;
 }
 
 interface FileSnap {
@@ -124,13 +135,17 @@ describe('served lanes', () => {
 
       expect(sha256Hex(await readFile(lanePath))).toBe(sha256Hex(baked));
       const laneAfter = await stat(lanePath);
-      expect(laneAfter.ino).toBe(laneBefore.ino);
       expect(laneAfter.uid).toBe(laneBefore.uid);
       expect(laneAfter.gid).toBe(laneBefore.gid);
       expect(laneAfter.mode).toBe(laneBefore.mode);
-      const backupDir = `${volumeDir}.bak-${backupStamp(NOW)}`;
-      expect(result.backup_path).toBe(backupDir);
-      expect(result.replaced).toEqual(['lane.yaml']);
+      expect(result.backup_path).not.toBeNull();
+      const backupDir = result.backup_path ?? '';
+      const backupPrefix = `${volumeDir}.bak-${backupStamp(NOW)}-${process.pid}-`;
+      expect(backupDir.startsWith(backupPrefix)).toBe(true);
+      expect(backupDir.slice(backupPrefix.length)).toMatch(/^[0-9a-f]{6}$/);
+      expect(result.replaced).toEqual([
+        { filename: 'lane.yaml', backup_path: join(backupDir, 'lane.yaml') },
+      ]);
       expect(sha256Hex(await readFile(join(backupDir, 'lane.yaml')))).toBe(sha256Hex(stale));
       const backupNames = await readdir(backupDir);
       expect(backupNames).toEqual(['lane.yaml']);
@@ -140,8 +155,8 @@ describe('served lanes', () => {
 
       const report = JSON.parse(
         await readFile(join(parent, 'served-lanes-report.json'), 'utf8')
-      ) as { replaced: string[] };
-      expect(report.replaced).toEqual(['lane.yaml']);
+      ) as { replaced: Array<{ filename: string; backup_path: string }> };
+      expect(report.replaced).toEqual(result.replaced);
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
@@ -189,109 +204,6 @@ describe('served lanes', () => {
       );
       expect(messages.rows.length).toBe(1);
       expect(messages.rows[0]?.body ?? '').toContain('lane.yaml');
-    } finally {
-      await rm(parent, { recursive: true, force: true });
-    }
-  });
-
-  test('an edit between classify and replace is preserved', async () => {
-    const { parent, volumeDir, bakedDir } = await makeTree();
-    try {
-      const stale = laneYaml('STALE');
-      const baked = laneYaml('BAKED');
-      const edited = Buffer.from(laneYaml('EDITED-BETWEEN'));
-      const volumePath = join(volumeDir, 'lane.yaml');
-      await writeFile(volumePath, stale);
-      await writeFile(join(bakedDir, 'lane.yaml'), baked);
-      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
-      let capturedMtime = '';
-
-      const result = await reconcileServedLanes({
-        volumeDir,
-        bakedDir,
-        history,
-        now: NOW,
-        beforeReplace: async () => {
-          await writeFile(volumePath, edited);
-          const info = await stat(volumePath);
-          capturedMtime = info.mtime.toISOString();
-        },
-      });
-
-      const liveBytes = await readFile(volumePath);
-      expect(Buffer.compare(liveBytes, edited)).toBe(0);
-      expect(result.replaced).toEqual([]);
-      expect(result.backup_path).toBeNull();
-      const parentNames = await readdir(parent);
-      expect(parentNames.some(name => name.includes('.bak-'))).toBe(false);
-      const uniqueEdit = {
-        filename: 'lane.yaml',
-        sha256: sha256Hex(edited),
-        mtime: capturedMtime,
-      };
-      expect(result.unique_edit).toEqual([uniqueEdit]);
-
-      const report = JSON.parse(
-        await readFile(join(parent, 'served-lanes-report.json'), 'utf8')
-      ) as {
-        unique_edit: Array<{ filename: string; sha256: string; mtime: string }>;
-      };
-      expect(report.unique_edit).toEqual([uniqueEdit]);
-    } finally {
-      await rm(parent, { recursive: true, force: true });
-    }
-  });
-
-  test('an edit after the final verification read is preserved', async () => {
-    const { parent, volumeDir, bakedDir } = await makeTree();
-    try {
-      const stale = laneYaml('STALE');
-      const baked = laneYaml('BAKED');
-      const edited = Buffer.from(laneYaml('EDITED-AT-FINAL-VERIFY'));
-      const volumePath = join(volumeDir, 'lane.yaml');
-      await writeFile(volumePath, stale);
-      await writeFile(join(bakedDir, 'lane.yaml'), baked);
-      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
-      let capturedMtime = '';
-      let injected = false;
-
-      const result = await reconcileServedLanes({
-        volumeDir,
-        bakedDir,
-        history,
-        now: NOW,
-        // Fires per-lane immediately before the final hash/mtime/ino read,
-        // after the backup has already been staged. The edit must be caught
-        // by the final verification and preserved, never overwritten.
-        beforeFinalVerify: async filename => {
-          if (filename !== 'lane.yaml') return;
-          await writeFile(volumePath, edited);
-          const info = await stat(volumePath);
-          capturedMtime = info.mtime.toISOString();
-          injected = true;
-        },
-      });
-
-      expect(injected).toBe(true);
-      const liveBytes = await readFile(volumePath);
-      expect(Buffer.compare(liveBytes, edited)).toBe(0);
-      expect(result.replaced).toEqual([]);
-      expect(result.backup_path).toBeNull();
-      const parentNames = await readdir(parent);
-      expect(parentNames.some(name => name.includes('.bak-'))).toBe(false);
-      const uniqueEdit = {
-        filename: 'lane.yaml',
-        sha256: sha256Hex(edited),
-        mtime: capturedMtime,
-      };
-      expect(result.unique_edit).toEqual([uniqueEdit]);
-
-      const report = JSON.parse(
-        await readFile(join(parent, 'served-lanes-report.json'), 'utf8')
-      ) as {
-        unique_edit: Array<{ filename: string; sha256: string; mtime: string }>;
-      };
-      expect(report.unique_edit).toEqual([uniqueEdit]);
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
@@ -659,10 +571,10 @@ describe('served lanes', () => {
       expect(steadyAfter.mtimeMs).toBe(steadyBefore.mtimeMs);
       expect(sha256Hex(await readFile(join(volumeDir, 'lane.yaml')))).toBe(sha256Hex(baked));
       const volumeParentNames = await readdir(parent);
-      expect(volumeParentNames.some(name => name.endsWith(`.bak-${backupStamp(NOW)}`))).toBe(true);
-      expect(volumeParentNames.some(name => name.endsWith(`.bak-${backupStamp(NOW_LATER)}`))).toBe(
-        false
-      );
+      const backups = volumeParentNames.filter(name => name.includes('.bak-'));
+      expect(backups).toHaveLength(1);
+      expect(backups[0]).toContain(backupStamp(NOW));
+      expect(volumeParentNames.some(name => name.includes(backupStamp(NOW_LATER)))).toBe(false);
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
@@ -712,6 +624,283 @@ describe('served lanes', () => {
       expect(hashes).toContain(sha256Hex(mainBytes));
     } finally {
       await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('edit_between_stat_and_swap_preserved', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const edited = Buffer.from(laneYaml('EDITED-AFTER-STAT'));
+      const volumePath = join(volumeDir, 'lane.yaml');
+      await writeFile(volumePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+
+      const result = await reconcileServedLanes({
+        volumeDir,
+        bakedDir,
+        history,
+        now: NOW,
+        hooks: {
+          afterFinalStat: async path => {
+            expect(path).toBe(volumePath);
+            await writeFile(path, edited);
+          },
+        },
+      });
+
+      expect(Buffer.compare(await readFile(volumePath), edited)).toBe(0);
+      expect(result.replaced).toEqual([]);
+      expect(result.edit_conflict).toEqual([]);
+      expect(result.unique_edit).toEqual([
+        {
+          filename: 'lane.yaml',
+          sha256: sha256Hex(edited),
+          mtime: (await stat(volumePath)).mtime.toISOString(),
+        },
+      ]);
+      const names = await readdir(volumeDir);
+      expect(names.some(name => name.includes('served-lanes-tmp-'))).toBe(false);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('edit_after_swap_retained_in_backup', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const marker = 'editor-held-inode\n';
+      const volumePath = join(volumeDir, 'lane.yaml');
+      await writeFile(volumePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+
+      const result = await reconcileServedLanes({
+        volumeDir,
+        bakedDir,
+        history,
+        now: NOW,
+        hooks: {
+          afterInstall: async (livePath, backupPath) => {
+            expect(livePath).toBe(volumePath);
+            await appendFile(backupPath, marker);
+          },
+        },
+      });
+
+      expect(sha256Hex(await readFile(volumePath))).toBe(sha256Hex(baked));
+      expect(result.backup_path).not.toBeNull();
+      const backupFile = join(result.backup_path ?? '', 'lane.yaml');
+      const backupBytes = await readFile(backupFile);
+      expect(backupBytes.subarray(backupBytes.length - Buffer.byteLength(marker)).toString()).toBe(
+        marker
+      );
+      expect(result.replaced).toEqual([{ filename: 'lane.yaml', backup_path: backupFile }]);
+      expect(result.edit_after_swap).toEqual([
+        {
+          filename: 'lane.yaml',
+          backup_path: backupFile,
+          sha256: sha256Hex(backupBytes),
+          mtime: (await stat(backupFile)).mtime.toISOString(),
+        },
+      ]);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('recreated_live_never_clobbered', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const recreated = Buffer.from(laneYaml('RECREATED-LIVE'));
+      const volumePath = join(volumeDir, 'lane.yaml');
+      await writeFile(volumePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+
+      const result = await reconcileServedLanes({
+        volumeDir,
+        bakedDir,
+        history,
+        now: NOW,
+        hooks: {
+          afterSwapToBackup: async (livePath, backupPath) => {
+            expect(backupPath).toContain('lane.yaml');
+            await writeFile(livePath, recreated);
+          },
+        },
+      });
+
+      expect(Buffer.compare(await readFile(volumePath), recreated)).toBe(0);
+      const backupFile = join(result.backup_path ?? '', 'lane.yaml');
+      expect(sha256Hex(await readFile(backupFile))).toBe(sha256Hex(stale));
+      expect(result.replaced).toEqual([]);
+      expect(result.edit_conflict).toEqual([
+        {
+          filename: 'lane.yaml',
+          live_path: volumePath,
+          backup_path: backupFile,
+          sha256: sha256Hex(recreated),
+          mtime: (await stat(volumePath)).mtime.toISOString(),
+        },
+      ]);
+      const names = await readdir(volumeDir);
+      expect(names.some(name => name.includes('served-lanes-tmp-'))).toBe(false);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('two_reconciles_same_second', async () => {
+    const first = await makeTree();
+    const second = await makeTree();
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+      await writeFile(join(first.volumeDir, 'lane.yaml'), stale);
+      await writeFile(join(first.bakedDir, 'lane.yaml'), baked);
+      await writeFile(join(second.volumeDir, 'lane.yaml'), stale);
+      await writeFile(join(second.bakedDir, 'lane.yaml'), baked);
+
+      const resultA = await reconcileServedLanes({
+        volumeDir: first.volumeDir,
+        bakedDir: first.bakedDir,
+        history,
+        now: NOW,
+      });
+      const resultB = await reconcileServedLanes({
+        volumeDir: second.volumeDir,
+        bakedDir: second.bakedDir,
+        history,
+        now: NOW,
+      });
+
+      expect(resultA.backup_path).not.toBeNull();
+      expect(resultB.backup_path).not.toBeNull();
+      expect(resultA.backup_path).not.toBe(resultB.backup_path);
+      const backupA = join(resultA.backup_path ?? '', 'lane.yaml');
+      const backupB = join(resultB.backup_path ?? '', 'lane.yaml');
+      expect(resultA.replaced).toEqual([{ filename: 'lane.yaml', backup_path: backupA }]);
+      expect(resultB.replaced).toEqual([{ filename: 'lane.yaml', backup_path: backupB }]);
+      expect(sha256Hex(await readFile(join(first.volumeDir, 'lane.yaml')))).toBe(sha256Hex(baked));
+      expect(sha256Hex(await readFile(join(second.volumeDir, 'lane.yaml')))).toBe(sha256Hex(baked));
+      expect(sha256Hex(await readFile(backupA))).toBe(sha256Hex(stale));
+      expect(sha256Hex(await readFile(backupB))).toBe(sha256Hex(stale));
+    } finally {
+      await rm(first.parent, { recursive: true, force: true });
+      await rm(second.parent, { recursive: true, force: true });
+    }
+  });
+
+  test('backup_reservation_failure_mutates_nothing', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const lanePath = join(volumeDir, 'lane.yaml');
+      await writeFile(lanePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      const past = new Date('2020-01-01T00:00:00.000Z');
+      await utimes(lanePath, past, past);
+      const before = await stat(lanePath);
+      const beforeBytes = await readFile(lanePath);
+      let mkdirCalls = 0;
+
+      await expect(
+        reconcileServedLanes({
+          volumeDir,
+          bakedDir,
+          history: { 'lane.yaml': [sha256Hex(stale)] },
+          now: NOW,
+          mkdirExclusive: () => {
+            mkdirCalls += 1;
+            return Promise.reject(
+              Object.assign(new Error('injected mkdir failure'), { code: 'EIO' })
+            );
+          },
+        })
+      ).rejects.toThrow('injected mkdir failure');
+
+      expect(mkdirCalls).toBe(1);
+      const after = await stat(lanePath);
+      expect(after.mtimeMs).toBe(before.mtimeMs);
+      expect(Buffer.compare(await readFile(lanePath), beforeBytes)).toBe(0);
+      const report = JSON.parse(
+        await readFile(join(parent, 'served-lanes-report.json'), 'utf8')
+      ) as {
+        replaced: unknown[];
+        backup_path: string | null;
+      };
+      expect(report.replaced).toEqual([]);
+      expect(report.backup_path).toBeNull();
+      const names = await readdir(parent);
+      expect(names.some(name => name.includes('.bak-'))).toBe(false);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('swap_preserves_owner_and_mode', async () => {
+    const { parent, volumeDir, bakedDir } = await makeTree();
+    try {
+      const stale = laneYaml('STALE');
+      const baked = laneYaml('BAKED');
+      const lanePath = join(volumeDir, 'lane.yaml');
+      await writeFile(lanePath, stale);
+      await writeFile(join(bakedDir, 'lane.yaml'), baked);
+      await chmod(lanePath, 0o640);
+      const before = await stat(lanePath);
+      const history: ServedLaneHistory = { 'lane.yaml': [sha256Hex(stale)] };
+
+      await reconcileServedLanes({ volumeDir, bakedDir, history, now: NOW });
+
+      const after = await stat(lanePath);
+      expect(after.mode & 0o777).toBe(0o640);
+      expect(after.uid).toBe(before.uid);
+      expect(after.gid).toBe(before.gid);
+      expect(sha256Hex(await readFile(lanePath))).toBe(sha256Hex(baked));
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test('missing_volume_drift_is_empty', async () => {
+    const parent = await mkdtemp(join(tmpdir(), 'served-lanes-missing-'));
+    try {
+      const volumeDir = join(parent, 'absent-workflows');
+      const bakedDir = join(parent, 'baked');
+      await mkdir(bakedDir);
+      const alpha = laneYaml('ALPHA');
+      const beta = laneYaml('BETA');
+      await writeFile(join(bakedDir, 'alpha.yaml'), alpha);
+      await writeFile(join(bakedDir, 'beta.yaml'), beta);
+
+      const drift = await computeDrift({ volumeDir, bakedDir, history: {} });
+
+      expect(drift.lanes).toEqual([
+        {
+          filename: 'alpha.yaml',
+          state: 'missing_in_volume',
+          served_sha256: null,
+          baked_sha256: sha256Hex(alpha),
+        },
+        {
+          filename: 'beta.yaml',
+          state: 'missing_in_volume',
+          served_sha256: null,
+          baked_sha256: sha256Hex(beta),
+        },
+      ]);
+      await expect(stat(volumeDir)).rejects.toThrow();
+    } finally {
+      await rm(parent, { recursive: true, force: true });
     }
   });
 });
