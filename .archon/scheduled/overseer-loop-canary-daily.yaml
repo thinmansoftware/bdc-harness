@@ -1,0 +1,7 @@
+# Source-only schedule record. No scheduler consumes .archon/scheduled yet.
+enabled: false
+name: overseer-loop-canary-daily
+schedule: "0 9 * * *"
+command: "bun packages/canary-suite/src/cli.ts overseer-loop --db-path /opt/bdc/archon-data/archon.db --output-root /opt/bdc/archon-data/canary"
+since_rebuild_command: "bun packages/canary-suite/src/cli.ts overseer-loop --since-rebuild --db-path /opt/bdc/archon-data/archon.db --output-root /opt/bdc/archon-data/canary"
+mutation: read-only
