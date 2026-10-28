@@ -484,7 +484,11 @@ export class GitHubAdapter implements IPlatformAdapter {
 
     // Directory doesn't exist - clone the repository
     getLog().info({ owner, repo, repoPath }, 'github.repo_cloning');
-    const ghToken = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+    const { getServiceGitHubToken, resolveServiceGitHubAuth } =
+      await import('@archon/core/github/service-identity');
+    const ghToken = await getServiceGitHubToken(resolveServiceGitHubAuth('run_nodes')).catch(
+      () => ''
+    );
     const repoUrl = `https://github.com/${owner}/${repo}.git`;
 
     const cloneResult = await cloneRepository(

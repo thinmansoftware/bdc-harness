@@ -590,7 +590,8 @@ export function createRealFetchExactHeadPullRequestEvidence(
 
 /** Resolve the GitHub token from the standard env vars. No fallback secrets. */
 export function resolveGitHubToken(): string {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
+  const identity = resolveServiceGitHubAuth('overseer');
+  const token = identity.kind === 'pat' ? identity.token : '';
   if (!token) {
     throw new Error(
       'overseer_real_adapter_missing_github_token: set GH_TOKEN or GITHUB_TOKEN to run Overseer in real mode'
@@ -814,7 +815,13 @@ export function createRealOctokitClient(
  * identities, and nothing here widens what the PAT is used for.
  */
 export function createRealReadOnlyPatOctokitClient(): RealGitHubOctokitLike | null {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
+  let identity: ReturnType<typeof resolveServiceGitHubAuth>;
+  try {
+    identity = resolveServiceGitHubAuth('overseer');
+  } catch {
+    return null;
+  }
+  const token = identity.kind === 'pat' ? identity.token : '';
   if (!token) return null;
   const client = new Octokit({ auth: token });
   attachGitHubQuotaHooks(client, 'overseer', 'user-pat');
@@ -824,13 +831,11 @@ export function createRealReadOnlyPatOctokitClient(): RealGitHubOctokitLike | nu
 /**
  * M-153 identity separation seam: the MERGE mutation must not run as the
  * Review Gate identity ("review and merge are separate actors", John
- * 2026-08-24). When MERGE_MANAGER_GH_TOKEN is set, merges are executed with
- * that PAT identity while reviews keep the App identity. When it is unset,
+ * 2026-08-24). When the merge-manager PAT is set, merges are executed with
+ * that identity while reviews keep the App identity. When it is unset,
  * the merge octokit falls back to the shared resolution -- callers that
  * enforce M-153 must treat that as the single-identity condition and hold.
  */
-export const MERGE_MANAGER_GH_TOKEN_ENV = 'MERGE_MANAGER_GH_TOKEN' as const;
-
 export function hasDistinctMergeIdentity(): boolean {
   return resolveServiceGitHubAuth('merge_manager').distinct;
 }

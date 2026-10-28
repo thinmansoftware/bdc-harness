@@ -3,10 +3,9 @@
  * set (distinct PAT identity), and fall back to shared resolution when unset.
  */
 import { describe, test, expect, afterEach } from 'bun:test';
-import {
-  hasDistinctMergeIdentity,
-  MERGE_MANAGER_GH_TOKEN_ENV,
-} from '../adapters/github-real-deps.js';
+import { hasDistinctMergeIdentity } from '../adapters/github-real-deps.js';
+
+const MERGE_MANAGER_GH_TOKEN_ENV = 'MERGE_MANAGER_GH_TOKEN';
 
 const ORIGINAL = process.env[MERGE_MANAGER_GH_TOKEN_ENV];
 

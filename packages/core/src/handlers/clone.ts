@@ -245,7 +245,11 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
 
   // Build clone command with authentication if GitHub token is available
   let cloneUrl = workingUrl;
-  const ghToken = process.env.GH_TOKEN;
+  const { getServiceGitHubToken, resolveServiceGitHubAuth } =
+    await import('../github/service-identity');
+  const ghToken = await getServiceGitHubToken(resolveServiceGitHubAuth('run_nodes')).catch(
+    () => ''
+  );
 
   if (ghToken && workingUrl.includes('github.com')) {
     if (workingUrl.startsWith('https://github.com')) {
