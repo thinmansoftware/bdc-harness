@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { generateKeyPairSync } from 'node:crypto';
-import { serviceGitHubFetchWithPermissionFallback } from './request';
+import { serviceGitHubFetch, serviceGitHubFetchWithPermissionFallback } from './request';
+import { clearServiceGitHubTokenCache } from './service-identity';
+import {
+  clearGitHubCredentialAlertDedupe,
+  registerGitHubCredentialAlertSink,
+  type GitHubCredentialAlert,
+} from './credential-alerts';
 import {
   assertGitHubPoolAvailable,
   recordGitHubApiCall,
@@ -9,6 +15,73 @@ import {
 } from './metering';
 
 afterEach(resetGitHubApiMeterForTests);
+
+afterEach(() => {
+  clearServiceGitHubTokenCache();
+  clearGitHubCredentialAlertDedupe();
+  registerGitHubCredentialAlertSink(null);
+});
+
+it('Test 4: a 401 evicts, re-mints, and retries exactly once', async () => {
+  const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
+    .privateKey.export({ type: 'pkcs8', format: 'pem' })
+    .toString();
+  let mints = 0;
+  let requests = 0;
+  const response = await serviceGitHubFetch({
+    service: 'taskmaster',
+    url: 'https://api.github.com/test',
+    identity: {
+      kind: 'app',
+      service: 'taskmaster',
+      appId: 'retry',
+      installationId: '1',
+      privateKey: key,
+      poolId: 'app-retry-1',
+      distinct: true,
+    },
+    fetch: (async (url: string | URL | Request) => {
+      if (String(url).includes('/access_tokens')) {
+        mints += 1;
+        return Response.json({ token: `mint-${mints}` });
+      }
+      requests += 1;
+      return new Response('{}', { status: requests === 1 ? 401 : 200 });
+    }) as typeof fetch,
+  });
+  expect(response.status).toBe(200);
+  expect(mints).toBe(2);
+  expect(requests).toBe(2);
+});
+
+it('Test 4 and 6: a second 401 emits one deduplicated credential alert', async () => {
+  const alerts: GitHubCredentialAlert[] = [];
+  registerGitHubCredentialAlertSink(async alert => {
+    alerts.push(alert);
+  });
+  const identity = {
+    kind: 'pat' as const,
+    service: 'taskmaster' as const,
+    token: 'synthetic',
+    poolId: 'user-pat' as const,
+    distinct: false,
+  };
+  const fetchImpl = (async () => new Response('{}', { status: 401 })) as typeof fetch;
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    expect(
+      (
+        await serviceGitHubFetch({
+          service: 'taskmaster',
+          url: 'https://api.github.com/test',
+          identity,
+          fetch: fetchImpl,
+        })
+      ).status
+    ).toBe(401);
+  }
+  expect(alerts).toHaveLength(1);
+  expect(alerts[0]?.subjectKey).toBe('credential:taskmaster-user-pat');
+});
 
 it('consults the fallback PAT search pool before sending a permission retry', async () => {
   resetGitHubApiMeterForTests();

@@ -4,6 +4,8 @@
 
 <h1 align="center">bdc-harness</h1>
 
+Credential ownership, expiry, and refresh behavior are documented in the [credential inventory](docs/credentials-inventory.md).
+
 <p align="center">
   Blue Devil Collectibles' AI build harness. Forked from <a href="https://github.com/coleam00/Archon">coleam00/Archon</a> (MIT).
   BDC-specific extensions: ${run.id} substitution fix, fresh_context default, sonnet model default.

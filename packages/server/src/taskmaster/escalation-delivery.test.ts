@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { generateKeyPairSync } from 'node:crypto';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import {
   TASKMASTER_ESCALATION_MARKER,
@@ -413,6 +414,37 @@ describe('deliverEscalationToIssue', () => {
 });
 
 describe('createRealEscalationDeliveryDeps (fake fetch)', () => {
+  test('Test 1: App identity mints a token used by escalation comments', async () => {
+    const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
+      .privateKey.export({ type: 'pkcs8', format: 'pem' })
+      .toString();
+    process.env.GITHUB_APP_ID = 'taskmaster-test';
+    process.env.GITHUB_APP_INSTALLATION_ID = '8';
+    process.env.GITHUB_APP_PRIVATE_KEY = key;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      Response.json({
+        token: 'minted-installation-token',
+        expires_at: new Date(T0 + 3_600_000),
+      })) as typeof fetch;
+    let authorization = '';
+    try {
+      const deps = createRealEscalationDeliveryDeps({
+        fetchImpl: async (_url, init) => {
+          authorization = new Headers(init?.headers).get('authorization') ?? '';
+          return Response.json({}, { status: 201 });
+        },
+      });
+      await deps.postIssueComment(ISSUE, 'escalation');
+      expect(authorization).toBe('Bearer minted-installation-token');
+    } finally {
+      globalThis.fetch = originalFetch;
+      delete process.env.GITHUB_APP_ID;
+      delete process.env.GITHUB_APP_INSTALLATION_ID;
+      delete process.env.GITHUB_APP_PRIVATE_KEY;
+    }
+  });
+
   test('>100 comments with the only marker recent (#141 of 150) -> no new comment posted', async () => {
     const comments: EscalationIssueComment[] = [];
     for (let i = 0; i < 150; i += 1) {

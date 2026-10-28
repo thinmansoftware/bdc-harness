@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { generateKeyPairSync } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core/db/connection';
@@ -15,12 +16,35 @@ import {
 import {
   githubIssueInAllowList,
   githubNudgeEnabled,
+  githubToken,
   postGithubIssueComment,
   startDutyOfficerClock,
   stopDutyOfficerClock,
   tickDutyOfficerClock,
   type DutyOfficerClockDeps,
 } from './duty-officer-clock';
+
+test('Test 2: githubToken returns a Promise that resolves an App installation token', async () => {
+  const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
+    .privateKey.export({ type: 'pkcs8', format: 'pem' })
+    .toString();
+  process.env.GITHUB_APP_ID = 'duty-test';
+  process.env.GITHUB_APP_INSTALLATION_ID = '7';
+  process.env.GITHUB_APP_PRIVATE_KEY = key;
+  const fetchSpy = spyOn(globalThis, 'fetch').mockResolvedValue(
+    Response.json({ token: 'installation-token', expires_at: new Date(Date.now() + 3_600_000) })
+  );
+  try {
+    const result = githubToken();
+    expect(result).toBeInstanceOf(Promise);
+    expect(await result).toBe('installation-token');
+  } finally {
+    fetchSpy.mockRestore();
+    delete process.env.GITHUB_APP_ID;
+    delete process.env.GITHUB_APP_INSTALLATION_ID;
+    delete process.env.GITHUB_APP_PRIVATE_KEY;
+  }
+});
 
 test('explicit GitHub nudge switch still requires a usable authenticated identity', () => {
   process.env.DUTY_OFFICER_GH_NUDGE = 'true';
