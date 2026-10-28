@@ -1,9 +1,12 @@
 import {
   getServiceGitHubToken,
+  clearServiceGitHubTokenCacheForIdentity,
   resolveServiceGitHubAuth,
+  resolveServiceGitHubPatFallback,
   type GitHubService,
   type ServiceGitHubAuth,
 } from './service-identity';
+import { alertCredentialFailure } from './credential-alert';
 import {
   assertPersistedGitHubPoolAvailable,
   flushGitHubApiMeter,
@@ -20,6 +23,7 @@ export interface ServiceGitHubRequestOptions {
   resource?: string;
   permissionFallback?: boolean;
   fallbackToken?: string;
+  alert?: typeof alertCredentialFailure;
 }
 
 export function isAppPermissionDenied(response: Response, body: string): boolean {
@@ -33,11 +37,27 @@ export async function serviceGitHubFetch(options: ServiceGitHubRequestOptions): 
     options.resource ??
     (path === '/graphql' ? 'graphql' : path.startsWith('/search/') ? 'search' : 'core');
   await assertPersistedGitHubPoolAvailable(identity.poolId, [resource]);
-  const token = await getServiceGitHubToken(identity, { fetch: options.fetch });
-  const headers = new Headers(options.init?.headers);
-  if (token) headers.set('authorization', `Bearer ${token}`);
-  if (!headers.has('accept')) headers.set('accept', 'application/vnd.github+json');
-  const response = await (options.fetch ?? fetch)(options.url, { ...options.init, headers });
+  const send = async (): Promise<Response> => {
+    const token = await getServiceGitHubToken(identity, {
+      fetch: options.fetch,
+      alert: options.alert,
+    });
+    const headers = new Headers(options.init?.headers);
+    if (token) headers.set('authorization', `Bearer ${token}`);
+    if (!headers.has('accept')) headers.set('accept', 'application/vnd.github+json');
+    return (options.fetch ?? fetch)(options.url, { ...options.init, headers });
+  };
+  let response = await send();
+  if (response.status === 401) {
+    clearServiceGitHubTokenCacheForIdentity(identity);
+    response = await send();
+    if (response.status === 401) {
+      await (options.alert ?? alertCredentialFailure)(
+        identity.poolId,
+        new Error(`github_credential_unauthorized:${identity.poolId}`)
+      );
+    }
+  }
   const observation = observationFromResponse(options.service, identity.poolId, response, {
     permissionFallback: options.permissionFallback,
   });
@@ -55,7 +75,12 @@ export async function serviceGitHubFetchWithPermissionFallback(
   if (identity.kind !== 'app' || response.status !== 403) return response;
   const body = await response.clone().text();
   if (!isAppPermissionDenied(response, body)) return response;
-  const token = options.fallbackToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  const fallbackIdentity = resolveServiceGitHubPatFallback(options.service);
+  const token =
+    options.fallbackToken ??
+    (fallbackIdentity
+      ? await getServiceGitHubToken(fallbackIdentity, { alert: options.alert })
+      : '');
   if (!token) return response;
   return serviceGitHubFetch({
     ...options,

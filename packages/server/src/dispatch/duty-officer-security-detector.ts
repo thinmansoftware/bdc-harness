@@ -1,7 +1,8 @@
 import {
-  resolveGitHubAppAuth,
-  resolveRealOctokitAuthOptions,
-} from '@archon/overseer/adapters/github-real-deps';
+  clearServiceGitHubTokenCacheForIdentity,
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 import { createLogger } from '@archon/paths';
 
 const log = createLogger('dispatch/duty-officer-security-detector');
@@ -24,7 +25,7 @@ export interface SecurityDetectorReason {
 }
 export interface SecurityDetectorDeps {
   fetchImpl: typeof fetch;
-  readToken: () => string | null;
+  readToken: () => Promise<string | null>;
   writeTokenProvider: (signal: AbortSignal) => Promise<string | null>;
   signal?: AbortSignal;
   now: () => Date;
@@ -197,24 +198,12 @@ export function receiptValid(body: string, issueCreatedAt: string, now: Date): b
 
 export async function mintAppInstallationToken(signal: AbortSignal): Promise<string | null> {
   signal.throwIfAborted();
-  const config = resolveGitHubAppAuth();
-  if (!config) return null;
-  const options = resolveRealOctokitAuthOptions();
-  if (!('authStrategy' in options)) return null;
-  const auth = options.authStrategy(options.auth);
-  const app = await auth({ type: 'app' });
-  signal.throwIfAborted();
-  const response = await abortable(
-    fetch(`${API}/app/installations/${config.installationId}/access_tokens`, {
-      method: 'POST',
-      signal,
-      headers: { Authorization: `Bearer ${app.token}`, Accept: 'application/vnd.github+json' },
-    }),
-    signal
-  );
-  if (!response.ok) throw new Error(`duty_officer_github_http_${response.status}`);
-  const result = (await abortable(response.json(), signal)) as { token: string };
-  return result.token;
+  const identity = resolveServiceGitHubAuth('duty_officer');
+  if (identity.kind === 'none') return null;
+  clearServiceGitHubTokenCacheForIdentity(identity);
+  return getServiceGitHubToken(identity, {
+    fetch: ((input, init) => fetch(input, { ...init, signal })) as typeof fetch,
+  });
 }
 
 function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -305,7 +294,7 @@ export async function runSecurityDetector(
   const evaluatedAt = now.toISOString();
   const armedAt = process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT?.trim() || '9999-12-31';
   const armed = now.getTime() >= Date.parse(`${armedAt}T00:00:00Z`);
-  const token = deps.readToken();
+  const token = await deps.readToken();
   const result: SecurityDetectorResult = {
     verdict: armed ? 'clean' : 'disarmed',
     reasons: [],

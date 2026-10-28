@@ -3,6 +3,7 @@ import { generateKeyPairSync } from 'node:crypto';
 import {
   SERVICE_GITHUB_AUTH_PRECEDENCE,
   clearServiceGitHubTokenCache,
+  getServiceGitHubToken,
   resolveServiceGitHubAuth,
 } from './service-identity';
 
@@ -161,4 +162,30 @@ describe('Test 2: service GitHub identity precedence', () => {
       }).distinct
     ).toBe(true);
   });
+});
+
+it('Test 3: refreshes a near-expiry token with one concurrent mint', async () => {
+  const identity = resolveServiceGitHubAuth('taskmaster', {
+    GITHUB_APP_ID: '11',
+    GITHUB_APP_INSTALLATION_ID: '22',
+    GITHUB_APP_PRIVATE_KEY: privateKey,
+  });
+  let mints = 0;
+  const now = Date.now();
+  const fetchImpl = (async () => {
+    mints += 1;
+    return Response.json({
+      token: `token-${mints}`,
+      expires_at: new Date(now + (mints === 1 ? 5 * 60_000 : 60 * 60_000)).toISOString(),
+    });
+  }) as typeof fetch;
+  expect(await getServiceGitHubToken(identity, { fetch: fetchImpl, now: () => now })).toBe(
+    'token-1'
+  );
+  const tokens = await Promise.all([
+    getServiceGitHubToken(identity, { fetch: fetchImpl, now: () => now }),
+    getServiceGitHubToken(identity, { fetch: fetchImpl, now: () => now }),
+  ]);
+  expect(tokens).toEqual(['token-2', 'token-2']);
+  expect(mints).toBe(2);
 });

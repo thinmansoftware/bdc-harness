@@ -6,6 +6,7 @@ const log: ReconcileLogger = {
     console.info('[overseer/reconcile]', message, fields);
   },
 };
+import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
 
 export const RECONCILE_ACTION = 'reconcile_close';
 export const RECONCILE_SKIP_ACTION = 'reconcile_skip_noted';
@@ -635,13 +636,18 @@ async function hasDefaultHoldBeenNoted(input: { prRef: string; woId: string }): 
 }
 
 export function createDefaultReconcileDeps(): ReconcileDeps {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  const appConfigured = ['GITHUB_APP_', 'GITHUB_APP_OVERSEER_'].some(prefix =>
-    ['ID', 'INSTALLATION_ID', 'PRIVATE_KEY', 'PRIVATE_KEY_PATH'].some(suffix =>
-      Boolean(process.env[`${prefix}${suffix}`]?.trim())
-    )
-  );
-  if (!token && !appConfigured) {
+  let configured = true;
+  try {
+    const identity = resolveServiceGitHubAuth('overseer');
+    configured = identity.kind === 'app' || (identity.kind === 'pat' && Boolean(identity.token));
+  } catch (cause) {
+    if (cause instanceof Error && cause.message.startsWith('github_auth_missing:')) {
+      configured = false;
+    } else {
+      throw cause;
+    }
+  }
+  if (!configured) {
     return {
       readCursor: async () => null,
       searchMergedPullRequests: async (): Promise<ReconcileMergedPullRequest[]> => {

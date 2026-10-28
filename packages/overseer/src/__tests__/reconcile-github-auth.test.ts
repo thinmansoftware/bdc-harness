@@ -143,7 +143,9 @@ for (const status of [401, 403, 429])
     await expect(
       createDefaultReconcileDeps().addTrackerLabel({ issue, label: 'wo:done' })
     ).rejects.toThrow();
-    expect(calls.map(call => call.auth)).toEqual(['Bearer fixture-app']);
+    expect(calls.map(call => call.auth)).toEqual(
+      status === 401 ? ['Bearer fixture-app', 'Bearer fixture-app'] : ['Bearer fixture-app']
+    );
   });
 
 test('ambiguous write transport failure does not retry with PAT', async () => {

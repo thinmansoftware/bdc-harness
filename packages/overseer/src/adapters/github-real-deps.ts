@@ -1,7 +1,12 @@
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
-import { resolveServiceGitHubAuth, type GitHubService } from '@archon/core/github/service-identity';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+  resolveServiceGitHubPatFallback,
+  type GitHubService,
+} from '@archon/core/github/service-identity';
 import {
   assertPersistedGitHubPoolAvailable,
   flushGitHubApiMeter,
@@ -590,13 +595,13 @@ export function createRealFetchExactHeadPullRequestEvidence(
 
 /** Resolve the GitHub token from the standard env vars. No fallback secrets. */
 export function resolveGitHubToken(): string {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
-  if (!token) {
+  const identity = resolveServiceGitHubAuth('overseer');
+  if (identity.kind !== 'pat' || !identity.token) {
     throw new Error(
       'overseer_real_adapter_missing_github_token: set GH_TOKEN or GITHUB_TOKEN to run Overseer in real mode'
     );
   }
-  return token;
+  return identity.token;
 }
 
 /** Resolved GitHub App installation-auth configuration. */
@@ -789,18 +794,11 @@ export function createRealOctokitClient(
   service: Extract<GitHubService, 'overseer' | 'pr_discovery'> = 'overseer'
 ): RealGitHubOctokitLike {
   const identity = resolveServiceGitHubAuth(service);
-  const options: RealOctokitAuthOptions =
-    identity.kind === 'app'
-      ? {
-          authStrategy: createAppAuth,
-          auth: {
-            appId: identity.appId,
-            privateKey: identity.privateKey,
-            installationId: identity.installationId,
-          },
-        }
-      : { auth: identity.kind === 'pat' ? identity.token : resolveGitHubToken() };
-  const client = new Octokit(options);
+  const client = new Octokit();
+  client.hook.before('request', async options => {
+    const token = await getServiceGitHubToken(identity);
+    options.headers.authorization = `Bearer ${token}`;
+  });
   attachGitHubQuotaHooks(client, service, identity.poolId);
   return client as unknown as RealGitHubOctokitLike;
 }
@@ -814,9 +812,13 @@ export function createRealOctokitClient(
  * identities, and nothing here widens what the PAT is used for.
  */
 export function createRealReadOnlyPatOctokitClient(): RealGitHubOctokitLike | null {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
-  if (!token) return null;
-  const client = new Octokit({ auth: token });
+  const identity = resolveServiceGitHubPatFallback('overseer');
+  if (!identity) return null;
+  const client = new Octokit();
+  client.hook.before('request', async options => {
+    const token = await getServiceGitHubToken(identity);
+    options.headers.authorization = `Bearer ${token}`;
+  });
   attachGitHubQuotaHooks(client, 'overseer', 'user-pat');
   return client as unknown as RealGitHubOctokitLike;
 }

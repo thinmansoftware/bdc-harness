@@ -4,6 +4,7 @@ import type { OverseerServiceOptions, OverseerWiredAdapterKind } from '@archon/o
 import { PRODUCTION_EFFECT_HOLD_REASON } from '@archon/overseer/merge-manager';
 import { DEFAULT_WATCH_INTERVAL_MS } from '@archon/overseer/watch';
 import { logDiscoveryConfigurationAtStartup } from '@archon/overseer';
+import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
 
 const log = createLogger('server/overseer-runtime');
 
@@ -66,8 +67,11 @@ function resolveAdapterKind(): OverseerAdapterKind {
   ) {
     return 'fake';
   }
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
-  return token.length > 0 ? 'real' : 'none';
+  try {
+    return resolveServiceGitHubAuth('overseer').kind !== 'none' ? 'real' : 'none';
+  } catch {
+    return 'none';
+  }
 }
 
 /**

@@ -35,7 +35,11 @@
 import { createLogger } from '@archon/paths';
 import type { IDatabase } from '@archon/core/db/adapters/types';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
-import { githubToken } from '../dispatch/duty-officer-clock';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
+import { serviceGitHubFetch } from '@archon/core/github/request';
 
 const log = createLogger('taskmaster/escalation-delivery');
 
@@ -427,9 +431,7 @@ export function parseNextLink(linkHeader: string | null): string | null {
 }
 
 /**
- * Minimal GitHub REST helper mirroring duty-officer-clock's private githubJson
- * (kept local rather than exported from that file, which the spec limits to a
- * single githubToken() export). Reuses the shared container token accessor.
+ * Minimal GitHub REST helper for Taskmaster escalation delivery.
  * Takes a full URL and returns the raw Response so callers can read headers
  * (the Link header drives comment pagination). Only api.github.com URLs are
  * requested, so a Link header can never send the token to another host.
@@ -442,11 +444,23 @@ async function githubRequest(
   if (!url.startsWith(`${GITHUB_API_ORIGIN}/`)) {
     throw new Error('taskmaster_github_url_not_api_origin');
   }
-  const token = options.token !== undefined ? options.token : githubToken();
-  if (!token) throw new Error('taskmaster_github_token_missing');
+  const identity =
+    options.token !== undefined
+      ? {
+          kind: 'pat' as const,
+          service: 'taskmaster' as const,
+          token: options.token ?? '',
+          poolId: 'user-pat' as const,
+          distinct: false,
+        }
+      : resolveServiceGitHubAuth('taskmaster');
+  if (identity.kind === 'pat' && !identity.token)
+    throw new Error('taskmaster_github_token_missing');
+  if (options.token === undefined) {
+    await getServiceGitHubToken(identity, { fetch: options.fetchImpl as typeof fetch | undefined });
+  }
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
-    Authorization: `Bearer ${token}`,
     'User-Agent': 'bdc-harness-taskmaster-escalation',
     'X-GitHub-Api-Version': '2022-11-28',
   };
@@ -457,11 +471,17 @@ async function githubRequest(
   }
   const fetchImpl: FetchLike =
     options.fetchImpl ?? ((input, reqInit): Promise<Response> => fetch(input, reqInit));
-  const response = await fetchImpl(url, {
-    method: init?.method,
-    headers,
-    body: init?.body,
-    signal: AbortSignal.timeout(githubTimeoutMs()),
+  const response = await serviceGitHubFetch({
+    service: 'taskmaster',
+    identity,
+    url,
+    fetch: fetchImpl as typeof fetch,
+    init: {
+      method: init?.method,
+      headers,
+      body: init?.body,
+      signal: AbortSignal.timeout(githubTimeoutMs()),
+    },
   });
   if (!response.ok) {
     throw new Error(`taskmaster_github_http_${response.status}`);
@@ -526,10 +546,9 @@ function toEscalationComment(raw: unknown): EscalationIssueComment {
  * blindly.
  */
 function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () => Promise<string> {
-  let cached: { token: string | null; login: Promise<string> } | null = null;
+  let cached: Promise<string> | null = null;
   return (): Promise<string> => {
-    const token = options.token !== undefined ? options.token : githubToken();
-    if (cached?.token === token) return cached.login;
+    if (cached) return cached;
     const login = (async (): Promise<string> => {
       const response = await githubRequest(`${GITHUB_API_ORIGIN}/user`, options);
       const user = (await response.json()) as { login?: unknown } | null;
@@ -539,9 +558,9 @@ function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () =
       }
       return value;
     })();
-    cached = { token, login };
+    cached = login;
     login.catch(() => {
-      if (cached?.login === login) cached = null;
+      if (cached === login) cached = null;
     });
     return login;
   };

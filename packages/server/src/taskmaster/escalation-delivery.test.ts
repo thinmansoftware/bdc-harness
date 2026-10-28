@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { generateKeyPairSync } from 'node:crypto';
+import { clearServiceGitHubTokenCache } from '@archon/core/github/service-identity';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import {
   TASKMASTER_ESCALATION_MARKER,
@@ -413,6 +415,35 @@ describe('deliverEscalationToIssue', () => {
 });
 
 describe('createRealEscalationDeliveryDeps (fake fetch)', () => {
+  test('Test 1: App identity mints and carries the installation token', async () => {
+    const prior = { ...process.env };
+    const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
+      .privateKey.export({ type: 'pkcs8', format: 'pem' })
+      .toString();
+    process.env.GITHUB_APP_ID = '901';
+    process.env.GITHUB_APP_INSTALLATION_ID = '902';
+    process.env.GITHUB_APP_PRIVATE_KEY = key;
+    delete process.env.GITHUB_APP_TASKMASTER_ID;
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    let authorization = '';
+    const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
+      if (input.includes('/access_tokens')) {
+        return Response.json({ token: 'minted-installation-token' });
+      }
+      authorization = new Headers(init?.headers).get('authorization') ?? '';
+      return Response.json({ id: 1 }, { status: 201 });
+    };
+    try {
+      const deps = createRealEscalationDeliveryDeps({ fetchImpl });
+      await deps.postIssueComment(ISSUE, 'hello');
+      expect(authorization).toBe('Bearer minted-installation-token');
+    } finally {
+      process.env = prior;
+      clearServiceGitHubTokenCache();
+    }
+  });
+
   test('>100 comments with the only marker recent (#141 of 150) -> no new comment posted', async () => {
     const comments: EscalationIssueComment[] = [];
     for (let i = 0; i < 150; i += 1) {

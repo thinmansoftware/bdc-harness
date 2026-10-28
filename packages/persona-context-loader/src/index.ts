@@ -4,6 +4,10 @@ import { queryOracle, OracleError } from './oracle-client';
 import { truncate } from './truncator';
 import { contextCache, makeCacheKey } from './cache';
 import type { WikiFetchResult, OracleFetchResult, AgentContext } from './types';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 
 export type { AgentContext, WikiFetchResult, OracleFetchResult, ContextLoadResult } from './types';
 
@@ -14,7 +18,6 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 const ORACLE_API_KEY = process.env.ORACLE_API_KEY;
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
 export interface PersonaContextInput {
   name: string;
@@ -33,11 +36,17 @@ export async function loadContext(agent: PersonaContextInput): Promise<string> {
   const oracleResults: OracleFetchResult[] = [];
 
   if (context.wiki && context.wiki.length > 0) {
-    if (!GITHUB_TOKEN) {
+    let githubToken = '';
+    try {
+      githubToken = await getServiceGitHubToken(resolveServiceGitHubAuth('overseer'));
+    } catch {
+      // Preserve the existing best-effort behavior for optional wiki context.
+    }
+    if (!githubToken) {
       getLog().warn({ name: agent.name }, 'context_loader.github_token_missing');
     } else {
       const wikiPromises = context.wiki.map(path =>
-        fetchWikiPath(path, GITHUB_TOKEN).catch(err => {
+        fetchWikiPath(path, githubToken).catch(err => {
           getLog().warn(
             { name: agent.name, path, err: (err as Error).message },
             'context_loader.wiki_fetch_failed'

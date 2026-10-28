@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it } from 'bun:test';
+import { afterEach, describe, expect, it, mock } from 'bun:test';
 import { generateKeyPairSync } from 'node:crypto';
-import { serviceGitHubFetchWithPermissionFallback } from './request';
+import { serviceGitHubFetch, serviceGitHubFetchWithPermissionFallback } from './request';
 import {
   assertGitHubPoolAvailable,
   recordGitHubApiCall,
@@ -94,5 +94,57 @@ describe('Test 5: App permission fallback', () => {
     } finally {
     }
     void flushGitHubApiMeter;
+  });
+});
+
+describe('Test 4: 401 refresh', () => {
+  const identity = {
+    kind: 'app' as const,
+    service: 'taskmaster' as const,
+    appId: '401',
+    installationId: '1',
+    privateKey: generateKeyPairSync('rsa', { modulusLength: 2048 })
+      .privateKey.export({ type: 'pkcs8', format: 'pem' })
+      .toString(),
+    poolId: 'app-401-1',
+    distinct: true as const,
+  };
+
+  it('re-mints and retries exactly once after a 401', async () => {
+    let mints = 0;
+    let requests = 0;
+    const fetchImpl = (async (url: string | URL | Request) => {
+      if (String(url).includes('/access_tokens')) {
+        mints += 1;
+        return Response.json({ token: `token-${mints}` });
+      }
+      requests += 1;
+      return new Response('{}', { status: requests === 1 ? 401 : 200 });
+    }) as typeof fetch;
+    const response = await serviceGitHubFetch({
+      service: 'taskmaster',
+      identity,
+      url: 'https://api.github.com/repos/o/r',
+      fetch: fetchImpl,
+    });
+    expect(response.status).toBe(200);
+    expect({ mints, requests }).toEqual({ mints: 2, requests: 2 });
+  });
+
+  it('alerts once and returns the second 401', async () => {
+    const alert = mock(async () => {});
+    const fetchImpl = (async (url: string | URL | Request) =>
+      String(url).includes('/access_tokens')
+        ? Response.json({ token: crypto.randomUUID() })
+        : new Response('{}', { status: 401 })) as typeof fetch;
+    const response = await serviceGitHubFetch({
+      service: 'taskmaster',
+      identity: { ...identity, poolId: 'app-401-2' },
+      url: 'https://api.github.com/repos/o/r',
+      fetch: fetchImpl,
+      alert,
+    });
+    expect(response.status).toBe(401);
+    expect(alert).toHaveBeenCalledTimes(1);
   });
 });

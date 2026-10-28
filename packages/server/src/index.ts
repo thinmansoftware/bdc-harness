@@ -33,6 +33,10 @@ if (envPath) {
 // with the CLI -- see packages/paths/src/env-loader.ts and the three-path model
 // (#1302 / #1303).
 import { loadArchonEnv } from '@archon/paths/env-loader';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 loadArchonEnv(process.cwd());
 
 // CLAUDECODE=1 warning is emitted inside stripCwdEnv() (boot import above)
@@ -193,10 +197,13 @@ function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
-function startOverseerRuntimeWithRealMergeManager(): void {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
-  const realAdapterRequested =
-    !envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) && token.length > 0;
+async function startOverseerRuntimeWithRealMergeManager(): Promise<void> {
+  let realAdapterRequested = !envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER);
+  try {
+    resolveServiceGitHubAuth('overseer');
+  } catch {
+    realAdapterRequested = false;
+  }
   if (!realAdapterRequested) {
     startOverseerRuntime();
     return;
@@ -303,7 +310,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  startOverseerRuntimeWithRealMergeManager();
+  await startOverseerRuntimeWithRealMergeManager();
 
   const config = await loadConfig();
   logConfig(config);
@@ -372,7 +379,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     // Check that at least one platform is configured
     const hasTelegram = Boolean(process.env.TELEGRAM_BOT_TOKEN);
     const hasDiscord = Boolean(process.env.DISCORD_BOT_TOKEN);
-    const hasGitHub = Boolean(process.env.GITHUB_TOKEN && process.env.WEBHOOK_SECRET);
+    let githubToken = '';
+    try {
+      githubToken = await getServiceGitHubToken(resolveServiceGitHubAuth('overseer'));
+    } catch {
+      // A missing GitHub identity leaves the optional platform adapter disabled.
+    }
+    const hasGitHub = Boolean(githubToken && process.env.WEBHOOK_SECRET);
     const hasGitea = Boolean(
       process.env.GITEA_URL && process.env.GITEA_TOKEN && process.env.GITEA_WEBHOOK_SECRET
     );
@@ -383,15 +396,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     }
 
     // Initialize GitHub adapter (conditional)
-    if (process.env.GITHUB_TOKEN && process.env.WEBHOOK_SECRET) {
+    if (githubToken && process.env.WEBHOOK_SECRET) {
       const botMention =
         process.env.GITHUB_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
-      github = new GitHubAdapter(
-        process.env.GITHUB_TOKEN,
-        process.env.WEBHOOK_SECRET,
-        lockManager,
-        botMention
-      );
+      github = new GitHubAdapter(githubToken, process.env.WEBHOOK_SECRET, lockManager, botMention);
       await github.start();
       activePlatforms.push('GitHub');
     } else {
