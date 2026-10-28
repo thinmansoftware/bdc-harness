@@ -2233,7 +2233,17 @@ nodes:
       #   "not ok <n> <name>", pytest "FAILED <nodeid>", mocha "  <n>) <name>",
       #   vitest/jest "FAIL <file> > <suite> > <name>", and "x <name>" / "- <name>"
       #   directly under a bare FAIL header. A bare "FAIL <file>" is a file identity
-      #   only (one count per matching line), never a test identity. Reporter JSON
+      #   only (one count per matching line), never a test identity.
+      #   FILE QUALIFICATION (bdc-xo #1940, round 5): a bare name carries no file, so
+      #   the same name failing in DIFFERENT files at base and head compared equal and
+      #   could emit baseline_red. When the log supplies the enclosing file -- a bun
+      #   "<path.ext>:" block header, or the "FAIL <file>" header a "x/- <name>" child
+      #   sits under -- the identity is emitted as "<file>::<name>" so those two are
+      #   distinct. Identities that already carry a file (pytest nodeids, vitest
+      #   "FAIL <file> > <name>") are never re-qualified. When the runner supplies no
+      #   file anywhere the identity stays bare; rst_identity_context_mixed then fails
+      #   names mode closed for any log that proves file context WAS available while
+      #   some identity still lacks it. Reporter JSON
       #   ("### json-report: <path>", testResults[].assertionResults[] status=failed)
       #   contributes "<file>::<fullName>" after stripping a "### checkout-root: <pwd>"
       #   prefix only when that exact prefix plus a slash is present. JSON identities
@@ -2256,19 +2266,37 @@ nodes:
             s = trim(s)
             if (s != "" && !(s in seen)) { seen[s] = 1; print "T\t" s }
           }
+          # qual(s) prefixes a BARE name with the enclosing file when the log gave one.
+          # Identities that already carry a file must never reach this.
+          function qual(s,   f) {
+            s = trim(s)
+            if (s == "") return s
+            f = (fail_file != "" ? fail_file : curfile)
+            if (f == "") return s
+            return f "::" s
+          }
           /^### json-report: / { next }
           /^### checkout-root: / { next }
+          # bun block header: a bare "<path.ext>:" line opens a new file scope.
+          /^[ \t]*[A-Za-z0-9._\/@+-]+\.[A-Za-z0-9]+:[ \t]*\r?$/ {
+            line = trim($0)
+            sub(/:$/, "", line)
+            curfile = line
+            in_fail = 0
+            fail_file = ""
+            next
+          }
           /^[ \t]*\(fail\)[ \t]+/ {
             line = $0
             sub(/^[ \t]*\(fail\)[ \t]+/, "", line)
-            emit_t(line)
+            emit_t(qual(line))
             next
           }
           /^[ \t]*not ok[ \t]+[0-9]+/ {
             line = $0
             sub(/^[ \t]*not ok[ \t]+[0-9]+[ \t]*/, "", line)
             sub(/^-([ \t]+)?/, "", line)
-            emit_t(line)
+            emit_t(qual(line))
             next
           }
           /^[ \t]*FAILED[ \t]+[^ \t]/ {
@@ -2281,13 +2309,14 @@ nodes:
           /^[ \t]*[0-9]+\)[ \t]+/ {
             line = $0
             sub(/^[ \t]*[0-9]+\)[ \t]+/, "", line)
-            emit_t(line)
+            emit_t(qual(line))
             next
           }
           /^[ \t]*FAIL[ \t]+/ {
             line = trim($0)
             if (index(line, " > ") > 0) {
               in_fail = 0
+              fail_file = ""
               emit_t(line)
               next
             }
@@ -2296,17 +2325,18 @@ nodes:
             if (line != "") {
               files[line] += 1
               in_fail = 1
+              fail_file = line
             }
             next
           }
           in_fail && /^[ \t]+[x-][ \t]+/ {
             line = $0
             sub(/^[ \t]+[x-][ \t]+/, "", line)
-            emit_t(line)
+            emit_t(qual(line))
             next
           }
-          /^[ \t]*$/ { in_fail = 0; next }
-          in_fail { in_fail = 0 }
+          /^[ \t]*$/ { in_fail = 0; fail_file = ""; next }
+          in_fail { in_fail = 0; fail_file = "" }
           END {
             for (f in files) print "F\t" f "\t" files[f]
           }
@@ -2488,6 +2518,32 @@ nodes:
           $1 == "T" { f = filepart(substr($0, 3)); if (f != "") tf[f] = 1; next }
           $1 == "F" { ff[$2] = 1 }
           END { n = 0; for (k in ff) if (!(k in tf)) n++; print n + 0 }
+        '
+      }
+      # rst_identity_context_mixed (T/F records on stdin) -> "1" when the stream carries
+      #   BOTH file-qualified and bare T identities, else "0" (bdc-xo #1940, round 5).
+      #   A bare identity is only safe to compare when the runner never reported a file
+      #   at all: then neither side can observe the file and the comparison is symmetric.
+      #   If the SAME log proves file context was available (some identity carries a
+      #   file) while another identity is still bare, that bare name may belong to a
+      #   different file at head than at base -- exactly the collision that lets a real
+      #   regression match a baseline name and emit baseline_red. There is no evidence
+      #   left to resolve it, so names mode fails CLOSED and the caller falls through to
+      #   the file-count/count gate, both of which stay blocking.
+      rst_identity_context_mixed() {
+        awk -F '\t' '
+          function filepart(id,   p, f) {
+            if (index(id, "FAIL ") == 1 && index(id, " > ") > 0) {
+              f = substr(id, 6, index(id, " > ") - 6)
+              sub(/^[ \t]+/, "", f); sub(/[ \t]+$/, "", f)
+              return f
+            }
+            p = index(id, "::")
+            if (p > 1) return substr(id, 1, p - 1)
+            return ""
+          }
+          $1 == "T" { if (filepart(substr($0, 3)) == "") bare = 1; else qualified = 1 }
+          END { print (bare && qualified) ? 1 : 0 }
         '
       }
       # rst_segment_count <log> -> number of "### run-stop-tests:" command segments.
@@ -2740,7 +2796,7 @@ nodes:
           cmd_regression="$(rst_cmd_new_names "$log" "$base_log")"
         fi
         local ht_n bt_n hf_n bf_n hf_sum bf_sum head_obs base_obs names_complete=0 file_cover=0
-        local head_f_uncovered=0
+        local head_f_uncovered=0 head_mixed=0 base_mixed=0
         head_obs=$((ht - hp))
         base_obs=$((bt - bp))
         if [ "$head_obs" -lt 0 ]; then head_obs=0; fi
@@ -2756,8 +2812,14 @@ nodes:
         # unexplained -- names mode would drop that F record and emit baseline_red. Require
         # every head failing file to be named by a T identity before trusting names.
         head_f_uncovered="$(printf '%s\n' "$head_records" | rst_uncovered_file_count)"
+        # Bare names are comparable only while NEITHER side ever reported a file. A log
+        # that qualifies some identities but leaves others bare cannot prove the bare
+        # ones came from the same file on both sides, so names mode fails closed
+        # (bdc-xo #1940 round 5).
+        head_mixed="$(printf '%s\n' "$head_records" | rst_identity_context_mixed)"
+        base_mixed="$(printf '%s\n' "$base_records" | rst_identity_context_mixed)"
         # One physical identity per observed failure. Duplicate reporter strings are not coverage.
-        if [ "$ht_n" -ge 1 ] && [ "$bt_n" -ge 1 ] && [ "$ht_n" -eq "$head_obs" ] && [ "$bt_n" -eq "$base_obs" ] && [ "${head_f_uncovered:-0}" -eq 0 ]; then
+        if [ "$ht_n" -ge 1 ] && [ "$bt_n" -ge 1 ] && [ "$ht_n" -eq "$head_obs" ] && [ "$bt_n" -eq "$base_obs" ] && [ "${head_f_uncovered:-0}" -eq 0 ] && [ "${head_mixed:-0}" -eq 0 ] && [ "${base_mixed:-0}" -eq 0 ]; then
           names_complete=1
         fi
         if [ "$hf_n" -ge 1 ] && [ "$bf_n" -ge 1 ] && [ "$hf_sum" -ge "$head_obs" ] && [ "$bf_sum" -ge "$base_obs" ]; then

@@ -981,11 +981,18 @@ assert_contains "tap bare identity" "$(printf 'T\ttap bare')" "$NAME_SAMPLE"
 assert_contains "pytest identity" "$(printf 'T\ttests/test_a.py::test_b')" "$NAME_SAMPLE"
 assert_contains "mocha identity" "$(printf 'T\tmocha name')" "$NAME_SAMPLE"
 assert_contains "vitest summary identity" "$(printf 'T\tFAIL file.ts > suite > vitest name')" "$NAME_SAMPLE"
-assert_contains "x under FAIL" "$(printf 'T\tunder fail')" "$NAME_SAMPLE"
-assert_contains "dash under FAIL" "$(printf 'T\talso under')" "$NAME_SAMPLE"
+# round 5: a child under "FAIL <file>" is qualified with that file so the same name
+# under a DIFFERENT file is a different identity.
+assert_contains "x under FAIL" "$(printf 'T\tX::under fail')" "$NAME_SAMPLE"
+assert_contains "dash under FAIL" "$(printf 'T\tX::also under')" "$NAME_SAMPLE"
 assert_contains "file identity count" "$(printf 'F\tX\t1')" "$NAME_SAMPLE"
 assert_not_contains "bare FAIL is not a test identity" "$(printf 'T\tFAIL X')" "$NAME_SAMPLE"
-assert_not_contains "bare FAIL line is not a T record" "$(printf 'T\tX')" "$NAME_SAMPLE"
+# exact-record check: "T<TAB>X" must not exist as a whole record (substring matching
+# would now trip on the legitimate "T<TAB>X::under fail").
+assert_eq "bare FAIL line is not a T record" "" \
+  "$(printf '%s\n' "$NAME_SAMPLE" | awk -F '\t' '$1=="T" && $2=="X"')"
+# no bun block header in this sample, so bun/tap/mocha identities stay bare
+assert_contains "bun fail stays bare without a header" "$(printf 'T\tbun name')" "$NAME_SAMPLE"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "FATAL: jq is required for the vitest reporter scenario"
@@ -1678,5 +1685,114 @@ assert_not_contains "t16 mode not names" "names" "$(rst_out_field TESTS_NEWLY_FA
 rm -rf "$T16"
 
 echo
+echo "--- Test 17: a bare name in a DIFFERENT file at head blocks (round 5) ---"
+# bdc-xo #1940 round 5: text identities were bare WITHIN a single command. A base
+# failure "(fail) same name" in file A and a head failure with the same name in file B
+# compared equal, satisfied names_complete, and emitted baseline_red -- masking a real
+# regression. rst_cmd_new_names only separated command segments, not files. The parser
+# now qualifies a bare name with the enclosing bun block header.
+T17_SAMPLE="$(printf '%s\n' \
+  'a.test.ts:' \
+  '(fail) same name' \
+  'b.test.ts:' \
+  '(fail) same name' \
+  | rst_failing_names)"
+assert_contains "t17 file A qualified" "$(printf 'T\ta.test.ts::same name')" "$T17_SAMPLE"
+assert_contains "t17 file B qualified" "$(printf 'T\tb.test.ts::same name')" "$T17_SAMPLE"
+assert_eq "t17 two distinct identities" "2" "$(printf '%s\n' "$T17_SAMPLE" | rst_identity_count)"
+
+echo "--- Test 17b: same command, same name, file moved -- not baseline_red (round 5) ---"
+# The reviewer's exact scenario end-to-end: ONE command, identical failing COUNT on
+# both sides, identical bare name -- only the file differs. rst_cmd_regression cannot
+# see it (counts match) and rst_cmd_new_names cannot see it (one segment), so the file
+# qualification is the only thing that keeps this blocking.
+T17B="$(mktemp -d)"
+rst_git_init "$T17B"
+cat > "$T17B/t.sh" <<'EOF'
+#!/bin/bash
+echo "a.test.ts:"
+echo "(fail) same name"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'base\n' > "$T17B/note.txt"
+rst_commit "$T17B" base
+git -C "$T17B" update-ref refs/remotes/origin/dev "$(git -C "$T17B" rev-parse HEAD)"
+cat > "$T17B/t.sh" <<'EOF'
+#!/bin/bash
+echo "b.test.ts:"
+echo "(fail) same name"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'head\n' > "$T17B/note.txt"
+rst_commit "$T17B" head
+T17B_OUT="$(rst_verdict_for "$T17B" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t17b status" "failed" "$(rst_out_field TESTS_STATUS "$T17B_OUT")"
+assert_not_contains "t17b not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T17B_OUT")"
+assert_eq "t17b newly" "1" "$(rst_out_field TESTS_NEWLY_FAILING "$T17B_OUT")"
+assert_contains "t17b names the new file" "b.test.ts::same name" "$(rst_out_field TESTS_LINE "$T17B_OUT")"
+rm -rf "$T17B"
+
+echo "--- Test 17c: an unmoved qualified failure is still baseline_red (round 5) ---"
+# Guard against over-blocking: qualification must not turn a genuinely red baseline
+# into a block when the SAME test in the SAME file fails on both sides.
+T17C="$(mktemp -d)"
+rst_git_init "$T17C"
+cat > "$T17C/t.sh" <<'EOF'
+#!/bin/bash
+echo "a.test.ts:"
+echo "(fail) same name"
+echo "0 pass"
+echo "1 fail"
+exit 1
+EOF
+printf 'base\n' > "$T17C/note.txt"
+rst_commit "$T17C" base
+git -C "$T17C" update-ref refs/remotes/origin/dev "$(git -C "$T17C" rev-parse HEAD)"
+printf 'head\n' > "$T17C/note.txt"
+rst_commit "$T17C" head
+T17C_OUT="$(rst_verdict_for "$T17C" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_eq "t17c status" "baseline_red" "$(rst_out_field TESTS_STATUS "$T17C_OUT")"
+assert_eq "t17c mode" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T17C_OUT")"
+assert_eq "t17c newly" "0" "$(rst_out_field TESTS_NEWLY_FAILING "$T17C_OUT")"
+rm -rf "$T17C"
+
+echo "--- Test 17d: rst_identity_context_mixed fails closed on partial file context ---"
+assert_eq "t17d all bare" "0" \
+  "$(printf 'T\t%s\nT\t%s\n' 'plain one' 'plain two' | rst_identity_context_mixed)"
+assert_eq "t17d all qualified" "0" \
+  "$(printf 'T\t%s\nT\t%s\n' 'a.ts::one' 'FAIL b.ts > two' | rst_identity_context_mixed)"
+assert_eq "t17d mixed" "1" \
+  "$(printf 'T\t%s\nT\t%s\n' 'a.ts::one' 'plain two' | rst_identity_context_mixed)"
+assert_eq "t17d no identities" "0" "$(printf 'F\t%s\t%s\n' 'a.ts' '1' | rst_identity_context_mixed)"
+
+echo "--- Test 17e: mixed file context denies names mode end-to-end (round 5) ---"
+# head proves the runner CAN report a file (one qualified identity) but still emits a
+# bare name. That bare name may belong to a different file than the base's bare name
+# and nothing in the log can resolve it, so names mode must fail closed rather than
+# compare the bare names and emit baseline_red.
+T17E="$(mktemp -d)"
+rst_git_init "$T17E"
+cat > "$T17E/t.sh" <<'EOF'
+#!/bin/bash
+echo "not ok 1 - bare name"
+echo "FAILED tests/test_a.py::test_b"
+echo "0 pass"
+echo "2 fail"
+exit 1
+EOF
+printf 'base\n' > "$T17E/note.txt"
+rst_commit "$T17E" base
+git -C "$T17E" update-ref refs/remotes/origin/dev "$(git -C "$T17E" rev-parse HEAD)"
+printf 'head\n' > "$T17E/note.txt"
+rst_commit "$T17E" head
+T17E_OUT="$(rst_verdict_for "$T17E" "bash ./t.sh" "$(printf 'REVIEW_BASE=dev\nREVIEW_BASE_SOURCE=declared\n')")"
+assert_not_contains "t17e mode not names" "names" "$(rst_out_field TESTS_NEWLY_FAILING_MODE "$T17E_OUT")"
+assert_not_contains "t17e not baseline_red" "baseline_red" "$(rst_out_field TESTS_STATUS "$T17E_OUT")"
+rm -rf "$T17E"
+
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
