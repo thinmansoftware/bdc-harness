@@ -165,6 +165,24 @@ export function resolveServiceGitHubAuth(
   return pat(service, token, 'user-pat', false);
 }
 
+/** Resolve only the legacy PAT fallback for permission-limited App requests. */
+export function resolveServiceGitHubPatFallback(
+  service: GitHubService,
+  env: Env = process.env
+): GitHubPatIdentity | null {
+  const token =
+    service === 'merge_manager'
+      ? (env.MERGE_MANAGER_GH_TOKEN ?? '')
+      : (env.GITHUB_TOKEN ?? env.GH_TOKEN ?? '');
+  if (!token) return null;
+  return pat(
+    service,
+    token,
+    service === 'merge_manager' ? 'merge-manager-pat' : 'user-pat',
+    service === 'merge_manager'
+  );
+}
+
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
 const tokenMints = new Map<string, Promise<string>>();
 const patWarningAt = new Map<GitHubService, number>();

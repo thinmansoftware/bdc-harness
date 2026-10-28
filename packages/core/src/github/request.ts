@@ -2,6 +2,7 @@ import {
   getServiceGitHubToken,
   clearServiceGitHubTokenCache,
   resolveServiceGitHubAuth,
+  resolveServiceGitHubPatFallback,
   serviceGitHubCredentialName,
   type GitHubService,
   type ServiceGitHubAuth,
@@ -75,11 +76,19 @@ export async function serviceGitHubFetchWithPermissionFallback(
   if (identity.kind !== 'app' || response.status !== 403) return response;
   const body = await response.clone().text();
   if (!isAppPermissionDenied(response, body)) return response;
-  const token = options.fallbackToken;
-  if (!token) return response;
+  const fallbackIdentity = options.fallbackToken
+    ? {
+        kind: 'pat' as const,
+        service: options.service,
+        token: options.fallbackToken,
+        poolId: 'user-pat' as const,
+        distinct: false,
+      }
+    : resolveServiceGitHubPatFallback(options.service);
+  if (!fallbackIdentity) return response;
   return serviceGitHubFetch({
     ...options,
-    identity: { kind: 'pat', service: options.service, token, poolId: 'user-pat', distinct: false },
+    identity: fallbackIdentity,
     permissionFallback: true,
   });
 }
