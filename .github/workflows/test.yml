@@ -220,6 +220,10 @@ jobs:
         run: |
           docker exec --user appuser archon-smoke sh -ec 'node --version && npm --version && npx --version && pytest --version'
 
+      - name: Smoke test -- Overseer native review sandbox as application user
+        run: |
+          docker exec --user appuser archon-smoke bun run scripts/overseer-review-sandbox-smoke.ts
+
       - name: Dump container logs on failure
         if: failure()
         run: docker logs archon-smoke 2>&1 || true
