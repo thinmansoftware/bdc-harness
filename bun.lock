@@ -56,6 +56,15 @@
         "zod": "^3.25.28",
       },
     },
+    "packages/grimoire-mcp": {
+      "name": "@archon/grimoire-mcp",
+      "version": "0.1.0",
+      "dependencies": {
+        "@archon/core": "workspace:*",
+        "@archon/overseer": "workspace:*",
+        "@modelcontextprotocol/sdk": "^1.29.0",
+      },
+    },
     "packages/cli": {
       "name": "@archon/cli",
       "version": "0.3.10",
