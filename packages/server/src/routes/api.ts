@@ -6,7 +6,7 @@ import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
 import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
-import { rm, readFile, writeFile, unlink, mkdir } from 'fs/promises';
+import { rm, readFile, writeFile, unlink, mkdir, access } from 'fs/promises';
 import { readFileSync } from 'fs';
 import { normalize, join, sep, basename } from 'path';
 import { createHash, randomUUID } from 'crypto';
@@ -45,6 +45,7 @@ import {
   getCommandFolderSearchPaths,
   getDefaultCommandsPath,
   getDefaultWorkflowsPath,
+  getHomeWorkflowsPath,
   getArchonWorkspacesPath,
   getHomeCommandsPath,
   getRunArtifactsPath,
@@ -405,6 +406,15 @@ import {
 } from '@archon/providers';
 import { claudeProviderThrottle } from '@archon/providers/claude/throttle';
 import { buildProductionCanarySnapshot } from '../services/canary-snapshot';
+import {
+  computeDrift,
+  readServedLaneHistory,
+  type ServedLaneHistory,
+} from '../../../../scripts/served-lanes/sync';
+
+const servedLaneHistory: ServedLaneHistory = readServedLaneHistory(
+  join(import.meta.dir, '../../../../scripts/served-lanes/history.json')
+);
 
 // Read app version: use build-time constant in binary, package.json in dev
 let appVersion = 'unknown';
@@ -528,6 +538,42 @@ const saveWorkflowRoute = createRoute({
       description: 'Saved workflow',
     },
     400: jsonError('Bad request'),
+    409: jsonError('Conflict'),
+    500: jsonError('Server error'),
+  },
+});
+
+const servedLaneDriftLaneSchema = z
+  .object({
+    filename: z.string(),
+    state: z.enum([
+      'in_sync',
+      'stale_replaceable',
+      'unique_edit',
+      'volume_only',
+      'missing_in_volume',
+    ]),
+    served_sha256: z.string().nullable(),
+    baked_sha256: z.string().nullable(),
+  })
+  .openapi('ServedLaneDriftLane');
+
+const servedLaneDriftResponseSchema = z
+  .object({
+    lanes: z.array(servedLaneDriftLaneSchema),
+  })
+  .openapi('ServedLaneDriftResponse');
+
+const getServedLaneDriftRoute = createRoute({
+  method: 'get',
+  path: '/api/served-lanes/drift',
+  tags: ['Workflows'],
+  summary: 'Report drift between the served global workflow volume and baked defaults',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: servedLaneDriftResponseSchema } },
+      description: 'Drift report',
+    },
     500: jsonError('Server error'),
   },
 });
@@ -7575,6 +7621,18 @@ export function registerApiRoutes(
     }
   });
 
+  // GET /api/served-lanes/drift - read-only volume vs baked comparison.
+  // Distinct prefix so it cannot collide with GET /api/workflows/{name}.
+  registerOpenApiRoute(getServedLaneDriftRoute, async c => {
+    return c.json(
+      await computeDrift({
+        volumeDir: getHomeWorkflowsPath(),
+        bakedDir: getDefaultWorkflowsPath(),
+        history: servedLaneHistory,
+      })
+    );
+  });
+
   // PUT /api/workflows/:name - Save (create or update) a workflow
   registerOpenApiRoute(saveWorkflowRoute, async c => {
     const name = c.req.param('name') ?? '';
@@ -7583,12 +7641,26 @@ export function registerApiRoutes(
     }
 
     const cwd = c.req.query('cwd');
-    let workingDir = cwd;
     if (cwd) {
       if (!(await validateCwd(cwd))) {
         return apiError(c, 400, 'Invalid cwd: must match a registered codebase path');
       }
     } else {
+      const bundledDefaultPath = join(getDefaultWorkflowsPath(), `${name}.yaml`);
+      try {
+        await access(bundledDefaultPath);
+        return apiError(c, 409, 'bundled_default_use_rebuild');
+      } catch (error) {
+        const err = error as NodeJS.ErrnoException;
+        if (err.code !== 'ENOENT') {
+          getLog().error({ err, name }, 'workflow.bundled_default_check_failed');
+          return apiError(c, 500, 'Failed to save workflow');
+        }
+      }
+    }
+
+    let workingDir = cwd;
+    if (!cwd) {
       const codebases = await codebaseDb.listCodebases();
       if (codebases.length > 0) workingDir = codebases[0].default_cwd;
     }
