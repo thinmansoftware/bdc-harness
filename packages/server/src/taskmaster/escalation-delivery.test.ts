@@ -962,4 +962,42 @@ describe('Test 1: taskmaster escalation uses the App identity via the provider',
 
     expect(authHeaders).toEqual(['Bearer minted-install-token']);
   });
+
+  test('App identity poster login is <slug>[bot] via GET /app and never GET /user', async () => {
+    const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
+      .privateKey.export({ type: 'pkcs8', format: 'pem' })
+      .toString();
+    process.env.GITHUB_APP_TASKMASTER_ID = '55';
+    process.env.GITHUB_APP_TASKMASTER_INSTALLATION_ID = '66';
+    process.env.GITHUB_APP_TASKMASTER_PRIVATE_KEY = key;
+
+    const seen: Array<{ pathname: string; authorization: string }> = [];
+    const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input);
+      const authorization = new Headers(init?.headers).get('authorization') ?? '';
+      seen.push({ pathname: url.pathname, authorization });
+      if (url.pathname === '/user' || url.pathname.includes('access_tokens')) {
+        throw new Error(`unexpected_github_path:${url.pathname}`);
+      }
+      if (url.pathname === '/app') {
+        return Response.json({ slug: 'thinman-taskmaster' });
+      }
+      throw new Error(`unexpected_github_path:${url.pathname}`);
+    };
+
+    const deps = createRealEscalationDeliveryDeps({ fetchImpl });
+    await expect(deps.posterLogin()).resolves.toBe('thinman-taskmaster[bot]');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.pathname).toBe('/app');
+    const jwt = (seen[0]?.authorization ?? '').replace(/^Bearer /, '');
+    const payload = JSON.parse(
+      Buffer.from(jwt.split('.')[1] ?? '', 'base64url').toString('utf8')
+    ) as {
+      iss?: unknown;
+    };
+    expect(payload.iss).toBe('55');
+
+    await expect(deps.posterLogin()).resolves.toBe('thinman-taskmaster[bot]');
+    expect(seen).toHaveLength(1);
+  });
 });

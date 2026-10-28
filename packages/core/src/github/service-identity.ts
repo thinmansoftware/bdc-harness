@@ -202,7 +202,7 @@ function base64Url(value: string | Uint8Array): string {
 // Mint a signed GitHub App JWT (RS256) for the given App identity. `now` is a
 // resolved epoch-millisecond timestamp; it defaults to the current time. Shared
 // by getServiceGitHubToken (installation-token mint) and
-// scripts/github-service-login.ts (GET /app slug lookup) so the header/payload/
+// resolveGitHubActingLogin (the shared GET /app caller) so the header/payload/
 // signature shape stays in lockstep.
 export function buildAppJwt(identity: GitHubAppIdentity, now: number = Date.now()): string {
   const header = base64Url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
@@ -217,6 +217,56 @@ export function buildAppJwt(identity: GitHubAppIdentity, now: number = Date.now(
     sign('RSA-SHA256', Buffer.from(`${header}.${payload}`), identity.privateKey)
   );
   return `${header}.${payload}.${signature}`;
+}
+
+// Acting login for a resolved identity. A PAT names itself via GET /user. An
+// App installation token cannot call GET /user, so an App identity is named via
+// GET /app with the App JWT and the login is "<slug>[bot]". Does not cache and
+// does not mint an installation token. A held ('none') identity cannot act.
+export async function resolveGitHubActingLogin(
+  identity: ServiceGitHubAuth,
+  options: { fetch?: typeof fetch; apiBaseUrl?: string } = {}
+): Promise<string> {
+  const doFetch = options.fetch ?? fetch;
+  const apiBaseUrl = options.apiBaseUrl ?? 'https://api.github.com';
+
+  if (identity.kind === 'none') {
+    throw new Error('github_login_identity_held');
+  }
+
+  if (identity.kind === 'pat') {
+    const response = await doFetch(`${apiBaseUrl}/user`, {
+      headers: {
+        accept: 'application/vnd.github+json',
+        authorization: `Bearer ${identity.token}`,
+        'user-agent': 'bdc-harness-service-auth',
+        'x-github-api-version': '2022-11-28',
+      },
+    });
+    if (!response.ok) throw new Error(`github_login_user_failed:${response.status}`);
+    const body = (await response.json()) as { login?: unknown };
+    if (typeof body.login !== 'string' || body.login.length === 0) {
+      throw new Error('github_login_user_failed:invalid_response');
+    }
+    return body.login;
+  }
+
+  // identity.kind === 'app'
+  const jwt = buildAppJwt(identity);
+  const response = await doFetch(`${apiBaseUrl}/app`, {
+    headers: {
+      accept: 'application/vnd.github+json',
+      authorization: `Bearer ${jwt}`,
+      'user-agent': 'bdc-harness-service-auth',
+      'x-github-api-version': '2022-11-28',
+    },
+  });
+  if (!response.ok) throw new Error(`github_login_app_failed:${response.status}`);
+  const body = (await response.json()) as { slug?: unknown };
+  if (typeof body.slug !== 'string' || body.slug.length === 0) {
+    throw new Error('github_login_app_failed:invalid_response');
+  }
+  return `${body.slug}[bot]`;
 }
 
 export async function getServiceGitHubToken(

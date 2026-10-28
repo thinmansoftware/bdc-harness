@@ -173,4 +173,67 @@ describe('Test 4: 401 re-mints once then alerts', () => {
     expect(apiCalls).toBe(2); // one 401 + one retry, both 401
     expect(alerts).toEqual(['app-1-2']);
   });
+
+  it('mint throws on first use: alert sink is called once and the error propagates', async () => {
+    resetGitHubApiMeterForTests();
+    clearServiceGitHubTokenCache();
+    const alerts: string[] = [];
+    let mints = 0;
+    const fetchImpl = (async (url: string | URL | Request): Promise<Response> => {
+      if (String(url).includes('/access_tokens')) {
+        mints += 1;
+        throw new Error('mint_exploded');
+      }
+      throw new Error('api_should_not_be_called');
+    }) as typeof fetch;
+    await expect(
+      serviceGitHubFetch({
+        service: 'overseer',
+        url: 'https://api.github.com/user',
+        identity: appIdentity(),
+        fetch: fetchImpl,
+        alertSink: credential => {
+          alerts.push(credential);
+        },
+      })
+    ).rejects.toThrow('mint_exploded');
+    expect(mints).toBe(1);
+    expect(alerts).toEqual(['app-1-2']);
+  });
+
+  it('401 then retry mint throws: one alert, mint error propagates, no further API request', async () => {
+    resetGitHubApiMeterForTests();
+    clearServiceGitHubTokenCache();
+    const alerts: string[] = [];
+    let mints = 0;
+    let apiCalls = 0;
+    const fetchImpl = (async (url: string | URL | Request): Promise<Response> => {
+      if (String(url).includes('/access_tokens')) {
+        mints += 1;
+        if (mints === 1) {
+          return Response.json({
+            token: 'mint-1',
+            expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+          });
+        }
+        throw new Error('mint_exploded');
+      }
+      apiCalls += 1;
+      return new Response('{}', { status: 401 });
+    }) as typeof fetch;
+    await expect(
+      serviceGitHubFetch({
+        service: 'overseer',
+        url: 'https://api.github.com/user',
+        identity: appIdentity(),
+        fetch: fetchImpl,
+        alertSink: credential => {
+          alerts.push(credential);
+        },
+      })
+    ).rejects.toThrow('mint_exploded');
+    expect(alerts).toEqual(['app-1-2']);
+    expect(mints).toBe(2);
+    expect(apiCalls).toBe(1);
+  });
 });

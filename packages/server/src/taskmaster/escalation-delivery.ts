@@ -27,9 +27,10 @@
  * Taskmaster escalation comment on that issue.
  *
  * MARKER TRUST. The marker is public text, so a marker comment counts only
- * when its author is the login Taskmaster posts as (deps.posterLogin; the real
- * deps resolve it once with GET /user using the same token that posts). A
- * copied marker from anyone else is ignored and cannot suppress or delay an
+ * when its author is the login Taskmaster posts as (deps.posterLogin). Real
+ * deps resolve an App identity once via GET /app with an App JWT (the acting
+ * login is "<slug>[bot]") and resolve a PAT or an injected token via GET /user.
+ * A copied marker from anyone else is ignored and cannot suppress or delay an
  * escalation.
  */
 import { createLogger } from '@archon/paths';
@@ -37,6 +38,7 @@ import type { IDatabase } from '@archon/core/db/adapters/types';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
   getServiceGitHubToken,
+  resolveGitHubActingLogin,
   resolveServiceGitHubAuth,
 } from '@archon/core/github/service-identity';
 
@@ -526,15 +528,36 @@ function toEscalationComment(raw: unknown): EscalationIssueComment {
 }
 
 /**
- * The login the token authenticates as (GET /user), cached per token for the
- * life of the deps object so the lookup costs one call, not one per
- * escalation. A failed lookup is not cached; it throws, so the escalation
- * fails this tick and is retried rather than trusting or distrusting markers
- * blindly.
+ * The login Taskmaster posts as, cached for the life of the deps object so the
+ * lookup costs one call, not one per escalation. An App identity is named via
+ * GET /app (App JWT) and cached by pool id. A PAT or an injected token
+ * (including explicit null) is named via GET /user and cached per token. A
+ * failed lookup is not cached; it throws, so the escalation fails this tick
+ * and is retried rather than trusting or distrusting markers blindly.
  */
 function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () => Promise<string> {
   let cached: { token: string | null; login: Promise<string> } | null = null;
+  const appLoginByPool = new Map<string, Promise<string>>();
   return async (): Promise<string> => {
+    // An explicit token, including null, keeps the injected GET /user path.
+    // Only the unresolved taskmaster identity may take the App GET /app path.
+    if (options.token === undefined) {
+      const identity = resolveServiceGitHubAuth('taskmaster');
+      if (identity.kind === 'app') {
+        const cachedLogin = appLoginByPool.get(identity.poolId);
+        if (cachedLogin) return cachedLogin;
+        const login = resolveGitHubActingLogin(identity, {
+          fetch: appPosterLoginFetch(options),
+          apiBaseUrl: GITHUB_API_ORIGIN,
+        });
+        appLoginByPool.set(identity.poolId, login);
+        login.catch(() => {
+          if (appLoginByPool.get(identity.poolId) === login) appLoginByPool.delete(identity.poolId);
+        });
+        return login;
+      }
+    }
+
     const token =
       options.token !== undefined
         ? options.token
@@ -555,6 +578,23 @@ function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () =
     });
     return login;
   };
+}
+
+/** Adapt the escalation fetch to standard fetch and bound the GET /app call. */
+function appPosterLoginFetch(options: RealEscalationDeliveryOptions): typeof fetch {
+  const fetchImpl: FetchLike =
+    options.fetchImpl ?? ((input, init): Promise<Response> => fetch(input, init));
+  const adapted = (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url =
+      typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    return fetchImpl(url, {
+      ...init,
+      signal: AbortSignal.timeout(githubTimeoutMs()),
+    });
+  };
+  // Bun's fetch type also carries fetch.preconnect. The login lookup only
+  // performs GET /app, so the extra method is forwarded unchanged.
+  return Object.assign(adapted, { preconnect: fetch.preconnect });
 }
 
 /**
