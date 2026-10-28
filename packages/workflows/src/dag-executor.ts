@@ -3356,7 +3356,11 @@ function readProcComm(pid: number): string {
   }
 }
 
-/** Non-zombie processes whose /proc stat pgrp equals pgid. */
+/**
+ * Every /proc process whose stat pgrp equals pgid, including zombies.
+ * T2 retires and reports a group over every process that still has that pgrp.
+ * An empty state is an unreadable stat line, not an absent member.
+ */
 function listGroupMembers(pgid: number): TeardownSurvivor[] {
   let entries: string[] = [];
   try {
@@ -3378,7 +3382,7 @@ function listGroupMembers(pgid: number): TeardownSurvivor[] {
     const fields = after.split(/\s+/);
     const state = fields[0] ?? '';
     const pgrp = Number(fields[2]);
-    if (pgrp !== pgid || state === 'Z' || state === '') continue;
+    if (pgrp !== pgid || state === '') continue;
     members.push({ pid, comm: readProcComm(pid) });
   }
   return members;

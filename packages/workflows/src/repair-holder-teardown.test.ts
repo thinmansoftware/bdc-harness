@@ -1616,6 +1616,32 @@ describe.serial('repair holder teardown', () => {
     expect(again.survivors).toEqual([{ pid: 4242, comm: 'sleep' }]);
   }, 20000);
 
+  it('zombie_descendant_is_named: a surviving zombie is its own pid and comm', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'rht-zombie-'));
+    roots.push(dir);
+    const procRoot = join(dir, 'proc');
+    const pidDir = join(procRoot, '5151');
+    mkdirSync(pidDir, { recursive: true });
+    writeFileSync(
+      join(pidDir, 'stat'),
+      '5151 (worker) Z 4242 4242 4242 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100\n'
+    );
+    writeFileSync(join(pidDir, 'comm'), 'worker\n');
+    setTeardownProcRootForTests(procRoot);
+    recordOwnedProcessGroupForTests('run-zombie', 4242);
+    setProcessGroupControlForTests({
+      signal() {
+        return false;
+      },
+      groupExists() {
+        return true;
+      },
+    });
+    const report = await endRunProcessTree('run-zombie', dir);
+    expect(report.confirmedAt).toBeNull();
+    expect(report.survivors).toEqual([{ pid: 5151, comm: 'worker' }]);
+  });
+
   it('unverifiable_platform_fails_closed: win32 and unreadable proc do not confirm', async () => {
     const assertUnverifiable = async (label: string): Promise<void> => {
       const dir = mkdtempSync(join(tmpdir(), `rht-unver-${label}-`));
