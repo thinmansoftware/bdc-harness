@@ -22,6 +22,7 @@ import { bindingUsedPercent, resolveEntryThreshold } from '@archon/smart-cauldro
 import {
   assessDispatchRecipient,
   createAuthenticatedMessage,
+  disposeMessageByMachine,
   getMessage,
   listMessages,
   type CreateAuthenticatedMessageData,
@@ -30,11 +31,18 @@ import {
 } from '@archon/core/db/dispatch';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
 import {
+  parseRemediationCandidateBody,
+  REMEDIATION_RECIPIENT,
+  type RemediationCandidateBody,
+} from '@archon/overseer/remediation-candidate';
+import {
   adoptionContentHash,
   classifyThread,
   computeBlockerReport,
   computeNextAction,
+  computeRemediationNudge,
   isSuppressedByNoise,
+  MAX_INTERVENTIONS_PER_ITEM_24H,
   type ActionProposal,
   type ThreadSnapshot,
   type ThreadPriority,
@@ -227,6 +235,22 @@ export interface TaskmasterDeps {
   db?: TaskmasterDal;
   createTask?: typeof createAuthenticatedMessage;
   listUndeliveredRulings?: () => Promise<ThreadSnapshot[]>;
+  /**
+   * Overseer remediation candidates queued for Taskmaster
+   * (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01): queued, not-yet-consumed
+   * `run_review` dispatch rows addressed to 'taskmaster' whose body parses as an
+   * `overseer_remediation_candidate`. Defaults to defaultListRemediationCandidates.
+   */
+  listRemediationCandidates?: () => Promise<RemediationCandidate[]>;
+  /**
+   * Mark a consumed candidate row so the reader stops returning it. Defaults to
+   * disposing the queued row by machine (route_disposition='expired'): the
+   * 'taskmaster' principal is worker_poll, so the drain_on_start/notify_only
+   * mailbox lifecycle (acknowledgeMessage/addressMessage) does not apply to it;
+   * machine disposal is the correct system-actor consumption signal and still
+   * leaves the row counted by the producer's attempt cap.
+   */
+  consumeRemediationCandidate?: (id: string) => Promise<void>;
   listThreads?: () => Promise<ThreadSnapshot[] | ListedThreadResult>;
   headroom?: () => Promise<HeadroomReading>;
   /** External-SOR check: does a dispatch row exist for this key, and when was it sent? */
@@ -339,6 +363,137 @@ async function defaultListUndeliveredRulings(): Promise<ThreadSnapshot[]> {
     }));
 }
 
+/** One Overseer remediation candidate: the dispatch row id plus its parsed body. */
+export interface RemediationCandidate {
+  id: string;
+  body: RemediationCandidateBody;
+}
+
+/**
+ * Queued Overseer remediation candidates for Taskmaster
+ * (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01).
+ *
+ * Lists queued `run_review` rows addressed to the remediation recipient
+ * ('taskmaster') and keeps only those whose body parses as an
+ * `overseer_remediation_candidate` via the producer's own parser. A row that
+ * does not parse, or carries another kind, is ignored with one log line and
+ * NEVER throws the tick. `status: 'queued'` excludes machine-ADDRESSED (disposed)
+ * rows -- the queued read adds `route_disposition IS NULL` -- so a candidate whose
+ * two-phase lifecycle has reached the address phase is not returned again. The
+ * `acknowledged_at IS NULL` filter below matches the spec's "queued, UNACKNOWLEDGED
+ * rows" wording and mirrors defaultListUndeliveredRulings; taskmaster is worker_poll
+ * and never sets acknowledged_at on its own rows, so it is a no-op in practice that
+ * keeps the reader honest if that ever changes.
+ */
+function isQueuedRemediationEnvelope(message: DispatchMessage | null): message is DispatchMessage {
+  return (
+    message !== null &&
+    message.recipient === REMEDIATION_RECIPIENT &&
+    message.status === 'queued' &&
+    message.task_type === 'run_review' &&
+    message.acknowledged_at === null &&
+    message.addressed_at === null &&
+    message.route_disposition === null
+  );
+}
+
+export async function defaultListRemediationCandidates(
+  listFn: typeof listMessages = listMessages
+): Promise<RemediationCandidate[]> {
+  const queued: DispatchMessage[] = await listFn({
+    recipient: REMEDIATION_RECIPIENT,
+    status: 'queued',
+    limit: 200,
+  });
+  const candidates: RemediationCandidate[] = [];
+  for (const message of queued) {
+    if (!isQueuedRemediationEnvelope(message)) continue;
+    const body = parseRemediationCandidateBody(message.body);
+    if (!body) {
+      log.warn({ messageId: message.id }, 'taskmaster.remediation_candidate_ignored');
+      continue;
+    }
+    candidates.push({ id: message.id, body });
+  }
+  return candidates;
+}
+
+export interface RemediationConsumptionDeps {
+  getMessage?: typeof getMessage;
+  listMessages?: typeof listMessages;
+  disposeMessageByMachine?: typeof disposeMessageByMachine;
+}
+
+/** Existing two-phase lifecycle, injectable without changing dispatch authority. */
+export async function defaultConsumeRemediationCandidate(
+  id: string,
+  deps: RemediationConsumptionDeps = {}
+): Promise<void> {
+  const read = deps.getMessage ?? getMessage;
+  const list = deps.listMessages ?? listMessages;
+  const dispose = deps.disposeMessageByMachine ?? disposeMessageByMachine;
+  // Two-phase candidate lifecycle (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01).
+  //
+  // taskmaster is a worker_poll principal, so the drain_on_start/notify_only
+  // acknowledge/address mailbox calls (acknowledgeMessage / addressMessage)
+  // reject its OWN rows. The take-up ACKNOWLEDGEMENT is therefore the nudge's
+  // tm_journal 'sent' row under this proposal's idempotency key: that row -- not
+  // a dispatch-row mutation -- is what stops the candidate re-sending every tick
+  // (the same mechanism the deliver_ruling reminder relies on; it never re-fires
+  // once journaled). The dispatch row itself is only ADDRESSED -- terminally
+  // disposed -- once it can no longer yield a fresh nudge: the attempt cap is
+  // reached, or a newer candidate for the same PR (the owner's new reviewed
+  // head) has superseded it. Until one of those holds the row is deliberately
+  // left live and unaddressed so a new head can still arrive, exactly as the
+  // spec requires. Disposing on the first successful send (the prior behavior)
+  // was a terminal one-phase disposal that both mislabeled a just-delivered
+  // candidate 'expired' and killed a still-usable attempt slot before its head
+  // could change.
+  const row = await read(id);
+  if (!isQueuedRemediationEnvelope(row)) return;
+  const body = parseRemediationCandidateBody(row.body);
+  if (!body) return;
+  const capReached = body.attempt >= body.maxAttempts;
+  let superseded = false;
+  if (!capReached) {
+    const siblings = await list({
+      recipient: REMEDIATION_RECIPIENT,
+      status: 'queued',
+      limit: 200,
+    });
+    superseded = siblings.some(sibling => {
+      if (sibling.id === id || !isQueuedRemediationEnvelope(sibling)) return false;
+      const other = parseRemediationCandidateBody(sibling.body);
+      return (
+        other !== null &&
+        other.owner.toLowerCase() === body.owner.toLowerCase() &&
+        other.repo.toLowerCase() === body.repo.toLowerCase() &&
+        other.prNumber === body.prNumber &&
+        other.attempt > body.attempt
+      );
+    });
+  }
+  // ACKNOWLEDGE phase only: the nudge is sent and journaled, but a fresh head
+  // could still arrive, so leave the row live (unaddressed).
+  if (!capReached && !superseded) return;
+  // ADDRESS phase: no further nudge can come from this row. Dispose it. A row a
+  // racing tick already disposed is a success here, not a warning.
+  const current = await read(id);
+  if (!isQueuedRemediationEnvelope(current) || current.body !== row.body) return;
+  const result = await dispose({
+    id,
+    actor: 'system:taskmaster-remediation',
+    disposition: 'expired',
+    requireNoReceipt: true,
+  });
+  if (!result.ok && result.reason !== 'already_disposed') {
+    log.warn(
+      { messageId: id, reason: result.reason },
+      'taskmaster.remediation_candidate_dispose_failed'
+    );
+  }
+}
+
 export function priorityFromLabels(labels: string[]): ThreadPriority | null {
   for (const p of ['P0', 'P1', 'P2', 'P3'] as const) {
     if (
@@ -440,6 +595,7 @@ export const TM_REPEAT_REASON_BY_TYPE: Record<TmActionType, string> = {
   digest: 'tm:digest:repeated',
   fire_cauldron: 'tm:fire_cauldron:repeated',
   blocker_report: 'tm:blocker_report:repeated',
+  remediation_nudge: 'tm:remediation_nudge:repeated',
 };
 
 /** Listed work-SOR thread with optional adoption fields carried from the issue payload. */
@@ -1447,6 +1603,9 @@ function proofPredicate(proposal: ActionProposal): string {
   if (proposal.type === 'blocker_report') {
     return 'blocker report delivery only; relayed to xo by the Duty Officer clock; never qualifies as an SC7 useful action';
   }
+  if (proposal.type === 'remediation_nudge') {
+    return 'owner pushes a new head to the rejected PR, or the PR is closed, before the proof deadline';
+  }
   return 'digest delivery only; never qualifies as an SC7 useful action';
 }
 
@@ -1669,6 +1828,10 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
   }
   const createTask = deps.createTask ?? createAuthenticatedMessage;
+  const listRemediationCandidates =
+    deps.listRemediationCandidates ?? defaultListRemediationCandidates;
+  const consumeRemediationCandidate =
+    deps.consumeRemediationCandidate ?? defaultConsumeRemediationCandidate;
   const findEffect = deps.findEffectByIdempotencyKey ?? defaultFindEffectByIdempotencyKey;
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
   const assessRecipient = deps.assessDispatchRecipient ?? assessDispatchRecipient;
@@ -1939,6 +2102,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
   let rulings: ThreadSnapshot[] = [];
   let threads: ThreadSnapshot[] = [];
+  let remediationCandidates: RemediationCandidate[] = [];
   let unlabelledPriorityTriage: string[] = [];
   let threadsReadSucceeded = false;
   try {
@@ -1946,6 +2110,12 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   } catch (error) {
     tickFailures += 1;
     log.warn({ err: error as Error }, 'taskmaster.rulings_read_failed');
+  }
+  try {
+    remediationCandidates = await listRemediationCandidates();
+  } catch (error) {
+    tickFailures += 1;
+    log.warn({ err: error as Error }, 'taskmaster.remediation_candidates_read_failed');
   }
   try {
     const listed = await (deps.listThreads ?? defaultListThreads)();
@@ -2109,6 +2279,26 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
   }
 
+  // Overseer remediation candidates (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01).
+  // Each candidate becomes ONE proposal pushed into the SAME proposals array, so
+  // it is subject to the existing pause / per-item cap / guard / journal / send
+  // pipeline. The owner thread is resolved by matching the candidate's woId
+  // against the already-fetched open threads (the same WO_ID_RE match the nudge
+  // and PR-claim lookups use); no woId or no match becomes an operator escalation.
+  // Taskmaster nudges the owner -- it never fires a builder or creates work.
+  for (const candidate of remediationCandidates) {
+    const matched =
+      candidate.body.woId !== null
+        ? threads.find(thread => {
+            const title = (thread as ListedThread).title;
+            return typeof title === 'string' && title.match(WO_ID_RE)?.[0] === candidate.body.woId;
+          })
+        : undefined;
+    const proposal = computeRemediationNudge(candidate.body, { thread: matched });
+    proposal.remediationCandidateId = candidate.id;
+    proposals.push(proposal);
+  }
+
   if (
     laneDecision.holding &&
     (state.lastHoldMonitorTick === null || state.tickIndex - state.lastHoldMonitorTick >= 96)
@@ -2156,6 +2346,9 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   const proposalRank = (proposal: ActionProposal): number => {
     if (proposal.type === 'deliver_ruling') return 0;
     if (proposal.type === 'escalate_p0') return 1;
+    // A remediation nudge chases a rejected PR; it acts immediately, like
+    // deliver_ruling / escalate_p0, so it ranks with the exception classes.
+    if (proposal.type === 'remediation_nudge') return 1;
     if (proposal.type === 'fire_cauldron') {
       return 2 + priorityRank[priorityByRef.get(proposal.threadRef) ?? 'P3'];
     }
@@ -2177,9 +2370,6 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
   for (const proposal of proposals) {
     const canonicalProposalRef = canonicalizeThreadRef(proposal.threadRef);
-    if (proposal.type === 'escalate_p0' && recentEscalateP0ByThread.has(canonicalProposalRef)) {
-      continue;
-    }
     let existingAction =
       actionsByKey.get(proposal.idempotencyKey) ??
       (await dal.getActionByIdempotencyKey(proposal.idempotencyKey));
@@ -2200,6 +2390,29 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       existingAction &&
       ['sent', 'pending', 'rejected', 'expired', 'parked'].includes(existingAction.outcome)
     ) {
+      // Reconcile the remediation candidate lifecycle BEFORE this terminal dedupe
+      // skip (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01). A prior tick may have
+      // sent the nudge (journal 'sent') yet failed to dispose the candidate row;
+      // without this, the 'sent' dedupe would `continue` every subsequent tick and
+      // the consume path at the send site would never run again, leaving the
+      // dispatch row queued forever. Re-run the idempotent consume so the candidate
+      // is still addressed once the cap is reached or a new head supersedes it.
+      // Best-effort: a consume failure is logged and never turns a dedupe-skip into
+      // a tick failure.
+      if (existingAction.outcome === 'sent' && proposal.remediationCandidateId) {
+        try {
+          await consumeRemediationCandidate(proposal.remediationCandidateId);
+        } catch (reconcileError) {
+          log.warn(
+            { err: reconcileError as Error, messageId: proposal.remediationCandidateId },
+            'taskmaster.remediation_candidate_reconcile_failed'
+          );
+        }
+      }
+      continue;
+    }
+    // Backoff withholds new sends, not cleanup of already-confirmed delivery.
+    if (proposal.type === 'escalate_p0' && recentEscalateP0ByThread.has(canonicalProposalRef)) {
       continue;
     }
     if (existingAction && ['failed', 'deferred'].includes(existingAction.outcome)) {
@@ -2259,11 +2472,36 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     // digest alive so watching never goes dark.
     if (
       control.pause_state !== 'RUNNING' &&
-      !isPauseEffectsExempt(
-        proposal.type === 'digest' ? 'canary' : proposal.type,
-        control.pause_scope
-      )
+      (Boolean(proposal.remediationCandidateId) ||
+        !isPauseEffectsExempt(
+          proposal.type === 'digest' ? 'canary' : proposal.type,
+          control.pause_scope
+        ))
     ) {
+      // Every candidate-bearing proposal's idempotency key has no time bucket (one key per
+      // PR/attempt/head), so a sticky 'parked' row under that key would make the
+      // first-skip branch drop it forever and no post-resume tick could ever
+      // deliver it. Record it as a retryable 'deferred' (with a proof deadline)
+      // instead, which the second-skip retry path reuses when the loop resumes.
+      // The candidate dispatch row is left unconsumed, so a later tick re-reads
+      // it. Noncandidate proposals keep their existing pause behavior.
+      if (proposal.remediationCandidateId) {
+        result.deferred += 1;
+        if (!existingAction) {
+          existingAction = await dal.recordAction({
+            thread_ref: proposal.threadRef,
+            action_type: proposal.type,
+            proposal_json: JSON.stringify({ ...proposal, deferred: true, reason: 'paused' }),
+            idempotency_key: proposal.idempotencyKey,
+            before_hash: sha256(proposal.body),
+            proof_predicate: proofPredicate(proposal),
+            proof_deadline_at: new Date(nowMs + PROOF_DEADLINE_MS).toISOString(),
+            outcome: 'deferred',
+          });
+          actionsByKey.set(proposal.idempotencyKey, existingAction);
+        }
+        continue;
+      }
       result.parked += 1;
       await dal.recordAction({
         thread_ref: proposal.threadRef,
@@ -2283,6 +2521,17 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       (proposal.type === 'fire_cauldron' && firesThisTick >= MAX_FIRES_PER_TICK) ||
       (proposal.type === 'blocker_report' &&
         blockerReportsThisTick >= MAX_BLOCKER_REPORTS_PER_TICK) ||
+      // Lane/budget and per-item gates for a remediation nudge. Per the spec the
+      // existing gates apply unchanged: when the fire lanes are holding
+      // (laneDecision.holding -- all lanes degraded/unavailable or over threshold)
+      // or the owner thread already carries MAX_INTERVENTIONS_PER_ITEM_24H sends in
+      // the last 24h, nothing is sent. The refusal is recorded 'deferred' (retryable)
+      // and the candidate dispatch row is left unconsumed, so a later tick with lanes
+      // available and headroom under the cap can still deliver it.
+      (proposal.type === 'remediation_nudge' &&
+        (laneDecision.holding ||
+          (interventions24hByThread.get(proposal.threadRef) ?? 0) >=
+            MAX_INTERVENTIONS_PER_ITEM_24H)) ||
       touchedThisTick.has(proposal.threadRef)
     ) {
       result.deferred += 1;
@@ -2332,11 +2581,28 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     const fresh = await dal.getPauseState();
     const freshPauseWithhold =
       fresh.pause_state !== 'RUNNING' &&
-      !isPauseEffectsExempt(
-        proposal.type === 'digest' ? 'canary' : proposal.type,
-        fresh.pause_scope
-      );
+      (Boolean(proposal.remediationCandidateId) ||
+        !isPauseEffectsExempt(
+          proposal.type === 'digest' ? 'canary' : proposal.type,
+          fresh.pause_scope
+        ));
     if (fresh.epoch !== epoch || freshPauseWithhold) {
+      // No outbound effect started: retain this stable candidate key for a
+      // fresh gated tick, under its original proof deadline.
+      if (proposal.remediationCandidateId) {
+        result.deferred += 1;
+        await dal.updateActionOutcome(
+          journalRow.id,
+          'deferred',
+          JSON.stringify({
+            ...JSON.parse(journalRow.proposal_json),
+            deferred: true,
+            reason: freshPauseWithhold ? 'paused' : 'epoch-changed',
+          })
+        );
+        journalRow.outcome = 'deferred';
+        continue;
+      }
       // A pause that landed mid-tick (fresh scope withholds this effect) is a
       // pause-park, not an ordinary stale-epoch/resume expiry: re-tag the
       // ROW-FIRST row as parked with reason='paused' so it is indistinguishable
@@ -2640,6 +2906,20 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
       if (proposal.type === 'blocker_report') blockerReportsThisTick += 1;
+      // Mark the consumed remediation candidate so a later tick does not re-read
+      // it. Best-effort and isolated: a consume failure is logged but must not
+      // turn a successful send into a 'failed' outcome (the tm_journal 'sent' row
+      // under this proposal's idempotency key already prevents a second send).
+      if (proposal.remediationCandidateId) {
+        try {
+          await consumeRemediationCandidate(proposal.remediationCandidateId);
+        } catch (consumeError) {
+          log.warn(
+            { err: consumeError as Error, messageId: proposal.remediationCandidateId },
+            'taskmaster.remediation_candidate_consume_failed'
+          );
+        }
+      }
       log.info(
         {
           actionType: proposal.type,
