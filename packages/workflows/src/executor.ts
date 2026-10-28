@@ -33,10 +33,14 @@ import {
   getSeatCutoff,
   getSeatUsageReader,
   seatsForBindings,
+  seatsForGateScope,
   unknownSeatReading,
+  type SeatGateScope,
   type SeatId,
   type SeatReading,
 } from './reliability/seat-usage';
+import { resolveWorkflowNodeProviders } from './reliability/resolve-binding';
+import { selectQuotaExhaustionRoute } from './node-failover';
 import {
   renderCanaryProbeRed,
   renderCanaryProbeWarn,
@@ -1128,11 +1132,41 @@ export async function executeWorkflow(
     }
 
     // Seat gate: always on (John Ranson, 2026-09-24). There is no off switch.
+    // Lane-scoped (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01): the lane's
+    // own seat refuses; a seat bound only by reviewer nodes refuses only when
+    // those nodes have no failover target with headroom.
+    const failoverDefaults = {
+      failoverProvider: executableWorkflow.failover_provider,
+      failoverModel: executableWorkflow.failover_model,
+    };
+    const seatScope: SeatGateScope = {
+      laneProvider: writtenProvider,
+      nodes: resolveWorkflowNodeProviders({
+        workflow: executableWorkflow,
+        workflowProvider: writtenProvider,
+        workflowModel: resolvedModel,
+        config,
+        modelOverride,
+      }).map(({ node, providerId }) => {
+        const route = selectQuotaExhaustionRoute(providerId, node, failoverDefaults);
+        return {
+          nodeId: node.id,
+          providerId,
+          ...(route.kind === 'failover' ? { failoverProvider: route.provider } : {}),
+        };
+      }),
+    };
+    const laneName = executableWorkflow.name;
     const seatIds = seatsForBindings(probeDecision.bindings);
     if (seatIds.length > 0) {
-      const readings = await readBoundSeats(seatIds);
+      const readings = await readBoundSeats(seatsForGateScope(probeDecision.bindings, seatScope));
       const cutoff = getSeatCutoff();
-      const seatDecision = decideSeatGate(probeDecision.bindings, readings, cutoff.percent);
+      const seatDecision = decideSeatGate(
+        probeDecision.bindings,
+        readings,
+        cutoff.percent,
+        seatScope
+      );
       // UNKNOWN never refuses on its own (a broken probe must not stop all
       // work), and it is never silent either: log + alert for every bound
       // seat that could not be measured, regardless of whether ANOTHER seat
@@ -1153,8 +1187,39 @@ export async function executeWorkflow(
           workflowRunId: workflowRun.id,
         });
       }
+      for (const detail of seatDecision.onCredits ?? []) {
+        getLog().warn(
+          {
+            workflowName: laneName,
+            workflowRunId: workflowRun.id,
+            lane: laneName,
+            detail,
+            cutoffPercent: cutoff.percent,
+          },
+          'workflow.seat_usage_on_credits'
+        );
+      }
+      if (!seatDecision.refused) {
+        for (const degraded of seatDecision.degradedSeats ?? []) {
+          getLog().warn(
+            {
+              workflowName: laneName,
+              workflowRunId: workflowRun.id,
+              lane: laneName,
+              seat: degraded.seat,
+              window: degraded.window,
+              usedPercent: degraded.usedPercent,
+              cutoffPercent: degraded.cutoffPercent,
+              nodeIds: degraded.nodeIds,
+              failoverProviders: degraded.failoverProviders,
+            },
+            'workflow.seat_usage_node_degraded'
+          );
+        }
+      }
       if (seatDecision.refused) {
-        const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}`;
+        const role = seatDecision.role ?? 'lane';
+        const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}:lane=${laneName}:role=${role}`;
         getLog().warn(
           {
             workflowName: executableWorkflow.name,
@@ -1163,6 +1228,8 @@ export async function executeWorkflow(
             window: seatDecision.window,
             usedPercent: seatDecision.usedPercent,
             cutoffPercent: seatDecision.cutoffPercent,
+            lane: laneName,
+            role,
           },
           'workflow.seat_usage_refused'
         );
@@ -1173,6 +1240,8 @@ export async function executeWorkflow(
             data: {
               reason: 'seat_usage_refused',
               detail,
+              lane: laneName,
+              role,
             },
           })
           .catch((err: Error) => {

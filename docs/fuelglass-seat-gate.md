@@ -7,6 +7,11 @@ The harness reports each subscription seat's measured usage. It refuses to start
 - **Allowed range 1 to 95.** A cutoff above 95 would switch the gate off in effect, so the operator route and the env var both refuse it.
 - **UNKNOWN proceeds and alerts.** If a bound seat cannot be measured, the run proceeds (a broken probe must not stop all work). The harness logs `workflow.seat_usage_unknown` and sends an operator alert through Dispatch, at most once per seat per hour.
 
+- **The lane's own seat decides (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01).** The lane seat is the seat of the workflow-level provider the run was fired on. If the lane seat is at or above the cutoff the run is refused with `role=lane`. A seat bound only by individual nodes (for example a `codex-native-strict` reviewer node in a claude lane) does not refuse the run when every node on that seat declares an eligible failover target (`failover_provider`, checked with `selectQuotaExhaustionRoute`) whose seat is not measured at or above the cutoff. The run then proceeds and logs `workflow.seat_usage_node_degraded`. Otherwise it is refused with `role=node`, so a run is never dispatched into a certain mid-run quota failure.
+
+- **Codex purchased credits count as headroom (John Ranson, 2026-10-27).** The Codex reading carries the usage endpoint's top-level `credits` object (`has_credits`, `unlimited`, `overage_limit_reached`, `balance`). When `has_credits` is true, `overage_limit_reached` is not true and the request is still `allowed`, Codex keeps billing credits past the window, so the gate does not refuse on the codex seat even at or above the cutoff. It logs `workflow.seat_usage_on_credits` with detail `codex:on_credits`, and the decision carries `onCredits: ["codex:on_credits"]`. With `has_credits` false the gate refuses as before.
+- **Reviewer failover on the claude and fable lanes.** The `codex-native-strict` reviewer nodes (`diff-review`, `diff-review-final`, `opus-rereview`, `apply-diff-review-final`) declare `failover_provider: openrouter`, `failover_model: moonshotai/kimi-k3.1-pro`, `failover_agent: opr-adversarial-reviewer` (John Ranson 2026-10-27). They never fail over to Claude (ruling D0, M-20261021c). `openrouter` is not a gated seat, so with Codex over the cutoff and no credits these lanes proceed in degraded mode.
+
 This supersedes the M-171 rules "default cutoff 100" and "UNKNOWN never refuses and only logs" for this gate.
 
 Operator routes require the operator token (`x-archon-operator-token`), the same as other `/api/*` routes.
@@ -139,8 +144,14 @@ ssh hetzner-prod "TOKEN=\$(docker exec archon-app-1 printenv ARCHON_OPERATOR_TOK
 
 ## Logs and events
 
-Refusal log: `workflow.seat_usage_refused` with `seat`, `window`, `usedPercent` and `cutoffPercent`.
+Refusal log: `workflow.seat_usage_refused` with `seat`, `window`, `usedPercent`, `cutoffPercent`, `lane` (the workflow name) and `role` (`lane` or `node`).
+
+Degraded log: `workflow.seat_usage_node_degraded` with `lane`, `seat`, `window`, `usedPercent`, `cutoffPercent`, `nodeIds` and `failoverProviders`. The run continues.
 
 Unknown log: `workflow.seat_usage_unknown` with `seat` and `note`. The run continues and the operator alert above is sent.
 
-Workflow event: `dag_workflow_failed` with `data.reason` `seat_usage_refused` and `data.detail` `seat_usage_refused:<seat>:<window>:<usedPercent>:<cutoffPercent>`.
+Workflow event: `dag_workflow_failed` with `data.reason` `seat_usage_refused`, `data.lane`, `data.role` and `data.detail` `seat_usage_refused:<seat>:<window>:<usedPercent>:<cutoffPercent>:lane=<workflow name>:role=<lane|node>`. The prefix up to `cutoffPercent` is unchanged, so prefix matchers keep working. Example: `seat_usage_refused:codex:primary:96:90:lane=bdc-feature-development:role=node`.
+
+## Conductor climb rule
+
+The Smart Cauldron conductor (`packages/smart-cauldron/src/cascade.ts`) reads the same seats route, including `cutoff.percent`. A rung whose own seat (`seatForTier`) is measured at or above that cutoff is skipped during entry and during a climb, with a log line `Skipping tier "<tier>" during <entry|climb>: seat_over_cutoff:<seat>:<used>:<cutoff>`. An UNKNOWN seat, or an unknown cutoff, is never skipped on this basis. A pinned entry (`--entry`) is not skipped; the run-start gate decides it. A fired rung that the run-start gate refuses (run error `seat_usage_refused:...`) is recorded as `seat_refusal: <detail>` and climbs to the next rung with headroom. It is not a quality failure (no informed-climb context, no SPEC-REPAIR) and not a gate misfire.
