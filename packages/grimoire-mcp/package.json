@@ -1,0 +1,14 @@
+{
+  "name": "@archon/grimoire-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "bun test --timeout 30000 src/",
+    "type-check": "bun x tsc --noEmit"
+  },
+  "dependencies": {
+    "@archon/core": "workspace:*",
+    "@archon/overseer": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}
