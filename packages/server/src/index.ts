@@ -85,6 +85,12 @@ import {
 } from '@archon/workflows/reliability/seat-usage';
 import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
 import { createMergeManager } from '@archon/overseer/merge-manager';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
+import { registerGitHubCredentialAlertSink } from '@archon/core/github/credential-alerts';
+import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
 import { resolveDefaultDeps } from '@archon/overseer/service';
 import { ingestPullRequestEvent } from '@archon/overseer/pr-review-ingest';
 import { createRealIngestDeps, resolveReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
@@ -193,8 +199,13 @@ function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
-function startOverseerRuntimeWithRealMergeManager(): void {
-  const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
+async function startOverseerRuntimeWithRealMergeManager(): Promise<void> {
+  let token = '';
+  try {
+    token = await getServiceGitHubToken(resolveServiceGitHubAuth('overseer'));
+  } catch {
+    // The runtime retains its established disabled/fake behavior when auth is absent.
+  }
   const realAdapterRequested =
     !envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) && token.length > 0;
   if (!realAdapterRequested) {
@@ -210,6 +221,27 @@ function startOverseerRuntimeWithRealMergeManager(): void {
 
 export async function startServer(opts: ServerOptions = {}): Promise<void> {
   getLog().info('server_starting');
+
+  registerGitHubCredentialAlertSink(async alert => {
+    await createAuthenticatedMessage(
+      { kind: 'system', sender: 'dispatch' },
+      {
+        correlation_id: alert.subjectKey,
+        idempotency_key: `github-credential:${alert.subjectKey}:${Math.floor(Date.now() / (6 * 60 * 60_000))}`,
+        task_type: 'agent_message',
+        recipient: 'operator',
+        priority: 'blocker',
+        subject_key: alert.subjectKey,
+        body: JSON.stringify({
+          kind: 'github_credential_failure',
+          credential: alert.credential,
+          service: alert.service,
+          failure_class: alert.failureClass,
+          detail: alert.detail,
+        }),
+      }
+    );
+  });
 
   // Database auto-detected: SQLite (default) or PostgreSQL (if DATABASE_URL set)
   // No required environment variables - SQLite works out of the box
@@ -303,7 +335,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  startOverseerRuntimeWithRealMergeManager();
+  await startOverseerRuntimeWithRealMergeManager();
 
   const config = await loadConfig();
   logConfig(config);
@@ -372,7 +404,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     // Check that at least one platform is configured
     const hasTelegram = Boolean(process.env.TELEGRAM_BOT_TOKEN);
     const hasDiscord = Boolean(process.env.DISCORD_BOT_TOKEN);
-    const hasGitHub = Boolean(process.env.GITHUB_TOKEN && process.env.WEBHOOK_SECRET);
+    const githubToken = await getServiceGitHubToken(resolveServiceGitHubAuth('overseer')).catch(
+      () => ''
+    );
+    const hasGitHub = Boolean(githubToken && process.env.WEBHOOK_SECRET);
     const hasGitea = Boolean(
       process.env.GITEA_URL && process.env.GITEA_TOKEN && process.env.GITEA_WEBHOOK_SECRET
     );
@@ -383,15 +418,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     }
 
     // Initialize GitHub adapter (conditional)
-    if (process.env.GITHUB_TOKEN && process.env.WEBHOOK_SECRET) {
+    if (githubToken && process.env.WEBHOOK_SECRET) {
       const botMention =
         process.env.GITHUB_BOT_MENTION || process.env.BOT_DISPLAY_NAME || config.botName;
-      github = new GitHubAdapter(
-        process.env.GITHUB_TOKEN,
-        process.env.WEBHOOK_SECRET,
-        lockManager,
-        botMention
-      );
+      github = new GitHubAdapter(githubToken, process.env.WEBHOOK_SECRET, lockManager, botMention);
       await github.start();
       activePlatforms.push('GitHub');
     } else {

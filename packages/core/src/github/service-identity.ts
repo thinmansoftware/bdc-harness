@@ -1,5 +1,6 @@
 import { createPrivateKey, sign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { emitGitHubCredentialAlert } from './credential-alerts';
 
 export type GitHubService =
   | 'overseer'
@@ -165,6 +166,16 @@ export function resolveServiceGitHubAuth(
 }
 
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
+const tokenMints = new Map<string, Promise<string>>();
+const patWarningAt = new Map<GitHubService, number>();
+const TOKEN_REFRESH_WINDOW_MS = 10 * 60_000;
+const PAT_WARNING_INTERVAL_MS = 60 * 60_000;
+
+export function serviceGitHubCredentialName(identity: ServiceGitHubAuth): string {
+  if (identity.kind === 'app') return `${identity.service}-app`;
+  if (identity.kind === 'pat') return `${identity.service}-${identity.poolId}`;
+  return `${identity.service}-none`;
+}
 
 function base64Url(value: string | Uint8Array): string {
   return Buffer.from(value).toString('base64url');
@@ -194,37 +205,70 @@ export async function getServiceGitHubToken(
   identity: ServiceGitHubAuth,
   options: { fetch?: typeof fetch; apiBaseUrl?: string; now?: () => number } = {}
 ): Promise<string> {
-  if (identity.kind === 'pat') return identity.token;
+  if (identity.kind === 'pat') {
+    const now = (options.now ?? Date.now)();
+    const warnedAt = patWarningAt.get(identity.service);
+    if (warnedAt === undefined || now - warnedAt >= PAT_WARNING_INTERVAL_MS) {
+      patWarningAt.set(identity.service, now);
+      console.warn('github_legacy_pat_selected', { service: identity.service });
+    }
+    return identity.token;
+  }
   if (identity.kind === 'none') throw new Error('github_merge_identity_not_distinct');
   const now = (options.now ?? Date.now)();
   const cached = tokenCache.get(identity.poolId);
-  if (cached && cached.expiresAt - now > 5 * 60_000) return cached.token;
+  if (cached && cached.expiresAt - now > TOKEN_REFRESH_WINDOW_MS) return cached.token;
+  const existing = tokenMints.get(identity.poolId);
+  if (existing) return existing;
 
-  const jwt = buildAppJwt(identity, now);
-  const response = await (options.fetch ?? fetch)(
-    `${options.apiBaseUrl ?? 'https://api.github.com'}/app/installations/${identity.installationId}/access_tokens`,
-    {
-      method: 'POST',
-      headers: {
-        accept: 'application/vnd.github+json',
-        authorization: `Bearer ${jwt}`,
-        'user-agent': 'bdc-harness-service-auth',
-        'x-github-api-version': '2022-11-28',
-      },
+  const mint = (async (): Promise<string> => {
+    try {
+      const jwt = buildAppJwt(identity, now);
+      const response = await (options.fetch ?? fetch)(
+        `${options.apiBaseUrl ?? 'https://api.github.com'}/app/installations/${identity.installationId}/access_tokens`,
+        {
+          method: 'POST',
+          headers: {
+            accept: 'application/vnd.github+json',
+            authorization: `Bearer ${jwt}`,
+            'user-agent': 'bdc-harness-service-auth',
+            'x-github-api-version': '2022-11-28',
+          },
+        }
+      );
+      if (!response.ok) throw new Error(`github_app_token_mint_failed:${response.status}`);
+      const body = (await response.json()) as { token?: unknown; expires_at?: unknown };
+      if (typeof body.token !== 'string') {
+        throw new Error('github_app_token_mint_failed:invalid_response');
+      }
+      const expiresAt =
+        typeof body.expires_at === 'string' ? Date.parse(body.expires_at) : now + 55 * 60_000;
+      tokenCache.set(identity.poolId, { token: body.token, expiresAt });
+      return body.token;
+    } catch (error) {
+      await emitGitHubCredentialAlert(
+        {
+          subjectKey: `credential:${serviceGitHubCredentialName(identity)}`,
+          credential: serviceGitHubCredentialName(identity),
+          service: identity.service,
+          failureClass: 'mint_failed',
+          detail: error instanceof Error ? error.message : 'github_app_token_mint_failed',
+        },
+        now
+      );
+      throw error;
+    } finally {
+      tokenMints.delete(identity.poolId);
     }
-  );
-  if (!response.ok) throw new Error(`github_app_token_mint_failed:${response.status}`);
-  const body = (await response.json()) as { token?: unknown; expires_at?: unknown };
-  if (typeof body.token !== 'string')
-    throw new Error('github_app_token_mint_failed:invalid_response');
-  const expiresAt =
-    typeof body.expires_at === 'string' ? Date.parse(body.expires_at) : now + 55 * 60_000;
-  tokenCache.set(identity.poolId, { token: body.token, expiresAt });
-  return body.token;
+  })();
+  tokenMints.set(identity.poolId, mint);
+  return mint;
 }
 
-export function clearServiceGitHubTokenCache(): void {
-  tokenCache.clear();
+export function clearServiceGitHubTokenCache(...args: [] | [poolId: string]): void {
+  const poolId = args[0];
+  if (poolId) tokenCache.delete(poolId);
+  else tokenCache.clear();
 }
 
 /** Preserve service selection and original permission fallback across a CLI shim. */
