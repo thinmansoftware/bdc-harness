@@ -3425,7 +3425,20 @@ nodes:
       fi
       if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
         REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
-        PR_URL=$(gh pr create --repo "$REPO" --head "$BR" --base "${BASE_BRANCH:-dev}" \
+        RECORDED_BASE_BRANCH="${RECORDED_BASE_BRANCH:-}"
+        ATTEMPTED_BASE="${BASE_BRANCH:-}"
+        if [ -z "$RECORDED_BASE_BRANCH" ]; then
+          echo "ERROR: recorded_base_branch_missing" >&2
+          exit 1
+        fi
+        if [ -n "$ATTEMPTED_BASE" ] && [ "$ATTEMPTED_BASE" != "$RECORDED_BASE_BRANCH" ]; then
+          echo "ERROR: base_branch_mismatch: recorded=${RECORDED_BASE_BRANCH} attempted=${ATTEMPTED_BASE}" >&2
+          exit 1
+        fi
+        if [ -z "$ATTEMPTED_BASE" ]; then
+          BASE_BRANCH="$RECORDED_BASE_BRANCH"
+        fi
+        PR_URL=$(gh pr create --repo "$REPO" --head "$BR" --base "$BASE_BRANCH" \
           --title "FALLBACK: opus-repaired build needs human review" \
           --body "FALLBACK PATH: a BLOCKED build was auto-repaired by opus-repair, but the non-interactive run could not reach a human approval gate. The repair commit is pushed here for human review instead of being stranded in the worktree. See run artifacts for the original block reason." \
           2>&1 | tail -1 || true)
@@ -4457,6 +4470,20 @@ nodes:
       else
         BASE_BRANCH=""
       fi
+      # WO-HARNESS-RUN-BRANCH-IDENTITY-01: refuse a PR whose base is not the
+      # base recorded for this run. Never retarget and never invent a default.
+      RECORDED_BASE_BRANCH="${RECORDED_BASE_BRANCH:-}"
+      if [ -z "$RECORDED_BASE_BRANCH" ]; then
+        echo "ERROR: recorded_base_branch_missing" >&2
+        exit 1
+      fi
+      if [ -n "$BASE_BRANCH" ] && [ "$BASE_BRANCH" != "$RECORDED_BASE_BRANCH" ]; then
+        echo "ERROR: base_branch_mismatch: recorded=${RECORDED_BASE_BRANCH} attempted=${BASE_BRANCH}" >&2
+        exit 1
+      fi
+      if [ -z "$BASE_BRANCH" ]; then
+        BASE_BRANCH="$RECORDED_BASE_BRANCH"
+      fi
       TITLE=$(printf '%s\n' "$PLAN_OUTPUT" | sed -n 's/^Commit message: //p' | head -n 1)
       if [ -z "$TITLE" ]; then
         TITLE="BDC feature Work Order implementation"
@@ -4533,7 +4560,7 @@ nodes:
         PR_OK=true
       else
         for attempt in 1 2 3; do
-          if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" ${BASE_BRANCH:+--base "$BASE_BRANCH"} 2>&1; then
+          if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" --base "$BASE_BRANCH" 2>&1; then
             PR_OK=true
             break
           fi
@@ -4558,7 +4585,7 @@ nodes:
         # branch + SHA survive in the run output even though the worktree is cleaned.
         echo "PR_CREATE_FAILED_BUT_BRANCH_SAFE: repo=${REPO} branch=${UNIQUE_BRANCH} sha=$(git rev-parse HEAD)" >&2
         echo "ERROR: gh pr create failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
-        echo "RECOVERY: open the PR manually -> gh pr create --repo ${REPO} --head ${UNIQUE_BRANCH} ${BASE_BRANCH:+--base ${BASE_BRANCH}}" >&2
+        echo "RECOVERY: open the PR manually -> gh pr create --repo ${REPO} --head ${UNIQUE_BRANCH} --base ${BASE_BRANCH}" >&2
         exit 1
       fi
 

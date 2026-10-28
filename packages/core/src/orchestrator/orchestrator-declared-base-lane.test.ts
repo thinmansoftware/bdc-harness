@@ -101,9 +101,10 @@ mock.module('@archon/isolation', () => ({
   getIsolationProvider: mock(() => ({})),
 }));
 
+const mockCreateWorkflowRun = mock(() => Promise.resolve({ id: 'run-1' }));
 mock.module('../workflows/store-adapter', () => ({
   createWorkflowDeps: mock(() => ({
-    store: { createWorkflowRun: mock(() => Promise.resolve({ id: 'run-1' })) },
+    store: { createWorkflowRun: mockCreateWorkflowRun },
     getAgentProvider: () => ({}),
     loadConfig: async () => ({}),
   })),
@@ -187,6 +188,7 @@ describe('dispatchBackgroundWorkflow declared base-lane authority', () => {
   beforeEach(() => {
     mockResolve.mockClear();
     mockFreeze.mockClear();
+    mockCreateWorkflowRun.mockClear();
     execFileCalls.length = 0;
     lsRemoteShouldFail = false;
     freezeWithSpec('no base here');
@@ -194,6 +196,26 @@ describe('dispatchBackgroundWorkflow declared base-lane authority', () => {
 
   test('declared "Base branch: release/ce" cuts the worker worktree from origin/release/ce', async () => {
     freezeWithSpec('# WO-X\n\nBase branch: release/ce\n\nBody...');
+    mockResolve.mockImplementationOnce(() =>
+      Promise.resolve({
+        status: 'resolved',
+        cwd: '/workspace/worker',
+        method: { type: 'created' },
+        env: {
+          id: 'env-1',
+          codebase_id: 'cb-1',
+          workflow_type: 'task',
+          workflow_id: 'worker',
+          provider: 'worktree',
+          working_path: '/workspace/worker',
+          branch_name: 'archon/thread-abc',
+          status: 'active',
+          created_at: new Date(),
+          created_by_platform: 'web',
+          metadata: {},
+        },
+      })
+    );
     // No parent hints at all: the declared base alone must drive a task worktree.
     const ctx = makeCtx({ isolationHints: undefined });
 
@@ -210,6 +232,15 @@ describe('dispatchBackgroundWorkflow declared base-lane authority', () => {
     expect(resolveArg.hints?.workflowType).toBe('task');
     expect(resolveArg.hints?.fromBranch).toBe('origin/release/ce');
     expect(String(resolveArg.hints?.workflowId)).toMatch(/^web-worker-/);
+
+    expect(mockCreateWorkflowRun).toHaveBeenCalledTimes(1);
+    const created = mockCreateWorkflowRun.mock.calls[0]?.[0] as {
+      metadata?: Record<string, unknown>;
+    };
+    expect(created.metadata?.base_branch).toBe('release/ce');
+    expect(typeof created.metadata?.base_branch).toBe('string');
+    expect(created.metadata?.head_branch).toBe('archon/thread-abc');
+    expect(typeof created.metadata?.head_branch).toBe('string');
   });
 
   test('declared base overrides a DIFFERENT inherited parent from-branch', async () => {
@@ -261,7 +292,8 @@ describe('dispatchBackgroundWorkflow declared base-lane authority', () => {
 
     await dispatchBackgroundWorkflow(ctx as never, makeWorkflow());
 
-    expect(execFileCalls.length).toBe(0);
+    expect(execFileCalls.some(call => call.args.includes('ls-remote'))).toBe(false);
+    expect(execFileCalls.some(call => call.file === 'gh')).toBe(true);
     const resolveArg = mockResolve.mock.calls[0][0] as { hints?: Record<string, unknown> };
     expect(resolveArg.hints?.workflowType).toBe('task');
     expect(resolveArg.hints?.fromBranch).toBe('origin/dev');
@@ -273,7 +305,8 @@ describe('dispatchBackgroundWorkflow declared base-lane authority', () => {
 
     await dispatchBackgroundWorkflow(ctx as never, makeWorkflow());
 
-    expect(execFileCalls.length).toBe(0);
+    expect(execFileCalls.some(call => call.args.includes('ls-remote'))).toBe(false);
+    expect(execFileCalls.some(call => call.file === 'gh')).toBe(true);
     const resolveArg = mockResolve.mock.calls[0][0] as { hints?: Record<string, unknown> };
     expect(resolveArg.hints?.workflowType).toBe('thread');
     expect(resolveArg.hints?.fromBranch).toBeUndefined();

@@ -3177,6 +3177,12 @@ async function executeNodeInternal(
 /** Default timeout for subprocess nodes (bash, script): 2 minutes */
 const SUBPROCESS_DEFAULT_TIMEOUT = 120_000;
 
+function recordedBaseBranchEnv(metadata: Record<string, unknown> | null | undefined): string {
+  const value = metadata?.base_branch;
+  if (typeof value !== 'string') return '';
+  return value.trim();
+}
+
 /**
  * Execute a bash (shell script) DAG node.
  * Runs the script via a temp file, captures stdout as node output.
@@ -3264,6 +3270,9 @@ async function executeBashNode(
     // recovery, and resolve-review-base all key off origin/$BASE_BRANCH, so a
     // lane-correct baseBranch here makes the whole tail lane-correct.
     BASE_BRANCH: baseBranch,
+    // Recorded run identity (WO-HARNESS-RUN-BRANCH-IDENTITY-01). Empty when the
+    // run has no base_branch, so open-pr fails closed instead of inventing one.
+    RECORDED_BASE_BRANCH: recordedBaseBranchEnv(workflowRun.metadata),
     // WORKFLOW_ID and WORKTREE_PATH as actual env vars (complement the $WORKFLOW_ID template token).
     WORKFLOW_ID: workflowRun.id,
     WORKTREE_PATH: cwd,
