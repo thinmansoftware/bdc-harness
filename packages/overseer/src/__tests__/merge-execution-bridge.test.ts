@@ -704,7 +704,7 @@ describe('merge execution bridge', () => {
     expect(await h.store.listUnactionedVerdicts()).toHaveLength(0);
   });
 
-  test('replay-promoted shopops master verdict is refused as integration_base_mismatch', async () => {
+  test('Test 5: production base shopops master is refused by the bridge', async () => {
     const h = harness(
       [verdict('shopops-master')],
       greenPr({
@@ -720,13 +720,20 @@ describe('merge execution bridge', () => {
       owner: 'thinmansoftware',
       repo: 'shopops',
     });
+
     await runMergeExecutionBridgeOnce({
       store: h.store,
       github: h.github,
       readPolicy: () => policy(),
     });
+
     expect(h.merges).toBe(0);
-    expect(h.outcomes[0]?.reason).toBe('integration_base_mismatch');
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({
+        mutationSent: false,
+        reason: 'integration_base_mismatch',
+      })
+    );
   });
 });
 
