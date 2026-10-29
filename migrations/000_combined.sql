@@ -631,7 +631,15 @@ VALUES
   ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', TRUE),
   ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE),
   ('duty-officer', 'Duty Officer', 'worker_poll', TRUE),
-  ('do', 'Duty Officer alias', 'worker_poll', TRUE)
+  ('do', 'Duty Officer alias', 'worker_poll', TRUE),
+  -- WO-HARNESS-COMPANION-MCP-MAILBOX-01 (migration 065): voice companion
+  -- mailboxes. grokbot is the enabled slot; dot, muse and duet stay inactive
+  -- until that companion is enabled by config. drain_on_start: no worker
+  -- claims this mail.
+  ('grokbot', 'Grok Bot (voice companion)', 'drain_on_start', TRUE),
+  ('dot', 'Dot (voice companion)', 'drain_on_start', FALSE),
+  ('muse', 'Muse (voice companion)', 'drain_on_start', FALSE),
+  ('duet', 'Duet (voice companion)', 'drain_on_start', FALSE)
 ON CONFLICT (principal_id) DO NOTHING;
 
 INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
