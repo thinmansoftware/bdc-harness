@@ -35,7 +35,10 @@
 import { createLogger } from '@archon/paths';
 import type { IDatabase } from '@archon/core/db/adapters/types';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
-import { githubToken } from '../dispatch/duty-officer-clock';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 
 const log = createLogger('taskmaster/escalation-delivery');
 
@@ -442,7 +445,10 @@ async function githubRequest(
   if (!url.startsWith(`${GITHUB_API_ORIGIN}/`)) {
     throw new Error('taskmaster_github_url_not_api_origin');
   }
-  const token = options.token !== undefined ? options.token : githubToken();
+  const token =
+    options.token !== undefined
+      ? options.token
+      : await getServiceGitHubToken(resolveServiceGitHubAuth('taskmaster'));
   if (!token) throw new Error('taskmaster_github_token_missing');
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
@@ -526,10 +532,9 @@ function toEscalationComment(raw: unknown): EscalationIssueComment {
  * blindly.
  */
 function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () => Promise<string> {
-  let cached: { token: string | null; login: Promise<string> } | null = null;
+  let cached: Promise<string> | null = null;
   return (): Promise<string> => {
-    const token = options.token !== undefined ? options.token : githubToken();
-    if (cached?.token === token) return cached.login;
+    if (cached) return cached;
     const login = (async (): Promise<string> => {
       const response = await githubRequest(`${GITHUB_API_ORIGIN}/user`, options);
       const user = (await response.json()) as { login?: unknown } | null;
@@ -539,9 +544,9 @@ function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () =
       }
       return value;
     })();
-    cached = { token, login };
+    cached = login;
     login.catch(() => {
-      if (cached?.login === login) cached = null;
+      if (cached === login) cached = null;
     });
     return login;
   };

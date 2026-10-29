@@ -1,3 +1,8 @@
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
+
 const BDC_OWNER = 'thinmansoftware';
 const BDC_XO_REPO = 'bdc-xo';
 const BDC_XO_REF = 'main';
@@ -30,7 +35,7 @@ export interface OwnerResolutionOctokitLike {
 let octokit: Promise<OwnerResolutionOctokitLike> | null = null;
 
 async function getOctokit(): Promise<OwnerResolutionOctokitLike> {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  const token = await getServiceGitHubToken(resolveServiceGitHubAuth('overseer'));
   octokit ??= import('@octokit/rest').then(
     module => new module.Octokit({ auth: token }) as unknown as OwnerResolutionOctokitLike
   );

@@ -165,6 +165,41 @@ export function resolveServiceGitHubAuth(
 }
 
 const tokenCache = new Map<string, { token: string; expiresAt: number }>();
+const tokenMints = new Map<string, Promise<string>>();
+const patWarnings = new Map<GitHubService, number>();
+let defaultMintFailureHandler: ServiceGitHubTokenOptions['onMintFailure'];
+
+export interface ServiceGitHubTokenOptions {
+  fetch?: typeof fetch;
+  apiBaseUrl?: string;
+  now?: () => number;
+  onMintFailure?: (identity: GitHubAppIdentity, error: unknown) => void | Promise<void>;
+}
+
+export function setServiceGitHubMintFailureHandler(
+  handler: ServiceGitHubTokenOptions['onMintFailure']
+): void {
+  defaultMintFailureHandler = handler;
+}
+
+/** Read a legacy PAT only inside the credential provider. */
+export function resolveLegacyGitHubToken(env: Env = process.env): string {
+  return (
+    env.GH_TOKEN ??
+    env.GITHUB_TOKEN ??
+    env.MERGE_MANAGER_GH_TOKEN ??
+    env.GH_AUTH_TOKEN_INTERNAL ??
+    ''
+  );
+}
+
+function warnPatFallback(identity: GitHubPatIdentity, now: number): void {
+  if (!identity.token) return;
+  const last = patWarnings.get(identity.service) ?? 0;
+  if (now - last < 60 * 60_000) return;
+  patWarnings.set(identity.service, now);
+  console.warn(`github_pat_fallback service=${identity.service}`);
+}
 
 function base64Url(value: string | Uint8Array): string {
   return Buffer.from(value).toString('base64url');
@@ -192,39 +227,59 @@ export function buildAppJwt(identity: GitHubAppIdentity, now: number = Date.now(
 
 export async function getServiceGitHubToken(
   identity: ServiceGitHubAuth,
-  options: { fetch?: typeof fetch; apiBaseUrl?: string; now?: () => number } = {}
+  options: ServiceGitHubTokenOptions = {}
 ): Promise<string> {
-  if (identity.kind === 'pat') return identity.token;
-  if (identity.kind === 'none') throw new Error('github_merge_identity_not_distinct');
   const now = (options.now ?? Date.now)();
+  if (identity.kind === 'pat') {
+    warnPatFallback(identity, now);
+    return identity.token;
+  }
+  if (identity.kind === 'none') throw new Error('github_merge_identity_not_distinct');
   const cached = tokenCache.get(identity.poolId);
-  if (cached && cached.expiresAt - now > 5 * 60_000) return cached.token;
+  if (cached && cached.expiresAt - now > 10 * 60_000) return cached.token;
+  const existing = tokenMints.get(identity.poolId);
+  if (existing) return existing;
 
-  const jwt = buildAppJwt(identity, now);
-  const response = await (options.fetch ?? fetch)(
-    `${options.apiBaseUrl ?? 'https://api.github.com'}/app/installations/${identity.installationId}/access_tokens`,
-    {
-      method: 'POST',
-      headers: {
-        accept: 'application/vnd.github+json',
-        authorization: `Bearer ${jwt}`,
-        'user-agent': 'bdc-harness-service-auth',
-        'x-github-api-version': '2022-11-28',
-      },
+  const mint = (async (): Promise<string> => {
+    try {
+      const jwt = buildAppJwt(identity, now);
+      const response = await (options.fetch ?? fetch)(
+        `${options.apiBaseUrl ?? 'https://api.github.com'}/app/installations/${identity.installationId}/access_tokens`,
+        {
+          method: 'POST',
+          headers: {
+            accept: 'application/vnd.github+json',
+            authorization: `Bearer ${jwt}`,
+            'user-agent': 'bdc-harness-service-auth',
+            'x-github-api-version': '2022-11-28',
+          },
+        }
+      );
+      if (!response.ok) throw new Error(`github_app_token_mint_failed:${response.status}`);
+      const body = (await response.json()) as { token?: unknown; expires_at?: unknown };
+      if (typeof body.token !== 'string')
+        throw new Error('github_app_token_mint_failed:invalid_response');
+      const expiresAt =
+        typeof body.expires_at === 'string' ? Date.parse(body.expires_at) : now + 55 * 60_000;
+      tokenCache.set(identity.poolId, { token: body.token, expiresAt });
+      return body.token;
+    } catch (error) {
+      await (options.onMintFailure ?? defaultMintFailureHandler)?.(identity, error);
+      throw error;
+    } finally {
+      tokenMints.delete(identity.poolId);
     }
-  );
-  if (!response.ok) throw new Error(`github_app_token_mint_failed:${response.status}`);
-  const body = (await response.json()) as { token?: unknown; expires_at?: unknown };
-  if (typeof body.token !== 'string')
-    throw new Error('github_app_token_mint_failed:invalid_response');
-  const expiresAt =
-    typeof body.expires_at === 'string' ? Date.parse(body.expires_at) : now + 55 * 60_000;
-  tokenCache.set(identity.poolId, { token: body.token, expiresAt });
-  return body.token;
+  })();
+  tokenMints.set(identity.poolId, mint);
+  return mint;
 }
 
 export function clearServiceGitHubTokenCache(): void {
   tokenCache.clear();
+}
+
+export function clearServiceGitHubToken(identity: ServiceGitHubAuth): void {
+  tokenCache.delete(identity.poolId);
 }
 
 /** Preserve service selection and original permission fallback across a CLI shim. */

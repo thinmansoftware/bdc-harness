@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import type { RunAuthorityPolicy } from '@archon/workflows/schemas/workflow';
 import type { FrozenSpecSource } from '@archon/workflows/reliability/run-authority';
+import { getServiceGitHubToken, resolveServiceGitHubAuth } from '../github/service-identity';
 
 export interface WorkOrderSourceDependencies {
   readonly fetcher?: typeof fetch;
@@ -136,7 +137,9 @@ async function resolveWorkOrderSource(
   }
 
   const fetcher = dependencies.fetcher ?? fetch;
-  const token = dependencies.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  const token =
+    dependencies.githubToken ??
+    (await getServiceGitHubToken(resolveServiceGitHubAuth('smart_cauldron')));
   if (!dependencies.fetcher && !token) {
     throw new Error('scope_authority_missing: GitHub authentication');
   }

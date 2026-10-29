@@ -4,6 +4,7 @@ import { queryOracle, OracleError } from './oracle-client';
 import { truncate } from './truncator';
 import { contextCache, makeCacheKey } from './cache';
 import type { WikiFetchResult, OracleFetchResult, AgentContext } from './types';
+import { resolveLegacyGitHubToken } from '../../core/src/github/service-identity';
 
 export type { AgentContext, WikiFetchResult, OracleFetchResult, ContextLoadResult } from './types';
 
@@ -14,7 +15,7 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 const ORACLE_API_KEY = process.env.ORACLE_API_KEY;
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_TOKEN = resolveLegacyGitHubToken();
 
 export interface PersonaContextInput {
   name: string;

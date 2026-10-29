@@ -15,7 +15,10 @@ import {
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
-import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
 import {
@@ -97,10 +100,10 @@ export interface DutyOfficerClockDeps {
   now?: () => Date;
 }
 
-export function githubToken(): string | null {
+export async function githubToken(): Promise<string | null> {
   try {
     const identity = resolveServiceGitHubAuth('duty_officer');
-    return identity.kind === 'pat' ? identity.token : null;
+    return await getServiceGitHubToken(identity);
   } catch {
     return null;
   }
