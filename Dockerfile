@@ -35,6 +35,7 @@ COPY packages/smart-cauldron/package.json ./packages/smart-cauldron/
 COPY packages/web/package.json ./packages/web/
 COPY packages/workflows/package.json ./packages/workflows/
 COPY packages/persona-context-loader/package.json ./packages/persona-context-loader/
+COPY packages/companion-mcp/package.json ./packages/companion-mcp/
 
 # Install ALL dependencies (including devDependencies needed for web build)
 # --linker=hoisted: Bun's default "isolated" linker stores packages in
@@ -231,6 +232,7 @@ COPY packages/smart-cauldron/package.json ./packages/smart-cauldron/
 COPY packages/web/package.json ./packages/web/
 COPY packages/workflows/package.json ./packages/workflows/
 COPY packages/persona-context-loader/package.json ./packages/persona-context-loader/
+COPY packages/companion-mcp/package.json ./packages/companion-mcp/
 
 # Install production dependencies only (--ignore-scripts skips husky prepare hook)
 RUN bun install --frozen-lockfile --production --ignore-scripts --linker=hoisted

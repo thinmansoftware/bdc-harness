@@ -62,6 +62,13 @@ export const SECRET_PAGE = [
   'prefix https://gho_tokensecret@github.com/thinmansoftware/bdc-xo suffix',
 ].join('\n');
 
+export const BOARD_SECRET_PAGE = [
+  'ordinary board sentence',
+  '-----BEGIN PRIVATE KEY-----',
+  'not-a-real-key',
+  '-----END PRIVATE KEY-----',
+].join('\n');
+
 export const BASE_REGISTER = [
   '# Motion register',
   '',
@@ -156,6 +163,11 @@ export async function createHarness(): Promise<Harness> {
     'board tracked note\n',
     'utf8'
   );
+  await writeFile(
+    join(wikiRoot, 'docs/board/motions/M-SECRET.discussion.md'),
+    BOARD_SECRET_PAGE,
+    'utf8'
+  );
   const outside = join(dir, 'outside-secret.txt');
   await writeFile(outside, 'OUTSIDE-SECRET-CONTENT\n', 'utf8');
   await symlink(outside, join(wikiRoot, 'xo-wiki/wiki/outside.md'));
@@ -171,6 +183,7 @@ export async function createHarness(): Promise<Harness> {
     'xo-wiki/wiki/secrets.md',
     'xo-wiki/wiki/outside.md',
     'docs/board/motions/M-READ.discussion.md',
+    'docs/board/motions/M-SECRET.discussion.md',
   ]);
   await git(wikiRoot, [
     '-c',

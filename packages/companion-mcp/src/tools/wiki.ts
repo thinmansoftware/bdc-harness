@@ -1,5 +1,6 @@
 import { BOARD_PREFIX, SNIPPETS_PER_HIT, WIKI_PREFIX, WIKI_SEARCH_MAX } from '../constants';
 import { ToolFailure } from '../errors';
+import { scrub } from '../scrub';
 import { lexicalTrackedPath, readTrackedFile, type TrackedTree } from '../tracked-tree';
 
 export interface SearchHit {
@@ -66,7 +67,7 @@ export async function searchTree(
       }
       throw error;
     }
-    const snippets = text
+    const snippets = scrub(text)
       .split('\n')
       .filter(line => line.includes(query))
       .slice(0, SNIPPETS_PER_HIT);

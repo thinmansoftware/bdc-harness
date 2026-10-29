@@ -38,3 +38,25 @@ export function scrub(value: string): string {
   }
   return next;
 }
+
+function isPlainObject(value: object): boolean {
+  const proto: unknown = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+export function scrubDeep(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return scrub(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map(item => scrubDeep(item));
+  }
+  if (typeof value === 'object' && value !== null && isPlainObject(value)) {
+    const next: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      next[key] = scrubDeep(item);
+    }
+    return next;
+  }
+  return value;
+}

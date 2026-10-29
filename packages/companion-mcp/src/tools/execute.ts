@@ -4,7 +4,7 @@ import { appendAudit } from '../audit';
 import { BOARD_PREFIX, WIKI_PREFIX, WIKI_SEARCH_MAX } from '../constants';
 import { DispatchClient } from '../dispatch-client';
 import { ToolFailure } from '../errors';
-import { scrub } from '../scrub';
+import { scrubDeep } from '../scrub';
 import type { TrackedTree } from '../tracked-tree';
 import type { CompanionSlot, ProposalFile } from '../types';
 import { boardRecordPropose, BOARD_RECORD_PROPOSE_TOOL } from './board';
@@ -30,7 +30,7 @@ export interface ToolDeps {
 
 function textResult(payload: unknown, isError = false): CallToolResult {
   return {
-    content: [{ type: 'text', text: scrub(JSON.stringify(payload)) }],
+    content: [{ type: 'text', text: JSON.stringify(scrubDeep(payload)) }],
     isError,
   };
 }

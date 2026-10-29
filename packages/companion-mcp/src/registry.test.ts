@@ -5,11 +5,56 @@ import { describe, expect, test } from 'bun:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 
+import { PROPOSAL_KINDS } from './constants';
 import { DispatchClient } from './dispatch-client';
 import { buildMcpServer } from './mcp';
 import { loadCompanionRegistry, parseCompanionRegistry } from './registry';
 import { TrackedTree } from './tracked-tree';
 import type { ToolDeps } from './tools/execute';
+
+interface ListedProperty {
+  type?: string;
+  minimum?: number;
+  maximum?: number;
+  enum?: string[];
+  items?: { type?: string; required?: string[]; properties?: Record<string, { type?: string }> };
+}
+
+interface ListedSchema {
+  type?: string;
+  required?: string[];
+  properties?: Record<string, ListedProperty>;
+}
+
+const SCHEMA_FIELDS: Record<string, { required: string[]; types: Record<string, string> }> = {
+  wiki_search: { required: ['query'], types: { query: 'string', limit: 'integer' } },
+  wiki_read: { required: ['path'], types: { path: 'string' } },
+  oracle_query: { required: ['question'], types: { question: 'string' } },
+  mailbox_send: {
+    required: ['recipient', 'text'],
+    types: { recipient: 'string', text: 'string', correlation_id: 'string' },
+  },
+  mailbox_list: { required: [], types: { status: 'string' } },
+  mailbox_read: { required: ['id'], types: { id: 'string' } },
+  mailbox_ack: { required: ['id'], types: { id: 'string' } },
+  board_record_search: { required: ['query'], types: { query: 'string', limit: 'integer' } },
+  board_record_read: { required: ['path'], types: { path: 'string' } },
+  board_brief_send: {
+    required: ['motion_id', 'seats', 'brief_text'],
+    types: { motion_id: 'string', seats: 'array', brief_text: 'string' },
+  },
+  board_replies_collect: { required: ['correlation_id'], types: { correlation_id: 'string' } },
+  board_record_propose: {
+    required: ['kind', 'motion_id', 'summary', 'files'],
+    types: { kind: 'string', motion_id: 'string', summary: 'string', files: 'array' },
+  },
+};
+
+function listedSchema(value: unknown): ListedSchema {
+  expect(typeof value).toBe('object');
+  expect(value).not.toBeNull();
+  return value as ListedSchema;
+}
 
 const EXAMPLE = join(
   import.meta.dir,
@@ -83,10 +128,37 @@ describe('companion registry', () => {
       await mcp.connect(serverTransport);
       const client = new Client({ name: 'allowlist-test', version: '0.0.1' });
       await client.connect(clientTransport);
-      const names = (await client.listTools()).tools.map(tool => tool.name).sort();
+      const listed = await client.listTools();
+      const names = listed.tools.map(tool => tool.name).sort();
       expect(names).toEqual([...entry.tools].sort());
       for (const name of names) {
         expect(name).not.toMatch(/shell|exec|sql|deploy|vault|secret/);
+        const expected = SCHEMA_FIELDS[name];
+        expect(expected).toBeDefined();
+        const schema = listedSchema(listed.tools.find(tool => tool.name === name)?.inputSchema);
+        expect(schema.type).toBe('object');
+        expect(schema.required ?? []).toEqual(expected?.required ?? []);
+        for (const [field, type] of Object.entries(expected?.types ?? {})) {
+          const property = schema.properties?.[field];
+          expect(
+            property?.type === type || (type === 'integer' && property?.type === 'number')
+          ).toBe(true);
+        }
+        if (name === 'wiki_search' || name === 'board_record_search') {
+          const limit = schema.properties?.limit;
+          expect(limit?.minimum).toBe(1);
+          expect(limit?.maximum).toBe(20);
+        }
+        if (name === 'board_record_propose') {
+          expect(schema.properties?.kind?.enum).toEqual([...PROPOSAL_KINDS]);
+          expect(schema.properties?.files?.items?.type).toBe('object');
+          expect(schema.properties?.files?.items?.required).toEqual(['path', 'content']);
+          expect(schema.properties?.files?.items?.properties?.path?.type).toBe('string');
+          expect(schema.properties?.files?.items?.properties?.content?.type).toBe('string');
+        }
+        if (name === 'board_brief_send') {
+          expect(schema.properties?.seats?.items?.type).toBe('string');
+        }
       }
       expect(names.includes('board_record_propose')).toBe(entry.board_secretary);
       await client.close();

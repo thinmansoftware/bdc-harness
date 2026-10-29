@@ -10,6 +10,7 @@ import {
   createHarness,
   parseToolJson,
   startFromHarness,
+  startRecordingServer,
   withClient,
   writeConfig,
   type Harness,
@@ -35,8 +36,20 @@ describe('companion mcp server', () => {
     try {
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
         const listed = await client.listTools();
-        expect(listed.tools.map(tool => tool.name)).toContain('wiki_read');
-        expect(listed.tools.map(tool => tool.name)).toContain('board_record_propose');
+        const names = listed.tools.map(tool => tool.name);
+        expect(names).toContain('wiki_read');
+        expect(names).toContain('board_record_propose');
+        const wikiRead = listed.tools.find(tool => tool.name === 'wiki_read');
+        const schema = wikiRead?.inputSchema as {
+          required?: string[];
+          properties?: Record<string, { type?: string }>;
+        };
+        expect(schema.required).toContain('path');
+        expect(schema.properties?.path?.type).toBe('string');
+        const page = parseToolJson(
+          await callToolText(client, 'wiki_read', { path: 'xo-wiki/wiki/a.md' })
+        );
+        expect(page.text).toContain('alpha tracked page');
       });
     } finally {
       await running.close();
@@ -180,6 +193,8 @@ describe('companion mcp server', () => {
         const dot = registry.slots.find(slot => slot.companion_id === 'dot');
         expect(names).toEqual([...(dot?.tools ?? [])].sort());
         expect(names).not.toContain('board_record_propose');
+        expect(names).not.toContain('board_record_search');
+        expect(names).not.toContain('board_brief_send');
         const refused = parseToolJson(
           await callToolText(client, 'board_record_propose', {
             kind: 'synthesis',
@@ -192,6 +207,42 @@ describe('companion mcp server', () => {
       });
     } finally {
       await running.close();
+      await harness.cleanup();
+    }
+  });
+
+  test('invalid_mailbox_send_refused_before_dispatch', async () => {
+    const dispatch = await startRecordingServer(() => ({ status: 200, body: { id: 'm-1' } }));
+    const harness = await createHarness();
+    const recording = await startFromHarness(harness, { DISPATCH_BASE_URL: dispatch.url });
+    const closedPort = await startFromHarness(harness);
+    try {
+      await withClient(recording.baseUrl, harness.tokens.grokbot, async client => {
+        const missing = parseToolJson(
+          await callToolText(client, 'mailbox_send', { recipient: 'xo' })
+        );
+        const typed = parseToolJson(
+          await callToolText(client, 'mailbox_send', { recipient: 'xo', text: 12 })
+        );
+        expect(missing.error).toBe('invalid_params');
+        expect(typed.error).toBe('invalid_params');
+      });
+      expect(dispatch.requests).toHaveLength(0);
+      expect(harness.env.DISPATCH_BASE_URL).toBe('http://127.0.0.1:9');
+      await withClient(closedPort.baseUrl, harness.tokens.grokbot, async client => {
+        const refused = parseToolJson(
+          await callToolText(client, 'mailbox_send', { recipient: 'xo', text: false })
+        );
+        expect(refused.error).toBe('invalid_params');
+      });
+      const audit = await readFile(harness.auditLog, 'utf8');
+      expect(audit).toContain('"error":"invalid_params"');
+      expect(audit).toContain('"outcome":"refused"');
+      expect(audit).not.toContain(harness.tokens.grokbot);
+    } finally {
+      await recording.close();
+      await closedPort.close();
+      await dispatch.close();
       await harness.cleanup();
     }
   });
