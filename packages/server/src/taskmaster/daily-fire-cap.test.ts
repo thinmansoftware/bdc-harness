@@ -248,6 +248,10 @@ test('synthetic raw file WAL control closes finalized old and reopened connectio
 });
 
 test('synthetic native-close controls distinguish owned statement and connection lifetimes', async () => {
+  const [bunMajor, bunMinor] = Bun.version.split('.').map(Number);
+  // Bun 1.4 finalizes outstanding statements on close(true). Older Bun reports
+  // SQLITE_BUSY and preserves them. Assert the pinned runtime's actual contract.
+  const strictCloseFinalizes = bunMajor > 1 || (bunMajor === 1 && bunMinor >= 4);
   const samples: object[] = [];
   const finalizedControl = new Database(':memory:');
   const finalizedStatement = finalizedControl.prepare('SELECT 1 AS value');
@@ -313,12 +317,12 @@ test('synthetic native-close controls distinguish owned statement and connection
             samples.push(sample);
             console.info('[tm-cap-native-close]', JSON.stringify(sample));
             if (closeMode === 'native-strict') {
-              if (statementMode === 'pending') {
+              if (statementMode === 'pending' && !strictCloseFinalizes) {
                 expect(outcome).toMatch(/^reported-in-use/);
                 expect(statementAfterClose).toBe('usable');
               } else {
                 expect(outcome).toBe('returned');
-                expect(statementAfterClose).toBe('finalized');
+                expect(statementAfterClose).toMatch(/^(finalized|closed)$/);
               }
             }
           } finally {

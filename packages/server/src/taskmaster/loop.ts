@@ -856,7 +856,7 @@ export async function loadGitHubDigestData(nowMs: number): Promise<GitHubDigestD
     remaining: number | string;
     limit: number | string;
   }>(
-    `SELECT pool_id, resource, remaining, "limit" AS limit FROM github_api_pool_state
+    `SELECT pool_id, resource, remaining, "limit" FROM github_api_pool_state
      WHERE resource IN ('core', 'search', 'graphql') ORDER BY pool_id, resource`
   );
   const servicesByPool = new Map<string, string[]>();
