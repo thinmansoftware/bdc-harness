@@ -9,8 +9,8 @@
  *    M-15 tier map, and it gates execution only, never consultation.
  *  - Judge health failures finalize as alarm states and escalate loudly when
  *    the retry budget is exhausted -- they never become semantic verdicts.
- *  - Replay: a lost claim means another pass already owns this evidence; the
- *    pipeline exits without a model call or a second action.
+ *  - Replay: a lost claim does not invoke the judge, but a merge-ready open
+ *    PR may emit one flag_merge_ready action.
  */
 
 import { createLogger } from '@archon/paths';
@@ -134,6 +134,127 @@ export interface JudgeFirstPipelineOptions {
 
 function actionClass(record: WatchedRunRecord): string {
   return record.errorClass ?? 'none';
+}
+
+function logReplayGreenSkipped(fields: Record<string, unknown>): void {
+  log.info(fields, 'overseer.judge_first.replay_green_skipped');
+}
+
+/**
+ * Lost-claim come-back for an open PR. The first verdict already exists for
+ * this run and head; when deterministic evidence is now merge-ready, promote
+ * an observe or healthy row and hand it to the existing coordinator. No judge
+ * call. Promotion and the flag_merge_ready receipt commit together so the
+ * merge bridge cannot observe an unactioned merge-ready row that has no
+ * handoff receipt. Fail closed on every other verdict, store error, dry run,
+ * or missing coordinator.
+ */
+async function replayGreenHandoff(
+  record: WatchedRunRecord,
+  deps: OverseerActionsDeps,
+  options: JudgeFirstPipelineOptions,
+  headSha: string
+): Promise<void> {
+  if (!isPrMergeReady(record.prEvidence)) {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      reason: record.prEvidence.checks.pending > 0 ? 'checks_pending' : 'not_merge_ready',
+    });
+    return;
+  }
+
+  let row: Awaited<ReturnType<OverseerVerdictStoreDeps['getVerdictByRunHead']>>;
+  try {
+    row = await options.verdictStore.getVerdictByRunHead({ runId: record.runId, headSha });
+  } catch (error) {
+    log.error(
+      { err: error as Error, runId: record.runId, headSha, reason: 'verdict_read_failed' },
+      'overseer.judge_first.replay_green_skipped'
+    );
+    return;
+  }
+  if (!row) {
+    logReplayGreenSkipped({ runId: record.runId, headSha, reason: 'verdict_missing' });
+    return;
+  }
+  if (row.verdict !== 'observe' && row.verdict !== 'healthy') {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      verdictId: row.id,
+      verdict: row.verdict,
+      reason: 'verdict_not_promotable',
+    });
+    return;
+  }
+
+  const result = `steward_handoff:replay_green:verdict:${row.id}${options.dryRun ? ':dry_run' : ''}`;
+  if (options.dryRun) {
+    await deps.insertOverseerAction({
+      runId: record.runId,
+      woId: record.woId,
+      class: actionClass(record),
+      action: 'flag_merge_ready',
+      result,
+    });
+    log.info(
+      { runId: record.runId, woId: record.woId, verdictId: row.id, dryRun: true },
+      'overseer.judge_first.replay_green_handoff'
+    );
+    return;
+  }
+  if (!options.mergeCoordinator) {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      verdictId: row.id,
+      reason: 'coordinator_missing',
+    });
+    return;
+  }
+
+  let promoted = false;
+  try {
+    // One store call: the verdict update and the handoff receipt commit
+    // together. A receipt failure rolls the promotion back, so this path
+    // never leaves an unactioned flag_merge_ready row for the bridge.
+    promoted = await options.verdictStore.promoteObserveOrHealthyVerdictWithReceipt({
+      verdictId: row.id,
+      runId: record.runId,
+      woId: record.woId,
+      class: actionClass(record),
+      action: 'flag_merge_ready',
+      result,
+    });
+  } catch (error) {
+    log.error(
+      {
+        err: error as Error,
+        runId: record.runId,
+        headSha,
+        verdictId: row.id,
+        reason: 'promote_or_receipt_failed',
+      },
+      'overseer.judge_first.replay_green_skipped'
+    );
+    return;
+  }
+  if (!promoted) {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      verdictId: row.id,
+      reason: 'promote_no_change',
+    });
+    return;
+  }
+
+  log.info(
+    { runId: record.runId, woId: record.woId, verdictId: row.id, dryRun: false },
+    'overseer.judge_first.replay_green_handoff'
+  );
+  await options.mergeCoordinator(record);
 }
 
 function newestEvent(events: OverseerWorkflowEvent[]): OverseerWorkflowEvent | undefined {
@@ -312,6 +433,9 @@ export async function handleRecordJudgeFirst(
     // its PR opened, while checks were still running -- the loop then never
     // re-examined it. Close only when the PR is merged/closed/missing.
     const prStillOpen = record.prEvidence?.state === 'open';
+    if (prStillOpen) {
+      await replayGreenHandoff(record, deps, options, headSha);
+    }
     if (
       (record.action === 'success' || record.action === 'ignore') &&
       !prStillOpen &&

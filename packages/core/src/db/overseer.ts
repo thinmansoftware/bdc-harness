@@ -746,6 +746,96 @@ export async function finalizeOverseerVerdict(input: {
   return row;
 }
 
+/** Read the single verdict row for a run and head, if one exists. */
+export async function getVerdictByRunHead(input: { runId: string; headSha: string }): Promise<{
+  id: string;
+  verdict: string | null;
+  proposedAction: string | null;
+  actionedAt: string | null;
+} | null> {
+  const result = await getDatabase().query<{
+    id: string;
+    verdict: string | null;
+    proposed_action: string | null;
+    actioned_at: string | null;
+  }>(
+    `SELECT id, verdict, proposed_action, actioned_at
+     FROM overseer_verdicts
+     WHERE run_id = $1 AND head_sha = $2
+     LIMIT 1`,
+    [input.runId, input.headSha]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    verdict: row.verdict,
+    proposedAction: row.proposed_action,
+    actionedAt: row.actioned_at,
+  };
+}
+
+/**
+ * Promote an unactioned observe or healthy verdict to flag_merge_ready.
+ * Returns true only when this call changed the row. A second call is a no-op.
+ * No UPDATE ... RETURNING: the SQLite adapter rejects it.
+ */
+export async function promoteObserveOrHealthyVerdict(verdictId: string): Promise<boolean> {
+  const result = await getDatabase().query(
+    `UPDATE overseer_verdicts
+     SET proposed_action = 'flag_merge_ready', updated_at = $2
+     WHERE id = $1
+       AND verdict IN ('observe', 'healthy')
+       AND proposed_action IS DISTINCT FROM 'flag_merge_ready'
+       AND actioned_at IS NULL`,
+    [verdictId, new Date().toISOString()]
+  );
+  return result.rowCount === 1;
+}
+
+/**
+ * Promote an unactioned observe or healthy verdict to flag_merge_ready and
+ * insert the handoff receipt in the same transaction.
+ *
+ * The merge-execution bridge lists unactioned flag_merge_ready rows and can
+ * merge one with no handoff receipt. The promotion must not commit unless the
+ * receipt insert commits with it. A receipt failure rolls the promotion back.
+ * Returns true only when this call changed the row and wrote the receipt.
+ * A second call is a no-op and does not write another receipt.
+ */
+export async function promoteObserveOrHealthyVerdictWithReceipt(input: {
+  verdictId: string;
+  runId: string;
+  woId: string;
+  class: string;
+  action: string;
+  result: string;
+}): Promise<boolean> {
+  const db = getDatabase();
+  const now = new Date().toISOString();
+  const actionId = randomUUID();
+  return db.withTransaction(async query => {
+    const updated = await query(
+      `UPDATE overseer_verdicts
+       SET proposed_action = 'flag_merge_ready', updated_at = $2
+       WHERE id = $1
+         AND verdict IN ('observe', 'healthy')
+         AND proposed_action IS DISTINCT FROM 'flag_merge_ready'
+         AND actioned_at IS NULL`,
+      [input.verdictId, now]
+    );
+    if (updated.rowCount !== 1) return false;
+    const inserted = await query<{ id: string }>(
+      `INSERT INTO overseer_actions (id, run_id, wo_id, class, action, result)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id`,
+      [actionId, input.runId, input.woId, input.class, input.action, input.result]
+    );
+    if (!inserted.rows[0]) throw new Error('Failed to insert overseer action');
+    return true;
+  });
+}
+
 export async function getOverseerVerdictsForRun(runId: string): Promise<OverseerVerdictRow[]> {
   const result = await getDatabase().query<OverseerVerdictRow>(
     'SELECT * FROM overseer_verdicts WHERE run_id = $1 ORDER BY created_at ASC',
