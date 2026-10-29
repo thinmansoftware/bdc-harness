@@ -14,6 +14,7 @@ import {
   createRealSubmitPullRequestReview,
   type RealGitHubOctokitLike,
 } from '../adapters/github-real-deps.ts';
+import { buildReviewBody } from '../pr-review-submit.ts';
 
 const HEAD_SHA = 'a'.repeat(40);
 const REF = { owner: 'thinmansoftware', repo: 'bdc-harness', number: 673, commitId: HEAD_SHA };
@@ -37,6 +38,37 @@ function httpError(status: number, message: string): Error & { status: number } 
 }
 
 describe('createRealSubmitPullRequestReview', () => {
+  test('required_context_never_reported comment includes operator recovery details', () => {
+    const body = buildReviewBody(
+      {
+        owner: 'thinmansoftware',
+        repo: 'bdc-xo',
+        prNumber: 3799,
+        headSha: HEAD_SHA,
+        author: 'builder',
+      },
+      {
+        approved: false,
+        summary: '',
+        reviewedHeadSha: HEAD_SHA,
+        requiredContextsUnavailable: true,
+        requiredContextsUnavailableReason: 'required_context_never_reported',
+        missingRequiredContexts: ['Gitleaks'],
+        requiredContextAttempts: 10,
+        requiredContextRearm: {
+          attempted: true,
+          dispatched: true,
+          workflow: 'secrets-scan.yml',
+          branch: 'docs/update',
+        },
+      }
+    );
+    expect(body).toContain('Gitleaks');
+    expect(body).toContain(HEAD_SHA);
+    expect(body).toContain('10 attempts');
+    expect(body).toContain('gh workflow run secrets-scan.yml --ref docs/update');
+    expect(body).toContain('repair/enable the workflow');
+  });
   test('submits APPROVE and reports success', async () => {
     const calls: unknown[] = [];
     const submit = createRealSubmitPullRequestReview(

@@ -241,6 +241,9 @@ export async function tickReviewWorkerClock(
               headSha: work.headSha,
               defer_until: deferUntil,
               pending_checks: pendingChecks,
+              ...(outcome.pendingChecks !== undefined
+                ? { missing_required_contexts: outcome.pendingChecks }
+                : {}),
               ...(outcome.pendingChecks === undefined ? { reason: 'no_checks_reported' } : {}),
             },
             'overseer_review_checks_pending_deferred'
