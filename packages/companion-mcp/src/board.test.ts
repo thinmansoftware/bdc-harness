@@ -334,6 +334,23 @@ describe('board secretary tools', () => {
     const cases: Array<{ files: Array<{ path: string; content: string }> }> = [
       { files: [{ path: 'README.md', content: `${label}\noutside\n` }] },
       { files: [{ path: 'docs/board/motions/M-TEST-RULING.md', content: `${label}\nno\n` }] },
+      { files: [{ path: 'docs/board/motions/M-TEST-ruling.md', content: `${label}\nno\n` }] },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/M-TEST-Ruling.synthesis.md',
+            content: `${label}\nno\n`,
+          },
+        ],
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/design-rounds/M-TEST-Ruling.md',
+            content: `${label}\nno\n`,
+          },
+        ],
+      },
       { files: [{ path: 'docs/board/motions/M-TEST.votes.md', content: `${label}\nno\n` }] },
       {
         files: [

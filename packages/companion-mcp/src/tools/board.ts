@@ -72,11 +72,8 @@ function rulingViolation(content: string): string | null {
 }
 
 function classifyPath(filePath: string): PreparedFile['kind'] | null {
-  if (
-    filePath.includes('RULING') ||
-    filePath.endsWith('.votes.md') ||
-    filePath.includes('/votes/')
-  ) {
+  const folded = filePath.toLowerCase();
+  if (folded.includes('ruling') || filePath.endsWith('.votes.md') || filePath.includes('/votes/')) {
     return null;
   }
   if (filePath === REGISTER_PATH) {
