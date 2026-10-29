@@ -29,6 +29,7 @@ import {
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
   promoteObserveOrHealthyVerdict,
+  promoteObserveOrHealthyVerdictWithReceipt,
   recordVerdictMergeOutcome,
   releaseOverseerMergeSlot,
   releaseVerdictClaimForMergeExecution,
@@ -870,6 +871,99 @@ describe('overseer db', () => {
     expect(
       (await getVerdictByRunHead({ runId: 'run-sql-race', headSha: 'H' }))?.proposedAction
     ).toBe('escalate_with_evidence');
+  });
+
+  test('promote with receipt commits the verdict and the receipt together', async () => {
+    const verdictId = await seedSafeVerdict('run-atomic-ok', 'healthy', 'none');
+    const result = `steward_handoff:replay_green:verdict:${verdictId}`;
+    const receipt = {
+      verdictId,
+      runId: 'run-atomic-ok',
+      woId: 'WO-TEST-OVERSEER-01',
+      class: 'none',
+      result,
+    };
+    expect(await promoteObserveOrHealthyVerdictWithReceipt(receipt)).toBe(true);
+    expect(
+      (await getVerdictByRunHead({ runId: 'run-atomic-ok', headSha: 'H' }))?.proposedAction
+    ).toBe('flag_merge_ready');
+    expect(
+      (await getOverseerActionsForRun('run-atomic-ok')).filter(
+        action => action.action === 'flag_merge_ready' && action.result === result
+      )
+    ).toHaveLength(1);
+    expect(await promoteObserveOrHealthyVerdictWithReceipt(receipt)).toBe(false);
+    expect(
+      (await getOverseerActionsForRun('run-atomic-ok')).filter(
+        action => action.action === 'flag_merge_ready'
+      )
+    ).toHaveLength(1);
+    expect((await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)).toBe(
+      true
+    );
+
+    const blockedId = await seedSafeVerdict(
+      'run-atomic-unsafe',
+      'observe',
+      'escalate_with_evidence'
+    );
+    expect(
+      await promoteObserveOrHealthyVerdictWithReceipt({
+        verdictId: blockedId,
+        runId: 'run-atomic-unsafe',
+        woId: 'WO-TEST-OVERSEER-01',
+        class: 'none',
+        result: `steward_handoff:replay_green:verdict:${blockedId}`,
+      })
+    ).toBe(false);
+    expect(
+      (await getVerdictByRunHead({ runId: 'run-atomic-unsafe', headSha: 'H' }))?.proposedAction
+    ).toBe('escalate_with_evidence');
+    expect(
+      (await getOverseerActionsForRun('run-atomic-unsafe')).filter(
+        action => action.action === 'flag_merge_ready'
+      )
+    ).toHaveLength(0);
+  });
+
+  test('receipt insert failure does not leave flag_merge_ready when revert would fail', async () => {
+    const verdictId = await seedSafeVerdict('run-atomic-rollback', 'observe', 'comment_findings');
+    const result = `steward_handoff:replay_green:verdict:${verdictId}`;
+    await db.query(
+      `CREATE TRIGGER reject_replay_green_receipt BEFORE INSERT ON overseer_actions
+       WHEN NEW.action = 'flag_merge_ready'
+       BEGIN SELECT RAISE(ABORT, 'receipt_insert_failed'); END`
+    );
+    await db.query(
+      `CREATE TRIGGER reject_replay_green_revert BEFORE UPDATE ON overseer_verdicts
+       WHEN OLD.proposed_action = 'flag_merge_ready' AND NEW.proposed_action != 'flag_merge_ready'
+       BEGIN SELECT RAISE(ABORT, 'revert_failed'); END`
+    );
+    try {
+      await expect(
+        promoteObserveOrHealthyVerdictWithReceipt({
+          verdictId,
+          runId: 'run-atomic-rollback',
+          woId: 'WO-TEST-OVERSEER-01',
+          class: 'none',
+          result,
+        })
+      ).rejects.toThrow('receipt_insert_failed');
+    } finally {
+      await db.query('DROP TRIGGER IF EXISTS reject_replay_green_receipt');
+      await db.query('DROP TRIGGER IF EXISTS reject_replay_green_revert');
+    }
+    expect(
+      (await getVerdictByRunHead({ runId: 'run-atomic-rollback', headSha: 'H' }))?.proposedAction
+    ).toBe('comment_findings');
+    expect(
+      (await getOverseerActionsForRun('run-atomic-rollback')).filter(
+        action => action.action === 'flag_merge_ready'
+      )
+    ).toHaveLength(0);
+    expect((await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)).toBe(
+      false
+    );
   });
 
   test('concurrent promote calls change one observe row', async () => {

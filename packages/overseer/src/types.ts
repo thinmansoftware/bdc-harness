@@ -349,8 +349,15 @@ export interface OverseerVerdictStoreDeps {
   } | null>;
   promoteObserveOrHealthyVerdict(verdictId: string): Promise<boolean>;
   /**
-   * Restore the prior safe action when the flag_merge_ready receipt failed.
-   * Returns true only when this call undid an unactioned promotion.
+   * Promote an unactioned observe or healthy verdict and insert its
+   * flag_merge_ready receipt in one transaction. Returns true only when both
+   * writes committed. A failed insert must leave the prior action in place.
    */
-  revertUnactionedFlagMergeReadyPromotion(verdictId: string, priorAction: string): Promise<boolean>;
+  promoteObserveOrHealthyVerdictWithReceipt(input: {
+    verdictId: string;
+    runId: string;
+    woId: string;
+    class: string;
+    result: string;
+  }): Promise<boolean>;
 }

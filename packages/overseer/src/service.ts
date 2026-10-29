@@ -12,11 +12,11 @@ import {
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
   promoteObserveOrHealthyVerdict,
+  promoteObserveOrHealthyVerdictWithReceipt,
   recordVerdictMergeOutcome,
   releaseOverseerMergeSlot,
   releaseVerdictClaimForMergeExecution,
   reserveOverseerMergeSlot,
-  revertUnactionedFlagMergeReadyPromotion,
 } from '@archon/core/db/overseer';
 import { hasActiveRunForWo } from './active-run-guard';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
@@ -210,7 +210,7 @@ const defaultVerdictStore: OverseerVerdictStoreDeps = {
   finalizeVerdict: finalizeOverseerVerdict,
   getVerdictByRunHead,
   promoteObserveOrHealthyVerdict,
-  revertUnactionedFlagMergeReadyPromotion,
+  promoteObserveOrHealthyVerdictWithReceipt,
 };
 
 /**

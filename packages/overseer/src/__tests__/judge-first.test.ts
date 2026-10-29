@@ -21,7 +21,7 @@ import {
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
   promoteObserveOrHealthyVerdict,
-  revertUnactionedFlagMergeReadyPromotion,
+  promoteObserveOrHealthyVerdictWithReceipt,
 } from '@archon/core/db/overseer';
 import { rootLogger } from '@archon/paths';
 import {
@@ -118,6 +118,8 @@ interface FakeStoreState {
   replayRow?: ReplayVerdictRow | null;
   readCalls?: number;
   promoteCalls?: number;
+  failReceiptInsert?: boolean;
+  receipts?: { action: string; result: string }[];
 }
 
 function makeVerdictStore(
@@ -138,7 +140,6 @@ function makeVerdictStore(
       return state.replayRow ?? null;
     },
     promoteObserveOrHealthyVerdict: async verdictId => {
-      state.promoteCalls = (state.promoteCalls ?? 0) + 1;
       const row = state.replayRow;
       if (!row || row.id !== verdictId) return false;
       if (row.verdict !== 'observe' && row.verdict !== 'healthy') return false;
@@ -147,12 +148,20 @@ function makeVerdictStore(
       row.proposedAction = 'flag_merge_ready';
       return true;
     },
-    revertUnactionedFlagMergeReadyPromotion: async (verdictId, priorAction) => {
+    promoteObserveOrHealthyVerdictWithReceipt: async input => {
+      state.promoteCalls = (state.promoteCalls ?? 0) + 1;
+      if (state.failReceiptInsert) {
+        throw new Error('receipt_insert_failed');
+      }
       const row = state.replayRow;
-      if (!row || row.id !== verdictId) return false;
-      if (row.actionedAt !== null || row.proposedAction !== 'flag_merge_ready') return false;
-      if (!REPLAY_SAFE_ACTIONS.has(priorAction)) return false;
-      row.proposedAction = priorAction;
+      if (!row || row.id !== input.verdictId) return false;
+      if (row.verdict !== 'observe' && row.verdict !== 'healthy') return false;
+      if (row.actionedAt !== null) return false;
+      if (row.proposedAction === null || !REPLAY_SAFE_ACTIONS.has(row.proposedAction)) return false;
+      row.proposedAction = 'flag_merge_ready';
+      const receipts = state.receipts ?? [];
+      receipts.push({ action: 'flag_merge_ready', result: input.result });
+      state.receipts = receipts;
       return true;
     },
   };
@@ -923,8 +932,9 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
       record,
       state
     );
-    const handoffs = actions.filter(action => action.action === 'flag_merge_ready');
+    const handoffs = state.receipts ?? [];
     expect(judgeCalls).toBe(0);
+    expect(actions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
     expect(handoffs).toHaveLength(1);
     expect(handoffs[0]?.result.startsWith('steward_handoff:replay_green:verdict:')).toBe(true);
     expect(handoffs[0]?.result).toBe('steward_handoff:replay_green:verdict:verdict-replay-1');
@@ -941,8 +951,9 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
       record,
       state
     );
-    const handoffs = actions.filter(action => action.action === 'flag_merge_ready');
+    const handoffs = state.receipts ?? [];
     expect(judgeCalls).toBe(0);
+    expect(actions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
     expect(handoffs).toHaveLength(1);
     expect(handoffs[0]?.result).toBe('steward_handoff:replay_green:verdict:verdict-replay-1');
     expect(state.replayRow?.proposedAction).toBe('flag_merge_ready');
@@ -955,9 +966,7 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
     const record = greenReplayRecord();
     const first = await runReplayTick(record, state);
     const second = await runReplayTick(record, state);
-    const handoffs = [...first.actions, ...second.actions].filter(
-      action => action.action === 'flag_merge_ready'
-    );
+    const handoffs = state.receipts ?? [];
     expect(first.judgeCalls).toBe(0);
     expect(second.judgeCalls).toBe(0);
     expect(handoffs).toHaveLength(1);
@@ -1009,35 +1018,31 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
     expect(handoffCalls).toHaveLength(0);
   });
 
-  test('replay green: receipt insert failure reverts the promotion and does not hand off', async () => {
+  test('replay green: receipt insert failure does not promote and does not hand off', async () => {
     const state = replayState('observe');
+    state.failReceiptInsert = true;
     const record = greenReplayRecord();
-    const { deps } = makeDeps();
-    deps.insertOverseerAction = async action => {
-      if (action.action === 'flag_merge_ready') throw new Error('receipt_insert_failed');
-    };
-    const handoffCalls: WatchedRunRecord[] = [];
-    await handleRecordJudgeFirst(record, deps, {
-      dryRun: false,
-      actor: 'test',
-      mergeCoordinator: async () => {
-        throw new Error('coordinator must not run');
-      },
-      deterministicMergeHandoff: {
-        handoff: async seen => {
-          handoffCalls.push(seen);
-        },
-      },
-      verdictStore: makeVerdictStore({ claimed: false }, state),
-      judge: async () => {
-        throw new Error('judge must not run');
-      },
-      escalate: fakeEscalate,
-    });
-    expect(handoffCalls).toHaveLength(0);
+    const failed = await runReplayTick(record, state);
+    expect(failed.judgeCalls).toBe(0);
+    expect(failed.actions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
+    expect(state.receipts ?? []).toHaveLength(0);
+    expect(failed.handoffCalls).toHaveLength(0);
+    expect(failed.coordinatorCalls).toHaveLength(0);
     expect(state.promoteCalls).toBe(1);
     expect(state.replayRow?.proposedAction).toBe('comment_findings');
     expect(state.replayRow?.verdict).toBe('observe');
+
+    state.failReceiptInsert = false;
+    const retried = await runReplayTick(record, state);
+    expect(retried.handoffCalls).toEqual([record]);
+    expect(retried.coordinatorCalls).toHaveLength(0);
+    expect(state.replayRow?.proposedAction).toBe('flag_merge_ready');
+    expect(state.receipts).toEqual([
+      {
+        action: 'flag_merge_ready',
+        result: 'steward_handoff:replay_green:verdict:verdict-replay-1',
+      },
+    ]);
   });
 
   test('replay green: missing deterministic handoff does not promote', async () => {
@@ -1184,9 +1189,29 @@ if (soleJudgeFirstFile) {
         finalizeVerdict: finalizeOverseerVerdict,
         getVerdictByRunHead,
         promoteObserveOrHealthyVerdict,
-        revertUnactionedFlagMergeReadyPromotion,
+        promoteObserveOrHealthyVerdictWithReceipt,
         ...overrides,
       };
+    }
+
+    async function installReceiptFailureGuards(): Promise<void> {
+      const db = getDatabase();
+      await db.query(
+        `CREATE TRIGGER reject_replay_green_receipt BEFORE INSERT ON overseer_actions
+         WHEN NEW.action = 'flag_merge_ready'
+         BEGIN SELECT RAISE(ABORT, 'receipt_insert_failed'); END`
+      );
+      await db.query(
+        `CREATE TRIGGER reject_replay_green_revert BEFORE UPDATE ON overseer_verdicts
+         WHEN OLD.proposed_action = 'flag_merge_ready' AND NEW.proposed_action != 'flag_merge_ready'
+         BEGIN SELECT RAISE(ABORT, 'revert_failed'); END`
+      );
+    }
+
+    async function dropReceiptFailureGuards(): Promise<void> {
+      const db = getDatabase();
+      await db.query('DROP TRIGGER IF EXISTS reject_replay_green_receipt');
+      await db.query('DROP TRIGGER IF EXISTS reject_replay_green_revert');
     }
 
     async function runRealReplay(input: {
@@ -1197,15 +1222,11 @@ if (soleJudgeFirstFile) {
       store?: OverseerVerdictStoreDeps;
       tally?: { handoff: number; coordinator: number; judge: number };
       withHandoff?: boolean;
-      failReceiptInsert?: boolean;
       judge?: Parameters<typeof handleRecordJudgeFirst>[2]['judge'];
     }): Promise<{ handoff: number; coordinator: number; judge: number }> {
       const tally = input.tally ?? { handoff: 0, coordinator: 0, judge: 0 };
       const { deps } = makeDeps();
       deps.insertOverseerAction = async record => {
-        if (input.failReceiptInsert && record.action === 'flag_merge_ready') {
-          throw new Error('receipt_insert_failed');
-        }
         await insertOverseerAction(record);
       };
       await handleRecordJudgeFirst(
@@ -1396,7 +1417,7 @@ if (soleJudgeFirstFile) {
       expect(live).toHaveLength(1);
     });
 
-    test('replay green: receipt insert failure reverts the real promotion', async () => {
+    test('replay green: receipt insert failure rolls the promotion back', async () => {
       const runId = 'run-receipt-fail';
       await seedCompletedRun(runId);
       const verdictId = await seedVerdict({
@@ -1404,17 +1425,25 @@ if (soleJudgeFirstFile) {
         verdict: 'observe',
         proposedAction: 'comment_findings',
       });
-      const failed = await runRealReplay({
-        runId,
-        evidence: prEvidence(0),
-        failReceiptInsert: true,
-      });
-      const reverted = await getVerdictByRunHead({ runId, headSha: 'H' });
+      // The revert trigger fails any compensating UPDATE that tries to leave
+      // flag_merge_ready after it has committed. Only a transaction that rolls
+      // the promotion back with the failed receipt keeps the prior action.
+      await installReceiptFailureGuards();
+      let failed: { handoff: number; coordinator: number; judge: number };
+      try {
+        failed = await runRealReplay({
+          runId,
+          evidence: prEvidence(0),
+        });
+      } finally {
+        await dropReceiptFailureGuards();
+      }
+      const unchanged = await getVerdictByRunHead({ runId, headSha: 'H' });
       const failedActions = await getOverseerActionsForRun(runId);
       expect(failed.handoff).toBe(0);
       expect(failed.coordinator).toBe(0);
       expect(failed.judge).toBe(0);
-      expect(reverted?.proposedAction).toBe('comment_findings');
+      expect(unchanged?.proposedAction).toBe('comment_findings');
       expect(failedActions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
       expect((await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)).toBe(
         false

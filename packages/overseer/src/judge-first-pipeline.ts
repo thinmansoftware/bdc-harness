@@ -177,9 +177,10 @@ function replayPromotionSkipReason(row: {
  * an observe or healthy row whose prior action is still safe, then hand it to
  * the merge-execution bridge. No judge call and no mergeCoordinator call.
  * Fail closed on every other verdict, unsafe action, store error, dry run,
- * missing deterministic handoff, or a failed handoff receipt. Promotion and
- * the receipt are compensated: a failed insert restores the prior action so
- * the bridge cannot merge a flag_merge_ready row that has no receipt.
+ * missing deterministic handoff, or a failed handoff receipt. The promotion
+ * and the flag_merge_ready receipt commit in one transaction. A failed insert
+ * rolls the promotion back before it is visible, so the bridge cannot merge a
+ * flag_merge_ready row that has no receipt.
  */
 async function replayGreenHandoff(
   record: WatchedRunRecord,
@@ -248,26 +249,15 @@ async function replayGreenHandoff(
     return;
   }
 
-  const priorAction = row.proposedAction;
-  if (
-    priorAction !== 'none' &&
-    priorAction !== 'verdict_write' &&
-    priorAction !== 'comment_findings'
-  ) {
-    logReplayGreenSkipped({
-      runId: record.runId,
-      headSha,
-      verdictId: row.id,
-      verdict: row.verdict,
-      proposedAction: row.proposedAction,
-      reason: 'action_not_promotable',
-    });
-    return;
-  }
-
   let promoted = false;
   try {
-    promoted = await options.verdictStore.promoteObserveOrHealthyVerdict(row.id);
+    promoted = await options.verdictStore.promoteObserveOrHealthyVerdictWithReceipt({
+      verdictId: row.id,
+      runId: record.runId,
+      woId: record.woId,
+      class: actionClass(record),
+      result,
+    });
   } catch (error) {
     log.error(
       {
@@ -275,7 +265,7 @@ async function replayGreenHandoff(
         runId: record.runId,
         headSha,
         verdictId: row.id,
-        reason: 'promote_failed',
+        reason: 'promote_receipt_failed',
       },
       'overseer.judge_first.replay_green_skipped'
     );
@@ -288,48 +278,6 @@ async function replayGreenHandoff(
       verdictId: row.id,
       reason: 'promote_no_change',
     });
-    return;
-  }
-
-  try {
-    await deps.insertOverseerAction({
-      runId: record.runId,
-      woId: record.woId,
-      class: actionClass(record),
-      action: 'flag_merge_ready',
-      result,
-    });
-  } catch (error) {
-    let compensated = false;
-    try {
-      compensated = await options.verdictStore.revertUnactionedFlagMergeReadyPromotion(
-        row.id,
-        priorAction
-      );
-    } catch (revertError) {
-      log.error(
-        {
-          err: revertError as Error,
-          runId: record.runId,
-          headSha,
-          verdictId: row.id,
-          reason: 'promote_compensate_failed',
-        },
-        'overseer.judge_first.replay_green_skipped'
-      );
-      return;
-    }
-    log.error(
-      {
-        err: error as Error,
-        runId: record.runId,
-        headSha,
-        verdictId: row.id,
-        compensated,
-        reason: compensated ? 'handoff_receipt_failed' : 'promote_compensate_failed',
-      },
-      'overseer.judge_first.replay_green_skipped'
-    );
     return;
   }
   log.info(

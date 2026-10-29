@@ -794,50 +794,76 @@ export async function getVerdictByRunHead(input: { runId: string; headSha: strin
 }
 
 /**
- * Promote an unactioned observe or healthy verdict to flag_merge_ready.
- * Returns true only when this call changed the row. A second call is a no-op.
+ * Conditional predicate for an unactioned observe or healthy replay row.
+ * Does not write the flag_merge_ready receipt. Replay handoff must use
+ * promoteObserveOrHealthyVerdictWithReceipt so the verdict and the receipt
+ * commit together. Returns true only when this call changed the row.
  * No UPDATE ... RETURNING: the SQLite adapter rejects it.
  */
-export async function promoteObserveOrHealthyVerdict(verdictId: string): Promise<boolean> {
-  const result = await getDatabase().query(
-    `UPDATE overseer_verdicts
+const PROMOTE_OBSERVE_OR_HEALTHY_SQL = `UPDATE overseer_verdicts
      SET proposed_action = 'flag_merge_ready', updated_at = $2
      WHERE id = $1
        AND verdict IN ('observe', 'healthy')
        AND proposed_action IN ('none', 'verdict_write', 'comment_findings')
-       AND actioned_at IS NULL`,
-    [verdictId, new Date().toISOString()]
-  );
+       AND actioned_at IS NULL`;
+
+export async function promoteObserveOrHealthyVerdict(verdictId: string): Promise<boolean> {
+  const result = await getDatabase().query(PROMOTE_OBSERVE_OR_HEALTHY_SQL, [
+    verdictId,
+    new Date().toISOString(),
+  ]);
   return result.rowCount === 1;
 }
 
-const REVERTIBLE_REPLAY_ACTIONS: ReadonlySet<string> = new Set([
-  'none',
-  'verdict_write',
-  'comment_findings',
-]);
+/**
+ * SQLite's withTransaction uses one connection and rejects a nested BEGIN.
+ * Overlapping handoffs in this process run one at a time. The database
+ * transaction is still the commit boundary: a failed receipt rolls the
+ * promotion back before any other connection can see it.
+ */
+let replayGreenReceiptTail: Promise<void> = Promise.resolve();
+
+function enqueueReplayGreenReceipt<T>(run: () => Promise<T>): Promise<T> {
+  const executed = replayGreenReceiptTail.then(run);
+  replayGreenReceiptTail = executed.then(
+    () => undefined,
+    () => undefined
+  );
+  return executed;
+}
 
 /**
- * Undo a replay promotion when the flag_merge_ready receipt did not commit.
- * The merge bridge claims unactioned flag_merge_ready rows and does not
- * require that receipt, so a promoted row with no receipt is mergeable.
- * Restores priorAction only while the row is still unactioned.
+ * Promote an unactioned observe or healthy verdict and insert its
+ * flag_merge_ready receipt in one transaction. Returns true only when both
+ * writes committed. Returns false when the row was not promotable; no receipt
+ * is inserted. A failed insert rolls the promotion back, so the merge bridge
+ * cannot observe a flag_merge_ready verdict that has no receipt.
  */
-export async function revertUnactionedFlagMergeReadyPromotion(
-  verdictId: string,
-  priorAction: string
-): Promise<boolean> {
-  if (!REVERTIBLE_REPLAY_ACTIONS.has(priorAction)) return false;
-  const result = await getDatabase().query(
-    `UPDATE overseer_verdicts
-     SET proposed_action = $2, updated_at = $3
-     WHERE id = $1
-       AND verdict IN ('observe', 'healthy')
-       AND proposed_action = 'flag_merge_ready'
-       AND actioned_at IS NULL`,
-    [verdictId, priorAction, new Date().toISOString()]
+export async function promoteObserveOrHealthyVerdictWithReceipt(input: {
+  verdictId: string;
+  runId: string;
+  woId: string;
+  class: string;
+  result: string;
+}): Promise<boolean> {
+  return enqueueReplayGreenReceipt(() =>
+    getDatabase().withTransaction(async query => {
+      const updated = await query(PROMOTE_OBSERVE_OR_HEALTHY_SQL, [
+        input.verdictId,
+        new Date().toISOString(),
+      ]);
+      if (updated.rowCount !== 1) return false;
+      const inserted = await query(
+        `INSERT INTO overseer_actions (id, run_id, wo_id, class, action, result)
+         VALUES ($1, $2, $3, $4, 'flag_merge_ready', $5)`,
+        [randomUUID(), input.runId, input.woId, input.class, input.result]
+      );
+      if (inserted.rowCount !== 1) {
+        throw new Error('overseer_replay_green_receipt_missing');
+      }
+      return true;
+    })
   );
-  return result.rowCount === 1;
 }
 
 export async function getOverseerVerdictsForRun(runId: string): Promise<OverseerVerdictRow[]> {
