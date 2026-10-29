@@ -703,6 +703,38 @@ describe('merge execution bridge', () => {
     ]);
     expect(await h.store.listUnactionedVerdicts()).toHaveLength(0);
   });
+
+  test('Test 5: production base shopops master is refused by the bridge', async () => {
+    const h = harness(
+      [verdict('shopops-master')],
+      greenPr({
+        baseBranch: 'master',
+        headSha: 'judged-sha',
+        mergeable: true,
+        mergeableState: 'clean',
+        pr: { owner: 'thinmansoftware', repo: 'shopops', number: 1 },
+      })
+    );
+    h.store.getRunById = async () => ({
+      ...run('shopops-master'),
+      owner: 'thinmansoftware',
+      repo: 'shopops',
+    });
+
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({
+        mutationSent: false,
+        reason: 'integration_base_mismatch',
+      })
+    );
+  });
 });
 
 const RUNLESS_PR = 844;

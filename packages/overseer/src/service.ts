@@ -5,11 +5,13 @@ import {
   deferVerdictClaimForMergeExecution,
   finalizeOverseerVerdict,
   getOverseerWatchRunById,
+  getVerdictByRunHead,
   insertOverseerAction,
   listActiveRunUserMessages,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
+  promoteObserveOrHealthyVerdict,
   recordVerdictMergeOutcome,
   releaseOverseerMergeSlot,
   releaseVerdictClaimForMergeExecution,
@@ -192,6 +194,8 @@ export function emergencyStopEngaged(): boolean {
 const defaultVerdictStore: OverseerVerdictStoreDeps = {
   claimVerdict: claimOverseerVerdict,
   finalizeVerdict: finalizeOverseerVerdict,
+  getVerdictByRunHead,
+  promoteObserveOrHealthyVerdict,
 };
 
 /**
@@ -200,13 +204,18 @@ const defaultVerdictStore: OverseerVerdictStoreDeps = {
  * Exported so wiring tests can drive the REAL merge-vs-skip gate
  * (`record.action === 'merge_ready'`) instead of re-implementing it inline: a
  * test that copies this condition cannot detect drift if the gate here changes.
+ *
+ * deterministicMergeHandoff is the replay-green path into the merge execution
+ * bridge. It stays separate from mergeCoordinator because that coordinator is
+ * createMergeManager and calls judgeWithGrok.
  */
 export async function handleRecord(
   record: WatchedRunRecord,
   deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
   dryRun: boolean,
   actor: string,
-  mergeCoordinator?: MergeReadyCoordinator
+  mergeCoordinator?: MergeReadyCoordinator,
+  deterministicMergeHandoff?: () => Promise<unknown>
 ): Promise<void> {
   if (emergencyStopEngaged()) {
     log.warn({ runId: record.runId }, 'overseer.emergency_stop_engaged');
@@ -223,6 +232,7 @@ export async function handleRecord(
         dryRun,
         actor,
         mergeCoordinator,
+        deterministicMergeHandoff,
         verdictStore: defaultVerdictStore,
       });
     } catch (error) {
@@ -413,19 +423,8 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   };
   options.signal?.addEventListener('abort', abortFromParent, { once: true });
   if (options.signal?.aborted) coupledAbort.abort();
-  const watcher = watchLoop(
-    deps,
-    record => handleRecord(record, deps, dryRun, 'overseer-service', options.mergeCoordinator),
-    {
-      intervalMs: options.intervalMs,
-      once: options.once,
-      signal: coupledAbort.signal,
-    }
-  );
-  const tasks: Promise<void>[] = [watcher];
-  if (options.mergeBridgeEnabled) {
-    const mergeBridgeRun =
-      options.mergeBridgeRun ??
+  const mergeBridgeRun = options.mergeBridgeEnabled
+    ? (options.mergeBridgeRun ??
       ((): Promise<void> =>
         runMergeExecutionBridgeOnce({
           github: deps,
@@ -440,7 +439,27 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
             releaseMergeSlot: releaseOverseerMergeSlot,
             recordOutcome: recordVerdictMergeOutcome,
           },
-        }));
+        })))
+    : undefined;
+  const watcher = watchLoop(
+    deps,
+    record =>
+      handleRecord(
+        record,
+        deps,
+        dryRun,
+        'overseer-service',
+        options.mergeCoordinator,
+        mergeBridgeRun
+      ),
+    {
+      intervalMs: options.intervalMs,
+      once: options.once,
+      signal: coupledAbort.signal,
+    }
+  );
+  const tasks: Promise<void>[] = [watcher];
+  if (mergeBridgeRun) {
     tasks.push(
       runMergeBridgeScheduler({
         signal: coupledAbort.signal,

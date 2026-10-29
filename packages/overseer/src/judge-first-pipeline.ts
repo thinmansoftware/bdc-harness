@@ -9,8 +9,12 @@
  *    M-15 tier map, and it gates execution only, never consultation.
  *  - Judge health failures finalize as alarm states and escalate loudly when
  *    the retry budget is exhausted -- they never become semantic verdicts.
- *  - Replay: a lost claim means another pass already owns this evidence; the
- *    pipeline exits without a model call or a second action.
+ *  - Replay: a lost claim does not invoke the judge. A merge-ready open PR
+ *    may emit one flag_merge_ready action, and only after that insert succeeds
+ *    promote the verdict and hand off to the deterministic merge execution
+ *    bridge. It must not call the runtime merge coordinator
+ *    (createMergeManager), which calls judgeWithGrok. A failed audit insert
+ *    must not leave the verdict merge-queued.
  */
 
 import { createLogger } from '@archon/paths';
@@ -121,6 +125,12 @@ export interface JudgeFirstPipelineOptions {
   dryRun: boolean;
   actor: string;
   mergeCoordinator?: MergeReadyCoordinator;
+  /**
+   * Replay-green handoff. Production passes the merge execution bridge.
+   * This must not be mergeCoordinator: that function is createMergeManager
+   * and calls judgeWithGrok, which this path is forbidden to do.
+   */
+  deterministicMergeHandoff?: () => Promise<unknown>;
   verdictStore: OverseerVerdictStoreDeps;
   judge?: (
     envelope: ReturnType<typeof buildEvidenceEnvelope>,
@@ -134,6 +144,162 @@ export interface JudgeFirstPipelineOptions {
 
 function actionClass(record: WatchedRunRecord): string {
   return record.errorClass ?? 'none';
+}
+
+function logReplayGreenSkipped(fields: Record<string, unknown>): void {
+  log.info(fields, 'overseer.judge_first.replay_green_skipped');
+}
+
+/**
+ * Lost-claim come-back for an open PR. The first verdict already exists for
+ * this run and head; when deterministic evidence is now merge-ready, record
+ * the flag_merge_ready audit action and only then promote an observe or
+ * healthy row and hand it to the merge execution bridge. The insert is first
+ * so a failed insert cannot leave a merge-queued row for a later scheduler.
+ * No judge call and no runtime merge coordinator call. Fail closed on every
+ * other verdict, store error, dry run, or missing bridge.
+ */
+async function replayGreenHandoff(
+  record: WatchedRunRecord,
+  deps: OverseerActionsDeps,
+  options: JudgeFirstPipelineOptions,
+  headSha: string
+): Promise<void> {
+  if (!isPrMergeReady(record.prEvidence)) {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      reason: record.prEvidence.checks.pending > 0 ? 'checks_pending' : 'not_merge_ready',
+    });
+    return;
+  }
+
+  let row: Awaited<ReturnType<OverseerVerdictStoreDeps['getVerdictByRunHead']>>;
+  try {
+    row = await options.verdictStore.getVerdictByRunHead({ runId: record.runId, headSha });
+  } catch (error) {
+    log.error(
+      { err: error as Error, runId: record.runId, headSha, reason: 'verdict_read_failed' },
+      'overseer.judge_first.replay_green_skipped'
+    );
+    return;
+  }
+  if (!row) {
+    logReplayGreenSkipped({ runId: record.runId, headSha, reason: 'verdict_missing' });
+    return;
+  }
+  if (row.verdict !== 'observe' && row.verdict !== 'healthy') {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      verdictId: row.id,
+      verdict: row.verdict,
+      reason: 'verdict_not_promotable',
+    });
+    return;
+  }
+
+  const result = `steward_handoff:replay_green:verdict:${row.id}${options.dryRun ? ':dry_run' : ''}`;
+  if (options.dryRun) {
+    await deps.insertOverseerAction({
+      runId: record.runId,
+      woId: record.woId,
+      class: actionClass(record),
+      action: 'flag_merge_ready',
+      result,
+    });
+    log.info(
+      { runId: record.runId, woId: record.woId, verdictId: row.id, dryRun: true },
+      'overseer.judge_first.replay_green_handoff'
+    );
+    return;
+  }
+  // Same function as mergeCoordinator means createMergeManager / judgeWithGrok.
+  // Refuse that wiring rather than take a second LLM judgment.
+  if (
+    !options.deterministicMergeHandoff ||
+    options.deterministicMergeHandoff === options.mergeCoordinator
+  ) {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      verdictId: row.id,
+      reason: options.deterministicMergeHandoff
+        ? 'bridge_is_runtime_coordinator'
+        : 'bridge_missing',
+    });
+    return;
+  }
+
+  // Already queued or already actioned: do not write a second audit row and
+  // do not hand off again. Promotion is conditional, so a concurrent winner
+  // already inserted its action before it changed the row.
+  if (row.proposedAction === 'flag_merge_ready' || row.actionedAt !== null) {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      verdictId: row.id,
+      reason: 'already_queued',
+    });
+    return;
+  }
+
+  try {
+    await deps.insertOverseerAction({
+      runId: record.runId,
+      woId: record.woId,
+      class: actionClass(record),
+      action: 'flag_merge_ready',
+      result,
+    });
+  } catch (error) {
+    log.error(
+      {
+        err: error as Error,
+        runId: record.runId,
+        headSha,
+        verdictId: row.id,
+        reason: 'audit_insert_failed',
+      },
+      'overseer.judge_first.replay_green_skipped'
+    );
+    return;
+  }
+
+  let promoted = false;
+  try {
+    promoted = await options.verdictStore.promoteObserveOrHealthyVerdict(row.id);
+  } catch (error) {
+    log.error(
+      {
+        err: error as Error,
+        runId: record.runId,
+        headSha,
+        verdictId: row.id,
+        reason: 'promote_failed',
+      },
+      'overseer.judge_first.replay_green_skipped'
+    );
+    return;
+  }
+  if (!promoted) {
+    logReplayGreenSkipped({
+      runId: record.runId,
+      headSha,
+      verdictId: row.id,
+      reason: 'promote_no_change',
+    });
+    return;
+  }
+
+  log.info(
+    { runId: record.runId, woId: record.woId, verdictId: row.id, dryRun: false },
+    'overseer.judge_first.replay_green_handoff'
+  );
+  // createMergeManager (options.mergeCoordinator) always calls judgeWithGrok.
+  // The promoted flag_merge_ready row is the bridge queue; running the bridge
+  // here merges from that row with no second LLM judgment.
+  await options.deterministicMergeHandoff();
 }
 
 function newestEvent(events: OverseerWorkflowEvent[]): OverseerWorkflowEvent | undefined {
@@ -312,6 +478,9 @@ export async function handleRecordJudgeFirst(
     // its PR opened, while checks were still running -- the loop then never
     // re-examined it. Close only when the PR is merged/closed/missing.
     const prStillOpen = record.prEvidence?.state === 'open';
+    if (prStillOpen) {
+      await replayGreenHandoff(record, deps, options, headSha);
+    }
     if (
       (record.action === 'success' || record.action === 'ignore') &&
       !prStillOpen &&

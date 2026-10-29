@@ -333,4 +333,11 @@ export interface OverseerVerdictStoreDeps {
     evidenceDigest?: string;
     evidence?: string;
   }): Promise<unknown>;
+  getVerdictByRunHead(input: { runId: string; headSha: string }): Promise<{
+    id: string;
+    verdict: string | null;
+    proposedAction: string | null;
+    actionedAt: string | null;
+  } | null>;
+  promoteObserveOrHealthyVerdict(verdictId: string): Promise<boolean>;
 }
