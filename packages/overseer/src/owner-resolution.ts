@@ -30,9 +30,22 @@ export interface OwnerResolutionOctokitLike {
 let octokit: Promise<OwnerResolutionOctokitLike> | null = null;
 
 async function getOctokit(): Promise<OwnerResolutionOctokitLike> {
-  const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  octokit ??= import('@octokit/rest').then(
-    module => new module.Octokit({ auth: token }) as unknown as OwnerResolutionOctokitLike
+  // Route every request through the shared service-identity transport (overseer
+  // identity) so authentication -- including App installation-token minting and
+  // refresh -- is owned by the provider; no token is read from process.env here.
+  octokit ??= Promise.all([import('@octokit/rest'), import('@archon/core/github/request')]).then(
+    ([module, transport]) => {
+      const requestFetch = async (
+        input: string | URL | Request,
+        init?: RequestInit
+      ): Promise<Response> => {
+        const url = input instanceof Request ? input.url : input;
+        return transport.serviceGitHubFetch({ service: 'overseer', url, init });
+      };
+      return new module.Octokit({
+        request: { fetch: requestFetch },
+      }) as unknown as OwnerResolutionOctokitLike;
+    }
   );
   return octokit;
 }

@@ -3,7 +3,9 @@ import { generateKeyPairSync } from 'node:crypto';
 import {
   SERVICE_GITHUB_AUTH_PRECEDENCE,
   clearServiceGitHubTokenCache,
+  getServiceGitHubToken,
   resolveServiceGitHubAuth,
+  type GitHubAppIdentity,
 } from './service-identity';
 
 const privateKey = generateKeyPairSync('rsa', { modulusLength: 2048 })
@@ -160,5 +162,129 @@ describe('Test 2: service GitHub identity precedence', () => {
         GITHUB_APP_MERGE_MANAGER_PRIVATE_KEY: privateKey,
       }).distinct
     ).toBe(true);
+  });
+});
+
+describe('Test 3: refresh before expiry and single-flight minting', () => {
+  const appIdentity = (): GitHubAppIdentity => ({
+    kind: 'app',
+    service: 'overseer',
+    appId: '1',
+    installationId: '2',
+    privateKey,
+    poolId: 'app-1-2',
+    distinct: true,
+  });
+
+  it('single-flights concurrent mints: exactly one mint, both get the new token', async () => {
+    clearServiceGitHubTokenCache();
+    let mints = 0;
+    const fetchImpl = (async (url: string | URL | Request): Promise<Response> => {
+      if (String(url).includes('/access_tokens')) {
+        mints += 1;
+        await new Promise(resolve => setTimeout(resolve, 10));
+        return Response.json({
+          token: `tok-${mints}`,
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      }
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch;
+    const [a, b] = await Promise.all([
+      getServiceGitHubToken(appIdentity(), { fetch: fetchImpl }),
+      getServiceGitHubToken(appIdentity(), { fetch: fetchImpl }),
+    ]);
+    expect(mints).toBe(1);
+    expect(a).toBe('tok-1');
+    expect(b).toBe('tok-1');
+  });
+
+  it('refreshes when fewer than 10 minutes remain of the token life', async () => {
+    clearServiceGitHubTokenCache();
+    const base = 1_000_000_000_000;
+    let mints = 0;
+    const fetchImpl = (async (): Promise<Response> => {
+      mints += 1;
+      // Expires only 5 minutes after "now" -> inside the 10-minute refresh skew.
+      return Response.json({
+        token: `tok-${mints}`,
+        expires_at: new Date(base + 5 * 60_000).toISOString(),
+      });
+    }) as typeof fetch;
+    const first = await getServiceGitHubToken(appIdentity(), { fetch: fetchImpl, now: () => base });
+    expect(first).toBe('tok-1');
+    const second = await getServiceGitHubToken(appIdentity(), {
+      fetch: fetchImpl,
+      now: () => base,
+    });
+    expect(mints).toBe(2);
+    expect(second).toBe('tok-2');
+  });
+
+  it('alerts exactly once when the installation-token mint fails, then rethrows', async () => {
+    clearServiceGitHubTokenCache();
+    const alerts: string[] = [];
+    let mints = 0;
+    const fetchImpl = (async (url: string | URL | Request): Promise<Response> => {
+      if (String(url).includes('/access_tokens')) {
+        mints += 1;
+        return new Response('nope', { status: 401 });
+      }
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch;
+    await expect(
+      getServiceGitHubToken(appIdentity(), {
+        fetch: fetchImpl,
+        alertSink: credential => {
+          alerts.push(credential);
+        },
+      })
+    ).rejects.toThrow('github_app_token_mint_failed:401');
+    expect(mints).toBe(1);
+    expect(alerts).toEqual(['app-1-2']);
+  });
+
+  it('single-flights a failed mint: both callers reject, one alert', async () => {
+    clearServiceGitHubTokenCache();
+    const alerts: string[] = [];
+    let mints = 0;
+    const fetchImpl = (async (url: string | URL | Request): Promise<Response> => {
+      if (String(url).includes('/access_tokens')) {
+        mints += 1;
+        await new Promise(resolve => setTimeout(resolve, 10));
+        return new Response('nope', { status: 500 });
+      }
+      return new Response('{}', { status: 200 });
+    }) as typeof fetch;
+    const alertSink = (credential: string): void => {
+      alerts.push(credential);
+    };
+    const results = await Promise.allSettled([
+      getServiceGitHubToken(appIdentity(), { fetch: fetchImpl, alertSink }),
+      getServiceGitHubToken(appIdentity(), { fetch: fetchImpl, alertSink }),
+    ]);
+    expect(results.every(r => r.status === 'rejected')).toBe(true);
+    expect(mints).toBe(1);
+    expect(alerts).toEqual(['app-1-2']);
+  });
+
+  it('returns the cached token when more than 10 minutes remain', async () => {
+    clearServiceGitHubTokenCache();
+    const base = 1_000_000_000_000;
+    let mints = 0;
+    const fetchImpl = (async (): Promise<Response> => {
+      mints += 1;
+      return Response.json({
+        token: `tok-${mints}`,
+        expires_at: new Date(base + 30 * 60_000).toISOString(),
+      });
+    }) as typeof fetch;
+    const first = await getServiceGitHubToken(appIdentity(), { fetch: fetchImpl, now: () => base });
+    const second = await getServiceGitHubToken(appIdentity(), {
+      fetch: fetchImpl,
+      now: () => base,
+    });
+    expect(mints).toBe(1);
+    expect(second).toBe(first);
   });
 });

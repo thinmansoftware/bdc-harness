@@ -7,6 +7,7 @@ import { checkGitHubWebhookSignature } from './webhook-signature';
 import { readdir, access } from 'fs/promises';
 import { join } from 'path';
 import type { IPlatformAdapter, MessageMetadata } from '@archon/core';
+import { getGitHubTokenForService } from '@archon/core/github/service-identity';
 import type { IsolationHints } from '@archon/isolation';
 import {
   ConversationNotFoundError,
@@ -484,7 +485,14 @@ export class GitHubAdapter implements IPlatformAdapter {
 
     // Directory doesn't exist - clone the repository
     getLog().info({ owner, repo, repoPath }, 'github.repo_cloning');
-    const ghToken = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+    // Token from the shared provider (App installation token or PAT); fall back
+    // to an anonymous clone when no credential resolves.
+    let ghToken = '';
+    try {
+      ghToken = await getGitHubTokenForService('overseer');
+    } catch {
+      ghToken = '';
+    }
     const repoUrl = `https://github.com/${owner}/${repo}.git`;
 
     const cloneResult = await cloneRepository(

@@ -14,17 +14,30 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 const ORACLE_API_KEY = process.env.ORACLE_API_KEY;
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
 export interface PersonaContextInput {
   name: string;
   context?: AgentContext;
 }
 
-export async function loadContext(agent: PersonaContextInput): Promise<string> {
+/**
+ * Options for loadContext. `githubToken` is injected by the caller (resolved
+ * from the shared service-identity provider in @archon/core via WorkflowDeps),
+ * so this package never reads a GitHub token from process.env itself. When
+ * absent, wiki fetching is skipped with a warning.
+ */
+export interface PersonaContextOptions {
+  githubToken?: string;
+}
+
+export async function loadContext(
+  agent: PersonaContextInput,
+  options: PersonaContextOptions = {}
+): Promise<string> {
   const context = agent.context;
   if (!context) return '';
 
+  const githubToken = options.githubToken;
   const cacheKey = makeCacheKey(agent.name, context);
   const cached = contextCache.get(cacheKey);
   if (cached !== undefined) return cached;
@@ -33,11 +46,11 @@ export async function loadContext(agent: PersonaContextInput): Promise<string> {
   const oracleResults: OracleFetchResult[] = [];
 
   if (context.wiki && context.wiki.length > 0) {
-    if (!GITHUB_TOKEN) {
+    if (!githubToken) {
       getLog().warn({ name: agent.name }, 'context_loader.github_token_missing');
     } else {
       const wikiPromises = context.wiki.map(path =>
-        fetchWikiPath(path, GITHUB_TOKEN).catch(err => {
+        fetchWikiPath(path, githubToken).catch(err => {
           getLog().warn(
             { name: agent.name, path, err: (err as Error).message },
             'context_loader.wiki_fetch_failed'
