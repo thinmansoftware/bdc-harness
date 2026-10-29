@@ -238,6 +238,13 @@ describe('PostgresAdapter', () => {
         // desktop Board/XO seat, added after Phase 0, so combined carries it.
         ['astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 'TRUE'],
         ['taskmaster', 'Taskmaster', 'worker_poll', 'TRUE'],
+        // WO-HARNESS-COMPANION-MCP-MAILBOX-01 (migration 065): companion
+        // mailboxes added after Phase 0. combined carries them; migration 040
+        // must not.
+        ['grokbot', 'Grok Bot (voice companion)', 'drain_on_start', 'TRUE'],
+        ['dot', 'Dot (voice companion)', 'drain_on_start', 'FALSE'],
+        ['muse', 'Muse (voice companion)', 'drain_on_start', 'FALSE'],
+        ['duet', 'Duet (voice companion)', 'drain_on_start', 'FALSE'],
       ] as const;
 
       expect(migration).toContain(

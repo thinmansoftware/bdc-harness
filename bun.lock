@@ -78,6 +78,13 @@
         "@types/node": "^22.0.0",
       },
     },
+    "packages/companion-mcp": {
+      "name": "@archon/companion-mcp",
+      "version": "0.3.10",
+      "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.29.0",
+      },
+    },
     "packages/core": {
       "name": "@archon/core",
       "version": "0.3.10",
@@ -356,6 +363,8 @@
     "@archon/canary-suite": ["@archon/canary-suite@workspace:packages/canary-suite"],
 
     "@archon/cli": ["@archon/cli@workspace:packages/cli"],
+
+    "@archon/companion-mcp": ["@archon/companion-mcp@workspace:packages/companion-mcp"],
 
     "@archon/core": ["@archon/core@workspace:packages/core"],
 
