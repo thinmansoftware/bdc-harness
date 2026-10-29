@@ -142,6 +142,14 @@ export interface WatchedRunRecord {
   lastEvent?: OverseerWorkflowEvent;
 }
 
+/**
+ * Replay handoff into the merge-execution bridge. A method object, not a
+ * MergeReadyCoordinator function, so the two cannot be substituted.
+ */
+export interface DeterministicMergeHandoff {
+  handoff(record: WatchedRunRecord): Promise<unknown>;
+}
+
 export interface OverseerRunStoreDeps {
   listRunsForWatch(): Promise<OverseerRunRecord[]>;
   listRunEvents(runId: string): Promise<OverseerWorkflowEvent[]>;

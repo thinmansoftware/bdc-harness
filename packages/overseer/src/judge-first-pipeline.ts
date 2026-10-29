@@ -25,6 +25,7 @@ import { ruleOnAction, type TierRuling } from './tier-map';
 import { runEscalation } from './escalate';
 import { isPrMergeReady } from './judge-pr';
 import type {
+  DeterministicMergeHandoff,
   GitHubClientDeps,
   OverseerActionsDeps,
   OverseerRunStoreDeps,
@@ -121,6 +122,11 @@ export interface JudgeFirstPipelineOptions {
   dryRun: boolean;
   actor: string;
   mergeCoordinator?: MergeReadyCoordinator;
+  /**
+   * Replay-only handoff. The initial merge_candidate path keeps using
+   * mergeCoordinator. This field is not an alias of that function.
+   */
+  deterministicMergeHandoff?: DeterministicMergeHandoff;
   verdictStore: OverseerVerdictStoreDeps;
   judge?: (
     envelope: ReturnType<typeof buildEvidenceEnvelope>,
@@ -140,12 +146,38 @@ function logReplayGreenSkipped(fields: Record<string, unknown>): void {
   log.info(fields, 'overseer.judge_first.replay_green_skipped');
 }
 
+const REPLAY_PROMOTABLE_VERDICTS: ReadonlySet<string> = new Set(['observe', 'healthy']);
+const REPLAY_PROMOTABLE_ACTIONS: ReadonlySet<string> = new Set([
+  'none',
+  'verdict_write',
+  'comment_findings',
+]);
+
+function replayPromotionSkipReason(row: {
+  verdict: string | null;
+  proposedAction: string | null;
+  actionedAt: string | null;
+}): 'verdict_not_promotable' | 'action_not_promotable' | null {
+  if (row.verdict === null || !REPLAY_PROMOTABLE_VERDICTS.has(row.verdict)) {
+    return 'verdict_not_promotable';
+  }
+  if (
+    row.actionedAt !== null ||
+    row.proposedAction === null ||
+    !REPLAY_PROMOTABLE_ACTIONS.has(row.proposedAction)
+  ) {
+    return 'action_not_promotable';
+  }
+  return null;
+}
+
 /**
  * Lost-claim come-back for an open PR. The first verdict already exists for
  * this run and head; when deterministic evidence is now merge-ready, promote
- * an observe or healthy row and hand it to the existing coordinator. No judge
- * call. Fail closed on every other verdict, store error, dry run, or missing
- * coordinator.
+ * an observe or healthy row whose prior action is still safe, then hand it to
+ * the merge-execution bridge. No judge call and no mergeCoordinator call.
+ * Fail closed on every other verdict, unsafe action, store error, dry run,
+ * or missing deterministic handoff.
  */
 async function replayGreenHandoff(
   record: WatchedRunRecord,
@@ -176,13 +208,15 @@ async function replayGreenHandoff(
     logReplayGreenSkipped({ runId: record.runId, headSha, reason: 'verdict_missing' });
     return;
   }
-  if (row.verdict !== 'observe' && row.verdict !== 'healthy') {
+  const skipReason = replayPromotionSkipReason(row);
+  if (skipReason) {
     logReplayGreenSkipped({
       runId: record.runId,
       headSha,
       verdictId: row.id,
       verdict: row.verdict,
-      reason: 'verdict_not_promotable',
+      proposedAction: row.proposedAction,
+      reason: skipReason,
     });
     return;
   }
@@ -202,7 +236,7 @@ async function replayGreenHandoff(
     );
     return;
   }
-  if (!options.mergeCoordinator) {
+  if (!options.deterministicMergeHandoff) {
     logReplayGreenSkipped({
       runId: record.runId,
       headSha,
@@ -249,7 +283,7 @@ async function replayGreenHandoff(
     { runId: record.runId, woId: record.woId, verdictId: row.id, dryRun: false },
     'overseer.judge_first.replay_green_handoff'
   );
-  await options.mergeCoordinator(record);
+  await options.deterministicMergeHandoff.handoff(record);
 }
 
 function newestEvent(events: OverseerWorkflowEvent[]): OverseerWorkflowEvent | undefined {

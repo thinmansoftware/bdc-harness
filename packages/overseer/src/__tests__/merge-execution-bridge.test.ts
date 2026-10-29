@@ -706,7 +706,13 @@ describe('merge execution bridge', () => {
 
   test('Test 5: production base shopops master is refused by the bridge', async () => {
     const h = harness(
-      [verdict('shopops-master')],
+      [
+        {
+          ...verdict('shopops-master'),
+          run_id: 'pr-discovery:thinmansoftware/shopops#1',
+          wo_id: 'gh:thinmansoftware/shopops#1',
+        },
+      ],
       greenPr({
         baseBranch: 'master',
         headSha: 'judged-sha',
@@ -715,11 +721,6 @@ describe('merge execution bridge', () => {
         pr: { owner: 'thinmansoftware', repo: 'shopops', number: 1 },
       })
     );
-    h.store.getRunById = async () => ({
-      ...run('shopops-master'),
-      owner: 'thinmansoftware',
-      repo: 'shopops',
-    });
 
     await runMergeExecutionBridgeOnce({
       store: h.store,
@@ -731,7 +732,7 @@ describe('merge execution bridge', () => {
     expect(h.outcomes[0]).toEqual(
       expect.objectContaining({
         mutationSent: false,
-        reason: 'integration_base_mismatch',
+        reason: 'base_not_allowlisted',
       })
     );
   });

@@ -194,14 +194,17 @@ function normalizeEvent(row: WorkflowEventRow): OverseerWorkflowEventRow {
 }
 
 /**
- * A run is excluded from future watch cycles only once it has a TERMINAL
- * overseer_actions row -- one that reflects a permanent, unchangeable
- * disposition (a completed merge). Every other recorded action
- * (verdict_write, merge_denied, merge_failed, tier_refused,
- * escalation_denied, escalate_with_evidence, comment_findings) describes a
- * snapshot of state that can change afterward -- CI can finish, a review
- * can post, a retry can succeed -- and must not permanently lock the run
- * out of re-evaluation.
+ * Unconditional terminal overseer_actions. Any one of these retires a run from
+ * the watch window: the merge finished, the PR was closed, an escalation was
+ * posted or refused, or the tier map refused the proposal.
+ *
+ * comment_findings is not in this list. It excludes a run only when that run
+ * lacks an unactioned observe or healthy verdict whose proposed_action is still
+ * none, verdict_write, or comment_findings. The exception keeps a run-derived
+ * PR reachable after the first judgment comments while checks are still pending.
+ * Once that verdict is promoted to flag_merge_ready, the exception no longer
+ * matches and the comment retires the run. verdict_write, merge_denied, and
+ * other non-terminal actions stay non-terminal for every verdict.
  *
  * Anchor: 2026-08-25 E2E merge canary (WO-HARNESS-E2E-MERGE-CANARY-01,
  * bdc-harness PR #705). The judge wrote a provisional `verdict_write` before
@@ -210,17 +213,16 @@ function normalizeEvent(row: WorkflowEventRow): OverseerWorkflowEventRow {
  * and the PR was approved. The Merge Manager's own heartbeat stayed
  * eligible:0 for 30+ minutes on a fully mergeable PR.
  */
-const TERMINAL_OVERSEER_ACTIONS = [
+const UNCONDITIONAL_TERMINAL_OVERSEER_ACTIONS = [
   'merged', // merge manager executed -- permanently done
   'watch_closed', // judged with a resolved lookup and nothing actionable -- done
   'escalate_with_evidence', // escalation posted once -- human owns it now
   'escalation_denied',
   'tier_refused',
-  'comment_findings',
 ] as const;
 
 export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
-  const placeholders = TERMINAL_OVERSEER_ACTIONS.map(() => '?').join(', ');
+  const placeholders = UNCONDITIONAL_TERMINAL_OVERSEER_ACTIONS.map(() => '?').join(', ');
   const result = await getDatabase().query<WorkflowRunRow>(
     `SELECT r.id, r.status, r.metadata, r.user_message, r.working_path,
             c.name AS codebase_name
@@ -236,8 +238,24 @@ export async function listRunsForOverseerWatch(): Promise<OverseerWatchRun[]> {
          WHERE oa.run_id = r.id
            AND oa.action IN (${placeholders})
        )
+       -- comment_findings retires the run only when no safe unactioned
+       -- observe/healthy verdict is still waiting for green evidence.
+       AND NOT (
+         EXISTS (
+           SELECT 1 FROM overseer_actions cf
+           WHERE cf.run_id = r.id
+             AND cf.action = 'comment_findings'
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM overseer_verdicts v
+           WHERE v.run_id = r.id
+             AND v.verdict IN ('observe', 'healthy')
+             AND v.proposed_action IN ('none', 'verdict_write', 'comment_findings')
+             AND v.actioned_at IS NULL
+         )
+       )
      ORDER BY COALESCE(r.completed_at, r.last_activity_at, r.started_at) ASC`,
-    [...TERMINAL_OVERSEER_ACTIONS]
+    [...UNCONDITIONAL_TERMINAL_OVERSEER_ACTIONS]
   );
   return result.rows.map(normalizeRun);
 }
@@ -786,7 +804,7 @@ export async function promoteObserveOrHealthyVerdict(verdictId: string): Promise
      SET proposed_action = 'flag_merge_ready', updated_at = $2
      WHERE id = $1
        AND verdict IN ('observe', 'healthy')
-       AND proposed_action IS DISTINCT FROM 'flag_merge_ready'
+       AND proposed_action IN ('none', 'verdict_write', 'comment_findings')
        AND actioned_at IS NULL`,
     [verdictId, new Date().toISOString()]
   );
