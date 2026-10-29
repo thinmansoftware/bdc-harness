@@ -348,4 +348,9 @@ export interface OverseerVerdictStoreDeps {
     actionedAt: string | null;
   } | null>;
   promoteObserveOrHealthyVerdict(verdictId: string): Promise<boolean>;
+  /**
+   * Restore the prior safe action when the flag_merge_ready receipt failed.
+   * Returns true only when this call undid an unactioned promotion.
+   */
+  revertUnactionedFlagMergeReadyPromotion(verdictId: string, priorAction: string): Promise<boolean>;
 }

@@ -19,7 +19,9 @@ import {
   getVerdictByRunHead,
   insertOverseerAction,
   listRunsForOverseerWatch,
+  listUnactionedFlagMergeReadyVerdicts,
   promoteObserveOrHealthyVerdict,
+  revertUnactionedFlagMergeReadyPromotion,
 } from '@archon/core/db/overseer';
 import { rootLogger } from '@archon/paths';
 import {
@@ -143,6 +145,14 @@ function makeVerdictStore(
       if (row.actionedAt !== null) return false;
       if (row.proposedAction === null || !REPLAY_SAFE_ACTIONS.has(row.proposedAction)) return false;
       row.proposedAction = 'flag_merge_ready';
+      return true;
+    },
+    revertUnactionedFlagMergeReadyPromotion: async (verdictId, priorAction) => {
+      const row = state.replayRow;
+      if (!row || row.id !== verdictId) return false;
+      if (row.actionedAt !== null || row.proposedAction !== 'flag_merge_ready') return false;
+      if (!REPLAY_SAFE_ACTIONS.has(priorAction)) return false;
+      row.proposedAction = priorAction;
       return true;
     },
   };
@@ -999,6 +1009,37 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
     expect(handoffCalls).toHaveLength(0);
   });
 
+  test('replay green: receipt insert failure reverts the promotion and does not hand off', async () => {
+    const state = replayState('observe');
+    const record = greenReplayRecord();
+    const { deps } = makeDeps();
+    deps.insertOverseerAction = async action => {
+      if (action.action === 'flag_merge_ready') throw new Error('receipt_insert_failed');
+    };
+    const handoffCalls: WatchedRunRecord[] = [];
+    await handleRecordJudgeFirst(record, deps, {
+      dryRun: false,
+      actor: 'test',
+      mergeCoordinator: async () => {
+        throw new Error('coordinator must not run');
+      },
+      deterministicMergeHandoff: {
+        handoff: async seen => {
+          handoffCalls.push(seen);
+        },
+      },
+      verdictStore: makeVerdictStore({ claimed: false }, state),
+      judge: async () => {
+        throw new Error('judge must not run');
+      },
+      escalate: fakeEscalate,
+    });
+    expect(handoffCalls).toHaveLength(0);
+    expect(state.promoteCalls).toBe(1);
+    expect(state.replayRow?.proposedAction).toBe('comment_findings');
+    expect(state.replayRow?.verdict).toBe('observe');
+  });
+
   test('replay green: missing deterministic handoff does not promote', async () => {
     const state = replayState('observe');
     const record = greenReplayRecord();
@@ -1135,6 +1176,19 @@ if (soleJudgeFirstFile) {
       };
     }
 
+    function realVerdictStore(
+      overrides: Partial<OverseerVerdictStoreDeps> = {}
+    ): OverseerVerdictStoreDeps {
+      return {
+        claimVerdict: claimOverseerVerdict,
+        finalizeVerdict: finalizeOverseerVerdict,
+        getVerdictByRunHead,
+        promoteObserveOrHealthyVerdict,
+        revertUnactionedFlagMergeReadyPromotion,
+        ...overrides,
+      };
+    }
+
     async function runRealReplay(input: {
       runId: string;
       evidence: WatchedRunRecord['prEvidence'];
@@ -1143,10 +1197,15 @@ if (soleJudgeFirstFile) {
       store?: OverseerVerdictStoreDeps;
       tally?: { handoff: number; coordinator: number; judge: number };
       withHandoff?: boolean;
+      failReceiptInsert?: boolean;
+      judge?: Parameters<typeof handleRecordJudgeFirst>[2]['judge'];
     }): Promise<{ handoff: number; coordinator: number; judge: number }> {
       const tally = input.tally ?? { handoff: 0, coordinator: 0, judge: 0 };
       const { deps } = makeDeps();
       deps.insertOverseerAction = async record => {
+        if (input.failReceiptInsert && record.action === 'flag_merge_ready') {
+          throw new Error('receipt_insert_failed');
+        }
         await insertOverseerAction(record);
       };
       await handleRecordJudgeFirst(
@@ -1172,14 +1231,10 @@ if (soleJudgeFirstFile) {
                   },
                 },
               }),
-          verdictStore: input.store ?? {
-            claimVerdict: claimOverseerVerdict,
-            finalizeVerdict: finalizeOverseerVerdict,
-            getVerdictByRunHead,
-            promoteObserveOrHealthyVerdict,
-          },
-          judge: async () => {
+          verdictStore: input.store ?? realVerdictStore(),
+          judge: async (envelope, judgeOptions) => {
             tally.judge += 1;
+            if (input.judge) return input.judge(envelope, judgeOptions);
             return verdictOutcome();
           },
           escalate: fakeEscalate,
@@ -1291,9 +1346,7 @@ if (soleJudgeFirstFile) {
       const tick = await runRealReplay({
         runId,
         evidence: prEvidence(0),
-        store: {
-          claimVerdict: claimOverseerVerdict,
-          finalizeVerdict: finalizeOverseerVerdict,
+        store: realVerdictStore({
           getVerdictByRunHead: async input => {
             const row = await getVerdictByRunHead(input);
             if (row) {
@@ -1304,8 +1357,7 @@ if (soleJudgeFirstFile) {
             }
             return row;
           },
-          promoteObserveOrHealthyVerdict,
-        },
+        }),
       });
       const row = await getVerdictByRunHead({ runId, headSha: 'H' });
       const actions = await getOverseerActionsForRun(runId);
@@ -1344,28 +1396,74 @@ if (soleJudgeFirstFile) {
       expect(live).toHaveLength(1);
     });
 
-    test('replay green Test 8: watch selector keeps a commented observe until green, then drops it', async () => {
-      const runId = 'run-watch-observe';
+    test('replay green: receipt insert failure reverts the real promotion', async () => {
+      const runId = 'run-receipt-fail';
       await seedCompletedRun(runId);
       const verdictId = await seedVerdict({
         runId,
         verdict: 'observe',
         proposedAction: 'comment_findings',
       });
-      await insertOverseerAction({
+      const failed = await runRealReplay({
         runId,
-        woId: 'WO-REPLAY-GREEN-01',
-        class: 'none',
-        action: 'verdict_write',
-        result: 'initial',
+        evidence: prEvidence(0),
+        failReceiptInsert: true,
       });
-      await insertOverseerAction({
+      const reverted = await getVerdictByRunHead({ runId, headSha: 'H' });
+      const failedActions = await getOverseerActionsForRun(runId);
+      expect(failed.handoff).toBe(0);
+      expect(failed.coordinator).toBe(0);
+      expect(failed.judge).toBe(0);
+      expect(reverted?.proposedAction).toBe('comment_findings');
+      expect(failedActions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
+      expect((await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)).toBe(
+        false
+      );
+
+      const retried = await runRealReplay({ runId, evidence: prEvidence(0) });
+      const promoted = await getVerdictByRunHead({ runId, headSha: 'H' });
+      const retriedActions = await getOverseerActionsForRun(runId);
+      expect(retried.handoff).toBe(1);
+      expect(retried.coordinator).toBe(0);
+      expect(promoted?.proposedAction).toBe('flag_merge_ready');
+      expect(
+        retriedActions.filter(
+          action =>
+            action.action === 'flag_merge_ready' &&
+            action.result === `steward_handoff:replay_green:verdict:${verdictId}`
+        )
+      ).toHaveLength(1);
+      expect((await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)).toBe(
+        true
+      );
+    });
+
+    test('replay green Test 8: watch selector keeps a commented observe until green, then drops it', async () => {
+      const runId = 'run-watch-observe';
+      await seedCompletedRun(runId);
+      const initial = await runRealReplay({
         runId,
-        woId: 'WO-REPLAY-GREEN-01',
-        class: 'none',
-        action: 'comment_findings',
-        result: 'initial comment',
+        evidence: prEvidence(1),
+        judge: async () =>
+          verdictOutcome({
+            verdict: 'observe',
+            proposedAction: 'comment_findings',
+            reason: 'checks still pending',
+          }),
       });
+      expect(initial.judge).toBe(1);
+      expect(initial.handoff).toBe(0);
+      expect(initial.coordinator).toBe(0);
+      const seeded = await getVerdictByRunHead({ runId, headSha: 'H' });
+      const verdictId = seeded?.id;
+      expect(verdictId).toBeTruthy();
+      expect(seeded?.verdict).toBe('observe');
+      expect(seeded?.proposedAction).toBe('comment_findings');
+      const initialActions = await getOverseerActionsForRun(runId);
+      expect(initialActions.map(action => action.action).sort()).toEqual([
+        'comment_findings',
+        'verdict_write',
+      ]);
       expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain(runId);
 
       const pending = await runRealReplay({ runId, evidence: prEvidence(1) });

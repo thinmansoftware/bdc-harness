@@ -16,6 +16,7 @@ import {
   releaseOverseerMergeSlot,
   releaseVerdictClaimForMergeExecution,
   reserveOverseerMergeSlot,
+  revertUnactionedFlagMergeReadyPromotion,
 } from '@archon/core/db/overseer';
 import { hasActiveRunForWo } from './active-run-guard';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
@@ -76,8 +77,9 @@ export interface OverseerServiceOptions {
   mergeCoordinator?: MergeReadyCoordinator;
   /**
    * Replay handoff. Tests inject this directly. When the property is omitted,
-   * the service binds it to the merge-execution bridge. An explicit undefined
-   * fails closed and is never replaced with mergeCoordinator.
+   * the service binds it to mergeBridgeRun, or to the merge-execution bridge
+   * when that seam is also omitted. An explicit undefined fails closed and is
+   * never replaced with mergeCoordinator.
    */
   deterministicMergeHandoff?: DeterministicMergeHandoff;
   intervalMs?: number;
@@ -96,6 +98,11 @@ export interface OverseerServiceOptions {
   reconcileIntervalMs?: number;
   reconcileRun?: () => Promise<unknown>;
   mergeBridgeIntervalMs?: number;
+  /**
+   * Merge-execution bridge tick. The scheduler uses it when mergeBridgeEnabled
+   * is set. When deterministicMergeHandoff is omitted, replay handoff uses
+   * this same runner.
+   */
   mergeBridgeRun?: () => Promise<unknown>;
   mergeBridgeEnabled?: boolean;
 }
@@ -203,6 +210,7 @@ const defaultVerdictStore: OverseerVerdictStoreDeps = {
   finalizeVerdict: finalizeOverseerVerdict,
   getVerdictByRunHead,
   promoteObserveOrHealthyVerdict,
+  revertUnactionedFlagMergeReadyPromotion,
 };
 
 /**
@@ -433,14 +441,13 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
 
 function resolveDeterministicMergeHandoff(
   options: OverseerServiceOptions,
-  github: GitHubClientDeps
+  bridgeRun: (() => Promise<unknown>) | undefined
 ): DeterministicMergeHandoff | undefined {
   if (Object.prototype.hasOwnProperty.call(options, 'deterministicMergeHandoff')) {
     return options.deterministicMergeHandoff;
   }
-  if (!githubCanDriveMergeBridge(github)) return undefined;
-  const run = createMergeExecutionBridgeRun(github);
-  return { handoff: () => run() };
+  if (!bridgeRun) return undefined;
+  return { handoff: () => bridgeRun() };
 }
 
 export async function runOverseerService(options: OverseerServiceOptions = {}): Promise<void> {
@@ -456,10 +463,11 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
     throw new Error('overseer_real_adapter_requires_qualified_coordinator');
   }
   const deps = options.deps ?? resolveDefaultDeps();
-  const deterministicMergeHandoff = resolveDeterministicMergeHandoff(options, deps);
   const defaultMergeBridgeRun = githubCanDriveMergeBridge(deps)
     ? createMergeExecutionBridgeRun(deps)
     : undefined;
+  const mergeBridgeRun = options.mergeBridgeRun ?? defaultMergeBridgeRun;
+  const deterministicMergeHandoff = resolveDeterministicMergeHandoff(options, mergeBridgeRun);
   const coupledAbort = new AbortController();
   const abortFromParent = (): void => {
     coupledAbort.abort();
@@ -485,7 +493,6 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   );
   const tasks: Promise<void>[] = [watcher];
   if (options.mergeBridgeEnabled) {
-    const mergeBridgeRun = options.mergeBridgeRun ?? defaultMergeBridgeRun;
     if (!mergeBridgeRun) {
       log.error({}, 'overseer.merge_bridge.bind_failed');
     } else {

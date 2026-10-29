@@ -811,6 +811,35 @@ export async function promoteObserveOrHealthyVerdict(verdictId: string): Promise
   return result.rowCount === 1;
 }
 
+const REVERTIBLE_REPLAY_ACTIONS: ReadonlySet<string> = new Set([
+  'none',
+  'verdict_write',
+  'comment_findings',
+]);
+
+/**
+ * Undo a replay promotion when the flag_merge_ready receipt did not commit.
+ * The merge bridge claims unactioned flag_merge_ready rows and does not
+ * require that receipt, so a promoted row with no receipt is mergeable.
+ * Restores priorAction only while the row is still unactioned.
+ */
+export async function revertUnactionedFlagMergeReadyPromotion(
+  verdictId: string,
+  priorAction: string
+): Promise<boolean> {
+  if (!REVERTIBLE_REPLAY_ACTIONS.has(priorAction)) return false;
+  const result = await getDatabase().query(
+    `UPDATE overseer_verdicts
+     SET proposed_action = $2, updated_at = $3
+     WHERE id = $1
+       AND verdict IN ('observe', 'healthy')
+       AND proposed_action = 'flag_merge_ready'
+       AND actioned_at IS NULL`,
+    [verdictId, priorAction, new Date().toISOString()]
+  );
+  return result.rowCount === 1;
+}
+
 export async function getOverseerVerdictsForRun(runId: string): Promise<OverseerVerdictRow[]> {
   const result = await getDatabase().query<OverseerVerdictRow>(
     'SELECT * FROM overseer_verdicts WHERE run_id = $1 ORDER BY created_at ASC',

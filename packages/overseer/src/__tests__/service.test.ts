@@ -1168,6 +1168,59 @@ serviceSuite('service', () => {
       spawnSpy.mockRestore();
     }
   });
+
+  test('judge-first replay default binding calls the merge bridge seam, not the coordinator', async () => {
+    const judgeSpy = spyOn(judgeFirst, 'judgeTerminalRun').mockImplementation(async () => {
+      throw new Error('judge must not run');
+    });
+    const spawnSpy = spyOn(judgeFirst, 'spawnJudgeBinary').mockImplementation(async () => {
+      throw new Error('provider must not run');
+    });
+    try {
+      await withTempDatabase(async () => {
+        const runId = 'run-service-bridge-seam';
+        await seedReplayRun({
+          runId,
+          verdict: 'observe',
+          proposedAction: 'comment_findings',
+          comment: true,
+        });
+        expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain(runId);
+        process.env.OVERSEER_JUDGE_FIRST = '1';
+        const mergeCoordinator = mock(async () => undefined);
+        const bridgeRun = mock(async () => undefined);
+        await runOverseerService({
+          once: true,
+          enabled: true,
+          dryRun: false,
+          adapterKind: 'fake',
+          mergeCoordinator,
+          mergeBridgeRun: bridgeRun,
+          deps: {
+            listRunsForWatch: listRunsForOverseerWatch,
+            listRunEvents: async () => [],
+            findPullRequest: async () => replayEvidence(0),
+            mergePullRequest: async () => {
+              throw new Error('direct merge must not run');
+            },
+            insertOverseerAction: async record => {
+              await insertOverseerActionRow(record);
+            },
+          },
+        });
+        expect(bridgeRun).toHaveBeenCalledTimes(1);
+        expect(mergeCoordinator).not.toHaveBeenCalled();
+        expect(judgeSpy).not.toHaveBeenCalled();
+        expect(spawnSpy).not.toHaveBeenCalled();
+        expect((await getVerdictByRunHead({ runId, headSha: 'H' }))?.proposedAction).toBe(
+          'flag_merge_ready'
+        );
+      });
+    } finally {
+      judgeSpy.mockRestore();
+      spawnSpy.mockRestore();
+    }
+  });
 });
 
 if (!invokedDirectly) {
