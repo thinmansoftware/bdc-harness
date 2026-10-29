@@ -9,8 +9,10 @@
  *    M-15 tier map, and it gates execution only, never consultation.
  *  - Judge health failures finalize as alarm states and escalate loudly when
  *    the retry budget is exhausted -- they never become semantic verdicts.
- *  - Replay: a lost claim does not invoke the judge, but a merge-ready open
- *    PR may emit one flag_merge_ready action.
+ *  - Replay: a lost claim does not invoke the judge. A merge-ready open PR
+ *    may emit one flag_merge_ready action and hand off to the deterministic
+ *    merge execution bridge. It must not call the runtime merge coordinator
+ *    (createMergeManager), which calls judgeWithGrok.
  */
 
 import { createLogger } from '@archon/paths';
@@ -121,6 +123,12 @@ export interface JudgeFirstPipelineOptions {
   dryRun: boolean;
   actor: string;
   mergeCoordinator?: MergeReadyCoordinator;
+  /**
+   * Replay-green handoff. Production passes the merge execution bridge.
+   * This must not be mergeCoordinator: that function is createMergeManager
+   * and calls judgeWithGrok, which this path is forbidden to do.
+   */
+  deterministicMergeHandoff?: () => Promise<unknown>;
   verdictStore: OverseerVerdictStoreDeps;
   judge?: (
     envelope: ReturnType<typeof buildEvidenceEnvelope>,
@@ -143,9 +151,9 @@ function logReplayGreenSkipped(fields: Record<string, unknown>): void {
 /**
  * Lost-claim come-back for an open PR. The first verdict already exists for
  * this run and head; when deterministic evidence is now merge-ready, promote
- * an observe or healthy row and hand it to the existing coordinator. No judge
- * call. Fail closed on every other verdict, store error, dry run, or missing
- * coordinator.
+ * an observe or healthy row and hand it to the merge execution bridge. No
+ * judge call and no runtime merge coordinator call. Fail closed on every
+ * other verdict, store error, dry run, or missing bridge.
  */
 async function replayGreenHandoff(
   record: WatchedRunRecord,
@@ -202,12 +210,19 @@ async function replayGreenHandoff(
     );
     return;
   }
-  if (!options.mergeCoordinator) {
+  // Same function as mergeCoordinator means createMergeManager / judgeWithGrok.
+  // Refuse that wiring rather than take a second LLM judgment.
+  if (
+    !options.deterministicMergeHandoff ||
+    options.deterministicMergeHandoff === options.mergeCoordinator
+  ) {
     logReplayGreenSkipped({
       runId: record.runId,
       headSha,
       verdictId: row.id,
-      reason: 'coordinator_missing',
+      reason: options.deterministicMergeHandoff
+        ? 'bridge_is_runtime_coordinator'
+        : 'bridge_missing',
     });
     return;
   }
@@ -249,7 +264,10 @@ async function replayGreenHandoff(
     { runId: record.runId, woId: record.woId, verdictId: row.id, dryRun: false },
     'overseer.judge_first.replay_green_handoff'
   );
-  await options.mergeCoordinator(record);
+  // createMergeManager (options.mergeCoordinator) always calls judgeWithGrok.
+  // The promoted flag_merge_ready row is the bridge queue; running the bridge
+  // here merges from that row with no second LLM judgment.
+  await options.deterministicMergeHandoff();
 }
 
 function newestEvent(events: OverseerWorkflowEvent[]): OverseerWorkflowEvent | undefined {

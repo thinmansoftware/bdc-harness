@@ -836,21 +836,33 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
   async function runReplayTick(
     record: WatchedRunRecord,
     state: FakeStoreState,
-    dryRun = false
+    dryRun = false,
+    withBridge = true
   ): Promise<{
     actions: { action: string; result: string }[];
     judgeCalls: number;
     coordinatorCalls: WatchedRunRecord[];
+    bridgeCalls: number;
   }> {
     const { actions, deps } = makeDeps();
     let judgeCalls = 0;
+    let bridgeCalls = 0;
     const coordinatorCalls: WatchedRunRecord[] = [];
     await handleRecordJudgeFirst(record, deps, {
       dryRun,
       actor: 'test',
+      // Stand-in for createMergeManager, whose default judge is judgeWithGrok.
+      // Replay must not enter this function.
       mergeCoordinator: async seen => {
         coordinatorCalls.push(seen);
       },
+      ...(withBridge
+        ? {
+            deterministicMergeHandoff: async () => {
+              bridgeCalls += 1;
+            },
+          }
+        : {}),
       verdictStore: makeVerdictStore({ claimed: false }, state),
       judge: async () => {
         judgeCalls += 1;
@@ -858,26 +870,33 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
       },
       escalate: fakeEscalate,
     });
-    return { actions, judgeCalls, coordinatorCalls };
+    return { actions, judgeCalls, coordinatorCalls, bridgeCalls };
   }
 
   test('replay green Test 1: pending checks stay observe and do not merge', async () => {
     const state = replayState('observe');
     const record = greenReplayRecord({ total: 18, passed: 17, failed: 0, pending: 1 });
-    const { actions, judgeCalls, coordinatorCalls } = await runReplayTick(record, state);
+    const { actions, judgeCalls, coordinatorCalls, bridgeCalls } = await runReplayTick(
+      record,
+      state
+    );
     expect(judgeCalls).toBe(0);
     expect(actions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
     expect(state.readCalls).toBe(0);
     expect(state.promoteCalls).toBe(0);
     expect(coordinatorCalls).toHaveLength(0);
+    expect(bridgeCalls).toBe(0);
     expect(state.replayRow?.verdict).toBe('observe');
     expect(state.replayRow?.proposedAction).toBe('comment_findings');
   });
 
-  test('replay green Test 2: green after observe promotes once and calls the coordinator', async () => {
+  test('replay green Test 2: green after observe promotes once and hands off to the bridge', async () => {
     const state = replayState('observe');
     const record = greenReplayRecord();
-    const { actions, judgeCalls, coordinatorCalls } = await runReplayTick(record, state);
+    const { actions, judgeCalls, coordinatorCalls, bridgeCalls } = await runReplayTick(
+      record,
+      state
+    );
     const handoffs = actions.filter(action => action.action === 'flag_merge_ready');
     expect(judgeCalls).toBe(0);
     expect(handoffs).toHaveLength(1);
@@ -885,19 +904,24 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
     expect(handoffs[0]?.result).toBe('steward_handoff:replay_green:verdict:verdict-replay-1');
     expect(state.replayRow?.proposedAction).toBe('flag_merge_ready');
     expect(state.promoteCalls).toBe(1);
-    expect(coordinatorCalls).toEqual([record]);
+    expect(coordinatorCalls).toHaveLength(0);
+    expect(bridgeCalls).toBe(1);
   });
 
-  test('replay green Test 2b: green after healthy promotes once and calls the coordinator', async () => {
+  test('replay green Test 2b: green after healthy promotes once and hands off to the bridge', async () => {
     const state = replayState('healthy');
     const record = greenReplayRecord();
-    const { actions, judgeCalls, coordinatorCalls } = await runReplayTick(record, state);
+    const { actions, judgeCalls, coordinatorCalls, bridgeCalls } = await runReplayTick(
+      record,
+      state
+    );
     const handoffs = actions.filter(action => action.action === 'flag_merge_ready');
     expect(judgeCalls).toBe(0);
     expect(handoffs).toHaveLength(1);
     expect(handoffs[0]?.result).toBe('steward_handoff:replay_green:verdict:verdict-replay-1');
     expect(state.replayRow?.proposedAction).toBe('flag_merge_ready');
-    expect(coordinatorCalls).toEqual([record]);
+    expect(coordinatorCalls).toHaveLength(0);
+    expect(bridgeCalls).toBe(1);
   });
 
   test('replay green Test 3: second tick is a no-op', async () => {
@@ -911,8 +935,10 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
     expect(first.judgeCalls).toBe(0);
     expect(second.judgeCalls).toBe(0);
     expect(handoffs).toHaveLength(1);
-    expect(first.coordinatorCalls).toHaveLength(1);
+    expect(first.coordinatorCalls).toHaveLength(0);
     expect(second.coordinatorCalls).toHaveLength(0);
+    expect(first.bridgeCalls).toBe(1);
+    expect(second.bridgeCalls).toBe(0);
     expect(state.promoteCalls).toBe(2);
     expect(state.replayRow?.proposedAction).toBe('flag_merge_ready');
   });
@@ -922,12 +948,16 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
     async verdict => {
       const state = replayState(verdict);
       const record = greenReplayRecord();
-      const { actions, judgeCalls, coordinatorCalls } = await runReplayTick(record, state);
+      const { actions, judgeCalls, coordinatorCalls, bridgeCalls } = await runReplayTick(
+        record,
+        state
+      );
       expect(judgeCalls).toBe(0);
       expect(actions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
       expect(state.readCalls).toBe(1);
       expect(state.promoteCalls).toBe(0);
       expect(coordinatorCalls).toHaveLength(0);
+      expect(bridgeCalls).toBe(0);
       expect(state.replayRow?.proposedAction).toBe('comment_findings');
     }
   );
@@ -935,7 +965,11 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
   test('replay green Test 6: dry run records the handoff and does not act', async () => {
     const state = replayState('observe');
     const record = greenReplayRecord();
-    const { actions, judgeCalls, coordinatorCalls } = await runReplayTick(record, state, true);
+    const { actions, judgeCalls, coordinatorCalls, bridgeCalls } = await runReplayTick(
+      record,
+      state,
+      true
+    );
     const handoffs = actions.filter(action => action.action === 'flag_merge_ready');
     expect(judgeCalls).toBe(0);
     expect(handoffs).toHaveLength(1);
@@ -946,6 +980,56 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
     expect(state.promoteCalls).toBe(0);
     expect(state.replayRow?.proposedAction).toBe('comment_findings');
     expect(coordinatorCalls).toHaveLength(0);
+    expect(bridgeCalls).toBe(0);
+  });
+
+  test('replay green does not invoke the runtime merge coordinator', async () => {
+    const state = replayState('observe');
+    const record = greenReplayRecord();
+    const { judgeCalls, coordinatorCalls, bridgeCalls } = await runReplayTick(record, state);
+    expect(judgeCalls).toBe(0);
+    expect(coordinatorCalls).toHaveLength(0);
+    expect(bridgeCalls).toBe(1);
+  });
+
+  test('replay green without a bridge does not promote or call the LLM coordinator', async () => {
+    const state = replayState('observe');
+    const record = greenReplayRecord();
+    const { actions, judgeCalls, coordinatorCalls, bridgeCalls } = await runReplayTick(
+      record,
+      state,
+      false,
+      false
+    );
+    expect(judgeCalls).toBe(0);
+    expect(coordinatorCalls).toHaveLength(0);
+    expect(bridgeCalls).toBe(0);
+    expect(actions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
+    expect(state.promoteCalls).toBe(0);
+    expect(state.replayRow?.proposedAction).toBe('comment_findings');
+  });
+
+  test('replay green refuses a handoff that is the runtime merge coordinator', async () => {
+    const state = replayState('observe');
+    const record = greenReplayRecord();
+    const { actions, deps } = makeDeps();
+    let calls = 0;
+    const coordinator = async (): Promise<void> => {
+      calls += 1;
+    };
+    await handleRecordJudgeFirst(record, deps, {
+      dryRun: false,
+      actor: 'test',
+      mergeCoordinator: coordinator,
+      deterministicMergeHandoff: coordinator,
+      verdictStore: makeVerdictStore({ claimed: false }, state),
+      judge: async () => verdictOutcome(),
+      escalate: fakeEscalate,
+    });
+    expect(calls).toBe(0);
+    expect(actions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
+    expect(state.promoteCalls).toBe(0);
+    expect(state.replayRow?.proposedAction).toBe('comment_findings');
   });
 });
 
