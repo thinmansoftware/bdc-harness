@@ -15,7 +15,10 @@ import {
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
-import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
 import {
@@ -97,10 +100,20 @@ export interface DutyOfficerClockDeps {
   now?: () => Date;
 }
 
-export function githubToken(): string | null {
+/**
+ * Resolve and (for an App identity) mint the duty-officer GitHub token through
+ * the shared service-identity provider. Async so an App installation token is
+ * never silently dropped to null the way the old sync accessor did; throws when
+ * no credential can be resolved or minted.
+ */
+export async function getDutyOfficerGithubToken(): Promise<string> {
+  return getServiceGitHubToken(resolveServiceGitHubAuth('duty_officer'));
+}
+
+/** Best-effort token for presence checks and the security detector: null on any failure. */
+export async function getDutyOfficerGithubTokenOrNull(): Promise<string | null> {
   try {
-    const identity = resolveServiceGitHubAuth('duty_officer');
-    return identity.kind === 'pat' ? identity.token : null;
+    return (await getDutyOfficerGithubToken()) || null;
   } catch {
     return null;
   }
@@ -291,7 +304,7 @@ export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
       runSecurityDetector(
         {
           fetchImpl: fetch,
-          readToken: githubToken,
+          readToken: getDutyOfficerGithubTokenOrNull,
           writeTokenProvider: mintAppInstallationToken,
           now: () => new Date(),
           buildSha: process.env.ARCHON_BUILD_SHA ?? 'unknown',

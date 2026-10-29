@@ -31,6 +31,12 @@ import {
   type EscalationIssueComment,
   type EscalationIssueRef,
 } from './escalation-delivery';
+import { generateKeyPairSync } from 'node:crypto';
+import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
+import {
+  clearServiceGitHubTokenCache,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 
 const ISSUE: EscalationIssueRef = { owner: 'thinmansoftware', repo: 'bdc-harness', number: 194 };
 const T0 = Date.parse('2026-09-23T12:00:00.000Z');
@@ -887,5 +893,173 @@ describe('marker trust: only the poster identity suppresses', () => {
     expect((await deliverEscalationToIssue(params, deps)).posted).toBe(false);
     expect(userCalls).toBe(2);
     expect(posts).toBe(0);
+  });
+});
+
+describe('Test 1: taskmaster escalation uses the App identity via the provider', () => {
+  const APP_ENV_KEYS = [
+    'GH_TOKEN',
+    'GITHUB_TOKEN',
+    'GITHUB_APP_ID',
+    'GITHUB_APP_INSTALLATION_ID',
+    'GITHUB_APP_PRIVATE_KEY',
+    'GITHUB_APP_TASKMASTER_ID',
+    'GITHUB_APP_TASKMASTER_INSTALLATION_ID',
+    'GITHUB_APP_TASKMASTER_PRIVATE_KEY',
+  ];
+  let saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    saved = {};
+    for (const key of APP_ENV_KEYS) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+    clearServiceGitHubTokenCache();
+  });
+
+  afterEach(() => {
+    for (const key of APP_ENV_KEYS) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    clearServiceGitHubTokenCache();
+    resetGitHubApiMeterForTests();
+  });
+
+  function installTaskmasterApp(): void {
+    const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
+      .privateKey.export({ type: 'pkcs8', format: 'pem' })
+      .toString();
+    process.env.GITHUB_APP_TASKMASTER_ID = '55';
+    process.env.GITHUB_APP_TASKMASTER_INSTALLATION_ID = '66';
+    process.env.GITHUB_APP_TASKMASTER_PRIVATE_KEY = key;
+  }
+
+  test('posts with the minted installation token and never throws token_missing', async () => {
+    installTaskmasterApp();
+    const identity = resolveServiceGitHubAuth('taskmaster');
+    expect(identity.kind).toBe('app');
+
+    // No pre-seeded cache: the escalation fetch itself must mint.
+    const seen: Array<{ pathname: string; authorization: string }> = [];
+    const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input);
+      expect(url.origin).toBe('https://api.github.com');
+      const authorization = new Headers(init?.headers).get('authorization') ?? '';
+      seen.push({ pathname: url.pathname, authorization });
+      if (url.pathname.includes('/access_tokens')) {
+        return Response.json({
+          token: 'minted-install-token',
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      }
+      return new Response('{}', { status: 201 });
+    };
+    const deps = createRealEscalationDeliveryDeps({ fetchImpl });
+    await deps.postIssueComment(ISSUE, 'escalation body');
+
+    const mints = seen.filter(call => call.pathname.includes('/access_tokens'));
+    const posts = seen.filter(call => !call.pathname.includes('/access_tokens'));
+    expect(mints).toHaveLength(1);
+    expect(posts).toEqual([
+      {
+        pathname: '/repos/thinmansoftware/bdc-harness/issues/194/comments',
+        authorization: 'Bearer minted-install-token',
+      },
+    ]);
+  });
+
+  test('401 re-mints once through the escalation fetch and retries the post', async () => {
+    installTaskmasterApp();
+    let mints = 0;
+    let posts = 0;
+    const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input);
+      if (url.pathname.includes('/access_tokens')) {
+        mints += 1;
+        return Response.json({
+          token: `mint-${mints}`,
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      }
+      posts += 1;
+      const authorization = new Headers(init?.headers).get('authorization') ?? '';
+      expect(authorization).toBe(`Bearer mint-${posts}`);
+      return new Response('{}', { status: posts === 1 ? 401 : 201 });
+    };
+    const deps = createRealEscalationDeliveryDeps({ fetchImpl });
+    await deps.postIssueComment(ISSUE, 'escalation body');
+    expect(mints).toBe(2);
+    expect(posts).toBe(2);
+  });
+
+  test('second 401 alerts once and propagates', async () => {
+    installTaskmasterApp();
+    const alerts: string[] = [];
+    let mints = 0;
+    let posts = 0;
+    const fetchImpl = async (input: string): Promise<Response> => {
+      const url = new URL(input);
+      if (url.pathname.includes('/access_tokens')) {
+        mints += 1;
+        return Response.json({
+          token: `mint-${mints}`,
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      }
+      posts += 1;
+      return new Response('{}', { status: 401 });
+    };
+    const deps = createRealEscalationDeliveryDeps({
+      fetchImpl,
+      alertSink: credential => {
+        alerts.push(credential);
+      },
+    });
+    await expect(deps.postIssueComment(ISSUE, 'escalation body')).rejects.toThrow(
+      'github_credential_unrefreshable_401:app-55-66'
+    );
+    expect(mints).toBe(2);
+    expect(posts).toBe(2);
+    expect(alerts).toEqual(['app-55-66']);
+  });
+
+  test('App identity poster login is <slug>[bot] via GET /app and never GET /user', async () => {
+    const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
+      .privateKey.export({ type: 'pkcs8', format: 'pem' })
+      .toString();
+    process.env.GITHUB_APP_TASKMASTER_ID = '55';
+    process.env.GITHUB_APP_TASKMASTER_INSTALLATION_ID = '66';
+    process.env.GITHUB_APP_TASKMASTER_PRIVATE_KEY = key;
+
+    const seen: Array<{ pathname: string; authorization: string }> = [];
+    const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input);
+      const authorization = new Headers(init?.headers).get('authorization') ?? '';
+      seen.push({ pathname: url.pathname, authorization });
+      if (url.pathname === '/user' || url.pathname.includes('access_tokens')) {
+        throw new Error(`unexpected_github_path:${url.pathname}`);
+      }
+      if (url.pathname === '/app') {
+        return Response.json({ slug: 'thinman-taskmaster' });
+      }
+      throw new Error(`unexpected_github_path:${url.pathname}`);
+    };
+
+    const deps = createRealEscalationDeliveryDeps({ fetchImpl });
+    await expect(deps.posterLogin()).resolves.toBe('thinman-taskmaster[bot]');
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.pathname).toBe('/app');
+    const jwt = (seen[0]?.authorization ?? '').replace(/^Bearer /, '');
+    const payload = JSON.parse(
+      Buffer.from(jwt.split('.')[1] ?? '', 'base64url').toString('utf8')
+    ) as {
+      iss?: unknown;
+    };
+    expect(payload.iss).toBe('55');
+
+    await expect(deps.posterLogin()).resolves.toBe('thinman-taskmaster[bot]');
+    expect(seen).toHaveLength(1);
   });
 });

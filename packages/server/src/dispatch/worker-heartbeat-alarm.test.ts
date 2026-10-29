@@ -1,7 +1,12 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { generateKeyPairSync } from 'node:crypto';
 import type { DispatchWorker } from '@archon/core/db/dispatch';
+import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
+import { clearServiceGitHubTokenCache } from '@archon/core/github/service-identity';
 import {
   evaluateWorkerHeartbeats,
+  listWorkerAlarmIssueComments,
+  postWorkerAlarmComment,
   runWorkerHeartbeatAlarm,
   type WorkerAlarmIssueComment,
   type WorkerHeartbeatAlarmDeps,
@@ -253,5 +258,245 @@ describe('worker heartbeat alarm inside the Duty Officer tick', () => {
     // Next tick: C is still stale and the post now succeeds.
     await expect(tickDutyOfficerClock(deps)).resolves.toBeUndefined();
     expect(downCount(alarm.comments, 'C')).toBe(1);
+  });
+});
+
+const ALARM_ISSUE = { owner: 'thinmansoftware', repo: 'bdc-xo', number: 2489 };
+
+const ALARM_APP_ENV_KEYS = [
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'GITHUB_APP_ID',
+  'GITHUB_APP_INSTALLATION_ID',
+  'GITHUB_APP_PRIVATE_KEY',
+  'GITHUB_APP_PRIVATE_KEY_PATH',
+  'GITHUB_APP_DUTY_OFFICER_ID',
+  'GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID',
+  'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY',
+  'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY_PATH',
+  'GITHUB_APP_TASKMASTER_ID',
+  'GITHUB_APP_TASKMASTER_INSTALLATION_ID',
+  'GITHUB_APP_TASKMASTER_PRIVATE_KEY',
+  'GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH',
+] as const;
+
+function alarmFetch(impl: (input: string, init?: RequestInit) => Promise<Response>): typeof fetch {
+  const adapted = (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url =
+      typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    return impl(url, init);
+  };
+  return Object.assign(adapted, { preconnect: fetch.preconnect });
+}
+
+describe('worker heartbeat alarm GitHub refresh', () => {
+  let saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    saved = {};
+    for (const key of ALARM_APP_ENV_KEYS) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+    process.env.DUTY_OFFICER_GH_REPO = 'thinmansoftware/bdc-xo';
+    clearServiceGitHubTokenCache();
+    resetGitHubApiMeterForTests();
+  });
+
+  afterEach(() => {
+    for (const key of ALARM_APP_ENV_KEYS) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+    clearServiceGitHubTokenCache();
+    resetGitHubApiMeterForTests();
+  });
+
+  function installDutyOfficerApp(): void {
+    const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
+      .privateKey.export({ type: 'pkcs8', format: 'pem' })
+      .toString();
+    process.env.GITHUB_APP_DUTY_OFFICER_ID = '77';
+    process.env.GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID = '88';
+    process.env.GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY = key;
+  }
+
+  test('missing credential throws token_missing and does not fetch', async () => {
+    let calls = 0;
+    const fetchImpl = alarmFetch(async () => {
+      calls += 1;
+      return new Response('{}', { status: 500 });
+    });
+    await expect(postWorkerAlarmComment(ALARM_ISSUE, 'x', { fetchImpl })).rejects.toThrow(
+      'worker_heartbeat_alarm_token_missing'
+    );
+    await expect(listWorkerAlarmIssueComments(ALARM_ISSUE, { fetchImpl })).rejects.toThrow(
+      'worker_heartbeat_alarm_token_missing'
+    );
+    expect(calls).toBe(0);
+  });
+
+  test('post mints through the supplied fetch and sends the installation token', async () => {
+    installDutyOfficerApp();
+    const seen: Array<{ pathname: string; authorization: string; method: string }> = [];
+    const fetchImpl = alarmFetch(async (input, init) => {
+      const url = new URL(input);
+      expect(url.origin).toBe('https://api.github.com');
+      seen.push({
+        pathname: url.pathname,
+        authorization: new Headers(init?.headers).get('authorization') ?? '',
+        method: init?.method ?? 'GET',
+      });
+      if (url.pathname.includes('/access_tokens')) {
+        return Response.json({
+          token: 'minted-install-token',
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      }
+      return new Response('{}', { status: 201 });
+    });
+    await postWorkerAlarmComment(ALARM_ISSUE, 'alarm body', { fetchImpl });
+    const mints = seen.filter(call => call.pathname.includes('/access_tokens'));
+    const posts = seen.filter(call => !call.pathname.includes('/access_tokens'));
+    expect(mints).toHaveLength(1);
+    expect(mints[0]?.method).toBe('POST');
+    expect(posts).toEqual([
+      {
+        pathname: '/repos/thinmansoftware/bdc-xo/issues/2489/comments',
+        authorization: 'Bearer minted-install-token',
+        method: 'POST',
+      },
+    ]);
+  });
+
+  test('post 401 re-mints once through the alarm fetch and retries', async () => {
+    installDutyOfficerApp();
+    let mints = 0;
+    let posts = 0;
+    const fetchImpl = alarmFetch(async (input, init) => {
+      const url = new URL(input);
+      if (url.pathname.includes('/access_tokens')) {
+        mints += 1;
+        return Response.json({
+          token: `mint-${mints}`,
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      }
+      posts += 1;
+      const authorization = new Headers(init?.headers).get('authorization') ?? '';
+      expect(authorization).toBe(`Bearer mint-${posts}`);
+      return new Response('{}', { status: posts === 1 ? 401 : 201 });
+    });
+    await postWorkerAlarmComment(ALARM_ISSUE, 'alarm body', { fetchImpl });
+    expect(mints).toBe(2);
+    expect(posts).toBe(2);
+  });
+
+  test('list 401 re-mints once and returns the retried page', async () => {
+    installDutyOfficerApp();
+    let mints = 0;
+    let gets = 0;
+    const fetchImpl = alarmFetch(async (input, init) => {
+      const url = new URL(input);
+      if (url.pathname.includes('/access_tokens')) {
+        mints += 1;
+        return Response.json({
+          token: `mint-${mints}`,
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      }
+      gets += 1;
+      const authorization = new Headers(init?.headers).get('authorization') ?? '';
+      expect(authorization).toBe(`Bearer mint-${gets}`);
+      expect(url.pathname).toBe('/repos/thinmansoftware/bdc-xo/issues/2489/comments');
+      if (gets === 1) return new Response('{}', { status: 401 });
+      return Response.json([{ body: 'down', created_at: '2026-09-28T12:00:00.000Z' }]);
+    });
+    const comments = await listWorkerAlarmIssueComments(ALARM_ISSUE, { fetchImpl });
+    expect(mints).toBe(2);
+    expect(gets).toBe(2);
+    expect(comments).toEqual([{ body: 'down', created_at: '2026-09-28T12:00:00.000Z' }]);
+  });
+
+  test('second post 401 alerts once and propagates', async () => {
+    installDutyOfficerApp();
+    const alerts: string[] = [];
+    let mints = 0;
+    let posts = 0;
+    const fetchImpl = alarmFetch(async input => {
+      const url = new URL(input);
+      if (url.pathname.includes('/access_tokens')) {
+        mints += 1;
+        return Response.json({
+          token: `mint-${mints}`,
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      }
+      posts += 1;
+      return new Response('{}', { status: 401 });
+    });
+    await expect(
+      postWorkerAlarmComment(ALARM_ISSUE, 'alarm body', {
+        fetchImpl,
+        alertSink: credential => {
+          alerts.push(credential);
+        },
+      })
+    ).rejects.toThrow('github_credential_unrefreshable_401:app-77-88');
+    expect(mints).toBe(2);
+    expect(posts).toBe(2);
+    expect(alerts).toEqual(['app-77-88']);
+  });
+
+  test('non-401 http failure does not re-mint or alert', async () => {
+    installDutyOfficerApp();
+    const alerts: string[] = [];
+    let mints = 0;
+    let posts = 0;
+    const fetchImpl = alarmFetch(async input => {
+      const url = new URL(input);
+      if (url.pathname.includes('/access_tokens')) {
+        mints += 1;
+        return Response.json({
+          token: 'minted',
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      }
+      posts += 1;
+      return new Response('nope', { status: 500 });
+    });
+    await expect(
+      postWorkerAlarmComment(ALARM_ISSUE, 'alarm body', {
+        fetchImpl,
+        alertSink: credential => {
+          alerts.push(credential);
+        },
+      })
+    ).rejects.toThrow('worker_heartbeat_alarm_http_500');
+    expect(mints).toBe(1);
+    expect(posts).toBe(1);
+    expect(alerts).toEqual([]);
+  });
+
+  test('PAT 401 is returned as http_401 and does not alert', async () => {
+    process.env.GITHUB_TOKEN = 'ghs_pat_test';
+    const alerts: string[] = [];
+    let calls = 0;
+    const fetchImpl = alarmFetch(async input => {
+      const url = new URL(input);
+      expect(url.pathname).not.toContain('/access_tokens');
+      calls += 1;
+      return new Response('{}', { status: 401 });
+    });
+    await expect(
+      postWorkerAlarmComment(ALARM_ISSUE, 'alarm body', {
+        fetchImpl,
+        alertSink: credential => {
+          alerts.push(credential);
+        },
+      })
+    ).rejects.toThrow('worker_heartbeat_alarm_http_401');
+    expect(calls).toBe(1);
+    expect(alerts).toEqual([]);
   });
 });

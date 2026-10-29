@@ -14,6 +14,7 @@ import { getAgentProvider } from '@archon/providers';
 import { loadConfig as loadMergedConfig } from '../config/config-loader';
 import { createLogger } from '@archon/paths';
 import { freezeWorkOrderSource } from './work-order-source';
+import { getGitHubTokenForService } from '../github/service-identity';
 
 // Compile-time assertion: MergedConfig must remain a structural subtype of WorkflowConfig.
 // If MergedConfig drifts from WorkflowConfig, this line becomes a type error.
@@ -107,5 +108,12 @@ export function createWorkflowDeps(): WorkflowDeps {
     getAgentProvider,
     loadConfig: loadMergedConfig,
     freezeWorkOrderSource,
+    resolveGithubToken: async (): Promise<string | undefined> => {
+      try {
+        return await getGitHubTokenForService('overseer');
+      } catch {
+        return undefined;
+      }
+    },
   };
 }

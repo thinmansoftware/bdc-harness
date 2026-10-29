@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { generateKeyPairSync } from 'node:crypto';
+import * as credentialAlert from '@archon/core/github/credential-alert';
+import { clearServiceGitHubTokenCache } from '@archon/core/github/service-identity';
 import { rootLogger } from '@archon/paths';
 import {
   resetSecurityDetectorStateForTests,
@@ -147,6 +149,90 @@ describe('duty officer security detector', () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       fetchMock.mockRestore();
+      clearServiceGitHubTokenCache();
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  test('second mint reuses the shared provider cache', async () => {
+    const saved = {
+      GITHUB_APP_ID: process.env.GITHUB_APP_ID,
+      GITHUB_APP_INSTALLATION_ID: process.env.GITHUB_APP_INSTALLATION_ID,
+      GITHUB_APP_PRIVATE_KEY: process.env.GITHUB_APP_PRIVATE_KEY,
+      GITHUB_APP_OVERSEER_ID: process.env.GITHUB_APP_OVERSEER_ID,
+      GITHUB_APP_OVERSEER_INSTALLATION_ID: process.env.GITHUB_APP_OVERSEER_INSTALLATION_ID,
+      GITHUB_APP_OVERSEER_PRIVATE_KEY: process.env.GITHUB_APP_OVERSEER_PRIVATE_KEY,
+    };
+    clearServiceGitHubTokenCache();
+    const fetchMock = spyOn(globalThis, 'fetch').mockImplementation(async () =>
+      Response.json({
+        token: 'cached-installation-token',
+        expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+      })
+    );
+    try {
+      delete process.env.GITHUB_APP_OVERSEER_ID;
+      delete process.env.GITHUB_APP_OVERSEER_INSTALLATION_ID;
+      delete process.env.GITHUB_APP_OVERSEER_PRIVATE_KEY;
+      process.env.GITHUB_APP_ID = '123';
+      process.env.GITHUB_APP_INSTALLATION_ID = '456';
+      process.env.GITHUB_APP_PRIVATE_KEY = generateKeyPairSync('rsa', {
+        modulusLength: 2048,
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+      }).privateKey;
+      const signal = new AbortController().signal;
+      expect(await mintAppInstallationToken(signal)).toBe('cached-installation-token');
+      expect(await mintAppInstallationToken(signal)).toBe('cached-installation-token');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchMock.mockRestore();
+      clearServiceGitHubTokenCache();
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  test('mint failure alerts once and propagates the provider error', async () => {
+    const saved = {
+      GITHUB_APP_ID: process.env.GITHUB_APP_ID,
+      GITHUB_APP_INSTALLATION_ID: process.env.GITHUB_APP_INSTALLATION_ID,
+      GITHUB_APP_PRIVATE_KEY: process.env.GITHUB_APP_PRIVATE_KEY,
+      GITHUB_APP_OVERSEER_ID: process.env.GITHUB_APP_OVERSEER_ID,
+      GITHUB_APP_OVERSEER_INSTALLATION_ID: process.env.GITHUB_APP_OVERSEER_INSTALLATION_ID,
+      GITHUB_APP_OVERSEER_PRIVATE_KEY: process.env.GITHUB_APP_OVERSEER_PRIVATE_KEY,
+    };
+    clearServiceGitHubTokenCache();
+    const alert = spyOn(credentialAlert, 'alertCredentialFailure').mockResolvedValue(true);
+    const fetchMock = spyOn(globalThis, 'fetch').mockImplementation(
+      async () => new Response('nope', { status: 401 })
+    );
+    try {
+      delete process.env.GITHUB_APP_OVERSEER_ID;
+      delete process.env.GITHUB_APP_OVERSEER_INSTALLATION_ID;
+      delete process.env.GITHUB_APP_OVERSEER_PRIVATE_KEY;
+      process.env.GITHUB_APP_ID = '123';
+      process.env.GITHUB_APP_INSTALLATION_ID = '456';
+      process.env.GITHUB_APP_PRIVATE_KEY = generateKeyPairSync('rsa', {
+        modulusLength: 2048,
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+      }).privateKey;
+      await expect(mintAppInstallationToken(new AbortController().signal)).rejects.toThrow(
+        'github_app_token_mint_failed:401'
+      );
+      expect(alert).toHaveBeenCalledTimes(1);
+      expect(alert.mock.calls[0]?.[0]).toBe('app-123-456');
+    } finally {
+      alert.mockRestore();
+      fetchMock.mockRestore();
+      clearServiceGitHubTokenCache();
+      credentialAlert.resetCredentialAlertDedupe();
       for (const [key, value] of Object.entries(saved)) {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
