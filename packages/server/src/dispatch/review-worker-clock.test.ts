@@ -263,6 +263,7 @@ describe('review worker clock', () => {
         }),
       }),
     ]);
+    expect(warnings[0]?.data).not.toHaveProperty('missing_required_contexts');
     // A defer is not a terminal result.
     expect(deps.postResult).not.toHaveBeenCalled();
   });
@@ -289,6 +290,25 @@ describe('review worker clock', () => {
     deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
     await tickReviewWorkerClock(CONFIG, deps);
     expect(warnings[0]?.data).toEqual(expect.objectContaining({ pending_checks: [] }));
+    expect(warnings[0]?.data).not.toHaveProperty('reason');
+  });
+
+  test('clock_log_names_the_missing_context', async () => {
+    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
+    const deps = fakeDeps([message('missing-context')], () => ({
+      disposition: 'checks_pending',
+      reason: 'checks_not_terminal',
+      pendingChecks: ['Gitleaks'],
+      pendingRequiredContexts: true,
+    }));
+    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
+    await tickReviewWorkerClock(CONFIG, deps);
+    expect(warnings[0]?.data).toEqual(
+      expect.objectContaining({
+        pending_checks: ['Gitleaks'],
+        missing_required_contexts: ['Gitleaks'],
+      })
+    );
     expect(warnings[0]?.data).not.toHaveProperty('reason');
   });
 

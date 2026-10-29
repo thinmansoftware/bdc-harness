@@ -127,6 +127,16 @@ export interface PrReviewResult {
   retry_after_ms?: number;
   /** Names of checks still awaited. Set only on CHECKS_PENDING. */
   pendingChecks?: string[];
+  pendingRequiredContexts?: boolean;
+  requiredContextsUnavailableReason?: string;
+  missingRequiredContexts?: string[];
+  requiredContextAttempts?: number;
+  requiredContextRearm?: {
+    attempted: boolean;
+    dispatched: boolean;
+    workflow?: string;
+    branch?: string;
+  };
 }
 
 export interface PrReviewModelResult {
@@ -267,7 +277,7 @@ export function buildReviewPrompt(input: {
   ].join('\n');
 }
 
-function normalizedCheckName(name: string): string {
+export function normalizedCheckName(name: string): string {
   return name.trim().toLowerCase();
 }
 
@@ -563,7 +573,10 @@ function checksPending(
     reviewer: deps.reviewer,
     acceptance_criteria_available: false,
     error: 'checks_pending',
-    ...(checks.length === 0 ? {} : { pendingChecks }),
+    ...(pendingChecks.length === 0 ? {} : { pendingChecks }),
+    ...(requiredContexts && requiredContexts.length > 0 && pendingChecks.length > 0
+      ? { pendingRequiredContexts: true }
+      : {}),
   };
 }
 
@@ -580,6 +593,14 @@ export async function evaluatePullRequest(
     checks: PrReviewCheck[];
     requiredContexts?: string[] | null;
     requiredContextsBlocked?: { reason: string; attempts: number; failureKind: string };
+    missingRequiredContexts?: string[];
+    requiredContextRearm?: {
+      attempted: boolean;
+      dispatched: boolean;
+      context?: string;
+      workflow?: string;
+      branch?: string;
+    };
   };
   try {
     evidence = await deps.fetchEvidence(input);
@@ -612,7 +633,28 @@ export async function evaluatePullRequest(
       reviewed_head_sha: input.head_sha,
       reviewer: deps.reviewer,
       acceptance_criteria_available: false,
-      error: `${evidence.requiredContextsBlocked.reason}:attempts=${evidence.requiredContextsBlocked.attempts}:reason=${evidence.requiredContextsBlocked.failureKind}`,
+      error: [
+        evidence.requiredContextsBlocked.reason,
+        `attempts=${evidence.requiredContextsBlocked.attempts}`,
+        `reason=${evidence.requiredContextsBlocked.failureKind}`,
+        ...(evidence.missingRequiredContexts
+          ? [`missing=${evidence.missingRequiredContexts.join(',')}`]
+          : []),
+        ...(evidence.requiredContextRearm?.workflow
+          ? [
+              `workflow=${evidence.requiredContextRearm.workflow}`,
+              `rearm=${evidence.requiredContextRearm.dispatched ? 'dispatched' : evidence.requiredContextRearm.attempted ? 'failed' : 'not_sent'}`,
+            ]
+          : []),
+      ].join(':'),
+      requiredContextsUnavailableReason: evidence.requiredContextsBlocked.reason,
+      requiredContextAttempts: evidence.requiredContextsBlocked.attempts,
+      ...(evidence.missingRequiredContexts
+        ? { missingRequiredContexts: evidence.missingRequiredContexts }
+        : {}),
+      ...(evidence.requiredContextRearm
+        ? { requiredContextRearm: evidence.requiredContextRearm }
+        : {}),
     };
   }
 

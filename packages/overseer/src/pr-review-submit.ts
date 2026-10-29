@@ -60,6 +60,8 @@ export interface ReviewerVerdict {
   checksPending?: boolean;
   /** Names of checks still awaited when `checksPending` is true. */
   pendingChecks?: readonly string[];
+  /** True when pendingChecks specifically names required contexts. */
+  pendingRequiredContexts?: boolean;
   /**
    * Set when the required status-check contexts could not be read after the
    * configured attempt bound (#775). TERMINAL and NON-APPROVING: unlike
@@ -70,6 +72,15 @@ export interface ReviewerVerdict {
    * `blocked_required_contexts_unavailable`, which the worker escalates.
    */
   requiredContextsUnavailable?: boolean;
+  requiredContextsUnavailableReason?: string;
+  missingRequiredContexts?: readonly string[];
+  requiredContextAttempts?: number;
+  requiredContextRearm?: {
+    attempted: boolean;
+    dispatched: boolean;
+    workflow?: string;
+    branch?: string;
+  };
   /**
    * True when the judge process could not be reached at all -- the prompt
    * exceeded the argv limit (E2BIG), the binary failed to spawn, or every rung
@@ -207,6 +218,7 @@ export interface SubmitOutcome {
   retryAfterMs?: number;
   /** Names of checks still awaited on a checks-pending deferral. */
   pendingChecks?: readonly string[];
+  pendingRequiredContexts?: boolean;
 }
 
 export interface SubmitDeps {
@@ -294,7 +306,27 @@ const MAX_EVIDENCE_BODY = 60_000;
  */
 export function buildReviewBody(work: ReviewWorkItem, verdict: ReviewerVerdict): string {
   const header = `Independent review by the Overseer App at head \`${work.headSha}\`.`;
-  const summary = verdict.summary.trim();
+  let summary = verdict.summary.trim();
+  if (verdict.requiredContextsUnavailableReason === 'required_context_never_reported') {
+    const contexts = verdict.missingRequiredContexts?.join(', ') || 'unknown required context';
+    const attempts = verdict.requiredContextAttempts ?? 'the configured number of';
+    const rearm = verdict.requiredContextRearm;
+    const workflow = rearm?.workflow ?? '<workflow-file>';
+    const branch = rearm?.branch ?? '<pr-branch>';
+    const dispatchState = rearm?.dispatched
+      ? `A re-arm dispatch was sent for ${workflow}.`
+      : rearm?.attempted
+        ? `A re-arm dispatch was attempted for ${workflow}, but did not succeed.`
+        : `No re-arm dispatch was sent${rearm?.workflow ? ` for ${workflow}` : ''}.`;
+    summary = [
+      `Required context(s) never reported after ${attempts} attempts: ${contexts}. Review blocked, not approved.`,
+      dispatchState,
+      `Operator action: run \`gh workflow run ${workflow} --ref ${branch}\` on the PR branch, or repair/enable the workflow.`,
+      summary,
+    ]
+      .filter(Boolean)
+      .join('\n\n');
+  }
   const body = summary.length > 0 ? `${header}\n\n${summary}` : header;
   return body.length > MAX_EVIDENCE_BODY ? body.slice(0, MAX_EVIDENCE_BODY) : body;
 }
@@ -406,6 +438,7 @@ export async function runAndSubmitReview(
       disposition: 'checks_pending',
       reason: 'checks_not_terminal',
       ...(verdict.pendingChecks ? { pendingChecks: verdict.pendingChecks } : {}),
+      ...(verdict.pendingRequiredContexts ? { pendingRequiredContexts: true } : {}),
     });
   }
 
@@ -491,9 +524,7 @@ export async function runAndSubmitReview(
     }
     return finish(deps, work, work.headSha, {
       disposition: 'blocked_required_contexts_unavailable',
-      reason: submitted
-        ? 'required_contexts_unavailable_blocked'
-        : `required_contexts_unavailable_blocked:comment_failed:${submitMessage ?? 'unknown'}`,
+      reason: `${verdict.requiredContextsUnavailableReason ?? 'required_contexts_unavailable_blocked'}${submitted ? '' : `:comment_failed:${submitMessage ?? 'unknown'}`}`,
       event: 'COMMENT',
       ...summaryField(verdict),
     });

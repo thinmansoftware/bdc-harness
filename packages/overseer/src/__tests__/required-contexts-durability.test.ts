@@ -32,6 +32,9 @@ afterAll(() => {
 const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
 const requiredContextsDb = await import('@archon/core/db/overseer-required-contexts');
 const { createDurableAttemptCounterStore } = await import('../adapters/required-contexts-store.ts');
+const { createRealFetchExactHeadPullRequestEvidence } =
+  await import('../adapters/github-real-deps.ts');
+type RealGitHubOctokitLike = import('../adapters/github-real-deps.ts').RealGitHubOctokitLike;
 const {
   NO_BASE_REF_SENTINEL,
   REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
@@ -271,5 +274,86 @@ describe('durable attempt counters -- the count outlives the process', () => {
     await store.increment(key, 20_000);
     await store.increment(key, 21_000);
     expect(pruneCalls).toBe(2);
+  });
+
+  test('rearm_is_once_per_head_across_processes', async () => {
+    const dispatches: Array<Record<string, unknown>> = [];
+    const clientFor = (headSha: string) =>
+      ({
+        pulls: {
+          get: async () => ({
+            data: {
+              head: { sha: headSha, ref: `feature/${headSha.slice(0, 4)}` },
+              base: { sha: 'c'.repeat(40), ref: BASE },
+            },
+          }),
+        },
+        repos: {
+          compareCommits: async () => ({ data: { files: [] } }),
+          getAllStatusCheckContexts: async () => ({ data: ['Gitleaks'] }),
+        },
+        checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+        actions: {
+          createWorkflowDispatch: async (receipt: Record<string, unknown>) => {
+            dispatches.push(receipt);
+          },
+        },
+      }) as unknown as RealGitHubOctokitLike;
+    const oldMap = process.env.OVERSEER_REQUIRED_CONTEXT_WORKFLOWS_JSON;
+    const oldRearm = process.env.OVERSEER_REQUIRED_CONTEXT_REARM_ATTEMPT;
+    const oldMax = process.env.OVERSEER_REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS;
+    process.env.OVERSEER_REQUIRED_CONTEXT_WORKFLOWS_JSON = JSON.stringify({
+      [`${OWNER}/${REPO}`]: { Gitleaks: 'secrets-scan.yml' },
+    });
+    process.env.OVERSEER_REQUIRED_CONTEXT_REARM_ATTEMPT = '1';
+    process.env.OVERSEER_REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS = '10';
+    try {
+      for (const headSha of [HEAD, OTHER_HEAD]) {
+        // Separate fetchers and stores model two reviewer processes sharing only
+        // the durable SQLite receipt table.
+        const firstFetcher = createRealFetchExactHeadPullRequestEvidence(
+          clientFor(headSha),
+          undefined,
+          freshStore()
+        );
+        const secondFetcher = createRealFetchExactHeadPullRequestEvidence(
+          clientFor(headSha),
+          undefined,
+          freshStore()
+        );
+        const input = { owner: OWNER, repo: REPO, prNumber: 42, headSha };
+        await Promise.all([firstFetcher(input), secondFetcher(input)]);
+      }
+
+      expect(dispatches).toHaveLength(2);
+      expect(dispatches.map(receipt => receipt.ref).sort()).toEqual([
+        `feature/${HEAD.slice(0, 4)}`,
+        `feature/${OTHER_HEAD.slice(0, 4)}`,
+      ]);
+      expect(
+        await requiredContextsDb.readRequiredContextsAttempts({
+          owner: OWNER,
+          repo: REPO,
+          baseRef: `rearm-dispatched:${BASE}`,
+          headSha: HEAD,
+        })
+      ).toBe(1);
+      expect(
+        await requiredContextsDb.readRequiredContextsAttempts({
+          owner: OWNER,
+          repo: REPO,
+          baseRef: `rearm-dispatched:${BASE}`,
+          headSha: OTHER_HEAD,
+        })
+      ).toBe(1);
+    } finally {
+      if (oldMap === undefined) delete process.env.OVERSEER_REQUIRED_CONTEXT_WORKFLOWS_JSON;
+      else process.env.OVERSEER_REQUIRED_CONTEXT_WORKFLOWS_JSON = oldMap;
+      if (oldRearm === undefined) delete process.env.OVERSEER_REQUIRED_CONTEXT_REARM_ATTEMPT;
+      else process.env.OVERSEER_REQUIRED_CONTEXT_REARM_ATTEMPT = oldRearm;
+      if (oldMax === undefined)
+        delete process.env.OVERSEER_REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS;
+      else process.env.OVERSEER_REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS = oldMax;
+    }
   });
 });
