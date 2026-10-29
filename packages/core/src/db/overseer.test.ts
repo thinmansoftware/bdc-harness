@@ -21,12 +21,15 @@ import {
   getOverseerLastVerdictAt,
   getOverseerVerdictsForRun,
   getOverseerWatchRunById,
+  getVerdictByRunHead,
   hasReconcileActionForPr,
   insertOverseerAction,
   insertReconcileAction,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
+  promoteObserveOrHealthyVerdict,
+  promoteObserveOrHealthyVerdictWithReceipt,
   recordVerdictMergeOutcome,
   releaseOverseerMergeSlot,
   releaseVerdictClaimForMergeExecution,
@@ -310,6 +313,63 @@ describe('overseer db', () => {
     const rows = await getOverseerVerdictsForRun('run-verdict');
     expect(rows).toHaveLength(1);
     expect(rows[0].status).toBe('verdict');
+  });
+
+  test('promotes an observe or healthy verdict once, and never a needs_human row', async () => {
+    await seedRun('run-promote-observe', 'completed');
+    const observe = await claimOverseerVerdict({
+      runId: 'run-promote-observe',
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: 'H',
+    });
+    await finalizeOverseerVerdict({
+      verdictId: observe.verdictId!,
+      status: 'verdict',
+      verdict: 'observe',
+      proposedAction: 'comment_findings',
+    });
+    const before = await getVerdictByRunHead({ runId: 'run-promote-observe', headSha: 'H' });
+    expect(before?.id).toBe(observe.verdictId);
+    expect(before?.verdict).toBe('observe');
+    expect(before?.proposedAction).toBe('comment_findings');
+    expect(before?.actionedAt).toBeNull();
+
+    expect(await promoteObserveOrHealthyVerdict(observe.verdictId!)).toBe(true);
+    const promoted = await getOverseerVerdictsForRun('run-promote-observe');
+    expect(promoted[0]?.proposed_action).toBe('flag_merge_ready');
+    expect(await promoteObserveOrHealthyVerdict(observe.verdictId!)).toBe(false);
+
+    await seedRun('run-promote-healthy', 'completed');
+    const healthy = await claimOverseerVerdict({
+      runId: 'run-promote-healthy',
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: 'H',
+    });
+    await finalizeOverseerVerdict({
+      verdictId: healthy.verdictId!,
+      status: 'verdict',
+      verdict: 'healthy',
+      proposedAction: 'none',
+    });
+    expect(await promoteObserveOrHealthyVerdict(healthy.verdictId!)).toBe(true);
+    const healthyRows = await getOverseerVerdictsForRun('run-promote-healthy');
+    expect(healthyRows[0]?.proposed_action).toBe('flag_merge_ready');
+
+    await seedRun('run-promote-human', 'completed');
+    const human = await claimOverseerVerdict({
+      runId: 'run-promote-human',
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: 'H',
+    });
+    await finalizeOverseerVerdict({
+      verdictId: human.verdictId!,
+      status: 'verdict',
+      verdict: 'needs_human',
+      proposedAction: 'escalate_with_evidence',
+    });
+    expect(await promoteObserveOrHealthyVerdict(human.verdictId!)).toBe(false);
+    const humanRows = await getOverseerVerdictsForRun('run-promote-human');
+    expect(humanRows[0]?.proposed_action).toBe('escalate_with_evidence');
   });
 
   test('claim is idempotent per (run_id, head_sha) -- replay never wins a second claim', async () => {
@@ -732,5 +792,250 @@ describe('overseer db', () => {
     expect(rows[0]?.merge_sha).toBeNull();
     expect(rows[0]?.mutation_sent === false || rows[0]?.mutation_sent === 0).toBe(true);
     expect(await listUnactionedFlagMergeReadyVerdicts()).toHaveLength(0);
+  });
+
+  async function seedSafeVerdict(
+    runId: string,
+    verdict: 'observe' | 'healthy',
+    proposedAction: string | null
+  ): Promise<string> {
+    await seedRun(runId, 'completed');
+    const claim = await claimOverseerVerdict({
+      runId,
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: 'H',
+    });
+    await finalizeOverseerVerdict({
+      verdictId: claim.verdictId!,
+      status: 'verdict',
+      verdict,
+      ...(proposedAction === null ? {} : { proposedAction }),
+    });
+    return claim.verdictId!;
+  }
+
+  test('promote allows only unactioned none, verdict_write, and comment_findings', async () => {
+    const safe = [
+      ['run-sql-observe-none', 'observe', 'none'],
+      ['run-sql-observe-write', 'observe', 'verdict_write'],
+      ['run-sql-observe-comment', 'observe', 'comment_findings'],
+      ['run-sql-healthy-none', 'healthy', 'none'],
+      ['run-sql-healthy-write', 'healthy', 'verdict_write'],
+      ['run-sql-healthy-comment', 'healthy', 'comment_findings'],
+    ] as const;
+    for (const [runId, verdict, action] of safe) {
+      const verdictId = await seedSafeVerdict(runId, verdict, action);
+      expect(await promoteObserveOrHealthyVerdict(verdictId)).toBe(true);
+      expect(await promoteObserveOrHealthyVerdict(verdictId)).toBe(false);
+      const row = await getVerdictByRunHead({ runId, headSha: 'H' });
+      expect(row?.proposedAction).toBe('flag_merge_ready');
+    }
+
+    const blocked = [
+      ['run-sql-esc-observe', 'observe', 'escalate_with_evidence'],
+      ['run-sql-esc-healthy', 'healthy', 'escalate_with_evidence'],
+      ['run-sql-null-observe', 'observe', null],
+      ['run-sql-null-healthy', 'healthy', null],
+      ['run-sql-unknown-observe', 'observe', 'not_a_real_action'],
+      ['run-sql-unknown-healthy', 'healthy', 'not_a_real_action'],
+      ['run-sql-ready-observe', 'observe', 'flag_merge_ready'],
+      ['run-sql-ready-healthy', 'healthy', 'flag_merge_ready'],
+    ] as const;
+    for (const [runId, verdict, action] of blocked) {
+      const verdictId = await seedSafeVerdict(runId, verdict, action);
+      expect(await promoteObserveOrHealthyVerdict(verdictId)).toBe(false);
+      const row = await getVerdictByRunHead({ runId, headSha: 'H' });
+      expect(row?.proposedAction).toBe(action);
+    }
+
+    const actionedId = await seedSafeVerdict('run-sql-actioned', 'observe', 'comment_findings');
+    await db.query(`UPDATE overseer_verdicts SET actioned_at = $2 WHERE id = $1`, [
+      actionedId,
+      '2026-10-29T00:00:00.000Z',
+    ]);
+    expect(await promoteObserveOrHealthyVerdict(actionedId)).toBe(false);
+    expect(
+      (await getVerdictByRunHead({ runId: 'run-sql-actioned', headSha: 'H' }))?.proposedAction
+    ).toBe('comment_findings');
+  });
+
+  test('conditional promote refuses an escalation written after the safe read', async () => {
+    const verdictId = await seedSafeVerdict('run-sql-race', 'healthy', 'none');
+    const before = await getVerdictByRunHead({ runId: 'run-sql-race', headSha: 'H' });
+    expect(before?.proposedAction).toBe('none');
+    await db.query(
+      `UPDATE overseer_verdicts SET proposed_action = 'escalate_with_evidence' WHERE id = $1`,
+      [verdictId]
+    );
+    expect(await promoteObserveOrHealthyVerdict(verdictId)).toBe(false);
+    expect(
+      (await getVerdictByRunHead({ runId: 'run-sql-race', headSha: 'H' }))?.proposedAction
+    ).toBe('escalate_with_evidence');
+  });
+
+  test('promote with receipt commits the verdict and the receipt together', async () => {
+    const verdictId = await seedSafeVerdict('run-atomic-ok', 'healthy', 'none');
+    const result = `steward_handoff:replay_green:verdict:${verdictId}`;
+    const receipt = {
+      verdictId,
+      runId: 'run-atomic-ok',
+      woId: 'WO-TEST-OVERSEER-01',
+      class: 'none',
+      result,
+    };
+    expect(await promoteObserveOrHealthyVerdictWithReceipt(receipt)).toBe(true);
+    expect(
+      (await getVerdictByRunHead({ runId: 'run-atomic-ok', headSha: 'H' }))?.proposedAction
+    ).toBe('flag_merge_ready');
+    expect(
+      (await getOverseerActionsForRun('run-atomic-ok')).filter(
+        action => action.action === 'flag_merge_ready' && action.result === result
+      )
+    ).toHaveLength(1);
+    expect(await promoteObserveOrHealthyVerdictWithReceipt(receipt)).toBe(false);
+    expect(
+      (await getOverseerActionsForRun('run-atomic-ok')).filter(
+        action => action.action === 'flag_merge_ready'
+      )
+    ).toHaveLength(1);
+    expect((await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)).toBe(
+      true
+    );
+
+    const blockedId = await seedSafeVerdict(
+      'run-atomic-unsafe',
+      'observe',
+      'escalate_with_evidence'
+    );
+    expect(
+      await promoteObserveOrHealthyVerdictWithReceipt({
+        verdictId: blockedId,
+        runId: 'run-atomic-unsafe',
+        woId: 'WO-TEST-OVERSEER-01',
+        class: 'none',
+        result: `steward_handoff:replay_green:verdict:${blockedId}`,
+      })
+    ).toBe(false);
+    expect(
+      (await getVerdictByRunHead({ runId: 'run-atomic-unsafe', headSha: 'H' }))?.proposedAction
+    ).toBe('escalate_with_evidence');
+    expect(
+      (await getOverseerActionsForRun('run-atomic-unsafe')).filter(
+        action => action.action === 'flag_merge_ready'
+      )
+    ).toHaveLength(0);
+  });
+
+  test('receipt insert failure does not leave flag_merge_ready when revert would fail', async () => {
+    const verdictId = await seedSafeVerdict('run-atomic-rollback', 'observe', 'comment_findings');
+    const result = `steward_handoff:replay_green:verdict:${verdictId}`;
+    await db.query(
+      `CREATE TRIGGER reject_replay_green_receipt BEFORE INSERT ON overseer_actions
+       WHEN NEW.action = 'flag_merge_ready'
+       BEGIN SELECT RAISE(ABORT, 'receipt_insert_failed'); END`
+    );
+    await db.query(
+      `CREATE TRIGGER reject_replay_green_revert BEFORE UPDATE ON overseer_verdicts
+       WHEN OLD.proposed_action = 'flag_merge_ready' AND NEW.proposed_action != 'flag_merge_ready'
+       BEGIN SELECT RAISE(ABORT, 'revert_failed'); END`
+    );
+    try {
+      await expect(
+        promoteObserveOrHealthyVerdictWithReceipt({
+          verdictId,
+          runId: 'run-atomic-rollback',
+          woId: 'WO-TEST-OVERSEER-01',
+          class: 'none',
+          result,
+        })
+      ).rejects.toThrow('receipt_insert_failed');
+    } finally {
+      await db.query('DROP TRIGGER IF EXISTS reject_replay_green_receipt');
+      await db.query('DROP TRIGGER IF EXISTS reject_replay_green_revert');
+    }
+    expect(
+      (await getVerdictByRunHead({ runId: 'run-atomic-rollback', headSha: 'H' }))?.proposedAction
+    ).toBe('comment_findings');
+    expect(
+      (await getOverseerActionsForRun('run-atomic-rollback')).filter(
+        action => action.action === 'flag_merge_ready'
+      )
+    ).toHaveLength(0);
+    expect((await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)).toBe(
+      false
+    );
+  });
+
+  test('concurrent promote calls change one observe row', async () => {
+    const verdictId = await seedSafeVerdict('run-sql-concurrent', 'observe', 'verdict_write');
+    const results = await Promise.all([
+      promoteObserveOrHealthyVerdict(verdictId),
+      promoteObserveOrHealthyVerdict(verdictId),
+    ]);
+    expect(results.filter(won => won)).toHaveLength(1);
+    expect(
+      (await getVerdictByRunHead({ runId: 'run-sql-concurrent', headSha: 'H' }))?.proposedAction
+    ).toBe('flag_merge_ready');
+  });
+
+  test('comment_findings keeps a safe unactioned verdict selectable and drops it after promotion', async () => {
+    const observeId = await seedSafeVerdict('run-watch-comment', 'observe', 'comment_findings');
+    await insertOverseerAction({
+      runId: 'run-watch-comment',
+      woId: 'WO-TEST-OVERSEER-01',
+      class: 'none',
+      action: 'verdict_write',
+      result: 'initial',
+    });
+    await insertOverseerAction({
+      runId: 'run-watch-comment',
+      woId: 'WO-TEST-OVERSEER-01',
+      class: 'none',
+      action: 'comment_findings',
+      result: 'initial comment',
+    });
+    expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain('run-watch-comment');
+    expect(await promoteObserveOrHealthyVerdict(observeId)).toBe(true);
+    expect((await listRunsForOverseerWatch()).map(run => run.id)).not.toContain(
+      'run-watch-comment'
+    );
+
+    await seedSafeVerdict('run-watch-healthy', 'healthy', 'none');
+    await insertOverseerAction({
+      runId: 'run-watch-healthy',
+      woId: 'WO-TEST-OVERSEER-01',
+      class: 'none',
+      action: 'comment_findings',
+      result: 'initial comment',
+    });
+    expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain('run-watch-healthy');
+
+    const retired = [
+      ['run-watch-human', 'needs_human', 'escalate_with_evidence', 'comment_findings'],
+      ['run-watch-genuine', 'failed_genuine', 'escalate_with_evidence', 'comment_findings'],
+      ['run-watch-dup', 'duplicate_work', 'comment_findings', 'comment_findings'],
+      ['run-watch-merged', 'observe', 'none', 'merged'],
+      ['run-watch-closed', 'healthy', 'verdict_write', 'watch_closed'],
+      ['run-watch-tier', 'observe', 'comment_findings', 'tier_refused'],
+      ['run-watch-denied', 'healthy', 'none', 'escalation_denied'],
+      ['run-watch-escalated', 'observe', 'comment_findings', 'escalate_with_evidence'],
+    ] as const;
+    for (const [runId, verdict, proposedAction, terminalAction] of retired) {
+      await seedSafeVerdict(runId, verdict === 'healthy' ? 'healthy' : 'observe', proposedAction);
+      if (verdict !== 'observe' && verdict !== 'healthy') {
+        await db.query(`UPDATE overseer_verdicts SET verdict = $2 WHERE run_id = $1`, [
+          runId,
+          verdict,
+        ]);
+      }
+      await insertOverseerAction({
+        runId,
+        woId: 'WO-TEST-OVERSEER-01',
+        class: 'none',
+        action: terminalAction,
+        result: 'terminal',
+      });
+      expect((await listRunsForOverseerWatch()).map(run => run.id)).not.toContain(runId);
+    }
   });
 });

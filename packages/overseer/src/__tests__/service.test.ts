@@ -1,9 +1,18 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { mkdtempSync } from 'fs';
 import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
+import {
+  claimOverseerVerdict,
+  finalizeOverseerVerdict,
+  getOverseerActionsForRun,
+  getVerdictByRunHead,
+  insertOverseerAction as insertOverseerActionRow,
+  listRunsForOverseerWatch,
+} from '@archon/core/db/overseer';
+import * as judgeFirst from '../judge-first';
 import { listOverseerCapabilityEvents } from '@archon/core/db/overseer-capabilities';
 import { listOperatorCards } from '@archon/core/db/overseer-briefing';
 import {
@@ -26,6 +35,7 @@ const ENV_KEYS = [
   'OVERSEER_BRANCH_ACTIONS_ENABLED',
   'OVERSEER_LIFECYCLE_ACTIONS_ENABLED',
   'OVERSEER_MERGE_ACTIONS_ENABLED',
+  'OVERSEER_JUDGE_FIRST',
   'GITHUB_TOKEN',
   'GH_TOKEN',
 ] as const;
@@ -944,6 +954,272 @@ serviceSuite('service', () => {
     const drainsAfterReject = drains;
     await new Promise<void>(resolve => setTimeout(resolve, 10));
     expect(drains).toBe(drainsAfterReject);
+  });
+
+  async function seedReplayRun(input: {
+    runId: string;
+    verdict: string;
+    proposedAction: string;
+    comment?: boolean;
+  }): Promise<string> {
+    const db = getDatabase();
+    await db.query(
+      `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, title)
+       VALUES ($1, 'test', $1, 'Test')`,
+      [`conv-${input.runId}`]
+    );
+    await db.query(
+      `INSERT INTO remote_agent_workflow_runs
+       (id, conversation_id, workflow_name, user_message, status, metadata, completed_at)
+       VALUES ($1, $2, 'bdc-feature-development', $3, 'completed', $4, $5)`,
+      [
+        input.runId,
+        `conv-${input.runId}`,
+        'Implement WO-REPLAY-GREEN-01',
+        JSON.stringify({
+          woId: 'WO-REPLAY-GREEN-01',
+          targetRepo: 'thinmansoftware/bdc-harness',
+          headBranch: `wo/${input.runId}`,
+        }),
+        '2026-10-29T00:00:00.000Z',
+      ]
+    );
+    const claim = await claimOverseerVerdict({
+      runId: input.runId,
+      woId: 'WO-REPLAY-GREEN-01',
+      headSha: 'H',
+    });
+    if (!claim.verdictId) throw new Error(`claim_failed:${input.runId}`);
+    await finalizeOverseerVerdict({
+      verdictId: claim.verdictId,
+      status: 'verdict',
+      verdict: input.verdict,
+      proposedAction: input.proposedAction,
+    });
+    if (input.comment) {
+      await insertOverseerActionRow({
+        runId: input.runId,
+        woId: 'WO-REPLAY-GREEN-01',
+        class: 'none',
+        action: 'comment_findings',
+        result: 'initial comment',
+      });
+    }
+    return claim.verdictId;
+  }
+
+  function replayEvidence(pending: number) {
+    const total = pending > 0 ? 4 : 2;
+    return {
+      exists: true as const,
+      state: 'open' as const,
+      checks: { total, passed: total - pending, failed: 0, pending },
+      mergeable: true,
+      headSha: 'H',
+      pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1373 },
+    };
+  }
+
+  async function runJudgeFirstReplay(input: {
+    runId: string;
+    pending?: number;
+    dryRun?: boolean;
+    handoff?: ReturnType<typeof mock> | undefined;
+    omitHandoff?: boolean;
+  }): Promise<void> {
+    process.env.OVERSEER_JUDGE_FIRST = '1';
+    const mergeCoordinator = mock(async () => undefined);
+    await runOverseerService({
+      once: true,
+      enabled: true,
+      dryRun: input.dryRun ?? false,
+      adapterKind: 'fake',
+      mergeCoordinator,
+      ...(input.omitHandoff
+        ? { deterministicMergeHandoff: undefined }
+        : { deterministicMergeHandoff: { handoff: input.handoff ?? mock(async () => undefined) } }),
+      deps: {
+        listRunsForWatch: listRunsForOverseerWatch,
+        listRunEvents: async () => [],
+        findPullRequest: async () => replayEvidence(input.pending ?? 0),
+        mergePullRequest: async () => {
+          throw new Error('direct merge must not run');
+        },
+        insertOverseerAction: async record => {
+          await insertOverseerActionRow(record);
+        },
+      },
+    });
+    expect(mergeCoordinator).toHaveBeenCalledTimes(0);
+  }
+
+  test('judge-first replay hands a green observe row to the deterministic bridge once', async () => {
+    const judgeSpy = spyOn(judgeFirst, 'judgeTerminalRun').mockImplementation(async () => {
+      throw new Error('judge must not run');
+    });
+    const spawnSpy = spyOn(judgeFirst, 'spawnJudgeBinary').mockImplementation(async () => {
+      throw new Error('provider must not run');
+    });
+    try {
+      await withTempDatabase(async () => {
+        const runId = 'run-service-green';
+        await seedReplayRun({
+          runId,
+          verdict: 'observe',
+          proposedAction: 'comment_findings',
+          comment: true,
+        });
+        expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain(runId);
+        const handoff = mock(async () => undefined);
+        await runJudgeFirstReplay({ runId, handoff });
+        expect(handoff).toHaveBeenCalledTimes(1);
+        expect(judgeSpy).not.toHaveBeenCalled();
+        expect(spawnSpy).not.toHaveBeenCalled();
+        expect((await getVerdictByRunHead({ runId, headSha: 'H' }))?.proposedAction).toBe(
+          'flag_merge_ready'
+        );
+        await runJudgeFirstReplay({ runId, handoff });
+        expect(handoff).toHaveBeenCalledTimes(1);
+      });
+    } finally {
+      judgeSpy.mockRestore();
+      spawnSpy.mockRestore();
+    }
+  });
+
+  test('judge-first replay does not hand off pending, needs_human, dry-run, or a missing bridge', async () => {
+    const judgeSpy = spyOn(judgeFirst, 'judgeTerminalRun').mockImplementation(async () => {
+      throw new Error('judge must not run');
+    });
+    const spawnSpy = spyOn(judgeFirst, 'spawnJudgeBinary').mockImplementation(async () => {
+      throw new Error('provider must not run');
+    });
+    try {
+      await withTempDatabase(async () => {
+        await seedReplayRun({
+          runId: 'run-service-pending',
+          verdict: 'observe',
+          proposedAction: 'comment_findings',
+          comment: true,
+        });
+        const pendingHandoff = mock(async () => undefined);
+        await runJudgeFirstReplay({
+          runId: 'run-service-pending',
+          pending: 1,
+          handoff: pendingHandoff,
+        });
+        expect(pendingHandoff).not.toHaveBeenCalled();
+        expect(
+          (await getVerdictByRunHead({ runId: 'run-service-pending', headSha: 'H' }))
+            ?.proposedAction
+        ).toBe('comment_findings');
+
+        await seedReplayRun({
+          runId: 'run-service-human',
+          verdict: 'needs_human',
+          proposedAction: 'escalate_with_evidence',
+        });
+        const humanHandoff = mock(async () => undefined);
+        await runJudgeFirstReplay({ runId: 'run-service-human', handoff: humanHandoff });
+        expect(humanHandoff).not.toHaveBeenCalled();
+        expect(
+          (await getVerdictByRunHead({ runId: 'run-service-human', headSha: 'H' }))?.proposedAction
+        ).toBe('escalate_with_evidence');
+
+        const dryId = await seedReplayRun({
+          runId: 'run-service-dry',
+          verdict: 'healthy',
+          proposedAction: 'none',
+          comment: true,
+        });
+        const dryHandoff = mock(async () => undefined);
+        await runJudgeFirstReplay({ runId: 'run-service-dry', dryRun: true, handoff: dryHandoff });
+        expect(dryHandoff).not.toHaveBeenCalled();
+        expect(
+          (await getVerdictByRunHead({ runId: 'run-service-dry', headSha: 'H' }))?.proposedAction
+        ).toBe('none');
+        const dryActions = await getOverseerActionsForRun('run-service-dry');
+        expect(
+          dryActions.some(
+            action =>
+              action.action === 'flag_merge_ready' &&
+              action.result === `steward_handoff:replay_green:verdict:${dryId}:dry_run`
+          )
+        ).toBe(true);
+
+        await seedReplayRun({
+          runId: 'run-service-missing',
+          verdict: 'observe',
+          proposedAction: 'verdict_write',
+          comment: true,
+        });
+        await runJudgeFirstReplay({ runId: 'run-service-missing', omitHandoff: true });
+        expect(
+          (await getVerdictByRunHead({ runId: 'run-service-missing', headSha: 'H' }))
+            ?.proposedAction
+        ).toBe('verdict_write');
+        const missingActions = await getOverseerActionsForRun('run-service-missing');
+        expect(missingActions.some(action => action.action === 'flag_merge_ready')).toBe(false);
+        expect(judgeSpy).not.toHaveBeenCalled();
+        expect(spawnSpy).not.toHaveBeenCalled();
+      });
+    } finally {
+      judgeSpy.mockRestore();
+      spawnSpy.mockRestore();
+    }
+  });
+
+  test('judge-first replay default binding calls the merge bridge seam, not the coordinator', async () => {
+    const judgeSpy = spyOn(judgeFirst, 'judgeTerminalRun').mockImplementation(async () => {
+      throw new Error('judge must not run');
+    });
+    const spawnSpy = spyOn(judgeFirst, 'spawnJudgeBinary').mockImplementation(async () => {
+      throw new Error('provider must not run');
+    });
+    try {
+      await withTempDatabase(async () => {
+        const runId = 'run-service-bridge-seam';
+        await seedReplayRun({
+          runId,
+          verdict: 'observe',
+          proposedAction: 'comment_findings',
+          comment: true,
+        });
+        expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain(runId);
+        process.env.OVERSEER_JUDGE_FIRST = '1';
+        const mergeCoordinator = mock(async () => undefined);
+        const bridgeRun = mock(async () => undefined);
+        await runOverseerService({
+          once: true,
+          enabled: true,
+          dryRun: false,
+          adapterKind: 'fake',
+          mergeCoordinator,
+          mergeBridgeRun: bridgeRun,
+          deps: {
+            listRunsForWatch: listRunsForOverseerWatch,
+            listRunEvents: async () => [],
+            findPullRequest: async () => replayEvidence(0),
+            mergePullRequest: async () => {
+              throw new Error('direct merge must not run');
+            },
+            insertOverseerAction: async record => {
+              await insertOverseerActionRow(record);
+            },
+          },
+        });
+        expect(bridgeRun).toHaveBeenCalledTimes(1);
+        expect(mergeCoordinator).not.toHaveBeenCalled();
+        expect(judgeSpy).not.toHaveBeenCalled();
+        expect(spawnSpy).not.toHaveBeenCalled();
+        expect((await getVerdictByRunHead({ runId, headSha: 'H' }))?.proposedAction).toBe(
+          'flag_merge_ready'
+        );
+      });
+    } finally {
+      judgeSpy.mockRestore();
+      spawnSpy.mockRestore();
+    }
   });
 });
 
