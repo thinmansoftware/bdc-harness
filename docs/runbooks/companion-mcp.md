@@ -81,7 +81,7 @@ Other required environment:
 
 | Variable | Meaning |
 | --- | --- |
-| COMPANION_MCP_BIND_ADDR | Required. Startup throws bind_addr_refused for a missing value, an empty value, 0.0.0.0, or :: |
+| COMPANION_MCP_BIND_ADDR | Required. The compose example pins `10.209.48.2`, the fixed address on bridge `companion_publish`. Startup throws bind_addr_refused for a missing value, an empty value, 0.0.0.0, or ::. Do not set the host tailnet IP or 127.0.0.1. |
 | COMPANION_MCP_PORT | Default 3095 |
 | COMPANION_MCP_AUDIT_LOG | One JSON line per tool call and per refused authentication |
 | COMPANION_MCP_REVOKED_FILE | JSON array of sha256 digests, re-read on every call |
@@ -175,17 +175,34 @@ ${COMPANION_MCP_TAILNET_IP}:3095:3095
 
 ### Bind address and container networking
 
-The process refuses to listen on `0.0.0.0` or `::`. Docker's published port
-in the example is bound on the host to the tailnet IP, which limits who can
-open a TCP connection to the host. That is not the same address the process
-binds inside the container network namespace.
+The process refuses to listen on `0.0.0.0` or `::`. Two different addresses
+are involved:
 
-Do not set `COMPANION_MCP_BIND_ADDR=0.0.0.0` to "make the publish work".
-Startup will throw `bind_addr_refused` and nothing will listen. Set
-`COMPANION_MCP_BIND_ADDR` to the non-wildcard address the process should bind
-in its own namespace (the container interface address when the service is on
-the bridge network). Listening on `127.0.0.1` inside the container is not
-reachable through a published port.
+- Host publish: `${COMPANION_MCP_TAILNET_IP}:3095:3095`. This is the only
+  address tailnet clients use. It exists on the host, not in the container.
+- Container bind: `COMPANION_MCP_BIND_ADDR=10.209.48.2`. This is the fixed
+  address on bridge network `companion_publish` (`10.209.48.0/29`, gateway
+  `10.209.48.1`). The process listens there.
+
+Docker forwards a published port to the container IP on the default-gateway
+network. `companion_publish` is that network: its endpoint `gw_priority` is
+100, and its docker name `0-companion-publish` sorts before
+`archon_archon-network`. `gw_priority` is honored by Docker Engine 28 and
+newer. Older engines keep the lexicographic name rule when priorities are
+equal, which still selects `0-companion-publish`. The service stays on
+`archon_archon-network` so `http://archon-app-1:3090` still resolves. That
+second endpoint has `gw_priority` 1, so it is not where the published port
+is delivered.
+
+Do not set `COMPANION_MCP_BIND_ADDR` to the host tailnet IP. Listen fails
+because that address is not in the container namespace. Do not set
+`127.0.0.1`. A published port is delivered to the bridge address, not to
+loopback. Do not set `0.0.0.0` or `::`. Startup throws `bind_addr_refused`.
+
+If `10.209.48.0/29` overlaps an existing network, pick another aligned /29
+and change the subnet, gateway, `ipv4_address`, and `COMPANION_MCP_BIND_ADDR`
+together. Keep `companion_publish` as the higher `gw_priority`, and keep its
+docker name sorting before `archon_archon-network`.
 
 ## Go-live gates
 
@@ -225,7 +242,7 @@ container for a real companion until each item is closed and recorded.
 `deploy/companion-mcp/docker-compose.example.yml`:
 
 - Service and container name `bdc-companion-mcp`.
-- Port publish is the tailnet IP only. No `env_file`.
+- Port publish is the tailnet IP only. The process bind is the fixed `companion_publish` address, not that tailnet IP. No `env_file`.
 - No mount of `/opt/bdc/archon`, `/opt/bdc/archon/.env`, `/opt/bdc/archon-secrets`, or an operator token.
 - Wiki, config, token digests, Dispatch credential, revocation file, and GitHub token are read-only.
 - The only writable volume is the audit log.

@@ -16,11 +16,17 @@ services:
     container_name: bdc-companion-mcp
     user: "10001:10001"
     restart: unless-stopped
+    # Published ports follow the container default gateway, not file order.
+    # companion_publish wins that selection (higher gw_priority, and the
+    # docker network name sorts before archon_archon-network). The process
+    # binds 10.209.48.2 on that bridge. The host tailnet IP is only the
+    # published address; it is not in this namespace. 127.0.0.1 is not
+    # reachable through a published port. 0.0.0.0 and :: are refused.
     ports:
       - "${COMPANION_MCP_TAILNET_IP:?COMPANION_MCP_TAILNET_IP is required}:3095:3095"
     environment:
       COMPANION_BUILD_SHA: "${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}"
-      COMPANION_MCP_BIND_ADDR: "${COMPANION_MCP_BIND_ADDR:?Set a non-wildcard listen address. 0.0.0.0 and :: are refused}"
+      COMPANION_MCP_BIND_ADDR: "10.209.48.2"
       COMPANION_MCP_PORT: "3095"
       COMPANION_MCP_CONFIG: /run/companion-mcp/companions.json
       COMPANION_MCP_AUDIT_LOG: /var/lib/companion-mcp/audit.log
@@ -40,9 +46,20 @@ services:
       - ${COMPANION_GITHUB_TOKEN_FILE:?COMPANION_GITHUB_TOKEN_FILE is required}:/run/companion-mcp/github-token:ro
       - companion-mcp-audit:/var/lib/companion-mcp
     networks:
-      - archon_archon-network
+      companion_publish:
+        ipv4_address: "10.209.48.2"
+        gw_priority: 100
+      archon_archon-network:
+        gw_priority: 1
 
 networks:
+  companion_publish:
+    name: "0-companion-publish"
+    driver: bridge
+    ipam:
+      config:
+        - subnet: "10.209.48.0/29"
+          gateway: "10.209.48.1"
   archon_archon-network:
     external: true
 
