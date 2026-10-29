@@ -704,9 +704,19 @@ describe('merge execution bridge', () => {
     expect(await h.store.listUnactionedVerdicts()).toHaveLength(0);
   });
 
-  test('replay-promoted shopops master verdict is refused as integration_base_mismatch', async () => {
+  test('replay-promoted shopops master verdict is refused as base_not_allowlisted', async () => {
+    // A run-backed shopops master row stops at integration_base_mismatch
+    // and never reaches the allowlist guard. This pr-discovery row keeps
+    // the same protected base (master, unattended: false) so the allowlist
+    // guard records base_not_allowlisted and performs zero merge calls.
     const h = harness(
-      [verdict('shopops-master')],
+      [
+        {
+          ...verdict('shopops-master'),
+          run_id: 'pr-discovery:thinmansoftware/shopops#1',
+          wo_id: 'gh:thinmansoftware/shopops#1',
+        } as OverseerVerdictRow,
+      ],
       greenPr({
         baseBranch: 'master',
         headSha: 'judged-sha',
@@ -715,18 +725,15 @@ describe('merge execution bridge', () => {
         pr: { owner: 'thinmansoftware', repo: 'shopops', number: 1 },
       })
     );
-    h.store.getRunById = async () => ({
-      ...run('shopops-master'),
-      owner: 'thinmansoftware',
-      repo: 'shopops',
-    });
     await runMergeExecutionBridgeOnce({
       store: h.store,
       github: h.github,
       readPolicy: () => policy(),
     });
     expect(h.merges).toBe(0);
-    expect(h.outcomes[0]?.reason).toBe('integration_base_mismatch');
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: false, reason: 'base_not_allowlisted' })
+    );
   });
 });
 

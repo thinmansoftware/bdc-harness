@@ -917,7 +917,7 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
     expect(state.replayRow?.proposedAction).toBe('flag_merge_ready');
   });
 
-  test.each(['needs_human', 'failed_genuine', 'duplicate_work'])(
+  test.each(['needs_human', 'failed_genuine', 'duplicate_work', 'reject-class'])(
     'replay green Test 4: %s prior verdict never auto-merges',
     async verdict => {
       const state = replayState(verdict);
