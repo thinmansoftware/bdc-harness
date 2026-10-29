@@ -101,6 +101,9 @@ interface FakeStoreState {
   replayRow?: ReplayVerdictRow | null;
   readCalls?: number;
   promoteCalls?: number;
+  /** When set, the atomic promote+receipt call throws and does not mutate. */
+  receiptFails?: boolean;
+  onReceipt?: (record: { action: string; result: string }) => void;
 }
 
 function makeVerdictStore(
@@ -127,6 +130,18 @@ function makeVerdictStore(
       if (row.verdict !== 'observe' && row.verdict !== 'healthy') return false;
       if (row.proposedAction === 'flag_merge_ready' || row.actionedAt !== null) return false;
       row.proposedAction = 'flag_merge_ready';
+      return true;
+    },
+    promoteObserveOrHealthyVerdictWithReceipt: async input => {
+      state.promoteCalls = (state.promoteCalls ?? 0) + 1;
+      const row = state.replayRow;
+      if (!row || row.id !== input.verdictId) return false;
+      if (row.verdict !== 'observe' && row.verdict !== 'healthy') return false;
+      if (row.proposedAction === 'flag_merge_ready' || row.actionedAt !== null) return false;
+      // Model the store contract: a receipt failure commits neither write.
+      if (state.receiptFails) throw new Error('receipt_insert_failed');
+      row.proposedAction = 'flag_merge_ready';
+      state.onReceipt?.({ action: input.action, result: input.result });
       return true;
     },
   };
@@ -845,6 +860,9 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
     const { actions, deps } = makeDeps();
     let judgeCalls = 0;
     const coordinatorCalls: WatchedRunRecord[] = [];
+    state.onReceipt = receipt => {
+      actions.push({ action: receipt.action, result: receipt.result });
+    };
     await handleRecordJudgeFirst(record, deps, {
       dryRun,
       actor: 'test',
@@ -931,6 +949,26 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
       expect(state.replayRow?.proposedAction).toBe('comment_findings');
     }
   );
+
+  test('replay green: receipt failure does not promote and does not call the coordinator', async () => {
+    const state = replayState('observe');
+    state.receiptFails = true;
+    const record = greenReplayRecord();
+    const failed = await runReplayTick(record, state);
+    expect(failed.judgeCalls).toBe(0);
+    expect(failed.actions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
+    expect(failed.coordinatorCalls).toHaveLength(0);
+    expect(state.replayRow?.verdict).toBe('observe');
+    expect(state.replayRow?.proposedAction).toBe('comment_findings');
+
+    state.receiptFails = false;
+    const retried = await runReplayTick(record, state);
+    const handoffs = retried.actions.filter(action => action.action === 'flag_merge_ready');
+    expect(handoffs).toHaveLength(1);
+    expect(handoffs[0]?.result).toBe('steward_handoff:replay_green:verdict:verdict-replay-1');
+    expect(retried.coordinatorCalls).toEqual([record]);
+    expect(state.replayRow?.proposedAction).toBe('flag_merge_ready');
+  });
 
   test('replay green Test 6: dry run records the handoff and does not act', async () => {
     const state = replayState('observe');

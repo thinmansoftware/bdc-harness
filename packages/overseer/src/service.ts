@@ -12,6 +12,7 @@ import {
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
   promoteObserveOrHealthyVerdict,
+  promoteObserveOrHealthyVerdictWithReceipt,
   recordVerdictMergeOutcome,
   releaseOverseerMergeSlot,
   releaseVerdictClaimForMergeExecution,
@@ -196,6 +197,7 @@ const defaultVerdictStore: OverseerVerdictStoreDeps = {
   finalizeVerdict: finalizeOverseerVerdict,
   getVerdictByRunHead,
   promoteObserveOrHealthyVerdict,
+  promoteObserveOrHealthyVerdictWithReceipt,
 };
 
 /**

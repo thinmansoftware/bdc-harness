@@ -340,4 +340,20 @@ export interface OverseerVerdictStoreDeps {
     actionedAt: string | null;
   } | null>;
   promoteObserveOrHealthyVerdict(verdictId: string): Promise<boolean>;
+  /**
+   * Promote an unactioned observe/healthy row to flag_merge_ready and insert
+   * the handoff receipt in one commit. Returns false when the row is not
+   * promotable (no receipt written). Throws only when the pair did not commit,
+   * in which case the promotion is rolled back. Replay handoff must use this:
+   * a promote-then-insert gap lets the merge bridge claim an unactioned
+   * flag_merge_ready row that has no handoff receipt.
+   */
+  promoteObserveOrHealthyVerdictWithReceipt(input: {
+    verdictId: string;
+    runId: string;
+    woId: string;
+    class: string;
+    action: string;
+    result: string;
+  }): Promise<boolean>;
 }

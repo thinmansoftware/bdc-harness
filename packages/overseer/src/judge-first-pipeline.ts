@@ -144,8 +144,10 @@ function logReplayGreenSkipped(fields: Record<string, unknown>): void {
  * Lost-claim come-back for an open PR. The first verdict already exists for
  * this run and head; when deterministic evidence is now merge-ready, promote
  * an observe or healthy row and hand it to the existing coordinator. No judge
- * call. Fail closed on every other verdict, store error, dry run, or missing
- * coordinator.
+ * call. Promotion and the flag_merge_ready receipt commit together so the
+ * merge bridge cannot observe an unactioned merge-ready row that has no
+ * handoff receipt. Fail closed on every other verdict, store error, dry run,
+ * or missing coordinator.
  */
 async function replayGreenHandoff(
   record: WatchedRunRecord,
@@ -214,7 +216,17 @@ async function replayGreenHandoff(
 
   let promoted = false;
   try {
-    promoted = await options.verdictStore.promoteObserveOrHealthyVerdict(row.id);
+    // One store call: the verdict update and the handoff receipt commit
+    // together. A receipt failure rolls the promotion back, so this path
+    // never leaves an unactioned flag_merge_ready row for the bridge.
+    promoted = await options.verdictStore.promoteObserveOrHealthyVerdictWithReceipt({
+      verdictId: row.id,
+      runId: record.runId,
+      woId: record.woId,
+      class: actionClass(record),
+      action: 'flag_merge_ready',
+      result,
+    });
   } catch (error) {
     log.error(
       {
@@ -222,7 +234,7 @@ async function replayGreenHandoff(
         runId: record.runId,
         headSha,
         verdictId: row.id,
-        reason: 'promote_failed',
+        reason: 'promote_or_receipt_failed',
       },
       'overseer.judge_first.replay_green_skipped'
     );
@@ -238,13 +250,6 @@ async function replayGreenHandoff(
     return;
   }
 
-  await deps.insertOverseerAction({
-    runId: record.runId,
-    woId: record.woId,
-    class: actionClass(record),
-    action: 'flag_merge_ready',
-    result,
-  });
   log.info(
     { runId: record.runId, woId: record.woId, verdictId: row.id, dryRun: false },
     'overseer.judge_first.replay_green_handoff'

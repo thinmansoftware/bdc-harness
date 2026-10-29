@@ -29,6 +29,7 @@ import {
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
   promoteObserveOrHealthyVerdict,
+  promoteObserveOrHealthyVerdictWithReceipt,
   recordVerdictMergeOutcome,
   releaseOverseerMergeSlot,
   releaseVerdictClaimForMergeExecution,
@@ -369,6 +370,75 @@ describe('overseer db', () => {
     expect(await promoteObserveOrHealthyVerdict(human.verdictId!)).toBe(false);
     const humanRows = await getOverseerVerdictsForRun('run-promote-human');
     expect(humanRows[0]?.proposed_action).toBe('escalate_with_evidence');
+  });
+
+  test('promotion and handoff receipt commit together', async () => {
+    await seedRun('run-promote-atomic', 'completed');
+    const observe = await claimOverseerVerdict({
+      runId: 'run-promote-atomic',
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: 'H',
+    });
+    await finalizeOverseerVerdict({
+      verdictId: observe.verdictId!,
+      status: 'verdict',
+      verdict: 'observe',
+      proposedAction: 'comment_findings',
+    });
+
+    const receipt = {
+      verdictId: observe.verdictId!,
+      runId: 'run-promote-atomic',
+      woId: 'WO-TEST-OVERSEER-01',
+      class: 'none',
+      action: 'flag_merge_ready',
+      result: `steward_handoff:replay_green:verdict:${observe.verdictId}`,
+    };
+    expect(await promoteObserveOrHealthyVerdictWithReceipt(receipt)).toBe(true);
+    const promoted = await getVerdictByRunHead({ runId: 'run-promote-atomic', headSha: 'H' });
+    expect(promoted?.proposedAction).toBe('flag_merge_ready');
+    const actions = await getOverseerActionsForRun('run-promote-atomic');
+    expect(actions.map(action => action.action)).toEqual(['flag_merge_ready']);
+    expect(actions[0]?.result).toBe(receipt.result);
+    const visible = await listUnactionedFlagMergeReadyVerdicts();
+    expect(visible.map(row => row.id)).toEqual([observe.verdictId]);
+
+    expect(await promoteObserveOrHealthyVerdictWithReceipt(receipt)).toBe(false);
+    const afterRetry = await getOverseerActionsForRun('run-promote-atomic');
+    expect(afterRetry.filter(action => action.action === 'flag_merge_ready')).toHaveLength(1);
+  });
+
+  test('receipt insert failure rolls the merge-ready promotion back', async () => {
+    await seedRun('run-promote-rollback', 'completed');
+    const observe = await claimOverseerVerdict({
+      runId: 'run-promote-rollback',
+      woId: 'WO-TEST-OVERSEER-01',
+      headSha: 'H',
+    });
+    await finalizeOverseerVerdict({
+      verdictId: observe.verdictId!,
+      status: 'verdict',
+      verdict: 'observe',
+      proposedAction: 'comment_findings',
+    });
+
+    await expect(
+      promoteObserveOrHealthyVerdictWithReceipt({
+        verdictId: observe.verdictId!,
+        runId: 'run-does-not-exist',
+        woId: 'WO-TEST-OVERSEER-01',
+        class: 'none',
+        action: 'flag_merge_ready',
+        result: `steward_handoff:replay_green:verdict:${observe.verdictId}`,
+      })
+    ).rejects.toThrow();
+
+    const row = await getVerdictByRunHead({ runId: 'run-promote-rollback', headSha: 'H' });
+    expect(row?.verdict).toBe('observe');
+    expect(row?.proposedAction).toBe('comment_findings');
+    expect(row?.actionedAt).toBeNull();
+    expect(await getOverseerActionsForRun('run-promote-rollback')).toHaveLength(0);
+    expect(await listUnactionedFlagMergeReadyVerdicts()).toEqual([]);
   });
 
   test('claim is idempotent per (run_id, head_sha) -- replay never wins a second claim', async () => {
