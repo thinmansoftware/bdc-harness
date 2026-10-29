@@ -746,6 +746,53 @@ export async function finalizeOverseerVerdict(input: {
   return row;
 }
 
+/** Read the single verdict row for a run and head, if one exists. */
+export async function getVerdictByRunHead(input: { runId: string; headSha: string }): Promise<{
+  id: string;
+  verdict: string | null;
+  proposedAction: string | null;
+  actionedAt: string | null;
+} | null> {
+  const result = await getDatabase().query<{
+    id: string;
+    verdict: string | null;
+    proposed_action: string | null;
+    actioned_at: string | null;
+  }>(
+    `SELECT id, verdict, proposed_action, actioned_at
+     FROM overseer_verdicts
+     WHERE run_id = $1 AND head_sha = $2
+     LIMIT 1`,
+    [input.runId, input.headSha]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  return {
+    id: row.id,
+    verdict: row.verdict,
+    proposedAction: row.proposed_action,
+    actionedAt: row.actioned_at,
+  };
+}
+
+/**
+ * Promote an unactioned observe or healthy verdict to flag_merge_ready.
+ * Returns true only when this call changed the row. A second call is a no-op.
+ * No UPDATE ... RETURNING: the SQLite adapter rejects it.
+ */
+export async function promoteObserveOrHealthyVerdict(verdictId: string): Promise<boolean> {
+  const result = await getDatabase().query(
+    `UPDATE overseer_verdicts
+     SET proposed_action = 'flag_merge_ready', updated_at = $2
+     WHERE id = $1
+       AND verdict IN ('observe', 'healthy')
+       AND proposed_action IS DISTINCT FROM 'flag_merge_ready'
+       AND actioned_at IS NULL`,
+    [verdictId, new Date().toISOString()]
+  );
+  return result.rowCount === 1;
+}
+
 export async function getOverseerVerdictsForRun(runId: string): Promise<OverseerVerdictRow[]> {
   const result = await getDatabase().query<OverseerVerdictRow>(
     'SELECT * FROM overseer_verdicts WHERE run_id = $1 ORDER BY created_at ASC',

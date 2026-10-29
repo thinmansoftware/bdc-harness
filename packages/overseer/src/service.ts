@@ -5,11 +5,13 @@ import {
   deferVerdictClaimForMergeExecution,
   finalizeOverseerVerdict,
   getOverseerWatchRunById,
+  getVerdictByRunHead,
   insertOverseerAction,
   listActiveRunUserMessages,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
+  promoteObserveOrHealthyVerdict,
   recordVerdictMergeOutcome,
   releaseOverseerMergeSlot,
   releaseVerdictClaimForMergeExecution,
@@ -192,6 +194,8 @@ export function emergencyStopEngaged(): boolean {
 const defaultVerdictStore: OverseerVerdictStoreDeps = {
   claimVerdict: claimOverseerVerdict,
   finalizeVerdict: finalizeOverseerVerdict,
+  getVerdictByRunHead,
+  promoteObserveOrHealthyVerdict,
 };
 
 /**
