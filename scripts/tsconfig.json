@@ -15,6 +15,7 @@
     "staging/**/*.ts",
     "taskmaster/**/*.ts",
     "mta/**/*.ts",
-    "windows-ci/**/*.ts"
+    "windows-ci/**/*.ts",
+    "served-lanes/**/*.ts"
   ]
 }
