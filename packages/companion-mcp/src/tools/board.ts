@@ -32,6 +32,8 @@ interface PreparedFile {
 
 export const BOARD_RECORD_PROPOSE_TOOL = 'board_record_propose';
 
+const BOARD_REPOSITORY = 'thinmansoftware/bdc-xo';
+
 const MOTION_SUFFIX =
   /^docs\/board\/motions\/M-[A-Za-z0-9][A-Za-z0-9.-]*\.(brief|questions|discussion|synthesis|checklist)\.md$/;
 const NEW_MOTION = /^docs\/board\/motions\/M-[A-Za-z0-9][A-Za-z0-9-]*-[a-z0-9][a-z0-9-]*\.md$/;
@@ -42,12 +44,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function rulingViolation(content: string): string | null {
+  const folded = content.toLowerCase();
   for (const word of RULING_STATUS_WORDS) {
-    if (new RegExp(`\\b${word}\\b`).test(content)) {
+    if (new RegExp(`\\b${word.toLowerCase()}\\b`).test(folded)) {
       return word;
     }
   }
-  if (/^#{1,6}\s+Ruling\b/im.test(content) || /^Ruling\s*$/im.test(content)) {
+  if (/^#{1,6}\s+ruling\b/m.test(folded) || /^ruling\s*$/m.test(folded)) {
     return 'ruling_section';
   }
   const lines = content.split('\n');
@@ -175,27 +178,23 @@ function localProposal(
 }
 
 function addedRegisterLines(base: string, proposed: string): string | null {
-  if (proposed === base) {
+  if (base.length === 0 || !proposed.startsWith(base) || proposed.length <= base.length) {
     return null;
   }
-  if (proposed.startsWith(base)) {
-    return proposed.slice(base.length);
+  let added = proposed.slice(base.length);
+  if (!base.endsWith('\n') && added.startsWith('\n')) {
+    added = added.slice(1);
   }
-  const baseLines = base.split('\n');
-  const proposedLines = proposed.split('\n');
-  const added: string[] = [];
-  let index = 0;
-  for (const line of proposedLines) {
-    if (index < baseLines.length && line === baseLines[index]) {
-      index += 1;
-    } else {
-      added.push(line);
-    }
+  if (added.endsWith('\n')) {
+    added = added.slice(0, -1);
   }
-  if (index !== baseLines.length) {
+  if (added.length === 0 || added.includes('\n') || added.includes('\r')) {
     return null;
   }
-  return added.join('\n');
+  if (!added.startsWith('|') || !added.endsWith('|') || added.split('|').length < 3) {
+    return null;
+  }
+  return added;
 }
 
 function assertRegisterAddition(base: string, proposed: string, companionId: string): void {
@@ -204,11 +203,14 @@ function assertRegisterAddition(base: string, proposed: string, companionId: str
     throw new ToolFailure('refused', 'path_refused');
   }
   const added = addedRegisterLines(base, proposed);
-  if (added === null || added.trim() === '') {
+  if (added === null) {
     throw new ToolFailure('refused', 'path_refused');
   }
   if (rulingViolation(added) !== null) {
     throw new ToolFailure('refused', 'ruling_refused');
+  }
+  if (!added.includes(label)) {
+    throw new ToolFailure('refused', 'path_refused');
   }
 }
 
@@ -358,7 +360,7 @@ export async function boardRecordPropose(
     throw new ToolFailure('refused', 'path_refused');
   }
   const config = readGithubConfig(env);
-  if (config === null || !/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(config.repo)) {
+  if (config?.repo !== BOARD_REPOSITORY) {
     throw new ToolFailure('error', 'github_credential_unavailable');
   }
   if (!/^[A-Za-z0-9._/-]+$/.test(config.base) || config.base.includes('..')) {
@@ -384,10 +386,14 @@ export async function boardRecordPropose(
   const label = secretaryLabel(slot.companion_id);
   for (const file of prepared) {
     const existing = await readBaseFile(config, token, baseSha, file.path);
+    if (
+      file.path.startsWith('docs/board/motions/') &&
+      file.path !== REGISTER_PATH &&
+      existing !== null
+    ) {
+      throw new ToolFailure('refused', 'path_refused');
+    }
     if (file.kind === 'motion') {
-      if (existing !== null) {
-        throw new ToolFailure('refused', 'path_refused');
-      }
       if (!file.content.startsWith(label)) {
         throw new ToolFailure('refused', 'path_refused');
       }

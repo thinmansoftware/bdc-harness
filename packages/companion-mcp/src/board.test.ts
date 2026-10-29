@@ -264,7 +264,7 @@ describe('board secretary tools', () => {
     const mail = await startRecordingServer(dispatch.handler);
     const harness = await createHarness();
     const synthesis = `${secretaryLabel('grokbot')}\n\nSeats disagreed. The secretary records that without ranking them.\n`;
-    const addition = '| M-TEST | recorded | prepared by grokbot as board secretary |\n';
+    const addition = `| M-TEST | recorded | ${secretaryLabel('grokbot')} |\n`;
     const register = `${BASE_REGISTER}${addition}`;
     const running = await startFromHarness(harness, {
       COMPANION_GITHUB_API_BASE: github.url,
@@ -363,6 +363,22 @@ describe('board secretary tools', () => {
         files: [
           {
             path: 'docs/board/design-rounds/M-TEST.discussion.md',
+            content: `${label}\n\nStatus ratified in this edit.\n`,
+          },
+        ],
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/M-TEST.synthesis.md',
+            content: `${label}\n\n## ruling\nnotes\n`,
+          },
+        ],
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/design-rounds/M-TEST.discussion.md',
             content: `${label}\n\n## Ruling\ninserted into an existing round file\n`,
           },
         ],
@@ -406,6 +422,10 @@ describe('board secretary tools', () => {
         'docs/board/motions/M-TEST-existing.md',
         `${secretaryLabel('grokbot')}\n\nOriginal motion.\n`,
       ],
+      [
+        'docs/board/motions/M-TEST.synthesis.md',
+        `${secretaryLabel('grokbot')}\n\nOriginal synthesis.\n`,
+      ],
       ['docs/board/motions/REGISTER.md', BASE_REGISTER],
     ]);
     const github = await startRecordingServer(githubStub(files));
@@ -418,6 +438,15 @@ describe('board secretary tools', () => {
           {
             path: 'docs/board/motions/M-TEST-existing.md',
             content: `${label}\n\nEdited the draft.\n`,
+          },
+        ],
+        error: 'path_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/M-TEST.synthesis.md',
+            content: `${label}\n\nEdited the existing synthesis.\n`,
           },
         ],
         error: 'path_refused',
@@ -443,6 +472,45 @@ describe('board secretary tools', () => {
         ],
         error: 'ruling_refused',
       },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-9 | ratified | ${label} |\n`,
+          },
+        ],
+        error: 'ruling_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: BASE_REGISTER.replace(
+              '| M-2 | CARRIED | historical |',
+              `| M-INJECT | recorded | ${label} |\n| M-2 | CARRIED | historical |`
+            ),
+          },
+        ],
+        error: 'path_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-TEST | recorded | note |\n`,
+          },
+        ],
+        error: 'path_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-A | recorded | ${label} |\n| M-B | recorded | ${label} |\n`,
+          },
+        ],
+        error: 'path_refused',
+      },
     ];
     try {
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
@@ -466,6 +534,38 @@ describe('board secretary tools', () => {
         }
       });
       expect(github.requests.some(request => request.method !== 'GET')).toBe(false);
+    } finally {
+      await running.close();
+      await github.close();
+      await harness.cleanup();
+    }
+  });
+
+  test('board_record_propose_refuses_repo_other_than_bdc_xo', async () => {
+    const github = await startRecordingServer(githubStub(new Map()));
+    const harness = await createHarness();
+    const running = await startFromHarness(harness, {
+      COMPANION_GITHUB_API_BASE: github.url,
+      COMPANION_BOARD_REPO: 'other-org/other-repo',
+    });
+    try {
+      await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
+        const refused = parseToolJson(
+          await callToolText(client, 'board_record_propose', {
+            kind: 'synthesis',
+            motion_id: 'M-TEST',
+            summary: 'should not reach github',
+            files: [
+              {
+                path: 'docs/board/motions/M-TEST.synthesis.md',
+                content: `${secretaryLabel('grokbot')}\n\nA permitted new synthesis.\n`,
+              },
+            ],
+          })
+        );
+        expect(refused.error).toBe('github_credential_unavailable');
+      });
+      expect(github.requests).toHaveLength(0);
     } finally {
       await running.close();
       await github.close();
