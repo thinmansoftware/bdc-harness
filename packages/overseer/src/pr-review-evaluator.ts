@@ -283,14 +283,52 @@ export function resolveWoIdFromPullRequest(input: {
   return { status: 'none' };
 }
 
+/**
+ * Forward scan for work-order ids. Accepted ids, first-seen order, and
+ * duplicate collapse stay the same, and each character is visited a
+ * constant number of times.
+ */
 function distinctWoIds(source: string): string[] {
+  const isRunChar = (char: string): boolean =>
+    char === '-' || (char >= '0' && char <= '9') || (char >= 'A' && char <= 'Z');
+  const isDigit = (char: string): boolean => char >= '0' && char <= '9';
+
   const ids: string[] = [];
   const seen = new Set<string>();
-  for (const match of source.matchAll(/WO-[A-Z0-9-]+-[0-9]+/g)) {
-    const id = match[0];
-    if (seen.has(id)) continue;
-    seen.add(id);
-    ids.push(id);
+  const length = source.length;
+  let index = 0;
+  while (index < length) {
+    if (source[index] !== 'W' || source[index + 1] !== 'O' || source[index + 2] !== '-') {
+      index += 1;
+      continue;
+    }
+
+    const idStart = index;
+    let runEnd = index + 3;
+    while (runEnd < length && isRunChar(source[runEnd] ?? '')) runEnd += 1;
+
+    // Rightmost hyphen in the run that has a preceding run character and
+    // at least one digit after it. The id ends when that digit run ends.
+    let digitEnd = -1;
+    for (let hyphen = idStart + 4; hyphen < runEnd; hyphen += 1) {
+      if (source[hyphen] !== '-') continue;
+      let digits = hyphen + 1;
+      if (digits >= runEnd || !isDigit(source[digits] ?? '')) continue;
+      while (digits < runEnd && isDigit(source[digits] ?? '')) digits += 1;
+      digitEnd = digits;
+    }
+
+    if (digitEnd < 0) {
+      index = runEnd;
+      continue;
+    }
+
+    const id = source.slice(idStart, digitEnd);
+    if (!seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+    index = digitEnd;
   }
   return ids;
 }

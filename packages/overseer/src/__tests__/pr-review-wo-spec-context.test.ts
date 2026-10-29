@@ -4,6 +4,9 @@
  * and stamps every posted body with the spec revision it used.
  */
 import { expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps.ts';
 import {
   buildReviewPrompt,
@@ -476,4 +479,295 @@ test('model_provenance_line_is_replaced_by_exactly_one', async () => {
   expect(verdict.summary).not.toContain('WO-EVIL-01');
   expect(verdict.summary).not.toContain('not found on bdc-xo main');
   expect(provenanceLines(verdict.summary)).toEqual([realLine]);
+});
+
+const ORACLE_MAX_CHARS = 128;
+const HOSTILE_REPEAT = 100000;
+
+interface WoPullText {
+  headRef: string;
+  title: string;
+  body: string;
+}
+
+function legacyDistinctWoIds(source: string): string[] {
+  if (source.length > ORACLE_MAX_CHARS) {
+    throw new Error('oracle input exceeds 128 characters');
+  }
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  for (const match of source.matchAll(/WO-[A-Z0-9-]+-[0-9]+/g)) {
+    const id = match[0];
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+function legacyResolveWoId(input: WoPullText): ReturnType<typeof resolveWoIdFromPullRequest> {
+  const sources = [input.headRef, input.title, input.body];
+  for (const source of sources) {
+    const ids = legacyDistinctWoIds(source);
+    const only = ids.length === 1 ? ids[0] : undefined;
+    if (only) return { status: 'resolved', woId: only };
+    if (ids.length > 1) return { status: 'ambiguous', ids };
+  }
+  return { status: 'none' };
+}
+
+function subprocessText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value instanceof Uint8Array) return new TextDecoder().decode(value);
+  return '';
+}
+
+test('hostile_wo_id_inputs_cannot_cause_polynomial_work', () => {
+  expect(() => legacyDistinctWoIds('A'.repeat(ORACLE_MAX_CHARS + 1))).toThrow(
+    'oracle input exceeds 128 characters'
+  );
+  expect(legacyDistinctWoIds('A'.repeat(ORACLE_MAX_CHARS))).toEqual([]);
+
+  const nearSafe = 'WO-A-01-'.repeat(4);
+  const differentialFixtures: WoPullText[] = [
+    { headRef: 'WO-HARNESS-FOO-01-abc', title: '', body: '' },
+    { headRef: 'WO-A-01-02', title: '', body: '' },
+    { headRef: 'WO-A-01WO-B-02', title: '', body: '' },
+    { headRef: 'WO-A-01-B-02', title: '', body: '' },
+    { headRef: 'WO-A-01 WO-B-02', title: '', body: '' },
+    { headRef: 'WO-01', title: '', body: '' },
+    { headRef: 'WO--01', title: '', body: '' },
+    { headRef: 'WO-1-02', title: '', body: '' },
+    { headRef: 'wo-harness-foo-01', title: 'wo-a-01', body: 'wo-b-02' },
+    { headRef: 'WO-A-01 WO-A-01 WO-A-01', title: '', body: '' },
+    {
+      headRef: 'cauldron/WO-HARNESS-FOO-01-abc',
+      title: 'fix: WO-HARNESS-BAR-02',
+      body: '',
+    },
+    {
+      headRef: 'feature/no-work-order',
+      title: 'fix WO-A-01 and WO-B-02',
+      body: 'WO-C-03',
+    },
+    {
+      headRef: 'feature/no-work-order',
+      title: 'fix a typo',
+      body: 'see WO-BODY-07',
+    },
+    {
+      headRef: 'feature/no-work-order',
+      title: 'fix a typo',
+      body: 'no identifier in the body',
+    },
+    { headRef: nearSafe, title: 'WO-B-02', body: '' },
+  ];
+
+  for (const fixture of differentialFixtures) {
+    for (const source of [fixture.headRef, fixture.title, fixture.body]) {
+      expect(source.length).toBeLessThanOrEqual(ORACLE_MAX_CHARS);
+    }
+    const resolved = resolveWoIdFromPullRequest(fixture);
+    expect(resolved).toEqual(legacyResolveWoId(fixture));
+  }
+
+  expect(
+    resolveWoIdFromPullRequest({
+      headRef: 'cauldron/WO-HARNESS-FOO-01-abc',
+      title: 'fix: WO-HARNESS-BAR-02',
+      body: '',
+    })
+  ).toEqual({ status: 'resolved', woId: 'WO-HARNESS-FOO-01' });
+  expect(
+    resolveWoIdFromPullRequest({
+      headRef: 'feature/no-work-order',
+      title: 'fix WO-A-01 and WO-B-02',
+      body: 'WO-C-03',
+    })
+  ).toEqual({ status: 'ambiguous', ids: ['WO-A-01', 'WO-B-02'] });
+  expect(
+    resolveWoIdFromPullRequest({
+      headRef: 'feature/no-work-order',
+      title: 'fix a typo',
+      body: 'no identifier in the body',
+    })
+  ).toEqual({ status: 'none' });
+  expect(resolveWoIdFromPullRequest({ headRef: 'WO-A-01WO-B-02', title: '', body: '' })).toEqual({
+    status: 'resolved',
+    woId: 'WO-A-01WO-B-02',
+  });
+  expect(resolveWoIdFromPullRequest({ headRef: nearSafe, title: 'WO-B-02', body: '' })).toEqual({
+    status: 'resolved',
+    woId: nearSafe.slice(0, -1),
+  });
+
+  const evaluatorPath = join(import.meta.dir, '../pr-review-evaluator.ts');
+  const childProgram = `
+import { writeFileSync } from 'node:fs';
+import { resolveWoIdFromPullRequest } from ${JSON.stringify(evaluatorPath)};
+
+const repeat = ${HOSTILE_REPEAT};
+const outPath = process.argv[1];
+if (!outPath) throw new Error('missing output path');
+
+const repeatedWo = resolveWoIdFromPullRequest({
+  headRef: 'WO-'.repeat(repeat),
+  title: '',
+  body: '',
+});
+const longHyphen = resolveWoIdFromPullRequest({
+  headRef: 'WO-' + '-'.repeat(repeat),
+  title: '',
+  body: '',
+});
+const longA = resolveWoIdFromPullRequest({
+  headRef: 'WO-' + 'A'.repeat(repeat),
+  title: '',
+  body: '',
+});
+const repeatedAHyphen = resolveWoIdFromPullRequest({
+  headRef: 'WO-' + 'A-'.repeat(repeat),
+  title: '',
+  body: '',
+});
+const nearRaw = 'WO-A-01-'.repeat(repeat);
+const nearExpected = nearRaw.slice(0, -1);
+const near = resolveWoIdFromPullRequest({
+  headRef: nearRaw,
+  title: 'fix: WO-HARNESS-BAR-02',
+  body: '',
+});
+if (near.status !== 'resolved' || near.woId !== nearExpected) {
+  throw new Error('near-valid id was truncated or split');
+}
+const distinctIds = [];
+for (let i = 1; i <= repeat; i += 1) distinctIds.push('WO-T' + i + '-01');
+const many = resolveWoIdFromPullRequest({
+  headRef: distinctIds.join(' '),
+  title: '',
+  body: '',
+});
+if (many.status !== 'ambiguous' || many.ids.length !== distinctIds.length) {
+  throw new Error('distinct ids were dropped or merged');
+}
+for (let i = 0; i < distinctIds.length; i += 1) {
+  if (many.ids[i] !== distinctIds[i]) throw new Error('distinct id order changed at ' + i);
+}
+const repeatedIds = resolveWoIdFromPullRequest({
+  headRef: 'WO-A-01 '.repeat(repeat),
+  title: '',
+  body: '',
+});
+if (repeatedIds.status !== 'resolved' || repeatedIds.woId !== 'WO-A-01') {
+  throw new Error('repeated ids did not collapse to one');
+}
+const branchFirst = resolveWoIdFromPullRequest({
+  headRef: 'cauldron/WO-HARNESS-FOO-01-abc',
+  title: 'fix: WO-HARNESS-BAR-02',
+  body: '',
+});
+if (branchFirst.status !== 'resolved' || branchFirst.woId !== 'WO-HARNESS-FOO-01') {
+  throw new Error('branch precedence changed');
+}
+const titleAmbiguous = resolveWoIdFromPullRequest({
+  headRef: 'feature/no-work-order',
+  title: 'fix WO-A-01 and WO-B-02',
+  body: '',
+});
+if (
+  titleAmbiguous.status !== 'ambiguous' ||
+  titleAmbiguous.ids.join(',') !== 'WO-A-01,WO-B-02'
+) {
+  throw new Error('title ambiguity changed');
+}
+const none = resolveWoIdFromPullRequest({
+  headRef: 'feature/no-work-order',
+  title: 'fix a typo',
+  body: 'no identifier in the body',
+});
+if (none.status !== 'none') throw new Error('missing id changed');
+
+writeFileSync(outPath, JSON.stringify({
+  repeatedWo: repeatedWo.status,
+  longHyphen: longHyphen.status,
+  longA: longA.status,
+  repeatedAHyphen: repeatedAHyphen.status,
+  near: { status: near.status, length: near.woId.length },
+  many: {
+    status: many.status,
+    count: many.ids.length,
+    first: many.ids[0],
+    second: many.ids[1],
+    last: many.ids[many.ids.length - 1],
+  },
+  repeatedIds: { status: repeatedIds.status, woId: repeatedIds.woId },
+  branchFirst: { status: branchFirst.status, woId: branchFirst.woId },
+  titleAmbiguous: { status: titleAmbiguous.status, ids: titleAmbiguous.ids },
+  none: none.status,
+}));
+`;
+
+  expect(childProgram).toContain('resolveWoIdFromPullRequest');
+  expect(childProgram).not.toContain('distinctWoIds');
+  expect(childProgram).not.toContain('octokit');
+  expect(childProgram).not.toContain('fetch(');
+  expect(childProgram).not.toContain('api.github.com');
+
+  const directory = mkdtempSync(join(tmpdir(), 'wo-id-hostile-'));
+  const outputPath = join(directory, 'report.json');
+  try {
+    const result = Bun.spawnSync({
+      cmd: [process.execPath, '-e', childProgram, outputPath],
+      cwd: join(import.meta.dir, '../../../..'),
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 5000,
+    });
+    const stderr = subprocessText(result.stderr);
+    const stdout = subprocessText(result.stdout);
+    const detail = `${stderr}\n${stdout}`.slice(0, 4000);
+    expect(result.exitedDueToTimeout, detail).toBeFalsy();
+    expect(result.signalCode, detail).toBeFalsy();
+    expect(result.exitCode, detail).toBe(0);
+
+    const report = JSON.parse(readFileSync(outputPath, 'utf8')) as {
+      repeatedWo: string;
+      longHyphen: string;
+      longA: string;
+      repeatedAHyphen: string;
+      near: { status: string; length: number };
+      many: { status: string; count: number; first: string; second: string; last: string };
+      repeatedIds: { status: string; woId: string };
+      branchFirst: { status: string; woId: string };
+      titleAmbiguous: { status: string; ids: string[] };
+      none: string;
+    };
+    expect(report.repeatedWo).toBe('none');
+    expect(report.longHyphen).toBe('none');
+    expect(report.longA).toBe('none');
+    expect(report.repeatedAHyphen).toBe('none');
+    expect(report.near).toEqual({
+      status: 'resolved',
+      length: 'WO-A-01-'.length * HOSTILE_REPEAT - 1,
+    });
+    expect(report.many).toEqual({
+      status: 'ambiguous',
+      count: HOSTILE_REPEAT,
+      first: 'WO-T1-01',
+      second: 'WO-T2-01',
+      last: `WO-T${HOSTILE_REPEAT}-01`,
+    });
+    expect(report.repeatedIds).toEqual({ status: 'resolved', woId: 'WO-A-01' });
+    expect(report.branchFirst).toEqual({
+      status: 'resolved',
+      woId: 'WO-HARNESS-FOO-01',
+    });
+    expect(report.titleAmbiguous).toEqual({
+      status: 'ambiguous',
+      ids: ['WO-A-01', 'WO-B-02'],
+    });
+    expect(report.none).toBe('none');
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
