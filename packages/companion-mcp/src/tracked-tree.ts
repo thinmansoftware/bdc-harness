@@ -36,15 +36,6 @@ async function gitText(
   return { code, stdout };
 }
 
-function cloneStatusDirty(stdout: string): boolean {
-  for (const entry of stdout.split('\0')) {
-    if (entry.length > 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
 export function lexicalTrackedPath(requested: string, prefix: string): string | null {
   if (requested.length === 0 || requested.length > 512) {
     return null;
@@ -78,8 +69,8 @@ export class TrackedTree {
     await this.refresh();
     this.timer = setInterval(() => {
       void this.refresh().catch(() => {
-        // Dirty and untracked clones clear the served set inside refresh().
-        // The next tick retries.
+        // A failed ls-files retains the previous list and retries next tick.
+        // Dirty and untracked detection is not a runtime reader responsibility.
       });
     }, this.intervalMs);
     this.timer.unref();
@@ -108,16 +99,6 @@ export class TrackedTree {
   }
 
   async refresh(): Promise<void> {
-    const status = await gitText(this.root, [
-      'status',
-      '--porcelain=v1',
-      '-z',
-      '--untracked-files=all',
-    ]);
-    if (status.code !== 0 || cloneStatusDirty(status.stdout)) {
-      this.files = new Set();
-      throw new Error(status.code !== 0 ? 'wiki_root_unreadable' : 'wiki_root_dirty');
-    }
     const listed = await gitText(this.root, ['ls-files', '-z', '--', 'xo-wiki/wiki', 'docs/board']);
     if (listed.code !== 0) {
       throw new Error('wiki_root_unreadable');

@@ -60,16 +60,33 @@ gates in this runbook stay in force.
 
 ## Clean wiki clone
 
-The server reads only `git ls-files` paths under `xo-wiki/wiki` and
-`docs/board` from `COMPANION_WIKI_ROOT`. The clone must be clean and the
-deploy key must be read-only.
+The server lists tracked paths with `git ls-files` under `xo-wiki/wiki` and
+`docs/board` in `COMPANION_WIKI_ROOT`, then reads those working-tree bytes.
+At startup and every ten minutes it refreshes that list. The reader does not
+reject untracked files at runtime, detect runtime dirty state, or serve an
+immutable Git snapshot.
 
-Do not reuse `/opt/bdc/harness-wiki`. That checkout is stale and its git
-remote URL embeds a GitHub token.
+Before serving a selected clone with a valid `HEAD`, the operator must run:
+
+```bash
+git -C "$COMPANION_WIKI_ROOT" diff --quiet --
+git -C "$COMPANION_WIKI_ROOT" diff --cached --quiet HEAD --
+```
+
+Both commands validate clean tracked state. Unrelated untracked files do not
+fail the precondition. A single `git diff HEAD` is not enough, because a
+staged change reversed only in the worktree can cancel in that comparison
+while the index still differs from `HEAD`.
+
+The deploy key must be read-only. Do not reuse `/opt/bdc/harness-wiki`. That
+checkout is stale and its git remote URL embeds a GitHub token.
 
 Create a new clone with a read-only deploy key and a sparse checkout of
-`xo-wiki/wiki` and `docs/board` only. Mount that directory read-only. The
-process refreshes `git ls-files` at startup and every 10 minutes.
+`xo-wiki/wiki` and `docs/board` only. Mount that directory read-only. Verify
+the source mount is read-only and the service user is `companion` UID/GID
+10001. A read-only container mount does not prevent host-side modifications.
+The operator preserves the clean tracked source condition while the clone is
+served.
 
 ## Config fields
 

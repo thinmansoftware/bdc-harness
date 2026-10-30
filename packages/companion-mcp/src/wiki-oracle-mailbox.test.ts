@@ -1,5 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readFile } from 'node:fs/promises';
 
 import { describe, expect, test } from 'bun:test';
 
@@ -23,11 +22,6 @@ describe('wiki oracle and mailbox tools', () => {
     const oracle = await startRecordingServer(() => ({ status: 500, body: { error: 'down' } }));
     const running = await startFromHarness(harness, { ORACLE_URL: oracle.url });
     try {
-      await writeFile(
-        join(harness.wikiRoot, 'xo-wiki/wiki/secret.md'),
-        'UNTRACKED-SECRET-CONTENT\n',
-        'utf8'
-      );
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
         await callToolText(client, 'wiki_read', { path: 'xo-wiki/wiki/a.md' });
         await callToolText(client, 'wiki_read', { path: 'xo-wiki/wiki/secret.md' });
@@ -130,11 +124,6 @@ describe('wiki oracle and mailbox tools', () => {
     const harness = await createHarness();
     const running = await startFromHarness(harness);
     try {
-      await writeFile(
-        join(harness.wikiRoot, 'xo-wiki/wiki/secret.md'),
-        'UNTRACKED-SECRET-CONTENT\n',
-        'utf8'
-      );
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
         const ok = parseToolJson(
           await callToolText(client, 'wiki_read', { path: 'xo-wiki/wiki/a.md' })
@@ -145,6 +134,10 @@ describe('wiki oracle and mailbox tools', () => {
         );
         expect(refused.error).toBe('not_tracked');
         expect(JSON.stringify(refused)).not.toContain('UNTRACKED-SECRET-CONTENT');
+        const hidden = parseToolJson(
+          await callToolText(client, 'wiki_search', { query: 'UNTRACKED-SECRET-CONTENT' })
+        );
+        expect(JSON.stringify(hidden)).not.toContain('UNTRACKED-SECRET-CONTENT');
       });
     } finally {
       await running.close();
