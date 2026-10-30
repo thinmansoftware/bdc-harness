@@ -671,6 +671,37 @@ async function chownForeignWiki(wikiHostPath: string): Promise<void> {
   }
 }
 
+async function reclaimFixture(fixture: string): Promise<void> {
+  const uid = process.getuid?.();
+  const gid = process.getgid?.();
+  if (uid === undefined || gid === undefined) {
+    return;
+  }
+  // The synthetic wiki is owned by uid 20002. Return it to the runner before delete.
+  await runCommand([
+    'docker',
+    'run',
+    '--rm',
+    '--user',
+    '0:0',
+    '--network',
+    'none',
+    '--entrypoint',
+    '/bin/chown',
+    '-v',
+    `${fixture}:${fixture}`,
+    REPAIR_IMAGE,
+    '-R',
+    `${String(uid)}:${String(gid)}`,
+    fixture,
+  ]);
+}
+
+async function removeOwnedFixture(fixture: string): Promise<void> {
+  await reclaimFixture(fixture);
+  await rm(fixture, { recursive: true, force: true });
+}
+
 async function prepareUntrustedRepo(repo: string): Promise<void> {
   await mkdir(repo, { recursive: true });
   const init = await runCommand(['git', '-C', repo, 'init', '-b', 'main']);
@@ -1125,7 +1156,7 @@ describe('companion image fresh audit volume', () => {
       await runCommand(['docker', 'volume', 'rm', '-f', volume]);
       await oracle.close();
       await dispatch.close();
-      await rm(fixture, { recursive: true, force: true });
+      await removeOwnedFixture(fixture);
     }
   }, 900000);
 });
@@ -1357,7 +1388,7 @@ describe('companion compose published port', () => {
       await runCommand(['docker', 'network', 'rm', publishNet]);
       await runCommand(['docker', 'network', 'rm', sideNet]);
       await runCommand(['docker', 'volume', 'rm', '-f', volume]);
-      await rm(fixture, { recursive: true, force: true });
+      await removeOwnedFixture(fixture);
     }
   }, 900000);
 });
