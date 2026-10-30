@@ -197,6 +197,14 @@ describe('companion-mcp Dockerfile contract', () => {
     expect(userAt).toBeGreaterThan(gitAt);
   });
 
+  test('pins the patched Bun 1.4.4 slim base', () => {
+    expect(dockerfile).toMatch(/^FROM oven\/bun:1\.4\.4-slim$/m);
+    expect(dockerfile).toContain('test "$(bun --version)" = "1.4.4"');
+    expect(dockerfile).not.toContain('oven/bun:1.3');
+    expect(dockerfile).not.toContain('oven/bun:latest');
+    expect(dockerfile).not.toMatch(/^FROM oven\/bun$/m);
+  });
+
   test('copies every workspace manifest before the frozen install and only companion source after', () => {
     const installAt = dockerfile.indexOf('bun install --frozen-lockfile');
     expect(installAt).toBeGreaterThan(-1);
@@ -329,6 +337,28 @@ function ensureRepairImage(): Promise<string> {
   })();
   return repairImage;
 }
+
+describe('companion image bun runtime', () => {
+  test('reports bun 1.4.4 inside the repair image', async () => {
+    if (!(await dockerAvailable())) {
+      throw new Error('docker_unavailable');
+    }
+    await ensureRepairImage();
+    const version = await runCommand([
+      'docker',
+      'run',
+      '--rm',
+      '--network',
+      'none',
+      '--entrypoint',
+      'bun',
+      REPAIR_IMAGE,
+      '--version',
+    ]);
+    expect(version.code).toBe(0);
+    expect(version.stdout.trim()).toBe('1.4.4');
+  }, 900000);
+});
 
 function localPublishTarget(): string {
   const nets = networkInterfaces();

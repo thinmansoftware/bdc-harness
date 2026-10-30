@@ -2,7 +2,8 @@
 #
 # Source packaging only. Building this image, mounting a real credential, and
 # starting a container are go-live actions and are not part of this change.
-FROM oven/bun:1.3-slim
+FROM oven/bun:1.4.4-slim
+RUN test "$(bun --version)" = "1.4.4"
 
 # No default on purpose. A placeholder SHA would let the image advertise an
 # identity it does not have.

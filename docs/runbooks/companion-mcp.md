@@ -43,6 +43,21 @@ The image build fails if `BUILD_SHA` is empty. The process runs as user
 `companion` (uid 10001). Do not build or start this on Hetzner as part of a
 source change.
 
+## Bun runtime
+
+GHSA-663w-cv8g-jj2p was published 2026-10-23. It affects Bun `>=1.0.21,<1.4.4`
+and is fixed by `1.4.4`. The companion image uses `oven/bun:1.4.4-slim`.
+Do not launch an image based on `oven/bun:1.3-slim` or any older base.
+
+Qualification evidence is the exact in-image `bun --version` output `1.4.4`,
+plus GitHub job `companion-container-contract` on Bun 1.4.4 running both
+`bun --cwd packages/companion-mcp test` and
+`bun test ./deploy/companion-mcp/container-contract.test.ts`.
+`BUILD_SHA=repair` is a test label, not the checkout SHA.
+
+Passing that qualification does not authorize a live start. The go-live
+gates in this runbook stay in force.
+
 ## Clean wiki clone
 
 The server reads only `git ls-files` paths under `xo-wiki/wiki` and
