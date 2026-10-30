@@ -97,6 +97,22 @@ const PUBLISH_NETWORK = 'companion_publish';
 const compose = parse(composeRaw) as ComposeFile;
 const service = compose.services['bdc-companion-mcp'];
 
+const COMPANION_WIKI_MOUNT = '/var/lib/companion-wiki';
+const UNTRUSTED_WIKI_MOUNT = '/var/lib/untrusted-wiki';
+const DELIVERED_GIT_TRUST_ENV = [
+  'GIT_CONFIG_COUNT=1',
+  'GIT_CONFIG_KEY_0=safe.directory',
+  'GIT_CONFIG_VALUE_0=/var/lib/companion-wiki',
+] as const;
+
+function deliveredGitTrustArgs(): string[] {
+  const args: string[] = [];
+  for (const entry of DELIVERED_GIT_TRUST_ENV) {
+    args.push('-e', entry);
+  }
+  return args;
+}
+
 function ipv4ToInt(ip: string): number {
   const parts = ip.split('.').map(part => Number(part));
   if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) {
@@ -288,6 +304,21 @@ describe('companion-mcp compose contract', () => {
     expect(readOnly.some(volume => volume.includes('github-token'))).toBe(true);
     const writable = volumes.filter(volume => !volume.endsWith(':ro'));
     expect(writable).toEqual(['companion-mcp-audit:/var/lib/companion-mcp']);
+  });
+
+  test('trusts only the delivered companion wiki directory', () => {
+    expect(service?.user).toBe('10001:10001');
+    expect(service?.environment?.COMPANION_WIKI_ROOT).toBe(COMPANION_WIKI_MOUNT);
+    for (const entry of DELIVERED_GIT_TRUST_ENV) {
+      const splitAt = entry.indexOf('=');
+      const key = entry.slice(0, splitAt);
+      const value = entry.slice(splitAt + 1);
+      expect(service?.environment?.[key]).toBe(value);
+    }
+    expect(composeRaw).not.toContain('safe.directory=*');
+    expect(composeRaw).not.toContain('GIT_CONFIG_VALUE_0=*');
+    expect(composeRaw).not.toContain('GIT_CONFIG_VALUE_0: "*"');
+    expect(DELIVERED_GIT_TRUST_ENV.join('\n')).not.toContain('*');
   });
 });
 
@@ -615,6 +646,125 @@ const PAGE = [
   'not-a-real-key',
   '-----END PRIVATE KEY-----',
 ].join('\n');
+const UNTRACKED_SECRET = 'UNTRACKED-SECRET-BODY';
+
+async function chownForeignWiki(wikiHostPath: string): Promise<void> {
+  const owned = await runCommand([
+    'docker',
+    'run',
+    '--rm',
+    '--user',
+    '0:0',
+    '--network',
+    'none',
+    '--entrypoint',
+    '/bin/chown',
+    '-v',
+    `${wikiHostPath}:${COMPANION_WIKI_MOUNT}`,
+    REPAIR_IMAGE,
+    '-R',
+    '20002:20002',
+    COMPANION_WIKI_MOUNT,
+  ]);
+  if (owned.code !== 0) {
+    throw new Error(owned.stderr.slice(-2000) || owned.stdout.slice(-2000));
+  }
+}
+
+async function prepareUntrustedRepo(repo: string): Promise<void> {
+  await mkdir(repo, { recursive: true });
+  const init = await runCommand(['git', '-C', repo, 'init', '-b', 'main']);
+  if (init.code !== 0) {
+    throw new Error(init.stderr.slice(-2000));
+  }
+  await writeFile(join(repo, 'README.md'), 'foreign owned notes\n', 'utf8');
+  const added = await runCommand([
+    'git',
+    '-C',
+    repo,
+    '-c',
+    'user.email=test@example.com',
+    '-c',
+    'user.name=Test',
+    'add',
+    '--',
+    'README.md',
+  ]);
+  if (added.code !== 0) {
+    throw new Error(added.stderr.slice(-2000));
+  }
+  const committed = await runCommand([
+    'git',
+    '-C',
+    repo,
+    '-c',
+    'user.email=test@example.com',
+    '-c',
+    'user.name=Test',
+    '-c',
+    'commit.gpgsign=false',
+    '-c',
+    'core.hooksPath=/dev/null',
+    'commit',
+    '-m',
+    'init',
+  ]);
+  if (committed.code !== 0) {
+    throw new Error(committed.stderr.slice(-2000));
+  }
+  const opened = await runCommand(['chmod', '-R', 'a+rX', repo]);
+  if (opened.code !== 0) {
+    throw new Error(opened.stderr.slice(-2000));
+  }
+}
+
+async function assertDeliveredMountTrust(container: string): Promise<void> {
+  const uid = await runCommand(['docker', 'exec', container, 'id', '-u']);
+  expect(uid.code).toBe(0);
+  expect(uid.stdout.trim()).toBe('10001');
+  const owner = await runCommand([
+    'docker',
+    'exec',
+    container,
+    'stat',
+    '-c',
+    '%u',
+    COMPANION_WIKI_MOUNT,
+  ]);
+  expect(owner.code).toBe(0);
+  expect(owner.stdout.trim()).toBe('20002');
+  const untrustedOwner = await runCommand([
+    'docker',
+    'exec',
+    container,
+    'stat',
+    '-c',
+    '%u',
+    UNTRUSTED_WIKI_MOUNT,
+  ]);
+  expect(untrustedOwner.code).toBe(0);
+  expect(untrustedOwner.stdout.trim()).not.toBe('10001');
+  const mounts = await runCommand(['docker', 'inspect', '-f', '{{json .Mounts}}', container]);
+  expect(mounts.code).toBe(0);
+  const parsed = JSON.parse(mounts.stdout) as Array<{ Destination?: string; RW?: boolean }>;
+  const wikiMount = parsed.find(item => item.Destination === COMPANION_WIKI_MOUNT);
+  expect(wikiMount).toBeDefined();
+  expect(wikiMount?.RW).toBe(false);
+  const status = await runCommand([
+    'docker',
+    'exec',
+    container,
+    'git',
+    '-C',
+    UNTRUSTED_WIKI_MOUNT,
+    'status',
+  ]);
+  expect(status.code).not.toBe(0);
+  const detail = `${status.stderr}\n${status.stdout}`;
+  expect(detail).toContain('dubious ownership');
+  expect(detail).not.toContain('Permission denied');
+  expect(detail.toLowerCase()).not.toContain('not a git repository');
+}
 
 describe('compose published path', () => {
   test('a host publish socket reaches a non-loopback bind and misses loopback', async () => {
@@ -734,6 +884,7 @@ describe('companion image fresh audit volume', () => {
         'init',
       ]);
       expect(committed.code).toBe(0);
+      await writeFile(join(wiki, 'xo-wiki/wiki/secret.md'), `${UNTRACKED_SECRET}\n`, 'utf8');
       await runCommand(['chmod', '-R', 'a+rX', wiki]);
       const digest = createHash('sha256').update(token).digest('hex');
       await writeFile(join(fixture, 'grokbot.sha256'), `${digest}\n`, 'utf8');
@@ -758,6 +909,9 @@ describe('companion image fresh audit volume', () => {
       };
       await writeFile(join(fixture, 'companions.json'), JSON.stringify(config), 'utf8');
       await ensureRepairImage();
+      await chownForeignWiki(wiki);
+      const untrusted = join(fixture, 'untrusted');
+      await prepareUntrustedRepo(untrusted);
       const created = await runCommand(['docker', 'volume', 'create', volume]);
       expect(created.code).toBe(0);
       const network = await createDisposableNetwork(suffix);
@@ -792,7 +946,7 @@ describe('companion image fresh audit volume', () => {
         '-e',
         'COMPANION_MCP_REVOKED_FILE=/run/companion-mcp/revoked.json',
         '-e',
-        'COMPANION_WIKI_ROOT=/wiki',
+        `COMPANION_WIKI_ROOT=${COMPANION_WIKI_MOUNT}`,
         '-e',
         `ORACLE_URL=${oracleRelay.url}`,
         '-e',
@@ -803,16 +957,13 @@ describe('companion image fresh audit volume', () => {
         'COMPANION_BOARD_BASE=main',
         '-e',
         'COMPANION_GITHUB_TOKEN_FILE=/run/companion-mcp/github-token',
-        '-e',
-        'GIT_CONFIG_COUNT=1',
-        '-e',
-        'GIT_CONFIG_KEY_0=safe.directory',
-        '-e',
-        'GIT_CONFIG_VALUE_0=*',
+        ...deliveredGitTrustArgs(),
         '-v',
         `${join(fixture, 'companions.json')}:/run/companion-mcp/companions.json:ro`,
         '-v',
-        `${wiki}:/wiki:ro`,
+        `${wiki}:${COMPANION_WIKI_MOUNT}:ro`,
+        '-v',
+        `${untrusted}:${UNTRUSTED_WIKI_MOUNT}:ro`,
         '-v',
         `${join(fixture, 'grokbot.sha256')}:/run/companion-mcp/digests/grokbot.sha256:ro`,
         '-v',
@@ -835,6 +986,7 @@ describe('companion image fresh audit volume', () => {
         const detail = error instanceof Error ? error.message : 'not_ready';
         throw new Error(`${detail}\n${logs.stderr.slice(-2000)}\n${logs.stdout.slice(-2000)}`);
       }
+      await assertDeliveredMountTrust(container);
       const routeProbe = await runCommand([
         'docker',
         'run',
@@ -896,6 +1048,18 @@ describe('companion image fresh audit volume', () => {
         expect(text).toContain('[REDACTED]');
         expect(text).not.toContain('not-a-real-key');
         expect(text).not.toContain('BEGIN PRIVATE KEY');
+        expect(text).not.toContain(UNTRACKED_SECRET);
+        const hidden = await client.callTool({
+          name: 'wiki_read',
+          arguments: { path: 'xo-wiki/wiki/secret.md' },
+        });
+        const hiddenContent =
+          'content' in hidden && Array.isArray(hidden.content) ? hidden.content : [];
+        const hiddenItem = hiddenContent.find(item => item.type === 'text');
+        const hiddenText =
+          hiddenItem !== undefined && hiddenItem.type === 'text' ? hiddenItem.text : '';
+        expect(hiddenText).toContain('not_tracked');
+        expect(hiddenText).not.toContain(UNTRACKED_SECRET);
       } finally {
         await client.close();
       }
@@ -934,8 +1098,18 @@ describe('companion image fresh audit volume', () => {
         .map(line => line.trim())
         .filter(line => line.length > 0)
         .map(line => JSON.parse(line) as { outcome?: string });
-      expect(lines.map(line => line.outcome).sort()).toEqual(['ok', 'refused']);
+      expect(lines.map(line => line.outcome).sort()).toEqual(['ok', 'refused', 'refused']);
+      const audited = evidence.log
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0)
+        .map(line => JSON.parse(line) as { outcome?: string; error?: string; tool?: string });
+      expect(audited.some(line => line.outcome === 'refused' && line.tool === 'auth')).toBe(true);
+      expect(audited.some(line => line.outcome === 'refused' && line.error === 'not_tracked')).toBe(
+        true
+      );
       expect(evidence.log).not.toContain(token);
+      expect(evidence.log).not.toContain(UNTRACKED_SECRET);
       expect(evidence.log).not.toContain('not-a-real-key');
       expect(evidence.log).not.toContain('BEGIN PRIVATE KEY');
       expect(evidence.log).not.toContain('synthetic-dispatch-credential');
@@ -1042,6 +1216,9 @@ describe('companion compose published port', () => {
     try {
       await preparePublishFixture(fixture);
       await ensureRepairImage();
+      await chownForeignWiki(join(fixture, 'wiki'));
+      const untrusted = join(fixture, 'untrusted');
+      await prepareUntrustedRepo(untrusted);
       const createdNet = await runCommand([
         'docker',
         'network',
@@ -1094,7 +1271,7 @@ describe('companion compose published port', () => {
         '-e',
         'COMPANION_MCP_REVOKED_FILE=/run/companion-mcp/revoked.json',
         '-e',
-        'COMPANION_WIKI_ROOT=/wiki',
+        `COMPANION_WIKI_ROOT=${COMPANION_WIKI_MOUNT}`,
         '-e',
         'ORACLE_URL=http://127.0.0.1:9/oracle',
         '-e',
@@ -1105,16 +1282,13 @@ describe('companion compose published port', () => {
         'COMPANION_BOARD_BASE=main',
         '-e',
         'COMPANION_GITHUB_TOKEN_FILE=/run/companion-mcp/github-token',
-        '-e',
-        'GIT_CONFIG_COUNT=1',
-        '-e',
-        'GIT_CONFIG_KEY_0=safe.directory',
-        '-e',
-        'GIT_CONFIG_VALUE_0=*',
+        ...deliveredGitTrustArgs(),
         '-v',
         `${join(fixture, 'companions.json')}:/run/companion-mcp/companions.json:ro`,
         '-v',
-        `${join(fixture, 'wiki')}:/wiki:ro`,
+        `${join(fixture, 'wiki')}:${COMPANION_WIKI_MOUNT}:ro`,
+        '-v',
+        `${untrusted}:${UNTRUSTED_WIKI_MOUNT}:ro`,
         '-v',
         `${join(fixture, 'grokbot.sha256')}:/run/companion-mcp/digests/grokbot.sha256:ro`,
         '-v',
@@ -1148,6 +1322,7 @@ describe('companion compose published port', () => {
         const detail = error instanceof Error ? error.message : 'not_ready';
         throw new Error(`${detail}\n${logs.stderr.slice(-2000)}\n${logs.stdout.slice(-2000)}`);
       }
+      await assertDeliveredMountTrust(container);
       const health = await fetch(`http://127.0.0.1:${hostPort}/healthz`);
       expect(health.status).toBe(200);
       expect(await health.json()).toEqual({ ok: true });

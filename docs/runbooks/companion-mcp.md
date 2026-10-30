@@ -88,6 +88,33 @@ the source mount is read-only and the service user is `companion` UID/GID
 The operator preserves the clean tracked source condition while the clone is
 served.
 
+## Process-scoped Git trust
+
+The companion checkout is operator-owned. Git would otherwise refuse it for
+service UID/GID 10001 as dubious ownership. Compose supplies three environment
+variables to that container process only:
+
+```
+GIT_CONFIG_COUNT=1
+GIT_CONFIG_KEY_0=safe.directory
+GIT_CONFIG_VALUE_0=/var/lib/companion-wiki
+```
+
+Those variables trust exactly `/var/lib/companion-wiki`. They are not wildcard
+trust, not parent-directory trust, and not host or global Git configuration.
+
+Before serving, the operator still runs both clean-tracked checks:
+
+```bash
+git -C "$COMPANION_WIKI_ROOT" diff --quiet --
+git -C "$COMPANION_WIKI_ROOT" diff --cached --quiet HEAD --
+```
+
+Unrelated untracked files do not fail that precondition. A read-only container
+mount does not prevent host-side writes. The operator keeps the tracked tree
+clean while the clone is served. This process does not detect runtime dirty
+state and does not serve an immutable Git snapshot.
+
 ## Config fields
 
 Example: `deploy/companion-mcp/companions.config.example.json`.

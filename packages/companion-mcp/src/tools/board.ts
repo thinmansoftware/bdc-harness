@@ -363,7 +363,12 @@ function addedRegisterLines(base: string, proposed: string): string | null {
   return added;
 }
 
-function assertRegisterAddition(base: string, proposed: string, companionId: string): void {
+function assertRegisterAddition(
+  base: string,
+  proposed: string,
+  companionId: string,
+  motionId: string
+): void {
   const label = secretaryLabel(companionId);
   if (proposed.startsWith(label) && !base.startsWith(label)) {
     throw new ToolFailure('refused', 'path_refused');
@@ -376,6 +381,11 @@ function assertRegisterAddition(base: string, proposed: string, companionId: str
     throw new ToolFailure('refused', 'ruling_refused');
   }
   if (!added.includes(label)) {
+    throw new ToolFailure('refused', 'path_refused');
+  }
+  const cells = added.split('|');
+  const identity = cells[1]?.trim() ?? '';
+  if (identity !== motionId) {
     throw new ToolFailure('refused', 'path_refused');
   }
 }
@@ -575,7 +585,7 @@ export async function boardRecordPropose(
       }
     } else {
       const base = existing ?? '';
-      assertRegisterAddition(base, file.content, slot.companion_id);
+      assertRegisterAddition(base, file.content, slot.companion_id, motionId);
     }
   }
   const commitInfo = await githubRequest(

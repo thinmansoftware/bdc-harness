@@ -32,6 +32,9 @@ services:
       COMPANION_MCP_AUDIT_LOG: /var/lib/companion-mcp/audit.log
       COMPANION_MCP_REVOKED_FILE: /run/companion-mcp/revoked.json
       COMPANION_WIKI_ROOT: /var/lib/companion-wiki
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: /var/lib/companion-wiki
       ORACLE_URL: https://n8n.bluedevilcollectibles.com/webhook/chatbot-query
       DISPATCH_BASE_URL: http://archon-app-1:3090
       COMPANION_BOARD_REPO: thinmansoftware/bdc-xo

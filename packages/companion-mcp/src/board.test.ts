@@ -798,6 +798,51 @@ describe('board secretary tools', () => {
         ],
         error: 'ruling_refused',
       },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-OTHER | recorded | ${label} |\n`,
+          },
+        ],
+        error: 'path_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-TEST-OTHER | recorded | ${label} |\n`,
+          },
+        ],
+        error: 'path_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| OTHER-M-TEST | recorded | ${label} |\n`,
+          },
+        ],
+        error: 'path_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-OTHER | M-TEST | ${label} |\n`,
+          },
+        ],
+        error: 'path_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-TEST | recorded | ${label} |\n| M-OTHER | recorded | ${label} |\n`,
+          },
+        ],
+        error: 'path_refused',
+      },
     ];
     try {
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
@@ -821,6 +866,7 @@ describe('board secretary tools', () => {
           expect(
             added.every(request => request.path.startsWith('/repos/thinmansoftware/bdc-xo/'))
           ).toBe(true);
+          expect(dispatch.messages).toHaveLength(0);
         }
       });
       expect(github.requests.some(request => request.method !== 'GET')).toBe(false);
