@@ -500,6 +500,16 @@ describe('board secretary tools', () => {
       "John, verbatim: '\u00A0'",
       'John, verbatim: "\u2003"',
       "John, verbatim: '\u2003'",
+      '\u00A0John, verbatim: "bring the ledger"',
+      'John, verbatim: "bring the ledger"\u00A0',
+      '\u2003John, verbatim: "bring the ledger"\u2003',
+      '\uFEFFJohn, verbatim: "bring the ledger"',
+      "John, verbatim: 'bring the ledger'\uFEFF",
+      ' \u00A0John, verbatim: "bring the ledger" \u2003',
+      '\u3000John, verbatim: "bring the ledger"\u3000',
+      "\u202FJohn, verbatim: 'bring the ledger'\u202F",
+      '\u2028John, verbatim: "bring the ledger"',
+      'John, verbatim: "bring the ledger"\u2029',
     ];
     for (const marker of markerOnlySamples) {
       pushAttribution(`${label}\n\n${marker}\n`);
@@ -840,6 +850,8 @@ describe('board secretary tools', () => {
       'John, verbatim: "I decided the motion should proceed"',
       "John, verbatim: 'bring the ledger'",
       '  John, verbatim: "bring the ledger"  ',
+      '\tJohn, verbatim: "bring the ledger"\t',
+      'John, verbatim: "bring the ledger"\r',
       unicodeSource,
       '',
     ].join('\n');

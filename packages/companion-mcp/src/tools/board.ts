@@ -70,8 +70,31 @@ function rulingViolation(content: string): string | null {
 const JOHN_WORD_ATTRIBUTION =
   /\b(decided|decision|ruled|ruling|approved|directed|said|ordered|chose|write|writes|wrote|written|writing)\b/i;
 
+function isOrdinaryWhitespace(char: string): boolean {
+  return (
+    char === ' ' ||
+    char === '\t' ||
+    char === '\n' ||
+    char === '\r' ||
+    char === '\f' ||
+    char === '\v'
+  );
+}
+
+function trimOrdinaryWhitespace(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && isOrdinaryWhitespace(value.charAt(start))) {
+    start += 1;
+  }
+  while (end > start && isOrdinaryWhitespace(value.charAt(end - 1))) {
+    end -= 1;
+  }
+  return value.slice(start, end);
+}
+
 function johnSourceLine(line: string): boolean {
-  const trimmed = line.trim();
+  const trimmed = trimOrdinaryWhitespace(line);
   const prefix = 'John, verbatim:';
   if (!trimmed.startsWith(prefix)) {
     return false;
