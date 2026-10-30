@@ -7,6 +7,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
+import { statSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { connect, createServer as createTcpServer, type Socket } from 'node:net';
 import { networkInterfaces, tmpdir } from 'node:os';
@@ -648,57 +649,15 @@ const PAGE = [
 ].join('\n');
 const UNTRACKED_SECRET = 'UNTRACKED-SECRET-BODY';
 
-async function chownForeignWiki(wikiHostPath: string): Promise<void> {
-  const owned = await runCommand([
-    'docker',
-    'run',
-    '--rm',
-    '--user',
-    '0:0',
-    '--network',
-    'none',
-    '--entrypoint',
-    '/bin/chown',
-    '-v',
-    `${wikiHostPath}:${COMPANION_WIKI_MOUNT}`,
-    REPAIR_IMAGE,
-    '-R',
-    '20002:20002',
-    COMPANION_WIKI_MOUNT,
-  ]);
-  if (owned.code !== 0) {
-    throw new Error(owned.stderr.slice(-2000) || owned.stdout.slice(-2000));
+function captureHostFixtureOwner(hostPath: string): number {
+  const uid = statSync(hostPath).uid;
+  if (uid === 10001) {
+    throw new Error('fixture_owner_equals_service_uid');
   }
-}
-
-async function reclaimFixture(fixture: string): Promise<void> {
-  const uid = process.getuid?.();
-  const gid = process.getgid?.();
-  if (uid === undefined || gid === undefined) {
-    return;
-  }
-  // The synthetic wiki is owned by uid 20002. Return it to the runner before delete.
-  await runCommand([
-    'docker',
-    'run',
-    '--rm',
-    '--user',
-    '0:0',
-    '--network',
-    'none',
-    '--entrypoint',
-    '/bin/chown',
-    '-v',
-    `${fixture}:${fixture}`,
-    REPAIR_IMAGE,
-    '-R',
-    `${String(uid)}:${String(gid)}`,
-    fixture,
-  ]);
+  return uid;
 }
 
 async function removeOwnedFixture(fixture: string): Promise<void> {
-  await reclaimFixture(fixture);
   await rm(fixture, { recursive: true, force: true });
 }
 
@@ -749,7 +708,11 @@ async function prepareUntrustedRepo(repo: string): Promise<void> {
   }
 }
 
-async function assertDeliveredMountTrust(container: string): Promise<void> {
+async function assertDeliveredMountTrust(
+  container: string,
+  wikiOwnerUid: number,
+  untrustedOwnerUid: number
+): Promise<void> {
   const uid = await runCommand(['docker', 'exec', container, 'id', '-u']);
   expect(uid.code).toBe(0);
   expect(uid.stdout.trim()).toBe('10001');
@@ -763,7 +726,9 @@ async function assertDeliveredMountTrust(container: string): Promise<void> {
     COMPANION_WIKI_MOUNT,
   ]);
   expect(owner.code).toBe(0);
-  expect(owner.stdout.trim()).toBe('20002');
+  const mountedWikiUid = Number(owner.stdout.trim());
+  expect(mountedWikiUid).toBe(wikiOwnerUid);
+  expect(mountedWikiUid).not.toBe(10001);
   const untrustedOwner = await runCommand([
     'docker',
     'exec',
@@ -774,7 +739,9 @@ async function assertDeliveredMountTrust(container: string): Promise<void> {
     UNTRUSTED_WIKI_MOUNT,
   ]);
   expect(untrustedOwner.code).toBe(0);
-  expect(untrustedOwner.stdout.trim()).not.toBe('10001');
+  const mountedUntrustedUid = Number(untrustedOwner.stdout.trim());
+  expect(mountedUntrustedUid).toBe(untrustedOwnerUid);
+  expect(mountedUntrustedUid).not.toBe(10001);
   const mounts = await runCommand(['docker', 'inspect', '-f', '{{json .Mounts}}', container]);
   expect(mounts.code).toBe(0);
   const parsed = JSON.parse(mounts.stdout) as Array<{ Destination?: string; RW?: boolean }>;
@@ -940,9 +907,10 @@ describe('companion image fresh audit volume', () => {
       };
       await writeFile(join(fixture, 'companions.json'), JSON.stringify(config), 'utf8');
       await ensureRepairImage();
-      await chownForeignWiki(wiki);
       const untrusted = join(fixture, 'untrusted');
       await prepareUntrustedRepo(untrusted);
+      const wikiOwnerUid = captureHostFixtureOwner(wiki);
+      const untrustedOwnerUid = captureHostFixtureOwner(untrusted);
       const created = await runCommand(['docker', 'volume', 'create', volume]);
       expect(created.code).toBe(0);
       const network = await createDisposableNetwork(suffix);
@@ -1017,7 +985,7 @@ describe('companion image fresh audit volume', () => {
         const detail = error instanceof Error ? error.message : 'not_ready';
         throw new Error(`${detail}\n${logs.stderr.slice(-2000)}\n${logs.stdout.slice(-2000)}`);
       }
-      await assertDeliveredMountTrust(container);
+      await assertDeliveredMountTrust(container, wikiOwnerUid, untrustedOwnerUid);
       const routeProbe = await runCommand([
         'docker',
         'run',
@@ -1247,9 +1215,10 @@ describe('companion compose published port', () => {
     try {
       await preparePublishFixture(fixture);
       await ensureRepairImage();
-      await chownForeignWiki(join(fixture, 'wiki'));
       const untrusted = join(fixture, 'untrusted');
       await prepareUntrustedRepo(untrusted);
+      const wikiOwnerUid = captureHostFixtureOwner(join(fixture, 'wiki'));
+      const untrustedOwnerUid = captureHostFixtureOwner(untrusted);
       const createdNet = await runCommand([
         'docker',
         'network',
@@ -1353,7 +1322,7 @@ describe('companion compose published port', () => {
         const detail = error instanceof Error ? error.message : 'not_ready';
         throw new Error(`${detail}\n${logs.stderr.slice(-2000)}\n${logs.stdout.slice(-2000)}`);
       }
-      await assertDeliveredMountTrust(container);
+      await assertDeliveredMountTrust(container, wikiOwnerUid, untrustedOwnerUid);
       const health = await fetch(`http://127.0.0.1:${hostPort}/healthz`);
       expect(health.status).toBe(200);
       expect(await health.json()).toEqual({ ok: true });
