@@ -96,7 +96,7 @@ Read only when `board_record_propose` runs, after local path and ruling checks:
 | COMPANION_BOARD_REPO | Example `thinmansoftware/bdc-xo` |
 | COMPANION_BOARD_BASE | Example `main` |
 | COMPANION_GITHUB_TOKEN_FILE | One-line GitHub token. Read-only mount |
-| COMPANION_GITHUB_API_BASE | Optional. Default `https://api.github.com` |
+| COMPANION_GITHUB_API_BASE | Optional. Unset sends the token only to `https://api.github.com`. Any other origin is refused before the token is sent, except an `http://127.0.0.1`, `http://localhost`, or `http://[::1]` stub with an explicit port. A token starting with `ghp_`, `gho_`, `ghu_`, `ghs_`, or `github_pat_` is never sent to a stub. |
 
 ## Enable a disabled slot
 

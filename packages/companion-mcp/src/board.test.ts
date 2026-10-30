@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 
 import { describe, expect, test } from 'bun:test';
 
@@ -408,6 +408,30 @@ describe('board secretary tools', () => {
           },
         ],
       },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/M-TEST.synthesis.md',
+            content: `${label}\n\nJohn wrote the closing note.\n`,
+          },
+        ],
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/M-TEST.synthesis.md',
+            content: `${label}\n\nJohn, verbatim: "bring the ledger"\nThe secretary records the round.\nJohn wrote that the motion is closed.\n`,
+          },
+        ],
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/M-TEST.discussion.md',
+            content: `${label}\n\nJohn decided the motion should proceed.\nJohn, verbatim: "the motion should proceed"\nJohn wrote that the other seat must stop.\n`,
+          },
+        ],
+      },
     ];
     try {
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
@@ -571,6 +595,15 @@ describe('board secretary tools', () => {
         ],
         error: 'path_refused',
       },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-9 | recorded | John wrote the row ${label} |\n`,
+          },
+        ],
+        error: 'ruling_refused',
+      },
     ];
     try {
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
@@ -600,6 +633,119 @@ describe('board secretary tools', () => {
       await harness.cleanup();
     }
   });
+
+  test('board_record_propose_accepts_attribution_with_its_own_source_line', async () => {
+    const files = new Map<string, string>();
+    const github = await startRecordingServer(githubStub(files));
+    const dispatch = dispatchStub();
+    const mail = await startRecordingServer(dispatch.handler);
+    const harness = await createHarness();
+    const label = secretaryLabel('grokbot');
+    const content = `${label}\n\nJohn decided the motion should proceed.\nJohn, verbatim: "I decided the motion should proceed"\n`;
+    const running = await startFromHarness(harness, {
+      COMPANION_GITHUB_API_BASE: github.url,
+      DISPATCH_BASE_URL: mail.url,
+    });
+    try {
+      await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
+        const ok = parseToolJson(
+          await callToolText(client, 'board_record_propose', {
+            kind: 'synthesis',
+            motion_id: 'M-TEST',
+            summary: 'record a sourced attribution',
+            files: [{ path: 'docs/board/motions/M-TEST.synthesis.md', content }],
+          })
+        );
+        expect(ok.pr_url).toContain('/pull/7');
+      });
+      const blob = github.requests.find(request => request.path.endsWith('/git/blobs'));
+      const blobBody = blob?.body as { content?: unknown } | undefined;
+      expect(String(blobBody?.content ?? '')).toContain('John, verbatim:');
+      expect(github.requests.some(request => isForbiddenGithub(request))).toBe(false);
+    } finally {
+      await running.close();
+      await github.close();
+      await mail.close();
+      await harness.cleanup();
+    }
+  });
+
+  test('board_record_propose_does_not_send_the_github_token_off_host', async () => {
+    const github = await startRecordingServer(githubStub(new Map()));
+    const harness = await createHarness();
+    const label = secretaryLabel('grokbot');
+    const files = [
+      {
+        path: 'docs/board/motions/M-TEST.synthesis.md',
+        content: `${label}\n\nA permitted new synthesis.\n`,
+      },
+    ];
+    const bases = [
+      'https://example.invalid',
+      'http://169.254.169.254',
+      'https://api.github.com.evil.example',
+      `${github.url}/exfil`,
+    ];
+    const runningHosts: Array<{ close: () => Promise<void> }> = [];
+    try {
+      for (const base of bases) {
+        const running = await startFromHarness(harness, { COMPANION_GITHUB_API_BASE: base });
+        runningHosts.push(running);
+        await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
+          const refused = parseToolJson(
+            await callToolText(client, 'board_record_propose', {
+              kind: 'synthesis',
+              motion_id: 'M-TEST',
+              summary: 'should not send the token',
+              files,
+            })
+          );
+          expect(refused.error).toBe('github_scope_refused');
+        });
+      }
+      await writeFile(harness.githubTokenFile, 'ghp_exampletokenvalue\n', 'utf8');
+      const classic = await startFromHarness(harness, { COMPANION_GITHUB_API_BASE: github.url });
+      runningHosts.push(classic);
+      await withClient(classic.baseUrl, harness.tokens.grokbot, async client => {
+        const refused = parseToolJson(
+          await callToolText(client, 'board_record_propose', {
+            kind: 'synthesis',
+            motion_id: 'M-TEST',
+            summary: 'should not send a real token to the stub',
+            files,
+          })
+        );
+        expect(refused.error).toBe('github_scope_refused');
+      });
+      await writeFile(harness.githubTokenFile, 'github_pat_abcdefghijklmnop\n', 'utf8');
+      const fineGrained = await startFromHarness(harness, {
+        COMPANION_GITHUB_API_BASE: github.url,
+      });
+      runningHosts.push(fineGrained);
+      await withClient(fineGrained.baseUrl, harness.tokens.grokbot, async client => {
+        const refused = parseToolJson(
+          await callToolText(client, 'board_record_propose', {
+            kind: 'synthesis',
+            motion_id: 'M-TEST',
+            summary: 'should not send a fine-grained token to the stub',
+            files,
+          })
+        );
+        expect(refused.error).toBe('github_scope_refused');
+      });
+      expect(github.requests).toHaveLength(0);
+      const leaked = JSON.stringify(github.requests);
+      expect(leaked).not.toContain('ghp_exampletokenvalue');
+      expect(leaked).not.toContain('github_pat_abcdefghijklmnop');
+      expect(leaked).not.toContain('authorization');
+    } finally {
+      for (const running of runningHosts) {
+        await running.close();
+      }
+      await github.close();
+      await harness.cleanup();
+    }
+  }, 120000);
 
   test('board_record_propose_refuses_repo_other_than_bdc_xo', async () => {
     const github = await startRecordingServer(githubStub(new Map()));

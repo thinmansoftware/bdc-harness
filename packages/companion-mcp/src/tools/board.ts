@@ -61,21 +61,76 @@ function rulingViolation(content: string): string | null {
     return 'ruling_section';
   }
   const lines = content.split('\n');
-  const attributesJohn = lines.some(line => {
-    if (!/\bJohn\b/.test(line) || line.includes('John, verbatim:')) {
-      return false;
-    }
-    return (
-      /\b(decided|decision|ruled|ruling|approved|directed|said|ordered|chose)\b/i.test(line) ||
-      /^John\s*:/.test(line.trim()) ||
-      /John's\b/.test(line)
-    );
-  });
-  if (!attributesJohn) {
-    return null;
+  if (unsourcedJohnAttribution(lines)) {
+    return 'unsourced_john';
   }
-  const hasSource = lines.some(line => line.includes('John, verbatim:'));
-  return hasSource ? null : 'unsourced_john';
+  return null;
+}
+
+const JOHN_WORD_ATTRIBUTION =
+  /\b(decided|decision|ruled|ruling|approved|directed|said|ordered|chose|write|writes|wrote|written|writing)\b/i;
+
+function johnSourceLine(line: string): boolean {
+  return line.includes('John, verbatim:');
+}
+
+function johnAttribution(line: string): boolean {
+  if (!/\bJohn\b/.test(line)) {
+    return false;
+  }
+  return JOHN_WORD_ATTRIBUTION.test(line) || /^John\s*:/.test(line.trim()) || /John's\b/.test(line);
+}
+
+function adjacentContentIndex(lines: readonly string[], index: number, direction: -1 | 1): number {
+  let cursor = index + direction;
+  while (cursor >= 0 && cursor < lines.length && (lines[cursor] ?? '').trim() === '') {
+    cursor += direction;
+  }
+  return cursor;
+}
+
+function attributionBeforeSource(line: string): boolean {
+  const markerAt = line.indexOf('John, verbatim:');
+  if (markerAt < 0) {
+    return johnAttribution(line);
+  }
+  return johnAttribution(line.slice(0, markerAt));
+}
+
+function unsourcedJohnAttribution(lines: readonly string[]): boolean {
+  const usedSources = new Set<number>();
+  const pending: number[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? '';
+    if (johnSourceLine(line)) {
+      if (attributionBeforeSource(line)) {
+        usedSources.add(index);
+      }
+      continue;
+    }
+    if (johnAttribution(line)) {
+      pending.push(index);
+    }
+  }
+  for (const index of pending) {
+    let matched = false;
+    for (const direction of [-1, 1] as const) {
+      const neighbor = adjacentContentIndex(lines, index, direction);
+      if (neighbor < 0 || neighbor >= lines.length || usedSources.has(neighbor)) {
+        continue;
+      }
+      if (!johnSourceLine(lines[neighbor] ?? '')) {
+        continue;
+      }
+      usedSources.add(neighbor);
+      matched = true;
+      break;
+    }
+    if (!matched) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function classifyPath(filePath: string): PreparedFile['kind'] | null {
@@ -164,6 +219,52 @@ function lexicalBoardPath(filePath: string): string | null {
 
 const PROPOSAL_KIND_SET: ReadonlySet<string> = new Set(PROPOSAL_KINDS);
 
+const GITHUB_API_ORIGIN = 'https://api.github.com';
+
+const REAL_GITHUB_TOKEN = /^(?:github_pat_|ghp_|gho_|ghu_|ghs_)/;
+
+function resolveGithubApiBase(raw: string | undefined): string {
+  const trimmed = raw?.trim() ?? '';
+  if (trimmed === '') {
+    return GITHUB_API_ORIGIN;
+  }
+  let url: URL;
+  try {
+    url = new URL(trimmed);
+  } catch {
+    throw new ToolFailure('error', 'github_scope_refused');
+  }
+  if (url.username !== '' || url.password !== '' || url.search !== '' || url.hash !== '') {
+    throw new ToolFailure('error', 'github_scope_refused');
+  }
+  const path = url.pathname.replace(/\/+$/, '');
+  if (path !== '') {
+    throw new ToolFailure('error', 'github_scope_refused');
+  }
+  const host = url.hostname.toLowerCase();
+  if (
+    url.protocol === 'https:' &&
+    host === 'api.github.com' &&
+    (url.port === '' || url.port === '443')
+  ) {
+    return GITHUB_API_ORIGIN;
+  }
+  const loopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+  if (url.protocol === 'http:' && loopback && url.port !== '') {
+    return `${url.protocol}//${url.host}`;
+  }
+  throw new ToolFailure('error', 'github_scope_refused');
+}
+
+function assertTokenDestination(apiBase: string, token: string): void {
+  if (apiBase === GITHUB_API_ORIGIN) {
+    return;
+  }
+  if (REAL_GITHUB_TOKEN.test(token)) {
+    throw new ToolFailure('error', 'github_scope_refused');
+  }
+}
+
 function readGithubConfig(env: Record<string, string | undefined>): GithubConfig | null {
   const repo = env.COMPANION_BOARD_REPO;
   const base = env.COMPANION_BOARD_BASE;
@@ -178,9 +279,8 @@ function readGithubConfig(env: Record<string, string | undefined>): GithubConfig
   ) {
     return null;
   }
-  const apiBase = env.COMPANION_GITHUB_API_BASE;
   return {
-    apiBase: apiBase !== undefined && apiBase.trim() !== '' ? apiBase : 'https://api.github.com',
+    apiBase: resolveGithubApiBase(env.COMPANION_GITHUB_API_BASE),
     repo: repo.trim(),
     base: base.trim(),
     tokenFile: tokenFile.trim(),
@@ -300,11 +400,13 @@ async function githubRequest(
       throw new ToolFailure('error', 'github_scope_refused');
     }
   }
+  assertTokenDestination(config.apiBase, token);
   const url = `${config.apiBase.replace(/\/$/, '')}${path}`;
   let response: Response;
   try {
     response = await fetch(url, {
       method,
+      redirect: 'manual',
       headers: {
         accept: 'application/vnd.github+json',
         authorization: `Bearer ${token}`,
@@ -316,6 +418,10 @@ async function githubRequest(
     });
   } catch {
     throw new ToolFailure('error', 'github_unavailable');
+  }
+  if (response.status >= 300 && response.status < 400) {
+    await response.body?.cancel();
+    throw new ToolFailure('error', 'github_scope_refused');
   }
   const text = await response.text();
   let json: unknown = null;

@@ -410,6 +410,88 @@ async function expectUnreachable(url: string): Promise<void> {
   expect(failed).toBe(true);
 }
 
+function loopbackPort(url: string): number {
+  const port = Number(new URL(url).port);
+  if (!Number.isInteger(port) || port <= 0) {
+    throw new Error('stub_port_missing');
+  }
+  return port;
+}
+
+async function createDisposableNetwork(
+  suffix: string
+): Promise<{ name: string; gateway: string; bindAddr: string }> {
+  const name = `bdc-cmp-audit-${suffix}`;
+  const seed = Number.parseInt(suffix.slice(0, 2), 16);
+  let last = 'network_create_failed';
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const third = (Number.isNaN(seed) ? 0 : seed + attempt) % 200;
+    const gateway = `10.251.${third}.1`;
+    const bindAddr = `10.251.${third}.2`;
+    const created = await runCommand([
+      'docker',
+      'network',
+      'create',
+      '--driver',
+      'bridge',
+      '--subnet',
+      `10.251.${third}.0/29`,
+      '--gateway',
+      gateway,
+      name,
+    ]);
+    if (created.code === 0) {
+      return { name, gateway, bindAddr };
+    }
+    last = created.stderr.slice(-500);
+  }
+  throw new Error(last);
+}
+
+function relayLoopback(
+  listenHost: string,
+  targetPort: number
+): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = createTcpServer(socket => {
+    const upstream = connect({ host: '127.0.0.1', port: targetPort });
+    const shutdown = (): void => {
+      socket.destroy();
+      upstream.destroy();
+    };
+    socket.on('error', shutdown);
+    upstream.on('error', shutdown);
+    socket.pipe(upstream);
+    upstream.pipe(socket);
+  });
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, listenHost, () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') {
+        reject(new Error('relay_bind_failed'));
+        return;
+      }
+      resolve({
+        url: `http://${listenHost}:${address.port}`,
+        close: async (): Promise<void> => {
+          if (typeof server.closeAllConnections === 'function') {
+            server.closeAllConnections();
+          }
+          await new Promise<void>((done, fail) => {
+            server.close(error => {
+              if (error) {
+                fail(error);
+                return;
+              }
+              done();
+            });
+          });
+        },
+      });
+    });
+  });
+}
+
 function listenStub(): Promise<{ url: string; hits: () => number; close: () => Promise<void> }> {
   const hits = { count: 0 };
   const server: Server = createServer((req, res) => {
@@ -587,6 +669,8 @@ describe('companion image fresh audit volume', () => {
     const oracle = await listenStub();
     const dispatch = await listenStub();
     let port = 0;
+    let networkName = '';
+    const relays: Array<{ close: () => Promise<void> }> = [];
     try {
       await mkdir(join(wiki, 'xo-wiki/wiki'), { recursive: true });
       await writeFile(join(wiki, 'xo-wiki/wiki/page.md'), `${PAGE}\n`, 'utf8');
@@ -646,6 +730,12 @@ describe('companion image fresh audit volume', () => {
       await ensureRepairImage();
       const created = await runCommand(['docker', 'volume', 'create', volume]);
       expect(created.code).toBe(0);
+      const network = await createDisposableNetwork(suffix);
+      networkName = network.name;
+      const oracleRelay = await relayLoopback(network.gateway, loopbackPort(oracle.url));
+      relays.push(oracleRelay);
+      const dispatchRelay = await relayLoopback(network.gateway, loopbackPort(dispatch.url));
+      relays.push(dispatchRelay);
       port = await freePort();
       const started = await runCommand([
         'docker',
@@ -656,11 +746,15 @@ describe('companion image fresh audit volume', () => {
         '--user',
         '10001:10001',
         '--network',
-        'host',
+        network.name,
+        '--ip',
+        network.bindAddr,
+        '-p',
+        `127.0.0.1:${port}:3095`,
         '-e',
-        'COMPANION_MCP_BIND_ADDR=127.0.0.1',
+        `COMPANION_MCP_BIND_ADDR=${network.bindAddr}`,
         '-e',
-        `COMPANION_MCP_PORT=${port}`,
+        'COMPANION_MCP_PORT=3095',
         '-e',
         'COMPANION_MCP_CONFIG=/run/companion-mcp/companions.json',
         '-e',
@@ -670,9 +764,9 @@ describe('companion image fresh audit volume', () => {
         '-e',
         'COMPANION_WIKI_ROOT=/wiki',
         '-e',
-        `ORACLE_URL=${oracle.url}`,
+        `ORACLE_URL=${oracleRelay.url}`,
         '-e',
-        `DISPATCH_BASE_URL=${dispatch.url}`,
+        `DISPATCH_BASE_URL=${dispatchRelay.url}`,
         '-e',
         'COMPANION_BOARD_REPO=thinmansoftware/bdc-xo',
         '-e',
@@ -711,6 +805,44 @@ describe('companion image fresh audit volume', () => {
         const detail = error instanceof Error ? error.message : 'not_ready';
         throw new Error(`${detail}\n${logs.stderr.slice(-2000)}\n${logs.stdout.slice(-2000)}`);
       }
+      const routeProbe = await runCommand([
+        'docker',
+        'run',
+        '--rm',
+        '--network',
+        networkName,
+        '--entrypoint',
+        'bun',
+        image,
+        '-e',
+        `const response = await fetch(${JSON.stringify(oracleRelay.url)}); if (!response.ok) throw new Error('stub_route_' + response.status);`,
+      ]);
+      if (routeProbe.code !== 0) {
+        throw new Error(routeProbe.stderr.slice(-2000));
+      }
+      expect(oracle.hits()).toBe(1);
+      const oracleBaseline = oracle.hits();
+      const dispatchBaseline = dispatch.hits();
+      const mode = await runCommand([
+        'docker',
+        'inspect',
+        '-f',
+        '{{.HostConfig.NetworkMode}}',
+        container,
+      ]);
+      expect(mode.code).toBe(0);
+      expect(mode.stdout.trim()).toBe(networkName);
+      expect(mode.stdout.trim()).not.toBe('host');
+      const publishedPorts = await runCommand([
+        'docker',
+        'inspect',
+        '-f',
+        '{{json .NetworkSettings.Ports}}',
+        container,
+      ]);
+      expect(publishedPorts.code).toBe(0);
+      expect(publishedPorts.stdout).toContain('127.0.0.1');
+      expect(publishedPorts.stdout).not.toContain('0.0.0.0');
       const denied = await fetch(`http://127.0.0.1:${port}/mcp`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -737,8 +869,8 @@ describe('companion image fresh audit volume', () => {
       } finally {
         await client.close();
       }
-      expect(oracle.hits()).toBe(0);
-      expect(dispatch.hits()).toBe(0);
+      expect(oracle.hits()).toBe(oracleBaseline);
+      expect(dispatch.hits()).toBe(dispatchBaseline);
       const inspected = await runCommand([
         'docker',
         'run',
@@ -780,6 +912,12 @@ describe('companion image fresh audit volume', () => {
       expect(evidence.log).not.toContain('synthetic-github-token');
     } finally {
       await runCommand(['docker', 'rm', '-f', container]);
+      for (const relay of relays) {
+        await relay.close();
+      }
+      if (networkName !== '') {
+        await runCommand(['docker', 'network', 'rm', networkName]);
+      }
       await runCommand(['docker', 'volume', 'rm', '-f', volume]);
       await oracle.close();
       await dispatch.close();
