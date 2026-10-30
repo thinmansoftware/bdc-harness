@@ -71,7 +71,36 @@ const JOHN_WORD_ATTRIBUTION =
   /\b(decided|decision|ruled|ruling|approved|directed|said|ordered|chose|write|writes|wrote|written|writing)\b/i;
 
 function johnSourceLine(line: string): boolean {
-  return line.includes('John, verbatim:');
+  const trimmed = line.trim();
+  const prefix = 'John, verbatim:';
+  if (!trimmed.startsWith(prefix)) {
+    return false;
+  }
+  let rest = trimmed.slice(prefix.length);
+  let cursor = 0;
+  while (cursor < rest.length && (rest.charAt(cursor) === ' ' || rest.charAt(cursor) === '\t')) {
+    cursor += 1;
+  }
+  rest = rest.slice(cursor);
+  if (rest.length < 2) {
+    return false;
+  }
+  const quote = rest.charAt(0);
+  if (quote !== '"' && quote !== "'") {
+    return false;
+  }
+  const closeAt = rest.indexOf(quote, 1);
+  if (closeAt !== rest.length - 1) {
+    return false;
+  }
+  const payload = rest.slice(1, closeAt);
+  for (let index = 0; index < payload.length; index += 1) {
+    const code = payload.charCodeAt(index);
+    if (code !== 9 && code !== 10 && code !== 11 && code !== 12 && code !== 13 && code !== 32) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function johnAttribution(line: string): boolean {
@@ -81,52 +110,12 @@ function johnAttribution(line: string): boolean {
   return JOHN_WORD_ATTRIBUTION.test(line) || /^John\s*:/.test(line.trim()) || /John's\b/.test(line);
 }
 
-function adjacentContentIndex(lines: readonly string[], index: number, direction: -1 | 1): number {
-  let cursor = index + direction;
-  while (cursor >= 0 && cursor < lines.length && (lines[cursor] ?? '').trim() === '') {
-    cursor += direction;
-  }
-  return cursor;
-}
-
-function attributionBeforeSource(line: string): boolean {
-  const markerAt = line.indexOf('John, verbatim:');
-  if (markerAt < 0) {
-    return johnAttribution(line);
-  }
-  return johnAttribution(line.slice(0, markerAt));
-}
-
 function unsourcedJohnAttribution(lines: readonly string[]): boolean {
-  const usedSources = new Set<number>();
-  const pending: number[] = [];
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index] ?? '';
+  for (const line of lines) {
     if (johnSourceLine(line)) {
-      if (attributionBeforeSource(line)) {
-        usedSources.add(index);
-      }
       continue;
     }
     if (johnAttribution(line)) {
-      pending.push(index);
-    }
-  }
-  for (const index of pending) {
-    let matched = false;
-    for (const direction of [-1, 1] as const) {
-      const neighbor = adjacentContentIndex(lines, index, direction);
-      if (neighbor < 0 || neighbor >= lines.length || usedSources.has(neighbor)) {
-        continue;
-      }
-      if (!johnSourceLine(lines[neighbor] ?? '')) {
-        continue;
-      }
-      usedSources.add(neighbor);
-      matched = true;
-      break;
-    }
-    if (!matched) {
       return true;
     }
   }

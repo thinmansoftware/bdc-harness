@@ -25,6 +25,10 @@ const LANE_FILES = [
 
 const DEFAULTS_DIR = join(import.meta.dir, '../../../../.archon/workflows/defaults');
 
+function toLf(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
 function toCrlf(text: string): string {
   return text.replace(/\n/g, '\r\n');
 }
@@ -134,9 +138,18 @@ describe('cauldron lane PR open guard', () => {
   test('each feature lane refuses a base mismatch inside open-pr-if-needed and does not retarget', () => {
     expect(LANE_FILES.length).toBe(13);
     for (const file of LANE_FILES) {
-      const yaml = readFileSync(join(DEFAULTS_DIR, file), 'utf8');
-      const lfNode = openPrNode(yaml);
-      const crlfNode = openPrNode(toCrlf(yaml));
+      const raw = readFileSync(join(DEFAULTS_DIR, file), 'utf8');
+      const canonical = toLf(raw);
+      const crlfCheckout = toCrlf(canonical);
+      const fromCrlfCheckout = toLf(crlfCheckout);
+      expect(fromCrlfCheckout).toBe(canonical);
+      expect(canonical.includes('\r')).toBe(false);
+      expect(fromCrlfCheckout.includes('\r')).toBe(false);
+      const syntheticCrlf = toCrlf(canonical);
+      expect(syntheticCrlf.includes('\r\r\n')).toBe(false);
+      expect(toLf(syntheticCrlf)).toBe(canonical);
+      const lfNode = openPrNode(canonical);
+      const crlfNode = openPrNode(syntheticCrlf);
       expect(lfNode).toBe(crlfNode);
       assertOpenPrGuard(lfNode);
       assertOpenPrGuard(crlfNode);
@@ -146,21 +159,48 @@ describe('cauldron lane PR open guard', () => {
   test('LF and CRLF extractions return the same node and exclude the next node', () => {
     const lf =
       '\n  - id: open-pr-if-needed\n    run: target-body\n  - id: next-node\n    run: adjacent-body\n';
-    const fromLf = openPrNode(lf);
-    const fromCrlf = openPrNode(toCrlf(lf));
+    const crlfCheckout = toCrlf(toLf(lf));
+    const canonical = toLf(crlfCheckout);
+    expect(canonical).toBe(toLf(lf));
+    expect(canonical.includes('\r')).toBe(false);
+    const syntheticCrlf = toCrlf(canonical);
+    expect(syntheticCrlf.includes('\r\r\n')).toBe(false);
+    expect(toLf(syntheticCrlf)).toBe(canonical);
+    const fromLf = openPrNode(canonical);
+    const fromCrlf = openPrNode(syntheticCrlf);
     expect(fromLf).toBe(fromCrlf);
-    expect(fromLf).toContain('id: open-pr-if-needed');
-    expect(fromLf).toContain('target-body');
-    expect(fromLf).not.toContain('next-node');
-    expect(fromLf).not.toContain('adjacent-body');
+    for (const node of [fromLf, fromCrlf]) {
+      expect(node).toContain('id: open-pr-if-needed');
+      expect(node).toContain('target-body');
+      expect(node).not.toContain('next-node');
+      expect(node).not.toContain('adjacent-body');
+    }
+  });
+
+  test('naive conversion of an existing CRLF checkout becomes CRCRLF and misses the node', () => {
+    const lf = '\n  - id: open-pr-if-needed\n    run: target-body\n';
+    const crlfCheckout = toCrlf(toLf(lf));
+    const crcrlf = crlfCheckout.replace(/\n/g, '\r\n');
+    expect(crcrlf.includes('\r\r\n')).toBe(true);
+    expectMissingOpenPrNode(crcrlf);
+    const canonical = toLf(crlfCheckout);
+    expect(canonical.includes('\r')).toBe(false);
+    const syntheticCrlf = toCrlf(canonical);
+    expect(syntheticCrlf.includes('\r\r\n')).toBe(false);
+    expect(openPrNode(canonical)).toBe(openPrNode(syntheticCrlf));
   });
 
   test('a missing node and a differently named node throw for LF and CRLF', () => {
     const absent = '\n  - id: some-other-node\n    run: nope\n';
     const differentlyNamed = '\n  - id: open-pr-if-needed-extra\n    run: nope\n';
-    for (const yaml of [absent, differentlyNamed]) {
-      expectMissingOpenPrNode(yaml);
-      expectMissingOpenPrNode(toCrlf(yaml));
+    for (const source of [absent, differentlyNamed]) {
+      const canonical = toLf(source);
+      const crlfCheckout = toCrlf(canonical);
+      expect(toLf(crlfCheckout)).toBe(canonical);
+      expect(canonical.includes('\r')).toBe(false);
+      expect(crlfCheckout.includes('\r\r\n')).toBe(false);
+      expectMissingOpenPrNode(canonical);
+      expectMissingOpenPrNode(toCrlf(canonical));
     }
   });
 });

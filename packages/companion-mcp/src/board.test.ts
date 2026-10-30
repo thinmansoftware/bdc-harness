@@ -1,4 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, unlink, writeFile } from 'node:fs/promises';
 
 import { describe, expect, test } from 'bun:test';
 
@@ -433,7 +433,61 @@ describe('board secretary tools', () => {
         ],
       },
     ];
+    const invalidSourceMarkers = [
+      'John, verbatim:',
+      'John, verbatim: ""',
+      'John, verbatim: "   "',
+      "John, verbatim: '   '",
+      'John, verbatim: bring the ledger',
+      'Note John, verbatim: "bring the ledger"',
+      'John, verbatim: "bring the ledger',
+      'John, verbatim: "bring the ledger" extra',
+      "John, verbatim: 'bring the ledger' extra",
+    ];
+    const attributionVerbs = ['wrote', 'said', 'decided'];
+    const validSource = 'John, verbatim: "bring the ledger"';
+    const quotedAttributionCases: Array<{ files: Array<{ path: string; content: string }> }> = [];
+    const pushAttribution = (content: string): void => {
+      quotedAttributionCases.push({
+        files: [{ path: 'docs/board/motions/M-TEST.synthesis.md', content }],
+      });
+    };
+    for (const [index, marker] of invalidSourceMarkers.entries()) {
+      const verb = attributionVerbs[index % attributionVerbs.length] ?? 'wrote';
+      const attribution = `John ${verb} the motion is closed.`;
+      pushAttribution(`${label}\n\n${marker}\n${attribution}\n`);
+      pushAttribution(`${label}\n\n${marker}\n${attribution}\n${validSource}\n`);
+      pushAttribution(`${label}\n\n${validSource}\n${marker}\n${attribution}\n`);
+      pushAttribution(
+        `${label}\n\n${validSource}\nThe secretary records the round.\n${marker}\n${attribution}\n`
+      );
+    }
+    for (const verb of attributionVerbs) {
+      const attribution = `John ${verb} the motion is closed.`;
+      pushAttribution(`${label}\n\n${attribution}\n${validSource}\n`);
+      pushAttribution(`${label}\n\n${validSource}\n${attribution}\n`);
+      pushAttribution(
+        `${label}\n\n${validSource}\nThe secretary records the round.\n${attribution}\n`
+      );
+    }
+    const sameLineMarkers = [
+      'John, verbatim: John decided the motion is closed.',
+      'John, verbatim: "" John decided the motion is closed.',
+      'John, verbatim: "   " John wrote the closing note.',
+      "John, verbatim: '   ' John said the motion is closed.",
+      'John, verbatim: bring the ledger. John decided the motion is closed.',
+      'Note John, verbatim: "bring the ledger". John wrote the closing note.',
+      'John, verbatim: "bring the ledger and John decided the motion is closed.',
+      'John, verbatim: "bring the ledger" extra. John said the motion is closed.',
+      "John, verbatim: 'bring the ledger' extra. John wrote the closing note.",
+    ];
+    for (const marker of sameLineMarkers) {
+      pushAttribution(`${label}\n\n${marker}\n`);
+      pushAttribution(`${label}\n\n${marker}\n${validSource}\n`);
+      pushAttribution(`${label}\n\n${validSource}\nThe secretary records the round.\n${marker}\n`);
+    }
     try {
+      await unlink(harness.githubTokenFile);
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
         for (const item of cases) {
           const before = github.requests.length;
@@ -446,6 +500,19 @@ describe('board secretary tools', () => {
             })
           );
           expect(refused.error === 'path_refused' || refused.error === 'ruling_refused').toBe(true);
+          expect(github.requests).toHaveLength(before);
+        }
+        for (const item of quotedAttributionCases) {
+          const before = github.requests.length;
+          const refused = parseToolJson(
+            await callToolText(client, 'board_record_propose', {
+              kind: 'synthesis',
+              motion_id: 'M-TEST',
+              summary: 'marker or proximity is not a source',
+              files: item.files,
+            })
+          );
+          expect(refused.error).toBe('ruling_refused');
           expect(github.requests).toHaveLength(before);
         }
       });
@@ -513,9 +580,14 @@ describe('board secretary tools', () => {
       ['docs/board/motions/REGISTER.md', BASE_REGISTER],
     ]);
     const github = await startRecordingServer(githubStub(files));
+    const dispatch = dispatchStub();
+    const mail = await startRecordingServer(dispatch.handler);
     const harness = await createHarness();
     const label = secretaryLabel('grokbot');
-    const running = await startFromHarness(harness, { COMPANION_GITHUB_API_BASE: github.url });
+    const running = await startFromHarness(harness, {
+      COMPANION_GITHUB_API_BASE: github.url,
+      DISPATCH_BASE_URL: mail.url,
+    });
     const calls: Array<{ files: Array<{ path: string; content: string }>; error: string }> = [
       {
         files: [
@@ -604,6 +676,15 @@ describe('board secretary tools', () => {
         ],
         error: 'ruling_refused',
       },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-9 | recorded | John wrote the row. John, verbatim: "bring the ledger" ${label} |\n`,
+          },
+        ],
+        error: 'ruling_refused',
+      },
     ];
     try {
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
@@ -621,15 +702,23 @@ describe('board secretary tools', () => {
           const added = github.requests.slice(before);
           expect(added.length).toBeGreaterThan(0);
           expect(added.every(request => request.method === 'GET')).toBe(true);
+          expect(added.some(request => request.method === 'POST')).toBe(false);
+          expect(added.some(request => request.path.endsWith('/git/refs'))).toBe(false);
+          expect(added.some(request => request.path.endsWith('/pulls'))).toBe(false);
           expect(
             added.every(request => request.path.startsWith('/repos/thinmansoftware/bdc-xo/'))
           ).toBe(true);
         }
       });
       expect(github.requests.some(request => request.method !== 'GET')).toBe(false);
+      expect(github.requests.some(request => request.path.endsWith('/git/refs'))).toBe(false);
+      expect(github.requests.some(request => request.path.endsWith('/pulls'))).toBe(false);
+      expect(dispatch.messages).toHaveLength(0);
+      expect(files.get('docs/board/motions/REGISTER.md')).toBe(BASE_REGISTER);
     } finally {
       await running.close();
       await github.close();
+      await mail.close();
       await harness.cleanup();
     }
   });
@@ -641,7 +730,14 @@ describe('board secretary tools', () => {
     const mail = await startRecordingServer(dispatch.handler);
     const harness = await createHarness();
     const label = secretaryLabel('grokbot');
-    const content = `${label}\n\nJohn decided the motion should proceed.\nJohn, verbatim: "I decided the motion should proceed"\n`;
+    const content = [
+      label,
+      '',
+      'John, verbatim: "I decided the motion should proceed"',
+      "John, verbatim: 'bring the ledger'",
+      '  John, verbatim: "bring the ledger"  ',
+      '',
+    ].join('\n');
     const running = await startFromHarness(harness, {
       COMPANION_GITHUB_API_BASE: github.url,
       DISPATCH_BASE_URL: mail.url,
@@ -660,7 +756,13 @@ describe('board secretary tools', () => {
       });
       const blob = github.requests.find(request => request.path.endsWith('/git/blobs'));
       const blobBody = blob?.body as { content?: unknown } | undefined;
-      expect(String(blobBody?.content ?? '')).toContain('John, verbatim:');
+      const stored = String(blobBody?.content ?? '');
+      expect(stored).toContain('John, verbatim: "I decided the motion should proceed"');
+      expect(stored).toContain("John, verbatim: 'bring the ledger'");
+      expect(stored).toContain('John, verbatim: "bring the ledger"');
+      expect(stored).not.toContain('John decided');
+      expect(stored).not.toContain('John wrote');
+      expect(stored).not.toContain('John said');
       expect(github.requests.some(request => isForbiddenGithub(request))).toBe(false);
     } finally {
       await running.close();
