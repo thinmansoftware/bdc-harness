@@ -25,13 +25,38 @@ const LANE_FILES = [
 
 const DEFAULTS_DIR = join(import.meta.dir, '../../../../.archon/workflows/defaults');
 
+function toCrlf(text: string): string {
+  return text.replace(/\n/g, '\r\n');
+}
+
 function openPrNode(yaml: string): string {
+  const normalized = yaml.replace(/\r\n/g, '\n');
   const marker = '\n  - id: open-pr-if-needed\n';
-  const start = yaml.indexOf(marker);
+  const start = normalized.indexOf(marker);
   if (start < 0) throw new Error('open-pr-if-needed node missing');
-  const rest = yaml.slice(start + 1);
+  const rest = normalized.slice(start + 1);
   const next = rest.indexOf('\n  - id: ', marker.length);
   return next < 0 ? rest : rest.slice(0, next);
+}
+
+function assertOpenPrGuard(node: string): void {
+  expect(node).toContain('ERROR: base_branch_mismatch');
+  expect(node).toContain('ERROR: recorded_base_branch_missing');
+  expect(node).not.toContain('gh pr edit');
+  expect(node).toContain('--base "$BASE_BRANCH"');
+  expect(node).not.toContain('${BASE_BRANCH:+--base');
+  expect(node).not.toContain('${BASE_BRANCH:-dev}');
+}
+
+function expectMissingOpenPrNode(yaml: string): void {
+  let thrown: unknown;
+  try {
+    openPrNode(yaml);
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(Error);
+  expect((thrown as Error).message).toBe('open-pr-if-needed node missing');
 }
 
 describe('resolveRecordedBaseBranch', () => {
@@ -110,13 +135,32 @@ describe('cauldron lane PR open guard', () => {
     expect(LANE_FILES.length).toBe(13);
     for (const file of LANE_FILES) {
       const yaml = readFileSync(join(DEFAULTS_DIR, file), 'utf8');
-      const node = openPrNode(yaml);
-      expect(node).toContain('ERROR: base_branch_mismatch');
-      expect(node).toContain('ERROR: recorded_base_branch_missing');
-      expect(node).not.toContain('gh pr edit');
-      expect(node).toContain('--base "$BASE_BRANCH"');
-      expect(node).not.toContain('${BASE_BRANCH:+--base');
-      expect(node).not.toContain('${BASE_BRANCH:-dev}');
+      const lfNode = openPrNode(yaml);
+      const crlfNode = openPrNode(toCrlf(yaml));
+      expect(lfNode).toBe(crlfNode);
+      assertOpenPrGuard(lfNode);
+      assertOpenPrGuard(crlfNode);
+    }
+  });
+
+  test('LF and CRLF extractions return the same node and exclude the next node', () => {
+    const lf =
+      '\n  - id: open-pr-if-needed\n    run: target-body\n  - id: next-node\n    run: adjacent-body\n';
+    const fromLf = openPrNode(lf);
+    const fromCrlf = openPrNode(toCrlf(lf));
+    expect(fromLf).toBe(fromCrlf);
+    expect(fromLf).toContain('id: open-pr-if-needed');
+    expect(fromLf).toContain('target-body');
+    expect(fromLf).not.toContain('next-node');
+    expect(fromLf).not.toContain('adjacent-body');
+  });
+
+  test('a missing node and a differently named node throw for LF and CRLF', () => {
+    const absent = '\n  - id: some-other-node\n    run: nope\n';
+    const differentlyNamed = '\n  - id: open-pr-if-needed-extra\n    run: nope\n';
+    for (const yaml of [absent, differentlyNamed]) {
+      expectMissingOpenPrNode(yaml);
+      expectMissingOpenPrNode(toCrlf(yaml));
     }
   });
 });
