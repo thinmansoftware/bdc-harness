@@ -322,7 +322,7 @@ jobs:
             case "${name}" in
               bridge|host|none)
                 ;;
-              0cmppub*|archonside*)
+              0cmppub*|archonside*|bdc-cmp-audit*)
                 echo "leftover network: ${name}"
                 fail=1
                 ;;
