@@ -19,6 +19,32 @@ function gitEnv(): Record<string, string> {
   return env;
 }
 
+async function gitText(
+  root: string,
+  args: readonly string[]
+): Promise<{ code: number; stdout: string }> {
+  const proc = Bun.spawn(['git', '-C', root, ...args], {
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: gitEnv(),
+  });
+  const [code, stdout] = await Promise.all([
+    proc.exited,
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+  ]);
+  return { code, stdout };
+}
+
+function cloneStatusDirty(stdout: string): boolean {
+  for (const entry of stdout.split('\0')) {
+    if (entry.length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function lexicalTrackedPath(requested: string, prefix: string): string | null {
   if (requested.length === 0 || requested.length > 512) {
     return null;
@@ -52,7 +78,8 @@ export class TrackedTree {
     await this.refresh();
     this.timer = setInterval(() => {
       void this.refresh().catch(() => {
-        // Keep the last good snapshot if a refresh fails. The next tick retries.
+        // Dirty and untracked clones clear the served set inside refresh().
+        // The next tick retries.
       });
     }, this.intervalMs);
     this.timer.unref();
@@ -81,20 +108,22 @@ export class TrackedTree {
   }
 
   async refresh(): Promise<void> {
-    const proc = Bun.spawn(
-      ['git', '-C', this.root, 'ls-files', '-z', '--', 'xo-wiki/wiki', 'docs/board'],
-      {
-        stdout: 'pipe',
-        stderr: 'pipe',
-        env: gitEnv(),
-      }
-    );
-    const [code, stdout] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
-    if (code !== 0) {
+    const status = await gitText(this.root, [
+      'status',
+      '--porcelain=v1',
+      '-z',
+      '--untracked-files=all',
+    ]);
+    if (status.code !== 0 || cloneStatusDirty(status.stdout)) {
+      this.files = new Set();
+      throw new Error(status.code !== 0 ? 'wiki_root_unreadable' : 'wiki_root_dirty');
+    }
+    const listed = await gitText(this.root, ['ls-files', '-z', '--', 'xo-wiki/wiki', 'docs/board']);
+    if (listed.code !== 0) {
       throw new Error('wiki_root_unreadable');
     }
     const next = new Set<string>();
-    for (const entry of stdout.split('\0')) {
+    for (const entry of listed.stdout.split('\0')) {
       if (entry.length > 0) {
         next.add(entry);
       }

@@ -198,7 +198,6 @@ export async function createHarness(): Promise<Harness> {
     '-m',
     'init',
   ]);
-  await writeFile(join(wikiRoot, 'xo-wiki/wiki/secret.md'), 'UNTRACKED-SECRET-CONTENT\n', 'utf8');
   const configPath = join(dir, 'companions.json');
   const auditLog = join(dir, 'audit.log');
   const revokedFile = join(dir, 'revoked.json');
