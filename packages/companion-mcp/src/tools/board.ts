@@ -94,20 +94,23 @@ function johnSourceLine(line: string): boolean {
     return false;
   }
   const payload = rest.slice(1, closeAt);
-  for (let index = 0; index < payload.length; index += 1) {
-    const code = payload.charCodeAt(index);
-    if (code !== 9 && code !== 10 && code !== 11 && code !== 12 && code !== 13 && code !== 32) {
-      return true;
-    }
+  if (payload.trim().length === 0) {
+    return false;
   }
-  return false;
+  return true;
 }
 
 function johnAttribution(line: string): boolean {
-  if (!/\bJohn\b/.test(line)) {
+  if (!/\bjohn\b/i.test(line)) {
     return false;
   }
-  return JOHN_WORD_ATTRIBUTION.test(line) || /^John\s*:/.test(line.trim()) || /John's\b/.test(line);
+  return (
+    JOHN_WORD_ATTRIBUTION.test(line) || /^john\s*:/i.test(line.trim()) || /john's\b/i.test(line)
+  );
+}
+
+function johnVerbatimMarker(line: string): boolean {
+  return line.toLowerCase().includes('john, verbatim:');
 }
 
 function unsourcedJohnAttribution(lines: readonly string[]): boolean {
@@ -115,7 +118,7 @@ function unsourcedJohnAttribution(lines: readonly string[]): boolean {
     if (johnSourceLine(line)) {
       continue;
     }
-    if (johnAttribution(line)) {
+    if (johnVerbatimMarker(line) || johnAttribution(line)) {
       return true;
     }
   }

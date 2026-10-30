@@ -486,6 +486,27 @@ describe('board secretary tools', () => {
       pushAttribution(`${label}\n\n${marker}\n${validSource}\n`);
       pushAttribution(`${label}\n\n${validSource}\nThe secretary records the round.\n${marker}\n`);
     }
+    const markerOnlySamples = [
+      ...invalidSourceMarkers,
+      'John, verbatim: "bring the ledger" trailing',
+      'john, verbatim: bring the ledger',
+      'JOHN, VERBATIM: bring the ledger',
+      'john, verbatim: ""',
+      'JOHN, VERBATIM: "bring the ledger" trailing',
+      'note john, verbatim: "bring the ledger"',
+      'john wrote the closing note.',
+      'JOHN said the motion is closed.',
+      'John, verbatim: "\u00A0"',
+      "John, verbatim: '\u00A0'",
+      'John, verbatim: "\u2003"',
+      "John, verbatim: '\u2003'",
+    ];
+    for (const marker of markerOnlySamples) {
+      pushAttribution(`${label}\n\n${marker}\n`);
+      pushAttribution(`${label}\n\n${marker}\n${validSource}\n`);
+      pushAttribution(`${label}\n\n${validSource}\n${marker}\n`);
+      pushAttribution(`${label}\n\n${validSource}\nThe secretary records the round.\n${marker}\n`);
+    }
     try {
       await unlink(harness.githubTokenFile);
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
@@ -513,6 +534,7 @@ describe('board secretary tools', () => {
             })
           );
           expect(refused.error).toBe('ruling_refused');
+          expect(refused.error).not.toBe('github_credential_unavailable');
           expect(github.requests).toHaveLength(before);
         }
       });
@@ -685,6 +707,87 @@ describe('board secretary tools', () => {
         ],
         error: 'ruling_refused',
       },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-9 | recorded | John, verbatim: bring the ledger ${label} |\n`,
+          },
+        ],
+        error: 'ruling_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-9 | recorded | John, verbatim: "bring the ledger ${label} |\n`,
+          },
+        ],
+        error: 'ruling_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-9 | recorded | John, verbatim: "bring the ledger" trailing ${label} |\n`,
+          },
+        ],
+        error: 'ruling_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-9 | recorded | Note John, verbatim: "bring the ledger" ${label} |\n`,
+          },
+        ],
+        error: 'ruling_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-9 | recorded | John, verbatim: "" ${label} |\n`,
+          },
+        ],
+        error: 'ruling_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-9 | recorded | john, verbatim: bring the ledger ${label} |\n`,
+          },
+        ],
+        error: 'ruling_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-9 | recorded | JOHN, VERBATIM: bring the ledger ${label} |\n`,
+          },
+        ],
+        error: 'ruling_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-9 | recorded | John, verbatim: "\u00A0" ${label} |\n`,
+          },
+        ],
+        error: 'ruling_refused',
+      },
+      {
+        files: [
+          {
+            path: 'docs/board/motions/REGISTER.md',
+            content: `${BASE_REGISTER}| M-9 | recorded | John, verbatim: "\u2003" ${label} |\n`,
+          },
+        ],
+        error: 'ruling_refused',
+      },
     ];
     try {
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
@@ -730,12 +833,14 @@ describe('board secretary tools', () => {
     const mail = await startRecordingServer(dispatch.handler);
     const harness = await createHarness();
     const label = secretaryLabel('grokbot');
+    const unicodeSource = 'John, verbatim: "caf\u00E9"';
     const content = [
       label,
       '',
       'John, verbatim: "I decided the motion should proceed"',
       "John, verbatim: 'bring the ledger'",
       '  John, verbatim: "bring the ledger"  ',
+      unicodeSource,
       '',
     ].join('\n');
     const running = await startFromHarness(harness, {
@@ -760,6 +865,7 @@ describe('board secretary tools', () => {
       expect(stored).toContain('John, verbatim: "I decided the motion should proceed"');
       expect(stored).toContain("John, verbatim: 'bring the ledger'");
       expect(stored).toContain('John, verbatim: "bring the ledger"');
+      expect(stored).toContain(unicodeSource);
       expect(stored).not.toContain('John decided');
       expect(stored).not.toContain('John wrote');
       expect(stored).not.toContain('John said');
