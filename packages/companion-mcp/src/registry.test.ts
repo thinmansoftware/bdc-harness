@@ -110,6 +110,39 @@ describe('companion registry', () => {
     ).toThrow('registry_invalid:allowed_recipients');
   });
 
+  test('registry_rejects_parseable_non_iso_token_expiry', () => {
+    const malformed = [
+      'January 1, 2099',
+      '2099/01/01',
+      '01 Jan 2099 00:00:00 GMT',
+      '2099-01-01',
+      '2099-01-01T00:00:00',
+      '2099-01-01 00:00:00.000Z',
+      '2099-01-01T00:00:00.000z',
+      '2099-02-31T00:00:00.000Z',
+      '2099-04-31T00:00:00.000Z',
+      '2100-02-29T00:00:00.000Z',
+      '2099-01-01T24:00:00.000Z',
+      '2099-01-01T00:00:00.0000Z',
+    ];
+    for (const tokenExpiresAt of malformed) {
+      expect(Number.isFinite(Date.parse(tokenExpiresAt))).toBe(true);
+      const entry = slot('grokbot');
+      entry.token_expires_at = tokenExpiresAt;
+      expect(() => parseCompanionRegistry({ slots: [entry] })).toThrow(
+        'registry_invalid:token_expires_at'
+      );
+    }
+    const leap = parseCompanionRegistry({
+      slots: [{ ...slot('grokbot'), token_expires_at: '2096-02-29T12:30:00Z' }],
+    });
+    expect(leap.slots[0]?.token_expires_ms).toBe(Date.parse('2096-02-29T12:30:00Z'));
+    const offset = parseCompanionRegistry({
+      slots: [{ ...slot('grokbot'), token_expires_at: '2099-01-01T00:00:00.000+00:00' }],
+    });
+    expect(offset.slots[0]?.token_expires_ms).toBe(Date.parse('2099-01-01T00:00:00.000+00:00'));
+  });
+
   test('registered_tools_equal_allowlist', async () => {
     const registry = loadCompanionRegistry(EXAMPLE);
     const deps: ToolDeps = {

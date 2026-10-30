@@ -78,6 +78,48 @@ function assertRecipient(
   return canonical;
 }
 
+function daysInMonth(year: number, month: number): number {
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [0, 31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return days[month] ?? 0;
+}
+
+function parseTokenExpiresAt(value: string): number {
+  const match =
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,3})?(?:Z|[+-](\d{2}):(\d{2}))$/.exec(
+      value
+    );
+  if (match === null) {
+    throw new RegistryError('token_expires_at');
+  }
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  const zoneHour = match[7] === undefined ? 0 : Number(match[7]);
+  const zoneMinute = match[8] === undefined ? 0 : Number(match[8]);
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > daysInMonth(year, month) ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59 ||
+    zoneHour > 23 ||
+    zoneMinute > 59
+  ) {
+    throw new RegistryError('token_expires_at');
+  }
+  const expiresMs = Date.parse(value);
+  if (!Number.isFinite(expiresMs)) {
+    throw new RegistryError('token_expires_at');
+  }
+  return expiresMs;
+}
+
 function parseSlot(value: unknown, slotPrincipals: ReadonlySet<string>): CompanionSlot {
   if (!isRecord(value)) {
     throw new RegistryError('slots');
@@ -99,10 +141,7 @@ function parseSlot(value: unknown, slotPrincipals: ReadonlySet<string>): Compani
     throw new RegistryError('tools');
   }
   const expiresAt = requireString(value, 'token_expires_at');
-  const expiresMs = Date.parse(expiresAt);
-  if (!Number.isFinite(expiresMs)) {
-    throw new RegistryError('token_expires_at');
-  }
+  const expiresMs = parseTokenExpiresAt(expiresAt);
   const allowed = requireStringList(value, 'allowed_recipients').map(item =>
     assertRecipient(item, 'allowed_recipients', slotPrincipals)
   );

@@ -38,6 +38,13 @@ const MOTION_SUFFIX =
   /^docs\/board\/motions\/M-[A-Za-z0-9][A-Za-z0-9.-]*\.(brief|questions|discussion|synthesis|checklist)\.md$/;
 const NEW_MOTION = /^docs\/board\/motions\/M-[A-Za-z0-9][A-Za-z0-9-]*-[a-z0-9][a-z0-9-]*\.md$/;
 const DESIGN_ROUND = /^docs\/board\/design-rounds\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.md$/;
+const MOTION_RECORD_SUFFIXES: ReadonlySet<string> = new Set([
+  'brief.md',
+  'questions.md',
+  'discussion.md',
+  'synthesis.md',
+  'checklist.md',
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -86,6 +93,53 @@ function classifyPath(filePath: string): PreparedFile['kind'] | null {
     return 'motion';
   }
   return null;
+}
+
+function motionRecordName(name: string, motionId: string): boolean {
+  const dotted = `${motionId}.`;
+  if (name.startsWith(dotted)) {
+    return MOTION_RECORD_SUFFIXES.has(name.slice(dotted.length));
+  }
+  const slugged = `${motionId}-`;
+  if (!name.startsWith(slugged)) {
+    return false;
+  }
+  return /^[a-z0-9][a-z0-9-]*\.md$/.test(name.slice(slugged.length));
+}
+
+function embeddedMotionMatches(value: string, motionId: string): boolean {
+  let index = 0;
+  while (index < value.length) {
+    const found = value.indexOf('M-', index);
+    if (found < 0) {
+      return true;
+    }
+    const tail = value.slice(found);
+    if (!tail.startsWith(motionId)) {
+      return false;
+    }
+    const next = tail.charAt(motionId.length);
+    if (next !== '' && /[A-Za-z0-9]/.test(next)) {
+      return false;
+    }
+    index = found + motionId.length;
+  }
+  return true;
+}
+
+function motionPathMatches(filePath: string, motionId: string): boolean {
+  if (filePath === REGISTER_PATH) {
+    return true;
+  }
+  const motionRoot = 'docs/board/motions/';
+  if (filePath.startsWith(motionRoot)) {
+    return motionRecordName(filePath.slice(motionRoot.length), motionId);
+  }
+  const roundRoot = 'docs/board/design-rounds/';
+  if (filePath.startsWith(roundRoot)) {
+    return embeddedMotionMatches(filePath.slice(roundRoot.length), motionId);
+  }
+  return false;
 }
 
 function lexicalBoardPath(filePath: string): string | null {
@@ -157,7 +211,7 @@ function localProposal(
     }
     seen.add(path);
     const fileKind = classifyPath(path);
-    if (fileKind === null) {
+    if (fileKind === null || !motionPathMatches(path, motionId)) {
       throw new ToolFailure('refused', 'path_refused');
     }
     if (fileKind !== 'register') {

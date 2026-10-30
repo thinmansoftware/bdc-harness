@@ -433,6 +433,49 @@ describe('board secretary tools', () => {
     }
   });
 
+  test('board_record_propose_refuses_motion_id_path_mismatch', async () => {
+    const github = await startRecordingServer(githubStub(new Map()));
+    const harness = await createHarness();
+    const permitted = `${secretaryLabel('grokbot')}\n\nSeats disagreed. The secretary records that without ranking them.\n`;
+    const running = await startFromHarness(harness, { COMPANION_GITHUB_API_BASE: github.url });
+    const cases: Array<{ files: Array<{ path: string; content: string }> }> = [
+      { files: [{ path: 'docs/board/motions/M-OTHER.synthesis.md', content: permitted }] },
+      { files: [{ path: 'docs/board/motions/M-OTHER-draft.md', content: permitted }] },
+      { files: [{ path: 'docs/board/motions/M-TESTER.synthesis.md', content: permitted }] },
+      { files: [{ path: 'docs/board/design-rounds/M-OTHER.discussion.md', content: permitted }] },
+      { files: [{ path: 'docs/board/design-rounds/M-OTHER/notes.md', content: permitted }] },
+      { files: [{ path: 'docs/board/design-rounds/round-M-OTHER.md', content: permitted }] },
+      {
+        files: [
+          { path: 'docs/board/motions/M-TEST.synthesis.md', content: permitted },
+          { path: 'docs/board/motions/M-OTHER.synthesis.md', content: permitted },
+        ],
+      },
+    ];
+    try {
+      await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
+        for (const item of cases) {
+          const before = github.requests.length;
+          const refused = parseToolJson(
+            await callToolText(client, 'board_record_propose', {
+              kind: 'synthesis',
+              motion_id: 'M-TEST',
+              summary: 'path claims a different motion',
+              files: item.files,
+            })
+          );
+          expect(refused.error).toBe('path_refused');
+          expect(github.requests).toHaveLength(before);
+        }
+      });
+      expect(github.requests).toHaveLength(0);
+    } finally {
+      await running.close();
+      await github.close();
+      await harness.cleanup();
+    }
+  });
+
   test('board_record_propose_refuses_existing_edits_before_mutation', async () => {
     const files = new Map<string, string>([
       [
