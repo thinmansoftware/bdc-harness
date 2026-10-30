@@ -227,3 +227,111 @@ jobs:
       - name: Cleanup smoke test container
         if: always()
         run: docker rm -f archon-smoke || true
+
+  companion-container-contract:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Docker info
+        run: docker info
+
+      - name: Pre-test Docker inventory
+        run: |
+          set -euo pipefail
+          inv="${GITHUB_WORKSPACE}/companion-docker-inventory"
+          mkdir -p "${inv}"
+          docker ps -a --format '{{.Names}}' | LC_ALL=C sort > "${inv}/pre-containers.txt"
+          docker volume ls --format '{{.Name}}' | LC_ALL=C sort > "${inv}/pre-volumes.txt"
+          docker network ls --format '{{.Name}}' | LC_ALL=C sort > "${inv}/pre-networks.txt"
+          echo "===== pre-test containers ====="
+          cat "${inv}/pre-containers.txt"
+          echo "===== pre-test volumes ====="
+          cat "${inv}/pre-volumes.txt"
+          echo "===== pre-test networks ====="
+          cat "${inv}/pre-networks.txt"
+          echo "checkout_sha=${GITHUB_SHA}"
+          echo "image=bdc-companion-mcp:repair"
+          echo "build_arg=BUILD_SHA=repair"
+
+      - name: Companion container contract
+        run: bun test ./deploy/companion-mcp/container-contract.test.ts
+
+      - name: Post-test Docker inventory
+        if: always()
+        run: |
+          set -euo pipefail
+          inv="${GITHUB_WORKSPACE}/companion-docker-inventory"
+          for kind in containers volumes networks; do
+            if [ ! -f "${inv}/pre-${kind}.txt" ]; then
+              echo "missing pre-test inventory: pre-${kind}.txt"
+              exit 1
+            fi
+          done
+          docker ps -a --format '{{.Names}}' | LC_ALL=C sort > "${inv}/post-containers.txt"
+          docker volume ls --format '{{.Name}}' | LC_ALL=C sort > "${inv}/post-volumes.txt"
+          docker network ls --format '{{.Name}}' | LC_ALL=C sort > "${inv}/post-networks.txt"
+          log_diff() {
+            echo "===== ${1} diff (pre -> post) ====="
+            if diff -u "${2}" "${3}"; then
+              echo "(empty)"
+            fi
+          }
+          log_diff containers "${inv}/pre-containers.txt" "${inv}/post-containers.txt"
+          log_diff volumes "${inv}/pre-volumes.txt" "${inv}/post-volumes.txt"
+          log_diff networks "${inv}/pre-networks.txt" "${inv}/post-networks.txt"
+          echo "===== newly observed containers ====="
+          comm -13 "${inv}/pre-containers.txt" "${inv}/post-containers.txt" | tee "${inv}/new-containers.txt"
+          echo "===== newly observed volumes ====="
+          comm -13 "${inv}/pre-volumes.txt" "${inv}/post-volumes.txt" | tee "${inv}/new-volumes.txt"
+          echo "===== newly observed networks ====="
+          comm -13 "${inv}/pre-networks.txt" "${inv}/post-networks.txt" | tee "${inv}/new-networks.txt"
+          fail=0
+          while IFS= read -r name; do
+            [ -z "${name}" ] && continue
+            case "${name}" in
+              bdc-companion-mcp-*)
+                echo "leftover container: ${name}"
+                fail=1
+                ;;
+            esac
+          done < "${inv}/new-containers.txt"
+          while IFS= read -r name; do
+            [ -z "${name}" ] && continue
+            case "${name}" in
+              bdc-companion-mcp-*)
+                echo "leftover volume: ${name}"
+                fail=1
+                ;;
+            esac
+          done < "${inv}/new-volumes.txt"
+          while IFS= read -r name; do
+            [ -z "${name}" ] && continue
+            case "${name}" in
+              bridge|host|none)
+                ;;
+              0cmppub*|archonside*)
+                echo "leftover network: ${name}"
+                fail=1
+                ;;
+            esac
+          done < "${inv}/new-networks.txt"
+          echo "image bdc-companion-mcp:repair is intentionally retained; it is an image, not a container, volume, or network"
+          echo "checkout_sha=${GITHUB_SHA}"
+          echo "build_arg=BUILD_SHA=repair"
+          if [ "${fail}" -ne 0 ]; then
+            echo "leftover test resources block qualification"
+            exit 1
+          fi
