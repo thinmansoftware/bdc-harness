@@ -337,6 +337,46 @@ async function runCommand(args: string[]): Promise<CommandResult> {
   return { code, stdout, stderr };
 }
 
+// Removal status counts only for resources this attempt created. A resource
+// that was never created must not fail finally, and an earlier scenario error
+// is rethrown so a cleanup failure cannot replace it.
+async function cleanupCreatedResource(
+  created: boolean,
+  args: string[],
+  label: string,
+  errors: string[]
+): Promise<void> {
+  let result: CommandResult;
+  try {
+    result = await runCommand(args);
+  } catch (error) {
+    if (created) {
+      const message = error instanceof Error ? error.message : 'cleanup_threw';
+      errors.push(`${label} ${message}`);
+    }
+    return;
+  }
+  if (!created || result.code === 0) {
+    return;
+  }
+  const detail = `${result.stderr}\n${result.stdout}`.trim().slice(-500);
+  const suffix = detail.length > 0 ? ` ${detail}` : '';
+  errors.push(`${label} code=${result.code}${suffix}`);
+}
+
+function finishStrictCleanup(scenarioError: unknown, cleanupErrors: string[]): void {
+  if (scenarioError !== undefined) {
+    if (cleanupErrors.length === 0) {
+      throw scenarioError;
+    }
+    const primary =
+      scenarioError instanceof Error ? scenarioError : new Error(String(scenarioError));
+    primary.message = `${primary.message}\ncleanup_failed ${cleanupErrors.join(' | ')}`;
+    throw primary;
+  }
+  expect(cleanupErrors).toEqual([]);
+}
+
 async function dockerAvailable(): Promise<boolean> {
   try {
     const result = await runCommand(['docker', 'info']);
@@ -848,6 +888,9 @@ describe('companion image fresh audit volume', () => {
     const dispatch = await listenStub();
     let port = 0;
     let networkName = '';
+    let volumeCreated = false;
+    let containerCreated = false;
+    let scenarioError: unknown;
     const relays: Array<{ close: () => Promise<void> }> = [];
     try {
       await mkdir(join(wiki, 'xo-wiki/wiki'), { recursive: true });
@@ -913,6 +956,7 @@ describe('companion image fresh audit volume', () => {
       const untrustedOwnerUid = captureHostFixtureOwner(untrusted);
       const created = await runCommand(['docker', 'volume', 'create', volume]);
       expect(created.code).toBe(0);
+      volumeCreated = true;
       const network = await createDisposableNetwork(suffix);
       networkName = network.name;
       const oracleRelay = await relayLoopback(network.gateway, loopbackPort(oracle.url));
@@ -978,6 +1022,7 @@ describe('companion image fresh audit volume', () => {
       if (started.code !== 0) {
         throw new Error(started.stderr.slice(-2000));
       }
+      containerCreated = true;
       try {
         await waitHealth(port);
       } catch (error) {
@@ -1113,18 +1158,57 @@ describe('companion image fresh audit volume', () => {
       expect(evidence.log).not.toContain('BEGIN PRIVATE KEY');
       expect(evidence.log).not.toContain('synthetic-dispatch-credential');
       expect(evidence.log).not.toContain('synthetic-github-token');
+    } catch (error) {
+      scenarioError = error;
     } finally {
-      await runCommand(['docker', 'rm', '-f', container]);
+      const cleanupErrors: string[] = [];
+      await cleanupCreatedResource(
+        containerCreated,
+        ['docker', 'rm', '-f', container],
+        'container',
+        cleanupErrors
+      );
       for (const relay of relays) {
-        await relay.close();
+        try {
+          await relay.close();
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'relay_close_failed';
+          cleanupErrors.push(`relay ${message}`);
+        }
       }
       if (networkName !== '') {
-        await runCommand(['docker', 'network', 'rm', networkName]);
+        await cleanupCreatedResource(
+          true,
+          ['docker', 'network', 'rm', networkName],
+          'network',
+          cleanupErrors
+        );
       }
-      await runCommand(['docker', 'volume', 'rm', '-f', volume]);
-      await oracle.close();
-      await dispatch.close();
-      await removeOwnedFixture(fixture);
+      await cleanupCreatedResource(
+        volumeCreated,
+        ['docker', 'volume', 'rm', '-f', volume],
+        'volume',
+        cleanupErrors
+      );
+      try {
+        await oracle.close();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'oracle_close_failed';
+        cleanupErrors.push(`oracle ${message}`);
+      }
+      try {
+        await dispatch.close();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'dispatch_close_failed';
+        cleanupErrors.push(`dispatch ${message}`);
+      }
+      try {
+        await removeOwnedFixture(fixture);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'fixture_cleanup_failed';
+        cleanupErrors.push(`fixture ${message}`);
+      }
+      finishStrictCleanup(scenarioError, cleanupErrors);
     }
   }, 900000);
 });
@@ -1212,6 +1296,11 @@ describe('companion compose published port', () => {
     const volume = `bdc-companion-mcp-publish-${suffix}`;
     const fixture = await mkdtemp(join(tmpdir(), 'companion-mcp-publish-'));
     const hostPort = await freePort();
+    let publishNetCreated = false;
+    let sideNetCreated = false;
+    let volumeCreated = false;
+    let containerCreated = false;
+    let scenarioError: unknown;
     try {
       await preparePublishFixture(fixture);
       await ensureRepairImage();
@@ -1234,6 +1323,7 @@ describe('companion compose published port', () => {
       if (createdNet.code !== 0) {
         throw new Error(createdNet.stderr.slice(-2000));
       }
+      publishNetCreated = true;
       const createdSide = await runCommand([
         'docker',
         'network',
@@ -1245,8 +1335,10 @@ describe('companion compose published port', () => {
       if (createdSide.code !== 0) {
         throw new Error(createdSide.stderr.slice(-2000));
       }
+      sideNetCreated = true;
       const createdVol = await runCommand(['docker', 'volume', 'create', volume]);
       expect(createdVol.code).toBe(0);
+      volumeCreated = true;
       const created = await runCommand([
         'docker',
         'create',
@@ -1304,6 +1396,7 @@ describe('companion compose published port', () => {
       if (created.code !== 0) {
         throw new Error(created.stderr.slice(-2000));
       }
+      containerCreated = true;
       const connected = await runCommand(['docker', 'network', 'connect', sideNet, container]);
       if (connected.code !== 0) {
         throw new Error(connected.stderr.slice(-2000));
@@ -1352,12 +1445,73 @@ describe('companion compose published port', () => {
       expect(networks.stdout).toContain(published.bindAddr);
       expect(networks.stdout).toContain(publishNet);
       expect(networks.stdout).toContain(sideNet);
+    } catch (error) {
+      scenarioError = error;
     } finally {
-      await runCommand(['docker', 'rm', '-f', container]);
-      await runCommand(['docker', 'network', 'rm', publishNet]);
-      await runCommand(['docker', 'network', 'rm', sideNet]);
-      await runCommand(['docker', 'volume', 'rm', '-f', volume]);
-      await removeOwnedFixture(fixture);
+      const cleanupErrors: string[] = [];
+      await cleanupCreatedResource(
+        containerCreated,
+        ['docker', 'rm', '-f', container],
+        'container',
+        cleanupErrors
+      );
+      await cleanupCreatedResource(
+        publishNetCreated,
+        ['docker', 'network', 'rm', publishNet],
+        'publish-network',
+        cleanupErrors
+      );
+      await cleanupCreatedResource(
+        sideNetCreated,
+        ['docker', 'network', 'rm', sideNet],
+        'side-network',
+        cleanupErrors
+      );
+      await cleanupCreatedResource(
+        volumeCreated,
+        ['docker', 'volume', 'rm', '-f', volume],
+        'volume',
+        cleanupErrors
+      );
+      try {
+        await removeOwnedFixture(fixture);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'fixture_cleanup_failed';
+        cleanupErrors.push(`fixture ${message}`);
+      }
+      finishStrictCleanup(scenarioError, cleanupErrors);
     }
   }, 900000);
+});
+
+describe('strict finally resource cleanup', () => {
+  test('records a failed removal only when that resource was created', async () => {
+    const ignored: string[] = [];
+    await cleanupCreatedResource(false, ['/bin/false'], 'container', ignored);
+    expect(ignored).toEqual([]);
+    const recorded: string[] = [];
+    await cleanupCreatedResource(true, ['/bin/false'], 'volume', recorded);
+    expect(recorded).toEqual(['volume code=1']);
+    const removed: string[] = [];
+    await cleanupCreatedResource(true, ['/bin/true'], 'network', removed);
+    expect(removed).toEqual([]);
+  });
+
+  test('a passing scenario fails when created-resource cleanup failed', () => {
+    expect(() => {
+      finishStrictCleanup(undefined, ['container code=1']);
+    }).toThrow(/container code=1/);
+  });
+
+  test('an earlier scenario error stays the failure when cleanup also fails', () => {
+    const scenario = new Error('tracked_read_failed');
+    try {
+      finishStrictCleanup(scenario, ['volume code=1']);
+      throw new Error('cleanup_error_was_swallowed');
+    } catch (error) {
+      expect(error).toBe(scenario);
+      expect(scenario.message).toContain('tracked_read_failed');
+      expect(scenario.message).toContain('cleanup_failed volume code=1');
+    }
+  });
 });
