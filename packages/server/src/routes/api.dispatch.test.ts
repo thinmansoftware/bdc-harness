@@ -2567,6 +2567,53 @@ describe('dispatch API', () => {
     });
   });
 
+  test('test129 rejects duplicated legacy list filters with the historical validation body', async () => {
+    await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'legacy-dup-visible',
+      recipient: 'codex',
+      body: 'LEGACY-DUP-VISIBLE',
+    });
+    const app = makeApp('synthetic-operator-token');
+    const headers = { 'x-archon-operator-token': 'synthetic-operator-token' };
+    const duplicates = [
+      {
+        url: '/api/dispatch/messages?recipient=codex&recipient=xo',
+        error: 'recipient: Expected string, received array',
+      },
+      {
+        url: '/api/dispatch/messages?recipient=codex&status=queued&status=done',
+        error:
+          "status: Expected 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled', received array",
+      },
+      {
+        url: '/api/dispatch/messages?recipient=codex&limit=10&limit=20',
+        error: 'limit: Expected string, received array',
+      },
+      {
+        url: '/api/dispatch/messages?recipient=codex&subject_key=wo:WO-MAILBOX&subject_key=other',
+        error: 'subject_key: Expected string, received array',
+      },
+      {
+        url: '/api/dispatch/messages?recipient=codex&route_disposition=auto_surfaced&route_disposition=expired',
+        error:
+          "route_disposition: Expected 'unroutable' | 'superseded' | 'expired' | 'auto_surfaced', received array",
+      },
+    ];
+    for (const item of duplicates) {
+      const response = await app.request(item.url, { headers });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: item.error });
+    }
+
+    const unknown = await app.request(
+      '/api/dispatch/messages?recipient=codex&not_a_selector=1&not_a_selector=2',
+      { headers }
+    );
+    expect(unknown.status).toBe(200);
+    expect(Array.isArray(await unknown.json())).toBe(true);
+  });
+
   test('test124 config does not activate inactive companion principals', async () => {
     const seeded = await db.query<{
       principal_id: string;

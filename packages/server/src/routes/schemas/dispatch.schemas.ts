@@ -103,18 +103,56 @@ export const dispatchMailboxPrincipalBodySchema = z
 // can reject a selected request by name instead of a generic type error.
 const dispatchQueryString = z.union([z.string(), z.array(z.string()).min(1)]);
 
-export const listDispatchMessagesQuerySchema = z.object({
-  recipient: dispatchQueryString.optional(),
-  status: z.union([dispatchMessageStatusSchema, z.array(z.string()).min(1)]).optional(),
-  limit: dispatchQueryString.optional(),
-  subject_key: dispatchQueryString.optional(),
-  route_disposition: z
-    .union([dispatchRouteDispositionSchema, z.array(z.string()).min(1)])
-    .optional(),
-  message_id: dispatchQueryString.optional(),
-  correlation_id: dispatchQueryString.optional(),
-  after_seq: dispatchQueryString.optional(),
-});
+// No-selector lists still use the historical OpenAPI hook text. Selected
+// requests keep arrays so the route parser can name the selector error.
+const legacyDuplicateQueryMessage = {
+  recipient: 'Expected string, received array',
+  status: "Expected 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled', received array",
+  limit: 'Expected string, received array',
+  subject_key: 'Expected string, received array',
+  route_disposition:
+    "Expected 'unroutable' | 'superseded' | 'expired' | 'auto_surfaced', received array",
+} as const;
+
+const legacyDuplicateQueryFields = [
+  'recipient',
+  'status',
+  'limit',
+  'subject_key',
+  'route_disposition',
+] as const;
+
+export const listDispatchMessagesQuerySchema = z
+  .object({
+    recipient: dispatchQueryString.optional(),
+    status: z.union([dispatchMessageStatusSchema, z.array(z.string()).min(1)]).optional(),
+    limit: dispatchQueryString.optional(),
+    subject_key: dispatchQueryString.optional(),
+    route_disposition: z
+      .union([dispatchRouteDispositionSchema, z.array(z.string()).min(1)])
+      .optional(),
+    message_id: dispatchQueryString.optional(),
+    correlation_id: dispatchQueryString.optional(),
+    after_seq: dispatchQueryString.optional(),
+  })
+  .superRefine((query, ctx) => {
+    if (
+      query.message_id !== undefined ||
+      query.correlation_id !== undefined ||
+      query.after_seq !== undefined
+    ) {
+      return;
+    }
+    for (const field of legacyDuplicateQueryFields) {
+      if (Array.isArray(query[field])) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [field],
+          message: legacyDuplicateQueryMessage[field],
+        });
+      }
+    }
+  });
 
 export const claimDispatchMessageBodySchema = z
   .object({
