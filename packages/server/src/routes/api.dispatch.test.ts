@@ -3855,5 +3855,157 @@ describe('dispatch API', () => {
       expect(headerlessList.status).toBe(200);
       expect(Array.isArray(await headerlessList.json())).toBe(true);
     });
+
+    test('principal headers are classified before operator-auth bypasses', async () => {
+      const priorAuthDisabled = process.env.ARCHON_OPERATOR_AUTH_DISABLED;
+      const priorNodeEnv = process.env.NODE_ENV;
+      const restoreEnv = (name: string, prior: string | undefined): void => {
+        if (prior === undefined) delete process.env[name];
+        else process.env[name] = prior;
+      };
+      try {
+        process.env.NODE_ENV = 'test';
+        delete process.env.DISPATCH_SENDER_AUTH_MODE;
+        clearMatchingAccess();
+        useRegistry([fullGrokbot()]);
+        await createMessage({
+          ...VALID_BODY,
+          sender: 'xo',
+          recipient: 'codex',
+          body: foreignBody,
+          idempotency_key: 'bypass-foreign-seed',
+        });
+
+        const bypasses: Array<{ name: string; app: OpenAPIHono }> = [
+          {
+            name: 'auth-disabled',
+            app: (() => {
+              process.env.ARCHON_OPERATOR_AUTH_DISABLED = 'true';
+              return makeApp('secret-token');
+            })(),
+          },
+          {
+            name: 'no-operator-token',
+            app: (() => {
+              delete process.env.ARCHON_OPERATOR_AUTH_DISABLED;
+              return makeApp();
+            })(),
+          },
+        ];
+
+        for (const bypass of bypasses) {
+          const { app, name } = bypass;
+          const emptyHeaders = new Headers({ 'Content-Type': 'application/json' });
+          emptyHeaders.set('x-dispatch-principal-id', '');
+          emptyHeaders.set('x-dispatch-principal-token', '');
+          const empty = await app.request('/api/dispatch/messages', {
+            method: 'POST',
+            headers: emptyHeaders,
+            body: JSON.stringify({
+              ...VALID_BODY,
+              sender: 'grokbot',
+              recipient: 'grokbot',
+              body: ownBody,
+              idempotency_key: `bypass-empty-${name}`,
+            }),
+          });
+          const emptyBody = await readError(empty);
+          expect(empty.status).toBe(401);
+          expect(emptyBody.error).toBe('dispatch_principal_missing');
+          expectNoSecret(emptyBody.text, grokbotToken);
+          expect(
+            (
+              await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+                `bypass-empty-${name}`,
+              ])
+            ).rowCount
+          ).toBe(0);
+
+          const partial = await postMessage(app, principalHeaders('grokbot', undefined), {
+            idempotency_key: `bypass-partial-${name}`,
+          });
+          const partialBody = await readError(partial);
+          expect(partial.status).toBe(401);
+          expect(partialBody.error).toBe('dispatch_principal_partial');
+          expectNoSecret(partialBody.text, grokbotToken);
+
+          const partialList = await app.request(listUrl({ recipient: 'codex' }), {
+            headers: principalHeaders('grokbot', undefined),
+          });
+          const partialListBody = await readError(partialList);
+          expect(partialList.status).toBe(401);
+          expect(partialListBody.error).toBe('dispatch_principal_partial');
+          expect(partialListBody.text.includes(foreignBody)).toBe(false);
+
+          const statusRoute = await app.request('/api/dispatch/status', {
+            headers: principalHeaders('grokbot', grokbotToken),
+          });
+          const statusBody = await readError(statusRoute);
+          expect(statusRoute.status).toBe(403);
+          expect(statusBody.error).toBe('dispatch_principal_forbidden');
+          expect(statusBody.text.includes(foreignBody)).toBe(false);
+
+          const report = await postMessage(app, principalHeaders('grokbot', grokbotToken), {
+            task_type: 'run_report',
+            idempotency_key: `bypass-report-${name}`,
+            body: 'Report on the latest CI failure.',
+          });
+          const reportBody = await readError(report);
+          expect(report.status).toBe(403);
+          expect(reportBody.error).toBe('dispatch_principal_forbidden');
+          expect(
+            (
+              await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+                `bypass-report-${name}`,
+              ])
+            ).rowCount
+          ).toBe(0);
+
+          const allowed = await postMessage(app, principalHeaders('grokbot', grokbotToken), {
+            idempotency_key: `bypass-allowed-${name}`,
+          });
+          expect(allowed.status).toBe(200);
+          expect(
+            ((await allowed.json()) as { sender_principal_id: string | null }).sender_principal_id
+          ).toBe('grokbot');
+
+          const headerless = await postMessage(
+            app,
+            { 'Content-Type': 'application/json' },
+            {
+              sender: 'claude',
+              recipient: 'codex',
+              idempotency_key: `bypass-headerless-${name}`,
+            }
+          );
+          expect(headerless.status).toBe(200);
+          expect(
+            ((await headerless.json()) as { sender_principal_id: string | null })
+              .sender_principal_id
+          ).toBeNull();
+        }
+
+        process.env.ARCHON_OPERATOR_AUTH_DISABLED = 'true';
+        const disabledWithToken = makeApp('secret-token');
+        const mixedPartial = await postMessage(
+          disabledWithToken,
+          principalHeaders('grokbot', undefined, { 'x-archon-operator-token': 'secret-token' }),
+          { idempotency_key: 'bypass-disabled-mixed-partial' }
+        );
+        const mixedPartialBody = await readError(mixedPartial);
+        expect(mixedPartial.status).toBe(401);
+        expect(mixedPartialBody.error).toBe('dispatch_principal_partial');
+        expect(
+          (
+            await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+              'bypass-disabled-mixed-partial',
+            ])
+          ).rowCount
+        ).toBe(0);
+      } finally {
+        restoreEnv('ARCHON_OPERATOR_AUTH_DISABLED', priorAuthDisabled);
+        restoreEnv('NODE_ENV', priorNodeEnv);
+      }
+    });
   });
 });
