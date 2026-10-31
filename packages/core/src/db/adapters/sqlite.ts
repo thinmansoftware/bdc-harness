@@ -1295,7 +1295,15 @@ export class SqliteAdapter implements IDatabase {
         -- back as remediation candidates addressed to 'taskmaster'. Without
         -- this row createAuthenticatedMessage rejects every one with
         -- missing_principal.
-        ('taskmaster', 'Taskmaster', 'worker_poll', 1)
+        ('taskmaster', 'Taskmaster', 'worker_poll', 1),
+        -- WO-HARNESS-COMPANION-MCP-MAILBOX-01 (migration 065 parity): voice
+        -- companion mailboxes. Hand-maintained mirror of 000_combined.sql.
+        -- grokbot is active; dot, muse and duet stay inactive. No follow-up
+        -- UPDATE: inactive companions must not be switched on by the seed.
+        ('grokbot', 'Grok Bot (voice companion)', 'drain_on_start', 1),
+        ('dot', 'Dot (voice companion)', 'drain_on_start', 0),
+        ('muse', 'Muse (voice companion)', 'drain_on_start', 0),
+        ('duet', 'Duet (voice companion)', 'drain_on_start', 0)
       ON CONFLICT (principal_id) DO NOTHING
     `);
     this.db.run(`

@@ -228,6 +228,7 @@ import {
   DispatchPrincipalAuthError,
   authenticateDispatchPrincipal,
   parseDispatchPrincipalsRegistry,
+  type DispatchPrincipalCredential,
   type DispatchSenderAuthMode,
 } from '../auth/dispatch-principal';
 import { createLogger as createDispatchRouteLogger } from '@archon/paths';
@@ -331,7 +332,7 @@ import {
   supersedeDispatchMessageBodySchema,
   dispatchMailboxPrincipalBodySchema,
   dispatchMessageIdParamsSchema,
-  dispatchMessageListResponseSchema,
+  dispatchMessageListOrCursorResponseSchema,
   dispatchMessageSchema,
   dispatchSenderBodySchema,
   dispatchWorkerSchema,
@@ -744,9 +745,11 @@ const listDispatchMessagesRoute = createRoute({
   request: { query: listDispatchMessagesQuerySchema },
   responses: {
     200: {
-      content: { 'application/json': { schema: dispatchMessageListResponseSchema } },
-      description: 'Dispatch messages',
+      content: { 'application/json': { schema: dispatchMessageListOrCursorResponseSchema } },
+      description:
+        'Dispatch messages. No selector returns the legacy array. after_seq returns one cursor page.',
     },
+    400: jsonError('Invalid dispatch list selector'),
     500: jsonError('Server error'),
   },
 });
@@ -2757,6 +2760,217 @@ function pushedReadingView(row: {
   };
 }
 
+const DISPATCH_LIST_SELECTOR_KEYS = ['message_id', 'correlation_id', 'after_seq'] as const;
+const DISPATCH_LIST_STATUSES = new Set(['queued', 'claimed', 'done', 'failed', 'cancelled']);
+const COMPLETE_BASE10_INTEGER = /^(0|[1-9][0-9]*)$/;
+
+type DispatchListStatus = 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
+
+type DispatchListSelection =
+  | { kind: 'legacy' }
+  | { kind: 'invalid' }
+  | { kind: 'message_id'; recipient: string; messageId: string }
+  | { kind: 'correlation_id'; recipient: string; correlationId: string; limit?: number }
+  | {
+      kind: 'after_seq';
+      recipient: string;
+      afterSeq: number;
+      status?: DispatchListStatus;
+      limit?: number;
+    };
+
+function parseCompleteNonnegativeSafeInteger(value: string): number | null {
+  if (!COMPLETE_BASE10_INTEGER.test(value)) return null;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) return null;
+  return parsed;
+}
+
+function parseSelectedDispatchLimit(value: string): number | null {
+  const parsed = parseCompleteNonnegativeSafeInteger(value);
+  if (parsed === null || parsed < 1 || parsed > 500) return null;
+  return parsed;
+}
+
+function dispatchListKeys(params: URLSearchParams): string[] {
+  const keys: string[] = [];
+  params.forEach((_value, key) => {
+    if (!keys.includes(key)) keys.push(key);
+  });
+  return keys;
+}
+
+function dispatchListKeyRepeated(params: URLSearchParams, keys: readonly string[]): boolean {
+  return keys.some(key => params.getAll(key).length > 1);
+}
+
+function canonicalDispatchListRecipient(params: URLSearchParams): string | null {
+  const values = params.getAll('recipient');
+  if (values.length !== 1) return null;
+  const canonical = (values[0] ?? '').trim().toLowerCase();
+  return canonical.length === 0 ? null : canonical;
+}
+
+/**
+ * Selector key presence opts into a direct read, including after_seq=0.
+ * The legacy path stays in place only when none of those keys appear.
+ */
+function parseDispatchListSelection(requestUrl: string): DispatchListSelection {
+  let params: URLSearchParams;
+  try {
+    params = new URL(requestUrl, 'http://127.0.0.1').searchParams;
+  } catch {
+    return { kind: 'invalid' };
+  }
+  const presentSelectors = DISPATCH_LIST_SELECTOR_KEYS.filter(key => params.has(key));
+  if (presentSelectors.length === 0) return { kind: 'legacy' };
+  if (presentSelectors.length !== 1) return { kind: 'invalid' };
+  const keys = dispatchListKeys(params);
+  if (dispatchListKeyRepeated(params, keys)) return { kind: 'invalid' };
+  const mode = presentSelectors[0];
+  if (mode === undefined) return { kind: 'invalid' };
+  const allowed = new Set<string>(['recipient', mode]);
+  if (mode === 'correlation_id' || mode === 'after_seq') allowed.add('limit');
+  if (mode === 'after_seq') allowed.add('status');
+  if (keys.some(key => !allowed.has(key))) return { kind: 'invalid' };
+  const recipient = canonicalDispatchListRecipient(params);
+  if (recipient === null) return { kind: 'invalid' };
+  let limit: number | undefined;
+  if (params.has('limit')) {
+    const parsedLimit = parseSelectedDispatchLimit(params.get('limit') ?? '');
+    if (parsedLimit === null) return { kind: 'invalid' };
+    limit = parsedLimit;
+  }
+  if (mode === 'message_id') {
+    const messageId = params.get('message_id') ?? '';
+    if (messageId.trim() === '') return { kind: 'invalid' };
+    return { kind: 'message_id', recipient, messageId };
+  }
+  if (mode === 'correlation_id') {
+    const correlationId = params.get('correlation_id') ?? '';
+    if (correlationId.trim() === '') return { kind: 'invalid' };
+    return { kind: 'correlation_id', recipient, correlationId, limit };
+  }
+  const afterSeq = parseCompleteNonnegativeSafeInteger(params.get('after_seq') ?? '');
+  if (afterSeq === null) return { kind: 'invalid' };
+  let status: DispatchListStatus | undefined;
+  if (params.has('status')) {
+    const rawStatus = params.get('status') ?? '';
+    if (!DISPATCH_LIST_STATUSES.has(rawStatus)) return { kind: 'invalid' };
+    status = rawStatus as DispatchListStatus;
+  }
+  return { kind: 'after_seq', recipient, afterSeq, status, limit };
+}
+
+/**
+ * One bounded queued page. Deferred rows stay in the raw page so the cursor
+ * cannot walk past them. The first otherwise-open future not_before stops
+ * the page before that sequence.
+ */
+function walkQueuedDispatchCursorPage(
+  rows: readonly dispatchDb.SeqCursorMessage[],
+  afterSeq: number,
+  dalLimit: number,
+  observedAtMs: number
+): {
+  messages: dispatchDb.DispatchMessage[];
+  next_after_seq: number;
+  page_full: boolean;
+} {
+  const messages: dispatchDb.DispatchMessage[] = [];
+  let safeCursor = afterSeq;
+  for (const row of rows) {
+    if (
+      !Number.isSafeInteger(row.cursor_seq) ||
+      row.cursor_seq < 0 ||
+      row.cursor_seq <= safeCursor
+    ) {
+      throw new Error('dispatch_cursor_not_finite');
+    }
+    const notBeforeMs = row.not_before === null ? null : Date.parse(row.not_before);
+    if (row.not_before !== null && !Number.isFinite(notBeforeMs)) {
+      throw new Error('dispatch_not_before_unparseable');
+    }
+    if (row.addressed_at !== null || row.route_disposition !== null) {
+      safeCursor = row.cursor_seq;
+      continue;
+    }
+    if (notBeforeMs !== null && notBeforeMs > observedAtMs) {
+      return { messages, next_after_seq: safeCursor, page_full: false };
+    }
+    const { cursor_seq: cursorSeq, ...message } = row;
+    messages.push(message);
+    safeCursor = cursorSeq;
+  }
+  return {
+    messages,
+    next_after_seq: safeCursor,
+    page_full: rows.length === dalLimit,
+  };
+}
+
+async function loadSelectedDispatchMessages(
+  selection: Exclude<DispatchListSelection, { kind: 'legacy' | 'invalid' }>
+): Promise<unknown> {
+  if (selection.kind === 'message_id') {
+    const message = await dispatchDb.getMessage(selection.messageId);
+    if (message === null) return [];
+    if (message.recipient.trim().toLowerCase() !== selection.recipient) return [];
+    return [message];
+  }
+  if (selection.kind === 'correlation_id') {
+    return dispatchDb.listMessagesByCorrelationId({
+      correlationId: selection.correlationId,
+      recipient: selection.recipient,
+      ...(selection.limit !== undefined ? { limit: selection.limit } : {}),
+    });
+  }
+  const dalLimit = Math.max(1, Math.min(selection.limit ?? 100, 500));
+  if (selection.status === 'queued') {
+    const rows = await dispatchDb.listMessagesBySeqCursor({
+      recipient: selection.recipient,
+      afterSeq: selection.afterSeq,
+      status: 'queued',
+      limit: dalLimit,
+    });
+    if (rows.length === 0) {
+      return { messages: [], next_after_seq: selection.afterSeq, page_full: false };
+    }
+    const observedAtMs = Date.now();
+    return walkQueuedDispatchCursorPage(rows, selection.afterSeq, dalLimit, observedAtMs);
+  }
+  const rows = await dispatchDb.listMessagesBySeqCursor({
+    recipient: selection.recipient,
+    afterSeq: selection.afterSeq,
+    ...(selection.status !== undefined ? { status: selection.status } : {}),
+    ...(selection.limit !== undefined ? { limit: selection.limit } : {}),
+  });
+  if (rows.length === 0) {
+    return { messages: [], next_after_seq: selection.afterSeq, page_full: false };
+  }
+  const messages: dispatchDb.DispatchMessage[] = [];
+  let nextAfterSeq = selection.afterSeq;
+  for (const row of rows) {
+    // Same contract as walkQueuedDispatchCursorPage: the response schema only
+    // allows a safe nonnegative integer, and each row must advance the cursor.
+    if (
+      !Number.isSafeInteger(row.cursor_seq) ||
+      row.cursor_seq < 0 ||
+      row.cursor_seq <= nextAfterSeq
+    ) {
+      throw new Error('dispatch_cursor_not_finite');
+    }
+    const { cursor_seq: cursorSeq, ...message } = row;
+    messages.push(message);
+    nextAfterSeq = cursorSeq;
+  }
+  return {
+    messages,
+    next_after_seq: nextAfterSeq,
+    page_full: rows.length === dalLimit,
+  };
+}
+
 /**
  * Register all /api/* routes on the Hono app.
  */
@@ -2768,6 +2982,8 @@ export function registerApiRoutes(
   canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot,
   dispatchMailboxActorResolvedHook?: () => Promise<void>
 ): void {
+  const dispatchPrincipalTransportCredentials = new WeakMap<Request, DispatchPrincipalCredential>();
+
   // The readings route refs this component instead of validating with it.
   app.openAPIRegistry.register('FuelglassReadingPushBody', fuelglassReadingPushBodySchema);
 
@@ -3132,14 +3348,88 @@ export function registerApiRoutes(
     };
   }
 
+  function dispatchPrincipalHeaderPresent(c: Context): boolean {
+    const headers = c.req.raw.headers;
+    return headers.has('x-dispatch-principal-id') || headers.has('x-dispatch-principal-token');
+  }
+
+  function isDispatchPrincipalTransportRoute(method: string, path: string): boolean {
+    if (path === '/api/dispatch/messages' && (method === 'GET' || method === 'POST')) return true;
+    return method === 'POST' && /^\/api\/dispatch\/messages\/[^/]+\/ack$/.test(path);
+  }
+
+  function principalTransportListRecipient(
+    c: Context,
+    credential: DispatchPrincipalCredential
+  ): { ok: true; recipient: string } | { ok: false; response: Response } {
+    if (!credential.roles.includes('receive')) {
+      return { ok: false, response: apiError(c, 403, 'dispatch_principal_forbidden') };
+    }
+    let params: URLSearchParams;
+    try {
+      params = new URL(c.req.url, 'http://127.0.0.1').searchParams;
+    } catch {
+      return { ok: false, response: apiError(c, 403, 'dispatch_principal_forbidden') };
+    }
+    const recipient = canonicalDispatchListRecipient(params);
+    if (recipient === null || !credential.receive_as.includes(recipient)) {
+      return { ok: false, response: apiError(c, 403, 'dispatch_principal_forbidden') };
+    }
+    return { ok: true, recipient };
+  }
+
   app.use('/api/*', cors({ origin: process.env.WEB_UI_ORIGIN || '*' }));
 
   app.use('/api/*', async (c, next) => {
-    if (c.req.method === 'OPTIONS' || operatorAuthDisabled() || isPublicApiPath(c.req.path)) {
+    if (c.req.method === 'OPTIONS' || isPublicApiPath(c.req.path)) {
       return next();
     }
 
-    if (!privateApiRequiresOperatorToken()) {
+    // Strict principal classification applies only when the request does not
+    // present the configured operator token. An exact ARCHON_OPERATOR_TOKEN
+    // match stays on the operator path even if ARCHON_OPERATOR_AUTH_DISABLED
+    // is set or operator-token enforcement is off, including when principal
+    // headers are also present. Absent that exact token, classify every
+    // principal-header request before the operator-auth bypasses so disabled
+    // auth and an unconfigured operator token cannot let empty, partial, or
+    // otherwise malformed principal headers reach legacy handlers. Any
+    // principal header, even empty, is classified before the Access-header
+    // predicate so matching Host and Access-email headers cannot promote
+    // that request.
+    const authDisabled = operatorAuthDisabled();
+    const tokenRequired = privateApiRequiresOperatorToken();
+    const expectedToken = process.env.ARCHON_OPERATOR_TOKEN;
+    if (expectedToken && getPresentedOperatorToken(c) === expectedToken) {
+      return next();
+    }
+
+    if (dispatchPrincipalHeaderPresent(c)) {
+      if (!isDispatchPrincipalTransportRoute(c.req.method, c.req.path)) {
+        return apiError(c, 403, 'dispatch_principal_forbidden');
+      }
+      try {
+        const credential = authenticateDispatchPrincipal({
+          principal_id: c.req.header('x-dispatch-principal-id'),
+          token: c.req.header('x-dispatch-principal-token'),
+          require_send_role: false,
+        });
+        dispatchPrincipalTransportCredentials.set(c.req.raw, credential);
+      } catch (error) {
+        const mapped = mapDispatchPrincipalAuthError(c, error);
+        if (mapped) return mapped;
+        return apiError(c, 401, 'dispatch_principal_unauthorized');
+      }
+      if (c.req.method === 'GET' && c.req.path === '/api/dispatch/messages') {
+        const credential = dispatchPrincipalTransportCredentials.get(c.req.raw);
+        if (credential) {
+          const listed = principalTransportListRecipient(c, credential);
+          if (!listed.ok) return listed.response;
+        }
+      }
+      return next();
+    }
+
+    if (authDisabled || !tokenRequired) {
       return next();
     }
 
@@ -3147,7 +3437,6 @@ export function registerApiRoutes(
       return next();
     }
 
-    const expectedToken = process.env.ARCHON_OPERATOR_TOKEN;
     if (!expectedToken) {
       return apiError(
         c,
@@ -4508,6 +4797,29 @@ export function registerApiRoutes(
         return apiError(c, 400, assessment.reason ?? 'dispatch_message_body_rejected');
       }
       const canonicalBody = { ...body, recipient: body.recipient.trim().toLowerCase() };
+      const principalCredential = dispatchPrincipalTransportCredentials.get(c.req.raw);
+      if (principalCredential) {
+        if (canonicalBody.task_type !== 'agent_message' || canonicalBody.recipient === 'board') {
+          return apiError(c, 403, 'dispatch_principal_forbidden');
+        }
+        const capability = DispatchNonSystemCapability.fromAuthenticatedRequest({
+          principal_id: c.req.header('x-dispatch-principal-id'),
+          token: c.req.header('x-dispatch-principal-token'),
+          requested_sender: canonicalBody.sender,
+        });
+        const message = await dispatchDb.createAuthenticatedMessage(capability, {
+          correlation_id: canonicalBody.correlation_id,
+          idempotency_key: canonicalBody.idempotency_key,
+          task_type: canonicalBody.task_type,
+          recipient: canonicalBody.recipient,
+          body: canonicalBody.body,
+          not_before: canonicalBody.not_before ?? null,
+          priority: canonicalBody.priority,
+          subject_key: canonicalBody.subject_key,
+          repeat_reason: canonicalBody.repeat_reason,
+        });
+        return c.json(message);
+      }
       if (canonicalBody.task_type === 'board_motion') {
         const { capability, principal } = await DispatchNonSystemCapability.fromBoardProof({
           proof: boardPrincipalProofFromHeaders(c),
@@ -4620,6 +4932,56 @@ export function registerApiRoutes(
   });
 
   registerOpenApiRoute(listDispatchMessagesRoute, async c => {
+    const principalCredential = dispatchPrincipalTransportCredentials.get(c.req.raw);
+    if (principalCredential) {
+      const listed = principalTransportListRecipient(c, principalCredential);
+      if (!listed.ok) return listed.response;
+      const selection = parseDispatchListSelection(c.req.url);
+      if (selection.kind === 'invalid') {
+        return apiError(c, 400, 'dispatch_list_selector_invalid');
+      }
+      try {
+        if (selection.kind === 'legacy') {
+          const rawLimit = Number.parseInt(c.req.query('limit') ?? '100', 10);
+          const messages = await dispatchDb.listMessages({
+            recipient: listed.recipient,
+            status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
+            subject_key: c.req.query('subject_key') ?? undefined,
+            route_disposition: c.req.query('route_disposition') as
+              | dispatchDb.DispatchRouteDisposition
+              | undefined,
+            limit: Number.isFinite(rawLimit) ? rawLimit : 100,
+            allowBoardAlias: false,
+          });
+          return c.json(messages);
+        }
+        if (selection.recipient !== listed.recipient) {
+          return apiError(c, 403, 'dispatch_principal_forbidden');
+        }
+        return c.json(await loadSelectedDispatchMessages(selection));
+      } catch (error) {
+        if (error instanceof Error && error.message === 'dispatch_not_before_unparseable') {
+          return apiError(c, 500, 'dispatch_not_before_unparseable');
+        }
+        getLog().error({ err: error }, 'dispatch_list_messages_failed');
+        return apiError(c, 500, 'Failed to list dispatch messages');
+      }
+    }
+    const selection = parseDispatchListSelection(c.req.url);
+    if (selection.kind === 'invalid') {
+      return apiError(c, 400, 'dispatch_list_selector_invalid');
+    }
+    if (selection.kind !== 'legacy') {
+      try {
+        return c.json(await loadSelectedDispatchMessages(selection));
+      } catch (error) {
+        if (error instanceof Error && error.message === 'dispatch_not_before_unparseable') {
+          return apiError(c, 500, 'dispatch_not_before_unparseable');
+        }
+        getLog().error({ err: error }, 'dispatch_list_messages_failed');
+        return apiError(c, 500, 'Failed to list dispatch messages');
+      }
+    }
     try {
       const rawLimit = Number.parseInt(c.req.query('limit') ?? '100', 10);
       const messages = await dispatchDb.listMessages({
@@ -4692,6 +5054,10 @@ export function registerApiRoutes(
   registerOpenApiRoute(acknowledgeDispatchMessageRoute, async c => {
     try {
       const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
+      const principalCredential = dispatchPrincipalTransportCredentials.get(c.req.raw);
+      if (principalCredential && !principalCredential.roles.includes('receive')) {
+        return apiError(c, 403, 'dispatch_principal_forbidden');
+      }
       const { actor, bind } = await resolveDispatchMailboxActor(c);
       if (
         body.principal_id !== undefined &&
@@ -4699,6 +5065,17 @@ export function registerApiRoutes(
         body.principal_id !== bind?.holder_principal_id
       )
         return apiError(c, 409, 'actor_mismatch');
+      if (principalCredential) {
+        const existing = await dispatchDb.getMessage(c.req.param('id') ?? '');
+        if (existing) {
+          const mailboxRecipient = (existing.resolved_recipient ?? existing.recipient)
+            .trim()
+            .toLowerCase();
+          if (!principalCredential.receive_as.includes(mailboxRecipient)) {
+            return apiError(c, 403, 'dispatch_principal_forbidden');
+          }
+        }
+      }
       const result = await dispatchDb.acknowledgeMessage({
         id: c.req.param('id') ?? '',
         principal_id: actor,

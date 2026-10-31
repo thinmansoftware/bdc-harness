@@ -22,7 +22,6 @@
         "typescript": "^5.3.0",
         "typescript-eslint": "^8.48.0",
         "yaml": "^2.7.0",
-        "yaml": "^2.7.0",
       },
     },
     "packages/adapters": {
@@ -76,6 +75,14 @@
       },
       "devDependencies": {
         "@types/node": "^22.0.0",
+      },
+    },
+    "packages/companion-mcp": {
+      "name": "@archon/companion-mcp",
+      "version": "0.3.10",
+      "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.29.0",
+        "zod": "4.3.6",
       },
     },
     "packages/core": {
@@ -356,6 +363,8 @@
     "@archon/canary-suite": ["@archon/canary-suite@workspace:packages/canary-suite"],
 
     "@archon/cli": ["@archon/cli@workspace:packages/cli"],
+
+    "@archon/companion-mcp": ["@archon/companion-mcp@workspace:packages/companion-mcp"],
 
     "@archon/core": ["@archon/core@workspace:packages/core"],
 
@@ -3018,6 +3027,8 @@
     "@antfu/ni/tinyexec": ["tinyexec@1.0.2", "", {}, "sha512-W/KYk+NFhkmsYpuHq5JykngiOCnxeVL8v8dFnqxSD8qEEdRfXk1SDM6JzNqcERbcGYj9tMrDQBYV9cjgnunFIg=="],
 
     "@anthropic-ai/claude-agent-sdk/zod": ["zod@4.3.6", "", {}, "sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg=="],
+
+    "@archon/companion-mcp/zod": ["zod@4.3.6", "", {}, "sha512-rftlrkhHZOcjDwkGlnUtZZkvaPHCsDATp4pGpuOOMDaTdDDXF91wuVDJoWoPsKX/3YPQ5fHuF3STjcYyKr+Qhg=="],
 
     "@archon/docs-web/zod": ["zod@4.6.7", "", {}, "sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg=="],
 
