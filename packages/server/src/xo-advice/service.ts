@@ -104,12 +104,16 @@ export class OpenRouterAdviceClient implements AdviceClient {
   ) {
     if (!key.trim()) throw new Error('advice_key_unconfigured');
   }
-  private async request(path: string, payload?: ModelRequest): Promise<unknown> {
+  private async request(
+    path: string,
+    payload?: ModelRequest,
+    timeoutMs = 150_000
+  ): Promise<unknown> {
     const response = await this.fetchImpl('https://openrouter.ai/api/v1/' + path, {
       method: payload ? 'POST' : 'GET',
       headers: { Authorization: 'Bearer ' + this.key, 'Content-Type': 'application/json' },
       body: payload ? JSON.stringify(payload) : undefined,
-      signal: AbortSignal.timeout(150_000),
+      signal: AbortSignal.timeout(timeoutMs),
       redirect: 'error',
     });
     if (!response.ok) throw new Error('advice_provider_http_' + response.status);
@@ -155,9 +159,14 @@ export class OpenRouterAdviceClient implements AdviceClient {
   ): Promise<{ id: string; model: string; provider_name: string; total_cost: number }> {
     // Only metadata GETs may be repeated: generation receipts are eventually
     // consistent. Never retry a paid generation, change model or release reserve.
-    for (let attempt = 0; attempt < 8; attempt++) {
+    const deadline = Date.now() + 90_000;
+    for (let attempt = 0; attempt < 45 && Date.now() < deadline; attempt++) {
       try {
-        const raw = await this.request('generation?id=' + encodeURIComponent(id));
+        const raw = await this.request(
+          'generation?id=' + encodeURIComponent(id),
+          undefined,
+          Math.min(5000, Math.max(1, deadline - Date.now()))
+        );
         return z
           .object({
             data: z.object({
@@ -170,12 +179,14 @@ export class OpenRouterAdviceClient implements AdviceClient {
           .parse(raw).data;
       } catch (error) {
         if (
-          attempt === 7 ||
+          attempt === 44 ||
+          Date.now() >= deadline ||
           !(error instanceof Error) ||
-          !/^advice_provider_http_(404|408|429|503)$/.test(error.message)
+          (!/^advice_provider_http_(404|408|429|503)$/.test(error.message) &&
+            !['TimeoutError', 'AbortError'].includes(error.name))
         )
           throw error;
-        await Bun.sleep(1000);
+        await Bun.sleep(Math.min(1000, Math.max(0, deadline - Date.now())));
       }
     }
     throw new Error('provider_receipt_unverified');

@@ -50,7 +50,7 @@ All paid runs share the pinned campaign file `~/Downloads/terra-xo-lane-approval
 
 The HTTP runner verifies operator/Board refusal, strict body validation, stale fence, Terra-only routine work, duplicate refusal, independent Terra+Sol important work and the shared cap. Paid source packets contain a small fresh GitHub capture, not evaluation cases. It records model IDs, input hashes, receipts, ledger, source hashes and source commit. Keep reports and ledger private locally; no API secret is included.
 
-Generation receipts can lag the completed answer. The client repeats only bounded read-only metadata GETs, never paid POSTs, while retaining full reservations. If the window expires, the campaign stops. After the receipt becomes available, the explicit operator command below fetches only recorded generation IDs from the pinned pilot and reconciles matching identity/provider/cost. It does not reset the cap, reopen an incomplete request, replay an answer or create another campaign:
+Generation receipts can lag the completed answer. The client repeats only read-only metadata GETs within a90-second deadline (45 attempts maximum, 5-second native fetch bound), never paid POSTs, while retaining full reservations. If the window expires, the campaign stops. After the receipt becomes available, the explicit operator command below fetches only recorded generation IDs from the pinned pilot and reconciles matching identity/provider/cost. It does not reset the cap, reopen an incomplete request, replay an answer or create another campaign:
 
 ```powershell
 bun run scripts/staging/xo-advice-reconcile.ts
