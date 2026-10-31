@@ -228,6 +228,7 @@ import {
   DispatchPrincipalAuthError,
   authenticateDispatchPrincipal,
   parseDispatchPrincipalsRegistry,
+  type DispatchPrincipalCredential,
   type DispatchSenderAuthMode,
 } from '../auth/dispatch-principal';
 import { createLogger as createDispatchRouteLogger } from '@archon/paths';
@@ -2916,6 +2917,8 @@ export function registerApiRoutes(
   canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot,
   dispatchMailboxActorResolvedHook?: () => Promise<void>
 ): void {
+  const dispatchPrincipalTransportCredentials = new WeakMap<Request, DispatchPrincipalCredential>();
+
   // The readings route refs this component instead of validating with it.
   app.openAPIRegistry.register('FuelglassReadingPushBody', fuelglassReadingPushBodySchema);
 
@@ -3280,6 +3283,36 @@ export function registerApiRoutes(
     };
   }
 
+  function dispatchPrincipalHeaderPresent(c: Context): boolean {
+    const headers = c.req.raw.headers;
+    return headers.has('x-dispatch-principal-id') || headers.has('x-dispatch-principal-token');
+  }
+
+  function isDispatchPrincipalTransportRoute(method: string, path: string): boolean {
+    if (path === '/api/dispatch/messages' && (method === 'GET' || method === 'POST')) return true;
+    return method === 'POST' && /^\/api\/dispatch\/messages\/[^/]+\/ack$/.test(path);
+  }
+
+  function principalTransportListRecipient(
+    c: Context,
+    credential: DispatchPrincipalCredential
+  ): { ok: true; recipient: string } | { ok: false; response: Response } {
+    if (!credential.roles.includes('receive')) {
+      return { ok: false, response: apiError(c, 403, 'dispatch_principal_forbidden') };
+    }
+    let params: URLSearchParams;
+    try {
+      params = new URL(c.req.url, 'http://127.0.0.1').searchParams;
+    } catch {
+      return { ok: false, response: apiError(c, 403, 'dispatch_principal_forbidden') };
+    }
+    const recipient = canonicalDispatchListRecipient(params);
+    if (recipient === null || !credential.receive_as.includes(recipient)) {
+      return { ok: false, response: apiError(c, 403, 'dispatch_principal_forbidden') };
+    }
+    return { ok: true, recipient };
+  }
+
   app.use('/api/*', cors({ origin: process.env.WEB_UI_ORIGIN || '*' }));
 
   app.use('/api/*', async (c, next) => {
@@ -3291,11 +3324,45 @@ export function registerApiRoutes(
       return next();
     }
 
+    // A presented operator token that matches stays on the existing operator
+    // path, including when principal headers are also present. Any principal
+    // header, even empty, is classified before the Access-header predicate so
+    // matching Host and Access-email headers cannot promote that request.
+    const expectedToken = process.env.ARCHON_OPERATOR_TOKEN;
+    if (expectedToken && getPresentedOperatorToken(c) === expectedToken) {
+      return next();
+    }
+
+    if (dispatchPrincipalHeaderPresent(c)) {
+      if (!isDispatchPrincipalTransportRoute(c.req.method, c.req.path)) {
+        return apiError(c, 403, 'dispatch_principal_forbidden');
+      }
+      try {
+        const credential = authenticateDispatchPrincipal({
+          principal_id: c.req.header('x-dispatch-principal-id'),
+          token: c.req.header('x-dispatch-principal-token'),
+          require_send_role: false,
+        });
+        dispatchPrincipalTransportCredentials.set(c.req.raw, credential);
+      } catch (error) {
+        const mapped = mapDispatchPrincipalAuthError(c, error);
+        if (mapped) return mapped;
+        return apiError(c, 401, 'dispatch_principal_unauthorized');
+      }
+      if (c.req.method === 'GET' && c.req.path === '/api/dispatch/messages') {
+        const credential = dispatchPrincipalTransportCredentials.get(c.req.raw);
+        if (credential) {
+          const listed = principalTransportListRecipient(c, credential);
+          if (!listed.ok) return listed.response;
+        }
+      }
+      return next();
+    }
+
     if (isAllowedAccessEmail(c)) {
       return next();
     }
 
-    const expectedToken = process.env.ARCHON_OPERATOR_TOKEN;
     if (!expectedToken) {
       return apiError(
         c,
@@ -4656,6 +4723,29 @@ export function registerApiRoutes(
         return apiError(c, 400, assessment.reason ?? 'dispatch_message_body_rejected');
       }
       const canonicalBody = { ...body, recipient: body.recipient.trim().toLowerCase() };
+      const principalCredential = dispatchPrincipalTransportCredentials.get(c.req.raw);
+      if (principalCredential) {
+        if (canonicalBody.task_type !== 'agent_message' || canonicalBody.recipient === 'board') {
+          return apiError(c, 403, 'dispatch_principal_forbidden');
+        }
+        const capability = DispatchNonSystemCapability.fromAuthenticatedRequest({
+          principal_id: c.req.header('x-dispatch-principal-id'),
+          token: c.req.header('x-dispatch-principal-token'),
+          requested_sender: canonicalBody.sender,
+        });
+        const message = await dispatchDb.createAuthenticatedMessage(capability, {
+          correlation_id: canonicalBody.correlation_id,
+          idempotency_key: canonicalBody.idempotency_key,
+          task_type: canonicalBody.task_type,
+          recipient: canonicalBody.recipient,
+          body: canonicalBody.body,
+          not_before: canonicalBody.not_before ?? null,
+          priority: canonicalBody.priority,
+          subject_key: canonicalBody.subject_key,
+          repeat_reason: canonicalBody.repeat_reason,
+        });
+        return c.json(message);
+      }
       if (canonicalBody.task_type === 'board_motion') {
         const { capability, principal } = await DispatchNonSystemCapability.fromBoardProof({
           proof: boardPrincipalProofFromHeaders(c),
@@ -4768,6 +4858,38 @@ export function registerApiRoutes(
   });
 
   registerOpenApiRoute(listDispatchMessagesRoute, async c => {
+    const principalCredential = dispatchPrincipalTransportCredentials.get(c.req.raw);
+    if (principalCredential) {
+      const listed = principalTransportListRecipient(c, principalCredential);
+      if (!listed.ok) return listed.response;
+      const selection = parseDispatchListSelection(c.req.url);
+      if (selection.kind === 'invalid') {
+        return apiError(c, 400, 'dispatch_list_selector_invalid');
+      }
+      try {
+        if (selection.kind === 'legacy') {
+          const rawLimit = Number.parseInt(c.req.query('limit') ?? '100', 10);
+          const messages = await dispatchDb.listMessages({
+            recipient: listed.recipient,
+            status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
+            subject_key: c.req.query('subject_key') ?? undefined,
+            route_disposition: c.req.query('route_disposition') as
+              | dispatchDb.DispatchRouteDisposition
+              | undefined,
+            limit: Number.isFinite(rawLimit) ? rawLimit : 100,
+            allowBoardAlias: false,
+          });
+          return c.json(messages);
+        }
+        if (selection.recipient !== listed.recipient) {
+          return apiError(c, 403, 'dispatch_principal_forbidden');
+        }
+        return c.json(await loadSelectedDispatchMessages(selection));
+      } catch (error) {
+        getLog().error({ err: error }, 'dispatch_list_messages_failed');
+        return apiError(c, 500, 'Failed to list dispatch messages');
+      }
+    }
     const selection = parseDispatchListSelection(c.req.url);
     if (selection.kind === 'invalid') {
       return apiError(c, 400, 'dispatch_list_selector_invalid');
@@ -4852,6 +4974,10 @@ export function registerApiRoutes(
   registerOpenApiRoute(acknowledgeDispatchMessageRoute, async c => {
     try {
       const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
+      const principalCredential = dispatchPrincipalTransportCredentials.get(c.req.raw);
+      if (principalCredential && !principalCredential.roles.includes('receive')) {
+        return apiError(c, 403, 'dispatch_principal_forbidden');
+      }
       const { actor, bind } = await resolveDispatchMailboxActor(c);
       if (
         body.principal_id !== undefined &&
@@ -4859,6 +4985,17 @@ export function registerApiRoutes(
         body.principal_id !== bind?.holder_principal_id
       )
         return apiError(c, 409, 'actor_mismatch');
+      if (principalCredential) {
+        const existing = await dispatchDb.getMessage(c.req.param('id') ?? '');
+        if (existing) {
+          const mailboxRecipient = (existing.resolved_recipient ?? existing.recipient)
+            .trim()
+            .toLowerCase();
+          if (!principalCredential.receive_as.includes(mailboxRecipient)) {
+            return apiError(c, 403, 'dispatch_principal_forbidden');
+          }
+        }
+      }
       const result = await dispatchDb.acknowledgeMessage({
         id: c.req.param('id') ?? '',
         principal_id: actor,
