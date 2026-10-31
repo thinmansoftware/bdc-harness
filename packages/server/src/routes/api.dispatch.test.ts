@@ -2421,6 +2421,97 @@ describe('dispatch API', () => {
     expect(text).not.toContain('OTHER-SECRET');
   });
 
+  test('non-queued after_seq rejects an unsafe or non-monotonic cursor', async () => {
+    await insertSyntheticDispatch({
+      id: 'safe-2',
+      recipient: 'grokbot',
+      correlationId: 'safe-2-corr',
+      seq: 2,
+      body: 'SAFE-CURSOR-2',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'safe-5',
+      recipient: 'grokbot',
+      correlationId: 'safe-5-corr',
+      seq: 5,
+      body: 'SAFE-CURSOR-5',
+      acknowledged: false,
+    });
+    const app = makeApp();
+    const safeResponse = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&limit=50'
+    );
+    expect(safeResponse.status).toBe(200);
+    const safePage = (await safeResponse.json()) as {
+      messages: Array<{ id: string }>;
+      next_after_seq: number;
+      page_full: boolean;
+    };
+    expect(safePage.messages.map(message => message.id)).toEqual(['safe-2', 'safe-5']);
+    expect(safePage.next_after_seq).toBe(5);
+    expect(Number.isSafeInteger(safePage.next_after_seq)).toBe(true);
+    expect(safePage.page_full).toBe(false);
+    expect(JSON.stringify(safePage)).not.toContain('cursor_seq');
+
+    await insertSyntheticDispatch({
+      id: 'dup-a',
+      recipient: 'codex',
+      correlationId: 'dup-a-corr',
+      seq: 8,
+      body: 'DUP-A-SECRET',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'dup-b',
+      recipient: 'codex',
+      correlationId: 'dup-b-corr',
+      seq: 8,
+      body: 'DUP-B-SECRET',
+      acknowledged: false,
+    });
+    const duplicate = await app.request(
+      '/api/dispatch/messages?recipient=codex&after_seq=0&limit=50'
+    );
+    expect(duplicate.status).toBe(500);
+    const duplicateBody = await duplicate.json();
+    expect(duplicateBody).toEqual({ error: 'Failed to list dispatch messages' });
+    const duplicateText = JSON.stringify(duplicateBody);
+    expect(duplicateText).not.toContain('DUP-A-SECRET');
+    expect(duplicateText).not.toContain('DUP-B-SECRET');
+    expect(duplicateText).not.toContain('next_after_seq');
+
+    await insertSyntheticDispatch({
+      id: 'unsafe-cursor',
+      recipient: 'operator',
+      correlationId: 'unsafe-cursor-corr',
+      seq: 1,
+      body: 'UNSAFE-CURSOR-SECRET',
+      acknowledged: false,
+    });
+    await db.query('UPDATE agent_dispatch_messages SET seq = $1 WHERE id = $2', [
+      '9007199254740993',
+      'unsafe-cursor',
+    ]);
+    const stored = await db.query<{ cursor_seq: unknown }>(
+      'SELECT seq AS cursor_seq FROM agent_dispatch_messages WHERE id = $1',
+      ['unsafe-cursor']
+    );
+    const storedCursor = Number(stored.rows[0]?.cursor_seq);
+    expect(Number.isFinite(storedCursor)).toBe(true);
+    expect(Number.isSafeInteger(storedCursor)).toBe(false);
+    const unsafe = await app.request(
+      '/api/dispatch/messages?recipient=operator&after_seq=0&limit=50'
+    );
+    expect(unsafe.status).toBe(500);
+    const unsafeBody = await unsafe.json();
+    expect(unsafeBody).toEqual({ error: 'Failed to list dispatch messages' });
+    const unsafeText = JSON.stringify(unsafeBody);
+    expect(unsafeText).not.toContain('UNSAFE-CURSOR-SECRET');
+    expect(unsafeText).not.toContain('9007199254740992');
+    expect(unsafeText).not.toContain('next_after_seq');
+  });
+
   test('test121 returns own correlation replies behind unrelated history', async () => {
     for (let index = 0; index < 501; index += 1) {
       await insertSyntheticDispatch({

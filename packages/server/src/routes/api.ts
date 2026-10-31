@@ -2951,7 +2951,13 @@ async function loadSelectedDispatchMessages(
   const messages: dispatchDb.DispatchMessage[] = [];
   let nextAfterSeq = selection.afterSeq;
   for (const row of rows) {
-    if (!Number.isFinite(row.cursor_seq)) {
+    // Same contract as walkQueuedDispatchCursorPage: the response schema only
+    // allows a safe nonnegative integer, and each row must advance the cursor.
+    if (
+      !Number.isSafeInteger(row.cursor_seq) ||
+      row.cursor_seq < 0 ||
+      row.cursor_seq <= nextAfterSeq
+    ) {
       throw new Error('dispatch_cursor_not_finite');
     }
     const { cursor_seq: cursorSeq, ...message } = row;
