@@ -1,9 +1,12 @@
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { describe, expect, test } from 'bun:test';
 
 import { COMPANION_REQUEST_NOTE } from './constants';
 import { DispatchClient } from './dispatch-client';
+import { ToolFailure } from './errors';
 import { loadCompanionRegistry } from './registry';
 import {
   callToolText,
@@ -16,6 +19,7 @@ import {
   type RecordedHttpRequest,
 } from './test-harness';
 import { executeTool } from './tools/execute';
+import { mailboxList, mailboxRead } from './tools/mailbox';
 import { TrackedTree } from './tracked-tree';
 
 const BEARER_TAIL = 'Authorization: Bearer abcdefghijklmnop';
@@ -516,6 +520,213 @@ describe('wiki oracle and mailbox tools', () => {
       await harness.cleanup();
       if (previousOperatorToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
       else process.env.ARCHON_OPERATOR_TOKEN = previousOperatorToken;
+    }
+  });
+
+  test('test119 direct id and cursor interoperate with the selected route', async () => {
+    const previousHome = process.env.ARCHON_HOME;
+    const previousDatabaseUrl = process.env.DATABASE_URL;
+    const previousOperatorToken = process.env.ARCHON_OPERATOR_TOKEN;
+    const home = await mkdtemp(join(tmpdir(), 'companion-selected-route-'));
+    const nativeFetch = globalThis.fetch;
+    const harness = await createHarness();
+    let server: { stop: (closeActiveConnections?: boolean) => void } | undefined;
+    let closeDatabase: (() => Promise<void>) | undefined;
+    let resetDatabase: (() => void) | undefined;
+    try {
+      // The selected route keeps the outer operator gate. Unset it here so the
+      // companion's own principal headers are what reach the route.
+      process.env.ARCHON_HOME = home;
+      delete process.env.DATABASE_URL;
+      delete process.env.ARCHON_OPERATOR_TOKEN;
+
+      const connection = await import('../../core/src/db/connection.ts');
+      closeDatabase = connection.closeDatabase;
+      resetDatabase = connection.resetDatabase;
+      await connection.closeDatabase();
+      connection.resetDatabase();
+      const db = connection.getDatabase();
+
+      async function insertRow(input: {
+        id: string;
+        recipient: string;
+        correlationId: string;
+        seq: number;
+        body: string;
+        acknowledged: boolean;
+      }): Promise<void> {
+        const createdAt = new Date(Date.UTC(2020, 0, 1) + input.seq * 1000).toISOString();
+        await db.query(
+          `INSERT INTO agent_dispatch_messages (
+             id, correlation_id, idempotency_key, task_type, sender, recipient, body, status,
+             created_at, priority, fencing_token, acknowledged_at, acknowledged_by, not_before, seq
+           ) VALUES (
+             $1, $2, $3, 'agent_message', 'xo', $4, $5, 'queued', $6, 'normal', 0, $7, $8, $9, $10
+           )`,
+          [
+            input.id,
+            input.correlationId,
+            `idem-${input.id}`,
+            input.recipient,
+            input.body,
+            createdAt,
+            input.acknowledged ? createdAt : null,
+            input.acknowledged ? input.recipient : null,
+            null,
+            input.seq,
+          ]
+        );
+      }
+
+      for (let index = 0; index < 501; index += 1) {
+        await insertRow({
+          id: `old-${index}`,
+          recipient: 'grokbot',
+          correlationId: `old-corr-${index}`,
+          seq: index + 1,
+          body: `OLD-BODY-${index}`,
+          acknowledged: true,
+        });
+      }
+      await insertRow({
+        id: 'newer-own',
+        recipient: 'grokbot',
+        correlationId: 'newer-corr',
+        seq: 600,
+        body: 'NEWER-OWN-BODY',
+        acknowledged: false,
+      });
+      await insertRow({
+        id: 'foreign-own-id',
+        recipient: 'xo',
+        correlationId: 'foreign-corr',
+        seq: 601,
+        body: 'FOREIGN-SECRET-BODY',
+        acknowledged: false,
+      });
+
+      const { OpenAPIHono } =
+        await import('../../server/node_modules/@hono/zod-openapi/dist/index.js');
+      const { validationErrorHook } = await import('../../server/src/routes/openapi-defaults.ts');
+      const { registerApiRoutes } = await import('../../server/src/routes/api.ts');
+      const app = new OpenAPIHono({ defaultHook: validationErrorHook });
+      registerApiRoutes(
+        app,
+        {
+          setConversationDbId(): void {},
+          async emitSSE(): Promise<void> {},
+          async emitLockEvent(): Promise<void> {},
+          registerStream(): void {},
+          removeStream(): void {},
+        } as never,
+        {
+          async acquireLock(_id: string, fn: () => Promise<void>): Promise<{ status: string }> {
+            await fn();
+            return { status: 'started' };
+          },
+          getStats(): { active: number; queued: number } {
+            return { active: 0, queued: 0 };
+          },
+        } as never
+      );
+      const listening = Bun.serve({
+        hostname: '127.0.0.1',
+        port: 0,
+        fetch: request => app.fetch(request),
+      });
+      server = listening;
+
+      const slot = loadCompanionRegistry(harness.configPath).slots.find(
+        entry => entry.companion_id === 'grokbot'
+      );
+      if (slot === undefined) {
+        throw new Error('missing grokbot slot');
+      }
+      const dispatch = new DispatchClient(`http://127.0.0.1:${listening.port}`);
+      const requestedUrls: string[] = [];
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url =
+          typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        const headers = new Headers(
+          init?.headers ?? (input instanceof Request ? input.headers : undefined)
+        );
+        expect(headers.get('authorization')).toBeNull();
+        expect(headers.get('x-archon-operator-token')).toBeNull();
+        expect(headers.get('x-dispatch-principal-id')).toBe('grokbot');
+        expect(headers.get('x-dispatch-principal-token')).toBe(harness.dispatchToken);
+        requestedUrls.push(url);
+        return nativeFetch(input, init);
+      }) as typeof fetch;
+
+      const legacy = await dispatch.list(slot, 'queued');
+      expect(legacy).toHaveLength(500);
+      expect(legacy.map(message => message.id)).not.toContain('newer-own');
+      expect(JSON.stringify(legacy)).not.toContain('FOREIGN-SECRET-BODY');
+      expect(JSON.stringify(legacy)).not.toContain('NEWER-OWN-BODY');
+
+      const read = await mailboxRead(dispatch, slot, 'newer-own');
+      expect(read).toMatchObject({
+        id: 'newer-own',
+        recipient: 'grokbot',
+        body: 'NEWER-OWN-BODY',
+      });
+
+      for (const hiddenId of ['foreign-own-id', 'missing-message']) {
+        try {
+          await mailboxRead(dispatch, slot, hiddenId);
+          throw new Error(`expected not_own_message for ${hiddenId}`);
+        } catch (error) {
+          expect(error).toBeInstanceOf(ToolFailure);
+          expect((error as ToolFailure).code).toBe('not_own_message');
+          expect(String(error)).not.toContain('FOREIGN-SECRET-BODY');
+        }
+      }
+
+      const first = await mailboxList(dispatch, slot, 'queued', 0);
+      expect(first.page_full).toBe(true);
+      expect(first.messages.map(message => message.id)).toEqual(
+        Array.from({ length: 500 }, (_unused, index) => `old-${index}`)
+      );
+      expect(first.next_after_seq).toBe(500);
+      expect(JSON.stringify(first)).not.toContain('FOREIGN-SECRET-BODY');
+      expect(JSON.stringify(first)).not.toContain('NEWER-OWN-BODY');
+
+      const second = await mailboxList(dispatch, slot, 'queued', first.next_after_seq);
+      expect(second.messages.map(message => message.id)).toEqual(['old-500', 'newer-own']);
+      expect(second.page_full).toBe(false);
+      expect(second.next_after_seq).toBe(600);
+      expect(second.messages.every(message => message.recipient === 'grokbot')).toBe(true);
+      expect(JSON.stringify(second)).not.toContain('FOREIGN-SECRET-BODY');
+
+      const empty = await mailboxList(dispatch, slot, 'queued', second.next_after_seq);
+      expect(empty).toEqual({
+        messages: [],
+        next_after_seq: second.next_after_seq,
+        page_full: false,
+      });
+
+      expect(requestedUrls.some(url => url.includes('message_id=newer-own'))).toBe(true);
+      expect(requestedUrls.some(url => url.includes('message_id=foreign-own-id'))).toBe(true);
+      expect(requestedUrls.some(url => url.includes('message_id=missing-message'))).toBe(true);
+      expect(requestedUrls.some(url => url.includes('after_seq=0'))).toBe(true);
+      expect(requestedUrls.some(url => url.includes('after_seq=500'))).toBe(true);
+      expect(requestedUrls.some(url => url.includes('after_seq=600'))).toBe(true);
+      expect(
+        requestedUrls.some(url => url.includes('limit=500') && !url.includes('after_seq='))
+      ).toBe(true);
+    } finally {
+      globalThis.fetch = nativeFetch;
+      if (previousHome === undefined) delete process.env.ARCHON_HOME;
+      else process.env.ARCHON_HOME = previousHome;
+      if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = previousDatabaseUrl;
+      if (previousOperatorToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
+      else process.env.ARCHON_OPERATOR_TOKEN = previousOperatorToken;
+      server?.stop(true);
+      if (closeDatabase !== undefined) await closeDatabase();
+      resetDatabase?.();
+      await rm(home, { recursive: true, force: true });
+      await harness.cleanup();
     }
   });
 

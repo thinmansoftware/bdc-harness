@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { createHash } from 'crypto';
 import { unlinkSync } from 'fs';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
 import { join } from 'path';
+import { BASE_TOOL_NAMES } from '../../../companion-mcp/src/constants';
+import { loadCompanionRegistry } from '../../../companion-mcp/src/registry';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
@@ -2599,33 +2603,173 @@ describe('dispatch API', () => {
       );
     }
 
-    await db.query(
-      `INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
-       VALUES ('synth-active-slot', 'Synthetic active slot', 'drain_on_start', 1)`
-    );
-    const accepted = await app.request('/api/dispatch/messages', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
-      body: JSON.stringify({
-        ...VALID_BODY,
-        idempotency_key: 'synth-active-create',
-        recipient: 'synth-active-slot',
-        body: 'delivery to an explicitly activated synthetic principal',
-      }),
-    });
-    expect(accepted.status).toBe(200);
-    expect(((await accepted.json()) as { recipient: string }).recipient).toBe('synth-active-slot');
+    const slotDir = await mkdtemp(join(tmpdir(), 'companion-configured-slot-'));
+    try {
+      const slotIds = ['dot', 'muse', 'duet', 'synth-active-slot'] as const;
+      const slotTokens = Object.fromEntries(slotIds.map(id => [id, `token-for-${id}`])) as Record<
+        (typeof slotIds)[number],
+        string
+      >;
+      const slots = [];
+      for (const id of slotIds) {
+        const credentialFile = join(slotDir, `${id}.dispatch`);
+        const digestFile = join(slotDir, `${id}.sha256`);
+        await writeFile(credentialFile, `${slotTokens[id]}\n`);
+        await writeFile(digestFile, `${sha(`bearer-for-${id}`)}\n`);
+        slots.push({
+          companion_id: id,
+          enabled: true,
+          dispatch_principal_id: id,
+          token_sha256_file: digestFile,
+          token_expires_at: '2099-01-01T00:00:00.000Z',
+          dispatch_credential_file: credentialFile,
+          tools: [...BASE_TOOL_NAMES],
+          allowed_recipients: ['astra'],
+          board_secretary: false,
+          board_seat_recipients: ['astra'],
+        });
+      }
+      const configPath = join(slotDir, 'companions.json');
+      await writeFile(configPath, JSON.stringify({ slots }));
+      const loaded = loadCompanionRegistry(configPath);
+      expect(loaded.slots.map(slot => [slot.companion_id, slot.enabled])).toEqual(
+        slotIds.map(id => [id, true])
+      );
+      for (const id of slotIds) {
+        const slot = loaded.byPrincipal.get(id);
+        expect(slot?.enabled).toBe(true);
+        expect((await readFile(slot?.dispatch_credential_file ?? '', 'utf8')).trim()).toBe(
+          slotTokens[id]
+        );
+      }
 
-    const stillInactive = await db.query<{ principal_id: string; active: number }>(
-      `SELECT principal_id, active FROM dispatch_principals
-       WHERE principal_id IN ('dot', 'muse', 'duet')
-       ORDER BY principal_id`
-    );
-    expect(stillInactive.rows).toEqual([
-      { principal_id: 'dot', active: 0 },
-      { principal_id: 'duet', active: 0 },
-      { principal_id: 'muse', active: 0 },
-    ]);
-    expect((await db.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(1);
+      const afterConfig = await db.query<{ principal_id: string; active: number }>(
+        `SELECT principal_id, active FROM dispatch_principals
+         WHERE principal_id IN ('dot', 'muse', 'duet')
+         ORDER BY principal_id`
+      );
+      expect(afterConfig.rows).toEqual([
+        { principal_id: 'dot', active: 0 },
+        { principal_id: 'duet', active: 0 },
+        { principal_id: 'muse', active: 0 },
+      ]);
+
+      const priorRegistry = JSON.parse(process.env.DISPATCH_PRINCIPALS_JSON ?? '[]') as unknown[];
+      process.env.DISPATCH_SENDER_AUTH_MODE = 'enforce';
+      process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+        ...priorRegistry,
+        ...slotIds.map(id => ({
+          credential_id: `configured-${id}`,
+          principal_id: id,
+          token_sha256: sha(slotTokens[id]),
+          status: 'active',
+          send_as: [id],
+          receive_as: [id],
+          roles: ['send', 'receive'],
+        })),
+      ]);
+
+      async function postSlot(
+        principalId: string,
+        token: string | undefined,
+        idempotencyKey: string
+      ): Promise<Response> {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'x-archon-operator-token': 'secret-token',
+        };
+        if (token !== undefined) {
+          headers['x-dispatch-principal-id'] = principalId;
+          headers['x-dispatch-principal-token'] = token;
+        }
+        return app.request('/api/dispatch/messages', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            ...VALID_BODY,
+            sender: principalId,
+            recipient: principalId,
+            idempotency_key: idempotencyKey,
+            body: `synthetic delivery for ${principalId}`,
+          }),
+        });
+      }
+
+      for (const recipient of ['dot', 'muse', 'duet'] as const) {
+        const rejected = await postSlot(
+          recipient,
+          slotTokens[recipient],
+          `configured-${recipient}`
+        );
+        expect(rejected.status).toBe(400);
+        expect(((await rejected.json()) as { error: string }).error).toBe(
+          'dispatch_recipient_rejected:inactive_principal'
+        );
+      }
+
+      await db.query(
+        `INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
+         VALUES ('synth-active-slot', 'Synthetic active slot', 'drain_on_start', 0)`
+      );
+      const inactiveSynth = await postSlot(
+        'synth-active-slot',
+        slotTokens['synth-active-slot'],
+        'synth-inactive-configured'
+      );
+      expect(inactiveSynth.status).toBe(400);
+      expect(((await inactiveSynth.json()) as { error: string }).error).toBe(
+        'dispatch_recipient_rejected:inactive_principal'
+      );
+
+      await db.query(
+        `UPDATE dispatch_principals SET active = 1 WHERE principal_id = 'synth-active-slot'`
+      );
+      const operatorOnly = await postSlot(
+        'synth-active-slot',
+        undefined,
+        'synth-operator-token-only'
+      );
+      expect(operatorOnly.status).toBe(401);
+      expect(((await operatorOnly.json()) as { error: string }).error).toBe(
+        'dispatch_principal_missing'
+      );
+      const wrongCredential = await postSlot(
+        'synth-active-slot',
+        'not-the-slot-credential',
+        'synth-wrong-credential'
+      );
+      expect(wrongCredential.status).toBe(401);
+      expect(((await wrongCredential.json()) as { error: string }).error).toBe(
+        'dispatch_principal_unauthorized'
+      );
+
+      const accepted = await postSlot(
+        'synth-active-slot',
+        (await readFile(join(slotDir, 'synth-active-slot.dispatch'), 'utf8')).trim(),
+        'synth-active-create'
+      );
+      expect(accepted.status).toBe(200);
+      expect((await accepted.json()) as { recipient: string; sender_principal_id: string }).toEqual(
+        expect.objectContaining({
+          recipient: 'synth-active-slot',
+          sender: 'synth-active-slot',
+          sender_principal_id: 'synth-active-slot',
+        })
+      );
+
+      const stillInactive = await db.query<{ principal_id: string; active: number }>(
+        `SELECT principal_id, active FROM dispatch_principals
+         WHERE principal_id IN ('dot', 'muse', 'duet')
+         ORDER BY principal_id`
+      );
+      expect(stillInactive.rows).toEqual([
+        { principal_id: 'dot', active: 0 },
+        { principal_id: 'duet', active: 0 },
+        { principal_id: 'muse', active: 0 },
+      ]);
+      expect((await db.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(1);
+    } finally {
+      await rm(slotDir, { recursive: true, force: true });
+    }
   });
 });
