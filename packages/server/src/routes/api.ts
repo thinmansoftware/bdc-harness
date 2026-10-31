@@ -3320,23 +3320,21 @@ export function registerApiRoutes(
       return next();
     }
 
-    // Classify every principal-header request before the operator-auth
-    // bypasses. ARCHON_OPERATOR_AUTH_DISABLED and an unconfigured operator
-    // token must not let empty, partial, or otherwise malformed principal
-    // headers reach legacy handlers. A matching operator token stays on the
-    // operator path only while operator auth is actually enforced, including
-    // when principal headers are also present. Any principal header, even
-    // empty, is classified before the Access-header predicate so matching
-    // Host and Access-email headers cannot promote that request.
+    // Strict principal classification applies only when the request does not
+    // present the configured operator token. An exact ARCHON_OPERATOR_TOKEN
+    // match stays on the operator path even if ARCHON_OPERATOR_AUTH_DISABLED
+    // is set or operator-token enforcement is off, including when principal
+    // headers are also present. Absent that exact token, classify every
+    // principal-header request before the operator-auth bypasses so disabled
+    // auth and an unconfigured operator token cannot let empty, partial, or
+    // otherwise malformed principal headers reach legacy handlers. Any
+    // principal header, even empty, is classified before the Access-header
+    // predicate so matching Host and Access-email headers cannot promote
+    // that request.
     const authDisabled = operatorAuthDisabled();
     const tokenRequired = privateApiRequiresOperatorToken();
     const expectedToken = process.env.ARCHON_OPERATOR_TOKEN;
-    if (
-      !authDisabled &&
-      tokenRequired &&
-      expectedToken &&
-      getPresentedOperatorToken(c) === expectedToken
-    ) {
+    if (expectedToken && getPresentedOperatorToken(c) === expectedToken) {
       return next();
     }
 

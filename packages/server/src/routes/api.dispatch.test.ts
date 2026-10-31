@@ -3895,6 +3895,16 @@ describe('dispatch API', () => {
 
         for (const bypass of bypasses) {
           const { app, name } = bypass;
+          // makeApp() mutates process.env while the apps are constructed, and
+          // the middleware reads that env per request. Re-apply the bypass
+          // under test immediately before its requests.
+          if (name === 'auth-disabled') {
+            process.env.ARCHON_OPERATOR_AUTH_DISABLED = 'true';
+            process.env.ARCHON_OPERATOR_TOKEN = 'secret-token';
+          } else {
+            delete process.env.ARCHON_OPERATOR_AUTH_DISABLED;
+            delete process.env.ARCHON_OPERATOR_TOKEN;
+          }
           const emptyHeaders = new Headers({ 'Content-Type': 'application/json' });
           emptyHeaders.set('x-dispatch-principal-id', '');
           emptyHeaders.set('x-dispatch-principal-token', '');
@@ -3983,10 +3993,40 @@ describe('dispatch API', () => {
             ((await headerless.json()) as { sender_principal_id: string | null })
               .sender_principal_id
           ).toBeNull();
+
+          if (name === 'no-operator-token') {
+            const presentedUnconfigured = await app.request('/api/dispatch/status', {
+              headers: principalHeaders('grokbot', grokbotToken, {
+                'x-archon-operator-token': 'secret-token',
+              }),
+            });
+            const presentedBody = await readError(presentedUnconfigured);
+            expect(presentedUnconfigured.status).toBe(403);
+            expect(presentedBody.error).toBe('dispatch_principal_forbidden');
+            expect(presentedBody.text.includes(foreignBody)).toBe(false);
+          }
         }
 
         process.env.ARCHON_OPERATOR_AUTH_DISABLED = 'true';
         const disabledWithToken = makeApp('secret-token');
+        const operatorHeaders = principalHeaders('grokbot', grokbotToken, {
+          'x-archon-operator-token': 'secret-token',
+        });
+        const operatorReport = await postMessage(disabledWithToken, operatorHeaders, {
+          task_type: 'run_report',
+          idempotency_key: 'bypass-disabled-operator-report',
+          body: 'Operator report.',
+        });
+        expect(operatorReport.status).toBe(200);
+        expect(((await operatorReport.json()) as { task_type: string }).task_type).toBe(
+          'run_report'
+        );
+
+        const operatorStatus = await disabledWithToken.request('/api/dispatch/status', {
+          headers: operatorHeaders,
+        });
+        expect(operatorStatus.status).toBe(200);
+
         const mixedPartial = await postMessage(
           disabledWithToken,
           principalHeaders('grokbot', undefined, { 'x-archon-operator-token': 'secret-token' }),
@@ -4002,6 +4042,13 @@ describe('dispatch API', () => {
             ])
           ).rowCount
         ).toBe(0);
+
+        const partialStatus = await disabledWithToken.request('/api/dispatch/status', {
+          headers: principalHeaders('grokbot', undefined, {
+            'x-archon-operator-token': 'secret-token',
+          }),
+        });
+        expect(partialStatus.status).toBe(200);
       } finally {
         restoreEnv('ARCHON_OPERATOR_AUTH_DISABLED', priorAuthDisabled);
         restoreEnv('NODE_ENV', priorNodeEnv);
