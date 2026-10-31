@@ -4140,6 +4140,40 @@ describe('dispatch API', () => {
             ).rowCount
           ).toBe(0);
 
+          const emptyAccessList = await app.request(listUrl({ recipient: 'codex' }), {
+            headers: emptyAccessHeaders,
+          });
+          const emptyAccessListBody = await readError(emptyAccessList);
+          expect(emptyAccessList.status).toBe(401);
+          expect(emptyAccessListBody.error).toBe('dispatch_principal_missing');
+          expectNoSecret(emptyAccessListBody.text, grokbotToken);
+          expect(emptyAccessListBody.text.includes(foreignBody)).toBe(false);
+
+          const emptyAccessReport = await app.request('/api/dispatch/messages', {
+            method: 'POST',
+            headers: emptyAccessHeaders,
+            body: JSON.stringify({
+              ...VALID_BODY,
+              sender: 'grokbot',
+              recipient: 'grokbot',
+              task_type: 'run_report',
+              body: 'Report on the latest CI failure.',
+              idempotency_key: `bypass-empty-access-report-${name}`,
+            }),
+          });
+          const emptyAccessReportBody = await readError(emptyAccessReport);
+          expect(emptyAccessReport.status).toBe(401);
+          expect(emptyAccessReportBody.error).toBe('dispatch_principal_missing');
+          expectNoSecret(emptyAccessReportBody.text, grokbotToken);
+          expect(emptyAccessReportBody.text.includes(foreignBody)).toBe(false);
+          expect(
+            (
+              await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+                `bypass-empty-access-report-${name}`,
+              ])
+            ).rowCount
+          ).toBe(0);
+
           const partialAccess = await postMessage(
             app,
             principalHeaders('grokbot', undefined, accessExtra),
@@ -4150,6 +4184,28 @@ describe('dispatch API', () => {
           expect(partialAccessBody.error).toBe('dispatch_principal_partial');
           expectNoSecret(partialAccessBody.text, grokbotToken);
           expect(partialAccessBody.text.includes(foreignBody)).toBe(false);
+
+          const partialAccessReport = await postMessage(
+            app,
+            principalHeaders('grokbot', undefined, accessExtra),
+            {
+              task_type: 'run_report',
+              idempotency_key: `bypass-partial-access-report-${name}`,
+              body: 'Report on the latest CI failure.',
+            }
+          );
+          const partialAccessReportBody = await readError(partialAccessReport);
+          expect(partialAccessReport.status).toBe(401);
+          expect(partialAccessReportBody.error).toBe('dispatch_principal_partial');
+          expectNoSecret(partialAccessReportBody.text, grokbotToken);
+          expect(partialAccessReportBody.text.includes(foreignBody)).toBe(false);
+          expect(
+            (
+              await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+                `bypass-partial-access-report-${name}`,
+              ])
+            ).rowCount
+          ).toBe(0);
 
           const partialAccessList = await app.request(listUrl({ recipient: 'codex' }), {
             headers: principalHeaders('grokbot', undefined, accessExtra),
