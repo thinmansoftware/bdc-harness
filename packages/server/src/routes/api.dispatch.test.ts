@@ -3531,6 +3531,120 @@ describe('dispatch API', () => {
         );
         expect(badCursor.status).toBe(400);
         expect((await readError(badCursor)).error).toBe('dispatch_list_selector_invalid');
+
+        const shapes: Array<{
+          name: 'legacy' | 'message_id' | 'correlation_id' | 'after_seq';
+          selector: Record<string, string>;
+        }> = [
+          { name: 'legacy', selector: {} },
+          { name: 'message_id', selector: { message_id: own.id } },
+          { name: 'correlation_id', selector: { correlation_id: 'principal-corr' } },
+          { name: 'after_seq', selector: { after_seq: '0' } },
+        ];
+        const workerHeaderFields = {
+          'x-dispatch-worker-credential-id': 'board-worker-1',
+          'x-dispatch-worker-token': 'worker-secret',
+          'x-dispatch-worker-id': 'worker-a',
+        };
+        for (const withWorker of [false, true]) {
+          const matrixHeaders = withWorker
+            ? { ...requestHeaders, ...workerHeaderFields }
+            : requestHeaders;
+          for (const shape of shapes) {
+            useRegistry([fullGrokbot()]);
+            const shapeList = await app.request(
+              listUrl({ recipient: 'grokbot', ...shape.selector }),
+              {
+                headers: matrixHeaders,
+              }
+            );
+            expect(shapeList.status).toBe(200);
+            const shapeText = await shapeList.text();
+            expect(shapeText.includes(foreignBody)).toBe(false);
+            expect(shapeText.includes(boardAliasBody)).toBe(false);
+            if (shape.name === 'after_seq') {
+              const cursor = JSON.parse(shapeText) as {
+                messages: Array<{ id: string }>;
+                next_after_seq: number;
+                page_full: boolean;
+              };
+              expect(Array.isArray(cursor.messages)).toBe(true);
+              expect(typeof cursor.next_after_seq).toBe('number');
+              expect(typeof cursor.page_full).toBe('boolean');
+              expect(cursor.messages.map(row => row.id)).toContain(own.id);
+              expect(cursor.messages.map(row => row.id)).not.toContain(foreignId);
+              expect(cursor.messages.map(row => row.id)).not.toContain('board-alias-foreign');
+            } else {
+              const rows = JSON.parse(shapeText) as Array<{ id: string }>;
+              expect(Array.isArray(rows)).toBe(true);
+              expect(rows.map(row => row.id)).toContain(own.id);
+              expect(rows.map(row => row.id)).not.toContain(foreignId);
+              expect(rows.map(row => row.id)).not.toContain('board-alias-foreign');
+            }
+
+            const denials: Array<Record<string, string | string[]>> = [
+              { ...shape.selector },
+              { recipient: '', ...shape.selector },
+              { recipient: '   ', ...shape.selector },
+              { recipient: 'codex', ...shape.selector },
+              { recipient: ['grokbot', 'codex'], ...shape.selector },
+              { recipient: 'board', ...shape.selector },
+            ];
+            for (const query of denials) {
+              const denied = await app.request(listUrl(query), { headers: matrixHeaders });
+              const deniedBody = await readError(denied);
+              expect(denied.status).toBe(403);
+              expect(deniedBody.error).toBe('dispatch_principal_forbidden');
+              expect(deniedBody.text.includes(foreignBody)).toBe(false);
+              expect(deniedBody.text.includes(boardAliasBody)).toBe(false);
+              expect(deniedBody.text.includes(ownBody)).toBe(false);
+              expectNoSecret(deniedBody.text, grokbotToken);
+            }
+
+            useRegistry([
+              record({
+                credential_id: 'grokbot-send-only',
+                principal_id: 'grokbot',
+                token: sendOnlyToken,
+                send_as: ['grokbot'],
+                receive_as: ['grokbot'],
+                roles: ['send'],
+              }),
+            ]);
+            const sendOnlyHeaders = principalHeaders('grokbot', sendOnlyToken, {
+              ...(withAccess ? matchingAccessHeaders() : {}),
+              ...(withWorker ? workerHeaderFields : {}),
+            });
+            const sendOnlyDenied = await app.request(
+              listUrl({ recipient: 'grokbot', ...shape.selector }),
+              { headers: sendOnlyHeaders }
+            );
+            const sendOnlyBody = await readError(sendOnlyDenied);
+            expect(sendOnlyDenied.status).toBe(403);
+            expect(sendOnlyBody.error).toBe('dispatch_principal_forbidden');
+            expect(sendOnlyBody.text.includes(foreignBody)).toBe(false);
+            expect(sendOnlyBody.text.includes(boardAliasBody)).toBe(false);
+            expect(sendOnlyBody.text.includes(ownBody)).toBe(false);
+            expectNoSecret(sendOnlyBody.text, grokbotToken);
+            expectNoSecret(sendOnlyBody.text, sendOnlyToken);
+            useRegistry([fullGrokbot()]);
+
+            if (shape.name === 'message_id' && withWorker) {
+              for (const hiddenId of [foreignId, 'board-alias-foreign']) {
+                const hidden = await app.request(
+                  listUrl({ recipient: 'grokbot', message_id: hiddenId }),
+                  { headers: matrixHeaders }
+                );
+                expect(hidden.status).toBe(200);
+                const hiddenText = await hidden.text();
+                expect(JSON.parse(hiddenText)).toEqual([]);
+                expect(hiddenText.includes(foreignBody)).toBe(false);
+                expect(hiddenText.includes(boardAliasBody)).toBe(false);
+                expect(hiddenText.includes(ownBody)).toBe(false);
+              }
+            }
+          }
+        }
       }
     });
 
@@ -3994,6 +4108,102 @@ describe('dispatch API', () => {
               .sender_principal_id
           ).toBeNull();
 
+          enableMatchingAccess();
+          const accessExtra = matchingAccessHeaders();
+          const emptyAccessHeaders = new Headers({
+            'Content-Type': 'application/json',
+            ...accessExtra,
+          });
+          emptyAccessHeaders.set('x-dispatch-principal-id', '');
+          emptyAccessHeaders.set('x-dispatch-principal-token', '');
+          const emptyAccess = await app.request('/api/dispatch/messages', {
+            method: 'POST',
+            headers: emptyAccessHeaders,
+            body: JSON.stringify({
+              ...VALID_BODY,
+              sender: 'grokbot',
+              recipient: 'grokbot',
+              body: ownBody,
+              idempotency_key: `bypass-empty-access-${name}`,
+            }),
+          });
+          const emptyAccessBody = await readError(emptyAccess);
+          expect(emptyAccess.status).toBe(401);
+          expect(emptyAccessBody.error).toBe('dispatch_principal_missing');
+          expectNoSecret(emptyAccessBody.text, grokbotToken);
+          expect(emptyAccessBody.text.includes(foreignBody)).toBe(false);
+          expect(
+            (
+              await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+                `bypass-empty-access-${name}`,
+              ])
+            ).rowCount
+          ).toBe(0);
+
+          const partialAccess = await postMessage(
+            app,
+            principalHeaders('grokbot', undefined, accessExtra),
+            { idempotency_key: `bypass-partial-access-${name}` }
+          );
+          const partialAccessBody = await readError(partialAccess);
+          expect(partialAccess.status).toBe(401);
+          expect(partialAccessBody.error).toBe('dispatch_principal_partial');
+          expectNoSecret(partialAccessBody.text, grokbotToken);
+          expect(partialAccessBody.text.includes(foreignBody)).toBe(false);
+
+          const partialAccessList = await app.request(listUrl({ recipient: 'codex' }), {
+            headers: principalHeaders('grokbot', undefined, accessExtra),
+          });
+          const partialAccessListBody = await readError(partialAccessList);
+          expect(partialAccessList.status).toBe(401);
+          expect(partialAccessListBody.error).toBe('dispatch_principal_partial');
+          expect(partialAccessListBody.text.includes(foreignBody)).toBe(false);
+
+          const foreignAccessList = await app.request(listUrl({ recipient: 'codex' }), {
+            headers: principalHeaders('grokbot', grokbotToken, accessExtra),
+          });
+          const foreignAccessListBody = await readError(foreignAccessList);
+          expect(foreignAccessList.status).toBe(403);
+          expect(foreignAccessListBody.error).toBe('dispatch_principal_forbidden');
+          expect(foreignAccessListBody.text.includes(foreignBody)).toBe(false);
+          expectNoSecret(foreignAccessListBody.text, grokbotToken);
+
+          const accessReport = await postMessage(
+            app,
+            principalHeaders('grokbot', grokbotToken, accessExtra),
+            {
+              task_type: 'run_report',
+              idempotency_key: `bypass-report-access-${name}`,
+              body: 'Report on the latest CI failure.',
+            }
+          );
+          const accessReportBody = await readError(accessReport);
+          expect(accessReport.status).toBe(403);
+          expect(accessReportBody.error).toBe('dispatch_principal_forbidden');
+          expectNoSecret(accessReportBody.text, grokbotToken);
+          expect(
+            (
+              await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+                `bypass-report-access-${name}`,
+              ])
+            ).rowCount
+          ).toBe(0);
+
+          const headerlessAccess = await postMessage(
+            app,
+            { 'Content-Type': 'application/json', ...accessExtra },
+            {
+              sender: 'claude',
+              recipient: 'codex',
+              idempotency_key: `bypass-headerless-access-${name}`,
+            }
+          );
+          expect(headerlessAccess.status).toBe(200);
+          expect(
+            ((await headerlessAccess.json()) as { sender_principal_id: string | null })
+              .sender_principal_id
+          ).toBeNull();
+
           if (name === 'no-operator-token') {
             const presentedUnconfigured = await app.request('/api/dispatch/status', {
               headers: principalHeaders('grokbot', grokbotToken, {
@@ -4027,6 +4237,25 @@ describe('dispatch API', () => {
         });
         expect(operatorStatus.status).toBe(200);
 
+        enableMatchingAccess();
+        const operatorAccessHeaders = principalHeaders('grokbot', grokbotToken, {
+          'x-archon-operator-token': 'secret-token',
+          ...matchingAccessHeaders(),
+        });
+        const operatorAccessReport = await postMessage(disabledWithToken, operatorAccessHeaders, {
+          task_type: 'run_report',
+          idempotency_key: 'bypass-disabled-operator-report-access',
+          body: 'Operator report.',
+        });
+        expect(operatorAccessReport.status).toBe(200);
+        expect(((await operatorAccessReport.json()) as { task_type: string }).task_type).toBe(
+          'run_report'
+        );
+        const operatorAccessStatus = await disabledWithToken.request('/api/dispatch/status', {
+          headers: operatorAccessHeaders,
+        });
+        expect(operatorAccessStatus.status).toBe(200);
+
         const mixedPartial = await postMessage(
           disabledWithToken,
           principalHeaders('grokbot', undefined, { 'x-archon-operator-token': 'secret-token' }),
@@ -4050,6 +4279,7 @@ describe('dispatch API', () => {
         });
         expect(partialStatus.status).toBe(200);
       } finally {
+        clearMatchingAccess();
         restoreEnv('ARCHON_OPERATOR_AUTH_DISABLED', priorAuthDisabled);
         restoreEnv('NODE_ENV', priorNodeEnv);
       }

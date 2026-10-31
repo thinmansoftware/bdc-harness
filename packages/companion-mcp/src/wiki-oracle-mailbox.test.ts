@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -527,6 +528,7 @@ describe('wiki oracle and mailbox tools', () => {
     const previousHome = process.env.ARCHON_HOME;
     const previousDatabaseUrl = process.env.DATABASE_URL;
     const previousOperatorToken = process.env.ARCHON_OPERATOR_TOKEN;
+    const previousPrincipalsJson = process.env.DISPATCH_PRINCIPALS_JSON;
     const home = await mkdtemp(join(tmpdir(), 'companion-selected-route-'));
     const nativeFetch = globalThis.fetch;
     const harness = await createHarness();
@@ -535,7 +537,19 @@ describe('wiki oracle and mailbox tools', () => {
     let resetDatabase: (() => void) | undefined;
     try {
       // The selected route keeps the outer operator gate. Unset it here so the
-      // companion's own principal headers are what reach the route.
+      // companion's own principal headers are what reach the route. Register
+      // only the digest this test already sends; do not keep an auth bypass.
+      process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+        {
+          credential_id: 'test119-grokbot-receive',
+          principal_id: 'grokbot',
+          status: 'active',
+          send_as: ['grokbot'],
+          receive_as: ['grokbot'],
+          roles: ['receive'],
+          token_sha256: createHash('sha256').update(harness.dispatchToken).digest('hex'),
+        },
+      ]);
       process.env.ARCHON_HOME = home;
       delete process.env.DATABASE_URL;
       delete process.env.ARCHON_OPERATOR_TOKEN;
@@ -722,6 +736,8 @@ describe('wiki oracle and mailbox tools', () => {
       else process.env.DATABASE_URL = previousDatabaseUrl;
       if (previousOperatorToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
       else process.env.ARCHON_OPERATOR_TOKEN = previousOperatorToken;
+      if (previousPrincipalsJson === undefined) delete process.env.DISPATCH_PRINCIPALS_JSON;
+      else process.env.DISPATCH_PRINCIPALS_JSON = previousPrincipalsJson;
       server?.stop(true);
       if (closeDatabase !== undefined) await closeDatabase();
       resetDatabase?.();
