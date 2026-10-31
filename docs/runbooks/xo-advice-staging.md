@@ -50,6 +50,14 @@ All paid runs share the pinned campaign file `~/Downloads/terra-xo-lane-approval
 
 The HTTP runner verifies operator/Board refusal, strict body validation, stale fence, Terra-only routine work, duplicate refusal, independent Terra+Sol important work and the shared cap. Paid source packets contain a small fresh GitHub capture, not evaluation cases. It records model IDs, input hashes, receipts, ledger, source hashes and source commit. Keep reports and ledger private locally; no API secret is included.
 
+Generation receipts can lag the completed answer. The client repeats only bounded read-only metadata GETs, never paid POSTs, while retaining full reservations. If the window expires, the campaign stops. After the receipt becomes available, the explicit operator command below fetches only recorded generation IDs from the pinned pilot and reconciles matching identity/provider/cost. It does not reset the cap, reopen an incomplete request, replay an answer or create another campaign:
+
+```powershell
+bun run scripts/staging/xo-advice-reconcile.ts
+```
+
+The original incomplete outcome remains. New qualification work after a harness fix must have a distinct current capture and request; never erase the failure or reuse its request ID. A newly chosen report directory cannot bypass the shared pilot ledger. Unknown IDs, mismatched models/providers/costs, over-reserve charges or unfinished work retain the stop.
+
 ## Review and go-live boundary
 
 Before live use: exact-head independent review and required CI, staged served-model receipts, a canonical persistent single-writer ledger binding, rollback evidence and an environment/commit-scoped production motion with required recorded approvals. The incumbent coordinator must explicitly adopt the delegate; merely installing the endpoint does not reroute interactive sessions.

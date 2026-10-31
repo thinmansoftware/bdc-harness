@@ -85,7 +85,9 @@ export interface CandidateResponse {
 export interface AdviceClient {
   prices(model: string): Promise<{ prompt: number; completion: number }>;
   complete(request: ModelRequest): Promise<CandidateResponse>;
-  receipt(id: string): Promise<{ provider_name?: string; total_cost?: number }>;
+  receipt(
+    id: string
+  ): Promise<{ id: string; model: string; provider_name: string; total_cost: number }>;
 }
 export interface CurrentLease extends LeaseBinding {
   expires_at: string;
@@ -148,16 +150,35 @@ export class OpenRouterAdviceClient implements AdviceClient {
   async complete(request: ModelRequest): Promise<CandidateResponse> {
     return (await this.request('responses', request)) as CandidateResponse;
   }
-  async receipt(id: string): Promise<{ provider_name?: string; total_cost?: number }> {
-    const raw = await this.request('generation?id=' + encodeURIComponent(id));
-    return z
-      .object({
-        data: z.object({
-          provider_name: z.string(),
-          total_cost: z.number().finite().nonnegative(),
-        }),
-      })
-      .parse(raw).data;
+  async receipt(
+    id: string
+  ): Promise<{ id: string; model: string; provider_name: string; total_cost: number }> {
+    // Only metadata GETs may be repeated: generation receipts are eventually
+    // consistent. Never retry a paid generation, change model or release reserve.
+    for (let attempt = 0; attempt < 8; attempt++) {
+      try {
+        const raw = await this.request('generation?id=' + encodeURIComponent(id));
+        return z
+          .object({
+            data: z.object({
+              id: z.string(),
+              model: z.string(),
+              provider_name: z.string(),
+              total_cost: z.number().finite().nonnegative(),
+            }),
+          })
+          .parse(raw).data;
+      } catch (error) {
+        if (
+          attempt === 7 ||
+          !(error instanceof Error) ||
+          !/^advice_provider_http_(404|408|429|503)$/.test(error.message)
+        )
+          throw error;
+        await Bun.sleep(1000);
+      }
+    }
+    throw new Error('provider_receipt_unverified');
   }
 }
 
@@ -301,23 +322,29 @@ export class AdviceService {
           raw.status !== 'completed' ||
           ![requests[leg].model, requests[leg].model.split('/')[1]].includes(raw.model ?? '')
         ) {
-          this.ledger.halt();
+          this.ledger.halt('provider_identity');
           throw new Error('provider_identity_or_completion');
         }
         let receipt: Awaited<ReturnType<AdviceClient['receipt']>>;
         try {
           receipt = await this.client.receipt(raw.id);
         } catch {
-          this.ledger.halt();
+          this.ledger.halt('receipt_pending');
           throw new Error('provider_receipt_unverified');
         }
         this.ledger.recordAttribution(id, leg, { ...attribution, receipt });
         if (
+          receipt.id !== raw.id ||
+          (receipt.model !== requests[leg].model &&
+            !(
+              receipt.model.startsWith(requests[leg].model + '-') &&
+              /^\d{8}$/.test(receipt.model.slice(requests[leg].model.length + 1))
+            )) ||
           receipt.provider_name !== 'OpenAI' ||
           typeof receipt.total_cost !== 'number' ||
           Math.abs(receipt.total_cost - cost) > 1e-8
         ) {
-          this.ledger.halt();
+          this.ledger.halt('receipt_mismatch');
           throw new Error('provider_receipt_mismatch');
         }
         this.ledger.settle(id, leg, Math.ceil(cost * 1_000_000));

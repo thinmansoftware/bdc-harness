@@ -75,7 +75,9 @@ async function setup(
         ],
       };
     },
-    receipt: async () => ({
+    receipt: async id => ({
+      id,
+      model: seen[seen.length - 1].model,
       provider_name: options.badReceipt ? 'Other' : 'OpenAI',
       total_cost: 0.01,
     }),

@@ -111,7 +111,12 @@ const underlying: AdviceClient = paid
           },
         ],
       }),
-      receipt: async () => ({ provider_name: 'OpenAI', total_cost: 0 }),
+      receipt: async id => ({
+        id,
+        model: id.includes('terra') ? TERRA : SOL,
+        provider_name: 'OpenAI',
+        total_cost: 0,
+      }),
     };
 const client: AdviceClient = {
   prices: model => underlying.prices(model),

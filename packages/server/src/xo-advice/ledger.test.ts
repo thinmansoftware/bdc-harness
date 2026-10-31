@@ -68,3 +68,60 @@ test('refuses memory/relative storage and invalid monetary values', () => {
   expect(() => s.admit('r1', 'h', binding, [NaN])).toThrow();
   expect(() => s.admit('r1', 'h', binding, [-1])).toThrow();
 });
+test('verified late receipt reconciles cost without resetting cap or replaying the request', () => {
+  const s = open();
+  s.admit('r1', 'h', binding, [400_000], { evidence: 'preserved' });
+  s.started('r1', 0);
+  s.recordAttribution('r1', 0, {
+    requested_model: 'openai/gpt-6.1-terra',
+    served_model: 'openai/gpt-6.1-terra',
+    generation_id: 'gen-test',
+    status: 'completed',
+    reported_cost_usd: 0.01,
+  });
+  s.settle('r1', 0, null);
+  s.finish('r1', { status: 'incomplete' });
+  expect(() =>
+    s.reconcileVerifiedCall('r1', 0, {
+      id: 'wrong',
+      model: 'openai/gpt-6.1-terra',
+      provider_name: 'OpenAI',
+      total_cost: 0.01,
+    })
+  ).toThrow();
+  s.reconcileVerifiedCall('r1', 0, {
+    id: 'gen-test',
+    model: 'openai/gpt-6.1-terra-20261026',
+    provider_name: 'OpenAI',
+    total_cost: 0.01,
+  });
+  expect(s.total()).toBe(10_000);
+  expect(() => s.admit('r1', 'h', binding, [1])).toThrow('duplicate_request');
+  expect(() => s.admit('r2', 'h2', binding, [1_000_000])).toThrow('pilot_cap');
+  expect(JSON.stringify(s.snapshot())).toContain('incomplete');
+});
+test('receipt reconciliation cannot clear another calls reservation-breach halt', () => {
+  const s = open();
+  s.admit('a', 'ha', binding, [10_000]);
+  s.admit('b', 'hb', binding, [400_000]);
+  s.started('a', 0);
+  s.started('b', 0);
+  expect(() => s.settle('a', 0, 11_000)).toThrow('reservation_exceeded');
+  s.finish('a', { status: 'incomplete' });
+  s.recordAttribution('b', 0, {
+    requested_model: 'openai/gpt-6.1-terra',
+    served_model: 'openai/gpt-6.1-terra',
+    generation_id: 'gen-b',
+    status: 'completed',
+    reported_cost_usd: 0.01,
+  });
+  s.settle('b', 0, null);
+  s.finish('b', { status: 'incomplete' });
+  s.reconcileVerifiedCall('b', 0, {
+    id: 'gen-b',
+    model: 'openai/gpt-6.1-terra',
+    provider_name: 'OpenAI',
+    total_cost: 0.01,
+  });
+  expect(() => s.admit('c', 'hc', binding, [1])).toThrow('campaign_halted');
+});
