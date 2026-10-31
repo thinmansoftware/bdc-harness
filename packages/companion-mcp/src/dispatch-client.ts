@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 
 import { COMPANION_REQUEST_NOTE, DISPATCH_LIST_LIMIT } from './constants';
 import { ToolFailure } from './errors';
-import type { CompanionSlot, DispatchWireMessage } from './types';
+import type { CompanionSlot, DispatchCursorPage, DispatchWireMessage } from './types';
 
 export interface CompanionSendInput {
   recipient: string;
@@ -51,6 +51,40 @@ function readMessage(value: unknown): DispatchWireMessage | null {
     status,
     task_type: taskType,
   };
+}
+
+function readMessageList(payload: unknown): DispatchWireMessage[] {
+  if (!Array.isArray(payload)) {
+    throw new ToolFailure('error', 'dispatch_rejected');
+  }
+  const messages: DispatchWireMessage[] = [];
+  for (const item of payload) {
+    const message = readMessage(item);
+    if (message === null) {
+      throw new ToolFailure('error', 'dispatch_rejected');
+    }
+    messages.push(message);
+  }
+  return messages;
+}
+
+function readCursorPage(payload: unknown, recipient: string): DispatchCursorPage {
+  if (
+    !isRecord(payload) ||
+    !Array.isArray(payload.messages) ||
+    typeof payload.page_full !== 'boolean'
+  ) {
+    throw new ToolFailure('error', 'dispatch_rejected');
+  }
+  const nextAfterSeq = payload.next_after_seq;
+  if (typeof nextAfterSeq !== 'number' || !Number.isSafeInteger(nextAfterSeq) || nextAfterSeq < 0) {
+    throw new ToolFailure('error', 'dispatch_rejected');
+  }
+  const messages = readMessageList(payload.messages);
+  if (messages.some(message => message.recipient !== recipient)) {
+    throw new ToolFailure('error', 'dispatch_rejected');
+  }
+  return { messages, next_after_seq: nextAfterSeq, page_full: payload.page_full };
 }
 
 export class DispatchClient {
@@ -113,6 +147,46 @@ export class DispatchClient {
     return messages;
   }
 
+  async listPage(
+    slot: CompanionSlot,
+    afterSeq: number,
+    status?: string
+  ): Promise<DispatchCursorPage> {
+    const url = new URL(`${baseUrl(this.dispatchBaseUrl)}/api/dispatch/messages`);
+    url.searchParams.set('recipient', slot.dispatch_principal_id);
+    url.searchParams.set('after_seq', String(afterSeq));
+    url.searchParams.set('limit', String(DISPATCH_LIST_LIMIT));
+    if (status !== undefined && status.length > 0) {
+      url.searchParams.set('status', status);
+    }
+    const payload = await this.getJson(slot, url);
+    return readCursorPage(payload, slot.dispatch_principal_id);
+  }
+
+  async readById(slot: CompanionSlot, id: string): Promise<DispatchWireMessage[]> {
+    const url = new URL(`${baseUrl(this.dispatchBaseUrl)}/api/dispatch/messages`);
+    url.searchParams.set('recipient', slot.dispatch_principal_id);
+    url.searchParams.set('message_id', id);
+    const payload = await this.getJson(slot, url);
+    const messages = readMessageList(payload);
+    if (messages.length > 1) {
+      throw new ToolFailure('error', 'dispatch_rejected');
+    }
+    return messages;
+  }
+
+  async listByCorrelation(
+    slot: CompanionSlot,
+    correlationId: string
+  ): Promise<DispatchWireMessage[]> {
+    const url = new URL(`${baseUrl(this.dispatchBaseUrl)}/api/dispatch/messages`);
+    url.searchParams.set('recipient', slot.dispatch_principal_id);
+    url.searchParams.set('correlation_id', correlationId);
+    url.searchParams.set('limit', String(DISPATCH_LIST_LIMIT));
+    const payload = await this.getJson(slot, url);
+    return readMessageList(payload);
+  }
+
   async ack(slot: CompanionSlot, id: string): Promise<void> {
     const token = await this.readCredential(slot);
     const response = await this.post(
@@ -132,6 +206,27 @@ export class DispatchClient {
       'x-dispatch-principal-id': slot.dispatch_principal_id,
       'x-dispatch-principal-token': token,
     };
+  }
+
+  private async getJson(slot: CompanionSlot, url: URL): Promise<unknown> {
+    const token = await this.readCredential(slot);
+    let response: Response;
+    try {
+      response = await fetch(url, { headers: this.headers(slot, token) });
+    } catch (error) {
+      if (error instanceof ToolFailure) {
+        throw error;
+      }
+      throw new ToolFailure('error', 'dispatch_unavailable');
+    }
+    if (!response.ok) {
+      throw new ToolFailure('error', 'dispatch_rejected');
+    }
+    try {
+      return await response.json();
+    } catch {
+      throw new ToolFailure('error', 'dispatch_rejected');
+    }
   }
 
   private async readCredential(slot: CompanionSlot): Promise<string> {

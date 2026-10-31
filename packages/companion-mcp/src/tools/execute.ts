@@ -51,6 +51,17 @@ function readLimit(args: Record<string, unknown>): number {
   return Math.min(value, WIKI_SEARCH_MAX);
 }
 
+function readCursor(args: Record<string, unknown>): number {
+  if (!Object.prototype.hasOwnProperty.call(args, 'after_seq')) {
+    return 0;
+  }
+  const value = args.after_seq;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new ToolFailure('refused', 'cursor_invalid');
+  }
+  return value;
+}
+
 function readSeats(value: unknown): string[] | null {
   if (!Array.isArray(value)) {
     return null;
@@ -126,8 +137,15 @@ async function runKnownTool(
     }
     case 'mailbox_list': {
       const status = readString(args, 'status') ?? undefined;
-      const messages = await mailboxList(deps.dispatch, slot, status);
-      return { payload: { messages }, rowCount: messages.length };
+      const page = await mailboxList(deps.dispatch, slot, status, readCursor(args));
+      return {
+        payload: {
+          messages: page.messages,
+          next_after_seq: page.next_after_seq,
+          page_full: page.page_full,
+        },
+        rowCount: page.messages.length,
+      };
     }
     case 'mailbox_read': {
       const id = readString(args, 'id');

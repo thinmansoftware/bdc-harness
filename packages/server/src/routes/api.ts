@@ -331,7 +331,7 @@ import {
   supersedeDispatchMessageBodySchema,
   dispatchMailboxPrincipalBodySchema,
   dispatchMessageIdParamsSchema,
-  dispatchMessageListResponseSchema,
+  dispatchMessageListOrCursorResponseSchema,
   dispatchMessageSchema,
   dispatchSenderBodySchema,
   dispatchWorkerSchema,
@@ -744,9 +744,11 @@ const listDispatchMessagesRoute = createRoute({
   request: { query: listDispatchMessagesQuerySchema },
   responses: {
     200: {
-      content: { 'application/json': { schema: dispatchMessageListResponseSchema } },
-      description: 'Dispatch messages',
+      content: { 'application/json': { schema: dispatchMessageListOrCursorResponseSchema } },
+      description:
+        'Dispatch messages. No selector returns the legacy array. after_seq returns one cursor page.',
     },
+    400: jsonError('Invalid dispatch list selector'),
     500: jsonError('Server error'),
   },
 });
@@ -2757,6 +2759,152 @@ function pushedReadingView(row: {
   };
 }
 
+const DISPATCH_LIST_SELECTOR_KEYS = ['message_id', 'correlation_id', 'after_seq'] as const;
+const DISPATCH_LIST_STATUSES = new Set(['queued', 'claimed', 'done', 'failed', 'cancelled']);
+const COMPLETE_BASE10_INTEGER = /^(0|[1-9][0-9]*)$/;
+
+type DispatchListStatus = 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
+
+type DispatchListSelection =
+  | { kind: 'legacy' }
+  | { kind: 'invalid' }
+  | { kind: 'message_id'; recipient: string; messageId: string }
+  | { kind: 'correlation_id'; recipient: string; correlationId: string; limit?: number }
+  | {
+      kind: 'after_seq';
+      recipient: string;
+      afterSeq: number;
+      status?: DispatchListStatus;
+      limit?: number;
+    };
+
+function parseCompleteNonnegativeSafeInteger(value: string): number | null {
+  if (!COMPLETE_BASE10_INTEGER.test(value)) return null;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) return null;
+  return parsed;
+}
+
+function parseSelectedDispatchLimit(value: string): number | null {
+  const parsed = parseCompleteNonnegativeSafeInteger(value);
+  if (parsed === null || parsed < 1 || parsed > 500) return null;
+  return parsed;
+}
+
+function dispatchListKeys(params: URLSearchParams): string[] {
+  const keys: string[] = [];
+  params.forEach((_value, key) => {
+    if (!keys.includes(key)) keys.push(key);
+  });
+  return keys;
+}
+
+function dispatchListKeyRepeated(params: URLSearchParams, keys: readonly string[]): boolean {
+  return keys.some(key => params.getAll(key).length > 1);
+}
+
+function canonicalDispatchListRecipient(params: URLSearchParams): string | null {
+  const values = params.getAll('recipient');
+  if (values.length !== 1) return null;
+  const canonical = (values[0] ?? '').trim().toLowerCase();
+  return canonical.length === 0 ? null : canonical;
+}
+
+/**
+ * Selector key presence opts into a direct read, including after_seq=0.
+ * The legacy path stays in place only when none of those keys appear.
+ */
+function parseDispatchListSelection(requestUrl: string): DispatchListSelection {
+  let params: URLSearchParams;
+  try {
+    params = new URL(requestUrl, 'http://127.0.0.1').searchParams;
+  } catch {
+    return { kind: 'invalid' };
+  }
+  const presentSelectors = DISPATCH_LIST_SELECTOR_KEYS.filter(key => params.has(key));
+  if (presentSelectors.length === 0) return { kind: 'legacy' };
+  if (presentSelectors.length !== 1) return { kind: 'invalid' };
+  const keys = dispatchListKeys(params);
+  if (dispatchListKeyRepeated(params, keys)) return { kind: 'invalid' };
+  const mode = presentSelectors[0];
+  if (mode === undefined) return { kind: 'invalid' };
+  const allowed = new Set<string>(['recipient', mode]);
+  if (mode === 'correlation_id' || mode === 'after_seq') allowed.add('limit');
+  if (mode === 'after_seq') allowed.add('status');
+  if (keys.some(key => !allowed.has(key))) return { kind: 'invalid' };
+  const recipient = canonicalDispatchListRecipient(params);
+  if (recipient === null) return { kind: 'invalid' };
+  let limit: number | undefined;
+  if (params.has('limit')) {
+    const parsedLimit = parseSelectedDispatchLimit(params.get('limit') ?? '');
+    if (parsedLimit === null) return { kind: 'invalid' };
+    limit = parsedLimit;
+  }
+  if (mode === 'message_id') {
+    const messageId = params.get('message_id') ?? '';
+    if (messageId.trim() === '') return { kind: 'invalid' };
+    return { kind: 'message_id', recipient, messageId };
+  }
+  if (mode === 'correlation_id') {
+    const correlationId = params.get('correlation_id') ?? '';
+    if (correlationId.trim() === '') return { kind: 'invalid' };
+    return { kind: 'correlation_id', recipient, correlationId, limit };
+  }
+  const afterSeq = parseCompleteNonnegativeSafeInteger(params.get('after_seq') ?? '');
+  if (afterSeq === null) return { kind: 'invalid' };
+  let status: DispatchListStatus | undefined;
+  if (params.has('status')) {
+    const rawStatus = params.get('status') ?? '';
+    if (!DISPATCH_LIST_STATUSES.has(rawStatus)) return { kind: 'invalid' };
+    status = rawStatus as DispatchListStatus;
+  }
+  return { kind: 'after_seq', recipient, afterSeq, status, limit };
+}
+
+async function loadSelectedDispatchMessages(
+  selection: Exclude<DispatchListSelection, { kind: 'legacy' | 'invalid' }>
+): Promise<unknown> {
+  if (selection.kind === 'message_id') {
+    const message = await dispatchDb.getMessage(selection.messageId);
+    if (message === null) return [];
+    if (message.recipient.trim().toLowerCase() !== selection.recipient) return [];
+    return [message];
+  }
+  if (selection.kind === 'correlation_id') {
+    return dispatchDb.listMessagesByCorrelationId({
+      correlationId: selection.correlationId,
+      recipient: selection.recipient,
+      ...(selection.limit !== undefined ? { limit: selection.limit } : {}),
+    });
+  }
+  const rows = await dispatchDb.listMessagesBySeqCursor({
+    recipient: selection.recipient,
+    afterSeq: selection.afterSeq,
+    ...(selection.status !== undefined ? { status: selection.status } : {}),
+    ...(selection.limit !== undefined ? { limit: selection.limit } : {}),
+    ...(selection.status === 'queued' ? { openOnly: true } : {}),
+  });
+  const dalLimit = Math.max(1, Math.min(selection.limit ?? 100, 500));
+  if (rows.length === 0) {
+    return { messages: [], next_after_seq: selection.afterSeq, page_full: false };
+  }
+  const messages: dispatchDb.DispatchMessage[] = [];
+  let nextAfterSeq = selection.afterSeq;
+  for (const row of rows) {
+    if (!Number.isFinite(row.cursor_seq)) {
+      throw new Error('dispatch_cursor_not_finite');
+    }
+    const { cursor_seq: cursorSeq, ...message } = row;
+    messages.push(message);
+    nextAfterSeq = cursorSeq;
+  }
+  return {
+    messages,
+    next_after_seq: nextAfterSeq,
+    page_full: rows.length === dalLimit,
+  };
+}
+
 /**
  * Register all /api/* routes on the Hono app.
  */
@@ -4620,6 +4768,18 @@ export function registerApiRoutes(
   });
 
   registerOpenApiRoute(listDispatchMessagesRoute, async c => {
+    const selection = parseDispatchListSelection(c.req.url);
+    if (selection.kind === 'invalid') {
+      return apiError(c, 400, 'dispatch_list_selector_invalid');
+    }
+    if (selection.kind !== 'legacy') {
+      try {
+        return c.json(await loadSelectedDispatchMessages(selection));
+      } catch (error) {
+        getLog().error({ err: error }, 'dispatch_list_messages_failed');
+        return apiError(c, 500, 'Failed to list dispatch messages');
+      }
+    }
     try {
       const rawLimit = Number.parseInt(c.req.query('limit') ?? '100', 10);
       const messages = await dispatchDb.listMessages({

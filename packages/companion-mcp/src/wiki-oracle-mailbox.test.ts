@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { describe, expect, test } from 'bun:test';
 
 import { COMPANION_REQUEST_NOTE } from './constants';
+import { DispatchClient } from './dispatch-client';
+import { loadCompanionRegistry } from './registry';
 import {
   callToolText,
   createHarness,
@@ -13,8 +15,43 @@ import {
   withClient,
   type RecordedHttpRequest,
 } from './test-harness';
+import { executeTool } from './tools/execute';
+import { TrackedTree } from './tracked-tree';
 
 const BEARER_TAIL = 'Authorization: Bearer abcdefghijklmnop';
+
+function ownWireMessage(body: string, id = 'own-1'): Record<string, string> {
+  return {
+    id,
+    correlation_id: 'c-own',
+    sender: 'xo',
+    recipient: 'grokbot',
+    body,
+    status: 'queued',
+    task_type: 'agent_message',
+  };
+}
+
+function selectedDispatchGet(
+  request: RecordedHttpRequest,
+  respond: (params: URLSearchParams) => { status: number; body: unknown }
+): { status: number; body: unknown } {
+  if (
+    request.headers.authorization !== undefined ||
+    request.headers['x-archon-operator-token'] !== undefined
+  ) {
+    return { status: 403, body: { error: 'operator_credential_refused' } };
+  }
+  if (request.headers['x-dispatch-principal-id'] !== 'grokbot') {
+    return { status: 401, body: { error: 'principal_required' } };
+  }
+  const params = new URL(request.path, 'http://stub.local').searchParams;
+  const selectors = ['message_id', 'correlation_id', 'after_seq'].filter(key => params.has(key));
+  if (selectors.length !== 1) {
+    return { status: 400, body: { error: 'selector_required' } };
+  }
+  return respond(params);
+}
 
 describe('wiki oracle and mailbox tools', () => {
   test('audit_line_per_call', async () => {
@@ -248,40 +285,25 @@ describe('wiki oracle and mailbox tools', () => {
   });
 
   test('mailbox_list_and_read_are_own_inbox_only', async () => {
-    const dispatch = await startRecordingServer(request => {
-      const url = new URL(request.path, 'http://stub.local');
-      const recipient = url.searchParams.get('recipient');
-      if (recipient === 'grokbot') {
+    const dispatch = await startRecordingServer(request =>
+      selectedDispatchGet(request, params => {
+        const messageId = params.get('message_id');
+        if (messageId !== null) {
+          return {
+            status: 200,
+            body: messageId === 'own-1' ? [ownWireMessage('hello grokbot')] : [],
+          };
+        }
         return {
           status: 200,
-          body: [
-            {
-              id: 'own-1',
-              correlation_id: 'c-own',
-              sender: 'xo',
-              recipient: 'grokbot',
-              body: 'hello grokbot',
-              status: 'queued',
-              task_type: 'agent_message',
-            },
-          ],
-        };
-      }
-      return {
-        status: 200,
-        body: [
-          {
-            id: 'xo-1',
-            correlation_id: 'c-xo',
-            sender: 'astra',
-            recipient: 'xo',
-            body: 'XO-PRIVATE-BODY',
-            status: 'queued',
-            task_type: 'agent_message',
+          body: {
+            messages: [ownWireMessage('hello grokbot')],
+            next_after_seq: 4,
+            page_full: false,
           },
-        ],
-      };
-    });
+        };
+      })
+    );
     const harness = await createHarness();
     const running = await startFromHarness(harness, { DISPATCH_BASE_URL: dispatch.url });
     try {
@@ -289,16 +311,28 @@ describe('wiki oracle and mailbox tools', () => {
         const listed = parseToolJson(await callToolText(client, 'mailbox_list', {}));
         const messages = listed.messages as Array<{ id: string }>;
         expect(messages.map(message => message.id)).toEqual(['own-1']);
+        expect(listed.next_after_seq).toBe(4);
+        expect(listed.page_full).toBe(false);
         const refused = parseToolJson(await callToolText(client, 'mailbox_read', { id: 'xo-1' }));
         expect(refused.error).toBe('not_own_message');
         expect(JSON.stringify(refused)).not.toContain('XO-PRIVATE-BODY');
       });
-      const listCalls = dispatch.requests.filter(request => request.method === 'GET');
-      expect(listCalls.length).toBeGreaterThan(0);
-      for (const call of listCalls) {
-        expect(call.path).toContain('recipient=grokbot');
-        expect(call.path).toContain('limit=500');
+      const gets = dispatch.requests.filter(request => request.method === 'GET');
+      const lists = gets.filter(request => request.path.includes('after_seq='));
+      const reads = gets.filter(request => request.path.includes('message_id='));
+      expect(lists).toHaveLength(1);
+      expect(reads).toHaveLength(1);
+      expect(lists[0]?.path).toContain('recipient=grokbot');
+      expect(lists[0]?.path).toContain('after_seq=0');
+      expect(lists[0]?.path).toContain('limit=500');
+      expect(reads[0]?.path).toContain('recipient=grokbot');
+      expect(reads[0]?.path).toContain('message_id=xo-1');
+      expect(reads[0]?.path).not.toContain('limit=');
+      for (const call of gets) {
         expect(call.path).not.toContain('recipient=xo');
+        expect(call.headers['x-dispatch-principal-id']).toBe('grokbot');
+        expect(call.headers.authorization).toBeUndefined();
+        expect(call.headers['x-archon-operator-token']).toBeUndefined();
       }
     } finally {
       await running.close();
@@ -308,39 +342,19 @@ describe('wiki oracle and mailbox tools', () => {
   });
 
   test('nested_structured_responses_redact_bearer_and_stay_json', async () => {
-    const dispatch = await startRecordingServer(request => {
-      const url = new URL(request.path, 'http://stub.local');
-      if (url.searchParams.get('recipient') === 'grokbot') {
+    const dispatch = await startRecordingServer(request =>
+      selectedDispatchGet(request, params => {
+        const message = ownWireMessage(`ordinary hello ${BEARER_TAIL}`);
+        const messageId = params.get('message_id');
+        if (messageId !== null) {
+          return { status: 200, body: messageId === 'own-1' ? [message] : [] };
+        }
         return {
           status: 200,
-          body: [
-            {
-              id: 'own-1',
-              correlation_id: 'c-own',
-              sender: 'xo',
-              recipient: 'grokbot',
-              body: `ordinary hello ${BEARER_TAIL}`,
-              status: 'queued',
-              task_type: 'agent_message',
-            },
-          ],
+          body: { messages: [message], next_after_seq: 4, page_full: false },
         };
-      }
-      return {
-        status: 200,
-        body: [
-          {
-            id: 'xo-1',
-            correlation_id: 'c-xo',
-            sender: 'astra',
-            recipient: 'xo',
-            body: 'XO-PRIVATE-BODY',
-            status: 'queued',
-            task_type: 'agent_message',
-          },
-        ],
-      };
-    });
+      })
+    );
     const oracle = await startRecordingServer(() => ({
       status: 200,
       body: {
@@ -409,6 +423,168 @@ describe('wiki oracle and mailbox tools', () => {
       expect(acks[0]?.headers['x-dispatch-principal-id']).toBe('grokbot');
       expect(acks[0]?.headers['x-dispatch-principal-token']).toBe(harness.dispatchToken);
       expect(acks[0]?.body).toEqual({ principal_id: 'grokbot' });
+      expect(acks[0]?.headers.authorization).toBeUndefined();
+      expect(acks[0]?.headers['x-archon-operator-token']).toBeUndefined();
+    } finally {
+      await running.close();
+      await dispatch.close();
+      await harness.cleanup();
+    }
+  });
+
+  test('mailbox_read_uses_direct_id_beyond_the_first_page', async () => {
+    const previousOperatorToken = process.env.ARCHON_OPERATOR_TOKEN;
+    process.env.ARCHON_OPERATOR_TOKEN = 'operator-secret-must-not-be-sent';
+    const later = ownWireMessage('LATER-OWN-BODY', 'later-id');
+    const dispatch = await startRecordingServer(request =>
+      selectedDispatchGet(request, params => {
+        const messageId = params.get('message_id');
+        if (messageId !== null) {
+          if (messageId === 'later-id') return { status: 200, body: [later] };
+          return { status: 200, body: [] };
+        }
+        if (params.get('after_seq') === '500') {
+          return { status: 200, body: { messages: [], next_after_seq: 500, page_full: false } };
+        }
+        if (!params.has('after_seq')) {
+          return { status: 400, body: { error: 'selector_required' } };
+        }
+        return {
+          status: 200,
+          body: {
+            messages: [ownWireMessage('OLD-PAGE-BODY', 'old-id')],
+            next_after_seq: 500,
+            page_full: true,
+          },
+        };
+      })
+    );
+    const harness = await createHarness();
+    const running = await startFromHarness(harness, { DISPATCH_BASE_URL: dispatch.url });
+    try {
+      await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
+        const read = parseToolJson(await callToolText(client, 'mailbox_read', { id: 'later-id' }));
+        expect(read.id).toBe('later-id');
+        expect(read.body).toBe('LATER-OWN-BODY');
+        const foreign = parseToolJson(
+          await callToolText(client, 'mailbox_read', { id: 'foreign-id' })
+        );
+        const unknown = parseToolJson(
+          await callToolText(client, 'mailbox_read', { id: 'missing-id' })
+        );
+        expect(foreign).toEqual({ error: 'not_own_message' });
+        expect(unknown).toEqual({ error: 'not_own_message' });
+        expect(JSON.stringify(foreign)).not.toContain('FOREIGN');
+        const listed = parseToolJson(
+          await callToolText(client, 'mailbox_list', { status: 'queued' })
+        );
+        expect(listed.messages).toEqual([
+          expect.objectContaining({ id: 'old-id', body: 'OLD-PAGE-BODY' }),
+        ]);
+        expect(listed.next_after_seq).toBe(500);
+        expect(listed.page_full).toBe(true);
+        const next = parseToolJson(
+          await callToolText(client, 'mailbox_list', { after_seq: listed.next_after_seq })
+        );
+        expect(next.messages).toEqual([]);
+        expect(next.next_after_seq).toBe(500);
+        expect(next.page_full).toBe(false);
+      });
+      const gets = dispatch.requests.filter(request => request.method === 'GET');
+      expect(gets).toHaveLength(5);
+      for (const call of gets) {
+        expect(call.headers['x-dispatch-principal-id']).toBe('grokbot');
+        expect(call.headers['x-dispatch-principal-token']).toBe(harness.dispatchToken);
+        expect(call.headers.authorization).toBeUndefined();
+        expect(call.headers['x-archon-operator-token']).toBeUndefined();
+        expect(JSON.stringify(call.headers)).not.toContain('operator-secret-must-not-be-sent');
+      }
+      const reads = gets.filter(request => request.path.includes('message_id='));
+      expect(reads.map(request => request.path)).toEqual([
+        expect.stringContaining('message_id=later-id'),
+        expect.stringContaining('message_id=foreign-id'),
+        expect.stringContaining('message_id=missing-id'),
+      ]);
+      expect(reads.every(request => !request.path.includes('after_seq='))).toBe(true);
+      const lists = gets.filter(request => request.path.includes('after_seq='));
+      expect(lists[0]?.path).toContain('after_seq=0');
+      expect(lists[0]?.path).toContain('status=queued');
+      expect(lists[1]?.path).toContain('after_seq=500');
+    } finally {
+      await running.close();
+      await dispatch.close();
+      await harness.cleanup();
+      if (previousOperatorToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
+      else process.env.ARCHON_OPERATOR_TOKEN = previousOperatorToken;
+    }
+  });
+
+  test('mailbox_list_schema_cursor_and_malformed_dispatch_are_refused', async () => {
+    const harness = await createHarness();
+    const slot = loadCompanionRegistry(harness.configPath).slots.find(
+      entry => entry.companion_id === 'grokbot'
+    );
+    if (slot === undefined) {
+      throw new Error('missing grokbot slot');
+    }
+    const deps = {
+      wikiRoot: harness.wikiRoot,
+      tree: new TrackedTree(harness.wikiRoot),
+      oracleUrl: 'http://127.0.0.1:9',
+      dispatch: new DispatchClient('http://127.0.0.1:9'),
+      auditLog: harness.auditLog,
+      env: harness.env,
+    };
+    const invalidCursors: unknown[] = [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, '2'];
+    for (const afterSeq of invalidCursors) {
+      const refused = await executeTool(slot, 'mailbox_list', { after_seq: afterSeq }, deps);
+      expect(refused.isError).toBe(true);
+      expect(refused.content[0]).toMatchObject({
+        type: 'text',
+        text: '{"error":"cursor_invalid"}',
+      });
+    }
+    const unavailable = await executeTool(slot, 'mailbox_list', {}, deps);
+    expect(unavailable.isError).toBe(true);
+    expect(unavailable.content[0]).toMatchObject({
+      type: 'text',
+      text: '{"error":"dispatch_unavailable"}',
+    });
+
+    const dispatch = await startRecordingServer(request =>
+      selectedDispatchGet(request, params => {
+        const afterSeq = params.get('after_seq');
+        if (afterSeq === '0') {
+          return { status: 200, body: [ownWireMessage('SHOULD-NOT-LEAK')] };
+        }
+        if (afterSeq === '1') {
+          return { status: 500, body: { error: 'down' } };
+        }
+        return { status: 200, body: { messages: 'nope', next_after_seq: 2, page_full: false } };
+      })
+    );
+    const running = await startFromHarness(harness, { DISPATCH_BASE_URL: dispatch.url });
+    try {
+      await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
+        const listed = await client.listTools();
+        const schema = listed.tools.find(tool => tool.name === 'mailbox_list')?.inputSchema as {
+          required?: string[];
+          properties?: Record<string, { type?: string; minimum?: number }>;
+        };
+        expect(schema.required ?? []).not.toContain('after_seq');
+        expect(schema.properties?.status?.type).toBe('string');
+        expect(
+          schema.properties?.after_seq?.type === 'integer' ||
+            schema.properties?.after_seq?.type === 'number'
+        ).toBe(true);
+        expect(schema.properties?.after_seq?.minimum).toBe(0);
+        for (const afterSeq of [0, 1, 2]) {
+          const text = await callToolText(client, 'mailbox_list', { after_seq: afterSeq });
+          expect(parseToolJson(text).error).toBe('dispatch_rejected');
+          expect(text).not.toContain('SHOULD-NOT-LEAK');
+        }
+      });
+      expect(dispatch.requests.filter(request => request.method === 'GET')).toHaveLength(3);
     } finally {
       await running.close();
       await dispatch.close();

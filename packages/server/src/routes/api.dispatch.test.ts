@@ -278,6 +278,38 @@ function cleanupDb(path: string): void {
   }
 }
 
+async function insertSyntheticDispatch(input: {
+  id: string;
+  recipient: string;
+  correlationId: string;
+  seq: number;
+  body: string;
+  acknowledged: boolean;
+  notBefore?: string | null;
+}): Promise<void> {
+  const createdAt = new Date(Date.UTC(2020, 0, 1) + input.seq * 1000).toISOString();
+  await db.query(
+    `INSERT INTO agent_dispatch_messages (
+       id, correlation_id, idempotency_key, task_type, sender, recipient, body, status,
+       created_at, priority, fencing_token, acknowledged_at, acknowledged_by, not_before, seq
+     ) VALUES (
+       $1, $2, $3, 'agent_message', 'xo', $4, $5, 'queued', $6, 'normal', 0, $7, $8, $9, $10
+     )`,
+    [
+      input.id,
+      input.correlationId,
+      `idem-${input.id}`,
+      input.recipient,
+      input.body,
+      createdAt,
+      input.acknowledged ? createdAt : null,
+      input.acknowledged ? input.recipient : null,
+      input.notBefore ?? null,
+      input.seq,
+    ]
+  );
+}
+
 function makeApp(
   token?: string,
   dispatchMailboxActorResolvedHook?: () => Promise<void>
@@ -2205,5 +2237,395 @@ describe('dispatch API', () => {
     const stored = await storedReceipt(message.id);
     expect(stored.acknowledged_at).toBeNull();
     expect(stored.acknowledged_by).toBeNull();
+  });
+
+  test('test119 reads an own message behind an acknowledged 500-row backlog', async () => {
+    for (let index = 0; index < 501; index += 1) {
+      await insertSyntheticDispatch({
+        id: `old-${index}`,
+        recipient: 'grokbot',
+        correlationId: `old-corr-${index}`,
+        seq: index + 1,
+        body: `OLD-BODY-${index}`,
+        acknowledged: true,
+      });
+    }
+    await insertSyntheticDispatch({
+      id: 'newer-own',
+      recipient: 'grokbot',
+      correlationId: 'newer-corr',
+      seq: 600,
+      body: 'NEWER-OWN-BODY',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'foreign-own-id',
+      recipient: 'xo',
+      correlationId: 'foreign-corr',
+      seq: 601,
+      body: 'FOREIGN-SECRET-BODY',
+      acknowledged: false,
+    });
+
+    const app = makeApp();
+    const legacy = await app.request('/api/dispatch/messages?recipient=grokbot&limit=500');
+    expect(legacy.status).toBe(200);
+    const legacyRows = (await legacy.json()) as Array<{ id: string }>;
+    expect(Array.isArray(legacyRows)).toBe(true);
+    expect(legacyRows).toHaveLength(500);
+    expect(legacyRows.map(row => row.id)).not.toContain('newer-own');
+
+    const own = await app.request(
+      '/api/dispatch/messages?recipient=%20GrokBot%20&message_id=newer-own'
+    );
+    expect(own.status).toBe(200);
+    const ownRows = (await own.json()) as Array<{ id: string; body: string; recipient: string }>;
+    expect(ownRows.map(row => row.id)).toEqual(['newer-own']);
+    expect(ownRows[0]?.recipient).toBe('grokbot');
+    expect(ownRows[0]?.body).toBe('NEWER-OWN-BODY');
+    expect(ownRows[0]).not.toHaveProperty('cursor_seq');
+
+    const foreign = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&message_id=foreign-own-id'
+    );
+    const unknown = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&message_id=missing-message'
+    );
+    expect(foreign.status).toBe(200);
+    expect(unknown.status).toBe(200);
+    const foreignBody = await foreign.json();
+    const unknownBody = await unknown.json();
+    expect(foreignBody).toEqual([]);
+    expect(unknownBody).toEqual(foreignBody);
+    expect(JSON.stringify(foreignBody)).not.toContain('FOREIGN-SECRET-BODY');
+
+    process.env.ARCHON_OPERATOR_TOKEN = 'operator-secret-must-not-gate-reads';
+    const blocked = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&message_id=newer-own'
+    );
+    expect(blocked.status).toBe(401);
+    expect(JSON.stringify(await blocked.json())).not.toContain('NEWER-OWN-BODY');
+    const gated = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&message_id=newer-own',
+      { headers: { 'x-archon-operator-token': 'operator-secret-must-not-gate-reads' } }
+    );
+    expect(gated.status).toBe(200);
+    expect((await gated.json()) as Array<{ id: string }>).toEqual([
+      expect.objectContaining({ id: 'newer-own' }),
+    ]);
+    const stillHidden = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&message_id=foreign-own-id',
+      { headers: { 'x-archon-operator-token': 'operator-secret-must-not-gate-reads' } }
+    );
+    expect(await stillHidden.json()).toEqual([]);
+  });
+
+  test('test120 pages an own inbox past interleaved foreign rows', async () => {
+    for (let index = 0; index < 501; index += 1) {
+      await insertSyntheticDispatch({
+        id: `own-${index}`,
+        recipient: 'grokbot',
+        correlationId: `own-corr-${index}`,
+        seq: index * 2 + 1,
+        body: `OWN-BODY-${index}`,
+        acknowledged: false,
+      });
+      await insertSyntheticDispatch({
+        id: `other-${index}`,
+        recipient: 'xo',
+        correlationId: `other-corr-${index}`,
+        seq: index * 2 + 2,
+        body: `OTHER-SECRET-${index}`,
+        acknowledged: false,
+      });
+    }
+    const app = makeApp();
+    const firstResponse = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&limit=500'
+    );
+    expect(firstResponse.status).toBe(200);
+    const first = (await firstResponse.json()) as {
+      messages: Array<{ id: string; recipient: string; cursor_seq?: number }>;
+      next_after_seq: number;
+      page_full: boolean;
+    };
+    expect(Array.isArray(first)).toBe(false);
+    expect(first.page_full).toBe(true);
+    expect(first.messages).toHaveLength(500);
+    expect(first.messages.every(message => message.recipient === 'grokbot')).toBe(true);
+    expect(first.messages.some(message => message.cursor_seq !== undefined)).toBe(false);
+    expect(first.messages.map(message => message.id)).toEqual(
+      Array.from({ length: 500 }, (_unused, index) => `own-${index}`)
+    );
+    const seen = new Set(first.messages.map(message => message.id));
+
+    const secondResponse = await app.request(
+      `/api/dispatch/messages?recipient=grokbot&after_seq=${first.next_after_seq}&limit=500`
+    );
+    const second = (await secondResponse.json()) as {
+      messages: Array<{ id: string; recipient: string }>;
+      next_after_seq: number;
+      page_full: boolean;
+    };
+    expect(second.messages.map(message => message.id)).toEqual(['own-500']);
+    expect(second.page_full).toBe(false);
+    expect(seen.has('own-500')).toBe(false);
+    expect(second.next_after_seq).toBeGreaterThan(first.next_after_seq);
+
+    const emptyResponse = await app.request(
+      `/api/dispatch/messages?recipient=grokbot&after_seq=${second.next_after_seq}&limit=500`
+    );
+    expect(await emptyResponse.json()).toEqual({
+      messages: [],
+      next_after_seq: second.next_after_seq,
+      page_full: false,
+    });
+    const text = JSON.stringify({ first, second });
+    expect(text).not.toContain('OTHER-SECRET');
+  });
+
+  test('test121 returns own correlation replies behind unrelated history', async () => {
+    for (let index = 0; index < 501; index += 1) {
+      await insertSyntheticDispatch({
+        id: `unrelated-${index}`,
+        recipient: 'grokbot',
+        correlationId: `unrelated-${index}`,
+        seq: index + 1,
+        body: `UNRELATED-${index}`,
+        acknowledged: true,
+      });
+    }
+    await insertSyntheticDispatch({
+      id: 'own-reply-1',
+      recipient: 'grokbot',
+      correlationId: 'board-brief-target',
+      seq: 700,
+      body: 'OWN-REPLY-1',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'own-reply-2',
+      recipient: 'grokbot',
+      correlationId: 'board-brief-target',
+      seq: 701,
+      body: 'OWN-REPLY-2',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'foreign-reply',
+      recipient: 'xo',
+      correlationId: 'board-brief-target',
+      seq: 702,
+      body: 'FOREIGN-REPLY-SECRET',
+      acknowledged: false,
+    });
+    for (let index = 0; index < 501; index += 1) {
+      await insertSyntheticDispatch({
+        id: `capped-${index}`,
+        recipient: 'grokbot',
+        correlationId: 'capped-correlation',
+        seq: 1000 + index,
+        body: `CAPPED-${index}`,
+        acknowledged: false,
+      });
+    }
+
+    const app = makeApp();
+    const own = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=board-brief-target&limit=500'
+    );
+    expect(own.status).toBe(200);
+    const ownRows = (await own.json()) as Array<{ id: string; body: string }>;
+    expect(ownRows.map(row => row.id).sort()).toEqual(['own-reply-1', 'own-reply-2']);
+    expect(JSON.stringify(ownRows)).not.toContain('FOREIGN-REPLY-SECRET');
+    expect(JSON.stringify(ownRows)).not.toContain('UNRELATED-0');
+
+    const foreign = await app.request(
+      '/api/dispatch/messages?recipient=xo&correlation_id=board-brief-target&limit=500'
+    );
+    const foreignRows = (await foreign.json()) as Array<{ id: string }>;
+    expect(foreignRows.map(row => row.id)).toEqual(['foreign-reply']);
+
+    const capped = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=capped-correlation&limit=500'
+    );
+    expect(capped.status).toBe(200);
+    const cappedRows = (await capped.json()) as Array<{ id: string }>;
+    expect(Array.isArray(cappedRows)).toBe(true);
+    expect(cappedRows).toHaveLength(500);
+    expect(cappedRows.map(row => row.id)).not.toContain('capped-0');
+  });
+
+  test('test122 keeps legacy list arrays and rejects bad selectors', async () => {
+    const visible = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'legacy-visible',
+      recipient: 'codex',
+      body: 'LEGACY-VISIBLE',
+    });
+    await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'legacy-other',
+      correlation_id: 'other-corr',
+      recipient: 'operator',
+      body: 'LEGACY-OTHER',
+    });
+    const deferred = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'legacy-deferred',
+      recipient: 'grokbot',
+      body: 'DEFERRED-BODY',
+      not_before: '2999-01-01T00:00:00.000Z',
+    });
+    const app = makeApp();
+
+    const legacy = await app.request(
+      '/api/dispatch/messages?recipient=codex&status=queued&limit=10'
+    );
+    expect(legacy.status).toBe(200);
+    const legacyRows = (await legacy.json()) as Array<{ id: string }>;
+    expect(legacyRows.map(row => row.id)).toEqual([visible.id]);
+
+    const unknownKey = await app.request('/api/dispatch/messages?recipient=codex&not_a_selector=1');
+    expect(unknownKey.status).toBe(200);
+    expect(Array.isArray(await unknownKey.json())).toBe(true);
+
+    const clamped = await app.request('/api/dispatch/messages?recipient=codex&limit=9999');
+    expect(clamped.status).toBe(200);
+    expect(Array.isArray(await clamped.json())).toBe(true);
+
+    const queued = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&status=queued&limit=50'
+    );
+    expect(await queued.json()).toEqual({ messages: [], next_after_seq: 0, page_full: false });
+    const anyStatus = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&limit=50'
+    );
+    const anyPage = (await anyStatus.json()) as { messages: Array<{ id: string }> };
+    expect(anyPage.messages.map(message => message.id)).toContain(deferred.id);
+
+    const invalidUrls = [
+      '/api/dispatch/messages?recipient=grokbot&message_id=&after_seq=0',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&correlation_id=def',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&after_seq=0',
+      '/api/dispatch/messages?message_id=abc',
+      '/api/dispatch/messages?recipient=%20%20&message_id=abc',
+      '/api/dispatch/messages?recipient=grokbot&recipient=xo&message_id=abc',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&message_id=def',
+      '/api/dispatch/messages?recipient=grokbot&message_id=',
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=-1',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=1.5',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=00',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=1e2',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=%2B1',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&limit=1',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&status=queued',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&subject_key=wo:WO-MAILBOX',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&route_disposition=auto_surfaced',
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=abc&status=queued',
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=abc&subject_key=wo:WO-MAILBOX',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&subject_key=wo:WO-MAILBOX',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&route_disposition=auto_surfaced',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&extra=1',
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=abc&limit=0',
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=abc&limit=501',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&limit=1.2',
+    ];
+    for (const url of invalidUrls) {
+      const response = await app.request(url);
+      expect(response.status).toBe(400);
+      expect(((await response.json()) as { error: string }).error).toBe(
+        'dispatch_list_selector_invalid'
+      );
+    }
+
+    const badStatus = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&status=not-a-status'
+    );
+    expect(badStatus.status).toBe(400);
+    const badStatusBody = (await badStatus.json()) as { error?: string; body?: string };
+    expect(badStatusBody.body).toBeUndefined();
+    expect(JSON.stringify(badStatusBody)).not.toContain('DEFERRED-BODY');
+
+    const specResponse = await app.request('/api/openapi.json');
+    const spec = (await specResponse.json()) as {
+      paths: Record<string, { get?: { responses?: Record<string, unknown> } }>;
+      components: { schemas: Record<string, { properties?: Record<string, unknown> }> };
+    };
+    expect(spec.paths['/api/dispatch/messages']?.get?.responses?.['400']).toBeDefined();
+    expect(spec.components.schemas.DispatchMessage?.properties?.cursor_seq).toBeUndefined();
+    expect(spec.components.schemas.DispatchMessageCursorPage?.properties).toMatchObject({
+      messages: expect.anything(),
+      next_after_seq: expect.anything(),
+      page_full: expect.anything(),
+    });
+  });
+
+  test('test124 config does not activate inactive companion principals', async () => {
+    const seeded = await db.query<{
+      principal_id: string;
+      active: number;
+      delivery_mode: string;
+    }>(
+      `SELECT principal_id, active, delivery_mode
+       FROM dispatch_principals
+       WHERE principal_id IN ('dot', 'duet', 'grokbot', 'muse')
+       ORDER BY principal_id`
+    );
+    expect(seeded.rows).toEqual([
+      { principal_id: 'dot', active: 0, delivery_mode: 'drain_on_start' },
+      { principal_id: 'duet', active: 0, delivery_mode: 'drain_on_start' },
+      { principal_id: 'grokbot', active: 1, delivery_mode: 'drain_on_start' },
+      { principal_id: 'muse', active: 0, delivery_mode: 'drain_on_start' },
+    ]);
+
+    const app = makeApp('secret-token');
+    for (const recipient of ['dot', 'muse', 'duet']) {
+      const rejected = await app.request('/api/dispatch/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+        body: JSON.stringify({
+          ...VALID_BODY,
+          idempotency_key: `inactive-${recipient}`,
+          recipient,
+          body: `delivery to inactive ${recipient}`,
+        }),
+      });
+      expect(rejected.status).toBe(400);
+      expect(((await rejected.json()) as { error: string }).error).toBe(
+        'dispatch_recipient_rejected:inactive_principal'
+      );
+    }
+
+    await db.query(
+      `INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
+       VALUES ('synth-active-slot', 'Synthetic active slot', 'drain_on_start', 1)`
+    );
+    const accepted = await app.request('/api/dispatch/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+      body: JSON.stringify({
+        ...VALID_BODY,
+        idempotency_key: 'synth-active-create',
+        recipient: 'synth-active-slot',
+        body: 'delivery to an explicitly activated synthetic principal',
+      }),
+    });
+    expect(accepted.status).toBe(200);
+    expect(((await accepted.json()) as { recipient: string }).recipient).toBe('synth-active-slot');
+
+    const stillInactive = await db.query<{ principal_id: string; active: number }>(
+      `SELECT principal_id, active FROM dispatch_principals
+       WHERE principal_id IN ('dot', 'muse', 'duet')
+       ORDER BY principal_id`
+    );
+    expect(stillInactive.rows).toEqual([
+      { principal_id: 'dot', active: 0 },
+      { principal_id: 'duet', active: 0 },
+      { principal_id: 'muse', active: 0 },
+    ]);
+    expect((await db.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(1);
   });
 });

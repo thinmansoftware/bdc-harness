@@ -159,12 +159,32 @@ Read only when `board_record_propose` runs, after local path and ruling checks:
 
 ## Enable a disabled slot
 
+Editing the companion config and restarting the process enables only the MCP
+slot. That change does not activate the slot's Dispatch principal, does not
+flip `active`, and does not register a credential.
+
+A working mailbox also requires three separate operator steps. Their absence
+is a blocker. Each one stays on the already governed operator process, and
+none of them is performed by a config edit:
+
+1. Dispatch principal activation for that slot.
+2. `DISPATCH_PRINCIPALS_JSON` registration for that principal.
+3. Delivery of a matching Dispatch credential file.
+
+This section does not activate a principal, register a credential, or give a
+SQL statement, a live command, or a credential value. Those duties stay behind
+the go-live gates below. Config enablement is not those gates.
+
+To enable the MCP slot itself:
+
 1. Edit the config. Set `enabled` to true for that slot only.
 2. Confirm `board_secretary` stays false until that companion has been checked for MCP support, data retention, training use, and staff access.
-3. Install that slot's digest file and Dispatch credential file.
+3. Install that slot's digest file and the already delivered Dispatch credential file. Delivery of the credential remains the separate blocker above.
 4. Restart the process.
 
 No image rebuild is required for an enablement that only changes config.
+Dot, Muse, and Duet stay inactive in Dispatch until that separate activation.
+Config alone does not make delivery succeed.
 
 ## Bearer token mint
 

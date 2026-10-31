@@ -99,12 +99,21 @@ export const dispatchMailboxPrincipalBodySchema = z
   .strict()
   .openapi('DispatchMailboxPrincipalBody');
 
+// Duplicate query keys arrive as arrays. Accept them here so the route parser
+// can reject a selected request by name instead of a generic type error.
+const dispatchQueryString = z.union([z.string(), z.array(z.string()).min(1)]);
+
 export const listDispatchMessagesQuerySchema = z.object({
-  recipient: z.string().optional(),
-  status: dispatchMessageStatusSchema.optional(),
-  limit: z.string().optional(),
-  subject_key: z.string().optional(),
-  route_disposition: dispatchRouteDispositionSchema.optional(),
+  recipient: dispatchQueryString.optional(),
+  status: z.union([dispatchMessageStatusSchema, z.array(z.string()).min(1)]).optional(),
+  limit: dispatchQueryString.optional(),
+  subject_key: dispatchQueryString.optional(),
+  route_disposition: z
+    .union([dispatchRouteDispositionSchema, z.array(z.string()).min(1)])
+    .optional(),
+  message_id: dispatchQueryString.optional(),
+  correlation_id: dispatchQueryString.optional(),
+  after_seq: dispatchQueryString.optional(),
 });
 
 export const claimDispatchMessageBodySchema = z
@@ -176,6 +185,18 @@ export const heartbeatDispatchWorkerBodySchema = z
 export const dispatchMessageListResponseSchema = z
   .array(dispatchMessageSchema)
   .openapi('DispatchMessageListResponse');
+
+export const dispatchMessageCursorPageSchema = z
+  .object({
+    messages: z.array(dispatchMessageSchema),
+    next_after_seq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    page_full: z.boolean(),
+  })
+  .openapi('DispatchMessageCursorPage');
+
+export const dispatchMessageListOrCursorResponseSchema = z
+  .union([dispatchMessageListResponseSchema, dispatchMessageCursorPageSchema])
+  .openapi('DispatchMessageListOrCursorResponse');
 
 export const dispatchStatusQuerySchema = z.object({
   worker_stale_after_ms: z.coerce.number().int().positive().max(86_400_000).optional(),

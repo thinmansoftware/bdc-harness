@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto';
 
-import { utcCompact } from '../constants';
+import { DISPATCH_LIST_LIMIT, utcCompact } from '../constants';
 import { DispatchClient } from '../dispatch-client';
 import { ToolFailure } from '../errors';
-import type { CompanionSlot, DispatchWireMessage } from '../types';
+import type { CompanionSlot, DispatchCursorPage, DispatchWireMessage } from '../types';
 
 export async function mailboxSend(
   dispatch: DispatchClient,
@@ -34,9 +34,10 @@ export async function mailboxSend(
 export async function mailboxList(
   dispatch: DispatchClient,
   slot: CompanionSlot,
-  status: string | undefined
-): Promise<DispatchWireMessage[]> {
-  return dispatch.list(slot, status);
+  status: string | undefined,
+  afterSeq = 0
+): Promise<DispatchCursorPage> {
+  return dispatch.listPage(slot, afterSeq, status);
 }
 
 export async function mailboxRead(
@@ -44,11 +45,11 @@ export async function mailboxRead(
   slot: CompanionSlot,
   id: string
 ): Promise<DispatchWireMessage> {
-  const messages = await dispatch.list(slot);
+  const messages = await dispatch.readById(slot, id);
   const found = messages.find(
     message => message.id === id && message.recipient === slot.dispatch_principal_id
   );
-  if (found === undefined) {
+  if (messages.length === 0 || found === undefined) {
     throw new ToolFailure('refused', 'not_own_message');
   }
   return found;
@@ -109,7 +110,10 @@ export async function boardRepliesCollect(
   if (correlationId.trim() === '') {
     throw new ToolFailure('refused', 'query_required');
   }
-  const messages = await dispatch.list(slot);
+  const messages = await dispatch.listByCorrelation(slot, correlationId);
+  if (messages.length === DISPATCH_LIST_LIMIT) {
+    throw new ToolFailure('error', 'collection_limit');
+  }
   return messages.filter(
     message =>
       message.recipient === slot.dispatch_principal_id && message.correlation_id === correlationId

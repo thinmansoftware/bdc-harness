@@ -113,6 +113,21 @@ interface StoredMessage {
   task_type: string;
 }
 
+function refuseOperatorCredential(
+  request: RecordedHttpRequest
+): { status: number; body: unknown } | null {
+  if (
+    request.headers.authorization !== undefined ||
+    request.headers['x-archon-operator-token'] !== undefined
+  ) {
+    return { status: 403, body: { error: 'operator_credential_refused' } };
+  }
+  if (request.headers['x-dispatch-principal-id'] !== 'grokbot') {
+    return { status: 401, body: { error: 'principal_required' } };
+  }
+  return null;
+}
+
 function dispatchStub(seed: StoredMessage[] = []): {
   handler: (request: RecordedHttpRequest) => { status: number; body: unknown };
   messages: StoredMessage[];
@@ -121,9 +136,37 @@ function dispatchStub(seed: StoredMessage[] = []): {
   return {
     messages,
     handler: request => {
+      const refused = refuseOperatorCredential(request);
+      if (refused !== null) return refused;
       if (request.method === 'GET') {
-        const recipient = new URL(request.path, 'http://stub.local').searchParams.get('recipient');
-        return { status: 200, body: messages.filter(message => message.recipient === recipient) };
+        const params = new URL(request.path, 'http://stub.local').searchParams;
+        const recipient = params.get('recipient');
+        const messageId = params.get('message_id');
+        const correlationId = params.get('correlation_id');
+        const afterSeq = params.get('after_seq');
+        const selectors = [messageId, correlationId, afterSeq].filter(value => value !== null);
+        if (selectors.length !== 1 || recipient === null || recipient.trim() === '') {
+          return { status: 400, body: { error: 'dispatch_list_selector_invalid' } };
+        }
+        const own = messages.filter(message => message.recipient === recipient);
+        if (messageId !== null) {
+          return { status: 200, body: own.filter(message => message.id === messageId).slice(0, 1) };
+        }
+        if (correlationId !== null) {
+          return {
+            status: 200,
+            body: own.filter(message => message.correlation_id === correlationId),
+          };
+        }
+        const cursor = Number(afterSeq);
+        return {
+          status: 200,
+          body: {
+            messages: own,
+            next_after_seq: Number.isSafeInteger(cursor) ? cursor : 0,
+            page_full: false,
+          },
+        };
       }
       const body = request.body as Record<string, unknown>;
       const stored: StoredMessage = {
@@ -242,6 +285,15 @@ describe('board secretary tools', () => {
           status: 'queued',
           task_type: 'agent_message',
         });
+        dispatch.messages.push({
+          id: 'reply-foreign',
+          correlation_id: correlation,
+          sender: 'astra',
+          recipient: 'xo',
+          body: 'FOREIGN-REPLY-BODY',
+          status: 'queued',
+          task_type: 'agent_message',
+        });
         const collected = parseToolJson(
           await callToolText(client, 'board_replies_collect', { correlation_id: correlation })
         );
@@ -249,7 +301,51 @@ describe('board secretary tools', () => {
         expect(messages.map(message => message.body)).toEqual(['ASTRA-REPLY-BODY']);
         expect(messages.every(message => message.correlation_id === correlation)).toBe(true);
         expect(JSON.stringify(collected)).not.toContain('NOISE-OTHER-CORRELATION');
+        expect(JSON.stringify(collected)).not.toContain('FOREIGN-REPLY-BODY');
+        const collects = server.requests.filter(
+          request => request.method === 'GET' && request.path.includes('correlation_id=')
+        );
+        expect(collects).toHaveLength(1);
+        expect(collects[0]?.path).toContain('recipient=grokbot');
+        expect(collects[0]?.path).toContain(`correlation_id=${encodeURIComponent(correlation)}`);
+        expect(collects[0]?.path).toContain('limit=500');
+        expect(collects[0]?.headers['x-dispatch-principal-id']).toBe('grokbot');
+        expect(collects[0]?.headers['x-dispatch-principal-token']).toBe(harness.dispatchToken);
+        expect(collects[0]?.headers.authorization).toBeUndefined();
+        expect(collects[0]?.headers['x-archon-operator-token']).toBeUndefined();
       });
+    } finally {
+      await running.close();
+      await server.close();
+      await harness.cleanup();
+    }
+  });
+
+  test('board_replies_collect_refuses_a_full_500_row_page', async () => {
+    const full = Array.from({ length: 500 }, (_unused, index) => ({
+      id: `full-${index}`,
+      correlation_id: 'full-correlation',
+      sender: 'astra',
+      recipient: 'grokbot',
+      body: `FULL-ROW-${index}`,
+      status: 'queued',
+      task_type: 'agent_message',
+    }));
+    const bounded = dispatchStub(full);
+    const server = await startRecordingServer(bounded.handler);
+    const harness = await createHarness();
+    const running = await startFromHarness(harness, { DISPATCH_BASE_URL: server.url });
+    try {
+      await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
+        const refusedText = await callToolText(client, 'board_replies_collect', {
+          correlation_id: 'full-correlation',
+        });
+        const refused = parseToolJson(refusedText);
+        expect(refused.error).toBe('collection_limit');
+        expect(refusedText).not.toContain('FULL-ROW-0');
+        expect(refused.messages).toBeUndefined();
+      });
+      expect(server.requests.filter(request => request.method === 'GET')).toHaveLength(1);
     } finally {
       await running.close();
       await server.close();

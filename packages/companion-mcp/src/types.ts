@@ -27,6 +27,12 @@ export interface DispatchWireMessage {
   task_type: string;
 }
 
+export interface DispatchCursorPage {
+  messages: DispatchWireMessage[];
+  next_after_seq: number;
+  page_full: boolean;
+}
+
 export interface ProposalFile {
   path: string;
   content: string;

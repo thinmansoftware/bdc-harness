@@ -69,6 +69,7 @@ export const TOOL_INPUT_SCHEMAS: Record<ToolName, JsonSchema> = {
     type: 'object',
     properties: {
       status: { type: 'string' },
+      after_seq: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
     },
   },
   mailbox_read: idSchema,
