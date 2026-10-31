@@ -66,6 +66,36 @@ not part of this transport.
 Denials use the existing principal error codes. Responses do not echo tokens,
 header values, or digests.
 
+## Queued after_seq cursor
+
+A queued `after_seq` read is one bounded ascending page for that recipient
+and `status=queued`. The page does not use the open-row SQL filter. Cursor
+calculation therefore still sees a deferred row.
+
+Addressed rows (`addressed_at` set) and route-disposed rows
+(`route_disposition` set) are skipped. Their bodies are not returned, and the
+safe cursor advances over each skipped sequence. `acknowledged_at` by itself
+does not skip a row.
+
+The first otherwise-open row whose `not_before` is strictly in the future is
+a barrier. The response returns only eligible earlier rows and stops before
+that sequence. The barrier and every later row stay out of this page.
+`next_after_seq` remains the last safe sequence before the barrier.
+`page_full` is false. That false value means the walk stopped at a deferral.
+Later queued rows for this recipient can still be waiting. Poll again from
+the returned `next_after_seq` on a later normal poll. Do not busy-loop.
+
+A raw page filled with addressed or route-disposed rows sets `page_full` to
+true when that raw page reaches its limit. Continue from `next_after_seq`.
+`page_full` follows the raw page size, not the number of visible messages.
+
+A non-null `not_before` that cannot be parsed fails the request with
+`dispatch_not_before_unparseable`. The response has no message body and no
+cursor fields, and the stored delay stays in place.
+
+Other recipients are unaffected. Legacy list, `message_id`, `correlation_id`,
+and non-queued `after_seq` keep their existing behavior.
+
 ## Preserved limitation
 
 When both principal headers are omitted, a matching `Host` and

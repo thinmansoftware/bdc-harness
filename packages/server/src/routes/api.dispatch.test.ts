@@ -290,14 +290,18 @@ async function insertSyntheticDispatch(input: {
   body: string;
   acknowledged: boolean;
   notBefore?: string | null;
+  addressedAt?: string | null;
+  routeDisposition?: DispatchMessage['route_disposition'];
 }): Promise<void> {
   const createdAt = new Date(Date.UTC(2020, 0, 1) + input.seq * 1000).toISOString();
   await db.query(
     `INSERT INTO agent_dispatch_messages (
        id, correlation_id, idempotency_key, task_type, sender, recipient, body, status,
-       created_at, priority, fencing_token, acknowledged_at, acknowledged_by, not_before, seq
+       created_at, priority, fencing_token, acknowledged_at, acknowledged_by, not_before, seq,
+       addressed_at, route_disposition
      ) VALUES (
-       $1, $2, $3, 'agent_message', 'xo', $4, $5, 'queued', $6, 'normal', 0, $7, $8, $9, $10
+       $1, $2, $3, 'agent_message', 'xo', $4, $5, 'queued', $6, 'normal', 0, $7, $8, $9, $10,
+       $11, $12
      )`,
     [
       input.id,
@@ -310,8 +314,35 @@ async function insertSyntheticDispatch(input: {
       input.acknowledged ? input.recipient : null,
       input.notBefore ?? null,
       input.seq,
+      input.addressedAt ?? null,
+      input.routeDisposition ?? null,
     ]
   );
+}
+
+const QUEUED_CURSOR_DUE = '2000-01-01T00:00:00.000Z';
+const QUEUED_CURSOR_FUTURE = '2999-01-01T00:00:00.000Z';
+
+async function pollQueuedCursor(
+  app: OpenAPIHono,
+  afterSeq: number,
+  limit: number
+): Promise<{
+  messages: Array<{ id: string; body: string; recipient: string }>;
+  next_after_seq: number;
+  page_full: boolean;
+}> {
+  const response = await app.request(
+    `/api/dispatch/messages?recipient=grokbot&status=queued&after_seq=${afterSeq}&limit=${limit}`
+  );
+  expect(response.status).toBe(200);
+  const body = (await response.json()) as {
+    messages: Array<{ id: string; body: string; recipient: string }>;
+    next_after_seq: number;
+    page_full: boolean;
+  };
+  expect(JSON.stringify(body)).not.toContain('cursor_seq');
+  return body;
 }
 
 function makeApp(
@@ -2567,6 +2598,303 @@ describe('dispatch API', () => {
       next_after_seq: expect.anything(),
       page_full: expect.anything(),
     });
+  });
+
+  test('queued after_seq holds a future row until it is due', async () => {
+    await insertSyntheticDispatch({
+      id: 'future-10',
+      recipient: 'grokbot',
+      correlationId: 'future-10-corr',
+      seq: 10,
+      body: 'FUTURE-BODY-10',
+      acknowledged: false,
+      notBefore: QUEUED_CURSOR_FUTURE,
+    });
+    await insertSyntheticDispatch({
+      id: 'ready-11',
+      recipient: 'grokbot',
+      correlationId: 'ready-11-corr',
+      seq: 11,
+      body: 'READY-BODY-11',
+      acknowledged: false,
+    });
+    const app = makeApp();
+    const blocked = await pollQueuedCursor(app, 9, 50);
+    expect(blocked).toEqual({ messages: [], next_after_seq: 9, page_full: false });
+    expect(JSON.stringify(blocked)).not.toContain('FUTURE-BODY-10');
+    expect(JSON.stringify(blocked)).not.toContain('READY-BODY-11');
+
+    await db.query('UPDATE agent_dispatch_messages SET not_before = $1 WHERE id = $2', [
+      QUEUED_CURSOR_DUE,
+      'future-10',
+    ]);
+    const delivered = await pollQueuedCursor(app, 9, 50);
+    expect(delivered.messages.map(message => message.id)).toEqual(['future-10', 'ready-11']);
+    expect(delivered.messages.map(message => message.body)).toEqual([
+      'FUTURE-BODY-10',
+      'READY-BODY-11',
+    ]);
+    expect(delivered.next_after_seq).toBe(11);
+    expect(delivered.page_full).toBe(false);
+
+    const drained = await pollQueuedCursor(app, delivered.next_after_seq, 50);
+    expect(drained).toEqual({ messages: [], next_after_seq: 11, page_full: false });
+    expect(JSON.stringify(drained)).not.toContain('FUTURE-BODY-10');
+    expect(JSON.stringify(drained)).not.toContain('READY-BODY-11');
+  });
+
+  test('queued after_seq returns the ready row before a future barrier', async () => {
+    await insertSyntheticDispatch({
+      id: 'ready-9',
+      recipient: 'grokbot',
+      correlationId: 'ready-9-corr',
+      seq: 9,
+      body: 'READY-BODY-9',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'future-10',
+      recipient: 'grokbot',
+      correlationId: 'future-10-corr',
+      seq: 10,
+      body: 'FUTURE-BODY-10',
+      acknowledged: false,
+      notBefore: QUEUED_CURSOR_FUTURE,
+    });
+    await insertSyntheticDispatch({
+      id: 'ready-11',
+      recipient: 'grokbot',
+      correlationId: 'ready-11-corr',
+      seq: 11,
+      body: 'READY-BODY-11',
+      acknowledged: false,
+    });
+    const app = makeApp();
+    const blocked = await pollQueuedCursor(app, 0, 50);
+    expect(blocked.messages.map(message => message.id)).toEqual(['ready-9']);
+    expect(blocked.messages.map(message => message.body)).toEqual(['READY-BODY-9']);
+    expect(blocked.next_after_seq).toBe(9);
+    expect(blocked.page_full).toBe(false);
+    expect(JSON.stringify(blocked)).not.toContain('FUTURE-BODY-10');
+    expect(JSON.stringify(blocked)).not.toContain('READY-BODY-11');
+
+    await db.query('UPDATE agent_dispatch_messages SET not_before = $1 WHERE id = $2', [
+      QUEUED_CURSOR_DUE,
+      'future-10',
+    ]);
+    const delivered = await pollQueuedCursor(app, blocked.next_after_seq, 50);
+    expect(delivered.messages.map(message => message.id)).toEqual(['future-10', 'ready-11']);
+    expect(delivered.next_after_seq).toBe(11);
+    expect(delivered.page_full).toBe(false);
+    expect(delivered.messages.map(message => message.id)).not.toContain('ready-9');
+  });
+
+  test('queued after_seq advances over a full page of hidden rows', async () => {
+    for (let index = 0; index < 500; index += 1) {
+      const addressed = index % 2 === 0;
+      await insertSyntheticDispatch({
+        id: `hidden-${index}`,
+        recipient: 'grokbot',
+        correlationId: `hidden-corr-${index}`,
+        seq: index + 1,
+        body: addressed ? `HIDDEN-ADDRESSED-${index}` : `HIDDEN-DISPOSED-${index}`,
+        acknowledged: false,
+        ...(addressed
+          ? { addressedAt: '2020-01-01T00:00:00.000Z' }
+          : { routeDisposition: 'auto_surfaced' }),
+      });
+    }
+    await insertSyntheticDispatch({
+      id: 'ready-501',
+      recipient: 'grokbot',
+      correlationId: 'ready-501-corr',
+      seq: 501,
+      body: 'READY-BACKLOG-501',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'foreign-hidden',
+      recipient: 'xo',
+      correlationId: 'foreign-hidden-corr',
+      seq: 250,
+      body: 'FOREIGN-CURSOR-SECRET',
+      acknowledged: false,
+    });
+    const app = makeApp();
+    const first = await pollQueuedCursor(app, 0, 500);
+    expect(first.messages).toEqual([]);
+    expect(first.page_full).toBe(true);
+    expect(first.next_after_seq).toBe(500);
+    const firstText = JSON.stringify(first);
+    expect(firstText).not.toContain('HIDDEN-ADDRESSED-0');
+    expect(firstText).not.toContain('HIDDEN-DISPOSED-1');
+    expect(firstText).not.toContain('READY-BACKLOG-501');
+    expect(firstText).not.toContain('FOREIGN-CURSOR-SECRET');
+
+    const second = await pollQueuedCursor(app, first.next_after_seq, 500);
+    expect(second.messages.map(message => message.id)).toEqual(['ready-501']);
+    expect(second.messages.map(message => message.body)).toEqual(['READY-BACKLOG-501']);
+    expect(second.page_full).toBe(false);
+    expect(second.next_after_seq).toBe(501);
+    expect(second.next_after_seq).toBeGreaterThan(first.next_after_seq);
+    const secondText = JSON.stringify(second);
+    expect(secondText).not.toContain('HIDDEN-ADDRESSED-0');
+    expect(secondText).not.toContain('HIDDEN-DISPOSED-499');
+    expect(secondText).not.toContain('FOREIGN-CURSOR-SECRET');
+  });
+
+  test('queued after_seq stops at a barrier on a full raw page boundary', async () => {
+    await insertSyntheticDispatch({
+      id: 'boundary-ready',
+      recipient: 'grokbot',
+      correlationId: 'boundary-ready-corr',
+      seq: 1,
+      body: 'BOUNDARY-READY-BODY',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'boundary-future',
+      recipient: 'grokbot',
+      correlationId: 'boundary-future-corr',
+      seq: 2,
+      body: 'BOUNDARY-FUTURE-BODY',
+      acknowledged: false,
+      notBefore: QUEUED_CURSOR_FUTURE,
+    });
+    await insertSyntheticDispatch({
+      id: 'boundary-later',
+      recipient: 'grokbot',
+      correlationId: 'boundary-later-corr',
+      seq: 3,
+      body: 'BOUNDARY-LATER-BODY',
+      acknowledged: false,
+    });
+    const page = await pollQueuedCursor(makeApp(), 0, 2);
+    expect(page.messages.map(message => message.id)).toEqual(['boundary-ready']);
+    expect(page.next_after_seq).toBe(1);
+    expect(page.page_full).toBe(false);
+    const text = JSON.stringify(page);
+    expect(text).not.toContain('BOUNDARY-FUTURE-BODY');
+    expect(text).not.toContain('BOUNDARY-LATER-BODY');
+  });
+
+  test('queued after_seq skips future addressed and route-disposed rows', async () => {
+    await insertSyntheticDispatch({
+      id: 'addressed-future',
+      recipient: 'grokbot',
+      correlationId: 'addressed-future-corr',
+      seq: 1,
+      body: 'ADDRESSED-FUTURE-BODY',
+      acknowledged: false,
+      notBefore: QUEUED_CURSOR_FUTURE,
+      addressedAt: '2020-01-01T00:00:00.000Z',
+    });
+    await insertSyntheticDispatch({
+      id: 'disposed-future',
+      recipient: 'grokbot',
+      correlationId: 'disposed-future-corr',
+      seq: 2,
+      body: 'DISPOSED-FUTURE-BODY',
+      acknowledged: false,
+      notBefore: QUEUED_CURSOR_FUTURE,
+      routeDisposition: 'expired',
+    });
+    await insertSyntheticDispatch({
+      id: 'acked-ready',
+      recipient: 'grokbot',
+      correlationId: 'acked-ready-corr',
+      seq: 3,
+      body: 'ACKED-READY-BODY',
+      acknowledged: true,
+    });
+    await insertSyntheticDispatch({
+      id: 'after-terminal',
+      recipient: 'grokbot',
+      correlationId: 'after-terminal-corr',
+      seq: 4,
+      body: 'AFTER-TERMINAL-BODY',
+      acknowledged: false,
+    });
+    const page = await pollQueuedCursor(makeApp(), 0, 50);
+    expect(page.messages.map(message => message.id)).toEqual(['acked-ready', 'after-terminal']);
+    expect(page.next_after_seq).toBe(4);
+    expect(page.page_full).toBe(false);
+    const text = JSON.stringify(page);
+    expect(text).not.toContain('ADDRESSED-FUTURE-BODY');
+    expect(text).not.toContain('DISPOSED-FUTURE-BODY');
+  });
+
+  test('queued after_seq pages ready rows and preserves an empty cursor', async () => {
+    const app = makeApp();
+    const empty = await pollQueuedCursor(app, 4, 1);
+    expect(empty).toEqual({ messages: [], next_after_seq: 4, page_full: false });
+
+    await insertSyntheticDispatch({
+      id: 'ready-a',
+      recipient: 'grokbot',
+      correlationId: 'ready-a-corr',
+      seq: 1,
+      body: 'READY-A-BODY',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'ready-b',
+      recipient: 'grokbot',
+      correlationId: 'ready-b-corr',
+      seq: 2,
+      body: 'READY-B-BODY',
+      acknowledged: false,
+    });
+    const first = await pollQueuedCursor(app, 0, 1);
+    expect(first.messages.map(message => message.id)).toEqual(['ready-a']);
+    expect(first.page_full).toBe(true);
+    expect(first.next_after_seq).toBe(1);
+    const second = await pollQueuedCursor(app, first.next_after_seq, 1);
+    expect(second.messages.map(message => message.id)).toEqual(['ready-b']);
+    expect(second.page_full).toBe(true);
+    expect(second.next_after_seq).toBeGreaterThan(first.next_after_seq);
+    const third = await pollQueuedCursor(app, second.next_after_seq, 1);
+    expect(third).toEqual({
+      messages: [],
+      next_after_seq: second.next_after_seq,
+      page_full: false,
+    });
+    expect(
+      [...first.messages, ...second.messages, ...third.messages].map(message => message.id)
+    ).toEqual(['ready-a', 'ready-b']);
+  });
+
+  test('queued after_seq fails closed when not_before is unparseable', async () => {
+    await insertSyntheticDispatch({
+      id: 'ready-before-bad',
+      recipient: 'grokbot',
+      correlationId: 'ready-before-bad-corr',
+      seq: 1,
+      body: 'READY-BEFORE-BAD-BODY',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'malformed-delay',
+      recipient: 'grokbot',
+      correlationId: 'malformed-delay-corr',
+      seq: 2,
+      body: 'MALFORMED-DELAY-BODY',
+      acknowledged: false,
+      notBefore: 'not-a-date',
+    });
+    const app = makeApp();
+    const url = '/api/dispatch/messages?recipient=grokbot&status=queued&after_seq=0&limit=50';
+    const first = await app.request(url);
+    expect(first.status).toBe(500);
+    expect(await first.json()).toEqual({ error: 'dispatch_not_before_unparseable' });
+    const second = await app.request(url);
+    expect(second.status).toBe(500);
+    expect(await second.json()).toEqual({ error: 'dispatch_not_before_unparseable' });
+    const stored = await db.query<{ not_before: string | null }>(
+      'SELECT not_before FROM agent_dispatch_messages WHERE id = $1',
+      ['malformed-delay']
+    );
+    expect(stored.rows[0]?.not_before).toBe('not-a-date');
   });
 
   test('test129 rejects duplicated legacy list filters with the historical validation body', async () => {

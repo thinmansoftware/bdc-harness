@@ -2862,6 +2862,53 @@ function parseDispatchListSelection(requestUrl: string): DispatchListSelection {
   return { kind: 'after_seq', recipient, afterSeq, status, limit };
 }
 
+/**
+ * One bounded queued page. Deferred rows stay in the raw page so the cursor
+ * cannot walk past them. The first otherwise-open future not_before stops
+ * the page before that sequence.
+ */
+function walkQueuedDispatchCursorPage(
+  rows: readonly dispatchDb.SeqCursorMessage[],
+  afterSeq: number,
+  dalLimit: number,
+  observedAtMs: number
+): {
+  messages: dispatchDb.DispatchMessage[];
+  next_after_seq: number;
+  page_full: boolean;
+} {
+  const messages: dispatchDb.DispatchMessage[] = [];
+  let safeCursor = afterSeq;
+  for (const row of rows) {
+    if (
+      !Number.isSafeInteger(row.cursor_seq) ||
+      row.cursor_seq < 0 ||
+      row.cursor_seq <= safeCursor
+    ) {
+      throw new Error('dispatch_cursor_not_finite');
+    }
+    const notBeforeMs = row.not_before === null ? null : Date.parse(row.not_before);
+    if (row.not_before !== null && !Number.isFinite(notBeforeMs)) {
+      throw new Error('dispatch_not_before_unparseable');
+    }
+    if (row.addressed_at !== null || row.route_disposition !== null) {
+      safeCursor = row.cursor_seq;
+      continue;
+    }
+    if (notBeforeMs !== null && notBeforeMs > observedAtMs) {
+      return { messages, next_after_seq: safeCursor, page_full: false };
+    }
+    const { cursor_seq: cursorSeq, ...message } = row;
+    messages.push(message);
+    safeCursor = cursorSeq;
+  }
+  return {
+    messages,
+    next_after_seq: safeCursor,
+    page_full: rows.length === dalLimit,
+  };
+}
+
 async function loadSelectedDispatchMessages(
   selection: Exclude<DispatchListSelection, { kind: 'legacy' | 'invalid' }>
 ): Promise<unknown> {
@@ -2878,14 +2925,26 @@ async function loadSelectedDispatchMessages(
       ...(selection.limit !== undefined ? { limit: selection.limit } : {}),
     });
   }
+  const dalLimit = Math.max(1, Math.min(selection.limit ?? 100, 500));
+  if (selection.status === 'queued') {
+    const rows = await dispatchDb.listMessagesBySeqCursor({
+      recipient: selection.recipient,
+      afterSeq: selection.afterSeq,
+      status: 'queued',
+      limit: dalLimit,
+    });
+    if (rows.length === 0) {
+      return { messages: [], next_after_seq: selection.afterSeq, page_full: false };
+    }
+    const observedAtMs = Date.now();
+    return walkQueuedDispatchCursorPage(rows, selection.afterSeq, dalLimit, observedAtMs);
+  }
   const rows = await dispatchDb.listMessagesBySeqCursor({
     recipient: selection.recipient,
     afterSeq: selection.afterSeq,
     ...(selection.status !== undefined ? { status: selection.status } : {}),
     ...(selection.limit !== undefined ? { limit: selection.limit } : {}),
-    ...(selection.status === 'queued' ? { openOnly: true } : {}),
   });
-  const dalLimit = Math.max(1, Math.min(selection.limit ?? 100, 500));
   if (rows.length === 0) {
     return { messages: [], next_after_seq: selection.afterSeq, page_full: false };
   }
@@ -4895,6 +4954,9 @@ export function registerApiRoutes(
         }
         return c.json(await loadSelectedDispatchMessages(selection));
       } catch (error) {
+        if (error instanceof Error && error.message === 'dispatch_not_before_unparseable') {
+          return apiError(c, 500, 'dispatch_not_before_unparseable');
+        }
         getLog().error({ err: error }, 'dispatch_list_messages_failed');
         return apiError(c, 500, 'Failed to list dispatch messages');
       }
@@ -4907,6 +4969,9 @@ export function registerApiRoutes(
       try {
         return c.json(await loadSelectedDispatchMessages(selection));
       } catch (error) {
+        if (error instanceof Error && error.message === 'dispatch_not_before_unparseable') {
+          return apiError(c, 500, 'dispatch_not_before_unparseable');
+        }
         getLog().error({ err: error }, 'dispatch_list_messages_failed');
         return apiError(c, 500, 'Failed to list dispatch messages');
       }
