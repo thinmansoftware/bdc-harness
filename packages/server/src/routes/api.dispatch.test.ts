@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { createHash } from 'crypto';
-import { unlinkSync } from 'fs';
-import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { existsSync, unlinkSync } from 'fs';
+import { mkdtemp, readdir, readFile, rm, symlink, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { BASE_TOOL_NAMES } from '../../../companion-mcp/src/constants';
@@ -352,6 +352,242 @@ const VALID_BODY = {
   recipient: 'codex',
   body: 'Please summarize this.',
 };
+
+const HISTORICAL_DISPATCH_REVISION = '2ee95173f5127b0566561b48c8ca8790c8f04b4f';
+const LEGACY_DUPLICATE_AB_PROBE_NAME = 'api.dispatch.legacy-dup-ab.generated.test.ts';
+const LEGACY_DUPLICATE_AB_IDS = [
+  'control_recipient',
+  'control_status',
+  'control_limit',
+  'control_subject_key',
+  'control_route_disposition',
+  'dup_recipient',
+  'dup_status',
+  'dup_limit',
+  'dup_subject_key',
+  'dup_route_disposition',
+  'dup_unknown',
+] as const;
+
+type LegacyDuplicateAbBody =
+  | { kind: 'array'; length: number }
+  | { kind: 'non_array_200' }
+  | { kind: 'error'; status: number; body: { error: string } }
+  | { kind: 'unparsed'; status: number };
+
+type LegacyDuplicateAbRow = {
+  id: string;
+  status: number;
+  body: LegacyDuplicateAbBody;
+};
+
+type LegacyDuplicateAbEvidence = {
+  revision: string;
+  results: LegacyDuplicateAbRow[];
+};
+
+const LEGACY_DUP_AB_PROBE =
+  "import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';\nimport { createHash } from 'crypto';\nimport { unlinkSync } from 'fs';\nimport { mkdtemp, rm, writeFile } from 'fs/promises';\nimport { tmpdir } from 'os';\nimport { join } from 'path';\nimport { OpenAPIHono } from '@hono/zod-openapi';\nimport type { ConversationLockManager } from '@archon/core';\nimport type { WebAdapter } from '../adapters/web';\nimport { SqliteAdapter } from '@archon/core/db/adapters/sqlite';\nimport { setBoardPrincipalResolverForTests } from '@archon/core/db/board-authority';\nimport {\n  createAuthenticatedMessage,\n  type CreateAuthenticatedMessageData,\n  type DispatchMessage,\n} from '@archon/core/db/dispatch';\nimport { validationErrorHook } from './openapi-defaults';\nimport { mockAllWorkflowModules } from '../test/workflow-mock-factories';\nimport { DispatchNonSystemCapability } from '../auth/dispatch-principal';\n\nfunction setSenderAuthMode(mode: 'enforce'): void {\n  process.env.DISPATCH_SENDER_AUTH_MODE = mode;\n}\n\n/** Test-local fixture constructor -- production path is createAuthenticatedMessage. */\nasync function createMessage(\n  data: CreateAuthenticatedMessageData & { sender: string; sender_principal_id?: string | null }\n): Promise<DispatchMessage> {\n  if (data.sender_principal_id) {\n    return createAuthenticatedMessage(\n      testAuthenticatedCapability(data.sender_principal_id, data.sender),\n      data\n    );\n  }\n  return createAuthenticatedMessage(testLegacyCapability(data.sender), data);\n}\n\nfunction testAuthenticatedCapability(principalId: string, sender: string) {\n  const token = `test-token-${principalId}-${sender}`;\n  const priorRegistry = process.env.DISPATCH_PRINCIPALS_JSON;\n  const priorMode = process.env.DISPATCH_SENDER_AUTH_MODE;\n  try {\n    setSenderAuthMode('enforce');\n    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([\n      {\n        credential_id: `test-${principalId}-${sender}`,\n        principal_id: principalId,\n        token_sha256: createHash('sha256').update(token).digest('hex'),\n        status: 'active',\n        send_as: [sender],\n        receive_as: [sender],\n        roles: ['send', 'receive'],\n      },\n    ]);\n    return DispatchNonSystemCapability.fromAuthenticatedRequest({\n      principal_id: principalId,\n      token,\n      requested_sender: sender,\n    });\n  } finally {\n    if (priorRegistry === undefined) delete process.env.DISPATCH_PRINCIPALS_JSON;\n    else process.env.DISPATCH_PRINCIPALS_JSON = priorRegistry;\n    if (priorMode === undefined) delete process.env.DISPATCH_SENDER_AUTH_MODE;\n    else process.env.DISPATCH_SENDER_AUTH_MODE = priorMode;\n  }\n}\n\nfunction testLegacyCapability(sender: string) {\n  const priorRegistry = process.env.DISPATCH_PRINCIPALS_JSON;\n  const priorMode = process.env.DISPATCH_SENDER_AUTH_MODE;\n  try {\n    process.env.DISPATCH_SENDER_AUTH_MODE = 'off';\n    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([\n      {\n        credential_id: 'test-legacy-registry',\n        principal_id: 'test-legacy-principal',\n        token_sha256: '0'.repeat(64),\n        status: 'active',\n        send_as: ['claude'],\n        receive_as: [],\n        roles: ['send'],\n      },\n    ]);\n    return DispatchNonSystemCapability.fromHttpRequest({ requested_sender: sender }).capability;\n  } finally {\n    if (priorRegistry === undefined) delete process.env.DISPATCH_PRINCIPALS_JSON;\n    else process.env.DISPATCH_PRINCIPALS_JSON = priorRegistry;\n    if (priorMode === undefined) delete process.env.DISPATCH_SENDER_AUTH_MODE;\n    else process.env.DISPATCH_SENDER_AUTH_MODE = priorMode;\n  }\n}\n\nlet db: SqliteAdapter;\nlet currentDbPath = '';\nlet dbDir = '';\n\nmock.module('@archon/core/db/connection', () => ({\n  getDatabase: () => db,\n}));\n\nmock.module('@archon/core', () => ({\n  handleMessage: mock(async () => {}),\n  getDatabaseType: () => 'sqlite',\n  loadConfig: mock(async () => ({})),\n  toSafeConfig: mock(() => ({})),\n  updateGlobalConfig: mock(async () => ({})),\n  cloneRepository: mock(async () => ({ codebaseId: 'x', alreadyExisted: false })),\n  registerRepository: mock(async () => ({ codebaseId: 'x', alreadyExisted: false })),\n  ConversationNotFoundError: class ConversationNotFoundError extends Error {},\n  generateAndSetTitle: mock(async () => {}),\n}));\n\nmock.module('@archon/paths', () => ({\n  createLogger: () => ({\n    fatal: mock(() => undefined),\n    error: mock(() => undefined),\n    warn: mock(() => undefined),\n    info: mock(() => undefined),\n    debug: mock(() => undefined),\n    trace: mock(() => undefined),\n    child: mock(function (this: unknown) {\n      return this;\n    }),\n    bindings: mock(() => ({ module: 'test' })),\n    isLevelEnabled: mock(() => true),\n    level: 'info',\n  }),\n  getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),\n  getCommandFolderSearchPaths: mock(() => ['.archon/commands']),\n  getDefaultCommandsPath: mock(() => '/tmp/.archon-test-nonexistent/commands/defaults'),\n  getDefaultWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows/defaults'),\n  getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',\n  getArchonHome: () => '/tmp/.archon',\n  getRunArtifactsPath: () => '/tmp/.archon/artifacts',\n  isDocker: () => false,\n  checkForUpdate: mock(async () => null),\n  BUNDLED_IS_BINARY: false,\n  BUNDLED_VERSION: 'test',\n}));\n\nmockAllWorkflowModules();\n\nmock.module('@archon/git', () => ({\n  removeWorktree: mock(async () => {}),\n  toRepoPath: (p: string) => p,\n  toWorktreePath: (p: string) => p,\n}));\n\nfor (const moduleName of [\n  '@archon/core/db/conversations',\n  '@archon/core/db/codebases',\n  '@archon/core/db/env-vars',\n  '@archon/core/db/isolation-environments',\n  '@archon/core/db/workflows',\n  '@archon/core/db/workflow-events',\n  '@archon/core/db/messages',\n  '@archon/core/utils/commands',\n]) {\n  mock.module(moduleName, () => ({\n    listConversations: mock(async () => []),\n    findConversationByPlatformId: mock(async () => null),\n    getOrCreateConversation: mock(async () => null),\n    softDeleteConversation: mock(async () => {}),\n    updateConversationTitle: mock(async () => {}),\n    getConversationById: mock(async () => null),\n    listCodebases: mock(async () => []),\n    getCodebase: mock(async () => null),\n    deleteCodebase: mock(async () => {}),\n    listEnvVars: mock(async () => []),\n    setEnvVar: mock(async () => null),\n    deleteEnvVar: mock(async () => false),\n    listByCodebase: mock(async () => []),\n    updateStatus: mock(async () => {}),\n    listWorkflowRuns: mock(async () => []),\n    listDashboardRuns: mock(async () => ({\n      runs: [],\n      total: 0,\n      counts: { all: 0, running: 0, completed: 0, failed: 0, cancelled: 0, pending: 0 },\n    })),\n    getWorkflowRun: mock(async () => null),\n    cancelWorkflowRun: mock(async () => {}),\n    getWorkflowRunByWorkerPlatformId: mock(async () => null),\n    getCauldronDrainState: mock(async () => ({\n      mode: 'normal',\n      activeLeaseCount: 0,\n      activeRunCount: 0,\n      activeRunIds: [],\n      drained: false,\n      updatedAt: null,\n    })),\n    listWorkflowEvents: mock(async () => []),\n    addMessage: mock(async () => null),\n    listMessages: mock(async () => []),\n    findMarkdownFilesRecursive: mock(async () => []),\n  }));\n}\n\nimport { registerApiRoutes } from './api';\n\nfunction sha(value: string): string {\n  return createHash('sha256').update(value).digest('hex');\n}\n\nfunction cleanupDb(path: string): void {\n  for (const suffix of ['', '-wal', '-shm']) {\n    try {\n      unlinkSync(path + suffix);\n    } catch {\n      /* file may not exist */\n    }\n  }\n}\n\nfunction makeApp(token?: string): OpenAPIHono {\n  if (token) process.env.ARCHON_OPERATOR_TOKEN = token;\n  else delete process.env.ARCHON_OPERATOR_TOKEN;\n  const app = new OpenAPIHono({ defaultHook: validationErrorHook });\n  registerApiRoutes(\n    app,\n    {\n      setConversationDbId: mock(() => {}),\n      emitSSE: mock(async () => {}),\n      emitLockEvent: mock(async () => {}),\n      registerStream: mock(() => {}),\n      removeStream: mock(() => {}),\n    } as unknown as WebAdapter,\n    {\n      acquireLock: mock(async (_id: string, fn: () => Promise<void>) => {\n        await fn();\n        return { status: 'started' };\n      }),\n      getStats: mock(() => ({ active: 0, queued: 0 })),\n    } as unknown as ConversationLockManager\n  );\n  return app;\n}\n\nconst VALID_BODY = {\n  correlation_id: 'corr-legacy-dup',\n  idempotency_key: 'idem-legacy-dup',\n  task_type: 'agent_message' as const,\n  sender: 'claude',\n  recipient: 'codex',\n  body: 'synthetic legacy list fixture',\n};\n\nconst OPERATOR_TOKEN = 'synthetic-operator-token';\n\nconst CASES: Array<{ id: string; url: string; expectArray: boolean }> = [\n  {\n    id: 'control_recipient',\n    url: '/api/dispatch/messages?recipient=codex',\n    expectArray: true,\n  },\n  {\n    id: 'control_status',\n    url: '/api/dispatch/messages?recipient=codex&status=queued',\n    expectArray: true,\n  },\n  {\n    id: 'control_limit',\n    url: '/api/dispatch/messages?recipient=codex&limit=10',\n    expectArray: true,\n  },\n  {\n    id: 'control_subject_key',\n    url: '/api/dispatch/messages?recipient=codex&subject_key=wo:WO-MAILBOX',\n    expectArray: true,\n  },\n  {\n    id: 'control_route_disposition',\n    url: '/api/dispatch/messages?recipient=codex&route_disposition=auto_surfaced',\n    expectArray: true,\n  },\n  {\n    id: 'dup_recipient',\n    url: '/api/dispatch/messages?recipient=codex&recipient=xo',\n    expectArray: false,\n  },\n  {\n    id: 'dup_status',\n    url: '/api/dispatch/messages?recipient=codex&status=queued&status=done',\n    expectArray: false,\n  },\n  {\n    id: 'dup_limit',\n    url: '/api/dispatch/messages?recipient=codex&limit=10&limit=20',\n    expectArray: false,\n  },\n  {\n    id: 'dup_subject_key',\n    url: '/api/dispatch/messages?recipient=codex&subject_key=wo:WO-MAILBOX&subject_key=other',\n    expectArray: false,\n  },\n  {\n    id: 'dup_route_disposition',\n    url: '/api/dispatch/messages?recipient=codex&route_disposition=auto_surfaced&route_disposition=expired',\n    expectArray: false,\n  },\n  {\n    id: 'dup_unknown',\n    url: '/api/dispatch/messages?recipient=codex&not_a_selector=1&not_a_selector=2',\n    expectArray: true,\n  },\n];\n\ntype Sanitized =\n  | { kind: 'array'; length: number }\n  | { kind: 'non_array_200' }\n  | { kind: 'error'; status: number; body: unknown }\n  | { kind: 'unparsed'; status: number };\n\nasync function sanitize(response: Response): Promise<{ status: number; body: Sanitized }> {\n  const status = response.status;\n  const text = await response.text();\n  let parsed: unknown;\n  try {\n    parsed = JSON.parse(text) as unknown;\n  } catch {\n    return { status, body: { kind: 'unparsed', status } };\n  }\n  if (status === 200 && Array.isArray(parsed)) {\n    return { status, body: { kind: 'array', length: parsed.length } };\n  }\n  if (status === 200) {\n    return { status, body: { kind: 'non_array_200' } };\n  }\n  return { status, body: { kind: 'error', status, body: parsed } };\n}\n\ndescribe('legacy duplicate query product-route A/B', () => {\n  beforeEach(async () => {\n    delete process.env.DATABASE_URL;\n    process.env.BUN_ENV = 'test';\n    process.env.GITHUB_TOKEN = 'test-token';\n    process.env.DISPATCH_WORKER_CREDENTIALS_JSON = JSON.stringify([\n      {\n        credential_id: 'board-worker-1',\n        worker_id: 'worker-a',\n        role: 'board_delivery_worker',\n        allowed_principals: ['claude'],\n        token_sha256: sha('worker-secret'),\n        status: 'active',\n      },\n    ]);\n    process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([\n      {\n        credential_id: 'default-claude',\n        principal_id: 'claude-principal',\n        token_sha256: sha('claude-secret'),\n        status: 'active',\n        send_as: ['claude'],\n        receive_as: ['claude'],\n        roles: ['send', 'receive'],\n      },\n    ]);\n    setBoardPrincipalResolverForTests(async () => ({\n      principal_id: 'claude',\n      seat_id: 'xo' as const,\n      roles: ['motion_notifier', 'petition_eligible'],\n    }));\n    dbDir = await mkdtemp(join(tmpdir(), 'legacy-dup-ab-'));\n    currentDbPath = join(dbDir, 'dispatch.db');\n    db = new SqliteAdapter(currentDbPath);\n    globalThis.fetch = (async () =>\n      new Response(JSON.stringify({ ok: true }), {\n        status: 200,\n        headers: { 'content-type': 'application/json' },\n      })) as typeof fetch;\n  });\n\n  afterEach(async () => {\n    setBoardPrincipalResolverForTests(undefined);\n    delete process.env.ARCHON_OPERATOR_TOKEN;\n    delete process.env.GITHUB_TOKEN;\n    delete process.env.DISPATCH_WORKER_CREDENTIALS_JSON;\n    delete process.env.DISPATCH_PRINCIPALS_JSON;\n    delete process.env.DISPATCH_SENDER_AUTH_MODE;\n    await db.close();\n    cleanupDb(currentDbPath);\n    await rm(dbDir, { recursive: true, force: true });\n  });\n\n  test('records legacy duplicate query statuses', async () => {\n    await createMessage(VALID_BODY);\n    const app = makeApp(OPERATOR_TOKEN);\n    const revision = process.env.WO_AB_REVISION ?? 'unknown';\n    const results: Array<{ id: string; status: number; body: Sanitized }> = [];\n\n    for (const item of CASES) {\n      const response = await app.request(item.url, {\n        headers: { 'x-archon-operator-token': OPERATOR_TOKEN },\n      });\n      const sanitized = await sanitize(response);\n      results.push({ id: item.id, status: sanitized.status, body: sanitized.body });\n    }\n\n    const resultPath = process.env.WO_AB_RESULT_PATH;\n    if (resultPath === undefined || resultPath === '') throw new Error('missing_ab_result_path');\n    await writeFile(resultPath, JSON.stringify({ revision, results }));\n\n    for (const item of CASES) {\n      const found = results.find(row => row.id === item.id);\n      expect(found?.status).not.toBe(401);\n      if (item.expectArray) {\n        expect(found?.status).toBe(200);\n        expect(found?.body).toMatchObject({ kind: 'array' });\n      }\n    }\n\n    const seeded = results.find(row => row.id === 'control_recipient');\n    expect(seeded?.body).toEqual({ kind: 'array', length: 1 });\n  });\n});\n";
+
+function gitOutput(cwd: string, args: readonly string[]): string {
+  const proc = Bun.spawnSync(['git', ...args], {
+    cwd,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  if (proc.exitCode !== 0) {
+    throw new Error(`git ${args.join(' ')} failed: ${proc.stderr.toString()}`);
+  }
+  return proc.stdout.toString().trim();
+}
+
+function objectField(value: object, key: string): unknown {
+  return Reflect.get(value, key);
+}
+
+function parseLegacyDuplicateAbBody(value: unknown): LegacyDuplicateAbBody {
+  if (typeof value !== 'object' || value === null) throw new Error('ab_evidence_body_invalid');
+  const kind = objectField(value, 'kind');
+  const length = objectField(value, 'length');
+  const status = objectField(value, 'status');
+  if (kind === 'array' && typeof length === 'number') {
+    return { kind: 'array', length };
+  }
+  if (kind === 'non_array_200') return { kind: 'non_array_200' };
+  if (kind === 'unparsed' && typeof status === 'number') {
+    return { kind: 'unparsed', status };
+  }
+  if (kind === 'error' && typeof status === 'number') {
+    const nested = objectField(value, 'body');
+    if (typeof nested !== 'object' || nested === null) throw new Error('ab_evidence_error_invalid');
+    const error = objectField(nested, 'error');
+    if (typeof error !== 'string') throw new Error('ab_evidence_error_invalid');
+    return { kind: 'error', status, body: { error } };
+  }
+  throw new Error('ab_evidence_body_invalid');
+}
+
+function parseLegacyDuplicateAbEvidence(text: string, revision: string): LegacyDuplicateAbEvidence {
+  const parsed: unknown = JSON.parse(text);
+  if (typeof parsed !== 'object' || parsed === null) throw new Error('ab_evidence_invalid');
+  if (objectField(parsed, 'revision') !== revision)
+    throw new Error('ab_evidence_revision_mismatch');
+  const results = objectField(parsed, 'results');
+  if (!Array.isArray(results)) throw new Error('ab_evidence_results_invalid');
+  return {
+    revision,
+    results: results.map(item => {
+      if (typeof item !== 'object' || item === null) throw new Error('ab_evidence_row_invalid');
+      const id = objectField(item, 'id');
+      const status = objectField(item, 'status');
+      if (typeof id !== 'string' || typeof status !== 'number') {
+        throw new Error('ab_evidence_row_invalid');
+      }
+      return { id, status, body: parseLegacyDuplicateAbBody(objectField(item, 'body')) };
+    }),
+  };
+}
+
+function abRow(evidence: LegacyDuplicateAbEvidence, id: string): LegacyDuplicateAbRow {
+  const row = evidence.results.find(item => item.id === id);
+  if (!row) throw new Error(`missing_ab_row:${id}`);
+  return row;
+}
+
+// Symlinks only the already-installed dependency trees. The probe imports ./api
+// from whichever checkout it is written into, so each revision loads its own route.
+async function linkInstalledModules(currentRoot: string, historicalRoot: string): Promise<void> {
+  await symlink(join(currentRoot, 'node_modules'), join(historicalRoot, 'node_modules'));
+  const packageNames = await readdir(join(currentRoot, 'packages'));
+  for (const name of packageNames) {
+    const source = join(currentRoot, 'packages', name, 'node_modules');
+    const historicalPackage = join(historicalRoot, 'packages', name);
+    if (!existsSync(source) || !existsSync(historicalPackage)) continue;
+    await symlink(source, join(historicalPackage, 'node_modules'));
+  }
+}
+
+function childProbeEnv(revision: string, resultPath: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (typeof value === 'string') env[key] = value;
+  }
+  delete env.DATABASE_URL;
+  env.WO_AB_REVISION = revision;
+  env.WO_AB_RESULT_PATH = resultPath;
+  return env;
+}
+
+async function runLegacyDuplicateProbe(
+  checkoutRoot: string,
+  revision: string,
+  resultPath: string
+): Promise<LegacyDuplicateAbEvidence> {
+  const probePath = join(
+    checkoutRoot,
+    'packages/server/src/routes',
+    LEGACY_DUPLICATE_AB_PROBE_NAME
+  );
+  await writeFile(probePath, LEGACY_DUP_AB_PROBE);
+  try {
+    const proc = Bun.spawnSync(
+      [
+        process.execPath,
+        'test',
+        '--timeout',
+        '20000',
+        `./packages/server/src/routes/${LEGACY_DUPLICATE_AB_PROBE_NAME}`,
+      ],
+      {
+        cwd: checkoutRoot,
+        env: childProbeEnv(revision, resultPath),
+        stdout: 'pipe',
+        stderr: 'pipe',
+        timeout: 20_000,
+      }
+    );
+    if (proc.exitCode !== 0) {
+      throw new Error(
+        `ab_probe_failed:${revision}:${proc.exitCode}:${proc.stderr.toString()}\n${proc.stdout.toString()}`
+      );
+    }
+    return parseLegacyDuplicateAbEvidence(await readFile(resultPath, 'utf8'), revision);
+  } finally {
+    try {
+      unlinkSync(probePath);
+    } catch {
+      /* probe file is removed when the process still owns the checkout */
+    }
+  }
+}
+
+async function recordLegacyDuplicateProductRouteAb(): Promise<{
+  historical: LegacyDuplicateAbEvidence;
+  current: LegacyDuplicateAbEvidence;
+}> {
+  const currentRoot = gitOutput(import.meta.dir, ['rev-parse', '--show-toplevel']);
+  const parent = await mkdtemp(join(tmpdir(), 'legacy-dup-ab-'));
+  const historicalRoot = join(parent, 'historical');
+  let added = false;
+  try {
+    gitOutput(currentRoot, [
+      'worktree',
+      'add',
+      '--detach',
+      historicalRoot,
+      HISTORICAL_DISPATCH_REVISION,
+    ]);
+    added = true;
+    await linkInstalledModules(currentRoot, historicalRoot);
+    const historicalSha = gitOutput(historicalRoot, ['rev-parse', 'HEAD']);
+    if (historicalSha !== HISTORICAL_DISPATCH_REVISION) {
+      throw new Error(`historical_revision_mismatch:${historicalSha}`);
+    }
+    const currentSha = gitOutput(currentRoot, ['rev-parse', 'HEAD']);
+    const historicalSchema = await readFile(
+      join(historicalRoot, 'packages/server/src/routes/schemas/dispatch.schemas.ts'),
+      'utf8'
+    );
+    const currentSchema = await readFile(
+      join(currentRoot, 'packages/server/src/routes/schemas/dispatch.schemas.ts'),
+      'utf8'
+    );
+    if (
+      historicalSchema === currentSchema ||
+      historicalSchema.includes('legacyDuplicateQueryMessage') ||
+      !currentSchema.includes('legacyDuplicateQueryMessage')
+    ) {
+      throw new Error('ab_schema_sources_not_distinct');
+    }
+    const historical = await runLegacyDuplicateProbe(
+      historicalRoot,
+      historicalSha,
+      join(parent, 'historical.json')
+    );
+    const current = await runLegacyDuplicateProbe(
+      currentRoot,
+      currentSha,
+      join(parent, 'current.json')
+    );
+    return { historical, current };
+  } finally {
+    if (added) {
+      Bun.spawnSync(['git', 'worktree', 'remove', '--force', historicalRoot], {
+        cwd: currentRoot,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+    }
+    await rm(parent, { recursive: true, force: true });
+    if (added) {
+      Bun.spawnSync(['git', 'worktree', 'prune'], {
+        cwd: currentRoot,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+    }
+  }
+}
 
 describe('dispatch API', () => {
   beforeEach(() => {
@@ -2567,51 +2803,47 @@ describe('dispatch API', () => {
     });
   });
 
-  test('test129 rejects duplicated legacy list filters with the historical validation body', async () => {
-    await createMessage({
-      ...VALID_BODY,
-      idempotency_key: 'legacy-dup-visible',
-      recipient: 'codex',
-      body: 'LEGACY-DUP-VISIBLE',
-    });
-    const app = makeApp('synthetic-operator-token');
-    const headers = { 'x-archon-operator-token': 'synthetic-operator-token' };
-    const duplicates = [
-      {
-        url: '/api/dispatch/messages?recipient=codex&recipient=xo',
-        error: 'recipient: Expected string, received array',
-      },
-      {
-        url: '/api/dispatch/messages?recipient=codex&status=queued&status=done',
-        error:
-          "status: Expected 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled', received array",
-      },
-      {
-        url: '/api/dispatch/messages?recipient=codex&limit=10&limit=20',
-        error: 'limit: Expected string, received array',
-      },
-      {
-        url: '/api/dispatch/messages?recipient=codex&subject_key=wo:WO-MAILBOX&subject_key=other',
-        error: 'subject_key: Expected string, received array',
-      },
-      {
-        url: '/api/dispatch/messages?recipient=codex&route_disposition=auto_surfaced&route_disposition=expired',
-        error:
-          "route_disposition: Expected 'unroutable' | 'superseded' | 'expired' | 'auto_surfaced', received array",
-      },
-    ];
-    for (const item of duplicates) {
-      const response = await app.request(item.url, { headers });
-      expect(response.status).toBe(400);
-      expect(await response.json()).toEqual({ error: item.error });
-    }
+  test('test129 compares duplicated legacy list filters on the historical and current product routes', async () => {
+    const evidence = await recordLegacyDuplicateProductRouteAb();
+    expect(evidence.historical.revision).toBe(HISTORICAL_DISPATCH_REVISION);
+    expect(evidence.current.revision).not.toBe(evidence.historical.revision);
+    expect(evidence.current.results.map(row => row.id)).toEqual(LEGACY_DUPLICATE_AB_IDS);
+    expect(evidence.current.results).toEqual(evidence.historical.results);
 
-    const unknown = await app.request(
-      '/api/dispatch/messages?recipient=codex&not_a_selector=1&not_a_selector=2',
-      { headers }
-    );
-    expect(unknown.status).toBe(200);
-    expect(Array.isArray(await unknown.json())).toBe(true);
+    for (const id of [
+      'control_recipient',
+      'control_status',
+      'control_limit',
+      'dup_unknown',
+    ] as const) {
+      expect(abRow(evidence.historical, id)).toEqual({
+        id,
+        status: 200,
+        body: { kind: 'array', length: 1 },
+      });
+    }
+    for (const id of ['control_subject_key', 'control_route_disposition'] as const) {
+      expect(abRow(evidence.historical, id)).toEqual({
+        id,
+        status: 200,
+        body: { kind: 'array', length: 0 },
+      });
+    }
+    for (const [id, field] of [
+      ['dup_recipient', 'recipient'],
+      ['dup_status', 'status'],
+      ['dup_limit', 'limit'],
+      ['dup_subject_key', 'subject_key'],
+      ['dup_route_disposition', 'route_disposition'],
+    ] as const) {
+      const row = abRow(evidence.historical, id);
+      expect(row.status).toBe(400);
+      expect(row.body.kind).toBe('error');
+      if (row.body.kind !== 'error') continue;
+      expect(row.body.status).toBe(400);
+      expect(row.body.body.error.startsWith(`${field}:`)).toBe(true);
+    }
+    expect(existsSync(join(import.meta.dir, LEGACY_DUPLICATE_AB_PROBE_NAME))).toBe(false);
   });
 
   test('test124 config does not activate inactive companion principals', async () => {
