@@ -182,6 +182,22 @@ interface GuardResult {
   stderr: string;
   args: string;
   creates: number;
+  /** `command -v gh` inside the Git Bash that ran the guard. */
+  ghResolved: string;
+  /** Fixture stub prepended to that shell's PATH. */
+  ghFixture: string;
+}
+
+/** Path recorded by the in-script `command -v gh` probe. Empty when the probe is missing. */
+function ghResolvedFromTrace(stderr: string): string {
+  const trace = stderr
+    .split('\n')
+    .map(line => line.replace(/\r$/, ''))
+    .find(line => line.startsWith('TRACE gh='));
+  if (trace === undefined) return '';
+  const marked = trace.slice('TRACE gh='.length);
+  const pythonAt = marked.indexOf(' python3=');
+  return pythonAt < 0 ? marked : marked.slice(0, pythonAt);
 }
 
 function runExistingPrGuard(
@@ -241,6 +257,7 @@ exit 96
       process.platform === 'win32'
         ? dir.replace(/\\/g, '/').replace(/^([A-Za-z]):\//, match => `/${match[0].toLowerCase()}/`)
         : dir;
+    const ghFixture = `${bashDir}/gh`;
     const script = join(dir, 'guard.sh');
     writeFileSync(
       script,
@@ -280,14 +297,14 @@ exit 96
       stderr: 'pipe',
     });
     const stderr = new TextDecoder().decode(result.stderr);
-    const trace = stderr.split('\n').find(line => line.startsWith('TRACE gh='));
-    if (trace !== undefined) console.error(trace);
     return {
       code: result.exitCode ?? -1,
       stdout: new TextDecoder().decode(result.stdout),
       stderr,
       args: readFileSync(argsLog, 'utf8'),
       creates: Number(readFileSync(createCount, 'utf8')),
+      ghResolved: ghResolvedFromTrace(stderr),
+      ghFixture,
     };
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -307,6 +324,8 @@ describe('existing PR base verification', () => {
       const guard = guards[index];
       if (!guard) throw new Error(`missing guard for ${file}`);
       const result = runExistingPrGuard(guard, EXISTING_PR_ON_MAIN, EXISTING_PR_ON_MAIN, 0);
+      expect(result.ghFixture.endsWith('/gh'), file).toBe(true);
+      expect(result.ghResolved, file).toBe(result.ghFixture);
       expect(result.code, file).toBe(1);
       expect(result.stderr).toContain('ERROR: base_branch_mismatch: recorded=dev attempted=main');
       expect(result.stdout).not.toContain('PR already exists');
@@ -323,6 +342,8 @@ describe('existing PR base verification', () => {
       readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8')
     );
     const result = runExistingPrGuard(guard, EXISTING_PR_ON_DEV, EXISTING_PR_ON_DEV, 0);
+    expect(result.ghFixture.endsWith('/gh')).toBe(true);
+    expect(result.ghResolved).toBe(result.ghFixture);
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain('PR_URL=https://github.com/acme/widgets/pull/55');
     expect(result.stdout).toContain('PR already exists (no create needed).');
@@ -335,6 +356,8 @@ describe('existing PR base verification', () => {
       readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8')
     );
     const result = runExistingPrGuard(guard, EXISTING_PR_WITHOUT_BASE, EXISTING_PR_WITHOUT_BASE, 0);
+    expect(result.ghFixture.endsWith('/gh')).toBe(true);
+    expect(result.ghResolved).toBe(result.ghFixture);
     expect(result.code, result.stderr).toBe(1);
     expect(result.stderr).toContain(
       'ERROR: base_branch_mismatch: recorded=dev attempted=<unverified>'
@@ -348,6 +371,8 @@ describe('existing PR base verification', () => {
       readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8')
     );
     const result = runExistingPrGuard(guard, NO_OPEN_PR, EXISTING_PR_ON_MAIN, 1);
+    expect(result.ghFixture.endsWith('/gh')).toBe(true);
+    expect(result.ghResolved).toBe(result.ghFixture);
     expect(result.code, result.stderr).toBe(1);
     expect(result.stderr).toContain('ERROR: base_branch_mismatch: recorded=dev attempted=main');
     expect(result.stdout).not.toContain('PR confirmed via list');
@@ -360,6 +385,8 @@ describe('existing PR base verification', () => {
       readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8')
     );
     const result = runExistingPrGuard(guard, NO_OPEN_PR, EXISTING_PR_ON_DEV, 1);
+    expect(result.ghFixture.endsWith('/gh')).toBe(true);
+    expect(result.ghResolved).toBe(result.ghFixture);
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain(
       'PR created despite non-zero exit (gh CLI quirk; PR confirmed via list).'
