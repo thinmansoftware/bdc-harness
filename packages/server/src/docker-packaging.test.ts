@@ -8,6 +8,7 @@ import { join } from 'path';
 // without running Tests 2-5. Register that suite through this file, which
 // the same command does execute, and which package CI already runs.
 await import('../../../scripts/container/build-app-image.test');
+await import('../../../scripts/container/rebuild-archon-app.test');
 
 describe('production Docker packaging', () => {
   it('copies Smart Cauldron source required by the server runtime', async () => {

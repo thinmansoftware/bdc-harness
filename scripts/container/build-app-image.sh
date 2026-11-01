@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+hold_file="${ARCHON_REBUILD_HOLD_FILE:-/opt/bdc/archon/.rebuild-hold}"
+if [ -f "$hold_file" ]; then
+  printf 'refusing to build: rebuild hold present\n' >&2
+  cat "$hold_file" >&2
+  exit 10
+fi
+
 dirty="$(git status --porcelain)" || exit $?
 if [ -n "$dirty" ]; then
   printf 'refusing to build: dirty tree\n%s\n' "$dirty" >&2
