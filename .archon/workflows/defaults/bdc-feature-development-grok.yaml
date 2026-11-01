@@ -4657,19 +4657,77 @@ nodes:
         PUSHED_SHA=$(git rev-parse HEAD 2>/dev/null || true)
       fi
       if [ -n "$PUSHED_SHA" ]; then
-        same_head_raw=$(gh pr list --repo "$REPO" --state open --limit 200 \
-          --json number,title,headRefOid,headRefName,baseRefName,url 2>/dev/null || true)
-        same_head_row=$(SAME_HEAD_RAW="$same_head_raw" PUSHED_SHA="$PUSHED_SHA" BASE_BRANCH="$BASE_BRANCH" python3 -c "$(cat <<'PY'
+        # All open PRs. A capped gh pr list kept only its first page, so a
+        # same-SHA PR past that page was missed (duplicate create) or a higher
+        # number was adopted instead of the lowest. --paginate follows Link
+        # headers; the file avoids the 128KB env limit.
+        same_head_file=$(mktemp)
+        same_head_list_ok=true
+        if ! gh api --paginate --slurp --method GET \
+          "repos/${REPO}/pulls?state=open" \
+          > "$same_head_file" 2>/dev/null; then
+          same_head_list_ok=false
+        fi
+        same_head_row=""
+        if [ "$same_head_list_ok" = "true" ]; then
+          same_head_row=$(SAME_HEAD_FILE="$same_head_file" PUSHED_SHA="$PUSHED_SHA" BASE_BRANCH="$BASE_BRANCH" python3 -c "$(cat <<'PY'
       import json, os, sys
-      raw = os.environ.get("SAME_HEAD_RAW", "").strip()
+      path = os.environ.get("SAME_HEAD_FILE", "")
+      if not path:
+          raise SystemExit(0)
+      try:
+          with open(path, "r", encoding="utf-8") as fh:
+              raw = fh.read().strip()
+      except Exception:
+          raise SystemExit(0)
       if not raw:
           raise SystemExit(0)
       try:
-          data = json.loads(raw)
+          payload = json.loads(raw)
       except Exception:
           raise SystemExit(0)
-      if not isinstance(data, list):
+
+      def flatten(value):
+          if not isinstance(value, list):
+              return None
+          if value and all(isinstance(page, list) for page in value):
+              items = []
+              for page in value:
+                  items.extend(page)
+              return items
+          return value
+
+      def text_or_empty(value):
+          if isinstance(value, str):
+              return value
+          return ""
+
+      def normalize(item):
+          if not isinstance(item, dict):
+              return None
+          head = item.get("head")
+          base = item.get("base")
+          if isinstance(head, dict) or isinstance(base, dict):
+              head = head if isinstance(head, dict) else {}
+              base = base if isinstance(base, dict) else {}
+              return {
+                  "number": item.get("number"),
+                  "title": text_or_empty(item.get("title")),
+                  "headRefOid": text_or_empty(head.get("sha")),
+                  "headRefName": text_or_empty(head.get("ref")),
+                  "baseRefName": text_or_empty(base.get("ref")),
+                  "url": text_or_empty(item.get("html_url")),
+              }
+          return item
+
+      items = flatten(payload)
+      if items is None:
           raise SystemExit(0)
+      data = []
+      for item in items:
+          mapped = normalize(item)
+          if mapped is not None:
+              data.append(mapped)
       want = os.environ.get("PUSHED_SHA", "")
       base_branch = os.environ.get("BASE_BRANCH", "")
       kept = []
@@ -4718,6 +4776,8 @@ nodes:
       sys.stdout.write("adopt\t" + url + "\t" + title + "\t" + ", ".join(others))
       PY
       )")
+        fi
+        rm -f "$same_head_file"
         same_head_kind=$(printf '%s' "$same_head_row" | cut -f1)
         if [ "$same_head_kind" = "mismatch" ]; then
           same_head_rest=$(printf '%s' "$same_head_row" | cut -f2-)
