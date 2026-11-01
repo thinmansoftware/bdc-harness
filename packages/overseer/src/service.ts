@@ -16,7 +16,7 @@ import {
   reserveOverseerMergeSlot,
 } from '@archon/core/db/overseer';
 import { hasActiveRunForWo } from './active-run-guard';
-import { handleRecordJudgeFirst } from './judge-first-pipeline';
+import { handleRecordJudgeFirst, type JudgeFirstPipelineOptions } from './judge-first-pipeline';
 import type { OverseerVerdictStoreDeps } from './types.ts';
 import { runAuthorizedEscalation } from './authorized-escalation';
 import { runEscalation } from './escalate';
@@ -89,6 +89,18 @@ export interface OverseerServiceOptions {
   mergeBridgeIntervalMs?: number;
   mergeBridgeRun?: () => Promise<unknown>;
   mergeBridgeEnabled?: boolean;
+  fireWorkflowRun?: (input: {
+    workflowName: string;
+    woId: string;
+    project: string;
+    runId: string;
+  }) => Promise<unknown>;
+  countAutomaticAttempts?: (woId: string) => Promise<number>;
+  releaseTerminalWorktree?: (
+    record: WatchedRunRecord,
+    events: import('./types.ts').OverseerWorkflowEvent[]
+  ) => Promise<unknown>;
+  executeAutomaticRefire?: JudgeFirstPipelineOptions['executeAutomaticRefire'];
 }
 
 export async function runOperatorCardDeliveryScheduler(input: {
@@ -206,7 +218,8 @@ export async function handleRecord(
   deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
   dryRun: boolean,
   actor: string,
-  mergeCoordinator?: MergeReadyCoordinator
+  mergeCoordinator?: MergeReadyCoordinator,
+  executeAutomaticRefire?: JudgeFirstPipelineOptions['executeAutomaticRefire']
 ): Promise<void> {
   if (emergencyStopEngaged()) {
     log.warn({ runId: record.runId }, 'overseer.emergency_stop_engaged');
@@ -224,6 +237,7 @@ export async function handleRecord(
         actor,
         mergeCoordinator,
         verdictStore: defaultVerdictStore,
+        executeAutomaticRefire,
       });
     } catch (error) {
       log.error(
@@ -415,7 +429,15 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (options.signal?.aborted) coupledAbort.abort();
   const watcher = watchLoop(
     deps,
-    record => handleRecord(record, deps, dryRun, 'overseer-service', options.mergeCoordinator),
+    record =>
+      handleRecord(
+        record,
+        deps,
+        dryRun,
+        'overseer-service',
+        options.mergeCoordinator,
+        options.executeAutomaticRefire
+      ),
     {
       intervalMs: options.intervalMs,
       once: options.once,

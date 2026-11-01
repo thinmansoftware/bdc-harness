@@ -130,6 +130,14 @@ export interface JudgeFirstPipelineOptions {
   maxRetries?: number;
   /** Injectable escalation executor; defaults to runEscalation (operator card rail). */
   escalate?: typeof runEscalation;
+  executeAutomaticRefire?: (
+    record: WatchedRunRecord,
+    events: OverseerWorkflowEvent[]
+  ) => Promise<
+    | { status: 'fired'; runId: string; attempt: number }
+    | { status: 'indeterminate'; reason: string }
+    | { status: 'refused'; reason: string }
+  >;
 }
 
 function actionClass(record: WatchedRunRecord): string {
@@ -430,6 +438,80 @@ export async function handleRecordJudgeFirst(
     },
     'overseer.judge_first.verdict_completed'
   );
+
+  if (record.recovery?.plan === 'operator_card') {
+    const stopOutput = events.find(
+      event => event.step_name === 'run-stop-tests' && event.event_type === 'node_completed'
+    )?.data.node_output;
+    const text = typeof stopOutput === 'string' ? stopOutput : '';
+    const source = /^TESTS_SOURCE=(.*)$/m.exec(text)?.[1]?.trim() ?? 'unknown';
+    const status = /^TESTS_STATUS=(.*)$/m.exec(text)?.[1]?.trim() ?? 'unknown';
+    await escalateWithEvidence(
+      record,
+      deps,
+      events,
+      {
+        verdictId: claim.verdictId,
+        reason: 'spec_tests_line_defect',
+        blocker: `spec Tests-line defect: run-stop-tests found no runnable spec-declared test command (TESTS_SOURCE=${source}, TESTS_STATUS=${status}); the WO's own stop tests passed; the code is not the failure; a spec amendment is required (WO-HARNESS-OVERSEER-REPAIR-IN-PLACE-01)`,
+      },
+      options.escalate
+    );
+    return;
+  }
+
+  if (record.recovery?.plan === 'refire') {
+    if (outcome.verdict === 'failed_genuine' || outcome.verdict === 'duplicate_work') {
+      await deps.insertOverseerAction({
+        runId: record.runId,
+        woId: record.woId,
+        class: actionClass(record),
+        action: 'repair_refire_refused',
+        result: `vetoed:${outcome.verdict}:verdict:${claim.verdictId}`,
+      });
+    } else if (options.executeAutomaticRefire) {
+      const recovery = await options.executeAutomaticRefire(record, events);
+      if (recovery.status === 'fired') {
+        await deps.insertOverseerAction({
+          runId: record.runId,
+          woId: record.woId,
+          class: actionClass(record),
+          action: 'repair_refire',
+          result: `fired:successor:${recovery.runId}:attempt:${recovery.attempt}:verdict:${claim.verdictId}`,
+        });
+        return;
+      }
+      await deps.insertOverseerAction({
+        runId: record.runId,
+        woId: record.woId,
+        class: actionClass(record),
+        action: recovery.status === 'indeterminate' ? 'repair_refire' : 'repair_refire_refused',
+        result:
+          recovery.status === 'indeterminate'
+            ? `indeterminate:${recovery.reason}:verdict:${claim.verdictId}`
+            : `refused:${recovery.reason}:verdict:${claim.verdictId}`,
+      });
+      // Keep the safety-ceiling diagnosis literal in both the ledger and card path.
+      const refusalReason =
+        recovery.status === 'refused' && recovery.reason === 'attempt_ceiling'
+          ? 'attempt_ceiling'
+          : recovery.reason;
+      await escalateWithEvidence(
+        record,
+        deps,
+        events,
+        {
+          verdictId: claim.verdictId,
+          reason:
+            recovery.status === 'indeterminate' ? 'indeterminate_prior_effect' : refusalReason,
+          blocker:
+            recovery.status === 'indeterminate' ? 'indeterminate_prior_effect' : refusalReason,
+        },
+        options.escalate
+      );
+      return;
+    }
+  }
 
   // Tier >= 1 proposals are refused with a recorded refusal (v1 = Tier 0 only).
   if (
