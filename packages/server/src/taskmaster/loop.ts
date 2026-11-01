@@ -78,8 +78,9 @@ const log = createLogger('taskmaster/loop');
 
 /**
  * One process-wide real escalation-delivery deps object, so its cached
- * poster-login lookup (GET /user, used to trust only Taskmaster's own marker
- * comments) runs once per token rather than once per escalation.
+ * poster-login lookup (GET /app for an App identity, GET /user for a PAT; used
+ * to trust only Taskmaster's own marker comments) runs once per identity
+ * rather than once per escalation.
  */
 let realEscalationDelivery: EscalationDeliveryDeps | null = null;
 function defaultEscalationDelivery(): EscalationDeliveryDeps {
