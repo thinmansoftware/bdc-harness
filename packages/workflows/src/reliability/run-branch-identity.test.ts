@@ -27,10 +27,13 @@ const LANE_FILES = [
 const DEFAULTS_DIR = join(import.meta.dir, '../../../../.archon/workflows/defaults');
 
 function openPrNode(yaml: string): string {
+  // Windows checkout of text=auto YAML is CRLF. These anchors are
+  // newline-terminated (see bdc-push-correctness.test.ts).
+  const text = yaml.replace(/\r\n/g, '\n');
   const marker = '\n  - id: open-pr-if-needed\n';
-  const start = yaml.indexOf(marker);
+  const start = text.indexOf(marker);
   if (start < 0) throw new Error('open-pr-if-needed node missing');
-  const rest = yaml.slice(start + 1);
+  const rest = text.slice(start + 1);
   const next = rest.indexOf('\n  - id: ', marker.length);
   return next < 0 ? rest : rest.slice(0, next);
 }
@@ -110,18 +113,21 @@ describe('cauldron lane PR open guard', () => {
   test('each feature lane refuses a base mismatch inside open-pr-if-needed and does not retarget', () => {
     expect(LANE_FILES.length).toBe(13);
     for (const file of LANE_FILES) {
-      const yaml = readFileSync(join(DEFAULTS_DIR, file), 'utf8');
-      const node = openPrNode(yaml);
-      expect(node).toContain('ERROR: base_branch_mismatch');
-      expect(node).toContain('ERROR: recorded_base_branch_missing');
-      expect(node).toContain('# existing-pr-base-guard: begin');
-      expect(node).toContain('--json url,baseRefName');
-      expect(node).toContain('accept_open_pr_or_refuse');
-      expect(node).not.toContain('gh pr edit');
-      expect(node).not.toContain('.[0].url // empty');
-      expect(node).toContain('--base "$BASE_BRANCH"');
-      expect(node).not.toContain('${BASE_BRANCH:+--base');
-      expect(node).not.toContain('${BASE_BRANCH:-dev}');
+      const lf = readFileSync(join(DEFAULTS_DIR, file), 'utf8').replace(/\r\n/g, '\n');
+      const copies = [lf, lf.replace(/\n/g, '\r\n')];
+      for (const yaml of copies) {
+        const node = openPrNode(yaml);
+        expect(node).toContain('ERROR: base_branch_mismatch');
+        expect(node).toContain('ERROR: recorded_base_branch_missing');
+        expect(node).toContain('# existing-pr-base-guard: begin');
+        expect(node).toContain('--json url,baseRefName');
+        expect(node).toContain('accept_open_pr_or_refuse');
+        expect(node).not.toContain('gh pr edit');
+        expect(node).not.toContain('.[0].url // empty');
+        expect(node).toContain('--base "$BASE_BRANCH"');
+        expect(node).not.toContain('${BASE_BRANCH:+--base');
+        expect(node).not.toContain('${BASE_BRANCH:-dev}');
+      }
     }
   });
 });
