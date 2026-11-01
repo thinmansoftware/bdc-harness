@@ -589,6 +589,9 @@ export async function finalizeRunTeardown(
   run: Pick<WorkflowRun, 'id' | 'working_path' | 'started_at'>,
   opts: TeardownOptions = {}
 ): Promise<Record<string, unknown>> {
+  // A run without a working path owns no process (identity rule (a)); there is
+  // nothing to tear down and nothing to record. Production runs always carry one.
+  if (!run.working_path) return {};
   const target: TeardownTarget = {
     id: run.id,
     working_path: run.working_path,

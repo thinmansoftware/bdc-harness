@@ -882,7 +882,7 @@ describe('run teardown (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01)', () => {
         started_at: new Date(),
         completed_at: null,
         last_activity_at: null,
-        working_path: null,
+        working_path: root,
       };
       await executeDagWorkflow(
         deps,
