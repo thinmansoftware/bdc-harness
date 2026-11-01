@@ -1083,4 +1083,258 @@ describe('SqliteAdapter', () => {
       expect(tableSql.rows[0]?.sql ?? '').not.toMatch(/idempotency_key TEXT NOT NULL UNIQUE/i);
     });
   });
+
+  describe('SQLite transaction serialization', () => {
+    function deferred(): { promise: Promise<void>; resolve: () => void } {
+      let resolve: () => void = () => {};
+      const promise = new Promise<void>(done => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    }
+
+    function delay(ms: number): Promise<void> {
+      return new Promise(resolve => {
+        setTimeout(resolve, ms);
+      });
+    }
+
+    async function waitUntil(predicate: () => boolean): Promise<void> {
+      const started = Date.now();
+      while (!predicate()) {
+        if (Date.now() - started > 1000) {
+          throw new Error('timed out waiting for sqlite transaction state');
+        }
+        await delay(0);
+      }
+    }
+
+    async function createProbe(): Promise<void> {
+      db = createTestDb();
+      await db.query('CREATE TABLE tx_probe (id TEXT PRIMARY KEY)');
+    }
+
+    test('Test 1: outside reader never sees uncommitted rows', async () => {
+      await createProbe();
+      const park = deferred();
+      let parked = false;
+      const txDone = db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['r1']);
+        parked = true;
+        await park.promise;
+      });
+
+      await waitUntil(() => parked);
+      let outsideSettled = false;
+      const outside = db
+        .query<{ count: number }>('SELECT COUNT(*) AS count FROM tx_probe')
+        .then(result => {
+          outsideSettled = true;
+          return result;
+        });
+      await delay(20);
+      expect(outsideSettled).toBe(false);
+
+      park.resolve();
+      await txDone;
+      const result = await outside;
+      expect(result.rows[0]?.count).toBe(1);
+    });
+
+    test('Test 2: outside reader never sees rolled-back rows', async () => {
+      await createProbe();
+      const park = deferred();
+      let parked = false;
+      const txDone = db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['r1']);
+        parked = true;
+        await park.promise;
+        throw new Error('tx-rollback');
+      });
+
+      await waitUntil(() => parked);
+      let outsideSettled = false;
+      const outside = db
+        .query<{ count: number }>('SELECT COUNT(*) AS count FROM tx_probe')
+        .then(result => {
+          outsideSettled = true;
+          return result;
+        });
+      await delay(20);
+      expect(outsideSettled).toBe(false);
+
+      park.resolve();
+      await expect(txDone).rejects.toThrow('tx-rollback');
+      const result = await outside;
+      expect(result.rows[0]?.count).toBe(0);
+    });
+
+    test('Test 3: outside writer is not rolled back with the transaction', async () => {
+      await createProbe();
+      const park = deferred();
+      let parked = false;
+      const txDone = db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['r1']);
+        parked = true;
+        await park.promise;
+        throw new Error('tx-rollback');
+      });
+
+      await waitUntil(() => parked);
+      let writerSettled = false;
+      const writer = db.query('INSERT INTO tx_probe (id) VALUES ($1)', ['r2']).then(result => {
+        writerSettled = true;
+        return result;
+      });
+      await delay(20);
+      expect(writerSettled).toBe(false);
+
+      park.resolve();
+      await expect(txDone).rejects.toThrow('tx-rollback');
+      await writer;
+      const rows = await db.query<{ id: string }>('SELECT id FROM tx_probe ORDER BY id');
+      expect(rows.rows.map(row => row.id)).toEqual(['r2']);
+    });
+
+    test('Test 4: concurrent transactions serialize', async () => {
+      await createProbe();
+      const gateA = deferred();
+      const gateB = deferred();
+      const order: string[] = [];
+
+      const txA = db.withTransaction(async tx => {
+        order.push('BEGIN');
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['a']);
+        await gateA.promise;
+        order.push('COMMIT');
+      });
+      const txB = db.withTransaction(async tx => {
+        order.push('BEGIN');
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['b']);
+        await gateB.promise;
+        order.push('COMMIT');
+      });
+
+      await waitUntil(() => order.length >= 1);
+      expect(order).toEqual(['BEGIN']);
+
+      gateA.resolve();
+      await txA;
+      await waitUntil(() => order.length >= 3);
+      expect(order).toEqual(['BEGIN', 'COMMIT', 'BEGIN']);
+
+      gateB.resolve();
+      await txB;
+      expect(order).toEqual(['BEGIN', 'COMMIT', 'BEGIN', 'COMMIT']);
+
+      const committed = await db.query<{ id: string }>('SELECT id FROM tx_probe ORDER BY id');
+      expect(committed.rows.map(row => row.id)).toEqual(['a', 'b']);
+
+      await expect(
+        db.withTransaction(async tx => {
+          await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['doomed']);
+          await tx('ROLLBACK');
+          throw new Error('rollback-throws');
+        })
+      ).rejects.toThrow('rollback-throws');
+
+      await db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['c']);
+      });
+      const after = await db.query<{ id: string }>('SELECT id FROM tx_probe ORDER BY id');
+      expect(after.rows.map(row => row.id)).toEqual(['a', 'b', 'c']);
+    });
+
+    test('Test 5: helper calling public query inside a transaction does not deadlock', async () => {
+      await createProbe();
+      const startLeaked = deferred();
+      let leakedQueued = false;
+      let leakedSettled = false;
+      let leakedCount: number | undefined;
+
+      await db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['r1']);
+        const seen = await db.query<{ count: number }>('SELECT COUNT(*) AS count FROM tx_probe');
+        expect(seen.rows[0]?.count).toBe(1);
+        // Timer keeps this transaction's AsyncLocalStorage store after commit.
+        // Once released, that store must not bypass the mutex.
+        setTimeout(() => {
+          void startLeaked.promise.then(() => {
+            leakedQueued = true;
+            void db
+              .query<{ count: number }>('SELECT COUNT(*) AS count FROM tx_probe')
+              .then(result => {
+                leakedSettled = true;
+                leakedCount = result.rows[0]?.count;
+              });
+          });
+        }, 0);
+      });
+
+      const committed = await db.query<{ count: number }>('SELECT COUNT(*) AS count FROM tx_probe');
+      expect(committed.rows[0]?.count).toBe(1);
+
+      const later = deferred();
+      let secondParked = false;
+      const second = db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['r2']);
+        secondParked = true;
+        await later.promise;
+      });
+      await waitUntil(() => secondParked);
+      startLeaked.resolve();
+      await waitUntil(() => leakedQueued);
+      await delay(20);
+      expect(leakedSettled).toBe(false);
+
+      later.resolve();
+      await second;
+      await waitUntil(() => leakedSettled);
+      expect(leakedCount).toBe(2);
+    }, 2000);
+
+    test('Test 6: nested withTransaction fails fast', async () => {
+      await createProbe();
+
+      await db.withTransaction(async tx => {
+        let caught: unknown;
+        try {
+          await db.withTransaction(async () => 'inner');
+        } catch (error) {
+          caught = error;
+        }
+        expect(caught).toBeInstanceOf(Error);
+        expect((caught as Error).message).toContain('nested sqlite transaction');
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['outer']);
+      });
+
+      const committed = await db.query<{ count: number }>('SELECT COUNT(*) AS count FROM tx_probe');
+      expect(committed.rows[0]?.count).toBe(1);
+
+      await expect(
+        db.withTransaction(async () => {
+          let caught: unknown;
+          try {
+            await db.withTransaction(async () => 'inner');
+          } catch (error) {
+            caught = error;
+          }
+          expect(caught).toBeInstanceOf(Error);
+          expect((caught as Error).message).toContain('nested sqlite transaction');
+          throw new Error('outer-rollback');
+        })
+      ).rejects.toThrow('outer-rollback');
+
+      const afterRollback = await db.query<{ count: number }>(
+        'SELECT COUNT(*) AS count FROM tx_probe'
+      );
+      expect(afterRollback.rows[0]?.count).toBe(1);
+
+      await db.withTransaction(async tx => {
+        await tx('INSERT INTO tx_probe (id) VALUES ($1)', ['later']);
+      });
+      const rows = await db.query<{ id: string }>('SELECT id FROM tx_probe ORDER BY id');
+      expect(rows.rows.map(row => row.id)).toEqual(['later', 'outer']);
+    });
+  });
 });
