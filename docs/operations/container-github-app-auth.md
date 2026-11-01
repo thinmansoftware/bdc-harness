@@ -229,6 +229,28 @@ GITHUB_APP_TASKMASTER_INSTALLATION_ID=
 GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH=
 ```
 
+## Duty Officer
+
+Duty Officer token precedence is the duty-officer App
+(`GITHUB_APP_DUTY_OFFICER_*`), then the Taskmaster App alias
+(`GITHUB_APP_TASKMASTER_*`), then the shared App (`GITHUB_APP_*`), then
+`GH_TOKEN` / `GITHUB_TOKEN`.
+
+The security detector, the worker heartbeat alarm, and Taskmaster escalation
+delivery obtain that credential through `getServiceGitHubToken`. An App
+identity mints an installation token. A PAT is returned unchanged. Tokens are
+never logged.
+
+`DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS` defaults to `900000` and has
+a floor of `1000`. An `observation_error` uses that backoff. `clean`, `alarm`,
+and `disarmed` use `DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS` (default six
+hours). Throttle state stays in memory and resets when the process restarts.
+
+When a detector run fails, grep `duty_officer_security_detector_observation_error`
+and read `last_error`. A missing-token record also includes `identity_kind`
+(`pat`, `app`, or `none`). Installation-token mint failures log
+`duty_officer_github_token_mint_failed`.
+
 ## Builder App (run_nodes / smart_cauldron)
 
 The Cauldron builder lanes (`run_nodes` and `smart_cauldron`) open PRs and push
