@@ -631,8 +631,8 @@ nodes:
   - id: check-already-satisfied
     persona: war-council-architect
     agent: war-council-architect
-    provider: claude
-    model: sonnet
+    provider: codex
+    model: gpt-6.1-terra
     depends_on: [checkout-repair-target]
     task_class: clerical
     prompt: |
@@ -757,8 +757,8 @@ nodes:
     # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
     # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
     # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
-    provider: claude
-    model: sonnet
+    provider: codex
+    model: gpt-6.1-terra
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
     agent: war-council-architect
@@ -3806,8 +3806,8 @@ nodes:
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
     agent: overseer-opus
-    provider: claude
-    model: claude-opus-5-5
+    provider: codex
+    model: gpt-6.1-sol
     effort: xhigh
     context: fresh
     depends_on: [pause-gate, repair-gate]
@@ -3892,8 +3892,8 @@ nodes:
 
   - id: decide-push-target
     persona: major-build
-    provider: claude
-    model: opus[1m]
+    provider: codex
+    model: gpt-6.1-sol
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
@@ -4982,8 +4982,6 @@ nodes:
 
   - id: build-manifest
     persona: major-build
-    provider: claude
-    model: opus[1m]
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical
