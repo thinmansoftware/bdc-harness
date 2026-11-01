@@ -157,7 +157,8 @@ describe('duty officer security detector', () => {
           // Each trust check is an independent evaluation at the same deterministic time.
           resetSecurityDetectorStateForTests();
           const result = await runSecurityDetector({ ...d });
-          expect(result?.verdict).toBe('alarm');
+          expect(result?.verdict).toBe('observation_error');
+          expect(result?.last_error).toBe('app_auth_missing');
           const codes = result!.reasons.map(reason => reason.code);
           expect(codes.includes('receipt_missing')).toBe(!trusted);
           expect(codes.includes('unread')).toBe(!trusted);
@@ -599,6 +600,90 @@ describe('duty officer security detector', () => {
         nowMs = t0 + 61_000;
         const retried = await runSecurityDetector(d);
         expect(retried?.verdict).toBe('observation_error');
+        expect(fetchImpl.mock.calls.length).toBeGreaterThan(callsAfterFailure);
+      }
+    } finally {
+      logs.restore();
+    }
+  });
+
+  test('write token mint failures record observation_error backoff', async () => {
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS = '60000';
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT = '2026-09-01';
+    process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
+    process.env.DUTY_OFFICER_GH_REPO = 'owner/write';
+    const t0 = Date.parse('2026-09-30T12:00:00.000Z');
+    const logs = captureLogs();
+    try {
+      for (const mode of ['rejected', 'null'] as const) {
+        resetSecurityDetectorStateForTests();
+        logs.lines.length = 0;
+        let nowMs = t0;
+        const writes: string[] = [];
+        const fetchImpl = mock(async (url: string | URL | Request, init?: RequestInit) => {
+          const href = String(url);
+          const method = init?.method ?? 'GET';
+          if (method !== 'GET') {
+            writes.push(href);
+            return Response.json({ number: 77, id: 9 });
+          }
+          if (href.includes('/runs?')) {
+            return Response.json({
+              workflow_runs: [{ created_at: '2026-09-29T00:00:00.000Z', conclusion: 'success' }],
+            });
+          }
+          if (href.includes('/comments')) {
+            return Response.json([
+              {
+                id: 1,
+                user: { login: 'bluedevilcollectibles' },
+                body: '<!-- host-inventory -->\nposted_at: 2026-09-29T00:00:00Z',
+              },
+              { id: 2, user: { login: 'bluedevilcollectibles' }, body: 'TRIAGED ok' },
+            ]);
+          }
+          return Response.json([
+            {
+              number: 77,
+              title: 'Security Scan -- 2026-W40',
+              labels: ['security-scan'],
+              state: 'open',
+              body: 'weekly',
+              created_at: '2026-09-28T00:00:00.000Z',
+              updated_at: '2026-09-29T00:00:00.000Z',
+            },
+          ]);
+        });
+        const d = deps(fetchImpl as typeof fetch);
+        d.readToken = async () => 'read-token';
+        const expectedError = mode === 'rejected' ? 'app_token_mint_failed' : 'app_auth_missing';
+        d.writeTokenProvider =
+          mode === 'rejected'
+            ? async () => {
+                throw new Error('app_token_mint_failed');
+              }
+            : async () => null;
+        d.now = () => new Date(nowMs);
+
+        const first = await runSecurityDetector(d);
+        expect(first?.verdict).toBe('observation_error');
+        expect(first?.last_error).toBe(expectedError);
+        expect(first?.wrote).toEqual([]);
+        expect(writes).toEqual([]);
+        expect(
+          observationRecords(logs.lines).some(record => record.last_error === expectedError)
+        ).toBe(true);
+
+        const callsAfterFailure = fetchImpl.mock.calls.length;
+        nowMs = t0 + 30_000;
+        expect(await runSecurityDetector(d)).toBeNull();
+        expect(fetchImpl.mock.calls.length).toBe(callsAfterFailure);
+
+        nowMs = t0 + 61_000;
+        const retried = await runSecurityDetector(d);
+        expect(retried?.verdict).toBe('observation_error');
+        expect(retried?.last_error).toBe(expectedError);
+        expect(retried?.wrote).toEqual([]);
         expect(fetchImpl.mock.calls.length).toBeGreaterThan(callsAfterFailure);
       }
     } finally {

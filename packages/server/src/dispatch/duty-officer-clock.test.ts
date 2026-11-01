@@ -344,6 +344,7 @@ afterEach(() => {
   resetSecurityDetectorStateForTests();
   delete process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS;
+  delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS;
   delete process.env.DUTY_OFFICER_CLOCK_ENABLED;
   writeDutyOfficerProcessEnv(dutyOfficerProcessEnvSnapshot);
   delete process.env.DUTY_OFFICER_GH_REPO;
@@ -700,12 +701,14 @@ describe('duty officer clock', () => {
     expect(deps.postResult).toHaveBeenCalledTimes(1);
   });
 
-  test('fresh deps each tick preserve detector throttle and verdict until the interval expires', async () => {
+  test('fresh deps each tick preserve a missing write token on the error backoff', async () => {
     resetSecurityDetectorStateForTests();
     process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
     process.env.DUTY_OFFICER_GH_REPO = 'owner/write';
     const interval = 21_600_000;
+    const errorBackoff = 60_000;
     process.env.DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS = String(interval);
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS = String(errorBackoff);
     const start = Date.parse('2026-09-30T12:00:00Z');
     let tickTime = start;
     const fetchImpl = mock(async (url: string | URL | Request) =>
@@ -734,9 +737,11 @@ describe('duty officer clock', () => {
     const prior = registeredDetector(first);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(writeTokenProvider).toHaveBeenCalledTimes(1);
+    expect(prior.verdict).toBe('observation_error');
+    expect(prior.last_error).toBe('app_auth_missing');
     expect(prior.last_run_at).toBe(new Date(start).toISOString());
 
-    tickTime += 900_000;
+    tickTime += 30_000;
     const second = createTickDeps();
     await tickDutyOfficerClock(second);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
@@ -747,11 +752,12 @@ describe('duty officer clock', () => {
       last_tick_at: new Date(tickTime).toISOString(),
     });
 
-    tickTime = start + interval + 1;
+    tickTime = start + errorBackoff + 1;
     const third = createTickDeps();
     await tickDutyOfficerClock(third);
     expect(fetchImpl).toHaveBeenCalledTimes(4);
     expect(writeTokenProvider).toHaveBeenCalledTimes(2);
+    expect(registeredDetector(third).verdict).toBe('observation_error');
     expect(registeredDetector(third).last_run_at).toBe(new Date(tickTime).toISOString());
   });
 
@@ -1320,7 +1326,9 @@ describe('duty officer github token', () => {
         now: () => new Date('2026-09-30T12:00:00.000Z'),
         buildSha: 'abc1234',
       });
-      expect(result?.verdict === 'clean' || result?.verdict === 'alarm').toBe(true);
+      expect(result?.verdict).toBe('observation_error');
+      expect(result?.last_error).toBe('app_auth_missing');
+      expect(result?.wrote).toEqual([]);
       expect(auths.length).toBeGreaterThan(0);
       expect(auths.every(header => header === 'Bearer t-app')).toBe(true);
       expect(logs.lines.join('')).not.toContain('t-app');

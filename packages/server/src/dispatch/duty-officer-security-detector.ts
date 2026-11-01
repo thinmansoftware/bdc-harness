@@ -473,14 +473,22 @@ export async function runSecurityDetector(
     signal.throwIfAborted();
   } catch (error) {
     signal.throwIfAborted();
+    result.verdict = 'observation_error';
     result.last_error = (error as Error).message;
-    log.error({ err: error }, 'duty_officer_security_detector_write_refused_no_app_auth');
+    log.error(
+      { err: error, last_error: (error as Error).message },
+      'duty_officer_security_detector_observation_error'
+    );
     recordRun(result.verdict);
     return result;
   }
   if (!writeToken) {
+    result.verdict = 'observation_error';
     result.last_error = 'app_auth_missing';
-    log.warn('duty_officer_security_detector_write_refused_no_app_auth');
+    log.error(
+      { last_error: 'app_auth_missing' },
+      'duty_officer_security_detector_observation_error'
+    );
     recordRun(result.verdict);
     return result;
   }
