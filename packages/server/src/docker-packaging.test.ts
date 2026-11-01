@@ -30,7 +30,7 @@ describe('production Docker packaging', () => {
       'utf8'
     );
     const copyLine = dockerfile
-      .split('\n')
+      .split(/\r?\n/)
       .find(l => l.startsWith('COPY scripts/') && l.endsWith('./scripts/'));
     expect(copyLine).toContain('scripts/run-completion-report.ts');
     expect(dockerfile.split('AS production')[1]).toContain('scripts/run-completion-report.ts');
@@ -133,7 +133,9 @@ describe('production Docker packaging', () => {
     const runtime = dockerfile.split('AS production')[1] ?? '';
     const labelLine = 'LABEL org.opencontainers.image.revision="${ARCHON_BUILD_SHA}"';
 
-    expect(runtime.split('\n')).toContain(labelLine);
+    // Split on CRLF too: on Windows checkouts (core.autocrlf / text=auto) the
+    // working-tree Dockerfile is CRLF, and a bare '\n' split leaves a trailing '\r'.
+    expect(runtime.split(/\r?\n/)).toContain(labelLine);
     const argAt = runtime.indexOf('ARG ARCHON_BUILD_SHA=unknown');
     const labelAt = runtime.indexOf(labelLine);
     expect(argAt).toBeGreaterThanOrEqual(0);
