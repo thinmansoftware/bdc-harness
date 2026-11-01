@@ -177,20 +177,38 @@ function runCheckout(
   });
 }
 
-function sleepShim(fixture: Fixture): {
+function shQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function sleepShim(
+  fixture: Fixture,
+  hookBody = ''
+): {
   readonly env: Record<string, string>;
   readonly logFile: string;
 } {
   const bin = join(fixture.root, 'sleep-bin');
   mkdirSync(bin);
   const logFile = join(fixture.root, 'sleep.log');
+  const once = join(fixture.root, 'sleep.once');
+  const hook =
+    hookBody.length > 0
+      ? `if [ ! -e ${shQuote(once)} ]; then\n  touch ${shQuote(once)}\n${hookBody}\nfi\n`
+      : '';
   writeFileSync(
     join(bin, 'sleep'),
-    `#!/bin/sh\nprintf '%s\\n' "$1" >> ${JSON.stringify(logFile)}\n`,
+    `#!/bin/sh\nset -eu\nprintf '%s\\n' "$1" >> ${shQuote(logFile)}\n${hook}`,
     { mode: 0o755 }
   );
   chmodSync(join(bin, 'sleep'), 0o755);
   return { env: { PATH: `${bin}:${process.env.PATH ?? ''}` }, logFile };
+}
+
+function sqliteHook(dbPath: string, source: string): string {
+  const script = `${dbPath}.hook.mjs`;
+  writeFileSync(script, source);
+  return `  bun ${shQuote(script)}`;
 }
 
 function sleepTotal(logFile: string): number {
@@ -508,7 +526,11 @@ describe('repair-target worktree reclaim', () => {
     git(['commit', '-m', 'add gone'], holder);
     const head = git(['rev-parse', 'HEAD'], holder).trim();
     git(['rm', 'gone.txt'], holder);
-    writeFileSync(join(holder, 'README.md'), 'init\nedited\n');
+    // Same file, staged then edited again. A concatenated cached+unstaged diff
+    // is based on the index and does not apply to a fresh checkout of HEAD.
+    writeFileSync(join(holder, 'README.md'), 'init\nstaged\n');
+    git(['add', 'README.md'], holder);
+    writeFileSync(join(holder, 'README.md'), 'init\nstaged\nunstaged\n');
     writeFileSync(join(holder, 'keep me.txt'), 'untracked-body\n');
     const qdir = join(fixture.root, 'quarantine');
     mkdirSync(qdir);
@@ -590,7 +612,8 @@ describe('repair-target worktree reclaim', () => {
     const patch = readFileSync(patches[0], 'utf8');
     expect(patch).toContain('gone.txt');
     expect(patch).toContain('README.md');
-    expect(patch).toContain('+edited');
+    expect(patch).toContain('+staged');
+    expect(patch).toContain('+unstaged');
     const tars = quarantineFiles(dirty.qdir, '.tar');
     expect(tars.length).toBe(1);
     const extracted = join(fixture.root, 'extracted');
@@ -608,12 +631,25 @@ describe('repair-target worktree reclaim', () => {
     const fixture = makeFixture({ hold: true, withOther: false });
     roots.push(fixture.root);
     const dirty = dirtyEscalated(fixture);
+    const expectedReadme = readFileSync(join(dirty.holder, 'README.md'), 'utf8');
     const result = runCheckout(fixture, fixture.dbPath, { RTW_QUARANTINE_DIR: dirty.qdir });
     if (result.exitCode !== 0) throw new Error(show(result));
     const patches = quarantineFiles(dirty.qdir, '.patch');
     expect(patches.length).toBe(1);
+    const patch = readFileSync(patches[0], 'utf8');
+    const readmeDiffs = patch.split('\n').filter(line => /^diff --git \S+README\.md /.test(line));
+    expect(readmeDiffs.length).toBe(1);
+    // Archive the holder's commit into a plain directory. That tree is only
+    // HEAD: the staged blob is not available to paper over an index-based diff.
     const fresh = join(fixture.root, 'fresh');
-    git(['worktree', 'add', '--detach', fresh, dirty.head], fixture.caller);
+    const archive = join(fixture.root, 'head.tar');
+    git(['archive', '--format=tar', '-o', archive, dirty.head], fixture.caller);
+    mkdirSync(fresh);
+    const unpack = Bun.spawnSync(['tar', '-xf', archive, '-C', fresh], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(unpack.exitCode, unpack.stderr.toString()).toBe(0);
     const apply = Bun.spawnSync(['git', 'apply', patches[0]], {
       cwd: fresh,
       stdout: 'pipe',
@@ -621,7 +657,7 @@ describe('repair-target worktree reclaim', () => {
     });
     expect(apply.exitCode, apply.stderr.toString()).toBe(0);
     expect(existsSync(join(fresh, 'gone.txt'))).toBe(false);
-    expect(readFileSync(join(fresh, 'README.md'), 'utf8')).toBe('init\nedited\n');
+    expect(readFileSync(join(fresh, 'README.md'), 'utf8')).toBe(expectedReadme);
   }, 30000);
 
   it('Test 5: patch write failure refuses', () => {
@@ -709,4 +745,92 @@ describe('repair-target worktree reclaim', () => {
     expect(bundle).toContain('repair_target_quarantined');
     expect(bundle).toContain('repair_target_grace_wait');
   });
+
+  it('Test 8: grace wait revalidates runs and live cwd before reclaim', () => {
+    interface GraceOutcome {
+      readonly result: RunResult;
+      readonly caller: string;
+      readonly holder: string;
+      readonly qdir: string;
+      readonly waited: number;
+    }
+
+    function duringGrace(hookFor: (fixture: Fixture, holder: string) => string): GraceOutcome {
+      const fixture = makeFixture({ hold: true, withOther: false });
+      roots.push(fixture.root);
+      const holder = holderPath(fixture.holder);
+      const qdir = join(fixture.root, 'quarantine');
+      mkdirSync(qdir);
+      writeFileSync(join(holder, 'dirty.txt'), 'dirty\n');
+      writeRuns(fixture.dbPath, [
+        {
+          id: 'abcd1234ef567890',
+          status: 'completed',
+          working_path: holder,
+          completed_at: utcSecondsAgo(397),
+        },
+      ]);
+      const shim = sleepShim(fixture, hookFor(fixture, holder));
+      const result = runCheckout(fixture, fixture.dbPath, {
+        ...shim.env,
+        RTW_QUARANTINE_DIR: qdir,
+      });
+      return { result, caller: fixture.caller, holder, qdir, waited: sleepTotal(shim.logFile) };
+    }
+
+    function expectStillHeld(outcome: GraceOutcome, reason: string): void {
+      expect(outcome.result.exitCode, show(outcome.result)).toBe(1);
+      expect(outcome.waited).toBeGreaterThanOrEqual(190);
+      expect(outcome.waited).toBeLessThanOrEqual(210);
+      expect(outcome.result.stdout).toContain('repair_target_grace_wait:');
+      expect(outcome.result.stdout).toContain(reason);
+      expect(outcome.result.stdout).toContain('repair_target_branch_held:');
+      expect(outcome.result.stdout).not.toContain('repair_target_worktree_reclaimed:');
+      expect(outcome.result.stdout).not.toContain('repair_target_quarantined:');
+      expect(worktrees(outcome.caller)).toContain(outcome.holder);
+      expect(readFileSync(join(outcome.holder, 'dirty.txt'), 'utf8')).toBe('dirty\n');
+      expect(readdirSync(outcome.qdir)).toEqual([]);
+    }
+
+    const running = duringGrace((fixture, holder) =>
+      sqliteHook(
+        fixture.dbPath,
+        [
+          'import { Database } from "bun:sqlite";',
+          `const db = new Database(${JSON.stringify(fixture.dbPath)});`,
+          'db.run(',
+          '  "INSERT INTO remote_agent_workflow_runs (id, status, working_path, completed_at) VALUES (?, ?, ?, ?)",',
+          `  ["ffffeeeeddddcccc", "running", ${JSON.stringify(holder)}, null]`,
+          ');',
+          'db.close();',
+          '',
+        ].join('\n')
+      )
+    );
+    expectStillHeld(running, 'status running is not terminal');
+
+    const live = duringGrace((fixture, holder) => {
+      const pid = join(fixture.procRoot, '7777');
+      const nested = join(holder, 'nested');
+      return `  mkdir -p ${shQuote(nested)} ${shQuote(pid)}\n  ln -s ${shQuote(nested)} ${shQuote(join(pid, 'cwd'))}`;
+    });
+    expectStillHeld(live, 'live process cwd under holder');
+
+    const younger = duringGrace((fixture, holder) =>
+      sqliteHook(
+        fixture.dbPath,
+        [
+          'import { Database } from "bun:sqlite";',
+          `const db = new Database(${JSON.stringify(fixture.dbPath)});`,
+          'db.run(',
+          '  "INSERT INTO remote_agent_workflow_runs (id, status, working_path, completed_at) VALUES (?, ?, ?, ?)",',
+          `  ["aaaabbbbccccdddd", "completed", ${JSON.stringify(holder)}, ${JSON.stringify(utcSecondsAgo(1))}]`,
+          ');',
+          'db.close();',
+          '',
+        ].join('\n')
+      )
+    );
+    expectStillHeld(younger, 'completed_at is only');
+  }, 60000);
 });
