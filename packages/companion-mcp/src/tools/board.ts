@@ -150,7 +150,7 @@ function unsourcedJohnAttribution(lines: readonly string[]): boolean {
 
 function classifyPath(filePath: string): PreparedFile['kind'] | null {
   const folded = filePath.toLowerCase();
-  if (folded.includes('ruling') || filePath.endsWith('.votes.md') || filePath.includes('/votes/')) {
+  if (folded.includes('ruling') || folded.endsWith('.votes.md') || folded.includes('/votes/')) {
     return null;
   }
   if (filePath === REGISTER_PATH) {

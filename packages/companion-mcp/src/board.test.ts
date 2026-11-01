@@ -652,6 +652,74 @@ describe('board secretary tools', () => {
     }
   });
 
+  test('board_record_propose_refuses_vote_paths_regardless_of_case', async () => {
+    const github = await startRecordingServer(githubStub(new Map()));
+    const harness = await createHarness();
+    const label = secretaryLabel('grokbot');
+    const running = await startFromHarness(harness, { COMPANION_GITHUB_API_BASE: github.url });
+    const paths = [
+      'docs/board/design-rounds/M-TEST.VOTES.md',
+      'docs/board/design-rounds/M-TEST.Votes.md',
+      'docs/board/motions/M-TEST.VOTES.md',
+      'docs/board/design-rounds/VOTES/M-TEST.md',
+    ];
+    try {
+      await unlink(harness.githubTokenFile);
+      await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
+        for (const path of paths) {
+          const before = github.requests.length;
+          const refused = parseToolJson(
+            await callToolText(client, 'board_record_propose', {
+              kind: 'synthesis',
+              motion_id: 'M-TEST',
+              summary: 'should not reach github',
+              files: [{ path, content: `${label}\nno\n` }],
+            })
+          );
+          expect(refused.error).toBe('path_refused');
+          expect(github.requests).toHaveLength(before);
+        }
+      });
+      expect(github.requests).toHaveLength(0);
+    } finally {
+      await running.close();
+      await github.close();
+      await harness.cleanup();
+    }
+  });
+
+  test('board_record_propose_accepts_design_round_proposal', async () => {
+    const github = await startRecordingServer(githubStub(new Map()));
+    const dispatch = dispatchStub();
+    const mail = await startRecordingServer(dispatch.handler);
+    const harness = await createHarness();
+    const synthesis = `${secretaryLabel('grokbot')}\n\nSeats disagreed. The secretary records that without ranking them.\n`;
+    const running = await startFromHarness(harness, {
+      COMPANION_GITHUB_API_BASE: github.url,
+      DISPATCH_BASE_URL: mail.url,
+    });
+    try {
+      await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
+        const result = parseToolJson(
+          await callToolText(client, 'board_record_propose', {
+            kind: 'synthesis',
+            motion_id: 'M-TEST',
+            summary: 'Record the design-round synthesis',
+            files: [{ path: 'docs/board/design-rounds/M-TEST.md', content: synthesis }],
+          })
+        );
+        expect(result.error).toBeUndefined();
+        expect(String(result.pr_url)).toContain('/pull/7');
+      });
+      expect(github.requests.length).toBeGreaterThan(0);
+    } finally {
+      await running.close();
+      await github.close();
+      await mail.close();
+      await harness.cleanup();
+    }
+  });
+
   test('board_record_propose_refuses_motion_id_path_mismatch', async () => {
     const github = await startRecordingServer(githubStub(new Map()));
     const harness = await createHarness();
