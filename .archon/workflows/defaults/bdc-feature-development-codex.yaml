@@ -629,8 +629,8 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    persona: war-council-architect
-    agent: war-council-architect
+    persona: war-council-architect-opr
+    agent: war-council-architect-opr
     provider: codex
     model: gpt-6.1-terra
     depends_on: [checkout-repair-target]
@@ -752,16 +752,16 @@ nodes:
       exit 0
 
   - id: plan
-    persona: war-council-architect
-    # Provider pin: persona war-council-architect declares model: sonnet; the lane
-    # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
-    # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
-    # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
+    persona: war-council-architect-opr
+    # Model-free persona. war-council-architect declares model: sonnet, and
+    # resolveAgentPersona throws for any Codex persona that pins a model.
+    # war-council-architect-opr omits model:, so the node pin (gpt-6.1-terra)
+    # survives dispatch. Anchor: runs 723842fe, 10f6add0, 28e98197 (2026-07-01).
     provider: codex
     model: gpt-6.1-terra
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
-    agent: war-council-architect
+    agent: war-council-architect-opr
     task_class: medium_work
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
@@ -3801,11 +3801,14 @@ nodes:
         max_attempts: 2
 
   # apply-suggested-fix: runs ONLY when the operator chose APPROVE-WITH-FIX at the gate.
-  # Authorizes overseer-opus to apply the named suggested fix(es) -- including writing a NEW
+  # Authorizes major-build-opr to apply the named suggested fix(es) -- including writing a NEW
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
+  # major-build-opr omits model:; overseer-opus pins claude-opus-5 and resolveAgentPersona
+  # rejects that pairing on provider: codex.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
-    agent: overseer-opus
+    persona: major-build-opr
+    agent: major-build-opr
     provider: codex
     model: gpt-6.1-sol
     effort: xhigh
@@ -3891,7 +3894,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: decide-push-target
-    persona: major-build
+    persona: major-build-opr
     provider: codex
     model: gpt-6.1-sol
     depends_on: [pause-gate, classify-apply-review]

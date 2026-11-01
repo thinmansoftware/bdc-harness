@@ -5,7 +5,10 @@
 import { expect, test } from 'bun:test';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { loadAgentFile } from '../agents/registry';
 import type { WorkflowConfig } from '../deps';
+import { resolveAgentPersona } from '../executor-shared';
+import { resolveModelForNode } from '../model-override';
 import { selectQuotaExhaustionRoute } from '../node-failover';
 import type { WorkflowDefinition } from '../schemas';
 import { resolveWorkflowNodeProviders } from './resolve-binding';
@@ -19,6 +22,7 @@ import {
 } from './seat-usage';
 
 const LANE_DIR = join(import.meta.dir, '..', '..', '..', '..', '.archon/workflows/defaults');
+const AGENTS_DIR = join(import.meta.dir, '..', '..', '..', '..', '.archon/agents');
 const RESETS_AT = '2026-11-01T00:00:00Z';
 const CUTOFF_PERCENT = 95;
 
@@ -125,7 +129,7 @@ function gateLane(workflow: WorkflowDefinition): {
   };
 }
 
-test('claudeSeatFullCodexLaneRuns', () => {
+test('claudeSeatFullCodexLaneRuns', async () => {
   const codex = loadLane('bdc-feature-development-codex.yaml');
   const cursor = loadLane('bdc-feature-development-cursor.yaml');
   const codexGate = gateLane(codex);
@@ -136,11 +140,42 @@ test('claudeSeatFullCodexLaneRuns', () => {
     .map(entry => entry.node.id);
   expect(claudeNodes).toEqual([]);
 
+  const assistantModels = { codex: undefined };
   for (const [nodeId, model] of Object.entries(EXPECTED_CODEX_MODELS)) {
     const entry = codexGate.resolved.find(item => item.node.id === nodeId);
     if (!entry) throw new Error(`missing resolved node ${nodeId}`);
     expect(entry.providerId).toBe('codex');
     expect(entry.node.model).toBe(model);
+
+    // Dispatch path: load the real persona, then resolveAgentPersona the way
+    // dag-executor does before the second resolveModelForNode. A Codex persona
+    // that declares model: throws InfrastructureClassBlock here.
+    const agentName = entry.node.agent ?? entry.node.persona;
+    if (!agentName) throw new Error(`${nodeId} declares no agent or persona`);
+    const persona = await loadAgentFile(join(AGENTS_DIR, `${agentName}.md`));
+    expect(persona.model, nodeId).toBeUndefined();
+    const prePersona = resolveModelForNode({
+      nodeId: entry.node.id,
+      nodeProvider: entry.node.provider,
+      nodeModel: entry.node.model,
+      workflowProvider: codex.provider ?? 'codex',
+      workflowModel: codex.model,
+      assistantModels,
+    });
+    const personaResolution = resolveAgentPersona(persona, prePersona.model, prePersona.provider);
+    const dispatched = resolveModelForNode({
+      nodeId: entry.node.id,
+      nodeProvider: entry.node.provider,
+      nodeModel: entry.node.model,
+      personaModel: personaResolution.model,
+      workflowProvider: codex.provider ?? 'codex',
+      workflowModel: codex.model,
+      assistantModels,
+    });
+    expect(dispatched.provider, nodeId).toBe('codex');
+    expect(dispatched.model, nodeId).toBe(model);
+    expect(personaResolution.agentName, nodeId).toBe(agentName);
+    expect(personaResolution.systemPrompt.length, nodeId).toBeGreaterThan(0);
   }
 
   const manifest = codex.nodes.find(node => node.id === 'build-manifest');
