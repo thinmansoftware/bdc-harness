@@ -8,6 +8,7 @@ const ORACLE_MAX_RESPONSE_BYTES = 256 * 1024;
 const ORACLE_TEXT_CAP = 2000;
 const ORACLE_TOP_K_DEFAULT = 5;
 const ORACLE_TOP_K_MAX = 8;
+const ORACLE_SEARCH_ORIGIN = 'https://oracle.bluedevilcollectibles.com';
 
 export interface OracleHit {
   doc_title: string;
@@ -24,7 +25,7 @@ export function assertOracleSearchUrl(value: string): string {
   } catch {
     throw new Error('oracle_url_refused');
   }
-  if (parsed.protocol !== 'https:' || parsed.pathname !== '/v1/search') {
+  if (parsed.origin !== ORACLE_SEARCH_ORIGIN || parsed.pathname !== '/v1/search') {
     throw new Error('oracle_url_refused');
   }
   if (

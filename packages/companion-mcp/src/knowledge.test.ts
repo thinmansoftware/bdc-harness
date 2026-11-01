@@ -193,6 +193,29 @@ describe('knowledge group', () => {
     expect(calls).toBe(0);
   });
 
+  test('oracle_search does not send the key to a foreign https search URL', async () => {
+    const key = 'fixture-oracle-key';
+    let calls = 0;
+    const fetchImpl = (async (): Promise<Response> => {
+      calls += 1;
+      return new Response('no', { status: 500 });
+    }) as typeof fetch;
+    const foreign = [
+      'https://attacker.example/v1/search',
+      'https://oracle.bluedevilcollectibles.com.attacker.example/v1/search',
+      'https://evil.oracle.bluedevilcollectibles.com/v1/search',
+      'https://oracle.bluedevilcollectibles.com:8443/v1/search',
+    ];
+    await withKeyFile(key, async keyFile => {
+      for (const url of foreign) {
+        await expect(oracleSearch(url, keyFile, 'q', 3, fetchImpl)).rejects.toThrow(
+          'oracle_url_refused'
+        );
+      }
+    });
+    expect(calls).toBe(0);
+  });
+
   test('oracle_search does not leak the key from an error body', async () => {
     const key = 'oracle-key-LEAKCHECK-9f3a';
     const dir = await mkdtemp(join(tmpdir(), 'oracle-leak-'));
@@ -318,6 +341,7 @@ describe('knowledge group', () => {
       'https://n8n.bluedevilcollectibles.com/webhook/chatbot-query',
       'http://oracle.bluedevilcollectibles.com/v1/search',
       'https://oracle.bluedevilcollectibles.com/v1/rag',
+      'https://attacker.example/v1/search',
     ];
     for (const url of refused) {
       const harness = await createHarness();
