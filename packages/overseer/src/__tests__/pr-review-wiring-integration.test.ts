@@ -20,32 +20,28 @@
  * this test fails with the exact real-world symptom instead of passing
  * vacuously against a fake.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, test, mock } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test as bunTest } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps.ts';
+import { runWithBoundDatabase } from './isolated-database';
 
 let db: import('@archon/core/db/adapters/sqlite').SqliteAdapter;
 let currentDbPath = '';
 
-// Bug found + fixed 2026-08-25 (same disease class as the CI-stabilization
-// WO this test's sibling PR fixed): mock.module() patches the PROCESS-GLOBAL
-// module registry, so replacing '@archon/core/db/connection' with an object
-// carrying ONLY getDatabase silently dropped every other export of that
-// module (getDialect, pool, etc.) for every LATER-loaded test file that
-// imports from it -- crashing them at import time with "Export named
-// 'getDialect' not found". Spreading the real module and restoring in
-// afterAll keeps the blast radius inside this file.
-import * as realConnection from '@archon/core/db/connection';
-
-mock.module('@archon/core/db/connection', () => ({
-  ...realConnection,
-  getDatabase: () => db,
-}));
-
-afterAll(() => {
-  mock.restore();
-});
+// getDatabase() follows the calling async context. mock.module() on
+// '@archon/core/db/connection' is process-global: its closed adapter then
+// fails every later suite in one `bun test` directory run.
+function test(name: string, fn: () => Promise<unknown>, timeout?: number): void {
+  bunTest(
+    name,
+    () => {
+      if (!db) throw new Error('pr-review sqlite adapter was not created');
+      return runWithBoundDatabase(db, () => Promise.resolve(fn()));
+    },
+    timeout
+  );
+}
 
 const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
 const {
@@ -74,8 +70,8 @@ const {
 } = await import('../remediation-candidate.ts');
 const { createRealOctokitClient } = await import('../adapters/github-real-deps.ts');
 const { createHmac } = await import('crypto');
-// Imported dynamically, after mock.module above, so it binds the mocked
-// connection and therefore the per-test SqliteAdapter.
+// Imported after the test wrapper so runtime getDatabase() calls see this
+// file's per-test SqliteAdapter.
 const dispatchModule = await import('@archon/core/db/dispatch');
 
 function cleanupDb(path: string): void {
