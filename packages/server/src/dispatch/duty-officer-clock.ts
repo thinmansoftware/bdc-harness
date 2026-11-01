@@ -7,6 +7,7 @@ import {
   postResult,
   registerWorker,
   releaseMessage,
+  requeueExpiredClaims,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
   type DispatchSenderContext,
@@ -79,6 +80,7 @@ export interface DutyOfficerClockDeps {
   claimMessage: typeof claimMessage;
   postResult: typeof postResult;
   releaseMessage: typeof releaseMessage;
+  requeueExpiredClaims: typeof requeueExpiredClaims;
   createAuthenticatedMessage: (
     context: DispatchSenderContext,
     data: CreateAuthenticatedMessageData
@@ -279,6 +281,7 @@ export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
     claimMessage,
     postResult,
     releaseMessage,
+    requeueExpiredClaims,
     createAuthenticatedMessage,
     getCurrentXoLease,
     listStaleIssues: listStaleGithubIssues,
@@ -542,6 +545,7 @@ export async function tickDutyOfficerClock(
   if (inFlight) return;
   inFlight = true;
   try {
+    await deps.requeueExpiredClaims((deps.now?.() ?? new Date()).toISOString());
     await deps.registerWorker({
       worker_id: DUTY_OFFICER_WORKER_ID,
       host: process.env.HOSTNAME ?? 'in-process',

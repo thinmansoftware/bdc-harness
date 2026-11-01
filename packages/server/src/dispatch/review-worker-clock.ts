@@ -6,6 +6,7 @@ import {
   postResult,
   registerWorker,
   releaseMessage,
+  requeueExpiredClaims,
   type DispatchTaskOutcome,
 } from '@archon/core/db/dispatch';
 import {
@@ -64,6 +65,7 @@ export interface ReviewWorkerDeps {
    * `releaseMessage`, which already carries the required fencing guards.
    */
   deferMessage: typeof deferMessage;
+  requeueExpiredClaims: typeof requeueExpiredClaims;
   runAndSubmitReview: typeof runAndSubmitReview;
   createSubmitDeps: (reviewerIdentity: string) => ReturnType<typeof createRealSubmitDeps>;
   /** Optional logger seam for deterministic observability tests. */
@@ -136,6 +138,7 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     postResult,
     releaseMessage,
     deferMessage,
+    requeueExpiredClaims,
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
     staleVerdictSweep: config =>
@@ -161,6 +164,7 @@ export async function tickReviewWorkerClock(
   if (inFlight) return;
   inFlight = true;
   try {
+    await deps.requeueExpiredClaims(new Date().toISOString());
     await deps.registerWorker({
       worker_id: REVIEW_WORKER_ID,
       host: process.env.HOSTNAME ?? 'in-process',
@@ -357,4 +361,23 @@ export function startReviewWorkerClock(
 export function stopReviewWorkerClock(): void {
   if (timer) clearInterval(timer);
   timer = null;
+}
+
+/**
+ * Requeue expired claims once, then start the in-process dispatch clocks.
+ * The duty-officer starter is injected so this module does not import that clock.
+ * A failed sweep throws before either clock starts.
+ */
+export async function bootInProcessDispatchClocks(input: {
+  now: string;
+  reviewConfig: ReviewRouteConfig | null | undefined;
+  requeueExpiredClaims: (now: string) => Promise<readonly string[]>;
+  startReviewWorkerClock: typeof startReviewWorkerClock;
+  startDutyOfficerClock: () => void;
+}): Promise<void> {
+  await input.requeueExpiredClaims(input.now);
+  if (input.reviewConfig) {
+    input.startReviewWorkerClock(input.reviewConfig);
+  }
+  input.startDutyOfficerClock();
 }
