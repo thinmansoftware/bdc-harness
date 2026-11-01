@@ -6,6 +6,7 @@ import {
   runMergeExecutionBridgeOnce,
   type MergeExecutionBridgeStore,
 } from '../merge-execution-bridge';
+import { specDeclaresMergeHold } from '../merge-hold';
 import { parseMergeRepoPolicy } from '../merge-repo-policy';
 import type {
   GitHubClientDeps,
@@ -1193,5 +1194,139 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     const body = bodies[0] ?? '';
     expect(/^[\x00-\x7F]*$/.test(body)).toBe(true);
     expect(body).toContain('policy thinmansoftware/bdc-harness:dev');
+  });
+});
+
+function httpStatusError(status: number): Error & { status: number } {
+  const error = new Error(`github status ${status}`) as Error & { status: number };
+  error.status = status;
+  return error;
+}
+
+describe('merge hold', () => {
+  test('spec hold blocks an otherwise mergeable PR', async () => {
+    const row = { ...verdict('spec-hold'), wo_id: 'WO-X-01' };
+    const h = harness([row], greenPr());
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readWoSpec: async () => 'WO: WO-X-01\nmerge_hold: true\n',
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([{ verdictId: 'spec-hold', reason: 'merge_hold' }]);
+  });
+
+  test('header parsing is strict', () => {
+    expect(specDeclaresMergeHold('merge_hold: false')).toBe(false);
+    expect(specDeclaresMergeHold('merge_hold: true # note')).toBe(false);
+    expect(specDeclaresMergeHold('The words merge_hold true appear in a prose paragraph.')).toBe(
+      false
+    );
+    expect(specDeclaresMergeHold(' merge_hold: true')).toBe(false);
+    expect(specDeclaresMergeHold('merge_hold: true')).toBe(true);
+    expect(specDeclaresMergeHold('merge_hold: true   ')).toBe(true);
+    expect(specDeclaresMergeHold('Merge_Hold: TRUE')).toBe(true);
+    expect(specDeclaresMergeHold('WO: WO-X-01\nmerge_hold: true\n\nBody text.\n')).toBe(true);
+  });
+
+  test('lifting the hold merges normally', async () => {
+    let spec = 'WO: WO-X-01\nmerge_hold: true\n';
+    const row = { ...verdict('lift-hold'), wo_id: 'WO-X-01' };
+    const h = harness([row], greenPr());
+    const options = {
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readWoSpec: async (): Promise<string> => spec,
+    };
+    await runMergeExecutionBridgeOnce(options);
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([{ verdictId: 'lift-hold', reason: 'merge_hold' }]);
+
+    spec = 'WO: WO-X-01\n\nThe hold line is gone.\n';
+    await runMergeExecutionBridgeOnce(options);
+    expect(h.merges).toBe(1);
+    expect(h.approvals).toBe(1);
+    expect(h.outcomes).toEqual([
+      expect.objectContaining({
+        verdictId: 'lift-hold',
+        mutationSent: true,
+        reason: 'merge_executed',
+      }),
+    ]);
+  });
+
+  test('fetch error defers, never merges', async () => {
+    const row = { ...verdict('fetch-502'), wo_id: 'WO-X-01' };
+    const h = harness([row], greenPr());
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readWoSpec: async () => {
+        throw httpStatusError(502);
+      },
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([{ verdictId: 'fetch-502', reason: 'merge_hold_unverified' }]);
+  });
+
+  test('missing spec is no hold', async () => {
+    const row = { ...verdict('missing-spec'), wo_id: 'WO-X-01' };
+    const h = harness([row], greenPr());
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readWoSpec: async () => {
+        throw httpStatusError(404);
+      },
+    });
+    expect(h.merges).toBe(1);
+    expect(h.approvals).toBe(1);
+    expect(h.outcomes).toEqual([
+      expect.objectContaining({
+        verdictId: 'missing-spec',
+        mutationSent: true,
+        reason: 'merge_executed',
+      }),
+    ]);
+  });
+
+  test('label hold applies to non-WO PRs', async () => {
+    const row = {
+      ...verdict('label-hold'),
+      run_id: 'pr-discovery:thinmansoftware/bdc-harness#5',
+      wo_id: 'gh:thinmansoftware/bdc-harness#5',
+    };
+    const h = harness(
+      [row],
+      greenPr({
+        labels: ['merge-hold'],
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 5 },
+      })
+    );
+    let reads = 0;
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readWoSpec: async () => {
+        reads += 1;
+        return 'merge_hold: true\n';
+      },
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([{ verdictId: 'label-hold', reason: 'merge_hold_label' }]);
+    expect(reads).toBe(0);
   });
 });
