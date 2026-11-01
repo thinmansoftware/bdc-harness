@@ -1857,9 +1857,17 @@ async function resolveNodeProviderAndModel(
       // Retain the persona prompt/tools while replacing its model binding with
       // the override for Claude (whose persona resolver requires a model) and
       // removing it for providers whose persona resolver does not.
+      // A seat reroute (WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01) writes the same
+      // per-node entry, so a rerouted persona node adapts to its new provider here.
       const nodeBindingOverride = modelOverride?.nodes?.[node.id];
       const personaForResolution = nodeBindingOverride
-        ? { ...persona, model: provider === 'claude' ? model : undefined }
+        ? {
+            ...persona,
+            model:
+              provider === 'claude'
+                ? (model ?? assistantModels[provider] ?? persona.model)
+                : undefined,
+          }
         : persona;
       const personaResolution = resolveAgentPersona(personaForResolution, effectiveModel, provider);
       effectiveModel = resolveModelForNode({
@@ -3908,7 +3916,8 @@ async function executeLoopNode(
   nodeOutputs: Map<string, NodeOutput>,
   config: WorkflowConfig,
   issueContext?: string,
-  workflowLevelOptions?: WorkflowLevelOptions
+  workflowLevelOptions?: WorkflowLevelOptions,
+  nodeBindingOverridden = false
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3974,8 +3983,16 @@ async function executeLoopNode(
       // workflowProvider here is already the per-node provider (the outer
       // dispatch resolves node.provider ?? workflowProvider before calling
       // executeLoopNode), so a codex loop node is correctly recognized.
+      // A node-level binding override (including a seat reroute) owns the model,
+      // so the persona model pin is replaced for the provider actually running.
+      const personaForLoop = nodeBindingOverridden
+        ? {
+            ...persona,
+            model: workflowProvider === 'claude' ? resolvedOptions.model : undefined,
+          }
+        : persona;
       const personaResolution = resolveAgentPersona(
-        persona,
+        personaForLoop,
         resolvedOptions.model,
         workflowProvider
       );
@@ -5887,7 +5904,8 @@ async function executeDagWorkflowInternal(
               nodeOutputs,
               config,
               issueContext,
-              workflowLevelOptions
+              workflowLevelOptions,
+              Boolean(modelOverride?.nodes?.[node.id])
             );
 
             // AVAILABILITY failover for loop nodes (WO-HARNESS-NODE-PROVIDER-FAILOVER-01).

@@ -60,6 +60,10 @@ export function selectSeatNodeFailover(input: SeatNodeFailoverInput): string | n
  * attempt. The model is cleared on purpose so the primary provider's model id
  * never leaks to the new provider; the provider's own configured model applies.
  * No model id is introduced here.
+ *
+ * A declared persona stays on the node (instructions and tool restrictions are
+ * kept). The executor also writes a per-node model override for the route, which
+ * the persona binding reads to adapt the persona's model pin to the new provider.
  */
 export function buildSeatRerouteNode(
   node: DagNode,

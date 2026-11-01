@@ -1283,6 +1283,9 @@ export async function executeWorkflow(
     // Nodes the seat gate reroutes off an over-cutoff seat dispatch from this
     // copy of the workflow (WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01).
     let dispatchWorkflow = executableWorkflow;
+    // Per-node model overrides for the dispatch. A reroute replaces the node's entry:
+    // the override pinned the exhausted provider, so it must not beat the new route.
+    let dispatchModelOverride = modelOverride;
     const laneName = executableWorkflow.name;
     const seatIds = seatsForBindings(probeDecision.bindings);
     if (seatIds.length > 0) {
@@ -1348,6 +1351,13 @@ export async function executeWorkflow(
           for (const route of degraded.routes ?? []) routes.set(route.nodeId, route);
         }
         if (routes.size > 0) {
+          const nodeOverrides: Record<string, { provider?: string; model?: string }> = {
+            ...(modelOverride?.nodes ?? {}),
+          };
+          for (const [nodeId, route] of routes) {
+            nodeOverrides[nodeId] = { provider: route.toProvider };
+          }
+          dispatchModelOverride = { ...(modelOverride ?? {}), nodes: nodeOverrides };
           dispatchWorkflow = {
             ...executableWorkflow,
             nodes: executableWorkflow.nodes.map(node => {
@@ -1583,7 +1593,7 @@ export async function executeWorkflow(
       configuredCommandFolder,
       issueContext,
       dagPriorCompletedNodes,
-      modelOverride
+      dispatchModelOverride
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

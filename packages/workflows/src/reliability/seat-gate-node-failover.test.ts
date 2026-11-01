@@ -6,7 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { readFileSync } from 'fs';
-import { mkdtemp } from 'fs/promises';
+import { mkdir, mkdtemp, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
@@ -16,7 +16,12 @@ import {
   registerCommunityProviders,
   registerProvider,
 } from '@archon/providers';
-import type { IAgentProvider, MessageChunk, ProviderCapabilities } from '@archon/providers/types';
+import type {
+  IAgentProvider,
+  MessageChunk,
+  ProviderCapabilities,
+  SendQueryOptions,
+} from '@archon/providers/types';
 import { rootLogger } from '@archon/paths';
 import { executeWorkflow } from '../executor';
 import { parseWorkflow } from '../loader';
@@ -32,12 +37,21 @@ import {
   type SeatReading,
 } from './seat-usage';
 import { selectSeatNodeFailover } from './seat-node-failover';
+import type { ModelOverride } from '../model-override';
 
 const LANE = 'stub-reroute-lane';
 const LF = String.fromCharCode(10);
 const CRLF = String.fromCharCode(13, 10);
 const warnings: Array<{ obj: Record<string, unknown>; msg: string }> = [];
 const dispatched: string[] = [];
+interface Invocation {
+  provider: string;
+  prompt: string;
+  model: string | undefined;
+  systemPrompt: string | undefined;
+  disallowedTools: string[] | undefined;
+}
+const invocations: Invocation[] = [];
 const streamSym = Object.getOwnPropertySymbols(rootLogger).find(
   sym => sym.description === 'pino.stream'
 );
@@ -121,8 +135,22 @@ function provider(id = 'claude'): IAgentProvider {
   return {
     getType: () => id,
     getCapabilities: () => ({}) as ReturnType<IAgentProvider['getCapabilities']>,
-    sendQuery: async function* (prompt: string): AsyncGenerator<MessageChunk> {
+    sendQuery: async function* (
+      prompt: string,
+      _cwd: string,
+      _resume?: string,
+      options?: SendQueryOptions
+    ): AsyncGenerator<MessageChunk> {
       if (prompt.startsWith('review-')) dispatched.push(id);
+      if (prompt.startsWith('review-')) {
+        invocations.push({
+          provider: id,
+          prompt,
+          model: options?.model,
+          systemPrompt: options?.systemPrompt,
+          disallowedTools: options?.disallowedTools,
+        });
+      }
       yield { type: 'assistant', content: 'OK' };
     },
   };
@@ -159,6 +187,18 @@ function useSeatRegistry(): void {
   });
 }
 
+const PERSONA = [
+  '---',
+  'name: reroute-claude-persona',
+  'model: sonnet',
+  'tools: [Read, Grep]',
+  'description: reroute test persona',
+  '---',
+  '',
+  'REROUTE-PERSONA-INSTRUCTIONS: keep this system prompt on the rerouted node.',
+  '',
+].join(LF);
+
 function claudeNodes(extra: Record<string, unknown> = {}): DagNode[] {
   return ['review-a', 'review-b'].map(
     id => ({ id, prompt: id, provider: 'claude', model: 'sonnet', ...extra }) as DagNode
@@ -175,12 +215,19 @@ function stubLane(laneProvider: string, nodes: DagNode[]): WorkflowDefinition {
   };
 }
 
-async function run(wf: WorkflowDefinition): Promise<{
+async function run(
+  wf: WorkflowDefinition,
+  options: { modelOverride?: ModelOverride; personaFiles?: Record<string, string> } = {}
+): Promise<{
   result: Awaited<ReturnType<typeof executeWorkflow>>;
   store: ReturnType<typeof makeStore>;
 }> {
   const store = makeStore();
   const cwd = await mkdtemp(join(tmpdir(), 'seat-node-failover-'));
+  for (const [name, body] of Object.entries(options.personaFiles ?? {})) {
+    await mkdir(join(cwd, '.archon', 'agents'), { recursive: true });
+    await writeFile(join(cwd, '.archon', 'agents', name), body);
+  }
   const deps = {
     store,
     loadConfig: async (): Promise<WorkflowConfig> =>
@@ -208,7 +255,11 @@ async function run(wf: WorkflowDefinition): Promise<{
     undefined,
     undefined,
     undefined,
-    makeRun()
+    undefined,
+    undefined,
+    makeRun(),
+    undefined,
+    options.modelOverride
   );
   return { result, store };
 }
@@ -224,6 +275,7 @@ function events(store: ReturnType<typeof makeStore>, type: string): Recorded[] {
 beforeEach(() => {
   warnings.length = 0;
   dispatched.length = 0;
+  invocations.length = 0;
   clearRegistry();
   useSeatRegistry();
   resetSeatUsageCacheForTests();
@@ -413,5 +465,50 @@ describe('node-level seat reroute', () => {
       event => event.data.reason === 'seat_usage_refused'
     );
     expect(failed?.data.role).toBe('lane');
+  });
+  test('rerouted_persona_node_dispatches_on_the_new_provider', async () => {
+    setSeatUsageReaderForTests(async () => ({
+      claude: reading('claude', 'seven_day', 96),
+      codex: reading('codex', 'primary', 10),
+    }));
+    const { result, store } = await run(
+      stubLane('codex', claudeNodes({ agent: 'reroute-claude-persona' })),
+      {
+        personaFiles: { 'reroute-claude-persona.md': PERSONA },
+      }
+    );
+    expect(result.error ?? '').not.toContain('InfrastructureClassBlock');
+    expect(result.error ?? '').not.toContain('must not declare');
+    expect(result.error ?? '').not.toContain('must declare');
+    expect(events(store, 'node_failover')).toHaveLength(2);
+    const review = invocations.filter(call => call.prompt.startsWith('review-'));
+    expect(review.map(call => call.provider).sort()).toEqual(['codex', 'codex']);
+    for (const call of review) {
+      // The persona's Anthropic model pin never reaches the codex provider.
+      expect(call.model).toBeUndefined();
+      // Instructions and tool restrictions survive the reroute.
+      expect(call.systemPrompt ?? '').toContain('REROUTE-PERSONA-INSTRUCTIONS');
+    }
+  });
+
+  test('rerouted_node_uses_reroute_target_not_user_model_override', async () => {
+    setSeatUsageReaderForTests(async () => ({
+      claude: reading('claude', 'seven_day', 96),
+      codex: reading('codex', 'primary', 10),
+    }));
+    const modelOverride: ModelOverride = {
+      nodes: { 'review-a': { provider: 'claude', model: 'override-model' } },
+    };
+    const { store } = await run(stubLane('codex', claudeNodes()), { modelOverride });
+    expect(
+      events(store, 'node_failover')
+        .map(event => event.step_name)
+        .sort()
+    ).toEqual(['review-a', 'review-b']);
+    const reviewA = invocations.filter(call => call.prompt === 'review-a');
+    // The override pinned the exhausted claude provider; it must not win over the route.
+    expect(reviewA.map(call => call.provider)).toEqual(['codex']);
+    expect(reviewA[0]?.model).toBeUndefined();
+    expect(invocations.filter(call => call.provider === 'claude')).toEqual([]);
   });
 });
