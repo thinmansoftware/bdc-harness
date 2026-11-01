@@ -31,7 +31,7 @@
  * after the floor makes the scan incomplete.
  *
  * Node-timeout teardown is node-specific: every bash/script node subprocess is
- * spawned with a unique ARCHON_NODE_TOKEN in its environment, inherited by all
+ * spawned with ARCHON_NODE_RUN_ID=<run>:<node> in its environment, inherited by all
  * of its descendants (it survives reparenting after the direct child is
  * killed). A timeout signals only processes whose /proc/<pid>/environ carries
  * that node's token, each still required to satisfy (a)-(d) against the node's
@@ -617,7 +617,7 @@ export async function finalizeRunTeardown(
 // Node-specific timeout teardown (Scope IN item 2, Overseer review of #4113)
 // ---------------------------------------------------------------------------
 
-export const NODE_TOKEN_ENV = 'ARCHON_NODE_TOKEN';
+export const NODE_TOKEN_ENV = 'ARCHON_NODE_RUN_ID';
 
 /** Membership test: does pid's environment carry `NODE_TOKEN_ENV=<token>`? */
 function nodeTokenMembership(reader: ProcReader, token: string): Membership {
@@ -635,7 +635,7 @@ function nodeTokenMembership(reader: ProcReader, token: string): Membership {
 export interface NodeTimeoutTeardownInput {
   readonly run: TeardownTarget;
   readonly nodeStartMs: number;
-  /** The ARCHON_NODE_TOKEN value the timed-out node was spawned with. */
+  /** The ARCHON_NODE_RUN_ID value the timed-out node was spawned with. */
   readonly nodeToken: string;
 }
 

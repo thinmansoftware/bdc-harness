@@ -3274,7 +3274,7 @@ async function executeBashNode(
     : nodeRefResolved;
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
-  const bashNodeToken = `${workflowRun.id}:${node.id}:${randomUUID()}`;
+  const bashNodeToken = `${workflowRun.id}:${node.id}`;
   // Inject workflow inputs as INPUT_<NAME> env vars (belt-and-suspenders alongside template substitution).
   const inputEnvVars: Record<string, string> = resolvedInputs
     ? Object.fromEntries(
@@ -3601,7 +3601,7 @@ async function executeScriptNode(
   const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
-  const scriptNodeToken = `${workflowRun.id}:${node.id}:${randomUUID()}`;
+  const scriptNodeToken = `${workflowRun.id}:${node.id}`;
   const subprocessEnv: NodeJS.ProcessEnv = {
     ...process.env,
     ...(envVars ?? {}),

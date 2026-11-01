@@ -526,8 +526,8 @@ describe('run teardown (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01)', () => {
       const earlier = spawnDetached('sleep', ['300'], wt);
       await sleepMs(1200);
       const nodeAStart = Date.now();
-      const tokenA = 'run-t:node-a:token';
-      const tokenB = 'run-t:node-b:token';
+      const tokenA = 'run-t:node-a';
+      const tokenB = 'run-t:node-b';
       const nodeA = execFileAsync('bash', ['-c', 'sleep 0.3; sleep 300 >/dev/null 2>&1 & wait'], {
         cwd: wt,
         timeout: 2000,

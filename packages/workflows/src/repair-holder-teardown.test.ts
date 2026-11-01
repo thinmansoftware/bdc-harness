@@ -496,29 +496,34 @@ describe('repair holder teardown -- rtw core (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-
     expect(git(['worktree', 'list'], fixture.caller)).toContain(fixture.holder);
   }, 60000);
 
-  it('rtw core: a holder that predates the holder run blocks release (Overseer #4113)', () => {
-    const fixture = makeFixture();
-    roots.push(fixture.root);
-    writeRuns(fixture.dbPath, [terminalRow(fixture, 'failed', 30, 600)]);
-    // Started 2 hours ago, before the holder run's started_at (10 min ago).
-    fakeProc(fixture.procRoot, 4646, fixture.holder, { startSecondsAgo: 7200 });
-    const result = runSync(fixture, script(), envFor(fixture));
-    expect(result.exitCode, show(result)).not.toBe(0);
-    expect(result.stdout).toContain('live process cwd under holder');
-    expect(result.stdout).toContain('reason predates_run');
-    expect(git(['worktree', 'list'], fixture.caller)).toContain(fixture.holder);
-  }, 60000);
-
-  it('rtw core: a holder of another uid blocks release (Overseer #4113)', () => {
-    const fixture = makeFixture();
-    roots.push(fixture.root);
-    writeRuns(fixture.dbPath, [terminalRow(fixture, 'failed', 30)]);
+  it('Test 2b: reclaim_blocked_by_predates_run_and_foreign_uid_holders', () => {
     const otherUid = SELF_UID === '0' ? '1001' : '0';
-    fakeProc(fixture.procRoot, 4747, join(fixture.holder), { uid: otherUid, startSecondsAgo: 5 });
-    const result = runSync(fixture, script(), envFor(fixture));
-    expect(result.exitCode, show(result)).not.toBe(0);
-    expect(result.stdout).toContain('reason foreign_uid');
-    expect(git(['worktree', 'list'], fixture.caller)).toContain(fixture.holder);
+    const cases: { reason: string; pid: number; opts: Parameters<typeof fakeProc>[3] }[] = [
+      // Started 2 hours ago, before the holder run's started_at (10 min ago).
+      { reason: 'predates_run', pid: 4646, opts: { startSecondsAgo: 7200, comm: 'tail' } },
+      // Same age as a holder-owned process, different uid.
+      {
+        reason: 'foreign_uid',
+        pid: 4747,
+        opts: { startSecondsAgo: 60, uid: otherUid, comm: 'cat' },
+      },
+    ];
+    for (const c of cases) {
+      const fixture = makeFixture();
+      roots.push(fixture.root);
+      writeRuns(fixture.dbPath, [terminalRow(fixture, 'escalated', 30, 600)]);
+      fakeProc(fixture.procRoot, c.pid, fixture.holder, c.opts);
+      const before = treeHashes(fixture.holder);
+      const t0 = Date.now();
+      const result = runSync(fixture, script(), envFor(fixture, { RTW_HOLDER_WAIT_SECONDS: '20' }));
+      expect(Date.now() - t0).toBeLessThan(3000);
+      expect(result.exitCode, show(result)).not.toBe(0);
+      expect(result.stdout).toContain(`reason ${c.reason}`);
+      expect(result.stdout).toContain(`pid ${String(c.pid)} comm ${c.opts?.comm ?? ''}`);
+      expect(result.stdout).not.toContain('repair_target_worktree_reclaimed');
+      expect(treeHashes(fixture.holder)).toEqual(before);
+      expect(git(['worktree', 'list'], fixture.caller)).toContain(fixture.holder);
+    }
   }, 60000);
 
   it('Test 18: rtw_core_identical_in_all_lanes', () => {

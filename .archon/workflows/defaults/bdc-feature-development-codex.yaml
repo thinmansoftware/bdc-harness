@@ -223,6 +223,7 @@ nodes:
       # RTW_PROC_ROOT (default /proc) is the holder or inside it. EVERY observable cwd
       # holder blocks: start time (after the holder run's started_at) and uid only
       # label the holder (run_owned, predates_run, foreign_uid), they never excuse it.
+      # A predates_run or foreign_uid holder is refused at once, never waited on.
       # Skipped: this shell, its ancestors and PID 1. A same-uid entry whose cwd, stat
       # or status cannot be read makes the scan incomplete and is refused, unless it
       # started at or before the holder run (a non-dumpable session process). When every
@@ -299,6 +300,7 @@ nodes:
         local d pid cwdlink resolved uid start comm reason
         rtw_scan_result="clear"
         rtw_scan_detail=""
+        rtw_scan_foreign=""
         rtw_scan_unreadable=0
         for d in "$proc_root"/[0-9]*; do
           [ -d "$d" ] || continue
@@ -353,6 +355,9 @@ nodes:
           elif [ "$start" -le "$rtw_holder_started_ms" ]; then
             reason="predates_run"
           fi
+          if [ "$reason" != "run_owned" ] && [ -z "$rtw_scan_foreign" ]; then
+            rtw_scan_foreign="pid ${pid} comm ${comm} reason ${reason}"
+          fi
           if [ "$rtw_scan_result" = "clear" ]; then
             rtw_scan_result="blocked"
             rtw_scan_detail="pid ${pid} comm ${comm} reason ${reason}"
@@ -376,6 +381,10 @@ nodes:
               return 1
               ;;
           esac
+          if [ -n "$rtw_scan_foreign" ]; then
+            rtw_refuse "live process cwd under holder (${rtw_scan_foreign})"
+            return 1
+          fi
           if [ "$waited" -ge "$limit" ]; then
             rtw_refuse "live process cwd under holder after ${waited}s wait (${rtw_scan_detail})"
             return 1
@@ -400,7 +409,8 @@ nodes:
           return 1
         fi
         rm -rf "$idx_dir"
-        commit=$(git -C "$holder" -c user.name=archon-rtw -c user.email=rtw@archon.invalid \
+        commit=$(git -C "$holder" -c user.name="${CAULDRON_GIT_AUTHOR_NAME:-Thinman Cauldron}" \
+          -c user.email="${CAULDRON_GIT_AUTHOR_EMAIL:-admin@bluedevilcollectibles.com}" \
           commit-tree "$tree" -p "$tip" -m "rtw dirty holder snapshot of ${branch}") || return 1
         sha7=$(printf '%s' "$tip" | cut -c1-7)
         stamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -426,7 +436,8 @@ nodes:
         local holder_sha="" backup_ref="" sha7="" stamp="" id8=""
         local row_id="" row_status="" row_completed="" row_started="" row_epoch="" now_epoch="" row_age=0
         local row_started_ms="" rtw_holder_started_ms=-1 rtw_boot_ms="" rtw_hz="" rtw_btime=""
-        local rtw_self_uid="" rtw_skip_pids="" rtw_scan_result="" rtw_scan_detail="" rtw_scan_unreadable=0
+        local rtw_self_uid="" rtw_skip_pids="" rtw_scan_result="" rtw_scan_detail="" rtw_scan_foreign=""
+        local rtw_scan_unreadable=0
         err_file=$(mktemp)
         rtw_query=$(mktemp)
         rtw_db_out=$(mktemp)
