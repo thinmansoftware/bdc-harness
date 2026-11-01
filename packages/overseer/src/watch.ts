@@ -13,6 +13,7 @@ import {
   type DiscoverMergeCandidatesOptions,
   type MergeCandidateDiscoveryResult,
 } from './merge-candidate-discovery';
+import { hasIngestReceiptForHead } from './review-ingest-receipts';
 import type {
   GitHubClientDeps,
   OverseerRunRecord,
@@ -371,6 +372,15 @@ export async function watchOnce(
         ...options.discovery,
         alreadyCoveredPullRequests:
           options.discovery?.alreadyCoveredPullRequests ?? coveredPullRequests(outcomes),
+        hasIngestReceiptForHead:
+          options.discovery?.hasIngestReceiptForHead ??
+          ((candidate): Promise<boolean> =>
+            hasIngestReceiptForHead(
+              candidate.owner,
+              candidate.repo,
+              candidate.prNumber,
+              candidate.headSha
+            )),
       });
     } catch (error) {
       // A broken sweep must never take down the watch tick -- the run-derived

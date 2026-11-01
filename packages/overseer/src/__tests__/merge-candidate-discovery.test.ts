@@ -484,7 +484,9 @@ describe('watchOnce integration -- discovered PRs reach the outcome set', () => 
     const excluded = logged.filter(entry => entry.msg === 'merge-coordinator.candidate_excluded');
     expect(excluded).toHaveLength(3);
     const reasons = excluded.map(entry => entry.obj.reason).sort();
-    expect(reasons).toEqual(['draft', 'not_mergeable', 'review_not_approved']);
+    // The live watcher looks up an ingest receipt. This head has none, so the
+    // digest names the gap instead of a generic unapproved review.
+    expect(reasons).toEqual(['draft', 'not_mergeable', 'review_missing']);
     for (const entry of excluded) {
       expect(entry.obj.prNumber).toBeDefined();
       expect(entry.obj.detail).toBeDefined();
@@ -493,7 +495,7 @@ describe('watchOnce integration -- discovered PRs reach the outcome set', () => 
     const heartbeat = logged.find(entry => entry.msg === 'merge-coordinator.heartbeat_evaluated');
     expect(heartbeat?.obj.exclusionsByReason).toEqual({
       not_mergeable: 1,
-      review_not_approved: 1,
+      review_missing: 1,
       draft: 1,
     });
     expect(heartbeat?.obj.eligible).toBe(0);

@@ -93,6 +93,7 @@ export type MergeCandidateExclusionReason =
   | 'repo_policy_missing'
   | 'base_branch_not_watched'
   | 'review_not_approved'
+  | 'review_missing'
   | 'checks_failing'
   | 'checks_pending'
   | 'checks_absent'
@@ -496,6 +497,8 @@ function detailFor(reason: MergeCandidateExclusionReason, pr: DiscoveredPullRequ
       return `base ${pr.baseRef} is not a watched base branch`;
     case 'review_not_approved':
       return `review decision is ${pr.reviewDecision ?? 'none'}`;
+    case 'review_missing':
+      return 'current head has no ingest receipt';
     default:
       return reason;
   }
@@ -601,6 +604,12 @@ export interface DiscoverMergeCandidatesOptions {
   readonly cursor?: DiscoveryCursor | null;
   /** Injectable for tests; defaults to this module's logger. */
   readonly logger?: DiscoveryLogger;
+  /**
+   * Called only after classification is review_not_approved. False replaces
+   * that reason with review_missing. Absent keeps review_not_approved. A
+   * throw keeps review_not_approved and logs review_receipt_lookup_failed.
+   */
+  readonly hasIngestReceiptForHead?: (pr: DiscoveredPullRequest) => Promise<boolean>;
 }
 
 /**
@@ -898,12 +907,30 @@ export async function discoverMergeCandidates(
 
       const structural = classifyDiscoveredPullRequest(pr, explicitWatchedBases, policy);
       if (structural) {
+        let reason = structural;
+        if (structural === 'review_not_approved' && options.hasIngestReceiptForHead) {
+          try {
+            const hasReceipt = await options.hasIngestReceiptForHead(pr);
+            if (!hasReceipt) reason = 'review_missing';
+          } catch (error) {
+            warnVia(
+              logger,
+              {
+                owner: pr.owner,
+                repo: pr.repo,
+                prNumber: pr.prNumber,
+                err: errorMessage(error),
+              },
+              'review_receipt_lookup_failed'
+            );
+          }
+        }
         exclusions.push({
           owner: pr.owner,
           repo: pr.repo,
           prNumber: pr.prNumber,
-          reason: structural,
-          detail: detailFor(structural, pr),
+          reason,
+          detail: detailFor(reason, pr),
         });
         continue;
       }

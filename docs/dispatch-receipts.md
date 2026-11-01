@@ -249,3 +249,13 @@ sqlite3 /opt/bdc/archon-data/archon.db "select count(*), count(distinct thread_r
 
 Expected: the first count equals H0, the second is 0, and in the third the two numbers are
 equal and no larger than the number of stalled items.
+
+## Review catch-up after a missed webhook
+
+GitHub does not redeliver an App webhook that arrived while archon-app-1 was down. Two mechanisms feed the existing review ingest path. Neither changes signature checks, receipt shape, or review evaluation.
+
+Startup catch-up (`runWebhookRedeliveryCatchup`) runs once the HTTP listener is up, and only when the review route is configured. It lists App webhook deliveries newer than the last ingest receipt (or container start) minus 10 minutes, and redelivers each `pull_request` delivery whose status is not OK or whose delivery GUID has no ingest receipt. Bounds: 200 redeliveries per startup, and 10 pages / 1000 inspected deliveries. Pagination stops when a page is entirely older than the window. Each success is logged as `webhook_redelivered` with the numeric delivery id, the GUID, and the PR number. A failure is logged as `webhook_catchup_failed` and does not reject server startup. Missing App credentials log `webhook_catchup_skipped`. The App JWT is never logged.
+
+The review-gap sweeper (`startReviewGapSweeper`) ticks immediately and then every five minutes. For each repo in the merge allowlist it lists open non-draft pull requests updated in the last two hours. A head with no ingest receipt and no Overseer review, whose commit is more than 10 minutes old, is submitted to ingest as a signed `pull_request` `synchronize` event. Bound: 20 requests per tick. Each success is logged as `review_gap_swept` with owner, repository, PR number, and head SHA.
+
+Merge-candidate discovery reports the digest token `review_missing` (detail: current head has no ingest receipt) when a pull request would otherwise be `review_not_approved` and the current head has no ingest receipt. Drafts, unwatched bases, and other exclusion reasons are left as they are. A receipt lookup failure keeps `review_not_approved` and logs `review_receipt_lookup_failed`.
