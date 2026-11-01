@@ -200,6 +200,17 @@ function ghResolvedFromTrace(stderr: string): string {
   return pythonAt < 0 ? marked : marked.slice(0, pythonAt);
 }
 
+/**
+ * Git Bash form of a Windows directory. `C:\foo` and `C:/foo` both become `/c/foo`.
+ * The replacement inserts only the captured drive letter. The colon is dropped and
+ * the separator after it is left in place, so the result is `/c/...`.
+ */
+function toGitBashDir(dir: string): string {
+  return dir
+    .replace(/\\/g, '/')
+    .replace(/^([A-Za-z]):/, (_match, drive: string) => `/${drive.toLowerCase()}`);
+}
+
 function runExistingPrGuard(
   guard: string,
   list1: string,
@@ -253,10 +264,7 @@ exit 96
     const sleep = join(dir, 'sleep');
     writeFileSync(sleep, '#!/bin/bash\nexit 0\n');
     chmodSync(sleep, 0o755);
-    const bashDir =
-      process.platform === 'win32'
-        ? dir.replace(/\\/g, '/').replace(/^([A-Za-z]):\//, match => `/${match[0].toLowerCase()}/`)
-        : dir;
+    const bashDir = process.platform === 'win32' ? toGitBashDir(dir) : dir;
     const ghFixture = `${bashDir}/gh`;
     const script = join(dir, 'guard.sh');
     writeFileSync(
@@ -310,6 +318,18 @@ exit 96
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe('toGitBashDir', () => {
+  test('uses only the drive letter so a Windows temp dir is /c/...', () => {
+    expect(toGitBashDir('C:\\Users\\runner\\Temp\\pr-base-guard-abc')).toBe(
+      '/c/Users/runner/Temp/pr-base-guard-abc'
+    );
+    expect(toGitBashDir('C:/Users/runner/Temp/pr-base-guard-abc')).toBe(
+      '/c/Users/runner/Temp/pr-base-guard-abc'
+    );
+    expect(toGitBashDir('D:\\a\\b')).toBe('/d/a/b');
+  });
+});
 
 describe('existing PR base verification', () => {
   test('every lane refuses a pre-existing main PR when the recorded base is dev', () => {
