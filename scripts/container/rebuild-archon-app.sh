@@ -4,7 +4,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 hold_file="${ARCHON_REBUILD_HOLD_FILE:-/opt/bdc/archon/.rebuild-hold}"
 stop_file="${ARCHON_REBUILD_STOP_FILE:-/opt/bdc/archon/.rebuild-stop}"
-root="${ARCHON_REBUILD_ROOT:-/opt/bdc/archon}"
+root="/opt/bdc/archon"
 db="/opt/bdc/archon-data/archon.db"
 backup_dir="/opt/bdc/backups/archon"
 

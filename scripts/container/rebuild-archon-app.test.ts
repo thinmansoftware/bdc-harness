@@ -2,6 +2,11 @@
  * Behavioral tests for scripts/container/rebuild-archon-app.sh.
  * Stub git, docker, and sqlite3 sit first on PATH so the script never touches
  * a real daemon or the host database. Skipped on win32 like build-app-image.
+ *
+ * The checkout path is the literal /opt/bdc/archon and is not an input.
+ * Test 4 cannot create that directory here, so it installs a BASH_ENV cd
+ * double that sends only that absolute path at a temp checkout. The script
+ * does not read BASH_ENV.
  */
 import { describe, expect, it } from 'bun:test';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -117,7 +122,7 @@ interface RebuildResult {
 function rebuildEnv(
   binDir: string,
   logs: { docker: string; git: string; sqlite: string },
-  paths: { root: string; hold: string; stop: string },
+  paths: { hold: string; stop: string },
   controls: RebuildControls
 ): Record<string, string> {
   const base: Record<string, string> = {};
@@ -127,7 +132,7 @@ function rebuildEnv(
     }
   }
   const head = controls.head ?? GOOD_SHA;
-  return {
+  const env: Record<string, string> = {
     ...base,
     PATH: `${binDir}:${process.env.PATH ?? ''}`,
     GIT_LOG: logs.git,
@@ -141,11 +146,14 @@ function rebuildEnv(
     SQLITE_CHECK: 'ok',
     SQLITE_CLAIMS: '0',
     STOP_ON_BUILD: controls.stopOnBuild ? '1' : '0',
-    ARCHON_REBUILD_ROOT: paths.root,
     ARCHON_REBUILD_HOLD_FILE: paths.hold,
     ARCHON_REBUILD_STOP_FILE: paths.stop,
     TARGET: controls.target ?? GOOD_SHA,
   };
+  delete env.ARCHON_REBUILD_ROOT;
+  delete env.BASH_ENV;
+  delete env.REBUILD_TEST_ROOT;
+  return env;
 }
 
 async function runRebuild(controls: RebuildControls): Promise<RebuildResult> {
@@ -166,9 +174,33 @@ async function runRebuild(controls: RebuildControls): Promise<RebuildResult> {
     if (controls.holdContents !== undefined) {
       await writeFile(holdFile, controls.holdContents);
     }
+    const env = rebuildEnv(
+      binDir,
+      { docker: dockerLog, git: gitLog, sqlite: sqliteLog },
+      {
+        hold: controls.holdContents !== undefined ? holdFile : join(dir, 'hold-absent'),
+        stop: stopFile,
+      },
+      controls
+    );
     if (controls.withComposeFiles) {
       await writeFile(join(root, 'docker-compose.yml'), 'services: {}\n');
       await writeFile(join(root, 'docker-compose.override.yml'), 'services: {}\n');
+      const bashEnv = join(dir, 'bash-env.sh');
+      await writeFile(
+        bashEnv,
+        [
+          'cd() {',
+          '  if [ "${1:-}" = "/opt/bdc/archon" ]; then',
+          '    set -- "${REBUILD_TEST_ROOT:?}"',
+          '  fi',
+          '  builtin cd -- "$@"',
+          '}',
+          '',
+        ].join('\n')
+      );
+      env.BASH_ENV = bashEnv;
+      env.REBUILD_TEST_ROOT = root;
     }
 
     const gitPath = join(binDir, 'git');
@@ -182,16 +214,7 @@ async function runRebuild(controls: RebuildControls): Promise<RebuildResult> {
     await chmod(sqlitePath, 0o755);
 
     const proc = Bun.spawn(['bash', SCRIPT], {
-      env: rebuildEnv(
-        binDir,
-        { docker: dockerLog, git: gitLog, sqlite: sqliteLog },
-        {
-          root,
-          hold: controls.holdContents !== undefined ? holdFile : join(dir, 'hold-absent'),
-          stop: stopFile,
-        },
-        controls
-      ),
+      env,
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -235,6 +258,10 @@ describe('rebuild-archon-app', () => {
   it.skipIf(SKIP_ON_WINDOWS)(
     'Test 4: a stop file placed mid-run prevents the restart',
     async () => {
+      const source = await readFile(SCRIPT, 'utf8');
+      expect(source).toContain('root="/opt/bdc/archon"');
+      expect(source).not.toContain('ARCHON_REBUILD_ROOT');
+
       const result = await runRebuild({
         target: GOOD_SHA,
         withComposeFiles: true,
