@@ -1,7 +1,17 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -153,13 +163,71 @@ function writeRuns(
   db.close();
 }
 
-function runCheckout(fixture: Fixture, dbPath: string): RunResult {
+function runCheckout(
+  fixture: Fixture,
+  dbPath: string,
+  extraEnv: Record<string, string> = {}
+): RunResult {
   git(['fetch', 'origin', 'refs/heads/feat/x'], fixture.caller);
   const script = `set -euo pipefail\n${RTW_CORE}\nrtw_checkout_repair_branch "$1"\n`;
   return bash(script, fixture.caller, ['feat/x'], {
     RTW_RUNS_DB: dbPath,
     RTW_PROC_ROOT: fixture.procRoot,
+    ...extraEnv,
   });
+}
+
+function shQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function sleepShim(
+  fixture: Fixture,
+  hookBody = ''
+): {
+  readonly env: Record<string, string>;
+  readonly logFile: string;
+} {
+  const bin = join(fixture.root, 'sleep-bin');
+  mkdirSync(bin);
+  const logFile = join(fixture.root, 'sleep.log');
+  const once = join(fixture.root, 'sleep.once');
+  const hook =
+    hookBody.length > 0
+      ? `if [ ! -e ${shQuote(once)} ]; then\n  touch ${shQuote(once)}\n${hookBody}\nfi\n`
+      : '';
+  writeFileSync(
+    join(bin, 'sleep'),
+    `#!/bin/sh\nset -eu\nprintf '%s\\n' "$1" >> ${shQuote(logFile)}\n${hook}`,
+    { mode: 0o755 }
+  );
+  chmodSync(join(bin, 'sleep'), 0o755);
+  return { env: { PATH: `${bin}:${process.env.PATH ?? ''}` }, logFile };
+}
+
+function sqliteHook(dbPath: string, source: string): string {
+  const script = `${dbPath}.hook.mjs`;
+  writeFileSync(script, source);
+  return `  bun ${shQuote(script)}`;
+}
+
+function sleepTotal(logFile: string): number {
+  if (!existsSync(logFile)) return 0;
+  const raw = readFileSync(logFile, 'utf8').trim();
+  if (raw.length === 0) return 0;
+  let total = 0;
+  for (const line of raw.split('\n')) {
+    const value = Number(line);
+    if (!Number.isFinite(value)) throw new Error(`bad sleep log line: ${line}`);
+    total += value;
+  }
+  return total;
+}
+
+function quarantineFiles(dir: string, suffix: string): string[] {
+  return readdirSync(dir)
+    .filter(name => name.endsWith(suffix))
+    .map(name => join(dir, name));
 }
 
 function worktrees(cwd: string): string {
@@ -219,6 +287,7 @@ describe('repair-target worktree reclaim', () => {
   it('Test 7b: a completed holder only two minutes old is refused by the age gate', () => {
     // The age gate stays in force for `completed` holders (only escalated/failed/
     // cancelled skip it, per WO-HARNESS-REPAIR-PATH-HOTFIX-01 F3a / item 1e).
+    // Max grace wait 0 keeps the refusal immediate, with no wall-clock sleep.
     const fixture = makeFixture({ hold: true, withOther: false });
     roots.push(fixture.root);
     const holder = holderPath(fixture.holder);
@@ -230,7 +299,7 @@ describe('repair-target worktree reclaim', () => {
         completed_at: utcMinutesAgo(2),
       },
     ]);
-    const result = runCheckout(fixture, fixture.dbPath);
+    const result = runCheckout(fixture, fixture.dbPath, { RTW_MAX_GRACE_WAIT_SECONDS: '0' });
     expect(result.exitCode, show(result)).toBe(1);
     expect(result.stdout).toContain('repair_target_branch_held:');
     expect(worktrees(fixture.caller)).toContain(holder);
@@ -281,9 +350,12 @@ describe('repair-target worktree reclaim', () => {
   }, 30000);
 
   it('Test 8c: a dirty holder is refused', () => {
+    // A dirty terminal holder is quarantined, then reclaimed.
     const fixture = makeFixture({ hold: true, withOther: false });
     roots.push(fixture.root);
     const holder = holderPath(fixture.holder);
+    const qdir = join(fixture.root, 'quarantine');
+    mkdirSync(qdir);
     writeFileSync(join(holder, 'dirty.txt'), 'dirty\n');
     writeRuns(fixture.dbPath, [
       {
@@ -293,10 +365,19 @@ describe('repair-target worktree reclaim', () => {
         completed_at: utcMinutesAgo(20),
       },
     ]);
-    const result = runCheckout(fixture, fixture.dbPath);
-    expect(result.exitCode, show(result)).toBe(1);
-    expect(result.stdout).toContain('repair_target_branch_held:');
-    expect(worktrees(fixture.caller)).toContain(holder);
+    const result = runCheckout(fixture, fixture.dbPath, { RTW_QUARANTINE_DIR: qdir });
+    if (result.exitCode !== 0) throw new Error(show(result));
+    expect(result.stdout).toContain('repair_target_quarantined:');
+    expect(result.stdout).toContain(qdir);
+    expect(result.stdout).toContain('repair_target_worktree_reclaimed:');
+    expect(worktrees(fixture.caller)).not.toContain(holder);
+    expect(quarantineFiles(qdir, '.patch').length).toBe(1);
+    const tarPath = quarantineFiles(qdir, '.tar');
+    expect(tarPath.length).toBe(1);
+    const listed = Bun.spawnSync(['tar', '-tf', tarPath[0]], { stdout: 'pipe', stderr: 'pipe' });
+    expect(listed.exitCode).toBe(0);
+    expect(listed.stdout.toString()).toContain('dirty.txt');
+    expect(git(['stash', 'list'], fixture.caller)).toContain('reclaim-');
   }, 30000);
 
   it('Test 8d: an unpushed commit is backed up before reclaim', () => {
@@ -384,7 +465,7 @@ describe('repair-target worktree reclaim', () => {
         completed_at: utcSecondsAgo(15),
       },
     ]);
-    const result = runCheckout(fixture, fixture.dbPath);
+    const result = runCheckout(fixture, fixture.dbPath, { RTW_MAX_GRACE_WAIT_SECONDS: '0' });
     expect(result.exitCode, show(result)).toBe(1);
     expect(result.stderr).toContain('repair_target_branch_held:');
     expect(result.stderr).toContain('completed_at is only');
@@ -415,9 +496,12 @@ describe('repair-target worktree reclaim', () => {
   }, 30000);
 
   it('Test 5b: a failed holder 15s old is still refused when the worktree is dirty', () => {
+    // A dirty terminal holder is quarantined, then reclaimed.
     const fixture = makeFixture({ hold: true, withOther: false });
     roots.push(fixture.root);
     const holder = holderPath(fixture.holder);
+    const qdir = join(fixture.root, 'quarantine');
+    mkdirSync(qdir);
     writeFileSync(join(holder, 'dirty.txt'), 'dirty\n');
     writeRuns(fixture.dbPath, [
       {
@@ -427,9 +511,326 @@ describe('repair-target worktree reclaim', () => {
         completed_at: utcSecondsAgo(15),
       },
     ]);
-    const result = runCheckout(fixture, fixture.dbPath);
+    const result = runCheckout(fixture, fixture.dbPath, { RTW_QUARANTINE_DIR: qdir });
+    if (result.exitCode !== 0) throw new Error(show(result));
+    expect(result.stdout).toContain('repair_target_quarantined:');
+    expect(result.stdout).toContain('repair_target_worktree_reclaimed:');
+    expect(worktrees(fixture.caller)).not.toContain(holder);
+    expect(git(['stash', 'list'], fixture.caller)).toContain('reclaim-');
+  }, 30000);
+
+  function dirtyEscalated(fixture: Fixture): { holder: string; head: string; qdir: string } {
+    const holder = holderPath(fixture.holder);
+    writeFileSync(join(holder, 'gone.txt'), 'gone\n');
+    git(['add', 'gone.txt'], holder);
+    git(['commit', '-m', 'add gone'], holder);
+    const head = git(['rev-parse', 'HEAD'], holder).trim();
+    git(['rm', 'gone.txt'], holder);
+    // Same file, staged then edited again. A concatenated cached+unstaged diff
+    // is based on the index and does not apply to a fresh checkout of HEAD.
+    writeFileSync(join(holder, 'README.md'), 'init\nstaged\n');
+    git(['add', 'README.md'], holder);
+    writeFileSync(join(holder, 'README.md'), 'init\nstaged\nunstaged\n');
+    writeFileSync(join(holder, 'keep me.txt'), 'untracked-body\n');
+    const qdir = join(fixture.root, 'quarantine');
+    mkdirSync(qdir);
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'escalated',
+        working_path: holder,
+        completed_at: utcSecondsAgo(15),
+      },
+    ]);
+    return { holder, head, qdir };
+  }
+
+  it('Test 1: young completed holder is waited out, then reclaimed', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    const shim = sleepShim(fixture);
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'completed',
+        working_path: holder,
+        completed_at: utcSecondsAgo(397),
+      },
+    ]);
+    const result = runCheckout(fixture, fixture.dbPath, shim.env);
+    if (result.exitCode !== 0) throw new Error(show(result));
+    const waited = sleepTotal(shim.logFile);
+    expect(waited).toBeGreaterThanOrEqual(190);
+    expect(waited).toBeLessThanOrEqual(210);
+    const logged = result.stdout.match(/repair_target_grace_wait: (\d+)s/);
+    expect(logged, result.stdout).not.toBeNull();
+    expect(Number(logged?.[1])).toBe(waited);
+    expect(result.stdout).not.toContain('repair_target_branch_held');
+    expect(result.stdout).toContain('repair_target_worktree_reclaimed:');
+    expect(worktrees(fixture.caller)).not.toContain(holder);
+  }, 30000);
+
+  it('Test 2: grace wait is bounded', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    const shim = sleepShim(fixture);
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'completed',
+        working_path: holder,
+        completed_at: utcSecondsAgo(397),
+      },
+    ]);
+    const result = runCheckout(fixture, fixture.dbPath, {
+      ...shim.env,
+      RTW_MAX_GRACE_WAIT_SECONDS: '10',
+    });
     expect(result.exitCode, show(result)).toBe(1);
-    expect(result.stderr).toContain('worktree is dirty');
+    expect(sleepTotal(shim.logFile)).toBe(0);
+    expect(result.stdout).toContain('completed_at is only');
+    expect(result.stdout).toContain('repair_target_branch_held:');
+    expect(result.stdout).not.toContain('repair_target_worktree_reclaimed:');
     expect(worktrees(fixture.caller)).toContain(holder);
   }, 30000);
+
+  it('Test 3: dirty holder of an escalated run is quarantined, then reclaimed', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const dirty = dirtyEscalated(fixture);
+    const result = runCheckout(fixture, fixture.dbPath, { RTW_QUARANTINE_DIR: dirty.qdir });
+    if (result.exitCode !== 0) throw new Error(show(result));
+    expect(result.stdout).toContain('repair_target_quarantined:');
+    expect(result.stdout).toContain(dirty.qdir);
+    expect(result.stdout).not.toContain('repair_target_branch_held');
+    expect(result.stdout).toContain('repair_target_worktree_reclaimed:');
+    expect(worktrees(fixture.caller)).not.toContain(dirty.holder);
+    const patches = quarantineFiles(dirty.qdir, '.patch');
+    expect(patches.length).toBe(1);
+    const patch = readFileSync(patches[0], 'utf8');
+    expect(patch).toContain('gone.txt');
+    expect(patch).toContain('README.md');
+    expect(patch).toContain('+staged');
+    expect(patch).toContain('+unstaged');
+    const tars = quarantineFiles(dirty.qdir, '.tar');
+    expect(tars.length).toBe(1);
+    const extracted = join(fixture.root, 'extracted');
+    mkdirSync(extracted);
+    const unpack = Bun.spawnSync(['tar', '-xf', tars[0], '-C', extracted], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(unpack.exitCode, unpack.stderr.toString()).toBe(0);
+    expect(readFileSync(join(extracted, 'keep me.txt'), 'utf8')).toBe('untracked-body\n');
+    expect(git(['stash', 'list'], fixture.caller)).toContain('reclaim-');
+  }, 30000);
+
+  it('Test 4: quarantined patch round-trips', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const dirty = dirtyEscalated(fixture);
+    const expectedReadme = readFileSync(join(dirty.holder, 'README.md'), 'utf8');
+    const result = runCheckout(fixture, fixture.dbPath, { RTW_QUARANTINE_DIR: dirty.qdir });
+    if (result.exitCode !== 0) throw new Error(show(result));
+    const patches = quarantineFiles(dirty.qdir, '.patch');
+    expect(patches.length).toBe(1);
+    const patch = readFileSync(patches[0], 'utf8');
+    const readmeDiffs = patch.split('\n').filter(line => /^diff --git \S+README\.md /.test(line));
+    expect(readmeDiffs.length).toBe(1);
+    // Archive the holder's commit into a plain directory. That tree is only
+    // HEAD: the staged blob is not available to paper over an index-based diff.
+    const fresh = join(fixture.root, 'fresh');
+    const archive = join(fixture.root, 'head.tar');
+    git(['archive', '--format=tar', '-o', archive, dirty.head], fixture.caller);
+    mkdirSync(fresh);
+    const unpack = Bun.spawnSync(['tar', '-xf', archive, '-C', fresh], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(unpack.exitCode, unpack.stderr.toString()).toBe(0);
+    const apply = Bun.spawnSync(['git', 'apply', patches[0]], {
+      cwd: fresh,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(apply.exitCode, apply.stderr.toString()).toBe(0);
+    expect(existsSync(join(fresh, 'gone.txt'))).toBe(false);
+    expect(readFileSync(join(fresh, 'README.md'), 'utf8')).toBe(expectedReadme);
+  }, 30000);
+
+  it('Test 5: patch write failure refuses', () => {
+    const fixture = makeFixture({ hold: true, withOther: false });
+    roots.push(fixture.root);
+    const holder = holderPath(fixture.holder);
+    const blocker = join(fixture.root, 'not-a-dir');
+    writeFileSync(blocker, 'x\n');
+    const qdir = join(blocker, 'quarantine');
+    writeFileSync(join(holder, 'dirty.txt'), 'still-here\n');
+    writeRuns(fixture.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'failed',
+        working_path: holder,
+        completed_at: utcMinutesAgo(20),
+      },
+    ]);
+    const result = runCheckout(fixture, fixture.dbPath, { RTW_QUARANTINE_DIR: qdir });
+    expect(result.exitCode, show(result)).toBe(1);
+    expect(result.stdout).toContain('quarantine');
+    expect(result.stdout).toContain('repair_target_branch_held:');
+    expect(result.stdout).not.toContain('repair_target_worktree_reclaimed:');
+    expect(worktrees(fixture.caller)).toContain(holder);
+    expect(readFileSync(join(holder, 'dirty.txt'), 'utf8')).toBe('still-here\n');
+    expect(git(['stash', 'list'], fixture.caller)).not.toContain('reclaim-');
+  }, 30000);
+
+  it('Test 6: live or running holders still refused', () => {
+    const running = makeFixture({ hold: true, withOther: false });
+    roots.push(running.root);
+    const runningHolder = holderPath(running.holder);
+    writeRuns(running.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'running',
+        working_path: runningHolder,
+        completed_at: null,
+      },
+    ]);
+    const runningResult = runCheckout(running, running.dbPath);
+    expect(runningResult.exitCode, show(runningResult)).toBe(1);
+    expect(runningResult.stdout).toContain('status running is not terminal');
+    expect(worktrees(running.caller)).toContain(runningHolder);
+
+    const live = makeFixture({ hold: true, withOther: false });
+    roots.push(live.root);
+    const liveHolder = holderPath(live.holder);
+    const nested = join(liveHolder, 'nested');
+    mkdirSync(nested);
+    const pidDir = join(live.procRoot, '4242');
+    mkdirSync(pidDir);
+    symlinkSync(nested, join(pidDir, 'cwd'));
+    writeRuns(live.dbPath, [
+      {
+        id: 'abcd1234ef567890',
+        status: 'failed',
+        working_path: liveHolder,
+        completed_at: utcMinutesAgo(20),
+      },
+    ]);
+    const liveResult = runCheckout(live, live.dbPath);
+    expect(liveResult.exitCode, show(liveResult)).toBe(1);
+    expect(liveResult.stdout).toContain('live process cwd under holder');
+    expect(liveResult.stdout).not.toContain('repair_target_worktree_reclaimed:');
+    expect(worktrees(live.caller)).toContain(liveHolder);
+  }, 30000);
+
+  it('Test 7: every lane carries the change', () => {
+    const lanesDir = join(REPO_ROOT, '.archon/workflows/defaults');
+    const lanes = readdirSync(lanesDir).filter(name => name.endsWith('.yaml'));
+    const held = lanes.filter(name =>
+      readFileSync(join(lanesDir, name), 'utf8').includes('repair_target_branch_held')
+    );
+    expect(held.length).toBeGreaterThan(0);
+    for (const name of held) {
+      const text = readFileSync(join(lanesDir, name), 'utf8');
+      expect(text, name).toContain('repair_target_quarantined');
+      expect(text, name).toContain('repair_target_grace_wait');
+    }
+    const bundle = readFileSync(
+      join(REPO_ROOT, 'packages/workflows/src/defaults/bundled-defaults.generated.ts'),
+      'utf8'
+    );
+    expect(bundle).toContain('repair_target_quarantined');
+    expect(bundle).toContain('repair_target_grace_wait');
+  });
+
+  it('Test 8: grace wait revalidates runs and live cwd before reclaim', () => {
+    interface GraceOutcome {
+      readonly result: RunResult;
+      readonly caller: string;
+      readonly holder: string;
+      readonly qdir: string;
+      readonly waited: number;
+    }
+
+    function duringGrace(hookFor: (fixture: Fixture, holder: string) => string): GraceOutcome {
+      const fixture = makeFixture({ hold: true, withOther: false });
+      roots.push(fixture.root);
+      const holder = holderPath(fixture.holder);
+      const qdir = join(fixture.root, 'quarantine');
+      mkdirSync(qdir);
+      writeFileSync(join(holder, 'dirty.txt'), 'dirty\n');
+      writeRuns(fixture.dbPath, [
+        {
+          id: 'abcd1234ef567890',
+          status: 'completed',
+          working_path: holder,
+          completed_at: utcSecondsAgo(397),
+        },
+      ]);
+      const shim = sleepShim(fixture, hookFor(fixture, holder));
+      const result = runCheckout(fixture, fixture.dbPath, {
+        ...shim.env,
+        RTW_QUARANTINE_DIR: qdir,
+      });
+      return { result, caller: fixture.caller, holder, qdir, waited: sleepTotal(shim.logFile) };
+    }
+
+    function expectStillHeld(outcome: GraceOutcome, reason: string): void {
+      expect(outcome.result.exitCode, show(outcome.result)).toBe(1);
+      expect(outcome.waited).toBeGreaterThanOrEqual(190);
+      expect(outcome.waited).toBeLessThanOrEqual(210);
+      expect(outcome.result.stdout).toContain('repair_target_grace_wait:');
+      expect(outcome.result.stdout).toContain(reason);
+      expect(outcome.result.stdout).toContain('repair_target_branch_held:');
+      expect(outcome.result.stdout).not.toContain('repair_target_worktree_reclaimed:');
+      expect(outcome.result.stdout).not.toContain('repair_target_quarantined:');
+      expect(worktrees(outcome.caller)).toContain(outcome.holder);
+      expect(readFileSync(join(outcome.holder, 'dirty.txt'), 'utf8')).toBe('dirty\n');
+      expect(readdirSync(outcome.qdir)).toEqual([]);
+    }
+
+    const running = duringGrace((fixture, holder) =>
+      sqliteHook(
+        fixture.dbPath,
+        [
+          'import { Database } from "bun:sqlite";',
+          `const db = new Database(${JSON.stringify(fixture.dbPath)});`,
+          'db.run(',
+          '  "INSERT INTO remote_agent_workflow_runs (id, status, working_path, completed_at) VALUES (?, ?, ?, ?)",',
+          `  ["ffffeeeeddddcccc", "running", ${JSON.stringify(holder)}, null]`,
+          ');',
+          'db.close();',
+          '',
+        ].join('\n')
+      )
+    );
+    expectStillHeld(running, 'status running is not terminal');
+
+    const live = duringGrace((fixture, holder) => {
+      const pid = join(fixture.procRoot, '7777');
+      const nested = join(holder, 'nested');
+      return `  mkdir -p ${shQuote(nested)} ${shQuote(pid)}\n  ln -s ${shQuote(nested)} ${shQuote(join(pid, 'cwd'))}`;
+    });
+    expectStillHeld(live, 'live process cwd under holder');
+
+    const younger = duringGrace((fixture, holder) =>
+      sqliteHook(
+        fixture.dbPath,
+        [
+          'import { Database } from "bun:sqlite";',
+          `const db = new Database(${JSON.stringify(fixture.dbPath)});`,
+          'db.run(',
+          '  "INSERT INTO remote_agent_workflow_runs (id, status, working_path, completed_at) VALUES (?, ?, ?, ?)",',
+          `  ["aaaabbbbccccdddd", "completed", ${JSON.stringify(holder)}, ${JSON.stringify(utcSecondsAgo(1))}]`,
+          ');',
+          'db.close();',
+          '',
+        ].join('\n')
+      )
+    );
+    expectStillHeld(younger, 'completed_at is only');
+  }, 60000);
 });
