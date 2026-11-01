@@ -24,7 +24,7 @@ interface IsolatedDatabaseSlot {
 const STORAGE_KEY = '__archonOverseerIsolatedDatabase';
 
 function slot(): IsolatedDatabaseSlot {
-  const globals = globalThis as Record<string, IsolatedDatabaseSlot | undefined>;
+  const globals = globalThis as unknown as Record<string, IsolatedDatabaseSlot | undefined>;
   const existing = globals[STORAGE_KEY];
   if (existing) return existing;
   const created: IsolatedDatabaseSlot = {
