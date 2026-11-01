@@ -253,10 +253,14 @@ export interface MergeCandidateDiscoveryDeps {
   listOpenPullRequests?(
     input: GitHubOpenPullRequestListInput
   ): Promise<readonly DiscoveredPullRequest[]>;
+  /** Durable sandbox-review qualification. Production wiring must provide it. */
+  hasQualifiedReview?(input: PullRequestRef & { headSha: string }): Promise<boolean>;
 }
 
 export interface GitHubClientDeps {
   findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
+  /** Receipt-backed exact-head sandbox-review qualification. */
+  hasQualifiedReview?(input: PullRequestRef & { headSha: string }): Promise<boolean>;
   mergePullRequest(
     input: GitHubPullRequestMergeInput
   ): Promise<{ merged: boolean; message?: string; sha?: string; mergeSha?: string }>;

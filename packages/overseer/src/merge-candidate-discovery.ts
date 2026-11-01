@@ -93,6 +93,7 @@ export type MergeCandidateExclusionReason =
   | 'repo_policy_missing'
   | 'base_branch_not_watched'
   | 'review_not_approved'
+  | 'review_execution_unqualified'
   | 'checks_failing'
   | 'checks_pending'
   | 'checks_absent'
@@ -958,6 +959,28 @@ export async function discoverMergeCandidates(
           prNumber: pr.prNumber,
           reason: evidenceReason,
           detail: evidenceDetail(evidenceReason, evidence),
+        });
+        continue;
+      }
+
+      // GitHub's aggregate APPROVED bit is not merge authority. Production
+      // callers supply the receipt-backed guard; test/legacy compositions may
+      // omit the optional seam until they are migrated.
+      if (
+        deps.hasQualifiedReview &&
+        !(await deps.hasQualifiedReview({
+          owner: pr.owner,
+          repo: pr.repo,
+          number: pr.prNumber,
+          headSha: pr.headSha,
+        }))
+      ) {
+        exclusions.push({
+          owner: pr.owner,
+          repo: pr.repo,
+          prNumber: pr.prNumber,
+          reason: 'review_execution_unqualified',
+          detail: 'no durable exact-head sandbox execution and GitHub response qualification',
         });
         continue;
       }

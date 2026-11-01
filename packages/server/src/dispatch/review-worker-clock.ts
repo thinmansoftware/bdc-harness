@@ -6,6 +6,7 @@ import {
   postResult,
   registerWorker,
   releaseMessage,
+  renewMessageLease,
   type DispatchTaskOutcome,
 } from '@archon/core/db/dispatch';
 import {
@@ -47,6 +48,36 @@ const CHECKS_PENDING_BACKOFF_MS = Math.max(
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
 
+export function readTrustedCheckPlan(
+  raw: string | undefined = process.env.OVERSEER_REVIEW_CHECK_PLAN_JSON
+): readonly (readonly string[])[] {
+  if (!raw) return [];
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (!Array.isArray(value) || value.length === 0) return [];
+    if (
+      !value.every(
+        command =>
+          Array.isArray(command) &&
+          command.length > 0 &&
+          !['sh', 'bash', 'zsh', 'cmd', 'cmd.exe', 'powershell', 'pwsh'].includes(command[0]) &&
+          command.every(
+            argument =>
+              typeof argument === 'string' &&
+              argument.length > 0 &&
+              !argument.includes('\0') &&
+              argument.length <= 4096
+          )
+      )
+    ) {
+      return [];
+    }
+    return value as string[][];
+  } catch {
+    return [];
+  }
+}
+
 interface ReviewWorkerLogger {
   warn(data: Record<string, unknown>, message: string): void;
 }
@@ -64,6 +95,7 @@ export interface ReviewWorkerDeps {
    * `releaseMessage`, which already carries the required fencing guards.
    */
   deferMessage: typeof deferMessage;
+  renewMessageLease?: typeof renewMessageLease;
   runAndSubmitReview: typeof runAndSubmitReview;
   createSubmitDeps: (reviewerIdentity: string) => ReturnType<typeof createRealSubmitDeps>;
   /** Optional logger seam for deterministic observability tests. */
@@ -113,6 +145,7 @@ function mapSubmitOutcome(
     case 'custody_conflict':
     case 'merge_custody_conflict':
     case 'blocked_required_contexts_unavailable':
+    case 'review_incomplete':
       return { status: 'failed', task_outcome: 'blocked' };
     case 'reviewer_failed':
     case 'submission_failed':
@@ -136,6 +169,7 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     postResult,
     releaseMessage,
     deferMessage,
+    renewMessageLease,
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
     staleVerdictSweep: config =>
@@ -214,11 +248,39 @@ export async function tickReviewWorkerClock(
           prNumber: body.prNumber,
           headSha: body.headSha,
           author: body.author,
+          executionContext: Object.freeze({
+            requestId: claimed.id,
+            workerId: REVIEW_WORKER_ID,
+            fencingToken: claimed.fencing_token,
+            owner: body.owner,
+            repo: body.repo,
+            prNumber: body.prNumber,
+            headSha: body.headSha,
+            checkoutPath: resolveTrustedCheckoutPath(body.owner, body.repo, body.headSha),
+            reviewerIdentity: config.reviewerIdentity,
+            rung: 'pr-review',
+            checkPlan: Object.freeze(readTrustedCheckPlan()),
+          }),
         };
-        const outcome: SubmitOutcome = await deps.runAndSubmitReview(
-          work,
-          deps.createSubmitDeps(config.reviewerIdentity)
-        );
+        const renew = deps.renewMessageLease;
+        const leaseTimer = renew
+          ? setInterval(() => {
+              void renew({
+                id: claimed.id,
+                worker_id: REVIEW_WORKER_ID,
+                fencing_token: claimed.fencing_token,
+              });
+            }, 30_000)
+          : undefined;
+        let outcome: SubmitOutcome;
+        try {
+          outcome = await deps.runAndSubmitReview(
+            work,
+            deps.createSubmitDeps(config.reviewerIdentity)
+          );
+        } finally {
+          if (leaseTimer) clearInterval(leaseTimer);
+        }
         // CHECKS PENDING is the ONLY non-terminal disposition: the bound head is
         // still live and CI on it has simply not concluded, so releasing the
         // claim with a backoff retries the SAME head productively.
@@ -338,6 +400,13 @@ export async function tickReviewWorkerClock(
   } finally {
     inFlight = false;
   }
+}
+
+function resolveTrustedCheckoutPath(owner: string, repo: string, headSha: string): string {
+  const root = process.env.OVERSEER_REVIEW_CHECKOUT_ROOT?.trim();
+  if (!root || !/^[0-9a-f]{40}$/i.test(headSha)) return '';
+  const safe = (value: string): string => value.replace(/[^A-Za-z0-9_.-]/g, '_');
+  return `${root}/${safe(owner)}/${safe(repo)}/${headSha}`;
 }
 
 export function startReviewWorkerClock(
