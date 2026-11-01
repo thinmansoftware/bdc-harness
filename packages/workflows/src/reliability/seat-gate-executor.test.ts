@@ -5,7 +5,7 @@ import { join } from 'path';
 import { clearRegistry, registerBuiltinProviders } from '@archon/providers';
 import type { IAgentProvider, MessageChunk } from '@archon/providers/types';
 import { rootLogger } from '@archon/paths';
-import { executeWorkflow } from '../executor';
+import { executeWorkflow, resetExecutorLogForTests } from '../executor';
 import type { IWorkflowPlatform, WorkflowConfig, WorkflowDeps } from '../deps';
 import type { IWorkflowStore } from '../store';
 import type { WorkflowDefinition, WorkflowRun } from '../schemas';
@@ -133,10 +133,12 @@ beforeEach(() => {
     }) as typeof child.warn;
     return child;
   }) as typeof rootLogger.child;
+  resetExecutorLogForTests();
 });
 
 afterEach(() => {
   rootLogger.child = origChild as typeof rootLogger.child;
+  resetExecutorLogForTests();
   resetSeatUsageCacheForTests();
   delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
   clearRegistry();
