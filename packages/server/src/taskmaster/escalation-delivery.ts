@@ -27,10 +27,10 @@
  * Taskmaster escalation comment on that issue.
  *
  * MARKER TRUST. The marker is public text, so a marker comment counts only
- * when its author is the login Taskmaster posts as (deps.posterLogin; the real
- * deps resolve it once with GET /user using the same token that posts). A
- * copied marker from anyone else is ignored and cannot suppress or delay an
- * escalation.
+ * when its author is the login Taskmaster posts as (deps.posterLogin). The
+ * real deps resolve that login from GET /user for a PAT and from GET /app
+ * ("<slug>[bot]") for an App identity. A copied marker from anyone else is
+ * ignored and cannot suppress or delay an escalation.
  */
 import { createLogger } from '@archon/paths';
 import type { IDatabase } from '@archon/core/db/adapters/types';
@@ -419,7 +419,7 @@ export interface RealEscalationDeliveryOptions {
   fetchImpl?: FetchLike;
   /**
    * Injected for tests: a fixed token that bypasses identity resolution. When
-   * absent, the token comes from the taskmaster service identity (see
+   * absent, the token comes from the duty_officer identity (see
    * resolveEscalationToken).
    */
   token?: string | null;
@@ -428,16 +428,18 @@ export interface RealEscalationDeliveryOptions {
 }
 
 /**
- * Resolve the taskmaster service identity. The container runs on GitHub App
- * identity (GITHUB_APP_TASKMASTER_*), so this is normally kind 'app'; a PAT
- * resolves only when no App is configured. Any resolution error (incomplete or
- * unreadable App config) fails closed as taskmaster_github_token_missing --
- * the failure text recorded in proposal_json.failure -- with the cause logged.
+ * Resolve the duty_officer identity used for escalation delivery. Precedence
+ * is the duty officer App, then the taskmaster App alias, then the shared
+ * Overseer App, then a PAT, so a container that only sets
+ * GITHUB_APP_TASKMASTER_* still resolves kind 'app'. Any resolution error
+ * (incomplete or unreadable App config) fails closed as
+ * taskmaster_github_token_missing -- the failure text recorded in
+ * proposal_json.failure -- with the cause logged.
  */
 function resolveEscalationIdentity(options: RealEscalationDeliveryOptions): ServiceGitHubAuth {
   let identity: ServiceGitHubAuth;
   try {
-    identity = resolveServiceGitHubAuth('taskmaster', options.env ?? process.env);
+    identity = resolveServiceGitHubAuth('duty_officer', options.env ?? process.env);
   } catch (error) {
     log.warn(
       { cause: (error as Error).message.slice(0, 200) },
@@ -454,12 +456,10 @@ function resolveEscalationIdentity(options: RealEscalationDeliveryOptions): Serv
 
 /**
  * The bearer token for a Taskmaster GitHub request. An injected options.token
- * wins (tests). Otherwise the taskmaster identity is resolved and its token
- * obtained through the shared core path, getServiceGitHubToken: an App
- * identity mints (and caches, per identity pool) an installation token; a PAT
- * identity returns the PAT. The PAT-only githubToken accessor in
- * dispatch/duty-officer-clock.ts is deliberately not used: it returns null
- * for an App identity, which failed every escalation.
+ * wins (tests). Otherwise the duty_officer identity is resolved and its token
+ * obtained through getServiceGitHubToken: an App identity mints (and caches,
+ * per identity pool) an installation token; a PAT identity returns the PAT.
+ * A blank or missing identity fails closed as taskmaster_github_token_missing.
  */
 async function resolveEscalationToken(options: RealEscalationDeliveryOptions): Promise<string> {
   if (options.token !== undefined) {
@@ -488,7 +488,7 @@ export function parseNextLink(linkHeader: string | null): string | null {
 /**
  * Minimal GitHub REST helper mirroring duty-officer-clock's private githubJson
  * (kept local rather than exported from that file). The token comes from
- * resolveEscalationToken (taskmaster service identity, App preferred). Takes a full URL and returns the raw Response so callers can read headers
+ * resolveEscalationToken (duty_officer identity, App preferred). Takes a full URL and returns the raw Response so callers can read headers
  * (the Link header drives comment pagination). Only api.github.com URLs are
  * requested, so a Link header can never send the token to another host.
  */
@@ -589,8 +589,9 @@ async function resolveUserLogin(options: RealEscalationDeliveryOptions): Promise
 /**
  * The login an App identity posts as: "<slug>[bot]", from GET /app signed with
  * an App JWT. GET /user is not callable with an installation token (GitHub
- * answers 403), so it cannot name an App. Same method as
- * scripts/github-service-login.ts. The JWT is never logged or returned.
+ * answers 403), so it cannot name an App. The metadata call is authenticated
+ * with the App JWT, never the installation token and never via githubRequest.
+ * The JWT is never logged or returned.
  */
 async function resolveAppLogin(
   identity: Extract<ServiceGitHubAuth, { kind: 'app' }>,
@@ -618,12 +619,15 @@ async function resolveAppLogin(
 
 /**
  * The login Taskmaster posts as, cached for the life of the deps object so the
- * lookup costs one call, not one per escalation. An App identity is named via
- * GET /app ("<slug>[bot]") and cached on its identity pool -- never on the
- * installation token, which rotates hourly. A PAT (or an injected test token)
- * is named via GET /user and cached on that token. A failed lookup is not
- * cached; it throws, so the escalation fails this tick and is retried rather
- * than trusting or distrusting markers blindly.
+ * lookup costs one call, not one per escalation. When no token is injected,
+ * the duty_officer identity is used: an App is named via GET /app
+ * ("<slug>[bot]") and cached on its identity pool -- never on the installation
+ * token, which rotates hourly. A PAT (or an injected test token) is named via
+ * GET /user and cached on that token. Kind none, a resolver exception, a
+ * non-OK /app response, or a blank slug throws without falling through to
+ * GET /user. A failed lookup is not cached; it throws, so the escalation
+ * fails this tick and is retried rather than trusting or distrusting markers
+ * blindly.
  */
 function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () => Promise<string> {
   let cached: { key: string; login: Promise<string> } | null = null;
