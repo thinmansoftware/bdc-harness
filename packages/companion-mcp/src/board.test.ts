@@ -269,7 +269,9 @@ describe('board secretary tools', () => {
           })
         );
         const correlation = String(sent.correlation_id);
-        expect(correlation).toMatch(/^board-brief-M-TEST-\d{8}T\d{6}Z$/);
+        expect(correlation).toMatch(
+          /^board-brief-M-TEST-\d{8}T\d{6}Z-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+        );
         const posts = server.requests.filter(request => request.method === 'POST');
         expect(posts).toHaveLength(3);
         const correlations = posts.map(

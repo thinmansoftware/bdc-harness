@@ -151,6 +151,13 @@ Other required environment:
 | ORACLE_API_KEY_FILE | Path of the Oracle retrieval key file. Not required at startup. The value stays on the server and is never a tool argument. |
 | DISPATCH_BASE_URL | Archon Dispatch base, example `http://archon-app-1:3090` on network `archon_archon-network` |
 
+Optional session limits. A blank value uses the default. A non-integer or a value below 1 refuses startup.
+
+| Variable | Meaning |
+| --- | --- |
+| COMPANION_SESSION_IDLE_MS | Default `1800000` (30 minutes). Sessions idle longer than this are removed and closed transport-first, server-second. The approximately one-minute sweep can delay expiry by up to one minute. |
+| COMPANION_SESSION_MAX | Default `64`. Initializing beyond the cap closes and removes the least recently active session first. |
+
 Read only when `board_record_propose` runs, after local path and ruling checks:
 
 | Variable | Meaning |

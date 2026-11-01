@@ -16,10 +16,11 @@ import { assertOracleSearchUrl } from './tools/oracle';
 
 type Env = Record<string, string | undefined>;
 
-interface SessionRecord {
+export interface SessionRecord {
   transport: StreamableHTTPServerTransport;
   server: McpServer;
   companionId: string;
+  lastActivityMs: number;
 }
 
 export interface RunningCompanionServer {
@@ -53,6 +54,17 @@ function readPort(value: string | undefined): number {
   return port;
 }
 
+function readPositiveInt(value: string | undefined, name: string, fallback: number): number {
+  if (value === undefined || value.trim() === '') {
+    return fallback;
+  }
+  const parsed = Number(value.trim());
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`invalid_env:${name}`);
+  }
+  return parsed;
+}
+
 function requiredEnv(env: Env, name: string): string {
   const value = env[name];
   if (value === undefined || value.trim() === '') {
@@ -77,6 +89,96 @@ function headerValue(value: string | string[] | undefined): string | undefined {
   return value;
 }
 
+export function touchSession(
+  sessions: Map<string, SessionRecord>,
+  id: string,
+  nowMs: number
+): void {
+  const record = sessions.get(id);
+  if (record !== undefined) {
+    record.lastActivityMs = nowMs;
+  }
+}
+
+function detachLeastRecentIfAtCap(
+  sessions: Map<string, SessionRecord>,
+  maxSessions: number
+): SessionRecord | undefined {
+  if (sessions.size < maxSessions) {
+    return undefined;
+  }
+  let oldestId: string | undefined;
+  let oldestMs = 0;
+  for (const [id, record] of sessions) {
+    if (oldestId === undefined || record.lastActivityMs < oldestMs) {
+      oldestId = id;
+      oldestMs = record.lastActivityMs;
+    }
+  }
+  if (oldestId === undefined) {
+    return undefined;
+  }
+  const record = sessions.get(oldestId);
+  sessions.delete(oldestId);
+  return record;
+}
+
+async function closeSessionRecord(record: SessionRecord): Promise<void> {
+  await record.transport.close();
+  await record.server.close();
+}
+
+export async function evictLeastRecentIfAtCap(
+  sessions: Map<string, SessionRecord>,
+  maxSessions: number
+): Promise<void> {
+  const record = detachLeastRecentIfAtCap(sessions, maxSessions);
+  if (record === undefined) {
+    return;
+  }
+  await closeSessionRecord(record);
+}
+
+// Admissions share one queue. Each admission detaches the least-recent session
+// (when at cap) and inserts the new record before awaiting cleanup, so a peer
+// cannot observe the freed slot and push the map past maxSessions.
+export function createSessionAdmissions(
+  sessions: Map<string, SessionRecord>,
+  maxSessions: number
+): (id: string, record: SessionRecord) => Promise<void> {
+  let tail: Promise<void> = Promise.resolve();
+  const release = (): undefined => undefined;
+  return (id: string, record: SessionRecord): Promise<void> => {
+    const run = tail.then(async (): Promise<void> => {
+      const evicted = detachLeastRecentIfAtCap(sessions, maxSessions);
+      sessions.set(id, record);
+      if (evicted !== undefined) {
+        await closeSessionRecord(evicted);
+      }
+    });
+    tail = run.then(release, release);
+    return run;
+  };
+}
+
+export async function sweepIdleSessions(
+  sessions: Map<string, SessionRecord>,
+  nowMs: number,
+  idleMs: number
+): Promise<void> {
+  const expired: SessionRecord[] = [];
+  for (const [id, record] of sessions) {
+    if (nowMs - record.lastActivityMs > idleMs) {
+      sessions.delete(id);
+      expired.push(record);
+    }
+  }
+  for (const record of expired) {
+    await record.transport.close();
+    await record.server.close();
+  }
+}
+
 export async function startCompanionMcp(
   env: Env = process.env,
   hooks?: { fetchImpl?: typeof fetch }
@@ -89,6 +191,12 @@ export async function startCompanionMcp(
   const wikiRoot = requiredEnv(env, 'COMPANION_WIKI_ROOT');
   const oracleUrl = assertOracleSearchUrl(requiredEnv(env, 'ORACLE_URL'));
   const dispatchBaseUrl = requiredEnv(env, 'DISPATCH_BASE_URL');
+  const idleMs = readPositiveInt(
+    env.COMPANION_SESSION_IDLE_MS,
+    'COMPANION_SESSION_IDLE_MS',
+    30 * 60 * 1000
+  );
+  const maxSessions = readPositiveInt(env.COMPANION_SESSION_MAX, 'COMPANION_SESSION_MAX', 64);
   const registry = loadCompanionRegistry(configPath);
   const tree = new TrackedTree(wikiRoot);
   await tree.start();
@@ -104,6 +212,11 @@ export async function startCompanionMcp(
     env,
   };
   const sessions = new Map<string, SessionRecord>();
+  const admitSession = createSessionAdmissions(sessions, maxSessions);
+  const sweepTimer = setInterval(() => {
+    void sweepIdleSessions(sessions, Date.now(), idleMs);
+  }, 60_000);
+  sweepTimer.unref();
 
   const httpServer = createServer((req, res) => {
     void handle(req, res).catch(() => {
@@ -147,6 +260,7 @@ export async function startCompanionMcp(
         writeJson(res, 401, { error: 'unauthorized' });
         return;
       }
+      touchSession(sessions, sessionId, Date.now());
       await existing.transport.handleRequest(req, res);
       return;
     }
@@ -154,17 +268,24 @@ export async function startCompanionMcp(
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: (): string => randomUUID(),
       enableJsonResponse: true,
-      onsessioninitialized: (id: string): void => {
-        if (holder.session !== undefined) {
-          sessions.set(id, holder.session);
+      onsessioninitialized: (id: string): void | Promise<void> => {
+        if (holder.session === undefined) {
+          return;
         }
+        holder.session.lastActivityMs = Date.now();
+        return admitSession(id, holder.session);
       },
       onsessionclosed: (id: string): void => {
         sessions.delete(id);
       },
     });
     const mcp = buildMcpServer(auth.slot, deps);
-    holder.session = { transport, server: mcp, companionId: auth.slot.companion_id };
+    holder.session = {
+      transport,
+      server: mcp,
+      companionId: auth.slot.companion_id,
+      lastActivityMs: Date.now(),
+    };
     await mcp.connect(transport);
     await transport.handleRequest(req, res);
   }
@@ -188,6 +309,7 @@ export async function startCompanionMcp(
   return {
     baseUrl: `http://${bindAddr}:${address.port}`,
     close: async (): Promise<void> => {
+      clearInterval(sweepTimer);
       tree.stop();
       for (const session of sessions.values()) {
         await session.transport.close();
