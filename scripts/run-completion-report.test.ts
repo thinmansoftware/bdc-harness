@@ -17,6 +17,8 @@ create table remote_agent_workflow_runs (id text primary key, workflow_name text
 create table remote_agent_workflow_events (id text primary key, workflow_run_id text not null, event_type text not null, step_index integer, step_name text, data text, created_at text);
 create table remote_agent_run_outcomes (run_id text primary key, execution_state text);
 create table overseer_actions (id text primary key, run_id text, wo_id text, class text, action text, result text not null, created_at text not null);
+create table tm_journal (id text primary key, created_at text not null, thread_ref text not null, action_type text not null, proposal_json text not null, outcome text not null);
+create table agent_dispatch_messages (id text primary key, correlation_id text not null, idempotency_key text not null, task_type text not null, sender text not null, recipient text not null, body text not null, status text not null default 'queued', created_at text not null, acknowledged_at text);
 `;
 const SCHEMA_NO_OVERSEER = SCHEMA.split('\n')
   .filter(l => !l.includes('overseer_actions'))
@@ -251,5 +253,308 @@ describe('run-completion-report', () => {
     expect(line).toBeDefined();
     expect(line).toContain('scripts/run-completion-report.ts');
     expect(df.split('AS production')[1]).toContain('scripts/run-completion-report.ts');
+  });
+});
+
+// --- Outcomes (last 24h), WO-HARNESS-DAILY-OUTCOME-REPORT-01 ---
+const WS = '2026-10-31T14:30:00.000Z';
+const WE = '2026-11-01T14:30:00.000Z';
+const IN_W = '2026-11-01T10:00:00.000Z';
+const OUT_W = '2026-10-30T10:00:00.000Z';
+
+function tm(db: Database, action: string, outcome: string, createdAt: string): void {
+  db.query(
+    "insert into tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome) values (?,?,'t',?,'{}',?)"
+  ).run(`t${++seq}`, createdAt, action, outcome);
+}
+function msg(
+  db: Database,
+  o: {
+    task_type?: string;
+    recipient: string;
+    body?: string;
+    status?: string;
+    created_at: string;
+    acknowledged_at?: string | null;
+  }
+): void {
+  db.query(
+    `insert into agent_dispatch_messages (id, correlation_id, idempotency_key, task_type, sender, recipient, body, status, created_at, acknowledged_at)
+     values (?,?,?,?,'s',?,?,?,?,?)`
+  ).run(
+    `m${++seq}`,
+    `c${seq}`,
+    `k${seq}`,
+    o.task_type ?? 'agent_message',
+    o.recipient,
+    o.body ?? '{}',
+    o.status ?? 'queued',
+    o.created_at,
+    o.acknowledged_at ?? null
+  );
+}
+function receipt(db: Database, recipient: string, disposition: string, createdAt: string): void {
+  msg(db, {
+    task_type: 'run_report',
+    recipient,
+    status: 'queued',
+    created_at: createdAt,
+    body: JSON.stringify({ kind: 'pr_review_submit_receipt', disposition }),
+  });
+}
+
+// Hand queries O1-O7 from the WO spec, run independently of the script.
+const MECH_ORDER = [
+  'taskmaster_escalate_p0',
+  'overseer_review',
+  'overseer_repair',
+  'overseer_merge',
+  'cauldron_runs',
+  'mailbox_operator',
+  'mailbox_xo',
+  'mailbox_t3-desktop',
+];
+function outcomeFixtures(path: string): { mechanisms: any[]; mailboxes: any[] } {
+  const db = new Database(path, { readonly: true });
+  const w = { $ws: WS, $we: WE };
+  const io = (sql: string, params: Record<string, string> = w): any => db.query(sql).get(params);
+  const m: any[] = [];
+  m.push({
+    name: 'taskmaster_escalate_p0',
+    ...io(
+      "select count(*) as input, coalesce(sum(outcome='sent'),0) as outcome from tm_journal where action_type='escalate_p0' and created_at >= $ws and created_at < $we"
+    ),
+  });
+  m.push({
+    name: 'overseer_review',
+    ...io(
+      "select (select count(*) from agent_dispatch_messages where task_type='run_review' and recipient='overseer-reviewer' and created_at >= $ws and created_at < $we) as input, (select count(*) from agent_dispatch_messages where created_at >= $ws and created_at < $we and json_valid(body) and json_extract(body,'$.kind')='pr_review_submit_receipt' and json_extract(body,'$.disposition') in ('approved','changes_requested')) as outcome"
+    ),
+  });
+  m.push({
+    name: 'overseer_repair',
+    ...io(
+      "select coalesce(sum(action='escalate_with_evidence'),0) as input, coalesce(sum(action like '%repair%' or action like '%refire%'),0) as outcome from overseer_actions where created_at >= $ws and created_at < $we"
+    ),
+  });
+  m.push({
+    name: 'overseer_merge',
+    ...io(
+      "select coalesce(sum(action='flag_merge_ready'),0) as input, coalesce(sum(action='merged'),0) as outcome from overseer_actions where created_at >= $ws and created_at < $we"
+    ),
+  });
+  m.push({
+    name: 'cauldron_runs',
+    ...io(
+      "select count(*) as input, coalesce(sum(status='completed'),0) as outcome from remote_agent_workflow_runs where workflow_name like 'bdc-feature-development%' and started_at >= datetime($a,'-1 days') and started_at < $a",
+      { $a: AS_OF }
+    ),
+  });
+  const boxes: any[] = [];
+  for (const r of ['operator', 'xo', 't3-desktop']) {
+    m.push({
+      name: `mailbox_${r}`,
+      ...io(
+        'select (select count(*) from agent_dispatch_messages where recipient=$r and created_at >= $ws and created_at < $we) as input, (select count(*) from agent_dispatch_messages where recipient=$r and acknowledged_at >= $ws and acknowledged_at < $we) as outcome',
+        { ...w, $r: r }
+      ),
+    });
+    boxes.push({
+      recipient: r,
+      ...io(
+        "select count(*) as depth, coalesce(sum($r <> 'operator' or created_at >= '2026-11-01T00:00:00.000Z'),0) as depth_live, min(case when $r <> 'operator' or created_at >= '2026-11-01T00:00:00.000Z' then created_at end) as oldest_live from agent_dispatch_messages where recipient=$r and status='queued' and acknowledged_at is null and created_at < $we",
+        { $r: r, $we: WE }
+      ),
+    });
+  }
+  db.close();
+  return { mechanisms: m, mailboxes: boxes };
+}
+
+describe('run-completion-report outcomes (last 24h)', () => {
+  function seed7(db: Database): void {
+    tm(db, 'escalate_p0', 'failed', IN_W);
+    tm(db, 'escalate_p0', 'failed', IN_W);
+    tm(db, 'escalate_p0', 'failed', IN_W);
+    tm(db, 'escalate_p0', 'sent', IN_W);
+    tm(db, 'escalate_p0', 'sent', '2026-11-01T01:00:00.000Z');
+    tm(db, 'escalate_p0', 'expired', IN_W);
+    tm(db, 'escalate_p0', 'sent', OUT_W);
+    tm(db, 'nudge', 'sent', IN_W);
+    for (let i = 0; i < 4; i++) {
+      msg(db, {
+        task_type: 'run_review',
+        recipient: 'overseer-reviewer',
+        status: 'done',
+        created_at: IN_W,
+      });
+    }
+    msg(db, { task_type: 'run_review', recipient: 'grok', status: 'done', created_at: IN_W });
+    receipt(db, 'operator', 'approved', '2026-10-31T20:00:00.000Z');
+    receipt(db, 'pr-review-log', 'changes_requested', IN_W);
+    receipt(db, 'pr-review-log', 'checks_pending', IN_W);
+    receipt(db, 'pr-review-log', 'submission_failed', IN_W);
+    receipt(db, 'pr-review-log', 'approved', OUT_W);
+    act(db, 'escalate_with_evidence', IN_W);
+    act(db, 'escalate_with_evidence', IN_W);
+    act(db, 'flag_merge_ready', IN_W);
+    act(db, 'flag_merge_ready', IN_W);
+    act(db, 'flag_merge_ready', IN_W);
+    act(db, 'merged', IN_W);
+    act(db, 'verdict_write', IN_W);
+    run(db, LANES[0]!, 'completed', '2026-11-01 09:00:00');
+    run(db, LANES[1]!, 'failed', '2026-11-01 09:00:00');
+    run(db, LANES[1]!, 'completed', '2026-10-30 09:00:00');
+  }
+
+  test('Test 7: outcomes equal fixture SQL', () => {
+    const { path, db } = newDb();
+    seed7(db);
+    db.close();
+    const r = exec(base(path, ['--json']));
+    expect(r.code).toBe(0);
+    const o = JSON.parse(r.out).outcomes;
+    const f = outcomeFixtures(path);
+    expect(o.mechanisms.map((m: any) => m.name)).toEqual(MECH_ORDER);
+    expect(o.mechanisms).toEqual(f.mechanisms);
+    const byName = Object.fromEntries(o.mechanisms.map((m: any) => [m.name, m]));
+    expect(byName.taskmaster_escalate_p0).toEqual({
+      name: 'taskmaster_escalate_p0',
+      input: 6,
+      outcome: 2,
+    });
+    expect(byName.overseer_review).toEqual({ name: 'overseer_review', input: 4, outcome: 2 });
+    expect(byName.overseer_repair).toEqual({ name: 'overseer_repair', input: 2, outcome: 0 });
+    expect(byName.overseer_merge).toEqual({ name: 'overseer_merge', input: 3, outcome: 1 });
+    expect(byName.cauldron_runs).toEqual({ name: 'cauldron_runs', input: 2, outcome: 1 });
+    expect(
+      o.mailboxes.map((m: any) => ({
+        recipient: m.recipient,
+        depth: m.depth,
+        depth_live: m.depth_live,
+        oldest_live: m.oldest_live,
+      }))
+    ).toEqual(f.mailboxes);
+  });
+
+  test('Test 8: dead-mechanism flag', () => {
+    const dead = newDb();
+    seed7(dead.db);
+    dead.db.close();
+    const j = JSON.parse(exec(base(dead.path, ['--json'])).out);
+    expect(j.outcomes.flags).toContain('dead_mechanism:overseer_repair');
+    expect(j.outcomes.flags).not.toContain('dead_mechanism:taskmaster_escalate_p0');
+    expect(j.outcomes.flags).not.toContain('dead_mechanism:overseer_review');
+    expect(j.outcomes.flags).not.toContain('dead_mechanism:overseer_merge');
+    // mailbox_operator: one receipt queued in the window, none acknowledged
+    expect(j.outcomes.flags).toContain('dead_mechanism:mailbox_operator');
+    expect(j.outcome_flag_line).toBe(
+      `outcome_flags: ${j.outcomes.flags.length} (${j.outcomes.flags.join(', ')})`
+    );
+    const firstLine = exec(base(dead.path)).out.split('\n')[0]!;
+    expect(firstLine).toBe(j.outcome_flag_line);
+    expect(firstLine).toContain('dead_mechanism:overseer_repair');
+
+    // every mechanism with input > 0 has outcome > 0: no flag at all
+    const alive = newDb();
+    tm(alive.db, 'escalate_p0', 'sent', IN_W);
+    msg(alive.db, {
+      task_type: 'run_review',
+      recipient: 'overseer-reviewer',
+      status: 'done',
+      created_at: IN_W,
+    });
+    receipt(alive.db, 'pr-review-log', 'approved', IN_W);
+    // the receipt itself is a pr-review-log row; acknowledge an operator row in the window
+    msg(alive.db, {
+      recipient: 'operator',
+      status: 'done',
+      created_at: IN_W,
+      acknowledged_at: IN_W,
+    });
+    act(alive.db, 'escalate_with_evidence', IN_W);
+    act(alive.db, 'repair_dispatched', IN_W);
+    act(alive.db, 'flag_merge_ready', IN_W);
+    act(alive.db, 'merged', IN_W);
+    run(alive.db, LANES[0]!, 'completed', '2026-11-01 09:00:00');
+    alive.db.close();
+    const a = JSON.parse(exec(base(alive.path, ['--json'])).out);
+    expect(a.outcomes.mechanisms.every((m: any) => m.input === 0 || m.outcome > 0)).toBe(true);
+    expect(a.outcomes.flags).toEqual([]);
+    expect(a.outcome_flag_line).toBe('outcome_flags: none');
+    expect(exec(base(alive.path)).out.split('\n')[0]).toBe('outcome_flags: none');
+
+    // input 0 and outcome 0: no flag
+    const idle = newDb();
+    act(idle.db, 'verdict_write', IN_W);
+    idle.db.close();
+    const i = JSON.parse(exec(base(idle.path, ['--json'])).out);
+    const repair = i.outcomes.mechanisms.find((m: any) => m.name === 'overseer_repair');
+    expect(repair).toEqual({ name: 'overseer_repair', input: 0, outcome: 0 });
+    expect(i.outcomes.flags).toEqual([]);
+  });
+
+  test('Test 9: mailbox depth and stale flag', () => {
+    const { path, db } = newDb();
+    msg(db, { recipient: 'operator', created_at: '2026-10-20T08:00:00.000Z' });
+    msg(db, { recipient: 'operator', created_at: '2026-11-01T00:30:00.000Z' });
+    msg(db, {
+      recipient: 'operator',
+      created_at: '2026-10-20T09:00:00.000Z',
+      acknowledged_at: '2026-10-21T09:00:00.000Z',
+    });
+    msg(db, { recipient: 'xo', created_at: '2026-10-30T10:00:00.000Z' });
+    db.close();
+    const j = JSON.parse(exec(base(path, ['--json'])).out);
+    const box = Object.fromEntries(j.outcomes.mailboxes.map((m: any) => [m.recipient, m]));
+    expect(box.operator).toEqual({
+      recipient: 'operator',
+      depth: 2,
+      depth_live: 1,
+      oldest_live: '2026-11-01T00:30:00.000Z',
+      oldest_live_age_hours: 14,
+    });
+    expect(box.xo).toEqual({
+      recipient: 'xo',
+      depth: 1,
+      depth_live: 1,
+      oldest_live: '2026-10-30T10:00:00.000Z',
+      oldest_live_age_hours: 52.5,
+    });
+    expect(box['t3-desktop']).toEqual({
+      recipient: 't3-desktop',
+      depth: 0,
+      depth_live: 0,
+      oldest_live: null,
+      oldest_live_age_hours: null,
+    });
+    expect(j.outcomes.flags).toContain('stale_mailbox:xo');
+    expect(j.outcomes.flags).not.toContain('stale_mailbox:operator');
+    expect(j.outcomes.flags).not.toContain('stale_mailbox:t3-desktop');
+    const f = outcomeFixtures(path);
+    const mo = (list: any[]): any => list.find((m: any) => m.name === 'mailbox_operator');
+    expect(mo(j.outcomes.mechanisms)).toEqual(mo(f.mechanisms));
+    expect(mo(j.outcomes.mechanisms)).toEqual({ name: 'mailbox_operator', input: 1, outcome: 0 });
+  });
+
+  test('Test 10: 24h window independent of --days', () => {
+    const { path, db } = newDb();
+    tm(db, 'escalate_p0', 'failed', WS);
+    tm(db, 'escalate_p0', 'failed', '2026-10-31T14:29:59.000Z');
+    tm(db, 'escalate_p0', 'failed', WE);
+    db.close();
+    const j = JSON.parse(exec(base(path, ['--json'])).out);
+    expect(j.window.days).toBe(7);
+    expect(j.outcomes.window).toEqual({ start: WS, end: WE });
+    expect(j.outcomes.mechanisms[0]).toEqual({
+      name: 'taskmaster_escalate_p0',
+      input: 1,
+      outcome: 0,
+    });
+    expect(j.outcomes.flags).toEqual(['dead_mechanism:taskmaster_escalate_p0']);
+    const t = exec(base(path)).out;
+    expect(t).toContain(`outcomes (last 24h): ${WS} to ${WE}`);
+    expect(t).toContain('  taskmaster_escalate_p0: input 1, outcome 0');
+    expect(t).toContain('  mailbox t3-desktop: depth 0, live 0, oldest_live none, age_h none');
   });
 });
