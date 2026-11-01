@@ -4637,26 +4637,174 @@ nodes:
         return 0
       }
       PR_OK=false
-      if accept_open_pr_or_refuse "$(lookup_open_pr)"; then
-        echo "PR_URL=$EXIST"
-        echo "PR already exists (no create needed)."
-        PR_OK=true
-      else
-        for attempt in 1 2 3; do
-          if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" --base "$BASE_BRANCH" 2>&1; then
-            PR_OK=true
-            break
+      # same-head-adopt: begin
+      PUSHED_SHA="${LOCAL_HEAD:-}"
+      if [ -z "$PUSHED_SHA" ]; then
+        PUSHED_SHA=$(git rev-parse HEAD 2>/dev/null || true)
+      fi
+      if [ -n "$PUSHED_SHA" ]; then
+        # All open PRs. A capped gh pr list kept only its first page, so a
+        # same-SHA PR past that page was missed (duplicate create) or a higher
+        # number was adopted instead of the lowest. --paginate follows Link
+        # headers; the file avoids the 128KB env limit.
+        same_head_file=$(mktemp)
+        same_head_list_ok=true
+        if ! gh api --paginate --slurp --method GET \
+          "repos/${REPO}/pulls?state=open" \
+          > "$same_head_file" 2>/dev/null; then
+          same_head_list_ok=false
+        fi
+        same_head_row=""
+        if [ "$same_head_list_ok" = "true" ]; then
+          same_head_row=$(SAME_HEAD_FILE="$same_head_file" PUSHED_SHA="$PUSHED_SHA" BASE_BRANCH="$BASE_BRANCH" python3 -c "$(cat <<'PY'
+      import json, os, sys
+      path = os.environ.get("SAME_HEAD_FILE", "")
+      if not path:
+          raise SystemExit(0)
+      try:
+          with open(path, "r", encoding="utf-8") as fh:
+              raw = fh.read().strip()
+      except Exception:
+          raise SystemExit(0)
+      if not raw:
+          raise SystemExit(0)
+      try:
+          payload = json.loads(raw)
+      except Exception:
+          raise SystemExit(0)
+
+      def flatten(value):
+          if not isinstance(value, list):
+              return None
+          if value and all(isinstance(page, list) for page in value):
+              items = []
+              for page in value:
+                  items.extend(page)
+              return items
+          return value
+
+      def text_or_empty(value):
+          if isinstance(value, str):
+              return value
+          return ""
+
+      def normalize(item):
+          if not isinstance(item, dict):
+              return None
+          head = item.get("head")
+          base = item.get("base")
+          if isinstance(head, dict) or isinstance(base, dict):
+              head = head if isinstance(head, dict) else {}
+              base = base if isinstance(base, dict) else {}
+              return {
+                  "number": item.get("number"),
+                  "title": text_or_empty(item.get("title")),
+                  "headRefOid": text_or_empty(head.get("sha")),
+                  "headRefName": text_or_empty(head.get("ref")),
+                  "baseRefName": text_or_empty(base.get("ref")),
+                  "url": text_or_empty(item.get("html_url")),
+              }
+          return item
+
+      items = flatten(payload)
+      if items is None:
+          raise SystemExit(0)
+      data = []
+      for item in items:
+          mapped = normalize(item)
+          if mapped is not None:
+              data.append(mapped)
+      want = os.environ.get("PUSHED_SHA", "")
+      base_branch = os.environ.get("BASE_BRANCH", "")
+      kept = []
+      for item in data:
+          if not isinstance(item, dict):
+              continue
+          if item.get("headRefOid") != want:
+              continue
+          number = item.get("number")
+          if isinstance(number, bool) or not isinstance(number, int):
+              continue
+          kept.append(item)
+      kept.sort(key=lambda item: item["number"])
+      if not kept:
+          raise SystemExit(0)
+
+      def text_field(item, key):
+          value = item.get(key) or ""
+          if not isinstance(value, str):
+              return ""
+          return value
+
+      eligible = []
+      for item in kept:
+          if text_field(item, "baseRefName") == base_branch:
+              eligible.append(item)
+      if not eligible:
+          item = kept[0]
+          url = text_field(item, "url")
+          base = text_field(item, "baseRefName")
+          if not url:
+              raise SystemExit(0)
+          sys.stdout.write("mismatch\t" + url + "\t" + base)
+          raise SystemExit(0)
+      chosen = eligible[0]
+      url = text_field(chosen, "url")
+      if not url:
+          raise SystemExit(0)
+      title = text_field(chosen, "title").replace("\t", " ").replace("\r", " ").replace("\n", " ")
+      others = []
+      chosen_number = chosen["number"]
+      for item in kept:
+          if item["number"] == chosen_number:
+              continue
+          others.append("#" + str(item["number"]) + " " + text_field(item, "url"))
+      sys.stdout.write("adopt\t" + url + "\t" + title + "\t" + ", ".join(others))
+      PY
+      )")
+        fi
+        rm -f "$same_head_file"
+        same_head_kind=$(printf '%s' "$same_head_row" | cut -f1)
+        if [ "$same_head_kind" = "mismatch" ]; then
+          same_head_rest=$(printf '%s' "$same_head_row" | cut -f2-)
+          accept_open_pr_or_refuse "$same_head_rest"
+        elif [ "$same_head_kind" = "adopt" ]; then
+          same_head_url=$(printf '%s' "$same_head_row" | cut -f2)
+          same_head_title=$(printf '%s' "$same_head_row" | cut -f3)
+          same_head_others=$(printf '%s' "$same_head_row" | cut -f4-)
+          if [ -n "$same_head_others" ]; then
+            printf '%s\n' "WARN: open-pr: same-head duplicates not adopted: ${same_head_others}" >&2
           fi
-          # Re-check: gh pr create may have created the PR but returned non-zero.
-          if accept_open_pr_or_refuse "$(lookup_open_pr)"; then
-            echo "PR_URL=$EXIST"
-            echo "PR created despite non-zero exit (gh CLI quirk; PR confirmed via list)."
-            PR_OK=true
-            break
-          fi
-          echo "WARN: gh pr create attempt $attempt failed AND no PR found on origin; retrying after $((attempt * 5))s..." >&2
-          sleep $((attempt * 5))
-        done
+          printf '%s\n' "PR_URL=${same_head_url}"
+          printf '%s\n' "open-pr: adopted existing PR ${same_head_url} at head ${PUSHED_SHA}"
+          printf '%s\n' "open-pr: adopted PR title: ${same_head_title}"
+          printf '%s\n' "PR already exists (no create needed)."
+          PR_OK=true
+        fi
+      fi
+      # same-head-adopt: end
+      if [ "$PR_OK" = "false" ]; then
+        if accept_open_pr_or_refuse "$(lookup_open_pr)"; then
+          echo "PR_URL=$EXIST"
+          echo "PR already exists (no create needed)."
+          PR_OK=true
+        else
+          for attempt in 1 2 3; do
+            if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" --base "$BASE_BRANCH" 2>&1; then
+              PR_OK=true
+              break
+            fi
+            # Re-check: gh pr create may have created the PR but returned non-zero.
+            if accept_open_pr_or_refuse "$(lookup_open_pr)"; then
+              echo "PR_URL=$EXIST"
+              echo "PR created despite non-zero exit (gh CLI quirk; PR confirmed via list)."
+              PR_OK=true
+              break
+            fi
+            echo "WARN: gh pr create attempt $attempt failed AND no PR found on origin; retrying after $((attempt * 5))s..." >&2
+            sleep $((attempt * 5))
+          done
+        fi
       fi
       # existing-pr-base-guard: end
       if [ "$PR_OK" = "false" ]; then
