@@ -1163,10 +1163,27 @@ describe('board secretary tools', () => {
         );
         expect(refused.error).toBe('github_scope_refused');
       });
+      await writeFile(harness.githubTokenFile, 'ghr_refreshtokenvalue\n', 'utf8');
+      const refresh = await startFromHarness(harness, {
+        COMPANION_GITHUB_API_BASE: github.url,
+      });
+      runningHosts.push(refresh);
+      await withClient(refresh.baseUrl, harness.tokens.grokbot, async client => {
+        const refused = parseToolJson(
+          await callToolText(client, 'board_record_propose', {
+            kind: 'synthesis',
+            motion_id: 'M-TEST',
+            summary: 'should not send a refresh token to the stub',
+            files,
+          })
+        );
+        expect(refused.error).toBe('github_scope_refused');
+      });
       expect(github.requests).toHaveLength(0);
       const leaked = JSON.stringify(github.requests);
       expect(leaked).not.toContain('ghp_exampletokenvalue');
       expect(leaked).not.toContain('github_pat_abcdefghijklmnop');
+      expect(leaked).not.toContain('ghr_refreshtokenvalue');
       expect(leaked).not.toContain('authorization');
     } finally {
       for (const running of runningHosts) {

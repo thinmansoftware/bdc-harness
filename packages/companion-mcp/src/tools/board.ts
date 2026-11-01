@@ -236,7 +236,7 @@ const PROPOSAL_KIND_SET: ReadonlySet<string> = new Set(PROPOSAL_KINDS);
 
 const GITHUB_API_ORIGIN = 'https://api.github.com';
 
-const REAL_GITHUB_TOKEN = /^(?:github_pat_|ghp_|gho_|ghu_|ghs_)/;
+const REAL_GITHUB_TOKEN = /^(?:github_pat_|ghp_|gho_|ghr_|ghu_|ghs_)/;
 
 function resolveGithubApiBase(raw: string | undefined): string {
   const trimmed = raw?.trim() ?? '';
