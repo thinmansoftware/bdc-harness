@@ -1628,21 +1628,6 @@ export async function refreshAdoption(
   }
 }
 
-function isDeliverySuppressedExpiry(action: taskmasterDb.TmJournalEntry): boolean {
-  if (action.outcome !== 'expired') return false;
-  try {
-    const proposal: unknown = JSON.parse(action.proposal_json);
-    return (
-      typeof proposal === 'object' &&
-      proposal !== null &&
-      !Array.isArray(proposal) &&
-      Boolean((proposal as Record<string, unknown>).suppressed)
-    );
-  } catch {
-    return false;
-  }
-}
-
 let tickQueue: Promise<void> = Promise.resolve();
 
 export function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
@@ -1791,13 +1776,14 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
   }
   const actions24h = lookback.filter(a => Date.parse(a.created_at) >= since24h);
+  // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: ANY escalate_p0 journal action in
+  // the trailing 24h (sent, failed, rejected, expired...) counts, so a failed
+  // delivery is not re-proposed on every tick. Before this, only 'sent' and
+  // suppressed expiries were remembered and failed rows re-proposed on each
+  // 30-minute bucket (5,319 failed rows over 30 issues in 7 days, board evidence 2026-11-01).
   const recentEscalateP0ByThread = new Set(
     actions24h
-      .filter(
-        action =>
-          action.action_type === 'escalate_p0' &&
-          (action.outcome === 'sent' || isDeliverySuppressedExpiry(action))
-      )
+      .filter(action => action.action_type === 'escalate_p0')
       .map(action => canonicalizeThreadRef(action.thread_ref))
   );
   try {
@@ -2649,8 +2635,18 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         'taskmaster.effect_sent'
       );
     } catch (error) {
-      await dal.updateActionOutcome(journalRow.id, 'failed');
+      // Record WHY: the reason was only logged before, so the 5,319 failed
+      // rows of 2026-11-01 had no recoverable cause in the journal.
+      const failureReason = (error instanceof Error ? error.message : String(error)).slice(0, 200);
+      await dal.updateActionOutcome(
+        journalRow.id,
+        'failed',
+        proposal.type === 'escalate_p0'
+          ? JSON.stringify({ ...proposal, failure: failureReason })
+          : undefined
+      );
       journalRow.outcome = 'failed';
+      if (proposal.type === 'escalate_p0') recentEscalateP0ByThread.add(canonicalProposalRef);
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');
     }
