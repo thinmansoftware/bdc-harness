@@ -247,15 +247,17 @@ test('test.yml routes Ubuntu, manual dispatch, schedule, and gated pull requests
   expect(windows.needs).toBe('windows-gate');
   const windowsIf = normalize(String(windows.if));
   expect(windowsIf).toBe(
-    "github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && needs.windows-gate.outputs.run_windows == 'true')"
+    "github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && needs.windows-gate.outputs.run_windows == 'true')"
   );
-  expect(windowsIf.includes("github.event_name == 'push'")).toBe(false);
+  expect(windowsIf.includes("github.event_name == 'push'")).toBe(true);
 
   const admitted = (eventName: string, runWindows: boolean): boolean =>
+    eventName === 'push' ||
     eventName === 'schedule' ||
     eventName === 'workflow_dispatch' ||
     (eventName === 'pull_request' && runWindows);
-  expect(admitted('push', true)).toBe(false);
+  expect(admitted('push', true)).toBe(true);
+  expect(admitted('push', false)).toBe(true);
   expect(admitted('schedule', false)).toBe(true);
   expect(admitted('workflow_dispatch', false)).toBe(true);
   expect(admitted('pull_request', true)).toBe(true);

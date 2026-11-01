@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { delimiter, join } from 'path';
 import {
   assertPrBaseAllowed,
   resolveRecordedBaseBranch,
@@ -234,25 +234,48 @@ exit 96
 `
     );
     chmodSync(gh, 0o755);
+    const sleep = join(dir, 'sleep');
+    writeFileSync(sleep, '#!/bin/bash\nexit 0\n');
+    chmodSync(sleep, 0o755);
+    const bashDir =
+      process.platform === 'win32'
+        ? dir.replace(/\\/g, '/').replace(/^([A-Za-z]):\//, match => `/${match[0].toLowerCase()}/`)
+        : dir;
     const script = join(dir, 'guard.sh');
-    writeFileSync(script, `set -euo pipefail\n${guard}\n`);
+    writeFileSync(
+      script,
+      [
+        'set -euo pipefail',
+        `export PATH='${bashDir}':"$PATH"`,
+        'echo "TRACE gh=$(command -v gh) python3=$(command -v python3)" >&2',
+        guard,
+        '',
+      ].join('\n')
+    );
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      PATH: `${dir}${delimiter}${process.env.PATH ?? ''}`,
+      GH_ARGS_LOG: argsLog,
+      GH_LIST_COUNT: listCount,
+      GH_CREATE_COUNT: createCount,
+      GH_LIST_1: list1Path,
+      GH_LIST_2: list2Path,
+      GH_CREATE_RC: String(createRc),
+      RECORDED_BASE_BRANCH: 'dev',
+      UNIQUE_BRANCH: 'feat/identity-01',
+      REPO: 'acme/widgets',
+      TITLE: 't',
+      BODY_FILE: '/dev/null',
+      BASE_BRANCH: 'dev',
+    };
+    if (process.platform === 'win32') {
+      // Windows treats these keys as aliases; keep the explicit fixture PATH.
+      for (const key of Object.keys(env)) {
+        if (key !== 'PATH' && key.toUpperCase() === 'PATH') delete env[key];
+      }
+    }
     const result = Bun.spawnSync(['bash', script], {
-      env: {
-        ...process.env,
-        PATH: `${dir}:${process.env.PATH ?? ''}`,
-        GH_ARGS_LOG: argsLog,
-        GH_LIST_COUNT: listCount,
-        GH_CREATE_COUNT: createCount,
-        GH_LIST_1: list1Path,
-        GH_LIST_2: list2Path,
-        GH_CREATE_RC: String(createRc),
-        RECORDED_BASE_BRANCH: 'dev',
-        UNIQUE_BRANCH: 'feat/identity-01',
-        REPO: 'acme/widgets',
-        TITLE: 't',
-        BODY_FILE: '/dev/null',
-        BASE_BRANCH: 'dev',
-      },
+      env,
       stdout: 'pipe',
       stderr: 'pipe',
     });

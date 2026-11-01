@@ -1,12 +1,13 @@
 # Windows CI path gate
 
-The `test (windows-latest)` job runs in three cases:
+The `test (windows-latest)` job runs for:
 
-- every day at 07:17 UTC on `dev` (`cron: '17 7 * * *'`)
-- a manual `workflow_dispatch`
-- a pull request whose diff matches `.github/windows-paths.txt`
+- every push to `main` and `dev`;
+- the `17 7 * * *` schedule;
+- `workflow_dispatch`;
+- pull requests whose diff matches `.github/windows-paths.txt`.
 
-Pushes do not run it. A nightly Test Suite run skips the Ubuntu jobs, so the
+A nightly Test Suite run skips the Ubuntu jobs, so the
 run conclusion is the Windows result. `test (ubuntu-latest)` stays the required
 check and still runs on every push and pull request.
 
