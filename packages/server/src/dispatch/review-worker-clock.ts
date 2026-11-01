@@ -6,6 +6,7 @@ import {
   postResult,
   registerWorker,
   releaseMessage,
+  renewMessageLease,
   type DispatchTaskOutcome,
 } from '@archon/core/db/dispatch';
 import {
@@ -34,6 +35,9 @@ import {
   type SubmitDisposition,
   type SubmitOutcome,
 } from '@archon/overseer/pr-review-submit';
+import { mkdir, realpath, rename, rm } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 const log = createLogger('dispatch/review-worker-clock');
 const REVIEW_WORKER_ID = 'overseer-review-worker';
@@ -46,6 +50,36 @@ const CHECKS_PENDING_BACKOFF_MS = Math.max(
 );
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
+
+export function readTrustedCheckPlan(
+  raw: string | undefined = process.env.OVERSEER_REVIEW_CHECK_PLAN_JSON
+): readonly (readonly string[])[] {
+  if (!raw) return [];
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (!Array.isArray(value) || value.length === 0) return [];
+    if (
+      !value.every(
+        command =>
+          Array.isArray(command) &&
+          command.length > 0 &&
+          !['sh', 'bash', 'zsh', 'cmd', 'cmd.exe', 'powershell', 'pwsh'].includes(command[0]) &&
+          command.every(
+            argument =>
+              typeof argument === 'string' &&
+              argument.length > 0 &&
+              !argument.includes('\0') &&
+              argument.length <= 4096
+          )
+      )
+    ) {
+      return [];
+    }
+    return value as string[][];
+  } catch {
+    return [];
+  }
+}
 
 interface ReviewWorkerLogger {
   warn(data: Record<string, unknown>, message: string): void;
@@ -64,8 +98,17 @@ export interface ReviewWorkerDeps {
    * `releaseMessage`, which already carries the required fencing guards.
    */
   deferMessage: typeof deferMessage;
+  renewMessageLease?: typeof renewMessageLease;
   runAndSubmitReview: typeof runAndSubmitReview;
   createSubmitDeps: (reviewerIdentity: string) => ReturnType<typeof createRealSubmitDeps>;
+  prepareCheckout?: (input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    baseRef: string;
+    baseSha: string;
+  }) => Promise<string>;
   /** Optional logger seam for deterministic observability tests. */
   logger?: ReviewWorkerLogger;
   /**
@@ -113,6 +156,7 @@ function mapSubmitOutcome(
     case 'custody_conflict':
     case 'merge_custody_conflict':
     case 'blocked_required_contexts_unavailable':
+    case 'review_incomplete':
       return { status: 'failed', task_outcome: 'blocked' };
     case 'reviewer_failed':
     case 'submission_failed':
@@ -136,8 +180,10 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     postResult,
     releaseMessage,
     deferMessage,
+    renewMessageLease,
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
+    prepareCheckout: prepareReviewCheckout,
     staleVerdictSweep: config =>
       runStaleVerdictSweep(
         createRealStaleVerdictSweepDeps(config),
@@ -206,6 +252,16 @@ export async function tickReviewWorkerClock(
         if (applyLadderRestoredRequest(claimed.repeat_reason)) {
           log.info({ messageId: claimed.id }, 'overseer_review_judge_ladder_restored_by_operator');
         }
+        const checkoutPath = deps.prepareCheckout
+          ? await deps.prepareCheckout({
+              owner: body.owner,
+              repo: body.repo,
+              prNumber: body.prNumber,
+              headSha: body.headSha,
+              baseRef: body.baseRef,
+              baseSha: body.baseSha ?? '',
+            })
+          : resolveTrustedCheckoutPath(body.owner, body.repo, body.headSha);
         const work: ReviewWorkItem = {
           correlationId: claimed.correlation_id,
           messageId: claimed.id,
@@ -214,11 +270,39 @@ export async function tickReviewWorkerClock(
           prNumber: body.prNumber,
           headSha: body.headSha,
           author: body.author,
+          executionContext: Object.freeze({
+            requestId: claimed.id,
+            workerId: REVIEW_WORKER_ID,
+            fencingToken: claimed.fencing_token,
+            owner: body.owner,
+            repo: body.repo,
+            prNumber: body.prNumber,
+            headSha: body.headSha,
+            checkoutPath,
+            reviewerIdentity: config.reviewerIdentity,
+            rung: 'pr-review',
+            checkPlan: Object.freeze(readTrustedCheckPlan()),
+          }),
         };
-        const outcome: SubmitOutcome = await deps.runAndSubmitReview(
-          work,
-          deps.createSubmitDeps(config.reviewerIdentity)
-        );
+        const renew = deps.renewMessageLease;
+        const leaseTimer = renew
+          ? setInterval(() => {
+              void renew({
+                id: claimed.id,
+                worker_id: REVIEW_WORKER_ID,
+                fencing_token: claimed.fencing_token,
+              });
+            }, 30_000)
+          : undefined;
+        let outcome: SubmitOutcome;
+        try {
+          outcome = await deps.runAndSubmitReview(
+            work,
+            deps.createSubmitDeps(config.reviewerIdentity)
+          );
+        } finally {
+          if (leaseTimer) clearInterval(leaseTimer);
+        }
         // CHECKS PENDING is the ONLY non-terminal disposition: the bound head is
         // still live and CI on it has simply not concluded, so releasing the
         // claim with a backoff retries the SAME head productively.
@@ -337,6 +421,106 @@ export async function tickReviewWorkerClock(
     log.error({ err: error }, 'overseer_review_worker_tick_failed');
   } finally {
     inFlight = false;
+  }
+}
+
+function resolveTrustedCheckoutPath(owner: string, repo: string, headSha: string): string {
+  const spool = process.env.OVERSEER_REVIEW_SPOOL?.trim() || '/var/lib/overseer-review';
+  const root = process.env.OVERSEER_REVIEW_CHECKOUT_ROOT?.trim() || join(spool, 'checkouts');
+  if (!/^[0-9a-f]{40}$/i.test(headSha)) return '';
+  const safe = (value: string): string => value.replace(/[^A-Za-z0-9_.-]/g, '_');
+  return `${root}/${safe(owner)}/${safe(repo)}/${headSha}`;
+}
+
+async function runCheckoutGit(argv: string[], cwd: string): Promise<string> {
+  const token = process.env.GITHUB_TOKEN?.trim() || process.env.GH_TOKEN?.trim();
+  const env: Record<string, string> = {
+    PATH: process.env.PATH ?? '/usr/bin:/bin',
+    HOME: process.env.HOME ?? '/tmp',
+    GIT_TERMINAL_PROMPT: '0',
+  };
+  if (token) {
+    env.GIT_CONFIG_COUNT = '1';
+    env.GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader';
+    env.GIT_CONFIG_VALUE_0 = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`;
+  }
+  const child = Bun.spawn(argv, { cwd, env, stdout: 'pipe', stderr: 'pipe' });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  if (exitCode !== 0) throw new Error(`review_checkout_git_failed:${stderr.slice(0, 300)}`);
+  return stdout.trim();
+}
+
+/** Materialize an immutable exact-head checkout, with its exact base commit available. */
+export async function prepareReviewCheckout(input: {
+  owner: string;
+  repo: string;
+  prNumber: number;
+  headSha: string;
+  baseRef: string;
+  baseSha: string;
+}): Promise<string> {
+  if (
+    !/^[A-Za-z0-9_.-]+$/.test(input.owner) ||
+    !/^[A-Za-z0-9_.-]+$/.test(input.repo) ||
+    !Number.isSafeInteger(input.prNumber) ||
+    input.prNumber < 1 ||
+    !/^[0-9a-f]{40}$/i.test(input.headSha) ||
+    (input.baseRef !== '' &&
+      (!/^[A-Za-z0-9._/-]+$/.test(input.baseRef) ||
+        input.baseRef.startsWith('-') ||
+        input.baseRef.includes('..')))
+  ) {
+    throw new Error('review_checkout_identity_invalid');
+  }
+  const checkout = resolveTrustedCheckoutPath(input.owner, input.repo, input.headSha);
+  if (!checkout) throw new Error('review_checkout_root_unconfigured');
+  try {
+    if ((await runCheckoutGit(['git', 'rev-parse', 'HEAD'], checkout)) === input.headSha) {
+      if (input.baseSha)
+        await runCheckoutGit(['git', 'cat-file', '-e', `${input.baseSha}^{commit}`], checkout);
+      return await realpath(checkout);
+    }
+  } catch {
+    // Missing or stale paths are replaced atomically below.
+  }
+  const temporary = `${checkout}.tmp-${randomUUID()}`;
+  if (!/^[0-9a-f]{40}$/i.test(input.baseSha) || !input.baseRef)
+    throw new Error('review_checkout_base_identity_missing');
+  await mkdir(dirname(checkout), { recursive: true, mode: 0o2770 });
+  await rm(temporary, { recursive: true, force: true });
+  try {
+    await mkdir(temporary, { mode: 0o2770 });
+    await runCheckoutGit(['git', 'init', '--quiet'], temporary);
+    const remote = `https://github.com/${input.owner}/${input.repo}.git`;
+    await runCheckoutGit(
+      [
+        'git',
+        'fetch',
+        '--no-tags',
+        remote,
+        `+refs/heads/${input.baseRef}:refs/review/base`,
+        `+refs/pull/${input.prNumber}/head:refs/review/head`,
+      ],
+      temporary
+    );
+    const [head, base] = await Promise.all([
+      runCheckoutGit(['git', 'rev-parse', 'refs/review/head'], temporary),
+      runCheckoutGit(['git', 'rev-parse', 'refs/review/base'], temporary),
+    ]);
+    if (head !== input.headSha || base !== input.baseSha)
+      throw new Error('review_checkout_identity_failure');
+    await runCheckoutGit(['git', 'checkout', '--quiet', '--detach', input.headSha], temporary);
+    await runCheckoutGit(['chmod', '-R', 'g+rwX', temporary], dirname(temporary));
+    await rm(checkout, { recursive: true, force: true });
+    await rename(temporary, checkout);
+    return await realpath(checkout);
+  } catch (error) {
+    await rm(temporary, { recursive: true, force: true });
+    throw error;
   }
 }
 

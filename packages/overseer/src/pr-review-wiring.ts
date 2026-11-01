@@ -15,7 +15,10 @@
  * events when it is not configured. Enabling the App's `pull_request` event
  * subscription remains a separate, external step.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdtemp, realpath, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import * as dispatch from '@archon/core/db/dispatch';
 import { claimOverseerVerdict, finalizeOverseerVerdict } from '@archon/core/db/overseer';
 import { createLogger } from '@archon/paths';
@@ -46,7 +49,12 @@ import {
 } from './pr-review-evaluator';
 import { createJudgeLadderBreaker, recordJudgeRungOutage } from './judge-ladder-health';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
-import type { ReviewerVerdict, SubmitDeps } from './pr-review-submit.ts';
+import type {
+  ReviewExecutionContext,
+  ReviewExecutionProof,
+  ReviewerVerdict,
+  SubmitDeps,
+} from './pr-review-submit.ts';
 import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
 import {
   countPriorRemediationAttempts,
@@ -56,6 +64,7 @@ import {
   REMEDIATION_SENDER,
 } from './remediation-candidate';
 import type { RemediationEmitResult } from './remediation-candidate';
+import { submitReviewerBrokerJob } from './reviewer-broker-client';
 
 /** Env var carrying the shared GitHub webhook secret for the review route. */
 export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
@@ -127,6 +136,236 @@ export async function maybeRecordReviewApprovalVerdict(
 
 export const REVIEW_RECIPIENT = 'overseer-reviewer';
 
+const NATIVE_EXECUTION_INCOMPLETE_SUMMARY =
+  'Native sandbox inspection or declared checks did not complete.';
+
+/** Git config that disables external diff helpers and fsmonitor hooks. */
+const GIT_CONFIG_ARGS = ['-c', 'diff.external=', '-c', 'core.fsmonitor=false'] as const;
+
+/**
+ * Explicit environment for repository-controlled git, inspection, and checks.
+ * PATH is the only inherited value. Credentials in the parent environment are
+ * not forwarded. Model authentication stays on the trusted judge spawn path.
+ */
+interface UntrustedExecutionEnv {
+  PATH: string;
+  HOME: string;
+  CODEX_HOME: string;
+  TMPDIR: string;
+}
+
+interface CheckoutFingerprint {
+  headSha: string;
+  treeSha: string;
+  cwd: string;
+}
+
+function commandOutputEmpty(output: string): boolean {
+  return output.trim().length === 0;
+}
+
+async function spawnCaptured(
+  argv: readonly string[],
+  cwd: string,
+  env: UntrustedExecutionEnv
+): Promise<{ exitCode: number; output: string }> {
+  const child = Bun.spawn(['setsid', '--', ...argv], {
+    cwd,
+    env: {
+      PATH: env.PATH,
+      HOME: env.HOME,
+      CODEX_HOME: env.CODEX_HOME,
+      TMPDIR: env.TMPDIR,
+    },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const cap = 128 * 1024;
+  let retained = '';
+  const consume = async (stream: ReadableStream<Uint8Array> | null): Promise<void> => {
+    if (!stream) return;
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (retained.length < cap)
+          retained += decoder.decode(value, { stream: true }).slice(0, cap - retained.length);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  };
+  const output = Promise.all([consume(child.stdout), consume(child.stderr)]);
+  let timer: Timer | undefined;
+  const timeout = new Promise<number>(resolve => {
+    timer = setTimeout(() => {
+      try {
+        process.kill(-child.pid, 'SIGTERM');
+      } catch {
+        child.kill('SIGTERM');
+      }
+      setTimeout(() => {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+        } catch {
+          child.kill('SIGKILL');
+        }
+      }, 250).unref?.();
+      resolve(124);
+    }, 30_000);
+  });
+  const completed = (async (): Promise<number> => {
+    const code = await child.exited;
+    await output;
+    return code;
+  })();
+  const exitCode = await Promise.race([completed, timeout]);
+  if (timer) clearTimeout(timer);
+  if (exitCode === 124) await Promise.race([output, Bun.sleep(1_000)]);
+  return { exitCode, output: retained };
+}
+
+async function withUntrustedScratch<T>(
+  run: (env: UntrustedExecutionEnv) => Promise<T>
+): Promise<T | undefined> {
+  const pathValue = process.env.PATH;
+  if (!pathValue) return undefined;
+  const scratch = await mkdtemp(join(tmpdir(), 'overseer-review-state-'));
+  try {
+    return await run({
+      PATH: pathValue,
+      HOME: scratch,
+      CODEX_HOME: scratch,
+      TMPDIR: scratch,
+    });
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Commit identity plus a real cleanliness check. HEAD and HEAD^{tree} alone do
+ * not detect tracked edits or untracked files, so both are required.
+ */
+async function readCheckoutFingerprint(
+  checkoutPath: string,
+  expectedHeadSha: string,
+  env: UntrustedExecutionEnv
+): Promise<CheckoutFingerprint | undefined> {
+  let cwd: string;
+  try {
+    cwd = await realpath(checkoutPath);
+  } catch {
+    return undefined;
+  }
+  const git = (args: readonly string[]): Promise<{ exitCode: number; output: string }> =>
+    spawnCaptured(['git', ...GIT_CONFIG_ARGS, ...args], cwd, env);
+
+  const head = await git(['rev-parse', 'HEAD']);
+  if (head.exitCode !== 0 || head.output.trim() !== expectedHeadSha) return undefined;
+
+  const top = await git(['rev-parse', '--show-toplevel']);
+  if (top.exitCode !== 0) return undefined;
+  let topReal: string;
+  try {
+    topReal = await realpath(top.output.trim());
+  } catch {
+    return undefined;
+  }
+  if (topReal !== cwd) return undefined;
+
+  const unstaged = await git(['diff', '--quiet', 'HEAD']);
+  if (unstaged.exitCode !== 0) return undefined;
+  const staged = await git(['diff', '--cached', '--quiet']);
+  if (staged.exitCode !== 0) return undefined;
+
+  const status = await git([
+    'status',
+    '--porcelain=v1',
+    '--untracked-files=all',
+    '--ignored=matching',
+  ]);
+  if (status.exitCode !== 0 || !commandOutputEmpty(status.output)) return undefined;
+
+  const others = await git(['ls-files', '--others', '-z']);
+  if (others.exitCode !== 0 || !commandOutputEmpty(others.output)) return undefined;
+
+  const tree = await git(['rev-parse', 'HEAD^{tree}']);
+  if (tree.exitCode !== 0 || tree.output.trim().length === 0) return undefined;
+  return { headSha: head.output.trim(), treeSha: tree.output.trim(), cwd };
+}
+
+/** Server-observed native execution. No model field can manufacture this proof. */
+export async function observeReviewExecution(
+  context: ReviewExecutionContext
+): Promise<ReviewExecutionProof | undefined> {
+  if (process.platform !== 'linux' || !context.checkoutPath || context.checkPlan.length === 0)
+    return undefined;
+  const startedAt = new Date().toISOString();
+  try {
+    return await withUntrustedScratch(async env => {
+      const before = await readCheckoutFingerprint(context.checkoutPath, context.headSha, env);
+      if (!before) return undefined;
+      // A real repository read inside the same native boundary is the supervisor
+      // inspection event. It catches a reviewer that only received a supplied diff.
+      const inspection = await submitReviewerBrokerJob({
+        checkout: before.cwd,
+        expectedHead: context.headSha,
+        argv: ['git', ...GIT_CONFIG_ARGS, 'show', '--stat', '--oneline', context.headSha],
+      });
+      if (!inspection.ok || inspection.stdout.trim().length === 0) return undefined;
+      const checks: ReviewExecutionProof['checks'][number][] = [];
+      for (const argv of context.checkPlan) {
+        if (argv.length === 0 || argv.some(value => !value || value.includes('\0')))
+          return undefined;
+        const checkStarted = new Date().toISOString();
+        const result = await submitReviewerBrokerJob({
+          checkout: before.cwd,
+          expectedHead: context.headSha,
+          argv,
+        });
+        const checkEnded = new Date().toISOString();
+        checks.push({
+          argv: [...argv],
+          cwd: before.cwd,
+          exitCode: result.exitCode,
+          outputDigest: `sha256:${createHash('sha256').update(`${result.stdout}\n${result.stderr}`).digest('hex')}`,
+          startedAt: checkStarted,
+          endedAt: checkEnded,
+        });
+        if (!result.ok || result.outputTruncated || result.timedOut) return undefined;
+        const after = await readCheckoutFingerprint(context.checkoutPath, context.headSha, env);
+        if (
+          after?.headSha !== before.headSha ||
+          after?.treeSha !== before.treeSha ||
+          after?.cwd !== before.cwd
+        ) {
+          return undefined;
+        }
+      }
+      return {
+        requestId: context.requestId,
+        headSha: before.headSha,
+        treeSha: before.treeSha,
+        cwd: before.cwd,
+        nativePolicy: 'codex_legacy_landlock',
+        nativeVersion: '0.153.3',
+        runtimeUid: inspection.uid,
+        inspectionObserved: true,
+        checks,
+        startedAt,
+        endedAt: new Date().toISOString(),
+      };
+    });
+  } catch {
+    // Broker absence, malformed responses, and broker deadlines are all the
+    // same fail-closed execution-unavailable state at this boundary.
+    return undefined;
+  }
+}
+
 export interface ReviewRouteConfig {
   webhookSecret: string;
   reviewerIdentity: string;
@@ -167,6 +406,7 @@ export interface ReviewWorkBody {
   prNumber: number;
   headSha: string;
   baseRef: string;
+  baseSha?: string;
   author: string;
   headCiGreen: boolean;
 }
@@ -188,6 +428,7 @@ export function parseReviewWorkBody(body: string): ReviewWorkBody | null {
       prNumber: value.prNumber,
       headSha: value.headSha,
       baseRef: typeof value.baseRef === 'string' ? value.baseRef : '',
+      baseSha: typeof value.baseSha === 'string' ? value.baseSha : '',
       author: typeof value.author === 'string' ? value.author : '',
       headCiGreen: value.headCiGreen === true,
     };
@@ -774,6 +1015,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
         prNumber: input.prNumber,
         headSha: input.headSha,
         baseRef: input.baseRef,
+        baseSha: input.baseSha ?? '',
         author: input.author,
         headCiGreen: input.headCiGreen,
       };
@@ -927,6 +1169,16 @@ export function createRealSubmitDeps(
   return {
     reviewerIdentity,
     async runReviewer(work): Promise<ReviewerVerdict> {
+      const executionProof = work.executionContext
+        ? await observeReviewExecution(work.executionContext)
+        : undefined;
+      if (work.executionContext && !executionProof) {
+        return {
+          approved: false,
+          summary: NATIVE_EXECUTION_INCOMPLETE_SUMMARY,
+          reviewedHeadSha: work.headSha,
+        };
+      }
       const result = await runEvaluation(
         {
           owner: work.owner,
@@ -947,11 +1199,35 @@ export function createRealSubmitDeps(
           // Missing criteria is an explicit, recorded degrade path.
           fetchAcceptanceCriteria: async () => null,
           invokeModel: overrides.invokeModel ?? invokeConfiguredReviewModel,
+          ...(work.executionContext
+            ? {
+                executionContext: {
+                  kind: 'pr-review' as const,
+                  cwd: work.executionContext.checkoutPath,
+                  expectedHeadSha: work.executionContext.headSha,
+                  nativePolicy: 'codex_legacy_landlock' as const,
+                },
+              }
+            : {}),
           // #847: every rung refusal (quota, credits, auth) and every clean
           // exit is recorded so ingest can stop spawning a dead ladder.
           recordRungOutage: recordJudgeRungOutage,
         }
       );
+      if (work.executionContext) {
+        const checkoutPath = work.executionContext.checkoutPath;
+        const expectedHead = work.executionContext.headSha;
+        const stillQualified = await withUntrustedScratch(env =>
+          readCheckoutFingerprint(checkoutPath, expectedHead, env)
+        );
+        if (!stillQualified) {
+          return {
+            approved: false,
+            summary: NATIVE_EXECUTION_INCOMPLETE_SUMMARY,
+            reviewedHeadSha: work.headSha,
+          };
+        }
+      }
       // CHECKS_PENDING is a non-terminal defer, NOT a verdict. Surface it as a
       // distinct signal so the submit path can release-and-retry rather than
       // fall through to the summary/`approved` mapping below, which would
@@ -1002,6 +1278,13 @@ export function createRealSubmitDeps(
       // INDETERMINATE summary below. The retry delay travels with it so the
       // worker requeues instead of spinning.
       if (result.verdict === 'TRANSPORT_ERROR') {
+        if (work.executionContext) {
+          return {
+            approved: false,
+            summary: NATIVE_EXECUTION_INCOMPLETE_SUMMARY,
+            reviewedHeadSha: work.headSha,
+          };
+        }
         const reasonCode = reviewErrorCode(result.error);
         return {
           approved: false,
@@ -1036,6 +1319,7 @@ export function createRealSubmitDeps(
         // summary string has already lost that.
         findings: result.findings,
         ...(indeterminateCode ? { reasonCode: indeterminateCode } : {}),
+        ...(executionProof ? { executionProof } : {}),
       };
     },
     submitReview: createRealSubmitPullRequestReview(octokit),
@@ -1047,30 +1331,42 @@ export function createRealSubmitDeps(
       });
       return pr.data.head.sha;
     },
+    async hasCustody(context): Promise<boolean> {
+      const message = await dispatch.renewMessageLease({
+        id: context.requestId,
+        worker_id: context.workerId,
+        fencing_token: context.fencingToken,
+      });
+      return message !== null;
+    },
+    async recordExecutionProof({ work, proof }): Promise<void> {
+      await (overrides.createReceiptMessage ?? dispatch.createAuthenticatedMessage)(
+        { kind: 'system', sender: REVIEW_SENDER },
+        {
+          correlation_id: work.correlationId,
+          idempotency_key: `pr-review-execution-proof:${work.messageId}:${work.headSha}`,
+          task_type: 'run_report',
+          recipient: 'operator',
+          subject_key: reviewSubjectKey(work.owner, work.repo, work.prNumber),
+          repeat_reason: `review_execution_proof:${work.messageId}`,
+          body: JSON.stringify({
+            kind: 'pr_review_execution_proof',
+            messageId: work.messageId,
+            owner: work.owner,
+            repo: work.repo,
+            prNumber: work.prNumber,
+            headSha: work.headSha,
+            proof,
+          }),
+        }
+      );
+    },
     async recordReceipt(input): Promise<void> {
       // This receipt IS the escalation path: every terminal disposition lands
       // in the operator dispatch inbox, which XO drains at session start. #775
       // additionally logs at error level and marks the body `needsOperator` so
       // a blocked-for-permissions PR is not just one more receipt in the list.
       const blocked = input.disposition === 'blocked_required_contexts_unavailable';
-      await maybeRecordReviewApprovalVerdict(
-        { ...input, model: modelReviewer.model },
-        {
-          record: overrides.recordApprovalVerdict,
-          onError: error => {
-            log.error(
-              {
-                error,
-                owner: input.owner,
-                repo: input.repo,
-                prNumber: input.prNumber,
-                headSha: input.headSha,
-              },
-              'overseer.pr_review.verdict_record_failed'
-            );
-          },
-        }
-      );
       if (blocked) {
         log.error(
           {
@@ -1097,6 +1393,26 @@ export function createRealSubmitDeps(
             ...input,
             ...(blocked ? { needsOperator: true } : {}),
           }),
+        }
+      );
+      // Merge-ready state is last: both execution proof and the actual GitHub
+      // response identity are durable in receipts before this can run.
+      await maybeRecordReviewApprovalVerdict(
+        { ...input, model: modelReviewer.model },
+        {
+          record: overrides.recordApprovalVerdict,
+          onError: error => {
+            log.error(
+              {
+                error,
+                owner: input.owner,
+                repo: input.repo,
+                prNumber: input.prNumber,
+                headSha: input.headSha,
+              },
+              'overseer.pr_review.verdict_record_failed'
+            );
+          },
         }
       );
     },

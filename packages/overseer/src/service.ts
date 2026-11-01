@@ -429,6 +429,12 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
       ((): Promise<void> =>
         runMergeExecutionBridgeOnce({
           github: deps,
+          ...(deps.hasQualifiedReview
+            ? {
+                hasQualifiedReview: (input): Promise<boolean> =>
+                  deps.hasQualifiedReview?.(input) ?? Promise.resolve(false),
+              }
+            : {}),
           store: {
             listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
             claimVerdict: claimVerdictForMergeExecution,

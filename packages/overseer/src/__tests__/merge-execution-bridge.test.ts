@@ -3,7 +3,8 @@ import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overs
 import { rootLogger } from '@archon/paths';
 import {
   buildCeScopeCompareAdapter,
-  runMergeExecutionBridgeOnce,
+  runMergeExecutionBridgeOnce as runMergeExecutionBridgeOnceProduction,
+  type MergeExecutionBridgeOptions,
   type MergeExecutionBridgeStore,
 } from '../merge-execution-bridge';
 import { parseMergeRepoPolicy } from '../merge-repo-policy';
@@ -12,6 +13,12 @@ import type {
   GitHubPullRequestSearchInput,
   PullRequestEvidence,
 } from '../types.ts';
+
+const runMergeExecutionBridgeOnce = (options: MergeExecutionBridgeOptions): Promise<void> =>
+  runMergeExecutionBridgeOnceProduction({
+    hasQualifiedReview: async () => true,
+    ...options,
+  });
 
 const verdict = (id: string, head = 'judged-sha'): OverseerVerdictRow =>
   ({
@@ -179,6 +186,17 @@ afterEach(() => {
 });
 
 describe('merge execution bridge', () => {
+  test('fails closed when exact-head review qualification is not wired', async () => {
+    const h = harness([verdict('qualification-missing')]);
+    await runMergeExecutionBridgeOnceProduction({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('review_execution_unqualified');
+  });
+
   test('production CE compare adapter accepts 150 page-one files as complete', async () => {
     const compareCommits = mock(async () => ({
       data: {
