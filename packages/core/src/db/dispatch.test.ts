@@ -51,6 +51,7 @@ import {
   releaseDispatchEscalationClaim,
   releaseMessage,
   renewMessageLease,
+  requeueExpiredClaims,
   resolveDispatchRecipient,
   assessDispatchRecipient,
   normalizeDispatchSubjectKey,
@@ -1895,6 +1896,204 @@ describe('dispatch db', () => {
       result_body: 'late',
     });
     expect(staleResult).toBeNull();
+  });
+
+  async function claimedRunReview(key: string, workerId: string): Promise<DispatchMessage> {
+    await registerWorker({
+      worker_id: workerId,
+      host: `${workerId}-host`,
+      capabilities: {},
+      max_concurrency: 1,
+    });
+    const message = await createAuthenticatedMessage(
+      { kind: 'system', sender: 'overseer' },
+      {
+        correlation_id: `corr-${key}`,
+        idempotency_key: `idem-${key}`,
+        task_type: 'run_review',
+        recipient: 'overseer-reviewer',
+        body: JSON.stringify({
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          prNumber: 983,
+          headSha: 'a'.repeat(40),
+          baseRef: 'dev',
+          author: 'fixture',
+        }),
+      }
+    );
+    const claimed = await claimMessage({ id: message.id, worker_id: workerId });
+    if (!claimed) throw new Error(`seed claim failed for ${key}`);
+    return claimed;
+  }
+
+  function inspectedLease(message: DispatchMessage): {
+    status: DispatchMessage['status'];
+    lease_owner: string | null;
+    lease_expires_at: string | null;
+    fencing_token: number;
+    route_disposition: DispatchMessage['route_disposition'];
+    claimed_at: string | null;
+    not_before: string | null;
+    body: string;
+    result_body: string | null;
+  } {
+    return {
+      status: message.status,
+      lease_owner: message.lease_owner,
+      lease_expires_at: message.lease_expires_at,
+      fencing_token: message.fencing_token,
+      route_disposition: message.route_disposition,
+      claimed_at: message.claimed_at,
+      not_before: message.not_before,
+      body: message.body,
+      result_body: message.result_body,
+    };
+  }
+
+  test('expired claim is requeued', async () => {
+    const now = new Date('2026-11-01T18:00:00.000Z');
+    const past = new Date(now.getTime() - 10 * 60 * 1000).toISOString();
+    const claimed = await claimedRunReview('requeue-expired', 'worker-a');
+    await db.query('UPDATE agent_dispatch_messages SET lease_expires_at = $1 WHERE id = $2', [
+      past,
+      claimed.id,
+    ]);
+
+    const ids = await requeueExpiredClaims(now.toISOString());
+    const row = await getMessage(claimed.id);
+
+    expect(ids).toContain(claimed.id);
+    expect(row?.status).toBe('queued');
+    expect(row?.lease_owner).toBeNull();
+    expect(row?.lease_expires_at).toBeNull();
+    expect(row?.fencing_token).toBe(claimed.fencing_token);
+  });
+
+  test('live leases and terminal rows are not requeued', async () => {
+    const now = new Date('2026-11-01T18:00:00.000Z');
+    const past = new Date(now.getTime() - 10 * 60 * 1000).toISOString();
+    const future = new Date(now.getTime() + 5 * 60 * 1000).toISOString();
+    const live = await claimedRunReview('requeue-live', 'worker-a');
+    await db.query('UPDATE agent_dispatch_messages SET lease_expires_at = $1 WHERE id = $2', [
+      future,
+      live.id,
+    ]);
+
+    const doneClaim = await claimedRunReview('requeue-done', 'worker-a');
+    const done = await postResult({
+      id: doneClaim.id,
+      worker_id: 'worker-a',
+      fencing_token: doneClaim.fencing_token,
+      result_body: 'done',
+      status: 'done',
+    });
+    if (!done) throw new Error('done post failed');
+    await db.query('UPDATE agent_dispatch_messages SET lease_expires_at = $1 WHERE id = $2', [
+      past,
+      done.id,
+    ]);
+
+    const failedClaim = await claimedRunReview('requeue-failed', 'worker-a');
+    const failed = await postResult({
+      id: failedClaim.id,
+      worker_id: 'worker-a',
+      fencing_token: failedClaim.fencing_token,
+      result_body: 'failed',
+      status: 'failed',
+    });
+    if (!failed) throw new Error('failed post failed');
+    await db.query('UPDATE agent_dispatch_messages SET lease_expires_at = $1 WHERE id = $2', [
+      past,
+      failed.id,
+    ]);
+
+    const cancelledClaim = await claimedRunReview('requeue-cancelled', 'worker-a');
+    const cancelled = await cancelMessage({ id: cancelledClaim.id, sender: cancelledClaim.sender });
+    expect(cancelled.ok).toBe(true);
+    await db.query(
+      `UPDATE agent_dispatch_messages
+       SET lease_expires_at = $1, lease_owner = $2, route_disposition = 'superseded'
+       WHERE id = $3`,
+      [past, 'worker-a', cancelledClaim.id]
+    );
+
+    const before = {
+      live: inspectedLease((await getMessage(live.id)) as DispatchMessage),
+      done: inspectedLease((await getMessage(done.id)) as DispatchMessage),
+      failed: inspectedLease((await getMessage(failed.id)) as DispatchMessage),
+      cancelled: inspectedLease((await getMessage(cancelledClaim.id)) as DispatchMessage),
+    };
+    expect(before.live.status).toBe('claimed');
+    expect(before.live.lease_expires_at).toBe(future);
+    expect(before.done.status).toBe('done');
+    expect(before.failed.status).toBe('failed');
+    expect(before.cancelled.status).toBe('cancelled');
+    expect(before.cancelled.route_disposition).toBe('superseded');
+
+    expect(await requeueExpiredClaims(now.toISOString())).toEqual([]);
+
+    expect(inspectedLease((await getMessage(live.id)) as DispatchMessage)).toEqual(before.live);
+    expect(inspectedLease((await getMessage(done.id)) as DispatchMessage)).toEqual(before.done);
+    expect(inspectedLease((await getMessage(failed.id)) as DispatchMessage)).toEqual(before.failed);
+    expect(inspectedLease((await getMessage(cancelledClaim.id)) as DispatchMessage)).toEqual(
+      before.cancelled
+    );
+  });
+
+  test('dead holder cannot complete after requeue', async () => {
+    const now = new Date('2026-11-01T18:00:00.000Z');
+    const past = new Date(now.getTime() - 10 * 60 * 1000).toISOString();
+    const claimed = await claimedRunReview('requeue-fence', 'worker-a');
+    await registerWorker({
+      worker_id: 'worker-b',
+      host: 'worker-b-host',
+      capabilities: {},
+      max_concurrency: 1,
+    });
+    await db.query('UPDATE agent_dispatch_messages SET lease_expires_at = $1 WHERE id = $2', [
+      past,
+      claimed.id,
+    ]);
+
+    const ids = await requeueExpiredClaims(now.toISOString());
+    expect(ids).toContain(claimed.id);
+    const requeued = await getMessage(claimed.id);
+    expect(requeued?.fencing_token).toBe(claimed.fencing_token);
+    expect(requeued?.status).toBe('queued');
+
+    const reclaim = await claimMessage({ id: claimed.id, worker_id: 'worker-b' });
+    expect(reclaim?.fencing_token).toBe(claimed.fencing_token + 1);
+
+    const rejected = await postResult({
+      id: claimed.id,
+      worker_id: 'worker-a',
+      fencing_token: claimed.fencing_token,
+      result_body: 'late from worker A',
+    });
+    expect(rejected).toBeNull();
+
+    const completed = await postResult({
+      id: claimed.id,
+      worker_id: 'worker-b',
+      fencing_token: reclaim?.fencing_token ?? 0,
+      result_body: 'completed by worker B',
+    });
+    expect(completed?.status).toBe('done');
+    expect(completed?.result_body).toBe('completed by worker B');
+
+    const finals = await db.query<{ id: string; result_body: string | null }>(
+      `SELECT id, result_body FROM agent_dispatch_messages
+       WHERE id = $1 AND status = 'done' AND completed_at IS NOT NULL`,
+      [claimed.id]
+    );
+    expect(finals.rowCount).toBe(1);
+    expect(finals.rows[0]?.result_body).toBe('completed by worker B');
+    expect(await getMessage(claimed.id)).toMatchObject({
+      status: 'done',
+      result_body: 'completed by worker B',
+      fencing_token: claimed.fencing_token + 1,
+    });
   });
 
   test('renewMessageLease keeps a long run claimed past its original lease', async () => {

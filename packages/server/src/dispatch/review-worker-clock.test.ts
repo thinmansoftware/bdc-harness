@@ -111,6 +111,7 @@ function fakeDeps(
     // calls the deferral by its WO name. It delegates to releaseMessage, so the
     // fencing guards asserted below are unchanged.
     deferMessage: mock(async () => null),
+    requeueExpiredClaims: mock(async () => []),
     runAndSubmitReview: mock(async work => outcomeFor(work.messageId)),
     createSubmitDeps: mock(() => ({ reviewerIdentity: CONFIG.reviewerIdentity }) as SubmitDeps),
   };
@@ -470,6 +471,7 @@ describe('invalid review work against isolated real SQLite', () => {
             registerWorker: dispatch.registerWorker, heartbeatWorker: dispatch.heartbeatWorker,
             listMessages: dispatch.listMessages, claimMessage: dispatch.claimMessage,
             releaseMessage: dispatch.releaseMessage, deferMessage: dispatch.deferMessage,
+            requeueExpiredClaims: dispatch.requeueExpiredClaims,
             postResult: async input => {
               if (${conflict} && input.id === bad.id) {
                 await db.query('UPDATE agent_dispatch_messages SET fencing_token = fencing_token + 1 WHERE id = $1', [bad.id]);
@@ -523,4 +525,175 @@ describe('invalid review work against isolated real SQLite', () => {
       }
     }, 60_000);
   }
+});
+
+function runExpiredClaimProbe(script: string): { stdout: string; stderr: string } {
+  const home = mkdtempSync(join(tmpdir(), 'review-requeue-'));
+  const url = (path: string): string =>
+    JSON.stringify(pathToFileURL(resolve(import.meta.dir, path)).href);
+  const source = script
+    .replaceAll('__DISPATCH_URL__', url('../../../core/src/db/dispatch.ts'))
+    .replaceAll('__CONNECTION_URL__', url('../../../core/src/db/connection.ts'))
+    .replaceAll('__CLOCK_URL__', url('./review-worker-clock.ts'));
+  try {
+    writeFileSync(join(home, 'probe.ts'), source);
+    const env: NodeJS.ProcessEnv = { ...process.env, ARCHON_HOME: home, LOG_LEVEL: 'info' };
+    delete env.DATABASE_URL;
+    const proc = Bun.spawnSync([process.execPath, 'run', join(home, 'probe.ts')], {
+      env,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 45_000,
+    });
+    const stdout = proc.stdout.toString();
+    const stderr = proc.stderr.toString();
+    if (proc.exitCode !== 0) {
+      throw new Error(`SQLite probe exited ${proc.exitCode}: ${stderr} ${stdout}`);
+    }
+    return { stdout, stderr };
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+const EXPIRED_CLAIM_PROBE_PREAMBLE = `
+  const dispatch = await import(__DISPATCH_URL__);
+  const { getDatabase, closeDatabase } = await import(__CONNECTION_URL__);
+  const clock = await import(__CLOCK_URL__);
+  const config = { webhookSecret: 'fixture', reviewerIdentity: 'fixture-reviewer' };
+  const reviewBody = {
+    owner: 'thinmansoftware',
+    repo: 'bdc-harness',
+    prNumber: 983,
+    headSha: 'a'.repeat(40),
+    baseRef: 'dev',
+    author: 'fixture',
+  };
+  async function seedExpiredClaim() {
+    const db = getDatabase();
+    if (db.dialect !== 'sqlite') throw new Error('isolated_sqlite_required');
+    const message = await dispatch.createAuthenticatedMessage(
+      { kind: 'system', sender: 'overseer' },
+      {
+        correlation_id: 'expired-review',
+        idempotency_key: 'expired-review',
+        task_type: 'run_review',
+        recipient: 'overseer-reviewer',
+        body: JSON.stringify(reviewBody),
+      }
+    );
+    await dispatch.registerWorker({
+      worker_id: 'worker-a',
+      host: 'host-a',
+      capabilities: {},
+      max_concurrency: 1,
+    });
+    const claim = await dispatch.claimMessage({ id: message.id, worker_id: 'worker-a' });
+    if (!claim) throw new Error('seed_claim_failed');
+    const past = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    await db.query('UPDATE agent_dispatch_messages SET lease_expires_at = $1 WHERE id = $2', [past, message.id]);
+    return message;
+  }
+  function reviewDeps(reviews) {
+    return {
+      registerWorker: dispatch.registerWorker,
+      heartbeatWorker: dispatch.heartbeatWorker,
+      listMessages: dispatch.listMessages,
+      claimMessage: dispatch.claimMessage,
+      releaseMessage: dispatch.releaseMessage,
+      deferMessage: dispatch.deferMessage,
+      requeueExpiredClaims: dispatch.requeueExpiredClaims,
+      postResult: dispatch.postResult,
+      runAndSubmitReview: async () => {
+        reviews.count += 1;
+        return { disposition: 'approved' };
+      },
+      createSubmitDeps: () => ({ reviewerIdentity: 'fixture-reviewer' }),
+    };
+  }
+`;
+
+describe('expired dispatch claim redelivery', () => {
+  test('boot sweep runs before the review worker tick', () => {
+    const script = `
+      ${EXPIRED_CLAIM_PROBE_PREAMBLE}
+      const reviews = { count: 0 };
+      let queuedBeforeTick = false;
+      try {
+        const message = await seedExpiredClaim();
+        let tickPromise = Promise.resolve();
+        await clock.bootInProcessDispatchClocks({
+          now: new Date().toISOString(),
+          reviewConfig: config,
+          requeueExpiredClaims: dispatch.requeueExpiredClaims,
+          startReviewWorkerClock: () => {
+            tickPromise = (async () => {
+              const row = await dispatch.getMessage(message.id);
+              queuedBeforeTick = row?.status === 'queued' && row.lease_owner === null && row.lease_expires_at === null;
+              await clock.tickReviewWorkerClock(config, reviewDeps(reviews));
+            })();
+          },
+          startDutyOfficerClock: () => {},
+        });
+        await tickPromise;
+        const finalMessage = await dispatch.getMessage(message.id);
+        console.log('PROBE=' + JSON.stringify({
+          reviews: reviews.count,
+          queuedBeforeTick,
+          status: finalMessage?.status,
+        }));
+      } finally {
+        await closeDatabase();
+      }
+    `;
+    const output = runExpiredClaimProbe(script);
+    const combined = `${output.stdout}\n${output.stderr}`;
+    const logged = combined.split('\n').some(line => {
+      if (!line.includes('dispatch.expired_claims_requeued')) return false;
+      try {
+        const parsed = JSON.parse(line) as { msg?: string; count?: number };
+        return parsed.msg === 'dispatch.expired_claims_requeued' && parsed.count === 1;
+      } catch {
+        return line.includes('"count":1');
+      }
+    });
+    expect(logged).toBe(true);
+    const line = output.stdout.split('\n').find(entry => entry.startsWith('PROBE='));
+    if (!line) throw new Error(`missing probe output: ${combined}`);
+    const result = JSON.parse(line.slice(6)) as {
+      reviews: number;
+      queuedBeforeTick: boolean;
+      status: string;
+    };
+    expect(result.queuedBeforeTick).toBe(true);
+    expect(result.reviews).toBe(1);
+    expect(result.status).toBe('done');
+  }, 60_000);
+
+  test('review worker redelivers an expired claim exactly once', () => {
+    const script = `
+      ${EXPIRED_CLAIM_PROBE_PREAMBLE}
+      const reviews = { count: 0 };
+      try {
+        const message = await seedExpiredClaim();
+        const deps = reviewDeps(reviews);
+        await clock.tickReviewWorkerClock(config, deps);
+        await clock.tickReviewWorkerClock(config, deps);
+        const finalMessage = await dispatch.getMessage(message.id);
+        console.log('PROBE=' + JSON.stringify({
+          reviews: reviews.count,
+          status: finalMessage?.status,
+          result: finalMessage?.result_body,
+        }));
+      } finally {
+        await closeDatabase();
+      }
+    `;
+    const output = runExpiredClaimProbe(script);
+    const line = output.stdout.split('\n').find(entry => entry.startsWith('PROBE='));
+    if (!line) throw new Error(`missing probe output: ${output.stderr} ${output.stdout}`);
+    const result = JSON.parse(line.slice(6)) as { reviews: number; status: string };
+    expect(result.reviews).toBe(1);
+    expect(result.status).toBe('done');
+  }, 60_000);
 });
