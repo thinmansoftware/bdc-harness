@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test';
 import { utcCompact } from './constants';
 import type { CompanionSendInput, DispatchClient } from './dispatch-client';
 import {
+  createSessionAdmissions,
   evictLeastRecentIfAtCap,
   sweepIdleSessions,
   touchSession,
@@ -83,6 +84,80 @@ describe('companion session limits', () => {
     expect(sessions.has('B')).toBe(true);
     expect(sessions.has('C')).toBe(true);
     expect(sessions.size).toBe(2);
+  });
+
+  test('concurrent initialization reserves before cleanup', async () => {
+    class PeakMap extends Map<string, SessionRecord> {
+      peak = 0;
+      override set(key: string, value: SessionRecord): this {
+        const out = super.set(key, value);
+        if (this.size > this.peak) {
+          this.peak = this.size;
+        }
+        return out;
+      }
+    }
+
+    const sessions = new PeakMap();
+    const maxSessions = 2;
+    const admitSession = createSessionAdmissions(sessions, maxSessions);
+    let releaseClose = (): void => {
+      return undefined;
+    };
+    const closeGate = new Promise<void>(resolve => {
+      releaseClose = resolve;
+    });
+    let closeEntered = 0;
+
+    const blocking = (id: string, nowMs: number): SessionRecord => {
+      const transport = {
+        close: async (): Promise<void> => {
+          closeEntered += 1;
+          await closeGate;
+        },
+      };
+      const server = {
+        close: async (): Promise<void> => {
+          return undefined;
+        },
+      };
+      return {
+        transport: transport as unknown as StreamableHTTPServerTransport,
+        server: server as unknown as McpServer,
+        companionId: id,
+        lastActivityMs: nowMs,
+      };
+    };
+
+    sessions.set('A', blocking('A', 1));
+    sessions.set('B', blocking('B', 2));
+
+    const pendingC = admitSession('C', blocking('C', 3));
+    const pendingD = admitSession('D', blocking('D', 4));
+
+    for (let i = 0; i < 20 && closeEntered < 1; i += 1) {
+      await Promise.resolve();
+    }
+    expect(closeEntered).toBe(1);
+    for (let i = 0; i < 20; i += 1) {
+      await Promise.resolve();
+    }
+
+    expect(sessions.has('C')).toBe(true);
+    expect(sessions.has('D')).toBe(false);
+    expect(sessions.size).toBe(maxSessions);
+    expect(sessions.peak).toBeLessThanOrEqual(maxSessions);
+
+    releaseClose();
+    await Promise.all([pendingC, pendingD]);
+
+    expect(closeEntered).toBe(2);
+    expect(sessions.size).toBe(maxSessions);
+    expect(sessions.has('A')).toBe(false);
+    expect(sessions.has('B')).toBe(false);
+    expect(sessions.has('C')).toBe(true);
+    expect(sessions.has('D')).toBe(true);
+    expect(sessions.peak).toBeLessThanOrEqual(maxSessions);
   });
 
   test('unique brief correlation IDs', async () => {
