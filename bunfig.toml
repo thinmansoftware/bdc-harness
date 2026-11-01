@@ -1,8 +1,16 @@
 # Bun configuration for Remote Agentic Coding Platform
 
 [test]
-# Only discover tests in packages/ - prevents finding duplicates in workspace/worktrees
-root = "./packages"
+# Substring filters such as `bun test scripts/container` only match files under
+# root. Scan the repo root so that command discovers scripts/container tests.
+# Ignore nested workspace and worktree checkouts so those trees are not scanned
+# for duplicate suites (what root = "./packages" used to prevent).
+root = "."
+pathIgnorePatterns = [
+  "workspace/**",
+  "workspaces/**",
+  "worktrees/**",
+]
 # Run preload script before tests (now in @archon/core)
 preload = ["./packages/core/src/test/setup.ts"]
 # Coverage output
