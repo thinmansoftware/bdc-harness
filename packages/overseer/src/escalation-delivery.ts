@@ -10,6 +10,7 @@ import {
   type OperatorCardView,
 } from '@archon/core/db/overseer-briefing';
 import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
+import { T3_DESKTOP_RECIPIENT } from '@archon/core/db/dispatch-routing';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
 import { buildDispatchRunReportBody } from './escalate';
 import { resolveWoBoardSeatOwner } from './owner-resolution';
@@ -83,7 +84,14 @@ export function createDefaultOperatorCardChannels(
   const dispatch: OperatorCardChannel = {
     channel: 'dispatch',
     deliver: async (card, idempotencyKey) => {
-      const body = buildDispatchRunReportBody(card.card);
+      // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: always deliver to the T3 results
+      // queue; the resolved board-seat owner rides in the body as owner_seat so
+      // the desktop bridge can address it (null when unresolved).
+      const ownerSeat = (await deps.resolve_owner(card.card.wo_id)) ?? null;
+      const body = JSON.stringify({
+        ...(JSON.parse(buildDispatchRunReportBody(card.card)) as Record<string, unknown>),
+        owner_seat: ownerSeat,
+      });
       const assessment = assessDispatchMessageBody('run_report', body);
       if (!assessment.allowed) {
         return {
@@ -98,7 +106,7 @@ export function createDefaultOperatorCardChannels(
           correlation_id: card.card.run_id,
           idempotency_key: idempotencyKey,
           task_type: 'run_report',
-          recipient: (await deps.resolve_owner(card.card.wo_id)) ?? 'operator',
+          recipient: T3_DESKTOP_RECIPIENT,
           body,
         }
       );

@@ -56,7 +56,10 @@ async function withDefaultThreshold<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-function claimStubs(): Pick<CascadeDeps, 'findWoClaim' | 'acquireWoLock' | 'releaseWoLock'> {
+function claimStubs(): Pick<
+  CascadeDeps,
+  'findWoClaim' | 'acquireWoLock' | 'releaseWoLock' | 'readRunDetail'
+> {
   return {
     findWoClaim: async () => null,
     acquireWoLock: async (woId, project, cascadeId) => ({
@@ -70,6 +73,9 @@ function claimStubs(): Pick<CascadeDeps, 'findWoClaim' | 'acquireWoLock' | 'rele
         createdAt: new Date(0).toISOString(),
         updatedAt: new Date(0).toISOString(),
       },
+    }),
+    readRunDetail: async () => ({
+      metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
     }),
     releaseWoLock: async () => {},
   };

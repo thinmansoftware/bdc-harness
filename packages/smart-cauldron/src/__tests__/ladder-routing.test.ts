@@ -163,6 +163,9 @@ describe('cascade entry override and refuse', () => {
         judge: () => makeFailVerdict('validator: needs_revision'),
         escalate: async () => undefined,
         findWoClaim: async () => null,
+        readRunDetail: async () => ({
+          metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        }),
         seatUsage: async () => ({
           claude: {
             limit_source: 'measured',
@@ -218,6 +221,9 @@ describe('cascade entry override and refuse', () => {
         },
         escalate: async () => undefined,
         findWoClaim: async () => null,
+        readRunDetail: async () => ({
+          metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        }),
       };
 
       const record = await runCascade({

@@ -205,3 +205,47 @@ The reader never acknowledges, addresses or cancels; it only machine-disposes IN
 
 Direct receipt operations and cancellation are prohibited. The legacy non-terminal surface
 disposition remains owned by the existing operator consumer and is not produced by this reader.
+
+## Routing since 2026-11-01
+
+WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01. The cut-off is `OPERATOR_HISTORY_CUTOFF` =
+`2026-11-01T00:00:00.000Z` in `packages/core/src/db/dispatch-routing.ts`.
+
+| Recipient | What lands there | Who reads it |
+|---|---|---|
+| `operator` | History only. Rows queued before the cut-off stay as they are. Low-volume senders not moved by this WO (re-review cap claims, judge-ladder blocker notices, model-resource health, Taskmaster deadman, digest and blocker_report) still write here. | Nothing new. The operator inbox consumer skips every row created before the cut-off. |
+| `pr-review-log` | The three PR-review receipt kinds: `pr_review_ingest_receipt`, `pr_review_submit_receipt`, `pr_review_recheck_ingest_receipt`. | The reviewer, for re-review authorization. It reads `pr-review-log` first, then `operator` for pre-cut-off receipts. Nothing drains it. |
+| `t3-desktop` | `overseer_run_report` rows from operator-card delivery (the resolved board-seat owner is in the body as `owner_seat`, null when unresolved) and Taskmaster `escalate_p0`. | The T3 desktop bridge (WO-XO-T3-RESULTS-BRIDGE-01). |
+
+Rules:
+
+- No code path cancels, deletes, acknowledges or addresses an `operator` row created before
+  the cut-off. The consumer compares `created_at` as an instant, so ISO and SQLite
+  `YYYY-MM-DD HH:MM:SS` text both work. A stamp it cannot parse is treated as history.
+- Taskmaster admits `t3-desktop` only for `escalate_p0`, and `escalate_p0` only to
+  `t3-desktop`. Any other pairing is a forbidden effect.
+- Taskmaster escalates a stalled item at most once per 24 hours, whatever the outcome of the
+  last attempt (sent, failed, rejected). A failed attempt records the error text in the
+  journal row's `proposal_json.failure`.
+- Both principals are seeded in `migrations/065_dispatch_t3_desktop_and_pr_review_log.sql`,
+  `migrations/000_combined.sql` and the SQLite adapter seed.
+- `dispatch_receipt_cutover` (2026-09-24) is a different thing. It only decides which
+  acknowledge and address stamps count as trustworthy in mailbox depth. No writer reads it, so
+  it never moved any traffic.
+
+Post-merge acceptance, on the harness host. Record H0 before the rebuild:
+
+```sh
+sqlite3 /opt/bdc/archon-data/archon.db "select count(*) from agent_dispatch_messages where recipient='operator' and created_at < '2026-11-01'"
+```
+
+24 hours after the rebuild:
+
+```sh
+sqlite3 /opt/bdc/archon-data/archon.db "select count(*) from agent_dispatch_messages where recipient='operator' and created_at < '2026-11-01'"
+sqlite3 /opt/bdc/archon-data/archon.db "select count(*) from agent_dispatch_messages where recipient='operator' and json_extract(body,'$.kind') like 'pr_review_%_receipt' and created_at >= datetime('now','-1 day')"
+sqlite3 /opt/bdc/archon-data/archon.db "select count(*), count(distinct thread_ref) from tm_journal where action_type='escalate_p0' and created_at >= datetime('now','-1 day')"
+```
+
+Expected: the first count equals H0, the second is 0, and in the third the two numbers are
+equal and no larger than the number of stalled items.

@@ -999,6 +999,13 @@ export async function listMessages(filters: {
   allowBoardAlias?: boolean;
   subject_key?: string;
   route_disposition?: DispatchRouteDisposition;
+  /**
+   * Lexical lower bound on created_at (WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01).
+   * Pass a DATE prefix such as '2026-11-01': it orders correctly against both
+   * ISO ('2026-11-01T...') and SQLite datetime ('2026-11-01 ...') text, so the
+   * oldest-first queued page is not filled with fenced history rows.
+   */
+  created_at_gte?: string;
 }): Promise<DispatchMessage[]> {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -1033,6 +1040,10 @@ export async function listMessages(filters: {
   if (filters.route_disposition !== undefined) {
     params.push(filters.route_disposition);
     clauses.push(`route_disposition = $${params.length}`);
+  }
+  if (filters.created_at_gte !== undefined) {
+    params.push(filters.created_at_gte);
+    clauses.push(`created_at >= $${params.length}`);
   }
   if (filters.status === 'queued') {
     params.push(nowIso());

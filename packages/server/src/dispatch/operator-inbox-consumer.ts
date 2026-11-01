@@ -19,6 +19,7 @@ import {
   type DispatchMessage,
   type DispatchMailboxResult,
 } from '@archon/core/db/dispatch';
+import { OPERATOR_HISTORY_CUTOFF } from '@archon/core/db/dispatch-routing';
 import { createLogger, getArchonHome } from '@archon/paths';
 
 const log = createLogger('dispatch/operator-inbox-consumer');
@@ -81,6 +82,7 @@ export interface OperatorInboxDeps {
     recipient?: string;
     status?: 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
     limit?: number;
+    created_at_gte?: string;
   }) => Promise<OperatorInboxMessage[]>;
   disposeMessageByMachine?: (data: {
     id: string;
@@ -319,6 +321,22 @@ async function processOne(
  * bad row cannot permanently stop the drain (mirror of the failure mode this
  * WO exists to eliminate).
  */
+/**
+ * WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: true when the row was queued before
+ * the operator history cut-off. Such rows are history -- the consumer never
+ * touches them. Compared as instants (the column may hold ISO or SQLite
+ * 'YYYY-MM-DD HH:MM:SS' text, which is UTC). An unparseable stamp is treated
+ * as history (fail closed: never act on a row we cannot date).
+ */
+export function isPreCutoffOperatorRow(createdAt: string): boolean {
+  const text = /^\d{4}-\d{2}-\d{2} \d/.test(createdAt)
+    ? `${createdAt.replace(' ', 'T')}Z`
+    : createdAt;
+  const ms = Date.parse(text);
+  if (!Number.isFinite(ms)) return true;
+  return ms < Date.parse(OPERATOR_HISTORY_CUTOFF);
+}
+
 export async function drainOperatorInbox(deps: OperatorInboxDeps = {}): Promise<DrainResult> {
   const list =
     deps.listMessages ??
@@ -326,11 +344,13 @@ export async function drainOperatorInbox(deps: OperatorInboxDeps = {}): Promise<
       recipient?: string;
       status?: 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
       limit?: number;
+      created_at_gte?: string;
     }): Promise<OperatorInboxMessage[]> => {
       const rows = await listMessages({
         recipient: filters.recipient,
         status: filters.status,
         limit: filters.limit,
+        created_at_gte: filters.created_at_gte,
       });
       return rows.map(toInboxMessage);
     });
@@ -360,6 +380,9 @@ export async function drainOperatorInbox(deps: OperatorInboxDeps = {}): Promise<
       recipient: OPERATOR_INBOX_PRINCIPAL,
       status: 'queued',
       limit: 500,
+      // Date-prefix bound so the oldest-first page is not filled with fenced
+      // pre-cut-off history; the exact instant check is applied below.
+      created_at_gte: OPERATOR_HISTORY_CUTOFF.slice(0, 10),
     });
   } catch (error) {
     const err = error as Error;
@@ -376,6 +399,8 @@ export async function drainOperatorInbox(deps: OperatorInboxDeps = {}): Promise<
     // Already addressed elsewhere -- listMessages should exclude these, but
     // keep the guard for injected/stale views.
     if (message.addressed_at !== null || message.route_disposition !== null) continue;
+    // Fence: rows queued before the cut-off are history, never touched.
+    if (isPreCutoffOperatorRow(message.created_at)) continue;
 
     try {
       const { classification } = await processOne(message, {

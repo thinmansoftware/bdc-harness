@@ -171,13 +171,13 @@ describe('computeNextAction', () => {
     expect(proposal?.idempotencyKey).toBe('tm:deliver_ruling:ruling-42');
   });
 
-  test('unclaimed P0 escalates to operator immediately', () => {
+  test('unclaimed P0 escalates to t3-desktop immediately', () => {
     const proposal = computeNextAction(thread({ priority: 'P0', isUnclaimedP0: true }), 'ready', {
       interventionsLast24h: 0,
       nowMs: NOW_MS,
     });
     expect(proposal?.type).toBe('escalate_p0');
-    expect(proposal?.recipient).toBe('operator');
+    expect(proposal?.recipient).toBe('t3-desktop');
     expect(proposal?.actsImmediately).toBe(true);
   });
 
@@ -652,7 +652,7 @@ describe('M-155 exception push (rules)', () => {
       nowMs: NOW_MS,
     });
     expect(proposal?.type).toBe('escalate_p0');
-    expect(proposal?.recipient).toBe('operator');
+    expect(proposal?.recipient).toBe('t3-desktop');
     expect(proposal?.actsImmediately).toBe(true);
   });
 

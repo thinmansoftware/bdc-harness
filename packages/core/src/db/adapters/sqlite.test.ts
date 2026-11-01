@@ -177,6 +177,10 @@ describe('SqliteAdapter', () => {
         // alphabetically by principal_id, same as the query's ORDER BY.
         { principal_id: 'overseer-review-route', delivery_mode: 'notify_only', active: 1 },
         { principal_id: 'overseer-reviewer', delivery_mode: 'worker_poll', active: 1 },
+        // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065): PR review
+        // receipt log and the T3 desktop results queue.
+        { principal_id: 'pr-review-log', delivery_mode: 'drain_on_start', active: 1 },
+        { principal_id: 't3-desktop', delivery_mode: 'drain_on_start', active: 1 },
         // WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01
         // (migration 046): recipient of Overseer's remediation candidates.
         { principal_id: 'taskmaster', delivery_mode: 'worker_poll', active: 1 },

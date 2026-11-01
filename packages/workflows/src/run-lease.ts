@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import { hostname } from 'os';
 import { createLogger } from '@archon/paths';
 import type { IWorkflowStore } from './store';
+import { isTeardownConfirmed, isTerminalRunStatus } from './run-teardown';
 
 const DEFAULT_LEASE_DURATION_MS = 60_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 20_000;
@@ -71,7 +72,26 @@ export async function withRunLease<T>(
     return await operation(() => leaseValid);
   } finally {
     clearInterval(timer);
-    if (leaseValid) {
+    // N5 (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01): a terminal run whose teardown is
+    // confirmed releases its lease even when a heartbeat renewal failed; a terminal
+    // run whose teardown is unconfirmed keeps its lease. The release stays
+    // token-matched, so a lease another worker re-claimed is never touched.
+    // Non-terminal runs (paused, interrupted) keep the prior behavior.
+    // When the final run state cannot be established (read failed, row missing,
+    // store without getWorkflowRun) the lease is kept: release requires proof.
+    const finalState = await readFinalRunState(store, runId);
+    let shouldRelease = false;
+    if (finalState === null) {
+      log.warn({ runId, ownerId, leaseValid }, 'run_lease_held_final_state_unknown');
+    } else if (finalState.terminal) {
+      shouldRelease = finalState.teardownConfirmed;
+      if (!finalState.teardownConfirmed) {
+        log.warn({ runId, ownerId, leaseValid }, 'run_lease_held_teardown_unconfirmed');
+      }
+    } else {
+      shouldRelease = leaseValid;
+    }
+    if (shouldRelease) {
       await store
         .releaseRunLease({
           runId,
@@ -83,5 +103,23 @@ export async function withRunLease<T>(
           log.error({ err: error, runId, ownerId }, 'run_lease_release_failed');
         });
     }
+  }
+}
+
+async function readFinalRunState(
+  store: IWorkflowStore,
+  runId: string
+): Promise<{ terminal: boolean; teardownConfirmed: boolean } | null> {
+  if (typeof store.getWorkflowRun !== 'function') return null;
+  try {
+    const run = await store.getWorkflowRun(runId);
+    if (!run) return null;
+    return {
+      terminal: isTerminalRunStatus(run.status),
+      teardownConfirmed: isTeardownConfirmed(run.metadata),
+    };
+  } catch (error) {
+    log.warn({ err: error as Error, runId }, 'run_lease_final_state_read_failed');
+    return null;
   }
 }

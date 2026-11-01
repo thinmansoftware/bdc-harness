@@ -1388,6 +1388,9 @@ export class SqliteAdapter implements IDatabase {
         -- Board/XO seat. drain_on_start (mailbox) like operator/xo -- no worker
         -- ever claims it; the desktop automation reads and addresses it directly.
         ('astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 1),
+        -- WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065 parity)
+        ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', 1),
+        ('pr-review-log', 'PR review receipt log', 'drain_on_start', 1),
         ('operator', 'Operator', 'drain_on_start', 1),
         ('xo', 'XO', 'drain_on_start', 1),
         ('board', 'Board', 'alias_resolved', 1),

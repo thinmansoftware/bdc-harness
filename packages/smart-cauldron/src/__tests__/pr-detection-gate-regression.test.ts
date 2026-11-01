@@ -327,7 +327,12 @@ function baseOpts(deps: CascadeDeps): RunCascadeOptions {
     outDir: '/tmp/smart-cauldron-1502-test-runs',
     token: 'test-token',
     project: 'lspro-react',
-    deps,
+    deps: {
+      readRunDetail: async () => ({
+        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+      }),
+      ...deps,
+    },
   };
 }
 

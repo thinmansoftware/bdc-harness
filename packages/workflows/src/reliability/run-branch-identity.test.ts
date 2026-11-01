@@ -325,6 +325,12 @@ if [ "$1" = "pr" ] && [ "$2" = "edit" ]; then
   exit 97
 fi
 if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  case "$*" in
+    *headRefOid*)
+      printf '%s\n' '[]'
+      exit 0
+      ;;
+  esac
   n=$(cat "$GH_LIST_COUNT")
   n=$((n + 1))
   printf '%s' "$n" > "$GH_LIST_COUNT"
