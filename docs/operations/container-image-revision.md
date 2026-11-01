@@ -66,6 +66,9 @@ Optional overrides:
 
 - `ARCHON_REBUILD_HOLD_FILE` (default `/opt/bdc/archon/.rebuild-hold`)
 - `ARCHON_REBUILD_STOP_FILE` (default `/opt/bdc/archon/.rebuild-stop`)
+- `ARCHON_REBUILD_BACKUP_DIR` (default `/opt/bdc/backups/archon/compose`)
+
+Both compose files are copied into that directory as `*.pre-rebuild-<STAMP>`. They are never copied into `/opt/bdc/archon`. The database backup remains `/opt/bdc/backups/archon/archon.db.pre-rebuild-<STAMP>` and is unaffected by `ARCHON_REBUILD_BACKUP_DIR`.
 
 `build-app-image.sh` checks the hold file before `git status`. When that file exists it prints `refusing to build: rebuild hold present`, prints the file contents to stderr, and exits 10. Git and Docker are not called.
 
@@ -78,7 +81,7 @@ cd /opt/bdc/archon
 TARGET=<40-hex-sha> bash scripts/container/rebuild-archon-app.sh
 ```
 
-`TARGET` is required. The script refuses to start while a workflow run is `running` or `pending`. It copies the compose files, backs up the database, tags `archon:rollback-<STAMP>`, checks out `TARGET`, builds by calling `scripts/container/build-app-image.sh`, waits until live dispatch claims drain, then runs `docker compose up -d app`.
+`TARGET` is required. The script refuses to start while a workflow run is `running` or `pending`. It copies both compose files into `ARCHON_REBUILD_BACKUP_DIR`, backs up the database, tags `archon:rollback-<STAMP>`, checks out `TARGET`, builds by calling `scripts/container/build-app-image.sh`, waits until live dispatch claims drain, then runs `docker compose up -d app`.
 
 Untracked files such as `.env.bak-*` are still rejected later by `build-app-image.sh` (bdc-xo #4112). That dirty-tree rule is unchanged. This script does not prune images, delete backups, or remove old tags. Cleanup stays a separate overnight job.
 

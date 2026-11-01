@@ -7,6 +7,7 @@ stop_file="${ARCHON_REBUILD_STOP_FILE:-/opt/bdc/archon/.rebuild-stop}"
 root="/opt/bdc/archon"
 db="/opt/bdc/archon-data/archon.db"
 backup_dir="/opt/bdc/backups/archon"
+compose_backup_dir="${ARCHON_REBUILD_BACKUP_DIR:-/opt/bdc/backups/archon/compose}"
 
 refuse_hold_or_stop() {
   if [ ! -f "$hold_file" ] && [ ! -f "$stop_file" ]; then
@@ -49,9 +50,10 @@ if [ -n "$tracked" ]; then
   exit 3
 fi
 
+mkdir -p "$compose_backup_dir"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-cp docker-compose.yml "docker-compose.yml.pre-rebuild-${STAMP}"
-cp docker-compose.override.yml "docker-compose.override.yml.pre-rebuild-${STAMP}"
+cp docker-compose.yml "${compose_backup_dir}/docker-compose.yml.pre-rebuild-${STAMP}"
+cp docker-compose.override.yml "${compose_backup_dir}/docker-compose.override.yml.pre-rebuild-${STAMP}"
 
 sqlite3 "$db" ".backup ${backup_dir}/archon.db.pre-rebuild-${STAMP}" || exit $?
 check="$(sqlite3 "$db" "pragma quick_check")" || exit $?
