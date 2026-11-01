@@ -31,6 +31,7 @@ import {
   type RepoBasePolicy,
   warnLegacyMergePolicy,
 } from './merge-repo-policy';
+import { specDeclaresMergeHold } from './merge-hold';
 import { isSpecOnlyChangeSet } from './reconcile';
 import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
 import { createRealOctokitClient } from './adapters/github-real-deps';
@@ -86,6 +87,8 @@ export interface MergeExecutionBridgeOptions {
   retryMaxAttempts?: number;
   repoConfig?: MergeExecutionRepoConfig;
   ceScopeRecheckDeps?: CeScopeRecheckDeps;
+  // Absent in tests that predate the spec hold. When omitted, no spec is read.
+  readWoSpec?(woId: string): Promise<string>;
 }
 
 export interface MinimalCompareClient {
@@ -255,6 +258,12 @@ function configuredPolicy(override?: MergeExecutionRepoConfig): MergeRepoPolicy 
   if (raw === undefined) return resolveMergeRepoPolicy();
   warnLegacyMergePolicy(LEGACY_REPO_CONFIG_ENV);
   return resolveMergeRepoPolicy({ legacyRepoConfig: parseLegacyRepoConfig(raw) });
+}
+
+function errorStatus(error: unknown): number | undefined {
+  if (typeof error !== 'object' || error === null || !('status' in error)) return undefined;
+  const status = (error as { status: unknown }).status;
+  return typeof status === 'number' ? status : undefined;
 }
 
 function isDocumentationOnly(paths: readonly string[]): boolean {
@@ -725,6 +734,58 @@ async function mergeClaimedVerdict(
         'merge-coordinator.active_run_deferred'
       );
       return undefined;
+    }
+  }
+
+  // Holds release the claim and return. They are not skip() or deferVerdictClaim:
+  // an extended hold must not set actioned_at, increment attempts, or exhaust
+  // the transient retry cap. The next tick re-evaluates after the claim is free.
+  if (pr.labels?.includes('merge-hold')) {
+    await options.store.releaseVerdictClaim(verdict.id, 'merge_hold_label');
+    log.info(
+      {
+        verdictId: verdict.id,
+        runId: verdict.run_id,
+        woId: verdict.wo_id,
+        prUrl: pr.htmlUrl,
+      },
+      'merge-coordinator.merge_hold_label'
+    );
+    return undefined;
+  }
+
+  if (options.readWoSpec && typeof verdict.wo_id === 'string' && verdict.wo_id.startsWith('WO-')) {
+    try {
+      const specText = await options.readWoSpec(verdict.wo_id);
+      if (specDeclaresMergeHold(specText)) {
+        await options.store.releaseVerdictClaim(verdict.id, 'merge_hold');
+        log.info(
+          {
+            verdictId: verdict.id,
+            runId: verdict.run_id,
+            woId: verdict.wo_id,
+            prUrl: pr.htmlUrl,
+          },
+          'merge-coordinator.merge_hold'
+        );
+        return undefined;
+      }
+    } catch (error) {
+      // 404 means the spec file is absent, which is not a hold.
+      if (errorStatus(error) !== 404) {
+        await options.store.releaseVerdictClaim(verdict.id, 'merge_hold_unverified');
+        log.warn(
+          {
+            err: error as Error,
+            verdictId: verdict.id,
+            runId: verdict.run_id,
+            woId: verdict.wo_id,
+            prUrl: pr.htmlUrl,
+          },
+          'merge-coordinator.merge_hold_unverified'
+        );
+        return undefined;
+      }
     }
   }
 

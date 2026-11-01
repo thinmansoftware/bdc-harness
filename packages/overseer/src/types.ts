@@ -84,6 +84,11 @@ export interface PullRequestEvidence {
    * not loaded.
    */
   otherOpenPrsForWoLookupFailed?: boolean;
+  /**
+   * GitHub label names on this pull request. Absent on older evidence
+   * fixtures. An exact, case-sensitive `merge-hold` name holds the merge.
+   */
+  labels?: readonly string[];
 }
 
 export interface GrokJudgeEvidence {

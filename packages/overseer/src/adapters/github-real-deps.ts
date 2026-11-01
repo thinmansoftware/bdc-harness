@@ -178,6 +178,7 @@ export interface RealGitHubOctokitLike {
         created_at?: string;
         base?: { sha: string; ref?: string };
         mergeable_state?: string;
+        labels?: { name?: string | null }[];
       };
     }>;
     listFiles?(input: Record<string, unknown>): Promise<{
@@ -878,6 +879,16 @@ export function summarizeChecks(
   return { total: checkRuns.length, passed, failed, pending };
 }
 
+function pullRequestLabelNames(labels: { name?: string | null }[] | undefined): string[] {
+  if (!labels) return [];
+  const names: string[] = [];
+  for (const label of labels) {
+    const name = label?.name;
+    if (typeof name === 'string' && name.length > 0) names.push(name);
+  }
+  return names;
+}
+
 /**
  * Real findPullRequest: looks up an open PR by head branch first (the run's
  * own PR), then complete REST open-PR discovery with exact WO title/body matching.
@@ -1136,6 +1147,7 @@ export function createRealFindPullRequest(
         baseBranch: pr.data.base?.ref,
         mergeableState: pr.data.mergeable_state,
         changedFilePaths,
+        labels: pullRequestLabelNames(pr.data.labels),
       };
       if (!preserveRateLimitBackoff) {
         rateLimitBackoffUntil = 0;

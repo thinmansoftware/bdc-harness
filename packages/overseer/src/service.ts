@@ -48,6 +48,7 @@ import { assessQualifiedMerge } from './actions/merge-ready';
 import { assertOverseerDefaultOff } from './integration-scenarios';
 import { createRealGitHubClientDeps } from './adapters/github-real-deps';
 import { runMergeExecutionBridgeOnce } from './merge-execution-bridge';
+import { readWoSpecForMergeHold } from './merge-hold';
 
 /**
  * Integrated S4-S7 assessment surface for Slice 8 wiring.
@@ -436,6 +437,7 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
         releaseMergeSlot: releaseOverseerMergeSlot,
         recordOutcome: recordVerdictMergeOutcome,
       },
+      readWoSpec: readWoSpecForMergeHold,
     });
 }
 
