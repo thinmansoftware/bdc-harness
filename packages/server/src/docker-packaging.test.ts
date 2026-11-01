@@ -17,6 +17,18 @@ describe('production Docker packaging', () => {
     expect(dockerfile).toContain('COPY .archon/ ./.archon/');
   });
 
+  it('packages the run completion report script into the production image', async () => {
+    const dockerfile = await readFile(
+      join(import.meta.dir, '..', '..', '..', 'Dockerfile'),
+      'utf8'
+    );
+    const copyLine = dockerfile
+      .split('\n')
+      .find(l => l.startsWith('COPY scripts/') && l.endsWith('./scripts/'));
+    expect(copyLine).toContain('scripts/run-completion-report.ts');
+    expect(dockerfile.split('AS production')[1]).toContain('scripts/run-completion-report.ts');
+  });
+
   /**
    * These CLI tools are relied on by lane bash nodes and by agent code search.
    * A missing binary fails at RUNTIME with exit 127, mid-run, after the fire has
