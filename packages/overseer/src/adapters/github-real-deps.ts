@@ -31,6 +31,7 @@ import type {
   RequiredContextsFailureKind,
 } from './required-contexts.ts';
 import { createDurableAttemptCounterStore } from './required-contexts-store';
+import { classifyRateLimitError } from '../github-rate-limit';
 
 const log = createLogger('overseer/github-real-deps');
 
@@ -1401,6 +1402,11 @@ export function createRealSubmitPullRequestReview(
       if (status === 422) {
         return { submitted: false, message: 'github_review_unprocessable' };
       }
+      // A rate-limit answer, or the local pool gate refusing before any
+      // request left, means no review was created. Rethrow it so the submit
+      // path defers the item instead of retiring it as transport-ambiguous
+      // (WO-HARNESS-OVERSEER-REVIEW-TRIGGER-01).
+      if (classifyRateLimitError(error)) throw error;
       return { submitted: false, message: 'github_review_transport_ambiguous' };
     }
   };
