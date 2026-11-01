@@ -18,6 +18,11 @@ test('authority-bound run claims and releases its lease around execution', async
     claimRunLease: mock(async lease => lease),
     heartbeatRunLease: mock(async () => true),
     releaseRunLease: mock(async () => true),
+    getWorkflowRun: mock(async () => ({
+      id: 'run-1',
+      status: 'completed',
+      metadata: { teardown_confirmed_at: '2026-07-09T20:00:00.000Z', teardown_survivors: [] },
+    })),
   } as unknown as IWorkflowStore;
   const now = mock(() => new Date('2026-07-09T20:00:00.000Z'));
 
@@ -88,4 +93,25 @@ test('release failure cannot replace a successful workflow result', async () => 
   } as unknown as IWorkflowStore;
 
   await expect(withRunLease(store, 'run-1', async () => 'completed')).resolves.toBe('completed');
+});
+
+test('unknown final run state keeps the lease (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01)', async () => {
+  for (const getWorkflowRun of [
+    mock(async () => {
+      throw new Error('database unavailable');
+    }),
+    mock(async () => null),
+  ]) {
+    const releaseRunLease = mock(async () => true);
+    const store = {
+      getRunAuthority: mock(async () => ({ runId: 'run-1' })),
+      claimRunLease: mock(async lease => lease),
+      heartbeatRunLease: mock(async () => true),
+      releaseRunLease,
+      getWorkflowRun,
+    } as unknown as IWorkflowStore;
+    await expect(withRunLease(store, 'run-1', async isValid => isValid())).resolves.toBe(true);
+    expect(getWorkflowRun).toHaveBeenCalled();
+    expect(releaseRunLease).not.toHaveBeenCalled();
+  }
 });

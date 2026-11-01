@@ -178,6 +178,12 @@ export interface CascadeRunRecord {
     runId: string | null;
     tier: TierName;
   };
+  /**
+   * Populated when the cascade stopped blocked for a teardown/checkout reason
+   * (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01): 'checkout_failed_no_climb' or
+   * 'teardown_unconfirmed'.
+   */
+  blockedReason?: 'checkout_failed_no_climb' | 'teardown_unconfirmed';
   supervisorRecovery?: {
     ownerId: string;
     fencingToken: number;

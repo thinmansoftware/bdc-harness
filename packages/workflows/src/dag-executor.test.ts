@@ -8667,6 +8667,11 @@ describe('executeDagWorkflow -- credit exhaustion', () => {
     (store.getWorkflowRunStatus as Mock<() => Promise<WorkflowRun['status']>>).mockImplementation(
       async () => status
     );
+    // withRunLease reads the final run state before releasing (unknown state keeps
+    // the lease, WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01); a waiting run releases.
+    (store.getWorkflowRun as Mock<() => Promise<WorkflowRun>>).mockImplementation(async () =>
+      makeWorkflowRun('credit-exhaustion-run', { status })
+    );
     (store.updateWorkflowRun as Mock<() => Promise<void>>).mockImplementation(
       async (_runId: string, updates: { status?: WorkflowRun['status'] }) => {
         if (updates.status) status = updates.status;

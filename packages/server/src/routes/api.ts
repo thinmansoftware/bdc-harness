@@ -27,6 +27,7 @@ import {
   registerRepository,
   ConversationNotFoundError,
   generateAndSetTitle,
+  releaseTerminalRunLeasesSweep,
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
@@ -148,10 +149,13 @@ export const EXPECTATION_DAILY_CAP =
     : 50;
 
 let providerWaitSchedulerTimer: ReturnType<typeof setInterval> | undefined;
+let terminalLeaseSweepTimer: ReturnType<typeof setInterval> | undefined;
 
 export function stopProviderWaitScheduler(): void {
   if (providerWaitSchedulerTimer) clearInterval(providerWaitSchedulerTimer);
   providerWaitSchedulerTimer = undefined;
+  if (terminalLeaseSweepTimer) clearInterval(terminalLeaseSweepTimer);
+  terminalLeaseSweepTimer = undefined;
 }
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -3770,6 +3774,33 @@ export function registerApiRoutes(
     providerWaitSchedulerTimer = setInterval(() => void tick(), intervalMs);
     providerWaitSchedulerTimer.unref?.();
     void tick();
+  }
+
+  // Terminal-run lease sweep (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01, N5): release
+  // leases left on terminal runs whose worktree scan is clear. Default every
+  // 10 minutes; ARCHON_TERMINAL_LEASE_SWEEP_MS overrides, 0 disables.
+  if (process.env.NODE_ENV !== 'test' && terminalLeaseSweepTimer === undefined) {
+    const sweepStore = createWorkflowDeps().store;
+    const configuredSweep = Number.parseInt(process.env.ARCHON_TERMINAL_LEASE_SWEEP_MS ?? '', 10);
+    const sweepMs =
+      Number.isInteger(configuredSweep) && configuredSweep >= 0 ? configuredSweep : 600_000;
+    if (sweepMs > 0) {
+      let sweepInFlight = false;
+      const sweep = async (): Promise<void> => {
+        if (sweepInFlight) return;
+        sweepInFlight = true;
+        try {
+          await releaseTerminalRunLeasesSweep(sweepStore);
+        } catch (error) {
+          getLog().error({ err: error as Error }, 'api.terminal_lease_sweep_failed');
+        } finally {
+          sweepInFlight = false;
+        }
+      };
+      terminalLeaseSweepTimer = setInterval(() => void sweep(), sweepMs);
+      terminalLeaseSweepTimer.unref?.();
+      void sweep();
+    }
   }
 
   // Taskmaster Slice 1 loop (WO-HARNESS-TASKMASTER-SLICE1-01, M-133).
