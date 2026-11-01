@@ -6,6 +6,7 @@ import { afterEach, describe, expect, mock, test } from 'bun:test';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import type { ReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
 import type { SubmitDeps, SubmitOutcome } from '@archon/overseer/pr-review-submit';
+import { runAndSubmitReview } from '@archon/overseer/pr-review-submit';
 import {
   startReviewWorkerClock,
   stopReviewWorkerClock,
@@ -331,6 +332,81 @@ describe('review worker clock', () => {
     };
     expect(new Date(deferArg.defer_until).getTime()).toBeGreaterThan(before);
     expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
+  // WO-HARNESS-OVERSEER-REVIEW-TRIGGER-01: end to end through the REAL submit
+  // path. Live 2026-11-01 17:07Z, bdc-harness #1390's first review was retired
+  // `failed` because the head re-read hit the local pool gate; nothing re-armed
+  // it for 80 minutes. The item must instead go back to the queue until the
+  // gate opens, with no terminal result posted.
+  test('a pool-gate refusal on the head re-read re-queues the item until the gate opens', async () => {
+    const gateUntil = Date.now() + 120_000;
+    let submitted = 0;
+    const deps = fakeDeps([message('gated', 'exact-head')]);
+    deps.runAndSubmitReview = runAndSubmitReview;
+    deps.createSubmitDeps = () => ({
+      reviewerIdentity: CONFIG.reviewerIdentity,
+      runReviewer: async () => ({
+        approved: true,
+        summary: 'No blocking findings.',
+        reviewedHeadSha: 'exact-head',
+      }),
+      submitReview: async () => {
+        submitted += 1;
+        return { submitted: true };
+      },
+      currentHeadSha: async () => {
+        throw new Error(`github_pool_backoff:app-4574893-153295654/core:${gateUntil}`);
+      },
+      recordReceipt: async () => undefined,
+    });
+
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(deps.postResult).not.toHaveBeenCalled();
+    expect(submitted).toBe(0);
+    expect(deps.deferMessage).toHaveBeenCalledTimes(1);
+    const deferArg = (deps.deferMessage as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+      id: string;
+      fencing_token: number;
+      defer_until: string;
+    };
+    expect(deferArg.id).toBe('gated');
+    expect(deferArg.fencing_token).toBe(1);
+    const deferMs = new Date(deferArg.defer_until).getTime();
+    // The gate's own expiry, give or take the milliseconds the tick took.
+    expect(Math.abs(deferMs - gateUntil)).toBeLessThan(5_000);
+  });
+
+  test('a non-rate-limit head re-read failure is still posted terminal', async () => {
+    const deps = fakeDeps([message('broken', 'exact-head')]);
+    deps.runAndSubmitReview = runAndSubmitReview;
+    deps.createSubmitDeps = () => ({
+      reviewerIdentity: CONFIG.reviewerIdentity,
+      runReviewer: async () => ({
+        approved: true,
+        summary: 'No blocking findings.',
+        reviewedHeadSha: 'exact-head',
+      }),
+      submitReview: async () => ({ submitted: true }),
+      currentHeadSha: async () => {
+        throw new Error('github_500');
+      },
+      recordReceipt: async () => undefined,
+    });
+
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(deps.deferMessage).not.toHaveBeenCalled();
+    expect(deps.postResult).toHaveBeenCalledTimes(1);
+    const posted = (deps.postResult as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+      status: string;
+      task_outcome: string;
+      result_body: string;
+    };
+    expect(posted.status).toBe('failed');
+    expect(posted.task_outcome).toBe('failed');
+    expect(JSON.parse(posted.result_body).reason).toBe('head_recheck_failed:github_500');
   });
 
   // bdc-harness #782 part 3: the sweep runs on the heartbeat and never takes
