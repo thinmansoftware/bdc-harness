@@ -1,9 +1,7 @@
-import { afterAll, afterEach, beforeEach, expect, test } from 'bun:test';
+import { expect, test as bunTest } from 'bun:test';
 import { generateKeyPairSync } from 'node:crypto';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { closeDatabase, getDatabase } from '@archon/core/db/connection';
+import { getDatabase } from '@archon/core/db/connection';
+import { withIsolatedDatabase } from './isolated-database';
 import { clearServiceGitHubTokenCache } from '@archon/core/github/service-identity';
 import {
   flushGitHubApiMeter,
@@ -18,8 +16,6 @@ import {
 } from '../reconcile';
 
 const envNames = [
-  'ARCHON_HOME',
-  'DATABASE_URL',
   'GH_TOKEN',
   'GITHUB_TOKEN',
   'GITHUB_APP_ID',
@@ -33,7 +29,6 @@ const envNames = [
 ] as const;
 const originalEnv = Object.fromEntries(envNames.map(name => [name, process.env[name]]));
 const originalFetch = globalThis.fetch;
-const testHome = mkdtempSync(join(tmpdir(), 'reconcile-app-auth-'));
 const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
   .privateKey.export({ type: 'pkcs8', format: 'pem' })
   .toString();
@@ -53,25 +48,30 @@ const pr = {
 };
 let calls: { auth: string; method: string; body: string; url: string }[];
 
-beforeEach(async () => {
-  await closeDatabase();
-  clearServiceGitHubTokenCache();
-  resetGitHubApiMeterForTests();
-  for (const name of envNames) delete process.env[name];
-  process.env.ARCHON_HOME = mkdtempSync(join(testHome, 'case-'));
-  calls = [];
-});
-afterEach(() => {
-  globalThis.fetch = originalFetch;
-  clearServiceGitHubTokenCache();
-  resetGitHubApiMeterForTests();
-  for (const name of envNames) {
-    const value = originalEnv[name];
-    if (value === undefined) delete process.env[name];
-    else process.env[name] = value;
-  }
-});
-afterAll(closeDatabase);
+// Each case opens a private sqlite file. Closing the process singleton here
+// races every other file in the directory suite.
+function test(name: string, fn: () => Promise<void>): void {
+  bunTest(name, () =>
+    withIsolatedDatabase(async () => {
+      clearServiceGitHubTokenCache();
+      resetGitHubApiMeterForTests();
+      for (const keyName of envNames) delete process.env[keyName];
+      calls = [];
+      try {
+        await fn();
+      } finally {
+        globalThis.fetch = originalFetch;
+        clearServiceGitHubTokenCache();
+        resetGitHubApiMeterForTests();
+        for (const keyName of envNames) {
+          const value = originalEnv[keyName];
+          if (value === undefined) delete process.env[keyName];
+          else process.env[keyName] = value;
+        }
+      }
+    })
+  );
+}
 
 function app(): void {
   process.env.GITHUB_APP_ID = '123';

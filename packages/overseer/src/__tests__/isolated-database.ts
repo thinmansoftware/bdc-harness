@@ -44,13 +44,21 @@ function ensureRouter(state: IsolatedDatabaseSlot): void {
   state.router = connection.getDatabase;
 }
 
-export async function withIsolatedDatabase<T>(work: () => Promise<T>): Promise<T> {
+/** Route getDatabase() to this adapter for the async extent of `work` only. */
+export async function runWithBoundDatabase<T>(
+  database: IDatabase,
+  work: () => Promise<T>
+): Promise<T> {
   const state = slot();
   ensureRouter(state);
+  return state.storage.run(database, work);
+}
+
+export async function withIsolatedDatabase<T>(work: () => Promise<T>): Promise<T> {
   const home = mkdtempSync(join(tmpdir(), 'archon-overseer-isolated-'));
   const database = new SqliteAdapter(join(home, 'archon.db'));
   try {
-    return await state.storage.run(database, work);
+    return await runWithBoundDatabase(database, work);
   } finally {
     await database.close();
     removeTempDirWithRetry(home);
