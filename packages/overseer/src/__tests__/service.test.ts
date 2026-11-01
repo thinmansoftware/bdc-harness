@@ -1,9 +1,6 @@
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
-import { mkdtempSync } from 'fs';
-import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { getDatabase } from '@archon/core/db/connection';
+import { withIsolatedDatabase } from './isolated-database';
 import {
   claimOverseerVerdict,
   finalizeOverseerVerdict,
@@ -23,24 +20,15 @@ import {
 } from '../service.ts';
 import type { M31ActionPermit, M31ActionProposal } from '../m31-substrate.ts';
 
-const ENV_KEYS = [
-  'ARCHON_HOME',
-  'DATABASE_URL',
-  'OVERSEER_ENABLED',
-  'OVERSEER_EMERGENCY_STOP',
-  'OVERSEER_DRY_RUN',
-  'OVERSEER_USE_FAKE_GITHUB_ADAPTER',
-  'OVERSEER_FAKE_GITHUB_REPOSITORIES',
-  'OVERSEER_ESCALATION_ACTIONS_ENABLED',
-  'OVERSEER_REPAIR_ACTIONS_ENABLED',
-  'OVERSEER_BRANCH_ACTIONS_ENABLED',
-  'OVERSEER_LIFECYCLE_ACTIONS_ENABLED',
-  'OVERSEER_MERGE_ACTIONS_ENABLED',
-  'OVERSEER_JUDGE_FIRST',
-  'GITHUB_TOKEN',
-  'GH_TOKEN',
-] as const;
-const oldEnv = new Map(ENV_KEYS.map(key => [key, process.env[key]]));
+const envEdits = new Map<string, { prior: string | undefined; written: string | undefined }>();
+
+function setTestEnv(key: string, value: string | undefined): void {
+  const existing = envEdits.get(key);
+  if (existing) existing.written = value;
+  else envEdits.set(key, { prior: process.env[key], written: value });
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+}
 
 const POLICY_DIGEST = 'a'.repeat(64);
 const VERIFIER_DIGEST = 'b'.repeat(64);
@@ -88,18 +76,7 @@ function permit(): M31ActionPermit {
 }
 
 async function withTempDatabase<T>(work: () => Promise<T>): Promise<T> {
-  const home = mkdtempSync(join(tmpdir(), 'archon-overseer-service-'));
-  await closeDatabase();
-  resetDatabase();
-  process.env.ARCHON_HOME = home;
-  delete process.env.DATABASE_URL;
-  try {
-    return await work();
-  } finally {
-    await closeDatabase();
-    resetDatabase();
-    removeTempDirWithRetry(home);
-  }
+  return withIsolatedDatabase(work);
 }
 
 async function seedPersistentPermit(
@@ -185,27 +162,20 @@ async function seedPersistentPermit(
 }
 
 function enableFakeCapability(capability: 'merge' | 'escalation'): void {
-  process.env.OVERSEER_ENABLED = 'true';
-  process.env.OVERSEER_EMERGENCY_STOP = 'false';
-  process.env.OVERSEER_DRY_RUN = 'false';
-  process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = '1';
-  process.env.OVERSEER_FAKE_GITHUB_REPOSITORIES = 'thinmansoftware/bdc-harness';
+  setTestEnv('OVERSEER_ENABLED', 'true');
+  setTestEnv('OVERSEER_EMERGENCY_STOP', 'false');
+  setTestEnv('OVERSEER_DRY_RUN', 'false');
+  setTestEnv('OVERSEER_USE_FAKE_GITHUB_ADAPTER', '1');
+  setTestEnv('OVERSEER_FAKE_GITHUB_REPOSITORIES', 'thinmansoftware/bdc-harness');
   for (const name of ['ESCALATION', 'REPAIR', 'BRANCH', 'LIFECYCLE', 'MERGE']) {
-    process.env[`OVERSEER_${name}_ACTIONS_ENABLED`] = 'false';
+    setTestEnv(`OVERSEER_${name}_ACTIONS_ENABLED`, 'false');
   }
-  process.env[`OVERSEER_${capability.toUpperCase()}_ACTIONS_ENABLED`] = 'true';
+  setTestEnv(`OVERSEER_${capability.toUpperCase()}_ACTIONS_ENABLED`, 'true');
 }
 
-// This suite owns process-global database state. Bun runs files concurrently for
-// directory invocations, so execute it in its own process in that invocation
-// shape; direct/package-script runs continue to execute the suite normally.
-const invokedDirectly = process.argv.some(arg => /service\.test\.ts$/.test(arg));
-
-const serviceSuite: typeof describe = invokedDirectly ? describe : (_name, _tests) => undefined;
-
-serviceSuite('service', () => {
+describe('service', () => {
   test('resolveDefaultDeps preserves the fake GitHub adapter behavior', async () => {
-    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'true';
+    setTestEnv('OVERSEER_USE_FAKE_GITHUB_ADAPTER', 'true');
     const realFactory = mock(() => {
       throw new Error('real factory must not run');
     });
@@ -236,7 +206,7 @@ serviceSuite('service', () => {
   });
 
   test('resolveDefaultDeps uses real GitHub deps when fake mode is not requested', async () => {
-    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'false';
+    setTestEnv('OVERSEER_USE_FAKE_GITHUB_ADAPTER', 'false');
     const findPullRequest = mock(async () => ({
       exists: true as const,
       state: 'open',
@@ -267,23 +237,17 @@ serviceSuite('service', () => {
     expect(realFactory).toHaveBeenCalledTimes(1);
   });
 
-  beforeEach(() => {
-    process.env.GITHUB_TOKEN = '';
-    process.env.GH_TOKEN = '';
-  });
-
-  afterEach(async () => {
-    await closeDatabase();
-    resetDatabase();
-    for (const key of ENV_KEYS) {
-      const value = oldEnv.get(key);
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
+  afterEach(() => {
+    for (const [key, edit] of envEdits) {
+      if ((process.env[key] ?? undefined) !== edit.written) continue;
+      if (edit.prior === undefined) delete process.env[key];
+      else process.env[key] = edit.prior;
     }
+    envEdits.clear();
   });
 
   test('OVERSEER_ENABLED unset exits with no db reads', async () => {
-    delete process.env.OVERSEER_ENABLED;
+    setTestEnv('OVERSEER_ENABLED', undefined);
     const listRunsForWatch = mock(async () => []);
     await runOverseerService({
       once: true,
@@ -392,7 +356,7 @@ serviceSuite('service', () => {
   test('fake adapterKind without injected deps resolves stub -- service completes once', async () => {
     // Verify that adapterKind='fake' without explicit deps wires the internal stub
     // path (no Octokit constructed). Use once=true so the call terminates.
-    delete process.env.OVERSEER_ENABLED;
+    setTestEnv('OVERSEER_ENABLED', undefined);
     // Service skips when not enabled -- but we need to verify stub selection resolves.
     // We rely on the unit test above + type check for the real adapter path.
     // This test exercises the enabled=false early-return path (safe no-op).
@@ -1028,7 +992,7 @@ serviceSuite('service', () => {
     handoff?: ReturnType<typeof mock> | undefined;
     omitHandoff?: boolean;
   }): Promise<void> {
-    process.env.OVERSEER_JUDGE_FIRST = '1';
+    setTestEnv('OVERSEER_JUDGE_FIRST', '1');
     const mergeCoordinator = mock(async () => undefined);
     await runOverseerService({
       once: true,
@@ -1187,7 +1151,7 @@ serviceSuite('service', () => {
           comment: true,
         });
         expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain(runId);
-        process.env.OVERSEER_JUDGE_FIRST = '1';
+        setTestEnv('OVERSEER_JUDGE_FIRST', '1');
         const mergeCoordinator = mock(async () => undefined);
         const bridgeRun = mock(async () => undefined);
         await runOverseerService({
@@ -1234,7 +1198,7 @@ serviceSuite('service', () => {
     mergeBridgeEnabled?: boolean;
     omitBridgeFlag?: boolean;
   }): Promise<{ mergeCoordinator: ReturnType<typeof mock> }> {
-    process.env.OVERSEER_JUDGE_FIRST = '1';
+    setTestEnv('OVERSEER_JUDGE_FIRST', '1');
     const mergeCoordinator = mock(async () => undefined);
     await expect(
       runOverseerService({
@@ -1381,16 +1345,3 @@ serviceSuite('service', () => {
     }
   });
 });
-
-if (!invokedDirectly) {
-  test('service suite passes with isolated database state', () => {
-    const child = Bun.spawnSync(['bun', 'test', import.meta.path, '--timeout', '30000'], {
-      cwd: process.cwd(),
-      env: process.env,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    const output = new TextDecoder().decode(child.stdout) + new TextDecoder().decode(child.stderr);
-    expect(child.exitCode, output).toBe(0);
-  });
-}

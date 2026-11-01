@@ -7,11 +7,9 @@
  * stricter-of-two tier law, and permit-free Tier 0 escalation.
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'fs';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
+import { afterEach, describe, expect, test } from 'bun:test';
+import { getDatabase } from '@archon/core/db/connection';
+import { withIsolatedDatabase } from './isolated-database';
 import {
   claimOverseerVerdict,
   finalizeOverseerVerdict,
@@ -1094,211 +1092,190 @@ describe('handleRecordJudgeFirst: pipeline (continued)', () => {
   );
 });
 
-const testFileArgs = process.argv.filter(arg => arg.endsWith('.test.ts'));
-const soleJudgeFirstFile =
-  testFileArgs.length === 1 && testFileArgs[0]?.endsWith('judge-first.test.ts') === true;
+describe('replay green real adapter', () => {
+  function testIsolated(name: string, fn: () => Promise<void>): void {
+    test(name, () => withIsolatedDatabase(fn));
+  }
 
-if (soleJudgeFirstFile) {
-  describe('replay green real adapter', () => {
-    let home = '';
-    const savedArchonHome = process.env.ARCHON_HOME;
-    const savedDatabaseUrl = process.env.DATABASE_URL;
-
-    beforeAll(async () => {
-      home = mkdtempSync(join(tmpdir(), 'archon-replay-green-'));
-      process.env.ARCHON_HOME = home;
-      delete process.env.DATABASE_URL;
-      await closeDatabase();
-      resetDatabase();
-      getDatabase();
-    });
-
-    afterAll(async () => {
-      await closeDatabase();
-      resetDatabase();
-      if (savedArchonHome === undefined) delete process.env.ARCHON_HOME;
-      else process.env.ARCHON_HOME = savedArchonHome;
-      if (savedDatabaseUrl === undefined) delete process.env.DATABASE_URL;
-      else process.env.DATABASE_URL = savedDatabaseUrl;
-      if (home) rmSync(home, { recursive: true, force: true });
-    });
-
-    async function seedCompletedRun(id: string): Promise<void> {
-      const db = getDatabase();
-      await db.query(
-        `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, title)
+  async function seedCompletedRun(id: string): Promise<void> {
+    const db = getDatabase();
+    await db.query(
+      `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, title)
          VALUES ($1, 'test', $1, 'Test')`,
-        [`conv-${id}`]
-      );
-      await db.query(
-        `INSERT INTO remote_agent_workflow_runs
+      [`conv-${id}`]
+    );
+    await db.query(
+      `INSERT INTO remote_agent_workflow_runs
          (id, conversation_id, workflow_name, user_message, status, metadata, completed_at)
          VALUES ($1, $2, 'bdc-feature-development', $3, 'completed', $4, $5)`,
-        [
-          id,
-          `conv-${id}`,
-          'Implement WO-REPLAY-GREEN-01',
-          JSON.stringify({
-            woId: 'WO-REPLAY-GREEN-01',
-            targetRepo: 'thinmansoftware/bdc-harness',
-            headBranch: `wo/${id}`,
-          }),
-          '2026-10-29T00:00:00.000Z',
-        ]
-      );
-    }
+      [
+        id,
+        `conv-${id}`,
+        'Implement WO-REPLAY-GREEN-01',
+        JSON.stringify({
+          woId: 'WO-REPLAY-GREEN-01',
+          targetRepo: 'thinmansoftware/bdc-harness',
+          headBranch: `wo/${id}`,
+        }),
+        '2026-10-29T00:00:00.000Z',
+      ]
+    );
+  }
 
-    async function seedVerdict(input: {
-      runId: string;
-      verdict: string;
-      proposedAction: string | null;
-      headSha?: string;
-    }): Promise<string> {
-      const claim = await claimOverseerVerdict({
+  async function seedVerdict(input: {
+    runId: string;
+    verdict: string;
+    proposedAction: string | null;
+    headSha?: string;
+  }): Promise<string> {
+    const claim = await claimOverseerVerdict({
+      runId: input.runId,
+      woId: 'WO-REPLAY-GREEN-01',
+      headSha: input.headSha ?? 'H',
+    });
+    if (!claim.verdictId) throw new Error(`claim_failed:${input.runId}`);
+    await finalizeOverseerVerdict({
+      verdictId: claim.verdictId,
+      status: 'verdict',
+      verdict: input.verdict,
+      ...(input.proposedAction === null ? {} : { proposedAction: input.proposedAction }),
+    });
+    return claim.verdictId;
+  }
+
+  function prEvidence(pending: number): WatchedRunRecord['prEvidence'] {
+    const total = pending > 0 ? 18 : 3;
+    return {
+      exists: true,
+      state: 'open',
+      checks: { total, passed: total - pending, failed: 0, pending },
+      mergeable: true,
+      headSha: 'H',
+      pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1373 },
+    };
+  }
+
+  function realVerdictStore(
+    overrides: Partial<OverseerVerdictStoreDeps> = {}
+  ): OverseerVerdictStoreDeps {
+    return {
+      claimVerdict: claimOverseerVerdict,
+      finalizeVerdict: finalizeOverseerVerdict,
+      getVerdictByRunHead,
+      promoteObserveOrHealthyVerdict,
+      promoteObserveOrHealthyVerdictWithReceipt,
+      ...overrides,
+    };
+  }
+
+  async function installReceiptFailureGuards(runId: string): Promise<void> {
+    const db = getDatabase();
+    await db.query(
+      `CREATE TRIGGER reject_replay_green_receipt BEFORE INSERT ON overseer_actions
+         WHEN NEW.action = 'flag_merge_ready' AND NEW.run_id = '${runId}'
+         BEGIN SELECT RAISE(ABORT, 'receipt_insert_failed'); END`
+    );
+    await db.query(
+      `CREATE TRIGGER reject_replay_green_revert BEFORE UPDATE ON overseer_verdicts
+         WHEN OLD.proposed_action = 'flag_merge_ready' AND NEW.proposed_action != 'flag_merge_ready'
+           AND OLD.run_id = '${runId}'
+         BEGIN SELECT RAISE(ABORT, 'revert_failed'); END`
+    );
+  }
+
+  async function dropReceiptFailureGuards(): Promise<void> {
+    const db = getDatabase();
+    await db.query('DROP TRIGGER IF EXISTS reject_replay_green_receipt');
+    await db.query('DROP TRIGGER IF EXISTS reject_replay_green_revert');
+  }
+
+  async function runRealReplay(input: {
+    runId: string;
+    evidence: WatchedRunRecord['prEvidence'];
+    dryRun?: boolean;
+    action?: WatchedRunRecord['action'];
+    store?: OverseerVerdictStoreDeps;
+    tally?: { handoff: number; coordinator: number; judge: number };
+    withHandoff?: boolean;
+    judge?: Parameters<typeof handleRecordJudgeFirst>[2]['judge'];
+  }): Promise<{ handoff: number; coordinator: number; judge: number }> {
+    const tally = input.tally ?? { handoff: 0, coordinator: 0, judge: 0 };
+    const { deps } = makeDeps();
+    deps.insertOverseerAction = async record => {
+      await insertOverseerAction(record);
+    };
+    await handleRecordJudgeFirst(
+      makeRecord({
         runId: input.runId,
         woId: 'WO-REPLAY-GREEN-01',
-        headSha: input.headSha ?? 'H',
-      });
-      if (!claim.verdictId) throw new Error(`claim_failed:${input.runId}`);
-      await finalizeOverseerVerdict({
-        verdictId: claim.verdictId,
-        status: 'verdict',
-        verdict: input.verdict,
-        ...(input.proposedAction === null ? {} : { proposedAction: input.proposedAction }),
-      });
-      return claim.verdictId;
-    }
-
-    function prEvidence(pending: number): WatchedRunRecord['prEvidence'] {
-      const total = pending > 0 ? 18 : 3;
-      return {
-        exists: true,
-        state: 'open',
-        checks: { total, passed: total - pending, failed: 0, pending },
-        mergeable: true,
-        headSha: 'H',
-        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1373 },
-      };
-    }
-
-    function realVerdictStore(
-      overrides: Partial<OverseerVerdictStoreDeps> = {}
-    ): OverseerVerdictStoreDeps {
-      return {
-        claimVerdict: claimOverseerVerdict,
-        finalizeVerdict: finalizeOverseerVerdict,
-        getVerdictByRunHead,
-        promoteObserveOrHealthyVerdict,
-        promoteObserveOrHealthyVerdictWithReceipt,
-        ...overrides,
-      };
-    }
-
-    async function installReceiptFailureGuards(): Promise<void> {
-      const db = getDatabase();
-      await db.query(
-        `CREATE TRIGGER reject_replay_green_receipt BEFORE INSERT ON overseer_actions
-         WHEN NEW.action = 'flag_merge_ready'
-         BEGIN SELECT RAISE(ABORT, 'receipt_insert_failed'); END`
-      );
-      await db.query(
-        `CREATE TRIGGER reject_replay_green_revert BEFORE UPDATE ON overseer_verdicts
-         WHEN OLD.proposed_action = 'flag_merge_ready' AND NEW.proposed_action != 'flag_merge_ready'
-         BEGIN SELECT RAISE(ABORT, 'revert_failed'); END`
-      );
-    }
-
-    async function dropReceiptFailureGuards(): Promise<void> {
-      const db = getDatabase();
-      await db.query('DROP TRIGGER IF EXISTS reject_replay_green_receipt');
-      await db.query('DROP TRIGGER IF EXISTS reject_replay_green_revert');
-    }
-
-    async function runRealReplay(input: {
-      runId: string;
-      evidence: WatchedRunRecord['prEvidence'];
-      dryRun?: boolean;
-      action?: WatchedRunRecord['action'];
-      store?: OverseerVerdictStoreDeps;
-      tally?: { handoff: number; coordinator: number; judge: number };
-      withHandoff?: boolean;
-      judge?: Parameters<typeof handleRecordJudgeFirst>[2]['judge'];
-    }): Promise<{ handoff: number; coordinator: number; judge: number }> {
-      const tally = input.tally ?? { handoff: 0, coordinator: 0, judge: 0 };
-      const { deps } = makeDeps();
-      deps.insertOverseerAction = async record => {
-        await insertOverseerAction(record);
-      };
-      await handleRecordJudgeFirst(
-        makeRecord({
-          runId: input.runId,
-          woId: 'WO-REPLAY-GREEN-01',
-          action: input.action ?? 'ignore',
-          prEvidence: input.evidence,
-        }),
-        deps,
-        {
-          dryRun: input.dryRun ?? false,
-          actor: 'test',
-          mergeCoordinator: async () => {
-            tally.coordinator += 1;
-          },
-          ...(input.withHandoff === false
-            ? {}
-            : {
-                deterministicMergeHandoff: {
-                  handoff: async () => {
-                    tally.handoff += 1;
-                  },
+        action: input.action ?? 'ignore',
+        prEvidence: input.evidence,
+      }),
+      deps,
+      {
+        dryRun: input.dryRun ?? false,
+        actor: 'test',
+        mergeCoordinator: async () => {
+          tally.coordinator += 1;
+        },
+        ...(input.withHandoff === false
+          ? {}
+          : {
+              deterministicMergeHandoff: {
+                handoff: async () => {
+                  tally.handoff += 1;
                 },
-              }),
-          verdictStore: input.store ?? realVerdictStore(),
-          judge: async (envelope, judgeOptions) => {
-            tally.judge += 1;
-            if (input.judge) return input.judge(envelope, judgeOptions);
-            return verdictOutcome();
-          },
-          escalate: fakeEscalate,
-        }
-      );
-      return tally;
-    }
-
-    test('replay green Test 7: safe actions promote once on the real adapter', async () => {
-      const cases = [
-        ['observe', 'none'],
-        ['observe', 'verdict_write'],
-        ['observe', 'comment_findings'],
-        ['healthy', 'none'],
-        ['healthy', 'verdict_write'],
-        ['healthy', 'comment_findings'],
-      ] as const;
-      for (const [verdict, proposedAction] of cases) {
-        const runId = `run-safe-${verdict}-${proposedAction}`;
-        await seedCompletedRun(runId);
-        const verdictId = await seedVerdict({ runId, verdict, proposedAction });
-        const first = await runRealReplay({ runId, evidence: prEvidence(0) });
-        const second = await runRealReplay({ runId, evidence: prEvidence(0) });
-        const row = await getVerdictByRunHead({ runId, headSha: 'H' });
-        const actions = await getOverseerActionsForRun(runId);
-        const live = actions.filter(
-          action =>
-            action.action === 'flag_merge_ready' &&
-            action.result === `steward_handoff:replay_green:verdict:${verdictId}`
-        );
-        expect(first.judge).toBe(0);
-        expect(first.coordinator).toBe(0);
-        expect(first.handoff).toBe(1);
-        expect(second.handoff).toBe(0);
-        expect(second.judge).toBe(0);
-        expect(second.coordinator).toBe(0);
-        expect(row?.proposedAction).toBe('flag_merge_ready');
-        expect(live).toHaveLength(1);
-        expect(await promoteObserveOrHealthyVerdict(verdictId)).toBe(false);
+              },
+            }),
+        verdictStore: input.store ?? realVerdictStore(),
+        judge: async (envelope, judgeOptions) => {
+          tally.judge += 1;
+          if (input.judge) return input.judge(envelope, judgeOptions);
+          return verdictOutcome();
+        },
+        escalate: fakeEscalate,
       }
-    });
+    );
+    return tally;
+  }
 
-    test('replay green Test 7: unsafe rows are not promoted by the real adapter', async () => {
+  testIsolated('replay green Test 7: safe actions promote once on the real adapter', async () => {
+    const cases = [
+      ['observe', 'none'],
+      ['observe', 'verdict_write'],
+      ['observe', 'comment_findings'],
+      ['healthy', 'none'],
+      ['healthy', 'verdict_write'],
+      ['healthy', 'comment_findings'],
+    ] as const;
+    for (const [verdict, proposedAction] of cases) {
+      const runId = `run-safe-${verdict}-${proposedAction}`;
+      await seedCompletedRun(runId);
+      const verdictId = await seedVerdict({ runId, verdict, proposedAction });
+      const first = await runRealReplay({ runId, evidence: prEvidence(0) });
+      const second = await runRealReplay({ runId, evidence: prEvidence(0) });
+      const row = await getVerdictByRunHead({ runId, headSha: 'H' });
+      const actions = await getOverseerActionsForRun(runId);
+      const live = actions.filter(
+        action =>
+          action.action === 'flag_merge_ready' &&
+          action.result === `steward_handoff:replay_green:verdict:${verdictId}`
+      );
+      expect(first.judge).toBe(0);
+      expect(first.coordinator).toBe(0);
+      expect(first.handoff).toBe(1);
+      expect(second.handoff).toBe(0);
+      expect(second.judge).toBe(0);
+      expect(second.coordinator).toBe(0);
+      expect(row?.proposedAction).toBe('flag_merge_ready');
+      expect(live).toHaveLength(1);
+      expect(await promoteObserveOrHealthyVerdict(verdictId)).toBe(false);
+    }
+  });
+
+  testIsolated(
+    'replay green Test 7: unsafe rows are not promoted by the real adapter',
+    async () => {
       const blocked: { id: string; verdict: string; action: string | null; actioned?: boolean }[] =
         [
           {
@@ -1354,9 +1331,12 @@ if (soleJudgeFirstFile) {
         expect(row?.proposedAction).toBe(blockedRow.action);
         expect(actions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
       }
-    });
+    }
+  );
 
-    test('replay green Test 7: raced escalation is refused by the conditional update', async () => {
+  testIsolated(
+    'replay green Test 7: raced escalation is refused by the conditional update',
+    async () => {
       const runId = 'run-race-escalate';
       await seedCompletedRun(runId);
       const verdictId = await seedVerdict({
@@ -1388,9 +1368,12 @@ if (soleJudgeFirstFile) {
       expect(await promoteObserveOrHealthyVerdict(verdictId)).toBe(false);
       expect(row?.proposedAction).toBe('escalate_with_evidence');
       expect(actions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
-    });
+    }
+  );
 
-    test('replay green Test 7: concurrent green ticks promote and hand off once', async () => {
+  testIsolated(
+    'replay green Test 7: concurrent green ticks promote and hand off once',
+    async () => {
       const runId = 'run-concurrent-green';
       await seedCompletedRun(runId);
       const verdictId = await seedVerdict({
@@ -1415,59 +1398,62 @@ if (soleJudgeFirstFile) {
       expect(tally.judge).toBe(0);
       expect(row?.proposedAction).toBe('flag_merge_ready');
       expect(live).toHaveLength(1);
-    });
+    }
+  );
 
-    test('replay green: receipt insert failure rolls the promotion back', async () => {
-      const runId = 'run-receipt-fail';
-      await seedCompletedRun(runId);
-      const verdictId = await seedVerdict({
+  testIsolated('replay green: receipt insert failure rolls the promotion back', async () => {
+    const runId = 'run-receipt-fail';
+    await seedCompletedRun(runId);
+    const verdictId = await seedVerdict({
+      runId,
+      verdict: 'observe',
+      proposedAction: 'comment_findings',
+    });
+    // The revert trigger fails any compensating UPDATE that tries to leave
+    // flag_merge_ready after it has committed. Only a transaction that rolls
+    // the promotion back with the failed receipt keeps the prior action.
+    await installReceiptFailureGuards(runId);
+    let failed: { handoff: number; coordinator: number; judge: number };
+    try {
+      failed = await runRealReplay({
         runId,
-        verdict: 'observe',
-        proposedAction: 'comment_findings',
+        evidence: prEvidence(0),
       });
-      // The revert trigger fails any compensating UPDATE that tries to leave
-      // flag_merge_ready after it has committed. Only a transaction that rolls
-      // the promotion back with the failed receipt keeps the prior action.
-      await installReceiptFailureGuards();
-      let failed: { handoff: number; coordinator: number; judge: number };
-      try {
-        failed = await runRealReplay({
-          runId,
-          evidence: prEvidence(0),
-        });
-      } finally {
-        await dropReceiptFailureGuards();
-      }
-      const unchanged = await getVerdictByRunHead({ runId, headSha: 'H' });
-      const failedActions = await getOverseerActionsForRun(runId);
-      expect(failed.handoff).toBe(0);
-      expect(failed.coordinator).toBe(0);
-      expect(failed.judge).toBe(0);
-      expect(unchanged?.proposedAction).toBe('comment_findings');
-      expect(failedActions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
-      expect((await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)).toBe(
-        false
-      );
+    } finally {
+      await dropReceiptFailureGuards();
+    }
+    const unchanged = await getVerdictByRunHead({ runId, headSha: 'H' });
+    const failedActions = await getOverseerActionsForRun(runId);
+    expect(failed.handoff).toBe(0);
+    expect(failed.coordinator).toBe(0);
+    expect(failed.judge).toBe(0);
+    expect(unchanged?.proposedAction).toBe('comment_findings');
+    expect(failedActions.filter(action => action.action === 'flag_merge_ready')).toHaveLength(0);
+    expect((await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)).toBe(
+      false
+    );
 
-      const retried = await runRealReplay({ runId, evidence: prEvidence(0) });
-      const promoted = await getVerdictByRunHead({ runId, headSha: 'H' });
-      const retriedActions = await getOverseerActionsForRun(runId);
-      expect(retried.handoff).toBe(1);
-      expect(retried.coordinator).toBe(0);
-      expect(promoted?.proposedAction).toBe('flag_merge_ready');
-      expect(
-        retriedActions.filter(
-          action =>
-            action.action === 'flag_merge_ready' &&
-            action.result === `steward_handoff:replay_green:verdict:${verdictId}`
-        )
-      ).toHaveLength(1);
-      expect((await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)).toBe(
-        true
-      );
-    });
+    const retried = await runRealReplay({ runId, evidence: prEvidence(0) });
+    const promoted = await getVerdictByRunHead({ runId, headSha: 'H' });
+    const retriedActions = await getOverseerActionsForRun(runId);
+    expect(retried.handoff).toBe(1);
+    expect(retried.coordinator).toBe(0);
+    expect(promoted?.proposedAction).toBe('flag_merge_ready');
+    expect(
+      retriedActions.filter(
+        action =>
+          action.action === 'flag_merge_ready' &&
+          action.result === `steward_handoff:replay_green:verdict:${verdictId}`
+      )
+    ).toHaveLength(1);
+    expect((await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)).toBe(
+      true
+    );
+  });
 
-    test('replay green Test 8: watch selector keeps a commented observe until green, then drops it', async () => {
+  testIsolated(
+    'replay green Test 8: watch selector keeps a commented observe until green, then drops it',
+    async () => {
       const runId = 'run-watch-observe';
       await seedCompletedRun(runId);
       const initial = await runRealReplay({
@@ -1521,76 +1507,63 @@ if (soleJudgeFirstFile) {
           action => action.result === `steward_handoff:replay_green:verdict:${verdictId}`
         )
       ).toHaveLength(1);
-    });
+    }
+  );
 
-    test('replay green Test 8: excluded rows do not hand off', async () => {
-      const excluded = [
-        ['run-ex-human', 'needs_human', 'escalate_with_evidence', 'comment_findings'],
-        ['run-ex-genuine', 'failed_genuine', 'escalate_with_evidence', 'comment_findings'],
-        ['run-ex-dup', 'duplicate_work', 'comment_findings', 'comment_findings'],
-        ['run-ex-escalation', 'observe', 'comment_findings', 'escalate_with_evidence'],
-        ['run-ex-closed-watch', 'observe', 'none', 'watch_closed'],
-        ['run-ex-merged', 'healthy', 'verdict_write', 'merged'],
-        ['run-ex-tier', 'observe', 'none', 'tier_refused'],
-        ['run-ex-denied', 'healthy', 'comment_findings', 'escalation_denied'],
-      ] as const;
-      for (const [runId, verdict, proposedAction, terminalAction] of excluded) {
-        await seedCompletedRun(runId);
-        await seedVerdict({ runId, verdict, proposedAction });
-        await insertOverseerAction({
-          runId,
-          woId: 'WO-REPLAY-GREEN-01',
-          class: 'none',
-          action: terminalAction,
-          result: 'terminal',
-        });
-        expect((await listRunsForOverseerWatch()).map(run => run.id)).not.toContain(runId);
-        if (verdict !== 'observe' && verdict !== 'healthy') {
-          const tick = await runRealReplay({ runId, evidence: prEvidence(0) });
-          expect(tick.handoff).toBe(0);
-          expect(tick.coordinator).toBe(0);
-          expect(tick.judge).toBe(0);
-        }
-      }
-
-      const closedId = 'run-ex-closed-pr';
-      await seedCompletedRun(closedId);
-      await seedVerdict({ runId: closedId, verdict: 'observe', proposedAction: 'none' });
-      const closed = await runRealReplay({
-        runId: closedId,
-        action: 'ignore',
-        evidence: { ...prEvidence(0), state: 'closed' },
-      });
-      expect(closed.handoff).toBe(0);
-      const closedActions = await getOverseerActionsForRun(closedId);
-      expect(closedActions.some(action => action.action === 'flag_merge_ready')).toBe(false);
-      expect(closedActions.some(action => action.action === 'watch_closed')).toBe(true);
-
-      const discoveryId = 'pr-discovery:thinmansoftware/bdc-harness#1373';
-      await claimOverseerVerdict({
-        runId: discoveryId,
+  testIsolated('replay green Test 8: excluded rows do not hand off', async () => {
+    const excluded = [
+      ['run-ex-human', 'needs_human', 'escalate_with_evidence', 'comment_findings'],
+      ['run-ex-genuine', 'failed_genuine', 'escalate_with_evidence', 'comment_findings'],
+      ['run-ex-dup', 'duplicate_work', 'comment_findings', 'comment_findings'],
+      ['run-ex-escalation', 'observe', 'comment_findings', 'escalate_with_evidence'],
+      ['run-ex-closed-watch', 'observe', 'none', 'watch_closed'],
+      ['run-ex-merged', 'healthy', 'verdict_write', 'merged'],
+      ['run-ex-tier', 'observe', 'none', 'tier_refused'],
+      ['run-ex-denied', 'healthy', 'comment_findings', 'escalation_denied'],
+    ] as const;
+    for (const [runId, verdict, proposedAction, terminalAction] of excluded) {
+      await seedCompletedRun(runId);
+      await seedVerdict({ runId, verdict, proposedAction });
+      await insertOverseerAction({
+        runId,
         woId: 'WO-REPLAY-GREEN-01',
-        headSha: 'H',
+        class: 'none',
+        action: terminalAction,
+        result: 'terminal',
       });
-      expect(
-        (await listRunsForOverseerWatch()).some(run => run.id.startsWith('pr-discovery:'))
-      ).toBe(false);
-    });
-  });
-}
+      expect((await listRunsForOverseerWatch()).map(run => run.id)).not.toContain(runId);
+      if (verdict !== 'observe' && verdict !== 'healthy') {
+        const tick = await runRealReplay({ runId, evidence: prEvidence(0) });
+        expect(tick.handoff).toBe(0);
+        expect(tick.coordinator).toBe(0);
+        expect(tick.judge).toBe(0);
+      }
+    }
 
-if (!soleJudgeFirstFile) {
-  test('replay green real adapter executes in an isolated process', () => {
-    const child = Bun.spawnSync(['bun', 'test', import.meta.path, '--timeout', '30000'], {
-      cwd: process.cwd(),
-      env: process.env,
-      stdout: 'pipe',
-      stderr: 'pipe',
+    const closedId = 'run-ex-closed-pr';
+    await seedCompletedRun(closedId);
+    await seedVerdict({ runId: closedId, verdict: 'observe', proposedAction: 'none' });
+    const closed = await runRealReplay({
+      runId: closedId,
+      action: 'ignore',
+      evidence: { ...prEvidence(0), state: 'closed' },
     });
-    const output = new TextDecoder().decode(child.stdout) + new TextDecoder().decode(child.stderr);
-    expect(child.exitCode, output).toBe(0);
+    expect(closed.handoff).toBe(0);
+    const closedActions = await getOverseerActionsForRun(closedId);
+    expect(closedActions.some(action => action.action === 'flag_merge_ready')).toBe(false);
+    expect(closedActions.some(action => action.action === 'watch_closed')).toBe(true);
+
+    const discoveryId = 'pr-discovery:thinmansoftware/bdc-harness#1373';
+    await claimOverseerVerdict({
+      runId: discoveryId,
+      woId: 'WO-REPLAY-GREEN-01',
+      headSha: 'H',
+    });
+    expect((await listRunsForOverseerWatch()).some(run => run.id.startsWith('pr-discovery:'))).toBe(
+      false
+    );
   });
-}
+});
 
 describe('evidence envelope: bounded by construction', () => {
   test('caps the event tail at 20 and truncates long messages', () => {
