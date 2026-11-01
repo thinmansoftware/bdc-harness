@@ -123,6 +123,7 @@ function fakeDeps(queued: DispatchMessage[]): DutyOfficerClockDeps & {
       const found = queued.find(item => item.id === input.id);
       return found ? { ...found, status: 'queued' as const, lease_owner: null } : null;
     }),
+    requeueExpiredClaims: mock(async () => []),
     createAuthenticatedMessage: mock(async (_context, data) => {
       if (data.subject_key != null) normalizeDispatchSubjectKey(data.subject_key);
       return { id: 'xo-msg' };
@@ -572,6 +573,27 @@ describe('duty officer nudge delivery evidence', () => {
 });
 
 describe('duty officer clock', () => {
+  test('requeues expired claims before listing queued rows', async () => {
+    const order: string[] = [];
+    const deps = fakeDeps([]);
+    const requeue = deps.requeueExpiredClaims;
+    const list = deps.listMessages;
+    deps.requeueExpiredClaims = mock(async now => {
+      order.push('requeue');
+      return requeue(now);
+    });
+    deps.listMessages = mock(async filters => {
+      order.push('list');
+      return list(filters);
+    });
+
+    await tickDutyOfficerClock(deps);
+
+    expect(order[0]).toBe('requeue');
+    expect(order.indexOf('list')).toBeGreaterThan(0);
+    expect(deps.requeueExpiredClaims).toHaveBeenCalledTimes(1);
+  });
+
   test.each(['before-write', 'after-write', 'completion-before-write'] as const)(
     'generic relay failure %s is held, respects backoff and retries without duplicate delivery',
     async failure => {

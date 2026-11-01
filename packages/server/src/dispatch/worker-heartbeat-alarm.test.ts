@@ -216,6 +216,7 @@ function tickDeps(
     claimMessage: mock(async () => null),
     postResult: mock(async () => null),
     releaseMessage: mock(async () => null),
+    requeueExpiredClaims: mock(async () => []),
     createAuthenticatedMessage: mock(async () => ({ id: 'xo-msg' })),
     getCurrentXoLease: mock(async () => null),
     listStaleIssues: mock(async () => []),

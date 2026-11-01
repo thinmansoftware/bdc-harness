@@ -889,15 +889,49 @@ describe('SqliteAdapter', () => {
   });
 
   describe('UPDATE/DELETE with RETURNING', () => {
-    test('throws error for UPDATE RETURNING', async () => {
+    test('returns only the updated row via native RETURNING', async () => {
+      db = createTestDb();
+      await insertCodebase(db, 'cb-1');
+      await db.query(
+        `INSERT INTO remote_agent_isolation_environments
+         (id, codebase_id, workflow_type, workflow_id, provider, working_path, branch_name, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        ['keep-id', 'cb-1', 'issue', '1', 'worktree', '/tmp/keep', 'issue-1', 'active']
+      );
+      await db.query(
+        `INSERT INTO remote_agent_isolation_environments
+         (id, codebase_id, workflow_type, workflow_id, provider, working_path, branch_name, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        ['drop-id', 'cb-1', 'issue', '2', 'worktree', '/tmp/drop', 'issue-2', 'active']
+      );
+
+      const result = await db.query<{ id: string; status: string }>(
+        `UPDATE remote_agent_isolation_environments
+         SET status = $1
+         WHERE id = $2
+         RETURNING id, status`,
+        ['destroyed', 'drop-id']
+      );
+
+      expect(result.rows).toEqual([{ id: 'drop-id', status: 'destroyed' }]);
+      expect(result.rowCount).toBe(1);
+      const remaining = await db.query<{ id: string; status: string }>(
+        `SELECT id, status FROM remote_agent_isolation_environments ORDER BY id`
+      );
+      expect(remaining.rows).toEqual([
+        { id: 'drop-id', status: 'destroyed' },
+        { id: 'keep-id', status: 'active' },
+      ]);
+    });
+
+    test('throws error for DELETE RETURNING', async () => {
       db = createTestDb();
 
       await expect(
-        db.query(
-          `UPDATE remote_agent_isolation_environments SET status = $1 WHERE id = $2 RETURNING *`,
-          ['destroyed', 'test-id']
-        )
-      ).rejects.toThrow('does not support RETURNING clause on UPDATE/DELETE');
+        db.query(`DELETE FROM remote_agent_isolation_environments WHERE id = $1 RETURNING *`, [
+          'test-id',
+        ])
+      ).rejects.toThrow('does not support RETURNING clause on DELETE');
     });
   });
 

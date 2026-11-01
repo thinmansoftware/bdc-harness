@@ -285,11 +285,14 @@ export class SqliteAdapter implements IDatabase {
       } else {
         const upperSql = sql.toUpperCase();
 
-        // Handle INSERT with RETURNING using native SQLite RETURNING (3.35+)
-        // We must use .all() instead of .run() because .run() discards
-        // RETURNING results, and its lastInsertRowid is unreliable when
-        // ON CONFLICT DO UPDATE fires.
-        if (upperSql.includes('RETURNING') && upperSql.includes('INSERT')) {
+        // INSERT and UPDATE with RETURNING use native SQLite RETURNING (3.35+).
+        // .all() is required: .run() discards RETURNING rows, and lastInsertRowid
+        // is unreliable when ON CONFLICT DO UPDATE fires. The returned rows are
+        // the mutation's own RETURNING set.
+        if (
+          upperSql.includes('RETURNING') &&
+          (upperSql.includes('INSERT') || upperSql.includes('UPDATE'))
+        ) {
           const stmt = this.db.prepare(convertedSql);
           try {
             const rows = stmt.all(...sqliteParams) as T[];
@@ -299,10 +302,11 @@ export class SqliteAdapter implements IDatabase {
           }
         }
 
-        // UPDATE/DELETE with RETURNING not supported
+        // DELETE ... RETURNING is still rejected. .run() would report a change
+        // count and drop the RETURNING payload.
         if (upperSql.includes('RETURNING')) {
           throw new Error(
-            'SQLite adapter does not support RETURNING clause on UPDATE/DELETE statements. ' +
+            'SQLite adapter does not support RETURNING clause on DELETE statements. ' +
               `Query: ${convertedSql.substring(0, 100)}... ` +
               'Hint: Use a SELECT before the mutation if you need the row data.'
           );

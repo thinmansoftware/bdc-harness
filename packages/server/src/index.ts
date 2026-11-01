@@ -68,7 +68,12 @@ import {
   startDispatchEscalationClock,
   stopDispatchEscalationClock,
 } from './dispatch/escalation-clock';
-import { startReviewWorkerClock, stopReviewWorkerClock } from './dispatch/review-worker-clock';
+import {
+  bootInProcessDispatchClocks,
+  startReviewWorkerClock,
+  stopReviewWorkerClock,
+} from './dispatch/review-worker-clock';
+import { requeueExpiredClaims } from '@archon/core/db/dispatch';
 import { startDutyOfficerClock, stopDutyOfficerClock } from './dispatch/duty-officer-clock';
 import {
   startWorkerHeartbeatAlarmTimer,
@@ -687,13 +692,23 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       }
     });
     getLog().info('overseer_review_route_registered');
-    startReviewWorkerClock(reviewRouteConfig);
   } else {
     getLog().info(
       'overseer_review_route_not_configured: set OVERSEER_REVIEW_WEBHOOK_SECRET and OVERSEER_REVIEW_IDENTITY to enable'
     );
   }
-  startDutyOfficerClock();
+  try {
+    await bootInProcessDispatchClocks({
+      now: new Date().toISOString(),
+      reviewConfig: reviewRouteConfig,
+      requeueExpiredClaims,
+      startReviewWorkerClock,
+      startDutyOfficerClock,
+    });
+  } catch (err) {
+    getLog().fatal({ err }, 'dispatch.expired_claims_requeue_failed');
+    process.exit(1);
+  }
   // Dedicated fast timer (default 60s) that pages John for a dead/restarted
   // Dispatch worker, independent of the 15-minute Duty Officer tick.
   startWorkerHeartbeatAlarmTimer();
