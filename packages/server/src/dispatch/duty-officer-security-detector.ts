@@ -25,7 +25,7 @@ export interface SecurityDetectorReason {
 }
 export interface SecurityDetectorDeps {
   fetchImpl: typeof fetch;
-  readToken: () => Promise<string | null>;
+  readToken: (signal?: AbortSignal) => Promise<string | null>;
   writeTokenProvider: (signal: AbortSignal) => Promise<string | null>;
   signal?: AbortSignal;
   now: () => Date;
@@ -324,8 +324,14 @@ export async function runSecurityDetector(
     wrote: [],
   };
   signal.throwIfAborted();
-  const token = await deps.readToken();
-  signal.throwIfAborted();
+  let token: string | null;
+  try {
+    token = await abortable(deps.readToken(signal), signal);
+  } catch (error) {
+    if (!signal.aborted) throw error;
+    token = null;
+  }
+  if (!signal.aborted) signal.throwIfAborted();
   if (!token) {
     result.verdict = 'observation_error';
     result.last_error = 'duty_officer_github_token_missing';

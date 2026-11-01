@@ -1,0 +1,89 @@
+{
+  "slots": [
+    {
+      "companion_id": "grokbot",
+      "enabled": true,
+      "dispatch_principal_id": "grokbot",
+      "token_sha256_file": "/run/companion-mcp/digests/grokbot.sha256",
+      "token_expires_at": "2099-01-01T00:00:00.000Z",
+      "dispatch_credential_file": "/run/companion-mcp/dispatch/grokbot",
+      "tools": [
+        "wiki_search",
+        "wiki_read",
+        "oracle_query",
+        "mailbox_send",
+        "mailbox_list",
+        "mailbox_read",
+        "mailbox_ack",
+        "board_record_search",
+        "board_record_read",
+        "board_brief_send",
+        "board_replies_collect",
+        "board_record_propose"
+      ],
+      "allowed_recipients": ["xo", "astra", "claude", "codex", "grok", "fable"],
+      "board_secretary": true,
+      "board_seat_recipients": ["astra", "fable", "grok", "claude", "codex"]
+    },
+    {
+      "companion_id": "dot",
+      "enabled": false,
+      "dispatch_principal_id": "dot",
+      "token_sha256_file": "/run/companion-mcp/digests/dot.sha256",
+      "token_expires_at": "2099-01-01T00:00:00.000Z",
+      "dispatch_credential_file": "/run/companion-mcp/dispatch/dot",
+      "tools": [
+        "wiki_search",
+        "wiki_read",
+        "oracle_query",
+        "mailbox_send",
+        "mailbox_list",
+        "mailbox_read",
+        "mailbox_ack"
+      ],
+      "allowed_recipients": ["xo", "astra"],
+      "board_secretary": false,
+      "board_seat_recipients": ["astra", "fable", "grok"]
+    },
+    {
+      "companion_id": "muse",
+      "enabled": false,
+      "dispatch_principal_id": "muse",
+      "token_sha256_file": "/run/companion-mcp/digests/muse.sha256",
+      "token_expires_at": "2099-01-01T00:00:00.000Z",
+      "dispatch_credential_file": "/run/companion-mcp/dispatch/muse",
+      "tools": [
+        "wiki_search",
+        "wiki_read",
+        "oracle_query",
+        "mailbox_send",
+        "mailbox_list",
+        "mailbox_read",
+        "mailbox_ack"
+      ],
+      "allowed_recipients": ["xo", "astra"],
+      "board_secretary": false,
+      "board_seat_recipients": ["astra", "fable", "grok"]
+    },
+    {
+      "companion_id": "duet",
+      "enabled": false,
+      "dispatch_principal_id": "duet",
+      "token_sha256_file": "/run/companion-mcp/digests/duet.sha256",
+      "token_expires_at": "2099-01-01T00:00:00.000Z",
+      "dispatch_credential_file": "/run/companion-mcp/dispatch/duet",
+      "tools": [
+        "wiki_search",
+        "wiki_read",
+        "oracle_query",
+        "mailbox_send",
+        "mailbox_list",
+        "mailbox_read",
+        "mailbox_ack"
+      ],
+      "allowed_recipients": ["xo", "astra"],
+      "board_secretary": false,
+      "board_seat_recipients": ["astra", "fable", "grok"]
+    }
+  ]
+}

@@ -241,6 +241,13 @@ describe('PostgresAdapter', () => {
         // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065).
         ['t3-desktop', 'T3 desktop results queue', 'drain_on_start', 'TRUE'],
         ['pr-review-log', 'PR review receipt log', 'drain_on_start', 'TRUE'],
+        // WO-HARNESS-COMPANION-MCP-MAILBOX-01 (migration 065): companion
+        // mailboxes added after Phase 0. combined carries them; migration 040
+        // must not.
+        ['grokbot', 'Grok Bot (voice companion)', 'drain_on_start', 'TRUE'],
+        ['dot', 'Dot (voice companion)', 'drain_on_start', 'FALSE'],
+        ['muse', 'Muse (voice companion)', 'drain_on_start', 'FALSE'],
+        ['duet', 'Duet (voice companion)', 'drain_on_start', 'FALSE'],
       ] as const;
 
       expect(migration).toContain(

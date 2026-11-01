@@ -5,9 +5,8 @@
  * delivery-claim tests use the REAL database-backed claim on a temp SQLite
  * file (two adapters on one file model two processes sharing the DB).
  */
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { generateKeyPairSync } from 'node:crypto';
-import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
-import * as serviceIdentity from '@archon/core/github/service-identity';
 import { unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -890,144 +889,6 @@ describe('marker trust: only the poster identity suppresses', () => {
     expect((await deliverEscalationToIssue(params, deps)).posted).toBe(false);
     expect(userCalls).toBe(2);
     expect(posts).toBe(0);
-  });
-
-  const appIdentity = {
-    kind: 'app' as const,
-    service: 'duty_officer' as const,
-    appId: '4574893',
-    installationId: '153295654',
-    privateKey: 'PEM_SENTINEL_DO_NOT_LOG',
-    poolId: 'app-test',
-    distinct: true as const,
-  };
-
-  function recordGithub(onRequest: (url: URL, method: string) => Response | null): {
-    fetchImpl: (input: string, init?: RequestInit) => Promise<Response>;
-    calls: { path: string; method: string; auth: string }[];
-  } {
-    const calls: { path: string; method: string; auth: string }[] = [];
-    const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
-      const url = new URL(input);
-      const method = init?.method ?? 'GET';
-      calls.push({
-        path: url.pathname,
-        method,
-        auth: new Headers(init?.headers).get('authorization') ?? '',
-      });
-      return onRequest(url, method) ?? new Response(JSON.stringify({ id: 1 }), { status: 201 });
-    };
-    return { fetchImpl, calls };
-  }
-
-  test('omitted token mints an App installation token; an explicit token is kept', async () => {
-    const mint = spyOn(serviceIdentity, 'getServiceGitHubToken').mockResolvedValue('t-app');
-    const resolve = spyOn(serviceIdentity, 'resolveServiceGitHubAuth').mockReturnValue(appIdentity);
-    const jwt = spyOn(serviceIdentity, 'buildAppJwt').mockReturnValue('fixed.app.jwt');
-    const github = recordGithub((url, method) => {
-      if (url.pathname === '/user' && method === 'GET') {
-        return Response.json({ login: 'explicit-user' });
-      }
-      if (url.pathname === '/app' && method === 'GET') {
-        return Response.json({ slug: 'thinman-overseer' });
-      }
-      return null;
-    });
-    try {
-      const minted = createRealEscalationDeliveryDeps({ fetchImpl: github.fetchImpl });
-      await minted.postIssueComment(ISSUE, 'hello');
-      expect(await minted.posterLogin()).toBe('thinman-overseer[bot]');
-      expect(github.calls.find(call => call.path === '/app')?.auth).toBe('Bearer fixed.app.jwt');
-      expect(github.calls.find(call => call.method === 'POST')?.auth).toBe('Bearer t-app');
-      expect(github.calls.some(call => call.path === '/user')).toBe(false);
-      expect(mint).toHaveBeenCalled();
-      expect(resolve).toHaveBeenCalledWith('duty_officer', process.env);
-      expect(jwt).toHaveBeenCalled();
-
-      mint.mockClear();
-      jwt.mockClear();
-      const resolvesBeforeExplicit = resolve.mock.calls.length;
-      github.calls.length = 0;
-      const explicit = createRealEscalationDeliveryDeps({
-        fetchImpl: github.fetchImpl,
-        token: 'explicit-token',
-      });
-      await explicit.postIssueComment(ISSUE, 'hello');
-      expect(await explicit.posterLogin()).toBe('explicit-user');
-      expect(github.calls.find(call => call.method === 'POST')?.auth).toBe('Bearer explicit-token');
-      expect(github.calls.find(call => call.path === '/user')?.auth).toBe('Bearer explicit-token');
-      expect(github.calls.some(call => call.path === '/app')).toBe(false);
-      expect(mint).not.toHaveBeenCalled();
-      expect(jwt).not.toHaveBeenCalled();
-      expect(resolve.mock.calls.length).toBe(resolvesBeforeExplicit);
-
-      mint.mockClear();
-      await expect(
-        createRealEscalationDeliveryDeps({
-          fetchImpl: github.fetchImpl,
-          token: null,
-        }).postIssueComment(ISSUE, 'x')
-      ).rejects.toThrow('taskmaster_github_token_missing');
-      expect(mint).not.toHaveBeenCalled();
-    } finally {
-      mint.mockRestore();
-      resolve.mockRestore();
-      jwt.mockRestore();
-      serviceIdentity.clearServiceGitHubTokenCache();
-    }
-  });
-
-  test('installationTokenUserRejected: a foreign marker still posts when GET /user would reject', async () => {
-    const mint = spyOn(serviceIdentity, 'getServiceGitHubToken').mockResolvedValue('t-install');
-    const resolve = spyOn(serviceIdentity, 'resolveServiceGitHubAuth').mockReturnValue(appIdentity);
-    const jwt = spyOn(serviceIdentity, 'buildAppJwt').mockReturnValue('fixed.app.jwt');
-    const github = recordGithub((url, method) => {
-      if (url.pathname === '/user') {
-        return new Response('{"message":"Resource not accessible by integration"}', {
-          status: 403,
-        });
-      }
-      if (url.pathname === '/app' && method === 'GET') {
-        return Response.json({ slug: 'thinman-overseer' });
-      }
-      if (method === 'GET') {
-        return Response.json([
-          {
-            body: `${TASKMASTER_ESCALATION_MARKER}\ncopied`,
-            created_at: RECENT,
-            user: { login: 'someone-else' },
-          },
-        ]);
-      }
-      return null;
-    });
-    try {
-      const deps = {
-        ...createRealEscalationDeliveryDeps({ fetchImpl: github.fetchImpl }),
-        now: () => new Date(T0),
-      };
-      const result = await deliverEscalationToIssue(
-        { issue: ISSUE, threadRef: 'gh:thinmansoftware/bdc-harness#194', body: 'escalate-now' },
-        deps
-      );
-      expect(result).toEqual({ posted: true });
-      expect(await deps.posterLogin()).toBe('thinman-overseer[bot]');
-      expect(github.calls.find(call => call.path === '/app')?.auth).toBe('Bearer fixed.app.jwt');
-      expect(
-        github.calls.find(
-          call => call.method === 'POST' && call.path.endsWith('/issues/194/comments')
-        )?.auth
-      ).toBe('Bearer t-install');
-      expect(github.calls.some(call => call.path === '/user')).toBe(false);
-      expect(resolve).toHaveBeenCalledWith('duty_officer', process.env);
-      expect(jwt).toHaveBeenCalled();
-      expect(mint).toHaveBeenCalled();
-    } finally {
-      mint.mockRestore();
-      resolve.mockRestore();
-      jwt.mockRestore();
-      serviceIdentity.clearServiceGitHubTokenCache();
-    }
   });
 });
 

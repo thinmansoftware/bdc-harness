@@ -353,4 +353,100 @@ describe('worker heartbeat alarm under an App identity', () => {
       mint.mockRestore();
     }
   });
+
+  test('tokenMintStallsAlarm releases the clock guard when installation mint never resolves', async () => {
+    const savedGh = process.env.GH_TOKEN;
+    const savedGithub = process.env.GITHUB_TOKEN;
+    const savedTimeout = process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS;
+    const savedRepo = process.env.DUTY_OFFICER_GH_REPO;
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    delete process.env.DUTY_OFFICER_GH_REPO;
+    process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS = '50';
+    process.env.DISPATCH_WORKER_ALARM_WORKERS = 'A';
+    const nowMs = Date.parse('2026-09-28T12:00:00.000Z');
+    const alarm = alarmDeps({
+      workers: { A: worker('A', nowMs - 11 * MINUTE) },
+      now: () => nowMs,
+    });
+    const deps = tickDeps(alarm, () => new Date(nowMs));
+    const calls: { method: string; authorization: string }[] = [];
+    const fetchMock = spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const method = init?.method ?? 'GET';
+      calls.push({
+        method,
+        authorization: new Headers(init?.headers).get('authorization') ?? '',
+      });
+      if (method === 'POST') return new Response(JSON.stringify({ id: 1 }), { status: 201 });
+      return Response.json([]);
+    });
+    const resolve = spyOn(serviceIdentity, 'resolveServiceGitHubAuth').mockReturnValue({
+      kind: 'app',
+      service: 'duty_officer',
+      appId: '4574893',
+      installationId: '153295654',
+      privateKey: 'PEM_SENTINEL_DO_NOT_LOG',
+      poolId: 'app-stall-alarm',
+      distinct: true,
+    });
+    let hangMint = true;
+    const mint = spyOn(serviceIdentity, 'getServiceGitHubToken').mockImplementation(() =>
+      hangMint ? new Promise<string>(() => {}) : Promise.resolve('t-app')
+    );
+    const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+      symbol => symbol.description === 'pino.stream'
+    );
+    if (streamSymbol === undefined) throw new Error('pino.stream symbol missing on rootLogger');
+    const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+      streamSymbol
+    ];
+    const lines: string[] = [];
+    const write = spyOn(stream, 'write').mockImplementation(line => {
+      lines.push(String(line));
+    });
+    const clockDeps: DutyOfficerClockDeps = {
+      ...deps,
+      securityDetector: mock(async () => null),
+      listAlarmIssueComments: listWorkerAlarmIssueComments,
+      postAlarmComment: postWorkerAlarmComment,
+    };
+    try {
+      await tickDutyOfficerClock(clockDeps);
+      expect(deps.listMessages).toHaveBeenCalled();
+      const joinedFirst = lines.join('');
+      expect(joinedFirst).toContain('worker_heartbeat_alarm_no_token');
+      expect(joinedFirst).not.toContain('worker_heartbeat_alarm_token_missing');
+      expect(calls).toEqual([]);
+      const listCallsAfterFirst = (deps.listMessages as unknown as { mock: { calls: unknown[][] } })
+        .mock.calls.length;
+
+      hangMint = false;
+      await tickDutyOfficerClock(clockDeps);
+      expect(
+        (deps.listMessages as unknown as { mock: { calls: unknown[][] } }).mock.calls.length
+      ).toBeGreaterThan(listCallsAfterFirst);
+      const posts = calls.filter(call => call.method === 'POST');
+      expect(posts).toEqual([{ method: 'POST', authorization: 'Bearer t-app' }]);
+      expect(
+        calls.some(call => call.method === 'GET' && call.authorization === 'Bearer t-app')
+      ).toBe(true);
+      const joined = lines.join('');
+      expect(joined).not.toContain('worker_heartbeat_alarm_token_missing');
+      expect(joined).not.toContain('t-app');
+      expect(joined).not.toContain('PEM_SENTINEL_DO_NOT_LOG');
+    } finally {
+      write.mockRestore();
+      fetchMock.mockRestore();
+      resolve.mockRestore();
+      mint.mockRestore();
+      if (savedTimeout === undefined) delete process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS;
+      else process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS = savedTimeout;
+      if (savedRepo === undefined) delete process.env.DUTY_OFFICER_GH_REPO;
+      else process.env.DUTY_OFFICER_GH_REPO = savedRepo;
+      if (savedGh === undefined) delete process.env.GH_TOKEN;
+      else process.env.GH_TOKEN = savedGh;
+      if (savedGithub === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = savedGithub;
+    }
+  });
 });

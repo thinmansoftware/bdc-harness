@@ -26,6 +26,14 @@ const LANE_FILES = [
 
 const DEFAULTS_DIR = join(import.meta.dir, '../../../../.archon/workflows/defaults');
 
+function toLf(text: string): string {
+  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+}
+
+function toCrlf(text: string): string {
+  return text.replace(/\n/g, '\r\n');
+}
+
 function openPrNode(yaml: string): string {
   // Windows checkout of text=auto YAML is CRLF. These anchors are
   // newline-terminated (see bdc-push-correctness.test.ts).
@@ -36,6 +44,30 @@ function openPrNode(yaml: string): string {
   const rest = text.slice(start + 1);
   const next = rest.indexOf('\n  - id: ', marker.length);
   return next < 0 ? rest : rest.slice(0, next);
+}
+
+function assertOpenPrGuard(node: string): void {
+  expect(node).toContain('ERROR: base_branch_mismatch');
+  expect(node).toContain('ERROR: recorded_base_branch_missing');
+  expect(node).toContain('# existing-pr-base-guard: begin');
+  expect(node).toContain('--json url,baseRefName');
+  expect(node).toContain('accept_open_pr_or_refuse');
+  expect(node).not.toContain('gh pr edit');
+  expect(node).not.toContain('.[0].url // empty');
+  expect(node).toContain('--base "$BASE_BRANCH"');
+  expect(node).not.toContain('${BASE_BRANCH:+--base');
+  expect(node).not.toContain('${BASE_BRANCH:-dev}');
+}
+
+function expectMissingOpenPrNode(yaml: string): void {
+  let thrown: unknown;
+  try {
+    openPrNode(yaml);
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(Error);
+  expect((thrown as Error).message).toBe('open-pr-if-needed node missing');
 }
 
 describe('resolveRecordedBaseBranch', () => {
@@ -113,21 +145,69 @@ describe('cauldron lane PR open guard', () => {
   test('each feature lane refuses a base mismatch inside open-pr-if-needed and does not retarget', () => {
     expect(LANE_FILES.length).toBe(13);
     for (const file of LANE_FILES) {
-      const lf = readFileSync(join(DEFAULTS_DIR, file), 'utf8').replace(/\r\n/g, '\n');
-      const copies = [lf, lf.replace(/\n/g, '\r\n')];
-      for (const yaml of copies) {
-        const node = openPrNode(yaml);
-        expect(node).toContain('ERROR: base_branch_mismatch');
-        expect(node).toContain('ERROR: recorded_base_branch_missing');
-        expect(node).toContain('# existing-pr-base-guard: begin');
-        expect(node).toContain('--json url,baseRefName');
-        expect(node).toContain('accept_open_pr_or_refuse');
-        expect(node).not.toContain('gh pr edit');
-        expect(node).not.toContain('.[0].url // empty');
-        expect(node).toContain('--base "$BASE_BRANCH"');
-        expect(node).not.toContain('${BASE_BRANCH:+--base');
-        expect(node).not.toContain('${BASE_BRANCH:-dev}');
-      }
+      const raw = readFileSync(join(DEFAULTS_DIR, file), 'utf8');
+      const canonical = toLf(raw);
+      const crlfCheckout = toCrlf(canonical);
+      const fromCrlfCheckout = toLf(crlfCheckout);
+      expect(fromCrlfCheckout).toBe(canonical);
+      expect(canonical.includes('\r')).toBe(false);
+      expect(fromCrlfCheckout.includes('\r')).toBe(false);
+      const syntheticCrlf = toCrlf(canonical);
+      expect(syntheticCrlf.includes('\r\r\n')).toBe(false);
+      expect(toLf(syntheticCrlf)).toBe(canonical);
+      const lfNode = openPrNode(canonical);
+      const crlfNode = openPrNode(syntheticCrlf);
+      expect(lfNode).toBe(crlfNode);
+      assertOpenPrGuard(lfNode);
+      assertOpenPrGuard(crlfNode);
+    }
+  });
+
+  test('LF and CRLF extractions return the same node and exclude the next node', () => {
+    const lf =
+      '\n  - id: open-pr-if-needed\n    run: target-body\n  - id: next-node\n    run: adjacent-body\n';
+    const crlfCheckout = toCrlf(toLf(lf));
+    const canonical = toLf(crlfCheckout);
+    expect(canonical).toBe(toLf(lf));
+    expect(canonical.includes('\r')).toBe(false);
+    const syntheticCrlf = toCrlf(canonical);
+    expect(syntheticCrlf.includes('\r\r\n')).toBe(false);
+    expect(toLf(syntheticCrlf)).toBe(canonical);
+    const fromLf = openPrNode(canonical);
+    const fromCrlf = openPrNode(syntheticCrlf);
+    expect(fromLf).toBe(fromCrlf);
+    for (const node of [fromLf, fromCrlf]) {
+      expect(node).toContain('id: open-pr-if-needed');
+      expect(node).toContain('target-body');
+      expect(node).not.toContain('next-node');
+      expect(node).not.toContain('adjacent-body');
+    }
+  });
+
+  test('naive conversion of an existing CRLF checkout becomes CRCRLF and misses the node', () => {
+    const lf = '\n  - id: open-pr-if-needed\n    run: target-body\n';
+    const crlfCheckout = toCrlf(toLf(lf));
+    const crcrlf = crlfCheckout.replace(/\n/g, '\r\n');
+    expect(crcrlf.includes('\r\r\n')).toBe(true);
+    expectMissingOpenPrNode(crcrlf);
+    const canonical = toLf(crlfCheckout);
+    expect(canonical.includes('\r')).toBe(false);
+    const syntheticCrlf = toCrlf(canonical);
+    expect(syntheticCrlf.includes('\r\r\n')).toBe(false);
+    expect(openPrNode(canonical)).toBe(openPrNode(syntheticCrlf));
+  });
+
+  test('a missing node and a differently named node throw for LF and CRLF', () => {
+    const absent = '\n  - id: some-other-node\n    run: nope\n';
+    const differentlyNamed = '\n  - id: open-pr-if-needed-extra\n    run: nope\n';
+    for (const source of [absent, differentlyNamed]) {
+      const canonical = toLf(source);
+      const crlfCheckout = toCrlf(canonical);
+      expect(toLf(crlfCheckout)).toBe(canonical);
+      expect(canonical.includes('\r')).toBe(false);
+      expect(crlfCheckout.includes('\r\r\n')).toBe(false);
+      expectMissingOpenPrNode(canonical);
+      expectMissingOpenPrNode(toCrlf(canonical));
     }
   });
 });
