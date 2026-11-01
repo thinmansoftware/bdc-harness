@@ -105,10 +105,12 @@ import {
 import type { IPlatformAdapter } from '@archon/core';
 import {
   createLogger,
+  getArchonHome,
   logArchonPaths,
   validateAppDefaultsPaths,
   shutdownTelemetry,
 } from '@archon/paths';
+import { notifyServedLaneUniqueEdits } from '../../../scripts/served-lanes/sync';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -301,6 +303,12 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   } catch (error) {
     getLog().fatal({ err: error }, 'startup_running_reconciliation_failed');
     process.exit(1);
+  }
+
+  try {
+    await notifyServedLaneUniqueEdits(join(getArchonHome(), 'served-lanes-report.json'));
+  } catch (error) {
+    getLog().warn({ err: error }, 'served_lanes.notice_failed');
   }
 
   startOverseerRuntimeWithRealMergeManager();
