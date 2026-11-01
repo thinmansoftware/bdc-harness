@@ -1,7 +1,9 @@
 import { appendFile, mkdir, open, readdir, rename, unlink } from 'node:fs/promises';
 import { createHash, randomUUID } from 'crypto';
 import { join } from 'path';
+import { getCurrentXoLease } from '@archon/core/db/board-authority';
 import {
+  createAuthenticatedMessage,
   disposeMessageByMachine,
   heartbeatWorker,
   listMessagesBySeqCursor,
@@ -16,9 +18,23 @@ import {
   type InboxClassification,
   type InboxMessage,
 } from './inbox-reader-rules';
+import {
+  bodyContainsLeaseId,
+  buildXoActionMessageBody,
+  commentIsBeforeWatermark,
+  defaultListXoActionComments,
+  defaultProbeCoreRemaining,
+  firstLineContainsXoAction,
+  parseXoActionTimestamp,
+  selectSkippedXoActionCursor,
+  selectXoActionCursor,
+  xoActionListingBlockedByRate,
+  type XoActionComment,
+} from './xo-action-watch';
 
 export const INBOX_READER_WORKER_ID = 'inbox-reader';
 export const INBOX_READER_ACTOR = 'system:inbox-reader';
+const XO_ACTION_MARK = 'XO ACTION';
 
 type Mode = 'dry-run' | 'enforce';
 type Owner = 'consumer' | 'reader';
@@ -56,6 +72,13 @@ export interface AlertRow {
   detail: string;
 }
 
+export interface XoActionDigest {
+  scanned: number;
+  qualified: number;
+  sent: number;
+  skipped: null | 'rate_limit' | 'not_configured' | 'github_auth_missing' | 'rate_probe_failed';
+}
+
 export interface Digest {
   run_id: string;
   started_at: string;
@@ -70,6 +93,7 @@ export interface Digest {
   disposal_plan: { id: string; recipient: string; rule_id: string; reason: string }[];
   disposal_results: { id: string; ok: boolean; reason: string | null }[];
   alerts: AlertRow[];
+  xo_action: XoActionDigest;
   content_hash: string;
   last_run_at: string;
   run_file: string | null;
@@ -82,6 +106,7 @@ interface ReaderState {
   last_alert_at?: Record<string, string>;
   cursors?: Record<string, number>;
   rotation?: number;
+  xo_action_since?: string;
 }
 
 export interface InboxListFilters {
@@ -113,6 +138,10 @@ export interface InboxReaderDeps {
     warn: (data: unknown, message?: string) => void;
     error: (data: unknown, message?: string) => void;
   };
+  probeCoreRemaining?: () => Promise<number | null>;
+  listXoActionComments?: (sinceIso: string) => Promise<XoActionComment[]>;
+  getCurrentXoLease?: () => Promise<{ lease_id: string } | null>;
+  createXoActionMessage?: typeof createAuthenticatedMessage;
 }
 
 export interface InboxReaderRunResult {
@@ -220,7 +249,193 @@ function markdown(digest: Digest): string {
   for (const nudge of digest.nudges) {
     lines.push(`- ${nudge.collapse_key} x${nudge.count} (newest ${nudge.newest_created_at})`);
   }
+  lines.push('', xoActionDigestLine(digest.xo_action));
   return `${lines.join('\n')}\n`;
+}
+
+function xoActionDigestLine(step: XoActionDigest): string {
+  if (step.skipped) return `${XO_ACTION_MARK}: skipped ${step.skipped}`;
+  return `${XO_ACTION_MARK}: scanned ${step.scanned}, qualified ${step.qualified}, sent ${step.sent}`;
+}
+
+function emptyXoActionDigest(): XoActionDigest {
+  return { scanned: 0, qualified: 0, sent: 0, skipped: 'not_configured' };
+}
+
+interface XoActionWatchOutcome {
+  digest: XoActionDigest;
+  cursor?: string;
+}
+
+type InboxReaderLog = NonNullable<InboxReaderDeps['log']>;
+
+function xoActionSkip(
+  skipped: Exclude<XoActionDigest['skipped'], null | 'not_configured'>,
+  prior: string | undefined,
+  startedIso: string
+): XoActionWatchOutcome {
+  return {
+    digest: { scanned: 0, qualified: 0, sent: 0, skipped },
+    cursor: selectSkippedXoActionCursor(prior, startedIso),
+  };
+}
+
+/**
+ * Cursor after doorbell sends. GitHub `since` is inclusive, so a failed send
+ * stays in the next window: the cursor may move up to that comment and no
+ * further. Later successes are idempotent and are listed again. An unparseable
+ * failure timestamp holds the current window so the comment is still retried.
+ */
+function selectCursorAfterXoActionSends(input: {
+  prior: string | undefined;
+  startedIso: string;
+  comments: readonly { created_at: string }[];
+  earliestFailedAt: string | null;
+  failedWithoutTimestamp: boolean;
+}): string | null {
+  if (input.failedWithoutTimestamp) {
+    return selectSkippedXoActionCursor(input.prior, input.startedIso);
+  }
+  const advanced = selectXoActionCursor({
+    prior: input.prior,
+    startedIso: input.startedIso,
+    comments: input.comments,
+  });
+  if (input.earliestFailedAt === null) return advanced;
+  const failedMs = parseXoActionTimestamp(input.earliestFailedAt);
+  const floorMs = parseXoActionTimestamp(input.prior ?? input.startedIso);
+  if (failedMs === null || (floorMs !== null && failedMs < floorMs)) {
+    return selectSkippedXoActionCursor(input.prior, input.startedIso);
+  }
+  // No forward cursor was proposed (unknown page boundary). Keeping the prior
+  // window still includes the failed comment.
+  if (advanced === null) return null;
+  const advancedMs = parseXoActionTimestamp(advanced);
+  if (advancedMs === null || advancedMs > failedMs) return input.earliestFailedAt;
+  return advanced;
+}
+
+function xoActionCommentQualifies(
+  comment: XoActionComment,
+  leaseId: string,
+  watermarkMs: number | null
+): boolean {
+  if (comment.id === '') return false;
+  if (comment.issue === null || !Number.isSafeInteger(comment.issue) || comment.issue <= 0) {
+    return false;
+  }
+  if (commentIsBeforeWatermark(comment.created_at, watermarkMs)) return false;
+  if (firstLineContainsXoAction(comment.body)) return true;
+  return bodyContainsLeaseId(comment.body, leaseId);
+}
+
+/**
+ * Isolated GitHub doorbell. Failures are logged here and never added to the
+ * reader error list, so mailbox classification and disposal keep running.
+ */
+async function runXoActionWatch(
+  deps: InboxReaderDeps,
+  state: ReaderState,
+  started: Date,
+  logger: InboxReaderLog
+): Promise<XoActionWatchOutcome> {
+  if (!deps.probeCoreRemaining || !deps.listXoActionComments) {
+    return { digest: emptyXoActionDigest() };
+  }
+  const startedIso = started.toISOString();
+  const prior = state.xo_action_since;
+  let leaseId = '';
+  if (deps.getCurrentXoLease) {
+    try {
+      const lease = await deps.getCurrentXoLease();
+      if (!lease || lease.lease_id.length === 0) {
+        logger.info({}, 'xo_action_lease_empty');
+      } else {
+        leaseId = lease.lease_id;
+      }
+    } catch (error) {
+      logger.warn({ error }, 'xo_action_lease_read_failed');
+    }
+  }
+
+  let remaining: number | null;
+  try {
+    remaining = await deps.probeCoreRemaining();
+  } catch (error) {
+    logger.error({ error }, 'xo_action_rate_probe_failed');
+    return xoActionSkip('rate_probe_failed', prior, startedIso);
+  }
+  if (remaining === null) return xoActionSkip('github_auth_missing', prior, startedIso);
+  if (!Number.isFinite(remaining)) {
+    logger.error({ remaining }, 'xo_action_rate_probe_failed');
+    return xoActionSkip('rate_probe_failed', prior, startedIso);
+  }
+  if (xoActionListingBlockedByRate(remaining)) {
+    return xoActionSkip('rate_limit', prior, startedIso);
+  }
+
+  const watermarkIso = prior ?? startedIso;
+  const watermarkMs = parseXoActionTimestamp(watermarkIso);
+  let comments: XoActionComment[];
+  try {
+    comments = await deps.listXoActionComments(watermarkIso);
+  } catch (error) {
+    logger.error({ error }, 'xo_action_list_failed');
+    return {
+      digest: { scanned: 0, qualified: 0, sent: 0, skipped: null },
+      cursor: selectSkippedXoActionCursor(prior, startedIso),
+    };
+  }
+
+  let qualified = 0;
+  let sent = 0;
+  let earliestFailedAt: string | null = null;
+  let earliestFailedAtMs = Number.POSITIVE_INFINITY;
+  let failedWithoutTimestamp = false;
+  for (const comment of comments) {
+    const issue = comment.issue;
+    if (issue === null || !xoActionCommentQualifies(comment, leaseId, watermarkMs)) continue;
+    qualified += 1;
+    const key = `inbox-reader:xo-action:${comment.id}`;
+    try {
+      if (!deps.createXoActionMessage) throw new Error('xo_action_sender_missing');
+      await deps.createXoActionMessage(
+        { kind: 'system', sender: 'dispatch' },
+        {
+          correlation_id: key,
+          idempotency_key: key,
+          task_type: 'agent_message',
+          recipient: 'xo',
+          priority: 'normal',
+          body: buildXoActionMessageBody(comment),
+          subject_key: `gh:thinmansoftware/bdc-xo#${issue}`,
+          repeat_reason: key,
+        }
+      );
+      sent += 1;
+    } catch (error) {
+      logger.error({ error, commentId: comment.id }, 'xo_action_send_failed');
+      const createdMs = parseXoActionTimestamp(comment.created_at);
+      if (createdMs === null) {
+        failedWithoutTimestamp = true;
+      } else if (createdMs < earliestFailedAtMs) {
+        earliestFailedAtMs = createdMs;
+        earliestFailedAt = comment.created_at;
+      }
+    }
+  }
+
+  const cursor = selectCursorAfterXoActionSends({
+    prior,
+    startedIso,
+    comments,
+    earliestFailedAt,
+    failedWithoutTimestamp,
+  });
+  return {
+    digest: { scanned: comments.length, qualified, sent, skipped: null },
+    ...(cursor === null ? {} : { cursor }),
+  };
 }
 
 function alertKey(kind: string, recipient: string | null): string {
@@ -602,6 +817,7 @@ export async function runInboxReader(
       disposal_plan: plan,
       disposal_results: [],
       alerts: [...alerts],
+      xo_action: emptyXoActionDigest(),
       content_hash: hash,
       last_run_at: started.toISOString(),
       run_file: runRequired ? runFile : null,
@@ -681,6 +897,13 @@ export async function runInboxReader(
     }
     for (const alert of alerts)
       await append(join(root, 'alerts.jsonl'), `${JSON.stringify(alert)}\n`);
+    let xoAction: XoActionWatchOutcome = { digest: emptyXoActionDigest() };
+    try {
+      xoAction = await runXoActionWatch(deps, state, started, logger);
+    } catch (error) {
+      logger.error({ error }, 'xo_action_watch_failed');
+    }
+    digest.xo_action = xoAction.digest;
     try {
       await writeDigest(digest, root, writer, runRequired);
     } catch (error) {
@@ -689,10 +912,20 @@ export async function runInboxReader(
     }
     const lastAlertAt = { ...(state.last_alert_at ?? {}) };
     for (const alert of alerts) lastAlertAt[alertKey(alert.kind, alert.recipient)] = alert.at;
-    await writer(
-      join(root, 'state.json'),
-      `${JSON.stringify({ last_run_at: started.toISOString(), content_hash: hash, run_file: digest.run_file, last_alert_at: lastAlertAt, cursors: nextCursors, rotation: (state.rotation ?? 0) + 1 }, null, 2)}\n`
-    );
+    const nextState: ReaderState = {
+      last_run_at: started.toISOString(),
+      content_hash: hash,
+      run_file: digest.run_file,
+      last_alert_at: lastAlertAt,
+      cursors: nextCursors,
+      rotation: (state.rotation ?? 0) + 1,
+    };
+    if (xoAction.cursor !== undefined) {
+      nextState.xo_action_since = xoAction.cursor;
+    } else if (state.xo_action_since !== undefined) {
+      nextState.xo_action_since = state.xo_action_since;
+    }
+    await writer(join(root, 'state.json'), `${JSON.stringify(nextState, null, 2)}\n`);
     const cutoff = started.getTime() - config.retentionDays * 86_400_000;
     for (const file of await readdir(join(root, 'runs'))) {
       const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z-/.exec(file);
@@ -767,12 +1000,24 @@ export function startInboxReader(deps: InboxReaderDeps = {}): void {
   if (timer !== undefined) return;
   const config = resolveInboxReaderConfig(process.env);
   if (config.intervalMs === 0) return;
+  const wired: InboxReaderDeps = {
+    ...deps,
+    probeCoreRemaining: deps.probeCoreRemaining ?? defaultProbeCoreRemaining,
+    listXoActionComments: deps.listXoActionComments ?? defaultListXoActionComments,
+    getCurrentXoLease:
+      deps.getCurrentXoLease ??
+      (async (): Promise<{ lease_id: string } | null> => {
+        const lease = await getCurrentXoLease();
+        return lease ? { lease_id: lease.lease_id } : null;
+      }),
+    createXoActionMessage: deps.createXoActionMessage ?? createAuthenticatedMessage,
+  };
   let inFlight = false;
   const tick = async (): Promise<void> => {
     if (inFlight) return;
     inFlight = true;
     try {
-      await runInboxReader(deps, config);
+      await runInboxReader(wired, config);
     } finally {
       inFlight = false;
     }
