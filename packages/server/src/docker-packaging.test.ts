@@ -2,6 +2,13 @@ import { describe, expect, it } from 'bun:test';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
 
+// Root bunfig.toml sets [test] root = "./packages". Stop 5 passes
+// scripts/container/build-app-image.test.ts without a ./ prefix, so Bun
+// treats it as a name filter, searches only under packages/, and exits 0
+// without running Tests 2-5. Register that suite through this file, which
+// the same command does execute, and which package CI already runs.
+await import('../../../scripts/container/build-app-image.test');
+
 describe('production Docker packaging', () => {
   it('copies Smart Cauldron source required by the server runtime', async () => {
     const dockerfile = await readFile(
