@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { loadRuleset, pickEntryTier } from '../conductor.js';
 import {
+  admitClaudeTier,
   bindingUsedPercent,
   chooseHeadroomEntry,
   resolveEntryThreshold,
@@ -65,6 +66,32 @@ const HOT_CODEX_COOL_CLAUDE: SeatUsageSnapshot = {
 };
 
 describe('entry headroom', () => {
+  test('claude-tier-admission-distinguishes-measured-over-and-unknown', () => {
+    expect(
+      admitClaudeTier({
+        usage: {
+          claude: measured([
+            { name: 'seven_day', used_percent: 41 },
+            { name: 'five_hour', used_percent: 62 },
+          ]),
+        },
+        thresholdPercent: 80,
+      })
+    ).toEqual({ admitted: true, reason: 'claude_seat_ok:62:80' });
+    expect(
+      admitClaudeTier({
+        usage: { claude: measured([{ name: 'seven_day', used_percent: 80 }]) },
+        thresholdPercent: 80,
+      })
+    ).toEqual({ admitted: false, reason: 'claude_seat_over_threshold:80:80' });
+    expect(
+      admitClaudeTier({
+        usage: { claude: { limit_source: 'UNKNOWN', windows: [] } },
+        thresholdPercent: 80,
+      })
+    ).toEqual({ admitted: false, reason: 'claude_seat_unknown' });
+  });
+
   test('over-threshold-entry-moves-up', () => {
     expect(seatForTier('codex')).toBe('codex');
     expect(seatForTier('claude')).toBe('claude');
@@ -236,19 +263,22 @@ describe('entry headroom', () => {
     expect(coolCursor.changed).toBe(false);
 
     const billingPick = pickEntryTier({ woClass: 'CODE', tags: ['billing'] }, ruleset);
-    expect(billingPick).toBe('claude');
+    expect(billingPick).toBe('cursor');
     const billingEntry = chooseHeadroomEntry({
       picked: billingPick,
       tiers,
       refusedTiers,
       premiumTiers,
-      usage: HOT_CODEX_COOL_CLAUDE,
+      usage: {
+        cursor: { limit_source: 'measured', windows: [{ name: 'primary', used_percent: 20 }] },
+      },
       thresholdPercent: 80,
       pinned: false,
     });
-    expect(billingEntry.entry).toBe('claude');
+    expect(billingEntry.picked).toBe('cursor');
+    expect(billingEntry.entry).toBe('cursor');
     expect(billingEntry.changed).toBe(false);
-    expect(billingEntry.reason).toBe('seat_ok:claude:45');
+    expect(billingEntry.reason).toBe('seat_ok:cursor:20');
   });
 
   test('node-models-extracted-from-events', () => {

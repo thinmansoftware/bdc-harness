@@ -1,4 +1,4 @@
-import { pool, getDialect } from './connection';
+import { pool, getDatabase, getDialect } from './connection';
 
 export type KnownBadBindingSource = 'fire_probe' | 'binding_change' | 'operator';
 export type KnownBadBindingClearReason = 'operator' | 'fire_reprobe';
@@ -98,6 +98,26 @@ export async function clearKnownBadBinding(
   bindingKey: string,
   clearReason: KnownBadBindingClearReason
 ): Promise<KnownBadBindingRow | null> {
+  if (getDatabase().dialect === 'sqlite') {
+    // SQLite's adapter supports native INSERT RETURNING, not UPDATE RETURNING.
+    // Select only the existing active row so this cannot insert or resurrect a
+    // missing/cleared binding. Keep the mutation and returned row in ONE statement.
+    const result = await pool.query<KnownBadBindingRow>(
+      `INSERT INTO known_bad_bindings
+         (id, binding_key, provider_id, model_id, auth_context_id, assistant_config_hash,
+          node_override_hash, error_class, http_status, error_body_excerpt, first_seen_at,
+          last_seen_at, hit_count, source, cleared_at, clear_reason)
+       SELECT id, binding_key, provider_id, model_id, auth_context_id, assistant_config_hash,
+          node_override_hash, error_class, http_status, error_body_excerpt, first_seen_at,
+          last_seen_at, hit_count, source, cleared_at, clear_reason
+       FROM known_bad_bindings WHERE binding_key = $1 AND cleared_at IS NULL
+       ON CONFLICT (binding_key) DO UPDATE SET cleared_at = $2, clear_reason = $3
+       WHERE known_bad_bindings.cleared_at IS NULL
+       RETURNING *`,
+      [bindingKey, new Date().toISOString(), clearReason]
+    );
+    return result.rows[0] ?? null;
+  }
   const result = await pool.query<KnownBadBindingRow>(
     `UPDATE known_bad_bindings
      SET cleared_at = $2, clear_reason = $3
@@ -111,6 +131,24 @@ export async function clearKnownBadBinding(
 export async function incrementKnownBadBindingHit(
   bindingKey: string
 ): Promise<KnownBadBindingRow | null> {
+  if (getDatabase().dialect === 'sqlite') {
+    const result = await pool.query<KnownBadBindingRow>(
+      `INSERT INTO known_bad_bindings
+         (id, binding_key, provider_id, model_id, auth_context_id, assistant_config_hash,
+          node_override_hash, error_class, http_status, error_body_excerpt, first_seen_at,
+          last_seen_at, hit_count, source, cleared_at, clear_reason)
+       SELECT id, binding_key, provider_id, model_id, auth_context_id, assistant_config_hash,
+          node_override_hash, error_class, http_status, error_body_excerpt, first_seen_at,
+          last_seen_at, hit_count, source, cleared_at, clear_reason
+       FROM known_bad_bindings WHERE binding_key = $1 AND cleared_at IS NULL
+       ON CONFLICT (binding_key) DO UPDATE SET
+         hit_count = known_bad_bindings.hit_count + 1, last_seen_at = $2
+       WHERE known_bad_bindings.cleared_at IS NULL
+       RETURNING *`,
+      [bindingKey, new Date().toISOString()]
+    );
+    return result.rows[0] ?? null;
+  }
   const result = await pool.query<KnownBadBindingRow>(
     `UPDATE known_bad_bindings
      SET hit_count = hit_count + 1, last_seen_at = $2

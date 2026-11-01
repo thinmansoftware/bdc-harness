@@ -54,3 +54,7 @@ harness/policies/
 # reconcile test fixtures (bdc-xo #1889 false close, 2026-09-02). Bytes must
 # stay exactly as GitHub returned them, CRLF included.
 packages/overseer/src/__tests__/fixtures/reconcile/
+
+# Pinned Docker/Moby 29.3.0 default seccomp bytes (WO-HARNESS-CONTAINER-SECCOMP-USERNS-01).
+# SHA256 01536f1d1df938ae611eba20d6349e0de7a99b6ecdee1549427a0b01b8301e28. Prettier must not reflow.
+docker/seccomp-upstream-29.3.0.json

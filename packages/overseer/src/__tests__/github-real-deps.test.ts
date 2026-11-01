@@ -7,12 +7,14 @@ import { createAppAuth } from '@octokit/auth-app';
 import {
   createRealApprovePullRequest,
   createRealFindPullRequest,
+  createRealFetchExactHeadPullRequestEvidence,
   createRealGitHubClientDeps,
   createRealMergePullRequest,
   resolveGitHubAppAuth,
   resolveRealOctokitAuthOptions,
   type RealGitHubOctokitLike,
 } from '../adapters/github-real-deps.ts';
+import type { AttemptCounterKey, AttemptCounterStore } from '../adapters/required-contexts.ts';
 import type { PullRequestRef } from '../types.ts';
 
 // WO-HARNESS-OVERSEER-APP-AUTH-01: Overseer authenticates as the Thinman Overseer
@@ -59,6 +61,94 @@ beforeEach(() => {
     savedEnv.set(key, process.env[key]);
     delete process.env[key];
   }
+});
+
+describe('unprotected base zero-check attempt bound', () => {
+  const headSha = 'c'.repeat(40);
+
+  function octokit(checkRuns: Array<{ name: string; status: string; conclusion: string | null }>) {
+    return {
+      pulls: {
+        get: async () => ({
+          data: { head: { sha: headSha }, base: { sha: 'b'.repeat(40), ref: 'main' } },
+        }),
+      },
+      repos: {
+        compareCommits: async () => ({ data: { files: [] } }),
+        getAllStatusCheckContexts: async () => {
+          throw Object.assign(new Error('Branch not protected'), { status: 404 });
+        },
+        getBranchRules: async () => ({ data: [] }),
+        getBranch: async () => ({ data: { protected: false } }),
+      },
+      checks: { listForRef: async () => ({ data: { check_runs: checkRuns } }) },
+    } as unknown as RealGitHubOctokitLike;
+  }
+
+  test('third zero-check evaluation blocks and uses a distinct key namespace', async () => {
+    const counts = new Map<string, number>();
+    const keys: AttemptCounterKey[] = [];
+    const store: AttemptCounterStore = {
+      increment: async key => {
+        keys.push(key);
+        const encoded = JSON.stringify(key);
+        const next = (counts.get(encoded) ?? 0) + 1;
+        counts.set(encoded, next);
+        return next;
+      },
+      clear: async key => {
+        counts.delete(JSON.stringify(key));
+      },
+    };
+    const previous = process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS;
+    process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS = '3';
+    try {
+      const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(
+        octokit([]),
+        undefined,
+        store
+      );
+      expect(
+        (await fetchEvidence({ owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha }))
+          .requiredContextsBlocked
+      ).toBeUndefined();
+      expect(
+        (await fetchEvidence({ owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha }))
+          .requiredContextsBlocked
+      ).toBeUndefined();
+      expect(
+        (await fetchEvidence({ owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha }))
+          .requiredContextsBlocked
+      ).toEqual({ reason: 'unprotected_base_no_checks', attempts: 3, failureKind: 'transient' });
+      expect(keys.every(key => key.baseRef === 'zero-checks:main')).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS;
+      else process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS = previous;
+    }
+  });
+
+  test('a reported check clears the zero-check streak', async () => {
+    let attempts = 0;
+    const cleared: AttemptCounterKey[] = [];
+    const store: AttemptCounterStore = {
+      increment: async () => ++attempts,
+      clear: async key => {
+        cleared.push(key);
+        attempts = 0;
+      },
+    };
+    const input = { owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha };
+    await createRealFetchExactHeadPullRequestEvidence(octokit([]), undefined, store)(input);
+    await createRealFetchExactHeadPullRequestEvidence(octokit([]), undefined, store)(input);
+    await createRealFetchExactHeadPullRequestEvidence(
+      octokit([{ name: 'test', status: 'in_progress', conclusion: null }]),
+      undefined,
+      store
+    )(input);
+    expect(cleared.some(key => key.baseRef === 'zero-checks:main')).toBe(true);
+    await createRealFetchExactHeadPullRequestEvidence(octokit([]), undefined, store)(input);
+    expect(attempts).toBe(1);
+  });
 });
 
 afterEach(() => {
@@ -431,8 +521,8 @@ describe('createRealFindPullRequest rate-limit load profile', () => {
     });
 
     expect(result.exists).toBe(true);
-    expect(list).toHaveBeenCalledTimes(1);
-    expect(search).toHaveBeenCalledTimes(1);
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(search).toHaveBeenCalledTimes(0);
   });
 
   test('403 rate limit starts a process-wide backoff and logs only once in the window', async () => {
@@ -492,7 +582,7 @@ describe('createRealFindPullRequest rate-limit load profile', () => {
     expect((await find(input)).exists).toBe(true);
     now = 1_001;
     expect((await find(input)).exists).toBe(true);
-    expect(list).toHaveBeenCalledTimes(3);
+    expect(list).toHaveBeenCalledTimes(5);
   });
 
   test('message-only 403 is classified as a rate limit', async () => {
@@ -576,35 +666,32 @@ import { describe as describe422, test as test422, expect as expect422 } from 'b
 import { createRealFindPullRequest as mkFind422 } from '../adapters/github-real-deps.js';
 
 describe422('findPullRequest permanent 422 handling', () => {
-  test422(
-    '422 search error returns missing (permanent), not lookup_failed (transient)',
-    async () => {
-      const octokit = {
-        pulls: {
-          list: async () => ({ data: [] }),
-          get: async () => {
-            throw new Error('unreachable');
-          },
+  test422('unused Search422 cannot affect a complete empty REST result', async () => {
+    const octokit = {
+      pulls: {
+        list: async () => ({ data: [] }),
+        get: async () => {
+          throw new Error('unreachable');
         },
-        search: {
-          issuesAndPullRequests: async () => {
-            const e = new Error('Validation Failed: cannot be searched') as Error & {
-              status: number;
-            };
-            e.status = 422;
-            throw e;
-          },
+      },
+      search: {
+        issuesAndPullRequests: async () => {
+          const e = new Error('Validation Failed: cannot be searched') as Error & {
+            status: number;
+          };
+          e.status = 422;
+          throw e;
         },
-        checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
-      };
-      const find = mkFind422(octokit as never, {
-        logger: { warn: () => undefined, error: () => undefined } as never,
-      });
-      const evidence = await find({ owner: 'o', repo: 'ungranted-repo', woId: 'WO-X-01' });
-      expect422(evidence.lookupFailed ?? false).toBe(false);
-      expect422(evidence.exists).toBe(false);
-    }
-  );
+      },
+      checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+    };
+    const find = mkFind422(octokit as never, {
+      logger: { warn: () => undefined, error: () => undefined } as never,
+    });
+    const evidence = await find({ owner: 'o', repo: 'ungranted-repo', woId: 'WO-X-01' });
+    expect422(evidence.lookupFailed ?? false).toBe(false);
+    expect422(evidence.exists).toBe(false);
+  });
 
   test422("woId 'unknown' never reaches the search endpoint", async () => {
     let searched = false;
@@ -811,19 +898,28 @@ describe('WO-search prefers the run PR over an early archon/task PR', () => {
     const gets: number[] = [];
     const octokit: RealGitHubOctokitLike = {
       pulls: {
-        list: async () => ({
-          data:
-            headHit === undefined
+        list: async input => ({
+          data: input.head
+            ? headHit === undefined
               ? []
               : [
                   {
                     number: headHit,
-                    title: `WO ${headHit}`,
+                    title: 'WO-X-01',
+                    body: null,
                     state: 'open',
                     html_url: `https://github.test/pull/${headHit}`,
                     head: { sha: 'a'.repeat(40), ref: 'head' },
                   },
-                ],
+                ]
+            : prs.map(pr => ({
+                number: pr.number,
+                title: 'WO-X-01',
+                body: null,
+                state: 'open',
+                html_url: `https://github.test/pull/${pr.number}`,
+                head: { sha: 'a'.repeat(40), ref: pr.headRef },
+              })),
         }),
         get: async input => {
           const number = Number(input.pull_number);
@@ -833,7 +929,8 @@ describe('WO-search prefers the run PR over an early archon/task PR', () => {
           return {
             data: {
               number: match.number,
-              title: `WO ${match.number}`,
+              title: 'WO-X-01',
+              body: null,
               state: 'open',
               mergeable: true,
               html_url: `https://github.test/pull/${match.number}`,
@@ -963,10 +1060,12 @@ describe('WO-search prefers the run PR over an early archon/task PR', () => {
     expect(evidence.otherOpenPrsForWoLookupFailed).toBeUndefined();
   });
 
-  test('resolved head-branch PR survives a throwing sibling search', async () => {
+  test('resolved head-branch PR survives a throwing sibling listing', async () => {
     const { octokit } = octokitFor([early, own], own.number);
-    octokit.search.issuesAndPullRequests = async () => {
-      throw new Error('search unavailable');
+    const list = octokit.pulls.list;
+    octokit.pulls.list = async input => {
+      if (!input.head) throw new Error('listing unavailable');
+      return list(input);
     };
 
     const evidence = await createRealFindPullRequest(octokit)({
@@ -1013,17 +1112,19 @@ describe('WO-search prefers the run PR over an early archon/task PR', () => {
     expect(evidence.otherOpenPrsForWoLookupFailed).toBe(true);
   });
 
-  test('sibling search rate limit keeps the resolved PR and starts backoff', async () => {
+  test('sibling listing rate limit keeps the resolved PR and starts backoff', async () => {
     const { octokit } = octokitFor([own], own.number);
     let limited = true;
-    octokit.search.issuesAndPullRequests = async () => {
+    const list = octokit.pulls.list;
+    octokit.pulls.list = async input => {
+      if (input.head) return list(input);
       if (limited) {
         throw Object.assign(new Error('API rate limit exceeded for installation'), {
           status: 403,
           response: { headers: { 'x-ratelimit-remaining': '0' } },
         });
       }
-      return { data: { items: [] } };
+      return { data: [] };
     };
     const warnings: string[] = [];
     let now = 500_000;
@@ -1059,5 +1160,214 @@ describe('WO-search prefers the run PR over an early archon/task PR', () => {
     const cleared = await find(input);
     expect(cleared.exists).toBe(true);
     expect(cleared.otherOpenPrsForWoLookupFailed).toBeUndefined();
+  });
+});
+
+describe('WO discovery uses complete REST listing without Search', () => {
+  function row(number: number, title = 'WO-REST-01', body: string | null = null) {
+    return {
+      number,
+      title,
+      body,
+      state: 'open',
+      html_url: `https://github.test/pull/${number}`,
+      head: { sha: 'a'.repeat(40), ref: `fix/${number}` },
+      user: { login: 'builder' },
+      created_at: '2026-10-18T00:00:00Z',
+    };
+  }
+  function fixture(pages: unknown[], headHit?: number) {
+    const calls: Record<string, unknown>[] = [];
+    let searchCalls = 0;
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = async input => {
+      calls.push(input);
+      if (input.head) return { data: headHit ? [row(headHit)] : [] };
+      const index = Number(input.page ?? 1) - 1;
+      const data = index < pages.length ? pages[index] : [];
+      if (data instanceof Error) throw data;
+      return { data: data as ReturnType<typeof row>[] };
+    };
+    octokit.pulls.get = async input => ({ data: row(Number(input.pull_number)) });
+    octokit.search.issuesAndPullRequests = async () => {
+      searchCalls++;
+      throw new Error('Search resource exhausted while core is healthy');
+    };
+    return { octokit, calls, searchCalls: () => searchCalls };
+  }
+  const input = { owner: 'thinmansoftware', repo: 'bdc-harness', woId: 'WO-REST-01' };
+
+  test('reads past100 and selects exact body match without touching exhausted Search', async () => {
+    const f = fixture([
+      Array.from({ length: 100 }, (_, i) => row(i + 1, 'unrelated')),
+      [row(101, 'custom title', 'implements WO-REST-01')],
+    ]);
+    const evidence = await createRealFindPullRequest(f.octokit)(input);
+    expect(evidence.pr?.number).toBe(101);
+    expect(f.searchCalls()).toBe(0);
+    expect(f.calls.map(call => call.page)).toEqual([1, 2]);
+  });
+
+  test('all candidates are considered before builder selection; presentation stays bounded', async () => {
+    const builders = Array.from({ length: 6 }, (_, i) => ({
+      ...row(i + 1),
+      head: { sha: 'a'.repeat(40), ref: `archon/task-${i}` },
+    }));
+    const f = fixture([[...builders, row(7)]]);
+    f.octokit.pulls.get = async request => ({
+      data: [...builders, row(7)].find(pr => pr.number === request.pull_number)!,
+    });
+    const evidence = await createRealFindPullRequest(f.octokit)(input);
+    expect(evidence.pr?.number).toBe(7);
+    expect(evidence.otherOpenPrsForWo).toHaveLength(5);
+    expect(f.searchCalls()).toBe(0);
+  });
+
+  test('exact token boundaries and excluded sections do not claim another WO', async () => {
+    const f = fixture([
+      [
+        row(1, 'WO-REST-010'),
+        row(2, 'XWO-REST-01'),
+        row(3, 'custom', '## Files explicitly out of scope\nWO-REST-01'),
+        row(4, 'custom', '## Not in scope\nWO-REST-01\n## Implemented\nWO-REST-01'),
+      ],
+    ]);
+    const evidence = await createRealFindPullRequest(f.octokit)(input);
+    expect(evidence.pr?.number).toBe(4);
+    expect(evidence.otherOpenPrsForWo).toEqual([]);
+    expect(f.searchCalls()).toBe(0);
+  });
+
+  test.each(['ceiling', 'malformed-page', 'malformed-row', 'late-error'])(
+    '%s remains unknown without Search fallback',
+    async mode => {
+      const full = Array.from({ length: 100 }, (_, i) => row(i + 1));
+      const pages =
+        mode === 'ceiling'
+          ? Array.from({ length: 10 }, () => full)
+          : mode === 'malformed-page'
+            ? [{}]
+            : mode === 'malformed-row'
+              ? [[row(1), { ...row(2), body: 42 }]]
+              : [full, new Error('later page failed')];
+      const f = fixture(pages);
+      const evidence = await createRealFindPullRequest(f.octokit)(input);
+      expect(evidence.lookupFailed).toBe(true);
+      expect(evidence.state).toBe('lookup_failed');
+      expect(f.searchCalls()).toBe(0);
+    }
+  );
+
+  test('incomplete sibling listing preserves resolved head but reports unknown siblings', async () => {
+    const f = fixture(
+      [Array.from({ length: 100 }, (_, i) => row(i + 1)), new Error('later page failed')],
+      42
+    );
+    const evidence = await createRealFindPullRequest(f.octokit)({ ...input, headBranch: 'fix/42' });
+    expect(evidence.pr?.number).toBe(42);
+    expect(evidence.otherOpenPrsForWoLookupFailed).toBe(true);
+    expect(f.searchCalls()).toBe(0);
+  });
+
+  test.each([null, undefined])('null/absent page %s cannot prove absence', async page => {
+    const f = fixture([page]);
+    expect((await createRealFindPullRequest(f.octokit)(input)).lookupFailed).toBe(true);
+    expect(f.searchCalls()).toBe(0);
+  });
+
+  test.each(['number', 'state', 'title', 'body', 'head'])(
+    'invalid nonmatching %s blocks primary discovery',
+    async field => {
+      const invalid = { ...row(2, 'unrelated'), [field]: undefined };
+      const f = fixture([[row(1), invalid]]);
+      expect((await createRealFindPullRequest(f.octokit)(input)).lookupFailed).toBe(true);
+    }
+  );
+
+  test.each(['', '   '])('blank head reference %s remains unknown', async ref => {
+    const f = fixture([[{ ...row(1), head: { sha: 'a'.repeat(40), ref } }]]);
+    expect((await createRealFindPullRequest(f.octokit)(input)).lookupFailed).toBe(true);
+  });
+
+  test('identical repeated PR numbers are fetched once; conflicting identity is unknown', async () => {
+    const f = fixture([[row(1), row(1)]]);
+    let gets = 0;
+    const get = f.octokit.pulls.get;
+    f.octokit.pulls.get = async request => {
+      gets++;
+      return get(request);
+    };
+    const evidence = await createRealFindPullRequest(f.octokit)(input);
+    expect(evidence.pr?.number).toBe(1);
+    // One candidate refresh and one selected evidence read.
+    expect(gets).toBe(2);
+    const conflict = fixture([
+      [row(1), { ...row(1), head: { sha: 'b'.repeat(40), ref: 'other' } }],
+    ]);
+    expect((await createRealFindPullRequest(conflict.octokit)(input)).lookupFailed).toBe(true);
+  });
+
+  test.each(['wrong-number', 'missing-body', 'changed-claim', 'closed'])(
+    'candidate refresh %s cannot select stale identity',
+    async mode => {
+      const f = fixture([[row(1)]]);
+      f.octokit.pulls.get = async () => ({
+        data:
+          mode === 'wrong-number'
+            ? row(2)
+            : mode === 'missing-body'
+              ? { ...row(1), body: undefined }
+              : mode === 'changed-claim'
+                ? row(1, 'unrelated')
+                : { ...row(1), state: 'closed' },
+      });
+      const evidence = await createRealFindPullRequest(f.octokit)(input);
+      expect(evidence.exists).toBe(false);
+      expect(evidence.lookupFailed).toBe(mode === 'wrong-number' || mode === 'missing-body');
+    }
+  );
+
+  test.each(['WO-REST-01-FOLLOWUP', 'OTHER-WO-REST-01'])(
+    'hyphen identifier %s is not an exact claim',
+    async title => {
+      const f = fixture([[row(1, title)]]);
+      const evidence = await createRealFindPullRequest(f.octokit)(input);
+      expect(evidence.exists).toBe(false);
+      expect(evidence.lookupFailed).toBe(false);
+    }
+  );
+
+  test.each(['primary', 'head', 'sibling', 'direct'])(
+    'HTTP422 %s discovery preserves the applicable unknown/direct contract',
+    async mode => {
+      const f = fixture([Object.assign(new Error('REST validation failed'), { status: 422 })], 42);
+      const request =
+        mode === 'direct'
+          ? { ...input, prNumber: 42 }
+          : mode === 'sibling' || mode === 'head'
+            ? { ...input, headBranch: 'fix/42' }
+            : input;
+      if (mode === 'head')
+        f.octokit.pulls.list = async () => {
+          throw Object.assign(new Error('head lookup validation'), { status: 422 });
+        };
+      if (mode === 'direct')
+        f.octokit.pulls.get = async () => {
+          throw Object.assign(new Error('direct legacy422'), { status: 422 });
+        };
+      const evidence = await createRealFindPullRequest(f.octokit)(request);
+      if (mode === 'sibling') {
+        expect(evidence.pr?.number).toBe(42);
+        expect(evidence.otherOpenPrsForWoLookupFailed).toBe(true);
+      } else expect(evidence.lookupFailed).toBe(mode === 'primary' || mode === 'head');
+    }
+  );
+
+  test('explicit PR number still uses direct addressing without any listing', async () => {
+    const f = fixture([new Error('listing must not run')]);
+    const evidence = await createRealFindPullRequest(f.octokit)({ ...input, prNumber: 42 });
+    expect(evidence.pr?.number).toBe(42);
+    expect(f.calls).toEqual([]);
+    expect(f.searchCalls()).toBe(0);
   });
 });

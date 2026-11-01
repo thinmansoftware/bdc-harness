@@ -35,7 +35,12 @@
 import { createLogger } from '@archon/paths';
 import type { IDatabase } from '@archon/core/db/adapters/types';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
-import { githubToken } from '../dispatch/duty-officer-clock';
+import {
+  buildAppJwt,
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+  type ServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 
 const log = createLogger('taskmaster/escalation-delivery');
 
@@ -412,8 +417,62 @@ type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 export interface RealEscalationDeliveryOptions {
   /** Injected for tests; defaults to global fetch. */
   fetchImpl?: FetchLike;
-  /** Injected for tests; defaults to the shared container token accessor. */
+  /**
+   * Injected for tests: a fixed token that bypasses identity resolution. When
+   * absent, the token comes from the taskmaster service identity (see
+   * resolveEscalationToken).
+   */
   token?: string | null;
+  /** Injected for tests; the environment the taskmaster identity resolves from. */
+  env?: Record<string, string | undefined>;
+}
+
+/**
+ * Resolve the taskmaster service identity. The container runs on GitHub App
+ * identity (GITHUB_APP_TASKMASTER_*), so this is normally kind 'app'; a PAT
+ * resolves only when no App is configured. Any resolution error (incomplete or
+ * unreadable App config) fails closed as taskmaster_github_token_missing --
+ * the failure text recorded in proposal_json.failure -- with the cause logged.
+ */
+function resolveEscalationIdentity(options: RealEscalationDeliveryOptions): ServiceGitHubAuth {
+  let identity: ServiceGitHubAuth;
+  try {
+    identity = resolveServiceGitHubAuth('taskmaster', options.env ?? process.env);
+  } catch (error) {
+    log.warn(
+      { cause: (error as Error).message.slice(0, 200) },
+      'taskmaster.escalation_github_identity_unresolved'
+    );
+    throw new Error('taskmaster_github_token_missing');
+  }
+  if (identity.kind === 'none') throw new Error('taskmaster_github_token_missing');
+  if (identity.kind === 'pat' && !identity.token.trim()) {
+    throw new Error('taskmaster_github_token_missing');
+  }
+  return identity;
+}
+
+/**
+ * The bearer token for a Taskmaster GitHub request. An injected options.token
+ * wins (tests). Otherwise the taskmaster identity is resolved and its token
+ * obtained through the shared core path, getServiceGitHubToken: an App
+ * identity mints (and caches, per identity pool) an installation token; a PAT
+ * identity returns the PAT. The PAT-only githubToken accessor in
+ * dispatch/duty-officer-clock.ts is deliberately not used: it returns null
+ * for an App identity, which failed every escalation.
+ */
+async function resolveEscalationToken(options: RealEscalationDeliveryOptions): Promise<string> {
+  if (options.token !== undefined) {
+    if (!options.token) throw new Error('taskmaster_github_token_missing');
+    return options.token;
+  }
+  const identity = resolveEscalationIdentity(options);
+  const token = await getServiceGitHubToken(identity, {
+    fetch: options.fetchImpl as typeof fetch | undefined,
+    apiBaseUrl: GITHUB_API_ORIGIN,
+  });
+  if (!token) throw new Error('taskmaster_github_token_missing');
+  return token;
 }
 
 /** Return the rel="next" URL from a GitHub Link header, or null. */
@@ -428,9 +487,8 @@ export function parseNextLink(linkHeader: string | null): string | null {
 
 /**
  * Minimal GitHub REST helper mirroring duty-officer-clock's private githubJson
- * (kept local rather than exported from that file, which the spec limits to a
- * single githubToken() export). Reuses the shared container token accessor.
- * Takes a full URL and returns the raw Response so callers can read headers
+ * (kept local rather than exported from that file). The token comes from
+ * resolveEscalationToken (taskmaster service identity, App preferred). Takes a full URL and returns the raw Response so callers can read headers
  * (the Link header drives comment pagination). Only api.github.com URLs are
  * requested, so a Link header can never send the token to another host.
  */
@@ -442,8 +500,7 @@ async function githubRequest(
   if (!url.startsWith(`${GITHUB_API_ORIGIN}/`)) {
     throw new Error('taskmaster_github_url_not_api_origin');
   }
-  const token = options.token !== undefined ? options.token : await githubToken();
-  if (!token) throw new Error('taskmaster_github_token_missing');
+  const token = await resolveEscalationToken(options);
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
     Authorization: `Bearer ${token}`,
@@ -518,28 +575,83 @@ function toEscalationComment(raw: unknown): EscalationIssueComment {
   };
 }
 
+/** GET /user with the request token: the login a PAT (or injected token) acts as. */
+async function resolveUserLogin(options: RealEscalationDeliveryOptions): Promise<string> {
+  const response = await githubRequest(`${GITHUB_API_ORIGIN}/user`, options);
+  const user = (await response.json()) as { login?: unknown } | null;
+  const value = user?.login;
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error('taskmaster_github_poster_login_unresolved');
+  }
+  return value;
+}
+
 /**
- * The login the token authenticates as (GET /user), cached per token for the
- * life of the deps object so the lookup costs one call, not one per
- * escalation. A failed lookup is not cached; it throws, so the escalation
- * fails this tick and is retried rather than trusting or distrusting markers
- * blindly.
+ * The login an App identity posts as: "<slug>[bot]", from GET /app signed with
+ * an App JWT. GET /user is not callable with an installation token (GitHub
+ * answers 403), so it cannot name an App. Same method as
+ * scripts/github-service-login.ts. The JWT is never logged or returned.
+ */
+async function resolveAppLogin(
+  identity: Extract<ServiceGitHubAuth, { kind: 'app' }>,
+  options: RealEscalationDeliveryOptions
+): Promise<string> {
+  const fetchImpl: FetchLike =
+    options.fetchImpl ?? ((input, reqInit): Promise<Response> => fetch(input, reqInit));
+  const response = await fetchImpl(`${GITHUB_API_ORIGIN}/app`, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${buildAppJwt(identity)}`,
+      'User-Agent': 'bdc-harness-taskmaster-escalation',
+      'X-GitHub-Api-Version': '2022-11-28',
+    },
+    signal: AbortSignal.timeout(githubTimeoutMs()),
+  });
+  if (!response.ok) throw new Error(`taskmaster_github_http_${response.status}`);
+  const app = (await response.json()) as { slug?: unknown } | null;
+  const slug = app?.slug;
+  if (typeof slug !== 'string' || !slug.trim()) {
+    throw new Error('taskmaster_github_poster_login_unresolved');
+  }
+  return `${slug}[bot]`;
+}
+
+/**
+ * The login Taskmaster posts as, cached for the life of the deps object so the
+ * lookup costs one call, not one per escalation. An App identity is named via
+ * GET /app ("<slug>[bot]") and cached on its identity pool -- never on the
+ * installation token, which rotates hourly. A PAT (or an injected test token)
+ * is named via GET /user and cached on that token. A failed lookup is not
+ * cached; it throws, so the escalation fails this tick and is retried rather
+ * than trusting or distrusting markers blindly.
  */
 function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () => Promise<string> {
-  let cached: { token: string | null; login: Promise<string> } | null = null;
-  return async (): Promise<string> => {
-    const token = options.token !== undefined ? options.token : await githubToken();
-    if (cached?.token === token) return cached.login;
-    const login = (async (): Promise<string> => {
-      const response = await githubRequest(`${GITHUB_API_ORIGIN}/user`, options);
-      const user = (await response.json()) as { login?: unknown } | null;
-      const value = user?.login;
-      if (typeof value !== 'string' || !value.trim()) {
-        throw new Error('taskmaster_github_poster_login_unresolved');
+  let cached: { key: string; login: Promise<string> } | null = null;
+  return (): Promise<string> => {
+    let key: string;
+    let lookup: () => Promise<string>;
+    if (options.token !== undefined) {
+      key = `token:${options.token ?? ''}`;
+      lookup = (): Promise<string> => resolveUserLogin(options);
+    } else {
+      let identity: ServiceGitHubAuth;
+      try {
+        identity = resolveEscalationIdentity(options);
+      } catch (error) {
+        return Promise.reject(error as Error);
       }
-      return value;
-    })();
-    cached = { token, login };
+      if (identity.kind === 'app') {
+        const appIdentity = identity;
+        key = `app:${appIdentity.poolId}`;
+        lookup = (): Promise<string> => resolveAppLogin(appIdentity, options);
+      } else {
+        key = `pat:${identity.kind === 'pat' ? identity.token : ''}`;
+        lookup = (): Promise<string> => resolveUserLogin(options);
+      }
+    }
+    if (cached?.key === key) return cached.login;
+    const login = lookup();
+    cached = { key, login };
     login.catch(() => {
       if (cached?.login === login) cached = null;
     });

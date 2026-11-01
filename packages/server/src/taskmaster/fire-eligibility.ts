@@ -128,38 +128,64 @@ export async function checkFireEligibility(
   const project = codebase.name.includes('/') ? codebase.name.split('/').at(-1) : codebase.name;
   if (!project) return { eligible: false, reason: 'project_not_registered' };
 
-  // Mirrors fire.ps1's `gh pr list --state all --search <WO>` gate, while
-  // enforcing a WO token boundary to avoid generic-title substring matches.
-  const searchResponse = deps.githubToken
-    ? await fetchImpl(
-        `https://api.github.com/search/issues?q=${encodeURIComponent(`${woId} repo:${targetRepo} is:pr`)}`,
-        { headers: headers(token) }
-      )
-    : await serviceGitHubFetchWithPermissionFallback({
-        service: 'taskmaster',
-        fetch: fetchImpl,
-        resource: 'search',
-        identity,
-        url: `https://api.github.com/search/issues?q=${encodeURIComponent(`${woId} repo:${targetRepo} is:pr`)}`,
-      });
-  assertRateLimit(searchResponse);
-  if (!searchResponse.ok)
-    throw new Error(`taskmaster_fire_pr_search_failed:${searchResponse.status}`);
-  const search = (await searchResponse.json()) as {
-    items?: {
-      title?: string;
-      body?: string | null;
-      state?: string;
-      pull_request?: { merged_at?: string };
-    }[];
-  };
+  // Complete all-state history is required before asserting that this WO has
+  // no open or merged PR. Search has an independent, scarce resource budget.
   const escaped = woId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const exactWo = new RegExp(`(?:^|[^A-Za-z0-9-])${escaped}(?:[^A-Za-z0-9-]|$)`);
-  const satisfying = (search.items ?? []).some(
-    pr =>
-      exactWo.test(`${pr.title ?? ''}\n${pr.body ?? ''}`) &&
-      (pr.state?.toLowerCase() === 'open' || Boolean(pr.pull_request?.merged_at))
-  );
+  const identities = new Map<number, string>();
+  let satisfying = false;
+  let complete = false;
+  const maxPages = 100;
+  for (let page = 1; page <= maxPages; page++) {
+    const url = `https://api.github.com/repos/${targetRepo}/pulls?state=all&per_page=100&sort=created&direction=asc&page=${page}`;
+    const response = deps.githubToken
+      ? await fetchImpl(url, { headers: headers(token) })
+      : await serviceGitHubFetchWithPermissionFallback({
+          service: 'taskmaster',
+          fetch: fetchImpl,
+          resource: 'core',
+          identity,
+          url,
+        });
+    assertRateLimit(response);
+    if (!response.ok) throw new Error(`taskmaster_fire_pr_listing_failed:${response.status}`);
+    const rows: unknown = await response.json();
+    if (!Array.isArray(rows) || rows.length > 100)
+      throw new Error('taskmaster_fire_pr_listing_invalid_page');
+    for (const value of rows) {
+      if (!value || typeof value !== 'object')
+        throw new Error('taskmaster_fire_pr_listing_invalid_row');
+      const pr = value as Record<string, unknown>;
+      if (
+        !Number.isSafeInteger(pr.number) ||
+        (pr.number as number) <= 0 ||
+        typeof pr.title !== 'string' ||
+        !(pr.body === null || typeof pr.body === 'string') ||
+        !['open', 'closed'].includes(pr.state as string) ||
+        !(
+          pr.merged_at === null ||
+          (typeof pr.merged_at === 'string' && Number.isFinite(Date.parse(pr.merged_at)))
+        ) ||
+        (pr.state === 'open' && pr.merged_at !== null)
+      )
+        throw new Error('taskmaster_fire_pr_listing_invalid_row');
+      const identity = JSON.stringify([pr.title, pr.body, pr.state, pr.merged_at]);
+      const number = pr.number as number;
+      if (identities.has(number) && identities.get(number) !== identity)
+        throw new Error('taskmaster_fire_pr_listing_conflicting_duplicate');
+      identities.set(number, identity);
+      if (
+        exactWo.test(`${pr.title}\n${pr.body ?? ''}`) &&
+        (pr.state === 'open' || pr.merged_at !== null)
+      )
+        satisfying = true;
+    }
+    if (rows.length < 100) {
+      complete = true;
+      break;
+    }
+  }
+  if (!complete) throw new Error('taskmaster_fire_pr_listing_incomplete');
   if (satisfying) return { eligible: false, reason: 'pr_exists' };
 
   return {

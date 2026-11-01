@@ -1,0 +1,59 @@
+# The Dispatch worker runs on the Windows operator desktop and laptop.
+scripts/dispatch-worker/**
+
+# PowerShell files run only on Windows hosts (install, staging, auth sync, taskmaster).
+**/*.ps1
+
+# The CLI is installed on Windows and setup.ts branches on win32.
+packages/cli/**
+
+# archon-paths.ts creates a junction on win32 and is imported by the CLI and dispatch.
+packages/paths/**
+
+# session-launcher.ts branches on win32.
+packages/core/src/orchestrator/session-launcher.ts
+
+# recovery.ts branches on win32.
+packages/core/src/workflows/recovery.ts
+
+# worktree.ts branches on win32.
+packages/git/src/worktree.ts
+
+# Claude binary resolution branches on win32.
+packages/providers/src/claude/binary-resolver.ts
+
+# Codex binary resolution branches on win32.
+packages/providers/src/codex/binary-resolver.ts
+
+# Grok provider tools branch on win32.
+packages/providers/src/community/grok/tools.ts
+
+# dag-executor.ts resolves bun.cmd on win32.
+packages/workflows/src/dag-executor.ts
+
+# Workflow edits decide when Windows CI runs, so they must run Windows CI.
+.github/workflows/test.yml
+
+# Path-list edits must run Windows CI so a bad glob cannot skip itself.
+.github/windows-paths.txt
+
+# The classifier and skip helper are the Windows CI gate.
+scripts/windows-ci/**
+
+# The root package manifest changes what the Windows job installs and runs.
+package.json
+
+# The lockfile changes the dependency set the Windows job installs.
+bun.lock
+
+# Root bunfig changes test discovery and preloads for the Windows job.
+bunfig.toml
+
+# A package manifest changes that package's Windows test script.
+packages/*/package.json
+
+# A package bunfig changes that package's Windows test preload and timeout.
+packages/*/bunfig.toml
+
+# The shared test preload sets the timeout used by Windows package-serial runs.
+packages/core/src/test/setup.ts

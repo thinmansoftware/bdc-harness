@@ -18,6 +18,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { runCascade } from '../cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
+import { classifyGateMisfire } from '../gate-misfire.js';
 import type { FireResult, PollResult, GateVerdict, CascadeRunRecord } from '../types.js';
 import { loadLadder, loadRefusedTiers } from '../ladder.js';
 
@@ -44,7 +45,8 @@ function makePollResult(overrides?: Partial<PollResult>): PollResult {
     prUrl: 'https://github.com/org/repo/pull/1',
     prMergeable: true,
     servedModelId: null,
-    rawMetadata: {},
+    // Terminal runs record a confirmed teardown (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01).
+    rawMetadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
     ...overrides,
   };
 }
@@ -116,6 +118,11 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
         },
       }),
       releaseWoLock: async () => {},
+      // Prior runs report a confirmed teardown unless a test overrides it.
+      readRunDetail: async () => ({
+        status: 'failed',
+        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+      }),
       ...deps,
     },
   };
@@ -402,11 +409,11 @@ describe('Test: progress-timeout respects the frontier approval gate + records a
   test('a frontier tier that needs approval: the current run is not cancelled', async () => {
     let cancelCalls = 0;
     const deps: CascadeDeps = {
-      // Enter at claude (non-premium, human-typed) so the climb target is the
-      // premium frontier tier.
-      fire: async () => makeFireOk('run-claude'),
+      // Entry is codex and the next automatic climb is frontier, so the hung
+      // run is not cancelled.
+      fire: async () => makeFireOk('run-codex'),
       poll: async () => {
-        throw new TimeoutError('[smart-cauldron/poll] Run run-claude stalled: no new events');
+        throw new TimeoutError('[smart-cauldron/poll] Run run-codex stalled: no new events');
       },
       judge: () => makePassVerdict(),
       escalate: async () => {
@@ -419,17 +426,17 @@ describe('Test: progress-timeout respects the frontier approval gate + records a
       },
     };
 
-    const record = await runCascade(baseOpts({ deps, entryOverride: 'claude' }));
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'codex' }));
 
     // No cancel-to-nowhere: the hung run was left RUNNING, not cancelled, because
     // the climb target (frontier) requires operator approval.
     expect(cancelCalls).toBe(0);
     expect(record.status).toBe('pending-frontier-approval');
     expect(record.frontierApproval?.tierName).toBe('frontier');
-    // The timed-out claude attempt is recorded; frontier was never fired.
+    // The timed-out codex attempt is recorded; frontier was never fired.
     expect(record.attempts.length).toBe(1);
     expect(record.attempts[0]?.outcome).toBe('progress-timeout');
-    expect(record.attempts.map(a => a.tier)).toEqual(['claude']);
+    expect(record.attempts.map(a => a.tier)).toEqual(['codex']);
   });
 
   test('the cancel reason is non-empty', async () => {
@@ -1333,5 +1340,490 @@ describe('wo claim + single-flight (#1546)', () => {
     expect(record.attempts[0]?.outcome).toBe('refused');
     expect(record.refusalReason?.prNumber).toBe(77);
     expect(record.refusalReason?.checkedAtTier).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gate misfire: stop on the failing tier. Do not climb. Do not SPEC-REPAIR.
+// Real judgeGate (deps.judge is not stubbed).
+// ---------------------------------------------------------------------------
+
+function failedGatePoll(error: string, failedNodes: string[]): PollResult {
+  return makePollResult({
+    terminalStatus: 'failed',
+    prUrl: null,
+    prMergeable: null,
+    validatorVerdict: 'unknown',
+    rawMetadata: { error, failed_nodes: failedNodes },
+  });
+}
+
+describe('Test: harness gate misfire never climbs', () => {
+  test('HARNESS_REFUSED at manifest-evidence-check stops after one fire', async () => {
+    const fireCalls: string[] = [];
+    let cancelCalls = 0;
+    const escalations: { errorClass: string; reason: string }[] = [];
+    const error =
+      "'manifest-evidence-check': Bash node failed [exit 1]: HARNESS_REFUSED: 1 grep stop condition(s) were declared but none executed (grep_executed=0, grep_dropped=1, grep_unparsed=0)";
+
+    const deps: CascadeDeps = {
+      fire: async () => {
+        fireCalls.push('fired');
+        return makeFireOk('run-1');
+      },
+      poll: async () => failedGatePoll(error, ['manifest-evidence-check']),
+      escalate: async ctx => {
+        escalations.push({ errorClass: ctx.errorClass, reason: ctx.reason });
+      },
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async () => {
+        cancelCalls++;
+        return { ok: true, error: null };
+      },
+    };
+
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'cursor' }));
+
+    expect(fireCalls.length).toBe(1);
+    expect(cancelCalls).toBe(0);
+    expect(record.status).toBe('gate-misfire');
+    expect(record.winningTier).toBeNull();
+    expect(record.attempts.length).toBe(1);
+    expect(record.attempts[0]?.outcome).toBe('gate-misfire');
+    expect(record.attempts[0]?.gateFailReason?.startsWith('evidence_harness_refused: ')).toBe(true);
+    expect(record.gateMisfire?.kind).toBe('evidence_harness_refused');
+    expect(record.gateMisfire?.gateNode).toBe('manifest-evidence-check');
+    expect(record.gateMisfire?.tier).toBe('cursor');
+    expect(record.gateMisfire?.runId).toBe('run-1');
+    expect(record.telemetry.climbed).toBe(false);
+    expect(record.telemetry.climbCount).toBe(0);
+    expect(record.telemetry.wonCheap).toBe(false);
+    expect(escalations.length).toBe(1);
+    expect(escalations[0]?.errorClass).toBe('harness_gate_misfire');
+    expect(escalations[0]?.reason).toContain('GATE MISFIRE (no climb)');
+    expect(escalations[0]?.reason).toContain('evidence_harness_refused');
+  });
+
+  test('plan-review repair-target record demand stops without climbing', async () => {
+    let fireCalls = 0;
+    const escalations: string[] = [];
+    const error =
+      "'plan-review': escalated at iteration 2: Have the lane run the GitHub CLI check against thinmansoftware/bdc-harness to confirm PR #1196 is open on branch archon/task-web-worker-1792508866189-fj3m6u, and supply that REPAIR_TARGET / REPAIR_TARGET_BRANCH record back into plan-review so the gate can clear.";
+
+    const deps: CascadeDeps = {
+      fire: async () => {
+        fireCalls++;
+        return makeFireOk('run-plan-review');
+      },
+      poll: async () => failedGatePoll(error, ['plan-review']),
+      escalate: async ctx => {
+        escalations.push(ctx.errorClass);
+      },
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async () => ({ ok: true, error: null }),
+    };
+
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'cursor' }));
+
+    expect(fireCalls).toBe(1);
+    expect(record.status).toBe('gate-misfire');
+    expect(record.gateMisfire?.kind).toBe('plan_review_record_demand');
+    expect(record.attempts[0]?.gateFailReason?.startsWith('plan_review_record_demand: ')).toBe(
+      true
+    );
+    expect(record.telemetry.climbed).toBe(false);
+    expect(record.telemetry.climbCount).toBe(0);
+    expect(escalations).toEqual(['harness_gate_misfire']);
+  });
+
+  test('held repair target stops as repair_target_unavailable', async () => {
+    let fireCalls = 0;
+    let escalateCalls = 0;
+    const error =
+      "repair_target_branch_held: feat/x is checked out by /.archon/workspaces/o/r/worktrees/archon/task-web-worker-1-a; not reclaimed: live process cwd under holder; 'repair-gate-fail': Bash node 'repair-gate-fail' failed [exit 1]: repair_gate_closed: checkout_failed";
+
+    const deps: CascadeDeps = {
+      fire: async () => {
+        fireCalls++;
+        return makeFireOk('run-held');
+      },
+      poll: async () => failedGatePoll(error, ['checkout-repair-target', 'repair-gate-fail']),
+      escalate: async () => {
+        escalateCalls++;
+      },
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async () => ({ ok: true, error: null }),
+    };
+
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'cursor' }));
+
+    expect(fireCalls).toBe(1);
+    expect(escalateCalls).toBe(1);
+    expect(record.status).toBe('gate-misfire');
+    expect(record.gateMisfire?.kind).toBe('repair_target_unavailable');
+    expect(record.attempts[0]?.gateFailReason?.startsWith('repair_target_unavailable: ')).toBe(
+      true
+    );
+    expect(record.telemetry.climbCount).toBe(0);
+  });
+
+  test('an implement-side failure plus a gate failure still climbs and wins', async () => {
+    let pollCalls = 0;
+    const fireCalls: string[] = [];
+    let escalateCalls = 0;
+    const tier0 = failedGatePoll(
+      "'implement': loop exhausted; 'manifest-evidence-check': HARNESS_REFUSED: 1 grep stop condition(s) were declared but none executed",
+      ['implement', 'manifest-evidence-check']
+    );
+
+    expect(classifyGateMisfire(tier0)).toBeNull();
+
+    const deps: CascadeDeps = {
+      fire: async () => {
+        fireCalls.push('fired');
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      poll: async () => {
+        pollCalls++;
+        return pollCalls === 1 ? tier0 : makePollResult();
+      },
+      escalate: async () => {
+        escalateCalls++;
+      },
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async () => ({ ok: true, error: null }),
+    };
+
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'cursor' }));
+
+    expect(fireCalls.length).toBe(2);
+    expect(escalateCalls).toBe(0);
+    expect(record.status).toBe('won');
+    expect(record.winningTier).toBe('codex');
+    expect(record.telemetry.climbed).toBe(true);
+    expect(record.attempts[0]?.outcome).toBe('gate-failed');
+  });
+
+  test('a genuine red test climbs and wins; a cancelled run stays cancelled', async () => {
+    let pollCalls = 0;
+    let fireCalls = 0;
+    let escalateCalls = 0;
+    const red = failedGatePoll(
+      '\'manifest-evidence-check\': EVIDENCE_ERROR: Tests: "6/7 (bash ./scripts/x.sh) -- FAILED, exit 1" on a CODE WO (tests_status=failed)',
+      ['manifest-evidence-check']
+    );
+    expect(classifyGateMisfire(red)).toBeNull();
+
+    const climbDeps: CascadeDeps = {
+      fire: async () => {
+        fireCalls++;
+        return makeFireOk(`run-${fireCalls}`);
+      },
+      poll: async () => {
+        pollCalls++;
+        return pollCalls === 1 ? red : makePollResult();
+      },
+      escalate: async () => {
+        escalateCalls++;
+      },
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async () => ({ ok: true, error: null }),
+    };
+
+    const climbed = await runCascade(baseOpts({ deps: climbDeps, entryOverride: 'cursor' }));
+    expect(fireCalls).toBe(2);
+    expect(escalateCalls).toBe(0);
+    expect(climbed.status).toBe('won');
+    expect(climbed.winningTier).toBe('codex');
+    expect(climbed.telemetry.climbed).toBe(true);
+
+    let cancelFires = 0;
+    let cancelEscalations = 0;
+    const cancelDeps: CascadeDeps = {
+      fire: async () => {
+        cancelFires++;
+        return makeFireOk('run-cancelled');
+      },
+      poll: async () =>
+        makePollResult({
+          terminalStatus: 'cancelled',
+          prUrl: null,
+          prMergeable: null,
+          validatorVerdict: 'unknown',
+          rawMetadata: {},
+        }),
+      escalate: async () => {
+        cancelEscalations++;
+      },
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async () => ({ ok: true, error: null }),
+    };
+
+    const cancelled = await runCascade(baseOpts({ deps: cancelDeps, entryOverride: 'cursor' }));
+    expect(cancelFires).toBe(1);
+    expect(cancelEscalations).toBe(0);
+    expect(cancelled.status).toBe('cancelled');
+    expect(cancelled.telemetry.climbed).toBe(false);
+    expect(cancelled.telemetry.climbCount).toBe(0);
+    expect(cancelled.attempts[0]?.outcome).toBe('cancelled');
+  });
+
+  test('frontier misfire does not post SPEC-REPAIR', async () => {
+    let fireCalls = 0;
+    let specRepairCalls = 0;
+    const escalations: string[] = [];
+    const error =
+      "'manifest-evidence-check': Bash node failed [exit 1]: HARNESS_REFUSED: 1 grep stop condition(s) were declared but none executed (grep_executed=0, grep_dropped=1, grep_unparsed=0)";
+
+    const deps: CascadeDeps = {
+      fire: async () => {
+        fireCalls++;
+        return makeFireOk('run-frontier');
+      },
+      poll: async () => failedGatePoll(error, ['manifest-evidence-check']),
+      escalate: async ctx => {
+        escalations.push(ctx.errorClass);
+      },
+      specRepair: async () => {
+        specRepairCalls++;
+        return { posted: true, issueRepo: 'thinmansoftware/bdc-xo', issueNumber: 1 };
+      },
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+      cancel: async () => ({ ok: true, error: null }),
+    };
+
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'frontier' }));
+
+    expect(fireCalls).toBe(1);
+    expect(specRepairCalls).toBe(0);
+    expect(record.status).toBe('gate-misfire');
+    expect(record.status).not.toBe('spec-repair');
+    expect(record.telemetry.climbCount).toBe(0);
+    expect(escalations).toEqual(['harness_gate_misfire']);
+  });
+
+  test('plan_review_not_approved climbs and wins; checkout_failed does not', async () => {
+    const qualityError =
+      "'plan-review': escalated at iteration 1: ESCALATION_REASON=ambiguous-spec -- the spec's invariant (e) contradicts its objective; 'repair-gate-fail': Bash node 'repair-gate-fail' failed [exit 1]: repair_gate_closed: plan_review_not_approved";
+    const qualityPoll = failedGatePoll(qualityError, ['plan-review', 'repair-gate-fail']);
+    expect(classifyGateMisfire(qualityPoll)).toBeNull();
+
+    let qualityFires = 0;
+    let qualityEscalations = 0;
+    const quality = await runCascade(
+      baseOpts({
+        entryOverride: 'cursor',
+        deps: {
+          fire: async () => {
+            qualityFires++;
+            return makeFireOk(`run-quality-${qualityFires}`);
+          },
+          poll: async () => (qualityFires === 1 ? qualityPoll : makePollResult()),
+          escalate: async () => {
+            qualityEscalations++;
+          },
+          writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+          cancel: async () => ({ ok: true, error: null }),
+        },
+      })
+    );
+    expect(qualityFires).toBe(2);
+    expect(qualityEscalations).toBe(0);
+    expect(quality.status).toBe('won');
+    expect(quality.winningTier).toBe('codex');
+
+    const checkoutError =
+      "'checkout-repair-target': Bash node failed [exit 1]: fatal: branch feat/x is already used by worktree; 'repair-gate-fail': Bash node 'repair-gate-fail' failed [exit 1]: repair_gate_closed: checkout_failed";
+    const checkoutPoll = failedGatePoll(checkoutError, [
+      'checkout-repair-target',
+      'repair-gate-fail',
+    ]);
+    expect(classifyGateMisfire(checkoutPoll)?.kind).toBe('repair_gate_closed');
+
+    let checkoutFires = 0;
+    let checkoutEscalations = 0;
+    const checkout = await runCascade(
+      baseOpts({
+        entryOverride: 'cursor',
+        deps: {
+          fire: async () => {
+            checkoutFires++;
+            return makeFireOk('run-checkout');
+          },
+          poll: async () => checkoutPoll,
+          escalate: async () => {
+            checkoutEscalations++;
+          },
+          writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+          cancel: async () => ({ ok: true, error: null }),
+        },
+      })
+    );
+    expect(checkoutFires).toBe(1);
+    expect(checkoutEscalations).toBe(1);
+    expect(checkout.status).toBe('gate-misfire');
+    expect(checkout.gateMisfire?.kind).toBe('repair_gate_closed');
+    expect(checkout.attempts[0]?.gateFailReason?.startsWith('repair_gate_closed: ')).toBe(true);
+    expect(checkout.telemetry.climbed).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01: no climb on a failed repair checkout,
+// and every retry waits for the prior run's confirmed teardown.
+// ---------------------------------------------------------------------------
+
+describe('repair holder teardown (conductor)', () => {
+  test('Test 16: conductor_does_not_climb_failed_checkout', async () => {
+    const polls: PollResult[] = [
+      makePollResult({
+        terminalStatus: 'failed',
+        prUrl: null,
+        prMergeable: null,
+        validatorVerdict: 'unknown',
+        rawMetadata: {
+          terminal_cause: 'repair_checkout_failed',
+          teardown_confirmed_at: '2026-11-01T00:00:00.000Z',
+        },
+      }),
+      makePollResult({
+        terminalStatus: 'failed',
+        prUrl: null,
+        prMergeable: null,
+        validatorVerdict: 'unknown',
+        rawMetadata: {
+          error:
+            "'repair-gate-fail': repair_gate_closed: checkout_failed; 'capture-run-scope': failed",
+          failed_nodes: ['repair-gate-fail', 'capture-run-scope'],
+          teardown_confirmed_at: '2026-11-01T00:00:00.000Z',
+        },
+      }),
+    ];
+    for (const poll of polls) {
+      let fires = 0;
+      const escalations: string[] = [];
+      const record = await runCascade(
+        baseOpts({
+          entryOverride: 'cursor',
+          deps: {
+            fire: async () => {
+              fires++;
+              return makeFireOk(`run-${fires}`);
+            },
+            poll: async () => poll,
+            judge: () => makeFailVerdict('terminal status: failed'),
+            escalate: async ctx => {
+              escalations.push(ctx.reason);
+            },
+            writeRecord: async r => `/tmp/cascade-record-${r.cascadeId}.json`,
+            cancel: async () => ({ ok: true, error: null }),
+          },
+        })
+      );
+      expect(fires).toBe(1);
+      expect(record.status).toBe('blocked');
+      expect(record.blockedReason).toBe('checkout_failed_no_climb');
+      expect(escalations.length).toBe(1);
+      expect(escalations[0]).toContain('checkout_failed_no_climb');
+    }
+  });
+
+  test('Test 17: retry_waits_for_prior_teardown', async () => {
+    const failPoll = makePollResult({
+      terminalStatus: 'failed',
+      prUrl: null,
+      prMergeable: null,
+      validatorVerdict: 'needs_revision',
+      rawMetadata: {},
+    });
+    const run = async (
+      read: (runId: string) => Promise<{ metadata?: Record<string, unknown> } | null>,
+      waitMs: number
+    ): Promise<{ fires: number; record: CascadeRunRecord; escalations: number; ms: number }> => {
+      let fires = 0;
+      let escalations = 0;
+      const t0 = Date.now();
+      const record = await runCascade(
+        baseOpts({
+          entryOverride: 'cursor',
+          deps: {
+            fire: async () => {
+              fires++;
+              return makeFireOk(`run-${fires}`);
+            },
+            poll: async () => (fires === 1 ? failPoll : makePollResult()),
+            judge: p =>
+              p.terminalStatus === 'completed' ? makePassVerdict() : makeFailVerdict('red'),
+            escalate: async () => {
+              escalations++;
+            },
+            writeRecord: async r => `/tmp/cascade-record-${r.cascadeId}.json`,
+            cancel: async () => ({ ok: true, error: null }),
+            readRunDetail: read,
+            teardownWaitMs: waitMs,
+            teardownPollMs: 20,
+          },
+        })
+      );
+      return { fires, record, escalations, ms: Date.now() - t0 };
+    };
+
+    // Case 1: confirmed after the third poll -> tier 2 fires once.
+    let reads = 0;
+    const firesAtRead: number[] = [];
+    const case1 = await run(async () => {
+      reads++;
+      firesAtRead.push(reads);
+      return reads >= 3 ? { metadata: { teardown_confirmed_at: '2026-11-01T00:00:00Z' } } : {};
+    }, 2000);
+    expect(reads).toBe(3);
+    expect(case1.fires).toBe(2);
+    expect(case1.record.status).toBe('won');
+
+    // Case 2: never set; case 3: survivors present; case 4: read never completes.
+    const never = await run(async () => ({ metadata: {} }), 300);
+    const survivors = await run(
+      async () => ({ metadata: { teardown_survivors: [{ reason: 'survived_kill', pid: 7 }] } }),
+      300
+    );
+    const hung = await run(() => new Promise(() => undefined), 300);
+    for (const result of [never, survivors, hung]) {
+      expect(result.fires).toBe(1);
+      expect(result.record.status).toBe('blocked');
+      expect(result.record.blockedReason).toBe('teardown_unconfirmed');
+      expect(result.escalations).toBe(1);
+    }
+    expect(hung.ms).toBeLessThan(5000);
+  });
+
+  test('Test 14: unverifiable_platform_fails_closed (conductor: next tier not fired)', async () => {
+    let fires = 0;
+    const record = await runCascade(
+      baseOpts({
+        entryOverride: 'cursor',
+        deps: {
+          fire: async () => {
+            fires++;
+            return makeFireOk(`run-${fires}`);
+          },
+          poll: async () =>
+            makePollResult({
+              terminalStatus: 'failed',
+              prUrl: null,
+              prMergeable: null,
+              validatorVerdict: 'needs_revision',
+              rawMetadata: { teardown_survivors: [{ reason: 'teardown_unverifiable' }] },
+            }),
+          judge: () => makeFailVerdict('red'),
+          escalate: async () => undefined,
+          writeRecord: async r => `/tmp/cascade-record-${r.cascadeId}.json`,
+          cancel: async () => ({ ok: true, error: null }),
+          teardownWaitMs: 200,
+          teardownPollMs: 20,
+        },
+      })
+    );
+    expect(fires).toBe(1);
+    expect(record.blockedReason).toBe('teardown_unconfirmed');
   });
 });

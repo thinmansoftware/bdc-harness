@@ -114,11 +114,20 @@ describe('already-satisfied lane wiring', () => {
 
       const node = (id: string) => result.workflow?.nodes.find(n => n.id === id);
       const skipWhen = "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'";
+      // plan-review additionally fails closed on a failed checkout-repair-target
+      // (WO-HARNESS-REPAIR-PATH-HOTFIX-01 item 1b): an empty checkout output means
+      // the repair-target checkout failed, so plan-review must not run on it.
+      const planReviewWhen =
+        "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true' && $checkout-repair-target.output != ''";
 
       expect(node('plan')?.when).toBe(skipWhen);
-      expect(node('plan-review')?.when).toBe(skipWhen);
+      expect(node('plan-review')?.when).toBe(planReviewWhen);
       expect(node('plan-review')?.trigger_rule).toBe('all_done');
-      expect(node('implement')?.when).toBe(skipWhen);
+      // Repair runs also require an open repair-gate. The gate clause is
+      // ANDed so a missing gate output fails closed (WO-HARNESS-REPAIR-RUN-GUARDS-01).
+      expect(node('implement')?.when).toBe(
+        "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
+      );
       expect(node('implement')?.trigger_rule).toBe('all_done');
 
       for (const id of [

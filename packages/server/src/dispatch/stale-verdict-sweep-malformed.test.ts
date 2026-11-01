@@ -18,215 +18,205 @@
  *
  * REAL DATABASE ON PURPOSE. The bug lives in the seam between the DAL's raw
  * page and the wiring's parsed output; a mocked lister cannot show it.
- */
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { unlinkSync } from 'fs';
-import { join } from 'path';
-import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
-
-let db: SqliteAdapter;
-let currentDbPath = '';
-
-mock.module('@archon/core/db/connection', () => ({
-  getDatabase: () => db,
-}));
-
-const { listRealSweepCandidates } = await import('./stale-verdict-sweep-wiring');
-const { runStaleVerdictSweep, createMemorySweepCursor } = await import('./stale-verdict-sweep');
-
-const REVIEW_RECIPIENT = 'overseer-reviewer';
-const TOTAL_ROWS = 60;
-/** Rows 1..50 are malformed -- a full default page of them. */
-const MALFORMED_THROUGH = 50;
-/** The only row that can ever become a candidate. */
-const ELIGIBLE_ROW = 55;
-
-function cleanupDb(path: string): void {
-  for (const suffix of ['', '-wal', '-shm']) {
-    try {
-      unlinkSync(path + suffix);
-    } catch {
-      /* file may not exist */
-    }
-  }
-}
-
-/**
- * Seed 60 completed run_review rows. Rows 1-50 carry bodies the review-work
- * parser rejects; rows 51-60 are well-formed, and only row 55 is wired to be
- * the eligible one in the sweep test below.
  *
- * Two distinct malformed shapes on purpose, because production has both: bodies
- * that are not valid JSON at all, and bodies that parse but lack the required
- * owner/repo/prNumber/headSha fields.
+ * ISOLATION. SQLite runs in a child process with its own ARCHON_HOME. This
+ * file does not mock `@archon/core/db/connection` and does not close a handle
+ * shared with the rest of the dispatch suite.
  */
-async function seedRows(): Promise<void> {
-  for (let index = 1; index <= TOTAL_ROWS; index += 1) {
-    const malformed = index <= MALFORMED_THROUGH;
-    const body = malformed
-      ? index % 2 === 0
-        ? '{ this is not json'
-        : JSON.stringify({ note: 'parses, but carries no review fields' })
-      : JSON.stringify({
-          owner: 'thinmansoftware',
-          repo: 'bdc-harness',
-          prNumber: index,
-          headSha: `head-${index}`,
-          baseRef: 'dev',
-          author: 'bluedevilcollectibles',
-        });
-    await db.query(
-      `INSERT INTO agent_dispatch_messages
-         (id, correlation_id, idempotency_key, task_type, sender, recipient, body,
-          status, created_at, priority, fencing_token, seq)
-       VALUES ($1, $2, $3, 'run_review', 'overseer', $4, $5, 'done', $6, 'normal', 0, $7)`,
-      [
-        `msg-${index}`,
-        `pr-review:thinmansoftware/bdc-harness#${index}@head-${index}`,
-        `pr-review:${index}`,
-        REVIEW_RECIPIENT,
-        body,
-        new Date(Date.UTC(2026, 8, 8, 0, 0, 0) + index * 1000).toISOString(),
-        index,
-      ]
-    );
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, test } from 'bun:test';
+
+interface PageProbe {
+  kind: 'page';
+  candidatesLength: number;
+  rawCount: number;
+  discarded: number;
+  lastRawSeq: number;
+  firstPrNumber: number | null;
+}
+
+interface WalkProbe {
+  kind: 'walk';
+  firstExamined: number;
+  firstEnqueued: number;
+  firstDiscarded: number;
+  firstAfterSeq: number;
+  cursorAfterFirst: number;
+  cursorAfterSecond: number;
+  totalEnqueued: number;
+  enqueuedPrs: number[];
+}
+
+interface RewindProbe {
+  kind: 'rewind';
+  afterSeq: number;
+  cursor: number;
+}
+
+type ProbePayload = PageProbe | WalkProbe | RewindProbe;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isPageProbe(value: Record<string, unknown>): value is PageProbe {
+  return (
+    value.kind === 'page' &&
+    typeof value.candidatesLength === 'number' &&
+    typeof value.rawCount === 'number' &&
+    typeof value.discarded === 'number' &&
+    typeof value.lastRawSeq === 'number' &&
+    (typeof value.firstPrNumber === 'number' || value.firstPrNumber === null)
+  );
+}
+
+function isWalkProbe(value: Record<string, unknown>): value is WalkProbe {
+  return (
+    value.kind === 'walk' &&
+    typeof value.firstExamined === 'number' &&
+    typeof value.firstEnqueued === 'number' &&
+    typeof value.firstDiscarded === 'number' &&
+    typeof value.firstAfterSeq === 'number' &&
+    typeof value.cursorAfterFirst === 'number' &&
+    typeof value.cursorAfterSecond === 'number' &&
+    typeof value.totalEnqueued === 'number' &&
+    Array.isArray(value.enqueuedPrs) &&
+    value.enqueuedPrs.every(item => typeof item === 'number')
+  );
+}
+
+function isRewindProbe(value: Record<string, unknown>): value is RewindProbe {
+  return (
+    value.kind === 'rewind' &&
+    typeof value.afterSeq === 'number' &&
+    typeof value.cursor === 'number'
+  );
+}
+
+function probeResultLines(stdout: string): string[] {
+  return stdout
+    .split('\n')
+    .map(item => item.trim())
+    .filter(item => item.startsWith('PROBE='));
+}
+
+function parseProbe(stdout: string): ProbePayload {
+  const lines = probeResultLines(stdout);
+  if (lines.length !== 1) {
+    throw new Error(`expected exactly one PROBE= line, found ${lines.length}: ${stdout}`);
+  }
+  const line = lines[0] ?? '';
+  const parsed: unknown = JSON.parse(line.slice('PROBE='.length));
+  if (!isRecord(parsed)) throw new Error(`unexpected probe payload: ${line}`);
+  if (isPageProbe(parsed) || isWalkProbe(parsed) || isRewindProbe(parsed)) return parsed;
+  throw new Error(`unexpected probe payload: ${line}`);
+}
+
+function runProbe(scenario: string): ProbePayload {
+  const home = mkdtempSync(join(tmpdir(), 'sweep-malformed-'));
+  try {
+    const env: NodeJS.ProcessEnv = { ...process.env, ARCHON_HOME: home, BUN_ENV: 'test' };
+    delete env.DATABASE_URL;
+    const probe = join(import.meta.dir, 'stale-verdict-sweep-malformed.probe.ts');
+    const proc = Bun.spawnSync([process.execPath, 'run', probe, scenario], {
+      env,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 45_000,
+    });
+    if (proc.exitCode !== 0) {
+      throw new Error(
+        `SQLite probe exited ${proc.exitCode}: ${proc.stderr.toString()} ${proc.stdout.toString()}`
+      );
+    }
+    const stdout = proc.stdout.toString();
+    try {
+      return parseProbe(stdout);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`${message}; stderr: ${proc.stderr.toString()}`);
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 }
 
-describe('listRealSweepCandidates over a block of unparseable rows', () => {
-  beforeEach(async () => {
-    process.env.BUN_ENV = 'test';
-    currentDbPath = join(
-      import.meta.dir,
-      `.test-sweep-malformed-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
-    );
-    db = new SqliteAdapter(currentDbPath);
-    await seedRows();
-  });
+function runPageProbe(scenario: string): PageProbe {
+  const payload = runProbe(scenario);
+  if (payload.kind !== 'page') throw new Error(`expected page probe, got ${payload.kind}`);
+  return payload;
+}
 
-  afterEach(async () => {
-    delete process.env.BUN_ENV;
-    await db.close();
-    cleanupDb(currentDbPath);
-  });
+describe('probe result line protocol', () => {
+  test('requires exactly one PROBE= line', () => {
+    const payload = parseProbe('log line\nPROBE={"kind":"rewind","afterSeq":1,"cursor":2}\n');
+    expect(payload).toEqual({ kind: 'rewind', afterSeq: 1, cursor: 2 });
 
-  test('a page of only-malformed rows reports its raw position, not an empty list', async () => {
-    // limit 3 -> raw fetch of 50, which lands entirely inside the malformed block.
-    const page = await listRealSweepCandidates(3, 0);
-
-    expect(page.candidates).toHaveLength(0);
-    expect(page.rawCount).toBe(MALFORMED_THROUGH);
-    expect(page.discarded).toBe(MALFORMED_THROUGH);
-    // THE REGRESSION GUARD: the raw position of the last row examined. Without
-    // it the caller cannot tell this page from the end of the store.
-    expect(page.lastRawSeq).toBe(MALFORMED_THROUGH);
-  });
-
-  test('resuming past the malformed block returns the well-formed rows', async () => {
-    const page = await listRealSweepCandidates(3, MALFORMED_THROUGH);
-
-    expect(page.candidates.length).toBeGreaterThan(0);
-    expect(page.discarded).toBe(0);
-    expect(page.candidates[0]?.prNumber).toBe(MALFORMED_THROUGH + 1);
-  });
-
-  test('a genuinely exhausted cursor reports zero raw rows', async () => {
-    const page = await listRealSweepCandidates(3, TOTAL_ROWS);
-
-    expect(page.rawCount).toBe(0);
-    expect(page.candidates).toHaveLength(0);
-    expect(page.lastRawSeq).toBe(0);
+    expect(() => parseProbe('no probe here\n')).toThrow(/exactly one PROBE= line, found 0/);
+    expect(() =>
+      parseProbe(
+        'PROBE={"kind":"rewind","afterSeq":1,"cursor":2}\nPROBE={"kind":"rewind","afterSeq":3,"cursor":4}\n'
+      )
+    ).toThrow(/exactly one PROBE= line, found 2/);
   });
 });
 
+describe('listRealSweepCandidates over a block of unparseable rows', () => {
+  test('a page of only-malformed rows reports its raw position, not an empty list', () => {
+    const page = runPageProbe('page-malformed');
+
+    expect(page.candidatesLength).toBe(0);
+    expect(page.rawCount).toBe(50);
+    expect(page.discarded).toBe(50);
+    // THE REGRESSION GUARD: the raw position of the last row examined. Without
+    // it the caller cannot tell this page from the end of the store.
+    expect(page.lastRawSeq).toBe(50);
+  }, 60_000);
+
+  test('resuming past the malformed block returns the well-formed rows', () => {
+    const page = runPageProbe('page-resume');
+
+    expect(page.candidatesLength).toBeGreaterThan(0);
+    expect(page.discarded).toBe(0);
+    expect(page.firstPrNumber).toBe(51);
+  }, 60_000);
+
+  test('a genuinely exhausted cursor reports zero raw rows', () => {
+    const page = runPageProbe('page-exhausted');
+
+    expect(page.rawCount).toBe(0);
+    expect(page.candidatesLength).toBe(0);
+    expect(page.lastRawSeq).toBe(0);
+  }, 60_000);
+});
+
 describe('the sweep walks past malformed rows across heartbeats', () => {
-  beforeEach(async () => {
-    process.env.BUN_ENV = 'test';
-    currentDbPath = join(
-      import.meta.dir,
-      `.test-sweep-walk-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
-    );
-    db = new SqliteAdapter(currentDbPath);
-    await seedRows();
-  });
-
-  afterEach(async () => {
-    delete process.env.BUN_ENV;
-    await db.close();
-    cleanupDb(currentDbPath);
-  });
-
-  test('row 55 is reached on the SECOND heartbeat, with no rewind after the first', async () => {
-    const enqueued: number[] = [];
-    const deps = {
-      listCandidates: listRealSweepCandidates,
-      // Only row 55 carries an authorizing, stale verdict.
-      readStandingVerdict: async (candidate: { prNumber: number; headSha: string }) =>
-        candidate.prNumber === ELIGIBLE_ROW
-          ? {
-              headSha: candidate.headSha,
-              disposition: 'changes_requested',
-              summary: '[major] checks/test (windows-latest): required check failed',
-              recordedAt: '2026-09-08T12:00:00.000Z',
-            }
-          : {
-              headSha: candidate.headSha,
-              disposition: 'approved',
-              summary: 'No blocking findings.',
-              recordedAt: '2026-09-08T12:00:00.000Z',
-            },
-      readLatestCheckCompletion: async () => ({
-        checkId: 'check_run:555',
-        checkName: 'test (windows-latest)',
-        conclusion: 'success',
-        completedAt: '2026-09-08T16:00:00.000Z',
-        // The suite is fully green: staleness alone no longer authorizes an
-        // enqueue (#786 review @18df6323).
-        allChecksGreen: true,
-      }),
-      enqueueRecheckWork: async (input: { prNumber: number }) => {
-        enqueued.push(input.prNumber);
-        return { messageId: `msg-${input.prNumber}`, alreadyExisted: false };
-      },
-    };
-    const cursor = createMemorySweepCursor();
+  test('row 55 is reached on the SECOND heartbeat, with no rewind after the first', () => {
+    const payload = runProbe('walk-second-heartbeat');
+    if (payload.kind !== 'walk') throw new Error(`expected walk probe, got ${payload.kind}`);
 
     // HEARTBEAT 1: the raw page is the 50-row malformed block. Nothing parses,
     // so nothing is examined -- but the walk must still move.
-    const first = await runStaleVerdictSweep(deps, 3, cursor);
-    expect(first.examined).toBe(0);
-    expect(first.enqueued).toBe(0);
-    expect(first.discarded).toBe(MALFORMED_THROUGH);
+    expect(payload.firstExamined).toBe(0);
+    expect(payload.firstEnqueued).toBe(0);
+    expect(payload.firstDiscarded).toBe(50);
     // THE REGRESSION GUARD: before the fix this rewound to 0 every time.
-    expect(first.afterSeq).toBe(MALFORMED_THROUGH);
-    expect(await cursor.read()).toBe(MALFORMED_THROUGH);
+    expect(payload.firstAfterSeq).toBe(50);
+    expect(payload.cursorAfterFirst).toBe(50);
 
     // HEARTBEAT 2: resumes past the block and finds the eligible row.
-    const second = await runStaleVerdictSweep(deps, 3, cursor);
-    expect(await cursor.read()).toBeGreaterThan(MALFORMED_THROUGH);
-    expect(second.enqueued + first.enqueued).toBe(1);
-    expect(enqueued).toEqual([ELIGIBLE_ROW]);
-  });
+    expect(payload.cursorAfterSecond).toBeGreaterThan(50);
+    expect(payload.totalEnqueued).toBe(1);
+    expect(payload.enqueuedPrs).toEqual([55]);
+  }, 60_000);
 
-  test('the walk still rewinds once the store is genuinely exhausted', async () => {
-    const deps = {
-      listCandidates: listRealSweepCandidates,
-      readStandingVerdict: async (candidate: { headSha: string }) => ({
-        headSha: candidate.headSha,
-        disposition: 'approved',
-        summary: 'No blocking findings.',
-        recordedAt: '2026-09-08T12:00:00.000Z',
-      }),
-      readLatestCheckCompletion: async () => null,
-      enqueueRecheckWork: async () => ({ messageId: 'unused', alreadyExisted: true }),
-    };
-    // A cursor already past every seeded row: zero RAW rows come back, which is
-    // the only condition that may rewind.
-    const cursor = createMemorySweepCursor(TOTAL_ROWS);
+  test('the walk still rewinds once the store is genuinely exhausted', () => {
+    const payload = runProbe('walk-exhausted-rewind');
+    if (payload.kind !== 'rewind') throw new Error(`expected rewind probe, got ${payload.kind}`);
 
-    const result = await runStaleVerdictSweep(deps, 3, cursor);
-
-    expect(result.afterSeq).toBe(0);
-    expect(await cursor.read()).toBe(0);
-  });
+    expect(payload.afterSeq).toBe(0);
+    expect(payload.cursor).toBe(0);
+  }, 60_000);
 });

@@ -27,6 +27,7 @@ import {
   registerRepository,
   ConversationNotFoundError,
   generateAndSetTitle,
+  releaseTerminalRunLeasesSweep,
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
@@ -65,8 +66,10 @@ import { processDueProviderWaits } from '@archon/workflows/reliability/wait-sche
 import {
   FUELGLASS_SEAT_CUTOFF_SETTING_KEY,
   getSeatCutoff,
+  invalidateSeatUsageCache,
   isValidSeatCutoff,
   readAllSeats,
+  resolvePushedReadingMaxAgeMinutes,
   SEAT_CUTOFF_OUT_OF_RANGE,
   setSeatCutoffOverride,
 } from '@archon/workflows/reliability/seat-usage';
@@ -75,6 +78,10 @@ import {
   getOperatorSetting,
   setOperatorSetting,
 } from '@archon/core/db/operator-settings';
+import {
+  getLatestSeatUsageReading,
+  upsertSeatUsageReading,
+} from '@archon/core/db/seat-usage-readings';
 import { resolveWorkflowProbeBindings } from '@archon/workflows/reliability/resolve-binding';
 import type { ModelOverride } from '@archon/workflows/model-override';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
@@ -142,10 +149,13 @@ export const EXPECTATION_DAILY_CAP =
     : 50;
 
 let providerWaitSchedulerTimer: ReturnType<typeof setInterval> | undefined;
+let terminalLeaseSweepTimer: ReturnType<typeof setInterval> | undefined;
 
 export function stopProviderWaitScheduler(): void {
   if (providerWaitSchedulerTimer) clearInterval(providerWaitSchedulerTimer);
   providerWaitSchedulerTimer = undefined;
+  if (terminalLeaseSweepTimer) clearInterval(terminalLeaseSweepTimer);
+  terminalLeaseSweepTimer = undefined;
 }
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -221,6 +231,7 @@ import {
   DispatchNonSystemCapability,
   DispatchPrincipalAuthError,
   authenticateDispatchPrincipal,
+  parseDispatchPrincipalsRegistry,
   type DispatchSenderAuthMode,
 } from '../auth/dispatch-principal';
 import { createLogger as createDispatchRouteLogger } from '@archon/paths';
@@ -313,6 +324,9 @@ import {
 import {
   fuelglassCutoffBodySchema,
   fuelglassCutoffResponseSchema,
+  fuelglassReadingGetResponseSchema,
+  fuelglassReadingPostResponseSchema,
+  fuelglassReadingPushBodySchema,
   fuelglassSeatsResponseSchema,
 } from './schemas/fuelglass.schemas';
 import {
@@ -325,6 +339,7 @@ import {
   dispatchMessageSchema,
   dispatchSenderBodySchema,
   dispatchWorkerSchema,
+  dispatchPrincipalsResponseSchema,
   dispatchStatusQuerySchema,
   dispatchStatusResponseSchema,
   executionHandoffBodySchema,
@@ -950,6 +965,37 @@ const getDispatchStatusRoute = createRoute({
     200: {
       content: { 'application/json': { schema: dispatchStatusResponseSchema } },
       description: 'Dispatch status',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+function dispatchPrincipalAckPath(
+  principalId: string,
+  deliveryMode: dispatchDb.DispatchDeliveryMode,
+  credentialConfigured: boolean
+): 'xo_lease' | 'operator_token' | 'principal_credential' | 'worker_claim' | 'none' {
+  if (principalId === 'xo') return 'xo_lease';
+  if (principalId === 'operator') return 'operator_token';
+  if (deliveryMode === 'worker_poll') return 'worker_claim';
+  if (
+    credentialConfigured &&
+    (deliveryMode === 'drain_on_start' || deliveryMode === 'notify_only')
+  ) {
+    return 'principal_credential';
+  }
+  return 'none';
+}
+
+const getDispatchPrincipalsRoute = createRoute({
+  method: 'get',
+  path: '/api/dispatch/principals',
+  tags: ['Dispatch'],
+  summary: 'List dispatch principals and the ack path each one has',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchPrincipalsResponseSchema } },
+      description: 'Dispatch principals',
     },
     500: jsonError('Server error'),
   },
@@ -1965,6 +2011,47 @@ const postFuelglassCutoffRoute = createRoute({
   },
 });
 
+const postFuelglassReadingRoute = createRoute({
+  method: 'post',
+  path: '/api/fuelglass/readings',
+  tags: ['Admin'],
+  summary: 'Store a desktop-pushed cursor seat reading',
+  request: {
+    // Ref, not the Zod schema: OpenAPI still publishes the strict six fields,
+    // and no body validator runs before the handler's raw credential scan.
+    body: {
+      content: {
+        'application/json': {
+          schema: { $ref: '#/components/schemas/FuelglassReadingPushBody' },
+        },
+      },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: fuelglassReadingPostResponseSchema } },
+      description: 'Reading stored',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getFuelglassReadingRoute = createRoute({
+  method: 'get',
+  path: '/api/fuelglass/readings/cursor',
+  tags: ['Admin'],
+  summary: 'Read the latest pushed cursor seat reading',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: fuelglassReadingGetResponseSchema } },
+      description: 'Latest cursor reading and freshness',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
 const adminDrainRoute = createRoute({
   method: 'post',
   path: '/api/admin/drain',
@@ -2585,6 +2672,95 @@ const postTaskmasterResumeRoute = createRoute({
   },
 });
 
+const PUSHED_READING_KEYS = new Set([
+  'seat',
+  'used_percent',
+  'remaining_percent',
+  'resets_at',
+  'observed_at',
+  'source',
+]);
+
+const CREDENTIAL_KEY_FRAGMENTS = [
+  'cookie',
+  'token',
+  'session',
+  'secret',
+  'credential',
+  'password',
+  'authorization',
+  'jwt',
+  'bearer',
+];
+
+const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+const OBSERVED_AT_FUTURE_MS = 5 * 60 * 1000;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isCredentialKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return CREDENTIAL_KEY_FRAGMENTS.some(fragment => lower.includes(fragment));
+}
+
+/** True when any key at any depth names a credential. Checked before values. */
+function hasCredentialKey(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(item => hasCredentialKey(item));
+  if (!isPlainRecord(value)) return false;
+  for (const [key, child] of Object.entries(value)) {
+    if (isCredentialKey(key) || hasCredentialKey(child)) return true;
+  }
+  return false;
+}
+
+function isCredentialString(value: string): boolean {
+  return (
+    value.includes('WorkosCursorSessionToken') || (value.length > 100 && JWT_SHAPE.test(value))
+  );
+}
+
+/** True when any string at any depth carries a credential. Checked after keys. */
+function hasCredentialValue(value: unknown): boolean {
+  if (typeof value === 'string') return isCredentialString(value);
+  if (Array.isArray(value)) return value.some(item => hasCredentialValue(item));
+  if (!isPlainRecord(value)) return false;
+  return Object.values(value).some(child => hasCredentialValue(child));
+}
+
+function percentInRange(value: number): boolean {
+  return Number.isFinite(value) && value >= 0 && value <= 100;
+}
+
+function pushedReadingView(row: {
+  seat: string;
+  used_percent: number;
+  remaining_percent: number;
+  resets_at: string;
+  observed_at: string;
+  source: string;
+  received_at: string;
+}): {
+  seat: string;
+  used_percent: number;
+  remaining_percent: number;
+  resets_at: string;
+  observed_at: string;
+  source: string;
+  received_at: string;
+} {
+  return {
+    seat: row.seat,
+    used_percent: row.used_percent,
+    remaining_percent: row.remaining_percent,
+    resets_at: row.resets_at,
+    observed_at: row.observed_at,
+    source: row.source,
+    received_at: row.received_at,
+  };
+}
+
 /**
  * Register all /api/* routes on the Hono app.
  */
@@ -2596,6 +2772,9 @@ export function registerApiRoutes(
   canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot,
   dispatchMailboxActorResolvedHook?: () => Promise<void>
 ): void {
+  // The readings route refs this component instead of validating with it.
+  app.openAPIRegistry.register('FuelglassReadingPushBody', fuelglassReadingPushBodySchema);
+
   function apiError(
     c: Context,
     // 429 is here for the expectation front door's per-registrant daily cap
@@ -3595,6 +3774,33 @@ export function registerApiRoutes(
     providerWaitSchedulerTimer = setInterval(() => void tick(), intervalMs);
     providerWaitSchedulerTimer.unref?.();
     void tick();
+  }
+
+  // Terminal-run lease sweep (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01, N5): release
+  // leases left on terminal runs whose worktree scan is clear. Default every
+  // 10 minutes; ARCHON_TERMINAL_LEASE_SWEEP_MS overrides, 0 disables.
+  if (process.env.NODE_ENV !== 'test' && terminalLeaseSweepTimer === undefined) {
+    const sweepStore = createWorkflowDeps().store;
+    const configuredSweep = Number.parseInt(process.env.ARCHON_TERMINAL_LEASE_SWEEP_MS ?? '', 10);
+    const sweepMs =
+      Number.isInteger(configuredSweep) && configuredSweep >= 0 ? configuredSweep : 600_000;
+    if (sweepMs > 0) {
+      let sweepInFlight = false;
+      const sweep = async (): Promise<void> => {
+        if (sweepInFlight) return;
+        sweepInFlight = true;
+        try {
+          await releaseTerminalRunLeasesSweep(sweepStore);
+        } catch (error) {
+          getLog().error({ err: error as Error }, 'api.terminal_lease_sweep_failed');
+        } finally {
+          sweepInFlight = false;
+        }
+      };
+      terminalLeaseSweepTimer = setInterval(() => void sweep(), sweepMs);
+      terminalLeaseSweepTimer.unref?.();
+      void sweep();
+    }
   }
 
   // Taskmaster Slice 1 loop (WO-HARNESS-TASKMASTER-SLICE1-01, M-133).
@@ -4745,6 +4951,49 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'dispatch_status_failed');
       return apiError(c, 500, 'Failed to get dispatch status');
+    }
+  });
+
+  registerOpenApiRoute(getDispatchPrincipalsRoute, async c => {
+    try {
+      const rawRegistry = process.env.DISPATCH_PRINCIPALS_JSON;
+      let records: { principal_id: string; receive_as: readonly string[] }[] = [];
+      if (rawRegistry !== undefined && rawRegistry !== '') {
+        try {
+          records = parseDispatchPrincipalsRegistry(rawRegistry).map(record => ({
+            principal_id: record.principal_id,
+            receive_as: record.receive_as,
+          }));
+        } catch (error) {
+          const authMapped = mapDispatchPrincipalAuthError(c, error);
+          if (authMapped) return authMapped;
+          getLog().error({ err: error }, 'dispatch_principals_registry_invalid');
+          return apiError(c, 500, 'dispatch_principal_config_invalid');
+        }
+      }
+      const rows = await dispatchDb.listDispatchPrincipals();
+      const principals = rows.map(row => {
+        const credentialConfigured = records.some(
+          record =>
+            record.principal_id === row.principal_id || record.receive_as.includes(row.principal_id)
+        );
+        return {
+          principal_id: row.principal_id,
+          display_name: row.display_name,
+          delivery_mode: row.delivery_mode,
+          active: row.active,
+          credential_configured: credentialConfigured,
+          ack_path: dispatchPrincipalAckPath(
+            row.principal_id,
+            row.delivery_mode,
+            credentialConfigured
+          ),
+        };
+      });
+      return c.json({ principals });
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_principals_failed');
+      return apiError(c, 500, 'Failed to list dispatch principals');
     }
   });
 
@@ -6285,7 +6534,10 @@ export function registerApiRoutes(
         return apiError(c, 400, `Cannot cancel workflow in '${run.status}' status`);
       }
       const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
-      const reason = body.reason ?? '';
+      const reason =
+        typeof body.reason === 'string' && body.reason.trim()
+          ? body.reason
+          : 'API cancellation requested; caller did not supply a reason';
       await workflowDb.cancelWorkflowRun(runId);
       void workflowEventDb.createWorkflowEvent({
         workflow_run_id: runId,
@@ -6588,6 +6840,87 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'fuelglass_cutoff_api_failed');
       return apiError(c, 500, 'Failed to update seat cutoff');
+    }
+  });
+
+  // Rejected reading bodies are never logged or echoed. Credential checks run
+  // on the raw JSON before the strict schema so the code names the real problem.
+  registerOpenApiRoute(postFuelglassReadingRoute, async c => {
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return apiError(c, 400, 'invalid_json');
+    }
+    if (hasCredentialKey(raw)) return apiError(c, 400, 'credential_field_rejected');
+    if (hasCredentialValue(raw)) return apiError(c, 400, 'credential_value_rejected');
+    if (!isPlainRecord(raw) || Object.keys(raw).some(key => !PUSHED_READING_KEYS.has(key))) {
+      return apiError(c, 400, 'unknown_field');
+    }
+    const parsed = fuelglassReadingPushBodySchema.safeParse(raw);
+    if (!parsed.success) return apiError(c, 400, 'invalid_reading');
+    const body = parsed.data;
+    if (body.seat !== 'cursor') return apiError(c, 400, 'seat_not_pushable');
+    if (!percentInRange(body.used_percent) || !percentInRange(body.remaining_percent)) {
+      return apiError(c, 400, 'percent_out_of_range');
+    }
+    if (Math.abs(body.remaining_percent - (100 - body.used_percent)) > 0.01) {
+      return apiError(c, 400, 'percent_mismatch');
+    }
+    const resetsMs = Date.parse(body.resets_at);
+    const observedMs = Date.parse(body.observed_at);
+    if (!Number.isFinite(resetsMs) || !Number.isFinite(observedMs)) {
+      return apiError(c, 400, 'timestamp_unparseable');
+    }
+    if (observedMs - Date.now() > OBSERVED_AT_FUTURE_MS) {
+      return apiError(c, 400, 'observed_at_in_future');
+    }
+    try {
+      await upsertSeatUsageReading({
+        seat: body.seat,
+        used_percent: body.used_percent,
+        remaining_percent: body.remaining_percent,
+        resets_at: body.resets_at,
+        observed_at: body.observed_at,
+        source: body.source,
+      });
+      const stored = await getLatestSeatUsageReading('cursor');
+      if (!stored) return apiError(c, 500, 'Failed to store seat reading');
+      invalidateSeatUsageCache('cursor');
+      return c.json({ success: true, reading: pushedReadingView(stored) });
+    } catch (error) {
+      getLog().error({ err: error }, 'fuelglass_reading_push_failed');
+      return apiError(c, 500, 'Failed to store seat reading');
+    }
+  });
+
+  registerOpenApiRoute(getFuelglassReadingRoute, async c => {
+    try {
+      const maxAgeMinutes = resolvePushedReadingMaxAgeMinutes();
+      const row = await getLatestSeatUsageReading('cursor');
+      if (!row) {
+        return c.json({
+          success: true,
+          reading: null,
+          fresh: false,
+          age_seconds: null,
+          max_age_minutes: maxAgeMinutes,
+        });
+      }
+      const observedMs = Date.parse(row.observed_at);
+      const ageMs = Date.now() - observedMs;
+      const fresh = Number.isFinite(observedMs) && ageMs <= maxAgeMinutes * 60_000;
+      const ageSeconds = Number.isFinite(observedMs) ? Math.floor(ageMs / 1000) : null;
+      return c.json({
+        success: true,
+        reading: pushedReadingView(row),
+        fresh,
+        age_seconds: ageSeconds,
+        max_age_minutes: maxAgeMinutes,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'fuelglass_reading_get_failed');
+      return apiError(c, 500, 'Failed to read seat reading');
     }
   });
 

@@ -191,6 +191,40 @@ const dispatchStatusItemSchema = z.object({
   result_preview: z.string().nullable(),
 });
 
+export const dispatchPrincipalDeliveryModeSchema = z.enum([
+  'worker_poll',
+  'drain_on_start',
+  'alias_resolved',
+  'notify_only',
+]);
+
+export const dispatchPrincipalAckPathSchema = z.enum([
+  'xo_lease',
+  'operator_token',
+  'principal_credential',
+  'worker_claim',
+  'none',
+]);
+
+export const dispatchPrincipalListingEntrySchema = z
+  .object({
+    principal_id: z.string(),
+    display_name: z.string(),
+    delivery_mode: dispatchPrincipalDeliveryModeSchema,
+    active: z.boolean(),
+    credential_configured: z.boolean(),
+    ack_path: dispatchPrincipalAckPathSchema,
+  })
+  .strict()
+  .openapi('DispatchPrincipalListingEntry');
+
+export const dispatchPrincipalsResponseSchema = z
+  .object({
+    principals: z.array(dispatchPrincipalListingEntrySchema),
+  })
+  .strict()
+  .openapi('DispatchPrincipalsResponse');
+
 export const dispatchStatusResponseSchema = z
   .object({
     generated_at: z.string(),

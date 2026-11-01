@@ -5,7 +5,7 @@ import { join } from 'path';
 import { clearRegistry, registerBuiltinProviders } from '@archon/providers';
 import type { IAgentProvider, MessageChunk } from '@archon/providers/types';
 import { rootLogger } from '@archon/paths';
-import { executeWorkflow } from '../executor';
+import { executeWorkflow, resetExecutorLogForTests } from '../executor';
 import type { IWorkflowPlatform, WorkflowConfig, WorkflowDeps } from '../deps';
 import type { IWorkflowStore } from '../store';
 import type { WorkflowDefinition, WorkflowRun } from '../schemas';
@@ -133,10 +133,12 @@ beforeEach(() => {
     }) as typeof child.warn;
     return child;
   }) as typeof rootLogger.child;
+  resetExecutorLogForTests();
 });
 
 afterEach(() => {
   rootLogger.child = origChild as typeof rootLogger.child;
+  resetExecutorLogForTests();
   resetSeatUsageCacheForTests();
   delete process.env.FUELGLASS_SEAT_CUTOFF_PERCENT;
   clearRegistry();
@@ -194,7 +196,7 @@ describe('executor seat gate', () => {
     setSeatCutoffOverride(90);
     const { result, store } = await runWorkflow();
     expect(result.success).toBe(false);
-    expect(result.error).toBe('seat_usage_refused:codex:primary:95:90');
+    expect(result.error).toBe('seat_usage_refused:codex:primary:95:90:lane=seat-gate-wf:role=node');
     const events = store.createWorkflowEvent.mock.calls.map(
       call =>
         call[0] as {
@@ -229,12 +231,14 @@ describe('executor seat gate', () => {
     const { result, store } = await runWorkflow();
     expect(reads).toBe(1);
     expect(result.success).toBe(false);
-    expect(result.error).toBe('seat_usage_refused:claude:seven_day:91:90');
+    expect(result.error).toBe(
+      'seat_usage_refused:claude:seven_day:91:90:lane=seat-gate-wf:role=lane'
+    );
     expect(eventTypes(store)).toContain('dag_workflow_failed');
     expect(eventTypes(store)).not.toContain('workflow_started');
     expect(store.failWorkflowRun).toHaveBeenCalledWith(
       'run-seat-gate',
-      'seat_usage_refused:claude:seven_day:91:90'
+      'seat_usage_refused:claude:seven_day:91:90:lane=seat-gate-wf:role=lane'
     );
     expect(
       warnings.some(
@@ -259,7 +263,7 @@ describe('executor seat gate', () => {
     }));
     const { result, store } = await runWorkflow();
     expect(result.success).toBe(false);
-    expect(result.error).toBe('seat_usage_refused:codex:primary:95:90');
+    expect(result.error).toBe('seat_usage_refused:codex:primary:95:90:lane=seat-gate-wf:role=node');
     expect(eventTypes(store)).toContain('dag_workflow_failed');
     expect(eventTypes(store)).not.toContain('workflow_started');
     expect(

@@ -88,7 +88,7 @@ export interface DutyOfficerClockDeps {
   ) => Promise<unknown>;
   getCurrentXoLease: () => Promise<XoLease | null>;
   listStaleIssues: () => Promise<DutyOfficerStaleIssue[]>;
-  postIssueComment: (issue: DutyOfficerStaleIssue, body: string) => Promise<void>;
+  postIssueComment: (issue: DutyOfficerStaleIssue, body: string) => Promise<boolean>;
   judge: (message: DispatchMessage) => Promise<DutyOfficerJudgeVerdict>;
   securityDetector: (signal: AbortSignal) => Promise<SecurityDetectorResult | null>;
   // Worker heartbeat alarm deps (independent of DUTY_OFFICER_GH_NUDGE). Optional
@@ -256,18 +256,19 @@ export function githubIssueInAllowList(issue: DutyOfficerStaleIssue): boolean {
 export async function postGithubIssueComment(
   issue: DutyOfficerStaleIssue,
   body: string
-): Promise<void> {
-  if (!githubNudgeEnabled()) return;
+): Promise<boolean> {
+  if (!githubNudgeEnabled()) return false;
   if (!githubIssueInAllowList(issue)) {
     log.warn({ issue }, 'duty_officer_github_repo_refused');
-    return;
+    return false;
   }
   const comments = await githubJson<{ body?: string }[]>(
     `/repos/${encodeURIComponent(issue.owner)}/${encodeURIComponent(issue.repo)}/issues/${issue.number}/comments?per_page=30`
   );
   if (comments.some(comment => (comment.body ?? '').includes(DUTY_OFFICER_NUDGE_MARKER))) {
-    return;
+    return true;
   }
+  if (!githubNudgeEnabled() || !githubIssueInAllowList(issue)) return false;
   await githubJson(
     `/repos/${encodeURIComponent(issue.owner)}/${encodeURIComponent(issue.repo)}/issues/${issue.number}/comments`,
     {
@@ -276,6 +277,7 @@ export async function postGithubIssueComment(
       body: JSON.stringify({ body }),
     }
   );
+  return true;
 }
 
 export function createRealDutyOfficerClockDeps(): DutyOfficerClockDeps {
@@ -366,11 +368,11 @@ async function finishItem(
 async function cueGithubIfPresent(
   deps: DutyOfficerClockDeps,
   message: DispatchMessage
-): Promise<void> {
+): Promise<boolean> {
   const issue = parseGithubSubject(message.subject_key);
-  if (!issue) return;
-  if (!githubNudgeEnabled()) return;
-  await deps.postIssueComment(issue, nudgeBody());
+  if (!issue || !githubNudgeEnabled() || !githubIssueInAllowList(issue)) return false;
+  const confirmed: unknown = await deps.postIssueComment(issue, nudgeBody());
+  return confirmed === true;
 }
 
 function escalationSubjectKey(subjectKey: string | null): string | undefined {
@@ -517,15 +519,23 @@ async function handleClaimed(deps: DutyOfficerClockDeps, claimed: DispatchMessag
     verdict = mechanicalVerdict(claimed);
   }
   if (verdict.action === 'escalate_xo') {
-    await escalateToXo(deps, claimed, verdict);
-    await finishItem(deps, claimed, 'done', 'succeeded', {
-      disposition: 'escalated_to_xo',
-      transport: verdict.transport ?? null,
-    });
+    try {
+      await escalateToXo(deps, claimed, verdict);
+      await finishItem(deps, claimed, 'done', 'succeeded', {
+        disposition: 'escalated_to_xo',
+        transport: verdict.transport ?? null,
+      });
+    } catch (error) {
+      log.error({ err: error, messageId: claimed.id }, 'duty_officer_escalation_delivery_failed');
+      await holdItem(deps, claimed);
+    }
     return;
   }
   if (verdict.action === 'nudge') {
-    await cueGithubIfPresent(deps, claimed);
+    if (!(await cueGithubIfPresent(deps, claimed))) {
+      await holdItem(deps, claimed);
+      return;
+    }
     await finishItem(deps, claimed, 'done', 'succeeded', {
       disposition: 'cued',
       transport: verdict.transport ?? null,

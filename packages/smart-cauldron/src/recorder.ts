@@ -19,6 +19,28 @@ export interface CreateCascadeRecordResult {
   readonly record: CascadeRunRecord;
 }
 
+/** Exact stable identity lookup; unreadable/corrupt evidence is not absence. */
+export async function readCascadeRecord(
+  cascadeId: string,
+  outDir = './cascade-runs'
+): Promise<CascadeRunRecord | null> {
+  const dispatchDigest = createHash('sha256').update(cascadeId).digest('hex').slice(0, 24);
+  let bytes: string;
+  try {
+    bytes = await readFile(
+      join(outDir, `dispatch-${dispatchDigest}`, 'cascade-record.json'),
+      'utf8'
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  const record = JSON.parse(bytes) as CascadeRunRecord;
+  if (record.cascadeId !== cascadeId || !Array.isArray(record.attempts))
+    throw new Error('automatic_fire_cascade_identity_invalid');
+  return record;
+}
+
 /** Create the admission record exactly once. Existing dispatch IDs are returned, not overwritten. */
 export async function createRecord(
   record: CascadeRunRecord,

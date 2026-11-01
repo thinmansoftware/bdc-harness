@@ -192,6 +192,7 @@ export type MessageChunk =
         | 'provider_unavailable'
         | 'provider_rate_limited'
         | 'provider_auth_failed'
+        | 'provider_model_capacity'
         | 'progress_timeout';
     }
   | {

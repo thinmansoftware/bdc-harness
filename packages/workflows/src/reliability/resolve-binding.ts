@@ -62,27 +62,50 @@ function optionsForNode(
   };
 }
 
+function resolveNodeBinding(
+  node: DagNode,
+  input: ResolveWorkflowBindingsInput
+): ReturnType<typeof resolveModelForNode> {
+  return resolveModelForNode({
+    nodeId: node.id,
+    nodeProvider: node.provider,
+    nodeModel: node.model,
+    workflowProvider: input.workflowProvider,
+    workflowModel: input.workflowModel,
+    assistantModels: Object.fromEntries(
+      Object.entries(input.config.assistants).map(([provider, assistant]) => [
+        provider,
+        assistant?.model as string | undefined,
+      ])
+    ),
+    modelOverride: input.modelOverride,
+    fallbackModel: 'default',
+  });
+}
+
+/**
+ * Per-node resolved provider for every prompt/command node -- the same node
+ * set and resolution resolveWorkflowProbeBindings uses, but keeping the node
+ * so the seat gate can tell the lane's own seat from reviewer-node seats.
+ */
+export function resolveWorkflowNodeProviders(
+  input: ResolveWorkflowBindingsInput
+): readonly { node: DagNode; providerId: string }[] {
+  const out: { node: DagNode; providerId: string }[] = [];
+  for (const node of input.workflow.nodes) {
+    if (!('prompt' in node) && !('command' in node)) continue;
+    out.push({ node, providerId: resolveNodeBinding(node, input).provider });
+  }
+  return out;
+}
+
 export function resolveWorkflowProbeBindings(
   input: ResolveWorkflowBindingsInput
 ): readonly ProviderProbeBinding[] {
   const bindings = new Map<string, ProviderProbeBinding>();
   for (const node of input.workflow.nodes) {
     if (!('prompt' in node) && !('command' in node)) continue;
-    const binding = resolveModelForNode({
-      nodeId: node.id,
-      nodeProvider: node.provider,
-      nodeModel: node.model,
-      workflowProvider: input.workflowProvider,
-      workflowModel: input.workflowModel,
-      assistantModels: Object.fromEntries(
-        Object.entries(input.config.assistants).map(([provider, assistant]) => [
-          provider,
-          assistant?.model as string | undefined,
-        ])
-      ),
-      modelOverride: input.modelOverride,
-      fallbackModel: 'default',
-    });
+    const binding = resolveNodeBinding(node, input);
     const providerId = binding.provider;
     if (!isRegisteredProvider(providerId)) {
       throw new Error(

@@ -47,6 +47,8 @@ export type ErrorClass =
   | 'validator_rejected' // war-council-validator stdout begins with REJECT/BLOCK/FAIL
   | 'implement_loop_skipped' // commit-and-push: thread branch HEAD-only, agent never wrote to disk
   | 'validator_sdk_contradiction' // non-loop node (e.g. war-council-validator): Anthropic SDK returned isError=true + errorSubtype='success' (bdc-harness#344), previously fell through to unknown with no escalation
+  // Set explicitly by the smart-cauldron cascade. classifyError does not match this class.
+  | 'harness_gate_misfire'
   // Fallback
   | 'unknown';
 

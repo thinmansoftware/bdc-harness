@@ -18,7 +18,7 @@
  *
  * The prompt is NEVER an argv element. Per binary:
  *
- * - `codex`: `bunx @openai/codex exec --skip-git-repo-check`, prompt on stdin.
+ * - `codex`: `bunx @openai/codex@<pin> exec --skip-git-repo-check --model <MODEL>`, prompt on stdin.
  *   With no positional PROMPT, "instructions are read from stdin" (`codex exec
  *   --help`, verified in the container 2026-09-07; matches the board skill's
  *   2026-07-26 finding). 'codex' is not a container binary; the CLI runs via
@@ -107,11 +107,55 @@ export function resolveCursorJudgeModel(
     : DEFAULT_CURSOR_JUDGE_MODEL;
 }
 
+/**
+ * The Codex CLI the `codex` judge rung runs, pinned to an exact version rather
+ * than floating `bunx` latest. GPT-6 models need codex-cli >= 0.155; the harness
+ * SDK pin in packages/providers/package.json is the same version (a test keeps
+ * the two equal).
+ */
+export const CODEX_JUDGE_CLI_PACKAGE = '@openai/codex@0.159.2';
+
+/**
+ * Default model for the `codex` judge rung (John 2026-11-01: the Overseer judge
+ * runs GPT-6.1 Sol, never the CLI default). Override with
+ * OVERSEER_CODEX_JUDGE_MODEL; a blank value falls back to the default.
+ */
+export const DEFAULT_CODEX_JUDGE_MODEL = 'gpt-6.1-sol';
+
+export function resolveCodexJudgeModel(
+  env: Record<string, string | undefined> = process.env
+): string {
+  const configured = env.OVERSEER_CODEX_JUDGE_MODEL;
+  return typeof configured === 'string' && configured.trim().length > 0
+    ? configured.trim()
+    : DEFAULT_CODEX_JUDGE_MODEL;
+}
+
+/**
+ * The model identity recorded on a verdict for one ladder rung. The codex rung
+ * records `codex:<model>` so a post-deploy check can prove which model ran; other
+ * rungs keep their bare binary name.
+ */
+export function describeJudgeModel(
+  binary: string,
+  env: Record<string, string | undefined> = process.env
+): string {
+  return binary === 'codex' ? `codex:${resolveCodexJudgeModel(env)}` : binary;
+}
+
 /** argv plus prompt delivery for one ladder rung. The prompt is never in argv. */
 export async function buildJudgeTransport(binary: string, prompt: string): Promise<JudgeTransport> {
   if (binary === 'codex') {
     return {
-      argv: ['bunx', '@openai/codex', 'exec', '--skip-git-repo-check'],
+      // --model stays LAST in argv (same shape as the cursor rung).
+      argv: [
+        'bunx',
+        CODEX_JUDGE_CLI_PACKAGE,
+        'exec',
+        '--skip-git-repo-check',
+        '--model',
+        resolveCodexJudgeModel(),
+      ],
       stdinPrompt: prompt,
     };
   }

@@ -253,7 +253,7 @@ function tickDeps(
     createAuthenticatedMessage: mock(async () => ({ id: 'xo-msg' })),
     getCurrentXoLease: mock(async () => null),
     listStaleIssues: mock(async () => []),
-    postIssueComment: mock(async () => {}),
+    postIssueComment: mock(async () => false),
     getWorker: alarm.getWorker,
     postAlarmComment: alarm.postAlarmComment,
     listAlarmIssueComments: alarm.listIssueComments,

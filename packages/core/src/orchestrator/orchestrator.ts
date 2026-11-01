@@ -50,6 +50,15 @@ import { toError } from '../utils/error';
 import { getCodebase } from '../db/codebases';
 import { executeWorkflow } from '@archon/workflows/executor';
 import { parseDeclaredBaseBranch } from '@archon/workflows/reliability/run-authority';
+import {
+  decodeGitHubContentsJson,
+  parseRepairBaseStdout,
+  PROJECT_MAP_API_PATH,
+  repairBaseCommandArgs,
+  resolveRunBranchIdentity,
+  selectProjectMapBranchEntry,
+  type RunBranchIdentity,
+} from '@archon/workflows/reliability/run-branch-identity';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import type { ModelOverride } from '@archon/workflows/model-override';
 import { execFile } from 'node:child_process';
@@ -274,6 +283,30 @@ async function originBranchExists(repoPath: string, branch: string): Promise<boo
   }
 }
 
+/** gh stdout, or undefined when the command or its output cannot be used. */
+async function readGhStdout(args: string[]): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync('gh', args, { timeout: 15000 });
+    return stdout;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readRepairBaseRefName(prNumber: number, repo: string): Promise<string | undefined> {
+  const stdout = await readGhStdout(repairBaseCommandArgs(prNumber, repo));
+  return stdout === undefined ? undefined : parseRepairBaseStdout(stdout);
+}
+
+async function readProjectMapBranchEntry(
+  repo: string
+): Promise<{ cauldron_base?: string; base_branch?: string } | undefined> {
+  const stdout = await readGhStdout(['api', PROJECT_MAP_API_PATH]);
+  if (stdout === undefined) return undefined;
+  const decoded = decodeGitHubContentsJson(stdout);
+  return decoded === undefined ? undefined : selectProjectMapBranchEntry(decoded, repo);
+}
+
 /**
  * Dispatch a workflow to run in a background worker conversation (web platform only).
  * Creates a hidden worker conversation, sets up event bridging from worker to parent,
@@ -317,6 +350,8 @@ export async function dispatchBackgroundWorkflow(
   // 3. Resolve isolation for this worker (each background workflow gets its own worktree).
   // Isolation failure is fatal -- never run a workflow in a shared/parent worktree.
   let workerCwd: string;
+  let isolationBranch: string | undefined;
+  let targetRepo = workflow.target_repo?.trim() || undefined;
   if (ctx.codebaseId) {
     const codebase = await getCodebase(ctx.codebaseId);
     if (!codebase) {
@@ -361,6 +396,7 @@ export async function dispatchBackgroundWorkflow(
     } else {
       workerHints = { workflowType: 'thread', workflowId: workerPlatformId };
     }
+    if (!targetRepo && codebase.name.trim()) targetRepo = codebase.name.trim();
     const result = await validateAndResolveIsolation(
       workerConv,
       codebase,
@@ -369,6 +405,8 @@ export async function dispatchBackgroundWorkflow(
       workerHints
     );
     workerCwd = result.cwd;
+    const resolvedBranch = result.env?.branch_name.trim();
+    if (resolvedBranch) isolationBranch = resolvedBranch;
     await db.updateConversation(workerConv.id, { cwd: workerCwd }).catch((e: unknown) => {
       getLog().warn(
         { err: toError(e), workerPlatformId },
@@ -456,6 +494,23 @@ export async function dispatchBackgroundWorkflow(
   // Without this, navigating to the execution page before executeWorkflow's
   // async setup completes would 404 (row doesn't exist yet for 1-5 seconds).
   let preCreatedRun: Awaited<ReturnType<typeof workflowDeps.store.createWorkflowRun>> | undefined;
+  let branchIdentity: RunBranchIdentity = {};
+  try {
+    branchIdentity = await resolveRunBranchIdentity({
+      spec: frozenSpecSource?.specBytes,
+      isolationBranch,
+      targetRepo,
+      readers: {
+        readRepairBase: readRepairBaseRefName,
+        readProjectMap: readProjectMapBranchEntry,
+      },
+    });
+  } catch (error) {
+    getLog().warn(
+      { err: toError(error), workflowName: workflow.name },
+      'orchestrator.branch_identity_resolve_failed'
+    );
+  }
   try {
     preCreatedRun = await workflowDeps.store.createWorkflowRun({
       workflow_name: workflow.name,
@@ -466,6 +521,7 @@ export async function dispatchBackgroundWorkflow(
       metadata: {
         ...(ctx.issueContext ? { github_context: ctx.issueContext } : {}),
         ...(ctx.modelOverride ? { model_override: ctx.modelOverride } : {}),
+        ...branchIdentity,
       },
       parent_conversation_id: ctx.conversationDbId,
     });

@@ -23,7 +23,8 @@ import {
   type SurfaceEntry,
 } from './operator-inbox-consumer';
 
-const T0 = '2026-07-31T13:24:05.000Z';
+// After OPERATOR_HISTORY_CUTOFF (2026-11-01): rows queued before it are fenced history.
+const T0 = '2026-11-02T13:24:05.000Z';
 
 function makeMessage(overrides: Partial<OperatorInboxMessage> = {}): OperatorInboxMessage {
   const id = overrides.id ?? `msg-${Math.random().toString(36).slice(2, 10)}`;

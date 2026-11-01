@@ -335,6 +335,7 @@ function searchItem(number: number) {
     state: 'open',
     pull_request: {},
     repository_url: 'https://api.github.com/repos/thinmansoftware/bdc-harness',
+    html_url: `https://github.com/thinmansoftware/bdc-harness/pull/${number}`,
   };
 }
 
@@ -404,4 +405,140 @@ test('open_pr_search_throws_when_results_exceed_the_retrievable_limit', async ()
   await expect(
     searchOpenPullRequestsReferencingTracker(octokit, { issue: pagedTracker, stem })
   ).rejects.toThrow('exceeds retrievable');
+});
+
+function rawSearchClient(data: unknown): OctokitLike {
+  return { search: { issuesAndPullRequests: async () => ({ data }) } } as unknown as OctokitLike;
+}
+
+const malformedHolderCases: [string, unknown][] = [
+  [
+    'repository trailing LF',
+    { ...searchItem(762), repository_url: searchItem(762).repository_url + '\n' },
+  ],
+  [
+    'repository trailing CRLF',
+    { ...searchItem(762), repository_url: searchItem(762).repository_url + '\r\n' },
+  ],
+  ['missing repository', { ...searchItem(762), repository_url: undefined }],
+  [
+    'foreign repository host',
+    { ...searchItem(762), repository_url: 'https://evil.test/repos/thinmansoftware/bdc-harness' },
+  ],
+  [
+    'foreign organization',
+    { ...searchItem(762), repository_url: 'https://api.github.com/repos/other/bdc-harness' },
+  ],
+  [
+    'mismatched PR URL',
+    { ...searchItem(762), html_url: 'https://github.com/thinmansoftware/bdc-harness/pull/763' },
+  ],
+  ['missing body', { ...searchItem(762), body: undefined }],
+  ['missing title', { ...searchItem(762), title: undefined }],
+  ['not PR', { ...searchItem(762), pull_request: undefined }],
+  ['closed query drift', { ...searchItem(762), state: 'closed' }],
+  ['invalid number', { ...searchItem(762), number: 0 }],
+  ['null row', null],
+];
+for (const [name, row] of malformedHolderCases) {
+  test(`malformed holder ${name} holds tracker without side effects`, async () => {
+    const client = rawSearchClient({ items: [row], total_count: 1, incomplete_results: false });
+    const deps = harness({
+      openPrLookup: () =>
+        searchOpenPullRequestsReferencingTracker(client, { issue: pagedTracker, stem }),
+    });
+    const result = await runReconcileOnce({ deps });
+    expect(result.closed).toBe(0);
+    expect(deps.comments).toEqual([]);
+    expect(deps.labels).toEqual([]);
+    expect(deps.closes).toEqual([]);
+    expect(deps.actions).toEqual([]);
+    expect(deps.warnings).toContain(
+      'overseer.reconcile.open_pr_lookup_failed_leaving_tracker_open'
+    );
+  });
+}
+
+for (const [name, data] of [
+  ['missing total', { items: [], incomplete_results: false }],
+  ['negative total', { items: [], total_count: -1, incomplete_results: false }],
+  ['missing completeness', { items: [], total_count: 0 }],
+  ['non-array items', { items: {}, total_count: 0, incomplete_results: false }],
+  ['more items than total', { items: [searchItem(1)], total_count: 0, incomplete_results: false }],
+] as const) {
+  test(`open holder rejects ${name}`, async () => {
+    await expect(
+      searchOpenPullRequestsReferencingTracker(rawSearchClient(data), { issue: pagedTracker, stem })
+    ).rejects.toThrow();
+  });
+}
+
+test('conflicting holder copy in second query cannot erase hold evidence', async () => {
+  let calls = 0;
+  const client = {
+    search: {
+      issuesAndPullRequests: async () => ({
+        data: {
+          items: [{ ...searchItem(762), body: ++calls === 1 ? '' : `WO: ${stem}` }],
+          total_count: 1,
+          incomplete_results: false,
+        },
+      }),
+    },
+  } as unknown as OctokitLike;
+  await expect(
+    searchOpenPullRequestsReferencingTracker(client, { issue: pagedTracker, stem })
+  ).rejects.toThrow();
+});
+
+test('duplicate page rows cannot count as missing distinct results', async () => {
+  const first = Array.from({ length: 100 }, (_, i) => searchItem(i + 1));
+  const { octokit } = pagedOctokit({
+    1: { items: first, total: 101 },
+    2: { items: [searchItem(1)], total: 101 },
+  });
+  await expect(
+    searchOpenPullRequestsReferencingTracker(octokit, { issue: pagedTracker, stem })
+  ).rejects.toThrow();
+});
+
+test('total drift across pages cannot prove completeness', async () => {
+  const first = Array.from({ length: 100 }, (_, i) => searchItem(i + 1));
+  const { octokit } = pagedOctokit({
+    1: { items: first, total: 101 },
+    2: { items: [searchItem(101)], total: 100 },
+  });
+  await expect(
+    searchOpenPullRequestsReferencingTracker(octokit, { issue: pagedTracker, stem })
+  ).rejects.toThrow();
+});
+
+test('consistent cross-query copies remain one holder', async () => {
+  const { octokit } = pagedOctokit({
+    1: { items: [{ ...searchItem(762), body: `WO: ${stem}` }], total: 1 },
+  });
+  const found = await searchOpenPullRequestsReferencingTracker(octokit, {
+    issue: pagedTracker,
+    stem,
+  });
+  expect(found).toHaveLength(1);
+  expect(found[0]?.body).toBe(`WO: ${stem}`);
+});
+
+test('exactly one thousand distinct holders across ten pages proves the search boundary', async () => {
+  const pages: Record<number, { items: ReturnType<typeof searchItem>[]; total: number }> = {};
+  for (let page = 1; page <= 10; page++) {
+    pages[page] = {
+      items: Array.from({ length: 100 }, (_, i) => searchItem((page - 1) * 100 + i + 1)),
+      total: 1000,
+    };
+  }
+  const { octokit, pagesRequested } = pagedOctokit(pages);
+  const found = await searchOpenPullRequestsReferencingTracker(octokit, {
+    issue: pagedTracker,
+    stem,
+  });
+  expect(found).toHaveLength(1000);
+  expect(pagesRequested.filter(page => page === 10)).toHaveLength(2);
+  expect(pagesRequested).not.toContain(11);
 });

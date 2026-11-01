@@ -84,6 +84,11 @@ export interface PullRequestEvidence {
    * not loaded.
    */
   otherOpenPrsForWoLookupFailed?: boolean;
+  /**
+   * GitHub label names on this pull request. Absent on older evidence
+   * fixtures. An exact, case-sensitive `merge-hold` name holds the merge.
+   */
+  labels?: readonly string[];
 }
 
 export interface GrokJudgeEvidence {
@@ -140,6 +145,14 @@ export interface WatchedRunRecord {
   prEvidence: PullRequestEvidence;
   decision?: DecisionResult;
   lastEvent?: OverseerWorkflowEvent;
+}
+
+/**
+ * Replay handoff into the merge-execution bridge. A method object, not a
+ * MergeReadyCoordinator function, so the two cannot be substituted.
+ */
+export interface DeterministicMergeHandoff {
+  handoff(record: WatchedRunRecord): Promise<unknown>;
 }
 
 export interface OverseerRunStoreDeps {
@@ -333,4 +346,23 @@ export interface OverseerVerdictStoreDeps {
     evidenceDigest?: string;
     evidence?: string;
   }): Promise<unknown>;
+  getVerdictByRunHead(input: { runId: string; headSha: string }): Promise<{
+    id: string;
+    verdict: string | null;
+    proposedAction: string | null;
+    actionedAt: string | null;
+  } | null>;
+  promoteObserveOrHealthyVerdict(verdictId: string): Promise<boolean>;
+  /**
+   * Promote an unactioned observe or healthy verdict and insert its
+   * flag_merge_ready receipt in one transaction. Returns true only when both
+   * writes committed. A failed insert must leave the prior action in place.
+   */
+  promoteObserveOrHealthyVerdictWithReceipt(input: {
+    verdictId: string;
+    runId: string;
+    woId: string;
+    class: string;
+    result: string;
+  }): Promise<boolean>;
 }

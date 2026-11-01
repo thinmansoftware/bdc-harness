@@ -539,3 +539,99 @@ describe('inbox reader', () => {
     expect(runFiles).toContain('20260929T110000Z-new.json');
   });
 });
+
+describe('review receipts requiring an owner', () => {
+  const stopped = [
+    'non_auto_finding_present',
+    'remediation_attempts_exhausted',
+    'remediation_not_configured',
+    'emit_failed',
+    'attempt_slot_already_claimed',
+  ];
+  const badProofs: unknown[] = [
+    undefined,
+    null,
+    {},
+    { emitted: false },
+    { emitted: 'true', attempt: 1 },
+    { emitted: true },
+    { emitted: true, attempt: 0 },
+    { emitted: true, attempt: -1 },
+    { emitted: true, attempt: 1.5 },
+    { emitted: true, attempt: '1' },
+    { emitted: true, attempt: Number.MAX_SAFE_INTEGER + 1 },
+    ...stopped.map(reason => ({ emitted: false, reason })),
+  ];
+  for (const [index, remediation] of badProofs.entries()) {
+    test(`does not expire changes requested without a proven repair handoff (${index})`, async () => {
+      const row = {
+        ...F1,
+        body: JSON.stringify({
+          kind: 'pr_review_submit_receipt',
+          disposition: 'changes_requested',
+          event: 'REQUEST_CHANGES',
+          remediation,
+        }),
+      };
+      expect(classifyInboxMessage(row).class).toBe('ACTIONABLE');
+      const { disposed, result } = await harness([row]);
+      expect(disposed).toHaveLength(0);
+      expect(result.digest?.actionable).toHaveLength(1);
+    });
+  }
+  for (const needsOperator of [true, null, 'false', 1, {}]) {
+    test(`preserves explicit operator intent ${JSON.stringify(needsOperator)}`, async () => {
+      const row = { ...F1, body: JSON.stringify({ ...JSON.parse(F1.body), needsOperator }) };
+      expect(classifyInboxMessage(row).class).toBe('ACTIONABLE');
+      const { disposed } = await harness([row]);
+      expect(disposed).toHaveLength(0);
+    });
+  }
+  for (const [disposition, event] of [
+    ['approved', 'REQUEST_CHANGES'],
+    ['changes_requested', 'APPROVE'],
+  ]) {
+    test(`does not expire mismatched ${disposition}/${event}`, async () => {
+      const row = {
+        ...F1,
+        body: JSON.stringify({
+          kind: 'pr_review_submit_receipt',
+          disposition,
+          event,
+          remediation: { emitted: true, attempt: 1 },
+        }),
+      };
+      expect(classifyInboxMessage(row).class).toBe('ACTIONABLE');
+      const { disposed } = await harness([row]);
+      expect(disposed).toHaveLength(0);
+    });
+  }
+  for (const [kind, disposition] of [
+    ['pr_review_ingest_receipt', 'queued'],
+    ['pr_review_submit_receipt', 'checks_pending'],
+  ]) {
+    test(`operator intent outranks intermediate ${kind}/${disposition}`, async () => {
+      const row = { ...F1, body: JSON.stringify({ kind, disposition, needsOperator: true }) };
+      expect(classifyInboxMessage(row).class).toBe('ACTIONABLE');
+      const { disposed, result } = await harness([row]);
+      expect(disposed).toHaveLength(0);
+      expect(result.digest?.actionable).toHaveLength(1);
+    });
+  }
+  test('successful repair handoff stays informational and can expire', async () => {
+    const row = {
+      ...F1,
+      body: JSON.stringify({
+        kind: 'pr_review_submit_receipt',
+        disposition: 'changes_requested',
+        event: 'REQUEST_CHANGES',
+        remediation: { emitted: true, attempt: 1 },
+        needsOperator: false,
+      }),
+    };
+    expect(classifyInboxMessage(row).class).toBe('INFO_DUPLICATE');
+    const { disposed } = await harness([row]);
+    expect(disposed).toHaveLength(1);
+    expect(disposed[0]?.disposition).toBe('expired');
+  });
+});

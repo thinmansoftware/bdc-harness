@@ -8,6 +8,7 @@ import {
   type EvidenceSpec,
 } from './expectations';
 import type { TmExpectation } from '@archon/core/db/taskmaster';
+import type { CascadeRunRecord } from '@archon/smart-cauldron/types';
 
 const base: TmExpectation = {
   id: 'expectation-1',
@@ -25,6 +26,102 @@ const base: TmExpectation = {
   created_at: new Date(0).toISOString(),
   updated_at: new Date(0).toISOString(),
 };
+
+describe('internal cascade completion evidence', () => {
+  const evidence = {
+    kind: 'cascade_workflow_completed',
+    cascadeId: 'cascade-exact',
+    woId: 'WO-TEST-01',
+    project: 'bdc-harness',
+  };
+  const makeRecord = (runIds: (string | null)[]): CascadeRunRecord => ({
+    ...evidence,
+    request: { woClass: 'CODE', tags: [], entryOverride: null, dryRun: false },
+    createdAt: new Date(0).toISOString(),
+    status: 'running',
+    winningTier: null,
+    attempts: runIds.map(runId => ({
+      sourceEventId: `event-${runId}`,
+      sourceEventAt: new Date(0).toISOString(),
+      tier: 'codex',
+      workflowName: 'bound',
+      runId,
+      outcome: 'running',
+      gateFailReason: null,
+      infraErrorReason: null,
+      servedModelId: null,
+      costUsd: null,
+      startedAt: new Date(0).toISOString(),
+      completedAt: null,
+    })),
+    totalCostUsd: null,
+    telemetry: { entryTier: 'codex', climbed: false, climbCount: 0, wonCheap: false },
+  });
+  for (const scenario of [
+    'later-completed',
+    'pending-discovery',
+    'missing-record',
+    'failed-with-PR',
+  ] as const) {
+    test(`${scenario} uses exact completion proof without false absence on UNKNOWN`, async () => {
+      const marks: string[] = [];
+      const record =
+        scenario === 'missing-record'
+          ? null
+          : makeRecord(
+              scenario === 'pending-discovery' ? [null] : ['first-actual', 'later-actual']
+            );
+      await checkExpectations(new Date(1), {
+        listDueExpectations: async () => [
+          {
+            ...base,
+            evidence_json: JSON.stringify(evidence),
+            due_at:
+              scenario === 'failed-with-PR'
+                ? new Date(1000).toISOString()
+                : new Date(0).toISOString(),
+            on_absence: 'give_up',
+            max_retries: 0,
+          },
+        ],
+        readCascade: async () => record,
+        query: async <T>(_sql: string, params: unknown[] = []) => ({
+          rows: [
+            {
+              id: params[0],
+              workflow_name: 'bound',
+              status:
+                scenario === 'later-completed' && params[0] === 'later-actual'
+                  ? 'completed'
+                  : 'failed',
+              metadata: '{"prUrl":"https://github.com/synthetic/test/pull/1"}',
+            },
+          ] as T[],
+        }),
+        markMet: async (_id, pointer) => {
+          marks.push(`met:${pointer}`);
+          return true;
+        },
+        markFailed: async () => {
+          marks.push('failed');
+          return true;
+        },
+        markGivenUp: async () => {
+          marks.push('given_up');
+          return true;
+        },
+      });
+      expect(marks).toEqual(scenario === 'later-completed' ? ['met:workflow:later-actual'] : []);
+    });
+  }
+
+  test('internal completion escalation describes its exact scope', () => {
+    const body = renderEscalationBody({ ...base, evidence_json: JSON.stringify(evidence) });
+    expect(body).toContain('cascade-exact');
+    expect(body).toContain('WO-TEST-01');
+    expect(body).toContain('bdc-harness');
+  });
+});
 
 describe('expectation evidence', () => {
   test('issue_comment_exists returns the comment URL pointer', async () => {

@@ -25,6 +25,11 @@ import type {
   TerminalWorkflowPersistence,
 } from '@archon/workflows/reliability/types';
 import { createLogger } from '@archon/paths';
+import {
+  RELEASE_TERMINAL_RUN_LEASE_SQL,
+  TERMINAL_RUN_LEASES_SQL,
+  type TerminalRunLeaseRecord,
+} from '@archon/workflows/run-teardown';
 
 /**
  * workflow_name of the synthetic terminal parent rows minted for discovery-sourced
@@ -562,6 +567,54 @@ export async function releaseRunLease(data: {
     [data.runId, data.ownerId, data.leaseToken, data.releasedAt]
   );
   return result.rowCount === 1;
+}
+
+interface TerminalRunLeaseRow {
+  run_id: string;
+  status: string;
+  working_path: string | null;
+  started_at: string | Date;
+  completed_at: string | Date | null;
+}
+
+function timestampText(value: string | Date | null): string | null {
+  if (value === null) return null;
+  return value instanceof Date ? value.toISOString() : value;
+}
+
+/** Unreleased leases on terminal runs (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01, N5). */
+export async function listUnreleasedTerminalRunLeases(): Promise<TerminalRunLeaseRecord[]> {
+  const result = await pool.query<TerminalRunLeaseRow>(TERMINAL_RUN_LEASES_SQL, []);
+  return result.rows.map(row => ({
+    runId: row.run_id,
+    status: row.status,
+    workingPath: row.working_path,
+    startedAt: timestampText(row.started_at) ?? '',
+    completedAt: timestampText(row.completed_at),
+  }));
+}
+
+/** Release a terminal run's lease only while the run is still terminal. */
+export async function releaseTerminalRunLease(data: {
+  runId: string;
+  releasedAt: string;
+}): Promise<boolean> {
+  const result = await pool.query(RELEASE_TERMINAL_RUN_LEASE_SQL, [data.runId, data.releasedAt]);
+  return result.rowCount === 1;
+}
+
+/** Run rows recorded for a working path (repair not_before lookup, N6). */
+export async function listWorkflowRunsByWorkingPath(
+  workingPath: string
+): Promise<{ id: string; status: string; completed_at: string | Date | null }[]> {
+  const result = await pool.query<{
+    id: string;
+    status: string;
+    completed_at: string | Date | null;
+  }>('SELECT id, status, completed_at FROM remote_agent_workflow_runs WHERE working_path = $1', [
+    workingPath,
+  ]);
+  return [...result.rows];
 }
 
 export async function createSupervisorIncident(
@@ -1902,10 +1955,16 @@ async function persistTerminalWorkflowRun(
     );
     const currentStatus = runResult.rows[0]?.status;
     if (!currentStatus) throw new Error(`Workflow run not found (id: ${id})`);
+    const failedFromPending = status === 'failed' && currentStatus === 'pending';
     const cancellableStatus =
       status === 'cancelled' &&
       ['pending', 'running', 'waiting_provider', 'paused', 'interrupted'].includes(currentStatus);
-    if (currentStatus !== 'running' && currentStatus !== status && !cancellableStatus) {
+    if (
+      currentStatus !== 'running' &&
+      currentStatus !== status &&
+      !cancellableStatus &&
+      !failedFromPending
+    ) {
       throw new Error(
         `terminal_status_conflict: run ${id} is ${currentStatus}, cannot finalize as ${status}`
       );
@@ -1963,7 +2022,7 @@ async function persistTerminalWorkflowRun(
       throw new Error(`terminal_outcome_conflict: newer outcome already exists for run ${id}`);
     }
 
-    if (currentStatus === 'running' || cancellableStatus) {
+    if (currentStatus === 'running' || cancellableStatus || failedFromPending) {
       const updateResult = await query(
         `UPDATE remote_agent_workflow_runs
          SET status = $1, completed_at = ${dialect.now()},
@@ -2073,7 +2132,7 @@ export async function failWorkflowRun(
     result = await pool.query(
       `UPDATE remote_agent_workflow_runs
        SET status = 'failed', completed_at = ${dialect.now()}, metadata = ${dialect.jsonMerge('metadata', 2)}
-       WHERE id = $1 AND status = 'running'`,
+       WHERE id = $1 AND status IN ('pending','running')`,
       [id, JSON.stringify({ error })]
     );
   } catch (dbError) {
@@ -2083,7 +2142,7 @@ export async function failWorkflowRun(
   }
   if (result.rowCount === 0) {
     getLog().warn({ workflowRunId: id }, 'db.workflow_run_fail_no_match');
-    throw new Error(`Workflow run not found or not in running state (id: ${id})`);
+    throw new Error(`Workflow run not found or not in pending/running state (id: ${id})`);
   }
 }
 
