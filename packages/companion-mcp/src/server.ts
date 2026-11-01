@@ -12,6 +12,7 @@ import { buildMcpServer } from './mcp';
 import { loadCompanionRegistry } from './registry';
 import { TrackedTree } from './tracked-tree';
 import type { ToolDeps } from './tools/execute';
+import { assertOracleSearchUrl } from './tools/oracle';
 
 type Env = Record<string, string | undefined>;
 
@@ -76,20 +77,32 @@ function headerValue(value: string | string[] | undefined): string | undefined {
   return value;
 }
 
-export async function startCompanionMcp(env: Env = process.env): Promise<RunningCompanionServer> {
+export async function startCompanionMcp(
+  env: Env = process.env,
+  hooks?: { fetchImpl?: typeof fetch }
+): Promise<RunningCompanionServer> {
   const bindAddr = assertBindAddr(env.COMPANION_MCP_BIND_ADDR);
   const port = readPort(env.COMPANION_MCP_PORT);
   const configPath = requiredEnv(env, 'COMPANION_MCP_CONFIG');
   const auditLog = requiredEnv(env, 'COMPANION_MCP_AUDIT_LOG');
   const revokedFile = requiredEnv(env, 'COMPANION_MCP_REVOKED_FILE');
   const wikiRoot = requiredEnv(env, 'COMPANION_WIKI_ROOT');
-  const oracleUrl = requiredEnv(env, 'ORACLE_URL');
+  const oracleUrl = assertOracleSearchUrl(requiredEnv(env, 'ORACLE_URL'));
   const dispatchBaseUrl = requiredEnv(env, 'DISPATCH_BASE_URL');
   const registry = loadCompanionRegistry(configPath);
   const tree = new TrackedTree(wikiRoot);
   await tree.start();
   const dispatch = new DispatchClient(dispatchBaseUrl);
-  const deps: ToolDeps = { wikiRoot, tree, oracleUrl, dispatch, auditLog, env };
+  const deps: ToolDeps = {
+    wikiRoot,
+    tree,
+    oracleUrl,
+    oracleKeyFile: env.ORACLE_API_KEY_FILE,
+    fetchImpl: hooks?.fetchImpl,
+    dispatch,
+    auditLog,
+    env,
+  };
   const sessions = new Map<string, SessionRecord>();
 
   const httpServer = createServer((req, res) => {

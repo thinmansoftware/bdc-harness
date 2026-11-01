@@ -29,7 +29,7 @@ interface ListedSchema {
 const SCHEMA_FIELDS: Record<string, { required: string[]; types: Record<string, string> }> = {
   wiki_search: { required: ['query'], types: { query: 'string', limit: 'integer' } },
   wiki_read: { required: ['path'], types: { path: 'string' } },
-  oracle_query: { required: ['question'], types: { question: 'string' } },
+  oracle_search: { required: ['query'], types: { query: 'string', top_k: 'integer' } },
   mailbox_send: {
     required: ['recipient', 'text'],
     types: { recipient: 'string', text: 'string', correlation_id: 'string' },
@@ -77,13 +77,14 @@ function slot(principal: string, recipients: string[] = ['xo']): Record<string, 
 }
 
 describe('companion registry', () => {
-  test('example_config_has_grokbot_enabled_and_three_disabled_slots', async () => {
+  test('example_config_has_grokbot_enabled_and_disabled_slots', async () => {
     const registry = loadCompanionRegistry(EXAMPLE);
     expect(registry.slots.map(entry => entry.companion_id)).toEqual([
       'grokbot',
       'dot',
       'muse',
       'duet',
+      'grok-bot',
     ]);
     expect(registry.slots.filter(entry => entry.enabled).map(entry => entry.companion_id)).toEqual([
       'grokbot',
@@ -154,7 +155,7 @@ describe('companion registry', () => {
       env: {},
     };
     const raw = JSON.parse(await readFile(EXAMPLE, 'utf8')) as { slots: unknown[] };
-    expect(raw.slots).toHaveLength(4);
+    expect(raw.slots).toHaveLength(5);
     for (const entry of registry.slots) {
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       const mcp = buildMcpServer(entry, deps);

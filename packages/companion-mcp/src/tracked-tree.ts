@@ -1,7 +1,7 @@
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { dirname, join, sep } from 'node:path';
 
-import { MAX_TRACKED_BYTES, TRACKED_REFRESH_MS } from './constants';
+import { HEAD_CHECK_MS, MAX_TRACKED_BYTES, TRACKED_REFRESH_MS } from './constants';
 import { ToolFailure } from './errors';
 
 function gitEnv(): Record<string, string> {
@@ -59,10 +59,13 @@ export function lexicalTrackedPath(requested: string, prefix: string): string | 
 export class TrackedTree {
   private files = new Set<string>();
   private timer: ReturnType<typeof setInterval> | null = null;
+  private lastHeadCheckAt: number | null = null;
+  private headSha: string | null = null;
 
   constructor(
     private readonly root: string,
-    private readonly intervalMs: number = TRACKED_REFRESH_MS
+    private readonly intervalMs: number = TRACKED_REFRESH_MS,
+    private readonly now: () => number = Date.now
   ) {}
 
   async start(): Promise<void> {
@@ -96,6 +99,23 @@ export class TrackedTree {
     }
     matches.sort();
     return matches;
+  }
+
+  async refreshIfHeadChanged(): Promise<void> {
+    const current = this.now();
+    if (this.lastHeadCheckAt !== null && current - this.lastHeadCheckAt < HEAD_CHECK_MS) {
+      return;
+    }
+    this.lastHeadCheckAt = current;
+    const parsed = await gitText(this.root, ['rev-parse', 'HEAD']);
+    if (parsed.code !== 0) {
+      throw new Error('wiki_root_unreadable');
+    }
+    const sha = parsed.stdout.trim();
+    if (sha !== this.headSha) {
+      await this.refresh();
+      this.headSha = sha;
+    }
   }
 
   async refresh(): Promise<void> {

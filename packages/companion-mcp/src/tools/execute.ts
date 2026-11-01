@@ -16,13 +16,15 @@ import {
   mailboxRead,
   mailboxSend,
 } from './mailbox';
-import { oracleQuery } from './oracle';
+import { oracleSearch } from './oracle';
 import { boardRecordRead, searchTree, wikiRead } from './wiki';
 
 export interface ToolDeps {
   wikiRoot: string;
   tree: TrackedTree;
   oracleUrl: string;
+  oracleKeyFile?: string;
+  fetchImpl?: typeof fetch;
   dispatch: DispatchClient;
   auditLog: string;
   env: Record<string, string | undefined>;
@@ -49,6 +51,17 @@ function readLimit(args: Record<string, unknown>): number {
     throw new ToolFailure('refused', 'limit_refused');
   }
   return Math.min(value, WIKI_SEARCH_MAX);
+}
+
+function readOptionalTopK(args: Record<string, unknown>): number | undefined {
+  if (!Object.prototype.hasOwnProperty.call(args, 'top_k')) {
+    return undefined;
+  }
+  const value = args.top_k;
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    throw new ToolFailure('refused', 'refused');
+  }
+  return value;
 }
 
 function readCursor(args: Record<string, unknown>): number {
@@ -117,13 +130,19 @@ async function runKnownTool(
       const page = await wikiRead(deps.wikiRoot, deps.tree, requested);
       return { payload: page, rowCount: 1 };
     }
-    case 'oracle_query': {
-      const question = readString(args, 'question');
-      if (question === null) {
+    case 'oracle_search': {
+      const query = readString(args, 'query');
+      if (query === null) {
         throw new ToolFailure('refused', 'query_required');
       }
-      const answer = await oracleQuery(deps.oracleUrl, slot.companion_id, question);
-      return { payload: answer, rowCount: 1 };
+      const found = await oracleSearch(
+        deps.oracleUrl,
+        deps.oracleKeyFile,
+        query,
+        readOptionalTopK(args),
+        deps.fetchImpl
+      );
+      return { payload: found, rowCount: found.results.length };
     }
     case 'mailbox_send': {
       const recipient = readString(args, 'recipient');

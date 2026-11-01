@@ -10,7 +10,7 @@
       "tools": [
         "wiki_search",
         "wiki_read",
-        "oracle_query",
+        "oracle_search",
         "mailbox_send",
         "mailbox_list",
         "mailbox_read",
@@ -35,7 +35,7 @@
       "tools": [
         "wiki_search",
         "wiki_read",
-        "oracle_query",
+        "oracle_search",
         "mailbox_send",
         "mailbox_list",
         "mailbox_read",
@@ -55,7 +55,7 @@
       "tools": [
         "wiki_search",
         "wiki_read",
-        "oracle_query",
+        "oracle_search",
         "mailbox_send",
         "mailbox_list",
         "mailbox_read",
@@ -75,7 +75,7 @@
       "tools": [
         "wiki_search",
         "wiki_read",
-        "oracle_query",
+        "oracle_search",
         "mailbox_send",
         "mailbox_list",
         "mailbox_read",
@@ -84,6 +84,18 @@
       "allowed_recipients": ["xo", "astra"],
       "board_secretary": false,
       "board_seat_recipients": ["astra", "fable", "grok"]
+    },
+    {
+      "companion_id": "grok-bot",
+      "enabled": false,
+      "dispatch_principal_id": "grok-bot",
+      "token_sha256_file": "/run/companion-mcp/digests/grok-bot.sha256",
+      "token_expires_at": "2026-12-01T00:00:00.000Z",
+      "dispatch_credential_file": "/run/companion-mcp/dispatch/grok-bot",
+      "tools": ["wiki_search", "wiki_read", "oracle_search"],
+      "allowed_recipients": ["xo"],
+      "board_secretary": false,
+      "board_seat_recipients": ["astra"]
     }
   ]
 }

@@ -221,7 +221,7 @@ export async function createHarness(): Promise<Harness> {
     COMPANION_MCP_AUDIT_LOG: auditLog,
     COMPANION_MCP_REVOKED_FILE: revokedFile,
     COMPANION_WIKI_ROOT: wikiRoot,
-    ORACLE_URL: 'http://127.0.0.1:9/oracle',
+    ORACLE_URL: 'https://oracle.bluedevilcollectibles.com/v1/search',
     DISPATCH_BASE_URL: 'http://127.0.0.1:9',
     COMPANION_BOARD_REPO: 'thinmansoftware/bdc-xo',
     COMPANION_BOARD_BASE: 'main',
@@ -326,9 +326,10 @@ export async function startRecordingServer(
 
 export async function startFromHarness(
   harness: Harness,
-  patch: Record<string, string> = {}
+  patch: Record<string, string> = {},
+  hooks?: { fetchImpl?: typeof fetch }
 ): Promise<RunningCompanionServer> {
-  return startCompanionMcp({ ...harness.env, ...patch });
+  return startCompanionMcp({ ...harness.env, ...patch }, hooks);
 }
 
 export async function withClient(
