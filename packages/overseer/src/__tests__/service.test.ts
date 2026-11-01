@@ -11,6 +11,7 @@ import {
   getVerdictByRunHead,
   insertOverseerAction as insertOverseerActionRow,
   listRunsForOverseerWatch,
+  listUnactionedFlagMergeReadyVerdicts,
 } from '@archon/core/db/overseer';
 import * as judgeFirst from '../judge-first';
 import { listOverseerCapabilityEvents } from '@archon/core/db/overseer-capabilities';
@@ -1179,7 +1180,7 @@ serviceSuite('service', () => {
     try {
       await withTempDatabase(async () => {
         const runId = 'run-service-bridge-seam';
-        await seedReplayRun({
+        const verdictId = await seedReplayRun({
           runId,
           verdict: 'observe',
           proposedAction: 'comment_findings',
@@ -1195,6 +1196,7 @@ serviceSuite('service', () => {
           dryRun: false,
           adapterKind: 'fake',
           mergeCoordinator,
+          mergeBridgeEnabled: true,
           mergeBridgeRun: bridgeRun,
           deps: {
             listRunsForWatch: listRunsForOverseerWatch,
@@ -1208,13 +1210,170 @@ serviceSuite('service', () => {
             },
           },
         });
-        expect(bridgeRun).toHaveBeenCalledTimes(1);
+        expect(bridgeRun).toHaveBeenCalledTimes(2);
         expect(mergeCoordinator).not.toHaveBeenCalled();
         expect(judgeSpy).not.toHaveBeenCalled();
         expect(spawnSpy).not.toHaveBeenCalled();
         expect((await getVerdictByRunHead({ runId, headSha: 'H' }))?.proposedAction).toBe(
           'flag_merge_ready'
         );
+        const readyActions = (await getOverseerActionsForRun(runId)).filter(
+          action => action.action === 'flag_merge_ready'
+        );
+        expect(readyActions).toHaveLength(1);
+        expect(readyActions[0]?.result).toBe(`steward_handoff:replay_green:verdict:${verdictId}`);
+      });
+    } finally {
+      judgeSpy.mockRestore();
+      spawnSpy.mockRestore();
+    }
+  });
+
+  async function runFlagGatedReplay(input: {
+    mergeBridgeRun: () => Promise<unknown>;
+    mergeBridgeEnabled?: boolean;
+    omitBridgeFlag?: boolean;
+  }): Promise<{ mergeCoordinator: ReturnType<typeof mock> }> {
+    process.env.OVERSEER_JUDGE_FIRST = '1';
+    const mergeCoordinator = mock(async () => undefined);
+    await expect(
+      runOverseerService({
+        once: true,
+        enabled: true,
+        dryRun: false,
+        adapterKind: 'fake',
+        mergeCoordinator,
+        mergeBridgeRun: input.mergeBridgeRun,
+        ...(input.omitBridgeFlag ? {} : { mergeBridgeEnabled: input.mergeBridgeEnabled }),
+        deps: {
+          listRunsForWatch: listRunsForOverseerWatch,
+          listRunEvents: async () => [],
+          findPullRequest: async () => replayEvidence(0),
+          mergePullRequest: async () => {
+            throw new Error('direct merge must not run');
+          },
+          insertOverseerAction: async record => {
+            await insertOverseerActionRow(record);
+          },
+        },
+      })
+    ).resolves.toBeUndefined();
+    return { mergeCoordinator };
+  }
+
+  test('Test 9: mergeBridgeEnabled omitted or false fails closed before promotion', async () => {
+    const judgeSpy = spyOn(judgeFirst, 'judgeTerminalRun').mockImplementation(async () => {
+      throw new Error('judge must not run');
+    });
+    const spawnSpy = spyOn(judgeFirst, 'spawnJudgeBinary').mockImplementation(async () => {
+      throw new Error('provider must not run');
+    });
+    try {
+      await withTempDatabase(async () => {
+        const cases: Array<{
+          runId: string;
+          omitBridgeFlag: boolean;
+          mergeBridgeEnabled?: boolean;
+        }> = [
+          { runId: 'run-service-bridge-omitted', omitBridgeFlag: true },
+          {
+            runId: 'run-service-bridge-disabled',
+            omitBridgeFlag: false,
+            mergeBridgeEnabled: false,
+          },
+        ];
+        for (const item of cases) {
+          await seedReplayRun({
+            runId: item.runId,
+            verdict: 'observe',
+            proposedAction: 'comment_findings',
+            comment: true,
+          });
+          expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain(item.runId);
+          const mergeBridgeRun = mock(async () => undefined);
+          const { mergeCoordinator } = await runFlagGatedReplay({
+            omitBridgeFlag: item.omitBridgeFlag,
+            mergeBridgeEnabled: item.mergeBridgeEnabled,
+            mergeBridgeRun,
+          });
+          expect(mergeBridgeRun).toHaveBeenCalledTimes(0);
+          expect(mergeCoordinator).toHaveBeenCalledTimes(0);
+          expect(judgeSpy).not.toHaveBeenCalled();
+          expect(spawnSpy).not.toHaveBeenCalled();
+          const verdict = await getVerdictByRunHead({ runId: item.runId, headSha: 'H' });
+          expect(verdict?.proposedAction).toBe('comment_findings');
+          expect(verdict?.actionedAt).toBeNull();
+          expect(
+            (await getOverseerActionsForRun(item.runId)).some(
+              action => action.action === 'flag_merge_ready'
+            )
+          ).toBe(false);
+        }
+      });
+    } finally {
+      judgeSpy.mockRestore();
+      spawnSpy.mockRestore();
+    }
+  });
+
+  test('Test 10: enabled bridge keeps a throwing handoff retryable once', async () => {
+    const judgeSpy = spyOn(judgeFirst, 'judgeTerminalRun').mockImplementation(async () => {
+      throw new Error('judge must not run');
+    });
+    const spawnSpy = spyOn(judgeFirst, 'spawnJudgeBinary').mockImplementation(async () => {
+      throw new Error('provider must not run');
+    });
+    try {
+      await withTempDatabase(async () => {
+        const runId = 'run-service-bridge-throw';
+        const verdictId = await seedReplayRun({
+          runId,
+          verdict: 'observe',
+          proposedAction: 'comment_findings',
+          comment: true,
+        });
+        expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain(runId);
+        const first = await runFlagGatedReplay({
+          mergeBridgeEnabled: true,
+          mergeBridgeRun: async () => {
+            throw new Error('bridge_handoff_failed');
+          },
+        });
+        const promoted = await getVerdictByRunHead({ runId, headSha: 'H' });
+        expect(promoted?.proposedAction).toBe('flag_merge_ready');
+        expect(promoted?.actionedAt).toBeNull();
+        const readyActions = (await getOverseerActionsForRun(runId)).filter(
+          action => action.action === 'flag_merge_ready'
+        );
+        expect(readyActions).toHaveLength(1);
+        expect(readyActions[0]?.result).toBe(`steward_handoff:replay_green:verdict:${verdictId}`);
+        expect(
+          (await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)
+        ).toBe(true);
+        expect(first.mergeCoordinator).toHaveBeenCalledTimes(0);
+        expect(judgeSpy).not.toHaveBeenCalled();
+        expect(spawnSpy).not.toHaveBeenCalled();
+
+        const second = await runFlagGatedReplay({
+          mergeBridgeEnabled: true,
+          mergeBridgeRun: async () => {
+            throw new Error('bridge_handoff_failed_again');
+          },
+        });
+        const again = await getVerdictByRunHead({ runId, headSha: 'H' });
+        expect(again?.proposedAction).toBe('flag_merge_ready');
+        expect(again?.actionedAt).toBeNull();
+        expect(
+          (await getOverseerActionsForRun(runId)).filter(
+            action => action.action === 'flag_merge_ready'
+          )
+        ).toHaveLength(1);
+        expect(
+          (await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)
+        ).toBe(true);
+        expect(second.mergeCoordinator).toHaveBeenCalledTimes(0);
+        expect(judgeSpy).not.toHaveBeenCalled();
+        expect(spawnSpy).not.toHaveBeenCalled();
       });
     } finally {
       judgeSpy.mockRestore();

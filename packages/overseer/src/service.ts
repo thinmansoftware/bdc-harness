@@ -77,9 +77,9 @@ export interface OverseerServiceOptions {
   mergeCoordinator?: MergeReadyCoordinator;
   /**
    * Replay handoff. Tests inject this directly. When the property is omitted,
-   * the service binds it to mergeBridgeRun, or to the merge-execution bridge
-   * when that seam is also omitted. An explicit undefined fails closed and is
-   * never replaced with mergeCoordinator.
+   * the service binds mergeBridgeRun only when mergeBridgeEnabled is true.
+   * An explicit undefined fails closed and is never replaced with
+   * mergeCoordinator.
    */
   deterministicMergeHandoff?: DeterministicMergeHandoff;
   intervalMs?: number;
@@ -100,8 +100,8 @@ export interface OverseerServiceOptions {
   mergeBridgeIntervalMs?: number;
   /**
    * Merge-execution bridge tick. The scheduler uses it when mergeBridgeEnabled
-   * is set. When deterministicMergeHandoff is omitted, replay handoff uses
-   * this same runner.
+   * is set. When deterministicMergeHandoff is omitted, replay handoff binds
+   * this runner only when mergeBridgeEnabled is exactly true.
    */
   mergeBridgeRun?: () => Promise<unknown>;
   mergeBridgeEnabled?: boolean;
@@ -446,7 +446,7 @@ function resolveDeterministicMergeHandoff(
   if (Object.prototype.hasOwnProperty.call(options, 'deterministicMergeHandoff')) {
     return options.deterministicMergeHandoff;
   }
-  if (!bridgeRun) return undefined;
+  if (options.mergeBridgeEnabled !== true || !bridgeRun) return undefined;
   return { handoff: () => bridgeRun() };
 }
 
