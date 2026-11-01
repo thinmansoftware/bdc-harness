@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import type { CreateAuthenticatedMessageData } from '@archon/core/db/dispatch';
 import { readWorkerHeartbeatAlarmConfig } from './worker-heartbeat-alarm';
 import { classifyInboxMessage } from './inbox-reader-rules';
 import {
@@ -13,6 +14,7 @@ import {
   type InboxReaderDeps,
 } from './inbox-reader';
 import { F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12 } from './inbox-reader.fixtures';
+import type { XoActionComment } from './xo-action-watch';
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -633,5 +635,228 @@ describe('review receipts requiring an owner', () => {
     const { disposed } = await harness([row]);
     expect(disposed).toHaveLength(1);
     expect(disposed[0]?.disposition).toBe('expired');
+  });
+});
+
+interface XoActionStoredMessage {
+  id: string;
+  task_type: string;
+  recipient: string;
+  subject_key: string | null;
+  body: string;
+  idempotency_key: string;
+}
+
+function xoActionSender(
+  store: Map<string, XoActionStoredMessage>
+): NonNullable<InboxReaderDeps['createXoActionMessage']> {
+  return (async (_context, data: CreateAuthenticatedMessageData) => {
+    const existing = store.get(data.idempotency_key);
+    if (existing) return existing as never;
+    const row: XoActionStoredMessage = {
+      id: `msg-${store.size + 1}`,
+      task_type: data.task_type,
+      recipient: data.recipient,
+      subject_key: data.subject_key ?? null,
+      body: data.body,
+      idempotency_key: data.idempotency_key,
+    };
+    store.set(data.idempotency_key, row);
+    return row as never;
+  }) as NonNullable<InboxReaderDeps['createXoActionMessage']>;
+}
+
+function xoComment(
+  input: Partial<XoActionComment> & Pick<XoActionComment, 'id' | 'body'>
+): XoActionComment {
+  return {
+    html_url: `https://github.com/thinmansoftware/bdc-xo/issues/1873#issuecomment-${input.id}`,
+    author: 'codex',
+    created_at: '2026-10-22T18:05:00.000Z',
+    issue: 1873,
+    ...input,
+  };
+}
+
+describe('xo action watch', () => {
+  const started = '2026-10-22T18:10:00.000Z';
+
+  async function runWatch(input: {
+    comments?: XoActionComment[];
+    since?: string;
+    now?: string;
+    remaining?: number;
+    leaseId?: string | null;
+    root?: string;
+    store?: Map<string, XoActionStoredMessage>;
+    list?: (sinceIso: string) => Promise<XoActionComment[]>;
+  }) {
+    const root = input.root ?? (await mkdtemp(join(tmpdir(), 'inbox-reader-xo-')));
+    if (!input.root) roots.push(root);
+    if (input.since !== undefined) {
+      await mkdir(root, { recursive: true });
+      await writeFile(join(root, 'state.json'), JSON.stringify({ xo_action_since: input.since }));
+    }
+    const store = input.store ?? new Map<string, XoActionStoredMessage>();
+    const listed: string[] = [];
+    const deps: InboxReaderDeps = {
+      root,
+      now: () => new Date(input.now ?? started),
+      listMessages: async () => [],
+      registerWorker: async () => undefined,
+      heartbeatWorker: async () => undefined,
+      log: { info: () => {}, warn: () => {}, error: () => {} },
+      probeCoreRemaining: async () => input.remaining ?? 4000,
+      listXoActionComments:
+        input.list ??
+        (async (sinceIso: string) => {
+          listed.push(sinceIso);
+          return input.comments ?? [];
+        }),
+      getCurrentXoLease: async () => (input.leaseId ? { lease_id: input.leaseId } : null),
+      createXoActionMessage: xoActionSender(store),
+    };
+    const result = await runInboxReader(deps, resolveInboxReaderConfig({}));
+    const state = JSON.parse(await Bun.file(join(root, 'state.json')).text()) as {
+      xo_action_since?: string;
+    };
+    const markdown = await Bun.file(join(root, 'latest.md')).text();
+    return { root, result, state, store, listed, markdown };
+  }
+
+  test('xo_action_comment_creates_one_message', async () => {
+    const url = 'https://github.com/thinmansoftware/bdc-xo/issues/1873#issuecomment-6273795553';
+    const since = '2026-10-22T18:00:00.000Z';
+    const { result, store, listed, markdown } = await runWatch({
+      since,
+      comments: [
+        xoComment({
+          id: '6273795553',
+          html_url: url,
+          body: 'XO ACTION: please review',
+          issue: 1873,
+        }),
+      ],
+    });
+    const messages = [...store.values()];
+    expect(result.errors).toEqual([]);
+    expect(listed).toEqual([since]);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({
+      task_type: 'agent_message',
+      recipient: 'xo',
+      subject_key: 'gh:thinmansoftware/bdc-xo#1873',
+      idempotency_key: 'inbox-reader:xo-action:6273795553',
+    });
+    expect(messages[0]?.body.startsWith(`url: ${url}\n`)).toBe(true);
+    expect(result.digest?.xo_action).toEqual({
+      scanned: 1,
+      qualified: 1,
+      sent: 1,
+      skipped: null,
+    });
+    expect(markdown).toContain('XO ACTION: scanned 1, qualified 1, sent 1');
+  });
+
+  test('lease_id_mention_qualifies_and_plain_comment_does_not', async () => {
+    const leaseId = 'lease-xo-1873-arc';
+    const leaseUrl = 'https://github.com/thinmansoftware/bdc-xo/issues/1873#issuecomment-1';
+    const plainUrl = 'https://github.com/thinmansoftware/bdc-xo/issues/1873#issuecomment-2';
+    const { result, store } = await runWatch({
+      since: '2026-10-22T18:00:00.000Z',
+      leaseId,
+      comments: [
+        xoComment({
+          id: '1',
+          html_url: leaseUrl,
+          body: `Please look at ${leaseId} before the customer lane stalls.`,
+        }),
+        xoComment({
+          id: '2',
+          html_url: plainUrl,
+          body: 'Shipping note for the afternoon batch.',
+        }),
+      ],
+    });
+    const messages = [...store.values()];
+    expect(result.errors).toEqual([]);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.body).toContain(leaseUrl);
+    expect(messages[0]?.body).not.toContain(plainUrl);
+    expect(result.digest?.xo_action).toEqual({
+      scanned: 2,
+      qualified: 1,
+      sent: 1,
+      skipped: null,
+    });
+  });
+
+  test('same_comment_twice_is_idempotent', async () => {
+    const store = new Map<string, XoActionStoredMessage>();
+    const comment = xoComment({ id: '99', body: 'XO ACTION: please review' });
+    const first = await runWatch({
+      since: '2026-10-22T18:00:00.000Z',
+      comments: [comment],
+      store,
+    });
+    expect(first.store.size).toBe(1);
+    const rewound = JSON.parse(await Bun.file(join(first.root, 'state.json')).text()) as {
+      xo_action_since?: string;
+    };
+    rewound.xo_action_since = '2026-10-22T17:00:00.000Z';
+    await writeFile(join(first.root, 'state.json'), JSON.stringify(rewound));
+    const second = await runWatch({
+      root: first.root,
+      comments: [comment],
+      store,
+    });
+    expect(second.result.errors).toEqual([]);
+    expect(second.store.size).toBe(1);
+    expect([...second.store.values()][0]?.id).toBe([...first.store.values()][0]?.id);
+    expect(second.result.digest?.xo_action.sent).toBe(1);
+  });
+
+  test('first_run_starts_from_now', async () => {
+    const comments = Array.from({ length: 50 }, (_, index) =>
+      xoComment({
+        id: String(index + 1),
+        body: 'XO ACTION: old handoff',
+        created_at: '2020-01-01T00:00:00.000Z',
+        issue: 2002,
+      })
+    );
+    const { result, store, state, listed } = await runWatch({ comments, now: started });
+    expect(result.errors).toEqual([]);
+    expect(store.size).toBe(0);
+    expect(listed).toEqual([started]);
+    expect(state.xo_action_since).toBe(started);
+    expect(result.digest?.xo_action).toEqual({
+      scanned: 50,
+      qualified: 0,
+      sent: 0,
+      skipped: null,
+    });
+  });
+
+  test('low_rate_limit_skips_step', async () => {
+    let listCalls = 0;
+    const { result, store, markdown } = await runWatch({
+      remaining: 300,
+      comments: [xoComment({ id: '5', body: 'XO ACTION: should not send' })],
+      list: async () => {
+        listCalls += 1;
+        throw new Error('listing must not run');
+      },
+    });
+    expect(result.errors).toEqual([]);
+    expect(listCalls).toBe(0);
+    expect(store.size).toBe(0);
+    expect(result.digest?.xo_action).toEqual({
+      scanned: 0,
+      qualified: 0,
+      sent: 0,
+      skipped: 'rate_limit',
+    });
+    expect(markdown).toContain('XO ACTION: skipped rate_limit');
   });
 });
