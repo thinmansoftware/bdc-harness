@@ -7,6 +7,12 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+// Tests 2-5 drive build-app-image.sh with bash and extensionless PATH stubs
+// (git, docker). Windows cannot exec extensionless stubs from PATH and has no
+// reliable bash on PATH for Bun.spawn, so these tests are skipped on win32 only.
+// They still run on Linux CI, where the stubs and bash are real.
+const SKIP_ON_WINDOWS = process.platform === 'win32';
+
 const SCRIPT = join(import.meta.dir, 'build-app-image.sh');
 const GOOD_SHA = '0123456789abcdef0123456789abcdef01234567';
 const MISMATCH_SHA = 'fedcba9876543210fedcba9876543210fedcba98';
@@ -116,7 +122,7 @@ async function runBuild(controls: BuildControls): Promise<BuildResult> {
 }
 
 describe('build-app-image', () => {
-  it('Test 2: clean tree builds with the real SHA', async () => {
+  it.skipIf(SKIP_ON_WINDOWS)('Test 2: clean tree builds with the real SHA', async () => {
     const result = await runBuild({
       porcelain: '',
       head: GOOD_SHA,
@@ -131,7 +137,7 @@ describe('build-app-image', () => {
     expect(result.dockerLog).not.toContain('ARCHON_BUILD_SHA=not-the-sha');
   });
 
-  it('Test 3: dirty tree refuses before building', async () => {
+  it.skipIf(SKIP_ON_WINDOWS)('Test 3: dirty tree refuses before building', async () => {
     const result = await runBuild({
       porcelain: ' M Dockerfile',
       head: GOOD_SHA,
@@ -143,7 +149,7 @@ describe('build-app-image', () => {
     expect(result.dockerLog).toBe('');
   });
 
-  it('Test 4: label mismatch after build fails loudly', async () => {
+  it.skipIf(SKIP_ON_WINDOWS)('Test 4: label mismatch after build fails loudly', async () => {
     const result = await runBuild({
       porcelain: '',
       head: GOOD_SHA,
@@ -158,7 +164,7 @@ describe('build-app-image', () => {
     );
   });
 
-  it('Test 5: unusable HEAD or failed build', async () => {
+  it.skipIf(SKIP_ON_WINDOWS)('Test 5: unusable HEAD or failed build', async () => {
     const badHead = await runBuild({
       porcelain: '',
       head: 'unknown',
