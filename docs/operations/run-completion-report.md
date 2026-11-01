@@ -63,7 +63,7 @@ Every count in the JSON must equal the matching sqlite3 row. Record both outputs
 
 Added by WO-HARNESS-DAILY-OUTCOME-REPORT-01. Health checks watch liveness; this section watches outcomes. For each harness mechanism it prints INPUT (what went in) against OUTCOME (what came out) over the 24 hours ending at `--as-of`. The window is always 24 hours, whatever `--days` is.
 
-Where the output goes: stdout only, the same as the rest of this report (text, or the `outcomes` and `outcome_flag_line` keys with `--json`). The FIRST line of text output is the owner-visible flag line, `outcome_flags: none` or `outcome_flags: <n> (<flag>, ...)`. The script posts nowhere and never writes to the `operator` mailbox. A scheduled daily run that posts the flag line to the `t3-desktop` results queue is a separate follow-up.
+Where the output goes: the script itself prints to stdout only (text, or the `outcomes` and `outcome_flag_line` keys with `--json`), and the FIRST line of text output is the owner-visible flag line, `outcome_flags: none` or `outcome_flags: <n> (<flag>, ...)`. The script writes nothing. Once a day the server's outcome report clock runs it and posts the result as one GitHub issue comment (see "Daily posting" below). Nothing goes to a Dispatch mailbox: not `operator` (unread) and not `t3-desktop` (no reader until T3 is installed).
 
 | Mechanism | Input | Outcome |
 |---|---|---|
@@ -124,6 +124,28 @@ Shown with AS_OF = '2026-11-01 14:30:00'; WS = '2026-10-31T14:30:00.000Z', WE = 
     where recipient=:r and status='queued' and acknowledged_at is null and created_at < WE;
 
 Age: round((julianday(AS_OF) - julianday(oldest_live)) * 24, 1).
+
+### Daily posting
+
+`packages/server/src/dispatch/outcome-report-clock.ts` is an in-process server timer, started next to the Duty Officer clock in `packages/server/src/index.ts` (same pattern: `setInterval`, off when `NODE_ENV=test`). Every tick (default 15 minutes) it checks whether today's report is due:
+
+- `HARNESS_OUTCOME_REPORT_ISSUE` (issue number) unset or not a number: it logs `outcome_report_skipped_no_issue` and does nothing. It never fails.
+- Before 11:00 UTC (7 AM ET): not due.
+- At or after 11:00 UTC: it reads the issue's comments updated since 00:00 UTC today. If one contains `<!-- harness-outcome-report:YYYY-MM-DD -->` for today, it has already posted (this survives restarts). Otherwise it runs `bun run scripts/run-completion-report.ts --days 1 --as-of <now> --db <ARCHON_HOME>/archon.db --json` and posts one comment: the flag line first, then the mechanism table and the mailbox table, then the date marker.
+- A GitHub or report failure is logged as `outcome_report_failed` and retried on the next tick.
+- A postgres deployment (`DATABASE_URL` set) is refused, because the report reads sqlite only.
+
+Settings:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `HARNESS_OUTCOME_REPORT_ISSUE` | unset (off) | issue number to comment on |
+| `HARNESS_OUTCOME_REPORT_REPO` | `thinmansoftware/bdc-xo` | owner/repo of that issue |
+| `HARNESS_OUTCOME_REPORT_INTERVAL_MS` | `900000` | tick interval (minimum 60000) |
+| `HARNESS_OUTCOME_REPORT_CLOCK_ENABLED` | on | `false` turns the clock off |
+| `HARNESS_OUTCOME_REPORT_SCRIPT` | `/app/scripts/run-completion-report.ts` (resolved relative to the server source) | report script path |
+
+Token: the `taskmaster` service identity through `getServiceGitHubToken` (an App installation token when the App is configured), the same path as #1401.
 
 ### Live outcome check (after the governed rebuild)
 
