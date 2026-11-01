@@ -614,6 +614,10 @@ VALUES
   -- desktop Board/XO seat. drain_on_start (mailbox) like operator/xo -- no
   -- worker ever claims it; the desktop automation reads and addresses it.
   ('astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', TRUE),
+  -- WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065): T3 results queue and
+  -- PR review receipt log. Both drain_on_start mailboxes; nothing claims them.
+  ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', TRUE),
+  ('pr-review-log', 'PR review receipt log', 'drain_on_start', TRUE),
   ('operator', 'Operator', 'drain_on_start', TRUE),
   ('xo', 'XO', 'drain_on_start', TRUE),
   ('board', 'Board', 'alias_resolved', TRUE),
