@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { delimiter, join } from 'path';
 import {
   assertPrBaseAllowed,
   resolveRecordedBaseBranch,
@@ -27,10 +27,13 @@ const LANE_FILES = [
 const DEFAULTS_DIR = join(import.meta.dir, '../../../../.archon/workflows/defaults');
 
 function openPrNode(yaml: string): string {
+  // Windows checkout of text=auto YAML is CRLF. These anchors are
+  // newline-terminated (see bdc-push-correctness.test.ts).
+  const text = yaml.replace(/\r\n/g, '\n');
   const marker = '\n  - id: open-pr-if-needed\n';
-  const start = yaml.indexOf(marker);
+  const start = text.indexOf(marker);
   if (start < 0) throw new Error('open-pr-if-needed node missing');
-  const rest = yaml.slice(start + 1);
+  const rest = text.slice(start + 1);
   const next = rest.indexOf('\n  - id: ', marker.length);
   return next < 0 ? rest : rest.slice(0, next);
 }
@@ -110,18 +113,21 @@ describe('cauldron lane PR open guard', () => {
   test('each feature lane refuses a base mismatch inside open-pr-if-needed and does not retarget', () => {
     expect(LANE_FILES.length).toBe(13);
     for (const file of LANE_FILES) {
-      const yaml = readFileSync(join(DEFAULTS_DIR, file), 'utf8');
-      const node = openPrNode(yaml);
-      expect(node).toContain('ERROR: base_branch_mismatch');
-      expect(node).toContain('ERROR: recorded_base_branch_missing');
-      expect(node).toContain('# existing-pr-base-guard: begin');
-      expect(node).toContain('--json url,baseRefName');
-      expect(node).toContain('accept_open_pr_or_refuse');
-      expect(node).not.toContain('gh pr edit');
-      expect(node).not.toContain('.[0].url // empty');
-      expect(node).toContain('--base "$BASE_BRANCH"');
-      expect(node).not.toContain('${BASE_BRANCH:+--base');
-      expect(node).not.toContain('${BASE_BRANCH:-dev}');
+      const lf = readFileSync(join(DEFAULTS_DIR, file), 'utf8').replace(/\r\n/g, '\n');
+      const copies = [lf, lf.replace(/\n/g, '\r\n')];
+      for (const yaml of copies) {
+        const node = openPrNode(yaml);
+        expect(node).toContain('ERROR: base_branch_mismatch');
+        expect(node).toContain('ERROR: recorded_base_branch_missing');
+        expect(node).toContain('# existing-pr-base-guard: begin');
+        expect(node).toContain('--json url,baseRefName');
+        expect(node).toContain('accept_open_pr_or_refuse');
+        expect(node).not.toContain('gh pr edit');
+        expect(node).not.toContain('.[0].url // empty');
+        expect(node).toContain('--base "$BASE_BRANCH"');
+        expect(node).not.toContain('${BASE_BRANCH:+--base');
+        expect(node).not.toContain('${BASE_BRANCH:-dev}');
+      }
     }
   });
 });
@@ -182,6 +188,33 @@ interface GuardResult {
   stderr: string;
   args: string;
   creates: number;
+  /** `command -v gh` inside the Git Bash that ran the guard. */
+  ghResolved: string;
+  /** Fixture stub prepended to that shell's PATH. */
+  ghFixture: string;
+}
+
+/** Path recorded by the in-script `command -v gh` probe. Empty when the probe is missing. */
+function ghResolvedFromTrace(stderr: string): string {
+  const trace = stderr
+    .split('\n')
+    .map(line => line.replace(/\r$/, ''))
+    .find(line => line.startsWith('TRACE gh='));
+  if (trace === undefined) return '';
+  const marked = trace.slice('TRACE gh='.length);
+  const pythonAt = marked.indexOf(' python3=');
+  return pythonAt < 0 ? marked : marked.slice(0, pythonAt);
+}
+
+/**
+ * Git Bash form of a Windows directory. `C:\foo` and `C:/foo` both become `/c/foo`.
+ * The replacement inserts only the captured drive letter. The colon is dropped and
+ * the separator after it is left in place, so the result is `/c/...`.
+ */
+function toGitBashDir(dir: string): string {
+  return dir
+    .replace(/\\/g, '/')
+    .replace(/^([A-Za-z]):/, (_match, drive: string) => `/${drive.toLowerCase()}`);
 }
 
 function runExistingPrGuard(
@@ -234,39 +267,75 @@ exit 96
 `
     );
     chmodSync(gh, 0o755);
+    const sleep = join(dir, 'sleep');
+    writeFileSync(sleep, '#!/bin/bash\nexit 0\n');
+    chmodSync(sleep, 0o755);
+    const bashDir = process.platform === 'win32' ? toGitBashDir(dir) : dir;
+    const ghFixture = `${bashDir}/gh`;
     const script = join(dir, 'guard.sh');
-    writeFileSync(script, `set -euo pipefail\n${guard}\n`);
+    writeFileSync(
+      script,
+      [
+        'set -euo pipefail',
+        `export PATH='${bashDir}':"$PATH"`,
+        'echo "TRACE gh=$(command -v gh) python3=$(command -v python3)" >&2',
+        guard,
+        '',
+      ].join('\n')
+    );
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      PATH: `${dir}${delimiter}${process.env.PATH ?? ''}`,
+      GH_ARGS_LOG: argsLog,
+      GH_LIST_COUNT: listCount,
+      GH_CREATE_COUNT: createCount,
+      GH_LIST_1: list1Path,
+      GH_LIST_2: list2Path,
+      GH_CREATE_RC: String(createRc),
+      RECORDED_BASE_BRANCH: 'dev',
+      UNIQUE_BRANCH: 'feat/identity-01',
+      REPO: 'acme/widgets',
+      TITLE: 't',
+      BODY_FILE: '/dev/null',
+      BASE_BRANCH: 'dev',
+    };
+    if (process.platform === 'win32') {
+      // Windows treats these keys as aliases; keep the explicit fixture PATH.
+      for (const key of Object.keys(env)) {
+        if (key !== 'PATH' && key.toUpperCase() === 'PATH') delete env[key];
+      }
+    }
     const result = Bun.spawnSync(['bash', script], {
-      env: {
-        ...process.env,
-        PATH: `${dir}:${process.env.PATH ?? ''}`,
-        GH_ARGS_LOG: argsLog,
-        GH_LIST_COUNT: listCount,
-        GH_CREATE_COUNT: createCount,
-        GH_LIST_1: list1Path,
-        GH_LIST_2: list2Path,
-        GH_CREATE_RC: String(createRc),
-        RECORDED_BASE_BRANCH: 'dev',
-        UNIQUE_BRANCH: 'feat/identity-01',
-        REPO: 'acme/widgets',
-        TITLE: 't',
-        BODY_FILE: '/dev/null',
-        BASE_BRANCH: 'dev',
-      },
+      env,
       stdout: 'pipe',
       stderr: 'pipe',
     });
+    const stderr = new TextDecoder().decode(result.stderr);
     return {
       code: result.exitCode ?? -1,
       stdout: new TextDecoder().decode(result.stdout),
-      stderr: new TextDecoder().decode(result.stderr),
+      stderr,
       args: readFileSync(argsLog, 'utf8'),
       creates: Number(readFileSync(createCount, 'utf8')),
+      ghResolved: ghResolvedFromTrace(stderr),
+      ghFixture,
     };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+describe('toGitBashDir', () => {
+  test('uses only the drive letter so a Windows temp dir is /c/...', () => {
+    expect(toGitBashDir('C:\\Users\\runner\\Temp\\pr-base-guard-abc')).toBe(
+      '/c/Users/runner/Temp/pr-base-guard-abc'
+    );
+    expect(toGitBashDir('C:/Users/runner/Temp/pr-base-guard-abc')).toBe(
+      '/c/Users/runner/Temp/pr-base-guard-abc'
+    );
+    expect(toGitBashDir('D:\\a\\b')).toBe('/d/a/b');
+  });
+});
 
 describe('existing PR base verification', () => {
   test('every lane refuses a pre-existing main PR when the recorded base is dev', () => {
@@ -281,6 +350,8 @@ describe('existing PR base verification', () => {
       const guard = guards[index];
       if (!guard) throw new Error(`missing guard for ${file}`);
       const result = runExistingPrGuard(guard, EXISTING_PR_ON_MAIN, EXISTING_PR_ON_MAIN, 0);
+      expect(result.ghFixture.endsWith('/gh'), file).toBe(true);
+      expect(result.ghResolved, file).toBe(result.ghFixture);
       expect(result.code, file).toBe(1);
       expect(result.stderr).toContain('ERROR: base_branch_mismatch: recorded=dev attempted=main');
       expect(result.stdout).not.toContain('PR already exists');
@@ -297,6 +368,8 @@ describe('existing PR base verification', () => {
       readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8')
     );
     const result = runExistingPrGuard(guard, EXISTING_PR_ON_DEV, EXISTING_PR_ON_DEV, 0);
+    expect(result.ghFixture.endsWith('/gh')).toBe(true);
+    expect(result.ghResolved).toBe(result.ghFixture);
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain('PR_URL=https://github.com/acme/widgets/pull/55');
     expect(result.stdout).toContain('PR already exists (no create needed).');
@@ -309,6 +382,8 @@ describe('existing PR base verification', () => {
       readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8')
     );
     const result = runExistingPrGuard(guard, EXISTING_PR_WITHOUT_BASE, EXISTING_PR_WITHOUT_BASE, 0);
+    expect(result.ghFixture.endsWith('/gh')).toBe(true);
+    expect(result.ghResolved).toBe(result.ghFixture);
     expect(result.code, result.stderr).toBe(1);
     expect(result.stderr).toContain(
       'ERROR: base_branch_mismatch: recorded=dev attempted=<unverified>'
@@ -322,6 +397,8 @@ describe('existing PR base verification', () => {
       readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8')
     );
     const result = runExistingPrGuard(guard, NO_OPEN_PR, EXISTING_PR_ON_MAIN, 1);
+    expect(result.ghFixture.endsWith('/gh')).toBe(true);
+    expect(result.ghResolved).toBe(result.ghFixture);
     expect(result.code, result.stderr).toBe(1);
     expect(result.stderr).toContain('ERROR: base_branch_mismatch: recorded=dev attempted=main');
     expect(result.stdout).not.toContain('PR confirmed via list');
@@ -334,6 +411,8 @@ describe('existing PR base verification', () => {
       readFileSync(join(DEFAULTS_DIR, 'bdc-feature-development.yaml'), 'utf8')
     );
     const result = runExistingPrGuard(guard, NO_OPEN_PR, EXISTING_PR_ON_DEV, 1);
+    expect(result.ghFixture.endsWith('/gh')).toBe(true);
+    expect(result.ghResolved).toBe(result.ghFixture);
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain(
       'PR created despite non-zero exit (gh CLI quirk; PR confirmed via list).'
