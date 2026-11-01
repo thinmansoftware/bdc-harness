@@ -279,10 +279,13 @@ exit 96
       stdout: 'pipe',
       stderr: 'pipe',
     });
+    const stderr = new TextDecoder().decode(result.stderr);
+    const trace = stderr.split('\n').find(line => line.startsWith('TRACE gh='));
+    if (trace !== undefined) console.error(trace);
     return {
       code: result.exitCode ?? -1,
       stdout: new TextDecoder().decode(result.stdout),
-      stderr: new TextDecoder().decode(result.stderr),
+      stderr,
       args: readFileSync(argsLog, 'utf8'),
       creates: Number(readFileSync(createCount, 'utf8')),
     };
