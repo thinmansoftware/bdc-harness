@@ -203,7 +203,8 @@ nodes:
       # holder blocks: start time (after the holder run's started_at) and uid only
       # label the holder (run_owned, predates_run, foreign_uid), they never excuse it.
       # Skipped: this shell, its ancestors and PID 1. A same-uid entry whose cwd, stat
-      # or status cannot be read makes the scan incomplete and is refused. When every
+      # or status cannot be read makes the scan incomplete and is refused, unless it
+      # started at or before the holder run (a non-dumpable session process). When every
       # row is terminal and a live cwd is the only blocker, rtw_wait_for_holder_exit
       # polls every 5 s up to RTW_HOLDER_WAIT_SECONDS (default 120). A clean holder:
       # if its tip is not an ancestor of FETCH_HEAD, push it to
@@ -300,6 +301,10 @@ nodes:
               continue
             fi
             if [ "$uid" = "$rtw_self_uid" ]; then
+              if start=$(rtw_proc_start_ms "$pid") && [ "$start" -le "$rtw_holder_started_ms" ]; then
+                continue
+              fi
+              [ -d "$d" ] || continue
               rtw_scan_unreadable=$((rtw_scan_unreadable + 1))
             fi
             continue

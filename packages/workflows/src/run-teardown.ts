@@ -25,6 +25,10 @@
  *       run began, with its cwd inside the run's worktree, is treated as
  *       run-owned and terminated at run end;
  *   (3) only Linux proves teardown.
+ * Additional limit found on ubuntu CI: a same-uid process whose cwd is unreadable
+ * (non-dumpable, e.g. after a credential change) and that started at or before
+ * the start-time floor is not observable and does not block; one that started
+ * after the floor makes the scan incomplete.
  *
  * Node-timeout teardown is node-specific: every bash/script node subprocess is
  * spawned with a unique ARCHON_NODE_TOKEN in its environment, inherited by all
@@ -311,11 +315,20 @@ function scanWorktree(
       cwd = stripDeleted(reader.readCwd(pid));
     } catch (error) {
       if (isGone(error)) continue;
-      // cwd unreadable: same uid (or unknown uid) means we cannot prove absence.
+      // cwd unreadable: same uid (or unknown uid) started after the floor means we
+      // cannot prove absence (bdc-xo#3569: an orphan pipeline of the finished run).
+      // A non-dumpable same-uid process that started at or before the floor (a
+      // session manager such as `systemd --user`) is not observable and is skipped.
       try {
         if (reader.readUid(pid) !== selfUid) continue;
       } catch (uidError) {
         if (isGone(uidError)) continue;
+      }
+      try {
+        const unreadableStat = reader.readStat(pid);
+        if (!(startMs(reader, unreadableStat) > floorMs)) continue;
+      } catch (statError) {
+        if (isGone(statError)) continue;
       }
       incomplete++;
       blockers.push({ pid, reason: 'scan_incomplete' });

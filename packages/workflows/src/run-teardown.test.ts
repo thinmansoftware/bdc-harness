@@ -545,7 +545,8 @@ describe('run teardown (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01)', () => {
       } catch (error) {
         timeoutError = error;
       }
-      expect(String((timeoutError as Error | undefined)?.message ?? '')).toContain('timed out');
+      // execFile reports a timeout kill as killed=true (dag-executor's isTimeout test).
+      expect((timeoutError as { killed?: boolean } | undefined)?.killed).toBe(true);
       const beforeTeardown = pidsUnder(wt);
       strayPids.push(...beforeTeardown);
       const result = await endNodeProcessTree({
