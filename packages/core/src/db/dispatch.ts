@@ -1910,41 +1910,29 @@ export async function renewMessageLease(data: {
  * Returns every claimed message whose lease expired without completion to the
  * queue, so a worker or container restart cannot drop it.
  *
- * `now` is the only clock. The fencing token is not changed: the next
- * claimMessage bumps it, and a late completion from the dead holder is rejected.
- * Terminal rows and leases that are still in the future are left alone.
+ * `now` is the only clock. One conditional UPDATE ... RETURNING id decides the
+ * set: the returned ids are the rows this statement changed, not a prior read.
+ * The fencing token is not changed: the next claimMessage bumps it, and a late
+ * completion from the dead holder is rejected. Terminal rows and leases that
+ * are still in the future are left alone.
  */
 export async function requeueExpiredClaims(now: string): Promise<string[]> {
   if (!Number.isFinite(Date.parse(now))) {
     throw new Error('dispatch_expired_claim_requeue_now_invalid');
   }
   const db = getDatabase();
-  const ids = await db.withTransaction(async query => {
-    const lock = db.dialect === 'postgres' ? ' FOR UPDATE' : '';
-    const found = await query<{ id: string }>(
-      `SELECT id FROM agent_dispatch_messages
-       WHERE status = 'claimed'
-         AND lease_expires_at IS NOT NULL
-         AND lease_expires_at <= $1${lock}`,
-      [now]
-    );
-    const selected = found.rows.map(row => row.id);
-    if (selected.length === 0) return [];
-    const update = await query(
-      `UPDATE agent_dispatch_messages
-       SET status = 'queued',
-           lease_owner = NULL,
-           lease_expires_at = NULL
-       WHERE status = 'claimed'
-         AND lease_expires_at IS NOT NULL
-         AND lease_expires_at <= $1`,
-      [now]
-    );
-    if (update.rowCount !== selected.length) {
-      throw new Error('dispatch_expired_claim_requeue_count_mismatch');
-    }
-    return selected;
-  });
+  const result = await db.query<{ id: string }>(
+    `UPDATE agent_dispatch_messages
+     SET status = 'queued',
+         lease_owner = NULL,
+         lease_expires_at = NULL
+     WHERE status = 'claimed'
+       AND lease_expires_at IS NOT NULL
+       AND lease_expires_at <= $1
+     RETURNING id`,
+    [now]
+  );
+  const ids = result.rows.map(row => row.id);
   if (ids.length > 0) {
     log.info({ count: ids.length, ids }, 'dispatch.expired_claims_requeued');
   }
