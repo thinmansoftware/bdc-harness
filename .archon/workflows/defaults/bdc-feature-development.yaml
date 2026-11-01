@@ -217,21 +217,83 @@ nodes:
       fi
       # ---- BEGIN rtw core (byte-identical across lanes; extracted by unit test) ----
       # Reclaim a repair branch held by another worktree only when every signal says
-      # the holder is dead: not this worktree; every remote_agent_workflow_runs row
-      # for that working_path is completed, failed, escalated, or cancelled with
-      # completed_at at least RTW_MIN_AGE_SECONDS old (default 600); no resolvable
-      # process cwd under RTW_PROC_ROOT (default /proc) is the holder or inside it;
-      # and git status --porcelain is empty. If the holder tip is not an ancestor of
+      # the holder is finished: not this worktree; every remote_agent_workflow_runs
+      # row for that working_path is completed, failed, escalated, or cancelled; no
+      # resolvable process cwd under RTW_PROC_ROOT (default /proc) is the holder or
+      # inside it. A completed holder younger than RTW_MIN_AGE_SECONDS (default 600)
+      # is waited out up to RTW_MAX_GRACE_WAIT_SECONDS (default 660); a grace longer
+      # than that bound is refused. A dirty terminal holder is saved under
+      # RTW_QUARANTINE_DIR (default /.archon/workspaces/.worktree-quarantine) as a
+      # patch of the staged and unstaged diffs plus a tar of untracked files, then
+      # stashed, and reclaim continues. If saving those leftovers fails, reclaim is
+      # refused and the worktree stays. If the holder tip is not an ancestor of
       # FETCH_HEAD, push it to refs/heads/backup/<branch>-<sha7>-<UTC stamp> first.
       # Then remove that worktree once and retry the checkout once. Anything else is
       # refused. Never removes any other worktree. Env overrides: RTW_RUNS_DB
       # (default /.archon/archon.db), RTW_MIN_AGE_SECONDS (default 600), RTW_PROC_ROOT
-      # (default /proc).
+      # (default /proc), RTW_MAX_GRACE_WAIT_SECONDS (default 660), RTW_QUARANTINE_DIR
+      # (default /.archon/workspaces/.worktree-quarantine).
       rtw_refuse() {
         printf 'repair_target_branch_held: %s is checked out by %s; not reclaimed: %s\n' "$branch" "$holder" "$1"
         printf 'repair_target_branch_held: %s is checked out by %s; not reclaimed: %s\n' "$branch" "$holder" "$1" >&2
         rm -f "$err_file" "$rtw_query" "$rtw_db_out" "$rtw_db_err"
         return 1
+      }
+      rtw_quarantine_holder() {
+        local qdir="" qbase="" stamp="" qpatch="" qtar="" qdir_prefix="" untracked_list=""
+        qdir="${RTW_QUARANTINE_DIR:-/.archon/workspaces/.worktree-quarantine}"
+        qbase=$(basename "$holder")
+        case "$qbase" in
+          *'/'*|*..*)
+            rtw_refuse "quarantine holder basename unsafe" || return
+            ;;
+        esac
+        stamp=$(date -u +%Y%m%dT%H%M%SZ)
+        qdir_prefix="${qdir%/}/"
+        qpatch="${qdir_prefix}${qbase}-${stamp}.patch"
+        qtar="${qdir_prefix}${qbase}-${stamp}.tar"
+        case "$qpatch" in
+          "$qdir_prefix"*) ;;
+          *)
+            rtw_refuse "quarantine path escaped" || return
+            ;;
+        esac
+        case "$qtar" in
+          "$qdir_prefix"*) ;;
+          *)
+            rtw_refuse "quarantine path escaped" || return
+            ;;
+        esac
+        if ! mkdir -p "$qdir"; then
+          rtw_refuse "quarantine directory not writable" || return
+        fi
+        if ! git -C "$holder" diff --cached > "$qpatch"; then
+          rm -f "$qpatch"
+          rtw_refuse "quarantine staged diff failed" || return
+        fi
+        if ! git -C "$holder" diff >> "$qpatch"; then
+          rm -f "$qpatch"
+          rtw_refuse "quarantine unstaged diff failed" || return
+        fi
+        if ! untracked_list=$(mktemp); then
+          rm -f "$qpatch"
+          rtw_refuse "quarantine temp file failed" || return
+        fi
+        if ! git -C "$holder" ls-files --others --exclude-standard -z > "$untracked_list"; then
+          rm -f "$untracked_list" "$qpatch"
+          rtw_refuse "quarantine untracked list failed" || return
+        fi
+        if [ -s "$untracked_list" ]; then
+          if ! tar --null --verbatim-files-from -C "$holder" -T "$untracked_list" -cf "$qtar"; then
+            rm -f "$untracked_list" "$qtar"
+            rtw_refuse "quarantine archive failed" || return
+          fi
+        fi
+        rm -f "$untracked_list"
+        if ! git -C "$holder" stash push -u -m "reclaim-${qbase}-${stamp}"; then
+          rtw_refuse "quarantine stash failed" || return
+        fi
+        printf 'repair_target_quarantined: %s\n' "$qpatch"
       }
       rtw_checkout_repair_branch() {
         local branch="$1"
@@ -240,6 +302,7 @@ nodes:
         local holder="" rtw_top="" rtw_db="" min_age="" proc_root=""
         local best_id="" best_status="" best_ts="" best_epoch=-1
         local holder_sha="" backup_ref="" sha7="" stamp="" id8=""
+        local grace_need=0 max_wait=0 slept=0 chunk=0
         local row_id="" row_status="" row_completed="" row_epoch="" now_epoch="" row_age=0
         local resolved="" cwdlink=""
         err_file=$(mktemp)
@@ -336,12 +399,6 @@ nodes:
         fi
         now_epoch=$(date -u +%s)
         row_age=$((now_epoch - best_epoch))
-        if [ "$row_age" -lt "$min_age" ]; then
-          case "$best_status" in
-            escalated|failed|cancelled) ;;
-            *) rtw_refuse "completed_at is only ${row_age}s old" || return ;;
-          esac
-        fi
         proc_root="${RTW_PROC_ROOT:-/proc}"
         if [ ! -d "$proc_root" ]; then
           rtw_refuse "process root missing" || return
@@ -360,8 +417,32 @@ nodes:
             rtw_refuse "live process cwd under holder" || return
           fi
         done
+        if [ "$row_age" -lt "$min_age" ]; then
+          case "$best_status" in
+            escalated|failed|cancelled) ;;
+            *)
+              grace_need=$((min_age - row_age))
+              max_wait="${RTW_MAX_GRACE_WAIT_SECONDS:-660}"
+              if [ "$grace_need" -gt "$max_wait" ]; then
+                rtw_refuse "completed_at is only ${row_age}s old" || return
+              fi
+              slept=0
+              while [ "$slept" -lt "$grace_need" ]; do
+                chunk=$((grace_need - slept))
+                if [ "$chunk" -gt 30 ]; then
+                  chunk=30
+                fi
+                if ! sleep "$chunk"; then
+                  rtw_refuse "grace wait sleep failed" || return
+                fi
+                slept=$((slept + chunk))
+              done
+              printf 'repair_target_grace_wait: %ss\n' "$slept"
+              ;;
+          esac
+        fi
         if [ -n "$(git -C "$holder" status --porcelain)" ]; then
-          rtw_refuse "worktree is dirty" || return
+          rtw_quarantine_holder || return
         fi
         holder_sha=$(git -C "$holder" rev-parse HEAD)
         backup_ref=""
