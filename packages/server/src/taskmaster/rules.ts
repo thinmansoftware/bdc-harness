@@ -59,6 +59,16 @@ export interface ThreadSnapshot {
   isUnclaimedP0?: boolean;
   /** No assignee and no claim status, at any priority. */
   isUnclaimed?: boolean;
+  /**
+   * Latest non-automated comment is an EXECUTED or RECEIPT marker.
+   * Suppresses nudge and escalate_p0 on every tick and time bucket.
+   */
+  hasReceipt?: boolean;
+  /**
+   * A valid owner:<login> label is present. Suppresses only the unclaimed-P0
+   * escalation; the stale-thread nudge still applies unless a receipt does.
+   */
+  hasOwnerLabel?: boolean;
   /** Recipient seat for any message about this thread. */
   recipient: string;
 }
@@ -392,7 +402,10 @@ export function computeNextAction(
 
   if (classification === 'healthy') return null;
 
-  if (thread.isUnclaimedP0) {
+  // Owner label: an owner exists, so this is not an unclaimed P0. Receipt:
+  // the latest substantive comment already closed the thread. Neither fact
+  // changes isUnclaimed or fire_cauldron eligibility.
+  if (thread.isUnclaimedP0 && thread.hasOwnerLabel !== true && thread.hasReceipt !== true) {
     const bucket = Math.floor(context.nowMs / NUDGE_CLOCK_MS.P0);
     const woId = adoption?.title?.match(WO_ID_RE);
     const title = woId?.index === 0 ? woId[0] : adoption?.title;
@@ -415,7 +428,7 @@ export function computeNextAction(
     };
   }
 
-  if (classification === 'stale' || blockedSeatNudge) {
+  if ((classification === 'stale' || blockedSeatNudge) && thread.hasReceipt !== true) {
     // Noise suppression: the grader already called this thread's sends noise
     // and its content has not moved -- stay quiet until the work moves.
     if (isSuppressedByNoise(thread.ref, context.grades ?? [], adoption, context.suppression)) {
