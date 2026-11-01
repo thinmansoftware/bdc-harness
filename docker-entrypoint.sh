@@ -155,4 +155,8 @@ $RUNNER bun run setup-auth
 # any 401 that slips through.
 $RUNNER bun run verify-auth || true
 
+# Reconcile the global workflow volume to the baked defaults. Non-fatal: a sync
+# fault must never block boot. Uncommitted hand edits are preserved and reported.
+$RUNNER bun run /app/scripts/served-lanes/cli.ts --apply || echo "[archon] WARN: served-lanes sync failed" >&2
+
 exec $RUNNER bun run start

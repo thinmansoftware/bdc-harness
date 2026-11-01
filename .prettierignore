@@ -58,3 +58,8 @@ packages/overseer/src/__tests__/fixtures/reconcile/
 # Pinned Docker/Moby 29.3.0 default seccomp bytes (WO-HARNESS-CONTAINER-SECCOMP-USERNS-01).
 # SHA256 01536f1d1df938ae611eba20d6349e0de7a99b6ecdee1549427a0b01b8301e28. Prettier must not reflow.
 docker/seccomp-upstream-29.3.0.json
+
+# Generated served-lane history. One hash per line, including singleton arrays,
+# so a merge conflict stays trivial. Prettier's JSON printer collapses those
+# arrays onto one line and must not reflow this file.
+scripts/served-lanes/history.json
