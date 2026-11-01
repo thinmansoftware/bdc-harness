@@ -4,6 +4,10 @@ import type { IWorkflowStore } from '@archon/workflows/store';
 import type { RunLeaseRecord } from '@archon/workflows/reliability/types';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { createLogger } from '@archon/paths';
+import {
+  releaseTerminalRunLeases,
+  type TerminalLeaseReconcileReport,
+} from '@archon/workflows/run-teardown';
 
 const log = createLogger('workflow.recovery');
 
@@ -227,4 +231,18 @@ export async function claimAndResumeInterruptedRun(
     });
     throw error;
   }
+}
+
+/**
+ * Periodic sweep (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01, N5): release leases left
+ * on terminal runs whose worktree scan is clear. Never signals a process and
+ * never touches a non-terminal run's lease.
+ */
+export async function releaseTerminalRunLeasesSweep(
+  store: IWorkflowStore,
+  options: Parameters<typeof releaseTerminalRunLeases>[1] = {}
+): Promise<TerminalLeaseReconcileReport> {
+  const report = await releaseTerminalRunLeases(store, options);
+  if (report.observed > 0) log.info(report, 'terminal_run_lease_sweep');
+  return report;
 }

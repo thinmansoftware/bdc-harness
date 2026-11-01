@@ -61,6 +61,7 @@ export {
   reconcileExpiredWorkflowLeases,
   reconcilePendingWorkflowRunsAtBoot,
   reconcileRunningWorkflowRunsAtBoot,
+  releaseTerminalRunLeasesSweep,
   type PendingReconcileReport,
   type StartupRecoveryReport,
 } from './workflows/recovery';
