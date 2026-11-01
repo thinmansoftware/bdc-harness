@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { createHash } from 'crypto';
 import { unlinkSync } from 'fs';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { tmpdir } from 'os';
 import { join } from 'path';
+import { BASE_TOOL_NAMES } from '../../../companion-mcp/src/constants';
+import { loadCompanionRegistry } from '../../../companion-mcp/src/registry';
 import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
@@ -278,6 +282,69 @@ function cleanupDb(path: string): void {
   }
 }
 
+async function insertSyntheticDispatch(input: {
+  id: string;
+  recipient: string;
+  correlationId: string;
+  seq: number;
+  body: string;
+  acknowledged: boolean;
+  notBefore?: string | null;
+  addressedAt?: string | null;
+  routeDisposition?: DispatchMessage['route_disposition'];
+}): Promise<void> {
+  const createdAt = new Date(Date.UTC(2020, 0, 1) + input.seq * 1000).toISOString();
+  await db.query(
+    `INSERT INTO agent_dispatch_messages (
+       id, correlation_id, idempotency_key, task_type, sender, recipient, body, status,
+       created_at, priority, fencing_token, acknowledged_at, acknowledged_by, not_before, seq,
+       addressed_at, route_disposition
+     ) VALUES (
+       $1, $2, $3, 'agent_message', 'xo', $4, $5, 'queued', $6, 'normal', 0, $7, $8, $9, $10,
+       $11, $12
+     )`,
+    [
+      input.id,
+      input.correlationId,
+      `idem-${input.id}`,
+      input.recipient,
+      input.body,
+      createdAt,
+      input.acknowledged ? createdAt : null,
+      input.acknowledged ? input.recipient : null,
+      input.notBefore ?? null,
+      input.seq,
+      input.addressedAt ?? null,
+      input.routeDisposition ?? null,
+    ]
+  );
+}
+
+const QUEUED_CURSOR_DUE = '2000-01-01T00:00:00.000Z';
+const QUEUED_CURSOR_FUTURE = '2999-01-01T00:00:00.000Z';
+
+async function pollQueuedCursor(
+  app: OpenAPIHono,
+  afterSeq: number,
+  limit: number
+): Promise<{
+  messages: Array<{ id: string; body: string; recipient: string }>;
+  next_after_seq: number;
+  page_full: boolean;
+}> {
+  const response = await app.request(
+    `/api/dispatch/messages?recipient=grokbot&status=queued&after_seq=${afterSeq}&limit=${limit}`
+  );
+  expect(response.status).toBe(200);
+  const body = (await response.json()) as {
+    messages: Array<{ id: string; body: string; recipient: string }>;
+    next_after_seq: number;
+    page_full: boolean;
+  };
+  expect(JSON.stringify(body)).not.toContain('cursor_seq');
+  return body;
+}
+
 function makeApp(
   token?: string,
   dispatchMailboxActorResolvedHook?: () => Promise<void>
@@ -382,6 +449,8 @@ describe('dispatch API', () => {
     delete process.env.DISPATCH_WORKER_CREDENTIALS_JSON;
     delete process.env.DISPATCH_PRINCIPALS_JSON;
     delete process.env.DISPATCH_SENDER_AUTH_MODE;
+    delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+    delete process.env.ARCHON_OPERATOR_EMAILS;
     await db.close();
     cleanupDb(currentDbPath);
   });
@@ -2205,5 +2274,2490 @@ describe('dispatch API', () => {
     const stored = await storedReceipt(message.id);
     expect(stored.acknowledged_at).toBeNull();
     expect(stored.acknowledged_by).toBeNull();
+  });
+
+  test('test119 reads an own message behind an acknowledged 500-row backlog', async () => {
+    for (let index = 0; index < 501; index += 1) {
+      await insertSyntheticDispatch({
+        id: `old-${index}`,
+        recipient: 'grokbot',
+        correlationId: `old-corr-${index}`,
+        seq: index + 1,
+        body: `OLD-BODY-${index}`,
+        acknowledged: true,
+      });
+    }
+    await insertSyntheticDispatch({
+      id: 'newer-own',
+      recipient: 'grokbot',
+      correlationId: 'newer-corr',
+      seq: 600,
+      body: 'NEWER-OWN-BODY',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'foreign-own-id',
+      recipient: 'xo',
+      correlationId: 'foreign-corr',
+      seq: 601,
+      body: 'FOREIGN-SECRET-BODY',
+      acknowledged: false,
+    });
+
+    const app = makeApp();
+    const legacy = await app.request('/api/dispatch/messages?recipient=grokbot&limit=500');
+    expect(legacy.status).toBe(200);
+    const legacyRows = (await legacy.json()) as Array<{ id: string }>;
+    expect(Array.isArray(legacyRows)).toBe(true);
+    expect(legacyRows).toHaveLength(500);
+    expect(legacyRows.map(row => row.id)).not.toContain('newer-own');
+
+    const own = await app.request(
+      '/api/dispatch/messages?recipient=%20GrokBot%20&message_id=newer-own'
+    );
+    expect(own.status).toBe(200);
+    const ownRows = (await own.json()) as Array<{ id: string; body: string; recipient: string }>;
+    expect(ownRows.map(row => row.id)).toEqual(['newer-own']);
+    expect(ownRows[0]?.recipient).toBe('grokbot');
+    expect(ownRows[0]?.body).toBe('NEWER-OWN-BODY');
+    expect(ownRows[0]).not.toHaveProperty('cursor_seq');
+
+    const foreign = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&message_id=foreign-own-id'
+    );
+    const unknown = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&message_id=missing-message'
+    );
+    expect(foreign.status).toBe(200);
+    expect(unknown.status).toBe(200);
+    const foreignBody = await foreign.json();
+    const unknownBody = await unknown.json();
+    expect(foreignBody).toEqual([]);
+    expect(unknownBody).toEqual(foreignBody);
+    expect(JSON.stringify(foreignBody)).not.toContain('FOREIGN-SECRET-BODY');
+
+    process.env.ARCHON_OPERATOR_TOKEN = 'operator-secret-must-not-gate-reads';
+    const blocked = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&message_id=newer-own'
+    );
+    expect(blocked.status).toBe(401);
+    expect(JSON.stringify(await blocked.json())).not.toContain('NEWER-OWN-BODY');
+    const gated = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&message_id=newer-own',
+      { headers: { 'x-archon-operator-token': 'operator-secret-must-not-gate-reads' } }
+    );
+    expect(gated.status).toBe(200);
+    expect((await gated.json()) as Array<{ id: string }>).toEqual([
+      expect.objectContaining({ id: 'newer-own' }),
+    ]);
+    const stillHidden = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&message_id=foreign-own-id',
+      { headers: { 'x-archon-operator-token': 'operator-secret-must-not-gate-reads' } }
+    );
+    expect(await stillHidden.json()).toEqual([]);
+  });
+
+  test('test120 pages an own inbox past interleaved foreign rows', async () => {
+    for (let index = 0; index < 501; index += 1) {
+      await insertSyntheticDispatch({
+        id: `own-${index}`,
+        recipient: 'grokbot',
+        correlationId: `own-corr-${index}`,
+        seq: index * 2 + 1,
+        body: `OWN-BODY-${index}`,
+        acknowledged: false,
+      });
+      await insertSyntheticDispatch({
+        id: `other-${index}`,
+        recipient: 'xo',
+        correlationId: `other-corr-${index}`,
+        seq: index * 2 + 2,
+        body: `OTHER-SECRET-${index}`,
+        acknowledged: false,
+      });
+    }
+    const app = makeApp();
+    const firstResponse = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&limit=500'
+    );
+    expect(firstResponse.status).toBe(200);
+    const first = (await firstResponse.json()) as {
+      messages: Array<{ id: string; recipient: string; cursor_seq?: number }>;
+      next_after_seq: number;
+      page_full: boolean;
+    };
+    expect(Array.isArray(first)).toBe(false);
+    expect(first.page_full).toBe(true);
+    expect(first.messages).toHaveLength(500);
+    expect(first.messages.every(message => message.recipient === 'grokbot')).toBe(true);
+    expect(first.messages.some(message => message.cursor_seq !== undefined)).toBe(false);
+    expect(first.messages.map(message => message.id)).toEqual(
+      Array.from({ length: 500 }, (_unused, index) => `own-${index}`)
+    );
+    const seen = new Set(first.messages.map(message => message.id));
+
+    const secondResponse = await app.request(
+      `/api/dispatch/messages?recipient=grokbot&after_seq=${first.next_after_seq}&limit=500`
+    );
+    const second = (await secondResponse.json()) as {
+      messages: Array<{ id: string; recipient: string }>;
+      next_after_seq: number;
+      page_full: boolean;
+    };
+    expect(second.messages.map(message => message.id)).toEqual(['own-500']);
+    expect(second.page_full).toBe(false);
+    expect(seen.has('own-500')).toBe(false);
+    expect(second.next_after_seq).toBeGreaterThan(first.next_after_seq);
+
+    const emptyResponse = await app.request(
+      `/api/dispatch/messages?recipient=grokbot&after_seq=${second.next_after_seq}&limit=500`
+    );
+    expect(await emptyResponse.json()).toEqual({
+      messages: [],
+      next_after_seq: second.next_after_seq,
+      page_full: false,
+    });
+    const text = JSON.stringify({ first, second });
+    expect(text).not.toContain('OTHER-SECRET');
+  });
+
+  test('non-queued after_seq rejects an unsafe or non-monotonic cursor', async () => {
+    await insertSyntheticDispatch({
+      id: 'safe-2',
+      recipient: 'grokbot',
+      correlationId: 'safe-2-corr',
+      seq: 2,
+      body: 'SAFE-CURSOR-2',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'safe-5',
+      recipient: 'grokbot',
+      correlationId: 'safe-5-corr',
+      seq: 5,
+      body: 'SAFE-CURSOR-5',
+      acknowledged: false,
+    });
+    const app = makeApp();
+    const safeResponse = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&limit=50'
+    );
+    expect(safeResponse.status).toBe(200);
+    const safePage = (await safeResponse.json()) as {
+      messages: Array<{ id: string }>;
+      next_after_seq: number;
+      page_full: boolean;
+    };
+    expect(safePage.messages.map(message => message.id)).toEqual(['safe-2', 'safe-5']);
+    expect(safePage.next_after_seq).toBe(5);
+    expect(Number.isSafeInteger(safePage.next_after_seq)).toBe(true);
+    expect(safePage.page_full).toBe(false);
+    expect(JSON.stringify(safePage)).not.toContain('cursor_seq');
+
+    await insertSyntheticDispatch({
+      id: 'dup-a',
+      recipient: 'codex',
+      correlationId: 'dup-a-corr',
+      seq: 8,
+      body: 'DUP-A-SECRET',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'dup-b',
+      recipient: 'codex',
+      correlationId: 'dup-b-corr',
+      seq: 8,
+      body: 'DUP-B-SECRET',
+      acknowledged: false,
+    });
+    const duplicate = await app.request(
+      '/api/dispatch/messages?recipient=codex&after_seq=0&limit=50'
+    );
+    expect(duplicate.status).toBe(500);
+    const duplicateBody = await duplicate.json();
+    expect(duplicateBody).toEqual({ error: 'Failed to list dispatch messages' });
+    const duplicateText = JSON.stringify(duplicateBody);
+    expect(duplicateText).not.toContain('DUP-A-SECRET');
+    expect(duplicateText).not.toContain('DUP-B-SECRET');
+    expect(duplicateText).not.toContain('next_after_seq');
+
+    await insertSyntheticDispatch({
+      id: 'unsafe-cursor',
+      recipient: 'operator',
+      correlationId: 'unsafe-cursor-corr',
+      seq: 1,
+      body: 'UNSAFE-CURSOR-SECRET',
+      acknowledged: false,
+    });
+    await db.query('UPDATE agent_dispatch_messages SET seq = $1 WHERE id = $2', [
+      '9007199254740993',
+      'unsafe-cursor',
+    ]);
+    const stored = await db.query<{ cursor_seq: unknown }>(
+      'SELECT seq AS cursor_seq FROM agent_dispatch_messages WHERE id = $1',
+      ['unsafe-cursor']
+    );
+    const storedCursor = Number(stored.rows[0]?.cursor_seq);
+    expect(Number.isFinite(storedCursor)).toBe(true);
+    expect(Number.isSafeInteger(storedCursor)).toBe(false);
+    const unsafe = await app.request(
+      '/api/dispatch/messages?recipient=operator&after_seq=0&limit=50'
+    );
+    expect(unsafe.status).toBe(500);
+    const unsafeBody = await unsafe.json();
+    expect(unsafeBody).toEqual({ error: 'Failed to list dispatch messages' });
+    const unsafeText = JSON.stringify(unsafeBody);
+    expect(unsafeText).not.toContain('UNSAFE-CURSOR-SECRET');
+    expect(unsafeText).not.toContain('9007199254740992');
+    expect(unsafeText).not.toContain('next_after_seq');
+  });
+
+  test('test121 returns own correlation replies behind unrelated history', async () => {
+    for (let index = 0; index < 501; index += 1) {
+      await insertSyntheticDispatch({
+        id: `unrelated-${index}`,
+        recipient: 'grokbot',
+        correlationId: `unrelated-${index}`,
+        seq: index + 1,
+        body: `UNRELATED-${index}`,
+        acknowledged: true,
+      });
+    }
+    await insertSyntheticDispatch({
+      id: 'own-reply-1',
+      recipient: 'grokbot',
+      correlationId: 'board-brief-target',
+      seq: 700,
+      body: 'OWN-REPLY-1',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'own-reply-2',
+      recipient: 'grokbot',
+      correlationId: 'board-brief-target',
+      seq: 701,
+      body: 'OWN-REPLY-2',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'foreign-reply',
+      recipient: 'xo',
+      correlationId: 'board-brief-target',
+      seq: 702,
+      body: 'FOREIGN-REPLY-SECRET',
+      acknowledged: false,
+    });
+    for (let index = 0; index < 501; index += 1) {
+      await insertSyntheticDispatch({
+        id: `capped-${index}`,
+        recipient: 'grokbot',
+        correlationId: 'capped-correlation',
+        seq: 1000 + index,
+        body: `CAPPED-${index}`,
+        acknowledged: false,
+      });
+    }
+
+    const app = makeApp();
+    const own = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=board-brief-target&limit=500'
+    );
+    expect(own.status).toBe(200);
+    const ownRows = (await own.json()) as Array<{ id: string; body: string }>;
+    expect(ownRows.map(row => row.id).sort()).toEqual(['own-reply-1', 'own-reply-2']);
+    expect(JSON.stringify(ownRows)).not.toContain('FOREIGN-REPLY-SECRET');
+    expect(JSON.stringify(ownRows)).not.toContain('UNRELATED-0');
+
+    const foreign = await app.request(
+      '/api/dispatch/messages?recipient=xo&correlation_id=board-brief-target&limit=500'
+    );
+    const foreignRows = (await foreign.json()) as Array<{ id: string }>;
+    expect(foreignRows.map(row => row.id)).toEqual(['foreign-reply']);
+
+    const capped = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=capped-correlation&limit=500'
+    );
+    expect(capped.status).toBe(200);
+    const cappedRows = (await capped.json()) as Array<{ id: string }>;
+    expect(Array.isArray(cappedRows)).toBe(true);
+    expect(cappedRows).toHaveLength(500);
+    expect(cappedRows.map(row => row.id)).not.toContain('capped-0');
+  });
+
+  test('test122 keeps legacy list arrays and rejects bad selectors', async () => {
+    const visible = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'legacy-visible',
+      recipient: 'codex',
+      body: 'LEGACY-VISIBLE',
+    });
+    await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'legacy-other',
+      correlation_id: 'other-corr',
+      recipient: 'operator',
+      body: 'LEGACY-OTHER',
+    });
+    const deferred = await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'legacy-deferred',
+      recipient: 'grokbot',
+      body: 'DEFERRED-BODY',
+      not_before: '2999-01-01T00:00:00.000Z',
+    });
+    const app = makeApp();
+
+    const legacy = await app.request(
+      '/api/dispatch/messages?recipient=codex&status=queued&limit=10'
+    );
+    expect(legacy.status).toBe(200);
+    const legacyRows = (await legacy.json()) as Array<{ id: string }>;
+    expect(legacyRows.map(row => row.id)).toEqual([visible.id]);
+
+    const unknownKey = await app.request('/api/dispatch/messages?recipient=codex&not_a_selector=1');
+    expect(unknownKey.status).toBe(200);
+    expect(Array.isArray(await unknownKey.json())).toBe(true);
+
+    const clamped = await app.request('/api/dispatch/messages?recipient=codex&limit=9999');
+    expect(clamped.status).toBe(200);
+    expect(Array.isArray(await clamped.json())).toBe(true);
+
+    const queued = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&status=queued&limit=50'
+    );
+    expect(await queued.json()).toEqual({ messages: [], next_after_seq: 0, page_full: false });
+    const anyStatus = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&limit=50'
+    );
+    const anyPage = (await anyStatus.json()) as { messages: Array<{ id: string }> };
+    expect(anyPage.messages.map(message => message.id)).toContain(deferred.id);
+
+    const invalidUrls = [
+      '/api/dispatch/messages?recipient=grokbot&message_id=&after_seq=0',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&correlation_id=def',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&after_seq=0',
+      '/api/dispatch/messages?message_id=abc',
+      '/api/dispatch/messages?recipient=%20%20&message_id=abc',
+      '/api/dispatch/messages?recipient=grokbot&recipient=xo&message_id=abc',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&message_id=def',
+      '/api/dispatch/messages?recipient=grokbot&message_id=',
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=-1',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=1.5',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=00',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=1e2',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=%2B1',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&limit=1',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&status=queued',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&subject_key=wo:WO-MAILBOX',
+      '/api/dispatch/messages?recipient=grokbot&message_id=abc&route_disposition=auto_surfaced',
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=abc&status=queued',
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=abc&subject_key=wo:WO-MAILBOX',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&subject_key=wo:WO-MAILBOX',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&route_disposition=auto_surfaced',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&extra=1',
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=abc&limit=0',
+      '/api/dispatch/messages?recipient=grokbot&correlation_id=abc&limit=501',
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&limit=1.2',
+    ];
+    for (const url of invalidUrls) {
+      const response = await app.request(url);
+      expect(response.status).toBe(400);
+      expect(((await response.json()) as { error: string }).error).toBe(
+        'dispatch_list_selector_invalid'
+      );
+    }
+
+    const badStatus = await app.request(
+      '/api/dispatch/messages?recipient=grokbot&after_seq=0&status=not-a-status'
+    );
+    expect(badStatus.status).toBe(400);
+    const badStatusBody = (await badStatus.json()) as { error?: string; body?: string };
+    expect(badStatusBody.body).toBeUndefined();
+    expect(JSON.stringify(badStatusBody)).not.toContain('DEFERRED-BODY');
+
+    const specResponse = await app.request('/api/openapi.json');
+    const spec = (await specResponse.json()) as {
+      paths: Record<string, { get?: { responses?: Record<string, unknown> } }>;
+      components: { schemas: Record<string, { properties?: Record<string, unknown> }> };
+    };
+    expect(spec.paths['/api/dispatch/messages']?.get?.responses?.['400']).toBeDefined();
+    expect(spec.components.schemas.DispatchMessage?.properties?.cursor_seq).toBeUndefined();
+    expect(spec.components.schemas.DispatchMessageCursorPage?.properties).toMatchObject({
+      messages: expect.anything(),
+      next_after_seq: expect.anything(),
+      page_full: expect.anything(),
+    });
+  });
+
+  test('queued after_seq holds a future row until it is due', async () => {
+    await insertSyntheticDispatch({
+      id: 'future-10',
+      recipient: 'grokbot',
+      correlationId: 'future-10-corr',
+      seq: 10,
+      body: 'FUTURE-BODY-10',
+      acknowledged: false,
+      notBefore: QUEUED_CURSOR_FUTURE,
+    });
+    await insertSyntheticDispatch({
+      id: 'ready-11',
+      recipient: 'grokbot',
+      correlationId: 'ready-11-corr',
+      seq: 11,
+      body: 'READY-BODY-11',
+      acknowledged: false,
+    });
+    const app = makeApp();
+    const blocked = await pollQueuedCursor(app, 9, 50);
+    expect(blocked).toEqual({ messages: [], next_after_seq: 9, page_full: false });
+    expect(JSON.stringify(blocked)).not.toContain('FUTURE-BODY-10');
+    expect(JSON.stringify(blocked)).not.toContain('READY-BODY-11');
+
+    await db.query('UPDATE agent_dispatch_messages SET not_before = $1 WHERE id = $2', [
+      QUEUED_CURSOR_DUE,
+      'future-10',
+    ]);
+    const delivered = await pollQueuedCursor(app, 9, 50);
+    expect(delivered.messages.map(message => message.id)).toEqual(['future-10', 'ready-11']);
+    expect(delivered.messages.map(message => message.body)).toEqual([
+      'FUTURE-BODY-10',
+      'READY-BODY-11',
+    ]);
+    expect(delivered.next_after_seq).toBe(11);
+    expect(delivered.page_full).toBe(false);
+
+    const drained = await pollQueuedCursor(app, delivered.next_after_seq, 50);
+    expect(drained).toEqual({ messages: [], next_after_seq: 11, page_full: false });
+    expect(JSON.stringify(drained)).not.toContain('FUTURE-BODY-10');
+    expect(JSON.stringify(drained)).not.toContain('READY-BODY-11');
+  });
+
+  test('queued after_seq returns the ready row before a future barrier', async () => {
+    await insertSyntheticDispatch({
+      id: 'ready-9',
+      recipient: 'grokbot',
+      correlationId: 'ready-9-corr',
+      seq: 9,
+      body: 'READY-BODY-9',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'future-10',
+      recipient: 'grokbot',
+      correlationId: 'future-10-corr',
+      seq: 10,
+      body: 'FUTURE-BODY-10',
+      acknowledged: false,
+      notBefore: QUEUED_CURSOR_FUTURE,
+    });
+    await insertSyntheticDispatch({
+      id: 'ready-11',
+      recipient: 'grokbot',
+      correlationId: 'ready-11-corr',
+      seq: 11,
+      body: 'READY-BODY-11',
+      acknowledged: false,
+    });
+    const app = makeApp();
+    const blocked = await pollQueuedCursor(app, 0, 50);
+    expect(blocked.messages.map(message => message.id)).toEqual(['ready-9']);
+    expect(blocked.messages.map(message => message.body)).toEqual(['READY-BODY-9']);
+    expect(blocked.next_after_seq).toBe(9);
+    expect(blocked.page_full).toBe(false);
+    expect(JSON.stringify(blocked)).not.toContain('FUTURE-BODY-10');
+    expect(JSON.stringify(blocked)).not.toContain('READY-BODY-11');
+
+    await db.query('UPDATE agent_dispatch_messages SET not_before = $1 WHERE id = $2', [
+      QUEUED_CURSOR_DUE,
+      'future-10',
+    ]);
+    const delivered = await pollQueuedCursor(app, blocked.next_after_seq, 50);
+    expect(delivered.messages.map(message => message.id)).toEqual(['future-10', 'ready-11']);
+    expect(delivered.next_after_seq).toBe(11);
+    expect(delivered.page_full).toBe(false);
+    expect(delivered.messages.map(message => message.id)).not.toContain('ready-9');
+  });
+
+  test('queued after_seq advances over a full page of hidden rows', async () => {
+    for (let index = 0; index < 500; index += 1) {
+      const addressed = index % 2 === 0;
+      await insertSyntheticDispatch({
+        id: `hidden-${index}`,
+        recipient: 'grokbot',
+        correlationId: `hidden-corr-${index}`,
+        seq: index + 1,
+        body: addressed ? `HIDDEN-ADDRESSED-${index}` : `HIDDEN-DISPOSED-${index}`,
+        acknowledged: false,
+        ...(addressed
+          ? { addressedAt: '2020-01-01T00:00:00.000Z' }
+          : { routeDisposition: 'auto_surfaced' }),
+      });
+    }
+    await insertSyntheticDispatch({
+      id: 'ready-501',
+      recipient: 'grokbot',
+      correlationId: 'ready-501-corr',
+      seq: 501,
+      body: 'READY-BACKLOG-501',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'foreign-hidden',
+      recipient: 'xo',
+      correlationId: 'foreign-hidden-corr',
+      seq: 250,
+      body: 'FOREIGN-CURSOR-SECRET',
+      acknowledged: false,
+    });
+    const app = makeApp();
+    const first = await pollQueuedCursor(app, 0, 500);
+    expect(first.messages).toEqual([]);
+    expect(first.page_full).toBe(true);
+    expect(first.next_after_seq).toBe(500);
+    const firstText = JSON.stringify(first);
+    expect(firstText).not.toContain('HIDDEN-ADDRESSED-0');
+    expect(firstText).not.toContain('HIDDEN-DISPOSED-1');
+    expect(firstText).not.toContain('READY-BACKLOG-501');
+    expect(firstText).not.toContain('FOREIGN-CURSOR-SECRET');
+
+    const second = await pollQueuedCursor(app, first.next_after_seq, 500);
+    expect(second.messages.map(message => message.id)).toEqual(['ready-501']);
+    expect(second.messages.map(message => message.body)).toEqual(['READY-BACKLOG-501']);
+    expect(second.page_full).toBe(false);
+    expect(second.next_after_seq).toBe(501);
+    expect(second.next_after_seq).toBeGreaterThan(first.next_after_seq);
+    const secondText = JSON.stringify(second);
+    expect(secondText).not.toContain('HIDDEN-ADDRESSED-0');
+    expect(secondText).not.toContain('HIDDEN-DISPOSED-499');
+    expect(secondText).not.toContain('FOREIGN-CURSOR-SECRET');
+  });
+
+  test('queued after_seq stops at a barrier on a full raw page boundary', async () => {
+    await insertSyntheticDispatch({
+      id: 'boundary-ready',
+      recipient: 'grokbot',
+      correlationId: 'boundary-ready-corr',
+      seq: 1,
+      body: 'BOUNDARY-READY-BODY',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'boundary-future',
+      recipient: 'grokbot',
+      correlationId: 'boundary-future-corr',
+      seq: 2,
+      body: 'BOUNDARY-FUTURE-BODY',
+      acknowledged: false,
+      notBefore: QUEUED_CURSOR_FUTURE,
+    });
+    await insertSyntheticDispatch({
+      id: 'boundary-later',
+      recipient: 'grokbot',
+      correlationId: 'boundary-later-corr',
+      seq: 3,
+      body: 'BOUNDARY-LATER-BODY',
+      acknowledged: false,
+    });
+    const page = await pollQueuedCursor(makeApp(), 0, 2);
+    expect(page.messages.map(message => message.id)).toEqual(['boundary-ready']);
+    expect(page.next_after_seq).toBe(1);
+    expect(page.page_full).toBe(false);
+    const text = JSON.stringify(page);
+    expect(text).not.toContain('BOUNDARY-FUTURE-BODY');
+    expect(text).not.toContain('BOUNDARY-LATER-BODY');
+  });
+
+  test('queued after_seq skips future addressed and route-disposed rows', async () => {
+    await insertSyntheticDispatch({
+      id: 'addressed-future',
+      recipient: 'grokbot',
+      correlationId: 'addressed-future-corr',
+      seq: 1,
+      body: 'ADDRESSED-FUTURE-BODY',
+      acknowledged: false,
+      notBefore: QUEUED_CURSOR_FUTURE,
+      addressedAt: '2020-01-01T00:00:00.000Z',
+    });
+    await insertSyntheticDispatch({
+      id: 'disposed-future',
+      recipient: 'grokbot',
+      correlationId: 'disposed-future-corr',
+      seq: 2,
+      body: 'DISPOSED-FUTURE-BODY',
+      acknowledged: false,
+      notBefore: QUEUED_CURSOR_FUTURE,
+      routeDisposition: 'expired',
+    });
+    await insertSyntheticDispatch({
+      id: 'acked-ready',
+      recipient: 'grokbot',
+      correlationId: 'acked-ready-corr',
+      seq: 3,
+      body: 'ACKED-READY-BODY',
+      acknowledged: true,
+    });
+    await insertSyntheticDispatch({
+      id: 'after-terminal',
+      recipient: 'grokbot',
+      correlationId: 'after-terminal-corr',
+      seq: 4,
+      body: 'AFTER-TERMINAL-BODY',
+      acknowledged: false,
+    });
+    const page = await pollQueuedCursor(makeApp(), 0, 50);
+    expect(page.messages.map(message => message.id)).toEqual(['acked-ready', 'after-terminal']);
+    expect(page.next_after_seq).toBe(4);
+    expect(page.page_full).toBe(false);
+    const text = JSON.stringify(page);
+    expect(text).not.toContain('ADDRESSED-FUTURE-BODY');
+    expect(text).not.toContain('DISPOSED-FUTURE-BODY');
+  });
+
+  test('queued after_seq pages ready rows and preserves an empty cursor', async () => {
+    const app = makeApp();
+    const empty = await pollQueuedCursor(app, 4, 1);
+    expect(empty).toEqual({ messages: [], next_after_seq: 4, page_full: false });
+
+    await insertSyntheticDispatch({
+      id: 'ready-a',
+      recipient: 'grokbot',
+      correlationId: 'ready-a-corr',
+      seq: 1,
+      body: 'READY-A-BODY',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'ready-b',
+      recipient: 'grokbot',
+      correlationId: 'ready-b-corr',
+      seq: 2,
+      body: 'READY-B-BODY',
+      acknowledged: false,
+    });
+    const first = await pollQueuedCursor(app, 0, 1);
+    expect(first.messages.map(message => message.id)).toEqual(['ready-a']);
+    expect(first.page_full).toBe(true);
+    expect(first.next_after_seq).toBe(1);
+    const second = await pollQueuedCursor(app, first.next_after_seq, 1);
+    expect(second.messages.map(message => message.id)).toEqual(['ready-b']);
+    expect(second.page_full).toBe(true);
+    expect(second.next_after_seq).toBeGreaterThan(first.next_after_seq);
+    const third = await pollQueuedCursor(app, second.next_after_seq, 1);
+    expect(third).toEqual({
+      messages: [],
+      next_after_seq: second.next_after_seq,
+      page_full: false,
+    });
+    expect(
+      [...first.messages, ...second.messages, ...third.messages].map(message => message.id)
+    ).toEqual(['ready-a', 'ready-b']);
+  });
+
+  test('queued after_seq fails closed when not_before is unparseable', async () => {
+    await insertSyntheticDispatch({
+      id: 'ready-before-bad',
+      recipient: 'grokbot',
+      correlationId: 'ready-before-bad-corr',
+      seq: 1,
+      body: 'READY-BEFORE-BAD-BODY',
+      acknowledged: false,
+    });
+    await insertSyntheticDispatch({
+      id: 'malformed-delay',
+      recipient: 'grokbot',
+      correlationId: 'malformed-delay-corr',
+      seq: 2,
+      body: 'MALFORMED-DELAY-BODY',
+      acknowledged: false,
+      notBefore: 'not-a-date',
+    });
+    const app = makeApp();
+    const url = '/api/dispatch/messages?recipient=grokbot&status=queued&after_seq=0&limit=50';
+    const first = await app.request(url);
+    expect(first.status).toBe(500);
+    expect(await first.json()).toEqual({ error: 'dispatch_not_before_unparseable' });
+    const second = await app.request(url);
+    expect(second.status).toBe(500);
+    expect(await second.json()).toEqual({ error: 'dispatch_not_before_unparseable' });
+    const stored = await db.query<{ not_before: string | null }>(
+      'SELECT not_before FROM agent_dispatch_messages WHERE id = $1',
+      ['malformed-delay']
+    );
+    expect(stored.rows[0]?.not_before).toBe('not-a-date');
+  });
+
+  test('test129 rejects duplicated legacy list filters with the historical validation body', async () => {
+    await createMessage({
+      ...VALID_BODY,
+      idempotency_key: 'legacy-dup-visible',
+      recipient: 'codex',
+      body: 'LEGACY-DUP-VISIBLE',
+    });
+    const app = makeApp('synthetic-operator-token');
+    const headers = { 'x-archon-operator-token': 'synthetic-operator-token' };
+    const duplicates = [
+      {
+        url: '/api/dispatch/messages?recipient=codex&recipient=xo',
+        error: 'recipient: Expected string, received array',
+      },
+      {
+        url: '/api/dispatch/messages?recipient=codex&status=queued&status=done',
+        error:
+          "status: Expected 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled', received array",
+      },
+      {
+        url: '/api/dispatch/messages?recipient=codex&limit=10&limit=20',
+        error: 'limit: Expected string, received array',
+      },
+      {
+        url: '/api/dispatch/messages?recipient=codex&subject_key=wo:WO-MAILBOX&subject_key=other',
+        error: 'subject_key: Expected string, received array',
+      },
+      {
+        url: '/api/dispatch/messages?recipient=codex&route_disposition=auto_surfaced&route_disposition=expired',
+        error:
+          "route_disposition: Expected 'unroutable' | 'superseded' | 'expired' | 'auto_surfaced', received array",
+      },
+    ];
+    for (const item of duplicates) {
+      const response = await app.request(item.url, { headers });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: item.error });
+    }
+
+    const unknown = await app.request(
+      '/api/dispatch/messages?recipient=codex&not_a_selector=1&not_a_selector=2',
+      { headers }
+    );
+    expect(unknown.status).toBe(200);
+    expect(Array.isArray(await unknown.json())).toBe(true);
+  });
+
+  test('test124 config does not activate inactive companion principals', async () => {
+    const seeded = await db.query<{
+      principal_id: string;
+      active: number;
+      delivery_mode: string;
+    }>(
+      `SELECT principal_id, active, delivery_mode
+       FROM dispatch_principals
+       WHERE principal_id IN ('dot', 'duet', 'grokbot', 'muse')
+       ORDER BY principal_id`
+    );
+    expect(seeded.rows).toEqual([
+      { principal_id: 'dot', active: 0, delivery_mode: 'drain_on_start' },
+      { principal_id: 'duet', active: 0, delivery_mode: 'drain_on_start' },
+      { principal_id: 'grokbot', active: 1, delivery_mode: 'drain_on_start' },
+      { principal_id: 'muse', active: 0, delivery_mode: 'drain_on_start' },
+    ]);
+
+    const app = makeApp('secret-token');
+    for (const recipient of ['dot', 'muse', 'duet']) {
+      const rejected = await app.request('/api/dispatch/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-archon-operator-token': 'secret-token' },
+        body: JSON.stringify({
+          ...VALID_BODY,
+          idempotency_key: `inactive-${recipient}`,
+          recipient,
+          body: `delivery to inactive ${recipient}`,
+        }),
+      });
+      expect(rejected.status).toBe(400);
+      expect(((await rejected.json()) as { error: string }).error).toBe(
+        'dispatch_recipient_rejected:inactive_principal'
+      );
+    }
+
+    const slotDir = await mkdtemp(join(tmpdir(), 'companion-configured-slot-'));
+    try {
+      const slotIds = ['dot', 'muse', 'duet', 'synth-active-slot'] as const;
+      const slotTokens = Object.fromEntries(slotIds.map(id => [id, `token-for-${id}`])) as Record<
+        (typeof slotIds)[number],
+        string
+      >;
+      const slots = [];
+      for (const id of slotIds) {
+        const credentialFile = join(slotDir, `${id}.dispatch`);
+        const digestFile = join(slotDir, `${id}.sha256`);
+        await writeFile(credentialFile, `${slotTokens[id]}\n`);
+        await writeFile(digestFile, `${sha(`bearer-for-${id}`)}\n`);
+        slots.push({
+          companion_id: id,
+          enabled: true,
+          dispatch_principal_id: id,
+          token_sha256_file: digestFile,
+          token_expires_at: '2099-01-01T00:00:00.000Z',
+          dispatch_credential_file: credentialFile,
+          tools: [...BASE_TOOL_NAMES],
+          allowed_recipients: ['astra'],
+          board_secretary: false,
+          board_seat_recipients: ['astra'],
+        });
+      }
+      const configPath = join(slotDir, 'companions.json');
+      await writeFile(configPath, JSON.stringify({ slots }));
+      const loaded = loadCompanionRegistry(configPath);
+      expect(loaded.slots.map(slot => [slot.companion_id, slot.enabled])).toEqual(
+        slotIds.map(id => [id, true])
+      );
+      for (const id of slotIds) {
+        const slot = loaded.byPrincipal.get(id);
+        expect(slot?.enabled).toBe(true);
+        expect((await readFile(slot?.dispatch_credential_file ?? '', 'utf8')).trim()).toBe(
+          slotTokens[id]
+        );
+      }
+
+      const afterConfig = await db.query<{ principal_id: string; active: number }>(
+        `SELECT principal_id, active FROM dispatch_principals
+         WHERE principal_id IN ('dot', 'muse', 'duet')
+         ORDER BY principal_id`
+      );
+      expect(afterConfig.rows).toEqual([
+        { principal_id: 'dot', active: 0 },
+        { principal_id: 'duet', active: 0 },
+        { principal_id: 'muse', active: 0 },
+      ]);
+
+      const priorRegistry = JSON.parse(process.env.DISPATCH_PRINCIPALS_JSON ?? '[]') as unknown[];
+      process.env.DISPATCH_SENDER_AUTH_MODE = 'enforce';
+      process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify([
+        ...priorRegistry,
+        ...slotIds.map(id => ({
+          credential_id: `configured-${id}`,
+          principal_id: id,
+          token_sha256: sha(slotTokens[id]),
+          status: 'active',
+          send_as: [id],
+          receive_as: [id],
+          roles: ['send', 'receive'],
+        })),
+      ]);
+
+      async function postSlot(
+        principalId: string,
+        token: string | undefined,
+        idempotencyKey: string
+      ): Promise<Response> {
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'x-archon-operator-token': 'secret-token',
+        };
+        if (token !== undefined) {
+          headers['x-dispatch-principal-id'] = principalId;
+          headers['x-dispatch-principal-token'] = token;
+        }
+        return app.request('/api/dispatch/messages', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            ...VALID_BODY,
+            sender: principalId,
+            recipient: principalId,
+            idempotency_key: idempotencyKey,
+            body: `synthetic delivery for ${principalId}`,
+          }),
+        });
+      }
+
+      for (const recipient of ['dot', 'muse', 'duet'] as const) {
+        const rejected = await postSlot(
+          recipient,
+          slotTokens[recipient],
+          `configured-${recipient}`
+        );
+        expect(rejected.status).toBe(400);
+        expect(((await rejected.json()) as { error: string }).error).toBe(
+          'dispatch_recipient_rejected:inactive_principal'
+        );
+      }
+
+      await db.query(
+        `INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
+         VALUES ('synth-active-slot', 'Synthetic active slot', 'drain_on_start', 0)`
+      );
+      const inactiveSynth = await postSlot(
+        'synth-active-slot',
+        slotTokens['synth-active-slot'],
+        'synth-inactive-configured'
+      );
+      expect(inactiveSynth.status).toBe(400);
+      expect(((await inactiveSynth.json()) as { error: string }).error).toBe(
+        'dispatch_recipient_rejected:inactive_principal'
+      );
+
+      await db.query(
+        `UPDATE dispatch_principals SET active = 1 WHERE principal_id = 'synth-active-slot'`
+      );
+      const operatorOnly = await postSlot(
+        'synth-active-slot',
+        undefined,
+        'synth-operator-token-only'
+      );
+      expect(operatorOnly.status).toBe(401);
+      expect(((await operatorOnly.json()) as { error: string }).error).toBe(
+        'dispatch_principal_missing'
+      );
+      const wrongCredential = await postSlot(
+        'synth-active-slot',
+        'not-the-slot-credential',
+        'synth-wrong-credential'
+      );
+      expect(wrongCredential.status).toBe(401);
+      expect(((await wrongCredential.json()) as { error: string }).error).toBe(
+        'dispatch_principal_unauthorized'
+      );
+
+      const accepted = await postSlot(
+        'synth-active-slot',
+        (await readFile(join(slotDir, 'synth-active-slot.dispatch'), 'utf8')).trim(),
+        'synth-active-create'
+      );
+      expect(accepted.status).toBe(200);
+      expect((await accepted.json()) as { recipient: string; sender_principal_id: string }).toEqual(
+        expect.objectContaining({
+          recipient: 'synth-active-slot',
+          sender: 'synth-active-slot',
+          sender_principal_id: 'synth-active-slot',
+        })
+      );
+
+      const stillInactive = await db.query<{ principal_id: string; active: number }>(
+        `SELECT principal_id, active FROM dispatch_principals
+         WHERE principal_id IN ('dot', 'muse', 'duet')
+         ORDER BY principal_id`
+      );
+      expect(stillInactive.rows).toEqual([
+        { principal_id: 'dot', active: 0 },
+        { principal_id: 'duet', active: 0 },
+        { principal_id: 'muse', active: 0 },
+      ]);
+      expect((await db.query('SELECT id FROM agent_dispatch_messages')).rowCount).toBe(1);
+    } finally {
+      await rm(slotDir, { recursive: true, force: true });
+    }
+  });
+
+  describe('principal-only ordinary mail transport', () => {
+    const grokbotToken = 'grokbot-token';
+    const sendOnlyToken = 'grokbot-send-only-token';
+    const receiveOnlyToken = 'grokbot-receive-only-token';
+    const foreignSendToken = 'foreign-send-token';
+    const disabledToken = 'disabled-token';
+    const aliasToken = 'alias-token';
+    const accessHost = 'ops.example.test';
+    const accessEmail = 'operator@example.test';
+    const ownBody = 'OWN-ROUND-TRIP-BODY';
+    const foreignBody = 'FOREIGN-MAILBOX-BODY';
+    const aliasBody = 'ALIAS-MAILBOX-BODY';
+    const boardAliasBody = 'BOARD-ALIAS-FOREIGN-BODY';
+
+    function record(input: {
+      credential_id: string;
+      principal_id: string;
+      token: string;
+      status?: 'active' | 'retiring' | 'disabled';
+      send_as: string[];
+      receive_as: string[];
+      roles: string[];
+    }): {
+      credential_id: string;
+      principal_id: string;
+      token_sha256: string;
+      status: string;
+      send_as: string[];
+      receive_as: string[];
+      roles: string[];
+    } {
+      return {
+        credential_id: input.credential_id,
+        principal_id: input.principal_id,
+        token_sha256: sha(input.token),
+        status: input.status ?? 'active',
+        send_as: input.send_as,
+        receive_as: input.receive_as,
+        roles: input.roles,
+      };
+    }
+
+    function useRegistry(
+      records: Array<{
+        credential_id: string;
+        principal_id: string;
+        token_sha256: string;
+        status: string;
+        send_as: string[];
+        receive_as: string[];
+        roles: string[];
+      }>
+    ): void {
+      process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify(records);
+    }
+
+    function fullGrokbot() {
+      return record({
+        credential_id: 'grokbot-active',
+        principal_id: 'grokbot',
+        token: grokbotToken,
+        send_as: ['grokbot'],
+        receive_as: ['grokbot'],
+        roles: ['send', 'receive'],
+      });
+    }
+
+    function principalHeaders(
+      principalId: string | undefined,
+      token: string | undefined,
+      extra: Record<string, string> = {}
+    ): Record<string, string> {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        ...extra,
+      };
+      if (principalId !== undefined) headers['x-dispatch-principal-id'] = principalId;
+      if (token !== undefined) headers['x-dispatch-principal-token'] = token;
+      return headers;
+    }
+
+    function enableMatchingAccess(): void {
+      process.env.ARCHON_OPERATOR_ACCESS_HOSTS = accessHost;
+      process.env.ARCHON_OPERATOR_EMAILS = accessEmail;
+    }
+
+    function clearMatchingAccess(): void {
+      delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+      delete process.env.ARCHON_OPERATOR_EMAILS;
+    }
+
+    function matchingAccessHeaders(extra: Record<string, string> = {}): Record<string, string> {
+      return {
+        Host: accessHost,
+        'Cf-Access-Authenticated-User-Email': accessEmail,
+        ...extra,
+      };
+    }
+
+    async function messageCount(): Promise<number> {
+      return (await db.query('SELECT id FROM agent_dispatch_messages')).rowCount;
+    }
+
+    async function readError(response: Response): Promise<{ error: string; text: string }> {
+      const text = await response.text();
+      let error = '';
+      try {
+        const parsed = JSON.parse(text) as { error?: string };
+        error = parsed.error ?? '';
+      } catch {
+        error = text;
+      }
+      return { error, text };
+    }
+
+    function expectNoSecret(text: string, token: string): void {
+      expect(text.includes(token)).toBe(false);
+      expect(text.includes(sha(token))).toBe(false);
+    }
+
+    function listUrl(query: Record<string, string | string[]>): string {
+      const params = new URLSearchParams();
+      for (const [key, value] of Object.entries(query)) {
+        const items = Array.isArray(value) ? value : [value];
+        for (const item of items) params.append(key, item);
+      }
+      const encoded = params.toString();
+      return encoded.length > 0 ? `/api/dispatch/messages?${encoded}` : '/api/dispatch/messages';
+    }
+
+    async function postMessage(
+      app: OpenAPIHono,
+      headers: Record<string, string>,
+      overrides: Record<string, unknown>
+    ): Promise<Response> {
+      return app.request('/api/dispatch/messages', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          ...VALID_BODY,
+          sender: 'grokbot',
+          recipient: 'grokbot',
+          body: ownBody,
+          ...overrides,
+        }),
+      });
+    }
+
+    test('principal_only_round_trip', async () => {
+      useRegistry([fullGrokbot()]);
+      delete process.env.DISPATCH_SENDER_AUTH_MODE;
+      const app = makeApp('secret-token');
+      const headers = principalHeaders('grokbot', grokbotToken);
+      const created = await postMessage(app, headers, { idempotency_key: 'principal-round-trip' });
+      expect(created.status).toBe(200);
+      const message = (await created.json()) as {
+        id: string;
+        sender: string;
+        sender_principal_id: string | null;
+        recipient: string;
+        body: string;
+      };
+      expect(message.sender).toBe('grokbot');
+      expect(message.sender_principal_id).toBe('grokbot');
+      expect(message.recipient).toBe('grokbot');
+      expect(message.body).toBe(ownBody);
+
+      const repeat = await postMessage(app, headers, {
+        idempotency_key: 'principal-round-trip',
+        body: 'DIFFERENT-BODY-SHOULD-NOT-PERSIST',
+      });
+      expect(repeat.status).toBe(200);
+      const repeated = (await repeat.json()) as { id: string; body: string };
+      expect(repeated.id).toBe(message.id);
+      expect(repeated.body).toBe(ownBody);
+      expect(
+        (
+          await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+            'principal-round-trip',
+          ])
+        ).rowCount
+      ).toBe(1);
+
+      const listed = await app.request(listUrl({ recipient: 'grokbot' }), { headers });
+      expect(listed.status).toBe(200);
+      const inbox = (await listed.json()) as Array<{ id: string; body: string }>;
+      expect(Array.isArray(inbox)).toBe(true);
+      expect(inbox.map(row => row.id)).toEqual([message.id]);
+      expect(inbox[0]?.body).toBe(ownBody);
+
+      const ack = await app.request(`/api/dispatch/messages/${message.id}/ack`, {
+        method: 'POST',
+        headers,
+        body: '{}',
+      });
+      expect(ack.status).toBe(200);
+      const receipt = (await ack.json()) as {
+        acknowledged_by: string;
+        acknowledged_at: string | null;
+        status: string;
+      };
+      expect(receipt.acknowledged_by).toBe('grokbot');
+      expect(receipt.acknowledged_at).not.toBeNull();
+      expect(receipt.status).toBe('queued');
+
+      const ackAgain = await app.request(`/api/dispatch/messages/${message.id}/ack`, {
+        method: 'POST',
+        headers,
+        body: '{}',
+      });
+      expect(ackAgain.status).toBe(200);
+      const secondReceipt = (await ackAgain.json()) as { acknowledged_at: string | null };
+      expect(secondReceipt.acknowledged_at).toBe(receipt.acknowledged_at);
+      const stored = await storedReceipt(message.id);
+      expect(stored.acknowledged_by).toBe('grokbot');
+      expect(stored.acknowledged_at).toBe(receipt.acknowledged_at);
+      expect(stored.addressed_by).toBeNull();
+      expect(stored.status).toBe('queued');
+    });
+
+    test('credentials_and_send_scope', async () => {
+      const app = makeApp('secret-token');
+      const privilegedTypes = ['run_review', 'draft_spec', 'run_report', 'board_motion'] as const;
+
+      for (const mode of ['off', 'warn', 'enforce'] as const) {
+        process.env.DISPATCH_SENDER_AUTH_MODE = mode;
+        for (const withAccess of [false, true]) {
+          if (withAccess) enableMatchingAccess();
+          else clearMatchingAccess();
+          const extra = withAccess ? matchingAccessHeaders() : {};
+          useRegistry([fullGrokbot()]);
+          const before = await messageCount();
+
+          const missing = await postMessage(
+            app,
+            { 'Content-Type': 'application/json', ...extra },
+            {
+              idempotency_key: `missing-${mode}-${String(withAccess)}`,
+            }
+          );
+          if (!withAccess) {
+            const missingBody = await readError(missing);
+            expect(missing.status).toBe(401);
+            expect(missingBody.error).toBe('Missing or invalid operator token');
+            expectNoSecret(missingBody.text, grokbotToken);
+          } else if (mode === 'enforce') {
+            const missingBody = await readError(missing);
+            expect(missing.status).toBe(401);
+            expect(missingBody.error).toBe('dispatch_principal_missing');
+            expectNoSecret(missingBody.text, grokbotToken);
+          } else {
+            expect(missing.status).toBe(200);
+            expect(
+              ((await missing.json()) as { sender_principal_id: string | null }).sender_principal_id
+            ).toBeNull();
+          }
+
+          const emptyHeaders = new Headers({
+            'Content-Type': 'application/json',
+            ...(withAccess ? matchingAccessHeaders() : {}),
+          });
+          emptyHeaders.set('x-dispatch-principal-id', '');
+          emptyHeaders.set('x-dispatch-principal-token', '');
+          const empty = await app.request('/api/dispatch/messages', {
+            method: 'POST',
+            headers: emptyHeaders,
+            body: JSON.stringify({
+              ...VALID_BODY,
+              sender: 'grokbot',
+              recipient: 'grokbot',
+              body: ownBody,
+              idempotency_key: `empty-${mode}-${String(withAccess)}`,
+            }),
+          });
+          const emptyBody = await readError(empty);
+          expect(empty.status).toBe(401);
+          expect(emptyBody.error).toBe('dispatch_principal_missing');
+          expectNoSecret(emptyBody.text, grokbotToken);
+
+          const partial = await postMessage(app, principalHeaders('grokbot', undefined, extra), {
+            idempotency_key: `partial-${mode}-${String(withAccess)}`,
+          });
+          const partialBody = await readError(partial);
+          expect(partial.status).toBe(401);
+          expect(partialBody.error).toBe('dispatch_principal_partial');
+          expectNoSecret(partialBody.text, grokbotToken);
+
+          const invalid = await postMessage(
+            app,
+            principalHeaders('grokbot', 'not-the-token', extra),
+            { idempotency_key: `invalid-${mode}-${String(withAccess)}` }
+          );
+          const invalidBody = await readError(invalid);
+          expect(invalid.status).toBe(401);
+          expect(invalidBody.error).toBe('dispatch_principal_unauthorized');
+          expectNoSecret(invalidBody.text, 'not-the-token');
+
+          useRegistry([
+            record({
+              credential_id: 'grokbot-disabled',
+              principal_id: 'grokbot',
+              token: disabledToken,
+              status: 'disabled',
+              send_as: ['grokbot'],
+              receive_as: ['grokbot'],
+              roles: ['send', 'receive'],
+            }),
+          ]);
+          const disabled = await postMessage(
+            app,
+            principalHeaders('grokbot', disabledToken, extra),
+            { idempotency_key: `disabled-${mode}-${String(withAccess)}` }
+          );
+          const disabledBody = await readError(disabled);
+          expect(disabled.status).toBe(401);
+          expect(disabledBody.error).toBe('dispatch_principal_unauthorized');
+          expectNoSecret(disabledBody.text, disabledToken);
+          expect(disabledBody.text.includes('dispatch_principal_disabled')).toBe(false);
+
+          useRegistry([
+            record({
+              credential_id: 'grokbot-receive-only',
+              principal_id: 'grokbot',
+              token: receiveOnlyToken,
+              send_as: ['grokbot'],
+              receive_as: ['grokbot'],
+              roles: ['receive'],
+            }),
+          ]);
+          const receiveOnly = await postMessage(
+            app,
+            principalHeaders('grokbot', receiveOnlyToken, extra),
+            { idempotency_key: `receive-only-${mode}-${String(withAccess)}` }
+          );
+          const receiveOnlyBody = await readError(receiveOnly);
+          expect(receiveOnly.status).toBe(403);
+          expect(receiveOnlyBody.error).toBe('dispatch_principal_forbidden');
+          expectNoSecret(receiveOnlyBody.text, receiveOnlyToken);
+
+          useRegistry([
+            record({
+              credential_id: 'foreign-send',
+              principal_id: 'grokbot',
+              token: foreignSendToken,
+              send_as: ['codex'],
+              receive_as: ['grokbot'],
+              roles: ['send', 'receive'],
+            }),
+          ]);
+          const foreignSend = await postMessage(
+            app,
+            principalHeaders('grokbot', foreignSendToken, extra),
+            { idempotency_key: `foreign-send-${mode}-${String(withAccess)}` }
+          );
+          const foreignSendBody = await readError(foreignSend);
+          expect(foreignSend.status).toBe(403);
+          expect(foreignSendBody.error).toBe('dispatch_sender_selector_forbidden');
+          expectNoSecret(foreignSendBody.text, foreignSendToken);
+
+          useRegistry([fullGrokbot()]);
+          const headers = principalHeaders('grokbot', grokbotToken, extra);
+          for (const taskType of privilegedTypes) {
+            const denied = await postMessage(app, headers, {
+              task_type: taskType,
+              idempotency_key: `priv-${taskType}-${mode}-${String(withAccess)}`,
+              recipient: 'grokbot',
+            });
+            const deniedBody = await readError(denied);
+            expect(denied.status).toBe(403);
+            expect(deniedBody.error).toBe('dispatch_principal_forbidden');
+            expectNoSecret(deniedBody.text, grokbotToken);
+          }
+          const petition = await postMessage(app, headers, {
+            task_type: 'agent_message',
+            recipient: 'board',
+            idempotency_key: `petition-${mode}-${String(withAccess)}`,
+          });
+          const petitionBody = await readError(petition);
+          expect(petition.status).toBe(403);
+          expect(petitionBody.error).toBe('dispatch_principal_forbidden');
+
+          const statusRoute = await app.request('/api/dispatch/status', { headers });
+          const statusBody = await readError(statusRoute);
+          expect(statusRoute.status).toBe(403);
+          expect(statusBody.error).toBe('dispatch_principal_forbidden');
+
+          const nearMiss = await app.request('/api/dispatch/messages/not-ack', {
+            method: 'POST',
+            headers,
+            body: '{}',
+          });
+          expect(nearMiss.status).toBe(403);
+          expect((await readError(nearMiss)).error).toBe('dispatch_principal_forbidden');
+
+          const allowed = await postMessage(app, headers, {
+            idempotency_key: `allowed-${mode}-${String(withAccess)}`,
+          });
+          expect(allowed.status).toBe(200);
+          expect(
+            ((await allowed.json()) as { sender_principal_id: string | null }).sender_principal_id
+          ).toBe('grokbot');
+
+          const deniedKeys = [
+            `empty-${mode}-${String(withAccess)}`,
+            `partial-${mode}-${String(withAccess)}`,
+            `invalid-${mode}-${String(withAccess)}`,
+            `disabled-${mode}-${String(withAccess)}`,
+            `receive-only-${mode}-${String(withAccess)}`,
+            `foreign-send-${mode}-${String(withAccess)}`,
+            ...privilegedTypes.map(taskType => `priv-${taskType}-${mode}-${String(withAccess)}`),
+            `petition-${mode}-${String(withAccess)}`,
+          ];
+          for (const key of deniedKeys) {
+            expect(
+              (
+                await db.query(
+                  'SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1',
+                  [key]
+                )
+              ).rowCount
+            ).toBe(0);
+          }
+          if (!withAccess || mode === 'enforce') {
+            expect(await messageCount()).toBe(before + 1);
+          } else {
+            expect(await messageCount()).toBe(before + 2);
+          }
+        }
+      }
+
+      clearMatchingAccess();
+      useRegistry([fullGrokbot()]);
+      process.env.DISPATCH_SENDER_AUTH_MODE = 'off';
+      const wrongOperator = principalHeaders('grokbot', grokbotToken, {
+        'x-archon-operator-token': 'wrong-token',
+      });
+      const stillPrincipal = await postMessage(app, wrongOperator, {
+        task_type: 'run_report',
+        idempotency_key: 'wrong-operator-run-report',
+      });
+      expect(stillPrincipal.status).toBe(403);
+      expect((await readError(stillPrincipal)).error).toBe('dispatch_principal_forbidden');
+
+      const options = await app.request('/api/dispatch/messages', {
+        method: 'OPTIONS',
+        headers: principalHeaders('grokbot', grokbotToken),
+      });
+      expect(options.status).not.toBe(401);
+      expect(options.status).not.toBe(403);
+    });
+
+    test('receive_scope_and_selectors', async () => {
+      useRegistry([fullGrokbot()]);
+      delete process.env.DISPATCH_SENDER_AUTH_MODE;
+      const app = makeApp('secret-token');
+      const headers = principalHeaders('grokbot', grokbotToken);
+      const subjectKey = 'gh:thinmansoftware/bdc-harness#1377';
+      const created = await postMessage(app, headers, {
+        idempotency_key: 'selector-own',
+        correlation_id: 'principal-corr',
+        subject_key: subjectKey,
+      });
+      expect(created.status).toBe(200);
+      const own = (await created.json()) as { id: string };
+      const second = await postMessage(app, headers, {
+        idempotency_key: 'selector-own-2',
+        correlation_id: 'principal-corr',
+        body: 'SECOND-OWN-BODY',
+      });
+      expect(second.status).toBe(200);
+      const secondMessage = (await second.json()) as { id: string };
+      await db.query('UPDATE agent_dispatch_messages SET status = $2 WHERE id = $1', [
+        secondMessage.id,
+        'done',
+      ]);
+      await createMessage({
+        ...VALID_BODY,
+        sender: 'xo',
+        recipient: 'codex',
+        body: foreignBody,
+        idempotency_key: 'selector-foreign',
+        correlation_id: 'foreign-corr',
+      });
+      const foreign = await db.query<{ id: string }>(
+        'SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1',
+        ['selector-foreign']
+      );
+      const foreignId = foreign.rows[0]?.id ?? '';
+      expect(foreignId).not.toBe('');
+
+      process.env.DISPATCH_WORKER_CREDENTIALS_JSON = JSON.stringify([
+        {
+          credential_id: 'board-worker-1',
+          worker_id: 'worker-a',
+          role: 'board_delivery_worker',
+          allowed_principals: ['grokbot'],
+          token_sha256: sha('worker-secret'),
+          status: 'active',
+        },
+      ]);
+      await seedXoHolderLease('grokbot');
+      await insertSyntheticDispatch({
+        id: 'board-alias-foreign',
+        recipient: 'codex',
+        correlationId: 'board-alias-corr',
+        seq: 80,
+        body: boardAliasBody,
+        acknowledged: false,
+      });
+      await db.query(
+        "UPDATE agent_dispatch_messages SET recipient_alias = 'board' WHERE id = 'board-alias-foreign'"
+      );
+
+      for (const withAccess of [false, true]) {
+        if (withAccess) enableMatchingAccess();
+        else clearMatchingAccess();
+        const requestHeaders = principalHeaders(
+          'grokbot',
+          grokbotToken,
+          withAccess ? matchingAccessHeaders() : {}
+        );
+        const workerHeaders = {
+          ...requestHeaders,
+          'x-dispatch-worker-credential-id': 'board-worker-1',
+          'x-dispatch-worker-token': 'worker-secret',
+          'x-dispatch-worker-id': 'worker-a',
+        };
+
+        const ownList = await app.request(listUrl({ recipient: 'grokbot' }), {
+          headers: requestHeaders,
+        });
+        expect(ownList.status).toBe(200);
+        const ownRows = (await ownList.json()) as Array<{ id: string; body: string }>;
+        expect(Array.isArray(ownRows)).toBe(true);
+        expect(ownRows.map(row => row.id)).toContain(own.id);
+        expect(ownRows.map(row => row.id)).not.toContain(foreignId);
+        expect(ownRows.map(row => row.id)).not.toContain('board-alias-foreign');
+        expect(JSON.stringify(ownRows).includes(foreignBody)).toBe(false);
+        expect(JSON.stringify(ownRows).includes(boardAliasBody)).toBe(false);
+
+        const encoded = await app.request(listUrl({ recipient: 'GrokBot' }), {
+          headers: requestHeaders,
+        });
+        expect(encoded.status).toBe(200);
+        expect(((await encoded.json()) as Array<{ id: string }>).map(row => row.id)).toContain(
+          own.id
+        );
+
+        const subjectList = await app.request(
+          listUrl({ recipient: 'grokbot', subject_key: subjectKey }),
+          { headers: requestHeaders }
+        );
+        expect(subjectList.status).toBe(200);
+        expect(((await subjectList.json()) as Array<{ id: string }>).map(row => row.id)).toEqual([
+          own.id,
+        ]);
+
+        const doneList = await app.request(listUrl({ recipient: 'grokbot', status: 'done' }), {
+          headers: requestHeaders,
+        });
+        expect(doneList.status).toBe(200);
+        expect(((await doneList.json()) as Array<{ id: string }>).map(row => row.id)).toEqual([
+          secondMessage.id,
+        ]);
+
+        const limited = await app.request(listUrl({ recipient: 'grokbot', limit: '1' }), {
+          headers: requestHeaders,
+        });
+        expect(limited.status).toBe(200);
+        const limitedRows = (await limited.json()) as Array<{ id: string }>;
+        expect(limitedRows).toHaveLength(1);
+        expect(limitedRows[0]?.id).not.toBe(foreignId);
+
+        const byId = await app.request(listUrl({ recipient: 'grokbot', message_id: own.id }), {
+          headers: requestHeaders,
+        });
+        expect(byId.status).toBe(200);
+        expect((await byId.json()) as Array<{ id: string }>).toEqual([
+          expect.objectContaining({ id: own.id }),
+        ]);
+
+        const foreignById = await app.request(
+          listUrl({ recipient: 'grokbot', message_id: foreignId }),
+          { headers: requestHeaders }
+        );
+        expect(foreignById.status).toBe(200);
+        const foreignByIdBody = await foreignById.text();
+        expect(JSON.parse(foreignByIdBody)).toEqual([]);
+        expect(foreignByIdBody.includes(foreignBody)).toBe(false);
+
+        const unknownById = await app.request(
+          listUrl({ recipient: 'grokbot', message_id: 'missing-message-id' }),
+          { headers: requestHeaders }
+        );
+        expect(unknownById.status).toBe(200);
+        expect(await unknownById.json()).toEqual([]);
+
+        const byCorrelation = await app.request(
+          listUrl({ recipient: 'grokbot', correlation_id: 'principal-corr' }),
+          { headers: requestHeaders }
+        );
+        expect(byCorrelation.status).toBe(200);
+        const correlationRows = (await byCorrelation.json()) as Array<{ id: string }>;
+        expect(Array.isArray(correlationRows)).toBe(true);
+        expect(correlationRows.map(row => row.id)).toEqual(
+          expect.arrayContaining([own.id, secondMessage.id])
+        );
+
+        const correlationLimited = await app.request(
+          listUrl({ recipient: 'grokbot', correlation_id: 'principal-corr', limit: '1' }),
+          { headers: requestHeaders }
+        );
+        expect(correlationLimited.status).toBe(200);
+        expect((await correlationLimited.json()) as unknown[]).toHaveLength(1);
+
+        const foreignCorrelation = await app.request(
+          listUrl({ recipient: 'grokbot', correlation_id: 'foreign-corr' }),
+          { headers: requestHeaders }
+        );
+        expect(foreignCorrelation.status).toBe(200);
+        const foreignCorrelationText = await foreignCorrelation.text();
+        expect(JSON.parse(foreignCorrelationText)).toEqual([]);
+        expect(foreignCorrelationText.includes(foreignBody)).toBe(false);
+
+        const cursor = await app.request(
+          listUrl({ recipient: 'grokbot', after_seq: '0', limit: '1' }),
+          { headers: requestHeaders }
+        );
+        expect(cursor.status).toBe(200);
+        const cursorBody = (await cursor.json()) as {
+          messages: Array<{ id: string }>;
+          next_after_seq: number;
+          page_full: boolean;
+        };
+        expect(Array.isArray(cursorBody.messages)).toBe(true);
+        expect(cursorBody.messages).toHaveLength(1);
+        expect(typeof cursorBody.next_after_seq).toBe('number');
+        expect(cursorBody.page_full).toBe(true);
+        expect(cursorBody.messages[0]?.id).not.toBe(foreignId);
+
+        const aliasList = await app.request(listUrl({ recipient: 'grokbot', status: 'queued' }), {
+          headers: workerHeaders,
+        });
+        expect(aliasList.status).toBe(200);
+        const aliasText = await aliasList.text();
+        expect(aliasText.includes('board-alias-foreign')).toBe(false);
+        expect(aliasText.includes(boardAliasBody)).toBe(false);
+
+        const refusals: Array<{ url: string; token?: string }> = [
+          { url: '/api/dispatch/messages' },
+          { url: listUrl({ recipient: '' }) },
+          { url: listUrl({ recipient: '   ' }) },
+          { url: listUrl({ recipient: ['grokbot', 'codex'] }) },
+          { url: listUrl({ recipient: ['grokbot', 'grokbot'], message_id: own.id }) },
+          { url: listUrl({ recipient: 'codex', message_id: own.id }) },
+          { url: listUrl({ recipient: 'board', status: 'queued' }) },
+          { url: listUrl({ recipient: 'grokbot2' }) },
+          { url: listUrl({ recipient: 'grokbot', message_id: own.id }), token: sendOnlyToken },
+        ];
+        for (const refusal of refusals) {
+          const refusalHeaders =
+            refusal.token === undefined
+              ? requestHeaders
+              : principalHeaders(
+                  'grokbot',
+                  refusal.token,
+                  withAccess ? matchingAccessHeaders() : {}
+                );
+          if (refusal.token === sendOnlyToken) {
+            useRegistry([
+              record({
+                credential_id: 'grokbot-send-only',
+                principal_id: 'grokbot',
+                token: sendOnlyToken,
+                send_as: ['grokbot'],
+                receive_as: ['grokbot'],
+                roles: ['send'],
+              }),
+            ]);
+          }
+          const response = await app.request(refusal.url, { headers: refusalHeaders });
+          const body = await readError(response);
+          expect(response.status).toBe(403);
+          expect(body.error).toBe('dispatch_principal_forbidden');
+          expect(body.text.includes(foreignBody)).toBe(false);
+          expect(body.text.includes(ownBody)).toBe(false);
+          expectNoSecret(body.text, grokbotToken);
+          if (refusal.token === sendOnlyToken) useRegistry([fullGrokbot()]);
+        }
+
+        const conflict = await app.request(
+          listUrl({
+            recipient: 'grokbot',
+            message_id: own.id,
+            correlation_id: 'principal-corr',
+          }),
+          { headers: requestHeaders }
+        );
+        const conflictBody = await readError(conflict);
+        expect(conflict.status).toBe(400);
+        expect(conflictBody.error).toBe('dispatch_list_selector_invalid');
+        expect(conflictBody.text.includes(foreignBody)).toBe(false);
+
+        const badCursor = await app.request(
+          listUrl({ recipient: 'grokbot', after_seq: '0', limit: '501' }),
+          { headers: requestHeaders }
+        );
+        expect(badCursor.status).toBe(400);
+        expect((await readError(badCursor)).error).toBe('dispatch_list_selector_invalid');
+
+        const shapes: Array<{
+          name: 'legacy' | 'message_id' | 'correlation_id' | 'after_seq';
+          selector: Record<string, string>;
+        }> = [
+          { name: 'legacy', selector: {} },
+          { name: 'message_id', selector: { message_id: own.id } },
+          { name: 'correlation_id', selector: { correlation_id: 'principal-corr' } },
+          { name: 'after_seq', selector: { after_seq: '0' } },
+        ];
+        const workerHeaderFields = {
+          'x-dispatch-worker-credential-id': 'board-worker-1',
+          'x-dispatch-worker-token': 'worker-secret',
+          'x-dispatch-worker-id': 'worker-a',
+        };
+        for (const withWorker of [false, true]) {
+          const matrixHeaders = withWorker
+            ? { ...requestHeaders, ...workerHeaderFields }
+            : requestHeaders;
+          for (const shape of shapes) {
+            useRegistry([fullGrokbot()]);
+            const shapeList = await app.request(
+              listUrl({ recipient: 'grokbot', ...shape.selector }),
+              {
+                headers: matrixHeaders,
+              }
+            );
+            expect(shapeList.status).toBe(200);
+            const shapeText = await shapeList.text();
+            expect(shapeText.includes(foreignBody)).toBe(false);
+            expect(shapeText.includes(boardAliasBody)).toBe(false);
+            if (shape.name === 'after_seq') {
+              const cursor = JSON.parse(shapeText) as {
+                messages: Array<{ id: string }>;
+                next_after_seq: number;
+                page_full: boolean;
+              };
+              expect(Array.isArray(cursor.messages)).toBe(true);
+              expect(typeof cursor.next_after_seq).toBe('number');
+              expect(typeof cursor.page_full).toBe('boolean');
+              expect(cursor.messages.map(row => row.id)).toContain(own.id);
+              expect(cursor.messages.map(row => row.id)).not.toContain(foreignId);
+              expect(cursor.messages.map(row => row.id)).not.toContain('board-alias-foreign');
+            } else {
+              const rows = JSON.parse(shapeText) as Array<{ id: string }>;
+              expect(Array.isArray(rows)).toBe(true);
+              expect(rows.map(row => row.id)).toContain(own.id);
+              expect(rows.map(row => row.id)).not.toContain(foreignId);
+              expect(rows.map(row => row.id)).not.toContain('board-alias-foreign');
+            }
+
+            const denials: Array<Record<string, string | string[]>> = [
+              { ...shape.selector },
+              { recipient: '', ...shape.selector },
+              { recipient: '   ', ...shape.selector },
+              { recipient: 'codex', ...shape.selector },
+              { recipient: ['grokbot', 'codex'], ...shape.selector },
+              { recipient: 'board', ...shape.selector },
+            ];
+            for (const query of denials) {
+              const denied = await app.request(listUrl(query), { headers: matrixHeaders });
+              const deniedBody = await readError(denied);
+              expect(denied.status).toBe(403);
+              expect(deniedBody.error).toBe('dispatch_principal_forbidden');
+              expect(deniedBody.text.includes(foreignBody)).toBe(false);
+              expect(deniedBody.text.includes(boardAliasBody)).toBe(false);
+              expect(deniedBody.text.includes(ownBody)).toBe(false);
+              expectNoSecret(deniedBody.text, grokbotToken);
+            }
+
+            useRegistry([
+              record({
+                credential_id: 'grokbot-send-only',
+                principal_id: 'grokbot',
+                token: sendOnlyToken,
+                send_as: ['grokbot'],
+                receive_as: ['grokbot'],
+                roles: ['send'],
+              }),
+            ]);
+            const sendOnlyHeaders = principalHeaders('grokbot', sendOnlyToken, {
+              ...(withAccess ? matchingAccessHeaders() : {}),
+              ...(withWorker ? workerHeaderFields : {}),
+            });
+            const sendOnlyDenied = await app.request(
+              listUrl({ recipient: 'grokbot', ...shape.selector }),
+              { headers: sendOnlyHeaders }
+            );
+            const sendOnlyBody = await readError(sendOnlyDenied);
+            expect(sendOnlyDenied.status).toBe(403);
+            expect(sendOnlyBody.error).toBe('dispatch_principal_forbidden');
+            expect(sendOnlyBody.text.includes(foreignBody)).toBe(false);
+            expect(sendOnlyBody.text.includes(boardAliasBody)).toBe(false);
+            expect(sendOnlyBody.text.includes(ownBody)).toBe(false);
+            expectNoSecret(sendOnlyBody.text, grokbotToken);
+            expectNoSecret(sendOnlyBody.text, sendOnlyToken);
+            useRegistry([fullGrokbot()]);
+
+            if (shape.name === 'message_id' && withWorker) {
+              for (const hiddenId of [foreignId, 'board-alias-foreign']) {
+                const hidden = await app.request(
+                  listUrl({ recipient: 'grokbot', message_id: hiddenId }),
+                  { headers: matrixHeaders }
+                );
+                expect(hidden.status).toBe(200);
+                const hiddenText = await hidden.text();
+                expect(JSON.parse(hiddenText)).toEqual([]);
+                expect(hiddenText.includes(foreignBody)).toBe(false);
+                expect(hiddenText.includes(boardAliasBody)).toBe(false);
+                expect(hiddenText.includes(ownBody)).toBe(false);
+              }
+            }
+          }
+        }
+      }
+    });
+
+    test('mailbox_actor_ownership', async () => {
+      useRegistry([
+        record({
+          credential_id: 'grokbot-alias',
+          principal_id: 'grokbot',
+          token: aliasToken,
+          send_as: ['grokbot'],
+          receive_as: ['grokbot', 'aliasbox'],
+          roles: ['send', 'receive'],
+        }),
+      ]);
+      delete process.env.DISPATCH_SENDER_AUTH_MODE;
+      const app = makeApp('secret-token');
+
+      for (const withAccess of [false, true]) {
+        if (withAccess) enableMatchingAccess();
+        else clearMatchingAccess();
+        const headers = principalHeaders(
+          'grokbot',
+          aliasToken,
+          withAccess ? matchingAccessHeaders() : {}
+        );
+        const suffix = withAccess ? 'access' : 'plain';
+        const created = await postMessage(app, headers, {
+          idempotency_key: `ack-own-${suffix}`,
+        });
+        expect(created.status).toBe(200);
+        const own = (await created.json()) as { id: string };
+        const ack = await app.request(`/api/dispatch/messages/${own.id}/ack`, {
+          method: 'POST',
+          headers,
+          body: '{}',
+        });
+        expect(ack.status).toBe(200);
+        const receipt = (await ack.json()) as { acknowledged_by: string; acknowledged_at: string };
+        expect(receipt.acknowledged_by).toBe('grokbot');
+        const repeat = await app.request(`/api/dispatch/messages/${own.id}/ack`, {
+          method: 'POST',
+          headers,
+          body: '{}',
+        });
+        expect(repeat.status).toBe(200);
+        expect(((await repeat.json()) as { acknowledged_at: string }).acknowledged_at).toBe(
+          receipt.acknowledged_at
+        );
+        expect((await storedReceipt(own.id)).acknowledged_at).toBe(receipt.acknowledged_at);
+
+        const foreign = await createMessage({
+          ...VALID_BODY,
+          sender: 'xo',
+          recipient: 'codex',
+          body: foreignBody,
+          idempotency_key: `ack-foreign-${suffix}`,
+        });
+        const foreignAck = await app.request(`/api/dispatch/messages/${foreign.id}/ack`, {
+          method: 'POST',
+          headers,
+          body: '{}',
+        });
+        const foreignAckBody = await readError(foreignAck);
+        expect(foreignAck.status).toBe(403);
+        expect(foreignAckBody.error).toBe('dispatch_principal_forbidden');
+        expect(foreignAckBody.text.includes(foreignBody)).toBe(false);
+        expect((await storedReceipt(foreign.id)).acknowledged_at).toBeNull();
+
+        const mismatchTarget = await postMessage(app, headers, {
+          idempotency_key: `ack-mismatch-${suffix}`,
+        });
+        expect(mismatchTarget.status).toBe(200);
+        const mismatchMessage = (await mismatchTarget.json()) as { id: string };
+        const mismatch = await app.request(`/api/dispatch/messages/${mismatchMessage.id}/ack`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ principal_id: 'codex' }),
+        });
+        expect(mismatch.status).toBe(409);
+        expect((await readError(mismatch)).error).toBe('actor_mismatch');
+        expect((await storedReceipt(mismatchMessage.id)).acknowledged_at).toBeNull();
+
+        const aliasId = `alias-row-${suffix}`;
+        await insertSyntheticDispatch({
+          id: aliasId,
+          recipient: 'aliasbox',
+          correlationId: `alias-corr-${suffix}`,
+          seq: withAccess ? 91 : 90,
+          body: aliasBody,
+          acknowledged: false,
+        });
+        const aliasAck = await app.request(`/api/dispatch/messages/${aliasId}/ack`, {
+          method: 'POST',
+          headers,
+          body: '{}',
+        });
+        expect(aliasAck.status).toBe(409);
+        expect((await readError(aliasAck)).error).toBe('wrong_recipient');
+        expect((await storedReceipt(aliasId)).acknowledged_at).toBeNull();
+        expect((await storedReceipt(aliasId)).addressed_at).toBeNull();
+
+        const missing = await app.request('/api/dispatch/messages/missing-message-id/ack', {
+          method: 'POST',
+          headers,
+          body: '{}',
+        });
+        expect(missing.status).toBe(404);
+        expect((await readError(missing)).error).toBe('not_found');
+
+        useRegistry([
+          record({
+            credential_id: 'grokbot-send-only-ack',
+            principal_id: 'grokbot',
+            token: sendOnlyToken,
+            send_as: ['grokbot'],
+            receive_as: ['grokbot'],
+            roles: ['send'],
+          }),
+        ]);
+        const sendOnlyAck = await app.request(`/api/dispatch/messages/${mismatchMessage.id}/ack`, {
+          method: 'POST',
+          headers: principalHeaders(
+            'grokbot',
+            sendOnlyToken,
+            withAccess ? matchingAccessHeaders() : {}
+          ),
+          body: '{}',
+        });
+        expect(sendOnlyAck.status).toBe(403);
+        expect((await readError(sendOnlyAck)).error).toBe('dispatch_principal_forbidden');
+        expect((await storedReceipt(mismatchMessage.id)).acknowledged_at).toBeNull();
+        useRegistry([
+          record({
+            credential_id: 'grokbot-alias',
+            principal_id: 'grokbot',
+            token: aliasToken,
+            send_as: ['grokbot'],
+            receive_as: ['grokbot', 'aliasbox'],
+            roles: ['send', 'receive'],
+          }),
+        ]);
+      }
+    });
+
+    test('privileged_task_denial', async () => {
+      useRegistry([fullGrokbot()]);
+      delete process.env.DISPATCH_SENDER_AUTH_MODE;
+      const app = makeApp('secret-token');
+      const beforeMessages = await messageCount();
+      const beforeLeases = (await db.query('SELECT lease_id FROM board_xo_leases')).rowCount;
+      const beforeWorkers = (await db.query('SELECT worker_id FROM agent_dispatch_workers'))
+        .rowCount;
+
+      for (const withAccess of [false, true]) {
+        if (withAccess) enableMatchingAccess();
+        else clearMatchingAccess();
+        const headers = principalHeaders(
+          'grokbot',
+          grokbotToken,
+          withAccess ? matchingAccessHeaders() : {}
+        );
+        for (const taskType of [
+          'run_review',
+          'draft_spec',
+          'run_report',
+          'board_motion',
+        ] as const) {
+          const denied = await postMessage(app, headers, {
+            task_type: taskType,
+            idempotency_key: `deny-${taskType}-${String(withAccess)}`,
+          });
+          expect(denied.status).toBe(403);
+          expect((await readError(denied)).error).toBe('dispatch_principal_forbidden');
+        }
+        const petition = await postMessage(app, headers, {
+          recipient: 'board',
+          idempotency_key: `deny-petition-${String(withAccess)}`,
+        });
+        expect(petition.status).toBe(403);
+
+        const blocked: Array<{ method: string; path: string; body?: string }> = [
+          { method: 'POST', path: '/api/dispatch/messages/priv-1/claim', body: '{}' },
+          { method: 'POST', path: '/api/dispatch/messages/priv-1/result', body: '{}' },
+          { method: 'POST', path: '/api/dispatch/messages/priv-1/address', body: '{}' },
+          { method: 'POST', path: '/api/dispatch/messages/priv-1/cancel', body: '{}' },
+          { method: 'POST', path: '/api/dispatch/messages/priv-1/renew-lease', body: '{}' },
+          { method: 'POST', path: '/api/dispatch/workers/register', body: '{}' },
+          { method: 'POST', path: '/api/board/xo-lease/acquire', body: '{}' },
+          { method: 'POST', path: '/api/dispatch/execution-handoffs', body: '{}' },
+          { method: 'GET', path: '/api/dispatch/status' },
+          { method: 'GET', path: '/api/dispatch/principals' },
+          { method: 'GET', path: '/api/codebases' },
+        ];
+        for (const call of blocked) {
+          const response = await app.request(call.path, {
+            method: call.method,
+            headers,
+            body: call.body,
+          });
+          const body = await readError(response);
+          expect(response.status).toBe(403);
+          expect(body.error).toBe('dispatch_principal_forbidden');
+          expectNoSecret(body.text, grokbotToken);
+        }
+      }
+
+      expect(await messageCount()).toBe(beforeMessages);
+      expect((await db.query('SELECT lease_id FROM board_xo_leases')).rowCount).toBe(beforeLeases);
+      expect((await db.query('SELECT worker_id FROM agent_dispatch_workers')).rowCount).toBe(
+        beforeWorkers
+      );
+
+      const headers = principalHeaders('grokbot', grokbotToken);
+      const allowed = await postMessage(app, headers, { idempotency_key: 'deny-then-allow' });
+      expect(allowed.status).toBe(200);
+      const allowedMessage = (await allowed.json()) as { id: string; task_type: string };
+      expect(allowedMessage.task_type).toBe('agent_message');
+      const address = await app.request(`/api/dispatch/messages/${allowedMessage.id}/address`, {
+        method: 'POST',
+        headers,
+        body: '{}',
+      });
+      expect(address.status).toBe(403);
+      const cancel = await app.request(`/api/dispatch/messages/${allowedMessage.id}/cancel`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ sender: 'grokbot' }),
+      });
+      expect(cancel.status).toBe(403);
+      const stored = await db.query<{
+        status: string;
+        claimed_at: string | null;
+        acknowledged_at: string | null;
+        addressed_at: string | null;
+        result_body: string | null;
+      }>(
+        `SELECT status, claimed_at, acknowledged_at, addressed_at, result_body
+         FROM agent_dispatch_messages WHERE id = $1`,
+        [allowedMessage.id]
+      );
+      expect(stored.rows[0]).toEqual({
+        status: 'queued',
+        claimed_at: null,
+        acknowledged_at: null,
+        addressed_at: null,
+        result_body: null,
+      });
+    });
+
+    test('retained_operator_worker_and_xo_contracts', async () => {
+      useRegistry([fullGrokbot()]);
+      process.env.DISPATCH_SENDER_AUTH_MODE = 'off';
+      enableMatchingAccess();
+      const app = makeApp('secret-token');
+
+      const mixedOrdinary = await postMessage(
+        app,
+        principalHeaders('grokbot', grokbotToken, {
+          'x-archon-operator-token': 'secret-token',
+          ...matchingAccessHeaders(),
+        }),
+        { idempotency_key: 'mixed-ordinary' }
+      );
+      expect(mixedOrdinary.status).toBe(200);
+      expect(
+        (await mixedOrdinary.json()) as { sender: string; sender_principal_id: string }
+      ).toEqual(expect.objectContaining({ sender: 'grokbot', sender_principal_id: 'grokbot' }));
+
+      const mixedPrivileged = await postMessage(
+        app,
+        principalHeaders('grokbot', grokbotToken, {
+          'x-archon-operator-token': 'secret-token',
+        }),
+        { task_type: 'run_report', idempotency_key: 'mixed-privileged', body: 'Operator report.' }
+      );
+      expect(mixedPrivileged.status).toBe(200);
+      expect(
+        ((await mixedPrivileged.json()) as { task_type: string; sender_principal_id: string })
+          .task_type
+      ).toBe('run_report');
+
+      const principalPrivileged = await postMessage(
+        app,
+        principalHeaders('grokbot', grokbotToken, matchingAccessHeaders()),
+        {
+          task_type: 'run_report',
+          idempotency_key: 'access-plus-principal-report',
+          body: 'Should stay denied.',
+        }
+      );
+      expect(principalPrivileged.status).toBe(403);
+      expect((await readError(principalPrivileged)).error).toBe('dispatch_principal_forbidden');
+      expect(
+        (
+          await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+            'access-plus-principal-report',
+          ])
+        ).rowCount
+      ).toBe(0);
+
+      const headerless = await app.request('/api/dispatch/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...matchingAccessHeaders(),
+        },
+        body: JSON.stringify({
+          ...VALID_BODY,
+          sender: 'claude',
+          recipient: 'codex',
+          idempotency_key: 'headerless-access',
+        }),
+      });
+      expect(headerless.status).toBe(200);
+      expect(
+        ((await headerless.json()) as { sender_principal_id: string | null }).sender_principal_id
+      ).toBeNull();
+
+      const headerlessList = await app.request(listUrl({ recipient: 'codex' }), {
+        headers: matchingAccessHeaders(),
+      });
+      expect(headerlessList.status).toBe(200);
+      expect(Array.isArray(await headerlessList.json())).toBe(true);
+    });
+
+    test('principal headers are classified before operator-auth bypasses', async () => {
+      const priorAuthDisabled = process.env.ARCHON_OPERATOR_AUTH_DISABLED;
+      const priorNodeEnv = process.env.NODE_ENV;
+      const restoreEnv = (name: string, prior: string | undefined): void => {
+        if (prior === undefined) delete process.env[name];
+        else process.env[name] = prior;
+      };
+      try {
+        process.env.NODE_ENV = 'test';
+        delete process.env.DISPATCH_SENDER_AUTH_MODE;
+        clearMatchingAccess();
+        useRegistry([fullGrokbot()]);
+        await createMessage({
+          ...VALID_BODY,
+          sender: 'xo',
+          recipient: 'codex',
+          body: foreignBody,
+          idempotency_key: 'bypass-foreign-seed',
+        });
+
+        const bypasses: Array<{ name: string; app: OpenAPIHono }> = [
+          {
+            name: 'auth-disabled',
+            app: (() => {
+              process.env.ARCHON_OPERATOR_AUTH_DISABLED = 'true';
+              return makeApp('secret-token');
+            })(),
+          },
+          {
+            name: 'no-operator-token',
+            app: (() => {
+              delete process.env.ARCHON_OPERATOR_AUTH_DISABLED;
+              return makeApp();
+            })(),
+          },
+        ];
+
+        for (const bypass of bypasses) {
+          const { app, name } = bypass;
+          // makeApp() mutates process.env while the apps are constructed, and
+          // the middleware reads that env per request. Re-apply the bypass
+          // under test immediately before its requests.
+          if (name === 'auth-disabled') {
+            process.env.ARCHON_OPERATOR_AUTH_DISABLED = 'true';
+            process.env.ARCHON_OPERATOR_TOKEN = 'secret-token';
+          } else {
+            delete process.env.ARCHON_OPERATOR_AUTH_DISABLED;
+            delete process.env.ARCHON_OPERATOR_TOKEN;
+          }
+          const emptyHeaders = new Headers({ 'Content-Type': 'application/json' });
+          emptyHeaders.set('x-dispatch-principal-id', '');
+          emptyHeaders.set('x-dispatch-principal-token', '');
+          const empty = await app.request('/api/dispatch/messages', {
+            method: 'POST',
+            headers: emptyHeaders,
+            body: JSON.stringify({
+              ...VALID_BODY,
+              sender: 'grokbot',
+              recipient: 'grokbot',
+              body: ownBody,
+              idempotency_key: `bypass-empty-${name}`,
+            }),
+          });
+          const emptyBody = await readError(empty);
+          expect(empty.status).toBe(401);
+          expect(emptyBody.error).toBe('dispatch_principal_missing');
+          expectNoSecret(emptyBody.text, grokbotToken);
+          expect(
+            (
+              await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+                `bypass-empty-${name}`,
+              ])
+            ).rowCount
+          ).toBe(0);
+
+          const partial = await postMessage(app, principalHeaders('grokbot', undefined), {
+            idempotency_key: `bypass-partial-${name}`,
+          });
+          const partialBody = await readError(partial);
+          expect(partial.status).toBe(401);
+          expect(partialBody.error).toBe('dispatch_principal_partial');
+          expectNoSecret(partialBody.text, grokbotToken);
+
+          const partialList = await app.request(listUrl({ recipient: 'codex' }), {
+            headers: principalHeaders('grokbot', undefined),
+          });
+          const partialListBody = await readError(partialList);
+          expect(partialList.status).toBe(401);
+          expect(partialListBody.error).toBe('dispatch_principal_partial');
+          expect(partialListBody.text.includes(foreignBody)).toBe(false);
+
+          const statusRoute = await app.request('/api/dispatch/status', {
+            headers: principalHeaders('grokbot', grokbotToken),
+          });
+          const statusBody = await readError(statusRoute);
+          expect(statusRoute.status).toBe(403);
+          expect(statusBody.error).toBe('dispatch_principal_forbidden');
+          expect(statusBody.text.includes(foreignBody)).toBe(false);
+
+          const report = await postMessage(app, principalHeaders('grokbot', grokbotToken), {
+            task_type: 'run_report',
+            idempotency_key: `bypass-report-${name}`,
+            body: 'Report on the latest CI failure.',
+          });
+          const reportBody = await readError(report);
+          expect(report.status).toBe(403);
+          expect(reportBody.error).toBe('dispatch_principal_forbidden');
+          expect(
+            (
+              await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+                `bypass-report-${name}`,
+              ])
+            ).rowCount
+          ).toBe(0);
+
+          const allowed = await postMessage(app, principalHeaders('grokbot', grokbotToken), {
+            idempotency_key: `bypass-allowed-${name}`,
+          });
+          expect(allowed.status).toBe(200);
+          expect(
+            ((await allowed.json()) as { sender_principal_id: string | null }).sender_principal_id
+          ).toBe('grokbot');
+
+          const headerless = await postMessage(
+            app,
+            { 'Content-Type': 'application/json' },
+            {
+              sender: 'claude',
+              recipient: 'codex',
+              idempotency_key: `bypass-headerless-${name}`,
+            }
+          );
+          expect(headerless.status).toBe(200);
+          expect(
+            ((await headerless.json()) as { sender_principal_id: string | null })
+              .sender_principal_id
+          ).toBeNull();
+
+          enableMatchingAccess();
+          const accessExtra = matchingAccessHeaders();
+          const emptyAccessHeaders = new Headers({
+            'Content-Type': 'application/json',
+            ...accessExtra,
+          });
+          emptyAccessHeaders.set('x-dispatch-principal-id', '');
+          emptyAccessHeaders.set('x-dispatch-principal-token', '');
+          const emptyAccess = await app.request('/api/dispatch/messages', {
+            method: 'POST',
+            headers: emptyAccessHeaders,
+            body: JSON.stringify({
+              ...VALID_BODY,
+              sender: 'grokbot',
+              recipient: 'grokbot',
+              body: ownBody,
+              idempotency_key: `bypass-empty-access-${name}`,
+            }),
+          });
+          const emptyAccessBody = await readError(emptyAccess);
+          expect(emptyAccess.status).toBe(401);
+          expect(emptyAccessBody.error).toBe('dispatch_principal_missing');
+          expectNoSecret(emptyAccessBody.text, grokbotToken);
+          expect(emptyAccessBody.text.includes(foreignBody)).toBe(false);
+          expect(
+            (
+              await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+                `bypass-empty-access-${name}`,
+              ])
+            ).rowCount
+          ).toBe(0);
+
+          const emptyAccessList = await app.request(listUrl({ recipient: 'codex' }), {
+            headers: emptyAccessHeaders,
+          });
+          const emptyAccessListBody = await readError(emptyAccessList);
+          expect(emptyAccessList.status).toBe(401);
+          expect(emptyAccessListBody.error).toBe('dispatch_principal_missing');
+          expectNoSecret(emptyAccessListBody.text, grokbotToken);
+          expect(emptyAccessListBody.text.includes(foreignBody)).toBe(false);
+
+          const emptyAccessReport = await app.request('/api/dispatch/messages', {
+            method: 'POST',
+            headers: emptyAccessHeaders,
+            body: JSON.stringify({
+              ...VALID_BODY,
+              sender: 'grokbot',
+              recipient: 'grokbot',
+              task_type: 'run_report',
+              body: 'Report on the latest CI failure.',
+              idempotency_key: `bypass-empty-access-report-${name}`,
+            }),
+          });
+          const emptyAccessReportBody = await readError(emptyAccessReport);
+          expect(emptyAccessReport.status).toBe(401);
+          expect(emptyAccessReportBody.error).toBe('dispatch_principal_missing');
+          expectNoSecret(emptyAccessReportBody.text, grokbotToken);
+          expect(emptyAccessReportBody.text.includes(foreignBody)).toBe(false);
+          expect(
+            (
+              await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+                `bypass-empty-access-report-${name}`,
+              ])
+            ).rowCount
+          ).toBe(0);
+
+          const partialAccess = await postMessage(
+            app,
+            principalHeaders('grokbot', undefined, accessExtra),
+            { idempotency_key: `bypass-partial-access-${name}` }
+          );
+          const partialAccessBody = await readError(partialAccess);
+          expect(partialAccess.status).toBe(401);
+          expect(partialAccessBody.error).toBe('dispatch_principal_partial');
+          expectNoSecret(partialAccessBody.text, grokbotToken);
+          expect(partialAccessBody.text.includes(foreignBody)).toBe(false);
+
+          const partialAccessReport = await postMessage(
+            app,
+            principalHeaders('grokbot', undefined, accessExtra),
+            {
+              task_type: 'run_report',
+              idempotency_key: `bypass-partial-access-report-${name}`,
+              body: 'Report on the latest CI failure.',
+            }
+          );
+          const partialAccessReportBody = await readError(partialAccessReport);
+          expect(partialAccessReport.status).toBe(401);
+          expect(partialAccessReportBody.error).toBe('dispatch_principal_partial');
+          expectNoSecret(partialAccessReportBody.text, grokbotToken);
+          expect(partialAccessReportBody.text.includes(foreignBody)).toBe(false);
+          expect(
+            (
+              await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+                `bypass-partial-access-report-${name}`,
+              ])
+            ).rowCount
+          ).toBe(0);
+
+          const partialAccessList = await app.request(listUrl({ recipient: 'codex' }), {
+            headers: principalHeaders('grokbot', undefined, accessExtra),
+          });
+          const partialAccessListBody = await readError(partialAccessList);
+          expect(partialAccessList.status).toBe(401);
+          expect(partialAccessListBody.error).toBe('dispatch_principal_partial');
+          expect(partialAccessListBody.text.includes(foreignBody)).toBe(false);
+
+          const foreignAccessList = await app.request(listUrl({ recipient: 'codex' }), {
+            headers: principalHeaders('grokbot', grokbotToken, accessExtra),
+          });
+          const foreignAccessListBody = await readError(foreignAccessList);
+          expect(foreignAccessList.status).toBe(403);
+          expect(foreignAccessListBody.error).toBe('dispatch_principal_forbidden');
+          expect(foreignAccessListBody.text.includes(foreignBody)).toBe(false);
+          expectNoSecret(foreignAccessListBody.text, grokbotToken);
+
+          const accessReport = await postMessage(
+            app,
+            principalHeaders('grokbot', grokbotToken, accessExtra),
+            {
+              task_type: 'run_report',
+              idempotency_key: `bypass-report-access-${name}`,
+              body: 'Report on the latest CI failure.',
+            }
+          );
+          const accessReportBody = await readError(accessReport);
+          expect(accessReport.status).toBe(403);
+          expect(accessReportBody.error).toBe('dispatch_principal_forbidden');
+          expectNoSecret(accessReportBody.text, grokbotToken);
+          expect(
+            (
+              await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+                `bypass-report-access-${name}`,
+              ])
+            ).rowCount
+          ).toBe(0);
+
+          const headerlessAccess = await postMessage(
+            app,
+            { 'Content-Type': 'application/json', ...accessExtra },
+            {
+              sender: 'claude',
+              recipient: 'codex',
+              idempotency_key: `bypass-headerless-access-${name}`,
+            }
+          );
+          expect(headerlessAccess.status).toBe(200);
+          expect(
+            ((await headerlessAccess.json()) as { sender_principal_id: string | null })
+              .sender_principal_id
+          ).toBeNull();
+
+          if (name === 'no-operator-token') {
+            const presentedUnconfigured = await app.request('/api/dispatch/status', {
+              headers: principalHeaders('grokbot', grokbotToken, {
+                'x-archon-operator-token': 'secret-token',
+              }),
+            });
+            const presentedBody = await readError(presentedUnconfigured);
+            expect(presentedUnconfigured.status).toBe(403);
+            expect(presentedBody.error).toBe('dispatch_principal_forbidden');
+            expect(presentedBody.text.includes(foreignBody)).toBe(false);
+          }
+        }
+
+        process.env.ARCHON_OPERATOR_AUTH_DISABLED = 'true';
+        const disabledWithToken = makeApp('secret-token');
+        const operatorHeaders = principalHeaders('grokbot', grokbotToken, {
+          'x-archon-operator-token': 'secret-token',
+        });
+        const operatorReport = await postMessage(disabledWithToken, operatorHeaders, {
+          task_type: 'run_report',
+          idempotency_key: 'bypass-disabled-operator-report',
+          body: 'Operator report.',
+        });
+        expect(operatorReport.status).toBe(200);
+        expect(((await operatorReport.json()) as { task_type: string }).task_type).toBe(
+          'run_report'
+        );
+
+        const operatorStatus = await disabledWithToken.request('/api/dispatch/status', {
+          headers: operatorHeaders,
+        });
+        expect(operatorStatus.status).toBe(200);
+
+        enableMatchingAccess();
+        const operatorAccessHeaders = principalHeaders('grokbot', grokbotToken, {
+          'x-archon-operator-token': 'secret-token',
+          ...matchingAccessHeaders(),
+        });
+        const operatorAccessReport = await postMessage(disabledWithToken, operatorAccessHeaders, {
+          task_type: 'run_report',
+          idempotency_key: 'bypass-disabled-operator-report-access',
+          body: 'Operator report.',
+        });
+        expect(operatorAccessReport.status).toBe(200);
+        expect(((await operatorAccessReport.json()) as { task_type: string }).task_type).toBe(
+          'run_report'
+        );
+        const operatorAccessStatus = await disabledWithToken.request('/api/dispatch/status', {
+          headers: operatorAccessHeaders,
+        });
+        expect(operatorAccessStatus.status).toBe(200);
+
+        const mixedPartial = await postMessage(
+          disabledWithToken,
+          principalHeaders('grokbot', undefined, { 'x-archon-operator-token': 'secret-token' }),
+          { idempotency_key: 'bypass-disabled-mixed-partial' }
+        );
+        const mixedPartialBody = await readError(mixedPartial);
+        expect(mixedPartial.status).toBe(401);
+        expect(mixedPartialBody.error).toBe('dispatch_principal_partial');
+        expect(
+          (
+            await db.query('SELECT id FROM agent_dispatch_messages WHERE idempotency_key = $1', [
+              'bypass-disabled-mixed-partial',
+            ])
+          ).rowCount
+        ).toBe(0);
+
+        const partialStatus = await disabledWithToken.request('/api/dispatch/status', {
+          headers: principalHeaders('grokbot', undefined, {
+            'x-archon-operator-token': 'secret-token',
+          }),
+        });
+        expect(partialStatus.status).toBe(200);
+      } finally {
+        clearMatchingAccess();
+        restoreEnv('ARCHON_OPERATOR_AUTH_DISABLED', priorAuthDisabled);
+        restoreEnv('NODE_ENV', priorNodeEnv);
+      }
+    });
   });
 });

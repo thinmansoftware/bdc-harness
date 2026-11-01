@@ -160,12 +160,17 @@ describe('SqliteAdapter', () => {
         { principal_id: 'codex-mcp', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'cursor', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'do', delivery_mode: 'worker_poll', active: 1 },
+        // WO-HARNESS-COMPANION-MCP-MAILBOX-01: inactive until a config enable.
+        { principal_id: 'dot', delivery_mode: 'drain_on_start', active: 0 },
+        { principal_id: 'duet', delivery_mode: 'drain_on_start', active: 0 },
         { principal_id: 'duty-officer', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'fusion', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'grok', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'grok-acp', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'grokbot', delivery_mode: 'drain_on_start', active: 1 },
         { principal_id: 'john', delivery_mode: 'notify_only', active: 0 },
         { principal_id: 'merge-manager', delivery_mode: 'notify_only', active: 0 },
+        { principal_id: 'muse', delivery_mode: 'drain_on_start', active: 0 },
         { principal_id: 'operator', delivery_mode: 'drain_on_start', active: 1 },
         { principal_id: 'overseer', delivery_mode: 'notify_only', active: 1 },
         // WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 (migration 043): sorted

@@ -99,13 +99,60 @@ export const dispatchMailboxPrincipalBodySchema = z
   .strict()
   .openapi('DispatchMailboxPrincipalBody');
 
-export const listDispatchMessagesQuerySchema = z.object({
-  recipient: z.string().optional(),
-  status: dispatchMessageStatusSchema.optional(),
-  limit: z.string().optional(),
-  subject_key: z.string().optional(),
-  route_disposition: dispatchRouteDispositionSchema.optional(),
-});
+// Duplicate query keys arrive as arrays. Accept them here so the route parser
+// can reject a selected request by name instead of a generic type error.
+const dispatchQueryString = z.union([z.string(), z.array(z.string()).min(1)]);
+
+// No-selector lists still use the historical OpenAPI hook text. Selected
+// requests keep arrays so the route parser can name the selector error.
+const legacyDuplicateQueryMessage = {
+  recipient: 'Expected string, received array',
+  status: "Expected 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled', received array",
+  limit: 'Expected string, received array',
+  subject_key: 'Expected string, received array',
+  route_disposition:
+    "Expected 'unroutable' | 'superseded' | 'expired' | 'auto_surfaced', received array",
+} as const;
+
+const legacyDuplicateQueryFields = [
+  'recipient',
+  'status',
+  'limit',
+  'subject_key',
+  'route_disposition',
+] as const;
+
+export const listDispatchMessagesQuerySchema = z
+  .object({
+    recipient: dispatchQueryString.optional(),
+    status: z.union([dispatchMessageStatusSchema, z.array(z.string()).min(1)]).optional(),
+    limit: dispatchQueryString.optional(),
+    subject_key: dispatchQueryString.optional(),
+    route_disposition: z
+      .union([dispatchRouteDispositionSchema, z.array(z.string()).min(1)])
+      .optional(),
+    message_id: dispatchQueryString.optional(),
+    correlation_id: dispatchQueryString.optional(),
+    after_seq: dispatchQueryString.optional(),
+  })
+  .superRefine((query, ctx) => {
+    if (
+      query.message_id !== undefined ||
+      query.correlation_id !== undefined ||
+      query.after_seq !== undefined
+    ) {
+      return;
+    }
+    for (const field of legacyDuplicateQueryFields) {
+      if (Array.isArray(query[field])) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [field],
+          message: legacyDuplicateQueryMessage[field],
+        });
+      }
+    }
+  });
 
 export const claimDispatchMessageBodySchema = z
   .object({
@@ -176,6 +223,18 @@ export const heartbeatDispatchWorkerBodySchema = z
 export const dispatchMessageListResponseSchema = z
   .array(dispatchMessageSchema)
   .openapi('DispatchMessageListResponse');
+
+export const dispatchMessageCursorPageSchema = z
+  .object({
+    messages: z.array(dispatchMessageSchema),
+    next_after_seq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    page_full: z.boolean(),
+  })
+  .openapi('DispatchMessageCursorPage');
+
+export const dispatchMessageListOrCursorResponseSchema = z
+  .union([dispatchMessageListResponseSchema, dispatchMessageCursorPageSchema])
+  .openapi('DispatchMessageListOrCursorResponse');
 
 export const dispatchStatusQuerySchema = z.object({
   worker_stale_after_ms: z.coerce.number().int().positive().max(86_400_000).optional(),
