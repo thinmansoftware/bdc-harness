@@ -5,9 +5,14 @@ import {
   type TmActionType,
   type TmActionOutcome,
 } from '@archon/core/db/taskmaster';
+import { serviceGitHubFetch } from '@archon/core/github/request';
+import {
+  resolveServiceGitHubAuth,
+  type ServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 import { createLogger } from '@archon/paths';
 import {
-  githubToken,
+  getDutyOfficerGithubTokenOrNull,
   githubIssueInAllowList,
   parseGithubSubject,
   type DutyOfficerStaleIssue,
@@ -188,23 +193,78 @@ function parseNextLink(header: string | null): string | null {
   return null;
 }
 
+interface WorkerAlarmGitHubCallOptions {
+  /** Injected for tests. Mint and API calls share this fetch. */
+  fetchImpl?: typeof fetch;
+  /** Injected for tests; defaults to the shared credential-alert sink. */
+  alertSink?: (credential: string) => void | Promise<void>;
+}
+
+/**
+ * Incomplete App config throws from the resolver. Keep the alarm's existing
+ * missing-credential error so callers do not have to distinguish it.
+ */
+function resolveWorkerAlarmGitHubIdentity(): ServiceGitHubAuth {
+  let identity: ServiceGitHubAuth;
+  try {
+    identity = resolveServiceGitHubAuth('duty_officer');
+  } catch {
+    throw new Error('worker_heartbeat_alarm_token_missing');
+  }
+  if (identity.kind === 'app') return identity;
+  if (identity.kind === 'pat' && identity.token.trim()) return identity;
+  throw new Error('worker_heartbeat_alarm_token_missing');
+}
+
+/**
+ * Duty-officer GitHub request for the alarm. The HTTP call goes through
+ * serviceGitHubFetch, so an App 401 clears the cached installation token,
+ * re-mints once, and retries. A missing credential throws
+ * worker_heartbeat_alarm_token_missing. Mint failure and a second App 401
+ * alert inside serviceGitHubFetch and propagate.
+ */
+async function workerAlarmGitHubRequest(
+  url: string,
+  init: { method?: string; extraHeaders?: Record<string, string>; body?: string },
+  options?: WorkerAlarmGitHubCallOptions
+): Promise<Response> {
+  const identity = resolveWorkerAlarmGitHubIdentity();
+  const headers: Record<string, string> = {
+    Accept: 'application/vnd.github+json',
+    'User-Agent': 'bdc-harness-worker-heartbeat-alarm',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (init.extraHeaders) {
+    for (const key of Object.keys(init.extraHeaders)) {
+      headers[key] = init.extraHeaders[key];
+    }
+  }
+  return serviceGitHubFetch({
+    service: 'duty_officer',
+    url,
+    identity,
+    fetch: options?.fetchImpl,
+    alertSink: options?.alertSink,
+    init: {
+      method: init.method,
+      headers,
+      body: init.body,
+      signal: AbortSignal.timeout(15_000),
+    },
+  });
+}
+
 /**
  * Fetch every comment on the alarm issue, following Link rel="next" pages.
  * GitHub lists issue comments oldest-first, so a single page would miss the
  * newest marker on a busy issue. Mirrors the pagination in
  * packages/server/src/taskmaster/escalation-delivery.ts listAllIssueComments.
+ * Each page goes through serviceGitHubFetch so an App 401 re-mints.
  */
 export async function listWorkerAlarmIssueComments(
-  issue: DutyOfficerStaleIssue
+  issue: DutyOfficerStaleIssue,
+  options?: WorkerAlarmGitHubCallOptions
 ): Promise<WorkerAlarmIssueComment[]> {
-  const token = githubToken();
-  if (!token) throw new Error('worker_heartbeat_alarm_token_missing');
-  const headers: Record<string, string> = {
-    Accept: 'application/vnd.github+json',
-    Authorization: `Bearer ${token}`,
-    'User-Agent': 'bdc-harness-worker-heartbeat-alarm',
-    'X-GitHub-Api-Version': '2022-11-28',
-  };
   let url: string | null =
     `${GITHUB_API_ORIGIN}/repos/${encodeURIComponent(issue.owner)}/${encodeURIComponent(issue.repo)}/issues/${issue.number}/comments?per_page=100`;
   const all: WorkerAlarmIssueComment[] = [];
@@ -214,7 +274,7 @@ export async function listWorkerAlarmIssueComments(
       throw new Error('worker_heartbeat_alarm_comment_pages_exceeded');
     }
     pages += 1;
-    const response: Response = await fetch(url, { headers, signal: AbortSignal.timeout(15_000) });
+    const response = await workerAlarmGitHubRequest(url, {}, options);
     if (!response.ok) {
       throw new Error(`worker_heartbeat_alarm_http_${response.status}`);
     }
@@ -237,32 +297,26 @@ export async function listWorkerAlarmIssueComments(
  * postGithubIssueComment in duty-officer-clock.ts this does NOT consult
  * DUTY_OFFICER_GH_NUDGE and does NOT dedupe against the nudge marker; dedup for
  * the alarm is handled by runWorkerHeartbeatAlarm via listWorkerAlarmIssueComments.
- * The repo allowlist check is preserved.
+ * The repo allowlist check is preserved. The POST goes through
+ * serviceGitHubFetch (see workerAlarmGitHubRequest) so an App 401 re-mints.
  */
 export async function postWorkerAlarmComment(
   issue: DutyOfficerStaleIssue,
-  body: string
+  body: string,
+  options?: WorkerAlarmGitHubCallOptions
 ): Promise<void> {
   if (!githubIssueInAllowList(issue)) {
     log.warn({ issue }, 'worker_heartbeat_alarm_repo_refused');
     return;
   }
-  const token = githubToken();
-  if (!token) throw new Error('worker_heartbeat_alarm_token_missing');
-  const response = await fetch(
+  const response = await workerAlarmGitHubRequest(
     `${GITHUB_API_ORIGIN}/repos/${encodeURIComponent(issue.owner)}/${encodeURIComponent(issue.repo)}/issues/${issue.number}/comments`,
     {
       method: 'POST',
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${token}`,
-        'User-Agent': 'bdc-harness-worker-heartbeat-alarm',
-        'X-GitHub-Api-Version': '2022-11-28',
-        'Content-Type': 'application/json',
-      },
+      extraHeaders: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ body }),
-      signal: AbortSignal.timeout(15_000),
-    }
+    },
+    options
   );
   if (!response.ok) {
     throw new Error(`worker_heartbeat_alarm_http_${response.status}`);
@@ -459,7 +513,7 @@ export async function runWorkerHeartbeatAlarm(deps: WorkerHeartbeatAlarmDeps): P
     log.warn({ issue }, 'worker_heartbeat_alarm_repo_refused');
     return;
   }
-  if (!githubToken()) {
+  if (!(await getDutyOfficerGithubTokenOrNull())) {
     // Loud, not silent: without a token no comment alarm can fire.
     log.error('worker_heartbeat_alarm_no_token');
     return;

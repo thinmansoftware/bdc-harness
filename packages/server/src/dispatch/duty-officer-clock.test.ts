@@ -13,6 +13,7 @@ import {
   type SecurityDetectorResult,
 } from './duty-officer-security-detector';
 import {
+  getDutyOfficerGithubToken,
   githubIssueInAllowList,
   githubNudgeEnabled,
   postGithubIssueComment,
@@ -21,6 +22,12 @@ import {
   tickDutyOfficerClock,
   type DutyOfficerClockDeps,
 } from './duty-officer-clock';
+import { generateKeyPairSync } from 'node:crypto';
+import {
+  clearServiceGitHubTokenCache,
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 
 test('explicit GitHub nudge switch still requires a usable authenticated identity', () => {
   process.env.DUTY_OFFICER_GH_NUDGE = 'true';
@@ -1305,4 +1312,71 @@ test('dutyOfficerSqliteRaceIsolation', async () => {
     writeDutyOfficerProcessEnv(prior);
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+describe('Test 2: duty officer token accessor never returns null for an App identity', () => {
+  const KEYS = [
+    'GH_TOKEN',
+    'GITHUB_TOKEN',
+    'GITHUB_APP_ID',
+    'GITHUB_APP_INSTALLATION_ID',
+    'GITHUB_APP_PRIVATE_KEY',
+    'GITHUB_APP_DUTY_OFFICER_ID',
+    'GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID',
+    'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY',
+    'GITHUB_APP_TASKMASTER_ID',
+    'GITHUB_APP_TASKMASTER_INSTALLATION_ID',
+    'GITHUB_APP_TASKMASTER_PRIVATE_KEY',
+  ];
+  let saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    saved = {};
+    for (const k of KEYS) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+    clearServiceGitHubTokenCache();
+  });
+
+  afterEach(() => {
+    for (const k of KEYS) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+    clearServiceGitHubTokenCache();
+  });
+
+  test('returns a Promise resolving to the minted installation token for an App identity', async () => {
+    const key = generateKeyPairSync('rsa', { modulusLength: 2048 })
+      .privateKey.export({ type: 'pkcs8', format: 'pem' })
+      .toString();
+    process.env.GITHUB_APP_DUTY_OFFICER_ID = '77';
+    process.env.GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID = '88';
+    process.env.GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY = key;
+
+    const identity = resolveServiceGitHubAuth('duty_officer');
+    expect(identity.kind).toBe('app');
+
+    // Seed the cache offline so the accessor resolves without hitting the network.
+    await getServiceGitHubToken(identity, {
+      fetch: (async (url: string | URL | Request): Promise<Response> => {
+        expect(String(url)).toContain('/access_tokens');
+        return Response.json({
+          token: 'do-install-token',
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      }) as typeof fetch,
+    });
+
+    const result = getDutyOfficerGithubToken();
+    expect(result).toBeInstanceOf(Promise);
+    // The old sync accessor returned null here; the new async one must not.
+    await expect(result).resolves.toBe('do-install-token');
+  });
+
+  test('returns the PAT token for a PAT identity', async () => {
+    process.env.GH_TOKEN = 'synthetic-pat';
+    await expect(getDutyOfficerGithubToken()).resolves.toBe('synthetic-pat');
+  });
 });

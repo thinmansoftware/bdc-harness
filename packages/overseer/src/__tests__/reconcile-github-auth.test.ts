@@ -136,14 +136,21 @@ for (const operation of ['comment', 'label', 'close'] as const)
   });
 
 for (const status of [401, 403, 429])
-  test(`tracker write HTTP ${status} without permission denial does not fall back`, async () => {
+  test(`tracker write HTTP ${status} without permission denial does not fall back to the PAT`, async () => {
     app();
     process.env.GITHUB_TOKEN = 'fixture-pat';
     transport(() => Response.json({ message: 'fixture refusal' }, { status }));
     await expect(
       createDefaultReconcileDeps().addTrackerLabel({ issue, label: 'wo:done' })
     ).rejects.toThrow();
-    expect(calls.map(call => call.auth)).toEqual(['Bearer fixture-app']);
+    // A 401 for an App identity re-mints and retries exactly once through the
+    // shared provider (WO-HARNESS-GITHUB-TOKEN-PROVIDER-REFRESH-01) -- still the
+    // App identity, never the PAT. 403/429 are returned as-is with no retry. In
+    // no case does the write fall back to fixture-pat.
+    const expectedAppCalls = status === 401 ? 2 : 1;
+    expect(calls.map(call => call.auth)).toEqual(
+      Array(expectedAppCalls).fill('Bearer fixture-app')
+    );
   });
 
 test('ambiguous write transport failure does not retry with PAT', async () => {

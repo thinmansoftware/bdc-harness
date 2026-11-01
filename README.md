@@ -314,6 +314,7 @@ Full documentation is available at **[archon.diy](https://archon.diy)**.
 | [AI Assistants](https://archon.diy/getting-started/ai-assistants/) | Claude, Codex, and Pi setup details |
 | [Deployment](https://archon.diy/deployment/) | Docker, VPS, production setup |
 | [Architecture](https://archon.diy/reference/architecture/) | System design and internals |
+| [Credentials Inventory](docs/credentials-inventory.md) | Every credential the harness uses, its refresh method, owner, and expiry |
 | [Troubleshooting](https://archon.diy/reference/troubleshooting/) | Common issues and fixes |
 
 ## Telemetry

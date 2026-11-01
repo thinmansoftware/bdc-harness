@@ -27,15 +27,21 @@
  * Taskmaster escalation comment on that issue.
  *
  * MARKER TRUST. The marker is public text, so a marker comment counts only
- * when its author is the login Taskmaster posts as (deps.posterLogin; the real
- * deps resolve it once with GET /user using the same token that posts). A
- * copied marker from anyone else is ignored and cannot suppress or delay an
+ * when its author is the login Taskmaster posts as (deps.posterLogin). Real
+ * deps resolve an App identity once via GET /app with an App JWT (the acting
+ * login is "<slug>[bot]") and resolve a PAT or an injected token via GET /user.
+ * A copied marker from anyone else is ignored and cannot suppress or delay an
  * escalation.
  */
 import { createLogger } from '@archon/paths';
 import type { IDatabase } from '@archon/core/db/adapters/types';
 import * as taskmasterDb from '@archon/core/db/taskmaster';
-import { githubToken } from '../dispatch/duty-officer-clock';
+import {
+  getServiceGitHubToken,
+  resolveGitHubActingLogin,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
+import { serviceGitHubFetch } from '@archon/core/github/request';
 
 const log = createLogger('taskmaster/escalation-delivery');
 
@@ -414,6 +420,12 @@ export interface RealEscalationDeliveryOptions {
   fetchImpl?: FetchLike;
   /** Injected for tests; defaults to the shared container token accessor. */
   token?: string | null;
+  /**
+   * Injected for tests; defaults to the shared credential-alert sink. Used only
+   * on the provider path (no explicit token), when an App mint throws or an
+   * App 401 survives one re-mint + retry.
+   */
+  alertSink?: (credential: string) => void | Promise<void>;
 }
 
 /** Return the rel="next" URL from a GitHub Link header, or null. */
@@ -427,12 +439,14 @@ export function parseNextLink(linkHeader: string | null): string | null {
 }
 
 /**
- * Minimal GitHub REST helper mirroring duty-officer-clock's private githubJson
- * (kept local rather than exported from that file, which the spec limits to a
- * single githubToken() export). Reuses the shared container token accessor.
- * Takes a full URL and returns the raw Response so callers can read headers
- * (the Link header drives comment pagination). Only api.github.com URLs are
- * requested, so a Link header can never send the token to another host.
+ * GitHub REST helper. An explicit token (including null) is sent as-is through
+ * fetchImpl; that path does not mint. With no explicit token the call goes
+ * through serviceGitHubFetch for the taskmaster identity, so the same fetch
+ * mints the App installation token, a 401 clears the cache and re-mints once,
+ * and mint failure or a second 401 raises the credential alert. Takes a full
+ * URL and returns the raw Response so callers can read headers (the Link
+ * header drives comment pagination). Only api.github.com URLs are requested,
+ * so a Link header can never send the token to another host.
  */
 async function githubRequest(
   url: string,
@@ -442,11 +456,8 @@ async function githubRequest(
   if (!url.startsWith(`${GITHUB_API_ORIGIN}/`)) {
     throw new Error('taskmaster_github_url_not_api_origin');
   }
-  const token = options.token !== undefined ? options.token : githubToken();
-  if (!token) throw new Error('taskmaster_github_token_missing');
   const headers: Record<string, string> = {
     Accept: 'application/vnd.github+json',
-    Authorization: `Bearer ${token}`,
     'User-Agent': 'bdc-harness-taskmaster-escalation',
     'X-GitHub-Api-Version': '2022-11-28',
   };
@@ -455,18 +466,62 @@ async function githubRequest(
       headers[key] = init.extraHeaders[key];
     }
   }
-  const fetchImpl: FetchLike =
-    options.fetchImpl ?? ((input, reqInit): Promise<Response> => fetch(input, reqInit));
-  const response = await fetchImpl(url, {
-    method: init?.method,
-    headers,
-    body: init?.body,
-    signal: AbortSignal.timeout(githubTimeoutMs()),
+
+  // Injected token, including explicit null: keep the raw fetch seam. Tests
+  // pass a token and expect taskmaster_github_http_* with no mint and no alert.
+  if (options.token !== undefined) {
+    if (!options.token) throw new Error('taskmaster_github_token_missing');
+    headers.Authorization = `Bearer ${options.token}`;
+    const fetchImpl: FetchLike =
+      options.fetchImpl ?? ((input, reqInit): Promise<Response> => fetch(input, reqInit));
+    const response = await fetchImpl(url, {
+      method: init?.method,
+      headers,
+      body: init?.body,
+      signal: AbortSignal.timeout(githubTimeoutMs()),
+    });
+    if (!response.ok) {
+      throw new Error(`taskmaster_github_http_${response.status}`);
+    }
+    return response;
+  }
+
+  const identity = resolveServiceGitHubAuth('taskmaster');
+  if (identity.kind !== 'app' && !(identity.kind === 'pat' && identity.token.trim())) {
+    throw new Error('taskmaster_github_token_missing');
+  }
+  const response = await serviceGitHubFetch({
+    service: 'taskmaster',
+    url,
+    identity,
+    fetch: escalationServiceFetch(options),
+    alertSink: options.alertSink,
+    init: {
+      method: init?.method,
+      headers,
+      body: init?.body,
+      signal: AbortSignal.timeout(githubTimeoutMs()),
+    },
   });
   if (!response.ok) {
     throw new Error(`taskmaster_github_http_${response.status}`);
   }
   return response;
+}
+
+/** Adapt the escalation fetch to standard fetch. Mint calls have no signal yet, so bound them. */
+function escalationServiceFetch(options: RealEscalationDeliveryOptions): typeof fetch {
+  const fetchImpl: FetchLike =
+    options.fetchImpl ?? ((input, init): Promise<Response> => fetch(input, init));
+  const adapted = (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url =
+      typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    return fetchImpl(url, {
+      ...init,
+      signal: init?.signal ?? AbortSignal.timeout(githubTimeoutMs()),
+    });
+  };
+  return Object.assign(adapted, { preconnect: fetch.preconnect });
 }
 
 function issueCommentsUrl(issue: EscalationIssueRef): string {
@@ -519,16 +574,40 @@ function toEscalationComment(raw: unknown): EscalationIssueComment {
 }
 
 /**
- * The login the token authenticates as (GET /user), cached per token for the
- * life of the deps object so the lookup costs one call, not one per
- * escalation. A failed lookup is not cached; it throws, so the escalation
- * fails this tick and is retried rather than trusting or distrusting markers
- * blindly.
+ * The login Taskmaster posts as, cached for the life of the deps object so the
+ * lookup costs one call, not one per escalation. An App identity is named via
+ * GET /app (App JWT) and cached by pool id. A PAT or an injected token
+ * (including explicit null) is named via GET /user and cached per token. A
+ * failed lookup is not cached; it throws, so the escalation fails this tick
+ * and is retried rather than trusting or distrusting markers blindly.
  */
 function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () => Promise<string> {
   let cached: { token: string | null; login: Promise<string> } | null = null;
-  return (): Promise<string> => {
-    const token = options.token !== undefined ? options.token : githubToken();
+  const appLoginByPool = new Map<string, Promise<string>>();
+  return async (): Promise<string> => {
+    // An explicit token, including null, keeps the injected GET /user path.
+    // Only the unresolved taskmaster identity may take the App GET /app path.
+    if (options.token === undefined) {
+      const identity = resolveServiceGitHubAuth('taskmaster');
+      if (identity.kind === 'app') {
+        const cachedLogin = appLoginByPool.get(identity.poolId);
+        if (cachedLogin) return cachedLogin;
+        const login = resolveGitHubActingLogin(identity, {
+          fetch: appPosterLoginFetch(options),
+          apiBaseUrl: GITHUB_API_ORIGIN,
+        });
+        appLoginByPool.set(identity.poolId, login);
+        login.catch(() => {
+          if (appLoginByPool.get(identity.poolId) === login) appLoginByPool.delete(identity.poolId);
+        });
+        return login;
+      }
+    }
+
+    const token =
+      options.token !== undefined
+        ? options.token
+        : await getServiceGitHubToken(resolveServiceGitHubAuth('taskmaster'));
     if (cached?.token === token) return cached.login;
     const login = (async (): Promise<string> => {
       const response = await githubRequest(`${GITHUB_API_ORIGIN}/user`, options);
@@ -545,6 +624,23 @@ function createPosterLoginResolver(options: RealEscalationDeliveryOptions): () =
     });
     return login;
   };
+}
+
+/** Adapt the escalation fetch to standard fetch and bound the GET /app call. */
+function appPosterLoginFetch(options: RealEscalationDeliveryOptions): typeof fetch {
+  const fetchImpl: FetchLike =
+    options.fetchImpl ?? ((input, init): Promise<Response> => fetch(input, init));
+  const adapted = (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    const url =
+      typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    return fetchImpl(url, {
+      ...init,
+      signal: AbortSignal.timeout(githubTimeoutMs()),
+    });
+  };
+  // Bun's fetch type also carries fetch.preconnect. The login lookup only
+  // performs GET /app, so the extra method is forwarded unchanged.
+  return Object.assign(adapted, { preconnect: fetch.preconnect });
 }
 
 /**

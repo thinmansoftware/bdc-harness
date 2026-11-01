@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { getGitHubTokenForService } from '../github/service-identity';
 
 const BDC_XO_REPOSITORY = 'thinmansoftware/bdc-xo';
 const BDC_XO_BRANCH = 'main';
@@ -91,7 +92,17 @@ export async function freezeCanonicalBoardMotion(
     throw new Error('authority_source_invalid: noncanonical motion path');
   }
   const fetcher = dependencies.fetcher ?? fetch;
-  const token = dependencies.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
+  let token = dependencies.githubToken;
+  if (token === undefined) {
+    // Route through the shared provider (App installation token or PAT) rather
+    // than reading process.env directly; tolerate absence so an injected test
+    // fetcher still works without any credential.
+    try {
+      token = await getGitHubTokenForService('overseer');
+    } catch {
+      token = undefined;
+    }
+  }
   if (!dependencies.fetcher && !token) {
     throw new Error('authority_source_missing: GitHub authentication');
   }
