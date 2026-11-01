@@ -49,12 +49,13 @@ const proposalFileSchema: JsonSchema = {
 export const TOOL_INPUT_SCHEMAS: Record<ToolName, JsonSchema> = {
   wiki_search: searchSchema,
   wiki_read: pathSchema,
-  oracle_query: {
+  oracle_search: {
     type: 'object',
     properties: {
-      question: { type: 'string' },
+      query: { type: 'string' },
+      top_k: { type: 'integer' },
     },
-    required: ['question'],
+    required: ['query'],
   },
   mailbox_send: {
     type: 'object',

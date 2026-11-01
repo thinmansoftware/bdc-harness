@@ -69,7 +69,8 @@ export async function boardBriefSend(
   slot: CompanionSlot,
   motionId: string,
   seats: string[],
-  briefText: string
+  briefText: string,
+  now: Date = new Date()
 ): Promise<{ correlation_id: string; sent: number }> {
   if (!/^M-[A-Za-z0-9][A-Za-z0-9-]*$/.test(motionId)) {
     throw new ToolFailure('refused', 'path_refused');
@@ -91,7 +92,7 @@ export async function boardBriefSend(
     seen.add(canonical);
     canonicalSeats.push(canonical);
   }
-  const correlationId = `board-brief-${motionId}-${utcCompact()}`;
+  const correlationId = `board-brief-${motionId}-${utcCompact(now)}-${randomUUID()}`;
   for (const seat of canonicalSeats) {
     await dispatch.send(slot, {
       recipient: seat,

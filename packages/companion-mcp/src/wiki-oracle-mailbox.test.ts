@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -61,13 +61,21 @@ function selectedDispatchGet(
 describe('wiki oracle and mailbox tools', () => {
   test('audit_line_per_call', async () => {
     const harness = await createHarness();
-    const oracle = await startRecordingServer(() => ({ status: 500, body: { error: 'down' } }));
-    const running = await startFromHarness(harness, { ORACLE_URL: oracle.url });
+    const keyFile = join(harness.dir, 'oracle.key');
+    await writeFile(keyFile, 'audit-oracle-key', 'utf8');
+    const fetchImpl = (async (): Promise<Response> => {
+      return new Response(JSON.stringify({ error: 'down' }), { status: 500 });
+    }) as typeof fetch;
+    const running = await startFromHarness(
+      harness,
+      { ORACLE_API_KEY_FILE: keyFile },
+      { fetchImpl }
+    );
     try {
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
         await callToolText(client, 'wiki_read', { path: 'xo-wiki/wiki/a.md' });
         await callToolText(client, 'wiki_read', { path: 'xo-wiki/wiki/secret.md' });
-        await callToolText(client, 'oracle_query', { question: 'what is M-129' });
+        await callToolText(client, 'oracle_search', { query: 'what is M-129' });
       });
       const lines = (await readFile(harness.auditLog, 'utf8'))
         .split('\n')
@@ -85,9 +93,9 @@ describe('wiki oracle and mailbox tools', () => {
       const audit = lines.join('\n');
       expect(audit).not.toContain(harness.tokens.grokbot);
       expect(audit).not.toContain(harness.dispatchToken);
+      expect(audit).not.toContain('audit-oracle-key');
     } finally {
       await running.close();
-      await oracle.close();
       await harness.cleanup();
     }
   });
@@ -139,15 +147,37 @@ describe('wiki oracle and mailbox tools', () => {
       'ghr_abcdefgh1234',
     ];
     const tokenText = tokens.join(' ');
-    const oracle = await startRecordingServer(() => ({
-      status: 200,
-      body: { answer: tokenText, top_score: 0.5, needs_human: false },
-    }));
     const harness = await createHarness();
-    const running = await startFromHarness(harness, { ORACLE_URL: oracle.url });
+    const keyFile = join(harness.dir, 'oracle.key');
+    await writeFile(keyFile, 'redact-oracle-key', 'utf8');
+    const fetchImpl = (async (): Promise<Response> => {
+      return new Response(
+        JSON.stringify({
+          query: 'q',
+          top_k: 5,
+          results: [
+            {
+              doc_id: 'd',
+              doc_title: 'T',
+              doc_source: 'wiki/x',
+              chunk_id: 'c',
+              chunk_idx: 0,
+              text: tokenText,
+              score: 0.5,
+            },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }) as typeof fetch;
+    const running = await startFromHarness(
+      harness,
+      { ORACLE_API_KEY_FILE: keyFile },
+      { fetchImpl }
+    );
     try {
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
-        const text = await callToolText(client, 'oracle_query', { question: tokenText });
+        const text = await callToolText(client, 'oracle_search', { query: tokenText });
         expect(text).toContain('[REDACTED]');
         for (const token of tokens) {
           expect(text).not.toContain(token);
@@ -166,7 +196,6 @@ describe('wiki oracle and mailbox tools', () => {
       }
     } finally {
       await running.close();
-      await oracle.close();
       await harness.cleanup();
     }
   });
@@ -246,36 +275,63 @@ describe('wiki oracle and mailbox tools', () => {
     }
   });
 
-  test('oracle_query_shapes_request_and_response', async () => {
-    const seen: RecordedHttpRequest[] = [];
-    const oracle = await startRecordingServer(request => {
-      seen.push(request);
-      return {
-        status: 200,
-        body: { answer: 'M-129 is the dispatch mailbox', top_score: 0.42, needs_human: false },
-      };
-    });
+  test('oracle_search_shapes_request_and_response', async () => {
+    const seen: Array<{ url: string; init: RequestInit }> = [];
     const harness = await createHarness();
-    const running = await startFromHarness(harness, { ORACLE_URL: oracle.url });
+    const key = 'shape-oracle-key';
+    const keyFile = join(harness.dir, 'oracle.key');
+    await writeFile(keyFile, key, 'utf8');
+    const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url =
+        typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      seen.push({ url, init: init ?? {} });
+      return new Response(
+        JSON.stringify({
+          query: 'what is M-129',
+          top_k: 5,
+          results: [
+            {
+              doc_id: 'd',
+              doc_title: 'T',
+              doc_source: 'wiki/x',
+              chunk_id: 'c',
+              chunk_idx: 0,
+              text: 'M-129 is the dispatch mailbox',
+              score: 0.42,
+            },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }) as typeof fetch;
+    const running = await startFromHarness(
+      harness,
+      { ORACLE_API_KEY_FILE: keyFile },
+      { fetchImpl }
+    );
     try {
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
         const body = parseToolJson(
-          await callToolText(client, 'oracle_query', { question: 'what is M-129' })
+          await callToolText(client, 'oracle_search', { query: 'what is M-129' })
         );
-        expect(body.answer).toBe('M-129 is the dispatch mailbox');
-        expect(body.top_score).toBe(0.42);
-        expect(body.needs_human).toBe(false);
+        expect(body.results).toEqual([
+          {
+            doc_title: 'T',
+            doc_source: 'wiki/x',
+            chunk_idx: 0,
+            score: 0.42,
+            text: 'M-129 is the dispatch mailbox',
+          },
+        ]);
       });
       expect(seen).toHaveLength(1);
-      expect(seen[0]?.body).toEqual({
-        session_id: 'companion-grokbot',
-        message: 'what is M-129',
-        page_url: '',
-        conversation_history: [],
-      });
+      expect(seen[0]?.url).toBe('https://oracle.bluedevilcollectibles.com/v1/search');
+      expect(seen[0]?.init.method).toBe('POST');
+      expect(seen[0]?.init.redirect).toBe('error');
+      expect(seen[0]?.init.body).toBe(JSON.stringify({ query: 'what is M-129', top_k: 5 }));
+      expect(new Headers(seen[0]?.init.headers).get('x-api-key')).toBe(key);
     } finally {
       await running.close();
-      await oracle.close();
       await harness.cleanup();
     }
   });
@@ -401,19 +457,37 @@ describe('wiki oracle and mailbox tools', () => {
         };
       })
     );
-    const oracle = await startRecordingServer(() => ({
-      status: 200,
-      body: {
-        answer: `ordinary answer ${BEARER_TAIL}`,
-        top_score: 0.42,
-        needs_human: false,
-      },
-    }));
     const harness = await createHarness();
-    const running = await startFromHarness(harness, {
-      DISPATCH_BASE_URL: dispatch.url,
-      ORACLE_URL: oracle.url,
-    });
+    const keyFile = join(harness.dir, 'oracle.key');
+    await writeFile(keyFile, 'nested-oracle-key', 'utf8');
+    const fetchImpl = (async (): Promise<Response> => {
+      return new Response(
+        JSON.stringify({
+          query: 'what is M-129',
+          top_k: 5,
+          results: [
+            {
+              doc_id: 'd',
+              doc_title: 'T',
+              doc_source: 'wiki/x',
+              chunk_id: 'c',
+              chunk_idx: 0,
+              text: `ordinary answer ${BEARER_TAIL}`,
+              score: 0.42,
+            },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }) as typeof fetch;
+    const running = await startFromHarness(
+      harness,
+      {
+        DISPATCH_BASE_URL: dispatch.url,
+        ORACLE_API_KEY_FILE: keyFile,
+      },
+      { fetchImpl }
+    );
     try {
       await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
         const listedText = await callToolText(client, 'mailbox_list', {});
@@ -431,21 +505,17 @@ describe('wiki oracle and mailbox tools', () => {
         const refused = parseToolJson(refusedText);
         expect(refused.error).toBe('not_own_message');
         expect(refusedText).not.toContain('XO-PRIVATE-BODY');
-        const oracleText = await callToolText(client, 'oracle_query', {
-          question: 'what is M-129',
+        const oracleText = await callToolText(client, 'oracle_search', {
+          query: 'what is M-129',
         });
         const answer = parseToolJson(oracleText);
-        expect(String(answer.answer)).toContain('ordinary answer');
+        const results = answer.results as Array<{ text?: string }>;
+        expect(String(results[0]?.text)).toContain('ordinary answer');
         expect(oracleText).not.toContain('abcdefghijklmnop');
-        expect(answer.top_score).toBe(0.42);
-        expect(typeof answer.top_score).toBe('number');
-        expect(answer.needs_human).toBe(false);
-        expect(typeof answer.needs_human).toBe('boolean');
       });
     } finally {
       await running.close();
       await dispatch.close();
-      await oracle.close();
       await harness.cleanup();
     }
   });

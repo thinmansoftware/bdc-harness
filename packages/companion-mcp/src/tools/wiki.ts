@@ -42,6 +42,23 @@ export async function boardRecordRead(
   return { path: requestedPath, text };
 }
 
+function countOccurrences(haystack: string, needle: string): number {
+  if (needle.length === 0) {
+    return 0;
+  }
+  let count = 0;
+  let from = 0;
+  while (from <= haystack.length) {
+    const found = haystack.indexOf(needle, from);
+    if (found === -1) {
+      return count;
+    }
+    count += 1;
+    from = found + needle.length;
+  }
+  return count;
+}
+
 export async function searchTree(
   root: string,
   tree: TrackedTree,
@@ -49,15 +66,15 @@ export async function searchTree(
   query: string,
   limit: number
 ): Promise<SearchHit[]> {
-  if (query.trim() === '') {
+  await tree.refreshIfHeadChanged();
+  const trimmed = query.trim();
+  if (trimmed === '') {
     throw new ToolFailure('refused', 'query_required');
   }
+  const terms = trimmed.split(/\s+/);
   const cap = Math.min(Math.max(limit, 1), WIKI_SEARCH_MAX);
-  const hits: SearchHit[] = [];
+  const ranked: { path: string; snippets: string[]; count: number }[] = [];
   for (const file of tree.list(prefix)) {
-    if (hits.length >= cap) {
-      break;
-    }
     let text: string;
     try {
       text = await readTrackedFile(root, file);
@@ -67,13 +84,44 @@ export async function searchTree(
       }
       throw error;
     }
-    const snippets = scrub(text)
+    const scrubbed = scrub(text);
+    const haystack = scrubbed.toLowerCase();
+    let total = 0;
+    let matchedAll = true;
+    for (const term of terms) {
+      const needle = term.toLowerCase();
+      const occurrences = countOccurrences(haystack, needle);
+      if (occurrences === 0) {
+        matchedAll = false;
+        break;
+      }
+      total += occurrences;
+    }
+    if (!matchedAll) {
+      continue;
+    }
+    const snippets = scrubbed
       .split('\n')
-      .filter(line => line.includes(query))
+      .filter(line => {
+        const lower = line.toLowerCase();
+        return terms.some(term => lower.includes(term.toLowerCase()));
+      })
       .slice(0, SNIPPETS_PER_HIT);
     if (snippets.length > 0) {
-      hits.push({ path: file, snippets });
+      ranked.push({ path: file, snippets, count: total });
     }
   }
-  return hits;
+  ranked.sort((left, right) => {
+    if (left.count !== right.count) {
+      return right.count - left.count;
+    }
+    if (left.path < right.path) {
+      return -1;
+    }
+    if (left.path > right.path) {
+      return 1;
+    }
+    return 0;
+  });
+  return ranked.slice(0, cap).map(hit => ({ path: hit.path, snippets: hit.snippets }));
 }

@@ -15,8 +15,8 @@ Grok Bot is the first enabled slot. Dot, Muse, and Duet are present in the
 example config with `enabled: false` and `board_secretary: false`. Enabling a
 slot is a config edit plus a process restart. No code change is required.
 
-Each enabled slot can search and read tracked wiki files, ask Oracle, and use
-its own Dispatch mailbox. A slot with `board_secretary: true` can also read
+Each enabled slot can search and read tracked wiki files, search Oracle
+retrieval, and use its own Dispatch mailbox. A slot with `board_secretary: true` can also read
 the board record, send a brief to named seats, collect replies from its own
 inbox, and open one pull request on `thinmansoftware/bdc-xo` that records the
 round. That pull request is reviewed and merged by the normal bdc-xo path.
@@ -62,9 +62,11 @@ gates in this runbook stay in force.
 
 The server lists tracked paths with `git ls-files` under `xo-wiki/wiki` and
 `docs/board` in `COMPANION_WIKI_ROOT`, then reads those working-tree bytes.
-At startup and every ten minutes it refreshes that list. The reader does not
-reject untracked files at runtime, detect runtime dirty state, or serve an
-immutable Git snapshot.
+At startup and every ten minutes it refreshes that list from `git ls-files`.
+A search also checks `git rev-parse HEAD` at most once every 60 seconds and
+rebuilds the list when HEAD changed. The reader does not reject untracked
+files at runtime, detect runtime dirty state, or serve an immutable Git
+snapshot.
 
 Before serving a selected clone with a valid `HEAD`, the operator must run:
 
@@ -125,7 +127,7 @@ Each slot:
 
 | Field | Meaning |
 | --- | --- |
-| companion_id | Slot name: grokbot, dot, muse, or duet |
+| companion_id | Slot name: grokbot, dot, muse, duet, or the disabled grok-bot knowledge example |
 | enabled | false until that companion is allowed to call |
 | dispatch_principal_id | Mailbox principal. Never xo, operator, john, board, or a system:/board: address |
 | token_sha256_file | File containing only the sha256 hex digest of the bearer token |
@@ -145,8 +147,16 @@ Other required environment:
 | COMPANION_MCP_AUDIT_LOG | One JSON line per tool call and per refused authentication |
 | COMPANION_MCP_REVOKED_FILE | JSON array of sha256 digests, re-read on every call |
 | COMPANION_WIKI_ROOT | Clean clone root |
-| ORACLE_URL | Oracle chatbot-query URL |
+| ORACLE_URL | Must be `https://oracle.bluedevilcollectibles.com/v1/search`. Any other URL, including the n8n webhook, refuses startup with `oracle_url_refused`. |
+| ORACLE_API_KEY_FILE | Path of the Oracle retrieval key file. Not required at startup. The value stays on the server and is never a tool argument. |
 | DISPATCH_BASE_URL | Archon Dispatch base, example `http://archon-app-1:3090` on network `archon_archon-network` |
+
+Optional session limits. A blank value uses the default. A non-integer or a value below 1 refuses startup.
+
+| Variable | Meaning |
+| --- | --- |
+| COMPANION_SESSION_IDLE_MS | Default `1800000` (30 minutes). Sessions idle longer than this are removed and closed transport-first, server-second. The approximately one-minute sweep can delay expiry by up to one minute. |
+| COMPANION_SESSION_MAX | Default `64`. Initializing beyond the cap closes and removes the least recently active session first. |
 
 Read only when `board_record_propose` runs, after local path and ruling checks:
 
@@ -156,6 +166,53 @@ Read only when `board_record_propose` runs, after local path and ruling checks:
 | COMPANION_BOARD_BASE | Example `main` |
 | COMPANION_GITHUB_TOKEN_FILE | One-line GitHub token. Read-only mount |
 | COMPANION_GITHUB_API_BASE | Optional. Unset sends the token only to `https://api.github.com`. Any other origin is refused before the token is sent, except an `http://127.0.0.1`, `http://localhost`, or `http://[::1]` stub with an explicit port. A token starting with `ghp_`, `gho_`, `ghr_`, `ghu_`, `ghs_`, or `github_pat_` is never sent to a stub. |
+
+## Knowledge group
+
+`wiki_search`, `wiki_read`, and `oracle_search` are the knowledge tools. The
+disabled `grok-bot` example is granted exactly those three.
+
+`wiki_search` matches every whitespace-separated term, case-insensitive,
+against tracked files under `xo-wiki/wiki`. Hits are ranked by total term
+count, then tracked path. Each hit includes that tracked path so the caller
+can cite it. `wiki_read` reads one tracked file under that prefix and refuses
+anything else.
+
+The tracked list is rebuilt from `git ls-files` at startup and on the
+ten-minute timer. A search checks `git rev-parse HEAD` at most once every 60
+seconds. When that SHA changed, the tracked list is rebuilt. A check inside
+the 60-second window runs no git command. `wiki_read` does not perform that
+HEAD check.
+
+`oracle_search` is read-only retrieval. It POSTs `{query, top_k}` to
+`ORACLE_URL` and returns chunks. It never returns an invented answer. An
+empty result list stays empty. `ORACLE_URL` must be
+`https://oracle.bluedevilcollectibles.com/v1/search`. Any other URL, including
+`https://n8n.bluedevilcollectibles.com/webhook/chatbot-query`, makes the
+server refuse to start with `oracle_url_refused`.
+
+The Oracle key is read from the file named by `ORACLE_API_KEY_FILE`. The
+server holds that key. This runbook does not record the value. A missing or
+empty file makes `oracle_search` return `refused` before any network call.
+
+Refresh the wiki checkout with the read-only GitHub token file. The token
+value is not written here:
+
+```bash
+deploy/companion-mcp/wiki-sync.sh <checkout> <token-file>
+```
+
+The script fetches `origin` and resets the checkout to `origin/main`. It
+passes the token-file path to a `GIT_ASKPASS` helper. The token is not placed
+in a URL, a git argument, or the script output.
+
+`deploy/companion-mcp/docker-compose.example.yml` intentionally retains its
+old webhook URL and will refuse startup until the deploy WO changes it.
+
+Acceptance question: Is Dispatch the work system of record, or are GitHub
+issues? Expected fact: Dispatch is transport; GitHub issues are the durable
+ledger. Canonical page:
+`xo-wiki/wiki/doctrine/dispatch-is-transport-github-issues-are-the-work-sor/_index.md`.
 
 ## Enable a disabled slot
 
