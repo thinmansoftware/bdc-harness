@@ -350,7 +350,7 @@ describe('run teardown (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01)', () => {
       },
     } as unknown as IWorkflowStore;
     await withRunLease(store, 'run-b', async () => 'done');
-    await releaseTerminalRunLeases(store, { ...fakeOpts(r), pathExists: () => true });
+    await releaseTerminalRunLeases(store, fakeOpts(r));
     expect(leaseRows.get('run-b')).toBe('released');
     expect(leaseRows.get('run-a')).toBeNull();
     expect(r.kill.calls).toEqual([]);
@@ -793,10 +793,7 @@ describe('run teardown (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01)', () => {
     };
     // A qualifying live process sits in the cancelled run's worktree.
     const r = fakeReader([{ pid: 6001, cwd: '/w/live', startTicks: Date.now() }]);
-    const report = await releaseTerminalRunLeases(store, {
-      ...fakeOpts(r),
-      pathExists: path => path !== '/gone/worktree',
-    });
+    const report = await releaseTerminalRunLeases(store, fakeOpts(r));
     const released = Object.fromEntries(
       (
         db.query('SELECT run_id, released_at FROM remote_agent_run_leases').all() as {
@@ -812,6 +809,54 @@ describe('run teardown (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01)', () => {
     expect(report.released).toBe(1);
     expect(r.kill.calls).toEqual([]);
     db.close();
+  });
+
+  it('Test 12b: reconciler scans a deleted worktree and keeps the lease while a cwd lives in it', async () => {
+    const leaseRows = new Map<string, string | null>([
+      ['gone-held', null],
+      ['gone-clear', null],
+      ['gone-unverifiable', null],
+    ]);
+    const paths: Record<string, string> = {
+      'gone-held': '/gone/held',
+      'gone-clear': '/gone/clear',
+      'gone-unverifiable': '/gone/unverifiable',
+    };
+    const store = {
+      listUnreleasedTerminalRunLeases: async (): Promise<TerminalRunLeaseRecord[]> =>
+        [...leaseRows.entries()]
+          .filter(([, rel]) => rel === null)
+          .map(([id]) => ({
+            runId: id,
+            status: 'failed',
+            workingPath: paths[id] ?? null,
+            startedAt: '2026-01-01 00:00:00',
+            completedAt: '2026-01-01 00:00:00',
+          })),
+      releaseTerminalRunLease: async (data: { runId: string }) => {
+        leaseRows.set(data.runId, 'released');
+        return true;
+      },
+    };
+    // The worktree directories are gone; one process still holds a deleted cwd
+    // (Linux reports '<path> (deleted)'), another holds a path under the old one.
+    const r = fakeReader([
+      { pid: 6101, cwd: '/gone/held (deleted)', startTicks: Date.now() },
+      { pid: 6102, cwd: '/gone/held/sub (deleted)', startTicks: Date.now() },
+    ]);
+    // Teardown that cannot be verified keeps every lease, missing directory or not.
+    const unverifiable = await releaseTerminalRunLeases(store, { platform: 'win32' });
+    expect([...leaseRows.values()]).toEqual([null, null, null]);
+    expect(unverifiable.held).toContainEqual({
+      runId: 'gone-unverifiable',
+      reason: 'teardown_unverifiable',
+    });
+
+    const report = await releaseTerminalRunLeases(store, fakeOpts(r));
+    expect(leaseRows.get('gone-held')).toBeNull();
+    expect(leaseRows.get('gone-clear')).toBe('released');
+    expect(report.held).toContainEqual({ runId: 'gone-held', reason: 'holder_present' });
+    expect(r.kill.calls).toEqual([]);
   });
 
   it('Test 13: repair_run_waits_for_not_before', async () => {

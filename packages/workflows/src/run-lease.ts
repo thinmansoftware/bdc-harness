@@ -77,13 +77,19 @@ export async function withRunLease<T>(
     // run whose teardown is unconfirmed keeps its lease. The release stays
     // token-matched, so a lease another worker re-claimed is never touched.
     // Non-terminal runs (paused, interrupted) keep the prior behavior.
+    // When the final run state cannot be established (read failed, row missing,
+    // store without getWorkflowRun) the lease is kept: release requires proof.
     const finalState = await readFinalRunState(store, runId);
-    let shouldRelease = leaseValid;
-    if (finalState?.terminal) {
+    let shouldRelease = false;
+    if (finalState === null) {
+      log.warn({ runId, ownerId, leaseValid }, 'run_lease_held_final_state_unknown');
+    } else if (finalState.terminal) {
       shouldRelease = finalState.teardownConfirmed;
       if (!finalState.teardownConfirmed) {
         log.warn({ runId, ownerId, leaseValid }, 'run_lease_held_teardown_unconfirmed');
       }
+    } else {
+      shouldRelease = leaseValid;
     }
     if (shouldRelease) {
       await store

@@ -45,7 +45,7 @@
  * group; this module deliberately does not.
  */
 import { execFileSync } from 'child_process';
-import { existsSync, readFileSync, readdirSync, readlinkSync, realpathSync } from 'fs';
+import { readFileSync, readdirSync, readlinkSync, realpathSync } from 'fs';
 import { resolve, sep } from 'path';
 import { createLogger } from '@archon/paths';
 import type { IWorkflowStore } from './store';
@@ -740,20 +740,20 @@ export interface TerminalLeaseReconcileReport {
  * Release leases left on terminal runs (N5). For each unreleased lease whose run
  * is terminal and completed more than 600 s ago, scan the run's worktree without
  * signaling anything; release only when no holder, no blocker and a complete
- * scan (a missing directory counts as clear). Never touches a non-terminal run.
+ * scan. A missing directory is scanned too: a live process can keep its cwd in a
+ * deleted worktree (the link reads '<path> (deleted)'). Teardown that cannot be
+ * verified keeps the lease. Never touches a non-terminal run.
  */
 export async function releaseTerminalRunLeases(
   store: Pick<IWorkflowStore, 'listUnreleasedTerminalRunLeases' | 'releaseTerminalRunLease'>,
   opts: TeardownOptions & {
     readonly minAgeMs?: number;
-    readonly pathExists?: (path: string) => boolean;
   } = {}
 ): Promise<TerminalLeaseReconcileReport> {
   const report: TerminalLeaseReconcileReport = { observed: 0, released: 0, held: [] };
   if (!store.listUnreleasedTerminalRunLeases || !store.releaseTerminalRunLease) return report;
   const now = opts.now ?? ((): Date => new Date());
   const minAgeMs = opts.minAgeMs ?? TERMINAL_LEASE_MIN_AGE_MS;
-  const pathExists = opts.pathExists ?? existsSync;
   const candidates = await store.listUnreleasedTerminalRunLeases();
   report.observed = candidates.length;
   for (const lease of candidates) {
@@ -767,7 +767,8 @@ export async function releaseTerminalRunLeases(
       continue;
     }
     let clear = false;
-    if (!lease.workingPath || !pathExists(lease.workingPath)) {
+    if (!lease.workingPath) {
+      // No working path: the run owns no process (identity rule (a)).
       clear = true;
     } else {
       const reader = readerFor(opts);
