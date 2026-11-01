@@ -130,6 +130,47 @@ describe('wiki oracle and mailbox tools', () => {
     }
   });
 
+  test('ghu_ghr_classic_tokens_redacted_in_tool_response_and_audit_args', async () => {
+    const tokens = [
+      'ghp_abcdefgh1234',
+      'gho_abcdefgh1234',
+      'ghu_abcdefgh1234',
+      'ghs_abcdefgh1234',
+      'ghr_abcdefgh1234',
+    ];
+    const tokenText = tokens.join(' ');
+    const oracle = await startRecordingServer(() => ({
+      status: 200,
+      body: { answer: tokenText, top_score: 0.5, needs_human: false },
+    }));
+    const harness = await createHarness();
+    const running = await startFromHarness(harness, { ORACLE_URL: oracle.url });
+    try {
+      await withClient(running.baseUrl, harness.tokens.grokbot, async client => {
+        const text = await callToolText(client, 'oracle_query', { question: tokenText });
+        expect(text).toContain('[REDACTED]');
+        for (const token of tokens) {
+          expect(text).not.toContain(token);
+        }
+      });
+      const lines = (await readFile(harness.auditLog, 'utf8'))
+        .split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0);
+      expect(lines).toHaveLength(1);
+      const event = JSON.parse(lines[0] ?? '') as Record<string, unknown>;
+      const argsText = JSON.stringify(event.args);
+      expect(argsText).toContain('[REDACTED]');
+      for (const token of tokens) {
+        expect(argsText).not.toContain(token);
+      }
+    } finally {
+      await running.close();
+      await oracle.close();
+      await harness.cleanup();
+    }
+  });
+
   test('search_scrubs_source_before_snippets', async () => {
     const harness = await createHarness();
     const running = await startFromHarness(harness);

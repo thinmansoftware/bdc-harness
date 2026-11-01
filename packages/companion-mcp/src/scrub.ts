@@ -1,6 +1,6 @@
 const PEM_PATTERN = /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g;
 const GITHUB_PAT_PATTERN = /github_pat_[A-Za-z0-9_]{8,}/g;
-const GITHUB_CLASSIC_PATTERN = /\bgh[pous]_[A-Za-z0-9]{8,}/g;
+const GITHUB_CLASSIC_PATTERN = /\bgh[pousr]_[A-Za-z0-9]{8,}/g;
 const ANTHROPIC_PATTERN = /sk-ant-[A-Za-z0-9_-]{8,}/g;
 const STRIPE_SECRET_PATTERN = /sk_(?:live|test)_[A-Za-z0-9]{8,}/g;
 const STRIPE_RESTRICTED_PATTERN = /rk_live_[A-Za-z0-9]{8,}/g;
