@@ -67,6 +67,8 @@ interface FakeProc {
   ignoreKill?: boolean;
   /** Process forked from this process's SIGTERM handler. */
   onTerm?: FakeProc;
+  /** Uid returned on successive readUid calls (last value repeats). */
+  uidSequence?: number[];
 }
 
 const SELF_PID = 99_999;
@@ -82,6 +84,7 @@ function fakeReader(procs: FakeProc[]): {
 } {
   const alive = new Map<number, FakeProc>(procs.map(p => [p.pid, p]));
   const statReads = new Map<number, number>();
+  const uidReads = new Map<number, number>();
   const reader: ProcReader = {
     listPids: () => [SELF_PID, ...alive.keys()],
     readCwd: pid => {
@@ -103,6 +106,11 @@ function fakeReader(procs: FakeProc[]): {
       if (pid === SELF_PID) return SELF_UID;
       const p = alive.get(pid);
       if (!p) throw errno('ENOENT');
+      if (p.uidSequence && p.uidSequence.length > 0) {
+        const n = uidReads.get(pid) ?? 0;
+        uidReads.set(pid, n + 1);
+        return p.uidSequence[Math.min(n, p.uidSequence.length - 1)] as number;
+      }
       return p.uid ?? SELF_UID;
     },
     bootTimeMs: () => 0,
@@ -455,6 +463,39 @@ describe('run teardown (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01)', () => {
       fakeOpts(r)
     );
     expect(r.kill.calls.filter(([pid]) => pid === 4242)).toEqual([]);
+  });
+
+  it('Test 8b: a uid change before a signal is identity_changed and never signaled', async () => {
+    // Case 1: uid changes between the scan and SIGTERM -> no signal at all.
+    const early = fakeReader([
+      { pid: 4250, cwd: '/w/WB', startTicks: 5000, uidSequence: [SELF_UID, 0] },
+    ]);
+    const r1 = await endRunProcessTree(
+      { id: 'b', working_path: '/w/WB', started_at: new Date(1000) },
+      fakeOpts(early)
+    );
+    expect(early.kill.calls).toEqual([]);
+    expect(r1.confirmed).toBe(false);
+    expect(r1.survivors).toContainEqual({ pid: 4250, comm: 'sleep', reason: 'identity_changed' });
+
+    // Case 2: the process ignores SIGTERM and its uid changes before SIGKILL ->
+    // SIGKILL is never sent and the pid is reported as identity_changed.
+    const late = fakeReader([
+      {
+        pid: 4251,
+        cwd: '/w/WB',
+        startTicks: 5000,
+        ignoreTerm: true,
+        uidSequence: [SELF_UID, SELF_UID, 0],
+      },
+    ]);
+    const r2 = await endRunProcessTree(
+      { id: 'b', working_path: '/w/WB', started_at: new Date(1000) },
+      fakeOpts(late)
+    );
+    expect(late.kill.calls).toEqual([[4251, 'SIGTERM']]);
+    expect(r2.confirmed).toBe(false);
+    expect(r2.survivors).toContainEqual({ pid: 4251, comm: 'sleep', reason: 'identity_changed' });
   });
 
   it('Test 9: scan_permission_failure_is_not_empty', async () => {

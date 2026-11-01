@@ -24,7 +24,13 @@
  *   (2) a same-uid process started by someone else (an operator shell) after the
  *       run began, with its cwd inside the run's worktree, is treated as
  *       run-owned and terminated at run end;
- *   (3) only Linux proves teardown.
+ *   (3) only Linux proves teardown;
+ *   (4) the window between the final re-read and `process.kill` is not closed: if
+ *       the verified process exits and its pid is reused by a new same-uid process
+ *       inside that window (microseconds; pid reuse needs the pid space to wrap),
+ *       the new process could receive the signal. Closing it needs a pidfd-bound
+ *       signal (pidfd_open plus pidfd_send_signal), which Bun does not expose; out
+ *       of scope, accepted by John 2026-11-01 via XO after five review rounds.
  * Additional limit found on ubuntu CI: a same-uid process whose cwd is unreadable
  * (non-dumpable, e.g. after a credential change) and that started at or before
  * the start-time floor is not observable and does not block; one that started
@@ -67,7 +73,8 @@ export type TeardownSurvivorReason =
   | 'scan_incomplete'
   | 'survived_kill'
   | 'teardown_unverifiable'
-  | 'path_shared_with_active_run';
+  | 'path_shared_with_active_run'
+  | 'identity_changed';
 
 export interface TeardownSurvivor {
   readonly pid?: number;
@@ -261,6 +268,7 @@ interface OwnedProcess {
   readonly pid: number;
   readonly startTicks: number;
   readonly comm: string;
+  readonly uid: number;
 }
 
 interface ScanResult {
@@ -363,17 +371,22 @@ function scanWorktree(
     } else if (!(startMs(reader, stat) > floorMs)) {
       blockers.push({ pid, comm: stat.comm, reason: 'predates_run' });
     } else {
-      owned.push({ pid, startTicks: stat.startTicks, comm: stat.comm });
+      owned.push({ pid, startTicks: stat.startTicks, comm: stat.comm, uid });
     }
   }
   return { owned, blockers, incomplete };
 }
 
-/** Re-read identity right before a signal: same start time, cwd still inside, not a zombie. */
+/**
+ * N2: re-read identity immediately before a signal -- same start time (a reused
+ * pid has a different one), cwd still inside the worktree, same real uid, not a
+ * zombie. Any change, any unreadable field, or a vanished pid fails the check.
+ */
 function stillSame(reader: ProcReader, proc: OwnedProcess, workingPath: string): boolean {
   try {
     const stat = reader.readStat(proc.pid);
     if (stat.startTicks !== proc.startTicks || stat.state === 'Z') return false;
+    if (reader.readUid(proc.pid) !== proc.uid) return false;
     const cwd = stripDeleted(reader.readCwd(proc.pid));
     return isPathInside(cwd, canonicalPath(workingPath)) || isPathInside(cwd, workingPath);
   } catch {
@@ -403,11 +416,16 @@ function safeSignal(
   proc: OwnedProcess,
   workingPath: string,
   signal: 'SIGTERM' | 'SIGKILL',
-  signaled: Set<number>
+  signaled: Set<number>,
+  identityChanged: Map<number, OwnedProcess>
 ): void {
   const pid = proc.pid;
   if (!Number.isInteger(pid) || pid <= 1 || pid === reader.selfPid()) return;
-  if (!stillSame(reader, proc, workingPath)) return;
+  if (!stillSame(reader, proc, workingPath)) {
+    // Ownership is no longer proven: never signal, report as identity_changed.
+    identityChanged.set(pid, proc);
+    return;
+  }
   try {
     kill(pid, signal);
     signaled.add(pid);
@@ -425,10 +443,13 @@ async function terminate(
   targets: readonly OwnedProcess[],
   workingPath: string,
   opts: { graceMs: number; confirmMs: number; pollMs: number }
-): Promise<{ survivors: OwnedProcess[]; signaled: number[] }> {
+): Promise<{ survivors: OwnedProcess[]; signaled: number[]; identityChanged: OwnedProcess[] }> {
   const signaled = new Set<number>();
-  for (const proc of targets) safeSignal(reader, kill, proc, workingPath, 'SIGTERM', signaled);
-  let alive = targets.filter(p => isAlive(reader, p));
+  const changed = new Map<number, OwnedProcess>();
+  for (const proc of targets) {
+    safeSignal(reader, kill, proc, workingPath, 'SIGTERM', signaled, changed);
+  }
+  let alive = targets.filter(p => !changed.has(p.pid) && isAlive(reader, p));
   let waited = 0;
   while (alive.length > 0 && waited < opts.graceMs) {
     await sleep(opts.pollMs);
@@ -436,7 +457,10 @@ async function terminate(
     alive = alive.filter(p => isAlive(reader, p));
   }
   if (alive.length > 0) {
-    for (const proc of alive) safeSignal(reader, kill, proc, workingPath, 'SIGKILL', signaled);
+    for (const proc of alive) {
+      safeSignal(reader, kill, proc, workingPath, 'SIGKILL', signaled, changed);
+    }
+    alive = alive.filter(p => !changed.has(p.pid));
     waited = 0;
     while (alive.length > 0 && waited < opts.confirmMs) {
       await sleep(opts.pollMs);
@@ -444,7 +468,7 @@ async function terminate(
       alive = alive.filter(p => isAlive(reader, p));
     }
   }
-  return { survivors: alive, signaled: [...signaled] };
+  return { survivors: alive, signaled: [...signaled], identityChanged: [...changed.values()] };
 }
 
 function unverifiable(): TeardownResult {
@@ -511,7 +535,7 @@ export async function endRunProcessTree(
       pollMs: opts.pollMs ?? TERMINATION_POLL_MS,
     };
     const first = scanWorktree(reader, run.working_path, floorMs);
-    const { survivors, signaled } = await terminate(
+    const { survivors, signaled, identityChanged } = await terminate(
       reader,
       kill,
       sleep,
@@ -529,6 +553,7 @@ export async function endRunProcessTree(
       seen.add(key);
       list.push(s);
     };
+    for (const s of identityChanged) push({ pid: s.pid, comm: s.comm, reason: 'identity_changed' });
     for (const s of survivors) push({ pid: s.pid, comm: s.comm, reason: 'survived_kill' });
     for (const p of final.owned) push({ pid: p.pid, comm: p.comm, reason: 'survived_kill' });
     for (const b of [...first.blockers, ...final.blockers]) push(b);
@@ -680,6 +705,9 @@ export async function endNodeProcessTree(
       seen.add(key);
       list.push(s);
     };
+    for (const s of [...first.identityChanged, ...second.identityChanged]) {
+      push({ pid: s.pid, comm: s.comm, reason: 'identity_changed' });
+    }
     for (const s of [...first.survivors, ...second.survivors, ...final.owned]) {
       push({ pid: s.pid, comm: s.comm, reason: 'survived_kill' });
     }
