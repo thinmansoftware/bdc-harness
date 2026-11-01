@@ -6,7 +6,7 @@ import {
   runMergeExecutionBridgeOnce,
   type MergeExecutionBridgeStore,
 } from '../merge-execution-bridge';
-import { specDeclaresMergeHold } from '../merge-hold';
+import { readWoSpecForMergeHold, specDeclaresMergeHold } from '../merge-hold';
 import { parseMergeRepoPolicy } from '../merge-repo-policy';
 import type {
   GitHubClientDeps,
@@ -1230,6 +1230,45 @@ describe('merge hold', () => {
     expect(specDeclaresMergeHold('merge_hold: true   ')).toBe(true);
     expect(specDeclaresMergeHold('Merge_Hold: TRUE')).toBe(true);
     expect(specDeclaresMergeHold('WO: WO-X-01\nmerge_hold: true\n\nBody text.\n')).toBe(true);
+    // `\s` used to swallow the newline and treat the next line's `true` as the value.
+    expect(specDeclaresMergeHold('merge_hold:\ntrue')).toBe(false);
+    expect(specDeclaresMergeHold('merge_hold:\r\ntrue')).toBe(false);
+    expect(specDeclaresMergeHold('merge_hold: \ntrue')).toBe(false);
+    expect(specDeclaresMergeHold('WO: WO-X-01\nmerge_hold:\ntrue\n')).toBe(false);
+    expect(specDeclaresMergeHold('merge_hold: true\r\n')).toBe(true);
+  });
+
+  test('malformed spec bytes throw so the hold stays unverified', async () => {
+    const woId = 'WO-X-01';
+    const clientFor = (content: string, encoding = 'base64') => ({
+      repos: {
+        getContent: async () => ({
+          data: { type: 'file' as const, encoding, content },
+        }),
+      },
+    });
+
+    const malformed = readWoSpecForMergeHold(woId, clientFor('!!!!'));
+    await expect(malformed).rejects.toMatchObject({
+      message: 'wo_spec_decode_failed',
+      status: 422,
+    });
+
+    const missingPadding = readWoSpecForMergeHold(woId, clientFor('YQ'));
+    await expect(missingPadding).rejects.toMatchObject({ status: 422 });
+
+    const invalidUtf8 = readWoSpecForMergeHold(
+      woId,
+      clientFor(Buffer.from([0xff, 0xfe]).toString('base64'))
+    );
+    await expect(invalidUtf8).rejects.toMatchObject({
+      message: 'wo_spec_decode_failed',
+      status: 422,
+    });
+
+    const spec = 'WO: WO-X-01\nmerge_hold: true\n';
+    const wrapped = Buffer.from(spec).toString('base64').replace(/.{60}/g, '$&\n');
+    await expect(readWoSpecForMergeHold(woId, clientFor(wrapped))).resolves.toBe(spec);
   });
 
   test('lifting the hold merges normally', async () => {
@@ -1259,6 +1298,28 @@ describe('merge hold', () => {
         reason: 'merge_executed',
       }),
     ]);
+  });
+
+  test('malformed spec base64 defers, never merges', async () => {
+    const row = { ...verdict('bad-b64'), wo_id: 'WO-X-01' };
+    const h = harness([row], greenPr());
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readWoSpec: woId =>
+        readWoSpecForMergeHold(woId, {
+          repos: {
+            getContent: async () => ({
+              data: { type: 'file', encoding: 'base64', content: '!!!!' },
+            }),
+          },
+        }),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([{ verdictId: 'bad-b64', reason: 'merge_hold_unverified' }]);
   });
 
   test('fetch error defers, never merges', async () => {

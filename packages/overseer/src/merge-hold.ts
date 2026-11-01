@@ -40,17 +40,35 @@ function decodeFailure(): Error & { status: number } {
   return error;
 }
 
+/** Canonical padded base64. Empty is an empty document, not a decode failure. */
+const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
 function decodeFile(data: GitHubContentFile | GitHubContentDirectoryEntry[]): string {
   if (Array.isArray(data) || data.type !== 'file' || typeof data.content !== 'string') {
     throw decodeFailure();
   }
   if (data.encoding !== 'base64') throw decodeFailure();
-  return Buffer.from(data.content.replace(/\s/g, ''), 'base64').toString('utf8');
+  // GitHub wraps base64 at 60 columns. Only those line breaks are removed.
+  // Node's Buffer decoder ignores illegal characters and replacement-decodes
+  // invalid UTF-8, which would turn a corrupt spec into a non-hold and merge.
+  const compact = data.content.replace(/[ \t\r\n]/g, '');
+  if (!CANONICAL_BASE64.test(compact)) throw decodeFailure();
+  const bytes = Buffer.from(compact, 'base64');
+  if (bytes.toString('base64') !== compact) throw decodeFailure();
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    throw decodeFailure();
+  }
 }
 
-/** Whole-line header only. Case-insensitive key and value; no comments or prose. */
+/**
+ * Whole-line header only. Case-insensitive key and value; no comments or prose.
+ * Spaces and tabs may surround `true`. A newline between the key and the value
+ * is not a header (`merge_hold:` and `true` on separate lines do not hold).
+ */
 export function specDeclaresMergeHold(text: string): boolean {
-  return /^merge_hold:\s*true\s*$/im.test(text);
+  return /^merge_hold:[ \t]*true[ \t]*\r?$/im.test(text);
 }
 
 /**
