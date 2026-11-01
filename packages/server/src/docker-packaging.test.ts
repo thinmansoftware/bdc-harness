@@ -105,4 +105,20 @@ describe('production Docker packaging', () => {
       expect(workflow).toContain(needle);
     }
   });
+
+  it('Test 1: production stage stamps the build commit', async () => {
+    const dockerfile = await readFile(
+      join(import.meta.dir, '..', '..', '..', 'Dockerfile'),
+      'utf8'
+    );
+    const runtime = dockerfile.split('AS production')[1] ?? '';
+    const labelLine = 'LABEL org.opencontainers.image.revision="${ARCHON_BUILD_SHA}"';
+
+    expect(runtime.split('\n')).toContain(labelLine);
+    const argAt = runtime.indexOf('ARG ARCHON_BUILD_SHA=unknown');
+    const labelAt = runtime.indexOf(labelLine);
+    expect(argAt).toBeGreaterThanOrEqual(0);
+    expect(labelAt).toBeGreaterThan(argAt);
+    expect(dockerfile.match(/org\.opencontainers\.image\.revision/g)).toHaveLength(1);
+  });
 });
