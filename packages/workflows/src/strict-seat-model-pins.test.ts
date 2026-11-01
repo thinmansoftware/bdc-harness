@@ -219,7 +219,7 @@ describe('strict seat model pins', () => {
         file: 'bdc-feature-development-codex.yaml',
         provider: 'codex',
         model: 'gpt-5.6-sol',
-        plan: { provider: 'claude', model: 'sonnet' },
+        plan: { provider: 'codex' },
         implement: { provider: 'codex', model: 'gpt-5.6-sol' },
       },
       {

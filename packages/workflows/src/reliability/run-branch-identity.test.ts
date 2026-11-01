@@ -26,7 +26,9 @@ const LANE_FILES = [
 
 const DEFAULTS_DIR = join(import.meta.dir, '../../../../.archon/workflows/defaults');
 
-function openPrNode(yaml: string): string {
+function openPrNode(rawYaml: string): string {
+  // Windows checkouts with core.autocrlf=true carry CRLF; normalise so the LF markers match.
+  const yaml = rawYaml.replace(/\r\n/g, '\n');
   const marker = '\n  - id: open-pr-if-needed\n';
   const start = yaml.indexOf(marker);
   if (start < 0) throw new Error('open-pr-if-needed node missing');
