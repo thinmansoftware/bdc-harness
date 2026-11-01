@@ -13,22 +13,29 @@
  * file -- is the load-bearing half there. A mocked store would prove nothing
  * about either.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test as bunTest } from 'bun:test';
 import { unlinkSync } from 'fs';
 import { join } from 'path';
+import { runWithBoundDatabase } from './isolated-database';
 
 let db: import('@archon/core/db/adapters/sqlite').SqliteAdapter;
 let currentDbPath = '';
 
-// mock.module() patches the PROCESS-GLOBAL registry, so spread the real module
-// and restore in afterAll or every later-loaded test file inherits this stub.
-import * as realConnection from '@archon/core/db/connection';
-mock.module('@archon/core/db/connection', () => ({ ...realConnection, getDatabase: () => db }));
-afterAll(() => {
-  mock.restore();
-});
+// getDatabase() follows the calling async context. mock.module() would replace
+// the process-wide connection module and close this file's adapter under every
+// other suite in `bun test packages/overseer/src/__tests__`.
+function test(name: string, fn: () => Promise<unknown>, timeout?: number): void {
+  bunTest(
+    name,
+    () => {
+      if (!db) throw new Error('required-contexts sqlite adapter was not created');
+      return runWithBoundDatabase(db, () => Promise.resolve(fn()));
+    },
+    timeout
+  );
+}
 
-// Dynamic imports AFTER mock.module so they bind the mocked connection.
+// Dynamic imports so production modules call getDatabase() at runtime.
 const { SqliteAdapter } = await import('@archon/core/db/adapters/sqlite');
 const requiredContextsDb = await import('@archon/core/db/overseer-required-contexts');
 const { createDurableAttemptCounterStore } = await import('../adapters/required-contexts-store.ts');

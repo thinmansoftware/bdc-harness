@@ -2,6 +2,13 @@ import { describe, expect, it } from 'bun:test';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
 
+// Root bunfig.toml sets [test] root = "./packages". Stop 5 passes
+// scripts/container/build-app-image.test.ts without a ./ prefix, so Bun
+// treats it as a name filter, searches only under packages/, and exits 0
+// without running Tests 2-5. Register that suite through this file, which
+// the same command does execute, and which package CI already runs.
+await import('../../../scripts/container/build-app-image.test');
+
 describe('production Docker packaging', () => {
   it('copies Smart Cauldron source required by the server runtime', async () => {
     const dockerfile = await readFile(
@@ -15,6 +22,18 @@ describe('production Docker packaging', () => {
     ).toHaveLength(2);
     expect(dockerfile).toContain('COPY packages/canary-suite/ ./packages/canary-suite/');
     expect(dockerfile).toContain('COPY .archon/ ./.archon/');
+  });
+
+  it('packages the run completion report script into the production image', async () => {
+    const dockerfile = await readFile(
+      join(import.meta.dir, '..', '..', '..', 'Dockerfile'),
+      'utf8'
+    );
+    const copyLine = dockerfile
+      .split(/\r?\n/)
+      .find(l => l.startsWith('COPY scripts/') && l.endsWith('./scripts/'));
+    expect(copyLine).toContain('scripts/run-completion-report.ts');
+    expect(dockerfile.split('AS production')[1]).toContain('scripts/run-completion-report.ts');
   });
 
   /**
@@ -104,5 +123,23 @@ describe('production Docker packaging', () => {
     ]) {
       expect(workflow).toContain(needle);
     }
+  });
+
+  it('Test 1: production stage stamps the build commit', async () => {
+    const dockerfile = await readFile(
+      join(import.meta.dir, '..', '..', '..', 'Dockerfile'),
+      'utf8'
+    );
+    const runtime = dockerfile.split('AS production')[1] ?? '';
+    const labelLine = 'LABEL org.opencontainers.image.revision="${ARCHON_BUILD_SHA}"';
+
+    // Split on CRLF too: on Windows checkouts (core.autocrlf / text=auto) the
+    // working-tree Dockerfile is CRLF, and a bare '\n' split leaves a trailing '\r'.
+    expect(runtime.split(/\r?\n/)).toContain(labelLine);
+    const argAt = runtime.indexOf('ARG ARCHON_BUILD_SHA=unknown');
+    const labelAt = runtime.indexOf(labelLine);
+    expect(argAt).toBeGreaterThanOrEqual(0);
+    expect(labelAt).toBeGreaterThan(argAt);
+    expect(dockerfile.match(/org\.opencontainers\.image\.revision/g)).toHaveLength(1);
   });
 });

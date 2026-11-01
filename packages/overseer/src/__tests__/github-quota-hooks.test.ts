@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { Octokit } from '@octokit/rest';
 import { attachGitHubQuotaHooks } from '../adapters/github-real-deps';
 import {
@@ -6,6 +6,9 @@ import {
   resetGitHubApiMeterForTests,
 } from '@archon/core/github/metering';
 
+// Aggregate runs can enter with leftover shared-app backoff from another file.
+// Reset before each case so a prior exhausted response cannot zero this file's requests.
+beforeEach(resetGitHubApiMeterForTests);
 afterEach(resetGitHubApiMeterForTests);
 
 describe('Octokit shared installation quota', () => {
