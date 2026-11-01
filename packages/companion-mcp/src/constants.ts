@@ -1,7 +1,7 @@
 export const BASE_TOOL_NAMES = [
   'wiki_search',
   'wiki_read',
-  'oracle_query',
+  'oracle_search',
   'mailbox_send',
   'mailbox_list',
   'mailbox_read',
@@ -47,6 +47,7 @@ export const DISPATCH_LIST_LIMIT = 500;
 export const ORACLE_TIMEOUT_MS = 70_000;
 export const ARG_MAX_CHARS = 500;
 export const TRACKED_REFRESH_MS = 10 * 60 * 1000;
+export const HEAD_CHECK_MS = 60_000;
 export const DEFAULT_PORT = 3095;
 
 export const WIKI_PREFIX = 'xo-wiki/wiki';
@@ -91,8 +92,8 @@ export function describeTool(name: string): string {
       return 'Search tracked xo-wiki/wiki files. Read-only.';
     case 'wiki_read':
       return 'Read one tracked xo-wiki/wiki file. Read-only.';
-    case 'oracle_query':
-      return 'Ask Oracle a question. Read-only.';
+    case 'oracle_search':
+      return 'Read-only retrieval that returns chunks and never an answer.';
     case 'mailbox_send':
       return 'Send an untrusted companion request to an allowlisted seat.';
     case 'mailbox_list':
