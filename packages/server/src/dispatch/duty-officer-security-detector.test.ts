@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { generateKeyPairSync } from 'node:crypto';
 import { rootLogger } from '@archon/paths';
+import * as serviceIdentity from '@archon/core/github/service-identity';
+import { githubToken, tickDutyOfficerClock, type DutyOfficerClockDeps } from './duty-officer-clock';
 import {
   resetSecurityDetectorStateForTests,
   classifyRuns,
@@ -19,11 +21,67 @@ function deps(
 ): SecurityDetectorDeps {
   return {
     fetchImpl,
-    readToken: () => null,
+    readToken: async () => null,
     writeTokenProvider: async () => null,
     now: () => now,
     buildSha: 'abc1234',
   };
+}
+
+const TOKEN_ENV_KEYS = [
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'DUTY_OFFICER_GH_NUDGE',
+  'GITHUB_APP_DUTY_OFFICER_ID',
+  'GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID',
+  'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY',
+  'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY_PATH',
+  'GITHUB_APP_TASKMASTER_ID',
+  'GITHUB_APP_TASKMASTER_INSTALLATION_ID',
+  'GITHUB_APP_TASKMASTER_PRIVATE_KEY',
+  'GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH',
+  'GITHUB_APP_ID',
+  'GITHUB_APP_INSTALLATION_ID',
+  'GITHUB_APP_PRIVATE_KEY',
+  'GITHUB_APP_PRIVATE_KEY_PATH',
+] as const;
+
+function snapshotEnv(keys: readonly string[]): Record<string, string | undefined> {
+  const saved: Record<string, string | undefined> = {};
+  for (const key of keys) saved[key] = process.env[key];
+  return saved;
+}
+
+function restoreEnv(saved: Record<string, string | undefined>): void {
+  for (const [key, value] of Object.entries(saved)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+function captureLogs(): { lines: string[]; restore: () => void } {
+  const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+    symbol => symbol.description === 'pino.stream'
+  );
+  if (streamSymbol === undefined) throw new Error('pino.stream symbol missing on rootLogger');
+  const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+    streamSymbol
+  ];
+  const lines: string[] = [];
+  const write = spyOn(stream, 'write').mockImplementation(line => {
+    lines.push(String(line));
+  });
+  return { lines, restore: () => write.mockRestore() };
+}
+
+function observationRecords(lines: string[]): Array<Record<string, unknown>> {
+  return lines
+    .map(line => line.trim())
+    .filter(
+      line =>
+        line.startsWith('{') && line.includes('duty_officer_security_detector_observation_error')
+    )
+    .map(line => JSON.parse(line) as Record<string, unknown>);
 }
 
 beforeEach(resetSecurityDetectorStateForTests);
@@ -32,6 +90,9 @@ afterEach(() => {
   resetSecurityDetectorStateForTests();
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS;
+  delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS;
+  delete process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS;
+  delete process.env.DUTY_OFFICER_GH_REPO;
   delete process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS;
 });
 
@@ -90,7 +151,7 @@ describe('duty officer security detector', () => {
           ]);
         }) as typeof fetch
       );
-      d.readToken = () => 'read-token';
+      d.readToken = async () => 'read-token';
       try {
         for (let run = 0; run < 2; run += 1) {
           if (allowList === undefined) delete process.env.DUTY_OFFICER_SECURITY_TRUSTED_LOGINS;
@@ -98,7 +159,8 @@ describe('duty officer security detector', () => {
           // Each trust check is an independent evaluation at the same deterministic time.
           resetSecurityDetectorStateForTests();
           const result = await runSecurityDetector({ ...d });
-          expect(result?.verdict).toBe('alarm');
+          expect(result?.verdict).toBe('observation_error');
+          expect(result?.last_error).toBe('app_auth_missing');
           const codes = result!.reasons.map(reason => reason.code);
           expect(codes.includes('receipt_missing')).toBe(!trusted);
           expect(codes.includes('unread')).toBe(!trusted);
@@ -164,7 +226,7 @@ describe('duty officer security detector', () => {
         return new Promise<Response>(() => {});
       }) as typeof fetch
     );
-    d.readToken = () => 'read-token';
+    d.readToken = async () => 'read-token';
     d.writeTokenProvider = mock(async () => 'app-token');
     const controller = new AbortController();
     const signal = controller.signal;
@@ -198,7 +260,7 @@ describe('duty officer security detector', () => {
         return Response.json({ number: 42 });
       }) as typeof fetch
     );
-    d.readToken = () => 'read-token';
+    d.readToken = async () => 'read-token';
     d.writeTokenProvider = async () => 'app-token';
     await expect(runSecurityDetector(d, controller.signal)).rejects.toThrow('test_deadline');
     expect(writes).toEqual(['POST']);
@@ -213,7 +275,7 @@ describe('duty officer security detector', () => {
         return Response.json(String(_url).includes('/runs?') ? { workflow_runs: [] } : []);
       }) as typeof fetch
     );
-    d.readToken = () => 'read-token';
+    d.readToken = async () => 'read-token';
     d.writeTokenProvider = async signal => {
       expect(signal).toBe(controller.signal);
       controller.abort(new Error('test_deadline'));
@@ -307,7 +369,7 @@ describe('duty officer security detector', () => {
 
   test('writes_use_app_token_reads_use_pat_and_no_app_means_no_writes', async () => {
     const d = deps();
-    d.readToken = () => null;
+    d.readToken = async () => null;
     d.writeTokenProvider = mock(async () => 'ghs_app');
     const result = await runSecurityDetector(d);
     expect(result?.wrote).toHaveLength(0);
@@ -317,5 +379,543 @@ describe('duty officer security detector', () => {
   test('never_labels_detector_issue_security_scan_and_tolerates_label_422 contract', () => {
     const detectorLabels = ['security-detector', 'prio:P0'];
     expect(detectorLabels).not.toContain('security-scan');
+  });
+
+  test('observation_error logs carry last_error', async () => {
+    const saved = snapshotEnv(TOKEN_ENV_KEYS);
+    const logs = captureLogs();
+    try {
+      for (const key of TOKEN_ENV_KEYS) delete process.env[key];
+      process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT = '2026-09-01';
+      const missing = await runSecurityDetector(deps());
+      expect(missing?.last_error).toBe('duty_officer_github_token_missing');
+      const missingRecords = observationRecords(logs.lines);
+      expect(missingRecords.length).toBeGreaterThan(0);
+      for (const record of missingRecords) {
+        expect(record.last_error).toBe('duty_officer_github_token_missing');
+        expect(record.identity_kind).toBe('pat');
+      }
+
+      logs.lines.length = 0;
+      resetSecurityDetectorStateForTests();
+      process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
+      process.env.DUTY_OFFICER_GH_REPO = 'owner/write';
+      let fetches = 0;
+      const failing = deps(
+        mock(async () => {
+          fetches += 1;
+          return new Response('unavailable', { status: 500 });
+        }) as typeof fetch
+      );
+      failing.readToken = async () => 'read-token';
+      failing.writeTokenProvider = async () => 'write-token';
+      const httpError = await runSecurityDetector(failing);
+      expect(httpError?.verdict).toBe('observation_error');
+      expect(httpError?.last_error).toBe('duty_officer_github_http_500');
+      // One retry on HTTP 500: workflow runs, then the issue list.
+      expect(fetches).toBe(4);
+      const httpRecords = observationRecords(logs.lines);
+      expect(httpRecords.length).toBeGreaterThan(0);
+      for (const record of httpRecords) {
+        expect(record.last_error).toBe('duty_officer_github_http_500');
+        expect(record.err).toBeDefined();
+      }
+    } finally {
+      logs.restore();
+      restoreEnv(saved);
+    }
+  });
+
+  test('error run retries after the backoff and a clean run keeps the normal interval', async () => {
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS = '60000';
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT = '2026-09-01';
+    process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
+    process.env.DUTY_OFFICER_GH_REPO = 'owner/write';
+    const t0 = Date.parse('2026-09-30T12:00:00.000Z');
+    let nowMs = t0;
+    let token: string | null = null;
+    const writes: string[] = [];
+    const fetchImpl = mock(async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if ((init?.method ?? 'GET') !== 'GET') {
+        writes.push(init?.method ?? 'POST');
+        return Response.json({ number: 77, id: 9 });
+      }
+      if (href.includes('/runs?')) {
+        return Response.json({
+          workflow_runs: [{ created_at: '2026-09-29T00:00:00.000Z', conclusion: 'success' }],
+        });
+      }
+      if (href.includes('/comments')) {
+        return Response.json([
+          {
+            id: 1,
+            user: { login: 'bluedevilcollectibles' },
+            body: '<!-- host-inventory -->\nposted_at: 2026-09-29T00:00:00Z',
+          },
+          { id: 2, user: { login: 'bluedevilcollectibles' }, body: 'TRIAGED ok' },
+        ]);
+      }
+      return Response.json([
+        {
+          number: 77,
+          title: 'Security Scan -- 2026-W40',
+          labels: ['security-scan'],
+          state: 'open',
+          body: 'weekly',
+          created_at: '2026-09-28T00:00:00.000Z',
+          updated_at: '2026-09-29T00:00:00.000Z',
+        },
+      ]);
+    });
+    const d = deps(fetchImpl as typeof fetch);
+    d.readToken = async () => token;
+    d.writeTokenProvider = async () => 'write-token';
+    d.now = () => new Date(nowMs);
+    const logs = captureLogs();
+    try {
+      const first = await runSecurityDetector(d);
+      expect(first?.verdict).toBe('observation_error');
+      expect(fetchImpl).not.toHaveBeenCalled();
+
+      nowMs = t0 + 61_000;
+      token = 'read-token';
+      const second = await runSecurityDetector(d);
+      expect(second?.verdict).toBe('clean');
+      expect(second?.wrote).toContain('marker_patched');
+      expect(writes.length).toBeGreaterThan(0);
+
+      const callsAfterClean = fetchImpl.mock.calls.length;
+      logs.lines.length = 0;
+      nowMs = t0 + 62_000;
+      const third = await runSecurityDetector(d);
+      expect(third).toBeNull();
+      expect(fetchImpl.mock.calls.length).toBe(callsAfterClean);
+      expect(
+        logs.lines.some(line => line.includes('duty_officer_security_detector_skipped_throttle'))
+      ).toBe(true);
+    } finally {
+      logs.restore();
+    }
+  });
+
+  test('repeated observation errors retry on the backoff boundary and do not spin', async () => {
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS = '60000';
+    const executed: number[] = [];
+    for (let seconds = 0; seconds <= 120; seconds += 10) {
+      const at = seconds * 1000;
+      const result = await runSecurityDetector({
+        ...deps(),
+        readToken: async () => null,
+        now: () => new Date(at),
+      });
+      if (result !== null) {
+        expect(result.verdict).toBe('observation_error');
+        executed.push(seconds);
+      }
+    }
+    expect(executed).toEqual([0, 60, 120]);
+  });
+
+  test('github write and marker failures record observation_error backoff', async () => {
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS = '60000';
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT = '2026-09-01';
+    process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
+    process.env.DUTY_OFFICER_GH_REPO = 'owner/write';
+    const t0 = Date.parse('2026-09-30T12:00:00.000Z');
+    const logs = captureLogs();
+    try {
+      for (const failingPath of ['/issues', '/comments']) {
+        resetSecurityDetectorStateForTests();
+        logs.lines.length = 0;
+        let nowMs = t0;
+        const writes: string[] = [];
+        const fetchImpl = mock(async (url: string | URL | Request, init?: RequestInit) => {
+          const href = String(url);
+          const method = init?.method ?? 'GET';
+          if (method !== 'GET') {
+            writes.push(href);
+            const isCommentWrite = href.includes('/comments') && !href.includes('/comments?');
+            const isIssueWrite = href.includes('/issues') && !isCommentWrite;
+            if (
+              (failingPath === '/comments' && isCommentWrite) ||
+              (failingPath === '/issues' && isIssueWrite)
+            ) {
+              return new Response('unavailable', { status: 500 });
+            }
+            return Response.json({
+              number: 88,
+              id: 9,
+              title: 'created',
+              state: 'open',
+              body: 'created',
+              created_at: '2026-09-30T12:00:00.000Z',
+              updated_at: '2026-09-30T12:00:00.000Z',
+            });
+          }
+          if (href.includes('/runs?')) {
+            return Response.json({
+              workflow_runs: [{ created_at: '2026-09-29T00:00:00.000Z', conclusion: 'success' }],
+            });
+          }
+          if (href.includes('/comments')) {
+            return Response.json([]);
+          }
+          return Response.json([
+            {
+              number: 77,
+              title: 'Security Scan -- 2026-W40',
+              labels: ['security-scan'],
+              state: 'open',
+              body: 'weekly',
+              created_at: '2026-09-28T00:00:00.000Z',
+              updated_at: '2026-09-29T00:00:00.000Z',
+            },
+          ]);
+        });
+        const d = deps(fetchImpl as typeof fetch);
+        d.readToken = async () => 'read-token';
+        d.writeTokenProvider = async () => 'write-token';
+        d.now = () => new Date(nowMs);
+
+        const first = await runSecurityDetector(d);
+        expect(first?.verdict).toBe('observation_error');
+        expect(first?.last_error).toBe('duty_officer_github_http_500');
+        expect(writes.some(href => href.includes(failingPath))).toBe(true);
+        if (failingPath === '/comments') {
+          expect(first?.wrote).toContain('issue_opened');
+          expect(first?.wrote).not.toContain('marker_patched');
+        } else {
+          expect(first?.wrote).toEqual([]);
+        }
+        expect(
+          observationRecords(logs.lines).some(
+            record => record.last_error === 'duty_officer_github_http_500'
+          )
+        ).toBe(true);
+
+        const callsAfterFailure = fetchImpl.mock.calls.length;
+        nowMs = t0 + 30_000;
+        expect(await runSecurityDetector(d)).toBeNull();
+        expect(fetchImpl.mock.calls.length).toBe(callsAfterFailure);
+
+        nowMs = t0 + 61_000;
+        const retried = await runSecurityDetector(d);
+        expect(retried?.verdict).toBe('observation_error');
+        expect(fetchImpl.mock.calls.length).toBeGreaterThan(callsAfterFailure);
+      }
+    } finally {
+      logs.restore();
+    }
+  });
+
+  test('write token mint failures record observation_error backoff', async () => {
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS = '60000';
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT = '2026-09-01';
+    process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
+    process.env.DUTY_OFFICER_GH_REPO = 'owner/write';
+    const t0 = Date.parse('2026-09-30T12:00:00.000Z');
+    const logs = captureLogs();
+    try {
+      for (const mode of ['rejected', 'null'] as const) {
+        resetSecurityDetectorStateForTests();
+        logs.lines.length = 0;
+        let nowMs = t0;
+        const writes: string[] = [];
+        const fetchImpl = mock(async (url: string | URL | Request, init?: RequestInit) => {
+          const href = String(url);
+          const method = init?.method ?? 'GET';
+          if (method !== 'GET') {
+            writes.push(href);
+            return Response.json({ number: 77, id: 9 });
+          }
+          if (href.includes('/runs?')) {
+            return Response.json({
+              workflow_runs: [{ created_at: '2026-09-29T00:00:00.000Z', conclusion: 'success' }],
+            });
+          }
+          if (href.includes('/comments')) {
+            return Response.json([
+              {
+                id: 1,
+                user: { login: 'bluedevilcollectibles' },
+                body: '<!-- host-inventory -->\nposted_at: 2026-09-29T00:00:00Z',
+              },
+              { id: 2, user: { login: 'bluedevilcollectibles' }, body: 'TRIAGED ok' },
+            ]);
+          }
+          return Response.json([
+            {
+              number: 77,
+              title: 'Security Scan -- 2026-W40',
+              labels: ['security-scan'],
+              state: 'open',
+              body: 'weekly',
+              created_at: '2026-09-28T00:00:00.000Z',
+              updated_at: '2026-09-29T00:00:00.000Z',
+            },
+          ]);
+        });
+        const d = deps(fetchImpl as typeof fetch);
+        d.readToken = async () => 'read-token';
+        const expectedError = mode === 'rejected' ? 'app_token_mint_failed' : 'app_auth_missing';
+        d.writeTokenProvider =
+          mode === 'rejected'
+            ? async () => {
+                throw new Error('app_token_mint_failed');
+              }
+            : async () => null;
+        d.now = () => new Date(nowMs);
+
+        const first = await runSecurityDetector(d);
+        expect(first?.verdict).toBe('observation_error');
+        expect(first?.last_error).toBe(expectedError);
+        expect(first?.wrote).toEqual([]);
+        expect(writes).toEqual([]);
+        expect(
+          observationRecords(logs.lines).some(record => record.last_error === expectedError)
+        ).toBe(true);
+
+        const callsAfterFailure = fetchImpl.mock.calls.length;
+        nowMs = t0 + 30_000;
+        expect(await runSecurityDetector(d)).toBeNull();
+        expect(fetchImpl.mock.calls.length).toBe(callsAfterFailure);
+
+        nowMs = t0 + 61_000;
+        const retried = await runSecurityDetector(d);
+        expect(retried?.verdict).toBe('observation_error');
+        expect(retried?.last_error).toBe(expectedError);
+        expect(retried?.wrote).toEqual([]);
+        expect(fetchImpl.mock.calls.length).toBeGreaterThan(callsAfterFailure);
+      }
+    } finally {
+      logs.restore();
+    }
+  });
+});
+
+function stallClockDeps(
+  securityDetector: DutyOfficerClockDeps['securityDetector'],
+  now: () => Date
+): DutyOfficerClockDeps {
+  return {
+    registerWorker: mock(async data => ({
+      ...data,
+      status: 'available' as const,
+      registered_at: new Date(0).toISOString(),
+      last_heartbeat_at: new Date(0).toISOString(),
+    })),
+    heartbeatWorker: mock(async data => ({
+      worker_id: data.worker_id,
+      host: 'test',
+      capabilities: {},
+      max_concurrency: 1,
+      status: data.status ?? 'available',
+      registered_at: new Date(0).toISOString(),
+      last_heartbeat_at: new Date(0).toISOString(),
+    })),
+    listMessages: mock(async () => []),
+    claimMessage: mock(async () => null),
+    postResult: mock(async () => null),
+    releaseMessage: mock(async () => null),
+    createAuthenticatedMessage: mock(async () => ({ id: 'xo-msg' })),
+    getCurrentXoLease: mock(async () => null),
+    listStaleIssues: mock(async () => []),
+    postIssueComment: mock(async () => false),
+    judge: mock(async () => ({
+      status: 'ok' as const,
+      transport: 'test',
+      action: 'hold' as const,
+      reason: 'test',
+      body: '',
+      failures: [],
+    })),
+    securityDetector,
+    now,
+  };
+}
+
+describe('token mint stall', () => {
+  test('tokenMintStallsDetector releases the guard when installation mint never resolves', async () => {
+    const envKeys = [
+      ...TOKEN_ENV_KEYS,
+      'DUTY_OFFICER_GITHUB_TIMEOUT_MS',
+      'DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS',
+      'DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS',
+      'DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT',
+      'DUTY_OFFICER_SECURITY_SCAN_REPOS',
+      'DUTY_OFFICER_GH_REPO',
+      'DUTY_OFFICER_GH_NUDGE',
+    ];
+    const saved = snapshotEnv(envKeys);
+    const logs = captureLogs();
+    let resolveSpy: { mockRestore: () => void } | null = null;
+    let mintSpy: { mockRestore: () => void } | null = null;
+    try {
+      serviceIdentity.clearServiceGitHubTokenCache();
+      const { privateKey } = generateKeyPairSync('rsa', {
+        modulusLength: 2048,
+        privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+        publicKeyEncoding: { type: 'spki', format: 'pem' },
+      });
+      delete process.env.GH_TOKEN;
+      delete process.env.GITHUB_TOKEN;
+      process.env.GITHUB_APP_DUTY_OFFICER_ID = '12345';
+      process.env.GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID = '67890';
+      process.env.GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY = privateKey;
+      const mintSignal = new AbortController().signal;
+      let forwarded: AbortSignal | undefined;
+      const mintFetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+        forwarded = init?.signal ?? undefined;
+        return Response.json({
+          token: 'minted-installation-token',
+          expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+        });
+      });
+      const identity = serviceIdentity.resolveServiceGitHubAuth('duty_officer');
+      expect(identity.kind).toBe('app');
+      const minted = await serviceIdentity.getServiceGitHubToken(identity, {
+        fetch: mintFetch as typeof fetch,
+        signal: mintSignal,
+      });
+      expect(minted).toBe('minted-installation-token');
+      expect(forwarded).toBe(mintSignal);
+      serviceIdentity.clearServiceGitHubTokenCache();
+
+      delete process.env.DUTY_OFFICER_GH_NUDGE;
+      process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS = '30';
+      process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS = '60000';
+      process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS = '1000';
+      process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT = '2026-09-01';
+      process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
+      process.env.DUTY_OFFICER_GH_REPO = 'owner/write';
+      resetSecurityDetectorStateForTests();
+      const auths: string[] = [];
+      const fetchImpl = mock(async (url: string | URL | Request, init?: RequestInit) => {
+        auths.push(new Headers(init?.headers).get('authorization') ?? '');
+        return Response.json(String(url).includes('/runs?') ? { workflow_runs: [] } : []);
+      });
+      let nowMs = Date.parse('2026-09-30T12:00:00.000Z');
+      resolveSpy = spyOn(serviceIdentity, 'resolveServiceGitHubAuth').mockReturnValue({
+        kind: 'app',
+        service: 'duty_officer',
+        appId: '4574893',
+        installationId: '153295654',
+        privateKey: 'PEM_SENTINEL_DO_NOT_LOG',
+        poolId: 'app-stall-detector',
+        distinct: true,
+      });
+      let hangMint = true;
+      mintSpy = spyOn(serviceIdentity, 'getServiceGitHubToken').mockImplementation(() =>
+        hangMint ? new Promise<string>(() => {}) : Promise.resolve('t-app')
+      );
+      const clock = stallClockDeps(
+        signal =>
+          runSecurityDetector(
+            {
+              fetchImpl: fetchImpl as typeof fetch,
+              readToken: githubToken,
+              writeTokenProvider: async () => null,
+              now: () => new Date(nowMs),
+              buildSha: 'stall123',
+            },
+            signal
+          ),
+        () => new Date(nowMs)
+      );
+      await tickDutyOfficerClock(clock);
+      expect(
+        logs.lines.some(line => line.includes('duty_officer_security_detector_observation_error'))
+      ).toBe(true);
+      expect(
+        logs.lines.some(line => line.includes('duty_officer_security_detector_skipped_in_flight'))
+      ).toBe(false);
+      expect(auths).toEqual([]);
+
+      hangMint = false;
+      nowMs += 1_001;
+      const mark = logs.lines.length;
+      await tickDutyOfficerClock(clock);
+      const secondLogs = logs.lines.slice(mark).join('');
+      expect(secondLogs).not.toContain('duty_officer_security_detector_skipped_in_flight');
+      expect(auths.length).toBeGreaterThan(0);
+      expect(auths.every(header => header === 'Bearer t-app')).toBe(true);
+      resolveSpy.mockRestore();
+      resolveSpy = null;
+      mintSpy.mockRestore();
+      mintSpy = null;
+
+      resetSecurityDetectorStateForTests();
+      process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS = '60000';
+      process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS = '40';
+      process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS = '1000';
+      const directAuths: string[] = [];
+      const directFetch = mock(async (_url: string | URL | Request, init?: RequestInit) => {
+        directAuths.push(new Headers(init?.headers).get('authorization') ?? '');
+        return Response.json(String(_url).includes('/runs?') ? { workflow_runs: [] } : []);
+      });
+      let directNow = Date.parse('2026-10-02T12:00:00.000Z');
+      const stalled = await runSecurityDetector(
+        {
+          fetchImpl: directFetch as typeof fetch,
+          readToken: () => new Promise<string | null>(() => {}),
+          writeTokenProvider: async () => null,
+          now: () => new Date(directNow),
+          buildSha: 'stall123',
+        },
+        AbortSignal.timeout(40)
+      );
+      expect(stalled?.verdict).toBe('observation_error');
+      expect(stalled?.last_error).toBe('duty_officer_github_token_missing');
+      expect(directAuths).toEqual([]);
+      directNow += 1_001;
+      await runSecurityDetector(
+        {
+          fetchImpl: directFetch as typeof fetch,
+          readToken: async () => 't-app',
+          writeTokenProvider: async () => null,
+          now: () => new Date(directNow),
+          buildSha: 'stall123',
+        },
+        AbortSignal.timeout(60_000)
+      );
+      expect(directAuths.length).toBeGreaterThan(0);
+      expect(directAuths.every(header => header === 'Bearer t-app')).toBe(true);
+
+      resolveSpy = spyOn(serviceIdentity, 'resolveServiceGitHubAuth').mockReturnValue({
+        kind: 'app',
+        service: 'duty_officer',
+        appId: '4574893',
+        installationId: '153295654',
+        privateKey: 'PEM_SENTINEL_DO_NOT_LOG',
+        poolId: 'app-stall-parentless',
+        distinct: true,
+      });
+      mintSpy = spyOn(serviceIdentity, 'getServiceGitHubToken').mockImplementation(
+        () => new Promise<string>(() => {})
+      );
+      process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS = '30';
+      const started = Date.now();
+      expect(await githubToken()).toBeNull();
+      expect(Date.now() - started).toBeLessThan(4_000);
+      resolveSpy.mockRestore();
+      resolveSpy = null;
+      mintSpy.mockRestore();
+      mintSpy = null;
+
+      const joined = logs.lines.join('');
+      expect(joined).not.toContain('minted-installation-token');
+      expect(joined).not.toContain('t-app');
+      expect(joined).not.toContain('PEM_SENTINEL_DO_NOT_LOG');
+      expect(joined).not.toContain(privateKey);
+      expect(joined).not.toContain('BEGIN PRIVATE KEY');
+    } finally {
+      resolveSpy?.mockRestore();
+      mintSpy?.mockRestore();
+      logs.restore();
+      restoreEnv(saved);
+      serviceIdentity.clearServiceGitHubTokenCache();
+      resetSecurityDetectorStateForTests();
+    }
   });
 });
