@@ -65,6 +65,8 @@ interface FakeProc {
   restartTicks?: number;
   ignoreTerm?: boolean;
   ignoreKill?: boolean;
+  /** Process forked from this process's SIGTERM handler. */
+  onTerm?: FakeProc;
 }
 
 const SELF_PID = 99_999;
@@ -118,6 +120,7 @@ function fakeReader(procs: FakeProc[]): {
     calls.push([pid, signal]);
     const p = alive.get(pid);
     if (!p) throw errno('ESRCH');
+    if (signal === 'SIGTERM' && p.onTerm) alive.set(p.onTerm.pid, p.onTerm);
     if (signal === 'SIGTERM' && !p.ignoreTerm) alive.delete(pid);
     if (signal === 'SIGKILL' && !p.ignoreKill) alive.delete(pid);
   }) as KillFn & { calls: [number, string][] };
@@ -585,6 +588,97 @@ describe('run teardown (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01)', () => {
     expect(r.kill.calls.map(([pid]) => pid)).toEqual([8001]);
     expect(result.confirmed).toBe(true);
   });
+
+  it('Test 10d: node teardown final scan finds a child forked in the SIGTERM handler (fake /proc)', async () => {
+    const env = `PATH=/bin\u0000${NODE_TOKEN_ENV}=run-t:node-a\u0000`;
+    // Case 1: the forked child dies on SIGTERM -> found and killed, confirmed.
+    const killable = fakeReader([
+      {
+        pid: 9001,
+        cwd: '/w/WT',
+        startTicks: 2000,
+        environ: env,
+        onTerm: { pid: 9002, cwd: '/w/WT', startTicks: 2500, environ: env },
+      },
+    ]);
+    const ok = await endNodeProcessTree(
+      {
+        run: { id: 'run-t', working_path: '/w/WT', started_at: new Date(100) },
+        nodeStartMs: 1500,
+        nodeToken: 'run-t:node-a',
+      },
+      fakeOpts(killable)
+    );
+    expect(killable.kill.calls.map(([pid]) => pid)).toEqual([9001, 9002]);
+    expect(ok.confirmed).toBe(true);
+    // Case 2: the forked child ignores every signal -> reported as a survivor.
+    const stubborn = fakeReader([
+      {
+        pid: 9101,
+        cwd: '/w/WT',
+        startTicks: 2000,
+        environ: env,
+        onTerm: {
+          pid: 9102,
+          cwd: '/w/WT',
+          startTicks: 2500,
+          environ: env,
+          ignoreTerm: true,
+          ignoreKill: true,
+        },
+      },
+    ]);
+    const held = await endNodeProcessTree(
+      {
+        run: { id: 'run-t', working_path: '/w/WT', started_at: new Date(100) },
+        nodeStartMs: 1500,
+        nodeToken: 'run-t:node-a',
+      },
+      fakeOpts(stubborn)
+    );
+    expect(held.confirmed).toBe(false);
+    expect(held.survivors).toContainEqual({ pid: 9102, comm: 'sleep', reason: 'survived_kill' });
+  });
+
+  linuxIt(
+    'Test 10e: node teardown reaps a child forked in a real SIGTERM trap',
+    async () => {
+      const root = tempRoot();
+      const wt = join(root, 'WT');
+      mkdirSync(wt);
+      const runStart = new Date(Date.now() - 2000);
+      await sleepMs(300);
+      const nodeStart = Date.now();
+      await sleepMs(300);
+      const token = 'run-t:node-trap';
+      spawnDetached(
+        'bash',
+        ['-c', 'trap "sleep 300 >/dev/null 2>&1 & exit 0" TERM; while :; do sleep 0.2; done'],
+        wt,
+        { ...process.env, [NODE_TOKEN_ENV]: token }
+      );
+      await sleepMs(500);
+      strayPids.push(...pidsUnder(wt));
+      const result = await endNodeProcessTree({
+        run: { id: 'run-t', working_path: wt, started_at: runStart },
+        nodeStartMs: nodeStart,
+        nodeToken: token,
+      });
+      await sleepMs(300);
+      const left = pidsUnder(wt);
+      strayPids.push(...left);
+      // Either every marked process is gone and confirmed, or it is a survivor.
+      if (result.confirmed) {
+        expect(left).toEqual([]);
+      } else {
+        for (const pid of left) {
+          expect(result.survivors.map(s => s.pid)).toContain(pid);
+        }
+      }
+      expect(left).toEqual([]);
+    },
+    30000
+  );
 
   it('Test 11: lease_released_when_terminal_and_clear', async () => {
     // Case 1: heartbeat failed (leaseValid false), teardown confirmed -> released.

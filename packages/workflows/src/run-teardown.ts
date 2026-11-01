@@ -654,23 +654,36 @@ export async function endNodeProcessTree(
       return { confirmed: true, survivors: [], signaled: [] };
     }
     const member = nodeTokenMembership(reader, input.nodeToken);
-    const scan = scanWorktree(reader, input.run.working_path, input.nodeStartMs, member);
-    const { survivors, signaled } = await terminate(
-      reader,
-      opts.kill ?? defaultKill,
-      opts.sleep ?? defaultSleep,
-      scan.owned,
-      input.run.working_path,
-      {
-        graceMs: opts.graceMs ?? TERMINATION_GRACE_MS,
-        confirmMs: opts.confirmMs ?? TERMINATION_CONFIRM_MS,
-        pollMs: opts.pollMs ?? TERMINATION_POLL_MS,
-      }
-    );
-    const list: TeardownSurvivor[] = [
-      ...survivors.map(s => ({ pid: s.pid, comm: s.comm, reason: 'survived_kill' as const })),
-      ...scan.blockers,
-    ];
+    const wp = input.run.working_path;
+    const kill = opts.kill ?? defaultKill;
+    const sleep = opts.sleep ?? defaultSleep;
+    const timing = {
+      graceMs: opts.graceMs ?? TERMINATION_GRACE_MS,
+      confirmMs: opts.confirmMs ?? TERMINATION_CONFIRM_MS,
+      pollMs: opts.pollMs ?? TERMINATION_POLL_MS,
+    };
+    const scan = scanWorktree(reader, wp, input.nodeStartMs, member);
+    const first = await terminate(reader, kill, sleep, scan.owned, wp, timing);
+    // Final membership scan (node marker + cwd), as run teardown does: a process
+    // forked during teardown (e.g. from a SIGTERM handler) carries the marker.
+    // One more verified kill round reaps it; anything still owned afterwards is a
+    // survivor, so the node teardown never confirms on the initial scan alone.
+    const rescan = scanWorktree(reader, wp, input.nodeStartMs, member);
+    const second = await terminate(reader, kill, sleep, rescan.owned, wp, timing);
+    const final = scanWorktree(reader, wp, input.nodeStartMs, member);
+    const signaled = [...new Set([...first.signaled, ...second.signaled])];
+    const list: TeardownSurvivor[] = [];
+    const seen = new Set<string>();
+    const push = (s: TeardownSurvivor): void => {
+      const key = `${String(s.pid)}:${s.reason}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      list.push(s);
+    };
+    for (const s of [...first.survivors, ...second.survivors, ...final.owned]) {
+      push({ pid: s.pid, comm: s.comm, reason: 'survived_kill' });
+    }
+    for (const b of [...scan.blockers, ...rescan.blockers, ...final.blockers]) push(b);
     return list.length > 0
       ? { confirmed: false, survivors: list, signaled }
       : { confirmed: true, survivors: [], signaled };

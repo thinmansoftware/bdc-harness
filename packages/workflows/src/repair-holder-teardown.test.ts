@@ -526,6 +526,30 @@ describe('repair holder teardown -- rtw core (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-
     }
   }, 60000);
 
+  it('rtw core: a NULL completed_at with an old started_at is refused (no TSV field collapse)', () => {
+    // Overseer review of #1389 head 4a44c34a: a tab-IFS read collapsed the empty
+    // completed_at field and shifted started_at into it, so the age check passed
+    // on an unknown completion time. NULL fields are now emitted as '-'.
+    for (const status of ['failed', 'completed']) {
+      const fixture = makeFixture();
+      roots.push(fixture.root);
+      writeRuns(fixture.dbPath, [
+        {
+          id: 'abcd1234ef567890',
+          status,
+          working_path: fixture.holder,
+          completed_at: null,
+          started_at: utcSecondsAgo(7200),
+        },
+      ]);
+      const result = runSync(fixture, script(), envFor(fixture));
+      expect(result.exitCode, show(result)).not.toBe(0);
+      expect(result.stdout).toContain('completed_at missing');
+      expect(result.stdout).not.toContain('repair_target_worktree_reclaimed');
+      expect(git(['worktree', 'list'], fixture.caller)).toContain(fixture.holder);
+    }
+  }, 60000);
+
   it('Test 18: rtw_core_identical_in_all_lanes', () => {
     expect(
       readdirSync(LANES_DIR)

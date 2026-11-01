@@ -218,7 +218,8 @@ nodes:
       # ---- BEGIN rtw core (byte-identical across lanes; extracted by unit test) ----
       # Reclaim a repair branch held by another worktree only when every signal says
       # the holder is dead: not this worktree; every remote_agent_workflow_runs row
-      # for that working_path is completed, failed, escalated, or cancelled with
+      # for that working_path (fields are '-' when NULL, so none collapse; a NULL
+      # completed_at is refused) is completed, failed, escalated, or cancelled with
       # completed_at at least RTW_MIN_AGE_SECONDS old (default 600; escalated, failed
       # and cancelled holders are waived); no observable process cwd under
       # RTW_PROC_ROOT (default /proc) is the holder or inside it. EVERY observable cwd
@@ -491,11 +492,8 @@ nodes:
         process.exit(3);
       }
       for (const row of rows) {
-        const id = row.id == null ? "" : String(row.id);
-        const status = row.status == null ? "" : String(row.status);
-        const completed = row.completed_at == null ? "" : String(row.completed_at);
-        const started = row.started_at == null ? "" : String(row.started_at);
-        process.stdout.write(id + "\t" + status + "\t" + completed + "\t" + started + "\n");
+        const field = (v) => (v == null || String(v) === "" ? "-" : String(v).replace(/[\t\n]/g, " "));
+        process.stdout.write(field(row.id) + "\t" + field(row.status) + "\t" + field(row.completed_at) + "\t" + field(row.started_at) + "\n");
       }
       RTW_BUN
         if bun "$rtw_query" "$rtw_db" "$holder" >"$rtw_db_out" 2>"$rtw_db_err"; then
@@ -516,14 +514,14 @@ nodes:
             completed|failed|escalated|cancelled) ;;
             *) rtw_refuse "status ${row_status} is not terminal" || return ;;
           esac
-          if [ -z "$row_completed" ]; then
+          if [ -z "$row_completed" ] || [ "$row_completed" = "-" ]; then
             rtw_refuse "completed_at missing" || return
           fi
           if ! row_epoch=$(date -u -d "$row_completed" +%s 2>/dev/null); then
             rtw_refuse "completed_at unparseable" || return
           fi
           row_started_ms=0
-          if [ -n "${row_started:-}" ]; then
+          if [ -n "${row_started:-}" ] && [ "$row_started" != "-" ]; then
             row_started_ms=$(date -u -d "$row_started" +%s%3N 2>/dev/null || printf '0')
             case "$row_started_ms" in
               ''|*[!0-9]*) row_started_ms=0 ;;
