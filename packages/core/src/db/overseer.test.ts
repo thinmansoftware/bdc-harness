@@ -926,6 +926,65 @@ describe('overseer db', () => {
     ).toHaveLength(0);
   });
 
+  test('promote with receipt refuses a run or wo that does not own the verdict', async () => {
+    const verdictId = await seedSafeVerdict('run-atomic-owner', 'healthy', 'none');
+    await seedRun('run-atomic-other', 'completed');
+    const result = `steward_handoff:replay_green:verdict:${verdictId}`;
+
+    expect(
+      await promoteObserveOrHealthyVerdictWithReceipt({
+        verdictId,
+        runId: 'run-atomic-other',
+        woId: 'WO-TEST-OVERSEER-01',
+        class: 'none',
+        result,
+      })
+    ).toBe(false);
+    expect(
+      await promoteObserveOrHealthyVerdictWithReceipt({
+        verdictId,
+        runId: 'run-atomic-owner',
+        woId: 'WO-OTHER',
+        class: 'none',
+        result,
+      })
+    ).toBe(false);
+
+    expect(
+      (await getVerdictByRunHead({ runId: 'run-atomic-owner', headSha: 'H' }))?.proposedAction
+    ).toBe('none');
+    for (const runId of ['run-atomic-owner', 'run-atomic-other']) {
+      expect(
+        (await getOverseerActionsForRun(runId)).filter(
+          action => action.action === 'flag_merge_ready'
+        )
+      ).toHaveLength(0);
+    }
+
+    expect(
+      await promoteObserveOrHealthyVerdictWithReceipt({
+        verdictId,
+        runId: 'run-atomic-owner',
+        woId: 'WO-TEST-OVERSEER-01',
+        class: 'none',
+        result,
+      })
+    ).toBe(true);
+    expect(
+      (await getVerdictByRunHead({ runId: 'run-atomic-owner', headSha: 'H' }))?.proposedAction
+    ).toBe('flag_merge_ready');
+    expect(
+      (await getOverseerActionsForRun('run-atomic-owner')).filter(
+        action => action.action === 'flag_merge_ready' && action.result === result
+      )
+    ).toHaveLength(1);
+    expect(
+      (await getOverseerActionsForRun('run-atomic-other')).filter(
+        action => action.action === 'flag_merge_ready'
+      )
+    ).toHaveLength(0);
+  });
+
   test('receipt insert failure does not leave flag_merge_ready when revert would fail', async () => {
     const verdictId = await seedSafeVerdict('run-atomic-rollback', 'observe', 'comment_findings');
     const result = `steward_handoff:replay_green:verdict:${verdictId}`;

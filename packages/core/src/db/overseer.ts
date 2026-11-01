@@ -807,6 +807,15 @@ const PROMOTE_OBSERVE_OR_HEALTHY_SQL = `UPDATE overseer_verdicts
        AND proposed_action IN ('none', 'verdict_write', 'comment_findings')
        AND actioned_at IS NULL`;
 
+/**
+ * Receipt handoff must not promote verdict A while recording flag_merge_ready
+ * for a caller-supplied run or WO. The identity predicates are bound only on
+ * this path; promoteObserveOrHealthyVerdict still keys by id alone.
+ */
+const PROMOTE_OBSERVE_OR_HEALTHY_WITH_IDENTITY_SQL = `${PROMOTE_OBSERVE_OR_HEALTHY_SQL}
+       AND run_id = $3
+       AND wo_id = $4`;
+
 export async function promoteObserveOrHealthyVerdict(verdictId: string): Promise<boolean> {
   const result = await getDatabase().query(PROMOTE_OBSERVE_OR_HEALTHY_SQL, [
     verdictId,
@@ -834,10 +843,12 @@ function enqueueReplayGreenReceipt<T>(run: () => Promise<T>): Promise<T> {
 
 /**
  * Promote an unactioned observe or healthy verdict and insert its
- * flag_merge_ready receipt in one transaction. Returns true only when both
- * writes committed. Returns false when the row was not promotable; no receipt
- * is inserted. A failed insert rolls the promotion back, so the merge bridge
- * cannot observe a flag_merge_ready verdict that has no receipt.
+ * flag_merge_ready receipt in one transaction. The conditional UPDATE binds
+ * run_id and wo_id to the caller, so a mismatched identity promotes nothing
+ * and inserts no receipt. Returns true only when both writes committed.
+ * Returns false when the row was not promotable; no receipt is inserted. A
+ * failed insert rolls the promotion back, so the merge bridge cannot observe
+ * a flag_merge_ready verdict that has no receipt.
  */
 export async function promoteObserveOrHealthyVerdictWithReceipt(input: {
   verdictId: string;
@@ -848,9 +859,11 @@ export async function promoteObserveOrHealthyVerdictWithReceipt(input: {
 }): Promise<boolean> {
   return enqueueReplayGreenReceipt(() =>
     getDatabase().withTransaction(async query => {
-      const updated = await query(PROMOTE_OBSERVE_OR_HEALTHY_SQL, [
+      const updated = await query(PROMOTE_OBSERVE_OR_HEALTHY_WITH_IDENTITY_SQL, [
         input.verdictId,
         new Date().toISOString(),
+        input.runId,
+        input.woId,
       ]);
       if (updated.rowCount !== 1) return false;
       const inserted = await query(
