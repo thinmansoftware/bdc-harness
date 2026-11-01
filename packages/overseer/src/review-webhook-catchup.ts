@@ -18,6 +18,16 @@ const MAX_PAGES = 10;
 const MAX_INSPECTED = 1000;
 const DELIVERIES_URL = 'https://api.github.com/app/hook/deliveries?per_page=100';
 
+/**
+ * Wall-clock instant the current process started.
+ *
+ * `process.uptime()` grows with the clock, so this stays at process start
+ * even when it is read after a long startup.
+ */
+export function containerStartedAtMs(nowMs: number = Date.now()): number {
+  return nowMs - process.uptime() * 1000;
+}
+
 export interface CatchupLogger {
   info(data: Record<string, unknown>, message: string): void;
   warn(data: Record<string, unknown>, message: string): void;
@@ -29,6 +39,11 @@ export interface WebhookRedeliveryCatchupDeps {
   /** Test seam. Production mints a JWT and never logs it. */
   authorizationHeader?: string;
   now?: () => number;
+  /**
+   * Process start, not the moment the HTTP listener becomes ready. When
+   * omitted, the window anchors on process start so a startup longer than
+   * the 10-minute lookback still includes deliveries from early in startup.
+   */
   containerStartedAt?: number;
   latestIngestReceiptAt?: () => Promise<Date | null>;
   hasIngestReceiptForDelivery?: (guid: string) => Promise<boolean>;
@@ -158,7 +173,7 @@ export async function runWebhookRedeliveryCatchup(
     if (!authorization) return;
 
     const nowMs = deps.now?.() ?? Date.now();
-    const containerStartedAt = deps.containerStartedAt ?? nowMs;
+    const containerStartedAt = deps.containerStartedAt ?? containerStartedAtMs(nowMs);
     const latest = await (deps.latestIngestReceiptAt ?? latestIngestReceiptAt)();
     const anchorMs = latest?.getTime() ?? containerStartedAt;
     if (!Number.isFinite(anchorMs)) {

@@ -90,7 +90,10 @@ import { resolveDefaultDeps } from '@archon/overseer/service';
 import { ingestPullRequestEvent } from '@archon/overseer/pr-review-ingest';
 import { createRealIngestDeps, resolveReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
 import { startReviewGapSweeper, stopReviewGapSweeper } from '@archon/overseer/review-gap-sweeper';
-import { runWebhookRedeliveryCatchup } from '@archon/overseer/review-webhook-catchup';
+import {
+  containerStartedAtMs,
+  runWebhookRedeliveryCatchup,
+} from '@archon/overseer/review-webhook-catchup';
 import { ingestCheckCompletionEvent } from '@archon/overseer/pr-review-check-ingest';
 import { createRealRecheckIngestDeps } from '@archon/overseer/pr-review-check-wiring';
 import {
@@ -819,9 +822,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   });
   getLog().info({ port: server.port, hostname }, 'server_listening');
   // Catch-up runs only after the listener exists, so a GitHub redelivery has
-  // a port to hit. A failure here must not reject startup.
+  // a port to hit. The window is anchored at process start, not listener-ready
+  // time: a startup longer than 10 minutes must not drop deliveries from early
+  // in that startup. A failure here must not reject startup.
   if (reviewRouteConfig) {
-    void runWebhookRedeliveryCatchup(reviewRouteConfig).catch((error: unknown) => {
+    void runWebhookRedeliveryCatchup(reviewRouteConfig, {
+      containerStartedAt: containerStartedAtMs(),
+    }).catch((error: unknown) => {
       getLog().error({ err: error }, 'webhook_catchup_failed');
     });
     startReviewGapSweeper(reviewRouteConfig);

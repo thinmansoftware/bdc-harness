@@ -52,7 +52,12 @@ export interface ReviewGapSweepDeps {
     repo: string;
     updatedAfterMs: number;
   }) => Promise<readonly ReviewGapPull[]>;
-  getCommitDate: (input: { owner: string; repo: string; sha: string }) => Promise<string | null>;
+  getHeadPushedAt: (input: {
+    owner: string;
+    repo: string;
+    sha: string;
+    prNumber: number;
+  }) => Promise<string | null>;
   hasIngestReceiptForHead?: (
     owner: string,
     repo: string,
@@ -92,13 +97,46 @@ interface SweepGitHub {
       page: number;
     }): Promise<{ data: ListedPull[] }>;
   };
-  repos: {
-    getCommit(input: {
-      owner: string;
-      repo: string;
-      ref: string;
-    }): Promise<{ data: { commit?: { committer?: { date?: string | null } | null } | null } }>;
-  };
+  graphql(query: string, variables?: Record<string, unknown>): Promise<unknown>;
+}
+
+const HEAD_PUSHED_AT_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid
+      commits(last: 1) {
+        nodes {
+          commit {
+            oid
+            pushedDate
+          }
+        }
+      }
+    }
+  }
+}`;
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+/**
+ * Push time of `headSha` from a pull-request GraphQL payload.
+ * `committedDate` is ignored: a commit authored earlier and pushed recently
+ * is only as old as the push. Returns null when the payload is not this head
+ * or GitHub did not report `pushedDate` -- the sweeper then leaves the head
+ * alone rather than falling back to the committer timestamp.
+ */
+export function headPushedAtFromGraphql(payload: unknown, headSha: string): string | null {
+  const pullRequest = asRecord(asRecord(asRecord(payload)?.repository)?.pullRequest);
+  if (pullRequest?.headRefOid !== headSha) return null;
+  const nodes = asRecord(pullRequest.commits)?.nodes;
+  if (!Array.isArray(nodes)) return null;
+  const commit = asRecord(asRecord(nodes[0])?.commit);
+  if (commit?.oid !== headSha) return null;
+  const pushed = commit.pushedDate;
+  return typeof pushed === 'string' && pushed.trim() !== '' ? pushed : null;
 }
 
 function safeErrorText(error: unknown): string {
@@ -181,17 +219,18 @@ async function listOpenPullsUpdatedSince(
   return found;
 }
 
-async function readCommitterDate(
-  client: SweepGitHub,
-  input: { owner: string; repo: string; sha: string }
+export async function readHeadPushedAt(
+  client: {
+    graphql(query: string, variables?: Record<string, unknown>): Promise<unknown>;
+  },
+  input: { owner: string; repo: string; sha: string; prNumber: number }
 ): Promise<string | null> {
-  const response = await client.repos.getCommit({
+  const payload = await client.graphql(HEAD_PUSHED_AT_QUERY, {
     owner: input.owner,
-    repo: input.repo,
-    ref: input.sha,
+    name: input.repo,
+    number: input.prNumber,
   });
-  const date = response.data.commit?.committer?.date;
-  return typeof date === 'string' && date.trim() !== '' ? date : null;
+  return headPushedAtFromGraphql(payload, input.sha);
 }
 
 function createProductionDeps(config: ReviewRouteConfig): ReviewGapSweepDeps {
@@ -207,7 +246,7 @@ function createProductionDeps(config: ReviewRouteConfig): ReviewGapSweepDeps {
     listRepos: (): readonly string[] => Object.keys(resolveMergeRepoPolicy()),
     listRecentPulls: (input): Promise<ReviewGapPull[]> =>
       listOpenPullsUpdatedSince(github(), input),
-    getCommitDate: (input): Promise<string | null> => readCommitterDate(github(), input),
+    getHeadPushedAt: (input): Promise<string | null> => readHeadPushedAt(github(), input),
     ingest: (request: IngestRequest): Promise<IngestResult> => {
       ingestDeps ??= createRealIngestDeps(config);
       return ingestPullRequestEvent(request, ingestDeps);
@@ -222,10 +261,15 @@ async function considerPull(
   logger: GapLogger
 ): Promise<boolean> {
   if (pull.draft || pull.state.toLowerCase() !== 'open' || pull.headSha === '') return false;
-  let committerMs = Number.NaN;
+  let pushedMs = Number.NaN;
   try {
-    committerMs = Date.parse(
-      (await deps.getCommitDate({ owner: pull.owner, repo: pull.repo, sha: pull.headSha })) ?? ''
+    pushedMs = Date.parse(
+      (await deps.getHeadPushedAt({
+        owner: pull.owner,
+        repo: pull.repo,
+        sha: pull.headSha,
+        prNumber: pull.prNumber,
+      })) ?? ''
     );
   } catch (error) {
     logger.warn(
@@ -239,7 +283,8 @@ async function considerPull(
     );
     return false;
   }
-  if (!Number.isFinite(committerMs) || now - committerMs <= HEAD_MIN_AGE_MS) return false;
+  // Age is when this head was pushed, not the git committer timestamp.
+  if (!Number.isFinite(pushedMs) || now - pushedMs <= HEAD_MIN_AGE_MS) return false;
 
   const hasReceipt = deps.hasIngestReceiptForHead ?? hasIngestReceiptForHead;
   const hasReview =

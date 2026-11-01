@@ -99,8 +99,34 @@ function loginFromReviewBody(body: Record<string, unknown>): string {
 }
 
 /**
- * True when pr-review-log already has an Overseer verdict or a stored GitHub
- * review for this exact head from the reviewer identity.
+ * Dispositions written only after GitHub accepts the review. Deferrals and
+ * failed submissions also store a `pr_review_submit_receipt`, and those must
+ * not count: the gap sweeper would otherwise skip the head forever.
+ */
+const LANDED_REVIEW_DISPOSITIONS: ReadonlySet<string> = new Set(['approved', 'changes_requested']);
+
+/**
+ * True when this submit receipt records a review GitHub accepted.
+ * `blocked_required_contexts_unavailable` is stored either way; only the
+ * success reason means the COMMENT review landed.
+ */
+function submitReceiptLandedReview(body: Record<string, unknown>): boolean {
+  if (body.kind !== 'pr_review_submit_receipt') return false;
+  const disposition = body.disposition;
+  if (typeof disposition !== 'string') return false;
+  if (LANDED_REVIEW_DISPOSITIONS.has(disposition)) return true;
+  if (disposition === 'blocked_required_contexts_unavailable') {
+    return body.reason === 'required_contexts_unavailable_blocked';
+  }
+  return false;
+}
+
+/**
+ * True when pr-review-log already has a submitted Overseer review or a stored
+ * GitHub review for this exact head from the reviewer identity.
+ *
+ * A submit receipt counts only when GitHub accepted a review. `checks_pending`,
+ * `transport_error`, `rate_limited`, and failed submissions did not land one.
  */
 export async function hasOverseerReviewForHead(
   owner: string,
@@ -119,7 +145,7 @@ export async function hasOverseerReviewForHead(
   for (const message of messages) {
     const body = parseBody(message.body);
     if (!body) continue;
-    if (body.kind === 'pr_review_submit_receipt' && body.headSha === headSha) return true;
+    if (submitReceiptLandedReview(body) && body.headSha === headSha) return true;
     const login = loginFromReviewBody(body);
     if (body.commit_id === headSha && login.toLowerCase() === identity) return true;
   }

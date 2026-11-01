@@ -8,14 +8,15 @@ import { createHmac } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, test as bunTest } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test as bunTest } from 'bun:test';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
 import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { discoverMergeCandidates } from '../merge-candidate-discovery';
 import { reviewCorrelationId, type IngestRequest } from '../pr-review-ingest';
-import type { ReviewRouteConfig } from '../pr-review-wiring';
-import { hasIngestReceiptForHead } from '../review-ingest-receipts';
+import { reviewSubjectKey, type ReviewRouteConfig } from '../pr-review-wiring';
+import { hasIngestReceiptForHead, hasOverseerReviewForHead } from '../review-ingest-receipts';
 import {
+  readHeadPushedAt,
   runReviewGapSweep,
   type ReviewGapPull,
   type ReviewGapSweepDeps,
@@ -128,6 +129,42 @@ async function insertIngestReceipt(input: {
       }),
       1,
       input.createdAt,
+    ]
+  );
+}
+
+async function insertSubmitReceipt(input: {
+  id: string;
+  prNumber: number;
+  headSha: string;
+  disposition: string;
+  reason?: string;
+  event?: string;
+  seq: number;
+}): Promise<void> {
+  const owner = 'thinmansoftware';
+  const repo = 'bdc-xo';
+  await db.query(
+    `INSERT INTO agent_dispatch_messages (
+       id, correlation_id, idempotency_key, task_type, sender, recipient, subject_key, body, status, seq, created_at
+     ) VALUES ($1, $2, $3, 'run_report', 'overseer', 'pr-review-log', $4, $5, 'done', $6, $7)`,
+    [
+      input.id,
+      `pr-review:${owner}/${repo}#${input.prNumber}@${input.headSha}`,
+      `pr-review-submit-receipt:${input.id}:${input.disposition}`,
+      reviewSubjectKey(owner, repo, input.prNumber),
+      JSON.stringify({
+        kind: 'pr_review_submit_receipt',
+        owner,
+        repo,
+        prNumber: input.prNumber,
+        headSha: input.headSha,
+        disposition: input.disposition,
+        ...(input.reason ? { reason: input.reason } : {}),
+        ...(input.event ? { event: input.event } : {}),
+      }),
+      input.seq,
+      '2026-11-01T20:40:00.000Z',
     ]
   );
 }
@@ -268,6 +305,45 @@ describe('review webhook restart catch-up', () => {
     expect(JSON.stringify(lines)).not.toContain('SENTINEL');
   });
 
+  test('a delivery during a long startup is inside the process-start window', async () => {
+    const now = Date.parse('2026-11-01T21:00:00.000Z');
+    const uptime = spyOn(process, 'uptime').mockReturnValue(11 * 60);
+    const deliveredAt = new Date(now - 10 * MINUTE - 30 * 1000).toISOString();
+    const { lines, log } = captureLog();
+    const { calls, fetch } = recordedFetch((url, method) => {
+      if (method === 'POST' && url.pathname.endsWith('/attempts')) {
+        return new Response('{}', { status: 202 });
+      }
+      if (/\/app\/hook\/deliveries\/\d+$/.test(url.pathname)) {
+        return Response.json({ request: { payload: { number: 4184 } } });
+      }
+      return Response.json([
+        {
+          id: 4243,
+          guid: 'guid-during-startup',
+          delivered_at: deliveredAt,
+          status: 'failed',
+          event: 'pull_request',
+          action: 'opened',
+        },
+      ]);
+    });
+
+    try {
+      await runWebhookRedeliveryCatchup(CONFIG, {
+        fetch,
+        authorizationHeader: BEARER,
+        now: () => now,
+        log,
+      });
+    } finally {
+      uptime.mockRestore();
+    }
+
+    expect(calls.filter(call => call.method === 'POST')).toHaveLength(1);
+    expect(lines.filter(line => line.message === 'webhook_redelivered')).toHaveLength(1);
+  });
+
   test('the sweeper requests a review for an unreviewed head after 10 minutes', async () => {
     const headSha = 'e'.repeat(40);
     const pull = gapPull({ prNumber: 4184, headSha });
@@ -282,7 +358,7 @@ describe('review webhook restart catch-up', () => {
         updatedAfterMs = input.updatedAfterMs;
         return [pull];
       },
-      getCommitDate: async () => new Date(NOW - 11 * MINUTE).toISOString(),
+      getHeadPushedAt: async () => new Date(NOW - 11 * MINUTE).toISOString(),
       ingest: async request => {
         ingestCalls.push(request);
       },
@@ -344,7 +420,7 @@ describe('review webhook restart catch-up', () => {
         gapPull({ prNumber: 10, headSha: freshSha }),
         gapPull({ prNumber: 11, headSha: coveredSha }),
       ],
-      getCommitDate: async input =>
+      getHeadPushedAt: async input =>
         new Date(NOW - (input.sha === freshSha ? 9 : 11) * MINUTE).toISOString(),
       hasIngestReceiptForHead: async (owner, repo, prNumber, headSha) => {
         const found = await hasIngestReceiptForHead(owner, repo, prNumber, headSha);
@@ -362,6 +438,168 @@ describe('review webhook restart catch-up', () => {
     expect(receiptResults).toEqual([true]);
     expect(ingestCalls).toHaveLength(0);
     expect(lines.some(line => line.message === 'review_gap_swept')).toBe(false);
+  });
+
+  test('a nine-minute-old push of an older commit is not swept', async () => {
+    const headSha = 'f'.repeat(40);
+    const pushedDate = new Date(NOW - 9 * MINUTE).toISOString();
+    const committedDate = new Date(NOW - 120 * MINUTE).toISOString();
+    let query = '';
+    const stamp = await readHeadPushedAt(
+      {
+        graphql: async (text: string) => {
+          query = text;
+          return {
+            repository: {
+              pullRequest: {
+                headRefOid: headSha,
+                commits: {
+                  nodes: [{ commit: { oid: headSha, committedDate, pushedDate } }],
+                },
+              },
+            },
+          };
+        },
+      },
+      { owner: 'thinmansoftware', repo: 'bdc-xo', sha: headSha, prNumber: 4184 }
+    );
+    expect(stamp).toBe(pushedDate);
+    expect(query).toContain('pushedDate');
+    expect(query).not.toContain('committedDate');
+
+    const ingestCalls: IngestRequest[] = [];
+    const deps: ReviewGapSweepDeps = {
+      webhookSecret: SECRET,
+      reviewerIdentity: CONFIG.reviewerIdentity,
+      listRepos: () => ['thinmansoftware/bdc-xo'],
+      listRecentPulls: async () => [gapPull({ prNumber: 4184, headSha })],
+      getHeadPushedAt: async () => stamp,
+      ingest: async request => {
+        ingestCalls.push(request);
+      },
+    };
+
+    await runReviewGapSweep(deps, NOW);
+
+    expect(ingestCalls).toHaveLength(0);
+  });
+
+  test('a failed submit receipt does not hide the head from the sweeper', async () => {
+    const headSha = 'd'.repeat(40);
+    await insertSubmitReceipt({
+      id: 'sub-pending',
+      prNumber: 4184,
+      headSha,
+      disposition: 'checks_pending',
+      seq: 2,
+    });
+    await insertSubmitReceipt({
+      id: 'sub-transport',
+      prNumber: 4184,
+      headSha,
+      disposition: 'transport_error',
+      seq: 3,
+    });
+    await insertSubmitReceipt({
+      id: 'sub-failed',
+      prNumber: 4184,
+      headSha,
+      disposition: 'submission_failed',
+      event: 'REQUEST_CHANGES',
+      reason: 'github_review_transport_ambiguous',
+      seq: 4,
+    });
+    await insertSubmitReceipt({
+      id: 'sub-blocked-failed',
+      prNumber: 4184,
+      headSha,
+      disposition: 'blocked_required_contexts_unavailable',
+      reason: 'required_contexts_unavailable_blocked:comment_failed:boom',
+      event: 'COMMENT',
+      seq: 5,
+    });
+
+    expect(
+      await hasOverseerReviewForHead(
+        'thinmansoftware',
+        'bdc-xo',
+        4184,
+        headSha,
+        CONFIG.reviewerIdentity
+      )
+    ).toBe(false);
+
+    const ingestCalls: IngestRequest[] = [];
+    const deps: ReviewGapSweepDeps = {
+      webhookSecret: SECRET,
+      reviewerIdentity: CONFIG.reviewerIdentity,
+      listRepos: () => ['thinmansoftware/bdc-xo'],
+      listRecentPulls: async () => [gapPull({ prNumber: 4184, headSha })],
+      getHeadPushedAt: async () => new Date(NOW - 11 * MINUTE).toISOString(),
+      ingest: async request => {
+        ingestCalls.push(request);
+      },
+    };
+
+    await runReviewGapSweep(deps, NOW);
+
+    expect(ingestCalls).toHaveLength(1);
+  });
+
+  test('a landed Overseer review keeps the sweeper off the head', async () => {
+    const headSha = 'c'.repeat(40);
+    await insertSubmitReceipt({
+      id: 'sub-approved',
+      prNumber: 4184,
+      headSha,
+      disposition: 'approved',
+      event: 'APPROVE',
+      seq: 2,
+    });
+    await insertSubmitReceipt({
+      id: 'sub-blocked',
+      prNumber: 12,
+      headSha: 'b'.repeat(40),
+      disposition: 'blocked_required_contexts_unavailable',
+      reason: 'required_contexts_unavailable_blocked',
+      event: 'COMMENT',
+      seq: 3,
+    });
+
+    expect(
+      await hasOverseerReviewForHead(
+        'thinmansoftware',
+        'bdc-xo',
+        4184,
+        headSha,
+        CONFIG.reviewerIdentity
+      )
+    ).toBe(true);
+    expect(
+      await hasOverseerReviewForHead(
+        'thinmansoftware',
+        'bdc-xo',
+        12,
+        'b'.repeat(40),
+        CONFIG.reviewerIdentity
+      )
+    ).toBe(true);
+
+    const ingestCalls: IngestRequest[] = [];
+    const deps: ReviewGapSweepDeps = {
+      webhookSecret: SECRET,
+      reviewerIdentity: CONFIG.reviewerIdentity,
+      listRepos: () => ['thinmansoftware/bdc-xo'],
+      listRecentPulls: async () => [gapPull({ prNumber: 4184, headSha })],
+      getHeadPushedAt: async () => new Date(NOW - 11 * MINUTE).toISOString(),
+      ingest: async request => {
+        ingestCalls.push(request);
+      },
+    };
+
+    await runReviewGapSweep(deps, NOW);
+
+    expect(ingestCalls).toHaveLength(0);
   });
 
   test('discovery names the gap', async () => {
