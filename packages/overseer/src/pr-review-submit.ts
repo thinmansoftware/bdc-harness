@@ -113,6 +113,12 @@ export interface ReviewExecutionContext {
   readonly rung: string;
   readonly checkPlanStatus: 'absent' | 'present' | 'unsafe';
   readonly checkPlan: readonly (readonly string[])[];
+  /**
+   * Set by the trusted worker when the exact-head checkout could not be
+   * prepared or verified (for example review_checkout_identity_failure). The
+   * review is then incomplete before any broker or model call.
+   */
+  readonly checkoutFailure?: string;
 }
 
 export interface ReviewExecutionProof {

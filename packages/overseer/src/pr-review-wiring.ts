@@ -302,6 +302,17 @@ async function readCheckoutFingerprint(
   return { headSha: head.output.trim(), treeSha: tree.output.trim(), cwd };
 }
 
+/**
+ * A bounded untrusted child that hit its deadline or byte limit (S4). Carried
+ * as the review_incomplete reason so the COMMENT names what stopped the review.
+ */
+export class ReviewExecutionIncompleteError extends Error {
+  constructor(readonly reason: string) {
+    super(reason);
+    this.name = 'ReviewExecutionIncompleteError';
+  }
+}
+
 /** Server-observed native execution. No model field can manufacture this proof. */
 export async function observeReviewExecution(
   context: ReviewExecutionContext
@@ -341,7 +352,11 @@ export async function observeReviewExecution(
           startedAt: checkStarted,
           endedAt: checkEnded,
         });
-        if (!result.ok || result.outputTruncated || result.timedOut) return undefined;
+        if (result.timedOut)
+          throw new ReviewExecutionIncompleteError('untrusted_check_deadline_exceeded');
+        if (result.outputTruncated)
+          throw new ReviewExecutionIncompleteError('untrusted_check_output_limit_exceeded');
+        if (!result.ok) return undefined;
         const after = await readCheckoutFingerprint(context.checkoutPath, context.headSha, env);
         if (
           after?.headSha !== before.headSha ||
@@ -369,7 +384,8 @@ export async function observeReviewExecution(
   } catch (error) {
     // Broker absence, malformed responses, and broker deadlines are all the
     // same fail-closed execution-unavailable state at this boundary.
-    if (error instanceof ReviewerBrokerError) throw error;
+    if (error instanceof ReviewerBrokerError || error instanceof ReviewExecutionIncompleteError)
+      throw error;
     return undefined;
   }
 }
@@ -1191,6 +1207,14 @@ export function createRealSubmitDeps(
   return {
     reviewerIdentity,
     async runReviewer(work): Promise<ReviewerVerdict> {
+      if (work.executionContext?.checkoutFailure) {
+        return {
+          approved: false,
+          summary: NATIVE_EXECUTION_INCOMPLETE_SUMMARY,
+          reviewedHeadSha: work.headSha,
+          reasonCode: work.executionContext.checkoutFailure,
+        };
+      }
       let executionProof: ReviewExecutionProof | undefined;
       try {
         executionProof = work.executionContext
@@ -1203,6 +1227,14 @@ export function createRealSubmitDeps(
             summary: NATIVE_EXECUTION_INCOMPLETE_SUMMARY,
             reviewedHeadSha: work.headSha,
             reasonCode: REVIEWER_BROKER_UNAVAILABLE,
+          };
+        }
+        if (error instanceof ReviewExecutionIncompleteError) {
+          return {
+            approved: false,
+            summary: NATIVE_EXECUTION_INCOMPLETE_SUMMARY,
+            reviewedHeadSha: work.headSha,
+            reasonCode: error.reason,
           };
         }
         throw error;

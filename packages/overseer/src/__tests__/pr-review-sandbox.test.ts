@@ -24,6 +24,12 @@ import {
   type SubmitDeps,
 } from '../pr-review-submit';
 
+/**
+ * Native process-group, setsid and POSIX-shell tests run on Linux only (the
+ * production container and the required ubuntu job). Windows keeps the
+ * platform-neutral caller tests.
+ */
+const linux = process.platform === 'linux';
 const head = 'a'.repeat(40);
 const context = {
   requestId: 'request-1',
@@ -169,38 +175,41 @@ describe('sandbox-qualified submit', () => {
 });
 
 describe('bounded broker process capture', () => {
-  test('broker_runs_pinned_codex_argv and rejects a substituted model argv', async () => {
-    const spool = await mkdtemp(join(tmpdir(), 'overseer-real-broker-'));
-    const checkout = join(spool, 'checkout');
-    await mkdir(checkout);
-    await runGit(checkout, ['init', '-q']);
-    await runGit(checkout, ['config', 'user.email', 'smoke@example.invalid']);
-    await runGit(checkout, ['config', 'user.name', 'smoke']);
-    await writeFile(join(checkout, 'allowed.txt'), 'allowed\n');
-    await runGit(checkout, ['add', 'allowed.txt']);
-    await runGit(checkout, ['commit', '-qm', 'fixture']);
-    const expectedHead = await runGit(checkout, ['rev-parse', 'HEAD']);
-    const request = join(spool, 'bad-model.request.json');
-    await writeFile(
-      request,
-      JSON.stringify({
-        version: 1,
-        id: 'bad-model',
-        checkout,
-        expectedHead,
-        argv: ['/bin/true'],
-        prompt: 'review',
-      })
-    );
-    try {
-      const result = await processJob(request, spool);
-      expect(result.ok).toBe(false);
-      expect(result.reason).toBe('model_argv_invalid');
-      expect(result.uid).toBe(process.getuid?.());
-    } finally {
-      await rm(spool, { recursive: true, force: true });
+  test.skipIf(!linux)(
+    'broker_runs_pinned_codex_argv and rejects a substituted model argv',
+    async () => {
+      const spool = await mkdtemp(join(tmpdir(), 'overseer-real-broker-'));
+      const checkout = join(spool, 'checkout');
+      await mkdir(checkout);
+      await runGit(checkout, ['init', '-q']);
+      await runGit(checkout, ['config', 'user.email', 'smoke@example.invalid']);
+      await runGit(checkout, ['config', 'user.name', 'smoke']);
+      await writeFile(join(checkout, 'allowed.txt'), 'allowed\n');
+      await runGit(checkout, ['add', 'allowed.txt']);
+      await runGit(checkout, ['commit', '-qm', 'fixture']);
+      const expectedHead = await runGit(checkout, ['rev-parse', 'HEAD']);
+      const request = join(spool, 'bad-model.request.json');
+      await writeFile(
+        request,
+        JSON.stringify({
+          version: 1,
+          id: 'bad-model',
+          checkout,
+          expectedHead,
+          argv: ['/bin/true'],
+          prompt: 'review',
+        })
+      );
+      try {
+        const result = await processJob(request, spool);
+        expect(result.ok).toBe(false);
+        expect(result.reason).toBe('model_argv_invalid');
+        expect(result.uid).toBe(process.getuid?.());
+      } finally {
+        await rm(spool, { recursive: true, force: true });
+      }
     }
-  });
+  );
 
   test('broker removes per-request scratch after a post-allocation failure', async () => {
     const spool = await mkdtemp(join(tmpdir(), 'overseer-broker-cleanup-'));
@@ -252,7 +261,7 @@ describe('bounded broker process capture', () => {
     }
   });
 
-  test('terminates a hanging descendant within the deadline', async () => {
+  test.skipIf(!linux)('terminates a hanging descendant within the deadline', async () => {
     const started = Date.now();
     const result = await runBrokerProcess(
       ['/bin/sh', '-c', '(sleep 30) & exit 0'],
@@ -266,7 +275,7 @@ describe('bounded broker process capture', () => {
     expect(Date.now() - started).toBeLessThan(2_000);
   });
 
-  test('bounds an output flood and makes it nonqualifying', async () => {
+  test.skipIf(!linux)('bounds an output flood and makes it nonqualifying', async () => {
     const result = await runBrokerProcess(
       ['/bin/sh', '-c', 'yes x | head -c 1048576'],
       process.cwd(),
@@ -547,94 +556,100 @@ async function reviewObservedCheckout(input: {
 }
 
 describe.serial('observed checkout integrity and check environment', () => {
-  test('real_broker_process_chain succeeds through the real broker then fails closed when it is killed', async () => {
-    const spool = await mkdtemp(join(tmpdir(), 'overseer-real-process-'));
-    const checkout = join(spool, 'checkout');
-    await mkdir(checkout);
-    await runGit(checkout, ['init', '-q']);
-    await runGit(checkout, ['config', 'user.email', 'smoke@example.invalid']);
-    await runGit(checkout, ['config', 'user.name', 'smoke']);
-    await writeFile(join(checkout, 'allowed.txt'), 'allowed\n');
-    await runGit(checkout, ['add', 'allowed.txt']);
-    await runGit(checkout, ['commit', '-qm', 'fixture']);
-    const checkoutHead = await runGit(checkout, ['rev-parse', 'HEAD']);
-    const previous = process.env.OVERSEER_REVIEW_SPOOL;
-    process.env.OVERSEER_REVIEW_SPOOL = spool;
-    const broker = Bun.spawn([process.execPath, 'run', 'scripts/overseer-reviewer-broker.ts'], {
-      cwd: process.cwd(),
-      env: { ...process.env, OVERSEER_REVIEW_SPOOL: spool },
-      stdout: 'ignore',
-      stderr: 'ignore',
-    });
-    try {
-      // This suite normally runs as appuser, so the real broker must reject the
-      // launch. In the UID-1002 final image, drive the production caller through
-      // that separately running broker before killing it.
-      if (process.getuid?.() === 1002) {
-        let ready = false;
-        for (let attempt = 0; attempt < 100; attempt += 1) {
-          try {
-            await access(join(spool, 'ready'));
-            ready = true;
-            break;
-          } catch {
-            await Bun.sleep(10);
+  test.skipIf(!linux)(
+    'real_broker_process_chain succeeds through the real broker then fails closed when it is killed',
+    async () => {
+      const spool = await mkdtemp(join(tmpdir(), 'overseer-real-process-'));
+      const checkout = join(spool, 'checkout');
+      await mkdir(checkout);
+      await runGit(checkout, ['init', '-q']);
+      await runGit(checkout, ['config', 'user.email', 'smoke@example.invalid']);
+      await runGit(checkout, ['config', 'user.name', 'smoke']);
+      await writeFile(join(checkout, 'allowed.txt'), 'allowed\n');
+      await runGit(checkout, ['add', 'allowed.txt']);
+      await runGit(checkout, ['commit', '-qm', 'fixture']);
+      const checkoutHead = await runGit(checkout, ['rev-parse', 'HEAD']);
+      const previous = process.env.OVERSEER_REVIEW_SPOOL;
+      process.env.OVERSEER_REVIEW_SPOOL = spool;
+      const broker = Bun.spawn([process.execPath, 'run', 'scripts/overseer-reviewer-broker.ts'], {
+        cwd: process.cwd(),
+        env: { ...process.env, OVERSEER_REVIEW_SPOOL: spool },
+        stdout: 'ignore',
+        stderr: 'ignore',
+      });
+      try {
+        // This suite normally runs as appuser, so the real broker must reject the
+        // launch. In the UID-1002 final image, drive the production caller through
+        // that separately running broker before killing it.
+        if (process.getuid?.() === 1002) {
+          let ready = false;
+          for (let attempt = 0; attempt < 100; attempt += 1) {
+            try {
+              await access(join(spool, 'ready'));
+              ready = true;
+              break;
+            } catch {
+              await Bun.sleep(10);
+            }
           }
+          expect(ready).toBe(true);
+          const successful = await reviewObservedCheckout({
+            dir: checkout,
+            head: checkoutHead,
+            checkPlan: [['/usr/bin/true']],
+            broker: false,
+          });
+          expect(successful.evaluated).toBe(true);
+          expect(successful.disposition).toBe('approved');
+          expect(successful.posts).toEqual(['APPROVE']);
+          broker.kill('SIGTERM');
+          await broker.exited;
+        } else {
+          expect(await broker.exited).not.toBe(0);
         }
-        expect(ready).toBe(true);
-        const successful = await reviewObservedCheckout({
+        const result = await reviewObservedCheckout({
           dir: checkout,
           head: checkoutHead,
           checkPlan: [['/usr/bin/true']],
           broker: false,
         });
-        expect(successful.evaluated).toBe(true);
-        expect(successful.disposition).toBe('approved');
-        expect(successful.posts).toEqual(['APPROVE']);
+        expect(result.evaluated).toBe(false);
+        expect(result.disposition).toBe('review_incomplete');
+        expect(result.reason).toBe('reviewer_broker_unavailable');
+        expect(result.posts).toEqual(['COMMENT']);
+      } finally {
         broker.kill('SIGTERM');
-        await broker.exited;
-      } else {
-        expect(await broker.exited).not.toBe(0);
+        if (previous === undefined) delete process.env.OVERSEER_REVIEW_SPOOL;
+        else process.env.OVERSEER_REVIEW_SPOOL = previous;
+        await rm(spool, { recursive: true, force: true });
       }
-      const result = await reviewObservedCheckout({
-        dir: checkout,
-        head: checkoutHead,
-        checkPlan: [['/usr/bin/true']],
-        broker: false,
-      });
-      expect(result.evaluated).toBe(false);
-      expect(result.disposition).toBe('review_incomplete');
-      expect(result.reason).toBe('reviewer_broker_unavailable');
-      expect(result.posts).toEqual(['COMMENT']);
-    } finally {
-      broker.kill('SIGTERM');
-      if (previous === undefined) delete process.env.OVERSEER_REVIEW_SPOOL;
-      else process.env.OVERSEER_REVIEW_SPOOL = previous;
-      await rm(spool, { recursive: true, force: true });
     }
-  });
+  );
 
-  test('absent source-controlled check plan completes inspection and records check_plan=absent', async () => {
-    const checkout = await initCheckout();
-    const broker = await startBrokerHarness();
-    const tracker = installSandboxSimulation(true);
-    try {
-      const proof = await observeReviewExecution({
-        ...context,
-        checkoutPath: checkout.dir,
-        headSha: checkout.head,
-        checkPlanStatus: 'absent',
-        checkPlan: [],
-      });
-      expect(proof?.inspectionObserved).toBe(true);
-      expect(proof?.check_plan).toBe('absent');
-      expect(proof?.checks).toEqual([]);
-    } finally {
-      tracker.restore();
-      await broker.stop();
-      await rm(checkout.dir, { recursive: true, force: true });
+  test.skipIf(!linux)(
+    'absent source-controlled check plan completes inspection and records check_plan=absent',
+    async () => {
+      const checkout = await initCheckout();
+      const broker = await startBrokerHarness();
+      const tracker = installSandboxSimulation(true);
+      try {
+        const proof = await observeReviewExecution({
+          ...context,
+          checkoutPath: checkout.dir,
+          headSha: checkout.head,
+          checkPlanStatus: 'absent',
+          checkPlan: [],
+        });
+        expect(proof?.inspectionObserved).toBe(true);
+        expect(proof?.check_plan).toBe('absent');
+        expect(proof?.checks).toEqual([]);
+      } finally {
+        tracker.restore();
+        await broker.stop();
+        await rm(checkout.dir, { recursive: true, force: true });
+      }
     }
-  });
+  );
 
   test('tracked modification prevents sandbox spawn and approval', async () => {
     const checkout = await initCheckout();
@@ -703,110 +718,119 @@ describe.serial('observed checkout integrity and check environment', () => {
     }
   });
 
-  test('a zero-exit check that edits a tracked file cannot qualify the head', async () => {
-    const checkout = await initCheckout();
-    const tracker = installSandboxSimulation(true);
-    try {
-      const result = await reviewObservedCheckout({
-        dir: checkout.dir,
-        head: checkout.head,
-        checkPlan: [['/bin/sh', '-c', 'printf x >> allowed.txt']],
-      });
-      expect(tracker.sandboxSpawns).toHaveLength(0);
-      expect(await readFile(join(checkout.dir, 'allowed.txt'), 'utf8')).toContain('x');
-      expect(result.evaluated).toBe(false);
-      expect(result.proofRecords).toBe(0);
-      expect(result.disposition).toBe('review_incomplete');
-      expect(result.posts).toEqual(['COMMENT']);
-    } finally {
-      tracker.restore();
-      await rm(checkout.dir, { recursive: true, force: true });
+  test.skipIf(!linux)(
+    'a zero-exit check that edits a tracked file cannot qualify the head',
+    async () => {
+      const checkout = await initCheckout();
+      const tracker = installSandboxSimulation(true);
+      try {
+        const result = await reviewObservedCheckout({
+          dir: checkout.dir,
+          head: checkout.head,
+          checkPlan: [['/bin/sh', '-c', 'printf x >> allowed.txt']],
+        });
+        expect(tracker.sandboxSpawns).toHaveLength(0);
+        expect(await readFile(join(checkout.dir, 'allowed.txt'), 'utf8')).toContain('x');
+        expect(result.evaluated).toBe(false);
+        expect(result.proofRecords).toBe(0);
+        expect(result.disposition).toBe('review_incomplete');
+        expect(result.posts).toEqual(['COMMENT']);
+      } finally {
+        tracker.restore();
+        await rm(checkout.dir, { recursive: true, force: true });
+      }
     }
-  });
+  );
 
-  test('mutation during model execution cannot qualify an otherwise clean head', async () => {
-    const checkout = await initCheckout();
-    const tracker = installSandboxSimulation(true);
-    try {
-      const result = await reviewObservedCheckout({
-        dir: checkout.dir,
-        head: checkout.head,
-        checkPlan: [['/usr/bin/true']],
-        evaluate: async () => {
-          await appendFile(join(checkout.dir, 'allowed.txt'), 'mutated\n');
-          return approveResult(checkout.head);
-        },
-      });
-      expect(result.evaluated).toBe(true);
-      expect(await readFile(join(checkout.dir, 'allowed.txt'), 'utf8')).toContain('mutated');
-      expect(result.proofRecords).toBe(0);
-      expect(result.disposition).toBe('review_incomplete');
-      expect(result.posts).toEqual(['COMMENT']);
-    } finally {
-      tracker.restore();
-      await rm(checkout.dir, { recursive: true, force: true });
+  test.skipIf(!linux)(
+    'mutation during model execution cannot qualify an otherwise clean head',
+    async () => {
+      const checkout = await initCheckout();
+      const tracker = installSandboxSimulation(true);
+      try {
+        const result = await reviewObservedCheckout({
+          dir: checkout.dir,
+          head: checkout.head,
+          checkPlan: [['/usr/bin/true']],
+          evaluate: async () => {
+            await appendFile(join(checkout.dir, 'allowed.txt'), 'mutated\n');
+            return approveResult(checkout.head);
+          },
+        });
+        expect(result.evaluated).toBe(true);
+        expect(await readFile(join(checkout.dir, 'allowed.txt'), 'utf8')).toContain('mutated');
+        expect(result.proofRecords).toBe(0);
+        expect(result.disposition).toBe('review_incomplete');
+        expect(result.posts).toEqual(['COMMENT']);
+      } finally {
+        tracker.restore();
+        await rm(checkout.dir, { recursive: true, force: true });
+      }
     }
-  });
+  );
 
-  test('git and sandbox spawns omit parent secrets and leave the parent env unchanged', async () => {
-    const checkout = await initCheckout();
-    const binParent = await mkdtemp(join(tmpdir(), 'overseer-review-bin-'));
-    const binDir = join(binParent, 'bin');
-    await mkdir(binDir);
-    const recordPath = join(binParent, 'env-record');
-    const realGit = Bun.which('git');
-    if (!realGit) throw new Error('git_missing');
-    await writeFile(
-      join(binDir, 'git'),
-      `#!/bin/sh\n/usr/bin/env >> '${recordPath}'\nprintf '\\n#\\n' >> '${recordPath}'\nexec '${realGit}' "$@"\n`,
-      { mode: 0o755 }
-    );
-    const saved: Record<string, string | undefined> = { ...process.env };
-    const tracker = installSandboxSimulation(true);
-    try {
-      for (const [key, value] of Object.entries(CANARIES)) process.env[key] = value;
-      process.env.PATH = `${binDir}:${saved.PATH ?? ''}`;
-      const during = Object.entries(process.env).map(([key, value]) => `${key}=${value ?? ''}`);
-      const broker = await startBrokerHarness();
-      await observeReviewExecution({
-        requestId: 'request-1',
-        workerId: 'worker-1',
-        fencingToken: 7,
-        owner: 'o',
-        repo: 'r',
-        prNumber: 1,
-        headSha: checkout.head,
-        checkoutPath: checkout.dir,
-        reviewerIdentity: 'bot',
-        rung: 'pr-review',
-        checkPlan: [['git', 'rev-parse', 'HEAD']],
-      });
-      await broker.stop();
-      const after = Object.entries(process.env).map(([key, value]) => `${key}=${value ?? ''}`);
-      expect(after.sort()).toEqual(during.sort());
-      const recorded = await readFile(recordPath, 'utf8');
-      expect(recorded.length).toBeGreaterThan(0);
-      expect(tracker.sandboxSpawns).toHaveLength(0);
-      for (const [key, value] of Object.entries(CANARIES)) {
-        expect(recorded.includes(`${key}=`)).toBe(false);
-        expect(recorded.includes(value)).toBe(false);
-        for (const spawn of tracker.sandboxSpawns) {
-          expect(spawn.env[key]).toBeUndefined();
-          expect(spawn.env.PATH?.length ?? 0).toBeGreaterThan(0);
-          expect(Object.values(spawn.env).join('\n').includes(value)).toBe(false);
+  test.skipIf(!linux)(
+    'git and sandbox spawns omit parent secrets and leave the parent env unchanged',
+    async () => {
+      const checkout = await initCheckout();
+      const binParent = await mkdtemp(join(tmpdir(), 'overseer-review-bin-'));
+      const binDir = join(binParent, 'bin');
+      await mkdir(binDir);
+      const recordPath = join(binParent, 'env-record');
+      const realGit = Bun.which('git');
+      if (!realGit) throw new Error('git_missing');
+      await writeFile(
+        join(binDir, 'git'),
+        `#!/bin/sh\n/usr/bin/env >> '${recordPath}'\nprintf '\\n#\\n' >> '${recordPath}'\nexec '${realGit}' "$@"\n`,
+        { mode: 0o755 }
+      );
+      const saved: Record<string, string | undefined> = { ...process.env };
+      const tracker = installSandboxSimulation(true);
+      try {
+        for (const [key, value] of Object.entries(CANARIES)) process.env[key] = value;
+        process.env.PATH = `${binDir}:${saved.PATH ?? ''}`;
+        const during = Object.entries(process.env).map(([key, value]) => `${key}=${value ?? ''}`);
+        const broker = await startBrokerHarness();
+        await observeReviewExecution({
+          requestId: 'request-1',
+          workerId: 'worker-1',
+          fencingToken: 7,
+          owner: 'o',
+          repo: 'r',
+          prNumber: 1,
+          headSha: checkout.head,
+          checkoutPath: checkout.dir,
+          reviewerIdentity: 'bot',
+          rung: 'pr-review',
+          checkPlan: [['git', 'rev-parse', 'HEAD']],
+        });
+        await broker.stop();
+        const after = Object.entries(process.env).map(([key, value]) => `${key}=${value ?? ''}`);
+        expect(after.sort()).toEqual(during.sort());
+        const recorded = await readFile(recordPath, 'utf8');
+        expect(recorded.length).toBeGreaterThan(0);
+        expect(tracker.sandboxSpawns).toHaveLength(0);
+        for (const [key, value] of Object.entries(CANARIES)) {
+          expect(recorded.includes(`${key}=`)).toBe(false);
+          expect(recorded.includes(value)).toBe(false);
+          for (const spawn of tracker.sandboxSpawns) {
+            expect(spawn.env[key]).toBeUndefined();
+            expect(spawn.env.PATH?.length ?? 0).toBeGreaterThan(0);
+            expect(Object.values(spawn.env).join('\n').includes(value)).toBe(false);
+          }
         }
+      } finally {
+        tracker.restore();
+        for (const key of Object.keys(process.env)) {
+          if (!(key in saved)) delete process.env[key];
+        }
+        for (const [key, value] of Object.entries(saved)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+        await rm(checkout.dir, { recursive: true, force: true });
+        await rm(binParent, { recursive: true, force: true });
       }
-    } finally {
-      tracker.restore();
-      for (const key of Object.keys(process.env)) {
-        if (!(key in saved)) delete process.env[key];
-      }
-      for (const [key, value] of Object.entries(saved)) {
-        if (value === undefined) delete process.env[key];
-        else process.env[key] = value;
-      }
-      await rm(checkout.dir, { recursive: true, force: true });
-      await rm(binParent, { recursive: true, force: true });
     }
-  });
+  );
 });

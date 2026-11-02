@@ -35,8 +35,9 @@ import {
   type SubmitDisposition,
   type SubmitOutcome,
 } from '@archon/overseer/pr-review-submit';
+import { createRealOctokitClient } from '@archon/overseer/adapters/github-real-deps';
 import { chmod, lstat, mkdir, opendir, readFile, realpath, rename, rm } from 'node:fs/promises';
-import { dirname, join, sep } from 'node:path';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 const log = createLogger('dispatch/review-worker-clock');
@@ -86,19 +87,19 @@ export function parseTrustedCheckPlan(raw: string): TrustedCheckPlan {
 }
 
 export async function readTrustedCheckPlan(checkoutPath: string): Promise<TrustedCheckPlan> {
+  if (!checkoutPath) return { status: 'unsafe', commands: [] };
   const planPath = join(checkoutPath, REVIEW_CHECK_PLAN_PATH);
   try {
-    const [checkoutReal, planReal, info] = await Promise.all([
-      realpath(checkoutPath),
-      realpath(planPath),
-      lstat(planPath),
-    ]);
-    if (
-      !info.isFile() ||
-      !planReal.startsWith(checkoutReal.endsWith(sep) ? checkoutReal : `${checkoutReal}${sep}`)
-    )
+    // Containment by lstat, never by comparing realpath strings: Windows can
+    // return a short (8.3) name for one path and the long name for the other.
+    // The checkout root is server-created; if neither `.github` nor the plan
+    // is a symlink, the plan cannot resolve outside the checkout.
+    const planDir = await lstat(dirname(planPath));
+    if (planDir.isSymbolicLink() || !planDir.isDirectory())
       return { status: 'unsafe', commands: [] };
-    return parseTrustedCheckPlan(await readFile(planReal, 'utf8'));
+    const info = await lstat(planPath);
+    if (!info.isFile()) return { status: 'unsafe', commands: [] };
+    return parseTrustedCheckPlan(await readFile(planPath, 'utf8'));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT')
       return { status: 'absent', commands: [] };
@@ -134,6 +135,17 @@ export interface ReviewWorkerDeps {
     baseRef: string;
     baseSha: string;
   }) => Promise<string>;
+  /**
+   * Trusted base capture for queued work that omits baseSha (check-completion
+   * and ladder-recovery re-reviews). The parent asks GitHub with its own
+   * installation credential; the answer becomes this review's captured base.
+   * Absent or failing = the checkout cannot be prepared (review_incomplete).
+   */
+  resolveReviewBase?: (input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+  }) => Promise<{ baseRef: string; baseSha: string }>;
   /** Optional logger seam for deterministic observability tests. */
   logger?: ReviewWorkerLogger;
   /**
@@ -209,6 +221,7 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
     prepareCheckout: prepareReviewCheckout,
+    resolveReviewBase: resolveLiveReviewBase,
     staleVerdictSweep: config =>
       runStaleVerdictSweep(
         createRealStaleVerdictSweepDeps(config),
@@ -277,17 +290,27 @@ export async function tickReviewWorkerClock(
         if (applyLadderRestoredRequest(claimed.repeat_reason)) {
           log.info({ messageId: claimed.id }, 'overseer_review_judge_ladder_restored_by_operator');
         }
-        const checkoutPath = deps.prepareCheckout
-          ? await deps.prepareCheckout({
-              owner: body.owner,
-              repo: body.repo,
-              prNumber: body.prNumber,
-              headSha: body.headSha,
-              baseRef: body.baseRef,
-              baseSha: body.baseSha ?? '',
-            })
-          : resolveTrustedCheckoutPath(body.owner, body.repo, body.headSha);
-        const checkPlan = await readTrustedCheckPlan(checkoutPath);
+        // S1/S6: a checkout that cannot be prepared or verified becomes a
+        // review_incomplete COMMENT, never a silently stuck claim and never an
+        // approval. The reason travels in the server-built execution context.
+        let checkoutPath = '';
+        let checkoutFailure: string | undefined;
+        try {
+          checkoutPath = deps.prepareCheckout
+            ? await deps.prepareCheckout(await captureReviewBase(body, deps))
+            : resolveTrustedCheckoutPath(body.owner, body.repo, body.headSha);
+          if (!checkoutPath) checkoutFailure = 'review_checkout_root_unconfigured';
+        } catch (error) {
+          checkoutPath = '';
+          checkoutFailure = classifyCheckoutFailure(error);
+          log.warn(
+            { messageId: claimed.id, reason: checkoutFailure },
+            'overseer_review_checkout_preparation_failed'
+          );
+        }
+        const checkPlan: TrustedCheckPlan = checkoutFailure
+          ? { status: 'unsafe', commands: [] }
+          : await readTrustedCheckPlan(checkoutPath);
         const work: ReviewWorkItem = {
           correlationId: claimed.correlation_id,
           messageId: claimed.id,
@@ -309,6 +332,7 @@ export async function tickReviewWorkerClock(
             rung: 'pr-review',
             checkPlanStatus: checkPlan.status,
             checkPlan: Object.freeze(checkPlan.commands),
+            ...(checkoutFailure ? { checkoutFailure } : {}),
           }),
         };
         const renew = deps.renewMessageLease;
@@ -451,15 +475,25 @@ export async function tickReviewWorkerClock(
   }
 }
 
-function resolveTrustedCheckoutPath(owner: string, repo: string, headSha: string): string {
+function resolveTrustedCheckoutPath(
+  owner: string,
+  repo: string,
+  headSha: string,
+  checkoutRoot?: string
+): string {
   const spool = process.env.OVERSEER_REVIEW_SPOOL?.trim() || '/var/lib/overseer-review';
-  const root = process.env.OVERSEER_REVIEW_CHECKOUT_ROOT?.trim() || join(spool, 'checkouts');
+  const root =
+    checkoutRoot ?? (process.env.OVERSEER_REVIEW_CHECKOUT_ROOT?.trim() || join(spool, 'checkouts'));
   if (!/^[0-9a-f]{40}$/i.test(headSha)) return '';
   const safe = (value: string): string => value.replace(/[^A-Za-z0-9_.-]/g, '_');
   return `${root}/${safe(owner)}/${safe(repo)}/${headSha}`;
 }
 
-async function runCheckoutGit(argv: string[], cwd: string): Promise<string> {
+async function runCheckoutGit(
+  argv: string[],
+  cwd: string,
+  options: { trim?: boolean } = {}
+): Promise<string> {
   const token = process.env.GITHUB_TOKEN?.trim() || process.env.GH_TOKEN?.trim();
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? '/usr/bin:/bin',
@@ -478,84 +512,205 @@ async function runCheckoutGit(argv: string[], cwd: string): Promise<string> {
     new Response(child.stderr).text(),
   ]);
   if (exitCode !== 0) throw new Error(`review_checkout_git_failed:${stderr.slice(0, 300)}`);
-  return stdout.trim();
+  return options.trim === false ? stdout : stdout.trim();
 }
 
-/** Seal without following checkout-controlled symlinks. */
-export async function sealReviewCheckout(path: string): Promise<void> {
-  const directory = await opendir(path);
-  for await (const entry of directory) {
-    const child = join(path, entry.name);
-    const info = await lstat(child);
-    if (info.isSymbolicLink()) continue;
-    if (info.isDirectory()) await sealReviewCheckout(child);
-    else if (info.isFile()) await chmod(child, 0o640);
-  }
-  await chmod(path, 0o750);
+const CHECKOUT_IDENTITY_FAILURE = 'review_checkout_identity_failure';
+const SHA_PATTERN = /^[0-9a-f]{40}$/i;
+
+function classifyCheckoutFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : '';
+  if (message.startsWith('review_checkout_git_failed')) return CHECKOUT_IDENTITY_FAILURE;
+  const code = /^review_checkout_[a-z_]+/.exec(message)?.[0];
+  return code ?? CHECKOUT_IDENTITY_FAILURE;
 }
 
-/** Materialize an immutable exact-head checkout, with its exact base commit available. */
-export async function prepareReviewCheckout(input: {
+interface ReviewCheckoutInput {
   owner: string;
   repo: string;
   prNumber: number;
   headSha: string;
   baseRef: string;
   baseSha: string;
-}): Promise<string> {
+}
+
+async function captureReviewBase(
+  body: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    baseRef: string;
+    baseSha?: string;
+  },
+  deps: Pick<ReviewWorkerDeps, 'resolveReviewBase'>
+): Promise<ReviewCheckoutInput> {
+  let baseRef = body.baseRef;
+  let baseSha = body.baseSha ?? '';
+  if (!SHA_PATTERN.test(baseSha)) {
+    if (!deps.resolveReviewBase) throw new Error('review_checkout_base_identity_missing');
+    const live = await deps.resolveReviewBase({
+      owner: body.owner,
+      repo: body.repo,
+      prNumber: body.prNumber,
+    });
+    baseSha = live.baseSha;
+    baseRef = baseRef || live.baseRef;
+  }
+  return {
+    owner: body.owner,
+    repo: body.repo,
+    prNumber: body.prNumber,
+    headSha: body.headSha,
+    baseRef,
+    baseSha,
+  };
+}
+
+async function resolveLiveReviewBase(input: {
+  owner: string;
+  repo: string;
+  prNumber: number;
+}): Promise<{ baseRef: string; baseSha: string }> {
+  const pr = await createRealOctokitClient().pulls.get({
+    owner: input.owner,
+    repo: input.repo,
+    pull_number: input.prNumber,
+  });
+  const baseSha = pr.data.base?.sha ?? '';
+  if (!SHA_PATTERN.test(baseSha)) throw new Error('review_checkout_base_identity_missing');
+  return { baseRef: pr.data.base?.ref ?? '', baseSha };
+}
+
+/** Paths Git records as executable (mode 100755), relative and '/'-separated. */
+async function readTrackedExecutables(checkout: string): Promise<Set<string>> {
+  const listing = await runCheckoutGit(['git', 'ls-files', '--stage', '-z'], checkout, {
+    trim: false,
+  });
+  const executables = new Set<string>();
+  for (const record of listing.split('\0')) {
+    const tab = record.indexOf('\t');
+    if (tab === -1) continue;
+    if (record.startsWith('100755 ')) executables.add(record.slice(tab + 1));
+  }
+  return executables;
+}
+
+/**
+ * Seal without following checkout-controlled symlinks (S2). Tracked 100755
+ * files become 0750, every other regular file 0640, directories 0750, so the
+ * `reviewer` group can read (and execute what Git records as executable) but
+ * modify nothing, and Git's core.filemode comparison still matches HEAD.
+ */
+export async function sealReviewCheckout(
+  path: string,
+  executables: ReadonlySet<string> = new Set()
+): Promise<void> {
+  await sealDirectory(path, '', executables);
+}
+
+async function sealDirectory(
+  path: string,
+  relative: string,
+  executables: ReadonlySet<string>
+): Promise<void> {
+  const directory = await opendir(path);
+  for await (const entry of directory) {
+    const child = join(path, entry.name);
+    const childRelative = relative ? `${relative}/${entry.name}` : entry.name;
+    const info = await lstat(child);
+    if (info.isSymbolicLink()) continue;
+    if (info.isDirectory()) await sealDirectory(child, childRelative, executables);
+    else if (info.isFile()) await chmod(child, executables.has(childRelative) ? 0o750 : 0o640);
+  }
+  await chmod(path, 0o750);
+}
+
+/** Pristine: HEAD and tree bound to H, base B present, no mode, content or untracked drift. */
+async function verifySealedCheckout(
+  checkout: string,
+  headSha: string,
+  baseSha: string
+): Promise<void> {
+  const head = await runCheckoutGit(['git', 'rev-parse', 'HEAD'], checkout);
+  const tree = await runCheckoutGit(['git', 'rev-parse', 'HEAD^{tree}'], checkout);
+  const expectedTree = await runCheckoutGit(['git', 'rev-parse', `${headSha}^{tree}`], checkout);
+  if (head !== headSha || tree !== expectedTree) throw new Error(CHECKOUT_IDENTITY_FAILURE);
+  await runCheckoutGit(['git', 'cat-file', '-e', `${baseSha}^{commit}`], checkout);
+  await runCheckoutGit(['git', '-c', 'core.filemode=true', 'diff', '--quiet', 'HEAD'], checkout);
+  const status = await runCheckoutGit(
+    ['git', '-c', 'core.filemode=true', 'status', '--porcelain=v1', '--untracked-files=all'],
+    checkout
+  );
+  if (status.length > 0) throw new Error(CHECKOUT_IDENTITY_FAILURE);
+}
+
+export interface PrepareReviewCheckoutOptions {
+  /** Remote to fetch object ids from. Defaults to the GitHub repository URL. */
+  remoteUrl?: string;
+  /** Root for exact-head checkouts. Defaults to the broker spool checkouts dir. */
+  checkoutRoot?: string;
+}
+
+/**
+ * Materialize an immutable exact-head checkout with its captured base commit
+ * (S1). Both commits are fetched BY OBJECT ID: the moving base branch tip is
+ * never consulted, so a base branch that advanced after the review was queued
+ * cannot fail a pristine head, and an object that cannot be fetched or
+ * verified fails closed with review_checkout_identity_failure.
+ */
+export async function prepareReviewCheckout(
+  input: ReviewCheckoutInput,
+  options: PrepareReviewCheckoutOptions = {}
+): Promise<string> {
   if (
     !/^[A-Za-z0-9_.-]+$/.test(input.owner) ||
     !/^[A-Za-z0-9_.-]+$/.test(input.repo) ||
     !Number.isSafeInteger(input.prNumber) ||
     input.prNumber < 1 ||
-    !/^[0-9a-f]{40}$/i.test(input.headSha) ||
-    (input.baseRef !== '' &&
-      (!/^[A-Za-z0-9._/-]+$/.test(input.baseRef) ||
-        input.baseRef.startsWith('-') ||
-        input.baseRef.includes('..')))
+    !SHA_PATTERN.test(input.headSha)
   ) {
     throw new Error('review_checkout_identity_invalid');
   }
-  const checkout = resolveTrustedCheckoutPath(input.owner, input.repo, input.headSha);
+  if (!SHA_PATTERN.test(input.baseSha)) throw new Error('review_checkout_base_identity_missing');
+  const headSha = input.headSha.toLowerCase();
+  const baseSha = input.baseSha.toLowerCase();
+  const checkout = resolveTrustedCheckoutPath(
+    input.owner,
+    input.repo,
+    headSha,
+    options.checkoutRoot
+  );
   if (!checkout) throw new Error('review_checkout_root_unconfigured');
   try {
-    if ((await runCheckoutGit(['git', 'rev-parse', 'HEAD'], checkout)) === input.headSha) {
-      if (input.baseSha)
-        await runCheckoutGit(['git', 'cat-file', '-e', `${input.baseSha}^{commit}`], checkout);
-      await sealReviewCheckout(checkout);
-      return await realpath(checkout);
-    }
+    // Cached checkout: re-seal from Git's own modes, then re-verify. Any
+    // drift (mode, content, untracked file, missing base) discards it.
+    await sealReviewCheckout(checkout, await readTrackedExecutables(checkout));
+    await verifySealedCheckout(checkout, headSha, baseSha);
+    return await realpath(checkout);
   } catch {
     // Missing or stale paths are replaced atomically below.
   }
   const temporary = `${checkout}.tmp-${randomUUID()}`;
-  if (!/^[0-9a-f]{40}$/i.test(input.baseSha) || !input.baseRef)
-    throw new Error('review_checkout_base_identity_missing');
   await mkdir(dirname(checkout), { recursive: true, mode: 0o2770 });
   await rm(temporary, { recursive: true, force: true });
   try {
     await mkdir(temporary, { mode: 0o700 });
     await runCheckoutGit(['git', 'init', '--quiet'], temporary);
-    const remote = `https://github.com/${input.owner}/${input.repo}.git`;
-    await runCheckoutGit(
-      [
-        'git',
-        'fetch',
-        '--no-tags',
-        remote,
-        `+refs/heads/${input.baseRef}:refs/review/base`,
-        `+refs/pull/${input.prNumber}/head:refs/review/head`,
-      ],
-      temporary
-    );
-    const [head, base] = await Promise.all([
-      runCheckoutGit(['git', 'rev-parse', 'refs/review/head'], temporary),
-      runCheckoutGit(['git', 'rev-parse', 'refs/review/base'], temporary),
-    ]);
-    if (head !== input.headSha || base !== input.baseSha)
-      throw new Error('review_checkout_identity_failure');
-    await runCheckoutGit(['git', 'checkout', '--quiet', '--detach', input.headSha], temporary);
-    await sealReviewCheckout(temporary);
+    const remote = options.remoteUrl ?? `https://github.com/${input.owner}/${input.repo}.git`;
+    try {
+      await runCheckoutGit(
+        ['git', 'fetch', '--quiet', '--no-tags', '--no-write-fetch-head', remote, headSha, baseSha],
+        temporary
+      );
+      await runCheckoutGit(['git', 'cat-file', '-e', `${headSha}^{commit}`], temporary);
+      await runCheckoutGit(['git', 'cat-file', '-e', `${baseSha}^{commit}`], temporary);
+    } catch {
+      throw new Error(CHECKOUT_IDENTITY_FAILURE);
+    }
+    await runCheckoutGit(['git', 'checkout', '--quiet', '--detach', headSha], temporary);
+    await sealReviewCheckout(temporary, await readTrackedExecutables(temporary));
+    await verifySealedCheckout(temporary, headSha, baseSha);
     await rm(checkout, { recursive: true, force: true });
     await rename(temporary, checkout);
     return await realpath(checkout);

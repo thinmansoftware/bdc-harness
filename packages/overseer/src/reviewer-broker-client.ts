@@ -4,13 +4,18 @@ import { join } from 'node:path';
 
 export const REVIEWER_BROKER_UNAVAILABLE = 'reviewer_broker_unavailable';
 const DEFAULT_SPOOL = '/var/lib/overseer-review';
-const DEFAULT_TIMEOUT_MS = 60_000;
+/** Client wait for a check job: the broker's 60 s child deadline plus setup. */
+const DEFAULT_TIMEOUT_MS = 120_000;
+/** Extra client wait beyond a model job's own deadline (setup and result write). */
+const MODEL_JOB_GRACE_MS = 60_000;
 
 export interface ReviewerBrokerJob {
   readonly checkout: string;
   readonly expectedHead: string;
   readonly argv: readonly string[];
   readonly prompt?: string;
+  /** Model jobs only: wall clock the broker enforces on the model child. */
+  readonly timeoutMs?: number;
 }
 
 export interface ReviewerBrokerResult {
@@ -59,7 +64,11 @@ export async function submitReviewerBrokerJob(
     flag: 'wx',
   });
   await rename(temporary, request);
-  const deadline = Date.now() + timeoutMs(env);
+  const deadline =
+    Date.now() +
+    (job.timeoutMs !== undefined
+      ? Math.max(timeoutMs(env), job.timeoutMs + MODEL_JOB_GRACE_MS)
+      : timeoutMs(env));
   try {
     while (Date.now() < deadline) {
       try {

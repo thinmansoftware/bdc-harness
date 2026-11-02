@@ -23,6 +23,8 @@ interface BrokerJob {
   expectedHead: string;
   argv: string[];
   prompt?: string;
+  /** Model jobs only: the trusted parent's configured model wall clock. */
+  timeoutMs?: number;
 }
 
 interface BrokerResult {
@@ -39,6 +41,28 @@ interface BrokerResult {
 
 const OUTPUT_LIMIT = 128 * 1024;
 const EXECUTION_TIMEOUT_MS = 60_000;
+/** A model job streams `codex exec --json` events, far larger than check output. */
+const MODEL_OUTPUT_LIMIT = 4 * 1024 * 1024;
+const MODEL_TIMEOUT_MAX_MS = 30 * 60_000;
+
+function positiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Per-child deadline and retained-output byte limit (S4). Read once from the
+ * broker's own env -i start environment; the defaults apply in production.
+ */
+export function brokerLimits(env: Record<string, string | undefined> = process.env): {
+  timeoutMs: number;
+  outputLimit: number;
+} {
+  return {
+    timeoutMs: positiveInteger(env.OVERSEER_REVIEW_CHECK_TIMEOUT_MS, EXECUTION_TIMEOUT_MS),
+    outputLimit: positiveInteger(env.OVERSEER_REVIEW_OUTPUT_LIMIT_BYTES, OUTPUT_LIMIT),
+  };
+}
 const PINNED_CODEX_PREFIX = ['bunx', '--offline', `@openai/codex@${CODEX_VERSION}`];
 
 function inside(path: string, root: string): boolean {
@@ -59,8 +83,30 @@ function validJob(value: unknown): value is BrokerJob {
     job.argv.every(
       value => typeof value === 'string' && value.length > 0 && !value.includes('\0')
     ) &&
-    (job.prompt === undefined || typeof job.prompt === 'string')
+    (job.prompt === undefined || typeof job.prompt === 'string') &&
+    (job.timeoutMs === undefined ||
+      (job.prompt !== undefined &&
+        Number.isSafeInteger(job.timeoutMs) &&
+        job.timeoutMs > 0 &&
+        job.timeoutMs <= MODEL_TIMEOUT_MAX_MS))
   );
+}
+
+/**
+ * Drop an incomplete trailing UTF-8 sequence left by a byte-limit cut, so the
+ * decoded text re-encodes to at most the retained byte count (no U+FFFD).
+ */
+function trimPartialUtf8(bytes: Buffer): Buffer {
+  let start = bytes.length - 1;
+  let continuation = 0;
+  while (start >= 0 && continuation < 3 && (bytes[start] & 0xc0) === 0x80) {
+    start -= 1;
+    continuation += 1;
+  }
+  if (start < 0) return bytes;
+  const lead = bytes[start];
+  const width = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+  return width > continuation + 1 ? bytes.subarray(0, start) : bytes;
 }
 
 export async function runBrokerProcess(
@@ -83,45 +129,54 @@ export async function runBrokerProcess(
     stdout: 'pipe',
     stderr: 'pipe',
   });
-  let stdout = '';
-  let stderr = '';
+  // Streaming capture bounded in BYTES across both streams. Chunks past the
+  // limit are drained and discarded, so a flooding child can never grow the
+  // broker's memory, and crossing the limit kills the whole process group.
+  const limit = options.outputLimit ?? OUTPUT_LIMIT;
+  const retained: { stdout: Uint8Array[]; stderr: Uint8Array[] } = { stdout: [], stderr: [] };
+  let retainedBytes = 0;
   let outputTruncated = false;
+  const killGroup = (signal: 'SIGTERM' | 'SIGKILL'): void => {
+    try {
+      process.kill(-child.pid, signal);
+    } catch {
+      try {
+        child.kill(signal);
+      } catch {
+        // Already gone.
+      }
+    }
+  };
   const consume = async (
     stream: ReadableStream<Uint8Array> | null,
-    append: (chunk: string) => void
+    into: Uint8Array[]
   ): Promise<void> => {
     if (!stream) return;
     const reader = stream.getReader();
-    const decoder = new TextDecoder();
     try {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
-        append(decoder.decode(value, { stream: true }));
+        const remaining = limit - retainedBytes;
+        if (value.byteLength > remaining) {
+          if (remaining > 0) into.push(value.subarray(0, remaining));
+          retainedBytes = limit;
+          if (!outputTruncated) {
+            outputTruncated = true;
+            killGroup('SIGKILL');
+          }
+        } else {
+          into.push(value);
+          retainedBytes += value.byteLength;
+        }
       }
     } finally {
       reader.releaseLock();
     }
   };
-  const appendStdout = (chunk: string): void => {
-    const remaining = (options.outputLimit ?? OUTPUT_LIMIT) - stdout.length - stderr.length;
-    if (remaining <= 0) outputTruncated = true;
-    else {
-      stdout += chunk.slice(0, remaining);
-      if (chunk.length > remaining) outputTruncated = true;
-    }
-  };
-  const appendStderr = (chunk: string): void => {
-    const remaining = (options.outputLimit ?? OUTPUT_LIMIT) - stdout.length - stderr.length;
-    if (remaining <= 0) outputTruncated = true;
-    else {
-      stderr += chunk.slice(0, remaining);
-      if (chunk.length > remaining) outputTruncated = true;
-    }
-  };
   const capture = Promise.all([
-    consume(child.stdout, appendStdout),
-    consume(child.stderr, appendStderr),
+    consume(child.stdout, retained.stdout),
+    consume(child.stderr, retained.stderr),
   ]);
   if (prompt !== undefined) {
     const stdin = child.stdin;
@@ -135,17 +190,9 @@ export async function runBrokerProcess(
   const timeout = new Promise<number>(resolveTimeout => {
     timer = setTimeout(() => {
       timedOut = true;
-      try {
-        process.kill(-child.pid, 'SIGTERM');
-      } catch {
-        child.kill('SIGTERM');
-      }
+      killGroup('SIGTERM');
       setTimeout(() => {
-        try {
-          process.kill(-child.pid, 'SIGKILL');
-        } catch {
-          child.kill('SIGKILL');
-        }
+        killGroup('SIGKILL');
       }, 250).unref?.();
       resolveTimeout(124);
     }, options.timeoutMs ?? EXECUTION_TIMEOUT_MS);
@@ -158,10 +205,27 @@ export async function runBrokerProcess(
   const exitCode = await Promise.race([completed, timeout]);
   if (timer) clearTimeout(timer);
   if (exitCode === 124) await Promise.race([capture, Bun.sleep(1_000)]);
-  return { exitCode, stdout, stderr, outputTruncated, timedOut };
+  // Belt and braces: never leave a descendant behind, even after a clean exit
+  // of the group leader (a background child would otherwise outlive the job).
+  killGroup('SIGKILL');
+  const decode = (chunks: Uint8Array[]): string =>
+    new TextDecoder().decode(
+      trimPartialUtf8(Buffer.concat(chunks.map(chunk => Buffer.from(chunk))))
+    );
+  return {
+    exitCode,
+    stdout: decode(retained.stdout),
+    stderr: decode(retained.stderr),
+    outputTruncated,
+    timedOut,
+  };
 }
 
-export async function processJob(path: string, spool = SPOOL): Promise<BrokerResult> {
+export async function processJob(
+  path: string,
+  spool = SPOOL,
+  limits: { timeoutMs: number; outputLimit: number } = brokerLimits()
+): Promise<BrokerResult> {
   const id = basename(path, '.request.json');
   const scratch = join(spool, `${id}.scratch`);
   try {
@@ -263,7 +327,14 @@ export async function processJob(path: string, spool = SPOOL): Promise<BrokerRes
     const version = await runBrokerProcess([...PINNED_CODEX_PREFIX, '--version'], checkout, env);
     if (version.exitCode !== 0 || !version.stdout.includes(CODEX_VERSION))
       throw new Error('landlock_unsupported');
-    const result = await runBrokerProcess(command, checkout, env, job.prompt);
+    const jobLimits =
+      job.prompt === undefined
+        ? limits
+        : {
+            timeoutMs: job.timeoutMs ?? limits.timeoutMs,
+            outputLimit: Math.max(limits.outputLimit, MODEL_OUTPUT_LIMIT),
+          };
+    const result = await runBrokerProcess(command, checkout, env, job.prompt, jobLimits);
     return {
       id,
       ok: result.exitCode === 0 && !result.outputTruncated && !result.timedOut,

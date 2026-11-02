@@ -863,7 +863,12 @@ export async function invokeConfiguredReviewModel(
   try {
     if (context) {
       if (!transport.brokerJob) throw new Error('reviewer_broker_unavailable');
-      const result = await submitReviewerBrokerJob(transport.brokerJob);
+      const result = await submitReviewerBrokerJob({
+        ...transport.brokerJob,
+        // The broker accepts 1 ms to 30 min; it starts from env -i, so the
+        // parent supplies its configured model wall clock per job.
+        timeoutMs: Math.max(1, Math.min(Math.floor(timeoutMs), 30 * 60_000)),
+      });
       return {
         exitCode: result.exitCode,
         stdout: result.stdout.trim().length > 0 ? result.stdout : result.stderr,
