@@ -1887,6 +1887,64 @@ describe('Zero-tier fence 3: one climb then stop', () => {
     expect(escalateCalls).toBe(1);
   });
 
+  test('Test 3b: zero entry, zero seat-refuses, cursor seat-refuses -> exactly two fires, BLOCKED climb_limit_reached (second climb site), escalate once, no further rung', async () => {
+    // The seat-refusal climb path (cascade.ts seat-refusal branch) is a SECOND,
+    // independent climb site from the gate-fail path exercised by Test 3. Fence
+    // 3's one-climb cap must hold here too: the zero run seat-refuses and climbs
+    // once to cursor (climbCount 0 < 1), then the cursor run seat-refuses and
+    // the cascade must STOP BLOCKED (climbCount 1 >= 1) rather than firing a
+    // third, more expensive rung.
+    const fireCalls: string[] = [];
+    let escalateCalls = 0;
+
+    // A seat refusal is a failed terminal run whose rawMetadata.error begins
+    // with "seat_usage_refused:" (see seatRefusalDetail). This is neither a
+    // quality failure nor a gate misfire.
+    const seatRefusedPoll = makePollResult({
+      terminalStatus: 'failed',
+      prUrl: null,
+      prMergeable: null,
+      validatorVerdict: 'needs_revision',
+      rawMetadata: { error: 'seat_usage_refused: lane seat over threshold' },
+    });
+
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      poll: async _opts => seatRefusedPoll,
+      judge: _poll => makeFailVerdict('seat refused'),
+      escalate: async _ctx => {
+        escalateCalls++;
+      },
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'zero' }));
+
+    const tiers = loadLiveTiers();
+    const zeroWf = tiers.find(t => t.name === 'zero')?.workflowName;
+    const cursorWf = tiers.find(t => t.name === 'cursor')?.workflowName;
+    const codexWf = tiers.find(t => t.name === 'codex')?.workflowName;
+    const claudeWf = tiers.find(t => t.name === 'claude')?.workflowName;
+    const frontierWf = tiers.find(t => t.isFrontier)?.workflowName;
+
+    expect(fireCalls.length).toBe(2);
+    expect(fireCalls[0]).toBe(zeroWf);
+    expect(fireCalls[1]).toBe(cursorWf);
+    expect(fireCalls).not.toContain(codexWf);
+    expect(fireCalls).not.toContain(claudeWf);
+    expect(fireCalls).not.toContain(frontierWf);
+
+    expect(record.status).toBe('blocked');
+    expect(record.blockedReason).toBe('climb_limit_reached');
+    expect(record.telemetry.climbCount).toBe(1);
+    expect(record.attempts.length).toBe(2);
+    expect(record.attempts[1]?.gateFailReason).toContain('seat_refusal');
+    expect(escalateCalls).toBe(1);
+  });
+
   test('Test 4: cursor entry with the same failures climbs normally -- the zero limit does not apply', async () => {
     const fireCalls: string[] = [];
     let escalateCalls = 0;

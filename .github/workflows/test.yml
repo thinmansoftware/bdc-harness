@@ -47,6 +47,9 @@ jobs:
       - name: GitHub service command and credential routing regressions
         run: bun test --timeout 30000 ./scripts/github-service-exec.test.ts packages/overseer/src/__tests__/github-command-durable-metering.test.ts ./scripts/github-service-token.test.ts ./scripts/container/gh-merge-guard.test.ts ./scripts/container/docker-entrypoint-app-helper.test.ts ./scripts/github-service-login.test.ts
 
+      - name: Zero-tier first-10 measurement report (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01)
+        run: bun test --timeout 30000 ./scripts/run-completion-report.test.ts
+
       - name: Run tests
         run: bun run test
 
