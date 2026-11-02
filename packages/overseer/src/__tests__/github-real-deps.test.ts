@@ -151,6 +151,83 @@ describe('unprotected base zero-check attempt bound', () => {
   });
 });
 
+describe('required context never reported', () => {
+  test('dispatches a mapped workflow once and blocks at the configured bound', async () => {
+    const headSha = 'd'.repeat(40);
+    const dispatches: unknown[] = [];
+    const counts = new Map<string, number>();
+    const store: AttemptCounterStore = {
+      increment: async key => {
+        const encoded = JSON.stringify(key);
+        const next = (counts.get(encoded) ?? 0) + 1;
+        counts.set(encoded, next);
+        return next;
+      },
+      clear: async key => void counts.delete(JSON.stringify(key)),
+    };
+    const client = {
+      pulls: {
+        get: async () => ({
+          data: {
+            head: { sha: headSha, ref: 'docs/update' },
+            base: { sha: 'b'.repeat(40), ref: 'main' },
+          },
+        }),
+      },
+      repos: {
+        compareCommits: async () => ({ data: { files: [] } }),
+        getAllStatusCheckContexts: async () => ({ data: ['Gitleaks'] }),
+      },
+      checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+      actions: {
+        createWorkflowDispatch: async (input: unknown) => void dispatches.push(input),
+      },
+    } as unknown as RealGitHubOctokitLike;
+    const oldMap = process.env.OVERSEER_REQUIRED_CONTEXT_WORKFLOWS_JSON;
+    const oldRearm = process.env.OVERSEER_REQUIRED_CONTEXT_REARM_ATTEMPT;
+    const oldMax = process.env.OVERSEER_REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS;
+    process.env.OVERSEER_REQUIRED_CONTEXT_WORKFLOWS_JSON =
+      '{"thinmansoftware/bdc-xo":{"Gitleaks":"secrets-scan.yml"}}';
+    process.env.OVERSEER_REQUIRED_CONTEXT_REARM_ATTEMPT = '3';
+    process.env.OVERSEER_REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS = '4';
+    try {
+      const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(client, undefined, store);
+      const input = { owner: 'thinmansoftware', repo: 'bdc-xo', prNumber: 3799, headSha };
+      expect((await fetchEvidence(input)).missingRequiredContexts).toEqual(['Gitleaks']);
+      await fetchEvidence(input);
+      const third = await fetchEvidence(input);
+      expect(third.requiredContextRearm).toEqual({
+        attempted: true,
+        dispatched: true,
+        context: 'Gitleaks',
+        workflow: 'secrets-scan.yml',
+      });
+      const fourth = await fetchEvidence(input);
+      expect(fourth.requiredContextsBlocked).toEqual({
+        reason: 'required_context_never_reported',
+        attempts: 4,
+        failureKind: 'transient',
+      });
+      expect(dispatches).toEqual([
+        {
+          owner: 'thinmansoftware',
+          repo: 'bdc-xo',
+          workflow_id: 'secrets-scan.yml',
+          ref: 'docs/update',
+        },
+      ]);
+    } finally {
+      if (oldMap === undefined) delete process.env.OVERSEER_REQUIRED_CONTEXT_WORKFLOWS_JSON;
+      else process.env.OVERSEER_REQUIRED_CONTEXT_WORKFLOWS_JSON = oldMap;
+      if (oldRearm === undefined) delete process.env.OVERSEER_REQUIRED_CONTEXT_REARM_ATTEMPT;
+      else process.env.OVERSEER_REQUIRED_CONTEXT_REARM_ATTEMPT = oldRearm;
+      if (oldMax === undefined)
+        delete process.env.OVERSEER_REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS;
+      else process.env.OVERSEER_REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS = oldMax;
+    }
+  });
+});
+
 afterEach(() => {
   for (const key of APP_ENV_KEYS) {
     const prior = savedEnv.get(key);
