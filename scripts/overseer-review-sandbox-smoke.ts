@@ -1,9 +1,9 @@
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
+import { CODEX_JUDGE_CLI_VERSION } from '../packages/overseer/src/judge-transport';
 
 const SPOOL = '/var/lib/overseer-review';
-const CODEX_VERSION = '0.153.3';
 
 async function command(argv: string[]): Promise<void> {
   const child = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' });
@@ -112,7 +112,7 @@ try {
   if ((await readFile(outside, 'utf8')) !== 'outside-control\n')
     throw new Error('sandbox_forbidden_write_succeeded');
   console.log(
-    `overseer-review-sandbox-smoke: ok uid=1002 codex=${CODEX_VERSION} policy=use_legacy_landlock`
+    `overseer-review-sandbox-smoke: ok uid=1002 codex=${CODEX_JUDGE_CLI_VERSION} policy=use_legacy_landlock`
   );
 } finally {
   server.close();

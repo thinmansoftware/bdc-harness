@@ -160,12 +160,18 @@ export function resolveCursorJudgeModel(
 }
 
 /**
- * The Codex CLI the `codex` judge rung runs, pinned to an exact version rather
- * than floating `bunx` latest. GPT-6 models need codex-cli >= 0.155; the harness
- * SDK pin in packages/providers/package.json is the same version (a test keeps
- * the two equal).
+ * Exact Codex CLI pin shared by the judge rung, the reviewer broker, execution
+ * proofs, and the sandbox smoke attestation. GPT-6 models need codex-cli >= 0.155.
+ * The harness SDK pin in packages/providers/package.json is the same version
+ * (a test keeps the two equal).
  */
-export const CODEX_JUDGE_CLI_PACKAGE = '@openai/codex@0.159.2';
+export const CODEX_JUDGE_CLI_VERSION = '0.159.2';
+
+/**
+ * The Codex CLI the `codex` judge rung runs, pinned to an exact version rather
+ * than floating `bunx` latest.
+ */
+export const CODEX_JUDGE_CLI_PACKAGE = `@openai/codex@${CODEX_JUDGE_CLI_VERSION}`;
 
 /**
  * Default model for the `codex` judge rung (John 2026-11-01: the Overseer judge

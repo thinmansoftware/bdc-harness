@@ -11,10 +11,9 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { basename, join, resolve, sep } from 'node:path';
+import { CODEX_JUDGE_CLI_VERSION as CODEX_VERSION } from '../packages/overseer/src/judge-transport';
 
 const SPOOL = process.env.OVERSEER_REVIEW_SPOOL ?? '/var/lib/overseer-review';
-/** Pin must match the version inside CODEX_JUDGE_CLI_PACKAGE. */
-const CODEX_VERSION = '0.159.2';
 const FORBIDDEN_ENV = /^(?:GITHUB_|GH_|ARCHON_)|(?:_TOKEN|_KEY|_SECRET)$/;
 
 interface BrokerJob {

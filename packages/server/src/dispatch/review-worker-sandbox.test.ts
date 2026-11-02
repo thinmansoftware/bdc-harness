@@ -420,7 +420,7 @@ function startProcessJobBroker(
       const prefix = argv[0] === 'setsid' ? ['setsid', '--'] : [];
       if (argv.includes('--version')) {
         return original(
-          [...prefix, process.execPath, '-e', "console.log('codex-cli 0.159.2')"],
+          [...prefix, process.execPath, '-e', "process.stdout.write('codex-cli 0.159.2\\n')"],
           options
         );
       }

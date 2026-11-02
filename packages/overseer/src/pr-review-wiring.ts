@@ -49,6 +49,7 @@ import {
   reviewErrorCode,
 } from './pr-review-evaluator';
 import { createJudgeLadderBreaker, recordJudgeRungOutage } from './judge-ladder-health';
+import { CODEX_JUDGE_CLI_VERSION } from './judge-transport';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type {
   ReviewExecutionContext,
@@ -372,7 +373,7 @@ export async function observeReviewExecution(
         treeSha: before.treeSha,
         cwd: before.cwd,
         nativePolicy: 'codex_legacy_landlock',
-        nativeVersion: '0.153.3',
+        nativeVersion: CODEX_JUDGE_CLI_VERSION,
         runtimeUid: inspection.uid,
         inspectionObserved: true,
         check_plan: checkPlanStatus,

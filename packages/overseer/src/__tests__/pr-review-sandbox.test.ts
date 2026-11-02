@@ -14,7 +14,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps';
 import { createRealSubmitDeps, observeReviewExecution } from '../pr-review-wiring';
-import { CODEX_JUDGE_CLI_PACKAGE, buildPrReviewTransport } from '../judge-transport';
+import {
+  CODEX_JUDGE_CLI_PACKAGE,
+  CODEX_JUDGE_CLI_VERSION,
+  buildPrReviewTransport,
+} from '../judge-transport';
 import { processJob, runBrokerProcess } from '../../../../scripts/overseer-reviewer-broker';
 import {
   runAndSubmitReview,
@@ -51,7 +55,7 @@ const proof: ReviewExecutionProof = {
   treeSha: 'b'.repeat(40),
   cwd: '/tmp/checkout',
   nativePolicy: 'codex_legacy_landlock',
-  nativeVersion: '0.153.3',
+  nativeVersion: CODEX_JUDGE_CLI_VERSION,
   runtimeUid: 1001,
   inspectionObserved: true,
   check_plan: 'present',
@@ -643,6 +647,7 @@ describe.serial('observed checkout integrity and check environment', () => {
           checkPlan: [],
         });
         expect(proof?.inspectionObserved).toBe(true);
+        expect(proof?.nativeVersion).toBe(CODEX_JUDGE_CLI_VERSION);
         expect(proof?.check_plan).toBe('absent');
         expect(proof?.checks).toEqual([]);
       } finally {
