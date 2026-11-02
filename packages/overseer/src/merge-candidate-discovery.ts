@@ -93,6 +93,7 @@ export type MergeCandidateExclusionReason =
   | 'repo_policy_missing'
   | 'base_branch_not_watched'
   | 'review_not_approved'
+  | 'review_execution_unqualified'
   | 'checks_failing'
   | 'checks_pending'
   | 'checks_absent'
@@ -266,6 +267,13 @@ export interface DiscoveryConfigurationReport {
   readonly repos: readonly DiscoveryRepoTarget[];
   readonly watchedBases: readonly string[];
   readonly maxPullRequestsPerTick: number;
+  /**
+   * The bases the sweep actually watches per repo, resolved from
+   * MERGE_MANAGER_REPO_POLICY exactly as the sweep does. `watchedBases` is the
+   * legacy global list; on its own it once suggested bdc-xo `main` was unwatched
+   * (WO-HARNESS-MERGE-MANAGER-POST-REBUILD-STALL-01).
+   */
+  readonly perRepoBases: Readonly<Record<string, readonly string[]>>;
   /** False when the sweep would return `no_repos_configured` on every tick. */
   readonly configured: boolean;
 }
@@ -274,9 +282,31 @@ export function describeDiscoveryConfiguration(
   env: NodeJS.ProcessEnv = process.env
 ): DiscoveryConfigurationReport {
   const repos = resolveDiscoveryRepos(env[DISCOVERY_REPOS_ENV]);
+  const explicitPolicy = env[MERGE_MANAGER_REPO_POLICY_ENV];
+  let perRepoBases: Record<string, readonly string[]> = {};
+  try {
+    const policy = resolveMergeRepoPolicy({
+      rawPolicy: explicitPolicy,
+      legacyAllowedBases:
+        explicitPolicy === undefined && env[LEGACY_ALLOWED_BASES_ENV] !== undefined
+          ? resolveWatchedBaseBranches(env[DISCOVERY_BASE_BRANCHES_ENV])
+          : undefined,
+      legacyRepos: repos.map(target => `${target.owner}/${target.repo}`),
+    });
+    perRepoBases = Object.fromEntries(
+      repos.map(target => {
+        const ownerRepo = `${target.owner}/${target.repo}`;
+        return [ownerRepo, resolveWatchedBaseBranchesForRepo(ownerRepo, policy)];
+      })
+    );
+  } catch {
+    // A malformed policy is reported by the sweep itself; the startup report
+    // must never be the thing that throws.
+  }
   return {
     repos,
     watchedBases: resolveWatchedBaseBranches(env[DISCOVERY_BASE_BRANCHES_ENV]),
+    perRepoBases,
     maxPullRequestsPerTick: resolveDiscoveryMaxPrsPerTick(
       env.OVERSEER_MERGE_DISCOVERY_MAX_PRS_PER_TICK
     ),
@@ -296,6 +326,7 @@ export function logDiscoveryConfigurationAtStartup(
   const fields = {
     repos: report.repos.map(target => `${target.owner}/${target.repo}`),
     watchedBases: report.watchedBases,
+    perRepoBases: report.perRepoBases,
     maxPullRequestsPerTick: report.maxPullRequestsPerTick,
     reposEnv: DISCOVERY_REPOS_ENV,
   };
@@ -958,6 +989,28 @@ export async function discoverMergeCandidates(
           prNumber: pr.prNumber,
           reason: evidenceReason,
           detail: evidenceDetail(evidenceReason, evidence),
+        });
+        continue;
+      }
+
+      // GitHub's aggregate APPROVED bit is not merge authority. Production
+      // callers must supply the receipt-backed guard. Missing qualification
+      // authority fails closed just like an explicit negative result.
+      if (
+        !deps.hasQualifiedReview ||
+        !(await deps.hasQualifiedReview({
+          owner: pr.owner,
+          repo: pr.repo,
+          number: pr.prNumber,
+          headSha: pr.headSha,
+        }))
+      ) {
+        exclusions.push({
+          owner: pr.owner,
+          repo: pr.repo,
+          prNumber: pr.prNumber,
+          reason: 'review_execution_unqualified',
+          detail: 'no durable exact-head sandbox execution and GitHub response qualification',
         });
         continue;
       }

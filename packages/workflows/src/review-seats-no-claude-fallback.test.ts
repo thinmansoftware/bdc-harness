@@ -4,8 +4,9 @@
  * WO-HARNESS-REVIEW-SEATS-NO-CLAUDE-FALLBACK-01:
  * served feature-development review seats fail closed on Codex. They use
  * provider codex-native-strict, carry no failover_provider, and every listed
- * strict seat is pinned to gpt-5.6-terra. No review-family node in these
- * lanes remains on plain provider codex.
+ * strict seat is pinned to Terra: gpt-6.1-terra on the Codex and Cursor lanes,
+ * gpt-5.6-terra on the Codex-only, Fable, and default lanes. No review-family
+ * node in these lanes remains on plain provider codex.
  *
  * WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01 (John Ranson 2026-10-27,
  * "use kimi k3.1 it scored high"): on the claude and fable lanes the four
@@ -46,13 +47,39 @@ const KIMI_FAILOVER = {
 const LANES: ReadonlyArray<{
   file: string;
   seats: readonly string[];
+  terra: string;
   failover: typeof KIMI_FAILOVER | null;
 }> = [
-  { file: 'bdc-feature-development-cursor.yaml', seats: SEVEN_SEATS, failover: null },
-  { file: 'bdc-feature-development-codex.yaml', seats: SEVEN_SEATS, failover: null },
-  { file: 'bdc-feature-development-codex-only.yaml', seats: SEVEN_SEATS, failover: null },
-  { file: 'bdc-feature-development-fable.yaml', seats: FOUR_SEATS, failover: KIMI_FAILOVER },
-  { file: 'bdc-feature-development.yaml', seats: FOUR_SEATS, failover: KIMI_FAILOVER },
+  {
+    file: 'bdc-feature-development-cursor.yaml',
+    seats: SEVEN_SEATS,
+    terra: 'gpt-6.1-terra',
+    failover: null,
+  },
+  {
+    file: 'bdc-feature-development-codex.yaml',
+    seats: SEVEN_SEATS,
+    terra: 'gpt-6.1-terra',
+    failover: null,
+  },
+  {
+    file: 'bdc-feature-development-codex-only.yaml',
+    seats: SEVEN_SEATS,
+    terra: 'gpt-5.6-terra',
+    failover: null,
+  },
+  {
+    file: 'bdc-feature-development-fable.yaml',
+    seats: FOUR_SEATS,
+    terra: 'gpt-5.6-terra',
+    failover: KIMI_FAILOVER,
+  },
+  {
+    file: 'bdc-feature-development.yaml',
+    seats: FOUR_SEATS,
+    terra: 'gpt-5.6-terra',
+    failover: KIMI_FAILOVER,
+  },
 ];
 
 interface NodeDef {
@@ -87,7 +114,7 @@ function isReviewFamily(node: NodeDef): boolean {
 }
 
 describe('review seats fail closed (no Claude fallback)', () => {
-  for (const { file, seats, failover } of LANES) {
+  for (const { file, seats, terra, failover } of LANES) {
     it(`${file}: listed seats keep strict model policy and never fail over to Claude`, () => {
       const nodes = loadLane(file).nodes ?? [];
       for (const id of seats) {
@@ -103,7 +130,7 @@ describe('review seats fail closed (no Claude fallback)', () => {
           expect(node?.failover_agent, `${id}:failover_agent`).toBe(failover.agent);
         }
         if (node?.agent || node?.persona) {
-          expect(node?.model, `${id}:model`).toBe('gpt-5.6-terra');
+          expect(node?.model, `${id}:model`).toBe(terra);
         }
       }
     });

@@ -21,6 +21,25 @@ if [ "$(id -u)" = "0" ]; then
     echo "ERROR: Failed to fix ownership of /home/appuser -- volume may be read-only or mounted with incompatible options" >&2
     exit 1
   fi
+  # Design A: OS permissions are the reviewer's read boundary. Reassert them
+  # on every start because these paths may be replaced by bind/named volumes.
+  chown appuser:appuser /home/appuser /.archon /.archon/workspaces
+  chmod 0750 /home/appuser /.archon /.archon/workspaces
+  mkdir -p /home/appuser/.codex /home/appuser/.config/gh /home/appuser/.cursor
+  chown -R appuser:appuser /home/appuser/.codex /home/appuser/.config/gh /home/appuser/.cursor
+  chmod 0700 /home/appuser/.codex /home/appuser/.config/gh /home/appuser/.cursor
+  if [ -d /run/secrets ]; then
+    chown root:appuser /run/secrets
+    chmod 0750 /run/secrets
+  fi
+  mkdir -p /var/lib/overseer-review /home/reviewer/.codex
+  chown appuser:reviewer /var/lib/overseer-review
+  chmod 2770 /var/lib/overseer-review
+  chown reviewer:reviewer /home/reviewer /home/reviewer/.codex
+  chmod 0700 /home/reviewer /home/reviewer/.codex
+  if [ -f /home/appuser/.codex/auth.json ]; then
+    install -o reviewer -g reviewer -m 0600 /home/appuser/.codex/auth.json /home/reviewer/.codex/auth.json
+  fi
   # PR #848: seed cursor-agent auth state from the read-only host mount.
   # docker-compose.yml binds ${CURSOR_CONFIG_HOST_PATH:-/dev/null} at
   # /run/secrets/cursor-config. Only a non-empty DIRECTORY is copied; the
@@ -154,5 +173,33 @@ $RUNNER bun run setup-auth
 # script always exits 0 and the reactive refresh path (PR #48) catches
 # any 401 that slips through.
 $RUNNER bun run verify-auth || true
+
+# The broker is intentionally born in the root phase as UID 1002. Its empty
+# environment prevents server/GitHub/dispatch credentials from crossing the
+# process boundary. There is no appuser fallback.
+if [ "$(id -u)" = "0" ]; then
+  rm -f /var/lib/overseer-review/ready
+  if [ -f /home/appuser/.codex/auth.json ]; then
+    install -o reviewer -g reviewer -m 0600 /home/appuser/.codex/auth.json /home/reviewer/.codex/auth.json
+  fi
+  gosu reviewer env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/reviewer \
+    LANG=C.UTF-8 OVERSEER_REVIEW_SPOOL=/var/lib/overseer-review \
+    bun run /app/scripts/overseer-reviewer-broker.ts &
+  _REVIEWER_BROKER_PID=$!
+  _REVIEWER_READY_ATTEMPTS=0
+  while [ ! -f /var/lib/overseer-review/ready ]; do
+    if ! kill -0 "$_REVIEWER_BROKER_PID" 2>/dev/null; then
+      echo "ERROR: reviewer_broker_unavailable" >&2
+      exit 1
+    fi
+    _REVIEWER_READY_ATTEMPTS=$((_REVIEWER_READY_ATTEMPTS + 1))
+    if [ "$_REVIEWER_READY_ATTEMPTS" -ge 100 ]; then
+      echo "ERROR: reviewer_broker_unavailable" >&2
+      exit 1
+    fi
+    sleep 0.05
+  done
+  unset _REVIEWER_READY_ATTEMPTS
+fi
 
 exec $RUNNER bun run start

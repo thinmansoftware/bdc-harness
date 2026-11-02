@@ -114,6 +114,28 @@ RUN apt-get update && apt-get install -y \
     # package). Agents and docs say `fd`, so expose it under the expected name.
     && ln -sf "$(command -v fdfind)" /usr/local/bin/fd
 
+# bubblewrap for the Overseer reviewer sandbox (WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01).
+# codex >= 0.159 builds a filesystem-restricted sandbox with bwrap (legacy
+# Landlock refuses it). Pinned to Debian bookworm's bubblewrap 0.8.0-2+deb12u1
+# (sha256-verified), not trixie's 0.12.0: inside Docker a fresh /proc mount is
+# always refused (masked /proc paths), and codex 0.159.2 only falls back to
+# "no new /proc" when bwrap's error names "/newroot/proc", which 0.12 no longer
+# prints. Not setuid; it relies on unprivileged user namespaces, and the
+# AppArmor profile docker/apparmor/archon-bwrap lets only /usr/bin/bwrap mount.
+ARG BUBBLEWRAP_DEB_SNAPSHOT_URL=https://snapshot.debian.org/file/75e7579318581f9d6633957a5482f63b7aa36c7c
+ARG BUBBLEWRAP_DEB_POOL_URL=https://deb.debian.org/debian/pool/main/b/bubblewrap/bubblewrap_0.8.0-2+deb12u1_amd64.deb
+ARG BUBBLEWRAP_DEB_SHA256=3cc9134a3286ad01a323dcd924ba123eb634cefaeec82d774257e06308aeaadb
+RUN { curl -fsSL --retry 3 -o /tmp/bubblewrap.deb "${BUBBLEWRAP_DEB_SNAPSHOT_URL}" \
+      || curl -fsSL --retry 3 -o /tmp/bubblewrap.deb "${BUBBLEWRAP_DEB_POOL_URL}"; } \
+    && echo "${BUBBLEWRAP_DEB_SHA256}  /tmp/bubblewrap.deb" | sha256sum -c - \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends --allow-downgrades /tmp/bubblewrap.deb \
+    && apt-mark hold bubblewrap \
+    && rm -rf /var/lib/apt/lists/* /tmp/bubblewrap.deb \
+    && test "$(command -v bwrap)" = /usr/bin/bwrap \
+    && test ! -u /usr/bin/bwrap \
+    && test "$(bwrap --version)" = "bubblewrap 0.8.0"
+
 # Install GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -201,12 +223,20 @@ RUN mkdir -p /opt/cursor-agent \
 
 # Create non-root user for running Claude Code
 # Claude Code refuses to run with --dangerously-skip-permissions as root for security
-RUN useradd -m -u 1001 -s /bin/bash appuser \
+RUN groupadd --gid 1002 reviewer \
+    && useradd --create-home --uid 1002 --gid 1002 --shell /usr/sbin/nologin reviewer \
+    && useradd -m -u 1001 -s /bin/bash appuser \
+    && usermod --append --groups reviewer appuser \
     && chown -R appuser:appuser /app
 
 # Create Archon directories
-RUN mkdir -p /.archon/workspaces /.archon/worktrees \
-    && chown -R appuser:appuser /.archon
+RUN mkdir -p /.archon/workspaces /.archon/worktrees /run/secrets /var/lib/overseer-review \
+    && chown -R appuser:appuser /.archon \
+    && chmod 0750 /.archon /.archon/workspaces \
+    && chown root:appuser /run/secrets \
+    && chmod 0750 /run/secrets \
+    && chown appuser:reviewer /var/lib/overseer-review \
+    && chmod 2770 /var/lib/overseer-review
 
 # Copy root package files and lockfile
 COPY package.json bun.lock ./
@@ -267,17 +297,22 @@ COPY tsconfig*.json ./
 
 # Entrypoints used by the container GitHub transport and credential preflight.
 COPY scripts/github-service-token.ts scripts/github-service-exec.ts scripts/github-service-login.ts scripts/run-completion-report.ts ./scripts/
+COPY scripts/overseer-review-sandbox-smoke.ts scripts/overseer-reviewer-broker.ts ./scripts/
 
 # Fix permissions for appuser
 RUN chown -R appuser:appuser /app
 
 # Create .codex directory for Codex authentication
-RUN mkdir -p /home/appuser/.codex && chown appuser:appuser /home/appuser/.codex
+RUN mkdir -p /home/appuser/.codex /home/appuser/.config/gh \
+    && chown -R appuser:appuser /home/appuser \
+    && chmod 0750 /home/appuser \
+    && chmod 0700 /home/appuser/.codex /home/appuser/.config/gh
 
 # Create .cursor directory for cursor-agent authentication. Populated at startup
 # from the read-only host mount /run/secrets/cursor-config (docker-entrypoint.sh)
 # or left empty when CURSOR_API_KEY is used instead.
-RUN mkdir -p /home/appuser/.cursor && chown appuser:appuser /home/appuser/.cursor
+RUN mkdir -p /home/appuser/.cursor && chown appuser:appuser /home/appuser/.cursor \
+    && chmod 0700 /home/appuser/.cursor
 
 # Configure git to trust all directories for both root and appuser.
 # Uses the git-native '*' wildcard (standalone token, not a shell glob) which
@@ -286,7 +321,8 @@ RUN mkdir -p /home/appuser/.cursor && chown appuser:appuser /home/appuser/.curso
 # git only matches them as literal strings, not as filesystem globs. The wildcard
 # covers worktrees created at arbitrary depths after container startup.
 RUN git config --global --add safe.directory '*' && \
-    gosu appuser git config --global --add safe.directory '*'
+    gosu appuser git config --global --add safe.directory '*' && \
+    gosu reviewer git config --global --add safe.directory '*'
 
 COPY scripts/container/project-pnpm.sh /usr/local/bin/pnpm
 RUN sed -i 's/\r$//' /usr/local/bin/pnpm && chmod 755 /usr/local/bin/pnpm

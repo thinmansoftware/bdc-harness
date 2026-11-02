@@ -40,3 +40,15 @@ docker exec archon-app-1 printenv ARCHON_BUILD_SHA
 ```
 
 Expected: `LABEL_OK`, and `printenv` prints the same 40-hex value.
+
+## AppArmor profile before recreate (WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01)
+
+From the commit that adds `apparmor=archon-bwrap` to `services.app`, Docker refuses to start `archon-app-1` unless the host has the profile loaded. Before the governed recreate, on the harness host:
+
+```bash
+sudo install -m 0644 /opt/bdc/archon/docker/apparmor/archon-bwrap /etc/apparmor.d/archon-bwrap
+sudo apparmor_parser --replace /etc/apparmor.d/archon-bwrap
+sudo aa-status | grep archon-bwrap
+```
+
+After the recreate, `docker inspect -f '{{.AppArmorProfile}}' archon-app-1` prints `archon-bwrap`. Rollback and unload commands: `docker/seccomp-archon.md`, section "AppArmor profile archon-bwrap".

@@ -426,6 +426,12 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
   return (): Promise<void> =>
     runMergeExecutionBridgeOnce({
       github,
+      ...(github.hasQualifiedReview
+        ? {
+            hasQualifiedReview: (input): Promise<boolean> =>
+              github.hasQualifiedReview?.(input) ?? Promise.resolve(false),
+          }
+        : {}),
       store: {
         listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
         claimVerdict: claimVerdictForMergeExecution,

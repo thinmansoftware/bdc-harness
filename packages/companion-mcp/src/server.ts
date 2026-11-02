@@ -100,12 +100,12 @@ export function touchSession(
   }
 }
 
-export async function evictLeastRecentIfAtCap(
+function detachLeastRecentIfAtCap(
   sessions: Map<string, SessionRecord>,
   maxSessions: number
-): Promise<void> {
+): SessionRecord | undefined {
   if (sessions.size < maxSessions) {
-    return;
+    return undefined;
   }
   let oldestId: string | undefined;
   let oldestMs = 0;
@@ -116,15 +116,49 @@ export async function evictLeastRecentIfAtCap(
     }
   }
   if (oldestId === undefined) {
-    return;
+    return undefined;
   }
   const record = sessions.get(oldestId);
   sessions.delete(oldestId);
+  return record;
+}
+
+async function closeSessionRecord(record: SessionRecord): Promise<void> {
+  await record.transport.close();
+  await record.server.close();
+}
+
+export async function evictLeastRecentIfAtCap(
+  sessions: Map<string, SessionRecord>,
+  maxSessions: number
+): Promise<void> {
+  const record = detachLeastRecentIfAtCap(sessions, maxSessions);
   if (record === undefined) {
     return;
   }
-  await record.transport.close();
-  await record.server.close();
+  await closeSessionRecord(record);
+}
+
+// Admissions share one queue. Each admission detaches the least-recent session
+// (when at cap) and inserts the new record before awaiting cleanup, so a peer
+// cannot observe the freed slot and push the map past maxSessions.
+export function createSessionAdmissions(
+  sessions: Map<string, SessionRecord>,
+  maxSessions: number
+): (id: string, record: SessionRecord) => Promise<void> {
+  let tail: Promise<void> = Promise.resolve();
+  const release = (): undefined => undefined;
+  return (id: string, record: SessionRecord): Promise<void> => {
+    const run = tail.then(async (): Promise<void> => {
+      const evicted = detachLeastRecentIfAtCap(sessions, maxSessions);
+      sessions.set(id, record);
+      if (evicted !== undefined) {
+        await closeSessionRecord(evicted);
+      }
+    });
+    tail = run.then(release, release);
+    return run;
+  };
 }
 
 export async function sweepIdleSessions(
@@ -178,6 +212,7 @@ export async function startCompanionMcp(
     env,
   };
   const sessions = new Map<string, SessionRecord>();
+  const admitSession = createSessionAdmissions(sessions, maxSessions);
   const sweepTimer = setInterval(() => {
     void sweepIdleSessions(sessions, Date.now(), idleMs);
   }, 60_000);
@@ -233,12 +268,12 @@ export async function startCompanionMcp(
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: (): string => randomUUID(),
       enableJsonResponse: true,
-      onsessioninitialized: (id: string): void => {
-        if (holder.session !== undefined) {
-          void evictLeastRecentIfAtCap(sessions, maxSessions);
-          holder.session.lastActivityMs = Date.now();
-          sessions.set(id, holder.session);
+      onsessioninitialized: (id: string): void | Promise<void> => {
+        if (holder.session === undefined) {
+          return;
         }
+        holder.session.lastActivityMs = Date.now();
+        return admitSession(id, holder.session);
       },
       onsessionclosed: (id: string): void => {
         sessions.delete(id);

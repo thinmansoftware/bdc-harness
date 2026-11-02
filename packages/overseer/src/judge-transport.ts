@@ -57,6 +57,56 @@ export interface JudgeTransport {
   promptFile?: string;
   /** Private 0700 directory containing `promptFile`; removed with it. */
   promptDir?: string;
+  /** PR review jobs are submitted to the UID-1002 broker, never spawned here. */
+  brokerJob?: { checkout: string; expectedHead: string; argv: string[]; prompt: string };
+}
+
+export interface PrReviewTransportContext {
+  readonly kind: 'pr-review';
+  readonly cwd: string;
+  readonly expectedHeadSha: string;
+  readonly nativePolicy: 'codex_bubblewrap';
+}
+
+/** PR-only transport. Shared judge callers continue to use buildJudgeTransport unchanged. */
+export async function buildPrReviewTransport(
+  binary: string,
+  prompt: string,
+  context: PrReviewTransportContext
+): Promise<JudgeTransport> {
+  if (binary !== 'codex') {
+    throw new Error('pr_review_native_sandbox_unsupported_binary');
+  }
+  if (!context.cwd || !context.expectedHeadSha) {
+    throw new Error('pr_review_native_sandbox_context_invalid');
+  }
+  const argv = [
+    'bunx',
+    '--offline',
+    CODEX_JUDGE_CLI_PACKAGE,
+    '-c',
+    'web_search="disabled"',
+    'exec',
+    '--json',
+    '--sandbox',
+    'workspace-write',
+    '-c',
+    'sandbox_workspace_write.network_access=false',
+    '--skip-git-repo-check',
+    '--cd',
+    context.cwd,
+    '--model',
+    resolveCodexJudgeModel(),
+  ];
+  return {
+    argv,
+    brokerJob: {
+      checkout: context.cwd,
+      expectedHead: context.expectedHeadSha,
+      argv,
+      prompt,
+    },
+  };
 }
 
 /** Owner-only directory (rwx------). */
@@ -108,12 +158,18 @@ export function resolveCursorJudgeModel(
 }
 
 /**
- * The Codex CLI the `codex` judge rung runs, pinned to an exact version rather
- * than floating `bunx` latest. GPT-6 models need codex-cli >= 0.155; the harness
- * SDK pin in packages/providers/package.json is the same version (a test keeps
- * the two equal).
+ * Exact Codex CLI pin shared by the judge rung, the reviewer broker, execution
+ * proofs, and the sandbox smoke attestation. GPT-6 models need codex-cli >= 0.155.
+ * The harness SDK pin in packages/providers/package.json is the same version
+ * (a test keeps the two equal).
  */
-export const CODEX_JUDGE_CLI_PACKAGE = '@openai/codex@0.159.2';
+export const CODEX_JUDGE_CLI_VERSION = '0.159.2';
+
+/**
+ * The Codex CLI the `codex` judge rung runs, pinned to an exact version rather
+ * than floating `bunx` latest.
+ */
+export const CODEX_JUDGE_CLI_PACKAGE = `@openai/codex@${CODEX_JUDGE_CLI_VERSION}`;
 
 /**
  * Default model for the `codex` judge rung (John 2026-11-01: the Overseer judge

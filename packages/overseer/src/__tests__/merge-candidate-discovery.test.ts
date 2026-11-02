@@ -112,6 +112,7 @@ function discoveryDeps(
 ): MergeCandidateDiscoveryDeps {
   return {
     listOpenPullRequests: async () => pullRequests,
+    hasQualifiedReview: async () => true,
     findPullRequest: async input => {
       const match = pullRequests.find(candidate => candidate.headRef === input.headBranch);
       const evidence = match ? evidenceByNumber[match.prNumber] : undefined;
@@ -122,6 +123,18 @@ function discoveryDeps(
 }
 
 describe('merge candidate discovery -- the #758 candidate set', () => {
+  test('fails closed when exact-head review qualification is not wired', async () => {
+    const candidate = pr({ prNumber: 729 });
+    const deps = discoveryDeps([candidate], { 729: greenEvidence(729) });
+    delete deps.hasQualifiedReview;
+    const result = await discoverMergeCandidates(deps, {
+      repos: REPOS,
+      watchedBaseBranches: WATCHED_BASES,
+    });
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions[0]?.reason).toBe('review_execution_unqualified');
+  });
+
   // THE HEADLINE CASE. A mixed set of five PRs, exactly one of which is the
   // shape #730/#731 had: open, non-draft, APPROVED, checks green, CLEAN. Before
   // the fix none of these could enter the set at all, because the set came from
@@ -259,6 +272,7 @@ describe('merge candidate discovery -- the #758 candidate set', () => {
         return [pr({ prNumber: 806 })];
       },
       findPullRequest: async () => greenEvidence(806),
+      hasQualifiedReview: async () => true,
     };
 
     const result = await discoverMergeCandidates(deps, {
@@ -432,6 +446,7 @@ describe('watchOnce integration -- discovered PRs reach the outcome set', () => 
       ...emptyRunStore,
       findPullRequest: discovery.findPullRequest,
       listOpenPullRequests: discovery.listOpenPullRequests,
+      hasQualifiedReview: discovery.hasQualifiedReview,
       mergePullRequest: async () => ({ merged: true }),
     };
   }
@@ -566,6 +581,7 @@ describe('merge candidate discovery -- evidence binding', () => {
         listOpenPullRequests: async () => [upstream, fork],
         // Branch-keyed lookup: the exact ambiguity the finding describes.
         findPullRequest: async () => greenEvidence(800),
+        hasQualifiedReview: async () => true,
       },
       { watchedBases: WATCHED_BASES, repos: REPOS }
     );
@@ -809,6 +825,7 @@ describe('watchOnce -> handleRecord -- discovered PRs reach the merge manager', 
       ...emptyRunStore,
       findPullRequest: discovery.findPullRequest,
       listOpenPullRequests: discovery.listOpenPullRequests,
+      hasQualifiedReview: discovery.hasQualifiedReview,
       mergePullRequest: async () => ({ merged: true }),
       insertOverseerAction: async () => undefined,
     };
@@ -854,6 +871,7 @@ describe('watchOnce -> handleRecord -- discovered PRs reach the merge manager', 
       // listing it once merged.
       listOpenPullRequests: async input =>
         open.filter(candidate => candidate.owner === input.owner && candidate.repo === input.repo),
+      hasQualifiedReview: async () => true,
       mergePullRequest: async () => ({ merged: true }),
       insertOverseerAction: async () => undefined,
     };
@@ -903,6 +921,7 @@ describe('watchOnce -> handleRecord -- discovered PRs reach the merge manager', 
       listRunEvents: async () => [],
       findPullRequest: discovery.findPullRequest,
       listOpenPullRequests: discovery.listOpenPullRequests,
+      hasQualifiedReview: discovery.hasQualifiedReview,
       mergePullRequest: async () => ({ merged: true }),
       insertOverseerAction: async () => undefined,
     } as unknown as OverseerRunStoreDeps & GitHubClientDeps & OverseerActionsDeps;
@@ -1339,6 +1358,35 @@ describe('merge candidate discovery -- unavailable is never silent', () => {
     expect(set.logged.some(entry => entry.level === 'warn')).toBe(false);
   });
 
+  test('startup logs the per-repo bases the sweep actually watches', () => {
+    // WO-HARNESS-MERGE-MANAGER-POST-REBUILD-STALL-01: the legacy global
+    // `watchedBases` ["dev","staging"] suggested bdc-xo `main` was unwatched.
+    const set = captureLogger();
+    const report = logDiscoveryConfigurationAtStartup(set.logger, {
+      OVERSEER_MERGE_DISCOVERY_REPOS: 'thinmansoftware/bdc-xo,thinmansoftware/bdc-harness',
+      MERGE_MANAGER_REPO_POLICY: JSON.stringify({
+        'thinmansoftware/bdc-xo': { main: { unattended: true, docs_only: 'merge' } },
+        'thinmansoftware/bdc-harness': { dev: { unattended: true, docs_only: 'skip' } },
+      }),
+    } as NodeJS.ProcessEnv);
+    expect(report.perRepoBases['thinmansoftware/bdc-xo']).toEqual(['main']);
+    expect(report.perRepoBases['thinmansoftware/bdc-harness']).toEqual(['dev']);
+    const info = set.logged.find(entry => entry.msg === 'merge-coordinator.discovery_configured');
+    expect(info?.obj.perRepoBases).toEqual({
+      'thinmansoftware/bdc-xo': ['main'],
+      'thinmansoftware/bdc-harness': ['dev'],
+    });
+  });
+
+  test('a malformed repo policy reports no watched bases (fail closed), never throws', () => {
+    const report = describeDiscoveryConfiguration({
+      OVERSEER_MERGE_DISCOVERY_REPOS: 'thinmansoftware/bdc-xo',
+      MERGE_MANAGER_REPO_POLICY: '{not json',
+    } as NodeJS.ProcessEnv);
+    expect(report.configured).toBe(true);
+    expect(report.perRepoBases).toEqual({ 'thinmansoftware/bdc-xo': [] });
+  });
+
   test('a missing list dep reports no_list_dep at warn', async () => {
     const { logged, logger } = captureLogger();
     const result = await discoverMergeCandidates(
@@ -1361,6 +1409,7 @@ describe('merge candidate discovery -- unavailable is never silent', () => {
           return [pr({ prNumber: 2166 })];
         },
         findPullRequest: async () => greenEvidence(2166),
+        hasQualifiedReview: async () => true,
       },
       {
         watchedBases: WATCHED_BASES,
