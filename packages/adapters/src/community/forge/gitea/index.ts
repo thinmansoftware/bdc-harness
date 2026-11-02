@@ -1,1 +1,0 @@
-export { GiteaAdapter } from './adapter';
