@@ -1,0 +1,2 @@
+SPEC_GAP: refusal text not in WO-HARNESS-OVERSEER-LOOP-CANARIES-01
+wrong_base_branch
