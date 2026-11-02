@@ -13,7 +13,8 @@ import {
 import { basename, join, resolve, sep } from 'node:path';
 
 const SPOOL = process.env.OVERSEER_REVIEW_SPOOL ?? '/var/lib/overseer-review';
-const CODEX_VERSION = '0.153.3';
+/** Pin must match the version inside CODEX_JUDGE_CLI_PACKAGE. */
+const CODEX_VERSION = '0.159.2';
 const FORBIDDEN_ENV = /^(?:GITHUB_|GH_|ARCHON_)|(?:_TOKEN|_KEY|_SECRET)$/;
 
 interface BrokerJob {
@@ -64,6 +65,32 @@ export function brokerLimits(env: Record<string, string | undefined> = process.e
   };
 }
 const PINNED_CODEX_PREFIX = ['bunx', '--offline', `@openai/codex@${CODEX_VERSION}`];
+
+/** Model jobs: pinned sandbox argv through --cd <checkout>, then --model <token>. */
+function isPinnedModelArgv(argv: string[], checkout: string): boolean {
+  const expected = [
+    ...PINNED_CODEX_PREFIX,
+    '--enable',
+    'use_legacy_landlock',
+    '-c',
+    'web_search="disabled"',
+    'exec',
+    '--json',
+    '--sandbox',
+    'workspace-write',
+    '-c',
+    'sandbox_workspace_write.network_access=false',
+    '--skip-git-repo-check',
+    '--cd',
+    checkout,
+  ];
+  if (argv.length !== expected.length + 2) return false;
+  for (let index = 0; index < expected.length; index += 1) {
+    if (argv[index] !== expected[index]) return false;
+  }
+  const model = argv[expected.length + 1];
+  return argv[expected.length] === '--model' && typeof model === 'string' && model.length > 0;
+}
 
 function inside(path: string, root: string): boolean {
   return path === root || path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
@@ -237,26 +264,7 @@ export async function processJob(
     if (!inside(checkout, spoolReal)) throw new Error('checkout_outside_spool');
     const info = await stat(checkout);
     if (!info.isDirectory()) throw new Error('checkout_invalid');
-    if (
-      job.prompt !== undefined &&
-      JSON.stringify(job.argv) !==
-        JSON.stringify([
-          ...PINNED_CODEX_PREFIX,
-          '--enable',
-          'use_legacy_landlock',
-          '-c',
-          'web_search="disabled"',
-          'exec',
-          '--json',
-          '--sandbox',
-          'workspace-write',
-          '-c',
-          'sandbox_workspace_write.network_access=false',
-          '--skip-git-repo-check',
-          '--cd',
-          checkout,
-        ])
-    ) {
+    if (job.prompt !== undefined && !isPinnedModelArgv(job.argv, checkout)) {
       throw new Error('model_argv_invalid');
     }
 
@@ -302,26 +310,7 @@ export async function processJob(
             ...job.argv,
           ]
         : job.argv;
-    if (
-      job.prompt !== undefined &&
-      JSON.stringify(command) !==
-        JSON.stringify([
-          ...PINNED_CODEX_PREFIX,
-          '--enable',
-          'use_legacy_landlock',
-          '-c',
-          'web_search="disabled"',
-          'exec',
-          '--json',
-          '--sandbox',
-          'workspace-write',
-          '-c',
-          'sandbox_workspace_write.network_access=false',
-          '--skip-git-repo-check',
-          '--cd',
-          checkout,
-        ])
-    ) {
+    if (job.prompt !== undefined && !isPinnedModelArgv(command, checkout)) {
       throw new Error('model_argv_invalid');
     }
     const version = await runBrokerProcess([...PINNED_CODEX_PREFIX, '--version'], checkout, env);

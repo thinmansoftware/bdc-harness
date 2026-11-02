@@ -12,6 +12,7 @@ import {
   buildReviewModelTransport,
   buildReviewPrompt,
   checksAreTerminal,
+  codexExecJsonlVerdictText,
   evaluatePullRequest,
   parseReviewVerdict,
   partitionChecksByRequired,
@@ -804,5 +805,70 @@ describe('cursor judge rung', () => {
         output('REQUEST_CHANGES', [{ scope: 'a.ts', severity: 'major', summary: 'x' }])
       )?.verdict
     ).toBe('REQUEST_CHANGES');
+  });
+});
+
+describe('WO-HARNESS-OVERSEER-REVIEW-JSONL-VERDICT-01 -- broker JSONL verdict text', () => {
+  const HEAD_H = 'H';
+
+  function event(value: unknown): string {
+    return JSON.stringify(value);
+  }
+
+  test('1 a JSONL stream whose last agent message is APPROVE parses that verdict', () => {
+    const stream = [
+      event({ type: 'thread.started', thread_id: 't' }),
+      event({
+        type: 'item.completed',
+        item: {
+          type: 'command_execution',
+          aggregated_output: 'bun test\n0 fail',
+        },
+      }),
+      event({
+        type: 'item.completed',
+        item: { type: 'agent_message', text: output('APPROVE', [], HEAD_H) },
+      }),
+      event({ type: 'turn.completed' }),
+    ].join('\n');
+    const parsed = parseReviewVerdict(codexExecJsonlVerdictText(stream));
+    expect(parsed?.verdict).toBe('APPROVE');
+    expect(parsed?.reviewed_head_sha).toBe(HEAD_H);
+  });
+
+  test('2 the last completed agent message wins over an earlier REQUEST_CHANGES', () => {
+    const stream = [
+      event({
+        type: 'item.completed',
+        item: {
+          type: 'agent_message',
+          text: output('REQUEST_CHANGES', [
+            { scope: 'a.ts', severity: 'major', summary: 'earlier' },
+          ]),
+        },
+      }),
+      event({ type: 'turn.completed' }),
+      event({
+        type: 'item.completed',
+        item: { type: 'agent_message', text: output('APPROVE', [], HEAD_H) },
+      }),
+    ].join('\n');
+    expect(parseReviewVerdict(codexExecJsonlVerdictText(stream))?.verdict).toBe('APPROVE');
+  });
+
+  test('3 streams with no completed agent message fail closed', () => {
+    const eventsOnly = [event({ type: 'thread.started' }), event({ type: 'turn.completed' })].join(
+      '\n'
+    );
+    const verdictOnlyInToolOutput = event({
+      type: 'item.completed',
+      item: {
+        type: 'command_execution',
+        aggregated_output: output('APPROVE', [], HEAD_H),
+      },
+    });
+    expect(parseReviewVerdict(codexExecJsonlVerdictText(eventsOnly))).toBeNull();
+    expect(parseReviewVerdict(codexExecJsonlVerdictText('not json at all'))).toBeNull();
+    expect(parseReviewVerdict(codexExecJsonlVerdictText(verdictOnlyInToolOutput))).toBeNull();
   });
 });

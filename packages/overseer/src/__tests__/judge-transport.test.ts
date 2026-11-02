@@ -22,6 +22,7 @@ import {
   DEFAULT_CODEX_JUDGE_MODEL,
   DEFAULT_CURSOR_JUDGE_MODEL,
   buildJudgeTransport,
+  buildPrReviewTransport,
   describeJudgeModel,
   resolveCodexJudgeModel,
   removeJudgeTransportFiles,
@@ -427,5 +428,23 @@ describe('#852 -- judge-second-opinion seam (spawnGrok) goes through the shared 
     expect(records[0]?.promptFileContents).toBe(LARGE_PROMPT);
     await expect(stat(argv[2] ?? '')).rejects.toThrow();
     expect(parseGrokVerdict(result.stdout)).toBe('hold');
+  });
+});
+
+describe('WO-HARNESS-OVERSEER-REVIEW-JSONL-VERDICT-01 -- sandboxed PR review argv', () => {
+  test('names the shared CLI pin and model and keeps the sandbox flags', async () => {
+    delete process.env.OVERSEER_CODEX_JUDGE_MODEL;
+    const transport = await buildPrReviewTransport('codex', 'review the diff', {
+      kind: 'pr-review',
+      cwd: '/tmp/checkout',
+      expectedHeadSha: 'a'.repeat(40),
+      nativePolicy: 'codex_legacy_landlock',
+    });
+    expect(transport.argv).toContain(CODEX_JUDGE_CLI_PACKAGE);
+    const modelAt = transport.argv.indexOf('--model');
+    expect(transport.argv[modelAt + 1]).toBe(resolveCodexJudgeModel());
+    const sandboxAt = transport.argv.indexOf('--sandbox');
+    expect(transport.argv[sandboxAt + 1]).toBe('workspace-write');
+    expect(transport.argv).toContain('sandbox_workspace_write.network_access=false');
   });
 });

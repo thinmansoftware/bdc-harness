@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps';
 import { createRealSubmitDeps, observeReviewExecution } from '../pr-review-wiring';
-import { buildPrReviewTransport } from '../judge-transport';
+import { CODEX_JUDGE_CLI_PACKAGE, buildPrReviewTransport } from '../judge-transport';
 import { processJob, runBrokerProcess } from '../../../../scripts/overseer-reviewer-broker';
 import {
   runAndSubmitReview,
@@ -234,7 +234,7 @@ describe('bounded broker process capture', () => {
         argv: [
           'bunx',
           '--offline',
-          '@openai/codex@0.153.3',
+          CODEX_JUDGE_CLI_PACKAGE,
           '--enable',
           'use_legacy_landlock',
           '-c',
@@ -248,6 +248,8 @@ describe('bounded broker process capture', () => {
           '--skip-git-repo-check',
           '--cd',
           checkout,
+          '--model',
+          'gpt-6.1-sol',
         ],
         prompt: 'review',
       })

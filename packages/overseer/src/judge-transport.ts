@@ -83,7 +83,7 @@ export async function buildPrReviewTransport(
   const argv = [
     'bunx',
     '--offline',
-    '@openai/codex@0.153.3',
+    CODEX_JUDGE_CLI_PACKAGE,
     '--enable',
     'use_legacy_landlock',
     '-c',
@@ -97,6 +97,8 @@ export async function buildPrReviewTransport(
     '--skip-git-repo-check',
     '--cd',
     context.cwd,
+    '--model',
+    resolveCodexJudgeModel(),
   ];
   return {
     argv,

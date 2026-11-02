@@ -869,9 +869,10 @@ export async function invokeConfiguredReviewModel(
         // parent supplies its configured model wall clock per job.
         timeoutMs: Math.max(1, Math.min(Math.floor(timeoutMs), 30 * 60_000)),
       });
+      const payload = result.stdout.trim().length > 0 ? result.stdout : result.stderr;
       return {
         exitCode: result.exitCode,
-        stdout: result.stdout.trim().length > 0 ? result.stdout : result.stderr,
+        stdout: codexExecJsonlVerdictText(payload),
         timedOut: result.timedOut === true,
       };
     }
@@ -959,6 +960,33 @@ export async function runReviewModelProcess(
   // parked if the child exited without draining stdin.
   destroyStdin(subprocess.stdin);
   return result;
+}
+
+/**
+ * Text of the last completed agent message in a `codex exec --json` stream.
+ * A stream with no such message returns '' so parseReviewVerdict fails closed.
+ */
+export function codexExecJsonlVerdictText(stdout: string): string {
+  let verdict = '';
+  for (const line of stdout.split(/\r?\n/)) {
+    if (line.trim().length === 0) continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!event || typeof event !== 'object' || Array.isArray(event)) continue;
+    const record = event as Record<string, unknown>;
+    if (record.type !== 'item.completed') continue;
+    const item = record.item;
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const message = item as Record<string, unknown>;
+    if (message.type !== 'agent_message') continue;
+    if (typeof message.text !== 'string' || message.text.trim().length === 0) continue;
+    verdict = message.text;
+  }
+  return verdict;
 }
 
 function normalizeModelOutput(binary: string, stdout: string): string {

@@ -401,7 +401,7 @@ test('captured_base_unavailable_fails_closed through the worker as a review_inco
  * In-process stand-in for the broker LOOP only: each request is handled by the
  * real processJob (validation, identity check, minimal env, setsid group,
  * deadline and byte-bounded capture). Codex itself is not installed on the
- * test host, so the pinned `codex --version` probe answers 0.153.3 and a
+ * test host, so the pinned `codex --version` probe answers 0.159.2 and a
  * `codex ... sandbox -- <argv>` launch runs <argv> under the same setsid
  * wrapper, env and cwd. Native Landlock enforcement is proven by Stop 7.
  */
@@ -420,7 +420,7 @@ function startProcessJobBroker(
       const prefix = argv[0] === 'setsid' ? ['setsid', '--'] : [];
       if (argv.includes('--version')) {
         return original(
-          [...prefix, process.execPath, '-e', "console.log('codex-cli 0.153.3')"],
+          [...prefix, process.execPath, '-e', "console.log('codex-cli 0.159.2')"],
           options
         );
       }
