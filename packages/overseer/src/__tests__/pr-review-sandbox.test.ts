@@ -8,6 +8,7 @@ import {
   readFile,
   readdir,
   rm,
+  stat,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -19,7 +20,12 @@ import {
   CODEX_JUDGE_CLI_VERSION,
   buildPrReviewTransport,
 } from '../judge-transport';
-import { processJob, runBrokerProcess } from '../../../../scripts/overseer-reviewer-broker';
+import {
+  prepareModelWorkingCopy,
+  processJob,
+  rebindModelArgv,
+  runBrokerProcess,
+} from '../../../../scripts/overseer-reviewer-broker';
 import {
   runAndSubmitReview,
   type ReviewExecutionContext,
@@ -263,6 +269,69 @@ describe('bounded broker process capture', () => {
     } finally {
       await rm(spool, { recursive: true, force: true });
     }
+  });
+
+  test.skipIf(!linux)(
+    'model jobs get a private working copy at the expected head; the sealed checkout is untouched',
+    async () => {
+      const spool = await mkdtemp(join(tmpdir(), 'overseer-working-copy-'));
+      const checkout = join(spool, 'checkout');
+      const scratch = join(spool, 'job.scratch');
+      await mkdir(checkout);
+      await mkdir(scratch, { mode: 0o700 });
+      await runGit(checkout, ['init', '-q']);
+      await runGit(checkout, ['config', 'user.email', 'smoke@example.invalid']);
+      await runGit(checkout, ['config', 'user.name', 'smoke']);
+      await writeFile(join(checkout, 'allowed.txt'), 'allowed\n');
+      await runGit(checkout, ['add', 'allowed.txt']);
+      await runGit(checkout, ['commit', '-qm', 'fixture']);
+      const expectedHead = await runGit(checkout, ['rev-parse', 'HEAD']);
+      // Seal like sealReviewCheckout: no write bits anywhere in the cached checkout.
+      const seal = Bun.spawn(['chmod', '-R', 'a-w', checkout]);
+      expect(await seal.exited).toBe(0);
+      const env = { PATH: '/usr/local/bin:/usr/bin:/bin', HOME: spool, LANG: 'C.UTF-8' };
+      try {
+        const copy = await prepareModelWorkingCopy(checkout, scratch, expectedHead, env);
+        expect(copy).toBe(join(scratch, 'co'));
+        expect((await stat(copy)).mode & 0o777).toBe(0o700);
+        expect(await readFile(join(copy, 'allowed.txt'), 'utf8')).toBe('allowed\n');
+        // The judge's sandbox must be able to create mount points in its workspace root.
+        await mkdir(join(copy, '.agents'));
+        await writeFile(join(copy, '.git', 'judge-scratch'), 'x');
+        // The cached checkout stays sealed.
+        expect((await stat(checkout)).mode & 0o222).toBe(0);
+        await expect(mkdir(join(checkout, '.agents'))).rejects.toThrow();
+
+        // processJob always creates the job scratch before preparing the copy.
+        const otherScratch = join(spool, 'other.scratch');
+        await mkdir(otherScratch, { mode: 0o700 });
+        await expect(
+          prepareModelWorkingCopy(checkout, otherScratch, 'f'.repeat(40), env)
+        ).rejects.toThrow('checkout_identity_failure');
+      } finally {
+        await Bun.spawn(['chmod', '-R', 'u+w', spool]).exited;
+        await rm(spool, { recursive: true, force: true });
+      }
+    }
+  );
+
+  test('rebindModelArgv moves only --cd and refuses an argv bound elsewhere', () => {
+    const argv = ['bunx', 'exec', '--cd', '/spool/checkout', '--model', 'gpt-6.1-sol'];
+    expect(rebindModelArgv(argv, '/spool/checkout', '/spool/x.scratch/co')).toEqual([
+      'bunx',
+      'exec',
+      '--cd',
+      '/spool/x.scratch/co',
+      '--model',
+      'gpt-6.1-sol',
+    ]);
+    expect(argv[3]).toBe('/spool/checkout');
+    expect(() => rebindModelArgv(argv, '/spool/other', '/spool/x.scratch/co')).toThrow(
+      'model_argv_invalid'
+    );
+    expect(() => rebindModelArgv(['bunx', 'exec'], '/spool/checkout', '/c')).toThrow(
+      'model_argv_invalid'
+    );
   });
 
   test.skipIf(!linux)('terminates a hanging descendant within the deadline', async () => {
