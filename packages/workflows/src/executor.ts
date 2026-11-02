@@ -1460,8 +1460,37 @@ export async function executeWorkflow(
           const nodeOverrides: Record<string, { provider?: string; model?: string }> = {
             ...(modelOverride?.nodes ?? {}),
           };
-          for (const [nodeId, route] of routes) {
-            nodeOverrides[nodeId] = { provider: route.toProvider };
+          // failover_model and failover_agent belong to the declared failover route; when a
+          // different provider was selected, keep the original persona and fall back to the
+          // target provider's configured assistant model. The per-node override carries the
+          // selected model so resolveModelForNode (override wins) dispatches it.
+          const rerouteBinding = (
+            node: (typeof executableWorkflow.nodes)[number],
+            toProvider: string
+          ): { model: string | undefined; agent: string | undefined } => {
+            const declared = node as {
+              failover_provider?: string;
+              failover_model?: string;
+              failover_agent?: string;
+            };
+            const declaredProvider =
+              declared.failover_provider ?? executableWorkflow.failover_provider;
+            const onDeclaredRoute = toProvider === declaredProvider;
+            const declaredModel = onDeclaredRoute
+              ? (declared.failover_model ?? executableWorkflow.failover_model)
+              : undefined;
+            return {
+              model: declaredModel ?? assistantModels[toProvider],
+              agent: onDeclaredRoute ? declared.failover_agent : undefined,
+            };
+          };
+          for (const node of executableWorkflow.nodes) {
+            const route = routes.get(node.id);
+            if (!route) continue;
+            const { model } = rerouteBinding(node, route.toProvider);
+            nodeOverrides[node.id] = model
+              ? { provider: route.toProvider, model }
+              : { provider: route.toProvider };
           }
           dispatchModelOverride = { ...(modelOverride ?? {}), nodes: nodeOverrides };
           dispatchWorkflow = {
@@ -1469,20 +1498,7 @@ export async function executeWorkflow(
             nodes: executableWorkflow.nodes.map(node => {
               const route = routes.get(node.id);
               if (!route) return node;
-              const declared = node as {
-                failover_provider?: string;
-                failover_model?: string;
-                failover_agent?: string;
-              };
-              const declaredProvider =
-                declared.failover_provider ?? executableWorkflow.failover_provider;
-              // failover_model and failover_agent belong to the declared failover route; when a
-              // different provider was selected, keep the original persona and no model pin.
-              const onDeclaredRoute = route.toProvider === declaredProvider;
-              const model = onDeclaredRoute
-                ? (declared.failover_model ?? executableWorkflow.failover_model)
-                : undefined;
-              const agent = onDeclaredRoute ? declared.failover_agent : undefined;
+              const { model, agent } = rerouteBinding(node, route.toProvider);
               return buildSeatRerouteNode(node, route.toProvider, model, agent);
             }),
           };

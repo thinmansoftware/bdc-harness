@@ -495,6 +495,22 @@ describe('node-level seat reroute', () => {
     }
   });
 
+  test('rerouted_node_dispatches_declared_failover_model', async () => {
+    setSeatUsageReaderForTests(async () => ({
+      claude: reading('claude', 'seven_day', 96),
+      codex: reading('codex', 'primary', 10),
+    }));
+    await run(
+      stubLane(
+        'codex',
+        claudeNodes({ failover_provider: 'codex', failover_model: 'failover-target-model' })
+      )
+    );
+    const review = invocations.filter(call => call.prompt.startsWith('review-'));
+    expect(review.map(call => call.provider).sort()).toEqual(['codex', 'codex']);
+    for (const call of review) expect(call.model).toBe('failover-target-model');
+  });
+
   test('failover_agent_ignored_when_declared_provider_not_selected', async () => {
     setSeatUsageReaderForTests(async () => ({
       claude: reading('claude', 'seven_day', 96),
