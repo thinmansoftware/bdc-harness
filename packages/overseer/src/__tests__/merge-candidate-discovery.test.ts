@@ -112,6 +112,7 @@ function discoveryDeps(
 ): MergeCandidateDiscoveryDeps {
   return {
     listOpenPullRequests: async () => pullRequests,
+    hasQualifiedReview: async () => true,
     findPullRequest: async input => {
       const match = pullRequests.find(candidate => candidate.headRef === input.headBranch);
       const evidence = match ? evidenceByNumber[match.prNumber] : undefined;
@@ -122,6 +123,18 @@ function discoveryDeps(
 }
 
 describe('merge candidate discovery -- the #758 candidate set', () => {
+  test('fails closed when exact-head review qualification is not wired', async () => {
+    const candidate = pr({ prNumber: 729 });
+    const deps = discoveryDeps([candidate], { 729: greenEvidence(729) });
+    delete deps.hasQualifiedReview;
+    const result = await discoverMergeCandidates(deps, {
+      repos: REPOS,
+      watchedBaseBranches: WATCHED_BASES,
+    });
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions[0]?.reason).toBe('review_execution_unqualified');
+  });
+
   // THE HEADLINE CASE. A mixed set of five PRs, exactly one of which is the
   // shape #730/#731 had: open, non-draft, APPROVED, checks green, CLEAN. Before
   // the fix none of these could enter the set at all, because the set came from
@@ -259,6 +272,7 @@ describe('merge candidate discovery -- the #758 candidate set', () => {
         return [pr({ prNumber: 806 })];
       },
       findPullRequest: async () => greenEvidence(806),
+      hasQualifiedReview: async () => true,
     };
 
     const result = await discoverMergeCandidates(deps, {
@@ -432,6 +446,7 @@ describe('watchOnce integration -- discovered PRs reach the outcome set', () => 
       ...emptyRunStore,
       findPullRequest: discovery.findPullRequest,
       listOpenPullRequests: discovery.listOpenPullRequests,
+      hasQualifiedReview: discovery.hasQualifiedReview,
       mergePullRequest: async () => ({ merged: true }),
     };
   }
@@ -566,6 +581,7 @@ describe('merge candidate discovery -- evidence binding', () => {
         listOpenPullRequests: async () => [upstream, fork],
         // Branch-keyed lookup: the exact ambiguity the finding describes.
         findPullRequest: async () => greenEvidence(800),
+        hasQualifiedReview: async () => true,
       },
       { watchedBases: WATCHED_BASES, repos: REPOS }
     );
@@ -809,6 +825,7 @@ describe('watchOnce -> handleRecord -- discovered PRs reach the merge manager', 
       ...emptyRunStore,
       findPullRequest: discovery.findPullRequest,
       listOpenPullRequests: discovery.listOpenPullRequests,
+      hasQualifiedReview: discovery.hasQualifiedReview,
       mergePullRequest: async () => ({ merged: true }),
       insertOverseerAction: async () => undefined,
     };
@@ -854,6 +871,7 @@ describe('watchOnce -> handleRecord -- discovered PRs reach the merge manager', 
       // listing it once merged.
       listOpenPullRequests: async input =>
         open.filter(candidate => candidate.owner === input.owner && candidate.repo === input.repo),
+      hasQualifiedReview: async () => true,
       mergePullRequest: async () => ({ merged: true }),
       insertOverseerAction: async () => undefined,
     };
@@ -903,6 +921,7 @@ describe('watchOnce -> handleRecord -- discovered PRs reach the merge manager', 
       listRunEvents: async () => [],
       findPullRequest: discovery.findPullRequest,
       listOpenPullRequests: discovery.listOpenPullRequests,
+      hasQualifiedReview: discovery.hasQualifiedReview,
       mergePullRequest: async () => ({ merged: true }),
       insertOverseerAction: async () => undefined,
     } as unknown as OverseerRunStoreDeps & GitHubClientDeps & OverseerActionsDeps;
@@ -1361,6 +1380,7 @@ describe('merge candidate discovery -- unavailable is never silent', () => {
           return [pr({ prNumber: 2166 })];
         },
         findPullRequest: async () => greenEvidence(2166),
+        hasQualifiedReview: async () => true,
       },
       {
         watchedBases: WATCHED_BASES,

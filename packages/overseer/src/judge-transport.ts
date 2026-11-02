@@ -57,6 +57,56 @@ export interface JudgeTransport {
   promptFile?: string;
   /** Private 0700 directory containing `promptFile`; removed with it. */
   promptDir?: string;
+  /** PR review jobs are submitted to the UID-1002 broker, never spawned here. */
+  brokerJob?: { checkout: string; expectedHead: string; argv: string[]; prompt: string };
+}
+
+export interface PrReviewTransportContext {
+  readonly kind: 'pr-review';
+  readonly cwd: string;
+  readonly expectedHeadSha: string;
+  readonly nativePolicy: 'codex_legacy_landlock';
+}
+
+/** PR-only transport. Shared judge callers continue to use buildJudgeTransport unchanged. */
+export async function buildPrReviewTransport(
+  binary: string,
+  prompt: string,
+  context: PrReviewTransportContext
+): Promise<JudgeTransport> {
+  if (binary !== 'codex') {
+    throw new Error('pr_review_native_sandbox_unsupported_binary');
+  }
+  if (!context.cwd || !context.expectedHeadSha) {
+    throw new Error('pr_review_native_sandbox_context_invalid');
+  }
+  const argv = [
+    'bunx',
+    '--offline',
+    '@openai/codex@0.153.3',
+    '--enable',
+    'use_legacy_landlock',
+    '-c',
+    'web_search="disabled"',
+    'exec',
+    '--json',
+    '--sandbox',
+    'workspace-write',
+    '-c',
+    'sandbox_workspace_write.network_access=false',
+    '--skip-git-repo-check',
+    '--cd',
+    context.cwd,
+  ];
+  return {
+    argv,
+    brokerJob: {
+      checkout: context.cwd,
+      expectedHead: context.expectedHeadSha,
+      argv,
+      prompt,
+    },
+  };
 }
 
 /** Owner-only directory (rwx------). */
