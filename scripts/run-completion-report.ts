@@ -13,6 +13,7 @@ import type {
   ServiceGitHubAuth,
 } from '../packages/core/src/github/service-identity';
 import type { IDatabase } from '../packages/core/src/db/adapters/types';
+import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
 
 const USAGE =
   "usage: run-completion-report.ts --days N [--as-of 'YYYY-MM-DD HH:MM:SS'] [--zero-since 'YYYY-MM-DD HH:MM:SS'] [--db PATH] [--json] [--no-github]";
@@ -560,17 +561,32 @@ export async function computeWoCompletion(
       rate: rate(0, 0),
       neither_wos: [],
     };
+  // Read-only contract (docs/operations/run-completion-report.md: "nothing is
+  // written"). runGitHubServiceCommand meters every call and flushes those rows
+  // to its db; left to default it would be getDatabase(), writing
+  // github_api_usage/github_api_pool_state to the production archon.db during a
+  // report that promises to write nothing. Route metering to a throwaway
+  // in-memory sink unless the caller injected its own db (the tests do). The
+  // call still goes through the metered taskmaster identity; only the durable
+  // write is discarded. Closed in finally so the handle never leaks.
+  const ownsMeterDb = opts.db === undefined;
+  const meterDb = opts.db ?? new SqliteAdapter(':memory:');
+  const inj: GitHubInjection = {
+    ...(opts.execute ? { execute: opts.execute } : {}),
+    ...(opts.identity ? { identity: opts.identity } : {}),
+    db: meterDb,
+  };
   const asOfMs = Date.parse(asOf.replace(' ', 'T') + 'Z');
   try {
     // (a) all bdc-xo WO issues, every state, complete pagination.
     const issueItems = (await collectList(
       'issues',
       ['api', '--paginate', '--slurp', `repos/${XO_REPO}/issues?labels=wo&state=all&per_page=100`],
-      opts
+      inj
     )) as GhIssue[];
     // The issues endpoint also returns PRs; keep only real issues to match is:issue.
     const issues = issueItems.filter(i => i != null && i.pull_request == null);
-    const issueTotal = await searchCount('issues', `repo:${XO_REPO} label:wo is:issue`, opts);
+    const issueTotal = await searchCount('issues', `repo:${XO_REPO} label:wo is:issue`, inj);
     if (issues.length !== issueTotal) return { available: false, reason: 'incomplete:issues' };
     const issueByTitle = new Map<string, GhIssue>();
     for (const i of issues) if (typeof i.title === 'string') issueByTitle.set(i.title, i);
@@ -584,12 +600,12 @@ export async function computeWoCompletion(
       const pullItems = (await collectList(
         col,
         ['api', '--paginate', '--slurp', `repos/${repo}/pulls?state=closed&per_page=100`],
-        opts
+        inj
       )) as GhPull[];
       const merged = pullItems.filter(
         (p): p is GhPull & { merged_at: string } => p?.merged_at != null
       );
-      const mergedTotal = await searchCount(col, `repo:${repo} is:pr is:merged`, opts);
+      const mergedTotal = await searchCount(col, `repo:${repo} is:pr is:merged`, inj);
       if (merged.length !== mergedTotal) return { available: false, reason: `incomplete:${col}` };
       mergedByProject.set(
         project,
@@ -640,6 +656,8 @@ export async function computeWoCompletion(
     if (e instanceof GhIncompleteError) return { available: false, reason: e.message };
     if (e instanceof GhAccessError) return { available: false, reason: firstLine(e.message) };
     return { available: false, reason: firstLine(e instanceof Error ? e.message : String(e)) };
+  } finally {
+    if (ownsMeterDb) await meterDb.close();
   }
 }
 

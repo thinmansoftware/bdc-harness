@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { createHash } from 'crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
@@ -7,6 +7,7 @@ import { join } from 'path';
 import { attributeRuns, computeWoCompletion, LEGACY_OVERALL_UNTIL } from './run-completion-report';
 import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
 import { resetGitHubApiMeterForTests } from '../packages/core/src/github/metering';
+import * as dbConnection from '../packages/core/src/db/connection';
 
 const SCRIPT = join(import.meta.dir, 'run-completion-report.ts');
 const AS_OF = '2026-11-01 14:30:00';
@@ -1001,5 +1002,45 @@ describe('run-completion-report merged-or-owned', () => {
     const pullCall = calls.find(c => c.some(e => e.includes('/pulls?')))!;
     expect(pullCall).toContain('--paginate');
     expect(pullCall.some(e => e.includes('per_page=100'))).toBe(true);
+  });
+
+  test('Test 9: the default github path never opens the shared/production db', async () => {
+    // Read-only contract: with no db injected (exactly how main() calls it), the
+    // GitHub join must route its metering flush to a throwaway in-memory sink, not
+    // to getDatabase() -- which in the container is the production archon.db this
+    // report promises never to write. If computeWoCompletion let runGitHubService-
+    // Command default its db to getDatabase(), the spy below would fire (and, in
+    // production, github_api_usage/github_api_pool_state rows would be written).
+    resetGitHubApiMeterForTests();
+    const spy = spyOn(dbConnection, 'getDatabase').mockImplementation(() => {
+      throw new Error('getDatabase must not be called during the read-only report');
+    });
+    const units = new Map([['WO-J', new Set(['shopops'])]]);
+    const execute = (argv: Argv, _env: Env): ExecResult => {
+      if (argv.includes('repos/thinmansoftware/bdc-xo/issues?labels=wo&state=all&per_page=100'))
+        return ok([[]]);
+      if (argv.includes('q=repo:thinmansoftware/bdc-xo label:wo is:issue'))
+        return ok({ total_count: 0 });
+      if (argv.includes('repos/thinmansoftware/shopops/pulls?state=closed&per_page=100'))
+        return ok([[]]);
+      if (argv.includes('q=repo:thinmansoftware/shopops is:pr is:merged'))
+        return ok({ total_count: 0 });
+      throw new Error(`unexpected gh call: ${argv.join(' ')}`);
+    };
+    try {
+      // No `db`: computeWoCompletion must build its own in-memory meter sink.
+      const r = await computeWoCompletion(units, AS_OF, {
+        noGithub: false,
+        execute,
+        identity: PAT,
+      });
+      expect(r.available).toBe(true);
+      if (!r.available) throw new Error('unavailable');
+      expect(r.den).toBe(1);
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+      resetGitHubApiMeterForTests();
+    }
   });
 });
