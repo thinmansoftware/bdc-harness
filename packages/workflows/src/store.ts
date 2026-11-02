@@ -19,6 +19,7 @@ import type {
   SupervisorRepairLeaseRecord,
   TerminalWorkflowPersistence,
 } from './reliability/types';
+import type { TerminalRunLeaseRecord } from './run-teardown';
 
 export const WORKFLOW_EVENT_TYPES = [
   'workflow_started',
@@ -165,6 +166,14 @@ export interface IWorkflowStore {
     releasedAt: string;
   }): Promise<boolean>;
   listExpiredRunLeases(expiredAt: string): Promise<ExpiredRunLeaseRecord[]>;
+  /** Unreleased leases whose run is terminal (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01, N5). */
+  listUnreleasedTerminalRunLeases?(): Promise<TerminalRunLeaseRecord[]>;
+  /** Release a terminal run's lease; re-checks the run is still terminal. */
+  releaseTerminalRunLease?(data: { runId: string; releasedAt: string }): Promise<boolean>;
+  /** Run rows recorded for a working path (repair not_before lookup, N6). */
+  listWorkflowRunsByWorkingPath?(
+    workingPath: string
+  ): Promise<{ id: string; status: string; completed_at: string | Date | null }[]>;
   interruptExpiredRunLease(data: {
     runId: string;
     leaseToken: string;

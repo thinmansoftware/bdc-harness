@@ -151,6 +151,7 @@ describe('collectRuntimeEvidence merge-base squash fallback', () => {
     baseShaReachable: boolean;
     originStdout?: string;
     ancestryThrows?: boolean;
+    originDisjoint?: boolean;
     diffStdout?: string | ((range: string) => string);
   }): {
     run: (command: string, args: readonly string[], cwd: string) => Promise<EvidenceCommandResult>;
@@ -191,7 +192,12 @@ describe('collectRuntimeEvidence merge-base squash fallback', () => {
             return { stdout: `${authority.baseSha}\n` };
           }
           // Origin lane: merge-base(refs/remotes/origin/<baseBranch>, HEAD)
-          if (operand === originRef) return { stdout: `${originStdout}\n` };
+          if (operand === originRef) {
+            if (opts.originDisjoint) {
+              throw new Error(`fatal: Not a valid object name ${originRef}`);
+            }
+            return { stdout: `${originStdout}\n` };
+          }
           throw new Error(`unexpected merge-base operand ${operand}`);
         }
         case 'rev-list':
@@ -284,6 +290,27 @@ describe('collectRuntimeEvidence merge-base squash fallback', () => {
     });
 
     await expect(collectRuntimeEvidence(store, run, request)).rejects.toThrow(
+      'gate_scope_mismatch: run scope is not an ancestor of the base-lane merge-base'
+    );
+    expect(mergeBaseCalls).toEqual([authority.baseSha, originRef]);
+    expect(diffRanges).toEqual([]);
+  });
+
+  it('disjoint-head-fails-closed', async () => {
+    const { run, mergeBaseCalls, diffRanges } = makeRunner({
+      baseShaReachable: false,
+      originDisjoint: true,
+    });
+
+    const error = await collectRuntimeEvidence(store, run, request).then(
+      () => null,
+      (caught: unknown) => caught
+    );
+    expect(error).toBeInstanceOf(Error);
+    if (!(error instanceof Error)) {
+      throw new Error('expected an Error');
+    }
+    expect(error.message).toBe(
       'gate_scope_mismatch: run scope is not an ancestor of the base-lane merge-base'
     );
     expect(mergeBaseCalls).toEqual([authority.baseSha, originRef]);

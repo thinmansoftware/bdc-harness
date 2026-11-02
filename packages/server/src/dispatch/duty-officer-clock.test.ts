@@ -1,3 +1,4 @@
+import { generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -7,6 +8,7 @@ import { rootLogger } from '@archon/paths';
 import { getDatabase } from '@archon/core/db/connection';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
+import * as serviceIdentity from '@archon/core/github/service-identity';
 import {
   resetSecurityDetectorStateForTests,
   runSecurityDetector,
@@ -15,12 +17,63 @@ import {
 import {
   githubIssueInAllowList,
   githubNudgeEnabled,
+  githubToken,
   postGithubIssueComment,
   startDutyOfficerClock,
   stopDutyOfficerClock,
   tickDutyOfficerClock,
   type DutyOfficerClockDeps,
 } from './duty-officer-clock';
+
+const APP_ENV_KEYS = [
+  'GITHUB_APP_DUTY_OFFICER_ID',
+  'GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID',
+  'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY',
+  'GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY_PATH',
+  'GITHUB_APP_TASKMASTER_ID',
+  'GITHUB_APP_TASKMASTER_INSTALLATION_ID',
+  'GITHUB_APP_TASKMASTER_PRIVATE_KEY',
+  'GITHUB_APP_TASKMASTER_PRIVATE_KEY_PATH',
+  'GITHUB_APP_ID',
+  'GITHUB_APP_INSTALLATION_ID',
+  'GITHUB_APP_PRIVATE_KEY',
+  'GITHUB_APP_PRIVATE_KEY_PATH',
+] as const;
+
+let savedAppEnv: Record<string, string | undefined> = {};
+
+function captureLogs(): { lines: string[]; restore: () => void } {
+  const streamSymbol = Object.getOwnPropertySymbols(rootLogger).find(
+    symbol => symbol.description === 'pino.stream'
+  );
+  if (streamSymbol === undefined) throw new Error('pino.stream symbol missing on rootLogger');
+  const stream = (rootLogger as unknown as Record<symbol, { write: (line: string) => void }>)[
+    streamSymbol
+  ];
+  const lines: string[] = [];
+  const write = spyOn(stream, 'write').mockImplementation(line => {
+    lines.push(String(line));
+  });
+  return { lines, restore: () => write.mockRestore() };
+}
+
+const appIdentity = {
+  kind: 'app' as const,
+  service: 'duty_officer' as const,
+  appId: '4574893',
+  installationId: '153295654',
+  privateKey: 'PEM_SENTINEL_DO_NOT_LOG',
+  poolId: 'app-test',
+  distinct: true as const,
+};
+
+beforeEach(() => {
+  savedAppEnv = {};
+  for (const key of APP_ENV_KEYS) {
+    savedAppEnv[key] = process.env[key];
+    delete process.env[key];
+  }
+});
 
 test('explicit GitHub nudge switch still requires a usable authenticated identity', () => {
   process.env.DUTY_OFFICER_GH_NUDGE = 'true';
@@ -291,11 +344,18 @@ afterEach(() => {
   resetSecurityDetectorStateForTests();
   delete process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS;
+  delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS;
   delete process.env.DUTY_OFFICER_CLOCK_ENABLED;
   writeDutyOfficerProcessEnv(dutyOfficerProcessEnvSnapshot);
   delete process.env.DUTY_OFFICER_GH_REPO;
   delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_TIMEOUT_MS;
   delete process.env.ARCHON_BUILD_SHA;
+  delete process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT;
+  serviceIdentity.clearServiceGitHubTokenCache();
+  for (const key of APP_ENV_KEYS) {
+    if (savedAppEnv[key] === undefined) delete process.env[key];
+    else process.env[key] = savedAppEnv[key];
+  }
 });
 
 const priorDetectorResult: SecurityDetectorResult = {
@@ -641,12 +701,14 @@ describe('duty officer clock', () => {
     expect(deps.postResult).toHaveBeenCalledTimes(1);
   });
 
-  test('fresh deps each tick preserve detector throttle and verdict until the interval expires', async () => {
+  test('fresh deps each tick preserve a missing write token on the error backoff', async () => {
     resetSecurityDetectorStateForTests();
     process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
     process.env.DUTY_OFFICER_GH_REPO = 'owner/write';
     const interval = 21_600_000;
+    const errorBackoff = 60_000;
     process.env.DUTY_OFFICER_SECURITY_DETECTOR_INTERVAL_MS = String(interval);
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ERROR_BACKOFF_MS = String(errorBackoff);
     const start = Date.parse('2026-09-30T12:00:00Z');
     let tickTime = start;
     const fetchImpl = mock(async (url: string | URL | Request) =>
@@ -661,7 +723,7 @@ describe('duty officer clock', () => {
         runSecurityDetector(
           {
             fetchImpl: fetchImpl as typeof fetch,
-            readToken: () => 'test-read-token',
+            readToken: async () => 'test-read-token',
             writeTokenProvider,
             now: () => new Date(tickTime),
             buildSha: 'test-build',
@@ -675,9 +737,11 @@ describe('duty officer clock', () => {
     const prior = registeredDetector(first);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
     expect(writeTokenProvider).toHaveBeenCalledTimes(1);
+    expect(prior.verdict).toBe('observation_error');
+    expect(prior.last_error).toBe('app_auth_missing');
     expect(prior.last_run_at).toBe(new Date(start).toISOString());
 
-    tickTime += 900_000;
+    tickTime += 30_000;
     const second = createTickDeps();
     await tickDutyOfficerClock(second);
     expect(fetchImpl).toHaveBeenCalledTimes(2);
@@ -688,11 +752,12 @@ describe('duty officer clock', () => {
       last_tick_at: new Date(tickTime).toISOString(),
     });
 
-    tickTime = start + interval + 1;
+    tickTime = start + errorBackoff + 1;
     const third = createTickDeps();
     await tickDutyOfficerClock(third);
     expect(fetchImpl).toHaveBeenCalledTimes(4);
     expect(writeTokenProvider).toHaveBeenCalledTimes(2);
+    expect(registeredDetector(third).verdict).toBe('observation_error');
     expect(registeredDetector(third).last_run_at).toBe(new Date(tickTime).toISOString());
   });
 
@@ -1234,6 +1299,135 @@ describe('duty officer clock', () => {
       deps.postResult as unknown as { mock: { calls: unknown[][] } }
     ).mock.calls.find(c => (c[0] as { id: string }).id === 'br-2')![0] as { result_body: string };
     expect(JSON.parse(br2Finish.result_body).disposition).toBe('taskmaster_blocker_report_relayed');
+  });
+});
+
+describe('duty officer github token', () => {
+  test('app identity yields a read token and the detector runs', async () => {
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    process.env.DUTY_OFFICER_SECURITY_DETECTOR_ARMED_AT = '2026-09-01';
+    process.env.DUTY_OFFICER_SECURITY_SCAN_REPOS = 'owner/scan';
+    process.env.DUTY_OFFICER_GH_REPO = 'owner/write';
+    const auths: string[] = [];
+    const fetchImpl = mock(async (url: string | URL | Request, init?: RequestInit) => {
+      auths.push(new Headers(init?.headers).get('authorization') ?? '');
+      return Response.json(String(url).includes('/runs?') ? { workflow_runs: [] } : []);
+    });
+    const resolve = spyOn(serviceIdentity, 'resolveServiceGitHubAuth').mockReturnValue(appIdentity);
+    const mint = spyOn(serviceIdentity, 'getServiceGitHubToken').mockResolvedValue('t-app');
+    const logs = captureLogs();
+    try {
+      expect(await githubToken()).toBe('t-app');
+      const result = await runSecurityDetector({
+        fetchImpl: fetchImpl as typeof fetch,
+        readToken: githubToken,
+        writeTokenProvider: async () => null,
+        now: () => new Date('2026-09-30T12:00:00.000Z'),
+        buildSha: 'abc1234',
+      });
+      expect(result?.verdict).toBe('observation_error');
+      expect(result?.last_error).toBe('app_auth_missing');
+      expect(result?.wrote).toEqual([]);
+      expect(auths.length).toBeGreaterThan(0);
+      expect(auths.every(header => header === 'Bearer t-app')).toBe(true);
+      expect(logs.lines.join('')).not.toContain('t-app');
+    } finally {
+      resolve.mockRestore();
+      mint.mockRestore();
+      logs.restore();
+    }
+  });
+
+  test('a nonblank PAT is returned exactly', async () => {
+    delete process.env.GITHUB_TOKEN;
+    process.env.GH_TOKEN = 'synthetic-pat-exact';
+    expect(await githubToken()).toBe('synthetic-pat-exact');
+  });
+
+  test('app identity enables the nudge only when the read token resolves', async () => {
+    delete process.env.GH_TOKEN;
+    delete process.env.GITHUB_TOKEN;
+    process.env.DUTY_OFFICER_GH_NUDGE = 'true';
+    const { privateKey } = generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+    });
+    process.env.GITHUB_APP_DUTY_OFFICER_ID = '123';
+    process.env.GITHUB_APP_DUTY_OFFICER_INSTALLATION_ID = '456';
+    process.env.GITHUB_APP_DUTY_OFFICER_PRIVATE_KEY = privateKey;
+    const mint = spyOn(serviceIdentity, 'getServiceGitHubToken').mockResolvedValue('t-app');
+    try {
+      expect(githubNudgeEnabled()).toBe(true);
+      expect(await githubToken()).toBe('t-app');
+    } finally {
+      mint.mockRestore();
+    }
+  });
+
+  test('resolver failure, kind none, and a blank PAT return null without throwing', async () => {
+    const logs = captureLogs();
+    const resolve = spyOn(serviceIdentity, 'resolveServiceGitHubAuth');
+    const mint = spyOn(serviceIdentity, 'getServiceGitHubToken');
+    try {
+      resolve.mockImplementation(() => {
+        throw new Error('github_auth_missing: duty_officer');
+      });
+      expect(await githubToken()).toBeNull();
+      expect(logs.lines.join('')).not.toContain('duty_officer_github_token_mint_failed');
+
+      logs.lines.length = 0;
+      resolve.mockReturnValue({
+        kind: 'none',
+        service: 'merge_manager',
+        poolId: 'none',
+        distinct: false,
+      });
+      mint.mockResolvedValue('should-not-mint');
+      expect(await githubToken()).toBeNull();
+      expect(mint).not.toHaveBeenCalled();
+    } finally {
+      resolve.mockRestore();
+      mint.mockRestore();
+      logs.restore();
+    }
+  });
+
+  test('empty and whitespace PATs return null without minting', async () => {
+    const mint = spyOn(serviceIdentity, 'getServiceGitHubToken').mockResolvedValue(
+      'should-not-mint'
+    );
+    try {
+      delete process.env.GITHUB_TOKEN;
+      process.env.GH_TOKEN = '';
+      expect(await githubToken()).toBeNull();
+      process.env.GH_TOKEN = '   ';
+      expect(await githubToken()).toBeNull();
+      expect(mint).not.toHaveBeenCalled();
+    } finally {
+      mint.mockRestore();
+    }
+  });
+
+  test('a failed installation mint returns null and logs the cause without the key', async () => {
+    const logs = captureLogs();
+    const resolve = spyOn(serviceIdentity, 'resolveServiceGitHubAuth').mockReturnValue(appIdentity);
+    const mint = spyOn(serviceIdentity, 'getServiceGitHubToken').mockRejectedValue(
+      new Error('github_app_token_mint_failed:401')
+    );
+    try {
+      expect(await githubToken()).toBeNull();
+      const joined = logs.lines.join('');
+      expect(joined).toContain('duty_officer_github_token_mint_failed');
+      expect(joined).toContain('github_app_token_mint_failed:401');
+      expect(joined).not.toContain('PEM_SENTINEL_DO_NOT_LOG');
+      expect(joined).not.toContain('t-app');
+    } finally {
+      resolve.mockRestore();
+      mint.mockRestore();
+      logs.restore();
+    }
   });
 });
 

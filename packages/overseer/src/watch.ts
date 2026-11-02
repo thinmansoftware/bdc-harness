@@ -148,10 +148,11 @@ async function assessRun(
   run: OverseerRunRecord,
   deps: OverseerRunStoreDeps & GitHubClientDeps
 ): Promise<WatchedRunRecord> {
-  if (!run.headBranch) {
-    const recovered = recoverHeadBranchFromEvents(await deps.listRunEvents(run.id));
-    if (recovered) run = { ...run, headBranch: recovered };
-  }
+  // A non-empty unique_branch= from the run's own events is the branch that
+  // was actually pushed. It wins even when metadata already has head_branch.
+  // When no event reports a branch, keep the metadata-derived head.
+  const recovered = recoverHeadBranchFromEvents(await deps.listRunEvents(run.id));
+  if (recovered) run = { ...run, headBranch: recovered };
   const prEvidence = await judgePullRequest(run, deps);
 
   if (prEvidence.state === 'merged') {

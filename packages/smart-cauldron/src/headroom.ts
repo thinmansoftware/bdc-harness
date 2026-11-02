@@ -16,6 +16,8 @@ export interface SeatReadingLike {
   limit_source: 'measured' | 'UNKNOWN';
   windows: SeatWindowLike[];
   limit_reached?: boolean;
+  /** Codex purchased credits (Fuelglass seats route `credits`). */
+  credits?: { has_credits: boolean; overage_limit_reached?: boolean };
 }
 
 export type SeatUsageSnapshot = Partial<Record<SeatId, SeatReadingLike>>;
@@ -55,6 +57,69 @@ export function seatForTier(tierName: string): SeatId | null {
   if (tierName === 'claude' || tierName === 'frontier') return 'claude';
   if (tierName === 'cursor') return 'cursor';
   return null;
+}
+
+export interface RungSeatSkip {
+  tier: string;
+  seat: SeatId;
+  usedPercent: number;
+  cutoffPercent: number;
+}
+
+/**
+ * WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01: a rung whose own seat is
+ * MEASURED at or over the run-start seat cutoff would be refused by the gate,
+ * so the conductor skips it. UNKNOWN (or an unknown cutoff) never skips.
+ */
+export function rungSeatSkip(
+  tierName: string,
+  usage: SeatUsageSnapshot | null,
+  cutoffPercent: number | null
+): RungSeatSkip | null {
+  if (usage === null || cutoffPercent === null) return null;
+  const seat = seatForTier(tierName);
+  if (seat === null) return null;
+  const reading = usage[seat];
+  const used = bindingUsedPercent(reading);
+  if (used === null || used < cutoffPercent) return null;
+  // A codex seat billing purchased credits has headroom (the run-start gate
+  // does not refuse it), so the rung is not skipped.
+  if (
+    seat === 'codex' &&
+    reading?.credits?.has_credits === true &&
+    reading.credits.overage_limit_reached !== true
+  ) {
+    return null;
+  }
+  return { tier: tierName, seat, usedPercent: used, cutoffPercent };
+}
+
+export function formatRungSeatSkip(skip: RungSeatSkip): string {
+  return `seat_over_cutoff:${skip.seat}:${String(skip.usedPercent)}:${String(skip.cutoffPercent)}`;
+}
+
+export type ClaudeTierAdmission =
+  | { admitted: true; reason: `claude_seat_ok:${number}:${number}` }
+  | {
+      admitted: false;
+      reason: `claude_seat_over_threshold:${number}:${number}` | 'claude_seat_unknown';
+    };
+
+/** Decide whether the Claude ladder tier may use the Claude subscription seat. */
+export function admitClaudeTier(input: {
+  usage: SeatUsageSnapshot | null;
+  thresholdPercent: number;
+}): ClaudeTierAdmission {
+  const seat = seatForTier('claude');
+  const used = seat === null || input.usage === null ? null : bindingUsedPercent(input.usage[seat]);
+  if (used === null) return { admitted: false, reason: 'claude_seat_unknown' };
+  if (used >= input.thresholdPercent) {
+    return {
+      admitted: false,
+      reason: `claude_seat_over_threshold:${used}:${input.thresholdPercent}`,
+    };
+  }
+  return { admitted: true, reason: `claude_seat_ok:${used}:${input.thresholdPercent}` };
 }
 
 export interface EntrySelection {

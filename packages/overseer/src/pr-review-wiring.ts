@@ -20,6 +20,7 @@ import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import * as dispatch from '@archon/core/db/dispatch';
+import { PR_REVIEW_LOG_RECIPIENT } from '@archon/core/db/dispatch-routing';
 import { claimOverseerVerdict, finalizeOverseerVerdict } from '@archon/core/db/overseer';
 import { createLogger } from '@archon/paths';
 import {
@@ -938,10 +939,19 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
       });
       // listMessages orders subject_key queries newest-first, which is what
       // collectVerdicts requires.
-      const receipts = await dispatch.listMessages({
+      // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: receipts live at the log
+      // recipient since the cut-off; pre-cut-off receipts stay at `operator`.
+      // Log rows are all newer than operator rows, so concatenating log first
+      // keeps the newest-first order collectVerdicts requires.
+      const logReceipts = await dispatch.listMessages({
+        recipient: PR_REVIEW_LOG_RECIPIENT,
+        subject_key: subjectKey,
+      });
+      const historyReceipts = await dispatch.listMessages({
         recipient: 'operator',
         subject_key: subjectKey,
       });
+      const receipts = [...logReceipts, ...historyReceipts];
       const verdictByMessageId = collectVerdicts(receipts, new Map<string, PriorVerdict>());
 
       // LEGACY FALLBACK. Review finding (Overseer, PR #772): subject_key on
@@ -966,11 +976,16 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
       const needsLegacyLookup = messages.some(message => !verdictByMessageId.has(message.id));
       if (needsLegacyLookup) {
         // Already newest-first from the DAL, as collectVerdicts requires.
-        const legacy = await dispatch.listMessagesByCorrelationPrefixWithoutSubjectKey({
-          recipient: 'operator',
-          correlationPrefix: reviewCorrelationPrefix(input.owner, input.repo, input.prNumber),
+        const correlationPrefix = reviewCorrelationPrefix(input.owner, input.repo, input.prNumber);
+        const legacyLog = await dispatch.listMessagesByCorrelationPrefixWithoutSubjectKey({
+          recipient: PR_REVIEW_LOG_RECIPIENT,
+          correlationPrefix,
         });
-        collectVerdicts(legacy, verdictByMessageId);
+        const legacyHistory = await dispatch.listMessagesByCorrelationPrefixWithoutSubjectKey({
+          recipient: 'operator',
+          correlationPrefix,
+        });
+        collectVerdicts([...legacyLog, ...legacyHistory], verdictByMessageId);
       }
 
       return messages
@@ -1063,7 +1078,7 @@ export function createRealIngestDeps(config: ReviewRouteConfig): IngestDeps {
           correlation_id: input.correlationId || `pr-review-receipt:${input.deliveryId}`,
           idempotency_key: `pr-review-receipt:${input.deliveryId}:${input.disposition}`,
           task_type: 'run_report',
-          recipient: 'operator',
+          recipient: PR_REVIEW_LOG_RECIPIENT,
           body: JSON.stringify({
             kind: 'pr_review_ingest_receipt',
             deliveryId: input.deliveryId,
@@ -1405,7 +1420,7 @@ export function createRealSubmitDeps(
           correlation_id: input.correlationId,
           idempotency_key: `pr-review-submit-receipt:${input.messageId}:${input.disposition}`,
           task_type: 'run_report',
-          recipient: 'operator',
+          recipient: PR_REVIEW_LOG_RECIPIENT,
           subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
           repeat_reason: `review_verdict_receipt:${input.messageId}:${input.disposition}`,
           body: JSON.stringify({

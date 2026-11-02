@@ -5,11 +5,14 @@ import {
   deferVerdictClaimForMergeExecution,
   finalizeOverseerVerdict,
   getOverseerWatchRunById,
+  getVerdictByRunHead,
   insertOverseerAction,
   listActiveRunUserMessages,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
+  promoteObserveOrHealthyVerdict,
+  promoteObserveOrHealthyVerdictWithReceipt,
   recordVerdictMergeOutcome,
   releaseOverseerMergeSlot,
   releaseVerdictClaimForMergeExecution,
@@ -29,6 +32,7 @@ import { permitFromMetadata } from './permit';
 import { runReconcileOnce } from './reconcile';
 import { watchLoop } from './watch';
 import type {
+  DeterministicMergeHandoff,
   GitHubClientDeps,
   OverseerActionsDeps,
   OverseerRunStoreDeps,
@@ -44,6 +48,7 @@ import { assessQualifiedMerge } from './actions/merge-ready';
 import { assertOverseerDefaultOff } from './integration-scenarios';
 import { createRealGitHubClientDeps } from './adapters/github-real-deps';
 import { runMergeExecutionBridgeOnce } from './merge-execution-bridge';
+import { readWoSpecForMergeHold } from './merge-hold';
 
 /**
  * Integrated S4-S7 assessment surface for Slice 8 wiring.
@@ -71,6 +76,13 @@ export interface OverseerServiceOptions {
   enabled?: boolean;
   dryRun?: boolean;
   mergeCoordinator?: MergeReadyCoordinator;
+  /**
+   * Replay handoff. Tests inject this directly. When the property is omitted,
+   * the service binds mergeBridgeRun only when mergeBridgeEnabled is true.
+   * An explicit undefined fails closed and is never replaced with
+   * mergeCoordinator.
+   */
+  deterministicMergeHandoff?: DeterministicMergeHandoff;
   intervalMs?: number;
   signal?: AbortSignal;
   /**
@@ -87,6 +99,11 @@ export interface OverseerServiceOptions {
   reconcileIntervalMs?: number;
   reconcileRun?: () => Promise<unknown>;
   mergeBridgeIntervalMs?: number;
+  /**
+   * Merge-execution bridge tick. The scheduler uses it when mergeBridgeEnabled
+   * is set. When deterministicMergeHandoff is omitted, replay handoff binds
+   * this runner only when mergeBridgeEnabled is exactly true.
+   */
   mergeBridgeRun?: () => Promise<unknown>;
   mergeBridgeEnabled?: boolean;
 }
@@ -192,6 +209,9 @@ export function emergencyStopEngaged(): boolean {
 const defaultVerdictStore: OverseerVerdictStoreDeps = {
   claimVerdict: claimOverseerVerdict,
   finalizeVerdict: finalizeOverseerVerdict,
+  getVerdictByRunHead,
+  promoteObserveOrHealthyVerdict,
+  promoteObserveOrHealthyVerdictWithReceipt,
 };
 
 /**
@@ -206,7 +226,8 @@ export async function handleRecord(
   deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
   dryRun: boolean,
   actor: string,
-  mergeCoordinator?: MergeReadyCoordinator
+  mergeCoordinator?: MergeReadyCoordinator,
+  deterministicMergeHandoff?: DeterministicMergeHandoff
 ): Promise<void> {
   if (emergencyStopEngaged()) {
     log.warn({ runId: record.runId }, 'overseer.emergency_stop_engaged');
@@ -223,6 +244,7 @@ export async function handleRecord(
         dryRun,
         actor,
         mergeCoordinator,
+        deterministicMergeHandoff,
         verdictStore: defaultVerdictStore,
       });
     } catch (error) {
@@ -394,6 +416,48 @@ export async function handleRecord(
   );
 }
 
+function githubCanDriveMergeBridge(github: GitHubClientDeps): boolean {
+  return (
+    typeof github.findPullRequest === 'function' && typeof github.mergePullRequest === 'function'
+  );
+}
+
+function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<void> {
+  return (): Promise<void> =>
+    runMergeExecutionBridgeOnce({
+      github,
+      ...(github.hasQualifiedReview
+        ? {
+            hasQualifiedReview: (input): Promise<boolean> =>
+              github.hasQualifiedReview?.(input) ?? Promise.resolve(false),
+          }
+        : {}),
+      store: {
+        listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
+        claimVerdict: claimVerdictForMergeExecution,
+        releaseVerdictClaim: releaseVerdictClaimForMergeExecution,
+        deferVerdictClaim: deferVerdictClaimForMergeExecution,
+        getRunById: getOverseerWatchRunById,
+        hasActiveRunForWo: (woId: string) => hasActiveRunForWo(woId, listActiveRunUserMessages),
+        reserveMergeSlot: reserveOverseerMergeSlot,
+        releaseMergeSlot: releaseOverseerMergeSlot,
+        recordOutcome: recordVerdictMergeOutcome,
+      },
+      readWoSpec: readWoSpecForMergeHold,
+    });
+}
+
+function resolveDeterministicMergeHandoff(
+  options: OverseerServiceOptions,
+  bridgeRun: (() => Promise<unknown>) | undefined
+): DeterministicMergeHandoff | undefined {
+  if (Object.prototype.hasOwnProperty.call(options, 'deterministicMergeHandoff')) {
+    return options.deterministicMergeHandoff;
+  }
+  if (options.mergeBridgeEnabled !== true || !bridgeRun) return undefined;
+  return { handoff: () => bridgeRun() };
+}
+
 export async function runOverseerService(options: OverseerServiceOptions = {}): Promise<void> {
   const enabled = options.enabled ?? envEnabled(process.env.OVERSEER_ENABLED);
   if (!enabled) return;
@@ -407,6 +471,11 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
     throw new Error('overseer_real_adapter_requires_qualified_coordinator');
   }
   const deps = options.deps ?? resolveDefaultDeps();
+  const defaultMergeBridgeRun = githubCanDriveMergeBridge(deps)
+    ? createMergeExecutionBridgeRun(deps)
+    : undefined;
+  const mergeBridgeRun = options.mergeBridgeRun ?? defaultMergeBridgeRun;
+  const deterministicMergeHandoff = resolveDeterministicMergeHandoff(options, mergeBridgeRun);
   const coupledAbort = new AbortController();
   const abortFromParent = (): void => {
     coupledAbort.abort();
@@ -415,7 +484,15 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (options.signal?.aborted) coupledAbort.abort();
   const watcher = watchLoop(
     deps,
-    record => handleRecord(record, deps, dryRun, 'overseer-service', options.mergeCoordinator),
+    record =>
+      handleRecord(
+        record,
+        deps,
+        dryRun,
+        'overseer-service',
+        options.mergeCoordinator,
+        deterministicMergeHandoff
+      ),
     {
       intervalMs: options.intervalMs,
       once: options.once,
@@ -424,37 +501,18 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   );
   const tasks: Promise<void>[] = [watcher];
   if (options.mergeBridgeEnabled) {
-    const mergeBridgeRun =
-      options.mergeBridgeRun ??
-      ((): Promise<void> =>
-        runMergeExecutionBridgeOnce({
-          github: deps,
-          ...(deps.hasQualifiedReview
-            ? {
-                hasQualifiedReview: (input): Promise<boolean> =>
-                  deps.hasQualifiedReview?.(input) ?? Promise.resolve(false),
-              }
-            : {}),
-          store: {
-            listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
-            claimVerdict: claimVerdictForMergeExecution,
-            releaseVerdictClaim: releaseVerdictClaimForMergeExecution,
-            deferVerdictClaim: deferVerdictClaimForMergeExecution,
-            getRunById: getOverseerWatchRunById,
-            hasActiveRunForWo: (woId: string) => hasActiveRunForWo(woId, listActiveRunUserMessages),
-            reserveMergeSlot: reserveOverseerMergeSlot,
-            releaseMergeSlot: releaseOverseerMergeSlot,
-            recordOutcome: recordVerdictMergeOutcome,
-          },
-        }));
-    tasks.push(
-      runMergeBridgeScheduler({
-        signal: coupledAbort.signal,
-        intervalMs: options.mergeBridgeIntervalMs,
-        once: options.once,
-        run: mergeBridgeRun,
-      })
-    );
+    if (!mergeBridgeRun) {
+      log.error({}, 'overseer.merge_bridge.bind_failed');
+    } else {
+      tasks.push(
+        runMergeBridgeScheduler({
+          signal: coupledAbort.signal,
+          intervalMs: options.mergeBridgeIntervalMs,
+          once: options.once,
+          run: mergeBridgeRun,
+        })
+      );
+    }
   }
   if (options.deliveryEnabled) {
     const delivery = runOperatorCardDeliveryScheduler({

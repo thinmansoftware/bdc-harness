@@ -60,6 +60,9 @@ export interface MechanicalEvidenceInput {
   readonly gates: readonly GateEvidence[];
   readonly verifiedNoop?: boolean;
   readonly acceptAdvancedBase?: boolean;
+  readonly repairScopeReanchored?: boolean;
+  readonly repairLeaseSha?: string;
+  readonly repairPullNumber?: number;
 }
 
 export interface CollectedMechanicalEvidence extends MechanicalEvidenceInput {
@@ -247,6 +250,59 @@ function parsePullRequest(json: string): PullRequestEvidence | null {
   };
 }
 
+const REPAIR_TARGET_RAW_LINE = /^REPAIR_TARGET=(.*)$/;
+const REPAIR_LEASE_RAW_LINE = /^REPAIR_TARGET_LEASE_SHA=(.*)$/;
+const REPAIR_TARGET_VALUE = /^#([1-9][0-9]*)$/;
+const REPAIR_LEASE_VALUE = /^[0-9a-fA-F]{40}$/;
+
+// Latest checkout-repair-target completion in this run. Whole lines only.
+// The final REPAIR_TARGET= and REPAIR_TARGET_LEASE_SHA= lines control
+// authorization. A final REPAIR_TARGET=none, a missing lease, or a final
+// lease that is not 40 hex clears an earlier valid pair and yields null.
+// REPAIR_TARGET_UPSTREAM= and REPAIR_TARGET_BRANCH= are not targets.
+function parseRepairReanchor(
+  events: readonly WorkflowEventRecord[]
+): { readonly leaseSha: string; readonly pullNumber: number } | null {
+  const event = [...events].reverse().find(candidate => {
+    return (
+      candidate.step_name === 'checkout-repair-target' && candidate.event_type === 'node_completed'
+    );
+  });
+  if (!event) return null;
+  const nodeOutput = event.data.node_output;
+  if (typeof nodeOutput !== 'string') return null;
+  let pullNumber: number | null = null;
+  let leaseSha: string | null = null;
+  for (const line of nodeOutput.split(/\r?\n/)) {
+    const targetRaw = REPAIR_TARGET_RAW_LINE.exec(line);
+    if (targetRaw) {
+      const targetValue = REPAIR_TARGET_VALUE.exec(targetRaw[1] ?? '');
+      const parsed = targetValue?.[1] === undefined ? Number.NaN : Number(targetValue[1]);
+      pullNumber = Number.isSafeInteger(parsed) ? parsed : null;
+    }
+    const leaseRaw = REPAIR_LEASE_RAW_LINE.exec(line);
+    if (leaseRaw) {
+      const leaseValue = leaseRaw[1] ?? '';
+      leaseSha = REPAIR_LEASE_VALUE.test(leaseValue) ? leaseValue : null;
+    }
+  }
+  if (pullNumber === null || leaseSha === null) return null;
+  return { leaseSha, pullNumber };
+}
+
+async function gitAncestor(
+  git: (args: readonly string[]) => Promise<string>,
+  ancestor: string,
+  descendant: string
+): Promise<boolean> {
+  try {
+    await git(['merge-base', '--is-ancestor', ancestor, descendant]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Authority-branch lookup misses when the lane pushes HEAD under a different
 // ref. Accept exactly one open PR at that sha on the authority base, then
 // re-fetch it with pr view. Zero, several, or any error yields null.
@@ -317,35 +373,77 @@ export async function collectRuntimeEvidence(
   // unreachable after the base branch is squash-merged and gc-pruned (a ROUTINE
   // event that must never fail a run). Fall back to the authority's base BRANCH
   // lane (origin/<baseBranch>), which shares true history with HEAD, before giving
-  // up. The fallback's own failure (genuinely disjoint lane) still throws.
+  // up. A genuinely disjoint lane has no merge-base with HEAD. Normalize that
+  // git failure to gate_scope_mismatch before any diff. The fallback does not
+  // consult repair events.
   //
   // When the pinned base is reachable but origin has moved forward
   // (WO-HARNESS-MANIFEST-STALE-BASE-DIFF-01), file changes and merge ancestors
   // follow that live lane merge-base only if the frozen run scope is an ancestor
   // of it. A disjoint or rewritten scope fails closed before any diff.
+  //
+  // Repair re-anchor (WO-HARNESS-REPAIR-SCOPE-AFTER-DEV-MERGE-01) is an internal
+  // gate with no new callable surface. The authority row is not written. If the
+  // ancestor check fails, re-anchor only from this run's own checkout-repair-target
+  // node_completed output (REPAIR_TARGET=#<digits> and REPAIR_TARGET_LEASE_SHA).
+  // Accept it only when the run scope equals the authority base, the lease SHA is
+  // still an ancestor of HEAD, and the lane merge-base is an ancestor of the
+  // authority base, meaning the repair branch forked from the same lane. Do not
+  // read agent-writable artifacts or the environment.
   let pinnedMergeBase = '';
   try {
     pinnedMergeBase = await git(['merge-base', authority.baseSha, headSha]);
   } catch {
     pinnedMergeBase = '';
   }
+  const events = await store.listWorkflowEvents(request.runId);
   const originRef = `refs/remotes/origin/${authority.baseBranch}`;
+  const baseLaneScopeMismatch =
+    'gate_scope_mismatch: run scope is not an ancestor of the base-lane merge-base';
+  // HEAD disjoint from the base lane makes `git merge-base` exit non-zero with
+  // a raw git error. Callers require the exact gate_scope_mismatch string.
+  const originLaneMergeBase = async (): Promise<string> => {
+    try {
+      return await git(['merge-base', originRef, headSha]);
+    } catch {
+      throw new Error(baseLaneScopeMismatch);
+    }
+  };
   let mergeBaseSha = '';
   let acceptAdvancedBase = false;
+  let repairScopeReanchored = false;
+  let repairLeaseSha = '';
+  let repairPullNumber = 0;
   if (!pinnedMergeBase) {
-    mergeBaseSha = await git(['merge-base', originRef, headSha]);
+    mergeBaseSha = await originLaneMergeBase();
   } else {
-    const laneMergeBase = await git(['merge-base', originRef, headSha]);
+    const laneMergeBase = await originLaneMergeBase();
+    let runScopeIsAncestor = false;
     try {
       await git(['merge-base', '--is-ancestor', authority.runScopeSha, laneMergeBase]);
+      runScopeIsAncestor = true;
     } catch {
-      throw new Error(
-        'gate_scope_mismatch: run scope is not an ancestor of the base-lane merge-base'
-      );
+      // The frozen run scope does not sit on the live lane merge-base.
     }
-    mergeBaseSha = laneMergeBase;
-    if (laneMergeBase !== authority.baseSha) {
-      acceptAdvancedBase = true;
+    if (runScopeIsAncestor) {
+      mergeBaseSha = laneMergeBase;
+      if (laneMergeBase !== authority.baseSha) {
+        acceptAdvancedBase = true;
+      }
+    } else {
+      const repair = parseRepairReanchor(events);
+      const reanchored =
+        authority.runScopeSha === authority.baseSha &&
+        repair !== null &&
+        (await gitAncestor(git, repair.leaseSha, headSha)) &&
+        (await gitAncestor(git, laneMergeBase, authority.baseSha));
+      if (!reanchored || repair === null) {
+        throw new Error(baseLaneScopeMismatch);
+      }
+      mergeBaseSha = laneMergeBase;
+      repairScopeReanchored = true;
+      repairLeaseSha = repair.leaseSha;
+      repairPullNumber = repair.pullNumber;
     }
   }
   const behindRaw = await git(['rev-list', '--count', `${headSha}..${originRef}`]);
@@ -382,7 +480,6 @@ export async function collectRuntimeEvidence(
       authority.baseBranch
     );
   }
-  const events = await store.listWorkflowEvents(request.runId);
   const gates = request.requiredGateIds.map(id => gateFromEvents(id, events));
   return collectMechanicalEvidence({
     authority,
@@ -400,6 +497,13 @@ export async function collectRuntimeEvidence(
     pullRequest,
     gates,
     ...(acceptAdvancedBase ? { acceptAdvancedBase: true } : {}),
+    ...(repairScopeReanchored
+      ? {
+          repairScopeReanchored: true,
+          repairLeaseSha,
+          repairPullNumber,
+        }
+      : {}),
   });
 }
 
@@ -415,7 +519,9 @@ export function collectMechanicalEvidence(
     pullRequestIdentityMatches(pullRequest, input.authority.canonicalRemote) &&
     pathsEqual(pullRequest.files, diffPaths);
   const scopeValid =
-    (input.git.mergeBaseSha === input.authority.baseSha || input.acceptAdvancedBase === true) &&
+    (input.git.mergeBaseSha === input.authority.baseSha ||
+      input.acceptAdvancedBase === true ||
+      input.repairScopeReanchored === true) &&
     normalizedRemote(input.git.originRemote) ===
       normalizedRemote(input.authority.canonicalRemote) &&
     (input.git.headBranch === input.authority.headBranch || prCorroborates) &&
@@ -510,6 +616,13 @@ export function renderManifestV2(evidence: CollectedMechanicalEvidence): string 
     'Tests: N/A (required gates are reported separately)',
     `PRs: ${evidence.pullRequest && evidence.scopeValid ? evidence.pullRequest.url : `N/A (${evidence.outcome.deliverableState})`}`,
     `Merge ancestors: ${evidence.git.mergeBaseSha}...${evidence.git.headSha} (behind_by=${String(evidence.git.behindBy)})`,
+    ...(evidence.repairScopeReanchored === true &&
+    evidence.repairLeaseSha &&
+    typeof evidence.repairPullNumber === 'number'
+      ? [
+          `Scope: repair re-anchored to lease ${evidence.repairLeaseSha} (PR #${String(evidence.repairPullNumber)})`,
+        ]
+      : []),
     'Grep assertions: N/A (no declared mechanical assertions)',
     `Runtime verification: ${runtimeEvidence.length > 0 ? runtimeEvidence.join('; ') : 'N/A (no runtime gate evidence)'}`,
     `VALIDATION: ${validationLabel}`,

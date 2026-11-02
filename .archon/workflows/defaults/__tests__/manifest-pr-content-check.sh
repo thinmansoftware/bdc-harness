@@ -206,6 +206,24 @@ else
   echo "$OUT"
 fi
 
+# Regression: PR #1345 round-1. Trailing-word strip must apply to
+# root-level paths with no slash (package.json updated).
+echo "--- Test: root-level annotated path (no slash) present -> OK ---"
+MANIFEST=$'Files created: none\nFiles modified: package.json updated\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/999'
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/999" "$MANIFEST" "package.json")
+CODE=$?
+set -e
+assert_eq "root-level annotation match exit 0" "0" "$CODE"
+if printf '%s\n' "$OUT" | grep -q '^OK$'; then
+  PASS=$((PASS + 1))
+  echo "PASS: OK when root-level annotated path resolves to present file"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: expected OK for root-level annotated present path"
+  echo "$OUT"
+fi
+
 # Regression (ordering lock): the exclusion filter must run BEFORE the new
 # leading-path truncation, so multi-word sentinel tokens like "no files" are
 # still fully excluded and do NOT leak through truncated to a bogus "no" path.
@@ -267,6 +285,129 @@ if [ "$CODE" -ne 0 ] && printf '%s\n' "$OUT" | grep -q 'PR_CONTENT_ERROR' &&
 else
   FAIL=$((FAIL + 1))
   echo "FAIL: over_100_files_one_missing_fails"
+  echo "$OUT"
+fi
+
+# WO-HARNESS-MANIFEST-CONSISTENCY-BRACKET-PATHS-01
+# Bracketed Next.js routes must compare as literal strings.
+echo "--- Test: bracketed Next.js paths match verbatim ---"
+MANIFEST=$'Files created: none\nFiles modified: app/shops/[shopSlug]/bundles/page.tsx, app/api/auth/[...nextauth]/route.ts\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/221'
+PR_PAYLOAD=$'app/shops/[shopSlug]/bundles/page.tsx\napp/api/auth/[...nextauth]/route.ts'
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/221" "$MANIFEST" "$PR_PAYLOAD")
+CODE=$?
+set -e
+assert_eq "bracketed next.js paths exit 0" "0" "$CODE"
+if printf '%s\n' "$OUT" | grep -q '^OK$'; then
+  PASS=$((PASS + 1))
+  echo "PASS: OK when bracketed Next.js paths match"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: expected OK for bracketed Next.js paths"
+  echo "$OUT"
+fi
+
+echo "--- Test: literal bracket directory matches, decoy does not ---"
+MANIFEST=$'Files created: none\nFiles modified: lib/[tmp]/file.ts\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/999'
+PR_PAYLOAD=$'lib/t/file.ts\nlib/[tmp]/file.ts'
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/999" "$MANIFEST" "$PR_PAYLOAD")
+CODE=$?
+set -e
+assert_eq "literal bracket path exit 0" "0" "$CODE"
+if printf '%s\n' "$OUT" | grep -q '^OK$'; then
+  PASS=$((PASS + 1))
+  echo "PASS: OK when literal bracket directory is present"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: expected OK for literal bracket directory"
+  echo "$OUT"
+fi
+
+MANIFEST=$'Files created: none\nFiles modified: lib/[tmp]/file.ts\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/999'
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/999" "$MANIFEST" "lib/t/file.ts")
+CODE=$?
+set -e
+assert_nonzero "bracket decoy is not a match" "$CODE"
+if printf '%s\n' "$OUT" | grep -q 'PR_CONTENT_ERROR' &&
+   printf '%s\n' "$OUT" | grep -Fxq 'lib/[tmp]/file.ts'; then
+  PASS=$((PASS + 1))
+  echo "PASS: decoy lib/t/file.ts does not satisfy lib/[tmp]/file.ts"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: bracket path was treated as a character class or not reported"
+  echo "$OUT"
+fi
+
+echo "--- Test: absent bracketed path fails and lists are verbatim ---"
+MANIFEST=$'Files created: none\nFiles modified: app/shops/[shopSlug]/missing.tsx\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/221'
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/221" "$MANIFEST" "app/shops/[shopSlug]/page.tsx")
+CODE=$?
+set -e
+assert_nonzero "absent bracketed path non-zero" "$CODE"
+if printf '%s\n' "$OUT" | grep -q 'PR_CONTENT_ERROR' &&
+   printf '%s\n' "$OUT" | grep -Fxq 'CLAIMED_PATHS' &&
+   printf '%s\n' "$OUT" | grep -Fxq 'app/shops/[shopSlug]/missing.tsx' &&
+   printf '%s\n' "$OUT" | grep -Fxq 'PR_FILES' &&
+   printf '%s\n' "$OUT" | grep -Fxq 'app/shops/[shopSlug]/page.tsx' &&
+   ! printf '%s\n' "$OUT" | grep -Fxq 'app/shops/'; then
+  PASS=$((PASS + 1))
+  echo "PASS: absent bracketed path printed in full under CLAIMED_PATHS and PR_FILES"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: absent bracketed path truncated or lists not verbatim"
+  echo "$OUT"
+fi
+
+echo "--- Test: path with spaces matches verbatim ---"
+MANIFEST=$'Files created: none\nFiles modified: docs/My Notes/read me.md\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/999'
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/999" "$MANIFEST" "docs/My Notes/read me.md")
+CODE=$?
+set -e
+assert_eq "spaced path exit 0" "0" "$CODE"
+if printf '%s\n' "$OUT" | grep -q '^OK$'; then
+  PASS=$((PASS + 1))
+  echo "PASS: OK when path with spaces matches"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: expected OK for path with spaces"
+  echo "$OUT"
+fi
+
+echo "--- Test: glob metacharacter is literal, not expanded ---"
+MANIFEST=$'Files created: src/*.ts\nFiles modified: none\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/999'
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/999" "$MANIFEST" "src/a.ts")
+CODE=$?
+set -e
+assert_nonzero "literal glob claim non-zero" "$CODE"
+if printf '%s\n' "$OUT" | grep -q 'PR_CONTENT_ERROR' &&
+   printf '%s\n' "$OUT" | grep -Fxq 'src/*.ts'; then
+  PASS=$((PASS + 1))
+  echo "PASS: src/*.ts stays literal and does not match src/a.ts"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: glob metacharacter was expanded or matched"
+  echo "$OUT"
+fi
+
+echo "--- Test: ALREADY_SATISFIED none/none skips real PR files ---"
+MANIFEST=$'Files created: none\nFiles modified: none\nOutcome: ALREADY_SATISFIED\nPRs: https://github.com/thinmansoftware/bdc-harness/pull/999'
+set +e
+OUT=$(run_pr_check "https://github.com/thinmansoftware/bdc-harness/pull/999" "$MANIFEST" "some/real/file.ts")
+CODE=$?
+set -e
+assert_eq "already-satisfied none exit 0" "0" "$CODE"
+if printf '%s\n' "$OUT" | grep -q '^OK$' &&
+   ! printf '%s\n' "$OUT" | grep -q 'PR_CONTENT_ERROR'; then
+  PASS=$((PASS + 1))
+  echo "PASS: none + ALREADY_SATISFIED does not claim PR files"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL: ALREADY_SATISFIED none case tripped the check"
   echo "$OUT"
 fi
 

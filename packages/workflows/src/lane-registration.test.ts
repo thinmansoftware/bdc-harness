@@ -185,6 +185,13 @@ describe('lane registration and war-council-validator pin', () => {
         return;
       }
 
+      if (file === 'bdc-feature-development.yaml') {
+        // Claude lane pins the allowlist id. Provider stays claude.
+        expect(wcv.provider).toBe('claude');
+        expect(wcv.model).toBe('claude-sonnet-5-5');
+        return;
+      }
+
       // M-121 (John, 2026-08-04): the apex lane's judge serves real
       // claude-fable-5 again. M-87's sweep to claude-opus-5 was an outage
       // workaround, not an apex ruling; Opus 5 is the cheap Fable-substitute

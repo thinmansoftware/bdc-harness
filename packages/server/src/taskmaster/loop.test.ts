@@ -3,19 +3,19 @@
  * auto-circuit. Everything is dependency-injected (fake clock, fake DAL,
  * fake dispatch); no mock.module.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { readFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { rootLogger } from '@archon/paths';
-import { resetGitHubApiMeterForTests } from '@archon/core/github/metering';
+import * as githubMetering from '@archon/core/github/metering';
 import {
   setSeatUsageReaderForTests,
   unknownSeatReading,
 } from '@archon/workflows/reliability/seat-usage';
 
 // A synthetic exhausted response belongs to its test, never the next caller.
-beforeEach(resetGitHubApiMeterForTests);
-afterEach(resetGitHubApiMeterForTests);
+beforeEach(githubMetering.resetGitHubApiMeterForTests);
+afterEach(githubMetering.resetGitHubApiMeterForTests);
 import {
   createTaskmasterState,
   defaultFindEffectByIdempotencyKey,
@@ -4335,15 +4335,158 @@ describe('defaultListThreads -- GitHub work-SOR read', () => {
       chunks.push(String(chunk));
       return true;
     };
+    // The 403 is a metered search backoff. Keep it in memory for this test
+    // only -- flushing would publish backoff:search into the shared pool table.
+    const flushSpy = spyOn(githubMetering, 'flushGitHubApiMeter').mockResolvedValue(undefined);
     try {
       const threads = await defaultListThreads(fetchImpl);
+      expect(flushSpy).toHaveBeenCalledTimes(1);
       expect(threads).toHaveLength(1);
       expect(threads[0]?.isUnclaimed).toBe(true);
       expect(threads[0]?.isUnclaimedP0).toBe(true);
       expect(chunks.join('')).toContain('taskmaster.pr_claim_lookup_failed');
     } finally {
+      githubMetering.resetGitHubApiMeterForTests();
+      flushSpy.mockRestore();
       stream.write = originalWrite;
     }
+  });
+
+  test('owner_label_makes_unassigned_issue_claimed', async () => {
+    const urls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes('/search/issues')) {
+        return new Response(JSON.stringify({ items: [{ title: 'WO-HARNESS-OWNER-LABEL-01' }] }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'x-ratelimit-remaining': '100',
+          },
+        });
+      }
+      const label = new URL(url).searchParams.get('labels') ?? '';
+      const issues =
+        label === 'wo'
+          ? [ghIssue(1538, ['prio:P0', 'owner:cursor'], { title: 'WO-HARNESS-OWNER-LABEL-01' })]
+          : [];
+      return new Response(JSON.stringify(issues), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    const threads = await defaultListThreads(fetchImpl);
+    expect(threads).toHaveLength(1);
+    expect(threads[0]?.ownerLogin).toBe('cursor');
+    expect(threads[0]?.isUnclaimed).toBe(false);
+    expect(threads[0]?.isUnclaimedP0).toBe(false);
+    expect(threads[0]?.recipient).toBe('xo');
+    expect(urls.some(url => url.includes('/search/issues'))).toBe(false);
+  });
+
+  test('unlabelled_unassigned_issue_stays_unclaimed', async () => {
+    // Search backoff lives in the shared github_api_pool_state table. Ignore it
+    // for this claim lookup so the test does not delete or depend on that row.
+    const originalAssert = githubMetering.assertPersistedGitHubPoolAvailable;
+    const gate = spyOn(githubMetering, 'assertPersistedGitHubPoolAvailable').mockImplementation(
+      async (poolId, resources, db, now) => {
+        const rest = resources.filter(resource => resource !== 'search');
+        if (rest.length === 0) return;
+        await originalAssert(poolId, rest, db, now);
+      }
+    );
+    const urls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      urls.push(url);
+      if (url.includes('/search/issues')) {
+        return new Response(JSON.stringify({ items: [] }), {
+          status: 200,
+          headers: {
+            'content-type': 'application/json',
+            'x-ratelimit-remaining': '100',
+          },
+        });
+      }
+      const label = new URL(url).searchParams.get('labels') ?? '';
+      const issues =
+        label === 'wo' ? [ghIssue(1539, ['prio:P0'], { title: 'WO-HARNESS-OWNER-LABEL-02' })] : [];
+      return new Response(JSON.stringify(issues), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    try {
+      const threads = await defaultListThreads(fetchImpl);
+      expect(threads).toHaveLength(1);
+      expect(threads[0]?.ownerLogin).toBeNull();
+      expect(threads[0]?.isUnclaimed).toBe(true);
+      expect(threads[0]?.isUnclaimedP0).toBe(true);
+      expect(urls.filter(url => url.includes('/search/issues'))).toHaveLength(1);
+    } finally {
+      gate.mockRestore();
+    }
+  });
+
+  test('assignee_wins_and_invalid_owner_label_is_ignored', async () => {
+    const { fetchImpl } = fakeGithubFetch({
+      wo: [
+        ghIssue(1540, ['prio:P0', 'owner:cursor'], { assignees: [{ login: 'jdoe' }] }),
+        ghIssue(1541, ['prio:P0', 'owner:user @team']),
+        ghIssue(1542, ['prio:P0', 'owner:']),
+      ],
+    });
+
+    const threads = await defaultListThreads(fetchImpl);
+    const byNumber = new Map(threads.map(thread => [Number(thread.ref.split('#')[1]), thread]));
+    expect(byNumber.get(1540)?.ownerLogin).toBe('jdoe');
+    expect(byNumber.get(1541)?.ownerLogin).toBeNull();
+    expect(byNumber.get(1541)?.isUnclaimed).toBe(true);
+    expect(byNumber.get(1542)?.ownerLogin).toBeNull();
+    expect(byNumber.get(1542)?.isUnclaimed).toBe(true);
+  });
+
+  test('evidence_owner_uses_owner_label_fallback', async () => {
+    const bodies = [
+      {
+        number: 1543,
+        state: 'open',
+        updated_at: new Date(T0).toISOString(),
+        labels: [{ name: 'owner:codex' }],
+        assignees: [],
+        title: 'labelled',
+      },
+      [],
+      [],
+    ];
+    let call = 0;
+    const fetchImpl = (async () => {
+      const body = bodies[call] ?? [];
+      call += 1;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: {
+          'content-type': 'application/json',
+          'x-ratelimit-remaining': '100',
+        },
+      });
+    }) as typeof fetch;
+
+    const evidence = await defaultGetGithubIssueEvidence(
+      'gh:thinmansoftware/bdc-harness#1543',
+      new Date(T0).toISOString(),
+      fetchImpl
+    );
+    expect(evidence?.ownerLogin).toBe('codex');
   });
 });
 
@@ -5052,6 +5195,7 @@ describe('M-155 exception push (loop)', () => {
       'captain-ci',
       'operator',
       'duty-officer',
+      't3-desktop',
     ]);
   });
 
@@ -5111,7 +5255,10 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     });
   }
 
-  test('adopt_fixup_stale_epoch_expired_does_not_suppress', async () => {
+  // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: ANY escalate_p0 journal outcome in the
+  // trailing 24h suppresses a re-proposal (expired, pending, failed...), so a
+  // failed or expired attempt is not retried every tick.
+  test('adopt_fixup_stale_epoch_expired_within_24h_suppresses', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     seedEscalation(world, 'expired', { type: 'escalate_p0' });
@@ -5124,11 +5271,11 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
 
     const result = await tick(createTaskmasterState(60_000), deps);
 
-    expect(result.effects).toBe(1);
-    expect(gh.posts()).toBe(1);
+    expect(result.effects).toBe(0);
+    expect(gh.posts()).toBe(0);
     expect(
       world.journal.filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
-    ).toHaveLength(2);
+    ).toHaveLength(1);
   });
 
   test('adopt_fixup_pending_and_suppressed_dedupe_boundaries', async () => {
@@ -5144,12 +5291,12 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
 
     await tick(createTaskmasterState(60_000), pendingDeps);
 
-    expect(pendingGh.posts()).toBe(1);
+    expect(pendingGh.posts()).toBe(0);
     expect(
       pendingWorld.journal.filter(
         row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
       )
-    ).toHaveLength(2);
+    ).toHaveLength(1);
 
     const suppressedWorld = makeWorld();
     seedDigestSent(suppressedWorld);
@@ -5172,6 +5319,72 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
         row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
       )
     ).toHaveLength(1);
+  });
+
+  // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01, Tests 5 and 6 (tick level).
+  function failingDispatchDeps(world: FakeWorld, attempts: string[]): TaskmasterDeps {
+    const deps = makeDeps(world, {
+      listThreads: async () => [unclaimedP0('dispatch:orphan-p0-1')],
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+    });
+    const originalCreate = deps.createTask!;
+    deps.createTask = (async (context, data, fence) => {
+      if (data.idempotency_key.startsWith('tm:escalate_p0:')) {
+        attempts.push(data.recipient);
+        throw new Error('dispatch_send_failed_for_test');
+      }
+      return originalCreate(context, data, fence);
+    }) as typeof deps.createTask;
+    return deps;
+  }
+
+  test('Test 5: one escalate_p0 per stall, even when delivery fails', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const attempts: string[] = [];
+    const deps = failingDispatchDeps(world, attempts);
+    const state = createTaskmasterState(60_000);
+
+    for (let i = 0; i < 4; i += 1) {
+      await tick(state, deps);
+      world.nowMs += 9 * 60_000;
+    }
+
+    const rows = world.journal.filter(
+      j => j.thread_ref === 'dispatch:orphan-p0-1' && j.action_type === 'escalate_p0'
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.outcome).toBe('failed');
+    // The failure reason is now recorded on the row instead of only logged.
+    expect(JSON.parse(rows[0]?.proposal_json ?? '{}')).toMatchObject({
+      recipient: 't3-desktop',
+      failure: 'dispatch_send_failed_for_test',
+    });
+    expect(attempts).toEqual(['t3-desktop']);
+  });
+
+  test('Test 6: a stall unmoved after 24 hours escalates once more', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const attempts: string[] = [];
+    const deps = failingDispatchDeps(world, attempts);
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+    expect(attempts).toHaveLength(1);
+
+    world.nowMs += 25 * 3_600_000;
+    await tick(state, deps);
+    expect(attempts).toHaveLength(2);
+
+    world.nowMs += 30 * 60_000;
+    await tick(state, deps);
+    expect(attempts).toHaveLength(2);
+    expect(
+      world.journal.filter(
+        j => j.thread_ref === 'dispatch:orphan-p0-1' && j.action_type === 'escalate_p0'
+      )
+    ).toHaveLength(2);
   });
 
   test('adopt_fixup_concurrent_ticks_journal_one_escalation', async () => {
@@ -5507,7 +5720,7 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     ).toHaveLength(0);
   });
 
-  test('a non-gh escalate_p0 thread keeps the operator-mailbox dispatch path', async () => {
+  test('a non-gh escalate_p0 thread uses the t3-desktop dispatch path', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     const gh = makeIssueCommentSink(world);
@@ -5526,7 +5739,7 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
       m.idempotency_key.startsWith('tm:escalate_p0:')
     );
     expect(escalations).toHaveLength(1);
-    expect(escalations[0]?.recipient).toBe('operator');
+    expect(escalations[0]?.recipient).toBe('t3-desktop');
     expect(escalations[0]?.body).toContain('Unclaimed P0');
   });
 
@@ -5551,7 +5764,7 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
         m.idempotency_key.startsWith('tm:escalate_p0:')
       );
       expect(escalations).toHaveLength(1);
-      expect(escalations[0]?.recipient).toBe('operator');
+      expect(escalations[0]?.recipient).toBe('t3-desktop');
     } finally {
       if (prior === undefined) delete process.env.TASKMASTER_ESCALATE_TO_ISSUE;
       else process.env.TASKMASTER_ESCALATE_TO_ISSUE = prior;

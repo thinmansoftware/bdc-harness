@@ -47,6 +47,9 @@ import type { CascadeStatus } from './types.js';
  *   refused                   -> 10 (already-satisfied guard declined to fire; no tier ran,
  *                                    attempts=0 -- a refusal is not a win and must never read
  *                                    as won=0 (bdc-xo#2140))
+ *   gate-misfire              -> 11 (harness gate misfire; stopped on this tier, no climb --
+ *                                    a terminal harness failure is not a win and must never
+ *                                    read as won=0)
  *
  * spec-repair MUST NOT collapse to 0 -- it is a distinct, visible outcome
  * (frontier tier gate-failed) and callers key off the exit code. cancelled
@@ -54,7 +57,8 @@ import type { CascadeStatus } from './types.js';
  * pending-frontier-approval, frontier-rejected, and frontier-approved likewise
  * MUST NOT collapse to 0 -- a paused-for-approval, rejected, or approved-and-
  * handed-off record never itself shipped code
- * (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01).
+ * (WO-HARNESS-FRONTIER-CLIMB-APPROVAL-GATE-01). gate-misfire likewise MUST NOT
+ * collapse to 0 -- the harness failed the gate; the cascade did not win.
  */
 export function statusToExitCode(status: CascadeStatus): number {
   switch (status) {
@@ -76,6 +80,8 @@ export function statusToExitCode(status: CascadeStatus): number {
       return 9;
     case 'refused':
       return 10;
+    case 'gate-misfire':
+      return 11;
     default:
       return 0;
   }

@@ -219,7 +219,8 @@ describe('strict seat model pins', () => {
         file: 'bdc-feature-development-codex.yaml',
         provider: 'codex',
         model: 'gpt-5.6-sol',
-        plan: { provider: 'claude', model: 'sonnet' },
+        // Plan left the Claude seat for Codex gpt-6.1-terra.
+        plan: { provider: 'codex', model: 'gpt-6.1-terra' },
         implement: { provider: 'codex', model: 'gpt-5.6-sol' },
       },
       {
@@ -232,7 +233,7 @@ describe('strict seat model pins', () => {
       {
         file: 'bdc-feature-development.yaml',
         provider: 'claude',
-        model: 'sonnet',
+        model: 'claude-sonnet-5-5',
         plan: {},
         implement: {},
       },
