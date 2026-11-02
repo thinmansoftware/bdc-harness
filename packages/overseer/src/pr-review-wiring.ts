@@ -49,6 +49,7 @@ import {
   reviewErrorCode,
 } from './pr-review-evaluator';
 import { createJudgeLadderBreaker, recordJudgeRungOutage } from './judge-ladder-health';
+import { CODEX_JUDGE_CLI_VERSION } from './judge-transport';
 import type { PrReviewDeps, PrReviewInput, PrReviewResult } from './pr-review-evaluator';
 import type {
   ReviewExecutionContext,
@@ -371,8 +372,8 @@ export async function observeReviewExecution(
         headSha: before.headSha,
         treeSha: before.treeSha,
         cwd: before.cwd,
-        nativePolicy: 'codex_legacy_landlock',
-        nativeVersion: '0.153.3',
+        nativePolicy: 'codex_bubblewrap',
+        nativeVersion: CODEX_JUDGE_CLI_VERSION,
         runtimeUid: inspection.uid,
         inspectionObserved: true,
         check_plan: checkPlanStatus,
@@ -1272,7 +1273,7 @@ export function createRealSubmitDeps(
                   kind: 'pr-review' as const,
                   cwd: work.executionContext.checkoutPath,
                   expectedHeadSha: work.executionContext.headSha,
-                  nativePolicy: 'codex_legacy_landlock' as const,
+                  nativePolicy: 'codex_bubblewrap' as const,
                 },
               }
             : {}),

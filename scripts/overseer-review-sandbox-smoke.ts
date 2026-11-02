@@ -1,16 +1,15 @@
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
+import { CODEX_JUDGE_CLI_VERSION } from '../packages/overseer/src/judge-transport';
 
 const SPOOL = '/var/lib/overseer-review';
-/** The broker's pinned legacy-Landlock codex (scripts/overseer-reviewer-broker.ts). */
-const CODEX_VERSION = '0.153.3';
 /**
  * codex >= 0.159 refuses legacy Landlock for a restricted filesystem policy and
  * builds the sandbox with bubblewrap instead. `--reviewer-bwrap` proves that
  * path as the reviewer user (WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01).
  */
-const BWRAP_CODEX_VERSION = '0.159.2';
+const BWRAP_CODEX_VERSION = CODEX_JUDGE_CLI_VERSION;
 
 async function command(argv: string[]): Promise<void> {
   const child = Bun.spawn(argv, { stdout: 'pipe', stderr: 'pipe' });
@@ -187,7 +186,7 @@ async function brokerSmoke(): Promise<void> {
 
     const probe = [
       'set -eu',
-      'assert_denied() { name="$1"; shift; output="$("$@" 2>&1)" && { echo "FAIL: $name succeeded"; exit 1; }; printf "%s" "$output" | grep -Eqi "Permission denied|Operation not permitted|Landlock|EACCES|Connection refused|Could not connect to server|Network is unreachable|blocked" || { echo "FAIL: $name failed for an unexpected reason: $output"; exit 1; }; }',
+      'assert_denied() { name="$1"; shift; output="$("$@" 2>&1)" && { echo "FAIL: $name succeeded"; exit 1; }; printf "%s" "$output" | grep -Eqi "Permission denied|Operation not permitted|Read-only file system|Landlock|EACCES|EROFS|Connection refused|Could not connect to server|Network is unreachable|blocked" || { echo "FAIL: $name failed for an unexpected reason: $output"; exit 1; }; }',
       'test "$(id -u)" = 1002',
       'test "$(cat allowed.txt)" = allowed',
       'assert_denied secret_read cat /run/secrets/thinman-overseer.pem',
@@ -231,7 +230,7 @@ async function brokerSmoke(): Promise<void> {
     if ((await readFile(outside, 'utf8')) !== 'outside-control\n')
       throw new Error('sandbox_forbidden_write_succeeded');
     console.log(
-      `overseer-review-sandbox-smoke: ok uid=1002 codex=${CODEX_VERSION} policy=use_legacy_landlock`
+      `overseer-review-sandbox-smoke: ok uid=1002 codex=${CODEX_JUDGE_CLI_VERSION} policy=bubblewrap`
     );
   } finally {
     server.close();

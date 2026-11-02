@@ -14,7 +14,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { RealGitHubOctokitLike } from '../adapters/github-real-deps';
 import { createRealSubmitDeps, observeReviewExecution } from '../pr-review-wiring';
-import { buildPrReviewTransport } from '../judge-transport';
+import {
+  CODEX_JUDGE_CLI_PACKAGE,
+  CODEX_JUDGE_CLI_VERSION,
+  buildPrReviewTransport,
+} from '../judge-transport';
 import { processJob, runBrokerProcess } from '../../../../scripts/overseer-reviewer-broker';
 import {
   runAndSubmitReview,
@@ -50,8 +54,8 @@ const proof: ReviewExecutionProof = {
   headSha: head,
   treeSha: 'b'.repeat(40),
   cwd: '/tmp/checkout',
-  nativePolicy: 'codex_legacy_landlock',
-  nativeVersion: '0.153.3',
+  nativePolicy: 'codex_bubblewrap',
+  nativeVersion: CODEX_JUDGE_CLI_VERSION,
   runtimeUid: 1001,
   inspectionObserved: true,
   check_plan: 'present',
@@ -139,7 +143,7 @@ describe('sandbox-qualified submit', () => {
       kind: 'pr-review',
       cwd: '/tmp/checkout',
       expectedHeadSha: head,
-      nativePolicy: 'codex_legacy_landlock',
+      nativePolicy: 'codex_bubblewrap',
     });
     expect(transport.argv).toContain('web_search="disabled"');
     expect(transport.argv).toContain('--json');
@@ -234,9 +238,7 @@ describe('bounded broker process capture', () => {
         argv: [
           'bunx',
           '--offline',
-          '@openai/codex@0.153.3',
-          '--enable',
-          'use_legacy_landlock',
+          CODEX_JUDGE_CLI_PACKAGE,
           '-c',
           'web_search="disabled"',
           'exec',
@@ -248,6 +250,8 @@ describe('bounded broker process capture', () => {
           '--skip-git-repo-check',
           '--cd',
           checkout,
+          '--model',
+          'gpt-6.1-sol',
         ],
         prompt: 'review',
       })
@@ -641,6 +645,7 @@ describe.serial('observed checkout integrity and check environment', () => {
           checkPlan: [],
         });
         expect(proof?.inspectionObserved).toBe(true);
+        expect(proof?.nativeVersion).toBe(CODEX_JUDGE_CLI_VERSION);
         expect(proof?.check_plan).toBe('absent');
         expect(proof?.checks).toEqual([]);
       } finally {
