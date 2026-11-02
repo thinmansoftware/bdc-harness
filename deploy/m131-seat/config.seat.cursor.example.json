@@ -1,0 +1,20 @@
+{
+  "worker_id": "bdc-seat-cursor",
+  "host": "bdc-seat-cursor",
+  "server_url": "http://archon-app-1:3090",
+  "poll_interval_ms": 5000,
+  "heartbeat_interval_ms": 30000,
+  "lease_duration_ms": 300000,
+  "max_concurrency": {
+    "cursor-build": 1
+  },
+  "seat": {
+    "seat_id": "bdc-seat-cursor",
+    "model_family": "cursor",
+    "provider_allowlist": ["cursor-build"],
+    "secret_ingress_file": "/run/m131/secret-ingress/cursor-credential.json",
+    "vendor_profile_dir": "/home/seat/.cursor",
+    "state_dir": "/var/lib/bdc-seat",
+    "build_sha_env": "SEAT_BUILD_SHA"
+  }
+}

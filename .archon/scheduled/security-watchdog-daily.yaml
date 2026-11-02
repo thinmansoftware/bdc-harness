@@ -1,0 +1,9 @@
+# Inert source-only schedule record for WO-HARNESS-SECURITY-WATCHDOG-V2-01.
+# No scheduler consumes .archon/scheduled in this repo yet. Activation is a
+# separately gated operator step after Phase 1 baseline proof.
+enabled: false
+name: security-watchdog-daily
+schedule: "0 9 * * *"
+command: "bun --filter @archon/security-watchdog start -- scan"
+phase: 1
+mutation: none

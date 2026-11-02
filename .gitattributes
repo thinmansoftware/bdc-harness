@@ -1,0 +1,11 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Force LF line endings for files that run inside Linux containers
+*.sh text eol=lf
+docker-entrypoint.sh text eol=lf
+Caddyfile text eol=lf
+Caddyfile.example text eol=lf
+
+# Verbatim GitHub PR bodies used as reconcile fixtures: keep CRLF bytes as captured
+packages/overseer/src/__tests__/fixtures/reconcile/*.md -text

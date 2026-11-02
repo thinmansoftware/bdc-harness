@@ -1,0 +1,607 @@
+import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test';
+import { mkdir, writeFile, rm } from 'fs/promises';
+import { join } from 'path';
+import { tmpdir } from 'os';
+
+// Mock @archon/paths before importing the registry (which calls createLogger)
+mock.module('@archon/paths', () => ({
+  createLogger: () => ({
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+    debug: () => {},
+    trace: () => {},
+    fatal: () => {},
+    child: () => ({}),
+  }),
+  BUNDLED_IS_BINARY: false,
+}));
+
+import {
+  loadAgentRegistry,
+  loadAgentFile,
+  resolveAgent,
+  parseFrontmatter,
+  AgentRegistryError,
+} from './registry';
+import { resolveAgentPersona } from '../executor-shared';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+let testDir: string;
+
+beforeEach(async () => {
+  testDir = join(
+    tmpdir(),
+    `agent-registry-test-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  );
+  await mkdir(testDir, { recursive: true });
+});
+
+afterEach(async () => {
+  try {
+    await rm(testDir, { recursive: true, force: true });
+  } catch {
+    // ignore cleanup errors
+  }
+});
+
+async function writeAgent(filename: string, content: string): Promise<string> {
+  const filePath = join(testDir, filename);
+  await writeFile(filePath, content, 'utf-8');
+  return filePath;
+}
+
+const VALID_AGENT = `---
+name: test-agent
+model: sonnet
+tools: [Read, Grep]
+description: A test agent.
+---
+
+You are a test agent. You test things.
+`;
+
+// ---------------------------------------------------------------------------
+// parseFrontmatter
+// ---------------------------------------------------------------------------
+
+describe('parseFrontmatter', () => {
+  test('parses simple frontmatter', () => {
+    const result = parseFrontmatter('---\nname: my-agent\nmodel: sonnet\n---\n\nBody here.');
+    expect(result).not.toBeNull();
+    expect(result?.frontmatter.name).toBe('my-agent');
+    expect(result?.frontmatter.model).toBe('sonnet');
+    expect(result?.body).toBe('Body here.');
+  });
+
+  test('parses inline array tools', () => {
+    const result = parseFrontmatter(
+      '---\nname: a\nmodel: opus\ntools: [Read, Grep, Glob]\n---\n\nPrompt.'
+    );
+    expect(result?.frontmatter.tools).toEqual(['Read', 'Grep', 'Glob']);
+  });
+
+  test('parses block sequence tools', () => {
+    const content = `---
+name: a
+model: sonnet
+tools:
+  - Read
+  - Grep
+---
+
+Prompt.`;
+    const result = parseFrontmatter(content);
+    expect(result?.frontmatter.tools).toEqual(['Read', 'Grep']);
+  });
+
+  test('returns null when no opening ---', () => {
+    const result = parseFrontmatter('name: foo\n\nBody.');
+    expect(result).toBeNull();
+  });
+
+  test('returns null when closing --- is missing', () => {
+    const result = parseFrontmatter('---\nname: foo\n\nBody.');
+    expect(result).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadAgentFile -- happy path
+// ---------------------------------------------------------------------------
+
+describe('loadAgentFile happy path', () => {
+  test('loads a valid agent file', async () => {
+    const filePath = await writeAgent('test-agent.md', VALID_AGENT);
+    const persona = await loadAgentFile(filePath);
+    expect(persona.name).toBe('test-agent');
+    expect(persona.model).toBe('sonnet');
+    expect(persona.tools).toEqual(['Read', 'Grep']);
+    expect(persona.systemPrompt).toContain('You are a test agent');
+  });
+
+  test('tools field is optional', async () => {
+    const content = `---
+name: no-tools-agent
+model: opus
+---
+
+System prompt here.
+`;
+    const filePath = await writeAgent('no-tools-agent.md', content);
+    const persona = await loadAgentFile(filePath);
+    expect(persona.tools).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadAgentFile -- error codes (fail-closed)
+// ---------------------------------------------------------------------------
+
+describe('loadAgentFile error codes', () => {
+  test('agent_missing_name: frontmatter has no name field', async () => {
+    const content = `---
+model: sonnet
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('missing-name.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_missing_name');
+  });
+
+  test('agent_name_filename_mismatch: frontmatter name does not match filename', async () => {
+    const content = `---
+name: different-name
+model: sonnet
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('actual-name.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_name_filename_mismatch');
+  });
+
+  test('no model field: loads successfully (model is optional at the registry layer)', async () => {
+    // A `provider: codex` persona MUST omit `model:`. The registry no longer
+    // requires it; provider-specific enforcement lives in resolveAgentPersona.
+    const content = `---
+name: no-model
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('no-model.md', content);
+    const persona = await loadAgentFile(filePath);
+    expect(persona.name).toBe('no-model');
+    expect(persona.model).toBeUndefined();
+  });
+
+  test('claude-opus-5-5 is a known model and does not raise agent_invalid_model', async () => {
+    const content = `---
+name: opus-55
+model: claude-opus-5-5
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('opus-55.md', content);
+    const persona = await loadAgentFile(filePath);
+    expect(persona.model).toBe('claude-opus-5-5');
+  });
+
+  test('claude-haiku-5-5 is a known model and does not raise agent_invalid_model', async () => {
+    const content = `---
+name: haiku-55
+model: claude-haiku-5-5
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('haiku-55.md', content);
+    const persona = await loadAgentFile(filePath);
+    expect(persona.model).toBe('claude-haiku-5-5');
+  });
+
+  test('agent_invalid_model: claude-haiku-5 is not the exact allowlisted ID', async () => {
+    const content = `---
+name: haiku-bare
+model: claude-haiku-5
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('haiku-bare.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_model');
+  });
+
+  test('agent_invalid_model: model alias not in known set', async () => {
+    const content = `---
+name: bad-model
+model: gpt-4o
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('bad-model.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_model');
+  });
+
+  test('agent_invalid_model: blank model scalar (model: with no value) is rejected (F3)', async () => {
+    // A bare `model:` with no value must fire agent_invalid_model rather than
+    // being silently treated as "omitted" (which would bypass the validator).
+    const content = `---
+name: blank-model
+model:
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('blank-model.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_model');
+  });
+
+  test('agent_invalid_tool: tool not in known allowlist', async () => {
+    const content = `---
+name: bad-tool
+model: sonnet
+tools: [Read, FakeTool]
+---
+
+Prompt.
+`;
+    const filePath = await writeAgent('bad-tool.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_tool');
+  });
+
+  test('agent_empty_prompt: body is empty after frontmatter', async () => {
+    const content = `---
+name: empty-prompt
+model: sonnet
+---
+`;
+    const filePath = await writeAgent('empty-prompt.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_empty_prompt');
+  });
+
+  test('agent_missing_name: file without frontmatter markers', async () => {
+    const content = `Just a plain markdown file with no frontmatter.`;
+    const filePath = await writeAgent('no-frontmatter.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_missing_name');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadAgentRegistry
+// ---------------------------------------------------------------------------
+
+describe('loadAgentRegistry', () => {
+  test('loads all valid agents from directory', async () => {
+    const agent1 = `---\nname: agent-one\nmodel: sonnet\n---\n\nAgent one prompt.`;
+    const agent2 = `---\nname: agent-two\nmodel: opus\n---\n\nAgent two prompt.`;
+    await writeAgent('agent-one.md', agent1);
+    await writeAgent('agent-two.md', agent2);
+
+    const registry = await loadAgentRegistry(testDir);
+    expect(registry.size).toBe(2);
+    expect(registry.has('agent-one')).toBe(true);
+    expect(registry.has('agent-two')).toBe(true);
+  });
+
+  test('returns empty registry when directory does not exist', async () => {
+    const registry = await loadAgentRegistry(join(testDir, 'nonexistent'));
+    expect(registry.size).toBe(0);
+  });
+
+  test('throws on first invalid file (fail-closed)', async () => {
+    await writeAgent('valid-agent.md', VALID_AGENT.replace('test-agent', 'valid-agent'));
+    // Invalid: a model is present but is not a known alias (agent_invalid_model).
+    // (A missing model is now valid -- codex personas omit it.)
+    await writeAgent('bad-agent.md', '---\nname: bad-agent\nmodel: gpt-9000\n---\n\nBad alias.');
+
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentRegistry(testDir);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_model');
+  });
+
+  test('ignores non-.md files in directory', async () => {
+    await writeAgent('valid-agent.md', VALID_AGENT.replace('test-agent', 'valid-agent'));
+    await writeFile(join(testDir, 'readme.txt'), 'not an agent', 'utf-8');
+    await writeFile(join(testDir, '.gitkeep'), '', 'utf-8');
+
+    const registry = await loadAgentRegistry(testDir);
+    expect(registry.size).toBe(1);
+    expect(registry.has('valid-agent')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveAgent
+// ---------------------------------------------------------------------------
+
+describe('resolveAgent', () => {
+  test('returns persona for known agent name', async () => {
+    const filePath = await writeAgent('my-agent.md', VALID_AGENT.replace('test-agent', 'my-agent'));
+    const registry = await loadAgentRegistry(testDir);
+    const persona = resolveAgent('my-agent', registry);
+    expect(persona).not.toBeUndefined();
+    expect(persona?.name).toBe('my-agent');
+  });
+
+  test('returns undefined for empty registry (no agents configured)', () => {
+    const emptyRegistry = new Map();
+    const result = resolveAgent('any-agent', emptyRegistry);
+    expect(result).toBeUndefined();
+  });
+
+  test('throws agent_not_found when registry has entries but name is missing', async () => {
+    const filePath = await writeAgent(
+      'known-agent.md',
+      VALID_AGENT.replace('test-agent', 'known-agent')
+    );
+    const registry = await loadAgentRegistry(testDir);
+
+    let err: AgentRegistryError | null = null;
+    try {
+      resolveAgent('unknown-agent', registry);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_not_found');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseFrontmatter -- nested context: block
+// ---------------------------------------------------------------------------
+
+describe('parseFrontmatter nested context:', () => {
+  test('parses valid context block with wiki, oracle, and scalar fields', () => {
+    const content = [
+      '---',
+      'name: a',
+      'model: sonnet',
+      'context:',
+      '  wiki:',
+      '    - docs/arch.md',
+      '  oracle:',
+      '    - BDC patterns',
+      '  cache_seconds: 3600',
+      '  max_chars: 50000',
+      '---',
+      '',
+      'Prompt.',
+    ].join('\n');
+    const result = parseFrontmatter(content);
+    expect(result?.frontmatter.context).toEqual({
+      wiki: ['docs/arch.md'],
+      oracle: ['BDC patterns'],
+      cache_seconds: 3600,
+      max_chars: 50000,
+    });
+  });
+
+  test('parses ad_hoc scalar under context:', () => {
+    const content = [
+      '---',
+      'name: a',
+      'model: sonnet',
+      'context:',
+      '  ad_hoc: allowed',
+      '---',
+      '',
+      'Prompt.',
+    ].join('\n');
+    const result = parseFrontmatter(content);
+    expect((result?.frontmatter.context as Record<string, unknown>)?.ad_hoc).toBe('allowed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadAgentFile -- context validation (agent_invalid_context)
+// ---------------------------------------------------------------------------
+
+describe('tracked major-build-haiku persona', () => {
+  test('loads the repo persona and resolves it over a sonnet workflow model', async () => {
+    const repoRoot = join(import.meta.dir, '..', '..', '..', '..');
+    const registry = await loadAgentRegistry(join(repoRoot, '.archon', 'agents'));
+    const haiku = resolveAgent('major-build-haiku', registry);
+    const original = resolveAgent('major-build', registry);
+
+    expect(haiku).toBeDefined();
+    expect(original).toBeDefined();
+    if (haiku === undefined || original === undefined) {
+      throw new Error('major-build personas missing from .archon/agents');
+    }
+
+    expect(haiku.model).toBe('claude-haiku-5-5');
+    expect(haiku.systemPrompt).toBe(original.systemPrompt);
+    expect(haiku.tools).toEqual(original.tools);
+    expect(haiku.context).toEqual(original.context);
+
+    const resolved = resolveAgentPersona(haiku, 'sonnet', 'claude');
+    expect(resolved.model).toBe('claude-haiku-5-5');
+    expect(resolved.systemPrompt).toBe(original.systemPrompt);
+    expect(resolved.allowedTools).toEqual(original.tools);
+  });
+});
+
+describe('loadAgentFile context validation', () => {
+  test('loads agent with valid context block', async () => {
+    const content = [
+      '---',
+      'name: ctx-agent',
+      'model: sonnet',
+      'context:',
+      '  wiki:',
+      '    - docs/a.md',
+      '---',
+      '',
+      'You are a test agent.',
+    ].join('\n');
+    const filePath = await writeAgent('ctx-agent.md', content);
+    const persona = await loadAgentFile(filePath);
+    expect(persona.context?.wiki).toEqual(['docs/a.md']);
+  });
+
+  test('agent_invalid_context: wiki path traversal (../)', async () => {
+    const content = [
+      '---',
+      'name: trav-ctx',
+      'model: sonnet',
+      'context:',
+      '  wiki:',
+      '    - ../etc/passwd',
+      '---',
+      '',
+      'Prompt.',
+    ].join('\n');
+    const filePath = await writeAgent('trav-ctx.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_context');
+  });
+
+  test('agent_invalid_context: secrets path in wiki', async () => {
+    const content = [
+      '---',
+      'name: sec-ctx',
+      'model: sonnet',
+      'context:',
+      '  wiki:',
+      '    - docs/secrets/keys.md',
+      '---',
+      '',
+      'Prompt.',
+    ].join('\n');
+    const filePath = await writeAgent('sec-ctx.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_context');
+  });
+
+  test('agent_invalid_context: invalid ad_hoc value', async () => {
+    const content = [
+      '---',
+      'name: adhoc-ctx',
+      'model: sonnet',
+      'context:',
+      '  ad_hoc: maybe',
+      '---',
+      '',
+      'Prompt.',
+    ].join('\n');
+    const filePath = await writeAgent('adhoc-ctx.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_context');
+  });
+
+  test('agent_invalid_context: cache_seconds as non-integer', async () => {
+    const content = [
+      '---',
+      'name: cache-ctx',
+      'model: sonnet',
+      'context:',
+      '  cache_seconds: 3.5',
+      '---',
+      '',
+      'Prompt.',
+    ].join('\n');
+    const filePath = await writeAgent('cache-ctx.md', content);
+    let err: AgentRegistryError | null = null;
+    try {
+      await loadAgentFile(filePath);
+    } catch (e) {
+      err = e as AgentRegistryError;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.code).toBe('agent_invalid_context');
+  });
+
+  test('agent without context: loads as before (backward compat)', async () => {
+    const filePath = await writeAgent('test-agent.md', VALID_AGENT);
+    const persona = await loadAgentFile(filePath);
+    expect(persona.context).toBeUndefined();
+  });
+});

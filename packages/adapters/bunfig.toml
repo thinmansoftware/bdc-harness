@@ -1,0 +1,9 @@
+# Package-scoped Bun test config.
+#
+# The root bunfig.toml is NOT read when `bun test` runs with a package as its
+# cwd -- which is exactly how every package's "test" script (and therefore CI's
+# `bun run test` / `bun --filter '*' test`) invokes it. Without this file the
+# shared preload never loads for package-scoped runs, which silently dropped
+# BOTH the production-DB safety guard and the raised default test timeout.
+[test]
+preload = ["../core/src/test/setup.ts"]

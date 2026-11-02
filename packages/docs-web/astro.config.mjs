@@ -1,0 +1,62 @@
+import { defineConfig } from 'astro/config';
+import { unified } from '@astrojs/markdown-remark';
+import starlight from '@astrojs/starlight';
+
+export default defineConfig({
+  compressHTML: true,
+  markdown: { processor: unified() },
+  site: 'https://archon.diy',
+  integrations: [
+    starlight({
+      title: 'Archon',
+      favicon: '/favicon.png',
+      logo: {
+        src: './src/assets/logo.png',
+        alt: 'Archon',
+      },
+      description: 'AI workflow engine -- package your coding workflows as YAML, run them anywhere.',
+      head: [
+        {
+          tag: 'script',
+          content: `if(!localStorage.getItem('archon-theme-init')){localStorage.setItem('archon-theme-init','1');localStorage.setItem('starlight-theme','dark');document.documentElement.dataset.theme='dark';}`,
+        },
+      ],
+      social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/coleam00/Archon' }],
+      editLink: {
+        baseUrl: 'https://github.com/coleam00/Archon/edit/main/packages/docs-web/',
+      },
+      sidebar: [
+        { label: '  Roadmap', link: '/roadmap/' },
+        {
+          label: 'The Book of Archon',
+          items: [{ autogenerate: { directory: 'book' } }],
+        },
+        {
+          label: 'Getting Started',
+          items: [{ autogenerate: { directory: 'getting-started' } }],
+        },
+        {
+          label: 'Guides',
+          items: [{ autogenerate: { directory: 'guides' } }],
+        },
+        {
+          label: 'Adapters',
+          items: [{ autogenerate: { directory: 'adapters' } }],
+        },
+        {
+          label: 'Deployment',
+          items: [{ autogenerate: { directory: 'deployment' } }],
+        },
+        {
+          label: 'Reference',
+          items: [{ autogenerate: { directory: 'reference' } }],
+        },
+        {
+          label: 'Contributing',
+          items: [{ autogenerate: { directory: 'contributing' } }],
+        },
+      ],
+      customCss: ['./src/styles/custom.css'],
+    }),
+  ],
+});

@@ -1,0 +1,1128 @@
+import { beforeEach, afterEach, describe, test, expect, mock } from 'bun:test';
+import { OpenAPIHono } from '@hono/zod-openapi';
+import type { ConversationLockManager } from '@archon/core';
+import type { WebAdapter } from '../adapters/web';
+import { mkdir, rm, writeFile } from 'fs/promises';
+import { createRequire } from 'node:module';
+import { join } from 'path';
+import { tmpdir } from 'os';
+
+// The operator-token gate in registerApiRoutes() activates whenever
+// ARCHON_OPERATOR_TOKEN is set. Clear it at module level so these tests run
+// deterministically in container envs (Cauldron build image exports this var).
+delete process.env.ARCHON_OPERATOR_TOKEN;
+delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+delete process.env.ARCHON_OPERATOR_EMAILS;
+
+// These tests deliberately rely on the REAL fs/promises behavior: the 404 cases
+// for GET/DELETE /api/workflows/:name depend on readFile/unlink throwing a
+// genuine ENOENT for a path that does not exist on disk. Bun's mock.module() is
+// process-global and persists across test files in a single run; a sibling file
+// (api.host-metrics.test.ts) registers a permanent fs/promises mock whose
+// readFile returns '{}' and whose unlink is a no-op that always succeeds. That
+// leaked stub turns these 404 cases into 200s. To stay deterministic regardless
+// of file load order, capture the real fs/promises via createRequire (which
+// bypasses the module-mock registry) and re-register it as this file's own mock
+// so the real implementation wins for the module under test.
+const realFsPromises = createRequire(import.meta.url)(
+  'fs/promises'
+) as typeof import('fs/promises');
+mock.module('fs/promises', () => ({ ...realFsPromises }));
+import { validationErrorHook } from './openapi-defaults';
+import { makeTestWorkflow, makeTestWorkflowWithSource } from '@archon/workflows/test-utils';
+import {
+  getOpenRouterXaiRefusal,
+  OPENROUTER_XAI_REFUSED_REASON,
+  setOpenRouterProviderIdResolver,
+} from '../../../providers/src/openrouter-guard';
+import {
+  registerBuiltinProviders,
+  registerCommunityProviders,
+  resolveProviderId,
+} from '../../../providers/src/registry';
+
+/** Test app factory: includes defaultHook to format validation errors as { error: string }. */
+function createTestApp(): OpenAPIHono {
+  return new OpenAPIHono({ defaultHook: validationErrorHook });
+}
+
+const mockDiscoverWorkflows = mock(async (_cwd: string) => ({
+  workflows: [makeTestWorkflowWithSource({ name: 'deploy', description: 'Deploy app' }, 'bundled')],
+  errors: [
+    { filename: '/tmp/.archon/workflows/bad.md', error: 'invalid', errorType: 'parse_error' },
+  ],
+}));
+
+const mockLoadConfig = mock(async () => ({}));
+
+// Default: returns a valid workflow. Use mockReturnValueOnce in tests that need a parse failure.
+const mockParseWorkflow = mock((_content: string, _filename: string) => ({
+  workflow: makeTestWorkflow({ name: 'test', description: 'Test workflow' }),
+  error: null,
+}));
+
+const mockGetLoaderErrors = mock(() => [
+  {
+    filename: 'bad.yaml',
+    path: '/tmp/project/.archon/workflows/bad.yaml',
+    error_type: 'dag_invalid',
+    message: "Node 'implement': 'loop.until' Required",
+    last_attempt_at: '2026-05-13T18:22:11.000Z',
+  },
+]);
+
+const mockHandleMessage = mock(async () => {});
+mock.module('@archon/core', () => ({
+  handleMessage: mockHandleMessage,
+  getDatabaseType: () => 'sqlite',
+  loadConfig: mockLoadConfig,
+  getWorkflowFolderSearchPaths: mock(() => ['.archon/workflows']),
+  getCommandFolderSearchPaths: mock(() => ['.archon/commands', '.archon/commands/defaults']),
+  getDefaultCommandsPath: mock(() => '/tmp/.archon-test-nonexistent/commands/defaults'),
+  getDefaultWorkflowsPath: mock(() => '/tmp/.archon-test-nonexistent/workflows/defaults'),
+  cloneRepository: mock(async () => {}),
+  registerRepository: mock(async () => ({ success: true })),
+  removeWorktree: mock(async () => ({ success: true })),
+  ConversationNotFoundError: class extends Error {},
+  getArchonWorkspacesPath: () => '/tmp/.archon/workspaces',
+  createLogger: () => ({
+    fatal: mock(() => undefined),
+    error: mock(() => undefined),
+    warn: mock(() => undefined),
+    info: mock(() => undefined),
+    debug: mock(() => undefined),
+    trace: mock(() => undefined),
+    child: mock(function (this: unknown) {
+      return this;
+    }),
+    bindings: mock(() => ({ module: 'test' })),
+    isLevelEnabled: mock(() => true),
+    level: 'info',
+  }),
+}));
+
+mock.module('@archon/workflows/workflow-discovery', () => ({
+  discoverWorkflowsWithConfig: mockDiscoverWorkflows,
+}));
+mock.module('@archon/workflows/loader', () => ({
+  parseWorkflow: mockParseWorkflow,
+  getLoaderErrors: mockGetLoaderErrors,
+}));
+const mockResolveWorkflowProbeBindings = mock(() => [
+  {
+    bindingKey: 'binding-key',
+    providerId: 'codex',
+    modelId: 'gpt-5.5',
+    authContextId: 'codex:chatgpt-account',
+    assistantConfigHash: 'assistant',
+    nodeOverrideHash: 'node',
+  },
+]);
+mock.module('@archon/workflows/reliability/resolve-binding', () => ({
+  resolveWorkflowProbeBindings: mockResolveWorkflowProbeBindings,
+}));
+mock.module('@archon/workflows/command-validation', () => ({
+  isValidCommandName: mock(
+    (name: string) =>
+      !name.includes('/') &&
+      !name.includes('\\') &&
+      !name.includes('..') &&
+      !!name &&
+      !name.startsWith('.')
+  ),
+}));
+mock.module('@archon/workflows/defaults', () => ({
+  BUNDLED_WORKFLOWS: {
+    'archon-assist': 'name: archon-assist\ndescription: Archon Assist\nnodes: []',
+  },
+  BUNDLED_COMMANDS: {
+    'archon-assist': '# archon-assist command',
+  },
+  isBinaryBuild: mock(() => false),
+}));
+
+// Note: @archon/core/defaults/bundled-defaults and @archon/core/utils/commands are NOT mocked.
+// The real implementations are used. isBinaryBuild() returns false in Bun test environment, and
+// the filesystem paths used by the routes point to non-existent directories, so access/readFile/unlink
+// calls naturally fail with ENOENT without needing to mock fs/promises (which would leak globally).
+
+const mockFindConversationByPlatformId = mock(async () => ({
+  id: 'conversation-db-id',
+  platform_conversation_id: 'conversation-platform-id',
+  platform_type: 'web',
+  title: 'Existing conversation',
+  codebase_id: null,
+  ai_assistant_type: 'claude',
+}));
+mock.module('@archon/core/db/conversations', () => ({
+  findConversationByPlatformId: mockFindConversationByPlatformId,
+  getOrCreateConversation: mockFindConversationByPlatformId,
+}));
+mock.module('@archon/core/db/isolation-environments', () => ({}));
+mock.module('@archon/core/db/workflows', () => ({}));
+mock.module('@archon/core/db/workflow-events', () => ({}));
+mock.module('@archon/core/db/messages', () => ({ addMessage: mock(async () => undefined) }));
+const mockFindActiveKnownBadBinding = mock(async () => null);
+mock.module('@archon/core/db/known-bad-bindings', () => ({
+  findActiveByBindingKey: mockFindActiveKnownBadBinding,
+}));
+const mockCheckCodexDispatchGate = mock(async () => ({ fresh: true as const }));
+mock.module('@archon/providers/auth-refresh/dispatch-gate', () => ({
+  checkCodexDispatchGate: mockCheckCodexDispatchGate,
+}));
+mock.module('@archon/providers', () => ({
+  isRegisteredProvider: (provider: string) =>
+    ['claude', 'codex', 'cursor', 'openrouter', 'grok', 'opr', 'opr-zero', 'glm', 'pi'].includes(
+      provider
+    ),
+  getProviderInfoList: () => [],
+  getOpenRouterXaiRefusal,
+  OPENROUTER_XAI_REFUSED_REASON,
+}));
+
+const mockListCodebases = mock(async () => [{ default_cwd: '/tmp/project' }]);
+mock.module('@archon/core/db/codebases', () => ({
+  listCodebases: mockListCodebases,
+}));
+
+import { registerApiRoutes } from './api';
+
+function createRunTestApp(): OpenAPIHono {
+  const app = createTestApp();
+  const webAdapter = {
+    setConversationDbId: mock(() => undefined),
+    emitLockEvent: mock(async () => undefined),
+    emitSSE: mock(async () => undefined),
+  } as unknown as WebAdapter;
+  const lockManager = {
+    acquireLock: mock(async (_id: string, task: () => Promise<void>) => {
+      await task();
+      return { status: 'completed' };
+    }),
+  } as unknown as ConversationLockManager;
+  registerApiRoutes(app, webAdapter, lockManager);
+  return app;
+}
+
+describe('GET /api/workflows', () => {
+  test('requires operator token when ARCHON_OPERATOR_TOKEN is configured', async () => {
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+      const response = await app.request('/api/workflows');
+
+      expect(response.status).toBe(401);
+      const body = (await response.json()) as { error: string };
+      expect(body.error).toContain('operator token');
+    } finally {
+      if (previousToken === undefined) {
+        delete process.env.ARCHON_OPERATOR_TOKEN;
+      } else {
+        process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+      }
+    }
+  });
+
+  test('accepts allowed Cloudflare Access email on configured operator host', async () => {
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    const previousHosts = process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+    const previousEmails = process.env.ARCHON_OPERATOR_EMAILS;
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
+    process.env.ARCHON_OPERATOR_ACCESS_HOSTS = 'ops.cauldron.thinmansoftware.com';
+    process.env.ARCHON_OPERATOR_EMAILS = 'john@example.com';
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+      const response = await app.request('/api/workflows', {
+        headers: {
+          Host: 'ops.cauldron.thinmansoftware.com',
+          'Cf-Access-Authenticated-User-Email': 'John@Example.com',
+        },
+      });
+
+      expect(response.status).toBe(200);
+    } finally {
+      if (previousToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
+      else process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+      if (previousHosts === undefined) delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+      else process.env.ARCHON_OPERATOR_ACCESS_HOSTS = previousHosts;
+      if (previousEmails === undefined) delete process.env.ARCHON_OPERATOR_EMAILS;
+      else process.env.ARCHON_OPERATOR_EMAILS = previousEmails;
+    }
+  });
+
+  test('rejects spoofed Cloudflare Access email on non-operator host', async () => {
+    const previousToken = process.env.ARCHON_OPERATOR_TOKEN;
+    const previousHosts = process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+    const previousEmails = process.env.ARCHON_OPERATOR_EMAILS;
+    process.env.ARCHON_OPERATOR_TOKEN = 'test-operator-token';
+    process.env.ARCHON_OPERATOR_ACCESS_HOSTS = 'ops.cauldron.thinmansoftware.com';
+    process.env.ARCHON_OPERATOR_EMAILS = 'john@example.com';
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+      const response = await app.request('/api/workflows', {
+        headers: {
+          Host: 'cauldron.thinmansoftware.com',
+          'Cf-Access-Authenticated-User-Email': 'john@example.com',
+        },
+      });
+
+      expect(response.status).toBe(401);
+    } finally {
+      if (previousToken === undefined) delete process.env.ARCHON_OPERATOR_TOKEN;
+      else process.env.ARCHON_OPERATOR_TOKEN = previousToken;
+      if (previousHosts === undefined) delete process.env.ARCHON_OPERATOR_ACCESS_HOSTS;
+      else process.env.ARCHON_OPERATOR_ACCESS_HOSTS = previousHosts;
+      if (previousEmails === undefined) delete process.env.ARCHON_OPERATOR_EMAILS;
+      else process.env.ARCHON_OPERATOR_EMAILS = previousEmails;
+    }
+  });
+
+  test('returns a flat workflows array from discoverWorkflows result', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/workflows');
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as {
+      workflows: Array<{ workflow: { name: string }; source: string }> & { workflows?: unknown };
+      errors: unknown[];
+    };
+
+    expect(Array.isArray(body.workflows)).toBe(true);
+    expect(body.workflows[0]?.workflow.name).toBe('deploy');
+    expect(body.workflows[0]?.source).toBe('bundled');
+    expect(body.workflows.workflows).toBeUndefined();
+    expect(mockDiscoverWorkflows).toHaveBeenCalledWith('/tmp/project', expect.any(Function));
+    expect(body.errors).toBeDefined();
+    expect(Array.isArray(body.errors)).toBe(true);
+    expect(body.validation_errors).toEqual({
+      count: 1,
+      endpoint: '/api/workflows/errors',
+    });
+  });
+});
+
+describe('GET /api/workflows/errors', () => {
+  test('returns captured loader errors', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/workflows/errors');
+    expect(response.status).toBe(200);
+
+    const body = (await response.json()) as {
+      errors: Array<{ filename: string; error_type: string; message: string }>;
+      count: number;
+    };
+
+    expect(body.count).toBe(1);
+    expect(body.errors[0].filename).toBe('bad.yaml');
+    expect(body.errors[0].error_type).toBe('dag_invalid');
+    expect(body.errors[0].message).toContain('loop.until');
+  });
+});
+
+describe('POST /api/workflows/:name/run model overrides', () => {
+  const request = (body: unknown) =>
+    createRunTestApp().request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  test('rejects an unregistered override provider', async () => {
+    const response = await request({
+      conversationId: 'override-provider',
+      message: 'run it',
+      modelOverride: { workflow: { provider: 'not-registered', model: 'model-x' } },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_unknown_provider:not-registered',
+    });
+  });
+
+  test('rejects an override for an unknown node id', async () => {
+    const response = await request({
+      conversationId: 'override-node',
+      message: 'run it',
+      modelOverride: { nodes: { missing: { model: 'sonnet' } } },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_unknown_node:missing',
+    });
+  });
+
+  test('rejects an empty override model', async () => {
+    const response = await request({
+      conversationId: 'override-empty-model',
+      message: 'run it',
+      modelOverride: { workflow: { provider: 'claude', model: '' } },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_empty_model',
+    });
+  });
+
+  test('rejects an empty override provider', async () => {
+    const response = await request({
+      conversationId: 'override-empty-provider',
+      message: 'run it',
+      modelOverride: { workflow: { provider: '', model: 'sonnet' } },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_empty_provider',
+    });
+  });
+
+  test('rejects modelOverride combined with conductor dispatch', async () => {
+    const response = await request({
+      conversationId: 'override-conductor',
+      message: 'run it',
+      modelOverride: { workflow: { provider: 'claude', model: 'sonnet' } },
+      conductor: {
+        enabled: true,
+        woId: 'WO-TEST-1',
+        project: 'test',
+        idempotencyKey: 'override-conductor',
+      },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      accepted: false,
+      error: 'model_override_conductor_conflict',
+    });
+  });
+
+  test('accepts a valid node override', async () => {
+    const response = await request({
+      conversationId: 'override-valid',
+      message: 'run it',
+      modelOverride: { nodes: { default: { model: 'sonnet' } } },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: true, status: 'completed' });
+  });
+
+  test('accepts a codex workflow override when the codex dispatch gate is fresh', async () => {
+    mockDiscoverWorkflows.mockImplementationOnce(async () => ({
+      workflows: [
+        makeTestWorkflowWithSource(
+          { name: 'deploy', description: 'Deploy app', provider: 'claude' },
+          'bundled'
+        ),
+      ],
+      errors: [],
+    }));
+
+    const response = await request({
+      conversationId: 'override-codex',
+      message: 'run it',
+      modelOverride: { workflow: { provider: 'codex', model: 'gpt-5.5' } },
+    });
+
+    expect(mockCheckCodexDispatchGate).toHaveBeenCalled();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: true, status: 'completed' });
+  });
+});
+
+describe('POST /api/workflows/validate', () => {
+  test('returns valid:true for valid definition', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/workflows/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ definition: { name: 'my-workflow', description: 'test', nodes: [] } }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { valid: boolean };
+    expect(body.valid).toBe(true);
+  });
+
+  test('returns valid:false with errors for invalid definition', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    mockParseWorkflow.mockReturnValueOnce({
+      workflow: null,
+      error: { filename: 'test.yaml', error: 'parse error', errorType: 'validation_error' },
+    });
+
+    const response = await app.request('/api/workflows/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ definition: { name: 'my-workflow', description: 'bad' } }),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { valid: boolean; errors: string[] };
+    expect(body.valid).toBe(false);
+    expect(Array.isArray(body.errors)).toBe(true);
+    expect(body.errors.length).toBeGreaterThan(0);
+  });
+
+  test('returns 400 for missing definition', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/workflows/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ other: 'data' }),
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('definition');
+  });
+
+  test('returns 400 for malformed JSON body', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/workflows/validate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: 'not json at all {{{',
+    });
+    expect(response.status).toBe(400);
+  });
+});
+
+describe('GET /api/workflows/:name', () => {
+  test('returns 400 for invalid name (path traversal)', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/workflows/..secret');
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('Invalid workflow name');
+  });
+
+  test('returns 404 when workflow not found', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    // No cwd -> no readFile attempt -> checks BUNDLED_WORKFLOWS -> not there -> 404
+    mockListCodebases.mockImplementationOnce(async () => []);
+
+    const response = await app.request('/api/workflows/nonexistent-workflow');
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('nonexistent-workflow');
+  });
+
+  test('returns bundled workflow with source:bundled', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    // No cwd -> no readFile attempt -> checks BUNDLED_WORKFLOWS -> archon-assist found
+    mockListCodebases.mockImplementationOnce(async () => []);
+
+    const response = await app.request('/api/workflows/archon-assist');
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { source: string; filename: string; workflow: unknown };
+    expect(body.source).toBe('bundled');
+    expect(body.filename).toBe('archon-assist.yaml');
+    expect(body.workflow).toBeDefined();
+  });
+
+  test('returns project workflow with source:project when file exists on disk', async () => {
+    const testDir = join(tmpdir(), `wf-get-test-${Date.now()}`);
+    const workflowDir = join(testDir, '.archon', 'workflows');
+    await mkdir(workflowDir, { recursive: true });
+    await writeFile(
+      join(workflowDir, 'custom.yaml'),
+      'name: custom\ndescription: My custom\nnodes:\n  - id: plan\n    command: plan\n'
+    );
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+      const response = await app.request(`/api/workflows/custom?cwd=${testDir}`);
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        source: string;
+        filename: string;
+        workflow: { name: string };
+      };
+      expect(body.source).toBe('project');
+      expect(body.filename).toBe('custom.yaml');
+      expect(body.workflow).toBeDefined();
+    } finally {
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+
+  test('returns WorkflowDefinition shape with expected top-level fields', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    mockListCodebases.mockImplementationOnce(async () => []);
+
+    const response = await app.request('/api/workflows/archon-assist');
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      workflow: Record<string, unknown>;
+    };
+    const wf = body.workflow;
+    // Guard against silent spec drift if engine's workflowBaseSchema drops or renames fields
+    expect(typeof wf['name']).toBe('string');
+    expect(typeof wf['description']).toBe('string');
+    expect(Array.isArray(wf['nodes'])).toBe(true);
+  });
+});
+
+describe('GET /api/workflows/:name - cwd validation', () => {
+  test('returns 400 when cwd is not a registered codebase path', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    // default mock returns /tmp/project; /etc/secrets is not registered
+    const response = await app.request('/api/workflows/archon-assist?cwd=/etc/secrets');
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('Invalid cwd');
+  });
+});
+
+describe('PUT /api/workflows/:name', () => {
+  beforeEach(() => {
+    mockLoadConfig.mockImplementation(async () => ({}));
+    mockResolveWorkflowProbeBindings.mockImplementation(() => [
+      {
+        bindingKey: 'binding-key',
+        providerId: 'codex',
+        modelId: 'gpt-5.5',
+        authContextId: 'codex:chatgpt-account',
+        assistantConfigHash: 'assistant',
+        nodeOverrideHash: 'node',
+      },
+    ]);
+    mockFindActiveKnownBadBinding.mockImplementation(async () => null);
+  });
+
+  test('returns 400 for invalid name', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/workflows/..secret', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ definition: { name: 'test' } }),
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('Invalid workflow name');
+  });
+
+  test('returns 400 for missing definition', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/workflows/my-workflow', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ other: 'data' }),
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('definition');
+  });
+
+  test('falls back to getArchonHome() when no cwd and no codebases registered', async () => {
+    const testArchonHome = join(tmpdir(), `archon-home-test-${Date.now()}`);
+    process.env.ARCHON_HOME = testArchonHome;
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+      mockListCodebases.mockImplementationOnce(async () => []);
+      mockParseWorkflow.mockReturnValueOnce({
+        workflow: makeTestWorkflow({ name: 'my-workflow', description: 'test' }),
+        error: null,
+      });
+
+      const response = await app.request('/api/workflows/my-workflow', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          definition: {
+            name: 'my-workflow',
+            description: 'test',
+            nodes: [{ id: 'n1', command: 'assist' }],
+          },
+        }),
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { workflow: object; source: string };
+      expect(body.source).toBe('project');
+    } finally {
+      delete process.env.ARCHON_HOME;
+      await rm(testArchonHome, { recursive: true, force: true });
+    }
+  });
+
+  test('returns 400 when definition fails validation', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    mockParseWorkflow.mockReturnValueOnce({
+      workflow: null,
+      error: {
+        filename: 'test.yaml',
+        error: 'missing required fields',
+        errorType: 'validation_error',
+      },
+    });
+
+    const response = await app.request('/api/workflows/my-workflow', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ definition: { name: 'my-workflow', description: 'bad' } }),
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string; detail: string };
+    expect(body.error).toContain('invalid');
+    expect(body.detail).toBeDefined();
+  });
+
+  test('returns 400 with known_bad_binding reason when save targets an active bad binding', async () => {
+    const testDir = join(tmpdir(), `wf-known-bad-test-${Date.now()}`);
+    mockFindActiveKnownBadBinding.mockImplementationOnce(async () => ({
+      binding_key: 'binding-key',
+      provider_id: 'codex',
+      model_id: 'gpt-5.5',
+      auth_context_id: 'codex:chatgpt-account',
+      assistant_config_hash: 'assistant',
+      node_override_hash: 'node',
+      error_class: 'structural_model_not_supported',
+      http_status: 400,
+      error_body_excerpt: 'model not supported',
+      source: 'fire_probe',
+      first_seen_at: new Date().toISOString(),
+      last_seen_at: new Date().toISOString(),
+      hit_count: 1,
+      cleared_at: null,
+      cleared_reason: null,
+    }));
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+
+      const response = await app.request(`/api/workflows/my-workflow?cwd=${testDir}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          definition: {
+            name: 'my-workflow',
+            description: 'Test',
+            nodes: [{ id: 'plan', prompt: 'plan', provider: 'codex', model: 'gpt-5.5' }],
+          },
+        }),
+      });
+
+      expect(response.status).toBe(400);
+      const body = (await response.json()) as { error: string; detail: string };
+      expect(body.error).toContain('known bad binding');
+      expect(body.detail).toBe('known_bad_binding:codex:gpt-5.5:model not supported');
+    } finally {
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+
+  test('fails open when known-bad binding resolution cannot inspect a workflow', async () => {
+    const testDir = join(tmpdir(), `wf-known-bad-fail-open-test-${Date.now()}`);
+    mockFindActiveKnownBadBinding.mockClear();
+    mockResolveWorkflowProbeBindings.mockImplementationOnce(() => {
+      throw new Error('unknown provider');
+    });
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+
+      const response = await app.request(`/api/workflows/my-workflow?cwd=${testDir}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          definition: {
+            name: 'my-workflow',
+            description: 'Test',
+            nodes: [{ id: 'plan', prompt: 'plan', provider: 'future-provider' }],
+          },
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(mockFindActiveKnownBadBinding).not.toHaveBeenCalled();
+    } finally {
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+
+  test('saves valid workflow and returns parsed workflow with source:project', async () => {
+    const testDir = join(tmpdir(), `wf-put-test-${Date.now()}`);
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+      const response = await app.request(`/api/workflows/my-workflow?cwd=${testDir}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          definition: {
+            name: 'my-workflow',
+            description: 'Test',
+            nodes: [{ id: 'plan', command: 'plan' }],
+          },
+        }),
+      });
+
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as {
+        workflow: { name: string };
+        filename: string;
+        source: string;
+      };
+      expect(body.workflow).toBeDefined();
+      expect(body.filename).toBe('my-workflow.yaml');
+      expect(body.source).toBe('project');
+    } finally {
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('DELETE /api/workflows/:name', () => {
+  test('returns 400 for bundled default name', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    // archon-assist is in the real BUNDLED_WORKFLOWS
+    const response = await app.request('/api/workflows/archon-assist', { method: 'DELETE' });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('archon-assist');
+  });
+
+  test('returns 404 when workflow file not found', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    // Uses real unlink on a path that definitely does not exist -> natural ENOENT -> 404
+    const response = await app.request('/api/workflows/test-nonexistent-workflow-xyz', {
+      method: 'DELETE',
+    });
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('test-nonexistent-workflow-xyz');
+  });
+
+  test('falls back to getArchonHome() when no cwd and no codebases, returns 404 for missing file', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    mockListCodebases.mockImplementationOnce(async () => []);
+
+    const response = await app.request('/api/workflows/nonexistent-no-cwd-test', {
+      method: 'DELETE',
+    });
+    expect(response.status).toBe(404);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('nonexistent-no-cwd-test');
+  });
+
+  test('removes existing workflow file and returns deleted:true', async () => {
+    const testDir = join(tmpdir(), `wf-del-test-${Date.now()}`);
+    const workflowDir = join(testDir, '.archon', 'workflows');
+    await mkdir(workflowDir, { recursive: true });
+    await writeFile(
+      join(workflowDir, 'to-delete.yaml'),
+      'name: x\ndescription: y\nnodes:\n  - id: z\n    command: z\n'
+    );
+
+    try {
+      const app = createTestApp();
+      registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+      mockListCodebases.mockImplementationOnce(async () => [{ default_cwd: testDir }]);
+      const response = await app.request(`/api/workflows/to-delete?cwd=${testDir}`, {
+        method: 'DELETE',
+      });
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { deleted: boolean; name: string };
+      expect(body.deleted).toBe(true);
+      expect(body.name).toBe('to-delete');
+    } finally {
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('GET /api/workflows - cwd validation', () => {
+  test('returns 400 when cwd is not a registered codebase path', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    // default mock returns /tmp/project; /etc is not registered
+    const response = await app.request('/api/workflows?cwd=/etc');
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('Invalid cwd');
+  });
+
+  test('accepts cwd matching a registered codebase path', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    // default mock returns /tmp/project
+    const response = await app.request('/api/workflows?cwd=/tmp/project');
+    expect(response.status).toBe(200);
+  });
+});
+
+describe('PUT /api/workflows/:name - cwd validation', () => {
+  test('returns 400 when cwd is not a registered codebase path', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/workflows/my-workflow?cwd=/etc/secrets', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ definition: { name: 'my-workflow', description: 'test', nodes: [] } }),
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('Invalid cwd');
+  });
+});
+
+describe('DELETE /api/workflows/:name - cwd validation', () => {
+  test('returns 400 when cwd is not a registered codebase path', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/workflows/some-workflow?cwd=/etc/secrets', {
+      method: 'DELETE',
+    });
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('Invalid cwd');
+  });
+});
+
+describe('GET /api/commands - cwd validation', () => {
+  test('returns 400 when cwd is not a registered codebase path', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/commands?cwd=/etc/secrets');
+    expect(response.status).toBe(400);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toContain('Invalid cwd');
+  });
+});
+
+describe('GET /api/commands', () => {
+  test('returns commands array', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/commands');
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { commands: Array<{ name: string; source: string }> };
+    expect(Array.isArray(body.commands)).toBe(true);
+  });
+
+  test('includes bundled commands with source:bundled', async () => {
+    const app = createTestApp();
+    registerApiRoutes(app, {} as WebAdapter, {} as ConversationLockManager);
+
+    const response = await app.request('/api/commands');
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { commands: Array<{ name: string; source: string }> };
+    // archon-assist is in the real BUNDLED_COMMANDS
+    const archonAssist = body.commands.find(c => c.name === 'archon-assist');
+    expect(archonAssist).toBeDefined();
+    expect(archonAssist?.source).toBe('bundled');
+  });
+});
+
+const XAI_REFUSAL = 'Grok is reached via provider cursor (grok-4.7-high)';
+
+describe('POST /api/workflows/:name/run openrouter xAI guard', () => {
+  registerBuiltinProviders();
+  registerCommunityProviders();
+  setOpenRouterProviderIdResolver(resolveProviderId);
+
+  const defaultDiscovery = async () => ({
+    workflows: [
+      makeTestWorkflowWithSource({ name: 'deploy', description: 'Deploy app' }, 'bundled'),
+    ],
+    errors: [
+      { filename: '/tmp/.archon/workflows/bad.md', error: 'invalid', errorType: 'parse_error' },
+    ],
+  });
+
+  beforeEach(() => {
+    mockHandleMessage.mockClear();
+  });
+
+  afterEach(() => {
+    mockDiscoverWorkflows.mockImplementation(defaultDiscovery);
+  });
+
+  const request = (body: unknown) =>
+    createRunTestApp().request('/api/workflows/deploy/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+  function useWorkflow(overrides: Parameters<typeof makeTestWorkflowWithSource>[0]): void {
+    mockDiscoverWorkflows.mockImplementation(async () => ({
+      workflows: [makeTestWorkflowWithSource({ name: 'deploy', ...overrides }, 'bundled')],
+      errors: [],
+    }));
+  }
+
+  test('refuses an OpenRouter xAI modelOverride at /run', async () => {
+    useWorkflow({
+      nodes: [{ id: 'implement', prompt: 'do the work', provider: 'claude', model: 'sonnet' }],
+    });
+    for (const provider of ['openrouter', 'grok', 'opr']) {
+      mockHandleMessage.mockClear();
+      const response = await request({
+        conversationId: `refuse-${provider}`,
+        message: 'run it',
+        modelOverride: { nodes: { implement: { provider, model: 'x-ai/grok-4.7' } } },
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        accepted: false,
+        error: `openrouter_xai_refused:implement: ${XAI_REFUSAL}`,
+      });
+      expect(mockHandleMessage).not.toHaveBeenCalled();
+    }
+  });
+
+  test('accepts an open model on openrouter and grok on cursor', async () => {
+    useWorkflow({
+      nodes: [{ id: 'implement', prompt: 'do the work', provider: 'claude', model: 'sonnet' }],
+    });
+    const overrides = [
+      { provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash' },
+      { provider: 'cursor', model: 'grok-4.7-high' },
+    ];
+    for (const binding of overrides) {
+      mockHandleMessage.mockClear();
+      const response = await request({
+        conversationId: `allow-${binding.provider}`,
+        message: 'run it',
+        modelOverride: { nodes: { implement: binding } },
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ accepted: true, status: 'completed' });
+      expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  test('refuses a YAML-pinned xAI binding and accepts an overriding open model', async () => {
+    useWorkflow({
+      nodes: [
+        {
+          id: 'build',
+          prompt: 'build',
+          provider: 'openrouter',
+          model: 'x-ai/grok-4.6',
+        },
+      ],
+    });
+    const pinned = await request({ conversationId: 'yaml-a', message: 'run it' });
+    expect(pinned.status).toBe(400);
+    const pinnedBody = (await pinned.json()) as { accepted: boolean; error: string };
+    expect(pinnedBody.accepted).toBe(false);
+    expect(pinnedBody.error.startsWith('openrouter_xai_refused:build:')).toBe(true);
+
+    useWorkflow({
+      nodes: [
+        {
+          id: 'build',
+          prompt: 'build',
+          provider: 'claude',
+          model: 'sonnet',
+          failover_provider: 'grok',
+          failover_model: 'x-ai/grok-4.6',
+        },
+      ],
+    });
+    const failover = await request({ conversationId: 'yaml-b', message: 'run it' });
+    expect(failover.status).toBe(400);
+    const failoverBody = (await failover.json()) as { error: string };
+    expect(failoverBody.error.startsWith('openrouter_xai_refused:build:')).toBe(true);
+
+    useWorkflow({
+      provider: 'grok',
+      model: 'x-ai/grok-4.6',
+      nodes: [{ id: 'build', prompt: 'build' }],
+    });
+    const root = await request({ conversationId: 'yaml-c', message: 'run it' });
+    expect(root.status).toBe(400);
+    const rootBody = (await root.json()) as { error: string };
+    expect(rootBody.error.startsWith('openrouter_xai_refused:')).toBe(true);
+
+    useWorkflow({
+      nodes: [
+        {
+          id: 'build',
+          prompt: 'build',
+          provider: 'openrouter',
+          model: 'x-ai/grok-4.6',
+        },
+      ],
+    });
+    mockHandleMessage.mockClear();
+    const overridden = await request({
+      conversationId: 'yaml-a-override',
+      message: 'run it',
+      modelOverride: {
+        nodes: { build: { provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash' } },
+      },
+    });
+    expect(overridden.status).toBe(200);
+    expect(await overridden.json()).toEqual({ accepted: true, status: 'completed' });
+    expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+  });
+});

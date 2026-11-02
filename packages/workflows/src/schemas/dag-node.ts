@@ -1,0 +1,853 @@
+/**
+ * Zod schemas for DAG node types.
+ *
+ * Design: a flat "raw" schema validates all fields (with mutual exclusivity enforced via
+ * superRefine), then a transform produces one of the six concrete variant types
+ * (CommandNode, PromptNode, BashNode, LoopNode, ApprovalNode, CancelNode) as the DagNode union.
+ * Per-variant schemas (commandNodeSchema etc.) are exported for type derivation only --
+ * use dagNodeSchema for validation.
+ *
+ * z.union() is NOT used here -- YAML nodes lack an explicit `type` discriminant,
+ * so a flat schema with superRefine is cleaner than a z.union() with implicit discriminants.
+ */
+import { z } from '@hono/zod-openapi';
+import { stepRetryConfigSchema } from './retry';
+import { loopNodeConfigSchema } from './loop';
+import { workflowNodeHooksSchema } from './hooks';
+import { isValidCommandName } from '../command-validation';
+import type { ProviderExecutionCapability } from '@archon/providers/types';
+
+// ---------------------------------------------------------------------------
+// TriggerRule
+// ---------------------------------------------------------------------------
+
+export const triggerRuleSchema = z.enum([
+  'all_success',
+  'one_success',
+  'none_failed_min_one_success',
+  'all_done',
+]);
+
+export type TriggerRule = z.infer<typeof triggerRuleSchema>;
+
+/** Canonical list of trigger rules -- derived from schema, do not duplicate. */
+export const TRIGGER_RULES: readonly TriggerRule[] = triggerRuleSchema.options;
+
+// ---------------------------------------------------------------------------
+// Claude SDK option schemas
+// ---------------------------------------------------------------------------
+
+/** Claude Agent SDK effort level -- controls reasoning depth. Different from Codex modelReasoningEffort. */
+export const effortLevelSchema = z.enum(['low', 'medium', 'high', 'max', 'xhigh']);
+
+export type EffortLevel = z.infer<typeof effortLevelSchema>;
+
+/**
+ * Claude Agent SDK ThinkingConfig -- string shorthand or full object form.
+ * Shorthand: 'adaptive' -> { type: 'adaptive' }, 'enabled' -> { type: 'enabled' }, 'disabled' -> { type: 'disabled' }.
+ */
+export const thinkingConfigSchema = z.preprocess(
+  val => {
+    if (typeof val === 'string') {
+      if (val === 'adaptive') return { type: 'adaptive' };
+      if (val === 'enabled') return { type: 'enabled' };
+      if (val === 'disabled') return { type: 'disabled' };
+    }
+    return val;
+  },
+  z.discriminatedUnion('type', [
+    z.object({ type: z.literal('adaptive') }),
+    z.object({ type: z.literal('enabled'), budgetTokens: z.number().int().positive().optional() }),
+    z.object({ type: z.literal('disabled') }),
+  ])
+);
+
+export type ThinkingConfig = z.infer<typeof thinkingConfigSchema>;
+
+/**
+ * Claude Agent SDK SandboxSettings -- OS-level filesystem/network restrictions.
+ * Uses passthrough() to match the SDK's loose schema (index signature allows extra fields).
+ */
+export const sandboxSettingsSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    autoAllowBashIfSandboxed: z.boolean().optional(),
+    allowUnsandboxedCommands: z.boolean().optional(),
+    network: z
+      .object({
+        allowedDomains: z.array(z.string()).optional(),
+        allowManagedDomainsOnly: z.boolean().optional(),
+        allowUnixSockets: z.array(z.string()).optional(),
+        allowAllUnixSockets: z.boolean().optional(),
+        allowLocalBinding: z.boolean().optional(),
+        httpProxyPort: z.number().optional(),
+        socksProxyPort: z.number().optional(),
+      })
+      .optional(),
+    filesystem: z
+      .object({
+        allowWrite: z.array(z.string()).optional(),
+        denyWrite: z.array(z.string()).optional(),
+        denyRead: z.array(z.string()).optional(),
+      })
+      .optional(),
+    ignoreViolations: z.record(z.array(z.string())).optional(),
+    enableWeakerNestedSandbox: z.boolean().optional(),
+    enableWeakerNetworkIsolation: z.boolean().optional(),
+    excludedCommands: z.array(z.string()).optional(),
+    ripgrep: z
+      .object({
+        command: z.string(),
+        args: z.array(z.string()).optional(),
+      })
+      .optional(),
+  })
+  .passthrough();
+
+export type SandboxSettings = z.infer<typeof sandboxSettingsSchema>;
+
+/**
+ * Claude Agent SDK AgentDefinition -- inline sub-agent available via the Task tool.
+ * Mirrors the SDK's AgentDefinition type (sdk.d.ts), minus mcpServers and the
+ * experimental critical-reminder field.
+ */
+export const agentDefinitionSchema = z.object({
+  description: z.string().min(1, "'description' is required"),
+  prompt: z.string().min(1, "'prompt' is required"),
+  model: z.string().min(1).optional(),
+  tools: z.array(z.string().min(1)).optional(),
+  disallowedTools: z.array(z.string().min(1)).optional(),
+  skills: z.array(z.string().min(1)).optional(),
+  maxTurns: z.number().int().positive().optional(),
+});
+
+export type AgentDefinition = z.infer<typeof agentDefinitionSchema>;
+
+// Kebab-case: no leading/trailing/double hyphens (e.g. `brief-gen`, not `-brief`, `brief-`, `brief--gen`).
+const AGENT_ID_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+// ---------------------------------------------------------------------------
+// DagNodeBase -- common fields shared by all node types
+// ---------------------------------------------------------------------------
+
+export const dagNodeBaseSchema = z.object({
+  id: z.string(),
+  description: z.string().max(120).optional(),
+  depends_on: z.array(z.string()).optional(),
+  when: z.string().optional(),
+  trigger_rule: triggerRuleSchema.optional(),
+  model: z.string().optional(),
+  provider: z.string().trim().min(1).optional(),
+  context: z.enum(['fresh', 'shared']).optional(),
+  output_format: z.record(z.unknown()).optional(),
+  allowed_tools: z.array(z.string()).optional(),
+  denied_tools: z.array(z.string()).optional(),
+  idle_timeout: z.number().optional(),
+  wall_timeout_ms: z.number().int().optional(),
+  retry: stepRetryConfigSchema.optional(),
+  hooks: workflowNodeHooksSchema.optional(),
+  mcp: z.string().min(1, "'mcp' must be a non-empty string path").optional(),
+  skills: z
+    .array(z.string().min(1, 'each skill must be a non-empty string'))
+    .nonempty("'skills' must be a non-empty array")
+    .optional(),
+  agents: z
+    .record(
+      z.string().regex(AGENT_ID_REGEX, 'agent IDs must be kebab-case (a-z, 0-9, hyphen)'),
+      agentDefinitionSchema
+    )
+    .refine(map => Object.keys(map).length > 0, "'agents' must have at least one entry")
+    .optional(),
+  effort: effortLevelSchema.optional(),
+  thinking: thinkingConfigSchema.optional(),
+  maxBudgetUsd: z.number().positive().optional(),
+  systemPrompt: z.string().min(1).optional(),
+  fallbackModel: z.string().min(1).optional(),
+  betas: z.array(z.string().min(1)).nonempty("'betas' must be a non-empty array").optional(),
+  sandbox: sandboxSettingsSchema.optional(),
+  /**
+   * WO-HARNESS-NODE-PROVIDER-FAILOVER-01: node-level AVAILABILITY failover.
+   * When the primary provider call fails with an availability-class error
+   * (429 / timeout / 5xx / connection error), the DAG executor re-dispatches
+   * this ONE node exactly once on `failover_provider` (+ `failover_model` and
+   * provider-compatible `failover_agent` if given), instead of failing the run. Auth/billing/other 4xx errors do NOT
+   * failover. These are pure control-plane fields consumed by the executor's
+   * failover logic -- they are NEVER forwarded into provider/SDK options.
+   * A node with no failover_provider (and no workflow-level default) behaves
+   * exactly as before.
+   */
+  failover_provider: z.string().trim().min(1).optional(),
+  failover_model: z.string().trim().min(1).optional(),
+  /** Alternate persona for the one-shot provider failover; never used by the primary attempt. */
+  failover_agent: z.string().min(1, "'failover_agent' must be a non-empty string").optional(),
+  agent: z.string().min(1, "'agent' must be a non-empty string").optional(),
+  /**
+   * Human-facing alias for `agent:` -- resolved identically by the executor and
+   * validator (see WO-HARNESS-PERSONA-DECLARED-NOT-LOADED-01).
+   *
+   * If both `agent:` and `persona:` are set on the same node they MUST agree;
+   * conflicting values are rejected at parse time by superRefine (fail-closed,
+   * no silent precedence). Either field alone resolves to the same persona;
+   * setting both is permitted only to make a node self-documenting.
+   *
+   * Loader emits `*_node_ai_fields_ignored` warnings if `persona:` appears on
+   * a non-AI node (bash, script, approval, cancel) -- same treatment as `agent:`.
+   */
+  persona: z.string().min(1, "'persona' must be a non-empty string").optional(),
+  /**
+   * WO-170 (depends on WO-167 doctrine, not yet merged): mark this node as
+   * "load-bearing" -- its output (commit-and-push, registry write, etc.) is
+   * critical to overall workflow success. When true, the DAG executor scans
+   * stdout for `STATUS=*_failed` patterns even on exit-0 and emits
+   * `node_completed_with_warning` instead of `node_completed` so Mission
+   * Control can show a yellow state instead of false-green.
+   *
+   * Independent of load_bearing, a small set of always-dangerous patterns
+   * (push_failed, commit_failed, pr_create_failed, registry_write_failed,
+   * artifact_persist_failed, bundle_save_failed, spec_save_failed) trigger
+   * the warning state too -- those are silent-data-loss signals regardless of
+   * how the node was authored.
+   */
+  load_bearing: z.boolean().optional(),
+  /**
+   * WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01: when this node fails, end the run at
+   * once -- not-started nodes are skipped and the run fails with
+   * metadata.terminal_cause = 'repair_checkout_failed' and
+   * metadata.repair_failure_reason = the first error line starting
+   * `repair_target_`, `repair_gate_closed:` or `ERROR:`.
+   */
+  abort_run_on_failure: z.boolean().optional(),
+});
+
+export type DagNodeBase = z.infer<typeof dagNodeBaseSchema>;
+
+// ---------------------------------------------------------------------------
+// Per-variant schemas -- exported for type derivation only (use dagNodeSchema for validation)
+// ---------------------------------------------------------------------------
+
+export const commandNodeSchema = dagNodeBaseSchema.extend({
+  command: z.string(),
+});
+
+/** DAG node that runs a named command from .archon/commands/ */
+export type CommandNode = z.infer<typeof commandNodeSchema> & {
+  prompt?: never;
+  bash?: never;
+  loop?: never;
+  approval?: never;
+  cancel?: never;
+  script?: never;
+};
+
+export const promptNodeSchema = dagNodeBaseSchema.extend({
+  prompt: z.string(),
+});
+
+/** DAG node with an inline prompt (no command file) */
+export type PromptNode = z.infer<typeof promptNodeSchema> & {
+  command?: never;
+  bash?: never;
+  loop?: never;
+  approval?: never;
+  cancel?: never;
+  script?: never;
+};
+
+/**
+ * Bash node schema -- extends base with `bash` (shell script) and `timeout` (ms).
+ * AI-specific fields from the base are present in the type but ignored at runtime with a warning.
+ */
+export const bashNodeSchema = dagNodeBaseSchema.extend({
+  bash: z.string(),
+  timeout: z.number().optional(),
+});
+
+/** DAG node that runs a shell script without AI */
+export type BashNode = z.infer<typeof bashNodeSchema> & {
+  command?: never;
+  prompt?: never;
+  loop?: never;
+  approval?: never;
+  cancel?: never;
+  script?: never;
+};
+
+/**
+ * Script node schema -- extends base with `script` (inline code or named script),
+ * `runtime` ('bun' or 'uv'), `deps` (dependency list), and `timeout` (ms).
+ * AI-specific fields from the base are present in the type but ignored at runtime with a warning.
+ */
+export const scriptNodeSchema = dagNodeBaseSchema.extend({
+  script: z.string().min(1, 'script cannot be empty'),
+  runtime: z.enum(['bun', 'uv']),
+  deps: z.array(z.string().min(1, 'each dep must be a non-empty string')).optional(),
+  timeout: z.number().optional(),
+});
+
+/** DAG node that runs a TypeScript or Python script via bun or uv */
+export type ScriptNode = z.infer<typeof scriptNodeSchema> & {
+  command?: never;
+  prompt?: never;
+  bash?: never;
+  loop?: never;
+  approval?: never;
+  cancel?: never;
+};
+
+export const evidenceNodeSchema = dagNodeBaseSchema.extend({
+  evidence: z.object({
+    kind: z.literal('manifest_v2'),
+    required_gates: z.array(z.string().min(1)).min(1),
+  }),
+});
+
+/** Engine-side mechanical evidence collection. Never delegates facts to an AI provider. */
+export type EvidenceNode = z.infer<typeof evidenceNodeSchema> & {
+  command?: never;
+  prompt?: never;
+  bash?: never;
+  loop?: never;
+  approval?: never;
+  cancel?: never;
+  script?: never;
+};
+
+/**
+ * Loop node schema -- extends base with `loop` config.
+ * AI-specific fields (provider, model, agent, persona, etc.) are supported on loop nodes
+ * and flow through to the executor for per-node provider and persona resolution.
+ * Fields that the loop executor does not consume (context, output_format, etc.) pass
+ * through the transform unchanged; the loader emits a warning for those fields.
+ * retry is not supported on loop nodes (enforced at parse time).
+ */
+export const loopNodeSchema = dagNodeBaseSchema.extend({
+  loop: loopNodeConfigSchema,
+});
+
+/** DAG node that runs an AI prompt in a loop until a completion condition is met */
+export type LoopNode = z.infer<typeof loopNodeSchema> & {
+  command?: never;
+  prompt?: never;
+  bash?: never;
+  approval?: never;
+  cancel?: never;
+  script?: never;
+};
+
+/** Schema for the `on_reject` sub-object on approval nodes. */
+export const approvalOnRejectSchema = z.object({
+  prompt: z.string().min(1, "'on_reject.prompt' must be a non-empty string"),
+  max_attempts: z.number().int().min(1).max(10).optional(),
+});
+
+export type ApprovalOnReject = z.infer<typeof approvalOnRejectSchema>;
+
+/**
+ * Approval node schema -- pauses the workflow for human review.
+ * Extends full base for type compatibility; AI-specific fields are ignored at runtime.
+ */
+export const approvalNodeSchema = dagNodeBaseSchema.extend({
+  approval: z.object({
+    message: z.string().min(1, "'approval.message' must not be empty"),
+    capture_response: z.boolean().optional(),
+    on_reject: approvalOnRejectSchema.optional(),
+    choices: z.array(z.enum(['approve_as_is', 'approve_with_fix', 'reject'])).optional(),
+  }),
+});
+
+/** DAG node that pauses workflow execution for human approval */
+export type ApprovalNode = z.infer<typeof approvalNodeSchema> & {
+  command?: never;
+  prompt?: never;
+  bash?: never;
+  loop?: never;
+  cancel?: never;
+  script?: never;
+};
+
+/**
+ * Cancel node schema -- terminates the workflow run with a reason string.
+ * Extends full base for type compatibility; AI-specific fields are ignored at runtime.
+ */
+export const cancelNodeSchema = dagNodeBaseSchema.extend({
+  cancel: z.string().min(1, "'cancel' reason must not be empty"),
+});
+
+/** DAG node that cancels the workflow run with a reason string */
+export type CancelNode = z.infer<typeof cancelNodeSchema> & {
+  command?: never;
+  prompt?: never;
+  bash?: never;
+  loop?: never;
+  approval?: never;
+  script?: never;
+};
+
+/** A single node in a DAG workflow. command, prompt, bash, loop, approval, cancel, and script are mutually exclusive. */
+export type DagNode =
+  | CommandNode
+  | PromptNode
+  | BashNode
+  | LoopNode
+  | ApprovalNode
+  | CancelNode
+  | ScriptNode
+  | EvidenceNode;
+
+const REPOSITORY_READ_TOOLS = new Set(['read', 'grep', 'glob', 'search']);
+const REPOSITORY_WRITE_TOOLS = new Set(['edit', 'write', 'applypatch', 'notebookedit']);
+const SHELL_TOOLS = new Set(['bash', 'shell', 'terminal', 'execute']);
+
+/**
+ * Derive the minimum provider execution authority required by an AI node.
+ * This is intentionally mechanical and does not inspect prompt prose. Text-only
+ * planning and review remain eligible for chat providers unless the node declares
+ * repository tools or occupies a known builder/repair seat.
+ */
+export function deriveNodeExecutionRequirements(node: DagNode): ProviderExecutionCapability[] {
+  if (!('command' in node) && !('prompt' in node) && !('loop' in node)) return [];
+
+  const required = new Set<ProviderExecutionCapability>(['text']);
+  const requireRepositoryExecution = (): void => {
+    required.add('repositoryRead');
+    required.add('repositoryWrite');
+    required.add('shell');
+  };
+
+  // Provider defaults may include repository write and shell tools. When an AI
+  // node does not declare a tool posture, treating it as text-only would grant a
+  // chat-only provider a seat that can mutate the repository at runtime. An
+  // explicit empty list is the mechanical declaration for a text-only node.
+  if (node.allowed_tools === undefined) requireRepositoryExecution();
+
+  const persona = (node.persona ?? node.agent ?? '').toLowerCase();
+  const builderPersona = persona === 'major-build' || persona.startsWith('major-build-');
+  const canonicalBuilderSeat = /^(implement|build|.*-repair)$/i.test(node.id);
+  if (canonicalBuilderSeat || (builderPersona && 'loop' in node)) {
+    requireRepositoryExecution();
+  }
+
+  if (
+    'command' in node &&
+    typeof node.command === 'string' &&
+    /(^|[-_/])(implement|repair|build)([-_/]|$)/i.test(node.command)
+  ) {
+    requireRepositoryExecution();
+  }
+
+  for (const rawTool of node.allowed_tools ?? []) {
+    const tool = rawTool.toLowerCase().replace(/[^a-z]/g, '');
+    if (REPOSITORY_READ_TOOLS.has(tool)) required.add('repositoryRead');
+    if (REPOSITORY_WRITE_TOOLS.has(tool)) {
+      required.add('repositoryRead');
+      required.add('repositoryWrite');
+    }
+    if (SHELL_TOOLS.has(tool)) requireRepositoryExecution();
+  }
+
+  const order: readonly ProviderExecutionCapability[] = [
+    'text',
+    'repositoryRead',
+    'repositoryWrite',
+    'shell',
+  ];
+  return order.filter(capability => required.has(capability));
+}
+
+// ---------------------------------------------------------------------------
+// AI-specific fields that are meaningless on non-AI nodes
+// ---------------------------------------------------------------------------
+
+/** AI-specific fields that are meaningless on bash nodes -- exported for loader warnings */
+export const BASH_NODE_AI_FIELDS: readonly string[] = [
+  'provider',
+  'model',
+  'context',
+  'output_format',
+  'allowed_tools',
+  'denied_tools',
+  'hooks',
+  'mcp',
+  'skills',
+  'agents',
+  'effort',
+  'thinking',
+  'maxBudgetUsd',
+  'systemPrompt',
+  'fallbackModel',
+  'betas',
+  'sandbox',
+  'agent',
+  'persona',
+  'failover_provider',
+  'failover_model',
+  'failover_agent',
+];
+
+/** AI-specific fields that are meaningless on script nodes -- same as bash nodes */
+export const SCRIPT_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS;
+
+/**
+ * AI-specific fields that are unsupported on loop nodes.
+ * `model`, `provider`, `agent`, `persona`, and the `failover_*` fields are excluded
+ * -- the DAG executor resolves and forwards them to each iteration's AI call, and
+ * failover applies to loop nodes as well as prompt nodes
+ * (WO-HARNESS-NODE-PROVIDER-FAILOVER-01). `persona` is the human-facing alias for
+ * `agent` (see dagNodeBaseSchema).
+ */
+export const LOOP_NODE_AI_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter(
+  f =>
+    f !== 'model' &&
+    f !== 'provider' &&
+    f !== 'agent' &&
+    f !== 'persona' &&
+    f !== 'failover_provider' &&
+    f !== 'failover_model' &&
+    f !== 'failover_agent'
+);
+
+// ---------------------------------------------------------------------------
+// dagNodeSchema -- flat validation schema with transform to DagNode
+// ---------------------------------------------------------------------------
+
+/**
+ * Validates a raw YAML object as a DAG node and transforms it to a typed DagNode.
+ *
+ * Enforces:
+ * - Non-empty id
+ * - Exactly one of command/prompt/bash/loop (mutual exclusivity)
+ * - command name validity (via isValidCommandName)
+ * - idle_timeout must be a finite positive number
+ * - retry not allowed on loop nodes
+ * - timeout on bash must be positive
+ *
+ * Note: provider identity is validated in loader.ts (workflow-level) and
+ * dag-executor.ts (node-level). Model strings are passed through to the SDK
+ * unchanged -- the SDK is the source of truth for what model names exist.
+ */
+export const dagNodeSchema = dagNodeBaseSchema
+  .extend({
+    // Mode fields (exactly one required)
+    command: z.string().optional(),
+    prompt: z.string().optional(),
+    bash: z.string().optional(),
+    loop: loopNodeConfigSchema.optional(),
+    approval: z
+      .object({
+        message: z.string().min(1, "'approval.message' must not be empty"),
+        capture_response: z.boolean().optional(),
+        on_reject: approvalOnRejectSchema.optional(),
+        choices: z.array(z.enum(['approve_as_is', 'approve_with_fix', 'reject'])).optional(),
+      })
+      .optional(),
+    cancel: z.string().optional(),
+    // Script-only
+    script: z.string().optional(),
+    evidence: z
+      .object({
+        kind: z.literal('manifest_v2'),
+        required_gates: z.array(z.string().min(1)).min(1),
+      })
+      .optional(),
+    runtime: z.enum(['bun', 'uv']).optional(),
+    deps: z.array(z.string().min(1, 'each dep must be a non-empty string')).optional(),
+    // Bash/Script shared
+    timeout: z.number().optional(),
+  })
+  .superRefine((data, ctx) => {
+    const id = data.id.trim();
+
+    // id must be non-empty
+    if (!id) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "missing required field 'id'",
+        path: ['id'],
+      });
+      return z.NEVER;
+    }
+
+    const hasCommand = typeof data.command === 'string' && data.command.trim().length > 0;
+    const hasPrompt = typeof data.prompt === 'string' && data.prompt.trim().length > 0;
+    const hasBash = typeof data.bash === 'string' && data.bash.trim().length > 0;
+    const hasLoop = data.loop !== undefined;
+    const hasApproval = data.approval !== undefined;
+    const hasCancel = typeof data.cancel === 'string' && data.cancel.trim().length > 0;
+    const hasScript = typeof data.script === 'string' && data.script.trim().length > 0;
+    const hasEvidence = data.evidence !== undefined;
+
+    const modeCount = [
+      hasCommand,
+      hasPrompt,
+      hasBash,
+      hasLoop,
+      hasApproval,
+      hasCancel,
+      hasScript,
+      hasEvidence,
+    ].filter(Boolean).length;
+
+    if (modeCount > 1) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "'command', 'prompt', 'bash', 'loop', 'approval', 'cancel', 'script', and 'evidence' are mutually exclusive",
+      });
+      return z.NEVER;
+    }
+    if (modeCount === 0) {
+      if (typeof data.bash === 'string') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'bash script cannot be empty',
+          path: ['bash'],
+        });
+        return z.NEVER;
+      }
+      if (typeof data.prompt === 'string') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'prompt cannot be empty',
+          path: ['prompt'],
+        });
+        return z.NEVER;
+      }
+      if (typeof data.script === 'string') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'script cannot be empty',
+          path: ['script'],
+        });
+        return z.NEVER;
+      }
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "must have either 'command', 'prompt', 'bash', 'loop', 'approval', 'cancel', 'script', or 'evidence'",
+      });
+      return z.NEVER;
+    }
+
+    // Command name validation
+    if (hasCommand && !isValidCommandName((data.command ?? '').trim())) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `invalid command name "${(data.command ?? '').trim()}"`,
+        path: ['command'],
+      });
+    }
+
+    // Bash node validations
+    if (hasBash) {
+      if (data.timeout !== undefined && (data.timeout <= 0 || !isFinite(data.timeout))) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'timeout' must be a positive number (ms)",
+          path: ['timeout'],
+        });
+      }
+    }
+
+    // Script node validations
+    if (hasScript) {
+      if (data.runtime === undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'runtime' is required for script nodes ('bun' or 'uv')",
+          path: ['runtime'],
+        });
+      }
+      if (data.timeout !== undefined && (data.timeout <= 0 || !isFinite(data.timeout))) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'timeout' must be a positive number (ms)",
+          path: ['timeout'],
+        });
+      }
+    }
+
+    // Loop node: retry not supported
+    if (hasLoop && data.retry !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "'retry' is not supported on loop nodes (loop manages its own iteration)",
+        path: ['retry'],
+      });
+    }
+
+    // idle_timeout must be finite and positive
+    if (
+      data.idle_timeout !== undefined &&
+      (data.idle_timeout <= 0 || !isFinite(data.idle_timeout))
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "'idle_timeout' must be a finite positive number (ms)",
+        path: ['idle_timeout'],
+      });
+    }
+
+    // wall_timeout_ms is a per-loop-iteration absolute cap, bounded to prevent
+    // accidental runaway or unusably short workflow YAML.
+    if (
+      data.wall_timeout_ms !== undefined &&
+      (!isFinite(data.wall_timeout_ms) ||
+        data.wall_timeout_ms < 60_000 ||
+        data.wall_timeout_ms > 3_600_000)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "'wall_timeout_ms' must be a finite integer between 60000 and 3600000 (ms)",
+        path: ['wall_timeout_ms'],
+      });
+    }
+
+    // persona/agent conflict: both fields allowed only if they agree.
+    // Fail-closed: no silent precedence (see WO-HARNESS-PERSONA-DECLARED-NOT-LOADED-01).
+    if (data.persona !== undefined && data.agent !== undefined && data.persona !== data.agent) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `'persona' ('${data.persona}') and 'agent' ('${data.agent}') must agree -- they resolve to the same persona. Set only one, or set both to the same value.`,
+        path: ['persona'],
+      });
+    }
+  })
+  .transform((data): DagNode => {
+    const id = data.id.trim();
+
+    // Common base fields (sparse -- only include defined values)
+    const base = {
+      id,
+      ...(data.description !== undefined ? { description: data.description } : {}),
+      ...(data.depends_on !== undefined && data.depends_on.length > 0
+        ? { depends_on: data.depends_on }
+        : {}),
+      ...(data.when !== undefined ? { when: data.when } : {}),
+      ...(data.trigger_rule !== undefined ? { trigger_rule: data.trigger_rule } : {}),
+      ...(data.idle_timeout !== undefined ? { idle_timeout: data.idle_timeout } : {}),
+      ...(data.wall_timeout_ms !== undefined ? { wall_timeout_ms: data.wall_timeout_ms } : {}),
+      ...(data.abort_run_on_failure !== undefined
+        ? { abort_run_on_failure: data.abort_run_on_failure }
+        : {}),
+    };
+
+    // Shared optional fields (valid on AI and bash nodes)
+    const shared = {
+      ...(data.retry !== undefined ? { retry: data.retry } : {}),
+    };
+
+    // AI-only fields (not applicable to bash, script, approval, or cancel nodes;
+    // loop nodes use provider, model, agent, and persona from this object)
+    const aiOnly = {
+      ...(data.model !== undefined ? { model: data.model } : {}),
+      ...(data.provider !== undefined ? { provider: data.provider } : {}),
+      ...(data.context !== undefined ? { context: data.context } : {}),
+      ...(data.output_format !== undefined ? { output_format: data.output_format } : {}),
+      ...(data.allowed_tools !== undefined ? { allowed_tools: data.allowed_tools } : {}),
+      ...(data.denied_tools !== undefined ? { denied_tools: data.denied_tools } : {}),
+      ...(data.hooks !== undefined ? { hooks: data.hooks } : {}),
+      ...(data.mcp !== undefined ? { mcp: data.mcp.trim() } : {}),
+      ...(data.skills !== undefined ? { skills: data.skills.map(s => s.trim()) } : {}),
+      ...(data.agents !== undefined ? { agents: data.agents } : {}),
+      ...(data.effort !== undefined ? { effort: data.effort } : {}),
+      ...(data.thinking !== undefined ? { thinking: data.thinking } : {}),
+      ...(data.maxBudgetUsd !== undefined ? { maxBudgetUsd: data.maxBudgetUsd } : {}),
+      ...(data.systemPrompt !== undefined ? { systemPrompt: data.systemPrompt } : {}),
+      ...(data.fallbackModel !== undefined ? { fallbackModel: data.fallbackModel } : {}),
+      ...(data.betas !== undefined ? { betas: data.betas } : {}),
+      ...(data.sandbox !== undefined ? { sandbox: data.sandbox } : {}),
+      // Control-plane failover fields (WO-HARNESS-NODE-PROVIDER-FAILOVER-01).
+      // Populated onto the parsed node so the DAG executor can read
+      // node.failover_provider/node.failover_model/node.failover_agent. NOT forwarded into
+      // nodeConfig/SDK options (see dag-executor.ts dispatch sites).
+      ...(data.failover_provider !== undefined
+        ? { failover_provider: data.failover_provider }
+        : {}),
+      ...(data.failover_model !== undefined ? { failover_model: data.failover_model } : {}),
+      ...(data.failover_agent !== undefined ? { failover_agent: data.failover_agent } : {}),
+      ...(data.agent !== undefined ? { agent: data.agent } : {}),
+      ...(data.persona !== undefined ? { persona: data.persona } : {}),
+    };
+
+    if (data.command !== undefined && data.command.trim().length > 0) {
+      return { ...base, ...shared, ...aiOnly, command: data.command.trim() } as CommandNode;
+    }
+    if (data.prompt !== undefined && data.prompt.trim().length > 0) {
+      return { ...base, ...shared, ...aiOnly, prompt: data.prompt.trim() } as PromptNode;
+    }
+    if (data.bash !== undefined && data.bash.trim().length > 0) {
+      return {
+        ...base,
+        ...shared,
+        bash: data.bash.trim(),
+        ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
+      } as BashNode;
+    }
+    if (data.script !== undefined && data.script.trim().length > 0) {
+      // runtime is guaranteed by superRefine to be defined at this point
+      if (!data.runtime) throw new Error('unreachable: runtime must be defined for script nodes');
+      return {
+        ...base,
+        ...shared,
+        script: data.script.trim(),
+        runtime: data.runtime,
+        ...(data.deps !== undefined ? { deps: data.deps } : {}),
+        ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
+      } as ScriptNode;
+    }
+    if (data.evidence !== undefined) {
+      return { ...base, evidence: data.evidence } as EvidenceNode;
+    }
+    if (data.approval !== undefined) {
+      return { ...base, ...shared, approval: data.approval } as ApprovalNode;
+    }
+    if (data.cancel !== undefined && data.cancel.trim().length > 0) {
+      return { ...base, ...shared, cancel: data.cancel.trim() } as CancelNode;
+    }
+    // loop -- guaranteed by superRefine to be defined at this point
+    if (!data.loop) throw new Error('unreachable: loop must be defined after superRefine');
+    // Spread ...shared and ...aiOnly exactly like command/prompt branches do.
+    // agent and persona are already included in aiOnly (see lines above); the old
+    // explicit spreads are removed to avoid duplicate keys.
+    return { ...base, ...shared, ...aiOnly, loop: data.loop } as LoopNode;
+  })
+  .openapi('DagNode');
+
+// ---------------------------------------------------------------------------
+// Type guards (preserved from original types.ts)
+// ---------------------------------------------------------------------------
+
+/** Type guard: check if a DAG node is a bash (shell script) node */
+export function isBashNode(node: DagNode): node is BashNode {
+  return 'bash' in node && typeof node.bash === 'string';
+}
+
+/** Type guard: check if a DAG node is a loop (iterative) node */
+export function isLoopNode(node: DagNode): node is LoopNode {
+  return 'loop' in node && typeof node.loop === 'object' && node.loop !== null;
+}
+
+/** Type guard: check if a DAG node is an approval (human-in-the-loop) node */
+export function isApprovalNode(node: DagNode): node is ApprovalNode {
+  return 'approval' in node && typeof node.approval === 'object' && node.approval !== null;
+}
+
+/** Type guard: check if a DAG node is a cancel (workflow termination) node */
+export function isCancelNode(node: DagNode): node is CancelNode {
+  return 'cancel' in node && typeof node.cancel === 'string';
+}
+
+/** Type guard: check if a DAG node is a script node */
+export function isScriptNode(node: DagNode): node is ScriptNode {
+  return 'script' in node && typeof node.script === 'string';
+}
+
+/** Type guard: check if a node collects engine-side mechanical evidence. */
+export function isEvidenceNode(node: DagNode): node is EvidenceNode {
+  return 'evidence' in node && node.evidence?.kind === 'manifest_v2';
+}
+
+/** Type guard: validates a value is a known TriggerRule */
+export function isTriggerRule(value: unknown): value is TriggerRule {
+  return typeof value === 'string' && (TRIGGER_RULES as readonly string[]).includes(value);
+}

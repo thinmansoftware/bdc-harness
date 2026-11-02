@@ -1,0 +1,53 @@
+# M-131 Phase A seat compose example (WO-HARNESS-M131-PHASE-A-GROK-SEAT-PROOF-01).
+#
+# Static example only: `docker compose -f deploy/m131-seat/docker-compose.example.yml
+# config` must render with the synthetic placeholders below. Building on a
+# live host, installing a real credential at the secret-ingress path, and
+# starting the service are separately gated (#1327 + John's current
+# authority) and never part of a source PR. No literal secret appears here.
+services:
+  bdc-seat-grok:
+    build:
+      context: ../..
+      dockerfile: deploy/m131-seat/Dockerfile
+      args:
+        BUILD_SHA: "${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}"
+    image: bdc-seat-grok:${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}
+    container_name: bdc-seat-grok
+    # Non-root seat user baked into the image; restated here so the contract
+    # is visible and testable at the compose layer too.
+    user: "10001:10001"
+    restart: unless-stopped
+    environment:
+      SEAT_BUILD_SHA: "${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}"
+    volumes:
+      # Seat config (worker identity, Grok-only allowlist). Read-only.
+      - ./config.seat.example.json:/app/config/seat.json:ro
+      # #1327 secret-ingress: exactly ONE read-only credential file. The
+      # host-side path is a placeholder; installing the real file is a
+      # separately gated John action.
+      - ${M131_GROK_SECRET_INGRESS:-./placeholder/grok-credential.json}:/run/m131/secret-ingress/grok-credential.json:ro
+      # Operator token file (drop-box auth), read-only, never an env value.
+      - ${M131_OPERATOR_TOKEN_FILE:-./placeholder/archon-operator-token}:/run/m131/operator-token/archon-operator-token:ro
+      # Seat-private WRITABLE vendor profile: the provider process in this
+      # seat is the single active refresh writer. Never shared across seats.
+      - m131-grok-vendor-profile:/home/seat/.grok
+      # Separate non-secret state volume, distinct from the vendor profile.
+      - m131-grok-state:/var/lib/bdc-seat
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bun",
+          "run",
+          "scripts/dispatch-worker/seat-preflight.ts",
+          "--config",
+          "/app/config/seat.json",
+        ]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+
+volumes:
+  m131-grok-vendor-profile:
+  m131-grok-state:

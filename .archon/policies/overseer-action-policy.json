@@ -1,0 +1,16 @@
+{
+  "schema_version": "overseer-action-policy-v1",
+  "entries": [
+    {
+      "owner": "thinmansoftware",
+      "repository": "bdc-harness",
+      "base_branch": "dev",
+      "resulting_deployment_effect": "staging",
+      "allowed_action_kinds": [
+        "MERGE"
+      ],
+      "credential_principal": "overseer-merge-manager-v1",
+      "policy_digest": "297609b5438bf0804402526a7d368d9aab6ef8a78f15aecae9b6d133615c32b4"
+    }
+  ]
+}

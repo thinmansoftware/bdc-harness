@@ -1,0 +1,411 @@
+import {
+  chmod,
+  copyFile,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from 'node:fs/promises';
+import { basename, join, resolve, sep } from 'node:path';
+import { CODEX_JUDGE_CLI_VERSION as CODEX_VERSION } from '../packages/overseer/src/judge-transport';
+
+const SPOOL = process.env.OVERSEER_REVIEW_SPOOL ?? '/var/lib/overseer-review';
+const FORBIDDEN_ENV = /^(?:GITHUB_|GH_|ARCHON_)|(?:_TOKEN|_KEY|_SECRET)$/;
+
+interface BrokerJob {
+  version: 1;
+  id: string;
+  checkout: string;
+  expectedHead: string;
+  argv: string[];
+  prompt?: string;
+  /** Model jobs only: the trusted parent's configured model wall clock. */
+  timeoutMs?: number;
+}
+
+interface BrokerResult {
+  id: string;
+  ok: boolean;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  uid: number;
+  reason?: string;
+  outputTruncated?: boolean;
+  timedOut?: boolean;
+}
+
+const OUTPUT_LIMIT = 128 * 1024;
+const EXECUTION_TIMEOUT_MS = 60_000;
+/** A model job streams `codex exec --json` events, far larger than check output. */
+const MODEL_OUTPUT_LIMIT = 4 * 1024 * 1024;
+const MODEL_TIMEOUT_MAX_MS = 30 * 60_000;
+
+function positiveInteger(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Per-child deadline and retained-output byte limit (S4). Read once from the
+ * broker's own env -i start environment; the defaults apply in production.
+ */
+export function brokerLimits(env: Record<string, string | undefined> = process.env): {
+  timeoutMs: number;
+  outputLimit: number;
+} {
+  return {
+    timeoutMs: positiveInteger(env.OVERSEER_REVIEW_CHECK_TIMEOUT_MS, EXECUTION_TIMEOUT_MS),
+    outputLimit: positiveInteger(env.OVERSEER_REVIEW_OUTPUT_LIMIT_BYTES, OUTPUT_LIMIT),
+  };
+}
+const PINNED_CODEX_PREFIX = ['bunx', '--offline', `@openai/codex@${CODEX_VERSION}`];
+
+/** Model jobs: pinned sandbox argv through --cd <checkout>, then --model <token>. */
+function isPinnedModelArgv(argv: string[], checkout: string): boolean {
+  const expected = [
+    ...PINNED_CODEX_PREFIX,
+    '-c',
+    'web_search="disabled"',
+    'exec',
+    '--json',
+    '--sandbox',
+    'workspace-write',
+    '-c',
+    'sandbox_workspace_write.network_access=false',
+    '--skip-git-repo-check',
+    '--cd',
+    checkout,
+  ];
+  if (argv.length !== expected.length + 2) return false;
+  for (let index = 0; index < expected.length; index += 1) {
+    if (argv[index] !== expected[index]) return false;
+  }
+  const model = argv[expected.length + 1];
+  return argv[expected.length] === '--model' && typeof model === 'string' && model.length > 0;
+}
+
+/** Model jobs only: point the pinned argv's --cd at the reviewer's working copy. */
+export function rebindModelArgv(argv: string[], checkout: string, workingCopy: string): string[] {
+  const index = argv.indexOf('--cd');
+  if (index < 0 || argv[index + 1] !== checkout) throw new Error('model_argv_invalid');
+  return argv.map((value, position) => (position === index + 1 ? workingCopy : value));
+}
+
+/**
+ * Model jobs run in a reviewer-only copy of the sealed checkout (#4291). codex
+ * 0.159.2 builds `workspace-write` with bubblewrap, which must create mount
+ * points (live: `.agents`) in the workspace root, and the sealed checkout is
+ * read-only for the reviewer by design. The copy lives in this job's 0700
+ * scratch, so it is removed with the scratch and the cached checkout stays
+ * sealed.
+ */
+export async function prepareModelWorkingCopy(
+  checkout: string,
+  scratch: string,
+  expectedHead: string,
+  env: Record<string, string>
+): Promise<string> {
+  const workingCopy = join(scratch, 'co');
+  const copied = await runBrokerProcess(
+    ['cp', '-R', '--no-dereference', '--preserve=mode,timestamps', `${checkout}/.`, workingCopy],
+    scratch,
+    env,
+    undefined,
+    { timeoutMs: 120_000 }
+  );
+  if (copied.exitCode !== 0 || copied.timedOut || copied.outputTruncated)
+    throw new Error('working_copy_failed');
+  // The copy is the reviewer's own: writable throughout (the judge may run
+  // tests), closed to everyone else at its root.
+  const writable = await runBrokerProcess(['chmod', '-R', 'u+rwX', workingCopy], scratch, env);
+  if (writable.exitCode !== 0) throw new Error('working_copy_failed');
+  await chmod(workingCopy, 0o700);
+  const head = await runBrokerProcess(
+    ['git', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'],
+    workingCopy,
+    env
+  );
+  if (head.exitCode !== 0 || head.stdout.trim() !== expectedHead)
+    throw new Error('checkout_identity_failure');
+  return workingCopy;
+}
+
+function inside(path: string, root: string): boolean {
+  return path === root || path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
+}
+
+function validJob(value: unknown): value is BrokerJob {
+  if (!value || typeof value !== 'object') return false;
+  const job = value as Partial<BrokerJob>;
+  return (
+    job.version === 1 &&
+    typeof job.id === 'string' &&
+    /^[a-zA-Z0-9_-]{1,80}$/.test(job.id) &&
+    typeof job.checkout === 'string' &&
+    /^[0-9a-f]{40}$/.test(job.expectedHead ?? '') &&
+    Array.isArray(job.argv) &&
+    job.argv.length > 0 &&
+    job.argv.every(
+      value => typeof value === 'string' && value.length > 0 && !value.includes('\0')
+    ) &&
+    (job.prompt === undefined || typeof job.prompt === 'string') &&
+    (job.timeoutMs === undefined ||
+      (job.prompt !== undefined &&
+        Number.isSafeInteger(job.timeoutMs) &&
+        job.timeoutMs > 0 &&
+        job.timeoutMs <= MODEL_TIMEOUT_MAX_MS))
+  );
+}
+
+/**
+ * Drop an incomplete trailing UTF-8 sequence left by a byte-limit cut, so the
+ * decoded text re-encodes to at most the retained byte count (no U+FFFD).
+ */
+function trimPartialUtf8(bytes: Buffer): Buffer {
+  let start = bytes.length - 1;
+  let continuation = 0;
+  while (start >= 0 && continuation < 3 && (bytes[start] & 0xc0) === 0x80) {
+    start -= 1;
+    continuation += 1;
+  }
+  if (start < 0) return bytes;
+  const lead = bytes[start];
+  const width = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+  return width > continuation + 1 ? bytes.subarray(0, start) : bytes;
+}
+
+export async function runBrokerProcess(
+  argv: string[],
+  cwd: string,
+  env: Record<string, string>,
+  prompt?: string,
+  options: { timeoutMs?: number; outputLimit?: number } = {}
+): Promise<{
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  outputTruncated: boolean;
+  timedOut: boolean;
+}> {
+  const child = Bun.spawn(['setsid', '--', ...argv], {
+    cwd,
+    env,
+    stdin: prompt === undefined ? 'ignore' : 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  // Streaming capture bounded in BYTES across both streams. Chunks past the
+  // limit are drained and discarded, so a flooding child can never grow the
+  // broker's memory, and crossing the limit kills the whole process group.
+  const limit = options.outputLimit ?? OUTPUT_LIMIT;
+  const retained: { stdout: Uint8Array[]; stderr: Uint8Array[] } = { stdout: [], stderr: [] };
+  let retainedBytes = 0;
+  let outputTruncated = false;
+  const killGroup = (signal: 'SIGTERM' | 'SIGKILL'): void => {
+    try {
+      process.kill(-child.pid, signal);
+    } catch {
+      try {
+        child.kill(signal);
+      } catch {
+        // Already gone.
+      }
+    }
+  };
+  const consume = async (
+    stream: ReadableStream<Uint8Array> | null,
+    into: Uint8Array[]
+  ): Promise<void> => {
+    if (!stream) return;
+    const reader = stream.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const remaining = limit - retainedBytes;
+        if (value.byteLength > remaining) {
+          if (remaining > 0) into.push(value.subarray(0, remaining));
+          retainedBytes = limit;
+          if (!outputTruncated) {
+            outputTruncated = true;
+            killGroup('SIGKILL');
+          }
+        } else {
+          into.push(value);
+          retainedBytes += value.byteLength;
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  };
+  const capture = Promise.all([
+    consume(child.stdout, retained.stdout),
+    consume(child.stderr, retained.stderr),
+  ]);
+  if (prompt !== undefined) {
+    const stdin = child.stdin;
+    if (!stdin) throw new Error('broker_stdin_unavailable');
+    void Promise.resolve(stdin.write(prompt))
+      .then(() => stdin.end())
+      .catch(() => undefined);
+  }
+  let timer: Timer | undefined;
+  let timedOut = false;
+  const timeout = new Promise<number>(resolveTimeout => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      killGroup('SIGTERM');
+      setTimeout(() => {
+        killGroup('SIGKILL');
+      }, 250).unref?.();
+      resolveTimeout(124);
+    }, options.timeoutMs ?? EXECUTION_TIMEOUT_MS);
+  });
+  const completed = (async (): Promise<number> => {
+    const code = await child.exited;
+    await capture;
+    return code;
+  })();
+  const exitCode = await Promise.race([completed, timeout]);
+  if (timer) clearTimeout(timer);
+  if (exitCode === 124) await Promise.race([capture, Bun.sleep(1_000)]);
+  // Belt and braces: never leave a descendant behind, even after a clean exit
+  // of the group leader (a background child would otherwise outlive the job).
+  killGroup('SIGKILL');
+  const decode = (chunks: Uint8Array[]): string =>
+    new TextDecoder().decode(
+      trimPartialUtf8(Buffer.concat(chunks.map(chunk => Buffer.from(chunk))))
+    );
+  return {
+    exitCode,
+    stdout: decode(retained.stdout),
+    stderr: decode(retained.stderr),
+    outputTruncated,
+    timedOut,
+  };
+}
+
+export async function processJob(
+  path: string,
+  spool = SPOOL,
+  limits: { timeoutMs: number; outputLimit: number } = brokerLimits()
+): Promise<BrokerResult> {
+  const id = basename(path, '.request.json');
+  const scratch = join(spool, `${id}.scratch`);
+  try {
+    const raw = JSON.parse(await readFile(path, 'utf8')) as unknown;
+    if (!validJob(raw) || raw.id !== id) throw new Error('invalid_job');
+    const job = raw;
+    const spoolReal = await realpath(spool);
+    const checkout = await realpath(job.checkout);
+    if (!inside(checkout, spoolReal)) throw new Error('checkout_outside_spool');
+    const info = await stat(checkout);
+    if (!info.isDirectory()) throw new Error('checkout_invalid');
+    if (job.prompt !== undefined && !isPinnedModelArgv(job.argv, checkout)) {
+      throw new Error('model_argv_invalid');
+    }
+
+    const codexHome = join(scratch, 'codex');
+    const temp = join(scratch, 'tmp');
+    await mkdir(codexHome, { recursive: true, mode: 0o700 });
+    await mkdir(temp, { recursive: true, mode: 0o700 });
+    await chmod(scratch, 0o700);
+    const login = '/home/reviewer/.codex/auth.json';
+    try {
+      await copyFile(login, join(codexHome, 'auth.json'));
+      await chmod(join(codexHome, 'auth.json'), 0o600);
+    } catch {
+      if (job.prompt !== undefined) throw new Error('reviewer_auth_missing');
+    }
+    const env = {
+      PATH: '/usr/local/bin:/usr/bin:/bin',
+      HOME: '/home/reviewer',
+      TMPDIR: temp,
+      CODEX_HOME: codexHome,
+      LANG: 'C.UTF-8',
+    };
+    if (Object.keys(env).some(name => FORBIDDEN_ENV.test(name)))
+      throw new Error('unsafe_environment');
+    const head = await runBrokerProcess(
+      ['git', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'],
+      checkout,
+      env
+    );
+    if (head.exitCode !== 0 || head.stdout.trim() !== job.expectedHead)
+      throw new Error('checkout_identity_failure');
+
+    const workdir =
+      job.prompt === undefined
+        ? checkout
+        : await prepareModelWorkingCopy(checkout, scratch, job.expectedHead, env);
+    const command =
+      job.prompt === undefined
+        ? [...PINNED_CODEX_PREFIX, '-C', checkout, 'sandbox', '--', ...job.argv]
+        : rebindModelArgv(job.argv, checkout, workdir);
+    if (job.prompt !== undefined && !isPinnedModelArgv(command, workdir)) {
+      throw new Error('model_argv_invalid');
+    }
+    const version = await runBrokerProcess([...PINNED_CODEX_PREFIX, '--version'], workdir, env);
+    if (version.exitCode !== 0 || !version.stdout.includes(CODEX_VERSION))
+      throw new Error('landlock_unsupported');
+    const jobLimits =
+      job.prompt === undefined
+        ? limits
+        : {
+            timeoutMs: job.timeoutMs ?? limits.timeoutMs,
+            outputLimit: Math.max(limits.outputLimit, MODEL_OUTPUT_LIMIT),
+          };
+    const result = await runBrokerProcess(command, workdir, env, job.prompt, jobLimits);
+    return {
+      id,
+      ok: result.exitCode === 0 && !result.outputTruncated && !result.timedOut,
+      ...result,
+      uid: process.getuid?.() ?? -1,
+      ...(result.timedOut ? { reason: 'execution_timeout' } : {}),
+      ...(result.outputTruncated ? { reason: 'output_limit_exceeded' } : {}),
+    };
+  } catch (error) {
+    return {
+      id,
+      ok: false,
+      exitCode: 125,
+      stdout: '',
+      stderr: '',
+      uid: process.getuid?.() ?? -1,
+      reason: error instanceof Error ? error.message : 'broker_failure',
+    };
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
+async function main(): Promise<never> {
+  if (process.platform !== 'linux' || process.getuid?.() !== 1002)
+    throw new Error('reviewer_identity_invalid');
+  await mkdir(SPOOL, { recursive: true });
+  await writeFile(join(SPOOL, 'ready.tmp'), `${process.pid}\n`, { mode: 0o640 });
+  await rename(join(SPOOL, 'ready.tmp'), join(SPOOL, 'ready'));
+
+  for (;;) {
+    const names = (await readdir(SPOOL)).filter(name => name.endsWith('.request.json')).sort();
+    for (const name of names) {
+      const path = resolve(SPOOL, name);
+      if (!inside(path, resolve(SPOOL))) continue;
+      const result = await processJob(path);
+      await writeFile(join(SPOOL, `${result.id}.result.tmp`), JSON.stringify(result), {
+        mode: 0o640,
+      });
+      await rename(join(SPOOL, `${result.id}.result.tmp`), join(SPOOL, `${result.id}.result.json`));
+      await rm(path, { force: true });
+    }
+    await Bun.sleep(25);
+  }
+}
+
+if (import.meta.main) await main();

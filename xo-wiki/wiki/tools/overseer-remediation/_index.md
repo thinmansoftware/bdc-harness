@@ -1,0 +1,368 @@
+# Overseer Remediation Hand-Back (verdict -> Taskmaster)
+
+WO: WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01 | Issue: bdc-xo#1835
+Architecture ruled by John 2026-08-28: "Overseer's job is to give it back to Taskmaster."
+
+## What this is
+
+The arrow that closes the review loop. Before this, the wheel was:
+
+```
+build -> review -> [GAP] -> merge -> deploy
+```
+
+The Overseer Review Gate went live 2026-08-28 and did its first unassisted
+review on `thinmansoftware/shopops#650` (head `f868542e`). It found a REAL
+defect -- a backfill migration updating a parent row's `tenant_id` before its
+child rows, which the composite foreign key `(case_id, tenant_id)` rejects, so
+the migration can never reach its own later step. It refused the PR correctly.
+Then it stopped: an operator card, zero dispatch messages, zero runs, no
+builder told to fix anything.
+
+Now a CHANGES_REQUESTED verdict whose blocking findings are all mechanically
+fixable becomes a **remediation candidate** on the existing
+`agent_dispatch_messages` seam that Taskmaster already reads.
+
+## STATUS: the hand-back is BUILT and DISARMED
+
+**Remediation does not fire today.** `AUTO_FIXABLE_CLASSES` ships **empty**, so
+every finding falls through the fail-closed default and reaches a human. The
+transport, the fence, the attempt cap, the idempotency and the dispatch contract
+are all complete, tested, and verified in CI -- only the eligibility DECISION is
+switched off.
+
+### Why
+
+Deciding _which_ findings are mechanically fixable was done by pattern-matching
+the reviewer's prose. The Overseer gate found that unsafe **ten times** on
+PR #740. The decisive pair:
+
+```
+"The permission test fails: expected 403 but received 200."
+    -> mechanical. A builder can fix this.
+"The permission test fails: a read-only member can delete projects."
+    -> a privilege-escalation report. A human must decide.
+```
+
+Same topic word, same evidence word, same grammatical shape. **Any pattern that
+admits the first admits the second.** Narrowing had also begun producing FALSE
+NEGATIVES (`"The auth test fails after the column rename."` was being refused),
+so continued tightening degraded the feature in both directions at once. Rounds
+3-9 were all this one defect class; round 9 closed seven bypasses in a single
+audited pass and round 10 arrived anyway.
+
+The gate's own wording is the finding:
+
+> _"Observed test failure does not establish that remediation is mechanical.
+> Require explicit, validated remediation eligibility rather than treating a
+> regex match plus absence of listed risk phrases as authorization."_
+
+That cannot be satisfied from `IndependentReviewFinding`, which carries only
+`{scope, severity, summary}`.
+
+### How to re-arm
+
+**Do not repopulate the table with regexes.** That is the mistake the emptiness
+records. The reviewer must emit a **machine-readable eligibility class**, with
+**absence meaning NON-AUTO**, and the table must key off that signal instead of
+prose. That changes the evaluator's model contract, which the original WO placed
+out of scope (_"Changing what the reviewer reviews or how it judges"_), so it is
+tracked as its own WO.
+
+`LEGACY_PATTERN_CLASSES` retains the former table as a **test fixture only** --
+it keeps the fence and cap exercised end to end. It is not imported by
+production code and should be deleted once a structured signal exists.
+
+## Division of labor (do not redesign this)
+
+**Overseer judges and hands back. Taskmaster decides what actually fires.**
+
+Overseer MUST NEVER spawn or refire a builder directly. Taskmaster already owns
+lane budget, backoff, pause state, fire-eligibility, and the tick. Emitting a
+candidate is a **proposal**; Taskmaster's existing gates still govern and may
+refuse it. A refusal is a correct outcome, not a failure of this path.
+
+## Invocation
+
+There is **no command to run**. This path is invoked by the review route
+itself: when the governed reviewer returns a non-approving verdict,
+`runAndSubmitReview` submits REQUEST_CHANGES to GitHub and then hands the
+verdict back. It is wired, not triggered.
+
+| Concern                               | Where                                                                |
+| ------------------------------------- | -------------------------------------------------------------------- |
+| Classification + decision (pure)      | `packages/overseer/src/remediation-candidate.ts`                     |
+| Emit site in the review path          | `packages/overseer/src/pr-review-submit.ts` (`handBackToTaskmaster`) |
+| Live dispatch binding                 | `packages/overseer/src/pr-review-wiring.ts` (`createRealSubmitDeps`) |
+| Tests (spec Section 11 scenarios 1-9) | `packages/overseer/src/__tests__/remediation-candidate.test.ts`      |
+
+Run the tests:
+
+```bash
+bun test packages/overseer/src/__tests__/remediation-candidate.test.ts
+```
+
+Replay a verdict through the classifier without touching GitHub -- import
+`decideRemediation` from `@archon/overseer/remediation-candidate` and pass the
+finding list; it is pure (no clock, no DB, no env), so it is safe to call from
+a scratch script.
+
+## The wire contract
+
+Written to `agent_dispatch_messages` with `task_type: 'run_review'`, recipient
+`taskmaster`, **authenticated sender `overseer`**, subject key
+`gh:owner/repo#number`. The body is JSON discriminated by
+`kind: "overseer_remediation_candidate"`:
+
+> The sender is `overseer`, NOT `overseer-review-route`. M-129 Phase 1.5
+> (PR #669) replaced `createMessage` with `createAuthenticatedMessage`, whose
+> `bindSenderContext` admits exactly three system senders -- `dispatch`,
+> `overseer`, `taskmaster`. `REMEDIATION_SENDER` names the real one and the
+> emitter binds that constant, so the two cannot drift; an integration test
+> asserts the sender on the **stored row**, not just on the constant. This doc
+> and the constant both said `overseer-review-route` until PR #740 [minor]
+> (2026-09-04).
+
+| Field                         | Meaning                                                                    |
+| ----------------------------- | -------------------------------------------------------------------------- |
+| `kind`                        | Always `overseer_remediation_candidate`. Taskmaster discriminates on this. |
+| `owner` / `repo` / `prNumber` | The PR to fix.                                                             |
+| `headSha`                     | The exact head the reviewer examined and rejected.                         |
+| `attempt` / `maxAttempts`     | 1-based attempt; cap is 2.                                                 |
+| `findingClasses`              | Matched auto-fixable class ids, for audit and routing.                     |
+| `verdictBody`                 | The reviewer's text, verbatim, so the builder fixes the NAMED defect.      |
+| `woId`                        | Work order id when known, else null.                                       |
+| `owningLane`                  | The lane that built the PR (see Known scope limit).                        |
+
+`task_type` reuses the existing `run_review` value deliberately: adding a new
+one would require a DB CHECK-constraint migration for no behavioral gain, and
+the `kind` discriminator already identifies a remediation candidate.
+
+### Two dispatch rules this path must satisfy (both were live defects)
+
+Both were caught by the real-DB integration test in
+`pr-review-wiring-integration.test.ts` on 2026-08-28. A mocked emitter passes
+happily while production fails on first use, which is why that file exists.
+
+1. **`taskmaster` must be a seeded dispatch principal.** `createMessage` calls
+   `assessDispatchRecipientWithQuery` and rejects any recipient with no row in
+   `dispatch_principals` (`missing_principal`). Seeded by **migration 046**,
+   plus `000_combined.sql` and the SQLite adapter's `seedDispatchPrincipals()`
+   mirror -- **that mirror is hand-maintained and NOT derived from the
+   migrations**, so a new principal must be added in all three places.
+2. **Attempt 2+ must carry a `repeat_reason`.** Once any earlier message under
+   the PR's subject key is terminal, `createMessage` throws
+   `repeat_reason_required` -- the dispatch layer refuses to silently re-open a
+   settled subject. The emitter supplies one naming the attempt and head.
+   Without it the cap of 2 would silently have been a cap of 1.
+
+## The auto-fixable class list (EMPTY — historical record only)
+
+> **This section is HISTORY, not instructions.** `AUTO_FIXABLE_CLASSES` is empty
+> and must stay empty until a structured eligibility signal exists. **Do not add
+> a regex class.** See "How to re-arm" above. The table below records what was
+> tried and why it was removed, so nobody rebuilds it.
+
+Remediation eligibility _was_ decided by matching patterns against the
+reviewer's prose. Five classes existed:
+
+| Class id (removed)   | What it tried to match                                   |
+| -------------------- | -------------------------------------------------------- |
+| `build_failure`      | Build / compile / type errors the toolchain had reported |
+| `test_failure`       | Tests observed failing (missing coverage excluded)       |
+| `lint_or_format`     | Violations a named tool reported (eslint/prettier/...)   |
+| `migration_ordering` | Ordering the schema rejects (FK/constraint violation)    |
+| `ascii_violation`    | Non-ASCII where the encoding rule itself was the defect  |
+
+They survive as `LEGACY_PATTERN_CLASSES`, a **test fixture only**, so the fence
+and attempt cap stay exercised. Nothing in production imports it.
+
+### Why the approach was abandoned
+
+Each round of review narrowed the patterns; each narrowing was defeated by a
+rephrasing. The belief being tested — _"require evidence of an already-observed
+failure and the boundary holds"_ — is **false**, and this pair is why:
+
+```
+"The permission test fails: expected 403 but received 200."
+    -> mechanical. A builder can fix this.
+"The permission test fails: a read-only member can delete projects."
+    -> a privilege-escalation report. A human must decide.
+```
+
+Same topic word, same evidence word, same grammatical shape. **Any pattern that
+admits the first admits the second.** Mechanical evidence was never the security
+boundary; it only looked like one until someone wrote a security finding in
+mechanical language.
+
+Ten phrasings defeated it across rounds 3-10 of PR #740. A sample:
+
+| Phrasing                                                                                                   | Wrongly matched      |
+| ---------------------------------------------------------------------------------------------------------- | -------------------- |
+| "Test missing for unescaped user content rendered into the page"                                           | `test_failure`       |
+| "The API response format exposes internal identifiers"                                                     | `lint_or_format`     |
+| "Non-ASCII tenant names collide, allowing one customer to read another customer's invoices"                | `ascii_violation`    |
+| "Unicode normalization breaks tenant isolation, allowing one customer to read another customer's invoices" | `ascii_violation`    |
+| "The tenant-id type check fails to stop one customer reading another customer invoices"                    | `build_failure`      |
+| "The migration foreign key constraint fails to isolate tenants, exposing invoices"                         | `migration_ordering` |
+| "The permission test fails: a read-only member can delete projects."                                       | `test_failure`       |
+
+Narrowing also began producing **false negatives** —
+`"The auth test fails after the column rename."` was refused — so continued
+tightening degraded the feature in both directions at once. Round 9 audited all
+five classes and closed seven bypasses in a single pass; round 10 arrived anyway.
+
+The full regression set lives in `remediation-candidate.test.ts` and carries over
+to the re-arm WO (bdc-xo#2974) as its acceptance suite.
+
+### Two vetoes, and why the second one exists
+
+A finding is handed back only if it matches a class below AND survives **both**
+vetoes. Both can only ever REFUSE, never approve.
+
+1. **`NON_AUTO_PATTERN` -- judgment-call VOCABULARY.** security, auth, design,
+   scope, governance, privacy, injection, and so on. Checked against scope AND
+   summary.
+2. **`NON_AUTO_IMPACT_PATTERN` -- judgment-call CONSEQUENCE.** Cross-party
+   access, isolation/boundary failure, exposure or leakage of data,
+   unauthenticated or arbitrary access.
+
+The second exists because a keyword list cannot enumerate every way to describe
+a security defect, and the review gate proved that **five rounds running** on
+PR #740. Each time, a finding used a class's own topic word AND its own evidence
+word while describing a data-disclosure defect, with no vocabulary keyword
+anywhere:
+
+| Phrasing                                                                                                   | Matched              |
+| ---------------------------------------------------------------------------------------------------------- | -------------------- |
+| "Unicode normalization breaks tenant isolation, allowing one customer to read another customer's invoices" | `ascii_violation`    |
+| "The tenant-id type check fails to stop one customer reading another customer invoices"                    | `build_failure`      |
+| "The tenant isolation test fails to cover cross-customer invoice reads"                                    | `test_failure`       |
+| "The migration foreign key constraint fails to isolate tenants, exposing invoices"                         | `migration_ordering` |
+| "eslint reports the rule is disabled where we leak invoices to any caller"                                 | `lint_or_format`     |
+
+Narrowing class patterns one at a time was losing a race against phrasing.
+
+**The structural distinction:** a genuinely mechanical defect's consequence is a
+RED TOOL -- the build fails, the suite fails, the linter objects, a constraint
+rejects the migration. A finding that instead describes a consequence TO DATA OR
+TO ANOTHER PARTY is reasoning about impact, and impact is exactly what a human
+must weigh. So the second veto matches on consequence SHAPE rather than topic
+vocabulary, which is why it catches phrasings no keyword list anticipated.
+
+The asymmetry is deliberate: a false positive costs one unnecessary human
+review; a false negative hands a disclosure defect to an unattended builder.
+When in doubt it refuses.
+
+**Both vetoes remain live, and both stay** when eligibility is re-armed from a
+structured signal (bdc-xo#2974). They are defence in depth, not the primary
+gate: the ten phrasings above prove a prose-based gate cannot be the primary
+one. Do not treat either veto as licence to re-add regex classes -- they were
+in place for the last several bypasses and did not stop them.
+
+### What must NEVER be added
+
+Design disagreements, scope questions, governance objections, security
+judgments. Those are cases where a human must decide, and routing them to a
+builder would launder a judgment call into a code change. A `NON_AUTO_PATTERN`
+override catches these **first**, so a finding is non-auto even when its text
+also matches a mechanical class ("the migration ordering here leaks a
+credential" is non-auto).
+
+## Safety rules (all enforced in code and tested)
+
+1. **Bounded retries.** Cap 2 per PR. Exhaustion escalates to a human with
+   reason `remediation_attempts_exhausted`. An unattended reviewer-fix-reviewer
+   loop burning lane budget is the failure this must not create.
+2. **Fail closed.** A finding matching no known class is NON-AUTO. There is no
+   wildcard and no default-auto branch.
+3. **Mixed verdicts go to the human.** One blocking judgment-call finding among
+   otherwise fixable ones refuses the whole verdict.
+4. **Two invariants, one DATABASE TRANSACTION.** They cannot share one key.
+   - **(A) BOUNDED:** at most `MAX_REMEDIATION_ATTEMPTS` candidates per PR,
+     however concurrent deliveries interleave.
+   - **(B) IDEMPOTENT:** a redelivered verdict (same reviewed head) must not add
+     a second candidate.
+
+   The only atomic primitive in the dispatch table is the UNIQUE index on
+   `(sender_principal_id, idempotency_key)`, so one key buys one guarantee. This
+   PR proved that the hard way **five** times:
+
+   | Round | Mechanism                                  | Fixed          | Broke                                                                       |
+   | ----- | ------------------------------------------ | -------------- | --------------------------------------------------------------------------- |
+   | 1     | key = (PR, head, attempt)                  | --             | (A): concurrent heads exceed the cap                                        |
+   | 2     | key = (PR, attempt)                        | (A)            | (B): redelivery duplicates                                                  |
+   | 3     | key = (PR, head)                           | (B)            | (A) again                                                                   |
+   | 4     | key = (PR, attempt) + pre-insert head read | sequential (B) | (B) under CONCURRENCY -- the read is not atomic against a concurrent insert |
+   | 5     | **`createCappedSubjectMessage` fence**     | both           | --                                                                          |
+
+   The fence (`packages/core/src/db/dispatch.ts`) does the dedupe read AND the
+   slot insert **inside one transaction** -- `BEGIN IMMEDIATE` on sqlite (plus
+   the in-process promise chain the control plane already uses), `FOR UPDATE`
+   row locks on postgres. The head is the dedupe token, giving (B); the attempt
+   slot is the idempotency key, giving (A).
+
+   It is deliberately NARROW, modelled on the taskmaster notice fence beside it:
+   it validates its own preconditions (`subject_key` present, `1 <= maxRows <=
+16`, non-empty dedupe token) and throws `capped_subject_fence_invalid`
+   rather than degrading to a racy path. Adding it does not widen what any other
+   dispatch caller may do.
+
+   **Do not replace this with an application-level read-then-insert.** That is
+   round 4, and it silently duplicates under concurrency.
+
+   The fence returns the slot it **actually** claimed, which may differ from the
+   attempt a delivery predicted when a racer took an earlier slot. The receipt
+   records that value -- otherwise an audit trail can say attempt 1 while the
+   durable row says attempt 2.
+
+   **Where the guarantee is tested:** `packages/core/src/db/dispatch.test.ts`,
+   `createCappedSubjectMessage (capped-subject fence)` -- against a real
+   database, with the transaction as the thing under test. Removing the
+   transaction makes the distinct-token case exceed `maxRows` and the suite
+   fail. The overseer-level tests cover the wiring only; Bun's sqlite driver is
+   synchronous, so they cannot distinguish a fence from a lucky schedule, and
+   they say so.
+
+5. **Taskmaster still decides.** Budget, pause, backoff, and eligibility all
+   still apply.
+6. **A hand-back failure never un-lands a review.** If the counter or the emit
+   throws, the outcome degrades to "not emitted" with a stated reason and the
+   finding goes to a human -- exactly where it went before this existed.
+
+## Attempt counting: no new table
+
+The attempt count is **derived** from the dispatch rows themselves. Every prior
+candidate IS a durable row under that PR's subject key, so
+`countPriorRemediationAttempts` counts them. This removes the class of bug
+where a separate counter and the queue disagree. Rows count regardless of
+status: a candidate Taskmaster refused still consumed an attempt -- that is the
+point of the cap.
+
+The count is an **optimization, not the enforcement mechanism**. It short-
+circuits the common case cheaply, but it is a read and therefore racy on its
+own. The cap is actually enforced by the UNIQUE constraint on the attempt slot
+(safety rule 4). Do not "improve" this by trusting the count alone.
+
+## Known scope limit (deliberate)
+
+Owner selection defaults to the lane that built the PR (`owningLane`). The
+general problem -- the machine ASSIGNING an owner to ownerless work -- is a
+board design question John raised 2026-08-28 and is explicitly NOT part of this
+WO.
+
+## Taskmaster consumer status
+
+**NOT YET BUILT -- and no longer blocked.** The freeze is OVER: bdc-harness
+PR #669 (M-129 Phase 1.5) merged **2026-08-30**, so
+`packages/server/src/taskmaster/*` is editable again.
+
+The Overseer half and the message contract are complete and tested. What remains
+is the consumer that reads candidates and subjects them to
+budget/backoff/eligibility -- unblocked, unowned, follow-on work. Spec Section 11
+scenario 8 stays skipped only because there is no consumer to assert a refusal
+against (verified by grep: nothing in `packages/server/src/taskmaster/` reads
+`overseer_remediation_candidate`). It unskips when that lands.
+
+Until the consumer exists, candidates accumulate as queued dispatch rows
+addressed to `taskmaster` and nothing fires -- which is the safe direction.

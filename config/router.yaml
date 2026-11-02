@@ -1,0 +1,194 @@
+# =============================================================================
+# Cauldron 2.0 Tier Router -- v1 (STATIC)
+# =============================================================================
+# Design authority: BDC_XO/briefs/2026-06-10-cauldron-2-design.md (Layer 2)
+# Status: P1 artifact. Static, hand-maintained. P4 replaces the static
+#         task_classes table with grader-fed learned routing -- the SHAPE of
+#         this file is the contract; the numbers inside it will move.
+#
+# WHAT THIS FILE IS
+#   The single versioned source of truth for "which engine runs which job".
+#   It is read by humans (PR review -- routing changes are code changes) and
+#   by agents (the dispatcher resolves a job's task class here before firing).
+#
+# HOW TO READ IT
+#   1. A job arrives as a GitHub issue (the WO queue) with a task class.
+#   2. task_classes maps that class to a STARTING tier (cheapest plausible).
+#   3. The job runs at that tier. If it passes its gates, done -- cheap win.
+#   4. If a gate fails or the engine self-flags a stall, the escalation
+#      ladder promotes the job EXACTLY ONE tier with a context packet.
+#      Never a blind restart, never a multi-tier jump.
+#
+# CHANGE RULES
+#   - Every edit lands via PR to dev, like any other code.
+#   - Adding a task class: pick the cheapest tier that could plausibly pass
+#     the gates, not the tier you are confident in. Escalation is the safety
+#     net; starting high burns the arbitrage.
+#   - ASCII only. This file is parsed by scripts on Windows PowerShell 5.1.
+# =============================================================================
+
+version: 1
+updated: "2026-06-30"
+source_brief: "BDC_XO/briefs/2026-06-10-cauldron-2-design.md"
+
+# -----------------------------------------------------------------------------
+# TIERS -- the engine ladder, cheapest first.
+# marginal_cost is the operative field: tiers 0-1 are free, 4 is flat-rate
+# subscription (already paid for -- saturate it), 2, 3, and 5 are metered API.
+# -----------------------------------------------------------------------------
+tiers:
+  "0":
+    name: script
+    engines:
+      - deterministic-script        # gh CLI, bash, PowerShell, jq -- no model at all
+    marginal_cost: zero
+    work_shape: >-
+      Issue ops, label management, lint, grep assertions, registration
+      checks, file moves, anything a script can do without judgment.
+    notes: >-
+      If a job CAN be a script, it MUST be a script. A model invoked for
+      deterministic work is a routing bug.
+
+  "1":
+    name: qwen-local
+    engines:
+      - ollama-qwen3                # local Qwen 3 on the BDC box, CPU-only
+    marginal_cost: zero
+    work_shape: >-
+      Log triage, summarization, first-pass classification, draft text.
+      Shared with the AIOS cadence layer (P2) -- this tier is the BDC box's
+      job. Latency is high (CPU inference); fine for overnight cadence work,
+      wrong for interactive lanes.
+
+  "2":
+    name: openrouter-cheap
+    engines:
+      # RETIRED/REFUSED 2026-07-07 -- glm-5.2 is a dark lane. Kept in the multi-tier
+      # vision table for history only. NOT wired in DEFAULT_ENGINE_TO_LANE (lane=null
+      # fail-closed). Do NOT reconnect as a live entry. Smart Cauldron refuses "glm"
+      # via packages/smart-cauldron/config/ladder.config.json refusedTiers.
+      - glm-5.2
+      - qwen3-coder
+      - deepseek-v4-pro
+    marginal_cost: cheap-api
+    work_shape: >-
+      Build agents, code generation, PR tasks via OpenRouter cheap models.
+      Live engines: qwen3-coder and deepseek-v4-pro. glm-5.2 is retired/refused
+      and is not a live lane entry (see notes). Escalates to haiku on gate failure.
+    notes: >-
+      glm-5.2 RETIRED/REFUSED (2026-07-07 zero-lane incident). Do not reconnect
+      bdc-feature-development-glm as a live entry. Dispatcher maps glm-5.2 to
+      null lane (fail-closed). Remaining engines use OpenRouter cheap models
+      (GLM_API_KEY / openrouter.ai/api/v1 where applicable).
+
+  "3":
+    name: haiku
+    engines:
+      - claude-haiku-api
+    marginal_cost: cheap-api
+    work_shape: >-
+      Clerical agents, persona walkthroughs, monitors, structured extraction
+      where Qwen's quality or latency is not enough.
+
+  "4":
+    name: workhorse-subscription
+    # TWO pools at flat rate = two or more parallel build lanes at zero
+    # marginal cost. The subscription scheduler (P2) tracks each pool's
+    # session window and saturates both; until it exists, the dispatcher
+    # picks by engine_hint on the task class and falls back to the other
+    # pool when one is window-exhausted.
+    engines:
+      - sonnet-subscription         # Claude subscription (Sonnet) -- multi-agent / judgment jobs
+      - codex-subscription          # Codex subscription -- single-builder PR jobs (its proven shape)
+    marginal_cost: flat-rate
+    work_shape: >-
+      The workhorse build tier. Ordinary CODE WOs, multi-file refactors,
+      test repair, PR fixes. Escalation destination from openrouter-cheap.
+
+  "5":
+    name: fable-opus
+    engines:
+      - fable-session               # PREFERRED when a subscription window is open
+      - opus-api                    # fallback when no session window
+    marginal_cost: expensive
+    # HARD CAP: every Tier 5 job carries a per-WO budget. The dispatcher
+    # MUST refuse to fire a Tier 5 job without an explicit budget on the WO;
+    # this default applies only when the WO omits one.
+    budget_cap_usd_per_wo_default: 25
+    work_shape: >-
+      Spec authoring, design nodes, architecture review, symptom-loop
+      escalations, risky-diff final review. The ~5-10 percent of tokens that
+      are genuinely design-shaped. Everything else is a routing bug.
+
+# -----------------------------------------------------------------------------
+# TASK CLASSES -- starting tier per job shape.
+# starting_tier is where the job FIRES, not where it may end up (see
+# escalation). engine_hint disambiguates within multi-engine tiers.
+# -----------------------------------------------------------------------------
+task_classes:
+  notion-flip:
+    starting_tier: "0"
+    status: legacy                  # dies with the Notion board (brief Section 3);
+                                    # kept routable until P4 retires flip-notion paths
+  log-triage:
+    starting_tier: "1"
+  summarize:
+    starting_tier: "1"
+  persona-walkthrough:
+    starting_tier: "3"
+  monitor:
+    starting_tier: "3"
+  build-code:
+    starting_tier: "2"
+    engine_hint: sonnet-subscription
+  single-builder-pr:
+    starting_tier: "2"
+    engine_hint: codex-subscription # Codex's proven shape per Codex-Goal doctrine
+  spec-authoring:
+    starting_tier: "5"              # the ONLY class allowed to START at Tier 5
+  architecture-review:
+    starting_tier: "5"
+  escalation-review:
+    starting_tier: "5"              # terminal review of jobs the ladder pushed up
+
+# -----------------------------------------------------------------------------
+# ESCALATION LADDER -- how jobs move between tiers.
+# -----------------------------------------------------------------------------
+escalation:
+  triggers:
+    - gate-failure                  # a required check / stop condition failed
+    - self-flagged-stall            # the engine itself reports it is stuck
+  rule: >-
+    Escalate EXACTLY ONE tier per trigger event. Never jump tiers, never
+    restart blind at the same tier, never restart from scratch at a higher
+    tier without the context packet.
+  context_packet:
+    # The packet travels WITH the job so the next tier resumes instead of
+    # rediscovering. An escalation without a packet is invalid -- reject it.
+    required:
+      - attempted-approach          # what the lower tier tried, in its own words
+      - failure-output              # the failing gate output / error text, verbatim
+      - relevant-diff               # the diff the lower tier produced (may be empty)
+  ceiling: >-
+    Tier 5 is terminal. A Tier 5 failure does not escalate -- it goes to the
+    WAITING-ON-JOHN queue as a human decision.
+  demotion: >-
+    v1 has NO automatic demotion. P4 grader feedback will add demotion
+    pressure (success rates per task class and tier flow back into this
+    file via PR). Until then, demotions are hand-edits to task_classes.
+
+# -----------------------------------------------------------------------------
+# DEFAULTS -- dispatcher behavior when the mapping is silent or ambiguous.
+# -----------------------------------------------------------------------------
+defaults:
+  # Unknown task class: start at the cheapest tier that could plausibly
+  # pass the job's gates. When in doubt between two tiers, pick the cheaper
+  # one -- the ladder exists to catch the miss.
+  start_at_cheapest_plausible_tier: true
+  # NOTHING starts at Tier 5 unless its task class is spec-authoring (or
+  # another class explicitly mapped to "5" above). A job arriving with a
+  # Tier 5 request and a non-design class is mis-specified: re-class it or
+  # kick it back.
+  never_start_at_tier_5_without_spec_authoring_class: true
+  # Unmapped classes land here until someone maps them properly via PR.
+  fallback_tier: "2"

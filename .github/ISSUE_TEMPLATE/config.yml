@@ -1,0 +1,3 @@
+# Issues must come in through a template -- blank issues bypass WO intake
+# validation (Cauldron 2.0 brief, Layer 1: template-validated at intake).
+blank_issues_enabled: false

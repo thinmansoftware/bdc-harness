@@ -1,0 +1,46 @@
+# =============================================================================
+# M-42 Slice 8 isolated credential-free staging (archon-m42-staging)
+# =============================================================================
+#
+# Standalone. NOT layered over the shared credential-bearing compose file.
+# Does not load external env files. No GitHub/Claude/OpenAI/OpenRouter/Grok/xAI env.
+# Credential keys are ABSENT (not present-but-empty): printenv KEY must fail.
+# Only two M-42 mounts. Loopback port 3092.
+# Lifecycle: scripts/staging/staging-m42-up.ps1
+
+name: archon-m42-staging
+
+services:
+  app:
+    image: archon-m42-staging:current
+    container_name: archon-m42-staging
+    environment:
+      ARCHON_DOCKER: "true"
+      PORT: "3092"
+      OVERSEER_ENABLED: "true"
+      OVERSEER_EMERGENCY_STOP: "true"
+      OVERSEER_DRY_RUN: "true"
+      OVERSEER_USE_FAKE_GITHUB_ADAPTER: "1"
+      OVERSEER_ESCALATION_ACTIONS_ENABLED: "false"
+      OVERSEER_REPAIR_ACTIONS_ENABLED: "false"
+      OVERSEER_BRANCH_ACTIONS_ENABLED: "false"
+      OVERSEER_LIFECYCLE_ACTIONS_ENABLED: "false"
+      OVERSEER_MERGE_ACTIONS_ENABLED: "false"
+    ports:
+      - "127.0.0.1:3092:3092"
+    volumes:
+      - ./staging-m42-data:/.archon
+      - ./staging-m42-user-home:/home/appuser
+    networks:
+      - archon-m42-staging-network
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3092/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+networks:
+  archon-m42-staging-network:
+    driver: bridge

@@ -1,0 +1,92 @@
+// Types (contract layer -- re-exported for convenience)
+export type {
+  IAgentProvider,
+  AgentRequestOptions,
+  SendQueryOptions,
+  NodeConfig,
+  ProviderDefaults,
+  ProviderDefaultsMap,
+  ProviderCapabilities,
+  ProviderExecutionCapabilities,
+  ProviderExecutionCapability,
+  ProviderRegistration,
+  ProviderInfo,
+  MessageChunk,
+  TokenUsage,
+} from './types';
+
+// Provider config types (canonical definitions in ./types, re-exported via config modules)
+// Import from ./types directly or from the config modules -- both work.
+
+// Registry
+export {
+  registerProvider,
+  getAgentProvider,
+  getRegistration,
+  getProviderCapabilities,
+  getMissingProviderExecutionCapabilities,
+  getRegisteredProviders,
+  getProviderInfoList,
+  isRegisteredProvider,
+  registerProviderAlias,
+  resolveProviderId,
+  registerBuiltinProviders,
+  registerCommunityProviders,
+  clearRegistry,
+} from './registry';
+
+export {
+  OPENROUTER_XAI_REFUSED_CODE,
+  OPENROUTER_XAI_REFUSED_REASON,
+  OPENROUTER_BACKED_PROVIDER_IDS,
+  getOpenRouterXaiRefusal,
+  setOpenRouterProviderIdResolver,
+} from './openrouter-guard';
+
+// Error
+export { UnknownProviderError } from './errors';
+export * from './probe';
+
+// Provider classes
+export { ClaudeProvider } from './claude/provider';
+export { CodexProvider } from './codex/provider';
+
+// Config parsers
+export { parseClaudeConfig, type ClaudeProviderDefaults } from './claude/config';
+export { parseCodexConfig, type CodexProviderDefaults } from './codex/config';
+
+// Utilities (needed by consumers)
+export { resetCodexSingleton } from './codex/provider';
+export { resolveCodexBinaryPath, fileExists as codexFileExists } from './codex/binary-resolver';
+export { resolveClaudeBinaryPath, fileExists as claudeFileExists } from './claude/binary-resolver';
+
+// Community providers
+export {
+  PiProvider,
+  parsePiConfig,
+  registerPiProvider,
+  type PiProviderDefaults,
+} from './community/pi';
+
+export {
+  GlmProvider,
+  parseGlmConfig,
+  registerGlmProvider,
+  registerOprProvider,
+  registerOprZeroProvider,
+  type GlmProviderDefaults,
+} from './community/glm';
+
+export {
+  GrokAgentProvider,
+  parseGrokAgentConfig,
+  registerGrokAgentProvider,
+  type GrokAgentProviderDefaults,
+} from './community/grok';
+
+export {
+  CursorAgentProvider,
+  parseCursorAgentConfig,
+  registerCursorAgentProvider,
+  type CursorAgentProviderDefaults,
+} from './community/cursor';

@@ -1,0 +1,27 @@
+-- WO-HARNESS-ESCALATED-RUN-STATUS-01
+-- Application adds a new terminal run status value: 'escalated'
+-- (gate-rejection ladder uplift, distinct from 'failed').
+--
+-- Intentionally NO DDL:
+--   remote_agent_workflow_runs.status is free TEXT in both SQLite and Postgres
+--   (see migrations/008_workflow_runs.sql and packages/core/src/db/adapters/sqlite.ts).
+--   There is no CHECK constraint or native ENUM type to extend.
+--
+-- Migration strategy for EXISTING rows (document-only):
+--   1. No bulk UPDATE. Historical rows with status='failed' stay 'failed'
+--      unless/until a same-WO_ID successor is dispatched AND the prior events
+--      contain a validator-rejection signal.
+--   2. At that dispatch moment, packages/core/src/escalation/escalation-linker.ts
+--      re-labels the prior run status -> 'escalated' and writes metadata:
+--        escalated_at, escalated_reason, escalated_wo_id, escalated_by,
+--        escalated_prior_status.
+--   3. Genuine breakages (no rejection signal) remain 'failed' forever.
+--
+-- Why lazy, not bulk:
+--   Bulk rewrites would reclassify genuine breakages or mis-attribute WOs that
+--   never re-ran. The linker requires a real successor dispatch as proof of
+--   ladder uplift intent.
+--
+-- This file exists so schema auditors and Codex review find an explicit
+-- migration artifact for the status contract change.
+SELECT 1;

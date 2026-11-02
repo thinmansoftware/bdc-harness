@@ -1,0 +1,29 @@
+# M-131 Phase B Codex seat compose example.
+services:
+  bdc-seat-codex:
+    build:
+      context: ../..
+      dockerfile: deploy/m131-seat/Dockerfile
+      args:
+        BUILD_SHA: "${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}"
+    image: bdc-seat-codex:${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}
+    container_name: bdc-seat-codex
+    user: "10001:10001"
+    restart: unless-stopped
+    environment:
+      SEAT_BUILD_SHA: "${BUILD_SHA:?BUILD_SHA is required - pass the exact commit SHA}"
+    volumes:
+      - ./config.seat.codex.example.json:/app/config/seat.json:ro
+      - ${M131_CODEX_SECRET_INGRESS:-./placeholder/codex-credential.json}:/run/m131/secret-ingress/codex-credential.json:ro
+      - ${M131_OPERATOR_TOKEN_FILE:-./placeholder/archon-operator-token}:/run/m131/operator-token/archon-operator-token:ro
+      - m131-codex-vendor-profile:/home/seat/.codex
+      - m131-codex-state:/var/lib/bdc-seat
+    healthcheck:
+      test: ["CMD", "bun", "run", "scripts/dispatch-worker/seat-preflight.ts", "--config", "/app/config/seat.json"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+
+volumes:
+  m131-codex-vendor-profile:
+  m131-codex-state:

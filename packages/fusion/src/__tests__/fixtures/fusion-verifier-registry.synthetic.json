@@ -1,0 +1,25 @@
+{
+  "schema_version": "overseer-verifier-registry-v1",
+  "source_artifact_path": "packages/fusion/src/__tests__/fixtures/fusion-verifier-registry.synthetic.json",
+  "source_git_blob": "synthetic-fusion-registry-v1",
+  "entries": [
+    {
+      "verifier_id": "fusion-independent-reviewer",
+      "provider": "synthetic-provider",
+      "model_family": "synthetic-family",
+      "roles": ["FUSION"],
+      "enabled": true
+    },
+    {
+      "verifier_id": "fusion-action-owner",
+      "provider": "builder-provider",
+      "model_family": "builder-family",
+      "roles": ["FUSION"],
+      "enabled": true
+    }
+  ],
+  "m28_blind_calibration": {
+    "artifact": "M-28 synthetic blind calibration: frozen registry routes dissent review to the independent Fusion verifier only.",
+    "expected_digest": "d935b3595d982066cc8e37595deb0a72da032c27cce26728d4f739e4d97cd846"
+  }
+}

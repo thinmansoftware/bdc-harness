@@ -1,0 +1,927 @@
+/**
+ * Governed reviewer -> GitHub review submission
+ * (WO-HARNESS-OVERSEER-REVIEW-ROUTE-01, XO authorization 2026-08-17).
+ *
+ * The second half of the review route. `pr-review-ingest.ts` turns a verified
+ * pull_request event into durable work bound to an exact head; this module
+ * takes one claimed work item, runs the governed reviewer, and submits the
+ * resulting verdict through the EXISTING Overseer App adapter.
+ *
+ * XO decision 1 (2026-08-17): a non-approving verdict MUST submit
+ * REQUEST_CHANGES -- approve-only is not a reviewer. If submission fails, we
+ * fail closed and record the blocker rather than silently degrading to "no
+ * review", which would leave the PR indistinguishable from never-reviewed.
+ *
+ * The reviewer itself is injected. This module owns custody enforcement,
+ * exact-head binding, verdict-to-event mapping, evidence-body construction,
+ * and receipt writing -- not the review judgment.
+ */
+import type {
+  OverseerReviewEvent,
+  SubmitPullRequestReviewInput,
+  SubmitPullRequestReviewResult,
+} from './adapters/github-real-deps.ts';
+import { readFile } from 'node:fs/promises';
+import { hasDistinctMergeIdentity } from './adapters/github-real-deps';
+import { classifyRateLimitError } from './github-rate-limit';
+import { resolveMergeManagerMode } from './merge-manager';
+import type { IndependentReviewFinding } from './independent-review-evidence.ts';
+import {
+  decideRemediation,
+  type RemediationCandidateBody,
+  type RemediationEmitResult,
+  type RemediationRefusalReason,
+} from './remediation-candidate';
+
+/** What the governed reviewer returns. */
+export interface ReviewerVerdict {
+  /** true -> APPROVE; false -> REQUEST_CHANGES. */
+  approved: boolean;
+  /** Evidence. REQUIRED (non-empty) when approved === false. */
+  summary: string;
+  /** The head the reviewer actually examined. Must match the work item. */
+  reviewedHeadSha: string;
+  /**
+   * The structured findings behind the verdict.
+   *
+   * Carried alongside `summary` because remediation classification must read
+   * SEVERITY and per-finding text, which the flattened summary string has
+   * already lost. Optional so existing reviewers that only produce a summary
+   * keep working -- absent findings simply yield no remediation candidate,
+   * which is the fail-closed direction.
+   */
+  findings?: readonly IndependentReviewFinding[];
+  /**
+   * True when CI checks on the bound head are not yet terminal, so no verdict
+   * was formed. A non-terminal disposition -- MUST NOT be collapsed into
+   * `approved: false` (that would be a REQUEST_CHANGES on checks-pending
+   * grounds, the exact bug WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01
+   * fixes). The worker releases and retries the item on a later tick.
+   */
+  checksPending?: boolean;
+  /** Names of checks still awaited when `checksPending` is true. */
+  pendingChecks?: readonly string[];
+  /**
+   * Set when the required status-check contexts could not be read after the
+   * configured attempt bound (#775). TERMINAL and NON-APPROVING: unlike
+   * `checksPending` the item is not released for another try, and unlike
+   * `approved: false` it is not a code rejection -- the reviewer found nothing
+   * wrong, it could not see what CI is mandatory. The submit path posts a
+   * COMMENT review carrying `summary` and finishes with
+   * `blocked_required_contexts_unavailable`, which the worker escalates.
+   */
+  requiredContextsUnavailable?: boolean;
+  /**
+   * True when the judge process could not be reached at all -- the prompt
+   * exceeded the argv limit (E2BIG), the binary failed to spawn, or every rung
+   * timed out -- so no evidence was read and no verdict formed (#789).
+   * NON-TERMINAL, exactly like `checksPending`: the item is released with a
+   * backoff and retried. It must never collapse into `approved: false`, which
+   * posted CHANGES_REQUESTED at the head with no stated reason on #776 and #786
+   * on 2026-09-07.
+   */
+  transportError?: boolean;
+  /**
+   * True when the GitHub client exhausted its rate budget mid-review, so no
+   * evidence could be read and no verdict formed (#782 part 2). NON-TERMINAL,
+   * exactly like `checksPending`: the item is released with a backoff and
+   * retried. It must never collapse into `approved: false` (REQUEST_CHANGES on
+   * rate-limit grounds) nor into a terminal reviewer_failed, which is what
+   * retired the review on #776 @c3935e09 on 2026-09-07.
+   */
+  rateLimited?: boolean;
+  /** Absolute instant (ISO-8601) the budget refills; from the reset header. */
+  retryAfter?: string;
+  /** Safe error code (no detail) explaining the deferral, for the receipt. */
+  reasonCode?: string;
+  /** Milliseconds to wait before the item becomes claimable again. */
+  retryAfterMs?: number;
+  /** Supervisor-observed native execution evidence. Model output cannot populate this. */
+  executionProof?: ReviewExecutionProof;
+}
+
+export interface ReviewExecutionContext {
+  readonly requestId: string;
+  readonly workerId: string;
+  readonly fencingToken: number;
+  readonly owner: string;
+  readonly repo: string;
+  readonly prNumber: number;
+  readonly headSha: string;
+  readonly checkoutPath: string;
+  readonly reviewerIdentity: string;
+  readonly rung: string;
+  readonly checkPlanStatus: 'absent' | 'present' | 'unsafe';
+  readonly checkPlan: readonly (readonly string[])[];
+  /**
+   * Set by the trusted worker when the exact-head checkout could not be
+   * prepared or verified (for example review_checkout_identity_failure). The
+   * review is then incomplete before any broker or model call.
+   */
+  readonly checkoutFailure?: string;
+}
+
+export interface ReviewExecutionProof {
+  readonly requestId: string;
+  readonly headSha: string;
+  readonly treeSha: string;
+  readonly cwd: string;
+  readonly nativePolicy: 'codex_bubblewrap';
+  readonly nativeVersion: string;
+  readonly runtimeUid: number;
+  readonly inspectionObserved: boolean;
+  /** Durable receipt marker required when the exact-head repository declares no plan. */
+  readonly check_plan: 'absent' | 'present';
+  readonly checks: readonly {
+    readonly argv: readonly string[];
+    readonly cwd: string;
+    readonly exitCode: number;
+    readonly outputDigest: string;
+    readonly startedAt: string;
+    readonly endedAt: string;
+  }[];
+  readonly startedAt: string;
+  readonly endedAt: string;
+}
+
+export interface ReviewWorkItem {
+  correlationId: string;
+  messageId: string;
+  owner: string;
+  repo: string;
+  prNumber: number;
+  /** The exact head this work item is bound to. */
+  headSha: string;
+  author: string;
+  /** Present on dispatch-worker work only; constructed from the live claim, never its body. */
+  executionContext?: ReviewExecutionContext;
+}
+
+export type SubmitDisposition =
+  | 'approved'
+  | 'changes_requested'
+  | 'custody_conflict'
+  | 'merge_custody_conflict'
+  | 'stale_head'
+  | 'reviewer_failed'
+  | 'submission_failed'
+  | 'checks_pending'
+  /**
+   * TERMINAL for THIS work item (#777 review finding, second pass). The head
+   * under evaluation was superseded before a required-contexts BLOCK could be
+   * recorded, so the block is suppressed -- it must never land on a head the
+   * reviewer did not judge. But the item itself is finished: its payload is
+   * bound to the now-dead SHA and nothing rewrites it, so releasing it would
+   * make every later tick re-evaluate the same stale SHA and return
+   * `superseded_head` again forever.
+   *
+   * The new head is NOT left unreviewed: ingest cancels every in-flight item
+   * bound to a different SHA and enqueues a fresh item bound to the exact new
+   * head. Unlike `checks_pending`, whose bound head is still live and therefore
+   * worth retrying, there is nothing here left to retry.
+   */
+  | 'superseded_head'
+  /**
+   * TERMINAL, NEVER APPROVING (#775). The required status-check contexts could
+   * not be read after the configured attempt bound, so the review is blocked
+   * and a human is told. Only reachable once BOTH head gates have passed, so it
+   * always binds to a head the reviewer actually evaluated and that is still
+   * live. Distinct from `checks_pending` (non-terminal, retried) and from
+   * `changes_requested` (a real code finding).
+   */
+  | 'blocked_required_contexts_unavailable'
+  /**
+   * NON-TERMINAL (#789). The judge process was never reached (E2BIG on the
+   * prompt argument, spawn failure, or every rung timing out). Released with a
+   * backoff and retried, exactly like `checks_pending` -- never terminal,
+   * because terminating here posts a CHANGES_REQUESTED for a review that was
+   * never actually performed.
+   */
+  | 'transport_error'
+  /**
+   * NON-TERMINAL (#782 part 2). The GitHub rate budget was exhausted mid-review.
+   * Released with a backoff derived from the reset header and retried, exactly
+   * like `checks_pending` -- never terminal, because terminating here retires a
+   * review that was never actually performed and leaves the PR's stale verdict
+   * standing with nothing to clear it.
+   *
+   * Deliberately distinct from `transport_error` even though both are
+   * "no verdict was formed, come back later": a rate limit knows the exact
+   * instant it clears (the reset header, carried in `retryAfter`) whereas a
+   * transport failure only has a fixed backoff, and the two are worth telling
+   * apart in the receipt when diagnosing why a review did not land.
+   */
+  | 'rate_limited'
+  | 'review_incomplete';
+
+export interface SubmitOutcome {
+  disposition: SubmitDisposition;
+  reason?: string;
+  event?: OverseerReviewEvent;
+  executionProof?: ReviewExecutionProof;
+  githubReview?: SubmitPullRequestReviewResult['review'];
+  /**
+   * Present only on a changes_requested disposition. Reports whether the
+   * verdict was handed back to Taskmaster and, when it was not, why it stopped
+   * with a human instead.
+   */
+  remediation?: RemediationOutcome;
+  /**
+   * The review text the reviewer actually posted, for the terminal branches
+   * that formed a verdict (`approved`, `changes_requested`, and the
+   * `blocked_required_contexts_unavailable` COMMENT).
+   *
+   * WHY IT IS ON THE OUTCOME (#782 review finding, 2026-09-07): the worker
+   * persists `result_body: JSON.stringify(outcome)`, and the same-head recheck
+   * path has to decide whether a standing CHANGES_REQUESTED was caused by a
+   * CHECK (auto-clearable by a green re-run) or by a CODE finding (not). That
+   * question can only be answered from the reviewer's finding text -- and
+   * before this field existed the text was never persisted ANYWHERE: not on the
+   * outcome, and not on the submit receipt, whose recorded fields are
+   * disposition/event/reason only. `reason` is absent on a clean
+   * `changes_requested`, so `extractReviewSummary` returned null, every verdict
+   * failed `verdictAuthorizesRecheck`, and BOTH the webhook path and the stale
+   * sweep silently enqueued nothing -- the exact re-review this WO exists to
+   * deliver.
+   *
+   * Deliberately NOT set on the non-terminal deferrals (`checks_pending`,
+   * `rate_limited`, `transport_error`): no verdict was formed there, their
+   * `summary` is the empty string, and `checks_pending` already authorizes a
+   * recheck on its disposition alone.
+   */
+  summary?: string;
+  /** Set only on `rate_limited`: when the item should become claimable again. */
+  retryAfter?: string;
+  /**
+   * Milliseconds until the item is retried. Set on `transport_error`, and on
+   * `rate_limited` as the duration form of `retryAfter`.
+   */
+  retryAfterMs?: number;
+  /** Names of checks still awaited on a checks-pending deferral. */
+  pendingChecks?: readonly string[];
+}
+
+export interface SubmitDeps {
+  reviewerIdentity: string;
+  /** Runs the governed reviewer against an exact head. */
+  runReviewer(work: ReviewWorkItem): Promise<ReviewerVerdict>;
+  /** The existing Overseer App adapter's general review submission. */
+  submitReview(input: SubmitPullRequestReviewInput): Promise<SubmitPullRequestReviewResult>;
+  /**
+   * Current head of the PR, re-read immediately before submission. A review
+   * must never land on a head the reviewer did not examine.
+   */
+  currentHeadSha(input: { owner: string; repo: string; prNumber: number }): Promise<string>;
+  recordReceipt(input: {
+    correlationId: string;
+    messageId: string;
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    disposition: SubmitDisposition;
+    event?: OverseerReviewEvent;
+    reason?: string;
+    /**
+     * Carried onto the operator card so a human reading the escalation can
+     * tell "handed back to Taskmaster, attempt 1" from "stopped here because a
+     * blocking finding needs your judgment".
+     */
+    remediation?: RemediationOutcome;
+    executionProof?: ReviewExecutionProof;
+    githubReview?: SubmitPullRequestReviewResult['review'];
+  }): Promise<void>;
+
+  /** Revalidates the dispatch fence. Required for execution-context work. */
+  hasCustody?(context: ReviewExecutionContext): Promise<boolean>;
+
+  /** Durable pre-publication write. Approval is refused if this write fails. */
+  recordExecutionProof?(input: {
+    work: ReviewWorkItem;
+    proof: ReviewExecutionProof;
+  }): Promise<void>;
+
+  /**
+   * Hands a CHANGES_REQUESTED verdict back to Taskmaster as a remediation
+   * PROPOSAL (WO-...-VERDICT-TO-TASKMASTER-REMEDIATION-01).
+   *
+   * OPTIONAL BY DESIGN. When absent, this module behaves exactly as it did
+   * before: the review is submitted and the operator-card path is unchanged.
+   * That keeps the existing escalation regression-safe and makes the hand-back
+   * an additive capability rather than a rewrite of the review route.
+   *
+   * The implementation must return the attempts ALREADY made for this PR so
+   * the cap can be enforced against durable state rather than a value this
+   * module guesses. Returning nothing signals the counter was unavailable, and
+   * the caller then declines to emit -- fail-closed.
+   */
+  countPriorRemediationAttempts?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+  }): Promise<number>;
+
+  /**
+   * Writes the remediation candidate onto the existing dispatch seam. Never
+   * fires a builder: Taskmaster's budget, backoff, pause state, and
+   * fire-eligibility still decide whether the proposal becomes work.
+   *
+   * Returns `claimed: false` when this attempt slot was already taken -- the
+   * durable per-PR cap is enforced by a UNIQUE constraint on the attempt slot,
+   * so a concurrent emitter can lose the race. Losing is a correct outcome, but
+   * it must be REPORTED rather than reported as success, or an operator would
+   * be told a fix was queued when this verdict queued nothing.
+   */
+  emitRemediationCandidate?(body: RemediationCandidateBody): Promise<RemediationEmitResult>;
+}
+
+/** What the remediation hand-back did, recorded on the receipt. */
+export interface RemediationOutcome {
+  readonly emitted: boolean;
+  /** Present when emitted; identifies the attempt for audit. */
+  readonly attempt?: number;
+  /** Present when NOT emitted, so a human sees why it stopped with them. */
+  readonly reason?:
+    | RemediationRefusalReason
+    | 'remediation_not_configured'
+    | 'emit_failed'
+    | 'attempt_slot_already_claimed';
+}
+
+/** Bounds the evidence body so a runaway reviewer cannot post an essay. */
+const MAX_EVIDENCE_BODY = 60_000;
+
+/**
+ * Builds the review body. Always states the exact head so the review is
+ * self-evidencing about what was examined.
+ */
+export function buildReviewBody(work: ReviewWorkItem, verdict: ReviewerVerdict): string {
+  const header = `Independent review by the Overseer App at head \`${work.headSha}\`.`;
+  const summary = verdict.summary.trim();
+  const body = summary.length > 0 ? `${header}\n\n${summary}` : header;
+  return body.length > MAX_EVIDENCE_BODY ? body.slice(0, MAX_EVIDENCE_BODY) : body;
+}
+
+/**
+ * Run the governed reviewer for one claimed work item and submit its verdict.
+ *
+ * Order is deliberate: custody first (never review our own PR), then the
+ * reviewer, then a head re-read (a push during review invalidates the result),
+ * then submission. Every terminal branch writes a receipt.
+ */
+export async function runAndSubmitReview(
+  work: ReviewWorkItem,
+  deps: SubmitDeps
+): Promise<SubmitOutcome> {
+  // CUSTODY: enforced here as well as at ingest, because a work item can be
+  // claimed long after it was queued and this is the last point before a real
+  // review lands.
+  if (work.author?.toLowerCase() === deps.reviewerIdentity.toLowerCase()) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'custody_conflict',
+      reason: 'reviewer_is_pull_request_author',
+    });
+  }
+
+  // MERGE-CUSTODY (M-153, RULED by John 2026-08-24: "the Review Gate reviews;
+  // the Merge Manager merges" -- one identity never does both on the same PR).
+  //
+  // The question this gate answers is IDENTITY SEPARATION, not merge mode. A
+  // review is safe to submit whenever the merge mutation will run as a
+  // DIFFERENT GitHub identity than this reviewer, because then approving here
+  // cannot let the same actor execute its own approval.
+  //
+  // Before the ruling this gate blocked on `mode === 'execute'` as a
+  // conservative stand-in while M-153 was tabled. That stand-in outlived the
+  // question: with the merge manager armed (the only mode that ever merges)
+  // no review could be submitted, so no approval ever existed, so the merge
+  // manager denied every PR for `review_gate_approval_missing_for_head`. The
+  // two halves deadlocked and the machine merged nothing.
+  //
+  // STILL FAILS CLOSED: when no distinct merge identity is configured, the
+  // merge octokit falls back to this same App, so review submission is
+  // refused exactly as before.
+  const mergeMode = resolveMergeManagerMode();
+  if (mergeMode === 'execute' && !hasDistinctMergeIdentity()) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'merge_custody_conflict',
+      reason: 'merge_manager_shares_reviewer_identity_m153',
+    });
+  }
+
+  let verdict: ReviewerVerdict;
+  try {
+    verdict = await deps.runReviewer(work);
+  } catch (error) {
+    // A rate limit thrown out of the reviewer seam is a deferral, not a failure
+    // (#782 part 2). Classified BEFORE `reviewer_failed`, which is terminal and
+    // would retire a review that never ran.
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'rate_limited',
+        reason: `rate_limited:reviewer_threw:${rateLimit.kind}:${rateLimit.source}`,
+        retryAfter: rateLimit.retryAfter,
+        retryAfterMs: rateLimit.retryAfterMs,
+      });
+    }
+    return finish(deps, work, work.headSha, {
+      disposition: 'reviewer_failed',
+      reason: `reviewer_error:${errorCode(error)}`,
+    });
+  }
+
+  // TRANSPORT ERROR (#789): the judge was never reached, so no evidence was
+  // read and no verdict formed. Submit nothing; the worker defers and retries.
+  // Checked BEFORE the exact-head gates on purpose: nothing was evaluated, so
+  // there is no reviewed head to compare and a stale-head classification here
+  // would be false.
+  if (verdict.transportError) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'transport_error',
+      reason: verdict.reasonCode
+        ? `review_transport_error:${verdict.reasonCode}`
+        : 'review_transport_error',
+      ...(typeof verdict.retryAfterMs === 'number' ? { retryAfterMs: verdict.retryAfterMs } : {}),
+    });
+  }
+
+  // RATE LIMITED (#782 part 2): no evidence was read and no verdict formed.
+  // Submit nothing; the worker releases the claim with the reset-derived backoff
+  // so the review resumes when the budget refills. Checked BEFORE the exact-head
+  // gates for the same reason as TRANSPORT ERROR above: nothing was evaluated,
+  // so there is no reviewed head to compare and a stale-head classification here
+  // would be false.
+  if (verdict.rateLimited) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'rate_limited',
+      reason: 'github_rate_limited',
+      ...(verdict.retryAfter ? { retryAfter: verdict.retryAfter } : {}),
+      ...(typeof verdict.retryAfterMs === 'number' ? { retryAfterMs: verdict.retryAfterMs } : {}),
+    });
+  }
+
+  // CHECKS PENDING: CI on the bound head is not terminal yet, so no verdict was
+  // formed. This is NOT a rejection -- submit nothing and let the worker release
+  // and retry later. Nothing was evaluated, so there is no head to re-read/bind.
+  if (verdict.checksPending) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'checks_pending',
+      reason: 'checks_not_terminal',
+      ...(verdict.pendingChecks ? { pendingChecks: verdict.pendingChecks } : {}),
+    });
+  }
+
+  // EXACT-HEAD BINDING: the reviewer must have examined the bound head.
+  //
+  // Both head gates run BEFORE the required-contexts block below. A blocked
+  // outcome is TERMINAL, so recording it against a head the reviewer did not
+  // actually evaluate -- or one the PR has already moved past -- would retire
+  // the work item for a head nobody reviewed (#777 review finding). Every
+  // terminal branch, approving or not, passes both gates first.
+  if (verdict.reviewedHeadSha !== work.headSha) {
+    // A stale evaluator result must never record a BLOCK against the bound
+    // head. Report it as superseded: the block is suppressed, this item
+    // finishes, and ingest's fresh item covers the head that is actually live.
+    if (verdict.requiredContextsUnavailable) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'superseded_head',
+        reason: 'reviewer_examined_different_head_before_required_contexts_block',
+      });
+    }
+    return finish(deps, work, work.headSha, {
+      disposition: 'stale_head',
+      reason: 'reviewer_examined_different_head',
+    });
+  }
+
+  // A push during review invalidates the verdict; do not land it on a head
+  // nobody reviewed.
+  let liveHead: string;
+  try {
+    liveHead = await deps.currentHeadSha({
+      owner: work.owner,
+      repo: work.repo,
+      prNumber: work.prNumber,
+    });
+  } catch (error) {
+    // A rate limit or the local pool gate on the head re-read is a deferral,
+    // not a failure (WO-HARNESS-OVERSEER-REVIEW-TRIGGER-01). The re-read never
+    // reached a head, so nothing was submitted and the verdict is not lost:
+    // the worker re-queues this item for when the budget refills, and the next
+    // attempt re-evaluates the same bound head. Terminating here retired five
+    // PRs' reviews on 2026-11-01 with nothing to re-arm them.
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) return rateLimitedOutcome(deps, work, 'head_recheck', rateLimit);
+    return finish(deps, work, work.headSha, {
+      disposition: 'submission_failed',
+      reason: `head_recheck_failed:${errorCode(error)}`,
+    });
+  }
+  if (liveHead !== work.headSha) {
+    // The PR moved while we were evaluating. For a required-contexts BLOCK this
+    // matters more than for an ordinary verdict: a BLOCK is a lasting verdict,
+    // and landing it here would record it against head A while head B is what
+    // the PR now is. Report it as superseded so the block is suppressed. This
+    // item still finishes -- head B is covered by the item ingest enqueues for
+    // it, not by re-running this one against a SHA that no longer exists.
+    if (verdict.requiredContextsUnavailable) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'superseded_head',
+        reason: 'head_advanced_before_required_contexts_block',
+      });
+    }
+    return finish(deps, work, work.headSha, {
+      disposition: 'stale_head',
+      reason: 'head_advanced_during_review',
+    });
+  }
+
+  // Execution qualification runs AFTER both head gates: an incomplete review
+  // of a head the PR has already moved past is stale, not incomplete, and a
+  // rate-limited or pool-gated head re-read stays a deferral (#1400). Nothing
+  // is published before this point, so the ordering never lets an
+  // unqualified verdict reach GitHub.
+  if (work.executionContext && !qualifiesExecution(work.executionContext, verdict.executionProof)) {
+    return submitIncomplete(
+      work,
+      deps,
+      verdict.reasonCode ?? 'sandbox_execution_proof_missing_or_invalid'
+    );
+  }
+
+  if (work.executionContext) {
+    const ownsFence = deps.hasCustody ? await deps.hasCustody(work.executionContext) : false;
+    if (!ownsFence) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'custody_conflict',
+        reason: 'dispatch_fence_lost_before_publication',
+      });
+    }
+  }
+
+  // REQUIRED CONTEXTS UNAVAILABLE (#775): bounded deferral has been exhausted,
+  // and the head the reviewer evaluated is confirmed to still be the live head.
+  // Post a COMMENT so the PR itself says why it is blocked, then finish with a
+  // terminal non-approving disposition the worker escalates. Submission failure
+  // must NOT convert this into a retry or an approval, so the disposition is
+  // preserved either way -- the escalation is what guarantees a human sees it.
+  if (verdict.requiredContextsUnavailable) {
+    let submitted = false;
+    let submitMessage: string | undefined;
+    try {
+      const result = await deps.submitReview({
+        owner: work.owner,
+        repo: work.repo,
+        number: work.prNumber,
+        event: 'COMMENT',
+        body: buildReviewBody(work, verdict),
+        commitId: work.headSha,
+      });
+      submitted = result.submitted;
+      submitMessage = result.message;
+    } catch (error) {
+      submitMessage = errorCode(error);
+    }
+    return finish(deps, work, work.headSha, {
+      disposition: 'blocked_required_contexts_unavailable',
+      reason: submitted
+        ? 'required_contexts_unavailable_blocked'
+        : `required_contexts_unavailable_blocked:comment_failed:${submitMessage ?? 'unknown'}`,
+      event: 'COMMENT',
+      ...summaryField(verdict),
+    });
+  }
+
+  const event: OverseerReviewEvent = verdict.approved ? 'APPROVE' : 'REQUEST_CHANGES';
+  const body = buildReviewBody(work, verdict);
+
+  if (work.executionContext && (await reviewBodyContainsCredential(body))) {
+    return submitIncomplete(work, deps, 'review_body_credential_leak');
+  }
+
+  if (work.executionContext && verdict.approved) {
+    if (!deps.recordExecutionProof || !verdict.executionProof) {
+      return submitIncomplete(work, deps, 'execution_proof_store_unavailable');
+    }
+    try {
+      await deps.recordExecutionProof({ work, proof: verdict.executionProof });
+    } catch (error) {
+      return submitIncomplete(work, deps, `execution_proof_store_failed:${errorCode(error)}`);
+    }
+    const ownsFence = deps.hasCustody ? await deps.hasCustody(work.executionContext) : false;
+    if (!ownsFence) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'custody_conflict',
+        reason: 'dispatch_fence_lost_immediately_before_post',
+      });
+    }
+  }
+
+  // A rejection with no evidence is not actionable; refuse before the call.
+  if (!verdict.approved && verdict.summary.trim().length === 0) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'submission_failed',
+      reason: 'request_changes_missing_evidence',
+      event,
+    });
+  }
+
+  let submission: SubmitPullRequestReviewResult;
+  try {
+    submission = await deps.submitReview({
+      owner: work.owner,
+      repo: work.repo,
+      number: work.prNumber,
+      event,
+      body,
+      // The exact head this work item is bound to -- the SAME sha the
+      // reviewer verdict was already checked against above. Never the
+      // live/current head; a push during review is caught by the
+      // stale-head check before this call is ever reached.
+      commitId: work.headSha,
+    });
+  } catch (error) {
+    // A rate-limit answer (or the local pool gate) means GitHub did not create
+    // the review, so retrying later cannot double-post. Any other throw stays
+    // terminal: its outcome on GitHub is unknown.
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) return rateLimitedOutcome(deps, work, 'submit', rateLimit);
+    return finish(deps, work, work.headSha, {
+      disposition: 'submission_failed',
+      reason: `submit_threw:${errorCode(error)}`,
+      event,
+    });
+  }
+
+  if (!submission.submitted) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'submission_failed',
+      reason: submission.message ?? 'submit_rejected',
+      event,
+    });
+  }
+
+  if (
+    work.executionContext &&
+    verdict.approved &&
+    (submission.review?.state !== 'APPROVED' || submission.review.commitSha !== work.headSha)
+  ) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'review_incomplete',
+      reason: 'github_approval_response_unqualified',
+      event: 'APPROVE',
+      executionProof: verdict.executionProof,
+    });
+  }
+
+  if (verdict.approved) {
+    // summaryField is REQUIRED here, not optional polish. Splitting the
+    // approved branch out of the shared terminal return dropped it (PR #740
+    // round 6 [minor]), which silently removed the reviewer's text from every
+    // successful approval outcome -- the same text #782 added so the same-head
+    // recheck path can tell a CHECK-caused verdict from a CODE finding.
+    return finish(deps, work, work.headSha, {
+      disposition: 'approved',
+      event,
+      executionProof: verdict.executionProof,
+      githubReview: submission.review,
+      ...summaryField(verdict),
+    });
+  }
+
+  // THE MISSING ARROW. The review has landed as REQUEST_CHANGES; without this
+  // the loop ended here and the finding waited on a human mailbox. Hand it
+  // back to Taskmaster, which decides whether it actually becomes work.
+  const remediation = await handBackToTaskmaster(work, verdict, deps);
+  return finish(deps, work, work.headSha, {
+    disposition: 'changes_requested',
+    event,
+    remediation,
+    ...summaryField(verdict),
+    // #847: an INDETERMINATE posted as REQUEST_CHANGES names its code on the
+    // receipt too. Only set when the reviewer supplied one; a real code finding
+    // has no reasonCode and its receipt shape is unchanged.
+    ...(!verdict.approved && verdict.reasonCode
+      ? { reason: `indeterminate:${verdict.reasonCode}` }
+      : {}),
+  });
+}
+
+const GENERIC_CREDENTIAL_SHAPE =
+  /(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|Bearer\s+[A-Za-z0-9._~+/-]{20,})/i;
+
+function collectLongStrings(value: unknown, into: string[]): void {
+  if (typeof value === 'string') {
+    if (value.length >= 20) into.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectLongStrings(item, into);
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const item of Object.values(value as Record<string, unknown>))
+      collectLongStrings(item, into);
+  }
+}
+
+/** Parent-only final egress guard for the reviewer's accepted residual-risk login. */
+async function reviewBodyContainsCredential(body: string): Promise<boolean> {
+  if (GENERIC_CREDENTIAL_SHAPE.test(body)) return true;
+  try {
+    const login = JSON.parse(await readFile('/home/appuser/.codex/auth.json', 'utf8')) as unknown;
+    const values: string[] = [];
+    collectLongStrings(login, values);
+    return values.some(value => body.includes(value));
+  } catch {
+    // Missing reviewer auth is handled by the broker. The generic shape guard
+    // remains active for test and bootstrap environments without this file.
+    return false;
+  }
+}
+
+function qualifiesExecution(
+  context: ReviewExecutionContext,
+  proof: ReviewExecutionProof | undefined
+): proof is ReviewExecutionProof {
+  if (proof?.requestId !== context.requestId || proof.headSha !== context.headSha) return false;
+  if (!proof.inspectionObserved || proof.nativePolicy !== 'codex_bubblewrap') return false;
+  if (!Number.isInteger(proof.runtimeUid) || proof.runtimeUid === 0 || !proof.treeSha || !proof.cwd)
+    return false;
+  if (context.checkPlanStatus === 'unsafe') return false;
+  if (proof.check_plan !== context.checkPlanStatus) return false;
+  if (proof.checks.length !== context.checkPlan.length) return false;
+  return proof.checks.every(
+    (check, index) =>
+      check.exitCode === 0 &&
+      check.outputDigest.length > 0 &&
+      JSON.stringify(check.argv) === JSON.stringify(context.checkPlan[index])
+  );
+}
+
+async function submitIncomplete(
+  work: ReviewWorkItem,
+  deps: SubmitDeps,
+  reason: string
+): Promise<SubmitOutcome> {
+  const body = `Review incomplete: ${reason}. No approval was recorded.`;
+  let suffix = '';
+  try {
+    const result = await deps.submitReview({
+      owner: work.owner,
+      repo: work.repo,
+      number: work.prNumber,
+      event: 'COMMENT',
+      body,
+      commitId: work.headSha,
+    });
+    if (!result.submitted) suffix = `:comment_failed:${result.message ?? 'unknown'}`;
+  } catch (error) {
+    suffix = `:comment_failed:${errorCode(error)}`;
+  }
+  return finish(deps, work, work.headSha, {
+    disposition: 'review_incomplete',
+    reason: `${reason}${suffix}`,
+    event: 'COMMENT',
+    summary: body,
+  });
+}
+
+/**
+ * Turn a rejected verdict into a remediation proposal for Taskmaster.
+ *
+ * NEVER THROWS. A failure to hand back must not convert a successfully
+ * submitted review into a failed submission -- the review is already on the PR
+ * and that fact must survive. Every failure path degrades to "not emitted" with
+ * a stated reason, which routes the finding to a human: the same place it went
+ * before this capability existed.
+ */
+async function handBackToTaskmaster(
+  work: ReviewWorkItem,
+  verdict: ReviewerVerdict,
+  deps: SubmitDeps
+): Promise<RemediationOutcome> {
+  if (!deps.emitRemediationCandidate || !deps.countPriorRemediationAttempts) {
+    return { emitted: false, reason: 'remediation_not_configured' };
+  }
+
+  let priorAttempts: number;
+  try {
+    priorAttempts = await deps.countPriorRemediationAttempts({
+      owner: work.owner,
+      repo: work.repo,
+      prNumber: work.prNumber,
+    });
+  } catch {
+    // Cannot prove we are under the cap -> must not emit. An unbounded
+    // reviewer-fix-reviewer loop is the exact failure this WO must not create.
+    return { emitted: false, reason: 'emit_failed' };
+  }
+
+  const decision = decideRemediation({
+    owner: work.owner,
+    repo: work.repo,
+    prNumber: work.prNumber,
+    headSha: work.headSha,
+    verdict: 'CHANGES_REQUESTED',
+    findings: verdict.findings ?? [],
+    verdictBody: buildReviewBody(work, verdict),
+    priorAttempts,
+    owningLane: work.author || null,
+  });
+
+  if (!decision.emit) return { emitted: false, reason: decision.reason };
+
+  let result: RemediationEmitResult;
+  try {
+    result = await deps.emitRemediationCandidate(decision.body);
+  } catch {
+    return { emitted: false, reason: 'emit_failed' };
+  }
+  // Losing the race for an attempt slot means another rejected review already
+  // queued this attempt. The cap held; this verdict simply created no work, and
+  // saying so keeps the receipt honest.
+  if (!result.claimed) {
+    return { emitted: false, reason: 'attempt_slot_already_claimed' };
+  }
+  // Report the slot the fence ACTUALLY claimed, not the attempt this delivery
+  // predicted: a concurrent racer may have taken an earlier slot, and a receipt
+  // that disagrees with the durable row is a false audit trail (PR #740 round 5
+  // [minor]). Falling back to the prediction only if the emitter omitted it.
+  return { emitted: true, attempt: result.attempt ?? decision.body.attempt };
+}
+
+/**
+ * The reviewer's posted text, as an optional outcome field.
+ *
+ * Only emitted when the verdict actually carries text, so an outcome never
+ * gains an empty `summary` key that a consumer could mistake for evidence. The
+ * spread form keeps every terminal branch's shape identical to what it was
+ * before this field existed when there is nothing to carry.
+ */
+function summaryField(verdict: ReviewerVerdict): { summary?: string } {
+  const summary = verdict.summary?.trim() ?? '';
+  return summary.length > 0 ? { summary } : {};
+}
+
+/**
+ * The non-terminal `rate_limited` outcome for a GitHub call made AFTER the
+ * reviewer ran (head re-read or review submission). The worker defers the
+ * item to `retryAfter`; the reason names which call was refused.
+ */
+function rateLimitedOutcome(
+  deps: SubmitDeps,
+  work: ReviewWorkItem,
+  stage: 'head_recheck' | 'submit',
+  rateLimit: NonNullable<ReturnType<typeof classifyRateLimitError>>
+): Promise<SubmitOutcome> {
+  return finish(deps, work, work.headSha, {
+    disposition: 'rate_limited',
+    reason: `rate_limited:${stage}:${rateLimit.kind}:${rateLimit.source}`,
+    retryAfter: rateLimit.retryAfter,
+    retryAfterMs: rateLimit.retryAfterMs,
+  });
+}
+
+function errorCode(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message.slice(0, 120);
+  return 'unknown_error';
+}
+
+async function finish(
+  deps: SubmitDeps,
+  work: ReviewWorkItem,
+  headSha: string,
+  outcome: SubmitOutcome
+): Promise<SubmitOutcome> {
+  try {
+    await deps.recordReceipt({
+      correlationId: work.correlationId,
+      messageId: work.messageId,
+      owner: work.owner,
+      repo: work.repo,
+      prNumber: work.prNumber,
+      headSha,
+      disposition: outcome.disposition,
+      ...(outcome.event ? { event: outcome.event } : {}),
+      ...(outcome.reason ? { reason: outcome.reason } : {}),
+      ...(outcome.remediation ? { remediation: outcome.remediation } : {}),
+      ...(outcome.executionProof ? { executionProof: outcome.executionProof } : {}),
+      ...(outcome.githubReview ? { githubReview: outcome.githubReview } : {}),
+    });
+  } catch {
+    // A posted approval whose actual response cannot be made durable is
+    // unknown and must never be presented to downstream code as qualified.
+    if (outcome.disposition === 'approved') {
+      return {
+        ...outcome,
+        disposition: 'review_incomplete',
+        reason: 'github_approval_response_receipt_failed',
+      };
+    }
+  }
+  // The retry instant is part of the outcome, not the receipt: the worker reads
+  // it off the return value to schedule the deferral.
+  return outcome;
+}

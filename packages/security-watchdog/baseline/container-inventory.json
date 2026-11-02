@@ -1,0 +1,21 @@
+[
+  {
+    "name": "lspro-react",
+    "required": true,
+    "secretFilePaths": ["/app/.env"],
+    "checks": [
+      "container-present",
+      "container-running",
+      "expected-image-known",
+      "healthcheck-present",
+      "no-host-network",
+      "no-privileged-mode",
+      "no-root-user",
+      "published-ports-reviewed",
+      "secret-files-declared",
+      "env-file-not-default",
+      "restart-policy-present",
+      "logs-readable"
+    ]
+  }
+]

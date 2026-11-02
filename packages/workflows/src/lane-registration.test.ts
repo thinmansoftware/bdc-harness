@@ -1,0 +1,596 @@
+/**
+ * lane-registration.test.ts
+ *
+ * Test scenario 4 from WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01:
+ *
+ * S4a: Each lane YAML passes parseWorkflow() validation (DAG valid, no loader errors).
+ * S4b: war-council-validator pin matches the lane's dual-cap / quality intent:
+ *      standard/codex/fable -> Claude judge; zero/zero-open/qwen dual-cap -> open models.
+ *
+ * Design: uses the real parseWorkflow() loader so validation logic matches production.
+ */
+
+import { describe, it, expect } from 'bun:test';
+import { readFileSync, readdirSync } from 'fs';
+import { join } from 'path';
+import { parseWorkflow } from './loader';
+import {
+  clearRegistry,
+  getMissingProviderExecutionCapabilities,
+  registerBuiltinProviders,
+  registerCommunityProviders,
+} from '@archon/providers';
+import { deriveNodeExecutionRequirements, isEvidenceNode } from './schemas/dag-node';
+
+clearRegistry();
+registerBuiltinProviders();
+registerCommunityProviders();
+
+const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
+const LANES_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
+
+// All bdc-feature-development lane YAMLs
+const LANE_FILES = readdirSync(LANES_DIR)
+  .filter(f => f.startsWith('bdc-feature-development') && f.endsWith('.yaml'))
+  .sort();
+
+interface NodeDef {
+  id: string;
+  provider?: string;
+  model?: string;
+  persona?: string;
+  agent?: string;
+  fallbackModel?: string;
+  bash?: string;
+  prompt?: string;
+  depends_on?: string[];
+  loop?: {
+    prompt?: string;
+  };
+}
+
+interface LaneDef {
+  name: string;
+  provider?: string;
+  model?: string;
+  nodes?: NodeDef[];
+  run_authority?: {
+    required?: boolean;
+    spec_repository?: string;
+    spec_revision?: string;
+    spec_paths?: string[];
+    allow_issue_fallback?: boolean;
+  };
+}
+
+function loadLane(filename: string): LaneDef {
+  const content = readFileSync(join(LANES_DIR, filename), 'utf-8');
+  return (Bun as unknown as { YAML: { parse(s: string): unknown } }).YAML.parse(content) as LaneDef;
+}
+
+describe('lane registration and war-council-validator pin', () => {
+  it('S4: enumerates exactly the twelve governed feature lanes', () => {
+    // Kimi canary lanes added 2026-07-20 (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01).
+    // Cursor lane added 2026-09-15 (PR #848): grok clone on the Cursor rail.
+    // This enumeration is deliberately hardcoded: it is the tripwire that forces a
+    // new lane to be acknowledged here AND given an explicit validator-pin branch
+    // in S4b below, rather than silently inheriting a default.
+    expect(LANE_FILES).toEqual([
+      'bdc-feature-development-astra.yaml',
+      'bdc-feature-development-codex-only.yaml',
+      'bdc-feature-development-codex.yaml',
+      'bdc-feature-development-cursor.yaml',
+      'bdc-feature-development-fable.yaml',
+      'bdc-feature-development-fusion-cx-kimi.yaml',
+      'bdc-feature-development-fusion-cx-qwen.yaml',
+      'bdc-feature-development-grok.yaml',
+      'bdc-feature-development-kimi-k3.yaml',
+      'bdc-feature-development-zero-claude.yaml',
+      'bdc-feature-development-zero-open.yaml',
+      'bdc-feature-development-zero.yaml',
+      'bdc-feature-development.yaml',
+    ]);
+  });
+
+  for (const file of LANE_FILES) {
+    it(`S4a: ${file} passes parseWorkflow() validation`, () => {
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const result = parseWorkflow(content, file);
+      expect(result.error).toBeNull();
+      expect(result.workflow).not.toBeNull();
+    });
+
+    it(`S4b: ${file} has the expected war-council-validator provider pin`, () => {
+      const lane = loadLane(file);
+      const nodes = lane.nodes ?? [];
+      const wcv = nodes.find((n: NodeDef) => n.id === 'war-council-validator');
+
+      if (!wcv) {
+        // Some lanes may not have the validator (skip gracefully)
+        return;
+      }
+
+      if (file === 'bdc-feature-development-zero.yaml') {
+        // DeepSeek judge through the repository-capable OpenRouter tool loop.
+        expect(wcv.provider).toBe('codex-opr');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-zero-open.yaml') {
+        // DeepSeek judge through the repository-capable OpenRouter tool loop.
+        expect(wcv.provider).toBe('codex-opr');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-zero-claude.yaml') {
+        // DeepSeek judge through the repository-capable OpenRouter tool loop.
+        expect(wcv.provider).toBe('codex-opr');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-fusion-cx-qwen.yaml') {
+        // DeepSeek judge through the repository-capable OpenRouter tool loop.
+        expect(wcv.provider).toBe('codex-opr');
+        return;
+      }
+
+      if (
+        file === 'bdc-feature-development-fusion-cx-kimi.yaml' ||
+        file === 'bdc-feature-development-kimi-k3.yaml'
+      ) {
+        // Kimi canary lanes (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01, 2026-07-20).
+        // Both are clones of fusion-cx-qwen with the BUILDER seats swapped to
+        // Kimi K3; the judge seat is deliberately unchanged, so they inherit the
+        // same DeepSeek-via-OpenRouter validator pin. Keeping the judge off the
+        // builder model is the point -- a lane must not grade its own work.
+        // Dispatchable canaries only; NOT ladder-wired until John reviews results.
+        expect(wcv.provider).toBe('codex-opr');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-cursor.yaml') {
+        // Grok 4.7 builds on the Cursor rail; the judge is codex-native-strict
+        // pinned to Terra so the lane never grades its own work.
+        expect(wcv.provider).toBe('codex-native-strict');
+        expect(wcv.model).toBe('gpt-6.1-terra');
+        expect(wcv.persona).toBe('captain-ci-validator-codex');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-grok.yaml') {
+        // Grok builds; a repository-capable non-Grok judge validates.
+        expect(wcv.provider).toBe('codex-opr');
+        expect(wcv.model).not.toBe('x-ai/grok-4.6');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-astra.yaml') {
+        expect(wcv.provider).toBe('claude');
+        expect(wcv.model).toBe('claude-fable-5');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-codex-only.yaml') {
+        // Claude-out / Codex-in: validator on codex-native-strict with model-free persona.
+        expect(wcv.provider).toBe('codex-native-strict');
+        return;
+      }
+
+      if (file === 'bdc-feature-development-codex.yaml') {
+        // This lane builds with gpt-6.1-sol. The judge is codex-native-strict
+        // pinned to gpt-6.1-terra so the builder never grades its own work.
+        expect(wcv.provider).toBe('codex-native-strict');
+        expect(wcv.model).toBe('gpt-6.1-terra');
+        expect(wcv.persona).toBe('captain-ci-validator-codex');
+        return;
+      }
+
+      if (file === 'bdc-feature-development.yaml') {
+        // Claude lane pins the allowlist id. Provider stays claude.
+        expect(wcv.provider).toBe('claude');
+        expect(wcv.model).toBe('claude-sonnet-5-5');
+        return;
+      }
+
+      // M-121 (John, 2026-08-04): the apex lane's judge serves real
+      // claude-fable-5 again. M-87's sweep to claude-opus-5 was an outage
+      // workaround, not an apex ruling; Opus 5 is the cheap Fable-substitute
+      // and stays on the CLOSER rung (see the codex-lane branch above, which
+      // is correct and unchanged).
+      const expectedModel =
+        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5' : 'sonnet';
+      expect(wcv.provider).toBe('claude');
+      expect(wcv.model).toBe(expectedModel);
+    });
+  }
+
+  it('S4j: zero and zero-open Claude-free recovery roster', () => {
+    // WO-HARNESS-CLAUDE-FREE-LANE-RECOVERY-01: Qwen plans, Grok plan-reviews and
+    // builds/repairs, DeepSeek independently reviews implementation. No Anthropic
+    // executable binding, no overseer-opus persona, no false Claude/paid-seat trailer.
+    for (const file of [
+      'bdc-feature-development-zero.yaml',
+      'bdc-feature-development-zero-open.yaml',
+    ]) {
+      const lane = loadLane(file);
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const nodes = lane.nodes ?? [];
+      const node = (id: string) => nodes.find(candidate => candidate.id === id);
+
+      // Plan author remains the root Qwen provider/model.
+      expect(lane.provider === 'glm' || lane.provider === 'opr-zero').toBe(true);
+      expect(lane.model?.startsWith('qwen/')).toBe(true);
+
+      const planReview = node('plan-review');
+      expect(planReview?.provider, `${file}:plan-review:provider`).toBe('cursor');
+      expect(planReview?.model, `${file}:plan-review:model`).toBe('grok-4.7-high');
+
+      for (const id of ['implement', 'diff-repair', 'opus-repair', 'apply-suggested-fix']) {
+        const executionNode = node(id);
+        expect(executionNode?.provider, `${file}:${id}:provider`).toBe('cursor');
+        expect(executionNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
+      }
+
+      expect(node('apply-suggested-fix')?.agent, `${file}:apply-suggested-fix:agent`).toBe(
+        'major-build-opr'
+      );
+
+      // Independent DeepSeek implementation review seats.
+      const deepseekSeats =
+        file === 'bdc-feature-development-zero-open.yaml'
+          ? [
+              'war-council-validator',
+              'diff-review',
+              'diff-review-final',
+              'opus-rereview',
+              'apply-diff-review-final',
+            ]
+          : [
+              'war-council-validator',
+              'diff-review',
+              'diff-review-final',
+              'opus-rereview',
+              'apply-diff-review-final',
+            ];
+      for (const id of deepseekSeats) {
+        const reviewNode = node(id) as NodeDef & { agent?: string };
+        expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-opr');
+        expect(reviewNode?.model, `${file}:${id}:model`).toBe('deepseek/deepseek-v4-pro-0813');
+        expect(reviewNode?.model, `${file}:${id}:not-gpt`).not.toMatch(/^gpt-/);
+        expect(reviewNode?.model, `${file}:${id}:not-claude`).not.toMatch(/claude/i);
+        expect(reviewNode?.model, `${file}:${id}:not-grok`).not.toBe('x-ai/grok-4.6');
+      }
+
+      // Executable Claude/Anthropic and overseer-opus exclusions.
+      expect(content).not.toMatch(/^\s*provider:\s*claude\b/m);
+      expect(content).not.toMatch(/^\s*model:\s*claude/m);
+      expect(content).not.toContain('agent: overseer-opus');
+      expect(content).not.toMatch(/^\s*failover_provider:\s*claude\b/m);
+      expect(content).not.toMatch(/noreply@(anthropic|paid-seat-vendor)\.com/);
+      expect(content).not.toMatch(/Co-Authored-By:\s*(Claude|paid-seat)/i);
+    }
+  });
+
+  it('S4k: grok/zero/zero-open contain no false Claude or paid-seat commit trailers', () => {
+    for (const file of [
+      'bdc-feature-development-zero.yaml',
+      'bdc-feature-development-zero-open.yaml',
+      'bdc-feature-development-grok.yaml',
+    ]) {
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      expect(content, file).not.toMatch(/noreply@(anthropic|paid-seat-vendor)\.com/);
+      expect(content, file).not.toMatch(/Co-Authored-By:\s*(Claude|paid-seat)/i);
+      expect(content, file).not.toContain('agent: overseer-opus');
+    }
+  });
+
+  const REVIEW_SEAT_IDS = [
+    'plan-review',
+    'war-council-validator',
+    'diff-review',
+    'diff-review-final',
+    'opus-rereview',
+    'findings-consolidate',
+    'apply-diff-review-final',
+  ] as const;
+
+  const REVIEW_PERSONA_ALLOWLIST = new Set<string>([
+    'codex-adversarial-reviewer',
+    'captain-ci-validator-codex',
+    'war-council-architect-opr',
+    'xo-opr',
+  ]);
+
+  function reviewPersona(node: NodeDef | undefined): string | undefined {
+    return node?.persona ?? node?.agent;
+  }
+
+  it('S4l: the Cursor lane builds on grok-4.7 and reviews on codex-native-strict', () => {
+    const file = 'bdc-feature-development-cursor.yaml';
+    const lane = loadLane(file);
+    const grok = loadLane('bdc-feature-development-grok.yaml');
+    const codex = loadLane('bdc-feature-development-codex.yaml');
+    const nodes = lane.nodes ?? [];
+    const node = (id: string) => nodes.find(candidate => candidate.id === id);
+    const codexNode = (id: string) => (codex.nodes ?? []).find(candidate => candidate.id === id);
+
+    expect(lane.provider).toBe('cursor');
+    expect(lane.model).toBe('grok-4.7-high');
+    expect(lane.model?.toLowerCase()).not.toContain('fable');
+    // Same node ids, same order, as the grok lane it was cloned from.
+    expect(nodes.map(n => n.id)).toEqual((grok.nodes ?? []).map(n => n.id));
+
+    for (const candidate of nodes) {
+      if (typeof candidate.model === 'string') {
+        expect(candidate.model.toLowerCase(), `${candidate.id}:model`).not.toContain('fable');
+      }
+      if (candidate.provider === 'cursor') {
+        expect(candidate.model?.startsWith('grok-4.7'), `${candidate.id}:model`).toBe(true);
+      }
+    }
+
+    for (const id of REVIEW_SEAT_IDS) {
+      const reviewNode = node(id);
+      const source = codexNode(id);
+      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-native-strict');
+      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe(source?.provider);
+      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-6.1-terra');
+      expect(source?.model, `codex:${id}:model`).toBe('gpt-6.1-terra');
+      expect(reviewNode?.persona, `${file}:${id}:persona`).toBe(source?.persona);
+      expect(reviewNode?.agent, `${file}:${id}:agent`).toBe(source?.agent);
+      expect(REVIEW_PERSONA_ALLOWLIST.has(reviewPersona(reviewNode) ?? '')).toBe(true);
+    }
+    expect(nodes.filter(n => n.provider === 'claude').map(n => n.id)).toEqual([]);
+    for (const id of [
+      'check-already-satisfied',
+      'plan',
+      'implement',
+      'diff-repair',
+      'opus-repair',
+      'apply-suggested-fix',
+    ]) {
+      const buildNode = node(id);
+      expect(buildNode?.provider, `${file}:${id}:provider`).toBe('cursor');
+      expect(buildNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
+    }
+    const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+    expect(content).not.toMatch(/^\s*provider:\s*claude\b/m);
+    expect(content).not.toMatch(/^\s*provider:\s*(grok|codex-opr)\b/m);
+  });
+
+  it('Test 1: cursor-lane review seats pin Terra on codex-native-strict with model-free personas', () => {
+    const lane = loadLane('bdc-feature-development-cursor.yaml');
+    const nodes = lane.nodes ?? [];
+    for (const id of REVIEW_SEAT_IDS) {
+      const reviewNode = nodes.find(candidate => candidate.id === id);
+      expect(reviewNode?.provider, id).toBe('codex-native-strict');
+      expect(reviewNode?.model, id).toBe('gpt-6.1-terra');
+      expect(reviewNode?.provider, id).not.toBe('claude');
+      expect(reviewNode?.provider, id).not.toBe('cursor');
+      expect(reviewNode?.model ?? '', id).not.toMatch(/grok/i);
+      const persona = reviewPersona(reviewNode);
+      expect(REVIEW_PERSONA_ALLOWLIST.has(persona ?? ''), id).toBe(true);
+      const personaFile = readFileSync(join(REPO_ROOT, '.archon/agents', `${persona}.md`), 'utf-8');
+      const frontmatter = personaFile.split('---')[1] ?? '';
+      expect(frontmatter, persona).not.toMatch(/^model:/m);
+    }
+  });
+
+  it('Test 2: codex-lane review seats are codex-native-strict pinned to gpt-6.1-terra', () => {
+    const lane = loadLane('bdc-feature-development-codex.yaml');
+    const nodes = lane.nodes ?? [];
+    for (const id of REVIEW_SEAT_IDS) {
+      const reviewNode = nodes.find(candidate => candidate.id === id);
+      expect(reviewNode?.provider, id).toBe('codex-native-strict');
+      expect(reviewNode?.model, id).toBe('gpt-6.1-terra');
+      expect(reviewNode?.model, id).not.toBe('gpt-6.1-sol');
+      expect(reviewNode?.provider, id).not.toBe('claude');
+      const persona = reviewPersona(reviewNode);
+      expect(REVIEW_PERSONA_ALLOWLIST.has(persona ?? ''), id).toBe(true);
+    }
+  });
+
+  it('Test 3: no review seat shares its lane build model', () => {
+    const cursor = loadLane('bdc-feature-development-cursor.yaml');
+    const codex = loadLane('bdc-feature-development-codex.yaml');
+    const buildIds = ['implement', 'diff-repair', 'opus-repair'];
+
+    for (const id of buildIds) {
+      const buildNode = (cursor.nodes ?? []).find(candidate => candidate.id === id);
+      expect(buildNode?.model, `cursor:${id}`).toMatch(/^grok-4\.7-/);
+    }
+    for (const id of REVIEW_SEAT_IDS) {
+      const reviewNode = (cursor.nodes ?? []).find(candidate => candidate.id === id);
+      expect(reviewNode?.model, `cursor:${id}`).toBe('gpt-6.1-terra');
+      expect(reviewNode?.model, `cursor:${id}`).not.toBe(cursor.model);
+    }
+
+    for (const id of buildIds) {
+      const buildNode = (codex.nodes ?? []).find(candidate => candidate.id === id);
+      const model = buildNode?.model ?? codex.model;
+      expect(model, `codex:${id}`).toBe('gpt-6.1-sol');
+    }
+    for (const id of REVIEW_SEAT_IDS) {
+      const reviewNode = (codex.nodes ?? []).find(candidate => candidate.id === id);
+      expect(reviewNode?.model, `codex:${id}`).toBe('gpt-6.1-terra');
+      expect(reviewNode?.model, `codex:${id}`).not.toBe('gpt-6.1-sol');
+      expect(reviewNode?.model, `codex:${id}`).not.toBe(codex.model);
+    }
+  });
+
+  it('S4i: the dedicated Grok lane pins execution to Grok and review to non-Grok seats', () => {
+    const file = 'bdc-feature-development-grok.yaml';
+    const lane = loadLane(file);
+    const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+    const nodes = lane.nodes ?? [];
+    const node = (id: string) => nodes.find(candidate => candidate.id === id);
+
+    expect(lane.provider).toBe('cursor');
+    expect(lane.model).toBe('grok-4.7-high');
+    expect(content).not.toContain('provider: claude');
+    expect(content).not.toContain('model: claude');
+    expect(content).not.toContain('agent: overseer-opus');
+
+    for (const id of [
+      'check-already-satisfied',
+      'plan',
+      'implement',
+      'diff-repair',
+      'opus-repair',
+      'apply-suggested-fix',
+    ]) {
+      const executionNode = node(id);
+      expect(executionNode?.provider, `${file}:${id}:provider`).toBe('cursor');
+      expect(executionNode?.model, `${file}:${id}:model`).toBe('grok-4.7-high');
+      expect(executionNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
+    }
+
+    for (const id of [
+      'plan-review',
+      'war-council-validator',
+      'diff-review',
+      'diff-review-final',
+      'opus-rereview',
+      'findings-consolidate',
+      'apply-diff-review-final',
+    ]) {
+      const reviewNode = node(id);
+      expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-opr');
+      expect(reviewNode?.model, `${file}:${id}:model`).not.toBe('grok-4.7-high');
+      expect(reviewNode?.fallbackModel, `${file}:${id}:fallbackModel`).toBeUndefined();
+    }
+  });
+
+  for (const file of LANE_FILES) {
+    it(`S4c: ${file} never assigns a chat-only provider to a builder or repair seat`, () => {
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const result = parseWorkflow(content, file);
+      if (!result.workflow) throw new Error(`${file}: ${result.error?.error ?? 'failed to parse'}`);
+      for (const node of result.workflow.nodes) {
+        if (!['implement', 'diff-repair', 'opus-repair'].includes(node.id)) continue;
+        const provider = node.provider ?? result.workflow.provider;
+        if (!provider) continue;
+        const missing = getMissingProviderExecutionCapabilities(
+          provider,
+          deriveNodeExecutionRequirements(node)
+        );
+        expect(missing, `${file}:${node.id}:${provider}`).toEqual([]);
+      }
+    });
+
+    it(`S4d: ${file} consumes the frozen work-order artifact`, () => {
+      const lane = loadLane(file);
+      expect(lane.run_authority).toEqual({
+        required: true,
+        spec_repository: 'thinmansoftware/bdc-xo',
+        spec_revision: 'main',
+        spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
+        allow_issue_fallback: true,
+      });
+      const readSpec = lane.nodes?.find(node => node.id === 'read-spec');
+      const authoritativePrefix = readSpec?.bash?.split('exit 0', 1)[0] ?? '';
+      expect(authoritativePrefix).toContain('run-authority.json');
+      expect(authoritativePrefix).toContain('work-order.md');
+      expect(authoritativePrefix).toContain('sha256sum');
+      expect(authoritativePrefix).toContain('cat "$AUTHORITY_SPEC"');
+    });
+
+    it(`S4f: ${file} parseWorkflow() output carries run_authority (loader wiring)`, () => {
+      // Regression pin for the 2026-07-10 factory-down incident: S4d validates the
+      // RAW YAML (Bun.YAML.parse), but the loader used to drop run_authority from
+      // the returned WorkflowDefinition, so the orchestrator/executor authority
+      // freeze gate never fired and every /run lane fire died at read-spec with
+      // "scope_authority_missing: run-authority.json". This asserts the PARSED
+      // definition -- the object production dispatch actually sees.
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const result = parseWorkflow(content, file);
+      if (!result.workflow) throw new Error(`${file}: ${result.error?.error ?? 'failed to parse'}`);
+      expect(result.workflow.run_authority).toEqual({
+        required: true,
+        spec_repository: 'thinmansoftware/bdc-xo',
+        spec_revision: 'main',
+        spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
+        allow_issue_fallback: true,
+      });
+    });
+
+    it(`S4g: ${file} wires implement to read gate-already-satisfied output`, () => {
+      const lane = loadLane(file);
+      const implement = lane.nodes?.find(node => node.id === 'implement');
+      expect(implement?.loop?.prompt).toContain('$gate-already-satisfied.output');
+      expect(implement?.loop?.prompt).toContain('PRECHECK_VERDICT=already-satisfied');
+      expect(implement?.loop?.prompt).toContain('Completion Criteria case 2');
+    });
+
+    it(`S4h: ${file} wires plan/plan-review for already-satisfied verification`, () => {
+      const lane = loadLane(file);
+      const plan = lane.nodes?.find(node => node.id === 'plan');
+      const planReview = lane.nodes?.find(node => node.id === 'plan-review');
+      expect(plan?.prompt).toContain('$gate-already-satisfied.output');
+      expect(plan?.prompt).toContain('PRECHECK_VERDICT=already-satisfied');
+      expect(plan?.prompt).toContain('minimal plan that VERIFIES');
+      expect(planReview?.loop?.prompt).toContain('$gate-already-satisfied.output');
+      expect(planReview?.loop?.prompt).toContain('PRECHECK_VERDICT=already-satisfied');
+      expect(planReview?.loop?.prompt).toContain('minimal plan that VERIFIES');
+    });
+
+    it(`S4e: ${file} derives its manifest from mechanical evidence`, () => {
+      const content = readFileSync(join(LANES_DIR, file), 'utf-8');
+      const result = parseWorkflow(content, file);
+      if (!result.workflow) throw new Error(`${file}: ${result.error?.error ?? 'failed to parse'}`);
+      const manifestNode = result.workflow.nodes.find(node => node.id === 'build-manifest');
+      expect(manifestNode).toBeDefined();
+      expect(manifestNode && isEvidenceNode(manifestNode)).toBe(true);
+      expect(manifestNode && 'prompt' in manifestNode).toBe(false);
+    });
+  }
+});
+
+const REPAIR_TARGET_LANES = [
+  'bdc-feature-development-codex.yaml',
+  'bdc-feature-development-cursor.yaml',
+] as const;
+
+const MISMATCH_REASON = 'declared repair target #N does not match the lane-verified record';
+const UNVERIFIED_REASON = 'declared repair target #N was not verified by the lane';
+
+function extractStep4b(prompt: string): string {
+  const start = prompt.indexOf('4b. Repair target');
+  if (start < 0) {
+    throw new Error('step 4b start boundary missing');
+  }
+  const end = prompt.indexOf('\n5. Out-of-scope', start);
+  if (end < 0) {
+    throw new Error('step 4b end boundary missing');
+  }
+  return prompt.slice(start, end);
+}
+
+describe('plan-review repair-target record', () => {
+  for (const file of REPAIR_TARGET_LANES) {
+    it(`${file}: plan-review depends on the lane-verified checkout record`, () => {
+      const lane = loadLane(file);
+      const planReview = lane.nodes?.find(node => node.id === 'plan-review');
+      const prompt = planReview?.loop?.prompt ?? '';
+      const step4b = extractStep4b(prompt);
+
+      expect(planReview?.depends_on).toEqual(['plan', 'checkout-repair-target']);
+      expect(prompt).toContain('$checkout-repair-target.output');
+      expect(step4b).toContain('REPAIR_TARGET');
+      expect(step4b).toContain('REPAIR_TARGET_BRANCH');
+      expect(step4b).not.toContain('WebFetch');
+      expect(step4b).not.toContain('gh pr');
+      expect(step4b).toContain(MISMATCH_REASON);
+      expect(step4b).toContain(UNVERIFIED_REASON);
+    });
+  }
+
+  it('step 4b is byte-identical in the codex and cursor lanes', () => {
+    const blocks = REPAIR_TARGET_LANES.map(file => {
+      const lane = loadLane(file);
+      const prompt = lane.nodes?.find(node => node.id === 'plan-review')?.loop?.prompt ?? '';
+      return extractStep4b(prompt);
+    });
+    expect(blocks[0]).toBe(blocks[1]);
+  });
+});

@@ -1,0 +1,1373 @@
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { generateKeyPairSync } from 'node:crypto';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createAppAuth } from '@octokit/auth-app';
+import {
+  createRealApprovePullRequest,
+  createRealFindPullRequest,
+  createRealFetchExactHeadPullRequestEvidence,
+  createRealGitHubClientDeps,
+  createRealMergePullRequest,
+  resolveGitHubAppAuth,
+  resolveRealOctokitAuthOptions,
+  type RealGitHubOctokitLike,
+} from '../adapters/github-real-deps.ts';
+import type { AttemptCounterKey, AttemptCounterStore } from '../adapters/required-contexts.ts';
+import type { PullRequestRef } from '../types.ts';
+
+// WO-HARNESS-OVERSEER-APP-AUTH-01: Overseer authenticates as the Thinman Overseer
+// GitHub App (App ID 4574893, installation 153295654) so it can APPROVE pull
+// requests without deadlocking required review. These tests pin the auth
+// precedence contract (App-if-complete / PAT-if-absent / throw-if-broken) and the
+// approve path, all network-free.
+
+// A REAL, cryptographically valid RSA private key (PKCS#1 PEM, -----BEGIN RSA
+// PRIVATE KEY-----). resolveGitHubAppAuth now parses the key with
+// crypto.createPrivateKey at construction time, so success-path fixtures must be
+// keys that actually parse -- not a "-----BEGIN"-shaped placeholder. Generated
+// once per test process; RSA-2048 is the GitHub App key size.
+const FAKE_PEM = generateKeyPairSync('rsa', {
+  modulusLength: 2048,
+  publicKeyEncoding: { type: 'spki', format: 'pem' },
+  privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
+}).privateKey;
+
+// PEM-SHAPED but cryptographically INVALID: it carries the -----BEGIN marker (so
+// the old substring check accepted it) yet the base64 body is garbage, so
+// createPrivateKey rejects it. Proves construction-time validation catches a
+// truncated/corrupt key instead of deferring the failure to the first API call.
+const PEM_SHAPED_INVALID = [
+  '-----BEGIN RSA PRIVATE KEY-----',
+  'MIIFAKEKEYCONTENTNOTAREALKEY0000000000000000000000000000000000',
+  '-----END RSA PRIVATE KEY-----',
+  '',
+].join('\n');
+
+const APP_ENV_KEYS = [
+  'GITHUB_APP_ID',
+  'GITHUB_APP_INSTALLATION_ID',
+  'GITHUB_APP_PRIVATE_KEY',
+  'GITHUB_APP_PRIVATE_KEY_PATH',
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+] as const;
+
+const savedEnv = new Map<string, string | undefined>();
+
+beforeEach(() => {
+  for (const key of APP_ENV_KEYS) {
+    savedEnv.set(key, process.env[key]);
+    delete process.env[key];
+  }
+});
+
+describe('unprotected base zero-check attempt bound', () => {
+  const headSha = 'c'.repeat(40);
+
+  function octokit(checkRuns: Array<{ name: string; status: string; conclusion: string | null }>) {
+    return {
+      pulls: {
+        get: async () => ({
+          data: { head: { sha: headSha }, base: { sha: 'b'.repeat(40), ref: 'main' } },
+        }),
+      },
+      repos: {
+        compareCommits: async () => ({ data: { files: [] } }),
+        getAllStatusCheckContexts: async () => {
+          throw Object.assign(new Error('Branch not protected'), { status: 404 });
+        },
+        getBranchRules: async () => ({ data: [] }),
+        getBranch: async () => ({ data: { protected: false } }),
+      },
+      checks: { listForRef: async () => ({ data: { check_runs: checkRuns } }) },
+    } as unknown as RealGitHubOctokitLike;
+  }
+
+  test('third zero-check evaluation blocks and uses a distinct key namespace', async () => {
+    const counts = new Map<string, number>();
+    const keys: AttemptCounterKey[] = [];
+    const store: AttemptCounterStore = {
+      increment: async key => {
+        keys.push(key);
+        const encoded = JSON.stringify(key);
+        const next = (counts.get(encoded) ?? 0) + 1;
+        counts.set(encoded, next);
+        return next;
+      },
+      clear: async key => {
+        counts.delete(JSON.stringify(key));
+      },
+    };
+    const previous = process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS;
+    process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS = '3';
+    try {
+      const fetchEvidence = createRealFetchExactHeadPullRequestEvidence(
+        octokit([]),
+        undefined,
+        store
+      );
+      expect(
+        (await fetchEvidence({ owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha }))
+          .requiredContextsBlocked
+      ).toBeUndefined();
+      expect(
+        (await fetchEvidence({ owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha }))
+          .requiredContextsBlocked
+      ).toBeUndefined();
+      expect(
+        (await fetchEvidence({ owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha }))
+          .requiredContextsBlocked
+      ).toEqual({ reason: 'unprotected_base_no_checks', attempts: 3, failureKind: 'transient' });
+      expect(keys.every(key => key.baseRef === 'zero-checks:main')).toBe(true);
+    } finally {
+      if (previous === undefined) delete process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS;
+      else process.env.OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS = previous;
+    }
+  });
+
+  test('a reported check clears the zero-check streak', async () => {
+    let attempts = 0;
+    const cleared: AttemptCounterKey[] = [];
+    const store: AttemptCounterStore = {
+      increment: async () => ++attempts,
+      clear: async key => {
+        cleared.push(key);
+        attempts = 0;
+      },
+    };
+    const input = { owner: 'thinmansoftware', repo: 'bdc-ci', prNumber: 5, headSha };
+    await createRealFetchExactHeadPullRequestEvidence(octokit([]), undefined, store)(input);
+    await createRealFetchExactHeadPullRequestEvidence(octokit([]), undefined, store)(input);
+    await createRealFetchExactHeadPullRequestEvidence(
+      octokit([{ name: 'test', status: 'in_progress', conclusion: null }]),
+      undefined,
+      store
+    )(input);
+    expect(cleared.some(key => key.baseRef === 'zero-checks:main')).toBe(true);
+    await createRealFetchExactHeadPullRequestEvidence(octokit([]), undefined, store)(input);
+    expect(attempts).toBe(1);
+  });
+});
+
+afterEach(() => {
+  for (const key of APP_ENV_KEYS) {
+    const prior = savedEnv.get(key);
+    if (prior === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = prior;
+    }
+  }
+});
+
+describe('resolveGitHubAppAuth / auth precedence', () => {
+  test('App vars complete -> App auth path chosen', () => {
+    process.env.GITHUB_APP_ID = '4574893';
+    process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+    process.env.GITHUB_APP_PRIVATE_KEY = FAKE_PEM;
+
+    const config = resolveGitHubAppAuth();
+    expect(config).not.toBeNull();
+    expect(config).toMatchObject({
+      appId: '4574893',
+      installationId: '153295654',
+    });
+    expect(config?.privateKey).toContain('-----BEGIN');
+
+    const options = resolveRealOctokitAuthOptions();
+    // App auth path: the App strategy is selected, not a plain token string.
+    expect('authStrategy' in options).toBe(true);
+    if ('authStrategy' in options) {
+      expect(options.authStrategy).toBe(createAppAuth);
+      expect(options.auth.appId).toBe('4574893');
+      expect(options.auth.installationId).toBe('153295654');
+      expect(options.auth.privateKey).toContain('-----BEGIN');
+    }
+  });
+
+  test('App vars absent -> PAT path chosen (no behavior change)', () => {
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+
+    expect(resolveGitHubAppAuth()).toBeNull();
+
+    const options = resolveRealOctokitAuthOptions();
+    expect('authStrategy' in options).toBe(false);
+    expect(options).toEqual({ auth: 'ghp_pat_token_value' });
+  });
+
+  test('App vars partial (private key missing) -> throws naming the var, does NOT fall back to PAT', () => {
+    process.env.GITHUB_APP_ID = '4574893';
+    process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+    // No GITHUB_APP_PRIVATE_KEY / _PATH.
+    // A PAT is ALSO present: proves we fail loudly instead of silently downgrading.
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+
+    expect(() => resolveGitHubAppAuth()).toThrow(/private_key_missing/);
+    // resolveRealOctokitAuthOptions must propagate the throw rather than return the PAT.
+    expect(() => resolveRealOctokitAuthOptions()).toThrow(/private_key_missing/);
+  });
+
+  test('App ID set but installation ID missing -> throws naming the installation var', () => {
+    process.env.GITHUB_APP_ID = '4574893';
+    process.env.GITHUB_APP_PRIVATE_KEY = FAKE_PEM;
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+
+    expect(() => resolveGitHubAppAuth()).toThrow(/GITHUB_APP_INSTALLATION_ID/);
+    expect(() => resolveRealOctokitAuthOptions()).toThrow(/GITHUB_APP_INSTALLATION_ID/);
+  });
+
+  test('malformed private key (no PEM marker) -> throws, does NOT fall back to PAT', () => {
+    process.env.GITHUB_APP_ID = '4574893';
+    process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+    process.env.GITHUB_APP_PRIVATE_KEY = 'not-a-pem-at-all';
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+
+    expect(() => resolveGitHubAppAuth()).toThrow(/private_key_malformed/);
+    expect(() => resolveRealOctokitAuthOptions()).toThrow(/private_key_malformed/);
+  });
+
+  test('PEM-shaped but cryptographically invalid key -> throws malformed, does NOT fall back to PAT', () => {
+    // Regression guard: a substring "-----BEGIN" check would accept this (the marker
+    // is present) but the base64 body is garbage. Construction-time parsing must
+    // reject it here rather than letting it fail on the first signed API call.
+    process.env.GITHUB_APP_ID = '4574893';
+    process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+    process.env.GITHUB_APP_PRIVATE_KEY = PEM_SHAPED_INVALID;
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+
+    expect(() => resolveGitHubAppAuth()).toThrow(/private_key_malformed/);
+    expect(() => resolveRealOctokitAuthOptions()).toThrow(/private_key_malformed/);
+  });
+
+  test('private key from GITHUB_APP_PRIVATE_KEY_PATH -> newlines survive (Risk 11)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'overseer-app-pem-'));
+    const pemPath = join(dir, 'thinman-overseer.pem');
+    try {
+      writeFileSync(pemPath, FAKE_PEM, 'utf8');
+      process.env.GITHUB_APP_ID = '4574893';
+      process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+      process.env.GITHUB_APP_PRIVATE_KEY_PATH = pemPath;
+
+      const config = resolveGitHubAppAuth();
+      expect(config).not.toBeNull();
+      // Real newlines must be preserved (a PEM with all newlines stripped is unusable).
+      expect(config?.privateKey.split('\n').length).toBeGreaterThanOrEqual(3);
+      expect(config?.privateKey).toContain('-----BEGIN RSA PRIVATE KEY-----');
+      expect(config?.privateKey).toContain('-----END RSA PRIVATE KEY-----');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('unreadable GITHUB_APP_PRIVATE_KEY_PATH -> throws naming the path', () => {
+    process.env.GITHUB_APP_ID = '4574893';
+    process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+    process.env.GITHUB_APP_PRIVATE_KEY_PATH = '/nonexistent/definitely/not/here.pem';
+
+    expect(() => resolveGitHubAppAuth()).toThrow(/private_key_unreadable/);
+  });
+
+  test('single-line "\\n"-packed inline PEM is normalized to real newlines', () => {
+    process.env.GITHUB_APP_ID = '4574893';
+    process.env.GITHUB_APP_INSTALLATION_ID = '153295654';
+    // Env managers commonly pack the PEM onto one line with literal backslash-n.
+    // Pack a REAL key so that, after normalization, it parses as a valid PEM.
+    process.env.GITHUB_APP_PRIVATE_KEY = FAKE_PEM.replace(/\n/g, '\\n');
+
+    const config = resolveGitHubAppAuth();
+    expect(config?.privateKey.includes('\\n')).toBe(false);
+    expect(config?.privateKey.split('\n').length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+function approveInput(): PullRequestRef {
+  return { owner: 'bluedevilcollectibles', repo: 'lspro-react', number: 42 };
+}
+
+function octokitWithReview(
+  createReview: NonNullable<RealGitHubOctokitLike['pulls']['createReview']>
+): RealGitHubOctokitLike {
+  return {
+    pulls: {
+      list: async () => ({ data: [] }),
+      get: async () => ({
+        data: {
+          number: 42,
+          title: 't',
+          state: 'open',
+          html_url: 'u',
+          head: { sha: 'a'.repeat(40) },
+        },
+      }),
+      merge: async () => ({ data: { merged: true, sha: 'a'.repeat(40) } }),
+      createReview,
+    },
+    search: { issuesAndPullRequests: async () => ({ data: { items: [] } }) },
+    checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+  };
+}
+
+describe('createRealApprovePullRequest', () => {
+  test('success path -> submits an APPROVE review and returns approved', async () => {
+    const createReview = mock(async () => ({ data: { id: 999, state: 'APPROVED' } }));
+    const result = await createRealApprovePullRequest(octokitWithReview(createReview))(
+      approveInput()
+    );
+
+    expect(createReview).toHaveBeenCalledWith({
+      owner: 'bluedevilcollectibles',
+      repo: 'lspro-react',
+      pull_number: 42,
+      event: 'APPROVE',
+      // The wrapper fetches the live head via pulls.get and binds the review
+      // to it -- octokitWithReview's get() returns 'a'.repeat(40) as the head.
+      commit_id: 'a'.repeat(40),
+    });
+    expect(result).toEqual({ approved: true });
+  });
+
+  test('self-approval rejection -> surfaces a usable message, does not throw', async () => {
+    // GitHub returns 422 with a body message containing "own pull request" when an
+    // identity tries to approve a PR it authored. An App cannot approve its own PR.
+    const createReview = mock(async () => {
+      throw Object.assign(
+        new Error('Unprocessable Entity: Can not approve your own pull request'),
+        {
+          status: 422,
+        }
+      );
+    });
+
+    const result = await createRealApprovePullRequest(octokitWithReview(createReview))(
+      approveInput()
+    );
+
+    expect(result.approved).toBe(false);
+    expect(result.message).toBe('github_review_self_approval_rejected');
+  });
+
+  test('other 422 -> unprocessable message, not self-approval', async () => {
+    const createReview = mock(async () => {
+      throw Object.assign(new Error('Unprocessable Entity: something else entirely'), {
+        status: 422,
+      });
+    });
+    const result = await createRealApprovePullRequest(octokitWithReview(createReview))(
+      approveInput()
+    );
+    expect(result).toEqual({ approved: false, message: 'github_review_unprocessable' });
+  });
+
+  test('transport error -> ambiguous message', async () => {
+    const createReview = mock(async () => {
+      throw new Error('socket closed');
+    });
+    const result = await createRealApprovePullRequest(octokitWithReview(createReview))(
+      approveInput()
+    );
+    expect(result).toEqual({ approved: false, message: 'github_review_transport_ambiguous' });
+  });
+
+  test('missing createReview API -> throws loudly', async () => {
+    const octokit: RealGitHubOctokitLike = {
+      pulls: {
+        list: async () => ({ data: [] }),
+        get: async () => ({
+          data: {
+            number: 42,
+            title: 't',
+            state: 'open',
+            html_url: 'u',
+            head: { sha: 'a'.repeat(40) },
+          },
+        }),
+        merge: async () => ({ data: { merged: true, sha: 'a'.repeat(40) } }),
+        // no createReview
+      },
+      search: { issuesAndPullRequests: async () => ({ data: { items: [] } }) },
+      checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+    };
+    await expect(createRealApprovePullRequest(octokit)(approveInput())).rejects.toThrow(
+      /overseer_real_adapter_missing_review_api/
+    );
+  });
+
+  test('pins commit_id to expectedHeadSha rather than a later live head', async () => {
+    const createReview = mock(async () => ({ data: { id: 999, state: 'APPROVED' } }));
+    const expectedHeadSha = 'b'.repeat(40);
+    const result = await createRealApprovePullRequest(octokitWithReview(createReview))({
+      ...approveInput(),
+      expectedHeadSha,
+    });
+
+    expect(createReview).toHaveBeenCalledWith({
+      owner: 'bluedevilcollectibles',
+      repo: 'lspro-react',
+      pull_number: 42,
+      event: 'APPROVE',
+      commit_id: expectedHeadSha,
+    });
+    expect(result).toEqual({ approved: true });
+  });
+});
+
+describe('createRealMergePullRequest expected head SHA', () => {
+  const reviewed = 'b'.repeat(40);
+  const live = 'a'.repeat(40);
+
+  test('passes expectedHeadSha as pulls.merge sha', async () => {
+    const merge = mock(async () => ({ data: { merged: true, sha: reviewed } }));
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.get = async () => ({
+      data: {
+        number: 42,
+        title: 't',
+        state: 'open',
+        html_url: 'u',
+        head: { sha: reviewed },
+      },
+    });
+    octokit.pulls.merge = merge;
+    const result = await createRealMergePullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 42,
+      expectedHeadSha: reviewed,
+    });
+    expect(merge).toHaveBeenCalledWith({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      pull_number: 42,
+      sha: reviewed,
+      merge_method: 'squash',
+    });
+    expect(result.merged).toBe(true);
+  });
+
+  test('refetched head differs -> no merge call, head_moved', async () => {
+    const merge = mock(async () => ({ data: { merged: true, sha: live } }));
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.merge = merge;
+    const result = await createRealMergePullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 42,
+      expectedHeadSha: reviewed,
+    });
+    expect(merge).not.toHaveBeenCalled();
+    expect(result).toEqual({ merged: false, message: `head_moved:${live}` });
+  });
+
+  test('GitHub 405 precondition mismatch surfaces the API message', async () => {
+    const merge = mock(async () => {
+      throw Object.assign(new Error('Pull Request is not mergeable'), { status: 405 });
+    });
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.get = async () => ({
+      data: {
+        number: 42,
+        title: 't',
+        state: 'open',
+        html_url: 'u',
+        head: { sha: reviewed },
+      },
+    });
+    octokit.pulls.merge = merge;
+    const result = await createRealMergePullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 42,
+      expectedHeadSha: reviewed,
+    });
+    expect(merge).toHaveBeenCalledWith({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      pull_number: 42,
+      sha: reviewed,
+      merge_method: 'squash',
+    });
+    expect(result).toEqual({
+      merged: false,
+      message: 'Pull Request is not mergeable',
+    });
+  });
+});
+
+describe('createRealFindPullRequest rate-limit load profile', () => {
+  test('head branch resolves via pulls.list and still searches siblings for a known WO', async () => {
+    const list = mock(async () => ({
+      data: [
+        {
+          number: 42,
+          title: 'WO-CHEAP-PATH-01',
+          state: 'open',
+          html_url: 'https://github.test/pull/42',
+          head: { sha: 'a'.repeat(40) },
+        },
+      ],
+    }));
+    const search = mock(async () => ({ data: { items: [] } }));
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = list;
+    octokit.search.issuesAndPullRequests = search;
+
+    const result = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      headBranch: 'fix/cheap-path',
+      woId: 'WO-CHEAP-PATH-01',
+    });
+
+    expect(result.exists).toBe(true);
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(search).toHaveBeenCalledTimes(0);
+  });
+
+  test('403 rate limit starts a process-wide backoff and logs only once in the window', async () => {
+    let limited = true;
+    const list = mock(async () => {
+      if (limited) {
+        throw Object.assign(new Error('API rate limit exceeded for installation'), {
+          status: 403,
+          response: { headers: { 'x-ratelimit-remaining': '0' } },
+        });
+      }
+      return {
+        data: [
+          {
+            number: 42,
+            title: 'WO-RATE-LIMIT-01',
+            state: 'open',
+            html_url: 'https://github.test/pull/42',
+            head: { sha: 'a'.repeat(40) },
+          },
+        ],
+      };
+    });
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = list;
+    const warnings: string[] = [];
+    const errors: string[] = [];
+    let now = 1_000;
+    const find = createRealFindPullRequest(octokit, {
+      now: () => now,
+      logger: {
+        warn: (_obj, msg) => warnings.push(msg),
+        error: (_obj, msg) => errors.push(msg),
+      },
+    });
+    const input = {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      headBranch: 'fix/rate-limited',
+      woId: 'WO-RATE-LIMIT-01',
+    };
+
+    const first = await find(input);
+    const second = await find(input);
+
+    expect(first.lookupFailed).toBe(true);
+    expect(second.lookupFailed).toBe(true);
+    expect(list).toHaveBeenCalledTimes(1);
+    expect(warnings).toEqual(['overseer.github_real_deps.rate_limit_backoff']);
+    expect(errors).toEqual([]);
+
+    // Once the window expires, a successful lookup clears the process-wide
+    // state. Moving the injected clock back inside the old window proves the
+    // next call is no longer suppressed by stale backoff state.
+    now = 61_000;
+    limited = false;
+    expect((await find(input)).exists).toBe(true);
+    now = 1_001;
+    expect((await find(input)).exists).toBe(true);
+    expect(list).toHaveBeenCalledTimes(5);
+  });
+
+  test('message-only 403 is classified as a rate limit', async () => {
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = mock(async () => {
+      throw Object.assign(new Error('secondary rate limit exceeded'), { status: 403 });
+    });
+    const warnings: string[] = [];
+    const errors: string[] = [];
+
+    const result = await createRealFindPullRequest(octokit, {
+      now: () => 100_000,
+      logger: {
+        warn: (_obj, msg) => warnings.push(msg),
+        error: (_obj, msg) => errors.push(msg),
+      },
+    })({ owner: 'thinmansoftware', repo: 'bdc-harness', headBranch: 'fix/message-only' });
+
+    expect(result.lookupFailed).toBe(true);
+    expect(warnings).toEqual(['overseer.github_real_deps.rate_limit_backoff']);
+    expect(errors).toEqual([]);
+  });
+
+  test('non-rate-limit 403 logs an error and does not enter backoff', async () => {
+    const list = mock(async () => {
+      throw Object.assign(new Error('Resource not accessible by integration'), { status: 403 });
+    });
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = list;
+    const warnings: string[] = [];
+    const errors: string[] = [];
+    const find = createRealFindPullRequest(octokit, {
+      now: () => 200_000,
+      logger: {
+        warn: (_obj, msg) => warnings.push(msg),
+        error: (_obj, msg) => errors.push(msg),
+      },
+    });
+    const input = { owner: 'thinmansoftware', repo: 'bdc-harness', headBranch: 'fix/forbidden' };
+
+    await find(input);
+    await find(input);
+
+    expect(list).toHaveBeenCalledTimes(2);
+    expect(warnings).toEqual([]);
+    expect(errors).toEqual([
+      'overseer.github_real_deps.find_pull_request_failed',
+      'overseer.github_real_deps.find_pull_request_failed',
+    ]);
+  });
+
+  test('a successful missing result clears expired rate-limit backoff state', async () => {
+    let limited = true;
+    let now = 300_000;
+    const list = mock(async () => {
+      if (limited) {
+        throw Object.assign(new Error('rate limit exceeded'), { status: 403 });
+      }
+      return { data: [] };
+    });
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = list;
+    const find = createRealFindPullRequest(octokit, {
+      now: () => now,
+      logger: { warn: () => {}, error: () => {} },
+    });
+    const input = { owner: 'thinmansoftware', repo: 'bdc-harness', headBranch: 'fix/missing' };
+
+    expect((await find(input)).lookupFailed).toBe(true);
+    now = 360_000;
+    limited = false;
+    expect((await find(input)).state).toBe('missing');
+    now = 300_001;
+    expect((await find(input)).state).toBe('missing');
+    expect(list).toHaveBeenCalledTimes(3);
+  });
+});
+
+// 7th canary defect (2026-08-25): permanent unsearchability must not cycle as transient.
+import { describe as describe422, test as test422, expect as expect422 } from 'bun:test';
+import { createRealFindPullRequest as mkFind422 } from '../adapters/github-real-deps.js';
+
+describe422('findPullRequest permanent 422 handling', () => {
+  test422('unused Search422 cannot affect a complete empty REST result', async () => {
+    const octokit = {
+      pulls: {
+        list: async () => ({ data: [] }),
+        get: async () => {
+          throw new Error('unreachable');
+        },
+      },
+      search: {
+        issuesAndPullRequests: async () => {
+          const e = new Error('Validation Failed: cannot be searched') as Error & {
+            status: number;
+          };
+          e.status = 422;
+          throw e;
+        },
+      },
+      checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+    };
+    const find = mkFind422(octokit as never, {
+      logger: { warn: () => undefined, error: () => undefined } as never,
+    });
+    const evidence = await find({ owner: 'o', repo: 'ungranted-repo', woId: 'WO-X-01' });
+    expect422(evidence.lookupFailed ?? false).toBe(false);
+    expect422(evidence.exists).toBe(false);
+  });
+
+  test422("woId 'unknown' never reaches the search endpoint", async () => {
+    let searched = false;
+    const octokit = {
+      pulls: { list: async () => ({ data: [] }), get: async () => ({ data: {} }) },
+      search: {
+        issuesAndPullRequests: async () => {
+          searched = true;
+          return { data: { items: [] } };
+        },
+      },
+      checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+    };
+    const find = mkFind422(octokit as never, {
+      logger: { warn: () => undefined, error: () => undefined } as never,
+    });
+    const evidence = await find({ owner: 'o', repo: 'r', woId: 'unknown' });
+    expect422(searched).toBe(false);
+    expect422(evidence.exists).toBe(false);
+  });
+});
+
+// 12th canary defect (2026-08-26): mergeable:null is transient, retry before returning.
+import { describe as dNull, test as tNull, expect as eNull } from 'bun:test';
+import { createRealFindPullRequest as mkFindNull } from '../adapters/github-real-deps.js';
+
+dNull('mergeable:null retry', () => {
+  tNull(
+    'retries pulls.get when mergeable is null, uses the resolved value',
+    async () => {
+      let getCalls = 0;
+      const octokit = {
+        pulls: {
+          list: async () => ({ data: [{ number: 1 }] }),
+          get: async () => {
+            getCalls += 1;
+            const mergeable = getCalls < 3 ? null : true;
+            return {
+              data: {
+                number: 1,
+                state: 'open',
+                merged: false,
+                mergeable,
+                head: { sha: 'abc' },
+                title: 't',
+              },
+            };
+          },
+        },
+        checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+        search: { issuesAndPullRequests: async () => ({ data: { items: [] } }) },
+      };
+      const find = mkFindNull(octokit as never, {
+        logger: { warn: () => undefined, error: () => undefined, error2: () => undefined } as never,
+        now: () => 0,
+      });
+      const evidence = await find({ owner: 'o', repo: 'r', headBranch: 'b', woId: 'WO-X-01' });
+      eNull(getCalls).toBe(3);
+      eNull(evidence.mergeable).toBe(true);
+    },
+    15000
+  );
+
+  tNull(
+    'gives up after 3 retries and returns null (judge stays conservative)',
+    async () => {
+      let getCalls = 0;
+      const octokit = {
+        pulls: {
+          list: async () => ({ data: [{ number: 1 }] }),
+          get: async () => {
+            getCalls += 1;
+            return {
+              data: {
+                number: 1,
+                state: 'open',
+                merged: false,
+                mergeable: null,
+                head: { sha: 'abc' },
+                title: 't',
+              },
+            };
+          },
+        },
+        checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+        search: { issuesAndPullRequests: async () => ({ data: { items: [] } }) },
+      };
+      const find = mkFindNull(octokit as never, {
+        logger: { warn: () => undefined, error: () => undefined } as never,
+        now: () => 0,
+      });
+      const evidence = await find({ owner: 'o', repo: 'r', headBranch: 'b', woId: 'WO-X-01' });
+      eNull(getCalls).toBe(4);
+      eNull(evidence.mergeable).toBeNull();
+    },
+    15000
+  );
+});
+
+// THE PAGINATION HOLE (Overseer review, PR #918, [minor]): `per_page: 100`
+// unpaginated on listPullRequestComments meant a receipt marker posted before
+// comment 101 was invisible to the idempotency check, letting a redelivery
+// duplicate the merge receipt on any PR with a busy comment thread.
+describe('createRealGitHubClientDeps listPullRequestComments -- pagination', () => {
+  function octokitWithComments(bodies: string[]): {
+    octokit: RealGitHubOctokitLike;
+    pageLog: number[];
+  } {
+    const pageLog: number[] = [];
+    const octokit = {
+      pulls: {
+        list: async () => ({ data: [] }),
+        get: async () => {
+          throw new Error('pulls.get not used by this test');
+        },
+        merge: async () => ({ data: { merged: false } }),
+      },
+      issues: {
+        createComment: async () => ({ data: { html_url: 'https://github.test/comment' } }),
+        listComments: async (input: { per_page: number; page?: number }) => {
+          const page = input.page ?? 1;
+          pageLog.push(page);
+          const start = (page - 1) * input.per_page;
+          return {
+            data: bodies.slice(start, start + input.per_page).map(body => ({
+              body,
+              user: { login: 'thinman-overseer[bot]' },
+            })),
+          };
+        },
+      },
+      checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+      search: { issuesAndPullRequests: async () => ({ data: { items: [] } }) },
+    } as unknown as RealGitHubOctokitLike;
+    return { octokit, pageLog };
+  }
+
+  test('reads past comment 100 and finds a marker on page 2', async () => {
+    // createRealGitHubClientDeps also constructs a merge-identity client
+    // (M-153) that resolves a token at construction time, unrelated to the
+    // listPullRequestComments path under test here.
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+    const bodies = Array.from({ length: 100 }, (_, i) => `filler ${i}`);
+    bodies.push('<!-- merge-manager-receipt -->\nalready posted');
+    const { octokit, pageLog } = octokitWithComments(bodies);
+    const deps = createRealGitHubClientDeps(octokit);
+    const comments = await deps.listPullRequestComments?.({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 1,
+    });
+    expect(comments).toHaveLength(101);
+    expect(comments?.some(c => c.body.includes('<!-- merge-manager-receipt -->'))).toBe(true);
+    expect(
+      (comments?.at(-1) as { body: string; authorLogin?: string } | undefined)?.authorLogin
+    ).toBe('thinman-overseer[bot]');
+    expect((deps as typeof deps & { commentAuthorLogin?: string }).commentAuthorLogin).toBe(
+      'thinman-overseer[bot]'
+    );
+    expect(pageLog).toEqual([1, 2]);
+  });
+
+  test('stops paginating on the first short page', async () => {
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+    const { octokit, pageLog } = octokitWithComments(['one comment']);
+    const deps = createRealGitHubClientDeps(octokit);
+    const comments = await deps.listPullRequestComments?.({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 1,
+    });
+    expect(comments).toHaveLength(1);
+    expect(pageLog).toEqual([1]);
+  });
+
+  test('reads every available page when the receipt is beyond comment 1000', async () => {
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+    const bodies = Array.from({ length: 1000 }, (_, i) => `filler ${i}`);
+    bodies.push('<!-- merge-manager-receipt -->\nalready posted');
+    const { octokit, pageLog } = octokitWithComments(bodies);
+    const deps = createRealGitHubClientDeps(octokit);
+
+    const comments = await deps.listPullRequestComments?.({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 1,
+    });
+
+    expect(comments).toHaveLength(1001);
+    expect(comments?.at(-1)?.body).toContain('<!-- merge-manager-receipt -->');
+    expect(pageLog).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+  });
+});
+
+describe('WO-search prefers the run PR over an early archon/task PR', () => {
+  interface FixturePr {
+    number: number;
+    headRef: string;
+    author: string;
+    createdAt: string;
+  }
+
+  function octokitFor(prs: FixturePr[], headHit?: number) {
+    const gets: number[] = [];
+    const octokit: RealGitHubOctokitLike = {
+      pulls: {
+        list: async input => ({
+          data: input.head
+            ? headHit === undefined
+              ? []
+              : [
+                  {
+                    number: headHit,
+                    title: 'WO-X-01',
+                    body: null,
+                    state: 'open',
+                    html_url: `https://github.test/pull/${headHit}`,
+                    head: { sha: 'a'.repeat(40), ref: 'head' },
+                  },
+                ]
+            : prs.map(pr => ({
+                number: pr.number,
+                title: 'WO-X-01',
+                body: null,
+                state: 'open',
+                html_url: `https://github.test/pull/${pr.number}`,
+                head: { sha: 'a'.repeat(40), ref: pr.headRef },
+              })),
+        }),
+        get: async input => {
+          const number = Number(input.pull_number);
+          gets.push(number);
+          const match = prs.find(pr => pr.number === number);
+          if (!match) throw new Error(`unexpected pull ${number}`);
+          return {
+            data: {
+              number: match.number,
+              title: 'WO-X-01',
+              body: null,
+              state: 'open',
+              mergeable: true,
+              html_url: `https://github.test/pull/${match.number}`,
+              head: { sha: 'a'.repeat(40), ref: match.headRef },
+              user: { login: match.author },
+              created_at: match.createdAt,
+            },
+          };
+        },
+        merge: async () => ({ data: { merged: false } }),
+      },
+      search: {
+        issuesAndPullRequests: async () => ({
+          data: {
+            items: prs.map(pr => ({ number: pr.number, pull_request: {} })),
+          },
+        }),
+      },
+      checks: { listForRef: async () => ({ data: { check_runs: [] } }) },
+    };
+    return { octokit, gets };
+  }
+
+  const early: FixturePr = {
+    number: 967,
+    headRef: 'archon/task-web-worker-1',
+    author: 'builder',
+    createdAt: '2026-09-25T00:30:00Z',
+  };
+  const own: FixturePr = {
+    number: 968,
+    headRef: 'feat/wo-x-01-thread-abc',
+    author: 'builder',
+    createdAt: '2026-09-25T01:00:00Z',
+  };
+
+  test('selects the non-archon/task PR and lists the early PR beside it', async () => {
+    const { octokit, gets } = octokitFor([early, own]);
+    const evidence = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+    });
+
+    expect(gets).toContain(967);
+    expect(gets).toContain(968);
+    expect(evidence.pr).toMatchObject({
+      number: 968,
+      headRef: 'feat/wo-x-01-thread-abc',
+      author: 'builder',
+      createdAt: '2026-09-25T01:00:00Z',
+    });
+    expect(evidence.otherOpenPrsForWo).toEqual([
+      {
+        number: 967,
+        headRef: 'archon/task-web-worker-1',
+        createdAt: '2026-09-25T00:30:00Z',
+      },
+    ]);
+  });
+
+  test('selects the archon/task PR when it is the only match', async () => {
+    const { octokit } = octokitFor([early]);
+    const evidence = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+    });
+
+    expect(evidence.pr?.number).toBe(967);
+    expect(evidence.pr?.headRef).toBe('archon/task-web-worker-1');
+    expect(evidence.otherOpenPrsForWo).toEqual([]);
+  });
+
+  test('selects none when every match is an archon/task PR', async () => {
+    const second: FixturePr = {
+      number: 969,
+      headRef: 'archon/task-web-worker-2',
+      author: 'builder',
+      createdAt: '2026-09-25T01:10:00Z',
+    };
+    const { octokit } = octokitFor([early, second]);
+    const evidence = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+    });
+
+    expect(evidence.exists).toBe(false);
+    expect(evidence.pr).toBeUndefined();
+    expect(evidence.otherOpenPrsForWo).toEqual([
+      {
+        number: 967,
+        headRef: 'archon/task-web-worker-1',
+        createdAt: '2026-09-25T00:30:00Z',
+      },
+      {
+        number: 969,
+        headRef: 'archon/task-web-worker-2',
+        createdAt: '2026-09-25T01:10:00Z',
+      },
+    ]);
+  });
+
+  test('recovered head branch keeps its own PR and lists the archon/task sibling', async () => {
+    const { octokit, gets } = octokitFor([early, own], own.number);
+    const evidence = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+      headBranch: own.headRef,
+    });
+
+    expect(gets).toContain(967);
+    expect(gets).toContain(968);
+    expect(evidence.pr).toMatchObject({
+      number: 968,
+      headRef: 'feat/wo-x-01-thread-abc',
+    });
+    expect(evidence.otherOpenPrsForWo).toEqual([
+      {
+        number: 967,
+        headRef: 'archon/task-web-worker-1',
+        createdAt: '2026-09-25T00:30:00Z',
+      },
+    ]);
+    expect(evidence.otherOpenPrsForWoLookupFailed).toBeUndefined();
+  });
+
+  test('resolved head-branch PR survives a throwing sibling listing', async () => {
+    const { octokit } = octokitFor([early, own], own.number);
+    const list = octokit.pulls.list;
+    octokit.pulls.list = async input => {
+      if (!input.head) throw new Error('listing unavailable');
+      return list(input);
+    };
+
+    const evidence = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+      headBranch: own.headRef,
+    });
+
+    expect(evidence.exists).toBe(true);
+    expect(evidence.lookupFailed).toBeUndefined();
+    expect(evidence.state).not.toBe('lookup_failed');
+    expect(evidence.pr).toMatchObject({
+      number: 968,
+      headRef: 'feat/wo-x-01-thread-abc',
+      author: 'builder',
+      createdAt: '2026-09-25T01:00:00Z',
+    });
+    expect(evidence.otherOpenPrsForWo).toEqual([]);
+    expect(evidence.otherOpenPrsForWoLookupFailed).toBe(true);
+  });
+
+  test('resolved head-branch PR survives a sibling pulls.get rejection', async () => {
+    const { octokit } = octokitFor([early, own], own.number);
+    const get = octokit.pulls.get;
+    octokit.pulls.get = async input => {
+      if (Number(input.pull_number) === early.number) {
+        throw new Error('sibling pulls.get failed');
+      }
+      return get(input);
+    };
+
+    const evidence = await createRealFindPullRequest(octokit)({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+      headBranch: own.headRef,
+    });
+
+    expect(evidence.exists).toBe(true);
+    expect(evidence.lookupFailed).toBeUndefined();
+    expect(evidence.pr?.number).toBe(968);
+    expect(evidence.otherOpenPrsForWo).toEqual([]);
+    expect(evidence.otherOpenPrsForWoLookupFailed).toBe(true);
+  });
+
+  test('sibling listing rate limit keeps the resolved PR and starts backoff', async () => {
+    const { octokit } = octokitFor([own], own.number);
+    let limited = true;
+    const list = octokit.pulls.list;
+    octokit.pulls.list = async input => {
+      if (input.head) return list(input);
+      if (limited) {
+        throw Object.assign(new Error('API rate limit exceeded for installation'), {
+          status: 403,
+          response: { headers: { 'x-ratelimit-remaining': '0' } },
+        });
+      }
+      return { data: [] };
+    };
+    const warnings: string[] = [];
+    let now = 500_000;
+    const find = createRealFindPullRequest(octokit, {
+      now: () => now,
+      logger: {
+        warn: (_obj, msg) => warnings.push(msg),
+        error: (_obj, msg) => {
+          throw new Error(`unexpected error log: ${msg}`);
+        },
+      },
+    });
+    const input = {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      woId: 'WO-X-01',
+      headBranch: own.headRef,
+    };
+
+    const first = await find(input);
+    expect(first.exists).toBe(true);
+    expect(first.lookupFailed).toBeUndefined();
+    expect(first.pr?.number).toBe(968);
+    expect(first.otherOpenPrsForWo).toEqual([]);
+    expect(first.otherOpenPrsForWoLookupFailed).toBe(true);
+    expect(warnings).toEqual(['overseer.github_real_deps.rate_limit_backoff']);
+
+    const suppressed = await find(input);
+    expect(suppressed.lookupFailed).toBe(true);
+
+    now = 560_000;
+    limited = false;
+    const cleared = await find(input);
+    expect(cleared.exists).toBe(true);
+    expect(cleared.otherOpenPrsForWoLookupFailed).toBeUndefined();
+  });
+});
+
+describe('WO discovery uses complete REST listing without Search', () => {
+  function row(number: number, title = 'WO-REST-01', body: string | null = null) {
+    return {
+      number,
+      title,
+      body,
+      state: 'open',
+      html_url: `https://github.test/pull/${number}`,
+      head: { sha: 'a'.repeat(40), ref: `fix/${number}` },
+      user: { login: 'builder' },
+      created_at: '2026-10-18T00:00:00Z',
+    };
+  }
+  function fixture(pages: unknown[], headHit?: number) {
+    const calls: Record<string, unknown>[] = [];
+    let searchCalls = 0;
+    const octokit = octokitWithReview(async () => ({ data: { id: 1, state: 'APPROVED' } }));
+    octokit.pulls.list = async input => {
+      calls.push(input);
+      if (input.head) return { data: headHit ? [row(headHit)] : [] };
+      const index = Number(input.page ?? 1) - 1;
+      const data = index < pages.length ? pages[index] : [];
+      if (data instanceof Error) throw data;
+      return { data: data as ReturnType<typeof row>[] };
+    };
+    octokit.pulls.get = async input => ({ data: row(Number(input.pull_number)) });
+    octokit.search.issuesAndPullRequests = async () => {
+      searchCalls++;
+      throw new Error('Search resource exhausted while core is healthy');
+    };
+    return { octokit, calls, searchCalls: () => searchCalls };
+  }
+  const input = { owner: 'thinmansoftware', repo: 'bdc-harness', woId: 'WO-REST-01' };
+
+  test('reads past100 and selects exact body match without touching exhausted Search', async () => {
+    const f = fixture([
+      Array.from({ length: 100 }, (_, i) => row(i + 1, 'unrelated')),
+      [row(101, 'custom title', 'implements WO-REST-01')],
+    ]);
+    const evidence = await createRealFindPullRequest(f.octokit)(input);
+    expect(evidence.pr?.number).toBe(101);
+    expect(f.searchCalls()).toBe(0);
+    expect(f.calls.map(call => call.page)).toEqual([1, 2]);
+  });
+
+  test('all candidates are considered before builder selection; presentation stays bounded', async () => {
+    const builders = Array.from({ length: 6 }, (_, i) => ({
+      ...row(i + 1),
+      head: { sha: 'a'.repeat(40), ref: `archon/task-${i}` },
+    }));
+    const f = fixture([[...builders, row(7)]]);
+    f.octokit.pulls.get = async request => ({
+      data: [...builders, row(7)].find(pr => pr.number === request.pull_number)!,
+    });
+    const evidence = await createRealFindPullRequest(f.octokit)(input);
+    expect(evidence.pr?.number).toBe(7);
+    expect(evidence.otherOpenPrsForWo).toHaveLength(5);
+    expect(f.searchCalls()).toBe(0);
+  });
+
+  test('exact token boundaries and excluded sections do not claim another WO', async () => {
+    const f = fixture([
+      [
+        row(1, 'WO-REST-010'),
+        row(2, 'XWO-REST-01'),
+        row(3, 'custom', '## Files explicitly out of scope\nWO-REST-01'),
+        row(4, 'custom', '## Not in scope\nWO-REST-01\n## Implemented\nWO-REST-01'),
+      ],
+    ]);
+    const evidence = await createRealFindPullRequest(f.octokit)(input);
+    expect(evidence.pr?.number).toBe(4);
+    expect(evidence.otherOpenPrsForWo).toEqual([]);
+    expect(f.searchCalls()).toBe(0);
+  });
+
+  test.each(['ceiling', 'malformed-page', 'malformed-row', 'late-error'])(
+    '%s remains unknown without Search fallback',
+    async mode => {
+      const full = Array.from({ length: 100 }, (_, i) => row(i + 1));
+      const pages =
+        mode === 'ceiling'
+          ? Array.from({ length: 10 }, () => full)
+          : mode === 'malformed-page'
+            ? [{}]
+            : mode === 'malformed-row'
+              ? [[row(1), { ...row(2), body: 42 }]]
+              : [full, new Error('later page failed')];
+      const f = fixture(pages);
+      const evidence = await createRealFindPullRequest(f.octokit)(input);
+      expect(evidence.lookupFailed).toBe(true);
+      expect(evidence.state).toBe('lookup_failed');
+      expect(f.searchCalls()).toBe(0);
+    }
+  );
+
+  test('incomplete sibling listing preserves resolved head but reports unknown siblings', async () => {
+    const f = fixture(
+      [Array.from({ length: 100 }, (_, i) => row(i + 1)), new Error('later page failed')],
+      42
+    );
+    const evidence = await createRealFindPullRequest(f.octokit)({ ...input, headBranch: 'fix/42' });
+    expect(evidence.pr?.number).toBe(42);
+    expect(evidence.otherOpenPrsForWoLookupFailed).toBe(true);
+    expect(f.searchCalls()).toBe(0);
+  });
+
+  test.each([null, undefined])('null/absent page %s cannot prove absence', async page => {
+    const f = fixture([page]);
+    expect((await createRealFindPullRequest(f.octokit)(input)).lookupFailed).toBe(true);
+    expect(f.searchCalls()).toBe(0);
+  });
+
+  test.each(['number', 'state', 'title', 'body', 'head'])(
+    'invalid nonmatching %s blocks primary discovery',
+    async field => {
+      const invalid = { ...row(2, 'unrelated'), [field]: undefined };
+      const f = fixture([[row(1), invalid]]);
+      expect((await createRealFindPullRequest(f.octokit)(input)).lookupFailed).toBe(true);
+    }
+  );
+
+  test.each(['', '   '])('blank head reference %s remains unknown', async ref => {
+    const f = fixture([[{ ...row(1), head: { sha: 'a'.repeat(40), ref } }]]);
+    expect((await createRealFindPullRequest(f.octokit)(input)).lookupFailed).toBe(true);
+  });
+
+  test('identical repeated PR numbers are fetched once; conflicting identity is unknown', async () => {
+    const f = fixture([[row(1), row(1)]]);
+    let gets = 0;
+    const get = f.octokit.pulls.get;
+    f.octokit.pulls.get = async request => {
+      gets++;
+      return get(request);
+    };
+    const evidence = await createRealFindPullRequest(f.octokit)(input);
+    expect(evidence.pr?.number).toBe(1);
+    // One candidate refresh and one selected evidence read.
+    expect(gets).toBe(2);
+    const conflict = fixture([
+      [row(1), { ...row(1), head: { sha: 'b'.repeat(40), ref: 'other' } }],
+    ]);
+    expect((await createRealFindPullRequest(conflict.octokit)(input)).lookupFailed).toBe(true);
+  });
+
+  test.each(['wrong-number', 'missing-body', 'changed-claim', 'closed'])(
+    'candidate refresh %s cannot select stale identity',
+    async mode => {
+      const f = fixture([[row(1)]]);
+      f.octokit.pulls.get = async () => ({
+        data:
+          mode === 'wrong-number'
+            ? row(2)
+            : mode === 'missing-body'
+              ? { ...row(1), body: undefined }
+              : mode === 'changed-claim'
+                ? row(1, 'unrelated')
+                : { ...row(1), state: 'closed' },
+      });
+      const evidence = await createRealFindPullRequest(f.octokit)(input);
+      expect(evidence.exists).toBe(false);
+      expect(evidence.lookupFailed).toBe(mode === 'wrong-number' || mode === 'missing-body');
+    }
+  );
+
+  test.each(['WO-REST-01-FOLLOWUP', 'OTHER-WO-REST-01'])(
+    'hyphen identifier %s is not an exact claim',
+    async title => {
+      const f = fixture([[row(1, title)]]);
+      const evidence = await createRealFindPullRequest(f.octokit)(input);
+      expect(evidence.exists).toBe(false);
+      expect(evidence.lookupFailed).toBe(false);
+    }
+  );
+
+  test.each(['primary', 'head', 'sibling', 'direct'])(
+    'HTTP422 %s discovery preserves the applicable unknown/direct contract',
+    async mode => {
+      const f = fixture([Object.assign(new Error('REST validation failed'), { status: 422 })], 42);
+      const request =
+        mode === 'direct'
+          ? { ...input, prNumber: 42 }
+          : mode === 'sibling' || mode === 'head'
+            ? { ...input, headBranch: 'fix/42' }
+            : input;
+      if (mode === 'head')
+        f.octokit.pulls.list = async () => {
+          throw Object.assign(new Error('head lookup validation'), { status: 422 });
+        };
+      if (mode === 'direct')
+        f.octokit.pulls.get = async () => {
+          throw Object.assign(new Error('direct legacy422'), { status: 422 });
+        };
+      const evidence = await createRealFindPullRequest(f.octokit)(request);
+      if (mode === 'sibling') {
+        expect(evidence.pr?.number).toBe(42);
+        expect(evidence.otherOpenPrsForWoLookupFailed).toBe(true);
+      } else expect(evidence.lookupFailed).toBe(mode === 'primary' || mode === 'head');
+    }
+  );
+
+  test('explicit PR number still uses direct addressing without any listing', async () => {
+    const f = fixture([new Error('listing must not run')]);
+    const evidence = await createRealFindPullRequest(f.octokit)({ ...input, prNumber: 42 });
+    expect(evidence.pr?.number).toBe(42);
+    expect(f.calls).toEqual([]);
+    expect(f.searchCalls()).toBe(0);
+  });
+});

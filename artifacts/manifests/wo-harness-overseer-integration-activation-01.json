@@ -1,0 +1,158 @@
+{
+  "schema_version": "m42-parent-manifest-v1",
+  "wo_id": "WO-HARNESS-OVERSEER-INTEGRATION-ACTIVATION-01",
+  "builder_login": "codex-slice8-repair-builder",
+  "reviewer_login": "pending-independent-reviewer",
+  "builder": {
+    "provider": "openai",
+    "model": "codex-gpt-5"
+  },
+  "independent_review": {
+    "state": "pending",
+    "artifact_sha256": null,
+    "raw_transcript_sha256": null,
+    "reviewed_at": null,
+    "note": "A reviewer-owned external artifact must pass scripts/verify-m42-independent-review.ts at the exact candidate and child heads. GitHub review rows are optional additional evidence."
+  },
+  "pr_number": null,
+  "head_sha": null,
+  "prior_staging_sha": "4927c2db53b1a1e0ddce8142a162f04d3d16b729",
+  "image_digest": null,
+  "status": "BLOCKED",
+  "readiness_packet": null,
+  "proceed_deploy": "N/A",
+  "completion_statement": "Slice 8 build in progress; parent remains BLOCKED until S1/S2 review satisfaction, completed fake staging proof, and rollback evidence. No provider canary, paid Fusion, production deploy, live operator authority, or capability activation.",
+  "blockers": [
+    "unsatisfied review evidence: WO-HARNESS-OVERSEER-SAFETY-GATES-STAGING-01",
+    "unsatisfied review evidence: WO-HARNESS-OVERSEER-M31-SUBSTRATE-01",
+    "indeterminate review evidence: WO-HARNESS-OVERSEER-ESCALATION-BRIEFING-01",
+    "indeterminate review evidence: WO-HARNESS-OVERSEER-M31-CONTRACT-V2-01",
+    "indeterminate review evidence: WO-HARNESS-OVERSEER-CONTROL-PLANE-01",
+    "indeterminate review evidence: WO-HARNESS-OVERSEER-REPAIR-REFIRE-01",
+    "indeterminate review evidence: WO-HARNESS-OVERSEER-REFRESH-REBASE-01",
+    "indeterminate review evidence: WO-HARNESS-OVERSEER-LIFECYCLE-SALVAGE-01",
+    "indeterminate review evidence: WO-HARNESS-OVERSEER-QUALIFIED-MERGE-01",
+    "staging proof not run in builder session",
+    "rollback proof not run in builder session",
+    "independent exact-head review artifact not yet supplied or validated",
+    "unsigned activation packets withheld until staging proof and child review evidence are satisfied",
+    "exact PR head is external git metadata and remains pending until this manifest commit is published"
+  ],
+  "migrations": {
+    "029": ["029_board_authority_foundation.sql", "029_known_bad_bindings.sql"],
+    "035": ["035_overseer_escalation_briefing.sql"],
+    "036": ["036_overseer_m31_target_contract_v2.sql"],
+    "037": ["037_overseer_control_plane.sql"]
+  },
+  "contract_blobs": {
+    "m31_v1": "db368cbfc0209f1e96c90c5e7b6544f093d80cac",
+    "m31_v2": "f050c58a907622e210d231dda5ab38cc845afe1c"
+  },
+  "children": [
+    {
+      "wo_id": "WO-HARNESS-OVERSEER-SAFETY-GATES-STAGING-01",
+      "pr_number": 461,
+      "base_sha": "b954f23f0d1bf42066dd2773f95536211f13331a",
+      "pr_head": "a1ac6be240240e5e363ebab64014d13387fbaaa8",
+      "reviewed_head": "a1ac6be240240e5e363ebab64014d13387fbaaa8",
+      "merge_sha": "ac94ba522dd51c3c7530b979ea8a4508fa86fa88",
+      "review_state": "unsatisfied"
+    },
+    {
+      "wo_id": "WO-HARNESS-OVERSEER-M31-SUBSTRATE-01",
+      "pr_number": 458,
+      "base_sha": "83262796948efadabc04753afd106fa0f371e3d4",
+      "pr_head": "fa6240786cdfef4274dafd7a54e9fdf2c5751138",
+      "reviewed_head": "fa6240786cdfef4274dafd7a54e9fdf2c5751138",
+      "merge_sha": "fad167902f213ed09a48e3bcea5f69602bf3a32c",
+      "review_state": "unsatisfied"
+    },
+    {
+      "wo_id": "WO-HARNESS-OVERSEER-ESCALATION-BRIEFING-01",
+      "pr_number": 468,
+      "base_sha": "d10b9cac6c909e2029744a57de2b8529d7714a0f",
+      "pr_head": "83d049bf898d3e4349b942a3ca45927f903959c9",
+      "reviewed_head": "83d049bf898d3e4349b942a3ca45927f903959c9",
+      "merge_sha": "728bf175ce12585e328879716502084fc8d6ace0",
+      "review_state": "indeterminate"
+    },
+    {
+      "wo_id": "WO-HARNESS-OVERSEER-M31-CONTRACT-V2-01",
+      "pr_number": 471,
+      "base_sha": "728bf175ce12585e328879716502084fc8d6ace0",
+      "pr_head": "86a4e70779fdf547840d180abe7e5c83ab20f693",
+      "reviewed_head": "86a4e70779fdf547840d180abe7e5c83ab20f693",
+      "merge_sha": "4964804458218ca973f075310db37732d879437d",
+      "review_state": "indeterminate"
+    },
+    {
+      "wo_id": "WO-HARNESS-OVERSEER-CONTROL-PLANE-01",
+      "pr_number": 472,
+      "base_sha": "a85fdcc80d1eeb7304c740beb688a0c9888b92b4",
+      "pr_head": "63c7ce0ac4cc532ced6f253d70095d3bc31bdbb4",
+      "reviewed_head": "63c7ce0ac4cc532ced6f253d70095d3bc31bdbb4",
+      "merge_sha": "b54c0998924c03c60c3854fcdb1175ed9cd0c506",
+      "review_state": "indeterminate"
+    },
+    {
+      "wo_id": "WO-HARNESS-OVERSEER-REPAIR-REFIRE-01",
+      "pr_number": 476,
+      "base_sha": "62c1d2f624b0b7c7f846604a722ad0eb8f030786",
+      "pr_head": "d0c11475903f56e12997a62c6c6d9c972434b094",
+      "reviewed_head": "d0c11475903f56e12997a62c6c6d9c972434b094",
+      "merge_sha": "79dea99286aacfe8f84fd22733026b2ca62b1e64",
+      "review_state": "indeterminate"
+    },
+    {
+      "wo_id": "WO-HARNESS-OVERSEER-REFRESH-REBASE-01",
+      "pr_number": 475,
+      "base_sha": "62c1d2f624b0b7c7f846604a722ad0eb8f030786",
+      "pr_head": "48ad4db6fb9c259141552cc2207522408477b710",
+      "reviewed_head": "48ad4db6fb9c259141552cc2207522408477b710",
+      "merge_sha": "b7b38a9703843f78004979a90b20911c42c1a324",
+      "review_state": "indeterminate"
+    },
+    {
+      "wo_id": "WO-HARNESS-OVERSEER-LIFECYCLE-SALVAGE-01",
+      "pr_number": 480,
+      "base_sha": "b7b38a9703843f78004979a90b20911c42c1a324",
+      "pr_head": "db881d0c7e1aea15aaff3f20b1509d3f9ba5d0c7",
+      "reviewed_head": "db881d0c7e1aea15aaff3f20b1509d3f9ba5d0c7",
+      "merge_sha": "0e8d1f977440d8331a1134d405108590b9dfff4c",
+      "review_state": "indeterminate"
+    },
+    {
+      "wo_id": "WO-HARNESS-OVERSEER-QUALIFIED-MERGE-01",
+      "pr_number": 478,
+      "base_sha": "b7b38a9703843f78004979a90b20911c42c1a324",
+      "pr_head": "9073142bb9106f6365aabe0b16310c567649ddca",
+      "reviewed_head": "9073142bb9106f6365aabe0b16310c567649ddca",
+      "merge_sha": "4927c2db53b1a1e0ddce8142a162f04d3d16b729",
+      "review_state": "indeterminate"
+    }
+  ],
+  "scenario_receipts": {
+    "success_chain": "unit_harness_only",
+    "adversarial_matrix": "unit_harness_only",
+    "real_call_count": null,
+    "image_digest": null,
+    "note": "Deterministic S4-S7 integration harnesses pass in unit tests; Docker staging/rollback proofs not run (host has no container engine). READY=false."
+  },
+  "rollback": {
+    "status": "not_run_in_builder_session",
+    "prior_staging_sha": "4927c2db53b1a1e0ddce8142a162f04d3d16b729",
+    "evidence_retained": false
+  },
+  "ready": false,
+  "notes": [
+    "BLOCKED pre-proof manifest: missing Docker staging proof, missing rollback proof, no image digest, no validated independent-review artifact, no unsigned packets.",
+    "Historical GitHub review rows remain unchanged and may be retained as optional additional evidence; no retroactive approval fabricated.",
+    "Stop 7 requires a content-addressed external reviewer artifact covering the exact parent candidate and every exact child head.",
+    "Stop 7 exact-head independent review is NOT claimed complete by the builder.",
+    "Unsigned packets withheld while status=BLOCKED; packet builders reject zero prior SHA and zero verifier digests.",
+    "Official proof host corrected to Docker-capable LAPTOP-BQ6IEJNC; Stops 3-4 remain pending external execution at this committed head.",
+    "No provider canary, paid Fusion, production deploy, capability enablement, or live operator authority.",
+    "The committed BLOCKED manifest intentionally does not self-claim its containing commit SHA.",
+    "The original Slice 8 implementation was produced on a Grok lane; the exact-head repair candidate was modified by Codex and therefore uses the Codex repairer identity for Stop 7 independence."
+  ]
+}

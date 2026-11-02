@@ -1,0 +1,317 @@
+{
+  "schemaVersion": "dynamic-lane-snapshot/v4",
+  "evaluationTime": "2026-10-17T12:00:00.000Z",
+  "runId": "run-synthetic-001",
+  "nodeId": "plan",
+  "scopeId": "scope-synthetic-001",
+  "aiRole": "plan",
+  "node": {
+    "id": "plan",
+    "prompt": "Create a plan.",
+    "allowed_tools": []
+  },
+  "authority": {
+    "runId": "run-synthetic-001",
+    "dispatchId": "dispatch-001",
+    "woId": "WO-SYNTHETIC-001",
+    "specSource": "fixture",
+    "specRevision": "revision-001",
+    "specHash": "sha256:synthetic",
+    "workflowName": "synthetic",
+    "codebaseId": "fixture",
+    "canonicalRemote": "example.invalid/fixture",
+    "baseBranch": "dev",
+    "baseSha": "base-001",
+    "runScopeSha": "scope-sha-001",
+    "headBranch": "fixture/dynamic-lane",
+    "worktreePath": "/synthetic",
+    "workflowRevision": "workflow-001",
+    "bundleRevision": "bundle-001",
+    "engineRevision": "engine-001",
+    "runtimeImageRevision": null,
+    "createdAt": "2026-10-17T10:00:00.000Z"
+  },
+  "expectedAuthority": {
+    "runScopeSha": "scope-sha-001",
+    "headBranch": "fixture/dynamic-lane"
+  },
+  "custody": {
+    "known": true,
+    "held": true
+  },
+  "ready": true,
+  "dependenciesComplete": true,
+  "cancelled": false,
+  "paused": false,
+  "activeWriter": false,
+  "cancellationAcknowledged": true,
+  "candidateAllowlist": ["claude-plan", "codex-plan"],
+  "candidates": [
+    {
+      "candidateId": "codex-plan",
+      "provider": "codex",
+      "model": "gpt-synthetic",
+      "routerAccountId": "haiku-sub",
+      "workerAccountId": "codex",
+      "registered": true,
+      "capabilities": ["text"],
+      "nextStepCost": 2,
+      "family": "openai",
+      "familyMappingEvidence": {
+        "family": "openai",
+        "sourceRef": "registry:codex-plan",
+        "availableAt": "2026-10-17T11:00:00.000Z"
+      },
+      "transport": "subscription",
+      "contextCompatible": true,
+      "reviewerQualification": {
+        "strength": "strong",
+        "version": "reviewer-qualification/v1",
+        "sourceRef": "fixture:qualification",
+        "availableAt": "2026-10-17T11:00:00.000Z"
+      }
+    },
+    {
+      "candidateId": "claude-plan",
+      "provider": "claude",
+      "model": "claude-synthetic",
+      "routerAccountId": "haiku-sub",
+      "workerAccountId": "claude",
+      "registered": true,
+      "capabilities": ["text"],
+      "nextStepCost": 2,
+      "family": "anthropic",
+      "familyMappingEvidence": {
+        "family": "anthropic",
+        "sourceRef": "registry:claude-plan",
+        "availableAt": "2026-10-17T11:00:00.000Z"
+      },
+      "transport": "subscription",
+      "contextCompatible": true,
+      "reviewerQualification": {
+        "strength": "strong",
+        "version": "reviewer-qualification/v1",
+        "sourceRef": "fixture:qualification",
+        "availableAt": "2026-10-17T11:00:00.000Z"
+      }
+    }
+  ],
+  "modelResolution": {
+    "workflowProvider": "codex",
+    "workflowModel": "gpt-synthetic",
+    "operatorBinding": null
+  },
+  "accounts": [
+    {
+      "accountId": "haiku-sub",
+      "limit": 100,
+      "spend": 1,
+      "commitments": 0,
+      "verificationAllowance": 1,
+      "capacity": "healthy",
+      "observedAt": "2026-10-17T11:59:00.000Z",
+      "expiresAt": "2026-10-17T12:10:00.000Z",
+      "seat": "haiku-sub",
+      "window": "synthetic-window",
+      "sourceRef": "fixture:account:haiku-sub"
+    },
+    {
+      "accountId": "codex",
+      "limit": 100,
+      "spend": 1,
+      "commitments": 0,
+      "verificationAllowance": 1,
+      "capacity": "healthy",
+      "observedAt": "2026-10-17T11:59:00.000Z",
+      "expiresAt": "2026-10-17T12:10:00.000Z",
+      "seat": "codex",
+      "window": "synthetic-window",
+      "sourceRef": "fixture:account:codex"
+    },
+    {
+      "accountId": "claude",
+      "limit": 100,
+      "spend": 1,
+      "commitments": 0,
+      "verificationAllowance": 1,
+      "capacity": "healthy",
+      "observedAt": "2026-10-17T11:59:00.000Z",
+      "expiresAt": "2026-10-17T12:10:00.000Z",
+      "seat": "claude",
+      "window": "synthetic-window",
+      "sourceRef": "fixture:account:claude"
+    },
+    {
+      "accountId": "luna-sub",
+      "limit": 100,
+      "spend": 1,
+      "commitments": 0,
+      "verificationAllowance": 1,
+      "capacity": "healthy",
+      "observedAt": "2026-10-17T11:59:00.000Z",
+      "expiresAt": "2026-10-17T12:10:00.000Z",
+      "seat": "luna-sub",
+      "window": "synthetic-window",
+      "sourceRef": "fixture:account:luna-sub"
+    },
+    {
+      "accountId": "haiku-api",
+      "limit": 100,
+      "spend": 1,
+      "commitments": 0,
+      "verificationAllowance": 1,
+      "capacity": "healthy",
+      "observedAt": "2026-10-17T11:59:00.000Z",
+      "expiresAt": "2026-10-17T12:10:00.000Z",
+      "seat": "haiku-api",
+      "window": "synthetic-window",
+      "sourceRef": "fixture:account:haiku-api"
+    }
+  ],
+  "budget": {
+    "limit": 100,
+    "spend": 1,
+    "commitments": 0,
+    "verificationAllowance": 2,
+    "routerCallAllowance": 1
+  },
+  "providerAttempts": [],
+  "providerAttemptCeiling": 3,
+  "contributingFamilies": [],
+  "currentArtifactHash": null,
+  "reviewTargetHash": null,
+  "taskBrief": {
+    "version": "task-brief/v1",
+    "text": "Plan the synthetic task.",
+    "sourceRef": "fixture:brief",
+    "availableAt": "2026-10-17T11:00:00.000Z"
+  },
+  "roleObjective": {
+    "version": "role-objective/v1",
+    "role": "plan",
+    "text": "Produce a bounded plan.",
+    "acceptanceCriteria": ["Plan is complete"],
+    "sourceRef": "fixture:objective",
+    "availableAt": "2026-10-17T11:00:00.000Z"
+  },
+  "decisionEvidence": {
+    "version": "decision-evidence/v1",
+    "availability": "supplied",
+    "noPriorArtifactReason": null,
+    "items": [
+      {
+        "evidenceId": "evidence-001",
+        "sourceRef": "fixture:evidence",
+        "contentHash": "sha256:evidence",
+        "observedAt": "2026-10-17T11:00:00.000Z",
+        "availableAt": "2026-10-17T11:00:00.000Z",
+        "content": "Sanitized synthetic evidence.",
+        "kind": "decision_time"
+      }
+    ]
+  },
+  "candidateProfiles": [
+    {
+      "candidateId": "codex-plan",
+      "profileVersion": "candidate-profile/v1",
+      "applicableRoles": ["plan"],
+      "observations": [
+        {
+          "scope": "synthetic",
+          "provenance": "fixture",
+          "availableAt": "2026-10-17T11:00:00.000Z"
+        }
+      ],
+      "sourceRefs": ["fixture:profile:codex"],
+      "availableAt": "2026-10-17T11:00:00.000Z",
+      "limitations": ["Synthetic only"]
+    },
+    {
+      "candidateId": "claude-plan",
+      "profileVersion": "candidate-profile/v1",
+      "applicableRoles": ["plan"],
+      "observations": [
+        {
+          "scope": "synthetic",
+          "provenance": "fixture",
+          "availableAt": "2026-10-17T11:00:00.000Z"
+        }
+      ],
+      "sourceRefs": ["fixture:profile:claude"],
+      "availableAt": "2026-10-17T11:00:00.000Z",
+      "limitations": ["Synthetic only"]
+    }
+  ],
+  "policy": {
+    "maxCapacityAgeMs": 300000,
+    "maxDecisionAgeMs": 300000
+  },
+  "decisionId": "decision-synthetic-001",
+  "promptVersion": "dynamic-worker-choice/v1",
+  "routerCallsConsumed": 0,
+  "routerCallCeiling": 3,
+  "monthlyBudgetPolicy": {
+    "mode": "uncapped",
+    "effectiveFrom": "2026-10-01T00:00:00.000Z",
+    "effectiveUntil": "2026-11-01T00:00:00.000Z",
+    "authorizationRef": "fixture:John-October-policy"
+  },
+  "priorDecisions": {
+    "availableAt": "2026-10-17T11:00:00.000Z",
+    "sourceRef": "fixture:prior-ledger",
+    "entries": []
+  },
+  "decisionExchanges": [],
+  "routingResourcePlan": [
+    {
+      "routeId": "haiku-subscription",
+      "engineId": "haiku",
+      "requestedModel": "claude-haiku-5-5",
+      "transport": "subscription",
+      "accountId": "haiku-sub",
+      "adapterId": "claude",
+      "estimatedCost": 1,
+      "authorized": true,
+      "bindingEvidence": {
+        "sourceRef": "fixture:binding:haiku-subscription",
+        "availableAt": "2026-10-17T11:00:00.000Z"
+      },
+      "apiBillingEvidence": null
+    },
+    {
+      "routeId": "luna-subscription",
+      "engineId": "luna",
+      "requestedModel": "gpt-6-luna",
+      "transport": "subscription",
+      "accountId": "luna-sub",
+      "adapterId": "codex-native-strict",
+      "estimatedCost": 1,
+      "authorized": true,
+      "bindingEvidence": {
+        "sourceRef": "fixture:binding:luna-subscription",
+        "availableAt": "2026-10-17T11:00:00.000Z"
+      },
+      "apiBillingEvidence": null
+    },
+    {
+      "routeId": "haiku-api",
+      "engineId": "haiku",
+      "requestedModel": "claude-haiku-5-5",
+      "transport": "api",
+      "accountId": "haiku-api",
+      "adapterId": "claude-api",
+      "estimatedCost": 1,
+      "authorized": true,
+      "bindingEvidence": {
+        "sourceRef": "fixture:binding:haiku-api",
+        "availableAt": "2026-10-17T11:00:00.000Z"
+      },
+      "apiBillingEvidence": {
+        "sourceRef": "fixture:billing",
+        "availableAt": "2026-10-17T11:00:00.000Z",
+        "expiresAt": "2026-10-18T11:00:00.000Z",
+        "status": "available"
+      }
+    }
+  ]
+}
