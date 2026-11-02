@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import type { DispatchMessage } from '@archon/core/db/dispatch';
+import type { DispatchMessage, SeqCursorMessage } from '@archon/core/db/dispatch';
 import type { ReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
 import type { SubmitDeps, SubmitOutcome } from '@archon/overseer/pr-review-submit';
 import { runAndSubmitReview } from '@archon/overseer/pr-review-submit';
@@ -800,13 +800,13 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
       status: 'claimed',
       lease_expires_at: new Date(1_000_000 + leaseMs).toISOString(),
     });
-    const listMessages = mock(async () => [
-      claimedFor('live', sha(1), 60_000),
-      claimedFor('dead', sha(2), -60_000),
+    const listClaimedReviews = mock(async () => [
+      { ...claimedFor('live', sha(1), 60_000), cursor_seq: 1 },
+      { ...claimedFor('dead', sha(2), -60_000), cursor_seq: 2 },
     ]);
     const { logger, entries } = captureLogger();
     const evictor = createReviewCheckoutEvictor({
-      listMessages,
+      listClaimedReviews,
       checkoutRoot: root,
       maxBytes: 1,
       now: () => 1_000_000,
@@ -814,8 +814,9 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
       lookupPrState: async () => ({ state: 'merged' }),
     });
     await evictor({ protect: [] });
-    expect(listMessages).toHaveBeenCalledWith({
+    expect(listClaimedReviews).toHaveBeenCalledWith({
       recipient: 'overseer-reviewer',
+      task_type: 'run_review',
       status: 'claimed',
       limit: 500,
     });
@@ -825,6 +826,63 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
     expect(existsSync(join(scratch, 'file'))).toBe(true);
     expect(existsSync(join(tmpBuild, 'file'))).toBe(true);
     expect(evictedMessages(entries).map(e => e.headSha)).not.toContain(sha(1));
+  });
+
+  test('a live claim behind 500 stale claims is still protected (claims are walked by page)', async () => {
+    const live = await cachedCheckout(root, 'o', 'r', sha(1), 100, 900);
+    for (let i = 2; i <= 4; i += 1) await cachedCheckout(root, 'o', 'r', sha(i), 100, 1_000 + i);
+    const claim = (id: string, head: string, leaseMs: number, seq: number): SeqCursorMessage => ({
+      ...message(id, head),
+      body: JSON.stringify({ owner: 'o', repo: 'r', prNumber: 7, headSha: head, baseRef: 'dev' }),
+      status: 'claimed',
+      lease_expires_at: new Date(1_000_000 + leaseMs).toISOString(),
+      cursor_seq: seq,
+    });
+    // Page 1: 500 expired claims (the oldest rows). Page 2: the one live review.
+    const stale = Array.from({ length: 500 }, (_, i) =>
+      claim(`stale-${i}`, sha(9), -60_000, i + 1)
+    );
+    const calls: (number | undefined)[] = [];
+    const listClaimedReviews = async (filters: {
+      afterSeq?: number;
+    }): Promise<SeqCursorMessage[]> => {
+      calls.push(filters.afterSeq);
+      if (filters.afterSeq === undefined) return stale;
+      if (filters.afterSeq === 500) return [claim('live', sha(1), 60_000, 501)];
+      return [];
+    };
+    const evictor = createReviewCheckoutEvictor({
+      listClaimedReviews,
+      checkoutRoot: root,
+      maxBytes: 1,
+      now: () => 1_000_000,
+      logger: captureLogger().logger,
+    });
+    await evictor({ protect: [] });
+    expect(calls).toEqual([undefined, 500]);
+    expect(existsSync(live)).toBe(true);
+  });
+
+  test('a claim walk that cannot finish skips the pass instead of evicting', async () => {
+    const head = await cachedCheckout(root, 'o', 'r', sha(1), 100, 900);
+    for (let i = 2; i <= 4; i += 1) await cachedCheckout(root, 'o', 'r', sha(i), 100, 1_000 + i);
+    const { logger, entries } = captureLogger();
+    let seq = 0;
+    const evictor = createReviewCheckoutEvictor({
+      // Always a full page: the walk never ends, so it must give up and skip.
+      listClaimedReviews: async () =>
+        Array.from({ length: 500 }, () => {
+          seq += 1;
+          return { ...message(`m${seq}`, sha(9)), status: 'claimed' as const, cursor_seq: seq };
+        }),
+      checkoutRoot: root,
+      maxBytes: 1,
+      now: () => 1_000_000,
+      logger,
+    });
+    expect(await evictor({ protect: [] })).toBeNull();
+    expect(entries.map(e => e.message)).toEqual(['overseer_review_checkout_eviction_skipped']);
+    expect(existsSync(head)).toBe(true);
   });
 
   test('protected head survives, unreadable claims skip the pass, GitHub is throttled', async () => {
@@ -837,7 +895,7 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
     let nowMs = 1_000_000;
     let failClaims = true;
     const evictor = createReviewCheckoutEvictor({
-      listMessages: async () => {
+      listClaimedReviews: async () => {
         if (failClaims) throw new Error('db_down');
         return [];
       },

@@ -39,11 +39,13 @@ import {
   deferMessage,
   heartbeatWorker,
   listMessages,
+  listMessagesBySeqCursor,
   postResult,
   registerWorker,
   releaseMessage,
   renewMessageLease,
   type DispatchMessage,
+  type SeqCursorMessage,
   type DispatchTaskOutcome,
 } from '@archon/core/db/dispatch';
 import {
@@ -292,7 +294,7 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
       return recoverParkedJudgeHeads(ingestDeps, defaultReviewLadder());
     },
     evictCheckouts: createReviewCheckoutEvictor({
-      listMessages,
+      listClaimedReviews: listMessagesBySeqCursor,
       lookupPrState: createGitHubReviewCheckoutPrLookup(),
     }),
   };
@@ -1254,11 +1256,18 @@ export function createGitHubReviewCheckoutPrLookup(
 }
 
 export interface ReviewCheckoutEvictorDeps {
-  listMessages: (filters: {
+  /**
+   * Keyset reader over claimed run_review rows (listMessagesBySeqCursor). The
+   * evictor walks EVERY page: a single capped read could hide a live claim
+   * behind stale ones and let its checkout be deleted mid-review.
+   */
+  listClaimedReviews: (filters: {
     recipient: string;
+    task_type: string;
     status: 'claimed';
+    afterSeq?: number;
     limit: number;
-  }) => Promise<DispatchMessage[]>;
+  }) => Promise<SeqCursorMessage[]>;
   lookupPrState?: ReviewCheckoutPrLookup;
   checkoutRoot?: string;
   /** Defaults to OVERSEER_REVIEW_CHECKOUT_CACHE_MAX_BYTES, read on every pass. */
@@ -1274,6 +1283,10 @@ export interface ReviewCheckoutEvictorDeps {
  * the pass is SKIPPED (never evict blind). GitHub is consulted at most once
  * per state-sweep interval; other passes are cap-only.
  */
+const REVIEW_CHECKOUT_CLAIM_PAGE_SIZE = 500;
+/** 100 pages x 500 = 50,000 claimed rows; beyond that the pass is skipped. */
+const REVIEW_CHECKOUT_CLAIM_MAX_PAGES = 100;
+
 export function createReviewCheckoutEvictor(
   deps: ReviewCheckoutEvictorDeps
 ): (input: {
@@ -1282,13 +1295,26 @@ export function createReviewCheckoutEvictor(
   let lastStateSweepAt = Number.NEGATIVE_INFINITY;
   return async ({ protect }) => {
     const logger = deps.logger ?? log;
-    let claimed: DispatchMessage[];
+    // Walk every claimed run_review page. If the walk cannot finish (store error
+    // or more pages than any real queue holds), skip the whole pass: eviction
+    // with an incomplete in-use set could delete a checkout under a live review.
+    const claimed: DispatchMessage[] = [];
     try {
-      claimed = await deps.listMessages({
-        recipient: REVIEW_RECIPIENT,
-        status: 'claimed',
-        limit: 500,
-      });
+      let afterSeq: number | undefined;
+      for (let page = 0; ; page += 1) {
+        if (page >= REVIEW_CHECKOUT_CLAIM_MAX_PAGES) throw new Error('claim_walk_incomplete');
+        const rows = await deps.listClaimedReviews({
+          recipient: REVIEW_RECIPIENT,
+          task_type: REVIEW_TASK_TYPE,
+          status: 'claimed',
+          ...(afterSeq === undefined ? {} : { afterSeq }),
+          limit: REVIEW_CHECKOUT_CLAIM_PAGE_SIZE,
+        });
+        claimed.push(...rows);
+        if (rows.length < REVIEW_CHECKOUT_CLAIM_PAGE_SIZE) break;
+        afterSeq = rows[rows.length - 1]?.cursor_seq;
+        if (afterSeq === undefined) throw new Error('claim_walk_incomplete');
+      }
     } catch (error) {
       logger.warn(
         { error: error instanceof Error ? error.message : String(error) },
