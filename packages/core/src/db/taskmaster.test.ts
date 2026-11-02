@@ -785,6 +785,76 @@ afterEach(async () => {
 });
 
 describe('tm_journal DAL', () => {
+  test('fresh journal admits all seven verbs and still refuses unknown verbs', async () => {
+    for (const verb of [
+      'deliver_ruling',
+      'nudge',
+      'escalate_p0',
+      'digest',
+      'fire_cauldron',
+      'blocker_report',
+      'remediation_nudge',
+    ] as const) {
+      const row = await recordAction({
+        thread_ref: 'test:seven-verbs',
+        action_type: verb,
+        proposal_json: '{}',
+        outcome: 'deferred',
+      });
+      expect(row.action_type).toBe(verb);
+    }
+    await expect(
+      db.query(
+        "INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,outcome) VALUES ('invalid','test','unknown_verb','{}','deferred')"
+      )
+    ).rejects.toThrow();
+    expect(
+      (await db.query("SELECT id FROM tm_journal WHERE thread_ref='test:seven-verbs'")).rows
+    ).toHaveLength(7);
+  });
+
+  test('legacy six-verb journal upgrades without losing rows or sibling constraints', async () => {
+    const path = join(tmpdir(), `taskmaster-remediation-legacy-${Date.now()}-${Math.random()}.db`);
+    const seed = new Database(path);
+    seed.exec(`CREATE TABLE tm_journal (
+      id TEXT PRIMARY KEY, created_at TEXT NOT NULL, thread_ref TEXT NOT NULL,
+      action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling','nudge','escalate_p0','digest','fire_cauldron','blocker_report')),
+      proposal_json TEXT NOT NULL, idempotency_key TEXT, before_hash TEXT,
+      proof_predicate TEXT, proof_deadline_at TEXT,
+      outcome TEXT NOT NULL CHECK (outcome IN ('pending','sent','parked','deferred','rejected','expired','failed')),
+      graded_at TEXT, grade TEXT CHECK (grade IS NULL OR grade IN ('useful','noise','harmful','unheard','delivered_to_issue'))
+    )`);
+    seed
+      .query(
+        "INSERT INTO tm_journal(id,created_at,thread_ref,action_type,proposal_json,outcome) VALUES ('old','2026-10-18T00:00:00Z','test','blocker_report','{}','sent')"
+      )
+      .run();
+    seed.close();
+    const upgraded = new SqliteAdapter(path);
+    try {
+      expect(
+        (
+          await upgraded.query<{ id: string; action_type: string }>(
+            'SELECT id, action_type FROM tm_journal'
+          )
+        ).rows
+      ).toEqual([{ id: 'old', action_type: 'blocker_report' }]);
+      await upgraded.query(
+        "INSERT INTO tm_journal(id,thread_ref,action_type,proposal_json,outcome) VALUES ('new','test','remediation_nudge','{}','deferred')"
+      );
+      await expect(
+        upgraded.query("UPDATE tm_journal SET outcome='invented' WHERE id='old'")
+      ).rejects.toThrow();
+      await expect(
+        upgraded.query("UPDATE tm_journal SET grade='invented' WHERE id='old'")
+      ).rejects.toThrow();
+      expect((await upgraded.query('SELECT id FROM tm_journal')).rows).toHaveLength(2);
+    } finally {
+      await upgraded.close();
+      unlinkSync(path);
+    }
+  });
+
   test('reset winning before notice enqueue rejects the obsolete paused epoch', async () => {
     await db.query(`INSERT INTO dispatch_principals
       (principal_id, display_name, delivery_mode, active)
