@@ -472,14 +472,6 @@ export async function runAndSubmitReview(
     });
   }
 
-  if (work.executionContext && !qualifiesExecution(work.executionContext, verdict.executionProof)) {
-    return submitIncomplete(
-      work,
-      deps,
-      verdict.reasonCode ?? 'sandbox_execution_proof_missing_or_invalid'
-    );
-  }
-
   // EXACT-HEAD BINDING: the reviewer must have examined the bound head.
   //
   // Both head gates run BEFORE the required-contexts block below. A blocked
@@ -543,6 +535,19 @@ export async function runAndSubmitReview(
       disposition: 'stale_head',
       reason: 'head_advanced_during_review',
     });
+  }
+
+  // Execution qualification runs AFTER both head gates: an incomplete review
+  // of a head the PR has already moved past is stale, not incomplete, and a
+  // rate-limited or pool-gated head re-read stays a deferral (#1400). Nothing
+  // is published before this point, so the ordering never lets an
+  // unqualified verdict reach GitHub.
+  if (work.executionContext && !qualifiesExecution(work.executionContext, verdict.executionProof)) {
+    return submitIncomplete(
+      work,
+      deps,
+      verdict.reasonCode ?? 'sandbox_execution_proof_missing_or_invalid'
+    );
   }
 
   if (work.executionContext) {

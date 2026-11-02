@@ -128,8 +128,9 @@ async function createRemote(
   for (const [name, file] of Object.entries(files)) {
     await mkdir(join(remote, name, '..'), { recursive: true });
     await writeFile(join(remote, name), file.content);
+    // core.filemode=true: the worktree bit is what `git add` records as 100755.
+    if (file.executable) await chmod(join(remote, name), 0o755);
     await git(remote, ['add', name]);
-    if (file.executable) await git(remote, ['update-index', '--chmod=+x', name]);
   }
   await writeFile(join(remote, 'change.txt'), 'pr change\n');
   await git(remote, ['add', 'change.txt']);
