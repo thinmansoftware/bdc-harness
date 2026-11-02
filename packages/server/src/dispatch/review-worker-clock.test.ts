@@ -4,12 +4,31 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join as joinPath } from 'node:path';
+
+// Each test process gets its own spool lock, so a lock left by an earlier run
+// (or the real /var/lib/overseer-review) never makes a tick look busy.
+process.env.OVERSEER_REVIEW_SPOOL_LOCK = joinPath(
+  mkdtempSync(joinPath(tmpdir(), 'review-spool-lock-')),
+  '.review-worker.lock'
+);
+
+/** A spool lock that is held, for evictor unit tests. */
+const heldLock = (): ReviewSpoolLock => ({
+  path: 'test-lock',
+  token: 't',
+  held: async () => true,
+  release: async () => undefined,
+});
 import type { DispatchMessage, SeqCursorMessage } from '@archon/core/db/dispatch';
 import type { ReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
 import type { SubmitDeps, SubmitOutcome } from '@archon/overseer/pr-review-submit';
 import { runAndSubmitReview } from '@archon/overseer/pr-review-submit';
 import type { createRealOctokitClient } from '@archon/overseer/adapters/github-real-deps';
 import {
+  acquireReviewSpoolLock,
   createGitHubReviewCheckoutPrLookup,
   createReviewCheckoutEvictor,
   DEFAULT_REVIEW_CHECKOUT_CACHE_MAX_BYTES,
@@ -22,6 +41,7 @@ import {
   stopReviewWorkerClock,
   tickReviewWorkerClock,
   type ReviewCheckoutCacheLogger,
+  type ReviewSpoolLock,
   type ReviewCheckoutPrState,
   type ReviewWorkerDeps,
 } from './review-worker-clock';
@@ -813,7 +833,7 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
       logger,
       lookupPrState: async () => ({ state: 'merged' }),
     });
-    await evictor({ protect: [] });
+    await evictor({ protect: [], lock: heldLock() });
     expect(listClaimedReviews).toHaveBeenCalledWith({
       recipient: 'overseer-reviewer',
       task_type: 'run_review',
@@ -858,9 +878,67 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
       now: () => 1_000_000,
       logger: captureLogger().logger,
     });
-    await evictor({ protect: [] });
+    await evictor({ protect: [], lock: heldLock() });
     expect(calls).toEqual([undefined, 500]);
     expect(existsSync(live)).toBe(true);
+  });
+
+  test('single writer: eviction without a held spool lock deletes nothing', async () => {
+    const head = await cachedCheckout(root, 'o', 'r', sha(1), 100, 900);
+    for (let i = 2; i <= 4; i += 1) await cachedCheckout(root, 'o', 'r', sha(i), 100, 1_000 + i);
+    const { logger, entries } = captureLogger();
+    const listClaimedReviews = mock(async (): Promise<SeqCursorMessage[]> => []);
+    const evictor = createReviewCheckoutEvictor({
+      listClaimedReviews,
+      checkoutRoot: root,
+      maxBytes: 1,
+      now: () => 1_000_000,
+      logger,
+    });
+    const notHeld: ReviewSpoolLock = { ...heldLock(), held: async () => false };
+    expect(await evictor({ protect: [], lock: notHeld })).toBeNull();
+    expect(listClaimedReviews).not.toHaveBeenCalled();
+    expect(existsSync(head)).toBe(true);
+    expect(entries.map(e => e.message)).toEqual(['overseer_review_checkout_eviction_skipped']);
+    // Lost between the claim read and the delete: still nothing is deleted.
+    let checks = 0;
+    const lostMidPass: ReviewSpoolLock = { ...heldLock(), held: async () => (checks += 1) === 1 };
+    expect(await evictor({ protect: [], lock: lostMidPass })).toBeNull();
+    expect(existsSync(head)).toBe(true);
+  });
+
+  test('single writer: a second worker waits while the spool lock is held, and a stale lock is taken over', async () => {
+    const lockPath = join(root, '.review-worker.lock');
+    const first = await acquireReviewSpoolLock(lockPath);
+    expect(first).not.toBeNull();
+    expect(await first!.held()).toBe(true);
+    // A second worker on the same spool gets nothing while the lock is fresh.
+    expect(await acquireReviewSpoolLock(lockPath)).toBeNull();
+    // ...and takes it over only once the holder stopped refreshing it.
+    const later = Date.now() + 11 * 60_000;
+    const second = await acquireReviewSpoolLock(lockPath, { now: () => later });
+    expect(second).not.toBeNull();
+    expect(await first!.held()).toBe(false);
+    // Releasing a lock you no longer hold never removes the new holder's lock.
+    await first!.release();
+    expect(await second!.held()).toBe(true);
+    await second!.release();
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test('single writer: eviction is reachable only through the tick, with its lock', async () => {
+    const source = await Bun.file(join(import.meta.dir, 'review-worker-clock.ts')).text();
+    const calls = [...source.matchAll(/deps\.evictCheckouts\(/g)];
+    expect(calls).toHaveLength(1);
+    const helper = source.slice(source.indexOf('async function runCheckoutEviction('));
+    expect(helper.slice(0, 400)).toContain('deps.evictCheckouts({ protect, lock })');
+    const uses = [...source.matchAll(/runCheckoutEviction\(deps, lock, /g)];
+    expect(uses.length).toBeGreaterThanOrEqual(2);
+    const tick = source.slice(source.indexOf('export async function tickReviewWorkerClock('));
+    const tickBody = tick.slice(0, tick.indexOf('\nfunction '));
+    expect(tickBody).toContain('acquireReviewSpoolLock(');
+    expect(tickBody).toContain('await lock.release();');
+    for (const use of uses) expect(tickBody).toContain(use[0]);
   });
 
   test('a claim walk that cannot finish skips the pass instead of evicting', async () => {
@@ -880,7 +958,7 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
       now: () => 1_000_000,
       logger,
     });
-    expect(await evictor({ protect: [] })).toBeNull();
+    expect(await evictor({ protect: [], lock: heldLock() })).toBeNull();
     expect(entries.map(e => e.message)).toEqual(['overseer_review_checkout_eviction_skipped']);
     expect(existsSync(head)).toBe(true);
   });
@@ -906,16 +984,19 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
       logger,
       lookupPrState: lookup,
     });
-    expect(await evictor({ protect: [] })).toBeNull();
+    expect(await evictor({ protect: [], lock: heldLock() })).toBeNull();
     expect(entries.map(e => e.message)).toEqual(['overseer_review_checkout_eviction_skipped']);
     expect(existsSync(protectedHead)).toBe(true);
     failClaims = false;
-    await evictor({ protect: [{ owner: 'o', repo: 'r', headSha: sha(1).toUpperCase() }] });
+    await evictor({
+      protect: [{ owner: 'o', repo: 'r', headSha: sha(1).toUpperCase() }],
+      lock: heldLock(),
+    });
     expect(existsSync(protectedHead)).toBe(true);
     const callsAfterFirst = lookup.mock.calls.length;
     expect(callsAfterFirst).toBeGreaterThan(0);
     nowMs += 1_000;
-    await evictor({ protect: [] });
+    await evictor({ protect: [], lock: heldLock() });
     expect(lookup.mock.calls.length).toBe(callsAfterFirst);
   });
 

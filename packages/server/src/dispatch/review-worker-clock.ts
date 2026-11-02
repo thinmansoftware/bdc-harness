@@ -217,7 +217,12 @@ export interface ReviewWorkerDeps {
    * tick after the drain. Optional so test doubles can omit it; a failure is
    * logged and never blocks a review.
    */
-  evictCheckouts?: (input: { protect: readonly ReviewCheckoutKey[] }) => Promise<unknown>;
+  evictCheckouts?: (input: {
+    protect: readonly ReviewCheckoutKey[];
+    lock: ReviewSpoolLock;
+  }) => Promise<unknown>;
+  /** Spool lock path override (tests). Defaults to <spool>/.review-worker.lock. */
+  spoolLockPath?: string;
 }
 
 interface ResultMapping {
@@ -302,11 +307,12 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
 
 async function runCheckoutEviction(
   deps: ReviewWorkerDeps,
+  lock: ReviewSpoolLock,
   protect: readonly ReviewCheckoutKey[]
 ): Promise<void> {
   if (!deps.evictCheckouts) return;
   try {
-    await deps.evictCheckouts({ protect });
+    await deps.evictCheckouts({ protect, lock });
   } catch (error) {
     log.error({ err: error }, 'overseer_review_checkout_eviction_failed');
   }
@@ -318,6 +324,19 @@ export async function tickReviewWorkerClock(
 ): Promise<void> {
   if (inFlight) return;
   inFlight = true;
+  // SINGLE WRITER (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICTION-01). One review
+  // worker owns the spool for a whole tick: claiming, preparing and evicting
+  // checkouts all happen under this lock, so a second worker on the same spool
+  // waits for its next tick instead of racing an eviction against a claim.
+  const lock = await acquireReviewSpoolLock(deps.spoolLockPath ?? resolveReviewSpoolLockPath());
+  if (!lock) {
+    log.info(
+      { lockPath: deps.spoolLockPath ?? resolveReviewSpoolLockPath() },
+      'overseer_review_worker_spool_busy'
+    );
+    inFlight = false;
+    return;
+  }
   try {
     await deps.registerWorker({
       worker_id: REVIEW_WORKER_ID,
@@ -371,7 +390,7 @@ export async function tickReviewWorkerClock(
         let checkoutFailure: string | undefined;
         // Make room before materializing a new checkout; the head about to be
         // prepared is protected even if it is already cached and over cap.
-        await runCheckoutEviction(deps, [
+        await runCheckoutEviction(deps, lock, [
           { owner: body.owner, repo: body.repo, headSha: body.headSha },
         ]);
         try {
@@ -550,12 +569,91 @@ export async function tickReviewWorkerClock(
 
     // CHECKOUT CACHE EVICTION. After the drain, so nothing this tick is still
     // using a checkout; in-flight claims elsewhere are protected by the pass.
-    await runCheckoutEviction(deps, []);
+    await runCheckoutEviction(deps, lock, []);
   } catch (error) {
     log.error({ err: error }, 'overseer_review_worker_tick_failed');
   } finally {
+    await lock.release();
     inFlight = false;
   }
+}
+
+function resolveReviewSpoolLockPath(): string {
+  const explicit = process.env.OVERSEER_REVIEW_SPOOL_LOCK?.trim();
+  if (explicit) return explicit;
+  const spool = process.env.OVERSEER_REVIEW_SPOOL?.trim() || '/var/lib/overseer-review';
+  return join(spool, '.review-worker.lock');
+}
+
+/** A lock not refreshed for this long is abandoned (its holder died) and may be taken over. */
+export const REVIEW_SPOOL_LOCK_STALE_MS = 10 * 60_000;
+const REVIEW_SPOOL_LOCK_REFRESH_MS = 60_000;
+
+/**
+ * The review spool's single-writer lock (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICTION-01).
+ *
+ * Held for a whole review tick. Checkout eviction requires a held lock and
+ * re-verifies it immediately before deleting, so eviction cannot run outside a
+ * tick or race a second worker's claim on the same spool. Created with an
+ * exclusive open; refreshed (mtime) every minute while the tick runs, because a
+ * tick can drain several reviews of up to 30 minutes each; taken over only when
+ * unrefreshed for REVIEW_SPOOL_LOCK_STALE_MS.
+ */
+export interface ReviewSpoolLock {
+  readonly path: string;
+  readonly token: string;
+  /** True only while the lock file still carries this holder's token. */
+  held(): Promise<boolean>;
+  release(): Promise<void>;
+}
+
+export async function acquireReviewSpoolLock(
+  path: string,
+  options: { now?: () => number; staleMs?: number } = {}
+): Promise<ReviewSpoolLock | null> {
+  const now = options.now ?? Date.now;
+  const staleMs = options.staleMs ?? REVIEW_SPOOL_LOCK_STALE_MS;
+  const token = `${process.env.HOSTNAME ?? 'in-process'}:${process.pid}:${randomUUID()}`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, token, { flag: 'wx', mode: 0o640 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') return null;
+      let ageMs: number;
+      try {
+        ageMs = now() - (await lstat(path)).mtimeMs;
+      } catch {
+        continue; // released between our open and our stat: retry once
+      }
+      if (ageMs <= staleMs) return null;
+      await rm(path, { force: true });
+      log.warn({ lockPath: path, ageMs }, 'overseer_review_worker_spool_lock_taken_over');
+      continue;
+    }
+    const refresh = setInterval(() => {
+      const at = new Date(now());
+      void utimes(path, at, at).catch(() => undefined);
+    }, REVIEW_SPOOL_LOCK_REFRESH_MS);
+    refresh.unref?.();
+    const held = async (): Promise<boolean> => {
+      try {
+        return (await readFile(path, 'utf8')) === token;
+      } catch {
+        return false;
+      }
+    };
+    return {
+      path,
+      token,
+      held,
+      release: async (): Promise<void> => {
+        clearInterval(refresh);
+        if (await held()) await rm(path, { force: true });
+      },
+    };
+  }
+  return null;
 }
 
 function resolveReviewCheckoutRoot(): string {
@@ -1291,10 +1389,17 @@ export function createReviewCheckoutEvictor(
   deps: ReviewCheckoutEvictorDeps
 ): (input: {
   protect: readonly ReviewCheckoutKey[];
+  lock: ReviewSpoolLock;
 }) => Promise<ReviewCheckoutEvictionResult | null> {
   let lastStateSweepAt = Number.NEGATIVE_INFINITY;
-  return async ({ protect }) => {
+  return async ({ protect, lock }) => {
     const logger = deps.logger ?? log;
+    // Single writer: eviction runs only inside a review tick holding the spool
+    // lock. Without it, skip -- never delete on a guess.
+    if (!(await lock.held())) {
+      logger.warn({ lockPath: lock.path }, 'overseer_review_checkout_eviction_skipped');
+      return null;
+    }
     // Walk every claimed run_review page. If the walk cannot finish (store error
     // or more pages than any real queue holds), skip the whole pass: eviction
     // with an incomplete in-use set could delete a checkout under a live review.
@@ -1336,6 +1441,11 @@ export function createReviewCheckoutEvictor(
         DEFAULT_REVIEW_CHECKOUT_STATE_SWEEP_MS);
     const withState = deps.lookupPrState !== undefined && now - lastStateSweepAt >= interval;
     if (withState) lastStateSweepAt = now;
+    // Re-verify right before deleting: the lock must still be ours.
+    if (!(await lock.held())) {
+      logger.warn({ lockPath: lock.path }, 'overseer_review_checkout_eviction_skipped');
+      return null;
+    }
     return evictReviewCheckouts({
       checkoutRoot: deps.checkoutRoot ?? resolveReviewCheckoutRoot(),
       maxBytes: deps.maxBytes ?? resolveReviewCheckoutCacheMaxBytes(),
