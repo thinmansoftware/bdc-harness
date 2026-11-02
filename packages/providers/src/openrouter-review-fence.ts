@@ -255,31 +255,49 @@ function flattenUnifiedDiff(diffText: string): DiffLine[] {
   return out;
 }
 
-/** Collect customer-data pattern hits from a single text line. */
+/**
+ * Collect customer-data pattern hits from a single text line.
+ *
+ * When `useMatchOffset` is true the recorded `line` is each match's actual
+ * character offset within `content` -- this is what prompt mode needs to honor
+ * the `prompt:<offset>` event-location contract (the whole outgoing text is
+ * scanned as one string). When false (diff mode) the caller's per-file `line`
+ * number is recorded verbatim; match offsets within a diff line are not part of
+ * the `file:line` location.
+ */
 function scanLineForPatterns(
   content: string,
   file: string,
   line: number,
   tenantSlugs: readonly string[],
-  allowTenantSlug: boolean
+  allowTenantSlug: boolean,
+  useMatchOffset = false
 ): ScanHit[] {
   const hits: ScanHit[] = [];
+  const locOf = (index: number | undefined): number => (useMatchOffset ? (index ?? line) : line);
 
   for (const m of content.matchAll(EMAIL_RE)) {
     const address = m[0].toLowerCase();
     const domain = address.slice(address.indexOf('@') + 1);
     if (EMAIL_IGNORED_ADDRESSES.has(address) || EMAIL_IGNORED_DOMAINS.has(domain)) continue;
-    hits.push({ kind: 'email', file, line });
+    hits.push({ kind: 'email', file, line: locOf(m.index) });
   }
-  (content.match(PHONE_RE) ?? []).forEach(() => hits.push({ kind: 'phone', file, line }));
-  (content.match(STRIPE_KEY_RE) ?? []).forEach(() => hits.push({ kind: 'stripe_id', file, line }));
-  (content.match(STRIPE_OBJ_RE) ?? []).forEach(() => hits.push({ kind: 'stripe_id', file, line }));
+  for (const m of content.matchAll(PHONE_RE)) {
+    hits.push({ kind: 'phone', file, line: locOf(m.index) });
+  }
+  for (const m of content.matchAll(STRIPE_KEY_RE)) {
+    hits.push({ kind: 'stripe_id', file, line: locOf(m.index) });
+  }
+  for (const m of content.matchAll(STRIPE_OBJ_RE)) {
+    hits.push({ kind: 'stripe_id', file, line: locOf(m.index) });
+  }
   if (allowTenantSlug) {
     for (const slug of tenantSlugs) {
       if (!slug) continue;
       const slugRe = new RegExp(escapeRegExp(slug), 'g');
-      if (slugRe.test(content)) {
-        hits.push({ kind: 'tenant_slug', file, line });
+      const m = slugRe.exec(content);
+      if (m) {
+        hits.push({ kind: 'tenant_slug', file, line: locOf(m.index) });
       }
     }
   }
@@ -418,8 +436,10 @@ export async function scanDiffForOpenRouter(text: string, opts: ScanOptions): Pr
 
   if (mode === 'prompt') {
     // Tenant slugs are file-path gated, so they do not apply to free prompt
-    // text (no fixture path context); email/phone/stripe do.
-    hits.push(...scanLineForPatterns(text, 'prompt', text.length, tenantSlugs, false));
+    // text (no fixture path context); email/phone/stripe do. Each hit records
+    // the match's actual character offset (prompt:<offset>), not the text
+    // length -- useMatchOffset=true derives the offset per match.
+    hits.push(...scanLineForPatterns(text, 'prompt', 0, tenantSlugs, false, true));
   } else {
     for (const dl of flattenUnifiedDiff(text)) {
       const allowTenantSlug = FIXTURE_PATH_RE.test(dl.file);

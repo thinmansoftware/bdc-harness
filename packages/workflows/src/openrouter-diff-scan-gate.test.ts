@@ -170,6 +170,51 @@ describe('applyOpenRouterReviewFence', () => {
     expect(client.getType()).not.toBe('openrouter');
   });
 
+  // systemPrompt scan: customer data carried in the system / persona prompt is
+  // scanned as part of the assembled outgoing content and reroutes, even when
+  // the user prompt AND the repository diff are clean. Without this, a persona
+  // holding a customer email/phone would reach OpenRouter unscanned.
+  test('persona systemPrompt customer data reroutes off OpenRouter (clean prompt + diff)', async () => {
+    const h = makeHarness();
+    const decision = await applyOpenRouterReviewFence(
+      baseParams(h, {
+        finalPrompt: 'Review the diff, please.',
+        systemPrompt: 'You are a reviewer. Escalate to jane.customer@gmail.com when unsure.',
+        gitProbes: {
+          resolveRemote: async () => 'thinmansoftware/lspro-react',
+          resolveHeadSha: async () => 'headsha-persona',
+          resolveDiff: async () => '+++ b/src/x.ts\n@@ -0,0 +1,1 @@\n+const x = 1;\n',
+        },
+      })
+    );
+    expect(decision.rerouted).toBe(true);
+    expect(decision.verdict).toBe('hit');
+    expect(decision.hitKinds).toContain('email');
+    expect(decision.routedProvider).toBe('codex-native-strict');
+    const ev = h.events[0];
+    expect((ev?.data.hit_locations as string[]).some(l => l.startsWith('prompt:'))).toBe(true);
+    // The matched value never lands in the event.
+    expect(JSON.stringify(ev?.data)).not.toContain('jane.customer');
+    // The request never reaches an OpenRouter client.
+    expect(h.clients.get('opr')?.sendQuery).not.toHaveBeenCalled();
+  });
+
+  // A clean systemPrompt + clean prompt + clean diff still pins on OpenRouter --
+  // the added system-prompt scan does not over-trigger.
+  test('clean persona systemPrompt keeps the route on OpenRouter with the pin', async () => {
+    const h = makeHarness();
+    const decision = await applyOpenRouterReviewFence(
+      baseParams(h, {
+        finalPrompt: 'Review the diff, please.',
+        systemPrompt: 'You are a careful, concise code reviewer.',
+      })
+    );
+    expect(decision.rerouted).toBe(false);
+    expect(decision.privacyPin).toBe(true);
+    expect(decision.routedProvider).toBe('opr');
+    expect(decision.verdict).toBe('clean');
+  });
+
   // Test 5: non-customer repo is untouched.
   test('Test 5: non-customer repo -> no scan, no event, no pin, provider unchanged', async () => {
     const h = makeHarness();

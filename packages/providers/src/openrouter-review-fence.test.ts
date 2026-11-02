@@ -44,6 +44,7 @@ mock.module('openai', () => ({ default: mockOpenAI, OpenAI: mockOpenAI }));
 // --- Import under test (after mocks) ---------------------------------------
 import {
   CUSTOMER_REPOS,
+  formatHitLocation,
   isCustomerRepo,
   isNoPrivateEndpointError,
   isOpenRouterRoute,
@@ -172,6 +173,39 @@ describe('scanDiffForOpenRouter patterns', () => {
       { mode: 'prompt', tenantSlugs: SLUGS, gitleaksRunner: cleanGitleaks }
     );
     expect(ignored.hits.some(h => h.kind === 'email')).toBe(false);
+  });
+
+  // Prompt-mode hits must carry the ACTUAL character offset of each match
+  // (prompt:<offset>), not the text length. Two patterns at known, distinct
+  // offsets in a single prompt body must each report their own offset.
+  test('prompt-mode hits record the matched character offset, not text length', async () => {
+    const lead = 'Persona reviewer. ';
+    const email = 'jane.customer@gmail.com';
+    const mid = ' then call ';
+    const phone = '555-867-5309';
+    const text = `${lead}${email}${mid}${phone}.`;
+    const emailOffset = text.indexOf(email);
+    const phoneOffset = text.indexOf(phone);
+
+    const result = await scanDiffForOpenRouter(text, {
+      mode: 'prompt',
+      tenantSlugs: SLUGS,
+      gitleaksRunner: cleanGitleaks,
+    });
+    expect(result.verdict).toBe('hit');
+
+    const emailHit = result.hits.find(h => h.kind === 'email');
+    const phoneHit = result.hits.find(h => h.kind === 'phone');
+    expect(emailHit?.file).toBe('prompt');
+    expect(emailHit?.line).toBe(emailOffset);
+    expect(phoneHit?.line).toBe(phoneOffset);
+    // The two offsets differ and neither is the length of the scanned text.
+    expect(emailOffset).not.toBe(phoneOffset);
+    expect(emailHit?.line).not.toBe(text.length);
+    expect(phoneHit?.line).not.toBe(text.length);
+    // The event-location contract renders as prompt:<offset>.
+    expect(emailHit && formatHitLocation(emailHit)).toBe(`prompt:${emailOffset}`);
+    expect(phoneHit && formatHitLocation(phoneHit)).toBe(`prompt:${phoneOffset}`);
   });
 
   // Test 11 coverage at the fence layer: removed/context lines + prompt text

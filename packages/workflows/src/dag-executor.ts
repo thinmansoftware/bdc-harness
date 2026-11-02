@@ -732,6 +732,11 @@ export interface OpenRouterFenceParams {
   model: string | undefined;
   failoverTarget: { provider: string; model: string | undefined; agent: string | undefined } | null;
   finalPrompt: string;
+  /** The system / persona prompt transmitted to OpenRouter alongside
+   *  finalPrompt. Scanned together with finalPrompt so customer data carried in
+   *  a persona/system prompt cannot bypass the fence. Undefined when the route
+   *  carries no system prompt. */
+  systemPrompt?: string;
   /** Overrides the env slug list (tests). */
   tenantSlugs?: readonly string[];
   /** Overrides the git probes (tests). */
@@ -825,10 +830,17 @@ export async function applyOpenRouterReviewFence(
       diffResult = { verdict: 'scan_unavailable', hits: [], reason: 'repo_diff_unavailable' };
     }
 
-    // (b) Outgoing prompt -- scanned every request, never cached.
+    // (b) Outgoing prompt -- the FULLY ASSEMBLED outgoing content: the system /
+    // persona prompt plus the user prompt. OpenRouter clients transmit the
+    // system prompt as a separate message, so scanning only finalPrompt would
+    // let customer data in a persona/system prompt reach OpenRouter unseen.
+    // Scanned every request, never cached.
+    const outgoingContent = [params.systemPrompt, finalPrompt]
+      .filter((t): t is string => typeof t === 'string' && t.length > 0)
+      .join('\n\n');
     let promptResult: ScanResult;
     try {
-      promptResult = await scanText(finalPrompt, 'prompt');
+      promptResult = await scanText(outgoingContent, 'prompt');
     } catch {
       promptResult = { verdict: 'scan_unavailable', hits: [], reason: 'prompt_scan_failed' };
     }
@@ -2558,6 +2570,7 @@ async function executeNodeInternal(
       model: nodeOptions?.model,
       failoverTarget: resolveFailoverTarget(node, workflowLevelOptions),
       finalPrompt,
+      systemPrompt: nodeOptions?.systemPrompt,
     });
     if (fenceDecision.applicable && fenceDecision.rerouted) {
       getLog().warn(
@@ -4794,6 +4807,7 @@ async function executeLoopNode(
             model: iterationModel,
             failoverTarget: resolveFailoverTarget(node, workflowLevelOptions ?? {}),
             finalPrompt,
+            systemPrompt: iterationOptions.systemPrompt,
           });
           if (fenceDecision.applicable && fenceDecision.rerouted) {
             getLog().warn(
@@ -6365,6 +6379,69 @@ async function executeDagWorkflowInternal(
               issueContext,
               workflowLevelOptions
             );
+
+            // OpenRouter no-private-endpoint reroute for loop nodes (WO-HARNESS-
+            // OPENROUTER-REVIEW-DIFF-SCAN-01): a pinned OpenRouter loop request
+            // found no zdr / data_collection:deny endpoint, so the provider
+            // failed closed (no unpinned retry) and the loop surfaced the
+            // openrouter_no_private_endpoint error. Reroute the whole loop node
+            // to a non-OpenRouter seat and record the decision -- the same
+            // contract the single-shot path applies. Never retried without the
+            // pin. Checked BEFORE availability failover (this is not an
+            // availability-class error, so it would otherwise fall through to a
+            // plain loop failure).
+            if (
+              output.state === 'failed' &&
+              output.error?.includes('openrouter_no_private_endpoint')
+            ) {
+              try {
+                const declaredFailover = resolveFailoverTarget(node, workflowLevelOptions);
+                const noEndpointRemote = await defaultResolveRemote(cwd).catch(() => null);
+                const reroute = await emitNoPrivateEndpointReroute({
+                  deps,
+                  workflowRun,
+                  nodeId: node.id,
+                  provider: loopProvider,
+                  repo: normalizeRepoSlug(noEndpointRemote) ?? noEndpointRemote ?? '',
+                  failoverTarget: declaredFailover,
+                });
+                const rerouteNode = buildFailoverNode(node, {
+                  provider: reroute.routedProvider,
+                  model: reroute.routedModel,
+                  agent: declaredFailover?.agent,
+                });
+                assertProviderCanExecuteNode(reroute.routedProvider, rerouteNode);
+                await safeSendMessage(
+                  platform,
+                  conversationId,
+                  `! Loop node \`${node.id}\` had no private OpenRouter endpoint on ${loopProvider}; rerouting to ${reroute.routedProvider} (one attempt).`,
+                  { workflowId: workflowRun.id, nodeName: node.id }
+                );
+                output = await executeLoopNode(
+                  deps,
+                  platform,
+                  conversationId,
+                  cwd,
+                  workflowRun,
+                  rerouteNode as LoopNode,
+                  reroute.routedProvider,
+                  reroute.routedModel,
+                  artifactsDir,
+                  logDir,
+                  baseBranch,
+                  docsDir,
+                  nodeOutputs,
+                  config,
+                  issueContext,
+                  workflowLevelOptions
+                );
+              } catch (rerouteErr) {
+                getLog().error(
+                  { err: rerouteErr as Error, nodeId: node.id },
+                  'dag.openrouter_no_private_endpoint_reroute_failed'
+                );
+              }
+            }
 
             // AVAILABILITY failover for loop nodes (WO-HARNESS-NODE-PROVIDER-FAILOVER-01).
             // Same doctrine as prompt nodes: one sideways re-dispatch on a declared
