@@ -29,7 +29,50 @@ async function insertCodebase(db: SqliteAdapter, id: string): Promise<void> {
 }
 
 describe('SqliteAdapter', () => {
-  let db: SqliteAdapter;
+  // Unset until a test opens an adapter. The constructor-failure test never
+  // receives an instance, and afterEach must not touch a different database.
+  let db = undefined as unknown as SqliteAdapter;
+
+  test('constructor failure closes the handle before the error escapes', () => {
+    currentDbPath = join(
+      import.meta.dir,
+      `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    const legacy = new Database(currentDbPath);
+    try {
+      legacy.run(`CREATE TABLE tm_health (
+        provider TEXT NOT NULL, state TEXT NOT NULL, sampled_at TEXT NOT NULL,
+        expires_at TEXT, evidence TEXT, PRIMARY KEY (provider, sampled_at)
+      )`);
+      legacy.run('CREATE TABLE health_delete_audit (evidence TEXT)');
+      legacy.run(`CREATE TRIGGER reject_health_delete AFTER DELETE ON tm_health BEGIN
+        INSERT INTO health_delete_audit VALUES (OLD.evidence);
+        SELECT RAISE(FAIL, 'test health delete rejected'); END`);
+      legacy.run("INSERT INTO tm_health VALUES ('claude','dark','2026-08-27',NULL,'old')");
+      legacy.run("INSERT INTO tm_health VALUES ('claude','healthy','2026-08-28',NULL,'new')");
+    } finally {
+      legacy.close();
+    }
+
+    expect(() => new SqliteAdapter(currentDbPath)).toThrow('test health delete rejected');
+    const inspection = new Database(currentDbPath, { readonly: true });
+    try {
+      expect(inspection.query('SELECT evidence FROM tm_health ORDER BY sampled_at').all()).toEqual([
+        { evidence: 'old' },
+        { evidence: 'new' },
+      ]);
+      expect(inspection.query('SELECT * FROM health_delete_audit').all()).toEqual([]);
+    } finally {
+      inspection.close();
+    }
+    for (const suffix of ['', '-wal', '-shm']) {
+      try {
+        unlinkSync(currentDbPath + suffix);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+  });
 
   afterEach(async () => {
     if (db) {

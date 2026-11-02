@@ -764,24 +764,58 @@ describe('tm_expectations DAL', () => {
   });
 });
 
+let healthRollbackSetupStarted = 0;
+let healthRollbackTiming: {
+  setupMs: number;
+  constructMs: number;
+  assertMs: number;
+} | null = null;
+
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {
-    try {
-      unlinkSync(path + suffix);
-    } catch {
-      /* file may not exist */
+    const target = path + suffix;
+    let lastError: NodeJS.ErrnoException | undefined;
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      try {
+        unlinkSync(target);
+        lastError = undefined;
+        break;
+      } catch (error) {
+        const err = error as NodeJS.ErrnoException;
+        if (err.code === 'ENOENT') {
+          lastError = undefined;
+          break;
+        }
+        if (err.code === 'EBUSY' || err.code === 'EPERM' || err.code === 'UNKNOWN') {
+          lastError = err;
+          if (typeof Bun !== 'undefined' && typeof Bun.gc === 'function') Bun.gc(true);
+          continue;
+        }
+        throw error;
+      }
     }
+    if (lastError) throw lastError;
   }
 }
 
 beforeEach(() => {
+  healthRollbackSetupStarted = performance.now();
   currentDbPath = join(tmpdir(), `taskmaster-test-${Date.now()}-${Math.random()}.db`);
   db = new SqliteAdapter(currentDbPath);
 });
 
 afterEach(async () => {
+  const teardownStarted = performance.now();
   await db.close();
   cleanupDb(currentDbPath);
+  if (healthRollbackTiming) {
+    const teardownMs = Math.round(performance.now() - teardownStarted);
+    const timing = healthRollbackTiming;
+    healthRollbackTiming = null;
+    process.stdout.write(
+      `taskmaster_health_rollback_timing setupMs=${String(timing.setupMs)} constructMs=${String(timing.constructMs)} assertMs=${String(timing.assertMs)} teardownMs=${String(teardownMs)}\n`
+    );
+  }
 });
 
 describe('tm_journal DAL', () => {
@@ -1693,6 +1727,8 @@ describe('tm_health DAL', () => {
   );
 
   test('health repair rolls back partial trigger effects when deduplication fails', async () => {
+    // Measured Linux 2026-10-22: setupMs=69 constructMs=53 assertMs=2 teardownMs=0.
+    // No phase exceeded 25000ms, so this test keeps the 30000ms command timeout.
     await db.close();
     cleanupDb(currentDbPath);
     const old = new Database(currentDbPath);
@@ -1707,8 +1743,14 @@ describe('tm_health DAL', () => {
     old.run("INSERT INTO tm_health VALUES ('claude','dark','2026-08-27',NULL,'old')");
     old.run("INSERT INTO tm_health VALUES ('claude','healthy','2026-08-28',NULL,'new')");
     old.close();
+    Bun.gc(true);
+    const setupMs = Math.round(performance.now() - healthRollbackSetupStarted);
 
+    const constructStarted = performance.now();
     expect(() => new SqliteAdapter(currentDbPath)).toThrow('test health delete rejected');
+    const constructMs = Math.round(performance.now() - constructStarted);
+
+    const assertStarted = performance.now();
     const inspection = new Database(currentDbPath, { readonly: true });
     try {
       expect(inspection.query('SELECT evidence FROM tm_health ORDER BY sampled_at').all()).toEqual([
@@ -1718,7 +1760,13 @@ describe('tm_health DAL', () => {
       expect(inspection.query('SELECT * FROM health_delete_audit').all()).toEqual([]);
     } finally {
       inspection.close();
+      Bun.gc(true);
     }
+    healthRollbackTiming = {
+      setupMs,
+      constructMs,
+      assertMs: Math.round(performance.now() - assertStarted),
+    };
   });
 
   test('health repair is a no-op on a second connection', async () => {

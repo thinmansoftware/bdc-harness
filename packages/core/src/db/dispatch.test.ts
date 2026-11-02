@@ -1,5 +1,6 @@
+import { Database } from 'bun:sqlite';
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
-import { existsSync, mkdtempSync, unlinkSync } from 'fs';
+import { existsSync, mkdtempSync, unlinkSync, writeFileSync } from 'fs';
 import { removeTempDirWithRetry } from '../test/temp-dir';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
@@ -47,6 +48,9 @@ import {
   registerWorker,
   deferMessage,
   disposeMessageByMachine,
+  MAILBOX_SQLITE_BUSY_TIMEOUT_MS,
+  MAILBOX_TRANSACTION_MAX_ATTEMPTS,
+  MAILBOX_TRANSACTION_RETRY_DEADLINE_MS,
   listMessagesByCorrelationId,
   releaseDispatchEscalationClaim,
   releaseMessage,
@@ -288,6 +292,120 @@ async function makeSeparateProcessMailboxFixture(
   } finally {
     db = primaryDb;
     await raceDb.close();
+  }
+}
+
+async function createQueuedOperatorMessage(idempotencyKey: string): Promise<DispatchMessage> {
+  return createMessage({
+    correlation_id: `${idempotencyKey}-correlation`,
+    idempotency_key: idempotencyKey,
+    task_type: 'agent_message',
+    sender: 'xo',
+    recipient: 'operator',
+    body: 'Mailbox lock contention target.',
+  });
+}
+
+/**
+ * Hold a real SQLite reserved lock in a child process. The parent mailbox
+ * action starts only after the lock-held barrier. releaseAfterMs, when set,
+ * writes lock-release only after that acquisition is proven.
+ */
+async function withProvenMailboxLock<T>(
+  releaseAfterMs: number | null,
+  action: () => Promise<T>
+): Promise<T> {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const lockHeldFile = join(tmpdir(), `mailbox-lock-held-${suffix}`);
+  const lockReleaseFile = join(tmpdir(), `mailbox-lock-release-${suffix}`);
+  const childScript = `
+    const { Database } = await import('bun:sqlite');
+    const database = new Database(process.env.DB_PATH);
+    let held = false;
+    try {
+      database.run('PRAGMA busy_timeout = 0');
+      database.run('BEGIN IMMEDIATE');
+      held = true;
+      await Bun.write(process.env.LOCK_HELD_FILE, 'lock-held');
+      while (!(await Bun.file(process.env.LOCK_RELEASE_FILE).exists())) await Bun.sleep(2);
+      database.run('COMMIT');
+      held = false;
+    } catch (error) {
+      process.stderr.write(error instanceof Error ? error.message : 'mailbox_lock_holder_failed');
+      process.exitCode = 1;
+    } finally {
+      if (held) {
+        try {
+          database.run('ROLLBACK');
+        } catch {
+          /* Parent terminates this process when the lock must outlive the action. */
+        }
+      }
+      database.close();
+    }
+  `;
+  const child = Bun.spawn({
+    cmd: [process.execPath, '-e', childScript],
+    cwd: resolve(import.meta.dir, '..', '..', '..'),
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: {
+      ...process.env,
+      DB_PATH: currentDbPath,
+      LOCK_HELD_FILE: lockHeldFile,
+      LOCK_RELEASE_FILE: lockReleaseFile,
+      LOG_LEVEL: 'fatal',
+    },
+  });
+  const output = Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]).then(([exitCode, stdout, stderr]) => ({ exitCode, stdout, stderr }));
+  void output.catch(() => {});
+  let releaseTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    for (let attempt = 0; attempt < 1000; attempt += 1) {
+      if (existsSync(lockHeldFile)) break;
+      if (child.exitCode !== null) {
+        const captured = await output;
+        throw new Error(
+          `mailbox_lock_holder_exited_before_held exit=${String(captured.exitCode)} stderr=${captured.stderr}`
+        );
+      }
+      if (attempt === 999) throw new Error('mailbox_lock_holder_ready_timeout');
+      await Bun.sleep(5);
+    }
+    if (releaseAfterMs !== null) {
+      releaseTimer = setTimeout(() => {
+        writeFileSync(lockReleaseFile, 'lock-release');
+      }, releaseAfterMs);
+    }
+    return await action();
+  } finally {
+    if (releaseTimer) clearTimeout(releaseTimer);
+    try {
+      writeFileSync(lockReleaseFile, 'lock-release');
+    } catch {
+      /* The child is terminated below so a release-file failure cannot hang the test. */
+    }
+    const killAfter = Date.now() + 1000;
+    while (child.exitCode === null && Date.now() < killAfter) await Bun.sleep(10);
+    if (child.exitCode === null) {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already exited */
+      }
+    }
+    await output.catch(() => undefined);
+    for (const file of [lockHeldFile, lockReleaseFile]) {
+      try {
+        unlinkSync(file);
+      } catch {
+        /* file may not exist */
+      }
+    }
   }
 }
 
@@ -1617,6 +1735,276 @@ describe('dispatch db', () => {
       expect(stored.rows[0]?.addressed_at).toBe(processResults[0]?.message.addressed_at);
     } finally {
       await inspectionDb.close();
+    }
+  });
+
+  test('releases a held lock inside the mailbox retry budget and acknowledges once', async () => {
+    const message = await createQueuedOperatorMessage('idem-lock-release-ack');
+    const releaseAfterMs = MAILBOX_SQLITE_BUSY_TIMEOUT_MS + 250;
+    let elapsed = 0;
+    const result = await withProvenMailboxLock(releaseAfterMs, async () => {
+      const started = Date.now();
+      const value = await acknowledgeMessage({ id: message.id, principal_id: 'operator' });
+      elapsed = Date.now() - started;
+      return value;
+    });
+    expect(elapsed).toBeGreaterThan(MAILBOX_SQLITE_BUSY_TIMEOUT_MS);
+    expect(elapsed).toBeLessThan(MAILBOX_TRANSACTION_RETRY_DEADLINE_MS);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('expected acknowledgement');
+    expect(result.message.acknowledged_at).not.toBeNull();
+    const stored = await getMessage(message.id);
+    expect(stored).toMatchObject({ status: 'queued', acknowledged_by: 'operator' });
+    expect(stored?.acknowledged_at).toBe(result.message.acknowledged_at);
+    const repeat = await acknowledgeMessage({ id: message.id, principal_id: 'operator' });
+    expect(repeat.ok).toBe(true);
+    if (!repeat.ok) throw new Error('expected repeated acknowledgement');
+    expect(repeat.message.acknowledged_at).toBe(result.message.acknowledged_at);
+  });
+
+  test('releases a held lock inside the mailbox retry budget and addresses once', async () => {
+    const message = await createQueuedOperatorMessage('idem-lock-release-address');
+    expect((await acknowledgeMessage({ id: message.id, principal_id: 'operator' })).ok).toBe(true);
+    const releaseAfterMs = MAILBOX_SQLITE_BUSY_TIMEOUT_MS + 250;
+    let elapsed = 0;
+    const result = await withProvenMailboxLock(releaseAfterMs, async () => {
+      const started = Date.now();
+      const value = await addressMessage({ id: message.id, principal_id: 'operator' });
+      elapsed = Date.now() - started;
+      return value;
+    });
+    expect(elapsed).toBeGreaterThan(MAILBOX_SQLITE_BUSY_TIMEOUT_MS);
+    expect(elapsed).toBeLessThan(MAILBOX_TRANSACTION_RETRY_DEADLINE_MS);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('expected address');
+    expect(result.message.addressed_at).not.toBeNull();
+    const stored = await getMessage(message.id);
+    expect(stored).toMatchObject({
+      status: 'queued',
+      acknowledged_by: 'operator',
+      addressed_by: 'operator',
+    });
+    expect(stored?.addressed_at).toBe(result.message.addressed_at);
+    const repeat = await addressMessage({ id: message.id, principal_id: 'operator' });
+    expect(repeat.ok).toBe(true);
+    if (!repeat.ok) throw new Error('expected repeated address');
+    expect(repeat.message.addressed_at).toBe(result.message.addressed_at);
+  });
+
+  test('releases a held lock inside the mailbox retry budget and disposes once', async () => {
+    const message = await createQueuedOperatorMessage('idem-lock-release-dispose');
+    const releaseAfterMs = MAILBOX_SQLITE_BUSY_TIMEOUT_MS + 250;
+    let elapsed = 0;
+    const result = await withProvenMailboxLock(releaseAfterMs, async () => {
+      const started = Date.now();
+      const value = await disposeMessageByMachine({
+        id: message.id,
+        actor: 'system:inbox-reader',
+        disposition: 'expired',
+      });
+      elapsed = Date.now() - started;
+      return value;
+    });
+    expect(elapsed).toBeGreaterThan(MAILBOX_SQLITE_BUSY_TIMEOUT_MS);
+    expect(elapsed).toBeLessThan(MAILBOX_TRANSACTION_RETRY_DEADLINE_MS);
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error('expected machine disposition');
+    expect(result.message.route_disposed_at).not.toBeNull();
+    expect(result.message.route_disposition).toBe('expired');
+    const stored = await getMessage(message.id);
+    expect(stored).toMatchObject({
+      status: 'queued',
+      route_disposition: 'expired',
+      route_disposed_at: result.message.route_disposed_at,
+    });
+    const repeat = await disposeMessageByMachine({
+      id: message.id,
+      actor: 'system:inbox-reader',
+      disposition: 'expired',
+    });
+    expect(repeat).toEqual({ ok: false, reason: 'already_disposed' });
+    expect((await getMessage(message.id))?.route_disposed_at).toBe(
+      result.message.route_disposed_at
+    );
+  });
+
+  test(
+    'held mailbox lock exhausts bounded retries without partial receipts',
+    async () => {
+      // Address returns before any write when the row is unacknowledged, so the
+      // address call uses a separate already-acknowledged row. The queued row
+      // stays free of acknowledgement and disposition.
+      const queued = await createQueuedOperatorMessage('idem-lock-held-queued');
+      const addressed = await createQueuedOperatorMessage('idem-lock-held-address');
+      expect((await acknowledgeMessage({ id: addressed.id, principal_id: 'operator' })).ok).toBe(
+        true
+      );
+      const calls = [
+        () => acknowledgeMessage({ id: queued.id, principal_id: 'operator' }),
+        () => addressMessage({ id: addressed.id, principal_id: 'operator' }),
+        () =>
+          disposeMessageByMachine({
+            id: queued.id,
+            actor: 'system:inbox-reader',
+            disposition: 'expired',
+          }),
+      ];
+      await withProvenMailboxLock(null, async () => {
+        for (const call of calls) {
+          const started = Date.now();
+          await expect(call()).rejects.toThrow(/database is locked|SQLITE_BUSY/);
+          const elapsed = Date.now() - started;
+          expect(elapsed).toBeGreaterThanOrEqual(MAILBOX_SQLITE_BUSY_TIMEOUT_MS);
+          expect(elapsed).toBeLessThan(
+            MAILBOX_TRANSACTION_RETRY_DEADLINE_MS + MAILBOX_SQLITE_BUSY_TIMEOUT_MS
+          );
+        }
+      });
+      expect(await getMessage(queued.id)).toMatchObject({
+        acknowledged_at: null,
+        addressed_at: null,
+        route_disposition: null,
+        route_disposed_at: null,
+      });
+      expect(await getMessage(addressed.id)).toMatchObject({
+        addressed_at: null,
+        route_disposition: null,
+        route_disposed_at: null,
+      });
+    },
+    {
+      timeout:
+        MAILBOX_TRANSACTION_MAX_ATTEMPTS *
+          (MAILBOX_TRANSACTION_RETRY_DEADLINE_MS + MAILBOX_SQLITE_BUSY_TIMEOUT_MS) +
+        15_000,
+    }
+  );
+
+  test('non-lock mailbox errors propagate without retry', async () => {
+    const message = await createQueuedOperatorMessage('idem-lock-not-a-lock');
+    const calls = [
+      () => acknowledgeMessage({ id: message.id, principal_id: 'operator' }),
+      () => addressMessage({ id: message.id, principal_id: 'operator' }),
+      () =>
+        disposeMessageByMachine({
+          id: message.id,
+          actor: 'system:inbox-reader',
+          disposition: 'expired',
+        }),
+    ];
+    for (const call of calls) {
+      const transactionSpy = spyOn(db, 'withTransaction').mockImplementation(() => {
+        throw new Error('mailbox_not_a_lock');
+      });
+      const started = Date.now();
+      try {
+        await expect(call()).rejects.toThrow('mailbox_not_a_lock');
+        expect(Date.now() - started).toBeLessThan(250);
+        expect(transactionSpy).toHaveBeenCalledTimes(1);
+      } finally {
+        transactionSpy.mockRestore();
+      }
+    }
+    expect(await getMessage(message.id)).toMatchObject({
+      status: 'queued',
+      acknowledged_at: null,
+      acknowledged_by: null,
+      addressed_at: null,
+      addressed_by: null,
+      route_disposition: null,
+      route_disposed_at: null,
+    });
+  });
+
+  test('first nested transaction error keeps the sibling receipt and leaves no failed transaction', async () => {
+    const sibling = await createQueuedOperatorMessage('idem-nested-sibling');
+    const contender = await createQueuedOperatorMessage('idem-nested-contender');
+    const followUp = await createQueuedOperatorMessage('idem-nested-follow-up');
+    const siblingAckAt = '2026-01-15T00:00:00.000Z';
+    const reader = new Database(currentDbPath, { readonly: true });
+    const originalQuery = db.query.bind(db);
+    const rollbackStatements: string[] = [];
+    const querySpy = spyOn(db, 'query').mockImplementation((sql: string, params?: unknown[]) => {
+      if (sql.trim().toUpperCase() === 'ROLLBACK') rollbackStatements.push(sql);
+      return originalQuery(sql, params);
+    });
+    const sleepSpy = spyOn(Bun, 'sleep').mockImplementation(() => Promise.resolve());
+    let siblingOpen = false;
+
+    const readCommittedAck = (id: string): string | null => {
+      const row = reader
+        .query('SELECT acknowledged_at FROM agent_dispatch_messages WHERE id = ?')
+        .get(id) as { acknowledged_at: string | null } | null;
+      if (!row) throw new Error('mailbox_nested_row_missing');
+      return row.acknowledged_at;
+    };
+
+    try {
+      await originalQuery('BEGIN');
+      siblingOpen = true;
+      const update = await originalQuery(
+        `UPDATE agent_dispatch_messages
+         SET acknowledged_at = $2, acknowledged_by = 'operator'
+         WHERE id = $1 AND acknowledged_at IS NULL`,
+        [sibling.id, siblingAckAt]
+      );
+      expect(update.rowCount).toBe(1);
+      // The other connection must not see the receipt until the sibling commits.
+      expect(readCommittedAck(sibling.id)).toBeNull();
+
+      await expect(
+        acknowledgeMessage({ id: contender.id, principal_id: 'operator' })
+      ).rejects.toThrow('cannot start a transaction within a transaction');
+
+      const writerSibling = await originalQuery<{
+        acknowledged_at: string | null;
+        acknowledged_by: string | null;
+      }>('SELECT acknowledged_at, acknowledged_by FROM agent_dispatch_messages WHERE id = $1', [
+        sibling.id,
+      ]);
+      expect(writerSibling.rows[0]).toMatchObject({
+        acknowledged_at: siblingAckAt,
+        acknowledged_by: 'operator',
+      });
+      const writerContender = await originalQuery<{
+        acknowledged_at: string | null;
+        acknowledged_by: string | null;
+      }>('SELECT acknowledged_at, acknowledged_by FROM agent_dispatch_messages WHERE id = $1', [
+        contender.id,
+      ]);
+      expect(writerContender.rows[0]).toMatchObject({
+        acknowledged_at: null,
+        acknowledged_by: null,
+      });
+      // Skipped ROLLBACK left the sibling transaction open: still invisible elsewhere.
+      expect(readCommittedAck(sibling.id)).toBeNull();
+      expect(readCommittedAck(contender.id)).toBeNull();
+      expect(rollbackStatements).toEqual([]);
+      expect(sleepSpy).toHaveBeenCalledTimes(2);
+
+      await originalQuery('COMMIT');
+      siblingOpen = false;
+      expect(readCommittedAck(sibling.id)).toBe(siblingAckAt);
+      expect(readCommittedAck(contender.id)).toBeNull();
+
+      const follow = await acknowledgeMessage({ id: followUp.id, principal_id: 'operator' });
+      expect(follow.ok).toBe(true);
+      if (!follow.ok) throw new Error('expected follow-up acknowledgement');
+      expect(readCommittedAck(followUp.id)).toBe(follow.message.acknowledged_at);
+      expect(rollbackStatements).toEqual([]);
+      expect((await getMessage(contender.id))?.acknowledged_at).toBeNull();
+      expect((await getMessage(sibling.id))?.acknowledged_at).toBe(siblingAckAt);
+    } finally {
+      sleepSpy.mockRestore();
+      querySpy.mockRestore();
+      if (siblingOpen) {
+        try {
+          await originalQuery('ROLLBACK');
+        } catch {
+          /* Release the sibling transaction after an assertion failure. */
+        }
+      }
+      reader.close();
     }
   });
 
