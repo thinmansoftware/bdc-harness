@@ -40,6 +40,8 @@ const KNOWN_PRINCIPALS = [
   ['astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 1],
   ['board', 'Board', 'alias_resolved', 1],
   ['cauldron', 'Cauldron', 'notify_only', 1],
+  // Added by migration 067 (WO-HARNESS-T3-COMMAND-CONSUMER-01).
+  ['cauldron-fire', 'T3 command consumer', 'drain_on_start', 1],
   ['claude', 'Claude', 'worker_poll', 1],
   ['claude-acp', 'Claude ACP', 'worker_poll', 1],
   ['codex', 'Codex', 'worker_poll', 1],
@@ -63,6 +65,7 @@ const KNOWN_PRINCIPALS = [
   // Added by migration 065 (WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01).
   ['pr-review-log', 'PR review receipt log', 'drain_on_start', 1],
   ['t3-desktop', 'T3 desktop results queue', 'drain_on_start', 1],
+  ['t3-bridge', 'T3 VPS bridge sender', 'drain_on_start', 1],
   // Added by migration 046. This list is a FOURTH hand-maintained mirror of the
   // seeded principals (alongside the migration, 000_combined.sql and the SQLite
   // adapter); the validator compares an exact count, so a principal missing here

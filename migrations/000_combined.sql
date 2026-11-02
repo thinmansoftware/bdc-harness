@@ -618,7 +618,7 @@ VALUES
   -- PR review receipt log. Both drain_on_start mailboxes; nothing claims them.
   ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', TRUE),
   ('pr-review-log', 'PR review receipt log', 'drain_on_start', TRUE),
-  -- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 066): the cauldron-fire
+  -- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 067): the cauldron-fire
   -- command consumer mailbox and the t3-bridge VPS sender.
   ('cauldron-fire', 'T3 command consumer', 'drain_on_start', TRUE),
   ('t3-bridge', 'T3 VPS bridge sender', 'drain_on_start', TRUE),
@@ -888,7 +888,7 @@ CREATE INDEX IF NOT EXISTS idx_overseer_reconcile_actions_pr_ref
 CREATE INDEX IF NOT EXISTS idx_overseer_reconcile_actions_action
   ON overseer_reconcile_actions(action);
 
--- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 066): durable T3 command
+-- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 067): durable T3 command
 -- admission ledger for the cauldron-fire consumer. Keyed by request_id; rows
 -- are never deleted so request + run identity survive after completion.
 CREATE TABLE IF NOT EXISTS t3_command_admissions (

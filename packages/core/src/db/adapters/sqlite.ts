@@ -1391,7 +1391,7 @@ export class SqliteAdapter implements IDatabase {
         -- WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065 parity)
         ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', 1),
         ('pr-review-log', 'PR review receipt log', 'drain_on_start', 1),
-        -- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 066 parity): the
+        -- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 067 parity): the
         -- cauldron-fire command consumer mailbox and the t3-bridge VPS sender.
         ('cauldron-fire', 'T3 command consumer', 'drain_on_start', 1),
         ('t3-bridge', 'T3 VPS bridge sender', 'drain_on_start', 1),
@@ -2731,9 +2731,9 @@ export class SqliteAdapter implements IDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_tm_fire_admissions_day ON tm_fire_admissions(utc_day,state);
 
-      -- Durable T3 command admission ledger (migration 066,
+      -- Durable T3 command admission ledger (migration 067,
       -- WO-HARNESS-T3-COMMAND-CONSUMER-01). Hand-maintained mirror of
-      -- migrations/066_t3_command_consumer.sql. Keyed by request_id; rows are
+      -- migrations/067_t3_command_consumer.sql. Keyed by request_id; rows are
       -- never deleted so request + run identity survive after completion.
       CREATE TABLE IF NOT EXISTS t3_command_admissions (
         request_id TEXT PRIMARY KEY,
