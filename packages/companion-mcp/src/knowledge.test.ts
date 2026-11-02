@@ -494,7 +494,10 @@ describe('knowledge group', () => {
     }
   });
 
-  test('wiki-sync is idempotent and does not leak the token', async () => {
+  // POSIX-only: spawns wiki-sync.sh directly and joins PATH with ':'. Skip on win32 only.
+  const SKIP_ON_WINDOWS = process.platform === 'win32';
+
+  test.skipIf(SKIP_ON_WINDOWS)('wiki-sync is idempotent and does not leak the token', async () => {
     const token = 'bdc-wiki-sync-token-7f3c9a';
     const dir = await mkdtemp(join(tmpdir(), 'wiki-sync-'));
     const origin = join(dir, 'origin.git');
