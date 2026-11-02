@@ -1,5 +1,5 @@
-import { describe, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { existsSync, readFileSync } from 'node:fs';
 import { chmod, lstat, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -200,7 +200,11 @@ describe('round-6 exact-head checkout preparation', () => {
       expect(await git(checkout, ['rev-parse', 'HEAD'])).toBe(head);
       expect(await git(checkout, ['rev-parse', 'HEAD^{tree}'])).toBe(headTree);
       expect(await gitExit(checkout, ['cat-file', '-e', `${base}^{commit}`])).toBe(0);
-      expect(await git(checkout, ['merge-base', head, base])).toBe(base);
+      // WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICTION-01: head and base are
+      // fetched --depth 1, so their ancestry (merge-base) is deliberately not
+      // present; what the review needs is the exact base..head diff.
+      expect(await git(checkout, ['rev-parse', '--is-shallow-repository'])).toBe('true');
+      expect(await git(checkout, ['diff', '--stat', base, head])).toContain('change.txt');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -219,6 +223,143 @@ describe('round-6 exact-head checkout preparation', () => {
           })
         ).rejects.toThrow('review_checkout_identity_failure');
       }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * A bdc-xo-shaped remote: `generations/` media with HISTORY (an older large
+ * blob the head no longer references) plus docs the review needs. The remote
+ * serves partial and by-id fetches the way GitHub does.
+ */
+async function createGenerationsRemote(
+  root: string
+): Promise<{ remote: string; base: string; head: string; oldMedia: string }> {
+  const remote = join(root, 'remote');
+  await mkdir(join(remote, 'generations'), { recursive: true });
+  await mkdir(join(remote, 'docs'), { recursive: true });
+  await git(remote, ['init', '-q', '-b', 'main']);
+  await git(remote, ['config', 'user.email', 'review@example.invalid']);
+  await git(remote, ['config', 'user.name', 'review']);
+  await git(remote, ['config', 'core.autocrlf', 'false']);
+  await git(remote, ['config', 'uploadpack.allowAnySHA1InWant', 'true']);
+  await git(remote, ['config', 'uploadpack.allowFilter', 'true']);
+  await writeFile(join(remote, 'generations', 'old.png'), 'o'.repeat(200_000));
+  await writeFile(join(remote, 'docs', 'spec.md'), 'spec v1\n');
+  await git(remote, ['add', '.']);
+  await git(remote, ['commit', '-qm', 'history with old media']);
+  const oldMedia = await git(remote, ['rev-parse', 'HEAD:generations/old.png']);
+  await git(remote, ['rm', '-q', 'generations/old.png']);
+  // `git rm` deletes the emptied directory; recreate it before writing.
+  await mkdir(join(remote, 'generations'), { recursive: true });
+  await writeFile(join(remote, 'generations', 'cover.png'), 'c'.repeat(100_000));
+  await writeFile(join(remote, 'README.md'), 'base\n');
+  await git(remote, ['add', '.']);
+  await git(remote, ['commit', '-qm', 'base']);
+  const base = await git(remote, ['rev-parse', 'HEAD']);
+  await git(remote, ['checkout', '-q', '-b', 'pr']);
+  await writeFile(join(remote, 'docs', 'spec.md'), 'spec v2\n');
+  await writeFile(join(remote, 'generations', 'new.png'), 'n'.repeat(100_000));
+  await git(remote, ['add', '.']);
+  await git(remote, ['commit', '-qm', 'pr head']);
+  const head = await git(remote, ['rev-parse', 'HEAD']);
+  await git(remote, ['checkout', '-q', 'main']);
+  return { remote, base, head, oldMedia };
+}
+
+describe('sparse and shallow review checkouts (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICTION-01)', () => {
+  const savedExcludes = process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+  beforeEach(() => {
+    // The default (thinmansoftware/bdc-xo:generations/) is under test.
+    delete process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+  });
+  afterEach(() => {
+    if (savedExcludes === undefined) delete process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+    else process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES = savedExcludes;
+  });
+
+  test('bdc-xo checkout leaves out generations/, is shallow, verifies, diffs offline and is reused', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'review-sparse-'));
+    try {
+      const { remote, base, head, oldMedia } = await createGenerationsRemote(root);
+      const checkoutRoot = join(root, 'spool', 'checkouts');
+      const input = {
+        owner: 'thinmansoftware',
+        repo: 'bdc-xo',
+        prNumber: 4299,
+        headSha: head,
+        baseRef: 'main',
+        baseSha: base,
+      };
+      const checkout = await prepareReviewCheckout(input, { remoteUrl: remote, checkoutRoot });
+      expect(existsSync(join(checkout, 'generations'))).toBe(false);
+      expect(readFileSync(join(checkout, 'docs', 'spec.md'), 'utf8').trim()).toBe('spec v2');
+      // Tree identity is untouched by sparseness: generations/ is still in HEAD.
+      expect(await git(checkout, ['ls-tree', '--name-only', 'HEAD'])).toContain('generations');
+      expect(await git(checkout, ['sparse-checkout', 'list'])).toContain('!/generations/');
+      expect(await git(checkout, ['rev-parse', '--is-shallow-repository'])).toBe('true');
+      // protocol.allow=never forbids every transport, so no lazy (promisor)
+      // fetch can mask what is local. Old history media and excluded head
+      // media were never fetched.
+      const offline = ['-c', 'protocol.allow=never'];
+      expect(await gitExit(checkout, [...offline, 'cat-file', '-e', oldMedia])).not.toBe(0);
+      expect(
+        await gitExit(checkout, [...offline, 'cat-file', '-e', `${head}:generations/cover.png`])
+      ).not.toBe(0);
+      // Pristine (the verifier's own checks) and diffable offline.
+      expect(
+        await gitExit(checkout, [...offline, '-c', 'core.filemode=true', 'diff', '--quiet', 'HEAD'])
+      ).toBe(0);
+      expect(
+        await git(checkout, [
+          ...offline,
+          '-c',
+          'core.filemode=true',
+          'status',
+          '--porcelain=v1',
+          '--untracked-files=all',
+        ])
+      ).toBe('');
+      const stat = await git(checkout, [...offline, 'diff', '--stat', base, head]);
+      expect(stat).toContain('docs/spec.md');
+      expect(stat).toContain('generations/new.png');
+      // The cached checkout is reused: an unreachable remote proves no rebuild.
+      const reused = await prepareReviewCheckout(input, {
+        remoteUrl: join(root, 'no-such-remote'),
+        checkoutRoot,
+      });
+      expect(reused).toBe(checkout);
+      expect(
+        readFileSync(join(checkoutRoot, 'thinmansoftware', 'bdc-xo', `${head}.pr`), 'utf8')
+      ).toBe('4299\n');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('other repos keep generations/ (no sparse exclude) and still verify', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'review-nonsparse-'));
+    try {
+      const { remote, base, head } = await createGenerationsRemote(root);
+      const checkout = await prepareReviewCheckout(
+        {
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+          prNumber: 1,
+          headSha: head,
+          baseRef: 'main',
+          baseSha: base,
+        },
+        { remoteUrl: remote, checkoutRoot: join(root, 'spool', 'checkouts') }
+      );
+      expect(readFileSync(join(checkout, 'generations', 'new.png'), 'utf8')).toHaveLength(100_000);
+      expect(readFileSync(join(checkout, 'generations', 'cover.png'), 'utf8')).toHaveLength(
+        100_000
+      );
+      expect(await gitExit(checkout, ['sparse-checkout', 'list'])).not.toBe(0);
+      expect(await git(checkout, ['rev-parse', 'HEAD'])).toBe(head);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

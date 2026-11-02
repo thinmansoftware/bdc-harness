@@ -1,16 +1,28 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { afterEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import type { ReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
 import type { SubmitDeps, SubmitOutcome } from '@archon/overseer/pr-review-submit';
 import { runAndSubmitReview } from '@archon/overseer/pr-review-submit';
+import type { createRealOctokitClient } from '@archon/overseer/adapters/github-real-deps';
 import {
+  createGitHubReviewCheckoutPrLookup,
+  createReviewCheckoutEvictor,
+  DEFAULT_REVIEW_CHECKOUT_CACHE_MAX_BYTES,
+  DEFAULT_REVIEW_SPARSE_EXCLUDES,
+  derivePrStateFromAssociatedPulls,
+  evictReviewCheckouts,
+  resolveReviewCheckoutCacheMaxBytes,
+  resolveSparseExcludes,
   startReviewWorkerClock,
   stopReviewWorkerClock,
   tickReviewWorkerClock,
+  type ReviewCheckoutCacheLogger,
+  type ReviewCheckoutPrState,
   type ReviewWorkerDeps,
 } from './review-worker-clock';
 
@@ -599,4 +611,354 @@ describe('invalid review work against isolated real SQLite', () => {
       }
     }, 60_000);
   }
+});
+
+// ---------------------------------------------------------------------------
+// WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICTION-01: review checkout cache eviction.
+// Pure filesystem + injected GitHub/claims: these run on every platform.
+// ---------------------------------------------------------------------------
+
+interface LogEntry {
+  level: 'info' | 'warn';
+  message: string;
+  data: Record<string, unknown>;
+}
+
+function captureLogger(): { logger: ReviewCheckoutCacheLogger; entries: LogEntry[] } {
+  const entries: LogEntry[] = [];
+  return {
+    entries,
+    logger: {
+      info: (data, message): void => {
+        entries.push({ level: 'info', message, data });
+      },
+      warn: (data, message): void => {
+        entries.push({ level: 'warn', message, data });
+      },
+    },
+  };
+}
+
+function sha(n: number): string {
+  return n.toString(16).padStart(40, '0');
+}
+
+/** A cached checkout dir holding `bytes` of content, last used at `usedAt` seconds. */
+async function cachedCheckout(
+  root: string,
+  owner: string,
+  repo: string,
+  head: string,
+  bytes: number,
+  usedAt: number,
+  prNumber?: number
+): Promise<string> {
+  const path = join(root, owner, repo, head);
+  await mkdir(join(path, 'docs'), { recursive: true });
+  await writeFile(join(path, 'docs', 'payload.bin'), 'x'.repeat(bytes));
+  await utimes(path, usedAt, usedAt);
+  if (prNumber !== undefined) await writeFile(`${path}.pr`, `${prNumber}\n`);
+  return path;
+}
+
+function evictedMessages(entries: LogEntry[]): Record<string, unknown>[] {
+  return entries.filter(e => e.message === 'overseer_review_checkout_evicted').map(e => e.data);
+}
+
+describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICTION-01)', () => {
+  let spool = '';
+  let root = '';
+  beforeEach(async () => {
+    spool = await mkdtemp(join(tmpdir(), 'review-cache-'));
+    root = join(spool, 'checkouts');
+    await mkdir(root, { recursive: true });
+  });
+  afterEach(async () => {
+    await rm(spool, { recursive: true, force: true });
+  });
+
+  test('evict-merged: merged and closed are evicted, open and lookup-failure are kept', async () => {
+    const merged = await cachedCheckout(root, 'o', 'r', sha(1), 100, 1_000, 11);
+    const closed = await cachedCheckout(root, 'o', 'r', sha(2), 50, 1_001);
+    const open = await cachedCheckout(root, 'o', 'r', sha(3), 10, 1_002);
+    const failing = await cachedCheckout(root, 'o', 'r', sha(4), 10, 1_003);
+    const seen: { headSha: string; prNumber?: number }[] = [];
+    const { logger, entries } = captureLogger();
+    const result = await evictReviewCheckouts({
+      checkoutRoot: root,
+      maxBytes: 1_000_000,
+      inUse: [],
+      logger,
+      lookupPrState: async input => {
+        seen.push({ headSha: input.headSha, prNumber: input.prNumber });
+        if (input.headSha === sha(1)) return { state: 'merged' };
+        if (input.headSha === sha(2)) return { state: 'closed' };
+        if (input.headSha === sha(3)) return { state: 'open', headSha: sha(3) };
+        throw new Error('github_unavailable');
+      },
+    });
+    expect(existsSync(merged)).toBe(false);
+    expect(existsSync(`${merged}.pr`)).toBe(false);
+    expect(existsSync(closed)).toBe(false);
+    expect(existsSync(open)).toBe(true);
+    expect(existsSync(failing)).toBe(true);
+    // The sibling marker routes the lookup by PR number.
+    expect(seen.find(s => s.headSha === sha(1))?.prNumber).toBe(11);
+    expect(evictedMessages(entries)).toEqual([
+      { owner: 'o', repo: 'r', headSha: sha(1), reason: 'merged', bytesFreed: 100 },
+      { owner: 'o', repo: 'r', headSha: sha(2), reason: 'closed', bytesFreed: 50 },
+    ]);
+    expect(
+      entries.find(e => e.message === 'overseer_review_checkout_state_unknown')?.data
+    ).toMatchObject({ headSha: sha(4), reason: 'github_unavailable' });
+    expect(result.freedBytes).toBe(150);
+    expect(
+      entries.find(e => e.message === 'overseer_review_checkout_eviction_pass')?.data
+    ).toMatchObject({ evicted: 2, freedBytes: 150, totalBytes: 20 });
+  });
+
+  test('evict-superseded: an older head of an open PR goes once its live head is cached', async () => {
+    const old = await cachedCheckout(root, 'o', 'r', sha(10), 40, 1_000);
+    const current = await cachedCheckout(root, 'o', 'r', sha(11), 40, 1_001);
+    // A superseded head whose live head is NOT cached is left for the cap.
+    const lonely = await cachedCheckout(root, 'o', 'other', sha(12), 40, 1_002);
+    const { logger, entries } = captureLogger();
+    await evictReviewCheckouts({
+      checkoutRoot: root,
+      maxBytes: 1_000_000,
+      inUse: [],
+      logger,
+      lookupPrState: async input =>
+        input.repo === 'other'
+          ? { state: 'open', headSha: sha(99) }
+          : { state: 'open', headSha: sha(11) },
+    });
+    expect(existsSync(old)).toBe(false);
+    expect(existsSync(current)).toBe(true);
+    expect(existsSync(lonely)).toBe(true);
+    expect(evictedMessages(entries)).toEqual([
+      { owner: 'o', repo: 'r', headSha: sha(10), reason: 'superseded', bytesFreed: 40 },
+    ]);
+  });
+
+  test('cap evicts least-recently-used first and always keeps the newest 2 per repo', async () => {
+    for (let i = 1; i <= 5; i += 1) await cachedCheckout(root, 'o', 'r', sha(i), 100, 1_000 + i);
+    // A second repo with one checkout: its newest-2 floor protects it.
+    const solo = await cachedCheckout(root, 'o', 'solo', sha(50), 100, 500);
+    const { logger, entries } = captureLogger();
+    const result = await evictReviewCheckouts({
+      checkoutRoot: root,
+      maxBytes: 350,
+      inUse: [],
+      logger,
+    });
+    // 600 total: LRU order evicts sha(1), sha(2), sha(3) (solo is floor-protected).
+    expect(evictedMessages(entries).map(e => [e.headSha, e.reason, e.bytesFreed])).toEqual([
+      [sha(1), 'cap', 100],
+      [sha(2), 'cap', 100],
+      [sha(3), 'cap', 100],
+    ]);
+    expect(existsSync(join(root, 'o', 'r', sha(4)))).toBe(true);
+    expect(existsSync(join(root, 'o', 'r', sha(5)))).toBe(true);
+    expect(existsSync(solo)).toBe(true);
+    expect(result).toMatchObject({ freedBytes: 300, totalBytes: 300, overCap: false });
+    expect(entries.some(e => e.message === 'overseer_review_checkout_cache_over_cap')).toBe(false);
+  });
+
+  test('cap that cannot be met keeps the newest 2 and logs over_cap', async () => {
+    for (let i = 1; i <= 5; i += 1) await cachedCheckout(root, 'o', 'r', sha(i), 100, 1_000 + i);
+    const { logger, entries } = captureLogger();
+    const result = await evictReviewCheckouts({
+      checkoutRoot: root,
+      maxBytes: 150,
+      inUse: [],
+      logger,
+    });
+    expect(evictedMessages(entries).map(e => e.headSha)).toEqual([sha(1), sha(2), sha(3)]);
+    expect(existsSync(join(root, 'o', 'r', sha(4)))).toBe(true);
+    expect(existsSync(join(root, 'o', 'r', sha(5)))).toBe(true);
+    expect(result.overCap).toBe(true);
+    expect(
+      entries.find(e => e.message === 'overseer_review_checkout_cache_over_cap')?.data
+    ).toEqual({ totalBytes: 200, maxBytes: 150 });
+  });
+
+  test('in-use checkout, job scratch and tmp builds are never touched', async () => {
+    // Oldest, merged and over cap: eligible on every axis except in-use.
+    const inFlight = await cachedCheckout(root, 'o', 'r', sha(1), 100, 900);
+    const expired = await cachedCheckout(root, 'o', 'r', sha(2), 100, 901);
+    for (let i = 3; i <= 4; i += 1) await cachedCheckout(root, 'o', 'r', sha(i), 100, 1_000 + i);
+    const scratch = join(spool, 'job-1.scratch', 'co');
+    await mkdir(scratch, { recursive: true });
+    await writeFile(join(scratch, 'file'), 'x'.repeat(500));
+    const tmpBuild = join(root, 'o', 'r', `${sha(9)}.tmp-1234`);
+    await mkdir(tmpBuild, { recursive: true });
+    await writeFile(join(tmpBuild, 'file'), 'x'.repeat(500));
+    const claimedFor = (id: string, head: string, leaseMs: number): DispatchMessage => ({
+      ...message(id, head),
+      body: JSON.stringify({ owner: 'o', repo: 'r', prNumber: 7, headSha: head, baseRef: 'dev' }),
+      status: 'claimed',
+      lease_expires_at: new Date(1_000_000 + leaseMs).toISOString(),
+    });
+    const listMessages = mock(async () => [
+      claimedFor('live', sha(1), 60_000),
+      claimedFor('dead', sha(2), -60_000),
+    ]);
+    const { logger, entries } = captureLogger();
+    const evictor = createReviewCheckoutEvictor({
+      listMessages,
+      checkoutRoot: root,
+      maxBytes: 1,
+      now: () => 1_000_000,
+      logger,
+      lookupPrState: async () => ({ state: 'merged' }),
+    });
+    await evictor({ protect: [] });
+    expect(listMessages).toHaveBeenCalledWith({
+      recipient: 'overseer-reviewer',
+      status: 'claimed',
+      limit: 500,
+    });
+    expect(existsSync(inFlight)).toBe(true);
+    // An expired lease is not in flight.
+    expect(existsSync(expired)).toBe(false);
+    expect(existsSync(join(scratch, 'file'))).toBe(true);
+    expect(existsSync(join(tmpBuild, 'file'))).toBe(true);
+    expect(evictedMessages(entries).map(e => e.headSha)).not.toContain(sha(1));
+  });
+
+  test('protected head survives, unreadable claims skip the pass, GitHub is throttled', async () => {
+    const protectedHead = await cachedCheckout(root, 'o', 'r', sha(1), 100, 900);
+    for (let i = 2; i <= 4; i += 1) await cachedCheckout(root, 'o', 'r', sha(i), 100, 1_000 + i);
+    const { logger, entries } = captureLogger();
+    const lookup = mock(
+      async (): Promise<ReviewCheckoutPrState> => ({ state: 'open', headSha: sha(4) })
+    );
+    let nowMs = 1_000_000;
+    let failClaims = true;
+    const evictor = createReviewCheckoutEvictor({
+      listMessages: async () => {
+        if (failClaims) throw new Error('db_down');
+        return [];
+      },
+      checkoutRoot: root,
+      maxBytes: 1,
+      now: () => nowMs,
+      stateSweepIntervalMs: 60_000,
+      logger,
+      lookupPrState: lookup,
+    });
+    expect(await evictor({ protect: [] })).toBeNull();
+    expect(entries.map(e => e.message)).toEqual(['overseer_review_checkout_eviction_skipped']);
+    expect(existsSync(protectedHead)).toBe(true);
+    failClaims = false;
+    await evictor({ protect: [{ owner: 'o', repo: 'r', headSha: sha(1).toUpperCase() }] });
+    expect(existsSync(protectedHead)).toBe(true);
+    const callsAfterFirst = lookup.mock.calls.length;
+    expect(callsAfterFirst).toBeGreaterThan(0);
+    nowMs += 1_000;
+    await evictor({ protect: [] });
+    expect(lookup.mock.calls.length).toBe(callsAfterFirst);
+  });
+
+  test('worker tick evicts before preparing (protecting that head) and after the drain', async () => {
+    const calls: string[] = [];
+    const deps = fakeDeps([message('a', sha(7))]);
+    deps.resolveReviewBase = mock(async () => ({ baseRef: 'dev', baseSha: sha(6) }));
+    deps.prepareCheckout = mock(async () => {
+      calls.push('prepare');
+      return '';
+    });
+    deps.evictCheckouts = mock(async input => {
+      calls.push(`evict:${input.protect.map(k => k.headSha).join(',')}`);
+      throw new Error('disk_walk_failed');
+    });
+    await tickReviewWorkerClock(CONFIG, deps);
+    expect(calls).toEqual([`evict:${sha(7)}`, 'prepare', 'evict:']);
+    // An eviction failure never blocks the review itself.
+    expect(deps.runAndSubmitReview).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('review checkout cache helpers', () => {
+  test('cache cap env defaults to 3GB and rejects junk', () => {
+    expect(DEFAULT_REVIEW_CHECKOUT_CACHE_MAX_BYTES).toBe(3221225472);
+    expect(resolveReviewCheckoutCacheMaxBytes(undefined)).toBe(3221225472);
+    expect(resolveReviewCheckoutCacheMaxBytes('')).toBe(3221225472);
+    expect(resolveReviewCheckoutCacheMaxBytes('-5')).toBe(3221225472);
+    expect(resolveReviewCheckoutCacheMaxBytes('1.5')).toBe(3221225472);
+    expect(resolveReviewCheckoutCacheMaxBytes(' 1048576 ')).toBe(1048576);
+  });
+
+  test('sparse excludes match owner/repo and refuse unsafe paths', () => {
+    expect(
+      resolveSparseExcludes('ThinmanSoftware', 'BDC-XO', DEFAULT_REVIEW_SPARSE_EXCLUDES)
+    ).toEqual(['generations']);
+    expect(
+      resolveSparseExcludes('thinmansoftware', 'bdc-harness', DEFAULT_REVIEW_SPARSE_EXCLUDES)
+    ).toEqual([]);
+    expect(
+      resolveSparseExcludes(
+        'o',
+        'r',
+        'o/r:/media/, o/r:../etc, o/r:a/*, o/r:, o/r:docs/big, x/y:skip, o/r:media'
+      )
+    ).toEqual(['media', 'docs/big']);
+    expect(resolveSparseExcludes('thinmansoftware', 'bdc-xo', '')).toEqual([]);
+  });
+
+  test('associated-pulls state: open wins, merged vs closed, doubt is unknown', () => {
+    expect(derivePrStateFromAssociatedPulls(sha(1), [])).toEqual({
+      state: 'unknown',
+      reason: 'no_associated_pr',
+    });
+    expect(derivePrStateFromAssociatedPulls(sha(1), { message: 'x' })).toMatchObject({
+      state: 'unknown',
+    });
+    expect(
+      derivePrStateFromAssociatedPulls(sha(1), [
+        { state: 'closed', merged_at: null, head: { sha: sha(1) } },
+        { state: 'open', head: { sha: sha(2) } },
+      ])
+    ).toEqual({ state: 'open', headSha: sha(2) });
+    expect(
+      derivePrStateFromAssociatedPulls(sha(1), [
+        { state: 'closed', merged_at: '2026-11-01T00:00:00Z', head: { sha: sha(1) } },
+      ])
+    ).toEqual({ state: 'merged' });
+    expect(
+      derivePrStateFromAssociatedPulls(sha(1), [{ state: 'closed', merged_at: null }])
+    ).toEqual({ state: 'closed' });
+  });
+
+  test('GitHub lookup reads the PR by number, else by commit association', async () => {
+    const pulls: Record<number, { state: string; merged?: boolean; head: { sha: string } }> = {
+      1: { state: 'closed', merged: true, head: { sha: sha(1) } },
+      2: { state: 'closed', merged: false, head: { sha: sha(2) } },
+      3: { state: 'open', head: { sha: sha(30) } },
+    };
+    const request = mock(async () => ({ data: [{ state: 'closed', merged_at: 'x' }] }));
+    const client = {
+      pulls: {
+        get: async (input: Record<string, unknown>): Promise<unknown> => ({
+          data: pulls[input.pull_number as number],
+        }),
+      },
+      request,
+    };
+    const lookup = createGitHubReviewCheckoutPrLookup(
+      () => client as unknown as ReturnType<typeof createRealOctokitClient>
+    );
+    const key = { owner: 'o', repo: 'r', headSha: sha(3) };
+    expect(await lookup({ ...key, prNumber: 1 })).toEqual({ state: 'merged' });
+    expect(await lookup({ ...key, prNumber: 2 })).toEqual({ state: 'closed' });
+    expect(await lookup({ ...key, prNumber: 3 })).toEqual({ state: 'open', headSha: sha(30) });
+    expect(request).not.toHaveBeenCalled();
+    expect(await lookup(key)).toEqual({ state: 'merged' });
+    expect(request).toHaveBeenCalledWith('GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls', {
+      owner: 'o',
+      repo: 'r',
+      commit_sha: sha(3),
+    });
+  });
 });
