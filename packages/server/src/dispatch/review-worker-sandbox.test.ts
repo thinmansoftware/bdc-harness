@@ -465,6 +465,22 @@ function workerHarness(input: {
     deferMessage: async () => null,
     runAndSubmitReview,
     prepareCheckout: input.prepareCheckout,
+    // The single-writer spool lease is unit-tested in review-worker-clock.test.ts;
+    // this harness is the only worker, so the lease is always granted to it.
+    spoolLease: {
+      acquire: async request => ({
+        spool_key: request.spool_key,
+        holder_id: request.holder_id,
+        fencing_token: 1,
+        acquired_at: new Date(0).toISOString(),
+        heartbeat_at: new Date(0).toISOString(),
+        expires_at: new Date(8.64e15).toISOString(),
+      }),
+      renew: async () => null,
+      release: async () => true,
+      check: async () => true,
+    },
+    spoolKey: 'review-spool:sandbox-test',
     createSubmitDeps: reviewerIdentity => ({
       ...createRealSubmitDeps(reviewerIdentity, {
         octokit: stubOctokit,

@@ -4,31 +4,81 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join as joinPath } from 'node:path';
+import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
+import {
+  acquireReviewSpoolLease,
+  checkReviewSpoolLease,
+  releaseReviewSpoolLease,
+  renewReviewSpoolLease,
+  type ReviewSpoolLease,
+} from '@archon/core/db/review-spool-leases';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 
-// Each test process gets its own spool lock, so a lock left by an earlier run
-// (or the real /var/lib/overseer-review) never makes a tick look busy.
-process.env.OVERSEER_REVIEW_SPOOL_LOCK = joinPath(
-  mkdtempSync(joinPath(tmpdir(), 'review-spool-lock-')),
-  '.review-worker.lock'
-);
-
-/** A spool lock that is held, for evictor unit tests. */
-const heldLock = (): ReviewSpoolLock => ({
-  path: 'test-lock',
-  token: 't',
+/** A spool lease that is held, for evictor unit tests. */
+const heldLease = (): ReviewSpoolLeaseHandle => ({
+  spoolKey: 'review-spool:test',
+  holderId: 'test-holder',
+  fencingToken: 1,
   held: async () => true,
   release: async () => undefined,
 });
+
+/** In-memory lease store for tick tests that do not need the database. */
+function memoryLeaseStore(): ReviewSpoolLeaseStore {
+  const rows = new Map<string, ReviewSpoolLease>();
+  const live = (row: ReviewSpoolLease | undefined): boolean =>
+    row !== undefined && Date.parse(row.expires_at) > Date.now();
+  const at = (offsetMs: number): string => new Date(Date.now() + offsetMs).toISOString();
+  const matches = (
+    row: ReviewSpoolLease | undefined,
+    id: { holder_id: string; fencing_token: number }
+  ): row is ReviewSpoolLease =>
+    live(row) && row?.holder_id === id.holder_id && row.fencing_token === id.fencing_token;
+  return {
+    acquire: async input => {
+      const row = rows.get(input.spool_key);
+      if (live(row)) return null;
+      const lease: ReviewSpoolLease = {
+        spool_key: input.spool_key,
+        holder_id: input.holder_id,
+        fencing_token: (row?.fencing_token ?? 0) + 1,
+        acquired_at: at(0),
+        heartbeat_at: at(0),
+        expires_at: at(input.ttl_seconds * 1000),
+      };
+      rows.set(input.spool_key, lease);
+      return lease;
+    },
+    renew: async (id, ttl) => {
+      const row = rows.get(id.spool_key);
+      if (!matches(row, id)) return null;
+      const next = { ...row, heartbeat_at: at(0), expires_at: at(ttl * 1000) };
+      rows.set(id.spool_key, next);
+      return next;
+    },
+    release: async id => {
+      const row = rows.get(id.spool_key);
+      if (!matches(row, id)) return false;
+      rows.set(id.spool_key, { ...row, expires_at: new Date(0).toISOString() });
+      return true;
+    },
+    check: async id => matches(rows.get(id.spool_key), id),
+  };
+}
+
+const REAL_LEASE_STORE: ReviewSpoolLeaseStore = {
+  acquire: acquireReviewSpoolLease,
+  renew: renewReviewSpoolLease,
+  release: releaseReviewSpoolLease,
+  check: checkReviewSpoolLease,
+};
 import type { DispatchMessage, SeqCursorMessage } from '@archon/core/db/dispatch';
 import type { ReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
 import type { SubmitDeps, SubmitOutcome } from '@archon/overseer/pr-review-submit';
 import { runAndSubmitReview } from '@archon/overseer/pr-review-submit';
 import type { createRealOctokitClient } from '@archon/overseer/adapters/github-real-deps';
 import {
-  acquireReviewSpoolLock,
+  acquireReviewSpoolLeaseHandle,
   createGitHubReviewCheckoutPrLookup,
   createReviewCheckoutEvictor,
   DEFAULT_REVIEW_CHECKOUT_CACHE_MAX_BYTES,
@@ -41,7 +91,8 @@ import {
   stopReviewWorkerClock,
   tickReviewWorkerClock,
   type ReviewCheckoutCacheLogger,
-  type ReviewSpoolLock,
+  type ReviewSpoolLeaseHandle,
+  type ReviewSpoolLeaseStore,
   type ReviewCheckoutPrState,
   type ReviewWorkerDeps,
 } from './review-worker-clock';
@@ -146,6 +197,7 @@ function fakeDeps(
     deferMessage: mock(async () => null),
     runAndSubmitReview: mock(async work => outcomeFor(work.messageId)),
     createSubmitDeps: mock(() => ({ reviewerIdentity: CONFIG.reviewerIdentity }) as SubmitDeps),
+    spoolLease: memoryLeaseStore(),
   };
 }
 
@@ -562,6 +614,7 @@ describe('invalid review work against isolated real SQLite', () => {
         const dispatch = await import(${url('../../../core/src/db/dispatch.ts')});
         const { getDatabase, closeDatabase } = await import(${url('../../../core/src/db/connection.ts')});
         const { tickReviewWorkerClock } = await import(${url('./review-worker-clock.ts')});
+        const leases = await import(${url('../../../core/src/db/review-spool-leases.ts')});
         const health = await import(${url('../../../overseer/src/judge-ladder-health.ts')});
         try {
           const db = getDatabase();
@@ -588,6 +641,8 @@ describe('invalid review work against isolated real SQLite', () => {
             },
             runAndSubmitReview: async () => { reviews++; return { disposition: 'approved' }; },
             createSubmitDeps: () => { constructions++; return { reviewerIdentity: 'fixture-reviewer' }; },
+            spoolLease: { acquire: leases.acquireReviewSpoolLease, renew: leases.renewReviewSpoolLease, release: leases.releaseReviewSpoolLease, check: leases.checkReviewSpoolLease },
+            spoolKey: 'review-spool:probe',
           };
           await tickReviewWorkerClock({ webhookSecret: 'fixture', reviewerIdentity: 'fixture-reviewer' }, deps);
           const invalid = await dispatch.getMessage(bad.id);
@@ -833,7 +888,7 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
       logger,
       lookupPrState: async () => ({ state: 'merged' }),
     });
-    await evictor({ protect: [], lock: heldLock() });
+    await evictor({ protect: [], lease: heldLease() });
     expect(listClaimedReviews).toHaveBeenCalledWith({
       recipient: 'overseer-reviewer',
       task_type: 'run_review',
@@ -878,12 +933,12 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
       now: () => 1_000_000,
       logger: captureLogger().logger,
     });
-    await evictor({ protect: [], lock: heldLock() });
+    await evictor({ protect: [], lease: heldLease() });
     expect(calls).toEqual([undefined, 500]);
     expect(existsSync(live)).toBe(true);
   });
 
-  test('single writer: eviction without a held spool lock deletes nothing', async () => {
+  test('single writer: eviction without a held spool lease deletes nothing', async () => {
     const head = await cachedCheckout(root, 'o', 'r', sha(1), 100, 900);
     for (let i = 2; i <= 4; i += 1) await cachedCheckout(root, 'o', 'r', sha(i), 100, 1_000 + i);
     const { logger, entries } = captureLogger();
@@ -895,50 +950,64 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
       now: () => 1_000_000,
       logger,
     });
-    const notHeld: ReviewSpoolLock = { ...heldLock(), held: async () => false };
-    expect(await evictor({ protect: [], lock: notHeld })).toBeNull();
+    const notHeld: ReviewSpoolLeaseHandle = { ...heldLease(), held: async () => false };
+    expect(await evictor({ protect: [], lease: notHeld })).toBeNull();
     expect(listClaimedReviews).not.toHaveBeenCalled();
     expect(existsSync(head)).toBe(true);
     expect(entries.map(e => e.message)).toEqual(['overseer_review_checkout_eviction_skipped']);
-    // Lost between the claim read and the delete: still nothing is deleted.
+    // Lost between the claim read and the first delete: nothing is deleted.
     let checks = 0;
-    const lostMidPass: ReviewSpoolLock = { ...heldLock(), held: async () => (checks += 1) === 1 };
-    expect(await evictor({ protect: [], lock: lostMidPass })).toBeNull();
-    expect(existsSync(head)).toBe(true);
+    const lostMidPass: ReviewSpoolLeaseHandle = {
+      ...heldLease(),
+      held: async () => (checks += 1) === 1,
+    };
+    const result = await evictor({ protect: [], lease: lostMidPass });
+    expect(result?.stopped).toBe(true);
+    expect(result?.evicted).toEqual([]);
+    for (let i = 1; i <= 4; i += 1) expect(existsSync(join(root, 'o', 'r', sha(i)))).toBe(true);
   });
 
-  test('single writer: a second worker waits while the spool lock is held, and a stale lock is taken over', async () => {
-    const lockPath = join(root, '.review-worker.lock');
-    const first = await acquireReviewSpoolLock(lockPath);
+  test('single writer: a second worker gets nothing while the lease is held, and the tick reports busy', async () => {
+    const store = memoryLeaseStore();
+    const first = await acquireReviewSpoolLeaseHandle(store, 'review-spool:k');
     expect(first).not.toBeNull();
     expect(await first!.held()).toBe(true);
-    // A second worker on the same spool gets nothing while the lock is fresh.
-    expect(await acquireReviewSpoolLock(lockPath)).toBeNull();
-    // ...and takes it over only once the holder stopped refreshing it.
-    const later = Date.now() + 11 * 60_000;
-    const second = await acquireReviewSpoolLock(lockPath, { now: () => later });
-    expect(second).not.toBeNull();
-    expect(await first!.held()).toBe(false);
-    // Releasing a lock you no longer hold never removes the new holder's lock.
+    expect(await acquireReviewSpoolLeaseHandle(store, 'review-spool:k')).toBeNull();
+    // A tick on the same spool does no review work while the lease is held.
+    const deps = fakeDeps([message('busy', sha(5))]);
+    deps.spoolLease = store;
+    deps.spoolKey = 'review-spool:k';
+    await tickReviewWorkerClock(CONFIG, deps);
+    expect(deps.listMessages).not.toHaveBeenCalled();
+    expect(deps.claimMessage).not.toHaveBeenCalled();
+    // Released: the next tick takes the spool, and releases it again in finally.
     await first!.release();
-    expect(await second!.held()).toBe(true);
-    await second!.release();
-    expect(existsSync(lockPath)).toBe(false);
+    expect(await first!.held()).toBe(false);
+    await tickReviewWorkerClock(CONFIG, deps);
+    expect(deps.claimMessage).toHaveBeenCalledTimes(1);
+    const after = await acquireReviewSpoolLeaseHandle(store, 'review-spool:k');
+    expect(after?.fencingToken).toBe(3);
+    await after!.release();
   });
 
-  test('single writer: eviction is reachable only through the tick, with its lock', async () => {
+  test('single writer: eviction is reachable only through the tick, with its lease', async () => {
     const source = await Bun.file(join(import.meta.dir, 'review-worker-clock.ts')).text();
+    expect(source).not.toContain('acquireReviewSpoolLock');
+    expect(source).not.toContain('OVERSEER_REVIEW_SPOOL_LOCK');
     const calls = [...source.matchAll(/deps\.evictCheckouts\(/g)];
     expect(calls).toHaveLength(1);
     const helper = source.slice(source.indexOf('async function runCheckoutEviction('));
-    expect(helper.slice(0, 400)).toContain('deps.evictCheckouts({ protect, lock })');
-    const uses = [...source.matchAll(/runCheckoutEviction\(deps, lock, /g)];
+    expect(helper.slice(0, 400)).toContain('deps.evictCheckouts({ protect, lease })');
+    const uses = [...source.matchAll(/runCheckoutEviction\(deps, lease, /g)];
     expect(uses.length).toBeGreaterThanOrEqual(2);
     const tick = source.slice(source.indexOf('export async function tickReviewWorkerClock('));
     const tickBody = tick.slice(0, tick.indexOf('\nfunction '));
-    expect(tickBody).toContain('acquireReviewSpoolLock(');
-    expect(tickBody).toContain('await lock.release();');
+    expect(tickBody).toContain('acquireReviewSpoolLeaseHandle(deps.spoolLease, spoolKey)');
+    expect(tickBody).toContain('await lease.release();');
     for (const use of uses) expect(tickBody).toContain(use[0]);
+    // The evictor checks the lease before every delete, not once per pass.
+    const evictor = source.slice(source.indexOf('export function createReviewCheckoutEvictor('));
+    expect(evictor).toContain('beforeDelete: () => lease.held()');
   });
 
   test('a claim walk that cannot finish skips the pass instead of evicting', async () => {
@@ -958,7 +1027,7 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
       now: () => 1_000_000,
       logger,
     });
-    expect(await evictor({ protect: [], lock: heldLock() })).toBeNull();
+    expect(await evictor({ protect: [], lease: heldLease() })).toBeNull();
     expect(entries.map(e => e.message)).toEqual(['overseer_review_checkout_eviction_skipped']);
     expect(existsSync(head)).toBe(true);
   });
@@ -984,19 +1053,19 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
       logger,
       lookupPrState: lookup,
     });
-    expect(await evictor({ protect: [], lock: heldLock() })).toBeNull();
+    expect(await evictor({ protect: [], lease: heldLease() })).toBeNull();
     expect(entries.map(e => e.message)).toEqual(['overseer_review_checkout_eviction_skipped']);
     expect(existsSync(protectedHead)).toBe(true);
     failClaims = false;
     await evictor({
       protect: [{ owner: 'o', repo: 'r', headSha: sha(1).toUpperCase() }],
-      lock: heldLock(),
+      lease: heldLease(),
     });
     expect(existsSync(protectedHead)).toBe(true);
     const callsAfterFirst = lookup.mock.calls.length;
     expect(callsAfterFirst).toBeGreaterThan(0);
     nowMs += 1_000;
-    await evictor({ protect: [], lock: heldLock() });
+    await evictor({ protect: [], lease: heldLease() });
     expect(lookup.mock.calls.length).toBe(callsAfterFirst);
   });
 
@@ -1016,6 +1085,118 @@ describe('review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICT
     expect(calls).toEqual([`evict:${sha(7)}`, 'prepare', 'evict:']);
     // An eviction failure never blocks the review itself.
     expect(deps.runAndSubmitReview).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('review spool lease against a real SQLite store (Test 7)', () => {
+  let home = '';
+  let spool = '';
+  let root = '';
+  const oldHome = process.env.ARCHON_HOME;
+  const oldUrl = process.env.DATABASE_URL;
+  beforeEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    home = await mkdtemp(join(tmpdir(), 'review-lease-db-'));
+    process.env.ARCHON_HOME = home;
+    delete process.env.DATABASE_URL;
+    expect(getDatabase().dialect).toBe('sqlite');
+    spool = await mkdtemp(join(tmpdir(), 'review-lease-spool-'));
+    root = join(spool, 'checkouts');
+    await mkdir(root, { recursive: true });
+  });
+  afterEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    if (oldHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = oldHome;
+    if (oldUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = oldUrl;
+    removeTempDirWithRetry(home);
+    await rm(spool, { recursive: true, force: true });
+  });
+
+  async function takeOver(spoolKey: string): Promise<ReviewSpoolLeaseHandle> {
+    await getDatabase().query(
+      `UPDATE review_spool_leases SET expires_at='2000-01-01T00:00:00.000Z' WHERE spool_key=$1`,
+      [spoolKey]
+    );
+    const other = await acquireReviewSpoolLeaseHandle(REAL_LEASE_STORE, spoolKey);
+    if (!other) throw new Error('takeover_failed');
+    return other;
+  }
+
+  test('second worker waits on a live lease; takeover only after expiry; stale holder is fenced out', async () => {
+    const key = `review-spool:${root}`;
+    const first = await acquireReviewSpoolLeaseHandle(REAL_LEASE_STORE, key);
+    expect(first).not.toBeNull();
+    expect(await acquireReviewSpoolLeaseHandle(REAL_LEASE_STORE, key)).toBeNull();
+    const second = await takeOver(key);
+    expect(second.fencingToken).toBeGreaterThan(first!.fencingToken);
+    expect(await first!.held()).toBe(false);
+    // The old holder's release must not free the new holder's lease.
+    await first!.release();
+    expect(await second.held()).toBe(true);
+    await second.release();
+    expect(await second.held()).toBe(false);
+  });
+
+  test('the evictor stops at the first delete after the fencing token changes', async () => {
+    const key = `review-spool:${root}`;
+    for (let i = 1; i <= 4; i += 1) await cachedCheckout(root, 'o', 'r', sha(i), 100, 1_000 + i);
+    const lease = await acquireReviewSpoolLeaseHandle(REAL_LEASE_STORE, key);
+    expect(lease).not.toBeNull();
+    let lookups = 0;
+    let rival: ReviewSpoolLeaseHandle | undefined;
+    const { logger, entries } = captureLogger();
+    const evictor = createReviewCheckoutEvictor({
+      listClaimedReviews: async () => [],
+      checkoutRoot: root,
+      maxBytes: 1_000_000,
+      now: () => 1_000_000,
+      logger,
+      // Every checkout is merged. A second worker takes the spool over after
+      // the first delete, before the second.
+      lookupPrState: async (): Promise<ReviewCheckoutPrState> => {
+        lookups += 1;
+        if (lookups === 2) rival = await takeOver(key);
+        return { state: 'merged' };
+      },
+    });
+    const result = await evictor({ protect: [], lease: lease! });
+    expect(result?.stopped).toBe(true);
+    expect(result?.evicted.map(e => e.headSha)).toEqual([sha(1)]);
+    expect(existsSync(join(root, 'o', 'r', sha(1)))).toBe(false);
+    for (let i = 2; i <= 4; i += 1) expect(existsSync(join(root, 'o', 'r', sha(i)))).toBe(true);
+    expect(entries.some(e => e.message === 'overseer_review_checkout_eviction_stopped')).toBe(true);
+    // With the token changed before the claim read, the pass deletes nothing.
+    const again = await evictor({ protect: [], lease: lease! });
+    expect(again).toBeNull();
+    for (let i = 2; i <= 4; i += 1) expect(existsSync(join(root, 'o', 'r', sha(i)))).toBe(true);
+    await rival?.release();
+    await lease!.release();
+  });
+
+  test('the token changing between the claim read and the first delete deletes nothing', async () => {
+    const key = `review-spool:${root}`;
+    for (let i = 1; i <= 4; i += 1) await cachedCheckout(root, 'o', 'r', sha(i), 100, 1_000 + i);
+    const lease = await acquireReviewSpoolLeaseHandle(REAL_LEASE_STORE, key);
+    let rival: ReviewSpoolLeaseHandle | undefined;
+    const evictor = createReviewCheckoutEvictor({
+      listClaimedReviews: async () => {
+        rival = await takeOver(key);
+        return [];
+      },
+      checkoutRoot: root,
+      maxBytes: 1,
+      now: () => 1_000_000,
+      logger: captureLogger().logger,
+    });
+    const result = await evictor({ protect: [], lease: lease! });
+    expect(result?.stopped).toBe(true);
+    expect(result?.evicted).toEqual([]);
+    for (let i = 1; i <= 4; i += 1) expect(existsSync(join(root, 'o', 'r', sha(i)))).toBe(true);
+    await rival?.release();
   });
 });
 
