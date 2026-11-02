@@ -202,7 +202,7 @@ describe('pr-review-wiring against a real SqliteAdapter', () => {
       ['pr-review-submit-receipt:submit-message-1:approved']
     );
     expect(row.rows).toHaveLength(1);
-    expect(row.rows[0]?.recipient).toBe('operator');
+    expect(row.rows[0]?.recipient).toBe('pr-review-log');
     expect(row.rows[0]?.sender).toBe(REVIEW_SENDER);
     expect(row.rows[0]?.sender_principal_id).toBe('system:overseer');
     expect(row.rows[0]?.task_type).toBe('run_report');

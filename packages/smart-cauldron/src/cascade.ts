@@ -119,6 +119,128 @@ export interface CascadeDeps {
    * grounds (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01).
    */
   seatCutoff?: () => Promise<number | null>;
+  /**
+   * Read a run's detail for the prior-teardown wait (WO-HARNESS-REPAIR-HOLDER-
+   * TEARDOWN-01). Each read is bounded by the overall wait deadline.
+   */
+  readRunDetail?: (runId: string) => Promise<PriorRunDetail | null>;
+  /** Overall prior-teardown wait (default SMART_CAULDRON_TEARDOWN_WAIT_MS or 180000). */
+  teardownWaitMs?: number;
+  /** Poll interval for the prior-teardown wait (default 5000). */
+  teardownPollMs?: number;
+}
+
+export interface PriorRunDetail {
+  readonly status?: string | null;
+  readonly completed_at?: string | null;
+  readonly metadata?: Record<string, unknown> | null;
+}
+
+const PRE_DEPLOY_CONFIRM_AGE_MS = 600_000;
+
+/**
+ * True when a run's error or terminal cause says the repair checkout failed
+ * (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01 item 8): climbing cannot free a held branch.
+ */
+export function isCheckoutFailedNoClimb(poll: PollResult): boolean {
+  const md = poll.rawMetadata ?? {};
+  if (md.terminal_cause === 'repair_checkout_failed') return true;
+  const error = typeof md.error === 'string' ? md.error : '';
+  return (
+    error.includes('repair_gate_closed: checkout_failed') ||
+    error.includes('repair_target_branch_held')
+  );
+}
+
+export type PriorTeardownVerdict = 'confirmed' | 'survivors' | 'timeout';
+
+function parseUtcMs(value: string): number {
+  const hasTz = /[zZ]$|[+-][0-9]{2}:?[0-9]{2}$/.test(value);
+  return new Date(hasTz ? value : `${value.replace(' ', 'T')}Z`).getTime();
+}
+
+/**
+ * Wait for the prior run's metadata.teardown_confirmed_at before firing the next
+ * tier. Every read is raced against the deadline, so a read whose body never
+ * completes still ends by the deadline. A prior row with neither teardown key
+ * that completed more than 600 s ago counts as confirmed (pre-deploy runs).
+ */
+export async function waitForPriorTeardown(
+  runId: string,
+  opts: {
+    readonly read: (runId: string) => Promise<PriorRunDetail | null>;
+    /** The prior attempt's terminal poll snapshot, checked before any read. */
+    readonly initial?: PriorRunDetail | null;
+    readonly waitMs: number;
+    readonly pollMs: number;
+    readonly now?: () => number;
+    readonly sleep?: (ms: number) => Promise<void>;
+  }
+): Promise<PriorTeardownVerdict> {
+  const now = opts.now ?? ((): number => Date.now());
+  const sleep = opts.sleep ?? ((ms: number): Promise<void> => new Promise(r => setTimeout(r, ms)));
+  const deadline = now() + opts.waitMs;
+  if (opts.initial?.metadata) {
+    const md = opts.initial.metadata;
+    const survivors = md.teardown_survivors;
+    if (Array.isArray(survivors) && survivors.length > 0) return 'survivors';
+    if (typeof md.teardown_confirmed_at === 'string') return 'confirmed';
+  }
+  for (;;) {
+    const remaining = deadline - now();
+    if (remaining <= 0) return 'timeout';
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const detail = await Promise.race([
+      opts.read(runId).catch(() => null),
+      new Promise<'deadline'>(r => {
+        timer = setTimeout(() => {
+          r('deadline');
+        }, remaining);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (detail === 'deadline') return 'timeout';
+    if (detail) {
+      const md = detail.metadata ?? {};
+      const survivors = md.teardown_survivors;
+      if (Array.isArray(survivors) && survivors.length > 0) return 'survivors';
+      if (typeof md.teardown_confirmed_at === 'string') return 'confirmed';
+      if (
+        !('teardown_survivors' in md) &&
+        typeof detail.completed_at === 'string' &&
+        now() - parseUtcMs(detail.completed_at) > PRE_DEPLOY_CONFIRM_AGE_MS
+      ) {
+        return 'confirmed';
+      }
+    }
+    const left = deadline - now();
+    if (left <= 0) return 'timeout';
+    await sleep(Math.min(opts.pollMs, left));
+  }
+}
+
+async function defaultReadRunDetail(
+  runId: string,
+  apiBaseUrl: string,
+  token: string
+): Promise<PriorRunDetail | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, 15_000);
+  try {
+    const res = await fetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}`, {
+      headers: { 'x-archon-operator-token': token },
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { run?: PriorRunDetail };
+    return body.run ?? null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const SEAT_USAGE_READ_TIMEOUT_MS = 5000;
@@ -421,6 +543,20 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       findWoClaim({ woId: id, project: proj }));
   const acquireWoLockImpl = opts.deps?.acquireWoLock ?? acquireWoLock;
   const releaseWoLockImpl = opts.deps?.releaseWoLock ?? releaseWoLock;
+  const readRunDetailImpl =
+    opts.deps?.readRunDetail ??
+    ((id: string): Promise<PriorRunDetail | null> =>
+      defaultReadRunDetail(id, apiBaseUrl, operatorToken));
+  const configuredTeardownWait = Number.parseInt(
+    process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS ?? '',
+    10
+  );
+  const teardownWaitMs =
+    opts.deps?.teardownWaitMs ??
+    (Number.isInteger(configuredTeardownWait) && configuredTeardownWait > 0
+      ? configuredTeardownWait
+      : 180_000);
+  const teardownPollMs = opts.deps?.teardownPollMs ?? 5000;
   const allowClaimed =
     opts.allowClaimed ??
     (process.env.SMART_CAULDRON_ALLOW_CLAIMED === '1' ||
@@ -743,6 +879,9 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     let frontierApprovalRecord: CascadeRunRecord['frontierApproval'];
     let refusalReason: CascadeRunRecord['refusalReason'];
     let gateMisfireRecord: CascadeRunRecord['gateMisfire'];
+    let blockedReason: CascadeRunRecord['blockedReason'];
+    let priorPollSnapshot: PriorRunDetail | null = null;
+    let currentPollSnapshot: PriorRunDetail | null = null;
     let automaticPreflightTier: string | null = null;
 
     function buildCurrentRecord(): CascadeRunRecord {
@@ -775,6 +914,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(frontierApprovalRecord ? { frontierApproval: frontierApprovalRecord } : {}),
         ...(refusalReason ? { refusalReason } : {}),
         ...(gateMisfireRecord ? { gateMisfire: gateMisfireRecord } : {}),
+        ...(blockedReason ? { blockedReason } : {}),
         ...(entrySelection ? { entrySelection } : {}),
       };
     }
@@ -1054,6 +1194,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         completedAt: null,
       };
       attempts.push(attempt);
+      priorPollSnapshot = currentPollSnapshot;
+      currentPollSnapshot = null;
       await checkpoint();
 
       if (preflightImpl && !(attempts.length === 1 && automaticPreflightTier === tier.name)) {
@@ -1103,6 +1245,40 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
             prUrl: claimBeforeFire.url,
             checkedAtTier: tier.name,
           };
+          await checkpoint();
+          break;
+        }
+      }
+
+      // Before any retry fire, the prior run's processes must be proven gone
+      // (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01 item 8).
+      const priorRunId = attempts.length > 1 ? (attempts.at(-2)?.runId ?? null) : null;
+      if (priorRunId) {
+        const verdictTeardown = await waitForPriorTeardown(priorRunId, {
+          read: readRunDetailImpl,
+          initial: priorPollSnapshot,
+          waitMs: teardownWaitMs,
+          pollMs: teardownPollMs,
+        });
+        if (verdictTeardown !== 'confirmed') {
+          attempt.outcome = 'infra-error';
+          attempt.infraErrorReason = `teardown_unconfirmed: prior run ${priorRunId} (${verdictTeardown})`;
+          attempt.completedAt = new Date().toISOString();
+          status = 'blocked';
+          blockedReason = 'teardown_unconfirmed';
+          console.log(
+            `[smart-cauldron] BLOCKED teardown_unconfirmed before tier=${tier.name}: ` +
+              `prior run ${priorRunId} ${verdictTeardown}`
+          );
+          await emitEscalation({
+            errorClass: 'worktree_collision',
+            woId,
+            reason:
+              `teardown_unconfirmed: prior run ${priorRunId} teardown ${verdictTeardown}; ` +
+              `tier ${tier.name} not fired`,
+            runId: priorRunId,
+            overseerPermit: opts.overseerPermit,
+          });
           await checkpoint();
           break;
         }
@@ -1309,6 +1485,11 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         break;
       }
 
+      currentPollSnapshot = {
+        status: pollResult.terminalStatus,
+        metadata: pollResult.rawMetadata ?? {},
+      };
+
       // Judge the gate
       const verdict: GateVerdict = judgeImpl(pollResult);
       const outcome = classifyAttemptOutcome(fireResult, verdict);
@@ -1402,6 +1583,29 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           await checkpoint();
           break;
         }
+      }
+
+      // A failed repair checkout (held branch, gate closed on checkout) is not a
+      // quality failure: a bigger model cannot free the branch. Stop blocked with
+      // one escalation (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01 item 8).
+      if (isCheckoutFailedNoClimb(pollResult)) {
+        attempt.gateFailReason = `checkout_failed_no_climb: ${verdict.reason}`;
+        status = 'blocked';
+        blockedReason = 'checkout_failed_no_climb';
+        console.log(
+          `[smart-cauldron] BLOCKED checkout_failed_no_climb on tier=${tier.name} for woId=${woId}`
+        );
+        await emitEscalation({
+          errorClass: 'worktree_collision',
+          woId,
+          reason:
+            `checkout_failed_no_climb: repair checkout failed on tier ${tier.name}; ` +
+            'not climbing (a held branch is not a model-quality failure)',
+          runId: fireResult.runId,
+          overseerPermit: opts.overseerPermit,
+        });
+        await checkpoint();
+        break;
       }
 
       // Gate failed

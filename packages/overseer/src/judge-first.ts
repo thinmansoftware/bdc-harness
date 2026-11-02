@@ -22,6 +22,7 @@ import type { OverseerWorkflowEvent, PullRequestEvidence, WatchedRunRecord } fro
 import { recordSpawnOutcome } from './model-resource-health.js';
 import {
   buildJudgeTransport,
+  describeJudgeModel,
   defaultJudgeChildSpawn,
   deliverStdin,
   destroyStdin,
@@ -473,7 +474,7 @@ export async function judgeTerminalRun(
         proposedAction: parsed.proposedAction,
         proposedTier: parsed.proposedTier,
         reason: parsed.reason,
-        model: binary,
+        model: describeJudgeModel(binary),
         modelRung: rung,
       };
     } catch (error) {

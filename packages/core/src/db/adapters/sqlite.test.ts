@@ -160,18 +160,27 @@ describe('SqliteAdapter', () => {
         { principal_id: 'codex-mcp', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'cursor', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'do', delivery_mode: 'worker_poll', active: 1 },
+        // WO-HARNESS-COMPANION-MCP-MAILBOX-01: inactive until a config enable.
+        { principal_id: 'dot', delivery_mode: 'drain_on_start', active: 0 },
+        { principal_id: 'duet', delivery_mode: 'drain_on_start', active: 0 },
         { principal_id: 'duty-officer', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'fusion', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'grok', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 'grok-acp', delivery_mode: 'worker_poll', active: 1 },
+        { principal_id: 'grokbot', delivery_mode: 'drain_on_start', active: 1 },
         { principal_id: 'john', delivery_mode: 'notify_only', active: 0 },
         { principal_id: 'merge-manager', delivery_mode: 'notify_only', active: 0 },
+        { principal_id: 'muse', delivery_mode: 'drain_on_start', active: 0 },
         { principal_id: 'operator', delivery_mode: 'drain_on_start', active: 1 },
         { principal_id: 'overseer', delivery_mode: 'notify_only', active: 1 },
         // WO-HARNESS-OVERSEER-REVIEW-ROUTE-01 (migration 043): sorted
         // alphabetically by principal_id, same as the query's ORDER BY.
         { principal_id: 'overseer-review-route', delivery_mode: 'notify_only', active: 1 },
         { principal_id: 'overseer-reviewer', delivery_mode: 'worker_poll', active: 1 },
+        // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065): PR review
+        // receipt log and the T3 desktop results queue.
+        { principal_id: 'pr-review-log', delivery_mode: 'drain_on_start', active: 1 },
+        { principal_id: 't3-desktop', delivery_mode: 'drain_on_start', active: 1 },
         // WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01
         // (migration 046): recipient of Overseer's remediation candidates.
         { principal_id: 'taskmaster', delivery_mode: 'worker_poll', active: 1 },

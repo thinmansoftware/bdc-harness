@@ -328,20 +328,24 @@ describe('node-level seat reroute', () => {
     // build-manifest parses as a legacy_prompt node without provider fields, so the
     // five node headers are checked on the YAML text itself.
     const text = readFileSync(file, 'utf8').split(CRLF).join(LF);
-    for (const id of [
-      'check-already-satisfied',
-      'plan',
-      'apply-suggested-fix',
-      'decide-push-target',
-      'build-manifest',
-    ]) {
+    // Explicit GPT-6.1 pins from origin/dev (GPT-6.1 family runs on Codex);
+    // build-manifest is mechanical and carries no model pin.
+    const expectedModels: Record<string, string | null> = {
+      'check-already-satisfied': 'gpt-6.1-terra',
+      plan: 'gpt-6.1-terra',
+      'apply-suggested-fix': 'gpt-6.1-sol',
+      'decide-push-target': 'gpt-6.1-sol',
+      'build-manifest': null,
+    };
+    for (const [id, model] of Object.entries(expectedModels)) {
       const start = text.indexOf(`  - id: ${id}${LF}`);
       expect(start).toBeGreaterThan(-1);
       const header = text.slice(start, text.indexOf('depends_on:', start));
       expect(header).toContain('provider: codex');
       expect(header).toContain('-opr' + LF);
       expect(header).toContain('persona: ');
-      expect(header).not.toContain('model:');
+      if (model === null) expect(header).not.toContain('model:');
+      else expect(header).toContain(`model: ${model}${LF}`);
       expect(text.slice(start, start + 2000)).toContain('depends_on: [');
     }
     const plan = wf.nodes.find(entry => entry.id === 'plan') as { when?: string };

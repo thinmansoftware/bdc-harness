@@ -46,16 +46,23 @@ const KNOWN_PRINCIPALS = [
   ['codex-mcp', 'Codex MCP', 'worker_poll', 1],
   ['cursor', 'Cursor', 'worker_poll', 1],
   ['do', 'Duty Officer alias', 'worker_poll', 1],
+  ['dot', 'Dot (voice companion)', 'drain_on_start', 0],
+  ['duet', 'Duet (voice companion)', 'drain_on_start', 0],
   ['duty-officer', 'Duty Officer', 'worker_poll', 1],
   ['fusion', 'Fusion', 'worker_poll', 1],
   ['grok', 'Grok', 'worker_poll', 1],
   ['grok-acp', 'Grok ACP', 'worker_poll', 1],
+  ['grokbot', 'Grok Bot (voice companion)', 'drain_on_start', 1],
   ['john', 'John', 'notify_only', 0],
   ['merge-manager', 'Merge Manager', 'notify_only', 0],
+  ['muse', 'Muse (voice companion)', 'drain_on_start', 0],
   ['operator', 'Operator', 'drain_on_start', 1],
   ['overseer', 'Overseer', 'notify_only', 1],
   ['overseer-review-route', 'Overseer Review Route', 'notify_only', 1],
   ['overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1],
+  // Added by migration 065 (WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01).
+  ['pr-review-log', 'PR review receipt log', 'drain_on_start', 1],
+  ['t3-desktop', 'T3 desktop results queue', 'drain_on_start', 1],
   // Added by migration 046. This list is a FOURTH hand-maintained mirror of the
   // seeded principals (alongside the migration, 000_combined.sql and the SQLite
   // adapter); the validator compares an exact count, so a principal missing here

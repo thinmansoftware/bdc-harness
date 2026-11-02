@@ -442,6 +442,14 @@ export async function runAndSubmitReview(
       prNumber: work.prNumber,
     });
   } catch (error) {
+    // A rate limit or the local pool gate on the head re-read is a deferral,
+    // not a failure (WO-HARNESS-OVERSEER-REVIEW-TRIGGER-01). The re-read never
+    // reached a head, so nothing was submitted and the verdict is not lost:
+    // the worker re-queues this item for when the budget refills, and the next
+    // attempt re-evaluates the same bound head. Terminating here retired five
+    // PRs' reviews on 2026-11-01 with nothing to re-arm them.
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) return rateLimitedOutcome(deps, work, 'head_recheck', rateLimit);
     return finish(deps, work, work.headSha, {
       disposition: 'submission_failed',
       reason: `head_recheck_failed:${errorCode(error)}`,
@@ -526,6 +534,11 @@ export async function runAndSubmitReview(
       commitId: work.headSha,
     });
   } catch (error) {
+    // A rate-limit answer (or the local pool gate) means GitHub did not create
+    // the review, so retrying later cannot double-post. Any other throw stays
+    // terminal: its outcome on GitHub is unknown.
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) return rateLimitedOutcome(deps, work, 'submit', rateLimit);
     return finish(deps, work, work.headSha, {
       disposition: 'submission_failed',
       reason: `submit_threw:${errorCode(error)}`,
@@ -647,6 +660,25 @@ async function handBackToTaskmaster(
 function summaryField(verdict: ReviewerVerdict): { summary?: string } {
   const summary = verdict.summary?.trim() ?? '';
   return summary.length > 0 ? { summary } : {};
+}
+
+/**
+ * The non-terminal `rate_limited` outcome for a GitHub call made AFTER the
+ * reviewer ran (head re-read or review submission). The worker defers the
+ * item to `retryAfter`; the reason names which call was refused.
+ */
+function rateLimitedOutcome(
+  deps: SubmitDeps,
+  work: ReviewWorkItem,
+  stage: 'head_recheck' | 'submit',
+  rateLimit: NonNullable<ReturnType<typeof classifyRateLimitError>>
+): Promise<SubmitOutcome> {
+  return finish(deps, work, work.headSha, {
+    disposition: 'rate_limited',
+    reason: `rate_limited:${stage}:${rateLimit.kind}:${rateLimit.source}`,
+    retryAfter: rateLimit.retryAfter,
+    retryAfterMs: rateLimit.retryAfterMs,
+  });
 }
 
 function errorCode(error: unknown): string {

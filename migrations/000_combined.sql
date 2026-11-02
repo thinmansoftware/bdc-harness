@@ -614,6 +614,10 @@ VALUES
   -- desktop Board/XO seat. drain_on_start (mailbox) like operator/xo -- no
   -- worker ever claims it; the desktop automation reads and addresses it.
   ('astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', TRUE),
+  -- WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065): T3 results queue and
+  -- PR review receipt log. Both drain_on_start mailboxes; nothing claims them.
+  ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', TRUE),
+  ('pr-review-log', 'PR review receipt log', 'drain_on_start', TRUE),
   ('operator', 'Operator', 'drain_on_start', TRUE),
   ('xo', 'XO', 'drain_on_start', TRUE),
   ('board', 'Board', 'alias_resolved', TRUE),
@@ -631,7 +635,15 @@ VALUES
   ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', TRUE),
   ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE),
   ('duty-officer', 'Duty Officer', 'worker_poll', TRUE),
-  ('do', 'Duty Officer alias', 'worker_poll', TRUE)
+  ('do', 'Duty Officer alias', 'worker_poll', TRUE),
+  -- WO-HARNESS-COMPANION-MCP-MAILBOX-01 (migration 065): voice companion
+  -- mailboxes. grokbot is the enabled slot; dot, muse and duet stay inactive
+  -- until that companion is enabled by config. drain_on_start: no worker
+  -- claims this mail.
+  ('grokbot', 'Grok Bot (voice companion)', 'drain_on_start', TRUE),
+  ('dot', 'Dot (voice companion)', 'drain_on_start', FALSE),
+  ('muse', 'Muse (voice companion)', 'drain_on_start', FALSE),
+  ('duet', 'Duet (voice companion)', 'drain_on_start', FALSE)
 ON CONFLICT (principal_id) DO NOTHING;
 
 INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)

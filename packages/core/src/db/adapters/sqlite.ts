@@ -1388,6 +1388,9 @@ export class SqliteAdapter implements IDatabase {
         -- Board/XO seat. drain_on_start (mailbox) like operator/xo -- no worker
         -- ever claims it; the desktop automation reads and addresses it directly.
         ('astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 1),
+        -- WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065 parity)
+        ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', 1),
+        ('pr-review-log', 'PR review receipt log', 'drain_on_start', 1),
         ('operator', 'Operator', 'drain_on_start', 1),
         ('xo', 'XO', 'drain_on_start', 1),
         ('board', 'Board', 'alias_resolved', 1),
@@ -1407,7 +1410,15 @@ export class SqliteAdapter implements IDatabase {
         -- back as remediation candidates addressed to 'taskmaster'. Without
         -- this row createAuthenticatedMessage rejects every one with
         -- missing_principal.
-        ('taskmaster', 'Taskmaster', 'worker_poll', 1)
+        ('taskmaster', 'Taskmaster', 'worker_poll', 1),
+        -- WO-HARNESS-COMPANION-MCP-MAILBOX-01 (migration 065 parity): voice
+        -- companion mailboxes. Hand-maintained mirror of 000_combined.sql.
+        -- grokbot is active; dot, muse and duet stay inactive. No follow-up
+        -- UPDATE: inactive companions must not be switched on by the seed.
+        ('grokbot', 'Grok Bot (voice companion)', 'drain_on_start', 1),
+        ('dot', 'Dot (voice companion)', 'drain_on_start', 0),
+        ('muse', 'Muse (voice companion)', 'drain_on_start', 0),
+        ('duet', 'Duet (voice companion)', 'drain_on_start', 0)
       ON CONFLICT (principal_id) DO NOTHING
     `);
     this.db.run(`

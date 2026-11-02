@@ -134,6 +134,13 @@ import type {
   TerminalWorkflowPersistence,
 } from './reliability/types';
 import { withRunLease } from './run-lease';
+import {
+  NODE_TOKEN_ENV,
+  describeNodeTeardown,
+  endNodeProcessTree,
+  finalizeRunTeardown,
+  isTerminalRunStatus,
+} from './run-teardown';
 
 function cancellationPersistence(
   runId: string,
@@ -166,10 +173,11 @@ async function persistCancellation(
   reason: string
 ): Promise<boolean> {
   try {
-    await deps.store.cancelWorkflowRun(
-      workflowRun.id,
-      cancellationPersistence(workflowRun.id, reason, nodeId)
-    );
+    const teardownMetadataForCancel = await finalizeRunTeardown(deps.store, workflowRun);
+    await deps.store.cancelWorkflowRun(workflowRun.id, {
+      ...cancellationPersistence(workflowRun.id, reason, nodeId),
+      metadata: teardownMetadataForCancel,
+    });
     return true;
   } catch (error) {
     const failedAt = new Date().toISOString();
@@ -1263,6 +1271,22 @@ async function safeSendMessage(
 
     return false;
   }
+}
+
+/**
+ * First error line naming a repair failure (`repair_target_`, `repair_gate_closed:`
+ * or `ERROR:`), else the first non-empty line. Used for repair_failure_reason.
+ */
+export function repairFailureReason(errorText: string): string {
+  const lines = errorText
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line.length > 0);
+  for (const line of lines) {
+    const idx = line.search(/repair_target_|repair_gate_closed:|ERROR:/);
+    if (idx >= 0) return line.slice(idx);
+  }
+  return lines[0] ?? 'unknown';
 }
 
 /**
@@ -3258,6 +3282,7 @@ async function executeBashNode(
     : nodeRefResolved;
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
+  const bashNodeToken = `${workflowRun.id}:${node.id}`;
   // Inject workflow inputs as INPUT_<NAME> env vars (belt-and-suspenders alongside template substitution).
   const inputEnvVars: Record<string, string> = resolvedInputs
     ? Object.fromEntries(
@@ -3290,6 +3315,8 @@ async function executeBashNode(
     ARCHON_NODE_OUT: join(artifactsDir || tmpdir(), 'node-out'),
     ...inputEnvVars,
     ...(envVars ?? {}),
+    // Node-specific ownership for timeout teardown: inherited by every descendant.
+    [NODE_TOKEN_ENV]: bashNodeToken,
   };
 
   const safeNodeId = node.id.replace(/[^A-Za-z0-9._-]/g, '_');
@@ -3466,6 +3493,13 @@ async function executeBashNode(
       errorMsg = `${label} failed: unable to prepare temporary script at ${err.scriptFile ?? scriptFile}`;
     } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
+      // Reap only this node's own processes (env token), never a concurrent node's.
+      const nodeTeardown = await endNodeProcessTree({
+        run: { id: workflowRun.id, working_path: cwd, started_at: workflowRun.started_at },
+        nodeStartMs: nodeStartTime,
+        nodeToken: bashNodeToken,
+      });
+      errorMsg += describeNodeTeardown(nodeTeardown);
     } else if (err.message?.includes('ENOENT')) {
       errorMsg = `${label} failed: bash executable not found in PATH`;
     } else if (err.message?.includes('EACCES')) {
@@ -3575,8 +3609,13 @@ async function executeScriptNode(
   const finalScript = substituteNodeOutputRefs(substitutedScript, nodeOutputs, false);
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
-  const subprocessEnv =
-    envVars && Object.keys(envVars).length > 0 ? { ...process.env, ...envVars } : undefined;
+  const scriptNodeToken = `${workflowRun.id}:${node.id}`;
+  const subprocessEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...(envVars ?? {}),
+    // Node-specific ownership for timeout teardown: inherited by every descendant.
+    [NODE_TOKEN_ENV]: scriptNodeToken,
+  };
 
   // Build the command and args based on runtime and inline vs named
   let cmd = '';
@@ -3814,6 +3853,12 @@ async function executeScriptNode(
     let errorMsg: string;
     if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
+      const nodeTeardown = await endNodeProcessTree({
+        run: { id: workflowRun.id, working_path: cwd, started_at: workflowRun.started_at },
+        nodeStartMs: nodeStartTime,
+        nodeToken: scriptNodeToken,
+      });
+      errorMsg += describeNodeTeardown(nodeTeardown);
     } else if (err.message?.includes('ENOENT')) {
       errorMsg = `${label} failed: '${cmd}' executable not found in PATH`;
     } else if (err.message?.includes('EACCES')) {
@@ -5626,6 +5671,7 @@ async function executeDagWorkflowInternal(
     });
   }
 
+  let runAbort: { nodeId: string; reason: string } | undefined;
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
     if (deps.isRunLeaseValid?.() === false) {
       getLog().warn({ workflowRunId: workflowRun.id }, 'dag.run_lease_lost');
@@ -6454,6 +6500,28 @@ async function executeDagWorkflowInternal(
       getLog().warn({ layerIdx, nodeCount: layer.length }, 'dag_layer_had_failures');
     }
 
+    // abort_run_on_failure (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01 item 7): a failed
+    // repair checkout ends the run at once; nothing later runs.
+    const abortingNode = layer.find(
+      n => n.abort_run_on_failure === true && nodeOutputs.get(n.id)?.state === 'failed'
+    );
+    if (abortingNode) {
+      const abortOutput = nodeOutputs.get(abortingNode.id);
+      const abortError =
+        abortOutput?.state === 'failed' ? (abortOutput.error ?? abortOutput.output) : '';
+      runAbort = { nodeId: abortingNode.id, reason: repairFailureReason(abortError) };
+      for (const pending of workflow.nodes) {
+        if (!nodeOutputs.has(pending.id)) {
+          nodeOutputs.set(pending.id, { state: 'skipped', output: '' });
+        }
+      }
+      getLog().warn(
+        { workflowRunId: workflowRun.id, nodeId: abortingNode.id, reason: runAbort.reason },
+        'dag.run_aborted_on_node_failure'
+      );
+      break;
+    }
+
     // Check for non-running status between DAG layers (cancellation, deletion, pause)
     try {
       const dagStatus = await deps.store.getWorkflowRunStatus(workflowRun.id);
@@ -6468,6 +6536,11 @@ async function executeDagWorkflowInternal(
           },
           'dag.stop_detected_between_layers'
         );
+        // An external terminal transition (operator cancel, conductor stall cancel)
+        // still owes a teardown: processes in the worktree must not outlive the run.
+        if (isTerminalRunStatus(dagStatus)) {
+          await finalizeRunTeardown(deps.store, workflowRun);
+        }
         // Paused is intentional (approval gate) -- the approval message was already sent
         if (effectiveStatus !== 'paused') {
           await safeSendMessage(
@@ -6650,17 +6723,72 @@ async function executeDagWorkflowInternal(
     'dag_workflow_finished'
   );
 
+  if (runAbort) {
+    if (await skipIfStatusChanged('dag.skip_fail_status_changed')) return;
+    const failMsg =
+      `DAG workflow '${workflow.name}' aborted: node '${runAbort.nodeId}' failed ` +
+      `(abort_run_on_failure): ${runAbort.reason}`;
+    const failedOutcome = await makeTerminalOutcome('failed');
+    const teardownMd = await finalizeRunTeardown(deps.store, workflowRun);
+    try {
+      await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
+        outcome: failedOutcome,
+        updatedAt: new Date().toISOString(),
+        metadata: {
+          ...teardownMd,
+          node_counts: nodeCounts,
+          terminal_cause: 'repair_checkout_failed',
+          repair_failure_reason: runAbort.reason,
+          failed_nodes: [runAbort.nodeId],
+        },
+        eventData: {
+          error: failMsg,
+          node_counts: nodeCounts,
+          terminal_cause: 'repair_checkout_failed',
+          repair_failure_reason: runAbort.reason,
+        },
+      });
+    } catch (dbErr) {
+      await handleTerminalPersistenceFailure('failed', failedOutcome, dbErr as Error);
+      return;
+    }
+    emitTerminalRunTokenTotals();
+    await logWorkflowError(logDir, workflowRun.id, failMsg).catch((logErr: Error) => {
+      getLog().error(
+        { err: logErr, workflowRunId: workflowRun.id },
+        'dag.workflow_error_log_write_failed'
+      );
+    });
+    const emitterForAbort = getWorkflowEventEmitter();
+    emitterForAbort.emit({
+      type: 'workflow_failed',
+      runId: workflowRun.id,
+      workflowName: workflow.name,
+      error: failMsg,
+    });
+    emitterForAbort.unregisterRun(workflowRun.id);
+    await safeSendMessage(platform, conversationId, `\u274c ${failMsg}`, {
+      workflowId: workflowRun.id,
+    });
+    return;
+  }
+
   if (!anyCompleted) {
     if (await skipIfStatusChanged('dag.skip_fail_status_changed')) return;
     const failMsg =
       `DAG workflow '${workflow.name}' completed with no successful nodes. ` +
       'Check node conditions, trigger rules, and upstream failures.';
     const failedOutcome = await makeTerminalOutcome('failed');
+    const teardownMd = await finalizeRunTeardown(deps.store, workflowRun);
     try {
       await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
         outcome: failedOutcome,
         updatedAt: new Date().toISOString(),
-        metadata: { node_counts: nodeCounts, terminal_cause: 'no_successful_nodes' },
+        metadata: {
+          ...teardownMd,
+          node_counts: nodeCounts,
+          terminal_cause: 'no_successful_nodes',
+        },
         eventData: {
           error: failMsg,
           node_counts: nodeCounts,
@@ -6717,10 +6845,12 @@ async function executeDagWorkflowInternal(
       );
       const degradedDuration = Date.now() - dagStartTime;
       const degradedOutcome = await makeTerminalOutcome('completed');
+      const teardownMd = await finalizeRunTeardown(deps.store, workflowRun);
       try {
         await deps.store.completeWorkflowRun(
           workflowRun.id,
           {
+            ...teardownMd,
             node_counts: nodeCounts,
             // Degraded-success signal consumed by the dashboard (Section 5 of the
             // WO): status 'completed' + paperwork_degraded=true, no new enum value.
@@ -6780,11 +6910,13 @@ async function executeDagWorkflowInternal(
       .join('; ');
     const failMsg = `DAG workflow '${workflow.name}' completed with failures: ${failedNodes}`;
     const failedOutcome = await makeTerminalOutcome('failed');
+    const teardownMd = await finalizeRunTeardown(deps.store, workflowRun);
     try {
       await deps.store.failWorkflowRun(workflowRun.id, failMsg, {
         outcome: failedOutcome,
         updatedAt: new Date().toISOString(),
         metadata: {
+          ...teardownMd,
           node_counts: nodeCounts,
           terminal_cause: 'node_failures',
           failed_nodes: failedNodeIds,
@@ -6829,10 +6961,14 @@ async function executeDagWorkflowInternal(
   // Persist terminal facts before publishing any terminal event.
   const duration = Date.now() - dagStartTime;
   const completedOutcome = await makeTerminalOutcome('completed');
+  // Teardown (N1-N3) runs and persists metadata.teardown_confirmed_at (or
+  // metadata.teardown_survivors) BEFORE the terminal status write below.
+  const teardownMd = await finalizeRunTeardown(deps.store, workflowRun);
   try {
     await deps.store.completeWorkflowRun(
       workflowRun.id,
       {
+        ...teardownMd,
         node_counts: nodeCounts,
         // totalCostUsd starts at 0; only write metadata when at least one node reported cost
         ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),

@@ -6,6 +6,7 @@ import { conclusionIsPassing, latestAttemptPerCheck } from './pr-review-check-in
 import { createLogger } from '@archon/paths';
 import {
   buildJudgeTransport,
+  describeJudgeModel,
   defaultJudgeChildSpawn,
   deliverStdin,
   destroyStdin,
@@ -726,10 +727,13 @@ export async function evaluatePullRequest(
       } catch {
         return indeterminate(input, deps, acceptanceCriteriaAvailable, 'reviewed_head_mismatch');
       }
-      getLog().info({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_verdict_produced');
+      getLog().info(
+        { binary, model: describeJudgeModel(binary), rungMs, prNumber: input.pr_number },
+        'judge_rung_verdict_produced'
+      );
       return {
         ...applyRequiredCheckGate(parsed, checkPartition),
-        reviewer: { provider: deps.reviewer.provider, model: binary },
+        reviewer: { provider: deps.reviewer.provider, model: describeJudgeModel(binary) },
         acceptance_criteria_available: acceptanceCriteriaAvailable,
       };
     } catch (error) {

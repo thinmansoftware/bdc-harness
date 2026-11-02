@@ -10,6 +10,7 @@ import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/p
 import { execFileAsync, getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
 import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from './schemas';
 import { executeDagWorkflow } from './dag-executor';
+import { finalizeRunTeardown, isTerminalRunStatus } from './run-teardown';
 import { resolveModelForNode, type ModelOverride } from './model-override';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
@@ -606,6 +607,111 @@ async function loadRunBranchIdentity(
   });
 }
 
+/** Holder wait bound for a repair run (N6): never more than 600 s from admission. */
+export const REPAIR_NOT_BEFORE_SECONDS = 600;
+
+export interface RepairNotBeforeInput {
+  readonly spec: string | Uint8Array | undefined;
+  readonly cwd: string;
+  /** `git worktree list --porcelain` output for the codebase clone. */
+  readonly listWorktrees: (cwd: string) => Promise<string>;
+  /** Run rows recorded for a working path. */
+  readonly listRuns: (
+    workingPath: string
+  ) => Promise<readonly { status: string; completed_at: string | Date | null }[]>;
+  readonly now?: () => Date;
+  readonly sleep?: (ms: number) => Promise<void>;
+  /** Persist metadata.repair_not_before (ISO UTC). */
+  readonly record?: (notBefore: string) => Promise<void>;
+}
+
+export interface RepairNotBeforeResult {
+  readonly holder: string;
+  readonly notBefore: string;
+  readonly waitMs: number;
+}
+
+function normalizeWorktreePath(path: string): string {
+  const resolved = resolve(path).replace(/\\/g, '/');
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+/** Path of the worktree (other than `cwd`) that has `branch` checked out, if any. */
+export function findBranchHolder(porcelain: string, branch: string, cwd: string): string | null {
+  const self = normalizeWorktreePath(cwd);
+  for (const block of porcelain.split(/\n\s*\n/)) {
+    let path: string | null = null;
+    let head: string | null = null;
+    for (const line of block.split('\n')) {
+      if (line.startsWith('worktree ')) path = line.slice('worktree '.length).trim();
+      if (line.startsWith('branch ')) head = line.slice('branch '.length).trim();
+    }
+    if (path && head === `refs/heads/${branch}` && normalizeWorktreePath(path) !== self) {
+      return path;
+    }
+  }
+  return null;
+}
+
+/**
+ * N6: when the spec declares a repair target and another worktree holds that
+ * branch, not_before = latest completed_at among the holder's terminal run rows
+ * + 600 s. Records metadata.repair_not_before and waits (bounded by 600 s) so the
+ * checkout-repair-target node starts no earlier. No holder, a holder with no
+ * terminal row, or a holder with a non-terminal row (the rtw core refuses it at
+ * once) means no wait and nothing recorded.
+ */
+export async function computeRepairNotBefore(
+  input: RepairNotBeforeInput
+): Promise<RepairNotBeforeResult | null> {
+  const target = parseRepairTarget(input.spec);
+  if (!target) return null;
+  let porcelain: string;
+  try {
+    porcelain = await input.listWorktrees(input.cwd);
+  } catch {
+    return null;
+  }
+  const holder = findBranchHolder(porcelain, target.branch, input.cwd);
+  if (!holder) return null;
+  const rows = await input.listRuns(holder);
+  if (rows.length === 0 || rows.some(row => !isTerminalRunStatus(row.status))) return null;
+  let latest = -1;
+  for (const row of rows) {
+    if (row.completed_at === null || row.completed_at === undefined) continue;
+    const ms = parseDbTimestamp(row.completed_at);
+    if (Number.isFinite(ms) && ms > latest) latest = ms;
+  }
+  if (latest < 0) return null;
+  const now = (input.now ?? ((): Date => new Date()))();
+  const notBeforeMs = latest + REPAIR_NOT_BEFORE_SECONDS * 1000;
+  const notBefore = new Date(notBeforeMs).toISOString();
+  const waitMs = Math.max(
+    0,
+    Math.min(notBeforeMs - now.getTime(), REPAIR_NOT_BEFORE_SECONDS * 1000)
+  );
+  if (input.record) await input.record(notBefore);
+  if (waitMs > 0) {
+    const sleep =
+      input.sleep ?? ((ms: number): Promise<void> => new Promise(r => setTimeout(r, ms)));
+    await sleep(waitMs);
+  }
+  return { holder, notBefore, waitMs };
+}
+
+/**
+ * Teardown (N1-N3) before a terminal failure write. The teardown metadata is
+ * written onto the run row first; the failure write itself is unchanged.
+ */
+async function failWorkflowRunWithTeardown(
+  deps: WorkflowDeps,
+  run: WorkflowRun,
+  reason: string
+): Promise<void> {
+  await finalizeRunTeardown(deps.store, run);
+  await deps.store.failWorkflowRun(run.id, reason);
+}
+
 /**
  * Execute a complete DAG-based workflow.
  *
@@ -1040,7 +1146,7 @@ export async function executeWorkflow(
             'workflow_event_persist_failed'
           );
         });
-      await deps.store.failWorkflowRun(workflowRun.id, reason);
+      await failWorkflowRunWithTeardown(deps, workflowRun, reason);
       await sendCriticalMessage(
         platform,
         conversationId,
@@ -1248,7 +1354,7 @@ export async function executeWorkflow(
             'workflow_event_persist_failed'
           );
         });
-      await deps.store.failWorkflowRun(workflowRun.id, reason);
+      await failWorkflowRunWithTeardown(deps, workflowRun, reason);
       await sendCriticalMessage(platform, conversationId, `[ ] **Workflow blocked**: ${reason}`);
       return { success: false, workflowRunId: workflowRun.id, error: reason };
     }
@@ -1432,7 +1538,7 @@ export async function executeWorkflow(
               'workflow_event_persist_failed'
             );
           });
-        await deps.store.failWorkflowRun(workflowRun.id, detail);
+        await failWorkflowRunWithTeardown(deps, workflowRun, detail);
         await sendCriticalMessage(
           platform,
           conversationId,
@@ -1575,6 +1681,45 @@ export async function executeWorkflow(
       // Continue anyway - workflow is already recorded in database
     }
 
+    // N6 (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01): a repair run waits until the
+    // holder's completed_at + 600 s before checkout-repair-target can start.
+    const repairWaitRun = workflowRun;
+    const repairNotBefore = await computeRepairNotBefore({
+      spec: identitySpec,
+      cwd,
+      listWorktrees: async dir =>
+        (await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: dir })).stdout,
+      listRuns: async path =>
+        deps.store.listWorkflowRunsByWorkingPath
+          ? deps.store.listWorkflowRunsByWorkingPath(path)
+          : [],
+      record: async notBefore => {
+        await deps.store.updateWorkflowRun(repairWaitRun.id, {
+          metadata: { repair_not_before: notBefore },
+        });
+      },
+    }).catch((error: unknown) => {
+      getLog().warn(
+        { err: error as Error, workflowRunId: repairWaitRun.id },
+        'workflow.repair_not_before_failed'
+      );
+      return null;
+    });
+    if (repairNotBefore && repairNotBefore.waitMs > 0) {
+      getLog().info(
+        { workflowRunId: workflowRun.id, ...repairNotBefore },
+        'workflow.repair_not_before_waited'
+      );
+      const afterWait = await deps.store.getWorkflowRunStatus(workflowRun.id).catch(() => null);
+      if (afterWait !== null && afterWait !== 'running') {
+        return {
+          success: false,
+          workflowRunId: workflowRun.id,
+          error: `Run left running state (${afterWait}) during repair_not_before wait`,
+        };
+      }
+    }
+
     // Execute the DAG workflow
     const dagSummary = await executeDagWorkflow(
       deps,
@@ -1619,7 +1764,7 @@ export async function executeWorkflow(
 
     // Record failure in database (non-blocking - log but don't re-throw on DB error)
     try {
-      await deps.store.failWorkflowRun(workflowRun.id, err.message);
+      await failWorkflowRunWithTeardown(deps, workflowRun, err.message);
     } catch (dbError) {
       getLog().error(
         { err: dbError as Error, workflowId: workflowRun.id, originalError: err.message },
@@ -1685,11 +1830,13 @@ export async function executeWorkflow(
       const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
       if (backstopStatus === 'running') {
         getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
-        await deps.store
-          .failWorkflowRun(runId, 'Workflow exited without finalizing -- see logs')
-          .catch((err: unknown) => {
-            getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
-          });
+        await failWorkflowRunWithTeardown(
+          deps,
+          workflowRun,
+          'Workflow exited without finalizing -- see logs'
+        ).catch((err: unknown) => {
+          getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
+        });
       }
     }
   }

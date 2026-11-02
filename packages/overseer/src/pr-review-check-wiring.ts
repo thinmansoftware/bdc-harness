@@ -16,6 +16,7 @@
  * / check_suite name cannot be matched to a verdict-named check.
  */
 import * as dispatch from '@archon/core/db/dispatch';
+import { PR_REVIEW_LOG_RECIPIENT } from '@archon/core/db/dispatch-routing';
 import type {
   RecheckCheckRun,
   RecheckIngestDeps,
@@ -33,7 +34,7 @@ import {
 } from './pr-review-wiring';
 
 /** Receipt recipient the submit path writes its verdicts to. */
-const RECEIPT_RECIPIENT = 'operator';
+const RECEIPT_RECIPIENT = PR_REVIEW_LOG_RECIPIENT;
 
 const CHECK_RUN_PAGE_SIZE = 100;
 const MAX_CHECK_RUN_PAGES = 10;
@@ -184,10 +185,17 @@ export function createRealRecheckIngestDeps(config: ReviewRouteConfig): RecheckI
       // Exact correlation-id match: head-bound, indexed, and immune to the
       // 500-row page cap that makes a listMessages scan unable to reach an
       // older receipt.
-      const receipts = await dispatch.listMessagesByCorrelationId({
+      // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: log recipient first, then the
+      // pre-cut-off history at `operator` (newest-first overall).
+      const logReceipts = await dispatch.listMessagesByCorrelationId({
         correlationId,
         recipient: RECEIPT_RECIPIENT,
       });
+      const historyReceipts = await dispatch.listMessagesByCorrelationId({
+        correlationId,
+        recipient: 'operator',
+      });
+      const receipts = [...logReceipts, ...historyReceipts];
       const verdict = foldSubmitReceipts(receipts, input.headSha);
       if (!verdict) return null;
 

@@ -15,7 +15,10 @@ import {
 } from '@archon/core/db/dispatch';
 import { getCurrentXoLease, type XoLease } from '@archon/core/db/board-authority';
 import { createLogger } from '@archon/paths';
-import { resolveServiceGitHubAuth } from '@archon/core/github/service-identity';
+import {
+  getServiceGitHubToken,
+  resolveServiceGitHubAuth,
+} from '@archon/core/github/service-identity';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { judgeDutyOfficerItem, type DutyOfficerJudgeVerdict } from './duty-officer-judge';
 import {
@@ -97,11 +100,37 @@ export interface DutyOfficerClockDeps {
   now?: () => Date;
 }
 
-export function githubToken(): string | null {
+function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason)));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    operation.then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+    if (signal.aborted) onAbort();
+  });
+}
+
+export async function githubToken(parent?: AbortSignal): Promise<string | null> {
+  const timeoutSignal = AbortSignal.timeout(githubTimeoutMs());
+  const signal = parent ? AbortSignal.any([timeoutSignal, parent]) : timeoutSignal;
   try {
+    if (signal.aborted) return null;
     const identity = resolveServiceGitHubAuth('duty_officer');
-    return identity.kind === 'pat' ? identity.token : null;
-  } catch {
+    if (identity.kind === 'none') return null;
+    if (identity.kind === 'pat') {
+      if (identity.token.trim() === '') return null;
+      if (signal.aborted) return null;
+      return identity.token;
+    }
+    return await abortable(getServiceGitHubToken(identity, { signal }), signal);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('github_app_token_mint_failed')) {
+      log.warn({ error: message }, 'duty_officer_github_token_mint_failed');
+    }
     return null;
   }
 }
