@@ -260,9 +260,13 @@ export async function recordReply(
 }
 
 /**
- * A still-live fire admission for this WO: a reserved fire (mid-admission) or an
- * admitted fire (succeeded). Excludes the caller's own request_id so a replay
- * does not treat itself as a competitor.
+ * A fire for this WO still mid-admission: a `reserved` row whose cascade has not
+ * yet been decided. Admissions are NEVER deleted, so an `admitted` row persists
+ * long after its run has completed; treating it as live here would permanently
+ * refuse every future fire for that WO. Liveness of an admitted fire's run is
+ * owned by the actual `remote_agent_workflow_runs` check (hasLiveWorkflowRun),
+ * not by this ledger -- so only `reserved` blocks. Excludes the caller's own
+ * request_id so a replay does not treat itself as a competitor.
  */
 export async function findLiveFireForWo(
   woId: string,
@@ -271,7 +275,7 @@ export async function findLiveFireForWo(
 ): Promise<T3CommandAdmissionRow | null> {
   const result = await db.query<T3CommandAdmissionRow>(
     `SELECT * FROM t3_command_admissions
-     WHERE verb = 'fire' AND wo_id = $1 AND state IN ('reserved','admitted')
+     WHERE verb = 'fire' AND wo_id = $1 AND state = 'reserved'
        AND ($2 = '' OR request_id <> $2)
      ORDER BY created_at ASC
      LIMIT 1`,

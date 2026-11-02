@@ -140,13 +140,17 @@ function makeWorld(env: Record<string, string | undefined>): World {
     checkFireEligibility: async () => ({ eligible: world.eligible, reason: 'spec_missing' }),
     fireCascade: async input => {
       world.calls.fire += 1;
-      return (
-        world.fireResults.get(input.woId) ?? {
-          cascadeId: `C-${input.woId}`,
-          status: 'running',
-          runId: `R-${input.woId}`,
-        }
-      );
+      const result = world.fireResults.get(input.woId) ?? {
+        cascadeId: `C-${input.woId}`,
+        status: 'running',
+        runId: `R-${input.woId}`,
+      };
+      // A successful fire produces a live workflow run that names this WO (the
+      // real `remote_agent_workflow_runs` row). Model it so a subsequent fire
+      // for the same WO is blocked by hasLiveWorkflowRun -- not by a historical
+      // `admitted` admission, which must NOT block once its run completes.
+      if (result.runId) world.liveRuns.set(input.woId, result.runId);
+      return result;
     },
     cancelRun: async (runId, opts) => {
       world.calls.cancel += 1;
@@ -362,6 +366,91 @@ describe('Test 3: live run refused server-side', () => {
     expect(states).toEqual(['admitted', 'refused']);
     const refusedRow = q3Row?.state === 'refused' ? q3Row : q4Row;
     expect(refusedRow?.code).toBe('live_run');
+  });
+});
+
+describe('Test 3b: a completed fire (admitted, run no longer live) does not block a fresh fire', () => {
+  test('after the prior run has completed, a new fire for the same WO is admitted', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    // A prior fire was admitted; its run has since completed, so it is NOT in
+    // liveRuns. The admission row persists forever (rows are never deleted).
+    await seedAdmittedFire('t3-bridge', 'WO-DONE', 'R-OLD', 'OLD');
+
+    const q = makeMessage({
+      idempotencyKey: 'NEW',
+      body: cmdBody({ request_id: 'NEW', verb: 'fire', wo_id: 'WO-DONE', project: 'bdc-harness' }),
+    });
+    await processCommand(world.deps, q);
+
+    // The historical admitted row must not masquerade as a live fire.
+    expect(world.calls.fire).toBe(1);
+    const reply = parseReply(world.replies[world.replies.length - 1]);
+    expect(reply.status).toBe(200);
+    expect(reply.code).toBe('ok');
+    const row = await admissions.getByRequestId('NEW', db);
+    expect(row?.state).toBe('admitted');
+  });
+});
+
+describe('Test 3c: a cascade that returns no run id is not replied as success', () => {
+  test('null run id -> unknown admission, non-2xx reply, never admitted', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    world.fireResults.set('WO-NORUN', { cascadeId: 'CX', status: 'running', runId: null });
+
+    const q = makeMessage({
+      idempotencyKey: 'NR',
+      body: cmdBody({ request_id: 'NR', verb: 'fire', wo_id: 'WO-NORUN', project: 'bdc-harness' }),
+    });
+    await processCommand(world.deps, q);
+
+    const reply = parseReply(world.replies[world.replies.length - 1]);
+    expect(reply.status).toBe(502);
+    expect(reply.code).toBe('fire_no_run');
+    expect(reply.run_id).toBeNull();
+    const row = await admissions.getByRequestId('NR', db);
+    expect(row?.state).toBe('unknown');
+  });
+});
+
+describe('Test 3d: a persistence failure after an executed cascade is reconciled, never refused', () => {
+  test('markAdmitted failure -> unknown (not refused), so the WO is never released for a refire', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    world.fireResults.set('WO-A', { cascadeId: 'C1', status: 'running', runId: 'R1' });
+    // Fail ONLY the write that persists the admitted outcome; reads and the
+    // unknown-reconciliation write still succeed.
+    const realDb = db;
+    world.deps.db = new Proxy(realDb, {
+      get(target, prop, receiver): unknown {
+        if (prop === 'query') {
+          return async (sql: string, params?: unknown[]): Promise<unknown> => {
+            if (typeof sql === 'string' && sql.includes("state = 'admitted'")) {
+              throw new Error('persist boom');
+            }
+            return target.query(sql, params as never);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as typeof realDb;
+
+    const q = makeMessage({
+      idempotencyKey: 'PF',
+      body: cmdBody({ request_id: 'PF', verb: 'fire', wo_id: 'WO-A', project: 'bdc-harness' }),
+    });
+    await processCommand(world.deps, q);
+
+    // The cascade executed exactly once and must NOT be refused.
+    expect(world.calls.fire).toBe(1);
+    const reply = parseReply(world.replies[world.replies.length - 1]);
+    expect(reply.status).toBe(500);
+    expect(reply.code).toBe('fire_admit_unpersisted');
+    const row = await admissions.getByRequestId('PF', db);
+    expect(row?.state).toBe('unknown');
+    expect(row?.state).not.toBe('refused');
   });
 });
 

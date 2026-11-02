@@ -322,7 +322,9 @@ async function handleFire(
     );
     return { status: 409, code: 'live_run', run_id: live.runId ?? cmd.request_id };
   }
-  // Live-run refusal: another fire admission for this WO is reserved/admitted.
+  // Live-run refusal: another fire admission for this WO is mid-admission
+  // (reserved). A completed `admitted` row does not block -- that run's liveness
+  // is owned by hasLiveWorkflowRun above, not by the admission ledger.
   const competitor = await admissions.findLiveFireForWo(woId, cmd.request_id, deps.db);
   if (competitor) {
     await admissions.insertRefused(
@@ -376,13 +378,43 @@ async function handleFire(
     return { status: 409, code: `fire_ineligible:${eligibility.reason ?? 'unknown'}` };
   }
 
+  let result: { cascadeId: string; status: string; runId: string | null };
   try {
-    const result = await deps.fireCascade({
+    result = await deps.fireCascade({
       woId,
       project: cmd.project,
       lane: cmd.lane,
       dispatchId: cmd.request_id,
     });
+  } catch (error) {
+    // The cascade invocation threw before returning a result. We cannot prove
+    // whether a run was created, so releasing the WO (markRefused) risks a
+    // double-fire once any created run completes. Reconcile as `unknown`: the
+    // actor is told admission_unknown and the fire is NEVER refired automatically
+    // (startup recovery / operator adjudicates instead).
+    log.warn(
+      { woId, cause: (error as Error).message.slice(0, 200) },
+      'cauldron_fire_cascade_failed'
+    );
+    await admissions
+      .markUnknown(cmd.request_id, { status_code: 500, code: 'fire_failed', now }, deps.db)
+      .catch(() => undefined);
+    return { status: 500, code: 'fire_failed' };
+  }
+
+  // Command contract: a fire is only `ok` when it yields a verifiable run id
+  // (custody of a specific run). A cascade that returns no run id cannot be
+  // confirmed, so it is NOT replied as success -- record it as `unknown` so it
+  // is never reported ok and never refired automatically.
+  if (!result.runId) {
+    log.warn({ woId, cascadeId: result.cascadeId }, 'cauldron_fire_no_run_id');
+    await admissions
+      .markUnknown(cmd.request_id, { status_code: 502, code: 'fire_no_run', now }, deps.db)
+      .catch(() => undefined);
+    return { status: 502, code: 'fire_no_run', cascade_id: result.cascadeId };
+  }
+
+  try {
     await admissions.markAdmitted(
       cmd.request_id,
       {
@@ -394,19 +426,31 @@ async function handleFire(
       },
       deps.db
     );
-    return { status: 200, code: 'ok', run_id: result.runId, cascade_id: result.cascadeId };
   } catch (error) {
+    // The cascade executed and produced run `result.runId`, but persisting the
+    // admitted outcome failed. Do NOT mark refused -- that would release the WO
+    // and allow a duplicate fire after the run completes. Reconcile as `unknown`
+    // (best effort; if even that write fails the row stays `reserved` and startup
+    // recovery marks it unknown) so the executed cascade is preserved, never refired.
     log.warn(
-      { woId, cause: (error as Error).message.slice(0, 200) },
-      'cauldron_fire_cascade_failed'
+      { woId, runId: result.runId, cause: (error as Error).message.slice(0, 200) },
+      'cauldron_fire_admit_persist_failed'
     );
-    await admissions.markRefused(
-      cmd.request_id,
-      { status_code: 500, code: 'fire_failed', now },
-      deps.db
-    );
-    return { status: 500, code: 'fire_failed' };
+    await admissions
+      .markUnknown(
+        cmd.request_id,
+        { status_code: 500, code: 'fire_admit_unpersisted', now },
+        deps.db
+      )
+      .catch(() => undefined);
+    return {
+      status: 500,
+      code: 'fire_admit_unpersisted',
+      run_id: result.runId,
+      cascade_id: result.cascadeId,
+    };
   }
+  return { status: 200, code: 'ok', run_id: result.runId, cascade_id: result.cascadeId };
 }
 
 async function handleCancel(
@@ -830,10 +874,15 @@ export function createRealCauldronFireConsumerDeps(
       const entryOverride =
         input.lane === 'cursor' || input.lane === 'zero' ? input.lane : undefined;
       const record = await runCascade({
+        // Trust boundary (WO-HARNESS-T3-COMMAND-CONSUMER-01 runbook): the T3
+        // command consumer fires on behalf of an authenticated ACTOR, never the
+        // operator. It must NOT carry the operator token. Pass an explicit empty
+        // token so runCascade does not fall back to process.env.ARCHON_OPERATOR_TOKEN
+        // (`token ?? env` only falls back on null/undefined, so '' short-circuits it).
+        token: '',
         woId: input.woId,
         project: input.project,
         dispatchId: input.dispatchId,
-        token: env.ARCHON_OPERATOR_TOKEN ?? '',
         entryOverride,
       });
       const persisted = await readCascadeRecord(record.cascadeId);
