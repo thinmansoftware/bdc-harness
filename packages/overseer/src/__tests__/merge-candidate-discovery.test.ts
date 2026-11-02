@@ -1358,6 +1358,35 @@ describe('merge candidate discovery -- unavailable is never silent', () => {
     expect(set.logged.some(entry => entry.level === 'warn')).toBe(false);
   });
 
+  test('startup logs the per-repo bases the sweep actually watches', () => {
+    // WO-HARNESS-MERGE-MANAGER-POST-REBUILD-STALL-01: the legacy global
+    // `watchedBases` ["dev","staging"] suggested bdc-xo `main` was unwatched.
+    const set = captureLogger();
+    const report = logDiscoveryConfigurationAtStartup(set.logger, {
+      OVERSEER_MERGE_DISCOVERY_REPOS: 'thinmansoftware/bdc-xo,thinmansoftware/bdc-harness',
+      MERGE_MANAGER_REPO_POLICY: JSON.stringify({
+        'thinmansoftware/bdc-xo': { main: { unattended: true, docs_only: 'merge' } },
+        'thinmansoftware/bdc-harness': { dev: { unattended: true, docs_only: 'skip' } },
+      }),
+    } as NodeJS.ProcessEnv);
+    expect(report.perRepoBases['thinmansoftware/bdc-xo']).toEqual(['main']);
+    expect(report.perRepoBases['thinmansoftware/bdc-harness']).toEqual(['dev']);
+    const info = set.logged.find(entry => entry.msg === 'merge-coordinator.discovery_configured');
+    expect(info?.obj.perRepoBases).toEqual({
+      'thinmansoftware/bdc-xo': ['main'],
+      'thinmansoftware/bdc-harness': ['dev'],
+    });
+  });
+
+  test('a malformed repo policy reports no watched bases (fail closed), never throws', () => {
+    const report = describeDiscoveryConfiguration({
+      OVERSEER_MERGE_DISCOVERY_REPOS: 'thinmansoftware/bdc-xo',
+      MERGE_MANAGER_REPO_POLICY: '{not json',
+    } as NodeJS.ProcessEnv);
+    expect(report.configured).toBe(true);
+    expect(report.perRepoBases).toEqual({ 'thinmansoftware/bdc-xo': [] });
+  });
+
   test('a missing list dep reports no_list_dep at warn', async () => {
     const { logged, logger } = captureLogger();
     const result = await discoverMergeCandidates(

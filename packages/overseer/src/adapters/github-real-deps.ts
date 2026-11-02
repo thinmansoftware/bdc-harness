@@ -19,6 +19,7 @@ import type {
   PullRequestRef,
 } from '../types.ts';
 import { listMessages as listDispatchMessages } from '@archon/core/db/dispatch';
+import { PR_REVIEW_LOG_RECIPIENT } from '@archon/core/db/dispatch-routing';
 import {
   REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
   UNPROTECTED_BASE_NO_CHECKS_REASON,
@@ -2051,11 +2052,24 @@ export function createRealGitHubClientDeps(
   const commentAuthorLogin = resolveReviewGateLogin();
   return {
     hasQualifiedReview: async (input): Promise<boolean> => {
-      const receipts = await listDispatchMessages({
-        recipient: 'operator',
-        subject_key: `gh:${input.owner}/${input.repo}#${input.number}`,
-        limit: 500,
-      });
+      // Receipts go to PR_REVIEW_LOG_RECIPIENT since #1390 (dispatch routing
+      // cut-off); pre-cut-off receipts stay at `operator`. Read both, log first,
+      // like every other receipt reader. Reading only `operator` made every PR
+      // review_execution_unqualified, so the merge manager merged nothing
+      // (WO-HARNESS-MERGE-MANAGER-POST-REBUILD-STALL-01).
+      const subjectKey = `gh:${input.owner}/${input.repo}#${input.number}`;
+      const receipts = [
+        ...(await listDispatchMessages({
+          recipient: PR_REVIEW_LOG_RECIPIENT,
+          subject_key: subjectKey,
+          limit: 500,
+        })),
+        ...(await listDispatchMessages({
+          recipient: 'operator',
+          subject_key: subjectKey,
+          limit: 500,
+        })),
+      ];
       return receipts.some(receipt => {
         try {
           const body = JSON.parse(receipt.body) as {
