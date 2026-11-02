@@ -7,6 +7,8 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   bootstrapProjectConfig,
+  buildDocsConfigBlock,
+  buildTerminalLaunchPlan,
   checkExistingConfig,
   generateEnvContent,
   generateWebhookSecret,
@@ -317,6 +319,90 @@ CODEX_ACCOUNT_ID=account1
     it('should export spawnTerminalWithSetup function', () => {
       // Just verify the function is exported and callable
       expect(typeof spawnTerminalWithSetup).toBe('function');
+    });
+  });
+
+  describe('buildDocsConfigBlock', () => {
+    const inputs = ['C:\\docs\\"x', 'docs/', 'a\\', '"q"'];
+
+    for (const input of inputs) {
+      it(`round-trips ${JSON.stringify(input)} through YAML`, () => {
+        const block = buildDocsConfigBlock(input);
+        const parsed = Bun.YAML.parse(block) as { docs: { path: string } };
+        expect(parsed.docs.path).toBe(input.trim());
+      });
+    }
+  });
+
+  describe('buildTerminalLaunchPlan', () => {
+    const repoPath = '/tmp/a"b&c$(touch x)\'d';
+
+    function shellSourceArgs(args: string[]): string[] {
+      const sources: string[] = [];
+      for (let i = 0; i < args.length; i++) {
+        const arg = args[i] ?? '';
+        if (arg === '-e' || arg === '-c') {
+          const next = args[i + 1];
+          if (next !== undefined) sources.push(next);
+        }
+        if (arg.includes('bash -c') || arg.startsWith('bash ')) {
+          sources.push(arg);
+        }
+      }
+      return sources;
+    }
+
+    it('keeps repoPath out of strings a shell, cmd.exe, or AppleScript parses', () => {
+      const win = buildTerminalLaunchPlan('win32', repoPath);
+      const mac = buildTerminalLaunchPlan('darwin', repoPath);
+      const linux = buildTerminalLaunchPlan('linux', repoPath);
+
+      expect(win.map(c => c.command)).toEqual(['wt.exe', 'cmd.exe']);
+      expect(mac.map(c => c.command)).toEqual(['osascript']);
+      expect(linux.map(c => c.command)).toEqual([
+        'x-terminal-emulator',
+        'gnome-terminal',
+        'konsole',
+        'xterm',
+      ]);
+
+      for (const candidate of [...win, ...mac, ...linux]) {
+        expect(candidate.cwd).toBe(repoPath);
+      }
+
+      const cmd = win.find(c => c.command === 'cmd.exe');
+      expect(cmd?.args.some(arg => arg.includes(repoPath))).toBe(false);
+
+      const xterm = linux.find(c => c.command === 'xterm');
+      expect(xterm?.args).toEqual(['-e', 'archon', 'setup']);
+      expect(xterm?.args.some(arg => arg.includes(repoPath))).toBe(false);
+
+      for (const candidate of linux) {
+        if (candidate.args.includes('-c') || candidate.args.some(arg => arg.includes('bash -c'))) {
+          for (const source of shellSourceArgs(candidate.args)) {
+            expect(source.includes(repoPath)).toBe(false);
+          }
+        }
+      }
+
+      const osa = mac[0];
+      expect(osa).toBeDefined();
+      const eStrings = (osa?.args ?? []).filter((_arg, i, arr) => arr[i - 1] === '-e');
+      for (const source of eStrings) {
+        expect(source.includes(repoPath)).toBe(false);
+      }
+      expect(osa?.args[osa.args.length - 1]).toBe(repoPath);
+
+      const wt = win.find(c => c.command === 'wt.exe');
+      const dIndex = wt?.args.indexOf('-d') ?? -1;
+      expect(wt?.args[dIndex + 1]).toBe(repoPath);
+
+      const gnome = linux.find(c => c.command === 'gnome-terminal');
+      expect(gnome?.args).toContain('--working-directory=' + repoPath);
+
+      const konsole = linux.find(c => c.command === 'konsole');
+      const workdir = konsole?.args.indexOf('--workdir') ?? -1;
+      expect(konsole?.args[workdir + 1]).toBe(repoPath);
     });
   });
 
