@@ -56,6 +56,7 @@ export interface HandleMessageContext {
 }
 
 export interface Codebase {
+  project_record?: string | null;
   id: string;
   name: string;
   repository_url: string | null;

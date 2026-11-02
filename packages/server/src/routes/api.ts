@@ -2,6 +2,7 @@
  * REST API routes for the Archon Web UI.
  * Provides conversation, codebase, and SSE streaming endpoints.
  */
+import { parseProjectRecord, type ProjectRecord } from '@archon/core/grimoire/project-record';
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
 import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
@@ -6249,7 +6250,7 @@ export function registerApiRoutes(
               commands = {};
             }
           }
-          return { ...cb, commands };
+          return { ...cb, commands, project_record: readProjectRecord(cb) };
         })
       );
     } catch (error) {
@@ -6274,7 +6275,7 @@ export function registerApiRoutes(
           commands = {};
         }
       }
-      return c.json({ ...codebase, commands });
+      return c.json({ ...codebase, commands, project_record: readProjectRecord(codebase) });
     } catch (error) {
       getLog().error({ err: error }, 'get_codebase_failed');
       return apiError(c, 500, 'Failed to get codebase');
@@ -6297,7 +6298,10 @@ export function registerApiRoutes(
         return apiError(c, 500, 'Codebase created but not found');
       }
 
-      return c.json(codebase, result.alreadyExisted ? 200 : 201);
+      return c.json(
+        { ...codebase, project_record: readProjectRecord(codebase) },
+        result.alreadyExisted ? 200 : 201
+      );
     } catch (error) {
       getLog().error({ err: error }, 'add_codebase_failed');
       return apiError(
@@ -6365,7 +6369,15 @@ export function registerApiRoutes(
         }
       }
 
-      await codebaseDb.updateCodebase(id, body);
+      await codebaseDb.updateCodebase(id, {
+        ...body,
+        project_record:
+          body.project_record === undefined
+            ? undefined
+            : body.project_record === null
+              ? null
+              : JSON.stringify(body.project_record),
+      });
       const updated = await codebaseDb.getCodebase(id);
       if (!updated) {
         return apiError(c, 500, 'Codebase updated but not found');
@@ -6396,7 +6408,7 @@ export function registerApiRoutes(
       }
       getLog().info({ codebaseId: id, changes }, 'codebase_updated');
 
-      return c.json({ ...updated, commands });
+      return c.json({ ...updated, commands, project_record: readProjectRecord(updated) });
     } catch (error) {
       getLog().error({ err: error, codebaseId: id }, 'update_codebase_failed');
       return apiError(c, 500, 'Failed to update codebase');
@@ -8462,4 +8474,15 @@ export function registerApiRoutes(
     const result = await checkForUpdate(appVersion);
     return c.json(result ?? noUpdate);
   });
+}
+
+function readProjectRecord(codebase: {
+  id: string;
+  project_record?: unknown;
+}): ProjectRecord | null {
+  const parsed = parseProjectRecord(codebase.project_record);
+  if (parsed.status === 'invalid') {
+    getLog().warn({ codebaseId: codebase.id }, 'project_record_unparseable');
+  }
+  return parsed.record;
 }

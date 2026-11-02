@@ -1,0 +1,2 @@
+-- WO-GRIMOIRE-PROJECT-RECORD-01
+ALTER TABLE remote_agent_codebases ADD COLUMN IF NOT EXISTS project_record TEXT;

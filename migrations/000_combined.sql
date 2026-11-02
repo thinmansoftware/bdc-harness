@@ -883,3 +883,6 @@ CREATE INDEX IF NOT EXISTS idx_overseer_reconcile_actions_pr_ref
   ON overseer_reconcile_actions(pr_ref);
 CREATE INDEX IF NOT EXISTS idx_overseer_reconcile_actions_action
   ON overseer_reconcile_actions(action);
+
+-- WO-GRIMOIRE-PROJECT-RECORD-01 (migration 066)
+ALTER TABLE remote_agent_codebases ADD COLUMN IF NOT EXISTS project_record TEXT;
