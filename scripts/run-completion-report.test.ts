@@ -558,3 +558,102 @@ describe('run-completion-report outcomes (last 24h)', () => {
     expect(t).toContain('  mailbox t3-desktop: depth 0, live 0, oldest_live none, age_h none');
   });
 });
+
+// --- Zero-tier first-10 measurement, WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01 ---
+const ZERO_LANE = 'bdc-feature-development-zero-open';
+const ZERO_SINCE = '2026-11-02 12:00:00';
+
+describe('run-completion-report zero-tier first-10', () => {
+  test('Test 7: counts, REVERT verdict, cancelled excluded, pre-cutoff excluded', () => {
+    const { path, db } = newDb();
+    // Two runs BEFORE the cutoff -- must be excluded from the 10.
+    run(db, ZERO_LANE, 'completed', '2026-11-02 11:00:00');
+    run(db, ZERO_LANE, 'failed', '2026-11-02 11:30:00');
+    // Three failed at or after the cutoff (earliest, so they land in the first 10).
+    const f1 = run(db, ZERO_LANE, 'failed', '2026-11-02 12:01:00');
+    run(db, ZERO_LANE, 'escalated', '2026-11-02 12:02:00');
+    run(db, ZERO_LANE, 'failed', '2026-11-02 12:03:00');
+    // Seven completed after the cutoff -> first 10 = 3 failed + 7 completed.
+    for (let i = 4; i <= 10; i++) {
+      const mm = i < 10 ? `0${i}` : `${i}`;
+      run(db, ZERO_LANE, 'completed', `2026-11-02 12:${mm}:00`);
+    }
+    // An 11th non-cancelled terminal run -- excluded from the first 10.
+    run(db, ZERO_LANE, 'completed', '2026-11-02 12:30:00');
+    // One cancelled after the cutoff -- excluded from the 10, counted separately.
+    run(db, ZERO_LANE, 'cancelled', '2026-11-02 12:40:00');
+    // A node_failed event on the first failed run.
+    nodeFailed(db, f1, 'repair-gate-fail');
+    nodeFailed(db, f1, 'manifest-evidence-check');
+    db.close();
+
+    const r = exec(base(path, ['--zero-since', ZERO_SINCE, '--json']));
+    expect(r.code).toBe(0);
+    const z = JSON.parse(r.out).zero_tier;
+    expect(z.since).toBe(ZERO_SINCE);
+    expect(z.runs).toHaveLength(10);
+    expect(z.total).toBe(10);
+    expect(z.failed).toBe(3);
+    expect(z.verdict).toBe('REVERT');
+    expect(z.cancelled).toBe(1);
+    // Pre-cutoff runs excluded: no run started before the cutoff appears.
+    expect(z.runs.every((x: any) => ['completed', 'failed', 'escalated'].includes(x.status))).toBe(
+      true
+    );
+    // The first failed run carries its node_failed step names.
+    const firstFailed = z.runs.find((x: any) => x.run === f1.slice(0, 8));
+    expect(firstFailed.status).toBe('failed');
+    expect([...firstFailed.failed_steps].sort()).toEqual([
+      'manifest-evidence-check',
+      'repair-gate-fail',
+    ]);
+
+    // Text output carries the same verdict and counts.
+    const t = exec(base(path, ['--zero-since', ZERO_SINCE])).out;
+    expect(t).toContain('zero_tier_failed: 3/10');
+    expect(t).toContain('zero_tier_verdict: REVERT');
+    expect(t).toContain('zero_tier_cancelled: 1');
+    expect(t).toContain('zero_tier_first10:');
+  });
+
+  test('Test 8: PENDING under 10, KEEP at 10 with fewer than 3 failed', () => {
+    // Fixture A: 4 runs after the cutoff, 1 failed -> PENDING 4/10.
+    const a = newDb();
+    run(a.db, ZERO_LANE, 'failed', '2026-11-02 12:01:00');
+    run(a.db, ZERO_LANE, 'completed', '2026-11-02 12:02:00');
+    run(a.db, ZERO_LANE, 'completed', '2026-11-02 12:03:00');
+    run(a.db, ZERO_LANE, 'completed', '2026-11-02 12:04:00');
+    a.db.close();
+    const ja = JSON.parse(exec(base(a.path, ['--zero-since', ZERO_SINCE, '--json'])).out).zero_tier;
+    expect(ja.total).toBe(4);
+    expect(ja.failed).toBe(1);
+    expect(ja.verdict).toBe('PENDING');
+    const ta = exec(base(a.path, ['--zero-since', ZERO_SINCE])).out;
+    expect(ta).toContain('zero_tier_verdict: PENDING 4/10');
+
+    // Fixture B: 10 runs after the cutoff, 2 failed -> KEEP.
+    const b = newDb();
+    run(b.db, ZERO_LANE, 'failed', '2026-11-02 12:01:00');
+    run(b.db, ZERO_LANE, 'failed', '2026-11-02 12:02:00');
+    for (let i = 3; i <= 10; i++) {
+      run(b.db, ZERO_LANE, 'completed', `2026-11-02 12:${i < 10 ? '0' + i : i}:00`);
+    }
+    b.db.close();
+    const jb = JSON.parse(exec(base(b.path, ['--zero-since', ZERO_SINCE, '--json'])).out).zero_tier;
+    expect(jb.total).toBe(10);
+    expect(jb.failed).toBe(2);
+    expect(jb.verdict).toBe('KEEP');
+    const tb = exec(base(b.path, ['--zero-since', ZERO_SINCE])).out;
+    expect(tb).toContain('zero_tier_verdict: KEEP');
+  });
+
+  test('Test 8b: --zero-since absent -> no zero_tier section', () => {
+    const { path, db } = newDb();
+    run(db, ZERO_LANE, 'completed', '2026-11-02 12:01:00');
+    db.close();
+    const j = JSON.parse(exec(base(path, ['--json'])).out);
+    expect(j.zero_tier).toBeUndefined();
+    const t = exec(base(path)).out;
+    expect(t).not.toContain('zero_tier_verdict');
+  });
+});

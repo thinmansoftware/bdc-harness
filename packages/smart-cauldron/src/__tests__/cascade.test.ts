@@ -30,7 +30,17 @@ function loadLiveTiers() {
   return loadLadder().filter(t => !refused.includes(t.name));
 }
 import { loadRuleset } from '../conductor.js';
+import { loadMaxClimbsByEntry } from '../ladder.js';
+import type { SeatUsageSnapshot } from '../headroom.js';
 import { TimeoutError } from '../poll.js';
+
+/** All subscription seats measured well under the headroom threshold, so no
+ *  rung is skipped on seat grounds and the Claude tier is admitted during a
+ *  climb (used by the zero-tier fence-3 "limit only applies to zero" test). */
+function lowSeatUsage(): SeatUsageSnapshot {
+  const reading = { limit_source: 'measured' as const, windows: [{ name: '5h', used_percent: 5 }] };
+  return { claude: reading, codex: reading, cursor: reading };
+}
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -1825,5 +1835,148 @@ describe('repair holder teardown (conductor)', () => {
     );
     expect(fires).toBe(1);
     expect(record.blockedReason).toBe('teardown_unconfirmed');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01 fence 3 + fence 4
+// ---------------------------------------------------------------------------
+
+describe('Zero-tier fence 3: one climb then stop', () => {
+  test('config carries the zero=1 climb limit (SOR)', () => {
+    expect(loadMaxClimbsByEntry().zero).toBe(1);
+  });
+
+  test('Test 3: zero entry, zero gate-fails, cursor gate-fails -> exactly two fires, BLOCKED climb_limit_reached, escalate once, no further rung', async () => {
+    const fireCalls: string[] = [];
+    let escalateCalls = 0;
+
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      poll: async _opts => makePollResult(),
+      judge: _poll => makeFailVerdict('validator verdict: needs_revision'),
+      escalate: async _ctx => {
+        escalateCalls++;
+      },
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'zero' }));
+
+    const tiers = loadLiveTiers();
+    const zeroWf = tiers.find(t => t.name === 'zero')?.workflowName;
+    const cursorWf = tiers.find(t => t.name === 'cursor')?.workflowName;
+    const codexWf = tiers.find(t => t.name === 'codex')?.workflowName;
+    const claudeWf = tiers.find(t => t.name === 'claude')?.workflowName;
+    const frontierWf = tiers.find(t => t.isFrontier)?.workflowName;
+
+    expect(fireCalls.length).toBe(2);
+    expect(fireCalls[0]).toBe(zeroWf);
+    expect(fireCalls[1]).toBe(cursorWf);
+    expect(fireCalls).not.toContain(codexWf);
+    expect(fireCalls).not.toContain(claudeWf);
+    expect(fireCalls).not.toContain(frontierWf);
+
+    expect(record.status).toBe('blocked');
+    expect(record.blockedReason).toBe('climb_limit_reached');
+    expect(record.telemetry.climbCount).toBe(1);
+    expect(record.attempts.length).toBe(2);
+    expect(escalateCalls).toBe(1);
+  });
+
+  test('Test 4: cursor entry with the same failures climbs normally -- the zero limit does not apply', async () => {
+    const fireCalls: string[] = [];
+    let escalateCalls = 0;
+
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      // cursor fails, codex fails, claude passes -- reaches the SECOND climb
+      // decision, where a limit wrongly keyed to any entry would have stopped.
+      poll: async _opts => makePollResult(),
+      judge: _poll =>
+        fireCalls.length < 3 ? makeFailVerdict('needs_revision') : makePassVerdict(),
+      escalate: async _ctx => {
+        escalateCalls++;
+      },
+      seatUsage: async () => lowSeatUsage(),
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'cursor' }));
+
+    const tiers = loadLiveTiers();
+    expect(fireCalls[0]).toBe(tiers.find(t => t.name === 'cursor')?.workflowName);
+    expect(fireCalls[1]).toBe(tiers.find(t => t.name === 'codex')?.workflowName);
+    expect(fireCalls[2]).toBe(tiers.find(t => t.name === 'claude')?.workflowName);
+    expect(record.status).toBe('won');
+    expect(record.winningTier).toBe('claude');
+    expect(record.blockedReason).toBeUndefined();
+    expect(record.telemetry.climbCount).toBe(2);
+    expect(escalateCalls).toBe(0);
+  });
+});
+
+describe('Zero-tier fence 4: one run row per rung (fire only after terminal)', () => {
+  test('Test 5: the cursor fire happens only after the zero run polled terminal; one attempt per rung', async () => {
+    const events: string[] = [];
+    const fireCalls: string[] = [];
+
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        events.push(`fire:${opts.workflowName}`);
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      poll: async _opts => {
+        if (fireCalls.length === 1) {
+          // Zero run: running, running, then failed (terminal reached here).
+          events.push('poll:running');
+          await Promise.resolve();
+          events.push('poll:running');
+          await Promise.resolve();
+          events.push('poll:failed');
+          return makePollResult({
+            terminalStatus: 'failed',
+            prUrl: null,
+            prMergeable: null,
+            validatorVerdict: 'needs_revision',
+          });
+        }
+        // Cursor run: passes, so the cascade stops after one climb.
+        return makePollResult();
+      },
+      judge: poll =>
+        poll.terminalStatus === 'failed' ? makeFailVerdict('zero failed') : makePassVerdict(),
+      escalate: async _ctx => undefined,
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+
+    const record = await runCascade(baseOpts({ deps, entryOverride: 'zero' }));
+
+    const tiers = loadLiveTiers();
+    const zeroWf = tiers.find(t => t.name === 'zero')?.workflowName;
+    const cursorWf = tiers.find(t => t.name === 'cursor')?.workflowName;
+
+    // Exactly one attempt (run row) per rung, in order.
+    expect(record.attempts.length).toBe(2);
+    expect(record.attempts[0]?.tier).toBe('zero');
+    expect(record.attempts[1]?.tier).toBe('cursor');
+    expect(record.status).toBe('won');
+
+    // The cursor fire must come AFTER the zero run reached terminal (failed).
+    const cursorFireIdx = events.indexOf(`fire:${cursorWf}`);
+    const zeroTerminalIdx = events.indexOf('poll:failed');
+    expect(events[0]).toBe(`fire:${zeroWf}`);
+    expect(zeroTerminalIdx).toBeGreaterThan(0);
+    expect(cursorFireIdx).toBeGreaterThan(zeroTerminalIdx);
+    // No second fire on either rung.
+    expect(fireCalls.filter(w => w === zeroWf).length).toBe(1);
+    expect(fireCalls.filter(w => w === cursorWf).length).toBe(1);
   });
 });
