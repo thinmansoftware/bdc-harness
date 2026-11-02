@@ -124,8 +124,8 @@ CAND_JSON_SAME_HEAD='[
   {"number": 11, "headRefName": "feat/wo-one-pr-thread-abc", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/11", "user": {"login": "fixture-builder[bot]"}}
 ]'
 
-# REST pull shape (gh api /pulls). Same head+base, other author must stay open.
-# app/Fixture-Builder is the same builder App as fixture-builder[bot].
+# REST pull shape (gh api /pulls). Same head+base is closed for every author.
+# The approved plan filters headRefName and baseRefName only.
 CAND_JSON_OTHER_AUTHOR='[
   {"number": 10, "html_url": "https://github.com/thinmansoftware/bdc-harness/pull/10", "head": {"ref": "archon/task-web-worker-x"}, "base": {"ref": "dev"}, "user": {"login": "fixture-builder[bot]"}},
   {"number": 14, "html_url": "https://github.com/thinmansoftware/bdc-harness/pull/14", "head": {"ref": "archon/task-web-worker-x"}, "base": {"ref": "dev"}, "user": {"login": "other-human"}},
@@ -133,8 +133,9 @@ CAND_JSON_OTHER_AUTHOR='[
   {"number": 16, "html_url": "https://github.com/thinmansoftware/bdc-harness/pull/16", "head": {"ref": "archon/task-web-worker-x"}, "base": {"ref": "dev"}, "user": null}
 ]'
 
-# --paginate --slurp returns one JSON array per page, wrapped. Page 2 holds the
-# only builder PR; a same-branch PR by someone else is on both pages.
+# --paginate --slurp returns one JSON array per page, wrapped. Every same
+# head+base PR is closed, including a match that appears only on a later page.
+# An unrelated head on page 1 stays open.
 CAND_JSON_PAGES='[
   [
     {"number": 14, "html_url": "https://github.com/thinmansoftware/bdc-harness/pull/14", "head": {"ref": "archon/task-web-worker-x"}, "base": {"ref": "dev"}, "user": {"login": "other-human"}},
@@ -323,7 +324,9 @@ assert_not_contains "no checkout of UNIQUE_BRANCH" 'git checkout' "$BLOCK"
 assert_not_contains "close does not delete the branch" '--delete-branch' "$BLOCK"
 assert_contains "candidates are paginated" 'gh api --paginate --slurp --method GET' "$BLOCK"
 assert_contains "candidates are filtered by head server-side" 'head=${REPO_OWNER}:${WORKING_BRANCH}' "$BLOCK"
-assert_contains "builder author is compared" 'norm_login' "$BLOCK"
+assert_contains "no author filter is stated" 'No author filter' "$BLOCK"
+assert_not_contains "close block does not read ACTING_LOGIN" 'ACTING_LOGIN' "$BLOCK"
+assert_not_contains "close block does not compare logins" 'norm_login' "$BLOCK"
 assert_not_contains "no capped global open list" 'gh pr list --repo "$REPO" --state open --limit 200 --json number,headRefName,baseRefName,url' "$BLOCK"
 
 echo "--- Test 1: builder PR on the working branch is closed as superseded ---"
@@ -469,45 +472,39 @@ assert_contains "test13 comment warn" "comment failed for #10" "$LAST_ERR"
 assert_not_contains "test13 no comment-failure stdout token" "comment_failed" "$LAST_OUT"
 assert_eq "test13 close targets" "10" "$(close_numbers)"
 
-echo "--- Test 14: same branch and base from another author is untouched ---"
+echo "--- Test 14: same branch and base is closed for every author ---"
 reset_case
 CAND_JSON="$CAND_JSON_OTHER_AUTHOR"
 run_block
 assert_eq "test14 exit" "0" "$LAST_RC"
-assert_eq "test14 stdout" "$(printf '%s\n' "superseded_pr_closed:10" "superseded_pr_closed:15")" "$LAST_OUT"
-assert_eq "test14 close targets" "$(printf '%s\n' "10" "15")" "$(close_numbers)"
-assert_eq "test14 comment targets" "$(printf '%s\n' "10" "15")" "$(comment_numbers)"
-assert_not_contains "test14 no close 14" $'\tclose\t14\t' "$LAST_LOG"
-assert_not_contains "test14 no comment 14" $'\tcomment\t14\t' "$LAST_LOG"
-assert_not_contains "test14 no close 16" $'\tclose\t16\t' "$LAST_LOG"
-assert_not_contains "test14 no comment 16" $'\tcomment\t16\t' "$LAST_LOG"
+assert_eq "test14 stdout" "$(printf '%s\n' "superseded_pr_closed:10" "superseded_pr_closed:14" "superseded_pr_closed:15" "superseded_pr_closed:16")" "$LAST_OUT"
+assert_eq "test14 close targets" "$(printf '%s\n' "10" "14" "15" "16")" "$(close_numbers)"
+assert_eq "test14 comment targets" "$(printf '%s\n' "10" "14" "15" "16")" "$(comment_numbers)"
 assert_contains "test14 still queries the working branch" "head=thinmansoftware:archon/task-web-worker-x" "$(api_call)"
 
-echo "--- Test 15: a later page is closed and other authors on every page stay open ---"
+echo "--- Test 15: a later page is closed and another branch stays open ---"
 reset_case
 CAND_JSON="$CAND_JSON_PAGES"
 run_block
 assert_eq "test15 exit" "0" "$LAST_RC"
-assert_eq "test15 stdout" "superseded_pr_closed:21" "$LAST_OUT"
-assert_eq "test15 close targets" "21" "$(close_numbers)"
-assert_eq "test15 comment targets" "21" "$(comment_numbers)"
-assert_not_contains "test15 no close 14" $'\tclose\t14\t' "$LAST_LOG"
-assert_not_contains "test15 no close 22" $'\tclose\t22\t' "$LAST_LOG"
+assert_eq "test15 stdout" "$(printf '%s\n' "superseded_pr_closed:14" "superseded_pr_closed:21" "superseded_pr_closed:22")" "$LAST_OUT"
+assert_eq "test15 close targets" "$(printf '%s\n' "14" "21" "22")" "$(close_numbers)"
+assert_eq "test15 comment targets" "$(printf '%s\n' "14" "21" "22")" "$(comment_numbers)"
 assert_not_contains "test15 no close 30" $'\tclose\t30\t' "$LAST_LOG"
 assert_contains "test15 paginates" "--paginate" "$(api_call)"
 assert_not_contains "test15 no limit cap" "--limit" "$(api_call)"
 
-echo "--- Test 16: unresolved builder author closes nothing ---"
+echo "--- Test 16: close does not depend on ACTING_LOGIN ---"
 reset_case
 ACTING=""
-CAND_JSON="$CAND_JSON_OTHER_AUTHOR"
+CAND_JSON="$CAND_JSON_DEFAULT"
 run_block
 assert_eq "test16 exit" "0" "$LAST_RC"
-assert_eq "test16 stdout" "superseded_pr_none" "$LAST_OUT"
-assert_eq "test16 close targets" "" "$(close_numbers)"
-assert_eq "test16 comment targets" "" "$(comment_numbers)"
-assert_eq "test16 no candidate query" "0" "$(api_count)"
-assert_contains "test16 warns" "builder author unresolved" "$LAST_ERR"
+assert_eq "test16 stdout" "superseded_pr_closed:10" "$LAST_OUT"
+assert_eq "test16 close targets" "10" "$(close_numbers)"
+assert_eq "test16 comment targets" "10" "$(comment_numbers)"
+assert_eq "test16 candidate query count" "1" "$(api_count)"
+assert_not_contains "test16 no author skip" "builder author unresolved" "$LAST_ERR"
 
 echo ""
 echo "RESULTS: ${PASS} passed, ${FAIL} failed"

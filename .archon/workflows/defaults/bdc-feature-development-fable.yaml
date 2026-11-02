@@ -5000,9 +5000,9 @@ nodes:
       # existing-pr-base-guard: end
       # superseded-pr-close: begin
       # Close open PRs on this run's working branch once the run PR URL is known.
-      # Never close the run PR, never close a PR on any other branch, and never
-      # close a PR whose author is not this run's builder App. ACTING_LOGIN is
-      # matched after normalizing app/<slug> and <slug>[bot] to the same slug.
+      # Never close the run PR, and never close a PR on any other branch.
+      # No author filter: head and base only. A reused working branch whose
+      # open PR has the same base is closed even if an older run opened it.
       # Candidates are queried server-side by head+base and paginated to the
       # last page. A global open-PR list with --limit is not used: it silently
       # drops matches past the cap.
@@ -5053,10 +5053,6 @@ nodes:
           if [ -z "$RUN_PR_NUM" ]; then
             echo "WARN: superseded-pr-close: could not parse run PR number from URL; skipping close" >&2
           else
-            if [ -z "${ACTING_LOGIN:-}" ]; then
-              echo "WARN: superseded-pr-close: builder author unresolved; skipping close" >&2
-              echo "superseded_pr_none"
-            else
               REPO_OWNER="${REPO%%/*}"
               cand_raw=$(gh api --paginate --slurp --method GET "repos/${REPO}/pulls" \
                 -f state=open \
@@ -5064,7 +5060,7 @@ nodes:
                 -f "base=${BASE_BRANCH}" \
                 -F per_page=100 \
                 2>/dev/null || true)
-              CANDIDATES=$(CAND_RAW="$cand_raw" WORKING_BRANCH="$WORKING_BRANCH" BASE_BRANCH="$BASE_BRANCH" UNIQUE_BRANCH="$UNIQUE_BRANCH" RUN_PR_NUM="$RUN_PR_NUM" ACTING_LOGIN="$ACTING_LOGIN" python3 -c "$(cat <<'PY'
+              CANDIDATES=$(CAND_RAW="$cand_raw" WORKING_BRANCH="$WORKING_BRANCH" BASE_BRANCH="$BASE_BRANCH" UNIQUE_BRANCH="$UNIQUE_BRANCH" RUN_PR_NUM="$RUN_PR_NUM" python3 -c "$(cat <<'PY'
       import json, os, sys
       raw = os.environ.get("CAND_RAW", "").strip()
       if not raw:
@@ -5099,19 +5095,6 @@ nodes:
               return ""
           return value
 
-      def norm_login(value):
-          if not isinstance(value, str):
-              return ""
-          text = value.strip().lower()
-          if text.startswith("app/"):
-              text = text[4:]
-          if text.endswith("[bot]"):
-              text = text[:-5]
-          return text
-
-      want_author = norm_login(os.environ.get("ACTING_LOGIN", ""))
-      if not want_author:
-          raise SystemExit(0)
       want_head = os.environ.get("WORKING_BRANCH", "")
       want_base = os.environ.get("BASE_BRANCH", "")
       unique = os.environ.get("UNIQUE_BRANCH", "")
@@ -5132,9 +5115,6 @@ nodes:
           if isinstance(number, bool) or not isinstance(number, int):
               continue
           if str(number) == run_num:
-              continue
-          author = nested_text(item, "user", "login") or nested_text(item, "author", "login")
-          if norm_login(author) != want_author:
               continue
           nums.append(str(number))
       sys.stdout.write("\n".join(nums))
@@ -5160,7 +5140,6 @@ nodes:
               done <<EOF
       $CANDIDATES
       EOF
-            fi
             fi
           fi
         fi
