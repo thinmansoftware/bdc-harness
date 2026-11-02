@@ -162,6 +162,12 @@ const CURL_STUB = [
   '      code="400"',
   '    fi',
   '  else',
+  '    if [ "${STOP_ON_DRAIN_GET:-}" = "1" ] && [ -n "${ARCHON_REBUILD_STOP_FILE:-}" ]; then',
+  '      printf \'stopped during drain\\n\' > "$ARCHON_REBUILD_STOP_FILE"',
+  '    fi',
+  '    if [ "${HOLD_ON_DRAIN_GET:-}" = "1" ] && [ -n "${ARCHON_REBUILD_HOLD_FILE:-}" ]; then',
+  '      printf \'held during drain\\n\' > "$ARCHON_REBUILD_HOLD_FILE"',
+  '    fi',
   '    code="${CURL_DRAIN_GET_CODE:-200}"',
   '    body="$(printf \'{"activeRunCount":%s,"activeLeaseCount":%s}\' "${CURL_ACTIVE_RUNS:-0}" "${CURL_ACTIVE_LEASES:-0}")"',
   '  fi',
@@ -181,6 +187,8 @@ interface RebuildControls {
   holdContents?: string;
   withComposeFiles?: boolean;
   stopOnBuild?: boolean;
+  stopOnDrainGet?: boolean;
+  holdOnDrainGet?: boolean;
   sqliteRuns?: string;
   head?: string;
   dockerBuildStatus?: string;
@@ -237,6 +245,8 @@ function rebuildEnv(
     SQLITE_CHECK: 'ok',
     SQLITE_CLAIMS: '0',
     STOP_ON_BUILD: controls.stopOnBuild ? '1' : '0',
+    STOP_ON_DRAIN_GET: controls.stopOnDrainGet ? '1' : '0',
+    HOLD_ON_DRAIN_GET: controls.holdOnDrainGet ? '1' : '0',
     ARCHON_REBUILD_HOLD_FILE: paths.hold,
     ARCHON_REBUILD_STOP_FILE: paths.stop,
     TARGET: controls.target ?? GOOD_SHA,
@@ -554,6 +564,41 @@ describe('rebuild-archon-app', () => {
     expect(result.dockerLog).toBe('');
     expect(result.curlLog).toBe('');
   });
+
+  it.skipIf(SKIP_ON_WINDOWS)(
+    'drainGateRechecksHold: a stop or hold file created during the drain GET refuses compose up',
+    async () => {
+      const stopped = await runRebuild({
+        target: GOOD_SHA,
+        withComposeFiles: true,
+        sqliteRuns: '0',
+        head: GOOD_SHA,
+        stopOnDrainGet: true,
+      });
+
+      expect(stopped.exitCode).toBe(11);
+      expect(stopped.stderr).toContain('hold or stop file present');
+      expect(stopped.stderr).toContain('stopped during drain');
+      expect(stopped.dockerLog).toContain('compose build');
+      expect(stopped.dockerLog).not.toContain('compose up');
+      expect(stopped.curlLog).toContain('/api/admin/drain');
+
+      const held = await runRebuild({
+        target: GOOD_SHA,
+        withComposeFiles: true,
+        sqliteRuns: '0',
+        head: GOOD_SHA,
+        holdOnDrainGet: true,
+      });
+
+      expect(held.exitCode).toBe(11);
+      expect(held.stderr).toContain('hold or stop file present');
+      expect(held.stderr).toContain('held during drain');
+      expect(held.dockerLog).toContain('compose build');
+      expect(held.dockerLog).not.toContain('compose up');
+      expect(held.curlLog).toContain('/api/admin/drain');
+    }
+  );
 
   it.skipIf(SKIP_ON_WINDOWS)(
     'drainBlocksAdmission: active runs at the pre-restart check refuse compose up',

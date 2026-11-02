@@ -168,6 +168,8 @@ if ! [[ "$active_runs" =~ ^[0-9]+$ ]] || ! [[ "$active_leases" =~ ^[0-9]+$ ]] ||
   exit 12
 fi
 
+refuse_hold_or_stop
+
 docker compose up -d app || exit $?
 
 poll=1
