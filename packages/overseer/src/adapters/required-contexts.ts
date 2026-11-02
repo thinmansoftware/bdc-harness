@@ -23,8 +23,8 @@
  *    retries with the PAT client. An explicit env override
  *    (OVERSEER_REQUIRED_CONTEXTS_JSON) short-circuits both when configured.
  *
- * 2. GENUINELY UNPROTECTED BRANCHES. bdc-xo `main` really is unprotected
- *    (branches/main reports protected:false; the rules endpoint returns []; the
+ * 2. GENUINELY UNPROTECTED BRANCHES. On 2026-09-07 bdc-xo `main` was
+ *    unprotected; it now requires `Gitleaks`. For genuinely unprotected branches
  *    protection endpoint answers 404 "Branch not protected"). The old adapter
  *    mapped that 404 to `null`, so a repo with nothing to wait for deferred
  *    forever. A 404 ALONE is still not evidence -- GitHub masks 403 as 404 on
@@ -89,6 +89,13 @@ export const REQUIRED_CONTEXTS_OVERRIDE_ENV = 'OVERSEER_REQUIRED_CONTEXTS_JSON' 
 /** Env var holding the consecutive-UNKNOWN attempt bound before blocking. */
 export const REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV =
   'OVERSEER_REQUIRED_CONTEXTS_MAX_ATTEMPTS' as const;
+export const REQUIRED_CONTEXT_WORKFLOWS_ENV = 'OVERSEER_REQUIRED_CONTEXT_WORKFLOWS_JSON' as const;
+export const REQUIRED_CONTEXT_REARM_ATTEMPT_ENV =
+  'OVERSEER_REQUIRED_CONTEXT_REARM_ATTEMPT' as const;
+export const REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS_ENV =
+  'OVERSEER_REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS' as const;
+export const DEFAULT_REQUIRED_CONTEXT_REARM_ATTEMPT = 3;
+export const DEFAULT_REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS = 10;
 
 /** Default bound when the env var is unset or unparseable. */
 export const DEFAULT_MAX_ATTEMPTS = 5;
@@ -98,6 +105,7 @@ export const REQUIRED_CONTEXTS_BLOCKED_REASON = 'required_contexts_unavailable_b
 
 /** Stable reason for an unprotected base whose head never reports CI. */
 export const UNPROTECTED_BASE_NO_CHECKS_REASON = 'unprotected_base_no_checks' as const;
+export const REQUIRED_CONTEXT_NEVER_REPORTED_REASON = 'required_context_never_reported' as const;
 
 /**
  * Stands in for the base branch when the PR's base ref could not be read. A
@@ -774,6 +782,75 @@ export function resolveMaxAttempts(raw: string | undefined): number {
     return DEFAULT_MAX_ATTEMPTS;
   }
   return parsed;
+}
+
+export type RequiredContextWorkflowsMap = ReadonlyMap<string, ReadonlyMap<string, string>>;
+
+/** Parse the explicit repository/context workflow map. Invalid configuration is inert. */
+export function parseRequiredContextWorkflowsMap(
+  raw: string | undefined
+): RequiredContextWorkflowsMap {
+  if (!raw?.trim()) return new Map();
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+      throw new Error('not_object');
+    const result = new Map<string, ReadonlyMap<string, string>>();
+    for (const [repository, contexts] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!contexts || typeof contexts !== 'object' || Array.isArray(contexts)) {
+        throw new Error('invalid_repository_entry');
+      }
+      const entries = Object.entries(contexts as Record<string, unknown>);
+      if (
+        entries.length === 0 ||
+        entries.some(
+          ([context, workflow]) =>
+            !context.trim() || typeof workflow !== 'string' || !workflow.trim()
+        )
+      ) {
+        throw new Error('invalid_context_entry');
+      }
+      result.set(
+        repository,
+        new Map(entries.map(([context, workflow]) => [context, (workflow as string).trim()]))
+      );
+    }
+    return result;
+  } catch (error) {
+    const key = `invalid:${REQUIRED_CONTEXT_WORKFLOWS_ENV}:${raw}`;
+    if (!loggedSources.has(key)) {
+      loggedSources.add(key);
+      log.warn(
+        { err: error, env: REQUIRED_CONTEXT_WORKFLOWS_ENV },
+        'overseer.required_context_workflows.invalid_ignored'
+      );
+    }
+    return new Map();
+  }
+}
+
+function resolvePositiveInteger(raw: string | undefined, fallback: number, env: string): number {
+  if (!raw?.trim()) return fallback;
+  const parsed = Number.parseInt(raw.trim(), 10);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  log.warn({ env, value: raw }, 'overseer.required_contexts.attempt_invalid_using_default');
+  return fallback;
+}
+
+export function resolveRequiredContextRearmAttempt(raw: string | undefined): number {
+  return resolvePositiveInteger(
+    raw,
+    DEFAULT_REQUIRED_CONTEXT_REARM_ATTEMPT,
+    REQUIRED_CONTEXT_REARM_ATTEMPT_ENV
+  );
+}
+
+export function resolveRequiredContextNeverReportedMaxAttempts(raw: string | undefined): number {
+  return resolvePositiveInteger(
+    raw,
+    DEFAULT_REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS,
+    REQUIRED_CONTEXT_NEVER_REPORTED_MAX_ATTEMPTS_ENV
+  );
 }
 
 function logSourceOnce(key: string, fields: Record<string, unknown>, message: string): void {

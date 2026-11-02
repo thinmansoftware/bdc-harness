@@ -58,6 +58,13 @@ export interface FakeGitHubAdapterDeps {
   readonly authorization_deps: AuthorizeOverseerActionDeps;
   readonly consume_execution: (executionId: string) => Promise<boolean>;
   readonly record_attempt: (input: AppendOverseerCapabilityEventInput) => Promise<unknown>;
+  /** Optional inert recorder used by required-context re-arm tests. */
+  readonly workflow_dispatch_receipts?: {
+    owner: string;
+    repo: string;
+    workflow_id: string;
+    ref: string;
+  }[];
 }
 
 export interface FakeGitHubAdapter {
@@ -65,6 +72,14 @@ export interface FakeGitHubAdapter {
     request: FakeGitHubMutationRequest,
     authorization: AuthorizeOverseerActionInput
   ): Promise<FakeGitHubReceipt>;
+  actions: {
+    createWorkflowDispatch(input: {
+      owner: string;
+      repo: string;
+      workflow_id: string;
+      ref: string;
+    }): Promise<void>;
+  };
 }
 
 function identityMatches(
@@ -137,6 +152,11 @@ export function createFakeGitHubAdapter(deps: FakeGitHubAdapterDeps): FakeGitHub
   );
 
   return {
+    actions: {
+      async createWorkflowDispatch(input): Promise<void> {
+        deps.workflow_dispatch_receipts?.push({ ...input });
+      },
+    },
     async attemptMutation(
       request: FakeGitHubMutationRequest,
       authorizationInput: AuthorizeOverseerActionInput
