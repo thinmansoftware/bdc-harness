@@ -230,14 +230,35 @@ describe('entry headroom', () => {
     const refusedTiers = loadRefusedTiers();
     const premiumTiers = loadPremiumTiers();
     const ruleset = loadRuleset();
-    const codePick = pickEntryTier({ woClass: 'CODE' }, ruleset);
-    expect(codePick).toBe('cursor');
     const hotCursorCoolCodex: SeatUsageSnapshot = {
       cursor: { limit_source: 'measured', windows: [{ name: 'primary', used_percent: 83 }] },
       codex: { limit_source: 'measured', windows: [{ name: 'primary', used_percent: 11 }] },
     };
-    const codeEntry = chooseHeadroomEntry({
+
+    // 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): plain CODE now
+    // picks zero. zero carries no paid seat, so seat-headroom must leave it
+    // where it is -- a hot cursor seat must NOT push a zero-entry WO up a rung.
+    const codePick = pickEntryTier({ woClass: 'CODE' }, ruleset);
+    expect(codePick).toBe('zero');
+    const zeroEntry = chooseHeadroomEntry({
       picked: codePick,
+      tiers,
+      refusedTiers,
+      premiumTiers,
+      usage: hotCursorCoolCodex,
+      thresholdPercent: 80,
+      pinned: false,
+    });
+    expect(zeroEntry.entry).toBe('zero');
+    expect(zeroEntry.changed).toBe(false);
+    expect(zeroEntry.reason).toBe('no_seat');
+
+    // Seat-shift parity still has to hold for picks that land on a real seat.
+    // feature-tagged CODE is the live rule that enters cursor.
+    const cursorPick = pickEntryTier({ woClass: 'CODE', tags: ['feature'] }, ruleset);
+    expect(cursorPick).toBe('cursor');
+    const codeEntry = chooseHeadroomEntry({
+      picked: cursorPick,
       tiers,
       refusedTiers,
       premiumTiers,
@@ -249,7 +270,7 @@ describe('entry headroom', () => {
     expect(codeEntry.changed).toBe(true);
     expect(codeEntry.reason).toBe('seat_over_threshold:cursor:83');
     const coolCursor = chooseHeadroomEntry({
-      picked: codePick,
+      picked: cursorPick,
       tiers,
       refusedTiers,
       premiumTiers,

@@ -55,11 +55,25 @@ describe('live ruleset routing', () => {
     expect(entry).toBe('zero');
   });
 
-  test('plain CODE and no-match default enter cursor (2026-09-29 default lane)', () => {
+  // 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01; John ruling on
+  // bdc-xo#4282 + M-20261027a r6 item 5): plain CODE (no tags) now enters zero
+  // instead of cursor. CODE carrying a tag that matches no earlier rule (e.g.
+  // 'docs') falls through to that same last CODE rule and also enters zero.
+  // THE REVERT IS ONE VALUE: set the last ruleset rule's entry back to cursor.
+  test('plain CODE enters zero (2026-11-02 zero floor)', () => {
     const ruleset = loadRuleset();
-    expect(pickEntryTier({ woClass: 'CODE' }, ruleset)).toBe('cursor');
-    expect(pickEntryTier({ woClass: 'CODE', tags: ['docs'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ woClass: 'CODE' }, ruleset)).toBe('zero');
+    expect(pickEntryTier({ woClass: 'CODE', tags: ['docs'] }, ruleset)).toBe('zero');
+  });
+
+  // defaultEntry is deliberately NOT part of the zero-floor change: a WO that
+  // matches no rule at all still enters cursor, not zero.
+  test('no-match default still enters cursor (defaultEntry unchanged)', () => {
+    const ruleset = loadRuleset();
     expect(ruleset.defaultEntry).toBe('cursor');
+    expect(pickEntryTier({}, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ tags: ['docs'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ woClass: 'DOCS' }, ruleset)).toBe('cursor');
   });
 
   test('feature-tagged CODE enters cursor', () => {

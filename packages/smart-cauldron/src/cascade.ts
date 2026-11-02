@@ -21,7 +21,7 @@ import { randomUUID } from 'crypto';
 import type { ExpectedSpecIdentity } from '@archon/core/workflows/work-order-source';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
+import { loadLadder, loadRefusedTiers, loadPremiumTiers, loadMaxClimbsByEntry } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
 import {
   admitClaudeTier,
@@ -567,6 +567,9 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const ruleset = opts.deps?.ruleset ?? loadRuleset();
   const refusedTiers = loadRefusedTiers();
   const premiumTiers = loadPremiumTiers();
+  // Fence 3 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): per-entry climb cap.
+  // Keyed by the cascade's resolved entry tier; a tier absent here has no limit.
+  const maxClimbsByEntry = loadMaxClimbsByEntry();
 
   // Conductor: pick entry tier (ruleset), or honor explicit --entry override
   let entryTierName = entryOverride ?? pickEntryTier({ woClass, tags }, ruleset);
@@ -1071,6 +1074,38 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         return true;
       }
 
+      // Fence 3 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): one climb, then stop.
+      // If this cascade's ENTRY tier has a maxClimbsByEntry limit and firing the
+      // next rung would push climbCount past it, stop BLOCKED with reason
+      // climb_limit_reached and escalate once -- do NOT fire another rung. A
+      // failing cheap-lane run must not climb into expensive seats (Grok fence 3:
+      // "One climb, then stop... a Codex 429 must not fall through onto Claude.").
+      const entryClimbLimit = maxClimbsByEntry[entryTierName];
+      if (typeof entryClimbLimit === 'number' && climbCount >= entryClimbLimit) {
+        status = 'blocked';
+        blockedReason = 'climb_limit_reached';
+        console.log(
+          `[smart-cauldron] BLOCKED climb_limit_reached: entry tier "${entryTierName}" allows ` +
+            `${entryClimbLimit} climb(s); tier=${currentTier.name} gate-failed and no further ` +
+            `rung will be fired for woId=${woId}`
+        );
+        await emitEscalation({
+          errorClass: 'validator_rejected',
+          woId,
+          reason:
+            `CLIMB LIMIT REACHED -- entry tier "${entryTierName}" allows ${entryClimbLimit} ` +
+            `climb(s). Tier ${currentTier.name} gate-failed: ${failReason}. The cascade stops ` +
+            'instead of firing a more expensive rung (fence 3).',
+          remediation: [
+            `Entry tier "${entryTierName}" is a fenced cheap lane; its one-climb budget is spent.`,
+            'Re-author or re-route the WO; do not re-fire the same lane expecting a different result.',
+          ],
+          runId,
+          overseerPermit: opts.overseerPermit,
+        });
+        return true;
+      }
+
       // Climb to the next admitted tier, skipping dark or headroom-denied rungs.
       currentIndex = nextAdmittedTierIndex(currentIndex, 'climb');
       climbCount++;
@@ -1528,6 +1563,38 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       const seatRefusal = seatRefusalDetail(pollResult);
       if (seatRefusal) {
         attempt.gateFailReason = `seat_refusal: ${seatRefusal}`;
+        // Fence 3 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): the one-climb cap
+        // also applies to a seat-refusal climb. If this cascade's ENTRY tier has
+        // a maxClimbsByEntry limit and a further climb would exceed it, stop
+        // BLOCKED (climb_limit_reached) with one escalation rather than firing
+        // another rung.
+        const entryClimbLimitSeat = maxClimbsByEntry[entryTierName];
+        if (typeof entryClimbLimitSeat === 'number' && climbCount >= entryClimbLimitSeat) {
+          status = 'blocked';
+          blockedReason = 'climb_limit_reached';
+          console.log(
+            '[smart-cauldron] BLOCKED climb_limit_reached (seat refusal): entry tier ' +
+              `"${entryTierName}" allows ${entryClimbLimitSeat} climb(s); tier=${tier.name} was ` +
+              `seat-refused and no further rung will be fired for woId=${woId}`
+          );
+          await emitEscalation({
+            errorClass: 'validator_rejected',
+            woId,
+            reason:
+              `CLIMB LIMIT REACHED -- entry tier "${entryTierName}" allows ` +
+              `${entryClimbLimitSeat} climb(s). Tier ${tier.name} was seat-refused ` +
+              `(${seatRefusal}). The cascade stops instead of firing a more expensive rung ` +
+              '(fence 3).',
+            remediation: [
+              `Entry tier "${entryTierName}" is a fenced cheap lane; its one-climb budget is spent.`,
+              'Resolve the seat pressure or re-route the WO; do not auto-climb into a paid seat.',
+            ],
+            runId: fireResult.runId,
+            overseerPermit: opts.overseerPermit,
+          });
+          await checkpoint();
+          break;
+        }
         console.log(
           `[smart-cauldron] Seat refusal on tier=${tier.name}: ${seatRefusal} -- ` +
             'climbing to the next rung with headroom (not a quality failure)'

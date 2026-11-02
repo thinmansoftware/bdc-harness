@@ -9,9 +9,15 @@ import { Database } from 'bun:sqlite';
 import { existsSync } from 'fs';
 
 const USAGE =
-  "usage: run-completion-report.ts --days N [--as-of 'YYYY-MM-DD HH:MM:SS'] [--db PATH] [--json]";
+  "usage: run-completion-report.ts --days N [--as-of 'YYYY-MM-DD HH:MM:SS'] [--zero-since 'YYYY-MM-DD HH:MM:SS'] [--db PATH] [--json]";
 const MIN_SAMPLE = 20;
 const LANE_LIKE = 'bdc-feature-development%';
+/** Zero-tier measurement (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01). */
+const ZERO_LANE = 'bdc-feature-development-zero-open';
+/** First-N zero-tier runs measured for the keep-or-revert verdict. */
+const ZERO_SAMPLE = 10;
+/** Review-fail count at or above which the XO reverts the routing. */
+const ZERO_REVERT_THRESHOLD = 3;
 /** Mailboxes read by people, with no worker (drain_on_start principals). */
 const MAILBOXES = ['operator', 'xo', 't3-desktop'] as const;
 /** Same instant as OPERATOR_HISTORY_CUTOFF in packages/core/src/db/dispatch-routing.ts. */
@@ -49,15 +55,22 @@ function validAsOf(s: string): boolean {
   );
 }
 
-function parseArgs(argv: string[]): { days: number; asOf: string; db: string; json: boolean } {
+function parseArgs(argv: string[]): {
+  days: number;
+  asOf: string;
+  db: string;
+  json: boolean;
+  zeroSince: string | null;
+} {
   let days: number | undefined;
   let asOf = nowUtc();
   let db = '/.archon/archon.db';
   let json = false;
+  let zeroSince: string | null = null;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') json = true;
-    else if (a === '--days' || a === '--as-of' || a === '--db') {
+    else if (a === '--days' || a === '--as-of' || a === '--db' || a === '--zero-since') {
       const v = argv[++i];
       if (v === undefined) fail(2, `missing value for ${a}\n${USAGE}`);
       if (a === '--days') {
@@ -66,11 +79,14 @@ function parseArgs(argv: string[]): { days: number; asOf: string; db: string; js
       } else if (a === '--as-of') {
         if (!validAsOf(v)) fail(2, `invalid --as-of: ${v}\n${USAGE}`);
         asOf = v;
+      } else if (a === '--zero-since') {
+        if (!validAsOf(v)) fail(2, `invalid --zero-since: ${v}\n${USAGE}`);
+        zeroSince = v;
       } else db = v;
     } else fail(2, `unknown argument: ${a}\n${USAGE}`);
   }
   if (days === undefined) fail(2, `--days is required\n${USAGE}`);
-  return { days, asOf, db, json };
+  return { days, asOf, db, json, zeroSince };
 }
 
 function rate(completed: number, total: number): string {
@@ -254,8 +270,82 @@ interface LaneRow {
   completed: number;
 }
 
+interface ZeroRun {
+  run: string;
+  status: string;
+  failed_steps: string[];
+}
+
+interface ZeroTier {
+  since: string;
+  runs: ZeroRun[];
+  failed: number;
+  total: number;
+  verdict: 'REVERT' | 'KEEP' | 'PENDING';
+  cancelled: number;
+}
+
+/**
+ * Zero-tier first-N measurement (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01).
+ *
+ * Lists, in started_at order, the first ZERO_SAMPLE (10) terminal runs
+ * (completed, failed, escalated) of the zero-open lane started at or after
+ * `zeroSince`. failed = status failed or escalated (a run that did not pass its
+ * in-lane review gates). Verdict: REVERT when failed >= 3; KEEP when 10 runs
+ * exist and failed < 3; else PENDING. Cancelled runs after the cutoff are
+ * excluded from the 10 and counted separately. Read-only.
+ */
+function readZeroTier(db: Database, zeroSince: string): ZeroTier {
+  const rows = db
+    .query(
+      `select id, status from remote_agent_workflow_runs
+       where workflow_name = $lane and started_at >= $since
+         and status in ('completed','failed','escalated')
+       order by started_at, id
+       limit $limit`
+    )
+    .all({ $lane: ZERO_LANE, $since: zeroSince, $limit: ZERO_SAMPLE }) as {
+    id: string;
+    status: string;
+  }[];
+
+  const stepsQuery = db.query(
+    `select coalesce(step_name,'(null)') as step_name
+     from remote_agent_workflow_events
+     where workflow_run_id = $id and event_type = 'node_failed'
+     order by step_index, step_name`
+  );
+
+  const runs: ZeroRun[] = rows.map(r => {
+    const steps = stepsQuery.all({ $id: r.id }) as { step_name: string }[];
+    return {
+      run: r.id.slice(0, 8),
+      status: r.status,
+      failed_steps: steps.map(s => s.step_name),
+    };
+  });
+
+  const failed = runs.filter(r => r.status === 'failed' || r.status === 'escalated').length;
+  const total = runs.length;
+  const cancelled = (
+    db
+      .query(
+        `select count(*) as n from remote_agent_workflow_runs
+         where workflow_name = $lane and started_at >= $since and status = 'cancelled'`
+      )
+      .get({ $lane: ZERO_LANE, $since: zeroSince }) as { n: number }
+  ).n;
+
+  let verdict: ZeroTier['verdict'];
+  if (failed >= ZERO_REVERT_THRESHOLD) verdict = 'REVERT';
+  else if (total === ZERO_SAMPLE) verdict = 'KEEP';
+  else verdict = 'PENDING';
+
+  return { since: zeroSince, runs, failed, total, verdict, cancelled };
+}
+
 function main(): void {
-  const { days, asOf, db: dbPath, json } = parseArgs(process.argv.slice(2));
+  const { days, asOf, db: dbPath, json, zeroSince } = parseArgs(process.argv.slice(2));
   if (!existsSync(dbPath)) fail(3, `database not found: ${dbPath}`);
   let db: Database;
   try {
@@ -273,6 +363,7 @@ function main(): void {
   let actions: { action: string; count: number }[];
   let start: string;
   let outcomes: Outcomes;
+  let zeroTier: ZeroTier | null = null;
   try {
     start = (
       db.query('select datetime($asof, $d) as s').get({ $asof: asOf, $d: dayArg }) as {
@@ -323,6 +414,7 @@ function main(): void {
       )
       .all({ $asof: asOf, $d: dayArg }) as { action: string; count: number }[];
     outcomes = readOutcomes(db, asOf);
+    if (zeroSince !== null) zeroTier = readZeroTier(db, zeroSince);
   } catch (e) {
     return fail(3, `query failed on ${dbPath}: ${(e as Error).message}`);
   } finally {
@@ -341,6 +433,7 @@ function main(): void {
     overseer_actions: actions,
     outcome_flag_line: flagLine(outcomes.flags),
     outcomes,
+    ...(zeroTier ? { zero_tier: zeroTier } : {}),
   };
 
   if (json) {
@@ -367,6 +460,20 @@ function main(): void {
       `  mailbox ${m.recipient}: depth ${m.depth}, live ${m.depth_live}, ` +
         `oldest_live ${m.oldest_live ?? 'none'}, age_h ${m.oldest_live_age_hours ?? 'none'}`
     );
+  if (zeroTier) {
+    out.push(`zero_tier (since ${zeroTier.since}):`);
+    out.push('zero_tier_first10:');
+    for (const r of zeroTier.runs) {
+      const stepsText = r.failed_steps.length === 0 ? '' : ` [steps: ${r.failed_steps.join(', ')}]`;
+      out.push(`  ${r.run} ${r.status}${stepsText}`);
+    }
+    out.push(`zero_tier_failed: ${zeroTier.failed}/${zeroTier.total}`);
+    out.push(
+      `zero_tier_verdict: ${zeroTier.verdict}` +
+        (zeroTier.verdict === 'PENDING' ? ` ${zeroTier.total}/${ZERO_SAMPLE}` : '')
+    );
+    out.push(`zero_tier_cancelled: ${zeroTier.cancelled}`);
+  }
   process.stdout.write(out.join('\n') + '\n');
 }
 
