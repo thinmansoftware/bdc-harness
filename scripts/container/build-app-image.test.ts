@@ -106,8 +106,13 @@ async function runBuild(controls: BuildControls): Promise<BuildResult> {
     await chmod(gitPath, 0o755);
     await chmod(dockerPath, 0o755);
 
+    const env = buildEnv(binDir, dockerLog, controls);
+    if (controls.extraEnv?.ARCHON_REBUILD_HOLD_FILE === undefined) {
+      env.ARCHON_REBUILD_HOLD_FILE = join(dir, 'rebuild-hold-absent');
+    }
+
     const proc = Bun.spawn(['bash', SCRIPT], {
-      env: buildEnv(binDir, dockerLog, controls),
+      env,
       stdout: 'pipe',
       stderr: 'pipe',
     });
@@ -122,6 +127,24 @@ async function runBuild(controls: BuildControls): Promise<BuildResult> {
 }
 
 describe('build-app-image', () => {
+  it.skipIf(SKIP_ON_WINDOWS)('Test 1: hold blocks the image build', async () => {
+    const holdDir = await mkdtemp(join(tmpdir(), 'build-app-image-hold-'));
+    try {
+      const holdFile = join(holdDir, 'hold');
+      await writeFile(holdFile, 'held by test\n');
+      const result = await runBuild({
+        extraEnv: { ARCHON_REBUILD_HOLD_FILE: holdFile },
+      });
+
+      expect(result.exitCode).toBe(10);
+      expect(result.stderr).toContain('rebuild hold present');
+      expect(result.stderr).toContain('held by test');
+      expect(result.dockerLog).toBe('');
+    } finally {
+      await rm(holdDir, { recursive: true, force: true });
+    }
+  });
+
   it.skipIf(SKIP_ON_WINDOWS)('Test 2: clean tree builds with the real SHA', async () => {
     const result = await runBuild({
       porcelain: '',
