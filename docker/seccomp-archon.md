@@ -1,8 +1,10 @@
 # Archon app seccomp profile
 
-This profile is the Docker/Moby 29.3.0 default seccomp profile plus a five-rule
-user-namespace delta for `services.app`. It removes only the namespace
-prerequisite. It is not full native sandbox acceptance.
+This profile is the Docker/Moby 29.3.0 default seccomp profile plus a six-rule
+delta for `services.app`: the five user-namespace rules below (#1289) and one
+bubblewrap mount rule (WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01). It is paired
+with the AppArmor profile `docker/apparmor/archon-bwrap`. It is not full native
+sandbox acceptance.
 
 ## Pinned upstream
 
@@ -16,12 +18,12 @@ prerequisite. It is not full native sandbox acceptance.
 The fixture is the bytes of that Moby commit. It is not Moby `main`. Do not
 reformat `docker/seccomp-upstream-29.3.0.json`.
 
-## Five-rule delta
+## Five-rule user-namespace delta
 
 Every upstream field and every existing syscall rule stays as an ordered
 prefix. That includes both original filtered `clone` rules and the complete
 `clone3` rule. The unprivileged `clone3` rule stays `SCMP_ACT_ERRNO` with
-errnoRet 38 and the `CAP_SYS_ADMIN` exclusion. Exactly five rules are appended:
+errnoRet 38 and the `CAP_SYS_ADMIN` exclusion. These five rules are appended first:
 
 1. Non-s390 unprivileged `clone` (flags argument index 0) with `valueTwo`
    `268435456` (`0x10000000`, `CLONE_NEWUSER`).
@@ -44,9 +46,67 @@ stay denied. Original no-namespace `clone` behavior stays unchanged.
 
 `setns` was not added. The isolated trace did not reach `setns` before the
 mount failure, so necessity is unproven. This is not a claim that `setns` is
-unnecessary on every sandbox path. No `mount`, `umount2`, or other syscall was
-allowed. There is no unconfined profile, no privileged mode, and no added
+unnecessary on every sandbox path. These five rules allow no `mount`,
+`umount2`, or other syscall; the sixth rule below adds the bwrap mount
+syscalls. There is no unconfined profile, no privileged mode, and no added
 capability.
+
+## Sixth rule: bubblewrap mounts (WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01)
+
+codex 0.159.2 refuses legacy Landlock for a restricted filesystem policy
+(`linux_run_main.rs`: "filesystem-restricted execution requires bubblewrap to
+isolate app-server sockets") and builds the reviewer sandbox with bubblewrap.
+bwrap creates a new user, mount, IPC, PID and network namespace with one
+`clone` (already allowed by rule 3 above), then:
+
+- `mount`: make `/` a slave mount, bind and tmpfs mounts, read-only remounts,
+  a fresh `/dev` and devpts, and optionally `/proc`.
+- `pivot_root`: switch into the new root.
+- `umount2`: detach the old root.
+
+One rule is appended:
+`{"names":["mount","umount2","pivot_root"],"action":"SCMP_ACT_ALLOW","excludes":{"caps":["CAP_SYS_ADMIN"]}}`.
+The container still has no `CAP_SYS_ADMIN`, so the kernel refuses these calls
+everywhere except inside a user and mount namespace the caller just created.
+`setns`, `mount_setattr`, `move_mount`, `open_tree`, `fsopen`, `fsmount`,
+`umount`, `clone3`, `CLONE_NEWUTS` and `CLONE_NEWCGROUP` stay denied.
+
+## AppArmor profile archon-bwrap
+
+Seccomp is per container, so the per-program limit is AppArmor.
+`docker/apparmor/archon-bwrap` is docker-default (moby/profiles template,
+ABI 3.0) with its names changed. It keeps `deny mount,` for every container
+process. Only an exec of `/usr/bin/bwrap` transitions (`Cx`) into the child
+profile `archon-bwrap//bwrap`, which adds `mount,`, `umount,` and
+`pivot_root,`. Builder lanes that do not run bwrap still cannot mount: the
+docker-build smoke asserts `unshare -Urm true` fails as appuser.
+
+`docker-compose.yml` loads it with `apparmor=archon-bwrap`. Docker refuses to
+start the app container if the profile is not loaded on the host, so the host
+step runs BEFORE the first recreate that includes this change:
+
+```bash
+# load (or reload after an edit); re-run after every host reboot
+sudo apparmor_parser --replace /opt/bdc/archon/docker/apparmor/archon-bwrap
+# to survive reboots without a manual step, install it with the system profiles:
+sudo install -m 0644 /opt/bdc/archon/docker/apparmor/archon-bwrap /etc/apparmor.d/archon-bwrap
+sudo apparmor_parser --replace /etc/apparmor.d/archon-bwrap
+# verify
+sudo aa-status | grep archon-bwrap
+```
+
+Rollback: recreate the container from the previous commit (no
+`apparmor=archon-bwrap`), confirm `docker inspect -f '{{.AppArmorProfile}}'
+archon-app-1` prints `docker-default`, then unload:
+
+```bash
+sudo apparmor_parser --remove /etc/apparmor.d/archon-bwrap   # or the /opt/bdc/archon path used to load it
+sudo rm -f /etc/apparmor.d/archon-bwrap
+```
+
+CI (`.github/workflows/test.yml`, docker-build) loads the same file with
+`sudo apparmor_parser --replace` and runs the smoke container with this
+seccomp profile and `apparmor=archon-bwrap`.
 
 ## Historical isolated proof
 
@@ -73,8 +133,10 @@ isolated container. It is not a deployment and it is not production acceptance.
 
 Full native sandbox acceptance is BLOCKED.
 
-The observed mount denial is outside this delta. Do not widen the profile to
-make the native sandbox command succeed.
+The observed mount denial was outside the original five-rule delta. The
+sixth rule and the archon-bwrap AppArmor profile are the authorized widening
+(John 2026-11-02, WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01). Do not widen
+either further without a new WO.
 
 Production activation is UNVERIFIED.
 
