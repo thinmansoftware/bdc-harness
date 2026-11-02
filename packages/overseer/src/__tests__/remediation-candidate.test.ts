@@ -441,7 +441,7 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
 
   /**
    * REGRESSION -- PR #740 round 7 [major] (2026-10-05). ascii_violation kept a
-   * BARE first alternative -- /(?:non-ascii|ascii-only)/ with no failure
+   * BARE first alternative -- /(?:non-ascii|ascii-only)/ with no failure
    * requirement -- so any finding that merely said "Non-ASCII" classified as
    * auto-fixable. The gate's example is a data-disclosure defect:
    * "Non-ASCII tenant names collide, allowing one customer to read another
@@ -654,17 +654,46 @@ describe('scenario 7: an APPROVED verdict never remediates', () => {
   });
 });
 
-describe('scenario 8: Taskmaster refusal (consumer not yet built)', () => {
-  // SKIPPED WITH REASON, per the spec.
+describe('scenario 8: Taskmaster refusal (consumer present)', () => {
+  // UNSKIPPED by WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01: the Taskmaster
+  // consumer now exists and reads `overseer_remediation_candidate` rows.
   //
-  // The freeze is OVER: PR #669 (M-129 Phase 1.5) merged 2026-08-30, so
-  // packages/server/src/taskmaster/* is editable again. What is still missing
-  // is the consumer itself -- nothing in packages/server/src/taskmaster/ reads
-  // `overseer_remediation_candidate`, so there is no budget/pause/eligibility
-  // refusal to assert against. Building that consumer is follow-on work
-  // (tracked separately); this test unskips when it lands.
-  test.skip('a candidate arriving while paused or over budget is not fired', () => {
-    throw new Error('unreachable: Taskmaster remediation consumer not yet built');
+  // The tick-level refusal itself -- a candidate arriving while Taskmaster is
+  // paused or over the per-item budget is NOT fired, the refusal is recorded,
+  // and the candidate is left for a later tick -- is exercised against the REAL
+  // consumer in packages/server/src/taskmaster/remediation-consumer.test.ts
+  // (Section 7 Tests 3 and 4). That assertion lives in @archon/server because
+  // @archon/overseer must not depend on @archon/server: the dependency edge runs
+  // server -> overseer only (importing the consumer here does not even resolve),
+  // so this file cannot drive a tick.
+  //
+  // What scenario 8 proves from inside the overseer boundary is the producer
+  // half of "Overseer did not bypass the gates": a CHANGES_REQUESTED verdict is
+  // handed back as an INERT candidate (a row Taskmaster reads and gates), never
+  // an action Overseer fires itself, and the candidate is exactly what the
+  // consumer's own parser accepts. Whatever Taskmaster's pause/budget gates then
+  // decide governs the outcome.
+  test('a CHANGES_REQUESTED verdict is handed back as an inert, consumer-readable candidate', () => {
+    const decision = decideRemediation(baseInput(), LEGACY_PATTERN_CLASSES);
+
+    // Overseer emits a candidate; it does not fire or escalate anything itself.
+    expect(decision.emit).toBe(true);
+    if (!decision.emit) throw new Error('unreachable');
+
+    // The candidate is inert data of the agreed wire kind -- not an executable
+    // directive -- so Taskmaster's gates, not Overseer, decide what happens.
+    expect(decision.body.kind).toBe(REMEDIATION_CANDIDATE_KIND);
+    expect(decision.body.attempt).toBeLessThanOrEqual(decision.body.maxAttempts);
+
+    // The consumer reads candidates through parseRemediationCandidateBody; the
+    // emitted body must round-trip through that exact parser, carrying every
+    // field the gated consumer needs to refuse-and-redeliver.
+    const parsed = parseRemediationCandidateBody(JSON.stringify(decision.body));
+    expect(parsed).not.toBeNull();
+    expect(parsed?.prNumber).toBe(decision.body.prNumber);
+    expect(parsed?.headSha).toBe(decision.body.headSha);
+    expect(parsed?.attempt).toBe(decision.body.attempt);
+    expect(parsed?.verdictBody).toBe(decision.body.verdictBody);
   });
 });
 
