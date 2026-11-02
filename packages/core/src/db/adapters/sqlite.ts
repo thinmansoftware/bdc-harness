@@ -2756,10 +2756,11 @@ export class SqliteAdapter implements IDatabase {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
-      -- At most one reserved fire per WO: a second concurrent fire reservation
-      -- for the same wo_id violates this and is refused 409 live_run.
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_live_fire
-        ON t3_command_admissions(wo_id) WHERE verb = 'fire' AND state = 'reserved';
+      -- WO fire lock: at most one unresolved (reserved or unknown) fire per WO;
+      -- an unknown fire holds it until operator adjudication (migration 067).
+      DROP INDEX IF EXISTS idx_t3_command_admissions_live_fire;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
+        ON t3_command_admissions(wo_id) WHERE verb = 'fire' AND state IN ('reserved', 'unknown');
 
       -- Per-service GitHub API usage and latest quota state (migration 062).
       CREATE TABLE IF NOT EXISTS github_api_usage (

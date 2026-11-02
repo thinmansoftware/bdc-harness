@@ -495,6 +495,148 @@ describe('Test 3d: a persistence failure after an executed cascade is reconciled
   });
 });
 
+describe('Test 3e: an unknown fire holds the WO lock until operator adjudication', () => {
+  test('a new request after an unknown admission is refused with the original admission id', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    // Uncertain cascade: no run id -> the admission becomes `unknown`.
+    world.fireResults.set('WO-U', { cascadeId: 'CU', status: 'running', runId: null });
+    await processCommand(
+      world.deps,
+      makeMessage({
+        id: 'cmd-u1',
+        idempotencyKey: 'U1',
+        body: cmdBody({ request_id: 'U1', verb: 'fire', wo_id: 'WO-U', project: 'bdc-harness' }),
+      })
+    );
+    expect((await admissions.getByRequestId('U1', db))?.state).toBe('unknown');
+    expect(world.calls.fire).toBe(1);
+
+    // No live run is visible (liveRuns empty) -- the ledger alone must refuse.
+    world.fireResults.set('WO-U', { cascadeId: 'CU2', status: 'running', runId: 'RU2' });
+    await processCommand(
+      world.deps,
+      makeMessage({
+        id: 'cmd-u2',
+        idempotencyKey: 'U2',
+        body: cmdBody({ request_id: 'U2', verb: 'fire', wo_id: 'WO-U', project: 'bdc-harness' }),
+      })
+    );
+    expect(world.calls.fire).toBe(1);
+    const refused = parseReply(world.replyById.get('reply:cmd-u2')!);
+    expect(refused.status).toBe(409);
+    expect(refused.code).toBe('live_run');
+    expect(refused.run_id).toBe('U1');
+    expect((await admissions.getByRequestId('U2', db))?.state).toBe('refused');
+    expect((await admissions.getByRequestId('U1', db))?.state).toBe('unknown');
+  });
+
+  test('the unique index alone refuses a reservation while an unknown fire holds the WO', async () => {
+    const base = {
+      actor_principal_id: 't3-bridge',
+      verb: 'fire' as const,
+      payload_sha256: 'd',
+      wo_id: 'WO-IDX',
+      project: 'bdc-harness',
+      now: T0,
+    };
+    await admissions.reserveAdmission({ ...base, request_id: 'I1', source_message_id: 'm-i1' }, db);
+    await admissions.markUnknown(
+      'I1',
+      { status_code: 409, code: 'admission_unknown', now: T0 },
+      db
+    );
+    const second = await admissions.reserveAdmission(
+      { ...base, request_id: 'I2', source_message_id: 'm-i2' },
+      db
+    );
+    expect(second.status).toBe('wo_fire_locked');
+  });
+
+  test('adjudication (no_run) releases the WO; a later request fires once', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    world.fireResults.set('WO-J', { cascadeId: 'CJ', status: 'running', runId: null });
+    await processCommand(
+      world.deps,
+      makeMessage({
+        id: 'cmd-j1',
+        idempotencyKey: 'J1',
+        body: cmdBody({ request_id: 'J1', verb: 'fire', wo_id: 'WO-J', project: 'bdc-harness' }),
+      })
+    );
+    expect((await admissions.getByRequestId('J1', db))?.state).toBe('unknown');
+
+    // Compare-and-set: adjudicating a non-unknown row changes nothing.
+    expect(
+      (
+        await admissions.adjudicateUnknownFire(
+          'NOPE',
+          { resolution: 'no_run', adjudicated_by: 'operator', now: T0 },
+          db
+        )
+      ).status
+    ).toBe('not_found');
+
+    const result = await admissions.adjudicateUnknownFire(
+      'J1',
+      { resolution: 'no_run', adjudicated_by: 'operator', now: T0 },
+      db
+    );
+    expect(result.status).toBe('adjudicated');
+    const adjudicated = await admissions.getByRequestId('J1', db);
+    expect(adjudicated?.state).toBe('refused');
+    expect(adjudicated?.code).toBe('adjudicated_no_run:operator');
+    // A second adjudication is a no-op on the now-resolved row.
+    expect(
+      (
+        await admissions.adjudicateUnknownFire(
+          'J1',
+          { resolution: 'run', run_id: 'RX', adjudicated_by: 'operator', now: T0 },
+          db
+        )
+      ).status
+    ).toBe('not_unknown');
+
+    world.fireResults.set('WO-J', { cascadeId: 'CJ2', status: 'running', runId: 'RJ2' });
+    await processCommand(
+      world.deps,
+      makeMessage({
+        id: 'cmd-j2',
+        idempotencyKey: 'J2',
+        body: cmdBody({ request_id: 'J2', verb: 'fire', wo_id: 'WO-J', project: 'bdc-harness' }),
+      })
+    );
+    expect(world.calls.fire).toBe(2);
+    const ok = parseReply(world.replyById.get('reply:cmd-j2')!);
+    expect(ok).toMatchObject({ status: 200, code: 'ok', run_id: 'RJ2' });
+  });
+
+  test('adjudication (run) admits the proven run to the original actor and releases the lock', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    world.fireResults.set('WO-K', { cascadeId: 'CK', status: 'running', runId: null });
+    await processCommand(
+      world.deps,
+      makeMessage({
+        id: 'cmd-k1',
+        idempotencyKey: 'K1',
+        body: cmdBody({ request_id: 'K1', verb: 'fire', wo_id: 'WO-K', project: 'bdc-harness' }),
+      })
+    );
+    const result = await admissions.adjudicateUnknownFire(
+      'K1',
+      { resolution: 'run', run_id: 'RK', adjudicated_by: 'operator', now: T0 },
+      db
+    );
+    expect(result.status).toBe('adjudicated');
+    const row = await admissions.getByRequestId('K1', db);
+    expect(row).toMatchObject({ state: 'admitted', status_code: 200, code: 'ok', run_id: 'RK' });
+    expect(await admissions.ownsRun('t3-bridge', 'RK', db)).toBe(true);
+    expect(await admissions.findLiveFireForWo('WO-K', undefined, db)).toBeNull();
+  });
+});
+
 describe('Test 4: cancel of another principal run returns 403', () => {
   test('non-owners refused; owner cancels once; retry replays without a second cancel', async () => {
     const world = makeWorld({ ...BASE_ENV });

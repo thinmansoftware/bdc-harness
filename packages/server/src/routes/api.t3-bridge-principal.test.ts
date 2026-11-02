@@ -120,6 +120,11 @@ for (const moduleName of [
 }
 
 import { registerApiRoutes } from './api';
+import {
+  createInProcessApiFetch,
+  IN_PROCESS_API_ORIGIN,
+  isInProcessServiceRequest,
+} from './in-process-authority';
 
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {
@@ -280,5 +285,71 @@ describe('Test 9: t3-bridge principal issuance and blast radius', () => {
     expect(reply.sender).toBe('cauldron-fire');
     expect(reply.sender_principal_id).toBe('system:cauldron-fire');
     expect(reply.recipient).toBe('t3-desktop');
+  });
+});
+
+describe('in-process service authority (cauldron-fire cascade path)', () => {
+  const OPERATOR = 'operator-secret-for-test';
+
+  beforeEach(() => {
+    process.env.BUN_ENV = 'test';
+    currentDbPath = join(
+      import.meta.dir,
+      `.test-t3-inproc-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new SqliteAdapter(currentDbPath);
+  });
+
+  afterEach(async () => {
+    delete process.env.ARCHON_OPERATOR_TOKEN;
+    await db.close();
+    cleanupDb(currentDbPath);
+  });
+
+  test('an in-process request is authenticated without the operator token; the same request over the app boundary is not', async () => {
+    const app = makeApp();
+    process.env.ARCHON_OPERATOR_TOKEN = OPERATOR;
+
+    const network = await app.request('/api/codebases', { method: 'GET' });
+    expect(network.status).toBe(401);
+
+    const inProcessFetch = createInProcessApiFetch(app);
+    const response = await inProcessFetch(`${IN_PROCESS_API_ORIGIN}/api/codebases`, {
+      headers: { 'x-archon-operator-token': '' },
+    });
+    expect(response.status).toBe(200);
+  });
+
+  test('a forged request object built outside createInProcessApiFetch is not admitted', async () => {
+    const app = makeApp();
+    process.env.ARCHON_OPERATOR_TOKEN = OPERATOR;
+    const forged = new Request(`${IN_PROCESS_API_ORIGIN}/api/codebases`);
+    expect(isInProcessServiceRequest(forged)).toBe(false);
+    const response = await app.fetch(forged);
+    expect(response.status).toBe(401);
+  });
+
+  test('refuses any origin other than the in-process origin (no network self-call)', async () => {
+    const app = makeApp();
+    const inProcessFetch = createInProcessApiFetch(app);
+    let threw = '';
+    try {
+      await inProcessFetch('http://localhost:3090/api/codebases');
+    } catch (error) {
+      threw = (error as Error).message;
+    }
+    expect(threw).toBe('in_process_api_fetch_origin_refused');
+  });
+
+  test('principal headers are stripped on the in-process path', async () => {
+    const app = makeApp();
+    process.env.ARCHON_OPERATOR_TOKEN = OPERATOR;
+    const inProcessFetch = createInProcessApiFetch(app);
+    // With principal headers honored this route would be 403
+    // dispatch_principal_forbidden; stripped, it runs as the in-process caller.
+    const response = await inProcessFetch(`${IN_PROCESS_API_ORIGIN}/api/codebases`, {
+      headers: T3_HEADERS,
+    });
+    expect(response.status).toBe(200);
   });
 });

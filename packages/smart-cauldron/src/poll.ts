@@ -74,6 +74,12 @@ interface PollOptions {
   /** Operator token for Archon API auth. Defaults to ARCHON_OPERATOR_TOKEN env. */
   token?: string;
   /**
+   * Transport for Archon API reads/writes. Defaults to global fetch. The
+   * in-process T3 command consumer passes the server's own in-process API
+   * dispatcher here so no network self-call is made.
+   */
+  fetchImpl?: typeof fetch;
+  /**
    * HARD CEILING on total run duration (ms). Default: 14400000 (4 hours).
    *
    * This is a backstop against true runaways, NOT the normal stop condition --
@@ -213,6 +219,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     checkPrMergeable: checkPrMergeableFn = checkPrMergeableDefault,
   } = opts;
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
+  const doFetch = opts.fetchImpl ?? fetch;
 
   const deadline = Date.now() + timeoutMs;
 
@@ -224,7 +231,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
   let lastActivityAt = Date.now();
 
   while (Date.now() < deadline) {
-    const detail = await fetchRunDetail(runId, apiBaseUrl, token);
+    const detail = await fetchRunDetail(runId, apiBaseUrl, token, doFetch);
 
     const newestNow = newestEventTimestamp(detail.events ?? []);
     if (newestNow !== null && (newestEventSeen === null || newestNow > newestEventSeen)) {
@@ -251,7 +258,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
       if (terminalStatus === 'completed' && prUrl === null) {
         for (let attempt = 0; attempt < prRetryAttempts && prUrl === null; attempt++) {
           await new Promise<void>(resolve => setTimeout(resolve, prRetryDelayMs));
-          const retryDetail = await fetchRunDetail(runId, apiBaseUrl, token);
+          const retryDetail = await fetchRunDetail(runId, apiBaseUrl, token, doFetch);
           events = retryDetail.events ?? [];
           prUrl = extractPrUrl(events);
           // The validator event can lag for the same reason -- refresh it too.
@@ -455,11 +462,12 @@ function openNodeNames(
 async function fetchRunDetail(
   runId: string,
   apiBaseUrl: string,
-  token: string
+  token: string,
+  doFetch: typeof fetch = fetch
 ): Promise<RunApiResponse> {
   let res: Response;
   try {
-    res = await fetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}`, {
+    res = await doFetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}`, {
       headers: { 'x-archon-operator-token': token },
     });
   } catch (error) {

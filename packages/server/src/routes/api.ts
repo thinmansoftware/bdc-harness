@@ -3,6 +3,7 @@
  * Provides conversation, codebase, and SSE streaming endpoints.
  */
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
+import { isInProcessServiceRequest } from './in-process-authority';
 import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
@@ -3521,6 +3522,12 @@ export function registerApiRoutes(
 
   app.use('/api/*', async (c, next) => {
     if (c.req.method === 'OPTIONS' || isPublicApiPath(c.req.path)) {
+      return next();
+    }
+
+    // The server's own in-process caller (createInProcessApiFetch). Unforgeable
+    // from the network: only in-process code can add a Request to this set.
+    if (isInProcessServiceRequest(c.req.raw)) {
       return next();
     }
 

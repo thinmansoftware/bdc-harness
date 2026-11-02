@@ -64,6 +64,7 @@ import { MessagePersistence } from './adapters/web/persistence';
 import { SSETransport } from './adapters/web/transport';
 import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { registerApiRoutes, stopProviderWaitScheduler } from './routes/api';
+import { createInProcessApiFetch } from './routes/in-process-authority';
 import {
   startDispatchEscalationClock,
   stopDispatchEscalationClock,
@@ -705,7 +706,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // cauldron-fire mailbox. No-op unless T3_COMMAND_CONSUMER_ENABLED=1 (default
   // off): no reads, no writes until an operator enables it and mints the
   // t3-bridge principal.
-  startCauldronFireConsumer();
+  startCauldronFireConsumer(undefined, { apiFetch: createInProcessApiFetch(app) });
   // Dedicated fast timer (default 60s) that pages John for a dead/restarted
   // Dispatch worker, independent of the 15-minute Duty Officer tick.
   startWorkerHeartbeatAlarmTimer();

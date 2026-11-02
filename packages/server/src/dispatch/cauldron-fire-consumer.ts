@@ -37,6 +37,7 @@ import { runCascade, readCascadeRecord } from '@archon/smart-cauldron/cascade';
 import * as admissions from '@archon/core/db/t3-command-admissions';
 import type { T3CommandAdmissionRow, T3CommandVerb } from '@archon/core/db/t3-command-admissions';
 import { checkFireEligibility as checkFireEligibilityImpl } from '../taskmaster/fire-eligibility';
+import { IN_PROCESS_API_ORIGIN } from '../routes/in-process-authority';
 // Type-only import: the run-action functions are loaded lazily in the real deps
 // (dynamic import) so this module -- and its tests -- never statically pull in the
 // heavy routes/api graph, which keeps mock-module ordering deterministic in tests.
@@ -367,10 +368,32 @@ async function handleFire(
     );
     return { status: 409, code: 'live_run', run_id: live.runId ?? cmd.request_id };
   }
-  // Live-run refusal: another fire admission for this WO is mid-admission
-  // (reserved). A completed `admitted` row does not block -- that run's liveness
-  // is owned by hasLiveWorkflowRun above, not by the admission ledger.
+  // Live-run refusal: another fire admission for this WO is unresolved --
+  // mid-admission (reserved) or unproven (unknown, awaiting operator
+  // adjudication; its run may exist but be invisible to the scan above). A
+  // completed `admitted` row does not block -- that run's liveness is owned by
+  // hasLiveWorkflowRun above, not by the admission ledger.
   const competitor = await admissions.findLiveFireForWo(woId, cmd.request_id, deps.db);
+  if (competitor?.state === 'unknown') {
+    // Reply with the ORIGINAL admission id: it is the key the operator
+    // adjudicates (adjudicateUnknownFire), and an unproven run id is not one.
+    await admissions.insertRefused(
+      {
+        ...fireFields,
+        status_code: 409,
+        code: 'live_run',
+        run_id: competitor.request_id,
+        now,
+      },
+      deps.db
+    );
+    return {
+      status: 409,
+      code: 'live_run',
+      run_id: competitor.request_id,
+      cascade_id: competitor.cascade_id ?? null,
+    };
+  }
   if (competitor) {
     await admissions.insertRefused(
       {
@@ -809,9 +832,22 @@ let recovered = false;
  * T3_COMMAND_CONSUMER_ENABLED=1. Runs crash recovery once, then an immediate
  * tick, then every T3_COMMAND_POLL_MS.
  */
-export function startCauldronFireConsumer(deps?: CauldronFireConsumerDeps): void {
+export function startCauldronFireConsumer(
+  deps?: CauldronFireConsumerDeps,
+  options: { apiFetch?: typeof fetch } = {}
+): void {
   if (timer) return;
-  const resolved = deps ?? createRealCauldronFireConsumerDeps();
+  let resolved = deps;
+  if (!resolved) {
+    if (!cauldronFireConsumerEnabled(process.env)) return;
+    if (!options.apiFetch) {
+      // Fail closed: production wiring must hand in the server's in-process API
+      // dispatcher. Without it a fire could only be an HTTP self-call.
+      log.error('cauldron_fire_consumer_in_process_api_missing');
+      return;
+    }
+    resolved = createRealCauldronFireConsumerDeps(process.env, options.apiFetch);
+  }
   if (!cauldronFireConsumerEnabled(resolved.env)) return;
   void (async (): Promise<void> => {
     if (!recovered) {
@@ -837,7 +873,8 @@ export function stopCauldronFireConsumer(): void {
 const GITHUB_API_ORIGIN = 'https://api.github.com';
 
 export function createRealCauldronFireConsumerDeps(
-  env: Record<string, string | undefined> = process.env
+  env: Record<string, string | undefined>,
+  apiFetch: typeof fetch
 ): CauldronFireConsumerDeps {
   async function githubToken(): Promise<string> {
     const identity = resolveServiceGitHubAuth('taskmaster', env);
@@ -913,6 +950,13 @@ export function createRealCauldronFireConsumerDeps(
         // token so runCascade does not fall back to process.env.ARCHON_OPERATOR_TOKEN
         // (`token ?? env` only falls back on null/undefined, so '' short-circuits it).
         token: '',
+        // Authenticated in-process execution: every Archon API call the cascade
+        // makes (codebase lookup, conversation dispatch, run discovery, poll,
+        // node timeouts, cancel, seat read) is dispatched into this server's own
+        // router by createInProcessApiFetch under the in-process service
+        // authority. No socket, no HTTP self-call, no operator token.
+        apiBaseUrl: IN_PROCESS_API_ORIGIN,
+        fetchImpl: apiFetch,
         woId: input.woId,
         project: input.project,
         dispatchId: input.dispatchId,

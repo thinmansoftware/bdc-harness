@@ -80,8 +80,9 @@ export async function getByRequestId(
 
 /**
  * Insert a `reserved` admission for this request. The partial unique index on
- * (wo_id) WHERE verb='fire' AND state='reserved' guarantees at most one reserved
- * fire per WO, so a losing concurrent fire returns `wo_fire_locked`. A duplicate
+ * (wo_id) WHERE verb='fire' AND state IN ('reserved','unknown') guarantees at
+ * most one unresolved fire per WO, so a losing concurrent fire -- or any fire
+ * while an unadjudicated `unknown` fire holds the WO -- returns `wo_fire_locked`. A duplicate
  * request_id returns the existing row (`exists`); the caller decides replay vs
  * conflict from the stored digest and actor.
  */
@@ -286,13 +287,15 @@ export async function recordReply(
 }
 
 /**
- * A fire for this WO still mid-admission: a `reserved` row whose cascade has not
- * yet been decided. Admissions are NEVER deleted, so an `admitted` row persists
- * long after its run has completed; treating it as live here would permanently
- * refuse every future fire for that WO. Liveness of an admitted fire's run is
- * owned by the actual `remote_agent_workflow_runs` check (hasLiveWorkflowRun),
- * not by this ledger -- so only `reserved` blocks. Excludes the caller's own
- * request_id so a replay does not treat itself as a competitor.
+ * An UNRESOLVED fire for this WO: a `reserved` row (mid-admission) or an
+ * `unknown` row (its effect could not be proven -- a crash or an uncertain
+ * cascade -- so a run may exist that no live-run scan can see yet, or one that
+ * already finished). Both hold the WO lock until resolved; an `unknown` row is
+ * resolved only by operator adjudication (adjudicateUnknownFire). Admissions are
+ * NEVER deleted, so an `admitted` or `refused` row does not block: liveness of
+ * an admitted fire's run is owned by the remote_agent_workflow_runs check
+ * (hasLiveWorkflowRun). Excludes the caller's own request_id so a replay does
+ * not treat itself as a competitor.
  */
 export async function findLiveFireForWo(
   woId: string,
@@ -301,7 +304,7 @@ export async function findLiveFireForWo(
 ): Promise<T3CommandAdmissionRow | null> {
   const result = await db.query<T3CommandAdmissionRow>(
     `SELECT * FROM t3_command_admissions
-     WHERE verb = 'fire' AND wo_id = $1 AND state = 'reserved'
+     WHERE verb = 'fire' AND wo_id = $1 AND state IN ('reserved', 'unknown')
        AND ($2 = '' OR request_id <> $2)
      ORDER BY created_at ASC
      LIMIT 1`,
@@ -340,4 +343,59 @@ export async function listReservedFires(
      ORDER BY created_at ASC`
   );
   return [...result.rows];
+}
+
+export type UnknownFireAdjudication =
+  | { resolution: 'no_run'; adjudicated_by: string; now: string }
+  | { resolution: 'run'; run_id: string; adjudicated_by: string; now: string };
+
+export type AdjudicateUnknownFireResult =
+  | { status: 'adjudicated'; row: T3CommandAdmissionRow }
+  | { status: 'not_found' }
+  | { status: 'not_unknown'; row: T3CommandAdmissionRow };
+
+/**
+ * Operator adjudication of an `unknown` fire -- the ONLY path that releases the
+ * WO fire lock an unknown fire holds (docs/runbooks/t3-command-consumer.md,
+ * "Adjudicating an unknown fire").
+ *
+ *   no_run -> state `refused`, 409 `adjudicated_no_run:<adjudicator>`: the
+ *             operator confirmed no run was created; the WO may be fired again
+ *             by a NEW request.
+ *   run    -> state `admitted`, 200 `ok` with the run id the operator proved;
+ *             the actor then owns that run for cancel-own / approve, and later
+ *             fires are gated by the live-run check like any admitted fire.
+ *
+ * Compare-and-set on state = 'unknown': a row in any other state is returned
+ * unchanged (`not_unknown`). Request identity is never deleted.
+ */
+export async function adjudicateUnknownFire(
+  requestId: string,
+  decision: UnknownFireAdjudication,
+  db: IDatabase = getDatabase()
+): Promise<AdjudicateUnknownFireResult> {
+  const adjudicatedBy = decision.adjudicated_by.trim();
+  if (!adjudicatedBy) throw new Error('t3_adjudicated_by_required');
+  if (decision.resolution === 'run' && !decision.run_id.trim()) {
+    throw new Error('t3_adjudicated_run_id_required');
+  }
+  const result =
+    decision.resolution === 'run'
+      ? await db.query(
+          `UPDATE t3_command_admissions
+             SET state = 'admitted', status_code = 200, code = 'ok',
+                 run_id = $2, updated_at = $3
+           WHERE request_id = $1 AND verb = 'fire' AND state = 'unknown'`,
+          [requestId, decision.run_id.trim(), decision.now]
+        )
+      : await db.query(
+          `UPDATE t3_command_admissions
+             SET state = 'refused', status_code = 409, code = $2, updated_at = $3
+           WHERE request_id = $1 AND verb = 'fire' AND state = 'unknown'`,
+          [requestId, `adjudicated_no_run:${adjudicatedBy}`, decision.now]
+        );
+  const row = await getByRequestId(requestId, db);
+  if (!row) return { status: 'not_found' };
+  if (result.rowCount === 0) return { status: 'not_unknown', row };
+  return { status: 'adjudicated', row };
 }

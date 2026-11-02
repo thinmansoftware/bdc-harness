@@ -34,12 +34,15 @@ CREATE TABLE IF NOT EXISTS t3_command_admissions (
   updated_at TEXT NOT NULL
 );
 
--- Two distinct requests for one WO cannot both be mid-admission: at most one
--- reserved fire per wo_id. A second concurrent fire reservation for the same WO
--- violates this index and is refused 409 live_run.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_live_fire
+-- WO fire lock: at most one UNRESOLVED fire per wo_id. `reserved` is
+-- mid-admission; `unknown` is a fire whose effect could not be proven (crash or
+-- uncertain cascade) and holds the lock until an operator adjudicates it
+-- (adjudicateUnknownFire -> admitted or refused). A second fire reservation for
+-- the same WO violates this index and is refused 409 live_run.
+DROP INDEX IF EXISTS idx_t3_command_admissions_live_fire;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
   ON t3_command_admissions (wo_id)
-  WHERE verb = 'fire' AND state = 'reserved';
+  WHERE verb = 'fire' AND state IN ('reserved', 'unknown');
 
 -- Recipient principal for the consumer (drains the command mailbox and sends
 -- replies) and the T3 VPS bridge sender. Shape copied from migration 065.

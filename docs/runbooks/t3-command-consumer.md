@@ -85,8 +85,11 @@ Status codes: 200 ok, 400 invalid, 403 forbidden, 409 conflict, 422 stale_head.
   and its reply unchanged.
 - fire: refused 409 `live_run` when any `remote_agent_workflow_runs` row in
   status pending/running/paused names the exact WO id (token match), or another
-  fire admission for the WO is reserved. Otherwise runs the same in-process
-  cascade Taskmaster uses (no HTTP self-call, no operator token header).
+  fire admission for the WO is unresolved (`reserved`, or `unknown` awaiting
+  adjudication -- that refusal carries the ORIGINAL admission's request_id in
+  `run_id`, the key to adjudicate). Otherwise runs the cascade (runCascade)
+  in-process (see "In-process execution" below): no HTTP self-call, no
+  operator token header.
 - cancel-own: allowed only when the actor fired that run through this consumer.
 - approve: every binding is derived server-side (ownership, run repo = project
   repo = PR repo, same-repo head ref = run branch, base allowlisted, PR current
@@ -100,6 +103,48 @@ Status codes: 200 ok, 400 invalid, 403 forbidden, 409 conflict, 422 stale_head.
   duplicate fire once the run completes). Any cascade/run id actually observed is
   retained on the row, so a retry replays the same outcome AND the same run
   identity. Never refired automatically; an operator adjudicates.
+- WO fire lock: an `unknown` fire holds the WO exactly like a `reserved` one
+  (partial unique index `idx_t3_command_admissions_wo_fire_lock` on
+  `(wo_id) WHERE verb='fire' AND state IN ('reserved','unknown')`, migration
+  067, mirrored in the SQLite adapter and 000_combined.sql). Every new fire for
+  that WO is refused 409 `live_run` until an operator adjudicates it.
+
+## In-process execution (fire)
+
+The consumer runs `runCascade` with `apiBaseUrl` = `http://archon.in-process`
+and `fetchImpl` = `createInProcessApiFetch(app)`
+(packages/server/src/routes/in-process-authority.ts), wired in
+packages/server/src/index.ts. Every Archon API call the cascade makes
+(codebase lookup, conversation dispatch, run discovery, poll, node timeouts,
+cancel, seat read) is dispatched straight into this process's own router with
+`app.fetch` -- no socket, no network self-call. Authority: the /api auth
+middleware admits a Request only if it was created by that function in this
+process (a WeakSet membership no network request can forge); principal headers
+are stripped on that path and any other origin is refused. No operator token is
+read or sent. Without the in-process dispatcher the consumer refuses to start
+(`cauldron_fire_consumer_in_process_api_missing`).
+
+## Adjudicating an unknown fire (operator)
+
+An `unknown` fire is never refired and holds its WO lock until adjudicated.
+First establish the truth on the event store: did request `<request_id>`
+(its `cascade_id` / `run_id` columns, and `remote_agent_workflow_runs` rows
+naming the WO) create a run? Then, inside archon-app-1:
+
+```
+docker exec -w /app archon-app-1 bun -e "const a = await import('@archon/core/db/t3-command-admissions'); console.log(JSON.stringify(await a.adjudicateUnknownFire('<request_id>', { resolution: 'no_run', adjudicated_by: '<who>', now: new Date().toISOString() })))"
+```
+
+- `resolution: 'no_run'` -> row becomes `refused`, code
+  `adjudicated_no_run:<who>`; the WO lock is released and a NEW request_id may
+  fire it.
+- `resolution: 'run', run_id: '<run id>'` -> row becomes `admitted` 200 `ok`
+  with that run; the original actor owns it for cancel-own / approve and the
+  lock is released (later fires are gated by the live-run check).
+
+Result `status`: `adjudicated`, `not_found`, or `not_unknown` (the row was not
+`unknown`; nothing changed). Adjudication is a compare-and-set and never
+deletes the row.
 
 ## Principal issuance (operator, John's go)
 

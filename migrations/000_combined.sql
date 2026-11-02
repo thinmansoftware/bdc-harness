@@ -912,6 +912,9 @@ CREATE TABLE IF NOT EXISTS t3_command_admissions (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_live_fire
+-- WO fire lock: reserved (mid-admission) and unknown (unproven, awaiting
+-- operator adjudication) fires both hold it (migration 067).
+DROP INDEX IF EXISTS idx_t3_command_admissions_live_fire;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
   ON t3_command_admissions (wo_id)
-  WHERE verb = 'fire' AND state = 'reserved';
+  WHERE verb = 'fire' AND state IN ('reserved', 'unknown');
