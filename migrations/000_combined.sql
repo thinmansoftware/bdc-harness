@@ -618,6 +618,10 @@ VALUES
   -- PR review receipt log. Both drain_on_start mailboxes; nothing claims them.
   ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', TRUE),
   ('pr-review-log', 'PR review receipt log', 'drain_on_start', TRUE),
+  -- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 066): the cauldron-fire
+  -- command consumer mailbox and the t3-bridge VPS sender.
+  ('cauldron-fire', 'T3 command consumer', 'drain_on_start', TRUE),
+  ('t3-bridge', 'T3 VPS bridge sender', 'drain_on_start', TRUE),
   ('operator', 'Operator', 'drain_on_start', TRUE),
   ('xo', 'XO', 'drain_on_start', TRUE),
   ('board', 'Board', 'alias_resolved', TRUE),
@@ -883,3 +887,31 @@ CREATE INDEX IF NOT EXISTS idx_overseer_reconcile_actions_pr_ref
   ON overseer_reconcile_actions(pr_ref);
 CREATE INDEX IF NOT EXISTS idx_overseer_reconcile_actions_action
   ON overseer_reconcile_actions(action);
+
+-- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 066): durable T3 command
+-- admission ledger for the cauldron-fire consumer. Keyed by request_id; rows
+-- are never deleted so request + run identity survive after completion.
+CREATE TABLE IF NOT EXISTS t3_command_admissions (
+  request_id TEXT PRIMARY KEY,
+  actor_principal_id TEXT NOT NULL,
+  verb TEXT NOT NULL CHECK (verb IN ('fire', 'cancel-own', 'approve')),
+  payload_sha256 TEXT NOT NULL,
+  wo_id TEXT,
+  project TEXT,
+  target_run_id TEXT,
+  pr_ref TEXT,
+  head_sha TEXT,
+  thread_id TEXT,
+  source_message_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('reserved', 'admitted', 'refused', 'unknown')),
+  status_code INTEGER,
+  code TEXT,
+  cascade_id TEXT,
+  run_id TEXT,
+  reply_message_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_live_fire
+  ON t3_command_admissions (wo_id)
+  WHERE verb = 'fire' AND state = 'reserved';

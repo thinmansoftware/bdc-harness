@@ -2975,6 +2975,141 @@ async function loadSelectedDispatchMessages(
   };
 }
 
+// WO-HARNESS-T3-COMMAND-CONSUMER-01: run-action primitives shared by the HTTP
+// routes below (behavior unchanged) and the cauldron-fire command consumer.
+// Each returns a discriminated result; the caller maps it to an HTTP response
+// or a Dispatch reply. DB errors throw and are handled by the caller's catch,
+// preserving the routes' existing 500 behavior.
+
+export type CancelWorkflowRunActorResult =
+  | { ok: true; run: WorkflowRun }
+  | { ok: false; status: 400 | 404 | 409 | 422; message: string };
+
+/**
+ * Status-gated cancel used by POST /api/workflows/runs/:runId/cancel (actor
+ * 'api') and the consumer's cancel-own (actor = the principal id). The status
+ * checks, error codes, and the run_cancelled event shape are identical to the
+ * original route body.
+ */
+export async function cancelWorkflowRunAsActor(
+  runId: string,
+  opts: { reason?: string; actor: string }
+): Promise<CancelWorkflowRunActorResult> {
+  const run = await workflowDb.getWorkflowRun(runId);
+  if (!run) {
+    return { ok: false, status: 404, message: 'Workflow run not found' };
+  }
+  if (run.status === 'cancelled') {
+    return { ok: false, status: 409, message: 'Workflow run is already cancelled' };
+  }
+  if (run.status === 'completed' || run.status === 'failed') {
+    return { ok: false, status: 422, message: `Cannot cancel workflow in '${run.status}' status` };
+  }
+  if (run.status !== 'running' && run.status !== 'pending' && run.status !== 'paused') {
+    return { ok: false, status: 400, message: `Cannot cancel workflow in '${run.status}' status` };
+  }
+  const reason = opts.reason?.trim()
+    ? opts.reason
+    : 'API cancellation requested; caller did not supply a reason';
+  await workflowDb.cancelWorkflowRun(runId);
+  void workflowEventDb.createWorkflowEvent({
+    workflow_run_id: runId,
+    event_type: 'run_cancelled',
+    data: { reason, actor: opts.actor },
+  });
+  const updated = await workflowDb.getWorkflowRun(runId);
+  const updatedRun = updated ?? {
+    ...run,
+    status: 'cancelled' as const,
+    completed_at: new Date(),
+  };
+  return { ok: true, run: updatedRun };
+}
+
+export type ApprovePausedWorkflowRunResult =
+  | { ok: true; kind: 'approved'; workflowName: string; autoResumed: boolean }
+  | { ok: true; kind: 'already_approved'; workflowName: string }
+  | { ok: false; status: 400 | 404; message: string };
+
+/**
+ * Approve a paused run used by POST /api/workflows/runs/:runId/approve and the
+ * consumer's approve. Preserves the idempotent already-approved path and the
+ * node_completed / approval_received event shape. `autoResume` is injected: the
+ * route passes tryAutoResumeRun; the consumer passes a no-op (cascade-fired runs
+ * have no web parent, so the real resume would return false regardless).
+ */
+export async function approvePausedWorkflowRun(
+  runId: string,
+  opts: {
+    comment: string;
+    decisionVerb: 'approve_as_is' | 'approve_with_fix';
+    authorizedFixIds: string[];
+    autoResume: (run: WorkflowRun) => Promise<boolean>;
+  }
+): Promise<ApprovePausedWorkflowRunResult> {
+  const run = await workflowDb.getWorkflowRun(runId);
+  if (!run) {
+    getLog().info({ runId }, 'api.workflow_run_approve_not_found');
+    return { ok: false, status: 404, message: 'Workflow run not found' };
+  }
+  const priorResponse = run.metadata.approval_response as string | undefined;
+  if (run.status !== 'paused') {
+    if (priorResponse === 'approved') {
+      getLog().info(
+        { runId, status: run.status },
+        'api.workflow_run_approve_idempotent_already_approved'
+      );
+      return { ok: true, kind: 'already_approved', workflowName: run.workflow_name };
+    }
+    getLog().info({ runId, status: run.status }, 'api.workflow_run_approve_rejected_bad_status');
+    return { ok: false, status: 400, message: `Cannot approve workflow in '${run.status}' status` };
+  }
+  const comment = opts.comment;
+  const decisionVerb = opts.decisionVerb;
+  const authorizedFixIds = opts.authorizedFixIds;
+  const approval = run.metadata.approval as ApprovalContext | undefined;
+  if (!approval?.nodeId) {
+    getLog().warn({ runId }, 'api.workflow_run_approve_missing_context');
+    return {
+      ok: false,
+      status: 400,
+      message: 'Workflow run is paused but missing approval context',
+    };
+  }
+  if (approval.type !== 'interactive_loop') {
+    const nodeOutput =
+      approval.captureResponse === true
+        ? JSON.stringify({
+            decision_verb: decisionVerb,
+            authorized_fix_ids: authorizedFixIds,
+            comment,
+          })
+        : '';
+    await workflowEventDb.createWorkflowEvent({
+      workflow_run_id: runId,
+      event_type: 'node_completed',
+      step_name: approval.nodeId,
+      data: { node_output: nodeOutput, approval_decision: 'approved' },
+    });
+  }
+  await workflowEventDb.createWorkflowEvent({
+    workflow_run_id: runId,
+    event_type: 'approval_received',
+    step_name: approval.nodeId,
+    data: { decision: 'approved', comment },
+  });
+  const metadataUpdate =
+    approval.type === 'interactive_loop'
+      ? { loop_user_input: comment }
+      : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
+  await workflowDb.updateWorkflowRun(runId, {
+    status: 'failed',
+    metadata: metadataUpdate,
+  });
+  const autoResumed = await opts.autoResume(run);
+  return { ok: true, kind: 'approved', workflowName: run.workflow_name, autoResumed };
+}
+
 /**
  * Register all /api/* routes on the Hono app.
  */
@@ -6897,40 +7032,15 @@ export function registerApiRoutes(
   registerOpenApiRoute(cancelWorkflowRunRoute, async c => {
     try {
       const runId = c.req.param('runId') ?? '';
-      const run = await workflowDb.getWorkflowRun(runId);
-      if (!run) {
-        return apiError(c, 404, 'Workflow run not found');
-      }
-      if (run.status === 'cancelled') {
-        return apiError(c, 409, 'Workflow run is already cancelled');
-      }
-      if (run.status === 'completed' || run.status === 'failed') {
-        return apiError(c, 422, `Cannot cancel workflow in '${run.status}' status`);
-      }
-      if (run.status !== 'running' && run.status !== 'pending' && run.status !== 'paused') {
-        return apiError(c, 400, `Cannot cancel workflow in '${run.status}' status`);
-      }
       const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
-      const reason =
-        typeof body.reason === 'string' && body.reason.trim()
-          ? body.reason
-          : 'API cancellation requested; caller did not supply a reason';
-      await workflowDb.cancelWorkflowRun(runId);
-      void workflowEventDb.createWorkflowEvent({
-        workflow_run_id: runId,
-        event_type: 'run_cancelled',
-        data: { reason, actor: 'api' },
-      });
-      const updated = await workflowDb.getWorkflowRun(runId);
-      const updatedRun = updated ?? {
-        ...run,
-        status: 'cancelled' as const,
-        completed_at: new Date().toISOString(),
-      };
+      const result = await cancelWorkflowRunAsActor(runId, { reason: body.reason, actor: 'api' });
+      if (!result.ok) {
+        return apiError(c, result.status, result.message);
+      }
       return c.json({
         success: true,
-        message: `Cancelled workflow: ${run.workflow_name}`,
-        run: updatedRun,
+        message: `Cancelled workflow: ${result.run.workflow_name}`,
+        run: result.run,
       });
     } catch (error) {
       getLog().error({ err: error }, 'cancel_workflow_run_api_failed');
@@ -7418,108 +7528,35 @@ export function registerApiRoutes(
   registerOpenApiRoute(approveWorkflowRunRoute, async c => {
     const runId = c.req.param('runId') ?? '';
     try {
-      const run = await workflowDb.getWorkflowRun(runId);
-      if (!run) {
-        // WO-MC-APPROVE-GATE-RELIABILITY-01: log early-returns. The 2026-06-09
-        // onramp incident left an 8-minute gap with no server-side trace of the
-        // first click. Logging here turns "did the click arrive?" from a guess
-        // into a fact in the archon logs.
-        getLog().info({ runId }, 'api.workflow_run_approve_not_found');
-        return apiError(c, 404, 'Workflow run not found');
-      }
-      // WO-MC-APPROVE-GATE-RELIABILITY-01: idempotency. Users re-click Approve
-      // when the UI looks stuck. Once the gate is approved the route flips the
-      // run to the 'failed' auto-resume sentinel and sets
-      // metadata.approval_response='approved'. A second click then hit the
-      // status!=='paused' guard and got a confusing 400 -- indistinguishable
-      // from a real failure. Recognize the already-approved state and report
-      // success without writing a duplicate approval_received or re-mutating
-      // the run. Only standard approvals carry approval_response; interactive
-      // loops do not, so they fall through to the normal paused-only path.
-      const priorResponse = run.metadata.approval_response as string | undefined;
-      if (run.status !== 'paused') {
-        if (priorResponse === 'approved') {
-          getLog().info(
-            { runId, status: run.status },
-            'api.workflow_run_approve_idempotent_already_approved'
-          );
-          return c.json({
-            success: true,
-            message: `Workflow already approved: ${run.workflow_name}.`,
-          });
-        }
-        getLog().info(
-          { runId, status: run.status },
-          'api.workflow_run_approve_rejected_bad_status'
-        );
-        return apiError(c, 400, `Cannot approve workflow in '${run.status}' status`);
-      }
       // Validate via the route schema so an invalid decision_verb is rejected with
       // 400 BEFORE anything is persisted. The OpenAPI defaultHook (validationErrorHook)
       // returns 400 on a Zod failure before this handler runs; Zod also applies the
       // .default('approve_as_is') so decision_verb is always a valid enum value here.
       const body = getValidatedBody(c, approveWorkflowRunBodySchema);
-      const comment = body.comment ?? 'Approved';
-      const decisionVerb = body.decision_verb; // schema default already applied
-      const authorizedFixIds = body.authorized_fix_ids ?? [];
-      const approval = run.metadata.approval as ApprovalContext | undefined;
-      if (!approval?.nodeId) {
-        getLog().warn({ runId }, 'api.workflow_run_approve_missing_context');
-        return apiError(c, 400, 'Workflow run is paused but missing approval context');
+      // Auto-resume: dispatch to the orchestrator so the workflow continues
+      // without requiring the user to re-run the workflow command. Mirrors what
+      // `workflowApproveCommand` does in the CLI. Requires parent_conversation_id
+      // and a web-platform parent (guarded in the helper).
+      const result = await approvePausedWorkflowRun(runId, {
+        comment: body.comment ?? 'Approved',
+        decisionVerb: body.decision_verb, // schema default already applied
+        authorizedFixIds: body.authorized_fix_ids ?? [],
+        autoResume: run => tryAutoResumeRun(run, 'approve'),
+      });
+      if (!result.ok) {
+        return apiError(c, result.status, result.message);
       }
-      // For interactive loops, do NOT write node_completed -- the executor writes it when
-      // the AI emits the completion signal (actual loop exit). Writing it here would cause
-      // the resume to skip the loop node entirely via priorCompletedNodes.
-      if (approval.type !== 'interactive_loop') {
-        // Design A: persist the graded decision verb + authorized fix ids INTO the
-        // captured node_output as JSON, so the DAG when: evaluator can route on
-        // $<gate>.output.decision_verb with no evaluator change. When the gate did not
-        // capture a response, keep node_output empty (legacy binary contract).
-        const nodeOutput =
-          approval.captureResponse === true
-            ? JSON.stringify({
-                decision_verb: decisionVerb,
-                authorized_fix_ids: authorizedFixIds,
-                comment,
-              })
-            : '';
-        await workflowEventDb.createWorkflowEvent({
-          workflow_run_id: runId,
-          event_type: 'node_completed',
-          step_name: approval.nodeId,
-          data: { node_output: nodeOutput, approval_decision: 'approved' },
+      if (result.kind === 'already_approved') {
+        return c.json({
+          success: true,
+          message: `Workflow already approved: ${result.workflowName}.`,
         });
       }
-      await workflowEventDb.createWorkflowEvent({
-        workflow_run_id: runId,
-        event_type: 'approval_received',
-        step_name: approval.nodeId,
-        data: { decision: 'approved', comment },
-      });
-      // For interactive loops, store user input; for standard approvals, mark as approved
-      // and clear any rejection state.
-      const metadataUpdate =
-        approval.type === 'interactive_loop'
-          ? { loop_user_input: comment }
-          : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
-      await workflowDb.updateWorkflowRun(runId, {
-        status: 'failed',
-        metadata: metadataUpdate,
-      });
-
-      // Auto-resume: dispatch to the orchestrator so the workflow continues
-      // without requiring the user to re-run the workflow command. Mirrors
-      // what `workflowApproveCommand` does in the CLI. Requires
-      // `parent_conversation_id` on the run (set by orchestrator-agent for any
-      // web-dispatched workflow -- foreground, interactive, and background via
-      // the pre-created run) and a web-platform parent (guarded in the helper).
-      const autoResumed = await tryAutoResumeRun(run, 'approve');
-
       return c.json({
         success: true,
-        message: autoResumed
-          ? `Workflow approved: ${run.workflow_name}. Resuming workflow.`
-          : `Workflow approved: ${run.workflow_name}. Send a message to continue.`,
+        message: result.autoResumed
+          ? `Workflow approved: ${result.workflowName}. Resuming workflow.`
+          : `Workflow approved: ${result.workflowName}. Send a message to continue.`,
       });
     } catch (error) {
       getLog().error({ err: error, runId }, 'api.workflow_run_approve_failed');

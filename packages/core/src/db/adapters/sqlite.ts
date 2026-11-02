@@ -1391,6 +1391,10 @@ export class SqliteAdapter implements IDatabase {
         -- WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065 parity)
         ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', 1),
         ('pr-review-log', 'PR review receipt log', 'drain_on_start', 1),
+        -- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 066 parity): the
+        -- cauldron-fire command consumer mailbox and the t3-bridge VPS sender.
+        ('cauldron-fire', 'T3 command consumer', 'drain_on_start', 1),
+        ('t3-bridge', 'T3 VPS bridge sender', 'drain_on_start', 1),
         ('operator', 'Operator', 'drain_on_start', 1),
         ('xo', 'XO', 'drain_on_start', 1),
         ('board', 'Board', 'alias_resolved', 1),
@@ -2726,6 +2730,36 @@ export class SqliteAdapter implements IDatabase {
         CHECK (state <> 'admitted' OR admitted_at IS NOT NULL)
       );
       CREATE INDEX IF NOT EXISTS idx_tm_fire_admissions_day ON tm_fire_admissions(utc_day,state);
+
+      -- Durable T3 command admission ledger (migration 066,
+      -- WO-HARNESS-T3-COMMAND-CONSUMER-01). Hand-maintained mirror of
+      -- migrations/066_t3_command_consumer.sql. Keyed by request_id; rows are
+      -- never deleted so request + run identity survive after completion.
+      CREATE TABLE IF NOT EXISTS t3_command_admissions (
+        request_id TEXT PRIMARY KEY,
+        actor_principal_id TEXT NOT NULL,
+        verb TEXT NOT NULL CHECK (verb IN ('fire','cancel-own','approve')),
+        payload_sha256 TEXT NOT NULL,
+        wo_id TEXT,
+        project TEXT,
+        target_run_id TEXT,
+        pr_ref TEXT,
+        head_sha TEXT,
+        thread_id TEXT,
+        source_message_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('reserved','admitted','refused','unknown')),
+        status_code INTEGER,
+        code TEXT,
+        cascade_id TEXT,
+        run_id TEXT,
+        reply_message_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      -- At most one reserved fire per WO: a second concurrent fire reservation
+      -- for the same wo_id violates this and is refused 409 live_run.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_live_fire
+        ON t3_command_admissions(wo_id) WHERE verb = 'fire' AND state = 'reserved';
 
       -- Per-service GitHub API usage and latest quota state (migration 062).
       CREATE TABLE IF NOT EXISTS github_api_usage (
