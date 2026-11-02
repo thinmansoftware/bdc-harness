@@ -2802,6 +2802,16 @@ export class SqliteAdapter implements IDatabase {
         source TEXT NOT NULL,
         received_at TEXT NOT NULL
       );
+
+      -- review spool single-writer lease (migration 066).
+      CREATE TABLE IF NOT EXISTS review_spool_leases (
+        spool_key TEXT PRIMARY KEY,
+        holder_id TEXT NOT NULL,
+        fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+        acquired_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
     `);
     getLog().info('db.sqlite_schema_initialized');
   }
