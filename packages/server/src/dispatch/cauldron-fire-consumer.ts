@@ -281,6 +281,51 @@ function replayOutcome(row: T3CommandAdmissionRow): ReplyOutcome {
   };
 }
 
+/**
+ * Reconcile a fire whose effect cannot be proven into the ONE in-contract
+ * unknown outcome (cascade threw / returned no run id / admitted-outcome write
+ * failed).
+ *
+ * Reply contract (docs/runbooks/t3-command-consumer.md): reply status is one of
+ * 200 | 400 | 403 | 409 | 422, and an unproven admission is 409
+ * `admission_unknown` -- byte-identical to what startup recovery replies, so a
+ * later retry replays the same in-contract outcome. 5xx is NOT in the contract.
+ * The specific cause stays in the logs (each call site logs a distinct event),
+ * never on the wire.
+ *
+ * Whatever identity was actually observed is persisted, so a retry returns the
+ * executed run/cascade instead of null. The row is NEVER marked refused: that
+ * would release the WO and permit a duplicate fire once the run completes.
+ */
+async function reconcileFireUnknown(
+  deps: CauldronFireConsumerDeps,
+  requestId: string,
+  observed: { cascadeId?: string | null; runId?: string | null },
+  now: string
+): Promise<ReplyOutcome> {
+  await admissions
+    .markUnknown(
+      requestId,
+      {
+        status_code: 409,
+        code: 'admission_unknown',
+        cascade_id: observed.cascadeId ?? null,
+        run_id: observed.runId ?? null,
+        now,
+      },
+      deps.db
+    )
+    // Best effort: if even this write fails the row stays `reserved`, and
+    // startup recovery reconciles it to unknown. Still never refired.
+    .catch(() => undefined);
+  return {
+    status: 409,
+    code: 'admission_unknown',
+    run_id: observed.runId ?? null,
+    cascade_id: observed.cascadeId ?? null,
+  };
+}
+
 function cancelCode(status: number): string {
   if (status === 409) return 'already_cancelled';
   if (status === 422) return 'run_terminal';
@@ -390,16 +435,14 @@ async function handleFire(
     // The cascade invocation threw before returning a result. We cannot prove
     // whether a run was created, so releasing the WO (markRefused) risks a
     // double-fire once any created run completes. Reconcile as `unknown`: the
-    // actor is told admission_unknown and the fire is NEVER refired automatically
-    // (startup recovery / operator adjudicates instead).
+    // actor is told 409 admission_unknown and the fire is NEVER refired
+    // automatically (startup recovery / operator adjudicates instead). No run or
+    // cascade id was observed, so none is recorded.
     log.warn(
       { woId, cause: (error as Error).message.slice(0, 200) },
       'cauldron_fire_cascade_failed'
     );
-    await admissions
-      .markUnknown(cmd.request_id, { status_code: 500, code: 'fire_failed', now }, deps.db)
-      .catch(() => undefined);
-    return { status: 500, code: 'fire_failed' };
+    return reconcileFireUnknown(deps, cmd.request_id, {}, now);
   }
 
   // Command contract: a fire is only `ok` when it yields a verifiable run id
@@ -408,10 +451,7 @@ async function handleFire(
   // is never reported ok and never refired automatically.
   if (!result.runId) {
     log.warn({ woId, cascadeId: result.cascadeId }, 'cauldron_fire_no_run_id');
-    await admissions
-      .markUnknown(cmd.request_id, { status_code: 502, code: 'fire_no_run', now }, deps.db)
-      .catch(() => undefined);
-    return { status: 502, code: 'fire_no_run', cascade_id: result.cascadeId };
+    return reconcileFireUnknown(deps, cmd.request_id, { cascadeId: result.cascadeId }, now);
   }
 
   try {
@@ -430,25 +470,18 @@ async function handleFire(
     // The cascade executed and produced run `result.runId`, but persisting the
     // admitted outcome failed. Do NOT mark refused -- that would release the WO
     // and allow a duplicate fire after the run completes. Reconcile as `unknown`
-    // (best effort; if even that write fails the row stays `reserved` and startup
-    // recovery marks it unknown) so the executed cascade is preserved, never refired.
+    // AND persist the executed cascade/run ids, so a retry replays this run's
+    // identity instead of null.
     log.warn(
       { woId, runId: result.runId, cause: (error as Error).message.slice(0, 200) },
       'cauldron_fire_admit_persist_failed'
     );
-    await admissions
-      .markUnknown(
-        cmd.request_id,
-        { status_code: 500, code: 'fire_admit_unpersisted', now },
-        deps.db
-      )
-      .catch(() => undefined);
-    return {
-      status: 500,
-      code: 'fire_admit_unpersisted',
-      run_id: result.runId,
-      cascade_id: result.cascadeId,
-    };
+    return reconcileFireUnknown(
+      deps,
+      cmd.request_id,
+      { cascadeId: result.cascadeId, runId: result.runId },
+      now
+    );
   }
   return { status: 200, code: 'ok', run_id: result.runId, cascade_id: result.cascadeId };
 }

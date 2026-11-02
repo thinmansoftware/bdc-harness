@@ -93,6 +93,13 @@ Status codes: 200 ok, 400 invalid, 403 forbidden, 409 conflict, 422 stale_head.
   head = stated `head_sha`). Production bases are never allowlisted.
 - Crash safety: a fire left `reserved` at startup is marked `unknown`, replied
   409 `admission_unknown`, and is NEVER refired automatically.
+- Unprovable fire (in-flight): if the cascade throws, returns no run id, or its
+  admitted outcome fails to persist, the admission is reconciled to `unknown` and
+  replied 409 `admission_unknown` -- never a 5xx, since the status set above is
+  closed. It is never marked `refused` (that would release the WO and permit a
+  duplicate fire once the run completes). Any cascade/run id actually observed is
+  retained on the row, so a retry replays the same outcome AND the same run
+  identity. Never refired automatically; an operator adjudicates.
 
 ## Principal issuance (operator, John's go)
 

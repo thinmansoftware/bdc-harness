@@ -231,8 +231,18 @@ const BASE_ENV = {
   T3_COMMAND_APPROVE_BASES: 'thinmansoftware/bdc-harness:dev',
 };
 
-function parseReply(record: ReplyRecord): { status: number; code: string; run_id: string | null } {
-  return JSON.parse(record.body) as { status: number; code: string; run_id: string | null };
+function parseReply(record: ReplyRecord): {
+  status: number;
+  code: string;
+  run_id: string | null;
+  cascade_id: string | null;
+} {
+  return JSON.parse(record.body) as {
+    status: number;
+    code: string;
+    run_id: string | null;
+    cascade_id: string | null;
+  };
 }
 
 /** Seed an admitted fire admission (a prior fire the actor made through the consumer). */
@@ -394,7 +404,7 @@ describe('Test 3b: a completed fire (admitted, run no longer live) does not bloc
 });
 
 describe('Test 3c: a cascade that returns no run id is not replied as success', () => {
-  test('null run id -> unknown admission, non-2xx reply, never admitted', async () => {
+  test('null run id -> unknown admission, in-contract 409, cascade id retained', async () => {
     const world = makeWorld({ ...BASE_ENV });
     world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
     world.fireResults.set('WO-NORUN', { cascadeId: 'CX', status: 'running', runId: null });
@@ -405,12 +415,20 @@ describe('Test 3c: a cascade that returns no run id is not replied as success', 
     });
     await processCommand(world.deps, q);
 
+    // Reply contract (runbook): status is one of 200/400/403/409/422 and an
+    // unproven admission is 409 admission_unknown -- never a 5xx.
     const reply = parseReply(world.replies[world.replies.length - 1]);
-    expect(reply.status).toBe(502);
-    expect(reply.code).toBe('fire_no_run');
+    expect(reply.status).toBe(409);
+    expect(reply.code).toBe('admission_unknown');
     expect(reply.run_id).toBeNull();
+    // The cascade id WAS observed, so it is durably recorded for adjudication.
+    expect(reply.cascade_id).toBe('CX');
     const row = await admissions.getByRequestId('NR', db);
     expect(row?.state).toBe('unknown');
+    expect(row?.status_code).toBe(409);
+    expect(row?.code).toBe('admission_unknown');
+    expect(row?.cascade_id).toBe('CX');
+    expect(row?.run_id).toBeNull();
   });
 });
 
@@ -445,12 +463,35 @@ describe('Test 3d: a persistence failure after an executed cascade is reconciled
 
     // The cascade executed exactly once and must NOT be refused.
     expect(world.calls.fire).toBe(1);
+    // In-contract unknown reply (never a 5xx), carrying the executed run.
     const reply = parseReply(world.replies[world.replies.length - 1]);
-    expect(reply.status).toBe(500);
-    expect(reply.code).toBe('fire_admit_unpersisted');
+    expect(reply.status).toBe(409);
+    expect(reply.code).toBe('admission_unknown');
+    expect(reply.run_id).toBe('R1');
+    expect(reply.cascade_id).toBe('C1');
     const row = await admissions.getByRequestId('PF', db);
     expect(row?.state).toBe('unknown');
     expect(row?.state).not.toBe('refused');
+    // Durable request/run identity: the executed cascade's ids survive the
+    // failed admitted-write, so the ledger still knows which run this request owns.
+    expect(row?.run_id).toBe('R1');
+    expect(row?.cascade_id).toBe('C1');
+
+    // Retry semantics: a later retry of the SAME request_id (new message row, so
+    // a new reply identity) replays the original outcome AND the original run
+    // identity -- never null, and never a second fire.
+    const retry = makeMessage({
+      id: 'cmd-pf-retry',
+      idempotencyKey: 'PF',
+      body: cmdBody({ request_id: 'PF', verb: 'fire', wo_id: 'WO-A', project: 'bdc-harness' }),
+    });
+    await processCommand(world.deps, retry);
+    expect(world.calls.fire).toBe(1);
+    const replayed = parseReply(world.replies[world.replies.length - 1]);
+    expect(replayed.status).toBe(409);
+    expect(replayed.code).toBe('admission_unknown');
+    expect(replayed.run_id).toBe('R1');
+    expect(replayed.cascade_id).toBe('C1');
   });
 });
 

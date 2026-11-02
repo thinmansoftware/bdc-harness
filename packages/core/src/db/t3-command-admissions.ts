@@ -233,16 +233,42 @@ export async function markRefused(
   );
 }
 
+/**
+ * Reconcile an admission to `unknown`: the command's effect cannot be proven
+ * either way, so it is never reported ok and is NEVER refired automatically.
+ *
+ * Any cascade/run identity the caller DID observe is persisted -- a cascade that
+ * executed before the failure already owns a real run, and this ledger is the
+ * only durable record of it. `COALESCE($4, cascade_id)` can only ADD identity:
+ * a caller that observed nothing (startup recovery) leaves whatever the row
+ * already holds intact, so a retry still replays the original run identity.
+ */
 export async function markUnknown(
   requestId: string,
-  outcome: { status_code: number; code: string; now: string },
+  outcome: {
+    status_code: number;
+    code: string;
+    cascade_id?: string | null;
+    run_id?: string | null;
+    now: string;
+  },
   db: IDatabase = getDatabase()
 ): Promise<void> {
   await db.query(
     `UPDATE t3_command_admissions
-       SET state = 'unknown', status_code = $2, code = $3, updated_at = $4
+       SET state = 'unknown', status_code = $2, code = $3,
+           cascade_id = COALESCE($4, cascade_id),
+           run_id = COALESCE($5, run_id),
+           updated_at = $6
      WHERE request_id = $1`,
-    [requestId, outcome.status_code, outcome.code, outcome.now]
+    [
+      requestId,
+      outcome.status_code,
+      outcome.code,
+      outcome.cascade_id ?? null,
+      outcome.run_id ?? null,
+      outcome.now,
+    ]
   );
 }
 
