@@ -54,7 +54,7 @@ const proof: ReviewExecutionProof = {
   headSha: head,
   treeSha: 'b'.repeat(40),
   cwd: '/tmp/checkout',
-  nativePolicy: 'codex_legacy_landlock',
+  nativePolicy: 'codex_bubblewrap',
   nativeVersion: CODEX_JUDGE_CLI_VERSION,
   runtimeUid: 1001,
   inspectionObserved: true,
@@ -143,7 +143,7 @@ describe('sandbox-qualified submit', () => {
       kind: 'pr-review',
       cwd: '/tmp/checkout',
       expectedHeadSha: head,
-      nativePolicy: 'codex_legacy_landlock',
+      nativePolicy: 'codex_bubblewrap',
     });
     expect(transport.argv).toContain('web_search="disabled"');
     expect(transport.argv).toContain('--json');
@@ -239,8 +239,6 @@ describe('bounded broker process capture', () => {
           'bunx',
           '--offline',
           CODEX_JUDGE_CLI_PACKAGE,
-          '--enable',
-          'use_legacy_landlock',
           '-c',
           'web_search="disabled"',
           'exec',

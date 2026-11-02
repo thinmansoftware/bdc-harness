@@ -65,7 +65,7 @@ export interface PrReviewTransportContext {
   readonly kind: 'pr-review';
   readonly cwd: string;
   readonly expectedHeadSha: string;
-  readonly nativePolicy: 'codex_legacy_landlock';
+  readonly nativePolicy: 'codex_bubblewrap';
 }
 
 /** PR-only transport. Shared judge callers continue to use buildJudgeTransport unchanged. */
@@ -84,8 +84,6 @@ export async function buildPrReviewTransport(
     'bunx',
     '--offline',
     CODEX_JUDGE_CLI_PACKAGE,
-    '--enable',
-    'use_legacy_landlock',
     '-c',
     'web_search="disabled"',
     'exec',

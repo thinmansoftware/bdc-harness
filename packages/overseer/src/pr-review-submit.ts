@@ -126,7 +126,7 @@ export interface ReviewExecutionProof {
   readonly headSha: string;
   readonly treeSha: string;
   readonly cwd: string;
-  readonly nativePolicy: 'codex_legacy_landlock';
+  readonly nativePolicy: 'codex_bubblewrap';
   readonly nativeVersion: string;
   readonly runtimeUid: number;
   readonly inspectionObserved: boolean;
@@ -746,7 +746,7 @@ function qualifiesExecution(
   proof: ReviewExecutionProof | undefined
 ): proof is ReviewExecutionProof {
   if (proof?.requestId !== context.requestId || proof.headSha !== context.headSha) return false;
-  if (!proof.inspectionObserved || proof.nativePolicy !== 'codex_legacy_landlock') return false;
+  if (!proof.inspectionObserved || proof.nativePolicy !== 'codex_bubblewrap') return false;
   if (!Number.isInteger(proof.runtimeUid) || proof.runtimeUid === 0 || !proof.treeSha || !proof.cwd)
     return false;
   if (context.checkPlanStatus === 'unsafe') return false;

@@ -438,7 +438,7 @@ describe('WO-HARNESS-OVERSEER-REVIEW-JSONL-VERDICT-01 -- sandboxed PR review arg
       kind: 'pr-review',
       cwd: '/tmp/checkout',
       expectedHeadSha: 'a'.repeat(40),
-      nativePolicy: 'codex_legacy_landlock',
+      nativePolicy: 'codex_bubblewrap',
     });
     expect(transport.argv).toContain(CODEX_JUDGE_CLI_PACKAGE);
     const modelAt = transport.argv.indexOf('--model');

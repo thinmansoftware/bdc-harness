@@ -69,8 +69,6 @@ const PINNED_CODEX_PREFIX = ['bunx', '--offline', `@openai/codex@${CODEX_VERSION
 function isPinnedModelArgv(argv: string[], checkout: string): boolean {
   const expected = [
     ...PINNED_CODEX_PREFIX,
-    '--enable',
-    'use_legacy_landlock',
     '-c',
     'web_search="disabled"',
     'exec',
@@ -298,16 +296,7 @@ export async function processJob(
 
     const command =
       job.prompt === undefined
-        ? [
-            ...PINNED_CODEX_PREFIX,
-            '--enable',
-            'use_legacy_landlock',
-            '-C',
-            checkout,
-            'sandbox',
-            '--',
-            ...job.argv,
-          ]
+        ? [...PINNED_CODEX_PREFIX, '-C', checkout, 'sandbox', '--', ...job.argv]
         : job.argv;
     if (job.prompt !== undefined && !isPinnedModelArgv(command, checkout)) {
       throw new Error('model_argv_invalid');

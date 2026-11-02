@@ -372,7 +372,7 @@ export async function observeReviewExecution(
         headSha: before.headSha,
         treeSha: before.treeSha,
         cwd: before.cwd,
-        nativePolicy: 'codex_legacy_landlock',
+        nativePolicy: 'codex_bubblewrap',
         nativeVersion: CODEX_JUDGE_CLI_VERSION,
         runtimeUid: inspection.uid,
         inspectionObserved: true,
@@ -1273,7 +1273,7 @@ export function createRealSubmitDeps(
                   kind: 'pr-review' as const,
                   cwd: work.executionContext.checkoutPath,
                   expectedHeadSha: work.executionContext.headSha,
-                  nativePolicy: 'codex_legacy_landlock' as const,
+                  nativePolicy: 'codex_bubblewrap' as const,
                 },
               }
             : {}),
