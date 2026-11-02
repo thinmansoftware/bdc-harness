@@ -950,7 +950,8 @@ async function recordCheckoutUse(checkout: string, prNumber: number): Promise<vo
 
 async function listDirectoryNames(path: string): Promise<string[]> {
   try {
-    return await readdir(path);
+    // Sorted: readdir order is filesystem-dependent; passes must be deterministic.
+    return (await readdir(path)).sort();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw error;
