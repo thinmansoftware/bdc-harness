@@ -23,8 +23,7 @@ const CLONE_NEWNET = 0x40000000;
 const COMBINED = 0x78020000;
 
 const SECCOMP_OPT = 'seccomp=./docker/seccomp-archon.json';
-const APPARMOR_OPT = 'apparmor=archon-bwrap';
-const SECURITY_BLOCK = `    security_opt:\n      - ${SECCOMP_OPT}\n      - ${APPARMOR_OPT}\n`;
+const SECURITY_BLOCK = `    security_opt:\n      - ${SECCOMP_OPT}\n`;
 const UPSTREAM_SHA256 = '01536f1d1df938ae611eba20d6349e0de7a99b6ecdee1549427a0b01b8301e28';
 const HASHED_FILES = [
   'docker-compose.yml',
@@ -72,13 +71,13 @@ function cloneScenario(arch, flags, other = 0) {
   return { syscall: 'clone', arch, caps: [], args };
 }
 
-test('pinned baseline keeps the upstream prefix, six-rule suffix, and clone3 errno 38', () => {
+test('pinned baseline keeps the upstream prefix, five-rule suffix, and clone3 errno 38', () => {
   const upstreamBytes = repoBytes('docker/seccomp-upstream-29.3.0.json');
   assert.equal(createHash('sha256').update(upstreamBytes).digest('hex'), UPSTREAM_SHA256);
   const { upstream, archon } = loadProfiles();
   verifyDelta(upstream, archon);
   assert.deepEqual(archon.syscalls.slice(0, upstream.syscalls.length), upstream.syscalls);
-  assert.equal(archon.syscalls.length, upstream.syscalls.length + 6);
+  assert.equal(archon.syscalls.length, upstream.syscalls.length + 5);
   const clone3 = upstream.syscalls.find(
     rule => rule.names?.includes('clone3') && rule.action === 'SCMP_ACT_ERRNO'
   );
@@ -97,11 +96,12 @@ test('compose wires the profile only on the app service', () => {
   assert.equal(text.split(SECCOMP_OPT).length - 1, 1);
   verifyComposeYaml(text);
   const doc = parseYaml(text);
-  assert.deepEqual(doc.services.app.security_opt, [SECCOMP_OPT, APPARMOR_OPT]);
+  assert.deepEqual(doc.services.app.security_opt, [SECCOMP_OPT]);
   assert.equal(doc.services.app.privileged, undefined);
   assert.equal(doc.services.app.cap_add, undefined);
   for (const option of doc.services.app.security_opt) {
     assert.equal(String(option).toLowerCase().includes('unconfined'), false);
+    assert.equal(String(option).toLowerCase().includes('apparmor'), false);
   }
   for (const [name, service] of Object.entries(doc.services)) {
     if (name === 'app') continue;
@@ -187,7 +187,7 @@ test('s390 uses argument index 1 and amd64 uses argument index 0', () => {
   );
 });
 
-test('clone3, unshare, bwrap mount syscalls, and setns keep their bounded results', () => {
+test('clone3, unshare, mount, umount2, and setns keep their bounded results', () => {
   const { archon } = loadProfiles();
   for (const arch of ['amd64', 's390x']) {
     assert.deepEqual(decide(archon, { syscall: 'clone3', arch, caps: [], args: [] }), {
@@ -197,15 +197,12 @@ test('clone3, unshare, bwrap mount syscalls, and setns keep their bounded result
     assert.deepEqual(decide(archon, { syscall: 'unshare', arch, caps: [], args: [] }), {
       action: 'ALLOW',
     });
-    for (const syscall of ['mount', 'umount2', 'pivot_root']) {
+    for (const syscall of ['mount', 'umount2', 'setns']) {
       assert.deepEqual(decide(archon, { syscall, arch, caps: [], args: [] }), {
-        action: 'ALLOW',
+        action: 'DEFAULT',
+        errno: 1,
       });
     }
-    assert.deepEqual(decide(archon, { syscall: 'setns', arch, caps: [], args: [] }), {
-      action: 'DEFAULT',
-      errno: 1,
-    });
   }
   assert.deepEqual(
     decide(archon, { syscall: 'clone3', arch: 'amd64', caps: ['CAP_SYS_ADMIN'], args: [] }),
@@ -301,20 +298,6 @@ test('added mount rule is rejected', () => {
   });
 });
 
-test('dropped bwrap mount rule is rejected', () => {
-  assertRejected(pair => {
-    pair.archon.syscalls = pair.archon.syscalls.filter(rule => !rule.names?.includes('pivot_root'));
-  });
-});
-
-test('widened bwrap mount rule is rejected', () => {
-  assertRejected(pair => {
-    const rule = suffixOf(pair).find(item => item.names?.includes('pivot_root'));
-    assert.ok(rule);
-    rule.names.push('setns');
-  });
-});
-
 test('added umount2 rule is rejected', () => {
   assertRejected(pair => {
     pair.archon.syscalls.push({ names: ['umount2'], action: 'SCMP_ACT_ALLOW' });
@@ -372,14 +355,6 @@ test('apparmor unconfined is rejected', () => {
   const text = repoText('docker-compose.yml').replace(
     SECURITY_BLOCK,
     `    security_opt:\n      - ${SECCOMP_OPT}\n      - apparmor=unconfined\n`
-  );
-  assert.throws(() => verifyComposeYaml(text));
-});
-
-test('missing archon-bwrap AppArmor profile is rejected', () => {
-  const text = repoText('docker-compose.yml').replace(
-    SECURITY_BLOCK,
-    `    security_opt:\n      - ${SECCOMP_OPT}\n`
   );
   assert.throws(() => verifyComposeYaml(text));
 });

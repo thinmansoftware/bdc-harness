@@ -770,13 +770,6 @@
     {
       "names": ["unshare"],
       "action": "SCMP_ACT_ALLOW"
-    },
-    {
-      "names": ["mount", "umount2", "pivot_root"],
-      "action": "SCMP_ACT_ALLOW",
-      "excludes": {
-        "caps": ["CAP_SYS_ADMIN"]
-      }
     }
   ]
 }

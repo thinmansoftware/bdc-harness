@@ -103,12 +103,6 @@ RUN apt-get update && apt-get install -y \
     # `|| echo` swallowing real errors). Static-check that class before a run
     # spends 20 minutes discovering it.
     shellcheck \
-    # bubblewrap: codex >= 0.159 builds the Overseer reviewer sandbox with
-    # bwrap (legacy Landlock refuses a restricted filesystem policy). Not
-    # setuid on Debian; it relies on unprivileged user namespaces, and the
-    # AppArmor profile docker/apparmor/archon-bwrap lets only /usr/bin/bwrap
-    # mount (WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01).
-    bubblewrap \
     postgresql-client \
     # Required by Python WO tests; keep the distro-managed pytest runtime.
     python3-pytest \
@@ -118,10 +112,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     # Debian ships fd-find's binary as `fdfind` (name clash with an unrelated
     # package). Agents and docs say `fd`, so expose it under the expected name.
-    && ln -sf "$(command -v fdfind)" /usr/local/bin/fd \
-    && test "$(command -v bwrap)" = /usr/bin/bwrap \
-    && test ! -u /usr/bin/bwrap \
-    && bwrap --version
+    && ln -sf "$(command -v fdfind)" /usr/local/bin/fd
 
 # Install GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
