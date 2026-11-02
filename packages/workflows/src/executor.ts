@@ -1476,11 +1476,14 @@ export async function executeWorkflow(
               };
               const declaredProvider =
                 declared.failover_provider ?? executableWorkflow.failover_provider;
-              const model =
-                route.toProvider === declaredProvider
-                  ? (declared.failover_model ?? executableWorkflow.failover_model)
-                  : undefined;
-              return buildSeatRerouteNode(node, route.toProvider, model, declared.failover_agent);
+              // failover_model and failover_agent belong to the declared failover route; when a
+              // different provider was selected, keep the original persona and no model pin.
+              const onDeclaredRoute = route.toProvider === declaredProvider;
+              const model = onDeclaredRoute
+                ? (declared.failover_model ?? executableWorkflow.failover_model)
+                : undefined;
+              const agent = onDeclaredRoute ? declared.failover_agent : undefined;
+              return buildSeatRerouteNode(node, route.toProvider, model, agent);
             }),
           };
           for (const [nodeId, route] of routes) {

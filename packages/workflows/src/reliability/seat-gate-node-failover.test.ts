@@ -495,6 +495,44 @@ describe('node-level seat reroute', () => {
     }
   });
 
+  test('failover_agent_ignored_when_declared_provider_not_selected', async () => {
+    setSeatUsageReaderForTests(async () => ({
+      claude: reading('claude', 'seven_day', 96),
+      codex: reading('codex', 'primary', 10),
+      cursor: reading('cursor', 'monthly', 96),
+    }));
+    const other = PERSONA.replace(
+      'name: reroute-claude-persona',
+      'name: other-failover-persona'
+    ).replace('REROUTE-PERSONA-INSTRUCTIONS', 'OTHER-FAILOVER-INSTRUCTIONS');
+    const { store } = await run(
+      stubLane(
+        'codex',
+        claudeNodes({
+          agent: 'reroute-claude-persona',
+          failover_provider: 'cursor',
+          failover_agent: 'other-failover-persona',
+        })
+      ),
+      {
+        personaFiles: {
+          'reroute-claude-persona.md': PERSONA,
+          'other-failover-persona.md': other,
+        },
+      }
+    );
+    const failovers = events(store, 'node_failover');
+    expect(failovers).toHaveLength(2);
+    for (const event of failovers) expect(event.data.to_provider).toBe('codex');
+    const review = invocations.filter(call => call.prompt.startsWith('review-'));
+    expect(review.map(call => call.provider).sort()).toEqual(['codex', 'codex']);
+    for (const call of review) {
+      // The declared cursor route was exhausted, so its persona must not replace the original.
+      expect(call.systemPrompt ?? '').toContain('REROUTE-PERSONA-INSTRUCTIONS');
+      expect(call.systemPrompt ?? '').not.toContain('OTHER-FAILOVER-INSTRUCTIONS');
+    }
+  });
+
   test('rerouted_node_uses_reroute_target_not_user_model_override', async () => {
     setSeatUsageReaderForTests(async () => ({
       claude: reading('claude', 'seven_day', 96),
