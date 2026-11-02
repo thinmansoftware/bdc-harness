@@ -4970,7 +4970,12 @@ nodes:
       # existing-pr-base-guard: end
       # superseded-pr-close: begin
       # Close open PRs on this run's working branch once the run PR URL is known.
-      # Never close the run PR, and never close a PR on any other branch.
+      # Never close the run PR, never close a PR on any other branch, and never
+      # close a PR whose author is not this run's builder App. ACTING_LOGIN is
+      # matched after normalizing app/<slug> and <slug>[bot] to the same slug.
+      # Candidates are queried server-side by head+base and paginated to the
+      # last page. A global open-PR list with --limit is not used: it silently
+      # drops matches past the cap.
       # A close failure is logged and does not fail this node.
       WORKING_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
       if [ -z "$WORKING_BRANCH" ] || [ "$WORKING_BRANCH" = "HEAD" ]; then
@@ -5018,8 +5023,18 @@ nodes:
           if [ -z "$RUN_PR_NUM" ]; then
             echo "WARN: superseded-pr-close: could not parse run PR number from URL; skipping close" >&2
           else
-            cand_raw=$(gh pr list --repo "$REPO" --state open --limit 200 --json number,headRefName,baseRefName,url 2>/dev/null || true)
-            CANDIDATES=$(CAND_RAW="$cand_raw" WORKING_BRANCH="$WORKING_BRANCH" BASE_BRANCH="$BASE_BRANCH" UNIQUE_BRANCH="$UNIQUE_BRANCH" RUN_PR_NUM="$RUN_PR_NUM" python3 -c "$(cat <<'PY'
+            if [ -z "${ACTING_LOGIN:-}" ]; then
+              echo "WARN: superseded-pr-close: builder author unresolved; skipping close" >&2
+              echo "superseded_pr_none"
+            else
+              REPO_OWNER="${REPO%%/*}"
+              cand_raw=$(gh api --paginate --slurp --method GET "repos/${REPO}/pulls" \
+                -f state=open \
+                -f "head=${REPO_OWNER}:${WORKING_BRANCH}" \
+                -f "base=${BASE_BRANCH}" \
+                -F per_page=100 \
+                2>/dev/null || true)
+              CANDIDATES=$(CAND_RAW="$cand_raw" WORKING_BRANCH="$WORKING_BRANCH" BASE_BRANCH="$BASE_BRANCH" UNIQUE_BRANCH="$UNIQUE_BRANCH" RUN_PR_NUM="$RUN_PR_NUM" ACTING_LOGIN="$ACTING_LOGIN" python3 -c "$(cat <<'PY'
       import json, os, sys
       raw = os.environ.get("CAND_RAW", "").strip()
       if not raw:
@@ -5030,18 +5045,56 @@ nodes:
           raise SystemExit(0)
       if not isinstance(data, list):
           raise SystemExit(0)
+
+      def flatten(pages):
+          if pages and all(isinstance(page, list) for page in pages):
+              items = []
+              for page in pages:
+                  items.extend(page)
+              return items
+          return pages
+
+      def text_field(item, key):
+          value = item.get(key) or ""
+          if not isinstance(value, str):
+              return ""
+          return value
+
+      def nested_text(item, outer, inner):
+          child = item.get(outer)
+          if not isinstance(child, dict):
+              return ""
+          value = child.get(inner) or ""
+          if not isinstance(value, str):
+              return ""
+          return value
+
+      def norm_login(value):
+          if not isinstance(value, str):
+              return ""
+          text = value.strip().lower()
+          if text.startswith("app/"):
+              text = text[4:]
+          if text.endswith("[bot]"):
+              text = text[:-5]
+          return text
+
+      want_author = norm_login(os.environ.get("ACTING_LOGIN", ""))
+      if not want_author:
+          raise SystemExit(0)
       want_head = os.environ.get("WORKING_BRANCH", "")
       want_base = os.environ.get("BASE_BRANCH", "")
       unique = os.environ.get("UNIQUE_BRANCH", "")
       run_num = os.environ.get("RUN_PR_NUM", "")
       nums = []
-      for item in data:
+      for item in flatten(data):
           if not isinstance(item, dict):
               continue
-          head = item.get("headRefName")
+          head = nested_text(item, "head", "ref") or text_field(item, "headRefName")
           if head != want_head:
               continue
-          if item.get("baseRefName") != want_base:
+          base = nested_text(item, "base", "ref") or text_field(item, "baseRefName")
+          if base != want_base:
               continue
           if head == unique:
               continue
@@ -5049,6 +5102,9 @@ nodes:
           if isinstance(number, bool) or not isinstance(number, int):
               continue
           if str(number) == run_num:
+              continue
+          author = nested_text(item, "user", "login") or nested_text(item, "author", "login")
+          if norm_login(author) != want_author:
               continue
           nums.append(str(number))
       sys.stdout.write("\n".join(nums))
@@ -5074,6 +5130,7 @@ nodes:
               done <<EOF
       $CANDIDATES
       EOF
+            fi
             fi
           fi
         fi

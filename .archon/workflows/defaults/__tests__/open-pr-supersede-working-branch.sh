@@ -100,26 +100,50 @@ RUN_JSON_DEFAULT='[
   {"number": 88, "url": "https://github.com/thinmansoftware/bdc-harness/pull/88", "headRefName": "other-decoy", "baseRefName": "dev"}
 ]'
 
+BUILDER_AUTHOR="fixture-builder[bot]"
+
 CAND_JSON_DEFAULT='[
-  {"number": 11, "headRefName": "feat/wo-one-pr-thread-abc", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/11"},
-  {"number": 10, "headRefName": "archon/task-web-worker-x", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/10"}
+  {"number": 11, "headRefName": "feat/wo-one-pr-thread-abc", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/11", "user": {"login": "fixture-builder[bot]"}},
+  {"number": 10, "headRefName": "archon/task-web-worker-x", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/10", "user": {"login": "fixture-builder[bot]"}}
 ]'
 
 CAND_JSON_WITH_OTHERS='[
-  {"number": 12, "headRefName": "unrelated-branch", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/12"},
-  {"number": 13, "headRefName": "archon/task-web-worker-x", "baseRefName": "staging", "url": "https://github.com/thinmansoftware/bdc-harness/pull/13"},
-  {"number": 11, "headRefName": "feat/wo-one-pr-thread-abc", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/11"},
-  {"number": 10, "headRefName": "archon/task-web-worker-x", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/10"}
+  {"number": 12, "headRefName": "unrelated-branch", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/12", "user": {"login": "fixture-builder[bot]"}},
+  {"number": 13, "headRefName": "archon/task-web-worker-x", "baseRefName": "staging", "url": "https://github.com/thinmansoftware/bdc-harness/pull/13", "user": {"login": "fixture-builder[bot]"}},
+  {"number": 11, "headRefName": "feat/wo-one-pr-thread-abc", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/11", "user": {"login": "fixture-builder[bot]"}},
+  {"number": 10, "headRefName": "archon/task-web-worker-x", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/10", "user": {"login": "fixture-builder[bot]"}}
 ]'
 
 CAND_JSON_NONE='[
-  {"number": 11, "headRefName": "feat/wo-one-pr-thread-abc", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/11"},
-  {"number": 12, "headRefName": "unrelated-branch", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/12"}
+  {"number": 11, "headRefName": "feat/wo-one-pr-thread-abc", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/11", "user": {"login": "fixture-builder[bot]"}},
+  {"number": 12, "headRefName": "unrelated-branch", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/12", "user": {"login": "fixture-builder[bot]"}}
 ]'
 
 CAND_JSON_SAME_HEAD='[
-  {"number": 10, "headRefName": "feat/wo-one-pr-thread-abc", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/10"},
-  {"number": 11, "headRefName": "feat/wo-one-pr-thread-abc", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/11"}
+  {"number": 10, "headRefName": "feat/wo-one-pr-thread-abc", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/10", "user": {"login": "fixture-builder[bot]"}},
+  {"number": 11, "headRefName": "feat/wo-one-pr-thread-abc", "baseRefName": "dev", "url": "https://github.com/thinmansoftware/bdc-harness/pull/11", "user": {"login": "fixture-builder[bot]"}}
+]'
+
+# REST pull shape (gh api /pulls). Same head+base, other author must stay open.
+# app/Fixture-Builder is the same builder App as fixture-builder[bot].
+CAND_JSON_OTHER_AUTHOR='[
+  {"number": 10, "html_url": "https://github.com/thinmansoftware/bdc-harness/pull/10", "head": {"ref": "archon/task-web-worker-x"}, "base": {"ref": "dev"}, "user": {"login": "fixture-builder[bot]"}},
+  {"number": 14, "html_url": "https://github.com/thinmansoftware/bdc-harness/pull/14", "head": {"ref": "archon/task-web-worker-x"}, "base": {"ref": "dev"}, "user": {"login": "other-human"}},
+  {"number": 15, "html_url": "https://github.com/thinmansoftware/bdc-harness/pull/15", "head": {"ref": "archon/task-web-worker-x"}, "base": {"ref": "dev"}, "user": {"login": "app/Fixture-Builder"}},
+  {"number": 16, "html_url": "https://github.com/thinmansoftware/bdc-harness/pull/16", "head": {"ref": "archon/task-web-worker-x"}, "base": {"ref": "dev"}, "user": null}
+]'
+
+# --paginate --slurp returns one JSON array per page, wrapped. Page 2 holds the
+# only builder PR; a same-branch PR by someone else is on both pages.
+CAND_JSON_PAGES='[
+  [
+    {"number": 14, "html_url": "https://github.com/thinmansoftware/bdc-harness/pull/14", "head": {"ref": "archon/task-web-worker-x"}, "base": {"ref": "dev"}, "user": {"login": "other-human"}},
+    {"number": 30, "html_url": "https://github.com/thinmansoftware/bdc-harness/pull/30", "head": {"ref": "unrelated-branch"}, "base": {"ref": "dev"}, "user": {"login": "fixture-builder[bot]"}}
+  ],
+  [
+    {"number": 21, "html_url": "https://github.com/thinmansoftware/bdc-harness/pull/21", "head": {"ref": "archon/task-web-worker-x"}, "base": {"ref": "dev"}, "user": {"login": "fixture-builder[bot]"}},
+    {"number": 22, "html_url": "https://github.com/thinmansoftware/bdc-harness/pull/22", "head": {"ref": "archon/task-web-worker-x"}, "base": {"ref": "dev"}, "user": {"login": "someone-else[bot]"}}
+  ]
 ]'
 
 RUN_JSON_TRAP='[
@@ -148,6 +172,7 @@ reset_case() {
   EXIST_URL=""
   RUN_JSON="$RUN_JSON_DEFAULT"
   CAND_JSON="$CAND_JSON_DEFAULT"
+  ACTING="$BUILDER_AUTHOR"
 }
 
 run_block() {
@@ -188,6 +213,10 @@ if [ "$1" = "pr" ] && [ "$2" = "comment" ]; then
 fi
 if [ "$1" = "pr" ] && [ "$2" = "close" ]; then
   exit "${GH_CLOSE_RC:-0}"
+fi
+if [ "$1" = "api" ]; then
+  cat "$GH_CAND_JSON"
+  exit 0
 fi
 echo "unexpected gh invocation: $*" >&2
 exit 1
@@ -232,6 +261,11 @@ EOF
     else
       unset EXIST
     fi
+    if [ -n "$ACTING" ]; then
+      export ACTING_LOGIN="$ACTING"
+    else
+      unset ACTING_LOGIN
+    fi
     bash "$script"
   ) >"$out_file" 2>"$err_file"
   LAST_RC=$?
@@ -269,11 +303,28 @@ head_list_count() {
   '
 }
 
+api_call() {
+  printf '%s\n' "$LAST_LOG" | awk -F '\t' '
+    $1 == "CALL" && $2 == "api" { print; exit }
+  '
+}
+
+api_count() {
+  printf '%s\n' "$LAST_LOG" | awk -F '\t' '
+    $1 == "CALL" && $2 == "api" { c++ }
+    END { print c + 0 }
+  '
+}
+
 echo "--- Block shape ---"
 assert_contains "literal workflow id expansion" '$WORKFLOW_ID' "$BLOCK"
 assert_contains "working branch lookup" 'git rev-parse --abbrev-ref HEAD' "$BLOCK"
 assert_not_contains "no checkout of UNIQUE_BRANCH" 'git checkout' "$BLOCK"
 assert_not_contains "close does not delete the branch" '--delete-branch' "$BLOCK"
+assert_contains "candidates are paginated" 'gh api --paginate --slurp --method GET' "$BLOCK"
+assert_contains "candidates are filtered by head server-side" 'head=${REPO_OWNER}:${WORKING_BRANCH}' "$BLOCK"
+assert_contains "builder author is compared" 'norm_login' "$BLOCK"
+assert_not_contains "no capped global open list" 'gh pr list --repo "$REPO" --state open --limit 200 --json number,headRefName,baseRefName,url' "$BLOCK"
 
 echo "--- Test 1: builder PR on the working branch is closed as superseded ---"
 reset_case
@@ -285,6 +336,12 @@ assert_eq "test1 comment body" "$EXPECTED_BODY" "$(comment_body 10)"
 assert_eq "test1 close targets" "10" "$(close_numbers)"
 assert_eq "test1 comment targets" "10" "$(comment_numbers)"
 assert_eq "test1 fallback list used" "1" "$(head_list_count)"
+assert_eq "test1 candidate query count" "1" "$(api_count)"
+assert_contains "test1 paginates" "--paginate" "$(api_call)"
+assert_contains "test1 slurps every page" "--slurp" "$(api_call)"
+assert_contains "test1 server-side head" "head=thinmansoftware:archon/task-web-worker-x" "$(api_call)"
+assert_contains "test1 server-side base" "base=dev" "$(api_call)"
+assert_not_contains "test1 candidate query has no limit" "--limit" "$(api_call)"
 assert_not_contains "test1 log has no close 11" $'\tclose\t11\t' "$LAST_LOG"
 
 echo "--- Test 2: other branches and other bases are never touched ---"
@@ -411,6 +468,46 @@ assert_eq "test13 stdout" "superseded_pr_closed:10" "$LAST_OUT"
 assert_contains "test13 comment warn" "comment failed for #10" "$LAST_ERR"
 assert_not_contains "test13 no comment-failure stdout token" "comment_failed" "$LAST_OUT"
 assert_eq "test13 close targets" "10" "$(close_numbers)"
+
+echo "--- Test 14: same branch and base from another author is untouched ---"
+reset_case
+CAND_JSON="$CAND_JSON_OTHER_AUTHOR"
+run_block
+assert_eq "test14 exit" "0" "$LAST_RC"
+assert_eq "test14 stdout" "$(printf '%s\n' "superseded_pr_closed:10" "superseded_pr_closed:15")" "$LAST_OUT"
+assert_eq "test14 close targets" "$(printf '%s\n' "10" "15")" "$(close_numbers)"
+assert_eq "test14 comment targets" "$(printf '%s\n' "10" "15")" "$(comment_numbers)"
+assert_not_contains "test14 no close 14" $'\tclose\t14\t' "$LAST_LOG"
+assert_not_contains "test14 no comment 14" $'\tcomment\t14\t' "$LAST_LOG"
+assert_not_contains "test14 no close 16" $'\tclose\t16\t' "$LAST_LOG"
+assert_not_contains "test14 no comment 16" $'\tcomment\t16\t' "$LAST_LOG"
+assert_contains "test14 still queries the working branch" "head=thinmansoftware:archon/task-web-worker-x" "$(api_call)"
+
+echo "--- Test 15: a later page is closed and other authors on every page stay open ---"
+reset_case
+CAND_JSON="$CAND_JSON_PAGES"
+run_block
+assert_eq "test15 exit" "0" "$LAST_RC"
+assert_eq "test15 stdout" "superseded_pr_closed:21" "$LAST_OUT"
+assert_eq "test15 close targets" "21" "$(close_numbers)"
+assert_eq "test15 comment targets" "21" "$(comment_numbers)"
+assert_not_contains "test15 no close 14" $'\tclose\t14\t' "$LAST_LOG"
+assert_not_contains "test15 no close 22" $'\tclose\t22\t' "$LAST_LOG"
+assert_not_contains "test15 no close 30" $'\tclose\t30\t' "$LAST_LOG"
+assert_contains "test15 paginates" "--paginate" "$(api_call)"
+assert_not_contains "test15 no limit cap" "--limit" "$(api_call)"
+
+echo "--- Test 16: unresolved builder author closes nothing ---"
+reset_case
+ACTING=""
+CAND_JSON="$CAND_JSON_OTHER_AUTHOR"
+run_block
+assert_eq "test16 exit" "0" "$LAST_RC"
+assert_eq "test16 stdout" "superseded_pr_none" "$LAST_OUT"
+assert_eq "test16 close targets" "" "$(close_numbers)"
+assert_eq "test16 comment targets" "" "$(comment_numbers)"
+assert_eq "test16 no candidate query" "0" "$(api_count)"
+assert_contains "test16 warns" "builder author unresolved" "$LAST_ERR"
 
 echo ""
 echo "RESULTS: ${PASS} passed, ${FAIL} failed"
