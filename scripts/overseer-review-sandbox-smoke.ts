@@ -2,12 +2,19 @@ import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promise
 import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { CODEX_JUDGE_CLI_VERSION } from '../packages/overseer/src/judge-transport';
+import { prepareModelWorkingCopy } from './overseer-reviewer-broker';
 
 const SPOOL = '/var/lib/overseer-review';
 /**
  * codex >= 0.159 refuses legacy Landlock for a restricted filesystem policy and
  * builds the sandbox with bubblewrap instead. `--reviewer-bwrap` proves that
  * path as the reviewer user (WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01).
+ *
+ * `--reviewer-bwrap` also runs the judge's own policy (`--sandbox
+ * workspace-write`, network off) on the reviewer-only working copy the broker
+ * builds from a sealed checkout, and prints a line ending `workspace-write`
+ * (WO-HARNESS-REVIEW-JUDGE-WORKSPACE-WRITABLE-01). CI (test.yml, docker-build)
+ * runs it as `docker exec --user reviewer ... --reviewer-bwrap` and greps both lines.
  */
 const BWRAP_CODEX_VERSION = CODEX_JUDGE_CLI_VERSION;
 
@@ -123,8 +130,72 @@ async function reviewerBwrapSmoke(): Promise<void> {
     console.log(
       `overseer-review-sandbox-smoke: ok uid=1002 codex=${BWRAP_CODEX_VERSION} policy=bubblewrap`
     );
+
+    // The judge's own policy (#4291): `exec --sandbox workspace-write` with the
+    // network off. bwrap must create mount points (`.agents`) in the workspace
+    // root, which a sealed checkout refuses, so the broker runs model jobs in a
+    // reviewer-only working copy. Prove that copy starts the judge's sandbox.
+    const sealed = join(root, 'sealed');
+    await mkdir(sealed, { mode: 0o700 });
+    await writeFile(join(sealed, 'allowed.txt'), 'allowed\n', { mode: 0o600 });
+    const git = (args: string[]): Promise<void> =>
+      command([
+        'git',
+        '-C',
+        sealed,
+        '-c',
+        'user.name=smoke',
+        '-c',
+        'user.email=smoke@example.invalid',
+        ...args,
+      ]);
+    await git(['init', '-q']);
+    await git(['add', 'allowed.txt']);
+    await git(['commit', '-qm', 'fixture']);
+    const headRun = await run(['git', '-C', sealed, 'rev-parse', 'HEAD'], { env });
+    const head = headRun.stdout.trim();
+    await command(['chmod', '-R', 'a-w', sealed]);
+    const workspaceWrite = [
+      ...codex,
+      '-c',
+      'sandbox_mode="workspace-write"',
+      '-c',
+      'sandbox_workspace_write.network_access=false',
+    ];
+    const control = await run([...workspaceWrite, '-C', sealed, 'sandbox', '--', '/bin/true'], {
+      cwd: sealed,
+      env,
+    });
+    console.log(
+      `overseer-review-sandbox-smoke: control sealed-checkout workspace-write exit=${control.code}`
+    );
+    const scratch = join(root, 'job.scratch');
+    await mkdir(scratch, { mode: 0o700 });
+    const copy = await prepareModelWorkingCopy(sealed, scratch, head, env);
+    const judgeProbe = probe.replace(
+      'echo BWRAP_PROBE_OK',
+      'printf w > judge-write.txt && test "$(cat judge-write.txt)" = w\necho BWRAP_PROBE_OK'
+    );
+    const judge = await run(
+      [...workspaceWrite, '-C', copy, 'sandbox', '--', '/bin/sh', '-c', judgeProbe],
+      {
+        cwd: copy,
+        env,
+      }
+    );
+    const judgeOutput = `${judge.stdout}${judge.stderr}`;
+    if (/Can't mkdir|requires bubblewrap|panicked/.test(judgeOutput))
+      throw new Error(`judge_sandbox_failed:${judgeOutput}`);
+    if (judge.code !== 0 || !judge.stdout.includes('BWRAP_PROBE_OK'))
+      throw new Error(`judge_sandbox_failed:exit=${judge.code}:${judgeOutput}`);
+    if ((await readFile(outside, 'utf8')) !== 'outside-control\n')
+      throw new Error('sandbox_forbidden_write_succeeded');
+    console.log(
+      `overseer-review-sandbox-smoke: ok uid=1002 codex=${BWRAP_CODEX_VERSION} policy=bubblewrap workspace-write`
+    );
   } finally {
     server.close();
+    await command(['chmod', '-R', 'u+w', root]).catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 }

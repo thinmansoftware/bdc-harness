@@ -273,6 +273,8 @@ jobs:
           docker exec --user reviewer archon-smoke env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/reviewer \
             bun run /app/scripts/overseer-review-sandbox-smoke.ts --reviewer-bwrap | tee "$RUNNER_TEMP/bwrap-smoke.txt"
           grep -F 'overseer-review-sandbox-smoke: ok uid=1002 codex=0.159.2' "$RUNNER_TEMP/bwrap-smoke.txt"
+          # The judge's workspace-write policy starts on the broker's working copy (#4291).
+          grep -F 'policy=bubblewrap workspace-write' "$RUNNER_TEMP/bwrap-smoke.txt"
 
       - name: Dump container logs on failure
         if: failure()

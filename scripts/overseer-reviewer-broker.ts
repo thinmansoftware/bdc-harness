@@ -89,6 +89,52 @@ function isPinnedModelArgv(argv: string[], checkout: string): boolean {
   return argv[expected.length] === '--model' && typeof model === 'string' && model.length > 0;
 }
 
+/** Model jobs only: point the pinned argv's --cd at the reviewer's working copy. */
+export function rebindModelArgv(argv: string[], checkout: string, workingCopy: string): string[] {
+  const index = argv.indexOf('--cd');
+  if (index < 0 || argv[index + 1] !== checkout) throw new Error('model_argv_invalid');
+  return argv.map((value, position) => (position === index + 1 ? workingCopy : value));
+}
+
+/**
+ * Model jobs run in a reviewer-only copy of the sealed checkout (#4291). codex
+ * 0.159.2 builds `workspace-write` with bubblewrap, which must create mount
+ * points (live: `.agents`) in the workspace root, and the sealed checkout is
+ * read-only for the reviewer by design. The copy lives in this job's 0700
+ * scratch, so it is removed with the scratch and the cached checkout stays
+ * sealed.
+ */
+export async function prepareModelWorkingCopy(
+  checkout: string,
+  scratch: string,
+  expectedHead: string,
+  env: Record<string, string>
+): Promise<string> {
+  const workingCopy = join(scratch, 'co');
+  const copied = await runBrokerProcess(
+    ['cp', '-R', '--no-dereference', '--preserve=mode,timestamps', `${checkout}/.`, workingCopy],
+    scratch,
+    env,
+    undefined,
+    { timeoutMs: 120_000 }
+  );
+  if (copied.exitCode !== 0 || copied.timedOut || copied.outputTruncated)
+    throw new Error('working_copy_failed');
+  // The copy is the reviewer's own: writable throughout (the judge may run
+  // tests), closed to everyone else at its root.
+  const writable = await runBrokerProcess(['chmod', '-R', 'u+rwX', workingCopy], scratch, env);
+  if (writable.exitCode !== 0) throw new Error('working_copy_failed');
+  await chmod(workingCopy, 0o700);
+  const head = await runBrokerProcess(
+    ['git', '-c', 'core.fsmonitor=false', 'rev-parse', 'HEAD'],
+    workingCopy,
+    env
+  );
+  if (head.exitCode !== 0 || head.stdout.trim() !== expectedHead)
+    throw new Error('checkout_identity_failure');
+  return workingCopy;
+}
+
 function inside(path: string, root: string): boolean {
   return path === root || path.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
 }
@@ -294,14 +340,18 @@ export async function processJob(
     if (head.exitCode !== 0 || head.stdout.trim() !== job.expectedHead)
       throw new Error('checkout_identity_failure');
 
+    const workdir =
+      job.prompt === undefined
+        ? checkout
+        : await prepareModelWorkingCopy(checkout, scratch, job.expectedHead, env);
     const command =
       job.prompt === undefined
         ? [...PINNED_CODEX_PREFIX, '-C', checkout, 'sandbox', '--', ...job.argv]
-        : job.argv;
-    if (job.prompt !== undefined && !isPinnedModelArgv(command, checkout)) {
+        : rebindModelArgv(job.argv, checkout, workdir);
+    if (job.prompt !== undefined && !isPinnedModelArgv(command, workdir)) {
       throw new Error('model_argv_invalid');
     }
-    const version = await runBrokerProcess([...PINNED_CODEX_PREFIX, '--version'], checkout, env);
+    const version = await runBrokerProcess([...PINNED_CODEX_PREFIX, '--version'], workdir, env);
     if (version.exitCode !== 0 || !version.stdout.includes(CODEX_VERSION))
       throw new Error('landlock_unsupported');
     const jobLimits =
@@ -311,7 +361,7 @@ export async function processJob(
             timeoutMs: job.timeoutMs ?? limits.timeoutMs,
             outputLimit: Math.max(limits.outputLimit, MODEL_OUTPUT_LIMIT),
           };
-    const result = await runBrokerProcess(command, checkout, env, job.prompt, jobLimits);
+    const result = await runBrokerProcess(command, workdir, env, job.prompt, jobLimits);
     return {
       id,
       ok: result.exitCode === 0 && !result.outputTruncated && !result.timedOut,
