@@ -57,21 +57,27 @@ its `entry` value changed from `cursor` to `zero`.
 
 ## Running the fence and measurement tests
 
-`bunfig.toml` sets `root = "./packages"`, so a bare path arg under `scripts/` is
-read as a filter relative to that root and is silently dropped (bun reports "Ran
-N tests" with the scripts file never loaded). Scripts tests in this repo are
-therefore always invoked with a leading `./` (see `.github/workflows/test.yml`
-and `package.json`). To run the measurement tests (Tests 7 and 8) locally, prefix
-the scripts path with `./`:
+Run the fence tests (Tests 1-6) and the measurement tests (Tests 7 and 8) with
+the one canonical invocation:
 
 ```
-bun test packages/smart-cauldron/src/__tests__/conductor.test.ts \
-  packages/smart-cauldron/src/__tests__/cascade.test.ts \
-  ./scripts/run-completion-report.test.ts
+bun run test:zero-tier-fences
 ```
 
-CI runs `./scripts/run-completion-report.test.ts` as its own step in the Linux
-`test` job, so Tests 7 and 8 execute on every push and pull request.
+Expected: `Ran 81 tests across 3 files` -- the file count is the check that
+matters. If it says `across 2 files`, the measurement tests did not run.
+
+Do NOT hand-roll this command with a bare `scripts/` path. `bunfig.toml` sets
+`root = "./packages"`, so a bare path arg under `scripts/` is not resolvable as
+a path and is instead treated as a name filter against that root. When it is the
+only arg bun exits 1, but when it is mixed with args that DO match (the two
+package paths above) bun runs those, silently ignores the unmatched filter, and
+exits 0 -- a green result in which Tests 7 and 8 never loaded. For this reason
+the invocation is pinned in `package.json` as `test:zero-tier-fences` with the
+leading `./` baked in, and `.github/workflows/test.yml` runs that same script in
+the Linux `test` job rather than repeating the paths, so CI and this documented
+command cannot drift. Tests 7 and 8 therefore execute on every push and pull
+request.
 
 ## Measuring the first 10 zero-tier runs
 

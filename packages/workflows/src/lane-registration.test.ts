@@ -34,6 +34,14 @@ const LANE_FILES = readdirSync(LANES_DIR)
   .filter(f => f.startsWith('bdc-feature-development') && f.endsWith('.yaml'))
   .sort();
 
+// 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01, Fence 5; John ruling on
+// bdc-xo#4282): the zero-open lane pins allow_issue_fallback FALSE so a zero-tier
+// fire can never fall back to an issue body as spec authority. Every other lane
+// keeps the fallback. Kept parameterized rather than hardcoded so the fence is
+// pinned for the zero-open lane instead of being loosened for all lanes.
+const ZERO_OPEN_LANE = 'bdc-feature-development-zero-open.yaml';
+const expectsIssueFallback = (laneFile: string): boolean => laneFile !== ZERO_OPEN_LANE;
+
 interface NodeDef {
   id: string;
   provider?: string;
@@ -485,7 +493,7 @@ describe('lane registration and war-council-validator pin', () => {
         spec_repository: 'thinmansoftware/bdc-xo',
         spec_revision: 'main',
         spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
-        allow_issue_fallback: true,
+        allow_issue_fallback: expectsIssueFallback(file),
       });
       const readSpec = lane.nodes?.find(node => node.id === 'read-spec');
       const authoritativePrefix = readSpec?.bash?.split('exit 0', 1)[0] ?? '';
@@ -510,7 +518,7 @@ describe('lane registration and war-council-validator pin', () => {
         spec_repository: 'thinmansoftware/bdc-xo',
         spec_revision: 'main',
         spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
-        allow_issue_fallback: true,
+        allow_issue_fallback: expectsIssueFallback(file),
       });
     });
 

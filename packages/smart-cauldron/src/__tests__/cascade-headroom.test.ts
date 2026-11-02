@@ -291,6 +291,10 @@ describe('cascade headroom', () => {
         const moved = await runCascade({
           woId: 'WO-HEADROOM-DRY',
           woClass: 'CODE',
+          // 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): plain CODE now
+          // enters the seatless zero lane, so a seat-bearing tag is required to
+          // keep exercising seat-headroom behavior on cursor.
+          tags: ['feature'],
           project: 'fixture',
           dryRun: true,
           outDir,
@@ -345,6 +349,10 @@ describe('cascade headroom', () => {
         const rejected = await runCascade({
           woId: 'WO-HEADROOM-REJECT',
           woClass: 'CODE',
+          // 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): plain CODE now
+          // enters the seatless zero lane, so a seat-bearing tag is required to
+          // keep exercising seat-headroom behavior on cursor.
+          tags: ['feature'],
           project: 'fixture',
           dryRun: true,
           outDir,
@@ -363,6 +371,10 @@ describe('cascade headroom', () => {
         const timedOut = await runCascade({
           woId: 'WO-HEADROOM-TIMEOUT',
           woClass: 'CODE',
+          // 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): plain CODE now
+          // enters the seatless zero lane, so a seat-bearing tag is required to
+          // keep exercising seat-headroom behavior on cursor.
+          tags: ['feature'],
           project: 'fixture',
           dryRun: true,
           outDir,
@@ -379,6 +391,10 @@ describe('cascade headroom', () => {
         const absent = await runCascade({
           woId: 'WO-HEADROOM-ABSENT',
           woClass: 'CODE',
+          // 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): plain CODE now
+          // enters the seatless zero lane, so a seat-bearing tag is required to
+          // keep exercising seat-headroom behavior on cursor.
+          tags: ['feature'],
           project: 'fixture',
           dryRun: true,
           outDir,
