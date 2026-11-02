@@ -82,4 +82,67 @@ describe('board audit sqlite upgrade', () => {
     expect(rows.rows.map(row => row.rowid)).toEqual([1, 2, 3]);
     await second.close();
   });
+
+  test('pre-wo lease schema gains handoff columns without losing rows', async () => {
+    path = join(import.meta.dir, `.handoff-upgrade-${crypto.randomUUID()}.db`);
+    const raw = new Database(path);
+    raw.exec(`CREATE TABLE board_xo_leases (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      lease_id TEXT NOT NULL UNIQUE,
+      principal_id TEXT NOT NULL,
+      seat_id TEXT NOT NULL,
+      holder_id TEXT NOT NULL,
+      holder_token_hash TEXT NOT NULL,
+      fencing_token INTEGER NOT NULL,
+      acquired_at TEXT NOT NULL,
+      renewed_at TEXT,
+      expires_at TEXT NOT NULL,
+      released_at TEXT
+    );
+    INSERT INTO board_xo_leases (
+      id, lease_id, principal_id, seat_id, holder_id, holder_token_hash,
+      fencing_token, acquired_at, renewed_at, expires_at, released_at
+    ) VALUES (
+      1, 'lease-old', 'xo-a', 'xo', 'holder-a', 'hash-a',
+      7, '2026-01-01T00:00:00.000Z', NULL, '2026-01-01T01:00:00.000Z', NULL
+    );
+    CREATE TABLE board_audit_events (
+      id TEXT PRIMARY KEY, event_type TEXT NOT NULL CHECK (event_type IN (
+        'xo_lease_acquired','xo_lease_acquire_rejected','xo_lease_renewed','xo_lease_renew_rejected',
+        'xo_lease_released','xo_lease_release_rejected','board_recipient_resolved','board_recipient_deferred',
+        'canonical_motion_frozen','canonical_approval_accepted','canonical_approval_rejected',
+        'motion_notification_enqueued','motion_notification_deduplicated','board_alias_resolved','board_petition_delivered')),
+      actor_principal_id TEXT, actor_seat_id TEXT, xo_lease_id TEXT, xo_fencing_token INTEGER,
+      motion_id TEXT, motion_revision_sha TEXT, details TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
+    INSERT INTO board_audit_events (id, event_type, details, created_at)
+      VALUES ('audit-old', 'xo_lease_acquired', '{"kept":true}', '2026-01-01T00:00:00Z');`);
+    raw.close();
+
+    const db = new SqliteAdapter(path);
+    const columns = await db.query<{ name: string }>("PRAGMA table_info('board_xo_leases')");
+    const names = columns.rows.map(column => column.name);
+    expect(names).toContain('handoff_successor_principal_id');
+    expect(names).toContain('handoff_reserved_until');
+    expect(names).toContain('handoff_directed_by');
+    const lease = await db.query<{
+      lease_id: string;
+      principal_id: string;
+      fencing_token: number;
+      holder_id: string;
+    }>('SELECT lease_id, principal_id, fencing_token, holder_id FROM board_xo_leases WHERE id = 1');
+    expect(lease.rows[0]).toEqual({
+      lease_id: 'lease-old',
+      principal_id: 'xo-a',
+      fencing_token: 7,
+      holder_id: 'holder-a',
+    });
+    const kept = await db.query<{ id: string; details: string }>(
+      "SELECT id, details FROM board_audit_events WHERE id = 'audit-old'"
+    );
+    expect(kept.rows).toEqual([{ id: 'audit-old', details: '{"kept":true}' }]);
+    await db.query(
+      "INSERT INTO board_audit_events(id,event_type,details,created_at) VALUES('handoff-1','xo_lease_handoff_directed','{}','2026-01-06')"
+    );
+    await db.close();
+  });
 });

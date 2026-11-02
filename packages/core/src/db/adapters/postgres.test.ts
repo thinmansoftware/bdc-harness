@@ -134,6 +134,25 @@ describe('PostgresAdapter', () => {
     });
   });
 
+  describe('XO lease directed handoff schema', () => {
+    test('migration, combined schema, and sqlite adapter include handoff columns and audit event', () => {
+      const migration = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '063_xo_lease_directed_handoff.sql'),
+        'utf8'
+      );
+      const combined = readFileSync(
+        resolve(import.meta.dir, '../../../../../migrations', '000_combined.sql'),
+        'utf8'
+      );
+      const sqlite = readFileSync(resolve(import.meta.dir, 'sqlite.ts'), 'utf8');
+
+      for (const schema of [migration, combined, sqlite]) {
+        expect(schema).toContain('handoff_successor_principal_id');
+        expect(schema).toContain('xo_lease_handoff_directed');
+      }
+    });
+  });
+
   describe('Board motion dispatch schema', () => {
     test('numbered migration, combined schema, and SQLite bootstrap define resolution fields', () => {
       const migration = readFileSync(
