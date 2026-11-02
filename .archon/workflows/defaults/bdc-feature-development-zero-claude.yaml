@@ -4702,6 +4702,117 @@ nodes:
         fi
       fi
       # existing-pr-base-guard: end
+      # superseded-pr-close: begin
+      # Close open PRs on this run's working branch once the run PR URL is known.
+      # Never close the run PR, and never close a PR on any other branch.
+      # A close failure is logged and does not fail this node.
+      WORKING_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+      if [ -z "$WORKING_BRANCH" ] || [ "$WORKING_BRANCH" = "HEAD" ]; then
+        echo "superseded_pr_none"
+      else
+        RUN_PR_URL=""
+        if [ "${same_head_kind:-}" = "adopt" ] && [ -n "${same_head_url:-}" ]; then
+          RUN_PR_URL="$same_head_url"
+        elif [ -n "${EXIST:-}" ]; then
+          RUN_PR_URL="$EXIST"
+        else
+          run_pr_raw=$(gh pr list --repo "$REPO" --head "$UNIQUE_BRANCH" --state open --limit 200 --json number,url,headRefName,baseRefName 2>/dev/null || true)
+          RUN_PR_URL=$(RUN_PR_RAW="$run_pr_raw" UNIQUE_BRANCH="$UNIQUE_BRANCH" BASE_BRANCH="$BASE_BRANCH" python3 -c "$(cat <<'PY'
+      import json, os, sys
+      raw = os.environ.get("RUN_PR_RAW", "").strip()
+      if not raw:
+          raise SystemExit(0)
+      try:
+          data = json.loads(raw)
+      except Exception:
+          raise SystemExit(0)
+      if not isinstance(data, list):
+          raise SystemExit(0)
+      want_head = os.environ.get("UNIQUE_BRANCH", "")
+      want_base = os.environ.get("BASE_BRANCH", "")
+      for item in data:
+          if not isinstance(item, dict):
+              continue
+          if item.get("headRefName") != want_head:
+              continue
+          if item.get("baseRefName") != want_base:
+              continue
+          url = item.get("url") or ""
+          if isinstance(url, str) and url:
+              sys.stdout.write(url)
+              raise SystemExit(0)
+      raise SystemExit(0)
+      PY
+      )") || true
+        fi
+        if [ -z "$RUN_PR_URL" ]; then
+          echo "WARN: superseded-pr-close: no usable run PR URL; skipping close" >&2
+        else
+          RUN_PR_NUM=$(printf '%s\n' "$RUN_PR_URL" | sed -n 's#.*/pull/\([0-9][0-9]*\).*#\1#p' || true)
+          if [ -z "$RUN_PR_NUM" ]; then
+            echo "WARN: superseded-pr-close: could not parse run PR number from URL; skipping close" >&2
+          else
+            cand_raw=$(gh pr list --repo "$REPO" --state open --limit 200 --json number,headRefName,baseRefName,url 2>/dev/null || true)
+            CANDIDATES=$(CAND_RAW="$cand_raw" WORKING_BRANCH="$WORKING_BRANCH" BASE_BRANCH="$BASE_BRANCH" UNIQUE_BRANCH="$UNIQUE_BRANCH" RUN_PR_NUM="$RUN_PR_NUM" python3 -c "$(cat <<'PY'
+      import json, os, sys
+      raw = os.environ.get("CAND_RAW", "").strip()
+      if not raw:
+          raise SystemExit(0)
+      try:
+          data = json.loads(raw)
+      except Exception:
+          raise SystemExit(0)
+      if not isinstance(data, list):
+          raise SystemExit(0)
+      want_head = os.environ.get("WORKING_BRANCH", "")
+      want_base = os.environ.get("BASE_BRANCH", "")
+      unique = os.environ.get("UNIQUE_BRANCH", "")
+      run_num = os.environ.get("RUN_PR_NUM", "")
+      nums = []
+      for item in data:
+          if not isinstance(item, dict):
+              continue
+          head = item.get("headRefName")
+          if head != want_head:
+              continue
+          if item.get("baseRefName") != want_base:
+              continue
+          if head == unique:
+              continue
+          number = item.get("number")
+          if isinstance(number, bool) or not isinstance(number, int):
+              continue
+          if str(number) == run_num:
+              continue
+          nums.append(str(number))
+      sys.stdout.write("\n".join(nums))
+      PY
+      )") || true
+            if [ -z "$CANDIDATES" ]; then
+              echo "superseded_pr_none"
+            else
+              while IFS= read -r prnum || [ -n "${prnum:-}" ]; do
+                if [ -z "${prnum:-}" ]; then
+                  continue
+                fi
+                if gh pr comment "$prnum" --repo "$REPO" --body "Superseded by #${RUN_PR_NUM} (same Cauldron run $WORKFLOW_ID)"; then
+                  :
+                else
+                  echo "WARN: superseded-pr-close: comment failed for #${prnum}" >&2
+                fi
+                if gh pr close "$prnum" --repo "$REPO"; then
+                  echo "superseded_pr_closed:${prnum}"
+                else
+                  echo "superseded_pr_close_failed:${prnum}"
+                fi
+              done <<EOF
+      $CANDIDATES
+      EOF
+            fi
+          fi
+        fi
+      fi
+      # superseded-pr-close: end
       if [ "$PR_OK" = "false" ]; then
         # WO-HARNESS-COMMIT-AND-PUSH-ORIGIN-VERIFY-02: gh pr create failed, but the
         # canonical branch was VERIFIED on origin at HEAD above (precondition guard
