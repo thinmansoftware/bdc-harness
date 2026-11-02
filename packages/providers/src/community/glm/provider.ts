@@ -9,6 +9,7 @@ import type {
 } from '../../types';
 
 import { getOpenRouterXaiRefusal } from '../../openrouter-guard';
+import { isNoPrivateEndpointError } from '../../openrouter-review-fence';
 import { GLM_CAPABILITIES } from './capabilities';
 import { parseGlmConfig } from './config';
 
@@ -140,15 +141,37 @@ export class GlmProvider implements IAgentProvider {
     }
     messages.push({ role: 'user', content: userContent });
 
+    // OpenRouter privacy pin (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01): when
+    // the executor's review-fence gate approved this OpenRouter route on a
+    // customer repo, restrict routing to no-training / zero-retention
+    // providers. The OpenRouter API accepts a top-level `provider` body field
+    // that the OpenAI SDK params type does not model, so it is attached via a
+    // cast; the SDK serializes unknown body fields verbatim.
+    const createBody: OpenAI.Chat.ChatCompletionCreateParamsStreaming & {
+      provider?: { data_collection: 'deny'; zdr: true };
+    } = {
+      model: resolvedModel,
+      messages,
+      stream: true,
+      stream_options: { include_usage: true },
+    };
+    if (options?.openrouterPrivacyPin) {
+      createBody.provider = { data_collection: 'deny', zdr: true };
+    }
+
     let stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>;
     try {
-      stream = await client.chat.completions.create({
-        model: resolvedModel,
-        messages,
-        stream: true,
-        stream_options: { include_usage: true },
-      });
+      stream = await client.chat.completions.create(createBody);
     } catch (err) {
+      // Privacy pin set + "no endpoint satisfies the data policy" -> fail
+      // closed. Never retry without the pin and never availability-failback;
+      // the executor reroutes this to a non-OpenRouter seat.
+      if (options?.openrouterPrivacyPin) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (isNoPrivateEndpointError(msg)) {
+          throw new Error(`openrouter_no_private_endpoint: ${msg}`);
+        }
+      }
       if (isAvailabilityError(err) && this.failbackProviderFactory) {
         const failback = this.failbackProviderFactory();
         yield {

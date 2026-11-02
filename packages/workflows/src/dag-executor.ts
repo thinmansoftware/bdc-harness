@@ -37,6 +37,14 @@ import {
   getRegisteredProviders,
   isRegisteredProvider,
   resolveProviderId,
+  isOpenRouterRoute,
+  isCustomerRepo,
+  normalizeRepoSlug,
+  scanDiffForOpenRouter,
+  formatHitLocation,
+  OPENROUTER_TOOL_LOOP_PROVIDER_ID,
+  type ScanResult,
+  type ScanHit,
 } from '@archon/providers';
 import type {
   DagNode,
@@ -595,6 +603,331 @@ function buildFailoverNode(
     model: target.model,
     ...(target.agent !== undefined ? { agent: target.agent, persona: undefined } : {}),
   } as DagNode;
+}
+
+// ---------------------------------------------------------------------------
+// OpenRouter review fence (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01)
+//
+// Before any diff/prompt from a customer repository reaches an OpenRouter
+// review seat, scan the transmitted content (repository diff + outgoing
+// prompt) for secrets and customer data. On any hit -- or a scan that cannot
+// run -- reroute that review to the node's non-OpenRouter failover (else
+// codex-native-strict). On a clean scan, pin the OpenRouter request to
+// no-training / zero-retention providers. One openrouter_diff_scan event is
+// recorded per decision. The pure scan + classifiers live in
+// @archon/providers/openrouter-review-fence; this is the executor-side gate.
+// ---------------------------------------------------------------------------
+
+/** Non-OpenRouter review seat used when a node declares no usable failover. */
+const CODEX_STRICT_FALLBACK_PROVIDER = 'codex-native-strict';
+
+/**
+ * Repository-diff scan results, cached by `${runId}:${headSha}`. The repo diff
+ * is identical for every node in a run at a fixed HEAD, so it is scanned once;
+ * the outgoing PROMPT is scanned on every request and never cached (a prompt
+ * verdict is never reused for another node, iteration or retry) -- spec Test 10.
+ */
+const openRouterDiffScanCache = new Map<string, ScanResult>();
+
+/** Test hook: drop the cached repository-diff scan results. */
+export function clearOpenRouterDiffScanCache(): void {
+  openRouterDiffScanCache.clear();
+}
+
+/** Git probes used by the gate; overridable in tests. */
+interface FenceGitProbes {
+  resolveRemote: (cwd: string) => Promise<string | null>;
+  resolveHeadSha: (cwd: string) => Promise<string>;
+  resolveDiff: (cwd: string, baseBranch: string) => Promise<string>;
+}
+
+async function defaultResolveRemote(cwd: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', cwd, 'remote', 'get-url', 'origin'], {
+      timeout: 10_000,
+    });
+    return stdout.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function defaultResolveHeadSha(cwd: string): Promise<string> {
+  const { stdout } = await execFileAsync('git', ['-C', cwd, 'rev-parse', 'HEAD'], {
+    timeout: 10_000,
+  });
+  return stdout.trim();
+}
+
+async function defaultResolveDiff(cwd: string, baseBranch: string): Promise<string> {
+  let base = baseBranch;
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', cwd, 'merge-base', baseBranch, 'HEAD'], {
+      timeout: 15_000,
+    });
+    base = stdout.trim() || baseBranch;
+  } catch {
+    base = baseBranch;
+  }
+  const { stdout } = await execFileAsync('git', ['-C', cwd, 'diff', `${base}..HEAD`], {
+    timeout: 30_000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return stdout;
+}
+
+/** Parse OPENROUTER_FENCE_TENANT_SLUGS (comma list) into trimmed, non-empty slugs. */
+function parseTenantSlugsFromEnv(): string[] {
+  return (process.env.OPENROUTER_FENCE_TENANT_SLUGS ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+/** Persist one openrouter_diff_scan event. Awaited so the decision is durable
+ *  before the (possibly rerouted) request is dispatched. */
+async function emitOpenRouterDiffScanEvent(
+  deps: WorkflowDeps,
+  runId: string,
+  nodeId: string,
+  data: Record<string, unknown>
+): Promise<void> {
+  try {
+    await deps.store.createWorkflowEvent({
+      workflow_run_id: runId,
+      event_type: 'openrouter_diff_scan',
+      step_name: nodeId,
+      data,
+    });
+  } catch (err) {
+    getLog().error(
+      { err: err as Error, workflowRunId: runId, eventType: 'openrouter_diff_scan' },
+      'workflow_event_persist_failed'
+    );
+  }
+}
+
+export interface OpenRouterFenceDecision {
+  /** True when this was an OpenRouter route on a customer repo (gate ran). */
+  applicable: boolean;
+  /** True when the route was moved off OpenRouter. */
+  rerouted: boolean;
+  routedProvider: string;
+  routedModel: string | undefined;
+  /** True when the route stays on OpenRouter and must carry the privacy pin. */
+  privacyPin: boolean;
+  verdict: ScanResult['verdict'] | 'skipped';
+  reason: string;
+  hitKinds: string[];
+  hitLocations: string[];
+}
+
+export interface OpenRouterFenceParams {
+  deps: WorkflowDeps;
+  workflowRun: WorkflowRun;
+  nodeId: string;
+  cwd: string;
+  baseBranch: string;
+  provider: string;
+  model: string | undefined;
+  failoverTarget: { provider: string; model: string | undefined; agent: string | undefined } | null;
+  finalPrompt: string;
+  /** Overrides the env slug list (tests). */
+  tenantSlugs?: readonly string[];
+  /** Overrides the git probes (tests). */
+  gitProbes?: Partial<FenceGitProbes>;
+  /** Overrides the scanner (tests) -- counts diff vs prompt invocations. */
+  scanText?: (text: string, mode: 'diff' | 'prompt') => Promise<ScanResult>;
+  /** Default true; set false to compute the decision without recording an event. */
+  emitEvent?: boolean;
+}
+
+/**
+ * Run the review fence for a single (possibly rerouted) node/iteration entry.
+ * Returns a decision the caller applies: reroute the provider/model (and drop
+ * the OpenRouter persona), or keep OpenRouter and set the privacy pin.
+ */
+export async function applyOpenRouterReviewFence(
+  params: OpenRouterFenceParams
+): Promise<OpenRouterFenceDecision> {
+  const {
+    deps,
+    workflowRun,
+    nodeId,
+    cwd,
+    baseBranch,
+    provider,
+    model,
+    failoverTarget,
+    finalPrompt,
+  } = params;
+
+  const notApplicable: OpenRouterFenceDecision = {
+    applicable: false,
+    rerouted: false,
+    routedProvider: provider,
+    routedModel: model,
+    privacyPin: false,
+    verdict: 'skipped',
+    reason: '',
+    hitKinds: [],
+    hitLocations: [],
+  };
+
+  if (!isOpenRouterRoute(provider, model)) return notApplicable;
+
+  const probes: FenceGitProbes = {
+    resolveRemote: defaultResolveRemote,
+    resolveHeadSha: defaultResolveHeadSha,
+    resolveDiff: defaultResolveDiff,
+    ...params.gitProbes,
+  };
+
+  const remote = await probes.resolveRemote(cwd).catch(() => null);
+  if (!isCustomerRepo(remote)) return notApplicable;
+  const repoSlug = normalizeRepoSlug(remote) ?? remote ?? '';
+
+  const tenantSlugs = params.tenantSlugs ?? parseTenantSlugsFromEnv();
+  const scanText =
+    params.scanText ??
+    ((text: string, mode: 'diff' | 'prompt'): Promise<ScanResult> =>
+      scanDiffForOpenRouter(text, { mode, tenantSlugs, cwd }));
+
+  let verdict: ScanResult['verdict'] = 'clean';
+  let reason = '';
+  const hits: ScanHit[] = [];
+
+  if (resolveProviderId(provider) === OPENROUTER_TOOL_LOOP_PROVIDER_ID) {
+    // The tool-loop seat reads files under cwd and sends tool results to
+    // OpenRouter AFTER this gate runs, so no pre-send scan can cover what it
+    // transmits. Always reroute on a customer repo.
+    verdict = 'scan_unavailable';
+    reason = 'repo_read_unscannable';
+  } else if (tenantSlugs.length === 0) {
+    // Fail closed: cannot prove the change is slug-free without the slug list.
+    verdict = 'scan_unavailable';
+    reason = 'tenant_slugs_unset';
+  } else {
+    // (a) Repository diff -- cached by run id + HEAD sha.
+    let diffResult: ScanResult;
+    try {
+      const headSha = await probes.resolveHeadSha(cwd);
+      const cacheKey = `${workflowRun.id}:${headSha}`;
+      const cached = openRouterDiffScanCache.get(cacheKey);
+      if (cached) {
+        diffResult = cached;
+      } else {
+        const diffText = await probes.resolveDiff(cwd, baseBranch);
+        diffResult = await scanText(diffText, 'diff');
+        openRouterDiffScanCache.set(cacheKey, diffResult);
+      }
+    } catch {
+      diffResult = { verdict: 'scan_unavailable', hits: [], reason: 'repo_diff_unavailable' };
+    }
+
+    // (b) Outgoing prompt -- scanned every request, never cached.
+    let promptResult: ScanResult;
+    try {
+      promptResult = await scanText(finalPrompt, 'prompt');
+    } catch {
+      promptResult = { verdict: 'scan_unavailable', hits: [], reason: 'prompt_scan_failed' };
+    }
+
+    hits.push(...diffResult.hits, ...promptResult.hits);
+    if (diffResult.verdict === 'scan_unavailable' || promptResult.verdict === 'scan_unavailable') {
+      verdict = 'scan_unavailable';
+      reason =
+        diffResult.verdict === 'scan_unavailable'
+          ? (diffResult.reason ?? 'scan_unavailable')
+          : (promptResult.reason ?? 'scan_unavailable');
+    } else if (diffResult.verdict === 'hit' || promptResult.verdict === 'hit') {
+      verdict = 'hit';
+      reason = 'customer_data';
+    } else {
+      verdict = 'clean';
+    }
+  }
+
+  const hitKinds = [...new Set(hits.map(h => h.kind))];
+  const hitLocations = hits.map(formatHitLocation);
+
+  let rerouted = false;
+  let routedProvider = provider;
+  let routedModel = model;
+  let privacyPin = false;
+
+  if (verdict === 'clean') {
+    privacyPin = true;
+  } else {
+    rerouted = true;
+    if (failoverTarget && !isOpenRouterRoute(failoverTarget.provider, failoverTarget.model)) {
+      routedProvider = failoverTarget.provider;
+      routedModel = failoverTarget.model;
+    } else {
+      routedProvider = CODEX_STRICT_FALLBACK_PROVIDER;
+      routedModel = undefined;
+    }
+  }
+
+  if (params.emitEvent !== false) {
+    await emitOpenRouterDiffScanEvent(deps, workflowRun.id, nodeId, {
+      repo: repoSlug,
+      node_id: nodeId,
+      original_provider: provider,
+      routed_provider: routedProvider,
+      verdict,
+      reason,
+      hit_kinds: hitKinds,
+      hit_locations: hitLocations,
+    });
+  }
+
+  return {
+    applicable: true,
+    rerouted,
+    routedProvider,
+    routedModel,
+    privacyPin,
+    verdict,
+    reason,
+    hitKinds,
+    hitLocations,
+  };
+}
+
+/**
+ * Resolve the non-OpenRouter reroute target after an OpenRouter request was
+ * refused for having no zdr / data_collection:deny endpoint, and record an
+ * openrouter_diff_scan event (reason openrouter_no_private_endpoint). The
+ * request is NEVER retried without the pin -- the provider already failed
+ * closed; this only chooses where the review goes instead.
+ */
+export async function emitNoPrivateEndpointReroute(params: {
+  deps: WorkflowDeps;
+  workflowRun: WorkflowRun;
+  nodeId: string;
+  provider: string;
+  repo: string;
+  failoverTarget: { provider: string; model: string | undefined; agent: string | undefined } | null;
+}): Promise<{ routedProvider: string; routedModel: string | undefined }> {
+  const { failoverTarget } = params;
+  let routedProvider = CODEX_STRICT_FALLBACK_PROVIDER;
+  let routedModel: string | undefined;
+  if (failoverTarget && !isOpenRouterRoute(failoverTarget.provider, failoverTarget.model)) {
+    routedProvider = failoverTarget.provider;
+    routedModel = failoverTarget.model;
+  }
+  await emitOpenRouterDiffScanEvent(params.deps, params.workflowRun.id, params.nodeId, {
+    repo: params.repo,
+    node_id: params.nodeId,
+    original_provider: params.provider,
+    routed_provider: routedProvider,
+    verdict: 'scan_unavailable',
+    reason: 'openrouter_no_private_endpoint',
+    hit_kinds: [],
+    hit_locations: [],
+  });
+  return { routedProvider, routedModel };
 }
 
 /**
@@ -2095,7 +2428,11 @@ async function executeNodeInternal(
   // Persona wiki/oracle context-load state from resolveNodeProviderAndModel,
   // dumped alongside the raw SDK message on a success-contradiction for
   // root-cause evidence (WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01).
-  personaContextState = 'none'
+  personaContextState = 'none',
+  // Workflow-level failover defaults -- used by the OpenRouter review fence to
+  // resolve a node's non-OpenRouter reroute target (WO-HARNESS-OPENROUTER-
+  // REVIEW-DIFF-SCAN-01).
+  workflowLevelOptions: WorkflowLevelOptions = {}
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -2202,6 +2539,50 @@ async function executeNodeInternal(
 
   // Substitute upstream node output references
   const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
+
+  // OpenRouter review fence (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01): on a
+  // customer-repo OpenRouter route, scan the repository diff + outgoing prompt
+  // before a provider is chosen. A hit (or a scan that cannot run) reroutes
+  // this node off OpenRouter to its non-OpenRouter failover (else
+  // codex-native-strict); a clean scan keeps OpenRouter and pins the request
+  // to no-training / zero-retention endpoints. Runs on EVERY entry, including
+  // an availability-failover re-dispatch onto an OpenRouter provider.
+  if (isOpenRouterRoute(provider, nodeOptions?.model)) {
+    const fenceDecision = await applyOpenRouterReviewFence({
+      deps,
+      workflowRun,
+      nodeId: node.id,
+      cwd,
+      baseBranch,
+      provider,
+      model: nodeOptions?.model,
+      failoverTarget: resolveFailoverTarget(node, workflowLevelOptions),
+      finalPrompt,
+    });
+    if (fenceDecision.applicable && fenceDecision.rerouted) {
+      getLog().warn(
+        {
+          nodeId: node.id,
+          from: provider,
+          to: fenceDecision.routedProvider,
+          verdict: fenceDecision.verdict,
+          reason: fenceDecision.reason,
+        },
+        'dag.openrouter_review_fence_rerouted'
+      );
+      provider = fenceDecision.routedProvider;
+      // Drop the model override and the OpenRouter persona system prompt the
+      // way buildFailoverNode does -- the reroute target is a different seat.
+      nodeOptions = {
+        ...nodeOptions,
+        model: fenceDecision.routedModel,
+        systemPrompt: undefined,
+        openrouterPrivacyPin: false,
+      };
+    } else if (fenceDecision.applicable && fenceDecision.privacyPin) {
+      nodeOptions = { ...nodeOptions, openrouterPrivacyPin: true };
+    }
+  }
 
   const aiClient = deps.getAgentProvider(provider);
   const streamingMode = platform.getStreamingMode();
@@ -4390,20 +4771,68 @@ async function executeLoopNode(
         );
         const finalPrompt = substituteNodeOutputRefs(substitutedPrompt, nodeOutputs);
 
+        // OpenRouter review fence, re-evaluated PER ITERATION (WO-HARNESS-
+        // OPENROUTER-REVIEW-DIFF-SCAN-01): the repository diff is cached by run
+        // id + HEAD sha, but THIS iteration's prompt is scanned fresh (never
+        // cached), so one iteration may pass while a later iteration whose
+        // prompt carries customer data is rerouted -- spec Test 10.
+        let iterationProvider = workflowProvider;
+        let iterationModel = resolvedOptions.model;
+        let iterationClient = aiClient;
         const iterationOptions: SendQueryOptions | undefined = {
           ...resolvedOptions,
           abortSignal: iterationAbortController.signal,
         };
+        if (isOpenRouterRoute(iterationProvider, iterationModel)) {
+          const fenceDecision = await applyOpenRouterReviewFence({
+            deps,
+            workflowRun,
+            nodeId: node.id,
+            cwd,
+            baseBranch,
+            provider: iterationProvider,
+            model: iterationModel,
+            failoverTarget: resolveFailoverTarget(node, workflowLevelOptions ?? {}),
+            finalPrompt,
+          });
+          if (fenceDecision.applicable && fenceDecision.rerouted) {
+            getLog().warn(
+              {
+                nodeId: node.id,
+                iteration: i,
+                from: iterationProvider,
+                to: fenceDecision.routedProvider,
+                verdict: fenceDecision.verdict,
+                reason: fenceDecision.reason,
+              },
+              'loop_node.openrouter_review_fence_rerouted'
+            );
+            iterationProvider = fenceDecision.routedProvider;
+            iterationModel = fenceDecision.routedModel;
+            iterationClient = deps.getAgentProvider(iterationProvider);
+            iterationOptions.model = iterationModel;
+            // Drop the OpenRouter persona system prompt -- different seat.
+            iterationOptions.systemPrompt = undefined;
+            iterationOptions.openrouterPrivacyPin = false;
+          } else if (fenceDecision.applicable && fenceDecision.privacyPin) {
+            iterationOptions.openrouterPrivacyPin = true;
+          }
+        }
 
         iterationAttempt = await beginProviderAttempt(
           deps,
           workflowRun,
           node,
-          workflowProvider,
-          resolvedOptions.model,
+          iterationProvider,
+          iterationModel,
           workflowModel
         );
-        const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
+        const generator = iterationClient.sendQuery(
+          finalPrompt,
+          cwd,
+          resumeSessionId,
+          iterationOptions
+        );
         let lastToolStartedAt: { toolName: string; startedAt: number } | null = null;
 
         for await (const msg of withIdleTimeout(generator, effectiveIdleTimeout, () => {
@@ -5360,7 +5789,8 @@ async function executeApprovalNode(
       undefined, // fresh session
       configuredCommandFolder,
       issueContext,
-      personaContextState
+      personaContextState,
+      workflowLevelOptions
     );
 
     if (output.state === 'failed') {
@@ -6180,7 +6610,8 @@ async function executeDagWorkflowInternal(
                 resumeSessionId,
                 configuredCommandFolder,
                 issueContext,
-                personaContextState
+                personaContextState,
+                workflowLevelOptions
               );
 
               if (output.state !== 'failed') break;
@@ -6257,6 +6688,79 @@ async function executeDagWorkflowInternal(
               continue sdkContradictionRetry;
             }
             break;
+          }
+
+          // OpenRouter no-private-endpoint reroute (WO-HARNESS-OPENROUTER-
+          // REVIEW-DIFF-SCAN-01): the pinned OpenRouter request found no
+          // zdr / data_collection:deny endpoint. The provider already failed
+          // closed (no unpinned retry); reroute the review to a non-OpenRouter
+          // seat and record the decision. Never retried without the pin.
+          if (
+            output.state === 'failed' &&
+            output.error?.includes('openrouter_no_private_endpoint')
+          ) {
+            try {
+              const declaredFailover = resolveFailoverTarget(node, workflowLevelOptions);
+              const noEndpointRemote = await defaultResolveRemote(cwd).catch(() => null);
+              const reroute = await emitNoPrivateEndpointReroute({
+                deps,
+                workflowRun,
+                nodeId: node.id,
+                provider,
+                repo: normalizeRepoSlug(noEndpointRemote) ?? noEndpointRemote ?? '',
+                failoverTarget: declaredFailover,
+              });
+              const rerouteNode = buildFailoverNode(node, {
+                provider: reroute.routedProvider,
+                model: reroute.routedModel,
+                agent: declaredFailover?.agent,
+              });
+              assertProviderCanExecuteNode(reroute.routedProvider, rerouteNode);
+              const rerouteResolved = await resolveNodeProviderAndModel(
+                rerouteNode,
+                workflowProvider,
+                workflowModel,
+                config,
+                platform,
+                conversationId,
+                workflowRun.id,
+                cwd,
+                workflowLevelOptions,
+                modelOverride
+              );
+              await safeSendMessage(
+                platform,
+                conversationId,
+                `! Node \`${node.id}\` had no private OpenRouter endpoint on ${provider}; rerouting to ${rerouteResolved.provider} (one attempt).`,
+                { workflowId: workflowRun.id, nodeName: node.id }
+              );
+              output = await executeNodeInternal(
+                deps,
+                platform,
+                conversationId,
+                cwd,
+                workflowRun,
+                rerouteNode as CommandNode | PromptNode,
+                rerouteResolved.provider,
+                rerouteResolved.options,
+                rerouteResolved.declaredModelId,
+                artifactsDir,
+                logDir,
+                baseBranch,
+                docsDir,
+                nodeOutputs,
+                resumeSessionId,
+                configuredCommandFolder,
+                issueContext,
+                rerouteResolved.personaContextState,
+                workflowLevelOptions
+              );
+            } catch (rerouteErr) {
+              getLog().error(
+                { err: rerouteErr as Error, nodeId: node.id },
+                'dag.openrouter_no_private_endpoint_reroute_failed'
+              );
+            }
           }
 
           // AVAILABILITY failover (WO-HARNESS-NODE-PROVIDER-FAILOVER-01): the
@@ -6344,7 +6848,8 @@ async function executeDagWorkflowInternal(
                 resumeSessionId,
                 configuredCommandFolder,
                 issueContext,
-                failoverResolved.personaContextState
+                failoverResolved.personaContextState,
+                workflowLevelOptions
               );
             } catch (failoverErr) {
               // A misconfigured failover (e.g. InfrastructureClassBlock from a

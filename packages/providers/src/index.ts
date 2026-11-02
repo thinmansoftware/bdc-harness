@@ -43,6 +43,24 @@ export {
   setOpenRouterProviderIdResolver,
 } from './openrouter-guard';
 
+// OpenRouter review fence (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01)
+export {
+  CUSTOMER_REPOS,
+  OPENROUTER_TOOL_LOOP_PROVIDER_ID,
+  normalizeRepoSlug,
+  isCustomerRepo,
+  isOpenRouterRoute,
+  isNoPrivateEndpointError,
+  scanDiffForOpenRouter,
+  formatHitLocation,
+  type ScanKind,
+  type ScanHit,
+  type ScanVerdict,
+  type ScanResult,
+  type ScanOptions,
+  type GitleaksResult,
+} from './openrouter-review-fence';
+
 // Error
 export { UnknownProviderError } from './errors';
 export * from './probe';
