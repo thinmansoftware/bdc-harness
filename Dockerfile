@@ -103,12 +103,6 @@ RUN apt-get update && apt-get install -y \
     # `|| echo` swallowing real errors). Static-check that class before a run
     # spends 20 minutes discovering it.
     shellcheck \
-    # bubblewrap: codex >= 0.159 builds the Overseer reviewer sandbox with
-    # bwrap (legacy Landlock refuses a restricted filesystem policy). Not
-    # setuid on Debian; it relies on unprivileged user namespaces, and the
-    # AppArmor profile docker/apparmor/archon-bwrap lets only /usr/bin/bwrap
-    # mount (WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01).
-    bubblewrap \
     postgresql-client \
     # Required by Python WO tests; keep the distro-managed pytest runtime.
     python3-pytest \
@@ -118,10 +112,29 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     # Debian ships fd-find's binary as `fdfind` (name clash with an unrelated
     # package). Agents and docs say `fd`, so expose it under the expected name.
-    && ln -sf "$(command -v fdfind)" /usr/local/bin/fd \
+    && ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+# bubblewrap for the Overseer reviewer sandbox (WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01).
+# codex >= 0.159 builds a filesystem-restricted sandbox with bwrap (legacy
+# Landlock refuses it). Pinned to Debian bookworm's bubblewrap 0.8.0-2+deb12u1
+# (sha256-verified), not trixie's 0.12.0: inside Docker a fresh /proc mount is
+# always refused (masked /proc paths), and codex 0.159.2 only falls back to
+# "no new /proc" when bwrap's error names "/newroot/proc", which 0.12 no longer
+# prints. Not setuid; it relies on unprivileged user namespaces, and the
+# AppArmor profile docker/apparmor/archon-bwrap lets only /usr/bin/bwrap mount.
+ARG BUBBLEWRAP_DEB_SNAPSHOT_URL=https://snapshot.debian.org/file/75e7579318581f9d6633957a5482f63b7aa36c7c
+ARG BUBBLEWRAP_DEB_POOL_URL=https://deb.debian.org/debian/pool/main/b/bubblewrap/bubblewrap_0.8.0-2+deb12u1_amd64.deb
+ARG BUBBLEWRAP_DEB_SHA256=3cc9134a3286ad01a323dcd924ba123eb634cefaeec82d774257e06308aeaadb
+RUN { curl -fsSL --retry 3 -o /tmp/bubblewrap.deb "${BUBBLEWRAP_DEB_SNAPSHOT_URL}" \
+      || curl -fsSL --retry 3 -o /tmp/bubblewrap.deb "${BUBBLEWRAP_DEB_POOL_URL}"; } \
+    && echo "${BUBBLEWRAP_DEB_SHA256}  /tmp/bubblewrap.deb" | sha256sum -c - \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends --allow-downgrades /tmp/bubblewrap.deb \
+    && apt-mark hold bubblewrap \
+    && rm -rf /var/lib/apt/lists/* /tmp/bubblewrap.deb \
     && test "$(command -v bwrap)" = /usr/bin/bwrap \
     && test ! -u /usr/bin/bwrap \
-    && bwrap --version
+    && test "$(bwrap --version)" = "bubblewrap 0.8.0"
 
 # Install GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \

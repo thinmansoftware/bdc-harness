@@ -64,6 +64,12 @@ bwrap creates a new user, mount, IPC, PID and network namespace with one
 - `pivot_root`: switch into the new root.
 - `umount2`: detach the old root.
 
+The image pins Debian bookworm's bubblewrap 0.8.0-2+deb12u1 (sha256 in the
+Dockerfile). Docker always refuses a fresh `/proc` mount inside the container,
+and codex 0.159.2 drops `--proc` only when bwrap's error names
+`/newroot/proc`; bubblewrap 0.12 (trixie) prints `/proc` instead, so codex
+never falls back and the sandbox fails.
+
 One rule is appended:
 `{"names":["mount","umount2","pivot_root"],"action":"SCMP_ACT_ALLOW","excludes":{"caps":["CAP_SYS_ADMIN"]}}`.
 The container still has no `CAP_SYS_ADMIN`, so the kernel refuses these calls
