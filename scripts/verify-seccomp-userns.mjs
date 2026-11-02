@@ -9,6 +9,15 @@ const CLONE_MASK = 2114060288;
 const USER_NAMESPACE = 268435456;
 const COMBINED_NAMESPACES = 2013396992;
 const SECCOMP_OPT = 'seccomp=./docker/seccomp-archon.json';
+// WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01: the app loads the archon-bwrap
+// AppArmor profile (docker-default plus mount only for /usr/bin/bwrap).
+const APPARMOR_OPT = 'apparmor=archon-bwrap';
+// The sixth appended rule: bubblewrap's mount-namespace setup syscalls.
+const BWRAP_MOUNT_RULE = {
+  names: ['mount', 'umount2', 'pivot_root'],
+  action: 'SCMP_ACT_ALLOW',
+  excludes: { caps: ['CAP_SYS_ADMIN'] },
+};
 const UINT32_MASK = 0xffffffffn;
 
 const REQUIRED_DOC_TEXT = [
@@ -24,6 +33,9 @@ const REQUIRED_DOC_TEXT = [
   'UNVERIFIED',
   'no deployment authority',
   'docker-default',
+  'archon-bwrap',
+  'apparmor_parser --replace',
+  'apparmor_parser --remove',
 ];
 
 const PASS_CLAIM =
@@ -179,9 +191,9 @@ export function verifyDelta(upstreamValue, archonValue) {
   if (!deepEqual(upstream.archMap, archon.archMap)) {
     throw new Error('archMap changed');
   }
-  if (archon.syscalls.length !== upstream.syscalls.length + 5) {
+  if (archon.syscalls.length !== upstream.syscalls.length + 6) {
     throw new Error(
-      `candidate must append exactly five rules, found ${archon.syscalls.length - upstream.syscalls.length}`
+      `candidate must append exactly six rules, found ${archon.syscalls.length - upstream.syscalls.length}`
     );
   }
   const prefix = archon.syscalls.slice(0, upstream.syscalls.length);
@@ -189,11 +201,18 @@ export function verifyDelta(upstreamValue, archonValue) {
   if (!deepEqual(prefix, upstream.syscalls)) {
     throw new Error('candidate syscall prefix does not match the pinned upstream profile');
   }
-  for (const name of ['mount', 'umount2', 'setns', 'clone3']) {
+  for (const name of ['setns', 'clone3']) {
     const before = countNaming(upstream, name);
     const after = countNaming(archon, name);
     if (before !== after) {
       throw new Error(`${name} rule count changed from ${before} to ${after}`);
+    }
+  }
+  for (const name of BWRAP_MOUNT_RULE.names) {
+    const before = countNaming(upstream, name);
+    const after = countNaming(archon, name);
+    if (after !== before + 1) {
+      throw new Error(`${name} must gain exactly one rule, found ${before} -> ${after}`);
     }
   }
 
@@ -205,12 +224,13 @@ export function verifyDelta(upstreamValue, archonValue) {
     withValueTwo(normal, COMBINED_NAMESPACES),
     withValueTwo(s390, COMBINED_NAMESPACES),
     { names: ['unshare'], action: 'SCMP_ACT_ALLOW' },
+    BWRAP_MOUNT_RULE,
   ];
   const actual = archon.syscalls.slice(upstream.syscalls.length);
   const actualKeys = actual.map(rule => canonical(rule)).sort();
   const expectedKeys = expected.map(rule => canonical(rule)).sort();
   if (!deepEqual(actualKeys, expectedKeys)) {
-    throw new Error('appended seccomp rules are not the five-rule user-namespace delta');
+    throw new Error('appended seccomp rules are not the six-rule user-namespace delta');
   }
 }
 
@@ -306,13 +326,20 @@ export function verifyComposeYaml(text) {
   const app = doc.services.app;
   if (!app || typeof app !== 'object') throw new Error('compose is missing services.app');
   const options = app.security_opt;
-  if (!Array.isArray(options) || options.length !== 1 || options[0] !== SECCOMP_OPT) {
-    throw new Error('services.app.security_opt must be exactly the archon seccomp profile');
+  if (
+    !Array.isArray(options) ||
+    options.length !== 2 ||
+    options[0] !== SECCOMP_OPT ||
+    options[1] !== APPARMOR_OPT
+  ) {
+    throw new Error(
+      'services.app.security_opt must be exactly the archon seccomp and archon-bwrap AppArmor profiles'
+    );
   }
   for (const option of options) {
     const lower = String(option).toLowerCase();
-    if (lower.includes('unconfined') || lower.includes('apparmor')) {
-      throw new Error('services.app.security_opt must not set unconfined or apparmor');
+    if (lower.includes('unconfined')) {
+      throw new Error('services.app.security_opt must not set unconfined');
     }
   }
   if (app.privileged !== undefined && app.privileged !== false) {

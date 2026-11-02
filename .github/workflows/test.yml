@@ -211,12 +211,21 @@ jobs:
             /app/scripts/github-service-token.ts /app/scripts/github-service-exec.ts \
             --target=bun --outdir /tmp/archon-github-helper-smoke
 
+      # Same security settings as services.app in docker-compose.yml: the archon
+      # seccomp profile and the archon-bwrap AppArmor profile (loaded here exactly
+      # as the operator loads it on the host; docker/seccomp-archon.md).
+      - name: Load the archon-bwrap AppArmor profile
+        run: |
+          sudo apparmor_parser --replace docker/apparmor/archon-bwrap
+          sudo aa-status | grep -F archon-bwrap
+
       - name: Smoke test -- container starts and serves /api/health
         run: |
           mkdir -p "$RUNNER_TEMP/overseer-secrets"
           printf 'synthetic-ci-canary\n' > "$RUNNER_TEMP/overseer-secrets/thinman-overseer.pem"
           chmod 0644 "$RUNNER_TEMP/overseer-secrets/thinman-overseer.pem"
           docker run -d --name archon-smoke -e PORT=3000 -e CLAUDE_USE_GLOBAL_AUTH=true -p 3000:3000 \
+            --security-opt seccomp=docker/seccomp-archon.json --security-opt apparmor=archon-bwrap \
             -v "$RUNNER_TEMP/overseer-secrets/thinman-overseer.pem:/run/secrets/thinman-overseer.pem:ro" archon-ci:test
           sleep 5
           curl --fail --retry 10 --retry-delay 3 --retry-all-errors http://localhost:3000/api/health
@@ -239,6 +248,29 @@ jobs:
           assert_denied parent_environment_read docker exec --user reviewer archon-smoke sh -c 'cat /proc/1/environ'
           docker exec --user appuser archon-smoke bun run scripts/overseer-review-sandbox-smoke.ts
           test "$(docker inspect archon-smoke --format '{{.HostConfig.Privileged}} {{.HostConfig.CapAdd}}')" = 'false []'
+          test "$(docker inspect archon-smoke --format '{{.AppArmorProfile}}')" = archon-bwrap
+
+      - name: Smoke test -- codex 0.159.2 bubblewrap sandbox as reviewer
+        run: |
+          assert_denied() {
+            name="$1"; shift
+            if output=$("$@" 2>&1); then echo "FAIL: $name succeeded"; exit 1; fi
+            echo "$output" | grep -Eqi 'Permission denied|Operation not permitted|EACCES' || { echo "FAIL: $name failed for an unexpected reason: $output"; exit 1; }
+          }
+          # Test 1: bubblewrap is on PATH for the reviewer.
+          test "$(docker exec --user reviewer archon-smoke sh -c 'command -v bwrap')" = /usr/bin/bwrap
+          # Test 2: the reviewer can build the namespaces and mounts codex asks bwrap for.
+          docker exec --user reviewer archon-smoke bwrap --new-session --die-with-parent \
+            --unshare-user --unshare-ipc --unshare-pid --unshare-net \
+            --ro-bind / / --dev /dev --cap-drop ALL -- /bin/true
+          # Mount stays denied to every process that is not bwrap.
+          assert_denied appuser_mount_outside_bwrap docker exec --user appuser archon-smoke unshare -Urm true
+          assert_denied reviewer_mount_outside_bwrap docker exec --user reviewer archon-smoke unshare -Urm true
+          # Test 3: codex 0.159.2 sandbox (no legacy Landlock) still denies network,
+          # outside writes, appuser auth, secrets and credential environment.
+          docker exec --user reviewer archon-smoke env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/reviewer \
+            bun run /app/scripts/overseer-review-sandbox-smoke.ts --reviewer-bwrap | tee "$RUNNER_TEMP/bwrap-smoke.txt"
+          grep -F 'overseer-review-sandbox-smoke: ok uid=1002 codex=0.159.2' "$RUNNER_TEMP/bwrap-smoke.txt"
 
       - name: Dump container logs on failure
         if: failure()
