@@ -59,6 +59,101 @@ export function githubCommandReadsStdin(args: string[]): boolean {
   });
 }
 
+/**
+ * True when this gh argv creates a PR or submits a review.
+ * A 403 on these commands must stay on the App token. PATCH counts here;
+ * the container gh guard does not treat PATCH as a review write.
+ */
+export function githubCommandChangesPullRequestAuthorship(args: string[]): boolean {
+  const valueTakingFlags: ReadonlySet<string> = new Set([
+    '-R',
+    '--repo',
+    '--hostname',
+    '--json',
+    '--jq',
+    '--template',
+    '-X',
+    '--method',
+    '-f',
+    '-F',
+    '--field',
+    '--raw-field',
+    '--input',
+    '-b',
+    '--body',
+    '-t',
+    '--title',
+    '--head',
+    '--base',
+  ]);
+  const fieldFlags: ReadonlySet<string> = new Set([
+    '-f',
+    '-F',
+    '--field',
+    '--raw-field',
+    '--input',
+  ]);
+  const authorshipMethod = (value: string): boolean => /^(?:POST|PUT|PATCH)$/i.test(value);
+  const positionals: string[] = [];
+  let writesPullRequest = false;
+
+  let index = 0;
+  while (index < args.length) {
+    const arg = args[index] ?? '';
+    const methodEquals = /^--method=(.*)$/i.exec(arg);
+    if (methodEquals) {
+      if (authorshipMethod(methodEquals[1] ?? '')) writesPullRequest = true;
+      index += 1;
+      continue;
+    }
+    if (/^-X(?:POST|PUT|PATCH)$/i.test(arg)) {
+      writesPullRequest = true;
+      index += 1;
+      continue;
+    }
+    if (/^(?:-f=|-F=|--field=|--raw-field=|--input=)/.test(arg)) {
+      writesPullRequest = true;
+      index += 1;
+      continue;
+    }
+    if (valueTakingFlags.has(arg)) {
+      const value = args[index + 1] ?? '';
+      if ((arg === '-X' || arg === '--method') && authorshipMethod(value)) {
+        writesPullRequest = true;
+      }
+      if (fieldFlags.has(arg)) writesPullRequest = true;
+      index += 2;
+      continue;
+    }
+    if (arg.startsWith('-')) {
+      index += 1;
+      continue;
+    }
+    positionals.push(arg);
+    index += 1;
+  }
+
+  const command = positionals[0] ?? '';
+  const subcommand = positionals[1] ?? '';
+  if (command === 'pr' && (subcommand === 'create' || subcommand === 'review')) return true;
+
+  // '$' keeps pulls-list query strings (pulls?state=all) from matching.
+  const pullsEndpoint = /\/pulls(\/\d+\/reviews)?$/;
+  if (command === 'api' && writesPullRequest && args.some(token => pullsEndpoint.test(token))) {
+    return true;
+  }
+
+  return (
+    args[0] === 'api' &&
+    args.some(
+      token =>
+        token.includes('createPullRequest') ||
+        token.includes('addPullRequestReview') ||
+        token.includes('submitPullRequestReview')
+    )
+  );
+}
+
 /** Consume gh's captured HTTP trace; never forward headers, URLs or bodies. */
 export function consumeGitHubTrace(
   raw: string,
@@ -199,6 +294,7 @@ export async function runGitHubServiceCommand(input: {
     }
     return { ...result, stderr: new TextEncoder().encode(stderr) };
   };
+  const changesPullRequestAuthorship = githubCommandChangesPullRequestAuthorship(args);
   const result = await invoke(identity);
   const stderr = new TextDecoder().decode(result.stderr);
   if (
@@ -210,6 +306,13 @@ export async function runGitHubServiceCommand(input: {
     fallback &&
     !permissionFallbackDisabled
   ) {
+    // Retrying pr create / pr review with the PAT would mix authors on one PR.
+    if (changesPullRequestAuthorship) {
+      const refusal =
+        'github_service_exec: permission fallback refused for a PR authorship command (authorship must come from one identity)';
+      const appended = stderr.endsWith('\n') ? `${stderr}${refusal}\n` : `${stderr}\n${refusal}\n`;
+      return { ...result, stderr: new TextEncoder().encode(appended) };
+    }
     return invoke(
       { kind: 'pat', service: input.service, token: fallback, poolId: 'user-pat', distinct: false },
       true
