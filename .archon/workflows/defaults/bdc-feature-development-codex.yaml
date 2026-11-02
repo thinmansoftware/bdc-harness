@@ -1,8 +1,8 @@
 name: bdc-feature-development-codex
 description: |
   Codex-implement variant of bdc-feature-development. Identical DAG; implement +
-  diff-repair use Codex gpt-5.6-sol. Review and judge seats run on Codex
-  gpt-5.6-terra so the builder never grades its own output.
+  diff-repair use Codex gpt-6.1-sol. Review and judge seats run on Codex
+  gpt-6.1-terra so the builder never grades its own output.
 
 policyFile: harness/policies/agent-behavior.md
 run_authority:
@@ -13,10 +13,10 @@ run_authority:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
-# Codex build lane: Codex/gpt-5.6-sol is the build default. Review and judge
-# seats override to gpt-5.6-terra. WO-HARNESS-LANE-REVIEWERS-SOL-TERRA-01.
+# Codex build lane: Codex/gpt-6.1-sol is the build default. Review and judge
+# seats override to gpt-6.1-terra. WO-HARNESS-LANE-REVIEWERS-SOL-TERRA-01.
 provider: codex
-model: gpt-5.6-sol
+model: gpt-6.1-sol
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -808,7 +808,7 @@ nodes:
     idle_timeout: 600000
     persona: war-council-architect-opr
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     agent: war-council-architect-opr
     depends_on: [plan, checkout-repair-target]
     trigger_rule: all_done
@@ -1191,7 +1191,7 @@ nodes:
   - id: implement
     idle_timeout: 600000
     provider: codex
-    model: gpt-5.6-sol
+    model: gpt-6.1-sol
     depends_on: [prep-dependencies, repair-gate]
     trigger_rule: all_done
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -2913,7 +2913,7 @@ nodes:
 
   - id: war-council-validator
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     persona: captain-ci-validator-codex
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
@@ -2982,7 +2982,7 @@ nodes:
   # executor-honest: Codex is read-only and CANNOT write files; until_bash CANNOT prove a
   # semantic Codex objection was fixed. So: codex reviews (stdout only) -> major-build repairs
   # (reads codex stdout in-prompt, until_bash checks MECHANICAL invariants only) -> codex
-  # RE-REVIEWS for real and decides. Cross-model: Terra (gpt-5.6-terra) reviews Sol-authored code.
+  # RE-REVIEWS for real and decides. Cross-model: Terra (gpt-6.1-terra) reviews Sol-authored code.
   # capture-diff: the Codex reviewer persona is read-only [Read,Grep,Glob] with NO Bash,
   # so it cannot run `git diff` itself (F5 fix). This bash node captures the full feature
   # diff (merge-base..HEAD plus any unstaged working-tree changes) to an artifact the
@@ -3057,7 +3057,7 @@ nodes:
   - id: diff-review
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -3113,7 +3113,7 @@ nodes:
 
   - id: diff-repair
     provider: codex
-    model: gpt-5.6-sol
+    model: gpt-6.1-sol
     depends_on: [diff-review, classify-diff-review, resolve-review-base, repair-gate]
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -3318,7 +3318,7 @@ nodes:
   - id: diff-review-final
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -3423,7 +3423,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: codex
-    model: gpt-5.6-sol
+    model: gpt-6.1-sol
     depends_on: [block-classify, repair-gate]
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $block-classify.output.status == 'BLOCKED'"
     prompt: |
@@ -3484,7 +3484,7 @@ nodes:
   - id: opus-rereview
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -3716,7 +3716,7 @@ nodes:
   - id: findings-consolidate
     persona: xo-opr
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -3848,7 +3848,7 @@ nodes:
   - id: apply-diff-review-final
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done

@@ -87,6 +87,13 @@ export interface MergeExecutionBridgeOptions {
   retryMaxAttempts?: number;
   repoConfig?: MergeExecutionRepoConfig;
   ceScopeRecheckDeps?: CeScopeRecheckDeps;
+  /** Receipt-backed exact-head review qualification. */
+  hasQualifiedReview?(input: {
+    owner: string;
+    repo: string;
+    number: number;
+    headSha: string;
+  }): Promise<boolean>;
   // Absent in tests that predate the spec hold. When omitted, no spec is read.
   readWoSpec?(woId: string): Promise<string>;
 }
@@ -656,6 +663,18 @@ async function mergeClaimedVerdict(
   }
   if (pr.headSha !== verdict.head_sha) {
     await skip('verdict_stale_head', pr.htmlUrl);
+    return undefined;
+  }
+  if (
+    !options.hasQualifiedReview ||
+    !(await options.hasQualifiedReview({
+      owner: pr.pr.owner,
+      repo: pr.pr.repo,
+      number: pr.pr.number,
+      headSha: verdict.head_sha,
+    }))
+  ) {
+    await skip('review_execution_unqualified', pr.htmlUrl);
     return undefined;
   }
   if (pr.state !== 'open') {

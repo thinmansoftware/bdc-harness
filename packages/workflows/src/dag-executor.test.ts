@@ -12005,7 +12005,7 @@ describe('agent persona dispatch', () => {
       );
       expect(captured).toHaveBeenCalledTimes(1);
       const options = (captured.mock.calls as unknown[][])[0][3] as Record<string, unknown>;
-      expect(options.model).toBe('gpt-5.6-terra');
+      expect(options.model).toBe('gpt-6.1-terra');
       expect(options.systemPrompt).toContain(
         'You are the War Council Architect for Blue Devil Collectibles.'
       );
