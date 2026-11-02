@@ -1,8 +1,9 @@
 /**
  * Behavioral tests for scripts/container/rebuild-archon-app.sh.
- * Tests 3-5 stub git, docker, and sqlite3 on PATH so the script never touches
- * a real daemon or the host database. backupsOutsideCheckout uses real git
- * and stubs only docker and sqlite3. Skipped on win32 like build-app-image.
+ * Tests 3-5 stub git, docker, sqlite3, and curl on PATH so the script never
+ * touches a real daemon, the host database, or the live drain API.
+ * backupsOutsideCheckout uses real git and stubs docker, sqlite3, and curl.
+ * Skipped on win32 like build-app-image.
  *
  * The checkout path is the literal /opt/bdc/archon and is not an input.
  * Test 4 cannot create that directory here, so it installs a BASH_ENV cd
@@ -60,7 +61,7 @@ const DOCKER_STUB = [
   '  if [ "${STOP_ON_BUILD:-}" = "1" ] && [ -n "${ARCHON_REBUILD_STOP_FILE:-}" ]; then',
   '    printf \'stopped during build\\n\' > "$ARCHON_REBUILD_STOP_FILE"',
   '  fi',
-  '  exit 0',
+  '  exit "${DOCKER_BUILD_STATUS:-0}"',
   'fi',
   'if [ "${1:-}" = "image" ] && [ "${2:-}" = "inspect" ]; then',
   '  printf \'%s\\n\' "${DOCKER_INSPECT_LABEL:?}"',
@@ -71,6 +72,10 @@ const DOCKER_STUB = [
   'fi',
   'if [ "${1:-}" = "inspect" ]; then',
   '  printf \'%s\\n\' "${DOCKER_HEALTH:-healthy}"',
+  '  exit 0',
+  'fi',
+  'if [ "${1:-}" = "exec" ]; then',
+  '  printf \'%s\\n\' "${DOCKER_OPERATOR_TOKEN:-drain-token-sentinel}"',
   '  exit 0',
   'fi',
   'exit 99',
@@ -102,6 +107,75 @@ const SQLITE_STUB = [
   '',
 ].join('\n');
 
+const CURL_STUB = [
+  '#!/usr/bin/env bash',
+  'set -euo pipefail',
+  'log="${CURL_LOG:?}"',
+  'printf \'%s\\n\' "$*" >> "$log"',
+  'out="/dev/null"',
+  'write_format=""',
+  'url=""',
+  'method="GET"',
+  'data=""',
+  'while [ "$#" -gt 0 ]; do',
+  '  case "$1" in',
+  '    -sS|-s|-S|-f|-k)',
+  '      shift',
+  '      ;;',
+  '    -o)',
+  '      out="$2"',
+  '      shift 2',
+  '      ;;',
+  '    -w)',
+  '      write_format="$2"',
+  '      shift 2',
+  '      ;;',
+  '    -H)',
+  '      shift 2',
+  '      ;;',
+  '    -d|--data|--data-raw)',
+  '      data="$2"',
+  '      method="POST"',
+  '      shift 2',
+  '      ;;',
+  '    -X)',
+  '      method="$2"',
+  '      shift 2',
+  '      ;;',
+  '    *)',
+  '      url="$1"',
+  '      shift',
+  '      ;;',
+  '  esac',
+  'done',
+  'code="500"',
+  'body=""',
+  'if [[ "$url" == *"/api/health"* ]]; then',
+  '  code="${CURL_HEALTH_CODE:-200}"',
+  'elif [[ "$url" == *"/api/admin/drain"* ]]; then',
+  '  if [ "$method" = "POST" ]; then',
+  '    if printf \'%s\\n\' "$data" | grep -Eq \'"draining": true|"draining":true\'; then',
+  '      code="${CURL_DRAIN_ENABLE_CODE:-200}"',
+  '    elif printf \'%s\\n\' "$data" | grep -Eq \'"draining": false|"draining":false\'; then',
+  '      code="${CURL_DRAIN_DISABLE_CODE:-200}"',
+  '    else',
+  '      code="400"',
+  '    fi',
+  '  else',
+  '    code="${CURL_DRAIN_GET_CODE:-200}"',
+  '    body="$(printf \'{"activeRunCount":%s,"activeLeaseCount":%s}\' "${CURL_ACTIVE_RUNS:-0}" "${CURL_ACTIVE_LEASES:-0}")"',
+  '  fi',
+  'fi',
+  'if [ -n "$out" ]; then',
+  '  printf \'%s\' "$body" > "$out"',
+  'fi',
+  'if [ "$write_format" = \'%{http_code}\' ]; then',
+  '  printf \'%s\' "$code"',
+  'fi',
+  'exit 0',
+  '',
+].join('\n');
+
 interface RebuildControls {
   target?: string;
   holdContents?: string;
@@ -109,6 +183,13 @@ interface RebuildControls {
   stopOnBuild?: boolean;
   sqliteRuns?: string;
   head?: string;
+  dockerBuildStatus?: string;
+  curlActiveRuns?: string;
+  curlActiveLeases?: string;
+  curlHealthCode?: string;
+  curlDrainEnableCode?: string;
+  curlDrainDisableCode?: string;
+  curlDrainGetCode?: string;
 }
 
 interface RebuildResult {
@@ -118,11 +199,12 @@ interface RebuildResult {
   dockerLog: string;
   gitLog: string;
   sqliteLog: string;
+  curlLog: string;
 }
 
 function rebuildEnv(
   binDir: string,
-  logs: { docker: string; git: string; sqlite: string },
+  logs: { docker: string; git: string; sqlite: string; curl: string },
   paths: { hold: string; stop: string },
   controls: RebuildControls
 ): Record<string, string> {
@@ -139,6 +221,14 @@ function rebuildEnv(
     GIT_LOG: logs.git,
     DOCKER_LOG: logs.docker,
     SQLITE_LOG: logs.sqlite,
+    CURL_LOG: logs.curl,
+    DOCKER_BUILD_STATUS: controls.dockerBuildStatus ?? '0',
+    CURL_HEALTH_CODE: controls.curlHealthCode ?? '200',
+    CURL_DRAIN_ENABLE_CODE: controls.curlDrainEnableCode ?? '200',
+    CURL_DRAIN_DISABLE_CODE: controls.curlDrainDisableCode ?? '200',
+    CURL_DRAIN_GET_CODE: controls.curlDrainGetCode ?? '200',
+    CURL_ACTIVE_RUNS: controls.curlActiveRuns ?? '0',
+    CURL_ACTIVE_LEASES: controls.curlActiveLeases ?? '0',
     GIT_PORCELAIN: '',
     GIT_HEAD: head,
     DOCKER_INSPECT_LABEL: head,
@@ -154,6 +244,7 @@ function rebuildEnv(
   delete env.ARCHON_REBUILD_ROOT;
   delete env.BASH_ENV;
   delete env.REBUILD_TEST_ROOT;
+  delete env.DOCKER_OPERATOR_TOKEN;
   return env;
 }
 
@@ -165,6 +256,7 @@ async function runRebuild(controls: RebuildControls): Promise<RebuildResult> {
     const dockerLog = join(dir, 'docker.log');
     const gitLog = join(dir, 'git.log');
     const sqliteLog = join(dir, 'sqlite.log');
+    const curlLog = join(dir, 'curl.log');
     const holdFile = join(dir, 'hold');
     const stopFile = join(dir, 'stop');
     await mkdir(binDir);
@@ -172,12 +264,13 @@ async function runRebuild(controls: RebuildControls): Promise<RebuildResult> {
     await writeFile(dockerLog, '');
     await writeFile(gitLog, '');
     await writeFile(sqliteLog, '');
+    await writeFile(curlLog, '');
     if (controls.holdContents !== undefined) {
       await writeFile(holdFile, controls.holdContents);
     }
     const env = rebuildEnv(
       binDir,
-      { docker: dockerLog, git: gitLog, sqlite: sqliteLog },
+      { docker: dockerLog, git: gitLog, sqlite: sqliteLog, curl: curlLog },
       {
         hold: controls.holdContents !== undefined ? holdFile : join(dir, 'hold-absent'),
         stop: stopFile,
@@ -210,12 +303,15 @@ async function runRebuild(controls: RebuildControls): Promise<RebuildResult> {
     const gitPath = join(binDir, 'git');
     const dockerPath = join(binDir, 'docker');
     const sqlitePath = join(binDir, 'sqlite3');
+    const curlPath = join(binDir, 'curl');
     await writeFile(gitPath, GIT_STUB, { mode: 0o755 });
     await writeFile(dockerPath, DOCKER_STUB, { mode: 0o755 });
     await writeFile(sqlitePath, SQLITE_STUB, { mode: 0o755 });
+    await writeFile(curlPath, CURL_STUB, { mode: 0o755 });
     await chmod(gitPath, 0o755);
     await chmod(dockerPath, 0o755);
     await chmod(sqlitePath, 0o755);
+    await chmod(curlPath, 0o755);
 
     const proc = Bun.spawn(['bash', SCRIPT], {
       env,
@@ -228,6 +324,7 @@ async function runRebuild(controls: RebuildControls): Promise<RebuildResult> {
     const dockerLogged = await readFile(dockerLog, 'utf8');
     const gitLogged = await readFile(gitLog, 'utf8');
     const sqliteLogged = await readFile(sqliteLog, 'utf8');
+    const curlLogged = await readFile(curlLog, 'utf8');
     return {
       exitCode,
       stdout,
@@ -235,6 +332,7 @@ async function runRebuild(controls: RebuildControls): Promise<RebuildResult> {
       dockerLog: dockerLogged,
       gitLog: gitLogged,
       sqliteLog: sqliteLogged,
+      curlLog: curlLogged,
     };
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -271,6 +369,7 @@ describe('rebuild-archon-app', () => {
       expect(result.sqliteLog).toBe('');
       expect(result.gitLog).toBe('');
       expect(result.dockerLog).toBe('');
+      expect(result.curlLog).toBe('');
     }
   );
 
@@ -306,12 +405,14 @@ describe('rebuild-archon-app', () => {
       const binDir = join(dir, 'bin');
       const dockerLog = join(dir, 'docker.log');
       const sqliteLog = join(dir, 'sqlite.log');
+      const curlLog = join(dir, 'curl.log');
       const marker = 'compose-marker-backups-outside-checkout';
       try {
         await mkdir(backupDir);
         await mkdir(binDir);
         await writeFile(dockerLog, '');
         await writeFile(sqliteLog, '');
+        await writeFile(curlLog, '');
 
         const runGit = async (args: string[]): Promise<string> => {
           const proc = Bun.spawn(['git', ...args], {
@@ -364,10 +465,13 @@ describe('rebuild-archon-app', () => {
 
         const dockerPath = join(binDir, 'docker');
         const sqlitePath = join(binDir, 'sqlite3');
+        const curlPath = join(binDir, 'curl');
         await writeFile(dockerPath, DOCKER_STUB, { mode: 0o755 });
         await writeFile(sqlitePath, SQLITE_STUB, { mode: 0o755 });
+        await writeFile(curlPath, CURL_STUB, { mode: 0o755 });
         await chmod(dockerPath, 0o755);
         await chmod(sqlitePath, 0o755);
+        await chmod(curlPath, 0o755);
 
         const base: Record<string, string> = {};
         for (const [key, value] of Object.entries(process.env)) {
@@ -380,6 +484,14 @@ describe('rebuild-archon-app', () => {
           PATH: `${binDir}:${process.env.PATH ?? ''}`,
           DOCKER_LOG: dockerLog,
           SQLITE_LOG: sqliteLog,
+          CURL_LOG: curlLog,
+          DOCKER_BUILD_STATUS: '0',
+          CURL_HEALTH_CODE: '200',
+          CURL_DRAIN_ENABLE_CODE: '200',
+          CURL_DRAIN_DISABLE_CODE: '200',
+          CURL_DRAIN_GET_CODE: '200',
+          CURL_ACTIVE_RUNS: '0',
+          CURL_ACTIVE_LEASES: '0',
           DOCKER_INSPECT_LABEL: head,
           DOCKER_HEALTH: 'healthy',
           SQLITE_RUNS: '0',
@@ -394,6 +506,7 @@ describe('rebuild-archon-app', () => {
           TARGET: head,
         };
         delete env.ARCHON_REBUILD_ROOT;
+        delete env.DOCKER_OPERATOR_TOKEN;
 
         const proc = Bun.spawn(['bash', SCRIPT], {
           env,
@@ -439,5 +552,46 @@ describe('rebuild-archon-app', () => {
     expect(`${result.stdout}\n${result.stderr}`).toContain('1');
     expect(result.dockerLog).not.toContain('build');
     expect(result.dockerLog).toBe('');
+    expect(result.curlLog).toBe('');
   });
+
+  it.skipIf(SKIP_ON_WINDOWS)(
+    'drainBlocksAdmission: active runs at the pre-restart check refuse compose up',
+    async () => {
+      const result = await runRebuild({
+        target: GOOD_SHA,
+        withComposeFiles: true,
+        sqliteRuns: '0',
+        head: GOOD_SHA,
+        curlActiveRuns: '1',
+      });
+
+      expect(result.exitCode).toBe(12);
+      expect(result.dockerLog).toContain('compose build');
+      expect(result.dockerLog).not.toContain('compose up');
+      expect(result.stderr).toContain('drain_disabled');
+      expect(result.stdout).not.toContain('drain-token-sentinel');
+      expect(result.stderr).not.toContain('drain-token-sentinel');
+    }
+  );
+
+  it.skipIf(SKIP_ON_WINDOWS)(
+    'drainReleasedOnAbort: a failed build releases drain from the trap',
+    async () => {
+      const result = await runRebuild({
+        target: GOOD_SHA,
+        withComposeFiles: true,
+        sqliteRuns: '0',
+        head: GOOD_SHA,
+        dockerBuildStatus: '1',
+      });
+
+      expect(result.dockerLog).toContain('compose build');
+      expect(result.dockerLog).not.toContain('compose up');
+      expect(result.stderr).toContain('drain_enabled');
+      expect(result.stderr).toContain('drain_disabled');
+      expect(result.curlLog).toContain('/api/admin/drain');
+      expect(result.curlLog).not.toContain('/api/health');
+    }
+  );
 });

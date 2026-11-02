@@ -83,6 +83,8 @@ TARGET=<40-hex-sha> bash scripts/container/rebuild-archon-app.sh
 
 `TARGET` is required. The script refuses to start while a workflow run is `running` or `pending`. It copies both compose files into `ARCHON_REBUILD_BACKUP_DIR`, backs up the database, tags `archon:rollback-<STAMP>`, checks out `TARGET`, builds by calling `scripts/container/build-app-image.sh`, waits until live dispatch claims drain, then runs `docker compose up -d app`.
 
+After the in-flight run check, the script enables drain mode. It refuses `docker compose up -d app` unless the immediate pre-restart GET reports zero active runs and zero active leases. It disables drain after the health check succeeds, or through the EXIT trap on abort. A failed rebuild must not leave Cauldron draining.
+
 Untracked files such as `.env.bak-*` are still rejected later by `build-app-image.sh` (bdc-xo #4112). That dirty-tree rule is unchanged. This script does not prune images, delete backups, or remove old tags. Cleanup stays a separate overnight job.
 
 On success the script prints one rollback line:

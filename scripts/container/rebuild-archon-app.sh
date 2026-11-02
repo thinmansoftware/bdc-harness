@@ -42,6 +42,54 @@ if ! [[ "$runs" =~ ^[0-9]+$ ]] || [ "$runs" != "0" ]; then
   exit 13
 fi
 
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+
+drain_enabled=0
+operator_token=""
+
+disable_drain() {
+  local entered="${1:-0}"
+  if [ "$drain_enabled" != "1" ]; then
+    return 0
+  fi
+  drain_enabled=0
+  local code
+  code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "x-archon-operator-token: ${operator_token}" \
+    -H 'Content-Type: application/json' \
+    -d '{"draining": false}' \
+    "http://127.0.0.1:3090/api/admin/drain")" || code="$?"
+  if [ "$code" = "200" ]; then
+    printf 'drain_disabled\n' >&2
+    return 0
+  fi
+  printf 'drain_disable_failed\n' >&2
+  if [ "$entered" = "0" ]; then
+    exit 18
+  fi
+  return 0
+}
+
+trap 'exit_status=$?; trap - EXIT; disable_drain "$exit_status"; exit "$exit_status"' EXIT
+
+operator_token="$(docker exec archon-app-1 printenv ARCHON_OPERATOR_TOKEN)" || operator_token=""
+if [ -z "$operator_token" ]; then
+  printf 'refusing to rebuild: operator token unavailable\n' >&2
+  exit 17
+fi
+
+enable_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+  -H "x-archon-operator-token: ${operator_token}" \
+  -H 'Content-Type: application/json' \
+  -d "{\"draining\": true, \"reason\": \"rebuild-archon-app ${STAMP}\"}" \
+  "http://127.0.0.1:3090/api/admin/drain")" || enable_code="$?"
+if [ "$enable_code" != "200" ]; then
+  printf 'refusing to rebuild: drain enable status %s\n' "$enable_code" >&2
+  exit 17
+fi
+drain_enabled=1
+printf 'drain_enabled\n' >&2
+
 cd "$root"
 
 tracked="$(git status --porcelain --untracked-files=no)" || exit $?
@@ -51,7 +99,6 @@ if [ -n "$tracked" ]; then
 fi
 
 mkdir -p "$compose_backup_dir"
-STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 cp docker-compose.yml "${compose_backup_dir}/docker-compose.yml.pre-rebuild-${STAMP}"
 cp docker-compose.override.yml "${compose_backup_dir}/docker-compose.override.yml.pre-rebuild-${STAMP}"
 
@@ -94,6 +141,33 @@ done
 
 refuse_hold_or_stop
 
+drain_body_file="$(mktemp /tmp/archon-rebuild-drain.XXXXXX)"
+drain_code="$(curl -sS -o "$drain_body_file" -w '%{http_code}' \
+  -H "x-archon-operator-token: ${operator_token}" \
+  "http://127.0.0.1:3090/api/admin/drain")" || drain_code="$?"
+drain_body="$(cat "$drain_body_file")"
+rm -f "$drain_body_file"
+if [ "$drain_code" != "200" ]; then
+  exit 12
+fi
+
+active_runs=""
+active_leases=""
+if [[ "$drain_body" =~ \"activeRunCount\"[[:space:]]*:[[:space:]]*([0-9]+)[[:space:]]*[,}] ]]; then
+  active_runs="${BASH_REMATCH[1]}"
+elif [[ "$drain_body" =~ \"activeRunCount\"[[:space:]]*:[[:space:]]*([^,}[:space:]]+) ]]; then
+  active_runs="${BASH_REMATCH[1]}"
+fi
+if [[ "$drain_body" =~ \"activeLeaseCount\"[[:space:]]*:[[:space:]]*([0-9]+)[[:space:]]*[,}] ]]; then
+  active_leases="${BASH_REMATCH[1]}"
+elif [[ "$drain_body" =~ \"activeLeaseCount\"[[:space:]]*:[[:space:]]*([^,}[:space:]]+) ]]; then
+  active_leases="${BASH_REMATCH[1]}"
+fi
+if ! [[ "$active_runs" =~ ^[0-9]+$ ]] || ! [[ "$active_leases" =~ ^[0-9]+$ ]] || [ "$active_runs" -ne 0 ] || [ "$active_leases" -ne 0 ]; then
+  printf 'refusing to rebuild: active work remains activeRunCount=%s activeLeaseCount=%s\n' "$active_runs" "$active_leases" >&2
+  exit 12
+fi
+
 docker compose up -d app || exit $?
 
 poll=1
@@ -121,4 +195,5 @@ if [ "$code" != "200" ]; then
   exit 15
 fi
 
+disable_drain
 printf 'docker tag archon:rollback-%s archon:latest && git checkout --detach %s && docker compose up -d --no-build app\n' "$STAMP" "$PREV"
