@@ -314,6 +314,24 @@ export class ReviewExecutionIncompleteError extends Error {
   }
 }
 
+/**
+ * The supervisor INSPECTION argv run inside the no-network reviewer sandbox
+ * (WO-HARNESS-REVIEW-PROOF-SHALLOW-CHECKOUT-01).
+ *
+ * It MUST stay blob-free. Review checkouts are fetched `--depth 1
+ * --filter=blob:none` and, for some repos, sparse; only the base..head diff
+ * blobs are prefetched, and the sandbox cannot reach the promisor remote.
+ * `git show --stat <head>` on a depth-1 head diffs against the empty tree and
+ * needs every blob, so it failed there and every such review ended as
+ * sandbox_execution_proof_missing_or_invalid. `ls-tree -r --name-only` reads
+ * only tree objects, which the blob filter keeps, so it succeeds on full and
+ * shallow/sparse checkouts alike, and non-empty output still proves git ran in
+ * the real checkout at the exact head.
+ */
+export function reviewInspectionArgv(headSha: string): string[] {
+  return ['git', ...GIT_CONFIG_ARGS, 'ls-tree', '-r', '--name-only', headSha];
+}
+
 /** Server-observed native execution. No model field can manufacture this proof. */
 export async function observeReviewExecution(
   context: ReviewExecutionContext
@@ -331,7 +349,7 @@ export async function observeReviewExecution(
       const inspection = await submitReviewerBrokerJob({
         checkout: before.cwd,
         expectedHead: context.headSha,
-        argv: ['git', ...GIT_CONFIG_ARGS, 'show', '--stat', '--oneline', context.headSha],
+        argv: reviewInspectionArgv(context.headSha),
       });
       if (!inspection.ok || inspection.stdout.trim().length === 0) return undefined;
       const checks: ReviewExecutionProof['checks'][number][] = [];
