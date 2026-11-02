@@ -302,8 +302,11 @@ describe('bounded broker process capture', () => {
         expect((await stat(checkout)).mode & 0o222).toBe(0);
         await expect(mkdir(join(checkout, '.agents'))).rejects.toThrow();
 
+        // processJob always creates the job scratch before preparing the copy.
+        const otherScratch = join(spool, 'other.scratch');
+        await mkdir(otherScratch, { mode: 0o700 });
         await expect(
-          prepareModelWorkingCopy(checkout, join(spool, 'other.scratch'), 'f'.repeat(40), env)
+          prepareModelWorkingCopy(checkout, otherScratch, 'f'.repeat(40), env)
         ).rejects.toThrow('checkout_identity_failure');
       } finally {
         await Bun.spawn(['chmod', '-R', 'u+w', spool]).exited;
