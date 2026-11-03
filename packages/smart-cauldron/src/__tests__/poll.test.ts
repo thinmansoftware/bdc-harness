@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 
+import { judgeGate } from '../judge.js';
 import { PollTransportError, pollForTerminal } from '../poll.js';
 
 const originalFetch = globalThis.fetch;
@@ -184,5 +185,72 @@ describe('pollForTerminal isTransitionalStatus hook (T3 consumer approve hand-of
   test('without the hook (every existing caller), failed stays terminal', async () => {
     const result = await pollForTerminal({ ...base, fetchImpl: sequence() });
     expect(result.terminalStatus).toBe('failed');
+  });
+});
+
+describe('pollForTerminal SHA-credited open WO PR', () => {
+  const pushedSha = 'c'.repeat(40);
+  const creditedUrl = 'https://github.com/thinmansoftware/bdc-harness/pull/4422';
+
+  const runWithPushedHead = () =>
+    new Response(
+      JSON.stringify({
+        run: { id: 'run-sha-credit', status: 'completed', metadata: { head_sha: pushedSha } },
+        events: [],
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } }
+    );
+
+  test('credited_pr_mergeability_checked', async () => {
+    const mergeableChecks: string[] = [];
+    const listCalls: Array<{ woId: string; project: string }> = [];
+    const result = await pollForTerminal({
+      runId: 'run-sha-credit',
+      apiBaseUrl: 'http://archon.test',
+      timeoutMs: 60_000,
+      intervalMs: 1,
+      prRetryAttempts: 0,
+      prRetryDelayMs: 1,
+      prBranchLookupDelayMs: 1,
+      fetchImpl: (async () => runWithPushedHead()) as unknown as typeof fetch,
+      repo: 'thinmansoftware/bdc-harness',
+      woId: 'WO-XO-BDC-BROWSER-KEEPER-04',
+      ghPrListForBranch: async (): Promise<string | null> => null,
+      listOpenWoPullRequests: async input => {
+        listCalls.push(input);
+        return [
+          {
+            number: 4422,
+            headRefName: 'archon/task-web-worker-1-abc',
+            headSha: pushedSha,
+            url: creditedUrl,
+            createdAt: '2026-11-03T10:47:06Z',
+            isDraft: false,
+            isFork: false,
+            body: 'WO: WO-XO-BDC-BROWSER-KEEPER-04',
+          },
+        ];
+      },
+      // The credited PR conflicts with its base.
+      checkPrMergeable: async (prUrl: string): Promise<boolean | null> => {
+        mergeableChecks.push(prUrl);
+        return false;
+      },
+    });
+
+    expect(listCalls).toEqual([
+      { woId: 'WO-XO-BDC-BROWSER-KEEPER-04', project: 'thinmansoftware/bdc-harness' },
+    ]);
+    expect(result.prUrl).toBe(creditedUrl);
+    expect(mergeableChecks).toEqual([creditedUrl]);
+    expect(result.prMergeable).toBe(false);
+    expect(result.runPushedHeadSha).toBe(pushedSha);
+    expect(result.openWoPrHeadSha).toBe(pushedSha);
+
+    const verdict = judgeGate(result);
+    expect(verdict.prOpened).toBe(true);
+    expect(verdict.prMergeable).toBe(false);
+    expect(verdict.pass).toBe(false);
+    expect(verdict.reason).toContain('PR is not mergeable');
   });
 });

@@ -1054,8 +1054,9 @@ function siblingCreatedBeforeMerge(
  * Close OPEN non-draft, non-fork PRs in the merged PR's repo that declare one
  * of its eligible WO stems and were created strictly before mergedAt.
  * Eligible stems are manifest `WO:` lines minus `Reconcile-Skip:` stems.
- * A merged PR whose base is not the project base, or that has no eligible
- * stems, returns without listing siblings. Does not call closeTrackerIssue.
+ * A merged PR whose base is not the project base, that has no eligible stems,
+ * or whose changed files are spec-only (or unreadable), returns without
+ * listing siblings. Does not call closeTrackerIssue.
  * A failed list closes nothing. A truncated list still processes what it returned.
  */
 async function closeSupersededSiblingPullRequests(
@@ -1070,6 +1071,31 @@ async function closeSupersededSiblingPullRequests(
   const skipped = extractReconcileSkipStems(pr.body ?? '');
   const stems = extractDeclaredWoStems(pr.body ?? '').filter(stem => !skipped.has(stem));
   if (stems.length === 0) return 'continue';
+
+  // SPEC-ONLY GUARD (same rule as the tracker path). A merge that only lands a
+  // WO spec document is not completion evidence, so it closes no sibling. A
+  // truncated or failed file list cannot prove otherwise: close nothing.
+  if (deps.listPullRequestFiles) {
+    let changedPaths: string[];
+    try {
+      const read = asPagedRead(await deps.listPullRequestFiles(pr));
+      if (read.truncated) {
+        logger.warn({ prRef }, 'overseer.reconcile.supersede_skipped_file_list_truncated');
+        return 'continue';
+      }
+      changedPaths = read.items;
+    } catch (error) {
+      logger.warn(
+        { err: error as Error, prRef },
+        'overseer.reconcile.supersede_skipped_file_list_failed'
+      );
+      return 'continue';
+    }
+    if (isSpecOnlyChangeSet(changedPaths)) {
+      logger.warn({ prRef, changedPaths }, 'overseer.reconcile.supersede_skipped_spec_only_merge');
+      return 'continue';
+    }
+  }
 
   let listed: PagedRead<ReconcileRepoOpenPullRequest>;
   try {
@@ -1163,6 +1189,8 @@ function collectStemsFromLines(input: string, linePattern: RegExp): Set<string> 
     // same tracker as `WO-FOO-01`. Comma/space separation falls out of the stem
     // pattern itself: anything between ids that is not a stem is ignored.
     for (const stem of extractWoStems(list.toUpperCase())) {
+      // Same boundary rule as branch matching: `WO-FOO-01-EXTRA` does not
+      // declare WO-FOO-01 just because the stem regex stops at a hyphen.
       if (matchesWoToken(list, stem)) stems.add(stem);
     }
   }

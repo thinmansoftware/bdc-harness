@@ -27,19 +27,19 @@ describe('textClaimsWoId', () => {
     expect(textClaimsWoId('WO-HARNESS-FOO-01A', 'WO-HARNESS-FOO-01')).toBe(false);
   });
 
-  test('rejects ambiguous thread suffixes even in branch names', () => {
+  test('matches branch names containing the WO (case-insensitive)', () => {
     expect(
       textClaimsWoId(
         'feat/wo-shopops-gary-support-visibility-01-thread-abc',
         'WO-SHOPOPS-GARY-SUPPORT-VISIBILITY-01'
       )
-    ).toBe(false);
+    ).toBe(true);
     expect(
       textClaimsWoId(
         'feat/WO-SHOPOPS-GARY-SUPPORT-VISIBILITY-01-thread-abc',
         'WO-SHOPOPS-GARY-SUPPORT-VISIBILITY-01'
       )
-    ).toBe(false);
+    ).toBe(true);
   });
 
   test('ignores a WO id listed under an "explicitly out of scope" heading (#1795)', () => {
@@ -164,7 +164,7 @@ describe('open WO repair selection', () => {
       ['OTHER', 'prefixwo-foo-01'],
       ['WO-FOO-01-EXTRA', 'wo-foo-01-extra'],
       ['WO-FOO-01-EXTRA', 'wo-foo-01-extra-thread-abc'],
-      ['WO-FOO-01-THREAD-ABC', 'wo-foo-01-thread-abc'],
+      ['WO-FOO-01-02', 'wo-foo-01-02-thread-abc'],
     ].map(([id, branch], index) => ({
       number: index + 1,
       body: `WO: ${id}`,
@@ -176,12 +176,16 @@ describe('open WO repair selection', () => {
       lookup: async () => rows,
     });
     expect(prs.map(pr => pr.number)).toEqual([2, 3]);
-    // Exercise branch matching independently of a matching body declaration.
+    // Exercise branch matching independently of a matching body declaration:
+    // fix/wo-foo-01-thread-def and fix/WO-FOO-01 match; wo-foo-010 never does.
     const branchOnly = await listOpenWoPullRequests({
       woId: 'wo-foo-01',
       project: 'bdc-harness',
       lookup: async () => rows.map(row => ({ ...row, body: 'WO: WO-OTHER-01' })),
     });
-    expect(branchOnly.map(pr => pr.number)).toEqual([3]);
+    expect(branchOnly.map(pr => pr.number)).toEqual([2, 3]);
+    expect(textClaimsWoId('fix/wo-foo-010-thread-abc', 'WO-FOO-01')).toBe(false);
+    expect(textClaimsWoId('fix/wo-foo-01-thread-def', 'WO-FOO-01')).toBe(true);
+    expect(textClaimsWoId('WO: WO-FOO-01-02', 'WO-FOO-01')).toBe(false);
   });
 });

@@ -348,11 +348,13 @@ describe('reconcile supersede', () => {
         keeperOpenPr(5, 'WO: WO-OTHER-01', 'fix/prefixwo-foo-01'),
         keeperOpenPr(6, 'WO: WO-FOO-01-EXTRA', 'fix/wo-foo-01-extra'),
         keeperOpenPr(7, 'WO: WO-FOO-01-EXTRA', 'fix/wo-foo-01-extra-thread-abc'),
-        keeperOpenPr(8, 'WO: WO-FOO-01-THREAD-ABC', 'fix/wo-foo-01-thread-abc'),
+        keeperOpenPr(8, 'WO: WO-FOO-01-02', 'fix/wo-foo-01-02-thread-abc'),
+        // Branch-only match through the engine -thread- suffix.
+        keeperOpenPr(9, 'WO: WO-OTHER-01', 'fix/wo-foo-01-thread-ghi'),
       ],
     });
     await runReconcileOnce({ deps });
-    expect(deps.pullCloses.map(pr => pr.number)).toEqual([2, 3]);
+    expect(deps.pullCloses.map(pr => pr.number)).toEqual([2, 3, 9]);
   });
 
   test('merge_closes_superseded_wo_prs', async () => {
@@ -438,6 +440,28 @@ describe('reconcile supersede', () => {
     expect(skipped.actions.filter(action => action.action === RECONCILE_SUPERSEDE_ACTION)).toEqual(
       []
     );
+
+    // A spec-only merge (only the WO document changed) is not completion evidence.
+    const specOnly = supersedeDeps({
+      pr: mergedPr({ ...merged, baseRef: 'dev' }),
+      opens: [sibling],
+    });
+    specOnly.listPullRequestFiles = async () => [`docs/work-orders/${KEEPER_WO}.md`];
+    await runReconcileOnce({ deps: specOnly });
+    expect(specOnly.pullCloses).toEqual([]);
+    expect(specOnly.listCalls.count).toBe(0);
+
+    // Positive control: the same merge with a code change on the project base closes it.
+    const eligible = supersedeDeps({
+      pr: mergedPr({ ...merged, baseRef: 'dev' }),
+      opens: [sibling],
+    });
+    eligible.listPullRequestFiles = async () => [
+      `docs/work-orders/${KEEPER_WO}.md`,
+      'packages/overseer/src/reconcile.ts',
+    ];
+    await runReconcileOnce({ deps: eligible });
+    expect(eligible.pullCloses.map(close => close.number)).toEqual([4422]);
   });
 
   test('newer_sibling_not_superseded', async () => {
