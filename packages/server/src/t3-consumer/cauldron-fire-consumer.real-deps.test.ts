@@ -30,7 +30,7 @@ import * as conversationsDb from '@archon/core/db/conversations';
 import * as workflowsDb from '@archon/core/db/workflows';
 import * as workflowEventsDb from '@archon/core/db/workflow-events';
 import * as claims from '@archon/core/db/cascade-wo-claims';
-import { runCascade } from '@archon/smart-cauldron/cascade';
+import { readCascadeRecord, runCascade } from '@archon/smart-cauldron/cascade';
 import type { CascadeDeps } from '@archon/smart-cauldron/cascade';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import {
@@ -41,7 +41,7 @@ import {
   NON_TERMINAL_RUN_STATUSES,
   type CauldronFireConsumerDeps,
 } from '../dispatch/cauldron-fire-consumer';
-import { cascadeWoClaimDeps } from '../cascade/wo-claim';
+import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
 
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {
@@ -382,6 +382,209 @@ describe('A5.0: a Taskmaster cascade and a T3 fire for the same WO cannot both p
     });
     expect(tmBlocked.status).toBe('blocked');
     expect(fires).toEqual(['tm', 't3']);
+    rmSync(outDir, { recursive: true, force: true });
+  });
+});
+
+describe('Overseer major 1: approve is one check-and-write on the reviewed gate', () => {
+  test('approvePausedRunAtGate flips paused -> failed only while the run is at the expected gate', async () => {
+    const runId = await makeRun('WO-GATECAS-01', 'paused', {
+      approval: { nodeId: 'gate-1', type: 'approval' },
+    });
+    expect(
+      await workflowsDb.approvePausedRunAtGate(runId, 'gate-2', { approval_response: 'approved' })
+    ).toBe(false);
+    expect((await workflowsDb.getWorkflowRun(runId))?.status).toBe('paused');
+    expect(
+      await workflowsDb.approvePausedRunAtGate(runId, 'gate-1', { approval_response: 'approved' })
+    ).toBe(true);
+    const run = await workflowsDb.getWorkflowRun(runId);
+    expect(run?.status).toBe('failed');
+    expect(run?.metadata.approval_response).toBe('approved');
+    // Second approval of the same gate: no longer paused, nothing written.
+    expect(
+      await workflowsDb.approvePausedRunAtGate(runId, 'gate-1', { approval_response: 'approved' })
+    ).toBe(false);
+  });
+});
+
+describe('Overseer major 2: the shared claim is released only on a proven-terminal outcome', () => {
+  type Rec = Awaited<ReturnType<typeof readCascadeRecord>>;
+  function record(status: string, runIds: string[], extra: Record<string, unknown> = {}): Rec {
+    return {
+      cascadeId: 'c',
+      status,
+      attempts: runIds.map(runId => ({ runId })),
+      ...extra,
+    } as unknown as Rec;
+  }
+  const runs = new Map<string, { status: string; approvalHandOff: boolean }>();
+  const readRun = async (
+    runId: string
+  ): Promise<{ status: string; approvalHandOff: boolean } | null> => runs.get(runId) ?? null;
+
+  async function claimFor(
+    woId: string,
+    cascadeId: string,
+    rec: Rec
+  ): Promise<Awaited<ReturnType<typeof claims.findActiveWoClaim>>> {
+    const pair = cascadeWoClaimDeps('t3:test', db, { readRun, readRecord: async () => rec });
+    expect((await pair.acquireWoLock(woId, 'bdc-harness', cascadeId, '/x')).acquired).toBe(true);
+    await pair.releaseWoLock(woId, 'bdc-harness', cascadeId, '/x');
+    return claims.findActiveWoClaim(woId, db);
+  }
+
+  test('pause retains; uncertain exit retains; a second fire while retained is refused', async () => {
+    runs.set('r-p1', { status: 'failed', approvalHandOff: false });
+    const paused = await claimFor(
+      'WO-KEEP-01',
+      'cas-pause',
+      record('pending-frontier-approval', ['r-p1'])
+    );
+    expect(paused?.retained_reason).toBe('pending-frontier-approval');
+    expect(JSON.parse(paused?.run_ids_json ?? '[]')).toEqual(['r-p1']);
+
+    const uncertain = await claimFor('WO-KEEP-02', 'cas-unc', null);
+    expect(uncertain?.retained_reason).toBe('record_missing');
+
+    runs.set('r-ho', { status: 'failed', approvalHandOff: true });
+    const handOff = await claimFor('WO-KEEP-03', 'cas-ho', record('won', ['r-ho']));
+    expect(handOff?.retained_reason).toBe('run_not_terminal');
+
+    // A second fire (another cascade) cannot acquire a retained claim ...
+    const other = cascadeWoClaimDeps('taskmaster', db, { readRun, readRecord: async () => null });
+    expect(
+      (await other.acquireWoLock('WO-KEEP-01', 'bdc-harness', 'cas-other', '/x')).acquired
+    ).toBe(false);
+    // ... and the consumer refuses it 409 live_run before admission.
+    const replies: Record<string, unknown>[] = [];
+    await processCommand(
+      {
+        ...realDeps(),
+        db,
+        resolveProjectRepository: async () => 'thinmansoftware/bdc-harness',
+        hasLiveWorkflowRun: async () => ({ live: false, runId: null }),
+        sendReply: async input => {
+          replies.push(JSON.parse(input.body) as Record<string, unknown>);
+          return { id: 'rep' } as DispatchMessage;
+        },
+        acknowledge: async () => undefined,
+      },
+      {
+        id: 'cmd-keep',
+        correlation_id: 'KEEP',
+        idempotency_key: 'KEEP',
+        sender: 't3-bridge',
+        sender_principal_id: 't3-bridge',
+        recipient: 'cauldron-fire',
+        created_at: new Date().toISOString(),
+        body: JSON.stringify({
+          schema: 't3-command/v1',
+          request_id: 'KEEP',
+          verb: 'fire',
+          wo_id: 'WO-KEEP-01',
+          project: 'bdc-harness',
+        }),
+      } as unknown as DispatchMessage
+    );
+    expect(replies[0]).toMatchObject({ status: 409, code: 'live_run', cascade_id: 'cas-pause' });
+  });
+
+  test('a terminal cascade whose runs are all terminal releases the claim', async () => {
+    runs.set('r-done', { status: 'completed', approvalHandOff: false });
+    runs.set('r-fail', { status: 'failed', approvalHandOff: false });
+    expect(await claimFor('WO-FREE-01', 'cas-won', record('won', ['r-fail', 'r-done']))).toBeNull();
+  });
+
+  test('reconcile releases a retained claim once every run under it is terminal; never a paused one', async () => {
+    runs.set('r-live', { status: 'running', approvalHandOff: false });
+    expect(
+      (await claimFor('WO-REC-01', 'cas-rec', record('running', ['r-live'])))?.retained_reason
+    ).toBe('running');
+    runs.set('r-p2', { status: 'failed', approvalHandOff: false });
+    await claimFor('WO-REC-02', 'cas-rec2', record('pending-frontier-approval', ['r-p2']));
+
+    const recordFor = async (cascadeId: string): Promise<Rec> =>
+      cascadeId === 'cas-rec2'
+        ? record('pending-frontier-approval', ['r-p2'])
+        : record('running', ['r-live']);
+    expect(await reconcileRetainedWoClaims(db, { readRun, readRecord: recordFor })).toEqual([]);
+    runs.set('r-live', { status: 'cancelled', approvalHandOff: false });
+    expect(await reconcileRetainedWoClaims(db, { readRun, readRecord: recordFor })).toEqual([
+      'WO-REC-01',
+    ]);
+    expect(await claims.findActiveWoClaim('WO-REC-01', db)).toBeNull();
+    expect((await claims.findActiveWoClaim('WO-REC-02', db))?.cascade_id).toBe('cas-rec2');
+  });
+
+  test('the cascade resumed from a frontier approval takes over the retained claim', async () => {
+    runs.set('r-p3', { status: 'failed', approvalHandOff: false });
+    await claimFor('WO-RES-01', 'cas-orig', record('pending-frontier-approval', ['r-p3']));
+    const resumed = cascadeWoClaimDeps('t3:test', db, {
+      readRun,
+      readRecord: async cascadeId =>
+        cascadeId === 'cas-orig'
+          ? record('frontier-approved', ['r-p3'], {
+              frontierApproval: { resumeCascadeId: 'cas-resumed' },
+            })
+          : null,
+    });
+    expect(
+      (await resumed.acquireWoLock('WO-RES-01', 'bdc-harness', 'cas-intruder', '/x')).acquired
+    ).toBe(false);
+    expect(
+      (await resumed.acquireWoLock('WO-RES-01', 'bdc-harness', 'cas-resumed', '/x')).acquired
+    ).toBe(true);
+    expect((await claims.findActiveWoClaim('WO-RES-01', db))?.cascade_id).toBe('cas-resumed');
+  });
+
+  test('a real cascade that wins releases its claim (record written to outDir)', async () => {
+    const outDir = join(tmpdir(), `t3-claim-win-${randomUUID()}`);
+    runs.set('win-run', { status: 'completed', approvalHandOff: false });
+    const won = await runCascade({
+      woId: 'WO-WIN-01',
+      woClass: 'CODE',
+      tags: ['mechanical'],
+      outDir,
+      token: 't',
+      project: 'bdc-harness',
+      dispatchId: 'cas-win',
+      deps: {
+        findWoClaim: async () => null,
+        seatUsage: async () => {
+          const reading = {
+            limit_source: 'measured' as const,
+            windows: [{ name: '5h', used_percent: 5 }],
+          };
+          return { claude: reading, codex: reading, cursor: reading };
+        },
+        fire: async () => ({ ok: true, runId: 'win-run', conversationId: 'c', infraError: null }),
+        poll: async () => ({
+          runId: 'win-run',
+          terminalStatus: 'completed',
+          validatorVerdict: 'satisfied',
+          prUrl: 'https://github.com/o/r/pull/1',
+          prMergeable: true,
+          servedModelId: null,
+          rawMetadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        }),
+        fetchNodeTimeouts: async () => ({}),
+        judge: () => ({
+          pass: true,
+          reason: 'ok',
+          cancelled: false,
+          validatorVerdict: 'satisfied',
+          prOpened: true,
+          prMergeable: true,
+          terminalStatus: 'completed',
+        }),
+        escalate: async () => undefined,
+        readRunDetail: async () => null,
+        ...cascadeWoClaimDeps('t3:test', db, { readRun }),
+      },
+    });
+    expect(won.status).toBe('won');
+    expect(await claims.findActiveWoClaim('WO-WIN-01', db)).toBeNull();
     rmSync(outDir, { recursive: true, force: true });
   });
 });

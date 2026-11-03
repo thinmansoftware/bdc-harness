@@ -40,7 +40,7 @@ import type { T3CommandAdmissionRow, T3CommandVerb } from '@archon/core/db/t3-co
 import { checkFireEligibility as checkFireEligibilityImpl } from '../taskmaster/fire-eligibility';
 import { IN_PROCESS_API_ORIGIN } from '../routes/in-process-authority';
 import { findActiveWoClaim } from '@archon/core/db/cascade-wo-claims';
-import { cascadeWoClaimDeps } from '../cascade/wo-claim';
+import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
 import { hostname } from 'os';
 import { randomUUID } from 'crypto';
 // Type-only import: the run-action functions are loaded lazily in the real deps
@@ -189,7 +189,13 @@ export interface CauldronFireConsumerDeps {
   ) => Promise<CancelWorkflowRunActorResult>;
   approveRun: (
     runId: string,
-    opts: { comment: string; decisionVerb: 'approve_as_is'; authorizedFixIds: string[] }
+    opts: {
+      comment: string;
+      decisionVerb: 'approve_as_is';
+      authorizedFixIds: string[];
+      /** The reviewed gate; enforced inside the approval's conditional update. */
+      expectedNodeId: string;
+    }
   ) => Promise<ApprovePausedWorkflowRunResult>;
 
   // --- Recovery proofs (Amendment 2 A2.2 rule 4; read-only, never re-execute) ---
@@ -923,8 +929,14 @@ async function handleApprove(
     comment: 'T3 approve',
     decisionVerb: 'approve_as_is',
     authorizedFixIds: [],
+    expectedNodeId: cmd.node_id ?? '',
   });
   if (!result.ok) {
+    // The gate moved between the check and the approval's conditional update:
+    // nothing was written (no approval events).
+    if (result.status === 409 && result.message === 'gate_changed') {
+      return refuse(409, 'gate_changed');
+    }
     return refuse(result.status, 'approve_refused');
   }
   // A2.1 item 4/6: `approved` only when the resume was dispatched; otherwise the
@@ -1388,6 +1400,13 @@ export async function tickCauldronFireConsumer(deps: CauldronFireConsumerDeps): 
     await recoverStaleReservations(deps).catch((error: unknown) => {
       log.warn({ cause: (error as Error).message?.slice(0, 200) }, 'cauldron_fire_sweep_failed');
     });
+    // Release retained WO claims whose runs are all terminal (claim release (c)).
+    await reconcileRetainedWoClaims(deps.db).catch((error: unknown) => {
+      log.warn(
+        { cause: (error as Error).message?.slice(0, 200) },
+        'cauldron_fire_claim_reconcile_failed'
+      );
+    });
     const commands = await deps.listCommands(CAULDRON_FIRE_RECIPIENT, COMMAND_LIST_LIMIT);
     for (const message of commands) {
       const ok = await processCommand(deps, message);
@@ -1588,7 +1607,12 @@ export async function fireCascadeUntilRunDiscovered(
  */
 export async function approveRunWithResume(
   runId: string,
-  opts: { comment: string; decisionVerb: 'approve_as_is'; authorizedFixIds: string[] }
+  opts: {
+    comment: string;
+    decisionVerb: 'approve_as_is';
+    authorizedFixIds: string[];
+    expectedNodeId: string;
+  }
 ): Promise<ApprovePausedWorkflowRunResult> {
   const api = await import('../routes/api');
   return api.approvePausedWorkflowRun(runId, {

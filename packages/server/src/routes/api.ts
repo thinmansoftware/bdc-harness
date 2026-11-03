@@ -4,6 +4,7 @@
  */
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
 import { isInProcessServiceRequest } from './in-process-authority';
+import { releaseWoClaim } from '@archon/core/db/cascade-wo-claims';
 import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
@@ -3249,7 +3250,7 @@ export async function tryAutoResumeRun(
 export type ApprovePausedWorkflowRunResult =
   | { ok: true; kind: 'approved'; workflowName: string; autoResumed: boolean }
   | { ok: true; kind: 'already_approved'; workflowName: string }
-  | { ok: false; status: 400 | 404; message: string };
+  | { ok: false; status: 400 | 404 | 409; message: string };
 
 /**
  * Approve a paused run used by POST /api/workflows/runs/:runId/approve and the
@@ -3266,6 +3267,14 @@ export async function approvePausedWorkflowRun(
     decisionVerb: 'approve_as_is' | 'approve_with_fix';
     authorizedFixIds: string[];
     autoResume: (run: WorkflowRun) => Promise<boolean>;
+    /**
+     * The gate node the approver reviewed (the cauldron-fire consumer passes
+     * it). When set, the paused -> failed hand-off is ONE conditional update on
+     * (run id, paused, this gate) BEFORE any approval event is written; a gate
+     * that changed meanwhile is refused 409 `gate_changed` with no events. The
+     * HTTP route does not pass it and keeps its original write order.
+     */
+    expectedNodeId?: string;
   }
 ): Promise<ApprovePausedWorkflowRunResult> {
   const run = await workflowDb.getWorkflowRun(runId);
@@ -3297,6 +3306,22 @@ export async function approvePausedWorkflowRun(
       message: 'Workflow run is paused but missing approval context',
     };
   }
+  const gateMetadataUpdate =
+    approval.type === 'interactive_loop'
+      ? { loop_user_input: opts.comment }
+      : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
+  if (opts.expectedNodeId !== undefined) {
+    const gateHeld =
+      approval.nodeId === opts.expectedNodeId &&
+      (await workflowDb.approvePausedRunAtGate(runId, opts.expectedNodeId, gateMetadataUpdate));
+    if (!gateHeld) {
+      getLog().info(
+        { runId, expected: opts.expectedNodeId },
+        'api.workflow_run_approve_gate_changed'
+      );
+      return { ok: false, status: 409, message: 'gate_changed' };
+    }
+  }
   if (approval.type !== 'interactive_loop') {
     const nodeOutput =
       approval.captureResponse === true
@@ -3319,14 +3344,12 @@ export async function approvePausedWorkflowRun(
     step_name: approval.nodeId,
     data: { decision: 'approved', comment },
   });
-  const metadataUpdate =
-    approval.type === 'interactive_loop'
-      ? { loop_user_input: comment }
-      : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
-  await workflowDb.updateWorkflowRun(runId, {
-    status: 'failed',
-    metadata: metadataUpdate,
-  });
+  if (opts.expectedNodeId === undefined) {
+    await workflowDb.updateWorkflowRun(runId, {
+      status: 'failed',
+      metadata: gateMetadataUpdate,
+    });
+  }
   const autoResumed = await opts.autoResume(run);
   return { ok: true, kind: 'approved', workflowName: run.workflow_name, autoResumed };
 }
@@ -7842,6 +7865,29 @@ export function registerApiRoutes(
   });
 
   // GET /api/workflows/runs/:runId - Get run details with events
+  // POST /api/cascade-wo-claims/release -- operator release of a RETAINED shared
+  // WO claim (WO-HARNESS-T3-COMMAND-CONSUMER-01). Behind the /api operator auth;
+  // dispatch principals are refused by the middleware (not a transport route).
+  // CAS on (wo_id, cascade_id, active): only the named holder's claim is released.
+  app.post('/api/cascade-wo-claims/release', async c => {
+    let body: { woId?: unknown; cascadeId?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return apiError(c, 400, 'invalid_body');
+    }
+    if (typeof body.woId !== 'string' || typeof body.cascadeId !== 'string') {
+      return apiError(c, 400, 'woId and cascadeId are required');
+    }
+    const released = await releaseWoClaim({
+      woId: body.woId,
+      cascadeId: body.cascadeId,
+      now: new Date().toISOString(),
+    });
+    getLog().info({ woId: body.woId, cascadeId: body.cascadeId, released }, 'api.wo_claim_release');
+    return c.json({ released });
+  });
+
   registerOpenApiRoute(getWorkflowRunRoute, async c => {
     try {
       const runId = c.req.param('runId') ?? '';

@@ -199,6 +199,17 @@ for (const moduleName of [
         if (patch.metadata) run.metadata = { ...run.metadata, ...patch.metadata };
       }
     ),
+    // Store-backed twin of workflowsDb.approvePausedRunAtGate (one conditional update).
+    approvePausedRunAtGate: mock(
+      async (id: string, expected: string, update: Record<string, unknown>) => {
+        const run = store.runs.get(id);
+        const gate = (run?.metadata.approval as { nodeId?: string } | undefined)?.nodeId;
+        if (!run || run.status !== 'paused' || gate !== expected) return false;
+        run.status = 'failed';
+        run.metadata = { ...run.metadata, ...update };
+        return true;
+      }
+    ),
     createWorkflowEvent: mock(
       async (event: Omit<StoredEvent, 'created_at' | 'step_name'> & { step_name?: string }) => {
         store.events.push({
@@ -771,6 +782,35 @@ describe('Tests 11-12: consumer approve uses the real resume path', () => {
     expect(replies).toHaveLength(1);
     expect(replies[0]?.body).toMatchObject({ status: 200, code: 'approved', run_id: 'P1' });
     expect((await admissions.getByRequestId('Q-A11', db))?.code).toBe('approved');
+  });
+
+  test('major 1: a gate that advances between the check and the approve -> 409 gate_changed, no approval event', async () => {
+    makeApp();
+    seedPausedRun('P5', true);
+    await seedOwnership('P5');
+    const { deps, replies } = consumerDeps(approveCommand('P5', 'Q-GC'));
+    // The consumer's gate check passes (P5 paused at 'gate'); the next read is
+    // the PR -- by then the run has advanced to another gate.
+    const readPr = deps.getPullRequest;
+    deps.getPullRequest = async (repo, number) => {
+      const run = store.runs.get('P5');
+      if (run) run.metadata = { ...run.metadata, approval: { nodeId: 'gate-2', type: 'approval' } };
+      return readPr(repo, number);
+    };
+
+    await tickCauldronFireConsumer(deps);
+
+    expect(replies[0]?.body).toMatchObject({ status: 409, code: 'gate_changed' });
+    expect(
+      store.events.some(
+        event =>
+          event.workflow_run_id === 'P5' &&
+          (event.event_type === 'approval_received' || event.event_type === 'node_completed')
+      )
+    ).toBe(false);
+    expect(store.runs.get('P5')?.status).toBe('paused');
+    expect(executorCalls).toHaveLength(0);
+    expect((await admissions.getByRequestId('Q-GC', db))?.code).toBe('gate_changed');
   });
 
   test('Test 12: auto-resume refusal is reported as approved_not_resumed', async () => {

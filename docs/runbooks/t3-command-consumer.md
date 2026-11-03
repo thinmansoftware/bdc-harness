@@ -193,13 +193,33 @@ returns `blocked` with zero attempts; the consumer replies 409 `live_run`
 (admission `refused`). Taskmaster's `tm_fire_admissions` budget is untouched;
 T3 fires are not charged to it.
 
-Operator release of a claim whose process died (unknown outcome stays blocked
-until then; read the cascade record first and release only on proven
-completion or proven non-execution):
+Release is OUTCOME-CONDITIONAL (Overseer round 1 under Amendment 5; XO
+decision 2026-11-03). runCascade calls releaseWoLock whenever it exits;
+smart-cauldron's own file lock keeps that behavior for every other caller, but
+this DB claim is released only when the cascade record is terminal AND every run
+under it is terminal (no resumable run, no approval hand-off). Otherwise it is
+RETAINED (`retained_reason` = the record status, `record_missing`, or
+`run_not_terminal`; `run_ids_json` = the cascade's runs) and released later by:
+
+- (a) the resumed cascade: a `frontier-approved` record hands the claim to its
+  `resumeCascadeId` on acquire, and that cascade releases it at terminal;
+- (b) an operator, through the operator-token API (CAS on the named holder):
 
 ```
-docker exec -w /app archon-app-1 bun -e "const c = await import('@archon/core/db/cascade-wo-claims'); console.log(await c.releaseWoClaim({ woId: '<WO id>', cascadeId: '<cascade id>', now: new Date().toISOString() }))"
+curl -s -X POST http://localhost:3090/api/cascade-wo-claims/release -H "x-archon-operator-token: $TOKEN" -H 'content-type: application/json' --data '{"woId":"<WO id>","cascadeId":"<cascade id>"}'
 ```
+
+- (c) reconcile (`reconcileRetainedWoClaims`, every consumer tick): releases a
+  retained claim whose record is not paused/handed-off/delegated and whose
+  recorded runs are all terminal in the event store.
+
+There is no time-based expiry.
+
+Approve is ONE check-and-write on the reviewed gate: the consumer passes
+`node_id` to `approvePausedWorkflowRun`, which flips paused -> failed with a
+conditional update on (run id, paused, current gate node) BEFORE writing any
+approval event; if the gate moved, the reply is 409 `gate_changed` and nothing
+is written. The HTTP approve route is unchanged.
 
 ## Single consumer and poison rows (Amendment 5 A5.7, A5.12)
 

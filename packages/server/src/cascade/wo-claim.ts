@@ -7,20 +7,92 @@
  * cascade and a T3 cascade can never run the same WO at once, including between
  * tiers and during discovery. Keyed by the canonical WO id only (not project).
  * Taskmaster's tm_fire_admissions budget is untouched.
+ *
+ * Outcome-conditional release (Overseer major, XO decision 2026-11-03): runCascade
+ * calls releaseWoLock whenever it exits. smart-cauldron's own file lock keeps
+ * that behavior for every other caller; THIS database claim is released only on
+ * a proven-terminal outcome -- a terminal cascade record whose every run is
+ * terminal (no resumable run). On a frontier-approval pause or an uncertain
+ * exit it is RETAINED with the run ids, and released later by (a) the resumed
+ * cascade reaching terminal (the claim transfers to it on acquire), (b) an
+ * operator release, or (c) reconcileRetainedWoClaims finding every run under the
+ * claim terminal. No time-based expiry.
  */
 import type { IDatabase } from '@archon/core';
-import { acquireWoClaim, releaseWoClaim } from '@archon/core/db/cascade-wo-claims';
+import {
+  acquireWoClaim,
+  findActiveWoClaim,
+  listRetainedWoClaims,
+  releaseWoClaim,
+  retainWoClaim,
+  transferWoClaim,
+} from '@archon/core/db/cascade-wo-claims';
+import * as workflowsDb from '@archon/core/db/workflows';
+import { readCascadeRecord } from '@archon/smart-cauldron/cascade';
 import type { CascadeDeps } from '@archon/smart-cauldron/cascade';
 import type { AcquireWoLockResult } from '@archon/smart-cauldron/wo-lock';
 
+/** Cascade record statuses that may still resume or are still executing. */
+const HOLDING_CASCADE_STATUSES = new Set([
+  'running',
+  'pending-frontier-approval',
+  'frontier-approved',
+  'recovery-delegated',
+]);
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled', 'escalated']);
+
+/** Status of one workflow run, and whether a `failed` is an approval hand-off (resumable). */
+export type ClaimRunReader = (
+  runId: string
+) => Promise<{ status: string; approvalHandOff: boolean } | null>;
+
+const defaultRunReader: ClaimRunReader = async runId => {
+  const run = await workflowsDb.getWorkflowRun(runId);
+  if (!run) return null;
+  return {
+    status: run.status,
+    approvalHandOff: run.status === 'failed' && run.metadata.approval_response === 'approved',
+  };
+};
+
+async function everyRunTerminal(runIds: string[], readRun: ClaimRunReader): Promise<boolean> {
+  for (const runId of runIds) {
+    const run = await readRun(runId);
+    if (!run || !TERMINAL_RUN_STATUSES.has(run.status) || run.approvalHandOff) return false;
+  }
+  return true;
+}
+
+export interface ClaimDepsOptions {
+  readRun?: ClaimRunReader;
+  readRecord?: typeof readCascadeRecord;
+}
+
 export function cascadeWoClaimDeps(
   holder: string,
-  db?: IDatabase
+  db?: IDatabase,
+  options: ClaimDepsOptions = {}
 ): Required<Pick<CascadeDeps, 'acquireWoLock' | 'releaseWoLock'>> {
+  const readRun = options.readRun ?? defaultRunReader;
+  const readRecord = options.readRecord ?? readCascadeRecord;
   return {
-    acquireWoLock: async (woId, project, cascadeId): Promise<AcquireWoLockResult> => {
+    acquireWoLock: async (woId, project, cascadeId, outDir): Promise<AcquireWoLockResult> => {
       const now = new Date().toISOString();
-      const result = await acquireWoClaim({ woId, project, cascadeId, holder, now }, db);
+      let result = await acquireWoClaim({ woId, project, cascadeId, holder, now }, db);
+      // A frontier-approved pause hands its retained claim to the resumed cascade.
+      if (!result.acquired && result.claim?.retained_reason) {
+        const held = await readRecord(result.claim.cascade_id, outDir).catch(() => null);
+        if (
+          held?.status === 'frontier-approved' &&
+          held.frontierApproval?.resumeCascadeId === cascadeId &&
+          (await transferWoClaim(
+            { woId, fromCascadeId: result.claim.cascade_id, toCascadeId: cascadeId },
+            db
+          ))
+        ) {
+          result = { acquired: true, claim: await findActiveWoClaim(woId, db) };
+        }
+      }
       const claim = result.claim;
       return {
         acquired: result.acquired,
@@ -35,8 +107,57 @@ export function cascadeWoClaimDeps(
         },
       };
     },
-    releaseWoLock: async (woId, _project, cascadeId): Promise<void> => {
+    releaseWoLock: async (woId, _project, cascadeId, outDir): Promise<void> => {
+      const record = await readRecord(cascadeId, outDir).catch(() => null);
+      const runIds = (record?.attempts ?? [])
+        .map(attempt => attempt.runId)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0);
+      let retainReason: string | null = null;
+      if (!record) retainReason = 'record_missing';
+      else if (HOLDING_CASCADE_STATUSES.has(record.status)) retainReason = record.status;
+      else if (!(await everyRunTerminal(runIds, readRun))) retainReason = 'run_not_terminal';
+      if (retainReason) {
+        await retainWoClaim({ woId, cascadeId, reason: retainReason, runIds }, db);
+        return;
+      }
       await releaseWoClaim({ woId, cascadeId, now: new Date().toISOString() }, db);
     },
   };
+}
+
+/**
+ * (c) Reconcile retained claims: release one when its cascade can no longer
+ * resume (record not paused for approval / handed off / delegated) and every run
+ * recorded under it is terminal in the event store. Returns released WO ids.
+ */
+export async function reconcileRetainedWoClaims(
+  db?: IDatabase,
+  options: ClaimDepsOptions & { outDir?: string } = {}
+): Promise<string[]> {
+  const readRun = options.readRun ?? defaultRunReader;
+  const readRecord = options.readRecord ?? readCascadeRecord;
+  const released: string[] = [];
+  for (const claim of await listRetainedWoClaims(db)) {
+    const record = await readRecord(claim.cascade_id, options.outDir).catch(() => null);
+    if (record && record.status !== 'running' && HOLDING_CASCADE_STATUSES.has(record.status)) {
+      continue; // still resumable (paused for approval, handed off, delegated)
+    }
+    let runIds: string[] = [];
+    try {
+      runIds = JSON.parse(claim.run_ids_json) as string[];
+    } catch {
+      continue;
+    }
+    if (runIds.length === 0) continue; // nothing to prove terminal: operator release only
+    if (!(await everyRunTerminal(runIds, readRun))) continue;
+    if (
+      await releaseWoClaim(
+        { woId: claim.wo_id, cascadeId: claim.cascade_id, now: new Date().toISOString() },
+        db
+      )
+    ) {
+      released.push(claim.wo_id);
+    }
+  }
+  return released;
 }

@@ -928,7 +928,11 @@ CREATE TABLE IF NOT EXISTS cascade_wo_claims (
   holder TEXT NOT NULL,
   state TEXT NOT NULL CHECK (state IN ('active', 'released')),
   claimed_at TEXT NOT NULL,
-  released_at TEXT
+  released_at TEXT,
+  -- Set when the cascade exited without a proven-terminal outcome (frontier
+  -- pause, uncertain exception): the claim is RETAINED with its run ids.
+  retained_reason TEXT,
+  run_ids_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_cascade_wo_claims_active
   ON cascade_wo_claims (wo_id)

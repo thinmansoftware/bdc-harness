@@ -1939,6 +1939,33 @@ export async function updateWorkflowRun(
   }
 }
 
+/**
+ * WO-HARNESS-T3-COMMAND-CONSUMER-01 (Overseer major on approve): the approval
+ * check-and-write as ONE conditional update. Flips the run paused -> failed (the
+ * approval hand-off to resume) and merges `metadataUpdate`, but ONLY while the
+ * run is still paused at the gate `expectedNodeId`. Returns false when the run
+ * moved on (another gate, already approved, no longer paused): the caller then
+ * writes no approval events.
+ */
+export async function approvePausedRunAtGate(
+  id: string,
+  expectedNodeId: string,
+  metadataUpdate: Record<string, unknown>
+): Promise<boolean> {
+  const dialect = getDialect();
+  const gateExpr =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'approval'->>'nodeId'"
+      : "json_extract(metadata, '$.approval.nodeId')";
+  const result = await pool.query(
+    `UPDATE remote_agent_workflow_runs
+       SET status = 'failed', metadata = ${dialect.jsonMerge('metadata', 2)}
+     WHERE id = $1 AND status = 'paused' AND ${gateExpr} = $3`,
+    [id, JSON.stringify(metadataUpdate), expectedNodeId]
+  );
+  return result.rowCount > 0;
+}
+
 async function persistTerminalWorkflowRun(
   id: string,
   status: 'completed' | 'failed' | 'cancelled',

@@ -22,6 +22,8 @@ export interface WoClaimRow {
   state: 'active' | 'released';
   claimed_at: string;
   released_at: string | null;
+  retained_reason: string | null;
+  run_ids_json: string;
 }
 
 export interface AcquireWoClaimResult {
@@ -80,4 +82,45 @@ export async function releaseWoClaim(
     [input.woId, input.cascadeId, input.now]
   );
   return result.rowCount > 0;
+}
+
+/**
+ * RETAIN an active claim whose cascade exited without a proven-terminal
+ * outcome, recording why and the cascade's run ids. CAS on the holder.
+ */
+export async function retainWoClaim(
+  input: { woId: string; cascadeId: string; reason: string; runIds: string[] },
+  db: IDatabase = getDatabase()
+): Promise<boolean> {
+  const result = await db.query(
+    `UPDATE cascade_wo_claims SET retained_reason = $3, run_ids_json = $4
+     WHERE wo_id = $1 AND cascade_id = $2 AND state = 'active'`,
+    [input.woId, input.cascadeId, input.reason, JSON.stringify(input.runIds)]
+  );
+  return result.rowCount > 0;
+}
+
+/**
+ * Hand a retained claim to the cascade that resumes it (frontier approval):
+ * CAS from the original cascade id to the resumed one; retention cleared.
+ */
+export async function transferWoClaim(
+  input: { woId: string; fromCascadeId: string; toCascadeId: string },
+  db: IDatabase = getDatabase()
+): Promise<boolean> {
+  const result = await db.query(
+    `UPDATE cascade_wo_claims SET cascade_id = $3, retained_reason = NULL
+     WHERE wo_id = $1 AND cascade_id = $2 AND state = 'active'`,
+    [input.woId, input.fromCascadeId, input.toCascadeId]
+  );
+  return result.rowCount > 0;
+}
+
+/** Active claims that were retained at cascade exit (reconcile candidates). */
+export async function listRetainedWoClaims(db: IDatabase = getDatabase()): Promise<WoClaimRow[]> {
+  const result = await db.query<WoClaimRow>(
+    "SELECT * FROM cascade_wo_claims WHERE state = 'active' AND retained_reason IS NOT NULL",
+    []
+  );
+  return [...result.rows];
 }
