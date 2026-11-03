@@ -7,6 +7,9 @@ const TRANSIENT_EXACT_REASONS = new Set([
   'open_pr_not_found',
   'changed_files_unresolved',
   'pr_context_fetch_failed',
+  // Retry once the other reviews of the head finish; changes_requested is terminal.
+  'review_conflict_at_head:review_in_flight',
+  'review_conflict_at_head:lookup_failed',
 ]);
 
 const TRANSIENT_MESSAGE_PATTERN =

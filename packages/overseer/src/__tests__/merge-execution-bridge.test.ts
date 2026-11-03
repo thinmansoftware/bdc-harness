@@ -26,6 +26,7 @@ import type {
 const runMergeExecutionBridgeOnce = (options: MergeExecutionBridgeOptions): Promise<void> =>
   runMergeExecutionBridgeOnceProduction({
     hasQualifiedReview: async () => true,
+    reviewConflictAtHead: async () => null,
     ...options,
   });
 
@@ -208,6 +209,105 @@ describe('merge execution bridge', () => {
     });
     expect(h.merges).toBe(0);
     expect(h.outcomes[0]?.reason).toBe('review_execution_unqualified');
+  });
+
+  describe('exact-head review conflict (WO-HARNESS-MERGE-GATE-REFUSE-CONFLICTING-VERDICTS-01)', () => {
+    test('Test 1: approved_then_changes_requested_no_merge', async () => {
+      const h = harness([verdict('cr-at-head')]);
+      await runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+        reviewConflictAtHead: async input => {
+          expect(input).toEqual({
+            owner: 'thinmansoftware',
+            repo: 'bdc-harness',
+            number: 1,
+            headSha: 'judged-sha',
+          });
+          return 'changes_requested';
+        },
+      });
+      expect(h.merges).toBe(0);
+      expect(h.occupied).toBe(0);
+      expect(h.outcomes[0]).toEqual(
+        expect.objectContaining({
+          mutationSent: false,
+          reason: 'review_conflict_at_head:changes_requested',
+        })
+      );
+    });
+
+    test('Test 2: review_in_flight_no_merge', async () => {
+      const h = harness([verdict('in-flight')]);
+      const deferrals: { verdictId: string; reason: string }[] = [];
+      h.store.deferVerdictClaim = async (verdictId, reason) => {
+        deferrals.push({ verdictId, reason });
+        return true;
+      };
+      const capture = captureRootLogLines();
+      try {
+        await runMergeExecutionBridgeOnce({
+          store: h.store,
+          github: h.github,
+          readPolicy: () => policy(),
+          reviewConflictAtHead: async () => 'review_in_flight',
+        });
+        expectCoordinatorWarn(
+          capture.lines,
+          'merge-coordinator.merge_refused_conflicting_reviews',
+          {
+            verdictId: 'in-flight',
+            conflict: 'review_in_flight',
+          }
+        );
+      } finally {
+        capture.restore();
+      }
+      expect(h.merges).toBe(0);
+      expect(h.occupied).toBe(0);
+      expect(h.outcomes).toEqual([]);
+      expect(deferrals).toEqual([
+        { verdictId: 'in-flight', reason: 'review_conflict_at_head:review_in_flight' },
+      ]);
+    });
+
+    test('Test 3: no_conflict_merges', async () => {
+      const h = harness([verdict('no-conflict')]);
+      await runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+        reviewConflictAtHead: async () => null,
+      });
+      expect(h.merges).toBe(1);
+    });
+
+    test('Test 4: missing_dep_fails_closed', async () => {
+      const h = harness([verdict('conflict-missing')]);
+      await runMergeExecutionBridgeOnceProduction({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+        hasQualifiedReview: async () => true,
+      });
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('review_conflict_at_head:check_unavailable');
+    });
+
+    test('a throwing conflict lookup fails closed as lookup_failed', async () => {
+      const h = harness([verdict('conflict-throws')]);
+      await runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+        reviewConflictAtHead: async () => {
+          throw new Error('db down');
+        },
+      });
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('review_conflict_at_head:lookup_failed');
+    });
   });
 
   test('production CE compare adapter accepts 150 page-one files as complete', async () => {

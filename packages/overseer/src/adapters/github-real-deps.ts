@@ -18,8 +18,12 @@ import type {
   PullRequestCommitStatus,
   PullRequestEvidence,
   PullRequestRef,
+  ReviewConflictAtHead,
 } from '../types.ts';
-import { listMessages as listDispatchMessages } from '@archon/core/db/dispatch';
+import {
+  listMessages as listDispatchMessages,
+  type DispatchMessage,
+} from '@archon/core/db/dispatch';
 import { PR_REVIEW_LOG_RECIPIENT } from '@archon/core/db/dispatch-routing';
 import {
   REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
@@ -2163,6 +2167,51 @@ export function createRealListOpenPullRequests(
   };
 }
 
+// Same value as REVIEW_RECIPIENT in pr-review-wiring.ts; not imported because
+// pr-review-wiring already imports this module.
+const REVIEW_REQUEST_RECIPIENT = 'overseer-reviewer';
+
+function bodyAtHead(
+  message: Pick<DispatchMessage, 'body'>,
+  input: PullRequestRef & { headSha: string }
+): Record<string, unknown> | null {
+  try {
+    const body = JSON.parse(message.body) as Record<string, unknown>;
+    return body.owner === input.owner &&
+      body.repo === input.repo &&
+      body.prNumber === input.number &&
+      body.headSha === input.headSha
+      ? body
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Exact-head review conflict from dispatch rows. `receipts` are review submit
+ * receipts (pr-review-log and operator); `requests` are review requests to the
+ * reviewer. A changes_requested receipt at the head wins; otherwise a request
+ * for the head that is still queued or claimed means a review is in flight.
+ */
+export function reviewConflictFromMessages(
+  input: PullRequestRef & { headSha: string },
+  receipts: readonly Pick<DispatchMessage, 'body'>[],
+  requests: readonly Pick<DispatchMessage, 'body' | 'status'>[]
+): ReviewConflictAtHead | null {
+  const changesRequested = receipts.some(receipt => {
+    const body = bodyAtHead(receipt, input);
+    return body?.kind === 'pr_review_submit_receipt' && body.disposition === 'changes_requested';
+  });
+  if (changesRequested) return 'changes_requested';
+  const inFlight = requests.some(
+    request =>
+      (request.status === 'queued' || request.status === 'claimed') &&
+      bodyAtHead(request, input) !== null
+  );
+  return inFlight ? 'review_in_flight' : null;
+}
+
 /**
  * Build the real (non-fake) GitHubClientDeps composition for Overseer. Fails
  * loudly at construction time if the token is missing -- never silently
@@ -2257,6 +2306,31 @@ export function createRealGitHubClientDeps(
           return false;
         }
       });
+    },
+    reviewConflictAtHead: async (input): Promise<ReviewConflictAtHead | null> => {
+      const subjectKey = `gh:${input.owner}/${input.repo}#${input.number}`;
+      try {
+        const receipts = [
+          ...(await listDispatchMessages({
+            recipient: PR_REVIEW_LOG_RECIPIENT,
+            subject_key: subjectKey,
+            limit: 500,
+          })),
+          ...(await listDispatchMessages({
+            recipient: 'operator',
+            subject_key: subjectKey,
+            limit: 500,
+          })),
+        ];
+        const requests = await listDispatchMessages({
+          recipient: REVIEW_REQUEST_RECIPIENT,
+          subject_key: subjectKey,
+          limit: 500,
+        });
+        return reviewConflictFromMessages(input, receipts, requests);
+      } catch {
+        return 'lookup_failed';
+      }
     },
     findPullRequest: createRealFindPullRequest(octokit),
     // Merge mutations go through the distinct merge identity when configured
