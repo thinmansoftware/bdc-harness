@@ -55,6 +55,33 @@ describe('production Docker packaging', () => {
     // Debian installs fd-find's binary as `fdfind`; agents invoke `fd`.
     expect(dockerfile).toContain('/usr/local/bin/fd');
   });
+  /**
+   * Test 9 (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01): the OpenRouter review
+   * fence shells out to gitleaks to scan customer diffs/prompts before they
+   * reach an OpenRouter seat. A missing binary makes the fence fail closed
+   * (reroute), but the governed image must ship it so clean customer reviews
+   * are not needlessly rerouted. Assert it is installed into the PRODUCTION
+   * stage (not merely a build stage) at /usr/local/bin, pinned to 8.30.1.
+   */
+  it('Test 9: packages gitleaks 8.30.1 into the production image', async () => {
+    const dockerfile = await readFile(
+      join(import.meta.dir, '..', '..', '..', 'Dockerfile'),
+      'utf8'
+    );
+    const runtime = dockerfile.split('AS production')[1] ?? '';
+
+    expect(runtime).toContain('GITLEAKS_VERSION=8.30.1');
+    expect(runtime).toContain('install -m 755 /tmp/gitleaks /usr/local/bin/gitleaks');
+    expect(runtime).toContain(
+      'https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz'
+    );
+    // Checksum-verified, like every other pinned binary in this image.
+    expect(runtime).toContain(
+      'echo "${GITLEAKS_LINUX_X64_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -'
+    );
+    expect(runtime).toContain('test "$(command -v gitleaks)" = /usr/local/bin/gitleaks');
+  });
+
   it('retains the build toolchain and probes it in the final image', async () => {
     const dockerfile = await readFile(
       join(import.meta.dir, '..', '..', '..', 'Dockerfile'),
