@@ -12,7 +12,9 @@ import {
   MERGED_MARKER,
   RECONCILE_ACTION,
   RECONCILE_MERGED_ACTION,
+  TruncatedCommentsError,
   findLiveProof,
+  listIssueComments,
   liveProofAuthors,
   extractClosingKeywordTrackerRefs,
   openPullRequestsHoldingTracker,
@@ -970,4 +972,48 @@ test('Test 13 (open holder): a native close by this merge is reopened even while
   // The holder still governs the merged mark: no status:merged while a stage is open.
   expect(state.labels).toEqual([]);
   expect(state.actions.filter(a => a.action === RECONCILE_MERGED_ACTION)).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// Test 15: a comment read cut short at the page cap never closes (fail closed)
+// ---------------------------------------------------------------------------
+
+test('Test 15: a truncated comment read with an old LIVE-PROOF leaves the tracker open', async () => {
+  // Ten full pages: page 1 holds an old merged marker and an allowed LIVE-PROOF;
+  // a newer marker could sit past the cap, so the read must not be trusted.
+  const pagesRead: number[] = [];
+  const octokit = {
+    issues: {
+      listComments: async (input: Record<string, unknown>) => {
+        const page = Number(input.page ?? 1);
+        pagesRead.push(page);
+        const data = Array.from({ length: 100 }, (_, i) => ({
+          user: { login: page === 1 && i === 1 ? 'bluedevilcollectibles' : 'someone' },
+          body:
+            page === 1 && i === 0
+              ? MERGED_NOTE
+              : page === 1 && i === 1
+                ? 'LIVE-PROOF https://example.test/old-merge'
+                : 'chatter',
+          html_url: `https://github.com/${ORG}/bdc-xo/issues/4130#issuecomment-${page}${i}`,
+          created_at: '2026-11-03T00:00:00Z',
+        }));
+        return { data };
+      },
+    },
+  } as unknown as OctokitLike;
+
+  await expect(listIssueComments(octokit, tracker(4130, SHOPOPS_WO))).rejects.toBeInstanceOf(
+    TruncatedCommentsError
+  );
+  expect(Math.max(...pagesRead)).toBe(10);
+
+  const state = proofState([]);
+  state.deps.listTrackerComments = async input => listIssueComments(octokit, input.issue);
+  const result = await runReconcileOnce({ deps: state.deps });
+
+  expect(result.closed).toBe(0);
+  expect(state.closes).toEqual([]);
+  expect(state.labels).toEqual([]);
+  expect(state.warnings).toContain('overseer.reconcile.live_proof_comments_truncated_left_open');
 });

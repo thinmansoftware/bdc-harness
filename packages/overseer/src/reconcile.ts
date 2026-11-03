@@ -651,7 +651,12 @@ async function runLiveProofPass(deps: ReconcileDeps, logger: ReconcileLogger): P
     try {
       comments = await deps.listTrackerComments({ issue });
     } catch (error) {
-      logger.warn({ err: error as Error, prRef }, 'overseer.reconcile.live_proof_comments_failed');
+      logger.warn(
+        { err: error as Error, prRef },
+        error instanceof TruncatedCommentsError
+          ? 'overseer.reconcile.live_proof_comments_truncated_left_open'
+          : 'overseer.reconcile.live_proof_comments_failed'
+      );
       continue;
     }
     const proof = findLiveProof(comments, allowed);
@@ -1346,12 +1351,24 @@ async function latestCloseCommitSha(
   return seenClose ? latest : null;
 }
 
-async function listIssueComments(
+/**
+ * Thrown when the comment read hit the page cap before the last page, so a newer
+ * merged marker could be unread. The LIVE-PROOF pass treats it as "do not close".
+ */
+export class TruncatedCommentsError extends Error {
+  constructor(issueRef: string) {
+    super(`tracker comment read truncated at the page cap: ${issueRef}`);
+    this.name = 'TruncatedCommentsError';
+  }
+}
+
+export async function listIssueComments(
   octokit: OctokitLike,
   issue: ReconcileTrackerIssue
 ): Promise<ReconcileTrackerComment[]> {
   if (!octokit.issues.listComments) return [];
   const out: ReconcileTrackerComment[] = [];
+  let complete = false;
   for (let page = 1; page <= MERGED_LIST_MAX_PAGES; page++) {
     const res = await octokit.issues.listComments({
       owner: issue.owner,
@@ -1370,8 +1387,13 @@ async function listIssueComments(
         createdAt: typeof row.created_at === 'string' ? row.created_at : '',
       });
     }
-    if (rows.length < 100) break;
+    if (rows.length < 100) {
+      complete = true;
+      break;
+    }
   }
+  // Fail closed: never judge LIVE-PROOF on a partial comment list.
+  if (!complete) throw new TruncatedCommentsError(`${issue.owner}/${issue.repo}#${issue.number}`);
   return out;
 }
 
