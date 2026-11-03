@@ -9,6 +9,9 @@ import {
 
 export const stem = 'WO-HARNESS-OVERSEER-V1B-TRACKER-RECONCILE-01';
 
+// Default fixture: a merged bdc-harness PR on its project base (dev) that carries
+// a closing keyword for tracker #1044. Under the keyword-close rule this is what
+// closes a tracker (a bare name-mention never does).
 export function mergedPr(
   overrides: Partial<ReconcileMergedPullRequest> = {}
 ): ReconcileMergedPullRequest {
@@ -17,12 +20,13 @@ export function mergedPr(
     repo: 'bdc-harness',
     number: 404,
     title: 'BDC feature Work Order implementation',
-    body: `Implements ${stem}.`,
+    body: `Implements ${stem}.\n\nCloses thinmansoftware/bdc-xo#1044`,
     htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/404',
     state: 'closed',
     merged: true,
     mergeCommitSha: 'abc123merge',
     mergedAt: '2026-07-17T12:00:00Z',
+    baseRef: 'dev',
     ...overrides,
   };
 }
@@ -45,6 +49,7 @@ export function fakeDeps(
     trackerLookupError?: unknown;
     skipAlreadyNoted?: boolean;
     closeAlreadyRecorded?: boolean;
+    mergedAlreadyNoted?: boolean;
   } = {}
 ): ReconcileDeps & {
   comments: string[];
@@ -60,6 +65,8 @@ export function fakeDeps(
   const actions: ReconcileActionRecord[] = [];
   const warnings: string[] = [];
   const infos: string[] = [];
+  const resolveTracker = (): ReconcileTrackerIssue | null =>
+    input.tracker === undefined ? trackerIssue() : input.tracker;
   return {
     comments,
     labels,
@@ -73,10 +80,17 @@ export function fakeDeps(
       if (input.searchError) throw input.searchError;
       return input.prs ?? [mergedPr()];
     }),
+    // Keyword closes resolve the tracker by NUMBER; the default fixture closes #1044.
+    findTrackerIssueByNumber: mock(async (number: number) => {
+      if (input.trackerLookupError) throw input.trackerLookupError;
+      if (number !== 1044) return null;
+      return resolveTracker();
+    }),
+    // Still used for the holder guard and the keyword-missing note (declared stems).
     findTrackerIssueByStem: mock(async (candidate: string) => {
       if (input.trackerLookupError) throw input.trackerLookupError;
       if (candidate !== stem) return null;
-      return input.tracker === undefined ? trackerIssue() : input.tracker;
+      return resolveTracker();
     }),
     addTrackerEvidenceComment: mock(async request => {
       comments.push(request.body);
@@ -89,6 +103,8 @@ export function fakeDeps(
     }),
     hasSkipBeenNoted: mock(async () => Boolean(input.skipAlreadyNoted)),
     hasCloseBeenRecorded: mock(async () => Boolean(input.closeAlreadyRecorded)),
+    hasMergedBeenNoted: mock(async () => Boolean(input.mergedAlreadyNoted)),
+    hasKeywordMissingBeenNoted: mock(async () => false),
     insertAction: mock(async record => {
       actions.push(record);
     }),
@@ -104,22 +120,24 @@ export function fakeDeps(
 }
 
 describe('reconcile', () => {
-  test('merged fixture PR with stem in BODY and open tracker closes with evidence and records action=reconcile_close', async () => {
+  test('merged fixture PR with a closing keyword on its project base marks the tracker merged (open) and records action=reconcile_merged_noted class=closes_keyword', async () => {
     const deps = fakeDeps();
 
     const result = await runReconcileOnce({ deps });
 
-    expect(result).toEqual({ scanned: 1, closed: 1, skipped: false });
+    // Amendment A1: merged is not done -- no close, status:merged, one comment.
+    expect(result).toEqual({ scanned: 1, closed: 0, skipped: false });
     expect(deps.comments).toHaveLength(1);
     expect(deps.comments[0]).toContain('https://github.com/thinmansoftware/bdc-harness/pull/404');
     expect(deps.comments[0]).toContain('abc123merge');
-    expect(deps.comments[0]).toContain('thinmansoftware/bdc-harness');
-    expect(deps.labels).toEqual(['wo:done']);
-    expect(deps.closes).toEqual([1044]);
+    expect(deps.comments[0]).toContain('Base: dev');
+    expect(deps.labels).toEqual(['status:merged']);
+    expect(deps.closes).toEqual([]);
     expect(deps.actions).toMatchObject([
       {
         woId: stem,
-        action: 'reconcile_close',
+        class: 'closes_keyword',
+        action: 'reconcile_merged_noted',
         result: 'https://github.com/thinmansoftware/bdc-harness/pull/404:abc123merge',
       },
     ]);
@@ -132,7 +150,7 @@ describe('reconcile', () => {
     deps.labels.length = 0;
     deps.closes.length = 0;
     deps.actions.length = 0;
-    deps.findTrackerIssueByStem = mock(async () => trackerIssue('closed'));
+    deps.findTrackerIssueByNumber = mock(async () => trackerIssue('closed'));
 
     const result = await runReconcileOnce({ deps });
 
@@ -143,7 +161,7 @@ describe('reconcile', () => {
     expect(deps.actions).toEqual([]);
   });
 
-  test('merged PR with no stem is ignored', async () => {
+  test('merged PR with no closing keyword and no WO: declaration is ignored', async () => {
     const deps = fakeDeps({
       prs: [mergedPr({ title: 'Generic merged PR', body: 'No work order marker here.' })],
     });
@@ -151,6 +169,7 @@ describe('reconcile', () => {
     const result = await runReconcileOnce({ deps });
 
     expect(result).toEqual({ scanned: 1, closed: 0, skipped: false });
+    expect(deps.findTrackerIssueByNumber).not.toHaveBeenCalled();
     expect(deps.findTrackerIssueByStem).not.toHaveBeenCalled();
     expect(deps.closes).toEqual([]);
   });
