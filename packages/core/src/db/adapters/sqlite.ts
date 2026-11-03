@@ -2762,6 +2762,14 @@ export class SqliteAdapter implements IDatabase {
       DROP INDEX IF EXISTS idx_t3_command_admissions_live_fire;
       CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
         ON t3_command_admissions(wo_id) WHERE verb = 'fire' AND state IN ('reserved', 'unknown');
+      -- Run custody: every run a fire admission's cascade creates (migration 067).
+      CREATE TABLE IF NOT EXISTS t3_command_run_custody (
+        admission_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        tier TEXT,
+        discovered_at TEXT NOT NULL,
+        UNIQUE (run_id)
+      );
       -- Run lock: one unresolved cancel-own / approve per target run (migration 067).
       CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_run_lock
         ON t3_command_admissions(target_run_id)

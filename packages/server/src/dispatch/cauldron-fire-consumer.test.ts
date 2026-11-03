@@ -86,7 +86,9 @@ interface World {
   approveResult:
     | { ok: true; kind: 'approved'; workflowName: string; autoResumed: boolean }
     | { ok: false; status: 400 | 404; message: string };
-  fireCustody: Map<string, { runId: string; cascadeId: string | null }>; // request_id ->
+  fireCustody: Map<string, { runId: string; cascadeId: string | null; runIds: string[] }>;
+  cascadeRuns: Map<string, string[]>; // cascadeId -> run ids (custody fallback)
+  cascadeReads: number;
   cancelledBy: Map<string, string>; // runId -> actor
   approvedRuns: Set<string>;
 }
@@ -111,6 +113,8 @@ function makeWorld(env: Record<string, string | undefined>): World {
     prs: new Map(),
     approveResult: { ok: true, kind: 'approved', workflowName: 'wf', autoResumed: true },
     fireCustody: new Map(),
+    cascadeRuns: new Map(),
+    cascadeReads: 0,
     cancelledBy: new Map(),
     approvedRuns: new Set(),
   };
@@ -159,6 +163,7 @@ function makeWorld(env: Record<string, string | undefined>): World {
       // for the same WO is blocked by hasLiveWorkflowRun -- not by a historical
       // `admitted` admission, which must NOT block once its run completes.
       if (result.runId) world.liveRuns.set(input.woId, result.runId);
+      if (result.runId) input.onRunDiscovered?.(result.runId, 'tier-1');
       return result;
     },
     cancelRun: async (runId, opts) => {
@@ -174,6 +179,10 @@ function makeWorld(env: Record<string, string | undefined>): World {
     getRunBranch: async runId => world.runBranches.get(runId) ?? null,
     getPullRequest: async (repo, number) => world.prs.get(`${repo}#${number}`) ?? null,
     proveFireCustody: async row => world.fireCustody.get(row.request_id) ?? null,
+    readCascadeRunIds: async cascadeId => {
+      world.cascadeReads += 1;
+      return world.cascadeRuns.get(cascadeId) ?? [];
+    },
     proveCancel: async (runId, actor) => world.cancelledBy.get(runId) === actor,
     proveApprove: async runId => world.approvedRuns.has(runId),
   };
@@ -1383,7 +1392,7 @@ describe('Test 14: cancel-own -- before effect, after effect, pending, recovery'
       get(target, prop, receiver): unknown {
         if (prop === 'query') {
           return async (sql: string, params?: unknown[]): Promise<unknown> => {
-            if (sql.includes('actor_principal_id = $1 AND run_id = $2')) {
+            if (sql.includes('a.actor_principal_id = $1')) {
               throw new TypeError('ownership read failed');
             }
             return target.query(sql, params as never);
@@ -1600,5 +1609,118 @@ describe('Test 16: stranded commands cannot starve the page', () => {
     await tickCauldronFireConsumer(world.deps);
     expect(replyFor(world, 'cmd-good')).toMatchObject({ status: 200, code: 'ok' });
     expect((await admissions.getByRequestId('GOOD', db))?.state).toBe('admitted');
+  });
+});
+
+describe('Amendment 3: run custody follows the cascade across tiers', () => {
+  type CascadeImpl = Parameters<typeof fireCascadeUntilRunDiscovered>[0];
+  type CascadeOpts = Parameters<CascadeImpl>[0];
+
+  test('Test 17: tier 1 fails, tier 2 runs; the submitter owns T2, another principal does not', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    const impl = (async (opts: CascadeOpts) => {
+      opts.onRunDiscovered?.('T1', `C-${opts.woId}`, 'zero'); // tier 1: fails, climbs
+      opts.onRunDiscovered?.('T2', `C-${opts.woId}`, 'cursor'); // tier 2: running / paused
+      await new Promise<void>(() => undefined);
+      return {} as never;
+    }) as unknown as CascadeImpl;
+    world.deps.fireCascade = async input => {
+      world.calls.fire += 1;
+      return fireCascadeUntilRunDiscovered(
+        impl,
+        async () => null,
+        { woId: input.woId, project: input.project, dispatchId: input.dispatchId },
+        input.onRunDiscovered
+      );
+    };
+    await processCommand(world.deps, fireMsg('cmd-t17', 'T17', 'WO-T'));
+    await new Promise(resolve => setTimeout(resolve, 20)); // custody appends settle
+    expect(replyFor(world, 'cmd-t17')).toMatchObject({ status: 200, code: 'ok', run_id: 'T1' });
+    const custody = await admissions.listRunCustody('T17', db);
+    expect(custody.map(row => [row.run_id, row.tier])).toEqual([
+      ['T1', 'zero'],
+      ['T2', 'cursor'],
+    ]);
+
+    // Bindings for approving T2 (paused at its gate).
+    world.runRepos.set('T2', 'thinmansoftware/bdc-harness');
+    world.runBranches.set('T2', 'feat/x');
+    world.prs.set('thinmansoftware/bdc-harness#5', {
+      open: true,
+      headRepo: 'thinmansoftware/bdc-harness',
+      baseRepo: 'thinmansoftware/bdc-harness',
+      headRef: 'feat/x',
+      baseRef: 'dev',
+      headSha: SHA_CURRENT,
+    });
+
+    // (c) another allowlisted principal: forbidden, no effect.
+    const p2Cancel = makeMessage({
+      id: 'cmd-t17-p2c',
+      idempotencyKey: 'T17-P2C',
+      sender: 'p2',
+      principal: 'p2',
+      body: cmdBody({
+        request_id: 'T17-P2C',
+        verb: 'cancel-own',
+        project: 'bdc-harness',
+        run_id: 'T2',
+      }),
+    });
+    const p2Approve = makeMessage({
+      id: 'cmd-t17-p2a',
+      idempotencyKey: 'T17-P2A',
+      sender: 'p2',
+      principal: 'p2',
+      body: cmdBody({
+        request_id: 'T17-P2A',
+        verb: 'approve',
+        project: 'bdc-harness',
+        run_id_for_approve: 'T2',
+        pr: 'thinmansoftware/bdc-harness#5',
+        head_sha: SHA_CURRENT,
+      }),
+    });
+    await processCommand(world.deps, p2Cancel);
+    await processCommand(world.deps, p2Approve);
+    expect(JSON.parse(world.replyById.get('reply:cmd-t17-p2c')!.body)).toMatchObject({
+      status: 403,
+      code: 'forbidden_not_own_run',
+    });
+    expect(JSON.parse(world.replyById.get('reply:cmd-t17-p2a')!.body)).toMatchObject({
+      status: 403,
+      code: 'forbidden_not_own_run',
+    });
+    expect(world.calls.cancel).toBe(0);
+    expect(world.calls.approve).toBe(0);
+
+    // (b) the submitter approves the tier-2 run, then (a) cancels it.
+    await processCommand(world.deps, approveMsg('cmd-t17-a', 'T17-A', 'T2'));
+    expect(replyFor(world, 'cmd-t17-a')).toMatchObject({ status: 200, code: 'approved' });
+    await processCommand(world.deps, cancelMsg('cmd-t17-c', 'T17-C', 'T2'));
+    expect(replyFor(world, 'cmd-t17-c')).toMatchObject({ status: 200, code: 'ok', run_id: 'T2' });
+    expect(world.calls.approve).toBe(1);
+    expect(world.calls.cancel).toBe(1);
+    expect(world.cancelActors).toEqual(['t3-bridge']);
+  });
+
+  test('Test 18: a run missing from custody is resolved once from the cascade record, then appended', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    await seedAdmittedFire('t3-bridge', 'WO-F18', 'T3-FIRST', 'fire-18');
+    world.cascadeRuns.set('C-WO-F18', ['T3-FIRST', 'T3']);
+    expect(await admissions.hasRunCustody('T3', db)).toBe(false);
+
+    await processCommand(world.deps, cancelMsg('cmd-t18', 'T18', 'T3'));
+    expect(replyFor(world, 'cmd-t18')).toMatchObject({ status: 200, code: 'ok', run_id: 'T3' });
+    expect(world.cascadeReads).toBe(1);
+    const custody = await admissions.listRunCustody('fire-18', db);
+    expect(custody.map(row => row.run_id)).toEqual(['T3']);
+
+    // Custody now answers directly: no second fallback read.
+    expect(await admissions.ownsRun('t3-bridge', 'T3', db)).toBe(true);
+    // A run already in someone's custody never falls back for another actor.
+    expect(await admissions.ownsRun('p2', 'T3', db)).toBe(false);
   });
 });

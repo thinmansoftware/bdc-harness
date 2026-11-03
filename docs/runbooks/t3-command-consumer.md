@@ -102,6 +102,13 @@ hand-off state until someone re-runs it from the dashboard.
   in-process (see "In-process execution" below): no HTTP self-call, no
   operator token header.
 - cancel-own: allowed only when the actor fired that run through this consumer.
+- Run custody (Amendment 3): a fire admission owns EVERY run its cascade
+  creates, on every tier. Each discovered run is appended to
+  `t3_command_run_custody` (admission_id, run_id, tier, discovered_at; unique
+  run_id; append-only). Ownership for cancel-own and approve reads custody;
+  only when no custody row exists for a run does it fall back to the actor's
+  cascade records, logging `cauldron_fire_custody_fallback_used` and appending
+  the missing row.
 - approve: every binding is derived server-side (ownership, run repo = project
   repo = PR repo, same-repo head ref = run branch, base allowlisted, PR current
   head = stated `head_sha`). Production bases are never allowlisted.

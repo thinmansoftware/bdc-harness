@@ -127,6 +127,8 @@ export interface CauldronFireConsumerDeps {
     project: string;
     lane?: string;
     dispatchId: string;
+    /** Called once PER run the cascade discovers, on every tier (Amendment 3). */
+    onRunDiscovered?: (runId: string, tier: string | null) => void;
   }) => Promise<{ cascadeId: string; status: string; runId: string | null }>;
   /** Known lane overrides; an unknown lane is refused 400 unknown_lane. Empty/omitted = no lane check. */
   knownLanes?: readonly string[];
@@ -145,7 +147,9 @@ export interface CauldronFireConsumerDeps {
   /** Fire custody: the cascade's run exists and names the WO (as loop.ts verifies). */
   proveFireCustody: (
     row: T3CommandAdmissionRow
-  ) => Promise<{ runId: string; cascadeId: string | null } | null>;
+  ) => Promise<{ runId: string; cascadeId: string | null; runIds: string[] } | null>;
+  /** Run ids recorded in a cascade's attempts (custody fallback; Amendment 3). */
+  readCascadeRunIds: (cascadeId: string) => Promise<string[]>;
   /** The run is cancelled and its run_cancelled event names this actor. */
   proveCancel: (runId: string, actor: string) => Promise<boolean>;
   /** An approval_received event for the run at or after `sinceIso`. */
@@ -473,6 +477,20 @@ async function handleFire(
       project: cmd.project,
       lane: cmd.lane,
       dispatchId: cmd.request_id,
+      // Amendment 3: durable custody for EVERY run, on every tier.
+      onRunDiscovered: (runId, tier) => {
+        void admissions
+          .appendRunCustody(
+            { admission_id: cmd.request_id, run_id: runId, tier, now: deps.now().toISOString() },
+            deps.db
+          )
+          .catch((error: unknown) => {
+            log.warn(
+              { runId, cause: (error as Error).message?.slice(0, 200) },
+              'cauldron_fire_custody_append_failed'
+            );
+          });
+      },
     });
   } catch (error) {
     // The cascade invocation threw before returning a result. We cannot prove
@@ -529,6 +547,34 @@ async function handleFire(
   return { status: 200, code: 'ok', run_id: result.runId, cascade_id: result.cascadeId };
 }
 
+/**
+ * Ownership (Amendment 3 A3.1): custody rows (every run the actor's fire
+ * cascades created, on every tier) or the admission's own run id. Only when NO
+ * custody row exists for the run does it fall back to the actor's cascade
+ * records -- logged, and the missing custody row is appended.
+ */
+async function actorOwnsRun(
+  deps: CauldronFireConsumerDeps,
+  actor: string,
+  runId: string
+): Promise<boolean> {
+  if (await admissions.ownsRun(actor, runId, deps.db)) return true;
+  if (await admissions.hasRunCustody(runId, deps.db)) return false;
+  const fires = await admissions.listAdmittedFiresForActor(actor, deps.db);
+  for (const fire of fires) {
+    const runIds = await deps.readCascadeRunIds(fire.cascade_id ?? fire.request_id);
+    if (runIds.includes(runId)) {
+      log.warn({ runId, admissionId: fire.request_id }, 'cauldron_fire_custody_fallback_used');
+      await admissions.appendRunCustody(
+        { admission_id: fire.request_id, run_id: runId, tier: null, now: deps.now().toISOString() },
+        deps.db
+      );
+      return true;
+    }
+  }
+  return false;
+}
+
 async function handleCancel(
   deps: CauldronFireConsumerDeps,
   cmd: T3Command,
@@ -558,7 +604,7 @@ async function handleCancel(
     return refuseRunLocked(deps, fields, runId, now);
   }
 
-  if (!(await admissions.ownsRun(actor, runId, deps.db))) {
+  if (!(await actorOwnsRun(deps, actor, runId))) {
     await admissions.markRefused(
       cmd.request_id,
       { status_code: 403, code: 'forbidden_not_own_run', now },
@@ -660,7 +706,7 @@ async function handleApprove(
   };
 
   // (i) OWNERSHIP: the actor must have fired this run through this consumer.
-  if (!(await admissions.ownsRun(actor, runId, deps.db))) {
+  if (!(await actorOwnsRun(deps, actor, runId))) {
     return refuse(403, 'forbidden_not_own_run');
   }
   // (ii) PROJECT/REPO: run repo == admission project repo == PR repo.
@@ -1051,6 +1097,12 @@ async function recoverEffectStarted(
   if (row.verb === 'fire') {
     const custody = await deps.proveFireCustody(row);
     if (custody) {
+      for (const runId of custody.runIds) {
+        await admissions.appendRunCustody(
+          { admission_id: row.request_id, run_id: runId, tier: null, now },
+          deps.db
+        );
+      }
       await admissions.markAdmitted(
         row.request_id,
         {
@@ -1231,7 +1283,8 @@ export async function completeCommandMessage(messageId: string): Promise<void> {
 export async function fireCascadeUntilRunDiscovered(
   runCascadeImpl: typeof runCascade,
   readRecord: typeof readCascadeRecord,
-  options: Parameters<typeof runCascade>[0]
+  options: Parameters<typeof runCascade>[0],
+  onEachRun?: (runId: string, tier: string | null) => void
 ): Promise<{ cascadeId: string; status: string; runId: string | null }> {
   let discovered: ((value: { runId: string; cascadeId: string }) => void) | null = null;
   const runDiscovered = new Promise<{ runId: string; cascadeId: string }>(resolve => {
@@ -1239,7 +1292,14 @@ export async function fireCascadeUntilRunDiscovered(
   });
   const cascade = runCascadeImpl({
     ...options,
-    onRunDiscovered: (runId, cascadeId) => {
+    // Fires once PER run on every tier (Amendment 3): custody is appended for
+    // each; the first discovery also completes the fire admission.
+    onRunDiscovered: (runId, cascadeId, tierName) => {
+      try {
+        onEachRun?.(runId, tierName ?? null);
+      } catch {
+        // Custody observation only; never alters the cascade.
+      }
       discovered?.({ runId, cascadeId });
     },
   });
@@ -1369,27 +1429,32 @@ export function createRealCauldronFireConsumerDeps(
     ): Promise<{ cascadeId: string; status: string; runId: string | null }> => {
       const entryOverride =
         input.lane === 'cursor' || input.lane === 'zero' ? input.lane : undefined;
-      return fireCascadeUntilRunDiscovered(runCascade, readCascadeRecord, {
-        woId: input.woId,
-        project: input.project,
-        dispatchId: input.dispatchId,
-        // Trust boundary (WO-HARNESS-T3-COMMAND-CONSUMER-01 runbook): the T3
-        // command consumer fires on behalf of an authenticated ACTOR, never the
-        // operator. It must NOT carry the operator token. Pass an explicit empty
-        // token so runCascade does not fall back to process.env.ARCHON_OPERATOR_TOKEN
-        // (`token ?? env` only falls back on null/undefined, so '' short-circuits it).
-        token: '',
-        // Authenticated in-process execution: every Archon API call the cascade
-        // makes (codebase lookup, conversation dispatch, run discovery, poll,
-        // node timeouts, cancel, seat read) is dispatched into this server's own
-        // router by createInProcessApiFetch under the in-process service
-        // authority. No socket, no HTTP self-call, no operator token.
-        apiBaseUrl: IN_PROCESS_API_ORIGIN,
-        fetchImpl: apiFetch,
-        // A2.1 item 5: an approval's `failed` hand-off is not a terminal failure.
-        isTransitionalStatus: isApprovalHandOff,
-        entryOverride,
-      });
+      return fireCascadeUntilRunDiscovered(
+        runCascade,
+        readCascadeRecord,
+        {
+          woId: input.woId,
+          project: input.project,
+          dispatchId: input.dispatchId,
+          // Trust boundary (WO-HARNESS-T3-COMMAND-CONSUMER-01 runbook): the T3
+          // command consumer fires on behalf of an authenticated ACTOR, never the
+          // operator. It must NOT carry the operator token. Pass an explicit empty
+          // token so runCascade does not fall back to process.env.ARCHON_OPERATOR_TOKEN
+          // (`token ?? env` only falls back on null/undefined, so '' short-circuits it).
+          token: '',
+          // Authenticated in-process execution: every Archon API call the cascade
+          // makes (codebase lookup, conversation dispatch, run discovery, poll,
+          // node timeouts, cancel, seat read) is dispatched into this server's own
+          // router by createInProcessApiFetch under the in-process service
+          // authority. No socket, no HTTP self-call, no operator token.
+          apiBaseUrl: IN_PROCESS_API_ORIGIN,
+          fetchImpl: apiFetch,
+          // A2.1 item 5: an approval's `failed` hand-off is not a terminal failure.
+          isTransitionalStatus: isApprovalHandOff,
+          entryOverride,
+        },
+        input.onRunDiscovered
+      );
     },
     knownLanes: ['cursor', 'zero'],
     cancelRun: async (runId, opts): Promise<CancelWorkflowRunActorResult> => {
@@ -1398,13 +1463,24 @@ export function createRealCauldronFireConsumerDeps(
     },
     approveRun: (runId, opts): Promise<ApprovePausedWorkflowRunResult> =>
       approveRunWithResume(runId, opts),
-    proveFireCustody: async (row): Promise<{ runId: string; cascadeId: string | null } | null> => {
+    proveFireCustody: async (
+      row
+    ): Promise<{ runId: string; cascadeId: string | null; runIds: string[] } | null> => {
       const record = await readCascadeRecord(row.cascade_id ?? row.request_id);
-      const runId = record?.attempts.find(attempt => attempt.runId)?.runId ?? null;
+      const runIds = (record?.attempts ?? [])
+        .map(attempt => attempt.runId)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0);
+      const runId = runIds[0] ?? null;
       if (!runId || !row.wo_id) return null;
       const run = await workflowsDb.getWorkflowRun(runId);
       if (!run || !userMessageNamesWo(run.user_message ?? '', row.wo_id)) return null;
-      return { runId, cascadeId: record?.cascadeId ?? row.cascade_id };
+      return { runId, cascadeId: record?.cascadeId ?? row.cascade_id, runIds };
+    },
+    readCascadeRunIds: async (cascadeId): Promise<string[]> => {
+      const record = await readCascadeRecord(cascadeId);
+      return (record?.attempts ?? [])
+        .map(attempt => attempt.runId)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0);
     },
     proveCancel: async (runId, actor): Promise<boolean> => {
       const run = await workflowsDb.getWorkflowRun(runId);

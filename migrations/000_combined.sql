@@ -919,6 +919,15 @@ DROP INDEX IF EXISTS idx_t3_command_admissions_live_fire;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
   ON t3_command_admissions (wo_id)
   WHERE verb = 'fire' AND state IN ('reserved', 'unknown');
+-- Run custody (Amendment 3 A3.1): an admission owns EVERY run its cascade
+-- creates, on every tier. Append-only; one row per run.
+CREATE TABLE IF NOT EXISTS t3_command_run_custody (
+  admission_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  tier TEXT,
+  discovered_at TEXT NOT NULL,
+  UNIQUE (run_id)
+);
 -- Run lock (Amendment 2 A2.2 rule 2): at most one unresolved cancel-own /
 -- approve per target run. An `unknown` cancel/approve holds it until an
 -- operator adjudicates.

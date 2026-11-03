@@ -444,7 +444,7 @@ export interface RunCascadeOptions {
    * the run is still running or paused. A throwing callback never affects the
    * cascade.
    */
-  onRunDiscovered?: (runId: string, cascadeId: string) => void;
+  onRunDiscovered?: (runId: string, cascadeId: string, tierName: string) => void;
   /**
    * Passed through to the poller: a normally-terminal status that is a
    * transitional hand-off for this run (see pollForTerminal). Absent by default,
@@ -1359,7 +1359,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       attempt.runId = fireResult.runId;
       if (fireResult.ok && fireResult.runId && opts.onRunDiscovered) {
         try {
-          opts.onRunDiscovered(fireResult.runId, cascadeId);
+          opts.onRunDiscovered(fireResult.runId, cascadeId, tier.name);
         } catch {
           // Observation hook only; never alters the climb.
         }

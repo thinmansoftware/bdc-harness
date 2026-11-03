@@ -328,14 +328,78 @@ export async function ownsRun(
   db: IDatabase = getDatabase()
 ): Promise<boolean> {
   if (!runId) return false;
+  // Amendment 3: custody rows cover every run the admission's cascade created
+  // on every tier; the admission's own run_id (first run) also counts.
   const result = await db.query<{ request_id: string }>(
-    `SELECT request_id FROM t3_command_admissions
-     WHERE verb = 'fire' AND state = 'admitted'
-       AND actor_principal_id = $1 AND run_id = $2
+    `SELECT a.request_id FROM t3_command_admissions a
+     WHERE a.verb = 'fire' AND a.state = 'admitted'
+       AND a.actor_principal_id = $1 AND (a.run_id = $2 OR EXISTS (
+         SELECT 1 FROM t3_command_run_custody c
+         WHERE c.admission_id = a.request_id AND c.run_id = $2))
      LIMIT 1`,
     [actorPrincipalId, runId]
   );
   return result.rows.length > 0;
+}
+
+/**
+ * Append durable custody of `runId` to fire admission `admissionId` (Amendment
+ * 3 A3.1). Append-only and idempotent: a run already in custody is left as is.
+ */
+export async function appendRunCustody(
+  input: { admission_id: string; run_id: string; tier: string | null; now: string },
+  db: IDatabase = getDatabase()
+): Promise<void> {
+  await db.query(
+    `INSERT INTO t3_command_run_custody (admission_id, run_id, tier, discovered_at)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (run_id) DO NOTHING`,
+    [input.admission_id, input.run_id, input.tier, input.now]
+  );
+}
+
+/** True when any custody row exists for the run (owned by anyone). */
+export async function hasRunCustody(
+  runId: string,
+  db: IDatabase = getDatabase()
+): Promise<boolean> {
+  const result = await db.query<{ run_id: string }>(
+    'SELECT run_id FROM t3_command_run_custody WHERE run_id = $1 LIMIT 1',
+    [runId]
+  );
+  return result.rows.length > 0;
+}
+
+/** Custody rows of one admission, oldest first. */
+export async function listRunCustody(
+  admissionId: string,
+  db: IDatabase = getDatabase()
+): Promise<{ admission_id: string; run_id: string; tier: string | null; discovered_at: string }[]> {
+  const result = await db.query<{
+    admission_id: string;
+    run_id: string;
+    tier: string | null;
+    discovered_at: string;
+  }>(
+    `SELECT admission_id, run_id, tier, discovered_at FROM t3_command_run_custody
+     WHERE admission_id = $1 ORDER BY discovered_at ASC`,
+    [admissionId]
+  );
+  return [...result.rows];
+}
+
+/** The actor's admitted fire admissions (custody fallback candidates). */
+export async function listAdmittedFiresForActor(
+  actorPrincipalId: string,
+  db: IDatabase = getDatabase()
+): Promise<T3CommandAdmissionRow[]> {
+  const result = await db.query<T3CommandAdmissionRow>(
+    `SELECT * FROM t3_command_admissions
+     WHERE verb = 'fire' AND state = 'admitted' AND actor_principal_id = $1
+     ORDER BY created_at DESC`,
+    [actorPrincipalId]
+  );
+  return [...result.rows];
 }
 
 /** Reserved fire admissions found at startup (crash recovery). */
