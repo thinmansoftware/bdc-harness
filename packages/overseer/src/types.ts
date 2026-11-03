@@ -106,14 +106,16 @@ export interface PullRequestEvidence {
   /**
    * Latest check run per name and app, when the evidence source loaded them.
    * Absent on older fixtures. An empty array means the lookup returned no runs.
-   * The merge gate matches required contexts against these runs, then against
-   * `commitStatuses` when a context has no check run.
+   * The merge gate matches required contexts against these runs and against
+   * `commitStatuses`. When both exist for one context, both must pass.
    */
   checkRuns?: readonly RecheckCheckRun[];
   /**
    * Commit statuses for the head. Absent when the evidence source did not load
    * them. An empty array means the lookup returned none. The merge gate treats
    * the latest status for a context as passing only when its state is success.
+   * A passing check run with the same name does not override a non-success
+   * status.
    */
   commitStatuses?: readonly PullRequestCommitStatus[];
 }

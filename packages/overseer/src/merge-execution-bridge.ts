@@ -629,8 +629,11 @@ function commitStatusIsPassing(state: string): boolean {
  * Required contexts that are missing, still running, or completed without a
  * passing conclusion. Names match after trim and case fold. Only the latest
  * attempt per check name and app is considered. A context with no check run
- * can still pass when its latest commit status state is success. The returned
- * strings are the required context names, not the check-run display names.
+ * can still pass when its latest commit status state is success. When the
+ * same context has both a check run and a commit status, both must pass: a
+ * successful run does not hide a failed or pending status, and a successful
+ * status does not hide a failing run. The returned strings are the required
+ * context names, not the check-run display names.
  */
 function blockingRequiredContexts(
   contexts: readonly string[],
@@ -643,14 +646,16 @@ function blockingRequiredContexts(
   for (const context of contexts) {
     const want = context.trim().toLowerCase();
     const matches = latest.filter(run => (run.name ?? '').trim().toLowerCase() === want);
-    if (matches.length > 0) {
-      if (matches.some(run => run.status !== 'completed' || !conclusionIsPassing(run.conclusion))) {
-        blocking.push(context);
-      }
+    const status = latestStatuses.get(want);
+    if (matches.length === 0 && !status) {
+      blocking.push(context);
       continue;
     }
-    const status = latestStatuses.get(want);
-    if (!status || !commitStatusIsPassing(status.state)) blocking.push(context);
+    const runBlocking = matches.some(
+      run => run.status !== 'completed' || !conclusionIsPassing(run.conclusion)
+    );
+    const statusBlocking = status !== undefined && !commitStatusIsPassing(status.state);
+    if (runBlocking || statusBlocking) blocking.push(context);
   }
   return blocking;
 }
