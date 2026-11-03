@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { RECONCILE_ACTION, RECONCILE_SKIP_ACTION, runReconcileOnce } from '../reconcile';
+import { RECONCILE_MERGED_ACTION, RECONCILE_SKIP_ACTION, runReconcileOnce } from '../reconcile';
 import { fakeDeps, mergedPr, stem } from './reconcile.test';
 
 describe('reconcile partial completion skip marker', () => {
@@ -34,22 +34,22 @@ Reconcile-Skip: ${stem}`,
     ]);
   });
 
-  test('merged PR without Reconcile-Skip keeps existing close behavior unchanged', async () => {
+  test('merged PR without Reconcile-Skip keeps the keyword path (marked merged, open)', async () => {
     const deps = fakeDeps({
       prs: [mergedPr({ body: `Implements ${stem}.\n\nCloses thinmansoftware/bdc-xo#1044` })],
     });
 
     const result = await runReconcileOnce({ deps });
 
-    expect(result).toEqual({ scanned: 1, closed: 1, skipped: false });
+    expect(result).toEqual({ scanned: 1, closed: 0, skipped: false });
     expect(deps.comments).toHaveLength(1);
-    expect(deps.comments[0]).toContain(`Overseer reconcile closed tracker for ${stem}.`);
-    expect(deps.labels).toEqual(['wo:done']);
-    expect(deps.closes).toEqual([1044]);
+    expect(deps.comments[0]).toContain(`Overseer reconcile: ${stem} merged, not done.`);
+    expect(deps.labels).toEqual(['status:merged']);
+    expect(deps.closes).toEqual([]);
     expect(deps.actions).toMatchObject([
       {
         woId: stem,
-        action: RECONCILE_ACTION,
+        action: RECONCILE_MERGED_ACTION,
         result: 'https://github.com/thinmansoftware/bdc-harness/pull/404:abc123merge',
       },
     ]);

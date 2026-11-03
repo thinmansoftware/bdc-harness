@@ -49,6 +49,7 @@ export function fakeDeps(
     trackerLookupError?: unknown;
     skipAlreadyNoted?: boolean;
     closeAlreadyRecorded?: boolean;
+    mergedAlreadyNoted?: boolean;
   } = {}
 ): ReconcileDeps & {
   comments: string[];
@@ -102,6 +103,7 @@ export function fakeDeps(
     }),
     hasSkipBeenNoted: mock(async () => Boolean(input.skipAlreadyNoted)),
     hasCloseBeenRecorded: mock(async () => Boolean(input.closeAlreadyRecorded)),
+    hasMergedBeenNoted: mock(async () => Boolean(input.mergedAlreadyNoted)),
     hasKeywordMissingBeenNoted: mock(async () => false),
     insertAction: mock(async record => {
       actions.push(record);
@@ -118,23 +120,24 @@ export function fakeDeps(
 }
 
 describe('reconcile', () => {
-  test('merged fixture PR with a closing keyword on its project base closes with evidence and records action=reconcile_close class=closes_keyword', async () => {
+  test('merged fixture PR with a closing keyword on its project base marks the tracker merged (open) and records action=reconcile_merged_noted class=closes_keyword', async () => {
     const deps = fakeDeps();
 
     const result = await runReconcileOnce({ deps });
 
-    expect(result).toEqual({ scanned: 1, closed: 1, skipped: false });
+    // Amendment A1: merged is not done -- no close, status:merged, one comment.
+    expect(result).toEqual({ scanned: 1, closed: 0, skipped: false });
     expect(deps.comments).toHaveLength(1);
     expect(deps.comments[0]).toContain('https://github.com/thinmansoftware/bdc-harness/pull/404');
     expect(deps.comments[0]).toContain('abc123merge');
-    expect(deps.comments[0]).toContain('thinmansoftware/bdc-harness');
-    expect(deps.labels).toEqual(['wo:done']);
-    expect(deps.closes).toEqual([1044]);
+    expect(deps.comments[0]).toContain('Base: dev');
+    expect(deps.labels).toEqual(['status:merged']);
+    expect(deps.closes).toEqual([]);
     expect(deps.actions).toMatchObject([
       {
         woId: stem,
         class: 'closes_keyword',
-        action: 'reconcile_close',
+        action: 'reconcile_merged_noted',
         result: 'https://github.com/thinmansoftware/bdc-harness/pull/404:abc123merge',
       },
     ]);

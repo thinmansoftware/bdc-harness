@@ -22,6 +22,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   RECONCILE_ACTION,
+  RECONCILE_MERGED_ACTION,
   RECONCILE_SKIP_ACTION,
   classifyPullRequestStems,
   extractDeclaredWoStems,
@@ -297,7 +298,7 @@ describe('runReconcileOnce -- replay of the 2026-09-02 morning', () => {
     expect(findTracker.mock.calls.map(call => call[0])).not.toContain(UI_WO);
   });
 
-  test('#662 still closes the tracker for the WO it DOES implement (#1887) -- via its Closes keyword on the staging base', async () => {
+  test('#662 still marks the tracker for the WO it DOES implement (#1887) merged -- via its Closes keyword on the staging base', async () => {
     const deps = fakeDeps({ prs: [serverHalf.pr] });
 
     const result = await runReconcileOnce({
@@ -309,16 +310,17 @@ describe('runReconcileOnce -- replay of the 2026-09-02 morning', () => {
       },
     });
 
-    expect(result.closed).toBe(1);
-    expect(deps.closes).toEqual([1887]);
+    expect(result.closed).toBe(0);
+    expect(deps.closes).toEqual([]);
+    expect(deps.labels).toEqual(['status:merged']);
     expect(deps.comments).toHaveLength(1);
-    expect(deps.comments[0]).toContain(`Overseer reconcile closed tracker for ${SERVER_WO}.`);
+    expect(deps.comments[0]).toContain(`Overseer reconcile: ${SERVER_WO} merged, not done.`);
     expect(deps.actions).toMatchObject([
       {
         prRef: 'thinmansoftware/shopops#662',
         woId: SERVER_WO,
         class: 'closes_keyword',
-        action: RECONCILE_ACTION,
+        action: RECONCILE_MERGED_ACTION,
       },
     ]);
   });
@@ -407,12 +409,24 @@ describe('re-close guard -- a human reopen is not undone by the same PR', () => 
     expect(deps.warnings).toContain('overseer.reconcile.tracker_reopened_after_close_left_open');
   });
 
-  test('a PR that has never closed this tracker closes it (guard is inert on first sight)', async () => {
+  test('a PR that has never closed this tracker marks it merged (guard is inert on first sight)', async () => {
     const deps = fakeDeps({ closeAlreadyRecorded: false });
 
     const result = await runReconcileOnce({ deps });
 
-    expect(result.closed).toBe(1);
-    expect(deps.closes).toEqual([1044]);
+    expect(result.closed).toBe(0);
+    expect(deps.closes).toEqual([]);
+    expect(deps.labels).toEqual(['status:merged']);
+  });
+
+  test('a PR that already marked this tracker merged does nothing on a rescan', async () => {
+    const deps = fakeDeps({ mergedAlreadyNoted: true });
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result.closed).toBe(0);
+    expect(deps.labels).toEqual([]);
+    expect(deps.comments).toEqual([]);
+    expect(deps.actions).toEqual([]);
   });
 });

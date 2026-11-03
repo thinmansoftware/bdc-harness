@@ -87,7 +87,16 @@ export { createGitHubQualifiedMergeAdapter } from './adapters/github-qualified-m
 export { resolveDefaultDeps, runOverseerService } from './service';
 export {
   buildEvidenceComment,
+  buildLiveProofComment,
+  buildMergedComment,
   classifyPullRequestStems,
+  findLiveProof,
+  liveProofAuthors,
+  LIVE_PROOF_PATTERN,
+  MERGED_LABEL,
+  MERGED_MARKER,
+  RECONCILE_LIVE_PROOF_CLASS,
+  RECONCILE_MERGED_ACTION,
   createDefaultReconcileDeps,
   deriveTrackerWoId,
   extractClosingKeywordTrackerRefs,

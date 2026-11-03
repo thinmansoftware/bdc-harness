@@ -313,6 +313,10 @@ function trackerRunDeps(
     listOpenPullRequestsReferencingTracker: async () => [],
     hasCloseBeenRecorded: async () => false,
     hasHoldBeenNoted: async () => false,
+    hasMergedBeenNoted: async () => false,
+    removeTrackerLabel: async () => undefined,
+    // The LIVE-PROOF pass has its own tests; these cases exercise the merge path.
+    listMergedAwaitingProof: async () => [],
     addTrackerEvidenceComment: async () => {
       effects.push('comment');
     },
@@ -401,15 +405,16 @@ test('tracker REST lookup reused dependency factory refreshes between invocation
   trackerTransport(() => [trackerRow(501, trackerStem, currentState)]);
   const effects: string[] = [];
   const deps = trackerRunDeps(createDefaultReconcileDeps(), [mergedTrackerPr(601)], effects);
-  expect((await runReconcileOnce({ deps })).closed).toBe(1);
+  // Amendment A1: the keyword merge marks (label + comment) and never closes.
+  expect((await runReconcileOnce({ deps })).closed).toBe(0);
   currentState = 'closed';
   expect((await runReconcileOnce({ deps })).closed).toBe(0);
-  expect(effects).toEqual(['comment', 'label', 'close']);
+  expect(effects).toEqual(['label', 'comment']);
   expect(calls).toHaveLength(2);
   expect(calls.every(call => !call.url.includes('/search/'))).toBe(true);
 });
 
-test('tracker REST lookup closes one tracker only once across merged PRs in an invocation', async () => {
+test('tracker REST lookup marks one tracker only once across merged PRs in an invocation', async () => {
   app();
   trackerTransport(() => [trackerRow(501)]);
   const effects: string[] = [];
@@ -418,8 +423,8 @@ test('tracker REST lookup closes one tracker only once across merged PRs in an i
     [mergedTrackerPr(601), mergedTrackerPr(602)],
     effects
   );
-  expect(await runReconcileOnce({ deps })).toEqual({ scanned: 2, closed: 1, skipped: false });
-  expect(effects).toEqual(['comment', 'label', 'close']);
+  expect(await runReconcileOnce({ deps })).toEqual({ scanned: 2, closed: 0, skipped: false });
+  expect(effects).toEqual(['label', 'comment']);
   expect(calls).toHaveLength(1);
 });
 
@@ -434,8 +439,8 @@ test('tracker REST lookup spec-only evidence does not consume later implementati
   );
   deps.listPullRequestFiles = async pr =>
     pr.number === 601 ? [`docs/work-orders/${trackerStem}.md`] : ['src/fixture.ts'];
-  expect((await runReconcileOnce({ deps })).closed).toBe(1);
-  expect(effects.filter(effect => effect === 'close')).toHaveLength(1);
+  expect((await runReconcileOnce({ deps })).closed).toBe(0);
+  expect(effects.filter(effect => effect === 'label')).toHaveLength(1);
 });
 
 test('tracker REST lookup completes pagination before selecting a later exact issue', async () => {
@@ -616,7 +621,7 @@ test('tracker REST lookup: a keyword referencing an absent issue number closes n
   expect(effects).toEqual([]);
 });
 
-test('tracker REST lookup open-holder guard does not consume a later eligible close', async () => {
+test('tracker REST lookup open-holder guard does not consume a later eligible mark', async () => {
   app();
   trackerTransport(() => [trackerRow(501)]);
   const effects: string[] = [];
@@ -639,25 +644,25 @@ test('tracker REST lookup open-holder guard does not consume a later eligible cl
           },
         ]
       : [];
-  expect((await runReconcileOnce({ deps })).closed).toBe(1);
-  expect(effects).toEqual(['comment', 'comment', 'label', 'close']);
+  expect((await runReconcileOnce({ deps })).closed).toBe(0);
+  expect(effects).toEqual(['comment', 'label', 'comment']);
   expect(calls).toHaveLength(1);
 });
 
-test('tracker REST lookup failed close is not remembered as a successful close on a later run', async () => {
+test('tracker REST lookup failed mark is not remembered as a successful mark on a later run', async () => {
   app();
   trackerTransport(() => [trackerRow(501)]);
   const effects: string[] = [];
   const deps = trackerRunDeps(createDefaultReconcileDeps(), [mergedTrackerPr(601)], effects);
-  let failClose = true;
-  deps.closeTrackerIssue = async () => {
-    if (failClose) throw new Error('fixture close failed');
-    effects.push('close');
+  let failComment = true;
+  deps.addTrackerEvidenceComment = async () => {
+    if (failComment) throw new Error('fixture comment failed');
+    effects.push('comment');
   };
-  await expect(runReconcileOnce({ deps })).rejects.toThrow('fixture close failed');
-  failClose = false;
-  expect((await runReconcileOnce({ deps })).closed).toBe(1);
-  expect(effects.filter(effect => effect === 'close')).toHaveLength(1);
+  await expect(runReconcileOnce({ deps })).rejects.toThrow('fixture comment failed');
+  failComment = false;
+  expect((await runReconcileOnce({ deps })).closed).toBe(0);
+  expect(effects.filter(effect => effect === 'comment')).toHaveLength(1);
   expect(calls).toHaveLength(2);
 });
 

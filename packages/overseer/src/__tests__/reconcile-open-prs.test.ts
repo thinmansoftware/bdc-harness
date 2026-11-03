@@ -8,8 +8,8 @@
 import { expect, mock, test } from 'bun:test';
 import {
   openPullRequestsHoldingTracker,
-  RECONCILE_ACTION,
   RECONCILE_HOLD_OPEN_ACTION,
+  RECONCILE_MERGED_ACTION,
   runReconcileOnce,
   searchOpenPullRequestsReferencingTracker,
   type OctokitLike,
@@ -116,6 +116,7 @@ function harness(
     hasSkipBeenNoted: mock(async () => false),
     hasCloseBeenRecorded: mock(async () => false),
     hasHoldBeenNoted: mock(async () => Boolean(input.holdAlreadyNoted)),
+    hasMergedBeenNoted: mock(async () => false),
     hasKeywordMissingBeenNoted: mock(async () => false),
     insertAction: mock(async (record: ReconcileActionRecord) => {
       actions.push(record);
@@ -134,17 +135,18 @@ function harness(
 }
 
 function expectNormalClose(deps: ReturnType<typeof harness>, result: { closed: number }): void {
-  expect(result.closed).toBe(1);
-  expect(deps.closes).toEqual([1044]);
-  expect(deps.labels).toEqual(['wo:done']);
+  // Amendment A1: the "normal" keyword outcome is a merged mark, not a close.
+  expect(result.closed).toBe(0);
+  expect(deps.closes).toEqual([]);
+  expect(deps.labels).toEqual(['status:merged']);
   expect(deps.comments).toHaveLength(1);
-  expect(deps.comments[0]).toContain('Overseer reconcile closed tracker');
+  expect(deps.comments[0]).toContain('merged, not done');
   expect(deps.actions).toEqual([
     {
       prRef: 'thinmansoftware/bdc-harness#404',
       woId: stem,
       class: 'closes_keyword',
-      action: RECONCILE_ACTION,
+      action: RECONCILE_MERGED_ACTION,
       result: 'https://github.com/thinmansoftware/bdc-harness/pull/404:abc123merge',
     },
   ]);

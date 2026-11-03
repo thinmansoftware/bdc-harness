@@ -9,7 +9,11 @@
 
 import { expect, test } from 'bun:test';
 import {
+  MERGED_MARKER,
   RECONCILE_ACTION,
+  RECONCILE_MERGED_ACTION,
+  findLiveProof,
+  liveProofAuthors,
   extractClosingKeywordTrackerRefs,
   openPullRequestsHoldingTracker,
   runReconcileOnce,
@@ -20,6 +24,7 @@ import {
   type ReconcileDeps,
   type ReconcileMergedPullRequest,
   type ReconcileOpenPullRequest,
+  type ReconcileTrackerComment,
   type ReconcileTrackerIssue,
 } from '../reconcile';
 import { resolveProjectBase } from '../project-bases';
@@ -37,6 +42,9 @@ interface HarnessOptions {
   files?: string[];
   searchMergedPullRequests?: ReconcileDeps['searchMergedPullRequests'];
   openPullRequests?: ReconcileOpenPullRequest[];
+  mergedAlreadyNoted?: boolean;
+  awaitingProof?: ReconcileTrackerIssue[];
+  commentsByIssue?: Record<number, ReconcileTrackerComment[]>;
 }
 
 interface HarnessState {
@@ -47,6 +55,7 @@ interface HarnessState {
   actions: ReconcileActionRecord[];
   warnings: string[];
   infos: string[];
+  removed: string[];
 }
 
 function harness(options: HarnessOptions): HarnessState {
@@ -56,6 +65,7 @@ function harness(options: HarnessOptions): HarnessState {
   const actions: ReconcileActionRecord[] = [];
   const warnings: string[] = [];
   const infos: string[] = [];
+  const removed: string[] = [];
   const byNumber = options.trackersByNumber ?? {};
   const byStem = options.trackersByStem ?? {};
   const deps: ReconcileDeps = {
@@ -79,6 +89,12 @@ function harness(options: HarnessOptions): HarnessState {
     hasCloseBeenRecorded: async () => Boolean(options.closeAlreadyRecorded),
     hasHoldBeenNoted: async () => false,
     hasKeywordMissingBeenNoted: async () => false,
+    hasMergedBeenNoted: async () => Boolean(options.mergedAlreadyNoted),
+    removeTrackerLabel: async request => {
+      removed.push(request.label);
+    },
+    listMergedAwaitingProof: async () => options.awaitingProof ?? [],
+    listTrackerComments: async request => options.commentsByIssue?.[request.issue.number] ?? [],
     insertAction: async record => {
       actions.push(record);
     },
@@ -87,7 +103,7 @@ function harness(options: HarnessOptions): HarnessState {
       info: (_fields, message) => infos.push(message),
     },
   };
-  return { deps, comments, labels, closes, actions, warnings, infos };
+  return { deps, comments, labels, closes, actions, warnings, infos, removed };
 }
 
 function tracker(
@@ -96,6 +112,19 @@ function tracker(
   state: 'open' | 'closed' = 'open'
 ): ReconcileTrackerIssue {
   return { owner: ORG, repo: 'bdc-xo', number, title, state };
+}
+
+/** Amendment A1: a keyword merge marks the tracker merged, never closes it. */
+function expectMarkedOnce(state: HarnessState, woId: string): void {
+  expect(state.closes).toEqual([]);
+  expect(state.labels).toEqual(['status:merged']);
+  expect(state.removed).toEqual(['status:building', 'status:review']);
+  expect(state.comments).toHaveLength(1);
+  expect(state.comments[0]).toContain(MERGED_MARKER);
+  expect(state.actions.filter(a => a.action === RECONCILE_ACTION)).toEqual([]);
+  expect(state.actions.filter(a => a.action === RECONCILE_MERGED_ACTION)).toMatchObject([
+    { woId, class: 'closes_keyword', action: RECONCILE_MERGED_ACTION },
+  ]);
 }
 
 function mergedPr(overrides: Partial<ReconcileMergedPullRequest>): ReconcileMergedPullRequest {
@@ -187,7 +216,7 @@ function pagedSearchOctokit(targetItem: ReturnType<typeof searchItem>): OctokitL
   } as unknown as OctokitLike;
 }
 
-test('Test 1: a staging merge with a Closes keyword on page 2 of the search closes the tracker', async () => {
+test('Test 1 (A1): a staging merge with a Closes keyword on page 2 marks 4130 merged and leaves it open', async () => {
   const octokit = pagedSearchOctokit(searchItem(948, 'shopops', true));
   const state = harness({
     prs: [],
@@ -198,12 +227,12 @@ test('Test 1: a staging merge with a Closes keyword on page 2 of the search clos
 
   const result = await runReconcileOnce({ deps: state.deps });
 
-  expect(result.closed).toBe(1);
-  expect(state.closes).toEqual([4130]);
-  expect(state.actions.filter(a => a.action === RECONCILE_ACTION)).toMatchObject([
-    { woId: SHOPOPS_WO, class: 'closes_keyword', action: RECONCILE_ACTION },
-  ]);
-  // No keyword-missing note: the declared WO's tracker (4130) was keyword-closed.
+  expect(result.closed).toBe(0);
+  expectMarkedOnce(state, SHOPOPS_WO);
+  expect(state.comments[0]).toContain(`https://github.com/${ORG}/shopops/pull/948`);
+  expect(state.comments[0]).toContain('Merge SHA: 9d86e9f');
+  expect(state.comments[0]).toContain('Base: staging');
+  // No keyword-missing note: the declared WO's tracker (4130) carried the keyword.
   expect(state.actions.map(a => a.action)).not.toContain('reconcile_keyword_missing_noted');
 });
 
@@ -253,7 +282,7 @@ test('Test 1 (negative): a page-1-only search never sees the page-2 PR and close
 // Test 2: same_repo_hash_reference
 // ---------------------------------------------------------------------------
 
-test('Test 2: a bdc-xo PR into main with `Fixes #4999` closes 4999 exactly once', async () => {
+test('Test 2 (A1): a bdc-xo PR into main with `Fixes #4999` marks 4999 merged exactly once', async () => {
   const WO_4999 = 'WO-XO-HASH-REF-01';
   const state = harness({
     prs: [
@@ -272,9 +301,8 @@ test('Test 2: a bdc-xo PR into main with `Fixes #4999` closes 4999 exactly once'
 
   const result = await runReconcileOnce({ deps: state.deps });
 
-  expect(result.closed).toBe(1);
-  expect(state.closes).toEqual([4999]);
-  expect(state.actions.filter(a => a.action === RECONCILE_ACTION)).toHaveLength(1);
+  expect(result.closed).toBe(0);
+  expectMarkedOnce(state, WO_4999);
 });
 
 test('Test 2 (native close): an already-closed 4999 is not double-closed and does not error', async () => {
@@ -318,6 +346,21 @@ test('Test 3: a shopops PR merged into a feature branch closes nothing', async (
 // ---------------------------------------------------------------------------
 // Test 5: rescan_is_idempotent
 // ---------------------------------------------------------------------------
+
+test('Test 5 (A1): a recorded merged mark is not repeated when the lookback floor rescans the same PR', async () => {
+  const state = harness({
+    prs: [mergedPr({ baseRef: 'staging', body: `Closes ${ORG}/bdc-xo#4130` })],
+    trackersByNumber: { 4130: tracker(4130, SHOPOPS_WO) },
+    mergedAlreadyNoted: true,
+  });
+
+  const result = await runReconcileOnce({ deps: state.deps });
+
+  expect(result.closed).toBe(0);
+  expect(state.labels).toEqual([]);
+  expect(state.comments).toEqual([]);
+  expect(state.actions).toEqual([]);
+});
 
 test('Test 5: a recorded close is not repeated when the lookback floor rescans the same PR', async () => {
   const state = harness({
@@ -369,7 +412,7 @@ test('Test 6: OVERSEER_PROJECT_BASES override wins over the constant and unknown
   });
 });
 
-test('Test 6 (close path): the override redirects which branch closes, and an unknown repo closes nothing', async () => {
+test('Test 6 (mark path): the override redirects which branch marks, and an unknown repo marks nothing', async () => {
   await withBasesEnv('{"thinmansoftware/shopops":"release/x"}', async () => {
     // shopops now closes only on release/x; a staging merge no longer closes.
     const stagingState = harness({
@@ -382,7 +425,8 @@ test('Test 6 (close path): the override redirects which branch closes, and an un
       prs: [mergedPr({ baseRef: 'release/x', body: `Closes ${ORG}/bdc-xo#4130` })],
       trackersByNumber: { 4130: tracker(4130, SHOPOPS_WO) },
     });
-    expect((await runReconcileOnce({ deps: releaseState.deps })).closed).toBe(1);
+    expect((await runReconcileOnce({ deps: releaseState.deps })).closed).toBe(0);
+    expect(releaseState.labels).toEqual(['status:merged']);
 
     const unknownState = harness({
       prs: [
@@ -460,7 +504,7 @@ test('Test 7: a keyword-close PR with no WO stem is discovered via the tracker-r
   expect(prs.some(p => /WO-/.test(`${p.title}\n${p.body ?? ''}`))).toBe(false);
 });
 
-test('Test 7 (close path): the no-stem keyword PR closes its tracker exactly once', async () => {
+test('Test 7 (mark path): the no-stem keyword PR marks its tracker merged exactly once', async () => {
   const octokit = keywordOnlySearchOctokit();
   const WO_4999 = 'WO-XO-NO-STEM-CLOSE-01';
   const state = harness({
@@ -471,9 +515,8 @@ test('Test 7 (close path): the no-stem keyword PR closes its tracker exactly onc
 
   const result = await runReconcileOnce({ deps: state.deps });
 
-  expect(result.closed).toBe(1);
-  expect(state.closes).toEqual([4999]);
-  expect(state.actions.filter(a => a.action === RECONCILE_ACTION)).toHaveLength(1);
+  expect(result.closed).toBe(0);
+  expectMarkedOnce(state, WO_4999);
 });
 
 // ---------------------------------------------------------------------------
@@ -557,7 +600,10 @@ test('Test 10: a PR merged before the tracker existed never closes it, even by n
 
   expect(result.closed).toBe(0);
   expect(state.closes).toEqual([]);
+  expect(state.labels).toEqual([]);
+  expect(state.comments).toEqual([]);
   expect(state.actions.filter(a => a.action === RECONCILE_ACTION)).toHaveLength(0);
+  expect(state.actions.filter(a => a.action === RECONCILE_MERGED_ACTION)).toHaveLength(0);
 });
 
 test('Test 10 (keyword edited in after merge): a pre-tracker merge with `Closes #4344` still closes nothing', async () => {
@@ -571,10 +617,12 @@ test('Test 10 (keyword edited in after merge): a pre-tracker merge with `Closes 
 
   expect(result.closed).toBe(0);
   expect(state.closes).toEqual([]);
+  expect(state.labels).toEqual([]);
+  expect(state.comments).toEqual([]);
   expect(state.warnings).toContain('overseer.reconcile.pr_merged_before_tracker_created_left_open');
 });
 
-test('Test 10 (control): the same keyword merged AFTER the tracker existed closes it once', async () => {
+test('Test 10 (control): the same keyword merged AFTER the tracker existed marks it merged once', async () => {
   const pr = { ...pr4326(`Closes #4344\n\nWO: ${WO_4344}`), mergedAt: '2026-11-03T02:30:00Z' };
   const state = harness({
     prs: [pr],
@@ -584,12 +632,12 @@ test('Test 10 (control): the same keyword merged AFTER the tracker existed close
 
   const result = await runReconcileOnce({ deps: state.deps });
 
-  expect(result.closed).toBe(1);
-  expect(state.closes).toEqual([4344]);
+  expect(result.closed).toBe(0);
+  expectMarkedOnce(state, WO_4344);
 });
 
 // ---------------------------------------------------------------------------
-// Test 11: same-repo `Fixes #N` holds the tracker while the PR is open
+// Holder: same-repo `Fixes #N` holds the tracker while the PR is open
 // (Overseer review finding on PR 1432 at 4f57e792).
 // ---------------------------------------------------------------------------
 
@@ -606,7 +654,7 @@ function openPr(repo: string, number: number, body: string): ReconcileOpenPullRe
   };
 }
 
-test('Test 11: an open bdc-xo PR with only `Fixes #4999` holds tracker 4999', () => {
+test('Holder: an open bdc-xo PR with only `Fixes #4999` holds tracker 4999', () => {
   const holders = openPullRequestsHoldingTracker({
     stem: WO_HOLD,
     mergedPr: { owner: ORG, repo: 'bdc-xo', number: 4326 },
@@ -616,7 +664,7 @@ test('Test 11: an open bdc-xo PR with only `Fixes #4999` holds tracker 4999', ()
   expect(holders.map(h => h.number)).toEqual([4400]);
 });
 
-test('Test 11 (other repo): an open shopops PR with `Fixes #4999` means shopops 4999 and does not hold', () => {
+test('Holder (other repo): an open shopops PR with `Fixes #4999` means shopops 4999 and does not hold', () => {
   const holders = openPullRequestsHoldingTracker({
     stem: WO_HOLD,
     mergedPr: { owner: ORG, repo: 'bdc-xo', number: 4326 },
@@ -626,7 +674,7 @@ test('Test 11 (other repo): an open shopops PR with `Fixes #4999` means shopops 
   expect(holders).toEqual([]);
 });
 
-test('Test 11 (close path): a merged `Fixes #4999` does not close while another open `Fixes #4999` PR holds it', async () => {
+test('Holder (mark path): a merged `Fixes #4999` does not mark while another open `Fixes #4999` PR holds it', async () => {
   const state = harness({
     prs: [
       mergedPr({
@@ -646,9 +694,10 @@ test('Test 11 (close path): a merged `Fixes #4999` does not close while another 
 
   expect(result.closed).toBe(0);
   expect(state.closes).toEqual([]);
+  expect(state.labels).toEqual([]);
 });
 
-test('Test 11 (discovery): the open-PR search also queries the tracker repo for the bare number', async () => {
+test('Holder (discovery): the open-PR search also queries the tracker repo for the bare number', async () => {
   const queries: string[] = [];
   const octokit = {
     search: {
@@ -680,4 +729,131 @@ test('Test 11 (discovery): the open-PR search also queries the tracker repo for 
 
   expect(queries).toContain(`repo:${ORG}/bdc-xo is:pr is:open 4999`);
   expect(found.map(pr => pr.number)).toEqual([4400]);
+});
+
+// ---------------------------------------------------------------------------
+// Test 11: LIVE-PROOF closes a status:merged tracker (amendment A1.3)
+// ---------------------------------------------------------------------------
+
+function comment(author: string, body: string, n: number): ReconcileTrackerComment {
+  return {
+    author,
+    body,
+    htmlUrl: `https://github.com/${ORG}/bdc-xo/issues/4130#issuecomment-${n}`,
+    createdAt: `2026-11-03T0${n}:00:00Z`,
+  };
+}
+
+const MERGED_NOTE = `${MERGED_MARKER}\nOverseer reconcile: ${SHOPOPS_WO} merged, not done.`;
+
+function proofState(comments: ReconcileTrackerComment[], closeAlreadyRecorded = false) {
+  return harness({
+    prs: [],
+    awaitingProof: [tracker(4130, SHOPOPS_WO)],
+    commentsByIssue: { 4130: comments },
+    closeAlreadyRecorded,
+  });
+}
+
+test('Test 11: LIVE-PROOF from the XO after the merged note closes the tracker once', async () => {
+  const state = proofState([
+    comment('thinman-overseer[bot]', MERGED_NOTE, 1),
+    comment(
+      'bluedevilcollectibles',
+      'Deployed.\nLIVE-PROOF https://example.test/run/1 4130 status ok',
+      2
+    ),
+  ]);
+
+  const result = await runReconcileOnce({ deps: state.deps });
+
+  expect(result.closed).toBe(1);
+  expect(state.closes).toEqual([4130]);
+  expect(state.labels).toEqual(['wo:done']);
+  expect(state.comments[0]).toContain('issuecomment-2');
+  expect(state.actions).toMatchObject([
+    {
+      prRef: `${ORG}/bdc-xo#4130`,
+      woId: SHOPOPS_WO,
+      class: 'live_proof',
+      action: RECONCILE_ACTION,
+    },
+  ]);
+});
+
+test('Test 11 (not allowed): LIVE-PROOF from another login does nothing', async () => {
+  const state = proofState([
+    comment('thinman-overseer[bot]', MERGED_NOTE, 1),
+    comment('random-user', 'LIVE-PROOF https://example.test/run/1', 2),
+  ]);
+  expect((await runReconcileOnce({ deps: state.deps })).closed).toBe(0);
+  expect(state.closes).toEqual([]);
+});
+
+test('Test 11 (no evidence): a bare LIVE-PROOF does nothing', async () => {
+  const state = proofState([
+    comment('thinman-overseer[bot]', MERGED_NOTE, 1),
+    comment('bluedevilcollectibles', 'LIVE-PROOF', 2),
+    comment('bluedevilcollectibles', 'LIVE-PROOF    ', 3),
+  ]);
+  expect((await runReconcileOnce({ deps: state.deps })).closed).toBe(0);
+  expect(state.closes).toEqual([]);
+});
+
+test('Test 11 (before the merge): a LIVE-PROOF older than the merged note does not count', async () => {
+  const state = proofState([
+    comment('bluedevilcollectibles', 'LIVE-PROOF https://example.test/old', 1),
+    comment('thinman-overseer[bot]', MERGED_NOTE, 2),
+  ]);
+  expect((await runReconcileOnce({ deps: state.deps })).closed).toBe(0);
+});
+
+test('Test 11 (reopen): a tracker already closed once on LIVE-PROOF is not closed again', async () => {
+  const state = proofState(
+    [
+      comment('thinman-overseer[bot]', MERGED_NOTE, 1),
+      comment('bluedevilcollectibles', 'LIVE-PROOF https://example.test/run/1', 2),
+    ],
+    true
+  );
+  expect((await runReconcileOnce({ deps: state.deps })).closed).toBe(0);
+  expect(state.closes).toEqual([]);
+});
+
+test('Test 11 (authors): OVERSEER_LIVE_PROOF_AUTHORS overrides the default list', () => {
+  expect(liveProofAuthors({})).toEqual(['bluedevilcollectibles']);
+  expect(liveProofAuthors({ OVERSEER_LIVE_PROOF_AUTHORS: ' Builder-Bot , xo ' })).toEqual([
+    'builder-bot',
+    'xo',
+  ]);
+  const proof = findLiveProof(
+    [comment('bot', MERGED_NOTE, 1), comment('Builder-Bot', 'LIVE-PROOF ok 1/1', 2)],
+    liveProofAuthors({ OVERSEER_LIVE_PROOF_AUTHORS: 'builder-bot' })
+  );
+  expect(proof?.evidence).toBe('ok 1/1');
+});
+
+// ---------------------------------------------------------------------------
+// Test 12: a name-only PR leaves the tracker untouched (amendment A1.4)
+// ---------------------------------------------------------------------------
+
+test('Test 12: a merged PR that only names the WO and its tracker number marks nothing', async () => {
+  const state = harness({
+    prs: [
+      mergedPr({
+        baseRef: 'staging',
+        body: `Work for ${SHOPOPS_WO} (tracker issue 4130).`,
+      }),
+    ],
+    trackersByNumber: { 4130: tracker(4130, SHOPOPS_WO) },
+    trackersByStem: { [SHOPOPS_WO]: tracker(4130, SHOPOPS_WO) },
+  });
+
+  const result = await runReconcileOnce({ deps: state.deps });
+
+  expect(result.closed).toBe(0);
+  expect(state.closes).toEqual([]);
+  expect(state.labels).toEqual([]);
+  expect(state.comments).toEqual([]);
+  expect(state.removed).toEqual([]);
 });

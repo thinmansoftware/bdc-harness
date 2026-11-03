@@ -19,6 +19,23 @@ export const RECONCILE_HOLD_OPEN_ACTION = 'reconcile_hold_open_noted';
  * left OPEN (a declaration is not completion evidence -- only a closing keyword is).
  */
 export const RECONCILE_KEYWORD_MISSING_ACTION = 'reconcile_keyword_missing_noted';
+/**
+ * MERGED IS NOT DONE (WO-HARNESS-STAGING-CLOSES-LINK-01 amendment A1; John
+ * 2026-10-15 "DONE = tested live, not merged"). A keyword merge on the project
+ * base marks the tracker `status:merged` and leaves it OPEN; one row with this
+ * action records the mark so a rescan never repeats it.
+ */
+export const RECONCILE_MERGED_ACTION = 'reconcile_merged_noted';
+/** Action-record class for a tracker closed by a LIVE-PROOF comment. */
+export const RECONCILE_LIVE_PROOF_CLASS = 'live_proof';
+export const MERGED_LABEL = 'status:merged';
+/** Claim labels removed when a tracker is marked merged. */
+export const STALE_STATUS_LABELS = ['status:building', 'status:review'] as const;
+/** Hidden marker in the merged comment; a LIVE-PROOF only counts after it. */
+export const MERGED_MARKER = '<!-- overseer:merged-not-done -->';
+/** `LIVE-PROOF <evidence>` on a line of its own; evidence must be non-empty. */
+export const LIVE_PROOF_PATTERN = /^[ \t]*LIVE-PROOF[ \t]+(\S.*)$/;
+const DEFAULT_LIVE_PROOF_AUTHORS = ['bluedevilcollectibles'];
 /** Action-record class for a tracker closed by a merged-PR closing keyword on the project base. */
 export const RECONCILE_CLOSES_KEYWORD_CLASS = 'closes_keyword';
 /** Action-record class for the non-close reconcile audit rows (skip/hold/keyword-missing). */
@@ -87,6 +104,13 @@ export interface ReconcileTrackerIssue {
    * 2026-11-03T01:51Z, closed two minutes later on PR 4326 merged 11/02 20:15Z).
    */
   createdAt?: string | null;
+}
+
+export interface ReconcileTrackerComment {
+  author: string;
+  body: string;
+  htmlUrl: string;
+  createdAt: string;
 }
 
 export interface ReconcileActionRecord {
@@ -168,6 +192,22 @@ export interface ReconcileDeps {
    * overseer_reconcile_actions.
    */
   hasKeywordMissingBeenNoted?: (input: { prRef: string; woId: string }) => Promise<boolean>;
+  /** Remove a label from a tracker; a label that is not present is not an error. */
+  removeTrackerLabel?: (input: { issue: ReconcileTrackerIssue; label: string }) => Promise<void>;
+  /**
+   * True when this merged PR already marked this WO's tracker merged (an
+   * action=reconcile_merged_noted row exists for prRef+woId).
+   */
+  hasMergedBeenNoted?: (input: { prRef: string; woId: string }) => Promise<boolean>;
+  /**
+   * Open tracker issues labelled status:merged (the LIVE-PROOF pass). Optional:
+   * when absent, or when listTrackerComments is absent, the pass is skipped.
+   */
+  listMergedAwaitingProof?: () => Promise<ReconcileTrackerIssue[]>;
+  /** Comments on a tracker issue, oldest first. */
+  listTrackerComments?: (input: {
+    issue: ReconcileTrackerIssue;
+  }) => Promise<ReconcileTrackerComment[]>;
   now?: () => Date;
   log?: ReconcileLogger;
 }
@@ -211,6 +251,8 @@ export interface OctokitLike {
     listForRepo?(input: Record<string, unknown>): Promise<{ data: unknown }>;
     createComment(input: Record<string, unknown>): Promise<unknown>;
     addLabels(input: Record<string, unknown>): Promise<unknown>;
+    removeLabel?(input: Record<string, unknown>): Promise<unknown>;
+    listComments?(input: Record<string, unknown>): Promise<{ data: unknown }>;
     update(input: Record<string, unknown>): Promise<unknown>;
   };
 }
@@ -224,6 +266,7 @@ export interface RunReconcileInput {
 
 export interface ReconcileResult {
   scanned: number;
+  /** Trackers closed (only by a LIVE-PROOF comment since amendment A1). */
   closed: number;
   skipped: boolean;
 }
@@ -253,6 +296,7 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
   }
 
   let closed = 0;
+  let marked = 0;
   const seen = new Set<string>();
   for (const pr of pullRequests) {
     const key = `${pr.owner}/${pr.repo}#${pr.number}`;
@@ -374,6 +418,11 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
           );
           continue;
         }
+        const mergedNoted = await (deps.hasMergedBeenNoted ?? hasDefaultMergedBeenNoted)({
+          prRef,
+          woId,
+        });
+        if (mergedNoted) continue;
 
         // SPEC-ONLY GUARD. author-wo.sh lands the WO spec document via its own PR,
         // which names the WO stem -- so without this, a WO can be closed as done
@@ -460,21 +509,25 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
           }
         }
 
+        // MERGED IS NOT DONE (amendment A1). Mark the tracker and leave it open;
+        // only a LIVE-PROOF comment closes it (see the pass after this loop).
+        await deps.addTrackerLabel({ issue: tracker, label: MERGED_LABEL });
+        for (const stale of STALE_STATUS_LABELS) {
+          await deps.removeTrackerLabel?.({ issue: tracker, label: stale });
+        }
         await deps.addTrackerEvidenceComment({
           issue: tracker,
-          body: buildEvidenceComment({ pr, stem: holderStem }),
+          body: buildMergedComment({ pr, stem: holderStem }),
         });
-        await deps.addTrackerLabel({ issue: tracker, label: DONE_LABEL });
-        await deps.closeTrackerIssue({ issue: tracker });
         successfullyClosedTrackers.add(trackerIdentity);
         await (deps.insertAction ?? insertDefaultOverseerAction)({
           prRef,
           woId,
           class: RECONCILE_CLOSES_KEYWORD_CLASS,
-          action: RECONCILE_ACTION,
+          action: RECONCILE_MERGED_ACTION,
           result: evidenceResult,
         });
-        closed += 1;
+        marked += 1;
       }
     }
 
@@ -524,7 +577,121 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
     }
   }
 
+  closed += await runLiveProofPass(deps, logger);
+  if (marked > 0) logger.info?.({ marked }, 'overseer.reconcile.trackers_marked_merged');
+
   return { scanned: seen.size, closed, skipped: false };
+}
+
+/**
+ * LIVE-PROOF pass (amendment A1.3). Closes an open `status:merged` tracker when
+ * an allowed author posted `LIVE-PROOF <evidence>` after the Overseer's merged
+ * comment. Any lookup failure leaves every tracker open for the next pass.
+ */
+async function runLiveProofPass(deps: ReconcileDeps, logger: ReconcileLogger): Promise<number> {
+  if (!deps.listMergedAwaitingProof || !deps.listTrackerComments) return 0;
+  let awaiting: ReconcileTrackerIssue[];
+  try {
+    awaiting = await deps.listMergedAwaitingProof();
+  } catch (error) {
+    logger.warn({ err: error as Error }, 'overseer.reconcile.live_proof_list_failed');
+    return 0;
+  }
+  const allowed = liveProofAuthors();
+  let closed = 0;
+  for (const issue of awaiting) {
+    if (issue.state !== 'open') continue;
+    const prRef = `${issue.owner}/${issue.repo}#${issue.number}`;
+    const woId = deriveTrackerWoId(issue);
+    // One live-proof close per issue: a human reopen afterwards is not undone.
+    const already = await (deps.hasCloseBeenRecorded ?? hasDefaultCloseBeenRecorded)({
+      prRef,
+      woId,
+    });
+    if (already) continue;
+    let comments: ReconcileTrackerComment[];
+    try {
+      comments = await deps.listTrackerComments({ issue });
+    } catch (error) {
+      logger.warn({ err: error as Error, prRef }, 'overseer.reconcile.live_proof_comments_failed');
+      continue;
+    }
+    const proof = findLiveProof(comments, allowed);
+    if (!proof) continue;
+    await deps.addTrackerEvidenceComment({ issue, body: buildLiveProofComment(proof) });
+    await deps.addTrackerLabel({ issue, label: DONE_LABEL });
+    await deps.closeTrackerIssue({ issue });
+    await (deps.insertAction ?? insertDefaultOverseerAction)({
+      prRef,
+      woId,
+      class: RECONCILE_LIVE_PROOF_CLASS,
+      action: RECONCILE_ACTION,
+      result: proof.htmlUrl,
+    });
+    closed += 1;
+  }
+  return closed;
+}
+
+/** Allowed LIVE-PROOF authors: OVERSEER_LIVE_PROOF_AUTHORS (comma logins) or the default. */
+export function liveProofAuthors(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = env.OVERSEER_LIVE_PROOF_AUTHORS;
+  const list = (raw ?? '')
+    .split(',')
+    .map(login => login.trim().toLowerCase())
+    .filter(login => login.length > 0);
+  return list.length > 0 ? list : DEFAULT_LIVE_PROOF_AUTHORS;
+}
+
+/**
+ * The first LIVE-PROOF comment by an allowed author that comes AFTER the latest
+ * Overseer merged comment (MERGED_MARKER). No marker means no proof counts.
+ */
+export function findLiveProof(
+  comments: readonly ReconcileTrackerComment[],
+  allowedAuthors: readonly string[]
+): (ReconcileTrackerComment & { evidence: string }) | null {
+  let markerIndex = -1;
+  comments.forEach((comment, index) => {
+    if (comment.body.includes(MERGED_MARKER)) markerIndex = index;
+  });
+  if (markerIndex < 0) return null;
+  const allowed = new Set(allowedAuthors.map(a => a.toLowerCase()));
+  for (const comment of comments.slice(markerIndex + 1)) {
+    if (!allowed.has(comment.author.toLowerCase())) continue;
+    for (const rawLine of comment.body.split('\n')) {
+      const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+      const match = LIVE_PROOF_PATTERN.exec(line);
+      if (match?.[1]) return { ...comment, evidence: match[1].trim() };
+    }
+  }
+  return null;
+}
+
+export function buildMergedComment(input: {
+  pr: ReconcileMergedPullRequest;
+  stem: string;
+}): string {
+  return [
+    MERGED_MARKER,
+    `Overseer reconcile: ${input.stem} merged, not done. Label ${MERGED_LABEL}; this issue stays open.`,
+    '',
+    `Merged PR: ${input.pr.htmlUrl}`,
+    `Merge SHA: ${input.pr.mergeCommitSha ?? 'unknown'}`,
+    `Base: ${input.pr.baseRef ?? 'unknown'}`,
+    '',
+    'It closes when the XO or the builder posts a comment line `LIVE-PROOF <evidence url or command output>` after deploy.',
+  ].join('\n');
+}
+
+export function buildLiveProofComment(
+  proof: ReconcileTrackerComment & { evidence: string }
+): string {
+  return [
+    `Overseer reconcile closed this issue on LIVE-PROOF by @${proof.author}.`,
+    '',
+    `Proof comment: ${proof.htmlUrl}`,
+  ].join('\n');
 }
 
 /** Nine GitHub closing-keyword forms, word-bounded, case-insensitive. */
@@ -819,8 +986,8 @@ export async function readReconcileCursorFromActions(): Promise<string | null> {
   const { getDatabase } = await import('@archon/core/db/connection');
   const db = getDatabase();
   const result = await db.query<{ cursor: string | null }>(
-    'SELECT MAX(created_at) AS cursor FROM overseer_reconcile_actions WHERE action = $1',
-    [RECONCILE_ACTION]
+    'SELECT MAX(created_at) AS cursor FROM overseer_reconcile_actions WHERE action IN ($1, $2)',
+    [RECONCILE_ACTION, RECONCILE_MERGED_ACTION]
   );
   return result.rows[0]?.cursor ?? null;
 }
@@ -848,6 +1015,15 @@ async function hasDefaultCloseBeenRecorded(input: {
     prRef: input.prRef,
     woId: input.woId,
     action: RECONCILE_ACTION,
+  });
+}
+
+async function hasDefaultMergedBeenNoted(input: { prRef: string; woId: string }): Promise<boolean> {
+  const { hasReconcileActionForPr } = await import('@archon/core/db/overseer');
+  return hasReconcileActionForPr({
+    prRef: input.prRef,
+    woId: input.woId,
+    action: RECONCILE_MERGED_ACTION,
   });
 }
 
@@ -916,7 +1092,9 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
           const trackerWrite =
             (method === 'POST' &&
               /^\/repos\/[^/]+\/[^/]+\/issues\/\d+\/(comments|labels)$/.test(path)) ||
-            (method === 'PATCH' && /^\/repos\/[^/]+\/[^/]+\/issues\/\d+$/.test(path));
+            (method === 'PATCH' && /^\/repos\/[^/]+\/[^/]+\/issues\/\d+$/.test(path)) ||
+            (method === 'DELETE' &&
+              /^\/repos\/[^/]+\/[^/]+\/issues\/\d+\/labels\/[^/]+$/.test(path));
           const request = trackerWrite
             ? transport.serviceGitHubFetchWithPermissionFallback
             : transport.serviceGitHubFetch;
@@ -998,9 +1176,90 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     hasCloseBeenRecorded: hasDefaultCloseBeenRecorded,
     hasHoldBeenNoted: hasDefaultHoldBeenNoted,
     hasKeywordMissingBeenNoted: hasDefaultKeywordMissingBeenNoted,
+    hasMergedBeenNoted: hasDefaultMergedBeenNoted,
+    removeTrackerLabel: async (input): Promise<void> => {
+      const client = await getOctokit();
+      if (!client.issues.removeLabel) return;
+      try {
+        await client.issues.removeLabel({
+          owner: input.issue.owner,
+          repo: input.issue.repo,
+          issue_number: input.issue.number,
+          name: input.label,
+        });
+      } catch (error) {
+        // 404 = the label was not on the issue; that is the desired end state.
+        if ((error as { status?: number }).status !== 404) throw error;
+      }
+    },
+    listMergedAwaitingProof: async (): Promise<ReconcileTrackerIssue[]> =>
+      listOpenMergedTrackers(await getOctokit()),
+    listTrackerComments: async (input): Promise<ReconcileTrackerComment[]> =>
+      listIssueComments(await getOctokit(), input.issue),
     insertAction: insertDefaultOverseerAction,
     log,
   };
+}
+
+const MERGED_LIST_MAX_PAGES = 10;
+
+async function listOpenMergedTrackers(octokit: OctokitLike): Promise<ReconcileTrackerIssue[]> {
+  if (!octokit.issues.listForRepo) return [];
+  const out: ReconcileTrackerIssue[] = [];
+  for (let page = 1; page <= MERGED_LIST_MAX_PAGES; page++) {
+    const res = await octokit.issues.listForRepo({
+      owner: DEFAULT_ORG,
+      repo: DEFAULT_TRACKER_REPO,
+      state: 'open',
+      labels: MERGED_LABEL,
+      per_page: 100,
+      page,
+    });
+    const rows = Array.isArray(res.data) ? (res.data as Record<string, unknown>[]) : [];
+    for (const row of rows) {
+      if (row.pull_request !== undefined) continue;
+      if (!Number.isSafeInteger(row.number) || typeof row.title !== 'string') continue;
+      out.push({
+        owner: DEFAULT_ORG,
+        repo: DEFAULT_TRACKER_REPO,
+        number: row.number as number,
+        title: row.title,
+        state: row.state === 'closed' ? 'closed' : 'open',
+        createdAt: typeof row.created_at === 'string' ? row.created_at : null,
+      });
+    }
+    if (rows.length < 100) break;
+  }
+  return out;
+}
+
+async function listIssueComments(
+  octokit: OctokitLike,
+  issue: ReconcileTrackerIssue
+): Promise<ReconcileTrackerComment[]> {
+  if (!octokit.issues.listComments) return [];
+  const out: ReconcileTrackerComment[] = [];
+  for (let page = 1; page <= MERGED_LIST_MAX_PAGES; page++) {
+    const res = await octokit.issues.listComments({
+      owner: issue.owner,
+      repo: issue.repo,
+      issue_number: issue.number,
+      per_page: 100,
+      page,
+    });
+    const rows = Array.isArray(res.data) ? (res.data as Record<string, unknown>[]) : [];
+    for (const row of rows) {
+      const user = row.user as { login?: unknown } | null | undefined;
+      out.push({
+        author: typeof user?.login === 'string' ? user.login : '',
+        body: typeof row.body === 'string' ? row.body : '',
+        htmlUrl: typeof row.html_url === 'string' ? row.html_url : '',
+        createdAt: typeof row.created_at === 'string' ? row.created_at : '',
+      });
+    }
+    if (rows.length < 100) break;
+  }
+  return out;
 }
 
 async function resolveSearchSince(input: RunReconcileInput, deps: ReconcileDeps): Promise<string> {

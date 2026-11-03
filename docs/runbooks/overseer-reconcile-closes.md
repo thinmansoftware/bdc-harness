@@ -1,4 +1,10 @@
-# Overseer reconcile: how WO trackers get closed
+# Overseer reconcile: how WO trackers get marked merged and closed
+
+> Amendment A1 (2026-11-03, John's ruling 2026-10-15 "DONE = tested live, not
+> merged"): a keyword merge NO LONGER closes a tracker. It marks it
+> `status:merged` and leaves it OPEN. Only a `LIVE-PROOF` comment closes it. See
+> "Merged is not done" and "LIVE-PROOF" below. Where this runbook says a merge
+> "closes" a tracker, read "marks it merged".
 
 The Overseer "reconcile" loop (`packages/overseer/src/reconcile.ts`,
 `runReconcileOnce`) closes WO tracker issues in `thinmansoftware/bdc-xo` after the
@@ -85,6 +91,51 @@ OVERSEER_PROJECT_BASES='{"thinmansoftware/shopops":"release/x"}'
 With that set, a shopops PR closes its trackers only when merged into
 `release/x`; a merge into `staging` no longer closes anything.
 
+## Merged is not done: the status:merged mark
+
+When a PR merges into its project base with a closing keyword naming an open
+tracker (and passes every guard), reconcile:
+
+1. adds the label `status:merged` (GitHub creates it on first use; the
+   bdc-xo script `scripts/github-org/taskmaster-labels.sh --apply` also creates it),
+2. removes `status:building` and `status:review` if present,
+3. posts ONE comment (it starts with the hidden marker
+   `<!-- overseer:merged-not-done -->`) naming the PR URL, merge SHA and base,
+4. records `class = closes_keyword`, `action = reconcile_merged_noted`.
+
+The issue stays OPEN. A rescan finds the row and does nothing. A PR merged before
+the tracker issue was created never marks it (pre-tracker guard).
+
+## LIVE-PROOF: how a tracker actually closes
+
+After deploy, the XO or the builder posts a comment on the WO issue with a line:
+
+```
+LIVE-PROOF <evidence url or command output>
+```
+
+Each reconcile pass reads the open `status:merged` issues in
+`thinmansoftware/bdc-xo` and their comments. The issue closes (label `wo:done`,
+one evidence comment, row `class = live_proof`, `action = reconcile_close`,
+`pr_ref = thinmansoftware/bdc-xo#<N>`) when such a line:
+
+- comes AFTER the Overseer merged comment (the marker above),
+- has non-empty evidence after `LIVE-PROOF `,
+- is written by an allowed GitHub login.
+
+Allowed logins: env `OVERSEER_LIVE_PROOF_AUTHORS` (comma list, case-insensitive)
+on archon-app-1; default `bluedevilcollectibles` (the account the XO posts as).
+Add a builder login there to let that builder close its own WOs. A human reopen
+after a LIVE-PROOF close is not undone (one live-proof close per issue).
+
+Read the marks and proof closes (readonly):
+
+```
+docker exec archon-app-1 bun -e "import {Database} from 'bun:sqlite'; \
+  const db=new Database('/.archon/archon.db',{readonly:true}); \
+  console.log(db.query(\"select class, action, pr_ref, wo_id, created_at from overseer_reconcile_actions where action in ('reconcile_merged_noted') or class='live_proof' order by created_at desc limit 50\").all())"
+```
+
 ## The reconcile_keyword_missing_noted row
 
 When a PR on its project base declares a WO on a manifest `WO:` line but carries
@@ -107,7 +158,7 @@ docker exec archon-app-1 bun -e "import {Database} from 'bun:sqlite'; \
 ## The lookback floor
 
 `resolveSearchSince` sets the merged-PR search `since` to the EARLIER of the
-reconcile cursor (date of the newest `reconcile_close` row) and today minus
+reconcile cursor (date of the newest `reconcile_close` or `reconcile_merged_noted` row) and today minus
 `RECONCILE_MIN_LOOKBACK_DAYS` (default 7, env-overridable). This guarantees at
 least the last 7 days are rescanned, so a PR that merged shortly BEFORE the
 newest close is not skipped. The re-close and already-closed guards make the
