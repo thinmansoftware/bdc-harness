@@ -829,6 +829,7 @@ async function mergeClaimedVerdict(
   // exhausted lookups keep the aggregate summary, and an authoritative empty
   // set does too, without the fallback log.
   const lookups = options.github.requiredContextsLookups;
+  let requiredContextsPassed = false;
   const resolution = await resolveRequiredContexts(
     {
       ...(lookups ?? {}),
@@ -849,6 +850,7 @@ async function mergeClaimedVerdict(
       await skip('required_checks_not_success', pr.htmlUrl, false, { blockingContexts });
       return undefined;
     }
+    requiredContextsPassed = true;
   } else {
     if (resolution.state !== 'known') {
       log.info(
@@ -874,7 +876,12 @@ async function mergeClaimedVerdict(
     await skip('not_mergeable_dirty', pr.htmlUrl);
     return undefined;
   }
-  if (pr.mergeable !== true || pr.mergeableState !== 'clean') {
+  // GitHub reports `unstable` when only non-required checks failed or are
+  // pending. Once every known required context passed, that state is
+  // mergeable; without a known required set, keep requiring `clean`.
+  const mergeableStateAccepted =
+    pr.mergeableState === 'clean' || (requiredContextsPassed && pr.mergeableState === 'unstable');
+  if (pr.mergeable !== true || !mergeableStateAccepted) {
     await skip('mergeable_state_not_clean', pr.htmlUrl);
     return undefined;
   }

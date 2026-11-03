@@ -1613,6 +1613,64 @@ describe('merge execution bridge required contexts', () => {
     );
   });
 
+  test('unstable mergeable state merges when every known required context passed', async () => {
+    // GitHub reports `unstable` when only a non-required check failed or was
+    // cancelled, which is exactly the Windows-job case this gate exists for.
+    const h = harness(
+      [verdict('required-green-unstable')],
+      greenPr({
+        mergeableState: 'unstable',
+        checks: { total: 3, passed: 2, failed: 1, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+          checkRun(3, 'test (windows-latest)', 'completed', 'cancelled'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+
+  test('unstable mergeable state still skips without a known required set', async () => {
+    const h = harness(
+      [verdict('empty-unstable')],
+      greenPr({
+        mergeableState: 'unstable',
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        checkRuns: [checkRun(1, 'docker-build', 'completed', 'success')],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup([]) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('mergeable_state_not_clean');
+  });
+
+  test('blocked mergeable state still skips when known required contexts passed', async () => {
+    const h = harness(
+      [verdict('required-green-blocked')],
+      greenPr({
+        mergeableState: 'blocked',
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('mergeable_state_not_clean');
+  });
+
   test('required failure still blocks and the skip log names the context', async () => {
     const captured = captureRootLogLines();
     try {
