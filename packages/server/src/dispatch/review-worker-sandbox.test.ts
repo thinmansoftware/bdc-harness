@@ -6,7 +6,11 @@ import { join } from 'node:path';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import type { RealGitHubOctokitLike } from '@archon/overseer/adapters/github-real-deps';
 import { runAndSubmitReview } from '@archon/overseer/pr-review-submit';
-import { createRealSubmitDeps, type ReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
+import {
+  createRealSubmitDeps,
+  reviewInspectionArgv,
+  type ReviewRouteConfig,
+} from '@archon/overseer/pr-review-wiring';
 import { processJob } from '../../../../scripts/overseer-reviewer-broker';
 import {
   parseTrustedCheckPlan,
@@ -744,3 +748,224 @@ describe.serial('untrusted check children are bounded through worker, wiring and
     60_000
   );
 });
+
+// ---------------------------------------------------------------------------
+// WO-HARNESS-REVIEW-PROOF-SHALLOW-CHECKOUT-01: the supervisor inspection must
+// succeed offline on the shallow, blob-filtered, sparse checkouts the preparer
+// builds. Live: bdc-xo PR 4330 ended "Review incomplete:
+// sandbox_execution_proof_missing_or_invalid" because `git show --stat <head>`
+// needed blobs the sandbox could not fetch from the promisor remote.
+// ---------------------------------------------------------------------------
+
+/** The pre-fix inspection argv, kept here only to document the regression. */
+function oldShowStatArgv(headSha: string): string[] {
+  return [
+    'git',
+    '-c',
+    'diff.external=',
+    '-c',
+    'core.fsmonitor=false',
+    'show',
+    '--stat',
+    '--oneline',
+    headSha,
+  ];
+}
+
+async function runArgv(cwd: string, argv: string[]): Promise<{ exitCode: number; stdout: string }> {
+  const child = Bun.spawn(argv, { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const [exitCode, stdout] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stdout };
+}
+
+/**
+ * Point the checkout's promisor remote at a path that does not exist, so no
+ * lazy blob fetch can succeed -- the condition inside the no-network sandbox.
+ * (Re-pointing instead of renaming the remote avoids Windows EPERM on rename.)
+ */
+async function makePromisorUnreachable(checkout: string, root: string): Promise<void> {
+  await git(checkout, ['remote', 'set-url', 'origin', join(root, 'unreachable-remote')]);
+}
+
+/** A real bdc-xo-shaped review checkout whose remote is then made unreachable. */
+async function prepareOfflineSparseCheckout(
+  root: string
+): Promise<{ checkout: string; head: string }> {
+  const { remote, base, head } = await createGenerationsRemote(root);
+  const checkout = await prepareReviewCheckout(
+    {
+      owner: 'thinmansoftware',
+      repo: 'bdc-xo',
+      prNumber: 4330,
+      headSha: head,
+      baseRef: 'main',
+      baseSha: base,
+    },
+    { remoteUrl: remote, checkoutRoot: join(root, 'spool', 'checkouts') }
+  );
+  await makePromisorUnreachable(checkout, root);
+  return { checkout, head };
+}
+
+describe('review inspection on shallow sparse checkouts (WO-HARNESS-REVIEW-PROOF-SHALLOW-CHECKOUT-01)', () => {
+  const savedExcludes = process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+  beforeEach(() => {
+    delete process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+  });
+  afterEach(() => {
+    if (savedExcludes === undefined) delete process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+    else process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES = savedExcludes;
+  });
+
+  test('inspection_succeeds_on_shallow_sparse_checkout_offline', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'review-inspect-sparse-'));
+    try {
+      const { checkout, head } = await prepareOfflineSparseCheckout(root);
+      expect(await git(checkout, ['rev-parse', '--is-shallow-repository'])).toBe('true');
+      expect(await git(checkout, ['config', 'remote.origin.partialclonefilter'])).toBe('blob:none');
+      expect(existsSync(join(checkout, 'generations'))).toBe(false);
+      const result = await runArgv(checkout, reviewInspectionArgv(head));
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim().length).toBeGreaterThan(0);
+      expect(result.stdout).toContain('docs/spec.md');
+      // Outside the sparse worktree and never fetched: listed from the tree alone.
+      expect(result.stdout).toContain('generations/cover.png');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('old_show_stat_inspection_fails_on_the_same_checkout', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'review-inspect-old-'));
+    try {
+      const { checkout, head } = await prepareOfflineSparseCheckout(root);
+      const result = await runArgv(checkout, oldShowStatArgv(head));
+      expect(result.exitCode).not.toBe(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('inspection_still_succeeds_on_a_full_checkout', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'review-inspect-full-'));
+    try {
+      const { remote, head } = await createRemote(root);
+      const checkout = join(root, 'full');
+      await git(root, ['clone', '-q', '--no-checkout', remote, checkout]);
+      await git(checkout, ['checkout', '-q', '--detach', head]);
+      expect(await git(checkout, ['rev-parse', '--is-shallow-repository'])).toBe('false');
+      const result = await runArgv(checkout, reviewInspectionArgv(head));
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('change.txt');
+      expect(result.stdout).toContain('README.md');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * One review through the real worker, preparer, wiring, submit and processJob
+ * broker on an offline bdc-xo-shaped checkout. `inspection: 'show-stat'`
+ * rewrites the inspection child back to the pre-fix argv so the same path
+ * shows what the old inspection produced.
+ */
+async function runOfflineShallowReview(input: {
+  root: string;
+  inspection: 'current' | 'show-stat';
+}): Promise<WorkerHarness> {
+  const spool = join(input.root, 'spool');
+  await mkdir(spool, { recursive: true });
+  await writeFile(join(spool, 'ready'), 'test\n');
+  const { remote, base, head } = await createGenerationsRemote(input.root);
+  let offline = false;
+  const original = Bun.spawn;
+  Bun.spawn = ((
+    command: Parameters<typeof Bun.spawn>[0],
+    options?: Parameters<typeof Bun.spawn>[1]
+  ) => {
+    if (offline && input.inspection === 'show-stat' && Array.isArray(command)) {
+      const argv = command.map(value => String(value));
+      const at = argv.indexOf('ls-tree');
+      if (at !== -1) {
+        const headSha = argv[argv.length - 1] ?? '';
+        return original([...argv.slice(0, at), 'show', '--stat', '--oneline', headSha], options);
+      }
+    }
+    return original(command, options);
+  }) as typeof Bun.spawn;
+  const previousSpool = process.env.OVERSEER_REVIEW_SPOOL;
+  process.env.OVERSEER_REVIEW_SPOOL = spool;
+  const broker = startProcessJobBroker(spool, { timeoutMs: 20_000, outputLimit: 1024 * 1024 });
+  try {
+    const harness = workerHarness({
+      head,
+      prepareCheckout: async request => {
+        const checkout = await prepareReviewCheckout(request, {
+          remoteUrl: remote,
+          checkoutRoot: join(spool, 'checkouts'),
+        });
+        await makePromisorUnreachable(checkout, input.root);
+        offline = true;
+        return checkout;
+      },
+    });
+    harness.queue.push(
+      queuedReview('offline-shallow', {
+        owner: 'thinmansoftware',
+        repo: 'bdc-xo',
+        prNumber: 4330,
+        headSha: head,
+        baseRef: 'main',
+        baseSha: base,
+        author: 'contributor',
+      })
+    );
+    await tickReviewWorkerClock(WORKER_CONFIG, harness.deps);
+    return harness;
+  } finally {
+    broker.stop();
+    Bun.spawn = original;
+    if (previousSpool === undefined) delete process.env.OVERSEER_REVIEW_SPOOL;
+    else process.env.OVERSEER_REVIEW_SPOOL = previousSpool;
+  }
+}
+
+describe.serial(
+  'offline shallow review qualifies end to end (WO-HARNESS-REVIEW-PROOF-SHALLOW-CHECKOUT-01)',
+  () => {
+    const savedExcludes = process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+    beforeEach(() => {
+      delete process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+    });
+    afterEach(() => {
+      if (savedExcludes === undefined) delete process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+      else process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES = savedExcludes;
+    });
+
+    test.skipIf(!linux)(
+      'worker_review_of_offline_shallow_checkout_qualifies_with_new_inspection_and_not_old',
+      async () => {
+        const current = await mkdtemp(join(tmpdir(), 'review-offline-current-'));
+        const old = await mkdtemp(join(tmpdir(), 'review-offline-old-'));
+        try {
+          const fixed = await runOfflineShallowReview({ root: current, inspection: 'current' });
+          expect(fixed.posts.map(post => post.event)).toEqual(['APPROVE']);
+          const before = await runOfflineShallowReview({ root: old, inspection: 'show-stat' });
+          expect(before.posts.map(post => post.event)).toEqual(['COMMENT']);
+          expect(before.posts[0]?.body).toStartWith(
+            'Review incomplete: sandbox_execution_proof_missing_or_invalid'
+          );
+        } finally {
+          await rm(current, { recursive: true, force: true });
+          await rm(old, { recursive: true, force: true });
+        }
+      },
+      60_000
+    );
+  }
+);
