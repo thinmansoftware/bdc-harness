@@ -34,6 +34,7 @@ import {
   releaseOverseerMergeSlot,
   releaseVerdictClaimForMergeExecution,
   reserveOverseerMergeSlot,
+  getEarliestOverseerMergeSlotReservation,
 } from './overseer';
 
 function cleanupDb(path: string): void {
@@ -650,6 +651,24 @@ describe('overseer db', () => {
         action: 'reconcile_skip_noted',
       })
     ).toBe(false);
+  });
+
+  test('selects the oldest live reservation inside the window', async () => {
+    const since = '2026-11-03T11:00:00.000Z';
+    expect(await getEarliestOverseerMergeSlotReservation(since)).toBeNull();
+    for (const [id, time, released] of [
+      ['released', '2026-11-03T11:05:00.000Z', '2026-11-03T11:06:00.000Z'],
+      ['old', since, null],
+      ['newer', '2026-11-03T11:40:00.000Z', null],
+      ['oldest', '2026-11-03T11:10:00.000Z', null],
+    ]) {
+      await db.query(
+        `INSERT INTO overseer_merge_slot_reservations (id, verdict_id, reserved_at, released_at)
+         VALUES ($1, $1, $2, $3)`,
+        [id, time, released]
+      );
+    }
+    expect(await getEarliestOverseerMergeSlotReservation(since)).toBe('2026-11-03T11:10:00.000Z');
   });
 
   test('reserves a merge slot under the ceiling and rejects the next at the limit', async () => {

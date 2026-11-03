@@ -17,6 +17,7 @@ import {
   releaseOverseerMergeSlot,
   releaseVerdictClaimForMergeExecution,
   reserveOverseerMergeSlot,
+  getEarliestOverseerMergeSlotReservation,
 } from '@archon/core/db/overseer';
 import { hasActiveRunForWo } from './active-run-guard';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
@@ -440,6 +441,7 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
         getRunById: getOverseerWatchRunById,
         hasActiveRunForWo: (woId: string) => hasActiveRunForWo(woId, listActiveRunUserMessages),
         reserveMergeSlot: reserveOverseerMergeSlot,
+        getEarliestMergeSlotReservation: getEarliestOverseerMergeSlotReservation,
         releaseMergeSlot: releaseOverseerMergeSlot,
         recordOutcome: recordVerdictMergeOutcome,
       },
