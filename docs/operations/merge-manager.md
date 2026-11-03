@@ -26,6 +26,40 @@ A pull request label named exactly `merge-hold` (case-sensitive) holds any pull 
 | `OVERSEER_MERGE_RETRY_MAX_DELAY_MINUTES` | 240 | Maximum delay between attempts |
 | `OVERSEER_MERGE_RETRY_MAX_ATTEMPTS` | 8 | Attempt cap, including the initial look |
 
+## Repository base policy (staging lineages)
+
+`DEFAULT_MERGE_REPO_POLICY` in `packages/overseer/src/merge-repo-policy.ts` declares merge candidacy per repository and base. A running container that sets `MERGE_MANAGER_REPO_POLICY` overrides the default completely, so the default alone does not change a live deployment (see the operator step below).
+
+| Repository | Base | Unattended | Docs-only |
+| --- | --- | --- | --- |
+| `thinmansoftware/lspro-react` | `dev` | yes | skip |
+| `thinmansoftware/lspro-react` | `staging` | yes | skip |
+| `thinmansoftware/lspro-react` | `main` | no | skip |
+| `thinmansoftware/shopops-storefront` | `staging` | yes | skip |
+| `thinmansoftware/shopops-storefront` | `master` | no | skip |
+
+`release/lspro`, `release/ce`, `main` and `master` are production lanes and are never unattended candidates: `release/*` has no entry at all.
+
+### Operator step after this lands on dev (not part of the code change)
+
+Edit `/opt/bdc/archon/.env`, then run the governed rebuild of `archon-app-1`:
+
+1. Line 99, `MERGE_MANAGER_REPO_POLICY`, replace the value with (generated from the default policy; round-trips through `parseMergeRepoPolicy`):
+
+```
+MERGE_MANAGER_REPO_POLICY={"thinmansoftware/bdc-harness":{"dev":{"unattended":true,"docs_only":"skip"},"staging":{"unattended":true,"docs_only":"skip"},"main":{"unattended":false,"docs_only":"skip"}},"thinmansoftware/shopops":{"staging":{"unattended":true,"docs_only":"skip"},"master":{"unattended":false,"docs_only":"skip"}},"thinmansoftware/lspro-react":{"dev":{"unattended":true,"docs_only":"skip"},"staging":{"unattended":true,"docs_only":"skip"},"main":{"unattended":false,"docs_only":"skip"}},"thinmansoftware/shopops-storefront":{"staging":{"unattended":true,"docs_only":"skip"},"master":{"unattended":false,"docs_only":"skip"}},"thinmansoftware/bdc-xo":{"main":{"unattended":true,"docs_only":"merge"}}}
+```
+
+2. Line 97, `OVERSEER_MERGE_DISCOVERY_REPOS`, append `thinmansoftware/lspro-react,thinmansoftware/shopops-storefront` to the existing comma-separated list.
+
+Verify after the rebuild:
+
+```sh
+ssh hetzner-prod 'docker exec archon-app-1 printenv MERGE_MANAGER_REPO_POLICY' | grep -c shopops-storefront
+```
+
+Expected output: `1`.
+
 ## Requeue verdicts stranded by the old behavior
 
 Preview eligible transient skips:

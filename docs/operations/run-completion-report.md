@@ -4,9 +4,9 @@ Read-only report of build-lane completion, so every seat counts the harness comp
 
 ## Invocation (inside archon-app-1)
 
-    docker exec archon-app-1 bun run /app/scripts/run-completion-report.ts --days 7 [--as-of 'YYYY-MM-DD HH:MM:SS'] [--db PATH] [--json]
+    docker exec archon-app-1 bun run /app/scripts/run-completion-report.ts --days 7 [--as-of 'YYYY-MM-DD HH:MM:SS'] [--db PATH] [--json] [--no-github]
 
-Flags: `--days N` (required, positive integer); `--as-of` UTC, default now; `--db` default `/.archon/archon.db`; `--json` machine output.
+Flags: `--days N` (required, positive integer); `--as-of` UTC, default now; `--db` default `/.archon/archon.db`; `--json` machine output; `--no-github` skip the GitHub join (the merged-or-owned section prints `unavailable (no-github)`).
 Exit codes: 0 ok, 2 bad arguments (usage on stderr), 3 database unopenable or table missing.
 The window is [as_of minus N days, as_of). Runs are the `bdc-feature-development%` lanes; the denominator is runs, never outcome rows. A lane or overall total under 20 prints the rate as `insufficient` (counts still print). The database is opened read-only with `PRAGMA query_only = ON`; nothing is written.
 
@@ -58,6 +58,31 @@ After the governed rebuild, pick one AS_OF value T (UTC) and run both on the hos
     sqlite3 -readonly /opt/bdc/archon-data/archon.db < f1-f5.sql
 
 Every count in the JSON must equal the matching sqlite3 row. Record both outputs on the issue.
+
+## Merged-or-owned WO completion
+
+Added by WO-HARNESS-COMPLETION-METRIC-MERGED-OR-OWNED-01 (ruling item 15 of motion M-20261027a round 6). The legacy `overall:` line counts runs completed over runs started, which climbs with retries and says nothing about whether the work landed. This section asks, per Work Order fired in the window, did its pull request merge, or is it still owned by a named seat? Abandoned work with no PR and no owner is the gap it exposes.
+
+Unit of measure: a WO ID that is the `WO_ID=<id> --project <project>` prefix (from `packages/smart-cauldron/src/fire.ts`) of at least one in-window build run (same `bdc-feature-development%` lanes and window as `overall:`). A WO fired many times, or across projects, is one unit. Runs whose `user_message` lacks the prefix are counted as `unattributed_runs` and excluded from the denominator.
+
+| Term | Definition |
+|---|---|
+| merged | at least one merged PR in `thinmansoftware/<project>` (project from the run prefix) whose title, body or head branch contains the WO ID (case-insensitive), merged at or before `--as-of`, at any date (no lower bound) |
+| owned | not merged, and the bdc-xo issue titled exactly the WO ID is OPEN with at least one assignee or at least one label starting `owner:` |
+| neither | not merged and not owned (includes closed-unmerged and missing issue); listed by WO ID |
+
+Numerator = merged + owned. Denominator = all units. The rate uses the same rule as `overall:` (`insufficient` under 20 units). Text lines: `wo_merged_or_owned: <num>/<den> rate <rate>`, `wo_breakdown: merged <a>, owned <b>, neither <c>`, and `wo_neither:` with one indented WO ID per line; `--json` adds the `wo_completion` object with the same fields plus the `neither_wos` array.
+
+GitHub join (read-only, no writes to GitHub): via `runGitHubServiceCommand` (service identity `taskmaster`, metered). It retrieves, completely (every page, no date lower bound, no item cap):
+
+- all bdc-xo WO issues: `gh api --paginate --slurp 'repos/thinmansoftware/bdc-xo/issues?labels=wo&state=all&per_page=100'` (real issues only; the endpoint also returns PRs);
+- per distinct project, all closed PRs: `gh api --paginate --slurp 'repos/thinmansoftware/<project>/pulls?state=closed&per_page=100'`, kept where `merged_at` is set and at or before `--as-of`.
+
+Each collection's retrieved count is compared with the GitHub search `total_count` for the same population (`gh api search/issues -X GET -f 'q=repo:thinmansoftware/bdc-xo label:wo is:issue'` and `-f 'q=repo:thinmansoftware/<project> is:pr is:merged'`; each `q` value is ONE argv element with space-separated qualifiers, never `+`-joined, because `gh api -f` URL-encodes the value). Any count mismatch, failed page or page-limit stop prints `wo_merged_or_owned: unavailable (incomplete:<collection>)`; an auth failure, quota error or `--no-github` prints `wo_merged_or_owned: unavailable (<reason>)`. In every unavailable case no partial number is printed, the rest of the report still prints, and the exit code stays 0. There is no per-WO API call.
+
+### Legacy line retirement
+
+While `--as-of` is before `2026-11-20` (the merge date plus 14 days, UTC midnight, constant `LEGACY_OVERALL_UNTIL`), the old run-completion number is shown relabelled as `overall (legacy run completion, retiring 2026-11-20): <completed>/<total> completed, rate <rate>` (and json key `legacy_overall`), so the two numbers can be compared. On or after that instant the legacy line and `legacy_overall` key are omitted; the raw `total`/`completed`/`rate` keys stay. The F1-F5 numbers are unchanged throughout.
 
 ## Outcomes (last 24h)
 
