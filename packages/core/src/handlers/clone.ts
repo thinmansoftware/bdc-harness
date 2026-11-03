@@ -6,7 +6,7 @@ import { access, rm } from 'fs/promises';
 import { join, basename, resolve } from 'path';
 import * as codebaseDb from '../db/codebases';
 import { sanitizeError } from '../utils/credential-sanitizer';
-import { execFileAsync } from '@archon/git';
+import { execFileAsync, addSafeDirectory, toRepoPath } from '@archon/git';
 import {
   expandTilde,
   getCommandFolderSearchPaths,
@@ -276,7 +276,7 @@ export async function cloneRepository(repoUrl: string): Promise<RegisterResult> 
   }
 
   // Add to git safe.directory
-  await execFileAsync('git', ['config', '--global', '--add', 'safe.directory', targetPath]);
+  await addSafeDirectory(toRepoPath(targetPath));
   getLog().debug({ path: targetPath }, 'safe_directory_added');
 
   const result = await registerRepoAtPath(targetPath, `${ownerName}/${repoName}`, workingUrl);
