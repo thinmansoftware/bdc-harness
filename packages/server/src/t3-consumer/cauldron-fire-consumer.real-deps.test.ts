@@ -32,6 +32,11 @@ import * as workflowEventsDb from '@archon/core/db/workflow-events';
 import * as claims from '@archon/core/db/cascade-wo-claims';
 import { readCascadeRecord, runCascade } from '@archon/smart-cauldron/cascade';
 import type { CascadeDeps } from '@archon/smart-cauldron/cascade';
+import type { CascadeRunRecord } from '@archon/smart-cauldron/types';
+import {
+  FrontierResumeClaimError,
+  resumeFrontierTier,
+} from '@archon/smart-cauldron/frontier-approval';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import {
   createRealCauldronFireConsumerDeps,
@@ -585,6 +590,285 @@ describe('Overseer major 2: the shared claim is released only on a proven-termin
     });
     expect(won.status).toBe('won');
     expect(await claims.findActiveWoClaim('WO-WIN-01', db)).toBeNull();
+    rmSync(outDir, { recursive: true, force: true });
+  });
+});
+
+describe('final round, finding 2: the approval is ONE transaction', () => {
+  test('a failure on the second event insert rolls the whole approval back', async () => {
+    const runId = await makeRun('WO-TX-01', 'paused', {
+      approval: { nodeId: 'gate', type: 'approval' },
+    });
+    const events = [
+      { event_type: 'node_completed', step_name: 'gate', data: { approval_decision: 'approved' } },
+      { event_type: 'approval_received', step_name: 'gate', data: { decision: 'approved' } },
+    ];
+    let inserts = 0;
+    const failing = new Proxy(db, {
+      get(target, prop, receiver): unknown {
+        if (prop === 'withTransaction') {
+          return (fn: Parameters<SqliteAdapter['withTransaction']>[0]) =>
+            target.withTransaction(query =>
+              fn(async (sql: string, params?: unknown[]) => {
+                if (sql.includes('INSERT INTO remote_agent_workflow_events')) {
+                  inserts += 1;
+                  if (inserts === 2) throw new Error('second insert failed');
+                }
+                return query(sql, params);
+              })
+            );
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as typeof db;
+
+    let thrown = '';
+    try {
+      await workflowsDb.approvePausedRunAtGate(
+        runId,
+        'gate',
+        { approval_response: 'approved' },
+        events,
+        failing
+      );
+    } catch (error) {
+      thrown = (error as Error).message;
+    }
+    expect(thrown).toBe('second insert failed');
+    const after = await workflowsDb.getWorkflowRun(runId);
+    expect(after?.status).toBe('paused');
+    expect(after?.metadata.approval_response).toBeUndefined();
+    expect(await workflowEventsDb.listWorkflowEvents(runId)).toHaveLength(0);
+
+    // The same call without the fault commits all three writes together.
+    expect(
+      await workflowsDb.approvePausedRunAtGate(
+        runId,
+        'gate',
+        { approval_response: 'approved' },
+        events,
+        db
+      )
+    ).toBe(true);
+    expect((await workflowsDb.getWorkflowRun(runId))?.status).toBe('failed');
+    expect(
+      (await workflowEventsDb.listWorkflowEvents(runId)).map(event => event.event_type)
+    ).toEqual(['node_completed', 'approval_received']);
+  });
+});
+
+describe('final round, finding 1: frontier resume takes over the claim before dispatch', () => {
+  const pausedRecord = (cascadeId: string, woId: string): CascadeRunRecord =>
+    ({
+      cascadeId,
+      woId,
+      project: 'bdc-harness',
+      request: { woClass: 'CODE', tags: ['mechanical'], entryOverride: null, dryRun: false },
+      createdAt: new Date().toISOString(),
+      status: 'pending-frontier-approval',
+      winningTier: null,
+      attempts: [],
+      totalCostUsd: null,
+      telemetry: { entryTier: 'codex', climbed: true, climbCount: 1, wonCheap: false },
+      frontierApproval: {
+        tierName: 'frontier',
+        workflowName: 'bdc-feature-development',
+        priorContext: '',
+        project: 'bdc-harness',
+        woId,
+        woClass: 'CODE',
+        tags: ['mechanical'],
+        apiBaseUrl: 'http://archon.in-process',
+        pausedAt: new Date().toISOString(),
+        notifiedAt: null,
+        resolution: null,
+        resolvedAt: null,
+        resumeCascadeId: null,
+      },
+    }) as unknown as CascadeRunRecord;
+
+  const runStatus = new Map<string, { status: string; approvalHandOff: boolean }>();
+  const readRun = async (
+    runId: string
+  ): Promise<{ status: string; approvalHandOff: boolean } | null> => runStatus.get(runId) ?? null;
+
+  function stubDeps(fires: string[], releasePoll: Promise<void>): CascadeDeps {
+    return {
+      findWoClaim: async () => null,
+      seatUsage: async () => {
+        const reading = {
+          limit_source: 'measured' as const,
+          windows: [{ name: '5h', used_percent: 5 }],
+        };
+        return { claude: reading, codex: reading, cursor: reading };
+      },
+      fire: async () => {
+        fires.push('resume');
+        return { ok: true, runId: 'resume-run', conversationId: 'c', infraError: null };
+      },
+      poll: async () => {
+        await releasePoll;
+        return {
+          runId: 'resume-run',
+          terminalStatus: 'completed',
+          validatorVerdict: 'satisfied',
+          prUrl: 'https://github.com/o/r/pull/1',
+          prMergeable: true,
+          servedModelId: null,
+          rawMetadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        };
+      },
+      fetchNodeTimeouts: async () => ({}),
+      judge: () => ({
+        pass: true,
+        reason: 'ok',
+        cancelled: false,
+        validatorVerdict: 'satisfied',
+        prOpened: true,
+        prMergeable: true,
+        terminalStatus: 'completed',
+      }),
+      escalate: async () => undefined,
+      readRunDetail: async () => null,
+      ...cascadeWoClaimDeps('frontier-resume', db, { readRun }),
+    };
+  }
+
+  function fireCommand(id: string): DispatchMessage {
+    return {
+      id: `cmd-${id}`,
+      correlation_id: id,
+      idempotency_key: id,
+      sender: 't3-bridge',
+      sender_principal_id: 't3-bridge',
+      recipient: 'cauldron-fire',
+      created_at: new Date().toISOString(),
+      body: JSON.stringify({
+        schema: 't3-command/v1',
+        request_id: id,
+        verb: 'fire',
+        wo_id: 'WO-FR-01',
+        project: 'bdc-harness',
+      }),
+    } as unknown as DispatchMessage;
+  }
+
+  function t3Deps(replies: Record<string, unknown>[], fires: string[]): CauldronFireConsumerDeps {
+    return {
+      ...realDeps(),
+      db,
+      resolveProjectRepository: async () => 'thinmansoftware/bdc-harness',
+      hasLiveWorkflowRun: async () => ({ live: false, runId: null }),
+      checkFireEligibility: async woId => ({
+        eligible: true,
+        evidence: { woId, project: 'bdc-harness' },
+      }),
+      fireCascade: async () => {
+        fires.push('t3');
+        return { cascadeId: 't3-after', status: 'running', runId: 't3-after-run' };
+      },
+      sendReply: async input => {
+        replies.push(JSON.parse(input.body) as Record<string, unknown>);
+        return { id: `rep-${replies.length}` } as DispatchMessage;
+      },
+      acknowledge: async () => undefined,
+    };
+  }
+
+  test('resume transfers the retained claim, a concurrent fire gets 409, terminal releases, a later fire is admitted', async () => {
+    const outDir = join(tmpdir(), `t3-frontier-${randomUUID()}`);
+    // The paused cascade holds a RETAINED claim.
+    const original = cascadeWoClaimDeps('taskmaster', db, {
+      readRun,
+      readRecord: async () => pausedRecord('orig-c', 'WO-FR-01'),
+    });
+    expect(
+      (await original.acquireWoLock('WO-FR-01', 'bdc-harness', 'orig-c', outDir)).acquired
+    ).toBe(true);
+    await original.releaseWoLock('WO-FR-01', 'bdc-harness', 'orig-c', outDir);
+    expect((await claims.findActiveWoClaim('WO-FR-01', db))?.retained_reason).toBe(
+      'pending-frontier-approval'
+    );
+
+    let releasePoll: () => void = () => undefined;
+    const pollGate = new Promise<void>(resolve => {
+      releasePoll = resolve;
+    });
+    const fires: string[] = [];
+    runStatus.set('resume-run', { status: 'completed', approvalHandOff: false });
+    const resumed = resumeFrontierTier(pausedRecord('orig-c', 'WO-FR-01'), {
+      outDir,
+      token: 't',
+      deps: stubDeps(fires, pollGate),
+      beforeDispatch: async input =>
+        claims.takeOverWoClaimForResume(
+          { ...input, holder: 'frontier-resume', now: new Date().toISOString() },
+          db
+        ),
+    });
+    for (let i = 0; i < 100 && fires.length === 0; i += 1) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(fires).toEqual(['resume']);
+    const held = await claims.findActiveWoClaim('WO-FR-01', db);
+    expect(held?.cascade_id).not.toBe('orig-c');
+    expect(held?.retained_reason).toBeNull();
+
+    // A concurrent fire during the resume is refused.
+    const replies: Record<string, unknown>[] = [];
+    const t3Fires: string[] = [];
+    await processCommand(t3Deps(replies, t3Fires), fireCommand('FR-DURING'));
+    expect(replies[0]).toMatchObject({
+      status: 409,
+      code: 'live_run',
+      cascade_id: held?.cascade_id,
+    });
+    expect(t3Fires).toHaveLength(0);
+
+    // The resumed cascade reaches terminal: the claim is released.
+    releasePoll();
+    expect((await resumed).status).toBe('won');
+    expect(await claims.findActiveWoClaim('WO-FR-01', db)).toBeNull();
+
+    // A later fire for the WO is admitted (T3) and a Taskmaster claim succeeds.
+    await processCommand(t3Deps(replies, t3Fires), fireCommand('FR-AFTER'));
+    expect(replies[1]).toMatchObject({ status: 200, code: 'ok' });
+    expect(t3Fires).toEqual(['t3']);
+    rmSync(outDir, { recursive: true, force: true });
+  });
+
+  test('a resume whose claim another cascade holds is refused before dispatch', async () => {
+    const outDir = join(tmpdir(), `t3-frontier-${randomUUID()}`);
+    await claims.acquireWoClaim(
+      {
+        woId: 'WO-FR-02',
+        project: 'bdc-harness',
+        cascadeId: 'other-c',
+        holder: 'taskmaster',
+        now: new Date().toISOString(),
+      },
+      db
+    );
+    const fires: string[] = [];
+    let error: unknown = null;
+    try {
+      await resumeFrontierTier(pausedRecord('orig-2', 'WO-FR-02'), {
+        outDir,
+        token: 't',
+        deps: stubDeps(fires, Promise.resolve()),
+        beforeDispatch: async input =>
+          claims.takeOverWoClaimForResume(
+            { ...input, holder: 'frontier-resume', now: new Date().toISOString() },
+            db
+          ),
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(FrontierResumeClaimError);
+    expect(fires).toHaveLength(0);
+    expect((await claims.findActiveWoClaim('WO-FR-02', db))?.cascade_id).toBe('other-c');
     rmSync(outDir, { recursive: true, force: true });
   });
 });

@@ -78,7 +78,9 @@ const mockRejectFrontierTier = mock(
   })
 );
 
+const mockReleaseFrontierClaim = mock(async () => undefined);
 mock.module('@archon/smart-cauldron/frontier-approval', () => ({
+  releaseFrontierClaim: mockReleaseFrontierClaim,
   readCascadeRecordById: mockReadCascadeRecordById,
   claimFrontierResolution: mockClaimFrontierResolution,
   resumeFrontierTier: mockResumeFrontierTier,
@@ -323,6 +325,32 @@ describe('POST /api/cascades/:id/approve-frontier', () => {
     expect(body.resolution).toBe('approved');
     expect(body.resumeCascadeId).toBe('resumed-cascade-1');
     expect(mockResumeFrontierTier).toHaveBeenCalledTimes(1);
+  });
+
+  test('the resume takes over the shared WO claim before dispatch; a held claim is 409 and rolls back', async () => {
+    mockReadCascadeRecordById.mockImplementationOnce(async () => PAUSED_RECORD);
+    const res = await makeApp().request('/api/cascades/cascade-1/approve-frontier', {
+      method: 'POST',
+    });
+    expect(res.status).toBe(200);
+    const opts = (mockResumeFrontierTier.mock.calls.at(-1) as unknown[] | undefined)?.[1] as
+      | { beforeDispatch?: unknown; deps?: { acquireWoLock?: unknown; releaseWoLock?: unknown } }
+      | undefined;
+    expect(typeof opts?.beforeDispatch).toBe('function');
+    expect(typeof opts?.deps?.acquireWoLock).toBe('function');
+    expect(typeof opts?.deps?.releaseWoLock).toBe('function');
+
+    mockReadCascadeRecordById.mockImplementationOnce(async () => PAUSED_RECORD);
+    mockResumeFrontierTier.mockImplementationOnce(async () => {
+      const error = new Error('claim held');
+      error.name = 'FrontierResumeClaimError';
+      throw error;
+    });
+    const held = await makeApp().request('/api/cascades/cascade-1/approve-frontier', {
+      method: 'POST',
+    });
+    expect(held.status).toBe(409);
+    expect(mockReleaseFrontierClaim).toHaveBeenCalledWith('cascade-1');
   });
 
   test('200 idempotent no-op when already resolved (no second fire)', async () => {

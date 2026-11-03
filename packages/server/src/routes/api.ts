@@ -4,7 +4,8 @@
  */
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
 import { isInProcessServiceRequest } from './in-process-authority';
-import { releaseWoClaim } from '@archon/core/db/cascade-wo-claims';
+import { releaseWoClaim, takeOverWoClaimForResume } from '@archon/core/db/cascade-wo-claims';
+import { cascadeWoClaimDeps } from '../cascade/wo-claim';
 import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
@@ -3310,18 +3311,8 @@ export async function approvePausedWorkflowRun(
     approval.type === 'interactive_loop'
       ? { loop_user_input: opts.comment }
       : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
-  if (opts.expectedNodeId !== undefined) {
-    const gateHeld =
-      approval.nodeId === opts.expectedNodeId &&
-      (await workflowDb.approvePausedRunAtGate(runId, opts.expectedNodeId, gateMetadataUpdate));
-    if (!gateHeld) {
-      getLog().info(
-        { runId, expected: opts.expectedNodeId },
-        'api.workflow_run_approve_gate_changed'
-      );
-      return { ok: false, status: 409, message: 'gate_changed' };
-    }
-  }
+  const approvalEvents: { event_type: string; step_name: string; data: Record<string, unknown> }[] =
+    [];
   if (approval.type !== 'interactive_loop') {
     const nodeOutput =
       approval.captureResponse === true
@@ -3331,20 +3322,39 @@ export async function approvePausedWorkflowRun(
             comment,
           })
         : '';
-    await workflowEventDb.createWorkflowEvent({
-      workflow_run_id: runId,
+    approvalEvents.push({
       event_type: 'node_completed',
       step_name: approval.nodeId,
       data: { node_output: nodeOutput, approval_decision: 'approved' },
     });
   }
-  await workflowEventDb.createWorkflowEvent({
-    workflow_run_id: runId,
+  approvalEvents.push({
     event_type: 'approval_received',
     step_name: approval.nodeId,
     data: { decision: 'approved', comment },
   });
-  if (opts.expectedNodeId === undefined) {
+  if (opts.expectedNodeId !== undefined) {
+    // Consumer path: gate CAS + approval events in ONE transaction.
+    const gateHeld =
+      approval.nodeId === opts.expectedNodeId &&
+      (await workflowDb.approvePausedRunAtGate(
+        runId,
+        opts.expectedNodeId,
+        gateMetadataUpdate,
+        approvalEvents
+      ));
+    if (!gateHeld) {
+      getLog().info(
+        { runId, expected: opts.expectedNodeId },
+        'api.workflow_run_approve_gate_changed'
+      );
+      return { ok: false, status: 409, message: 'gate_changed' };
+    }
+  } else {
+    // HTTP route: original write order, unchanged.
+    for (const event of approvalEvents) {
+      await workflowEventDb.createWorkflowEvent({ workflow_run_id: runId, ...event });
+    }
     await workflowDb.updateWorkflowRun(runId, {
       status: 'failed',
       metadata: gateMetadataUpdate,
@@ -7178,6 +7188,15 @@ export function registerApiRoutes(
       const resumePromise = resumeFrontierTier(record, {
         token,
         onAdmission: r => resolveAdmission?.(r),
+        // WO-HARNESS-T3-COMMAND-CONSUMER-01: the resumed cascade holds the shared
+        // database WO claim, taken over from the paused cascade BEFORE dispatch.
+        deps: { ...cascadeWoClaimDeps('frontier-resume') },
+        beforeDispatch: async input =>
+          takeOverWoClaimForResume({
+            ...input,
+            holder: 'frontier-resume',
+            now: new Date().toISOString(),
+          }),
       });
       void resumePromise.catch((error: unknown) => {
         getLog().error(
@@ -7186,7 +7205,22 @@ export function registerApiRoutes(
         );
       });
       // Race so a synchronous resume failure surfaces as 500 instead of hanging.
-      const admitted = await Promise.race([admission, resumePromise]);
+      let admitted: Awaited<ReturnType<typeof resumeFrontierTier>>;
+      try {
+        admitted = await Promise.race([admission, resumePromise]);
+      } catch (error) {
+        if ((error as Error | null)?.name !== 'FrontierResumeClaimError') throw error;
+        // Another cascade holds the WO claim: nothing fired. Roll the approval
+        // back so the operator can retry once it clears.
+        await releaseFrontierClaim(cascadeId);
+        getLog().warn({ cascadeId, woId: record.woId }, 'frontier_approval_resume_claim_held');
+        return apiError(
+          c,
+          409,
+          `Frontier resume for ${record.woId} could not take over the WO claim: another cascade holds it. ` +
+            'The approval was rolled back -- retry once it clears.'
+        );
+      }
       // A 'blocked' admission means the resumed cascade refused to fire because a
       // duplicate live cascade already holds the WO lock (smart-cauldron
       // acquireWoLock): nothing fired, no premium usage was spent, and the paused

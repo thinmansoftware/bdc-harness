@@ -201,12 +201,27 @@ for (const moduleName of [
     ),
     // Store-backed twin of workflowsDb.approvePausedRunAtGate (one conditional update).
     approvePausedRunAtGate: mock(
-      async (id: string, expected: string, update: Record<string, unknown>) => {
+      async (
+        id: string,
+        expected: string,
+        update: Record<string, unknown>,
+        events: { event_type: string; step_name?: string; data?: Record<string, unknown> }[] = []
+      ) => {
         const run = store.runs.get(id);
         const gate = (run?.metadata.approval as { nodeId?: string } | undefined)?.nodeId;
         if (!run || run.status !== 'paused' || gate !== expected) return false;
         run.status = 'failed';
         run.metadata = { ...run.metadata, ...update };
+        // Same transaction as the gate update: the approval events.
+        for (const event of events) {
+          store.events.push({
+            workflow_run_id: id,
+            event_type: event.event_type,
+            step_name: event.step_name ?? null,
+            data: event.data ?? {},
+            created_at: new Date().toISOString(),
+          });
+        }
         return true;
       }
     ),

@@ -201,8 +201,11 @@ under it is terminal (no resumable run, no approval hand-off). Otherwise it is
 RETAINED (`retained_reason` = the record status, `record_missing`, or
 `run_not_terminal`; `run_ids_json` = the cascade's runs) and released later by:
 
-- (a) the resumed cascade: a `frontier-approved` record hands the claim to its
-  `resumeCascadeId` on acquire, and that cascade releases it at terminal;
+- (a) the resumed cascade: `POST /api/cascades/{id}/approve-frontier` takes the
+  claim over for the resume cascade id BEFORE dispatch (`takeOverWoClaimForResume`:
+  transfer from the paused cascade, or a fresh claim when none is held; any other
+  holder -> 409, approval rolled back, nothing fired), runs the resume with the
+  shared claim deps, and the resumed cascade releases it at terminal;
 - (b) an operator, through the operator-token API (CAS on the named holder):
 
 ```
@@ -215,7 +218,7 @@ curl -s -X POST http://localhost:3090/api/cascade-wo-claims/release -H "x-archon
 
 There is no time-based expiry.
 
-Approve is ONE check-and-write on the reviewed gate: the consumer passes
+Approve is ONE transaction on the reviewed gate (gate update + node_completed + approval_received; any failure rolls all three back): the consumer passes
 `node_id` to `approvePausedWorkflowRun`, which flips paused -> failed with a
 conditional update on (run id, paused, current gate node) BEFORE writing any
 approval event; if the gate moved, the reply is 409 `gate_changed` and nothing

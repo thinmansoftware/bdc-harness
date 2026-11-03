@@ -116,6 +116,48 @@ export async function transferWoClaim(
   return result.rowCount > 0;
 }
 
+/**
+ * Frontier resume (one statement each, before dispatch): hand the claim to the
+ * resuming cascade when the ORIGINAL cascade still holds it; claim it fresh when
+ * no cascade holds the WO (a pause recorded before claims existed, or an operator
+ * release). Refused (false) when any OTHER cascade holds the WO.
+ */
+export async function takeOverWoClaimForResume(
+  input: {
+    woId: string;
+    project: string;
+    originalCascadeId: string;
+    resumeCascadeId: string;
+    holder: string;
+    now: string;
+  },
+  db: IDatabase = getDatabase()
+): Promise<boolean> {
+  if (
+    await transferWoClaim(
+      {
+        woId: input.woId,
+        fromCascadeId: input.originalCascadeId,
+        toCascadeId: input.resumeCascadeId,
+      },
+      db
+    )
+  ) {
+    return true;
+  }
+  const fresh = await acquireWoClaim(
+    {
+      woId: input.woId,
+      project: input.project,
+      cascadeId: input.resumeCascadeId,
+      holder: input.holder,
+      now: input.now,
+    },
+    db
+  );
+  return fresh.acquired;
+}
+
 /** Active claims that were retained at cascade exit (reconcile candidates). */
 export async function listRetainedWoClaims(db: IDatabase = getDatabase()): Promise<WoClaimRow[]> {
   const result = await db.query<WoClaimRow>(
