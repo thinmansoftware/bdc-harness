@@ -22,6 +22,9 @@ import {
 } from '@archon/core/db/dispatch';
 import { getOperatorSetting } from '@archon/core/db/operator-settings';
 import { getLatestSeatUsageReading } from '@archon/core/db/seat-usage-readings';
+import { getRegisteredProviders } from '@archon/providers';
+import type { DagNode } from '../schemas/dag-node';
+import { selectSeatNodeFailover } from './seat-node-failover';
 
 export const SEAT_IDS = ['claude', 'codex', 'cursor'] as const;
 export type SeatId = (typeof SEAT_IDS)[number];
@@ -108,6 +111,15 @@ export interface SeatGateDegradedSeat {
   cutoffPercent: number;
   nodeIds: string[];
   failoverProviders: string[];
+  /** Per-node reroute chosen by the gate (WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01). */
+  routes?: SeatGateNodeRoute[];
+}
+
+/** One node the gate rerouted off an over-cutoff seat. */
+export interface SeatGateNodeRoute {
+  nodeId: string;
+  fromProvider: string;
+  toProvider: string;
 }
 export interface SeatCredits {
   has_credits: boolean;
@@ -151,12 +163,16 @@ export interface SeatGateNodeBinding {
   providerId: string;
   /** Set only when selectQuotaExhaustionRoute returns a failover route for the node. */
   failoverProvider?: string;
+  /** The node itself, so the gate can check provider capabilities for a runtime reroute. */
+  node?: DagNode;
 }
 
 /** The lane the run was fired on plus the per-node bindings of its workflow. */
 export interface SeatGateScope {
   laneProvider: string;
   nodes: readonly SeatGateNodeBinding[];
+  /** Workflow-level declared failover provider, first runtime candidate after a node's own. */
+  workflowFailoverProvider?: string;
 }
 
 export interface SeatCutoff {
@@ -822,7 +838,13 @@ export function seatsForGateScope(
   scope: SeatGateScope
 ): SeatId[] {
   const seats = seatsForBindings(bindings);
-  const extra = [scope.laneProvider, ...scope.nodes.map(node => node.failoverProvider ?? '')];
+  const extra = [
+    scope.laneProvider,
+    ...scope.nodes.map(node => node.failoverProvider ?? ''),
+    // Runtime reroute candidates: every registered provider's seat is read so the
+    // gate can find headroom (WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01).
+    ...getRegisteredProviders().map(provider => provider.id),
+  ];
   for (const providerId of extra) {
     const seat = seatForProvider(providerId);
     if (seat && !seats.includes(seat)) seats.push(seat);
@@ -906,6 +928,26 @@ function decideScopedSeatGate(
     return seatOverCutoff(target, reading, cutoffPercent) === null;
   };
 
+  /**
+   * Provider a node on an over-cutoff seat should run on. A declared failover
+   * wins when it has headroom; otherwise the runtime selector looks for any
+   * registered provider with Fuelglass headroom. Null means refuse.
+   */
+  const pickNodeRoute = (fromSeat: SeatId, binding: SeatGateNodeBinding): string | null => {
+    if (binding.node === undefined) {
+      return binding.failoverProvider !== undefined &&
+        failoverHasHeadroom(fromSeat, binding.failoverProvider)
+        ? binding.failoverProvider
+        : null;
+    }
+    return selectSeatNodeFailover({
+      node: binding.node,
+      currentProvider: binding.providerId,
+      workflowFailoverProvider: scope.workflowFailoverProvider,
+      hasHeadroom: providerId => failoverHasHeadroom(fromSeat, providerId),
+    });
+  };
+
   for (const seat of seats) {
     const reading = readings[seat];
     if (reading?.limit_source !== 'measured') {
@@ -932,12 +974,13 @@ function decideScopedSeatGate(
       continue;
     }
     const nodes = nodeSeats[seat] ?? [];
-    const covered =
-      nodes.length > 0 &&
-      nodes.every(
-        node =>
-          node.failoverProvider !== undefined && failoverHasHeadroom(seat, node.failoverProvider)
-      );
+    const routes: SeatGateNodeRoute[] = [];
+    for (const binding of nodes) {
+      const toProvider = pickNodeRoute(seat, binding);
+      if (toProvider === null) break;
+      routes.push({ nodeId: binding.nodeId, fromProvider: binding.providerId, toProvider });
+    }
+    const covered = nodes.length > 0 && routes.length === nodes.length;
     if (!covered) {
       refusal = { ...base, role: 'node' };
       continue;
@@ -948,7 +991,8 @@ function decideScopedSeatGate(
       usedPercent: over.usedPercent,
       cutoffPercent,
       nodeIds: nodes.map(node => node.nodeId),
-      failoverProviders: [...new Set(nodes.map(node => node.failoverProvider ?? ''))],
+      failoverProviders: [...new Set(routes.map(route => route.toProvider))],
+      routes,
     });
   }
   const credits = onCredits.length > 0 ? { onCredits } : {};

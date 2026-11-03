@@ -50,6 +50,7 @@ import {
   type SeatId,
   type SeatReading,
 } from './reliability/seat-usage';
+import { buildSeatRerouteNode } from './reliability/seat-node-failover';
 import { resolveWorkflowNodeProviders } from './reliability/resolve-binding';
 import { selectQuotaExhaustionRoute } from './node-failover';
 import {
@@ -1379,10 +1380,18 @@ export async function executeWorkflow(
         return {
           nodeId: node.id,
           providerId,
+          node,
           ...(route.kind === 'failover' ? { failoverProvider: route.provider } : {}),
         };
       }),
+      workflowFailoverProvider: executableWorkflow.failover_provider,
     };
+    // Nodes the seat gate reroutes off an over-cutoff seat dispatch from this
+    // copy of the workflow (WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01).
+    let dispatchWorkflow = executableWorkflow;
+    // Per-node model overrides for the dispatch. A reroute replaces the node's entry:
+    // the override pinned the exhausted provider, so it must not beat the new route.
+    let dispatchModelOverride = modelOverride;
     const laneName = executableWorkflow.name;
     const seatIds = seatsForBindings(probeDecision.bindings);
     if (seatIds.length > 0) {
@@ -1442,6 +1451,77 @@ export async function executeWorkflow(
             },
             'workflow.seat_usage_node_degraded'
           );
+        }
+        const routes = new Map<string, { fromProvider: string; toProvider: string }>();
+        for (const degraded of seatDecision.degradedSeats ?? []) {
+          for (const route of degraded.routes ?? []) routes.set(route.nodeId, route);
+        }
+        if (routes.size > 0) {
+          const nodeOverrides: Record<string, { provider?: string; model?: string }> = {
+            ...(modelOverride?.nodes ?? {}),
+          };
+          // failover_model and failover_agent belong to the declared failover route; when a
+          // different provider was selected, keep the original persona and fall back to the
+          // target provider's configured assistant model. The per-node override carries the
+          // selected model so resolveModelForNode (override wins) dispatches it.
+          const rerouteBinding = (
+            node: (typeof executableWorkflow.nodes)[number],
+            toProvider: string
+          ): { model: string | undefined; agent: string | undefined } => {
+            const declared = node as {
+              failover_provider?: string;
+              failover_model?: string;
+              failover_agent?: string;
+            };
+            const declaredProvider =
+              declared.failover_provider ?? executableWorkflow.failover_provider;
+            const onDeclaredRoute = toProvider === declaredProvider;
+            const declaredModel = onDeclaredRoute
+              ? (declared.failover_model ?? executableWorkflow.failover_model)
+              : undefined;
+            return {
+              model: declaredModel ?? assistantModels[toProvider],
+              agent: onDeclaredRoute ? declared.failover_agent : undefined,
+            };
+          };
+          for (const node of executableWorkflow.nodes) {
+            const route = routes.get(node.id);
+            if (!route) continue;
+            const { model } = rerouteBinding(node, route.toProvider);
+            nodeOverrides[node.id] = model
+              ? { provider: route.toProvider, model }
+              : { provider: route.toProvider };
+          }
+          dispatchModelOverride = { ...(modelOverride ?? {}), nodes: nodeOverrides };
+          dispatchWorkflow = {
+            ...executableWorkflow,
+            nodes: executableWorkflow.nodes.map(node => {
+              const route = routes.get(node.id);
+              if (!route) return node;
+              const { model, agent } = rerouteBinding(node, route.toProvider);
+              return buildSeatRerouteNode(node, route.toProvider, model, agent);
+            }),
+          };
+          for (const [nodeId, route] of routes) {
+            await deps.store
+              .createWorkflowEvent({
+                workflow_run_id: workflowRun.id,
+                event_type: 'node_failover',
+                step_name: nodeId,
+                data: {
+                  node_id: nodeId,
+                  from_provider: route.fromProvider,
+                  to_provider: route.toProvider,
+                  reason_code: 'seat_over_cutoff',
+                },
+              })
+              .catch((err: Error) => {
+                getLog().error(
+                  { err, workflowRunId: workflowRun.id, eventType: 'node_failover' },
+                  'workflow_event_persist_failed'
+                );
+              });
+          }
         }
       }
       if (seatDecision.refused) {
@@ -1665,7 +1745,7 @@ export async function executeWorkflow(
       platform,
       conversationId,
       cwd,
-      executableWorkflow,
+      dispatchWorkflow,
       workflowRun,
       writtenProvider,
       resolvedModel,
@@ -1677,7 +1757,7 @@ export async function executeWorkflow(
       configuredCommandFolder,
       issueContext,
       dagPriorCompletedNodes,
-      modelOverride
+      dispatchModelOverride
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result

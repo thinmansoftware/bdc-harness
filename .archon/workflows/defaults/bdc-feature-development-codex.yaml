@@ -629,8 +629,8 @@ nodes:
   # the normal build path -- assert-implement-produced-work (Fix A) is the real safety
   # net, this is only an optimization that must never wrongly skip real work.
   - id: check-already-satisfied
-    persona: war-council-architect
-    agent: war-council-architect
+    persona: war-council-architect-opr
+    agent: war-council-architect-opr
     provider: codex
     model: gpt-6.1-terra
     depends_on: [checkout-repair-target]
@@ -752,16 +752,17 @@ nodes:
       exit 0
 
   - id: plan
-    persona: war-council-architect
-    # Provider pin: persona war-council-architect declares model: sonnet; the lane
-    # default (provider: codex) must never receive an Anthropic alias. Mirror of #313
-    # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
-    # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
+    persona: war-council-architect-opr
+    # Provider pin: the lane is Claude-free (WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01).
+    # The -opr persona carries no Anthropic model alias, so the node-level model pin
+    # below (gpt-6.1-terra, GPT-6.1 family on Codex) is what runs. Anchor: runs
+    # 723842fe, 10f6add0, 28e98197 (2026-07-01) died at plan when this node was
+    # pinned to an Anthropic persona.
     provider: codex
     model: gpt-6.1-terra
     depends_on: [gate-already-satisfied]
     when: "$gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
-    agent: war-council-architect
+    agent: war-council-architect-opr
     task_class: medium_work
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
@@ -3805,7 +3806,10 @@ nodes:
   # schema migration the self-repair loop deferred -- but ONLY for the authorized_fix_ids.
   # trigger_rule all_done so an APPROVE-AS-IS run (which skips this) does not hang the DAG.
   - id: apply-suggested-fix
-    agent: overseer-opus
+    # Persona: major-build-opr (no model pin) keeps the lane Claude-free; overseer-opus
+    # pins an Anthropic model and the persona model always wins over the node model.
+    persona: major-build-opr
+    agent: major-build-opr
     provider: codex
     model: gpt-6.1-sol
     effort: xhigh
@@ -3891,7 +3895,7 @@ nodes:
       printf '{"verdict":"%s"}\n' "$verdict"
 
   - id: decide-push-target
-    persona: major-build
+    persona: major-build-opr
     provider: codex
     model: gpt-6.1-sol
     depends_on: [pause-gate, classify-apply-review]
@@ -4981,7 +4985,8 @@ nodes:
       fi
 
   - id: build-manifest
-    persona: major-build
+    persona: major-build-opr
+    provider: codex
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical
