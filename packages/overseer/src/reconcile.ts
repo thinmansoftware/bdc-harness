@@ -106,6 +106,24 @@ export interface ReconcileTrackerIssue {
   createdAt?: string | null;
 }
 
+/**
+ * Result of a capped, paginated GitHub read. `truncated` is true when the page cap
+ * was reached on a full page (more may exist) or a page was malformed, so the
+ * items cannot be treated as complete. Every decision that reads one takes its
+ * no-change path when truncated (reopen: leave closed; mark: leave unmarked;
+ * close: leave open).
+ */
+export interface PagedRead<T> {
+  items: T[];
+  truncated: boolean;
+}
+
+/** Close-event history verdict for the A2.1 reopen. */
+export interface CloseEventRead {
+  closedByThisPr: boolean;
+  truncated: boolean;
+}
+
 export interface ReconcileTrackerComment {
   author: string;
   body: string;
@@ -167,7 +185,7 @@ export interface ReconcileDeps {
    * falls back to prior behavior rather than blocking, so a deps object that
    * predates this guard still works.
    */
-  listPullRequestFiles?: (pr: ReconcileMergedPullRequest) => Promise<string[]>;
+  listPullRequestFiles?: (pr: ReconcileMergedPullRequest) => Promise<string[] | PagedRead<string>>;
   /**
    * Open pull requests that may still reference this tracker. When one of them
    * holds the WO, reconcile leaves the tracker open. Optional: when absent,
@@ -203,11 +221,13 @@ export interface ReconcileDeps {
    * Open tracker issues labelled status:merged (the LIVE-PROOF pass). Optional:
    * when absent, or when listTrackerComments is absent, the pass is skipped.
    */
-  listMergedAwaitingProof?: () => Promise<ReconcileTrackerIssue[]>;
+  listMergedAwaitingProof?: () => Promise<
+    ReconcileTrackerIssue[] | PagedRead<ReconcileTrackerIssue>
+  >;
   /** Comments on a tracker issue, oldest first. */
   listTrackerComments?: (input: {
     issue: ReconcileTrackerIssue;
-  }) => Promise<ReconcileTrackerComment[]>;
+  }) => Promise<ReconcileTrackerComment[] | PagedRead<ReconcileTrackerComment>>;
   /**
    * Amendment A2.1: true when the tracker's most recent `closed` event carries
    * this PR's merge commit sha (GitHub closed it natively on the keyword merge).
@@ -216,7 +236,7 @@ export interface ReconcileDeps {
   wasClosedByPullRequestMerge?: (input: {
     issue: ReconcileTrackerIssue;
     pr: ReconcileMergedPullRequest;
-  }) => Promise<boolean>;
+  }) => Promise<boolean | CloseEventRead>;
   /** Reopen a tracker issue (amendment A2.1). */
   reopenTrackerIssue?: (input: { issue: ReconcileTrackerIssue }) => Promise<void>;
   now?: () => Date;
@@ -400,9 +420,10 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
         if (tracker.state !== 'open') {
           if (!deps.wasClosedByPullRequestMerge || !deps.reopenTrackerIssue) continue;
           if (!pr.mergeCommitSha) continue;
-          let closedByThisPr: boolean;
+          let closeRead: CloseEventRead;
           try {
-            closedByThisPr = await deps.wasClosedByPullRequestMerge({ issue: tracker, pr });
+            const raw = await deps.wasClosedByPullRequestMerge({ issue: tracker, pr });
+            closeRead = typeof raw === 'boolean' ? { closedByThisPr: raw, truncated: false } : raw;
           } catch (error) {
             logger.warn(
               { err: error as Error, prRef, tracker: tracker.number },
@@ -410,7 +431,15 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
             );
             continue;
           }
-          if (!closedByThisPr) continue;
+          if (closeRead.truncated) {
+            // Capped event history: a later close may be unread. Leave it closed.
+            logger.warn(
+              { prRef, tracker: tracker.number },
+              'overseer.reconcile.close_event_history_truncated_left_closed'
+            );
+            continue;
+          }
+          if (!closeRead.closedByThisPr) continue;
           reopenNeeded = true;
           // Reopen NOW, before the spec-only/holder guards: a native close by this
           // PR's merge is never left standing, whatever those guards decide about
@@ -469,7 +498,16 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
         if (listFiles) {
           let changedPaths: string[] | null = null;
           try {
-            changedPaths = await listFiles(pr);
+            const read = asPagedRead(await listFiles(pr));
+            if (read.truncated) {
+              // Capped file list: cannot prove the merge is not spec-only. No mark.
+              logger.warn(
+                { prRef, woId },
+                'overseer.reconcile.file_list_truncated_leaving_tracker_unmarked'
+              );
+              continue;
+            }
+            changedPaths = read.items;
           } catch (error) {
             // Fail OPEN on a file-listing error: leave the tracker alone rather
             // than closing on unverified evidence. A tracker left open is visible
@@ -630,7 +668,13 @@ async function runLiveProofPass(deps: ReconcileDeps, logger: ReconcileLogger): P
   if (!deps.listMergedAwaitingProof || !deps.listTrackerComments) return 0;
   let awaiting: ReconcileTrackerIssue[];
   try {
-    awaiting = await deps.listMergedAwaitingProof();
+    const read = asPagedRead(await deps.listMergedAwaitingProof());
+    if (read.truncated) {
+      // Capped list of status:merged issues: close nothing this pass.
+      logger.warn({ read: read.items.length }, 'overseer.reconcile.live_proof_list_truncated');
+      return 0;
+    }
+    awaiting = read.items;
   } catch (error) {
     logger.warn({ err: error as Error }, 'overseer.reconcile.live_proof_list_failed');
     return 0;
@@ -649,14 +693,15 @@ async function runLiveProofPass(deps: ReconcileDeps, logger: ReconcileLogger): P
     if (already) continue;
     let comments: ReconcileTrackerComment[];
     try {
-      comments = await deps.listTrackerComments({ issue });
+      const read = asPagedRead(await deps.listTrackerComments({ issue }));
+      if (read.truncated) {
+        // Capped comment list: a newer merged marker may be unread. Leave open.
+        logger.warn({ prRef }, 'overseer.reconcile.live_proof_comments_truncated_left_open');
+        continue;
+      }
+      comments = read.items;
     } catch (error) {
-      logger.warn(
-        { err: error as Error, prRef },
-        error instanceof TruncatedCommentsError
-          ? 'overseer.reconcile.live_proof_comments_truncated_left_open'
-          : 'overseer.reconcile.live_proof_comments_failed'
-      );
+      logger.warn({ err: error as Error, prRef }, 'overseer.reconcile.live_proof_comments_failed');
       continue;
     }
     const proof = findLiveProof(comments, allowed);
@@ -1185,7 +1230,14 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
   };
   return {
     readCursor: readReconcileCursorFromActions,
-    searchMergedPullRequests: async input => searchMergedPullRequests(await getOctokit(), input),
+    searchMergedPullRequests: async (input): Promise<ReconcileMergedPullRequest[]> => {
+      const read = await searchMergedPullRequestsPaged(await getOctokit(), input);
+      // Discovery only: a capped search can omit PRs (no change for those); every
+      // decision is made per PR on that PR's own complete data.
+      if (read.truncated)
+        log.warn({ found: read.items.length }, 'overseer.reconcile.merged_search_truncated');
+      return read.items;
+    },
     findTrackerIssueByStem: async (stem, scope): Promise<ReconcileTrackerIssue | null> => {
       let snapshot = scope ? trackerSnapshots.get(scope) : undefined;
       if (!snapshot) {
@@ -1209,19 +1261,8 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     },
     listOpenPullRequestsReferencingTracker: async input =>
       searchOpenPullRequestsReferencingTracker(await getOctokit(), input),
-    listPullRequestFiles: async (pr): Promise<string[]> => {
-      const client = await getOctokit();
-      // per_page 100: a spec-only PR is 1-2 files, so the first page is always
-      // enough to prove NOT-spec-only. A large PR truncated at 100 still contains
-      // a source file, so isSpecOnlyChangeSet correctly returns false.
-      const res = await client.pulls.listFiles({
-        owner: pr.owner,
-        repo: pr.repo,
-        pull_number: pr.number,
-        per_page: 100,
-      });
-      return res.data.map(f => f.filename);
-    },
+    listPullRequestFiles: async (pr): Promise<PagedRead<string>> =>
+      listPullRequestFilePaths(await getOctokit(), pr),
     addTrackerEvidenceComment: async (input): Promise<void> => {
       const client = await getOctokit();
       await client.issues.createComment({
@@ -1270,14 +1311,17 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
         if ((error as { status?: number }).status !== 404) throw error;
       }
     },
-    listMergedAwaitingProof: async (): Promise<ReconcileTrackerIssue[]> =>
+    listMergedAwaitingProof: async (): Promise<PagedRead<ReconcileTrackerIssue>> =>
       listOpenMergedTrackers(await getOctokit()),
-    listTrackerComments: async (input): Promise<ReconcileTrackerComment[]> =>
+    listTrackerComments: async (input): Promise<PagedRead<ReconcileTrackerComment>> =>
       listIssueComments(await getOctokit(), input.issue),
-    wasClosedByPullRequestMerge: async (input): Promise<boolean> =>
-      latestCloseCommitSha(await getOctokit(), input.issue).then(
-        sha => sha !== null && sha === input.pr.mergeCommitSha
-      ),
+    wasClosedByPullRequestMerge: async (input): Promise<CloseEventRead> => {
+      const read = await readLatestCloseEvent(await getOctokit(), input.issue);
+      return {
+        closedByThisPr: read.sha !== null && read.sha === input.pr.mergeCommitSha,
+        truncated: read.truncated,
+      };
+    },
     reopenTrackerIssue: async (input): Promise<void> => {
       const client = await getOctokit();
       await client.issues.update({
@@ -1292,109 +1336,143 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
   };
 }
 
-const MERGED_LIST_MAX_PAGES = 10;
+const READ_PAGE_SIZE = 100;
+const READ_MAX_PAGES = 10;
+/** GitHub's pulls.listFiles returns at most 3000 files (30 pages of 100). */
+const PR_FILES_MAX_PAGES = 30;
 
-async function listOpenMergedTrackers(octokit: OctokitLike): Promise<ReconcileTrackerIssue[]> {
-  if (!octokit.issues.listForRepo) return [];
-  const out: ReconcileTrackerIssue[] = [];
-  for (let page = 1; page <= MERGED_LIST_MAX_PAGES; page++) {
-    const res = await octokit.issues.listForRepo({
-      owner: DEFAULT_ORG,
-      repo: DEFAULT_TRACKER_REPO,
-      state: 'open',
-      labels: MERGED_LABEL,
-      per_page: 100,
-      page,
-    });
-    const rows = Array.isArray(res.data) ? (res.data as Record<string, unknown>[]) : [];
-    for (const row of rows) {
-      if (row.pull_request !== undefined) continue;
-      if (!Number.isSafeInteger(row.number) || typeof row.title !== 'string') continue;
-      out.push({
+/**
+ * THE one paginator for capped reconcile reads. Complete only when a short page is
+ * seen; a full page at the cap, or a malformed page, is `truncated: true`.
+ */
+async function readPages<T>(
+  fetchPage: (page: number) => Promise<unknown>,
+  map: (row: Record<string, unknown>) => T | null,
+  maxPages: number = READ_MAX_PAGES
+): Promise<PagedRead<T>> {
+  const items: T[] = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const data = await fetchPage(page);
+    if (!Array.isArray(data)) return { items, truncated: true };
+    for (const row of data as Record<string, unknown>[]) {
+      const value = map(row);
+      if (value !== null) items.push(value);
+    }
+    if (data.length < READ_PAGE_SIZE) return { items, truncated: false };
+  }
+  return { items, truncated: true };
+}
+
+export function asPagedRead<T>(value: T[] | PagedRead<T>): PagedRead<T> {
+  return Array.isArray(value) ? { items: value, truncated: false } : value;
+}
+
+/** Reader 1: open tracker issues labelled status:merged (LIVE-PROOF pass input). */
+export async function listOpenMergedTrackers(
+  octokit: OctokitLike
+): Promise<PagedRead<ReconcileTrackerIssue>> {
+  if (!octokit.issues.listForRepo) return { items: [], truncated: true };
+  return readPages(
+    async page =>
+      (
+        await octokit.issues.listForRepo?.({
+          owner: DEFAULT_ORG,
+          repo: DEFAULT_TRACKER_REPO,
+          state: 'open',
+          labels: MERGED_LABEL,
+          per_page: READ_PAGE_SIZE,
+          page,
+        })
+      )?.data,
+    row => {
+      if (row.pull_request !== undefined) return null;
+      if (!Number.isSafeInteger(row.number) || typeof row.title !== 'string') return null;
+      return {
         owner: DEFAULT_ORG,
         repo: DEFAULT_TRACKER_REPO,
         number: row.number as number,
         title: row.title,
         state: row.state === 'closed' ? 'closed' : 'open',
         createdAt: typeof row.created_at === 'string' ? row.created_at : null,
-      });
+      };
     }
-    if (rows.length < 100) break;
-  }
-  return out;
+  );
 }
 
-/** commit_id of the most recent `closed` event on an issue, or null. */
-async function latestCloseCommitSha(
+/** Reader 2: commit sha of the most recent `closed` event (A2.1 reopen input). */
+export async function readLatestCloseEvent(
   octokit: OctokitLike,
   issue: ReconcileTrackerIssue
-): Promise<string | null> {
-  if (!octokit.issues.listEvents) return null;
-  let latest: string | null = null;
-  let seenClose = false;
-  for (let page = 1; page <= MERGED_LIST_MAX_PAGES; page++) {
-    const res = await octokit.issues.listEvents({
-      owner: issue.owner,
-      repo: issue.repo,
-      issue_number: issue.number,
-      per_page: 100,
-      page,
-    });
-    const rows = Array.isArray(res.data) ? (res.data as Record<string, unknown>[]) : [];
-    for (const row of rows) {
-      if (row.event !== 'closed') continue;
-      seenClose = true;
-      latest = typeof row.commit_id === 'string' ? row.commit_id : null;
-    }
-    if (rows.length < 100) break;
-  }
-  return seenClose ? latest : null;
+): Promise<{ sha: string | null; truncated: boolean }> {
+  if (!octokit.issues.listEvents) return { sha: null, truncated: true };
+  const read = await readPages(
+    async page =>
+      (
+        await octokit.issues.listEvents?.({
+          owner: issue.owner,
+          repo: issue.repo,
+          issue_number: issue.number,
+          per_page: READ_PAGE_SIZE,
+          page,
+        })
+      )?.data,
+    row =>
+      row.event === 'closed'
+        ? { sha: typeof row.commit_id === 'string' ? row.commit_id : null }
+        : null
+  );
+  const last = read.items[read.items.length - 1];
+  return { sha: last ? last.sha : null, truncated: read.truncated };
 }
 
-/**
- * Thrown when the comment read hit the page cap before the last page, so a newer
- * merged marker could be unread. The LIVE-PROOF pass treats it as "do not close".
- */
-export class TruncatedCommentsError extends Error {
-  constructor(issueRef: string) {
-    super(`tracker comment read truncated at the page cap: ${issueRef}`);
-    this.name = 'TruncatedCommentsError';
-  }
-}
-
+/** Reader 3: comments on a tracker issue, oldest first (LIVE-PROOF input). */
 export async function listIssueComments(
   octokit: OctokitLike,
   issue: ReconcileTrackerIssue
-): Promise<ReconcileTrackerComment[]> {
-  if (!octokit.issues.listComments) return [];
-  const out: ReconcileTrackerComment[] = [];
-  let complete = false;
-  for (let page = 1; page <= MERGED_LIST_MAX_PAGES; page++) {
-    const res = await octokit.issues.listComments({
-      owner: issue.owner,
-      repo: issue.repo,
-      issue_number: issue.number,
-      per_page: 100,
-      page,
-    });
-    const rows = Array.isArray(res.data) ? (res.data as Record<string, unknown>[]) : [];
-    for (const row of rows) {
+): Promise<PagedRead<ReconcileTrackerComment>> {
+  if (!octokit.issues.listComments) return { items: [], truncated: true };
+  return readPages(
+    async page =>
+      (
+        await octokit.issues.listComments?.({
+          owner: issue.owner,
+          repo: issue.repo,
+          issue_number: issue.number,
+          per_page: READ_PAGE_SIZE,
+          page,
+        })
+      )?.data,
+    row => {
       const user = row.user as { login?: unknown } | null | undefined;
-      out.push({
+      return {
         author: typeof user?.login === 'string' ? user.login : '',
         body: typeof row.body === 'string' ? row.body : '',
         htmlUrl: typeof row.html_url === 'string' ? row.html_url : '',
         createdAt: typeof row.created_at === 'string' ? row.created_at : '',
-      });
+      };
     }
-    if (rows.length < 100) {
-      complete = true;
-      break;
-    }
-  }
-  // Fail closed: never judge LIVE-PROOF on a partial comment list.
-  if (!complete) throw new TruncatedCommentsError(`${issue.owner}/${issue.repo}#${issue.number}`);
-  return out;
+  );
+}
+
+/** Reader 4: changed file paths of a merged PR (spec-only guard input). */
+export async function listPullRequestFilePaths(
+  octokit: OctokitLike,
+  pr: Pick<ReconcileMergedPullRequest, 'owner' | 'repo' | 'number'>
+): Promise<PagedRead<string>> {
+  return readPages(
+    async page =>
+      (
+        await octokit.pulls.listFiles({
+          owner: pr.owner,
+          repo: pr.repo,
+          pull_number: pr.number,
+          per_page: READ_PAGE_SIZE,
+          page,
+        })
+      ).data,
+    row => (typeof row.filename === 'string' ? row.filename : null),
+    PR_FILES_MAX_PAGES
+  );
 }
 
 async function resolveSearchSince(input: RunReconcileInput, deps: ReconcileDeps): Promise<string> {
@@ -1418,10 +1496,18 @@ async function resolveSearchSince(input: RunReconcileInput, deps: ReconcileDeps)
   return since.toISOString().slice(0, 10);
 }
 
+/** Reader 5: merged PRs for reconcile, with the capped-search flag. */
 export async function searchMergedPullRequests(
   octokit: OctokitLike,
   input: { org: string; since: string }
 ): Promise<ReconcileMergedPullRequest[]> {
+  return (await searchMergedPullRequestsPaged(octokit, input)).items;
+}
+
+export async function searchMergedPullRequestsPaged(
+  octokit: OctokitLike,
+  input: { org: string; since: string }
+): Promise<PagedRead<ReconcileMergedPullRequest>> {
   const queries = [
     `org:${input.org} is:pr is:merged merged:>=${input.since} WO- in:title`,
     `org:${input.org} is:pr is:merged merged:>=${input.since} WO- in:body`,
@@ -1435,8 +1521,10 @@ export async function searchMergedPullRequests(
     `org:${input.org} is:pr is:merged merged:>=${input.since} ${DEFAULT_TRACKER_REPO} in:body`,
   ];
   const results = new Map<string, ReconcileMergedPullRequest>();
+  let truncated = false;
 
   for (const q of queries) {
+    let complete = false;
     // Paginate each query to GitHub's 1000-result cap (10 pages of 100). Before,
     // only page 1 was read, so a merged PR beyond the first 100 results was never
     // seen and its tracker never closed (bdc-xo #4130 / shopops #948 miss).
@@ -1475,11 +1563,15 @@ export async function searchMergedPullRequests(
         });
       }
       // Fewer than a full page means the query is exhausted.
-      if (items.length < OPEN_PR_SEARCH_PAGE_SIZE) break;
+      if (items.length < OPEN_PR_SEARCH_PAGE_SIZE) {
+        complete = true;
+        break;
+      }
     }
+    if (!complete) truncated = true;
   }
 
-  return [...results.values()];
+  return { items: [...results.values()], truncated };
 }
 
 // GitHub search returns at most 1000 results per query.

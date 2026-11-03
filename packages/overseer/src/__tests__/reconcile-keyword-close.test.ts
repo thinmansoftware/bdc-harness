@@ -12,10 +12,13 @@ import {
   MERGED_MARKER,
   RECONCILE_ACTION,
   RECONCILE_MERGED_ACTION,
-  TruncatedCommentsError,
   findLiveProof,
   listIssueComments,
+  listOpenMergedTrackers,
+  listPullRequestFilePaths,
   liveProofAuthors,
+  readLatestCloseEvent,
+  searchMergedPullRequestsPaged,
   extractClosingKeywordTrackerRefs,
   openPullRequestsHoldingTracker,
   runReconcileOnce,
@@ -975,45 +978,167 @@ test('Test 13 (open holder): a native close by this merge is reopened even while
 });
 
 // ---------------------------------------------------------------------------
-// Test 15: a comment read cut short at the page cap never closes (fail closed)
+// Test 15: every capped paginated reader reports truncation, and every decision
+// that reads one takes its no-change path (bdc-harness PR 1432 review rounds 3-5).
 // ---------------------------------------------------------------------------
 
-test('Test 15: a truncated comment read with an old LIVE-PROOF leaves the tracker open', async () => {
-  // Ten full pages: page 1 holds an old merged marker and an allowed LIVE-PROOF;
-  // a newer marker could sit past the cap, so the read must not be trusted.
-  const pagesRead: number[] = [];
+/** An octokit whose every list call returns a FULL page forever (or a short one). */
+function pagedOctokit(fullPages: boolean) {
+  const pagesRead: Record<string, number> = {};
+  const page =
+    (name: string, row: (page: number, i: number) => Record<string, unknown>) =>
+    async (input: Record<string, unknown>) => {
+      const n = Number(input.page ?? 1);
+      pagesRead[name] = Math.max(pagesRead[name] ?? 0, n);
+      const length = fullPages ? 100 : 3;
+      return { data: Array.from({ length }, (_, i) => row(n, i)) };
+    };
   const octokit = {
-    issues: {
-      listComments: async (input: Record<string, unknown>) => {
-        const page = Number(input.page ?? 1);
-        pagesRead.push(page);
-        const data = Array.from({ length: 100 }, (_, i) => ({
-          user: { login: page === 1 && i === 1 ? 'bluedevilcollectibles' : 'someone' },
-          body:
-            page === 1 && i === 0
-              ? MERGED_NOTE
-              : page === 1 && i === 1
-                ? 'LIVE-PROOF https://example.test/old-merge'
-                : 'chatter',
-          html_url: `https://github.com/${ORG}/bdc-xo/issues/4130#issuecomment-${page}${i}`,
-          created_at: '2026-11-03T00:00:00Z',
+    search: {
+      issuesAndPullRequests: async (input: Record<string, unknown>) => {
+        const n = Number(input.page ?? 1);
+        pagesRead.search = Math.max(pagesRead.search ?? 0, n);
+        const length = fullPages ? 100 : 3;
+        // Non-PR rows: the paginator is exercised without pulls.get lookups.
+        const items = Array.from({ length }, (_, i) => ({
+          number: n * 1000 + i,
+          title: 'filler',
+          state: 'closed',
         }));
-        return { data };
+        return { data: { total_count: 5000, incomplete_results: false, items } };
       },
     },
+    pulls: {
+      get: async () => {
+        throw new Error('unexpected pulls.get');
+      },
+      listFiles: page('files', (n, i) => ({ filename: `docs/f-${n}-${i}.md` })),
+    },
+    issues: {
+      listForRepo: page('merged', (n, i) => ({
+        number: n * 1000 + i,
+        title: `WO-X-${n}-${i}-01`,
+        state: 'open',
+      })),
+      listEvents: page('events', (n, i) => ({
+        event: 'closed',
+        commit_id: n === 1 && i === 0 ? 'feedface' : null,
+      })),
+      listComments: page('comments', (n, i) => ({
+        user: { login: 'bluedevilcollectibles' },
+        body: n === 1 && i === 0 ? MERGED_NOTE : 'LIVE-PROOF https://example.test/old',
+        html_url: `https://github.com/${ORG}/bdc-xo/issues/4130#issuecomment-${n}${i}`,
+        created_at: '2026-11-03T00:00:00Z',
+      })),
+      createComment: async () => undefined,
+      addLabels: async () => undefined,
+      update: async () => undefined,
+    },
   } as unknown as OctokitLike;
+  return { octokit, pagesRead };
+}
 
-  await expect(listIssueComments(octokit, tracker(4130, SHOPOPS_WO))).rejects.toBeInstanceOf(
-    TruncatedCommentsError
+const READERS: {
+  name: string;
+  key: string;
+  cap: number;
+  read: (octokit: OctokitLike) => Promise<{ truncated: boolean }>;
+}[] = [
+  { name: 'listOpenMergedTrackers', key: 'merged', cap: 10, read: o => listOpenMergedTrackers(o) },
+  {
+    name: 'readLatestCloseEvent',
+    key: 'events',
+    cap: 10,
+    read: o => readLatestCloseEvent(o, tracker(4130, SHOPOPS_WO)),
+  },
+  {
+    name: 'listIssueComments',
+    key: 'comments',
+    cap: 10,
+    read: o => listIssueComments(o, tracker(4130, SHOPOPS_WO)),
+  },
+  {
+    name: 'listPullRequestFilePaths',
+    key: 'files',
+    cap: 30,
+    read: o => listPullRequestFilePaths(o, { owner: ORG, repo: 'shopops', number: 948 }),
+  },
+  {
+    name: 'searchMergedPullRequestsPaged',
+    key: 'search',
+    cap: 10,
+    read: o => searchMergedPullRequestsPaged(o, { org: ORG, since: '2026-11-01' }),
+  },
+];
+
+for (const reader of READERS) {
+  test(`Test 15 (${reader.name}): full pages to the cap = truncated; a short page = complete`, async () => {
+    const capped = pagedOctokit(true);
+    expect((await reader.read(capped.octokit)).truncated).toBe(true);
+    expect(capped.pagesRead[reader.key]).toBe(reader.cap);
+
+    const short = pagedOctokit(false);
+    expect((await reader.read(short.octokit)).truncated).toBe(false);
+    expect(short.pagesRead[reader.key]).toBe(1);
+  });
+}
+
+test('Test 15 (reopen decision): a truncated close-event history leaves the tracker closed', async () => {
+  // Page 1 holds a close by this PR's merge; a later human close may be past the cap.
+  const { octokit } = pagedOctokit(true);
+  const { state, reopened } = nativeCloseState('feedface');
+  state.deps.wasClosedByPullRequestMerge = async input => {
+    const read = await readLatestCloseEvent(octokit, input.issue);
+    return { closedByThisPr: read.sha === input.pr.mergeCommitSha, truncated: read.truncated };
+  };
+
+  await runReconcileOnce({ deps: state.deps });
+
+  expect(reopened).toEqual([]);
+  expect(state.labels).toEqual([]);
+  expect(state.warnings).toContain('overseer.reconcile.close_event_history_truncated_left_closed');
+});
+
+test('Test 15 (merged-mark decision): a truncated PR file list leaves the tracker unmarked', async () => {
+  const { octokit } = pagedOctokit(true);
+  const state = harness({
+    prs: [mergedPr({ baseRef: 'staging', body: `Closes ${ORG}/bdc-xo#4130` })],
+    trackersByNumber: { 4130: tracker(4130, SHOPOPS_WO) },
+  });
+  state.deps.listPullRequestFiles = async pr => listPullRequestFilePaths(octokit, pr);
+
+  await runReconcileOnce({ deps: state.deps });
+
+  expect(state.labels).toEqual([]);
+  expect(state.comments).toEqual([]);
+  expect(state.warnings).toContain(
+    'overseer.reconcile.file_list_truncated_leaving_tracker_unmarked'
   );
-  expect(Math.max(...pagesRead)).toBe(10);
+});
 
+test('Test 15 (close decision): a truncated comment read with an old LIVE-PROOF leaves the tracker open', async () => {
+  const { octokit } = pagedOctokit(true);
   const state = proofState([]);
   state.deps.listTrackerComments = async input => listIssueComments(octokit, input.issue);
+
   const result = await runReconcileOnce({ deps: state.deps });
 
   expect(result.closed).toBe(0);
   expect(state.closes).toEqual([]);
-  expect(state.labels).toEqual([]);
   expect(state.warnings).toContain('overseer.reconcile.live_proof_comments_truncated_left_open');
+});
+
+test('Test 15 (close decision): a truncated status:merged list closes nothing this pass', async () => {
+  const { octokit } = pagedOctokit(true);
+  const state = proofState([
+    comment('thinman-overseer[bot]', MERGED_NOTE, 1),
+    comment('bluedevilcollectibles', 'LIVE-PROOF https://example.test/run/1', 2),
+  ]);
+  state.deps.listMergedAwaitingProof = async () => listOpenMergedTrackers(octokit);
+
+  const result = await runReconcileOnce({ deps: state.deps });
+
+  expect(result.closed).toBe(0);
+  expect(state.closes).toEqual([]);
+  expect(state.warnings).toContain('overseer.reconcile.live_proof_list_truncated');
 });

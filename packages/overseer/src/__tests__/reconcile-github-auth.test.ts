@@ -101,7 +101,10 @@ test('reconciliation reads use the configured App with no PAT present', async ()
   app();
   transport(() => Response.json([{ filename: 'src/example.ts' }]));
   const deps = createDefaultReconcileDeps();
-  expect(await deps.listPullRequestFiles?.(pr)).toEqual(['src/example.ts']);
+  expect(await deps.listPullRequestFiles?.(pr)).toEqual({
+    items: ['src/example.ts'],
+    truncated: false,
+  });
   expect(calls.map(call => call.auth)).toEqual(['Bearer fixture-app']);
   await flushGitHubApiMeter();
   const usage = await getDatabase().query<{ service: string; pool_id: string }>(
@@ -215,7 +218,10 @@ test('an exhausted fallback PAT is held before its HTTP request', async () => {
 test('PAT-only installations retain their read route', async () => {
   process.env.GITHUB_TOKEN = 'fixture-pat';
   transport(() => Response.json([]));
-  expect(await createDefaultReconcileDeps().listPullRequestFiles?.(pr)).toEqual([]);
+  expect(await createDefaultReconcileDeps().listPullRequestFiles?.(pr)).toEqual({
+    items: [],
+    truncated: false,
+  });
   expect(calls.map(call => call.auth)).toEqual(['Bearer fixture-pat']);
 });
 

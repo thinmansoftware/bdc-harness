@@ -147,6 +147,27 @@ docker exec archon-app-1 bun -e "import {Database} from 'bun:sqlite'; \
   console.log(db.query(\"select class, action, pr_ref, wo_id, created_at from overseer_reconcile_actions where action in ('reconcile_merged_noted') or class='live_proof' order by created_at desc limit 50\").all())"
 ```
 
+## Capped reads fail closed
+
+Every paginated GitHub read reconcile decides on is capped, and a capped read is
+never treated as complete. The readers in `reconcile.ts` return
+`{ items, truncated }` (one paginator, `readPages`): complete only on a short page;
+a full page at the cap, or a malformed page, is truncated. Each decision then takes
+its no-change path and logs one warn line:
+
+| Reader | Cap | Decision when truncated | Log line |
+|---|---|---|---|
+| `readLatestCloseEvent` (issue events) | 10 pages | reopen: leave closed | `close_event_history_truncated_left_closed` |
+| `listPullRequestFilePaths` (PR files) | 30 pages (GitHub max 3000 files) | merged mark: leave unmarked | `file_list_truncated_leaving_tracker_unmarked` |
+| `listOpenMergedTrackers` (status:merged issues) | 10 pages | LIVE-PROOF: close nothing this pass | `live_proof_list_truncated` |
+| `listIssueComments` (issue comments) | 10 pages | LIVE-PROOF: leave open | `live_proof_comments_truncated_left_open` |
+| `searchMergedPullRequestsPaged` (merged-PR search) | 10 pages per query | discovery only: unseen PRs get no change | `merged_search_truncated` |
+
+Two other capped reads already fail closed by throwing: the open-PR holder search
+(`searchOpenPullRequestsReferencingTracker`, leaves the tracker untouched) and the
+tracker snapshot (`readTrackerIssueSnapshot`, aborts the pass). All log lines are
+prefixed `overseer.reconcile.`.
+
 ## The reconcile_keyword_missing_noted row
 
 When a PR on its project base declares a WO on a manifest `WO:` line but carries
