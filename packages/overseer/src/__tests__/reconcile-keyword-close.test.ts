@@ -857,3 +857,100 @@ test('Test 12: a merged PR that only names the WO and its tracker number marks n
   expect(state.comments).toEqual([]);
   expect(state.removed).toEqual([]);
 });
+
+// ---------------------------------------------------------------------------
+// Test 13: a native GitHub close on a default-branch keyword merge is reopened
+// and marked merged (amendment A2.1)
+// ---------------------------------------------------------------------------
+
+const WO_NATIVE = 'WO-XO-NATIVE-CLOSE-01';
+
+function nativeCloseState(closeSha: string | null) {
+  const reopened: number[] = [];
+  const state = harness({
+    prs: [
+      mergedPr({
+        owner: ORG,
+        repo: 'bdc-xo',
+        number: 4400,
+        htmlUrl: `https://github.com/${ORG}/bdc-xo/pull/4400`,
+        baseRef: 'main',
+        mergeCommitSha: 'feedface',
+        body: 'Fixes #4999',
+      }),
+    ],
+    trackersByNumber: { 4999: tracker(4999, WO_NATIVE, 'closed') },
+  });
+  state.deps.wasClosedByPullRequestMerge = async input =>
+    closeSha !== null && closeSha === input.pr.mergeCommitSha;
+  state.deps.reopenTrackerIssue = async input => {
+    reopened.push(input.issue.number);
+  };
+  return { state, reopened };
+}
+
+test('Test 13: a bdc-xo main merge with `Fixes #4999` that GitHub closed is reopened and marked merged', async () => {
+  const { state, reopened } = nativeCloseState('feedface');
+
+  const result = await runReconcileOnce({ deps: state.deps });
+
+  expect(result.closed).toBe(0);
+  expect(reopened).toEqual([4999]);
+  expectMarkedOnce(state, WO_NATIVE);
+  expect(state.comments[0]).toContain(
+    'reopened: DONE = tested live (John 2026-10-15); close with LIVE-PROOF'
+  );
+});
+
+test('Test 13 (other closer): a tracker closed by someone else stays closed and unmarked', async () => {
+  for (const sha of [null, 'cafebabe']) {
+    const { state, reopened } = nativeCloseState(sha);
+    await runReconcileOnce({ deps: state.deps });
+    expect(reopened).toEqual([]);
+    expect(state.labels).toEqual([]);
+    expect(state.comments).toEqual([]);
+  }
+});
+
+test('Test 13 (once): a recorded mark means a later human close is never reopened again', async () => {
+  const { state, reopened } = nativeCloseState('feedface');
+  state.deps.hasMergedBeenNoted = async () => true;
+  await runReconcileOnce({ deps: state.deps });
+  expect(reopened).toEqual([]);
+  expect(state.labels).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// Test 14: a LIVE-PROOF close re-checks open-PR holders (amendment A2.2)
+// ---------------------------------------------------------------------------
+
+function holderProofState(lookup: ReconcileDeps['listOpenPullRequestsReferencingTracker']) {
+  const state = proofState([
+    comment('thinman-overseer[bot]', MERGED_NOTE, 1),
+    comment('bluedevilcollectibles', 'LIVE-PROOF https://example.test/run/1', 2),
+  ]);
+  state.deps.listOpenPullRequestsReferencingTracker = lookup;
+  return state;
+}
+
+test('Test 14: LIVE-PROOF does not close while an open PR still holds the WO', async () => {
+  const state = holderProofState(async () => [openPr('shopops', 990, `Closes ${ORG}/bdc-xo#4130`)]);
+  expect((await runReconcileOnce({ deps: state.deps })).closed).toBe(0);
+  expect(state.closes).toEqual([]);
+  expect(state.warnings).toContain('overseer.reconcile.live_proof_open_prs_hold_tracker_open');
+});
+
+test('Test 14 (lookup fails): LIVE-PROOF leaves the tracker open', async () => {
+  const state = holderProofState(async () => {
+    throw new Error('search 502');
+  });
+  expect((await runReconcileOnce({ deps: state.deps })).closed).toBe(0);
+  expect(state.closes).toEqual([]);
+  expect(state.warnings).toContain('overseer.reconcile.live_proof_holder_lookup_failed_left_open');
+});
+
+test('Test 14 (no holder): LIVE-PROOF closes once', async () => {
+  const state = holderProofState(async () => [openPr('shopops', 991, 'unrelated work')]);
+  expect((await runReconcileOnce({ deps: state.deps })).closed).toBe(1);
+  expect(state.closes).toEqual([4130]);
+});

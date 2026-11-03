@@ -106,6 +106,15 @@ tracker (and passes every guard), reconcile:
 The issue stays OPEN. A rescan finds the row and does nothing. A PR merged before
 the tracker issue was created never marks it (pre-tracker guard).
 
+Default-branch merges (amendment A2): GitHub itself closes an issue when a PR with
+a closing keyword merges into the repo's DEFAULT branch (for example a bdc-xo PR
+into main). When the issue's latest `closed` event carries that PR's merge sha,
+reconcile REOPENS it and marks it as above; the comment adds "reopened: DONE =
+tested live (John 2026-10-15); close with LIVE-PROOF". A close by anyone else is
+respected. Guidance for WO PR authors: write `Refs thinmansoftware/bdc-xo#N`, not
+`Closes`, so GitHub never closes the issue in the first place. Reconcile does not
+rely on this.
+
 ## LIVE-PROOF: how a tracker actually closes
 
 After deploy, the XO or the builder posts a comment on the WO issue with a line:
@@ -121,7 +130,9 @@ one evidence comment, row `class = live_proof`, `action = reconcile_close`,
 
 - comes AFTER the Overseer merged comment (the marker above),
 - has non-empty evidence after `LIVE-PROOF `,
-- is written by an allowed GitHub login.
+- is written by an allowed GitHub login,
+- and no open PR still holds the WO (amendment A2: the open-PR holder check runs
+  again before the close; a failed holder lookup also leaves the issue open).
 
 Allowed logins: env `OVERSEER_LIVE_PROOF_AUTHORS` (comma list, case-insensitive)
 on archon-app-1; default `bluedevilcollectibles` (the account the XO posts as).

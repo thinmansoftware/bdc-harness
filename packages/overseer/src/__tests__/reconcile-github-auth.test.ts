@@ -317,6 +317,8 @@ function trackerRunDeps(
     removeTrackerLabel: async () => undefined,
     // The LIVE-PROOF pass has its own tests; these cases exercise the merge path.
     listMergedAwaitingProof: async () => [],
+    // A2 native-close reopen has its own tests; here a closed tracker was closed by someone else.
+    wasClosedByPullRequestMerge: async () => false,
     addTrackerEvidenceComment: async () => {
       effects.push('comment');
     },

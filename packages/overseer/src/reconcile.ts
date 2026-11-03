@@ -208,6 +208,17 @@ export interface ReconcileDeps {
   listTrackerComments?: (input: {
     issue: ReconcileTrackerIssue;
   }) => Promise<ReconcileTrackerComment[]>;
+  /**
+   * Amendment A2.1: true when the tracker's most recent `closed` event carries
+   * this PR's merge commit sha (GitHub closed it natively on the keyword merge).
+   * Optional: when absent, a closed tracker is left closed.
+   */
+  wasClosedByPullRequestMerge?: (input: {
+    issue: ReconcileTrackerIssue;
+    pr: ReconcileMergedPullRequest;
+  }) => Promise<boolean>;
+  /** Reopen a tracker issue (amendment A2.1). */
+  reopenTrackerIssue?: (input: { issue: ReconcileTrackerIssue }) => Promise<void>;
   now?: () => Date;
   log?: ReconcileLogger;
 }
@@ -253,6 +264,7 @@ export interface OctokitLike {
     addLabels(input: Record<string, unknown>): Promise<unknown>;
     removeLabel?(input: Record<string, unknown>): Promise<unknown>;
     listComments?(input: Record<string, unknown>): Promise<{ data: unknown }>;
+    listEvents?(input: Record<string, unknown>): Promise<{ data: unknown }>;
     update(input: Record<string, unknown>): Promise<unknown>;
   };
 }
@@ -381,8 +393,26 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
           );
           continue;
         }
-        // GitHub may have closed the tracker natively; never double-close.
-        if (tracker.state !== 'open') continue;
+        // GitHub may have closed the tracker natively on a default-branch keyword
+        // merge. Amendment A2.1: if THIS PR's merge closed it, reopen it below
+        // (after every guard) and mark it merged; any other closer is respected.
+        let reopenNeeded = false;
+        if (tracker.state !== 'open') {
+          if (!deps.wasClosedByPullRequestMerge || !deps.reopenTrackerIssue) continue;
+          if (!pr.mergeCommitSha) continue;
+          let closedByThisPr: boolean;
+          try {
+            closedByThisPr = await deps.wasClosedByPullRequestMerge({ issue: tracker, pr });
+          } catch (error) {
+            logger.warn(
+              { err: error as Error, prRef, tracker: tracker.number },
+              'overseer.reconcile.close_event_lookup_failed_left_closed'
+            );
+            continue;
+          }
+          if (!closedByThisPr) continue;
+          reopenNeeded = true;
+        }
         // PRE-TRACKER GUARD. A PR that merged before the tracker issue existed
         // cannot be the work that tracker asks for (bdc-xo #4344 anchor).
         if (mergedBeforeTrackerCreated(pr.mergedAt, tracker.createdAt)) {
@@ -511,13 +541,20 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
 
         // MERGED IS NOT DONE (amendment A1). Mark the tracker and leave it open;
         // only a LIVE-PROOF comment closes it (see the pass after this loop).
+        if (reopenNeeded) {
+          await deps.reopenTrackerIssue?.({ issue: tracker });
+          logger.info?.(
+            { prRef, woId, tracker: tracker.number },
+            'overseer.reconcile.native_close_reopened'
+          );
+        }
         await deps.addTrackerLabel({ issue: tracker, label: MERGED_LABEL });
         for (const stale of STALE_STATUS_LABELS) {
           await deps.removeTrackerLabel?.({ issue: tracker, label: stale });
         }
         await deps.addTrackerEvidenceComment({
           issue: tracker,
-          body: buildMergedComment({ pr, stem: holderStem }),
+          body: buildMergedComment({ pr, stem: holderStem, reopened: reopenNeeded }),
         });
         successfullyClosedTrackers.add(trackerIdentity);
         await (deps.insertAction ?? insertDefaultOverseerAction)({
@@ -618,6 +655,34 @@ async function runLiveProofPass(deps: ReconcileDeps, logger: ReconcileLogger): P
     }
     const proof = findLiveProof(comments, allowed);
     if (!proof) continue;
+    // Amendment A2.2: an open PR that still holds this WO keeps it open, and a
+    // failed holder lookup keeps it open too (a false close is invisible).
+    if (deps.listOpenPullRequestsReferencingTracker) {
+      const stem = isWoStem(issue.title) ? issue.title : woId;
+      let holders: ReconcileOpenPullRequest[];
+      try {
+        const open = await deps.listOpenPullRequestsReferencingTracker({ issue, stem });
+        holders = openPullRequestsHoldingTracker({
+          stem,
+          mergedPr: { owner: '', repo: '', number: 0 },
+          tracker: issue,
+          openPullRequests: open,
+        });
+      } catch (error) {
+        logger.warn(
+          { err: error as Error, prRef },
+          'overseer.reconcile.live_proof_holder_lookup_failed_left_open'
+        );
+        continue;
+      }
+      if (holders.length > 0) {
+        logger.warn(
+          { prRef, holders: holders.map(h => `${h.owner}/${h.repo}#${h.number}`) },
+          'overseer.reconcile.live_proof_open_prs_hold_tracker_open'
+        );
+        continue;
+      }
+    }
     await deps.addTrackerEvidenceComment({ issue, body: buildLiveProofComment(proof) });
     await deps.addTrackerLabel({ issue, label: DONE_LABEL });
     await deps.closeTrackerIssue({ issue });
@@ -671,10 +736,17 @@ export function findLiveProof(
 export function buildMergedComment(input: {
   pr: ReconcileMergedPullRequest;
   stem: string;
+  reopened?: boolean;
 }): string {
   return [
     MERGED_MARKER,
     `Overseer reconcile: ${input.stem} merged, not done. Label ${MERGED_LABEL}; this issue stays open.`,
+    ...(input.reopened
+      ? [
+          '',
+          'reopened: DONE = tested live (John 2026-10-15); close with LIVE-PROOF. GitHub closed this issue on the merge; the Overseer reopened it.',
+        ]
+      : []),
     '',
     `Merged PR: ${input.pr.htmlUrl}`,
     `Merge SHA: ${input.pr.mergeCommitSha ?? 'unknown'}`,
@@ -1196,6 +1268,19 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       listOpenMergedTrackers(await getOctokit()),
     listTrackerComments: async (input): Promise<ReconcileTrackerComment[]> =>
       listIssueComments(await getOctokit(), input.issue),
+    wasClosedByPullRequestMerge: async (input): Promise<boolean> =>
+      latestCloseCommitSha(await getOctokit(), input.issue).then(
+        sha => sha !== null && sha === input.pr.mergeCommitSha
+      ),
+    reopenTrackerIssue: async (input): Promise<void> => {
+      const client = await getOctokit();
+      await client.issues.update({
+        owner: input.issue.owner,
+        repo: input.issue.repo,
+        issue_number: input.issue.number,
+        state: 'open',
+      });
+    },
     insertAction: insertDefaultOverseerAction,
     log,
   };
@@ -1231,6 +1316,33 @@ async function listOpenMergedTrackers(octokit: OctokitLike): Promise<ReconcileTr
     if (rows.length < 100) break;
   }
   return out;
+}
+
+/** commit_id of the most recent `closed` event on an issue, or null. */
+async function latestCloseCommitSha(
+  octokit: OctokitLike,
+  issue: ReconcileTrackerIssue
+): Promise<string | null> {
+  if (!octokit.issues.listEvents) return null;
+  let latest: string | null = null;
+  let seenClose = false;
+  for (let page = 1; page <= MERGED_LIST_MAX_PAGES; page++) {
+    const res = await octokit.issues.listEvents({
+      owner: issue.owner,
+      repo: issue.repo,
+      issue_number: issue.number,
+      per_page: 100,
+      page,
+    });
+    const rows = Array.isArray(res.data) ? (res.data as Record<string, unknown>[]) : [];
+    for (const row of rows) {
+      if (row.event !== 'closed') continue;
+      seenClose = true;
+      latest = typeof row.commit_id === 'string' ? row.commit_id : null;
+    }
+    if (rows.length < 100) break;
+  }
+  return seenClose ? latest : null;
 }
 
 async function listIssueComments(
