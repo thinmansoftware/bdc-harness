@@ -20,10 +20,10 @@ log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a "$LOG"; }
 log "=== cauldron-disk-cleanup start ==="
 df -h / | tail -1 | tee -a "$LOG"
 
-# --- 1. Orphaned build worktrees (age-gated: only dirs untouched > 24h) ---
+# --- 1. Orphaned build worktrees (age-gated: only dirs untouched > 3 days; was 24h until 2026-11-03 -- repair-in-place and long arcs idle > 24h) ---
 for repo_worktrees in "$WORKSPACES_ROOT"/*/*/worktrees/*; do
   [ -d "$repo_worktrees" ] || continue
-  find "$repo_worktrees" -maxdepth 1 -mindepth 1 -type d -mmin +1440 -print 2>/dev/null | while read -r wt; do
+  find "$repo_worktrees" -maxdepth 1 -mindepth 1 -type d -mmin +4320 -print 2>/dev/null | while read -r wt; do
     if [ "$DRY_RUN" = "1" ]; then du -sh "$wt" 2>/dev/null; continue; fi
     log "removing stale worktree: $wt"
     sudo rm -rf "$wt"
