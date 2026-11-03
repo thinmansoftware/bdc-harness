@@ -80,6 +80,13 @@ export interface ReconcileTrackerIssue {
   number: number;
   title: string;
   state: 'open' | 'closed';
+  /**
+   * ISO creation time of the tracker issue. Optional for backward
+   * compatibility; when present, a PR merged before the tracker existed is
+   * never completion evidence for it (anchor: bdc-xo #4344, created
+   * 2026-11-03T01:51Z, closed two minutes later on PR 4326 merged 11/02 20:15Z).
+   */
+  createdAt?: string | null;
 }
 
 export interface ReconcileActionRecord {
@@ -332,6 +339,21 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
         }
         // GitHub may have closed the tracker natively; never double-close.
         if (tracker.state !== 'open') continue;
+        // PRE-TRACKER GUARD. A PR that merged before the tracker issue existed
+        // cannot be the work that tracker asks for (bdc-xo #4344 anchor).
+        if (mergedBeforeTrackerCreated(pr.mergedAt, tracker.createdAt)) {
+          logger.warn(
+            {
+              prRef,
+              woId,
+              tracker: tracker.number,
+              mergedAt: pr.mergedAt,
+              trackerCreatedAt: tracker.createdAt,
+            },
+            'overseer.reconcile.pr_merged_before_tracker_created_left_open'
+          );
+          continue;
+        }
         const trackerIdentity = `${tracker.owner}/${tracker.repo}#${tracker.number}`.toLowerCase();
         if (successfullyClosedTrackers.has(trackerIdentity)) continue;
 
@@ -1186,6 +1208,7 @@ interface TrackerSnapshotRow {
   readonly state: 'open' | 'closed';
   readonly htmlUrl: string;
   readonly pullRequest: boolean;
+  readonly createdAt: string | null;
 }
 type TrackerIssueSnapshot = ReadonlyMap<number, TrackerSnapshotRow>;
 
@@ -1272,6 +1295,7 @@ function validatedTrackerSnapshotRow(value: unknown): TrackerSnapshotRow {
     state: row.state,
     htmlUrl: row.html_url,
     pullRequest,
+    createdAt: typeof row.created_at === 'string' ? row.created_at : null,
   };
 }
 
@@ -1289,6 +1313,7 @@ function findTrackerIssueByStem(
     number: exact.number,
     title: exact.title,
     state: exact.state,
+    createdAt: exact.createdAt,
   };
 }
 
@@ -1306,6 +1331,7 @@ function findTrackerIssueByNumber(
     number: row.number,
     title: row.title,
     state: row.state,
+    createdAt: row.createdAt,
   };
 }
 
@@ -1336,4 +1362,20 @@ function isAuthError(error: unknown): boolean {
   if (candidate.status === 401) return true;
   if (candidate.status === 403 && !isRateLimitError(error)) return true;
   return false;
+}
+
+/**
+ * True only when both times parse and the merge happened strictly before the
+ * tracker issue was created. Missing or unparseable times return false so the
+ * other guards decide (backward compatible with callers that omit them).
+ */
+export function mergedBeforeTrackerCreated(
+  mergedAt: string | null | undefined,
+  trackerCreatedAt: string | null | undefined
+): boolean {
+  if (!mergedAt || !trackerCreatedAt) return false;
+  const merged = Date.parse(mergedAt);
+  const created = Date.parse(trackerCreatedAt);
+  if (Number.isNaN(merged) || Number.isNaN(created)) return false;
+  return merged < created;
 }

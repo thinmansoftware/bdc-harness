@@ -31,7 +31,10 @@ feature-to-feature merge) also closes nothing.
 The close is still subject to the existing guards: `Reconcile-Skip:` markers,
 the re-close guard (a human reopen is not undone), the spec-only guard (the spec
 PR that created a WO cannot close it), and the open-PR holder guard (a later open
-stage keeps the tracker open). A close records an action row with
+stage keeps the tracker open), plus the pre-tracker guard: a PR that merged
+before the tracker issue was created never closes it, even with a keyword edited
+in later (log line `overseer.reconcile.pr_merged_before_tracker_created_left_open`;
+anchor bdc-xo #4344). A close records an action row with
 `class = closes_keyword`, `action = reconcile_close`.
 
 ## Project base map

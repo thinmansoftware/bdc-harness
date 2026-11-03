@@ -517,3 +517,69 @@ test('Test 9: a cursor newer than the 7-day floor still rescans back to the floo
   // newer cursor date (2026-11-01) and the pre-cursor merge window would be missed.
   expect(observedSince).toBe('2026-10-26');
 });
+
+// ---------------------------------------------------------------------------
+// Test 10: pre_tracker_merge_never_closes (bdc-xo #4344 shape)
+// PR 4326 merged 2026-11-02T20:15:40Z naming WO-XO-T3-CONTROL-HOST-SKELETON-01;
+// tracker 4344 was created 2026-11-03T01:51:06Z and closed two minutes later.
+// ---------------------------------------------------------------------------
+
+const WO_4344 = 'WO-XO-T3-CONTROL-HOST-SKELETON-01';
+
+function tracker4344(): ReconcileTrackerIssue {
+  return { ...tracker(4344, WO_4344), createdAt: '2026-11-03T01:51:06Z' };
+}
+
+function pr4326(body: string): ReconcileMergedPullRequest {
+  return mergedPr({
+    owner: ORG,
+    repo: 'bdc-xo',
+    number: 4326,
+    htmlUrl: `https://github.com/${ORG}/bdc-xo/pull/4326`,
+    baseRef: 'main',
+    mergedAt: '2026-11-02T20:15:40Z',
+    body,
+  });
+}
+
+test('Test 10: a PR merged before the tracker existed never closes it, even by name', async () => {
+  const state = harness({
+    prs: [pr4326(`T3 control host scripts for ${WO_4344}.\n\nWO: ${WO_4344}`)],
+    trackersByNumber: { 4344: tracker4344() },
+    trackersByStem: { [WO_4344]: tracker4344() },
+  });
+
+  const result = await runReconcileOnce({ deps: state.deps });
+
+  expect(result.closed).toBe(0);
+  expect(state.closes).toEqual([]);
+  expect(state.actions.filter(a => a.action === RECONCILE_ACTION)).toHaveLength(0);
+});
+
+test('Test 10 (keyword edited in after merge): a pre-tracker merge with `Closes #4344` still closes nothing', async () => {
+  const state = harness({
+    prs: [pr4326(`Closes #4344\n\nWO: ${WO_4344}`)],
+    trackersByNumber: { 4344: tracker4344() },
+    trackersByStem: { [WO_4344]: tracker4344() },
+  });
+
+  const result = await runReconcileOnce({ deps: state.deps });
+
+  expect(result.closed).toBe(0);
+  expect(state.closes).toEqual([]);
+  expect(state.warnings).toContain('overseer.reconcile.pr_merged_before_tracker_created_left_open');
+});
+
+test('Test 10 (control): the same keyword merged AFTER the tracker existed closes it once', async () => {
+  const pr = { ...pr4326(`Closes #4344\n\nWO: ${WO_4344}`), mergedAt: '2026-11-03T02:30:00Z' };
+  const state = harness({
+    prs: [pr],
+    trackersByNumber: { 4344: tracker4344() },
+    trackersByStem: { [WO_4344]: tracker4344() },
+  });
+
+  const result = await runReconcileOnce({ deps: state.deps });
+
+  expect(result.closed).toBe(1);
+  expect(state.closes).toEqual([4344]);
+});
