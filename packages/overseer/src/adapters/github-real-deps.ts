@@ -1084,7 +1084,18 @@ export function createRealFindPullRequest(
         ref: pr.data.head.sha,
         per_page: 100,
       });
-      const checks = summarizeChecks(checkRunsResp.data.check_runs);
+      // Same single page the aggregate summary already uses. No extra pagination.
+      const rawCheckRuns = checkRunsResp.data.check_runs ?? [];
+      const checks = summarizeChecks(rawCheckRuns);
+      const checkRuns = rawCheckRuns.map(run => ({
+        id: run.id,
+        name: run.name,
+        status: run.status,
+        conclusion: run.conclusion,
+        started_at: run.started_at,
+        completed_at: run.completed_at,
+        app: run.app,
+      }));
       let changedFilePaths: string[] | undefined;
       if (input.includeChangedFiles) {
         if (!octokit.pulls.listFiles) throw new Error('overseer_real_adapter_missing_list_files');
@@ -1115,6 +1126,7 @@ export function createRealFindPullRequest(
         exists: true,
         state,
         checks,
+        checkRuns,
         mergeable: pr.data.mergeable ?? null,
         pr: {
           owner: input.owner,
@@ -2050,7 +2062,17 @@ export function createRealGitHubClientDeps(
   octokit: RealGitHubOctokitLike = createRealOctokitClient()
 ): GitHubClientDeps {
   const commentAuthorLogin = resolveReviewGateLogin();
+  // Call-time PAT client, copied from createRealFetchExactHeadPullRequestEvidence.
+  // Used only as the second identity for the required-contexts lookup.
+  const patOctokit = createRealReadOnlyPatOctokitClient() ?? undefined;
   return {
+    requiredContextsLookups: {
+      fetchWithAppClient: bindRepoMethod(octokit, 'getAllStatusCheckContexts'),
+      fetchWithPatClient: bindRepoMethod(patOctokit, 'getAllStatusCheckContexts'),
+      fetchBranchRules:
+        bindRepoMethod(octokit, 'getBranchRules') ?? bindRepoMethod(patOctokit, 'getBranchRules'),
+      fetchBranch: bindRepoMethod(octokit, 'getBranch') ?? bindRepoMethod(patOctokit, 'getBranch'),
+    },
     hasQualifiedReview: async (input): Promise<boolean> => {
       // Receipts go to PR_REVIEW_LOG_RECIPIENT since #1390 (dispatch routing
       // cut-off); pre-cut-off receipts stay at `operator`. Read both, log first,

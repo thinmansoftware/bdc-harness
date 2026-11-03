@@ -34,7 +34,13 @@ import {
 import { specDeclaresMergeHold } from './merge-hold';
 import { isSpecOnlyChangeSet } from './reconcile';
 import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
+import { resolveRequiredContexts } from './adapters/required-contexts';
 import { createRealOctokitClient } from './adapters/github-real-deps';
+import {
+  conclusionIsPassing,
+  latestAttemptPerCheck,
+  type RecheckCheckRun,
+} from './pr-review-check-ingest';
 import { classifyMergeSkip, isRateLimitSkip } from './merge-skip-classification';
 import {
   getScopeApprovalDecision,
@@ -579,6 +585,35 @@ async function postMergeReceiptComment(
 
 const CEILING_QUEUE_MARKER = '<!-- overseer:merge-ceiling-queued -->';
 
+function reportedChecksAreBlocking(checks: PullRequestEvidence['checks']): boolean {
+  return checks.total === 0 || checks.failed > 0 || checks.pending > 0;
+}
+
+/**
+ * Required contexts that are missing, still running, or completed without a
+ * passing conclusion. Names match after trim and case fold. Only the latest
+ * attempt per check name and app is considered. The returned strings are the
+ * required context names, not the check-run display names.
+ */
+function blockingRequiredContexts(
+  contexts: readonly string[],
+  runs: readonly RecheckCheckRun[]
+): string[] {
+  const latest = latestAttemptPerCheck([...runs]);
+  const blocking: string[] = [];
+  for (const context of contexts) {
+    const want = context.trim().toLowerCase();
+    const matches = latest.filter(run => (run.name ?? '').trim().toLowerCase() === want);
+    if (
+      matches.length === 0 ||
+      matches.some(run => run.status !== 'completed' || !conclusionIsPassing(run.conclusion))
+    ) {
+      blocking.push(context);
+    }
+  }
+  return blocking;
+}
+
 async function postCeilingQueueNotice(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
@@ -632,7 +667,12 @@ async function mergeClaimedVerdict(
   queuePosition: number
 ): Promise<'stop' | undefined> {
   let rateLimitDeferred = false;
-  const skip = async (reason: string, prUrl?: string, rateLimited = false): Promise<void> => {
+  const skip = async (
+    reason: string,
+    prUrl?: string,
+    rateLimited = false,
+    details?: Record<string, unknown>
+  ): Promise<void> => {
     if (classifyMergeSkip(reason) === 'transient' && options.store.deferVerdictClaim) {
       const retryMaxAttempts = configuredNonNegativeInteger(
         options.retryMaxAttempts,
@@ -662,6 +702,7 @@ async function mergeClaimedVerdict(
               verdictId: verdict.id,
               runId: verdict.run_id,
               woId: verdict.wo_id,
+              ...(details ?? {}),
               reason,
               prUrl,
               notBefore,
@@ -681,7 +722,14 @@ async function mergeClaimedVerdict(
       prUrl,
     });
     log.info(
-      { verdictId: verdict.id, runId: verdict.run_id, woId: verdict.wo_id, reason, prUrl },
+      {
+        verdictId: verdict.id,
+        runId: verdict.run_id,
+        woId: verdict.wo_id,
+        ...(details ?? {}),
+        reason,
+        prUrl,
+      },
       'merge-coordinator.merge_skipped'
     );
   };
@@ -731,9 +779,44 @@ async function mergeClaimedVerdict(
     await skip('pr_not_open', pr.htmlUrl);
     return undefined;
   }
-  if (pr.checks.total === 0 || pr.checks.failed > 0 || pr.checks.pending > 0) {
-    await skip('required_checks_not_success', pr.htmlUrl);
-    return undefined;
+  // Known required contexts are the only checks that can block. Unknown and
+  // exhausted lookups keep the aggregate summary, and an authoritative empty
+  // set does too, without the fallback log.
+  const lookups = options.github.requiredContextsLookups;
+  const resolution = await resolveRequiredContexts(
+    {
+      ...(lookups ?? {}),
+      owner: pr.pr.owner,
+      repo: pr.pr.repo,
+      baseRef: pr.baseBranch,
+      headSha: verdict.head_sha,
+    },
+    lookups ? process.env : {}
+  );
+  if (resolution.state === 'known' && resolution.contexts.length > 0) {
+    const blockingContexts = blockingRequiredContexts(resolution.contexts, pr.checkRuns ?? []);
+    if (blockingContexts.length > 0) {
+      await skip('required_checks_not_success', pr.htmlUrl, false, { blockingContexts });
+      return undefined;
+    }
+  } else {
+    if (resolution.state !== 'known') {
+      log.info(
+        {
+          verdictId: verdict.id,
+          runId: verdict.run_id,
+          woId: verdict.wo_id,
+          prUrl: pr.htmlUrl,
+          state: resolution.state,
+          reason: resolution.reason,
+        },
+        'merge-coordinator.required_contexts_fallback'
+      );
+    }
+    if (reportedChecksAreBlocking(pr.checks)) {
+      await skip('required_checks_not_success', pr.htmlUrl);
+      return undefined;
+    }
   }
   // Conflicts are a distinct operator-visible skip: a generic not-clean
   // reason hid DIRTY PRs inside the same bucket as blocked/unstable.

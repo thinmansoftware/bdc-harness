@@ -1,5 +1,7 @@
 import type { DecisionResult } from './decide.ts';
 import type { ErrorClass } from './classify.ts';
+import type { ResolveRequiredContextsInput } from './adapters/required-contexts.ts';
+import type { RecheckCheckRun } from './pr-review-check-ingest.ts';
 
 export type WatchedRunStatus = string;
 
@@ -89,6 +91,12 @@ export interface PullRequestEvidence {
    * fixtures. An exact, case-sensitive `merge-hold` name holds the merge.
    */
   labels?: readonly string[];
+  /**
+   * Check runs behind `checks`, when the evidence source loaded them.
+   * Absent on older fixtures. An empty array means the lookup returned no runs.
+   * The merge gate matches required contexts against these runs.
+   */
+  checkRuns?: readonly RecheckCheckRun[];
 }
 
 export interface GrokJudgeEvidence {
@@ -272,6 +280,15 @@ export interface MergeCandidateDiscoveryDeps {
 
 export interface GitHubClientDeps {
   findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
+  /**
+   * Branch-protection lookups for the merge check gate. Optional so existing
+   * fakes keep compiling. When absent, the bridge resolves required contexts
+   * with an empty env and falls back to the aggregate check summary.
+   */
+  requiredContextsLookups?: Pick<
+    ResolveRequiredContextsInput,
+    'fetchWithAppClient' | 'fetchWithPatClient' | 'fetchBranchRules' | 'fetchBranch'
+  >;
   /** Receipt-backed exact-head sandbox-review qualification. */
   hasQualifiedReview?(input: PullRequestRef & { headSha: string }): Promise<boolean>;
   mergePullRequest(
