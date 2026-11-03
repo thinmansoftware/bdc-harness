@@ -11,6 +11,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import { judgeGate, classifyAttemptOutcome } from '../judge.js';
+import { pollForTerminal } from '../poll.js';
 import type { PollResult, FireResult } from '../types.js';
 
 function makePoll(overrides?: Partial<PollResult>): PollResult {
@@ -162,5 +163,62 @@ describe('judgeGate: existing WO PR head', () => {
     expect(unmergeable.pass).toBe(false);
     expect(unmergeable.reason).toContain('not mergeable');
     expect(unmergeable.reason).not.toContain('no PR opened after completed run');
+  });
+});
+
+describe('poll credit mergeability', () => {
+  test('credited_pr_mergeability_checked', async () => {
+    const headSha = 'a'.repeat(40);
+    const creditedUrl = 'https://github.com/thinmansoftware/bdc-harness/pull/4422';
+    const checked: string[] = [];
+    const fetchImpl: typeof fetch = async () =>
+      new Response(
+        JSON.stringify({
+          run: {
+            id: 'run-credit',
+            status: 'completed',
+            metadata: { head_sha: headSha },
+          },
+          events: [],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+
+    const poll = await pollForTerminal({
+      runId: 'run-credit',
+      apiBaseUrl: 'http://archon.test',
+      fetchImpl,
+      timeoutMs: 30_000,
+      intervalMs: 1,
+      prRetryAttempts: 0,
+      prBranchLookupAttempts: 1,
+      prBranchLookupDelayMs: 0,
+      repo: 'thinmansoftware/bdc-harness',
+      woId: 'WO-XO-BDC-BROWSER-KEEPER-04',
+      ghPrListForBranch: async () => null,
+      listOpenWoPullRequests: async () => [
+        {
+          number: 4422,
+          headRefName: 'archon/task-web-worker-1-abc',
+          headSha,
+          url: creditedUrl,
+          createdAt: '2026-11-03T10:47:06Z',
+          isDraft: false,
+          isFork: false,
+          body: 'WO: WO-XO-BDC-BROWSER-KEEPER-04\n',
+        },
+      ],
+      checkPrMergeable: async (url: string) => {
+        checked.push(url);
+        return false;
+      },
+    });
+
+    expect(poll.prUrl).toBe(creditedUrl);
+    expect(checked).toEqual([creditedUrl]);
+    expect(poll.prMergeable).toBe(false);
+    const verdict = judgeGate(poll);
+    expect(verdict.pass).toBe(false);
+    expect(verdict.reason).not.toContain('no PR opened after completed run');
   });
 });

@@ -10,7 +10,10 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { serviceGitHubCommandEnvironment } from '@archon/core/github/service-identity';
 import { assertGitHubPoolAvailable, recordGitHubApiCall } from '@archon/core/github/metering';
-import { listOpenWoPullRequests } from './already-satisfied.js';
+import {
+  listOpenWoPullRequests as defaultListOpenWoPullRequests,
+  type OpenWoPullRequest,
+} from './already-satisfied.js';
 import type { PollResult } from './types.js';
 
 const execFileAsync = promisify(execFile);
@@ -209,6 +212,14 @@ interface PollOptions {
    * Absent: the URL-based PR check is unchanged. Hermetic mode does not call GitHub.
    */
   woId?: string;
+  /**
+   * OPEN WO PR listing used to credit a run that pushed an existing PR head.
+   * Same call shape as the production lister. Defaults to that lister.
+   */
+  listOpenWoPullRequests?: (input: {
+    woId: string;
+    project: string;
+  }) => Promise<OpenWoPullRequest[]>;
 }
 
 /**
@@ -234,6 +245,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     repo = null,
     ghPrListForBranch = ghPrListForBranchDefault,
     checkPrMergeable: checkPrMergeableFn = checkPrMergeableDefault,
+    listOpenWoPullRequests: listOpenWoPullRequestsFn = defaultListOpenWoPullRequests,
   } = opts;
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
   const doFetch = opts.fetchImpl ?? fetch;
@@ -311,9 +323,17 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
           }
         }
         if (prUrl === null && opts.woId && repo) {
-          const credited = await creditRunPushedOpenPr(runId, opts.woId, repo, runMetadata, events);
+          const credited = await creditRunPushedOpenPr(
+            runId,
+            opts.woId,
+            repo,
+            runMetadata,
+            events,
+            listOpenWoPullRequestsFn
+          );
           runPushedHeadSha = credited.runPushedHeadSha;
           openWoPrHeadSha = credited.openWoPrHeadSha;
+          if (credited.prUrl !== null) prUrl = credited.prUrl;
         }
       }
 
@@ -659,26 +679,37 @@ function extractRunPushedHeadSha(
 
 /**
  * Credit an open WO PR only when exactly one candidate's head SHA equals the
- * run's pushed SHA. Lookup failure leaves both fields null. Hermetic mode
- * makes no GitHub call (listOpenWoPullRequests returns []).
+ * run's pushed SHA. That match also returns the PR URL when it is a non-empty
+ * string, so mergeability is checked on it. Zero matches, multiple matches, an
+ * empty URL, or a lookup failure leave prUrl null (and a lookup failure leaves
+ * both SHAs null). Hermetic mode makes no GitHub call when the default lister
+ * is used (it returns []).
  */
 async function creditRunPushedOpenPr(
   runId: string,
   woId: string,
   repo: string,
   metadata: Record<string, unknown>,
-  events: { data: Record<string, unknown> }[]
-): Promise<{ runPushedHeadSha: string | null; openWoPrHeadSha: string | null }> {
-  const empty = { runPushedHeadSha: null, openWoPrHeadSha: null };
+  events: { data: Record<string, unknown> }[],
+  listOpen: (input: { woId: string; project: string }) => Promise<OpenWoPullRequest[]>
+): Promise<{
+  runPushedHeadSha: string | null;
+  openWoPrHeadSha: string | null;
+  prUrl: string | null;
+}> {
+  const empty = { runPushedHeadSha: null, openWoPrHeadSha: null, prUrl: null };
   const pushed = extractRunPushedHeadSha(metadata, events);
   if (!pushed) return empty;
   try {
-    const opens = await listOpenWoPullRequests({ woId, project: repo });
+    const opens = await listOpen({ woId, project: repo });
     const matches = opens.filter(pr => validHeadSha(pr.headSha) === pushed);
     if (matches.length !== 1) return empty;
-    const openSha = validHeadSha(matches[0]?.headSha);
+    const match = matches[0];
+    const openSha = validHeadSha(match?.headSha);
     if (!openSha) return empty;
-    return { runPushedHeadSha: pushed, openWoPrHeadSha: openSha };
+    const url = match?.url;
+    const prUrl = typeof url === 'string' && url.length > 0 ? url : null;
+    return { runPushedHeadSha: pushed, openWoPrHeadSha: openSha, prUrl };
   } catch (err) {
     console.log(`[poll] run ${runId} open WO PR lookup failed: ${(err as Error).message}`);
     return empty;

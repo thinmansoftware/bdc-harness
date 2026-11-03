@@ -106,6 +106,11 @@ export interface ReconcileRepoOpenPullRequest {
   headRefName: string;
   isDraft: boolean;
   headRepository: { owner: string; repo: string } | null;
+  /**
+   * ISO creation time of the open PR. Optional for readers that predate the
+   * field; a missing or unparseable time is not created-before-merge.
+   */
+  createdAt?: string | null;
 }
 
 export interface ReconcileTrackerIssue {
@@ -405,23 +410,25 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
       logger.info?.({ prRef, stem }, 'overseer.reconcile.incidental_mention_not_evidence');
     }
 
-    // Supersede sibling OPEN PRs for the same declared WO before the project-base
-    // gate. Tracker close decisions below are unchanged. A rate-limit or auth
-    // error aborts the pass the same way other GitHub reads do.
-    const supersede = await closeSupersededSiblingPullRequests(pr, deps, logger);
-    if (supersede === 'rate_limit' || supersede === 'auth') {
-      return { scanned: seen.size, closed, skipped: true };
-    }
-
     // PROJECT-BASE GATE. GitHub only honours closing keywords on a merge into the
     // repository default branch, so a project whose Cauldron base is staging/dev/
     // bdc-main never gets its tracker closed by GitHub. Reconcile closes a tracker
     // ONLY when the merged PR's base ref equals that project's base AND the PR
     // carries a closing keyword naming the tracker issue. A merge into any other
     // branch (feature-to-feature) closes nothing. A merged PR that merely NAMES a
-    // WO (prose, or a bare `WO:` line with no keyword) is never completion evidence.
+    // WO (prose, or a bare `WO:` line with no keyword) is never completion evidence
+    // for its tracker.
     const projectBase = resolveProjectBase(pr.owner, pr.repo);
     if (projectBase === null || projectBase !== (pr.baseRef ?? null)) continue;
+
+    // Supersede sibling OPEN PRs only after the project-base gate. A merged PR
+    // that is not completion evidence must not close siblings. Reconcile-Skip
+    // stems are removed inside the call. A rate-limit or auth error aborts the
+    // pass the same way other GitHub reads do.
+    const supersede = await closeSupersededSiblingPullRequests(pr, deps, logger);
+    if (supersede === 'rate_limit' || supersede === 'auth') {
+      return { scanned: seen.size, closed, skipped: true };
+    }
 
     const refNumbers = extractClosingKeywordTrackerRefs(body, pr.owner, pr.repo);
     const declaredStems = extractDeclaredWoStems(body);
@@ -1011,9 +1018,29 @@ function firstMatchedSupersedeStem(
 }
 
 /**
+ * True only when both times parse and the sibling was created strictly before
+ * mergedAt. Missing, empty, invalid, or equal times return false (fail closed:
+ * the sibling is not superseded). Same parse and Number.isNaN checks as
+ * mergedBeforeTrackerCreated.
+ */
+function siblingCreatedBeforeMerge(
+  createdAt: string | null | undefined,
+  mergedAt: string | null | undefined
+): boolean {
+  if (!createdAt || !mergedAt) return false;
+  const created = Date.parse(createdAt);
+  const merged = Date.parse(mergedAt);
+  if (Number.isNaN(created) || Number.isNaN(merged)) return false;
+  return created < merged;
+}
+
+/**
  * Close OPEN non-draft, non-fork PRs in the merged PR's repo that declare one
- * of its WO stems. Does not call closeTrackerIssue. A failed list closes nothing.
- * A truncated list still processes the candidates it returned.
+ * of its eligible WO stems and were created strictly before mergedAt.
+ * Eligible stems are manifest `WO:` lines minus `Reconcile-Skip:` stems.
+ * A merged PR whose base is not the project base, or that has no eligible
+ * stems, returns without listing siblings. Does not call closeTrackerIssue.
+ * A failed list closes nothing. A truncated list still processes what it returned.
  */
 async function closeSupersededSiblingPullRequests(
   pr: ReconcileMergedPullRequest,
@@ -1021,8 +1048,11 @@ async function closeSupersededSiblingPullRequests(
   logger: ReconcileLogger
 ): Promise<SupersedeOutcome> {
   if (!deps.listOpenPullRequestsInRepo || !deps.closePullRequest) return 'continue';
+  const projectBase = resolveProjectBase(pr.owner, pr.repo);
+  if (projectBase === null || projectBase !== (pr.baseRef ?? null)) return 'continue';
   const prRef = `${pr.owner}/${pr.repo}#${pr.number}`;
-  const stems = extractDeclaredWoStems(pr.body ?? '');
+  const skipped = extractReconcileSkipStems(pr.body ?? '');
+  const stems = extractDeclaredWoStems(pr.body ?? '').filter(stem => !skipped.has(stem));
   if (stems.length === 0) return 'continue';
 
   let listed: PagedRead<ReconcileRepoOpenPullRequest>;
@@ -1053,6 +1083,7 @@ async function closeSupersededSiblingPullRequests(
     if (!headIsTargetRepo(candidate, pr.owner, pr.repo)) continue;
     const woId = firstMatchedSupersedeStem(candidate, stems);
     if (!woId) continue;
+    if (!siblingCreatedBeforeMerge(candidate.createdAt, pr.mergedAt)) continue;
     const siblingRef = `${pr.owner}/${pr.repo}#${candidate.number}`;
     const already = await (deps.hasSupersedeBeenRecorded ?? hasDefaultSupersedeBeenRecorded)({
       prRef: siblingRef,
@@ -1586,6 +1617,7 @@ function mapRepoOpenPullRequest(row: Record<string, unknown>): ReconcileRepoOpen
     headRefName,
     isDraft: row.draft === true,
     headRepository: owner.length > 0 && repo.length > 0 ? { owner, repo } : null,
+    createdAt: typeof row.created_at === 'string' ? row.created_at : null,
   };
 }
 
