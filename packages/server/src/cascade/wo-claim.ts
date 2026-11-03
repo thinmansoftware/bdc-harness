@@ -28,6 +28,8 @@ import {
   transferWoClaim,
 } from '@archon/core/db/cascade-wo-claims';
 import * as workflowsDb from '@archon/core/db/workflows';
+import * as workflowEventsDb from '@archon/core/db/workflow-events';
+import { approvalHandOffBoundS, isApprovalHandOff } from './approval-handoff';
 import { readCascadeRecord } from '@archon/smart-cauldron/cascade';
 import type { CascadeDeps } from '@archon/smart-cauldron/cascade';
 import type { AcquireWoLockResult } from '@archon/smart-cauldron/wo-lock';
@@ -46,14 +48,35 @@ export type ClaimRunReader = (
   runId: string
 ) => Promise<{ status: string; approvalHandOff: boolean } | null>;
 
+/**
+ * Hand-off status comes from the run's latest decisive events inside the
+ * bounded window (isApprovalHandOff + T3_APPROVAL_HANDOFF_S) -- never from the
+ * approval_response metadata, which resumeWorkflowRun preserves, so a run that
+ * resumed after approval and then failed is terminal, not a hand-off forever.
+ * Release and reconcile both use this reader.
+ */
 const defaultRunReader: ClaimRunReader = async runId => {
   const run = await workflowsDb.getWorkflowRun(runId);
   if (!run) return null;
+  if (run.status !== 'failed') return { status: run.status, approvalHandOff: false };
+  const events = await workflowEventsDb.listWorkflowEvents(runId);
   return {
     status: run.status,
-    approvalHandOff: run.status === 'failed' && run.metadata.approval_response === 'approved',
+    approvalHandOff: isApprovalHandOff(
+      {
+        run: { status: run.status },
+        events: events.map(event => ({
+          event_type: event.event_type,
+          created_at: event.created_at as unknown as string,
+        })),
+      },
+      { nowMs: Date.now(), maxAgeS: approvalHandOffBoundS(process.env) }
+    ),
   };
 };
+
+/** The production run reader (exported for the real-store tests). */
+export const claimRunReader: ClaimRunReader = defaultRunReader;
 
 async function everyRunTerminal(runIds: string[], readRun: ClaimRunReader): Promise<boolean> {
   for (const runId of runIds) {

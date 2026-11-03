@@ -46,7 +46,7 @@ import {
   NON_TERMINAL_RUN_STATUSES,
   type CauldronFireConsumerDeps,
 } from '../dispatch/cauldron-fire-consumer';
-import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
+import { cascadeWoClaimDeps, claimRunReader, reconcileRetainedWoClaims } from '../cascade/wo-claim';
 
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {
@@ -870,5 +870,115 @@ describe('final round, finding 1: frontier resume takes over the claim before di
     expect(fires).toHaveLength(0);
     expect((await claims.findActiveWoClaim('WO-FR-02', db))?.cascade_id).toBe('other-c');
     rmSync(outDir, { recursive: true, force: true });
+  });
+});
+
+describe('claim reader: hand-off from latest decisive events, not approval metadata', () => {
+  test('an approved run that resumed and then failed is terminal: reconcile releases, a later fire is admitted', async () => {
+    // approval_response stays 'approved' after resume (resumeWorkflowRun preserves it).
+    const resumedThenFailed = await makeRun('WO-RFAIL-01', 'failed', {
+      approval: { nodeId: 'gate', type: 'approval' },
+      approval_response: 'approved',
+    });
+    for (const [event_type, step_name] of [
+      ['approval_received', 'gate'],
+      ['node_started', 'after-gate'],
+      ['node_failed', 'after-gate'],
+    ]) {
+      await workflowEventsDb.createWorkflowEvent({
+        workflow_run_id: resumedThenFailed,
+        event_type,
+        step_name,
+        data: {},
+      });
+    }
+    // A fresh hand-off (approval only, inside the window) stays a hand-off.
+    const freshHandOff = await makeRun('WO-RFAIL-02', 'failed', {
+      approval: { nodeId: 'gate', type: 'approval' },
+      approval_response: 'approved',
+    });
+    await workflowEventsDb.createWorkflowEvent({
+      workflow_run_id: freshHandOff,
+      event_type: 'approval_received',
+      step_name: 'gate',
+      data: {},
+    });
+    expect((await claimRunReader(resumedThenFailed))?.approvalHandOff).toBe(false);
+    expect((await claimRunReader(freshHandOff))?.approvalHandOff).toBe(true);
+
+    const finished = (cascadeId: string, runId: string) =>
+      ({ cascadeId, status: 'won', attempts: [{ runId }] }) as unknown as Awaited<
+        ReturnType<typeof readCascadeRecord>
+      >;
+    const stillRunning = (cascadeId: string, runId: string) =>
+      ({ cascadeId, status: 'running', attempts: [{ runId }] }) as unknown as Awaited<
+        ReturnType<typeof readCascadeRecord>
+      >;
+    // Both claims were retained while their cascades were still running.
+    for (const [woId, cascadeId, runId] of [
+      ['WO-RFAIL-01', 'cas-rfail', resumedThenFailed],
+      ['WO-RFAIL-02', 'cas-fresh', freshHandOff],
+    ]) {
+      const pair = cascadeWoClaimDeps('t3:test', db, {
+        readRecord: async () => stillRunning(cascadeId, runId),
+      });
+      expect((await pair.acquireWoLock(woId, 'bdc-harness', cascadeId, '/x')).acquired).toBe(true);
+      await pair.releaseWoLock(woId, 'bdc-harness', cascadeId, '/x');
+      expect((await claims.findActiveWoClaim(woId, db))?.retained_reason).toBe('running');
+    }
+
+    // The cascades have finished; reconcile uses the SAME production reader.
+    const released = await reconcileRetainedWoClaims(db, {
+      readRecord: async cascadeId =>
+        cascadeId === 'cas-rfail'
+          ? finished('cas-rfail', resumedThenFailed)
+          : finished('cas-fresh', freshHandOff),
+    });
+    expect(released).toEqual(['WO-RFAIL-01']);
+    expect(await claims.findActiveWoClaim('WO-RFAIL-01', db)).toBeNull();
+    expect((await claims.findActiveWoClaim('WO-RFAIL-02', db))?.cascade_id).toBe('cas-fresh');
+
+    // A later fire for the released WO is admitted.
+    const replies: Record<string, unknown>[] = [];
+    const t3Fires: string[] = [];
+    await processCommand(
+      {
+        ...realDeps(),
+        db,
+        resolveProjectRepository: async () => 'thinmansoftware/bdc-harness',
+        hasLiveWorkflowRun: async () => ({ live: false, runId: null }),
+        checkFireEligibility: async woId => ({
+          eligible: true,
+          evidence: { woId, project: 'bdc-harness' },
+        }),
+        fireCascade: async () => {
+          t3Fires.push('t3');
+          return { cascadeId: 'after', status: 'running', runId: 'after-run' };
+        },
+        sendReply: async input => {
+          replies.push(JSON.parse(input.body) as Record<string, unknown>);
+          return { id: 'rep' } as DispatchMessage;
+        },
+        acknowledge: async () => undefined,
+      },
+      {
+        id: 'cmd-rfail',
+        correlation_id: 'RFAIL',
+        idempotency_key: 'RFAIL',
+        sender: 't3-bridge',
+        sender_principal_id: 't3-bridge',
+        recipient: 'cauldron-fire',
+        created_at: new Date().toISOString(),
+        body: JSON.stringify({
+          schema: 't3-command/v1',
+          request_id: 'RFAIL',
+          verb: 'fire',
+          wo_id: 'WO-RFAIL-01',
+          project: 'bdc-harness',
+        }),
+      } as unknown as DispatchMessage
+    );
+    expect(replies[0]).toMatchObject({ status: 200, code: 'ok' });
+    expect(t3Fires).toEqual(['t3']);
   });
 });
