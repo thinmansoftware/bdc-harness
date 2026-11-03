@@ -324,4 +324,47 @@ describe('pollForTerminal pushed-head credit', () => {
     expect(two.runPushedHeadSha).toBeNull();
     expect(two.openWoPrHeadSha).toBeNull();
   });
+
+  test('quoted verification from another node does not receive credit', async () => {
+    const quoted = 'd'.repeat(40);
+    const quotedLine = `Earlier run said VERIFIED: origin/feat/wo-old == local HEAD (${quoted})`;
+
+    const quotedOnly = await pollPushed(
+      [
+        {
+          event_type: 'node_completed',
+          step_name: 'implement',
+          data: { node_output: quotedLine },
+        },
+        {
+          event_type: 'node_completed',
+          step_name: 'diff-review',
+          data: {
+            output: `ORIGIN_PRECONDITION_OK: origin/feat/wo-old == ${quoted}`,
+          },
+        },
+      ],
+      [openPr(quoted)]
+    );
+    expect(quotedOnly.runPushedHeadSha).toBeNull();
+    expect(quotedOnly.openWoPrHeadSha).toBeNull();
+
+    const quotedAfterPush = await pollPushed(
+      [
+        {
+          event_type: 'node_completed',
+          step_name: 'commit-and-push',
+          data: { node_output: commitAndPushOutput(pushed) },
+        },
+        {
+          event_type: 'node_completed',
+          step_name: 'diff-review-final',
+          data: { node_output: quotedLine },
+        },
+      ],
+      [openPr(quoted), openPr(pushed, 8)]
+    );
+    expect(quotedAfterPush.runPushedHeadSha).toBe(pushed);
+    expect(quotedAfterPush.openWoPrHeadSha).toBe(pushed);
+  });
 });

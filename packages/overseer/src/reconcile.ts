@@ -1009,15 +1009,29 @@ function woStemsNamedByBranch(headRefName: string): Set<string> {
   return new Set(matches.map(match => match.toUpperCase()));
 }
 
-/** First declared stem that the candidate's WO: line or head branch names. */
+/**
+ * Stem that lets a merged PR close this open candidate.
+ *
+ * An explicit manifest `WO:` line is the candidate's identity. When one or
+ * more WOs are declared, only a declared stem that the merged PR also names
+ * matches. A declaration of a different WO is a conflict: the branch is not
+ * consulted and the candidate is skipped. With no declaration, the head branch
+ * may name the stem.
+ */
 function firstMatchedSupersedeStem(
   candidate: ReconcileRepoOpenPullRequest,
   stems: readonly string[]
 ): string | null {
   const declared = new Set(extractDeclaredWoStems(candidate.body ?? ''));
+  if (declared.size > 0) {
+    for (const stem of stems) {
+      if (declared.has(stem)) return stem;
+    }
+    return null;
+  }
   const namedByBranch = woStemsNamedByBranch(candidate.headRefName);
   for (const stem of stems) {
-    if (declared.has(stem) || namedByBranch.has(stem)) return stem;
+    if (namedByBranch.has(stem)) return stem;
   }
   return null;
 }

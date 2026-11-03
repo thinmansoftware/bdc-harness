@@ -687,16 +687,31 @@ function lastStructuredHeadSha(text: string): string | null {
 }
 
 /**
- * Pushed head from the run's own push proof. Later events win, so a re-push
- * replaces the earlier SHA. Metadata `head_sha` or `pushed_head_sha` is used
- * only when no event line recorded a SHA.
+ * Trusted producers of pushed-head proof. commit-and-push (and per-surface
+ * siblings such as commit-and-push-ui) print VERIFIED / pushed_head after the
+ * push. open-pr-if-needed is the origin re-check and may print
+ * ORIGIN_PRECONDITION_OK after a re-push. Any other node can quote those lines
+ * from an earlier run, so its text is not proof.
+ */
+function isTrustedPushedHeadStep(stepName: string | null | undefined): boolean {
+  if (typeof stepName !== 'string' || stepName.length === 0) return false;
+  if (stepName === 'commit-and-push' || stepName.startsWith('commit-and-push-')) return true;
+  return stepName === 'open-pr-if-needed';
+}
+
+/**
+ * Pushed head from this run's push or origin-check nodes. Later trusted events
+ * win, so a re-push replaces the earlier SHA. The same verification text quoted
+ * by any other node is ignored. Metadata `head_sha` or `pushed_head_sha` is
+ * used only when no trusted node recorded a SHA.
  */
 function extractRunPushedHeadSha(
   metadata: Record<string, unknown>,
-  events: { data: Record<string, unknown> }[]
+  events: { step_name?: string | null; data: Record<string, unknown> }[]
 ): string | null {
   let fromEvents: string | null = null;
   for (const ev of events) {
+    if (!isTrustedPushedHeadStep(ev.step_name)) continue;
     const sha = lastStructuredHeadSha(extractEventText(ev.data));
     if (sha) fromEvents = sha;
   }
@@ -714,7 +729,7 @@ async function creditRunPushedOpenPr(
   woId: string,
   repo: string,
   metadata: Record<string, unknown>,
-  events: { data: Record<string, unknown> }[],
+  events: { step_name?: string | null; data: Record<string, unknown> }[],
   listOpenPrs: (opts: {
     woId: string;
     project: string;

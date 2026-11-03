@@ -237,11 +237,13 @@ export interface PollResult {
   prUrl: string | null;
   prMergeable: boolean | null;
   /**
-   * Head SHA this run pushed. Taken from a commit-and-push
-   * `VERIFIED: origin/<branch> == local HEAD (<40 hex>)` line, an
-   * `ORIGIN_PRECONDITION_OK: origin/<branch> == <40 hex>` line, or
-   * `pushed_head=<40 hex>`. Metadata `head_sha` / `pushed_head_sha` applies
-   * only when no event line is present. Null when absent.
+   * Head SHA this run pushed. Taken only from a trusted push node
+   * (`commit-and-push` or `commit-and-push-<surface>`) or the origin-check
+   * node `open-pr-if-needed`: a `VERIFIED: origin/<branch> == local HEAD
+   * (<40 hex>)` line, an `ORIGIN_PRECONDITION_OK: origin/<branch> == <40 hex>`
+   * line, or `pushed_head=<40 hex>`. The same text quoted by any other node
+   * is ignored. Metadata `head_sha` / `pushed_head_sha` applies only when no
+   * trusted node recorded a SHA. Null when absent.
    */
   runPushedHeadSha?: string | null;
   /**
