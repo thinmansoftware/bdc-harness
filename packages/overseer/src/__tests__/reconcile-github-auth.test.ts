@@ -290,11 +290,13 @@ function mergedTrackerPr(number: number): ReconcileMergedPullRequest {
     repo: 'bdc-harness',
     number,
     title: 'Fixture implementation',
-    body: `WO: ${trackerStem}`,
+    // Closing keyword on the project base (bdc-harness -> dev) closes tracker #501.
+    body: `Closes thinmansoftware/bdc-xo#501`,
     htmlUrl: `https://github.com/thinmansoftware/bdc-harness/pull/${number}`,
     state: 'closed',
     merged: true,
     mergeCommitSha: 'a'.repeat(40),
+    baseRef: 'dev',
   };
 }
 
@@ -571,10 +573,17 @@ test('tracker REST lookup excludes PR rows and preserves closed issue state', as
 });
 
 test('tracker REST lookup rejects ambiguous exact titles rather than selecting REST order', async () => {
+  // Ambiguity is a by-STEM concern (the keyword-missing note resolves a declared
+  // WO by title). A PR that declares the WO but carries no closing keyword forces
+  // that lookup; two issues with the same title make it ambiguous and abort.
   app();
   trackerTransport(() => [trackerRow(501), trackerRow(502)]);
   const effects: string[] = [];
-  const deps = trackerRunDeps(createDefaultReconcileDeps(), [mergedTrackerPr(601)], effects);
+  const pr: ReconcileMergedPullRequest = {
+    ...mergedTrackerPr(601),
+    body: `WO: ${trackerStem}`,
+  };
+  const deps = trackerRunDeps(createDefaultReconcileDeps(), [pr], effects);
   await expect(runReconcileOnce({ deps })).rejects.toThrow('title is ambiguous');
   expect(effects).toEqual([]);
 });
@@ -587,12 +596,18 @@ test('tracker REST lookup rejects conflicting copies of one issue identity', asy
   );
 });
 
-test('tracker REST lookup complete empty and near-title snapshots do not close a tracker', async () => {
+test('tracker REST lookup: a keyword referencing an absent issue number closes nothing', async () => {
+  // Under keyword-close, a `Closes #N` only closes issue #N. If #777 is not in the
+  // snapshot (empty, or a different issue sits at #501) nothing is closed.
   app();
   let rows: ReturnType<typeof trackerRow>[] = [];
   trackerTransport(() => rows);
   const effects: string[] = [];
-  const deps = trackerRunDeps(createDefaultReconcileDeps(), [mergedTrackerPr(601)], effects);
+  const pr: ReconcileMergedPullRequest = {
+    ...mergedTrackerPr(601),
+    body: `Closes thinmansoftware/bdc-xo#777`,
+  };
+  const deps = trackerRunDeps(createDefaultReconcileDeps(), [pr], effects);
   expect((await runReconcileOnce({ deps })).closed).toBe(0);
   rows = [trackerRow(501, `${trackerStem}-NEAR`)];
   expect((await runReconcileOnce({ deps })).closed).toBe(0);

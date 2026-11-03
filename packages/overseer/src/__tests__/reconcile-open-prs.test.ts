@@ -28,12 +28,13 @@ function mergedPullRequest(): ReconcileMergedPullRequest {
     repo: 'bdc-harness',
     number: 404,
     title: 'BDC feature Work Order implementation',
-    body: `WO: ${stem}`,
+    body: `WO: ${stem}\n\nCloses thinmansoftware/bdc-xo#1044`,
     htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/404',
     state: 'closed',
     merged: true,
     mergeCommitSha: 'abc123merge',
     mergedAt: '2026-09-29T12:00:00Z',
+    baseRef: 'dev',
   };
 }
 
@@ -95,6 +96,10 @@ function harness(
     readCursor: mock(async () => null),
     now: () => new Date('2026-09-29T12:00:00Z'),
     searchMergedPullRequests: mock(async () => [mergedPullRequest()]),
+    findTrackerIssueByNumber: mock(async (number: number) => {
+      if (number !== 1044) return null;
+      return trackerIssue();
+    }),
     findTrackerIssueByStem: mock(async (candidate: string) => {
       if (candidate !== stem) return null;
       return trackerIssue();
@@ -111,6 +116,7 @@ function harness(
     hasSkipBeenNoted: mock(async () => false),
     hasCloseBeenRecorded: mock(async () => false),
     hasHoldBeenNoted: mock(async () => Boolean(input.holdAlreadyNoted)),
+    hasKeywordMissingBeenNoted: mock(async () => false),
     insertAction: mock(async (record: ReconcileActionRecord) => {
       actions.push(record);
     }),
@@ -137,7 +143,7 @@ function expectNormalClose(deps: ReturnType<typeof harness>, result: { closed: n
     {
       prRef: 'thinmansoftware/bdc-harness#404',
       woId: stem,
-      class: 'tracker_reconcile',
+      class: 'closes_keyword',
       action: RECONCILE_ACTION,
       result: 'https://github.com/thinmansoftware/bdc-harness/pull/404:abc123merge',
     },

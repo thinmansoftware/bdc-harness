@@ -35,7 +35,9 @@ Reconcile-Skip: ${stem}`,
   });
 
   test('merged PR without Reconcile-Skip keeps existing close behavior unchanged', async () => {
-    const deps = fakeDeps({ prs: [mergedPr({ body: `Implements ${stem}.` })] });
+    const deps = fakeDeps({
+      prs: [mergedPr({ body: `Implements ${stem}.\n\nCloses thinmansoftware/bdc-xo#1044` })],
+    });
 
     const result = await runReconcileOnce({ deps });
 
