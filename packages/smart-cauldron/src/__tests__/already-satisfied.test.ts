@@ -169,4 +169,52 @@ describe('listOpenWoPullRequests', () => {
     expect(listed.map(pr => pr.number)).toEqual([4422]);
     expect(listed.every(pr => pr.isDraft === false)).toBe(true);
   });
+
+  test('drops open PRs whose url is empty or whitespace', async () => {
+    const head = {
+      ref: 'archon/task-web-worker-1-abc',
+      sha: 'a'.repeat(40),
+      repo: { full_name: 'thinmansoftware/bdc-harness' },
+    };
+    const listed = await listOpenWoPullRequests({
+      woId: 'WO-TEST-001',
+      project: 'thinmansoftware/bdc-harness',
+      lookup: async () => [
+        {
+          number: 4422,
+          draft: false,
+          body: 'WO: WO-TEST-001\n',
+          html_url: '',
+          created_at: '2026-11-03T10:47:06Z',
+          head,
+        },
+        {
+          number: 4423,
+          draft: false,
+          body: 'WO: WO-TEST-001\n',
+          html_url: '   ',
+          created_at: '2026-11-03T10:47:07Z',
+          head,
+        },
+        {
+          number: 4424,
+          draft: false,
+          body: 'WO: WO-TEST-001\n',
+          created_at: '2026-11-03T10:47:08Z',
+          head,
+        },
+        {
+          number: 4425,
+          draft: false,
+          body: 'WO: WO-TEST-001\n',
+          html_url: '  https://github.com/thinmansoftware/bdc-harness/pull/4425  ',
+          created_at: '2026-11-03T10:47:09Z',
+          head,
+        },
+      ],
+    });
+
+    expect(listed.map(pr => pr.number)).toEqual([4425]);
+    expect(listed[0]?.url).toBe('https://github.com/thinmansoftware/bdc-harness/pull/4425');
+  });
 });

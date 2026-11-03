@@ -264,6 +264,10 @@ function toOpenWoPullRequest(
   const number = row.number;
   if (typeof number !== 'number' || !Number.isInteger(number) || number < 1) return null;
   if (row.draft === true) return null;
+  const url = typeof row.html_url === 'string' ? row.html_url.trim() : '';
+  // Mergeability is checked by URL. An empty URL must not become a candidate:
+  // a SHA match with no URL would satisfy the gate with no merge check.
+  if (url.length === 0) return null;
   const headRefName = typeof row.head?.ref === 'string' ? row.head.ref : '';
   const body = typeof row.body === 'string' ? row.body : '';
   const branchClaims = woId.length > 0 && headRefName.toLowerCase().includes(woId.toLowerCase());
@@ -272,7 +276,7 @@ function toOpenWoPullRequest(
     number,
     headRefName,
     headSha: typeof row.head?.sha === 'string' ? row.head.sha : '',
-    url: typeof row.html_url === 'string' ? row.html_url : '',
+    url,
     createdAt: typeof row.created_at === 'string' ? row.created_at : '',
     isDraft: row.draft === true,
     isFork: false,
@@ -322,7 +326,8 @@ async function ghListOpenPullRequestsDefault(
 /**
  * OPEN, non-draft, non-fork PRs in the target repo whose body has a WO: line
  * token-matching woId, or whose head branch contains woId (case-insensitive).
- * Head repositories that cannot be verified, forks, and drafts are excluded.
+ * Head repositories that cannot be verified, forks, drafts, and PRs with an
+ * empty URL are excluded.
  */
 export async function listOpenWoPullRequests(
   opts: ListOpenWoPullRequestsOptions

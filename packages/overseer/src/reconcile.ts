@@ -1384,10 +1384,11 @@ async function hasDefaultSupersedeBeenRecorded(input: {
 
 /**
  * Comment, then close. A retry after a successful comment and a failed close
- * does not post the comment again: the existing body is the idempotency key.
- * A truncated comment read that does not show the body also skips the post,
- * then still attempts the close. The caller records the action only after this
- * returns, so a failed close stays eligible for another pass.
+ * does not post the comment again when that body is already in the pages read.
+ * A truncated listing is not proof the comment exists: when the body is absent
+ * from the returned pages, it is posted before the close. The caller records
+ * the action only after this returns, so a failed close stays eligible for
+ * another pass.
  */
 export async function closeSupersededPullRequest(
   client: OctokitLike,
@@ -1404,7 +1405,9 @@ export async function closeSupersededPullRequest(
       state: 'open',
     });
     const found = existing.items.some(comment => comment.body.trim() === wanted);
-    skipComment = found || existing.truncated;
+    // Truncation must not skip the post. The comment may be absent entirely,
+    // and closing without it drops the required supersede note.
+    skipComment = found;
   }
   if (!skipComment) {
     await client.issues.createComment({

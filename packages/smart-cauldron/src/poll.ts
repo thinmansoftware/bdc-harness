@@ -693,11 +693,13 @@ function extractRunPushedHeadSha(
 
 /**
  * Credit an open WO PR only when exactly one candidate's head SHA equals the
- * run's pushed SHA. That match also returns the PR URL when it is a non-empty
- * string, so mergeability is checked on it. Zero matches, multiple matches, an
- * empty URL, or a lookup failure leave prUrl null (and a lookup failure leaves
- * both SHAs null). Hermetic mode makes no GitHub call when the default lister
- * is used (it returns []).
+ * run's pushed SHA and that candidate has a non-empty URL. The URL is returned
+ * so mergeability is checked on it. Zero matches, multiple matches, an empty
+ * or whitespace-only URL, or a lookup failure leave both SHAs null and prUrl
+ * null. Matching SHAs must not be returned without a URL: judgeGate treats
+ * them as an opened PR, and a null prUrl skips the mergeability check, so a
+ * conflicting PR would pass. Hermetic mode makes no GitHub call when the
+ * default lister is used (it returns []).
  */
 async function creditRunPushedOpenPr(
   runId: string,
@@ -721,8 +723,10 @@ async function creditRunPushedOpenPr(
     const match = matches[0];
     const openSha = validHeadSha(match?.headSha);
     if (!openSha) return empty;
-    const url = match?.url;
-    const prUrl = typeof url === 'string' && url.length > 0 ? url : null;
+    const prUrl = typeof match?.url === 'string' ? match.url.trim() : '';
+    // An empty URL cannot be merge-checked. Drop the SHAs too so judgeGate
+    // cannot treat the match as an opened PR.
+    if (prUrl.length === 0) return empty;
     return { runPushedHeadSha: pushed, openWoPrHeadSha: openSha, prUrl };
   } catch (err) {
     console.log(`[poll] run ${runId} open WO PR lookup failed: ${(err as Error).message}`);

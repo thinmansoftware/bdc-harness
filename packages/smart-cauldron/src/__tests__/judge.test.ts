@@ -291,4 +291,62 @@ describe('poll credit mergeability', () => {
     expect(verdict.pass).toBe(false);
     expect(verdict.reason).not.toContain('no PR opened after completed run');
   });
+
+  test('empty_url_match_does_not_credit_shas_or_pass_the_gate', async () => {
+    const headSha = 'c'.repeat(40);
+    for (const url of ['', '   ']) {
+      const checked: string[] = [];
+      const fetchImpl: typeof fetch = async () =>
+        new Response(
+          JSON.stringify({
+            run: {
+              id: 'run-empty-url',
+              status: 'completed',
+              metadata: { head_sha: headSha },
+            },
+            events: [],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        );
+
+      const poll = await pollForTerminal({
+        runId: 'run-empty-url',
+        apiBaseUrl: 'http://archon.test',
+        fetchImpl,
+        timeoutMs: 30_000,
+        intervalMs: 1,
+        prRetryAttempts: 0,
+        prBranchLookupAttempts: 1,
+        prBranchLookupDelayMs: 0,
+        repo: 'thinmansoftware/bdc-harness',
+        woId: 'WO-XO-BDC-BROWSER-KEEPER-04',
+        ghPrListForBranch: async () => null,
+        listOpenWoPullRequests: async () => [
+          {
+            number: 4422,
+            headRefName: 'archon/task-web-worker-1-abc',
+            headSha,
+            url,
+            createdAt: '2026-11-03T10:47:06Z',
+            isDraft: false,
+            isFork: false,
+            body: 'WO: WO-XO-BDC-BROWSER-KEEPER-04\n',
+          },
+        ],
+        checkPrMergeable: async (prUrl: string) => {
+          checked.push(prUrl);
+          return true;
+        },
+      });
+
+      expect(poll.prUrl).toBeNull();
+      expect(poll.runPushedHeadSha).toBeNull();
+      expect(poll.openWoPrHeadSha).toBeNull();
+      expect(poll.prMergeable).toBeNull();
+      expect(checked).toEqual([]);
+      const verdict = judgeGate(poll);
+      expect(verdict.pass).toBe(false);
+      expect(verdict.reason).toContain('no PR opened after completed run');
+    }
+  });
 });

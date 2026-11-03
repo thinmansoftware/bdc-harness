@@ -544,4 +544,76 @@ describe('reconcile supersede', () => {
     expect(comments).toEqual(['Superseded by #4425']);
     expect(closes).toBe(2);
   });
+
+  test('truncated_comment_list_posts_missing_supersede_comment_before_close', async () => {
+    const ops: string[] = [];
+    const client = {
+      issues: {
+        listComments: async () => ({ data: null }),
+        createComment: async (input: Record<string, unknown>) => {
+          ops.push(`comment:${String(input.body)}`);
+          return {};
+        },
+        update: async () => {
+          ops.push('close');
+          return {};
+        },
+        addLabels: async () => ({}),
+      },
+    } as unknown as OctokitLike;
+    const input = {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 4422,
+      comment: 'Superseded by #4425',
+    };
+
+    await closeSupersededPullRequest(client, input);
+
+    expect(ops).toEqual(['comment:Superseded by #4425', 'close']);
+  });
+
+  test('truncated_comment_list_with_visible_supersede_comment_does_not_repost', async () => {
+    const wanted = 'Superseded by #4425';
+    let posts = 0;
+    let closes = 0;
+    const client = {
+      issues: {
+        // A full first page keeps the read going; a non-array later page marks
+        // the listing truncated. The wanted body is in the pages that were read.
+        listComments: async (params: { page?: number }) => {
+          if (params.page === 1) {
+            return {
+              data: Array.from({ length: 100 }, (_, index) => ({
+                body: index === 3 ? wanted : `other ${String(index)}`,
+                user: { login: 'overseer' },
+                html_url: 'https://example.test/comment',
+                created_at: '2026-11-03T00:00:00Z',
+              })),
+            };
+          }
+          return { data: null };
+        },
+        createComment: async () => {
+          posts += 1;
+          return {};
+        },
+        update: async () => {
+          closes += 1;
+          return {};
+        },
+        addLabels: async () => ({}),
+      },
+    } as unknown as OctokitLike;
+
+    await closeSupersededPullRequest(client, {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 4422,
+      comment: wanted,
+    });
+
+    expect(posts).toBe(0);
+    expect(closes).toBe(1);
+  });
 });
