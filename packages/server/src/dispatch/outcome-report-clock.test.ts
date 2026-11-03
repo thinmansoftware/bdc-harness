@@ -195,7 +195,7 @@ describe('outcome-report-clock real runner', () => {
     const path = join(dir, 'archon.db');
     const db = new Database(path);
     db.exec(`
-create table remote_agent_workflow_runs (id text primary key, workflow_name text not null, status text not null default 'pending', started_at text);
+create table remote_agent_workflow_runs (id text primary key, workflow_name text not null, status text not null default 'pending', started_at text, user_message text not null default '');
 create table remote_agent_workflow_events (id text primary key, workflow_run_id text not null, event_type text not null, step_index integer, step_name text, data text, created_at text);
 create table remote_agent_run_outcomes (run_id text primary key, execution_state text);
 create table overseer_actions (id text primary key, run_id text, wo_id text, class text, action text, result text not null, created_at text not null);
