@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { rootLogger } from '@archon/paths';
 import {
@@ -9,6 +9,14 @@ import {
 } from '../merge-execution-bridge';
 import { readWoSpecForMergeHold, specDeclaresMergeHold } from '../merge-hold';
 import { parseMergeRepoPolicy } from '../merge-repo-policy';
+import {
+  REQUIRED_CONTEXTS_BLOCKED_REASON,
+  REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
+  REQUIRED_CONTEXTS_OVERRIDE_ENV,
+  resetRequiredContextsAttemptCounters,
+  resetRequiredContextsCache,
+} from '../adapters/required-contexts.ts';
+import type { RecheckCheckRun } from '../pr-review-check-ingest.ts';
 import type {
   GitHubClientDeps,
   GitHubPullRequestSearchInput,
@@ -1539,4 +1547,244 @@ describe('merge ceiling queue notices', () => {
       }
     }
   );
+});
+
+describe('merge execution bridge required contexts', () => {
+  const required = ['docker-build', 'test (ubuntu-latest)'] as const;
+
+  function checkRun(
+    id: number,
+    name: string,
+    status: string,
+    conclusion: string | null
+  ): RecheckCheckRun {
+    return { id, name, status, conclusion, completed_at: `2026-11-0${id}T00:00:00.000Z` };
+  }
+
+  function contextsLookup(
+    contexts: readonly string[]
+  ): NonNullable<GitHubClientDeps['requiredContextsLookups']> {
+    return {
+      fetchWithAppClient: async () => ({ data: [...contexts] }),
+    };
+  }
+
+  async function evaluate(h: ReturnType<typeof harness>): Promise<void> {
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+  }
+
+  beforeEach(() => {
+    resetRequiredContextsCache();
+    resetRequiredContextsAttemptCounters();
+    delete process.env[REQUIRED_CONTEXTS_OVERRIDE_ENV];
+    delete process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV];
+  });
+
+  afterEach(() => {
+    resetRequiredContextsCache();
+    resetRequiredContextsAttemptCounters();
+    delete process.env[REQUIRED_CONTEXTS_OVERRIDE_ENV];
+    delete process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV];
+  });
+
+  test('non-required cancelled check does not block when required checks succeed', async () => {
+    const h = harness(
+      [verdict('required-green')],
+      greenPr({
+        checks: { total: 3, passed: 2, failed: 1, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'failure'),
+          checkRun(2, ' Docker-Build ', 'completed', 'success'),
+          checkRun(3, 'test (ubuntu-latest)', 'completed', 'success'),
+          checkRun(4, 'test (windows-latest)', 'completed', 'cancelled'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+
+  test('required failure still blocks and the skip log names the context', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('required-red')],
+        greenPr({
+          checks: { total: 2, passed: 2, failed: 0, pending: 0 },
+          checkRuns: [
+            checkRun(1, 'docker-build', 'completed', 'success'),
+            checkRun(2, 'test (ubuntu-latest)', 'completed', 'failure'),
+          ],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup(required) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]).toEqual(
+        expect.objectContaining({ mutationSent: false, reason: 'required_checks_not_success' })
+      );
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.merge_skipped', {
+        reason: 'required_checks_not_success',
+        blockingContexts: ['test (ubuntu-latest)'],
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('required pending check blocks even when the aggregate summary is green', async () => {
+    const h = harness(
+      [verdict('required-pending')],
+      greenPr({
+        checks: { total: 2, passed: 2, failed: 0, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'in_progress', null),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+  });
+
+  test('missing required check blocks even when the aggregate summary is green', async () => {
+    const h = harness(
+      [verdict('required-missing')],
+      greenPr({
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        checkRuns: [checkRun(1, 'test (ubuntu-latest)', 'completed', 'success')],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+  });
+
+  test('unknown required set falls back to aggregate checks and logs the fallback', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('required-unknown')],
+        greenPr({
+          checks: { total: 3, passed: 2, failed: 1, pending: 0 },
+          checkRuns: [
+            checkRun(1, 'docker-build', 'completed', 'success'),
+            checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+            checkRun(3, 'test (windows-latest)', 'completed', 'cancelled'),
+          ],
+        })
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.required_contexts_fallback', {
+        state: 'unknown',
+        reason: 'protection_api_unavailable',
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('authoritative empty required set merges when reported checks pass', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('empty-pass')],
+        greenPr({
+          checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+          checkRuns: [checkRun(1, 'test (windows-latest)', 'completed', 'success')],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup([]) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(1);
+      expect(h.outcomes[0]).toEqual(
+        expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+      );
+      expect(
+        captured.lines.some(line => line.includes('merge-coordinator.required_contexts_fallback'))
+      ).toBe(false);
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('authoritative empty required set skips when a reported check fails', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('empty-fail')],
+        greenPr({
+          checks: { total: 2, passed: 1, failed: 1, pending: 0 },
+          checkRuns: [
+            checkRun(1, 'docker-build', 'completed', 'success'),
+            checkRun(2, 'test (windows-latest)', 'completed', 'failure'),
+          ],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup([]) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expect(
+        captured.lines.some(line => line.includes('merge-coordinator.required_contexts_fallback'))
+      ).toBe(false);
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('exhausted required set falls back to aggregate checks and logs the fallback', async () => {
+    process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV] = '1';
+    const captured = captureRootLogLines();
+    try {
+      const head = 'exhausted-head';
+      const h = harness(
+        [verdict('required-exhausted', head)],
+        greenPr({
+          headSha: head,
+          checks: { total: 1, passed: 0, failed: 1, pending: 0 },
+          checkRuns: [checkRun(1, 'test (windows-latest)', 'completed', 'cancelled')],
+        }),
+        0,
+        {
+          requiredContextsLookups: {
+            fetchWithAppClient: async () => {
+              throw new Error('lookup_down');
+            },
+          },
+        }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.required_contexts_fallback', {
+        state: 'exhausted',
+        reason: REQUIRED_CONTEXTS_BLOCKED_REASON,
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
 });
