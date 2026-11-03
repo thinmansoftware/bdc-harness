@@ -9,6 +9,8 @@
  * WO-HARNESS-*-01). Injectable lookup for tests.
  */
 
+import { matchesWoToken } from '@archon/overseer/wo-token';
+
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -98,22 +100,7 @@ function stripExclusionSections(text: string): string {
  * (hyphen is a boundary). Case-insensitive.
  */
 export function textClaimsWoId(text: string, woId: string): boolean {
-  if (!woId || !text) return false;
-  const hay = stripExclusionSections(text).toLowerCase();
-  const needle = woId.toLowerCase();
-  let from = 0;
-  while (from <= hay.length) {
-    const idx = hay.indexOf(needle, from);
-    if (idx < 0) return false;
-    const before = idx === 0 ? '' : hay[idx - 1];
-    const afterIdx = idx + needle.length;
-    const after = afterIdx >= hay.length ? '' : hay[afterIdx];
-    const beforeOk = idx === 0 || /[^a-z0-9]/.test(before);
-    const afterOk = after === '' || /[^a-z0-9]/.test(after);
-    if (beforeOk && afterOk) return true;
-    from = idx + 1;
-  }
-  return false;
+  return matchesWoToken(stripExclusionSections(text), woId);
 }
 
 interface GhPrRow {
@@ -203,8 +190,7 @@ export async function findWoClaim(opts: FindWoClaimOptions): Promise<WoClaim | n
 }
 
 /**
- * One-line manifest declaration. Copied locally so this package does not
- * import Overseer. A value token-matches via textClaimsWoId.
+ * One-line manifest declaration. A value token-matches via textClaimsWoId.
  */
 const WO_DECLARATION_LINE = /^WO[ \t]*:[ \t]*(\S.*)$/i;
 
@@ -265,7 +251,7 @@ function toOpenWoPullRequest(
   if (typeof number !== 'number' || !Number.isInteger(number) || number < 1) return null;
   const headRefName = typeof row.head?.ref === 'string' ? row.head.ref : '';
   const body = typeof row.body === 'string' ? row.body : '';
-  const branchClaims = woId.length > 0 && headRefName.toLowerCase().includes(woId.toLowerCase());
+  const branchClaims = matchesWoToken(headRefName, woId);
   if (!branchClaims && !bodyLineClaimsWo(body, woId)) return null;
   return {
     number,

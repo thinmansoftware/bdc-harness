@@ -1,3 +1,4 @@
+import { matchesWoToken } from './wo-token';
 import { resolveProjectBase } from './project-bases';
 
 const log: ReconcileLogger = {
@@ -1027,7 +1028,7 @@ function firstMatchedSupersedeStem(
   const declared = new Set(extractDeclaredWoStems(candidate.body ?? ''));
   const head = candidate.headRefName.toLowerCase();
   for (const stem of stems) {
-    if (declared.has(stem) || (stem.length > 0 && head.includes(stem.toLowerCase()))) return stem;
+    if (declared.has(stem) || matchesWoToken(head, stem)) return stem;
   }
   return null;
 }

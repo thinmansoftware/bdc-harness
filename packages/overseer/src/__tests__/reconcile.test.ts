@@ -337,6 +337,21 @@ function supersedeDeps(
 }
 
 describe('reconcile supersede', () => {
+  test('overlapping_wo_ids_do_not_match', async () => {
+    const deps = supersedeDeps({
+      pr: mergedPr({ number: 4425, body: 'WO: WO-FOO-01' }),
+      opens: [
+        keeperOpenPr(1, 'WO: WO-FOO-010', 'fix/wo-foo-010-thread-abc'),
+        keeperOpenPr(2, 'WO: WO-FOO-01', 'fix/wo-foo-01-thread-def'),
+        keeperOpenPr(3, 'WO: WO-OTHER-01', 'fix/WO-FOO-01-thread-upper'),
+        keeperOpenPr(4, 'WO: WO-FOO-01A', 'fix/wo-foo-01a'),
+        keeperOpenPr(5, 'WO: WO-OTHER-01', 'fix/prefixwo-foo-01'),
+      ],
+    });
+    await runReconcileOnce({ deps });
+    expect(deps.pullCloses.map(pr => pr.number)).toEqual([2, 3]);
+  });
+
   test('merge_closes_superseded_wo_prs', async () => {
     const deps = supersedeDeps();
 
