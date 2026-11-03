@@ -53,6 +53,10 @@ import {
   type GitleaksResult,
 } from './openrouter-review-fence';
 import { GlmProvider } from './community/glm/provider';
+import {
+  buildOpenRouterChatMessages,
+  serializeOpenRouterRequestContent,
+} from './openrouter-request';
 import { GrokAgentProvider } from './community/grok/provider';
 
 const SLUGS = ['mutant-market'];
@@ -226,6 +230,71 @@ describe('scanDiffForOpenRouter patterns', () => {
     expect(result.hits.some(h => h.kind === 'stripe_id')).toBe(true);
   });
 
+  test('deleted fixture: removed lines keep the old-side path so a tenant slug is a hit', async () => {
+    // Deleting seed/tenants.sql: `+++ /dev/null` must not leave the removed
+    // lines attributed to the previous file (Overseer f90adfec).
+    const diff = [
+      'diff --git a/src/app.ts b/src/app.ts',
+      '--- a/src/app.ts',
+      '+++ b/src/app.ts',
+      '@@ -1,1 +1,1 @@',
+      '-export const a = 1;',
+      '+export const a = 2;',
+      'diff --git a/seed/tenants.sql b/seed/tenants.sql',
+      'deleted file mode 100644',
+      '--- a/seed/tenants.sql',
+      '+++ /dev/null',
+      '@@ -1,2 +0,0 @@',
+      "-INSERT INTO tenants (slug) VALUES ('mutant-market');",
+      '-SELECT 1;',
+    ].join('\n');
+    const result = await scanDiffForOpenRouter(diff, {
+      mode: 'diff',
+      tenantSlugs: SLUGS,
+      gitleaksRunner: cleanGitleaks,
+    });
+    expect(result.verdict).toBe('hit');
+    const slugHit = result.hits.find(h => h.kind === 'tenant_slug');
+    expect(slugHit?.file).toBe('seed/tenants.sql');
+    expect(slugHit?.line).toBe(1);
+    expect(JSON.stringify(result)).not.toContain('mutant-market');
+  });
+
+  test('deleted fixture with no diff --git header still uses the old-side path', async () => {
+    const diff = [
+      '--- a/tests/fixtures/tenants.json',
+      '+++ /dev/null',
+      '@@ -1,1 +0,0 @@',
+      '-  "slug": "mutant-market"',
+    ].join('\n');
+    const result = await scanDiffForOpenRouter(diff, {
+      mode: 'diff',
+      tenantSlugs: SLUGS,
+      gitleaksRunner: cleanGitleaks,
+    });
+    expect(result.verdict).toBe('hit');
+    expect(result.hits.find(h => h.kind === 'tenant_slug')?.file).toBe(
+      'tests/fixtures/tenants.json'
+    );
+  });
+
+  test('added file: --- /dev/null does not clobber the new-side path', async () => {
+    const diff = [
+      'diff --git a/seed/new.sql b/seed/new.sql',
+      'new file mode 100644',
+      '--- /dev/null',
+      '+++ b/seed/new.sql',
+      '@@ -0,0 +1,1 @@',
+      "+INSERT INTO tenants (slug) VALUES ('mutant-market');",
+    ].join('\n');
+    const result = await scanDiffForOpenRouter(diff, {
+      mode: 'diff',
+      tenantSlugs: SLUGS,
+      gitleaksRunner: cleanGitleaks,
+    });
+    expect(result.hits.find(h => h.kind === 'tenant_slug')?.file).toBe('seed/new.sql');
+  });
+
   // Test 4: gitleaks finding reroutes (real binary; skip with a named reason).
   test('Test 4: a gitleaks finding is a gitleaks hit with its RuleID', async () => {
     if (!(await gitleaksBinaryPresent())) {
@@ -297,6 +366,32 @@ describe('OpenRouter client privacy pin', () => {
     const sent = captured[0]?.body.provider as { data_collection?: string; zdr?: boolean };
     expect(sent?.data_collection).toBe('deny');
     expect(sent?.zdr).toBe(true);
+  });
+
+  test('GlmProvider transmits exactly the shared builder output the fence scans', async () => {
+    // The executor's fence scans serializeOpenRouterRequestContent(); this
+    // proves GlmProvider sends that same content: system prompt, user prompt
+    // and the appended outputFormat.schema (Overseer major, PRs 1426/1428).
+    const options = {
+      systemPrompt: 'You are a careful code reviewer.',
+      outputFormat: {
+        type: 'json_schema' as const,
+        schema: { type: 'object', properties: { contact: { description: 'x@y.example' } } },
+      },
+      openrouterPrivacyPin: true,
+    };
+    const provider = new GlmProvider();
+    for await (const _ of provider.sendQuery('review this', '/tmp/x', undefined, options)) {
+      // drain
+    }
+    expect(captured.length).toBe(1);
+    const messages = captured[0]?.body.messages as Array<{ role: string; content: string }>;
+    expect(messages).toEqual(buildOpenRouterChatMessages('review this', options));
+    expect(messages.map(m => m.content).join('\n\n')).toBe(
+      serializeOpenRouterRequestContent('review this', options)
+    );
+    expect(messages[0]).toEqual({ role: 'system', content: 'You are a careful code reviewer.' });
+    expect(messages[1]?.content).toContain('"description":"x@y.example"');
   });
 
   test('Test 1: no pin -> no provider field on the request body', async () => {

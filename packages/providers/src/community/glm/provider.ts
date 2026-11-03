@@ -10,6 +10,7 @@ import type {
 
 import { getOpenRouterXaiRefusal } from '../../openrouter-guard';
 import { isNoPrivateEndpointError } from '../../openrouter-review-fence';
+import { buildOpenRouterChatMessages } from '../../openrouter-request';
 import { GLM_CAPABILITIES } from './capabilities';
 import { parseGlmConfig } from './config';
 
@@ -124,22 +125,13 @@ export class GlmProvider implements IAgentProvider {
     // Already-prefixed ids (e.g. "z-ai/glm-4.6") pass through unchanged.
     const resolvedModel = model.includes('/') ? model : 'z-ai/' + model;
 
-    // Build messages array from prompt. systemPrompt is prepended when present.
-    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
-    if (options?.systemPrompt) {
-      messages.push({ role: 'system', content: options.systemPrompt });
-    }
-
-    // structuredOutput: best-effort -- append JSON instruction to prompt
-    let userContent = prompt;
-    if (options?.outputFormat?.type === 'json_schema') {
-      const schema = JSON.stringify(options.outputFormat.schema);
-      userContent =
-        prompt +
-        '\n\nRespond with valid JSON only. The JSON must conform to this schema:\n' +
-        schema;
-    }
-    messages.push({ role: 'user', content: userContent });
+    // Build messages (system prompt, user prompt, appended outputFormat.schema)
+    // through the shared builder the executor's review fence scans, so the
+    // fence and this request can never diverge.
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = buildOpenRouterChatMessages(
+      prompt,
+      options
+    );
 
     // OpenRouter privacy pin (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01): when
     // the executor's review-fence gate approved this OpenRouter route on a

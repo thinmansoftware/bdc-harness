@@ -41,6 +41,7 @@ import {
   isCustomerRepo,
   normalizeRepoSlug,
   scanDiffForOpenRouter,
+  serializeOpenRouterRequestContent,
   formatHitLocation,
   OPENROUTER_TOOL_LOOP_PROVIDER_ID,
   type ScanResult,
@@ -737,6 +738,10 @@ export interface OpenRouterFenceParams {
    *  a persona/system prompt cannot bypass the fence. Undefined when the route
    *  carries no system prompt. */
   systemPrompt?: string;
+  /** The structured-output format of the request. GlmProvider appends the
+   *  serialized schema to the transmitted user message, so it is part of the
+   *  scanned outgoing content. */
+  outputFormat?: SendQueryOptions['outputFormat'];
   /** Overrides the env slug list (tests). */
   tenantSlugs?: readonly string[];
   /** Overrides the git probes (tests). */
@@ -830,14 +835,16 @@ export async function applyOpenRouterReviewFence(
       diffResult = { verdict: 'scan_unavailable', hits: [], reason: 'repo_diff_unavailable' };
     }
 
-    // (b) Outgoing prompt -- the FULLY ASSEMBLED outgoing content: the system /
-    // persona prompt plus the user prompt. OpenRouter clients transmit the
-    // system prompt as a separate message, so scanning only finalPrompt would
-    // let customer data in a persona/system prompt reach OpenRouter unseen.
+    // (b) Outgoing request -- the COMPLETE serialized request content, built by
+    // the same function GlmProvider uses to build what it sends: the system /
+    // persona prompt, the user prompt, and the JSON instruction + serialized
+    // outputFormat.schema appended to the user message. Scanning anything less
+    // would let customer data in a persona or schema reach OpenRouter unseen.
     // Scanned every request, never cached.
-    const outgoingContent = [params.systemPrompt, finalPrompt]
-      .filter((t): t is string => typeof t === 'string' && t.length > 0)
-      .join('\n\n');
+    const outgoingContent = serializeOpenRouterRequestContent(finalPrompt, {
+      systemPrompt: params.systemPrompt,
+      outputFormat: params.outputFormat,
+    });
     let promptResult: ScanResult;
     try {
       promptResult = await scanText(outgoingContent, 'prompt');
@@ -2571,6 +2578,7 @@ async function executeNodeInternal(
       failoverTarget: resolveFailoverTarget(node, workflowLevelOptions),
       finalPrompt,
       systemPrompt: nodeOptions?.systemPrompt,
+      outputFormat: nodeOptions?.outputFormat,
     });
     if (fenceDecision.applicable && fenceDecision.rerouted) {
       getLog().warn(
@@ -4808,6 +4816,7 @@ async function executeLoopNode(
             failoverTarget: resolveFailoverTarget(node, workflowLevelOptions ?? {}),
             finalPrompt,
             systemPrompt: iterationOptions.systemPrompt,
+            outputFormat: iterationOptions.outputFormat,
           });
           if (fenceDecision.applicable && fenceDecision.rerouted) {
             getLog().warn(

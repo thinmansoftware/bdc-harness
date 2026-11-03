@@ -60,6 +60,12 @@ export {
   type ScanOptions,
   type GitleaksResult,
 } from './openrouter-review-fence';
+export {
+  buildOpenRouterChatMessages,
+  serializeOpenRouterRequestContent,
+  type OpenRouterChatMessage,
+  type OpenRouterRequestContentOptions,
+} from './openrouter-request';
 
 // Error
 export { UnknownProviderError } from './errors';

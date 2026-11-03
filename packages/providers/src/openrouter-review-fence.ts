@@ -212,19 +212,34 @@ interface DiffLine {
 function flattenUnifiedDiff(diffText: string): DiffLine[] {
   const out: DiffLine[] = [];
   let currentFile = '<diff>';
+  // Old-side path from the most recent `--- a/path` header. A deleted file has
+  // `+++ /dev/null`, so its removed lines must be attributed to this path or
+  // the fixture-path tenant-slug check never sees them (Overseer f90adfec).
+  let oldSideFile: string | null = null;
   let newLineNo = 0;
   let oldLineNo = 0;
   const hunkRe = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
   for (const raw of diffText.split('\n')) {
+    if (raw.startsWith('diff --git ')) {
+      // diff --git a/old b/new -- start of a new file section.
+      const m = /^diff --git a\/(.+) b\/(.+)$/.exec(raw);
+      if (m?.[2]) currentFile = m[2];
+      oldSideFile = null;
+      out.push({ file: currentFile, line: 0, content: raw });
+      continue;
+    }
     if (raw.startsWith('+++ ')) {
-      // +++ b/path/to/file  (or +++ /dev/null)
+      // +++ b/path/to/file  (or +++ /dev/null for a deleted file)
       const path = raw.slice(4).replace(/^b\//, '').trim();
-      currentFile = path === '/dev/null' ? currentFile : path;
+      currentFile = path === '/dev/null' ? (oldSideFile ?? currentFile) : path;
       out.push({ file: currentFile, line: 0, content: raw });
       continue;
     }
     if (raw.startsWith('--- ')) {
-      out.push({ file: currentFile, line: 0, content: raw });
+      // --- a/path/to/file  (or --- /dev/null for an added file)
+      const path = raw.slice(4).replace(/^a\//, '').trim();
+      oldSideFile = path === '/dev/null' ? null : path;
+      out.push({ file: oldSideFile ?? currentFile, line: 0, content: raw });
       continue;
     }
     const hunk = hunkRe.exec(raw);
