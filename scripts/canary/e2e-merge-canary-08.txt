@@ -1,0 +1,5 @@
+E2E merge canary 08
+
+E2E_MERGE_CANARY_OK
+
+Canary run 2026-11-03 (WO-HARNESS-E2E-MERGE-CANARY-08) proves Test 1 (file present), Test 2 (the PR diff is exactly this file), and Test 3 (this dated marker) for a non-docs path under scripts/canary.
