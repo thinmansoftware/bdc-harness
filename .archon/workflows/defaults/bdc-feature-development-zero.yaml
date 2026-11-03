@@ -733,6 +733,8 @@ nodes:
 
       ## BDC Push Policy
       Hardcoded Rule 20 staging-gate repos:
+      - thinmansoftware/lspro-react
+      - thinmansoftware/shopops-storefront
       - thinmansoftware/shopops
 
       For those repos, use a feature branch plus PR and require the staging gate.
@@ -801,10 +803,14 @@ nodes:
         1. Scope creep -- any file not justified by the spec.
         2. Missing files -- in-scope work the plan omits.
         3. Unsafe assumptions -- "assume X exists" without verification.
-        4. Rule 20 staging gate -- if target repo is shopops (the API repo),
-           plan MUST require --base staging. Any other repo must NOT: lspro-react
-           and shopops-storefront have NO staging branch (verified 2026-07-07;
-           their PRs target the repo default branch).
+        4. Rule 20 staging gate -- if target repo is lspro-react / shopops-storefront /
+           shopops and the spec does not declare a `Base branch:`, plan MUST require
+           --base staging. A spec-declared PR base is self-authorizing: preserve it in
+           the approved plan as `base_authorized_by_spec: <branch-name>` and do not ask
+           for separate human authorization. You have no shell access and do not verify
+           branch existence here; decide-push-target verifies it and commit-and-push
+           fails closed before pushing when it is missing. If the repo is not one of
+           those three and no base is declared, the plan must NOT require staging.
         A repair-target declaration counts only when the first non-whitespace text on its line is the header `Repair target:`. A mention inside backticks, a table cell, prose, or a test description is not a declaration.
         4b. Repair target -- when the spec declares `Repair target: PR #N (branch X)`,
            parse REPAIR_TARGET and REPAIR_TARGET_BRANCH from the lane-verified repair-target record supplied above. When both the PR number and the branch
@@ -855,6 +861,8 @@ nodes:
         so emit it ONLY when PLAN_REVIEW_PASS=true.
 
         ## Escalation (emit instead of approving; do NOT emit the approved sentinel)
+        A spec-declared `Base branch:` on a Rule 20 repo is never, by itself, a valid
+        escalation reason. This does not weaken the separate crossing-into-staging gate.
         Asking whether an existing, spec-named PR is canonical or should be closed is
         never a valid escalation reason; apply the repair-target verification above.
         If the spec is ambiguous/contradictory, the fix needs a new side-effect class or
@@ -3971,6 +3979,8 @@ nodes:
       The target repo is where the PR must be opened (NOT the worktree's git origin - Rule 29).
 
       Match the extracted repo against this hardcoded staging-gate list:
+      - thinmansoftware/lspro-react
+      - thinmansoftware/shopops-storefront
       - thinmansoftware/shopops
 
       If the repo matches one of those entries, output:
