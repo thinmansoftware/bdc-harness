@@ -3,7 +3,7 @@
  * Provides conversation, codebase, and SSE streaming endpoints.
  */
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
-import { isInProcessServiceRequest } from './in-process-authority';
+import { IN_PROCESS_API_ORIGIN, isInProcessServiceRequest } from './in-process-authority';
 import { releaseWoClaim, takeOverWoClaimForResume } from '@archon/core/db/cascade-wo-claims';
 import { cascadeWoClaimDeps } from '../cascade/wo-claim';
 import { streamSSE } from 'hono/streaming';
@@ -7175,6 +7175,21 @@ export function registerApiRoutes(
           status: record.status,
           alreadyResolved: true,
         });
+      }
+      // Scoped out (WO-HARNESS-T3-FRONTIER-RESUME-TRANSPORT-01, bdc-xo issue 4410):
+      // a cascade fired by the T3 consumer runs over the in-process transport
+      // (apiBaseUrl = the in-process origin), which this resume path cannot carry
+      // yet. Refuse explicitly instead of firing against the synthetic host: no
+      // dispatch, the approval rolls back, and the WO claim stays retained.
+      if (record.frontierApproval.apiBaseUrl === IN_PROCESS_API_ORIGIN) {
+        await releaseFrontierClaim(cascadeId);
+        getLog().warn({ cascadeId, woId: record.woId }, 'frontier_approval_t3_resume_unsupported');
+        return apiError(
+          c,
+          409,
+          't3_frontier_resume_unsupported: resuming a T3-fired cascade is scoped to ' +
+            'WO-HARNESS-T3-FRONTIER-RESUME-TRANSPORT-01 (bdc-xo issue 4410); the approval was rolled back.'
+        );
       }
       const token =
         c.req.header('x-archon-operator-token') ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';

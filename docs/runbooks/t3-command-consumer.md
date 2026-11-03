@@ -218,6 +218,13 @@ curl -s -X POST http://localhost:3090/api/cascade-wo-claims/release -H "x-archon
 
 There is no time-based expiry.
 
+Known gap (scoped out): approving a frontier pause of a cascade the T3 consumer
+fired (its `apiBaseUrl` is the in-process origin) returns 409
+`t3_frontier_resume_unsupported` -- no dispatch, the approval rolls back, the WO
+claim stays retained. The fix is WO-HARNESS-T3-FRONTIER-RESUME-TRANSPORT-01
+(bdc-xo issue 4410). Until then an operator rejects the pause or releases the
+claim (above).
+
 Approve is ONE transaction on the reviewed gate (gate update + node_completed + approval_received; any failure rolls all three back): the consumer passes
 `node_id` to `approvePausedWorkflowRun`, which flips paused -> failed with a
 conditional update on (run id, paused, current gate node) BEFORE writing any

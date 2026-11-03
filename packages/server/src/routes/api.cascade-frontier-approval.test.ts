@@ -353,6 +353,24 @@ describe('POST /api/cascades/:id/approve-frontier', () => {
     expect(mockReleaseFrontierClaim).toHaveBeenCalledWith('cascade-1');
   });
 
+  test('a T3-fired cascade (in-process transport) is refused 409 t3_frontier_resume_unsupported', async () => {
+    mockReadCascadeRecordById.mockImplementationOnce(async () => ({
+      ...PAUSED_RECORD,
+      frontierApproval: {
+        ...PAUSED_RECORD.frontierApproval,
+        apiBaseUrl: 'http://archon.in-process',
+      },
+    }));
+    const callsBefore = mockResumeFrontierTier.mock.calls.length;
+    const res = await makeApp().request('/api/cascades/cascade-1/approve-frontier', {
+      method: 'POST',
+    });
+    expect(res.status).toBe(409);
+    expect(JSON.stringify(await res.json())).toContain('t3_frontier_resume_unsupported');
+    expect(mockResumeFrontierTier.mock.calls.length).toBe(callsBefore);
+    expect(mockReleaseFrontierClaim).toHaveBeenCalledWith('cascade-1');
+  });
+
   test('200 idempotent no-op when already resolved (no second fire)', async () => {
     mockReadCascadeRecordById.mockImplementationOnce(async () => PAUSED_RECORD);
     mockClaimFrontierResolution.mockImplementationOnce(async () => ({
