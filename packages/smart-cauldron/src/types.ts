@@ -237,8 +237,11 @@ export interface PollResult {
   prUrl: string | null;
   prMergeable: boolean | null;
   /**
-   * Head SHA this run pushed, when read from run metadata (`head_sha` or
-   * `pushed_head_sha`) or a `pushed_head=<40 hex>` event line. Null when absent.
+   * Head SHA this run pushed. Taken from a commit-and-push
+   * `VERIFIED: origin/<branch> == local HEAD (<40 hex>)` line, an
+   * `ORIGIN_PRECONDITION_OK: origin/<branch> == <40 hex>` line, or
+   * `pushed_head=<40 hex>`. Metadata `head_sha` / `pushed_head_sha` applies
+   * only when no event line is present. Null when absent.
    */
   runPushedHeadSha?: string | null;
   /**

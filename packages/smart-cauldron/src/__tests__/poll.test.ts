@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 
+import type { OpenWoPullRequest } from '../already-satisfied.js';
 import { PollTransportError, pollForTerminal } from '../poll.js';
 
 const originalFetch = globalThis.fetch;
@@ -184,5 +185,143 @@ describe('pollForTerminal isTransitionalStatus hook (T3 consumer approve hand-of
   test('without the hook (every existing caller), failed stays terminal', async () => {
     const result = await pollForTerminal({ ...base, fetchImpl: sequence() });
     expect(result.terminalStatus).toBe('failed');
+  });
+});
+
+describe('pollForTerminal pushed-head credit', () => {
+  const pushed = 'a'.repeat(40);
+  const other = 'b'.repeat(40);
+
+  function openPr(headSha: string, number = 7): OpenWoPullRequest {
+    return {
+      number,
+      headRefName: 'feat/wo-foo-01-thread-ab12cd34',
+      headSha,
+      url: `https://github.com/thinmansoftware/bdc-harness/pull/${String(number)}`,
+      createdAt: '2026-07-17T00:00:00Z',
+      isDraft: false,
+      isFork: false,
+      body: 'WO: WO-FOO-01\n',
+    };
+  }
+
+  function completed(events: unknown[]): Response {
+    return Response.json({
+      run: { id: 'run-pushed', status: 'completed', metadata: {} },
+      events,
+    });
+  }
+
+  /** The commit-and-push stdout every feature workflow already prints. */
+  function commitAndPushOutput(head: string): string {
+    return [
+      `previous HEAD was ${other} in the agent log`,
+      `VERIFIED: origin/feat/wo-foo-01-thread-ab12cd34 == local HEAD (${head})`,
+      'unique_branch=feat/wo-foo-01-thread-ab12cd34',
+    ].join('\n');
+  }
+
+  async function pollPushed(
+    events: unknown[],
+    opens: readonly OpenWoPullRequest[]
+  ): Promise<Awaited<ReturnType<typeof pollForTerminal>>> {
+    return pollForTerminal({
+      runId: 'run-pushed',
+      apiBaseUrl: 'http://archon.test',
+      timeoutMs: 60_000,
+      intervalMs: 1,
+      prRetryAttempts: 0,
+      prRetryDelayMs: 1,
+      prBranchLookupAttempts: 1,
+      prBranchLookupDelayMs: 1,
+      repo: 'thinmansoftware/bdc-harness',
+      woId: 'WO-FOO-01',
+      ghPrListForBranch: async (): Promise<string | null> => null,
+      checkPrMergeable: async (): Promise<boolean | null> => null,
+      fetchImpl: (async () => completed(events)) as unknown as typeof fetch,
+      listOpenWoPullRequests: async () => opens,
+    });
+  }
+
+  test('credits the SHA commit-and-push verified on origin', async () => {
+    const result = await pollPushed(
+      [
+        {
+          event_type: 'node_completed',
+          step_name: 'commit-and-push',
+          data: { node_output: commitAndPushOutput(pushed) },
+        },
+      ],
+      [openPr(pushed.toUpperCase())]
+    );
+
+    expect(result.prUrl).toBeNull();
+    expect(result.runPushedHeadSha).toBe(pushed);
+    expect(result.openWoPrHeadSha).toBe(pushed);
+  });
+
+  test('a later origin re-check replaces the earlier verified SHA', async () => {
+    const repushed = 'c'.repeat(40);
+    const result = await pollPushed(
+      [
+        {
+          event_type: 'node_completed',
+          step_name: 'commit-and-push',
+          data: { node_output: commitAndPushOutput(pushed) },
+        },
+        {
+          event_type: 'node_completed',
+          step_name: 'open-pr-if-needed',
+          data: {
+            node_output: `ORIGIN_PRECONDITION_OK: origin/feat/wo-foo-01-thread-ab12cd34 == ${repushed} (attempt 1)`,
+          },
+        },
+      ],
+      [openPr(repushed)]
+    );
+
+    expect(result.runPushedHeadSha).toBe(repushed);
+    expect(result.openWoPrHeadSha).toBe(repushed);
+  });
+
+  test('ignores a prose SHA and a non-unique or different open head', async () => {
+    const proseOnly = await pollPushed(
+      [
+        {
+          event_type: 'node_completed',
+          step_name: 'implement',
+          data: { node_output: `pushed something at ${pushed} then stopped` },
+        },
+      ],
+      [openPr(pushed)]
+    );
+    expect(proseOnly.runPushedHeadSha).toBeNull();
+    expect(proseOnly.openWoPrHeadSha).toBeNull();
+
+    const differed = await pollPushed(
+      [
+        {
+          event_type: 'node_completed',
+          step_name: 'commit-and-push',
+          data: { node_output: commitAndPushOutput(pushed) },
+        },
+      ],
+      [openPr(other)]
+    );
+    expect(differed.runPushedHeadSha).toBeNull();
+    expect(differed.openWoPrHeadSha).toBeNull();
+
+    const two = await pollPushed(
+      [
+        {
+          event_type: 'node_completed',
+          step_name: 'commit-and-push',
+          data: { node_output: commitAndPushOutput(pushed) },
+        },
+      ],
+      [openPr(pushed, 7), openPr(pushed, 8)]
+    );
+    expect(two.runPushedHeadSha).toBeNull();
+    expect(two.openWoPrHeadSha).toBeNull();
   });
 });

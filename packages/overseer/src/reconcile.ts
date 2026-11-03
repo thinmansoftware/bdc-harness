@@ -997,15 +997,27 @@ function headIsTargetRepo(
   );
 }
 
+/**
+ * Maximal WO stems in a branch ref. `wo-foo-01-extra-02` is one stem
+ * (WO-FOO-01-EXTRA-02), not also the prefix WO-FOO-01. A non-id suffix such as
+ * `-thread-<hash>` stays outside the stem, so `feat/wo-foo-01-thread-ab12cd34`
+ * still names WO-FOO-01. Case-insensitive.
+ */
+function woStemsNamedByBranch(headRefName: string): Set<string> {
+  const pattern = new RegExp(WO_STEM_PATTERN.source, 'gi');
+  const matches = headRefName.match(pattern) ?? [];
+  return new Set(matches.map(match => match.toUpperCase()));
+}
+
 /** First declared stem that the candidate's WO: line or head branch names. */
 function firstMatchedSupersedeStem(
   candidate: ReconcileRepoOpenPullRequest,
   stems: readonly string[]
 ): string | null {
   const declared = new Set(extractDeclaredWoStems(candidate.body ?? ''));
-  const head = candidate.headRefName.toLowerCase();
+  const namedByBranch = woStemsNamedByBranch(candidate.headRefName);
   for (const stem of stems) {
-    if (declared.has(stem) || (stem.length > 0 && head.includes(stem.toLowerCase()))) return stem;
+    if (declared.has(stem) || namedByBranch.has(stem)) return stem;
   }
   return null;
 }
