@@ -128,13 +128,21 @@ function makeProviders(sent: Sent[]) {
   });
 }
 
-function createMockStore(events: CapturedEvent[]): IWorkflowStore {
+interface RegisteredCodebase {
+  name: string;
+  repository_url: string | null;
+}
+
+function createMockStore(
+  events: CapturedEvent[],
+  codebase: RegisteredCodebase | null = null
+): IWorkflowStore {
   const run: WorkflowRun = {
     id: `run-${Math.random().toString(36).slice(2)}`,
     workflow_name: 'mock',
     conversation_id: 'conv-mock',
     parent_conversation_id: null,
-    codebase_id: null,
+    codebase_id: codebase ? 'cb-1' : null,
     status: 'running',
     user_message: 'msg',
     metadata: {},
@@ -186,7 +194,9 @@ function createMockStore(events: CapturedEvent[]): IWorkflowStore {
     ),
     listWorkflowEvents: mock(() => Promise.resolve([])),
     getCompletedDagNodeOutputs: mock(() => Promise.resolve(new Map<string, string>())),
-    getCodebase: mock(() => Promise.resolve(null)),
+    getCodebase: mock(() =>
+      Promise.resolve(codebase ? { id: 'cb-1', default_cwd: repoDir, ...codebase } : null)
+    ),
     getCodebaseEnvVars: mock(() => Promise.resolve({})),
   } as unknown as IWorkflowStore;
 }
@@ -230,21 +240,44 @@ beforeAll(async () => {
   await writeFile(join(repoDir, 'src.ts'), 'export const answer = 42;\n');
   git('add', '.');
   git('commit', '-q', '-m', 'clean change');
+
+  // Same shape, but NO origin remote: identity must come from run metadata.
+  noOriginDir = join(tmpdir(), `orfence-noorigin-${Math.random().toString(36).slice(2)}`);
+  await mkdir(noOriginDir, { recursive: true });
+  const g = (...args: string[]): void => {
+    execFileSync('git', ['-C', noOriginDir, ...args], { stdio: 'ignore' });
+  };
+  execFileSync('git', ['init', '-q', '-b', 'main', noOriginDir], { stdio: 'ignore' });
+  g('config', 'user.email', 'test@example.com');
+  g('config', 'user.name', 'test');
+  g('config', 'commit.gpgsign', 'false');
+  await writeFile(join(noOriginDir, 'README.md'), 'base\n');
+  g('add', '.');
+  g('commit', '-q', '-m', 'base');
+  g('checkout', '-q', '-b', 'feature');
+  await writeFile(join(noOriginDir, 'src.ts'), 'export const answer = 42;\n');
+  g('add', '.');
+  g('commit', '-q', '-m', 'clean change');
 });
+let noOriginDir: string;
 afterAll(async () => {
   if (savedSlugs === undefined) delete process.env.OPENROUTER_FENCE_TENANT_SLUGS;
   else process.env.OPENROUTER_FENCE_TENANT_SLUGS = savedSlugs;
   await rm(repoDir, { recursive: true, force: true }).catch(() => {});
+  await rm(noOriginDir, { recursive: true, force: true }).catch(() => {});
 });
 beforeEach(() => {
   clearOpenRouterDiffScanCache();
   promptScans.length = 0;
 });
 
-async function runNode(node: DagNode): Promise<{ sent: Sent[]; events: CapturedEvent[] }> {
+async function runNode(
+  node: DagNode,
+  opts: { cwd?: string; codebase?: RegisteredCodebase } = {}
+): Promise<{ sent: Sent[]; events: CapturedEvent[] }> {
   const events: CapturedEvent[] = [];
   const sent: Sent[] = [];
-  const store = createMockStore(events);
+  const store = createMockStore(events, opts.codebase ?? null);
   const deps: WorkflowDeps = {
     store,
     getAgentProvider: makeProviders(sent) as unknown as WorkflowDeps['getAgentProvider'],
@@ -260,7 +293,7 @@ async function runNode(node: DagNode): Promise<{ sent: Sent[]; events: CapturedE
     deps,
     createMockPlatform(),
     'conv',
-    repoDir,
+    opts.cwd ?? repoDir,
     { name: 'fence-dispatch', nodes: [node] },
     run,
     'opr',
@@ -396,5 +429,75 @@ describe('OpenRouter fence on the loop-node dispatch path', () => {
     expect(promptScans[0]).toBe(sent[0]?.transmitted ?? '<missing>');
     expect(promptScans[0]).toContain('Reviewer persona.');
     expect(scanEvents(events)[0]?.data.verdict).toBe('clean');
+  });
+});
+
+describe('OpenRouter fence repository identity (fail closed)', () => {
+  const reviewNode = {
+    id: 'diff-review',
+    prompt: 'Review the change.',
+    provider: 'opr',
+    model: 'deepseek/deepseek-v4-pro',
+    systemPrompt: 'You are a careful code reviewer.',
+    allowed_tools: [],
+    failover_provider: 'codex',
+  } as DagNode;
+
+  it('unknown origin + no run metadata -> rerouted off OpenRouter with the decision event', async () => {
+    const { sent, events } = await runNode(reviewNode, { cwd: noOriginDir });
+
+    expect(sent.some(s => s.provider === 'opr')).toBe(false);
+    expect(sent.map(s => s.provider)).toEqual(['codex']);
+    const ev = scanEvents(events);
+    expect(ev).toHaveLength(1);
+    expect(ev[0]?.data.verdict).toBe('scan_unavailable');
+    expect(ev[0]?.data.reason).toBe('repo_identity_unresolved');
+    expect(ev[0]?.data.routed_provider).toBe('codex');
+  });
+
+  it('run metadata says a customer repo while origin is missing -> scanned and pinned', async () => {
+    const { sent, events } = await runNode(reviewNode, {
+      cwd: noOriginDir,
+      codebase: {
+        name: 'lspro-react',
+        repository_url: 'https://github.com/thinmansoftware/lspro-react',
+      },
+    });
+
+    expect(sent.map(s => s.provider)).toEqual(['opr']);
+    expect(sent[0]?.options?.openrouterPrivacyPin).toBe(true);
+    expect(promptScans).toHaveLength(1);
+    expect(promptScans[0]).toBe(sent[0]?.transmitted ?? '<missing>');
+    const ev = scanEvents(events);
+    expect(ev).toHaveLength(1);
+    expect(ev[0]?.data.verdict).toBe('clean');
+    expect(ev[0]?.data.repo).toBe('thinmansoftware/lspro-react');
+  });
+
+  it('run metadata wins over the checkout origin: internal codebase on a customer-origin checkout is not fenced', async () => {
+    const { sent, events } = await runNode(reviewNode, {
+      cwd: repoDir,
+      codebase: {
+        name: 'bdc-harness',
+        repository_url: 'https://github.com/thinmansoftware/bdc-harness',
+      },
+    });
+    expect(sent.map(s => s.provider)).toEqual(['opr']);
+    expect(scanEvents(events)).toHaveLength(0);
+  });
+
+  it('a known internal repo still goes to OpenRouter, unscanned and unpinned', async () => {
+    const { sent, events } = await runNode(reviewNode, {
+      cwd: noOriginDir,
+      codebase: {
+        name: 'bdc-harness',
+        repository_url: 'https://github.com/thinmansoftware/bdc-harness',
+      },
+    });
+
+    expect(sent.map(s => s.provider)).toEqual(['opr']);
+    expect(sent[0]?.options?.openrouterPrivacyPin).toBeFalsy();
+    expect(promptScans).toHaveLength(0);
+    expect(scanEvents(events)).toHaveLength(0);
   });
 });

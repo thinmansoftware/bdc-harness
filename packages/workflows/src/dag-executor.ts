@@ -753,6 +753,34 @@ export interface OpenRouterFenceParams {
 }
 
 /**
+ * Resolve the repository identity the fence keys on, as an owner/repo slug.
+ * Order: (1) trusted run metadata -- the harness-registered codebase of this
+ * run (repository_url, else a name already in owner/repo form); (2) the
+ * checkout's git origin. Returns null when neither yields a slug; the caller
+ * fails closed on null.
+ */
+export async function resolveFenceRepoIdentity(
+  deps: WorkflowDeps,
+  workflowRun: WorkflowRun,
+  cwd: string,
+  probes: Pick<FenceGitProbes, 'resolveRemote'>
+): Promise<string | null> {
+  const codebaseId = workflowRun.codebase_id;
+  if (codebaseId) {
+    try {
+      const codebase = await deps.store.getCodebase(codebaseId);
+      const fromMetadata =
+        normalizeRepoSlug(codebase?.repository_url) ?? normalizeRepoSlug(codebase?.name);
+      if (fromMetadata) return fromMetadata;
+    } catch {
+      // fall through to the origin lookup
+    }
+  }
+  const remote = await probes.resolveRemote(cwd).catch(() => null);
+  return normalizeRepoSlug(remote);
+}
+
+/**
  * Run the review fence for a single (possibly rerouted) node/iteration entry.
  * Returns a decision the caller applies: reroute the provider/model (and drop
  * the OpenRouter persona), or keep OpenRouter and set the privacy pin.
@@ -793,9 +821,16 @@ export async function applyOpenRouterReviewFence(
     ...params.gitProbes,
   };
 
-  const remote = await probes.resolveRemote(cwd).catch(() => null);
-  if (!isCustomerRepo(remote)) return notApplicable;
-  const repoSlug = normalizeRepoSlug(remote) ?? remote ?? '';
+  // Repository identity -- FAIL CLOSED (Overseer 45ebb830). Trusted run
+  // metadata first (the codebase registered in the harness for this run), the
+  // checkout's git origin only as a fallback. An OpenRouter route whose repo
+  // identity cannot be resolved is treated as scan_unavailable and rerouted;
+  // rerouting a non-customer repo with unresolvable identity is the accepted
+  // cost (XO decision 2026-11-03).
+  const identity = await resolveFenceRepoIdentity(deps, workflowRun, cwd, probes);
+  if (identity !== null && !isCustomerRepo(identity)) return notApplicable;
+  const identityUnresolved = identity === null;
+  const repoSlug = identity ?? '<unresolved>';
 
   const tenantSlugs = params.tenantSlugs ?? parseTenantSlugsFromEnv();
   const scanText =
@@ -807,7 +842,12 @@ export async function applyOpenRouterReviewFence(
   let reason = '';
   const hits: ScanHit[] = [];
 
-  if (resolveProviderId(provider) === OPENROUTER_TOOL_LOOP_PROVIDER_ID) {
+  if (identityUnresolved) {
+    // Cannot tell whether this is a customer repo -> cannot prove the request
+    // is safe to send. Reroute and record the decision.
+    verdict = 'scan_unavailable';
+    reason = 'repo_identity_unresolved';
+  } else if (resolveProviderId(provider) === OPENROUTER_TOOL_LOOP_PROVIDER_ID) {
     // The tool-loop seat reads files under cwd and sends tool results to
     // OpenRouter AFTER this gate runs, so no pre-send scan can cover what it
     // transmits. Always reroute on a customer repo.
