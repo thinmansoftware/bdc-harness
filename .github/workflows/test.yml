@@ -47,6 +47,9 @@ jobs:
       - name: GitHub service command and credential routing regressions
         run: bun test --timeout 30000 ./scripts/github-service-exec.test.ts packages/overseer/src/__tests__/github-command-durable-metering.test.ts ./scripts/github-service-token.test.ts ./scripts/container/gh-merge-guard.test.ts ./scripts/container/docker-entrypoint-app-helper.test.ts ./scripts/container/docker-entrypoint-safe-directory.test.ts ./scripts/github-service-login.test.ts
 
+      - name: Host cleanup deletion guards
+        run: bun test --timeout 30000 ./scripts/host/cleanup-guards.test.ts
+
       - name: Zero-tier fences and first-10 measurement (Spec Stop 6)
         run: bun run test:zero-tier-fences
 
