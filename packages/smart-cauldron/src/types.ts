@@ -181,9 +181,12 @@ export interface CascadeRunRecord {
   /**
    * Populated when the cascade stopped blocked for a teardown/checkout reason
    * (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01): 'checkout_failed_no_climb' or
-   * 'teardown_unconfirmed'.
+   * 'teardown_unconfirmed'; or when a cascade whose entry tier has a
+   * maxClimbsByEntry limit reached that limit and stopped instead of firing
+   * another rung (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01 fence 3):
+   * 'climb_limit_reached'.
    */
-  blockedReason?: 'checkout_failed_no_climb' | 'teardown_unconfirmed';
+  blockedReason?: 'checkout_failed_no_climb' | 'teardown_unconfirmed' | 'climb_limit_reached';
   supervisorRecovery?: {
     ownerId: string;
     fencingToken: number;
