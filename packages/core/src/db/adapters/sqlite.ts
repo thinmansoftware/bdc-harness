@@ -1391,6 +1391,10 @@ export class SqliteAdapter implements IDatabase {
         -- WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065 parity)
         ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', 1),
         ('pr-review-log', 'PR review receipt log', 'drain_on_start', 1),
+        -- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 067 parity): the
+        -- cauldron-fire command consumer mailbox and the t3-bridge VPS sender.
+        ('cauldron-fire', 'T3 command consumer', 'drain_on_start', 1),
+        ('t3-bridge', 'T3 VPS bridge sender', 'drain_on_start', 1),
         ('operator', 'Operator', 'drain_on_start', 1),
         ('xo', 'XO', 'drain_on_start', 1),
         ('board', 'Board', 'alias_resolved', 1),
@@ -2726,6 +2730,81 @@ export class SqliteAdapter implements IDatabase {
         CHECK (state <> 'admitted' OR admitted_at IS NOT NULL)
       );
       CREATE INDEX IF NOT EXISTS idx_tm_fire_admissions_day ON tm_fire_admissions(utc_day,state);
+
+      -- Durable T3 command admission ledger (migration 067,
+      -- WO-HARNESS-T3-COMMAND-CONSUMER-01). Hand-maintained mirror of
+      -- migrations/067_t3_command_consumer.sql. Keyed by request_id; rows are
+      -- never deleted so request + run identity survive after completion.
+      CREATE TABLE IF NOT EXISTS t3_command_admissions (
+        request_id TEXT PRIMARY KEY,
+        actor_principal_id TEXT NOT NULL,
+        verb TEXT NOT NULL CHECK (verb IN ('fire','cancel-own','approve')),
+        payload_sha256 TEXT NOT NULL,
+        wo_id TEXT,
+        project TEXT,
+        target_run_id TEXT,
+        pr_ref TEXT,
+        head_sha TEXT,
+        thread_id TEXT,
+        source_message_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('reserved','admitted','refused','unknown')),
+        status_code INTEGER,
+        code TEXT,
+        cascade_id TEXT,
+        run_id TEXT,
+        reply_message_id TEXT,
+        effect_started_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      -- WO fire lock: at most one unresolved (reserved or unknown) fire per WO;
+      -- an unknown fire holds it until operator adjudication (migration 067).
+      DROP INDEX IF EXISTS idx_t3_command_admissions_live_fire;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
+        ON t3_command_admissions(wo_id) WHERE verb = 'fire' AND state IN ('reserved', 'unknown');
+      -- Amendment 5 A5.0: ONE shared WO claim for every in-process cascade caller
+      -- (Taskmaster and the T3 consumer), held through every tier until terminal.
+      CREATE TABLE IF NOT EXISTS cascade_wo_claims (
+        wo_id TEXT NOT NULL,
+        project TEXT NOT NULL,
+        cascade_id TEXT NOT NULL,
+        holder TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'released')),
+        claimed_at TEXT NOT NULL,
+        released_at TEXT,
+        retained_reason TEXT,
+        run_ids_json TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_cascade_wo_claims_active
+        ON cascade_wo_claims (wo_id)
+        WHERE state = 'active';
+
+      -- Amendment 5 A5.7: the consumer ticks only while holding this lease.
+      CREATE TABLE IF NOT EXISTS t3_consumer_lease (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        holder TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+
+      -- Amendment 5 A5.12: failed processing attempts per command row.
+      CREATE TABLE IF NOT EXISTS t3_command_attempts (
+        message_id TEXT PRIMARY KEY,
+        attempts INTEGER NOT NULL,
+        last_error TEXT,
+        updated_at TEXT NOT NULL
+      );
+      -- Run custody: every run a fire admission's cascade creates (migration 067).
+      CREATE TABLE IF NOT EXISTS t3_command_run_custody (
+        admission_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        tier TEXT,
+        discovered_at TEXT NOT NULL,
+        UNIQUE (run_id)
+      );
+      -- Run lock: one unresolved cancel-own / approve per target run (migration 067).
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_run_lock
+        ON t3_command_admissions(target_run_id)
+        WHERE verb IN ('cancel-own', 'approve') AND state IN ('reserved', 'unknown');
 
       -- Per-service GitHub API usage and latest quota state (migration 062).
       CREATE TABLE IF NOT EXISTS github_api_usage (
