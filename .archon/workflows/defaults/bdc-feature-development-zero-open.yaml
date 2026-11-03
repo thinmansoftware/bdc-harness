@@ -815,10 +815,14 @@ nodes:
         1. Scope creep -- any file not justified by the spec.
         2. Missing files -- in-scope work the plan omits.
         3. Unsafe assumptions -- "assume X exists" without verification.
-        4. Rule 20 staging gate -- if target repo is shopops (the API repo),
-           plan MUST require --base staging. Any other repo must NOT: lspro-react
-           and shopops-storefront have NO staging branch (verified 2026-07-07;
-           their PRs target the repo default branch).
+        4. Rule 20 staging gate -- if target repo is lspro-react / shopops-storefront /
+           shopops and the spec does not declare a `Base branch:`, plan MUST require
+           --base staging. A spec-declared PR base is self-authorizing: preserve it in
+           the approved plan as `base_authorized_by_spec: <branch-name>` and do not ask
+           for separate human authorization. You have no shell access and do not verify
+           branch existence here; decide-push-target verifies it and commit-and-push
+           fails closed before pushing when it is missing. If the repo is not one of
+           those three and no base is declared, the plan must NOT require staging.
         A repair-target declaration counts only when the first non-whitespace text on its line is the header `Repair target:`. A mention inside backticks, a table cell, prose, or a test description is not a declaration.
         4b. Repair target -- when the spec declares `Repair target: PR #N (branch X)`,
            parse REPAIR_TARGET and REPAIR_TARGET_BRANCH from the lane-verified repair-target record supplied above. When both the PR number and the branch
