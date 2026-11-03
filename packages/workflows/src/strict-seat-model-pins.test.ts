@@ -223,7 +223,7 @@ describe('strict seat model pins', () => {
         file: 'bdc-feature-development-codex.yaml',
         provider: 'codex',
         model: 'gpt-6.1-sol',
-        // Plan left the Claude seat for Codex gpt-6.1-terra.
+        // Plan runs the Claude-free -opr persona on Codex gpt-6.1-terra.
         plan: { provider: 'codex', model: 'gpt-6.1-terra' },
         implement: { provider: 'codex', model: 'gpt-6.1-sol' },
       },

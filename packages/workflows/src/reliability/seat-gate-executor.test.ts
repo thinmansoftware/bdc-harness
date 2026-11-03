@@ -195,13 +195,15 @@ describe('executor seat gate', () => {
     }));
     setSeatCutoffOverride(90);
     const { result, store } = await runWorkflow();
-    expect(result.success).toBe(false);
-    expect(result.error).toBe('seat_usage_refused:codex:primary:95:90:lane=seat-gate-wf:role=node');
+    // WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01: the over-cutoff codex node seat is
+    // rerouted to claude (headroom) instead of refusing the run.
+    expect(result.error ?? '').not.toContain('seat_usage_refused');
     const events = store.createWorkflowEvent.mock.calls.map(
       call =>
         call[0] as {
           event_type: string;
-          data: { reason?: string };
+          step_name?: string;
+          data: { reason?: string; to_provider?: string };
         }
     );
     expect(
@@ -209,14 +211,10 @@ describe('executor seat gate', () => {
         event =>
           event.event_type === 'dag_workflow_failed' && event.data.reason === 'seat_usage_refused'
       )
-    ).toBe(true);
-    expect(store.failWorkflowRun).toHaveBeenCalled();
-    expect(
-      warnings.some(
-        entry => entry.msg === 'workflow.seat_usage_refused' && entry.obj.seat === 'codex'
-      )
-    ).toBe(true);
-    expect(prompts.filter(prompt => prompt !== 'Reply with exactly: OK')).toEqual([]);
+    ).toBe(false);
+    const rerouted = events.filter(event => event.event_type === 'node_failover');
+    expect(rerouted.map(event => event.step_name)).toEqual(['b']);
+    expect(rerouted[0]?.data.to_provider).toBe('claude');
   });
 
   test('default cutoff 90 refuses a seat at 91 and names it', async () => {
@@ -262,18 +260,15 @@ describe('executor seat gate', () => {
       codex: reading('codex', 'primary', 95),
     }));
     const { result, store } = await runWorkflow();
-    expect(result.success).toBe(false);
-    expect(result.error).toBe('seat_usage_refused:codex:primary:95:90:lane=seat-gate-wf:role=node');
-    expect(eventTypes(store)).toContain('dag_workflow_failed');
-    expect(eventTypes(store)).not.toContain('workflow_started');
+    // The unmeasured claude seat is an admissible reroute target, so the run is
+    // no longer refused (WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01); the UNKNOWN
+    // diagnostics must still fire.
+    expect(result.error ?? '').not.toContain('seat_usage_refused');
+    expect(eventTypes(store)).not.toContain('dag_workflow_failed');
+    expect(eventTypes(store)).toContain('node_failover');
     expect(
       warnings.some(
         entry => entry.msg === 'workflow.seat_usage_unknown' && entry.obj.seat === 'claude'
-      )
-    ).toBe(true);
-    expect(
-      warnings.some(
-        entry => entry.msg === 'workflow.seat_usage_refused' && entry.obj.seat === 'codex'
       )
     ).toBe(true);
     expect(alerts).toHaveLength(1);

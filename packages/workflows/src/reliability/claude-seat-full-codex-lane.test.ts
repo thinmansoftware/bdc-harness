@@ -145,7 +145,9 @@ test('claudeSeatFullCodexLaneRuns', () => {
 
   const manifest = codex.nodes.find(node => node.id === 'build-manifest');
   if (!manifest) throw new Error('missing build-manifest');
-  expect(Object.hasOwn(manifest, 'provider')).toBe(false);
+  // build-manifest keeps provider: codex with the Claude-free major-build-opr
+  // persona (WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01); it carries no model pin.
+  expect((manifest as { provider?: string }).provider).toBe('codex');
   expect(Object.hasOwn(manifest, 'model')).toBe(false);
 
   expect(codexGate.decision.refused).toBe(false);
