@@ -345,6 +345,8 @@ test('tracker REST lookup uses healthy core while Search is exhausted', async ()
     number: 501,
     title: trackerStem,
     state: 'open',
+    // The fixture row carries no created_at, so the pre-tracker guard has no time to use.
+    createdAt: null,
   });
   expect(calls).toHaveLength(1);
   expect(new URL(calls[0]!.url).pathname).toBe('/repos/thinmansoftware/bdc-xo/issues');
