@@ -20,6 +20,7 @@ import type {
   TokenUsage,
 } from '../../types';
 import { getOpenRouterXaiRefusal } from '../../openrouter-guard';
+import { isNoPrivateEndpointError } from '../../openrouter-review-fence';
 import { GROK_AGENT_CAPABILITIES } from './capabilities';
 import { parseGrokAgentConfig } from './config';
 import { executeGrokTool, GROK_AGENT_TOOLS } from './tools';
@@ -116,19 +117,35 @@ export class GrokAgentProvider implements IAgentProvider {
     let finalText = '';
 
     for (let turn = 0; turn < this.maxTurns; turn++) {
+      // OpenRouter privacy pin (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01):
+      // restrict routing to no-training / zero-retention providers. The
+      // OpenRouter API accepts a top-level `provider` body field the OpenAI SDK
+      // params type does not model, so it is attached via a cast; the SDK
+      // serializes unknown body fields verbatim.
+      const createBody: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming & {
+        provider?: { data_collection: 'deny'; zdr: true };
+      } = {
+        model: resolvedModel,
+        messages,
+        tools: GROK_AGENT_TOOLS,
+        tool_choice: 'auto',
+      };
+      if (options?.openrouterPrivacyPin) {
+        createBody.provider = { data_collection: 'deny', zdr: true };
+      }
+
       let completion: OpenAI.Chat.Completions.ChatCompletion;
       try {
-        completion = await client.chat.completions.create(
-          {
-            model: resolvedModel,
-            messages,
-            tools: GROK_AGENT_TOOLS,
-            tool_choice: 'auto',
-          },
-          { signal: options?.abortSignal }
-        );
+        completion = await client.chat.completions.create(createBody, {
+          signal: options?.abortSignal,
+        });
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
+        // Privacy pin set + no compliant endpoint -> fail closed. Never retry
+        // without the pin; the executor reroutes to a non-OpenRouter seat.
+        if (options?.openrouterPrivacyPin && isNoPrivateEndpointError(msg)) {
+          throw new Error(`openrouter_no_private_endpoint: ${msg}`);
+        }
         throw new Error(`Grok/OpenRouter request failed: ${msg}`);
       }
 

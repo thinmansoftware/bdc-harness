@@ -104,6 +104,20 @@ function success(content = 'ok'): Generator<Chunk, void, unknown> {
     yield { type: 'result', sessionId: 'sess' };
   })();
 }
+// A pinned OpenRouter request that found no zero-retention / no-training
+// endpoint: the client fails closed with the openrouter_no_private_endpoint
+// marker (never an unpinned retry). Surfaced here as an SDK error result so the
+// loop executor raises it exactly as a real provider would.
+function noPrivateEndpointFailure(): Generator<Chunk, void, unknown> {
+  return (function* () {
+    yield {
+      type: 'result',
+      isError: true,
+      errorSubtype: 'no_private_endpoint',
+      errors: ['openrouter_no_private_endpoint: No endpoints found matching your data policy'],
+    };
+  })();
+}
 
 const CAPS_CLAUDE = () => ({
   execution: { text: true, repositoryRead: true, repositoryWrite: true, shell: true },
@@ -200,7 +214,10 @@ function createMockStore(
     workflow_name: 'mock',
     conversation_id: 'conv-mock',
     parent_conversation_id: null,
-    codebase_id: null,
+    // A registered internal (non-customer) codebase: the OpenRouter review
+    // fence resolves repo identity from this run metadata and stays out of the
+    // way. Without an identity the fence fails closed and reroutes.
+    codebase_id: 'cb-internal',
     status: 'running',
     user_message: 'msg',
     metadata: {},
@@ -246,7 +263,14 @@ function createMockStore(
     }),
     listWorkflowEvents: mock(() => Promise.resolve([])),
     getCompletedDagNodeOutputs: mock(() => Promise.resolve(new Map<string, string>())),
-    getCodebase: mock(() => Promise.resolve(null)),
+    getCodebase: mock(() =>
+      Promise.resolve({
+        id: 'cb-internal',
+        name: 'thinmansoftware/bdc-harness',
+        repository_url: 'https://github.com/thinmansoftware/bdc-harness',
+        default_cwd: '/tmp/x',
+      })
+    ),
     getCodebaseEnvVars: mock(() => Promise.resolve({})),
   } as unknown as IWorkflowStore;
 }
@@ -421,6 +445,41 @@ describe('node-level availability failover (prompt node)', () => {
     expect(result.calls.claude).toBe(1);
     expect(result.calls.codex).toBe(1);
     expect(result.events.some(event => event.event_type === 'node_failover')).toBe(true);
+  });
+
+  it('reroutes a loop node off OpenRouter when a pinned request has no private endpoint', async () => {
+    // A text-only review loop pinned to an OpenRouter seat. The pinned request
+    // finds no zero-retention endpoint and fails closed. The loop must reroute
+    // to its declared non-OpenRouter failover and record an openrouter_diff_scan
+    // event -- not fail the loop (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01).
+    const node = {
+      id: 'review-loop',
+      loop: { prompt: 'Review.', until: 'COMPLETE', max_iterations: 1 },
+      provider: 'opr',
+      model: 'deepseek/deepseek-v4-pro',
+      allowed_tools: [], // text-only: an OpenRouter text seat may execute it
+      failover_provider: 'codex',
+    } as DagNode;
+    const result = await runNode(
+      node,
+      {
+        opr: noPrivateEndpointFailure,
+        codex: () => success('COMPLETE'),
+      },
+      config,
+      'opr'
+    );
+
+    // Primary pinned seat tried once, then the whole loop reran on the
+    // non-OpenRouter seat -- never an unpinned retry on OpenRouter.
+    expect(result.calls.opr).toBe(1);
+    expect(result.calls.codex).toBe(1);
+    // The reroute decision is recorded as an openrouter_diff_scan event.
+    expect(result.events.some(e => e.event_type === 'openrouter_diff_scan')).toBe(true);
+    // The loop ultimately completes on the rerouted seat.
+    expect(
+      result.events.some(e => e.event_type === 'node_completed' && e.step_name === node.id)
+    ).toBe(true);
   });
 
   it('routes loop quota exhaustion through the same declared failover path', async () => {
