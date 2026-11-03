@@ -3,6 +3,9 @@
  * Provides conversation, codebase, and SSE streaming endpoints.
  */
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
+import { IN_PROCESS_API_ORIGIN, isInProcessServiceRequest } from './in-process-authority';
+import { releaseWoClaim, takeOverWoClaimForResume } from '@archon/core/db/cascade-wo-claims';
+import { cascadeWoClaimDeps } from '../cascade/wo-claim';
 import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
@@ -2975,6 +2978,392 @@ async function loadSelectedDispatchMessages(
   };
 }
 
+// WO-HARNESS-T3-COMMAND-CONSUMER-01: run-action primitives shared by the HTTP
+// routes below (behavior unchanged) and the cauldron-fire command consumer.
+// Each returns a discriminated result; the caller maps it to an HTTP response
+// or a Dispatch reply. DB errors throw and are handled by the caller's catch,
+// preserving the routes' existing 500 behavior.
+
+export type CancelWorkflowRunActorResult =
+  | { ok: true; run: WorkflowRun }
+  | { ok: false; status: 400 | 404 | 409 | 422; message: string };
+
+/**
+ * Status-gated cancel used by POST /api/workflows/runs/:runId/cancel (actor
+ * 'api') and the consumer's cancel-own (actor = the principal id). The status
+ * checks, error codes, and the run_cancelled event shape are identical to the
+ * original route body.
+ */
+export async function cancelWorkflowRunAsActor(
+  runId: string,
+  opts: { reason?: string; actor: string }
+): Promise<CancelWorkflowRunActorResult> {
+  const run = await workflowDb.getWorkflowRun(runId);
+  if (!run) {
+    return { ok: false, status: 404, message: 'Workflow run not found' };
+  }
+  if (run.status === 'cancelled') {
+    return { ok: false, status: 409, message: 'Workflow run is already cancelled' };
+  }
+  if (run.status === 'completed' || run.status === 'failed') {
+    return { ok: false, status: 422, message: `Cannot cancel workflow in '${run.status}' status` };
+  }
+  if (run.status !== 'running' && run.status !== 'pending' && run.status !== 'paused') {
+    return { ok: false, status: 400, message: `Cannot cancel workflow in '${run.status}' status` };
+  }
+  const reason = opts.reason?.trim()
+    ? opts.reason
+    : 'API cancellation requested; caller did not supply a reason';
+  await workflowDb.cancelWorkflowRun(runId);
+  // A5.10 (WO-HARNESS-T3-COMMAND-CONSUMER-01): the run_cancelled event is durable
+  // before cancel returns ok, so the consumer's recovery can prove the cancel.
+  await workflowEventDb.createWorkflowEvent({
+    workflow_run_id: runId,
+    event_type: 'run_cancelled',
+    data: { reason, actor: opts.actor },
+  });
+  const updated = await workflowDb.getWorkflowRun(runId);
+  const updatedRun = updated ?? {
+    ...run,
+    status: 'cancelled' as const,
+    completed_at: new Date(),
+  };
+  return { ok: true, run: updatedRun };
+}
+
+/**
+ * The web adapter registered by registerApiRoutes. tryAutoResumeRun (hoisted
+ * to module level so the cauldron-fire consumer's approve can use the same
+ * resume path as the HTTP approve route; WO-HARNESS-T3-COMMAND-CONSUMER-01
+ * Amendment 2 A2.1) dispatches the resumed execution through it.
+ */
+let registeredWebAdapter: WebAdapter | null = null;
+
+export function workflowRunTaskClass(run: WorkflowRun): string | undefined {
+  const rawTaskClass = run.metadata.task_class ?? run.metadata.taskClass;
+  if (typeof rawTaskClass !== 'string') return undefined;
+  const taskClass = rawTaskClass.trim();
+  return taskClass.length > 0 ? taskClass : undefined;
+}
+
+/**
+ * Re-enter the workflow executor directly after a paused approval gate is
+ * resolved, so a web-dispatched workflow continues (approve) or runs its
+ * on_reject prompt (reject) without the user having to re-run the workflow
+ * command. The CLI's `workflowApproveCommand` / `workflowRejectCommand`
+ * already auto-resume via `workflowRunCommand({ resume: true })`; this is the
+ * web-side equivalent without going back through the natural-language
+ * orchestrator.
+ *
+ * Returns `true` when a resume dispatch was initiated, `false` otherwise (no
+ * worker conversation on the run, parent conversation deleted, parent was on
+ * a non-web platform, workflow definition missing, or executor launch threw).
+ * Failures are non-fatal: the gate
+ * decision is recorded regardless; when this returns `false` the response
+ * text instructs the user to re-run the workflow command.
+ *
+ * **Cross-adapter guard**: only web-sourced parents qualify.
+ * `dispatchToOrchestrator` is wired to the web adapter + its lock manager,
+ * so a Slack / Telegram / GitHub / Discord run being approved from the
+ * dashboard must not route through it -- the Slack thread would never see
+ * the resumed output. Non-web parents skip auto-resume and the originating
+ * platform's own re-run flow applies.
+ */
+export async function tryAutoResumeRun(
+  run: WorkflowRun,
+  action: 'approve' | 'reject' | 'provider_wait'
+): Promise<boolean> {
+  const adapter = registeredWebAdapter;
+  if (!adapter) return false;
+  if (!run.parent_conversation_id) return false;
+  if (!run.conversation_id || !run.working_path) return false;
+  // Literal event names per action -- greppable for ops tooling. Keeping the
+  // branch explicit rather than templating avoids the earlier 3-segment
+  // `api.workflow_*.dispatched` shape that broke `{domain}.{action}_{state}`.
+  const events =
+    action === 'approve'
+      ? {
+          dispatched: 'api.workflow_approve_auto_resume_dispatched' as const,
+          skippedNoPlatformConv:
+            'api.workflow_approve_auto_resume_skipped_no_platform_conv' as const,
+          skippedNonWebParent: 'api.workflow_approve_auto_resume_skipped_non_web_parent' as const,
+          failed: 'api.workflow_approve_auto_resume_failed' as const,
+          missingWorker: 'api.workflow_approve_auto_resume_skipped_no_worker_conv' as const,
+          missingWorkflow: 'api.workflow_approve_auto_resume_skipped_missing_workflow' as const,
+          executorStarted: 'api.workflow_approve_direct_resume_started' as const,
+          executorFailed: 'api.workflow_approve_direct_resume_failed' as const,
+        }
+      : action === 'reject'
+        ? {
+            dispatched: 'api.workflow_reject_auto_resume_dispatched' as const,
+            skippedNoPlatformConv:
+              'api.workflow_reject_auto_resume_skipped_no_platform_conv' as const,
+            skippedNonWebParent: 'api.workflow_reject_auto_resume_skipped_non_web_parent' as const,
+            failed: 'api.workflow_reject_auto_resume_failed' as const,
+            missingWorker: 'api.workflow_reject_auto_resume_skipped_no_worker_conv' as const,
+            missingWorkflow: 'api.workflow_reject_auto_resume_skipped_missing_workflow' as const,
+            executorStarted: 'api.workflow_reject_direct_resume_started' as const,
+            executorFailed: 'api.workflow_reject_direct_resume_failed' as const,
+          }
+        : {
+            dispatched: 'api.provider_wait_auto_resume_dispatched' as const,
+            skippedNoPlatformConv:
+              'api.provider_wait_auto_resume_skipped_no_platform_conv' as const,
+            skippedNonWebParent: 'api.provider_wait_auto_resume_skipped_non_web_parent' as const,
+            failed: 'api.provider_wait_auto_resume_failed' as const,
+            missingWorker: 'api.provider_wait_auto_resume_skipped_no_worker_conv' as const,
+            missingWorkflow: 'api.provider_wait_auto_resume_skipped_missing_workflow' as const,
+            executorStarted: 'api.provider_wait_direct_resume_started' as const,
+            executorFailed: 'api.provider_wait_direct_resume_failed' as const,
+          };
+  try {
+    const parentConv = await conversationDb.getConversationById(run.parent_conversation_id);
+    const workerConv = await conversationDb.getConversationById(run.conversation_id);
+    const platformConvId = parentConv?.platform_conversation_id;
+    if (!platformConvId) {
+      // parentConv === null is a data-integrity signal (the parent
+      // conversation was deleted while the run was paused) -- worth
+      // surfacing at info level so operators notice. Missing
+      // platform_conversation_id on an existing row shouldn't happen and
+      // stays at debug.
+      const logFn =
+        parentConv === null ? getLog().info.bind(getLog()) : getLog().debug.bind(getLog());
+      logFn(
+        {
+          runId: run.id,
+          parentConversationId: run.parent_conversation_id,
+          parentDeleted: parentConv === null,
+        },
+        events.skippedNoPlatformConv
+      );
+      return false;
+    }
+    if (parentConv.platform_type !== 'web') {
+      getLog().debug(
+        {
+          runId: run.id,
+          parentConversationId: run.parent_conversation_id,
+          platformType: parentConv.platform_type,
+        },
+        events.skippedNonWebParent
+      );
+      return false;
+    }
+    const workerPlatformConvId = workerConv?.platform_conversation_id;
+    if (!workerConv || !workerPlatformConvId || workerConv.platform_type !== 'web') {
+      getLog().warn(
+        {
+          runId: run.id,
+          workerConversationId: run.conversation_id,
+          workerPlatformType: workerConv?.platform_type,
+        },
+        events.missingWorker
+      );
+      return false;
+    }
+
+    const resolvedWorkflowName =
+      (await resolveWebLane({
+        workflowName: run.workflow_name.trim() || undefined,
+        task_class: workflowRunTaskClass(run),
+        routerYamlPath: join(run.working_path, 'config', 'router.yaml'),
+      })) ?? run.workflow_name;
+
+    const discovery = await discoverWorkflowsWithConfig(run.working_path, loadConfig);
+    const workflow = discovery.workflows.find(
+      item => item.workflow.name === resolvedWorkflowName
+    )?.workflow;
+    if (!workflow) {
+      getLog().warn(
+        {
+          runId: run.id,
+          workflowName: resolvedWorkflowName,
+          workingPath: run.working_path,
+          loaderErrors: discovery.errors,
+        },
+        events.missingWorkflow
+      );
+      return false;
+    }
+
+    adapter.setConversationDbId(workerPlatformConvId, workerConv.id);
+    const unsubscribeBridge = adapter.setupEventBridge(workerPlatformConvId, platformConvId);
+    const execution =
+      action === 'provider_wait'
+        ? executeWorkflow(
+            createWorkflowDeps(),
+            adapter,
+            workerPlatformConvId,
+            run.working_path,
+            workflow,
+            run.user_message ?? '',
+            workerConv.id,
+            run.codebase_id ?? undefined,
+            undefined,
+            undefined,
+            parentConv.id,
+            run
+          )
+        : executeWorkflow(
+            createWorkflowDeps(),
+            adapter,
+            workerPlatformConvId,
+            run.working_path,
+            workflow,
+            run.user_message ?? '',
+            workerConv.id,
+            run.codebase_id ?? undefined,
+            undefined,
+            undefined,
+            parentConv.id
+          );
+    void execution
+      .then(result => {
+        if (result.success && 'summary' in result && result.summary) {
+          return adapter.sendMessage(platformConvId, result.summary, {
+            category: 'workflow_result',
+            segment: 'new',
+            workflowResult: {
+              workflowName: resolvedWorkflowName,
+              runId: run.id,
+            },
+          });
+        }
+        return undefined;
+      })
+      .catch(err => {
+        getLog().warn({ err: err as Error, runId: run.id }, events.executorFailed);
+      })
+      .finally(() => {
+        unsubscribeBridge();
+      });
+    getLog().info(
+      { runId: run.id, workflowName: resolvedWorkflowName, platformConvId, workerPlatformConvId },
+      events.executorStarted
+    );
+    return true;
+  } catch (err) {
+    getLog().warn({ err: err as Error, runId: run.id }, events.failed);
+    return false;
+  }
+}
+
+export type ApprovePausedWorkflowRunResult =
+  | { ok: true; kind: 'approved'; workflowName: string; autoResumed: boolean }
+  | { ok: true; kind: 'already_approved'; workflowName: string }
+  | { ok: false; status: 400 | 404 | 409; message: string };
+
+/**
+ * Approve a paused run used by POST /api/workflows/runs/:runId/approve and the
+ * consumer's approve. Preserves the idempotent already-approved path and the
+ * node_completed / approval_received event shape. `autoResume` is injected:
+ * the route AND the consumer both pass tryAutoResumeRun(run, 'approve') -- the
+ * real resume path. The run row's `failed` status written below is the
+ * hand-off to that resume, not an outcome.
+ */
+export async function approvePausedWorkflowRun(
+  runId: string,
+  opts: {
+    comment: string;
+    decisionVerb: 'approve_as_is' | 'approve_with_fix';
+    authorizedFixIds: string[];
+    autoResume: (run: WorkflowRun) => Promise<boolean>;
+    /**
+     * The gate node the approver reviewed (the cauldron-fire consumer passes
+     * it). When set, the paused -> failed hand-off is ONE conditional update on
+     * (run id, paused, this gate) BEFORE any approval event is written; a gate
+     * that changed meanwhile is refused 409 `gate_changed` with no events. The
+     * HTTP route does not pass it and keeps its original write order.
+     */
+    expectedNodeId?: string;
+  }
+): Promise<ApprovePausedWorkflowRunResult> {
+  const run = await workflowDb.getWorkflowRun(runId);
+  if (!run) {
+    getLog().info({ runId }, 'api.workflow_run_approve_not_found');
+    return { ok: false, status: 404, message: 'Workflow run not found' };
+  }
+  const priorResponse = run.metadata.approval_response as string | undefined;
+  if (run.status !== 'paused') {
+    if (priorResponse === 'approved') {
+      getLog().info(
+        { runId, status: run.status },
+        'api.workflow_run_approve_idempotent_already_approved'
+      );
+      return { ok: true, kind: 'already_approved', workflowName: run.workflow_name };
+    }
+    getLog().info({ runId, status: run.status }, 'api.workflow_run_approve_rejected_bad_status');
+    return { ok: false, status: 400, message: `Cannot approve workflow in '${run.status}' status` };
+  }
+  const comment = opts.comment;
+  const decisionVerb = opts.decisionVerb;
+  const authorizedFixIds = opts.authorizedFixIds;
+  const approval = run.metadata.approval as ApprovalContext | undefined;
+  if (!approval?.nodeId) {
+    getLog().warn({ runId }, 'api.workflow_run_approve_missing_context');
+    return {
+      ok: false,
+      status: 400,
+      message: 'Workflow run is paused but missing approval context',
+    };
+  }
+  const gateMetadataUpdate =
+    approval.type === 'interactive_loop'
+      ? { loop_user_input: opts.comment }
+      : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
+  const approvalEvents: { event_type: string; step_name: string; data: Record<string, unknown> }[] =
+    [];
+  if (approval.type !== 'interactive_loop') {
+    const nodeOutput =
+      approval.captureResponse === true
+        ? JSON.stringify({
+            decision_verb: decisionVerb,
+            authorized_fix_ids: authorizedFixIds,
+            comment,
+          })
+        : '';
+    approvalEvents.push({
+      event_type: 'node_completed',
+      step_name: approval.nodeId,
+      data: { node_output: nodeOutput, approval_decision: 'approved' },
+    });
+  }
+  approvalEvents.push({
+    event_type: 'approval_received',
+    step_name: approval.nodeId,
+    data: { decision: 'approved', comment },
+  });
+  if (opts.expectedNodeId !== undefined) {
+    // Consumer path: gate CAS + approval events in ONE transaction.
+    const gateHeld =
+      approval.nodeId === opts.expectedNodeId &&
+      (await workflowDb.approvePausedRunAtGate(
+        runId,
+        opts.expectedNodeId,
+        gateMetadataUpdate,
+        approvalEvents
+      ));
+    if (!gateHeld) {
+      getLog().info(
+        { runId, expected: opts.expectedNodeId },
+        'api.workflow_run_approve_gate_changed'
+      );
+      return { ok: false, status: 409, message: 'gate_changed' };
+    }
+  } else {
+    // HTTP route: original write order, unchanged.
+    for (const event of approvalEvents) {
+      await workflowEventDb.createWorkflowEvent({ workflow_run_id: runId, ...event });
+    }
+    await workflowDb.updateWorkflowRun(runId, {
+      status: 'failed',
+      metadata: gateMetadataUpdate,
+    });
+  }
+  const autoResumed = await opts.autoResume(run);
+  return { ok: true, kind: 'approved', workflowName: run.workflow_name, autoResumed };
+}
+
 /**
  * Register all /api/* routes on the Hono app.
  */
@@ -2986,6 +3375,7 @@ export function registerApiRoutes(
   canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot,
   dispatchMailboxActorResolvedHook?: () => Promise<void>
 ): void {
+  registeredWebAdapter = webAdapter;
   const dispatchPrincipalTransportCredentials = new WeakMap<Request, DispatchPrincipalCredential>();
 
   // The readings route refs this component instead of validating with it.
@@ -3319,13 +3709,6 @@ export function registerApiRoutes(
     return [...nodes.values()].slice(0, 8);
   }
 
-  function workflowRunTaskClass(run: WorkflowRun): string | undefined {
-    const rawTaskClass = run.metadata.task_class ?? run.metadata.taskClass;
-    if (typeof rawTaskClass !== 'string') return undefined;
-    const taskClass = rawTaskClass.trim();
-    return taskClass.length > 0 ? taskClass : undefined;
-  }
-
   async function sanitizeWorkflowRunForPublic(run: WorkflowRun): Promise<{
     workflow_label: string;
     status: WorkflowRun['status'];
@@ -3386,6 +3769,12 @@ export function registerApiRoutes(
 
   app.use('/api/*', async (c, next) => {
     if (c.req.method === 'OPTIONS' || isPublicApiPath(c.req.path)) {
+      return next();
+    }
+
+    // The server's own in-process caller (createInProcessApiFetch). Unforgeable
+    // from the network: only in-process code can add a Request to this set.
+    if (isInProcessServiceRequest(c.req.raw)) {
       return next();
     }
 
@@ -3824,207 +4213,6 @@ export function registerApiRoutes(
     }
 
     return { accepted: true, status: result.status };
-  }
-
-  /**
-   * Re-enter the workflow executor directly after a paused approval gate is
-   * resolved, so a web-dispatched workflow continues (approve) or runs its
-   * on_reject prompt (reject) without the user having to re-run the workflow
-   * command. The CLI's `workflowApproveCommand` / `workflowRejectCommand`
-   * already auto-resume via `workflowRunCommand({ resume: true })`; this is the
-   * web-side equivalent without going back through the natural-language
-   * orchestrator.
-   *
-   * Returns `true` when a resume dispatch was initiated, `false` otherwise (no
-   * worker conversation on the run, parent conversation deleted, parent was on
-   * a non-web platform, workflow definition missing, or executor launch threw).
-   * Failures are non-fatal: the gate
-   * decision is recorded regardless; when this returns `false` the response
-   * text instructs the user to re-run the workflow command.
-   *
-   * **Cross-adapter guard**: only web-sourced parents qualify.
-   * `dispatchToOrchestrator` is wired to the web adapter + its lock manager,
-   * so a Slack / Telegram / GitHub / Discord run being approved from the
-   * dashboard must not route through it -- the Slack thread would never see
-   * the resumed output. Non-web parents skip auto-resume and the originating
-   * platform's own re-run flow applies.
-   */
-  async function tryAutoResumeRun(
-    run: WorkflowRun,
-    action: 'approve' | 'reject' | 'provider_wait'
-  ): Promise<boolean> {
-    if (!run.parent_conversation_id) return false;
-    if (!run.conversation_id || !run.working_path) return false;
-    // Literal event names per action -- greppable for ops tooling. Keeping the
-    // branch explicit rather than templating avoids the earlier 3-segment
-    // `api.workflow_*.dispatched` shape that broke `{domain}.{action}_{state}`.
-    const events =
-      action === 'approve'
-        ? {
-            dispatched: 'api.workflow_approve_auto_resume_dispatched' as const,
-            skippedNoPlatformConv:
-              'api.workflow_approve_auto_resume_skipped_no_platform_conv' as const,
-            skippedNonWebParent: 'api.workflow_approve_auto_resume_skipped_non_web_parent' as const,
-            failed: 'api.workflow_approve_auto_resume_failed' as const,
-            missingWorker: 'api.workflow_approve_auto_resume_skipped_no_worker_conv' as const,
-            missingWorkflow: 'api.workflow_approve_auto_resume_skipped_missing_workflow' as const,
-            executorStarted: 'api.workflow_approve_direct_resume_started' as const,
-            executorFailed: 'api.workflow_approve_direct_resume_failed' as const,
-          }
-        : action === 'reject'
-          ? {
-              dispatched: 'api.workflow_reject_auto_resume_dispatched' as const,
-              skippedNoPlatformConv:
-                'api.workflow_reject_auto_resume_skipped_no_platform_conv' as const,
-              skippedNonWebParent:
-                'api.workflow_reject_auto_resume_skipped_non_web_parent' as const,
-              failed: 'api.workflow_reject_auto_resume_failed' as const,
-              missingWorker: 'api.workflow_reject_auto_resume_skipped_no_worker_conv' as const,
-              missingWorkflow: 'api.workflow_reject_auto_resume_skipped_missing_workflow' as const,
-              executorStarted: 'api.workflow_reject_direct_resume_started' as const,
-              executorFailed: 'api.workflow_reject_direct_resume_failed' as const,
-            }
-          : {
-              dispatched: 'api.provider_wait_auto_resume_dispatched' as const,
-              skippedNoPlatformConv:
-                'api.provider_wait_auto_resume_skipped_no_platform_conv' as const,
-              skippedNonWebParent: 'api.provider_wait_auto_resume_skipped_non_web_parent' as const,
-              failed: 'api.provider_wait_auto_resume_failed' as const,
-              missingWorker: 'api.provider_wait_auto_resume_skipped_no_worker_conv' as const,
-              missingWorkflow: 'api.provider_wait_auto_resume_skipped_missing_workflow' as const,
-              executorStarted: 'api.provider_wait_direct_resume_started' as const,
-              executorFailed: 'api.provider_wait_direct_resume_failed' as const,
-            };
-    try {
-      const parentConv = await conversationDb.getConversationById(run.parent_conversation_id);
-      const workerConv = await conversationDb.getConversationById(run.conversation_id);
-      const platformConvId = parentConv?.platform_conversation_id;
-      if (!platformConvId) {
-        // parentConv === null is a data-integrity signal (the parent
-        // conversation was deleted while the run was paused) -- worth
-        // surfacing at info level so operators notice. Missing
-        // platform_conversation_id on an existing row shouldn't happen and
-        // stays at debug.
-        const logFn =
-          parentConv === null ? getLog().info.bind(getLog()) : getLog().debug.bind(getLog());
-        logFn(
-          {
-            runId: run.id,
-            parentConversationId: run.parent_conversation_id,
-            parentDeleted: parentConv === null,
-          },
-          events.skippedNoPlatformConv
-        );
-        return false;
-      }
-      if (parentConv.platform_type !== 'web') {
-        getLog().debug(
-          {
-            runId: run.id,
-            parentConversationId: run.parent_conversation_id,
-            platformType: parentConv.platform_type,
-          },
-          events.skippedNonWebParent
-        );
-        return false;
-      }
-      const workerPlatformConvId = workerConv?.platform_conversation_id;
-      if (!workerConv || !workerPlatformConvId || workerConv.platform_type !== 'web') {
-        getLog().warn(
-          {
-            runId: run.id,
-            workerConversationId: run.conversation_id,
-            workerPlatformType: workerConv?.platform_type,
-          },
-          events.missingWorker
-        );
-        return false;
-      }
-
-      const resolvedWorkflowName =
-        (await resolveWebLane({
-          workflowName: run.workflow_name.trim() || undefined,
-          task_class: workflowRunTaskClass(run),
-          routerYamlPath: join(run.working_path, 'config', 'router.yaml'),
-        })) ?? run.workflow_name;
-
-      const discovery = await discoverWorkflowsWithConfig(run.working_path, loadConfig);
-      const workflow = discovery.workflows.find(
-        item => item.workflow.name === resolvedWorkflowName
-      )?.workflow;
-      if (!workflow) {
-        getLog().warn(
-          {
-            runId: run.id,
-            workflowName: resolvedWorkflowName,
-            workingPath: run.working_path,
-            loaderErrors: discovery.errors,
-          },
-          events.missingWorkflow
-        );
-        return false;
-      }
-
-      webAdapter.setConversationDbId(workerPlatformConvId, workerConv.id);
-      const unsubscribeBridge = webAdapter.setupEventBridge(workerPlatformConvId, platformConvId);
-      const execution =
-        action === 'provider_wait'
-          ? executeWorkflow(
-              createWorkflowDeps(),
-              webAdapter,
-              workerPlatformConvId,
-              run.working_path,
-              workflow,
-              run.user_message ?? '',
-              workerConv.id,
-              run.codebase_id ?? undefined,
-              undefined,
-              undefined,
-              parentConv.id,
-              run
-            )
-          : executeWorkflow(
-              createWorkflowDeps(),
-              webAdapter,
-              workerPlatformConvId,
-              run.working_path,
-              workflow,
-              run.user_message ?? '',
-              workerConv.id,
-              run.codebase_id ?? undefined,
-              undefined,
-              undefined,
-              parentConv.id
-            );
-      void execution
-        .then(result => {
-          if (result.success && 'summary' in result && result.summary) {
-            return webAdapter.sendMessage(platformConvId, result.summary, {
-              category: 'workflow_result',
-              segment: 'new',
-              workflowResult: {
-                workflowName: resolvedWorkflowName,
-                runId: run.id,
-              },
-            });
-          }
-          return undefined;
-        })
-        .catch(err => {
-          getLog().warn({ err: err as Error, runId: run.id }, events.executorFailed);
-        })
-        .finally(() => {
-          unsubscribeBridge();
-        });
-      getLog().info(
-        { runId: run.id, workflowName: resolvedWorkflowName, platformConvId, workerPlatformConvId },
-        events.executorStarted
-      );
-      return true;
-    } catch (err) {
-      getLog().warn({ err: err as Error, runId: run.id }, events.failed);
-      return false;
-    }
   }
 
   if (process.env.NODE_ENV !== 'test' && providerWaitSchedulerTimer === undefined) {
@@ -6897,40 +7085,15 @@ export function registerApiRoutes(
   registerOpenApiRoute(cancelWorkflowRunRoute, async c => {
     try {
       const runId = c.req.param('runId') ?? '';
-      const run = await workflowDb.getWorkflowRun(runId);
-      if (!run) {
-        return apiError(c, 404, 'Workflow run not found');
-      }
-      if (run.status === 'cancelled') {
-        return apiError(c, 409, 'Workflow run is already cancelled');
-      }
-      if (run.status === 'completed' || run.status === 'failed') {
-        return apiError(c, 422, `Cannot cancel workflow in '${run.status}' status`);
-      }
-      if (run.status !== 'running' && run.status !== 'pending' && run.status !== 'paused') {
-        return apiError(c, 400, `Cannot cancel workflow in '${run.status}' status`);
-      }
       const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
-      const reason =
-        typeof body.reason === 'string' && body.reason.trim()
-          ? body.reason
-          : 'API cancellation requested; caller did not supply a reason';
-      await workflowDb.cancelWorkflowRun(runId);
-      void workflowEventDb.createWorkflowEvent({
-        workflow_run_id: runId,
-        event_type: 'run_cancelled',
-        data: { reason, actor: 'api' },
-      });
-      const updated = await workflowDb.getWorkflowRun(runId);
-      const updatedRun = updated ?? {
-        ...run,
-        status: 'cancelled' as const,
-        completed_at: new Date().toISOString(),
-      };
+      const result = await cancelWorkflowRunAsActor(runId, { reason: body.reason, actor: 'api' });
+      if (!result.ok) {
+        return apiError(c, result.status, result.message);
+      }
       return c.json({
         success: true,
-        message: `Cancelled workflow: ${run.workflow_name}`,
-        run: updatedRun,
+        message: `Cancelled workflow: ${result.run.workflow_name}`,
+        run: result.run,
       });
     } catch (error) {
       getLog().error({ err: error }, 'cancel_workflow_run_api_failed');
@@ -7013,6 +7176,21 @@ export function registerApiRoutes(
           alreadyResolved: true,
         });
       }
+      // Scoped out (WO-HARNESS-T3-FRONTIER-RESUME-TRANSPORT-01, bdc-xo issue 4410):
+      // a cascade fired by the T3 consumer runs over the in-process transport
+      // (apiBaseUrl = the in-process origin), which this resume path cannot carry
+      // yet. Refuse explicitly instead of firing against the synthetic host: no
+      // dispatch, the approval rolls back, and the WO claim stays retained.
+      if (record.frontierApproval.apiBaseUrl === IN_PROCESS_API_ORIGIN) {
+        await releaseFrontierClaim(cascadeId);
+        getLog().warn({ cascadeId, woId: record.woId }, 'frontier_approval_t3_resume_unsupported');
+        return apiError(
+          c,
+          409,
+          't3_frontier_resume_unsupported: resuming a T3-fired cascade is scoped to ' +
+            'WO-HARNESS-T3-FRONTIER-RESUME-TRANSPORT-01 (bdc-xo issue 4410); the approval was rolled back.'
+        );
+      }
       const token =
         c.req.header('x-archon-operator-token') ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
       // Resume in the background; return once the resumed record is durable so
@@ -7025,6 +7203,15 @@ export function registerApiRoutes(
       const resumePromise = resumeFrontierTier(record, {
         token,
         onAdmission: r => resolveAdmission?.(r),
+        // WO-HARNESS-T3-COMMAND-CONSUMER-01: the resumed cascade holds the shared
+        // database WO claim, taken over from the paused cascade BEFORE dispatch.
+        deps: { ...cascadeWoClaimDeps('frontier-resume') },
+        beforeDispatch: async input =>
+          takeOverWoClaimForResume({
+            ...input,
+            holder: 'frontier-resume',
+            now: new Date().toISOString(),
+          }),
       });
       void resumePromise.catch((error: unknown) => {
         getLog().error(
@@ -7033,7 +7220,22 @@ export function registerApiRoutes(
         );
       });
       // Race so a synchronous resume failure surfaces as 500 instead of hanging.
-      const admitted = await Promise.race([admission, resumePromise]);
+      let admitted: Awaited<ReturnType<typeof resumeFrontierTier>>;
+      try {
+        admitted = await Promise.race([admission, resumePromise]);
+      } catch (error) {
+        if ((error as Error | null)?.name !== 'FrontierResumeClaimError') throw error;
+        // Another cascade holds the WO claim: nothing fired. Roll the approval
+        // back so the operator can retry once it clears.
+        await releaseFrontierClaim(cascadeId);
+        getLog().warn({ cascadeId, woId: record.woId }, 'frontier_approval_resume_claim_held');
+        return apiError(
+          c,
+          409,
+          `Frontier resume for ${record.woId} could not take over the WO claim: another cascade holds it. ` +
+            'The approval was rolled back -- retry once it clears.'
+        );
+      }
       // A 'blocked' admission means the resumed cascade refused to fire because a
       // duplicate live cascade already holds the WO lock (smart-cauldron
       // acquireWoLock): nothing fired, no premium usage was spent, and the paused
@@ -7418,108 +7620,35 @@ export function registerApiRoutes(
   registerOpenApiRoute(approveWorkflowRunRoute, async c => {
     const runId = c.req.param('runId') ?? '';
     try {
-      const run = await workflowDb.getWorkflowRun(runId);
-      if (!run) {
-        // WO-MC-APPROVE-GATE-RELIABILITY-01: log early-returns. The 2026-06-09
-        // onramp incident left an 8-minute gap with no server-side trace of the
-        // first click. Logging here turns "did the click arrive?" from a guess
-        // into a fact in the archon logs.
-        getLog().info({ runId }, 'api.workflow_run_approve_not_found');
-        return apiError(c, 404, 'Workflow run not found');
-      }
-      // WO-MC-APPROVE-GATE-RELIABILITY-01: idempotency. Users re-click Approve
-      // when the UI looks stuck. Once the gate is approved the route flips the
-      // run to the 'failed' auto-resume sentinel and sets
-      // metadata.approval_response='approved'. A second click then hit the
-      // status!=='paused' guard and got a confusing 400 -- indistinguishable
-      // from a real failure. Recognize the already-approved state and report
-      // success without writing a duplicate approval_received or re-mutating
-      // the run. Only standard approvals carry approval_response; interactive
-      // loops do not, so they fall through to the normal paused-only path.
-      const priorResponse = run.metadata.approval_response as string | undefined;
-      if (run.status !== 'paused') {
-        if (priorResponse === 'approved') {
-          getLog().info(
-            { runId, status: run.status },
-            'api.workflow_run_approve_idempotent_already_approved'
-          );
-          return c.json({
-            success: true,
-            message: `Workflow already approved: ${run.workflow_name}.`,
-          });
-        }
-        getLog().info(
-          { runId, status: run.status },
-          'api.workflow_run_approve_rejected_bad_status'
-        );
-        return apiError(c, 400, `Cannot approve workflow in '${run.status}' status`);
-      }
       // Validate via the route schema so an invalid decision_verb is rejected with
       // 400 BEFORE anything is persisted. The OpenAPI defaultHook (validationErrorHook)
       // returns 400 on a Zod failure before this handler runs; Zod also applies the
       // .default('approve_as_is') so decision_verb is always a valid enum value here.
       const body = getValidatedBody(c, approveWorkflowRunBodySchema);
-      const comment = body.comment ?? 'Approved';
-      const decisionVerb = body.decision_verb; // schema default already applied
-      const authorizedFixIds = body.authorized_fix_ids ?? [];
-      const approval = run.metadata.approval as ApprovalContext | undefined;
-      if (!approval?.nodeId) {
-        getLog().warn({ runId }, 'api.workflow_run_approve_missing_context');
-        return apiError(c, 400, 'Workflow run is paused but missing approval context');
+      // Auto-resume: dispatch to the orchestrator so the workflow continues
+      // without requiring the user to re-run the workflow command. Mirrors what
+      // `workflowApproveCommand` does in the CLI. Requires parent_conversation_id
+      // and a web-platform parent (guarded in the helper).
+      const result = await approvePausedWorkflowRun(runId, {
+        comment: body.comment ?? 'Approved',
+        decisionVerb: body.decision_verb, // schema default already applied
+        authorizedFixIds: body.authorized_fix_ids ?? [],
+        autoResume: run => tryAutoResumeRun(run, 'approve'),
+      });
+      if (!result.ok) {
+        return apiError(c, result.status, result.message);
       }
-      // For interactive loops, do NOT write node_completed -- the executor writes it when
-      // the AI emits the completion signal (actual loop exit). Writing it here would cause
-      // the resume to skip the loop node entirely via priorCompletedNodes.
-      if (approval.type !== 'interactive_loop') {
-        // Design A: persist the graded decision verb + authorized fix ids INTO the
-        // captured node_output as JSON, so the DAG when: evaluator can route on
-        // $<gate>.output.decision_verb with no evaluator change. When the gate did not
-        // capture a response, keep node_output empty (legacy binary contract).
-        const nodeOutput =
-          approval.captureResponse === true
-            ? JSON.stringify({
-                decision_verb: decisionVerb,
-                authorized_fix_ids: authorizedFixIds,
-                comment,
-              })
-            : '';
-        await workflowEventDb.createWorkflowEvent({
-          workflow_run_id: runId,
-          event_type: 'node_completed',
-          step_name: approval.nodeId,
-          data: { node_output: nodeOutput, approval_decision: 'approved' },
+      if (result.kind === 'already_approved') {
+        return c.json({
+          success: true,
+          message: `Workflow already approved: ${result.workflowName}.`,
         });
       }
-      await workflowEventDb.createWorkflowEvent({
-        workflow_run_id: runId,
-        event_type: 'approval_received',
-        step_name: approval.nodeId,
-        data: { decision: 'approved', comment },
-      });
-      // For interactive loops, store user input; for standard approvals, mark as approved
-      // and clear any rejection state.
-      const metadataUpdate =
-        approval.type === 'interactive_loop'
-          ? { loop_user_input: comment }
-          : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
-      await workflowDb.updateWorkflowRun(runId, {
-        status: 'failed',
-        metadata: metadataUpdate,
-      });
-
-      // Auto-resume: dispatch to the orchestrator so the workflow continues
-      // without requiring the user to re-run the workflow command. Mirrors
-      // what `workflowApproveCommand` does in the CLI. Requires
-      // `parent_conversation_id` on the run (set by orchestrator-agent for any
-      // web-dispatched workflow -- foreground, interactive, and background via
-      // the pre-created run) and a web-platform parent (guarded in the helper).
-      const autoResumed = await tryAutoResumeRun(run, 'approve');
-
       return c.json({
         success: true,
-        message: autoResumed
-          ? `Workflow approved: ${run.workflow_name}. Resuming workflow.`
-          : `Workflow approved: ${run.workflow_name}. Send a message to continue.`,
+        message: result.autoResumed
+          ? `Workflow approved: ${result.workflowName}. Resuming workflow.`
+          : `Workflow approved: ${result.workflowName}. Send a message to continue.`,
       });
     } catch (error) {
       getLog().error({ err: error, runId }, 'api.workflow_run_approve_failed');
@@ -7782,6 +7911,32 @@ export function registerApiRoutes(
       getLog().error({ err: error }, 'workflow_run_by_worker_lookup_failed');
       return apiError(c, 500, 'Failed to look up workflow run');
     }
+  });
+
+  // POST /api/cascade-wo-claims/release -- operator release of a RETAINED shared
+  // WO claim (WO-HARNESS-T3-COMMAND-CONSUMER-01). Behind the /api operator auth;
+  // dispatch principals are refused by the middleware (not a transport route).
+  // CAS on (wo_id, cascade_id, active): only the named holder's claim is released.
+  app.post('/api/cascade-wo-claims/release', async c => {
+    let body: { woId?: unknown; cascadeId?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return apiError(c, 400, 'invalid_body');
+    }
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      return apiError(c, 400, 'invalid_body');
+    }
+    if (typeof body.woId !== 'string' || typeof body.cascadeId !== 'string') {
+      return apiError(c, 400, 'woId and cascadeId are required');
+    }
+    const released = await releaseWoClaim({
+      woId: body.woId,
+      cascadeId: body.cascadeId,
+      now: new Date().toISOString(),
+    });
+    getLog().info({ woId: body.woId, cascadeId: body.cascadeId, released }, 'api.wo_claim_release');
+    return c.json({ released });
   });
 
   // GET /api/workflows/runs/:runId - Get run details with events
