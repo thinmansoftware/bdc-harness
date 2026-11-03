@@ -53,7 +53,7 @@ is_abandoned() {
   # The worktree's .git points at a container path, so git runs in the container.
   # If git cannot answer (container down, broken worktree), keep it.
   local st
-  st=$(docker exec -u appuser "$CONTAINER" git -C "$CWT_ROOT/$suffix" status --porcelain 2>/dev/null) || { echo "git-status-failed"; return 1; }
+  st=$(docker exec -u appuser "$CONTAINER" git -C "$CWT_ROOT/$suffix" status --porcelain --untracked-files=all 2>/dev/null) || { echo "git-status-failed"; return 1; }
   [ -z "$st" ] || { echo "uncommitted-changes"; return 1; }
   return 0
 }
