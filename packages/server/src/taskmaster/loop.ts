@@ -65,6 +65,7 @@ import {
   type CascadeEvidenceDeps,
 } from './expectations';
 import { canonicalizeThreadRef } from './thread-ref';
+import { cascadeWoClaimDeps } from '../cascade/wo-claim';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -2489,7 +2490,10 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             project: custody.identity.project,
             dispatchId: custody.identity.cascadeId,
             token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
-            deps: { seatUsage: conductorSeatUsage },
+            // Amendment 5 A5.0 (WO-HARNESS-T3-COMMAND-CONSUMER-01): the shared
+            // database WO claim, so a Taskmaster cascade and a T3 consumer
+            // cascade can never run the same WO at once.
+            deps: { seatUsage: conductorSeatUsage, ...cascadeWoClaimDeps('taskmaster') },
             beforeAdmission: async () => {
               guardAttempted = true;
               const decision = await fireBudget.authorizeAutomaticFire({
