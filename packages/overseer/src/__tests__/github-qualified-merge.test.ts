@@ -124,11 +124,16 @@ describe('real GitHub deps', () => {
       checks: {
         listForRef: async () => ({
           data: {
+            // findPullRequest now keeps only the latest attempt per check name
+            // and app, so each run carries its own name and id, as GitHub's do.
+            // A stale earlier attempt of "lint" must not count.
             check_runs: [
-              { status: 'completed', conclusion: 'success' },
-              { status: 'completed', conclusion: 'neutral' },
-              { status: 'completed', conclusion: 'failure' },
-              { status: 'in_progress', conclusion: null },
+              { id: 1, name: 'lint', status: 'completed', conclusion: 'failure' },
+              { id: 2, name: 'build', status: 'completed', conclusion: 'success' },
+              { id: 3, name: 'docs', status: 'completed', conclusion: 'neutral' },
+              { id: 4, name: 'unit', status: 'completed', conclusion: 'failure' },
+              { id: 5, name: 'e2e', status: 'in_progress', conclusion: null },
+              { id: 6, name: 'lint', status: 'completed', conclusion: 'success' },
             ],
           },
         }),
@@ -162,7 +167,7 @@ describe('real GitHub deps', () => {
     expect(result).toMatchObject({
       exists: true,
       state: 'open',
-      checks: { total: 4, passed: 2, failed: 1, pending: 1 },
+      checks: { total: 5, passed: 3, failed: 1, pending: 1 },
       pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
     });
   });

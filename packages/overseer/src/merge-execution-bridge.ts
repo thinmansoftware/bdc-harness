@@ -33,7 +33,7 @@ import {
 } from './merge-repo-policy';
 import { specDeclaresMergeHold } from './merge-hold';
 import { isSpecOnlyChangeSet } from './reconcile';
-import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
+import type { GitHubClientDeps, PullRequestCommitStatus, PullRequestEvidence } from './types.ts';
 import { resolveRequiredContexts } from './adapters/required-contexts';
 import { createRealOctokitClient } from './adapters/github-real-deps';
 import {
@@ -589,27 +589,73 @@ function reportedChecksAreBlocking(checks: PullRequestEvidence['checks']): boole
   return checks.total === 0 || checks.failed > 0 || checks.pending > 0;
 }
 
+function commitStatusRank(status: PullRequestCommitStatus): number {
+  const created = typeof status.createdAt === 'string' ? Date.parse(status.createdAt) : NaN;
+  if (Number.isFinite(created)) return created;
+  const updated = typeof status.updatedAt === 'string' ? Date.parse(status.updatedAt) : NaN;
+  if (Number.isFinite(updated)) return updated;
+  return Number.NEGATIVE_INFINITY;
+}
+
+function commitStatusIsNewer(
+  candidate: PullRequestCommitStatus,
+  current: PullRequestCommitStatus
+): boolean {
+  const candidateRank = commitStatusRank(candidate);
+  const currentRank = commitStatusRank(current);
+  if (candidateRank !== currentRank) return candidateRank > currentRank;
+  return (candidate.id ?? 0) > (current.id ?? 0);
+}
+
+/** Latest status per context name. Names match after trim and case fold. */
+function latestCommitStatusPerContext(
+  statuses: readonly PullRequestCommitStatus[]
+): Map<string, PullRequestCommitStatus> {
+  const latest = new Map<string, PullRequestCommitStatus>();
+  for (const status of statuses) {
+    const key = status.context.trim().toLowerCase();
+    if (key.length === 0) continue;
+    const held = latest.get(key);
+    if (!held || commitStatusIsNewer(status, held)) latest.set(key, status);
+  }
+  return latest;
+}
+
+function commitStatusIsPassing(state: string): boolean {
+  return state.trim().toLowerCase() === 'success';
+}
+
 /**
  * Required contexts that are missing, still running, or completed without a
  * passing conclusion. Names match after trim and case fold. Only the latest
- * attempt per check name and app is considered. The returned strings are the
- * required context names, not the check-run display names.
+ * attempt per check name and app is considered. A context with no check run
+ * can still pass when its latest commit status state is success. When the
+ * same context has both a check run and a commit status, both must pass: a
+ * successful run does not hide a failed or pending status, and a successful
+ * status does not hide a failing run. The returned strings are the required
+ * context names, not the check-run display names.
  */
 function blockingRequiredContexts(
   contexts: readonly string[],
-  runs: readonly RecheckCheckRun[]
+  runs: readonly RecheckCheckRun[],
+  statuses: readonly PullRequestCommitStatus[]
 ): string[] {
   const latest = latestAttemptPerCheck([...runs]);
+  const latestStatuses = latestCommitStatusPerContext(statuses);
   const blocking: string[] = [];
   for (const context of contexts) {
     const want = context.trim().toLowerCase();
     const matches = latest.filter(run => (run.name ?? '').trim().toLowerCase() === want);
-    if (
-      matches.length === 0 ||
-      matches.some(run => run.status !== 'completed' || !conclusionIsPassing(run.conclusion))
-    ) {
+    const status = latestStatuses.get(want);
+    if (matches.length === 0 && !status) {
       blocking.push(context);
+      continue;
     }
+    const runBlocking = matches.some(
+      run => run.status !== 'completed' || !conclusionIsPassing(run.conclusion)
+    );
+    const statusBlocking = status !== undefined && !commitStatusIsPassing(status.state);
+    if (runBlocking || statusBlocking) blocking.push(context);
   }
   return blocking;
 }
@@ -783,6 +829,7 @@ async function mergeClaimedVerdict(
   // exhausted lookups keep the aggregate summary, and an authoritative empty
   // set does too, without the fallback log.
   const lookups = options.github.requiredContextsLookups;
+  let requiredContextsPassed = false;
   const resolution = await resolveRequiredContexts(
     {
       ...(lookups ?? {}),
@@ -794,11 +841,16 @@ async function mergeClaimedVerdict(
     lookups ? process.env : {}
   );
   if (resolution.state === 'known' && resolution.contexts.length > 0) {
-    const blockingContexts = blockingRequiredContexts(resolution.contexts, pr.checkRuns ?? []);
+    const blockingContexts = blockingRequiredContexts(
+      resolution.contexts,
+      pr.checkRuns ?? [],
+      pr.commitStatuses ?? []
+    );
     if (blockingContexts.length > 0) {
       await skip('required_checks_not_success', pr.htmlUrl, false, { blockingContexts });
       return undefined;
     }
+    requiredContextsPassed = true;
   } else {
     if (resolution.state !== 'known') {
       log.info(
@@ -824,7 +876,12 @@ async function mergeClaimedVerdict(
     await skip('not_mergeable_dirty', pr.htmlUrl);
     return undefined;
   }
-  if (pr.mergeable !== true || pr.mergeableState !== 'clean') {
+  // GitHub reports `unstable` when only non-required checks failed or are
+  // pending. Once every known required context passed, that state is
+  // mergeable; without a known required set, keep requiring `clean`.
+  const mergeableStateAccepted =
+    pr.mergeableState === 'clean' || (requiredContextsPassed && pr.mergeableState === 'unstable');
+  if (pr.mergeable !== true || !mergeableStateAccepted) {
     await skip('mergeable_state_not_clean', pr.htmlUrl);
     return undefined;
   }

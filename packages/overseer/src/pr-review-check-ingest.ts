@@ -380,7 +380,21 @@ function checkAttemptRank(run: RecheckCheckRun): number {
   return Number.NEGATIVE_INFINITY;
 }
 
+function checkRunId(run: RecheckCheckRun): number | undefined {
+  return typeof run.id === 'number' && Number.isFinite(run.id) ? run.id : undefined;
+}
+
+/**
+ * Newest attempt by creation order. Check-run ids are assigned in creation
+ * order, so a queued rerun (no started_at or completed_at yet) still beats an
+ * older completed attempt. Timestamps decide only when either id is missing.
+ */
 function checkAttemptIsNewer(candidate: RecheckCheckRun, current: RecheckCheckRun): boolean {
+  const candidateId = checkRunId(candidate);
+  const currentId = checkRunId(current);
+  if (candidateId !== undefined && currentId !== undefined && candidateId !== currentId) {
+    return candidateId > currentId;
+  }
   const candidateRank = checkAttemptRank(candidate);
   const currentRank = checkAttemptRank(current);
   if (candidateRank !== currentRank) return candidateRank > currentRank;

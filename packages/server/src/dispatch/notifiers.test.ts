@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 
 // Snapshot before mocking: sibling dispatch tests load @archon/paths, which
 // imports other fs/promises exports (including symlink) in the same process.
@@ -15,6 +15,12 @@ mock.module('fs/promises', () => ({
 }));
 const { readDispatchSecretFile, sendSmsEscalation, sendTelegramEscalation } =
   await import('./notifiers');
+// bun keeps a module mock for the rest of the process, so later files in the
+// same `bun test src/dispatch/` run (review-worker-clock, review-worker-sandbox)
+// would get the secret-only readFile above and fail. Put the real module back.
+afterAll(() => {
+  mock.module('fs/promises', () => realFsPromises);
+});
 const originalFetch = globalThis.fetch;
 const ENV_KEYS = [
   'DISPATCH_SENDER_AUTH_MODE',

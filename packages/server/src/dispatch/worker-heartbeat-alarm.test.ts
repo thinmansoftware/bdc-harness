@@ -355,6 +355,13 @@ describe('worker heartbeat alarm under an App identity', () => {
   });
 
   test('tokenMintStallsAlarm releases the clock guard when installation mint never resolves', async () => {
+    // The stalled mint is rescued only by githubToken's AbortSignal.timeout,
+    // which is an unref'd timer. Under bun test on Windows (bun 1.3.13), when
+    // the awaited promise's only wakeup is an unref'd timer, the runner spins
+    // without firing it, and the per-test timeout never fires either, so the
+    // whole src/dispatch/ process hangs. A ref'd keepalive lets the timer run,
+    // as the server's own ref'd handles do in production.
+    const keepAlive = setInterval(() => {}, 1_000);
     const savedGh = process.env.GH_TOKEN;
     const savedGithub = process.env.GITHUB_TOKEN;
     const savedTimeout = process.env.DUTY_OFFICER_GITHUB_TIMEOUT_MS;
@@ -435,6 +442,7 @@ describe('worker heartbeat alarm under an App identity', () => {
       expect(joined).not.toContain('t-app');
       expect(joined).not.toContain('PEM_SENTINEL_DO_NOT_LOG');
     } finally {
+      clearInterval(keepAlive);
       write.mockRestore();
       fetchMock.mockRestore();
       resolve.mockRestore();

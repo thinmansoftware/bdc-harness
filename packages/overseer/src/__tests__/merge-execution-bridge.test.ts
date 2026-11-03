@@ -1613,6 +1613,95 @@ describe('merge execution bridge required contexts', () => {
     );
   });
 
+  test('unstable mergeable state merges when every known required context passed', async () => {
+    // GitHub reports `unstable` when only a non-required check failed or was
+    // cancelled, which is exactly the Windows-job case this gate exists for.
+    const h = harness(
+      [verdict('required-green-unstable')],
+      greenPr({
+        mergeableState: 'unstable',
+        checks: { total: 3, passed: 2, failed: 1, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+          checkRun(3, 'test (windows-latest)', 'completed', 'cancelled'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+
+  test('a newer queued rerun beats an older completed success and blocks unstable', async () => {
+    // filter=all returns the historical success next to the queued rerun. The
+    // rerun has no timestamps yet; creation order (id) must still pick it.
+    const h = harness(
+      [verdict('required-rerun-queued')],
+      greenPr({
+        mergeableState: 'unstable',
+        checks: { total: 3, passed: 3, failed: 0, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          {
+            id: 9,
+            name: 'docker-build',
+            status: 'queued',
+            conclusion: null,
+            started_at: null,
+            completed_at: null,
+          },
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: false, reason: 'required_checks_not_success' })
+    );
+  });
+
+  test('unstable mergeable state still skips without a known required set', async () => {
+    const h = harness(
+      [verdict('empty-unstable')],
+      greenPr({
+        mergeableState: 'unstable',
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        checkRuns: [checkRun(1, 'docker-build', 'completed', 'success')],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup([]) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('mergeable_state_not_clean');
+  });
+
+  test('blocked mergeable state still skips when known required contexts passed', async () => {
+    const h = harness(
+      [verdict('required-green-blocked')],
+      greenPr({
+        mergeableState: 'blocked',
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('mergeable_state_not_clean');
+  });
+
   test('required failure still blocks and the skip log names the context', async () => {
     const captured = captureRootLogLines();
     try {
@@ -1786,5 +1875,226 @@ describe('merge execution bridge required contexts', () => {
     } finally {
       captured.restore();
     }
+  });
+
+  test('a newer successful commit status satisfies a required context with no check run', async () => {
+    const h = harness(
+      [verdict('status-green')],
+      greenPr({
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        checkRuns: [checkRun(1, 'test (ubuntu-latest)', 'completed', 'success')],
+        commitStatuses: [
+          {
+            id: 3,
+            context: ' Docker-Build ',
+            state: 'success',
+            createdAt: '2026-11-03T00:00:00.000Z',
+          },
+          {
+            id: 50,
+            context: 'docker-build',
+            state: 'failure',
+            createdAt: '2026-11-01T00:00:00.000Z',
+          },
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+
+  test('a newer failed commit status blocks and the skip log names the context', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('status-red')],
+        greenPr({
+          checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+          checkRuns: [checkRun(1, 'test (ubuntu-latest)', 'completed', 'success')],
+          commitStatuses: [
+            {
+              id: 3,
+              context: 'docker-build',
+              state: 'success',
+              createdAt: '2026-11-01T00:00:00.000Z',
+            },
+            {
+              id: 1,
+              context: 'docker-build',
+              state: 'failure',
+              createdAt: '2026-11-03T00:00:00.000Z',
+            },
+          ],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup(required) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.merge_skipped', {
+        reason: 'required_checks_not_success',
+        blockingContexts: ['docker-build'],
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('a pending commit status blocks when the context has no check run', async () => {
+    const h = harness(
+      [verdict('status-pending')],
+      greenPr({
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        checkRuns: [checkRun(1, 'test (ubuntu-latest)', 'completed', 'success')],
+        commitStatuses: [
+          {
+            id: 4,
+            context: 'docker-build',
+            state: 'pending',
+            createdAt: '2026-11-03T00:00:00.000Z',
+          },
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+  });
+
+  test('a successful commit status does not clear a failing check run of the same name', async () => {
+    const h = harness(
+      [verdict('check-beats-status')],
+      greenPr({
+        checks: { total: 2, passed: 1, failed: 1, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'failure'),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+        commitStatuses: [
+          {
+            id: 9,
+            context: 'docker-build',
+            state: 'success',
+            createdAt: '2026-11-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+  });
+
+  test('a successful check run does not clear a newer failed commit status of the same name', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('status-and-check-red')],
+        greenPr({
+          checks: { total: 2, passed: 2, failed: 0, pending: 0 },
+          checkRuns: [
+            checkRun(1, 'docker-build', 'completed', 'success'),
+            checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+          ],
+          commitStatuses: [
+            {
+              id: 8,
+              context: 'docker-build',
+              state: 'success',
+              createdAt: '2026-11-01T00:00:00.000Z',
+            },
+            {
+              id: 9,
+              context: ' Docker-Build ',
+              state: 'failure',
+              createdAt: '2026-11-04T00:00:00.000Z',
+            },
+          ],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup(required) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.merge_skipped', {
+        reason: 'required_checks_not_success',
+        blockingContexts: ['docker-build'],
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('a successful check run does not clear a pending commit status of the same name', async () => {
+    const h = harness(
+      [verdict('status-and-check-pending')],
+      greenPr({
+        checks: { total: 2, passed: 2, failed: 0, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+        commitStatuses: [
+          {
+            id: 10,
+            context: 'docker-build',
+            state: 'pending',
+            createdAt: '2026-11-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+  });
+
+  test('a required context passes when its check run and latest commit status both succeed', async () => {
+    const h = harness(
+      [verdict('status-and-check-green')],
+      greenPr({
+        checks: { total: 2, passed: 2, failed: 0, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+        commitStatuses: [
+          {
+            id: 1,
+            context: 'docker-build',
+            state: 'failure',
+            createdAt: '2026-11-01T00:00:00.000Z',
+          },
+          {
+            id: 11,
+            context: 'docker-build',
+            state: 'success',
+            createdAt: '2026-11-04T00:00:00.000Z',
+          },
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
   });
 });

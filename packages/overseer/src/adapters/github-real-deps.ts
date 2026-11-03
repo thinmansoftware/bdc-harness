@@ -15,6 +15,7 @@ import type {
   GitHubPullRequestMergeInput,
   GitHubPullRequestSearchInput,
   PullRequestCheckSummary,
+  PullRequestCommitStatus,
   PullRequestEvidence,
   PullRequestRef,
 } from '../types.ts';
@@ -34,6 +35,7 @@ import type {
 } from './required-contexts.ts';
 import { createDurableAttemptCounterStore } from './required-contexts-store';
 import { classifyRateLimitError } from '../github-rate-limit';
+import { latestAttemptPerCheck } from '../pr-review-check-ingest';
 
 const log = createLogger('overseer/github-real-deps');
 
@@ -328,6 +330,26 @@ export interface RealGitHubOctokitLike {
       repo: string;
       branch: string;
     }): Promise<{ data: { protected?: boolean; protection?: { enabled?: boolean } } }>;
+    /**
+     * Optional: commit statuses for a ref (not check runs). Present on the real
+     * Octokit client; omitted by narrow test mocks. The merge gate needs every
+     * page, because a required context may exist only as a status.
+     */
+    listCommitStatusesForRef?(input: {
+      owner: string;
+      repo: string;
+      ref: string;
+      per_page: number;
+      page?: number;
+    }): Promise<{
+      data: {
+        id?: number;
+        context?: string | null;
+        state?: string | null;
+        created_at?: string | null;
+        updated_at?: string | null;
+      }[];
+    }>;
   };
 }
 
@@ -380,6 +402,14 @@ export const BOUND_REPOS_METHODS = [
   'getBranchRules',
   'getBranch',
 ] as const satisfies readonly RealOctokitReposMethodName[];
+
+/**
+ * Commit-status read used by findPullRequest. Kept off BOUND_REPOS_METHODS,
+ * which is the branch-protection probe list, but still pinned to a real
+ * Octokit method so a rename fails typecheck instead of dropping statuses.
+ */
+const LIST_COMMIT_STATUSES_METHOD =
+  'listCommitStatusesForRef' as const satisfies RealOctokitReposMethodName;
 
 /**
  * The bound names, additionally required to exist on our own stand-in so
@@ -892,6 +922,80 @@ function pullRequestLabelNames(labels: { name?: string | null }[] | undefined): 
   return names;
 }
 
+/** GitHub REST page size. A short page is the last page. */
+const REQUIRED_EVIDENCE_PAGE_SIZE = 100;
+
+interface ListedCheckRun {
+  id?: number;
+  name?: string;
+  status: string;
+  conclusion: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  app?: { slug?: string; name?: string };
+}
+
+/**
+ * Every check run for the ref, across pages. `filter=all` is required: the
+ * default `latest` filter is not a complete set once a ref has more than one
+ * page of runs, and the required-context gate treats an unread run as missing.
+ * Callers reduce to the latest attempt per name before evaluating.
+ */
+async function listEveryCheckRun(
+  octokit: RealGitHubOctokitLike,
+  input: { owner: string; repo: string; ref: string }
+): Promise<ListedCheckRun[]> {
+  const runs: ListedCheckRun[] = [];
+  for (let page = 1; ; page += 1) {
+    const response = await octokit.checks.listForRef({
+      owner: input.owner,
+      repo: input.repo,
+      ref: input.ref,
+      filter: 'all',
+      per_page: REQUIRED_EVIDENCE_PAGE_SIZE,
+      page,
+    });
+    const pageRuns = response.data.check_runs ?? [];
+    runs.push(...pageRuns);
+    if (pageRuns.length < REQUIRED_EVIDENCE_PAGE_SIZE) return runs;
+  }
+}
+
+/**
+ * Every commit status for the ref, newest page first. Undefined when this
+ * client has no status API, so callers do not pretend the lookup happened.
+ */
+async function listEveryCommitStatus(
+  octokit: RealGitHubOctokitLike,
+  input: { owner: string; repo: string; ref: string }
+): Promise<PullRequestCommitStatus[] | undefined> {
+  const repos = octokit.repos;
+  const listStatuses = repos?.[LIST_COMMIT_STATUSES_METHOD];
+  if (!repos || typeof listStatuses !== 'function') return undefined;
+  const statuses: PullRequestCommitStatus[] = [];
+  for (let page = 1; ; page += 1) {
+    const response = await listStatuses.call(repos, {
+      owner: input.owner,
+      repo: input.repo,
+      ref: input.ref,
+      per_page: REQUIRED_EVIDENCE_PAGE_SIZE,
+      page,
+    });
+    const pageStatuses = response.data ?? [];
+    for (const status of pageStatuses) {
+      if (typeof status.context !== 'string' || status.context.length === 0) continue;
+      statuses.push({
+        ...(typeof status.id === 'number' ? { id: status.id } : {}),
+        context: status.context,
+        state: typeof status.state === 'string' ? status.state : '',
+        createdAt: status.created_at,
+        updatedAt: status.updated_at,
+      });
+    }
+    if (pageStatuses.length < REQUIRED_EVIDENCE_PAGE_SIZE) return statuses;
+  }
+}
+
 /**
  * Real findPullRequest: looks up an open PR by head branch first (the run's
  * own PR), then complete REST open-PR discovery with exact WO title/body matching.
@@ -1078,16 +1182,16 @@ export function createRealFindPullRequest(
         });
       }
 
-      const checkRunsResp = await octokit.checks.listForRef({
-        owner: input.owner,
-        repo: input.repo,
-        ref: pr.data.head.sha,
-        per_page: 100,
-      });
-      // Same single page the aggregate summary already uses. No extra pagination.
-      const rawCheckRuns = checkRunsResp.data.check_runs ?? [];
-      const checks = summarizeChecks(rawCheckRuns);
-      const checkRuns = rawCheckRuns.map(run => ({
+      const headSha = pr.data.head.sha;
+      const latestCheckRuns = latestAttemptPerCheck(
+        await listEveryCheckRun(octokit, {
+          owner: input.owner,
+          repo: input.repo,
+          ref: headSha,
+        })
+      );
+      const checks = summarizeChecks(latestCheckRuns);
+      const checkRuns = latestCheckRuns.map(run => ({
         id: run.id,
         name: run.name,
         status: run.status,
@@ -1096,6 +1200,11 @@ export function createRealFindPullRequest(
         completed_at: run.completed_at,
         app: run.app,
       }));
+      const commitStatuses = await listEveryCommitStatus(octokit, {
+        owner: input.owner,
+        repo: input.repo,
+        ref: headSha,
+      });
       let changedFilePaths: string[] | undefined;
       if (input.includeChangedFiles) {
         if (!octokit.pulls.listFiles) throw new Error('overseer_real_adapter_missing_list_files');
@@ -1158,7 +1267,8 @@ export function createRealFindPullRequest(
             : undefined,
         htmlUrl: pr.data.html_url,
         // Provenance anchor: GitHub's own view of the PR head, not run metadata.
-        headSha: pr.data.head.sha,
+        headSha,
+        ...(commitStatuses !== undefined ? { commitStatuses } : {}),
         baseBranch: pr.data.base?.ref,
         mergeableState: pr.data.mergeable_state,
         changedFilePaths,
