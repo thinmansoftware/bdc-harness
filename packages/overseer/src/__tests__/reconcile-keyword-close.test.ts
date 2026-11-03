@@ -11,12 +11,15 @@ import { expect, test } from 'bun:test';
 import {
   RECONCILE_ACTION,
   extractClosingKeywordTrackerRefs,
+  openPullRequestsHoldingTracker,
   runReconcileOnce,
+  searchOpenPullRequestsReferencingTracker,
   searchMergedPullRequests,
   type OctokitLike,
   type ReconcileActionRecord,
   type ReconcileDeps,
   type ReconcileMergedPullRequest,
+  type ReconcileOpenPullRequest,
   type ReconcileTrackerIssue,
 } from '../reconcile';
 import { resolveProjectBase } from '../project-bases';
@@ -33,6 +36,7 @@ interface HarnessOptions {
   closeAlreadyRecorded?: boolean;
   files?: string[];
   searchMergedPullRequests?: ReconcileDeps['searchMergedPullRequests'];
+  openPullRequests?: ReconcileOpenPullRequest[];
 }
 
 interface HarnessState {
@@ -61,7 +65,7 @@ function harness(options: HarnessOptions): HarnessState {
     findTrackerIssueByNumber: async (number: number) => byNumber[number] ?? null,
     findTrackerIssueByStem: async (stem: string) => byStem[stem] ?? null,
     listPullRequestFiles: async () => options.files ?? ['src/real-code.ts'],
-    listOpenPullRequestsReferencingTracker: async () => [],
+    listOpenPullRequestsReferencingTracker: async () => options.openPullRequests ?? [],
     addTrackerEvidenceComment: async request => {
       comments.push(request.body);
     },
@@ -582,4 +586,98 @@ test('Test 10 (control): the same keyword merged AFTER the tracker existed close
 
   expect(result.closed).toBe(1);
   expect(state.closes).toEqual([4344]);
+});
+
+// ---------------------------------------------------------------------------
+// Test 11: same-repo `Fixes #N` holds the tracker while the PR is open
+// (Overseer review finding on PR 1432 at 4f57e792).
+// ---------------------------------------------------------------------------
+
+const WO_HOLD = 'WO-XO-HASH-REF-01';
+
+function openPr(repo: string, number: number, body: string): ReconcileOpenPullRequest {
+  return {
+    owner: ORG,
+    repo,
+    number,
+    title: 'second stage',
+    body,
+    htmlUrl: `https://github.com/${ORG}/${repo}/pull/${number}`,
+  };
+}
+
+test('Test 11: an open bdc-xo PR with only `Fixes #4999` holds tracker 4999', () => {
+  const holders = openPullRequestsHoldingTracker({
+    stem: WO_HOLD,
+    mergedPr: { owner: ORG, repo: 'bdc-xo', number: 4326 },
+    tracker: tracker(4999, WO_HOLD),
+    openPullRequests: [openPr('bdc-xo', 4400, 'Fixes #4999')],
+  });
+  expect(holders.map(h => h.number)).toEqual([4400]);
+});
+
+test('Test 11 (other repo): an open shopops PR with `Fixes #4999` means shopops 4999 and does not hold', () => {
+  const holders = openPullRequestsHoldingTracker({
+    stem: WO_HOLD,
+    mergedPr: { owner: ORG, repo: 'bdc-xo', number: 4326 },
+    tracker: tracker(4999, WO_HOLD),
+    openPullRequests: [openPr('shopops', 4400, 'Fixes #4999')],
+  });
+  expect(holders).toEqual([]);
+});
+
+test('Test 11 (close path): a merged `Fixes #4999` does not close while another open `Fixes #4999` PR holds it', async () => {
+  const state = harness({
+    prs: [
+      mergedPr({
+        owner: ORG,
+        repo: 'bdc-xo',
+        number: 4326,
+        htmlUrl: `https://github.com/${ORG}/bdc-xo/pull/4326`,
+        baseRef: 'main',
+        body: 'Fixes #4999',
+      }),
+    ],
+    trackersByNumber: { 4999: tracker(4999, WO_HOLD) },
+    openPullRequests: [openPr('bdc-xo', 4400, 'Fixes #4999')],
+  });
+
+  const result = await runReconcileOnce({ deps: state.deps });
+
+  expect(result.closed).toBe(0);
+  expect(state.closes).toEqual([]);
+});
+
+test('Test 11 (discovery): the open-PR search also queries the tracker repo for the bare number', async () => {
+  const queries: string[] = [];
+  const octokit = {
+    search: {
+      issuesAndPullRequests: async (input: Record<string, unknown>) => {
+        const q = String(input.q ?? '');
+        queries.push(q);
+        const items = q.startsWith(`repo:${ORG}/bdc-xo `)
+          ? [
+              {
+                number: 4400,
+                title: 'second stage',
+                body: 'Fixes #4999',
+                state: 'open',
+                pull_request: {},
+                repository_url: `https://api.github.com/repos/${ORG}/bdc-xo`,
+                html_url: `https://github.com/${ORG}/bdc-xo/pull/4400`,
+              },
+            ]
+          : [];
+        return { data: { total_count: items.length, incomplete_results: false, items } };
+      },
+    },
+  } as unknown as OctokitLike;
+
+  const found = await searchOpenPullRequestsReferencingTracker(octokit, {
+    issue: tracker(4999, WO_HOLD),
+    stem: WO_HOLD,
+  });
+
+  expect(queries).toContain(`repo:${ORG}/bdc-xo is:pr is:open 4999`);
+  expect(found.map(pr => pr.number)).toEqual([4400]);
 });

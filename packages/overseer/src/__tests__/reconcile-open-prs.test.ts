@@ -545,6 +545,7 @@ test('exactly one thousand distinct holders across ten pages proves the search b
     stem,
   });
   expect(found).toHaveLength(1000);
-  expect(pagesRequested.filter(page => page === 10)).toHaveLength(2);
+  // Three queries (stem, owner/repo#N, tracker-repo bare number) each reach page 10.
+  expect(pagesRequested.filter(page => page === 10)).toHaveLength(3);
   expect(pagesRequested).not.toContain(11);
 });

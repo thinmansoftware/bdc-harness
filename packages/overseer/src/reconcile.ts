@@ -731,7 +731,22 @@ export function openPullRequestsHoldingTracker(input: {
       title: candidate.title,
       body: candidate.body,
     }).evidence;
-    if (evidence.includes(input.stem) || bodyClosesTracker(candidate.body ?? '', token)) {
+    // Same-repo `Fixes #N` in a tracker-repo PR resolves through the same parser
+    // the close path uses, so any reference that could CLOSE the tracker also
+    // HOLDS it while the PR is open.
+    const keywordRefs = extractClosingKeywordTrackerRefs(
+      candidate.body ?? '',
+      candidate.owner,
+      candidate.repo
+    );
+    const trackerIsDefault =
+      input.tracker.owner.toLowerCase() === DEFAULT_ORG &&
+      input.tracker.repo.toLowerCase() === DEFAULT_TRACKER_REPO;
+    if (
+      evidence.includes(input.stem) ||
+      bodyClosesTracker(candidate.body ?? '', token) ||
+      (trackerIsDefault && keywordRefs.includes(input.tracker.number))
+    ) {
       holders.push(candidate);
     }
   }
@@ -1085,6 +1100,10 @@ export async function searchOpenPullRequestsReferencingTracker(
   const queries = [
     `org:${DEFAULT_ORG} is:pr is:open ${input.stem}`,
     `org:${DEFAULT_ORG} is:pr is:open ${issueRef}`,
+    // Same-repo `Fixes #N` holders live in the tracker repo and never spell the
+    // owner/repo token; search that repo for the bare number and let
+    // openPullRequestsHoldingTracker decide which candidates really hold it.
+    `repo:${input.issue.owner}/${input.issue.repo} is:pr is:open ${input.issue.number}`,
   ];
   const results = new Map<string, ReconcileOpenPullRequest>();
 
