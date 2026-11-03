@@ -330,7 +330,7 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
   let closed = 0;
   let marked = 0;
   const seen = new Set<string>();
-  for (const pr of pullRequests) {
+  nextPullRequest: for (const pr of pullRequests) {
     const key = `${pr.owner}/${pr.repo}#${pr.number}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -399,7 +399,14 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
             );
             return { scanned: seen.size, closed, skipped: true };
           }
-          throw error;
+          // Untrustworthy tracker data stays fail-closed (see isTrackerIntegrityError):
+          // a malformed snapshot or an ambiguous title means we do not know which
+          // issue this is, so the pass aborts with no further tracker effect.
+          if (isTrackerIntegrityError(error)) throw error;
+          // PER-PR ISOLATION. A generic lookup failure for THIS PR is contained:
+          // record it and move to the next PR instead of aborting the pass.
+          logger.warn({ err: error as Error, prRef, number }, 'overseer.reconcile.pr_error');
+          continue nextPullRequest;
         }
         if (!tracker) continue;
         const woId = deriveTrackerWoId(tracker);
@@ -631,7 +638,15 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
           );
           return { scanned: seen.size, closed, skipped: true };
         }
-        throw error;
+        // Untrustworthy tracker data stays fail-closed (see isTrackerIntegrityError).
+        if (isTrackerIntegrityError(error)) throw error;
+        // PER-STEM ISOLATION. This note is advisory bookkeeping, so a generic
+        // lookup failure for one declared stem skips that stem only.
+        logger.warn(
+          { err: error as Error, prRef, stem: declared },
+          'overseer.reconcile.stem_lookup_error'
+        );
+        continue;
       }
       if (declaredTracker?.state !== 'open') continue;
       if (refNumbers.includes(declaredTracker.number)) continue;
@@ -1707,7 +1722,7 @@ function validatedOpenSearchPullRequest(item: unknown): ReconcileOpenPullRequest
 
 const TRACKER_ISSUE_PAGE_SIZE = 100;
 const TRACKER_ISSUE_MAX_PAGES = 100;
-interface TrackerSnapshotRow {
+export interface TrackerSnapshotRow {
   readonly number: number;
   readonly title: string;
   readonly state: 'open' | 'closed';
@@ -1715,11 +1730,11 @@ interface TrackerSnapshotRow {
   readonly pullRequest: boolean;
   readonly createdAt: string | null;
 }
-type TrackerIssueSnapshot = ReadonlyMap<number, TrackerSnapshotRow>;
+export type TrackerIssueSnapshot = ReadonlyMap<number, TrackerSnapshotRow>;
 
 async function readTrackerIssueSnapshot(octokit: OctokitLike): Promise<TrackerIssueSnapshot> {
   const issues = octokit.issues;
-  if (!issues.listForRepo) throw new Error('tracker issue REST listing is unavailable');
+  if (!issues.listForRepo) throw failClosedError('tracker issue REST listing is unavailable');
   const rows = new Map<number, TrackerSnapshotRow>();
   // At most 100 logical core reads per invocation. Created order reduces churn;
   // REST pagination is not an atomic snapshot and issue numbers need not increase.
@@ -1738,7 +1753,7 @@ async function readTrackerIssueSnapshot(octokit: OctokitLike): Promise<TrackerIs
       !Array.isArray(response.data) ||
       response.data.length > TRACKER_ISSUE_PAGE_SIZE
     ) {
-      throw new Error('tracker issue REST listing returned a malformed page');
+      throw failClosedError('tracker issue REST listing returned a malformed page');
     }
     for (const value of response.data) {
       const row = validatedTrackerSnapshotRow(value);
@@ -1750,18 +1765,20 @@ async function readTrackerIssueSnapshot(octokit: OctokitLike): Promise<TrackerIs
           prior.htmlUrl.toLowerCase() !== row.htmlUrl.toLowerCase() ||
           prior.pullRequest !== row.pullRequest)
       ) {
-        throw new Error(`tracker issue REST listing returned conflicting copies of ${row.number}`);
+        throw failClosedError(
+          `tracker issue REST listing returned conflicting copies of ${row.number}`
+        );
       }
       rows.set(row.number, row);
     }
     if (response.data.length < TRACKER_ISSUE_PAGE_SIZE) return rows;
   }
-  throw new Error('tracker issue REST listing exceeded its complete-page budget');
+  throw failClosedError('tracker issue REST listing exceeded its complete-page budget');
 }
 
 function validatedTrackerSnapshotRow(value: unknown): TrackerSnapshotRow {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error('tracker issue REST listing returned a malformed row');
+    throw failClosedError('tracker issue REST listing returned a malformed row');
   }
   const row = value as Record<string, unknown>;
   const pullRequest = row.pull_request !== undefined;
@@ -1778,7 +1795,7 @@ function validatedTrackerSnapshotRow(value: unknown): TrackerSnapshotRow {
     typeof row.html_url !== 'string' ||
     row.html_url.toLowerCase() !== webUrl.toLowerCase()
   ) {
-    throw new Error('tracker issue REST listing returned a malformed identity or state');
+    throw failClosedError('tracker issue REST listing returned a malformed identity or state');
   }
   if (pullRequest) {
     const detail = row.pull_request as Record<string, unknown> | null;
@@ -1790,7 +1807,7 @@ function validatedTrackerSnapshotRow(value: unknown): TrackerSnapshotRow {
       typeof detail.url !== 'string' ||
       detail.url.toLowerCase() !== expected.toLowerCase()
     ) {
-      throw new Error('tracker issue REST listing returned malformed PR metadata');
+      throw failClosedError('tracker issue REST listing returned malformed PR metadata');
     }
   }
   // Retain only identity/matching metadata, not potentially large unused bodies.
@@ -1804,13 +1821,28 @@ function validatedTrackerSnapshotRow(value: unknown): TrackerSnapshotRow {
   };
 }
 
-function findTrackerIssueByStem(
+export function findTrackerIssueByStem(
   snapshot: TrackerIssueSnapshot,
   stem: string
 ): ReconcileTrackerIssue | null {
   const matches = [...snapshot.values()].filter(row => !row.pullRequest && row.title === stem);
-  if (matches.length > 1) throw new Error(`tracker issue title is ambiguous: ${stem}`);
-  const exact = matches[0];
+  if (matches.length === 0) return null;
+  // A same-title open+closed pair is NOT ambiguous for reconcile: the closed
+  // copy is containment/history and the open issue is the live tracker (anchor:
+  // bdc-xo #4114 open + #3743 closed shared one title and aborted a whole pass).
+  // The disambiguation authorized here is a SINGLE-OPEN preference and nothing
+  // more. Two or more OPEN matches are genuinely ambiguous. A set with NO open
+  // match and more than one closed copy is ALSO ambiguous: there is no live
+  // tracker to prefer, so reconcile must not silently pick an arbitrary closed
+  // issue -- it retains the fail-closed ambiguity error.
+  const openMatches = matches.filter(row => row.state === 'open');
+  if (openMatches.length > 1) throw failClosedError(`tracker issue title is ambiguous: ${stem}`);
+  if (openMatches.length === 0 && matches.length > 1) {
+    throw failClosedError(`tracker issue title is ambiguous: ${stem}`);
+  }
+  // Prefer the single open match; otherwise exactly one closed match remains,
+  // which is unambiguous history and safe to return.
+  const exact = openMatches[0] ?? matches[0];
   if (!exact) return null;
   return {
     owner: DEFAULT_ORG,
@@ -1867,6 +1899,42 @@ function isAuthError(error: unknown): boolean {
   if (candidate.status === 401) return true;
   if (candidate.status === 403 && !isRateLimitError(error)) return true;
   return false;
+}
+
+/**
+ * TRACKER-INTEGRITY FAIL-CLOSED MARKER.
+ *
+ * Reconcile isolates a *generic* per-PR or per-stem lookup failure (transport
+ * blip, one unreadable tracker) so one bad PR cannot abort a whole pass. It must
+ * NOT isolate an error that says the tracker DATA ITSELF is untrustworthy:
+ *   - a malformed/conflicting/over-budget REST snapshot (we do not know the
+ *     tracker state at all), and
+ *   - a genuinely ambiguous exact title (we do not know WHICH tracker is meant).
+ * Acting on later PRs after either one risks commenting on, labelling or closing
+ * the wrong issue, so those stay fail-closed and abort the pass with no effect.
+ *
+ * The marker is carried on the error object (set where it is thrown) rather than
+ * matched by message, so the boundary is structural. The message prefixes are a
+ * defensive fallback for an error that crossed a boundary which dropped own
+ * properties (e.g. a re-wrapped rejection).
+ */
+const RECONCILE_FAIL_CLOSED = 'reconcileFailClosed';
+
+function failClosedError(message: string): Error {
+  const error = new Error(message);
+  Object.defineProperty(error, RECONCILE_FAIL_CLOSED, {
+    value: true,
+    enumerable: false,
+  });
+  return error;
+}
+
+function isTrackerIntegrityError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as Record<string, unknown> & { message?: string };
+  if (candidate[RECONCILE_FAIL_CLOSED] === true) return true;
+  const message = typeof candidate.message === 'string' ? candidate.message : '';
+  return message.includes('tracker issue REST listing') || message.includes('title is ambiguous');
 }
 
 /**
