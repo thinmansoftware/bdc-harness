@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { rootLogger } from '@archon/paths';
 import {
@@ -9,6 +9,14 @@ import {
 } from '../merge-execution-bridge';
 import { readWoSpecForMergeHold, specDeclaresMergeHold } from '../merge-hold';
 import { parseMergeRepoPolicy } from '../merge-repo-policy';
+import {
+  REQUIRED_CONTEXTS_BLOCKED_REASON,
+  REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
+  REQUIRED_CONTEXTS_OVERRIDE_ENV,
+  resetRequiredContextsAttemptCounters,
+  resetRequiredContextsCache,
+} from '../adapters/required-contexts.ts';
+import type { RecheckCheckRun } from '../pr-review-check-ingest.ts';
 import type {
   GitHubClientDeps,
   GitHubPullRequestSearchInput,
@@ -97,6 +105,8 @@ function harness(
       return true;
     },
     getRunById: async runId => run(runId.replace('run-', '')),
+    getEarliestMergeSlotReservation: async () =>
+      new Date(Date.now() - 50 * 60 * 1000).toISOString(),
     reserveMergeSlot: async (verdictId, _since, limit) => {
       const existing = slots.get(verdictId);
       if (existing && !existing.released) return false;
@@ -131,6 +141,8 @@ function harness(
       merges += 1;
       return { merged: true, mergeSha: 'merge-sha' };
     },
+    listPullRequestComments: async () => [],
+    commentOnPullRequest: async () => ({ commented: true }),
     ...githubExtras,
   };
   return {
@@ -481,6 +493,7 @@ describe('merge execution bridge', () => {
         return true;
       },
       getRunById: async () => run(id),
+      getEarliestMergeSlotReservation: async () => null,
       reserveMergeSlot,
       releaseMergeSlot,
       recordOutcome: async input => {
@@ -974,7 +987,7 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
       readPolicy: () => policy(),
     });
     expect(h.merges).toBe(1);
-    expect(bodies).toEqual([]);
+    expect(bodies.filter(body => body.includes('merge-manager-receipt'))).toEqual([]);
     expect(h.outcomes[0]?.reason).toBe('merge_executed');
   });
 
@@ -1071,7 +1084,9 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
   test('receipt is a no-throw when commentOnPullRequest is absent', async () => {
     const captured = captureRootLogLines();
     try {
-      const h = harness([verdict('receipt-absent')]);
+      const h = harness([verdict('receipt-absent')], greenPr(), 0, {
+        commentOnPullRequest: undefined,
+      });
       expect(h.github.commentOnPullRequest).toBeUndefined();
       await expect(
         runMergeExecutionBridgeOnce({
@@ -1094,7 +1109,7 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     }
   });
 
-  test('receipt skip, hold, and failed merge post no comment', async () => {
+  test('receipt skip, hold, and failed merge post no receipt', async () => {
     const bodies: string[] = [];
     const commentOnPullRequest = async (input: {
       body: string;
@@ -1129,7 +1144,7 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
       github: failed.github,
       readPolicy: () => policy(),
     });
-    expect(bodies).toEqual([]);
+    expect(bodies.filter(body => body.includes('merge-manager-receipt'))).toEqual([]);
     expect(skipped.outcomes[0]?.reason).toBe('required_checks_not_success');
     expect(held.claimReleases).toEqual([
       { verdictId: 'receipt-hold', reason: 'rate_ceiling_deferred' },
@@ -1407,5 +1422,369 @@ describe('merge hold', () => {
     expect(h.outcomes).toEqual([]);
     expect(h.claimReleases).toEqual([{ verdictId: 'label-hold', reason: 'merge_hold_label' }]);
     expect(reads).toBe(0);
+  });
+});
+
+describe('merge ceiling queue notices', () => {
+  const marker = '<!-- overseer:merge-ceiling-queued -->';
+  const now = new Date('2026-11-03T12:00:00.000Z');
+  function queued(head = 'abc', comments: string[] = []) {
+    const post = mock(async (_input: { body: string }) => ({ commented: true }));
+    const h = harness(
+      [verdict('queued', head)],
+      greenPr({
+        headSha: head,
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1439 },
+      }),
+      4,
+      {
+        commentOnPullRequest: post,
+        listPullRequestComments: async () => comments.map(body => ({ body, authorLogin: 'bot' })),
+      }
+    );
+    h.store.getEarliestMergeSlotReservation = async since => {
+      expect(since).toBe('2026-11-03T11:00:00.000Z');
+      return '2026-11-03T11:10:00.000Z';
+    };
+    return {
+      h,
+      post,
+      execute: () =>
+        runMergeExecutionBridgeOnce({
+          store: h.store,
+          github: h.github,
+          now: () => now,
+          maxMergesPerHour: 4,
+          readPolicy: () => policy(),
+        }),
+    };
+  }
+
+  test('ceiling_deferral_posts_notice', async () => {
+    const { h, post, execute } = queued();
+    h.store.listUnactionedVerdicts = async () => [
+      verdict('a'),
+      { ...verdict('other'), proposed_action: 'observe' } as OverseerVerdictRow,
+      verdict('b'),
+      verdict('queued', 'abc'),
+    ];
+    h.store.claimVerdict = async id => id === 'queued';
+    await execute();
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ number: 1439, body: expect.stringContaining(marker) })
+    );
+    const body = (post.mock.calls[0] as unknown as [{ body: string }])[0].body;
+    for (const value of ['abc', 'position 3', 'ceiling 4', '2026-11-03T12:10:00.000Z']) {
+      expect(body).toContain(value);
+    }
+  });
+
+  test('next_slot_time_from_oldest_live_reservation', async () => {
+    const { post, execute } = queued();
+    await execute();
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({
+        body: expect.stringContaining('2026-11-03T12:10:00.000Z'),
+      })
+    );
+  });
+
+  test('no_duplicate_notice_same_head', async () => {
+    const { post, execute } = queued('abc', [`${marker}\nHead: \`abc\``]);
+    await execute();
+    expect(post).not.toHaveBeenCalled();
+  });
+
+  test('new_head_gets_new_notice', async () => {
+    const { post, execute } = queued('def', [
+      `${marker}\nHead: \`abc\``,
+      `${marker}\nHead: \`def123\``,
+    ]);
+    await execute();
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ body: expect.stringContaining('Head: `def`') })
+    );
+  });
+
+  test.each(['post', 'list', 'missing-post', 'missing-list', 'lookup', 'empty', 'invalid'])(
+    'comment_failure_does_not_break_deferral: %s',
+    async failure => {
+      const { h, execute } = queued();
+      const logs = captureRootLogLines();
+      const claims: string[] = [];
+      const claim = h.store.claimVerdict;
+      h.store.claimVerdict = async id => {
+        claims.push(id);
+        return claim(id);
+      };
+      h.store.listUnactionedVerdicts = async () => [verdict('queued', 'abc'), verdict('next')];
+      const fail = async (): Promise<never> => {
+        throw new Error('notice failed');
+      };
+      if (failure === 'post') h.github.commentOnPullRequest = fail;
+      if (failure === 'list') h.github.listPullRequestComments = fail;
+      if (failure === 'missing-post') h.github.commentOnPullRequest = undefined;
+      if (failure === 'missing-list') h.github.listPullRequestComments = undefined;
+      if (failure === 'lookup') h.store.getEarliestMergeSlotReservation = fail;
+      if (failure === 'empty') h.store.getEarliestMergeSlotReservation = async () => null;
+      if (failure === 'invalid') h.store.getEarliestMergeSlotReservation = async () => 'invalid';
+      try {
+        await execute();
+        expect(h.claimReleases).toContainEqual({
+          verdictId: 'queued',
+          reason: 'rate_ceiling_deferred',
+        });
+        expect(claims).toEqual(['queued', 'next']);
+        expect(
+          logs.lines.some(
+            line => line.includes('ceiling_queue_notice_failed') && line.includes('"level":40')
+          )
+        ).toBe(true);
+      } finally {
+        logs.restore();
+      }
+    }
+  );
+});
+
+describe('merge execution bridge required contexts', () => {
+  const required = ['docker-build', 'test (ubuntu-latest)'] as const;
+
+  function checkRun(
+    id: number,
+    name: string,
+    status: string,
+    conclusion: string | null
+  ): RecheckCheckRun {
+    return { id, name, status, conclusion, completed_at: `2026-11-0${id}T00:00:00.000Z` };
+  }
+
+  function contextsLookup(
+    contexts: readonly string[]
+  ): NonNullable<GitHubClientDeps['requiredContextsLookups']> {
+    return {
+      fetchWithAppClient: async () => ({ data: [...contexts] }),
+    };
+  }
+
+  async function evaluate(h: ReturnType<typeof harness>): Promise<void> {
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+  }
+
+  beforeEach(() => {
+    resetRequiredContextsCache();
+    resetRequiredContextsAttemptCounters();
+    delete process.env[REQUIRED_CONTEXTS_OVERRIDE_ENV];
+    delete process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV];
+  });
+
+  afterEach(() => {
+    resetRequiredContextsCache();
+    resetRequiredContextsAttemptCounters();
+    delete process.env[REQUIRED_CONTEXTS_OVERRIDE_ENV];
+    delete process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV];
+  });
+
+  test('non-required cancelled check does not block when required checks succeed', async () => {
+    const h = harness(
+      [verdict('required-green')],
+      greenPr({
+        checks: { total: 3, passed: 2, failed: 1, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'failure'),
+          checkRun(2, ' Docker-Build ', 'completed', 'success'),
+          checkRun(3, 'test (ubuntu-latest)', 'completed', 'success'),
+          checkRun(4, 'test (windows-latest)', 'completed', 'cancelled'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(1);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+    );
+  });
+
+  test('required failure still blocks and the skip log names the context', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('required-red')],
+        greenPr({
+          checks: { total: 2, passed: 2, failed: 0, pending: 0 },
+          checkRuns: [
+            checkRun(1, 'docker-build', 'completed', 'success'),
+            checkRun(2, 'test (ubuntu-latest)', 'completed', 'failure'),
+          ],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup(required) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]).toEqual(
+        expect.objectContaining({ mutationSent: false, reason: 'required_checks_not_success' })
+      );
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.merge_skipped', {
+        reason: 'required_checks_not_success',
+        blockingContexts: ['test (ubuntu-latest)'],
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('required pending check blocks even when the aggregate summary is green', async () => {
+    const h = harness(
+      [verdict('required-pending')],
+      greenPr({
+        checks: { total: 2, passed: 2, failed: 0, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'in_progress', null),
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+  });
+
+  test('missing required check blocks even when the aggregate summary is green', async () => {
+    const h = harness(
+      [verdict('required-missing')],
+      greenPr({
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        checkRuns: [checkRun(1, 'test (ubuntu-latest)', 'completed', 'success')],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+  });
+
+  test('unknown required set falls back to aggregate checks and logs the fallback', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('required-unknown')],
+        greenPr({
+          checks: { total: 3, passed: 2, failed: 1, pending: 0 },
+          checkRuns: [
+            checkRun(1, 'docker-build', 'completed', 'success'),
+            checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+            checkRun(3, 'test (windows-latest)', 'completed', 'cancelled'),
+          ],
+        })
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.required_contexts_fallback', {
+        state: 'unknown',
+        reason: 'protection_api_unavailable',
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('authoritative empty required set merges when reported checks pass', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('empty-pass')],
+        greenPr({
+          checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+          checkRuns: [checkRun(1, 'test (windows-latest)', 'completed', 'success')],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup([]) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(1);
+      expect(h.outcomes[0]).toEqual(
+        expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
+      );
+      expect(
+        captured.lines.some(line => line.includes('merge-coordinator.required_contexts_fallback'))
+      ).toBe(false);
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('authoritative empty required set skips when a reported check fails', async () => {
+    const captured = captureRootLogLines();
+    try {
+      const h = harness(
+        [verdict('empty-fail')],
+        greenPr({
+          checks: { total: 2, passed: 1, failed: 1, pending: 0 },
+          checkRuns: [
+            checkRun(1, 'docker-build', 'completed', 'success'),
+            checkRun(2, 'test (windows-latest)', 'completed', 'failure'),
+          ],
+        }),
+        0,
+        { requiredContextsLookups: contextsLookup([]) }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expect(
+        captured.lines.some(line => line.includes('merge-coordinator.required_contexts_fallback'))
+      ).toBe(false);
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('exhausted required set falls back to aggregate checks and logs the fallback', async () => {
+    process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV] = '1';
+    const captured = captureRootLogLines();
+    try {
+      const head = 'exhausted-head';
+      const h = harness(
+        [verdict('required-exhausted', head)],
+        greenPr({
+          headSha: head,
+          checks: { total: 1, passed: 0, failed: 1, pending: 0 },
+          checkRuns: [checkRun(1, 'test (windows-latest)', 'completed', 'cancelled')],
+        }),
+        0,
+        {
+          requiredContextsLookups: {
+            fetchWithAppClient: async () => {
+              throw new Error('lookup_down');
+            },
+          },
+        }
+      );
+      await evaluate(h);
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe('required_checks_not_success');
+      expectCoordinatorWarn(captured.lines, 'merge-coordinator.required_contexts_fallback', {
+        state: 'exhausted',
+        reason: REQUIRED_CONTEXTS_BLOCKED_REASON,
+        prUrl: 'https://github.test/pr/1',
+      });
+    } finally {
+      captured.restore();
+    }
   });
 });

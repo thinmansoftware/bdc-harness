@@ -5,7 +5,7 @@ import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
-import { getDatabase } from '@archon/core/db/connection';
+import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import { normalizeDispatchSubjectKey } from '@archon/core/db/dispatch';
 import * as serviceIdentity from '@archon/core/github/service-identity';
@@ -1495,8 +1495,31 @@ test('dutyOfficerSqliteRaceIsolation', async () => {
     expect(getDatabase()).toBe(parentHandle);
     await parentHandle.query('SELECT 1');
   } finally {
-    fetchStub?.mockRestore();
-    writeDutyOfficerProcessEnv(prior);
-    rmSync(home, { recursive: true, force: true });
+    const cleanupErrors: unknown[] = [];
+    const runCleanup = async (step: () => void | Promise<void>): Promise<void> => {
+      try {
+        await step();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    };
+    await runCleanup(() => {
+      fetchStub?.mockRestore();
+    });
+    await runCleanup(() => {
+      writeDutyOfficerProcessEnv(prior);
+    });
+    await runCleanup(() => {
+      rmSync(home, { recursive: true, force: true });
+    });
+    // The parent getDatabase() singleton stays open for the identity assertion
+    // above. Closing it here is what lets the combined dispatch suite exit on
+    // Windows; reset still runs if close fails.
+    await runCleanup(() => closeDatabase());
+    await runCleanup(() => {
+      resetDatabase();
+    });
+    const cleanupError = cleanupErrors[0];
+    if (cleanupError !== undefined) throw cleanupError;
   }
 });

@@ -1939,6 +1939,54 @@ export async function updateWorkflowRun(
   }
 }
 
+/**
+ * WO-HARNESS-T3-COMMAND-CONSUMER-01 (Overseer majors on approve): the approval
+ * as ONE transaction. A conditional update flips the run paused -> failed (the
+ * approval hand-off to resume) and merges `metadataUpdate` ONLY while the run is
+ * still paused at the gate `expectedNodeId`; the approval events
+ * (node_completed / approval_received) are inserted in the SAME transaction, so
+ * there is never a `failed` run without its approval event and never a partial
+ * approval. Returns false (nothing written) when the run moved on; any failure
+ * rolls the whole approval back.
+ */
+export async function approvePausedRunAtGate(
+  id: string,
+  expectedNodeId: string,
+  metadataUpdate: Record<string, unknown>,
+  events: { event_type: string; step_name?: string; data?: Record<string, unknown> }[] = [],
+  db: IDatabase = getDatabase()
+): Promise<boolean> {
+  const dialect = getDialect();
+  const gateExpr =
+    db.dialect === 'postgres'
+      ? "metadata->'approval'->>'nodeId'"
+      : "json_extract(metadata, '$.approval.nodeId')";
+  return db.withTransaction(async query => {
+    const result = await query(
+      `UPDATE remote_agent_workflow_runs
+         SET status = 'failed', metadata = ${dialect.jsonMerge('metadata', 2)}
+       WHERE id = $1 AND status = 'paused' AND ${gateExpr} = $3`,
+      [id, JSON.stringify(metadataUpdate), expectedNodeId]
+    );
+    if (result.rowCount === 0) return false;
+    for (const event of events) {
+      await query(
+        `INSERT INTO remote_agent_workflow_events
+           (id, workflow_run_id, event_type, step_index, step_name, data)
+         VALUES ($1, $2, $3, NULL, $4, $5)`,
+        [
+          dialect.generateUuid(),
+          id,
+          event.event_type,
+          event.step_name ?? null,
+          JSON.stringify(event.data ?? {}),
+        ]
+      );
+    }
+    return true;
+  });
+}
+
 async function persistTerminalWorkflowRun(
   id: string,
   status: 'completed' | 'failed' | 'cancelled',

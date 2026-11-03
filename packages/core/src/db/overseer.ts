@@ -494,6 +494,18 @@ export async function countRecentOverseerVerdictMerges(since: string): Promise<n
   return Number(result.rows[0]?.merge_count ?? 0);
 }
 
+export async function getEarliestOverseerMergeSlotReservation(
+  since: string
+): Promise<string | null> {
+  const result = await getDatabase().query<{ reserved_at: string }>(
+    `SELECT reserved_at FROM overseer_merge_slot_reservations
+     WHERE reserved_at > $1 AND released_at IS NULL
+     ORDER BY reserved_at ASC LIMIT 1`,
+    [since]
+  );
+  return result.rows[0]?.reserved_at ?? null;
+}
+
 export async function reserveOverseerMergeSlot(
   verdictId: string,
   since: string,

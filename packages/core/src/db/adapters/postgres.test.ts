@@ -248,6 +248,11 @@ describe('PostgresAdapter', () => {
         ['dot', 'Dot (voice companion)', 'drain_on_start', 'FALSE'],
         ['muse', 'Muse (voice companion)', 'drain_on_start', 'FALSE'],
         ['duet', 'Duet (voice companion)', 'drain_on_start', 'FALSE'],
+        // WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 067): the cauldron-fire
+        // command consumer mailbox and the t3-bridge VPS sender, seeded after
+        // Phase 0. combined carries them; migration 040 must not.
+        ['cauldron-fire', 'T3 command consumer', 'drain_on_start', 'TRUE'],
+        ['t3-bridge', 'T3 VPS bridge sender', 'drain_on_start', 'TRUE'],
       ] as const;
 
       expect(migration).toContain(
