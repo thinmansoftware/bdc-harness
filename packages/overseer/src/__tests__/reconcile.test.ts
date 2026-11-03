@@ -1,9 +1,13 @@
 import { describe, expect, mock, test } from 'bun:test';
 import {
+  RECONCILE_SUPERSEDE_ACTION,
+  closeSupersededPullRequest,
   runReconcileOnce,
+  type OctokitLike,
   type ReconcileActionRecord,
   type ReconcileDeps,
   type ReconcileMergedPullRequest,
+  type ReconcileRepoOpenPullRequest,
   type ReconcileTrackerIssue,
 } from '../reconcile';
 
@@ -265,5 +269,351 @@ describe('reconcile', () => {
     expect(deps.labels).toEqual([]);
     expect(deps.closes).toEqual([]);
     expect(deps.actions).toEqual([]);
+  });
+});
+
+const KEEPER_WO = 'WO-XO-BDC-BROWSER-KEEPER-04';
+
+function keeperOpenPr(
+  number: number,
+  woLine: string,
+  headRefName: string,
+  createdAt: string | null = '2026-07-17T11:00:00Z'
+): ReconcileRepoOpenPullRequest {
+  return {
+    number,
+    body: woLine,
+    headRefName,
+    isDraft: false,
+    headRepository: { owner: 'thinmansoftware', repo: 'bdc-harness' },
+    createdAt,
+  };
+}
+
+function supersedeDeps(
+  input: {
+    pr?: ReconcileMergedPullRequest;
+    opens?: ReconcileRepoOpenPullRequest[];
+  } = {}
+): ReconcileDeps & {
+  comments: string[];
+  labels: string[];
+  closes: number[];
+  actions: ReconcileActionRecord[];
+  warnings: string[];
+  infos: string[];
+  pullCloses: Array<{ number: number; comment: string }>;
+  listCalls: { count: number };
+} {
+  const pr =
+    input.pr ??
+    mergedPr({
+      number: 4425,
+      title: 'Keeper implementation',
+      body: `WO: ${KEEPER_WO}\n`,
+      htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/4425',
+    });
+  const opens = input.opens ?? [
+    keeperOpenPr(4422, `WO: ${KEEPER_WO}\n`, 'archon/task-web-worker-1-abc'),
+    keeperOpenPr(4424, `WO: ${KEEPER_WO}\n`, 'archon/task-web-worker-2-def'),
+    keeperOpenPr(9, 'WO: WO-OTHER-THING-09\n', 'archon/other'),
+  ];
+  const deps = fakeDeps({ prs: [pr] });
+  const pullCloses: Array<{ number: number; comment: string }> = [];
+  const listCalls = { count: 0 };
+  deps.listOpenPullRequestsInRepo = async () => {
+    listCalls.count += 1;
+    return opens;
+  };
+  deps.closePullRequest = async closeInput => {
+    pullCloses.push({ number: closeInput.number, comment: closeInput.comment });
+  };
+  deps.hasSupersedeBeenRecorded = async ({ prRef, woId }) =>
+    deps.actions.some(
+      action =>
+        action.action === RECONCILE_SUPERSEDE_ACTION &&
+        action.prRef === prRef &&
+        action.woId === woId
+    );
+  return Object.assign(deps, { pullCloses, listCalls });
+}
+
+describe('reconcile supersede', () => {
+  test('merge_closes_superseded_wo_prs', async () => {
+    const deps = supersedeDeps();
+
+    await runReconcileOnce({ deps });
+
+    expect(deps.pullCloses.map(close => close.number).sort((a, b) => a - b)).toEqual([4422, 4424]);
+    expect(deps.pullCloses.every(close => close.comment.includes('Superseded by #4425'))).toBe(
+      true
+    );
+    expect(deps.closes).toEqual([]);
+    const supersede = deps.actions.filter(action => action.action === RECONCILE_SUPERSEDE_ACTION);
+    expect(supersede).toEqual([
+      {
+        prRef: 'thinmansoftware/bdc-harness#4422',
+        woId: KEEPER_WO,
+        class: 'supersede',
+        action: RECONCILE_SUPERSEDE_ACTION,
+        result: '#4425',
+      },
+      {
+        prRef: 'thinmansoftware/bdc-harness#4424',
+        woId: KEEPER_WO,
+        class: 'supersede',
+        action: RECONCILE_SUPERSEDE_ACTION,
+        result: '#4425',
+      },
+    ]);
+  });
+
+  test('supersede_close_is_idempotent', async () => {
+    const deps = supersedeDeps();
+
+    await runReconcileOnce({ deps });
+    const closesAfterFirst = deps.pullCloses.length;
+    const actionsAfterFirst = deps.actions.filter(
+      action => action.action === RECONCILE_SUPERSEDE_ACTION
+    ).length;
+
+    await runReconcileOnce({ deps });
+
+    expect(deps.pullCloses.length).toBe(closesAfterFirst);
+    expect(deps.actions.filter(action => action.action === RECONCILE_SUPERSEDE_ACTION).length).toBe(
+      actionsAfterFirst
+    );
+  });
+
+  test('supersede_respects_completion_gates', async () => {
+    const sibling = keeperOpenPr(
+      4422,
+      `WO: ${KEEPER_WO}\n`,
+      'archon/task-web-worker-1-abc',
+      '2026-07-17T11:00:00Z'
+    );
+    const merged = {
+      number: 4425,
+      title: 'Keeper implementation',
+      body: `WO: ${KEEPER_WO}\n`,
+      htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/4425',
+      mergedAt: '2026-07-17T12:00:00Z',
+    };
+
+    const wrongBase = supersedeDeps({
+      pr: mergedPr({ ...merged, baseRef: 'feature/not-base' }),
+      opens: [sibling],
+    });
+    await runReconcileOnce({ deps: wrongBase });
+    expect(wrongBase.pullCloses).toEqual([]);
+    expect(wrongBase.listCalls.count).toBe(0);
+
+    const skipped = supersedeDeps({
+      pr: mergedPr({
+        ...merged,
+        baseRef: 'dev',
+        body: `WO: ${KEEPER_WO}\nReconcile-Skip: ${KEEPER_WO}\n`,
+      }),
+      opens: [sibling],
+    });
+    await runReconcileOnce({ deps: skipped });
+    expect(skipped.pullCloses).toEqual([]);
+    expect(skipped.listCalls.count).toBe(0);
+    expect(skipped.actions.filter(action => action.action === RECONCILE_SUPERSEDE_ACTION)).toEqual(
+      []
+    );
+  });
+
+  test('newer_sibling_not_superseded', async () => {
+    const deps = supersedeDeps({
+      pr: mergedPr({
+        number: 4425,
+        title: 'Keeper implementation',
+        body: `WO: ${KEEPER_WO}\n`,
+        htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/4425',
+        baseRef: 'dev',
+        mergedAt: '2026-07-17T12:00:00Z',
+      }),
+      opens: [
+        keeperOpenPr(4422, `WO: ${KEEPER_WO}\n`, 'archon/older', '2026-07-17T11:00:00Z'),
+        keeperOpenPr(4424, `WO: ${KEEPER_WO}\n`, 'archon/newer', '2026-07-17T12:01:00Z'),
+      ],
+    });
+
+    await runReconcileOnce({ deps });
+
+    expect(deps.pullCloses.map(close => close.number)).toEqual([4422]);
+    expect(deps.pullCloses[0]?.comment.includes('Superseded by #4425')).toBe(true);
+    expect(
+      deps.actions
+        .filter(action => action.action === RECONCILE_SUPERSEDE_ACTION)
+        .map(action => action.prRef)
+    ).toEqual(['thinmansoftware/bdc-harness#4422']);
+  });
+
+  test('supersede_time_check_fails_closed', async () => {
+    const mergedFields = {
+      number: 4425,
+      title: 'Keeper implementation',
+      body: `WO: ${KEEPER_WO}\n`,
+      htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/4425',
+      baseRef: 'dev' as const,
+    };
+    const cases: Array<{ createdAt: string | null; mergedAt: string | null }> = [
+      { createdAt: '2026-07-17T12:00:00Z', mergedAt: '2026-07-17T12:00:00Z' },
+      { createdAt: null, mergedAt: '2026-07-17T12:00:00Z' },
+      { createdAt: '', mergedAt: '2026-07-17T12:00:00Z' },
+      { createdAt: 'not-a-date', mergedAt: '2026-07-17T12:00:00Z' },
+      { createdAt: '2026-07-17T11:00:00Z', mergedAt: null },
+      { createdAt: '2026-07-17T11:00:00Z', mergedAt: '' },
+      { createdAt: '2026-07-17T11:00:00Z', mergedAt: 'not-a-date' },
+    ];
+
+    for (const item of cases) {
+      const deps = supersedeDeps({
+        pr: mergedPr({ ...mergedFields, mergedAt: item.mergedAt }),
+        opens: [keeperOpenPr(4422, `WO: ${KEEPER_WO}\n`, 'archon/older', item.createdAt)],
+      });
+      await runReconcileOnce({ deps });
+      expect(deps.pullCloses).toEqual([]);
+      expect(deps.actions.filter(action => action.action === RECONCILE_SUPERSEDE_ACTION)).toEqual(
+        []
+      );
+    }
+  });
+
+  test('unskipped_declared_stem_supersedes_when_another_stem_is_skipped', async () => {
+    const deps = supersedeDeps({
+      pr: mergedPr({
+        number: 4425,
+        title: 'Keeper implementation',
+        body: `WO: ${KEEPER_WO}\nWO: WO-OTHER-THING-09\nReconcile-Skip: WO-OTHER-THING-09\n`,
+        htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/4425',
+        baseRef: 'dev',
+        mergedAt: '2026-07-17T12:00:00Z',
+      }),
+      opens: [
+        keeperOpenPr(4422, `WO: ${KEEPER_WO}\n`, 'archon/older', '2026-07-17T11:00:00Z'),
+        keeperOpenPr(9, 'WO: WO-OTHER-THING-09\n', 'archon/other', '2026-07-17T11:00:00Z'),
+      ],
+    });
+
+    await runReconcileOnce({ deps });
+
+    expect(deps.pullCloses.map(close => close.number)).toEqual([4422]);
+    expect(deps.pullCloses[0]?.comment.includes('Superseded by #4425')).toBe(true);
+  });
+
+  test('supersede_retry_does_not_repost_comment_after_failed_close', async () => {
+    const comments: string[] = [];
+    let closes = 0;
+    const client = {
+      issues: {
+        listComments: async () => ({
+          data: comments.map(body => ({
+            body,
+            user: { login: 'overseer' },
+            html_url: 'https://example.test/comment',
+            created_at: '2026-11-03T00:00:00Z',
+          })),
+        }),
+        createComment: async (input: Record<string, unknown>) => {
+          comments.push(String(input.body));
+          return {};
+        },
+        update: async () => {
+          closes += 1;
+          if (closes === 1) throw new Error('close failed');
+          return {};
+        },
+        addLabels: async () => ({}),
+      },
+    } as unknown as OctokitLike;
+    const input = {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 4422,
+      comment: 'Superseded by #4425',
+    };
+
+    await expect(closeSupersededPullRequest(client, input)).rejects.toThrow('close failed');
+    expect(comments).toEqual(['Superseded by #4425']);
+
+    await closeSupersededPullRequest(client, input);
+
+    expect(comments).toEqual(['Superseded by #4425']);
+    expect(closes).toBe(2);
+  });
+
+  test('truncated_comment_list_posts_missing_supersede_comment_before_close', async () => {
+    const ops: string[] = [];
+    const client = {
+      issues: {
+        listComments: async () => ({ data: null }),
+        createComment: async (input: Record<string, unknown>) => {
+          ops.push(`comment:${String(input.body)}`);
+          return {};
+        },
+        update: async () => {
+          ops.push('close');
+          return {};
+        },
+        addLabels: async () => ({}),
+      },
+    } as unknown as OctokitLike;
+    const input = {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 4422,
+      comment: 'Superseded by #4425',
+    };
+
+    await closeSupersededPullRequest(client, input);
+
+    expect(ops).toEqual(['comment:Superseded by #4425', 'close']);
+  });
+
+  test('truncated_comment_list_with_visible_supersede_comment_does_not_repost', async () => {
+    const wanted = 'Superseded by #4425';
+    let posts = 0;
+    let closes = 0;
+    const client = {
+      issues: {
+        // A full first page keeps the read going; a non-array later page marks
+        // the listing truncated. The wanted body is in the pages that were read.
+        listComments: async (params: { page?: number }) => {
+          if (params.page === 1) {
+            return {
+              data: Array.from({ length: 100 }, (_, index) => ({
+                body: index === 3 ? wanted : `other ${String(index)}`,
+                user: { login: 'overseer' },
+                html_url: 'https://example.test/comment',
+                created_at: '2026-11-03T00:00:00Z',
+              })),
+            };
+          }
+          return { data: null };
+        },
+        createComment: async () => {
+          posts += 1;
+          return {};
+        },
+        update: async () => {
+          closes += 1;
+          return {};
+        },
+        addLabels: async () => ({}),
+      },
+    } as unknown as OctokitLike;
+
+    await closeSupersededPullRequest(client, {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 4422,
+      comment: wanted,
+    });
+
+    expect(posts).toBe(0);
+    expect(closes).toBe(1);
   });
 });

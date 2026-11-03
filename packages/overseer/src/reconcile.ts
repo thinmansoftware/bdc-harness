@@ -26,6 +26,11 @@ export const RECONCILE_KEYWORD_MISSING_ACTION = 'reconcile_keyword_missing_noted
  * action records the mark so a rescan never repeats it.
  */
 export const RECONCILE_MERGED_ACTION = 'reconcile_merged_noted';
+/**
+ * A merged PR closed another OPEN PR that declares the same WO. One row per
+ * sibling so a later pass does not comment or close again.
+ */
+export const RECONCILE_SUPERSEDE_ACTION = 'reconcile_supersede_close';
 /** Action-record class for a tracker closed by a LIVE-PROOF comment. */
 export const RECONCILE_LIVE_PROOF_CLASS = 'live_proof';
 export const MERGED_LABEL = 'status:merged';
@@ -90,6 +95,23 @@ export type ReconcileOpenPullRequest = Pick<
   ReconcileMergedPullRequest,
   'owner' | 'repo' | 'number' | 'title' | 'body' | 'htmlUrl'
 >;
+
+/**
+ * One OPEN pull request in the merged PR's repository, for the supersede pass.
+ * `headRepository` is null when the head repo cannot be verified (deleted fork).
+ */
+export interface ReconcileRepoOpenPullRequest {
+  number: number;
+  body?: string | null;
+  headRefName: string;
+  isDraft: boolean;
+  headRepository: { owner: string; repo: string } | null;
+  /**
+   * ISO creation time of the open PR. Optional for readers that predate the
+   * field; a missing or unparseable time is not created-before-merge.
+   */
+  createdAt?: string | null;
+}
 
 export interface ReconcileTrackerIssue {
   owner: string;
@@ -239,6 +261,27 @@ export interface ReconcileDeps {
   }) => Promise<boolean | CloseEventRead>;
   /** Reopen a tracker issue (amendment A2.1). */
   reopenTrackerIssue?: (input: { issue: ReconcileTrackerIssue }) => Promise<void>;
+  /**
+   * OPEN pull requests in one repository. Optional: when absent, the supersede
+   * pass is skipped so older deps objects keep their current behavior.
+   * A truncated page set may still be processed.
+   */
+  listOpenPullRequestsInRepo?: (input: {
+    owner: string;
+    repo: string;
+  }) => Promise<ReconcileRepoOpenPullRequest[] | PagedRead<ReconcileRepoOpenPullRequest>>;
+  /** Comment and close one pull request. A throw writes no supersede action row. */
+  closePullRequest?: (input: {
+    owner: string;
+    repo: string;
+    number: number;
+    comment: string;
+  }) => Promise<void>;
+  /**
+   * True when this sibling PR already has a reconcile_supersede_close row for
+   * this WO. Defaults to the existing action lookup.
+   */
+  hasSupersedeBeenRecorded?: (input: { prRef: string; woId: string }) => Promise<boolean>;
   now?: () => Date;
   log?: ReconcileLogger;
 }
@@ -262,6 +305,7 @@ export interface OctokitLike {
     }>;
   };
   pulls: {
+    list?(input: Record<string, unknown>): Promise<{ data: unknown }>;
     listFiles(input: Record<string, unknown>): Promise<{
       data: { filename: string }[];
     }>;
@@ -372,9 +416,19 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
     // ONLY when the merged PR's base ref equals that project's base AND the PR
     // carries a closing keyword naming the tracker issue. A merge into any other
     // branch (feature-to-feature) closes nothing. A merged PR that merely NAMES a
-    // WO (prose, or a bare `WO:` line with no keyword) is never completion evidence.
+    // WO (prose, or a bare `WO:` line with no keyword) is never completion evidence
+    // for its tracker.
     const projectBase = resolveProjectBase(pr.owner, pr.repo);
     if (projectBase === null || projectBase !== (pr.baseRef ?? null)) continue;
+
+    // Supersede sibling OPEN PRs only after the project-base gate. A merged PR
+    // that is not completion evidence must not close siblings. Reconcile-Skip
+    // stems are removed inside the call. A rate-limit or auth error aborts the
+    // pass the same way other GitHub reads do.
+    const supersede = await closeSupersededSiblingPullRequests(pr, deps, logger);
+    if (supersede === 'rate_limit' || supersede === 'auth') {
+      return { scanned: seen.size, closed, skipped: true };
+    }
 
     const refNumbers = extractClosingKeywordTrackerRefs(body, pr.owner, pr.repo);
     const declaredStems = extractDeclaredWoStems(body);
@@ -950,6 +1004,151 @@ export function extractDeclaredWoStems(input: string): string[] {
   return [...collectStemsFromLines(input, WO_DECLARATION_PATTERN)];
 }
 
+type SupersedeOutcome = 'continue' | 'rate_limit' | 'auth';
+
+function headIsTargetRepo(
+  candidate: ReconcileRepoOpenPullRequest,
+  owner: string,
+  repo: string
+): boolean {
+  const headOwner = candidate.headRepository?.owner;
+  const headRepo = candidate.headRepository?.repo;
+  if (!headOwner || !headRepo) return false;
+  return (
+    headOwner.toLowerCase() === owner.toLowerCase() && headRepo.toLowerCase() === repo.toLowerCase()
+  );
+}
+
+/** First declared stem that the candidate's WO: line or head branch names. */
+function firstMatchedSupersedeStem(
+  candidate: ReconcileRepoOpenPullRequest,
+  stems: readonly string[]
+): string | null {
+  const declared = new Set(extractDeclaredWoStems(candidate.body ?? ''));
+  const head = candidate.headRefName.toLowerCase();
+  for (const stem of stems) {
+    if (declared.has(stem) || (stem.length > 0 && head.includes(stem.toLowerCase()))) return stem;
+  }
+  return null;
+}
+
+/**
+ * True only when both times parse and the sibling was created strictly before
+ * mergedAt. Missing, empty, invalid, or equal times return false (fail closed:
+ * the sibling is not superseded). Same parse and Number.isNaN checks as
+ * mergedBeforeTrackerCreated.
+ */
+function siblingCreatedBeforeMerge(
+  createdAt: string | null | undefined,
+  mergedAt: string | null | undefined
+): boolean {
+  if (!createdAt || !mergedAt) return false;
+  const created = Date.parse(createdAt);
+  const merged = Date.parse(mergedAt);
+  if (Number.isNaN(created) || Number.isNaN(merged)) return false;
+  return created < merged;
+}
+
+/**
+ * Close OPEN non-draft, non-fork PRs in the merged PR's repo that declare one
+ * of its eligible WO stems and were created strictly before mergedAt.
+ * Eligible stems are manifest `WO:` lines minus `Reconcile-Skip:` stems.
+ * A merged PR whose base is not the project base, or that has no eligible
+ * stems, returns without listing siblings. Does not call closeTrackerIssue.
+ * A failed list closes nothing. A truncated list still processes what it returned.
+ */
+async function closeSupersededSiblingPullRequests(
+  pr: ReconcileMergedPullRequest,
+  deps: ReconcileDeps,
+  logger: ReconcileLogger
+): Promise<SupersedeOutcome> {
+  if (!deps.listOpenPullRequestsInRepo || !deps.closePullRequest) return 'continue';
+  const projectBase = resolveProjectBase(pr.owner, pr.repo);
+  if (projectBase === null || projectBase !== (pr.baseRef ?? null)) return 'continue';
+  const prRef = `${pr.owner}/${pr.repo}#${pr.number}`;
+  const skipped = extractReconcileSkipStems(pr.body ?? '');
+  const stems = extractDeclaredWoStems(pr.body ?? '').filter(stem => !skipped.has(stem));
+  if (stems.length === 0) return 'continue';
+
+  let listed: PagedRead<ReconcileRepoOpenPullRequest>;
+  try {
+    listed = asPagedRead(await deps.listOpenPullRequestsInRepo({ owner: pr.owner, repo: pr.repo }));
+  } catch (error) {
+    if (isRateLimitError(error)) {
+      logger.warn(
+        { err: error as Error, rateLimit: true, prRef },
+        'overseer.reconcile.rate_limit_skip'
+      );
+      return 'rate_limit';
+    }
+    if (isAuthError(error)) {
+      logger.warn(
+        { err: error as Error, authError: true, prRef },
+        'overseer.reconcile.auth_error_skip'
+      );
+      return 'auth';
+    }
+    logger.warn({ err: error as Error, prRef }, 'overseer.reconcile.supersede_list_failed');
+    return 'continue';
+  }
+
+  for (const candidate of listed.items) {
+    if (candidate.number === pr.number) continue;
+    if (candidate.isDraft) continue;
+    if (!headIsTargetRepo(candidate, pr.owner, pr.repo)) continue;
+    const woId = firstMatchedSupersedeStem(candidate, stems);
+    if (!woId) continue;
+    if (!siblingCreatedBeforeMerge(candidate.createdAt, pr.mergedAt)) continue;
+    const siblingRef = `${pr.owner}/${pr.repo}#${candidate.number}`;
+    const already = await (deps.hasSupersedeBeenRecorded ?? hasDefaultSupersedeBeenRecorded)({
+      prRef: siblingRef,
+      woId,
+    });
+    if (already) continue;
+    const comment = `Superseded by #${String(pr.number)}`;
+    try {
+      await deps.closePullRequest({
+        owner: pr.owner,
+        repo: pr.repo,
+        number: candidate.number,
+        comment,
+      });
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        logger.warn(
+          { err: error as Error, rateLimit: true, prRef: siblingRef },
+          'overseer.reconcile.rate_limit_skip'
+        );
+        return 'rate_limit';
+      }
+      if (isAuthError(error)) {
+        logger.warn(
+          { err: error as Error, authError: true, prRef: siblingRef },
+          'overseer.reconcile.auth_error_skip'
+        );
+        return 'auth';
+      }
+      logger.warn(
+        { err: error as Error, woId, prNumber: candidate.number },
+        'overseer.reconcile.supersede_close_failed'
+      );
+      continue;
+    }
+    await (deps.insertAction ?? insertDefaultOverseerAction)({
+      prRef: siblingRef,
+      woId,
+      class: 'supersede',
+      action: RECONCILE_SUPERSEDE_ACTION,
+      result: `#${String(pr.number)}`,
+    });
+    logger.info?.(
+      { woId, prNumber: candidate.number, reason: 'superseded_by_merge' },
+      'overseer.reconcile.supersede_close'
+    );
+  }
+  return 'continue';
+}
+
 const RECONCILE_LINE_MAX = 4096;
 
 function collectStemsFromLines(input: string, linePattern: RegExp): Set<string> {
@@ -1186,6 +1385,61 @@ async function hasDefaultKeywordMissingBeenNoted(input: {
   });
 }
 
+async function hasDefaultSupersedeBeenRecorded(input: {
+  prRef: string;
+  woId: string;
+}): Promise<boolean> {
+  const { hasReconcileActionForPr } = await import('@archon/core/db/overseer');
+  return hasReconcileActionForPr({
+    prRef: input.prRef,
+    woId: input.woId,
+    action: RECONCILE_SUPERSEDE_ACTION,
+  });
+}
+
+/**
+ * Comment, then close. A retry after a successful comment and a failed close
+ * does not post the comment again when that body is already in the pages read.
+ * A truncated listing is not proof the comment exists: when the body is absent
+ * from the returned pages, it is posted before the close. The caller records
+ * the action only after this returns, so a failed close stays eligible for
+ * another pass.
+ */
+export async function closeSupersededPullRequest(
+  client: OctokitLike,
+  input: { owner: string; repo: string; number: number; comment: string }
+): Promise<void> {
+  const wanted = input.comment.trim();
+  let skipComment = false;
+  if (client.issues.listComments) {
+    const existing = await listIssueComments(client, {
+      owner: input.owner,
+      repo: input.repo,
+      number: input.number,
+      title: '',
+      state: 'open',
+    });
+    const found = existing.items.some(comment => comment.body.trim() === wanted);
+    // Truncation must not skip the post. The comment may be absent entirely,
+    // and closing without it drops the required supersede note.
+    skipComment = found;
+  }
+  if (!skipComment) {
+    await client.issues.createComment({
+      owner: input.owner,
+      repo: input.repo,
+      issue_number: input.number,
+      body: input.comment,
+    });
+  }
+  await client.issues.update({
+    owner: input.owner,
+    repo: input.repo,
+    issue_number: input.number,
+    state: 'closed',
+  });
+}
+
 export function createDefaultReconcileDeps(): ReconcileDeps {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const appConfigured = ['GITHUB_APP_', 'GITHUB_APP_OVERSEER_'].some(prefix =>
@@ -1208,6 +1462,9 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       hasSkipBeenNoted: async () => false,
       hasCloseBeenRecorded: async () => false,
       hasKeywordMissingBeenNoted: async () => false,
+      listOpenPullRequestsInRepo: async () => [],
+      closePullRequest: async () => undefined,
+      hasSupersedeBeenRecorded: async () => false,
       insertAction: insertDefaultOverseerAction,
       log,
     };
@@ -1311,6 +1568,12 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     hasHoldBeenNoted: hasDefaultHoldBeenNoted,
     hasKeywordMissingBeenNoted: hasDefaultKeywordMissingBeenNoted,
     hasMergedBeenNoted: hasDefaultMergedBeenNoted,
+    listOpenPullRequestsInRepo: async (input): Promise<PagedRead<ReconcileRepoOpenPullRequest>> =>
+      listRepoOpenPullRequests(await getOctokit(), input.owner, input.repo),
+    closePullRequest: async (input): Promise<void> => {
+      await closeSupersededPullRequest(await getOctokit(), input);
+    },
+    hasSupersedeBeenRecorded: hasDefaultSupersedeBeenRecorded,
     removeTrackerLabel: async (input): Promise<void> => {
       const client = await getOctokit();
       if (!client.issues.removeLabel) return;
@@ -1380,6 +1643,50 @@ async function readPages<T>(
 
 export function asPagedRead<T>(value: T[] | PagedRead<T>): PagedRead<T> {
   return Array.isArray(value) ? { items: value, truncated: false } : value;
+}
+
+function mapRepoOpenPullRequest(row: Record<string, unknown>): ReconcileRepoOpenPullRequest | null {
+  if (typeof row.number !== 'number' || !Number.isSafeInteger(row.number)) return null;
+  const head =
+    row.head && typeof row.head === 'object' ? (row.head as Record<string, unknown>) : undefined;
+  const headRefName = typeof head?.ref === 'string' ? head.ref : '';
+  const repoValue = head?.repo;
+  const repoRecord =
+    repoValue && typeof repoValue === 'object' ? (repoValue as Record<string, unknown>) : undefined;
+  const fullName = typeof repoRecord?.full_name === 'string' ? repoRecord.full_name : '';
+  const slash = fullName.indexOf('/');
+  const owner = slash > 0 ? fullName.slice(0, slash) : '';
+  const repo = slash > 0 ? fullName.slice(slash + 1) : '';
+  return {
+    number: row.number,
+    body: typeof row.body === 'string' ? row.body : null,
+    headRefName,
+    isDraft: row.draft === true,
+    headRepository: owner.length > 0 && repo.length > 0 ? { owner, repo } : null,
+    createdAt: typeof row.created_at === 'string' ? row.created_at : null,
+  };
+}
+
+/** Paginated open PRs for the supersede pass. A missing list method is a failed read. */
+async function listRepoOpenPullRequests(
+  octokit: OctokitLike,
+  owner: string,
+  repo: string
+): Promise<PagedRead<ReconcileRepoOpenPullRequest>> {
+  if (!octokit.pulls.list) return { items: [], truncated: true };
+  return readPages(
+    async page =>
+      (
+        await octokit.pulls.list?.({
+          owner,
+          repo,
+          state: 'open',
+          per_page: READ_PAGE_SIZE,
+          page,
+        })
+      )?.data,
+    mapRepoOpenPullRequest
+  );
 }
 
 /** Reader 1: open tracker issues labelled status:merged (LIVE-PROOF pass input). */
