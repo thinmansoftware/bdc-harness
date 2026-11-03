@@ -81,6 +81,13 @@ describe('adapter octokit method names -- against the real Octokit, not a mock',
     expect(typeof repos.getBranchRules).toBe('function');
   });
 
+  test('5 commit status listing exists on the real client', () => {
+    const repos = realOctokit().repos as unknown as Record<string, unknown>;
+    // findPullRequest calls this by name. A missing function would skip status
+    // evidence and leave a successful required status looking absent.
+    expect(typeof repos.listCommitStatusesForRef).toBe('function');
+  });
+
   test('4 the adapter binds real methods when built over a real Octokit instance', async () => {
     // The end-to-end shape check: construct the adapter exactly as production
     // does -- real client, same cast -- and prove the bound probes actually

@@ -1509,15 +1509,15 @@ test('dutyOfficerSqliteRaceIsolation', async () => {
     await runCleanup(() => {
       writeDutyOfficerProcessEnv(prior);
     });
-    await runCleanup(() => {
-      rmSync(home, { recursive: true, force: true });
-    });
-    // The parent getDatabase() singleton stays open for the identity assertion
-    // above. Closing it here is what lets the combined dispatch suite exit on
-    // Windows; reset still runs if close fails.
+    // Close and reset before deleting the temp dir. On Windows the open
+    // SQLite handle makes removal fail, and that recorded error is thrown
+    // even when a later close succeeds. reset still runs if close fails.
     await runCleanup(() => closeDatabase());
     await runCleanup(() => {
       resetDatabase();
+    });
+    await runCleanup(() => {
+      rmSync(home, { recursive: true, force: true });
     });
     const cleanupError = cleanupErrors[0];
     if (cleanupError !== undefined) throw cleanupError;

@@ -33,7 +33,7 @@ import {
 } from './merge-repo-policy';
 import { specDeclaresMergeHold } from './merge-hold';
 import { isSpecOnlyChangeSet } from './reconcile';
-import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
+import type { GitHubClientDeps, PullRequestCommitStatus, PullRequestEvidence } from './types.ts';
 import { resolveRequiredContexts } from './adapters/required-contexts';
 import { createRealOctokitClient } from './adapters/github-real-deps';
 import {
@@ -589,27 +589,68 @@ function reportedChecksAreBlocking(checks: PullRequestEvidence['checks']): boole
   return checks.total === 0 || checks.failed > 0 || checks.pending > 0;
 }
 
+function commitStatusRank(status: PullRequestCommitStatus): number {
+  const created = typeof status.createdAt === 'string' ? Date.parse(status.createdAt) : NaN;
+  if (Number.isFinite(created)) return created;
+  const updated = typeof status.updatedAt === 'string' ? Date.parse(status.updatedAt) : NaN;
+  if (Number.isFinite(updated)) return updated;
+  return Number.NEGATIVE_INFINITY;
+}
+
+function commitStatusIsNewer(
+  candidate: PullRequestCommitStatus,
+  current: PullRequestCommitStatus
+): boolean {
+  const candidateRank = commitStatusRank(candidate);
+  const currentRank = commitStatusRank(current);
+  if (candidateRank !== currentRank) return candidateRank > currentRank;
+  return (candidate.id ?? 0) > (current.id ?? 0);
+}
+
+/** Latest status per context name. Names match after trim and case fold. */
+function latestCommitStatusPerContext(
+  statuses: readonly PullRequestCommitStatus[]
+): Map<string, PullRequestCommitStatus> {
+  const latest = new Map<string, PullRequestCommitStatus>();
+  for (const status of statuses) {
+    const key = status.context.trim().toLowerCase();
+    if (key.length === 0) continue;
+    const held = latest.get(key);
+    if (!held || commitStatusIsNewer(status, held)) latest.set(key, status);
+  }
+  return latest;
+}
+
+function commitStatusIsPassing(state: string): boolean {
+  return state.trim().toLowerCase() === 'success';
+}
+
 /**
  * Required contexts that are missing, still running, or completed without a
  * passing conclusion. Names match after trim and case fold. Only the latest
- * attempt per check name and app is considered. The returned strings are the
- * required context names, not the check-run display names.
+ * attempt per check name and app is considered. A context with no check run
+ * can still pass when its latest commit status state is success. The returned
+ * strings are the required context names, not the check-run display names.
  */
 function blockingRequiredContexts(
   contexts: readonly string[],
-  runs: readonly RecheckCheckRun[]
+  runs: readonly RecheckCheckRun[],
+  statuses: readonly PullRequestCommitStatus[]
 ): string[] {
   const latest = latestAttemptPerCheck([...runs]);
+  const latestStatuses = latestCommitStatusPerContext(statuses);
   const blocking: string[] = [];
   for (const context of contexts) {
     const want = context.trim().toLowerCase();
     const matches = latest.filter(run => (run.name ?? '').trim().toLowerCase() === want);
-    if (
-      matches.length === 0 ||
-      matches.some(run => run.status !== 'completed' || !conclusionIsPassing(run.conclusion))
-    ) {
-      blocking.push(context);
+    if (matches.length > 0) {
+      if (matches.some(run => run.status !== 'completed' || !conclusionIsPassing(run.conclusion))) {
+        blocking.push(context);
+      }
+      continue;
     }
+    const status = latestStatuses.get(want);
+    if (!status || !commitStatusIsPassing(status.state)) blocking.push(context);
   }
   return blocking;
 }
@@ -794,7 +835,11 @@ async function mergeClaimedVerdict(
     lookups ? process.env : {}
   );
   if (resolution.state === 'known' && resolution.contexts.length > 0) {
-    const blockingContexts = blockingRequiredContexts(resolution.contexts, pr.checkRuns ?? []);
+    const blockingContexts = blockingRequiredContexts(
+      resolution.contexts,
+      pr.checkRuns ?? [],
+      pr.commitStatuses ?? []
+    );
     if (blockingContexts.length > 0) {
       await skip('required_checks_not_success', pr.htmlUrl, false, { blockingContexts });
       return undefined;

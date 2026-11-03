@@ -50,6 +50,18 @@ export interface PullRequestCheckSummary {
   conclusion?: string;
 }
 
+/**
+ * One GitHub commit status on the PR head. Distinct from a check run: a
+ * required context can be satisfied by a status alone.
+ */
+export interface PullRequestCommitStatus {
+  id?: number;
+  context: string;
+  state: string;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
 export interface PullRequestEvidence {
   exists: boolean;
   state: PullRequestState;
@@ -92,11 +104,18 @@ export interface PullRequestEvidence {
    */
   labels?: readonly string[];
   /**
-   * Check runs behind `checks`, when the evidence source loaded them.
+   * Latest check run per name and app, when the evidence source loaded them.
    * Absent on older fixtures. An empty array means the lookup returned no runs.
-   * The merge gate matches required contexts against these runs.
+   * The merge gate matches required contexts against these runs, then against
+   * `commitStatuses` when a context has no check run.
    */
   checkRuns?: readonly RecheckCheckRun[];
+  /**
+   * Commit statuses for the head. Absent when the evidence source did not load
+   * them. An empty array means the lookup returned none. The merge gate treats
+   * the latest status for a context as passing only when its state is success.
+   */
+  commitStatuses?: readonly PullRequestCommitStatus[];
 }
 
 export interface GrokJudgeEvidence {
