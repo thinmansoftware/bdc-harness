@@ -69,6 +69,23 @@ describe('reviewConflictFromMessages', () => {
     ).toBeNull();
   });
 
+  test('a read at its page cap fails closed unless a conflict is already visible', () => {
+    const clean = [receipt(H, 'approved')];
+    expect(
+      reviewConflictFromMessages({ ...PR, headSha: H }, clean, [request(H, 'done')], {
+        truncated: true,
+      })
+    ).toBe('lookup_failed');
+    expect(
+      reviewConflictFromMessages(
+        { ...PR, headSha: H },
+        [...clean, receipt(H, 'changes_requested')],
+        [],
+        { truncated: true }
+      )
+    ).toBe('changes_requested');
+  });
+
   test('ignores other PRs and unparseable bodies', () => {
     const otherPr = {
       body: JSON.stringify({

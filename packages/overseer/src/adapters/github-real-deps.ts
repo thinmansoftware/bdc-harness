@@ -2170,6 +2170,8 @@ export function createRealListOpenPullRequests(
 // Same value as REVIEW_RECIPIENT in pr-review-wiring.ts; not imported because
 // pr-review-wiring already imports this module.
 const REVIEW_REQUEST_RECIPIENT = 'overseer-reviewer';
+// listMessages caps a read at 500 rows.
+const REVIEW_CONFLICT_PAGE_LIMIT = 500;
 
 function bodyAtHead(
   message: Pick<DispatchMessage, 'body'>,
@@ -2193,11 +2195,14 @@ function bodyAtHead(
  * receipts (pr-review-log and operator); `requests` are review requests to the
  * reviewer. A changes_requested receipt at the head wins; otherwise a request
  * for the head that is still queued or claimed means a review is in flight.
+ * When a read came back at its page cap (`truncated`), rows for this head may
+ * be missing, so the answer is lookup_failed unless a conflict is already seen.
  */
 export function reviewConflictFromMessages(
   input: PullRequestRef & { headSha: string },
   receipts: readonly Pick<DispatchMessage, 'body'>[],
-  requests: readonly Pick<DispatchMessage, 'body' | 'status'>[]
+  requests: readonly Pick<DispatchMessage, 'body' | 'status'>[],
+  options: { truncated?: boolean } = {}
 ): ReviewConflictAtHead | null {
   const changesRequested = receipts.some(receipt => {
     const body = bodyAtHead(receipt, input);
@@ -2209,7 +2214,8 @@ export function reviewConflictFromMessages(
       (request.status === 'queued' || request.status === 'claimed') &&
       bodyAtHead(request, input) !== null
   );
-  return inFlight ? 'review_in_flight' : null;
+  if (inFlight) return 'review_in_flight';
+  return options.truncated ? 'lookup_failed' : null;
 }
 
 /**
@@ -2310,24 +2316,28 @@ export function createRealGitHubClientDeps(
     reviewConflictAtHead: async (input): Promise<ReviewConflictAtHead | null> => {
       const subjectKey = `gh:${input.owner}/${input.repo}#${input.number}`;
       try {
-        const receipts = [
-          ...(await listDispatchMessages({
-            recipient: PR_REVIEW_LOG_RECIPIENT,
-            subject_key: subjectKey,
-            limit: 500,
-          })),
-          ...(await listDispatchMessages({
-            recipient: 'operator',
-            subject_key: subjectKey,
-            limit: 500,
-          })),
-        ];
+        const pr = await listDispatchMessages({
+          recipient: PR_REVIEW_LOG_RECIPIENT,
+          subject_key: subjectKey,
+          limit: REVIEW_CONFLICT_PAGE_LIMIT,
+        });
+        const operator = await listDispatchMessages({
+          recipient: 'operator',
+          subject_key: subjectKey,
+          limit: REVIEW_CONFLICT_PAGE_LIMIT,
+        });
         const requests = await listDispatchMessages({
           recipient: REVIEW_REQUEST_RECIPIENT,
           subject_key: subjectKey,
-          limit: 500,
+          limit: REVIEW_CONFLICT_PAGE_LIMIT,
         });
-        return reviewConflictFromMessages(input, receipts, requests);
+        // listMessages has no pagination. A full page may hide older rows for
+        // this head, so a full page is not proof of "no conflict".
+        const truncated =
+          pr.length >= REVIEW_CONFLICT_PAGE_LIMIT ||
+          operator.length >= REVIEW_CONFLICT_PAGE_LIMIT ||
+          requests.length >= REVIEW_CONFLICT_PAGE_LIMIT;
+        return reviewConflictFromMessages(input, [...pr, ...operator], requests, { truncated });
       } catch {
         return 'lookup_failed';
       }
