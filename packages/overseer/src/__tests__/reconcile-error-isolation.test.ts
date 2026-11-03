@@ -12,15 +12,29 @@ import {
 
 // WO-HARNESS-RECONCILE-PER-PR-ERROR-ISOLATION-01
 //
-// A spurious same-title open+closed PAIR (a history/containment copy sitting
-// next to the live tracker) must not abort a reconcile pass -- findTrackerIssueByStem
-// now prefers the single open match. GENUINE ambiguity (two or more open matches,
-// or a zero-open set with more than one closed copy) and malformed-snapshot errors
-// remain FAIL CLOSED: they propagate out of runReconcileOnce and no tracker is
-// mutated (the existing contract enforced in reconcile-github-auth.test.ts). These
-// tests cover both the open-vs-closed preference and that fail-closed boundary.
+// Two behaviours, and the line between them.
+//
+// 1. ERROR ISOLATION (the WO's core ask). A GENERIC lookup failure -- a transport
+//    blip, one unreadable tracker -- is contained. A per-PR keyword lookup logs
+//    `overseer.reconcile.pr_error` and moves to the next PR; a declared-stem
+//    lookup logs `overseer.reconcile.stem_lookup_error` and skips that stem. The
+//    pass completes and later PRs are still reconciled.
+//
+// 2. FAIL CLOSED (the pre-existing safety contract, preserved). An error saying
+//    the tracker DATA is untrustworthy is NOT isolated: a malformed/conflicting/
+//    over-budget REST snapshot (we do not know the tracker state) and a genuinely
+//    ambiguous exact title (we do not know WHICH tracker) still propagate out of
+//    runReconcileOnce with no tracker mutated. Tracker MUTATION failures are also
+//    untouched: isolation wraps only the lookup call, never the comment/label/
+//    close effects, so a failed mark still aborts.
+//
+// A spurious same-title open+closed PAIR (a history/containment copy beside the
+// live tracker) is not genuine ambiguity -- findTrackerIssueByStem prefers the
+// single open match. The end-to-end fail-closed cases against the real REST
+// snapshot code live in reconcile-github-auth.test.ts.
 
 const STEM_A = 'WO-X-AMBIG-01';
+const STEM_B = 'WO-X-OTHER-02';
 
 // PR A: on its project base (bdc-harness -> dev), declares STEM_A on a manifest
 // WO: line and carries NO closing keyword. This drives the declared-stem lookup
@@ -48,6 +62,8 @@ function prA(overrides: Partial<ReconcileMergedPullRequest> = {}): ReconcileMerg
 function reconcileDeps(input: {
   prs: ReconcileMergedPullRequest[];
   snapshot: TrackerIssueSnapshot;
+  findTrackerIssueByStem?: (stem: string) => Promise<ReconcileTrackerIssue | null>;
+  findTrackerIssueByNumber?: (number: number) => Promise<ReconcileTrackerIssue | null>;
 }): ReconcileDeps & {
   labels: string[];
   comments: string[];
@@ -69,9 +85,13 @@ function reconcileDeps(input: {
     readCursor: mock(async () => null),
     now: () => new Date('2026-11-03T12:10:00Z'),
     searchMergedPullRequests: mock(async () => input.prs),
-    findTrackerIssueByNumber: mock(async () => null),
+    findTrackerIssueByNumber: mock(
+      async (number: number) => (await input.findTrackerIssueByNumber?.(number)) ?? null
+    ),
     findTrackerIssueByStem: mock(async (candidate: string) =>
-      findTrackerIssueByStem(input.snapshot, candidate)
+      input.findTrackerIssueByStem
+        ? await input.findTrackerIssueByStem(candidate)
+        : findTrackerIssueByStem(input.snapshot, candidate)
     ),
     addTrackerEvidenceComment: mock(async request => {
       comments.push(request.body);
@@ -170,6 +190,146 @@ describe('findTrackerIssueByStem open-vs-closed preference (WO-HARNESS-RECONCILE
   test('no_match_returns_null', () => {
     const snap = snapshot([snapshotRow({ number: 3743, title: 'WO-OTHER-01', state: 'open' })]);
     expect(findTrackerIssueByStem(snap, 'WO-X-01')).toBeNull();
+  });
+});
+
+// PR B: declares a DIFFERENT stem, also with no closing keyword. Used to prove a
+// later PR/stem is still reconciled after an earlier one failed.
+function prB(overrides: Partial<ReconcileMergedPullRequest> = {}): ReconcileMergedPullRequest {
+  return {
+    ...prA(),
+    number: 502,
+    title: 'PR B declares another WO stem',
+    body: `WO: ${STEM_B}\n\nImplementation notes for ${STEM_B}.`,
+    htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/502',
+    mergeCommitSha: 'shaB',
+    ...overrides,
+  };
+}
+
+// PR K: carries a closing keyword naming tracker #4114, which drives the per-PR
+// findTrackerIssueByNumber path. The cross-repo form is required: a bare `#n`
+// resolves to the PR's own repo and is not a tracker ref.
+function prK(overrides: Partial<ReconcileMergedPullRequest> = {}): ReconcileMergedPullRequest {
+  return {
+    ...prA(),
+    number: 601,
+    title: 'PR K closes a tracker by keyword',
+    body: 'Closes thinmansoftware/bdc-xo#4114',
+    htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/601',
+    mergeCommitSha: 'shaK',
+    ...overrides,
+  };
+}
+
+describe('runReconcileOnce generic error isolation (WO-HARNESS-RECONCILE-PER-PR-ERROR-ISOLATION-01)', () => {
+  test('generic_stem_lookup_error_is_isolated -- logs stem_lookup_error and finishes the pass', async () => {
+    // STEM_A's lookup fails generically; STEM_B on a later PR must still be noted.
+    const snap = snapshot([snapshotRow({ number: 4200, title: STEM_B, state: 'open' })]);
+    const deps = reconcileDeps({
+      prs: [prA(), prB()],
+      snapshot: snap,
+      findTrackerIssueByStem: async stem => {
+        if (stem === STEM_A) throw new Error('transient stem lookup blip');
+        return findTrackerIssueByStem(snap, stem);
+      },
+    });
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result.skipped).toBe(false);
+    expect(deps.warnings).toContain('overseer.reconcile.stem_lookup_error');
+    // The later stem was still reconciled -- the failure did not abort the pass.
+    expect(deps.actions.map(a => a.woId)).toContain(STEM_B);
+    expect(deps.actions.map(a => a.woId)).not.toContain(STEM_A);
+  });
+
+  test('generic_pr_lookup_error_is_isolated -- logs pr_error and proceeds to later PRs', async () => {
+    // PR K's keyword lookup fails generically. PR B, processed after it, must
+    // still be reconciled.
+    const snap = snapshot([snapshotRow({ number: 4200, title: STEM_B, state: 'open' })]);
+    const deps = reconcileDeps({
+      prs: [prK(), prB()],
+      snapshot: snap,
+      findTrackerIssueByNumber: async () => {
+        throw new Error('transient tracker lookup blip');
+      },
+    });
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result.skipped).toBe(false);
+    expect(deps.warnings).toContain('overseer.reconcile.pr_error');
+    // The later PR was still reconciled.
+    expect(deps.actions.map(a => a.woId)).toContain(STEM_B);
+    // The failing PR produced no tracker effect of its own.
+    expect(deps.comments).toEqual([]);
+    expect(deps.labels).toEqual([]);
+  });
+
+  test('rate_limit_at_pr_lookup_still_skips -- isolation did not swallow the RL skip', async () => {
+    const snap = snapshot([snapshotRow({ number: 4200, title: STEM_B, state: 'open' })]);
+    const deps = reconcileDeps({
+      prs: [prK(), prB()],
+      snapshot: snap,
+      findTrackerIssueByNumber: async () => {
+        throw Object.assign(new Error('API rate limit exceeded'), { status: 403 });
+      },
+    });
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result.skipped).toBe(true);
+    expect(deps.warnings).toContain('overseer.reconcile.rate_limit_skip');
+    expect(deps.warnings).not.toContain('overseer.reconcile.pr_error');
+    expect(deps.actions).toEqual([]);
+  });
+
+  test('malformed_snapshot_at_pr_lookup_aborts -- integrity errors are never isolated', async () => {
+    // A malformed REST snapshot means the tracker state is unknown. Isolating it
+    // would let reconcile act on later PRs against untrustworthy data.
+    const snap = snapshot([snapshotRow({ number: 4200, title: STEM_B, state: 'open' })]);
+    const deps = reconcileDeps({
+      prs: [prK(), prB()],
+      snapshot: snap,
+      findTrackerIssueByNumber: async () => {
+        throw new Error('tracker issue REST listing returned a malformed page');
+      },
+    });
+
+    await expect(runReconcileOnce({ deps })).rejects.toThrow('tracker issue REST listing');
+    expect(deps.actions).toEqual([]);
+    expect(deps.comments).toEqual([]);
+    expect(deps.labels).toEqual([]);
+  });
+
+  test('malformed_snapshot_at_stem_lookup_aborts -- integrity errors are never isolated', async () => {
+    const snap = snapshot([snapshotRow({ number: 4200, title: STEM_B, state: 'open' })]);
+    const deps = reconcileDeps({
+      prs: [prA(), prB()],
+      snapshot: snap,
+      findTrackerIssueByStem: async () => {
+        throw new Error('tracker issue REST listing exceeded its complete-page budget');
+      },
+    });
+
+    await expect(runReconcileOnce({ deps })).rejects.toThrow('complete-page budget');
+    expect(deps.actions).toEqual([]);
+  });
+
+  test('tracker_mutation_failure_still_aborts -- isolation wraps the lookup, not the effects', async () => {
+    // The comment/label/close effects sit OUTSIDE the isolated lookup, so a failed
+    // mark still aborts the pass and is never recorded as a success.
+    const snap = snapshot([snapshotRow({ number: 4114, title: STEM_A, state: 'open' })]);
+    const deps = reconcileDeps({
+      prs: [prA()],
+      snapshot: snap,
+    });
+    deps.insertAction = async () => {
+      throw new Error('fixture action insert failed');
+    };
+
+    await expect(runReconcileOnce({ deps })).rejects.toThrow('fixture action insert failed');
   });
 });
 
