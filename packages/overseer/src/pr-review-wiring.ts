@@ -323,14 +323,32 @@ export class ReviewExecutionIncompleteError extends Error {
  * blobs are prefetched, and the sandbox cannot reach the promisor remote.
  * `git show --stat <head>` on a depth-1 head diffs against the empty tree and
  * needs every blob, so it failed there and every such review ended as
- * sandbox_execution_proof_missing_or_invalid. `ls-tree -r --name-only` reads
- * only tree objects, which the blob filter keeps, so it succeeds on full and
- * shallow/sparse checkouts alike, and non-empty output still proves git ran in
- * the real checkout at the exact head.
+ * sandbox_execution_proof_missing_or_invalid. `ls-tree --name-only` reads only
+ * the head's root tree object, which the blob filter keeps, so it succeeds on
+ * full and shallow/sparse checkouts alike.
+ *
+ * It MUST also stay NON-RECURSIVE. The broker retains at most 128 KiB
+ * (OUTPUT_LIMIT in scripts/overseer-reviewer-broker.ts) of a check job's
+ * output and kills the job when that is crossed. A recursive `ls-tree -r`
+ * listing of thinmansoftware/bdc-xo is 7,167 paths = 442,357 bytes, so the
+ * inspection was killed and every bdc-xo review ended incomplete (PR 4330,
+ * head fb091356, 2026-11-02). Top-level entries only keep the output small
+ * for any repository, and non-empty output still proves git ran in the real
+ * checkout at the exact head. A head whose tree is empty prints nothing; that
+ * ends the review as REVIEW_HEAD_TREE_EMPTY, not the generic missing proof.
  */
 export function reviewInspectionArgv(headSha: string): string[] {
-  return ['git', ...GIT_CONFIG_ARGS, 'ls-tree', '-r', '--name-only', headSha];
+  return ['git', ...GIT_CONFIG_ARGS, 'ls-tree', '--name-only', headSha];
 }
+
+/** review_incomplete reason for a PR head whose tree has no entries. */
+export const REVIEW_HEAD_TREE_EMPTY = 'review_head_tree_empty';
+
+/** Git's empty tree object id in the SHA-1 and SHA-256 object formats. */
+const EMPTY_TREE_IDS: ReadonlySet<string> = new Set([
+  '4b825dc642cb6eb9a060e54bf8d69288fbee4904',
+  '6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321',
+]);
 
 /** Server-observed native execution. No model field can manufacture this proof. */
 export async function observeReviewExecution(
@@ -344,6 +362,8 @@ export async function observeReviewExecution(
     return await withUntrustedScratch(async env => {
       const before = await readCheckoutFingerprint(context.checkoutPath, context.headSha, env);
       if (!before) return undefined;
+      if (EMPTY_TREE_IDS.has(before.treeSha))
+        throw new ReviewExecutionIncompleteError(REVIEW_HEAD_TREE_EMPTY);
       // A real repository read inside the same native boundary is the supervisor
       // inspection event. It catches a reviewer that only received a supplied diff.
       const inspection = await submitReviewerBrokerJob({
@@ -351,7 +371,9 @@ export async function observeReviewExecution(
         expectedHead: context.headSha,
         argv: reviewInspectionArgv(context.headSha),
       });
-      if (!inspection.ok || inspection.stdout.trim().length === 0) return undefined;
+      if (!inspection.ok) return undefined;
+      if (inspection.stdout.trim().length === 0)
+        throw new ReviewExecutionIncompleteError(REVIEW_HEAD_TREE_EMPTY);
       const checks: ReviewExecutionProof['checks'][number][] = [];
       for (const argv of context.checkPlan) {
         if (argv.length === 0 || argv.some(value => !value || value.includes('\0')))
