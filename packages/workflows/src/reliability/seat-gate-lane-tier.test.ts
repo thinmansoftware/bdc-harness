@@ -245,18 +245,27 @@ describe('seat gate honors the fired lane tier', () => {
     expect(log?.obj.seat).toBe('claude');
   });
 
-  test('node_seat_over_cutoff_without_failover_still_refuses_with_role_node', async () => {
+  test('node_seat_over_cutoff_without_failover_reroutes_to_a_provider_with_headroom', async () => {
+    // WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01: claude (the lane seat) has room,
+    // so the undeclared codex reviewer node is rerouted instead of refusing the run.
+    // The role=node refusal where no provider has room is covered in
+    // seat-gate-node-failover.test.ts and by the decideSeatGate unit tests below.
     setSeatUsageReaderForTests(async () => ({
       claude: reading('claude', 'seven_day', 30),
       codex: reading('codex', 'primary', 96),
     }));
     const { result, store } = await run(stubLane(false));
-    expect(result.error).toBe(
-      'seat_usage_refused:codex:primary:96:90:lane=stub-claude-lane:role=node'
-    );
-    const event = failedEvents(store).find(data => data.reason === 'seat_usage_refused');
-    expect(event?.role).toBe('node');
-    expect(event?.lane).toBe(LANE);
+    expect(result.error ?? '').not.toContain('seat_usage_refused');
+    expect(failedEvents(store).some(data => data.reason === 'seat_usage_refused')).toBe(false);
+    const rerouted = store.createWorkflowEvent.mock.calls
+      .map(
+        call => call[0] as { event_type: string; step_name?: string; data: Record<string, string> }
+      )
+      .filter(event => event.event_type === 'node_failover');
+    expect(rerouted).toHaveLength(1);
+    expect(rerouted[0]?.step_name).toBe('diff-review');
+    expect(rerouted[0]?.data.to_provider).toBe('claude');
+    expect(rerouted[0]?.data.reason_code).toBe('seat_over_cutoff');
   });
 
   test('node seat refuses when the failover target seat is itself over the cutoff', () => {
@@ -398,16 +407,21 @@ describe('codex purchased credits', () => {
     expect(warnings.some(entry => entry.msg === 'workflow.seat_usage_node_degraded')).toBe(false);
   });
 
-  test('codex window at 96 with has_credits=false refuses as before', async () => {
+  test('codex window at 96 with has_credits=false is not treated as credits and reroutes', async () => {
     setSeatUsageReaderForTests(async () => ({
       claude: reading('claude', 'seven_day', 30),
       codex: codexOnCredits(96, false),
     }));
-    const { result } = await run(stubLane(false));
-    expect(result.error).toBe(
-      'seat_usage_refused:codex:primary:96:90:lane=stub-claude-lane:role=node'
-    );
+    const { result, store } = await run(stubLane(false));
+    // Without credits the codex seat is over the cutoff; the reviewer node is
+    // rerouted to the claude lane seat, which has headroom.
+    expect(result.error ?? '').not.toContain('seat_usage_refused');
     expect(warnings.some(entry => entry.msg === 'workflow.seat_usage_on_credits')).toBe(false);
+    expect(
+      store.createWorkflowEvent.mock.calls.some(
+        call => (call[0] as { event_type: string }).event_type === 'node_failover'
+      )
+    ).toBe(true);
   });
 
   test('codex lane on credits is not refused on its own seat; overage blocked still refuses', () => {
