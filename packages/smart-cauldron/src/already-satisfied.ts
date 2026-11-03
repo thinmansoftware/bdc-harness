@@ -96,8 +96,8 @@ function stripExclusionSections(text: string): string {
 /**
  * True when text contains the exact WO_ID as a token (not a longer sibling id),
  * OUTSIDE any "explicitly out of scope" section. "WO-FOO-01" must not match
- * "WO-FOO-010". Branch suffixes like "-thread-abc" after the id are allowed
- * (other hyphen continuations are rejected). Case-insensitive.
+ * "WO-FOO-010". Hyphen continuations, including "-thread-abc", are excluded
+ * as longer tokens. Case-insensitive.
  */
 export function textClaimsWoId(text: string, woId: string): boolean {
   return matchesWoToken(stripExclusionSections(text), woId);
@@ -244,6 +244,7 @@ function toOpenWoPullRequest(
   targetRepo: string,
   woId: string
 ): OpenWoPullRequest | null {
+  if (row.draft === true) return null;
   const fullName = row.head?.repo?.full_name;
   if (typeof fullName !== 'string' || fullName.length === 0) return null;
   if (fullName.toLowerCase() !== targetRepo.toLowerCase()) return null;
@@ -306,7 +307,7 @@ async function ghListOpenPullRequestsDefault(
 
 /**
  * OPEN, non-fork PRs in the target repo whose body has a WO: line token-matching
- * woId, or whose head branch contains woId (case-insensitive). Drafts included.
+ * woId, or whose head branch contains woId (case-insensitive). Drafts excluded.
  * Head repositories that cannot be verified, and forks, are excluded.
  */
 export async function listOpenWoPullRequests(

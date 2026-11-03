@@ -27,19 +27,19 @@ describe('textClaimsWoId', () => {
     expect(textClaimsWoId('WO-HARNESS-FOO-01A', 'WO-HARNESS-FOO-01')).toBe(false);
   });
 
-  test('matches branch names containing the WO (case-insensitive)', () => {
+  test('rejects ambiguous thread suffixes even in branch names', () => {
     expect(
       textClaimsWoId(
         'feat/wo-shopops-gary-support-visibility-01-thread-abc',
         'WO-SHOPOPS-GARY-SUPPORT-VISIBILITY-01'
       )
-    ).toBe(true);
+    ).toBe(false);
     expect(
       textClaimsWoId(
         'feat/WO-SHOPOPS-GARY-SUPPORT-VISIBILITY-01-thread-abc',
         'WO-SHOPOPS-GARY-SUPPORT-VISIBILITY-01'
       )
-    ).toBe(true);
+    ).toBe(false);
   });
 
   test('ignores a WO id listed under an "explicitly out of scope" heading (#1795)', () => {
@@ -134,15 +134,37 @@ describe('findWoClaim', () => {
 });
 
 describe('open WO repair selection', () => {
+  test('excludes drafts from repair targets and SHA evidence', async () => {
+    const row = {
+      number: 1,
+      body: 'WO: WO-FOO-01',
+      head: {
+        ref: 'fix/wo-foo-01',
+        sha: 'a'.repeat(40),
+        repo: { full_name: 'thinmansoftware/bdc-harness' },
+      },
+    };
+    const prs = await listOpenWoPullRequests({
+      woId: 'WO-FOO-01',
+      project: 'bdc-harness',
+      lookup: async () => [
+        { ...row, draft: true },
+        { ...row, number: 2, draft: false },
+      ],
+    });
+    expect(prs.map(pr => pr.number)).toEqual([2]);
+  });
+
   test('overlapping_wo_ids_do_not_match', async () => {
     const rows = [
       ['wo-foo-010', 'wo-foo-010-thread-abc'],
       ['wo-foo-01', 'wo-foo-01-thread-def'],
-      ['WO-FOO-01', 'WO-FOO-01-thread-upper'],
+      ['WO-OTHER-01', 'WO-FOO-01'],
       ['WO-FOO-01A', 'wo-foo-01a'],
       ['OTHER', 'prefixwo-foo-01'],
       ['WO-FOO-01-EXTRA', 'wo-foo-01-extra'],
       ['WO-FOO-01-EXTRA', 'wo-foo-01-extra-thread-abc'],
+      ['WO-FOO-01-THREAD-ABC', 'wo-foo-01-thread-abc'],
     ].map(([id, branch], index) => ({
       number: index + 1,
       body: `WO: ${id}`,
@@ -160,6 +182,6 @@ describe('open WO repair selection', () => {
       project: 'bdc-harness',
       lookup: async () => rows.map(row => ({ ...row, body: 'WO: WO-OTHER-01' })),
     });
-    expect(branchOnly.map(pr => pr.number)).toEqual([2, 3]);
+    expect(branchOnly.map(pr => pr.number)).toEqual([3]);
   });
 });

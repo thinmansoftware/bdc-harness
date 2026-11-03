@@ -343,11 +343,12 @@ describe('reconcile supersede', () => {
       opens: [
         keeperOpenPr(1, 'WO: WO-FOO-010', 'fix/wo-foo-010-thread-abc'),
         keeperOpenPr(2, 'WO: WO-FOO-01', 'fix/wo-foo-01-thread-def'),
-        keeperOpenPr(3, 'WO: WO-OTHER-01', 'fix/WO-FOO-01-thread-upper'),
+        keeperOpenPr(3, 'WO: WO-OTHER-01', 'fix/WO-FOO-01'),
         keeperOpenPr(4, 'WO: WO-FOO-01A', 'fix/wo-foo-01a'),
         keeperOpenPr(5, 'WO: WO-OTHER-01', 'fix/prefixwo-foo-01'),
         keeperOpenPr(6, 'WO: WO-FOO-01-EXTRA', 'fix/wo-foo-01-extra'),
         keeperOpenPr(7, 'WO: WO-FOO-01-EXTRA', 'fix/wo-foo-01-extra-thread-abc'),
+        keeperOpenPr(8, 'WO: WO-FOO-01-THREAD-ABC', 'fix/wo-foo-01-thread-abc'),
       ],
     });
     await runReconcileOnce({ deps });
