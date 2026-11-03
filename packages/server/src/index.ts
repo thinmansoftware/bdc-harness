@@ -64,6 +64,7 @@ import { MessagePersistence } from './adapters/web/persistence';
 import { SSETransport } from './adapters/web/transport';
 import { WorkflowEventBridge } from './adapters/web/workflow-bridge';
 import { registerApiRoutes, stopProviderWaitScheduler } from './routes/api';
+import { createInProcessApiFetch } from './routes/in-process-authority';
 import {
   startDispatchEscalationClock,
   stopDispatchEscalationClock,
@@ -71,6 +72,10 @@ import {
 import { startReviewWorkerClock, stopReviewWorkerClock } from './dispatch/review-worker-clock';
 import { startDutyOfficerClock, stopDutyOfficerClock } from './dispatch/duty-officer-clock';
 import { startOutcomeReportClock, stopOutcomeReportClock } from './dispatch/outcome-report-clock';
+import {
+  startCauldronFireConsumer,
+  stopCauldronFireConsumer,
+} from './dispatch/cauldron-fire-consumer';
 import {
   startWorkerHeartbeatAlarmTimer,
   stopWorkerHeartbeatAlarmTimer,
@@ -697,6 +702,11 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   startDutyOfficerClock();
   // Daily outcome report (WO-HARNESS-DAILY-OUTCOME-REPORT-01): 11:00 UTC GitHub comment.
   startOutcomeReportClock();
+  // T3 command consumer (WO-HARNESS-T3-COMMAND-CONSUMER-01): drains the
+  // cauldron-fire mailbox. No-op unless T3_COMMAND_CONSUMER_ENABLED=1 (default
+  // off): no reads, no writes until an operator enables it and mints the
+  // t3-bridge principal.
+  startCauldronFireConsumer(undefined, { apiFetch: createInProcessApiFetch(app) });
   // Dedicated fast timer (default 60s) that pages John for a dead/restarted
   // Dispatch worker, independent of the 15-minute Duty Officer tick.
   startWorkerHeartbeatAlarmTimer();
@@ -858,6 +868,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stopReviewWorkerClock();
     stopDutyOfficerClock();
     stopOutcomeReportClock();
+    stopCauldronFireConsumer();
     stopWorkerHeartbeatAlarmTimer();
     persistence.stopPeriodicFlush();
 
