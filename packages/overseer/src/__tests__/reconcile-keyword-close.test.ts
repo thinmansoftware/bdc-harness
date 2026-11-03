@@ -10,6 +10,7 @@
 import { expect, test } from 'bun:test';
 import {
   RECONCILE_ACTION,
+  extractClosingKeywordTrackerRefs,
   runReconcileOnce,
   searchMergedPullRequests,
   type OctokitLike,
@@ -391,4 +392,128 @@ test('Test 6 (close path): the override redirects which branch closes, and an un
     });
     expect((await runReconcileOnce({ deps: unknownState.deps })).closed).toBe(0);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Test 7: keyword-close PR carrying NO WO stem is still discovered
+// Regression: searchMergedPullRequests used to query only `WO- in:title/body`,
+// so a `Fixes #N` PR with no WO stem anywhere was never returned and its tracker
+// never closed, despite the keyword-close path being correct downstream.
+// ---------------------------------------------------------------------------
+
+function keywordOnlySearchOctokit(): OctokitLike {
+  // A merged bdc-xo PR whose body is a bare same-repo close, no WO- text at all.
+  const target = searchItem(4326, 'bdc-xo', true);
+  return {
+    search: {
+      issuesAndPullRequests: async (input: Record<string, unknown>) => {
+        const q = String(input.q ?? '');
+        // The WO- queries must NOT surface this PR -- it carries no WO stem.
+        if (q.includes('WO- in:title') || q.includes('WO- in:body')) {
+          return { data: { total_count: 0, incomplete_results: false, items: [] } };
+        }
+        // The tracker-repo scan is the only query that finds the keyword-close PR.
+        if (q.includes(`repo:${ORG}/bdc-xo`)) {
+          return { data: { total_count: 1, incomplete_results: false, items: [target] } };
+        }
+        return { data: { total_count: 0, incomplete_results: false, items: [] } };
+      },
+    },
+    pulls: {
+      listFiles: async () => ({ data: [{ filename: 'src/real-code.ts' }] }),
+      get: async (input: Record<string, unknown>) => {
+        if (Number(input.pull_number) !== 4326) throw new Error('unexpected pulls.get');
+        return {
+          data: {
+            title: 'fix a bug',
+            body: 'Fixes #4999',
+            html_url: `https://github.com/${ORG}/bdc-xo/pull/4326`,
+            state: 'closed' as const,
+            merged: true,
+            merge_commit_sha: 'abc1234',
+            merged_at: '2026-11-01T18:23:09Z',
+            base: { ref: 'main' },
+          },
+        };
+      },
+    },
+    issues: {
+      createComment: async () => undefined,
+      addLabels: async () => undefined,
+      update: async () => undefined,
+    },
+  } as unknown as OctokitLike;
+}
+
+test('Test 7: a keyword-close PR with no WO stem is discovered via the tracker-repo scan', async () => {
+  const octokit = keywordOnlySearchOctokit();
+
+  // Direct: searchMergedPullRequests surfaces the PR even though the WO- queries
+  // (which it also issues) return nothing for it.
+  const prs = await searchMergedPullRequests(octokit, { org: ORG, since: '2026-10-26' });
+  expect(prs.map(p => `${p.owner}/${p.repo}#${p.number}`)).toContain(`${ORG}/bdc-xo#4326`);
+  // It genuinely carries no WO stem, proving it was NOT found via a WO- query.
+  expect(prs.some(p => /WO-/.test(`${p.title}\n${p.body ?? ''}`))).toBe(false);
+});
+
+test('Test 7 (close path): the no-stem keyword PR closes its tracker exactly once', async () => {
+  const octokit = keywordOnlySearchOctokit();
+  const WO_4999 = 'WO-XO-NO-STEM-CLOSE-01';
+  const state = harness({
+    prs: [],
+    searchMergedPullRequests: async input => searchMergedPullRequests(octokit, input),
+    trackersByNumber: { 4999: tracker(4999, WO_4999) },
+  });
+
+  const result = await runReconcileOnce({ deps: state.deps });
+
+  expect(result.closed).toBe(1);
+  expect(state.closes).toEqual([4999]);
+  expect(state.actions.filter(a => a.action === RECONCILE_ACTION)).toHaveLength(1);
+});
+
+// ---------------------------------------------------------------------------
+// Test 8: a reference glued to trailing text is NOT a valid close
+// Regression: the closing-ref regex lacked a trailing boundary, so
+// `thinmansoftware/bdc-xo#4130draft` parsed as tracker #4130 and could close it.
+// ---------------------------------------------------------------------------
+
+test('Test 8: a number glued to trailing text does not parse as a tracker ref', () => {
+  // Cross-repo form with trailing letters -- rejected entirely.
+  expect(
+    extractClosingKeywordTrackerRefs(`Closes ${ORG}/bdc-xo#4130draft`, ORG, 'shopops')
+  ).toEqual([]);
+  // Same-repo form with trailing letters -- rejected entirely.
+  expect(extractClosingKeywordTrackerRefs('Fixes #4130x', ORG, 'bdc-xo')).toEqual([]);
+  // A trailing sentence period IS a real boundary and still resolves.
+  expect(extractClosingKeywordTrackerRefs(`Closes ${ORG}/bdc-xo#4130.`, ORG, 'shopops')).toEqual([
+    4130,
+  ]);
+  // Plain, well-formed reference still resolves (guards against over-tightening).
+  expect(extractClosingKeywordTrackerRefs('Fixes #4130', ORG, 'bdc-xo')).toEqual([4130]);
+});
+
+// ---------------------------------------------------------------------------
+// Test 9: the 7-day lookback floor rescans even when the cursor is newer
+// Regression guard for resolveSearchSince: a cursor inside the floor window must
+// still widen the search back to the floor. Observes the `since` sent to search.
+// ---------------------------------------------------------------------------
+
+test('Test 9: a cursor newer than the 7-day floor still rescans back to the floor', async () => {
+  let observedSince = '';
+  const state = harness({
+    prs: [],
+    searchMergedPullRequests: async input => {
+      observedSince = input.since;
+      return [];
+    },
+  });
+  // Cursor one day before `now` (2026-11-02T12:00:00Z) -- well inside the 7-day floor.
+  state.deps.readCursor = async () => '2026-11-01T09:00:00Z';
+
+  await runReconcileOnce({ deps: state.deps });
+
+  // Floor = now - 7 days = 2026-10-26. Without the floor, `since` would be the
+  // newer cursor date (2026-11-01) and the pre-cursor merge window would be missed.
+  expect(observedSince).toBe('2026-10-26');
 });

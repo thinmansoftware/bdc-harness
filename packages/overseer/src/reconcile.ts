@@ -510,8 +510,13 @@ const CLOSING_KEYWORD_SOURCE = '(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)';
 /**
  * A closing keyword immediately followed (optional `:` and whitespace) by an
  * issue reference: `#N` (the PR's own repo) or `owner/repo#N` (cross-repo).
+ *
+ * The trailing `\b` is a hard reference boundary so a number glued to more text
+ * (`thinmansoftware/bdc-xo#4130draft`, `#4130x`) is NOT parsed as `#4130`. This
+ * mirrors the trailing-boundary check in lineClosesTracker; without it a PR that
+ * references a lookalike tracker could close the wrong issue.
  */
-const CLOSING_KEYWORD_REF_SOURCE = `\\b${CLOSING_KEYWORD_SOURCE}\\b[:\\s]+([A-Za-z0-9][A-Za-z0-9_.-]*\\/[A-Za-z0-9][A-Za-z0-9_.-]*#\\d+|#\\d+)`;
+const CLOSING_KEYWORD_REF_SOURCE = `\\b${CLOSING_KEYWORD_SOURCE}\\b[:\\s]+([A-Za-z0-9][A-Za-z0-9_.-]*\\/[A-Za-z0-9][A-Za-z0-9_.-]*#\\d+|#\\d+)\\b`;
 
 /** True when `value` is exactly a WO stem (WO-...-NN). */
 export function isWoStem(value: string): boolean {
@@ -989,6 +994,14 @@ export async function searchMergedPullRequests(
   const queries = [
     `org:${input.org} is:pr is:merged merged:>=${input.since} WO- in:title`,
     `org:${input.org} is:pr is:merged merged:>=${input.since} WO- in:body`,
+    // Keyword-close PRs need NOT name a WO stem: `Fixes #4999` (a tracker-repo PR)
+    // or `Closes thinmansoftware/bdc-xo#4999` (cross-repo) carry no `WO-` text, so
+    // the two WO- queries above never return them. Without these the keyword-close
+    // path (extractClosingKeywordTrackerRefs) has nothing to act on in production.
+    //   - same-repo `#N` closes only resolve in the tracker repo, so scan it whole
+    //   - cross-repo `<org>/<tracker>#N` refs contain the tracker-repo name in body
+    `repo:${DEFAULT_ORG}/${DEFAULT_TRACKER_REPO} is:pr is:merged merged:>=${input.since}`,
+    `org:${input.org} is:pr is:merged merged:>=${input.since} ${DEFAULT_TRACKER_REPO} in:body`,
   ];
   const results = new Map<string, ReconcileMergedPullRequest>();
 
