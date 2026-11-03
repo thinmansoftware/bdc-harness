@@ -37,7 +37,7 @@ is_abandoned() {
     cwd=$(readlink "$pid/cwd" 2>/dev/null) || continue
     case "$cwd" in */"$suffix"|*/"$suffix"/*) echo "process ${pid#/proc/}"; return 1;; esac
   done
-  st=$(docker exec -u appuser "$CONTAINER" git -C "$CWT_ROOT/$suffix" status --porcelain 2>/dev/null) || { echo "git-status-failed"; return 1; }
+  st=$(docker exec -u appuser "$CONTAINER" git -C "$CWT_ROOT/$suffix" status --porcelain --untracked-files=all 2>/dev/null) || { echo "git-status-failed"; return 1; }
   [ -z "$st" ] || { echo "uncommitted-changes"; return 1; }
   return 0
 }
