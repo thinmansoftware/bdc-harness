@@ -1637,6 +1637,37 @@ describe('merge execution bridge required contexts', () => {
     );
   });
 
+  test('a newer queued rerun beats an older completed success and blocks unstable', async () => {
+    // filter=all returns the historical success next to the queued rerun. The
+    // rerun has no timestamps yet; creation order (id) must still pick it.
+    const h = harness(
+      [verdict('required-rerun-queued')],
+      greenPr({
+        mergeableState: 'unstable',
+        checks: { total: 3, passed: 3, failed: 0, pending: 0 },
+        checkRuns: [
+          checkRun(1, 'docker-build', 'completed', 'success'),
+          {
+            id: 9,
+            name: 'docker-build',
+            status: 'queued',
+            conclusion: null,
+            started_at: null,
+            completed_at: null,
+          },
+          checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+        ],
+      }),
+      0,
+      { requiredContextsLookups: contextsLookup(required) }
+    );
+    await evaluate(h);
+    expect(h.merges).toBe(0);
+    expect(h.outcomes[0]).toEqual(
+      expect.objectContaining({ mutationSent: false, reason: 'required_checks_not_success' })
+    );
+  });
+
   test('unstable mergeable state still skips without a known required set', async () => {
     const h = harness(
       [verdict('empty-unstable')],
