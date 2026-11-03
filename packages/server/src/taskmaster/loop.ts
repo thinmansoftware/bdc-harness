@@ -65,6 +65,7 @@ import {
   type CascadeEvidenceDeps,
 } from './expectations';
 import { canonicalizeThreadRef } from './thread-ref';
+import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
 import {
   createDeadmanState,
   recordTickAttempt,
@@ -224,6 +225,8 @@ export interface TaskmasterDeps {
     | 'updateAutomaticFireExpectation'
   >;
   readFireCascade?: typeof readCascadeRecord;
+  /** Test seam: release retained shared WO claims whose runs are all terminal. */
+  reconcileWoClaims?: () => Promise<string[]>;
   now?: () => Date;
   db?: TaskmasterDal;
   createTask?: typeof createAuthenticatedMessage;
@@ -2489,7 +2492,10 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             project: custody.identity.project,
             dispatchId: custody.identity.cascadeId,
             token: process.env.ARCHON_OPERATOR_TOKEN ?? '',
-            deps: { seatUsage: conductorSeatUsage },
+            // Amendment 5 A5.0 (WO-HARNESS-T3-COMMAND-CONSUMER-01): the shared
+            // database WO claim, so a Taskmaster cascade and a T3 consumer
+            // cascade can never run the same WO at once.
+            deps: { seatUsage: conductorSeatUsage, ...cascadeWoClaimDeps('taskmaster') },
             beforeAdmission: async () => {
               guardAttempted = true;
               const decision = await fireBudget.authorizeAutomaticFire({
@@ -2736,6 +2742,28 @@ export function resolveBlockerReportEnabled(
 }
 
 /**
+ * Release retained shared WO claims (WO-HARNESS-T3-COMMAND-CONSUMER-01, claim
+ * release (c)) once per tick, before any fire. A cascade that exits with a live
+ * run, or a frontier tier that is later rejected, retains its claim; this is the
+ * production path that frees it when every run is terminal. Never throws.
+ */
+export async function reconcileTaskmasterWoClaims(deps: TaskmasterDeps = {}): Promise<string[]> {
+  try {
+    const released = await (
+      deps.reconcileWoClaims ?? ((): Promise<string[]> => reconcileRetainedWoClaims())
+    )();
+    if (released.length > 0) log.info({ released }, 'taskmaster.wo_claims_released');
+    return released;
+  } catch (error) {
+    log.warn(
+      { cause: (error as Error).message?.slice(0, 200) },
+      'taskmaster.wo_claim_reconcile_failed'
+    );
+    return [];
+  }
+}
+
+/**
  * Start the taskmaster loop. Module-scope singleton: subsequent calls are
  * no-ops while a timer exists. TASKMASTER_INTERVAL_MS=0 disables (KILLED).
  */
@@ -2758,6 +2786,7 @@ export function startTaskmaster(ownerIdSuffix: string, deps: TaskmasterDeps = {}
     if (inFlight) return;
     inFlight = true;
     try {
+      await reconcileTaskmasterWoClaims(deps);
       const tickResult = await tick(state, deps);
       if (taskmasterRuntime) taskmasterRuntime.lastTickResult = tickResult;
       if (tickResult.effects > 0 || tickResult.rejected > 0) {
