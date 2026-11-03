@@ -913,7 +913,8 @@ test('Test 13 (other closer): a tracker closed by someone else stays closed and 
 });
 
 test('Test 13 (once): a recorded mark means a later human close is never reopened again', async () => {
-  const { state, reopened } = nativeCloseState('feedface');
+  // After the mark, a human close is the latest closed event and carries no merge sha.
+  const { state, reopened } = nativeCloseState(null);
   state.deps.hasMergedBeenNoted = async () => true;
   await runReconcileOnce({ deps: state.deps });
   expect(reopened).toEqual([]);
@@ -953,4 +954,20 @@ test('Test 14 (no holder): LIVE-PROOF closes once', async () => {
   const state = holderProofState(async () => [openPr('shopops', 991, 'unrelated work')]);
   expect((await runReconcileOnce({ deps: state.deps })).closed).toBe(1);
   expect(state.closes).toEqual([4130]);
+});
+
+test('Test 13 (open holder): a native close by this merge is reopened even while another open PR holds the WO', async () => {
+  const { state, reopened } = nativeCloseState('feedface');
+  state.deps.listOpenPullRequestsReferencingTracker = async () => [
+    openPr('bdc-xo', 4401, 'Fixes #4999'),
+  ];
+
+  const result = await runReconcileOnce({ deps: state.deps });
+
+  expect(result.closed).toBe(0);
+  expect(reopened).toEqual([4999]);
+  expect(state.closes).toEqual([]);
+  // The holder still governs the merged mark: no status:merged while a stage is open.
+  expect(state.labels).toEqual([]);
+  expect(state.actions.filter(a => a.action === RECONCILE_MERGED_ACTION)).toEqual([]);
 });

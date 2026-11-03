@@ -412,6 +412,14 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
           }
           if (!closedByThisPr) continue;
           reopenNeeded = true;
+          // Reopen NOW, before the spec-only/holder guards: a native close by this
+          // PR's merge is never left standing, whatever those guards decide about
+          // the status:merged mark. A close by anyone else never reaches here.
+          await deps.reopenTrackerIssue({ issue: tracker });
+          logger.info?.(
+            { prRef, woId, tracker: tracker.number },
+            'overseer.reconcile.native_close_reopened'
+          );
         }
         // PRE-TRACKER GUARD. A PR that merged before the tracker issue existed
         // cannot be the work that tracker asks for (bdc-xo #4344 anchor).
@@ -541,13 +549,6 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
 
         // MERGED IS NOT DONE (amendment A1). Mark the tracker and leave it open;
         // only a LIVE-PROOF comment closes it (see the pass after this loop).
-        if (reopenNeeded) {
-          await deps.reopenTrackerIssue?.({ issue: tracker });
-          logger.info?.(
-            { prRef, woId, tracker: tracker.number },
-            'overseer.reconcile.native_close_reopened'
-          );
-        }
         await deps.addTrackerLabel({ issue: tracker, label: MERGED_LABEL });
         for (const stale of STALE_STATUS_LABELS) {
           await deps.removeTrackerLabel?.({ issue: tracker, label: stale });
