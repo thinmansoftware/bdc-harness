@@ -219,6 +219,7 @@ import * as m31TargetV2Db from '@archon/core/db/m31-target-v2';
 import * as m31Substrate from '@archon/overseer/m31-substrate';
 import type { M31LiveStateReader } from '@archon/overseer/m31-substrate';
 import { registerM31TargetV2Routes } from './m31-target-v2.routes';
+import { registerXoAdviceRoutes } from './xo-advice.routes';
 import {
   deriveBoardMotionNotificationKey,
   recordBoardPetitionDelivery,
@@ -3455,6 +3456,8 @@ export function registerApiRoutes(
 
     return next();
   });
+
+  registerXoAdviceRoutes(app);
 
   // Shared lock/dispatch/error handling for message and workflow endpoints
   /** Maximum allowed upload size per file (10 MB) */
