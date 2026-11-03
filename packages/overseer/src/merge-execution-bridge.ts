@@ -66,6 +66,7 @@ export interface MergeExecutionBridgeStore {
   // behavior (bdc-harness #1046): when absent, no run-in-flight deferral runs.
   hasActiveRunForWo?(woId: string): Promise<boolean>;
   reserveMergeSlot(verdictId: string, since: string, limit: number): Promise<boolean>;
+  getEarliestMergeSlotReservation(since: string): Promise<string | null>;
   releaseMergeSlot(verdictId: string): Promise<void>;
   recordOutcome(input: {
     verdictId: string;
@@ -576,10 +577,59 @@ async function postMergeReceiptComment(
   }
 }
 
+const CEILING_QUEUE_MARKER = '<!-- overseer:merge-ceiling-queued -->';
+
+async function postCeilingQueueNotice(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  pr: PullRequestEvidence,
+  since: string,
+  queuePosition: number,
+  ceiling: number
+): Promise<boolean> {
+  try {
+    if (!pr.pr || !options.github.listPullRequestComments || !options.github.commentOnPullRequest) {
+      throw new Error('queue_notice_comment_api_unavailable');
+    }
+    const reservedAt = await options.store.getEarliestMergeSlotReservation(since);
+    const reservedMs = reservedAt === null ? Number.NaN : Date.parse(reservedAt);
+    if (!Number.isFinite(reservedMs) || reservedMs <= Date.parse(since)) {
+      throw new Error('queue_notice_reservation_unavailable');
+    }
+    const nextSlot = new Date(reservedMs + 60 * 60 * 1000).toISOString();
+    const headLine = `Head: \`${verdict.head_sha}\``;
+    const comments = await options.github.listPullRequestComments(pr.pr);
+    if (
+      comments.some(
+        comment =>
+          comment.body.includes(CEILING_QUEUE_MARKER) &&
+          comment.body.split(/\r?\n/).some(line => line.trim() === headLine)
+      )
+    )
+      return true;
+    await options.github.commentOnPullRequest({
+      ...pr.pr,
+      body: [
+        CEILING_QUEUE_MARKER,
+        headLine,
+        `Queued for merge: position ${queuePosition}, hourly ceiling ${ceiling}. Earliest next merge slot: ${nextSlot}.`,
+      ].join('\n'),
+    });
+    return true;
+  } catch (error) {
+    log.warn(
+      { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
+      'merge-coordinator.ceiling_queue_notice_failed'
+    );
+    return false;
+  }
+}
+
 async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
-  repoPolicy: MergeRepoPolicy
+  repoPolicy: MergeRepoPolicy,
+  queuePosition: number
 ): Promise<'stop' | undefined> {
   let rateLimitDeferred = false;
   const skip = async (reason: string, prUrl?: string, rateLimited = false): Promise<void> => {
@@ -827,13 +877,8 @@ async function mergeClaimedVerdict(
 
   const now = (options.now ?? ((): Date => new Date()))();
   const since = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
-  if (
-    !(await options.store.reserveMergeSlot(
-      verdict.id,
-      since,
-      configuredLimit(options.maxMergesPerHour)
-    ))
-  ) {
+  const ceiling = configuredLimit(options.maxMergesPerHour);
+  if (!(await options.store.reserveMergeSlot(verdict.id, since, ceiling))) {
     await options.store.releaseVerdictClaim(verdict.id, 'rate_ceiling_deferred');
     log.info(
       {
@@ -844,7 +889,15 @@ async function mergeClaimedVerdict(
       },
       'merge-coordinator.rate_ceiling_deferred'
     );
-    return 'stop';
+    const notified = await postCeilingQueueNotice(
+      options,
+      verdict,
+      pr,
+      since,
+      queuePosition,
+      ceiling
+    );
+    return notified ? 'stop' : undefined;
   }
 
   if (options.github.approvePullRequest) {
@@ -938,11 +991,14 @@ export async function runMergeExecutionBridgeOnce(
 ): Promise<void> {
   const repoPolicy = configuredPolicy(options.repoConfig);
   const verdicts = await options.store.listUnactionedVerdicts();
+  let queuePosition = 0;
   for (const verdict of verdicts) {
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
+    queuePosition += 1;
     if (!(await options.store.claimVerdict(verdict.id))) continue;
     try {
-      if ((await mergeClaimedVerdict(options, verdict, repoPolicy)) === 'stop') break;
+      if ((await mergeClaimedVerdict(options, verdict, repoPolicy, queuePosition)) === 'stop')
+        break;
     } catch (error) {
       await options.store.releaseMergeSlot(verdict.id);
       await options.store.releaseVerdictClaim(
