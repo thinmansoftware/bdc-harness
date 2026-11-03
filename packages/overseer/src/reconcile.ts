@@ -335,354 +335,321 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
     if (seen.has(key)) continue;
     seen.add(key);
     if (!pr.merged || pr.state !== 'closed') continue;
-    // PER-PR ISOLATION. A non-rate-limit, non-auth error anywhere in one PR's
-    // classification/evidence processing must not abort the pass for later PRs:
-    // it is logged and the loop continues. Rate-limit and auth errors keep the
-    // early-return skip behavior (they affect every later lookup equally).
-    try {
-      const classified = classifyPullRequestStems(pr);
-      const prRef = `${pr.owner}/${pr.repo}#${pr.number}`;
-      const body = pr.body ?? '';
-      const skippedSet = new Set(classified.skipped);
-      const evidenceResult = `${pr.htmlUrl}:${pr.mergeCommitSha ?? 'merge_sha_unknown'}`;
+    const classified = classifyPullRequestStems(pr);
+    const prRef = `${pr.owner}/${pr.repo}#${pr.number}`;
+    const body = pr.body ?? '';
+    const skippedSet = new Set(classified.skipped);
+    const evidenceResult = `${pr.htmlUrl}:${pr.mergeCommitSha ?? 'merge_sha_unknown'}`;
 
-      // RECONCILE-SKIP. An author who writes `Reconcile-Skip: <WO-ID>` is saying
-      // "this PR is NOT evidence that <WO-ID> is done". A closing keyword naming
-      // that WO's tracker is therefore ignored, and NO comment is posted -- the
-      // marker exists precisely so the tracker is left alone (the old "noted merged
-      // PR evidence" comment put four notices on bdc-xo #1889 in one morning). One
-      // deduplicated action row is the audit trail.
-      for (const stem of classified.skipped) {
-        const alreadyNoted = await (deps.hasSkipBeenNoted ?? hasDefaultSkipBeenNoted)({
-          prRef,
-          woId: stem,
-        });
-        if (alreadyNoted) continue;
-        logger.info?.({ prRef, stem }, 'overseer.reconcile.skip_marker_excluded_pr_evidence');
-        await (deps.insertAction ?? insertDefaultOverseerAction)({
-          prRef,
-          woId: stem,
-          class: RECONCILE_TRACKER_CLASS,
-          action: RECONCILE_SKIP_ACTION,
-          result: evidenceResult,
-        });
-      }
-      for (const stem of classified.incidental) {
-        logger.info?.({ prRef, stem }, 'overseer.reconcile.incidental_mention_not_evidence');
-      }
+    // RECONCILE-SKIP. An author who writes `Reconcile-Skip: <WO-ID>` is saying
+    // "this PR is NOT evidence that <WO-ID> is done". A closing keyword naming
+    // that WO's tracker is therefore ignored, and NO comment is posted -- the
+    // marker exists precisely so the tracker is left alone (the old "noted merged
+    // PR evidence" comment put four notices on bdc-xo #1889 in one morning). One
+    // deduplicated action row is the audit trail.
+    for (const stem of classified.skipped) {
+      const alreadyNoted = await (deps.hasSkipBeenNoted ?? hasDefaultSkipBeenNoted)({
+        prRef,
+        woId: stem,
+      });
+      if (alreadyNoted) continue;
+      logger.info?.({ prRef, stem }, 'overseer.reconcile.skip_marker_excluded_pr_evidence');
+      await (deps.insertAction ?? insertDefaultOverseerAction)({
+        prRef,
+        woId: stem,
+        class: RECONCILE_TRACKER_CLASS,
+        action: RECONCILE_SKIP_ACTION,
+        result: evidenceResult,
+      });
+    }
+    for (const stem of classified.incidental) {
+      logger.info?.({ prRef, stem }, 'overseer.reconcile.incidental_mention_not_evidence');
+    }
 
-      // PROJECT-BASE GATE. GitHub only honours closing keywords on a merge into the
-      // repository default branch, so a project whose Cauldron base is staging/dev/
-      // bdc-main never gets its tracker closed by GitHub. Reconcile closes a tracker
-      // ONLY when the merged PR's base ref equals that project's base AND the PR
-      // carries a closing keyword naming the tracker issue. A merge into any other
-      // branch (feature-to-feature) closes nothing. A merged PR that merely NAMES a
-      // WO (prose, or a bare `WO:` line with no keyword) is never completion evidence.
-      const projectBase = resolveProjectBase(pr.owner, pr.repo);
-      if (projectBase === null || projectBase !== (pr.baseRef ?? null)) continue;
+    // PROJECT-BASE GATE. GitHub only honours closing keywords on a merge into the
+    // repository default branch, so a project whose Cauldron base is staging/dev/
+    // bdc-main never gets its tracker closed by GitHub. Reconcile closes a tracker
+    // ONLY when the merged PR's base ref equals that project's base AND the PR
+    // carries a closing keyword naming the tracker issue. A merge into any other
+    // branch (feature-to-feature) closes nothing. A merged PR that merely NAMES a
+    // WO (prose, or a bare `WO:` line with no keyword) is never completion evidence.
+    const projectBase = resolveProjectBase(pr.owner, pr.repo);
+    if (projectBase === null || projectBase !== (pr.baseRef ?? null)) continue;
 
-      const refNumbers = extractClosingKeywordTrackerRefs(body, pr.owner, pr.repo);
-      const declaredStems = extractDeclaredWoStems(body);
+    const refNumbers = extractClosingKeywordTrackerRefs(body, pr.owner, pr.repo);
+    const declaredStems = extractDeclaredWoStems(body);
 
-      if (deps.findTrackerIssueByNumber) {
-        for (const number of refNumbers) {
-          let tracker: ReconcileTrackerIssue | null;
-          try {
-            tracker = await deps.findTrackerIssueByNumber(number, trackerLookupScope);
-          } catch (error) {
-            if (isRateLimitError(error)) {
-              logger.warn(
-                { err: error as Error, rateLimit: true, number },
-                'overseer.reconcile.rate_limit_skip'
-              );
-              return { scanned: seen.size, closed, skipped: true };
-            }
-            if (isAuthError(error)) {
-              logger.warn(
-                { err: error as Error, authError: true, number },
-                'overseer.reconcile.auth_error_skip'
-              );
-              return { scanned: seen.size, closed, skipped: true };
-            }
-            throw error;
-          }
-          if (!tracker) continue;
-          const woId = deriveTrackerWoId(tracker);
-          const holderStem = isWoStem(tracker.title) ? tracker.title : woId;
-
-          // A skip marker naming this WO suppresses its keyword close.
-          if (isWoStem(woId) && skippedSet.has(woId)) {
-            logger.info?.(
-              { prRef, woId, tracker: tracker.number },
-              'overseer.reconcile.skip_marker_excluded_pr_evidence'
-            );
-            continue;
-          }
-          // GitHub may have closed the tracker natively on a default-branch keyword
-          // merge. Amendment A2.1: if THIS PR's merge closed it, reopen it below
-          // (after every guard) and mark it merged; any other closer is respected.
-          let reopenNeeded = false;
-          if (tracker.state !== 'open') {
-            if (!deps.wasClosedByPullRequestMerge || !deps.reopenTrackerIssue) continue;
-            if (!pr.mergeCommitSha) continue;
-            let closeRead: CloseEventRead;
-            try {
-              const raw = await deps.wasClosedByPullRequestMerge({ issue: tracker, pr });
-              closeRead =
-                typeof raw === 'boolean' ? { closedByThisPr: raw, truncated: false } : raw;
-            } catch (error) {
-              logger.warn(
-                { err: error as Error, prRef, tracker: tracker.number },
-                'overseer.reconcile.close_event_lookup_failed_left_closed'
-              );
-              continue;
-            }
-            if (closeRead.truncated) {
-              // Capped event history: a later close may be unread. Leave it closed.
-              logger.warn(
-                { prRef, tracker: tracker.number },
-                'overseer.reconcile.close_event_history_truncated_left_closed'
-              );
-              continue;
-            }
-            if (!closeRead.closedByThisPr) continue;
-            reopenNeeded = true;
-            // Reopen NOW, before the spec-only/holder guards: a native close by this
-            // PR's merge is never left standing, whatever those guards decide about
-            // the status:merged mark. A close by anyone else never reaches here.
-            await deps.reopenTrackerIssue({ issue: tracker });
-            logger.info?.(
-              { prRef, woId, tracker: tracker.number },
-              'overseer.reconcile.native_close_reopened'
-            );
-          }
-          // PRE-TRACKER GUARD. A PR that merged before the tracker issue existed
-          // cannot be the work that tracker asks for (bdc-xo #4344 anchor).
-          if (mergedBeforeTrackerCreated(pr.mergedAt, tracker.createdAt)) {
-            logger.warn(
-              {
-                prRef,
-                woId,
-                tracker: tracker.number,
-                mergedAt: pr.mergedAt,
-                trackerCreatedAt: tracker.createdAt,
-              },
-              'overseer.reconcile.pr_merged_before_tracker_created_left_open'
-            );
-            continue;
-          }
-          const trackerIdentity =
-            `${tracker.owner}/${tracker.repo}#${tracker.number}`.toLowerCase();
-          if (successfullyClosedTrackers.has(trackerIdentity)) continue;
-
-          // RE-CLOSE GUARD. If this PR already closed this tracker once and the
-          // tracker is open again, a human reopened it on purpose. The same merged
-          // PR is not new evidence, so the lookback re-scan must not undo that
-          // decision. Anchor (2026-09-02): XO reopened bdc-xo #1889 at 13:51:26Z
-          // with a comment explaining why; reconcile re-closed it at 13:51:33Z on
-          // the same shopops#662 evidence.
-          const closeRecorded = await (deps.hasCloseBeenRecorded ?? hasDefaultCloseBeenRecorded)({
-            prRef,
-            woId,
-          });
-          if (closeRecorded) {
-            logger.warn(
-              { prRef, woId, tracker: tracker.number },
-              'overseer.reconcile.tracker_reopened_after_close_left_open'
-            );
-            continue;
-          }
-          const mergedNoted = await (deps.hasMergedBeenNoted ?? hasDefaultMergedBeenNoted)({
-            prRef,
-            woId,
-          });
-          if (mergedNoted) continue;
-
-          // SPEC-ONLY GUARD. author-wo.sh lands the WO spec document via its own PR,
-          // which names the WO stem -- so without this, a WO can be closed as done
-          // by the very PR that CREATED it. See isSpecOnlyChangeSet for the anchor.
-          const listFiles = deps.listPullRequestFiles;
-          if (listFiles) {
-            let changedPaths: string[] | null = null;
-            try {
-              const read = asPagedRead(await listFiles(pr));
-              if (read.truncated) {
-                // Capped file list: cannot prove the merge is not spec-only. No mark.
-                logger.warn(
-                  { prRef, woId },
-                  'overseer.reconcile.file_list_truncated_leaving_tracker_unmarked'
-                );
-                continue;
-              }
-              changedPaths = read.items;
-            } catch (error) {
-              // Fail OPEN on a file-listing error: leave the tracker alone rather
-              // than closing on unverified evidence. A tracker left open is visible
-              // and fixable; one falsely closed is invisible.
-              logger.warn(
-                { err: error as Error, prRef, woId },
-                'overseer.reconcile.file_list_failed_leaving_tracker_open'
-              );
-              continue;
-            }
-            if (isSpecOnlyChangeSet(changedPaths)) {
-              // warn, not info: `info` is optional on ReconcileLogger while `warn`
-              // is guaranteed, and a spec-only merge that LOOKS like completion is
-              // worth surfacing rather than burying at info level.
-              logger.warn(
-                { prRef, woId, changedPaths },
-                'overseer.reconcile.spec_only_merge_tracker_left_open'
-              );
-              // Silent by design. Reconcile re-scans a lookback window, so
-              // commenting here would re-post on every pass for the life of the
-              // window. The log line above is the record; the tracker stays open.
-              continue;
-            }
-          }
-
-          // OPEN-PR GUARD. A two-stage WO shares one tracker across PRs. Closing the
-          // tracker when the first stage merges leaves later stages (still open,
-          // sometimes with changes requested) looking done. Anchor: bdc-harness
-          // #1051 -- shopops#760 merged and closed bdc-xo#2581 while #762 and #763
-          // were still open.
-          const listOpen = deps.listOpenPullRequestsReferencingTracker;
-          if (listOpen) {
-            let openPullRequests: ReconcileOpenPullRequest[];
-            try {
-              openPullRequests = await listOpen({ issue: tracker, stem: holderStem });
-            } catch (error) {
-              // Fail OPEN on a lookup error: leave the tracker alone rather than
-              // closing on unverified evidence.
-              logger.warn(
-                { err: error as Error, prRef, woId },
-                'overseer.reconcile.open_pr_lookup_failed_leaving_tracker_open'
-              );
-              continue;
-            }
-            const holders = openPullRequestsHoldingTracker({
-              stem: holderStem,
-              mergedPr: pr,
-              tracker,
-              openPullRequests,
-            });
-            if (holders.length > 0) {
-              const alreadyNoted = await (deps.hasHoldBeenNoted ?? hasDefaultHoldBeenNoted)({
-                prRef,
-                woId,
-              });
-              if (alreadyNoted) {
-                logger.warn(
-                  { prRef, woId, tracker: tracker.number },
-                  'overseer.reconcile.open_prs_hold_tracker_open'
-                );
-                continue;
-              }
-              await deps.addTrackerEvidenceComment({
-                issue: tracker,
-                body: buildHoldOpenComment({ pr, stem: holderStem, holders }),
-              });
-              await (deps.insertAction ?? insertDefaultOverseerAction)({
-                prRef,
-                woId,
-                class: RECONCILE_TRACKER_CLASS,
-                action: RECONCILE_HOLD_OPEN_ACTION,
-                result: evidenceResult,
-              });
-              continue;
-            }
-          }
-
-          // MERGED IS NOT DONE (amendment A1). Mark the tracker and leave it open;
-          // only a LIVE-PROOF comment closes it (see the pass after this loop).
-          await deps.addTrackerLabel({ issue: tracker, label: MERGED_LABEL });
-          for (const stale of STALE_STATUS_LABELS) {
-            await deps.removeTrackerLabel?.({ issue: tracker, label: stale });
-          }
-          await deps.addTrackerEvidenceComment({
-            issue: tracker,
-            body: buildMergedComment({ pr, stem: holderStem, reopened: reopenNeeded }),
-          });
-          successfullyClosedTrackers.add(trackerIdentity);
-          await (deps.insertAction ?? insertDefaultOverseerAction)({
-            prRef,
-            woId,
-            class: RECONCILE_CLOSES_KEYWORD_CLASS,
-            action: RECONCILE_MERGED_ACTION,
-            result: evidenceResult,
-          });
-          marked += 1;
-        }
-      }
-
-      // KEYWORD-MISSING NOTE. A PR on its project base that declares a WO on a
-      // manifest `WO:` line but carries NO closing keyword for that WO's tracker
-      // leaves the tracker OPEN (a declaration is not completion evidence) and
-      // records one deduplicated audit row so the gap is visible.
-      for (const declared of declaredStems) {
-        if (skippedSet.has(declared)) continue;
-        let declaredTracker: ReconcileTrackerIssue | null;
+    if (deps.findTrackerIssueByNumber) {
+      for (const number of refNumbers) {
+        let tracker: ReconcileTrackerIssue | null;
         try {
-          declaredTracker = await deps.findTrackerIssueByStem(declared, trackerLookupScope);
+          tracker = await deps.findTrackerIssueByNumber(number, trackerLookupScope);
         } catch (error) {
           if (isRateLimitError(error)) {
             logger.warn(
-              { err: error as Error, rateLimit: true, stem: declared },
+              { err: error as Error, rateLimit: true, number },
               'overseer.reconcile.rate_limit_skip'
             );
             return { scanned: seen.size, closed, skipped: true };
           }
           if (isAuthError(error)) {
             logger.warn(
-              { err: error as Error, authError: true, stem: declared },
+              { err: error as Error, authError: true, number },
               'overseer.reconcile.auth_error_skip'
             );
             return { scanned: seen.size, closed, skipped: true };
           }
-          // A non-rate-limit, non-auth lookup error on ONE declared stem (e.g. a
-          // duplicate-title ambiguity) must not abort the whole pass: log and move
-          // on to the next stem. Anchor: bdc-xo #4130 never got status:merged
-          // because an ambiguous-title throw ended the pass before it.
-          logger.warn(
-            { err: error as Error, prRef, stem: declared },
-            'overseer.reconcile.stem_lookup_error'
+          throw error;
+        }
+        if (!tracker) continue;
+        const woId = deriveTrackerWoId(tracker);
+        const holderStem = isWoStem(tracker.title) ? tracker.title : woId;
+
+        // A skip marker naming this WO suppresses its keyword close.
+        if (isWoStem(woId) && skippedSet.has(woId)) {
+          logger.info?.(
+            { prRef, woId, tracker: tracker.number },
+            'overseer.reconcile.skip_marker_excluded_pr_evidence'
           );
           continue;
         }
-        if (declaredTracker?.state !== 'open') continue;
-        if (refNumbers.includes(declaredTracker.number)) continue;
-        const alreadyNoted = await (
-          deps.hasKeywordMissingBeenNoted ?? hasDefaultKeywordMissingBeenNoted
-        )({ prRef, woId: declared });
-        if (alreadyNoted) continue;
-        logger.info?.(
-          { prRef, woId: declared, tracker: declaredTracker.number },
-          'overseer.reconcile.keyword_missing_tracker_left_open'
-        );
+        // GitHub may have closed the tracker natively on a default-branch keyword
+        // merge. Amendment A2.1: if THIS PR's merge closed it, reopen it below
+        // (after every guard) and mark it merged; any other closer is respected.
+        let reopenNeeded = false;
+        if (tracker.state !== 'open') {
+          if (!deps.wasClosedByPullRequestMerge || !deps.reopenTrackerIssue) continue;
+          if (!pr.mergeCommitSha) continue;
+          let closeRead: CloseEventRead;
+          try {
+            const raw = await deps.wasClosedByPullRequestMerge({ issue: tracker, pr });
+            closeRead = typeof raw === 'boolean' ? { closedByThisPr: raw, truncated: false } : raw;
+          } catch (error) {
+            logger.warn(
+              { err: error as Error, prRef, tracker: tracker.number },
+              'overseer.reconcile.close_event_lookup_failed_left_closed'
+            );
+            continue;
+          }
+          if (closeRead.truncated) {
+            // Capped event history: a later close may be unread. Leave it closed.
+            logger.warn(
+              { prRef, tracker: tracker.number },
+              'overseer.reconcile.close_event_history_truncated_left_closed'
+            );
+            continue;
+          }
+          if (!closeRead.closedByThisPr) continue;
+          reopenNeeded = true;
+          // Reopen NOW, before the spec-only/holder guards: a native close by this
+          // PR's merge is never left standing, whatever those guards decide about
+          // the status:merged mark. A close by anyone else never reaches here.
+          await deps.reopenTrackerIssue({ issue: tracker });
+          logger.info?.(
+            { prRef, woId, tracker: tracker.number },
+            'overseer.reconcile.native_close_reopened'
+          );
+        }
+        // PRE-TRACKER GUARD. A PR that merged before the tracker issue existed
+        // cannot be the work that tracker asks for (bdc-xo #4344 anchor).
+        if (mergedBeforeTrackerCreated(pr.mergedAt, tracker.createdAt)) {
+          logger.warn(
+            {
+              prRef,
+              woId,
+              tracker: tracker.number,
+              mergedAt: pr.mergedAt,
+              trackerCreatedAt: tracker.createdAt,
+            },
+            'overseer.reconcile.pr_merged_before_tracker_created_left_open'
+          );
+          continue;
+        }
+        const trackerIdentity = `${tracker.owner}/${tracker.repo}#${tracker.number}`.toLowerCase();
+        if (successfullyClosedTrackers.has(trackerIdentity)) continue;
+
+        // RE-CLOSE GUARD. If this PR already closed this tracker once and the
+        // tracker is open again, a human reopened it on purpose. The same merged
+        // PR is not new evidence, so the lookback re-scan must not undo that
+        // decision. Anchor (2026-09-02): XO reopened bdc-xo #1889 at 13:51:26Z
+        // with a comment explaining why; reconcile re-closed it at 13:51:33Z on
+        // the same shopops#662 evidence.
+        const closeRecorded = await (deps.hasCloseBeenRecorded ?? hasDefaultCloseBeenRecorded)({
+          prRef,
+          woId,
+        });
+        if (closeRecorded) {
+          logger.warn(
+            { prRef, woId, tracker: tracker.number },
+            'overseer.reconcile.tracker_reopened_after_close_left_open'
+          );
+          continue;
+        }
+        const mergedNoted = await (deps.hasMergedBeenNoted ?? hasDefaultMergedBeenNoted)({
+          prRef,
+          woId,
+        });
+        if (mergedNoted) continue;
+
+        // SPEC-ONLY GUARD. author-wo.sh lands the WO spec document via its own PR,
+        // which names the WO stem -- so without this, a WO can be closed as done
+        // by the very PR that CREATED it. See isSpecOnlyChangeSet for the anchor.
+        const listFiles = deps.listPullRequestFiles;
+        if (listFiles) {
+          let changedPaths: string[] | null = null;
+          try {
+            const read = asPagedRead(await listFiles(pr));
+            if (read.truncated) {
+              // Capped file list: cannot prove the merge is not spec-only. No mark.
+              logger.warn(
+                { prRef, woId },
+                'overseer.reconcile.file_list_truncated_leaving_tracker_unmarked'
+              );
+              continue;
+            }
+            changedPaths = read.items;
+          } catch (error) {
+            // Fail OPEN on a file-listing error: leave the tracker alone rather
+            // than closing on unverified evidence. A tracker left open is visible
+            // and fixable; one falsely closed is invisible.
+            logger.warn(
+              { err: error as Error, prRef, woId },
+              'overseer.reconcile.file_list_failed_leaving_tracker_open'
+            );
+            continue;
+          }
+          if (isSpecOnlyChangeSet(changedPaths)) {
+            // warn, not info: `info` is optional on ReconcileLogger while `warn`
+            // is guaranteed, and a spec-only merge that LOOKS like completion is
+            // worth surfacing rather than burying at info level.
+            logger.warn(
+              { prRef, woId, changedPaths },
+              'overseer.reconcile.spec_only_merge_tracker_left_open'
+            );
+            // Silent by design. Reconcile re-scans a lookback window, so
+            // commenting here would re-post on every pass for the life of the
+            // window. The log line above is the record; the tracker stays open.
+            continue;
+          }
+        }
+
+        // OPEN-PR GUARD. A two-stage WO shares one tracker across PRs. Closing the
+        // tracker when the first stage merges leaves later stages (still open,
+        // sometimes with changes requested) looking done. Anchor: bdc-harness
+        // #1051 -- shopops#760 merged and closed bdc-xo#2581 while #762 and #763
+        // were still open.
+        const listOpen = deps.listOpenPullRequestsReferencingTracker;
+        if (listOpen) {
+          let openPullRequests: ReconcileOpenPullRequest[];
+          try {
+            openPullRequests = await listOpen({ issue: tracker, stem: holderStem });
+          } catch (error) {
+            // Fail OPEN on a lookup error: leave the tracker alone rather than
+            // closing on unverified evidence.
+            logger.warn(
+              { err: error as Error, prRef, woId },
+              'overseer.reconcile.open_pr_lookup_failed_leaving_tracker_open'
+            );
+            continue;
+          }
+          const holders = openPullRequestsHoldingTracker({
+            stem: holderStem,
+            mergedPr: pr,
+            tracker,
+            openPullRequests,
+          });
+          if (holders.length > 0) {
+            const alreadyNoted = await (deps.hasHoldBeenNoted ?? hasDefaultHoldBeenNoted)({
+              prRef,
+              woId,
+            });
+            if (alreadyNoted) {
+              logger.warn(
+                { prRef, woId, tracker: tracker.number },
+                'overseer.reconcile.open_prs_hold_tracker_open'
+              );
+              continue;
+            }
+            await deps.addTrackerEvidenceComment({
+              issue: tracker,
+              body: buildHoldOpenComment({ pr, stem: holderStem, holders }),
+            });
+            await (deps.insertAction ?? insertDefaultOverseerAction)({
+              prRef,
+              woId,
+              class: RECONCILE_TRACKER_CLASS,
+              action: RECONCILE_HOLD_OPEN_ACTION,
+              result: evidenceResult,
+            });
+            continue;
+          }
+        }
+
+        // MERGED IS NOT DONE (amendment A1). Mark the tracker and leave it open;
+        // only a LIVE-PROOF comment closes it (see the pass after this loop).
+        await deps.addTrackerLabel({ issue: tracker, label: MERGED_LABEL });
+        for (const stale of STALE_STATUS_LABELS) {
+          await deps.removeTrackerLabel?.({ issue: tracker, label: stale });
+        }
+        await deps.addTrackerEvidenceComment({
+          issue: tracker,
+          body: buildMergedComment({ pr, stem: holderStem, reopened: reopenNeeded }),
+        });
+        successfullyClosedTrackers.add(trackerIdentity);
         await (deps.insertAction ?? insertDefaultOverseerAction)({
           prRef,
-          woId: declared,
-          class: RECONCILE_TRACKER_CLASS,
-          action: RECONCILE_KEYWORD_MISSING_ACTION,
+          woId,
+          class: RECONCILE_CLOSES_KEYWORD_CLASS,
+          action: RECONCILE_MERGED_ACTION,
           result: evidenceResult,
         });
+        marked += 1;
       }
-    } catch (error) {
-      if (isRateLimitError(error)) {
-        logger.warn(
-          { err: error as Error, rateLimit: true, prRef: key },
-          'overseer.reconcile.rate_limit_skip'
-        );
-        return { scanned: seen.size, closed, skipped: true };
+    }
+
+    // KEYWORD-MISSING NOTE. A PR on its project base that declares a WO on a
+    // manifest `WO:` line but carries NO closing keyword for that WO's tracker
+    // leaves the tracker OPEN (a declaration is not completion evidence) and
+    // records one deduplicated audit row so the gap is visible.
+    for (const declared of declaredStems) {
+      if (skippedSet.has(declared)) continue;
+      let declaredTracker: ReconcileTrackerIssue | null;
+      try {
+        declaredTracker = await deps.findTrackerIssueByStem(declared, trackerLookupScope);
+      } catch (error) {
+        if (isRateLimitError(error)) {
+          logger.warn(
+            { err: error as Error, rateLimit: true, stem: declared },
+            'overseer.reconcile.rate_limit_skip'
+          );
+          return { scanned: seen.size, closed, skipped: true };
+        }
+        if (isAuthError(error)) {
+          logger.warn(
+            { err: error as Error, authError: true, stem: declared },
+            'overseer.reconcile.auth_error_skip'
+          );
+          return { scanned: seen.size, closed, skipped: true };
+        }
+        throw error;
       }
-      if (isAuthError(error)) {
-        logger.warn(
-          { err: error as Error, authError: true, prRef: key },
-          'overseer.reconcile.auth_error_skip'
-        );
-        return { scanned: seen.size, closed, skipped: true };
-      }
-      logger.warn({ err: error as Error, prRef: key }, 'overseer.reconcile.pr_error');
-      continue;
+      if (declaredTracker?.state !== 'open') continue;
+      if (refNumbers.includes(declaredTracker.number)) continue;
+      const alreadyNoted = await (
+        deps.hasKeywordMissingBeenNoted ?? hasDefaultKeywordMissingBeenNoted
+      )({ prRef, woId: declared });
+      if (alreadyNoted) continue;
+      logger.info?.(
+        { prRef, woId: declared, tracker: declaredTracker.number },
+        'overseer.reconcile.keyword_missing_tracker_left_open'
+      );
+      await (deps.insertAction ?? insertDefaultOverseerAction)({
+        prRef,
+        woId: declared,
+        class: RECONCILE_TRACKER_CLASS,
+        action: RECONCILE_KEYWORD_MISSING_ACTION,
+        result: evidenceResult,
+      });
     }
   }
 
@@ -1846,11 +1813,18 @@ export function findTrackerIssueByStem(
   // A same-title open+closed pair is NOT ambiguous for reconcile: the closed
   // copy is containment/history and the open issue is the live tracker (anchor:
   // bdc-xo #4114 open + #3743 closed shared one title and aborted a whole pass).
-  // Only two or more OPEN matches are genuinely ambiguous.
+  // The disambiguation authorized here is a SINGLE-OPEN preference and nothing
+  // more. Two or more OPEN matches are genuinely ambiguous. A set with NO open
+  // match and more than one closed copy is ALSO ambiguous: there is no live
+  // tracker to prefer, so reconcile must not silently pick an arbitrary closed
+  // issue -- it retains the fail-closed ambiguity error.
   const openMatches = matches.filter(row => row.state === 'open');
   if (openMatches.length > 1) throw new Error(`tracker issue title is ambiguous: ${stem}`);
-  // Prefer the single open match; otherwise (all matches closed, no live
-  // ambiguity) fall back to the first closed match rather than throwing.
+  if (openMatches.length === 0 && matches.length > 1) {
+    throw new Error(`tracker issue title is ambiguous: ${stem}`);
+  }
+  // Prefer the single open match; otherwise exactly one closed match remains,
+  // which is unambiguous history and safe to return.
   const exact = openMatches[0] ?? matches[0];
   if (!exact) return null;
   return {

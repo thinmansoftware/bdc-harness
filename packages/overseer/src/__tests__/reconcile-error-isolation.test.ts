@@ -12,15 +12,19 @@ import {
 
 // WO-HARNESS-RECONCILE-PER-PR-ERROR-ISOLATION-01
 //
-// One bad or duplicate-titled tracker must never abort a reconcile pass. These
-// tests cover the per-stem and per-PR error isolation in runReconcileOnce and
-// the open-vs-closed dedup in findTrackerIssueByStem.
+// A spurious same-title open+closed PAIR (a history/containment copy sitting
+// next to the live tracker) must not abort a reconcile pass -- findTrackerIssueByStem
+// now prefers the single open match. GENUINE ambiguity (two or more open matches,
+// or a zero-open set with more than one closed copy) and malformed-snapshot errors
+// remain FAIL CLOSED: they propagate out of runReconcileOnce and no tracker is
+// mutated (the existing contract enforced in reconcile-github-auth.test.ts). These
+// tests cover both the open-vs-closed preference and that fail-closed boundary.
 
 const STEM_A = 'WO-X-AMBIG-01';
-const TRACKER_B = 2044;
 
 // PR A: on its project base (bdc-harness -> dev), declares STEM_A on a manifest
-// WO: line, carries NO closing keyword. This drives the declared-stem lookup.
+// WO: line and carries NO closing keyword. This drives the declared-stem lookup
+// through findTrackerIssueByStem.
 function prA(overrides: Partial<ReconcileMergedPullRequest> = {}): ReconcileMergedPullRequest {
   return {
     owner: 'thinmansoftware',
@@ -38,41 +42,12 @@ function prA(overrides: Partial<ReconcileMergedPullRequest> = {}): ReconcileMerg
   };
 }
 
-// PR B: on its project base, carries a closing keyword for an open tracker.
-function prB(overrides: Partial<ReconcileMergedPullRequest> = {}): ReconcileMergedPullRequest {
-  return {
-    owner: 'thinmansoftware',
-    repo: 'bdc-harness',
-    number: 502,
-    title: 'PR B closes a valid tracker',
-    body: `Closes thinmansoftware/bdc-xo#${TRACKER_B}`,
-    htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/502',
-    state: 'closed',
-    merged: true,
-    mergeCommitSha: 'shaB',
-    mergedAt: '2026-11-03T12:05:00Z',
-    baseRef: 'dev',
-    ...overrides,
-  };
-}
-
-function trackerB(state: 'open' | 'closed' = 'open'): ReconcileTrackerIssue {
-  return {
-    owner: 'thinmansoftware',
-    repo: 'bdc-xo',
-    number: TRACKER_B,
-    title: 'WO-B-VALID-01',
-    state,
-  };
-}
-
-// Bespoke deps: findTrackerIssueByStem / findTrackerIssueByNumber can be made to
-// fail only for PR A while succeeding for PR B, which the shared reconcile.test
-// helpers (single hardcoded number + single global error) cannot express.
-function isolationDeps(input: {
+// Deps whose findTrackerIssueByStem resolves against a real tracker snapshot via
+// the production findTrackerIssueByStem, so the integration tests exercise the
+// open-vs-closed preference and the fail-closed ambiguity propagation end to end.
+function reconcileDeps(input: {
   prs: ReconcileMergedPullRequest[];
-  stemError?: unknown;
-  numberError?: unknown;
+  snapshot: TrackerIssueSnapshot;
 }): ReconcileDeps & {
   labels: string[];
   comments: string[];
@@ -94,16 +69,10 @@ function isolationDeps(input: {
     readCursor: mock(async () => null),
     now: () => new Date('2026-11-03T12:10:00Z'),
     searchMergedPullRequests: mock(async () => input.prs),
-    findTrackerIssueByNumber: mock(async (number: number) => {
-      if (input.numberError) throw input.numberError;
-      if (number === TRACKER_B) return trackerB();
-      return null;
-    }),
-    findTrackerIssueByStem: mock(async (candidate: string) => {
-      if (candidate === STEM_A && input.stemError) throw input.stemError;
-      // PR B declares nothing, so this is only reached for STEM_A.
-      return null;
-    }),
+    findTrackerIssueByNumber: mock(async () => null),
+    findTrackerIssueByStem: mock(async (candidate: string) =>
+      findTrackerIssueByStem(input.snapshot, candidate)
+    ),
     addTrackerEvidenceComment: mock(async request => {
       comments.push(request.body);
     }),
@@ -130,7 +99,7 @@ function isolationDeps(input: {
   };
 }
 
-// Build a tracker snapshot row for the direct findTrackerIssueByStem unit tests.
+// Build a tracker snapshot row for the findTrackerIssueByStem tests.
 function snapshotRow(
   overrides: Partial<TrackerSnapshotRow> & { number: number }
 ): TrackerSnapshotRow {
@@ -149,66 +118,8 @@ function snapshot(rows: TrackerSnapshotRow[]): TrackerIssueSnapshot {
   return new Map(rows.map(row => [row.number, row]));
 }
 
-describe('reconcile error isolation (WO-HARNESS-RECONCILE-PER-PR-ERROR-ISOLATION-01)', () => {
-  test('Test 1: stem_ambiguous_does_not_abort -- ambiguous stem on PR A is logged and skipped, PR B still marked', async () => {
-    const deps = isolationDeps({
-      prs: [prA(), prB()],
-      stemError: new Error('tracker issue title is ambiguous: WO-X-AMBIG-01'),
-    });
-
-    const result = await runReconcileOnce({ deps });
-
-    expect(result.skipped).toBe(false);
-    // PR B's tracker was marked merged (one status:merged label + evidence comment).
-    expect(deps.labels).toContain('status:merged');
-    expect(deps.actions.some(a => a.action === 'reconcile_merged_noted')).toBe(true);
-    // Exactly one stem_lookup_error was emitted (for PR A).
-    expect(deps.warnings.filter(w => w === 'overseer.reconcile.stem_lookup_error')).toHaveLength(1);
-  });
-
-  test('Test 2: generic_per_pr_error_isolated -- generic number-lookup error on PR A is logged, PR B processed', async () => {
-    const deps = isolationDeps({
-      prs: [prA({ body: `Closes thinmansoftware/bdc-xo#9999` }), prB()],
-    });
-
-    // Scope a generic (non-rate-limit, non-auth) error to PR A's referenced
-    // tracker number only; PR B's tracker still resolves and is marked.
-    deps.findTrackerIssueByNumber = mock(async (number: number) => {
-      if (number === 9999) throw new Error('boom: GitHub returned an unexpected shape');
-      if (number === TRACKER_B) return trackerB();
-      return null;
-    });
-
-    const result = await runReconcileOnce({ deps });
-
-    expect(result.skipped).toBe(false);
-    // pr_error logged for PR A.
-    expect(deps.warnings.filter(w => w === 'overseer.reconcile.pr_error')).toHaveLength(1);
-    // PR B still processed and marked.
-    expect(deps.labels).toContain('status:merged');
-    expect(deps.actions.some(a => a.action === 'reconcile_merged_noted')).toBe(true);
-  });
-
-  test('Test 3: rate_limit_still_early_returns -- rate-limit on PR A skips the whole pass', async () => {
-    const rateLimit = Object.assign(new Error('API rate limit exceeded'), { status: 403 });
-    const deps = isolationDeps({
-      prs: [prA({ body: `Closes thinmansoftware/bdc-xo#9999` }), prB()],
-    });
-    deps.findTrackerIssueByNumber = mock(async (number: number) => {
-      if (number === 9999) throw rateLimit;
-      if (number === TRACKER_B) return trackerB();
-      return null;
-    });
-
-    const result = await runReconcileOnce({ deps });
-
-    expect(result.skipped).toBe(true);
-    // PR B was never processed (no label marked).
-    expect(deps.labels).not.toContain('status:merged');
-    expect(deps.warnings.filter(w => w === 'overseer.reconcile.pr_error')).toHaveLength(0);
-  });
-
-  test('Test 4: one_open_one_closed_prefers_open -- returns the open issue, no throw', () => {
+describe('findTrackerIssueByStem open-vs-closed preference (WO-HARNESS-RECONCILE-PER-PR-ERROR-ISOLATION-01)', () => {
+  test('one_open_one_closed_prefers_open -- returns the open issue, no throw', () => {
     const snap = snapshot([
       snapshotRow({ number: 4114, title: 'WO-X-01', state: 'open' }),
       snapshotRow({ number: 3743, title: 'WO-X-01', state: 'closed' }),
@@ -221,7 +132,7 @@ describe('reconcile error isolation (WO-HARNESS-RECONCILE-PER-PR-ERROR-ISOLATION
     expect(result?.state).toBe('open');
   });
 
-  test('Test 5: two_open_still_ambiguous -- throws when two matches are open', () => {
+  test('two_open_still_ambiguous -- throws when two matches are open', () => {
     const snap = snapshot([
       snapshotRow({ number: 4114, title: 'WO-X-01', state: 'open' }),
       snapshotRow({ number: 4200, title: 'WO-X-01', state: 'open' }),
@@ -230,5 +141,86 @@ describe('reconcile error isolation (WO-HARNESS-RECONCILE-PER-PR-ERROR-ISOLATION
     expect(() => findTrackerIssueByStem(snap, 'WO-X-01')).toThrow(
       'tracker issue title is ambiguous: WO-X-01'
     );
+  });
+
+  test('zero_open_multiple_closed_still_ambiguous -- never picks an arbitrary closed issue', () => {
+    // No live tracker to prefer: two same-title CLOSED copies with zero open
+    // matches are genuinely ambiguous. The single-open preference must not
+    // degrade into silently returning matches[0].
+    const snap = snapshot([
+      snapshotRow({ number: 3743, title: 'WO-X-01', state: 'closed' }),
+      snapshotRow({ number: 3744, title: 'WO-X-01', state: 'closed' }),
+    ]);
+
+    expect(() => findTrackerIssueByStem(snap, 'WO-X-01')).toThrow(
+      'tracker issue title is ambiguous: WO-X-01'
+    );
+  });
+
+  test('single_closed_match_returns -- one closed copy with no open twin is unambiguous', () => {
+    const snap = snapshot([snapshotRow({ number: 3743, title: 'WO-X-01', state: 'closed' })]);
+
+    const result = findTrackerIssueByStem(snap, 'WO-X-01');
+
+    expect(result).not.toBeNull();
+    expect(result?.number).toBe(3743);
+    expect(result?.state).toBe('closed');
+  });
+
+  test('no_match_returns_null', () => {
+    const snap = snapshot([snapshotRow({ number: 3743, title: 'WO-OTHER-01', state: 'open' })]);
+    expect(findTrackerIssueByStem(snap, 'WO-X-01')).toBeNull();
+  });
+});
+
+describe('runReconcileOnce fail-closed boundary (WO-HARNESS-RECONCILE-PER-PR-ERROR-ISOLATION-01)', () => {
+  test('open_plus_closed_pair_does_not_abort -- resolves to the open tracker and completes the pass', async () => {
+    // Anchor bdc-xo #4114 open + #3743 closed: before the fix this same-title
+    // pair threw "ambiguous" and aborted the entire pass, so the declared WO was
+    // never noted. Now it resolves to the open tracker and the pass finishes.
+    const snap = snapshot([
+      snapshotRow({ number: 4114, title: STEM_A, state: 'open' }),
+      snapshotRow({ number: 3743, title: STEM_A, state: 'closed' }),
+    ]);
+    const deps = reconcileDeps({ prs: [prA()], snapshot: snap });
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result.skipped).toBe(false);
+    // The declared-but-not-closed WO was noted against the OPEN tracker.
+    expect(deps.actions.some(a => a.action === 'reconcile_keyword_missing_noted')).toBe(true);
+    expect(deps.infos).toContain('overseer.reconcile.keyword_missing_tracker_left_open');
+  });
+
+  test('two_open_duplicate_aborts_pass -- genuine ambiguity fails closed with no tracker effect', async () => {
+    // Two OPEN same-title trackers are genuinely ambiguous. The pass must abort
+    // (propagate) rather than guess, and nothing may be written.
+    const snap = snapshot([
+      snapshotRow({ number: 4114, title: STEM_A, state: 'open' }),
+      snapshotRow({ number: 4200, title: STEM_A, state: 'open' }),
+    ]);
+    const deps = reconcileDeps({ prs: [prA()], snapshot: snap });
+
+    await expect(runReconcileOnce({ deps })).rejects.toThrow(
+      `tracker issue title is ambiguous: ${STEM_A}`
+    );
+    expect(deps.actions).toEqual([]);
+    expect(deps.labels).toEqual([]);
+    expect(deps.comments).toEqual([]);
+  });
+
+  test('all_closed_duplicate_aborts_pass -- zero-open duplicate set fails closed', async () => {
+    const snap = snapshot([
+      snapshotRow({ number: 3743, title: STEM_A, state: 'closed' }),
+      snapshotRow({ number: 3744, title: STEM_A, state: 'closed' }),
+    ]);
+    const deps = reconcileDeps({ prs: [prA()], snapshot: snap });
+
+    await expect(runReconcileOnce({ deps })).rejects.toThrow(
+      `tracker issue title is ambiguous: ${STEM_A}`
+    );
+    expect(deps.actions).toEqual([]);
+    expect(deps.labels).toEqual([]);
+    expect(deps.comments).toEqual([]);
   });
 });
