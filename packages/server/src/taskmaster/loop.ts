@@ -841,9 +841,11 @@ export interface GitHubDigestData {
   servicesByPool: Map<string, string[]>;
 }
 
-export async function loadGitHubDigestData(nowMs: number): Promise<GitHubDigestData> {
+export async function loadGitHubDigestData(
+  nowMs: number,
+  db: Pick<ReturnType<typeof getDatabase>, 'query'> = getDatabase()
+): Promise<GitHubDigestData> {
   const since = new Date(nowMs - 24 * 60 * 60 * 1000).toISOString();
-  const db = getDatabase();
   const usage = await db.query<{
     service: string;
     pool_id: string;
@@ -860,7 +862,7 @@ export async function loadGitHubDigestData(nowMs: number): Promise<GitHubDigestD
     remaining: number | string;
     limit: number | string;
   }>(
-    `SELECT pool_id, resource, remaining, "limit" AS limit FROM github_api_pool_state
+    `SELECT pool_id, resource, remaining, "limit" AS "limit" FROM github_api_pool_state
      WHERE resource IN ('core', 'search', 'graphql') ORDER BY pool_id, resource`
   );
   const servicesByPool = new Map<string, string[]>();
