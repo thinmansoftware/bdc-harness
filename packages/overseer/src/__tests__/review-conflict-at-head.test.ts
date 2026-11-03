@@ -4,7 +4,7 @@
  * live ones seen for bdc-harness#1453 on 2026-11-03.
  */
 import { describe, expect, test } from 'bun:test';
-import { reviewConflictFromMessages } from '../adapters/github-real-deps';
+import { loadReviewConflictAtHead, reviewConflictFromMessages } from '../adapters/github-real-deps';
 
 const PR = { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1453 };
 const H = '68937274ac565096e886e65882cc3a197389c878';
@@ -84,6 +84,35 @@ describe('reviewConflictFromMessages', () => {
         { truncated: true }
       )
     ).toBe('changes_requested');
+  });
+
+  test('a review that finishes between the reads is still caught (requests read first)', async () => {
+    // Before the first read the review is running with no receipt; right after
+    // the first read it writes changes_requested and its request becomes done.
+    let reads = 0;
+    let finished = false;
+    const order: string[] = [];
+    const list = async (filters: { recipient: string }) => {
+      order.push(filters.recipient);
+      const rows =
+        filters.recipient === 'overseer-reviewer'
+          ? [request(H, finished ? 'done' : 'claimed')]
+          : finished && filters.recipient !== 'operator'
+            ? [receipt(H, 'changes_requested')]
+            : [];
+      reads += 1;
+      if (reads === 1) finished = true;
+      return rows;
+    };
+    expect(await loadReviewConflictAtHead({ ...PR, headSha: H }, list)).not.toBeNull();
+    expect(order[0]).toBe('overseer-reviewer');
+  });
+
+  test('a failing read fails closed', async () => {
+    const list = async (): Promise<never> => {
+      throw new Error('db down');
+    };
+    expect(await loadReviewConflictAtHead({ ...PR, headSha: H }, list)).toBe('lookup_failed');
   });
 
   test('ignores other PRs and unparseable bodies', () => {

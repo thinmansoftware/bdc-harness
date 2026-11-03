@@ -2218,6 +2218,53 @@ export function reviewConflictFromMessages(
   return options.truncated ? 'lookup_failed' : null;
 }
 
+type ReviewConflictListFn = (filters: {
+  recipient: string;
+  subject_key: string;
+  limit: number;
+}) => Promise<Pick<DispatchMessage, 'body' | 'status'>[]>;
+
+/**
+ * Reads the rows for reviewConflictFromMessages. REQUESTS ARE READ FIRST: a
+ * review writes its submit receipt inside the handler, and its request becomes
+ * done only after the handler returns. A review still running at the first read
+ * is seen as in flight; one that finished before it has already written its
+ * receipt, which the later receipt reads include. Reading receipts first lets a
+ * review finish between the two reads and look clean in both.
+ */
+export async function loadReviewConflictAtHead(
+  input: PullRequestRef & { headSha: string },
+  list: ReviewConflictListFn
+): Promise<ReviewConflictAtHead | null> {
+  const subjectKey = `gh:${input.owner}/${input.repo}#${input.number}`;
+  try {
+    const requests = await list({
+      recipient: REVIEW_REQUEST_RECIPIENT,
+      subject_key: subjectKey,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    const pr = await list({
+      recipient: PR_REVIEW_LOG_RECIPIENT,
+      subject_key: subjectKey,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    const operator = await list({
+      recipient: 'operator',
+      subject_key: subjectKey,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    // listMessages has no pagination. A full page may hide older rows for this
+    // head, so a full page is not proof of "no conflict".
+    const truncated =
+      requests.length >= REVIEW_CONFLICT_PAGE_LIMIT ||
+      pr.length >= REVIEW_CONFLICT_PAGE_LIMIT ||
+      operator.length >= REVIEW_CONFLICT_PAGE_LIMIT;
+    return reviewConflictFromMessages(input, [...pr, ...operator], requests, { truncated });
+  } catch {
+    return 'lookup_failed';
+  }
+}
+
 /**
  * Build the real (non-fake) GitHubClientDeps composition for Overseer. Fails
  * loudly at construction time if the token is missing -- never silently
@@ -2313,35 +2360,8 @@ export function createRealGitHubClientDeps(
         }
       });
     },
-    reviewConflictAtHead: async (input): Promise<ReviewConflictAtHead | null> => {
-      const subjectKey = `gh:${input.owner}/${input.repo}#${input.number}`;
-      try {
-        const pr = await listDispatchMessages({
-          recipient: PR_REVIEW_LOG_RECIPIENT,
-          subject_key: subjectKey,
-          limit: REVIEW_CONFLICT_PAGE_LIMIT,
-        });
-        const operator = await listDispatchMessages({
-          recipient: 'operator',
-          subject_key: subjectKey,
-          limit: REVIEW_CONFLICT_PAGE_LIMIT,
-        });
-        const requests = await listDispatchMessages({
-          recipient: REVIEW_REQUEST_RECIPIENT,
-          subject_key: subjectKey,
-          limit: REVIEW_CONFLICT_PAGE_LIMIT,
-        });
-        // listMessages has no pagination. A full page may hide older rows for
-        // this head, so a full page is not proof of "no conflict".
-        const truncated =
-          pr.length >= REVIEW_CONFLICT_PAGE_LIMIT ||
-          operator.length >= REVIEW_CONFLICT_PAGE_LIMIT ||
-          requests.length >= REVIEW_CONFLICT_PAGE_LIMIT;
-        return reviewConflictFromMessages(input, [...pr, ...operator], requests, { truncated });
-      } catch {
-        return 'lookup_failed';
-      }
-    },
+    reviewConflictAtHead: (input): Promise<ReviewConflictAtHead | null> =>
+      loadReviewConflictAtHead(input, listDispatchMessages),
     findPullRequest: createRealFindPullRequest(octokit),
     // Merge mutations go through the distinct merge identity when configured
     // (M-153: the merger is never the reviewer).
