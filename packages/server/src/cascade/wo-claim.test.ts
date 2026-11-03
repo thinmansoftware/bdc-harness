@@ -257,6 +257,21 @@ describe('cascadeWoClaimDeps / reconcileRetainedWoClaims (real sqlite)', () => {
       expect(await findActiveWoClaim('WO-A-01')).toBeNull();
     });
 
+    test('releases a claim retained at frontier approval once the operator rejects the tier', async () => {
+      await seedRetained('WO-A-01', 'casc-1', ['r1']);
+      const pending = await reconcileRetainedWoClaims(undefined, {
+        readRecord: recordsReader({ 'casc-1': { status: 'pending-frontier-approval' } }),
+        readRun: runsReader({ r1: { status: 'completed' } }),
+      });
+      expect(pending).toEqual([]);
+      const released = await reconcileRetainedWoClaims(undefined, {
+        readRecord: recordsReader({ 'casc-1': { status: 'frontier-rejected' } }),
+        readRun: runsReader({ r1: { status: 'completed' } }),
+      });
+      expect(released).toEqual(['WO-A-01']);
+      expect(await findActiveWoClaim('WO-A-01')).toBeNull();
+    });
+
     test('also releases when the record is missing but runs are terminal', async () => {
       await seedRetained('WO-A-01', 'casc-1', ['r1']);
       const released = await reconcileRetainedWoClaims(undefined, {
