@@ -33,6 +33,12 @@ export interface CancelRunOptions {
    * the forbidden empty reason.
    */
   reason: string;
+  /**
+   * Transport for Archon API reads/writes. Defaults to global fetch. The
+   * in-process T3 command consumer passes the server's own in-process API
+   * dispatcher here so no network self-call is made.
+   */
+  fetchImpl?: typeof fetch;
 }
 
 /**
@@ -60,11 +66,14 @@ export async function cancelRun(opts: CancelRunOptions): Promise<CancelResult> {
 
   let res: Response;
   try {
-    res = await fetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}/cancel`, {
-      method: 'POST',
-      headers: { 'x-archon-operator-token': token, 'content-type': 'application/json' },
-      body: JSON.stringify({ reason: trimmedReason }),
-    });
+    res = await (opts.fetchImpl ?? fetch)(
+      `${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}/cancel`,
+      {
+        method: 'POST',
+        headers: { 'x-archon-operator-token': token, 'content-type': 'application/json' },
+        body: JSON.stringify({ reason: trimmedReason }),
+      }
+    );
   } catch (err) {
     const msg = `[smart-cauldron/cancel] network error on POST /api/workflows/runs/${runId}/cancel: ${(err as Error).message}`;
     return { ok: false, error: msg };

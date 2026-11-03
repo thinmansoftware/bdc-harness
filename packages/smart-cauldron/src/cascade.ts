@@ -222,14 +222,15 @@ export async function waitForPriorTeardown(
 async function defaultReadRunDetail(
   runId: string,
   apiBaseUrl: string,
-  token: string
+  token: string,
+  doFetch: typeof fetch = fetch
 ): Promise<PriorRunDetail | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => {
     controller.abort();
   }, 15_000);
   try {
-    const res = await fetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}`, {
+    const res = await doFetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}`, {
       headers: { 'x-archon-operator-token': token },
       signal: controller.signal,
     });
@@ -315,7 +316,8 @@ export function parseFuelglassSeatCutoff(value: unknown): number | null {
 function defaultFuelglassSeatReader(
   apiBaseUrl: string,
   token: string,
-  onCutoff: (percent: number | null) => void = () => undefined
+  onCutoff: (percent: number | null) => void = () => undefined,
+  doFetch: typeof fetch = fetch
 ): () => Promise<SeatUsageSnapshot> {
   return async () => {
     const controller = new AbortController();
@@ -323,7 +325,7 @@ function defaultFuelglassSeatReader(
       controller.abort();
     }, DEFAULT_FUELGLASS_TIMEOUT_MS);
     try {
-      const response = await fetch(`${apiBaseUrl.replace(/\/$/, '')}/api/fuelglass/seats`, {
+      const response = await doFetch(`${apiBaseUrl.replace(/\/$/, '')}/api/fuelglass/seats`, {
         headers: { Authorization: `Bearer ${token}` },
         signal: controller.signal,
       });
@@ -436,6 +438,19 @@ export interface RunCascadeOptions {
   dispatchId?: string;
   /** Resolves only after the initial record is durable; used by async API dispatch. */
   onAdmission?: (record: CascadeRunRecord, created: boolean) => void;
+  /**
+   * Called the moment a tier's dispatch is proven and its run id discovered,
+   * BEFORE any terminal-state polling. Lets a caller persist run custody while
+   * the run is still running or paused. A throwing callback never affects the
+   * cascade.
+   */
+  onRunDiscovered?: (runId: string, cascadeId: string, tierName: string) => void;
+  /**
+   * Passed through to the poller: a normally-terminal status that is a
+   * transitional hand-off for this run (see pollForTerminal). Absent by default,
+   * so every existing caller behaves exactly as before.
+   */
+  isTransitionalStatus?: (detail: import('./poll.js').PollRunDetail) => boolean;
   /** Await durable automatic-fire permission after preflight, before admission/effects. */
   beforeAdmission?: () => Promise<import('@archon/core/db/taskmaster').AutomaticFireProvenance>;
   woClass?: string;
@@ -454,6 +469,12 @@ export interface RunCascadeOptions {
   apiBaseUrl?: string;
   /** Operator token for Archon API auth. Defaults to ARCHON_OPERATOR_TOKEN env in callees. */
   token?: string;
+  /**
+   * Transport for Archon API reads/writes. Defaults to global fetch. The
+   * in-process T3 command consumer passes the server's own in-process API
+   * dispatcher here so no network self-call is made.
+   */
+  fetchImpl?: typeof fetch;
   /** Codebase shortname for explicit workflow binding. Required for live fires. */
   project?: string;
   /** Output directory for cascade-runs/ records. Default: ./cascade-runs. */
@@ -513,6 +534,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
   const apiBaseUrl = opts.apiBaseUrl ?? process.env.ARCHON_API_BASE_URL ?? 'http://localhost:3090';
   const operatorToken = token ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
+  const fetchImpl = opts.fetchImpl;
 
   // Inject real implementations unless overridden (for testing)
   const fireImpl = opts.deps?.fire ?? fireTier;
@@ -546,7 +568,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const readRunDetailImpl =
     opts.deps?.readRunDetail ??
     ((id: string): Promise<PriorRunDetail | null> =>
-      defaultReadRunDetail(id, apiBaseUrl, operatorToken));
+      defaultReadRunDetail(id, apiBaseUrl, operatorToken, fetchImpl));
   const configuredTeardownWait = Number.parseInt(
     process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS ?? '',
     10
@@ -608,9 +630,14 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   let seatCutoffPercent: number | null = null;
   const seatUsage = opts.deps?.seatUsage
     ? await readSeatUsageOrUnknown(opts.deps.seatUsage)
-    : await defaultFuelglassSeatReader(apiBaseUrl, operatorToken, percent => {
-        seatCutoffPercent = percent;
-      })();
+    : await defaultFuelglassSeatReader(
+        apiBaseUrl,
+        operatorToken,
+        percent => {
+          seatCutoffPercent = percent;
+        },
+        fetchImpl
+      )();
   if (opts.deps?.seatCutoff) {
     try {
       seatCutoffPercent = await opts.deps.seatCutoff();
@@ -1327,8 +1354,16 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         message: buildFireMessage(woId, project, priorContext ?? undefined, opts.expectedSpec),
         apiBaseUrl,
         token,
+        ...(fetchImpl ? { fetchImpl } : {}),
       });
       attempt.runId = fireResult.runId;
+      if (fireResult.ok && fireResult.runId && opts.onRunDiscovered) {
+        try {
+          opts.onRunDiscovered(fireResult.runId, cascadeId, tier.name);
+        } catch {
+          // Observation hook only; never alters the climb.
+        }
+      }
 
       // Infra error: alert + stop (do NOT count as "too hard")
       if (!fireResult.ok) {
@@ -1399,6 +1434,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           workflowName: tier.workflowName,
           apiBaseUrl,
           token,
+          ...(fetchImpl ? { fetchImpl } : {}),
           floorMs: DEFAULT_OPEN_NODE_BUDGET_MS,
         });
       } catch (err) {
@@ -1415,6 +1451,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           runId: resolvedRunId,
           apiBaseUrl,
           token,
+          ...(fetchImpl ? { fetchImpl } : {}),
+          ...(opts.isTransitionalStatus ? { isTransitionalStatus: opts.isTransitionalStatus } : {}),
           timeoutMs: pollTimeoutMs,
           stallTimeoutMs: pollStallTimeoutMs,
           intervalMs: pollIntervalMs,
@@ -1474,6 +1512,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
             runId: resolvedRunId,
             apiBaseUrl,
             token,
+            ...(fetchImpl ? { fetchImpl } : {}),
             reason: `smart-cauldron stall: ${timeoutReason}; cascade ${cascadeId}`,
           }).catch((cancelErr: unknown) => ({
             ok: false,
