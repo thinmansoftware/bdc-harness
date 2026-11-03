@@ -101,6 +101,47 @@ describe('fireTier atomic conversation dispatch', () => {
     expect(headerValue(atomicRequest?.init, 'x-archon-operator-token')).toBe('option-token');
   });
 
+  test('routes every API request through fetchImpl and never the global fetch', async () => {
+    let globalCalls = 0;
+    globalThis.fetch = (async () => {
+      globalCalls += 1;
+      return new Response('unexpected', { status: 500 });
+    }) as unknown as typeof globalThis.fetch;
+    const injected = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      fetchCalls.push({ url, init });
+      if (url.endsWith('/api/codebases')) return codebasesResponse();
+      if (url.endsWith('/api/conversations')) {
+        return Response.json({ conversationId: 'web-p', id: 'p-db', dispatched: true });
+      }
+      return Response.json({
+        runs: [
+          {
+            id: 'run-ip',
+            workflow_name: 'bdc-feature-development',
+            parent_conversation_id: 'p-db',
+            codebase_id: 'cb-harness',
+          },
+        ],
+      });
+    }) as typeof globalThis.fetch;
+
+    const result = await fireTier({
+      workflowName: 'bdc-feature-development',
+      woId: 'WO-TEST-001',
+      project: 'bdc-harness',
+      message: buildFireMessage('WO-TEST-001', 'bdc-harness'),
+      apiBaseUrl: 'http://archon.in-process',
+      token: '',
+      fetchImpl: injected,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.runId).toBe('run-ip');
+    expect(globalCalls).toBe(0);
+    expect(fetchCalls).toHaveLength(3);
+  });
+
   test('rejects a response that does not prove dispatched true', async () => {
     globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input);

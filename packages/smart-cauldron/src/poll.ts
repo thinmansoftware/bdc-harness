@@ -52,7 +52,7 @@ export class PollTransportError extends Error {
   }
 }
 
-interface RunApiResponse {
+export interface RunApiResponse {
   run: {
     id: string;
     status: string;
@@ -68,11 +68,28 @@ interface RunApiResponse {
   }[];
 }
 
+/** The run detail poll reads (GET /api/workflows/runs/:id). */
+export type PollRunDetail = RunApiResponse;
+
 interface PollOptions {
   runId: string;
   apiBaseUrl: string;
   /** Operator token for Archon API auth. Defaults to ARCHON_OPERATOR_TOKEN env. */
   token?: string;
+  /**
+   * Transport for Archon API reads/writes. Defaults to global fetch. The
+   * in-process T3 command consumer passes the server's own in-process API
+   * dispatcher here so no network self-call is made.
+   */
+  fetchImpl?: typeof fetch;
+  /**
+   * Optional: returns true when a status that is normally terminal is a
+   * TRANSITIONAL hand-off for this run (for example the `failed` an approval
+   * writes just before its resume), so polling continues inside its existing
+   * budget instead of reporting a terminal result. Absent = every terminal
+   * status is terminal (the behavior of every existing caller).
+   */
+  isTransitionalStatus?: (detail: PollRunDetail) => boolean;
   /**
    * HARD CEILING on total run duration (ms). Default: 14400000 (4 hours).
    *
@@ -213,6 +230,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     checkPrMergeable: checkPrMergeableFn = checkPrMergeableDefault,
   } = opts;
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
+  const doFetch = opts.fetchImpl ?? fetch;
 
   const deadline = Date.now() + timeoutMs;
 
@@ -224,7 +242,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
   let lastActivityAt = Date.now();
 
   while (Date.now() < deadline) {
-    const detail = await fetchRunDetail(runId, apiBaseUrl, token);
+    const detail = await fetchRunDetail(runId, apiBaseUrl, token, doFetch);
 
     const newestNow = newestEventTimestamp(detail.events ?? []);
     if (newestNow !== null && (newestEventSeen === null || newestNow > newestEventSeen)) {
@@ -232,7 +250,10 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
       lastActivityAt = Date.now();
     }
 
-    if (TERMINAL_STATUSES.has(detail.run.status)) {
+    if (
+      TERMINAL_STATUSES.has(detail.run.status) &&
+      !(opts.isTransitionalStatus?.(detail) ?? false)
+    ) {
       const terminalStatus = detail.run.status as
         | 'completed'
         | 'failed'
@@ -251,7 +272,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
       if (terminalStatus === 'completed' && prUrl === null) {
         for (let attempt = 0; attempt < prRetryAttempts && prUrl === null; attempt++) {
           await new Promise<void>(resolve => setTimeout(resolve, prRetryDelayMs));
-          const retryDetail = await fetchRunDetail(runId, apiBaseUrl, token);
+          const retryDetail = await fetchRunDetail(runId, apiBaseUrl, token, doFetch);
           events = retryDetail.events ?? [];
           prUrl = extractPrUrl(events);
           // The validator event can lag for the same reason -- refresh it too.
@@ -455,11 +476,12 @@ function openNodeNames(
 async function fetchRunDetail(
   runId: string,
   apiBaseUrl: string,
-  token: string
+  token: string,
+  doFetch: typeof fetch = fetch
 ): Promise<RunApiResponse> {
   let res: Response;
   try {
-    res = await fetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}`, {
+    res = await doFetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}`, {
       headers: { 'x-archon-operator-token': token },
     });
   } catch (error) {
