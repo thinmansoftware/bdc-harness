@@ -14,6 +14,7 @@ import type {
 } from '../packages/core/src/github/service-identity';
 import type { IDatabase } from '../packages/core/src/db/adapters/types';
 import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
+import { rootLogger } from '../packages/paths/src/logger';
 
 const USAGE =
   "usage: run-completion-report.ts --days N [--as-of 'YYYY-MM-DD HH:MM:SS'] [--zero-since 'YYYY-MM-DD HH:MM:SS'] [--db PATH] [--json] [--no-github]";
@@ -570,6 +571,13 @@ export async function computeWoCompletion(
   // call still goes through the metered taskmaster identity; only the durable
   // write is discarded. Closed in finally so the handle never leaks.
   const ownsMeterDb = opts.db === undefined;
+  // The throwaway sink's schema init logs at info, and the root Pino logger
+  // writes to stdout, so those records would precede the --json report and break
+  // JSON.parse in machine consumers. Silence logging for the whole default-path
+  // join (the adapter's lazy child logger is created silent during construction);
+  // the previous level is restored in finally.
+  const prevLogLevel = rootLogger.level;
+  if (ownsMeterDb) rootLogger.level = 'silent';
   const meterDb = opts.db ?? new SqliteAdapter(':memory:');
   const inj: GitHubInjection = {
     ...(opts.execute ? { execute: opts.execute } : {}),
@@ -657,7 +665,10 @@ export async function computeWoCompletion(
     if (e instanceof GhAccessError) return { available: false, reason: firstLine(e.message) };
     return { available: false, reason: firstLine(e instanceof Error ? e.message : String(e)) };
   } finally {
-    if (ownsMeterDb) await meterDb.close();
+    if (ownsMeterDb) {
+      await meterDb.close();
+      rootLogger.level = prevLogLevel;
+    }
   }
 }
 

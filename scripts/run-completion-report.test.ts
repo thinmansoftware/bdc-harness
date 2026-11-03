@@ -1043,4 +1043,25 @@ describe('run-completion-report merged-or-owned', () => {
       resetGitHubApiMeterForTests();
     }
   });
+
+  test('Test 10: default CLI path with an attributed WO keeps --json stdout pure JSON', () => {
+    // The default (no --no-github) path builds the in-memory meter SqliteAdapter,
+    // whose schema init logs at info. Those records must never reach stdout under
+    // --json, or JSON.parse in machine consumers breaks. PATH is emptied so the
+    // GitHub call cannot reach the network; the join then reports unavailable,
+    // which is exactly the "auth fails after the adapter was built" case.
+    const { path, db } = newDb();
+    runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:00:00', wm('WO-Z', 'shopops'));
+    db.close();
+    const p = Bun.spawnSync([process.execPath, 'run', SCRIPT, ...base(path, ['--json'])], {
+      env: { PATH: '', HOME: process.env.HOME ?? '', USERPROFILE: process.env.USERPROFILE ?? '' },
+    });
+    const out = p.stdout.toString();
+    expect(p.exitCode).toBe(0);
+    expect(out).not.toContain('db.sqlite_schema_initialized');
+    const jr = JSON.parse(out);
+    expect(jr.unattributed_runs).toBe(0);
+    expect(jr.wo_completion.available).toBe(false);
+    expect(jr.wo_completion.reason).not.toBe('no-github');
+  });
 });
