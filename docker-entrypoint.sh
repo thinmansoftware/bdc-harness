@@ -80,22 +80,21 @@ if [ -n "${ARCHON_DATA:-}" ]; then
   echo "[archon] ARCHON_DATA=${ARCHON_DATA} is a host-side compose token; not read inside the container" >&2
 fi
 
-# Register all git repositories under /.archon as safe directories.
+# Trust all repositories under /.archon via a single safe.directory '*' entry.
 # Git 2.35.2+ (CVE-2022-24765) rejects repos owned by a different UID.
 # On macOS bind mounts (VirtioFS), host UIDs don't map to appuser (1001),
 # so git prints "dubious ownership" and refuses all operations.
-# The Dockerfile RUN-layer registers fixed paths, but that gitconfig lives
-# in the image layer -- bind mounts don't inherit it on restart, and
-# worktrees are nested at arbitrary depths unknown at build time.
-# With /home/appuser now persisted, ~/.gitconfig survives across restarts --
-# so we must check before --add or duplicate safe.directory lines accumulate
-# every boot.
-find /.archon -name ".git" -prune -print 2>/dev/null | while IFS= read -r git_dir; do
-  repo_dir="$(dirname "$git_dir")"
-  if ! $RUNNER git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$repo_dir"; then
-    $RUNNER git config --global --add safe.directory "$repo_dir"
-  fi
-done
+# The Dockerfile already sets safe.directory '*' in the image layer, but with
+# /home/appuser bind-mounted that gitconfig does not carry over, and worktrees
+# are nested at arbitrary depths unknown at build time. So ensure exactly one
+# '*' entry here. Per-path entries are redundant once '*' is present and, since
+# ~/.gitconfig persists, they accumulated forever (thousands of lines, O(n^2)
+# boot loop, full-disk lock failures). Prune them on every boot.
+if ! $RUNNER git config --global --get-all safe.directory 2>/dev/null | grep -qxF '*'; then
+  $RUNNER git config --global --add safe.directory '*'
+fi
+# value-regex '^/' matches only path entries; '*' is kept. Exit 5 = nothing to unset.
+$RUNNER git config --global --unset-all safe.directory '^/' || [ $? -eq 5 ]
 
 # Configure git to use a GitHub token for HTTPS clones AND pushes via credential
 # helper. Accept either GH_TOKEN (gh CLI legacy) or GITHUB_TOKEN (compose default

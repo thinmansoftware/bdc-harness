@@ -73,6 +73,7 @@ import { cloneRepository, registerRepository } from './clone';
 let spyFsAccess: ReturnType<typeof spyOn>;
 let spyFsRm: ReturnType<typeof spyOn>;
 let spyExecFileAsync: ReturnType<typeof spyOn>;
+let spyAddSafeDirectory: ReturnType<typeof spyOn>;
 
 function setupSpies(): void {
   // Default: .git does NOT exist (no pre-existing clone)
@@ -84,12 +85,14 @@ function setupSpies(): void {
     stdout: '',
     stderr: '',
   });
+  spyAddSafeDirectory = spyOn(gitUtils, 'addSafeDirectory').mockResolvedValue(undefined);
 }
 
 function restoreSpies(): void {
   spyFsAccess?.mockRestore();
   spyFsRm?.mockRestore();
   spyExecFileAsync?.mockRestore();
+  spyAddSafeDirectory?.mockRestore();
 }
 
 function clearMocks(): void {
@@ -207,10 +210,7 @@ describe('cloneRepository', () => {
 
       await cloneRepository('https://github.com/owner/repo');
 
-      const safeDir = (spyExecFileAsync.mock.calls as string[][]).find(args =>
-        args[1]?.includes('safe.directory')
-      );
-      expect(safeDir).toBeDefined();
+      expect(spyAddSafeDirectory).toHaveBeenCalledTimes(1);
     });
 
     test('removes the source/ directory before cloning so git has a clean target', async () => {
