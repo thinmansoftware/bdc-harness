@@ -3013,7 +3013,9 @@ export async function cancelWorkflowRunAsActor(
     ? opts.reason
     : 'API cancellation requested; caller did not supply a reason';
   await workflowDb.cancelWorkflowRun(runId);
-  void workflowEventDb.createWorkflowEvent({
+  // A5.10 (WO-HARNESS-T3-COMMAND-CONSUMER-01): the run_cancelled event is durable
+  // before cancel returns ok, so the consumer's recovery can prove the cancel.
+  await workflowEventDb.createWorkflowEvent({
     workflow_run_id: runId,
     event_type: 'run_cancelled',
     data: { reason, actor: opts.actor },

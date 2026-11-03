@@ -21,6 +21,8 @@ the t3-bridge principal, and sets the allowlists (all below, all John's go).
 | `T3_COMMAND_ACTORS` | unset | Comma list of principal ids allowed to send commands. Unset or empty = every actor refused 403 `actor_not_allowed`. |
 | `T3_COMMAND_PROJECTS` | unset | Comma list of allowed project (codebase) names. Unset = every command refused 403 `project_not_allowed`. A project must also be a registered codebase. |
 | `T3_COMMAND_APPROVE_BASES` | unset | Comma list of allowed PR bases as `owner/repo:branch`. Unset = every approve refused 403 `base_not_allowed`. NEVER list a production base (M-09). |
+| `T3_COMMAND_MAX_AGE_S` | `900` | A NEW command (no existing admission) older than this is refused 409 `expired` (Amendment 5 A5.6). |
+| `T3_APPROVAL_HANDOFF_S` | `120` | An approval's `failed` hand-off counts as live/transitional only this long after `approval_received` (A5.9). |
 | `T3_COMMAND_RESERVATION_STALE_S` | `300` | A `reserved` admission not updated for this many seconds, and not held by a handler in this process, is recovered at the start of the next tick (all verbs). |
 
 ## Command and reply contract
@@ -78,8 +80,24 @@ Reply (one Dispatch `agent_message`):
 }
 ```
 
-Status codes: 200 ok, 202 pending, 400 invalid, 403 forbidden, 409 conflict,
-422 stale_head, 503 failed_before_effect.
+Status codes: 200 ok, 400 invalid, 403 forbidden, 409 conflict, 422
+stale_head, 503 failed_before_effect. (202 `pending` was removed by Amendment 5:
+Dispatch returns the ORIGINAL command row for a same-actor resend of a
+request_id, whatever the body, so a same-actor retry row never exists. The only
+outcome channel for a request is `reply:<original command id>`.)
+
+Amendment 5 additions to the contract:
+
+- Fire `wo_id` must be exactly one canonical WO id (`^WO-[A-Z][A-Z0-9-]*-\d+$`,
+  at most 96 characters), else 400 `invalid_wo_id`; it must equal the
+  eligibility evidence's WO id (409 `wo_id_mismatch`) and the request's project
+  must equal the spec's own project (409 `wo_project_mismatch`). The pinned spec
+  revision (`expectedSpec`) is passed to the cascade.
+- Approve must carry `node_id`, the approval node the actor reviewed: a
+  different paused gate is 409 `gate_mismatch`; an `interactive_loop` or
+  `captureResponse` gate is 409 `gate_not_supported`. Approve is bound to the
+  owning fire admission's project exactly like cancel-own.
+- `request_id` and `thread_id` are at most 128 characters (400 `invalid_field`).
 
 Approve success codes: `approved` (the approval was recorded AND the run's
 resume was dispatched) or `approved_not_resumed` (recorded, but the resume was
@@ -94,7 +112,7 @@ hand-off state until someone re-runs it from the dashboard.
   digest or actor is refused 409 `request_conflict`, leaving the original row
   and its reply unchanged.
 - fire: refused 409 `live_run` when any `remote_agent_workflow_runs` row in
-  status pending/running/paused names the exact WO id (token match), or another
+  status pending/running/waiting_provider/interrupted/orphaned/paused (or a bounded approval hand-off `failed`) names the exact WO id (token match), an active shared WO claim exists, or another
   fire admission for the WO is `reserved`. While a fire for the WO is `unknown`
   (awaiting adjudication) a new fire is refused 409 `admission_unknown`
   carrying the ORIGINAL admission's request_id in `run_id`, the key to
@@ -141,9 +159,8 @@ hand-off state until someone re-runs it from the dashboard.
     (Amendment 4): re-read while `reserved` (for example after a restart) it
     stays queued with no reply and no ack; the in-flight handler or recovery
     owns its final reply under `reply:<source_message_id>`.
-  - A genuine retry row (different message id) whose request_id is still `reserved` gets 202 `pending` and is
-    acknowledged; the final outcome is on the original row's reply, or on a
-    later retry once the reservation resolves.
+  - A command is NEVER acknowledged without a durable reply row: if the actor's
+    mailbox cannot be resolved the row stays queued (Amendment 5 A5.5).
 - Recovery (all verbs, start of every tick, so also at startup): a stale
   `reserved` row with no effect marker -> `refused` 503 `failed_before_effect`
   (`error_class` `RecoveredBeforeEffect`); with the marker and a provable
@@ -163,6 +180,37 @@ hand-off state until someone re-runs it from the dashboard.
   `(wo_id) WHERE verb='fire' AND state IN ('reserved','unknown')`, migration
   067, mirrored in the SQLite adapter and 000_combined.sql). Every new fire for
   that WO is refused 409 `live_run` until an operator adjudicates it.
+
+## Shared WO claim (Amendment 5 A5.0, General's verdict)
+
+Taskmaster and the T3 consumer share ONE database WO claim,
+`cascade_wo_claims` (partial unique index on `wo_id` WHERE state='active'),
+acquired through runCascade's WO-lock seam BEFORE any dispatch and released
+only when the cascade record is terminal -- so it is held through every tier,
+pause and discovery. Both callers pass `cascadeWoClaimDeps(...)`
+(packages/server/src/cascade/wo-claim.ts). A cascade refused by the claim
+returns `blocked` with zero attempts; the consumer replies 409 `live_run`
+(admission `refused`). Taskmaster's `tm_fire_admissions` budget is untouched;
+T3 fires are not charged to it.
+
+Operator release of a claim whose process died (unknown outcome stays blocked
+until then; read the cascade record first and release only on proven
+completion or proven non-execution):
+
+```
+docker exec -w /app archon-app-1 bun -e "const c = await import('@archon/core/db/cascade-wo-claims'); console.log(await c.releaseWoClaim({ woId: '<WO id>', cascadeId: '<cascade id>', now: new Date().toISOString() }))"
+```
+
+## Single consumer and poison rows (Amendment 5 A5.7, A5.12)
+
+- The consumer ticks only while holding the `t3_consumer_lease` row (CAS
+  acquire/renew each tick, TTL max(60 s, 3 x poll)). A second process (rebuild
+  overlap, second server) does nothing until the lease expires.
+- Every admission transition is CAS from `reserved`; a miss before an effect
+  aborts the effect with no reply and no ack.
+- A command row that fails processing 3 times (`t3_command_attempts`) is
+  acknowledged, addressed and dead-lettered: one Dispatch message from
+  `cauldron-fire` to `operator` (`idempotency_key` `dead-letter:<message id>`).
 
 ## In-process execution (fire)
 

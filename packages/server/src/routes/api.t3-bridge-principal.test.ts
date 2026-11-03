@@ -397,6 +397,43 @@ describe('Test 9: t3-bridge principal issuance and blast radius', () => {
     expect(reply.sender_principal_id).toBe('system:cauldron-fire');
     expect(reply.recipient).toBe('t3-desktop');
   });
+
+  test('Test 25 (A5.5): a same-actor resend of a request_id returns the ORIGINAL command row', async () => {
+    const app = makeApp();
+    const send = async (woId: string): Promise<{ id: string; body: string }> => {
+      const response = await app.request('/api/dispatch/messages', {
+        method: 'POST',
+        headers: T3_HEADERS,
+        body: JSON.stringify({
+          correlation_id: 'req-25',
+          idempotency_key: 'req-25',
+          task_type: 'agent_message',
+          sender: 't3-bridge',
+          recipient: 'cauldron-fire',
+          body: JSON.stringify({
+            schema: 't3-command/v1',
+            request_id: 'req-25',
+            verb: 'fire',
+            wo_id: woId,
+          }),
+        }),
+      });
+      expect(response.status).toBe(200);
+      return (await response.json()) as { id: string; body: string };
+    };
+    const first = await send('WO-SAME-01');
+    const same = await send('WO-SAME-01');
+    const changed = await send('WO-CHANGED-01');
+    expect(same.id).toBe(first.id);
+    // A changed payload under a reused request_id is silently the original command.
+    expect(changed.id).toBe(first.id);
+    expect(changed.body).toContain('WO-SAME-01');
+    const rows = await db.query<{ n: number }>(
+      'SELECT COUNT(*) AS n FROM agent_dispatch_messages WHERE idempotency_key = $1',
+      ['req-25']
+    );
+    expect(Number(rows.rows[0]?.n)).toBe(1);
+  });
 });
 
 describe('in-process service authority (cauldron-fire cascade path)', () => {
@@ -679,6 +716,7 @@ describe('Tests 11-12: consumer approve uses the real resume path', () => {
         run_id_for_approve: runId,
         pr: 'thinmansoftware/bdc-harness#5',
         head_sha: SHA,
+        node_id: 'gate',
         thread_id: 'th',
       }),
     } as unknown as DispatchMessage;

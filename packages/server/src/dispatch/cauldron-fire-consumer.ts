@@ -39,6 +39,10 @@ import * as admissions from '@archon/core/db/t3-command-admissions';
 import type { T3CommandAdmissionRow, T3CommandVerb } from '@archon/core/db/t3-command-admissions';
 import { checkFireEligibility as checkFireEligibilityImpl } from '../taskmaster/fire-eligibility';
 import { IN_PROCESS_API_ORIGIN } from '../routes/in-process-authority';
+import { findActiveWoClaim } from '@archon/core/db/cascade-wo-claims';
+import { cascadeWoClaimDeps } from '../cascade/wo-claim';
+import { hostname } from 'os';
+import { randomUUID } from 'crypto';
 // Type-only import: the run-action functions are loaded lazily in the real deps
 // (dynamic import) so this module -- and its tests -- never statically pull in the
 // heavy routes/api graph, which keeps mock-module ordering deterministic in tests.
@@ -63,6 +67,8 @@ export interface T3Command {
   pr?: string;
   head_sha?: string;
   run_id_for_approve?: string;
+  /** approve: the approval node id the actor reviewed (Amendment 5 A5.8). */
+  node_id?: string;
   thread_id?: string;
 }
 
@@ -79,6 +85,42 @@ export interface ReplyOutcome {
 export const ADMISSION_UNKNOWN_TEXT = 'unknown, adjudication required';
 /** Seconds after which a reservation no handler holds is swept (A2.2 rule 4). */
 const DEFAULT_RESERVATION_STALE_S = 300;
+/** A5.1: one canonical WO identifier, nothing around it. */
+export const WO_ID_PATTERN = /^WO-[A-Z][A-Z0-9-]*-\d+$/;
+const MAX_WO_ID_LENGTH = 96;
+/** A5.12: echoed reply fields are bounded so a reply can always be written. */
+const MAX_ECHOED_FIELD_LENGTH = 128;
+/** A5.6: a new command older than this is refused 409 expired. */
+const DEFAULT_MAX_AGE_S = 900;
+/** A5.9: an approval hand-off `failed` is transitional only this long. */
+const DEFAULT_APPROVAL_HANDOFF_S = 120;
+/** A5.12: failed processing attempts before a row is dead-lettered. */
+const DEAD_LETTER_ATTEMPTS = 3;
+/** A5.3: every non-terminal WorkflowRunStatus. */
+export const NON_TERMINAL_RUN_STATUSES = [
+  'pending',
+  'running',
+  'waiting_provider',
+  'interrupted',
+  'orphaned',
+  'paused',
+] as const;
+
+/** A5.7: a CAS transition found the reservation owned or resolved elsewhere. */
+class CasLostError extends Error {}
+/** A5.5: the actor's mailbox cannot be resolved; never ack without a reply. */
+class MailboxUnresolvedError extends Error {}
+
+/**
+ * Parse a stored timestamp as UTC. SQLite `datetime('now')` text
+ * ('YYYY-MM-DD HH:MM:SS', no zone) is UTC (A5.10).
+ */
+export function parseUtcTimestamp(value: string | Date | null | undefined): number {
+  if (value instanceof Date) return value.getTime();
+  if (!value) return Number.NaN;
+  const text = /[zZ]|[+-]\d\d:?\d\d$/.test(value) ? value : `${value.replace(' ', 'T')}Z`;
+  return Date.parse(text);
+}
 
 export interface PullRequestIdentity {
   open: boolean;
@@ -121,7 +163,12 @@ export interface CauldronFireConsumerDeps {
   // --- Fire ---
   /** True + the live run id when a pending/running/paused run already names this WO. */
   hasLiveWorkflowRun: (woId: string) => Promise<{ live: boolean; runId: string | null }>;
-  checkFireEligibility: (issueTitle: string) => Promise<{ eligible: boolean; reason?: string }>;
+  /** Eligibility (A5.2): evidence carries the canonical woId, the spec's project and the pinned spec. */
+  checkFireEligibility: (issueTitle: string) => Promise<{
+    eligible: boolean;
+    reason?: string;
+    evidence?: { woId: string; project: string; expectedSpec?: unknown };
+  }>;
   fireCascade: (input: {
     woId: string;
     project: string;
@@ -129,6 +176,8 @@ export interface CauldronFireConsumerDeps {
     dispatchId: string;
     /** Called once PER run the cascade discovers, on every tier (Amendment 3). */
     onRunDiscovered?: (runId: string, tier: string | null) => void;
+    /** The pinned spec identity from eligibility evidence (A5.2). */
+    expectedSpec?: unknown;
   }) => Promise<{ cascadeId: string; status: string; runId: string | null }>;
   /** Known lane overrides; an unknown lane is refused 400 unknown_lane. Empty/omitted = no lane check. */
   knownLanes?: readonly string[];
@@ -154,6 +203,22 @@ export interface CauldronFireConsumerDeps {
   proveCancel: (runId: string, actor: string) => Promise<boolean>;
   /** An approval_received event for the run at or after `sinceIso`. */
   proveApprove: (runId: string, sinceIso: string) => Promise<boolean>;
+
+  // --- Amendment 5 ---
+  /** The paused run's approval gate (metadata.approval), or null when not paused at one. */
+  getRunApproval: (
+    runId: string
+  ) => Promise<{ nodeId: string; type: string | null; captureResponse: boolean } | null>;
+  /** Non-terminal runs naming the WO that started at or after `sinceIso` (A5.9). */
+  findRunsForWoSince: (woId: string, sinceIso: string) => Promise<string[]>;
+  /** Durable operator alert (A5.12 dead-letter). */
+  alertOperator: (input: {
+    subject: string;
+    body: string;
+    idempotencyKey: string;
+  }) => Promise<void>;
+  /** This process's consumer lease identity (A5.7). */
+  leaseHolder: string;
 
   // --- Approve bindings (all derived server-side) ---
   /** Normalized repository of the run's codebase (run.codebase_id -> repository_url). */
@@ -244,6 +309,14 @@ export async function validateCommand(
   if (typeof body.request_id !== 'string' || body.request_id !== message.idempotency_key) {
     return { ok: false, outcome: { status: 400, code: 'request_id_mismatch' } };
   }
+  // A5.12: echoed fields are bounded so the reply can always be written.
+  if (
+    body.request_id.length > MAX_ECHOED_FIELD_LENGTH ||
+    (body.thread_id !== undefined &&
+      (typeof body.thread_id !== 'string' || body.thread_id.length > MAX_ECHOED_FIELD_LENGTH))
+  ) {
+    return { ok: false, outcome: { status: 400, code: 'invalid_field' } };
+  }
   if (typeof body.verb !== 'string' || !VALID_VERBS.includes(body.verb as T3CommandVerb)) {
     return { ok: false, outcome: { status: 400, code: 'unknown_verb' } };
   }
@@ -263,6 +336,7 @@ export async function validateCommand(
     head_sha: typeof body.head_sha === 'string' ? body.head_sha : undefined,
     run_id_for_approve:
       typeof body.run_id_for_approve === 'string' ? body.run_id_for_approve : undefined,
+    node_id: typeof body.node_id === 'string' ? body.node_id : undefined,
     thread_id: typeof body.thread_id === 'string' ? body.thread_id : undefined,
   };
 
@@ -270,11 +344,20 @@ export async function validateCommand(
   if (verb === 'fire' && !cmd.wo_id) {
     return { ok: false, outcome: { status: 400, code: 'wo_id_missing' } };
   }
+  // A5.1: exactly one canonical WO identifier -- never free text that run
+  // arguments, locks or live-run scans could split on.
+  if (
+    verb === 'fire' &&
+    cmd.wo_id &&
+    (cmd.wo_id.length > MAX_WO_ID_LENGTH || !WO_ID_PATTERN.test(cmd.wo_id))
+  ) {
+    return { ok: false, outcome: { status: 400, code: 'invalid_wo_id' } };
+  }
   if (verb === 'cancel-own' && !cmd.run_id) {
     return { ok: false, outcome: { status: 400, code: 'run_id_missing' } };
   }
   if (verb === 'approve') {
-    if (!cmd.run_id_for_approve || !cmd.pr || !cmd.head_sha) {
+    if (!cmd.run_id_for_approve || !cmd.pr || !cmd.head_sha || !cmd.node_id) {
       return { ok: false, outcome: { status: 400, code: 'approve_fields_missing' } };
     }
     if (!HEX40.test(cmd.head_sha) || !parsePrRef(cmd.pr)) {
@@ -429,6 +512,16 @@ async function handleFire(
     );
     return { status: 409, code: 'live_run', run_id: competitor.run_id ?? competitor.request_id };
   }
+  // A5.3(c): the shared WO claim (Taskmaster or T3 cascade, any tier, during
+  // discovery). Enforced again atomically by the claim inside runCascade.
+  const claim = await findActiveWoClaim(woId, deps.db);
+  if (claim) {
+    await admissions.insertRefused(
+      { ...fireFields, status_code: 409, code: 'live_run', cascade_id: claim.cascade_id, now },
+      deps.db
+    );
+    return { status: 409, code: 'live_run', cascade_id: claim.cascade_id };
+  }
 
   const reserved = await admissions.reserveAdmission({ ...fireFields, now }, deps.db);
   if (reserved.status === 'wo_fire_locked') {
@@ -459,24 +552,47 @@ async function handleFire(
   }
 
   const eligibility = await deps.checkFireEligibility(woId);
-  if (!eligibility.eligible) {
+  const evidence = eligibility.evidence;
+  if (!eligibility.eligible || !evidence) {
+    const reason = eligibility.eligible ? 'evidence_missing' : (eligibility.reason ?? 'unknown');
     await admissions.markRefused(
       cmd.request_id,
-      { status_code: 409, code: `fire_ineligible:${eligibility.reason ?? 'unknown'}`, now },
+      { status_code: 409, code: `fire_ineligible:${reason}`, now },
       deps.db
     );
-    return { status: 409, code: `fire_ineligible:${eligibility.reason ?? 'unknown'}` };
+    return { status: 409, code: `fire_ineligible:${reason}` };
+  }
+  // A5.1 / A5.2: the eligibility evidence is binding -- same WO id, the spec's
+  // own project, and the pinned spec revision travels to the cascade.
+  if (evidence.woId !== woId) {
+    await admissions.markRefused(
+      cmd.request_id,
+      { status_code: 409, code: 'wo_id_mismatch', now },
+      deps.db
+    );
+    return { status: 409, code: 'wo_id_mismatch' };
+  }
+  if (evidence.project !== cmd.project) {
+    await admissions.markRefused(
+      cmd.request_id,
+      { status_code: 409, code: 'wo_project_mismatch', now },
+      deps.db
+    );
+    return { status: 409, code: 'wo_project_mismatch' };
   }
 
   let result: { cascadeId: string; status: string; runId: string | null };
-  // Durable effect marker, committed BEFORE the side effect (A2.2).
-  await admissions.markEffectStarted(cmd.request_id, deps.now().toISOString(), deps.db);
+  // Durable effect marker, committed BEFORE the side effect (A2.2); CAS (A5.7).
+  if (!(await admissions.markEffectStarted(cmd.request_id, deps.now().toISOString(), deps.db))) {
+    throw new CasLostError('t3_fire_reservation_not_owned');
+  }
   try {
     result = await deps.fireCascade({
       woId,
       project: cmd.project,
       lane: cmd.lane,
       dispatchId: cmd.request_id,
+      expectedSpec: evidence.expectedSpec,
       // Amendment 3: durable custody for EVERY run, on every tier.
       onRunDiscovered: (runId, tier) => {
         void admissions
@@ -510,6 +626,16 @@ async function handleFire(
   // (custody of a specific run). A cascade that returns no run id cannot be
   // confirmed, so it is NOT replied as success -- record it as `unknown` so it
   // is never reported ok and never refired automatically.
+  if (!result.runId && result.status === 'blocked') {
+    // A5.0: the shared WO claim refused the cascade before any dispatch (zero
+    // attempts) -- proven non-execution. Another cascade holds this WO.
+    await admissions.markRefused(
+      cmd.request_id,
+      { status_code: 409, code: 'live_run', cascade_id: result.cascadeId, now },
+      deps.db
+    );
+    return { status: 409, code: 'live_run', cascade_id: result.cascadeId };
+  }
   if (!result.runId) {
     log.warn({ woId, cascadeId: result.cascadeId }, 'cauldron_fire_no_run_id');
     return reconcileFireUnknown(deps, cmd.request_id, { cascadeId: result.cascadeId }, now);
@@ -616,14 +742,7 @@ async function handleCancel(
   // Amendment 4 A4.1: the run's project is the one its owning fire admission
   // recorded, never the request's. A different requested project is refused,
   // and the recorded project must still be allowlisted at cancel time.
-  const owning = await admissions.findOwningFireAdmission(actor, runId, deps.db);
-  const runProject = owning?.project ?? null;
-  const projectRefusal: string | null =
-    !runProject || runProject !== cmd.project
-      ? 'project_mismatch'
-      : !parseList(deps.env.T3_COMMAND_PROJECTS).includes(runProject)
-        ? 'project_not_allowed'
-        : null;
+  const projectRefusal = await owningProjectRefusal(deps, actor, runId, cmd.project);
   if (projectRefusal) {
     await admissions.markRefused(
       cmd.request_id,
@@ -633,8 +752,10 @@ async function handleCancel(
     return { status: 403, code: projectRefusal };
   }
 
-  // Durable effect marker, committed BEFORE the side effect (A2.2).
-  await admissions.markEffectStarted(cmd.request_id, deps.now().toISOString(), deps.db);
+  // Durable effect marker, committed BEFORE the side effect (A2.2); CAS (A5.7).
+  if (!(await admissions.markEffectStarted(cmd.request_id, deps.now().toISOString(), deps.db))) {
+    throw new CasLostError('t3_cancel_reservation_not_owned');
+  }
   const result = await deps.cancelRun(runId, { reason: 'T3 cancel-own', actor });
   if (!result.ok) {
     const code = cancelCode(result.status);
@@ -651,6 +772,24 @@ async function handleCancel(
     deps.db
   );
   return { status: 200, code: 'ok', run_id: runId };
+}
+
+/**
+ * A4.1 / A5.8: the run's project is the one its owning fire admission recorded.
+ * Returns the refusal code, or null when the requested project is that project
+ * and it is still allowlisted.
+ */
+async function owningProjectRefusal(
+  deps: CauldronFireConsumerDeps,
+  actor: string,
+  runId: string,
+  requestedProject: string
+): Promise<string | null> {
+  const owning = await admissions.findOwningFireAdmission(actor, runId, deps.db);
+  const runProject = owning?.project ?? null;
+  if (!runProject || runProject !== requestedProject) return 'project_mismatch';
+  if (!parseList(deps.env.T3_COMMAND_PROJECTS).includes(runProject)) return 'project_not_allowed';
+  return null;
 }
 
 /**
@@ -729,6 +868,16 @@ async function handleApprove(
   if (!(await actorOwnsRun(deps, actor, runId))) {
     return refuse(403, 'forbidden_not_own_run');
   }
+  // (i-b) A5.8: the owning fire admission's recorded project, as A4.1 for cancel.
+  const projectRefusal = await owningProjectRefusal(deps, actor, runId, cmd.project);
+  if (projectRefusal) return refuse(403, projectRefusal);
+  // (i-c) A5.8: bound to the exact gate the actor reviewed; free-text gates are
+  // not approvable by command.
+  const gate = await deps.getRunApproval(runId);
+  if (!gate || gate.nodeId !== cmd.node_id) return refuse(409, 'gate_mismatch');
+  if (gate.type === 'interactive_loop' || gate.captureResponse) {
+    return refuse(409, 'gate_not_supported');
+  }
   // (ii) PROJECT/REPO: run repo == admission project repo == PR repo.
   if (!prRef) return refuse(409, 'run_pr_mismatch');
   const projectRepo = await deps.resolveProjectRepository(cmd.project);
@@ -765,8 +914,11 @@ async function handleApprove(
   }
 
   // Durable effect marker, committed BEFORE the side effect (A2.2): the approve
-  // function's first event write is the effect.
-  await admissions.markEffectStarted(cmd.request_id, deps.now().toISOString(), deps.db);
+  // function's first event write is the effect. CAS (A5.7).
+  const approvedSince = deps.now().toISOString();
+  if (!(await admissions.markEffectStarted(cmd.request_id, approvedSince, deps.db))) {
+    throw new CasLostError('t3_approve_reservation_not_owned');
+  }
   const result = await deps.approveRun(runId, {
     comment: 'T3 approve',
     decisionVerb: 'approve_as_is',
@@ -785,6 +937,17 @@ async function handleApprove(
     { status_code: 200, code, run_id: runId, now },
     deps.db
   );
+  // A5.9: a resume that started a FRESH run for the WO stays in the actor's custody.
+  const owning = await admissions.findOwningFireAdmission(actor, runId, deps.db);
+  if (owning?.wo_id) {
+    for (const freshRunId of await deps.findRunsForWoSince(owning.wo_id, approvedSince)) {
+      if (freshRunId === runId) continue;
+      await admissions.appendRunCustody(
+        { admission_id: owning.request_id, run_id: freshRunId, tier: 'resume', now },
+        deps.db
+      );
+    }
+  }
   return { status: 200, code, run_id: runId };
 }
 
@@ -825,10 +988,13 @@ async function sendReplyAndAck(
       await admissions.recordReply(requestId, reply.id, now, deps.db);
     }
   } else {
-    log.warn(
+    // A5.5: never acknowledge without a durable reply row. The row stays queued;
+    // the attempt counts toward the dead-letter threshold (A5.12).
+    log.error(
       { sender: message.sender, principal: message.sender_principal_id },
       'cauldron_fire_reply_mailbox_unresolved'
     );
+    throw new MailboxUnresolvedError('t3_reply_mailbox_unresolved');
   }
   await deps.acknowledge(message.id);
 }
@@ -938,11 +1104,14 @@ async function resolveHandlerException(
   );
 }
 
-/** Process one queued command row end-to-end. Never throws. */
+/**
+ * Process one queued command row end-to-end. Never throws. Returns false when
+ * the row is left queued after a failure (counted toward A5.12's dead-letter).
+ */
 export async function processCommand(
   deps: CauldronFireConsumerDeps,
   message: DispatchMessage
-): Promise<void> {
+): Promise<boolean> {
   const now = deps.now().toISOString();
   let ctx: { cmd: T3Command; actor: string; digest: string } | null = null;
   try {
@@ -950,7 +1119,7 @@ export async function processCommand(
     if (!validated.ok) {
       // Validation failures execute nothing and create no admission row.
       await sendReplyAndAck(deps, message, null, validated.outcome, now, false);
-      return;
+      return true;
     }
     const cmd = validated.cmd;
     const digest = canonicalDigest(cmd);
@@ -962,23 +1131,17 @@ export async function processCommand(
         existing.payload_sha256 === digest &&
         existing.actor_principal_id === message.sender_principal_id
       ) {
-        if (existing.state === 'reserved' && existing.source_message_id === message.id) {
-          // Amendment 4 A4.2: this IS the admission's source row, re-read (for
-          // example after a restart). Never answer it here -- no reply, no ack;
-          // the in-flight handler or stale-reservation recovery owns its final
-          // reply under reply:<source_message_id>.
-          return;
-        }
         if (existing.state === 'reserved') {
-          // A2.2 rule 5: the original command is still executing. This retry row
-          // gets its own 202 pending reply and is acknowledged; the final
-          // outcome goes to the ORIGINAL row's reply (or to a later retry).
-          await sendReplyAndAck(deps, message, cmd, { status: 202, code: 'pending' }, now, false);
-          return;
+          // A4.2 / A5.5: Dispatch returns the ORIGINAL row for a same-actor
+          // resend, so a reserved admission is only ever re-read through its own
+          // source row (e.g. after a restart) or while in flight. Never answer
+          // it here -- no reply, no ack; the in-flight handler or stale
+          // recovery owns its final reply under reply:<source_message_id>.
+          return true;
         }
         // Same request, same actor -> original outcome under this row's reply identity.
         await sendReplyAndAck(deps, message, cmd, replayOutcome(existing), now, false);
-        return;
+        return true;
       }
       // Different digest or different actor -> conflict; original row untouched.
       await sendReplyAndAck(
@@ -989,7 +1152,16 @@ export async function processCommand(
         now,
         false
       );
-      return;
+      return true;
+    }
+
+    // A5.6: a NEW command older than the max age is refused before admission.
+    const rawMaxAge = Number(deps.env.T3_COMMAND_MAX_AGE_S);
+    const maxAgeS = Number.isFinite(rawMaxAge) && rawMaxAge > 0 ? rawMaxAge : DEFAULT_MAX_AGE_S;
+    const createdMs = parseUtcTimestamp(message.created_at);
+    if (Number.isFinite(createdMs) && deps.now().getTime() - createdMs > maxAgeS * 1000) {
+      await sendReplyAndAck(deps, message, cmd, { status: 409, code: 'expired' }, now, false);
+      return true;
     }
 
     // Validation guaranteed sender_principal_id is a non-null, allowlisted actor
@@ -1010,7 +1182,14 @@ export async function processCommand(
       inFlightRequests.delete(cmd.request_id);
     }
     await sendReplyAndAck(deps, message, cmd, outcome, now, true);
+    return true;
   } catch (error) {
+    if (error instanceof CasLostError) {
+      // A5.7: another process owns or resolved this reservation. Abort with no
+      // reply and no ack; the owner answers the row.
+      log.warn({ messageId: message.id, cause: error.message }, 'cauldron_fire_cas_lost');
+      return true;
+    }
     log.warn(
       {
         messageId: message.id,
@@ -1034,13 +1213,16 @@ export async function processCommand(
           false
         );
       }
+      return true;
     } catch (resolveError) {
-      // Could not even record/reply (store down): the row stays queued and is
-      // retried next tick, where admission dedupe prevents a second effect.
+      // Could not even record/reply (store down, mailbox unresolved): the row
+      // stays queued and is retried next tick, where admission dedupe prevents a
+      // second effect. Counted toward the A5.12 dead-letter threshold.
       log.error(
         { messageId: message.id, cause: (resolveError as Error).message?.slice(0, 200) },
         'cauldron_fire_exception_unresolved'
       );
+      return false;
     }
   }
 }
@@ -1105,8 +1287,12 @@ export async function recoverStaleReservations(deps: CauldronFireConsumerDeps): 
           }),
         });
         await admissions.recordReply(row.request_id, reply.id, now, deps.db);
+        await deps.acknowledge(row.source_message_id).catch(() => undefined);
+      } else {
+        // A5.5: no reply row -> no ack; the decided outcome replays when the
+        // mailbox resolves (or the row is dead-lettered, A5.12).
+        log.error({ requestId: row.request_id }, 'cauldron_fire_recover_mailbox_unresolved');
       }
-      await deps.acknowledge(row.source_message_id).catch(() => undefined);
     } catch (error) {
       log.warn(
         { requestId: row.request_id, cause: (error as Error).message?.slice(0, 200) },
@@ -1193,17 +1379,60 @@ export async function tickCauldronFireConsumer(deps: CauldronFireConsumerDeps): 
   if (tickInFlight) return;
   tickInFlight = true;
   try {
+    // A5.7: only the lease holder ticks (multi-process safety).
+    const ttlMs = Math.max(60_000, 3 * resolvePollMs(deps.env));
+    const nowIso = deps.now().toISOString();
+    if (!(await admissions.acquireConsumerLease(deps.leaseHolder, nowIso, ttlMs, deps.db))) {
+      return;
+    }
     await recoverStaleReservations(deps).catch((error: unknown) => {
       log.warn({ cause: (error as Error).message?.slice(0, 200) }, 'cauldron_fire_sweep_failed');
     });
     const commands = await deps.listCommands(CAULDRON_FIRE_RECIPIENT, COMMAND_LIST_LIMIT);
     for (const message of commands) {
-      await processCommand(deps, message);
+      const ok = await processCommand(deps, message);
+      if (!ok) await countFailureOrDeadLetter(deps, message);
     }
   } catch (error) {
     log.warn({ cause: (error as Error).message.slice(0, 200) }, 'cauldron_fire_tick_failed');
   } finally {
     tickInFlight = false;
+  }
+}
+
+/**
+ * A5.12: count a failed processing attempt; after DEAD_LETTER_ATTEMPTS the row
+ * is acknowledged + addressed and one operator message names it.
+ */
+async function countFailureOrDeadLetter(
+  deps: CauldronFireConsumerDeps,
+  message: DispatchMessage
+): Promise<void> {
+  try {
+    const attempts = await admissions.recordFailedAttempt(
+      message.id,
+      'processing_failed',
+      deps.now().toISOString(),
+      deps.db
+    );
+    if (attempts < DEAD_LETTER_ATTEMPTS) return;
+    await deps.alertOperator({
+      subject: 'cauldron-fire command dead-lettered',
+      body: JSON.stringify({
+        message_id: message.id,
+        request_id: (message.idempotency_key ?? '').slice(0, MAX_ECHOED_FIELD_LENGTH),
+        sender: message.sender_principal_id ?? null,
+        attempts,
+      }),
+      idempotencyKey: `dead-letter:${message.id}`,
+    });
+    await deps.acknowledge(message.id);
+    log.error({ messageId: message.id, attempts }, 'cauldron_fire_command_dead_lettered');
+  } catch (error) {
+    log.error(
+      { messageId: message.id, cause: (error as Error).message?.slice(0, 200) },
+      'cauldron_fire_dead_letter_failed'
+    );
   }
 }
 
@@ -1374,10 +1603,13 @@ export async function approveRunWithResume(
  * resume, not a terminal failure. Passed to runCascade so the background
  * cascade keeps polling instead of recording a failure or climbing a rung.
  */
-export function isApprovalHandOff(detail: {
-  run: { status: string };
-  events?: { event_type: string }[];
-}): boolean {
+export function isApprovalHandOff(
+  detail: {
+    run: { status: string };
+    events?: { event_type: string; created_at?: string | null }[];
+  },
+  bound?: { nowMs: number; maxAgeS: number }
+): boolean {
   if (detail.run.status !== 'failed') return false;
   const events = detail.events ?? [];
   let lastApproval = -1;
@@ -1385,7 +1617,80 @@ export function isApprovalHandOff(detail: {
     if (event.event_type === 'approval_received') lastApproval = index;
   });
   if (lastApproval < 0) return false;
-  return !events.slice(lastApproval + 1).some(event => event.event_type.endsWith('_failed'));
+  if (events.slice(lastApproval + 1).some(event => event.event_type.endsWith('_failed'))) {
+    return false;
+  }
+  if (!bound) return true;
+  // A5.9: transitional only within the bound -- a resume that never happens
+  // must not be polled as live until the 4h ceiling.
+  const approvedMs = parseUtcTimestamp(events[lastApproval]?.created_at ?? null);
+  return Number.isFinite(approvedMs) && bound.nowMs - approvedMs <= bound.maxAgeS * 1000;
+}
+
+/** A5.9 bound from env. */
+export function approvalHandOffBoundS(env: Record<string, string | undefined>): number {
+  const raw = Number(env.T3_APPROVAL_HANDOFF_S);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_APPROVAL_HANDOFF_S;
+}
+
+/** Maps a GitHub pulls API body to the PR identity approve binds (A5.15: testable). */
+export function mapPullRequest(pr: {
+  state: string;
+  head: { ref: string; sha: string; repo: { full_name: string } | null };
+  base: { ref: string; repo: { full_name: string } | null };
+}): PullRequestIdentity {
+  return {
+    open: pr.state === 'open',
+    headRepo: pr.head.repo ? normalizeRepo(pr.head.repo.full_name) : '',
+    baseRepo: pr.base.repo ? normalizeRepo(pr.base.repo.full_name) : '',
+    headRef: pr.head.ref,
+    baseRef: pr.base.ref,
+    headSha: pr.head.sha,
+  };
+}
+
+/** A5.10: whole-second UTC comparison of a stored event time against a marker. */
+function atOrAfterSecond(eventTime: string | Date | null | undefined, markerIso: string): boolean {
+  const eventMs = parseUtcTimestamp(eventTime ?? null);
+  const markerMs = parseUtcTimestamp(markerIso);
+  if (!Number.isFinite(eventMs) || !Number.isFinite(markerMs)) return false;
+  return Math.floor(eventMs / 1000) >= Math.floor(markerMs / 1000);
+}
+
+/**
+ * A5.3(b): a run naming the WO is live when non-terminal, or `failed` as an
+ * approval hand-off within the A5.9 bound. Exported for the real-deps tests.
+ */
+export async function findLiveRunForWo(
+  db: IDatabase,
+  woId: string,
+  env: Record<string, string | undefined>,
+  nowMs: number
+): Promise<{ live: boolean; runId: string | null }> {
+  const statuses = [...NON_TERMINAL_RUN_STATUSES, 'failed'];
+  const placeholders = statuses.map((_, index) => `$${index + 2}`).join(',');
+  const result = await db.query<{ id: string; user_message: string; status: string }>(
+    `SELECT id, user_message, status FROM remote_agent_workflow_runs
+     WHERE user_message LIKE $1 AND status IN (${placeholders})`,
+    [`%${woId}%`, ...statuses]
+  );
+  for (const row of result.rows) {
+    if (!userMessageNamesWo(row.user_message, woId)) continue;
+    if (row.status !== 'failed') return { live: true, runId: row.id };
+    const events = await workflowEventsDb.listWorkflowEvents(row.id);
+    const handOff = isApprovalHandOff(
+      {
+        run: { status: row.status },
+        events: events.map(event => ({
+          event_type: event.event_type,
+          created_at: event.created_at as unknown as string,
+        })),
+      },
+      { nowMs, maxAgeS: approvalHandOffBoundS(env) }
+    );
+    if (handOff) return { live: true, runId: row.id };
+  }
+  return { live: false, runId: null };
 }
 
 export function createRealCauldronFireConsumerDeps(
@@ -1400,6 +1705,7 @@ export function createRealCauldronFireConsumerDeps(
     return token;
   }
 
+  const leaseHolder = `${hostname()}:${process.pid}:${randomUUID()}`;
   return {
     env,
     now: (): Date => new Date(),
@@ -1434,22 +1740,23 @@ export function createRealCauldronFireConsumerDeps(
       if (!match) return undefined;
       return match.repository_url ? normalizeRepo(match.repository_url) : null;
     },
-    hasLiveWorkflowRun: async (woId): Promise<{ live: boolean; runId: string | null }> => {
-      const result = await getDatabase().query<{ id: string; user_message: string }>(
-        `SELECT id, user_message FROM remote_agent_workflow_runs
-         WHERE status IN ('pending','running','paused') AND user_message LIKE $1`,
-        [`%${woId}%`]
-      );
-      for (const row of result.rows) {
-        if (userMessageNamesWo(row.user_message, woId)) {
-          return { live: true, runId: row.id };
-        }
-      }
-      return { live: false, runId: null };
-    },
-    checkFireEligibility: async (issueTitle): Promise<{ eligible: boolean; reason?: string }> => {
+    hasLiveWorkflowRun: (woId): Promise<{ live: boolean; runId: string | null }> =>
+      findLiveRunForWo(getDatabase(), woId, env, Date.now()),
+    checkFireEligibility: async (
+      issueTitle
+    ): ReturnType<CauldronFireConsumerDeps['checkFireEligibility']> => {
       const result = await checkFireEligibilityImpl(issueTitle);
-      return { eligible: result.eligible, reason: result.reason };
+      return {
+        eligible: result.eligible,
+        reason: result.reason,
+        evidence: result.evidence
+          ? {
+              woId: result.evidence.woId,
+              project: result.evidence.project,
+              expectedSpec: result.evidence.expectedSpec,
+            }
+          : undefined,
+      };
     },
     fireCascade: async (
       input
@@ -1463,6 +1770,10 @@ export function createRealCauldronFireConsumerDeps(
           woId: input.woId,
           project: input.project,
           dispatchId: input.dispatchId,
+          // A5.2: the spec revision eligibility verified is pinned for the build.
+          expectedSpec: input.expectedSpec as Parameters<typeof runCascade>[0]['expectedSpec'],
+          // A5.0: the shared database WO claim (also passed by Taskmaster).
+          deps: { ...cascadeWoClaimDeps(`t3:${leaseHolder}`) },
           // Trust boundary (WO-HARNESS-T3-COMMAND-CONSUMER-01 runbook): the T3
           // command consumer fires on behalf of an authenticated ACTOR, never the
           // operator. It must NOT carry the operator token. Pass an explicit empty
@@ -1476,8 +1787,10 @@ export function createRealCauldronFireConsumerDeps(
           // authority. No socket, no HTTP self-call, no operator token.
           apiBaseUrl: IN_PROCESS_API_ORIGIN,
           fetchImpl: apiFetch,
-          // A2.1 item 5: an approval's `failed` hand-off is not a terminal failure.
-          isTransitionalStatus: isApprovalHandOff,
+          // A2.1 item 5 / A5.9: an approval's `failed` hand-off is not a terminal
+          // failure -- for the bounded window only.
+          isTransitionalStatus: detail =>
+            isApprovalHandOff(detail, { nowMs: Date.now(), maxAgeS: approvalHandOffBoundS(env) }),
           entryOverride,
         },
         input.onRunDiscovered
@@ -1518,14 +1831,60 @@ export function createRealCauldronFireConsumerDeps(
       );
     },
     proveApprove: async (runId, sinceIso): Promise<boolean> => {
-      const since = Date.parse(sinceIso);
+      // A5.10: SQLite event times are second-resolution UTC without a zone.
       const events = await workflowEventsDb.listWorkflowEvents(runId);
       return events.some(
         event =>
           event.event_type === 'approval_received' &&
-          new Date(event.created_at as unknown as string).getTime() >= since
+          atOrAfterSecond(event.created_at as unknown as string, sinceIso)
       );
     },
+    getRunApproval: async (
+      runId
+    ): Promise<{ nodeId: string; type: string | null; captureResponse: boolean } | null> => {
+      const run = await workflowsDb.getWorkflowRun(runId);
+      const approval = run?.metadata.approval as
+        | { nodeId?: unknown; type?: unknown; captureResponse?: unknown }
+        | undefined;
+      if (run?.status !== 'paused' || typeof approval?.nodeId !== 'string') return null;
+      return {
+        nodeId: approval.nodeId,
+        type: typeof approval.type === 'string' ? approval.type : null,
+        captureResponse: approval.captureResponse === true,
+      };
+    },
+    findRunsForWoSince: async (woId, sinceIso): Promise<string[]> => {
+      const statuses = [...NON_TERMINAL_RUN_STATUSES];
+      const placeholders = statuses.map((_, index) => `$${index + 2}`).join(',');
+      const result = await getDatabase().query<{
+        id: string;
+        user_message: string;
+        started_at: string;
+      }>(
+        `SELECT id, user_message, started_at FROM remote_agent_workflow_runs
+         WHERE user_message LIKE $1 AND status IN (${placeholders})`,
+        [`%${woId}%`, ...statuses]
+      );
+      return result.rows
+        .filter(
+          row =>
+            userMessageNamesWo(row.user_message, woId) && atOrAfterSecond(row.started_at, sinceIso)
+        )
+        .map(row => row.id);
+    },
+    alertOperator: async (input): Promise<void> => {
+      await dispatchDb.createAuthenticatedMessage(
+        { kind: 'system', sender: 'cauldron-fire' },
+        {
+          task_type: 'agent_message',
+          recipient: 'operator',
+          correlation_id: input.idempotencyKey,
+          idempotency_key: input.idempotencyKey,
+          body: JSON.stringify({ subject: input.subject, detail: input.body }),
+        }
+      );
+    },
+    leaseHolder,
     getRunRepository: async (runId): Promise<string | null> => {
       const run = await workflowsDb.getWorkflowRun(runId);
       if (!run?.codebase_id) return null;
@@ -1549,19 +1908,7 @@ export function createRealCauldronFireConsumerDeps(
       });
       if (response.status === 404) return null;
       if (!response.ok) throw new Error(`cauldron_fire_github_${response.status}`);
-      const pr = (await response.json()) as {
-        state: string;
-        head: { ref: string; sha: string; repo: { full_name: string } | null };
-        base: { ref: string; repo: { full_name: string } | null };
-      };
-      return {
-        open: pr.state === 'open',
-        headRepo: pr.head.repo ? normalizeRepo(pr.head.repo.full_name) : '',
-        baseRepo: pr.base.repo ? normalizeRepo(pr.base.repo.full_name) : '',
-        headRef: pr.head.ref,
-        baseRef: pr.base.ref,
-        headSha: pr.head.sha,
-      };
+      return mapPullRequest((await response.json()) as Parameters<typeof mapPullRequest>[0]);
     },
   };
 }

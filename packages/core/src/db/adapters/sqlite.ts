@@ -2762,6 +2762,35 @@ export class SqliteAdapter implements IDatabase {
       DROP INDEX IF EXISTS idx_t3_command_admissions_live_fire;
       CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
         ON t3_command_admissions(wo_id) WHERE verb = 'fire' AND state IN ('reserved', 'unknown');
+      -- Amendment 5 A5.0: ONE shared WO claim for every in-process cascade caller
+      -- (Taskmaster and the T3 consumer), held through every tier until terminal.
+      CREATE TABLE IF NOT EXISTS cascade_wo_claims (
+        wo_id TEXT NOT NULL,
+        project TEXT NOT NULL,
+        cascade_id TEXT NOT NULL,
+        holder TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'released')),
+        claimed_at TEXT NOT NULL,
+        released_at TEXT
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_cascade_wo_claims_active
+        ON cascade_wo_claims (wo_id)
+        WHERE state = 'active';
+
+      -- Amendment 5 A5.7: the consumer ticks only while holding this lease.
+      CREATE TABLE IF NOT EXISTS t3_consumer_lease (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        holder TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+
+      -- Amendment 5 A5.12: failed processing attempts per command row.
+      CREATE TABLE IF NOT EXISTS t3_command_attempts (
+        message_id TEXT PRIMARY KEY,
+        attempts INTEGER NOT NULL,
+        last_error TEXT,
+        updated_at TEXT NOT NULL
+      );
       -- Run custody: every run a fire admission's cascade creates (migration 067).
       CREATE TABLE IF NOT EXISTS t3_command_run_custody (
         admission_id TEXT NOT NULL,

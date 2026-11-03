@@ -194,12 +194,12 @@ export async function markAdmitted(
     now: string;
   },
   db: IDatabase = getDatabase()
-): Promise<void> {
-  await db.query(
+): Promise<boolean> {
+  const result = await db.query(
     `UPDATE t3_command_admissions
        SET state = 'admitted', status_code = $2, code = $3,
            cascade_id = $4, run_id = $5, updated_at = $6
-     WHERE request_id = $1`,
+     WHERE request_id = $1 AND state = 'reserved'`,
     [
       requestId,
       outcome.status_code,
@@ -209,6 +209,7 @@ export async function markAdmitted(
       outcome.now,
     ]
   );
+  return result.rowCount > 0;
 }
 
 export async function markRefused(
@@ -221,12 +222,12 @@ export async function markRefused(
     now: string;
   },
   db: IDatabase = getDatabase()
-): Promise<void> {
-  await db.query(
+): Promise<boolean> {
+  const result = await db.query(
     `UPDATE t3_command_admissions
        SET state = 'refused', status_code = $2, code = $3,
            run_id = $4, cascade_id = $5, updated_at = $6
-     WHERE request_id = $1`,
+     WHERE request_id = $1 AND state = 'reserved'`,
     [
       requestId,
       outcome.status_code,
@@ -236,6 +237,7 @@ export async function markRefused(
       outcome.now,
     ]
   );
+  return result.rowCount > 0;
 }
 
 /**
@@ -258,14 +260,14 @@ export async function markUnknown(
     now: string;
   },
   db: IDatabase = getDatabase()
-): Promise<void> {
-  await db.query(
+): Promise<boolean> {
+  const result = await db.query(
     `UPDATE t3_command_admissions
        SET state = 'unknown', status_code = $2, code = $3,
            cascade_id = COALESCE($4, cascade_id),
            run_id = COALESCE($5, run_id),
            updated_at = $6
-     WHERE request_id = $1`,
+     WHERE request_id = $1 AND state = 'reserved'`,
     [
       requestId,
       outcome.status_code,
@@ -275,6 +277,7 @@ export async function markUnknown(
       outcome.now,
     ]
   );
+  return result.rowCount > 0;
 }
 
 export async function recordReply(
@@ -477,12 +480,15 @@ export async function markEffectStarted(
   requestId: string,
   now: string,
   db: IDatabase = getDatabase()
-): Promise<void> {
-  await db.query(
+): Promise<boolean> {
+  // CAS (A5.7): rowCount 0 means another process owns or resolved this
+  // reservation -- the caller must abort the effect.
+  const result = await db.query(
     `UPDATE t3_command_admissions SET effect_started_at = $2, updated_at = $2
-     WHERE request_id = $1 AND state = 'reserved'`,
+     WHERE request_id = $1 AND state = 'reserved' AND effect_started_at IS NULL`,
     [requestId, now]
   );
+  return result.rowCount > 0;
 }
 
 /**
@@ -582,4 +588,49 @@ export async function findOwningFireAdmission(
     [actorPrincipalId, runId]
   );
   return result.rows[0] ?? null;
+}
+
+/**
+ * Consumer lease (Amendment 5 A5.7). Acquire or renew by CAS: succeeds when no
+ * lease exists, the caller already holds it, or the current lease has expired.
+ */
+export async function acquireConsumerLease(
+  holder: string,
+  now: string,
+  ttlMs: number,
+  db: IDatabase = getDatabase()
+): Promise<boolean> {
+  const expiresAt = new Date(Date.parse(now) + ttlMs).toISOString();
+  await db.query(
+    `INSERT INTO t3_consumer_lease (id, holder, expires_at) VALUES (1, $1, $2)
+     ON CONFLICT (id) DO UPDATE SET holder = excluded.holder, expires_at = excluded.expires_at
+     WHERE t3_consumer_lease.holder = excluded.holder OR t3_consumer_lease.expires_at < $3`,
+    [holder, expiresAt, now]
+  );
+  const result = await db.query<{ holder: string }>(
+    'SELECT holder FROM t3_consumer_lease WHERE id = 1',
+    []
+  );
+  return result.rows[0]?.holder === holder;
+}
+
+/** Count one failed processing attempt for a command row (A5.12); returns the total. */
+export async function recordFailedAttempt(
+  messageId: string,
+  errorClass: string,
+  now: string,
+  db: IDatabase = getDatabase()
+): Promise<number> {
+  await db.query(
+    `INSERT INTO t3_command_attempts (message_id, attempts, last_error, updated_at)
+     VALUES ($1, 1, $2, $3)
+     ON CONFLICT (message_id) DO UPDATE SET attempts = t3_command_attempts.attempts + 1,
+       last_error = excluded.last_error, updated_at = excluded.updated_at`,
+    [messageId, errorClass.slice(0, 120), now]
+  );
+  const result = await db.query<{ attempts: number }>(
+    'SELECT attempts FROM t3_command_attempts WHERE message_id = $1',
+    [messageId]
+  );
+  return result.rows[0]?.attempts ?? 0;
 }
