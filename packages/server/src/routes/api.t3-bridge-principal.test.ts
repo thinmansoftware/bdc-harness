@@ -20,7 +20,12 @@ import { OpenAPIHono } from '@hono/zod-openapi';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
-import { createAuthenticatedMessage, type DispatchMessage } from '@archon/core/db/dispatch';
+import {
+  acknowledgeMessage,
+  createAuthenticatedMessage,
+  listMessages,
+  type DispatchMessage,
+} from '@archon/core/db/dispatch';
 import { parseDispatchPrincipalsRegistry } from '@archon/core/db/dispatch-sender-authority';
 import { validationErrorHook } from './openapi-defaults';
 import { mockAllWorkflowModules } from '../test/workflow-mock-factories';
@@ -125,6 +130,7 @@ import {
   IN_PROCESS_API_ORIGIN,
   isInProcessServiceRequest,
 } from './in-process-authority';
+import { completeCommandMessage, listPendingCommands } from '../dispatch/cauldron-fire-consumer';
 
 function cleanupDb(path: string): void {
   for (const suffix of ['', '-wal', '-shm']) {
@@ -351,5 +357,69 @@ describe('in-process service authority (cauldron-fire cascade path)', () => {
       headers: T3_HEADERS,
     });
     expect(response.status).toBe(200);
+  });
+});
+
+describe('cauldron-fire mailbox: completed commands leave the polling page', () => {
+  beforeEach(() => {
+    process.env.BUN_ENV = 'test';
+    currentDbPath = join(
+      import.meta.dir,
+      `.test-t3-page-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+    );
+    db = new SqliteAdapter(currentDbPath);
+  });
+
+  afterEach(async () => {
+    await db.close();
+    cleanupDb(currentDbPath);
+  });
+
+  test('60 completed commands do not starve the 61st', async () => {
+    const ids: string[] = [];
+    for (let i = 1; i <= 61; i += 1) {
+      const row = await createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        {
+          correlation_id: `page-${i}`,
+          idempotency_key: `page-${i}`,
+          task_type: 'agent_message',
+          recipient: 'cauldron-fire',
+          body: JSON.stringify({ n: i }),
+        }
+      );
+      ids.push(row.id);
+    }
+    for (const id of ids.slice(0, 60)) {
+      await completeCommandMessage(id);
+    }
+    // The consumer's real page size is 50; the 61st must be the first pending row.
+    const pending = await listPendingCommands('cauldron-fire', 50);
+    expect(pending.map(row => row.id)).toEqual([ids[60]]);
+    // Durable: the 60 completed rows are addressed, so the raw queued page
+    // (what listMessages(status='queued') returns) no longer contains them.
+    const raw = await listMessages({ recipient: 'cauldron-fire', status: 'queued', limit: 100 });
+    expect(raw.map(row => row.id)).toEqual([ids[60]]);
+  });
+
+  test('a row acknowledged but never addressed is healed, not re-listed forever', async () => {
+    const ids: string[] = [];
+    for (let i = 1; i <= 3; i += 1) {
+      const row = await createAuthenticatedMessage(
+        { kind: 'system', sender: 'taskmaster' },
+        {
+          correlation_id: `heal-${i}`,
+          idempotency_key: `heal-${i}`,
+          task_type: 'agent_message',
+          recipient: 'cauldron-fire',
+          body: '{}',
+        }
+      );
+      ids.push(row.id);
+    }
+    // Simulate an address step that failed after a successful ack.
+    await acknowledgeMessage({ id: ids[0] as string, principal_id: 'cauldron-fire' });
+    const pending = await listPendingCommands('cauldron-fire', 50);
+    expect(pending.map(row => row.id)).toEqual([ids[1], ids[2]]);
   });
 });

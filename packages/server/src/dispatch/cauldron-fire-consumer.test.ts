@@ -33,6 +33,9 @@ import {
   startCauldronFireConsumer,
   stopCauldronFireConsumer,
   cauldronFireConsumerEnabled,
+  canonicalDigest,
+  fireCascadeUntilRunDiscovered,
+  tickCauldronFireConsumer,
 } from './cauldron-fire-consumer';
 
 const T0 = '2026-11-02T13:24:05.000Z';
@@ -985,5 +988,194 @@ describe('Test 10: disabled by default', () => {
     expect(listCalls).toBe(0);
     expect(world.acked).toHaveLength(0);
     expect(await admissions.getByRequestId('Q1', db)).toBeNull();
+  });
+});
+
+describe('single-flight ticks and active reservations', () => {
+  test('a tick firing while runCascade is in flight is a no-op', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const baseFire = world.deps.fireCascade;
+    world.deps.fireCascade = async input => {
+      await gate;
+      return baseFire(input);
+    };
+    const message = makeMessage({
+      id: 'cmd-sf',
+      idempotencyKey: 'SF',
+      body: cmdBody({ request_id: 'SF', verb: 'fire', wo_id: 'WO-SF', project: 'bdc-harness' }),
+    });
+    world.queue.push(message);
+
+    const first = tickCauldronFireConsumer(world.deps);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect((await admissions.getByRequestId('SF', db))?.state).toBe('reserved');
+
+    // Overlapping tick while the fire is still executing: does nothing.
+    await tickCauldronFireConsumer(world.deps);
+    expect(world.replies).toHaveLength(0);
+    expect(world.acked).toHaveLength(0);
+    expect((await admissions.getByRequestId('SF', db))?.state).toBe('reserved');
+
+    release();
+    await first;
+    expect(world.calls.fire).toBe(1);
+    expect(world.replies).toHaveLength(1);
+    expect(parseReply(world.replies[0] as ReplyRecord)).toMatchObject({ status: 200, code: 'ok' });
+    expect(world.acked).toEqual(['cmd-sf']);
+  });
+
+  test('a retry of a request whose reservation is still active gets no reply and stays queued', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    const body = cmdBody({
+      request_id: 'AR',
+      verb: 'fire',
+      wo_id: 'WO-AR',
+      project: 'bdc-harness',
+    });
+    const cmd = JSON.parse(body) as T3Command;
+    // The original command (cmd-ar-1) is mid-execution: its admission is reserved.
+    await admissions.reserveAdmission(
+      {
+        request_id: 'AR',
+        actor_principal_id: 't3-bridge',
+        verb: 'fire',
+        payload_sha256: canonicalDigest(cmd),
+        wo_id: 'WO-AR',
+        project: 'bdc-harness',
+        thread_id: 'th-1',
+        source_message_id: 'cmd-ar-1',
+        now: T0,
+      },
+      db
+    );
+    const retry = makeMessage({ id: 'cmd-ar-2', idempotencyKey: 'AR', body });
+    await processCommand(world.deps, retry);
+    expect(world.replies).toHaveLength(0);
+    expect(world.acked).toHaveLength(0);
+    expect(world.calls.fire).toBe(0);
+  });
+});
+
+describe('run ownership is persisted at run discovery, before terminal polling', () => {
+  type CascadeImpl = Parameters<typeof fireCascadeUntilRunDiscovered>[0];
+  type CascadeOpts = Parameters<CascadeImpl>[0];
+
+  test('cancel-own and approve succeed while the fired run is still running / paused', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    let cascadeFinished = false;
+    const impl = (async (opts: CascadeOpts) => {
+      // Dispatch proven and run discovered...
+      opts.onRunDiscovered?.('RLIVE', `C-${opts.woId}`);
+      // ...then terminal-state polling that does not finish during this test.
+      await new Promise<void>(() => undefined);
+      cascadeFinished = true;
+      return {} as never;
+    }) as unknown as CascadeImpl;
+    world.deps.fireCascade = async input => {
+      world.calls.fire += 1;
+      return fireCascadeUntilRunDiscovered(impl, async () => null, {
+        woId: input.woId,
+        project: input.project,
+        dispatchId: input.dispatchId,
+      });
+    };
+
+    await processCommand(
+      world.deps,
+      makeMessage({
+        id: 'cmd-live-fire',
+        idempotencyKey: 'LF',
+        body: cmdBody({
+          request_id: 'LF',
+          verb: 'fire',
+          wo_id: 'WO-LIVE',
+          project: 'bdc-harness',
+        }),
+      })
+    );
+    // The cascade has NOT finished, yet the fire is admitted with its run id.
+    expect(cascadeFinished).toBe(false);
+    const fired = parseReply(world.replyById.get('reply:cmd-live-fire') as ReplyRecord);
+    expect(fired).toMatchObject({
+      status: 200,
+      code: 'ok',
+      run_id: 'RLIVE',
+      cascade_id: 'C-WO-LIVE',
+    });
+    expect(await admissions.ownsRun('t3-bridge', 'RLIVE', db)).toBe(true);
+
+    // Approve the paused run, bound to its repo / PR / exact head.
+    world.runRepos.set('RLIVE', 'thinmansoftware/bdc-harness');
+    world.runBranches.set('RLIVE', 'feat/live');
+    world.prs.set('thinmansoftware/bdc-harness#7', {
+      open: true,
+      headRepo: 'thinmansoftware/bdc-harness',
+      baseRepo: 'thinmansoftware/bdc-harness',
+      headRef: 'feat/live',
+      baseRef: 'dev',
+      headSha: SHA_CURRENT,
+    });
+    await processCommand(
+      world.deps,
+      makeMessage({
+        id: 'cmd-live-approve',
+        idempotencyKey: 'LA',
+        body: cmdBody({
+          request_id: 'LA',
+          verb: 'approve',
+          project: 'bdc-harness',
+          run_id_for_approve: 'RLIVE',
+          pr: 'thinmansoftware/bdc-harness#7',
+          head_sha: SHA_CURRENT,
+        }),
+      })
+    );
+    expect(world.calls.approve).toBe(1);
+    expect(parseReply(world.replyById.get('reply:cmd-live-approve') as ReplyRecord)).toMatchObject({
+      status: 200,
+      code: 'ok',
+    });
+
+    // Cancel the still-running run.
+    await processCommand(
+      world.deps,
+      makeMessage({
+        id: 'cmd-live-cancel',
+        idempotencyKey: 'LC',
+        body: cmdBody({
+          request_id: 'LC',
+          verb: 'cancel-own',
+          project: 'bdc-harness',
+          run_id: 'RLIVE',
+        }),
+      })
+    );
+    expect(world.calls.cancel).toBe(1);
+    expect(world.cancelActors).toEqual(['t3-bridge']);
+    expect(parseReply(world.replyById.get('reply:cmd-live-cancel') as ReplyRecord)).toMatchObject({
+      status: 200,
+      code: 'ok',
+    });
+  });
+
+  test('a cascade that ends before any run is discovered falls back to its final record', async () => {
+    const impl = (async () => ({
+      cascadeId: 'C-END',
+      status: 'refused',
+      attempts: [],
+    })) as unknown as CascadeImpl;
+    const result = await fireCascadeUntilRunDiscovered(impl, async () => null, {
+      woId: 'WO-END',
+      project: 'bdc-harness',
+      dispatchId: 'd',
+    });
+    expect(result).toEqual({ cascadeId: 'C-END', status: 'refused', runId: null });
   });
 });

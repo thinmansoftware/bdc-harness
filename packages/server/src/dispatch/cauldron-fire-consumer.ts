@@ -720,6 +720,13 @@ export async function processCommand(
         existing.payload_sha256 === digest &&
         existing.actor_principal_id === message.sender_principal_id
       ) {
+        if (existing.state === 'reserved') {
+          // Active reservation: the original command is still executing (or a
+          // crash left it for startup recovery). Never answer for it early --
+          // leave this row queued, unacked; a later tick replays the decided
+          // outcome once the reservation resolves.
+          return;
+        }
         // Same request, same actor -> original outcome under this row's reply identity.
         await sendReplyAndAck(deps, message, cmd, replayOutcome(existing), now, false);
         return;
@@ -803,8 +810,17 @@ export async function recoverReservedFires(deps: CauldronFireConsumerDeps): Prom
   }
 }
 
-/** One clock tick: drain the mailbox sequentially. Never throws. */
+let tickInFlight = false;
+
+/**
+ * One clock tick: drain the mailbox sequentially. Never throws. Single-flight
+ * (like review-worker-clock's inFlight): a tick that starts while another is
+ * still executing -- e.g. a fire awaiting run discovery -- is a no-op, so no
+ * second tick can re-read and answer a command whose decision is in progress.
+ */
 export async function tickCauldronFireConsumer(deps: CauldronFireConsumerDeps): Promise<void> {
+  if (tickInFlight) return;
+  tickInFlight = true;
   try {
     const commands = await deps.listCommands(CAULDRON_FIRE_RECIPIENT, COMMAND_LIST_LIMIT);
     for (const message of commands) {
@@ -812,6 +828,8 @@ export async function tickCauldronFireConsumer(deps: CauldronFireConsumerDeps): 
     }
   } catch (error) {
     log.warn({ cause: (error as Error).message.slice(0, 200) }, 'cauldron_fire_tick_failed');
+  } finally {
+    tickInFlight = false;
   }
 }
 
@@ -872,6 +890,93 @@ export function stopCauldronFireConsumer(): void {
 
 const GITHUB_API_ORIGIN = 'https://api.github.com';
 
+/**
+ * Pending commands for the consumer: queued, not yet acknowledged. Completed
+ * commands are acknowledged AND addressed (completeCommandMessage), so they
+ * leave the queued page; acknowledged rows are additionally excluded here so a
+ * row whose address step failed cannot occupy the LIMIT window forever.
+ */
+export async function listPendingCommands(
+  recipient: string,
+  limit: number
+): Promise<DispatchMessage[]> {
+  const page = await dispatchDb.listMessages({
+    recipient,
+    status: 'queued',
+    limit: limit + COMMAND_LIST_LIMIT,
+  });
+  const pending = page.filter(row => row.acknowledged_at === null);
+  if (pending.length > 0 || page.length === 0) return pending.slice(0, limit);
+  // The whole page was acknowledged-but-unaddressed leftovers: heal them
+  // (address) so the next page is reachable, then return nothing this tick.
+  for (const row of page) await completeCommandMessage(row.id).catch(() => undefined);
+  return [];
+}
+
+/**
+ * Durably complete a command row once its reply exists: acknowledge, then
+ * address it as cauldron-fire. listMessages(status='queued') excludes addressed
+ * rows, so a completed command never re-enters the polling page. Both steps
+ * are idempotent for the same principal.
+ */
+export async function completeCommandMessage(messageId: string): Promise<void> {
+  const acked = await dispatchDb.acknowledgeMessage({
+    id: messageId,
+    principal_id: CAULDRON_FIRE_RECIPIENT,
+  });
+  if (!acked.ok) throw new Error(`cauldron_fire_ack_failed:${acked.reason}`);
+  const addressed = await dispatchDb.addressMessage({
+    id: messageId,
+    principal_id: CAULDRON_FIRE_RECIPIENT,
+  });
+  if (!addressed.ok) throw new Error(`cauldron_fire_address_failed:${addressed.reason}`);
+}
+
+/**
+ * Run the cascade, but return as soon as the first run id is DISCOVERED (the
+ * dispatch is proven), not after terminal-state polling. The caller persists
+ * authenticated ownership (admitted + run_id) immediately, so cancel-own and
+ * approve work while the run is running or paused. The cascade keeps running
+ * in the background. If the cascade ends before any run is discovered, its
+ * final record decides the outcome exactly as before.
+ */
+export async function fireCascadeUntilRunDiscovered(
+  runCascadeImpl: typeof runCascade,
+  readRecord: typeof readCascadeRecord,
+  options: Parameters<typeof runCascade>[0]
+): Promise<{ cascadeId: string; status: string; runId: string | null }> {
+  let discovered: ((value: { runId: string; cascadeId: string }) => void) | null = null;
+  const runDiscovered = new Promise<{ runId: string; cascadeId: string }>(resolve => {
+    discovered = resolve;
+  });
+  const cascade = runCascadeImpl({
+    ...options,
+    onRunDiscovered: (runId, cascadeId) => {
+      discovered?.({ runId, cascadeId });
+    },
+  });
+  const first = await Promise.race([
+    runDiscovered.then(found => ({ kind: 'run' as const, found })),
+    cascade.then(record => ({ kind: 'done' as const, record })),
+  ]);
+  if (first.kind === 'run') {
+    void cascade.catch((error: unknown) => {
+      log.warn(
+        { cascadeId: first.found.cascadeId, cause: (error as Error).message.slice(0, 200) },
+        'cauldron_fire_background_cascade_failed'
+      );
+    });
+    return { cascadeId: first.found.cascadeId, status: 'running', runId: first.found.runId };
+  }
+  const record = first.record;
+  const persisted = await readRecord(record.cascadeId);
+  const runId =
+    persisted?.attempts.find(attempt => attempt.runId)?.runId ??
+    record.attempts.find(attempt => attempt.runId)?.runId ??
+    null;
+  return { cascadeId: record.cascadeId, status: record.status, runId };
+}
+
 export function createRealCauldronFireConsumerDeps(
   env: Record<string, string | undefined>,
   apiFetch: typeof fetch
@@ -888,8 +993,7 @@ export function createRealCauldronFireConsumerDeps(
     env,
     now: (): Date => new Date(),
     db: getDatabase(),
-    listCommands: (recipient, limit) =>
-      dispatchDb.listMessages({ recipient, status: 'queued', limit }),
+    listCommands: (recipient, limit) => listPendingCommands(recipient, limit),
     sendReply: (input): Promise<DispatchMessage> =>
       dispatchDb.createAuthenticatedMessage(
         { kind: 'system', sender: 'cauldron-fire' },
@@ -901,9 +1005,7 @@ export function createRealCauldronFireConsumerDeps(
           body: input.body,
         }
       ),
-    acknowledge: async (messageId): Promise<void> => {
-      await dispatchDb.acknowledgeMessage({ id: messageId, principal_id: CAULDRON_FIRE_RECIPIENT });
-    },
+    acknowledge: (messageId): Promise<void> => completeCommandMessage(messageId),
     resolveActorMailbox: (principalOrSender): string | null => {
       try {
         const registry = parseDispatchPrincipalsRegistry(env.DISPATCH_PRINCIPALS_JSON);
@@ -943,7 +1045,10 @@ export function createRealCauldronFireConsumerDeps(
     ): Promise<{ cascadeId: string; status: string; runId: string | null }> => {
       const entryOverride =
         input.lane === 'cursor' || input.lane === 'zero' ? input.lane : undefined;
-      const record = await runCascade({
+      return fireCascadeUntilRunDiscovered(runCascade, readCascadeRecord, {
+        woId: input.woId,
+        project: input.project,
+        dispatchId: input.dispatchId,
         // Trust boundary (WO-HARNESS-T3-COMMAND-CONSUMER-01 runbook): the T3
         // command consumer fires on behalf of an authenticated ACTOR, never the
         // operator. It must NOT carry the operator token. Pass an explicit empty
@@ -957,17 +1062,8 @@ export function createRealCauldronFireConsumerDeps(
         // authority. No socket, no HTTP self-call, no operator token.
         apiBaseUrl: IN_PROCESS_API_ORIGIN,
         fetchImpl: apiFetch,
-        woId: input.woId,
-        project: input.project,
-        dispatchId: input.dispatchId,
         entryOverride,
       });
-      const persisted = await readCascadeRecord(record.cascadeId);
-      const runId =
-        persisted?.attempts.find(attempt => attempt.runId)?.runId ??
-        record.attempts.find(attempt => attempt.runId)?.runId ??
-        null;
-      return { cascadeId: record.cascadeId, status: record.status, runId };
     },
     knownLanes: ['cursor', 'zero'],
     cancelRun: async (runId, opts): Promise<CancelWorkflowRunActorResult> => {

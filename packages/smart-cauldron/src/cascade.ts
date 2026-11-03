@@ -438,6 +438,13 @@ export interface RunCascadeOptions {
   dispatchId?: string;
   /** Resolves only after the initial record is durable; used by async API dispatch. */
   onAdmission?: (record: CascadeRunRecord, created: boolean) => void;
+  /**
+   * Called the moment a tier's dispatch is proven and its run id discovered,
+   * BEFORE any terminal-state polling. Lets a caller persist run custody while
+   * the run is still running or paused. A throwing callback never affects the
+   * cascade.
+   */
+  onRunDiscovered?: (runId: string, cascadeId: string) => void;
   /** Await durable automatic-fire permission after preflight, before admission/effects. */
   beforeAdmission?: () => Promise<import('@archon/core/db/taskmaster').AutomaticFireProvenance>;
   woClass?: string;
@@ -1309,6 +1316,13 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(fetchImpl ? { fetchImpl } : {}),
       });
       attempt.runId = fireResult.runId;
+      if (fireResult.ok && fireResult.runId && opts.onRunDiscovered) {
+        try {
+          opts.onRunDiscovered(fireResult.runId, cascadeId);
+        } catch {
+          // Observation hook only; never alters the climb.
+        }
+      }
 
       // Infra error: alert + stop (do NOT count as "too hard")
       if (!fireResult.ok) {
