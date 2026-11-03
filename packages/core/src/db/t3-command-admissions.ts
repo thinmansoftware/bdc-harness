@@ -560,3 +560,26 @@ export async function adjudicateUnknownRunCommand(
   if (result.rowCount === 0) return { status: 'not_unknown', row };
   return { status: 'adjudicated', row };
 }
+
+/**
+ * The actor's admitted fire admission that owns `runId` (Amendment 4 A4.1):
+ * through custody (Amendment 3) or the admission's own run_id. Its recorded
+ * `project` is the run's project for cancel-own.
+ */
+export async function findOwningFireAdmission(
+  actorPrincipalId: string,
+  runId: string,
+  db: IDatabase = getDatabase()
+): Promise<T3CommandAdmissionRow | null> {
+  const result = await db.query<T3CommandAdmissionRow>(
+    `SELECT a.* FROM t3_command_admissions a
+     WHERE a.verb = 'fire' AND a.state = 'admitted' AND a.actor_principal_id = $1
+       AND (a.run_id = $2 OR EXISTS (
+         SELECT 1 FROM t3_command_run_custody c
+         WHERE c.admission_id = a.request_id AND c.run_id = $2))
+     ORDER BY a.created_at ASC
+     LIMIT 1`,
+    [actorPrincipalId, runId]
+  );
+  return result.rows[0] ?? null;
+}

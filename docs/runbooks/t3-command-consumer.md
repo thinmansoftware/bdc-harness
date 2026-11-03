@@ -102,6 +102,10 @@ hand-off state until someone re-runs it from the dashboard.
   in-process (see "In-process execution" below): no HTTP self-call, no
   operator token header.
 - cancel-own: allowed only when the actor fired that run through this consumer.
+- cancel-own project binding (Amendment 4): the run's project is the one its
+  owning fire admission recorded. A request naming another project is refused
+  403 `project_mismatch`; a recorded project no longer in
+  `T3_COMMAND_PROJECTS` is refused 403 `project_not_allowed`. No cancel call.
 - Run custody (Amendment 3): a fire admission owns EVERY run its cascade
   creates, on every tier. Each discovered run is appended to
   `t3_command_run_custody` (admission_id, run_id, tier, discovered_at; unique
@@ -133,7 +137,11 @@ hand-off state until someone re-runs it from the dashboard.
     against a held lock is refused 409 `admission_unknown` with the holding
     request_id in `run_id` (or 409 `command_in_flight` while the holder is
     still `reserved`).
-  - A retry row whose request_id is still `reserved` gets 202 `pending` and is
+  - The admission's own SOURCE command row is never answered by the tick
+    (Amendment 4): re-read while `reserved` (for example after a restart) it
+    stays queued with no reply and no ack; the in-flight handler or recovery
+    owns its final reply under `reply:<source_message_id>`.
+  - A genuine retry row (different message id) whose request_id is still `reserved` gets 202 `pending` and is
     acknowledged; the final outcome is on the original row's reply, or on a
     later retry once the reservation resolves.
 - Recovery (all verbs, start of every tick, so also at startup): a stale

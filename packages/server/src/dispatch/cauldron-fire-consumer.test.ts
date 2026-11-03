@@ -1724,3 +1724,81 @@ describe('Amendment 3: run custody follows the cascade across tiers', () => {
     expect(await admissions.ownsRun('p2', 'T3', db)).toBe(false);
   });
 });
+
+describe('Amendment 4', () => {
+  test('Test 19: cancel-own is bound to the run recorded project, not the request', async () => {
+    const world = makeWorld({ ...BASE_ENV, T3_COMMAND_PROJECTS: 'bdc-harness' });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    world.projectRepos.set('lspro-react', 'thinmansoftware/lspro-react');
+    await admissions.reserveAdmission(
+      {
+        request_id: 'fire-R7',
+        actor_principal_id: 't3-bridge',
+        verb: 'fire',
+        payload_sha256: 'seed',
+        wo_id: 'WO-R7',
+        project: 'lspro-react',
+        source_message_id: 'seed-R7',
+        now: T0,
+      },
+      db
+    );
+    await admissions.markAdmitted(
+      'fire-R7',
+      { status_code: 200, code: 'ok', cascade_id: 'C-R7', run_id: 'R7', now: T0 },
+      db
+    );
+
+    // (a) lspro-react was removed from the allowlist; the request names an allowed project.
+    await processCommand(world.deps, cancelMsg('cmd-q19a', 'Q19A', 'R7'));
+    const a = replyFor(world, 'cmd-q19a');
+    expect(a.status).toBe(403);
+    expect(['project_mismatch', 'project_not_allowed']).toContain(a.code as string);
+
+    // (b) lspro-react allowlisted again, request still names bdc-harness.
+    world.deps.env = { ...world.deps.env, T3_COMMAND_PROJECTS: 'bdc-harness,lspro-react' };
+    await processCommand(world.deps, cancelMsg('cmd-q19b', 'Q19B', 'R7'));
+    expect(replyFor(world, 'cmd-q19b')).toMatchObject({ status: 403, code: 'project_mismatch' });
+
+    expect(world.calls.cancel).toBe(0);
+  });
+
+  test('Test 20: a re-read source row gets no reply; recovery later delivers the final outcome', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    const source = fireMsg('cmd-q40', 'Q40', 'WO-Q40');
+    const cmd = JSON.parse(source.body) as T3Command;
+    await admissions.reserveAdmission(
+      {
+        request_id: 'Q40',
+        actor_principal_id: 't3-bridge',
+        verb: 'fire',
+        payload_sha256: canonicalDigest(cmd),
+        wo_id: 'WO-Q40',
+        project: 'bdc-harness',
+        thread_id: 'th-1',
+        source_message_id: 'cmd-q40',
+        now: T0,
+      },
+      db
+    );
+    await admissions.markEffectStarted('Q40', T0, db);
+    world.queue.push(source);
+
+    // Restart: a fresh tick re-reads the still-queued source row before staleness.
+    await tickCauldronFireConsumer(world.deps);
+    expect(world.replyById.has('reply:cmd-q40')).toBe(false);
+    expect(world.acked).not.toContain('cmd-q40');
+    expect(world.calls.fire).toBe(0);
+
+    // The reservation goes stale; recovery owns the source row's final reply.
+    world.deps.now = STALE_NOW;
+    await tickCauldronFireConsumer(world.deps);
+    const reply = replyFor(world, 'cmd-q40');
+    expect(reply.status).not.toBe(202);
+    expect(reply).toMatchObject({ status: 409, code: 'admission_unknown' });
+    expect(world.acked).toContain('cmd-q40');
+    expect(world.replies.filter(r => r.idempotencyKey === 'reply:cmd-q40')).toHaveLength(1);
+    expect(world.calls.fire).toBe(0);
+  });
+});

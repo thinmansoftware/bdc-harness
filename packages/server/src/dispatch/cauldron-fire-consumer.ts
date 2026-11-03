@@ -613,6 +613,26 @@ async function handleCancel(
     return { status: 403, code: 'forbidden_not_own_run' };
   }
 
+  // Amendment 4 A4.1: the run's project is the one its owning fire admission
+  // recorded, never the request's. A different requested project is refused,
+  // and the recorded project must still be allowlisted at cancel time.
+  const owning = await admissions.findOwningFireAdmission(actor, runId, deps.db);
+  const runProject = owning?.project ?? null;
+  const projectRefusal: string | null =
+    !runProject || runProject !== cmd.project
+      ? 'project_mismatch'
+      : !parseList(deps.env.T3_COMMAND_PROJECTS).includes(runProject)
+        ? 'project_not_allowed'
+        : null;
+  if (projectRefusal) {
+    await admissions.markRefused(
+      cmd.request_id,
+      { status_code: 403, code: projectRefusal, now },
+      deps.db
+    );
+    return { status: 403, code: projectRefusal };
+  }
+
   // Durable effect marker, committed BEFORE the side effect (A2.2).
   await admissions.markEffectStarted(cmd.request_id, deps.now().toISOString(), deps.db);
   const result = await deps.cancelRun(runId, { reason: 'T3 cancel-own', actor });
@@ -942,6 +962,13 @@ export async function processCommand(
         existing.payload_sha256 === digest &&
         existing.actor_principal_id === message.sender_principal_id
       ) {
+        if (existing.state === 'reserved' && existing.source_message_id === message.id) {
+          // Amendment 4 A4.2: this IS the admission's source row, re-read (for
+          // example after a restart). Never answer it here -- no reply, no ack;
+          // the in-flight handler or stale-reservation recovery owns its final
+          // reply under reply:<source_message_id>.
+          return;
+        }
         if (existing.state === 'reserved') {
           // A2.2 rule 5: the original command is still executing. This retry row
           // gets its own 202 pending reply and is acknowledged; the final
