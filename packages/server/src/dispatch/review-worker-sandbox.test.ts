@@ -8,10 +8,11 @@ import type { RealGitHubOctokitLike } from '@archon/overseer/adapters/github-rea
 import { runAndSubmitReview } from '@archon/overseer/pr-review-submit';
 import {
   createRealSubmitDeps,
+  REVIEW_HEAD_TREE_EMPTY,
   reviewInspectionArgv,
   type ReviewRouteConfig,
 } from '@archon/overseer/pr-review-wiring';
-import { processJob } from '../../../../scripts/overseer-reviewer-broker';
+import { brokerLimits, processJob } from '../../../../scripts/overseer-reviewer-broker';
 import {
   parseTrustedCheckPlan,
   prepareReviewCheckout,
@@ -831,9 +832,11 @@ describe('review inspection on shallow sparse checkouts (WO-HARNESS-REVIEW-PROOF
       const result = await runArgv(checkout, reviewInspectionArgv(head));
       expect(result.exitCode).toBe(0);
       expect(result.stdout.trim().length).toBeGreaterThan(0);
-      expect(result.stdout).toContain('docs/spec.md');
+      // Top-level entries only (non-recursive, bounded output).
+      expect(result.stdout.split('\n')).toContain('docs');
+      expect(result.stdout).not.toContain('docs/spec.md');
       // Outside the sparse worktree and never fetched: listed from the tree alone.
-      expect(result.stdout).toContain('generations/cover.png');
+      expect(result.stdout.split('\n')).toContain('generations');
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -876,31 +879,40 @@ describe('review inspection on shallow sparse checkouts (WO-HARNESS-REVIEW-PROOF
  */
 async function runOfflineShallowReview(input: {
   root: string;
-  inspection: 'current' | 'show-stat';
-}): Promise<WorkerHarness> {
+  inspection: 'current' | 'show-stat' | 'recursive';
+  createFixture?: (root: string) => Promise<{ remote: string; base: string; head: string }>;
+  outputLimit?: number;
+}): Promise<WorkerHarness & { brokerResults: Record<string, unknown>[] }> {
   const spool = join(input.root, 'spool');
   await mkdir(spool, { recursive: true });
   await writeFile(join(spool, 'ready'), 'test\n');
-  const { remote, base, head } = await createGenerationsRemote(input.root);
+  const { remote, base, head } = await (input.createFixture ?? createGenerationsRemote)(input.root);
   let offline = false;
   const original = Bun.spawn;
   Bun.spawn = ((
     command: Parameters<typeof Bun.spawn>[0],
     options?: Parameters<typeof Bun.spawn>[1]
   ) => {
-    if (offline && input.inspection === 'show-stat' && Array.isArray(command)) {
+    if (offline && input.inspection !== 'current' && Array.isArray(command)) {
       const argv = command.map(value => String(value));
       const at = argv.indexOf('ls-tree');
       if (at !== -1) {
         const headSha = argv[argv.length - 1] ?? '';
-        return original([...argv.slice(0, at), 'show', '--stat', '--oneline', headSha], options);
+        const old =
+          input.inspection === 'show-stat'
+            ? ['show', '--stat', '--oneline', headSha]
+            : ['ls-tree', '-r', '--name-only', headSha];
+        return original([...argv.slice(0, at), ...old], options);
       }
     }
     return original(command, options);
   }) as typeof Bun.spawn;
   const previousSpool = process.env.OVERSEER_REVIEW_SPOOL;
   process.env.OVERSEER_REVIEW_SPOOL = spool;
-  const broker = startProcessJobBroker(spool, { timeoutMs: 20_000, outputLimit: 1024 * 1024 });
+  const broker = startProcessJobBroker(spool, {
+    timeoutMs: 20_000,
+    outputLimit: input.outputLimit ?? 1024 * 1024,
+  });
   try {
     const harness = workerHarness({
       head,
@@ -926,7 +938,7 @@ async function runOfflineShallowReview(input: {
       })
     );
     await tickReviewWorkerClock(WORKER_CONFIG, harness.deps);
-    return harness;
+    return { ...harness, brokerResults: broker.results };
   } finally {
     broker.stop();
     Bun.spawn = original;
@@ -963,6 +975,286 @@ describe.serial(
         } finally {
           await rm(current, { recursive: true, force: true });
           await rm(old, { recursive: true, force: true });
+        }
+      },
+      60_000
+    );
+  }
+);
+
+// ---------------------------------------------------------------------------
+// WO-HARNESS-REVIEW-PROOF-SHALLOW-CHECKOUT-01 amendment (2026-11-03): the
+// inspection must stay NON-RECURSIVE. The broker keeps at most 128 KiB of a
+// check job's output and kills the job past it. Live: the recursive listing
+// of bdc-xo is 7,167 paths = 442,357 bytes, so PR 4330 at head fb091356 ended
+// "Review incomplete: sandbox_execution_proof_missing_or_invalid".
+// ---------------------------------------------------------------------------
+
+/** The broker's default check-job output cap (OUTPUT_LIMIT, 128 KiB). */
+const BROKER_CHECK_OUTPUT_LIMIT = brokerLimits({}).outputLimit;
+
+/** Enough long nested paths that a recursive listing exceeds the broker cap. */
+const LARGE_TREE_FILES = 3_200;
+
+/** The pre-amendment recursive inspection argv, kept to document the regression. */
+function recursiveLsTreeArgv(headSha: string): string[] {
+  return [
+    'git',
+    '-c',
+    'diff.external=',
+    '-c',
+    'core.fsmonitor=false',
+    'ls-tree',
+    '-r',
+    '--name-only',
+    headSha,
+  ];
+}
+
+async function gitWithStdin(cwd: string, args: string[], input: string): Promise<string> {
+  const child = Bun.spawn(['git', '-C', cwd, ...args], {
+    stdin: 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  child.stdin.write(input);
+  await child.stdin.end();
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  if (code !== 0) throw new Error(`git ${args.join(' ')} failed: ${stderr}`);
+  return stdout.trim();
+}
+
+/** A partial-clone-capable remote with base B (README.md only) on main. */
+async function initBaseRemote(root: string): Promise<{ remote: string; base: string }> {
+  const remote = join(root, 'remote');
+  await mkdir(remote, { recursive: true });
+  await git(remote, ['init', '-q', '-b', 'main']);
+  await git(remote, ['config', 'user.email', 'review@example.invalid']);
+  await git(remote, ['config', 'user.name', 'review']);
+  await git(remote, ['config', 'core.autocrlf', 'false']);
+  await git(remote, ['config', 'uploadpack.allowAnySHA1InWant', 'true']);
+  await git(remote, ['config', 'uploadpack.allowFilter', 'true']);
+  await writeFile(join(remote, 'README.md'), 'base\n');
+  await git(remote, ['add', 'README.md']);
+  await git(remote, ['commit', '-qm', 'base']);
+  return { remote, base: await git(remote, ['rev-parse', 'HEAD']) };
+}
+
+/**
+ * PR head H adds LARGE_TREE_FILES long nested paths (one shared blob, so the
+ * fixture is fast) whose recursive name listing is well over the broker cap.
+ */
+async function createLargeTreeRemote(
+  root: string
+): Promise<{ remote: string; base: string; head: string }> {
+  const { remote, base } = await initBaseRemote(root);
+  const blob = await gitWithStdin(remote, ['hash-object', '-w', '--stdin'], 'shared\n');
+  const lines: string[] = [];
+  for (let index = 0; index < LARGE_TREE_FILES; index += 1) {
+    const module = String(index % 40).padStart(2, '0');
+    const name = String(index).padStart(5, '0');
+    lines.push(
+      `100644 ${blob}\tdeeply/nested/module-${module}/component-with-a-deliberately-long-file-name-${name}.md`
+    );
+  }
+  await gitWithStdin(remote, ['update-index', '--index-info'], `${lines.join('\n')}\n`);
+  const tree = await git(remote, ['write-tree']);
+  const head = await git(remote, ['commit-tree', tree, '-p', base, '-m', 'large pr head']);
+  await git(remote, ['update-ref', 'refs/heads/pr', head]);
+  await git(remote, ['read-tree', 'HEAD']);
+  return { remote, base, head };
+}
+
+/** PR head H is a commit whose tree is git's empty tree (made from an empty index). */
+async function createEmptyTreeRemote(
+  root: string
+): Promise<{ remote: string; base: string; head: string }> {
+  const { remote, base } = await initBaseRemote(root);
+  const tree = await gitWithStdin(remote, ['mktree'], '');
+  expect(tree).toBe('4b825dc642cb6eb9a060e54bf8d69288fbee4904');
+  const head = await git(remote, ['commit-tree', tree, '-p', base, '-m', 'empty pr head']);
+  await git(remote, ['update-ref', 'refs/heads/pr', head]);
+  return { remote, base, head };
+}
+
+async function prepareOfflineCheckoutFrom(
+  root: string,
+  fixture: { remote: string; base: string; head: string }
+): Promise<string> {
+  const checkout = await prepareReviewCheckout(
+    {
+      owner: 'thinmansoftware',
+      repo: 'bdc-xo',
+      prNumber: 4330,
+      headSha: fixture.head,
+      baseRef: 'main',
+      baseSha: fixture.base,
+    },
+    { remoteUrl: fixture.remote, checkoutRoot: join(root, 'spool', 'checkouts') }
+  );
+  await makePromisorUnreachable(checkout, root);
+  return checkout;
+}
+
+/**
+ * The preparer's exact fetch (`--depth 1 --filter=blob:none` of head and base)
+ * without a worktree checkout, so thousands of fixture files are never
+ * written (Windows rename of a large fresh tree can hit EPERM). ls-tree needs
+ * only tree objects, so the inspection runs here exactly as in a checkout.
+ */
+async function shallowBlobFreeFetch(
+  root: string,
+  fixture: { remote: string; base: string; head: string }
+): Promise<string> {
+  const checkout = join(root, 'shallow');
+  await mkdir(checkout, { recursive: true });
+  await git(checkout, ['init', '-q']);
+  await git(checkout, ['remote', 'add', 'origin', fixture.remote]);
+  await git(checkout, [
+    'fetch',
+    '--quiet',
+    '--no-tags',
+    '--no-write-fetch-head',
+    '--depth',
+    '1',
+    '--filter=blob:none',
+    'origin',
+    fixture.head,
+    fixture.base,
+  ]);
+  await makePromisorUnreachable(checkout, root);
+  return checkout;
+}
+
+describe('review inspection output stays under the broker cap (WO-HARNESS-REVIEW-PROOF-SHALLOW-CHECKOUT-01 amendment)', () => {
+  const savedExcludes = process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+  beforeEach(() => {
+    delete process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+  });
+  afterEach(() => {
+    if (savedExcludes === undefined) delete process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+    else process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES = savedExcludes;
+  });
+
+  test('inspection_is_non_recursive', () => {
+    const argv = reviewInspectionArgv('a'.repeat(40));
+    expect(argv).toContain('ls-tree');
+    expect(argv).toContain('--name-only');
+    expect(argv).not.toContain('-r');
+    expect(argv[argv.length - 1]).toBe('a'.repeat(40));
+  });
+
+  test('inspection_output_bounded_on_large_tree while the recursive listing exceeds the cap', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'review-inspect-large-'));
+    try {
+      const fixture = await createLargeTreeRemote(root);
+      const checkout = await shallowBlobFreeFetch(root, fixture);
+      expect(await git(checkout, ['rev-parse', '--is-shallow-repository'])).toBe('true');
+      expect(await git(checkout, ['config', 'remote.origin.partialclonefilter'])).toBe('blob:none');
+      const fixed = await runArgv(checkout, reviewInspectionArgv(fixture.head));
+      expect(fixed.exitCode).toBe(0);
+      expect(fixed.stdout.trim().length).toBeGreaterThan(0);
+      expect(fixed.stdout).toContain('README.md');
+      expect(fixed.stdout).toContain('deeply');
+      expect(Buffer.byteLength(fixed.stdout, 'utf8')).toBeLessThan(BROKER_CHECK_OUTPUT_LIMIT);
+      const recursive = await runArgv(checkout, recursiveLsTreeArgv(fixture.head));
+      expect(recursive.exitCode).toBe(0);
+      expect(Buffer.byteLength(recursive.stdout, 'utf8')).toBeGreaterThan(
+        BROKER_CHECK_OUTPUT_LIMIT
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test('inspection_prints_nothing_for_an_empty_tree_head', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'review-inspect-empty-'));
+    try {
+      const fixture = await createEmptyTreeRemote(root);
+      const checkout = await prepareOfflineCheckoutFrom(root, fixture);
+      expect(await git(checkout, ['rev-parse', 'HEAD^{tree}'])).toBe(
+        '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
+      );
+      const result = await runArgv(checkout, reviewInspectionArgv(fixture.head));
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe('');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe.serial(
+  'large-tree and empty-tree reviews through the real broker (WO-HARNESS-REVIEW-PROOF-SHALLOW-CHECKOUT-01 amendment)',
+  () => {
+    const savedExcludes = process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+    beforeEach(() => {
+      delete process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+    });
+    afterEach(() => {
+      if (savedExcludes === undefined) delete process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES;
+      else process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES = savedExcludes;
+    });
+
+    test.skipIf(!linux)(
+      'worker_review_of_large_tree_qualifies_under_the_broker_cap_and_recursive_is_truncated',
+      async () => {
+        const current = await mkdtemp(join(tmpdir(), 'review-large-current-'));
+        const old = await mkdtemp(join(tmpdir(), 'review-large-old-'));
+        try {
+          const fixed = await runOfflineShallowReview({
+            root: current,
+            inspection: 'current',
+            createFixture: createLargeTreeRemote,
+            outputLimit: BROKER_CHECK_OUTPUT_LIMIT,
+          });
+          expect(fixed.posts.map(post => post.event)).toEqual(['APPROVE']);
+          expect(fixed.brokerResults.some(result => result.outputTruncated === true)).toBe(false);
+          const before = await runOfflineShallowReview({
+            root: old,
+            inspection: 'recursive',
+            createFixture: createLargeTreeRemote,
+            outputLimit: BROKER_CHECK_OUTPUT_LIMIT,
+          });
+          const truncated = before.brokerResults.find(result => result.outputTruncated === true);
+          expect(truncated?.ok).toBe(false);
+          expect(before.posts.map(post => post.event)).toEqual(['COMMENT']);
+          expect(before.posts[0]?.body).toStartWith(
+            'Review incomplete: sandbox_execution_proof_missing_or_invalid'
+          );
+        } finally {
+          await rm(current, { recursive: true, force: true });
+          await rm(old, { recursive: true, force: true });
+        }
+      },
+      120_000
+    );
+
+    test.skipIf(!linux)(
+      'worker_review_of_empty_tree_head_fails_loudly_with_review_head_tree_empty',
+      async () => {
+        const root = await mkdtemp(join(tmpdir(), 'review-empty-tree-'));
+        try {
+          const harness = await runOfflineShallowReview({
+            root,
+            inspection: 'current',
+            createFixture: createEmptyTreeRemote,
+            outputLimit: BROKER_CHECK_OUTPUT_LIMIT,
+          });
+          expect(harness.posts.map(post => post.event)).toEqual(['COMMENT']);
+          expect(harness.posts[0]?.body).toStartWith(
+            `Review incomplete: ${REVIEW_HEAD_TREE_EMPTY}`
+          );
+          expect(harness.posts[0]?.body).not.toContain(
+            'sandbox_execution_proof_missing_or_invalid'
+          );
+          expect(harness.results[0]).toMatchObject({ status: 'failed', task_outcome: 'blocked' });
+        } finally {
+          await rm(root, { recursive: true, force: true });
         }
       },
       60_000
