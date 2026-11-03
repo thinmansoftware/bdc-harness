@@ -10,6 +10,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { serviceGitHubCommandEnvironment } from '@archon/core/github/service-identity';
 import { assertGitHubPoolAvailable, recordGitHubApiCall } from '@archon/core/github/metering';
+import { listOpenWoPullRequests } from './already-satisfied.js';
 import type { PollResult } from './types.js';
 
 const execFileAsync = promisify(execFile);
@@ -203,6 +204,11 @@ interface PollOptions {
    * production always uses the real gh CLI (checkPrMergeableDefault).
    */
   checkPrMergeable?: (prUrl: string) => Promise<boolean | null>;
+  /**
+   * WO id for crediting an already-open PR whose head SHA this run pushed.
+   * Absent: the URL-based PR check is unchanged. Hermetic mode does not call GitHub.
+   */
+  woId?: string;
 }
 
 /**
@@ -260,9 +266,12 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
         | 'escalated'
         | 'cancelled';
       let events = detail.events ?? [];
+      let runMetadata: Record<string, unknown> = detail.run.metadata ?? {};
 
       let validatorVerdict = extractValidatorVerdict(events);
       let prUrl = extractPrUrl(events);
+      let runPushedHeadSha: string | null = null;
+      let openWoPrHeadSha: string | null = null;
 
       // Race guard: run status can flip to "completed" before the
       // open-pr-if-needed node event lands in the event feed. A single read
@@ -274,6 +283,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
           await new Promise<void>(resolve => setTimeout(resolve, prRetryDelayMs));
           const retryDetail = await fetchRunDetail(runId, apiBaseUrl, token, doFetch);
           events = retryDetail.events ?? [];
+          runMetadata = retryDetail.run.metadata ?? {};
           prUrl = extractPrUrl(events);
           // The validator event can lag for the same reason -- refresh it too.
           if (validatorVerdict === 'unknown') {
@@ -300,6 +310,11 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
             );
           }
         }
+        if (prUrl === null && opts.woId && repo) {
+          const credited = await creditRunPushedOpenPr(runId, opts.woId, repo, runMetadata, events);
+          runPushedHeadSha = credited.runPushedHeadSha;
+          openWoPrHeadSha = credited.openWoPrHeadSha;
+        }
       }
 
       const prMergeable = prUrl ? await checkPrMergeableFn(prUrl) : null;
@@ -311,6 +326,8 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
         validatorVerdict,
         prUrl,
         prMergeable,
+        runPushedHeadSha,
+        openWoPrHeadSha,
         servedModelId,
         nodeModels: extractNodeModels(events),
         rawMetadata: detail.run.metadata ?? {},
@@ -613,6 +630,59 @@ async function findExistingPrForBranch(
     if (url !== null) return url;
   }
   return null;
+}
+
+const SHA40 = /^[0-9a-f]{40}$/i;
+
+function validHeadSha(value: unknown): string | null {
+  if (typeof value !== 'string' || !SHA40.test(value)) return null;
+  return value.toLowerCase();
+}
+
+/**
+ * Pushed head from metadata `head_sha` or `pushed_head_sha`, else a structured
+ * event line `pushed_head=<40 hex>`. Arbitrary SHAs in prose are ignored.
+ */
+function extractRunPushedHeadSha(
+  metadata: Record<string, unknown>,
+  events: { data: Record<string, unknown> }[]
+): string | null {
+  const fromMetadata = validHeadSha(metadata.head_sha) ?? validHeadSha(metadata.pushed_head_sha);
+  if (fromMetadata) return fromMetadata;
+  const line = /(?:^|\s)pushed_head=([0-9a-f]{40})(?![0-9a-f])/i;
+  for (const ev of events) {
+    const match = line.exec(extractEventText(ev.data));
+    if (match?.[1]) return match[1].toLowerCase();
+  }
+  return null;
+}
+
+/**
+ * Credit an open WO PR only when exactly one candidate's head SHA equals the
+ * run's pushed SHA. Lookup failure leaves both fields null. Hermetic mode
+ * makes no GitHub call (listOpenWoPullRequests returns []).
+ */
+async function creditRunPushedOpenPr(
+  runId: string,
+  woId: string,
+  repo: string,
+  metadata: Record<string, unknown>,
+  events: { data: Record<string, unknown> }[]
+): Promise<{ runPushedHeadSha: string | null; openWoPrHeadSha: string | null }> {
+  const empty = { runPushedHeadSha: null, openWoPrHeadSha: null };
+  const pushed = extractRunPushedHeadSha(metadata, events);
+  if (!pushed) return empty;
+  try {
+    const opens = await listOpenWoPullRequests({ woId, project: repo });
+    const matches = opens.filter(pr => validHeadSha(pr.headSha) === pushed);
+    if (matches.length !== 1) return empty;
+    const openSha = validHeadSha(matches[0]?.headSha);
+    if (!openSha) return empty;
+    return { runPushedHeadSha: pushed, openWoPrHeadSha: openSha };
+  } catch (err) {
+    console.log(`[poll] run ${runId} open WO PR lookup failed: ${(err as Error).message}`);
+    return empty;
+  }
 }
 
 /**

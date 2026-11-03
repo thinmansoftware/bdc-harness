@@ -201,3 +201,153 @@ export async function findWoClaim(opts: FindWoClaimOptions): Promise<WoClaim | n
   if (merged) return merged;
   return claims[0] ?? null;
 }
+
+/**
+ * One-line manifest declaration. Copied locally so this package does not
+ * import Overseer. A value token-matches via textClaimsWoId.
+ */
+const WO_DECLARATION_LINE = /^WO[ \t]*:[ \t]*(\S.*)$/i;
+
+const OPEN_PR_PAGE_SIZE = 100;
+const OPEN_PR_MAX_PAGES = 10;
+
+/** OPEN pull request in the target repo that claims a WO. Forks are excluded. */
+export interface OpenWoPullRequest {
+  readonly number: number;
+  readonly headRefName: string;
+  readonly headSha: string;
+  readonly url: string;
+  readonly createdAt: string;
+  readonly isDraft: boolean;
+  readonly isFork: boolean;
+  readonly body: string;
+}
+
+interface GhOpenPullRow {
+  number?: number;
+  body?: string | null;
+  html_url?: string;
+  draft?: boolean;
+  created_at?: string;
+  head?: {
+    ref?: string;
+    sha?: string;
+    repo?: { full_name?: string | null } | null;
+  } | null;
+}
+
+export interface ListOpenWoPullRequestsOptions {
+  readonly woId: string;
+  readonly project: string;
+  /** Override the paginated open-PR read (tests). */
+  readonly lookup?: (repo: string) => Promise<GhOpenPullRow[]>;
+  readonly execFn?: typeof execFileAsync;
+}
+
+function bodyLineClaimsWo(body: string, woId: string): boolean {
+  for (const raw of body.split('\n')) {
+    const match = WO_DECLARATION_LINE.exec(raw.trim());
+    const value = match?.[1];
+    if (value && textClaimsWoId(value, woId)) return true;
+  }
+  return false;
+}
+
+function toOpenWoPullRequest(
+  row: GhOpenPullRow,
+  targetRepo: string,
+  woId: string
+): OpenWoPullRequest | null {
+  const fullName = row.head?.repo?.full_name;
+  if (typeof fullName !== 'string' || fullName.length === 0) return null;
+  if (fullName.toLowerCase() !== targetRepo.toLowerCase()) return null;
+  const number = row.number;
+  if (typeof number !== 'number' || !Number.isInteger(number) || number < 1) return null;
+  const headRefName = typeof row.head?.ref === 'string' ? row.head.ref : '';
+  const body = typeof row.body === 'string' ? row.body : '';
+  const branchClaims = woId.length > 0 && headRefName.toLowerCase().includes(woId.toLowerCase());
+  if (!branchClaims && !bodyLineClaimsWo(body, woId)) return null;
+  return {
+    number,
+    headRefName,
+    headSha: typeof row.head?.sha === 'string' ? row.head.sha : '',
+    url: typeof row.html_url === 'string' ? row.html_url : '',
+    createdAt: typeof row.created_at === 'string' ? row.created_at : '',
+    isDraft: row.draft === true,
+    isFork: false,
+    body,
+  };
+}
+
+/**
+ * Paginated open-PR listing. Fails open to [] on throw, timeout, a non-array
+ * page, or SMART_CAULDRON_HERMETIC=1 (hermetic mode makes no GitHub call).
+ * A full page at the cap returns the pages already read.
+ */
+async function ghListOpenPullRequestsDefault(
+  repo: string,
+  execFn: typeof execFileAsync = execFileAsync
+): Promise<GhOpenPullRow[]> {
+  if (process.env.SMART_CAULDRON_HERMETIC === '1') {
+    console.log('[smart-cauldron/already-satisfied] skipping open-PR list in hermetic mode');
+    return [];
+  }
+  try {
+    const out: GhOpenPullRow[] = [];
+    for (let page = 1; page <= OPEN_PR_MAX_PAGES; page++) {
+      const { stdout } = await execFn(
+        'gh',
+        [
+          'api',
+          '--method',
+          'GET',
+          '-H',
+          'Accept: application/vnd.github+json',
+          `repos/${repo}/pulls?state=open&per_page=${String(OPEN_PR_PAGE_SIZE)}&page=${String(page)}`,
+        ],
+        { timeout: 30000 }
+      );
+      const parsed: unknown = JSON.parse(stdout || '[]');
+      if (!Array.isArray(parsed)) return [];
+      out.push(...(parsed as GhOpenPullRow[]));
+      if (parsed.length < OPEN_PR_PAGE_SIZE) return out;
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * OPEN, non-fork PRs in the target repo whose body has a WO: line token-matching
+ * woId, or whose head branch contains woId (case-insensitive). Drafts included.
+ * Head repositories that cannot be verified, and forks, are excluded.
+ */
+export async function listOpenWoPullRequests(
+  opts: ListOpenWoPullRequestsOptions
+): Promise<OpenWoPullRequest[]> {
+  if (!opts.woId) return [];
+  let repo: string;
+  try {
+    repo = resolveGithubRepo(opts.project);
+  } catch {
+    return [];
+  }
+  const lookup =
+    opts.lookup ??
+    ((target: string): Promise<GhOpenPullRow[]> =>
+      ghListOpenPullRequestsDefault(target, opts.execFn));
+  let rows: GhOpenPullRow[];
+  try {
+    rows = await lookup(repo);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(rows)) return [];
+  const matched: OpenWoPullRequest[] = [];
+  for (const row of rows) {
+    const candidate = toOpenWoPullRequest(row, repo, opts.woId);
+    if (candidate) matched.push(candidate);
+  }
+  return matched;
+}

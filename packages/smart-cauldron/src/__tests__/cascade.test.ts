@@ -18,6 +18,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { runCascade } from '../cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
+import type { OpenWoPullRequest } from '../already-satisfied.js';
 import { classifyGateMisfire } from '../gate-misfire.js';
 import type { FireResult, PollResult, GateVerdict, CascadeRunRecord } from '../types.js';
 import { loadLadder, loadRefusedTiers } from '../ladder.js';
@@ -1316,7 +1317,7 @@ describe('wo claim + single-flight (#1546)', () => {
         if (claimCalls <= 2) return null;
         return {
           number: 42,
-          state: 'OPEN',
+          state: 'MERGED',
           title: 'WO-TEST-001 landed elsewhere',
           url: 'https://github.com/org/repo/pull/42',
           repo: 'thinmansoftware/test-project',
@@ -1383,6 +1384,144 @@ describe('wo claim + single-flight (#1546)', () => {
     expect(record.attempts[0]?.outcome).toBe('refused');
     expect(record.refusalReason?.prNumber).toBe(77);
     expect(record.refusalReason?.checkedAtTier).not.toBeNull();
+  });
+});
+
+function openWoPr(
+  overrides: Partial<OpenWoPullRequest> & Pick<OpenWoPullRequest, 'number' | 'headRefName'>
+): OpenWoPullRequest {
+  return {
+    headSha: 'a'.repeat(40),
+    url: `https://github.com/thinmansoftware/test-project/pull/${String(overrides.number)}`,
+    createdAt: '2026-11-03T10:00:00Z',
+    isDraft: false,
+    isFork: false,
+    body: 'WO: WO-TEST-001\n',
+    ...overrides,
+  };
+}
+
+/** Gate-fail the entry tier, then let the climb tier win. Captures every fire message. */
+function climbTwiceDeps(partial: {
+  messages: string[];
+  findWoClaim?: CascadeDeps['findWoClaim'];
+  listOpenWoPullRequests?: CascadeDeps['listOpenWoPullRequests'];
+}): CascadeDeps {
+  let fires = 0;
+  return {
+    findWoClaim: partial.findWoClaim ?? (async () => null),
+    listOpenWoPullRequests: partial.listOpenWoPullRequests,
+    fire: async opts => {
+      fires += 1;
+      partial.messages.push(opts.message);
+      return makeFireOk(`run-${String(fires)}`);
+    },
+    poll: async () =>
+      fires === 1
+        ? makePollResult({
+            terminalStatus: 'completed',
+            prUrl: null,
+            prMergeable: null,
+            validatorVerdict: 'needs_revision',
+          })
+        : makePollResult(),
+    judge: () => (fires === 1 ? makeFailVerdict('no PR opened') : makePassVerdict()),
+    escalate: async () => undefined,
+    writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+  };
+}
+
+function declarationLines(message: string): string[] {
+  return message.split('\n').filter(line => line.startsWith('Repair target: '));
+}
+
+describe('climb repair target', () => {
+  test('climb_targets_open_wo_pr', async () => {
+    let claimCalls = 0;
+    const messages: string[] = [];
+    const record = await runCascade(
+      baseOpts({
+        deps: climbTwiceDeps({
+          messages,
+          findWoClaim: async () => {
+            claimCalls += 1;
+            if (claimCalls <= 2) return null;
+            return {
+              number: 4422,
+              state: 'OPEN',
+              title: 'WO-TEST-001',
+              url: 'https://github.com/thinmansoftware/test-project/pull/4422',
+              repo: 'thinmansoftware/test-project',
+            };
+          },
+          listOpenWoPullRequests: async () => [
+            openWoPr({
+              number: 4422,
+              headRefName: 'archon/task-web-worker-1-abc',
+              createdAt: '2026-11-03T10:47:06Z',
+            }),
+          ],
+        }),
+      })
+    );
+
+    expect(record.status).toBe('won');
+    expect(messages.length).toBe(2);
+    const line = 'Repair target: PR #4422 (branch archon/task-web-worker-1-abc)';
+    expect(declarationLines(messages[0] ?? '')).toEqual([]);
+    expect(declarationLines(messages[1] ?? '')).toEqual([line]);
+  });
+
+  test('no_open_pr_no_declaration', async () => {
+    const readers: Array<CascadeDeps['listOpenWoPullRequests']> = [
+      async () => [],
+      async () => {
+        throw new Error('github down');
+      },
+    ];
+    for (const listOpenWoPullRequests of readers) {
+      const messages: string[] = [];
+      const record = await runCascade(
+        baseOpts({
+          deps: climbTwiceDeps({ messages, listOpenWoPullRequests }),
+        })
+      );
+      expect(record.status).toBe('won');
+      expect(messages.length).toBe(2);
+      expect(declarationLines(messages[0] ?? '')).toEqual([]);
+      expect(declarationLines(messages[1] ?? '')).toEqual([]);
+    }
+  });
+
+  test('climb_picks_newest_open_wo_pr', async () => {
+    const messages: string[] = [];
+    const record = await runCascade(
+      baseOpts({
+        deps: climbTwiceDeps({
+          messages,
+          listOpenWoPullRequests: async () => [
+            openWoPr({
+              number: 4422,
+              headRefName: 'archon/task-web-worker-1-abc',
+              createdAt: '2026-11-03T10:47:06Z',
+            }),
+            openWoPr({
+              number: 4424,
+              headRefName: 'archon/task-web-worker-2-def',
+              createdAt: '2026-11-03T11:06:52Z',
+            }),
+          ],
+        }),
+      })
+    );
+
+    expect(record.status).toBe('won');
+    expect(declarationLines(messages[1] ?? '')).toEqual([
+      'Repair target: PR #4424 (branch archon/task-web-worker-2-def)',
+    ]);
+    expect(record.repairTargetAlternates).toEqual([
+      { number: 4422, headRefName: 'archon/task-web-worker-1-abc' },
+    ]);
   });
 });
 
