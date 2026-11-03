@@ -101,7 +101,10 @@ test('reconciliation reads use the configured App with no PAT present', async ()
   app();
   transport(() => Response.json([{ filename: 'src/example.ts' }]));
   const deps = createDefaultReconcileDeps();
-  expect(await deps.listPullRequestFiles?.(pr)).toEqual(['src/example.ts']);
+  expect(await deps.listPullRequestFiles?.(pr)).toEqual({
+    items: ['src/example.ts'],
+    truncated: false,
+  });
   expect(calls.map(call => call.auth)).toEqual(['Bearer fixture-app']);
   await flushGitHubApiMeter();
   const usage = await getDatabase().query<{ service: string; pool_id: string }>(
@@ -215,7 +218,10 @@ test('an exhausted fallback PAT is held before its HTTP request', async () => {
 test('PAT-only installations retain their read route', async () => {
   process.env.GITHUB_TOKEN = 'fixture-pat';
   transport(() => Response.json([]));
-  expect(await createDefaultReconcileDeps().listPullRequestFiles?.(pr)).toEqual([]);
+  expect(await createDefaultReconcileDeps().listPullRequestFiles?.(pr)).toEqual({
+    items: [],
+    truncated: false,
+  });
   expect(calls.map(call => call.auth)).toEqual(['Bearer fixture-pat']);
 });
 
@@ -290,11 +296,13 @@ function mergedTrackerPr(number: number): ReconcileMergedPullRequest {
     repo: 'bdc-harness',
     number,
     title: 'Fixture implementation',
-    body: `WO: ${trackerStem}`,
+    // Closing keyword on the project base (bdc-harness -> dev) closes tracker #501.
+    body: `Closes thinmansoftware/bdc-xo#501`,
     htmlUrl: `https://github.com/thinmansoftware/bdc-harness/pull/${number}`,
     state: 'closed',
     merged: true,
     mergeCommitSha: 'a'.repeat(40),
+    baseRef: 'dev',
   };
 }
 
@@ -311,6 +319,12 @@ function trackerRunDeps(
     listOpenPullRequestsReferencingTracker: async () => [],
     hasCloseBeenRecorded: async () => false,
     hasHoldBeenNoted: async () => false,
+    hasMergedBeenNoted: async () => false,
+    removeTrackerLabel: async () => undefined,
+    // The LIVE-PROOF pass has its own tests; these cases exercise the merge path.
+    listMergedAwaitingProof: async () => [],
+    // A2 native-close reopen has its own tests; here a closed tracker was closed by someone else.
+    wasClosedByPullRequestMerge: async () => false,
     addTrackerEvidenceComment: async () => {
       effects.push('comment');
     },
@@ -343,6 +357,8 @@ test('tracker REST lookup uses healthy core while Search is exhausted', async ()
     number: 501,
     title: trackerStem,
     state: 'open',
+    // The fixture row carries no created_at, so the pre-tracker guard has no time to use.
+    createdAt: null,
   });
   expect(calls).toHaveLength(1);
   expect(new URL(calls[0]!.url).pathname).toBe('/repos/thinmansoftware/bdc-xo/issues');
@@ -397,15 +413,16 @@ test('tracker REST lookup reused dependency factory refreshes between invocation
   trackerTransport(() => [trackerRow(501, trackerStem, currentState)]);
   const effects: string[] = [];
   const deps = trackerRunDeps(createDefaultReconcileDeps(), [mergedTrackerPr(601)], effects);
-  expect((await runReconcileOnce({ deps })).closed).toBe(1);
+  // Amendment A1: the keyword merge marks (label + comment) and never closes.
+  expect((await runReconcileOnce({ deps })).closed).toBe(0);
   currentState = 'closed';
   expect((await runReconcileOnce({ deps })).closed).toBe(0);
-  expect(effects).toEqual(['comment', 'label', 'close']);
+  expect(effects).toEqual(['label', 'comment']);
   expect(calls).toHaveLength(2);
   expect(calls.every(call => !call.url.includes('/search/'))).toBe(true);
 });
 
-test('tracker REST lookup closes one tracker only once across merged PRs in an invocation', async () => {
+test('tracker REST lookup marks one tracker only once across merged PRs in an invocation', async () => {
   app();
   trackerTransport(() => [trackerRow(501)]);
   const effects: string[] = [];
@@ -414,8 +431,8 @@ test('tracker REST lookup closes one tracker only once across merged PRs in an i
     [mergedTrackerPr(601), mergedTrackerPr(602)],
     effects
   );
-  expect(await runReconcileOnce({ deps })).toEqual({ scanned: 2, closed: 1, skipped: false });
-  expect(effects).toEqual(['comment', 'label', 'close']);
+  expect(await runReconcileOnce({ deps })).toEqual({ scanned: 2, closed: 0, skipped: false });
+  expect(effects).toEqual(['label', 'comment']);
   expect(calls).toHaveLength(1);
 });
 
@@ -430,8 +447,8 @@ test('tracker REST lookup spec-only evidence does not consume later implementati
   );
   deps.listPullRequestFiles = async pr =>
     pr.number === 601 ? [`docs/work-orders/${trackerStem}.md`] : ['src/fixture.ts'];
-  expect((await runReconcileOnce({ deps })).closed).toBe(1);
-  expect(effects.filter(effect => effect === 'close')).toHaveLength(1);
+  expect((await runReconcileOnce({ deps })).closed).toBe(0);
+  expect(effects.filter(effect => effect === 'label')).toHaveLength(1);
 });
 
 test('tracker REST lookup completes pagination before selecting a later exact issue', async () => {
@@ -571,10 +588,17 @@ test('tracker REST lookup excludes PR rows and preserves closed issue state', as
 });
 
 test('tracker REST lookup rejects ambiguous exact titles rather than selecting REST order', async () => {
+  // Ambiguity is a by-STEM concern (the keyword-missing note resolves a declared
+  // WO by title). A PR that declares the WO but carries no closing keyword forces
+  // that lookup; two issues with the same title make it ambiguous and abort.
   app();
   trackerTransport(() => [trackerRow(501), trackerRow(502)]);
   const effects: string[] = [];
-  const deps = trackerRunDeps(createDefaultReconcileDeps(), [mergedTrackerPr(601)], effects);
+  const pr: ReconcileMergedPullRequest = {
+    ...mergedTrackerPr(601),
+    body: `WO: ${trackerStem}`,
+  };
+  const deps = trackerRunDeps(createDefaultReconcileDeps(), [pr], effects);
   await expect(runReconcileOnce({ deps })).rejects.toThrow('title is ambiguous');
   expect(effects).toEqual([]);
 });
@@ -587,19 +611,25 @@ test('tracker REST lookup rejects conflicting copies of one issue identity', asy
   );
 });
 
-test('tracker REST lookup complete empty and near-title snapshots do not close a tracker', async () => {
+test('tracker REST lookup: a keyword referencing an absent issue number closes nothing', async () => {
+  // Under keyword-close, a `Closes #N` only closes issue #N. If #777 is not in the
+  // snapshot (empty, or a different issue sits at #501) nothing is closed.
   app();
   let rows: ReturnType<typeof trackerRow>[] = [];
   trackerTransport(() => rows);
   const effects: string[] = [];
-  const deps = trackerRunDeps(createDefaultReconcileDeps(), [mergedTrackerPr(601)], effects);
+  const pr: ReconcileMergedPullRequest = {
+    ...mergedTrackerPr(601),
+    body: `Closes thinmansoftware/bdc-xo#777`,
+  };
+  const deps = trackerRunDeps(createDefaultReconcileDeps(), [pr], effects);
   expect((await runReconcileOnce({ deps })).closed).toBe(0);
   rows = [trackerRow(501, `${trackerStem}-NEAR`)];
   expect((await runReconcileOnce({ deps })).closed).toBe(0);
   expect(effects).toEqual([]);
 });
 
-test('tracker REST lookup open-holder guard does not consume a later eligible close', async () => {
+test('tracker REST lookup open-holder guard does not consume a later eligible mark', async () => {
   app();
   trackerTransport(() => [trackerRow(501)]);
   const effects: string[] = [];
@@ -622,25 +652,25 @@ test('tracker REST lookup open-holder guard does not consume a later eligible cl
           },
         ]
       : [];
-  expect((await runReconcileOnce({ deps })).closed).toBe(1);
-  expect(effects).toEqual(['comment', 'comment', 'label', 'close']);
+  expect((await runReconcileOnce({ deps })).closed).toBe(0);
+  expect(effects).toEqual(['comment', 'label', 'comment']);
   expect(calls).toHaveLength(1);
 });
 
-test('tracker REST lookup failed close is not remembered as a successful close on a later run', async () => {
+test('tracker REST lookup failed mark is not remembered as a successful mark on a later run', async () => {
   app();
   trackerTransport(() => [trackerRow(501)]);
   const effects: string[] = [];
   const deps = trackerRunDeps(createDefaultReconcileDeps(), [mergedTrackerPr(601)], effects);
-  let failClose = true;
-  deps.closeTrackerIssue = async () => {
-    if (failClose) throw new Error('fixture close failed');
-    effects.push('close');
+  let failComment = true;
+  deps.addTrackerEvidenceComment = async () => {
+    if (failComment) throw new Error('fixture comment failed');
+    effects.push('comment');
   };
-  await expect(runReconcileOnce({ deps })).rejects.toThrow('fixture close failed');
-  failClose = false;
-  expect((await runReconcileOnce({ deps })).closed).toBe(1);
-  expect(effects.filter(effect => effect === 'close')).toHaveLength(1);
+  await expect(runReconcileOnce({ deps })).rejects.toThrow('fixture comment failed');
+  failComment = false;
+  expect((await runReconcileOnce({ deps })).closed).toBe(0);
+  expect(effects.filter(effect => effect === 'comment')).toHaveLength(1);
   expect(calls).toHaveLength(2);
 });
 

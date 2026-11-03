@@ -8,8 +8,8 @@
 import { expect, mock, test } from 'bun:test';
 import {
   openPullRequestsHoldingTracker,
-  RECONCILE_ACTION,
   RECONCILE_HOLD_OPEN_ACTION,
+  RECONCILE_MERGED_ACTION,
   runReconcileOnce,
   searchOpenPullRequestsReferencingTracker,
   type OctokitLike,
@@ -28,12 +28,13 @@ function mergedPullRequest(): ReconcileMergedPullRequest {
     repo: 'bdc-harness',
     number: 404,
     title: 'BDC feature Work Order implementation',
-    body: `WO: ${stem}`,
+    body: `WO: ${stem}\n\nCloses thinmansoftware/bdc-xo#1044`,
     htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/404',
     state: 'closed',
     merged: true,
     mergeCommitSha: 'abc123merge',
     mergedAt: '2026-09-29T12:00:00Z',
+    baseRef: 'dev',
   };
 }
 
@@ -95,6 +96,10 @@ function harness(
     readCursor: mock(async () => null),
     now: () => new Date('2026-09-29T12:00:00Z'),
     searchMergedPullRequests: mock(async () => [mergedPullRequest()]),
+    findTrackerIssueByNumber: mock(async (number: number) => {
+      if (number !== 1044) return null;
+      return trackerIssue();
+    }),
     findTrackerIssueByStem: mock(async (candidate: string) => {
       if (candidate !== stem) return null;
       return trackerIssue();
@@ -111,6 +116,8 @@ function harness(
     hasSkipBeenNoted: mock(async () => false),
     hasCloseBeenRecorded: mock(async () => false),
     hasHoldBeenNoted: mock(async () => Boolean(input.holdAlreadyNoted)),
+    hasMergedBeenNoted: mock(async () => false),
+    hasKeywordMissingBeenNoted: mock(async () => false),
     insertAction: mock(async (record: ReconcileActionRecord) => {
       actions.push(record);
     }),
@@ -128,17 +135,18 @@ function harness(
 }
 
 function expectNormalClose(deps: ReturnType<typeof harness>, result: { closed: number }): void {
-  expect(result.closed).toBe(1);
-  expect(deps.closes).toEqual([1044]);
-  expect(deps.labels).toEqual(['wo:done']);
+  // Amendment A1: the "normal" keyword outcome is a merged mark, not a close.
+  expect(result.closed).toBe(0);
+  expect(deps.closes).toEqual([]);
+  expect(deps.labels).toEqual(['status:merged']);
   expect(deps.comments).toHaveLength(1);
-  expect(deps.comments[0]).toContain('Overseer reconcile closed tracker');
+  expect(deps.comments[0]).toContain('merged, not done');
   expect(deps.actions).toEqual([
     {
       prRef: 'thinmansoftware/bdc-harness#404',
       woId: stem,
-      class: 'tracker_reconcile',
-      action: RECONCILE_ACTION,
+      class: 'closes_keyword',
+      action: RECONCILE_MERGED_ACTION,
       result: 'https://github.com/thinmansoftware/bdc-harness/pull/404:abc123merge',
     },
   ]);
@@ -539,6 +547,7 @@ test('exactly one thousand distinct holders across ten pages proves the search b
     stem,
   });
   expect(found).toHaveLength(1000);
-  expect(pagesRequested.filter(page => page === 10)).toHaveLength(2);
+  // Three queries (stem, owner/repo#N, tracker-repo bare number) each reach page 10.
+  expect(pagesRequested.filter(page => page === 10)).toHaveLength(3);
   expect(pagesRequested).not.toContain(11);
 });
