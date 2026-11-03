@@ -141,6 +141,8 @@ describe('open WO repair selection', () => {
       ['WO-FOO-01', 'WO-FOO-01-thread-upper'],
       ['WO-FOO-01A', 'wo-foo-01a'],
       ['OTHER', 'prefixwo-foo-01'],
+      ['WO-FOO-01-EXTRA', 'wo-foo-01-extra'],
+      ['WO-FOO-01-EXTRA', 'wo-foo-01-extra-thread-abc'],
     ].map(([id, branch], index) => ({
       number: index + 1,
       body: `WO: ${id}`,

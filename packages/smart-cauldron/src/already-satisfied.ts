@@ -97,7 +97,7 @@ function stripExclusionSections(text: string): string {
  * True when text contains the exact WO_ID as a token (not a longer sibling id),
  * OUTSIDE any "explicitly out of scope" section. "WO-FOO-01" must not match
  * "WO-FOO-010". Branch suffixes like "-thread-abc" after the id are allowed
- * (hyphen is a boundary). Case-insensitive.
+ * (other hyphen continuations are rejected). Case-insensitive.
  */
 export function textClaimsWoId(text: string, woId: string): boolean {
   return matchesWoToken(stripExclusionSections(text), woId);

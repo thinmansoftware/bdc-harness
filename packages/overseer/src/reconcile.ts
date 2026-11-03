@@ -1162,7 +1162,9 @@ function collectStemsFromLines(input: string, linePattern: RegExp): Set<string> 
     // Upper-case before stem matching so `reconcile-skip: wo-foo-01` names the
     // same tracker as `WO-FOO-01`. Comma/space separation falls out of the stem
     // pattern itself: anything between ids that is not a stem is ignored.
-    for (const stem of extractWoStems(list.toUpperCase())) stems.add(stem);
+    for (const stem of extractWoStems(list.toUpperCase())) {
+      if (matchesWoToken(list, stem)) stems.add(stem);
+    }
   }
   return stems;
 }

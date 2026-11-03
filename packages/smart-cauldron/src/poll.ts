@@ -661,18 +661,24 @@ function validHeadSha(value: unknown): string | null {
 
 /**
  * Pushed head from metadata `head_sha` or `pushed_head_sha`, else a structured
- * event line `pushed_head=<40 hex>`. Arbitrary SHAs in prose are ignored.
+ * event line `pushed_head=<40 hex>` or the standard commit-and-push node
+ * origin verification receipt. Arbitrary SHAs in prose are ignored.
  */
 function extractRunPushedHeadSha(
   metadata: Record<string, unknown>,
-  events: { data: Record<string, unknown> }[]
+  events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[]
 ): string | null {
   const fromMetadata = validHeadSha(metadata.head_sha) ?? validHeadSha(metadata.pushed_head_sha);
   if (fromMetadata) return fromMetadata;
   const line = /(?:^|\s)pushed_head=([0-9a-f]{40})(?![0-9a-f])/i;
   for (const ev of events) {
-    const match = line.exec(extractEventText(ev.data));
+    const output = extractEventText(ev.data);
+    const match = line.exec(output);
     if (match?.[1]) return match[1].toLowerCase();
+    if (ev.event_type === 'node_completed' && ev.step_name === 'commit-and-push') {
+      const verified = /^VERIFIED: origin\/\S+ == local HEAD \(([0-9a-f]{40})\)\r?$/im.exec(output);
+      if (verified?.[1]) return verified[1].toLowerCase();
+    }
   }
   return null;
 }
@@ -690,7 +696,7 @@ async function creditRunPushedOpenPr(
   woId: string,
   repo: string,
   metadata: Record<string, unknown>,
-  events: { data: Record<string, unknown> }[],
+  events: { event_type: string; step_name: string | null; data: Record<string, unknown> }[],
   listOpen: (input: { woId: string; project: string }) => Promise<OpenWoPullRequest[]>
 ): Promise<{
   runPushedHeadSha: string | null;
