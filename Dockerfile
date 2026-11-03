@@ -152,6 +152,22 @@ RUN chmod 755 /usr/local/bin/gh \
     && gh --version \
     && if ARCHON_TEST_OUT=$(gh pr merge 1 2>&1); then echo "gh-merge-guard failed to block" && exit 1; else echo "$ARCHON_TEST_OUT" | grep -q 'gh-merge-guard: BLOCKED'; fi
 
+# gitleaks: the OpenRouter review fence (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01)
+# scans the diff + prompt of every customer-repo OpenRouter review before send.
+# Pinned to the same 8.30.1 / default-ruleset the customer CI (lspro-react
+# secrets-scan.yml) runs. Checksum-verified like the bwrap install above; a
+# missing binary makes the fence fail closed (reroute), so assert it at build.
+ARG GITLEAKS_VERSION=8.30.1
+ARG GITLEAKS_LINUX_X64_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+RUN curl -fsSL --retry 3 -o /tmp/gitleaks.tar.gz \
+      "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+    && echo "${GITLEAKS_LINUX_X64_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks \
+    && install -m 755 /tmp/gitleaks /usr/local/bin/gitleaks \
+    && rm -f /tmp/gitleaks.tar.gz /tmp/gitleaks \
+    && test "$(command -v gitleaks)" = /usr/local/bin/gitleaks \
+    && gitleaks version
+
 # Install Terraform for deployment-factory planning workflows.
 RUN curl -fsSLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
     && unzip -o /tmp/terraform.zip -d /usr/local/bin \

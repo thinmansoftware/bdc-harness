@@ -72,6 +72,12 @@ export const WORKFLOW_EVENT_TYPES = [
   // for its cooldown window, and again when the mark auto-expires. See
   // engine-availability.ts for the full detection/cooldown contract.
   'engine_availability_changed',
+  // OpenRouter review-fence decision (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01).
+  // One event per gate decision on a customer-repo OpenRouter review route:
+  // verdict clean (sent with the privacy pin), hit or scan_unavailable
+  // (rerouted to a Claude/Codex seat). data carries locations as file:line
+  // only -- never the matched customer value.
+  'openrouter_diff_scan',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];
