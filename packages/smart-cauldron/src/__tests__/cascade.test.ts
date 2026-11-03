@@ -1523,6 +1523,59 @@ describe('climb repair target', () => {
       { number: 4422, headRefName: 'archon/task-web-worker-1-abc' },
     ]);
   });
+
+  test('climb_skips_draft_open_wo_pr', async () => {
+    const messages: string[] = [];
+    const record = await runCascade(
+      baseOpts({
+        deps: climbTwiceDeps({
+          messages,
+          listOpenWoPullRequests: async () => [
+            openWoPr({
+              number: 4422,
+              headRefName: 'archon/task-web-worker-1-abc',
+              createdAt: '2026-11-03T10:47:06Z',
+            }),
+            openWoPr({
+              number: 4424,
+              headRefName: 'archon/task-web-worker-2-def',
+              createdAt: '2026-11-03T11:06:52Z',
+              isDraft: true,
+            }),
+          ],
+        }),
+      })
+    );
+
+    expect(record.status).toBe('won');
+    expect(declarationLines(messages[1] ?? '')).toEqual([
+      'Repair target: PR #4422 (branch archon/task-web-worker-1-abc)',
+    ]);
+    expect(record.repairTargetAlternates).toBeUndefined();
+  });
+
+  test('draft_only_open_pr_no_declaration', async () => {
+    const messages: string[] = [];
+    const record = await runCascade(
+      baseOpts({
+        deps: climbTwiceDeps({
+          messages,
+          listOpenWoPullRequests: async () => [
+            openWoPr({
+              number: 4424,
+              headRefName: 'archon/task-web-worker-2-def',
+              createdAt: '2026-11-03T11:06:52Z',
+              isDraft: true,
+            }),
+          ],
+        }),
+      })
+    );
+
+    expect(record.status).toBe('won');
+    expect(declarationLines(messages[1] ?? '')).toEqual([]);
+    expect(record.repairTargetAlternates).toBeUndefined();
+  });
 });
 
 // ---------------------------------------------------------------------------

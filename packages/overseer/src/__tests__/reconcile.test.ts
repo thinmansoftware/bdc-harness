@@ -1,7 +1,9 @@
 import { describe, expect, mock, test } from 'bun:test';
 import {
   RECONCILE_SUPERSEDE_ACTION,
+  closeSupersededPullRequest,
   runReconcileOnce,
+  type OctokitLike,
   type ReconcileActionRecord,
   type ReconcileDeps,
   type ReconcileMergedPullRequest,
@@ -500,5 +502,46 @@ describe('reconcile supersede', () => {
 
     expect(deps.pullCloses.map(close => close.number)).toEqual([4422]);
     expect(deps.pullCloses[0]?.comment.includes('Superseded by #4425')).toBe(true);
+  });
+
+  test('supersede_retry_does_not_repost_comment_after_failed_close', async () => {
+    const comments: string[] = [];
+    let closes = 0;
+    const client = {
+      issues: {
+        listComments: async () => ({
+          data: comments.map(body => ({
+            body,
+            user: { login: 'overseer' },
+            html_url: 'https://example.test/comment',
+            created_at: '2026-11-03T00:00:00Z',
+          })),
+        }),
+        createComment: async (input: Record<string, unknown>) => {
+          comments.push(String(input.body));
+          return {};
+        },
+        update: async () => {
+          closes += 1;
+          if (closes === 1) throw new Error('close failed');
+          return {};
+        },
+        addLabels: async () => ({}),
+      },
+    } as unknown as OctokitLike;
+    const input = {
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 4422,
+      comment: 'Superseded by #4425',
+    };
+
+    await expect(closeSupersededPullRequest(client, input)).rejects.toThrow('close failed');
+    expect(comments).toEqual(['Superseded by #4425']);
+
+    await closeSupersededPullRequest(client, input);
+
+    expect(comments).toEqual(['Superseded by #4425']);
+    expect(closes).toBe(2);
   });
 });

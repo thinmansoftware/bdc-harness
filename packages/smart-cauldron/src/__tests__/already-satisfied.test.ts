@@ -5,6 +5,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   findWoClaim,
+  listOpenWoPullRequests,
   resolveGithubRepo,
   textClaimsWoId,
   type WoClaim,
@@ -129,5 +130,43 @@ describe('findWoClaim', () => {
       lookup: async () => [],
     });
     expect(claim).toBeNull();
+  });
+});
+
+describe('listOpenWoPullRequests', () => {
+  test('drops draft PRs before a climb can select them', async () => {
+    const listed = await listOpenWoPullRequests({
+      woId: 'WO-TEST-001',
+      project: 'thinmansoftware/bdc-harness',
+      lookup: async () => [
+        {
+          number: 4424,
+          draft: true,
+          body: 'WO: WO-TEST-001\n',
+          html_url: 'https://github.com/thinmansoftware/bdc-harness/pull/4424',
+          created_at: '2026-11-03T11:06:52Z',
+          head: {
+            ref: 'archon/task-web-worker-2-def',
+            sha: 'b'.repeat(40),
+            repo: { full_name: 'thinmansoftware/bdc-harness' },
+          },
+        },
+        {
+          number: 4422,
+          draft: false,
+          body: 'WO: WO-TEST-001\n',
+          html_url: 'https://github.com/thinmansoftware/bdc-harness/pull/4422',
+          created_at: '2026-11-03T10:47:06Z',
+          head: {
+            ref: 'archon/task-web-worker-1-abc',
+            sha: 'a'.repeat(40),
+            repo: { full_name: 'thinmansoftware/bdc-harness' },
+          },
+        },
+      ],
+    });
+
+    expect(listed.map(pr => pr.number)).toEqual([4422]);
+    expect(listed.every(pr => pr.isDraft === false)).toBe(true);
   });
 });

@@ -221,4 +221,74 @@ describe('poll credit mergeability', () => {
     expect(verdict.pass).toBe(false);
     expect(verdict.reason).not.toContain('no PR opened after completed run');
   });
+
+  test('production_commit_push_output_credits_pushed_sha', async () => {
+    const headSha = 'a'.repeat(40);
+    const decoySha = 'b'.repeat(40);
+    const branch = 'feat/wo-xo-bdc-browser-keeper-04-thread-d2259b1b';
+    const creditedUrl = 'https://github.com/thinmansoftware/bdc-harness/pull/4422';
+    // commit-and-push stdout from bdc-feature-development: git push text, then
+    // `VERIFIED: origin/<branch> == local HEAD (<sha>)` and `unique_branch=`.
+    // A different 40-hex SHA in the same output must not be credited.
+    const nodeOutput = [
+      'To github.com:thinmansoftware/bdc-harness.git',
+      `   abc1234..def5678  HEAD -> ${branch}`,
+      `WARN: unrelated commit ${decoySha} was mentioned in prose`,
+      `VERIFIED: origin/${branch} == local HEAD (${headSha})`,
+      `unique_branch=${branch}`,
+    ].join('\n');
+    const fetchImpl: typeof fetch = async () =>
+      new Response(
+        JSON.stringify({
+          run: {
+            id: 'run-credit-verified',
+            status: 'completed',
+            metadata: { head_sha: decoySha },
+          },
+          events: [
+            {
+              event_type: 'node_completed',
+              step_name: 'commit-and-push',
+              data: { duration_ms: 1200, type: 'bash', node_output: nodeOutput },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+
+    const poll = await pollForTerminal({
+      runId: 'run-credit-verified',
+      apiBaseUrl: 'http://archon.test',
+      fetchImpl,
+      timeoutMs: 30_000,
+      intervalMs: 1,
+      prRetryAttempts: 0,
+      prBranchLookupAttempts: 1,
+      prBranchLookupDelayMs: 0,
+      repo: 'thinmansoftware/bdc-harness',
+      woId: 'WO-XO-BDC-BROWSER-KEEPER-04',
+      ghPrListForBranch: async () => null,
+      listOpenWoPullRequests: async () => [
+        {
+          number: 4422,
+          headRefName: 'archon/task-web-worker-1-abc',
+          headSha,
+          url: creditedUrl,
+          createdAt: '2026-11-03T10:47:06Z',
+          isDraft: false,
+          isFork: false,
+          body: 'WO: WO-XO-BDC-BROWSER-KEEPER-04\n',
+        },
+      ],
+      checkPrMergeable: async () => false,
+    });
+
+    expect(poll.runPushedHeadSha).toBe(headSha);
+    expect(poll.openWoPrHeadSha).toBe(headSha);
+    expect(poll.prUrl).toBe(creditedUrl);
+    expect(poll.prMergeable).toBe(false);
+    const verdict = judgeGate(poll);
+    expect(verdict.pass).toBe(false);
+    expect(verdict.reason).not.toContain('no PR opened after completed run');
+  });
 });

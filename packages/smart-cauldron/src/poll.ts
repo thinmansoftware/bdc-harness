@@ -660,13 +660,27 @@ function validHeadSha(value: unknown): string | null {
 }
 
 /**
- * Pushed head from metadata `head_sha` or `pushed_head_sha`, else a structured
- * event line `pushed_head=<40 hex>`. Arbitrary SHAs in prose are ignored.
+ * Pushed head from the commit-and-push line feature-development workflows emit
+ * after a durable push:
+ *   VERIFIED: origin/<branch> == local HEAD (<40 hex>)
+ * The last such line wins. Metadata `head_sha` / `pushed_head_sha` and a
+ * `pushed_head=<40 hex>` event line are fallbacks only; those workflows do not
+ * emit them. Arbitrary SHAs in prose are ignored.
  */
+const VERIFIED_PUSHED_HEAD = /^VERIFIED: origin\/\S+ == local HEAD \(([0-9a-f]{40})\)$/i;
+
 function extractRunPushedHeadSha(
   metadata: Record<string, unknown>,
   events: { data: Record<string, unknown> }[]
 ): string | null {
+  let fromVerified: string | null = null;
+  for (const ev of events) {
+    for (const rawLine of extractEventText(ev.data).split('\n')) {
+      const match = VERIFIED_PUSHED_HEAD.exec(rawLine.trim());
+      if (match?.[1]) fromVerified = match[1].toLowerCase();
+    }
+  }
+  if (fromVerified) return fromVerified;
   const fromMetadata = validHeadSha(metadata.head_sha) ?? validHeadSha(metadata.pushed_head_sha);
   if (fromMetadata) return fromMetadata;
   const line = /(?:^|\s)pushed_head=([0-9a-f]{40})(?![0-9a-f])/i;

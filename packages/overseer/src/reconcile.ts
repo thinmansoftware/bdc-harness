@@ -1382,6 +1382,46 @@ async function hasDefaultSupersedeBeenRecorded(input: {
   });
 }
 
+/**
+ * Comment, then close. A retry after a successful comment and a failed close
+ * does not post the comment again: the existing body is the idempotency key.
+ * A truncated comment read that does not show the body also skips the post,
+ * then still attempts the close. The caller records the action only after this
+ * returns, so a failed close stays eligible for another pass.
+ */
+export async function closeSupersededPullRequest(
+  client: OctokitLike,
+  input: { owner: string; repo: string; number: number; comment: string }
+): Promise<void> {
+  const wanted = input.comment.trim();
+  let skipComment = false;
+  if (client.issues.listComments) {
+    const existing = await listIssueComments(client, {
+      owner: input.owner,
+      repo: input.repo,
+      number: input.number,
+      title: '',
+      state: 'open',
+    });
+    const found = existing.items.some(comment => comment.body.trim() === wanted);
+    skipComment = found || existing.truncated;
+  }
+  if (!skipComment) {
+    await client.issues.createComment({
+      owner: input.owner,
+      repo: input.repo,
+      issue_number: input.number,
+      body: input.comment,
+    });
+  }
+  await client.issues.update({
+    owner: input.owner,
+    repo: input.repo,
+    issue_number: input.number,
+    state: 'closed',
+  });
+}
+
 export function createDefaultReconcileDeps(): ReconcileDeps {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const appConfigured = ['GITHUB_APP_', 'GITHUB_APP_OVERSEER_'].some(prefix =>
@@ -1513,19 +1553,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
     listOpenPullRequestsInRepo: async (input): Promise<PagedRead<ReconcileRepoOpenPullRequest>> =>
       listRepoOpenPullRequests(await getOctokit(), input.owner, input.repo),
     closePullRequest: async (input): Promise<void> => {
-      const client = await getOctokit();
-      await client.issues.createComment({
-        owner: input.owner,
-        repo: input.repo,
-        issue_number: input.number,
-        body: input.comment,
-      });
-      await client.issues.update({
-        owner: input.owner,
-        repo: input.repo,
-        issue_number: input.number,
-        state: 'closed',
-      });
+      await closeSupersededPullRequest(await getOctokit(), input);
     },
     hasSupersedeBeenRecorded: hasDefaultSupersedeBeenRecorded,
     removeTrackerLabel: async (input): Promise<void> => {

@@ -263,6 +263,7 @@ function toOpenWoPullRequest(
   if (fullName.toLowerCase() !== targetRepo.toLowerCase()) return null;
   const number = row.number;
   if (typeof number !== 'number' || !Number.isInteger(number) || number < 1) return null;
+  if (row.draft === true) return null;
   const headRefName = typeof row.head?.ref === 'string' ? row.head.ref : '';
   const body = typeof row.body === 'string' ? row.body : '';
   const branchClaims = woId.length > 0 && headRefName.toLowerCase().includes(woId.toLowerCase());
@@ -319,9 +320,9 @@ async function ghListOpenPullRequestsDefault(
 }
 
 /**
- * OPEN, non-fork PRs in the target repo whose body has a WO: line token-matching
- * woId, or whose head branch contains woId (case-insensitive). Drafts included.
- * Head repositories that cannot be verified, and forks, are excluded.
+ * OPEN, non-draft, non-fork PRs in the target repo whose body has a WO: line
+ * token-matching woId, or whose head branch contains woId (case-insensitive).
+ * Head repositories that cannot be verified, forks, and drafts are excluded.
  */
 export async function listOpenWoPullRequests(
   opts: ListOpenWoPullRequestsOptions

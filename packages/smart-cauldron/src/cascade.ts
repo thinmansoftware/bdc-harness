@@ -1850,7 +1850,12 @@ async function resolveClimbRepairTarget(
     logClimbRepairTarget(woId, 'none', 'none');
     return none;
   }
-  const sorted = [...opens].sort(compareOpenPrNewest);
+  const eligible = opens.filter(pr => !pr.isDraft);
+  if (eligible.length === 0) {
+    logClimbRepairTarget(woId, 'none', 'draft_only');
+    return none;
+  }
+  const sorted = [...eligible].sort(compareOpenPrNewest);
   const selected = sorted[0];
   if (!selected || !isValidRepairCandidate(selected)) {
     const label =
