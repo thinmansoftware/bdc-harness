@@ -28,6 +28,7 @@ import * as dispatchDb from '@archon/core/db/dispatch';
 import type { DispatchMessage } from '@archon/core/db/dispatch';
 import * as codebasesDb from '@archon/core/db/codebases';
 import * as workflowsDb from '@archon/core/db/workflows';
+import * as workflowEventsDb from '@archon/core/db/workflow-events';
 import { parseDispatchPrincipalsRegistry } from '@archon/core/db/dispatch-sender-authority';
 import {
   getServiceGitHubToken,
@@ -70,7 +71,14 @@ export interface ReplyOutcome {
   code: string;
   run_id?: string | null;
   cascade_id?: string | null;
+  /** 503 failed_before_effect only: the thrown error's class name (never its message). */
+  error_class?: string;
 }
+
+/** Reply text carried with every 409 admission_unknown (Amendment 2 A2.2 rule 2). */
+export const ADMISSION_UNKNOWN_TEXT = 'unknown, adjudication required';
+/** Seconds after which a reservation no handler holds is swept (A2.2 rule 4). */
+const DEFAULT_RESERVATION_STALE_S = 300;
 
 export interface PullRequestIdentity {
   open: boolean;
@@ -132,6 +140,16 @@ export interface CauldronFireConsumerDeps {
     runId: string,
     opts: { comment: string; decisionVerb: 'approve_as_is'; authorizedFixIds: string[] }
   ) => Promise<ApprovePausedWorkflowRunResult>;
+
+  // --- Recovery proofs (Amendment 2 A2.2 rule 4; read-only, never re-execute) ---
+  /** Fire custody: the cascade's run exists and names the WO (as loop.ts verifies). */
+  proveFireCustody: (
+    row: T3CommandAdmissionRow
+  ) => Promise<{ runId: string; cascadeId: string | null } | null>;
+  /** The run is cancelled and its run_cancelled event names this actor. */
+  proveCancel: (runId: string, actor: string) => Promise<boolean>;
+  /** An approval_received event for the run at or after `sinceIso`. */
+  proveApprove: (runId: string, sinceIso: string) => Promise<boolean>;
 
   // --- Approve bindings (all derived server-side) ---
   /** Normalized repository of the run's codebase (run.codebase_id -> repository_url). */
@@ -381,7 +399,7 @@ async function handleFire(
       {
         ...fireFields,
         status_code: 409,
-        code: 'live_run',
+        code: 'admission_unknown',
         run_id: competitor.request_id,
         now,
       },
@@ -389,7 +407,7 @@ async function handleFire(
     );
     return {
       status: 409,
-      code: 'live_run',
+      code: 'admission_unknown',
       run_id: competitor.request_id,
       cascade_id: competitor.cascade_id ?? null,
     };
@@ -447,6 +465,8 @@ async function handleFire(
   }
 
   let result: { cascadeId: string; status: string; runId: string | null };
+  // Durable effect marker, committed BEFORE the side effect (A2.2).
+  await admissions.markEffectStarted(cmd.request_id, deps.now().toISOString(), deps.db);
   try {
     result = await deps.fireCascade({
       woId,
@@ -519,22 +539,24 @@ async function handleCancel(
 ): Promise<ReplyOutcome> {
   const runId = cmd.run_id;
   if (!runId) throw new Error('t3_cancel_run_id_missing'); // unreachable post-validation
-  const reserved = await admissions.reserveAdmission(
-    {
-      request_id: cmd.request_id,
-      actor_principal_id: actor,
-      verb: 'cancel-own',
-      payload_sha256: digest,
-      wo_id: cmd.wo_id ?? null,
-      project: cmd.project,
-      target_run_id: runId,
-      thread_id: cmd.thread_id ?? null,
-      source_message_id: message.id,
-      now,
-    },
-    deps.db
-  );
+  const fields = {
+    request_id: cmd.request_id,
+    actor_principal_id: actor,
+    verb: 'cancel-own' as const,
+    payload_sha256: digest,
+    wo_id: cmd.wo_id ?? null,
+    project: cmd.project,
+    target_run_id: runId,
+    thread_id: cmd.thread_id ?? null,
+    source_message_id: message.id,
+  };
+  const locked = await refuseIfRunLocked(deps, fields, runId, now);
+  if (locked) return locked;
+  const reserved = await admissions.reserveAdmission({ ...fields, now }, deps.db);
   if (reserved.status === 'exists') return replayOutcome(reserved.row);
+  if (reserved.status !== 'reserved') {
+    return refuseRunLocked(deps, fields, runId, now);
+  }
 
   if (!(await admissions.ownsRun(actor, runId, deps.db))) {
     await admissions.markRefused(
@@ -545,6 +567,8 @@ async function handleCancel(
     return { status: 403, code: 'forbidden_not_own_run' };
   }
 
+  // Durable effect marker, committed BEFORE the side effect (A2.2).
+  await admissions.markEffectStarted(cmd.request_id, deps.now().toISOString(), deps.db);
   const result = await deps.cancelRun(runId, { reason: 'T3 cancel-own', actor });
   if (!result.ok) {
     const code = cancelCode(result.status);
@@ -563,6 +587,40 @@ async function handleCancel(
   return { status: 200, code: 'ok', run_id: runId };
 }
 
+/**
+ * Run lock (A2.2 rule 2): another cancel-own / approve for this run is
+ * unresolved. An `unknown` holder is refused 409 admission_unknown naming the
+ * holding request_id (in run_id) until an operator adjudicates; a `reserved`
+ * holder is mid-execution and refused 409 command_in_flight. The refusal is
+ * recorded so a retry of this request replays it.
+ */
+async function refuseIfRunLocked(
+  deps: CauldronFireConsumerDeps,
+  fields: Omit<admissions.ReserveAdmissionInput, 'now'>,
+  runId: string,
+  now: string
+): Promise<ReplyOutcome | null> {
+  const holder = await admissions.findRunLockHolder(runId, fields.request_id, deps.db);
+  return holder ? refuseRunLocked(deps, fields, runId, now) : null;
+}
+
+/** Record and return the run-lock refusal (also used when a reservation lost the race). */
+async function refuseRunLocked(
+  deps: CauldronFireConsumerDeps,
+  fields: Omit<admissions.ReserveAdmissionInput, 'now'>,
+  runId: string,
+  now: string
+): Promise<ReplyOutcome> {
+  const holder = await admissions.findRunLockHolder(runId, fields.request_id, deps.db);
+  const code = holder?.state === 'unknown' ? 'admission_unknown' : 'command_in_flight';
+  const holdingId = holder?.request_id ?? null;
+  await admissions.insertRefused(
+    { ...fields, status_code: 409, code, run_id: holdingId, now },
+    deps.db
+  );
+  return { status: 409, code, run_id: holdingId };
+}
+
 async function handleApprove(
   deps: CauldronFireConsumerDeps,
   cmd: T3Command,
@@ -575,24 +633,26 @@ async function handleApprove(
   const prText = cmd.pr;
   if (!runId || !prText) throw new Error('t3_approve_fields_missing'); // unreachable post-validation
   const prRef = parsePrRef(prText);
-  const reserved = await admissions.reserveAdmission(
-    {
-      request_id: cmd.request_id,
-      actor_principal_id: actor,
-      verb: 'approve',
-      payload_sha256: digest,
-      wo_id: cmd.wo_id ?? null,
-      project: cmd.project,
-      target_run_id: runId,
-      pr_ref: cmd.pr ?? null,
-      head_sha: cmd.head_sha ?? null,
-      thread_id: cmd.thread_id ?? null,
-      source_message_id: message.id,
-      now,
-    },
-    deps.db
-  );
+  const fields = {
+    request_id: cmd.request_id,
+    actor_principal_id: actor,
+    verb: 'approve' as const,
+    payload_sha256: digest,
+    wo_id: cmd.wo_id ?? null,
+    project: cmd.project,
+    target_run_id: runId,
+    pr_ref: cmd.pr ?? null,
+    head_sha: cmd.head_sha ?? null,
+    thread_id: cmd.thread_id ?? null,
+    source_message_id: message.id,
+  };
+  const locked = await refuseIfRunLocked(deps, fields, runId, now);
+  if (locked) return locked;
+  const reserved = await admissions.reserveAdmission({ ...fields, now }, deps.db);
   if (reserved.status === 'exists') return replayOutcome(reserved.row);
+  if (reserved.status !== 'reserved') {
+    return refuseRunLocked(deps, fields, runId, now);
+  }
 
   const refuse = async (status: number, code: string): Promise<ReplyOutcome> => {
     await admissions.markRefused(cmd.request_id, { status_code: status, code, now }, deps.db);
@@ -638,6 +698,9 @@ async function handleApprove(
     return refuse(422, 'stale_head');
   }
 
+  // Durable effect marker, committed BEFORE the side effect (A2.2): the approve
+  // function's first event write is the effect.
+  await admissions.markEffectStarted(cmd.request_id, deps.now().toISOString(), deps.db);
   const result = await deps.approveRun(runId, {
     comment: 'T3 approve',
     decisionVerb: 'approve_as_is',
@@ -646,12 +709,17 @@ async function handleApprove(
   if (!result.ok) {
     return refuse(result.status, 'approve_refused');
   }
+  // A2.1 item 4/6: `approved` only when the resume was dispatched; otherwise the
+  // approval is recorded but the run needs an operator follow-up. An approval
+  // that already existed was not resumed by this command either.
+  const code =
+    result.kind === 'approved' && result.autoResumed ? 'approved' : 'approved_not_resumed';
   await admissions.markAdmitted(
     cmd.request_id,
-    { status_code: 200, code: 'ok', run_id: runId, now },
+    { status_code: 200, code, run_id: runId, now },
     deps.db
   );
-  return { status: 200, code: 'ok', run_id: runId };
+  return { status: 200, code, run_id: runId };
 }
 
 // --------------------------------------------------------------------------
@@ -678,6 +746,8 @@ async function sendReplyAndAck(
       run_id: outcome.run_id ?? null,
       cascade_id: outcome.cascade_id ?? null,
       thread_id: cmd?.thread_id ?? null,
+      ...(outcome.error_class ? { error_class: outcome.error_class } : {}),
+      ...(outcome.code === 'admission_unknown' ? { message: ADMISSION_UNKNOWN_TEXT } : {}),
     });
     const reply = await deps.sendReply({
       recipient: mailbox,
@@ -697,12 +767,118 @@ async function sendReplyAndAck(
   await deps.acknowledge(message.id);
 }
 
+/** Request ids whose verb handler is executing in this process right now. */
+const inFlightRequests = new Set<string>();
+
+function errorClassOf(error: unknown): string {
+  if (error instanceof Error) return error.constructor.name || error.name || 'Error';
+  return typeof error;
+}
+
+/**
+ * An exception escaped a verb handler (A2.2 rules 1 and 2). Decide a durable
+ * outcome from the admission row and the effect marker, reply, and acknowledge
+ * -- a command is never left silent or queued forever.
+ */
+async function resolveHandlerException(
+  deps: CauldronFireConsumerDeps,
+  message: DispatchMessage,
+  cmd: T3Command,
+  actor: string,
+  digest: string,
+  error: unknown
+): Promise<void> {
+  const now = deps.now().toISOString();
+  const errorClass = errorClassOf(error);
+  const row = await admissions.getByRequestId(cmd.request_id, deps.db);
+  if (!row) {
+    // Threw before any reservation (a pre-admission read): nothing executed.
+    await admissions.insertRefused(
+      {
+        request_id: cmd.request_id,
+        actor_principal_id: actor,
+        verb: cmd.verb,
+        payload_sha256: digest,
+        wo_id: cmd.wo_id ?? null,
+        project: cmd.project,
+        target_run_id:
+          cmd.verb === 'cancel-own' ? (cmd.run_id ?? null) : (cmd.run_id_for_approve ?? null),
+        thread_id: cmd.thread_id ?? null,
+        source_message_id: message.id,
+        status_code: 503,
+        code: 'failed_before_effect',
+        now,
+      },
+      deps.db
+    );
+    await sendReplyAndAck(
+      deps,
+      message,
+      cmd,
+      { status: 503, code: 'failed_before_effect', error_class: errorClass },
+      now,
+      true
+    );
+    return;
+  }
+  if (row.source_message_id !== message.id || row.state !== 'reserved') {
+    // Already decided (e.g. the reply or ack step threw): replay, never re-decide.
+    await sendReplyAndAck(
+      deps,
+      message,
+      cmd,
+      replayOutcome(row),
+      now,
+      row.source_message_id === message.id
+    );
+    return;
+  }
+  if (!row.effect_started_at) {
+    // Rule 1: failed before any side effect -> refused, lock released.
+    await admissions.markRefused(
+      cmd.request_id,
+      { status_code: 503, code: 'failed_before_effect', now },
+      deps.db
+    );
+    await sendReplyAndAck(
+      deps,
+      message,
+      cmd,
+      { status: 503, code: 'failed_before_effect', error_class: errorClass },
+      now,
+      true
+    );
+    return;
+  }
+  // Rule 2: the effect may have happened -> unknown, lock held for adjudication.
+  await admissions.markUnknown(
+    cmd.request_id,
+    { status_code: 409, code: 'admission_unknown', now },
+    deps.db
+  );
+  const unknown = await admissions.getByRequestId(cmd.request_id, deps.db);
+  await sendReplyAndAck(
+    deps,
+    message,
+    cmd,
+    {
+      status: 409,
+      code: 'admission_unknown',
+      run_id: unknown?.run_id ?? null,
+      cascade_id: unknown?.cascade_id ?? null,
+    },
+    now,
+    true
+  );
+}
+
 /** Process one queued command row end-to-end. Never throws. */
 export async function processCommand(
   deps: CauldronFireConsumerDeps,
   message: DispatchMessage
 ): Promise<void> {
   const now = deps.now().toISOString();
+  let ctx: { cmd: T3Command; actor: string; digest: string } | null = null;
   try {
     const validated = await validateCommand(deps, message);
     if (!validated.ok) {
@@ -721,10 +897,10 @@ export async function processCommand(
         existing.actor_principal_id === message.sender_principal_id
       ) {
         if (existing.state === 'reserved') {
-          // Active reservation: the original command is still executing (or a
-          // crash left it for startup recovery). Never answer for it early --
-          // leave this row queued, unacked; a later tick replays the decided
-          // outcome once the reservation resolves.
+          // A2.2 rule 5: the original command is still executing. This retry row
+          // gets its own 202 pending reply and is acknowledged; the final
+          // outcome goes to the ORIGINAL row's reply (or to a later retry).
+          await sendReplyAndAck(deps, message, cmd, { status: 202, code: 'pending' }, now, false);
           return;
         }
         // Same request, same actor -> original outcome under this row's reply identity.
@@ -746,41 +922,96 @@ export async function processCommand(
     // Validation guaranteed sender_principal_id is a non-null, allowlisted actor
     // equal to the envelope sender; fall back to sender only to satisfy the type.
     const actor = message.sender_principal_id ?? message.sender;
+    ctx = { cmd, actor, digest };
+    inFlightRequests.add(cmd.request_id);
     let outcome: ReplyOutcome;
-    if (cmd.verb === 'fire') {
-      outcome = await handleFire(deps, cmd, message, actor, now, digest);
-    } else if (cmd.verb === 'cancel-own') {
-      outcome = await handleCancel(deps, cmd, message, actor, now, digest);
-    } else {
-      outcome = await handleApprove(deps, cmd, message, actor, now, digest);
+    try {
+      if (cmd.verb === 'fire') {
+        outcome = await handleFire(deps, cmd, message, actor, now, digest);
+      } else if (cmd.verb === 'cancel-own') {
+        outcome = await handleCancel(deps, cmd, message, actor, now, digest);
+      } else {
+        outcome = await handleApprove(deps, cmd, message, actor, now, digest);
+      }
+    } finally {
+      inFlightRequests.delete(cmd.request_id);
     }
     await sendReplyAndAck(deps, message, cmd, outcome, now, true);
   } catch (error) {
-    // A crash between steps is safe: a reserved fire left behind is reconciled
-    // to `unknown` at startup, never refired. Do not ack here -- the row stays
-    // queued and is reprocessed (admission dedupe prevents a second effect).
-    log.error(
-      { messageId: message.id, cause: (error as Error).message.slice(0, 200) },
+    log.warn(
+      {
+        messageId: message.id,
+        errorClass: errorClassOf(error),
+        cause: (error as Error).message?.slice(0, 200),
+      },
       'cauldron_fire_process_failed'
     );
+    try {
+      if (ctx) {
+        await resolveHandlerException(deps, message, ctx.cmd, ctx.actor, ctx.digest, error);
+      } else {
+        // Threw before an admission could exist (validation / dedupe read):
+        // nothing executed. Answer and acknowledge so the row cannot strand.
+        await sendReplyAndAck(
+          deps,
+          message,
+          null,
+          { status: 503, code: 'failed_before_effect', error_class: errorClassOf(error) },
+          now,
+          false
+        );
+      }
+    } catch (resolveError) {
+      // Could not even record/reply (store down): the row stays queued and is
+      // retried next tick, where admission dedupe prevents a second effect.
+      log.error(
+        { messageId: message.id, cause: (resolveError as Error).message?.slice(0, 200) },
+        'cauldron_fire_exception_unresolved'
+      );
+    }
   }
 }
 
 /**
- * Crash recovery: a fire reserved before a crash whose cascade cannot be proven
- * is marked `unknown`, replied 409 admission_unknown, and NEVER refired. Run
- * once at startup only -- a freshly reserved in-flight fire must not be swept.
+ * Recovery for all three verbs (A2.2 rule 4), run at the start of every tick
+ * (and so at startup): every `reserved` admission not updated for
+ * T3_COMMAND_RESERVATION_STALE_S seconds (default 300) that no handler in this
+ * process holds gets a durable outcome:
+ *   effect_started_at null -> refused, 503 failed_before_effect
+ *                             (error_class RecoveredBeforeEffect);
+ *   effect set and provable -> admitted (fire: run custody; cancel-own: run
+ *                             cancelled by this actor; approve: approval_received
+ *                             after the marker, code approved_not_resumed);
+ *   otherwise               -> unknown, 409 admission_unknown (lock held).
+ * It replies under the stranded row's own reply identity
+ * (reply:<source_message_id>, so it can never duplicate) and acknowledges it.
+ * Recovery NEVER re-executes a verb.
  */
-export async function recoverReservedFires(deps: CauldronFireConsumerDeps): Promise<void> {
-  const now = deps.now().toISOString();
-  const reserved = await admissions.listReservedFires(deps.db);
-  for (const row of reserved) {
+export async function recoverStaleReservations(deps: CauldronFireConsumerDeps): Promise<void> {
+  const nowDate = deps.now();
+  const now = nowDate.toISOString();
+  const raw = Number(deps.env.T3_COMMAND_RESERVATION_STALE_S);
+  const staleS = Number.isFinite(raw) && raw >= 0 ? raw : DEFAULT_RESERVATION_STALE_S;
+  const cutoff = new Date(nowDate.getTime() - staleS * 1000).toISOString();
+  const stale = await admissions.listStaleReservations(cutoff, deps.db);
+  for (const row of stale) {
+    if (inFlightRequests.has(row.request_id)) continue;
     try {
-      await admissions.markUnknown(
-        row.request_id,
-        { status_code: 409, code: 'admission_unknown', now },
-        deps.db
-      );
+      let outcome: ReplyOutcome;
+      if (!row.effect_started_at) {
+        await admissions.markRefused(
+          row.request_id,
+          { status_code: 503, code: 'failed_before_effect', now },
+          deps.db
+        );
+        outcome = {
+          status: 503,
+          code: 'failed_before_effect',
+          error_class: 'RecoveredBeforeEffect',
+        };
+      } else {
+        outcome = await recoverEffectStarted(deps, row, now);
+      }
       const mailbox = deps.resolveActorMailbox(row.actor_principal_id);
       if (mailbox) {
         const reply = await deps.sendReply({
@@ -791,11 +1022,13 @@ export async function recoverReservedFires(deps: CauldronFireConsumerDeps): Prom
             schema: REPLY_SCHEMA,
             request_id: row.request_id,
             verb: row.verb,
-            status: 409,
-            code: 'admission_unknown',
-            run_id: null,
-            cascade_id: null,
+            status: outcome.status,
+            code: outcome.code,
+            run_id: outcome.run_id ?? null,
+            cascade_id: outcome.cascade_id ?? null,
             thread_id: row.thread_id,
+            ...(outcome.error_class ? { error_class: outcome.error_class } : {}),
+            ...(outcome.code === 'admission_unknown' ? { message: ADMISSION_UNKNOWN_TEXT } : {}),
           }),
         });
         await admissions.recordReply(row.request_id, reply.id, now, deps.db);
@@ -803,11 +1036,70 @@ export async function recoverReservedFires(deps: CauldronFireConsumerDeps): Prom
       await deps.acknowledge(row.source_message_id).catch(() => undefined);
     } catch (error) {
       log.warn(
-        { requestId: row.request_id, cause: (error as Error).message.slice(0, 200) },
+        { requestId: row.request_id, cause: (error as Error).message?.slice(0, 200) },
         'cauldron_fire_recover_failed'
       );
     }
   }
+}
+
+async function recoverEffectStarted(
+  deps: CauldronFireConsumerDeps,
+  row: T3CommandAdmissionRow,
+  now: string
+): Promise<ReplyOutcome> {
+  if (row.verb === 'fire') {
+    const custody = await deps.proveFireCustody(row);
+    if (custody) {
+      await admissions.markAdmitted(
+        row.request_id,
+        {
+          status_code: 200,
+          code: 'ok',
+          run_id: custody.runId,
+          cascade_id: custody.cascadeId ?? row.cascade_id,
+          now,
+        },
+        deps.db
+      );
+      return {
+        status: 200,
+        code: 'ok',
+        run_id: custody.runId,
+        cascade_id: custody.cascadeId ?? row.cascade_id,
+      };
+    }
+  } else if (row.verb === 'cancel-own' && row.target_run_id) {
+    if (await deps.proveCancel(row.target_run_id, row.actor_principal_id)) {
+      await admissions.markAdmitted(
+        row.request_id,
+        { status_code: 200, code: 'ok', run_id: row.target_run_id, now },
+        deps.db
+      );
+      return { status: 200, code: 'ok', run_id: row.target_run_id };
+    }
+  } else if (row.verb === 'approve' && row.target_run_id && row.effect_started_at) {
+    if (await deps.proveApprove(row.target_run_id, row.effect_started_at)) {
+      // The approval is proven; whether its resume was dispatched is not.
+      await admissions.markAdmitted(
+        row.request_id,
+        { status_code: 200, code: 'approved_not_resumed', run_id: row.target_run_id, now },
+        deps.db
+      );
+      return { status: 200, code: 'approved_not_resumed', run_id: row.target_run_id };
+    }
+  }
+  await admissions.markUnknown(
+    row.request_id,
+    { status_code: 409, code: 'admission_unknown', now },
+    deps.db
+  );
+  return {
+    status: 409,
+    code: 'admission_unknown',
+    run_id: row.run_id,
+    cascade_id: row.cascade_id,
+  };
 }
 
 let tickInFlight = false;
@@ -822,6 +1114,9 @@ export async function tickCauldronFireConsumer(deps: CauldronFireConsumerDeps): 
   if (tickInFlight) return;
   tickInFlight = true;
   try {
+    await recoverStaleReservations(deps).catch((error: unknown) => {
+      log.warn({ cause: (error as Error).message?.slice(0, 200) }, 'cauldron_fire_sweep_failed');
+    });
     const commands = await deps.listCommands(CAULDRON_FIRE_RECIPIENT, COMMAND_LIST_LIMIT);
     for (const message of commands) {
       await processCommand(deps, message);
@@ -843,7 +1138,6 @@ export function cauldronFireConsumerEnabled(env: Record<string, string | undefin
 }
 
 let timer: ReturnType<typeof setInterval> | null = null;
-let recovered = false;
 
 /**
  * Start the consumer clock. No-op (no reads, no writes) unless
@@ -867,13 +1161,8 @@ export function startCauldronFireConsumer(
     resolved = createRealCauldronFireConsumerDeps(process.env, options.apiFetch);
   }
   if (!cauldronFireConsumerEnabled(resolved.env)) return;
-  void (async (): Promise<void> => {
-    if (!recovered) {
-      recovered = true;
-      await recoverReservedFires(resolved).catch(() => undefined);
-    }
-    await tickCauldronFireConsumer(resolved);
-  })();
+  // The first tick runs startup recovery for all verbs (recoverStaleReservations).
+  void tickCauldronFireConsumer(resolved);
   timer = setInterval(() => void tickCauldronFireConsumer(resolved), resolvePollMs(resolved.env));
   timer.unref?.();
 }
@@ -881,7 +1170,6 @@ export function startCauldronFireConsumer(
 export function stopCauldronFireConsumer(): void {
   if (timer) clearInterval(timer);
   timer = null;
-  recovered = false;
 }
 
 // --------------------------------------------------------------------------
@@ -977,6 +1265,42 @@ export async function fireCascadeUntilRunDiscovered(
   return { cascadeId: record.cascadeId, status: record.status, runId };
 }
 
+/**
+ * The consumer's approve (A2.1): the SAME pair the HTTP approve route uses --
+ * approvePausedWorkflowRun followed by tryAutoResumeRun(run, 'approve'). Never a
+ * no-op resume and never the /resume route.
+ */
+export async function approveRunWithResume(
+  runId: string,
+  opts: { comment: string; decisionVerb: 'approve_as_is'; authorizedFixIds: string[] }
+): Promise<ApprovePausedWorkflowRunResult> {
+  const api = await import('../routes/api');
+  return api.approvePausedWorkflowRun(runId, {
+    ...opts,
+    autoResume: run => api.tryAutoResumeRun(run, 'approve'),
+  });
+}
+
+/**
+ * A2.1 item 5: a `failed` run whose most recent decisive event is
+ * approval_received (no later *_failed event) is the approval's hand-off to its
+ * resume, not a terminal failure. Passed to runCascade so the background
+ * cascade keeps polling instead of recording a failure or climbing a rung.
+ */
+export function isApprovalHandOff(detail: {
+  run: { status: string };
+  events?: { event_type: string }[];
+}): boolean {
+  if (detail.run.status !== 'failed') return false;
+  const events = detail.events ?? [];
+  let lastApproval = -1;
+  events.forEach((event, index) => {
+    if (event.event_type === 'approval_received') lastApproval = index;
+  });
+  if (lastApproval < 0) return false;
+  return !events.slice(lastApproval + 1).some(event => event.event_type.endsWith('_failed'));
+}
+
 export function createRealCauldronFireConsumerDeps(
   env: Record<string, string | undefined>,
   apiFetch: typeof fetch
@@ -1062,6 +1386,8 @@ export function createRealCauldronFireConsumerDeps(
         // authority. No socket, no HTTP self-call, no operator token.
         apiBaseUrl: IN_PROCESS_API_ORIGIN,
         fetchImpl: apiFetch,
+        // A2.1 item 5: an approval's `failed` hand-off is not a terminal failure.
+        isTransitionalStatus: isApprovalHandOff,
         entryOverride,
       });
     },
@@ -1070,12 +1396,32 @@ export function createRealCauldronFireConsumerDeps(
       const api = await import('../routes/api');
       return api.cancelWorkflowRunAsActor(runId, opts);
     },
-    approveRun: async (runId, opts): Promise<ApprovePausedWorkflowRunResult> => {
-      const api = await import('../routes/api');
-      return api.approvePausedWorkflowRun(runId, {
-        ...opts,
-        autoResume: async (): Promise<boolean> => false,
-      });
+    approveRun: (runId, opts): Promise<ApprovePausedWorkflowRunResult> =>
+      approveRunWithResume(runId, opts),
+    proveFireCustody: async (row): Promise<{ runId: string; cascadeId: string | null } | null> => {
+      const record = await readCascadeRecord(row.cascade_id ?? row.request_id);
+      const runId = record?.attempts.find(attempt => attempt.runId)?.runId ?? null;
+      if (!runId || !row.wo_id) return null;
+      const run = await workflowsDb.getWorkflowRun(runId);
+      if (!run || !userMessageNamesWo(run.user_message ?? '', row.wo_id)) return null;
+      return { runId, cascadeId: record?.cascadeId ?? row.cascade_id };
+    },
+    proveCancel: async (runId, actor): Promise<boolean> => {
+      const run = await workflowsDb.getWorkflowRun(runId);
+      if (run?.status !== 'cancelled') return false;
+      const events = await workflowEventsDb.listWorkflowEvents(runId);
+      return events.some(
+        event => event.event_type === 'run_cancelled' && event.data.actor === actor
+      );
+    },
+    proveApprove: async (runId, sinceIso): Promise<boolean> => {
+      const since = Date.parse(sinceIso);
+      const events = await workflowEventsDb.listWorkflowEvents(runId);
+      return events.some(
+        event =>
+          event.event_type === 'approval_received' &&
+          new Date(event.created_at as unknown as string).getTime() >= since
+      );
     },
     getRunRepository: async (runId): Promise<string | null> => {
       const run = await workflowsDb.getWorkflowRun(runId);

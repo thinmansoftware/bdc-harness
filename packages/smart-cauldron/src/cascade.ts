@@ -445,6 +445,12 @@ export interface RunCascadeOptions {
    * cascade.
    */
   onRunDiscovered?: (runId: string, cascadeId: string) => void;
+  /**
+   * Passed through to the poller: a normally-terminal status that is a
+   * transitional hand-off for this run (see pollForTerminal). Absent by default,
+   * so every existing caller behaves exactly as before.
+   */
+  isTransitionalStatus?: (detail: import('./poll.js').PollRunDetail) => boolean;
   /** Await durable automatic-fire permission after preflight, before admission/effects. */
   beforeAdmission?: () => Promise<import('@archon/core/db/taskmaster').AutomaticFireProvenance>;
   woClass?: string;
@@ -1411,6 +1417,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           apiBaseUrl,
           token,
           ...(fetchImpl ? { fetchImpl } : {}),
+          ...(opts.isTransitionalStatus ? { isTransitionalStatus: opts.isTransitionalStatus } : {}),
           timeoutMs: pollTimeoutMs,
           stallTimeoutMs: pollStallTimeoutMs,
           intervalMs: pollIntervalMs,

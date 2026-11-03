@@ -29,7 +29,7 @@ import {
   type PullRequestIdentity,
   type T3Command,
   processCommand,
-  recoverReservedFires,
+  recoverStaleReservations,
   startCauldronFireConsumer,
   stopCauldronFireConsumer,
   cauldronFireConsumerEnabled,
@@ -86,6 +86,9 @@ interface World {
   approveResult:
     | { ok: true; kind: 'approved'; workflowName: string; autoResumed: boolean }
     | { ok: false; status: 400 | 404; message: string };
+  fireCustody: Map<string, { runId: string; cascadeId: string | null }>; // request_id ->
+  cancelledBy: Map<string, string>; // runId -> actor
+  approvedRuns: Set<string>;
 }
 
 function makeWorld(env: Record<string, string | undefined>): World {
@@ -106,7 +109,10 @@ function makeWorld(env: Record<string, string | undefined>): World {
     runBranches: new Map(),
     projectRepos: new Map(),
     prs: new Map(),
-    approveResult: { ok: true, kind: 'approved', workflowName: 'wf', autoResumed: false },
+    approveResult: { ok: true, kind: 'approved', workflowName: 'wf', autoResumed: true },
+    fireCustody: new Map(),
+    cancelledBy: new Map(),
+    approvedRuns: new Set(),
   };
 
   world.deps = {
@@ -167,6 +173,9 @@ function makeWorld(env: Record<string, string | undefined>): World {
     getRunRepository: async runId => world.runRepos.get(runId) ?? null,
     getRunBranch: async runId => world.runBranches.get(runId) ?? null,
     getPullRequest: async (repo, number) => world.prs.get(`${repo}#${number}`) ?? null,
+    proveFireCustody: async row => world.fireCustody.get(row.request_id) ?? null,
+    proveCancel: async (runId, actor) => world.cancelledBy.get(runId) === actor,
+    proveApprove: async runId => world.approvedRuns.has(runId),
   };
   return world;
 }
@@ -528,7 +537,7 @@ describe('Test 3e: an unknown fire holds the WO lock until operator adjudication
     expect(world.calls.fire).toBe(1);
     const refused = parseReply(world.replyById.get('reply:cmd-u2')!);
     expect(refused.status).toBe(409);
-    expect(refused.code).toBe('live_run');
+    expect(refused.code).toBe('admission_unknown');
     expect(refused.run_id).toBe('U1');
     expect((await admissions.getByRequestId('U2', db))?.state).toBe('refused');
     expect((await admissions.getByRequestId('U1', db))?.state).toBe('unknown');
@@ -937,8 +946,11 @@ describe('Test 8: crash safety', () => {
       },
       db
     );
+    // The cascade dispatch had started (effect marker set) before the crash.
+    await admissions.markEffectStarted('RESV', T0, db);
+    world.deps.now = (): Date => new Date(Date.parse(T0) + 301_000);
 
-    await recoverReservedFires(world.deps);
+    await recoverStaleReservations(world.deps);
 
     expect(world.calls.fire).toBe(0);
     const row = await admissions.getByRequestId('RESV', db);
@@ -1029,7 +1041,7 @@ describe('single-flight ticks and active reservations', () => {
     expect(world.acked).toEqual(['cmd-sf']);
   });
 
-  test('a retry of a request whose reservation is still active gets no reply and stays queued', async () => {
+  test('a retry of a request whose reservation is still active gets 202 pending and is acked', async () => {
     const world = makeWorld({ ...BASE_ENV });
     world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
     const body = cmdBody({
@@ -1056,8 +1068,13 @@ describe('single-flight ticks and active reservations', () => {
     );
     const retry = makeMessage({ id: 'cmd-ar-2', idempotencyKey: 'AR', body });
     await processCommand(world.deps, retry);
-    expect(world.replies).toHaveLength(0);
-    expect(world.acked).toHaveLength(0);
+    // Amendment 2 A2.2 rule 5: 202 pending under the retry row's own identity.
+    expect(world.replies).toHaveLength(1);
+    expect(parseReply(world.replyById.get('reply:cmd-ar-2') as ReplyRecord)).toMatchObject({
+      status: 202,
+      code: 'pending',
+    });
+    expect(world.acked).toEqual(['cmd-ar-2']);
     expect(world.calls.fire).toBe(0);
   });
 });
@@ -1140,7 +1157,7 @@ describe('run ownership is persisted at run discovery, before terminal polling',
     expect(world.calls.approve).toBe(1);
     expect(parseReply(world.replyById.get('reply:cmd-live-approve') as ReplyRecord)).toMatchObject({
       status: 200,
-      code: 'ok',
+      code: 'approved',
     });
 
     // Cancel the still-running run.
@@ -1177,5 +1194,411 @@ describe('run ownership is persisted at run discovery, before terminal polling',
       dispatchId: 'd',
     });
     expect(result).toEqual({ cascadeId: 'C-END', status: 'refused', runId: null });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Amendment 2 (A2.2): outcome states for every verb
+// ---------------------------------------------------------------------------
+
+class GitHubRequestError extends Error {}
+
+const STALE_NOW = (): Date => new Date(Date.parse(T0) + 301_000);
+
+function fireMsg(id: string, requestId: string, woId: string): DispatchMessage {
+  return makeMessage({
+    id,
+    idempotencyKey: requestId,
+    body: cmdBody({ request_id: requestId, verb: 'fire', wo_id: woId, project: 'bdc-harness' }),
+  });
+}
+
+function cancelMsg(id: string, requestId: string, runId: string): DispatchMessage {
+  return makeMessage({
+    id,
+    idempotencyKey: requestId,
+    body: cmdBody({
+      request_id: requestId,
+      verb: 'cancel-own',
+      project: 'bdc-harness',
+      run_id: runId,
+    }),
+  });
+}
+
+function approveMsg(id: string, requestId: string, runId: string): DispatchMessage {
+  return makeMessage({
+    id,
+    idempotencyKey: requestId,
+    body: cmdBody({
+      request_id: requestId,
+      verb: 'approve',
+      project: 'bdc-harness',
+      run_id_for_approve: runId,
+      pr: 'thinmansoftware/bdc-harness#5',
+      head_sha: SHA_CURRENT,
+    }),
+  });
+}
+
+function replyFor(world: World, messageId: string): Record<string, unknown> {
+  const record = world.replyById.get(`reply:${messageId}`);
+  if (!record) throw new Error(`no reply for ${messageId}`);
+  return JSON.parse(record.body) as Record<string, unknown>;
+}
+
+function setupApprovableP1(world: World): void {
+  world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+  world.runRepos.set('P1', 'thinmansoftware/bdc-harness');
+  world.runBranches.set('P1', 'feat/x');
+  world.prs.set('thinmansoftware/bdc-harness#5', {
+    open: true,
+    headRepo: 'thinmansoftware/bdc-harness',
+    baseRepo: 'thinmansoftware/bdc-harness',
+    headRef: 'feat/x',
+    baseRef: 'dev',
+    headSha: SHA_CURRENT,
+  });
+}
+
+describe('Test 13: fire -- before effect, after effect, pending, recovery', () => {
+  test('(a) eligibility throws -> refused 503 failed_before_effect, WO lock released, no cascade', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    world.deps.checkFireEligibility = async () => {
+      throw new GitHubRequestError('boom');
+    };
+    await processCommand(world.deps, fireMsg('cmd-q10', 'Q10', 'WO-C'));
+    expect(world.calls.fire).toBe(0);
+    const row = await admissions.getByRequestId('Q10', db);
+    expect(row?.state).toBe('refused');
+    expect(row?.effect_started_at).toBeNull();
+    expect(replyFor(world, 'cmd-q10')).toMatchObject({
+      status: 503,
+      code: 'failed_before_effect',
+      error_class: 'GitHubRequestError',
+    });
+    expect(world.acked).toContain('cmd-q10');
+    // A retry with the SAME request_id replays the refusal.
+    await processCommand(world.deps, fireMsg('cmd-q10b', 'Q10', 'WO-C'));
+    expect(replyFor(world, 'cmd-q10b')).toMatchObject({
+      status: 503,
+      code: 'failed_before_effect',
+    });
+    // The WO lock is released: a NEW request for WO-C is admitted.
+    world.deps.checkFireEligibility = async () => ({ eligible: true });
+    await processCommand(world.deps, fireMsg('cmd-q10c', 'Q10C', 'WO-C'));
+    expect(replyFor(world, 'cmd-q10c')).toMatchObject({ status: 200, code: 'ok' });
+    expect(world.calls.fire).toBe(1);
+  });
+
+  test('(b) cascade throws after dispatch -> unknown 409, WO held', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    const posts: string[] = [];
+    world.deps.fireCascade = async input => {
+      world.calls.fire += 1;
+      posts.push(`POST /api/conversations ${input.woId}`);
+      throw new Error('cascade died after dispatch');
+    };
+    await processCommand(world.deps, fireMsg('cmd-q11', 'Q11', 'WO-D'));
+    expect(posts).toHaveLength(1);
+    const row = await admissions.getByRequestId('Q11', db);
+    expect(row?.state).toBe('unknown');
+    expect(row?.effect_started_at).not.toBeNull();
+    expect(replyFor(world, 'cmd-q11')).toMatchObject({
+      status: 409,
+      code: 'admission_unknown',
+      message: 'unknown, adjudication required',
+    });
+    await processCommand(world.deps, fireMsg('cmd-q11b', 'Q11B', 'WO-D'));
+    expect(replyFor(world, 'cmd-q11b')).toMatchObject({
+      status: 409,
+      code: 'admission_unknown',
+      run_id: 'Q11',
+    });
+    expect(world.calls.fire).toBe(1);
+  });
+
+  test('(c) a retry during a held fire gets 202 pending; the original later gets its 200', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const baseFire = world.deps.fireCascade;
+    world.deps.fireCascade = async input => {
+      await gate;
+      return baseFire(input);
+    };
+    const original = processCommand(world.deps, fireMsg('cmd-q12', 'Q12', 'WO-E'));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await processCommand(world.deps, fireMsg('cmd-q12-retry', 'Q12', 'WO-E'));
+    expect(replyFor(world, 'cmd-q12-retry')).toMatchObject({ status: 202, code: 'pending' });
+    expect(world.acked).toContain('cmd-q12-retry');
+    release();
+    await original;
+    expect(replyFor(world, 'cmd-q12')).toMatchObject({ status: 200, code: 'ok' });
+    expect(world.calls.fire).toBe(1);
+  });
+
+  test('(d) stale reserved fire with no effect marker -> refused, replied once, acked, no cascade', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    await admissions.reserveAdmission(
+      {
+        request_id: 'Q13',
+        actor_principal_id: 't3-bridge',
+        verb: 'fire',
+        payload_sha256: 'd',
+        wo_id: 'WO-F',
+        project: 'bdc-harness',
+        source_message_id: 'cmd-q13',
+        now: T0,
+      },
+      db
+    );
+    world.deps.now = STALE_NOW;
+    await recoverStaleReservations(world.deps);
+    await recoverStaleReservations(world.deps); // idempotent: nothing left to sweep
+    expect((await admissions.getByRequestId('Q13', db))?.state).toBe('refused');
+    expect(world.replies.filter(r => r.idempotencyKey === 'reply:cmd-q13')).toHaveLength(1);
+    expect(replyFor(world, 'cmd-q13')).toMatchObject({
+      status: 503,
+      code: 'failed_before_effect',
+      error_class: 'RecoveredBeforeEffect',
+    });
+    expect(world.acked).toEqual(['cmd-q13']);
+    expect(world.calls.fire).toBe(0);
+  });
+});
+
+describe('Test 14: cancel-own -- before effect, after effect, pending, recovery', () => {
+  test('(a) ownership read throws -> refused 503, cancel not called, no run lock left', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    await seedAdmittedFire('t3-bridge', 'WO-A', 'R1', 'fire-R1');
+    const realDb = db;
+    world.deps.db = new Proxy(realDb, {
+      get(target, prop, receiver): unknown {
+        if (prop === 'query') {
+          return async (sql: string, params?: unknown[]): Promise<unknown> => {
+            if (sql.includes('actor_principal_id = $1 AND run_id = $2')) {
+              throw new TypeError('ownership read failed');
+            }
+            return target.query(sql, params as never);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as typeof realDb;
+    await processCommand(world.deps, cancelMsg('cmd-q20', 'Q20', 'R1'));
+    expect(world.calls.cancel).toBe(0);
+    expect((await admissions.getByRequestId('Q20', db))?.state).toBe('refused');
+    expect(replyFor(world, 'cmd-q20')).toMatchObject({
+      status: 503,
+      code: 'failed_before_effect',
+      error_class: 'TypeError',
+    });
+    expect(await admissions.findRunLockHolder('R1', undefined, db)).toBeNull();
+  });
+
+  test('(b) cancel throws after being called -> unknown, run lock held for cancel and approve', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    setupApprovableP1(world);
+    await seedAdmittedFire('t3-bridge', 'WO-A', 'R1', 'fire-R1');
+    world.deps.cancelRun = async () => {
+      world.calls.cancel += 1;
+      throw new Error('cancel died midway');
+    };
+    await processCommand(world.deps, cancelMsg('cmd-q21', 'Q21', 'R1'));
+    expect(world.calls.cancel).toBe(1);
+    expect((await admissions.getByRequestId('Q21', db))?.state).toBe('unknown');
+    expect(replyFor(world, 'cmd-q21')).toMatchObject({ status: 409, code: 'admission_unknown' });
+
+    await processCommand(world.deps, cancelMsg('cmd-q21b', 'Q21B', 'R1'));
+    expect(replyFor(world, 'cmd-q21b')).toMatchObject({
+      status: 409,
+      code: 'admission_unknown',
+      run_id: 'Q21',
+    });
+    await processCommand(world.deps, approveMsg('cmd-q21c', 'Q21C', 'R1'));
+    expect(replyFor(world, 'cmd-q21c')).toMatchObject({
+      status: 409,
+      code: 'admission_unknown',
+      run_id: 'Q21',
+    });
+    expect(world.calls.cancel).toBe(1);
+    expect(world.calls.approve).toBe(0);
+  });
+
+  test('(c) a retry during a held cancel gets 202 pending', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    await seedAdmittedFire('t3-bridge', 'WO-A', 'R1', 'fire-R1');
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    world.deps.cancelRun = async () => {
+      world.calls.cancel += 1;
+      await gate;
+      return { ok: true, run: {} } as never;
+    };
+    const original = processCommand(world.deps, cancelMsg('cmd-q22', 'Q22', 'R1'));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await processCommand(world.deps, cancelMsg('cmd-q22-retry', 'Q22', 'R1'));
+    expect(replyFor(world, 'cmd-q22-retry')).toMatchObject({ status: 202, code: 'pending' });
+    release();
+    await original;
+    expect(replyFor(world, 'cmd-q22')).toMatchObject({ status: 200, code: 'ok' });
+    expect(world.calls.cancel).toBe(1);
+  });
+
+  test('(d) stale cancel with effect marker, run proven cancelled by the actor -> admitted', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    await admissions.reserveAdmission(
+      {
+        request_id: 'Q23',
+        actor_principal_id: 't3-bridge',
+        verb: 'cancel-own',
+        payload_sha256: 'd',
+        project: 'bdc-harness',
+        target_run_id: 'R1',
+        source_message_id: 'cmd-q23',
+        now: T0,
+      },
+      db
+    );
+    await admissions.markEffectStarted('Q23', T0, db);
+    world.cancelledBy.set('R1', 't3-bridge');
+    world.deps.now = STALE_NOW;
+    await recoverStaleReservations(world.deps);
+    const row = await admissions.getByRequestId('Q23', db);
+    expect(row).toMatchObject({ state: 'admitted', code: 'ok', run_id: 'R1' });
+    expect(world.replies.filter(r => r.idempotencyKey === 'reply:cmd-q23')).toHaveLength(1);
+    expect(world.acked).toEqual(['cmd-q23']);
+    expect(world.calls.cancel).toBe(0);
+  });
+});
+
+describe('Test 15: approve -- before effect, after effect, pending, recovery', () => {
+  test('(a) GitHub PR read throws -> refused 503 with the client error class, acked', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    setupApprovableP1(world);
+    await seedAdmittedFire('t3-bridge', 'WO-P1', 'P1', 'fire-P1');
+    world.deps.getPullRequest = async () => {
+      throw new GitHubRequestError('HTTP 502 from api.github.com');
+    };
+    await processCommand(world.deps, approveMsg('cmd-q30', 'Q30', 'P1'));
+    expect(world.calls.approve).toBe(0);
+    expect((await admissions.getByRequestId('Q30', db))?.state).toBe('refused');
+    const reply = replyFor(world, 'cmd-q30');
+    expect(reply).toMatchObject({
+      status: 503,
+      code: 'failed_before_effect',
+      error_class: 'GitHubRequestError',
+    });
+    expect(JSON.stringify(reply)).not.toContain('api.github.com');
+    expect(world.acked).toContain('cmd-q30');
+    expect(await admissions.findRunLockHolder('P1', undefined, db)).toBeNull();
+  });
+
+  test('(b) approve throws after writing approval_received -> unknown, run lock held', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    setupApprovableP1(world);
+    await seedAdmittedFire('t3-bridge', 'WO-P1', 'P1', 'fire-P1');
+    world.deps.approveRun = async () => {
+      world.calls.approve += 1;
+      world.approvedRuns.add('P1'); // the approval_received event was written
+      throw new Error('resume dispatch crashed');
+    };
+    await processCommand(world.deps, approveMsg('cmd-q31', 'Q31', 'P1'));
+    expect((await admissions.getByRequestId('Q31', db))?.state).toBe('unknown');
+    expect(replyFor(world, 'cmd-q31')).toMatchObject({ status: 409, code: 'admission_unknown' });
+    const holder = await admissions.findRunLockHolder('P1', undefined, db);
+    expect(holder?.request_id).toBe('Q31');
+    await processCommand(world.deps, approveMsg('cmd-q31b', 'Q31B', 'P1'));
+    expect(replyFor(world, 'cmd-q31b')).toMatchObject({ status: 409, code: 'admission_unknown' });
+    expect(world.calls.approve).toBe(1);
+  });
+
+  test('(c) a retry during a held approve gets 202 pending', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    setupApprovableP1(world);
+    await seedAdmittedFire('t3-bridge', 'WO-P1', 'P1', 'fire-P1');
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    world.deps.approveRun = async () => {
+      world.calls.approve += 1;
+      await gate;
+      return { ok: true, kind: 'approved', workflowName: 'wf', autoResumed: true };
+    };
+    const original = processCommand(world.deps, approveMsg('cmd-q32', 'Q32', 'P1'));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await processCommand(world.deps, approveMsg('cmd-q32-retry', 'Q32', 'P1'));
+    expect(replyFor(world, 'cmd-q32-retry')).toMatchObject({ status: 202, code: 'pending' });
+    release();
+    await original;
+    expect(replyFor(world, 'cmd-q32')).toMatchObject({ status: 200, code: 'approved' });
+    expect(world.calls.approve).toBe(1);
+  });
+
+  test('(d) stale approve with effect marker and no approval event -> unknown, replied once', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    await admissions.reserveAdmission(
+      {
+        request_id: 'Q33',
+        actor_principal_id: 't3-bridge',
+        verb: 'approve',
+        payload_sha256: 'd',
+        project: 'bdc-harness',
+        target_run_id: 'P1',
+        source_message_id: 'cmd-q33',
+        now: T0,
+      },
+      db
+    );
+    await admissions.markEffectStarted('Q33', T0, db);
+    world.deps.now = STALE_NOW;
+    await recoverStaleReservations(world.deps);
+    expect((await admissions.getByRequestId('Q33', db))?.state).toBe('unknown');
+    expect(world.replies.filter(r => r.idempotencyKey === 'reply:cmd-q33')).toHaveLength(1);
+    expect(replyFor(world, 'cmd-q33')).toMatchObject({ status: 409, code: 'admission_unknown' });
+    expect(world.acked).toEqual(['cmd-q33']);
+    expect(world.calls.approve).toBe(0);
+  });
+});
+
+describe('Test 16: stranded commands cannot starve the page', () => {
+  test('60 rows that throw before effect are all answered; a valid fire is then admitted', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    world.deps.checkFireEligibility = async woId => {
+      if (woId.startsWith('WO-BAD-')) throw new GitHubRequestError('issue read failed');
+      return { eligible: true };
+    };
+    for (let i = 1; i <= 60; i += 1) {
+      world.queue.push(fireMsg(`cmd-bad-${i}`, `BAD-${i}`, `WO-BAD-${i}`));
+    }
+    for (let guard = 0; guard < 10; guard += 1) {
+      const before = world.acked.length;
+      await tickCauldronFireConsumer(world.deps);
+      if (world.acked.length === before) break;
+    }
+    expect(world.acked).toHaveLength(60);
+    for (let i = 1; i <= 60; i += 1) {
+      expect(replyFor(world, `cmd-bad-${i}`)).toMatchObject({
+        status: 503,
+        code: 'failed_before_effect',
+      });
+    }
+    world.queue.push(fireMsg('cmd-good', 'GOOD', 'WO-GOOD'));
+    await tickCauldronFireConsumer(world.deps);
+    expect(replyFor(world, 'cmd-good')).toMatchObject({ status: 200, code: 'ok' });
+    expect((await admissions.getByRequestId('GOOD', db))?.state).toBe('admitted');
   });
 });

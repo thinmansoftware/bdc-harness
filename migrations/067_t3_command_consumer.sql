@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS t3_command_admissions (
   cascade_id TEXT,
   run_id TEXT,
   reply_message_id TEXT,
+  -- Set in its own committed write immediately BEFORE the verb's side effect
+  -- (Amendment 2 A2.2): null = failed before effects, set = effect possible.
+  effect_started_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -43,6 +46,13 @@ DROP INDEX IF EXISTS idx_t3_command_admissions_live_fire;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
   ON t3_command_admissions (wo_id)
   WHERE verb = 'fire' AND state IN ('reserved', 'unknown');
+
+-- Run lock (Amendment 2 A2.2 rule 2): at most one unresolved cancel-own /
+-- approve per target run. An `unknown` cancel/approve holds it until an
+-- operator adjudicates.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_run_lock
+  ON t3_command_admissions (target_run_id)
+  WHERE verb IN ('cancel-own', 'approve') AND state IN ('reserved', 'unknown');
 
 -- Recipient principal for the consumer (drains the command mailbox and sends
 -- replies) and the T3 VPS bridge sender. Shape copied from migration 065.

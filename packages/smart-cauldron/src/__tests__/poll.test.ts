@@ -137,3 +137,52 @@ describe('pollForTerminal transport truth', () => {
     ).rejects.toBeInstanceOf(PollTransportError);
   });
 });
+
+describe('pollForTerminal isTransitionalStatus hook (T3 consumer approve hand-off)', () => {
+  const approvalHandOff = {
+    run: { id: 'run-gate', status: 'failed', metadata: {} },
+    events: [{ event_type: 'approval_received', step_name: 'gate', data: {} }],
+  };
+  const resumedAndDone = {
+    run: { id: 'run-gate', status: 'completed', metadata: {} },
+    events: [
+      { event_type: 'approval_received', step_name: 'gate', data: {} },
+      { event_type: 'node_completed', step_name: 'after-gate', data: {} },
+    ],
+  };
+  function sequence(): typeof fetch {
+    let calls = 0;
+    return (async () => {
+      calls += 1;
+      return Response.json(calls === 1 ? approvalHandOff : resumedAndDone);
+    }) as unknown as typeof fetch;
+  }
+  const base = {
+    runId: 'run-gate',
+    apiBaseUrl: 'http://archon.in-process',
+    timeoutMs: 60_000,
+    intervalMs: 1,
+    prRetryAttempts: 0,
+    prRetryDelayMs: 1,
+    prBranchLookupAttempts: 0,
+    prBranchLookupDelayMs: 1,
+    ghPrListForBranch: async (): Promise<string | null> => null,
+    checkPrMergeable: async (): Promise<boolean | null> => null,
+  };
+
+  test('with the hook, the approval hand-off failed is not terminal; polling continues', async () => {
+    const result = await pollForTerminal({
+      ...base,
+      fetchImpl: sequence(),
+      isTransitionalStatus: detail =>
+        detail.run.status === 'failed' &&
+        (detail.events ?? []).at(-1)?.event_type === 'approval_received',
+    });
+    expect(result.terminalStatus).toBe('completed');
+  });
+
+  test('without the hook (every existing caller), failed stays terminal', async () => {
+    const result = await pollForTerminal({ ...base, fetchImpl: sequence() });
+    expect(result.terminalStatus).toBe('failed');
+  });
+});

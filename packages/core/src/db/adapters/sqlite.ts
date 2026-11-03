@@ -2753,6 +2753,7 @@ export class SqliteAdapter implements IDatabase {
         cascade_id TEXT,
         run_id TEXT,
         reply_message_id TEXT,
+        effect_started_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -2761,6 +2762,10 @@ export class SqliteAdapter implements IDatabase {
       DROP INDEX IF EXISTS idx_t3_command_admissions_live_fire;
       CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
         ON t3_command_admissions(wo_id) WHERE verb = 'fire' AND state IN ('reserved', 'unknown');
+      -- Run lock: one unresolved cancel-own / approve per target run (migration 067).
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_run_lock
+        ON t3_command_admissions(target_run_id)
+        WHERE verb IN ('cancel-own', 'approve') AND state IN ('reserved', 'unknown');
 
       -- Per-service GitHub API usage and latest quota state (migration 062).
       CREATE TABLE IF NOT EXISTS github_api_usage (

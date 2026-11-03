@@ -36,6 +36,8 @@ export interface T3CommandAdmissionRow {
   cascade_id: string | null;
   run_id: string | null;
   reply_message_id: string | null;
+  /** Set immediately before the verb's side effect; null = nothing executed. */
+  effect_started_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -58,7 +60,8 @@ export interface ReserveAdmissionInput {
 export type ReserveAdmissionResult =
   | { status: 'reserved'; row: T3CommandAdmissionRow }
   | { status: 'exists'; row: T3CommandAdmissionRow }
-  | { status: 'wo_fire_locked' };
+  | { status: 'wo_fire_locked' }
+  | { status: 'run_locked' };
 
 function isUniqueViolation(error: unknown): boolean {
   const code = (error as { code?: unknown }).code;
@@ -116,8 +119,9 @@ export async function reserveAdmission(
     if (!isUniqueViolation(error)) throw error;
     const existing = await getByRequestId(input.request_id, db);
     if (existing) return { status: 'exists', row: existing };
-    // request_id did not exist -> the violated constraint was the fire lock.
-    return { status: 'wo_fire_locked' };
+    // request_id did not exist -> the violated constraint was a lock index:
+    // the WO fire lock for a fire, the run lock for cancel-own / approve.
+    return input.verb === 'fire' ? { status: 'wo_fire_locked' } : { status: 'run_locked' };
   }
   const row = await getByRequestId(input.request_id, db);
   if (!row) throw new Error('t3_admission_reserve_readback_missing');
@@ -393,6 +397,99 @@ export async function adjudicateUnknownFire(
              SET state = 'refused', status_code = 409, code = $2, updated_at = $3
            WHERE request_id = $1 AND verb = 'fire' AND state = 'unknown'`,
           [requestId, `adjudicated_no_run:${adjudicatedBy}`, decision.now]
+        );
+  const row = await getByRequestId(requestId, db);
+  if (!row) return { status: 'not_found' };
+  if (result.rowCount === 0) return { status: 'not_unknown', row };
+  return { status: 'adjudicated', row };
+}
+
+/**
+ * Durable effect marker (Amendment 2 A2.2): written in its own committed write
+ * immediately BEFORE a verb's side effect. A reservation with this unset failed
+ * before any effect; with it set, the effect may have happened.
+ */
+export async function markEffectStarted(
+  requestId: string,
+  now: string,
+  db: IDatabase = getDatabase()
+): Promise<void> {
+  await db.query(
+    `UPDATE t3_command_admissions SET effect_started_at = $2, updated_at = $2
+     WHERE request_id = $1 AND state = 'reserved'`,
+    [requestId, now]
+  );
+}
+
+/**
+ * The unresolved (reserved or unknown) cancel-own / approve holding the run
+ * lock for `runId`, excluding the caller's own request.
+ */
+export async function findRunLockHolder(
+  runId: string,
+  excludeRequestId?: string,
+  db: IDatabase = getDatabase()
+): Promise<T3CommandAdmissionRow | null> {
+  const result = await db.query<T3CommandAdmissionRow>(
+    `SELECT * FROM t3_command_admissions
+     WHERE verb IN ('cancel-own', 'approve') AND target_run_id = $1
+       AND state IN ('reserved', 'unknown')
+       AND ($2 = '' OR request_id <> $2)
+     ORDER BY created_at ASC
+     LIMIT 1`,
+    [runId, excludeRequestId ?? '']
+  );
+  return result.rows[0] ?? null;
+}
+
+/** Reservations (any verb) not updated since `olderThan` (ISO): recovery candidates. */
+export async function listStaleReservations(
+  olderThan: string,
+  db: IDatabase = getDatabase()
+): Promise<T3CommandAdmissionRow[]> {
+  const result = await db.query<T3CommandAdmissionRow>(
+    `SELECT * FROM t3_command_admissions
+     WHERE state = 'reserved' AND updated_at < $1
+     ORDER BY created_at ASC`,
+    [olderThan]
+  );
+  return [...result.rows];
+}
+
+export type RunCommandAdjudication =
+  | { resolution: 'no_effect'; adjudicated_by: string; now: string }
+  | { resolution: 'effect_applied'; adjudicated_by: string; now: string };
+
+/**
+ * Operator adjudication of an `unknown` cancel-own / approve -- the only path
+ * that releases the run lock it holds (runbook "Adjudicating an unknown
+ * admission"). no_effect -> `refused` 409 `adjudicated_no_effect:<who>`;
+ * effect_applied -> `admitted` 200 (`ok` for cancel-own, `approved_not_resumed`
+ * for approve: an adjudicated approval never claims the resume was dispatched).
+ * Compare-and-set on state = 'unknown'.
+ */
+export async function adjudicateUnknownRunCommand(
+  requestId: string,
+  decision: RunCommandAdjudication,
+  db: IDatabase = getDatabase()
+): Promise<AdjudicateUnknownFireResult> {
+  const adjudicatedBy = decision.adjudicated_by.trim();
+  if (!adjudicatedBy) throw new Error('t3_adjudicated_by_required');
+  const result =
+    decision.resolution === 'effect_applied'
+      ? await db.query(
+          `UPDATE t3_command_admissions
+             SET state = 'admitted', status_code = 200,
+                 code = CASE WHEN verb = 'approve' THEN 'approved_not_resumed' ELSE 'ok' END,
+                 run_id = COALESCE(run_id, target_run_id), updated_at = $2
+           WHERE request_id = $1 AND verb IN ('cancel-own', 'approve') AND state = 'unknown'`,
+          [requestId, decision.now]
+        )
+      : await db.query(
+          `UPDATE t3_command_admissions
+             SET state = 'refused', status_code = 409, code = $2, updated_at = $3
+           WHERE request_id = $1 AND verb IN ('cancel-own', 'approve') AND state = 'unknown'`,
+          [requestId, `adjudicated_no_effect:${adjudicatedBy}`, decision.now]
         );
   const row = await getByRequestId(requestId, db);
   if (!row) return { status: 'not_found' };

@@ -21,6 +21,7 @@ the t3-bridge principal, and sets the allowlists (all below, all John's go).
 | `T3_COMMAND_ACTORS` | unset | Comma list of principal ids allowed to send commands. Unset or empty = every actor refused 403 `actor_not_allowed`. |
 | `T3_COMMAND_PROJECTS` | unset | Comma list of allowed project (codebase) names. Unset = every command refused 403 `project_not_allowed`. A project must also be a registered codebase. |
 | `T3_COMMAND_APPROVE_BASES` | unset | Comma list of allowed PR bases as `owner/repo:branch`. Unset = every approve refused 403 `base_not_allowed`. NEVER list a production base (M-09). |
+| `T3_COMMAND_RESERVATION_STALE_S` | `300` | A `reserved` admission not updated for this many seconds, and not held by a handler in this process, is recovered at the start of the next tick (all verbs). |
 
 ## Command and reply contract
 
@@ -71,11 +72,20 @@ Reply (one Dispatch `agent_message`):
         | "base_not_allowed" | "stale_head" | "admission_unknown" | ...,
   "run_id": "... | null",
   "cascade_id": "... | null",
-  "thread_id": "... | null"
+  "thread_id": "... | null",
+  "error_class": "<error class name>",   // 503 failed_before_effect only
+  "message": "unknown, adjudication required" // 409 admission_unknown only
 }
 ```
 
-Status codes: 200 ok, 400 invalid, 403 forbidden, 409 conflict, 422 stale_head.
+Status codes: 200 ok, 202 pending, 400 invalid, 403 forbidden, 409 conflict,
+422 stale_head, 503 failed_before_effect.
+
+Approve success codes: `approved` (the approval was recorded AND the run's
+resume was dispatched) or `approved_not_resumed` (recorded, but the resume was
+not dispatched -- missing conversation, non-web parent or missing workflow).
+`approved_not_resumed` is an OPERATOR FOLLOW-UP: the run sits in the approval
+hand-off state until someone re-runs it from the dashboard.
 
 ## Decision rules (summary)
 
@@ -85,17 +95,47 @@ Status codes: 200 ok, 400 invalid, 403 forbidden, 409 conflict, 422 stale_head.
   and its reply unchanged.
 - fire: refused 409 `live_run` when any `remote_agent_workflow_runs` row in
   status pending/running/paused names the exact WO id (token match), or another
-  fire admission for the WO is unresolved (`reserved`, or `unknown` awaiting
-  adjudication -- that refusal carries the ORIGINAL admission's request_id in
-  `run_id`, the key to adjudicate). Otherwise runs the cascade (runCascade)
+  fire admission for the WO is `reserved`. While a fire for the WO is `unknown`
+  (awaiting adjudication) a new fire is refused 409 `admission_unknown`
+  carrying the ORIGINAL admission's request_id in `run_id`, the key to
+  adjudicate. Otherwise runs the cascade (runCascade)
   in-process (see "In-process execution" below): no HTTP self-call, no
   operator token header.
 - cancel-own: allowed only when the actor fired that run through this consumer.
 - approve: every binding is derived server-side (ownership, run repo = project
   repo = PR repo, same-repo head ref = run branch, base allowlisted, PR current
   head = stated `head_sha`). Production bases are never allowlisted.
-- Crash safety: a fire left `reserved` at startup is marked `unknown`, replied
-  409 `admission_unknown`, and is NEVER refired automatically.
+- Approve contract (Amendment 2 A2.1): the consumer approves through exactly
+  the pair the HTTP approve route uses -- `approvePausedWorkflowRun` followed by
+  `tryAutoResumeRun(run, 'approve')` (hoisted to module level in
+  packages/server/src/routes/api.ts; consumer wrapper `approveRunWithResume`).
+  The run row passes through `failed` (the approval's hand-off) and the
+  executor's resume continues it. The background cascade for a consumer fire is
+  given `isApprovalHandOff` so that hand-off `failed` (latest decisive event
+  `approval_received`, no later `*_failed` event) is not read as terminal.
+- Outcome states (Amendment 2 A2.2), for fire, cancel-own and approve alike:
+  `reserved -> admitted | refused | unknown`. `effect_started_at` is written in
+  its own commit immediately BEFORE the side effect (fire: the cascade
+  dispatch; cancel-own: the cancel call; approve: the approve call).
+  - Exception with no effect marker -> `refused`, 503 `failed_before_effect`
+    with `error_class`; the lock is released; resend with a NEW request_id.
+  - Exception with the effect marker set -> `unknown`, 409 `admission_unknown`;
+    the lock is HELD until adjudication: the WO fire lock for a fire, the RUN
+    LOCK (`idx_t3_command_admissions_run_lock`, one unresolved cancel-own /
+    approve per `target_run_id`) for cancel-own and approve. A new command
+    against a held lock is refused 409 `admission_unknown` with the holding
+    request_id in `run_id` (or 409 `command_in_flight` while the holder is
+    still `reserved`).
+  - A retry row whose request_id is still `reserved` gets 202 `pending` and is
+    acknowledged; the final outcome is on the original row's reply, or on a
+    later retry once the reservation resolves.
+- Recovery (all verbs, start of every tick, so also at startup): a stale
+  `reserved` row with no effect marker -> `refused` 503 `failed_before_effect`
+  (`error_class` `RecoveredBeforeEffect`); with the marker and a provable
+  outcome -> `admitted` (fire: run custody; cancel-own: run cancelled with this
+  actor on its `run_cancelled` event; approve: `approval_received` after the
+  marker, code `approved_not_resumed`); otherwise -> `unknown`. Recovery replies
+  as `reply:<source_message_id>`, acknowledges, and never re-executes a verb.
 - Unprovable fire (in-flight): if the cascade throws, returns no run id, or its
   admitted outcome fails to persist, the admission is reconciled to `unknown` and
   replied 409 `admission_unknown` -- never a 5xx, since the status set above is
@@ -145,6 +185,22 @@ docker exec -w /app archon-app-1 bun -e "const a = await import('@archon/core/db
 Result `status`: `adjudicated`, `not_found`, or `not_unknown` (the row was not
 `unknown`; nothing changed). Adjudication is a compare-and-set and never
 deletes the row.
+
+## Adjudicating an unknown cancel-own / approve (operator)
+
+An `unknown` cancel-own or approve holds its run lock until adjudicated. Read
+the run's events first (`run_cancelled` with this actor; `approval_received`
+after the row's `effect_started_at`), then inside archon-app-1:
+
+```
+docker exec -w /app archon-app-1 bun -e "const a = await import('@archon/core/db/t3-command-admissions'); console.log(JSON.stringify(await a.adjudicateUnknownRunCommand('<request_id>', { resolution: 'no_effect', adjudicated_by: '<who>', now: new Date().toISOString() })))"
+```
+
+- `resolution: 'no_effect'` -> `refused`, code `adjudicated_no_effect:<who>`.
+- `resolution: 'effect_applied'` -> `admitted` 200 (`ok` for cancel-own;
+  `approved_not_resumed` for approve -- follow up on the run's resume).
+
+Either releases the run lock. Same result statuses as the fire adjudication.
 
 ## Principal issuance (operator, John's go)
 

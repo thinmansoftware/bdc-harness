@@ -52,7 +52,7 @@ export class PollTransportError extends Error {
   }
 }
 
-interface RunApiResponse {
+export interface RunApiResponse {
   run: {
     id: string;
     status: string;
@@ -68,6 +68,9 @@ interface RunApiResponse {
   }[];
 }
 
+/** The run detail poll reads (GET /api/workflows/runs/:id). */
+export type PollRunDetail = RunApiResponse;
+
 interface PollOptions {
   runId: string;
   apiBaseUrl: string;
@@ -79,6 +82,14 @@ interface PollOptions {
    * dispatcher here so no network self-call is made.
    */
   fetchImpl?: typeof fetch;
+  /**
+   * Optional: returns true when a status that is normally terminal is a
+   * TRANSITIONAL hand-off for this run (for example the `failed` an approval
+   * writes just before its resume), so polling continues inside its existing
+   * budget instead of reporting a terminal result. Absent = every terminal
+   * status is terminal (the behavior of every existing caller).
+   */
+  isTransitionalStatus?: (detail: PollRunDetail) => boolean;
   /**
    * HARD CEILING on total run duration (ms). Default: 14400000 (4 hours).
    *
@@ -239,7 +250,10 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
       lastActivityAt = Date.now();
     }
 
-    if (TERMINAL_STATUSES.has(detail.run.status)) {
+    if (
+      TERMINAL_STATUSES.has(detail.run.status) &&
+      !(opts.isTransitionalStatus?.(detail) ?? false)
+    ) {
       const terminalStatus = detail.run.status as
         | 'completed'
         | 'failed'

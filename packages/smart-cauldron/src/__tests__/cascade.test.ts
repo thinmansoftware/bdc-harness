@@ -255,6 +255,39 @@ describe('auth/project binding guards', () => {
   });
 });
 
+describe('T3 consumer hooks', () => {
+  test('passes isTransitionalStatus to poll and reports onRunDiscovered before polling', async () => {
+    const order: string[] = [];
+    const isTransitionalStatus = (): boolean => false;
+    let seenHook: unknown = null;
+    const deps: CascadeDeps = {
+      fire: async () => makeFireOk('run-hook'),
+      poll: async opts => {
+        order.push('poll');
+        seenHook = opts.isTransitionalStatus;
+        return makePollResult();
+      },
+      judge: _poll => makePassVerdict(),
+      escalate: async _ctx => {
+        /* no-op */
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+    await runCascade(
+      baseOpts({
+        deps,
+        isTransitionalStatus,
+        onRunDiscovered: runId => {
+          order.push(`discovered:${runId}`);
+        },
+      })
+    );
+    expect(seenHook).toBe(isTransitionalStatus);
+    expect(order[0]).toBe('discovered:run-hook');
+    expect(order).toContain('poll');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Test 2: CLIMB-ON-GATE-FAIL
 // ---------------------------------------------------------------------------
