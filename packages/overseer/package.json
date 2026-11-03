@@ -7,6 +7,7 @@
   "types": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
+    "./wo-token": "./src/wo-token.ts",
     "./classify": "./src/classify.ts",
     "./decide": "./src/decide.ts",
     "./watch": "./src/watch.ts",

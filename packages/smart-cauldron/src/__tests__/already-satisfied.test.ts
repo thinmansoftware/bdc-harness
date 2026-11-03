@@ -5,6 +5,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   findWoClaim,
+  listOpenWoPullRequests,
   resolveGithubRepo,
   textClaimsWoId,
   type WoClaim,
@@ -129,5 +130,62 @@ describe('findWoClaim', () => {
       lookup: async () => [],
     });
     expect(claim).toBeNull();
+  });
+});
+
+describe('open WO repair selection', () => {
+  test('excludes drafts from repair targets and SHA evidence', async () => {
+    const row = {
+      number: 1,
+      body: 'WO: WO-FOO-01',
+      head: {
+        ref: 'fix/wo-foo-01',
+        sha: 'a'.repeat(40),
+        repo: { full_name: 'thinmansoftware/bdc-harness' },
+      },
+    };
+    const prs = await listOpenWoPullRequests({
+      woId: 'WO-FOO-01',
+      project: 'bdc-harness',
+      lookup: async () => [
+        { ...row, draft: true },
+        { ...row, number: 2, draft: false },
+      ],
+    });
+    expect(prs.map(pr => pr.number)).toEqual([2]);
+  });
+
+  test('overlapping_wo_ids_do_not_match', async () => {
+    const rows = [
+      ['wo-foo-010', 'wo-foo-010-thread-abc'],
+      ['wo-foo-01', 'wo-foo-01-thread-def'],
+      ['WO-OTHER-01', 'WO-FOO-01'],
+      ['WO-FOO-01A', 'wo-foo-01a'],
+      ['OTHER', 'prefixwo-foo-01'],
+      ['WO-FOO-01-EXTRA', 'wo-foo-01-extra'],
+      ['WO-FOO-01-EXTRA', 'wo-foo-01-extra-thread-abc'],
+      ['WO-FOO-01-02', 'wo-foo-01-02-thread-abc'],
+    ].map(([id, branch], index) => ({
+      number: index + 1,
+      body: `WO: ${id}`,
+      head: { ref: `fix/${branch}`, repo: { full_name: 'thinmansoftware/bdc-harness' } },
+    }));
+    const prs = await listOpenWoPullRequests({
+      woId: 'WO-FOO-01',
+      project: 'bdc-harness',
+      lookup: async () => rows,
+    });
+    expect(prs.map(pr => pr.number)).toEqual([2, 3]);
+    // Exercise branch matching independently of a matching body declaration:
+    // fix/wo-foo-01-thread-def and fix/WO-FOO-01 match; wo-foo-010 never does.
+    const branchOnly = await listOpenWoPullRequests({
+      woId: 'wo-foo-01',
+      project: 'bdc-harness',
+      lookup: async () => rows.map(row => ({ ...row, body: 'WO: WO-OTHER-01' })),
+    });
+    expect(branchOnly.map(pr => pr.number)).toEqual([2, 3]);
+    expect(textClaimsWoId('fix/wo-foo-010-thread-abc', 'WO-FOO-01')).toBe(false);
+    expect(textClaimsWoId('fix/wo-foo-01-thread-def', 'WO-FOO-01')).toBe(true);
+    expect(textClaimsWoId('WO: WO-FOO-01-02', 'WO-FOO-01')).toBe(false);
   });
 });

@@ -40,7 +40,13 @@ import { createRecord, writeRecord } from './recorder.js';
 export { readCascadeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
 import { cancelRun } from './cancel.js';
-import { findWoClaim, resolveGithubRepo, type WoClaim } from './already-satisfied.js';
+import {
+  findWoClaim,
+  listOpenWoPullRequests,
+  resolveGithubRepo,
+  type OpenWoPullRequest,
+  type WoClaim,
+} from './already-satisfied.js';
 import { acquireWoLock, releaseWoLock } from './wo-lock.js';
 import { classifyError, type ErrorClass } from '@archon/overseer/classify';
 import { runAuthorizedEscalation } from '@archon/overseer/authorized-escalation';
@@ -96,6 +102,11 @@ export interface CascadeDeps {
    * merged PR that already owns this WO, or null when none / unknown.
    */
   findWoClaim?: (woId: string, project: string) => Promise<WoClaim | null>;
+  /**
+   * OPEN non-fork PRs that claim this WO. Used to declare a repair target on a
+   * climb fire. Defaults to listOpenWoPullRequests (fails open to []).
+   */
+  listOpenWoPullRequests?: (woId: string, project: string) => Promise<OpenWoPullRequest[]>;
   /** Exclusive active-cascade lock per woId+project. */
   acquireWoLock?: typeof acquireWoLock;
   releaseWoLock?: typeof releaseWoLock;
@@ -563,6 +574,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     opts.deps?.findWoClaim ??
     ((id: string, proj: string): Promise<WoClaim | null> =>
       findWoClaim({ woId: id, project: proj }));
+  const listOpenWoPullRequestsImpl =
+    opts.deps?.listOpenWoPullRequests ??
+    ((id: string, proj: string): Promise<OpenWoPullRequest[]> =>
+      listOpenWoPullRequests({ woId: id, project: proj }));
   const acquireWoLockImpl = opts.deps?.acquireWoLock ?? acquireWoLock;
   const releaseWoLockImpl = opts.deps?.releaseWoLock ?? releaseWoLock;
   const readRunDetailImpl =
@@ -910,6 +925,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     let refusalReason: CascadeRunRecord['refusalReason'];
     let gateMisfireRecord: CascadeRunRecord['gateMisfire'];
     let blockedReason: CascadeRunRecord['blockedReason'];
+    let repairTargetAlternates: CascadeRunRecord['repairTargetAlternates'];
     let priorPollSnapshot: PriorRunDetail | null = null;
     let currentPollSnapshot: PriorRunDetail | null = null;
     let automaticPreflightTier: string | null = null;
@@ -946,6 +962,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(gateMisfireRecord ? { gateMisfire: gateMisfireRecord } : {}),
         ...(blockedReason ? { blockedReason } : {}),
         ...(entrySelection ? { entrySelection } : {}),
+        ...(repairTargetAlternates ? { repairTargetAlternates } : {}),
       };
     }
 
@@ -1287,10 +1304,15 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       );
 
       // Re-check claim before each provider fire (another cascade or human may
-      // have landed a PR while we were climbing).
+      // have landed a PR while we were climbing). The first attempt still
+      // refuses OPEN and MERGED. A climb refuses only MERGED: an OPEN PR is
+      // the repair target, not a reason to stop.
       if (!allowClaimed) {
         const claimBeforeFire = await findWoClaimImpl(woId, project);
-        if (claimBeforeFire) {
+        const climbing = attempts.length > 1;
+        const refuseClaim =
+          claimBeforeFire !== null && (!climbing || claimBeforeFire.state === 'MERGED');
+        if (claimBeforeFire && refuseClaim) {
           console.log(
             `[smart-cauldron] ALREADY SATISFIED before tier=${tier.name}: PR #${claimBeforeFire.number} ` +
               `[${claimBeforeFire.state}] ${claimBeforeFire.url} -- stopping cascade (refused, not won)`
@@ -1346,12 +1368,19 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         }
       }
 
-      // Fire the WO on this tier
+      // Fire the WO on this tier. A climb (attempts already include this one)
+      // appends a repair-target line when exactly one declaration is selected.
+      let message = buildFireMessage(woId, project, priorContext ?? undefined, opts.expectedSpec);
+      if (attempts.length > 1) {
+        const decision = await resolveClimbRepairTarget(woId, project, listOpenWoPullRequestsImpl);
+        repairTargetAlternates = decision.alternates;
+        if (decision.declaration) message = `${message}\n${decision.declaration}`;
+      }
       const fireResult: FireResult = await fireImpl({
         workflowName: tier.workflowName,
         woId,
         project,
-        message: buildFireMessage(woId, project, priorContext ?? undefined, opts.expectedSpec),
+        message,
         apiBaseUrl,
         token,
         ...(fetchImpl ? { fetchImpl } : {}),
@@ -1458,6 +1487,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           intervalMs: pollIntervalMs,
           nodeTimeoutsMs,
           repo: resolveGithubRepo(project),
+          woId,
         });
       } catch (pollErr) {
         if (pollErr instanceof TimeoutError) {
@@ -1719,9 +1749,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
       // Before climbing, re-check whether the work already landed under another
       // branch/PR the per-run event feed missed (the classic 5-tier burn).
+      // MERGED still stops the climb. OPEN does not: the climb repairs that PR.
       if (!allowClaimed) {
         const claimBeforeClimb = await findWoClaimImpl(woId, project);
-        if (claimBeforeClimb) {
+        if (claimBeforeClimb?.state === 'MERGED') {
           console.log(
             `[smart-cauldron] ALREADY SATISFIED after gate-fail on tier=${tier.name}: ` +
               `PR #${claimBeforeClimb.number} [${claimBeforeClimb.state}] ${claimBeforeClimb.url} ` +
@@ -1764,6 +1795,80 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Formats `Repair target: PR #<number> (branch <branch>)`.
+ * Caller validates the number and branch before calling.
+ */
+export const REPAIR_TARGET_DECLARATION = (prNumber: number, branch: string): string =>
+  `Repair target: PR #${String(prNumber)} (branch ${branch})`;
+
+interface ClimbRepairDecision {
+  readonly declaration: string | null;
+  readonly alternates: CascadeRunRecord['repairTargetAlternates'];
+}
+
+function isValidRepairCandidate(pr: OpenWoPullRequest): boolean {
+  return (
+    Number.isInteger(pr.number) &&
+    pr.number > 0 &&
+    pr.headRefName.length > 0 &&
+    !/\s/.test(pr.headRefName)
+  );
+}
+
+/** Newest createdAt first, then higher PR number. */
+function compareOpenPrNewest(a: OpenWoPullRequest, b: OpenWoPullRequest): number {
+  if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+  return b.number - a.number;
+}
+
+function logClimbRepairTarget(woId: string, pr: number | 'none', reason: string): void {
+  console.log(
+    `[smart-cauldron] climb repair-target woId=${woId} pr=${String(pr)} reason=${reason}`
+  );
+}
+
+/**
+ * Select the repair target for a climb fire. Never throws: a reader error,
+ * an empty list, or an invalid selected candidate yields no declaration.
+ */
+async function resolveClimbRepairTarget(
+  woId: string,
+  project: string,
+  read: (woId: string, project: string) => Promise<OpenWoPullRequest[]>
+): Promise<ClimbRepairDecision> {
+  const none: ClimbRepairDecision = { declaration: null, alternates: undefined };
+  let opens: OpenWoPullRequest[];
+  try {
+    opens = await read(woId, project);
+  } catch {
+    logClimbRepairTarget(woId, 'none', 'reader_error');
+    return none;
+  }
+  if (!Array.isArray(opens) || opens.length === 0) {
+    logClimbRepairTarget(woId, 'none', 'none');
+    return none;
+  }
+  const sorted = [...opens].sort(compareOpenPrNewest);
+  const selected = sorted[0];
+  if (!selected || !isValidRepairCandidate(selected)) {
+    const label =
+      selected && Number.isFinite(selected.number) ? `#${String(selected.number)}` : 'unreadable';
+    logClimbRepairTarget(woId, 'none', `invalid_candidate:${label}`);
+    return none;
+  }
+  const alternates =
+    sorted.length > 1
+      ? sorted.slice(1).map(pr => ({ number: pr.number, headRefName: pr.headRefName }))
+      : undefined;
+  const reason = sorted.length === 1 ? 'single_open' : 'newest_of_many';
+  logClimbRepairTarget(woId, selected.number, reason);
+  return {
+    declaration: REPAIR_TARGET_DECLARATION(selected.number, selected.headRefName),
+    alternates,
+  };
+}
 
 /**
  * The run-start seat refusal detail (`seat_usage_refused:...`) when a fired
