@@ -11,6 +11,16 @@ source of truth: edit them here, then install them on the host.
 Both scripts take `DRY_RUN=1`, which lists candidate worktrees with their sizes
 and removes nothing. Cleanup runs overnight only (John 2026-10-21).
 
+A worktree past the age cutoff is removed only if it is also abandoned. That means
+no file inside it changed within the retention window, no process has its cwd in
+it, and `git status` shows no uncommitted changes. If git cannot answer, the
+worktree is kept. Each kept worktree is logged with its reason.
+
+A worktree's `.git` points at a container path (`/.archon/workspaces/...`), so
+every git command (`status`, `worktree prune`) runs inside `archon-app-1` through
+`docker exec -u appuser`. A host-side `git worktree prune` would treat every
+worktree as missing and drop live ones.
+
 Install:
 
 ```

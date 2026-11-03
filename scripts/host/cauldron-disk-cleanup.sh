@@ -15,7 +15,32 @@ DRY_RUN="${DRY_RUN:-0}"
 STAGING_MAX_AGE_DAYS=3
 KEEP_LATEST_STAGING_IMAGES=2
 
+# Git metadata in the workspaces holds container paths (/.archon/workspaces/...),
+# so git commands for them run inside the harness container.
+CONTAINER="${CONTAINER:-archon-app-1}"
+CWT_ROOT="/.archon/workspaces"
+
 log() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" | tee -a "$LOG"; }
+
+# Prints a reason and returns 1 when the worktree must be kept. The top-level
+# mtime does not move when files deeper in the tree are edited, so age alone does
+# not prove a worktree is abandoned. The process check matches on the
+# <owner>/<repo>/worktrees/<lane>/<name> suffix so it also catches processes in
+# the container, whose paths differ from the host path.
+is_abandoned() {
+  local wt="$1" suffix pid cwd st
+  if [ -n "$(find "$wt" -mmin "-$((STAGING_MAX_AGE_DAYS * 1440))" -print -quit 2>/dev/null)" ]; then
+    echo "recent-file"; return 1
+  fi
+  suffix="${wt#"$WORKSPACES_ROOT"/}"
+  for pid in /proc/[0-9]*; do
+    cwd=$(readlink "$pid/cwd" 2>/dev/null) || continue
+    case "$cwd" in */"$suffix"|*/"$suffix"/*) echo "process ${pid#/proc/}"; return 1;; esac
+  done
+  st=$(docker exec -u appuser "$CONTAINER" git -C "$CWT_ROOT/$suffix" status --porcelain 2>/dev/null) || { echo "git-status-failed"; return 1; }
+  [ -z "$st" ] || { echo "uncommitted-changes"; return 1; }
+  return 0
+}
 
 log "=== cauldron-disk-cleanup start ==="
 df -h / | tail -1 | tee -a "$LOG"
@@ -24,6 +49,10 @@ df -h / | tail -1 | tee -a "$LOG"
 for repo_worktrees in "$WORKSPACES_ROOT"/*/*/worktrees/*; do
   [ -d "$repo_worktrees" ] || continue
   find "$repo_worktrees" -maxdepth 1 -mindepth 1 -type d -mmin +4320 -print 2>/dev/null | while read -r wt; do
+    if ! why=$(is_abandoned "$wt"); then
+      log "keep worktree: $wt ($why)"
+      continue
+    fi
     if [ "$DRY_RUN" = "1" ]; then du -sh "$wt" 2>/dev/null; continue; fi
     log "removing stale worktree: $wt"
     sudo rm -rf "$wt"
@@ -31,10 +60,12 @@ for repo_worktrees in "$WORKSPACES_ROOT"/*/*/worktrees/*; do
 done
 if [ "$DRY_RUN" = "1" ]; then echo "DRY_RUN: worktree section only; nothing removed"; exit 0; fi
 
-# Prune git's own worktree bookkeeping in each repo's source clone
+# Prune git's own worktree bookkeeping in each repo's source clone. This runs in
+# the container: on the host every recorded worktree path (/.archon/...) looks
+# missing, so a host-side prune would drop live worktrees too.
 for src in "$WORKSPACES_ROOT"/*/*/source; do
   [ -d "$src/.git" ] || continue
-  (cd "$src" && sudo git worktree prune 2>&1 | sed "s#^#[prune $src] #" | tee -a "$LOG")
+  docker exec -u appuser "$CONTAINER" git -C "$CWT_ROOT/${src#"$WORKSPACES_ROOT"/}" worktree prune 2>&1 | sed "s#^#[prune $src] #" | tee -a "$LOG"
 done
 
 # --- 2. Stale staging/rollback Docker artifacts (age + keep-latest-N floor) ---
@@ -56,12 +87,18 @@ for c in "${stale_containers[@]:-}"; do
   docker rm -f "$c" >>"$LOG" 2>&1
 done
 
-mapfile -t staging_images < <(docker images --format '{{.Repository}}:{{.Tag}}' \
-  | grep -E '^archon(-rollback)?:m[0-9]+-(staging|attempt)?' \
-  | grep -E ':m[0-9]+-staging|^archon-rollback:m[0-9]+' | sort -r)
+# Newest first by creation time (not by tag text: m9 sorts after m11 as text).
+# Matches archon:m<N>-staging* and archon-rollback:m<N>*.
+mapfile -t staging_images < <(docker images --format '{{.CreatedAt}}|{{.Repository}}:{{.Tag}}' \
+  | grep -E '\|(archon:m[0-9]+-staging|archon-rollback:m[0-9]+)' \
+  | sort -r | cut -d'|' -f2)
+cutoff=$(date -d "-${STAGING_MAX_AGE_DAYS} days" +%s)
 if [ "${#staging_images[@]}" -gt "$KEEP_LATEST_STAGING_IMAGES" ]; then
   for img in "${staging_images[@]:$KEEP_LATEST_STAGING_IMAGES}"; do
-    if ! docker ps -a --format '{{.Image}}' | grep -qx "$img"; then
+    created=$(date -d "$(docker image inspect -f '{{.Created}}' "$img" 2>/dev/null)" +%s 2>/dev/null) || continue
+    if [ "$created" -gt "$cutoff" ]; then
+      log "skip (newer than ${STAGING_MAX_AGE_DAYS}d): $img"
+    elif ! docker ps -a --format '{{.Image}}' | grep -qx "$img"; then
       log "removing stale image: $img"
       docker rmi "$img" >>"$LOG" 2>&1
     else
