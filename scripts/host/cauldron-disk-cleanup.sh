@@ -74,18 +74,21 @@ done
 # *staging* substring match killed the unrelated long-running
 # bug-lifecycle-staging service (5-week uptime) on first run. Never widen this
 # pattern to a bare "staging"/"rollback" substring match again.
-mapfile -t stale_containers < <(docker ps -a --format '{{.Names}}\t{{.CreatedAt}}' \
+# Only STOPPED containers are removed: a running archon-m<N>-staging service is a
+# live deployment however old it is. Age comes from the full RFC 3339 .Created
+# timestamp (date and time), not the date alone.
+container_cutoff=$(date -d "-${STAGING_MAX_AGE_DAYS} days" +%s)
+docker ps -a --filter status=exited --filter status=created --filter status=dead --format '{{.Names}}' \
   | grep -E '^archon-m[0-9]+-(staging|attempt)' \
-  | awk -v days="$STAGING_MAX_AGE_DAYS" '
-    { split($2, d, " "); cmd = "date -d \"" d[1] " " d[2] "\" +%s"; cmd | getline created; close(cmd);
-      cmd2 = "date +%s"; cmd2 | getline now; close(cmd2);
-      age_days = (now - created) / 86400;
-      if (age_days > days) print $1 }')
-for c in "${stale_containers[@]:-}"; do
-  [ -z "$c" ] && continue
-  log "removing stale container: $c"
-  docker rm -f "$c" >>"$LOG" 2>&1
-done
+  | while read -r c; do
+    created=$(date -d "$(docker inspect -f '{{.Created}}' "$c" 2>/dev/null)" +%s 2>/dev/null) || continue
+    if [ "$created" -gt "$container_cutoff" ]; then
+      log "skip (stopped, newer than ${STAGING_MAX_AGE_DAYS}d): $c"
+      continue
+    fi
+    log "removing stale stopped container: $c"
+    docker rm "$c" >>"$LOG" 2>&1
+  done
 
 # Newest first by creation time (not by tag text: m9 sorts after m11 as text).
 # Matches archon:m<N>-staging* and archon-rollback:m<N>*.
