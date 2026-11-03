@@ -1873,7 +1873,8 @@ describe('Amendment 5', () => {
     expect(worldB.replies).toHaveLength(0);
     expect(worldA.replies).toHaveLength(1);
     // An expired lease is taken over.
-    const later = new Date(Date.parse(T0) + 61_000).toISOString();
+    // The tick renewed A's lease with the default TTL (15 min); after it lapses B takes over.
+    const later = new Date(Date.parse(T0) + 16 * 60_000).toISOString();
     expect(await admissions.acquireConsumerLease('holder-B', later, 60_000, db)).toBe(true);
     expect(await admissions.acquireConsumerLease('holder-A', later, 60_000, db)).toBe(false);
   });
@@ -1991,5 +1992,88 @@ describe('Amendment 5', () => {
     expect(world.replies).toHaveLength(0);
     expect(world.acked).toHaveLength(0);
     expect(await admissions.markEffectStarted('CAS1', T0, db)).toBe(false);
+  });
+});
+
+describe('final round: CAS results honored, lease renewed per command, in-flight not recovered', () => {
+  test('(1) a lost terminal CAS never replies success: the durable decision is replied', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    const baseFire = world.deps.fireCascade;
+    world.deps.fireCascade = async input => {
+      const result = await baseFire(input);
+      // Recovery (elsewhere) decided the reservation while the handler ran.
+      await admissions.markUnknown(
+        input.dispatchId,
+        { status_code: 409, code: 'admission_unknown', now: T0 },
+        db
+      );
+      return result;
+    };
+    await processCommand(world.deps, fireMsg('cmd-cas-lost', 'CASLOST', 'WO-CASLOST-01'));
+    const reply = replyFor(world, 'cmd-cas-lost');
+    expect(reply.status).not.toBe(200);
+    expect(reply).toMatchObject({ status: 409, code: 'admission_unknown' });
+    expect((await admissions.getByRequestId('CASLOST', db))?.state).toBe('unknown');
+  });
+
+  test('(1) no decided row at reply time -> 409 stale_reservation, never success', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    const realDb = db;
+    // The admitted write is lost (CAS miss) and the row stays reserved.
+    world.deps.db = new Proxy(realDb, {
+      get(target, prop, receiver): unknown {
+        if (prop === 'query') {
+          return async (sql: string, params?: unknown[]): Promise<unknown> => {
+            if (sql.includes("SET state = 'admitted'")) return { rows: [], rowCount: 0 };
+            return target.query(sql, params as never);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as typeof realDb;
+    await processCommand(world.deps, fireMsg('cmd-stale', 'STALE', 'WO-STALE-01'));
+    expect(replyFor(world, 'cmd-stale')).toMatchObject({ status: 409, code: 'stale_reservation' });
+  });
+
+  test('(2) the lease is renewed before each command: a lease lost mid-batch stops the batch', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    const baseFire = world.deps.fireCascade;
+    world.deps.fireCascade = async input => {
+      // While the first command runs, another process takes the lapsed lease.
+      await db.query(
+        "UPDATE t3_consumer_lease SET holder = 'holder-B', expires_at = '2099-01-01T00:00:00.000Z' WHERE id = 1",
+        []
+      );
+      return baseFire(input);
+    };
+    world.queue.push(fireMsg('cmd-l1', 'L1', 'WO-L1-01'));
+    world.queue.push(fireMsg('cmd-l2', 'L2', 'WO-L2-01'));
+    await tickCauldronFireConsumer(world.deps);
+    expect(world.calls.fire).toBe(1);
+    expect(world.replyById.has('reply:cmd-l1')).toBe(true);
+    expect(world.replyById.has('reply:cmd-l2')).toBe(false);
+    expect(world.acked).not.toContain('cmd-l2');
+    expect(await admissions.getByRequestId('L2', db)).toBeNull();
+  });
+
+  test('(2) recovery skips a stale reservation whose handler is still in flight in this process', async () => {
+    const world = makeWorld({ ...BASE_ENV });
+    world.projectRepos.set('bdc-harness', 'thinmansoftware/bdc-harness');
+    let stateDuringRecovery: string | undefined;
+    const baseFire = world.deps.fireCascade;
+    world.deps.fireCascade = async input => {
+      const later = { ...world.deps, now: (): Date => new Date(Date.parse(T0) + 3_600_000) };
+      await recoverStaleReservations(later);
+      stateDuringRecovery = (await admissions.getByRequestId(input.dispatchId, db))?.state;
+      return baseFire(input);
+    };
+    await processCommand(world.deps, fireMsg('cmd-if', 'INFLIGHT', 'WO-INFLIGHT-01'));
+    expect(stateDuringRecovery).toBe('reserved');
+    expect(replyFor(world, 'cmd-if')).toMatchObject({ status: 200, code: 'ok' });
+    expect(world.replies.filter(r => r.idempotencyKey === 'reply:cmd-if')).toHaveLength(1);
   });
 });

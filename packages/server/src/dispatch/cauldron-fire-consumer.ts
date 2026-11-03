@@ -961,6 +961,30 @@ async function handleApprove(
 // Per-command processing + tick
 // --------------------------------------------------------------------------
 
+/**
+ * The reply for an admission-owning command is the ledger's decision. Returns
+ * `outcome` when the durable row agrees (keeping reply-only fields such as
+ * error_class); the durable row's outcome when it was decided differently; and
+ * 409 stale_reservation when there is no decided row at all.
+ */
+async function durableOutcome(
+  deps: CauldronFireConsumerDeps,
+  requestId: string,
+  outcome: ReplyOutcome
+): Promise<ReplyOutcome> {
+  const row = await admissions.getByRequestId(requestId, deps.db);
+  if (!row || row.state === 'reserved' || row.status_code === null) {
+    log.warn({ requestId, state: row?.state ?? null }, 'cauldron_fire_stale_reservation');
+    return { status: 409, code: 'stale_reservation' };
+  }
+  if (row.status_code === outcome.status && row.code === outcome.code) return outcome;
+  log.warn(
+    { requestId, durable: row.code, attempted: outcome.code },
+    'cauldron_fire_terminal_cas_lost'
+  );
+  return replayOutcome(row);
+}
+
 async function sendReplyAndAck(
   deps: CauldronFireConsumerDeps,
   message: DispatchMessage,
@@ -970,6 +994,13 @@ async function sendReplyAndAck(
   recordOnAdmission: boolean
 ): Promise<void> {
   const requestId = cmd?.request_id ?? message.correlation_id ?? message.idempotency_key;
+  if (recordOnAdmission) {
+    // Honor every terminal-transition CAS: the reply is the DURABLE decision.
+    // When a handler's markAdmitted / markRefused / markUnknown lost its CAS
+    // (another process or recovery decided the row first), never reply the
+    // handler's outcome -- reply what the ledger holds, or 409 stale_reservation.
+    outcome = await durableOutcome(deps, requestId, outcome);
+  }
   const mailbox = deps.resolveActorMailbox(message.sender_principal_id ?? message.sender);
   if (mailbox) {
     const replyBody = JSON.stringify({
@@ -1385,12 +1416,12 @@ export async function tickCauldronFireConsumer(deps: CauldronFireConsumerDeps): 
   if (tickInFlight) return;
   tickInFlight = true;
   try {
-    // A5.7: only the lease holder ticks (multi-process safety).
-    const ttlMs = Math.max(60_000, 3 * resolvePollMs(deps.env));
-    const nowIso = deps.now().toISOString();
-    if (!(await admissions.acquireConsumerLease(deps.leaseHolder, nowIso, ttlMs, deps.db))) {
-      return;
-    }
+    // A5.7: only the lease holder ticks (multi-process safety). The lease is
+    // renewed before EACH command, never only once per batch.
+    const ttlMs = resolveLeaseTtlMs(deps.env);
+    const holdLease = (): Promise<boolean> =>
+      admissions.acquireConsumerLease(deps.leaseHolder, deps.now().toISOString(), ttlMs, deps.db);
+    if (!(await holdLease())) return;
     await recoverStaleReservations(deps).catch((error: unknown) => {
       log.warn({ cause: (error as Error).message?.slice(0, 200) }, 'cauldron_fire_sweep_failed');
     });
@@ -1403,6 +1434,10 @@ export async function tickCauldronFireConsumer(deps: CauldronFireConsumerDeps): 
     });
     const commands = await deps.listCommands(CAULDRON_FIRE_RECIPIENT, COMMAND_LIST_LIMIT);
     for (const message of commands) {
+      if (!(await holdLease())) {
+        log.warn({ messageId: message.id }, 'cauldron_fire_lease_lost_mid_batch');
+        break;
+      }
       const ok = await processCommand(deps, message);
       if (!ok) await countFailureOrDeadLetter(deps, message);
     }
@@ -1447,6 +1482,21 @@ async function countFailureOrDeadLetter(
       'cauldron_fire_dead_letter_failed'
     );
   }
+}
+
+/**
+ * Lease TTL (runbook "Single consumer"): comfortably longer than the longest
+ * handler. The longest is a fire, which holds the tick until run discovery:
+ * cascade preflight + seat read (<= ~30 s) + prior-run teardown wait
+ * (SMART_CAULDRON_TEARDOWN_WAIT_MS, default 180 s) + run discovery (30 s), about
+ * 4 minutes. Default 15 minutes (over 3x that); T3_COMMAND_LEASE_TTL_S overrides
+ * (never below 3 poll intervals).
+ */
+export const DEFAULT_LEASE_TTL_S = 900;
+export function resolveLeaseTtlMs(env: Record<string, string | undefined>): number {
+  const raw = Number(env.T3_COMMAND_LEASE_TTL_S);
+  const ttlS = Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_LEASE_TTL_S;
+  return Math.max(ttlS * 1000, 3 * resolvePollMs(env));
 }
 
 export function resolvePollMs(env: Record<string, string | undefined>): number {

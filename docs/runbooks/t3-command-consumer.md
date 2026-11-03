@@ -238,6 +238,25 @@ is written. The HTTP approve route is unchanged.
   overlap, second server) does nothing until the lease expires.
 - Every admission transition is CAS from `reserved`; a miss before an effect
   aborts the effect with no reply and no ack.
+- The reply for a decided command is always the DURABLE decision: if a
+  handler's terminal transition (admitted / refused / unknown) lost its CAS, the
+  ledger's decision is replied instead, or 409 `stale_reservation` when no
+  decision exists -- never the handler's success.
+- The lease is renewed before EACH command (a lease lost mid-batch stops the
+  batch). Lease TTL: `T3_COMMAND_LEASE_TTL_S`, default 900 s (15 min). Bound:
+  the longest handler is a fire, which holds the tick until run discovery --
+  preflight + seat read (~30 s) + prior-run teardown wait
+  (`SMART_CAULDRON_TEARDOWN_WAIT_MS`, default 180 s) + run discovery (30 s),
+  about 4 minutes -- so the default is over 3x the longest handler. Raise it if
+  the teardown wait is raised.
+- Recovery skips any reservation whose handler is still in flight in this
+  process.
+- OPERATING ASSUMPTION / known gap: today the harness runs ONE consumer process
+  in ONE container (archon-app-1). Cross-process fencing of recovery against a
+  live handler in ANOTHER process (a lease epoch / fencing token) is not built:
+  WO-HARNESS-T3-CONSUMER-LEASE-EPOCH-FENCING-01 (bdc-xo issue 4421). Do not run
+  a second consumer process (T3_COMMAND_CONSUMER_ENABLED=1 in two containers)
+  until it lands.
 - A command row that fails processing 3 times (`t3_command_attempts`) is
   acknowledged, addressed and dead-lettered: one Dispatch message from
   `cauldron-fire` to `operator` (`idempotency_key` `dead-letter:<message id>`).
