@@ -737,6 +737,13 @@ function stallClockDeps(
 
 describe('token mint stall', () => {
   test('tokenMintStallsDetector releases the guard when installation mint never resolves', async () => {
+    // The stalled mint is rescued only by githubToken's AbortSignal.timeout,
+    // which is an unref'd timer. Under bun test on Windows (bun 1.3.13), when
+    // the awaited promise's only wakeup is an unref'd timer, the runner spins
+    // without firing it, and the per-test timeout never fires either, so the
+    // whole src/dispatch/ process hangs. A ref'd keepalive lets the timer run,
+    // as the server's own ref'd handles do in production.
+    const keepAlive = setInterval(() => {}, 1_000);
     const envKeys = [
       ...TOKEN_ENV_KEYS,
       'DUTY_OFFICER_GITHUB_TIMEOUT_MS',
@@ -910,6 +917,7 @@ describe('token mint stall', () => {
       expect(joined).not.toContain(privateKey);
       expect(joined).not.toContain('BEGIN PRIVATE KEY');
     } finally {
+      clearInterval(keepAlive);
       resolveSpy?.mockRestore();
       mintSpy?.mockRestore();
       logs.restore();
