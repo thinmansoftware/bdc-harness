@@ -407,7 +407,15 @@ function bindSenderContext(context: DispatchSenderContext): {
 } {
   if ('kind' in context && context.kind === 'system') {
     const sender = context.sender;
-    if (sender !== 'dispatch' && sender !== 'overseer' && sender !== 'taskmaster') {
+    // Runtime mirror of FixedDispatchSystemSender (dispatch-sender-authority.ts):
+    // 'cauldron-fire' added for WO-HARNESS-T3-COMMAND-CONSUMER-01 so the command
+    // consumer can reply as a fixed system sender.
+    if (
+      sender !== 'dispatch' &&
+      sender !== 'overseer' &&
+      sender !== 'taskmaster' &&
+      sender !== 'cauldron-fire'
+    ) {
       throw new Error('dispatch_internal_sender_invalid');
     }
     return {
