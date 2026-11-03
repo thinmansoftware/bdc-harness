@@ -1,14 +1,65 @@
+/**
+ * Overseer review worker clock: claims run_review work, prepares an exact-head
+ * sealed checkout, runs the judge and submits the verdict.
+ *
+ * REVIEW CHECKOUT CACHE (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICTION-01).
+ * Cached checkouts live at `<checkout root>/<owner>/<repo>/<40-hex headSha>`
+ * (root = OVERSEER_REVIEW_CHECKOUT_ROOT, else `<OVERSEER_REVIEW_SPOOL>/checkouts`,
+ * spool default /var/lib/overseer-review). An eviction pass runs before each
+ * checkout is prepared and once per tick after the queue drain:
+ *
+ * - OVERSEER_REVIEW_CHECKOUT_CACHE_MAX_BYTES (default 3221225472 = 3GB): total
+ *   cache cap. Over it, least-recently-used checkouts (directory mtime, touched
+ *   on creation and on every reuse) are evicted first, but the newest 2 per
+ *   owner/repo are always kept. If the cap still cannot be met the pass logs
+ *   `overseer_review_checkout_cache_over_cap` with the total and stops.
+ * - Merged or closed PR -> evicted; superseded head (the PR's live head is a
+ *   different, also-cached checkout) -> evicted. The PR is read from GitHub at
+ *   most once per OVERSEER_REVIEW_CHECKOUT_STATE_SWEEP_MS (default 900000 =
+ *   15 minutes); a lookup failure KEEPS the directory and logs
+ *   `overseer_review_checkout_state_unknown`.
+ * - Never evicted: a checkout bound to an in-flight run_review (claimed, lease
+ *   not expired) or to the review being prepared. Never walked or touched:
+ *   anything that is not a 40-hex directory under `<root>/<owner>/<repo>/`
+ *   (job scratch `<spool>/<id>.scratch`, in-progress `*.tmp-*`, symlinks).
+ * - Single writer: one review worker owns a spool through the database lease
+ *   `review_spool_leases` (key `review-spool:<checkout root>`), acquired for
+ *   the whole tick (busy -> `overseer_review_worker_spool_busy`), renewed every
+ *   minute (TTL 10 minutes), released in `finally`. Eviction re-checks holder
+ *   and fencing token against the database before every directory delete and
+ *   stops the pass (`overseer_review_checkout_eviction_stopped`) on a mismatch.
+ * - Each eviction logs `overseer_review_checkout_evicted` with owner, repo,
+ *   headSha, reason (merged, closed, superseded, cap) and bytesFreed; a pass
+ *   that evicted anything logs `overseer_review_checkout_eviction_pass` with
+ *   freedBytes and totalBytes.
+ *
+ * SMALLER CHECKOUTS. New checkouts fetch head and base with `--depth 1` and
+ * `--filter=blob:none`, then prefetch the base..head diff blobs so
+ * `git diff <base> <head>` works offline. OVERSEER_REVIEW_SPARSE_EXCLUDES
+ * (comma-separated `owner/repo:path` entries, default
+ * `thinmansoftware/bdc-xo:generations/`, empty string = none) enables a
+ * non-cone sparse-checkout that leaves those paths out of the worktree.
+ */
 import {
   claimMessage,
   deferMessage,
   heartbeatWorker,
   listMessages,
+  listMessagesBySeqCursor,
   postResult,
   registerWorker,
   releaseMessage,
   renewMessageLease,
+  type DispatchMessage,
+  type SeqCursorMessage,
   type DispatchTaskOutcome,
 } from '@archon/core/db/dispatch';
+import {
+  acquireReviewSpoolLease,
+  checkReviewSpoolLease,
+  releaseReviewSpoolLease,
+  renewReviewSpoolLease,
+} from '@archon/core/db/review-spool-leases';
 import {
   createDurableSweepCursor,
   createRealStaleVerdictSweepDeps,
@@ -36,7 +87,19 @@ import {
   type SubmitOutcome,
 } from '@archon/overseer/pr-review-submit';
 import { createRealOctokitClient } from '@archon/overseer/adapters/github-real-deps';
-import { chmod, lstat, mkdir, opendir, readFile, realpath, rename, rm } from 'node:fs/promises';
+import {
+  chmod,
+  lstat,
+  mkdir,
+  opendir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -160,6 +223,23 @@ export interface ReviewWorkerDeps {
    * parked heads wait for an operator `ladder_restored` row.
    */
   judgeLadderRecovery?: (config: ReviewRouteConfig) => Promise<unknown>;
+  /**
+   * Review checkout cache eviction (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICTION-01).
+   * Called before each checkout is prepared (protecting that head) and once per
+   * tick after the drain. Optional so test doubles can omit it; a failure is
+   * logged and never blocks a review.
+   */
+  evictCheckouts?: (input: {
+    protect: readonly ReviewCheckoutKey[];
+    lease: ReviewSpoolLeaseHandle;
+  }) => Promise<unknown>;
+  /**
+   * Single-writer spool lease store (database table `review_spool_leases`).
+   * Required: a tick that cannot take the lease does no review work.
+   */
+  spoolLease: ReviewSpoolLeaseStore;
+  /** Spool lease key override (tests). Defaults to `review-spool:<checkout root>`. */
+  spoolKey?: string;
 }
 
 interface ResultMapping {
@@ -235,7 +315,30 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
       ingestDeps ??= createRealIngestDeps(config);
       return recoverParkedJudgeHeads(ingestDeps, defaultReviewLadder());
     },
+    evictCheckouts: createReviewCheckoutEvictor({
+      listClaimedReviews: listMessagesBySeqCursor,
+      lookupPrState: createGitHubReviewCheckoutPrLookup(),
+    }),
+    spoolLease: {
+      acquire: acquireReviewSpoolLease,
+      renew: renewReviewSpoolLease,
+      release: releaseReviewSpoolLease,
+      check: checkReviewSpoolLease,
+    },
   };
+}
+
+async function runCheckoutEviction(
+  deps: ReviewWorkerDeps,
+  lease: ReviewSpoolLeaseHandle,
+  protect: readonly ReviewCheckoutKey[]
+): Promise<void> {
+  if (!deps.evictCheckouts) return;
+  try {
+    await deps.evictCheckouts({ protect, lease });
+  } catch (error) {
+    log.error({ err: error }, 'overseer_review_checkout_eviction_failed');
+  }
 }
 
 export async function tickReviewWorkerClock(
@@ -244,6 +347,25 @@ export async function tickReviewWorkerClock(
 ): Promise<void> {
   if (inFlight) return;
   inFlight = true;
+  // SINGLE WRITER (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICTION-01). One review
+  // worker owns the spool for a whole tick through a fenced database lease:
+  // claiming, preparing and evicting checkouts all happen under it, so a second
+  // worker on the same spool waits for its next tick instead of racing an
+  // eviction against a claim.
+  const spoolKey = deps.spoolKey ?? resolveReviewSpoolKey();
+  let lease: ReviewSpoolLeaseHandle | null;
+  try {
+    lease = await acquireReviewSpoolLeaseHandle(deps.spoolLease, spoolKey);
+  } catch (error) {
+    log.error({ err: error, spoolKey }, 'overseer_review_worker_spool_lease_failed');
+    inFlight = false;
+    return;
+  }
+  if (!lease) {
+    log.info({ spoolKey }, 'overseer_review_worker_spool_busy');
+    inFlight = false;
+    return;
+  }
   try {
     await deps.registerWorker({
       worker_id: REVIEW_WORKER_ID,
@@ -260,6 +382,11 @@ export async function tickReviewWorkerClock(
     ).filter(message => message.task_type === REVIEW_TASK_TYPE);
 
     for (const message of messages) {
+      // Never claim more work once the spool lease is no longer ours.
+      if (!(await lease.held())) {
+        log.warn({ spoolKey }, 'overseer_review_worker_spool_lease_lost');
+        break;
+      }
       try {
         const claimed = await deps.claimMessage({ id: message.id, worker_id: REVIEW_WORKER_ID });
         if (!claimed) continue;
@@ -295,6 +422,11 @@ export async function tickReviewWorkerClock(
         // approval. The reason travels in the server-built execution context.
         let checkoutPath = '';
         let checkoutFailure: string | undefined;
+        // Make room before materializing a new checkout; the head about to be
+        // prepared is protected even if it is already cached and over cap.
+        await runCheckoutEviction(deps, lease, [
+          { owner: body.owner, repo: body.repo, headSha: body.headSha },
+        ]);
         try {
           checkoutPath = deps.prepareCheckout
             ? await deps.prepareCheckout(await captureReviewBase(body, deps))
@@ -468,11 +600,122 @@ export async function tickReviewWorkerClock(
         log.error({ err: error }, 'overseer_judge_ladder_recovery_failed');
       }
     }
+
+    // CHECKOUT CACHE EVICTION. After the drain, so nothing this tick is still
+    // using a checkout; in-flight claims elsewhere are protected by the pass.
+    await runCheckoutEviction(deps, lease, []);
   } catch (error) {
     log.error({ err: error }, 'overseer_review_worker_tick_failed');
   } finally {
+    await lease.release();
     inFlight = false;
   }
+}
+
+function resolveReviewSpoolKey(): string {
+  return `review-spool:${resolveReviewCheckoutRoot()}`;
+}
+
+/**
+ * Lease time-to-live. A tick can drain several reviews of up to 30 minutes
+ * each, so the lease is RENEWED every REVIEW_SPOOL_LEASE_RENEW_MS while the
+ * tick runs; the TTL only bounds how long a crashed holder blocks the spool.
+ */
+export const REVIEW_SPOOL_LEASE_TTL_SECONDS = 600;
+export const REVIEW_SPOOL_LEASE_RENEW_MS = 60_000;
+
+/** The database lease operations (packages/core/src/db/review-spool-leases.ts). */
+export interface ReviewSpoolLeaseStore {
+  acquire: typeof acquireReviewSpoolLease;
+  renew: typeof renewReviewSpoolLease;
+  release: typeof releaseReviewSpoolLease;
+  check: typeof checkReviewSpoolLease;
+}
+
+/**
+ * The review spool's single-writer lease (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICTION-01).
+ *
+ * Held for a whole review tick. `held()` asks the DATABASE whether this
+ * holder and fencing token still hold a live lease; checkout eviction calls it
+ * before every directory delete, so eviction cannot run outside a tick or
+ * after another worker took the spool over.
+ */
+export interface ReviewSpoolLeaseHandle {
+  readonly spoolKey: string;
+  readonly holderId: string;
+  readonly fencingToken: number;
+  held(): Promise<boolean>;
+  release(): Promise<void>;
+}
+
+export async function acquireReviewSpoolLeaseHandle(
+  store: ReviewSpoolLeaseStore,
+  spoolKey: string,
+  options: { ttlSeconds?: number; renewMs?: number } = {}
+): Promise<ReviewSpoolLeaseHandle | null> {
+  const ttlSeconds = options.ttlSeconds ?? REVIEW_SPOOL_LEASE_TTL_SECONDS;
+  const holderId = `${process.env.HOSTNAME ?? 'in-process'}:${process.pid}:${randomUUID()}`;
+  const acquired = await store.acquire({
+    spool_key: spoolKey,
+    holder_id: holderId,
+    ttl_seconds: ttlSeconds,
+  });
+  if (!acquired) return null;
+  const identity = {
+    spool_key: spoolKey,
+    holder_id: holderId,
+    fencing_token: acquired.fencing_token,
+  };
+  let lost = false;
+  const renew = setInterval(() => {
+    void store
+      .renew(identity, ttlSeconds)
+      .then(renewed => {
+        if (renewed || lost) return;
+        lost = true;
+        log.warn(
+          { spoolKey, fencingToken: identity.fencing_token },
+          'overseer_review_worker_spool_lease_lost'
+        );
+      })
+      .catch((error: unknown) => {
+        log.warn(
+          { spoolKey, error: error instanceof Error ? error.message : String(error) },
+          'overseer_review_worker_spool_lease_renew_failed'
+        );
+      });
+  }, options.renewMs ?? REVIEW_SPOOL_LEASE_RENEW_MS);
+  renew.unref?.();
+  return {
+    spoolKey,
+    holderId,
+    fencingToken: identity.fencing_token,
+    held: async (): Promise<boolean> => {
+      if (lost) return false;
+      try {
+        return await store.check(identity);
+      } catch {
+        return false; // doubt is not ownership
+      }
+    },
+    release: async (): Promise<void> => {
+      clearInterval(renew);
+      try {
+        await store.release(identity);
+      } catch (error) {
+        // An unreleased lease expires on its own after the TTL.
+        log.warn(
+          { spoolKey, error: error instanceof Error ? error.message : String(error) },
+          'overseer_review_worker_spool_lease_release_failed'
+        );
+      }
+    },
+  };
+}
+
+function resolveReviewCheckoutRoot(): string {
+  const spool = process.env.OVERSEER_REVIEW_SPOOL?.trim() || '/var/lib/overseer-review';
+  return process.env.OVERSEER_REVIEW_CHECKOUT_ROOT?.trim() || join(spool, 'checkouts');
 }
 
 function resolveTrustedCheckoutPath(
@@ -481,9 +724,7 @@ function resolveTrustedCheckoutPath(
   headSha: string,
   checkoutRoot?: string
 ): string {
-  const spool = process.env.OVERSEER_REVIEW_SPOOL?.trim() || '/var/lib/overseer-review';
-  const root =
-    checkoutRoot ?? (process.env.OVERSEER_REVIEW_CHECKOUT_ROOT?.trim() || join(spool, 'checkouts'));
+  const root = checkoutRoot ?? resolveReviewCheckoutRoot();
   if (!/^[0-9a-f]{40}$/i.test(headSha)) return '';
   const safe = (value: string): string => value.replace(/[^A-Za-z0-9_.-]/g, '_');
   return `${root}/${safe(owner)}/${safe(repo)}/${headSha}`;
@@ -687,6 +928,7 @@ export async function prepareReviewCheckout(
     // drift (mode, content, untracked file, missing base) discards it.
     await sealReviewCheckout(checkout, await readTrackedExecutables(checkout));
     await verifySealedCheckout(checkout, headSha, baseSha);
+    await recordCheckoutUse(checkout, input.prNumber);
     return await realpath(checkout);
   } catch {
     // Missing or stale paths are replaced atomically below.
@@ -698,9 +940,42 @@ export async function prepareReviewCheckout(
     await mkdir(temporary, { mode: 0o700 });
     await runCheckoutGit(['git', 'init', '--quiet'], temporary);
     const remote = options.remoteUrl ?? `https://github.com/${input.owner}/${input.repo}.git`;
+    // A NAMED remote: a partial (--filter) fetch records it as the promisor
+    // that later checkout and diff steps lazily fetch missing blobs from. The
+    // credential stays in runCheckoutGit's env and is never written to config.
+    await runCheckoutGit(['git', 'remote', 'add', 'origin', remote], temporary);
+    const sparseExcludes = resolveSparseExcludes(input.owner, input.repo);
+    if (sparseExcludes.length > 0) {
+      // Non-cone sparse-checkout, set BEFORE checkout so excluded blobs are
+      // never fetched or written. Tree identity is unchanged, so
+      // verifySealedCheckout still binds HEAD and its tree to headSha.
+      await runCheckoutGit(
+        [
+          'git',
+          'sparse-checkout',
+          'set',
+          '--no-cone',
+          '/*',
+          ...sparseExcludes.map(path => `!/${path}/`),
+        ],
+        temporary
+      );
+    }
     try {
       await runCheckoutGit(
-        ['git', 'fetch', '--quiet', '--no-tags', '--no-write-fetch-head', remote, headSha, baseSha],
+        [
+          'git',
+          'fetch',
+          '--quiet',
+          '--no-tags',
+          '--no-write-fetch-head',
+          '--depth',
+          '1',
+          '--filter=blob:none',
+          'origin',
+          headSha,
+          baseSha,
+        ],
         temporary
       );
       await runCheckoutGit(['git', 'cat-file', '-e', `${headSha}^{commit}`], temporary);
@@ -709,15 +984,558 @@ export async function prepareReviewCheckout(
       throw new Error(CHECKOUT_IDENTITY_FAILURE);
     }
     await runCheckoutGit(['git', 'checkout', '--quiet', '--detach', headSha], temporary);
+    // Prefetch both sides of the base..head diff now, while the parent holds
+    // the credential, so the reviewer's `git diff <base> <head>` never needs
+    // the network.
+    await runCheckoutGit(['git', 'diff', '--stat', baseSha, headSha], temporary);
     await sealReviewCheckout(temporary, await readTrackedExecutables(temporary));
     await verifySealedCheckout(temporary, headSha, baseSha);
     await rm(checkout, { recursive: true, force: true });
     await rename(temporary, checkout);
+    await recordCheckoutUse(checkout, input.prNumber);
     return await realpath(checkout);
   } catch (error) {
     await rm(temporary, { recursive: true, force: true });
     throw error;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Review checkout cache (WO-HARNESS-REVIEW-CHECKOUT-CACHE-EVICTION-01). See the
+// file header for the env vars and log lines.
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_REVIEW_CHECKOUT_CACHE_MAX_BYTES = 3 * 1024 * 1024 * 1024;
+export const DEFAULT_REVIEW_SPARSE_EXCLUDES = 'thinmansoftware/bdc-xo:generations/';
+const REVIEW_CHECKOUT_KEEP_PER_REPO = 2;
+const DEFAULT_REVIEW_CHECKOUT_STATE_SWEEP_MS = 15 * 60_000;
+const CACHE_NAME_PATTERN = /^[A-Za-z0-9_.-]+$/;
+const CACHED_HEAD_PATTERN = /^[0-9a-f]{40}$/;
+const SPARSE_PATH_PATTERN = /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/;
+
+export function resolveReviewCheckoutCacheMaxBytes(
+  raw: string | undefined = process.env.OVERSEER_REVIEW_CHECKOUT_CACHE_MAX_BYTES
+): number {
+  const value = Number(raw?.trim());
+  return raw?.trim() && Number.isSafeInteger(value) && value > 0
+    ? value
+    : DEFAULT_REVIEW_CHECKOUT_CACHE_MAX_BYTES;
+}
+
+/**
+ * Repo-relative directories left out of a review checkout for owner/repo, from
+ * `owner/repo:path` entries. Invalid paths (absolute, `..`, glob characters)
+ * are ignored so an exclude can never widen into a broader pattern.
+ */
+export function resolveSparseExcludes(
+  owner: string,
+  repo: string,
+  raw: string = process.env.OVERSEER_REVIEW_SPARSE_EXCLUDES ?? DEFAULT_REVIEW_SPARSE_EXCLUDES
+): string[] {
+  const target = `${owner}/${repo}`.toLowerCase();
+  const paths: string[] = [];
+  for (const entry of raw.split(',')) {
+    const trimmed = entry.trim();
+    const colon = trimmed.indexOf(':');
+    if (colon <= 0) continue;
+    if (trimmed.slice(0, colon).toLowerCase() !== target) continue;
+    const path = trimmed.slice(colon + 1).replace(/^\/+|\/+$/g, '');
+    if (!SPARSE_PATH_PATTERN.test(path)) continue;
+    if (path.split('/').some(segment => segment === '.' || segment === '..')) continue;
+    if (!paths.includes(path)) paths.push(path);
+  }
+  return paths;
+}
+
+export interface ReviewCheckoutKey {
+  owner: string;
+  repo: string;
+  headSha: string;
+}
+
+function checkoutKey(key: ReviewCheckoutKey): string {
+  return `${key.owner}/${key.repo}/${key.headSha}`.toLowerCase();
+}
+
+export type ReviewCheckoutPrState =
+  | { state: 'open'; headSha: string }
+  | { state: 'merged' }
+  | { state: 'closed' }
+  | { state: 'unknown'; reason: string };
+
+export type ReviewCheckoutPrLookup = (
+  input: ReviewCheckoutKey & { prNumber?: number }
+) => Promise<ReviewCheckoutPrState>;
+
+export type ReviewCheckoutEvictionReason = 'merged' | 'closed' | 'superseded' | 'cap';
+
+export interface ReviewCheckoutCacheLogger {
+  info(data: Record<string, unknown>, message: string): void;
+  warn(data: Record<string, unknown>, message: string): void;
+}
+
+export interface CachedReviewCheckout extends ReviewCheckoutKey {
+  path: string;
+  bytes: number;
+  lastUsedMs: number;
+  prNumber?: number;
+}
+
+export interface ReviewCheckoutEvictionResult {
+  evicted: (ReviewCheckoutKey & { reason: ReviewCheckoutEvictionReason; bytes: number })[];
+  freedBytes: number;
+  totalBytes: number;
+  overCap: boolean;
+  /** True when the pass stopped early because `beforeDelete` refused a delete. */
+  stopped: boolean;
+}
+
+/**
+ * Last use = directory mtime, set on creation and every reuse. The mtime of
+ * the checkout ROOT only; nothing is written inside the sealed tree, so the
+ * pristine (no untracked file) contract is unaffected.
+ */
+async function recordCheckoutUse(checkout: string, prNumber: number): Promise<void> {
+  try {
+    const now = new Date();
+    await utimes(checkout, now, now);
+    // Sibling marker `<headSha>.pr`, OUTSIDE the checkout: lets the eviction
+    // pass read the PR by number instead of by commit association.
+    await writeFile(`${checkout}.pr`, `${prNumber}\n`, { mode: 0o640 });
+  } catch (error) {
+    log.warn({ err: error, checkout }, 'overseer_review_checkout_use_record_failed');
+  }
+}
+
+async function listDirectoryNames(path: string): Promise<string[]> {
+  try {
+    // Sorted: readdir order is filesystem-dependent; passes must be deterministic.
+    return (await readdir(path)).sort();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+async function isRealDirectory(path: string): Promise<boolean> {
+  try {
+    const info = await lstat(path);
+    return info.isDirectory() && !info.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/** Sealed checkouts are immutable, so a size is cached per path and inode. */
+const checkoutSizeCache = new Map<string, { ino: number; bytes: number }>();
+
+async function treeBytes(path: string): Promise<number> {
+  let total = 0;
+  const directory = await opendir(path);
+  for await (const entry of directory) {
+    const child = join(path, entry.name);
+    const info = await lstat(child);
+    if (info.isDirectory() && !info.isSymbolicLink()) total += await treeBytes(child);
+    else total += info.size;
+  }
+  return total;
+}
+
+async function readPrMarker(path: string): Promise<number | undefined> {
+  try {
+    const info = await lstat(path);
+    if (!info.isFile() || info.size > 32) return undefined;
+    const value = Number((await readFile(path, 'utf8')).trim());
+    return Number.isSafeInteger(value) && value > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Cached checkouts are EXACTLY `<root>/<owner>/<repo>/<40 lowercase hex>`
+ * real directories. Symlinks, `*.tmp-*` builds in progress, markers and
+ * anything else are never returned, so they are never sized or deleted.
+ */
+export async function listCachedReviewCheckouts(root: string): Promise<CachedReviewCheckout[]> {
+  const found: CachedReviewCheckout[] = [];
+  for (const owner of await listDirectoryNames(root)) {
+    if (!CACHE_NAME_PATTERN.test(owner) || owner === '.' || owner === '..') continue;
+    const ownerPath = join(root, owner);
+    if (!(await isRealDirectory(ownerPath))) continue;
+    for (const repo of await listDirectoryNames(ownerPath)) {
+      if (!CACHE_NAME_PATTERN.test(repo) || repo === '.' || repo === '..') continue;
+      const repoPath = join(ownerPath, repo);
+      if (!(await isRealDirectory(repoPath))) continue;
+      for (const name of await listDirectoryNames(repoPath)) {
+        if (!CACHED_HEAD_PATTERN.test(name)) continue;
+        const path = join(repoPath, name);
+        let info;
+        try {
+          info = await lstat(path);
+        } catch {
+          continue;
+        }
+        if (!info.isDirectory() || info.isSymbolicLink()) continue;
+        let bytes: number;
+        const known = checkoutSizeCache.get(path);
+        if (known?.ino === info.ino) bytes = known.bytes;
+        else {
+          try {
+            bytes = await treeBytes(path);
+          } catch {
+            continue;
+          }
+          checkoutSizeCache.set(path, { ino: info.ino, bytes });
+        }
+        const prNumber = await readPrMarker(`${path}.pr`);
+        found.push({
+          owner,
+          repo,
+          headSha: name,
+          path,
+          bytes,
+          lastUsedMs: info.mtimeMs,
+          ...(prNumber ? { prNumber } : {}),
+        });
+      }
+    }
+  }
+  return found;
+}
+
+async function removeCachedCheckout(root: string, checkout: CachedReviewCheckout): Promise<void> {
+  // Recompute the path from validated parts; never trust a stored string.
+  if (
+    !CACHE_NAME_PATTERN.test(checkout.owner) ||
+    !CACHE_NAME_PATTERN.test(checkout.repo) ||
+    !CACHED_HEAD_PATTERN.test(checkout.headSha)
+  ) {
+    throw new Error('review_checkout_evict_refused');
+  }
+  const path = join(root, checkout.owner, checkout.repo, checkout.headSha);
+  if (path !== checkout.path || !(await isRealDirectory(path))) {
+    throw new Error('review_checkout_evict_refused');
+  }
+  await rm(path, { recursive: true, force: true });
+  await rm(`${path}.pr`, { force: true });
+  checkoutSizeCache.delete(path);
+}
+
+export interface EvictReviewCheckoutsOptions {
+  checkoutRoot: string;
+  maxBytes: number;
+  /** Checkouts that must never be evicted (in-flight reviews, the head being prepared). */
+  inUse: readonly ReviewCheckoutKey[];
+  /** Absent = cap-only pass (no merged/closed/superseded phase). */
+  lookupPrState?: ReviewCheckoutPrLookup;
+  logger?: ReviewCheckoutCacheLogger;
+  keepPerRepo?: number;
+  /**
+   * Called immediately before EVERY directory delete (the review tick passes
+   * its spool lease check). False or a throw stops the whole pass: nothing
+   * more is deleted.
+   */
+  beforeDelete?: () => Promise<boolean>;
+}
+
+export async function evictReviewCheckouts(
+  options: EvictReviewCheckoutsOptions
+): Promise<ReviewCheckoutEvictionResult> {
+  const logger = options.logger ?? log;
+  const keepPerRepo = options.keepPerRepo ?? REVIEW_CHECKOUT_KEEP_PER_REPO;
+  const inUse = new Set<string>(options.inUse.map(checkoutKey));
+  const evicted: ReviewCheckoutEvictionResult['evicted'] = [];
+  let stopped = false;
+  const evict = async (
+    checkout: CachedReviewCheckout,
+    reason: ReviewCheckoutEvictionReason
+  ): Promise<boolean> => {
+    if (stopped) return false;
+    const identity = { owner: checkout.owner, repo: checkout.repo, headSha: checkout.headSha };
+    if (options.beforeDelete) {
+      let allowed = false;
+      try {
+        allowed = await options.beforeDelete();
+      } catch {
+        allowed = false;
+      }
+      if (!allowed) {
+        stopped = true;
+        logger.warn({ ...identity, reason }, 'overseer_review_checkout_eviction_stopped');
+        return false;
+      }
+    }
+    try {
+      await removeCachedCheckout(options.checkoutRoot, checkout);
+    } catch (error) {
+      logger.warn(
+        { ...identity, reason, error: error instanceof Error ? error.message : String(error) },
+        'overseer_review_checkout_evict_failed'
+      );
+      return false;
+    }
+    evicted.push({ ...identity, reason, bytes: checkout.bytes });
+    logger.info(
+      { ...identity, reason, bytesFreed: checkout.bytes },
+      'overseer_review_checkout_evicted'
+    );
+    return true;
+  };
+
+  let cached = await listCachedReviewCheckouts(options.checkoutRoot);
+
+  if (options.lookupPrState) {
+    const cachedKeys = new Set(cached.map(checkoutKey));
+    const survivors: CachedReviewCheckout[] = [];
+    for (const checkout of cached) {
+      if (stopped) {
+        survivors.push(checkout);
+        continue;
+      }
+      if (inUse.has(checkoutKey(checkout))) {
+        survivors.push(checkout);
+        continue;
+      }
+      let state: ReviewCheckoutPrState;
+      try {
+        state = await options.lookupPrState({
+          owner: checkout.owner,
+          repo: checkout.repo,
+          headSha: checkout.headSha,
+          ...(checkout.prNumber ? { prNumber: checkout.prNumber } : {}),
+        });
+      } catch (error) {
+        state = {
+          state: 'unknown',
+          reason: error instanceof Error ? error.message.slice(0, 200) : 'lookup_failed',
+        };
+      }
+      let reason: ReviewCheckoutEvictionReason | undefined;
+      if (state.state === 'merged' || state.state === 'closed') reason = state.state;
+      else if (
+        state.state === 'open' &&
+        state.headSha.toLowerCase() !== checkout.headSha &&
+        cachedKeys.has(checkoutKey({ ...checkout, headSha: state.headSha }))
+      ) {
+        reason = 'superseded';
+      } else if (state.state === 'unknown') {
+        // Doubt keeps the directory: only the cap may remove it.
+        logger.warn(
+          {
+            owner: checkout.owner,
+            repo: checkout.repo,
+            headSha: checkout.headSha,
+            reason: state.reason,
+          },
+          'overseer_review_checkout_state_unknown'
+        );
+      }
+      if (reason && (await evict(checkout, reason))) continue;
+      survivors.push(checkout);
+    }
+    cached = survivors;
+  }
+
+  let totalBytes = cached.reduce((sum, checkout) => sum + checkout.bytes, 0);
+  if (!stopped && totalBytes > options.maxBytes) {
+    const newestFloor = new Set<string>();
+    const byRepo = new Map<string, CachedReviewCheckout[]>();
+    for (const checkout of cached) {
+      const repoKey = `${checkout.owner}/${checkout.repo}`.toLowerCase();
+      byRepo.set(repoKey, [...(byRepo.get(repoKey) ?? []), checkout]);
+    }
+    for (const group of byRepo.values()) {
+      group
+        .sort((a, b) => b.lastUsedMs - a.lastUsedMs)
+        .slice(0, keepPerRepo)
+        .forEach(checkout => newestFloor.add(checkoutKey(checkout)));
+    }
+    const candidates = cached
+      .filter(c => !inUse.has(checkoutKey(c)) && !newestFloor.has(checkoutKey(c)))
+      .sort((a, b) => a.lastUsedMs - b.lastUsedMs || a.headSha.localeCompare(b.headSha));
+    for (const checkout of candidates) {
+      if (stopped || totalBytes <= options.maxBytes) break;
+      if (await evict(checkout, 'cap')) totalBytes -= checkout.bytes;
+    }
+  }
+  const overCap = totalBytes > options.maxBytes;
+  if (overCap && !stopped) {
+    logger.warn(
+      { totalBytes, maxBytes: options.maxBytes },
+      'overseer_review_checkout_cache_over_cap'
+    );
+  }
+  const freedBytes = evicted.reduce((sum, entry) => sum + entry.bytes, 0);
+  if (evicted.length > 0) {
+    logger.info(
+      { evicted: evicted.length, freedBytes, totalBytes },
+      'overseer_review_checkout_eviction_pass'
+    );
+  }
+  return { evicted, freedBytes, totalBytes, overCap, stopped };
+}
+
+interface AssociatedPull {
+  state?: string;
+  merged_at?: string | null;
+  head?: { sha?: string };
+}
+
+/** PR state from `GET /repos/{o}/{r}/commits/{sha}/pulls` (legacy dirs with no marker). */
+export function derivePrStateFromAssociatedPulls(
+  headSha: string,
+  pulls: unknown
+): ReviewCheckoutPrState {
+  if (!Array.isArray(pulls)) return { state: 'unknown', reason: 'lookup_malformed' };
+  if (pulls.length === 0) return { state: 'unknown', reason: 'no_associated_pr' };
+  const typed = pulls as AssociatedPull[];
+  const open = typed.filter(pull => pull.state === 'open');
+  if (open.length > 0) {
+    const exact = open.find(pull => pull.head?.sha?.toLowerCase() === headSha.toLowerCase());
+    const live = (exact ?? open[0]).head?.sha ?? '';
+    return SHA_PATTERN.test(live)
+      ? { state: 'open', headSha: live }
+      : { state: 'unknown', reason: 'lookup_malformed' };
+  }
+  return typed.some(pull => pull.merged_at) ? { state: 'merged' } : { state: 'closed' };
+}
+
+interface OctokitRequester {
+  request?: (route: string, params: Record<string, unknown>) => Promise<{ data: unknown }>;
+}
+
+export function createGitHubReviewCheckoutPrLookup(
+  clientFactory: () => ReturnType<typeof createRealOctokitClient> = () => createRealOctokitClient()
+): ReviewCheckoutPrLookup {
+  let client: ReturnType<typeof createRealOctokitClient> | undefined;
+  return async ({ owner, repo, headSha, prNumber }) => {
+    client ??= clientFactory();
+    if (prNumber) {
+      const pr = (await client.pulls.get({ owner, repo, pull_number: prNumber })).data;
+      if (pr.state === 'open') {
+        return SHA_PATTERN.test(pr.head?.sha ?? '')
+          ? { state: 'open', headSha: pr.head.sha }
+          : { state: 'unknown', reason: 'lookup_malformed' };
+      }
+      if (pr.state === 'closed') return pr.merged ? { state: 'merged' } : { state: 'closed' };
+      return { state: 'unknown', reason: 'lookup_malformed' };
+    }
+    const requester = client as unknown as OctokitRequester;
+    if (typeof requester.request !== 'function') {
+      return { state: 'unknown', reason: 'lookup_unavailable' };
+    }
+    const response = await requester.request(
+      'GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls',
+      {
+        owner,
+        repo,
+        commit_sha: headSha,
+      }
+    );
+    return derivePrStateFromAssociatedPulls(headSha, response.data);
+  };
+}
+
+export interface ReviewCheckoutEvictorDeps {
+  /**
+   * Keyset reader over claimed run_review rows (listMessagesBySeqCursor). The
+   * evictor walks EVERY page: a single capped read could hide a live claim
+   * behind stale ones and let its checkout be deleted mid-review.
+   */
+  listClaimedReviews: (filters: {
+    recipient: string;
+    task_type: string;
+    status: 'claimed';
+    afterSeq?: number;
+    limit: number;
+  }) => Promise<SeqCursorMessage[]>;
+  lookupPrState?: ReviewCheckoutPrLookup;
+  checkoutRoot?: string;
+  /** Defaults to OVERSEER_REVIEW_CHECKOUT_CACHE_MAX_BYTES, read on every pass. */
+  maxBytes?: number;
+  now?: () => number;
+  stateSweepIntervalMs?: number;
+  logger?: ReviewCheckoutCacheLogger;
+}
+
+/**
+ * Real eviction entry point. In-use = every claimed run_review whose lease has
+ * not expired, plus the caller's protected heads. If the claims cannot be read
+ * the pass is SKIPPED (never evict blind). GitHub is consulted at most once
+ * per state-sweep interval; other passes are cap-only.
+ */
+const REVIEW_CHECKOUT_CLAIM_PAGE_SIZE = 500;
+/** 100 pages x 500 = 50,000 claimed rows; beyond that the pass is skipped. */
+const REVIEW_CHECKOUT_CLAIM_MAX_PAGES = 100;
+
+export function createReviewCheckoutEvictor(
+  deps: ReviewCheckoutEvictorDeps
+): (input: {
+  protect: readonly ReviewCheckoutKey[];
+  lease: ReviewSpoolLeaseHandle;
+}) => Promise<ReviewCheckoutEvictionResult | null> {
+  let lastStateSweepAt = Number.NEGATIVE_INFINITY;
+  return async ({ protect, lease }) => {
+    const logger = deps.logger ?? log;
+    // Single writer: eviction runs only inside a review tick holding the spool
+    // lease. Without it, skip -- never delete on a guess.
+    if (!(await lease.held())) {
+      logger.warn({ spoolKey: lease.spoolKey }, 'overseer_review_checkout_eviction_skipped');
+      return null;
+    }
+    // Walk every claimed run_review page. If the walk cannot finish (store error
+    // or more pages than any real queue holds), skip the whole pass: eviction
+    // with an incomplete in-use set could delete a checkout under a live review.
+    const claimed: DispatchMessage[] = [];
+    try {
+      let afterSeq: number | undefined;
+      for (let page = 0; ; page += 1) {
+        if (page >= REVIEW_CHECKOUT_CLAIM_MAX_PAGES) throw new Error('claim_walk_incomplete');
+        const rows = await deps.listClaimedReviews({
+          recipient: REVIEW_RECIPIENT,
+          task_type: REVIEW_TASK_TYPE,
+          status: 'claimed',
+          ...(afterSeq === undefined ? {} : { afterSeq }),
+          limit: REVIEW_CHECKOUT_CLAIM_PAGE_SIZE,
+        });
+        claimed.push(...rows);
+        if (rows.length < REVIEW_CHECKOUT_CLAIM_PAGE_SIZE) break;
+        afterSeq = rows[rows.length - 1]?.cursor_seq;
+        if (afterSeq === undefined) throw new Error('claim_walk_incomplete');
+      }
+    } catch (error) {
+      logger.warn(
+        { error: error instanceof Error ? error.message : String(error) },
+        'overseer_review_checkout_eviction_skipped'
+      );
+      return null;
+    }
+    const now = (deps.now ?? Date.now)();
+    const inUse: ReviewCheckoutKey[] = [...protect];
+    for (const message of claimed) {
+      if (message.task_type !== REVIEW_TASK_TYPE || message.status !== 'claimed') continue;
+      if (message.lease_expires_at && Date.parse(message.lease_expires_at) <= now) continue;
+      const body = parseReviewWorkBody(message.body);
+      if (body) inUse.push({ owner: body.owner, repo: body.repo, headSha: body.headSha });
+    }
+    const interval =
+      deps.stateSweepIntervalMs ??
+      (Number(process.env.OVERSEER_REVIEW_CHECKOUT_STATE_SWEEP_MS) ||
+        DEFAULT_REVIEW_CHECKOUT_STATE_SWEEP_MS);
+    const withState = deps.lookupPrState !== undefined && now - lastStateSweepAt >= interval;
+    if (withState) lastStateSweepAt = now;
+    // The lease (holder AND fencing token) is re-checked against the database
+    // immediately before EVERY directory delete; a mismatch stops the pass.
+    return evictReviewCheckouts({
+      checkoutRoot: deps.checkoutRoot ?? resolveReviewCheckoutRoot(),
+      maxBytes: deps.maxBytes ?? resolveReviewCheckoutCacheMaxBytes(),
+      inUse,
+      ...(withState ? { lookupPrState: deps.lookupPrState } : {}),
+      logger,
+      beforeDelete: () => lease.held(),
+    });
+  };
 }
 
 export function startReviewWorkerClock(

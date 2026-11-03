@@ -1,9 +1,13 @@
-import { afterAll, describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test, spyOn } from 'bun:test';
 import { Database } from 'bun:sqlite';
 import { createHash } from 'crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { attributeRuns, computeWoCompletion, LEGACY_OVERALL_UNTIL } from './run-completion-report';
+import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
+import { resetGitHubApiMeterForTests } from '../packages/core/src/github/metering';
+import * as dbConnection from '../packages/core/src/db/connection';
 
 const SCRIPT = join(import.meta.dir, 'run-completion-report.ts');
 const AS_OF = '2026-11-01 14:30:00';
@@ -13,7 +17,7 @@ afterAll(() => {
 });
 
 const SCHEMA = `
-create table remote_agent_workflow_runs (id text primary key, workflow_name text not null, status text not null default 'pending', started_at text default (datetime('now')));
+create table remote_agent_workflow_runs (id text primary key, workflow_name text not null, status text not null default 'pending', started_at text default (datetime('now')), user_message text not null default '');
 create table remote_agent_workflow_events (id text primary key, workflow_run_id text not null, event_type text not null, step_index integer, step_name text, data text, created_at text);
 create table remote_agent_run_outcomes (run_id text primary key, execution_state text);
 create table overseer_actions (id text primary key, run_id text, wo_id text, class text, action text, result text not null, created_at text not null);
@@ -179,7 +183,10 @@ describe('run-completion-report', () => {
     const t = exec(base(path));
     expect(t.out).toContain('bdc-feature-development: 6/12 completed, rate insufficient');
     expect(t.out).toContain('bdc-feature-development-codex: 20/25 completed, rate 80.0%');
-    expect(t.out).toContain('overall: 26/37 completed, rate 70.3%');
+    // AS_OF is before LEGACY_OVERALL_UNTIL, so the overall line is shown relabelled.
+    expect(t.out).toContain(
+      `overall (legacy run completion, retiring ${LEGACY_OVERALL_UNTIL}): 26/37 completed, rate 70.3%`
+    );
   });
 
   test('Test 3: window and timestamp-format boundaries', () => {
@@ -556,5 +563,505 @@ describe('run-completion-report outcomes (last 24h)', () => {
     expect(t).toContain(`outcomes (last 24h): ${WS} to ${WE}`);
     expect(t).toContain('  taskmaster_escalate_p0: input 1, outcome 0');
     expect(t).toContain('  mailbox t3-desktop: depth 0, live 0, oldest_live none, age_h none');
+  });
+});
+
+// --- Zero-tier first-10 measurement, WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01 ---
+const ZERO_LANE = 'bdc-feature-development-zero-open';
+const ZERO_SINCE = '2026-11-02 12:00:00';
+
+describe('run-completion-report zero-tier first-10', () => {
+  test('Test 7: counts, REVERT verdict, cancelled excluded, pre-cutoff excluded', () => {
+    const { path, db } = newDb();
+    // Two runs BEFORE the cutoff -- must be excluded from the 10.
+    run(db, ZERO_LANE, 'completed', '2026-11-02 11:00:00');
+    run(db, ZERO_LANE, 'failed', '2026-11-02 11:30:00');
+    // Three failed at or after the cutoff (earliest, so they land in the first 10).
+    const f1 = run(db, ZERO_LANE, 'failed', '2026-11-02 12:01:00');
+    run(db, ZERO_LANE, 'escalated', '2026-11-02 12:02:00');
+    run(db, ZERO_LANE, 'failed', '2026-11-02 12:03:00');
+    // Seven completed after the cutoff -> first 10 = 3 failed + 7 completed.
+    for (let i = 4; i <= 10; i++) {
+      const mm = i < 10 ? `0${i}` : `${i}`;
+      run(db, ZERO_LANE, 'completed', `2026-11-02 12:${mm}:00`);
+    }
+    // An 11th non-cancelled terminal run -- excluded from the first 10.
+    run(db, ZERO_LANE, 'completed', '2026-11-02 12:30:00');
+    // One cancelled after the cutoff -- excluded from the 10, counted separately.
+    run(db, ZERO_LANE, 'cancelled', '2026-11-02 12:40:00');
+    // A node_failed event on the first failed run.
+    nodeFailed(db, f1, 'repair-gate-fail');
+    nodeFailed(db, f1, 'manifest-evidence-check');
+    db.close();
+
+    const r = exec(base(path, ['--zero-since', ZERO_SINCE, '--json']));
+    expect(r.code).toBe(0);
+    const z = JSON.parse(r.out).zero_tier;
+    expect(z.since).toBe(ZERO_SINCE);
+    expect(z.runs).toHaveLength(10);
+    expect(z.total).toBe(10);
+    expect(z.failed).toBe(3);
+    expect(z.verdict).toBe('REVERT');
+    expect(z.cancelled).toBe(1);
+    // Pre-cutoff runs excluded: no run started before the cutoff appears.
+    expect(z.runs.every((x: any) => ['completed', 'failed', 'escalated'].includes(x.status))).toBe(
+      true
+    );
+    // The first failed run carries its node_failed step names.
+    const firstFailed = z.runs.find((x: any) => x.run === f1.slice(0, 8));
+    expect(firstFailed.status).toBe('failed');
+    expect([...firstFailed.failed_steps].sort()).toEqual([
+      'manifest-evidence-check',
+      'repair-gate-fail',
+    ]);
+
+    // Text output carries the same verdict and counts.
+    const t = exec(base(path, ['--zero-since', ZERO_SINCE])).out;
+    expect(t).toContain('zero_tier_failed: 3/10');
+    expect(t).toContain('zero_tier_verdict: REVERT');
+    expect(t).toContain('zero_tier_cancelled: 1');
+    expect(t).toContain('zero_tier_first10:');
+  });
+
+  test('Test 8: PENDING under 10, KEEP at 10 with fewer than 3 failed', () => {
+    // Fixture A: 4 runs after the cutoff, 1 failed -> PENDING 4/10.
+    const a = newDb();
+    run(a.db, ZERO_LANE, 'failed', '2026-11-02 12:01:00');
+    run(a.db, ZERO_LANE, 'completed', '2026-11-02 12:02:00');
+    run(a.db, ZERO_LANE, 'completed', '2026-11-02 12:03:00');
+    run(a.db, ZERO_LANE, 'completed', '2026-11-02 12:04:00');
+    a.db.close();
+    const ja = JSON.parse(exec(base(a.path, ['--zero-since', ZERO_SINCE, '--json'])).out).zero_tier;
+    expect(ja.total).toBe(4);
+    expect(ja.failed).toBe(1);
+    expect(ja.verdict).toBe('PENDING');
+    const ta = exec(base(a.path, ['--zero-since', ZERO_SINCE])).out;
+    expect(ta).toContain('zero_tier_verdict: PENDING 4/10');
+
+    // Fixture B: 10 runs after the cutoff, 2 failed -> KEEP.
+    const b = newDb();
+    run(b.db, ZERO_LANE, 'failed', '2026-11-02 12:01:00');
+    run(b.db, ZERO_LANE, 'failed', '2026-11-02 12:02:00');
+    for (let i = 3; i <= 10; i++) {
+      run(b.db, ZERO_LANE, 'completed', `2026-11-02 12:${i < 10 ? '0' + i : i}:00`);
+    }
+    b.db.close();
+    const jb = JSON.parse(exec(base(b.path, ['--zero-since', ZERO_SINCE, '--json'])).out).zero_tier;
+    expect(jb.total).toBe(10);
+    expect(jb.failed).toBe(2);
+    expect(jb.verdict).toBe('KEEP');
+    const tb = exec(base(b.path, ['--zero-since', ZERO_SINCE])).out;
+    expect(tb).toContain('zero_tier_verdict: KEEP');
+  });
+
+  test('Test 8b: --zero-since absent -> no zero_tier section', () => {
+    const { path, db } = newDb();
+    run(db, ZERO_LANE, 'completed', '2026-11-02 12:01:00');
+    db.close();
+    const j = JSON.parse(exec(base(path, ['--json'])).out);
+    expect(j.zero_tier).toBeUndefined();
+    const t = exec(base(path)).out;
+    expect(t).not.toContain('zero_tier_verdict');
+  });
+});
+
+// --- Merged-or-owned WO completion, WO-HARNESS-COMPLETION-METRIC-MERGED-OR-OWNED-01 ---
+type Argv = string[];
+type Env = Record<string, string | undefined>;
+type ExecResult = { exitCode: number; stdout: Uint8Array; stderr: Uint8Array };
+const EMPTY = new Uint8Array();
+const enc = (o: unknown): Uint8Array => new TextEncoder().encode(JSON.stringify(o));
+const ok = (o: unknown): ExecResult => ({ exitCode: 0, stdout: enc(o), stderr: EMPTY });
+const err = (code: number, message: string): ExecResult => ({
+  exitCode: code,
+  stdout: EMPTY,
+  stderr: new TextEncoder().encode(message),
+});
+// Injected GitHub identity: a PAT so runGitHubServiceCommand mints no real token.
+const PAT = {
+  kind: 'pat' as const,
+  service: 'taskmaster' as const,
+  token: 'test-pat',
+  poolId: 'user-pat' as const,
+  distinct: false,
+};
+function runMsg(
+  db: Database,
+  lane: string,
+  status: string,
+  startedAt: string,
+  userMessage: string
+): string {
+  const id = `r${++seq}`;
+  db.query(
+    'insert into remote_agent_workflow_runs (id, workflow_name, status, started_at, user_message) values (?,?,?,?,?)'
+  ).run(id, lane, status, startedAt, userMessage);
+  return id;
+}
+const wm = (wo: string, proj: string): string => `WO_ID=${wo} --project ${proj} do the thing`;
+
+describe('run-completion-report merged-or-owned', () => {
+  test('Test 1: merged-or-owned arithmetic', async () => {
+    resetGitHubApiMeterForTests();
+    const { path, db } = newDb();
+    // 9 runs for 6 WOs: WO-A thrice (shopops), WO-B twice (bdc-harness), rest once.
+    runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:00:00', wm('WO-A', 'shopops'));
+    runMsg(db, LANES[0]!, 'failed', '2026-10-30 10:01:00', wm('WO-A', 'shopops'));
+    runMsg(db, LANES[1]!, 'completed', '2026-10-30 10:02:00', wm('WO-A', 'shopops'));
+    runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:03:00', wm('WO-B', 'bdc-harness'));
+    runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:04:00', wm('WO-B', 'bdc-harness'));
+    runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:05:00', wm('WO-C', 'shopops'));
+    runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:06:00', wm('WO-D', 'shopops'));
+    runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:07:00', wm('WO-E', 'bdc-harness'));
+    runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:08:00', wm('WO-F', 'bdc-harness'));
+    db.close();
+
+    const ro = new Database(path, { readonly: true });
+    const { units, unattributed } = attributeRuns(ro, AS_OF, '-7 days');
+    ro.close();
+    expect(unattributed).toBe(0);
+    expect(units.size).toBe(6);
+    expect([...units.get('WO-A')!]).toEqual(['shopops']); // thrice-fired WO is one unit
+
+    const issues = [
+      { title: 'WO-C', state: 'open', labels: [{ name: 'owner:codex' }], assignees: [] },
+      { title: 'WO-D', state: 'open', labels: [], assignees: [{ login: 'alice' }] },
+      { title: 'WO-E', state: 'open', labels: [{ name: 'class:CODE' }], assignees: [] },
+      { title: 'WO-F', state: 'closed', labels: [], assignees: [] },
+    ];
+    const shopopsPulls = [
+      { title: 'Implement WO-A', head: { ref: 'feature/wo-a' }, merged_at: '2026-10-20T00:00:00Z' },
+    ];
+    const harnessPulls = [
+      {
+        title: 'harness fix',
+        body: 'resolves WO-B',
+        head: { ref: 'fix' },
+        merged_at: '2026-10-25T00:00:00Z',
+      },
+    ];
+
+    const calls: Argv[] = [];
+    const execute = (argv: Argv, _env: Env): ExecResult => {
+      calls.push(argv);
+      if (argv.includes('repos/thinmansoftware/bdc-xo/issues?labels=wo&state=all&per_page=100'))
+        return ok([issues]);
+      if (argv.includes('q=repo:thinmansoftware/bdc-xo label:wo is:issue'))
+        return ok({ total_count: issues.length });
+      if (argv.includes('repos/thinmansoftware/shopops/pulls?state=closed&per_page=100'))
+        return ok([shopopsPulls]);
+      if (argv.includes('q=repo:thinmansoftware/shopops is:pr is:merged'))
+        return ok({ total_count: 1 });
+      if (argv.includes('repos/thinmansoftware/bdc-harness/pulls?state=closed&per_page=100'))
+        return ok([harnessPulls]);
+      if (argv.includes('q=repo:thinmansoftware/bdc-harness is:pr is:merged'))
+        return ok({ total_count: 1 });
+      throw new Error(`unexpected gh call: ${argv.join(' ')}`);
+    };
+
+    const meterDb = new SqliteAdapter(':memory:');
+    const r = await computeWoCompletion(units, AS_OF, {
+      noGithub: false,
+      execute,
+      identity: PAT,
+      db: meterDb,
+    });
+    await meterDb.close();
+    resetGitHubApiMeterForTests();
+
+    expect(r.available).toBe(true);
+    if (!r.available) throw new Error('unavailable');
+    expect(r.den).toBe(6);
+    expect(r.merged).toBe(2);
+    expect(r.owned).toBe(2);
+    expect(r.neither).toBe(2);
+    expect(r.neither_wos).toEqual(['WO-E', 'WO-F']);
+    expect(r.num).toBe(4);
+    // 1 issue list + 1 issue search + 2 * (pull list + pull search) = 6; no per-WO call.
+    expect(calls.length).toBe(6);
+  });
+
+  test('Test 2: GitHub unavailable prints a reason and keeps exit 0', async () => {
+    resetGitHubApiMeterForTests();
+    // (a) execute exits nonzero with a rate-limit message -> unavailable with reason.
+    const units = new Map([['WO-X', new Set(['shopops'])]]);
+    const rl = (_argv: Argv, _env: Env): ExecResult =>
+      err(1, 'API rate limit exceeded for installation');
+    const meterDb = new SqliteAdapter(':memory:');
+    const r = await computeWoCompletion(units, AS_OF, {
+      noGithub: false,
+      execute: rl,
+      identity: PAT,
+      db: meterDb,
+    });
+    await meterDb.close();
+    resetGitHubApiMeterForTests();
+    expect(r.available).toBe(false);
+    if (r.available) throw new Error('expected unavailable');
+    expect(r.reason).toContain('rate limit');
+
+    // (b) --no-github forces the unavailable path; F1-F5 still print; exit 0.
+    const { path, db } = newDb();
+    for (let i = 0; i < 5; i++)
+      runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:00:00', wm('WO-Y', 'shopops'));
+    act(db, 'merged', '2026-10-30T10:00:00.000Z');
+    db.close();
+    const res = exec(base(path, ['--no-github']));
+    expect(res.code).toBe(0);
+    expect(res.out).toContain('wo_merged_or_owned: unavailable (no-github)');
+    expect(res.out).toContain('overall (legacy run completion, retiring');
+    expect(res.out).toContain('overseer_actions:');
+    const jr = JSON.parse(exec(base(path, ['--no-github', '--json'])).out);
+    expect(jr.wo_completion.available).toBe(false);
+    expect(jr.wo_completion.reason).toBe('no-github');
+  });
+
+  test('Test 3: legacy overall line respects LEGACY_OVERALL_UNTIL window', () => {
+    const { path, db } = newDb();
+    // Runs inside both candidate windows so F2 numbers are identical either side.
+    for (let i = 0; i < 5; i++) run(db, LANES[0]!, 'completed', '2026-11-15 10:00:00');
+    db.close();
+    const until = LEGACY_OVERALL_UNTIL; // 'YYYY-MM-DD'
+    const afterTs = `${until} 00:00:00`;
+    const beforeTs = new Date(Date.parse(`${until}T00:00:00Z`) - 1000)
+      .toISOString()
+      .slice(0, 19)
+      .replace('T', ' ');
+
+    const before = exec(['--days', '7', '--as-of', beforeTs, '--db', path]);
+    expect(before.code).toBe(0);
+    expect(before.out).toContain(`overall (legacy run completion, retiring ${until}):`);
+    const jb = JSON.parse(exec(['--days', '7', '--as-of', beforeTs, '--db', path, '--json']).out);
+    expect(jb.legacy_overall).toBeDefined();
+    expect(jb.legacy_overall.total).toBe(5);
+    expect(jb.legacy_overall.completed).toBe(5);
+
+    const after = exec(['--days', '7', '--as-of', afterTs, '--db', path]);
+    expect(after.code).toBe(0);
+    expect(after.out).not.toContain('overall (legacy run completion');
+    const ja = JSON.parse(exec(['--days', '7', '--as-of', afterTs, '--db', path, '--json']).out);
+    expect(ja.legacy_overall).toBeUndefined();
+  });
+
+  test('Test 4: unattributed runs excluded from the denominator', () => {
+    const { path, db } = newDb();
+    runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:00:00', 'no prefix here');
+    runMsg(db, LANES[0]!, 'failed', '2026-10-30 10:01:00', 'also not a wo message');
+    runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:02:00', '');
+    db.close();
+    const r = exec(base(path, ['--json']));
+    expect(r.code).toBe(0);
+    const j = JSON.parse(r.out);
+    expect(j.unattributed_runs).toBe(3);
+    expect(j.wo_completion.available).toBe(true);
+    expect(j.wo_completion.den).toBe(0);
+    expect(exec(base(path)).out).toContain('unattributed_runs: 3');
+  });
+
+  test('Test 5: read-only kept with the new section', () => {
+    const { path, db } = newDb();
+    for (let i = 0; i < 5; i++)
+      runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:00:00', wm('WO-Z', 'shopops'));
+    db.close();
+    const sha = (): string => createHash('sha256').update(readFileSync(path)).digest('hex');
+    const before = sha();
+    // --no-github avoids any network while still exercising the new code path.
+    for (let i = 0; i < 3; i++) expect(exec(base(path, ['--no-github'])).code).toBe(0);
+    expect(sha()).toBe(before);
+    expect(existsSync(path + '-journal')).toBe(false);
+    const src = readFileSync(join(import.meta.dir, 'run-completion-report.ts'), 'utf8');
+    for (const kw of ['INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER']) {
+      expect(new RegExp(`\\b${kw}\\b`, 'i').test(src)).toBe(false);
+    }
+  });
+
+  test('Test 6: a merge older than the window still counts', async () => {
+    resetGitHubApiMeterForTests();
+    const units = new Map([['WO-G', new Set(['shopops'])]]);
+    const oldPull = [
+      { title: 'old work for WO-G', head: { ref: 'wo-g' }, merged_at: '2026-08-01T00:00:00Z' },
+    ];
+    const execute = (argv: Argv, _env: Env): ExecResult => {
+      if (argv.includes('repos/thinmansoftware/bdc-xo/issues?labels=wo&state=all&per_page=100'))
+        return ok([[]]);
+      if (argv.includes('q=repo:thinmansoftware/bdc-xo label:wo is:issue'))
+        return ok({ total_count: 0 });
+      if (argv.includes('repos/thinmansoftware/shopops/pulls?state=closed&per_page=100'))
+        return ok([oldPull]);
+      if (argv.includes('q=repo:thinmansoftware/shopops is:pr is:merged'))
+        return ok({ total_count: 1 });
+      throw new Error(`unexpected gh call: ${argv.join(' ')}`);
+    };
+    const meterDb = new SqliteAdapter(':memory:');
+    const r = await computeWoCompletion(units, AS_OF, {
+      noGithub: false,
+      execute,
+      identity: PAT,
+      db: meterDb,
+    });
+    await meterDb.close();
+    resetGitHubApiMeterForTests();
+    expect(r.available).toBe(true);
+    if (!r.available) throw new Error('unavailable');
+    expect(r.merged).toBe(1);
+    expect(r.owned).toBe(0);
+    expect(r.neither).toBe(0);
+  });
+
+  test('Test 7: truncated or failed retrieval reports unavailable incomplete', async () => {
+    resetGitHubApiMeterForTests();
+    const units = new Map([['WO-H', new Set(['shopops'])]]);
+    // (a) retrieved merged 250 but search total_count 251 -> incomplete.
+    const pulls250 = Array.from({ length: 250 }, (_, i) => ({
+      title: `pr ${i}`,
+      merged_at: '2026-10-20T00:00:00Z',
+    }));
+    const execA = (argv: Argv, _env: Env): ExecResult => {
+      if (argv.includes('repos/thinmansoftware/bdc-xo/issues?labels=wo&state=all&per_page=100'))
+        return ok([[]]);
+      if (argv.includes('q=repo:thinmansoftware/bdc-xo label:wo is:issue'))
+        return ok({ total_count: 0 });
+      if (argv.includes('repos/thinmansoftware/shopops/pulls?state=closed&per_page=100'))
+        return ok([pulls250]);
+      if (argv.includes('q=repo:thinmansoftware/shopops is:pr is:merged'))
+        return ok({ total_count: 251 });
+      throw new Error(`unexpected gh call: ${argv.join(' ')}`);
+    };
+    const db1 = new SqliteAdapter(':memory:');
+    const ra = await computeWoCompletion(units, AS_OF, {
+      noGithub: false,
+      execute: execA,
+      identity: PAT,
+      db: db1,
+    });
+    await db1.close();
+    resetGitHubApiMeterForTests();
+    expect(ra.available).toBe(false);
+    if (ra.available) throw new Error('expected unavailable');
+    expect(ra.reason).toContain('incomplete:pulls:shopops');
+
+    // (b) a page of the pulls retrieval fails (nonzero, non-auth) -> incomplete.
+    const execB = (argv: Argv, _env: Env): ExecResult => {
+      if (argv.includes('repos/thinmansoftware/bdc-xo/issues?labels=wo&state=all&per_page=100'))
+        return ok([[]]);
+      if (argv.includes('q=repo:thinmansoftware/bdc-xo label:wo is:issue'))
+        return ok({ total_count: 0 });
+      if (argv.includes('repos/thinmansoftware/shopops/pulls?state=closed&per_page=100'))
+        return err(1, 'gh: pagination failed on page 3 (HTTP 502)');
+      throw new Error(`unexpected gh call: ${argv.join(' ')}`);
+    };
+    const db2 = new SqliteAdapter(':memory:');
+    const rb = await computeWoCompletion(units, AS_OF, {
+      noGithub: false,
+      execute: execB,
+      identity: PAT,
+      db: db2,
+    });
+    await db2.close();
+    resetGitHubApiMeterForTests();
+    expect(rb.available).toBe(false);
+    if (rb.available) throw new Error('expected unavailable');
+    expect(rb.reason).toContain('incomplete:pulls:shopops');
+  });
+
+  test('Test 8: request arguments are exact (one project)', async () => {
+    resetGitHubApiMeterForTests();
+    const units = new Map([['WO-I', new Set(['shopops'])]]);
+    const calls: Argv[] = [];
+    const execute = (argv: Argv, _env: Env): ExecResult => {
+      calls.push(argv);
+      if (argv.includes('repos/thinmansoftware/bdc-xo/issues?labels=wo&state=all&per_page=100'))
+        return ok([[]]);
+      if (argv.includes('q=repo:thinmansoftware/bdc-xo label:wo is:issue'))
+        return ok({ total_count: 0 });
+      if (argv.includes('repos/thinmansoftware/shopops/pulls?state=closed&per_page=100'))
+        return ok([[]]);
+      if (argv.includes('q=repo:thinmansoftware/shopops is:pr is:merged'))
+        return ok({ total_count: 0 });
+      throw new Error(`unexpected gh call: ${argv.join(' ')}`);
+    };
+    const meterDb = new SqliteAdapter(':memory:');
+    const r = await computeWoCompletion(units, AS_OF, {
+      noGithub: false,
+      execute,
+      identity: PAT,
+      db: meterDb,
+    });
+    await meterDb.close();
+    resetGitHubApiMeterForTests();
+    expect(r.available).toBe(true);
+
+    const flat = calls.flat();
+    expect(flat).toContain('-f');
+    expect(flat).toContain('q=repo:thinmansoftware/bdc-xo label:wo is:issue');
+    expect(flat).toContain('q=repo:thinmansoftware/shopops is:pr is:merged');
+    expect(flat.some(e => e.includes('+'))).toBe(false);
+    const issueCall = calls.find(c => c.some(e => e.includes('/issues?')))!;
+    expect(issueCall).toContain('--paginate');
+    expect(issueCall.some(e => e.includes('per_page=100'))).toBe(true);
+    const pullCall = calls.find(c => c.some(e => e.includes('/pulls?')))!;
+    expect(pullCall).toContain('--paginate');
+    expect(pullCall.some(e => e.includes('per_page=100'))).toBe(true);
+  });
+
+  test('Test 9: the default github path never opens the shared/production db', async () => {
+    // Read-only contract: with no db injected (exactly how main() calls it), the
+    // GitHub join must route its metering flush to a throwaway in-memory sink, not
+    // to getDatabase() -- which in the container is the production archon.db this
+    // report promises never to write. If computeWoCompletion let runGitHubService-
+    // Command default its db to getDatabase(), the spy below would fire (and, in
+    // production, github_api_usage/github_api_pool_state rows would be written).
+    resetGitHubApiMeterForTests();
+    const spy = spyOn(dbConnection, 'getDatabase').mockImplementation(() => {
+      throw new Error('getDatabase must not be called during the read-only report');
+    });
+    const units = new Map([['WO-J', new Set(['shopops'])]]);
+    const execute = (argv: Argv, _env: Env): ExecResult => {
+      if (argv.includes('repos/thinmansoftware/bdc-xo/issues?labels=wo&state=all&per_page=100'))
+        return ok([[]]);
+      if (argv.includes('q=repo:thinmansoftware/bdc-xo label:wo is:issue'))
+        return ok({ total_count: 0 });
+      if (argv.includes('repos/thinmansoftware/shopops/pulls?state=closed&per_page=100'))
+        return ok([[]]);
+      if (argv.includes('q=repo:thinmansoftware/shopops is:pr is:merged'))
+        return ok({ total_count: 0 });
+      throw new Error(`unexpected gh call: ${argv.join(' ')}`);
+    };
+    try {
+      // No `db`: computeWoCompletion must build its own in-memory meter sink.
+      const r = await computeWoCompletion(units, AS_OF, {
+        noGithub: false,
+        execute,
+        identity: PAT,
+      });
+      expect(r.available).toBe(true);
+      if (!r.available) throw new Error('unavailable');
+      expect(r.den).toBe(1);
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+      resetGitHubApiMeterForTests();
+    }
+  });
+
+  test('Test 10: default CLI path with an attributed WO keeps --json stdout pure JSON', () => {
+    // The default (no --no-github) path builds the in-memory meter SqliteAdapter,
+    // whose schema init logs at info. Those records must never reach stdout under
+    // --json, or JSON.parse in machine consumers breaks. PATH is emptied so the
+    // GitHub call cannot reach the network; the join then reports unavailable,
+    // which is exactly the "auth fails after the adapter was built" case.
+    const { path, db } = newDb();
+    runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:00:00', wm('WO-Z', 'shopops'));
+    db.close();
+    const p = Bun.spawnSync([process.execPath, 'run', SCRIPT, ...base(path, ['--json'])], {
+      env: { PATH: '', HOME: process.env.HOME ?? '', USERPROFILE: process.env.USERPROFILE ?? '' },
+    });
+    const out = p.stdout.toString();
+    expect(p.exitCode).toBe(0);
+    expect(out).not.toContain('db.sqlite_schema_initialized');
+    const jr = JSON.parse(out);
+    expect(jr.unattributed_runs).toBe(0);
+    expect(jr.wo_completion.available).toBe(false);
+    expect(jr.wo_completion.reason).not.toBe('no-github');
   });
 });

@@ -7,16 +7,44 @@
  */
 import { Database } from 'bun:sqlite';
 import { existsSync } from 'fs';
+import { runGitHubServiceCommand } from './github-service-exec';
+import type {
+  GitHubService,
+  ServiceGitHubAuth,
+} from '../packages/core/src/github/service-identity';
+import type { IDatabase } from '../packages/core/src/db/adapters/types';
+import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
+import { rootLogger } from '../packages/paths/src/logger';
 
 const USAGE =
-  "usage: run-completion-report.ts --days N [--as-of 'YYYY-MM-DD HH:MM:SS'] [--db PATH] [--json]";
+  "usage: run-completion-report.ts --days N [--as-of 'YYYY-MM-DD HH:MM:SS'] [--zero-since 'YYYY-MM-DD HH:MM:SS'] [--db PATH] [--json] [--no-github]";
 const MIN_SAMPLE = 20;
 const LANE_LIKE = 'bdc-feature-development%';
+/** Zero-tier measurement (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01). */
+const ZERO_LANE = 'bdc-feature-development-zero-open';
+/** First-N zero-tier runs measured for the keep-or-revert verdict. */
+const ZERO_SAMPLE = 10;
+/** Review-fail count at or above which the XO reverts the routing. */
+const ZERO_REVERT_THRESHOLD = 3;
 /** Mailboxes read by people, with no worker (drain_on_start principals). */
 const MAILBOXES = ['operator', 'xo', 't3-desktop'] as const;
 /** Same instant as OPERATOR_HISTORY_CUTOFF in packages/core/src/db/dispatch-routing.ts. */
 const OPERATOR_HISTORY_CUTOFF = '2026-11-01T00:00:00.000Z';
 const STALE_MAILBOX_HOURS = 24;
+
+/**
+ * Merged-or-owned WO completion (WO-HARNESS-COMPLETION-METRIC-MERGED-OR-OWNED-01).
+ * The legacy run-completion overall line retires 14 days after this WO merged.
+ * Set to the planned merge date (2026-11-06) plus 14 days, UTC midnight. While
+ * as_of is before this instant the legacy overall line and json legacy_overall
+ * key are shown; on or after it they are omitted.
+ */
+export const LEGACY_OVERALL_UNTIL = '2026-11-20';
+/** Every build-lane fire's user_message starts with this (packages/smart-cauldron/src/fire.ts). */
+const WO_ID_PREFIX_RE = /^WO_ID=(\S+) --project (\S+)/;
+/** Service identity for the read-only GitHub join (same path as the daily posting, #1401). */
+const GH_SERVICE: GitHubService = 'taskmaster';
+const XO_REPO = 'thinmansoftware/bdc-xo';
 
 function fail(code: number, msg: string): never {
   process.stderr.write(msg + '\n');
@@ -49,15 +77,25 @@ function validAsOf(s: string): boolean {
   );
 }
 
-function parseArgs(argv: string[]): { days: number; asOf: string; db: string; json: boolean } {
+function parseArgs(argv: string[]): {
+  days: number;
+  asOf: string;
+  db: string;
+  json: boolean;
+  zeroSince: string | null;
+  noGithub: boolean;
+} {
   let days: number | undefined;
   let asOf = nowUtc();
   let db = '/.archon/archon.db';
   let json = false;
+  let zeroSince: string | null = null;
+  let noGithub = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--json') json = true;
-    else if (a === '--days' || a === '--as-of' || a === '--db') {
+    else if (a === '--no-github') noGithub = true;
+    else if (a === '--days' || a === '--as-of' || a === '--db' || a === '--zero-since') {
       const v = argv[++i];
       if (v === undefined) fail(2, `missing value for ${a}\n${USAGE}`);
       if (a === '--days') {
@@ -66,11 +104,14 @@ function parseArgs(argv: string[]): { days: number; asOf: string; db: string; js
       } else if (a === '--as-of') {
         if (!validAsOf(v)) fail(2, `invalid --as-of: ${v}\n${USAGE}`);
         asOf = v;
+      } else if (a === '--zero-since') {
+        if (!validAsOf(v)) fail(2, `invalid --zero-since: ${v}\n${USAGE}`);
+        zeroSince = v;
       } else db = v;
     } else fail(2, `unknown argument: ${a}\n${USAGE}`);
   }
   if (days === undefined) fail(2, `--days is required\n${USAGE}`);
-  return { days, asOf, db, json };
+  return { days, asOf, db, json, zeroSince, noGithub };
 }
 
 function rate(completed: number, total: number): string {
@@ -254,8 +295,385 @@ interface LaneRow {
   completed: number;
 }
 
-function main(): void {
-  const { days, asOf, db: dbPath, json } = parseArgs(process.argv.slice(2));
+interface ZeroRun {
+  run: string;
+  status: string;
+  failed_steps: string[];
+}
+
+interface ZeroTier {
+  since: string;
+  runs: ZeroRun[];
+  failed: number;
+  total: number;
+  verdict: 'REVERT' | 'KEEP' | 'PENDING';
+  cancelled: number;
+}
+
+/**
+ * Zero-tier first-N measurement (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01).
+ *
+ * Lists, in started_at order, the first ZERO_SAMPLE (10) terminal runs
+ * (completed, failed, escalated) of the zero-open lane started at or after
+ * `zeroSince`. failed = status failed or escalated (a run that did not pass its
+ * in-lane review gates). Verdict: REVERT when failed >= 3; KEEP when 10 runs
+ * exist and failed < 3; else PENDING. Cancelled runs after the cutoff are
+ * excluded from the 10 and counted separately. Read-only.
+ */
+function readZeroTier(db: Database, zeroSince: string): ZeroTier {
+  const rows = db
+    .query(
+      `select id, status from remote_agent_workflow_runs
+       where workflow_name = $lane and started_at >= $since
+         and status in ('completed','failed','escalated')
+       order by started_at, id
+       limit $limit`
+    )
+    .all({ $lane: ZERO_LANE, $since: zeroSince, $limit: ZERO_SAMPLE }) as {
+    id: string;
+    status: string;
+  }[];
+
+  const stepsQuery = db.query(
+    `select coalesce(step_name,'(null)') as step_name
+     from remote_agent_workflow_events
+     where workflow_run_id = $id and event_type = 'node_failed'
+     order by step_index, step_name`
+  );
+
+  const runs: ZeroRun[] = rows.map(r => {
+    const steps = stepsQuery.all({ $id: r.id }) as { step_name: string }[];
+    return {
+      run: r.id.slice(0, 8),
+      status: r.status,
+      failed_steps: steps.map(s => s.step_name),
+    };
+  });
+
+  const failed = runs.filter(r => r.status === 'failed' || r.status === 'escalated').length;
+  const total = runs.length;
+  const cancelled = (
+    db
+      .query(
+        `select count(*) as n from remote_agent_workflow_runs
+         where workflow_name = $lane and started_at >= $since and status = 'cancelled'`
+      )
+      .get({ $lane: ZERO_LANE, $since: zeroSince }) as { n: number }
+  ).n;
+
+  let verdict: ZeroTier['verdict'];
+  if (failed >= ZERO_REVERT_THRESHOLD) verdict = 'REVERT';
+  else if (total === ZERO_SAMPLE) verdict = 'KEEP';
+  else verdict = 'PENDING';
+
+  return { since: zeroSince, runs, failed, total, verdict, cancelled };
+}
+
+export interface WoUnits {
+  units: Map<string, Set<string>>;
+  unattributed: number;
+}
+
+/**
+ * Attribute in-window build runs to WO IDs. Each run's user_message must start
+ * with `WO_ID=<id> --project <project>` (fire.ts requiredPrefix). Runs that do
+ * not match are counted as unattributed and excluded from the unit set. A WO
+ * fired many times, or across projects, is one unit holding a set of projects.
+ */
+export function attributeRuns(db: Database, asOf: string, dayArg: string): WoUnits {
+  const rows = db
+    .query(
+      `select user_message as um from remote_agent_workflow_runs
+       where workflow_name like $like and started_at >= datetime($asof, $d) and started_at < $asof`
+    )
+    .all({ $like: LANE_LIKE, $asof: asOf, $d: dayArg }) as { um: string | null }[];
+  const units = new Map<string, Set<string>>();
+  let unattributed = 0;
+  for (const r of rows) {
+    const m = r.um ? WO_ID_PREFIX_RE.exec(r.um) : null;
+    if (!m) {
+      unattributed++;
+      continue;
+    }
+    const woId = m[1];
+    const project = m[2];
+    let projects = units.get(woId);
+    if (!projects) {
+      projects = new Set<string>();
+      units.set(woId, projects);
+    }
+    projects.add(project);
+  }
+  return { units, unattributed };
+}
+
+type GhExecute = (
+  command: string[],
+  env: Record<string, string | undefined>
+) => { exitCode: number; stdout: Uint8Array; stderr: Uint8Array };
+
+export interface GitHubInjection {
+  execute?: GhExecute;
+  identity?: ServiceGitHubAuth;
+  db?: IDatabase;
+}
+
+export type WoCompletion =
+  | {
+      available: true;
+      den: number;
+      num: number;
+      merged: number;
+      owned: number;
+      neither: number;
+      rate: string;
+      neither_wos: string[];
+    }
+  | { available: false; reason: string };
+
+interface GhIssue {
+  title?: string;
+  state?: string;
+  assignees?: ({ login?: string } | null)[];
+  labels?: ({ name?: string } | string)[];
+  pull_request?: unknown;
+}
+interface GhPull {
+  title?: string;
+  body?: string | null;
+  merged_at?: string | null;
+  head?: { ref?: string } | null;
+}
+
+/** Auth or quota failure: the whole GitHub section is unavailable with this reason. */
+class GhAccessError extends Error {}
+/** A collection could not be fully retrieved (count mismatch or a failed page). */
+class GhIncompleteError extends Error {
+  constructor(public collection: string) {
+    super(`incomplete:${collection}`);
+  }
+}
+
+const ACCESS_RE =
+  /rate limit|abuse detection|bad credentials|HTTP 401|HTTP 403|not accessible|authentication failed/i;
+
+function firstLine(s: string): string {
+  const line = s.split(/\r?\n/).find(l => l.trim().length > 0);
+  return (line ?? s).trim();
+}
+
+/** gh `--paginate --slurp` yields an array of per-page responses; flatten one level. */
+function flattenPages(parsed: unknown): unknown[] {
+  if (!Array.isArray(parsed)) return parsed == null ? [] : [parsed];
+  const out: unknown[] = [];
+  for (const page of parsed) {
+    if (Array.isArray(page)) out.push(...page);
+    else if (page != null) out.push(page);
+  }
+  return out;
+}
+
+async function ghCommand(args: string[], inj: GitHubInjection): Promise<string> {
+  const res = await runGitHubServiceCommand({
+    service: GH_SERVICE,
+    command: 'gh',
+    args,
+    ...(inj.execute ? { execute: inj.execute } : {}),
+    ...(inj.identity ? { identity: inj.identity } : {}),
+    ...(inj.db ? { db: inj.db } : {}),
+  });
+  if (res.exitCode !== 0) {
+    const err = firstLine(new TextDecoder().decode(res.stderr));
+    const reason = err || `gh exited ${res.exitCode}`;
+    if (ACCESS_RE.test(reason)) throw new GhAccessError(reason);
+    throw new Error(reason);
+  }
+  return new TextDecoder().decode(res.stdout);
+}
+
+/** Complete paginated list for one collection; any failure short of success is incomplete. */
+async function collectList(
+  collection: string,
+  args: string[],
+  inj: GitHubInjection
+): Promise<unknown[]> {
+  try {
+    const text = (await ghCommand(args, inj)).trim();
+    return flattenPages(text ? JSON.parse(text) : []);
+  } catch (e) {
+    if (e instanceof GhAccessError) throw e;
+    throw new GhIncompleteError(collection);
+  }
+}
+
+/** total_count of a search population; used only to prove the list is complete. */
+async function searchCount(collection: string, q: string, inj: GitHubInjection): Promise<number> {
+  try {
+    const text = await ghCommand(['api', 'search/issues', '-X', 'GET', '-f', `q=${q}`], inj);
+    const parsed = JSON.parse(text.trim()) as { total_count?: number };
+    if (typeof parsed.total_count !== 'number') throw new GhIncompleteError(collection);
+    return parsed.total_count;
+  } catch (e) {
+    if (e instanceof GhAccessError || e instanceof GhIncompleteError) throw e;
+    throw new GhIncompleteError(collection);
+  }
+}
+
+function prMatches(p: GhPull, needle: string): boolean {
+  const hay = `${p.title ?? ''}\n${p.body ?? ''}\n${p.head?.ref ?? ''}`.toLowerCase();
+  return hay.includes(needle);
+}
+
+function hasOwner(issue: GhIssue): boolean {
+  const assignees = (issue.assignees ?? []).filter(a => a != null);
+  if (assignees.length > 0) return true;
+  for (const l of issue.labels ?? []) {
+    const name = typeof l === 'string' ? l : (l?.name ?? '');
+    if (name.startsWith('owner:')) return true;
+  }
+  return false;
+}
+
+/**
+ * Merged-or-owned WO completion, joined to GitHub via runGitHubServiceCommand.
+ * Numerator = merged (a merged PR in one of the WO's projects names the WO ID in
+ * its title, body or head branch, case-insensitive, merged at or before asOf,
+ * any date) plus owned (not merged, and the bdc-xo issue titled exactly the WO
+ * ID is OPEN with at least one assignee or an `owner:` label). Denominator = all
+ * units. Retrieval is complete (every page, no date lower bound, no item cap) and
+ * checked against the GitHub search total_count; any gap, failed page or auth or
+ * quota error yields unavailable, never a partial number. Read-only.
+ */
+export async function computeWoCompletion(
+  units: Map<string, Set<string>>,
+  asOf: string,
+  opts: { noGithub: boolean } & GitHubInjection
+): Promise<WoCompletion> {
+  const den = units.size;
+  if (opts.noGithub) return { available: false, reason: 'no-github' };
+  if (den === 0)
+    return {
+      available: true,
+      den: 0,
+      num: 0,
+      merged: 0,
+      owned: 0,
+      neither: 0,
+      rate: rate(0, 0),
+      neither_wos: [],
+    };
+  // Read-only contract (docs/operations/run-completion-report.md: "nothing is
+  // written"). runGitHubServiceCommand meters every call and flushes those rows
+  // to its db; left to default it would be getDatabase(), writing
+  // github_api_usage/github_api_pool_state to the production archon.db during a
+  // report that promises to write nothing. Route metering to a throwaway
+  // in-memory sink unless the caller injected its own db (the tests do). The
+  // call still goes through the metered taskmaster identity; only the durable
+  // write is discarded. Closed in finally so the handle never leaks.
+  const ownsMeterDb = opts.db === undefined;
+  // The throwaway sink's schema init logs at info, and the root Pino logger
+  // writes to stdout, so those records would precede the --json report and break
+  // JSON.parse in machine consumers. Silence logging for the whole default-path
+  // join (the adapter's lazy child logger is created silent during construction);
+  // the previous level is restored in finally.
+  const prevLogLevel = rootLogger.level;
+  if (ownsMeterDb) rootLogger.level = 'silent';
+  const meterDb = opts.db ?? new SqliteAdapter(':memory:');
+  const inj: GitHubInjection = {
+    ...(opts.execute ? { execute: opts.execute } : {}),
+    ...(opts.identity ? { identity: opts.identity } : {}),
+    db: meterDb,
+  };
+  const asOfMs = Date.parse(asOf.replace(' ', 'T') + 'Z');
+  try {
+    // (a) all bdc-xo WO issues, every state, complete pagination.
+    const issueItems = (await collectList(
+      'issues',
+      ['api', '--paginate', '--slurp', `repos/${XO_REPO}/issues?labels=wo&state=all&per_page=100`],
+      inj
+    )) as GhIssue[];
+    // The issues endpoint also returns PRs; keep only real issues to match is:issue.
+    const issues = issueItems.filter(i => i != null && i.pull_request == null);
+    const issueTotal = await searchCount('issues', `repo:${XO_REPO} label:wo is:issue`, inj);
+    if (issues.length !== issueTotal) return { available: false, reason: 'incomplete:issues' };
+    const issueByTitle = new Map<string, GhIssue>();
+    for (const i of issues) if (typeof i.title === 'string') issueByTitle.set(i.title, i);
+
+    // (b) merged PRs per distinct project, complete pagination.
+    const projects = [...new Set(Array.from(units.values()).flatMap(s => Array.from(s)))].sort();
+    const mergedByProject = new Map<string, GhPull[]>();
+    for (const project of projects) {
+      const repo = `thinmansoftware/${project}`;
+      const col = `pulls:${project}`;
+      const pullItems = (await collectList(
+        col,
+        ['api', '--paginate', '--slurp', `repos/${repo}/pulls?state=closed&per_page=100`],
+        inj
+      )) as GhPull[];
+      const merged = pullItems.filter(
+        (p): p is GhPull & { merged_at: string } => p?.merged_at != null
+      );
+      const mergedTotal = await searchCount(col, `repo:${repo} is:pr is:merged`, inj);
+      if (merged.length !== mergedTotal) return { available: false, reason: `incomplete:${col}` };
+      mergedByProject.set(
+        project,
+        merged.filter(p => Date.parse(p.merged_at) <= asOfMs)
+      );
+    }
+
+    // classify: merged > owned > neither.
+    let merged = 0;
+    let owned = 0;
+    const neitherWos: string[] = [];
+    const entries = Array.from(units.entries()).sort((a, b) =>
+      a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0
+    );
+    for (const [woId, projSet] of entries) {
+      const needle = woId.toLowerCase();
+      let isMerged = false;
+      for (const project of projSet) {
+        const pulls = mergedByProject.get(project) ?? [];
+        if (pulls.some(p => prMatches(p, needle))) {
+          isMerged = true;
+          break;
+        }
+      }
+      if (isMerged) {
+        merged++;
+        continue;
+      }
+      const issue = issueByTitle.get(woId);
+      if (issue && (issue.state ?? '').toLowerCase() === 'open' && hasOwner(issue)) {
+        owned++;
+        continue;
+      }
+      neitherWos.push(woId);
+    }
+    const num = merged + owned;
+    return {
+      available: true,
+      den,
+      num,
+      merged,
+      owned,
+      neither: neitherWos.length,
+      rate: rate(num, den),
+      neither_wos: neitherWos,
+    };
+  } catch (e) {
+    if (e instanceof GhIncompleteError) return { available: false, reason: e.message };
+    if (e instanceof GhAccessError) return { available: false, reason: firstLine(e.message) };
+    return { available: false, reason: firstLine(e instanceof Error ? e.message : String(e)) };
+  } finally {
+    if (ownsMeterDb) {
+      await meterDb.close();
+      rootLogger.level = prevLogLevel;
+    }
+  }
+}
+
+async function main(): Promise<void> {
+  const { days, asOf, db: dbPath, json, zeroSince, noGithub } = parseArgs(process.argv.slice(2));
   if (!existsSync(dbPath)) fail(3, `database not found: ${dbPath}`);
   let db: Database;
   try {
@@ -273,6 +691,8 @@ function main(): void {
   let actions: { action: string; count: number }[];
   let start: string;
   let outcomes: Outcomes;
+  let zeroTier: ZeroTier | null = null;
+  let attribution: WoUnits = { units: new Map(), unattributed: 0 };
   try {
     start = (
       db.query('select datetime($asof, $d) as s').get({ $asof: asOf, $d: dayArg }) as {
@@ -323,24 +743,38 @@ function main(): void {
       )
       .all({ $asof: asOf, $d: dayArg }) as { action: string; count: number }[];
     outcomes = readOutcomes(db, asOf);
+    if (zeroSince !== null) zeroTier = readZeroTier(db, zeroSince);
+    attribution = attributeRuns(db, asOf, dayArg);
   } catch (e) {
     return fail(3, `query failed on ${dbPath}: ${(e as Error).message}`);
   } finally {
     db.close();
   }
 
+  const woCompletion = await computeWoCompletion(attribution.units, asOf, { noGithub });
+  const asOfMs = Date.parse(asOf.replace(' ', 'T') + 'Z');
+  const legacyUntilMs = Date.parse(LEGACY_OVERALL_UNTIL + 'T00:00:00Z');
+  const showLegacy = asOfMs < legacyUntilMs;
+
   const completed = overall.completed ?? 0;
+  const legacyRate = rate(completed, overall.total);
   const report = {
     window: { as_of: asOf, days, start },
     total: overall.total,
     completed,
-    rate: rate(completed, overall.total),
+    rate: legacyRate,
+    ...(showLegacy
+      ? { legacy_overall: { total: overall.total, completed, rate: legacyRate } }
+      : {}),
     lanes: lanes.map(l => ({ ...l, rate: rate(l.completed, l.total) })),
     failing_steps: steps,
     failed_without_outcome: noOutcome.failed_without_outcome,
     overseer_actions: actions,
+    unattributed_runs: attribution.unattributed,
+    wo_completion: woCompletion,
     outcome_flag_line: flagLine(outcomes.flags),
     outcomes,
+    ...(zeroTier ? { zero_tier: zeroTier } : {}),
   };
 
   if (json) {
@@ -350,7 +784,25 @@ function main(): void {
   const out: string[] = [];
   out.push(report.outcome_flag_line);
   out.push(`window: ${start} to ${asOf} (${days} days, UTC)`);
-  out.push(`overall: ${report.completed}/${report.total} completed, rate ${report.rate}`);
+  if (showLegacy)
+    out.push(
+      `overall (legacy run completion, retiring ${LEGACY_OVERALL_UNTIL}): ` +
+        `${report.completed}/${report.total} completed, rate ${report.rate}`
+    );
+  if (woCompletion.available) {
+    out.push(
+      `wo_merged_or_owned: ${woCompletion.num}/${woCompletion.den} rate ${woCompletion.rate}`
+    );
+    out.push(
+      `wo_breakdown: merged ${woCompletion.merged}, owned ${woCompletion.owned}, ` +
+        `neither ${woCompletion.neither}`
+    );
+    out.push('wo_neither:');
+    for (const w of woCompletion.neither_wos) out.push(`  ${w}`);
+  } else {
+    out.push(`wo_merged_or_owned: unavailable (${woCompletion.reason})`);
+  }
+  out.push(`unattributed_runs: ${report.unattributed_runs}`);
   out.push('lanes:');
   for (const l of report.lanes)
     out.push(`  ${l.workflow_name}: ${l.completed}/${l.total} completed, rate ${l.rate}`);
@@ -367,7 +819,23 @@ function main(): void {
       `  mailbox ${m.recipient}: depth ${m.depth}, live ${m.depth_live}, ` +
         `oldest_live ${m.oldest_live ?? 'none'}, age_h ${m.oldest_live_age_hours ?? 'none'}`
     );
+  if (zeroTier) {
+    out.push(`zero_tier (since ${zeroTier.since}):`);
+    out.push('zero_tier_first10:');
+    for (const r of zeroTier.runs) {
+      const stepsText = r.failed_steps.length === 0 ? '' : ` [steps: ${r.failed_steps.join(', ')}]`;
+      out.push(`  ${r.run} ${r.status}${stepsText}`);
+    }
+    out.push(`zero_tier_failed: ${zeroTier.failed}/${zeroTier.total}`);
+    out.push(
+      `zero_tier_verdict: ${zeroTier.verdict}` +
+        (zeroTier.verdict === 'PENDING' ? ` ${zeroTier.total}/${ZERO_SAMPLE}` : '')
+    );
+    out.push(`zero_tier_cancelled: ${zeroTier.cancelled}`);
+  }
   process.stdout.write(out.join('\n') + '\n');
 }
 
-main();
+if (import.meta.main) {
+  main().catch(e => fail(3, `unexpected: ${(e as Error).message}`));
+}
