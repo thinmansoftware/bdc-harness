@@ -10,6 +10,10 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { serviceGitHubCommandEnvironment } from '@archon/core/github/service-identity';
 import { assertGitHubPoolAvailable, recordGitHubApiCall } from '@archon/core/github/metering';
+import {
+  listOpenWoPullRequests as defaultListOpenWoPullRequests,
+  type OpenWoPullRequest,
+} from './already-satisfied.js';
 import type { PollResult } from './types.js';
 
 const execFileAsync = promisify(execFile);
@@ -203,6 +207,19 @@ interface PollOptions {
    * production always uses the real gh CLI (checkPrMergeableDefault).
    */
   checkPrMergeable?: (prUrl: string) => Promise<boolean | null>;
+  /**
+   * WO id for crediting an already-open PR whose head SHA this run pushed.
+   * Absent: the URL-based PR check is unchanged. Hermetic mode does not call GitHub.
+   */
+  woId?: string;
+  /**
+   * OPEN WO PRs used to credit a pushed head when the run recorded no PR URL.
+   * Tests inject this. Production calls listOpenWoPullRequests.
+   */
+  listOpenWoPullRequests?: (opts: {
+    woId: string;
+    project: string;
+  }) => Promise<readonly Pick<OpenWoPullRequest, 'headSha'>[]>;
 }
 
 /**
@@ -228,6 +245,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
     repo = null,
     ghPrListForBranch = ghPrListForBranchDefault,
     checkPrMergeable: checkPrMergeableFn = checkPrMergeableDefault,
+    listOpenWoPullRequests: listOpenPrs = defaultListOpenWoPullRequests,
   } = opts;
   const token = tokenOverride ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
   const doFetch = opts.fetchImpl ?? fetch;
@@ -260,9 +278,12 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
         | 'escalated'
         | 'cancelled';
       let events = detail.events ?? [];
+      let runMetadata: Record<string, unknown> = detail.run.metadata ?? {};
 
       let validatorVerdict = extractValidatorVerdict(events);
       let prUrl = extractPrUrl(events);
+      let runPushedHeadSha: string | null = null;
+      let openWoPrHeadSha: string | null = null;
 
       // Race guard: run status can flip to "completed" before the
       // open-pr-if-needed node event lands in the event feed. A single read
@@ -274,6 +295,7 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
           await new Promise<void>(resolve => setTimeout(resolve, prRetryDelayMs));
           const retryDetail = await fetchRunDetail(runId, apiBaseUrl, token, doFetch);
           events = retryDetail.events ?? [];
+          runMetadata = retryDetail.run.metadata ?? {};
           prUrl = extractPrUrl(events);
           // The validator event can lag for the same reason -- refresh it too.
           if (validatorVerdict === 'unknown') {
@@ -300,6 +322,18 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
             );
           }
         }
+        if (prUrl === null && opts.woId && repo) {
+          const credited = await creditRunPushedOpenPr(
+            runId,
+            opts.woId,
+            repo,
+            runMetadata,
+            events,
+            listOpenPrs
+          );
+          runPushedHeadSha = credited.runPushedHeadSha;
+          openWoPrHeadSha = credited.openWoPrHeadSha;
+        }
       }
 
       const prMergeable = prUrl ? await checkPrMergeableFn(prUrl) : null;
@@ -311,6 +345,8 @@ export async function pollForTerminal(opts: PollOptions): Promise<PollResult> {
         validatorVerdict,
         prUrl,
         prMergeable,
+        runPushedHeadSha,
+        openWoPrHeadSha,
         servedModelId,
         nodeModels: extractNodeModels(events),
         rawMetadata: detail.run.metadata ?? {},
@@ -613,6 +649,106 @@ async function findExistingPrForBranch(
     if (url !== null) return url;
   }
   return null;
+}
+
+const SHA40 = /^[0-9a-f]{40}$/i;
+
+function validHeadSha(value: unknown): string | null {
+  if (typeof value !== 'string' || !SHA40.test(value)) return null;
+  return value.toLowerCase();
+}
+
+/**
+ * Last structured pushed-head SHA in one node blob.
+ *
+ * Production commit-and-push prints
+ * `VERIFIED: origin/<branch> == local HEAD (<40 hex>)` after `git ls-remote`
+ * matches local HEAD (bdc-feature-development and siblings). open-pr-if-needed
+ * prints `ORIGIN_PRECONDITION_OK: origin/<branch> == <40 hex>` for the same
+ * proof, including after a re-push. `pushed_head=<40 hex>` is accepted where a
+ * node emits it. A bare 40-hex string in prose is not evidence.
+ */
+function lastStructuredHeadSha(text: string): string | null {
+  const patterns = [
+    /(?:^|\s)pushed_head=([0-9a-f]{40})(?![0-9a-f])/gi,
+    /VERIFIED:\s+origin\/\S+\s+==\s+local HEAD \(([0-9a-f]{40})\)/gi,
+    /ORIGIN_PRECONDITION_OK:\s+origin\/\S+\s+==\s+([0-9a-f]{40})\b/gi,
+  ];
+  let best: { index: number; sha: string } | null = null;
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const sha = match[1];
+      const index = match.index ?? -1;
+      if (!sha || index < 0) continue;
+      if (!best || index >= best.index) best = { index, sha: sha.toLowerCase() };
+    }
+  }
+  return best?.sha ?? null;
+}
+
+/**
+ * Trusted producers of pushed-head proof. commit-and-push (and per-surface
+ * siblings such as commit-and-push-ui) print VERIFIED / pushed_head after the
+ * push. open-pr-if-needed is the origin re-check and may print
+ * ORIGIN_PRECONDITION_OK after a re-push. Any other node can quote those lines
+ * from an earlier run, so its text is not proof.
+ */
+function isTrustedPushedHeadStep(stepName: string | null | undefined): boolean {
+  if (typeof stepName !== 'string' || stepName.length === 0) return false;
+  if (stepName === 'commit-and-push' || stepName.startsWith('commit-and-push-')) return true;
+  return stepName === 'open-pr-if-needed';
+}
+
+/**
+ * Pushed head from this run's push or origin-check nodes. Later trusted events
+ * win, so a re-push replaces the earlier SHA. The same verification text quoted
+ * by any other node is ignored. Metadata `head_sha` or `pushed_head_sha` is
+ * used only when no trusted node recorded a SHA.
+ */
+function extractRunPushedHeadSha(
+  metadata: Record<string, unknown>,
+  events: { step_name?: string | null; data: Record<string, unknown> }[]
+): string | null {
+  let fromEvents: string | null = null;
+  for (const ev of events) {
+    if (!isTrustedPushedHeadStep(ev.step_name)) continue;
+    const sha = lastStructuredHeadSha(extractEventText(ev.data));
+    if (sha) fromEvents = sha;
+  }
+  if (fromEvents) return fromEvents;
+  return validHeadSha(metadata.head_sha) ?? validHeadSha(metadata.pushed_head_sha);
+}
+
+/**
+ * Credit an open WO PR only when exactly one candidate's head SHA equals the
+ * run's pushed SHA. Lookup failure leaves both fields null. Hermetic mode
+ * makes no GitHub call (listOpenWoPullRequests returns []).
+ */
+async function creditRunPushedOpenPr(
+  runId: string,
+  woId: string,
+  repo: string,
+  metadata: Record<string, unknown>,
+  events: { step_name?: string | null; data: Record<string, unknown> }[],
+  listOpenPrs: (opts: {
+    woId: string;
+    project: string;
+  }) => Promise<readonly Pick<OpenWoPullRequest, 'headSha'>[]>
+): Promise<{ runPushedHeadSha: string | null; openWoPrHeadSha: string | null }> {
+  const empty = { runPushedHeadSha: null, openWoPrHeadSha: null };
+  const pushed = extractRunPushedHeadSha(metadata, events);
+  if (!pushed) return empty;
+  try {
+    const opens = await listOpenPrs({ woId, project: repo });
+    const matches = opens.filter(pr => validHeadSha(pr.headSha) === pushed);
+    if (matches.length !== 1) return empty;
+    const openSha = validHeadSha(matches[0]?.headSha);
+    if (!openSha) return empty;
+    return { runPushedHeadSha: pushed, openWoPrHeadSha: openSha };
+  } catch (err) {
+    console.log(`[poll] run ${runId} open WO PR lookup failed: ${(err as Error).message}`);
+    return empty;
+  }
 }
 
 /**

@@ -200,6 +200,11 @@ export interface CascadeRunRecord {
    * (terminate as needs-human) later. See FrontierApprovalPacket.
    */
   frontierApproval?: FrontierApprovalPacket;
+  /**
+   * Other OPEN WO PRs passed over when a climb selected the newest one.
+   * Absent when the climb had zero or one open PR, or no climb repair decision.
+   */
+  repairTargetAlternates?: readonly { number: number; headRefName: string }[];
 }
 
 export interface GateVerdict {
@@ -231,6 +236,21 @@ export interface PollResult {
   validatorVerdict: 'satisfied' | 'needs_revision' | 'unknown';
   prUrl: string | null;
   prMergeable: boolean | null;
+  /**
+   * Head SHA this run pushed. Taken only from a trusted push node
+   * (`commit-and-push` or `commit-and-push-<surface>`) or the origin-check
+   * node `open-pr-if-needed`: a `VERIFIED: origin/<branch> == local HEAD
+   * (<40 hex>)` line, an `ORIGIN_PRECONDITION_OK: origin/<branch> == <40 hex>`
+   * line, or `pushed_head=<40 hex>`. The same text quoted by any other node
+   * is ignored. Metadata `head_sha` / `pushed_head_sha` applies only when no
+   * trusted node recorded a SHA. Null when absent.
+   */
+  runPushedHeadSha?: string | null;
+  /**
+   * Head SHA of the single open WO PR that matches `runPushedHeadSha`.
+   * Null unless exactly one open WO PR carries that SHA.
+   */
+  openWoPrHeadSha?: string | null;
   servedModelId: string | null;
   /** Last node_completed / node_failed model triple per step. */
   nodeModels?: Record<

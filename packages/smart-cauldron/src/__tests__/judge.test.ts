@@ -100,3 +100,67 @@ describe('classifyAttemptOutcome: cancelled', () => {
     expect(classifyAttemptOutcome(makeFireOk(), verdict)).toBe('won');
   });
 });
+
+describe('judgeGate: existing WO PR head', () => {
+  const pushed = 'a'.repeat(40);
+  const other = 'b'.repeat(40);
+
+  test('gate_counts_existing_wo_pr', () => {
+    const matched = judgeGate(
+      makePoll({
+        prUrl: null,
+        prMergeable: null,
+        runPushedHeadSha: pushed,
+        openWoPrHeadSha: pushed.toUpperCase(),
+      })
+    );
+    expect(matched.pass).toBe(true);
+    expect(matched.reason).not.toContain('no PR opened after completed run');
+
+    const differed = judgeGate(
+      makePoll({
+        prUrl: null,
+        prMergeable: null,
+        runPushedHeadSha: pushed,
+        openWoPrHeadSha: other,
+      })
+    );
+    expect(differed.pass).toBe(false);
+    expect(differed.reason).toContain('no PR opened after completed run');
+
+    const short = judgeGate(
+      makePoll({
+        prUrl: null,
+        prMergeable: null,
+        runPushedHeadSha: 'abc',
+        openWoPrHeadSha: 'abc',
+      })
+    );
+    expect(short.reason).toContain('no PR opened after completed run');
+
+    const needsRevision = judgeGate(
+      makePoll({
+        prUrl: null,
+        prMergeable: null,
+        validatorVerdict: 'needs_revision',
+        runPushedHeadSha: pushed,
+        openWoPrHeadSha: pushed,
+      })
+    );
+    expect(needsRevision.pass).toBe(false);
+    expect(needsRevision.reason).toContain('needs_revision');
+    expect(needsRevision.reason).not.toContain('no PR opened after completed run');
+
+    const unmergeable = judgeGate(
+      makePoll({
+        prUrl: null,
+        prMergeable: false,
+        runPushedHeadSha: pushed,
+        openWoPrHeadSha: pushed,
+      })
+    );
+    expect(unmergeable.pass).toBe(false);
+    expect(unmergeable.reason).toContain('not mergeable');
+    expect(unmergeable.reason).not.toContain('no PR opened after completed run');
+  });
+});
