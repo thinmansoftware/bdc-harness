@@ -300,6 +300,13 @@ export interface MergeCandidateDiscoveryDeps {
   ): Promise<readonly DiscoveredPullRequest[]>;
   /** Durable sandbox-review qualification. Production wiring must provide it. */
   hasQualifiedReview?(input: PullRequestRef & { headSha: string }): Promise<boolean>;
+  /**
+   * Branch-protection lookups, the same seam the merge bridge uses. When the
+   * base's required contexts are known and non-empty, only those contexts can
+   * exclude a candidate for checks_failing or checks_pending. When absent,
+   * discovery resolves with an empty env and keeps the all-checks rule.
+   */
+  requiredContextsLookups?: GitHubClientDeps['requiredContextsLookups'];
 }
 
 export interface GitHubClientDeps {
