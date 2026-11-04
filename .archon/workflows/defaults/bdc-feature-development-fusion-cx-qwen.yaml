@@ -3763,6 +3763,12 @@ nodes:
   - id: apply-diff-review-final
     provider: claude
     model: sonnet
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
     agent: claude-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done
