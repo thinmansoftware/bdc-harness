@@ -40,7 +40,11 @@ import type {
 } from './required-contexts.ts';
 import { createDurableAttemptCounterStore } from './required-contexts-store';
 import { classifyRateLimitError } from '../github-rate-limit';
-import { latestAttemptPerCheck } from '../pr-review-check-ingest';
+import {
+  attachWorkflowAttempts,
+  latestAttemptPerCheck,
+  type WorkflowAttempt,
+} from '../pr-review-check-ingest';
 
 const log = createLogger('overseer/github-real-deps');
 
@@ -294,6 +298,12 @@ export interface RealGitHubOctokitLike {
           check_suite?: { id?: number } | null;
         }[];
       };
+    }>;
+  };
+  /** Actions job lookup (job id = check-run id); used only for twin candidates. */
+  actions?: {
+    getJobForWorkflowRun?(input: Record<string, unknown>): Promise<{
+      data: { run_id?: number; run_attempt?: number };
     }>;
   };
   repos?: {
@@ -620,6 +630,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
         completed_at: run.completed_at,
         app: run.app,
         check_suite: run.check_suite,
+        workflow_attempt: run.workflow_attempt,
       })),
       requiredContexts,
     };
@@ -938,6 +949,30 @@ interface ListedCheckRun {
   completed_at?: string | null;
   app?: { slug?: string; name?: string };
   check_suite?: { id?: number } | null;
+  workflow_attempt?: WorkflowAttempt | null;
+}
+
+/**
+ * Actions run/attempt of one job, or null when this client cannot look it up
+ * or the id is not an Actions job. Errors propagate to attachWorkflowAttempts,
+ * which treats them as "unknown" (timestamp fallback).
+ */
+export function actionsJobAttemptLookup(
+  octokit: { actions?: RealGitHubOctokitLike['actions'] },
+  input: { owner: string; repo: string }
+): (checkRunId: number) => Promise<WorkflowAttempt | null> {
+  return async checkRunId => {
+    const actions = octokit.actions;
+    if (!actions || typeof actions.getJobForWorkflowRun !== 'function') return null;
+    const response = await actions.getJobForWorkflowRun({
+      owner: input.owner,
+      repo: input.repo,
+      job_id: checkRunId,
+    });
+    const { run_id: runId, run_attempt: runAttempt } = response.data;
+    if (typeof runId !== 'number' || typeof runAttempt !== 'number') return null;
+    return { run_id: runId, run_attempt: runAttempt };
+  };
 }
 
 /**
@@ -962,7 +997,9 @@ async function listEveryCheckRun(
     });
     const pageRuns = response.data.check_runs ?? [];
     runs.push(...pageRuns);
-    if (pageRuns.length < REQUIRED_EVIDENCE_PAGE_SIZE) return runs;
+    if (pageRuns.length < REQUIRED_EVIDENCE_PAGE_SIZE) {
+      return attachWorkflowAttempts(runs, actionsJobAttemptLookup(octokit, input));
+    }
   }
 }
 

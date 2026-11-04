@@ -23,8 +23,8 @@ import type {
   StandingVerdict,
 } from './pr-review-check-ingest.ts';
 import type { SubmitOutcome } from './pr-review-submit.ts';
-import { recheckCorrelationId } from './pr-review-check-ingest';
-import { createRealOctokitClient } from './adapters/github-real-deps';
+import { attachWorkflowAttempts, recheckCorrelationId } from './pr-review-check-ingest';
+import { actionsJobAttemptLookup, createRealOctokitClient } from './adapters/github-real-deps';
 import {
   REVIEW_RECIPIENT,
   REVIEW_SENDER,
@@ -43,6 +43,11 @@ interface CheckRunsForRefClient {
   checks: {
     listForRef(input: Record<string, unknown>): Promise<{
       data: { check_runs?: unknown[] };
+    }>;
+  };
+  actions?: {
+    getJobForWorkflowRun?(input: Record<string, unknown>): Promise<{
+      data: { run_id?: number; run_attempt?: number };
     }>;
   };
 }
@@ -68,7 +73,13 @@ export async function listCheckRunsForRefFromOctokit(
       });
       const pageRuns = (response.data.check_runs ?? []) as RecheckCheckRun[];
       runs.push(...pageRuns);
-      if (pageRuns.length < CHECK_RUN_PAGE_SIZE) return { runs, complete: true };
+      if (pageRuns.length < CHECK_RUN_PAGE_SIZE) {
+        const enriched = await attachWorkflowAttempts(
+          runs,
+          actionsJobAttemptLookup(octokit, { owner: input.owner, repo: input.repo })
+        );
+        return { runs: enriched, complete: true };
+      }
     } catch {
       return { runs, complete: false };
     }
