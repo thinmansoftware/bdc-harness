@@ -78,8 +78,15 @@ stamp-manifest-evidence, and makes one call in each node:
   $ARTIFACTS_DIR/stop-tests-base-wt.<pid>, runs dprep_ensure_js_deps and the same commands
   there through rst_run_commands (same per-command timeout), logs to
   $ARTIFACTS_DIR/evidence/stop-tests-base.log, and always removes the worktree.
-  Failing tests are identified from bun "(fail) <name>", node:test "not ok <n> - <name>",
-  jest bullet lines and vitest "FAIL <file> > <name>" lines. If every head failure also
+  Evidence is judged per command (one "### run-stop-tests:" block of the log each): every
+  head command that exited nonzero or reported a failing test must have its own parsed
+  counts, no timeout, and exactly one file-attributed name per failing test with no name
+  repeated; otherwise the result fails closed before the base runs. A test's identity is
+  command index + file + name, so one command's names never cover another command's
+  failures and equal names in different files never match. Files and names come from bun
+  "<file>:" / "::group::<file>:" headers plus "(fail) <name>", node:test "# Subtest:
+  <file>" plus "not ok <n> - <name>", jest "FAIL <file>" plus bullet lines, and vitest
+  "FAIL <file> > <name>" lines. If every head failure also
   fails on base, it prints TESTS_STATUS=base_red and
   TESTS_LINE=<pass>/<total> (base-red: <k> tests failing on base <sha8>; newly broken: 0)
   and writes the names to $ARTIFACTS_DIR/base-red-tests.txt. Otherwise the status stays
@@ -93,7 +100,7 @@ stamp-manifest-evidence, and makes one call in each node:
   names. sme_process and manifest-evidence-check accept base_red because its Tests: line
   starts with <pass>/<total> and its status is not "failed".
 
-Tests: bash .archon/workflows/defaults/__tests__/run-stop-tests.sh (Tests 1-7 of
+Tests: bash .archon/workflows/defaults/__tests__/run-stop-tests.sh (Tests 1-9 of
 WO-HARNESS-STOP-TESTS-BASE-RED-AWARE-01, against real temporary git repos).
 
 Bumping a version
