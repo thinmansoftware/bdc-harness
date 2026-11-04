@@ -160,3 +160,6 @@ export { getPort } from './utils/port-allocation';
 
 // Worktree sync
 export { syncArchonToWorktree } from './utils/worktree-sync';
+
+// Managed source clone sync before workflow discovery
+export { syncManagedSourceBeforeDiscovery } from './orchestrator/dispatch-discovery-sync';

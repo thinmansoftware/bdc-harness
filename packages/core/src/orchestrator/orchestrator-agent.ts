@@ -35,6 +35,7 @@ import type { ProviderName } from '@archon/providers/auth-refresh';
 import { AuthRefreshedRetryNeeded } from './auth-retry-sentinel';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { syncArchonToWorktree } from '../utils/worktree-sync';
+import { syncManagedSourceBeforeDiscovery } from './dispatch-discovery-sync';
 import { syncWorkspace, toRepoPath } from '@archon/git';
 import type { WorkspaceSyncResult } from '@archon/git';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
@@ -1746,6 +1747,8 @@ async function discoverWorkflowForCodebase(
   | { ok: true; workflow?: WorkflowDefinition; loadError?: WorkflowLoadError }
   | { ok: false; error: Error }
 > {
+  // Callers pass codebase.default_cwd; reset a managed clone before discovery.
+  await syncManagedSourceBeforeDiscovery(workflowCwd, workflowCwd);
   try {
     await syncArchonToWorktree(workflowCwd);
   } catch (error) {
@@ -2021,6 +2024,9 @@ async function handleWorkflowRunCommand(
       'workflow_codebase_bound'
     );
     const workflowCwd = conversation.cwd ?? codebase.default_cwd;
+    // Sync a managed source clone to origin BEFORE discovery so a fire right after a
+    // dev merge loads the merged lane (WO-HARNESS-A2-ENGAGES-ALL-REPOS-01).
+    await syncManagedSourceBeforeDiscovery(workflowCwd, codebase.default_cwd);
     try {
       await syncArchonToWorktree(workflowCwd);
     } catch (error) {
