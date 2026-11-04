@@ -99,6 +99,7 @@ export interface PrReviewCheck {
   started_at?: string | null;
   completed_at?: string | null;
   app?: { slug?: string; name?: string };
+  check_suite?: { id?: number } | null;
 }
 
 export interface PrReviewCheckPartition {
