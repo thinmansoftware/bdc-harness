@@ -2115,6 +2115,48 @@ export async function supersedeMessage(data: {
   });
 }
 
+/**
+ * Retire a QUEUED row because a claimed row already covers its work
+ * (WO-HARNESS-OVERSEER-RECHECK-DEDUPE-PER-HEAD-01: the review worker supersedes
+ * redundant queued reviews of the head it just claimed). Unlike
+ * `supersedeMessage` no replacement row is created -- the replacement is the
+ * row that was claimed, named in `reason`. The row is marked
+ * status='cancelled' + route_disposition='superseded' (never a bare cancel)
+ * and `reason` is stored as `result_body` = {"reason": <reason>,
+ * "superseded_by": <claimed id>}. Only a row still 'queued' is touched, so a
+ * row another worker claimed in the meantime is left alone; returns null then.
+ */
+export async function supersedeQueuedMessageByClaim(data: {
+  id: string;
+  claimed_id: string;
+  reason: string;
+}): Promise<DispatchMessage | null> {
+  if (data.id === data.claimed_id) return null;
+  const db = getDatabase();
+  const resultBody = JSON.stringify({ reason: data.reason, superseded_by: data.claimed_id });
+  const sql = `UPDATE agent_dispatch_messages
+     SET status = 'cancelled',
+         route_disposition = 'superseded',
+         completed_at = $2,
+         result_body = $3,
+         lease_owner = NULL,
+         lease_expires_at = NULL
+     WHERE id = $1
+       AND status = 'queued'`;
+  if (db.dialect === 'postgres') {
+    const result = await db.query<DispatchMessageRow>(`${sql} RETURNING *`, [
+      data.id,
+      nowIso(),
+      resultBody,
+    ]);
+    const row = result.rows[0];
+    return row ? normalizeMessage(row) : null;
+  }
+  const result = await db.query(sql, [data.id, nowIso(), resultBody]);
+  if (result.rowCount !== 1) return null;
+  return getMessage(data.id);
+}
+
 export type DispatchEscalationLeg = 'telegram' | 'sms';
 
 export async function claimDispatchEscalation(data: {
