@@ -92,13 +92,15 @@ stamp-manifest-evidence, and makes one call in each node:
   and writes the names to $ARTIFACTS_DIR/base-red-tests.txt. Otherwise the status stays
   failed (with "newly broken: <names>" when known). A missing or bad base sha, missing
   counts, failures that cannot be named, a base timeout (exit 124) or a worktree that
-  cannot be created all fail closed. Before the base run every
-  spelling of the head checkout root in a command (git form, pwd and pwd -P, cygpath
-  forms, trailing slash) is rebased onto the base worktree; a command that still names
-  the head root (in any letter case) or cds to an absolute directory outside the base
-  worktree fails closed as escapes_worktree, and the base never runs. It always appends TESTS_BASE_COMPARE=<outcome>
+  cannot be created all fail closed. The base comparison runs only when every
+  test command is on an allowlist, run from the repo root: bun run <script>, bun test
+  [paths], npm test, npm run <script>, pnpm test, pnpm run <script>, node --test [paths],
+  yarn test, yarn <script> (<script> is [A-Za-z0-9:_-]+; paths are relative with no ..
+  segment; only --flag or --flag=value flags; no cd, &&, ||, ;, |, redirects, $,
+  backticks, env assignments or absolute paths). Any other command keeps the result
+  failed as command_not_comparable, and no base worktree is created. It always appends TESTS_BASE_COMPARE=<outcome>
   (not_failed, base_red, newly_broken, base_passed, unparsed, no_base_sha, no_counts,
-  base_timeout, base_unrunnable, escapes_worktree, or script_missing from the fallback stub).
+  base_timeout, base_unrunnable, command_not_comparable, or script_missing from the fallback stub).
 - stamp-manifest-evidence pipes sme_process's output through stb_stamp_base_red, which
   adds "Base-red tests: <a>; <b> ..." after the Tests: line when base-red-tests.txt lists
   names. sme_process and manifest-evidence-check accept base_red because its Tests: line

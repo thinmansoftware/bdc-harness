@@ -1217,7 +1217,8 @@ done
 #   "<file>:" header per file and "(pass)/(fail) suite > <name>" lines (or, when
 #   plain.txt exists, only a "Passed: Failed: Total:" summary with no per-test
 #   markers) and exits 1 on any failure. crash.sh exits 2 with no counts when crash.txt
-#   exists ($STB_HEAD_CRASH=1 adds it on head only), else prints "1 pass". The base
+#   exists ($STB_HEAD_CRASH=1 adds it on head only), else prints "1 pass". package.json
+#   exposes them as the allowlisted "bun run test" / "bun run crash". The base
 #   commit carries .base-marker (run.sh touches $STB_MARK when it runs at base) plus an
 #   optional extra base-only file; the head commit removes both and changes fails.txt.
 #   Prints the base sha.
@@ -1233,6 +1234,7 @@ if [ -f crash.txt ]; then echo "Segmentation fault (core dumped)"; exit 2; fi
 echo " 1 pass"
 echo " 0 fail"
 CRASH
+    printf '{\n  "name": "stb-fixture",\n  "private": true,\n  "scripts": { "test": "bash ./run.sh", "crash": "bash ./crash.sh" }\n}\n' > package.json
     cat > run.sh <<'RUNSH'
 #!/usr/bin/env bash
 if [ -f .base-marker ] && [ -n "${STB_MARK:-}" ]; then : > "$STB_MARK"; fi
@@ -1275,7 +1277,7 @@ RUNSH
 #   <art>/report and sets STB_COUNTS.
 stb_head() {
   local repo="$1" art="$2" res ex cmdline
-  printf '%b' "${STB_CMDS:-bash ./run.sh\n}" > "$art/cmds"
+  printf '%b' "${STB_CMDS:-bun run test\n}" > "$art/cmds"
   cmdline="$(grep -v '^$' "$art/cmds" | paste -sd ';' - | sed 's/;/; /g')"
   : > "$art/head.log"
   res="$(cd "$repo" && rst_run_commands "$art/cmds" "$art/head.log")"
@@ -1299,7 +1301,7 @@ assert_eq "Test 1 base_red_only_passes: head is failed before the compare" "fail
 T1_OUT="$(cd "$STB_ROOT/t1/repo" && STB_MARK="$STB_ROOT/t1/mark" ARTIFACTS_DIR="$STB_ROOT/t1/art" rst_base_compare "$STB_ROOT/t1/art/report" "$STB_ROOT/t1/art/cmds" "$STB_ROOT/t1/art/head.log" "$STB_COUNTS" 2>/dev/null)"
 assert_eq "Test 1 base_red_only_passes: TESTS_STATUS=base_red" "base_red" "$(stb_field TESTS_STATUS "$T1_OUT")"
 assert_eq "Test 1 base_red_only_passes: TESTS_LINE starts <pass>/<total> with newly broken: 0" \
-  "2/4 (base-red: 2 tests failing on base $(printf '%s' "$T1_SHA" | cut -c1-8); newly broken: 0) (bash ./run.sh) [source: wo-spec]" \
+  "2/4 (base-red: 2 tests failing on base $(printf '%s' "$T1_SHA" | cut -c1-8); newly broken: 0) (bun run test) [source: wo-spec]" \
   "$(stb_field TESTS_LINE "$T1_OUT")"
 assert_eq "Test 1 base_red_only_passes: outcome" "base_red" "$(stb_field TESTS_BASE_COMPARE "$T1_OUT")"
 assert_eq "Test 1 base_red_only_passes: base-red-tests.txt lists A and B" "$(printf 's.test.ts :: suite > A\ns.test.ts :: suite > B')" "$(cat "$STB_ROOT/t1/art/base-red-tests.txt" 2>/dev/null)"
@@ -1323,7 +1325,7 @@ STB_NODE="$STB_ROOT/run-stop-tests-node.sh"
 stb_render_node > "$STB_NODE"
 assert_eq "rendered node calls rst_base_compare once" "1" "$(grep -c '^rst_base_compare ' "$STB_NODE")"
 STB_SPEC_FILE="$STB_ROOT/spec.md"
-printf 'WO Class: CODE\n\n## 8. Stop conditions\n\nStop 2 (test suite):\n  bash ./run.sh\n  Expected: all pass\n' > "$STB_SPEC_FILE"
+printf 'WO Class: CODE\n\n## 8. Stop conditions\n\nStop 2 (test suite):\n  bun run test\n  Expected: all pass\n' > "$STB_SPEC_FILE"
 export STB_SPEC_FILE
 mkdir -p "$STB_ROOT/e1/repo" "$STB_ROOT/e1/art"
 E1_SHA="$(stb_fixture "$STB_ROOT/e1/repo" 'A\nB\n' 'A\nB\n')"
@@ -1341,7 +1343,7 @@ echo "$T2_SHA" > "$STB_ROOT/t2/art/run-start-sha.txt"
 stb_head "$STB_ROOT/t2/repo" "$STB_ROOT/t2/art"
 T2_OUT="$(cd "$STB_ROOT/t2/repo" && STB_MARK="$STB_ROOT/t2/mark" ARTIFACTS_DIR="$STB_ROOT/t2/art" rst_base_compare "$STB_ROOT/t2/art/report" "$STB_ROOT/t2/art/cmds" "$STB_ROOT/t2/art/head.log" "$STB_COUNTS" 2>/dev/null)"
 assert_eq "Test 2 newly_broken_fails: TESTS_STATUS=failed" "failed" "$(stb_field TESTS_STATUS "$T2_OUT")"
-assert_eq "Test 2 newly_broken_fails: TESTS_LINE names C as newly broken" "2/4 (bash ./run.sh) -- FAILED, exit 1; newly broken: s.test.ts :: suite > C [source: wo-spec]" "$(stb_field TESTS_LINE "$T2_OUT")"
+assert_eq "Test 2 newly_broken_fails: TESTS_LINE names C as newly broken" "2/4 (bun run test) -- FAILED, exit 1; newly broken: s.test.ts :: suite > C [source: wo-spec]" "$(stb_field TESTS_LINE "$T2_OUT")"
 assert_eq "Test 2 newly_broken_fails: outcome" "newly_broken" "$(stb_field TESTS_BASE_COMPARE "$T2_OUT")"
 assert_eq "Test 2 newly_broken_fails: no base-red-tests.txt" "no" "$([ -e "$STB_ROOT/t2/art/base-red-tests.txt" ] && echo yes || echo no)"
 assert_eq "Test 2 newly_broken_fails: the base commit really ran" "yes" "$([ -f "$STB_ROOT/t2/mark" ] && echo yes || echo no)"
@@ -1443,7 +1445,7 @@ stb_fixture "$STB_ROOT/t6/repo" 'A\n' '' > "$STB_ROOT/t6/art/run-start-sha.txt"
 printf 'stale\n' > "$STB_ROOT/t6/art/base-red-tests.txt"
 T6_OUT="$(cd "$STB_ROOT/t6/repo" && STB_MARK="$STB_ROOT/t6/mark" ARTIFACTS_DIR="$STB_ROOT/t6/art" bash "$STB_NODE" 2>/dev/null)"
 assert_eq "Test 6 passing_head_never_runs_base: TESTS_STATUS=passed" "passed" "$(stb_field TESTS_STATUS "$T6_OUT")"
-assert_eq "Test 6 passing_head_never_runs_base: TESTS_LINE unchanged" "4/4 (bash ./run.sh) [source: wo-spec]" "$(stb_field TESTS_LINE "$T6_OUT")"
+assert_eq "Test 6 passing_head_never_runs_base: TESTS_LINE unchanged" "4/4 (bun run test) [source: wo-spec]" "$(stb_field TESTS_LINE "$T6_OUT")"
 assert_eq "Test 6 passing_head_never_runs_base: outcome" "not_failed" "$(stb_field TESTS_BASE_COMPARE "$T6_OUT")"
 assert_eq "Test 6 passing_head_never_runs_base: base never ran" "no" "$([ -f "$STB_ROOT/t6/mark" ] && echo yes || echo no)"
 assert_eq "Test 6 passing_head_never_runs_base: no base worktree created" "1 0" "$(stb_wt_count "$STB_ROOT/t6/repo") $(stb_leftover "$STB_ROOT/t6/art")"
@@ -1456,7 +1458,7 @@ echo "--- Test 8: crash_without_counts_fails_closed ---"
 # failure, one name) used to look complete; per command, crash.sh has no evidence.
 mkdir -p "$STB_ROOT/t8/repo" "$STB_ROOT/t8/art"
 STB_HEAD_CRASH=1 stb_fixture "$STB_ROOT/t8/repo" 'A\n' 'A\n' > "$STB_ROOT/t8/art/run-start-sha.txt"
-STB_CMDS='bash ./run.sh\nbash ./crash.sh\n' stb_head "$STB_ROOT/t8/repo" "$STB_ROOT/t8/art"
+STB_CMDS='bun run test\nbun run crash\n' stb_head "$STB_ROOT/t8/repo" "$STB_ROOT/t8/art"
 assert_eq "Test 8 crash_without_counts_fails_closed: aggregated head counts match the one name" "3 4" "$STB_COUNTS"
 T8_OUT="$(cd "$STB_ROOT/t8/repo" && STB_MARK="$STB_ROOT/t8/mark" ARTIFACTS_DIR="$STB_ROOT/t8/art" rst_base_compare "$STB_ROOT/t8/art/report" "$STB_ROOT/t8/art/cmds" "$STB_ROOT/t8/art/head.log" "$STB_COUNTS" 2>/dev/null)"
 assert_eq "Test 8 crash_without_counts_fails_closed: TESTS_STATUS=failed" "failed" "$(stb_field TESTS_STATUS "$T8_OUT")"
@@ -1466,7 +1468,7 @@ assert_eq "Test 8 crash_without_counts_fails_closed: no worktree left" "1 0" "$(
 # Control: the same two commands with no crash on head is base_red, named per command.
 mkdir -p "$STB_ROOT/t8c/repo" "$STB_ROOT/t8c/art"
 stb_fixture "$STB_ROOT/t8c/repo" 'A\n' 'A\n' > "$STB_ROOT/t8c/art/run-start-sha.txt"
-STB_CMDS='bash ./run.sh\nbash ./crash.sh\n' stb_head "$STB_ROOT/t8c/repo" "$STB_ROOT/t8c/art"
+STB_CMDS='bun run test\nbun run crash\n' stb_head "$STB_ROOT/t8c/repo" "$STB_ROOT/t8c/art"
 T8C_OUT="$(cd "$STB_ROOT/t8c/repo" && ARTIFACTS_DIR="$STB_ROOT/t8c/art" rst_base_compare "$STB_ROOT/t8c/art/report" "$STB_ROOT/t8c/art/cmds" "$STB_ROOT/t8c/art/head.log" "$STB_COUNTS" 2>/dev/null)"
 assert_eq "Test 8 control: no crash -> base_red" "base_red" "$(stb_field TESTS_STATUS "$T8C_OUT")"
 assert_eq "Test 8 control: base-red name carries the command index" "[cmd 1] s.test.ts :: suite > A" "$(cat "$STB_ROOT/t8c/art/base-red-tests.txt" 2>/dev/null)"
@@ -1494,44 +1496,43 @@ T9D_OUT="$(cd "$STB_ROOT/t9d/repo" && STB_MARK="$STB_ROOT/t9d/mark" ARTIFACTS_DI
 assert_eq "Test 9 same_name_different_file_fails_closed: repeated name in one command -> failed unparsed" "failed unparsed" "$(stb_field TESTS_STATUS "$T9D_OUT") $(stb_field TESTS_BASE_COMPARE "$T9D_OUT")"
 assert_eq "Test 9 same_name_different_file_fails_closed: repeated name never ran base" "no" "$([ -f "$STB_ROOT/t9d/mark" ] && echo yes || echo no)"
 
-echo "--- Test 10: absolute_head_path_fails_or_rebases ---"
-# (a) The command cds into the head checkout by absolute path. The base rerun must
-# run BASE code: base passes A, head fails A, so A is newly broken. Without the
-# rebase both runs execute the head script and A would be waived as base_red.
-mkdir -p "$STB_ROOT/t10a/repo" "$STB_ROOT/t10a/art"
-stb_fixture "$STB_ROOT/t10a/repo" '' 'A\n' > "$STB_ROOT/t10a/art/run-start-sha.txt"
-T10A_ABS="$(cd "$STB_ROOT/t10a/repo" && pwd)"
-STB_CMDS="cd $T10A_ABS && bash ./run.sh\n" stb_head "$STB_ROOT/t10a/repo" "$STB_ROOT/t10a/art"
-assert_eq "Test 10 absolute_head_path_fails_or_rebases (a): head failed on A" "failed" "$(stb_field TESTS_STATUS "$(cat "$STB_ROOT/t10a/art/report")")"
-T10A_OUT="$(cd "$STB_ROOT/t10a/repo" && STB_MARK="$STB_ROOT/t10a/mark" ARTIFACTS_DIR="$STB_ROOT/t10a/art" rst_base_compare "$STB_ROOT/t10a/art/report" "$STB_ROOT/t10a/art/cmds" "$STB_ROOT/t10a/art/head.log" "$STB_COUNTS" 2>/dev/null)"
-assert_eq "Test 10 absolute_head_path_fails_or_rebases (a): TESTS_STATUS=failed" "failed" "$(stb_field TESTS_STATUS "$T10A_OUT")"
-assert_contains "Test 10 absolute_head_path_fails_or_rebases (a): newly broken names A" "newly broken: s.test.ts :: suite > A" "$(stb_field TESTS_LINE "$T10A_OUT")"
-assert_eq "Test 10 absolute_head_path_fails_or_rebases (a): base code ran (base marker)" "yes" "$([ -f "$STB_ROOT/t10a/mark" ] && echo yes || echo no)"
-assert_contains "Test 10 absolute_head_path_fails_or_rebases (a): base command cd'd into the base worktree" "### run-stop-tests: cd $(cd "$STB_ROOT/t10a/art" && pwd)/stop-tests-base-wt." "$(cat "$STB_ROOT/t10a/art/evidence/stop-tests-base.log" 2>/dev/null)"
-assert_eq "Test 10 absolute_head_path_fails_or_rebases (a): worktree removed" "1 0" "$(stb_wt_count "$STB_ROOT/t10a/repo") $(stb_leftover "$STB_ROOT/t10a/art")"
-# Root spellings: git form, pwd form, trailing slash.
-T10_ROOTS="$(stb__head_roots "$(cd "$STB_ROOT/t10a/repo" && git rev-parse --show-toplevel)/")"
-assert_contains "Test 10 absolute_head_path_fails_or_rebases: roots include the pwd form" "$T10A_ABS" "$T10_ROOTS"
-assert_not_contains "Test 10 absolute_head_path_fails_or_rebases: roots carry no trailing slash" "$T10A_ABS/" "$T10_ROOTS"
-printf 'cd %s/ && bash ./run.sh\nbash %s/run.sh\n' "$T10A_ABS" "$T10A_ABS" > "$STB_ROOT/t10a/in.cmds"
-printf '%s\n' "$T10_ROOTS" > "$STB_ROOT/t10a/roots"
-stb__rebase_commands "$STB_ROOT/t10a/in.cmds" "$STB_ROOT/t10a/out.cmds" /base/wt "$STB_ROOT/t10a/roots"
-assert_eq "Test 10 absolute_head_path_fails_or_rebases: trailing slash and script path rebased" "$(printf 'cd /base/wt/ && bash ./run.sh\nbash /base/wt/run.sh')" "$(cat "$STB_ROOT/t10a/out.cmds")"
-printf 'bash %s/run.sh\n' "$(printf '%s' "$T10A_ABS" | tr 'a-z' 'A-Z')" > "$STB_ROOT/t10a/case.cmds"
-assert_eq "Test 10 absolute_head_path_fails_or_rebases: a head path in another letter case escapes" "1" "$(stb__rebase_commands "$STB_ROOT/t10a/case.cmds" "$STB_ROOT/t10a/case.out" /base/wt "$STB_ROOT/t10a/roots"; echo $?)"
-
-# (b) The command cds into an unrelated absolute directory (a copy of the head files,
-# not a git checkout). Base would run that directory's code: fail closed, never run base.
-mkdir -p "$STB_ROOT/t10b/repo" "$STB_ROOT/t10b/art" "$STB_ROOT/t10b/other"
-stb_fixture "$STB_ROOT/t10b/repo" 'A\n' 'A\n' > "$STB_ROOT/t10b/art/run-start-sha.txt"
-cp "$STB_ROOT/t10b/repo/run.sh" "$STB_ROOT/t10b/repo/tests.txt" "$STB_ROOT/t10b/repo/fails.txt" "$STB_ROOT/t10b/other/"
-T10B_OTHER="$(cd "$STB_ROOT/t10b/other" && pwd)"
-STB_CMDS="cd $T10B_OTHER && bash ./run.sh\n" stb_head "$STB_ROOT/t10b/repo" "$STB_ROOT/t10b/art"
-T10B_OUT="$(cd "$STB_ROOT/t10b/repo" && STB_MARK="$STB_ROOT/t10b/mark" ARTIFACTS_DIR="$STB_ROOT/t10b/art" rst_base_compare "$STB_ROOT/t10b/art/report" "$STB_ROOT/t10b/art/cmds" "$STB_ROOT/t10b/art/head.log" "$STB_COUNTS" 2>/dev/null)"
-assert_eq "Test 10 absolute_head_path_fails_or_rebases (b): TESTS_STATUS=failed" "failed" "$(stb_field TESTS_STATUS "$T10B_OUT")"
-assert_eq "Test 10 absolute_head_path_fails_or_rebases (b): outcome escapes_worktree" "escapes_worktree" "$(stb_field TESTS_BASE_COMPARE "$T10B_OUT")"
-assert_eq "Test 10 absolute_head_path_fails_or_rebases (b): base never ran (no log, no worktree)" "no 1 0" "$([ -e "$STB_ROOT/t10b/art/evidence/stop-tests-base.log" ] && echo yes || echo no) $(stb_wt_count "$STB_ROOT/t10b/repo") $(stb_leftover "$STB_ROOT/t10b/art")"
-assert_eq "Test 10 absolute_head_path_fails_or_rebases (b): no base-red-tests.txt" "no" "$([ -e "$STB_ROOT/t10b/art/base-red-tests.txt" ] && echo yes || echo no)"
+echo "--- Test 10: command_allowlist_fail_closed ---"
+# The base rerun runs only allowlisted commands from the repo root. Overseer round 3's
+# repro (a relative cd that climbs back into the head checkout) and every other shape
+# outside the allowlist stay failed as command_not_comparable, before any git work.
+stb_cmp() { if stb_command_comparable "$1"; then echo yes; else echo no; fi; }
+for c in 'bun run test' 'bun run test:unit' 'bun test' 'bun test src/a.test.ts packages/x' 'bun test --timeout=30000 src' \
+         'npm test' 'npm run lint:ci' 'pnpm test' 'pnpm run test' 'node --test' 'node --test tests/a.test.js' \
+         'yarn test' 'yarn test:ci'; do
+  assert_eq "Test 10 command_allowlist_fail_closed: comparable: $c" "yes" "$(stb_cmp "$c")"
+done
+for c in 'cd ../../../../../../tmp/fixture/./repo && bash ./run.sh' 'cd /tmp/x && bun run test' 'cd sub && bun run test' \
+         'bun run test && bun run lint' 'bun run test || true' 'bun run test; bun run lint' 'bun run test | tee x' \
+         'bun run test > out.txt' 'bun run $(echo test)' 'bun run `echo test`' 'FOO=1 bun run test' 'bash ./run.sh' \
+         'bun test /abs/a.test.ts' 'bun test ../other/a.test.ts' 'bun test src/../../x' 'bun test C:/x.test.ts' \
+         'bun test ~/x.test.ts' 'npm test -- --grep x' 'npm run' 'npx vitest run' 'node tests/a.js' 'pytest' \
+         'npm test --reporter=$X' 'yarn' 'bun test -t name'; do
+  assert_eq "Test 10 command_allowlist_fail_closed: not comparable: $c" "no" "$(stb_cmp "$c")"
+done
+# Round 3's exact shape, end to end: base passes A, head fails A. The relative cd
+# resolves back into the head checkout; without the allowlist both runs execute the
+# head script and A would be waived as base_red.
+mkdir -p "$STB_ROOT/t10/repo" "$STB_ROOT/t10/art"
+stb_fixture "$STB_ROOT/t10/repo" '' 'A\n' > "$STB_ROOT/t10/art/run-start-sha.txt"
+# Enough ".." to reach / from the head checkout AND from the deeper base worktree.
+T10_UP="../../../../../../../../../../../../../../../../../../../.."
+T10_CMD="cd ${T10_UP}$(cd "$STB_ROOT/t10/repo" && pwd)/./ && bash ./run.sh"
+STB_CMDS="$T10_CMD\n" stb_head "$STB_ROOT/t10/repo" "$STB_ROOT/t10/art"
+assert_eq "Test 10 command_allowlist_fail_closed: round-3 repro is a runnable head command that failed" "failed" "$(stb_field TESTS_STATUS "$(cat "$STB_ROOT/t10/art/report")")"
+T10_OUT="$(cd "$STB_ROOT/t10/repo" && STB_MARK="$STB_ROOT/t10/mark" ARTIFACTS_DIR="$STB_ROOT/t10/art" rst_base_compare "$STB_ROOT/t10/art/report" "$STB_ROOT/t10/art/cmds" "$STB_ROOT/t10/art/head.log" "$STB_COUNTS" 2>/dev/null)"
+assert_eq "Test 10 command_allowlist_fail_closed: round-3 repro -> failed command_not_comparable" "failed command_not_comparable" "$(stb_field TESTS_STATUS "$T10_OUT") $(stb_field TESTS_BASE_COMPARE "$T10_OUT")"
+assert_eq "Test 10 command_allowlist_fail_closed: round-3 repro created no base worktree or log" "no 1 0" "$([ -e "$STB_ROOT/t10/art/evidence/stop-tests-base.log" ] && echo yes || echo no) $(stb_wt_count "$STB_ROOT/t10/repo") $(stb_leftover "$STB_ROOT/t10/art")"
+assert_eq "Test 10 command_allowlist_fail_closed: round-3 repro wrote no base-red-tests.txt" "no" "$([ -e "$STB_ROOT/t10/art/base-red-tests.txt" ] && echo yes || echo no)"
+# The same fixture through an allowlisted command compares and runs base code: A is newly broken.
+STB_CMDS='bun run test\n' stb_head "$STB_ROOT/t10/repo" "$STB_ROOT/t10/art"
+T10B_OUT="$(cd "$STB_ROOT/t10/repo" && STB_MARK="$STB_ROOT/t10/mark" ARTIFACTS_DIR="$STB_ROOT/t10/art" rst_base_compare "$STB_ROOT/t10/art/report" "$STB_ROOT/t10/art/cmds" "$STB_ROOT/t10/art/head.log" "$STB_COUNTS" 2>/dev/null)"
+assert_eq "Test 10 command_allowlist_fail_closed: bun run test is compared (base_passed)" "failed base_passed" "$(stb_field TESTS_STATUS "$T10B_OUT") $(stb_field TESTS_BASE_COMPARE "$T10B_OUT")"
+assert_eq "Test 10 command_allowlist_fail_closed: bun run test ran base code" "yes" "$([ -f "$STB_ROOT/t10/mark" ] && echo yes || echo no)"
 
 echo "--- Test 7: all_lanes_call_shared_script ---"
 STB_CALL='rst_base_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS"'

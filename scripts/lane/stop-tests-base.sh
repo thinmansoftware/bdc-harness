@@ -161,64 +161,40 @@ stb__base_identities() {
   return 0
 }
 
-# stb__head_roots <top>   (-> every spelling of the head checkout root, one per line,
-#   longest first, no trailing slash): git's form, the logical and physical (pwd -P)
-#   paths, cygpath forms where cygpath exists, and the /<drive>/ form of a C:/ path.
-stb__head_roots() {
-  local top="$1" r
-  {
-    printf '%s\n' "$top"
-    (cd "$top" 2>/dev/null && pwd)
-    (cd "$top" 2>/dev/null && pwd -P)
-    if command -v cygpath >/dev/null 2>&1; then
-      cygpath -u "$top" 2>/dev/null
-      cygpath -m "$top" 2>/dev/null
-    fi
-  } | while IFS= read -r r; do
-    [ -n "$r" ] || continue
-    while [ "${#r}" -gt 1 ] && [ "${r%/}" != "$r" ]; do r="${r%/}"; done
-    [ "$r" = "/" ] && continue
-    printf '%s\n' "$r"
-    case "$r" in
-      [A-Za-z]:/*) printf '/%s%s\n' "$(printf '%s' "${r%%:*}" | tr 'A-Z' 'a-z')" "${r#?:}" ;;
-    esac
-  done | awk '!seen[$0]++ { print length($0) "\t" $0 }' | sort -rn | cut -f2-
-}
-
-# stb__rebase_commands <in> <out> <wt> <roots-file>   Rewrites each command for the
-#   base run: every head root (followed by "/", a space or the end) becomes <wt>.
-#   Returns 1 (nothing usable written) when a rewritten command still names a head
-#   root in any letter case, or starts with "cd <absolute dir>" outside <wt>.
-stb__rebase_commands() {
-  local in="$1" out="$2" wt="$3" roots="$4"
-  LC_ALL=C awk -v WT="$wt" -v RF="$roots" '
-    BEGIN { S = "\001BASEWT\001"; while ((getline r < RF) > 0) if (r != "") R[++n] = r }
-    function rebase(s, r,   o, i, c) {
-      o = ""
-      while ((i = index(s, r)) > 0) {
-        c = substr(s, i + length(r), 1)
-        if (c == "" || c == "/" || c == " ") { o = o substr(s, 1, i - 1) S; s = substr(s, i + length(r)) }
-        else { o = o substr(s, 1, i + length(r) - 1); s = substr(s, i + length(r)) }
-      }
-      return o s
-    }
-    {
-      line = $0
-      for (k = 1; k <= n; k++) line = rebase(line, R[k])
-      low = tolower(line)
-      for (k = 1; k <= n; k++) if (index(low, tolower(R[k])) > 0) bad = 1
-      if (match(line, /^[ ]*cd[ ]+[^ ]+[ ]+&&/)) {
-        d = line; sub(/^[ ]*cd[ ]+/, "", d); sub(/[ ]+&&.*$/, "", d)
-        if ((d ~ /^\// || d ~ /^[A-Za-z]:/) && !(d == S || index(d, S "/") == 1)) bad = 1
-      }
-      while ((i = index(line, S)) > 0) line = substr(line, 1, i - 1) WT substr(line, i + length(S))
-      out[++m] = line
-    }
-    END {
-      if (bad) exit 1
-      for (k = 1; k <= m; k++) print out[k]
-    }
-  ' "$in" > "$out" || { : > "$out"; return 1; }
+# stb_command_comparable <cmd>   (rc 0 when the base comparison may run it)
+#   The base rerun must execute base code from the base worktree root, so only these
+#   commands, run from the repo root, are comparable (WO-HARNESS-STOP-TESTS-BASE-RED-
+#   AWARE-01 allowlist rescope):
+#     bun run <script> | bun test [paths]   npm test | npm run <script>
+#     pnpm test | pnpm run <script>         node --test [paths]
+#     yarn test | yarn <script>
+#   <script> is [A-Za-z0-9:_-]+. A path is [A-Za-z0-9._/-]+ with no ".." segment and
+#   no leading "/". Flags are --[a-z-]+ with an optional =[A-Za-z0-9._-]+ value.
+#   Nothing else: no cd, no && || ; |, no redirects, no $ or backticks, no env
+#   assignments, no absolute paths.
+stb_command_comparable() {
+  local cmd="$1" form="" arg
+  printf '%s' "$cmd" | grep -qE '^[A-Za-z0-9 ._/:=-]+$' || return 1
+  set -f
+  set -- $cmd
+  set +f
+  case "$1 ${2:-}" in
+    "bun run"|"npm run"|"pnpm run") form="script"; shift 2 ;;
+    "bun test"|"node --test") form="paths"; shift 2 ;;
+    "npm test"|"pnpm test"|"yarn test") form="none"; shift 2 ;;
+    yarn\ *) form="none"; printf '%s' "${2:-}" | grep -qE '^[A-Za-z0-9:_-]+$' || return 1; shift 2 ;;
+    *) return 1 ;;
+  esac
+  if [ "$form" = "script" ]; then
+    printf '%s' "${1:-}" | grep -qE '^[A-Za-z0-9:_-]+$' || return 1
+    shift
+  fi
+  for arg in "$@"; do
+    if printf '%s' "$arg" | grep -qE '^--[a-z-]+(=[A-Za-z0-9._-]+)?$'; then continue; fi
+    [ "$form" = "paths" ] || return 1
+    printf '%s' "$arg" | grep -qE '^[A-Za-z0-9._][A-Za-z0-9._/-]*$' || return 1
+    case "/$arg/" in */../*) return 1 ;; esac
+  done
   return 0
 }
 
@@ -306,14 +282,13 @@ stb__base_red_line() {
 #     base_timeout    a base command timed out (exit 124) -> failed
 #     base_passed     the base run did not fail -> failed, every head failure is new
 #     base_unrunnable worktree or runner unavailable -> failed
-#     escapes_worktree a command reaches outside the base worktree after rebasing
-#                     head-checkout paths (an absolute cd elsewhere, or a head path
-#                     spelled another way) -> failed, base never runs
+#     command_not_comparable a test command is outside the allowlist
+#                     (stb_command_comparable) -> failed, base never runs
 #   Never returns nonzero.
 rst_base_compare() {
   local report="$1" cmds="$2" head_log="$3" counts="$4"
   local status line art sha sha8 top wt base_log base_res base_exit base_counts bp bt
-  local hp ht work ncmd nh nb k names newnames rc
+  local hp ht work ncmd nh nb k names newnames rc c
   art="${ARTIFACTS_DIR:-}"
   if [ -n "$art" ]; then rm -f "$art/base-red-tests.txt" 2>/dev/null || true; fi
   status="$(sed -n 's/^TESTS_STATUS=//p' "$report" | head -1)"
@@ -327,6 +302,13 @@ rst_base_compare() {
     *[0-9]\ [0-9]*) hp="${counts%% *}"; ht="${counts##* }" ;;
     *) stb__emit "$report" no_counts; return 0 ;;
   esac
+  while IFS= read -r c; do
+    [ -z "$c" ] && continue
+    if ! stb_command_comparable "$c"; then
+      stb__emit "$report" command_not_comparable
+      return 0
+    fi
+  done < "$cmds"
   if [ -z "$art" ] || [ ! -d "$art" ]; then
     stb__emit "$report" no_base_sha
     return 0
@@ -358,16 +340,6 @@ rst_base_compare() {
   fi
   top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
   wt="$(stb__abs "$art")/stop-tests-base-wt.$$"
-  # The base run must execute base code: every head-checkout root in a command is
-  # rebased onto the base worktree, and a command that still reaches outside it fails
-  # closed before any base worktree exists.
-  stb__head_roots "$top" > "$work/roots"
-  if ! stb__rebase_commands "$cmds" "$work/base.cmds" "$wt" "$work/roots"; then
-    rm -rf "$work"
-    stb__emit "$report" escapes_worktree
-    return 0
-  fi
-  cmds="$work/base.cmds"
   mkdir -p "$art/evidence" 2>/dev/null || true
   base_log="$(stb__abs "$art/evidence")/stop-tests-base.log"
   : > "$base_log"
