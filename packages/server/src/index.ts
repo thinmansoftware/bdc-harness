@@ -94,6 +94,10 @@ import { createMergeManager } from '@archon/overseer/merge-manager';
 import { resolveDefaultDeps } from '@archon/overseer/service';
 import { ingestPullRequestEvent } from '@archon/overseer/pr-review-ingest';
 import { createRealIngestDeps, resolveReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
+import {
+  startUnreviewedHeadReconcileClock,
+  stopUnreviewedHeadReconcileClock,
+} from '@archon/overseer/unreviewed-head-reconcile';
 import { ingestCheckCompletionEvent } from '@archon/overseer/pr-review-check-ingest';
 import { createRealRecheckIngestDeps } from '@archon/overseer/pr-review-check-wiring';
 import {
@@ -694,6 +698,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     });
     getLog().info('overseer_review_route_registered');
     startReviewWorkerClock(reviewRouteConfig);
+    // Unreviewed-head reconcile (WO-HARNESS-OVERSEER-UNREVIEWED-HEAD-RECONCILE-01):
+    // a push lost while the app was down (e.g. mid-rebuild) never reaches the
+    // route above. One pass now, then every OVERSEER_UNREVIEWED_HEAD_RECONCILE_MINUTES.
+    void startUnreviewedHeadReconcileClock(reviewRouteConfig);
   } else {
     getLog().info(
       'overseer_review_route_not_configured: set OVERSEER_REVIEW_WEBHOOK_SECRET and OVERSEER_REVIEW_IDENTITY to enable'
@@ -866,6 +874,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stopProviderWaitScheduler();
     stopDispatchEscalationClock();
     stopReviewWorkerClock();
+    stopUnreviewedHeadReconcileClock();
     stopDutyOfficerClock();
     stopOutcomeReportClock();
     stopCauldronFireConsumer();
