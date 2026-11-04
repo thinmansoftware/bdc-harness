@@ -59,6 +59,32 @@ export function seatForTier(tierName: string): SeatId | null {
   return null;
 }
 
+/**
+ * A codex seat billing purchased credits has headroom even when its plan
+ * windows read at or over a threshold: the run-start gate does not refuse it.
+ * Credits that hit their overage limit do not count.
+ */
+export function hasPurchasedCredits(seat: SeatId, reading: SeatReadingLike | undefined): boolean {
+  return (
+    seat === 'codex' &&
+    reading?.credits?.has_credits === true &&
+    reading.credits.overage_limit_reached !== true
+  );
+}
+
+/**
+ * Cursor is never out of usage (John), and no Cursor session credential exists
+ * to probe it, so Fuelglass reads it as limit_source UNKNOWN. SeatReadingLike
+ * carries no note field at this layer, so the rule is simply: the cursor seat
+ * with limit_source 'UNKNOWN' is unmetered headroom for entry selection.
+ * Cursor only -- an UNKNOWN Claude or Codex seat stays unknown (admitClaudeTier
+ * must keep refusing an unknown Claude seat). A missing cursor reading stays
+ * unknown.
+ */
+export function isUnmeteredSeat(seat: SeatId, reading: SeatReadingLike | undefined): boolean {
+  return seat === 'cursor' && reading?.limit_source === 'UNKNOWN';
+}
+
 export interface RungSeatSkip {
   tier: string;
   seat: SeatId;
@@ -84,13 +110,7 @@ export function rungSeatSkip(
   if (used === null || used < cutoffPercent) return null;
   // A codex seat billing purchased credits has headroom (the run-start gate
   // does not refuse it), so the rung is not skipped.
-  if (
-    seat === 'codex' &&
-    reading?.credits?.has_credits === true &&
-    reading.credits.overage_limit_reached !== true
-  ) {
-    return null;
-  }
+  if (hasPurchasedCredits(seat, reading)) return null;
   return { tier: tierName, seat, usedPercent: used, cutoffPercent };
 }
 
@@ -157,10 +177,13 @@ export function chooseHeadroomEntry(input: {
   const seat = seatForTier(picked);
   if (seat === null) return keep('no_seat');
 
-  const binding = bindingUsedPercent(usage[seat]);
+  const reading = usage[seat];
+  if (isUnmeteredSeat(seat, reading)) return keep(`seat_unmetered:${seat}`);
+  const binding = bindingUsedPercent(reading);
   if (binding === null) return keep(`seat_unknown:${seat}`);
   const percent = String(binding);
   if (binding < thresholdPercent) return keep(`seat_ok:${seat}:${percent}`);
+  if (hasPurchasedCredits(seat, reading)) return keep(`seat_credits:${seat}:${percent}`);
 
   const start = tiers.findIndex(tier => tier.name === picked);
   const later = start === -1 ? [] : tiers.slice(start + 1);
@@ -168,8 +191,7 @@ export function chooseHeadroomEntry(input: {
     if (refusedTiers.includes(tier.name) || premiumTiers.includes(tier.name)) continue;
     const destination = seatForTier(tier.name);
     if (destination === null || destination === seat) continue;
-    const destinationBinding = bindingUsedPercent(usage[destination]);
-    if (destinationBinding === null || destinationBinding >= thresholdPercent) continue;
+    if (!destinationHasHeadroom(destination, usage[destination], thresholdPercent)) continue;
     return {
       picked,
       entry: tier.name,
@@ -181,6 +203,19 @@ export function chooseHeadroomEntry(input: {
   }
 
   return keep(`no_known_headroom:${seat}:${percent}`);
+}
+
+/** Known headroom: unmetered, measured below threshold, or codex purchased credits. */
+function destinationHasHeadroom(
+  seat: SeatId,
+  reading: SeatReadingLike | undefined,
+  thresholdPercent: number
+): boolean {
+  if (isUnmeteredSeat(seat, reading)) return true;
+  const binding = bindingUsedPercent(reading);
+  if (binding === null) return false;
+  if (binding < thresholdPercent) return true;
+  return hasPurchasedCredits(seat, reading);
 }
 
 function seatsFromPick(
