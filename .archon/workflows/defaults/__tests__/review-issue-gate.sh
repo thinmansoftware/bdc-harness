@@ -171,6 +171,8 @@ else
   run_scenario review-label-skipped-when-evidence-failed '' '{"status":"PROCEED"}' skip "$BODY"
   run_scenario review-label-applied-when-evidence-passed 'OK' '{"status":"PROCEED"}' apply "$BODY"
   run_scenario review-label-skipped-on-reclassify-block 'OK' '{"status":"BLOCKED"}' skip "$BODY"
+  run_scenario review-label-skipped-on-not-gated-blocked 'NOT_GATED:BLOCKED' '{"status":"PROCEED"}' skip "$BODY"
+  run_scenario review-label-applied-on-not-gated-already-satisfied 'NOT_GATED:ALREADY_SATISFIED' '{"status":"ALREADY_SATISFIED"}' apply "$BODY"
   run_scenario flip-label-skipped-when-evidence-failed '' '{"status":"PROCEED"}' skip "$FLIP_BODY"
   run_scenario flip-label-applied-when-evidence-passed 'OK' '{"status":"PROCEED"}' apply "$FLIP_BODY"
   run_scenario flip-label-blocked-skips-review 'OK' '{"status":"BLOCKED"}' blocked "$FLIP_BODY"

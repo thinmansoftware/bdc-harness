@@ -40,6 +40,7 @@ interface FakePullRequest {
   head: { sha: string; ref?: string };
   base?: { ref?: string };
   body?: string | null;
+  labels?: { name?: string | null }[];
 }
 
 interface FakeReview {
@@ -605,10 +606,40 @@ describe('createRealListOpenPullRequests', () => {
       headRef: 'test/reviewer-live-fire',
       headSha: 'abc123',
       reviewDecision: 'APPROVED',
+      labels: [],
       woId: 'WO-HARNESS-REVIEW-01',
       // No GraphQL client on this fake, so the conservative fallback resolved it.
       reviewDecisionFromFallback: true,
     });
+  });
+
+  // WO-HARNESS-EVIDENCE-GATE-NOT-GATED-AND-BASE-UNRUNNABLE-01: the listing carries label
+  // names so the merge manager can refuse a run:blocked PR.
+  test('the listing fills labels from the PR, including run:blocked', async () => {
+    const list = createRealListOpenPullRequests(
+      octokitWith(
+        [
+          {
+            number: 731,
+            title: 'blocked run PR',
+            state: 'open',
+            draft: false,
+            html_url: 'https://github.com/thinmansoftware/bdc-harness/pull/731',
+            head: { sha: 'abc731', ref: 'feat/blocked' },
+            base: { ref: 'dev' },
+            body: null,
+            labels: [{ name: 'run:blocked' }, { name: 'wo' }, { name: null }],
+          },
+        ],
+        { 731: [approval(GATE, 'abc731')] }
+      )
+    );
+    const [discovered] = await list({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      baseBranches: ['dev'],
+    });
+    expect(discovered?.labels).toEqual(['run:blocked', 'wo']);
   });
 
   // A PR on an unwatched base is still RETURNED so the caller counts it as

@@ -92,6 +92,9 @@ export const DEFAULT_DISCOVERY_MAX_PRS_PER_TICK = 100;
  * distinct from the substantive exclusions -- they mean "we did not learn
  * anything", never "this PR is not mergeable".
  */
+/** Label the lane patch-pr-body node puts on a PR opened from a non-PROCEED run. */
+export const RUN_BLOCKED_LABEL = 'run:blocked';
+
 export type MergeCandidateExclusionReason =
   | 'draft'
   | 'not_open'
@@ -106,7 +109,8 @@ export type MergeCandidateExclusionReason =
   | 'mergeable_unknown'
   | 'evidence_lookup_failed'
   | 'evidence_mismatch'
-  | 'already_a_run_candidate';
+  | 'already_a_run_candidate'
+  | 'run_blocked';
 
 export interface MergeCandidateExclusion {
   readonly owner: string;
@@ -433,6 +437,7 @@ export function classifyDiscoveredPullRequest(
   }
   const resolvedBases = watchedBases ?? resolveWatchedBaseBranchesForRepo(ownerRepo, policy);
   if (!resolvedBases.includes(pr.baseRef.trim().toLowerCase())) return 'base_branch_not_watched';
+  if (pr.labels?.includes(RUN_BLOCKED_LABEL)) return 'run_blocked';
   if (pr.reviewDecision !== 'APPROVED') return 'review_not_approved';
   return null;
 }
@@ -598,6 +603,8 @@ function detailFor(reason: MergeCandidateExclusionReason, pr: DiscoveredPullRequ
       return `base ${pr.baseRef} is not a watched base branch`;
     case 'review_not_approved':
       return `review decision is ${pr.reviewDecision ?? 'none'}`;
+    case 'run_blocked':
+      return `pull request carries the ${RUN_BLOCKED_LABEL} label: its run ended BLOCKED and is not lane-verified`;
     default:
       return reason;
   }

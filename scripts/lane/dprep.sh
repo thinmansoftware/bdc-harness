@@ -10,8 +10,15 @@
 #   bun.lock / bun.lockb            -> bun install --frozen-lockfile
 #   pnpm-lock.yaml (pnpm on PATH)   -> pnpm install --frozen-lockfile
 #   package-lock.json               -> npm ci --no-audit --no-fund
-# Anything else skips. Always returns 0: an install failure is logged and the run
-# continues; run-stop-tests reports the real test result. The install subshell unsets
+# Anything else skips (return 0). An install that fails is retried ONCE without the
+# frozen lockfile (bun, pnpm: drop --frozen-lockfile; npm: npm install in place of npm ci),
+# because a lockfile that drifted from package.json (error: lockfile had changes, but
+# lockfile is frozen) is the commonest failure. The install output (stdout and stderr) is
+# printed to stdout so the real error text reaches the caller's log. The function returns
+# NONZERO when the install still failed, or when node_modules is still absent after it
+# (WO-HARNESS-EVIDENCE-GATE-NOT-GATED-AND-BASE-UNRUNNABLE-01); the base-red comparison
+# treats that as base_unrunnable, and the other callers (prep-dependencies, the
+# run-stop-tests head prep) log it and carry on. The install subshell unsets
 # the same credential families as rst_scrub_env and keeps *_TEST_* names.
 # node_modules is never symlinked or copied. ASCII only.
 
@@ -31,20 +38,20 @@ dprep__install() {
           ;;
       esac
     done
-    timeout "${DPREP_TIMEOUT_SECONDS:-600}" "$@" < /dev/null
+    timeout "${DPREP_TIMEOUT_SECONDS:-600}" "$@" < /dev/null 2>&1
   ) || rc=$?
   now="$(date +%s)"
   elapsed=$((now - start))
   if [ "$rc" -eq 0 ]; then
     printf 'dprep: install ok (%ss)\n' "$elapsed"
   else
-    printf 'dprep: install failed rc=%s (continuing; run-stop-tests reports the real result)\n' "$rc"
+    printf 'dprep: install failed rc=%s\n' "$rc"
   fi
-  return 0
+  return "$rc"
 }
 
 dprep_ensure_js_deps() {
-  local kind=""
+  local kind="" rc=0
   if [ -f package.json ]; then
     if [ -f bun.lock ] || [ -f bun.lockb ]; then
       kind="bun"
@@ -70,18 +77,34 @@ dprep_ensure_js_deps() {
         printf 'dprep: bun not found, skipping\n'
         return 0
       fi
-      dprep__install 'installing JS dependencies (bun install --frozen-lockfile)' bun install --frozen-lockfile
+      dprep__install 'installing JS dependencies (bun install --frozen-lockfile)' bun install --frozen-lockfile || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        rc=0
+        dprep__install 'retrying without --frozen-lockfile (bun install)' bun install || rc=$?
+      fi
       ;;
     pnpm)
-      dprep__install 'installing JS dependencies (pnpm, frozen lockfile)' pnpm install --frozen-lockfile
+      dprep__install 'installing JS dependencies (pnpm, frozen lockfile)' pnpm install --frozen-lockfile || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        rc=0
+        dprep__install 'retrying without --frozen-lockfile (pnpm install)' pnpm install || rc=$?
+      fi
       ;;
     npm)
       if ! command -v npm >/dev/null 2>&1; then
         printf 'dprep: npm not found, skipping\n'
         return 0
       fi
-      dprep__install 'npm ci (package-lock.json)' npm ci --no-audit --no-fund
+      dprep__install 'npm ci (package-lock.json)' npm ci --no-audit --no-fund || rc=$?
+      if [ "$rc" -ne 0 ]; then
+        rc=0
+        dprep__install 'retrying with npm install (npm ci failed)' npm install --no-audit --no-fund || rc=$?
+      fi
       ;;
   esac
-  return 0
+  if [ "$rc" -eq 0 ] && [ ! -d node_modules ]; then
+    printf 'dprep: install reported success but node_modules is still absent\n'
+    rc=1
+  fi
+  return "$rc"
 }
