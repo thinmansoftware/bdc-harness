@@ -39,6 +39,19 @@ assert_contains() {
   fi
 }
 
+NAMED_FAIL_MARK=0
+named_begin() { NAMED_FAIL_MARK=$FAIL; }
+named_end() {
+  if [ "$FAIL" -eq "$NAMED_FAIL_MARK" ]; then echo "PASS: $1"; else echo "FAIL: $1"; fi
+}
+assert_rc() {
+  # assert_rc <label> <expected rc> <command...>
+  local label="$1" expected="$2" rc
+  shift 2
+  "$@" >/dev/null 2>&1; rc=$?
+  assert_eq "$label" "$expected" "$rc"
+}
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
@@ -130,8 +143,9 @@ assert_contains "eq assertion extracted" "grep -c alpha fixture.txt${TAB}eq${TAB
 assert_contains "ge assertion extracted" "grep -c beta fixture.txt${TAB}ge${TAB}1" "$EXTRACTED"
 assert_contains "'no output' becomes eq 0" "grep -n delta fixture.txt${TAB}eq${TAB}0" "$EXTRACTED"
 assert_contains "awk assertion still extracted (dropped later, not here)" "| awk -F: \"{s+=\$2} END {print s+0}\"${TAB}eq${TAB}0" "$EXTRACTED"
-assert_contains "DECLARED counts every grep header including the one without Expected" "DECLARED${TAB}5" "$EXTRACTED"
-assert_eq "test-suite and ASCII stops are not grep assertions" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c 'bun test\|LC_ALL' || true)"
+assert_contains "DECLARED counts every grep command: the five grep headers plus the ASCII-scan stop that uses a grep command (WO-HARNESS-GREP-STOP-EXTRACTION-SILENT-WAIVE-01)" "DECLARED${TAB}6" "$EXTRACTED"
+assert_eq "test-suite stops are not grep assertions" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c 'bun test' || true)"
+assert_contains "an ASCII-scan stop that uses a grep command is a grep assertion" "LC_ALL=C grep -n \"[^ -~]\" src/a.ts${TAB}eq${TAB}0" "$EXTRACTED"
 assert_eq "header without Expected: emits no executable assertion line" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c "gamma.*${TAB}eq${TAB}" || true)"
 assert_contains "header without Expected is named as unparsed" "UNPARSED${TAB}1${TAB}grep -c gamma fixture.txt" "$EXTRACTED"
 assert_eq "no grep stops -> zero unparsed and declared" "UNPARSED${TAB}0
@@ -194,9 +208,9 @@ if rsg_compare le 3 3; then PASS=$((PASS+1)); echo "PASS: le holds"; else FAIL=$
 
 echo "--- rsg_run: end to end in the fixture worktree ---"
 OUT="$(printf '%s\n' "$SPEC" | rsg_extract | rsg_run)"
-assert_contains "GREP_DECLARED=5" "GREP_DECLARED=5" "$OUT"
+assert_contains "GREP_DECLARED=6 (five grep headers plus the ASCII-scan grep)" "GREP_DECLARED=6" "$OUT"
 assert_contains "GREP_EXECUTED=3" "GREP_EXECUTED=3" "$OUT"
-assert_contains "GREP_DROPPED=1 (the awk one)" "GREP_DROPPED=1" "$OUT"
+assert_contains "GREP_DROPPED=2 (the awk one and the double-quoted ASCII scan)" "GREP_DROPPED=2" "$OUT"
 assert_contains "GREP_UNPARSED=1 (the missing expectation)" "GREP_UNPARSED=1" "$OUT"
 assert_contains "GREP_MISMATCH=0" "GREP_MISMATCH=0" "$OUT"
 assert_contains "partial execution is incomplete" "GREP_STATUS=incomplete" "$OUT"
@@ -348,18 +362,6 @@ rm -rf "$TMP2"
 # WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01 named tests. Each prints one
 # "PASS: <name>" line only when every assertion inside it passed.
 # ---------------------------------------------------------------------------
-NAMED_FAIL_MARK=0
-named_begin() { NAMED_FAIL_MARK=$FAIL; }
-named_end() {
-  if [ "$FAIL" -eq "$NAMED_FAIL_MARK" ]; then echo "PASS: $1"; else echo "FAIL: $1"; fi
-}
-assert_rc() {
-  # assert_rc <label> <expected rc> <command...>
-  local label="$1" expected="$2" rc
-  shift 2
-  "$@" >/dev/null 2>&1; rc=$?
-  assert_eq "$label" "$expected" "$rc"
-}
 
 echo "--- multiword_single_quoted_grep_executes ---"
 named_begin
@@ -480,6 +482,278 @@ fi
 named_end harness_grep_verdict_fixtures_match
 
 rm -rf "$TMP3" "$TMP4" "$TMP5"
+
+# ---------------------------------------------------------------------------
+# WO-HARNESS-GREP-STOP-EXTRACTION-SILENT-WAIVE-01 named tests (bdc-xo #4753, stage 1).
+# Each prints one "PASS: <name>" line only when every assertion inside it passed.
+# ---------------------------------------------------------------------------
+FIXTURE="$HERE/fixtures/stop-extract-cases.txt"
+fixture_part() {
+  # fixture_part <case name> <spec|expect>  -> that part of the case, verbatim
+  awk -v c="$1" -v part="$2" '
+    /^@@CASE / { cur = substr($0, 8); sect = "spec"; next }
+    /^@@EXPECT$/ { sect = "expect"; next }
+    /^@@END$/ { cur = ""; next }
+    cur == c && sect == part { print }
+  ' "$FIXTURE"
+}
+kv() {
+  # kv <KEY> <text>  -> the value of the first KEY=value line
+  printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1
+}
+count_records() {
+  # count_records <text>  -> number of "<command> TAB <op> TAB <n>" records
+  printf '%s\n' "$1" | grep -c "${TAB}\(eq\|ge\|le\)${TAB}" || true
+}
+
+echo "--- descriptive_headers_are_counted ---"
+named_begin
+T1="$(printf '## 8. Stop conditions\n\nStop 1 (dashboard no longer mounts the panel):\n  grep -c a f.ts\n  Expected: 0\n\nStop 1 (dashboard no longer mounts the panel):\n  grep -c b f.ts\n  Expected: 2\n\nStop 1 (dashboard no longer mounts the panel):\n  grep -c c f.ts\n  Expected: at least 1\n' | rsg_extract)"
+assert_contains "descriptive header 1 emitted" "grep -c a f.ts${TAB}eq${TAB}0" "$T1"
+assert_contains "descriptive header 2 emitted" "grep -c b f.ts${TAB}eq${TAB}2" "$T1"
+assert_contains "descriptive header 3 emitted" "grep -c c f.ts${TAB}ge${TAB}1" "$T1"
+assert_contains "DECLARED is 3" "DECLARED${TAB}3" "$T1"
+assert_contains "UNPARSED is 0" "UNPARSED${TAB}0" "$T1"
+assert_eq "three command lines are emitted" "3" "$(count_records "$T1")"
+named_end descriptive_headers_are_counted
+
+echo "--- colon_header_form_is_counted ---"
+named_begin
+T2="$(printf '## 8. Stop conditions\n\nStop 2: route is mounted\n  grep -c route src/App.tsx\n  Expected: 1\n\n**Stop 3 (route is mounted):**\n  grep -c page src/App.tsx\n  Expected: 2\n' | rsg_extract)"
+assert_contains "colon header emitted" "grep -c route src/App.tsx${TAB}eq${TAB}1" "$T2"
+assert_contains "bold header emitted" "grep -c page src/App.tsx${TAB}eq${TAB}2" "$T2"
+assert_contains "DECLARED is 2" "DECLARED${TAB}2" "$T2"
+assert_eq "two lines emitted" "2" "$(count_records "$T2")"
+named_end colon_header_form_is_counted
+
+echo "--- multi_command_stop_keeps_every_command ---"
+named_begin
+T3="$(fixture_part multi_command_stop spec | rsg_extract)"
+assert_eq "emitted lines are in order" "grep -c one a.ts${TAB}eq${TAB}1
+grep -c two b.ts${TAB}eq${TAB}2
+grep -c three c.ts${TAB}ge${TAB}3
+grep -c five e.ts${TAB}eq${TAB}5" "$(printf '%s\n' "$T3" | grep "${TAB}\(eq\|ge\|le\)${TAB}")"
+assert_contains "the fourth command with no Expected is named in UNPARSED" "UNPARSED${TAB}1${TAB}grep -c four d.ts" "$T3"
+assert_contains "DECLARED counts all five commands" "DECLARED${TAB}5" "$T3"
+T3B="$(printf '## 8. Stop conditions\n\nStop 2 (three):\n  grep -c a f\n  Expected: 1\n  grep -c b f\n  Expected: 2\n  grep -c c f\n  Expected: 3\n' | rsg_extract)"
+assert_contains "three commands in one block: DECLARED 3" "DECLARED${TAB}3" "$T3B"
+assert_contains "three commands in one block: UNPARSED 0" "UNPARSED${TAB}0" "$T3B"
+named_end multi_command_stop_keeps_every_command
+
+echo "--- cgc_section8_fixture_counts_all_commands ---"
+named_begin
+T4="$(fixture_part cgc_section8 spec | rsg_extract)"
+assert_contains "CGC Section 8: DECLARED 16" "DECLARED${TAB}16" "$T4"
+assert_contains "CGC Section 8: UNPARSED 0" "UNPARSED${TAB}0" "$T4"
+assert_eq "CGC Section 8: 16 emitted lines" "16" "$(count_records "$T4")"
+assert_eq "CGC Section 8: the bun run test stop is test-owned and not counted" "0" "$(printf '%s\n' "$T4" | grep -c 'bun run test' || true)"
+TMP_EMPTY="$(mktemp -d)"
+T4R="$(cd "$TMP_EMPTY" && fixture_part cgc_section8 spec | rsg_extract | rsg_run)"
+rm -rf "$TMP_EMPTY"
+assert_eq "CGC Section 8: GREP_DECLARED=16" "16" "$(kv GREP_DECLARED "$T4R")"
+assert_eq "CGC Section 8: GREP_STATUS is not none_declared" "1" "$([ "$(kv GREP_STATUS "$T4R")" != "none_declared" ] && echo 1 || echo 0)"
+assert_contains "CGC Section 8: node -e is listed as DROPPED" "DROPPED (not on read-only allowlist; not executed): node -e" "$T4R"
+assert_contains "CGC Section 8: git diff is listed as DROPPED" "DROPPED (not on read-only allowlist; not executed): git diff" "$T4R"
+assert_contains "CGC Section 8: bunx tsc is listed as DROPPED" "DROPPED (not on read-only allowlist; not executed): bunx tsc" "$T4R"
+assert_contains "CGC Section 8: bunx playwright is listed as DROPPED" "DROPPED (not on read-only allowlist; not executed): bunx playwright" "$T4R"
+named_end cgc_section8_fixture_counts_all_commands
+
+echo "--- header_without_command_is_declared_unparsed ---"
+named_begin
+T5="$(printf '## 8. Stop conditions\n\nStop 1 (staging works):\n  Open the staging page and confirm it loads.\n' | rsg_extract)"
+assert_contains "header without a command: DECLARED 1" "DECLARED${TAB}1" "$T5"
+assert_contains "header without a command: UNPARSED 1 names the header text" "UNPARSED${TAB}1${TAB}Stop 1 (staging works):" "$T5"
+assert_eq "header without a command: no assertion line is emitted" "0" "$(count_records "$T5")"
+named_end header_without_command_is_declared_unparsed
+
+echo "--- test_owned_and_foreign_blocks_are_not_counted ---"
+named_begin
+SPEC_T6='## 8. Stop conditions
+
+Stop 1 (test suite, stage 1):
+  bun test x
+  Expected: 3 passing
+
+Stop 2 (unit tests):
+  node tests/a.js
+  Expected: 4 passing
+
+Stop 3 (runtime proof):
+  ssh hetzner-prod "docker exec app grep -c x /app/y"
+  Expected: at least 1
+'
+T6="$(printf '%s\n' "$SPEC_T6" | rsg_extract)"
+assert_contains "test-owned and foreign blocks: DECLARED 0" "DECLARED${TAB}0" "$T6"
+assert_contains "test-owned and foreign blocks: UNPARSED 0" "UNPARSED${TAB}0" "$T6"
+T6R="$(printf '%s\n' "$SPEC_T6" | rsg_extract | rsg_run)"
+assert_eq "a spec with no grep-class stop is still truthfully none_declared" "none_declared" "$(kv GREP_STATUS "$T6R")"
+named_end test_owned_and_foreign_blocks_are_not_counted
+
+echo "--- none_declared_with_uncounted_commands_fails ---"
+named_begin
+MEC_CORE_T="$(extract_core "$CANONICAL_YAML" mec)"
+eval "$MEC_CORE_T"
+MEC_MANIFEST='WO: WO-X
+Tests: 3/3 (bun test x)
+Grep assertions: N/A (spec declares no grep stop conditions)'
+mec_for() {
+  # mec_for <rsg_run output>  -> "<rc>|<stderr>"
+  local o="$1" err rc
+  err="$(mktemp)"
+  printf '%s\n' "$MEC_MANIFEST" | mec_check PROCEED CODE passed "$(kv GREP_DECLARED "$o")" "$(kv GREP_STATUS "$o")" 0 "$(kv GREP_EXECUTED "$o")" "$(kv GREP_DROPPED "$o")" "$(kv GREP_UNPARSED "$o")" "$(kv GREP_MISMATCH "$o")" "" >/dev/null 2>"$err"; rc=$?
+  printf '%s|%s' "$rc" "$(cat "$err")"
+  rm -f "$err"
+}
+T7R="$(printf '## 8. Stop conditions\n\ngrep -c x f.ts\nnode -e x\n' | rsg_extract | rsg_run)"
+assert_eq "bare command lines outside any block: GREP_STATUS all_dropped" "all_dropped" "$(kv GREP_STATUS "$T7R")"
+assert_eq "bare command lines: GREP_DECLARED 2" "2" "$(kv GREP_DECLARED "$T7R")"
+assert_eq "bare command lines: GREP_UNPARSED 2" "2" "$(kv GREP_UNPARSED "$T7R")"
+T7M="$(mec_for "$T7R")"
+assert_eq "mec_check returns 1 on the uncounted command lines" "1" "${T7M%%|*}"
+assert_contains "mec_check prints SPEC_DEFECT" "SPEC_DEFECT:" "$T7M"
+T7K="$(printf '## 8. Stop conditions\n\n- `node -e x` exits 0\n' | rsg_extract | rsg_run)"
+assert_eq "a backticked node line alone stays none_declared" "none_declared" "$(kv GREP_STATUS "$T7K")"
+T7KM="$(mec_for "$T7K")"
+assert_eq "a backticked node line alone: mec_check returns 0" "0" "${T7KM%%|*}"
+T7P="$(printf '## 8. Stop conditions\n\nStop 1 (grep assertion):\n  grep -c alpha fixture.txt\n  Expected: 1\n\ngrep -c stray f.ts\n' | rsg_extract)"
+assert_contains "a stray bare command after a block is part of that block and unparsed" "UNPARSED${TAB}1${TAB}grep -c stray f.ts" "$T7P"
+named_end none_declared_with_uncounted_commands_fails
+
+echo "--- existing_extraction_behavior_preserved ---"
+named_begin
+# The pre-existing extraction assertions run above and below this block unchanged except
+# the rewritten ones named in the WO; this block re-pins the shapes the WO lists.
+E1="$(printf 'Stop 2 (test suite):\n  bun test\n  Expected: ok\n' | rsg_extract)"
+assert_eq "a test-suite-only spec stays none_declared (extract)" "UNPARSED${TAB}0
+DECLARED${TAB}0" "$E1"
+assert_eq "a test-suite-only spec stays none_declared (run)" "none_declared" "$(kv GREP_STATUS "$(printf '%s\n' "$E1" | rsg_run)")"
+E2="$(printf 'Stop 1 (grep assertion):\n  grep -rn "a" src \\\n    | wc -l\n  Expected: 4\n' | rsg_extract)"
+assert_contains "backslash continuation still joins" "grep -rn \"a\" src | wc -l${TAB}eq${TAB}4" "$E2"
+E3="$(printf 'Stop 1 (grep assertion):\n  grep -c gamma f\n' | rsg_extract)"
+assert_contains "legacy header without Expected is still declared and unparsed" "UNPARSED${TAB}1${TAB}grep -c gamma f" "$E3"
+E4="$(printf '## Stop conditions\n- Baseline: `grep -c x y` returns 0 before this WO.\n- `grep -c x y` returns 2 or greater\n' | rsg_extract)"
+assert_contains "second shape and baseline exclusion unchanged" "grep -c x y${TAB}ge${TAB}2" "$E4"
+assert_contains "second shape declared count unchanged" "DECLARED${TAB}1" "$E4"
+E5="$(printf 'Stop 2 (assert the log line):\n  awk x y\n  Expected: 1\n' | rsg_extract)"
+assert_contains "legacy assert header counts any command-like line" "awk x y${TAB}eq${TAB}1" "$E5"
+named_end existing_extraction_behavior_preserved
+
+echo "--- all_lanes_share_extraction_core ---"
+named_begin
+LANE_COUNT2=0
+for lane in $LANES; do LANE_COUNT2=$((LANE_COUNT2 + 1)); done
+assert_eq "LANES names 13 lanes" "13" "$LANE_COUNT2"
+assert_contains "LANES includes astra" "bdc-feature-development-astra.yaml" "$LANES"
+RST_REF_SUM="$(extract_core "$CANONICAL_YAML" rst | cksum)"
+for lane in $LANES; do
+  LANE_CORE2="$(extract_core "$DEFAULTS/$lane" rsg)"
+  assert_eq "rsg core byte-identical to codex: $lane" "$RSG_CORE" "$LANE_CORE2"
+  assert_contains "rsg core carries note_uncounted: $lane" "note_uncounted" "$LANE_CORE2"
+  assert_eq "rsg core has no note_unparsed left: $lane" "0" "$(printf '%s\n' "$LANE_CORE2" | grep -c 'note_unparsed' || true)"
+  assert_eq "rst core byte-identical to codex: $lane" "$RST_REF_SUM" "$(extract_core "$DEFAULTS/$lane" rst | cksum)"
+done
+named_end all_lanes_share_extraction_core
+
+echo "--- shared_fixture_cases_match_in_harness ---"
+named_begin
+CASE_N=0
+if [ ! -f "$FIXTURE" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL: shared extraction fixture missing: $FIXTURE"
+else
+  for cname in $(sed -n 's/^@@CASE //p' "$FIXTURE"); do
+    CASE_N=$((CASE_N + 1))
+    assert_eq "fixture case $cname" "$(fixture_part "$cname" expect)" "$(fixture_part "$cname" spec | rsg_extract)"
+  done
+  if [ "$CASE_N" -ge 12 ]; then PASS=$((PASS + 1)); echo "PASS: fixture has at least 12 cases ($CASE_N)"; else FAIL=$((FAIL + 1)); echo "FAIL: fixture case count: $CASE_N"; fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "stop-extract-cases.txt sha256: $(sha256sum "$FIXTURE" | cut -d' ' -f1)"
+  else
+    echo "stop-extract-cases.txt sha256: $(shasum -a 256 "$FIXTURE" | cut -d' ' -f1)"
+  fi
+fi
+named_end shared_fixture_cases_match_in_harness
+
+echo "--- multi_file_grep_count_is_summed ---"
+named_begin
+TMPM="$(mktemp -d)"
+printf 'x\n' > "$TMPM/a.js"; : > "$TMPM/b.js"; : > "$TMPM/c.js"; : > "$TMPM/d.js"
+assert_eq "4-file grep -c with counts 0,0,0,0 gives 0" "0" "$(cd "$TMPM" && rsg_observe 'grep -c zzz a.js b.js c.js d.js')"
+printf 'k\n' > "$TMPM/a.js"; : > "$TMPM/b.js"; printf 'k\nk\n' > "$TMPM/c.js"; : > "$TMPM/d.js"
+assert_eq "4-file grep -c with counts 1,0,2,0 gives 3" "3" "$(cd "$TMPM" && rsg_observe 'grep -c k a.js b.js c.js d.js')"
+assert_eq "4-file grep -c -r style flag cluster is summed" "3" "$(cd "$TMPM" && rsg_observe 'grep -rc k a.js b.js c.js d.js')"
+assert_eq "a single-file grep -c is unchanged" "2" "$(cd "$TMPM" && rsg_observe 'grep -c k c.js')"
+printf '5:123\n7:9\n' > "$TMPM/n.txt"
+assert_eq "grep -n output that looks like path:digits is NOT summed (no -c)" "2" "$(cd "$TMPM" && rsg_observe 'grep -n . n.txt')"
+OUTM="$(cd "$TMPM" && printf 'Stop 1 (grep assertion):\n  grep -c k a.js b.js c.js d.js\n  Expected: 3\n' | rsg_extract | rsg_run)"
+assert_contains "rsg_run reports OK with the summed count" "OK: grep -c k a.js b.js c.js d.js => 3 (expected eq 3)" "$OUTM"
+assert_eq "rsg_run status passed" "passed" "$(kv GREP_STATUS "$OUTM")"
+rm -rf "$TMPM"
+named_end multi_file_grep_count_is_summed
+
+echo "--- other_stage_stops_are_skipped_visibly ---"
+named_begin
+TMPS="$(mktemp -d)"
+printf 'alpha\nalpha\n' > "$TMPS/fixture.txt"
+SPEC_2STAGE='# WO-X
+
+stages:
+  - repo: thinmansoftware/bdc-harness
+    what: harness side
+  - repo: thinmansoftware/bdc-xo
+    what: validator side
+
+## 8. Stop conditions (CI-executable)
+
+Stop 1 (grep assertion, stage 1):
+  grep -c alpha fixture.txt
+  Expected: 2
+
+Stop 2 (grep assertion, stage 2):
+  grep -c check22 scripts/cauldron/validate-wo-spec.sh
+  Expected: at least 1
+
+Stop 3 (test suite, stage 2):
+  bash scripts/cauldron/tests/t.sh
+  Expected: exit 0
+
+Stop 4 (grep assertion, repo thinmansoftware/bdc-xo):
+  grep -c note scripts/cauldron/lib/x.awk
+  Expected: at least 1
+
+Stop 5 (grep assertion, untagged):
+  grep -c alpha fixture.txt
+  Expected: 2
+
+Stop 6 (grep assertion, stage 9):
+  grep -c alpha fixture.txt
+  Expected: 2
+'
+# current repo = stage 1 (bdc-harness)
+OS1="$(cd "$TMPS" && printf '%s\n' "$SPEC_2STAGE" | RSG_STAGE_REPO=thinmansoftware/bdc-harness rsg_extract)"
+assert_contains "stage 2 stop is emitted as OTHER_STAGE with its tag" "OTHER_STAGE${TAB}grep -c check22 scripts/cauldron/validate-wo-spec.sh${TAB}stage repo thinmansoftware/bdc-xo" "$OS1"
+assert_contains "repo-tagged stop is emitted as OTHER_STAGE" "OTHER_STAGE${TAB}grep -c note scripts/cauldron/lib/x.awk${TAB}stage repo thinmansoftware/bdc-xo" "$OS1"
+assert_contains "DECLARED counts only this stage plus untagged plus unknown-stage stops (3)" "DECLARED${TAB}3" "$OS1"
+OS1R="$(cd "$TMPS" && printf '%s\n' "$SPEC_2STAGE" | RSG_STAGE_REPO=thinmansoftware/bdc-harness rsg_extract | rsg_run)"
+assert_eq "stage 1 run: GREP_DECLARED=3" "3" "$(kv GREP_DECLARED "$OS1R")"
+assert_eq "stage 1 run: GREP_EXECUTED=3" "3" "$(kv GREP_EXECUTED "$OS1R")"
+assert_eq "stage 1 run: GREP_OTHER_STAGE=2" "2" "$(kv GREP_OTHER_STAGE "$OS1R")"
+assert_eq "stage 1 run: nothing dropped" "0" "$(kv GREP_DROPPED "$OS1R")"
+assert_eq "stage 1 run: status passed" "passed" "$(kv GREP_STATUS "$OS1R")"
+assert_contains "stage 1 run: skipped stop is visible in GREP_LINE" "SKIPPED (other-stage): grep -c check22 scripts/cauldron/validate-wo-spec.sh" "$OS1R"
+assert_contains "stage 1 run: skipped stop is visible in the detail with its tag" "SKIPPED (other-stage: stage repo thinmansoftware/bdc-xo): grep -c note scripts/cauldron/lib/x.awk" "$OS1R"
+# current repo = stage 2 (bdc-xo): the stage 1 stop is the skipped one
+OS2="$(cd "$TMPS" && printf '%s\n' "$SPEC_2STAGE" | RSG_STAGE_REPO=thinmansoftware/bdc-xo rsg_extract)"
+assert_contains "stage 1 stop is OTHER_STAGE when running as stage 2" "OTHER_STAGE${TAB}grep -c alpha fixture.txt${TAB}stage repo thinmansoftware/bdc-harness" "$OS2"
+assert_contains "stage 2 stops are declared when running as stage 2 (check22, note, untagged, stage 9)" "DECLARED${TAB}4" "$OS2"
+# a stage-only spec with nothing for this stage stays visible
+OS3R="$(cd "$TMPS" && printf '%s\n' "$SPEC_2STAGE" | grep -v 'Stop [3456]' | RSG_STAGE_REPO=thinmansoftware/bdc-other rsg_extract | rsg_run)"
+assert_contains "unknown current repo still skips by tag, and says so" "stop(s) belong to other stages" "$OS3R"
+# no known current repo (no git, no override): nothing is scoped, every stop counts
+OS4="$(cd "$TMPS" && unset RSG_STAGE_REPO && export GIT_DIR=/nonexistent && printf '%s\n' "$SPEC_2STAGE" | rsg_extract)"
+assert_eq "no current repo: no OTHER_STAGE record" "0" "$(printf '%s\n' "$OS4" | grep -c '^OTHER_STAGE' || true)"
+assert_contains "no current repo: every grep stop is declared (5)" "DECLARED${TAB}5" "$OS4"
+rm -rf "$TMPS"
+named_end other_stage_stops_are_skipped_visibly
 
 echo
 echo "run-stop-greps.sh: $PASS passed, $FAIL failed (PASS=$PASS FAIL=$FAIL)"

@@ -93,6 +93,8 @@ extract_core_nth() {
   ' | sed 's/^      //'
 }
 
+REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
+export BDC_RSGARGV_SCRIPT="$REPO_ROOT/scripts/lane/rsg-argv.sh"
 RST_CORE="$(extract_core "$CANONICAL_YAML" rst)"
 if [ -z "$RST_CORE" ]; then
   echo "FATAL: could not extract rst core from $CANONICAL_YAML"; exit 1
@@ -1655,6 +1657,186 @@ assert_contains "A2 Test 3 case B names the file" "worker-skeleton.test.ts :: (f
 
 rm -rf "$STB_ROOT"
 unset BDC_STBASE_SCRIPT STB_SPEC_FILE
+
+# ---------------------------------------------------------------------------
+# WO-HARNESS-GREP-STOP-EXTRACTION-SILENT-WAIVE-01 named tests 11-15 (bdc-xo #4753, stage 1).
+# rst consumes the ONE tokenizer scripts/lane/rsg-argv.sh (rsg_parse_chain): a single-quoted
+# multi-word argument is one argv word, every other metacharacter is still refused. Each
+# prints one "PASS: <name>" line only when every assertion inside it passed.
+# ---------------------------------------------------------------------------
+echo "--- WO-HARNESS-GREP-STOP-EXTRACTION-SILENT-WAIVE-01: rst quote-aware command check ---"
+SQ="'"
+NAMED_FAIL_MARK=0
+named_begin() { NAMED_FAIL_MARK=$FAIL; }
+named_end() {
+  if [ "$FAIL" -eq "$NAMED_FAIL_MARK" ]; then echo "PASS: $1"; else echo "FAIL: $1"; fi
+}
+RSTQ="$(mktemp -d)"
+RSTQ_BIN="$RSTQ/bin"
+mkdir -p "$RSTQ_BIN"
+RSTQ_CALLS="$RSTQ/calls.log"
+cat > "$RSTQ_BIN/bun" <<'STUB'
+#!/usr/bin/env bash
+{ printf 'CALL pwd=%s argv=bun' "$(pwd)"; for a in "$@"; do printf '~%s' "$a"; done; printf '\n'; } >> "$STUB_CALL_LOG"
+echo "1 pass"
+exit 0
+STUB
+chmod +x "$RSTQ_BIN/bun"
+rstq_run() {
+  # rstq_run <worktree> <commands-file> <log>  -> "<exit> <passed> <total>" from rst_run_commands
+  ( cd "$1" && PATH="$RSTQ_BIN:$PATH" STUB_CALL_LOG="$RSTQ_CALLS" rst_run_commands "$2" "$3" )
+}
+rstq_calls() { grep -c '^CALL' "$RSTQ_CALLS" 2>/dev/null || true; }
+
+echo "--- rsg_parse_chain scanner (the shared tokenizer, chain entry point) ---"
+named_begin
+RSGARGV_SOURCE="$REPO_ROOT/scripts/lane/rsg-argv.sh"
+chain_words() {
+  # chain_words <cmd> -> the parsed words joined by "~" ("RS" for a segment separator), or REJECT
+  bash -c '
+    . "$1"
+    if rsg_parse_chain "$2"; then
+      out=""
+      for w in "${RSG_PARSED[@]}"; do
+        if [ "$w" = "$(printf "\036")" ]; then w=RS; fi
+        out="$out~$w"
+      done
+      printf "%s" "$out"
+    else
+      printf REJECT
+    fi
+  ' _ "$RSGARGV_SOURCE" "$1"
+}
+assert_eq "chain: two segments" "~bun~test~a~RS~bun~test~b" "$(chain_words 'bun test a && bun test b')"
+assert_eq "chain: quoted && is one word" "~bun~test~-t~a && b" "$(chain_words "bun test -t ${SQ}a && b${SQ}")"
+assert_eq "chain: quoted word with a space" "~bun~test~-t~a b" "$(chain_words "bun test -t ${SQ}a b${SQ}")"
+assert_eq "chain: cd prefix is its own segment" "~cd~sub~RS~bun~test~x" "$(chain_words 'cd sub && bun test x')"
+assert_eq "chain: a pipe outside quotes is rejected" "REJECT" "$(chain_words 'bun test a | cat')"
+assert_eq "chain: a pipe inside quotes is literal" "~bun~test~a|b" "$(chain_words "bun test ${SQ}a|b${SQ}")"
+assert_eq "chain: a lone & is rejected" "REJECT" "$(chain_words 'bun test a & rm x')"
+assert_eq "chain: a trailing && is rejected" "REJECT" "$(chain_words 'bun test a &&')"
+assert_eq "chain: a leading && is rejected" "REJECT" "$(chain_words '&& bun test a')"
+assert_eq "chain: &&& is rejected" "REJECT" "$(chain_words 'bun test a &&& bun test b')"
+assert_eq "chain: an empty middle segment is rejected" "REJECT" "$(chain_words 'bun test a && && bun test b')"
+assert_eq "chain: double quotes are rejected" "REJECT" "$(chain_words 'bun test -t "a b"')"
+assert_eq "chain: a backslash is rejected" "REJECT" "$(chain_words 'bun test a\ b')"
+assert_eq "chain: command substitution is rejected" "REJECT" "$(chain_words 'bun test $(id)')"
+assert_eq "chain: a redirect is rejected" "REJECT" "$(chain_words "bun test ${SQ}a b${SQ} > out")"
+assert_eq "chain: a glued quote is rejected" "REJECT" "$(chain_words "bun test -t ${SQ}a b${SQ}c")"
+assert_eq "chain: an empty quote is rejected" "REJECT" "$(chain_words "bun test -t ${SQ}${SQ}")"
+assert_eq "chain: an unterminated quote is rejected" "REJECT" "$(chain_words "bun test -t ${SQ}a b")"
+pipe_words() {
+  bash -c '
+    . "$1"
+    if rsg_parse_pipeline "$2"; then
+      out=""
+      for w in "${RSG_PARSED[@]}"; do
+        if [ "$w" = "$(printf "\037")" ]; then w=US; fi
+        out="$out~$w"
+      done
+      printf "%s" "$out"
+    else
+      printf REJECT
+    fi
+  ' _ "$RSGARGV_SOURCE" "$1"
+}
+assert_eq "pipeline behaviour unchanged: | still separates" "~grep~-c~x~f~US~wc~-l" "$(pipe_words 'grep -c x f | wc -l')"
+assert_eq "pipeline behaviour unchanged: && is still rejected" "REJECT" "$(pipe_words 'grep -c x f && wc -l')"
+assert_eq "pipeline behaviour unchanged: quoted word" "~grep~-c~a b~f" "$(pipe_words "grep -c ${SQ}a b${SQ} f")"
+named_end rsg_parse_chain_scanner
+
+echo "--- rst_single_quoted_arg_is_run ---"
+named_begin
+W11="$RSTQ/w11"; mkdir -p "$W11"; : > "$RSTQ_CALLS"
+printf 'Stop 1 (test suite):\n  bun test -t %sa b%s\n  Expected: 1 passing\n' "$SQ" "$SQ" | rst_extract_commands > "$RSTQ/cmds11"
+assert_eq "the spec text extracts the quoted command" "bun test -t ${SQ}a b${SQ}" "$(head -1 "$RSTQ/cmds11")"
+if rst_command_looks_runnable "bun test -t ${SQ}a b${SQ}"; then PASS=$((PASS+1)); echo "PASS: rst_command_looks_runnable accepts bun test -t 'a b'"; else FAIL=$((FAIL+1)); echo "FAIL: rst_command_looks_runnable accepts bun test -t 'a b'"; fi
+R11="$(rstq_run "$W11" "$RSTQ/cmds11" "$RSTQ/log11")"
+assert_eq "the stub was invoked exactly once" "1" "$(rstq_calls)"
+assert_eq "recorded argv is bun, test, -t and a b as ONE word" "bun~test~-t~a b" "$(sed -n 's/^CALL .* argv=//p' "$RSTQ_CALLS")"
+assert_not_contains "no refusing line in the log" "refusing non-runnable command" "$(cat "$RSTQ/log11")"
+assert_eq "exit 0 and counts parsed" "0 1 1" "$R11"
+named_end rst_single_quoted_arg_is_run
+
+echo "--- rst_double_quote_and_metacharacters_rejected ---"
+named_begin
+W12="$RSTQ/w12"; mkdir -p "$W12"; : > "$W12/x"; : > "$RSTQ_CALLS"
+RST12_LIST=(
+  'bun test -t "a b"'
+  "bun test -t ${SQ}a b${SQ}; rm x"
+  'rm x'
+  "bun test ${SQ}a b${SQ} > out"
+  "bun test -t ${SQ}a b${SQ}c"
+  "bun test -t ${SQ}a b"
+  "bun test -t ${SQ}${SQ}"
+  'bun test a\ b'
+  "node ${SQ}-e${SQ} x"
+  "bun test ${SQ}a b${SQ} | cat"
+  'bun test $(id)'
+)
+for c in "${RST12_LIST[@]}"; do
+  if rst_command_looks_runnable "$c"; then FAIL=$((FAIL+1)); echo "FAIL: not runnable expected: $c"; else PASS=$((PASS+1)); echo "PASS: not runnable: $c"; fi
+  printf '%s\n' "$c" > "$RSTQ/cmds12"
+  : > "$RSTQ/log12"
+  rstq_run "$W12" "$RSTQ/cmds12" "$RSTQ/log12" >/dev/null
+  assert_contains "refused by rst_run_commands: $c" "refusing non-runnable command" "$(cat "$RSTQ/log12")"
+done
+assert_eq "the stub was never invoked" "0" "$(rstq_calls)"
+assert_eq "no file named out exists" "0" "$(test -e "$W12/out" && echo 1 || echo 0)"
+assert_eq "file x was not removed" "1" "$(test -e "$W12/x" && echo 1 || echo 0)"
+named_end rst_double_quote_and_metacharacters_rejected
+
+echo "--- rst_quoted_andand_is_one_word_and_cd_chain_works ---"
+named_begin
+W13="$RSTQ/w13"; mkdir -p "$W13/sub"; : > "$W13/x"; : > "$RSTQ_CALLS"
+printf '%s\n' "bun test -t ${SQ}a && b${SQ}" "cd sub && bun test -t ${SQ}x y${SQ}" "bun test a && rm x" > "$RSTQ/cmds13"
+rstq_run "$W13" "$RSTQ/cmds13" "$RSTQ/log13" >/dev/null
+assert_eq "exactly two stub invocations (the third command is refused as a whole)" "2" "$(rstq_calls)"
+assert_eq "first call: one word a && b, run in the worktree root" "CALL pwd=$(cd "$W13" && pwd) argv=bun~test~-t~a && b" "$(sed -n 1p "$RSTQ_CALLS")"
+assert_eq "second call: one word x y, run inside sub" "CALL pwd=$(cd "$W13/sub" && pwd) argv=bun~test~-t~x y" "$(sed -n 2p "$RSTQ_CALLS")"
+assert_eq "exactly one refusal in the log" "1" "$(grep -c 'refusing non-runnable command' "$RSTQ/log13" || true)"
+assert_eq "rm never ran: file x still exists" "1" "$(test -e "$W13/x" && echo 1 || echo 0)"
+named_end rst_quoted_andand_is_one_word_and_cd_chain_works
+
+echo "--- rst_missing_helper_refuses_quotes_only ---"
+named_begin
+W14="$RSTQ/w14"; mkdir -p "$W14"
+printf '%s\n' "$RST_CORE" > "$RSTQ/core14.sh"
+cat > "$RSTQ/drive14.sh" <<'DRIVE'
+#!/usr/bin/env bash
+. "$1"
+cd "$2"
+rst_run_commands "$3" "$4"
+DRIVE
+printf 'bun test x y\n' > "$RSTQ/cmds14a"
+printf 'bun test -t %sa b%s\n' "$SQ" "$SQ" > "$RSTQ/cmds14b"
+: > "$RSTQ_CALLS"
+R14A="$(env -u ARCHON_LANE_SCRIPTS_DIR BDC_RSGARGV_SCRIPT=/nonexistent/rsg-argv.sh PATH="$RSTQ_BIN:$PATH" STUB_CALL_LOG="$RSTQ_CALLS" bash "$RSTQ/drive14.sh" "$RSTQ/core14.sh" "$W14" "$RSTQ/cmds14a" "$RSTQ/log14a" 2>/dev/null)"
+assert_eq "plain command without the helper: exit 0 as on dev today" "0 1 1" "$R14A"
+assert_eq "plain command without the helper: same argv as today" "CALL pwd=$(cd "$W14" && pwd) argv=bun~test~x~y" "$(sed -n 1p "$RSTQ_CALLS")"
+assert_eq "plain command: one invocation" "1" "$(rstq_calls)"
+R14B="$(env -u ARCHON_LANE_SCRIPTS_DIR BDC_RSGARGV_SCRIPT=/nonexistent/rsg-argv.sh PATH="$RSTQ_BIN:$PATH" STUB_CALL_LOG="$RSTQ_CALLS" bash "$RSTQ/drive14.sh" "$RSTQ/core14.sh" "$W14" "$RSTQ/cmds14b" "$RSTQ/log14b" 2>/dev/null)"
+assert_contains "quoted command without the helper is refused" "refusing non-runnable command" "$(cat "$RSTQ/log14b")"
+assert_eq "quoted command without the helper: stub not invoked again" "1" "$(rstq_calls)"
+assert_eq "quoted command without the helper: nonzero exit" "1" "${R14B%% *}"
+named_end rst_missing_helper_refuses_quotes_only
+
+echo "--- rst_rescue_subdir_uses_parsed_argv ---"
+named_begin
+W15="$RSTQ/w15"; mkdir -p "$W15/d1/a" "$W15/d2"; : > "$W15/d1/a/b"
+assert_eq "quoted argument is not mistaken for a path, no cd prefix" "bun test -t ${SQ}a/b c${SQ}" "$(cd "$W15" && rst_rescue_subdir "bun test -t ${SQ}a/b c${SQ}")"
+assert_eq "unquoted path is rewritten exactly as today" "cd d1 && bun test a/b" "$(cd "$W15" && rst_rescue_subdir 'bun test a/b')"
+named_end rst_rescue_subdir_uses_parsed_argv
+
+echo "--- rst core no longer splits on whitespace or carries a second tokenizer ---"
+named_begin
+assert_eq "rst core has no rst_tokens_safe" "0" "$(printf '%s\n' "$RST_CORE" | grep -c 'rst_tokens_safe' || true)"
+assert_contains "rst core sources the shared rsg-argv.sh" 'for rsgargv_candidate in "${BDC_RSGARGV_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/rsg-argv.sh}" /app/scripts/lane/rsg-argv.sh; do' "$RST_CORE"
+assert_contains "rst core imports rsg_parse_chain" "rsg_parse_chain" "$RST_CORE"
+assert_eq "rst core carries no scanner state of its own" "0" "$(printf '%s\n' "$RST_CORE" | grep -c 'inword=\|segwords=' || true)"
+named_end rst_core_imports_the_shared_tokenizer
+
+rm -rf "$RSTQ"
 
 echo
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"

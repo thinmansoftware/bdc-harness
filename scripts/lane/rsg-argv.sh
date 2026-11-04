@@ -30,6 +30,15 @@
 #   quote (it closes the word), the double quote and the backslash, which return 1.
 #   A | inside single quotes is a literal, not a segment separator.
 #
+# rsg_parse_chain <command>   (WO-HARNESS-GREP-STOP-EXTRACTION-SILENT-WAIVE-01, bdc-xo #4753)
+#   The flag-free second entry point of the SAME scanner, used by the run-stop-tests node
+#   (rst core). Identical rules to rsg_parse_pipeline except the separator: the two-character
+#   operator && outside single quotes separates chain segments (reported as a single element
+#   equal to RSG_RS, the one-character string ASCII 0x1E), and | outside quotes is REJECTED.
+#   A lone & is rejected, so is an empty segment (leading, trailing or doubled &&). A && or |
+#   inside single quotes is a literal byte. Fills RSG_PARSED exactly like rsg_parse_pipeline.
+#   rsg_parse_pipeline behaviour is unchanged.
+#
 # The parse is the single source of truth: the lane's allowlist check
 # (rsg_allow_cmd) and its execution (rsg_exec_pipeline) both consume RSG_PARSED, and
 # execution is argv-only ("$@"), never a shell -c of the spec string, so a quoted
@@ -40,13 +49,20 @@
 # ASCII only. Requires bash 4+ (arrays, ${var:offset:length}).
 
 RSG_US=$'\037'
+RSG_RS=$'\036'
 RSG_PARSED=()
 
-rsg_parse_pipeline() {
+# _rsg_scan <pipe|chain> <command>   (the one scanner behind both entry points)
+_rsg_scan() {
   local LC_ALL=C
-  local cmd="${1-}" n i j ch c2 nx lit word="" inword=0 segwords=0
+  local mode="${1-}" cmd="${2-}" sep sepelem step n i j ch c2 nx lit word="" inword=0 segwords=0
   local -a out=()
   RSG_PARSED=()
+  case "$mode" in
+    pipe) sep='|'; sepelem="$RSG_US" ;;
+    chain) sep='&'; sepelem="$RSG_RS" ;;
+    *) return 1 ;;
+  esac
   n=${#cmd}
   [ "$n" -gt 0 ] || return 1
   i=0
@@ -73,7 +89,7 @@ rsg_parse_pipeline() {
         # and must close at a word boundary (nothing glued after it)
         nx="${cmd:j+1:1}"
         case "$nx" in
-          '' | ' ' | $'\t' | '|') ;;
+          '' | ' ' | $'\t' | "$sep") ;;
           *) return 1 ;;
         esac
         out+=("$lit")
@@ -89,8 +105,14 @@ rsg_parse_pipeline() {
         fi
         i=$((i + 1))
         ;;
-      '|')
-        [ "${cmd:i+1:1}" != '|' ] || return 1
+      "$sep")
+        if [ "$mode" = pipe ]; then
+          [ "${cmd:i+1:1}" != '|' ] || return 1
+          step=1
+        else
+          [ "${cmd:i+1:1}" = '&' ] || return 1
+          step=2
+        fi
         if [ "$inword" -eq 1 ]; then
           out+=("$word")
           segwords=$((segwords + 1))
@@ -98,16 +120,16 @@ rsg_parse_pipeline() {
           inword=0
         fi
         [ "$segwords" -gt 0 ] || return 1
-        out+=("$RSG_US")
+        out+=("$sepelem")
         segwords=0
-        i=$((i + 1))
+        i=$((i + step))
         ;;
       '[' | ']')
         # only as a standalone word (the test builtin): boundary on both sides
         [ "$inword" -eq 0 ] || return 1
         nx="${cmd:i+1:1}"
         case "$nx" in
-          '' | ' ' | $'\t' | '|') ;;
+          '' | ' ' | $'\t' | "$sep") ;;
           *) return 1 ;;
         esac
         out+=("$ch")
@@ -129,4 +151,12 @@ rsg_parse_pipeline() {
   [ "$segwords" -gt 0 ] || return 1
   RSG_PARSED=("${out[@]}")
   return 0
+}
+
+rsg_parse_pipeline() {
+  _rsg_scan pipe "${1-}"
+}
+
+rsg_parse_chain() {
+  _rsg_scan chain "${1-}"
 }
