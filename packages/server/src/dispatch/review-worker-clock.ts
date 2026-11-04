@@ -50,6 +50,8 @@ import {
   registerWorker,
   releaseMessage,
   renewMessageLease,
+  supersedeQueuedMessageByClaim,
+  type ClaimedDispatchMessage,
   type DispatchMessage,
   type SeqCursorMessage,
   type DispatchTaskOutcome,
@@ -212,6 +214,21 @@ export interface ReviewWorkerDeps {
   /** Optional logger seam for deterministic observability tests. */
   logger?: ReviewWorkerLogger;
   /**
+   * Keyset reader over QUEUED run_review rows (listMessagesBySeqCursor) and the
+   * fenced retire-by-claim write, used to supersede redundant queued reviews of
+   * the head just claimed (WO-HARNESS-OVERSEER-RECHECK-DEDUPE-PER-HEAD-01).
+   * Optional so a test double can omit them; when either is absent nothing is
+   * superseded and every queued review runs as before.
+   */
+  listQueuedReviews?: (filters: {
+    recipient: string;
+    task_type: string;
+    status: 'queued';
+    afterSeq?: number;
+    limit: number;
+  }) => Promise<SeqCursorMessage[]>;
+  supersedeQueuedReview?: typeof supersedeQueuedMessageByClaim;
+  /**
    * Backstop for lost check-completion deliveries (#782 part 3). Optional so a
    * test double can omit it; when absent the sweep simply does not run and the
    * primary review path is untouched.
@@ -298,6 +315,8 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     releaseMessage,
     deferMessage,
     renewMessageLease,
+    listQueuedReviews: listMessagesBySeqCursor,
+    supersedeQueuedReview: supersedeQueuedMessageByClaim,
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
     prepareCheckout: prepareReviewCheckout,
@@ -410,6 +429,13 @@ export async function tickReviewWorkerClock(
           );
           continue;
         }
+        // SUPERSEDE AT CLAIM (WO-HARNESS-OVERSEER-RECHECK-DEDUPE-PER-HEAD-01):
+        // this review reads the head's checks NOW, so queued reviews of the same
+        // head inserted before this claim (seq <= the claim's boundary) are
+        // redundant and never run. Rows inserted after the claim (a check that
+        // completes while this review runs) survive. Fails open: the claimed
+        // review always runs.
+        await supersedeQueuedDuplicateReviews(deps, claimed, body);
         // OPERATOR OVERRIDE (#847): a hand-enqueued run_review whose
         // repeat_reason starts with `operator_request:ladder_restored` clears
         // the judge-ladder breaker before the judge runs; the recovery pass at
@@ -609,6 +635,109 @@ export async function tickReviewWorkerClock(
   } finally {
     await lease.release();
     inFlight = false;
+  }
+}
+
+let warnedNoClaimBoundary = false;
+
+/**
+ * Mark every OTHER queued run_review for the claimed row's owner/repo/PR/head
+ * that was inserted before the claim as superseded, with the reason
+ * `superseded_by_claim <claimed row id>`.
+ *
+ * "Before the claim" is the database order, never a clock: a row qualifies only
+ * when its own `seq` is set and <= `claimBoundarySeq`, the MAX(seq) read inside
+ * the claim transaction (see ClaimedDispatchMessage). created_at is not used --
+ * client clocks are monotonic only within one process, so a row enqueued by
+ * another writer after the claim can carry an earlier created_at. A NULL-seq
+ * row is never superseded. A claim with no boundary skips superseding (logged
+ * once per process). Never throws: any failure is logged and the claimed
+ * review proceeds. Operator-requested rows (`repeat_reason` starting
+ * `operator_request:`) are never superseded, so an operator override is not
+ * lost.
+ */
+async function supersedeQueuedDuplicateReviews(
+  deps: ReviewWorkerDeps,
+  claimed: ClaimedDispatchMessage,
+  body: { owner: string; repo: string; prNumber: number; headSha: string }
+): Promise<void> {
+  if (!deps.listQueuedReviews || !deps.supersedeQueuedReview) return;
+  const logger = deps.logger ?? log;
+  const context = {
+    messageId: claimed.id,
+    owner: body.owner,
+    repo: body.repo,
+    prNumber: body.prNumber,
+    headSha: body.headSha,
+  };
+  const boundary = claimed.claimBoundarySeq;
+  if (typeof boundary !== 'number' || !Number.isFinite(boundary)) {
+    if (!warnedNoClaimBoundary) {
+      warnedNoClaimBoundary = true;
+      logger.warn(context, 'overseer.pr_review.supersede_skipped_no_claim_boundary');
+    }
+    return;
+  }
+  const reason = `superseded_by_claim ${claimed.id}`;
+  const same = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+  const superseded: string[] = [];
+  try {
+    let afterSeq: number | undefined;
+    for (let page = 0; page < REVIEW_CHECKOUT_CLAIM_MAX_PAGES; page += 1) {
+      const rows = await deps.listQueuedReviews({
+        recipient: REVIEW_RECIPIENT,
+        task_type: REVIEW_TASK_TYPE,
+        status: 'queued',
+        ...(afterSeq === undefined ? {} : { afterSeq }),
+        limit: REVIEW_CHECKOUT_CLAIM_PAGE_SIZE,
+      });
+      for (const row of rows) {
+        if (row.id === claimed.id || row.status !== 'queued') continue;
+        if (row.task_type !== REVIEW_TASK_TYPE) continue;
+        if (row.repeat_reason?.startsWith('operator_request:')) continue;
+        if (typeof row.seq !== 'number' || !Number.isFinite(row.seq) || row.seq > boundary) {
+          continue;
+        }
+        const other = parseReviewWorkBody(row.body);
+        if (
+          other?.prNumber !== body.prNumber ||
+          !same(other.owner, body.owner) ||
+          !same(other.repo, body.repo) ||
+          !same(other.headSha, body.headSha)
+        ) {
+          continue;
+        }
+        try {
+          const retired = await deps.supersedeQueuedReview({
+            id: row.id,
+            claimed_id: claimed.id,
+            boundary_seq: boundary,
+            reason,
+          });
+          if (retired) superseded.push(row.id);
+        } catch (error) {
+          logger.warn(
+            {
+              ...context,
+              supersedeId: row.id,
+              error: error instanceof Error ? error.message : String(error),
+            },
+            'overseer.pr_review.supersede_failed'
+          );
+        }
+      }
+      if (rows.length < REVIEW_CHECKOUT_CLAIM_PAGE_SIZE) break;
+      afterSeq = rows[rows.length - 1]?.cursor_seq;
+      if (afterSeq === undefined) break;
+    }
+  } catch (error) {
+    logger.warn(
+      { ...context, error: error instanceof Error ? error.message : String(error) },
+      'overseer.pr_review.supersede_failed'
+    );
+  }
+  if (superseded.length > 0) {
+    log.info({ ...context, reason, superseded }, 'overseer.pr_review.superseded_by_claim');
   }
 }
 
