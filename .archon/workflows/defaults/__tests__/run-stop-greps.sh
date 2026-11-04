@@ -755,6 +755,35 @@ assert_contains "no current repo: every grep stop is declared (5)" "DECLARED${TA
 rm -rf "$TMPS"
 named_end other_stage_stops_are_skipped_visibly
 
+echo "--- backticked_command_with_separate_expected_is_one_assertion ---"
+named_begin
+R2A="$(printf '## 8. Stop conditions\n\nStop 1 (route check):\n  `grep -c x f`\n  Expected: 2\n' | rsg_extract)"
+assert_contains "backticked command plus a separate Expected: 2 is executable with eq 2" "grep -c x f${TAB}eq${TAB}2" "$R2A"
+assert_contains "UNPARSED is 0" "UNPARSED${TAB}0" "$R2A"
+assert_contains "DECLARED is 1" "DECLARED${TAB}1" "$R2A"
+R2B="$(printf '## 8. Stop conditions\n\nStop 1 (route check):\n- `grep -c x y` returns 2 or greater\n' | rsg_extract)"
+assert_contains "an inline expectation on the same line still uses the inline path" "grep -c x y${TAB}ge${TAB}2" "$R2B"
+named_end backticked_command_with_separate_expected_is_one_assertion
+
+echo "--- foreign_command_closes_a_pending_counted_command ---"
+named_begin
+R2C="$(printf '## 8. Stop conditions\n\nStop 1 (mixed block):\n  grep -c x f\n  curl -s https://example.test/health\n  Expected: 0\n' | rsg_extract)"
+assert_eq "no grep assertion with eq 0 is emitted" "0" "$(printf '%s\n' "$R2C" | grep -c "^grep -c x f${TAB}" || true)"
+assert_contains "the grep is declared and unparsed" "UNPARSED${TAB}1${TAB}grep -c x f" "$R2C"
+assert_contains "DECLARED is 1" "DECLARED${TAB}1" "$R2C"
+R2CR="$(printf '## 8. Stop conditions\n\nStop 1 (mixed block):\n  grep -c x f\n  curl -s https://example.test/health\n  Expected: 0\n' | rsg_extract | rsg_run)"
+assert_eq "such a stop can no longer pass: nothing executed, status all_dropped" "all_dropped" "$(kv GREP_STATUS "$R2CR")"
+named_end foreign_command_closes_a_pending_counted_command
+
+echo "--- counted_then_foreign_each_keep_their_own_expected ---"
+named_begin
+R2D="$(printf '## 8. Stop conditions\n\nStop 1 (mixed block):\n  grep -c x f\n  Expected: 1\n  curl -s https://example.test/health\n  Expected: 200\n' | rsg_extract)"
+assert_contains "the grep is paired with its own Expected" "grep -c x f${TAB}eq${TAB}1" "$R2D"
+assert_eq "the curl is ignored (no record for it)" "0" "$(printf '%s\n' "$R2D" | grep -c 'curl' || true)"
+assert_contains "UNPARSED is 0" "UNPARSED${TAB}0" "$R2D"
+assert_contains "DECLARED is 1" "DECLARED${TAB}1" "$R2D"
+named_end counted_then_foreign_each_keep_their_own_expected
+
 echo
 echo "run-stop-greps.sh: $PASS passed, $FAIL failed (PASS=$PASS FAIL=$FAIL)"
 [ "$FAIL" -eq 0 ]

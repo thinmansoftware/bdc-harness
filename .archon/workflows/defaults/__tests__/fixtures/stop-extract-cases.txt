@@ -337,3 +337,38 @@ grep -c gamma f.txt	ge	4
 UNPARSED	1	grep -c eps f.txt
 DECLARED	4
 @@END
+@@CASE backticked_command_separate_expected
+## 8. Stop conditions
+
+Stop 1 (route check):
+  `grep -c x f`
+  Expected: 2
+@@EXPECT
+grep -c x f	eq	2
+UNPARSED	0
+DECLARED	1
+@@END
+@@CASE foreign_command_closes_pending
+## 8. Stop conditions
+
+Stop 1 (mixed block):
+  grep -c x f
+  curl -s https://example.test/health
+  Expected: 0
+@@EXPECT
+UNPARSED	1	grep -c x f
+DECLARED	1
+@@END
+@@CASE counted_then_foreign_each_paired
+## 8. Stop conditions
+
+Stop 1 (mixed block):
+  grep -c x f
+  Expected: 1
+  curl -s https://example.test/health
+  Expected: 200
+@@EXPECT
+grep -c x f	eq	1
+UNPARSED	0
+DECLARED	1
+@@END

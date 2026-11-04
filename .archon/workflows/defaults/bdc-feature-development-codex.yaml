@@ -2595,8 +2595,11 @@ nodes:
       #        and unparsed, named by its header text; R7 a legacy "Stop N (grep" or "Stop N
       #        (assert" header counts anywhere in the spec and every command-like line before its
       #        Expected is an assertion whatever its first word; R8 the second shape (a backticked
-      #        read-only command followed by its expectation in prose) is kept and also applies
-      #        inside blocks; R9 a bare (not backticked) line in the section but outside any block
+      #        read-only command followed by its expectation in prose) is kept; inside a block it
+      #        applies only when the expectation is on the same line, otherwise the command is the
+      #        pending command for the next Expected line; any new command line, counted or foreign
+      #        (curl, ssh, sh, ...), first closes a pending counted command as unparsed and a
+      #        foreign command keeps its own Expected line; R9 a bare (not backticked) line in the section but outside any block
       #        whose first word is grep, egrep, fgrep, rg, git grep, node, bun, bunx, npm, npx,
       #        wc or "test -" is an uncounted command line: declared and unparsed, so
       #        none_declared can no longer sit next to an uncounted command line.
@@ -2671,6 +2674,18 @@ nodes:
             for (i = 1; i <= nrepo; i++) if (index(low, tolower(repos[i])) > 0) return repos[i]
             return ""
           }
+          function second_inline(s,   g, rest, e) {
+            if (!match(s, /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)[^`]*`/)) return 0
+            g = substr(s, RSTART + 1, RLENGTH - 2); rest = substr(s, RSTART + RLENGTH)
+            e = expect(rest)
+            if (e == "") return 0
+            declared++
+            print g "\t" e; parsed++
+            return 1
+          }
+          function isforeign(c) {
+            return (c ~ /^(ssh|scp|sh|bash|zsh|docker|curl|wget|gh|psql|sqlite3|python|python3|pip|make|cargo|go|pnpm|yarn|deno|jq|sed|awk|xargs|echo|printf|sudo|env|systemctl|journalctl|kill|rm|cp|mv|mkdir|touch|chmod|tee)( |$)/ || c ~ /^[a-z][a-z0-9_.\/-]* +-/ || c ~ /^[A-Z][0-9]+:/ || c ~ /^\.\//)
+          }
           function flush() {
             if (!inblk) return
             if (oth) { }
@@ -2706,7 +2721,7 @@ nodes:
             if ($0 ~ /^[ \t]*```/) next
             if (insec && second_gate($0)) {
               if (tolower($0) ~ /baseline|untouched tree|before the fix|before this wo/) next
-              if (second($0)) { bcmds++; next }
+              if (second_inline($0)) { bcmds++; next }
             }
             line = clean($0)
             if (line == "") next
@@ -2718,6 +2733,10 @@ nodes:
             }
             if (pending != "" && pending ~ /\\$/) { sub(/[ \t]*\\$/, "", pending); pending = pending " " line; next }
             if (iscmd(line)) {
+              if (pending != "" && (iscmd(pending) || (legacy && bexp == 0))) { declared++; note_uncounted(pending) }
+              pending = line; next
+            }
+            if (isforeign(line)) {
               if (pending != "" && (iscmd(pending) || (legacy && bexp == 0))) { declared++; note_uncounted(pending) }
               pending = line; next
             }
