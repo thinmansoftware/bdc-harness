@@ -235,6 +235,8 @@ describe('cascade entry override and refuse', () => {
         },
         escalate: async () => undefined,
         findWoClaim: async () => null,
+        // A climb's open-PR lookup fails closed (bdc-xo #4638); no open PR here.
+        listOpenWoPullRequests: async () => [],
         readRunDetail: async () => ({
           metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
         }),

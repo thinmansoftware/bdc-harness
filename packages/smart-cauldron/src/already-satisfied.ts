@@ -226,6 +226,18 @@ interface GhOpenPullRow {
 export interface ListOpenWoPullRequestsOptions {
   readonly woId: string;
   readonly project: string;
+  /**
+   * Head branches of earlier runs for this WO (run metadata.head_branch). A PR on
+   * one of them claims the WO even with no `WO:` line or WO token in its branch:
+   * implement-agent PRs often carry neither (bdc-harness #1476, 2026-11-04).
+   */
+  readonly headBranches?: readonly string[];
+  /**
+   * Throw on a lookup error instead of failing open to []. A climb must tell
+   * "no open PR" from "could not look" (bdc-xo #4638); the first-attempt guard
+   * keeps failing open.
+   */
+  readonly failOnError?: boolean;
   /** Override the paginated open-PR read (tests). */
   readonly lookup?: (repo: string) => Promise<GhOpenPullRow[]>;
   readonly execFn?: typeof execFileAsync;
@@ -243,7 +255,8 @@ function bodyLineClaimsWo(body: string, woId: string): boolean {
 function toOpenWoPullRequest(
   row: GhOpenPullRow,
   targetRepo: string,
-  woId: string
+  woId: string,
+  headBranches: ReadonlySet<string> = new Set()
 ): OpenWoPullRequest | null {
   if (row.draft === true) return null;
   const fullName = row.head?.repo?.full_name;
@@ -253,7 +266,7 @@ function toOpenWoPullRequest(
   if (typeof number !== 'number' || !Number.isInteger(number) || number < 1) return null;
   const headRefName = typeof row.head?.ref === 'string' ? row.head.ref : '';
   const body = typeof row.body === 'string' ? row.body : '';
-  const branchClaims = matchesWoToken(headRefName, woId);
+  const branchClaims = matchesWoToken(headRefName, woId) || headBranches.has(headRefName);
   if (!branchClaims && !bodyLineClaimsWo(body, woId)) return null;
   return {
     number,
@@ -274,7 +287,8 @@ function toOpenWoPullRequest(
  */
 async function ghListOpenPullRequestsDefault(
   repo: string,
-  execFn: typeof execFileAsync = execFileAsync
+  execFn: typeof execFileAsync = execFileAsync,
+  failOnError = false
 ): Promise<GhOpenPullRow[]> {
   if (process.env.SMART_CAULDRON_HERMETIC === '1') {
     console.log('[smart-cauldron/already-satisfied] skipping open-PR list in hermetic mode');
@@ -296,12 +310,16 @@ async function ghListOpenPullRequestsDefault(
         { timeout: 30000 }
       );
       const parsed: unknown = JSON.parse(stdout || '[]');
-      if (!Array.isArray(parsed)) return [];
+      if (!Array.isArray(parsed)) {
+        if (failOnError) throw new Error('open_pr_list_not_an_array');
+        return [];
+      }
       out.push(...(parsed as GhOpenPullRow[]));
       if (parsed.length < OPEN_PR_PAGE_SIZE) return out;
     }
     return out;
-  } catch {
+  } catch (error) {
+    if (failOnError) throw error;
     return [];
   }
 }
@@ -315,26 +333,35 @@ export async function listOpenWoPullRequests(
   opts: ListOpenWoPullRequestsOptions
 ): Promise<OpenWoPullRequest[]> {
   if (!opts.woId) return [];
+  const failOnError = opts.failOnError === true;
   let repo: string;
   try {
     repo = resolveGithubRepo(opts.project);
-  } catch {
+  } catch (error) {
+    if (failOnError) throw error;
     return [];
   }
   const lookup =
     opts.lookup ??
     ((target: string): Promise<GhOpenPullRow[]> =>
-      ghListOpenPullRequestsDefault(target, opts.execFn));
+      ghListOpenPullRequestsDefault(target, opts.execFn, failOnError));
   let rows: GhOpenPullRow[];
   try {
     rows = await lookup(repo);
-  } catch {
+  } catch (error) {
+    if (failOnError) throw error;
     return [];
   }
-  if (!Array.isArray(rows)) return [];
+  if (!Array.isArray(rows)) {
+    if (failOnError) throw new Error('open_pr_list_not_an_array');
+    return [];
+  }
+  const headBranches = new Set(
+    (opts.headBranches ?? []).filter(branch => typeof branch === 'string' && branch.length > 0)
+  );
   const matched: OpenWoPullRequest[] = [];
   for (const row of rows) {
-    const candidate = toOpenWoPullRequest(row, repo, opts.woId);
+    const candidate = toOpenWoPullRequest(row, repo, opts.woId, headBranches);
     if (candidate) matched.push(candidate);
   }
   return matched;
