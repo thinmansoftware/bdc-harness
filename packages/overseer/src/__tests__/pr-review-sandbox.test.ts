@@ -477,9 +477,15 @@ function approveResult(headSha: string): {
 
 const stubOctokit = { pulls: {} } as unknown as RealGitHubOctokitLike;
 
+/**
+ * scanSpool replaces the stand-in loop's directory scan (default readdir) so a
+ * test can hold a scan in flight across stop(); see
+ * stop_while_scanning_does_not_throw. spool is the stand-in spool directory,
+ * or undefined when the production broker is used.
+ */
 async function startBrokerHarness(
-  options: { standIn?: boolean } = {}
-): Promise<{ stop: () => Promise<void> }> {
+  options: { standIn?: boolean; scanSpool?: (dir: string) => Promise<string[]> } = {}
+): Promise<{ stop: () => Promise<void>; spool?: string }> {
   try {
     if (options.standIn) throw new Error('stand_in_requested');
     await access('/var/lib/overseer-review/ready');
@@ -498,58 +504,79 @@ async function startBrokerHarness(
   await writeFile(join(spool, 'ready'), 'test\n');
   const previous = process.env.OVERSEER_REVIEW_SPOOL;
   process.env.OVERSEER_REVIEW_SPOOL = spool;
-  let busy = false;
-  const timer = setInterval(async () => {
-    if (busy) return;
-    busy = true;
-    try {
-      const requests = (await readdir(spool)).filter(name => name.endsWith('.request.json'));
-      for (const name of requests) {
-        const job = JSON.parse(await readFile(join(spool, name), 'utf8')) as {
-          id: string;
-          checkout: string;
-          argv: string[];
-          prompt?: string;
-        };
-        let exitCode = 0;
-        let stdout = '';
-        let stderr = '';
-        if (job.prompt === undefined) {
-          const child = Bun.spawn(job.argv, {
-            cwd: job.checkout,
-            env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: spool, TMPDIR: spool },
-            stdout: 'pipe',
-            stderr: 'pipe',
-          });
-          [exitCode, stdout, stderr] = await Promise.all([
-            child.exited,
-            new Response(child.stdout).text(),
-            new Response(child.stderr).text(),
-          ]);
-        }
-        await writeFile(
-          join(spool, `${job.id}.result.json`),
-          JSON.stringify({
-            id: job.id,
-            ok: exitCode === 0,
-            exitCode,
-            stdout,
-            stderr,
-            uid: process.getuid?.() ?? -1,
-          })
-        );
-        await rm(join(spool, name), { force: true });
+  const scanSpool = options.scanSpool ?? ((dir: string) => readdir(dir));
+  // The stand-in loop runs one tick at a time. stop() must wait for the tick in
+  // flight before it removes the spool: clearInterval only cancels FUTURE ticks,
+  // so without the wait a tick already inside readdir/readFile/writeFile hits
+  // ENOENT after rm, and that unhandled rejection fails whichever test runs next.
+  let stopped = false;
+  let inFlight: Promise<void> | undefined;
+  const tick = async (): Promise<void> => {
+    const requests = (await scanSpool(spool)).filter(name => name.endsWith('.request.json'));
+    for (const name of requests) {
+      if (stopped) return;
+      const job = JSON.parse(await readFile(join(spool, name), 'utf8')) as {
+        id: string;
+        checkout: string;
+        argv: string[];
+        prompt?: string;
+      };
+      let exitCode = 0;
+      let stdout = '';
+      let stderr = '';
+      if (job.prompt === undefined) {
+        const child = Bun.spawn(job.argv, {
+          cwd: job.checkout,
+          env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: spool, TMPDIR: spool },
+          stdout: 'pipe',
+          stderr: 'pipe',
+        });
+        [exitCode, stdout, stderr] = await Promise.all([
+          child.exited,
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+        ]);
       }
-    } finally {
-      busy = false;
+      await writeFile(
+        join(spool, `${job.id}.result.json`),
+        JSON.stringify({
+          id: job.id,
+          ok: exitCode === 0,
+          exitCode,
+          stdout,
+          stderr,
+          uid: process.getuid?.() ?? -1,
+        })
+      );
+      await rm(join(spool, name), { force: true });
     }
+  };
+  const timer = setInterval(() => {
+    if (stopped || inFlight) return;
+    const run = tick();
+    inFlight = run;
+    // A failed tick is surfaced by stop(), never as an unhandled rejection.
+    run.then(
+      () => {
+        if (inFlight === run) inFlight = undefined;
+      },
+      () => undefined
+    );
   }, 5);
   return {
+    spool,
     async stop() {
+      stopped = true;
       clearInterval(timer);
-      if (previous === undefined) delete process.env.OVERSEER_REVIEW_SPOOL;
-      else process.env.OVERSEER_REVIEW_SPOOL = previous;
-      await rm(spool, { recursive: true, force: true });
+      try {
+        // Await the in-flight tick (and rethrow its failure) BEFORE removing
+        // the spool it is scanning.
+        if (inFlight) await inFlight;
+      } finally {
+        if (previous === undefined) delete process.env.OVERSEER_REVIEW_SPOOL;
+        else process.env.OVERSEER_REVIEW_SPOOL = previous;
+        await rm(spool, { recursive: true, force: true });
+      }
     },
   };
 }
@@ -642,6 +669,57 @@ async function reviewObservedCheckout(input: {
 }
 
 describe.serial('observed checkout integrity and check environment', () => {
+  test('stop_while_scanning_does_not_throw', async () => {
+    // Hold one stand-in scan open across stop(). stop() must wait for it to
+    // finish before removing the spool; otherwise the held readdir resumes
+    // against a deleted directory and throws ENOENT (dev 13325b51, run
+    // 41841058108). Platform-neutral: the stand-in runs on every OS.
+    let entered!: () => void;
+    const scanEntered = new Promise<void>(resolve => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    const scanReleased = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    let scans = 0;
+    const scanErrors: unknown[] = [];
+    const broker = await startBrokerHarness({
+      standIn: true,
+      scanSpool: async dir => {
+        scans += 1;
+        if (scans === 1) {
+          entered();
+          await scanReleased;
+        }
+        try {
+          return await readdir(dir);
+        } catch (error) {
+          scanErrors.push(error);
+          throw error;
+        }
+      },
+    });
+    const spool = broker.spool;
+    if (!spool) throw new Error('stand_in_spool_missing');
+    await scanEntered;
+    let stopSettled = false;
+    const stopping = broker.stop().finally(() => {
+      stopSettled = true;
+    });
+    // Give stop() every chance to remove the spool while the scan is held.
+    await Bun.sleep(50);
+    expect(stopSettled).toBe(false);
+    await access(spool);
+    release();
+    await stopping;
+    // Let a scan that outlived stop() (the bug) reach its readdir and fail.
+    await Bun.sleep(50);
+    expect(scanErrors).toEqual([]);
+    expect(scans).toBe(1);
+    await expect(access(spool)).rejects.toThrow();
+  });
+
   test.skipIf(!linux)(
     'real_broker_process_chain succeeds through the real broker then fails closed when it is killed',
     async () => {
