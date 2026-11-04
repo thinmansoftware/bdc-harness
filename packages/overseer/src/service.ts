@@ -31,7 +31,15 @@ import {
 } from './escalation-delivery';
 import { permitFromMetadata } from './permit';
 import { runReconcileOnce } from './reconcile';
+import {
+  fenceMethods,
+  MUTATING_DEP_NAMES,
+  RecordHandlerCancelledError,
+  throwIfFenced,
+} from './cancellation-fence';
 import { watchLoop, type WatchHeartbeatLogger } from './watch';
+
+export { RecordHandlerCancelledError };
 import type {
   DeterministicMergeHandoff,
   GitHubClientDeps,
@@ -70,7 +78,10 @@ const log = createLogger('overseer/service');
  * adapter that was actually wired when the service started.
  */
 export type OverseerWiredAdapterKind = 'fake' | 'real' | 'none';
-export type MergeReadyCoordinator = (record: WatchedRunRecord) => Promise<unknown>;
+export type MergeReadyCoordinator = (
+  record: WatchedRunRecord,
+  signal?: AbortSignal
+) => Promise<unknown>;
 
 export interface OverseerServiceOptions {
   once?: boolean;
@@ -105,7 +116,7 @@ export interface OverseerServiceOptions {
    * is set. When deterministicMergeHandoff is omitted, replay handoff binds
    * this runner only when mergeBridgeEnabled is exactly true.
    */
-  mergeBridgeRun?: () => Promise<unknown>;
+  mergeBridgeRun?: (signal?: AbortSignal) => Promise<unknown>;
   mergeBridgeEnabled?: boolean;
   /** Tests inject a spy for the watcher and delivery loop lines; defaults to the module logger. */
   logger?: WatchHeartbeatLogger;
@@ -231,68 +242,52 @@ const defaultVerdictStore: OverseerVerdictStoreDeps = {
   promoteObserveOrHealthyVerdictWithReceipt,
 };
 
-/**
- * Thrown by a side-effect fence when the record handler's signal has aborted
- * (record timeout, loop stop, runtime stop). A cancelled handler that resumes
- * later must perform NO merge, escalation, card or comment; it unwinds instead.
- */
-export class RecordHandlerCancelledError extends Error {
-  readonly point: string;
-
-  constructor(point: string) {
-    super(`record_handler_cancelled_before_${point}`);
-    this.name = 'RecordHandlerCancelledError';
-    this.point = point;
-  }
-}
-
-function throwIfFenced(signal: AbortSignal | undefined, point: string): void {
-  if (signal?.aborted) throw new RecordHandlerCancelledError(point);
-}
-
-/**
- * Wrap every mutating dependency so it checks the signal IMMEDIATELY before it
- * runs. Reads pass through untouched via the prototype chain.
- */
 function fenceDeps<T extends object>(deps: T, signal: AbortSignal): T {
-  const fenced = Object.create(deps) as Record<string, unknown>;
-  const source = deps as Record<string, unknown>;
-  for (const name of [
-    'insertOverseerAction',
-    'mergePullRequest',
-    'commentOnPullRequest',
-    'approvePullRequest',
-  ]) {
-    const original = source[name];
-    if (typeof original !== 'function') continue;
-    fenced[name] = (...args: unknown[]): unknown => {
-      throwIfFenced(signal, name);
-      return (original as (...a: unknown[]) => unknown).apply(deps, args);
-    };
-  }
-  return fenced as T;
+  return fenceMethods(deps, MUTATING_DEP_NAMES, signal);
 }
 
 function fenceVerdictStore(
   store: OverseerVerdictStoreDeps,
   signal: AbortSignal
 ): OverseerVerdictStoreDeps {
-  const fenced = Object.create(store) as Record<string, unknown>;
-  const source = store as unknown as Record<string, unknown>;
-  for (const name of [
-    'claimVerdict',
-    'finalizeVerdict',
-    'promoteObserveOrHealthyVerdict',
-    'promoteObserveOrHealthyVerdictWithReceipt',
-  ]) {
-    const original = source[name];
-    if (typeof original !== 'function') continue;
-    fenced[name] = (...args: unknown[]): unknown => {
-      throwIfFenced(signal, name);
-      return (original as (...a: unknown[]) => unknown).apply(store, args);
-    };
-  }
-  return fenced as unknown as OverseerVerdictStoreDeps;
+  return fenceMethods(
+    store,
+    [
+      'claimVerdict',
+      'finalizeVerdict',
+      'promoteObserveOrHealthyVerdict',
+      'promoteObserveOrHealthyVerdictWithReceipt',
+    ],
+    signal
+  );
+}
+
+/**
+ * Bind the merge coordinator and the deterministic merge handoff to a handler's
+ * signal. Both are fenced at entry AND receive the signal, so cancellation reaches
+ * the awaits and mutations inside them (evidence, judgment, merge, action rows).
+ */
+export function fenceMergeHandlers(
+  mergeCoordinator: MergeReadyCoordinator | undefined,
+  deterministicMergeHandoff: DeterministicMergeHandoff | undefined,
+  signal: AbortSignal
+): { coordinator?: MergeReadyCoordinator; handoff?: DeterministicMergeHandoff } {
+  return {
+    coordinator: mergeCoordinator
+      ? async (r): Promise<unknown> => {
+          throwIfFenced(signal, 'mergeCoordinator');
+          return mergeCoordinator(r, signal);
+        }
+      : undefined,
+    handoff: deterministicMergeHandoff
+      ? {
+          handoff: async (r): Promise<unknown> => {
+            throwIfFenced(signal, 'deterministicMergeHandoff');
+            return deterministicMergeHandoff.handoff(r, signal);
+          },
+        }
+      : undefined,
+  };
 }
 
 /**
@@ -328,25 +323,14 @@ export async function handleRecord(
   }
   try {
     throwIfFenced(signal, 'start');
+    const bound = fenceMergeHandlers(mergeCoordinator, deterministicMergeHandoff, signal);
     await handleRecordUnfenced(
       record,
       fenceDeps(deps, signal),
       dryRun,
       actor,
-      mergeCoordinator
-        ? (r): Promise<unknown> => {
-            throwIfFenced(signal, 'mergeCoordinator');
-            return mergeCoordinator(r);
-          }
-        : undefined,
-      deterministicMergeHandoff
-        ? {
-            handoff: (r): Promise<unknown> => {
-              throwIfFenced(signal, 'deterministicMergeHandoff');
-              return deterministicMergeHandoff.handoff(r);
-            },
-          }
-        : undefined,
+      bound.coordinator,
+      bound.handoff,
       signal
     );
   } catch (error) {
@@ -576,10 +560,13 @@ function githubCanDriveMergeBridge(github: GitHubClientDeps): boolean {
   );
 }
 
-function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<void> {
-  return (): Promise<void> =>
+function createMergeExecutionBridgeRun(
+  github: GitHubClientDeps
+): (signal?: AbortSignal) => Promise<void> {
+  return (signal?: AbortSignal): Promise<void> =>
     runMergeExecutionBridgeOnce({
       github,
+      signal,
       ...(github.hasQualifiedReview
         ? {
             hasQualifiedReview: (input): Promise<boolean> =>
@@ -612,13 +599,13 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
 
 function resolveDeterministicMergeHandoff(
   options: OverseerServiceOptions,
-  bridgeRun: (() => Promise<unknown>) | undefined
+  bridgeRun: ((signal?: AbortSignal) => Promise<unknown>) | undefined
 ): DeterministicMergeHandoff | undefined {
   if (Object.prototype.hasOwnProperty.call(options, 'deterministicMergeHandoff')) {
     return options.deterministicMergeHandoff;
   }
   if (options.mergeBridgeEnabled !== true || !bridgeRun) return undefined;
-  return { handoff: () => bridgeRun() };
+  return { handoff: (_record, signal) => bridgeRun(signal) };
 }
 
 export async function runOverseerService(options: OverseerServiceOptions = {}): Promise<void> {

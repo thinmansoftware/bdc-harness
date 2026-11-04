@@ -1,4 +1,5 @@
 import { createLogger } from '@archon/paths';
+import { fenceMethods, MUTATING_DEP_NAMES, throwIfFenced } from './cancellation-fence';
 import {
   assembleQualifiedMergeEvidence,
   type AssembledQualifiedMergeEvidence,
@@ -655,40 +656,47 @@ async function mergePreconditionMiss(
  * policy-tuple gate. This component owns the all-merging lifecycle directly.
  */
 export function createMergeManager(
-  deps: MergeManagerDeps
-): (record: WatchedRunRecord) => Promise<MergeManagerResult> {
-  const assembleEvidence =
-    deps.assembleEvidence ??
-    ((record: WatchedRunRecord): Promise<AssembledQualifiedMergeEvidence> =>
-      defaultAssembleEvidence(record, deps));
-  const judge = deps.judge ?? judgeWithGrok;
-  const readWorktreeHeadSha = deps.readWorktreeHeadSha ?? readWorktreeHeadShaWithGit;
-  const execute =
-    deps.execute ??
-    ((
-      evidence: QualifiedMergeEvidence
-    ): Promise<{ readonly merged: boolean; readonly message?: string; readonly sha?: string }> =>
-      defaultExecute(deps, evidence));
+  baseDeps: MergeManagerDeps
+): (record: WatchedRunRecord, signal?: AbortSignal) => Promise<MergeManagerResult> {
+  const deps0 = baseDeps;
   // deps.mode wins for tests/DI; else env; else hold-canary (fail closed).
   const mode = resolveMergeManagerMode(
-    deps.mode !== undefined ? deps.mode : process.env[MERGE_MANAGER_MODE_ENV]
+    deps0.mode !== undefined ? deps0.mode : process.env[MERGE_MANAGER_MODE_ENV]
   );
   const mutationsEnabled =
-    deps.mutationsEnabled ?? envFlagEnabled(process.env[MERGE_MANAGER_MUTATIONS_ENABLED_ENV]);
+    deps0.mutationsEnabled ?? envFlagEnabled(process.env[MERGE_MANAGER_MUTATIONS_ENABLED_ENV]);
   const allowedBases =
-    deps.allowedBases ?? allowedBasesFromEnv(process.env[MERGE_MANAGER_ALLOWED_BASES_ENV]);
+    deps0.allowedBases ?? allowedBasesFromEnv(process.env[MERGE_MANAGER_ALLOWED_BASES_ENV]);
   const useLegacyAllowedBases =
-    deps.allowedBases !== undefined || process.env[MERGE_MANAGER_ALLOWED_BASES_ENV] !== undefined;
+    deps0.allowedBases !== undefined || process.env[MERGE_MANAGER_ALLOWED_BASES_ENV] !== undefined;
   const reviewGateLogin = (
-    deps.reviewGateLogin ??
+    deps0.reviewGateLogin ??
     process.env[MERGE_MANAGER_REVIEW_GATE_LOGIN_ENV] ??
     ''
   ).trim();
 
-  return async (record: WatchedRunRecord): Promise<MergeManagerResult> => {
+  return async (record: WatchedRunRecord, signal?: AbortSignal): Promise<MergeManagerResult> => {
+    // With a signal, every mutation reachable from this handler (action rows,
+    // comments, the merge call, an injected executor) checks it IMMEDIATELY before
+    // it runs. Evidence and judgment awaits are followed by an explicit check.
+    const deps: MergeManagerDeps = signal ? fenceMethods(deps0, MUTATING_DEP_NAMES, signal) : deps0;
+    const assembleEvidence =
+      deps.assembleEvidence ??
+      ((r: WatchedRunRecord): Promise<AssembledQualifiedMergeEvidence> =>
+        defaultAssembleEvidence(r, deps));
+    const judge = deps.judge ?? judgeWithGrok;
+    const readWorktreeHeadSha = deps.readWorktreeHeadSha ?? readWorktreeHeadShaWithGit;
+    const execute = (
+      evidenceToMerge: QualifiedMergeEvidence
+    ): Promise<{ readonly merged: boolean; readonly message?: string; readonly sha?: string }> => {
+      throwIfFenced(signal, 'execute');
+      return deps.execute ? deps.execute(evidenceToMerge) : defaultExecute(deps, evidenceToMerge);
+    };
+    throwIfFenced(signal, 'assembleEvidence');
     let assembled: AssembledQualifiedMergeEvidence;
     try {
       assembled = await assembleEvidence(record);
+      throwIfFenced(signal, 'afterEvidence');
     } catch (error) {
       if (error instanceof BaseBranchMissingError || error instanceof BaseBranchMismatchError) {
         const reason =
@@ -784,6 +792,8 @@ export function createMergeManager(
     } catch {
       receipt = holdReceipt(evidence, evidenceDigest, 'judge_error');
     }
+    // A cancellation that landed during the judgment await ends the handler here.
+    throwIfFenced(signal, 'afterJudge');
     if (!receiptMatches(receipt, evidence, evidenceDigest)) {
       receipt = holdReceipt(evidence, evidenceDigest, 'judge_output_invalid');
     }

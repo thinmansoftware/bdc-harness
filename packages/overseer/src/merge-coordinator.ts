@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { fenceMethods, MUTATING_DEP_NAMES, throwIfFenced } from './cancellation-fence';
 import {
   assessQualifiedMerge as defaultAssessQualifiedMerge,
   handleMergeReady as defaultHandleMergeReady,
@@ -198,14 +199,32 @@ function receiptMatches(
 
 export async function coordinateMergeReady(
   record: WatchedRunRecord,
-  deps: MergeCoordinatorDeps
+  baseDeps: MergeCoordinatorDeps,
+  signal?: AbortSignal
 ): Promise<MergeCoordinatorResult> {
+  // With a signal (cancellation), every real mutation reachable from here checks it
+  // IMMEDIATELY before it runs: the action-row write, the executor, and the merge,
+  // approval and comment calls inside the execution deps. Reads are untouched.
+  const deps: MergeCoordinatorDeps = signal
+    ? {
+        ...baseDeps,
+        insertOverseerAction: fenceMethods(
+          { insertOverseerAction: baseDeps.insertOverseerAction },
+          ['insertOverseerAction'],
+          signal
+        ).insertOverseerAction,
+        executionDeps: fenceMethods(baseDeps.executionDeps, MUTATING_DEP_NAMES, signal),
+      }
+    : baseDeps;
+  throwIfFenced(signal, 'assembleEvidence');
   const assembled = await deps.assembleEvidence(record);
+  throwIfFenced(signal, 'afterEvidence');
   const { evidence, evidenceDigest } = assembled;
   const assess = deps.assess ?? defaultAssessQualifiedMerge;
   const preflight = assess(evidence);
   const execute = deps.handleMergeReady ?? defaultHandleMergeReady;
   if (!preflight.eligible) {
+    throwIfFenced(signal, 'handleMergeReady');
     const execution = await execute(evidence, deps.executionDeps);
     return { status: 'gated', receipt: null, execution };
   }
@@ -231,6 +250,8 @@ export async function coordinateMergeReady(
   } catch {
     disposition = holdReceipt(evidence, evidenceDigest, 'judge_error');
   }
+  // A cancellation that landed during the judgment await ends the handler here.
+  throwIfFenced(signal, 'afterJudge');
   if (!receiptMatches(disposition, evidence, evidenceDigest)) {
     disposition = holdReceipt(evidence, evidenceDigest, 'judge_output_invalid');
   }
@@ -244,6 +265,7 @@ export async function coordinateMergeReady(
     });
     return { status: 'held', receipt: disposition, execution: null };
   }
+  throwIfFenced(signal, 'handleMergeReady');
   const execution = await execute(evidence, deps.executionDeps);
   return { status: 'executed', receipt: disposition, execution };
 }

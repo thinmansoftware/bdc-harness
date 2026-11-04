@@ -118,6 +118,14 @@ What now protects the sweep:
   signal immediately before it runs, so a handler that resumes later unwinds (`overseer.record_handler_fenced`) instead
   of acting. A record whose previous handler is unfinished is skipped with
   `merge-coordinator.record_skipped_in_flight` (`reason: previous_handler_unfinished`).
+- The signal reaches INTO the merge coordinator, the merge manager and the deterministic merge handoff (the merge
+  execution bridge), not just their entry. Each checks it immediately before every real mutation (merge, approval,
+  comment, action-row write, verdict claim, merge-slot reservation, outcome write) and after each evidence or judgment
+  await, so a cancellation that lands mid-await ends in no merge and no write. Compensating releases stay open so a
+  cancelled run never strands a verdict claim, and an outcome recorded after a merge went out is never fenced.
+- The sweep deadline is derived from the whole-pass budget: `min(stepTimeout x 5, passDeadline - now - reserve)`, with a
+  reserve of 10% of the pass budget (at most 10 s), so the sweep always returns its partial candidates BEFORE the pass
+  wait rejects and discards them.
 - The PR sweep has an aggregate deadline (default five times the step timeout). On expiry it keeps the candidates
   gathered so far, advances the cursor only past PRs actually evaluated, and cancels in-flight lookups
   (`merge-coordinator.discovery_deadline`); the next pass continues where it stopped.

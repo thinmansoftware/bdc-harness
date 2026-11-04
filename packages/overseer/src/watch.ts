@@ -331,6 +331,12 @@ export interface WatchOnceOptions {
   discoveryDeadlineMs?: number;
   /** Cancels the pass (the loop's pass deadline or shutdown). */
   signal?: AbortSignal;
+  /**
+   * Absolute time (ms since epoch) at which the enclosing whole-pass timer fires.
+   * The sweep's aggregate deadline is derived from it so the sweep ALWAYS returns
+   * its partial candidates before the pass wait rejects and discards them.
+   */
+  passDeadlineAt?: number;
 }
 
 /**
@@ -361,6 +367,7 @@ export async function watchOnce(
     );
   };
   recordSweepProgress();
+  const passStartedAt = Date.now();
   const runs = await withBoundedAwait(
     'watch.listRunsForWatch',
     stepTimeoutMs,
@@ -423,7 +430,20 @@ export async function watchOnce(
       // expiry returns the candidates gathered so far with the cursor advanced only
       // past evaluated PRs; in-flight lookups are cancelled through the same signal.
       const discoveryController = new AbortController();
-      const deadlineMs = options.discoveryDeadlineMs ?? stepTimeoutMs * 5;
+      const configuredDeadlineMs = options.discoveryDeadlineMs ?? stepTimeoutMs * 5;
+      // Never at or above the enclosing pass timer: the run-store read and the
+      // per-run assessments already spent part of the pass budget, and the pass
+      // wait rejects at passDeadlineAt. Leave a reserve (10% of the pass budget,
+      // at most 10 s) to return, build outcomes and emit the heartbeat.
+      let deadlineMs = configuredDeadlineMs;
+      if (options.passDeadlineAt !== undefined) {
+        const reserveMs = Math.min(
+          10_000,
+          Math.floor((options.passDeadlineAt - passStartedAt) / 10)
+        );
+        const remainingMs = options.passDeadlineAt - Date.now() - reserveMs;
+        deadlineMs = Math.max(1, Math.min(configuredDeadlineMs, remainingMs));
+      }
       const deadlineTimer = setTimeout(() => {
         discoveryController.abort(
           new BoundedAwaitTimeoutError('watch.discoverMergeCandidates', deadlineMs)
@@ -595,7 +615,12 @@ export async function watchLoop(
       const records = await withBoundedAwait(
         'watch.watchOnce',
         passTimeoutMs,
-        signal => watchOnce(deps, { ...watchOptions, signal }),
+        signal =>
+          watchOnce(deps, {
+            ...watchOptions,
+            signal,
+            passDeadlineAt: Date.now() + passTimeoutMs,
+          }),
         {
           onTimeout: error => {
             logError(

@@ -184,7 +184,7 @@ export interface WatchedRunRecord {
  * MergeReadyCoordinator function, so the two cannot be substituted.
  */
 export interface DeterministicMergeHandoff {
-  handoff(record: WatchedRunRecord): Promise<unknown>;
+  handoff(record: WatchedRunRecord, signal?: AbortSignal): Promise<unknown>;
 }
 
 export interface OverseerRunStoreDeps {
