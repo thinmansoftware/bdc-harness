@@ -11,7 +11,11 @@ import { hasActiveRunForWo, userMessageWoId } from '../active-run-guard';
 import type { GitHubClientDeps, PullRequestEvidence } from '../types.ts';
 
 const runMergeExecutionBridgeOnce = (options: MergeExecutionBridgeOptions): Promise<void> =>
-  runMergeExecutionBridgeOnceProduction({ hasQualifiedReview: async () => true, ...options });
+  runMergeExecutionBridgeOnceProduction({
+    hasQualifiedReview: async () => true,
+    reviewConflictAtHead: async () => null,
+    ...options,
+  });
 
 const HEAD = 'judged-sha';
 

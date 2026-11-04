@@ -31,6 +31,9 @@ export interface OverseerWorkflowEvent {
   created_at?: string;
 }
 
+/** Reason a reviewed head must not merge yet (see reviewConflictAtHead). */
+export type ReviewConflictAtHead = 'changes_requested' | 'review_in_flight' | 'lookup_failed';
+
 export interface PullRequestRef {
   owner: string;
   repo: string;
@@ -312,6 +315,14 @@ export interface GitHubClientDeps {
   >;
   /** Receipt-backed exact-head sandbox-review qualification. */
   hasQualifiedReview?(input: PullRequestRef & { headSha: string }): Promise<boolean>;
+  /**
+   * Why the exact head must not merge even though one review approved it:
+   * another review of the same head requested changes, or is still running.
+   * Null when every review of the head has finished and none requested changes.
+   */
+  reviewConflictAtHead?(
+    input: PullRequestRef & { headSha: string }
+  ): Promise<ReviewConflictAtHead | null>;
   mergePullRequest(
     input: GitHubPullRequestMergeInput
   ): Promise<{ merged: boolean; message?: string; sha?: string; mergeSha?: string }>;

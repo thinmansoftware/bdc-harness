@@ -105,6 +105,7 @@ function makeHarness(rows: OverseerVerdictRow[], evidence: () => PullRequestEvid
     store,
     github,
     hasQualifiedReview: async () => true,
+    reviewConflictAtHead: async () => null,
     now: () => clock,
     retryBaseMinutes: 10,
     retryMaxDelayMinutes: 240,

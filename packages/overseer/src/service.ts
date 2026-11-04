@@ -433,6 +433,14 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
               github.hasQualifiedReview?.(input) ?? Promise.resolve(false),
           }
         : {}),
+      ...(github.reviewConflictAtHead
+        ? {
+            reviewConflictAtHead: (
+              input
+            ): ReturnType<NonNullable<GitHubClientDeps['reviewConflictAtHead']>> =>
+              github.reviewConflictAtHead?.(input) ?? Promise.resolve('lookup_failed'),
+          }
+        : {}),
       store: {
         listUnactionedVerdicts: listUnactionedFlagMergeReadyVerdicts,
         claimVerdict: claimVerdictForMergeExecution,

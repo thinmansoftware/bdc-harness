@@ -33,7 +33,12 @@ import {
 } from './merge-repo-policy';
 import { specDeclaresMergeHold } from './merge-hold';
 import { isSpecOnlyChangeSet } from './reconcile';
-import type { GitHubClientDeps, PullRequestCommitStatus, PullRequestEvidence } from './types.ts';
+import type {
+  GitHubClientDeps,
+  PullRequestCommitStatus,
+  PullRequestEvidence,
+  ReviewConflictAtHead,
+} from './types.ts';
 import { resolveRequiredContexts } from './adapters/required-contexts';
 import { createRealOctokitClient } from './adapters/github-real-deps';
 import {
@@ -101,6 +106,16 @@ export interface MergeExecutionBridgeOptions {
     number: number;
     headSha: string;
   }): Promise<boolean>;
+  /**
+   * Exact-head review conflict: a review of the same head requested changes, or
+   * one is still running. Checked last before the merge; absent fails closed.
+   */
+  reviewConflictAtHead?(input: {
+    owner: string;
+    repo: string;
+    number: number;
+    headSha: string;
+  }): Promise<ReviewConflictAtHead | null>;
   // Absent in tests that predate the spec hold. When omitted, no spec is read.
   readWoSpec?(woId: string): Promise<string>;
 }
@@ -1070,6 +1085,32 @@ async function mergeClaimedVerdict(
       await skip(premergeRecheck.reason, pr.htmlUrl);
       return undefined;
     }
+  }
+  // One approval is not enough when the same head has other reviews: every
+  // check event queues its own recheck, and on 2026-11-03 #1453 merged on the
+  // first APPROVED while three reviews of that head were still running; all
+  // three then requested changes. Checked last, right before the merge.
+  let conflict: ReviewConflictAtHead | 'check_unavailable' | null = 'check_unavailable';
+  if (options.reviewConflictAtHead) {
+    try {
+      conflict = await options.reviewConflictAtHead({
+        owner: pr.pr.owner,
+        repo: pr.pr.repo,
+        number: pr.pr.number,
+        headSha: verdict.head_sha,
+      });
+    } catch {
+      conflict = 'lookup_failed';
+    }
+  }
+  if (conflict) {
+    log.warn(
+      { verdictId: verdict.id, woId: verdict.wo_id, prUrl: pr.htmlUrl, conflict },
+      'merge-coordinator.merge_refused_conflicting_reviews'
+    );
+    await options.store.releaseMergeSlot(verdict.id);
+    await skip(`review_conflict_at_head:${conflict}`, pr.htmlUrl);
+    return undefined;
   }
   let merged: Awaited<ReturnType<GitHubClientDeps['mergePullRequest']>>;
   try {

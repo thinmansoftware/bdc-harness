@@ -18,8 +18,13 @@ import type {
   PullRequestCommitStatus,
   PullRequestEvidence,
   PullRequestRef,
+  ReviewConflictAtHead,
 } from '../types.ts';
-import { listMessages as listDispatchMessages } from '@archon/core/db/dispatch';
+import {
+  listMessages as listDispatchMessages,
+  listMessagesByCorrelationPrefixWithoutSubjectKey,
+  type DispatchMessage,
+} from '@archon/core/db/dispatch';
 import { PR_REVIEW_LOG_RECIPIENT } from '@archon/core/db/dispatch-routing';
 import {
   REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
@@ -2163,6 +2168,130 @@ export function createRealListOpenPullRequests(
   };
 }
 
+// Same value as REVIEW_RECIPIENT in pr-review-wiring.ts; not imported because
+// pr-review-wiring already imports this module.
+const REVIEW_REQUEST_RECIPIENT = 'overseer-reviewer';
+// listMessages caps a read at 500 rows.
+const REVIEW_CONFLICT_PAGE_LIMIT = 500;
+
+function bodyAtHead(
+  message: Pick<DispatchMessage, 'body'>,
+  input: PullRequestRef & { headSha: string }
+): Record<string, unknown> | null {
+  try {
+    const body = JSON.parse(message.body) as Record<string, unknown>;
+    return body.owner === input.owner &&
+      body.repo === input.repo &&
+      body.prNumber === input.number &&
+      body.headSha === input.headSha
+      ? body
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Exact-head review conflict from dispatch rows. `receipts` are review submit
+ * receipts (pr-review-log and operator); `requests` are review requests to the
+ * reviewer. A changes_requested receipt at the head wins; otherwise a request
+ * for the head that is still queued or claimed means a review is in flight.
+ * When a read came back at its page cap (`truncated`), rows for this head may
+ * be missing, so the answer is lookup_failed unless a conflict is already seen.
+ */
+export function reviewConflictFromMessages(
+  input: PullRequestRef & { headSha: string },
+  receipts: readonly Pick<DispatchMessage, 'body'>[],
+  requests: readonly Pick<DispatchMessage, 'body' | 'status'>[],
+  options: { truncated?: boolean } = {}
+): ReviewConflictAtHead | null {
+  const changesRequested = receipts.some(receipt => {
+    const body = bodyAtHead(receipt, input);
+    return body?.kind === 'pr_review_submit_receipt' && body.disposition === 'changes_requested';
+  });
+  if (changesRequested) return 'changes_requested';
+  const inFlight = requests.some(
+    request =>
+      (request.status === 'queued' || request.status === 'claimed') &&
+      bodyAtHead(request, input) !== null
+  );
+  if (inFlight) return 'review_in_flight';
+  return options.truncated ? 'lookup_failed' : null;
+}
+
+type ReviewConflictListFn = (filters: {
+  recipient: string;
+  subject_key: string;
+  limit: number;
+}) => Promise<Pick<DispatchMessage, 'body' | 'status'>[]>;
+
+type ReviewConflictLegacyListFn = (filters: {
+  recipient: string;
+  correlationPrefix: string;
+  limit: number;
+}) => Promise<Pick<DispatchMessage, 'body' | 'status'>[]>;
+
+/**
+ * Reads the rows for reviewConflictFromMessages. REQUESTS ARE READ FIRST: a
+ * review writes its submit receipt inside the handler, and its request becomes
+ * done only after the handler returns. A review still running at the first read
+ * is seen as in flight; one that finished before it has already written its
+ * receipt, which the later receipt reads include. Reading receipts first lets a
+ * review finish between the two reads and look clean in both.
+ *
+ * Receipts written before the 2026-09-07 subject_key cutover have no
+ * subject_key, so they are also read by correlation prefix for this exact head,
+ * the way listPriorReviewWork reads legacy history.
+ */
+export async function loadReviewConflictAtHead(
+  input: PullRequestRef & { headSha: string },
+  list: ReviewConflictListFn,
+  listLegacy: ReviewConflictLegacyListFn
+): Promise<ReviewConflictAtHead | null> {
+  const subjectKey = `gh:${input.owner}/${input.repo}#${input.number}`;
+  try {
+    const requests = await list({
+      recipient: REVIEW_REQUEST_RECIPIENT,
+      subject_key: subjectKey,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    const pr = await list({
+      recipient: PR_REVIEW_LOG_RECIPIENT,
+      subject_key: subjectKey,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    const operator = await list({
+      recipient: 'operator',
+      subject_key: subjectKey,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    const correlationPrefix = `pr-review:${input.owner}/${input.repo}#${input.number}@${input.headSha}`;
+    const legacyLog = await listLegacy({
+      recipient: PR_REVIEW_LOG_RECIPIENT,
+      correlationPrefix,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    const legacyOperator = await listLegacy({
+      recipient: 'operator',
+      correlationPrefix,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    // The reads have no pagination. A full page may hide older rows for this
+    // head, so a full page is not proof of "no conflict".
+    const truncated = [requests, pr, operator, legacyLog, legacyOperator].some(
+      rows => rows.length >= REVIEW_CONFLICT_PAGE_LIMIT
+    );
+    return reviewConflictFromMessages(
+      input,
+      [...pr, ...operator, ...legacyLog, ...legacyOperator],
+      requests,
+      { truncated }
+    );
+  } catch {
+    return 'lookup_failed';
+  }
+}
+
 /**
  * Build the real (non-fake) GitHubClientDeps composition for Overseer. Fails
  * loudly at construction time if the token is missing -- never silently
@@ -2258,6 +2387,12 @@ export function createRealGitHubClientDeps(
         }
       });
     },
+    reviewConflictAtHead: (input): Promise<ReviewConflictAtHead | null> =>
+      loadReviewConflictAtHead(
+        input,
+        listDispatchMessages,
+        listMessagesByCorrelationPrefixWithoutSubjectKey
+      ),
     findPullRequest: createRealFindPullRequest(octokit),
     // Merge mutations go through the distinct merge identity when configured
     // (M-153: the merger is never the reviewer).
