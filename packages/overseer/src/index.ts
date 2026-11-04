@@ -58,13 +58,6 @@ export type {
 
 export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
 export {
-  BoundedAwaitTimeoutError,
-  resolvePassTimeoutMs,
-  resolveRecordTimeoutMs,
-  resolveStepTimeoutMs,
-  withBoundedAwait,
-} from './bounded-await';
-export {
   recordSweepProgress,
   startMergeSweepLivenessMonitor,
   type MergeSweepLivenessMonitor,

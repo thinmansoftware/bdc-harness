@@ -31,15 +31,7 @@ import {
 } from './escalation-delivery';
 import { permitFromMetadata } from './permit';
 import { runReconcileOnce } from './reconcile';
-import {
-  fenceMethods,
-  MUTATING_DEP_NAMES,
-  RecordHandlerCancelledError,
-  throwIfFenced,
-} from './cancellation-fence';
 import { watchLoop, type WatchHeartbeatLogger } from './watch';
-
-export { RecordHandlerCancelledError };
 import type {
   DeterministicMergeHandoff,
   GitHubClientDeps,
@@ -78,10 +70,7 @@ const log = createLogger('overseer/service');
  * adapter that was actually wired when the service started.
  */
 export type OverseerWiredAdapterKind = 'fake' | 'real' | 'none';
-export type MergeReadyCoordinator = (
-  record: WatchedRunRecord,
-  signal?: AbortSignal
-) => Promise<unknown>;
+export type MergeReadyCoordinator = (record: WatchedRunRecord) => Promise<unknown>;
 
 export interface OverseerServiceOptions {
   once?: boolean;
@@ -116,9 +105,9 @@ export interface OverseerServiceOptions {
    * is set. When deterministicMergeHandoff is omitted, replay handoff binds
    * this runner only when mergeBridgeEnabled is exactly true.
    */
-  mergeBridgeRun?: (signal?: AbortSignal) => Promise<unknown>;
+  mergeBridgeRun?: () => Promise<unknown>;
   mergeBridgeEnabled?: boolean;
-  /** Tests inject a spy for the watcher and delivery loop lines; defaults to the module logger. */
+  /** Tests inject a spy for the delivery and watcher loop lines; defaults to the module logger. */
   logger?: WatchHeartbeatLogger;
 }
 
@@ -242,60 +231,8 @@ const defaultVerdictStore: OverseerVerdictStoreDeps = {
   promoteObserveOrHealthyVerdictWithReceipt,
 };
 
-function fenceDeps<T extends object>(deps: T, signal: AbortSignal): T {
-  return fenceMethods(deps, MUTATING_DEP_NAMES, signal);
-}
-
-function fenceVerdictStore(
-  store: OverseerVerdictStoreDeps,
-  signal: AbortSignal
-): OverseerVerdictStoreDeps {
-  return fenceMethods(
-    store,
-    [
-      'claimVerdict',
-      'finalizeVerdict',
-      'promoteObserveOrHealthyVerdict',
-      'promoteObserveOrHealthyVerdictWithReceipt',
-    ],
-    signal
-  );
-}
-
-/**
- * Bind the merge coordinator and the deterministic merge handoff to a handler's
- * signal. Both are fenced at entry AND receive the signal, so cancellation reaches
- * the awaits and mutations inside them (evidence, judgment, merge, action rows).
- */
-export function fenceMergeHandlers(
-  mergeCoordinator: MergeReadyCoordinator | undefined,
-  deterministicMergeHandoff: DeterministicMergeHandoff | undefined,
-  signal: AbortSignal
-): { coordinator?: MergeReadyCoordinator; handoff?: DeterministicMergeHandoff } {
-  return {
-    coordinator: mergeCoordinator
-      ? async (r): Promise<unknown> => {
-          throwIfFenced(signal, 'mergeCoordinator');
-          return mergeCoordinator(r, signal);
-        }
-      : undefined,
-    handoff: deterministicMergeHandoff
-      ? {
-          handoff: async (r): Promise<unknown> => {
-            throwIfFenced(signal, 'deterministicMergeHandoff');
-            return deterministicMergeHandoff.handoff(r, signal);
-          },
-        }
-      : undefined,
-  };
-}
-
 /**
  * Dispatch a single watched record to its action (merge / escalate / skip).
- *
- * With a `signal`, every side effect (merge, escalation, operator card, action
- * rows, comments) is fenced: it checks the signal immediately before it runs and
- * a cancelled handler unwinds without acting. Without one, behavior is unchanged.
  *
  * Exported so wiring tests can drive the REAL merge-vs-skip gate
  * (`record.action === 'merge_ready'`) instead of re-implementing it inline: a
@@ -307,52 +244,7 @@ export async function handleRecord(
   dryRun: boolean,
   actor: string,
   mergeCoordinator?: MergeReadyCoordinator,
-  deterministicMergeHandoff?: DeterministicMergeHandoff,
-  signal?: AbortSignal
-): Promise<void> {
-  if (!signal) {
-    await handleRecordUnfenced(
-      record,
-      deps,
-      dryRun,
-      actor,
-      mergeCoordinator,
-      deterministicMergeHandoff
-    );
-    return;
-  }
-  try {
-    throwIfFenced(signal, 'start');
-    const bound = fenceMergeHandlers(mergeCoordinator, deterministicMergeHandoff, signal);
-    await handleRecordUnfenced(
-      record,
-      fenceDeps(deps, signal),
-      dryRun,
-      actor,
-      bound.coordinator,
-      bound.handoff,
-      signal
-    );
-  } catch (error) {
-    if (error instanceof RecordHandlerCancelledError) {
-      log.warn(
-        { runId: record.runId, woId: record.woId, point: error.point },
-        'overseer.record_handler_fenced'
-      );
-      return;
-    }
-    throw error;
-  }
-}
-
-async function handleRecordUnfenced(
-  record: WatchedRunRecord,
-  deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
-  dryRun: boolean,
-  actor: string,
-  mergeCoordinator?: MergeReadyCoordinator,
-  deterministicMergeHandoff?: DeterministicMergeHandoff,
-  signal?: AbortSignal
+  deterministicMergeHandoff?: DeterministicMergeHandoff
 ): Promise<void> {
   if (emergencyStopEngaged()) {
     log.warn({ runId: record.runId }, 'overseer.emergency_stop_engaged');
@@ -370,20 +262,9 @@ async function handleRecordUnfenced(
         actor,
         mergeCoordinator,
         deterministicMergeHandoff,
-        verdictStore: signal ? fenceVerdictStore(defaultVerdictStore, signal) : defaultVerdictStore,
-        ...(signal
-          ? {
-              escalate: (
-                ...args: Parameters<typeof runEscalation>
-              ): ReturnType<typeof runEscalation> => {
-                throwIfFenced(signal, 'runEscalation');
-                return runEscalation(...args);
-              },
-            }
-          : {}),
+        verdictStore: defaultVerdictStore,
       });
     } catch (error) {
-      if (error instanceof RecordHandlerCancelledError) throw error;
       log.error(
         { err: error as Error, runId: record.runId, woId: record.woId },
         'overseer.judge_first.record_failed_isolated'
@@ -496,7 +377,6 @@ async function handleRecordUnfenced(
     throw new Error('operator_card_non_actionable_error_class');
   }
 
-  throwIfFenced(signal, 'runAuthorizedEscalation');
   const escalation = await runAuthorizedEscalation(record.runId, {
     permit: permitFromMetadata(record.metadata),
     actor,
@@ -506,7 +386,6 @@ async function handleRecordUnfenced(
     if (!record.lastEvent?.id || !record.lastEvent.created_at) {
       throw new Error('operator_card_source_event_identity_missing');
     }
-    throwIfFenced(signal, 'runEscalation');
     const card = await runEscalation(
       record.runId,
       record.decision,
@@ -560,13 +439,10 @@ function githubCanDriveMergeBridge(github: GitHubClientDeps): boolean {
   );
 }
 
-function createMergeExecutionBridgeRun(
-  github: GitHubClientDeps
-): (signal?: AbortSignal) => Promise<void> {
-  return (signal?: AbortSignal): Promise<void> =>
+function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<void> {
+  return (): Promise<void> =>
     runMergeExecutionBridgeOnce({
       github,
-      signal,
       ...(github.hasQualifiedReview
         ? {
             hasQualifiedReview: (input): Promise<boolean> =>
@@ -599,13 +475,13 @@ function createMergeExecutionBridgeRun(
 
 function resolveDeterministicMergeHandoff(
   options: OverseerServiceOptions,
-  bridgeRun: ((signal?: AbortSignal) => Promise<unknown>) | undefined
+  bridgeRun: (() => Promise<unknown>) | undefined
 ): DeterministicMergeHandoff | undefined {
   if (Object.prototype.hasOwnProperty.call(options, 'deterministicMergeHandoff')) {
     return options.deterministicMergeHandoff;
   }
   if (options.mergeBridgeEnabled !== true || !bridgeRun) return undefined;
-  return { handoff: (_record, signal) => bridgeRun(signal) };
+  return { handoff: () => bridgeRun() };
 }
 
 export async function runOverseerService(options: OverseerServiceOptions = {}): Promise<void> {
@@ -634,15 +510,14 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (options.signal?.aborted) coupledAbort.abort();
   const watcher = watchLoop(
     deps,
-    (record, signal) =>
+    record =>
       handleRecord(
         record,
         deps,
         dryRun,
         'overseer-service',
         options.mergeCoordinator,
-        deterministicMergeHandoff,
-        signal
+        deterministicMergeHandoff
       ),
     {
       intervalMs: options.intervalMs,

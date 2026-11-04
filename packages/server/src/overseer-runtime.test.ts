@@ -26,7 +26,7 @@ import {
   getOverseerRuntimeStatus,
 } from './overseer-runtime';
 import { createMergeManager } from '../../overseer/src/merge-manager.ts';
-import { handleRecord } from '../../overseer/src/service.ts';
+import { startMergeSweepLivenessMonitor } from '../../overseer/src/merge-sweep-liveness.ts';
 import { PRODUCTION_EFFECT_HOLD_REASON } from '../../overseer/src/merge-manager.ts';
 
 const getStatus = (now?: () => Date) =>
@@ -531,56 +531,71 @@ describe('overseer-runtime', () => {
     expect(serviceCalls).toBe(3);
   });
 
-  // Round 2 (PR 1502), test (iii): once stopOverseerRuntime resolves, a handler that was still
-  // running holds an aborted signal, so no merge, escalation or action can fire.
-  test('after stopOverseerRuntime resolves, a resumed record handler fires no side effect', async () => {
+  // XO guard (fence 283): the supervisor restarts a loop ONLY after that loop's promise has
+  // settled. A HANG raises the 10-minute liveness alarm and nothing else: no second pass, no
+  // second loop, no restart timer.
+  test('a loop hung forever raises the liveness alarm and starts no second loop', async () => {
     setEnabledEnv();
-    let handlerSignal: AbortSignal | undefined;
+    let clock = Date.UTC(2026, 10, 4, 16, 0, 0);
+    const posts: Array<{ recipient?: unknown; priority?: unknown }> = [];
+    const alarmLogs: string[] = [];
+    let serviceCalls = 0;
+    const timers: Array<{ ms: number }> = [];
     runOverseerServiceMock.mockImplementation(async (opts?: unknown) => {
-      handlerSignal = (opts as { signal: AbortSignal }).signal;
-      await new Promise<void>(resolve => handlerSignal?.addEventListener('abort', () => resolve()));
+      serviceCalls += 1;
+      // Hangs: it never settles on its own. It only unblocks when the test's final
+      // stopOverseerRuntime aborts it, so cleanup cannot wait forever.
+      const signal = (opts as { signal: AbortSignal }).signal;
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve()));
     });
+    let monitor: ReturnType<typeof startMergeSweepLivenessMonitor> | undefined;
     startOverseerRuntime({
       runService: runOverseerServiceMock,
-      startLivenessMonitor: () => ({ check: async () => false, stop: () => undefined }),
+      supervisor: {
+        setTimer: (_fn, ms) => {
+          timers.push({ ms });
+          return {};
+        },
+        clearTimer: () => undefined,
+      },
+      startLivenessMonitor: () => {
+        monitor = startMergeSweepLivenessMonitor({
+          now: () => clock,
+          startTimer: false,
+          maxSilenceMs: 600_000,
+          logger: {
+            info: () => undefined,
+            error: (_obj, msg) => alarmLogs.push(msg),
+          },
+          createMessage: async (_context, data) => {
+            posts.push({ recipient: data.recipient, priority: data.priority });
+            return undefined;
+          },
+        });
+        return monitor;
+      },
     });
     for (let i = 0; i < 5; i += 1) await Promise.resolve();
-    expect(handlerSignal?.aborted).toBe(false);
+    expect(serviceCalls).toBe(1);
 
-    await stopOverseerRuntime();
-    expect(handlerSignal?.aborted).toBe(true);
+    // Just under 10 minutes of silence: nothing yet.
+    clock += 9 * 60_000 + 59_000;
+    await monitor?.check();
+    expect(alarmLogs).toEqual([]);
 
-    const sideEffects: string[] = [];
-    const record = {
-      runId: 'pr-discovery:o/r#1',
-      woId: 'WO-X',
-      action: 'merge_ready',
-      reason: 'x',
-      prEvidence: { exists: true },
-    } as unknown as Parameters<typeof handleRecord>[0];
-    await handleRecord(
-      record,
-      {
-        listRunsForWatch: async () => [],
-        listRunEvents: async () => [],
-        findPullRequest: async () => ({ exists: false }) as never,
-        mergePullRequest: async () => {
-          sideEffects.push('merge');
-          return { merged: true } as never;
-        },
-        insertOverseerAction: async () => {
-          sideEffects.push('action');
-        },
-      },
-      false,
-      'test',
-      async () => {
-        sideEffects.push('coordinator');
-      },
-      undefined,
-      handlerSignal
-    );
-    expect(sideEffects).toEqual([]);
+    // Past 10 minutes: the alarm fires and the operator is paged exactly once.
+    clock += 2_000;
+    await monitor?.check();
+    clock += 60_000;
+    await monitor?.check();
+    expect(alarmLogs.filter(msg => msg === 'merge-coordinator.liveness_alarm').length).toBe(2);
+    expect(posts).toEqual([{ recipient: 'operator', priority: 'blocker' }]);
+
+    // The hang triggered NO restart: still one loop, no restart timer, still running.
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    expect(serviceCalls).toBe(1);
+    expect(timers).toHaveLength(0);
+    expect((await getStatus()).watcher).toBe('running');
   });
 
   test('Test 4b: stopping during backoff clears the restart timer and never restarts', async () => {

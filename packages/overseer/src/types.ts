@@ -184,7 +184,7 @@ export interface WatchedRunRecord {
  * MergeReadyCoordinator function, so the two cannot be substituted.
  */
 export interface DeterministicMergeHandoff {
-  handoff(record: WatchedRunRecord, signal?: AbortSignal): Promise<unknown>;
+  handoff(record: WatchedRunRecord): Promise<unknown>;
 }
 
 export interface OverseerRunStoreDeps {
@@ -221,8 +221,6 @@ export interface GitHubPullRequestSearchInput {
    */
   prNumber?: number;
   includeChangedFiles?: boolean;
-  /** Cancellation for the lookup (aggregate discovery deadline). Implementations may ignore it. */
-  signal?: AbortSignal;
 }
 
 export interface GitHubPullRequestMergeInput extends PullRequestRef {

@@ -1,7 +1,7 @@
 /**
- * Tests 1-3 (WO-HARNESS-MERGE-SWEEP-LIVENESS-AND-PAGING-01): a hung or throwing
- * await can no longer end or stall the merge-sweep loop, and an error in the
- * operator-card delivery scheduler can no longer stop the watcher.
+ * Tests 2-3 (WO-HARNESS-MERGE-SWEEP-LIVENESS-AND-PAGING-01): a THROW in a pass or record handler
+ * no longer ends the merge-sweep loop, and an error in the operator-card delivery scheduler
+ * can no longer stop the watcher. (A hung pass is not handled here: it raises the liveness alarm only.)
  */
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { resetDiscoveryCursorForTests } from '../merge-candidate-discovery.ts';
@@ -93,79 +93,6 @@ beforeEach(() => {
 });
 
 describe('watchLoop resilience', () => {
-  test('Test 1: a hung await is timed out and the next pass still runs', async () => {
-    const { logger, entries } = spyLogger();
-    const controller = new AbortController();
-    let listCallsForA = 0;
-    let onRecordCalls = 0;
-    const candidates = [pr(REPO_B, 11), pr(REPO_B, 12)];
-
-    const deps: OverseerRunStoreDeps & GitHubClientDeps = {
-      ...baseStore,
-      listOpenPullRequests: async input => {
-        if (input.repo === REPO_A) {
-          listCallsForA += 1;
-          // Pass 1: never settles. Pass 2+: normal.
-          if (listCallsForA === 1) return new Promise<DiscoveredPullRequest[]>(() => undefined);
-          return [];
-        }
-        return candidates;
-      },
-      findPullRequest: async input => {
-        const match = candidates.find(candidate => candidate.headRef === input.headBranch);
-        if (!match) throw new Error('no fixture');
-        return greenEvidence(match.repo, match.prNumber);
-      },
-      hasQualifiedReview: async () => true,
-      mergePullRequest: async () => ({ merged: true }),
-    };
-
-    const loop = watchLoop(
-      deps,
-      async (_record: WatchedRunRecord) => {
-        onRecordCalls += 1;
-        // The very first record never settles; every later one is fine.
-        if (onRecordCalls === 1) await new Promise<void>(() => undefined);
-      },
-      {
-        intervalMs: 5,
-        stepTimeoutMs: 50,
-        recordTimeoutMs: 50,
-        passTimeoutMs: 5000,
-        logger,
-        signal: controller.signal,
-        discovery: { watchedBases: WATCHED_BASES, repos: REPOS },
-      }
-    );
-
-    await waitFor(
-      () =>
-        count(entries, 'merge-coordinator.heartbeat_evaluated') >= 2 &&
-        count(entries, 'merge-coordinator.record_timeout') >= 1 &&
-        onRecordCalls >= 3,
-      'two heartbeats, a record timeout and the next records'
-    );
-    controller.abort();
-    await loop;
-
-    // The hung repo listing was named and skipped; the pass still heartbeated.
-    const stepTimeout = entries.find(entry => entry.msg === 'merge-coordinator.step_timeout');
-    expect(stepTimeout).toBeDefined();
-    expect(String(stepTimeout?.obj.label)).toContain(
-      `discovery.listOpenPullRequests:${OWNER}/${REPO_A}`
-    );
-    // The hung onRecord was abandoned, and the NEXT record in the same pass still ran.
-    expect(count(entries, 'merge-coordinator.record_timeout')).toBeGreaterThanOrEqual(1);
-    expect(onRecordCalls).toBeGreaterThanOrEqual(3);
-    // Pass 1 evaluated repo B despite repo A hanging.
-    const firstHeartbeat = entries.find(
-      entry => entry.msg === 'merge-coordinator.heartbeat_evaluated'
-    );
-    expect(firstHeartbeat?.obj.prCandidates).toBe(2);
-    // A second pass ran and listed repo A again.
-    expect(listCallsForA).toBeGreaterThanOrEqual(2);
-  });
-
   test('Test 2: a throw in a pass still reschedules', async () => {
     const { logger, entries } = spyLogger();
     const controller = new AbortController();
@@ -196,9 +123,6 @@ describe('watchLoop resilience', () => {
       },
       {
         intervalMs: 5,
-        stepTimeoutMs: 500,
-        recordTimeoutMs: 500,
-        passTimeoutMs: 5000,
         logger,
         signal: controller.signal,
         discovery: { watchedBases: WATCHED_BASES, repos: REPOS },

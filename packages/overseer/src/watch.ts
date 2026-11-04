@@ -1,15 +1,8 @@
 import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import { createLogger } from '@archon/paths';
-import {
-  BoundedAwaitAbortedError,
-  BoundedAwaitTimeoutError,
-  resolvePassTimeoutMs,
-  resolveRecordTimeoutMs,
-  resolveStepTimeoutMs,
-  withBoundedAwait,
-} from './bounded-await';
 import { classifyError } from './classify';
+import { recordSweepProgress } from './merge-sweep-liveness';
 import { decide } from './decide';
 import { isPrMergeReady, isPrGreen, judgePullRequest } from './judge-pr';
 import {
@@ -21,7 +14,6 @@ import {
   type DiscoverMergeCandidatesOptions,
   type MergeCandidateDiscoveryResult,
 } from './merge-candidate-discovery';
-import { recordSweepProgress } from './merge-sweep-liveness';
 import type {
   GitHubClientDeps,
   OverseerRunRecord,
@@ -303,11 +295,6 @@ function logError(logger: WatchHeartbeatLogger, obj: Record<string, unknown>, ms
   else log.error(obj, msg);
 }
 
-function logWarn(logger: WatchHeartbeatLogger, obj: Record<string, unknown>, msg: string): void {
-  if (typeof logger.warn === 'function') logger.warn(obj, msg);
-  else log.warn(obj, msg);
-}
-
 export interface WatchOnceOptions {
   /** Injected logger for the heartbeat line; defaults to the module logger. */
   logger?: WatchHeartbeatLogger;
@@ -321,22 +308,6 @@ export interface WatchOnceOptions {
   discovery?: DiscoverMergeCandidatesOptions;
   /** Set false to skip the PR-first sweep entirely (used by narrow unit tests). */
   discoveryEnabled?: boolean;
-  /** Per-step deadline (MERGE_SWEEP_STEP_TIMEOUT_MS, default 60000). */
-  stepTimeoutMs?: number;
-  /**
-   * Aggregate deadline for the whole PR sweep (default stepTimeoutMs * 5). On expiry
-   * the sweep returns the candidates gathered so far, persists the cursor past the
-   * PRs actually evaluated, and cancels the remaining lookups.
-   */
-  discoveryDeadlineMs?: number;
-  /** Cancels the pass (the loop's pass deadline or shutdown). */
-  signal?: AbortSignal;
-  /**
-   * Absolute time (ms since epoch) at which the enclosing whole-pass timer fires.
-   * The sweep's aggregate deadline is derived from it so the sweep ALWAYS returns
-   * its partial candidates before the pass wait rejects and discards them.
-   */
-  passDeadlineAt?: number;
 }
 
 /**
@@ -358,22 +329,8 @@ export async function watchOnce(
   options: WatchOnceOptions = {}
 ): Promise<WatchedRunRecord[]> {
   const heartbeatLogger: WatchHeartbeatLogger = options.logger ?? log;
-  const stepTimeoutMs = options.stepTimeoutMs ?? resolveStepTimeoutMs();
-  const onStepTimeout = (error: BoundedAwaitTimeoutError): void => {
-    logWarn(
-      heartbeatLogger,
-      { label: error.label, timeoutMs: error.timeoutMs },
-      'merge-coordinator.step_timeout'
-    );
-  };
   recordSweepProgress();
-  const passStartedAt = Date.now();
-  const runs = await withBoundedAwait(
-    'watch.listRunsForWatch',
-    stepTimeoutMs,
-    () => deps.listRunsForWatch(),
-    { onTimeout: onStepTimeout }
-  );
+  const runs = await deps.listRunsForWatch();
   // listRunsForWatch is oldest-first. Filter non-terminal rows, then continue the
   // current fair pass so permanently unmerged old rows cannot hide later work.
   const maxRunsPerTick = options.maxRunsPerTick ?? resolveWatchMaxRunsPerTick();
@@ -394,14 +351,7 @@ export async function watchOnce(
     // every future tick -- exactly the failure class #1348 already fixed one level
     // downstream in handleRecord. One bad run's lookup must never take down the watcher.
     try {
-      outcomes.push(
-        await withBoundedAwait(
-          `watch.assessRun:${run.id}`,
-          stepTimeoutMs,
-          () => assessRun(run, deps),
-          { onTimeout: onStepTimeout }
-        )
-      );
+      outcomes.push(await assessRun(run, deps));
     } catch (error) {
       log.error(
         { err: error as Error, runId: run.id, woId: run.woId },
@@ -426,47 +376,11 @@ export async function watchOnce(
   let discovery: MergeCandidateDiscoveryResult = unavailableDiscoveryResult('not_run');
   if (options.discoveryEnabled !== false) {
     try {
-      // Aggregate deadline WITHOUT discarding work: the sweep gets a signal, and on
-      // expiry returns the candidates gathered so far with the cursor advanced only
-      // past evaluated PRs; in-flight lookups are cancelled through the same signal.
-      const discoveryController = new AbortController();
-      const configuredDeadlineMs = options.discoveryDeadlineMs ?? stepTimeoutMs * 5;
-      // Never at or above the enclosing pass timer: the run-store read and the
-      // per-run assessments already spent part of the pass budget, and the pass
-      // wait rejects at passDeadlineAt. Leave a reserve (10% of the pass budget,
-      // at most 10 s) to return, build outcomes and emit the heartbeat.
-      let deadlineMs = configuredDeadlineMs;
-      if (options.passDeadlineAt !== undefined) {
-        const reserveMs = Math.min(
-          10_000,
-          Math.floor((options.passDeadlineAt - passStartedAt) / 10)
-        );
-        const remainingMs = options.passDeadlineAt - Date.now() - reserveMs;
-        deadlineMs = Math.max(1, Math.min(configuredDeadlineMs, remainingMs));
-      }
-      const deadlineTimer = setTimeout(() => {
-        discoveryController.abort(
-          new BoundedAwaitTimeoutError('watch.discoverMergeCandidates', deadlineMs)
-        );
-      }, deadlineMs);
-      const onParentAbort = (): void => {
-        discoveryController.abort(options.signal?.reason);
-      };
-      if (options.signal?.aborted) onParentAbort();
-      else options.signal?.addEventListener('abort', onParentAbort, { once: true });
-      try {
-        discovery = await discoverMergeCandidates(deps, {
-          stepTimeoutMs,
-          logger: heartbeatLogger,
-          ...options.discovery,
-          signal: discoveryController.signal,
-          alreadyCoveredPullRequests:
-            options.discovery?.alreadyCoveredPullRequests ?? coveredPullRequests(outcomes),
-        });
-      } finally {
-        clearTimeout(deadlineTimer);
-        options.signal?.removeEventListener('abort', onParentAbort);
-      }
+      discovery = await discoverMergeCandidates(deps, {
+        ...options.discovery,
+        alreadyCoveredPullRequests:
+          options.discovery?.alreadyCoveredPullRequests ?? coveredPullRequests(outcomes),
+      });
     } catch (error) {
       // A broken sweep must never take down the watch tick -- the run-derived
       // outcomes above are still valid work.
@@ -562,7 +476,7 @@ export async function watchOnce(
 
 export async function watchLoop(
   deps: OverseerRunStoreDeps & GitHubClientDeps,
-  onRecord: (record: WatchedRunRecord, signal?: AbortSignal) => Promise<void>,
+  onRecord: (record: WatchedRunRecord) => Promise<void>,
   options: {
     intervalMs?: number;
     once?: boolean;
@@ -577,29 +491,12 @@ export async function watchLoop(
     discoveryEnabled?: boolean;
     /** Logger for heartbeat and isolated-failure lines; defaults to the module logger. */
     logger?: WatchHeartbeatLogger;
-    /** Per-step deadline; defaults to MERGE_SWEEP_STEP_TIMEOUT_MS (60000). */
-    stepTimeoutMs?: number;
-    /** Per-record deadline; defaults to MERGE_SWEEP_RECORD_TIMEOUT_MS (180000). */
-    recordTimeoutMs?: number;
-    /** Whole-pass deadline; defaults to MERGE_SWEEP_PASS_TIMEOUT_MS (300000). */
-    passTimeoutMs?: number;
-    /** Aggregate discovery deadline; defaults to stepTimeoutMs * 5. */
-    discoveryDeadlineMs?: number;
   } = {}
 ): Promise<void> {
-  // Handlers still unwinding, keyed by record id, owned by THIS loop. A record is not
-  // handed to a new handler while its previous one is unfinished.
-  const inFlightRecords = new Map<string, { startedAt: number; done: Promise<void> }>();
   const loopLogger: WatchHeartbeatLogger = options.logger ?? log;
-  const recordTimeoutMs = options.recordTimeoutMs ?? resolveRecordTimeoutMs();
-  const passTimeoutMs = options.passTimeoutMs ?? resolvePassTimeoutMs();
   const intervalMs = options.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS;
   const watchOptions: WatchOnceOptions = {
     ...(options.logger === undefined ? {} : { logger: options.logger }),
-    ...(options.stepTimeoutMs === undefined ? {} : { stepTimeoutMs: options.stepTimeoutMs }),
-    ...(options.discoveryDeadlineMs === undefined
-      ? {}
-      : { discoveryDeadlineMs: options.discoveryDeadlineMs }),
     ...(options.discovery === undefined ? {} : { discovery: options.discovery }),
     ...(options.discoveryEnabled === undefined
       ? {}
@@ -607,96 +504,22 @@ export async function watchLoop(
   };
   for (;;) {
     if (options.signal?.aborted) return;
-    // A pass can fail or hang for reasons unrelated to the records it carries
-    // (a locked database, a wedged GitHub call). Neither may end this loop:
-    // on 2026-11-04 one escaped error stopped the merge sweep for an hour. Only
-    // an aborted signal ends it.
+    // A pass or a record handler that THROWS has settled: log it and run the next
+    // pass instead of ending the loop (2026-11-04: one escaped error stopped the
+    // merge sweep). Only an aborted signal ends the loop. A pass that HANGS is not
+    // handled here -- it raises the liveness alarm only.
     try {
-      const records = await withBoundedAwait(
-        'watch.watchOnce',
-        passTimeoutMs,
-        signal =>
-          watchOnce(deps, {
-            ...watchOptions,
-            signal,
-            passDeadlineAt: Date.now() + passTimeoutMs,
-          }),
-        {
-          onTimeout: error => {
-            logError(
-              loopLogger,
-              { label: error.label, timeoutMs: error.timeoutMs },
-              'merge-coordinator.step_timeout'
-            );
-          },
-        }
-      );
+      const records = await watchOnce(deps, watchOptions);
       for (const record of records) {
         if (options.signal?.aborted) return;
-        // Never run two handlers for one record. A handler that timed out is
-        // cancelled (its signal is aborted, so every side effect is fenced) but its
-        // promise may still be unwinding; its record is skipped until it finishes.
-        const running = inFlightRecords.get(record.runId);
-        if (running) {
-          logWarn(
+        try {
+          await onRecord(record);
+        } catch (error) {
+          logError(
             loopLogger,
-            {
-              runId: record.runId,
-              reason: 'previous_handler_unfinished',
-              ageMs: Date.now() - running.startedAt,
-            },
-            'merge-coordinator.record_skipped_in_flight'
+            { err: error as Error, stage: 'onRecord', runId: record.runId },
+            'overseer.watch.pass_failed_isolated'
           );
-          continue;
-        }
-        const handlerController = new AbortController();
-        const loopSignal = options.signal;
-        const onLoopAbort = (): void => {
-          handlerController.abort(loopSignal?.reason);
-        };
-        if (loopSignal?.aborted) onLoopAbort();
-        else loopSignal?.addEventListener('abort', onLoopAbort, { once: true });
-        let handlerPromise: Promise<void>;
-        try {
-          handlerPromise = Promise.resolve(onRecord(record, handlerController.signal));
-        } catch (error) {
-          handlerPromise = Promise.reject(
-            error instanceof Error ? error : new Error(String(error))
-          );
-        }
-        const settled = handlerPromise.then(
-          () => undefined,
-          () => undefined
-        );
-        inFlightRecords.set(record.runId, { startedAt: Date.now(), done: settled });
-        void settled.then(() => {
-          inFlightRecords.delete(record.runId);
-          loopSignal?.removeEventListener('abort', onLoopAbort);
-        });
-        try {
-          await withBoundedAwait('watch.onRecord', recordTimeoutMs, () => handlerPromise, {
-            onTimeout: error => {
-              // Cancel first: from here on the handler's side effects are fenced.
-              handlerController.abort(error);
-              logError(
-                loopLogger,
-                { runId: record.runId, label: error.label, timeoutMs: error.timeoutMs },
-                'merge-coordinator.record_timeout'
-              );
-            },
-            signal: loopSignal,
-          });
-        } catch (error) {
-          // The loop was stopped while a handler was running: do not wait for it.
-          // Its signal is aborted, so it can no longer act.
-          if (error instanceof BoundedAwaitAbortedError) return;
-          if (!(error instanceof BoundedAwaitTimeoutError)) {
-            logError(
-              loopLogger,
-              { err: error as Error, stage: 'onRecord', runId: record.runId },
-              'overseer.watch.pass_failed_isolated'
-            );
-          }
         }
         recordSweepProgress();
       }

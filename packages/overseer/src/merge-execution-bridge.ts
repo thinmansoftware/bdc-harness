@@ -18,7 +18,6 @@
  * merge releases its reservation; a successful merge keeps it for the window.
  */
 import { createLogger } from '@archon/paths';
-import { fenceMethods, throwIfFenced } from './cancellation-fence';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { readOverseerActionPolicyFromEnv, type OverseerActionPolicy } from './action-policy';
 import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
@@ -110,12 +109,6 @@ export interface MergeExecutionBridgeOptions {
   }): Promise<ReviewConflictAtHead | null>;
   // Absent in tests that predate the spec hold. When omitted, no spec is read.
   readWoSpec?(woId: string): Promise<string>;
-  /**
-   * Cancellation (record timeout, loop or runtime stop) when the bridge runs as a
-   * deterministic handoff for one record. Every real mutation checks it
-   * immediately before it runs; see fencedBridgeOptions.
-   */
-  signal?: AbortSignal;
 }
 
 export interface MinimalCompareClient {
@@ -1094,50 +1087,13 @@ async function mergeClaimedVerdict(
   return undefined;
 }
 
-/**
- * Fence the bridge's real mutations against a cancelled signal: a new claim, the
- * merge-slot reservation, approval, comment and merge calls, and outcome writes.
- * Compensating releases (releaseVerdictClaim, deferVerdictClaim, releaseMergeSlot)
- * stay open so a cancelled run never strands a claim. An outcome recorded AFTER
- * the merge call went out is the truth of what happened, so it is never fenced.
- */
-function fencedBridgeOptions(
-  options: MergeExecutionBridgeOptions,
-  signal: AbortSignal
-): MergeExecutionBridgeOptions {
-  let mergeSent = false;
-  const store = fenceMethods(
-    options.store,
-    ['claimVerdict', 'reserveMergeSlot', 'recordOutcome'],
-    signal,
-    name => !(name === 'recordOutcome' && mergeSent)
-  );
-  const github = fenceMethods(
-    options.github,
-    ['mergePullRequest', 'commentOnPullRequest', 'approvePullRequest'],
-    signal
-  );
-  const mergeCall = github.mergePullRequest.bind(github);
-  github.mergePullRequest = (input): ReturnType<typeof mergeCall> => {
-    const pending = mergeCall(input);
-    mergeSent = true;
-    return pending;
-  };
-  return { ...options, store, github };
-}
-
 export async function runMergeExecutionBridgeOnce(
-  rawOptions: MergeExecutionBridgeOptions
+  options: MergeExecutionBridgeOptions
 ): Promise<void> {
-  const options = rawOptions.signal
-    ? fencedBridgeOptions(rawOptions, rawOptions.signal)
-    : rawOptions;
   const repoPolicy = configuredPolicy(options.repoConfig);
   const verdicts = await options.store.listUnactionedVerdicts();
   let queuePosition = 0;
   for (const verdict of verdicts) {
-    // Cancelled between verdicts: start nothing new.
-    throwIfFenced(options.signal, 'nextVerdict');
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
     queuePosition += 1;
     if (!(await options.store.claimVerdict(verdict.id))) continue;

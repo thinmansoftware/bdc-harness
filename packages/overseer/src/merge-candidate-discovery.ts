@@ -49,12 +49,6 @@
  */
 import { createLogger } from '@archon/paths';
 import {
-  BoundedAwaitAbortedError,
-  BoundedAwaitTimeoutError,
-  resolveStepTimeoutMs,
-  withBoundedAwait,
-} from './bounded-await';
-import {
   hasRepoPolicyEntry,
   LEGACY_ALLOWED_BASES_ENV,
   MERGE_MANAGER_REPO_POLICY_ENV,
@@ -502,36 +496,22 @@ export function classifyPullRequestEvidence(
 async function resolveDiscoveryRequiredContexts(
   deps: MergeCandidateDiscoveryDeps,
   pr: DiscoveredPullRequest,
-  logger: DiscoveryLogger,
-  stepTimeoutMs: number,
-  signal?: AbortSignal
+  logger: DiscoveryLogger
 ): Promise<RequiredContextsResolution> {
   const lookups = deps.requiredContextsLookups;
   let resolution: RequiredContextsResolution;
   try {
-    resolution = await withBoundedAwait(
-      `discovery.requiredContexts:${pr.owner}/${pr.repo}#${pr.prNumber}`,
-      stepTimeoutMs,
-      () =>
-        resolveRequiredContexts(
-          {
-            ...(lookups ?? {}),
-            owner: pr.owner,
-            repo: pr.repo,
-            baseRef: pr.baseRef,
-            headSha: pr.headSha,
-          },
-          lookups ? process.env : {}
-        ),
+    resolution = await resolveRequiredContexts(
       {
-        onTimeout: error => {
-          logStepTimeout(logger, error);
-        },
-        signal,
-      }
+        ...(lookups ?? {}),
+        owner: pr.owner,
+        repo: pr.repo,
+        baseRef: pr.baseRef,
+        headSha: pr.headSha,
+      },
+      lookups ? process.env : {}
     );
   } catch (error) {
-    if (error instanceof BoundedAwaitAbortedError) throw error;
     // A resolver fault must not take down the sweep. Unknown keeps the
     // all-checks rule, which is never looser than today.
     resolution = {
@@ -727,15 +707,6 @@ export interface DiscoverMergeCandidatesOptions {
    * `already_a_run_candidate` rather than evaluated twice.
    */
   readonly alreadyCoveredPullRequests?: ReadonlySet<string>;
-  /** Per-step deadline for each GitHub-touching await (MERGE_SWEEP_STEP_TIMEOUT_MS, 60000). */
-  readonly stepTimeoutMs?: number;
-  /**
-   * Aggregate cancellation (the pass's discovery deadline, or shutdown). On abort,
-   * in-flight lookups are cancelled, no new PR is started, and the result carries
-   * the candidates gathered so far with the cursor advanced ONLY past the PRs
-   * actually evaluated.
-   */
-  readonly signal?: AbortSignal;
   /**
    * Where to resume the rotating evaluation window. Pass the previous tick's
    * `cursorAfter`. Omitted or null starts from the beginning of the population.
@@ -891,15 +862,6 @@ export function isPullRequestDiscoveredCandidate(record: {
   );
 }
 
-/** Name the hung call. A timeout is isolated like the throw it replaces, but never silent. */
-function logStepTimeout(logger: DiscoveryLogger, error: BoundedAwaitTimeoutError): void {
-  warnVia(
-    logger,
-    { label: error.label, timeoutMs: error.timeoutMs },
-    'merge-coordinator.step_timeout'
-  );
-}
-
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -958,7 +920,6 @@ export async function discoverMergeCandidates(
   }
 
   const maxPullRequests = options.maxPullRequestsPerTick ?? resolveDiscoveryMaxPrsPerTick();
-  const stepTimeoutMs = options.stepTimeoutMs ?? resolveStepTimeoutMs();
   const alreadyCovered = options.alreadyCoveredPullRequests ?? new Set<string>();
 
   const candidates: WatchedRunRecord[] = [];
@@ -988,22 +949,11 @@ export async function discoverMergeCandidates(
           'merge-coordinator.repo_policy_missing'
         );
       }
-      const listed = await withBoundedAwait(
-        `discovery.listOpenPullRequests:${target.owner}/${target.repo}`,
-        stepTimeoutMs,
-        () =>
-          listOpenPullRequests({
-            owner: target.owner,
-            repo: target.repo,
-            baseBranches: watchedBases,
-          }),
-        {
-          onTimeout: error => {
-            logStepTimeout(logger, error);
-          },
-          signal: options.signal,
-        }
-      );
+      const listed = await listOpenPullRequests({
+        owner: target.owner,
+        repo: target.repo,
+        baseBranches: watchedBases,
+      });
       byRepo.set(repoKey(target.owner, target.repo), listed);
       anyRepoListed = true;
     } catch (error) {
@@ -1085,58 +1035,26 @@ export async function discoverMergeCandidates(
   // Where each repo got to this tick, so the next tick resumes per repo rather
   // than rewinding every repo to whichever one happened to be evaluated last.
   const lastPerRepo = new Map<string, number>();
-  // True when the aggregate deadline (options.signal) cut the evaluation short.
-  let deadlineHit = false;
   {
     for (const pr of sequence) {
       if (evaluated >= maxPullRequests) break;
-      if (options.signal?.aborted) {
-        deadlineHit = true;
-        break;
-      }
-      const lastKey = repoKey(pr.owner, pr.repo);
-      const previousLast = lastPerRepo.get(lastKey);
       evaluated += 1;
-      lastPerRepo.set(lastKey, pr.prNumber);
-      // A PR whose lookup was CANCELLED was not evaluated: give back its budget
-      // slot and its cursor position so the next pass starts at it, not after it.
-      const abandonCurrent = (): void => {
-        evaluated -= 1;
-        if (previousLast === undefined) lastPerRepo.delete(lastKey);
-        else lastPerRepo.set(lastKey, previousLast);
-        deadlineHit = true;
-      };
+      lastPerRepo.set(repoKey(pr.owner, pr.repo), pr.prNumber);
 
       let evidence: PullRequestEvidence;
       try {
-        evidence = await withBoundedAwait(
-          `discovery.findPullRequest:${pr.owner}/${pr.repo}#${pr.prNumber}`,
-          stepTimeoutMs,
-          () =>
-            deps.findPullRequest({
-              owner: pr.owner,
-              repo: pr.repo,
-              headBranch: pr.headRef,
-              woId: pr.woId,
-              // The unique key, passed so an adapter that can address a PR directly
-              // resolves THIS one instead of searching by the ambiguous branch/WO.
-              // Optional in the contract, so existing implementations that ignore it
-              // still work -- and are still caught by the binding check below.
-              prNumber: pr.prNumber,
-              signal: options.signal,
-            }),
-          {
-            onTimeout: error => {
-              logStepTimeout(logger, error);
-            },
-            signal: options.signal,
-          }
-        );
-      } catch (error) {
-        if (error instanceof BoundedAwaitAbortedError) {
-          abandonCurrent();
-          break;
-        }
+        evidence = await deps.findPullRequest({
+          owner: pr.owner,
+          repo: pr.repo,
+          headBranch: pr.headRef,
+          woId: pr.woId,
+          // The unique key, passed so an adapter that can address a PR directly
+          // resolves THIS one instead of searching by the ambiguous branch/WO.
+          // Optional in the contract, so existing implementations that ignore it
+          // still work -- and are still caught by the binding check below.
+          prNumber: pr.prNumber,
+        });
+      } catch {
         exclusions.push({
           owner: pr.owner,
           repo: pr.repo,
@@ -1165,22 +1083,7 @@ export async function discoverMergeCandidates(
         continue;
       }
 
-      let requiredContexts: RequiredContextsResolution;
-      try {
-        requiredContexts = await resolveDiscoveryRequiredContexts(
-          deps,
-          pr,
-          logger,
-          stepTimeoutMs,
-          options.signal
-        );
-      } catch (error) {
-        if (error instanceof BoundedAwaitAbortedError) {
-          abandonCurrent();
-          break;
-        }
-        throw error;
-      }
+      const requiredContexts = await resolveDiscoveryRequiredContexts(deps, pr, logger);
       const evidenceReason = classifyPullRequestEvidence(evidence, requiredContexts);
       if (evidenceReason) {
         exclusions.push({
@@ -1196,47 +1099,15 @@ export async function discoverMergeCandidates(
       // GitHub's aggregate APPROVED bit is not merge authority. Production
       // callers must supply the receipt-backed guard. Missing qualification
       // authority fails closed just like an explicit negative result.
-      let qualified = false;
-      let qualificationLookupFailed = false;
-      if (deps.hasQualifiedReview) {
-        try {
-          qualified = await withBoundedAwait(
-            `discovery.hasQualifiedReview:${pr.owner}/${pr.repo}#${pr.prNumber}`,
-            stepTimeoutMs,
-            () =>
-              deps.hasQualifiedReview?.({
-                owner: pr.owner,
-                repo: pr.repo,
-                number: pr.prNumber,
-                headSha: pr.headSha,
-              }) ?? Promise.resolve(false),
-            {
-              onTimeout: error => {
-                logStepTimeout(logger, error);
-              },
-              signal: options.signal,
-            }
-          );
-        } catch (error) {
-          if (error instanceof BoundedAwaitAbortedError) {
-            abandonCurrent();
-            break;
-          }
-          qualificationLookupFailed = true;
-        }
-      }
-      if (qualificationLookupFailed) {
-        exclusions.push({
+      if (
+        !deps.hasQualifiedReview ||
+        !(await deps.hasQualifiedReview({
           owner: pr.owner,
           repo: pr.repo,
-          prNumber: pr.prNumber,
-          reason: 'evidence_lookup_failed',
-          detail: 'qualified-review lookup threw or timed out -- state unknown, retried next tick',
-        });
-        continue;
-      }
-      // Missing qualification authority fails closed (the dependency check is explicit).
-      if (!deps.hasQualifiedReview || !qualified) {
+          number: pr.prNumber,
+          headSha: pr.headSha,
+        }))
+      ) {
         exclusions.push({
           owner: pr.owner,
           repo: pr.repo,
@@ -1257,18 +1128,9 @@ export async function discoverMergeCandidates(
   // Truncated when this pass could not finish: PRs nobody has evaluated yet
   // remain. A cursor is carried only then; completing the pass clears it so the
   // next tick starts a fresh pass at the top of every repo.
-  const evaluationWindowTruncated = deadlineHit || evaluated < freshTotal;
-  if (deadlineHit) {
-    warnVia(
-      logger,
-      { evaluated, freshTotal, candidates: candidates.length },
-      'merge-coordinator.discovery_deadline'
-    );
-  }
-  // On a deadline the cursor advances ONLY past evaluated PRs; with zero progress
-  // the previous cursor is kept so the next pass retries from the same place.
+  const evaluationWindowTruncated = evaluated < freshTotal;
   const cursorAfter: DiscoveryCursor | null =
-    evaluationWindowTruncated && (lastPerRepo.size > 0 || (deadlineHit && startCursor))
+    evaluationWindowTruncated && lastPerRepo.size > 0
       ? {
           perRepo: {
             // Repos untouched this tick keep their previous position, or they
