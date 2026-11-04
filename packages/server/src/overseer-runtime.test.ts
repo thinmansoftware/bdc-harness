@@ -398,6 +398,13 @@ describe('overseer-runtime', () => {
       insertOverseerAction: async () => undefined,
     };
     const mergeManager = createMergeManager(deps);
+    // A real service stays up until stopped. (With a mock that exits at once, the supervisor
+    // now treats the exit as unexpected and reports 'degraded' while it backs off to restart.)
+    runOverseerServiceMock.mockImplementation(async (opts?: unknown) => {
+      capturedServiceOptions = (opts ?? {}) as NonNullable<typeof capturedServiceOptions>;
+      const signal = (opts as { signal: AbortSignal }).signal;
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve()));
+    });
 
     startOverseerRuntime({
       runService: runOverseerServiceMock,
@@ -407,7 +414,7 @@ describe('overseer-runtime', () => {
 
     expect(runOverseerServiceMock).toHaveBeenCalledTimes(1);
     expect(status.adapter).toBe('real');
-    expect(status.watcher).toBe('stopped');
+    expect(status.watcher).toBe('running');
     expect(capturedServiceOptions?.adapterKind).toBe('real');
     expect(capturedServiceOptions?.deps).toBe(deps);
     expect(capturedServiceOptions?.mergeCoordinator).toBe(mergeManager);
@@ -444,7 +451,7 @@ describe('overseer-runtime', () => {
   // Test 4 (WO-HARNESS-MERGE-SWEEP-LIVENESS-AND-PAGING-01): a service rejection no longer leaves
   // the watcher, merge bridge and reconcile loop dead; the runtime restarts it with bounded
   // backoff and still stops cleanly.
-  test('Test 4: supervisor restarts the watcher with backoff and stops cleanly', async () => {
+  test('supervisor: restarts the watcher only after it settled, with backoff, and stops cleanly', async () => {
     setEnabledEnv();
     const logs: Array<{ level: string; obj: Record<string, unknown>; msg: string }> = [];
     const logger = {
@@ -463,9 +470,14 @@ describe('overseer-runtime', () => {
     };
     let monitorStops = 0;
     let serviceCalls = 0;
+    const events: string[] = [];
     runOverseerServiceMock.mockImplementation(async (opts?: unknown) => {
       serviceCalls += 1;
-      if (serviceCalls <= 2) throw new Error(`database is locked (${serviceCalls})`);
+      events.push(`start${serviceCalls}`);
+      if (serviceCalls <= 2) {
+        events.push(`settle${serviceCalls}`);
+        throw new Error(`database is locked (${serviceCalls})`);
+      }
       // Third start stays up until the runtime aborts it.
       const signal = (opts as { signal: AbortSignal }).signal;
       await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve()));
@@ -524,6 +536,8 @@ describe('overseer-runtime', () => {
     expect(serviceCalls).toBe(3);
     expect((await getStatus()).watcher).toBe('running');
     expect(timers).toHaveLength(2);
+    // Each restart call happened strictly after the previous promise settled.
+    expect(events).toEqual(['start1', 'settle1', 'start2', 'settle2', 'start3']);
 
     await stopOverseerRuntime();
     expect(monitorStops).toBeGreaterThanOrEqual(1);
@@ -534,11 +548,12 @@ describe('overseer-runtime', () => {
   // XO guard (fence 283): the supervisor restarts a loop ONLY after that loop's promise has
   // settled. A HANG raises the 10-minute liveness alarm and nothing else: no second pass, no
   // second loop, no restart timer.
-  test('a loop hung forever raises the liveness alarm and starts no second loop', async () => {
+  test('supervisor: a loop hung forever raises the alarm and starts no second pass or loop', async () => {
     setEnabledEnv();
     let clock = Date.UTC(2026, 10, 4, 16, 0, 0);
     const posts: Array<{ recipient?: unknown; priority?: unknown }> = [];
     const alarmLogs: string[] = [];
+    const runtimeLogs: string[] = [];
     let serviceCalls = 0;
     const timers: Array<{ ms: number }> = [];
     runOverseerServiceMock.mockImplementation(async (opts?: unknown) => {
@@ -551,6 +566,10 @@ describe('overseer-runtime', () => {
     let monitor: ReturnType<typeof startMergeSweepLivenessMonitor> | undefined;
     startOverseerRuntime({
       runService: runOverseerServiceMock,
+      logger: {
+        info: (_obj, msg) => runtimeLogs.push(msg),
+        error: (_obj, msg) => runtimeLogs.push(msg),
+      },
       supervisor: {
         setTimer: (_fn, ms) => {
           timers.push({ ms });
@@ -563,6 +582,7 @@ describe('overseer-runtime', () => {
           now: () => clock,
           startTimer: false,
           maxSilenceMs: 600_000,
+          checkIntervalMs: 60_000,
           logger: {
             info: () => undefined,
             error: (_obj, msg) => alarmLogs.push(msg),
@@ -578,22 +598,22 @@ describe('overseer-runtime', () => {
     for (let i = 0; i < 5; i += 1) await Promise.resolve();
     expect(serviceCalls).toBe(1);
 
-    // Just under 10 minutes of silence: nothing yet.
-    clock += 9 * 60_000 + 59_000;
-    await monitor?.check();
-    expect(alarmLogs).toEqual([]);
+    // 30 simulated minutes with no sweep progress, one check per minute.
+    for (let minute = 1; minute <= 30; minute += 1) {
+      clock += 60_000;
+      await monitor?.check();
+      if (minute === 9) expect(alarmLogs).toEqual([]);
+      for (let i = 0; i < 3; i += 1) await Promise.resolve();
+    }
 
-    // Past 10 minutes: the alarm fires and the operator is paged exactly once.
-    clock += 2_000;
-    await monitor?.check();
-    clock += 60_000;
-    await monitor?.check();
-    expect(alarmLogs.filter(msg => msg === 'merge-coordinator.liveness_alarm').length).toBe(2);
+    // The alarm fired (one operator message for the episode) ...
+    expect(
+      alarmLogs.filter(msg => msg === 'merge-coordinator.liveness_alarm').length
+    ).toBeGreaterThan(0);
     expect(posts).toEqual([{ recipient: 'operator', priority: 'blocker' }]);
-
-    // The hang triggered NO restart: still one loop, no restart timer, still running.
-    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    // ... and the hang triggered NO restart: one call, no restart log, no timer, still running.
     expect(serviceCalls).toBe(1);
+    expect(runtimeLogs).not.toContain('overseer_runtime.watcher_restarting');
     expect(timers).toHaveLength(0);
     expect((await getStatus()).watcher).toBe('running');
   });

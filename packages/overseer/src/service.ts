@@ -31,7 +31,7 @@ import {
 } from './escalation-delivery';
 import { permitFromMetadata } from './permit';
 import { runReconcileOnce } from './reconcile';
-import { watchLoop, type WatchHeartbeatLogger } from './watch';
+import { watchLoop } from './watch';
 import type {
   DeterministicMergeHandoff,
   GitHubClientDeps,
@@ -107,8 +107,8 @@ export interface OverseerServiceOptions {
    */
   mergeBridgeRun?: () => Promise<unknown>;
   mergeBridgeEnabled?: boolean;
-  /** Tests inject a spy for the delivery and watcher loop lines; defaults to the module logger. */
-  logger?: WatchHeartbeatLogger;
+  /** Tests inject a spy for the delivery isolation line; defaults to the module logger. */
+  logger?: { error?(obj: Record<string, unknown>, msg: string): void };
 }
 
 export async function runOperatorCardDeliveryScheduler(input: {
@@ -523,7 +523,6 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
       intervalMs: options.intervalMs,
       once: options.once,
       signal: coupledAbort.signal,
-      ...(options.logger === undefined ? {} : { logger: options.logger }),
     }
   );
   const tasks: Promise<void>[] = [watcher];

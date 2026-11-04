@@ -168,8 +168,9 @@ export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
 }
 
 /**
- * Run the service once and supervise it. When the service promise rejects and
- * the runtime was not stopped on purpose, restart it after a bounded backoff.
+ * Run the service once and supervise it. When the service promise has SETTLED
+ * (rejected, or resolved unexpectedly) and the runtime was not stopped on purpose,
+ * restart it after a bounded backoff. Restart happens only after settlement.
  * Before this, a rejection left the watcher, merge bridge and reconcile loop
  * dead until a human restarted the container (2026-11-04: one hour).
  */
@@ -192,6 +193,36 @@ function launchService(deps: OverseerRuntimeDeps): void {
   watcherState = 'running';
   const startedAt = now();
 
+  // supervisor_settled_guard: the ONLY path that can start another service is the
+  // `settled` handler below, which runs only after this promise has actually
+  // settled (crashed or exited). Nothing else calls runService or aborts the running
+  // service: no timer, watchdog or liveness callback. A HANG never settles, so it
+  // reaches the 10-minute liveness alarm and nothing else.
+  const settled = (outcome: { err: unknown } | null): void => {
+    watcherTask = null;
+    watcherAbort = null;
+    if (outcome === null && intentionalStop) {
+      runtimeLog.info({}, 'overseer_runtime.watcher_stopped');
+      watcherState = 'stopped';
+      return;
+    }
+    controller.abort();
+    const err = outcome === null ? new Error('overseer_service_exited_unexpectedly') : outcome.err;
+    runtimeLog.error({ err }, 'overseer_runtime.watcher_exception_degraded');
+    watcherState = 'degraded';
+    if (intentionalStop) return;
+
+    if (now() - startedAt >= healthyResetMs) restartAttempt = 0;
+    const delayMs = Math.min(baseDelayMs * 2 ** restartAttempt, maxDelayMs);
+    restartAttempt += 1;
+    runtimeLog.error({ attempt: restartAttempt, delayMs }, 'overseer_runtime.watcher_restarting');
+    restartTimer = setTimer(() => {
+      restartTimer = null;
+      if (intentionalStop) return;
+      launchService(deps);
+    }, delayMs);
+  };
+
   const runService = deps.runService ?? runOverseerService;
   watcherTask = runService({
     ...deps.serviceOptions,
@@ -200,28 +231,10 @@ function launchService(deps: OverseerRuntimeDeps): void {
     deliveryEnabled: true,
   }).then(
     () => {
-      runtimeLog.info({}, 'overseer_runtime.watcher_stopped');
-      watcherState = 'stopped';
-      watcherTask = null;
-      watcherAbort = null;
+      settled(null);
     },
     (err: unknown) => {
-      controller.abort();
-      runtimeLog.error({ err }, 'overseer_runtime.watcher_exception_degraded');
-      watcherState = 'degraded';
-      watcherTask = null;
-      watcherAbort = null;
-      if (intentionalStop) return;
-
-      if (now() - startedAt >= healthyResetMs) restartAttempt = 0;
-      const delayMs = Math.min(baseDelayMs * 2 ** restartAttempt, maxDelayMs);
-      restartAttempt += 1;
-      runtimeLog.error({ attempt: restartAttempt, delayMs }, 'overseer_runtime.watcher_restarting');
-      restartTimer = setTimer(() => {
-        restartTimer = null;
-        if (intentionalStop) return;
-        launchService(deps);
-      }, delayMs);
+      settled({ err });
     }
   );
 }

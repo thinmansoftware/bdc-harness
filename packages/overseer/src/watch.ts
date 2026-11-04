@@ -286,13 +286,6 @@ export interface WatchHeartbeatLogger {
   info(obj: Record<string, unknown>, msg: string): void;
   /** Optional so existing injected loggers keep working; falls back to the module logger. */
   warn?(obj: Record<string, unknown>, msg: string): void;
-  /** Optional; used for the isolated-failure lines. Falls back to the module logger. */
-  error?(obj: Record<string, unknown>, msg: string): void;
-}
-
-function logError(logger: WatchHeartbeatLogger, obj: Record<string, unknown>, msg: string): void {
-  if (typeof logger.error === 'function') logger.error(obj, msg);
-  else log.error(obj, msg);
 }
 
 export interface WatchOnceOptions {
@@ -489,14 +482,10 @@ export async function watchLoop(
      */
     discovery?: WatchOnceOptions['discovery'];
     discoveryEnabled?: boolean;
-    /** Logger for heartbeat and isolated-failure lines; defaults to the module logger. */
-    logger?: WatchHeartbeatLogger;
   } = {}
 ): Promise<void> {
-  const loopLogger: WatchHeartbeatLogger = options.logger ?? log;
   const intervalMs = options.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS;
   const watchOptions: WatchOnceOptions = {
-    ...(options.logger === undefined ? {} : { logger: options.logger }),
     ...(options.discovery === undefined ? {} : { discovery: options.discovery }),
     ...(options.discoveryEnabled === undefined
       ? {}
@@ -504,31 +493,11 @@ export async function watchLoop(
   };
   for (;;) {
     if (options.signal?.aborted) return;
-    // A pass or a record handler that THROWS has settled: log it and run the next
-    // pass instead of ending the loop (2026-11-04: one escaped error stopped the
-    // merge sweep). Only an aborted signal ends the loop. A pass that HANGS is not
-    // handled here -- it raises the liveness alarm only.
-    try {
-      const records = await watchOnce(deps, watchOptions);
-      for (const record of records) {
-        if (options.signal?.aborted) return;
-        try {
-          await onRecord(record);
-        } catch (error) {
-          logError(
-            loopLogger,
-            { err: error as Error, stage: 'onRecord', runId: record.runId },
-            'overseer.watch.pass_failed_isolated'
-          );
-        }
-        recordSweepProgress();
-      }
-    } catch (error) {
-      logError(
-        loopLogger,
-        { err: error as Error, stage: 'watchOnce' },
-        'overseer.watch.pass_failed_isolated'
-      );
+    const records = await watchOnce(deps, watchOptions);
+    for (const record of records) {
+      if (options.signal?.aborted) return;
+      await onRecord(record);
+      recordSweepProgress();
     }
     recordSweepProgress();
     if (options.once) return;

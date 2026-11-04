@@ -1,8 +1,14 @@
 /**
- * Tests 7-9 (WO-HARNESS-MERGE-SWEEP-LIVENESS-AND-PAGING-01): approved-first
+ * Tests 6-8 (WO-HARNESS-MERGE-SWEEP-LIVENESS-AND-PAGING-01): approved-first
  * discovery. Every listed PR is classified structurally each pass at zero GitHub
  * cost; only approved PRs on a watched base consume the evidence budget, and
  * they rotate so none starves.
+ *
+ * The claim these tests pin (amended spec wording): approved PRs are NEVER crowded
+ * out by non-approved ones, and the rotation BOUNDS THE WAIT AMONG APPROVED PRs to
+ * ceil(approved / budget) passes. It is NOT a claim that every approved PR is
+ * evaluated inside one window: Test 8 has green PR 61 wait until pass 3 because 60
+ * other approved PRs ahead of it use the budget.
  */
 import { beforeEach, describe, expect, test } from 'bun:test';
 import {
@@ -76,7 +82,7 @@ beforeEach(() => {
 });
 
 describe('merge candidate discovery -- approved-first budgeting', () => {
-  test('Test 7: an approved-at-head PR beyond the first 100 becomes a candidate in one pass', async () => {
+  test('Test 6: an approved-at-head PR beyond the first 100 becomes a candidate in one pass', async () => {
     const pullRequests = [
       ...Array.from({ length: 249 }, (_, index) =>
         pr(index + 1, { reviewDecision: 'REVIEW_REQUIRED' })
@@ -104,7 +110,7 @@ describe('merge candidate discovery -- approved-first budgeting', () => {
     expect(result.evaluationWindowTruncated).toBe(false);
   });
 
-  test('Test 8: non-approved PRs never consume the evidence budget and every PR is still classified', async () => {
+  test('Test 7: non-approved PRs never consume the evidence budget and every PR is still classified', async () => {
     const pullRequests = [
       ...Array.from({ length: 120 }, (_, index) => pr(index + 1, { draft: true })),
       ...Array.from({ length: 100 }, (_, index) => pr(121 + index, { baseRef: 'main' })),
@@ -134,7 +140,7 @@ describe('merge candidate discovery -- approved-first budgeting', () => {
     expect(result.candidates).toHaveLength(0);
   });
 
-  test('Test 9: approved PRs rotate so none starves behind persistently excluded approved PRs', async () => {
+  test('Test 8: approved PRs rotate so none starves behind persistently excluded approved PRs', async () => {
     const pullRequests = [...Array.from({ length: 61 }, (_, index) => pr(index + 1))];
     // PRs 1-60 stay checks_pending forever; PR 61 is green.
     const { deps, findCalls } = makeDeps(pullRequests, number =>
@@ -146,9 +152,13 @@ describe('merge candidate discovery -- approved-first budgeting', () => {
       maxPullRequestsPerTick: 30,
     } as const;
 
+    // Every PR here is approved, so none is crowded out by a non-approved PR. PR 61 still
+    // waits: 60 approved PRs ahead of it spend the whole budget in passes 1 and 2 (a
+    // bounded rotation delay among approved PRs, ceil(61 / 30) = 3 passes at most).
     const pass1 = await discoverMergeCandidates(deps, options);
     const pass1Calls = findCalls.splice(0);
     expect(pass1Calls).toEqual(Array.from({ length: 30 }, (_, index) => index + 1));
+    expect(pass1Calls).not.toContain(61);
     expect(pass1.evaluationWindowTruncated).toBe(true);
     expect(pass1.cursorAfter?.perRepo[`${OWNER}/${REPO}`]).toBe(30);
     expect(pass1.candidates).toHaveLength(0);
@@ -156,6 +166,7 @@ describe('merge candidate discovery -- approved-first budgeting', () => {
     const pass2 = await discoverMergeCandidates(deps, options);
     const pass2Calls = findCalls.splice(0);
     expect(pass2Calls).toEqual(Array.from({ length: 30 }, (_, index) => index + 31));
+    expect(pass2Calls).not.toContain(61);
     expect(pass2.evaluationWindowTruncated).toBe(true);
     expect(pass2.candidates).toHaveLength(0);
 

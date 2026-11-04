@@ -92,10 +92,8 @@ What now protects the sweep:
 
 - The delivery scheduler isolates its own errors (`overseer.delivery.iteration_failed_isolated`), like the
   reconcile and merge-bridge schedulers. `abortOnFailure` in `runOverseerService` remains only as a last-resort guard.
-- `watchLoop` is not ended by a pass or record handler that THROWS: the error is logged at error level as
-  `overseer.watch.pass_failed_isolated` and the next pass runs. Only an aborted signal ends the loop.
 - `startOverseerRuntime` supervises the service. The supervisor restarts the loop ONLY after the service promise has
-  actually SETTLED (rejected). It never starts a new pass or loop while an old one is still pending. On a rejection
+  actually SETTLED (rejected, or resolved unexpectedly). It never starts a new pass or loop while an old one is still pending. On a rejection
   `overseer_runtime.watcher_exception_degraded` is logged, then `overseer_runtime.watcher_restarting` (attempt number,
   delay) and the service restarts after 5 s, doubling to a 60 s cap; five minutes of healthy running resets the counter.
   `stopOverseerRuntime` cancels any pending restart and a rejection after an intentional stop never restarts.
@@ -121,12 +119,12 @@ Environment variables (all optional; defaults shown):
 | `MERGE_SWEEP_LIVENESS_CHECK_MS` | 60000 | How often the monitor checks |
 
 Log tokens to grep in `docker logs archon-app-1`: `merge-coordinator.heartbeat_evaluated` (one per pass, should be
-about one per minute), `overseer.watch.pass_failed_isolated`, `overseer.delivery.iteration_failed_isolated`,
+about one per minute), `overseer.delivery.iteration_failed_isolated`,
 `overseer_runtime.watcher_restarting`, `merge-coordinator.liveness_alarm`, `merge-coordinator.liveness_recovered`.
 
 Operator response to a liveness alarm message (or a `liveness_alarm` log line):
 
-1. Confirm: `ssh hetzner-prod "docker logs --since 20m archon-app-1 2>&1 | grep -E 'merge-coordinator.heartbeat_evaluated|overseer_runtime.watcher|pass_failed_isolated' | tail -20"`.
+1. Confirm: `ssh hetzner-prod "docker logs --since 20m archon-app-1 2>&1 | grep -E 'merge-coordinator.heartbeat_evaluated|overseer_runtime.watcher' | tail -20"`.
 2. If `watcher_restarting` lines are repeating, read the error on the preceding `watcher_exception_degraded` line and fix that cause (a database lock, a bad config).
 3. If no heartbeat and no restart lines appear, the loop is hung (the alarm does not restart it): rebuild or restart `archon-app-1` under the standing harness rebuild rule.
 4. After recovery a `merge-coordinator.liveness_recovered` line confirms the monitor re-armed.

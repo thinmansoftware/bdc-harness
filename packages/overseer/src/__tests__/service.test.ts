@@ -898,15 +898,10 @@ describe('service', () => {
     expect(watcherPolls).toBeGreaterThan(0);
   });
 
-  // Same WO: a watcher pass failure is now isolated inside watchLoop, so it no longer rejects the
-  // service or stops the delivery scheduler (previously asserted the opposite).
-  test('watcher pass failure is isolated; the delivery scheduler keeps draining', async () => {
-    const controller = new AbortController();
-    let polls = 0;
+  test('watcher failure aborts and quiesces the delivery scheduler before rejecting', async () => {
     let drains = 0;
     const deps = {
       listRunsForWatch: async () => {
-        polls += 1;
         throw new Error('watcher_poll_failed');
       },
       listRunEvents: async () => [],
@@ -920,18 +915,17 @@ describe('service', () => {
         enabled: true,
         adapterKind: 'fake',
         deps,
-        signal: controller.signal,
         intervalMs: 1,
         deliveryEnabled: true,
         deliveryIntervalMs: 1,
         deliveryDrain: async () => {
           drains += 1;
-          if (drains === 3) controller.abort();
         },
       })
-    ).resolves.toBeUndefined();
-    expect(drains).toBe(3);
-    expect(polls).toBeGreaterThan(1);
+    ).rejects.toThrow('watcher_poll_failed');
+    const drainsAfterReject = drains;
+    await new Promise<void>(resolve => setTimeout(resolve, 10));
+    expect(drains).toBe(drainsAfterReject);
   });
 
   async function seedReplayRun(input: {
