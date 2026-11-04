@@ -100,6 +100,7 @@ export interface PrReviewCheck {
   completed_at?: string | null;
   app?: { slug?: string; name?: string };
   check_suite?: { id?: number } | null;
+  workflow_attempt?: { run_id: number; run_attempt: number } | null;
 }
 
 export interface PrReviewCheckPartition {
