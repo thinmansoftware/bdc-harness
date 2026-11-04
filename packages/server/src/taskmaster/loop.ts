@@ -308,6 +308,70 @@ export function dispatchSubjectKeyForThreadRef(threadRef: string, nowMs: number)
   }
 }
 
+/**
+ * Fail a Dispatch-refused Taskmaster send LOUD (fence 281): one error log line,
+ * then an operator page through the worker-heartbeat alarm's journal-first
+ * pageOnce, keyed per thread per clock hour so a retrying rejection pages once
+ * an hour, never once a tick. The page row lands in tm_journal with the
+ * failure, so a send that has no journal row of its own (the self-pause notice)
+ * is still visible there. A failed page leaves its row 'failed' and the next
+ * rejection in the hour retries it; it never throws into the tick.
+ */
+async function reportRejectedSend(
+  deps: TaskmasterDeps,
+  dal: TaskmasterDal,
+  nowMs: number,
+  args: {
+    actionType: string;
+    threadRef: string;
+    subjectKey: string | null;
+    idempotencyKey: string;
+    journalId: string | null;
+    failure: string;
+  }
+): Promise<void> {
+  log.error(
+    {
+      actionType: args.actionType,
+      threadRef: args.threadRef,
+      subjectKey: args.subjectKey,
+      idempotencyKey: args.idempotencyKey,
+      failure: args.failure,
+    },
+    'taskmaster.dispatch_send_rejected'
+  );
+  const hourBucket = Math.floor(nowMs / SEND_REJECTED_PAGE_BUCKET_MS);
+  const journalNote = args.journalId ? ` Journal row ${args.journalId} is failed.` : '';
+  try {
+    await pageOnce(
+      {
+        pageOperator: deps.pageOperator ?? ((text): Promise<void> => sendCanaryTelegramAlert(text)),
+        journal: dal,
+      },
+      {
+        idempotencyKey: `tm:send-rejected-page:${args.threadRef}:${hourBucket}`,
+        threadRef: `dispatch-send-rejected:${args.threadRef}`,
+        text:
+          `[TASKMASTER SEND REJECTED] ${args.actionType} for ${args.threadRef} ` +
+          `was refused by Dispatch: ${args.failure}.${journalNote}`,
+        proposal: {
+          kind: 'dispatch_send_rejected',
+          action_type: args.actionType,
+          thread_ref: args.threadRef,
+          subject_key: args.subjectKey,
+          journal_id: args.journalId,
+          failure: args.failure,
+        },
+      }
+    );
+  } catch (pageError) {
+    log.error(
+      { err: pageError as Error, threadRef: args.threadRef },
+      'taskmaster.dispatch_send_rejected_page_failed'
+    );
+  }
+}
+
 export interface TickResult {
   ran: boolean;
   successful: boolean;
@@ -849,9 +913,13 @@ export async function defaultGetGithubIssueEvidence(
 
 const RESET_COMMAND = "bash scripts/taskmaster/reset.sh --confirm --reason '<why>'";
 
+/** Taskmaster thread of the self-pause notice; mapped to a valid subject key at send. */
+export const SELF_PAUSE_THREAD_REF = 'taskmaster:self-pause';
+
 export function buildSelfPauseNotice(
   reason: string,
-  epoch: number
+  epoch: number,
+  nowMs: number = Date.now()
 ): CreateAuthenticatedMessageData {
   return {
     correlation_id: `tm-self-pause-${epoch}`,
@@ -859,7 +927,10 @@ export function buildSelfPauseNotice(
     task_type: 'agent_message',
     recipient: 'duty-officer',
     body: `Taskmaster self-paused: ${reason} Reset with: ${RESET_COMMAND}`,
-    subject_key: 'taskmaster:self-pause',
+    // 'taskmaster:self-pause' is refused by the Dispatch validator (fence 282).
+    // The Duty Officer still recognises the notice by its tm:self-pause:
+    // idempotency key and tm-self-pause- correlation id (isTaskmasterSelfPause).
+    subject_key: dispatchSubjectKeyForThreadRef(SELF_PAUSE_THREAD_REF, nowMs),
     repeat_reason: 'A new Taskmaster epoch self-paused and requires Duty Officer attention.',
   };
 }
@@ -1914,6 +1985,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           pause_reason: pauseReason,
           pause_actor: 'taskmaster:useful-rate-floor',
         });
+        let notice: CreateAuthenticatedMessageData | null = null;
         try {
           // Apply the monitoring exemption; Dispatch atomically fences enqueue
           // against reset using the expected paused epoch, not this snapshot.
@@ -1923,21 +1995,29 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             noticeControl.epoch === control.epoch &&
             isPauseEffectsExempt('self_pause_notice', noticeControl.pause_scope)
           ) {
-            await createTask(
-              { kind: 'system', sender: 'taskmaster' },
-              buildSelfPauseNotice(pauseReason, control.epoch),
-              {
-                taskmasterPausedEpoch: control.epoch,
-                // Carry the exact state the exemption was decided against so
-                // Dispatch can re-assert it inside its locked transaction.
-                taskmasterPausedState: 'PAUSED',
-                taskmasterPausedScope: noticeControl.pause_scope,
-              }
-            );
+            notice = buildSelfPauseNotice(pauseReason, control.epoch, nowMs);
+            await createTask({ kind: 'system', sender: 'taskmaster' }, notice, {
+              taskmasterPausedEpoch: control.epoch,
+              // Carry the exact state the exemption was decided against so
+              // Dispatch can re-assert it inside its locked transaction.
+              taskmasterPausedState: 'PAUSED',
+              taskmasterPausedScope: noticeControl.pause_scope,
+            });
           }
         } catch (error) {
           tickFailures += 1;
           log.error({ err: error as Error }, 'taskmaster.self_pause_notice_failed');
+          // Only the send itself can throw once the notice is built.
+          if (notice) {
+            await reportRejectedSend(deps, dal, nowMs, {
+              actionType: 'self_pause_notice',
+              threadRef: SELF_PAUSE_THREAD_REF,
+              subjectKey: notice.subject_key ?? null,
+              idempotencyKey: notice.idempotency_key,
+              journalId: null,
+              failure: (error instanceof Error ? error.message : String(error)).slice(0, 200),
+            });
+          }
         }
         log.warn({ usefulCount, noiseCount }, 'taskmaster.useful_rate_floor_auto_paused');
       }
@@ -2714,50 +2794,14 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');
       if (dispatchSendRejected) {
-        log.error(
-          {
-            actionType: proposal.type,
-            threadRef: proposal.threadRef,
-            subjectKey: dispatchSubjectKey,
-            idempotencyKey: proposal.idempotencyKey,
-            failure: failureReason,
-          },
-          'taskmaster.dispatch_send_rejected'
-        );
-        // Page the operator through the worker-heartbeat alarm's journal-first
-        // path, keyed per thread per clock hour so a retrying rejection pages
-        // once an hour, never once a tick. A failed page leaves its row
-        // 'failed' and the next rejection in the hour retries it.
-        const hourBucket = Math.floor(nowMs / SEND_REJECTED_PAGE_BUCKET_MS);
-        try {
-          await pageOnce(
-            {
-              pageOperator:
-                deps.pageOperator ?? ((text): Promise<void> => sendCanaryTelegramAlert(text)),
-              journal: dal,
-            },
-            {
-              idempotencyKey: `tm:send-rejected-page:${canonicalProposalRef}:${hourBucket}`,
-              threadRef: `dispatch-send-rejected:${canonicalProposalRef}`,
-              text:
-                `[TASKMASTER SEND REJECTED] ${proposal.type} for ${proposal.threadRef} ` +
-                `was refused by Dispatch: ${failureReason}. Journal row ${journalRow.id} is failed.`,
-              proposal: {
-                kind: 'dispatch_send_rejected',
-                action_type: proposal.type,
-                thread_ref: proposal.threadRef,
-                subject_key: dispatchSubjectKey,
-                journal_id: journalRow.id,
-                failure: failureReason,
-              },
-            }
-          );
-        } catch (pageError) {
-          log.error(
-            { err: pageError as Error, threadRef: proposal.threadRef },
-            'taskmaster.dispatch_send_rejected_page_failed'
-          );
-        }
+        await reportRejectedSend(deps, dal, nowMs, {
+          actionType: proposal.type,
+          threadRef: canonicalProposalRef,
+          subjectKey: dispatchSubjectKey,
+          idempotencyKey: proposal.idempotencyKey,
+          journalId: journalRow.id,
+          failure: failureReason,
+        });
       }
     }
   }

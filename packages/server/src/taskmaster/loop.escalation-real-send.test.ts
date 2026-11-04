@@ -19,6 +19,7 @@ import { join } from 'path';
 import { rootLogger } from '@archon/paths';
 import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
 import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
+import { gradeAction, recordAction } from '@archon/core/db/taskmaster';
 import { createTaskmasterState, tick, type ListedThread, type TaskmasterDeps } from './loop';
 
 const T0 = Date.parse('2026-11-04T12:00:00.000Z');
@@ -267,5 +268,80 @@ describe('Taskmaster P0 escalation, real Dispatch send', () => {
     // The P0 escalation on the same tick still delivered: one bad recipient
     // does not take the other sends down with it.
     expect(await dispatchRows()).toHaveLength(1);
+  });
+});
+
+/**
+ * Self-pause notice (fence 282): it sent subject_key 'taskmaster:self-pause',
+ * which the same validator refuses, through the fenced createAuthenticatedMessage
+ * overload. Trigger the real M-155 useful-rate floor with 20 real 'noise'
+ * grades in the real journal so the real tick self-pauses and sends it.
+ */
+describe('Taskmaster self-pause notice, real Dispatch send', () => {
+  async function seedNoiseGrades(): Promise<void> {
+    for (let i = 0; i < 20; i += 1) {
+      const row = await recordAction({
+        thread_ref: `gh:thinmansoftware/bdc-harness#${9000 + i}`,
+        action_type: 'nudge',
+        proposal_json: '{}',
+        idempotency_key: `tm:test-noise:${i}`,
+        outcome: 'sent',
+      });
+      await gradeAction(row.id, 'noise');
+    }
+  }
+
+  async function selfPauseRows(): Promise<{ subject_key: string | null; status: string }[]> {
+    const result = await getDatabase().query<{ subject_key: string | null; status: string }>(
+      "SELECT subject_key, status FROM agent_dispatch_messages WHERE idempotency_key LIKE 'tm:self-pause:%'"
+    );
+    return [...result.rows];
+  }
+
+  test('self_pause_notice_delivers', async () => {
+    await seedNoiseGrades();
+    const pages: string[] = [];
+    // Real wall clock: the floor's lookback starts at tm_control.updated_at.
+    const clock = { nowMs: Date.now() + 60_000 };
+    const deps = { ...realDeps(GH_REF, clock, pages), listThreads: async () => [] };
+    await tick(createTaskmasterState(60_000), deps);
+
+    const today = new Date(clock.nowMs).toISOString().slice(0, 10);
+    expect(await selfPauseRows()).toEqual([{ subject_key: `digest:${today}`, status: 'queued' }]);
+    expect(pages).toEqual([]);
+  });
+
+  test('self_pause_rejection_is_loud', async () => {
+    await seedNoiseGrades();
+    await getDatabase().query(
+      "UPDATE dispatch_principals SET active = 0 WHERE principal_id = 'duty-officer'"
+    );
+    const pages: string[] = [];
+    const clock = { nowMs: Date.now() + 60_000 };
+    const deps = { ...realDeps(GH_REF, clock, pages), listThreads: async () => [] };
+    const logs = captureLogs();
+    try {
+      await tick(createTaskmasterState(60_000), deps);
+    } finally {
+      logs.stop();
+    }
+
+    expect(await selfPauseRows()).toEqual([]);
+    const rejected = logs.lines.filter(
+      line =>
+        line.includes('"msg":"taskmaster.dispatch_send_rejected"') &&
+        line.includes('"threadRef":"taskmaster:self-pause"')
+    );
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toContain('dispatch_recipient_rejected:');
+    const selfPausePages = pages.filter(text => text.includes('taskmaster:self-pause'));
+    expect(selfPausePages).toHaveLength(1);
+    const pageRows = (await journal()).filter(
+      r => r.thread_ref === 'dispatch-send-rejected:taskmaster:self-pause'
+    );
+    expect(pageRows.map(r => r.outcome)).toEqual(['sent']);
+    expect(String(JSON.parse(pageRows[0]!.proposal_json).failure)).toStartWith(
+      'dispatch_recipient_rejected:'
+    );
   });
 });
