@@ -5,6 +5,7 @@
  * one commit behind, and a lane YAML that the newer commit changes.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { readFileSync } from 'fs';
 import { execFileSync } from 'child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
@@ -12,7 +13,12 @@ import { join } from 'path';
 import { getArchonWorkspacesPath } from '@archon/paths';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
 import { loadConfig } from '../config/config-loader';
-import { syncManagedSourceBeforeDiscovery, isManagedSourceClone } from './dispatch-discovery-sync';
+import {
+  syncManagedSourceBeforeDiscovery,
+  isManagedSourceClone,
+  withSyncedManagedSource,
+  setDiscoverySyncLoggerForTest,
+} from './dispatch-discovery-sync';
 
 const LANE = 'sync-probe-lane';
 
@@ -103,5 +109,111 @@ describe('dispatch discovery sync (A2 engages all repos)', () => {
     git(clone, 'remote', 'set-url', 'origin', join(root, 'does-not-exist.git'));
     const result = await syncManagedSourceBeforeDiscovery(clone, clone);
     expect(result).toBeUndefined();
+  });
+
+  function captureLog(): {
+    errors: Array<Record<string, unknown> & { msg: string }>;
+    restore: () => void;
+  } {
+    const errors: Array<Record<string, unknown> & { msg: string }> = [];
+    const stub = {
+      error: (obj: Record<string, unknown>, msg: string) => errors.push({ ...obj, msg }),
+      warn: () => undefined,
+      info: () => undefined,
+      debug: () => undefined,
+    };
+    setDiscoverySyncLoggerForTest(stub as never);
+    return { errors, restore: () => setDiscoverySyncLoggerForTest(undefined) };
+  }
+
+  function laneFile(): string {
+    return join(clone, '.archon', 'workflows', `${LANE}.yaml`);
+  }
+
+  test('concurrent_dispatch_does_not_reset_mid_discovery', async () => {
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const gate = new Promise<void>(resolve => {
+      releaseFirst = resolve;
+    });
+    let firstReads: string[] = [];
+    let firstStarted!: () => void;
+    const started = new Promise<void>(resolve => {
+      firstStarted = resolve;
+    });
+
+    const first = withSyncedManagedSource(clone, clone, async () => {
+      order.push('first:start');
+      const before = readFileSync(laneFile(), 'utf8');
+      firstStarted();
+      await gate; // the first dispatch is still reading its workflow YAML
+      const after = readFileSync(laneFile(), 'utf8');
+      firstReads = [before, after];
+      order.push('first:end');
+    });
+    await started;
+
+    // origin moves again while the first dispatch is mid-read
+    writeFileSync(join(seed, '.archon', 'workflows', `${LANE}.yaml`), laneYaml('NEWER'));
+    git(seed, 'commit', '-q', '-am', 'newer lane');
+    git(seed, 'push', '-q', 'origin', 'dev');
+
+    const second = withSyncedManagedSource(clone, clone, async () => {
+      order.push('second:start');
+      return readFileSync(laneFile(), 'utf8');
+    });
+    // give a racing second dispatch every chance to reset the clone under the first
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    releaseFirst();
+    await first;
+    const secondRead = await second;
+
+    expect(firstReads[0]).toContain('NEW');
+    expect(firstReads[1]).toBe(firstReads[0]); // consistent tree for the first dispatch
+    expect(firstReads[1]).not.toContain('NEWER');
+    expect(order).toEqual(['first:start', 'first:end', 'second:start']); // second waited
+    expect(secondRead).toContain('NEWER'); // and then saw the reset to the latest origin
+  }, 60000);
+
+  test('dirty_clone_not_reset_logs_error', async () => {
+    const dirtyPath = join(clone, '.archon', 'workflows', `${LANE}.yaml`);
+    const dirtyContent = laneYaml('LOCAL-EDIT');
+    writeFileSync(dirtyPath, dirtyContent);
+    const headBefore = git(clone, 'rev-parse', 'HEAD');
+    const cap = captureLog();
+    try {
+      const result = await syncManagedSourceBeforeDiscovery(clone, clone);
+      expect(result).toBeUndefined();
+      expect(git(clone, 'rev-parse', 'HEAD')).toBe(headBefore);
+      expect(readFileSync(dirtyPath, 'utf8')).toBe(dirtyContent); // local edit survived
+      const refused = cap.errors.find(e => e.msg.includes('discovery_sync.refused_local_state'));
+      expect(refused).toBeDefined();
+      expect(refused?.dirtyEntries).toBe(1);
+      expect(refused?.unpushedCommits).toBe(0);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  test('local_commit_clone_not_reset_logs_error', async () => {
+    git(clone, 'config', 'user.email', 't@t');
+    git(clone, 'config', 'user.name', 't');
+    writeFileSync(join(clone, 'local-only.txt'), 'local work');
+    git(clone, 'add', '-A');
+    git(clone, 'commit', '-q', '-m', 'local only commit');
+    const headBefore = git(clone, 'rev-parse', 'HEAD');
+    const cap = captureLog();
+    try {
+      const result = await syncManagedSourceBeforeDiscovery(clone, clone);
+      expect(result).toBeUndefined();
+      expect(git(clone, 'rev-parse', 'HEAD')).toBe(headBefore);
+      expect(git(clone, 'cat-file', '-t', headBefore)).toBe('commit');
+      const refused = cap.errors.find(e => e.msg.includes('discovery_sync.refused_local_state'));
+      expect(refused).toBeDefined();
+      expect(refused?.unpushedCommits).toBe(1);
+      expect(refused?.dirtyEntries).toBe(0);
+    } finally {
+      cap.restore();
+    }
   });
 });

@@ -35,7 +35,7 @@ import type { ProviderName } from '@archon/providers/auth-refresh';
 import { AuthRefreshedRetryNeeded } from './auth-retry-sentinel';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { syncArchonToWorktree } from '../utils/worktree-sync';
-import { syncManagedSourceBeforeDiscovery } from './dispatch-discovery-sync';
+import { withSyncedManagedSource } from './dispatch-discovery-sync';
 import { syncWorkspace, toRepoPath } from '@archon/git';
 import type { WorkspaceSyncResult } from '@archon/git';
 import { discoverWorkflowsWithConfig } from '@archon/workflows/workflow-discovery';
@@ -1747,25 +1747,29 @@ async function discoverWorkflowForCodebase(
   | { ok: true; workflow?: WorkflowDefinition; loadError?: WorkflowLoadError }
   | { ok: false; error: Error }
 > {
-  // Callers pass codebase.default_cwd; reset a managed clone before discovery.
-  await syncManagedSourceBeforeDiscovery(workflowCwd, workflowCwd);
-  try {
-    await syncArchonToWorktree(workflowCwd);
-  } catch (error) {
-    getLog().debug({ err: error as Error, workflowCwd }, 'workflow_sync_before_direct_run_failed');
-  }
+  // Callers pass codebase.default_cwd; reset a managed clone and discover under one lock.
+  return withSyncedManagedSource(workflowCwd, workflowCwd, async () => {
+    try {
+      await syncArchonToWorktree(workflowCwd);
+    } catch (error) {
+      getLog().debug(
+        { err: error as Error, workflowCwd },
+        'workflow_sync_before_direct_run_failed'
+      );
+    }
 
-  try {
-    const discovery = await discoverWorkflowsWithConfig(workflowCwd, loadConfig);
-    const workflows = discovery.workflows.map(w => w.workflow);
-    return {
-      ok: true,
-      workflow: resolveWorkflowByName(workflowName, workflows),
-      loadError: workflowLoadErrorForName(workflowName, discovery.errors),
-    };
-  } catch (error) {
-    return { ok: false, error: error as Error };
-  }
+    try {
+      const discovery = await discoverWorkflowsWithConfig(workflowCwd, loadConfig);
+      const workflows = discovery.workflows.map(w => w.workflow);
+      return {
+        ok: true as const,
+        workflow: resolveWorkflowByName(workflowName, workflows),
+        loadError: workflowLoadErrorForName(workflowName, discovery.errors),
+      };
+    } catch (error) {
+      return { ok: false as const, error: error as Error };
+    }
+  });
 }
 
 /**
@@ -2024,21 +2028,21 @@ async function handleWorkflowRunCommand(
       'workflow_codebase_bound'
     );
     const workflowCwd = conversation.cwd ?? codebase.default_cwd;
-    // Sync a managed source clone to origin BEFORE discovery so a fire right after a
-    // dev merge loads the merged lane (WO-HARNESS-A2-ENGAGES-ALL-REPOS-01).
-    await syncManagedSourceBeforeDiscovery(workflowCwd, codebase.default_cwd);
-    try {
-      await syncArchonToWorktree(workflowCwd);
-    } catch (error) {
-      getLog().debug(
-        { err: error as Error, workflowCwd },
-        'workflow_sync_before_validation_failed'
-      );
-    }
-
+    // Sync a managed source clone to origin BEFORE discovery, and hold one lock across
+    // the reset and the read (WO-HARNESS-A2-ENGAGES-ALL-REPOS-01).
     let discovery;
     try {
-      discovery = await discoverWorkflowsWithConfig(workflowCwd, loadConfig);
+      discovery = await withSyncedManagedSource(workflowCwd, codebase.default_cwd, async () => {
+        try {
+          await syncArchonToWorktree(workflowCwd);
+        } catch (error) {
+          getLog().debug(
+            { err: error as Error, workflowCwd },
+            'workflow_sync_before_validation_failed'
+          );
+        }
+        return discoverWorkflowsWithConfig(workflowCwd, loadConfig);
+      });
     } catch (error) {
       const err = error as Error;
       getLog().error({ err, cwd: workflowCwd }, 'workflow_discovery_failed');
