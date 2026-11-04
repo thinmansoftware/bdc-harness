@@ -784,6 +784,111 @@ assert_contains "UNPARSED is 0" "UNPARSED${TAB}0" "$R2D"
 assert_contains "DECLARED is 1" "DECLARED${TAB}1" "$R2D"
 named_end counted_then_foreign_each_keep_their_own_expected
 
+# ---------------------------------------------------------------------------
+# Round 3 (Overseer CHANGES_REQUESTED at e321afc1, two majors): a command word ends at a space
+# OR a tab, and EVERY command start (counted, foreign, inline backticked) closes the pending
+# command as unparsed through the one begin_command function.
+# ---------------------------------------------------------------------------
+echo "--- tab_separated_command_is_counted ---"
+named_begin
+TTAB="$(cd "$HERE" && printf '## 8. Stop conditions\n\nStop 1 (tabbed):\n  grep\t-c x f\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "tab-separated grep is emitted (tab normalised to a space) with eq 1" "grep -c x f${TAB}eq${TAB}1" "$TTAB"
+assert_contains "DECLARED is 1" "DECLARED${TAB}1" "$TTAB"
+assert_contains "UNPARSED is 0" "UNPARSED${TAB}0" "$TTAB"
+TTMP="$(mktemp -d)"
+printf 'x\n' > "$TTMP/f"
+TTABR="$(cd "$TTMP" && printf '## 8. Stop conditions\n\nStop 1 (tabbed):\n  grep\t-c x f\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract | rsg_run)"
+assert_eq "tab-separated grep: GREP_DECLARED=1" "1" "$(kv GREP_DECLARED "$TTABR")"
+assert_eq "tab-separated grep is executed" "1" "$(kv GREP_EXECUTED "$TTABR")"
+assert_eq "tab-separated grep passes" "passed" "$(kv GREP_STATUS "$TTABR")"
+for form in 'LC_ALL=C\tgrep -c x f' 'cd\t.\t&&\tgrep -c x f' 'test\t-f f' '- grep\t-c x f' '`grep\t-c x f`'; do
+  TF="$(printf "## 8. Stop conditions\n\nStop 1 (tabbed):\n  $form\n  Expected: 1\n" | RSG_STAGE_REPO=x/y rsg_extract)"
+  assert_contains "tab form is counted: $form" "DECLARED${TAB}1" "$TF"
+done
+TBK="$(printf '## 8. Stop conditions\n\ngrep\t-c x f.ts\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "a bare tab-separated command outside a block is the uncounted backstop" "UNPARSED${TAB}1${TAB}grep -c x f.ts" "$TBK"
+rm -rf "$TTMP"
+named_end tab_separated_command_is_counted
+
+echo "--- inline_command_closes_a_pending_command ---"
+named_begin
+INL="$(printf '## 8. Stop conditions\n\nStop 1 (inline after pending):\n  grep -c missing f\n- `grep -c x f` returns 1\n  Expected: 0\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "the earlier pending command is UNPARSED" "UNPARSED${TAB}1${TAB}grep -c missing f" "$INL"
+assert_contains "the inline command keeps its own inline expectation" "grep -c x f${TAB}eq${TAB}1" "$INL"
+assert_eq "the final Expected: 0 is not paired with the earlier command" "0" "$(printf '%s\n' "$INL" | grep -c "grep -c missing f${TAB}" || true)"
+assert_contains "DECLARED is 2" "DECLARED${TAB}2" "$INL"
+INL2="$(printf '## 8. Stop conditions\n\nStop 1 (two inlines):\n  grep -c a f\n- `grep -c b f` returns 2\n- `grep -c c f`\n  Expected: 3\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "a backticked command with no inline expectation pairs with the next Expected" "grep -c c f${TAB}eq${TAB}3" "$INL2"
+assert_contains "and the first pending grep is unparsed" "UNPARSED${TAB}1${TAB}grep -c a f" "$INL2"
+named_end inline_command_closes_a_pending_command
+
+echo "--- every_counted_command_pairs_with_its_own_expected_or_is_unparsed (mixed-sequence table + seeded fuzz) ---"
+named_begin
+export RSG_STAGE_REPO=thinmansoftware/fuzz-none
+fz_close() {
+  # close a pending counted command as unparsed (the invariant under test)
+  case "$FZ_PENDING" in zq*) FZ_UNP="$FZ_UNP $FZ_PENDING"; FZ_ANYC=1 ;; esac
+}
+fz_check() {
+  # fz_check <tokens...>: render the sequence, compute the oracle, compare with rsg_extract
+  local k=0 t id n spec out expected_paired actual_paired expected_unp actual_unp line hdr_exp="" label="$*"
+  FZ_PENDING=""; FZ_UNP=""; FZ_ANYC=0; FZ_ANYE=0
+  local paired=""
+  spec=$'## 8. Stop conditions\n\nStop 1 (fuzz):\n'
+  for t in "$@"; do
+    k=$((k + 1)); id="zq${k}zq"
+    case "$t" in
+      C)  spec="$spec  grep -c $id f"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      T)  spec="$spec  grep${TAB}-c $id f"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      BL) spec="$spec- grep -c $id f"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      BQ) spec="$spec  \`grep -c $id f\`"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      F)  spec="$spec  curl -s https://x.test/$k"$'\n'; fz_close; FZ_PENDING=FOREIGN ;;
+      I)  n=$((100 + k)); spec="$spec- \`grep -c $id f\` returns $n"$'\n'; fz_close; paired="$paired $id=$n"; FZ_ANYC=1; FZ_PENDING="" ;;
+      E)  spec="$spec  Expected: $k"$'\n'; FZ_ANYE=1
+          case "$FZ_PENDING" in zq*) paired="$paired ${FZ_PENDING}=$k"; FZ_ANYC=1 ;; esac
+          FZ_PENDING="" ;;
+      B)  spec="$spec"$'\n' ;;
+      P)  spec="$spec  note that this matters"$'\n' ;;
+    esac
+  done
+  case "$FZ_PENDING" in zq*) FZ_UNP="$FZ_UNP $FZ_PENDING"; FZ_ANYC=1 ;; esac
+  if [ "$FZ_ANYC" -eq 0 ] && [ "$FZ_ANYE" -eq 0 ]; then hdr_exp="Stop 1 (fuzz):"; fi
+  out="$(printf '%s' "$spec" | rsg_extract)"
+  expected_paired="$(printf '%s\n' $paired | sort | grep . || true)"
+  actual_paired="$(printf '%s\n' "$out" | while IFS= read -r line; do
+    case "$line" in *"${TAB}eq${TAB}"*)
+      printf '%s=%s\n' "$(printf '%s' "$line" | grep -o 'zq[0-9]*zq' | head -1)" "${line##*"${TAB}"}" ;;
+    esac
+  done | sort | grep . || true)"
+  expected_unp="$(printf '%s\n' $FZ_UNP | sort | grep . || true)"
+  actual_unp="$(printf '%s\n' "$out" | sed -n 's/^UNPARSED\t[0-9]*\t*//p' | grep -o 'zq[0-9]*zq' | sort | grep . || true)"
+  assert_eq "fuzz [$label] paired commands are exactly the oracle's" "$expected_paired" "$actual_paired"
+  assert_eq "fuzz [$label] unparsed commands are exactly the oracle's" "$expected_unp" "$actual_unp"
+  if [ -n "$hdr_exp" ]; then
+    assert_contains "fuzz [$label] a block with no command and no Expected names its header" "$hdr_exp" "$(printf '%s\n' "$out" | sed -n '/^UNPARSED/p')"
+  fi
+  local declared_exp=$(( $(printf '%s\n' $paired | grep -c . || true) + $(printf '%s\n' $FZ_UNP | grep -c . || true) + $([ -n "$hdr_exp" ] && echo 1 || echo 0) ))
+  assert_contains "fuzz [$label] DECLARED is paired + unparsed" "DECLARED${TAB}${declared_exp}" "$out"
+}
+FZ_TABLE=(
+  "C E" "T E" "BL E" "BQ E" "C F E" "C E F E" "I E" "C I E" "C I" "F E C E" "C B E" "C P E"
+  "C E E" "T I E" "BQ F E I" "E C" "C C E E" "F F E" "P B" "C" "I I E" "BQ BQ E" "T F I E" "B C B E B"
+)
+for seq in "${FZ_TABLE[@]}"; do
+  # shellcheck disable=SC2086
+  fz_check $seq
+done
+FZ_TOKENS=(C T BL BQ F I E E B P)
+RANDOM=4753
+for ((fzn = 0; fzn < 60; fzn++)); do
+  fzlen=$((RANDOM % 8 + 2)); fzseq=""
+  for ((fzi = 0; fzi < fzlen; fzi++)); do fzseq="$fzseq ${FZ_TOKENS[RANDOM % ${#FZ_TOKENS[@]}]}"; done
+  # shellcheck disable=SC2086
+  fz_check $fzseq
+done
+unset RSG_STAGE_REPO
+named_end every_counted_command_pairs_with_its_own_expected_or_is_unparsed
+
 echo
 echo "run-stop-greps.sh: $PASS passed, $FAIL failed (PASS=$PASS FAIL=$FAIL)"
 [ "$FAIL" -eq 0 ]

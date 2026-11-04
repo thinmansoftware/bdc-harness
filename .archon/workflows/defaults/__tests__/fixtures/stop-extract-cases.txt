@@ -372,3 +372,26 @@ grep -c x f	eq	1
 UNPARSED	0
 DECLARED	1
 @@END
+@@CASE tab_separated_command
+## 8. Stop conditions
+
+Stop 1 (tabbed):
+  grep	-c x f
+  Expected: 1
+@@EXPECT
+grep -c x f	eq	1
+UNPARSED	0
+DECLARED	1
+@@END
+@@CASE inline_command_closes_pending
+## 8. Stop conditions
+
+Stop 1 (inline after pending):
+  grep -c missing f
+- `grep -c x f` returns 1
+  Expected: 0
+@@EXPECT
+grep -c x f	eq	1
+UNPARSED	1	grep -c missing f
+DECLARED	2
+@@END

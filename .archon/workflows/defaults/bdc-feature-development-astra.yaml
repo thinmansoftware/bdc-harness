@@ -2589,11 +2589,14 @@ nodes:
       #        and unparsed, named by its header text; R7 a legacy "Stop N (grep" or "Stop N
       #        (assert" header counts anywhere in the spec and every command-like line before its
       #        Expected is an assertion whatever its first word; R8 the second shape (a backticked
-      #        read-only command followed by its expectation in prose) is kept; inside a block it
-      #        applies only when the expectation is on the same line, otherwise the command is the
-      #        pending command for the next Expected line; any new command line, counted or foreign
-      #        (curl, ssh, sh, ...), first closes a pending counted command as unparsed and a
-      #        foreign command keeps its own Expected line; R9 a bare (not backticked) line in the section but outside any block
+      #        read-only command followed by its expectation in prose) is kept; inside a block the
+      #        backticked command starts a command like any other line and is complete only when its
+      #        expectation is on the same line, otherwise it is the pending command for the next
+      #        Expected line; EVERY command start (counted line, foreign line such as curl or ssh,
+      #        inline backticked command) goes through one function, begin_command, which first
+      #        closes any pending command as unparsed, so an Expected line is only ever paired with
+      #        the command directly before it; a foreign command keeps its own Expected line;
+      #        command words end at a space OR a tab; R9 a bare (not backticked) line in the section but outside any block
       #        whose first word is grep, egrep, fgrep, rg, git grep, node, bun, bunx, npm, npx,
       #        wc or "test -" is an uncounted command line: declared and unparsed, so
       #        none_declared can no longer sit next to an uncounted command line.
@@ -2617,7 +2620,9 @@ nodes:
           cur="$(git remote get-url origin 2>/dev/null | sed -E 's#[.]git$##; s#^.*[:/]([^/:]+/[^/]+)$#\1#' || true)"
         fi
         awk -v cur="$cur" '
-          function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
+          # Tabs inside a command become spaces: the output is a tab separated record, and a tab in
+          # the command would cut it short in rsg_run.
+          function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); gsub(/\t/, " ", s); return s }
           function unbullet(s) { sub(/^([-*]|[0-9]+[.)])[ \t]+/, "", s); return s }
           function note_uncounted(name) {
             if (name == "") name = "unnamed grep stop condition"
@@ -2633,8 +2638,20 @@ nodes:
             return op "\t" n
           }
           function iscmd(c) {
-            while (c ~ /^cd [^ ]+ && /) sub(/^cd [^ ]+ && /, "", c)
-            return (c ~ /^(LC_ALL=[^ ]+ |LANG=[^ ]+ )*((grep|egrep|fgrep|rg|find|wc|cat|head|tail|sort|cut|tr|uniq|ls|git|node|bun|bunx|npm|npx)( |$)|test -|\[ )/)
+            while (c ~ /^cd[ \t]+[^ \t]+[ \t]+&&[ \t]+/) sub(/^cd[ \t]+[^ \t]+[ \t]+&&[ \t]+/, "", c)
+            return (c ~ /^((LC_ALL|LANG)=[^ \t]+[ \t]+)*((grep|egrep|fgrep|rg|find|wc|cat|head|tail|sort|cut|tr|uniq|ls|git|node|bun|bunx|npm|npx)([ \t]|$)|test[ \t]+-|\[[ \t])/)
+          }
+          function isforeign(c) {
+            return (c ~ /^(ssh|scp|sh|bash|zsh|docker|curl|wget|gh|psql|sqlite3|python|python3|pip|make|cargo|go|pnpm|yarn|deno|jq|sed|awk|xargs|echo|printf|sudo|env|systemctl|journalctl|kill|rm|cp|mv|mkdir|touch|chmod|tee)([ \t]|$)/ || c ~ /^[a-z][a-z0-9_.\/-]*[ \t]+-/ || c ~ /^[A-Z][0-9]+:/ || c ~ /^\.\//)
+          }
+          # A command-like pending line that no Expected line has paired yet.
+          function open_pending() { return (pending != "" && (iscmd(pending) || (legacy && bexp == 0))) }
+          # THE one place a command starts (counted line, foreign line, inline backticked command):
+          # whatever command was still pending is closed as UNPARSED first, so an Expected line can
+          # never be paired with a command other than the one directly before it.
+          function begin_command(c) {
+            if (open_pending()) { declared++; bcmds++; note_uncounted(pending) }
+            pending = c
           }
           function handle(cmd, ex,   e) {
             if (legacy || iscmd(cmd)) {
@@ -2645,14 +2662,21 @@ nodes:
             bexp++
           }
           function second_gate(s) {
-            return (s ~ /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)( |`)/)
+            return (s ~ /`((LC_ALL|LANG)=C[ \t]+)?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)([ \t]|`)/)
           }
-          function second(s,   g, rest, e) {
-            if (!match(s, /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)[^`]*`/)) return 0
-            g = substr(s, RSTART + 1, RLENGTH - 2); rest = substr(s, RSTART + RLENGTH)
+          # Splits the first backticked read-only command off a line: BTCMD is the command, BTREST
+          # the text after its closing backtick.
+          function bt_split(s) {
+            if (!match(s, /`((LC_ALL|LANG)=C[ \t]+)?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)[^`]*`/)) return 0
+            BTCMD = substr(s, RSTART + 1, RLENGTH - 2); BTREST = substr(s, RSTART + RLENGTH)
+            gsub(/\t/, " ", BTCMD)
+            return 1
+          }
+          function second(s,   e) {
+            if (!bt_split(s)) return 0
             declared++
-            e = expect(rest)
-            if (e != "") { print g "\t" e; parsed++ } else { note_uncounted(g) }
+            e = expect(BTREST)
+            if (e != "") { print BTCMD "\t" e; parsed++ } else { note_uncounted(BTCMD) }
             return 1
           }
           function repo_known(r,   i) { for (i = 1; i <= nrepo; i++) if (tolower(repos[i]) == tolower(r)) return 1; return 0 }
@@ -2668,33 +2692,21 @@ nodes:
             for (i = 1; i <= nrepo; i++) if (index(low, tolower(repos[i])) > 0) return repos[i]
             return ""
           }
-          function second_inline(s,   g, rest, e) {
-            if (!match(s, /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)[^`]*`/)) return 0
-            g = substr(s, RSTART + 1, RLENGTH - 2); rest = substr(s, RSTART + RLENGTH)
-            e = expect(rest)
-            if (e == "") return 0
-            declared++
-            print g "\t" e; parsed++
-            return 1
-          }
-          function isforeign(c) {
-            return (c ~ /^(ssh|scp|sh|bash|zsh|docker|curl|wget|gh|psql|sqlite3|python|python3|pip|make|cargo|go|pnpm|yarn|deno|jq|sed|awk|xargs|echo|printf|sudo|env|systemctl|journalctl|kill|rm|cp|mv|mkdir|touch|chmod|tee)( |$)/ || c ~ /^[a-z][a-z0-9_.\/-]* +-/ || c ~ /^[A-Z][0-9]+:/ || c ~ /^\.\//)
-          }
           function flush() {
             if (!inblk) return
             if (oth) { }
-            else if (pending != "" && (iscmd(pending) || (legacy && bexp == 0))) { declared++; note_uncounted(pending) }
-            else if (!excl && !oth && bcmds == 0 && (legacy || bexp == 0)) { declared++; note_uncounted(hdr) }
+            else if (open_pending()) { declared++; note_uncounted(pending) }
+            else if (!excl && bcmds == 0 && (legacy || bexp == 0)) { declared++; note_uncounted(hdr) }
             inblk = 0; pending = ""
           }
           !inblk && /^[ \t-]*repo:[ \t]*[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/ {
             r = $0; sub(/^[ \t-]*repo:[ \t]*/, "", r); sub(/[ \t].*$/, "", r)
             if (!repo_known(r)) { nrepo++; repos[nrepo] = r }
           }
-          /^[ \t]*[*_]*[Ss]top [0-9A-Za-z.]+[ \t]*[(:]/ && (insec || $0 ~ /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/) {
+          /^[ \t]*[*_]*[Ss]top[ \t]+[0-9A-Za-z.]+[ \t]*[(:]/ && (insec || $0 ~ /^[ \t]*[*]*[Ss]top[ \t]+[0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/) {
             flush(); inblk = 1; hdr = clean($0); l = tolower(hdr)
-            legacy = ($0 ~ /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/)
-            excl = (l ~ /^[ \t]*[*_]*stop [0-9a-z.]+[ \t]*[(:][ \t]*(test|unit|suite)/)
+            legacy = ($0 ~ /^[ \t]*[*]*[Ss]top[ \t]+[0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/)
+            excl = (l ~ /^[ \t]*[*_]*stop[ \t]+[0-9a-z.]+[ \t]*[(:][ \t]*(test|unit|suite)/)
             bexp = 0; bcmds = 0; pending = ""; bl = 0
             oth = 0; othtag = ""
             if (cur != "" && !excl) {
@@ -2713,9 +2725,14 @@ nodes:
           }
           inblk {
             if ($0 ~ /^[ \t]*```/) next
-            if (insec && second_gate($0)) {
+            if (insec && second_gate($0) && $0 !~ /^[ \t]*([-*][ \t]+)?[Ee]xpected:/) {
               if (tolower($0) ~ /baseline|untouched tree|before the fix|before this wo/) next
-              if (second_inline($0)) { bcmds++; next }
+              if (bt_split($0)) {
+                begin_command(BTCMD)
+                e = expect(BTREST)
+                if (e != "") { declared++; bcmds++; print BTCMD "\t" e; parsed++; pending = "" }
+                next
+              }
             }
             line = clean($0)
             if (line == "") next
@@ -2726,14 +2743,7 @@ nodes:
               pending = ""; next
             }
             if (pending != "" && pending ~ /\\$/) { sub(/[ \t]*\\$/, "", pending); pending = pending " " line; next }
-            if (iscmd(line)) {
-              if (pending != "" && (iscmd(pending) || (legacy && bexp == 0))) { declared++; note_uncounted(pending) }
-              pending = line; next
-            }
-            if (isforeign(line)) {
-              if (pending != "" && (iscmd(pending) || (legacy && bexp == 0))) { declared++; note_uncounted(pending) }
-              pending = line; next
-            }
+            if (iscmd(line) || isforeign(line)) { begin_command(line); next }
             if (legacy && bexp == 0 && pending != "" && !iscmd(pending)) { pending = pending " " line; next }
             if (pending == "" || !iscmd(pending)) pending = line
             next
@@ -2746,7 +2756,7 @@ nodes:
           }
           insec && $0 !~ /`/ {
             line = unbullet(clean($0))
-            if (line ~ /^(grep|egrep|fgrep|rg|git grep|node|bun|bunx|npm|npx|wc)( |$)|^test -/) { declared++; note_uncounted(line) }
+            if (line ~ /^(grep|egrep|fgrep|rg|git[ \t]+grep|node|bun|bunx|npm|npx|wc)([ \t]|$)|^test[ \t]+-/) { declared++; note_uncounted(line) }
           }
           END {
             flush()
