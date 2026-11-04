@@ -426,10 +426,18 @@ async function runGit(cwd: string, args: string[]): Promise<string> {
   return stdout.trim();
 }
 
-async function initCheckout(): Promise<{ dir: string; head: string }> {
+/**
+ * standIn: true pins the checkout to tmpdir even when the production UID-1002
+ * broker is ready (inside archon-app-1, where Cauldron runs these tests). Use it
+ * for scenarios the real broker cannot produce; see the zero-exit edit test.
+ */
+async function initCheckout(
+  options: { standIn?: boolean } = {}
+): Promise<{ dir: string; head: string }> {
   const productionSpool = '/var/lib/overseer-review';
   let parent = tmpdir();
   try {
+    if (options.standIn) throw new Error('stand_in_requested');
     await access(join(productionSpool, 'ready'));
     parent = join(productionSpool, 'test-checkouts');
     await mkdir(parent, { recursive: true });
@@ -469,8 +477,11 @@ function approveResult(headSha: string): {
 
 const stubOctokit = { pulls: {} } as unknown as RealGitHubOctokitLike;
 
-async function startBrokerHarness(): Promise<{ stop: () => Promise<void> }> {
+async function startBrokerHarness(
+  options: { standIn?: boolean } = {}
+): Promise<{ stop: () => Promise<void> }> {
   try {
+    if (options.standIn) throw new Error('stand_in_requested');
     await access('/var/lib/overseer-review/ready');
     const previous = process.env.OVERSEER_REVIEW_SPOOL;
     process.env.OVERSEER_REVIEW_SPOOL = '/var/lib/overseer-review';
@@ -549,6 +560,7 @@ async function reviewObservedCheckout(input: {
   checkPlan: ReadonlyArray<readonly string[]>;
   evaluate?: () => Promise<ReturnType<typeof approveResult>>;
   broker?: boolean;
+  standIn?: boolean;
 }): Promise<{
   disposition: string;
   reason?: string;
@@ -556,7 +568,8 @@ async function reviewObservedCheckout(input: {
   proofRecords: number;
   evaluated: boolean;
 }> {
-  const broker = input.broker === false ? undefined : await startBrokerHarness();
+  const broker =
+    input.broker === false ? undefined : await startBrokerHarness({ standIn: input.standIn });
   const posts: string[] = [];
   let proofRecords = 0;
   let evaluated = false;
@@ -795,13 +808,21 @@ describe.serial('observed checkout integrity and check environment', () => {
   test.skipIf(!linux)(
     'a zero-exit check that edits a tracked file cannot qualify the head',
     async () => {
-      const checkout = await initCheckout();
+      // This scenario needs a check that exits 0 AFTER writing a tracked file.
+      // The production broker (scripts/overseer-reviewer-broker.ts) runs checks
+      // through `codex sandbox` against the sealed checkout, which is read-only
+      // for the reviewer, so there the write never lands and allowed.txt keeps
+      // its fixture content: the zero-exit edit path is never reached. Cauldron
+      // runs this suite inside archon-app-1, where that broker is ready. Pin the
+      // in-process stand-in so this test exercises the same path everywhere.
+      const checkout = await initCheckout({ standIn: true });
       const tracker = installSandboxSimulation(true);
       try {
         const result = await reviewObservedCheckout({
           dir: checkout.dir,
           head: checkout.head,
           checkPlan: [['/bin/sh', '-c', 'printf x >> allowed.txt']],
+          standIn: true,
         });
         expect(tracker.sandboxSpawns).toHaveLength(0);
         expect(await readFile(join(checkout.dir, 'allowed.txt'), 'utf8')).toContain('x');
