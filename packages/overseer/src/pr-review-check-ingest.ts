@@ -310,16 +310,32 @@ function parseReviewFindingLines(
 /** Severities that block a verdict; minor and note are advisory. */
 const BLOCKING_SEVERITIES = new Set(['blocker', 'major']);
 
-const REQUIRED_CHECK_SCOPE_RE = /^required\s+checks?\s*(?:\/|:|\s)\s*(.+)$/i;
-const BARE_REQUIRED_CHECK_SCOPE_RE = /^required\s+checks?$/i;
+const REQUIRED_CHECK_WORD = 'required check';
 
+function isAsciiDigits(text: string): boolean {
+  if (text.length === 0) return false;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 48 || code > 57) return false;
+  }
+  return true;
+}
+
+/**
+ * Normalise a check name taken from a finding scope. Every step is linear in
+ * the input (redos-guard.test.ts feeds hostile whitespace runs here; CodeQL
+ * js/polynomial-redos flagged the earlier regex form).
+ */
 function cleanCheckName(raw: string): string | null {
   let name = raw.trim();
   const failedAt = name.search(/\sfailed\b/i);
-  if (failedAt !== -1) name = name.slice(0, failedAt);
+  if (failedAt !== -1) name = name.slice(0, failedAt).trim();
   // A trailing numeric check-run id, e.g. "CE Promotion Gate (126186742456)".
   // A matrix cell such as "(windows-latest)" is part of the name and is kept.
-  name = name.replace(/\s*\(\d+\)\s*$/, '').trim();
+  if (name.endsWith(')')) {
+    const open = name.lastIndexOf('(');
+    if (open !== -1 && isAsciiDigits(name.slice(open + 1, -1))) name = name.slice(0, open).trim();
+  }
   return name.length > 0 ? name : null;
 }
 
@@ -334,16 +350,31 @@ function cleanCheckName(raw: string): string | null {
  */
 export function checkNameFromFindingScope(scope: string, remainder = ''): string | null {
   const trimmed = scope.trim();
-  if (trimmed.toLowerCase().startsWith(CHECKS_SCOPE_PREFIX)) {
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith(CHECKS_SCOPE_PREFIX)) {
     return cleanCheckName(trimmed.slice(CHECKS_SCOPE_PREFIX.length));
   }
-  if (BARE_REQUIRED_CHECK_SCOPE_RE.test(trimmed)) {
+  if (!lower.startsWith(REQUIRED_CHECK_WORD)) return null;
+  let rest = trimmed.slice(REQUIRED_CHECK_WORD.length);
+  if (rest.startsWith('s') || rest.startsWith('S')) rest = rest.slice(1);
+  const afterWord = rest.trimStart();
+  if (afterWord.length === 0) {
+    // Bare "Required check(s)": the name follows the scope's colon.
     const colon = remainder.indexOf(':');
     if (colon === -1) return null;
     return cleanCheckName(remainder.slice(0, colon));
   }
-  const match = REQUIRED_CHECK_SCOPE_RE.exec(trimmed);
-  return match ? cleanCheckName(match[1] ?? '') : null;
+  // "Required checksum" and the like are not this form: a separator must follow.
+  if (
+    afterWord.length === rest.length &&
+    !afterWord.startsWith('/') &&
+    !afterWord.startsWith(':')
+  ) {
+    return null;
+  }
+  const separated =
+    afterWord.startsWith('/') || afterWord.startsWith(':') ? afterWord.slice(1) : afterWord;
+  return cleanCheckName(separated);
 }
 
 /**

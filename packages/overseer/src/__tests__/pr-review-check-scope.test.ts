@@ -122,3 +122,19 @@ test('Test 5: a green CE Promotion Gate queues a recheck for the #777 verdict', 
   expect(enqueued).toHaveLength(1);
   expect(receipts.some(r => r.disposition === 'ignored_no_authorizing_verdict')).toBe(false);
 });
+
+test('hostile free-text scopes stay linear (redos guard)', () => {
+  const pad = ' '.repeat(50_000);
+  const inputs = [
+    `[major] Required checks /${pad}x${pad}(1: y`,
+    `[major] Required check${pad}a${pad}): y`,
+    `[major] checks/a${pad}(${pad}`,
+  ];
+  for (const summary of inputs) {
+    const started = performance.now();
+    blockingCheckNamesFromVerdict(summary);
+    summaryNamesACheck(summary);
+    expect(performance.now() - started).toBeLessThan(100);
+  }
+  expect(checkNameFromFindingScope('Required checksum mismatch')).toBeNull();
+});
