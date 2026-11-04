@@ -152,6 +152,8 @@ export interface RecheckCheckRun {
   started_at?: string | null;
   completed_at?: string | null;
   app?: { slug?: string; name?: string };
+  /** One workflow execution = one check suite; used to recognise twin jobs. */
+  check_suite?: { id?: number } | null;
 }
 
 export interface RecheckIngestDeps {
@@ -409,28 +411,37 @@ function isSkippedRun(run: RecheckCheckRun): boolean {
   );
 }
 
-/**
- * One run per check name (and app). Two jobs in one workflow can share a check
- * name, one of them `if:`-gated off and therefore SKIPPED on every PR (anchor:
- * lspro-react ce-promotion-gate.yml, the dead PR #429 exemption twin). The
- * skipped twin is created after the real job, so newest-id alone picks it and
- * a required gate that actually ran reads as skipped. A run that was not
- * skipped therefore always wins over a skipped one; newest attempt decides
- * among runs on the same side. Only-skipped stays skipped.
- */
-function checkAttemptSupersedes(candidate: RecheckCheckRun, held: RecheckCheckRun): boolean {
-  const candidateSkipped = isSkippedRun(candidate);
-  const heldSkipped = isSkippedRun(held);
-  if (candidateSkipped !== heldSkipped) return heldSkipped;
-  return checkAttemptIsNewer(candidate, held);
+function checkSuiteId(run: RecheckCheckRun): number | undefined {
+  const id = run.check_suite?.id;
+  return typeof id === 'number' && Number.isFinite(id) ? id : undefined;
 }
 
+/**
+ * One run per check name (and app), newest attempt wins. Exception for twin
+ * jobs: two jobs in ONE workflow execution can share a check name, one of them
+ * `if:`-gated off and therefore SKIPPED (anchor: lspro-react
+ * ce-promotion-gate.yml, the dead PR #429 exemption twin). The skipped twin is
+ * created after the real job, so newest-id alone would pick it and a required
+ * gate that actually ran would read as skipped. So a SKIPPED run is set aside
+ * when a non-skipped run of the same name sits in the same check suite (one
+ * workflow execution). Across suites, recency is unchanged: a newer execution
+ * that legitimately skips the job still supersedes an older failure. Runs
+ * without a suite id are never treated as twins. Only-skipped stays skipped.
+ */
 export function latestAttemptPerCheck<T extends RecheckCheckRun>(runs: T[]): T[] {
+  const ranInSuite = new Set<string>();
+  for (const run of runs) {
+    const suite = checkSuiteId(run);
+    if (suite !== undefined && !isSkippedRun(run))
+      ranInSuite.add(`${checkAttemptKey(run)}#${suite}`);
+  }
   const latest = new Map<string, T>();
   for (const run of runs) {
     const key = checkAttemptKey(run);
+    const suite = checkSuiteId(run);
+    if (suite !== undefined && isSkippedRun(run) && ranInSuite.has(`${key}#${suite}`)) continue;
     const held = latest.get(key);
-    if (!held || checkAttemptSupersedes(run, held)) latest.set(key, run);
+    if (!held || checkAttemptIsNewer(run, held)) latest.set(key, run);
   }
   return [...latest.values()];
 }

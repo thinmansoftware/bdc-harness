@@ -286,6 +286,7 @@ export interface RealGitHubOctokitLike {
           started_at?: string | null;
           completed_at?: string | null;
           app?: { slug?: string; name?: string };
+          check_suite?: { id?: number } | null;
         }[];
       };
     }>;
@@ -616,6 +617,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
         started_at: run.started_at,
         completed_at: run.completed_at,
         app: run.app,
+        check_suite: run.check_suite,
       })),
       requiredContexts,
     };
@@ -933,6 +935,7 @@ interface ListedCheckRun {
   started_at?: string | null;
   completed_at?: string | null;
   app?: { slug?: string; name?: string };
+  check_suite?: { id?: number } | null;
 }
 
 /**
