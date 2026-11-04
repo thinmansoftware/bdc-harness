@@ -248,7 +248,7 @@ describe('WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01', () => {
     }
   });
 
-  test('Test 3: run reports and owner cards go to t3-desktop once', async () => {
+  test('Test 3: run reports and owner cards go to t3-desktop once (XO copy to operator)', async () => {
     const owners: Record<string, string | null> = {
       'WO-ROUTING-OWNED-01': 'Grok',
       'WO-ROUTING-ORPHAN-01': null,
@@ -330,7 +330,9 @@ describe('WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01', () => {
       kind: 'overseer_run_report',
       owner_seat: null,
     });
-    expect(await listMessages({ recipient: 'operator' })).toHaveLength(0);
+    // Fence 281: both cards are acting-xo, so each also has exactly one
+    // operator copy (redelivery of `owned` made no second one).
+    expect(await listMessages({ recipient: 'operator' })).toHaveLength(2);
     expect(await listMessages({ recipient: 'Grok' })).toHaveLength(0);
   });
 

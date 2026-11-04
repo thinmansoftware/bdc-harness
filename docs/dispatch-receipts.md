@@ -219,6 +219,12 @@ WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01. The cut-off is `OPERATOR_HISTORY_CUTOFF` 
 
 Rules:
 
+- Fence 281 (2026-11-04): an `overseer_run_report` whose `responsible_actor` is an XO principal
+  (`acting-xo`, `xo`, `operator`, or blank, which the body defaults to `acting-xo`) is written
+  to BOTH `t3-desktop` and `operator`. The two rows share `correlation_id` (the run id) and
+  `card_id`; the operator copy's idempotency key is the T3 key plus `:operator`. An XO-owned run
+  report never reaches only a T3 mailbox. Reports owned by any other actor go to `t3-desktop`
+  only, as before. Helper: `isXoResponsibleActor` in `packages/core/src/db/dispatch-routing.ts`.
 - No code path cancels, deletes, acknowledges or addresses an `operator` row created before
   the cut-off. The consumer compares `created_at` as an instant, so ISO and SQLite
   `YYYY-MM-DD HH:MM:SS` text both work. A stamp it cannot parse is treated as history.

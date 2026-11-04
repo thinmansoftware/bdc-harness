@@ -5,6 +5,7 @@ import {
   bindingUsedPercent,
   chooseHeadroomEntry,
   resolveEntryThreshold,
+  rungSeatSkip,
   seatForTier,
   type SeatReadingLike,
   type SeatUsageSnapshot,
@@ -428,5 +429,181 @@ describe('entry headroom', () => {
     expect(synthetic.changed).toBe(true);
     expect(synthetic.reason).toBe('seat_over_threshold:codex:83');
     expect(synthetic.seats).toEqual({ codex: 83, claude: 'UNKNOWN', cursor: 20 });
+  });
+});
+
+describe('entry headroom: codex credits and unmetered cursor', () => {
+  const LIVE_LADDER = [
+    { name: 'zero' },
+    { name: 'qwen' },
+    { name: 'cursor' },
+    { name: 'codex' },
+    { name: 'claude' },
+    { name: 'frontier' },
+  ];
+  const LIVE_REFUSED = ['glm', 'qwen'];
+  const coolClaude = measured([{ name: 'seven_day', used_percent: 45 }]);
+  const codexAt99 = (credits?: SeatReadingLike['credits']): SeatReadingLike => ({
+    limit_source: 'measured',
+    windows: [
+      { name: 'primary', used_percent: 10 },
+      { name: 'secondary', used_percent: 99 },
+    ],
+    ...(credits ? { credits } : {}),
+  });
+  const cursorUnknown: SeatReadingLike = { limit_source: 'UNKNOWN', windows: [] };
+
+  test('codex_99_with_credits_keeps_codex_entry', () => {
+    const result = choose({
+      picked: 'codex',
+      usage: { codex: codexAt99({ has_credits: true }), claude: coolClaude },
+    });
+    expect(result.entry).toBe('codex');
+    expect(result.changed).toBe(false);
+    expect(result.reason).toBe('seat_credits:codex:99');
+    expect(result.seats).toEqual({ codex: 99, claude: 45 });
+  });
+
+  test('codex_99_without_credits_still_steers_away', () => {
+    const noCredits = choose({
+      picked: 'codex',
+      usage: { codex: codexAt99(), claude: coolClaude },
+    });
+    expect(noCredits.entry).toBe('claude');
+    expect(noCredits.changed).toBe(true);
+    expect(noCredits.reason).toBe('seat_over_threshold:codex:99');
+
+    const zeroCredits = choose({
+      picked: 'codex',
+      usage: { codex: codexAt99({ has_credits: false }), claude: coolClaude },
+    });
+    expect(zeroCredits.entry).toBe('claude');
+    expect(zeroCredits.changed).toBe(true);
+    expect(zeroCredits.reason).toBe('seat_over_threshold:codex:99');
+  });
+
+  test('codex_credits_overage_blocked_steers_away', () => {
+    const result = choose({
+      picked: 'codex',
+      usage: {
+        codex: codexAt99({ has_credits: true, overage_limit_reached: true }),
+        claude: coolClaude,
+      },
+    });
+    expect(result.entry).toBe('claude');
+    expect(result.changed).toBe(true);
+    expect(result.reason).toBe('seat_over_threshold:codex:99');
+  });
+
+  test('cursor_unknown_is_headroom_destination', () => {
+    const result = choose({
+      picked: 'codex',
+      tiers: [{ name: 'codex' }, { name: 'claude' }, { name: 'cursor' }],
+      refusedTiers: [],
+      premiumTiers: [],
+      usage: {
+        codex: codexAt99(),
+        claude: measured([{ name: 'seven_day', used_percent: 90 }]),
+        cursor: cursorUnknown,
+      },
+    });
+    expect(result.entry).toBe('cursor');
+    expect(result.changed).toBe(true);
+    expect(result.reason).toBe('seat_over_threshold:codex:99');
+    expect(result.seats).toEqual({ codex: 99, claude: 90, cursor: 'UNKNOWN' });
+  });
+
+  test('codex_credits_is_headroom_destination', () => {
+    const result = choose({
+      picked: 'cursor',
+      tiers: LIVE_LADDER,
+      refusedTiers: LIVE_REFUSED,
+      usage: {
+        cursor: measured([{ name: 'monthly', used_percent: 90 }]),
+        codex: codexAt99({ has_credits: true }),
+        claude: measured([{ name: 'seven_day', used_percent: 95 }]),
+      },
+    });
+    expect(result.entry).toBe('codex');
+    expect(result.changed).toBe(true);
+    expect(result.reason).toBe('seat_over_threshold:cursor:90');
+  });
+
+  test('cursor_unknown_pick_kept_unmetered', () => {
+    const result = choose({
+      picked: 'cursor',
+      tiers: LIVE_LADDER,
+      refusedTiers: LIVE_REFUSED,
+      usage: { cursor: cursorUnknown, codex: codexAt99({ has_credits: true }), claude: coolClaude },
+    });
+    expect(result.entry).toBe('cursor');
+    expect(result.changed).toBe(false);
+    expect(result.reason).toBe('seat_unmetered:cursor');
+
+    // A missing cursor reading is not UNKNOWN-measured; it stays unknown.
+    const missing = choose({
+      picked: 'cursor',
+      tiers: LIVE_LADDER,
+      refusedTiers: LIVE_REFUSED,
+      usage: { codex: codexAt99(), claude: coolClaude },
+    });
+    expect(missing.entry).toBe('cursor');
+    expect(missing.changed).toBe(false);
+    expect(missing.reason).toBe('seat_unknown:cursor');
+  });
+
+  test('claude_unknown_still_not_headroom', () => {
+    const claudeUnknown: SeatReadingLike = {
+      limit_source: 'UNKNOWN',
+      windows: [{ name: 'five_hour', used_percent: 5 }],
+    };
+    const asDestination = choose({
+      picked: 'codex',
+      usage: { codex: codexAt99(), claude: claudeUnknown },
+    });
+    expect(asDestination.entry).toBe('codex');
+    expect(asDestination.changed).toBe(false);
+    expect(asDestination.reason).toBe('no_known_headroom:codex:99');
+
+    const asPick = choose({ picked: 'claude', usage: { claude: claudeUnknown } });
+    expect(asPick.entry).toBe('claude');
+    expect(asPick.changed).toBe(false);
+    expect(asPick.reason).toBe('seat_unknown:claude');
+
+    expect(admitClaudeTier({ usage: { claude: claudeUnknown }, thresholdPercent: 80 })).toEqual({
+      admitted: false,
+      reason: 'claude_seat_unknown',
+    });
+
+    // An UNKNOWN codex seat is not unmetered either.
+    const codexUnknown = choose({
+      picked: 'codex',
+      usage: { codex: { limit_source: 'UNKNOWN', windows: [] }, claude: coolClaude },
+    });
+    expect(codexUnknown.reason).toBe('seat_unknown:codex');
+    expect(codexUnknown.entry).toBe('codex');
+  });
+
+  test('rungSeatSkip_unchanged_behavior', () => {
+    expect(rungSeatSkip('codex', { codex: codexAt99({ has_credits: true }) }, 95)).toBeNull();
+    expect(rungSeatSkip('codex', { codex: codexAt99() }, 95)).toEqual({
+      tier: 'codex',
+      seat: 'codex',
+      usedPercent: 99,
+      cutoffPercent: 95,
+    });
+    expect(
+      rungSeatSkip(
+        'codex',
+        { codex: codexAt99({ has_credits: true, overage_limit_reached: true }) },
+        95
+      )
+    ).toEqual({ tier: 'codex', seat: 'codex', usedPercent: 99, cutoffPercent: 95 });
+    expect(rungSeatSkip('codex', { codex: codexAt99() }, null)).toBeNull();
+    expect(rungSeatSkip('cursor', { cursor: cursorUnknown }, 95)).toBeNull();
+    expect(
+      rungSeatSkip('claude', { claude: measured([{ name: 'seven_day', used_percent: 97 }]) }, 95)
+    ).toEqual({ tier: 'claude', seat: 'claude', usedPercent: 97, cutoffPercent: 95 });
+    expect(rungSeatSkip('zero', { codex: codexAt99() }, 95)).toBeNull();
   });
 });

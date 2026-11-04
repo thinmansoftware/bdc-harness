@@ -276,8 +276,10 @@ describe('cascade headroom', () => {
         apiBaseUrl: server.url.origin,
         token: 'test-token',
       });
+      // A failed read falls back to all-UNKNOWN seats; an UNKNOWN cursor seat is
+      // unmetered (headroom.ts isUnmeteredSeat), so the entry stays on cursor.
       expect(unavailable.telemetry.entryTier).toBe('cursor');
-      expect(unavailable.entrySelection?.reason).toBe('seat_unknown:cursor');
+      expect(unavailable.entrySelection?.reason).toBe('seat_unmetered:cursor');
     } finally {
       server.stop(true);
     }
@@ -365,7 +367,7 @@ describe('cascade headroom', () => {
           },
         });
         expect(rejected.telemetry.entryTier).toBe('cursor');
-        expect(rejected.entrySelection?.reason).toBe('seat_unknown:cursor');
+        expect(rejected.entrySelection?.reason).toBe('seat_unmetered:cursor');
 
         const started = Date.now();
         const timedOut = await runCascade({
@@ -386,7 +388,7 @@ describe('cascade headroom', () => {
         });
         expect(Date.now() - started).toBeLessThan(8000);
         expect(timedOut.telemetry.entryTier).toBe('cursor');
-        expect(timedOut.entrySelection?.reason).toBe('seat_unknown:cursor');
+        expect(timedOut.entrySelection?.reason).toBe('seat_unmetered:cursor');
 
         const absent = await runCascade({
           woId: 'WO-HEADROOM-ABSENT',
@@ -402,7 +404,7 @@ describe('cascade headroom', () => {
           token: 'test-token',
         });
         expect(absent.telemetry.entryTier).toBe('cursor');
-        expect(absent.entrySelection?.reason).toBe('seat_unknown:cursor');
+        expect(absent.entrySelection?.reason).toBe('seat_unmetered:cursor');
       });
     } finally {
       await rm(outDir, { recursive: true, force: true });

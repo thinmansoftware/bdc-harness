@@ -149,7 +149,8 @@ interface MailboxProcessResult {
 async function runMailboxRace(
   archonHome: string,
   action: 'acknowledge' | 'address',
-  messageId: string
+  messageId: string,
+  beforeStart?: () => Promise<void>
 ): Promise<MailboxProcessResult[]> {
   const dispatchUrl = pathToFileURL(resolve(import.meta.dir, 'dispatch.ts')).href;
   const connectionUrl = pathToFileURL(resolve(import.meta.dir, 'connection.ts')).href;
@@ -229,6 +230,7 @@ async function runMailboxRace(
         await Bun.sleep(5);
       }
     }
+    if (beforeStart) await beforeStart();
     await Bun.write(startFile, 'start');
     results = await Promise.all(children.map(({ output }) => output));
   } catch (error) {
@@ -949,6 +951,46 @@ describe('dispatch db', () => {
       expect(stored.rows[0]?.acknowledged_at).toBe(processResults[0]?.message.acknowledged_at);
     } finally {
       await inspectionDb.close();
+    }
+  });
+
+  test('separate-process acknowledgement waits out a write lock held by a third process', async () => {
+    // Regression for CI runs 41772183976 and 41780148151: a child exited 1 with
+    // "database is locked". Under a deferred BEGIN the mailbox UPDATE is a lock
+    // upgrade, which SQLite fails at once instead of waiting busy_timeout, and
+    // the mailbox retry only covered about 30ms. Holding the write lock longer
+    // than that budget makes the old path fail every time; with BEGIN IMMEDIATE
+    // the children wait for the lock and both succeed.
+    const { archonHome, messageId } = await makeSeparateProcessMailboxFixture(
+      'idem-ack-separate-processes-held-lock',
+      false
+    );
+    const holder = new SqliteAdapter(join(archonHome, 'archon.db'));
+    await holder.query('SELECT 1 AS holder_schema_ready');
+    let released: Promise<unknown> | undefined;
+    try {
+      const results = await runMailboxRace(archonHome, 'acknowledge', messageId, async () => {
+        await holder.query('BEGIN IMMEDIATE');
+        released = Bun.sleep(400).then(() => holder.query('COMMIT'));
+      });
+
+      expect(results.filter(result => result.exitCode !== 0)).toEqual([]);
+      const processResults = results.map(
+        result =>
+          JSON.parse(result.stdout) as {
+            ok: boolean;
+            message: { acknowledged_at: string | null; acknowledged_by: string | null };
+          }
+      );
+      expect(processResults).toEqual([
+        expect.objectContaining({ ok: true }),
+        expect.objectContaining({ ok: true }),
+      ]);
+      expect(new Set(processResults.map(result => result.message.acknowledged_at)).size).toBe(1);
+      expect(processResults[0]?.message.acknowledged_by).toBe('operator');
+    } finally {
+      await released;
+      await holder.close();
     }
   });
 

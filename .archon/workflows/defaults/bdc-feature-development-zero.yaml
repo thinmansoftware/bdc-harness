@@ -4638,6 +4638,22 @@ nodes:
           echo "ERROR: decide-push-target emitted an invalid base branch override ref name: ${BASE_BRANCH_OVERRIDE}" >&2
           exit 1
         fi
+        # Production-base guard (Rule 20 / Motion M-09): a spec-declared base never
+        # authorizes a PR to production. The refused list lives ONLY in
+        # scripts/lane/prod-base-guard.sh. Resolved like dprep.sh, but fail closed:
+        # without the guard an override is refused. bdc-xo #4469.
+        PBG_SCRIPT=""
+        for pbg_candidate in "${BDC_PROD_BASE_GUARD_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/prod-base-guard.sh}" /app/scripts/lane/prod-base-guard.sh; do
+          if [ -n "$pbg_candidate" ] && [ -f "$pbg_candidate" ]; then PBG_SCRIPT="$pbg_candidate"; break; fi
+        done
+        if [ -z "$PBG_SCRIPT" ]; then
+          echo "ERROR: prod_base_guard_missing: cannot check base ${BASE_BRANCH_OVERRIDE} against the production-base list; refusing the override." >&2
+          exit 1
+        fi
+        . "$PBG_SCRIPT"
+        if ! bdc_refuse_production_base "$REPO" "$BASE_BRANCH_OVERRIDE"; then
+          exit 1
+        fi
         if ! git ls-remote --exit-code "https://github.com/${REPO}.git" "refs/heads/${BASE_BRANCH_OVERRIDE}" >/dev/null 2>&1; then
           echo "ERROR: base branch override ${BASE_BRANCH_OVERRIDE} does not exist on ${REPO}; refusing to open PR against an unverified base." >&2
           exit 1
