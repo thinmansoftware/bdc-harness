@@ -31,6 +31,7 @@ import {
   ConversationNotFoundError,
   generateAndSetTitle,
   releaseTerminalRunLeasesSweep,
+  withSyncedManagedSource,
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
@@ -4071,9 +4072,14 @@ export function registerApiRoutes(
     }
     if (!cwd) cwd = getArchonWorkspacesPath();
 
+    // Reset a managed source clone to origin BEFORE discovery, under one lock held across
+    // the reset and the read; discovering first read the lane from the previous sync
+    // (run 8849e767, WO-HARNESS-A2-ENGAGES-ALL-REPOS-01).
     let workflows: WorkflowDefinition[];
     try {
-      const discovery = await discoverWorkflowsWithConfig(cwd, loadConfig);
+      const discovery = await withSyncedManagedSource(cwd, cwd, () =>
+        discoverWorkflowsWithConfig(cwd, loadConfig)
+      );
       workflows = discovery.workflows.map(ws => ws.workflow);
     } catch (error) {
       getLog().warn({ err: error, cwd, workflowName }, 'dispatch_precheck_discovery_failed');

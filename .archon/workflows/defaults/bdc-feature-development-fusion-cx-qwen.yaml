@@ -2307,6 +2307,7 @@ nodes:
           printf 'TESTS_BASE_COMPARE=script_missing\n'
         }
         stb_stamp_base_red() { cat; }
+        stb_report_compare() { rst_base_compare "$@"; }
       fi
       # ---- END stbase core ----
 
@@ -2414,7 +2415,7 @@ nodes:
         if [ "$REPORT_SOURCE" = "spec_declared" ]; then REPORT_SOURCE="wo-spec"; fi
         rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
       fi > "$EVIDENCE_DIR/stop-tests.report"
-      rst_base_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS"
+      stb_report_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS"
       echo "TESTS_LOG=$LOG"
       if [ -s "$LOG" ]; then
         echo "--- last 80 lines of test output ---"
@@ -5048,6 +5049,7 @@ nodes:
           printf 'TESTS_BASE_COMPARE=script_missing\n'
         }
         stb_stamp_base_red() { cat; }
+        stb_report_compare() { rst_base_compare "$@"; }
       fi
       # ---- END stbase core ----
 
