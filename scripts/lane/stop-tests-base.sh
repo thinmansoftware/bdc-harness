@@ -34,7 +34,8 @@
 #             is skipped.
 #   node:test top-level "# Subtest: <path>" naming a script file, then
 #             "not ok <n> - <name>" (TODO / SKIP are not failures; the file's own
-#             top-level "not ok" is not a test).
+#             top-level "not ok" is not a test, unless no failing nested test was
+#             emitted for that file: then it is one identity "(file failed to load)").
 #   jest      "FAIL <path>", then "<U+25CF> <suite> <U+203A> <name>"; collection stops at
 #             "Summary of all failing tests" (a repeat).
 #   vitest    "FAIL <path> > <suite> > <name>" (file and name on one line).
@@ -65,7 +66,7 @@ stb_failed_ids() {
       }
       if (line ~ /^# Subtest: /) {
         f = trim(substr(line, 12))
-        if (f ~ /[.][cm]?[jt]sx?$/) { file[pfx] = f; tapfile[pfx] = f } else { file[pfx] = ""; tapfile[pfx] = "" }
+        if (f ~ /[.][cm]?[jt]sx?$/) { file[pfx] = f; tapfile[pfx] = f; nested[pfx] = 0 } else { file[pfx] = ""; tapfile[pfx] = "" }
         next
       }
       if (t ~ /^\(fail\) /) {
@@ -75,7 +76,14 @@ stb_failed_ids() {
       if (t ~ /^not ok [0-9]+/) {
         if (t ~ /#[ \t]*(TODO|SKIP|todo|skip)/) next
         n = t; sub(/^not ok [0-9]+[ \t]*(-[ \t]*)?/, "", n); n = trim(n)
-        if (line == t && tapfile[pfx] != "" && n == tapfile[pfx]) next
+        if (line == t && tapfile[pfx] != "" && n == tapfile[pfx]) {
+          # file-failed-to-load: a file whose own top-level not ok follows no failing
+          # nested test crashed before running any (e.g. ERR_UNKNOWN_BUILTIN_MODULE); it
+          # is one identity. With nested failures emitted the file line stays skipped.
+          if (!nested[pfx]) emit(file[pfx], "(file failed to load)")
+          next
+        }
+        if (n != "") nested[pfx]++
         emit(file[pfx], n); next
       }
       if (t ~ /^FAIL[ \t]+.* > /) {
@@ -139,7 +147,8 @@ stb__head_identities() {
     printf '%s\n' "$ids" | awk -F '\t' '$1 == "" { bad = 1 } END { if (bad) exit 0; exit 1 }' && return 1
     nids="$(printf '%s\n' "$ids" | grep -c .)"
     [ "$nids" -eq $((t - p)) ] || return 1
-    [ -z "$(printf '%s\n' "$ids" | cut -f2 | LC_ALL=C sort | uniq -d)" ] || return 1
+    [ -z "$(printf '%s\n' "$ids" | cut -f2 | grep -vxF '(file failed to load)' | LC_ALL=C sort | uniq -d)" ] || return 1
+    [ -z "$(printf '%s\n' "$ids" | awk -F '\t' '$2 == "(file failed to load)" { print $1 }' | LC_ALL=C sort | uniq -d)" ] || return 1
     printf '%s\n' "$ids" | awk -v i="$i" '{ print i "\t" $0 }' >> "$out"
     i=$((i + 1))
   done
@@ -390,6 +399,24 @@ rst_base_compare() {
   rm -rf "$work"
   printf 'stop-tests-base: base-red: %s\n' "$names" >&2
   stb__emit "$report" base_red base_red "$(stb__base_red_line "$line" "$hp" "$ht" "$k" "$sha8")"
+  return 0
+}
+
+# stb_report_compare <report-file> <commands-file> <head-log> <head-counts>
+#   Runs rst_base_compare, prints its result like it does, and rewrites <report-file>
+#   (evidence/stop-tests.report) with that same final text, so the file carries the
+#   final TESTS_STATUS, TESTS_LINE and TESTS_BASE_COMPARE and not the pre-compare
+#   verdict (WO-HARNESS-A2-ENGAGES-ALL-REPOS-01). Never returns nonzero.
+stb_report_compare() {
+  local report="$1" out tmp
+  out="$(rst_base_compare "$@")" || true
+  printf '%s
+' "$out"
+  if [ -n "$out" ] && [ -n "$report" ]; then
+    tmp="${report}.final.$$"
+    if printf '%s
+' "$out" > "$tmp" 2>/dev/null; then mv -f "$tmp" "$report" 2>/dev/null || rm -f "$tmp"; else rm -f "$tmp" 2>/dev/null || true; fi
+  fi
   return 0
 }
 

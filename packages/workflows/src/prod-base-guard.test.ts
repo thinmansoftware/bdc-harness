@@ -10,7 +10,15 @@
  * text that ships, not a copy. Bun.spawnSync + bash; no mock.module().
  */
 import { describe, expect, it } from 'bun:test';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { BUNDLED_LANE_SCRIPTS } from './defaults/bundled-defaults';
@@ -20,6 +28,8 @@ const DEFAULTS_DIR = join(REPO_ROOT, '.archon/workflows/defaults');
 const GUARD_SCRIPT = join(REPO_ROOT, 'scripts/lane/prod-base-guard.sh');
 const LS_REMOTE_ANCHOR =
   'if ! git ls-remote --exit-code "https://github.com/${REPO}.git" "refs/heads/${BASE_BRANCH_OVERRIDE}" >/dev/null 2>&1; then';
+/** The hardcoded third resolution candidate in every lane's guard block. */
+const APP_FALLBACK = '/app/scripts/lane/prod-base-guard.sh';
 const GUARD_START = '# Production-base guard (Rule 20 / Motion M-09)';
 
 /** Lanes whose open-PR node honours base_branch_override. */
@@ -51,22 +61,51 @@ interface GuardRun {
   stderr: string;
 }
 
+interface GuardOptions {
+  /**
+   * Rewrites the hardcoded /app fallback literal in the extracted block (throws unless it
+   * occurs exactly once): 'absent' = a path that does not exist, 'copy' = a temp copy of
+   * the real guard script. Unset = the block runs untouched (reads the host's /app).
+   */
+  appFallback?: 'absent' | 'copy';
+  /** Sets ARCHON_LANE_SCRIPTS_DIR to a fresh empty temp dir. */
+  emptyLaneScriptsDir?: boolean;
+}
+
+function countOccurrences(text: string, needle: string): number {
+  return text.split(needle).length - 1;
+}
+
 function runGuard(
   lane: string,
   repo: string,
   base: string,
-  guardScript: string | null = GUARD_SCRIPT
+  guardScript: string | null = GUARD_SCRIPT,
+  options: GuardOptions = {}
 ): GuardRun {
   const dir = mkdtempSync(join(tmpdir(), 'prod-base-guard-'));
   try {
     const script = join(dir, 'run.sh');
+    let block = guardBlock(lane);
+    if (options.appFallback) {
+      const count = countOccurrences(block, APP_FALLBACK);
+      if (count !== 1) {
+        throw new Error(`${lane}: expected exactly 1 ${APP_FALLBACK} in guard block, got ${count}`);
+      }
+      let replacement = join(dir, 'absent', 'prod-base-guard.sh').replace(/\\/g, '/');
+      if (options.appFallback === 'copy') {
+        replacement = join(dir, 'app-copy-prod-base-guard.sh').replace(/\\/g, '/');
+        copyFileSync(GUARD_SCRIPT, replacement);
+      }
+      block = block.split(APP_FALLBACK).join(replacement);
+    }
     writeFileSync(
       script,
       [
         'set -u',
         `REPO='${repo}'`,
         `BASE_BRANCH_OVERRIDE='${base}'`,
-        guardBlock(lane),
+        block,
         // Stands in for the rest of the node (ls-remote, gh pr create).
         'echo PASSED_GUARD',
         '',
@@ -169,9 +208,53 @@ describe('production-base guard (bdc-xo #4469)', () => {
     expect(runGuard(lane, 'thinmansoftware/lspro-react', 'Main').exitCode).toBe(0);
   });
 
+  // Test 9 must hold on any host: the block also probes the hardcoded /app fallback, which
+  // exists inside the Cauldron container, so that candidate is rewritten to a missing path.
   it('guard_missing_fails_closed (Test 9) in every lane', () => {
     for (const lane of LANES) {
-      const run = runGuard(lane, 'thinmansoftware/lspro-react', 'staging', null);
+      const run = runGuard(lane, 'thinmansoftware/lspro-react', 'staging', null, {
+        appFallback: 'absent',
+      });
+      expect(run.exitCode).toBe(1);
+      expect(run.stderr).toContain('prod_base_guard_missing');
+      expect(run.stdout).not.toContain('PASSED_GUARD');
+    }
+  });
+
+  it('app_fallback_literal_present_once in every lane (Test 11)', () => {
+    for (const lane of LANES) {
+      expect(countOccurrences(guardBlock(lane), APP_FALLBACK)).toBe(1);
+    }
+    expect(() =>
+      runGuard(LANES[0] ?? '', 'thinmansoftware/lspro-react', 'staging', null, {
+        appFallback: 'absent',
+      })
+    ).not.toThrow();
+  });
+
+  it('app_fallback_resolves_and_refuses (Test 12) in every lane', () => {
+    for (const lane of LANES) {
+      const ok = runGuard(lane, 'thinmansoftware/lspro-react', 'staging', null, {
+        appFallback: 'copy',
+      });
+      expect(ok.exitCode).toBe(0);
+      expect(ok.stdout).toContain('PASSED_GUARD');
+      expect(ok.stderr).toBe('');
+      const refused = runGuard(lane, 'thinmansoftware/shopops', 'master', null, {
+        appFallback: 'copy',
+      });
+      expect(refused.exitCode).toBe(1);
+      expect(refused.stderr).toContain('production_base_refused');
+      expect(refused.stdout).not.toContain('PASSED_GUARD');
+    }
+  });
+
+  it('lane_scripts_dir_without_guard_fails_closed (Test 13) in every lane', () => {
+    for (const lane of LANES) {
+      const run = runGuard(lane, 'thinmansoftware/lspro-react', 'staging', null, {
+        appFallback: 'absent',
+        emptyLaneScriptsDir: true,
+      });
       expect(run.exitCode).toBe(1);
       expect(run.stderr).toContain('prod_base_guard_missing');
       expect(run.stdout).not.toContain('PASSED_GUARD');

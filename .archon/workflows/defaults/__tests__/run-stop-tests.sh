@@ -1207,7 +1207,7 @@ if [ -z "$STBASE_CORE" ]; then
   echo "FATAL: could not extract stbase core from $CANONICAL_YAML"; exit 1
 fi
 eval "$STBASE_CORE"
-for fn in rst_base_compare stb_stamp_base_red stb_failed_ids; do
+for fn in rst_base_compare stb_report_compare stb_stamp_base_red stb_failed_ids; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after sourcing stbase"; exit 1; fi
 done
 
@@ -1323,7 +1323,8 @@ stb_render_node() {
 }
 STB_NODE="$STB_ROOT/run-stop-tests-node.sh"
 stb_render_node > "$STB_NODE"
-assert_eq "rendered node calls rst_base_compare once" "1" "$(grep -c '^rst_base_compare ' "$STB_NODE")"
+assert_eq "rendered node calls stb_report_compare once" "1" "$(grep -c '^stb_report_compare ' "$STB_NODE")"
+assert_eq "rendered node no longer calls rst_base_compare directly" "0" "$(grep -c '^rst_base_compare ' "$STB_NODE")"
 STB_SPEC_FILE="$STB_ROOT/spec.md"
 printf 'WO Class: CODE\n\n## 8. Stop conditions\n\nStop 2 (test suite):\n  bun run test\n  Expected: all pass\n' > "$STB_SPEC_FILE"
 export STB_SPEC_FILE
@@ -1335,6 +1336,9 @@ assert_eq "Test 1 base_red_only_passes (node): TESTS_STATUS=base_red" "base_red"
 assert_contains "Test 1 base_red_only_passes (node): TESTS_LINE" "TESTS_LINE=2/4 (base-red: 2 tests failing on base $(printf '%s' "$E1_SHA" | cut -c1-8); newly broken: 0)" "$E1_OUT"
 assert_eq "Test 1 base_red_only_passes (node): base-red-tests.txt" "$(printf 's.test.ts :: suite > A\ns.test.ts :: suite > B')" "$(cat "$STB_ROOT/e1/art/base-red-tests.txt" 2>/dev/null)"
 assert_eq "Test 1 base_red_only_passes (node): worktree removed" "1 0" "$(stb_wt_count "$STB_ROOT/e1/repo") $(stb_leftover "$STB_ROOT/e1/art")"
+assert_eq "Test 4 report_has_final_verdict: evidence file TESTS_STATUS" "base_red" "$(stb_field TESTS_STATUS "$(cat "$STB_ROOT/e1/art/evidence/stop-tests.report")")"
+assert_eq "Test 4 report_has_final_verdict: evidence file TESTS_BASE_COMPARE" "base_red" "$(stb_field TESTS_BASE_COMPARE "$(cat "$STB_ROOT/e1/art/evidence/stop-tests.report")")"
+assert_eq "Test 4 report_has_final_verdict: evidence TESTS_LINE equals node output" "$(stb_field TESTS_LINE "$E1_OUT")" "$(stb_field TESTS_LINE "$(cat "$STB_ROOT/e1/art/evidence/stop-tests.report")")"
 
 echo "--- Test 2: newly_broken_fails ---"
 mkdir -p "$STB_ROOT/t2/repo" "$STB_ROOT/t2/art"
@@ -1562,7 +1566,7 @@ else
 fi
 
 echo "--- Test 7: all_lanes_call_shared_script ---"
-STB_CALL='rst_base_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS"'
+STB_CALL='stb_report_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS"'
 STB_STAMP='"$(sme_field GREP_DROPPED "$GREPS_OUT")" | stb_stamp_base_red'
 STB_N=0
 for lane in $LANES; do
@@ -1571,7 +1575,7 @@ for lane in $LANES; do
   assert_eq "Test 7 all_lanes_call_shared_script: $lane has 2 stbase stubs" "2" "$(grep -c 'BEGIN stbase core' "$lf")"
   assert_eq "Test 7 all_lanes_call_shared_script: $lane stub 1 identical" "$STBASE_CORE" "$(extract_core_nth "$lf" stbase 1)"
   assert_eq "Test 7 all_lanes_call_shared_script: $lane stub 2 identical" "$STBASE_CORE" "$(extract_core_nth "$lf" stbase 2)"
-  assert_eq "Test 7 all_lanes_call_shared_script: $lane one rst_base_compare call" "1" "$(tr -d '\r' < "$lf" | grep -cF "      $STB_CALL")"
+  assert_eq "Test 7 all_lanes_call_shared_script: $lane one stb_report_compare call" "1" "$(tr -d '\r' < "$lf" | grep -cF "      $STB_CALL")"
   assert_eq "Test 7 all_lanes_call_shared_script: $lane one stamp helper call" "1" "$(tr -d '\r' < "$lf" | grep -cF "$STB_STAMP")"
   assert_eq "Test 7 all_lanes_call_shared_script: $lane inlines no comparison logic" "0" "$(grep -cE 'stb_failed_ids|worktree add --detach|base-red-tests\.txt|comm -23' "$lf")"
 done
@@ -1584,6 +1588,70 @@ if command -v bun >/dev/null 2>&1; then
 else
   FAIL=$((FAIL + 1)); echo "FAIL: Test 7 all_lanes_call_shared_script: bun not on PATH, bundle check could not run"
 fi
+
+echo "--- WO-HARNESS-A2-ENGAGES-ALL-REPOS-01: crashed node:test files, final report ---"
+CRASH_LOG="$HERE/fixtures/stop-tests-node-crash.log"
+if [ ! -f "$CRASH_LOG" ]; then FAIL=$((FAIL + 1)); echo "FAIL: crash fixture missing at $CRASH_LOG"; fi
+CRASH_NAME='(file failed to load)'
+
+# Test 1 (A2 all repos): crashed node:test files become named failures
+CR1="$STB_ROOT/cr1"; mkdir -p "$CR1"
+CR1_N="$(stb_split_blocks "$CRASH_LOG" "$CR1/head" 1)"
+CR1_RC=0
+stb__head_identities "$CR1/head" "$CR1_N" "$CR1/head.ids" || CR1_RC=$?
+assert_eq "A2 Test 1 crashed_files_named: head identities return 0" "0" "$CR1_RC"
+assert_eq "A2 Test 1 crashed_files_named: 3 identities" "3" "$(grep -c . "$CR1/head.ids")"
+assert_eq "A2 Test 1 crashed_files_named: every name is the marker" "3" "$(awk -F '\t' -v n="$CRASH_NAME" '$3 == n' "$CR1/head.ids" | wc -l | tr -d ' ')"
+assert_eq "A2 Test 1 crashed_files_named: files" "/work/tests/worker-concurrency.test.ts
+/work/tests/worker-lease-reclaim.test.ts
+/work/tests/worker-skeleton.test.ts" "$(cut -f2 "$CR1/head.ids" | LC_ALL=C sort)"
+
+# Test 2: nested failures are not double counted
+CR2_OUT="$(printf '%s\n' '# Subtest: /work/tests/mixed.test.ts' \
+  '    # Subtest: first' '    not ok 1 - first' '    # Subtest: second' '    not ok 2 - second' \
+  '    # Subtest: third' '    ok 3 - third' 'not ok 1 - /work/tests/mixed.test.ts' | stb_failed_ids)"
+assert_eq "A2 Test 2 nested_not_double_counted: exactly the nested names" "/work/tests/mixed.test.ts	first
+/work/tests/mixed.test.ts	second" "$CR2_OUT"
+
+# Test 3: base comparison verdicts for crashed files
+CR3_REPORT_BODY='TESTS_STATUS=failed
+TESTS_LINE=65/68 (npm test) -- FAILED, exit 1 [source: project-map; map: 0ddb2bf0]'
+cr3_run() { # cr3_run <case> <base-log-fixture> <base-counts>
+  local c="$1" blog="$2" bcounts="$3" root
+  root="$STB_ROOT/cr3$c"; mkdir -p "$root/repo" "$root/art"
+  ( cd "$root/repo" && git init -q . && git config user.email t@t && git config user.name t && git config core.autocrlf false \
+    && printf '{"name":"cr3","private":true}\n' > package.json && git add -A && git commit -q -m base \
+    && git rev-parse HEAD > ../art/run-start-sha.txt ) || return 1
+  printf 'npm test\n' > "$root/art/cmds"
+  printf '%s\n' "$CR3_REPORT_BODY" > "$root/art/report"
+  cp "$CRASH_LOG" "$root/art/head.log"
+  CR3_PARSE="$(declare -f rst_parse_counts)" CR3_BLOG="$blog" CR3_BCOUNTS="$bcounts" bash -c '
+    set +e
+    . "$1"
+    eval "$CR3_PARSE"
+    rst_run_commands() { cat "$CR3_BLOG" >> "$2"; echo "$CR3_BCOUNTS"; }
+    dprep_ensure_js_deps() { :; }
+    cd "$2/repo" && ARTIFACTS_DIR="$2/art" rst_base_compare "$2/art/report" "$2/art/cmds" "$2/art/head.log" "65 68"
+  ' _ "$STBASE_SHARED" "$root" 2>/dev/null
+}
+# case A: base crashes the same 3 files
+CR3A_OUT="$(cr3_run a "$CRASH_LOG" "1 65 68")"
+assert_eq "A2 Test 3 case A (same crash on base): TESTS_BASE_COMPARE=base_red" "base_red" "$(stb_field TESTS_BASE_COMPARE "$CR3A_OUT")"
+assert_eq "A2 Test 3 case A (same crash on base): TESTS_STATUS=base_red" "base_red" "$(stb_field TESTS_STATUS "$CR3A_OUT")"
+assert_eq "A2 Test 3 case A: base-red-tests.txt names 3 crashed files" "3" "$(grep -c 'file failed to load' "$STB_ROOT/cr3a/art/base-red-tests.txt" 2>/dev/null)"
+# case B: base loads worker-skeleton (only 2 files crash there)
+CR3_BASE_B="$STB_ROOT/cr3b-base.log"
+grep -v '^### exit' "$CRASH_LOG" | awk '
+  /^# Subtest: .*worker-skeleton/ { skip = 1; next }
+  skip && /^# Subtest: / { skip = 0 }
+  skip && /^1\.\.8$/ { skip = 0 }
+  !skip { print }
+' | sed 's/^# fail 3$/# fail 2/; s/^# pass 65$/# pass 66/' > "$CR3_BASE_B"
+printf '### exit 1\n' >> "$CR3_BASE_B"
+CR3B_OUT="$(cr3_run b "$CR3_BASE_B" "1 66 68")"
+assert_eq "A2 Test 3 case B (loads on base): TESTS_BASE_COMPARE=newly_broken" "newly_broken" "$(stb_field TESTS_BASE_COMPARE "$CR3B_OUT")"
+assert_eq "A2 Test 3 case B (loads on base): TESTS_STATUS=failed" "failed" "$(stb_field TESTS_STATUS "$CR3B_OUT")"
+assert_contains "A2 Test 3 case B names the file" "worker-skeleton.test.ts :: (file failed to load)" "$CR3B_OUT"
 
 rm -rf "$STB_ROOT"
 unset BDC_STBASE_SCRIPT STB_SPEC_FILE

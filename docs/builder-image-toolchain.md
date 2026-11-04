@@ -1,16 +1,22 @@
-Per-project toolchain (Node 26 + pnpm)
+Per-project toolchain (Node LTS + pnpm)
 
-The builder image pins Node 26.12.1 and pnpm 12.14.0 beside Debian Node and the
-bun 1.3.11 server runtime. Repos that do not use pnpm are unchanged.
+The builder image pins the current Node LTS (v26.13.0, Lithium) and pnpm 12.14.0
+beside the bun 1.3.11 server runtime. One Node serves everything: node, npm and npx
+for root and appuser, bun-run lane scripts, project test commands and pnpm. Debian's
+nodejs and npm are not installed (Debian's Node 20 reached end of life 2026-04-30).
 
 Pins and paths
 
 Three artifacts are downloaded at image build time and verified with sha256sum
 before they are unpacked. Nothing is downloaded again at runtime.
 
-- Node 26.12.1 comes from the official Node linux-x64 archive. NODE26_SHA256
-  verifies node-v26.12.1-linux-x64.tar.xz. It is unpacked at /opt/node26 and
-  stays off the global PATH. pnpm-spawned commands use this Node.
+- Node 26.13.0 comes from the official Node linux-x64 archive. NODE26_SHA256
+  verifies node-v26.13.0-linux-x64.tar.xz. It is unpacked at /opt/node26, which
+  leads the global ENV PATH, so node, npm and npx resolve to /opt/node26/bin for
+  every user. /usr/local/bin/node, npm and npx are symlinks to the same binaries so
+  minimal-PATH contexts (the Overseer reviewer sandbox) still find a real Node.
+  pnpm-spawned commands use this same Node. The ARG names keep the NODE26_ prefix
+  for history; the value is whatever the current LTS is.
 - The pnpm 12.14.0 wrapper comes from the pnpm registry archive. PNPM_SHA256
   verifies pnpm-12.14.0.tgz. It is unpacked at /opt/pnpm-12.14.0 and keeps
   package.json and dist/.
@@ -61,6 +67,22 @@ that variable; removed when the node ends), so standalone CLI and source runs wo
 without /app. Only when no candidate exists does the node log "dprep: dprep.sh missing"
 and continue.
 
+Stop-grep tokenizer (scripts/lane/rsg-argv.sh)
+
+The run-stop-greps node of every bdc-feature-development lane runs the grep stop conditions
+a spec declares, under a read-only allowlist. Both the allowlist check and the execution
+consume ONE parse, rsg_parse_pipeline in scripts/lane/rsg-argv.sh, so a single-quoted
+multi-word pattern such as grep -c 'Grand Comics Database' src/x.tsx is one argv word and
+runs. Inside single quotes a space, ; | $( or ^ is a literal pattern byte. Double quotes,
+backslashes and every metacharacter outside single quotes are still rejected, as are
+unbalanced, glued and empty quotes and a quoted word that is itself a write/exec flag.
+Resolution order: $BDC_RSGARGV_SCRIPT (tests), $ARCHON_LANE_SCRIPTS_DIR/rsg-argv.sh, then
+/app/scripts/lane/rsg-argv.sh. When none exists every declared grep is dropped (fail closed)
+and the node logs "rsg-argv.sh missing". The shared verdict fixture
+.archon/workflows/defaults/__tests__/fixtures/grep-verdicts.tsv (pinned by sha256) is the
+agreement contract with the bdc-xo validator CHECK 14. Test it with:
+bash .archon/workflows/defaults/__tests__/run-stop-greps.sh
+
 Base-red aware stop tests (scripts/lane/stop-tests-base.sh)
 
 A build fails its test stop condition only for tests it newly broke. The second lane
@@ -109,6 +131,36 @@ stamp-manifest-evidence, and makes one call in each node:
 
 Tests: bash .archon/workflows/defaults/__tests__/run-stop-tests.sh (Tests 1-10 of
 WO-HARNESS-STOP-TESTS-BASE-RED-AWARE-01, against real temporary git repos).
+
+Upgrading Node
+
+The Node version and SHA are read live from https://nodejs.org/dist/index.json (the
+first entry whose lts field is not false) and from that version's SHASUMS256.txt,
+never from memory. Re-check the LTS line on every harness rebuild. When the LTS
+moves, change NODE26_VERSION and NODE26_SHA256 in the Dockerfile, the v26.x.y strings
+in .github/workflows/test.yml, and the version assertions in
+packages/server/src/docker-packaging.test.ts together, then run the canary set below.
+
+Verifying the default Node
+
+scripts/container/node-lts-smoke.sh <expected version> runs inside the image (the
+docker-build CI job runs it as appuser and as root, mounting the script). It prints
+command -v node, node, npm, npx, pnpm, bun and agent-browser versions, runs
+node -e 'require("node:sqlite")', and exits nonzero on any mismatch. After an
+archon-app-1 rebuild, XO runs the same script with docker exec --user appuser, and
+checks docker exec archon-app-1 node --version.
+
+Node canary set
+
+scripts/cauldron-canary/node-lts-canary-repos.sh derives the repos that build Node
+code from bdc-xo scripts/cauldron/cauldron-projects.json (package.json at the
+working_subdir on the base branch, or a test_command that names node, npm, npx or
+pnpm), prints them with a count, and exits 1 unless the set is exactly the expected
+15. After a Node upgrade, fire one canary WO per listed repo, one at a time, through
+the normal Cauldron lane. A repo that needs a different Node than the image default
+gets a per-repo override (a pinned second Node selected from cauldron-projects.json)
+rather than holding the image back; none has needed one so far. Offline test:
+bash scripts/cauldron-canary/node-lts-canary-repos.test.sh.
 
 Bumping a version
 

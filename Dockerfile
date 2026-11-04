@@ -72,8 +72,8 @@ ARG ARCHON_BUILD_SHA=unknown
 ENV ARCHON_BUILD_SHA=${ARCHON_BUILD_SHA}
 LABEL org.opencontainers.image.revision="${ARCHON_BUILD_SHA}"
 ARG TERRAFORM_VERSION=1.8.5
-ARG NODE26_VERSION=26.12.1
-ARG NODE26_SHA256=6170b2d474e1c626f43cff3adc118df9fe3b573258a4fc3d850c8dbc6b079bbd
+ARG NODE26_VERSION=26.13.0
+ARG NODE26_SHA256=d28a96af6c38596f6d9d97c0ee531c13d238d757742387d1928de822d959e997
 ARG PNPM_VERSION=12.14.0
 ARG PNPM_SHA256=ea206e35474bf87be9564a85ca70ed1c8ebdc45da55aafb0a3bf09d1ba69b179
 ARG PNPM_NATIVE_SHA256=1de98ed2e9621113b0887b06322b461efb9df73d913fc1d151039b10b7117a41
@@ -175,27 +175,10 @@ RUN curl -fsSLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${T
     && terraform version \
     && rm -f /tmp/terraform.zip
 
-# Install agent-browser CLI (Vercel Labs) for E2E testing workflows
-# - Uses npm (not bun) because postinstall script downloads the native Rust binary
-# - Keep nodejs/npm: WO tests require npm and npx at runtime.
-# - The npm entry point is a Node.js wrapper; the native binary works standalone
-# - agent-browser auto-detects Docker (via /.dockerenv) and adds --no-sandbox to Chromium
-RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
-    && npm install -g agent-browser@0.22.1 \
-    && NATIVE_BIN=$(find /usr/local/lib/node_modules/agent-browser -name 'agent-browser-*' -type f -executable 2>/dev/null | head -1) \
-    && if [ -n "$NATIVE_BIN" ]; then \
-         cp "$NATIVE_BIN" /usr/local/bin/agent-browser-native \
-         && chmod +x /usr/local/bin/agent-browser-native \
-         && ln -sf /usr/local/bin/agent-browser-native /usr/local/bin/agent-browser; \
-       else \
-         echo "ERROR: agent-browser native binary not found after npm install" >&2 && exit 1; \
-       fi \
-    && npm cache clean --force \
-    && rm -rf /usr/local/lib/node_modules/agent-browser \
-    && rm -rf /var/lib/apt/lists/*
-
-# Node 26.12.1 and pnpm 12.14.0 sit beside Debian nodejs. /opt/node26/bin is
-# not on the global PATH. /usr/local/bin/pnpm selects this pair per project.
+# The current Node LTS (ARG NODE26_VERSION, read live from nodejs.org/dist/index.json,
+# never from memory) is the ONLY Node in the image: Debian nodejs/npm are not installed.
+# /opt/node26/bin leads the global PATH below, so node, npm and npx resolve to it for
+# root and appuser. /usr/local/bin/pnpm still selects the pinned pnpm per project.
 RUN apt-get update && apt-get install -y --no-install-recommends xz-utils \
     && rm -rf /var/lib/apt/lists/* \
     && curl -fsSLo /tmp/node26.tar.xz "https://nodejs.org/dist/v${NODE26_VERSION}/node-v${NODE26_VERSION}-linux-x64.tar.xz" \
@@ -215,6 +198,35 @@ RUN apt-get update && apt-get install -y --no-install-recommends xz-utils \
     && install -m 755 /tmp/pnpm-native/package/pnpm "/opt/pnpm-${PNPM_VERSION}/pnpm" \
     && rm -rf /tmp/pnpm-native /tmp/pnpm-native.tgz \
     && chmod -R a+rX /opt/node26 "/opt/pnpm-${PNPM_VERSION}"
+
+# Make the LTS Node the default for every user, and keep it reachable from env -i
+# contexts that use the minimal /usr/local/bin:/usr/bin:/bin PATH (the Overseer
+# reviewer sandbox), which used to find Debian's /usr/bin/node. python follows the
+# Debian python-is-python3 convention (builders call bare `python`).
+ENV PATH=/opt/node26/bin:${PATH}
+RUN ln -sf /opt/node26/bin/node /usr/local/bin/node \
+    && ln -sf /opt/node26/bin/npm /usr/local/bin/npm \
+    && ln -sf /opt/node26/bin/npx /usr/local/bin/npx \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python
+
+# Install agent-browser CLI (Vercel Labs) for E2E testing workflows
+# - Uses npm (not bun) because postinstall script downloads the native Rust binary
+# - npm and npx come from the LTS Node installed above: WO tests require them at runtime.
+# - The npm entry point is a Node.js wrapper; the native binary works standalone
+# - agent-browser auto-detects Docker (via /.dockerenv) and adds --no-sandbox to Chromium
+RUN npm install -g agent-browser@0.22.1 \
+    && AB_ROOT="$(npm root -g)/agent-browser" \
+    && NATIVE_BIN=$(find "$AB_ROOT" -name 'agent-browser-*' -type f -executable 2>/dev/null | head -1) \
+    && if [ -n "$NATIVE_BIN" ]; then \
+         cp "$NATIVE_BIN" /usr/local/bin/agent-browser-native \
+         && chmod +x /usr/local/bin/agent-browser-native \
+         && ln -sf /usr/local/bin/agent-browser-native /usr/local/bin/agent-browser; \
+       else \
+         echo "ERROR: agent-browser native binary not found after npm install" >&2 && exit 1; \
+       fi \
+    && npm cache clean --force \
+    && rm -rf "$AB_ROOT" /opt/node26/bin/agent-browser \
+    && rm -rf /var/lib/apt/lists/*
 
 # Point agent-browser to system Chromium (avoids ~400MB Chrome for Testing download)
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
@@ -354,7 +366,7 @@ RUN gosu appuser node --version \
     && gosu appuser npx --version \
     && gosu appuser pytest --version
 
-# pnpm@12.14.0 must report pnpm 12.14.0 and Node v26.12.1. Default node and bun stay put.
+# The default node, pnpm exec node and npm/npx all run the pinned LTS Node; bun stays put.
 RUN set -eu; \
     scratch="$(mktemp -d)"; \
     printf '%s\n' '{"packageManager":"pnpm@12.14.0"}' > "$scratch/package.json"; \
@@ -362,12 +374,12 @@ RUN set -eu; \
     pnpm_ver="$(gosu appuser sh -c "cd '$scratch' && pnpm --version")"; \
     node26_ver="$(gosu appuser sh -c "cd '$scratch' && pnpm exec node --version")"; \
     default_node="$(gosu appuser node --version)"; \
+    default_path="$(gosu appuser sh -c 'command -v node')"; \
     bun_ver="$(gosu appuser bun --version)"; \
     test "$pnpm_ver" = "12.14.0"; \
-    test "$node26_ver" = "v26.12.1"; \
-    case "$default_node" in \
-      v26*) echo "default node unexpectedly $default_node" >&2; exit 1 ;; \
-    esac; \
+    test "$node26_ver" = "v${NODE26_VERSION}"; \
+    test "$default_node" = "v${NODE26_VERSION}"; \
+    test "$default_path" = "/opt/node26/bin/node"; \
     test "$bun_ver" = "1.3.11"; \
     rm -rf "$scratch"
 
