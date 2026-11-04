@@ -18,6 +18,7 @@
  * the process-global mock.module() calls here do not pollute sibling test files.
  */
 import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
+import { readdirSync, readFileSync } from 'fs';
 import { mkdir, rm, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -53,6 +54,7 @@ import {
   registerBuiltinProviders,
   registerCommunityProviders,
   clearRegistry,
+  getRegisteredProviders,
 } from '@archon/providers';
 clearRegistry();
 registerBuiltinProviders();
@@ -60,6 +62,7 @@ registerCommunityProviders();
 
 // --- Imports (after mocks) ---
 import { executeDagWorkflow } from './dag-executor';
+import { parseWorkflow } from './loader';
 import { assertProviderCanExecuteNode, isAvailabilityError } from './node-failover';
 import type { DagNode, WorkflowRun } from './schemas';
 import type { WorkflowDeps, IWorkflowPlatform, WorkflowConfig } from './deps';
@@ -652,5 +655,165 @@ describe('node-level availability failover (prompt node)', () => {
     // leaked primary OpenRouter-format string.
     expect(models.codex).toBe('gpt-5.5-codex');
     expect(models.codex).not.toBe('qwen/qwen3-coder');
+  });
+});
+
+/**
+ * WO-HARNESS-PERSONA-MODEL-DECLARED-01, Overseer round 1 on bdc-harness PR 1494:
+ * a review node's OpenRouter (Kimi) quota/availability failover must DISPATCH the
+ * failover_model, never the primary persona's Claude pin. These run the real
+ * executeDagWorkflow resolution path on the real shipped lane nodes and the real
+ * persona files, and record the model each provider actually receives.
+ */
+describe('review failover dispatch resolves the failover model, not the persona pin', () => {
+  const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
+  const LANES_DIR = join(REPO_ROOT, '.archon', 'workflows', 'defaults');
+  const AGENTS_DIR = join(REPO_ROOT, '.archon', 'agents');
+  const REVIEW_IDS = [
+    'plan-review',
+    'war-council-validator',
+    'diff-review',
+    'diff-review-final',
+    'opus-rereview',
+    'findings-consolidate',
+    'apply-diff-review-final',
+  ];
+
+  interface LaneNode {
+    lane: string;
+    laneProvider: string;
+    node: DagNode;
+  }
+
+  function loadLaneNode(file: string, id: string): LaneNode {
+    const parsed = parseWorkflow(readFileSync(join(LANES_DIR, file), 'utf8'), file);
+    if (!parsed.workflow) throw new Error(`${file}: ${parsed.error?.error ?? 'no workflow'}`);
+    const node = parsed.workflow.nodes.find(entry => entry.id === id);
+    if (!node) throw new Error(`${file}: no node ${id}`);
+    return { lane: file, laneProvider: parsed.workflow.provider ?? 'claude', node };
+  }
+
+  /** The node runnable in isolation: no upstream edges, gate or trigger, one loop pass. */
+  function isolate(entry: LaneNode): DagNode {
+    const raw = { ...(entry.node as Record<string, unknown>) };
+    delete raw.depends_on;
+    delete raw.when;
+    delete raw.trigger_rule;
+    raw.provider = (raw.provider as string | undefined) ?? entry.laneProvider;
+    const loop = raw.loop as Record<string, unknown> | undefined;
+    if (loop) raw.loop = { ...loop, max_iterations: 1 };
+    return raw as unknown as DagNode;
+  }
+
+  async function copyRealPersonas(): Promise<void> {
+    const target = join(testDir, '.archon', 'agents');
+    await mkdir(target, { recursive: true });
+    for (const name of readdirSync(AGENTS_DIR)) {
+      if (!name.endsWith('.md')) continue;
+      await writeFile(join(target, name), readFileSync(join(AGENTS_DIR, name), 'utf8'));
+    }
+  }
+
+  /** Primary provider out of quota; every other registered provider succeeds. */
+  function behaviorsFor(primary: string): Record<string, ProviderBehavior> {
+    const behaviors: Record<string, ProviderBehavior> = {};
+    for (const entry of getRegisteredProviders()) {
+      behaviors[entry.id] = entry.id === primary ? quotaFailure : (): Generator<Chunk> => success();
+    }
+    return behaviors;
+  }
+
+  const failoverConfig: WorkflowConfig = {
+    assistant: 'claude',
+    assistants: { claude: {}, codex: {} },
+    commands: {},
+    defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
+  };
+
+  async function dispatchUnderFailover(entry: LaneNode): Promise<{
+    primary: string;
+    declaredProvider: string | undefined;
+    declaredModel: string | undefined;
+    calls: Record<string, number>;
+    models: Record<string, string | undefined>;
+  }> {
+    await copyRealPersonas();
+    const node = isolate(entry);
+    const primary = (node as { provider: string }).provider;
+    const declared = node as { failover_provider?: string; failover_model?: string };
+    const { calls, models } = await runNode(
+      node,
+      behaviorsFor(primary),
+      failoverConfig,
+      entry.laneProvider
+    );
+    return {
+      primary,
+      declaredProvider: declared.failover_provider,
+      declaredModel: declared.failover_model,
+      calls,
+      models,
+    };
+  }
+
+  it('astra plan-review (claude primary, persona pinned claude-fable-5) dispatches Kimi on openrouter', async () => {
+    const entry = loadLaneNode('bdc-feature-development-astra.yaml', 'plan-review');
+    expect((entry.node as { agent?: string; persona?: string }).persona ?? '').toContain(
+      'astra-plan-reviewer'
+    );
+    const result = await dispatchUnderFailover(entry);
+    expect(result.primary).toBe('claude');
+    expect(result.calls.claude ?? 0).toBeGreaterThan(0);
+    expect(result.calls.openrouter ?? 0).toBeGreaterThan(0);
+    expect(result.models.openrouter).toBe('moonshotai/kimi-k3.1-pro');
+  });
+
+  it('default-lane war-council-validator (persona pinned sonnet) dispatches Kimi on openrouter', async () => {
+    const entry = loadLaneNode('bdc-feature-development.yaml', 'war-council-validator');
+    expect((entry.node as { persona?: string; agent?: string }).persona ?? '').toBe(
+      'captain-ci-validator'
+    );
+    const result = await dispatchUnderFailover(entry);
+    expect(result.primary).toBe('claude');
+    expect(result.calls.openrouter ?? 0).toBeGreaterThan(0);
+    expect(result.models.openrouter).toBe('moonshotai/kimi-k3.1-pro');
+  });
+
+  it('codex-primary diff-review (cursor lane) dispatches Kimi on openrouter', async () => {
+    const entry = loadLaneNode('bdc-feature-development-cursor.yaml', 'diff-review');
+    const result = await dispatchUnderFailover(entry);
+    expect(result.primary).toBe('codex-native-strict');
+    expect(result.calls.openrouter ?? 0).toBeGreaterThan(0);
+    expect(result.models.openrouter).toBe('moonshotai/kimi-k3.1-pro');
+  });
+
+  it('sweep: no review node in any lane sends a claude model to openrouter under failover', async () => {
+    const lanes = readdirSync(LANES_DIR)
+      .filter(name => /^bdc-feature-development(-[a-z0-9-]+)?\.yaml$/.test(name))
+      .sort();
+    expect(lanes).toHaveLength(13);
+    const rows: string[] = [];
+    const bad: string[] = [];
+    for (const lane of lanes) {
+      for (const id of REVIEW_IDS) {
+        const result = await dispatchUnderFailover(loadLaneNode(lane, id));
+        const target = result.declaredProvider ?? '(none)';
+        const sent = result.models[target];
+        rows.push(`${lane} ${id} ${result.primary} -> ${target} model=${String(sent)}`);
+        const ok =
+          target !== 'claude' &&
+          (result.calls[target] ?? 0) > 0 &&
+          sent === result.declaredModel &&
+          !String(sent).startsWith('claude');
+        const claudeToOpenRouter = String(result.models.openrouter ?? '').startsWith('claude');
+        if (!ok || claudeToOpenRouter) bad.push(rows[rows.length - 1] ?? '');
+      }
+    }
+    console.log(
+      `failover dispatch sweep: ${String(rows.length)} review nodes, ${String(bad.length)} bad`
+    );
+    for (const row of bad) console.log(`  BAD ${row}`);
+    expect(rows).toHaveLength(91);
+    expect(bad).toEqual([]);
   });
 });

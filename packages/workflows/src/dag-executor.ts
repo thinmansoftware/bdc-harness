@@ -595,17 +595,38 @@ function resolveFailoverTarget(
   };
 }
 
+/**
+ * Nodes built by buildFailoverNode for a cross-provider failover dispatch. The
+ * persona binding sites (resolveNodeProviderAndModel and executeLoopNode) treat
+ * a node in this set like a per-node binding override: the primary persona's
+ * model pin is dropped so the dispatch runs on the failover_model (or the
+ * failover provider's configured default), never on the primary pin. Without
+ * this, resolveAgentPersona passed a Claude pin such as claude-fable-5 or sonnet
+ * straight through to OpenRouter on a Kimi review failover and the recovery
+ * route failed with an incompatible model id (Overseer, bdc-harness PR 1494
+ * round 1; WO-HARNESS-PERSONA-MODEL-DECLARED-01). The persona's instructions and
+ * tool list are kept.
+ */
+const failoverDispatchNodes = new WeakSet();
+
+/** True when the node is a cross-provider failover clone from buildFailoverNode. */
+function isFailoverDispatchNode(node: object): boolean {
+  return failoverDispatchNodes.has(node);
+}
+
 /** Clone an AI node for a provider failover without retaining an incompatible persona. */
 function buildFailoverNode(
   node: DagNode,
   target: { provider: string; model: string | undefined; agent?: string }
 ): DagNode {
-  return {
+  const clone = {
     ...node,
     provider: target.provider,
     model: target.model,
     ...(target.agent !== undefined ? { agent: target.agent, persona: undefined } : {}),
   } as DagNode;
+  failoverDispatchNodes.add(clone);
+  return clone;
 }
 
 // ---------------------------------------------------------------------------
@@ -2278,7 +2299,11 @@ async function resolveNodeProviderAndModel(
       // A seat reroute (WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01) writes the same
       // per-node entry, so a rerouted persona node adapts to its new provider here.
       const nodeBindingOverride = modelOverride?.nodes?.[node.id];
-      const personaForResolution = nodeBindingOverride
+      // A cross-provider failover dispatch owns the model the same way an override
+      // does: the primary persona's pin never reaches the failover provider.
+      const bindingReplacesPersonaModel =
+        nodeBindingOverride !== undefined || isFailoverDispatchNode(node);
+      const personaForResolution = bindingReplacesPersonaModel
         ? {
             ...persona,
             // A NON-review node rerouted to claude falls back to
@@ -2309,7 +2334,7 @@ async function resolveNodeProviderAndModel(
       // which for a NON-review node includes DEFAULT_CLAUDE_FAILOVER_MODEL; otherwise
       // resolveModelForNode returns the override's empty model and the call would go
       // out with no model at all.
-      if (effectiveModel === undefined && nodeBindingOverride && provider === 'claude') {
+      if (effectiveModel === undefined && bindingReplacesPersonaModel && provider === 'claude') {
         effectiveModel = personaResolution.model;
       }
       // Prepend agent system prompt (agent role comes before node task)
@@ -4514,18 +4539,20 @@ async function executeLoopNode(
       // executeLoopNode), so a codex loop node is correctly recognized.
       // A node-level binding override (including a seat reroute) owns the model,
       // so the persona model pin is replaced for the provider actually running.
-      const personaForLoop = nodeBindingOverridden
-        ? {
-            ...persona,
-            // Same fallback as the DAG path: non-review nodes only (D0).
-            model:
-              workflowProvider === 'claude'
-                ? (resolvedOptions.model ??
-                  persona.model ??
-                  (isReviewNode(node) ? undefined : DEFAULT_CLAUDE_FAILOVER_MODEL))
-                : undefined,
-          }
-        : persona;
+      // A cross-provider failover clone (buildFailoverNode) does the same.
+      const personaForLoop =
+        nodeBindingOverridden || isFailoverDispatchNode(node)
+          ? {
+              ...persona,
+              // Same fallback as the DAG path: non-review nodes only (D0).
+              model:
+                workflowProvider === 'claude'
+                  ? (resolvedOptions.model ??
+                    persona.model ??
+                    (isReviewNode(node) ? undefined : DEFAULT_CLAUDE_FAILOVER_MODEL))
+                  : undefined,
+            }
+          : persona;
       const personaResolution = resolveAgentPersona(
         personaForLoop,
         resolvedOptions.model,
