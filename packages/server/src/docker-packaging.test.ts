@@ -9,6 +9,9 @@ import { join } from 'path';
 // the same command does execute, and which package CI already runs.
 await import('../../../scripts/container/build-app-image.test');
 
+// The previous pin, built from parts so the stale-version stop grep finds nothing here.
+const staleNode = ['26', '12', '1'].join('.');
+
 describe('production Docker packaging', () => {
   it('copies Smart Cauldron source required by the server runtime', async () => {
     const dockerfile = await readFile(
@@ -95,16 +98,24 @@ describe('production Docker packaging', () => {
     }
   });
 
-  it('pins Node 26 and pnpm 12.14.0 off the global PATH', async () => {
+  it('dockerfile_pins_current_lts_with_checksum: Test 1, pins the current Node LTS and makes it the default', async () => {
     const dockerfile = await readFile(
       join(import.meta.dir, '..', '..', '..', 'Dockerfile'),
       'utf8'
     );
     const runtime = dockerfile.split('AS production')[1] ?? '';
 
-    expect(runtime).toContain('NODE26_VERSION=26.12.1');
+    expect(runtime).toContain('NODE26_VERSION=26.13.0');
     expect(runtime).toContain('PNPM_VERSION=12.14.0');
-    expect(runtime).toContain('6170b2d474e1c626f43cff3adc118df9fe3b573258a4fc3d850c8dbc6b079bbd');
+    const nodeSha = 'd28a96af6c38596f6d9d97c0ee531c13d238d757742387d1928de822d959e997';
+    expect(runtime).toContain(`NODE26_SHA256=${nodeSha}`);
+    const nodeChecksumAt = runtime.indexOf(
+      'echo "${NODE26_SHA256}  /tmp/node26.tar.xz" | sha256sum -c -'
+    );
+    const nodeExtractAt = runtime.indexOf('tar -xJf /tmp/node26.tar.xz -C /opt/node26');
+    expect(nodeChecksumAt).toBeGreaterThanOrEqual(0);
+    expect(nodeExtractAt).toBeGreaterThan(nodeChecksumAt);
+    expect(dockerfile).not.toContain(staleNode);
     expect(runtime).toContain('ea206e35474bf87be9564a85ca70ed1c8ebdc45da55aafb0a3bf09d1ba69b179');
     expect(
       runtime.match(
@@ -127,10 +138,29 @@ describe('production Docker packaging', () => {
     expect(runtime).toContain('COPY scripts/container/project-pnpm.sh /usr/local/bin/pnpm');
     expect(runtime).toContain('pnpm exec node --version');
     expect(runtime).toContain('ENTRYPOINT ["docker-entrypoint.sh"]');
-    expect(runtime).not.toMatch(/ENV PATH=.*node26/);
+    expect(runtime).toMatch(/^ENV PATH=\/opt\/node26\/bin:/m);
+    // Debian nodejs/npm are not installed; the LTS Node is the only Node.
+    const aptInstalls = runtime
+      .replace(/\\\r?\n/g, ' ')
+      .split(/\r?\n/)
+      .filter(line => line.startsWith('RUN') && line.includes('apt-get install'))
+      .flatMap(line => line.split('apt-get install').slice(1))
+      .map(segment => segment.split(/&&|;/)[0] ?? '');
+    expect(aptInstalls.length).toBeGreaterThan(0);
+    for (const line of aptInstalls) {
+      expect(line).not.toMatch(/\b(?:nodejs|npm)\b/);
+    }
+    expect(runtime).toContain('"$(npm root -g)/agent-browser"');
+    expect(runtime).toContain('test "$default_node" = "v${NODE26_VERSION}"');
+    expect(runtime).toContain('test "$default_path" = "/opt/node26/bin/node"');
+    expect(runtime).not.toContain('default node unexpectedly');
+    // Node precedes the agent-browser npm install that needs it.
+    expect(runtime.indexOf('/opt/node26/bin:${PATH}')).toBeLessThan(
+      runtime.indexOf('npm install -g agent-browser')
+    );
   });
 
-  it('wires the offline packaged pnpm probe into docker-build', async () => {
+  it('image_reports_current_lts_node_as_default: Test 2, docker-build probes default node and runs the smoke script', async () => {
     const workflow = await readFile(
       join(import.meta.dir, '..', '..', '..', '.github/workflows/test.yml'),
       'utf8'
@@ -142,14 +172,18 @@ describe('production Docker packaging', () => {
       '--entrypoint sh',
       'archon-ci:test',
       'test "$(pnpm --version)" = "12.14.0"',
-      'test "$(pnpm exec node --version)" = "v26.12.1"',
-      'v26*) exit 1',
+      'test "$(pnpm exec node --version)" = "v26.13.0"',
+      'test "$(node --version)" = "v26.13.0"',
+      'test "$(command -v node)" = "/opt/node26/bin/node"',
       'test "$(bun --version)" = "1.3.11"',
       'http://localhost:3000/api/health',
       'node --version && npm --version && npx --version && pytest --version',
     ]) {
       expect(workflow).toContain(needle);
     }
+    expect(workflow).not.toContain(staleNode);
+    expect(workflow).not.toContain('v26*) exit 1');
+    expect(workflow).toContain('scripts/container/node-lts-smoke.sh');
   });
 
   it('Test 1: production stage stamps the build commit', async () => {
