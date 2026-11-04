@@ -62,6 +62,7 @@ function heartbeatWithoutListDep(counts: {
     prDiscoveryUnavailable: true,
     prDiscoveryUnavailableReason: 'no_list_dep',
     prsEvaluated: 0,
+    prsClassified: 0,
     prsFallbackDecision: 0,
     prsTotalOpen: 0,
     prsWindowTruncated: false,

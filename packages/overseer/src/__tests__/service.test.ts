@@ -826,8 +826,13 @@ describe('service', () => {
     expect(settled).toBe(true);
   });
 
-  test('delivery failure aborts and quiesces the watcher before rejecting', async () => {
+  // WO-HARNESS-MERGE-SWEEP-LIVENESS-AND-PAGING-01: this test used to assert that a delivery
+  // failure aborted the watcher and rejected the service -- the exact coupling that stopped the
+  // merge sweep on 2026-11-04. The delivery scheduler now isolates its own failures.
+  test('delivery failure is isolated; the watcher keeps polling', async () => {
+    const controller = new AbortController();
     let watcherPolls = 0;
+    let drains = 0;
     const deps = {
       listRunsForWatch: async () => {
         watcherPolls += 1;
@@ -844,17 +849,19 @@ describe('service', () => {
         enabled: true,
         adapterKind: 'fake',
         deps,
+        signal: controller.signal,
         intervalMs: 1,
         deliveryEnabled: true,
         deliveryIntervalMs: 1,
         deliveryDrain: async () => {
+          drains += 1;
+          if (drains === 2) controller.abort();
           throw new Error('delivery_drain_failed');
         },
       })
-    ).rejects.toThrow('delivery_drain_failed');
-    const pollsAfterReject = watcherPolls;
-    await new Promise<void>(resolve => setTimeout(resolve, 10));
-    expect(watcherPolls).toBe(pollsAfterReject);
+    ).resolves.toBeUndefined();
+    expect(drains).toBe(2);
+    expect(watcherPolls).toBeGreaterThan(0);
   });
 
   test('reconcile failure is isolated and the scheduler retries', async () => {
@@ -891,10 +898,15 @@ describe('service', () => {
     expect(watcherPolls).toBeGreaterThan(0);
   });
 
-  test('watcher failure aborts and quiesces the delivery scheduler before rejecting', async () => {
+  // Same WO: a watcher pass failure is now isolated inside watchLoop, so it no longer rejects the
+  // service or stops the delivery scheduler (previously asserted the opposite).
+  test('watcher pass failure is isolated; the delivery scheduler keeps draining', async () => {
+    const controller = new AbortController();
+    let polls = 0;
     let drains = 0;
     const deps = {
       listRunsForWatch: async () => {
+        polls += 1;
         throw new Error('watcher_poll_failed');
       },
       listRunEvents: async () => [],
@@ -908,17 +920,18 @@ describe('service', () => {
         enabled: true,
         adapterKind: 'fake',
         deps,
+        signal: controller.signal,
         intervalMs: 1,
         deliveryEnabled: true,
         deliveryIntervalMs: 1,
         deliveryDrain: async () => {
           drains += 1;
+          if (drains === 3) controller.abort();
         },
       })
-    ).rejects.toThrow('watcher_poll_failed');
-    const drainsAfterReject = drains;
-    await new Promise<void>(resolve => setTimeout(resolve, 10));
-    expect(drains).toBe(drainsAfterReject);
+    ).resolves.toBeUndefined();
+    expect(drains).toBe(3);
+    expect(polls).toBeGreaterThan(1);
   });
 
   async function seedReplayRun(input: {

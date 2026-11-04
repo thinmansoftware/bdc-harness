@@ -57,6 +57,18 @@ export type {
 } from './escalation-delivery';
 
 export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
+export {
+  BoundedAwaitTimeoutError,
+  resolvePassTimeoutMs,
+  resolveRecordTimeoutMs,
+  resolveStepTimeoutMs,
+  withBoundedAwait,
+} from './bounded-await';
+export {
+  recordSweepProgress,
+  startMergeSweepLivenessMonitor,
+  type MergeSweepLivenessMonitor,
+} from './merge-sweep-liveness';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
 export { judgeWithGrok } from './judge-second-opinion';
 export { assembleQualifiedMergeEvidence, coordinateMergeReady } from './merge-coordinator';

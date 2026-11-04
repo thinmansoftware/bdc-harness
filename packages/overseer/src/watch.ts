@@ -1,6 +1,13 @@
 import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import { createLogger } from '@archon/paths';
+import {
+  BoundedAwaitTimeoutError,
+  resolvePassTimeoutMs,
+  resolveRecordTimeoutMs,
+  resolveStepTimeoutMs,
+  withBoundedAwait,
+} from './bounded-await';
 import { classifyError } from './classify';
 import { decide } from './decide';
 import { isPrMergeReady, isPrGreen, judgePullRequest } from './judge-pr';
@@ -13,6 +20,7 @@ import {
   type DiscoverMergeCandidatesOptions,
   type MergeCandidateDiscoveryResult,
 } from './merge-candidate-discovery';
+import { recordSweepProgress } from './merge-sweep-liveness';
 import type {
   GitHubClientDeps,
   OverseerRunRecord,
@@ -285,6 +293,18 @@ export interface WatchHeartbeatLogger {
   info(obj: Record<string, unknown>, msg: string): void;
   /** Optional so existing injected loggers keep working; falls back to the module logger. */
   warn?(obj: Record<string, unknown>, msg: string): void;
+  /** Optional; used for the isolated-failure lines. Falls back to the module logger. */
+  error?(obj: Record<string, unknown>, msg: string): void;
+}
+
+function logError(logger: WatchHeartbeatLogger, obj: Record<string, unknown>, msg: string): void {
+  if (typeof logger.error === 'function') logger.error(obj, msg);
+  else log.error(obj, msg);
+}
+
+function logWarn(logger: WatchHeartbeatLogger, obj: Record<string, unknown>, msg: string): void {
+  if (typeof logger.warn === 'function') logger.warn(obj, msg);
+  else log.warn(obj, msg);
 }
 
 export interface WatchOnceOptions {
@@ -300,6 +320,8 @@ export interface WatchOnceOptions {
   discovery?: DiscoverMergeCandidatesOptions;
   /** Set false to skip the PR-first sweep entirely (used by narrow unit tests). */
   discoveryEnabled?: boolean;
+  /** Per-step deadline (MERGE_SWEEP_STEP_TIMEOUT_MS, default 60000). */
+  stepTimeoutMs?: number;
 }
 
 /**
@@ -321,7 +343,21 @@ export async function watchOnce(
   options: WatchOnceOptions = {}
 ): Promise<WatchedRunRecord[]> {
   const heartbeatLogger: WatchHeartbeatLogger = options.logger ?? log;
-  const runs = await deps.listRunsForWatch();
+  const stepTimeoutMs = options.stepTimeoutMs ?? resolveStepTimeoutMs();
+  const onStepTimeout = (error: BoundedAwaitTimeoutError): void => {
+    logWarn(
+      heartbeatLogger,
+      { label: error.label, timeoutMs: error.timeoutMs },
+      'merge-coordinator.step_timeout'
+    );
+  };
+  recordSweepProgress();
+  const runs = await withBoundedAwait(
+    'watch.listRunsForWatch',
+    stepTimeoutMs,
+    () => deps.listRunsForWatch(),
+    { onTimeout: onStepTimeout }
+  );
   // listRunsForWatch is oldest-first. Filter non-terminal rows, then continue the
   // current fair pass so permanently unmerged old rows cannot hide later work.
   const maxRunsPerTick = options.maxRunsPerTick ?? resolveWatchMaxRunsPerTick();
@@ -342,7 +378,14 @@ export async function watchOnce(
     // every future tick -- exactly the failure class #1348 already fixed one level
     // downstream in handleRecord. One bad run's lookup must never take down the watcher.
     try {
-      outcomes.push(await assessRun(run, deps));
+      outcomes.push(
+        await withBoundedAwait(
+          `watch.assessRun:${run.id}`,
+          stepTimeoutMs,
+          () => assessRun(run, deps),
+          { onTimeout: onStepTimeout }
+        )
+      );
     } catch (error) {
       log.error(
         { err: error as Error, runId: run.id, woId: run.woId },
@@ -367,11 +410,22 @@ export async function watchOnce(
   let discovery: MergeCandidateDiscoveryResult = unavailableDiscoveryResult('not_run');
   if (options.discoveryEnabled !== false) {
     try {
-      discovery = await discoverMergeCandidates(deps, {
-        ...options.discovery,
-        alreadyCoveredPullRequests:
-          options.discovery?.alreadyCoveredPullRequests ?? coveredPullRequests(outcomes),
-      });
+      // The sweep bounds each of its own awaits; this outer deadline (listing
+      // every repo plus evaluating the budget) is the backstop so a wedge the
+      // inner bounds miss still cannot hold the pass.
+      discovery = await withBoundedAwait(
+        'watch.discoverMergeCandidates',
+        stepTimeoutMs * 5,
+        () =>
+          discoverMergeCandidates(deps, {
+            stepTimeoutMs,
+            logger: heartbeatLogger,
+            ...options.discovery,
+            alreadyCoveredPullRequests:
+              options.discovery?.alreadyCoveredPullRequests ?? coveredPullRequests(outcomes),
+          }),
+        { onTimeout: onStepTimeout }
+      );
     } catch (error) {
       // A broken sweep must never take down the watch tick -- the run-derived
       // outcomes above are still valid work.
@@ -435,6 +489,9 @@ export async function watchOnce(
       runsEvaluated: terminalRuns.length,
       runsTotal: runs.length,
       prsEvaluated: discovery.evaluated,
+      // Every listed PR is classified structurally each pass at zero GitHub cost;
+      // only approved ones consume evidence budget (`prsEvaluated`).
+      prsClassified: discovery.structurallyClassified,
       prCandidates: discovery.candidates.length,
       prDiscoveryUnavailable: discovery.unavailable,
       // Null when discovery ran. Otherwise the reason token; the matching warn
@@ -458,6 +515,7 @@ export async function watchOnce(
     },
     'merge-coordinator.heartbeat_evaluated'
   );
+  recordSweepProgress();
   return outcomes;
 }
 
@@ -476,10 +534,23 @@ export async function watchLoop(
      */
     discovery?: WatchOnceOptions['discovery'];
     discoveryEnabled?: boolean;
+    /** Logger for heartbeat and isolated-failure lines; defaults to the module logger. */
+    logger?: WatchHeartbeatLogger;
+    /** Per-step deadline; defaults to MERGE_SWEEP_STEP_TIMEOUT_MS (60000). */
+    stepTimeoutMs?: number;
+    /** Per-record deadline; defaults to MERGE_SWEEP_RECORD_TIMEOUT_MS (180000). */
+    recordTimeoutMs?: number;
+    /** Whole-pass deadline; defaults to MERGE_SWEEP_PASS_TIMEOUT_MS (300000). */
+    passTimeoutMs?: number;
   } = {}
 ): Promise<void> {
+  const loopLogger: WatchHeartbeatLogger = options.logger ?? log;
+  const recordTimeoutMs = options.recordTimeoutMs ?? resolveRecordTimeoutMs();
+  const passTimeoutMs = options.passTimeoutMs ?? resolvePassTimeoutMs();
   const intervalMs = options.intervalMs ?? DEFAULT_WATCH_INTERVAL_MS;
   const watchOptions: WatchOnceOptions = {
+    ...(options.logger === undefined ? {} : { logger: options.logger }),
+    ...(options.stepTimeoutMs === undefined ? {} : { stepTimeoutMs: options.stepTimeoutMs }),
     ...(options.discovery === undefined ? {} : { discovery: options.discovery }),
     ...(options.discoveryEnabled === undefined
       ? {}
@@ -487,11 +558,56 @@ export async function watchLoop(
   };
   for (;;) {
     if (options.signal?.aborted) return;
-    const records = await watchOnce(deps, watchOptions);
-    for (const record of records) {
-      if (options.signal?.aborted) return;
-      await onRecord(record);
+    // A pass can fail or hang for reasons unrelated to the records it carries
+    // (a locked database, a wedged GitHub call). Neither may end this loop:
+    // on 2026-11-04 one escaped error stopped the merge sweep for an hour. Only
+    // an aborted signal ends it.
+    try {
+      const records = await withBoundedAwait(
+        'watch.watchOnce',
+        passTimeoutMs,
+        () => watchOnce(deps, watchOptions),
+        {
+          onTimeout: error => {
+            logError(
+              loopLogger,
+              { label: error.label, timeoutMs: error.timeoutMs },
+              'merge-coordinator.step_timeout'
+            );
+          },
+        }
+      );
+      for (const record of records) {
+        if (options.signal?.aborted) return;
+        try {
+          await withBoundedAwait('watch.onRecord', recordTimeoutMs, () => onRecord(record), {
+            onTimeout: error => {
+              logError(
+                loopLogger,
+                { runId: record.runId, label: error.label, timeoutMs: error.timeoutMs },
+                'merge-coordinator.record_timeout'
+              );
+            },
+          });
+        } catch (error) {
+          if (!(error instanceof BoundedAwaitTimeoutError)) {
+            logError(
+              loopLogger,
+              { err: error as Error, stage: 'onRecord', runId: record.runId },
+              'overseer.watch.pass_failed_isolated'
+            );
+          }
+        }
+        recordSweepProgress();
+      }
+    } catch (error) {
+      logError(
+        loopLogger,
+        { err: error as Error, stage: 'watchOnce' },
+        'overseer.watch.pass_failed_isolated'
+      );
     }
+    recordSweepProgress();
     if (options.once) return;
     await new Promise<void>(resolve => {
       const signal = options.signal;

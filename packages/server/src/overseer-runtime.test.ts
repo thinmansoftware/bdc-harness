@@ -440,6 +440,129 @@ describe('overseer-runtime', () => {
     await stopOverseerRuntime();
   });
 
+  // Test 4 (WO-HARNESS-MERGE-SWEEP-LIVENESS-AND-PAGING-01): a service rejection no longer leaves
+  // the watcher, merge bridge and reconcile loop dead; the runtime restarts it with bounded
+  // backoff and still stops cleanly.
+  test('Test 4: supervisor restarts the watcher with backoff and stops cleanly', async () => {
+    setEnabledEnv();
+    const logs: Array<{ level: string; obj: Record<string, unknown>; msg: string }> = [];
+    const logger = {
+      info: (obj: Record<string, unknown>, msg: string) => logs.push({ level: 'info', obj, msg }),
+      error: (obj: Record<string, unknown>, msg: string) => logs.push({ level: 'error', obj, msg }),
+    };
+    // Deterministic scheduler: nothing fires until the test says so.
+    const timers: Array<{ fn: () => void; ms: number; cleared: boolean }> = [];
+    const setTimer = (fn: () => void, ms: number): unknown => {
+      const timer = { fn, ms, cleared: false };
+      timers.push(timer);
+      return timer;
+    };
+    const clearTimer = (handle: unknown): void => {
+      (handle as { cleared: boolean }).cleared = true;
+    };
+    let monitorStops = 0;
+    let serviceCalls = 0;
+    runOverseerServiceMock.mockImplementation(async (opts?: unknown) => {
+      serviceCalls += 1;
+      if (serviceCalls <= 2) throw new Error(`database is locked (${serviceCalls})`);
+      // Third start stays up until the runtime aborts it.
+      const signal = (opts as { signal: AbortSignal }).signal;
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve()));
+    });
+    const flush = async (): Promise<void> => {
+      for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    };
+
+    startOverseerRuntime({
+      runService: runOverseerServiceMock,
+      logger,
+      supervisor: { setTimer, clearTimer },
+      startLivenessMonitor: () => ({
+        check: async () => false,
+        stop: () => {
+          monitorStops += 1;
+        },
+      }),
+    });
+    await flush();
+
+    // Rejection 1: degraded, restart scheduled at 5 s.
+    expect((await getStatus()).watcher).toBe('degraded');
+    expect(timers).toHaveLength(1);
+    expect(timers[0]?.ms).toBe(5_000);
+    expect(
+      logs.filter(entry => entry.msg === 'overseer_runtime.watcher_exception_degraded')
+    ).toHaveLength(1);
+    expect(logs.find(entry => entry.msg === 'overseer_runtime.watcher_restarting')?.obj).toEqual({
+      attempt: 1,
+      delayMs: 5_000,
+    });
+
+    // A second start during backoff must not stack a second watcher.
+    startOverseerRuntime({ runService: runOverseerServiceMock, logger });
+    expect(serviceCalls).toBe(1);
+
+    timers[0]?.fn();
+    await flush();
+
+    // Rejection 2: degraded again, backoff doubled to 10 s.
+    expect(serviceCalls).toBe(2);
+    expect((await getStatus()).watcher).toBe('degraded');
+    expect(timers).toHaveLength(2);
+    expect(timers[1]?.ms).toBe(10_000);
+    const restarts = logs.filter(entry => entry.msg === 'overseer_runtime.watcher_restarting');
+    expect(restarts.map(entry => entry.obj.attempt)).toEqual([1, 2]);
+    expect(
+      logs.filter(entry => entry.msg === 'overseer_runtime.watcher_exception_degraded')
+    ).toHaveLength(2);
+
+    timers[1]?.fn();
+    await flush();
+
+    // Third start stays up: running, no further timers.
+    expect(serviceCalls).toBe(3);
+    expect((await getStatus()).watcher).toBe('running');
+    expect(timers).toHaveLength(2);
+
+    await stopOverseerRuntime();
+    expect(monitorStops).toBeGreaterThanOrEqual(1);
+    expect((await getStatus()).watcher).not.toBe('running');
+    expect(serviceCalls).toBe(3);
+  });
+
+  test('Test 4b: stopping during backoff clears the restart timer and never restarts', async () => {
+    setEnabledEnv();
+    const timers: Array<{ fn: () => void; ms: number; cleared: boolean }> = [];
+    const setTimer = (fn: () => void, ms: number): unknown => {
+      const timer = { fn, ms, cleared: false };
+      timers.push(timer);
+      return timer;
+    };
+    const clearTimer = (handle: unknown): void => {
+      (handle as { cleared: boolean }).cleared = true;
+    };
+    let serviceCalls = 0;
+    runOverseerServiceMock.mockImplementation(async () => {
+      serviceCalls += 1;
+      throw new Error('database is locked');
+    });
+    startOverseerRuntime({
+      runService: runOverseerServiceMock,
+      supervisor: { setTimer, clearTimer },
+      startLivenessMonitor: () => ({ check: async () => false, stop: () => undefined }),
+    });
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    expect(timers).toHaveLength(1);
+
+    await stopOverseerRuntime();
+    expect(timers[0]?.cleared).toBe(true);
+    // Even if the (cleared) timer body ran, an intentional stop must not restart anything.
+    timers[0]?.fn();
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    expect(serviceCalls).toBe(1);
+    expect((await getStatus()).watcher).toBe('stopped');
+  });
+
   test('startup order: reconciliation precedes watcher (integration contract)', () => {
     const calls: string[] = [];
     calls.push('observeStartupRecovery');

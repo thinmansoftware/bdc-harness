@@ -48,6 +48,7 @@
  * still the Merge Manager's call, on exactly the rules it had before.
  */
 import { createLogger } from '@archon/paths';
+import { BoundedAwaitTimeoutError, resolveStepTimeoutMs, withBoundedAwait } from './bounded-await';
 import {
   hasRepoPolicyEntry,
   LEGACY_ALLOWED_BASES_ENV,
@@ -122,8 +123,18 @@ export interface MergeCandidateDiscoveryResult {
   readonly candidates: readonly WatchedRunRecord[];
   /** One entry per PR that was evaluated and NOT included. */
   readonly exclusions: readonly MergeCandidateExclusion[];
-  /** How many PRs were actually looked at this tick. */
+  /**
+   * How many PRs consumed EVIDENCE budget this tick (approved PRs on a watched
+   * base that got the findPullRequest / required-contexts / qualified-review
+   * lookups). Non-approved PRs never consume it; see `structurallyClassified`.
+   */
   readonly evaluated: number;
+  /**
+   * How many listed PRs were classified structurally this tick (zero GitHub
+   * calls). Every listed PR is, every pass, and each non-candidate carries a
+   * named exclusion.
+   */
+  readonly structurallyClassified: number;
   /**
    * How many evaluated PRs had their review decision resolved by the
    * conservative REST fallback instead of GitHub's own aggregate. Non-zero
@@ -241,6 +252,7 @@ export function unavailableDiscoveryResult(
     candidates: [],
     exclusions: [],
     evaluated: 0,
+    structurallyClassified: 0,
     fallbackReviewDecisions: 0,
     unavailable: true,
     unavailableReason: reason,
@@ -485,20 +497,31 @@ export function classifyPullRequestEvidence(
 async function resolveDiscoveryRequiredContexts(
   deps: MergeCandidateDiscoveryDeps,
   pr: DiscoveredPullRequest,
-  logger: DiscoveryLogger
+  logger: DiscoveryLogger,
+  stepTimeoutMs: number
 ): Promise<RequiredContextsResolution> {
   const lookups = deps.requiredContextsLookups;
   let resolution: RequiredContextsResolution;
   try {
-    resolution = await resolveRequiredContexts(
+    resolution = await withBoundedAwait(
+      `discovery.requiredContexts:${pr.owner}/${pr.repo}#${pr.prNumber}`,
+      stepTimeoutMs,
+      () =>
+        resolveRequiredContexts(
+          {
+            ...(lookups ?? {}),
+            owner: pr.owner,
+            repo: pr.repo,
+            baseRef: pr.baseRef,
+            headSha: pr.headSha,
+          },
+          lookups ? process.env : {}
+        ),
       {
-        ...(lookups ?? {}),
-        owner: pr.owner,
-        repo: pr.repo,
-        baseRef: pr.baseRef,
-        headSha: pr.headSha,
-      },
-      lookups ? process.env : {}
+        onTimeout: error => {
+          logStepTimeout(logger, error);
+        },
+      }
     );
   } catch (error) {
     // A resolver fault must not take down the sweep. Unknown keeps the
@@ -696,6 +719,8 @@ export interface DiscoverMergeCandidatesOptions {
    * `already_a_run_candidate` rather than evaluated twice.
    */
   readonly alreadyCoveredPullRequests?: ReadonlySet<string>;
+  /** Per-step deadline for each GitHub-touching await (MERGE_SWEEP_STEP_TIMEOUT_MS, 60000). */
+  readonly stepTimeoutMs?: number;
   /**
    * Where to resume the rotating evaluation window. Pass the previous tick's
    * `cursorAfter`. Omitted or null starts from the beginning of the population.
@@ -851,6 +876,15 @@ export function isPullRequestDiscoveredCandidate(record: {
   );
 }
 
+/** Name the hung call. A timeout is isolated like the throw it replaces, but never silent. */
+function logStepTimeout(logger: DiscoveryLogger, error: BoundedAwaitTimeoutError): void {
+  warnVia(
+    logger,
+    { label: error.label, timeoutMs: error.timeoutMs },
+    'merge-coordinator.step_timeout'
+  );
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -909,6 +943,7 @@ export async function discoverMergeCandidates(
   }
 
   const maxPullRequests = options.maxPullRequestsPerTick ?? resolveDiscoveryMaxPrsPerTick();
+  const stepTimeoutMs = options.stepTimeoutMs ?? resolveStepTimeoutMs();
   const alreadyCovered = options.alreadyCoveredPullRequests ?? new Set<string>();
 
   const candidates: WatchedRunRecord[] = [];
@@ -938,11 +973,21 @@ export async function discoverMergeCandidates(
           'merge-coordinator.repo_policy_missing'
         );
       }
-      const listed = await listOpenPullRequests({
-        owner: target.owner,
-        repo: target.repo,
-        baseBranches: watchedBases,
-      });
+      const listed = await withBoundedAwait(
+        `discovery.listOpenPullRequests:${target.owner}/${target.repo}`,
+        stepTimeoutMs,
+        () =>
+          listOpenPullRequests({
+            owner: target.owner,
+            repo: target.repo,
+            baseBranches: watchedBases,
+          }),
+        {
+          onTimeout: error => {
+            logStepTimeout(logger, error);
+          },
+        }
+      );
       byRepo.set(repoKey(target.owner, target.repo), listed);
       anyRepoListed = true;
     } catch (error) {
@@ -965,29 +1010,30 @@ export async function discoverMergeCandidates(
   }
 
   const startCursor = options.cursor === undefined ? processCursor : options.cursor;
-  const queues = rotatedQueues(repos, byRepo, startCursor);
-  const totalOpen = queues.reduce((sum, entry) => sum + entry.queue.length, 0);
-  // Unevaluated PRs remaining in THIS pass. `totalOpen` is the whole population,
-  // so comparing evaluated against it would report a pass as truncated even on
-  // the tick that finishes it -- the window is truncated when work is left over.
-  const freshTotal = queues.reduce((sum, entry) => sum + entry.fresh.length, 0);
-  const sequence = interleaveByRepo(queues);
 
-  // Where each repo got to this tick, so the next tick resumes per repo rather
-  // than rewinding every repo to whichever one happened to be evaluated last.
-  const lastPerRepo = new Map<string, number>();
-  {
-    for (const pr of sequence) {
-      if (evaluated >= maxPullRequests) break;
-      evaluated += 1;
-      lastPerRepo.set(repoKey(pr.owner, pr.repo), pr.prNumber);
-      // Counted BEFORE any exclusion `continue`: the PRs this most matters for
-      // are precisely the ones the stricter fallback pushed into
-      // `review_not_approved`. Counting only survivors would hide them.
+  // STRUCTURAL CLASSIFICATION OF EVERY LISTED PR, EVERY PASS, ZERO GITHUB CALLS.
+  //
+  // The approval signal (`reviewDecision`) is already on every listed PR, so the
+  // split between "cannot merge yet" and "worth an evidence lookup" is free.
+  // Non-approved PRs used to consume the 100-slot evidence budget, so with 663
+  // open PRs an approved one waited for the rotation to reach its number (and a
+  // restart reset the rotation). Now each PR is classified here and gets a named
+  // exclusion; only approved PRs on a watched base enter the evidence queue,
+  // which the existing per-repo cursor rotates under `maxPullRequestsPerTick`.
+  let structurallyClassified = 0;
+  let totalOpen = 0;
+  const approvedByRepo = new Map<string, DiscoveredPullRequest[]>();
+  for (const target of repos) {
+    const key = repoKey(target.owner, target.repo);
+    for (const pr of byRepo.get(key) ?? []) {
+      structurallyClassified += 1;
+      totalOpen += 1;
+      // Counted for every classified PR: the PRs this most matters for are the
+      // ones the stricter fallback pushed into `review_not_approved`.
       if (pr.reviewDecisionFromFallback) fallbackReviewDecisions += 1;
 
-      const key = pullRequestKey(pr.owner, pr.repo, pr.prNumber);
-      if (alreadyCovered.has(key)) {
+      const prKey = pullRequestKey(pr.owner, pr.repo, pr.prNumber);
+      if (alreadyCovered.has(prKey)) {
         exclusions.push({
           owner: pr.owner,
           repo: pr.repo,
@@ -997,7 +1043,6 @@ export async function discoverMergeCandidates(
         });
         continue;
       }
-
       const structural = classifyDiscoveredPullRequest(pr, explicitWatchedBases, policy);
       if (structural) {
         exclusions.push({
@@ -1009,20 +1054,50 @@ export async function discoverMergeCandidates(
         });
         continue;
       }
+      const bucket = approvedByRepo.get(key) ?? [];
+      bucket.push(pr);
+      approvedByRepo.set(key, bucket);
+    }
+  }
+
+  const queues = rotatedQueues(repos, approvedByRepo, startCursor);
+  // Unevaluated APPROVED PRs remaining in THIS pass. The window is truncated
+  // when approved work is left over, not when merely-listed PRs were skipped.
+  const freshTotal = queues.reduce((sum, entry) => sum + entry.fresh.length, 0);
+  const sequence = interleaveByRepo(queues);
+
+  // Where each repo got to this tick, so the next tick resumes per repo rather
+  // than rewinding every repo to whichever one happened to be evaluated last.
+  const lastPerRepo = new Map<string, number>();
+  {
+    for (const pr of sequence) {
+      if (evaluated >= maxPullRequests) break;
+      evaluated += 1;
+      lastPerRepo.set(repoKey(pr.owner, pr.repo), pr.prNumber);
 
       let evidence: PullRequestEvidence;
       try {
-        evidence = await deps.findPullRequest({
-          owner: pr.owner,
-          repo: pr.repo,
-          headBranch: pr.headRef,
-          woId: pr.woId,
-          // The unique key, passed so an adapter that can address a PR directly
-          // resolves THIS one instead of searching by the ambiguous branch/WO.
-          // Optional in the contract, so existing implementations that ignore it
-          // still work -- and are still caught by the binding check below.
-          prNumber: pr.prNumber,
-        });
+        evidence = await withBoundedAwait(
+          `discovery.findPullRequest:${pr.owner}/${pr.repo}#${pr.prNumber}`,
+          stepTimeoutMs,
+          () =>
+            deps.findPullRequest({
+              owner: pr.owner,
+              repo: pr.repo,
+              headBranch: pr.headRef,
+              woId: pr.woId,
+              // The unique key, passed so an adapter that can address a PR directly
+              // resolves THIS one instead of searching by the ambiguous branch/WO.
+              // Optional in the contract, so existing implementations that ignore it
+              // still work -- and are still caught by the binding check below.
+              prNumber: pr.prNumber,
+            }),
+          {
+            onTimeout: error => {
+              logStepTimeout(logger, error);
+            },
+          }
+        );
       } catch {
         exclusions.push({
           owner: pr.owner,
@@ -1052,7 +1127,12 @@ export async function discoverMergeCandidates(
         continue;
       }
 
-      const requiredContexts = await resolveDiscoveryRequiredContexts(deps, pr, logger);
+      const requiredContexts = await resolveDiscoveryRequiredContexts(
+        deps,
+        pr,
+        logger,
+        stepTimeoutMs
+      );
       const evidenceReason = classifyPullRequestEvidence(evidence, requiredContexts);
       if (evidenceReason) {
         exclusions.push({
@@ -1068,15 +1148,42 @@ export async function discoverMergeCandidates(
       // GitHub's aggregate APPROVED bit is not merge authority. Production
       // callers must supply the receipt-backed guard. Missing qualification
       // authority fails closed just like an explicit negative result.
-      if (
-        !deps.hasQualifiedReview ||
-        !(await deps.hasQualifiedReview({
+      let qualified = false;
+      let qualificationLookupFailed = false;
+      if (deps.hasQualifiedReview) {
+        try {
+          qualified = await withBoundedAwait(
+            `discovery.hasQualifiedReview:${pr.owner}/${pr.repo}#${pr.prNumber}`,
+            stepTimeoutMs,
+            () =>
+              deps.hasQualifiedReview?.({
+                owner: pr.owner,
+                repo: pr.repo,
+                number: pr.prNumber,
+                headSha: pr.headSha,
+              }) ?? Promise.resolve(false),
+            {
+              onTimeout: error => {
+                logStepTimeout(logger, error);
+              },
+            }
+          );
+        } catch {
+          qualificationLookupFailed = true;
+        }
+      }
+      if (qualificationLookupFailed) {
+        exclusions.push({
           owner: pr.owner,
           repo: pr.repo,
-          number: pr.prNumber,
-          headSha: pr.headSha,
-        }))
-      ) {
+          prNumber: pr.prNumber,
+          reason: 'evidence_lookup_failed',
+          detail: 'qualified-review lookup threw or timed out -- state unknown, retried next tick',
+        });
+        continue;
+      }
+      // Missing qualification authority fails closed (the dependency check is explicit).
+      if (!deps.hasQualifiedReview || !qualified) {
         exclusions.push({
           owner: pr.owner,
           repo: pr.repo,
@@ -1117,6 +1224,7 @@ export async function discoverMergeCandidates(
   logger.info(
     {
       evaluated,
+      structurallyClassified,
       totalOpen,
       cursorAfter,
       truncated: evaluationWindowTruncated,
@@ -1128,6 +1236,7 @@ export async function discoverMergeCandidates(
     candidates,
     exclusions,
     evaluated,
+    structurallyClassified,
     fallbackReviewDecisions,
     unavailable: false,
     unavailableReason: null,

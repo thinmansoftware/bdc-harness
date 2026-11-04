@@ -165,7 +165,13 @@ describe('merge candidate discovery -- the #758 candidate set', () => {
       repos: REPOS,
     });
 
-    expect(result.evaluated).toBe(5);
+    // Approved-first budgeting (WO-HARNESS-MERGE-SWEEP-LIVENESS-AND-PAGING-01): the draft (733)
+    // and CHANGES_REQUESTED (732) PRs are classified structurally at zero cost and no longer
+    // consume evidence budget, so `evaluated` counts the three approved PRs only. Population
+    // coverage is `structurallyClassified`.
+    expect(result.evaluated).toBe(3);
+    expect(result.structurallyClassified).toBe(5);
+    expect(result.exclusions).toHaveLength(4);
     expect(result.unavailable).toBe(false);
     expect(result.candidates).toHaveLength(1);
     expect(result.candidates[0]?.prEvidence.pr?.number).toBe(730);
@@ -226,7 +232,9 @@ describe('merge candidate discovery -- the #758 candidate set', () => {
       { watchedBases: WATCHED_BASES, repos: REPOS }
     );
 
-    expect(result.evaluated).toBe(1);
+    // Structurally excluded PRs cost no evidence budget (same WO); still classified and named.
+    expect(result.evaluated).toBe(0);
+    expect(result.structurallyClassified).toBe(1);
     expect(result.candidates).toHaveLength(0);
     expect(result.exclusions[0]?.reason).toBe('base_branch_not_watched');
     expect(result.exclusions[0]?.detail).toContain('main');

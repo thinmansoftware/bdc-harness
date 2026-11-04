@@ -81,3 +81,58 @@ select action_reason, merge_attempts, merge_not_before from overseer_verdicts wh
 ```
 
 Merging this code does not update the running source-copy container. XO must rebuild the container before runtime verification. Production requeue and canary execution are XO post-merge actions, not builder actions.
+
+## Sweep liveness and supervision
+
+Added by WO-HARNESS-MERGE-SWEEP-LIVENESS-AND-PAGING-01 after the 2026-11-04 stall: a SQLITE_BUSY in the
+operator-card delivery drain went uncaught, stopped the watcher, merge bridge and reconcile loops together,
+and nothing restarted them or raised an alarm for about an hour. Approved green PRs sat unmerged meanwhile.
+
+What now protects the sweep:
+
+- Every await in a pass has a deadline (`withBoundedAwait`). A hung GitHub call or database read becomes a named
+  `merge-coordinator.step_timeout` (repo skipped, PR excluded as `evidence_lookup_failed`, run skipped) instead of
+  holding the pass forever. A hung record handler logs `merge-coordinator.record_timeout` and is re-derived next pass.
+- `watchLoop` cannot be ended by a pass error. A throw or timeout is logged at error level as
+  `overseer.watch.pass_failed_isolated` and the next pass runs. Only an aborted signal ends the loop.
+- The delivery scheduler isolates its own errors (`overseer.delivery.iteration_failed_isolated`), like the
+  reconcile and merge-bridge schedulers. `abortOnFailure` in `runOverseerService` remains only as a last-resort guard.
+- `startOverseerRuntime` supervises the service. If it still rejects, `overseer_runtime.watcher_exception_degraded`
+  is logged, then `overseer_runtime.watcher_restarting` (attempt number, delay) and the service restarts after
+  5 s, doubling to a 60 s cap; five minutes of healthy running resets the counter. `stopOverseerRuntime` cancels any
+  pending restart and a rejection after an intentional stop never restarts.
+- An independent liveness monitor (own `setInterval`, unref'd) compares the newest sweep progress stamp (pass
+  start, heartbeat, each settled record, iteration end) to the clock. After 10 minutes of silence it logs
+  `merge-coordinator.liveness_alarm` at error level on every check and posts ONE operator message per episode
+  (`recipient: operator`, `priority: blocker`, via the same `createAuthenticatedMessage` path as the Taskmaster
+  dead-man checker). A failed post retries on the next check. Fresh progress logs
+  `merge-coordinator.liveness_recovered` and re-arms.
+- Discovery is approved-first. Every listed PR is classified structurally every pass with zero GitHub calls and
+  each non-candidate carries a named exclusion (`merge-coordinator.candidate_excluded`). Only approved PRs on a
+  watched base consume the evidence budget (`OVERSEER_MERGE_DISCOVERY_MAX_PRS_PER_TICK`, default 100), rotated by
+  the existing per-repo cursor, so an approved green PR is a candidate within one pass regardless of how many PRs
+  are open. The heartbeat reports `prsClassified` (whole population) next to `prsEvaluated` (evidence budget).
+
+Environment variables (all optional; defaults shown):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MERGE_SWEEP_STEP_TIMEOUT_MS` | 60000 | Deadline for one GitHub or database step in a pass |
+| `MERGE_SWEEP_RECORD_TIMEOUT_MS` | 180000 | Deadline for handling one record |
+| `MERGE_SWEEP_PASS_TIMEOUT_MS` | 300000 | Deadline for one whole `watchOnce` |
+| `MERGE_SWEEP_LIVENESS_MAX_SILENCE_MS` | 600000 | Silence before the alarm; `0` disables the monitor |
+| `MERGE_SWEEP_LIVENESS_CHECK_MS` | 60000 | How often the monitor checks |
+
+Log tokens to grep in `docker logs archon-app-1`: `merge-coordinator.heartbeat_evaluated` (one per pass, should be
+about one per minute), `merge-coordinator.step_timeout`, `merge-coordinator.record_timeout`,
+`overseer.watch.pass_failed_isolated`, `overseer_runtime.watcher_restarting`, `merge-coordinator.liveness_alarm`,
+`merge-coordinator.liveness_recovered`.
+
+Operator response to a liveness alarm message (or a `liveness_alarm` log line):
+
+1. Confirm: `ssh hetzner-prod "docker logs --since 20m archon-app-1 2>&1 | grep -E 'merge-coordinator.heartbeat_evaluated|overseer_runtime.watcher|pass_failed_isolated|step_timeout' | tail -20"`.
+2. If `watcher_restarting` lines are repeating, read the error on the preceding `watcher_exception_degraded` line and fix that cause (a database lock, a bad config).
+3. If no heartbeat and no restart lines appear, the process is wedged outside the sweep: rebuild or restart `archon-app-1` under the standing harness rebuild rule.
+4. After recovery a `merge-coordinator.liveness_recovered` line confirms the monitor re-armed.
+
+Merging this code does not update the running source-copy container. XO must rebuild the container before the live outcome check.
