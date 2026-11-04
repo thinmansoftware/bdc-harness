@@ -24,6 +24,7 @@ import {
   createAuthenticatedMessage,
   getMessage,
   listMessages,
+  normalizeDispatchSubjectKey,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
   type DispatchRecipientAssessment,
@@ -65,6 +66,8 @@ import {
   type CascadeEvidenceDeps,
 } from './expectations';
 import { canonicalizeThreadRef } from './thread-ref';
+import { pageOnce } from '../dispatch/worker-heartbeat-alarm';
+import { sendCanaryTelegramAlert } from '../services/canary-telegram-alert';
 import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
 import {
   createDeadmanState,
@@ -272,6 +275,37 @@ export interface TaskmasterDeps {
    * claim when the real DAL is in use (no deps.db), else none.
    */
   escalationDelivery?: EscalationDeliveryDeps;
+  /**
+   * Operator page transport for a REJECTED Dispatch send (fence 281). Defaults
+   * to the same Telegram page the worker-heartbeat alarm uses; tests capture it.
+   */
+  pageOperator?: (text: string) => Promise<void>;
+}
+
+/** One operator page per thread per clock hour for rejected Dispatch sends. */
+export const SEND_REJECTED_PAGE_BUCKET_MS = 60 * 60 * 1000;
+
+/**
+ * Map a Taskmaster thread ref to a Dispatch subject_key the core validator
+ * (normalizeDispatchSubjectKey: wo:, digest:YYYY-MM-DD, gh:) accepts.
+ *
+ * gh:, wo: and digest: refs pass through unchanged (canonicalized). Any other
+ * ref -- dispatch:<message-id> from undelivered rulings, or a future non-GitHub
+ * source -- maps deterministically to the documented Taskmaster day thread
+ * digest:<UTC date of the send>. The original ref is not lost: it stays on the
+ * tm_journal row's thread_ref and inside the message body. The validator is
+ * NOT widened: wo:/digest:/gh: is the contract its other readers also enforce
+ * (duty-officer-clock escalationSubjectKey), and subject_key here only groups
+ * same-subject rows for the repeat_reason check, which every Taskmaster verb
+ * already satisfies unconditionally (TM_REPEAT_REASON_BY_TYPE).
+ */
+export function dispatchSubjectKeyForThreadRef(threadRef: string, nowMs: number): string {
+  const canonical = canonicalizeThreadRef(threadRef);
+  try {
+    return normalizeDispatchSubjectKey(canonical);
+  } catch {
+    return `digest:${new Date(nowMs).toISOString().slice(0, 10)}`;
+  }
 }
 
 export interface TickResult {
@@ -2352,6 +2386,8 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       continue;
     }
 
+    let dispatchSendRejected = false;
+    let dispatchSubjectKey: string | null = null;
     try {
       const escalationIssue =
         proposal.type === 'escalate_p0' && resolveEscalateToIssueEnabled()
@@ -2588,20 +2624,29 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
           continue;
         }
       } else {
-        const dispatched = await createTask(
-          { kind: 'system', sender: 'taskmaster' },
-          {
-            correlation_id: `tm-${journalRow.id}`,
-            idempotency_key: proposal.idempotencyKey,
-            task_type: 'agent_message',
-            recipient: proposal.type === 'digest' ? 'duty-officer' : proposal.recipient,
-            body: proposal.body,
-            // Same-subject grouping + unconditional per-verb repeat reason
-            // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.
-            subject_key: canonicalizeThreadRef(proposal.threadRef),
-            repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
-          }
-        );
+        dispatchSubjectKey = dispatchSubjectKeyForThreadRef(proposal.threadRef, nowMs);
+        let dispatched: Awaited<ReturnType<typeof createTask>>;
+        try {
+          dispatched = await createTask(
+            { kind: 'system', sender: 'taskmaster' },
+            {
+              correlation_id: `tm-${journalRow.id}`,
+              idempotency_key: proposal.idempotencyKey,
+              task_type: 'agent_message',
+              recipient: proposal.type === 'digest' ? 'duty-officer' : proposal.recipient,
+              body: proposal.body,
+              // Same-subject grouping + unconditional per-verb repeat reason
+              // (M-155 WO 3): see TM_REPEAT_REASON_BY_TYPE for why unconditional.
+              subject_key: dispatchSubjectKey,
+              repeat_reason: TM_REPEAT_REASON_BY_TYPE[proposal.type],
+            }
+          );
+        } catch (sendError) {
+          // Dispatch refused the send itself (validator, recipient, repeat
+          // check). Marked so the catch below fails it LOUD, not silently.
+          dispatchSendRejected = true;
+          throw sendError;
+        }
         const registerExpectation =
           dal.registerExpectation ?? (!deps.db ? taskmasterDb.registerExpectation : undefined);
         await registerExpectation?.({
@@ -2647,17 +2692,73 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       // Record WHY: the reason was only logged before, so the 5,319 failed
       // rows of 2026-11-01 had no recoverable cause in the journal.
       const failureReason = (error instanceof Error ? error.message : String(error)).slice(0, 200);
+      // A rejected Dispatch send records its reason for EVERY verb (fence 281:
+      // never silent), in the same proposal_json.failure field the 2026-11-01
+      // taskmaster_github_token_missing rows used.
       await dal.updateActionOutcome(
         journalRow.id,
         'failed',
-        proposal.type === 'escalate_p0'
-          ? JSON.stringify({ ...proposal, failure: failureReason })
-          : undefined
+        dispatchSendRejected
+          ? JSON.stringify({
+              ...proposal,
+              failure: failureReason,
+              failure_stage: 'dispatch_send',
+              subject_key: dispatchSubjectKey,
+            })
+          : proposal.type === 'escalate_p0'
+            ? JSON.stringify({ ...proposal, failure: failureReason })
+            : undefined
       );
       journalRow.outcome = 'failed';
       if (proposal.type === 'escalate_p0') recentEscalateP0ByThread.add(canonicalProposalRef);
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');
+      if (dispatchSendRejected) {
+        log.error(
+          {
+            actionType: proposal.type,
+            threadRef: proposal.threadRef,
+            subjectKey: dispatchSubjectKey,
+            idempotencyKey: proposal.idempotencyKey,
+            failure: failureReason,
+          },
+          'taskmaster.dispatch_send_rejected'
+        );
+        // Page the operator through the worker-heartbeat alarm's journal-first
+        // path, keyed per thread per clock hour so a retrying rejection pages
+        // once an hour, never once a tick. A failed page leaves its row
+        // 'failed' and the next rejection in the hour retries it.
+        const hourBucket = Math.floor(nowMs / SEND_REJECTED_PAGE_BUCKET_MS);
+        try {
+          await pageOnce(
+            {
+              pageOperator:
+                deps.pageOperator ?? ((text): Promise<void> => sendCanaryTelegramAlert(text)),
+              journal: dal,
+            },
+            {
+              idempotencyKey: `tm:send-rejected-page:${canonicalProposalRef}:${hourBucket}`,
+              threadRef: `dispatch-send-rejected:${canonicalProposalRef}`,
+              text:
+                `[TASKMASTER SEND REJECTED] ${proposal.type} for ${proposal.threadRef} ` +
+                `was refused by Dispatch: ${failureReason}. Journal row ${journalRow.id} is failed.`,
+              proposal: {
+                kind: 'dispatch_send_rejected',
+                action_type: proposal.type,
+                thread_ref: proposal.threadRef,
+                subject_key: dispatchSubjectKey,
+                journal_id: journalRow.id,
+                failure: failureReason,
+              },
+            }
+          );
+        } catch (pageError) {
+          log.error(
+            { err: pageError as Error, threadRef: proposal.threadRef },
+            'taskmaster.dispatch_send_rejected_page_failed'
+          );
+        }
+      }
     }
   }
 
