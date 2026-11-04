@@ -317,8 +317,11 @@ export function parseWorkerRestartEvidence(
  * is already present, so a row already 'sent' is skipped (no duplicate page) and
  * a 'pending'/'failed' row is retried. The alarm therefore holds no state -- a
  * restart mid-drain simply re-reads the row and continues.
+ *
+ * Exported so the Taskmaster's rejected-send alarm pages through this same
+ * journal-first path (one row per idempotency key, so one page per key).
  */
-async function pageOnce(
+export async function pageOnce(
   deps: { pageOperator: (text: string) => Promise<void>; journal: WorkerHeartbeatAlarmJournal },
   args: { idempotencyKey: string; threadRef: string; text: string; proposal: unknown }
 ): Promise<void> {
