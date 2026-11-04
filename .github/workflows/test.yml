@@ -204,12 +204,21 @@ jobs:
             printf "%s\n" "{\"packageManager\":\"pnpm@12.14.0\"}" > package.json
             for attempt in 1 2; do
               test "$(pnpm --version)" = "12.14.0"
-              test "$(pnpm exec node --version)" = "v26.12.1"
+              test "$(pnpm exec node --version)" = "v26.13.0"
             done
             test "$(cat package.json)" = "{\"packageManager\":\"pnpm@12.14.0\"}"
-            case "$(node --version)" in v26*) exit 1 ;; esac
+            test "$(node --version)" = "v26.13.0"
+            test "$(command -v node)" = "/opt/node26/bin/node"
             test "$(bun --version)" = "1.3.11"
           '
+
+      - name: Node LTS smoke (default node, npm, npx, pnpm, bun, node:sqlite, agent-browser)
+        run: |
+          for user in appuser root; do
+            docker run --rm --user "$user" --entrypoint sh \
+              -v "$PWD/scripts/container/node-lts-smoke.sh:/tmp/node-lts-smoke.sh:ro" \
+              archon-ci:test /tmp/node-lts-smoke.sh v26.13.0
+          done
 
       - name: Smoke test -- packaged GitHub helper dependency closure
         run: |
