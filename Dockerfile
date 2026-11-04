@@ -206,7 +206,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends xz-utils \
 ENV PATH=/opt/node26/bin:${PATH}
 RUN ln -sf /opt/node26/bin/node /usr/local/bin/node \
     && ln -sf /opt/node26/bin/npm /usr/local/bin/npm \
-    && ln -sf /opt/node26/bin/npx /usr/local/bin/npx \n    && ln -sf /usr/bin/python3 /usr/local/bin/python
+    && ln -sf /opt/node26/bin/npx /usr/local/bin/npx \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python
 
 # Install agent-browser CLI (Vercel Labs) for E2E testing workflows
 # - Uses npm (not bun) because postinstall script downloads the native Rust binary
