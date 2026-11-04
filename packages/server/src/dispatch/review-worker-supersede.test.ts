@@ -6,10 +6,15 @@
  * redundant reviews never run. Rows created after the claim survive.
  *
  * The store is an in-memory dispatch mailbox with the same rules as
- * packages/core/src/db/dispatch.ts for the transitions used here: claim bumps
- * the fence and stamps claimed_at, postResult needs the current owner + fence,
- * supersedeQueuedMessageByClaim touches only a row still 'queued'. Timestamps
- * come from one strictly increasing clock, like dispatch.ts nowIso().
+ * packages/core/src/db/dispatch.ts for the transitions used here: every insert
+ * gets the next rowid and (unless it is a legacy NULL-seq row) seq = rowid;
+ * claim bumps the fence and returns claimBoundarySeq = MAX(seq) taken at the
+ * claim; postResult needs the current owner + fence; supersedeQueuedMessageByClaim
+ * touches only a row still 'queued' with a non-NULL seq <= the boundary.
+ * created_at is deliberately settable: another writer's clock can put a row
+ * inserted after the claim at an EARLIER created_at, and that row must survive.
+ * The real-SQLite proof of the boundary itself is
+ * packages/core/src/db/dispatch-supersede-by-claim.test.ts.
  */
 import { describe, expect, test } from 'bun:test';
 import type { DispatchMessage, SeqCursorMessage } from '@archon/core/db/dispatch';
@@ -28,7 +33,8 @@ const CONFIG: ReviewRouteConfig = {
 const HEAD = 'a'.repeat(40);
 
 interface Row extends DispatchMessage {
-  seq: number;
+  rowid: number;
+  seq: number | null;
 }
 
 interface LogLine {
@@ -41,12 +47,18 @@ interface Target {
   headSha?: string;
   repo?: string;
   repeatReason?: string;
+  /** Legacy/import row whose seq was never assigned. */
+  nullSeq?: boolean;
+  /** Override the row's created_at (another writer's clock). */
+  createdAt?: string;
 }
 
 class Mailbox {
   rows = new Map<string, Row>();
   private seq = 0;
   private clock = Date.now() - 3_600_000;
+  /** Runs inside the claim, after the boundary is taken (another writer). */
+  afterClaim: ((claimedId: string) => void) | null = null;
 
   now(): string {
     this.clock += 1;
@@ -65,7 +77,8 @@ class Mailbox {
       author: 'contributor',
     };
     const row = {
-      seq: this.seq,
+      rowid: this.seq,
+      seq: target.nullSeq ? null : this.seq,
       id,
       correlation_id: `correlation-${id}`,
       idempotency_key: `pr-recheck:${id}`,
@@ -76,7 +89,7 @@ class Mailbox {
       body: JSON.stringify(body),
       status: 'queued',
       result_body: null,
-      created_at: this.now(),
+      created_at: target.createdAt ?? this.now(),
       claimed_at: null,
       completed_at: null,
       not_before: null,
@@ -141,7 +154,7 @@ class Mailbox {
         [...this.rows.values()]
           .filter(row => row.recipient === filters.recipient && row.status === filters.status)
           .filter(row => filters.status !== 'queued' || open(row))
-          .sort((a, b) => a.seq - b.seq)
+          .sort((a, b) => a.rowid - b.rowid)
           .map(row => ({ ...row })),
       listQueuedReviews: async filters =>
         [...this.rows.values()]
@@ -150,14 +163,22 @@ class Mailbox {
               row.recipient === filters.recipient &&
               row.task_type === filters.task_type &&
               row.status === filters.status &&
-              (filters.afterSeq === undefined || row.seq > filters.afterSeq)
+              (filters.afterSeq === undefined || row.rowid > filters.afterSeq)
           )
-          .sort((a, b) => a.seq - b.seq)
+          .sort((a, b) => a.rowid - b.rowid)
           .slice(0, filters.limit)
-          .map(row => ({ ...row, cursor_seq: row.seq }) as SeqCursorMessage),
+          .map(row => ({ ...row, cursor_seq: row.rowid }) as SeqCursorMessage),
       supersedeQueuedReview: async input => {
         const row = this.rows.get(input.id);
-        if (!row || row.status !== 'queued' || input.id === input.claimed_id) return null;
+        if (
+          !row ||
+          row.status !== 'queued' ||
+          input.id === input.claimed_id ||
+          row.seq === null ||
+          row.seq > input.boundary_seq
+        ) {
+          return null;
+        }
         row.status = 'cancelled';
         row.route_disposition = 'superseded';
         row.completed_at = this.now();
@@ -175,7 +196,10 @@ class Mailbox {
         row.lease_owner = worker_id;
         row.lease_expires_at = new Date(Date.now() + 300_000).toISOString();
         row.fencing_token += 1;
-        return { ...row };
+        const seqs = [...this.rows.values()].map(r => r.seq).filter((v): v is number => v !== null);
+        const claimBoundarySeq = seqs.length > 0 ? Math.max(...seqs) : undefined;
+        this.afterClaim?.(id);
+        return claimBoundarySeq === undefined ? { ...row } : { ...row, claimBoundarySeq };
       },
       deferMessage: async () => null,
       releaseMessage: async () => null,
@@ -266,9 +290,9 @@ describe('review worker supersedes queued reviews of the head it claims', () => 
         reason: 'superseded_by_claim c1',
         superseded_by: 'c1',
       });
-      expect(Date.parse(row.created_at)).toBeLessThan(
-        Date.parse(mailbox.get('c1').claimed_at ?? '')
-      );
+      expect(row.seq).not.toBeNull();
+      // Inserted before c1's claim: seq <= the claim boundary MAX(seq) = 3.
+      expect(row.seq ?? Infinity).toBeLessThanOrEqual(3);
     }
 
     // Nothing left to run on the next tick.
@@ -283,28 +307,43 @@ describe('review worker supersedes queued reviews of the head it claims', () => 
     const observed: { id: string; checks: Record<string, string> }[] = [];
     const deps = mailbox.deps(async work => {
       observed.push({ id: work.messageId, checks: { ...checks } });
-      if (work.messageId === 'recheck-A') {
-        // While A's review runs, B passes and enqueues its own re-review.
-        checks.B = 'success';
-        mailbox.enqueue('recheck-B');
-      }
       return checks.B === 'success' && work.messageId === 'recheck-B'
         ? { disposition: 'approved' }
         : { disposition: 'changes_requested' };
     }, []);
 
-    mailbox.enqueue('recheck-A');
+    const rowA = mailbox.enqueue('recheck-A');
+    // THE REVIEWER'S CASE: right after A is claimed -- before the worker's
+    // supersede pass even reads the queue -- another writer whose clock runs
+    // behind inserts B's recheck. B is inserted AFTER the claim (higher seq) but
+    // carries a created_at EARLIER than A's claimed_at (earlier even than A's
+    // created_at). A timestamp test would supersede it; the seq boundary must not.
+    let claimedAtWhenBInserted = '';
+    mailbox.afterClaim = claimedId => {
+      if (claimedId !== 'recheck-A') return;
+      claimedAtWhenBInserted = mailbox.get('recheck-A').claimed_at ?? '';
+      checks.B = 'failure';
+      mailbox.enqueue('recheck-B', {
+        createdAt: new Date(Date.parse(rowA.created_at) - 60_000).toISOString(),
+      });
+    };
+    // A's review snapshots B as failed; B passes while A's review runs.
+    const run = deps.runAndSubmitReview;
+    deps.runAndSubmitReview = async (work, submitDeps) => {
+      const outcome = await run(work, submitDeps);
+      if (work.messageId === 'recheck-A') checks.B = 'success';
+      return outcome;
+    };
+
     await tickReviewWorkerClock(CONFIG, deps);
 
-    // A ran on the stale snapshot; B's row was created after A's claim and was
-    // NOT superseded.
-    expect(observed).toEqual([{ id: 'recheck-A', checks: { A: 'success', B: 'failure' } }]);
     const rowB = mailbox.get('recheck-B');
+    expect(Date.parse(rowB.created_at)).toBeLessThan(Date.parse(claimedAtWhenBInserted));
+    expect(rowB.seq ?? 0).toBeGreaterThan(mailbox.get('recheck-A').seq ?? Infinity);
+    // A ran on the stale snapshot; B's row was NOT superseded.
+    expect(observed).toEqual([{ id: 'recheck-A', checks: { A: 'success', B: 'failure' } }]);
     expect(rowB.status).toBe('queued');
     expect(rowB.route_disposition).toBeNull();
-    expect(Date.parse(rowB.created_at)).toBeGreaterThan(
-      Date.parse(mailbox.get('recheck-A').claimed_at ?? '')
-    );
 
     await tickReviewWorkerClock(CONFIG, deps);
 
@@ -313,6 +352,60 @@ describe('review worker supersedes queued reviews of the head it claims', () => 
     expect(JSON.parse(mailbox.get('recheck-B').result_body ?? '{}')).toEqual({
       disposition: 'approved',
     });
+  });
+
+  test('null_seq_row_is_never_superseded', async () => {
+    const mailbox = new Mailbox();
+    const ran: string[] = [];
+    const deps = mailbox.deps(async work => {
+      ran.push(work.messageId);
+      return { disposition: 'approved' };
+    }, []);
+
+    // A legacy row with no seq, queued before the claim, same head.
+    mailbox.enqueue('legacy', { nullSeq: true });
+    mailbox.enqueue('claimed-first');
+    mailbox.enqueue('dup');
+    // Make claimed-first the first claim of the tick.
+    mailbox.get('legacy').not_before = new Date(Date.now() + 60_000).toISOString();
+
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(ran).toEqual(['claimed-first']);
+    expect(mailbox.get('dup').route_disposition).toBe('superseded');
+    const legacy = mailbox.get('legacy');
+    expect(legacy.status).toBe('queued');
+    expect(legacy.route_disposition).toBeNull();
+    expect(legacy.result_body).toBeNull();
+  });
+
+  test('claim_without_boundary_skips_superseding', async () => {
+    const mailbox = new Mailbox();
+    const ran: string[] = [];
+    const base = mailbox.deps(async work => {
+      ran.push(work.messageId);
+      return { disposition: 'approved' };
+    }, []);
+    const claim = base.claimMessage;
+    const deps: ReviewWorkerDeps = {
+      ...base,
+      // An adapter that cannot report a boundary.
+      claimMessage: async input => {
+        const claimed = await claim(input);
+        if (!claimed) return null;
+        const { claimBoundarySeq: _omit, ...rest } = claimed;
+        return rest;
+      },
+    };
+
+    mailbox.enqueue('first');
+    mailbox.enqueue('second');
+
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    // Fail safe: nothing superseded, both reviews run.
+    expect(ran).toEqual(['first', 'second']);
+    expect(mailbox.get('second').route_disposition).toBeNull();
   });
 
   test('other_heads_and_prs_untouched', async () => {

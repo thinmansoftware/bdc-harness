@@ -79,6 +79,32 @@ export interface DispatchMessage {
  */
 export interface SeqCursorMessage extends DispatchMessage {
   cursor_seq: number;
+  /**
+   * The row's own database-assigned `seq`, or null when it was never assigned
+   * (raw/fixture/import rows on SQLite, where `cursor_seq` falls back to rowid).
+   * Optional so callers and test doubles that predate it stay valid.
+   */
+  seq?: number | null;
+}
+
+/**
+ * A claimed message plus the claim's insertion boundary.
+ *
+ * `claimBoundarySeq` is MAX(seq) of agent_dispatch_messages read INSIDE the
+ * claim transaction, after the claim UPDATE took the write lock. On SQLite
+ * every later insert is serialized behind that lock and assigned
+ * MAX(COALESCE(seq, rowid)) + 1, so any row inserted after the claim has
+ * seq > claimBoundarySeq. Absent when the store returned no value (empty or
+ * all-NULL seq). Optional so existing callers and doubles are unaffected.
+ *
+ * Postgres caveat: an IDENTITY value is drawn at INSERT time, not COMMIT time,
+ * so an insert that drew a lower value in a transaction still open at the
+ * claim can commit later with seq <= the boundary. Callers that act on the
+ * boundary must tolerate that (the review worker only uses it to skip
+ * redundant work).
+ */
+export interface ClaimedDispatchMessage extends DispatchMessage {
+  claimBoundarySeq?: number;
 }
 
 export interface DispatchWorker {
@@ -994,10 +1020,14 @@ export async function listMessagesBySeqCursor(filters: {
   // Postgres returns a BIGINT identity as a STRING through the driver while
   // SQLite returns a number, and `seq` is not part of the DispatchMessage
   // contract. Coercing here keeps that dialect difference out of every caller.
-  return result.rows.map(row => ({
-    ...normalizeMessage(row),
-    cursor_seq: Number(row.cursor_seq),
-  }));
+  return result.rows.map(row => {
+    const ownSeq = (row as { seq?: unknown }).seq;
+    return {
+      ...normalizeMessage(row),
+      cursor_seq: Number(row.cursor_seq),
+      seq: ownSeq === null || ownSeq === undefined ? null : Number(ownSeq),
+    };
+  });
 }
 
 export async function listMessages(filters: {
@@ -1290,7 +1320,7 @@ export async function claimMessage(data: {
   delivery_principal?: string | null;
   leaseDurationMs?: number;
   workerStaleAfterMs?: number;
-}): Promise<DispatchMessage | null> {
+}): Promise<ClaimedDispatchMessage | null> {
   const db = getDatabase();
   await evaluateWorkerStaleness(data.workerStaleAfterMs ?? DEFAULT_WORKER_STALE_AFTER_MS);
   const now = nowIso();
@@ -1404,6 +1434,18 @@ export async function claimMessage(data: {
       ]
     );
     if (claimUpdate.rowCount !== 1) return null;
+    // CLAIM BOUNDARY: read after the claim UPDATE, in the same transaction, so
+    // the write lock is already held and no insert can land between the claim
+    // and this read (see ClaimedDispatchMessage).
+    const boundaryRow = (
+      await txQuery<{ boundary: unknown }>(
+        'SELECT MAX(seq) AS boundary FROM agent_dispatch_messages'
+      )
+    ).rows[0];
+    const boundary =
+      boundaryRow?.boundary === null || boundaryRow?.boundary === undefined
+        ? Number.NaN
+        : Number(boundaryRow.boundary);
     const claimed = await txQuery<DispatchMessageRow>(
       `SELECT * FROM agent_dispatch_messages
        WHERE id = $1 AND status = 'claimed' AND lease_owner = $2 AND fencing_token = $3`,
@@ -1429,7 +1471,10 @@ export async function claimMessage(data: {
         ]
       );
     }
-    return claimedRow ? normalizeMessage(claimedRow) : null;
+    if (!claimedRow) return null;
+    const message: ClaimedDispatchMessage = normalizeMessage(claimedRow);
+    if (Number.isFinite(boundary)) message.claimBoundarySeq = boundary;
+    return message;
   });
 }
 
@@ -2118,7 +2163,9 @@ export async function supersedeMessage(data: {
 /**
  * Retire a QUEUED row because a claimed row already covers its work
  * (WO-HARNESS-OVERSEER-RECHECK-DEDUPE-PER-HEAD-01: the review worker supersedes
- * redundant queued reviews of the head it just claimed). Unlike
+ * redundant queued reviews of the head it just claimed). Only a row whose own
+ * `seq` is set and <= `boundary_seq` (the claim's `claimBoundarySeq`) is
+ * touched: a NULL-seq row is never provably older than the claim. Unlike
  * `supersedeMessage` no replacement row is created -- the replacement is the
  * row that was claimed, named in `reason`. The row is marked
  * status='cancelled' + route_disposition='superseded' (never a bare cancel)
@@ -2129,9 +2176,10 @@ export async function supersedeMessage(data: {
 export async function supersedeQueuedMessageByClaim(data: {
   id: string;
   claimed_id: string;
+  boundary_seq: number;
   reason: string;
 }): Promise<DispatchMessage | null> {
-  if (data.id === data.claimed_id) return null;
+  if (data.id === data.claimed_id || !Number.isFinite(data.boundary_seq)) return null;
   const db = getDatabase();
   const resultBody = JSON.stringify({ reason: data.reason, superseded_by: data.claimed_id });
   const sql = `UPDATE agent_dispatch_messages
@@ -2142,17 +2190,16 @@ export async function supersedeQueuedMessageByClaim(data: {
          lease_owner = NULL,
          lease_expires_at = NULL
      WHERE id = $1
-       AND status = 'queued'`;
+       AND status = 'queued'
+       AND seq IS NOT NULL
+       AND seq <= $4`;
+  const params = [data.id, nowIso(), resultBody, data.boundary_seq];
   if (db.dialect === 'postgres') {
-    const result = await db.query<DispatchMessageRow>(`${sql} RETURNING *`, [
-      data.id,
-      nowIso(),
-      resultBody,
-    ]);
+    const result = await db.query<DispatchMessageRow>(`${sql} RETURNING *`, params);
     const row = result.rows[0];
     return row ? normalizeMessage(row) : null;
   }
-  const result = await db.query(sql, [data.id, nowIso(), resultBody]);
+  const result = await db.query(sql, params);
   if (result.rowCount !== 1) return null;
   return getMessage(data.id);
 }

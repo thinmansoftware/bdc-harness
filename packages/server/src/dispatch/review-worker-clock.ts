@@ -51,6 +51,7 @@ import {
   releaseMessage,
   renewMessageLease,
   supersedeQueuedMessageByClaim,
+  type ClaimedDispatchMessage,
   type DispatchMessage,
   type SeqCursorMessage,
   type DispatchTaskOutcome,
@@ -430,9 +431,10 @@ export async function tickReviewWorkerClock(
         }
         // SUPERSEDE AT CLAIM (WO-HARNESS-OVERSEER-RECHECK-DEDUPE-PER-HEAD-01):
         // this review reads the head's checks NOW, so queued reviews of the same
-        // head created before this claim are redundant and never run. Rows
-        // created after the claim (a check that completes while this review
-        // runs) survive. Fails open: the claimed review always runs.
+        // head inserted before this claim (seq <= the claim's boundary) are
+        // redundant and never run. Rows inserted after the claim (a check that
+        // completes while this review runs) survive. Fails open: the claimed
+        // review always runs.
         await supersedeQueuedDuplicateReviews(deps, claimed, body);
         // OPERATOR OVERRIDE (#847): a hand-enqueued run_review whose
         // repeat_reason starts with `operator_request:ladder_restored` clears
@@ -636,17 +638,27 @@ export async function tickReviewWorkerClock(
   }
 }
 
+let warnedNoClaimBoundary = false;
+
 /**
  * Mark every OTHER queued run_review for the claimed row's owner/repo/PR/head
- * that was created before the claim as superseded, with the reason
- * `superseded_by_claim <claimed row id>`. Never throws: any failure is logged
- * and the claimed review proceeds. Operator-requested rows
- * (`repeat_reason` starting `operator_request:`) are never superseded, so an
- * operator override is not lost.
+ * that was inserted before the claim as superseded, with the reason
+ * `superseded_by_claim <claimed row id>`.
+ *
+ * "Before the claim" is the database order, never a clock: a row qualifies only
+ * when its own `seq` is set and <= `claimBoundarySeq`, the MAX(seq) read inside
+ * the claim transaction (see ClaimedDispatchMessage). created_at is not used --
+ * client clocks are monotonic only within one process, so a row enqueued by
+ * another writer after the claim can carry an earlier created_at. A NULL-seq
+ * row is never superseded. A claim with no boundary skips superseding (logged
+ * once per process). Never throws: any failure is logged and the claimed
+ * review proceeds. Operator-requested rows (`repeat_reason` starting
+ * `operator_request:`) are never superseded, so an operator override is not
+ * lost.
  */
 async function supersedeQueuedDuplicateReviews(
   deps: ReviewWorkerDeps,
-  claimed: DispatchMessage,
+  claimed: ClaimedDispatchMessage,
   body: { owner: string; repo: string; prNumber: number; headSha: string }
 ): Promise<void> {
   if (!deps.listQueuedReviews || !deps.supersedeQueuedReview) return;
@@ -658,9 +670,12 @@ async function supersedeQueuedDuplicateReviews(
     prNumber: body.prNumber,
     headSha: body.headSha,
   };
-  const claimedAt = Date.parse(claimed.claimed_at ?? '');
-  if (!Number.isFinite(claimedAt)) {
-    logger.warn(context, 'overseer.pr_review.supersede_skipped_no_claim_time');
+  const boundary = claimed.claimBoundarySeq;
+  if (typeof boundary !== 'number' || !Number.isFinite(boundary)) {
+    if (!warnedNoClaimBoundary) {
+      warnedNoClaimBoundary = true;
+      logger.warn(context, 'overseer.pr_review.supersede_skipped_no_claim_boundary');
+    }
     return;
   }
   const reason = `superseded_by_claim ${claimed.id}`;
@@ -680,8 +695,9 @@ async function supersedeQueuedDuplicateReviews(
         if (row.id === claimed.id || row.status !== 'queued') continue;
         if (row.task_type !== REVIEW_TASK_TYPE) continue;
         if (row.repeat_reason?.startsWith('operator_request:')) continue;
-        const createdAt = Date.parse(row.created_at);
-        if (!Number.isFinite(createdAt) || createdAt >= claimedAt) continue;
+        if (typeof row.seq !== 'number' || !Number.isFinite(row.seq) || row.seq > boundary) {
+          continue;
+        }
         const other = parseReviewWorkBody(row.body);
         if (
           other?.prNumber !== body.prNumber ||
@@ -695,6 +711,7 @@ async function supersedeQueuedDuplicateReviews(
           const retired = await deps.supersedeQueuedReview({
             id: row.id,
             claimed_id: claimed.id,
+            boundary_seq: boundary,
             reason,
           });
           if (retired) superseded.push(row.id);
