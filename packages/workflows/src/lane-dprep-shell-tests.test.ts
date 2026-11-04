@@ -35,6 +35,12 @@ describe('lane dprep shared script wiring', () => {
     expect(body).toContain("'npm ci (package-lock.json)'");
   });
 
+  it('bundles scripts/lane/dprep.sh verbatim for standalone and source runs', async () => {
+    const { BUNDLED_LANE_SCRIPTS } = await import('./defaults/bundled-defaults');
+    const source = readFileSync(SHARED_DPREP, 'utf-8').replace(/\r\n/g, '\n');
+    expect(BUNDLED_LANE_SCRIPTS['dprep.sh']).toBe(source);
+  });
+
   it('copies scripts/lane/ into the production image', () => {
     const dockerfile = readFileSync(join(REPO_ROOT, 'Dockerfile'), 'utf-8');
     expect(dockerfile).toContain('COPY scripts/lane/ ./scripts/lane/');
@@ -44,8 +50,11 @@ describe('lane dprep shared script wiring', () => {
     it(`${lane} sources the shared script and carries no inline dprep body`, () => {
       const text = readFileSync(join(LANES_DIR, lane), 'utf-8');
       // One sourcing stub per call site: prep-dependencies and run-stop-tests.
+      // Resolution order: BDC_DPREP_SCRIPT, engine-materialized bundle, image copy.
       expect(
-        text.split('DPREP_SCRIPT="${BDC_DPREP_SCRIPT:-/app/scripts/lane/dprep.sh}"').length - 1
+        text.split(
+          'for dprep_candidate in "${BDC_DPREP_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/dprep.sh}" /app/scripts/lane/dprep.sh; do'
+        ).length - 1
       ).toBe(2);
       expect(text.split('. "$DPREP_SCRIPT"').length - 1).toBe(2);
       expect(text).not.toContain('dprep_ensure_js_deps() {\n        if [ ! -f package.json ]');

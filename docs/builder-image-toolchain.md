@@ -51,10 +51,15 @@ The npm dprep branch runs only when there is no bun lock and no pnpm-lock.yaml, 
 package-lock.json exists. It runs npm ci --no-audit --no-fund in the same scrubbed
 subshell and logs "dprep: npm ci (package-lock.json)". Any other package dir skips.
 
-dprep_ensure_js_deps lives in one shared file, scripts/lane/dprep.sh, shipped in the
-image at /app/scripts/lane/dprep.sh. The prep-dependencies and run-stop-tests nodes of
-every bdc-feature-development lane source it (BDC_DPREP_SCRIPT overrides the path for
-tests). If the file is missing the node logs "dprep: <path> missing" and continues.
+dprep_ensure_js_deps lives in one shared file, scripts/lane/dprep.sh. The prep-dependencies
+and run-stop-tests nodes of every bdc-feature-development lane source it, trying in order:
+$BDC_DPREP_SCRIPT (tests), $ARCHON_LANE_SCRIPTS_DIR/dprep.sh, then
+/app/scripts/lane/dprep.sh (the Docker image copy). The bundle generator embeds
+scripts/lane/*.sh as BUNDLED_LANE_SCRIPTS, and the bash node executor writes them into a
+per-node directory exported as ARCHON_LANE_SCRIPTS_DIR (only for nodes whose script reads
+that variable; removed when the node ends), so standalone CLI and source runs work
+without /app. Only when no candidate exists does the node log "dprep: dprep.sh missing"
+and continue.
 
 Bumping a version
 

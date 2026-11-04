@@ -6,7 +6,7 @@
  * Captures all assistant output regardless of streaming mode for $node_id.output substitution.
  */
 import { existsSync } from 'fs';
-import { chmod, mkdir, readFile, unlink, writeFile } from 'fs/promises';
+import { chmod, mkdir, readFile, rm, unlink, writeFile } from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { tmpdir } from 'os';
 import {
@@ -18,6 +18,7 @@ import {
 } from 'path';
 import { execFileAsync } from '@archon/git';
 import { discoverScriptsForCwd } from './script-discovery';
+import { LANE_SCRIPTS_ENV, materializeLaneScripts, scriptUsesLaneScripts } from './lane-scripts';
 import { resolveModelForNode, type ModelOverride } from './model-override';
 import type {
   IWorkflowPlatform,
@@ -3765,6 +3766,12 @@ async function executeBashNode(
   const safeRunId = workflowRun.id.replace(/[^A-Za-z0-9._-]/g, '_');
   const scriptDir = artifactsDir || tmpdir();
   const scriptFile = join(scriptDir, `node-${safeNodeId}-${safeRunId}.sh`);
+  // Bundled scripts/lane/*.sh (e.g. dprep.sh) for nodes that source them, so
+  // standalone CLI and source runs work without /app/scripts/lane/.
+  const laneScriptsDir = scriptUsesLaneScripts(finalScript)
+    ? join(scriptDir, `lane-scripts-${safeNodeId}-${safeRunId}`)
+    : undefined;
+  if (laneScriptsDir) subprocessEnv[LANE_SCRIPTS_ENV] = laneScriptsDir;
 
   try {
     let stdout = '';
@@ -3774,6 +3781,19 @@ async function executeBashNode(
         await mkdir(scriptDir, { recursive: true });
         await writeFile(scriptFile, finalScript, { mode: 0o600 });
         await chmod(scriptFile, 0o600);
+        if (laneScriptsDir) {
+          try {
+            await materializeLaneScripts(laneScriptsDir);
+          } catch (error) {
+            // Not fatal: the lane stub falls back to /app/scripts/lane/ and then
+            // logs that no dprep.sh was found, exactly like a failed install.
+            delete subprocessEnv.ARCHON_LANE_SCRIPTS_DIR;
+            getLog().warn(
+              { nodeId: node.id, err: (error as Error).message },
+              'lane_scripts_materialize_failed'
+            );
+          }
+        }
       } catch (error) {
         const err = error as Error & { code?: number | string };
         const details = err.message ? `: ${err.message}` : '';
@@ -3794,6 +3814,13 @@ async function executeBashNode(
         await unlink(scriptFile);
       } catch {
         // Best-effort cleanup: deletion failures must not change node outcome.
+      }
+      if (laneScriptsDir) {
+        try {
+          await rm(laneScriptsDir, { recursive: true, force: true });
+        } catch {
+          // Best-effort cleanup, same as the node script file.
+        }
       }
     }
 

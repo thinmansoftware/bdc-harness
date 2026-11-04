@@ -1023,26 +1023,91 @@ else
   rm -rf "$NTMP"
 fi
 
-echo "--- dprep guard: a missing shared script is logged and the run continues ---"
-for occ in 1 2; do
-  gout="$(
+echo "--- dprep resolution: no /app, engine-materialized ARCHON_LANE_SCRIPTS_DIR copy installs (#1462 review) ---"
+# Standalone CLI and source runs have no /app/scripts/lane/. The engine writes the
+# bundled scripts/lane/*.sh into a per-node dir and exports ARCHON_LANE_SCRIPTS_DIR.
+# Simulate that: copy dprep.sh into a fresh dir, unset BDC_DPREP_SCRIPT, run the
+# real YAML stub at both call sites for bun, pnpm and npm lockfiles.
+if [ -e /app/scripts/lane/dprep.sh ]; then
+  echo "SKIP: dprep resolution (this host has /app/scripts/lane/dprep.sh)"
+else
+  RBINX="$(mktemp -d)"
+  RLOG="$RBINX/calls.log"
+  for pm in bun pnpm npm; do
+    cat > "$RBINX/$pm" <<STUB
+#!/usr/bin/env bash
+printf '$pm %s\n' "\$*" >> "$RLOG"
+mkdir -p node_modules
+STUB
+    chmod +x "$RBINX/$pm"
+  done
+  LANEDIR="$(mktemp -d)"
+  cp "$DPREP_SHARED" "$LANEDIR/dprep.sh"
+  for occ in 1 2; do
+    for kind in bun:bun.lock pnpm:pnpm-lock.yaml npm:package-lock.json; do
+      pm="${kind%%:*}"; lock="${kind#*:}"
+      : > "$RLOG"
+      RTMP="$(mktemp -d)"
+      printf '{}\n' > "$RTMP/package.json"
+      printf '{}\n' > "$RTMP/$lock"
+      rout="$(
+        unset -f dprep_ensure_js_deps dprep__install
+        unset BDC_DPREP_SCRIPT
+        export ARCHON_LANE_SCRIPTS_DIR="$LANEDIR"
+        eval "$(extract_core_nth "$CANONICAL_YAML" dprep "$occ")"
+        cd "$RTMP" || exit 1
+        PATH="$RBINX:/usr/bin:/bin" dprep_ensure_js_deps
+      )"
+      rrc=$?
+      assert_eq "resolve occ$occ $pm rc" "0" "$rrc"
+      assert_eq "resolve occ$occ $pm called" "$pm" "$(cut -d' ' -f1 "$RLOG")"
+      assert_contains "resolve occ$occ $pm install ok" "dprep: install ok (" "$rout"
+      assert_not_contains "resolve occ$occ $pm no missing message" "dprep.sh missing" "$rout"
+      if [ -d "$RTMP/node_modules" ]; then PASS=$((PASS + 1)); echo "PASS: resolve occ$occ $pm node_modules"; else FAIL=$((FAIL + 1)); echo "FAIL: resolve occ$occ $pm node_modules"; fi
+      rm -rf "$RTMP"
+    done
+  done
+  echo "--- dprep resolution: a stale BDC_DPREP_SCRIPT falls through to ARCHON_LANE_SCRIPTS_DIR ---"
+  : > "$RLOG"
+  RTMP="$(mktemp -d)"
+  printf '{}\n' > "$RTMP/package.json"
+  printf '{}\n' > "$RTMP/package-lock.json"
+  rout="$(
     unset -f dprep_ensure_js_deps dprep__install
-    export BDC_DPREP_SCRIPT="$NBIN/no-such-dir/dprep.sh"
-    eval "$(extract_core_nth "$CANONICAL_YAML" dprep "$occ")"
-    dprep_ensure_js_deps
+    export BDC_DPREP_SCRIPT="$RBINX/no-such-dir/dprep.sh"
+    export ARCHON_LANE_SCRIPTS_DIR="$LANEDIR"
+    eval "$(extract_core_nth "$CANONICAL_YAML" dprep 1)"
+    cd "$RTMP" || exit 1
+    PATH="$RBINX:/usr/bin:/bin" dprep_ensure_js_deps
   )"
-  grc=$?
-  assert_eq "guard occ$occ rc" "0" "$grc"
-  assert_contains "guard occ$occ message" "dprep: $NBIN/no-such-dir/dprep.sh missing" "$gout"
-done
-if [ ! -e /app/scripts/lane/dprep.sh ]; then
+  assert_eq "resolve fallthrough npm argv" "npm ci --no-audit --no-fund" "$(cat "$RLOG")"
+  assert_not_contains "resolve fallthrough no missing message" "dprep.sh missing" "$rout"
+  rm -rf "$RTMP" "$RBINX" "$LANEDIR"
+fi
+
+echo "--- dprep guard: missing message fires only when no resolution works ---"
+if [ -e /app/scripts/lane/dprep.sh ]; then
+  echo "SKIP: dprep guard (this host has /app/scripts/lane/dprep.sh)"
+else
+  for occ in 1 2; do
+    gout="$(
+      unset -f dprep_ensure_js_deps dprep__install
+      export BDC_DPREP_SCRIPT="$NBIN/no-such-dir/dprep.sh"
+      export ARCHON_LANE_SCRIPTS_DIR="$NBIN/no-such-lane-dir"
+      eval "$(extract_core_nth "$CANONICAL_YAML" dprep "$occ")"
+      dprep_ensure_js_deps
+    )"
+    grc=$?
+    assert_eq "guard occ$occ rc" "0" "$grc"
+    assert_contains "guard occ$occ message" "dprep: dprep.sh missing (tried BDC_DPREP_SCRIPT=$NBIN/no-such-dir/dprep.sh, ARCHON_LANE_SCRIPTS_DIR=$NBIN/no-such-lane-dir, /app/scripts/lane/dprep.sh)" "$gout"
+  done
   gout="$(
     unset -f dprep_ensure_js_deps dprep__install
-    unset BDC_DPREP_SCRIPT
+    unset BDC_DPREP_SCRIPT ARCHON_LANE_SCRIPTS_DIR
     eval "$(extract_core_nth "$CANONICAL_YAML" dprep 1)"
     dprep_ensure_js_deps
   )"
-  assert_contains "guard default path message" "dprep: /app/scripts/lane/dprep.sh missing" "$gout"
+  assert_contains "guard all-unset message" "dprep: dprep.sh missing (tried BDC_DPREP_SCRIPT=unset, ARCHON_LANE_SCRIPTS_DIR=unset, /app/scripts/lane/dprep.sh)" "$gout"
 fi
 rm -rf "$NBIN"
 

@@ -1119,17 +1119,21 @@ nodes:
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
       cd "$WT"
       # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
-      # dprep_ensure_js_deps lives in scripts/lane/dprep.sh (one shared copy; the image
-      # ships it at /app/scripts/lane/dprep.sh). It installs bun, pnpm or package-lock.json
-      # (npm ci) dependencies when node_modules is absent and always returns 0.
-      # BDC_DPREP_SCRIPT overrides the path for tests. A missing script is logged and the
-      # run continues, exactly like a failed install: run-stop-tests reports the real result.
-      DPREP_SCRIPT="${BDC_DPREP_SCRIPT:-/app/scripts/lane/dprep.sh}"
-      if [ -f "$DPREP_SCRIPT" ]; then
+      # dprep_ensure_js_deps lives in scripts/lane/dprep.sh (one source of truth). It installs
+      # bun, pnpm or package-lock.json (npm ci) dependencies when node_modules is absent and
+      # always returns 0. Resolution order: $BDC_DPREP_SCRIPT (tests), then the engine's
+      # per-node copy of the bundled script ($ARCHON_LANE_SCRIPTS_DIR/dprep.sh; works for
+      # standalone CLI and source runs), then the image copy /app/scripts/lane/dprep.sh.
+      # Only when none exists is it logged and the run continues like a failed install.
+      DPREP_SCRIPT=""
+      for dprep_candidate in "${BDC_DPREP_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/dprep.sh}" /app/scripts/lane/dprep.sh; do
+        if [ -n "$dprep_candidate" ] && [ -f "$dprep_candidate" ]; then DPREP_SCRIPT="$dprep_candidate"; break; fi
+      done
+      if [ -n "$DPREP_SCRIPT" ]; then
         . "$DPREP_SCRIPT"
       else
         dprep_ensure_js_deps() {
-          printf 'dprep: %s missing, cannot install JS dependencies (continuing; run-stop-tests reports the real result)\n' "$DPREP_SCRIPT"
+          printf 'dprep: dprep.sh missing (tried BDC_DPREP_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/dprep.sh), cannot install JS dependencies (continuing; run-stop-tests reports the real result)\n' "${BDC_DPREP_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}"
           return 0
         }
       fi
@@ -2307,17 +2311,21 @@ nodes:
       # ---- END rst core ----
 
       # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
-      # dprep_ensure_js_deps lives in scripts/lane/dprep.sh (one shared copy; the image
-      # ships it at /app/scripts/lane/dprep.sh). It installs bun, pnpm or package-lock.json
-      # (npm ci) dependencies when node_modules is absent and always returns 0.
-      # BDC_DPREP_SCRIPT overrides the path for tests. A missing script is logged and the
-      # run continues, exactly like a failed install: run-stop-tests reports the real result.
-      DPREP_SCRIPT="${BDC_DPREP_SCRIPT:-/app/scripts/lane/dprep.sh}"
-      if [ -f "$DPREP_SCRIPT" ]; then
+      # dprep_ensure_js_deps lives in scripts/lane/dprep.sh (one source of truth). It installs
+      # bun, pnpm or package-lock.json (npm ci) dependencies when node_modules is absent and
+      # always returns 0. Resolution order: $BDC_DPREP_SCRIPT (tests), then the engine's
+      # per-node copy of the bundled script ($ARCHON_LANE_SCRIPTS_DIR/dprep.sh; works for
+      # standalone CLI and source runs), then the image copy /app/scripts/lane/dprep.sh.
+      # Only when none exists is it logged and the run continues like a failed install.
+      DPREP_SCRIPT=""
+      for dprep_candidate in "${BDC_DPREP_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/dprep.sh}" /app/scripts/lane/dprep.sh; do
+        if [ -n "$dprep_candidate" ] && [ -f "$dprep_candidate" ]; then DPREP_SCRIPT="$dprep_candidate"; break; fi
+      done
+      if [ -n "$DPREP_SCRIPT" ]; then
         . "$DPREP_SCRIPT"
       else
         dprep_ensure_js_deps() {
-          printf 'dprep: %s missing, cannot install JS dependencies (continuing; run-stop-tests reports the real result)\n' "$DPREP_SCRIPT"
+          printf 'dprep: dprep.sh missing (tried BDC_DPREP_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/dprep.sh), cannot install JS dependencies (continuing; run-stop-tests reports the real result)\n' "${BDC_DPREP_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}"
           return 0
         }
       fi

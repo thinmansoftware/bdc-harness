@@ -26,6 +26,7 @@ export {
   BUNDLED_COMMANDS,
   BUNDLED_WORKFLOWS,
   BUNDLED_POLICIES,
+  BUNDLED_LANE_SCRIPTS,
 } from './bundled-defaults.generated';
 
 /**
