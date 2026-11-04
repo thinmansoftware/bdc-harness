@@ -691,7 +691,7 @@ describe('review seats never fall back to claude (D0)', () => {
       'A no declared failover': codexNode('diff-review'),
       'B declared claude failover': codexNode('diff-review', {
         failover_provider: 'claude',
-        failover_model: 'claude-opus-5-5',
+        failover_model: 'claude-sonnet-5-5',
       }),
     };
     for (const [label, node] of Object.entries(cases)) {
@@ -813,7 +813,8 @@ describe('review seats never fall back to claude (D0)', () => {
         model: 'opus',
       },
     ];
-    expect(DEFAULT_CLAUDE_FAILOVER_MODEL).toBe('claude-opus-5-5');
+    // The default claude lane's model (bdc-feature-development.yaml line 21).
+    expect(DEFAULT_CLAUDE_FAILOVER_MODEL).toBe('claude-sonnet-5-5');
     for (const entry of cases) {
       invocations.length = 0;
       const { result, store } = await run(stubLane('lane-stub', [entry.node]), {

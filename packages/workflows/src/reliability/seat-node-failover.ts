@@ -50,12 +50,17 @@ export function isReviewNode(node: { id: string }): boolean {
  * Last-resort Claude model for a NON-review node rerouted to Claude when neither
  * the node's failover_model nor config assistants.claude.model is set. Without
  * it the per-node override carries no model and a model-less persona throws
- * "must declare a 'model:'" (run 8849e767). Source: harness model allowlist
- * (xo-wiki doctrine harness-model-allowlist-gpt6-claude55-fable51), strongest
- * allowed Claude model. NEVER applied to a review node: review nodes do not
- * reroute to Claude at all (D0).
+ * "must declare a 'model:'" (run 8849e767). Source: the default claude lane's
+ * own model, .archon/workflows/defaults/bdc-feature-development.yaml line 21
+ * (lane default `model: claude-sonnet-5-5`, inherited by nodes with no pin; the
+ * same model as its war-council-validator pin). Non-review reroutes draw on the
+ * Claude seat's usage pool, so the default is the model that lane already runs,
+ * not the strongest one ("best per testing, balanced for usage"; acting XO,
+ * fence 282, 2026-11-04). It is on the harness model allowlist (xo-wiki doctrine
+ * harness-model-allowlist-gpt6-claude55-fable51). NEVER applied to a review
+ * node: review nodes do not reroute to Claude at all (D0).
  */
-export const DEFAULT_CLAUDE_FAILOVER_MODEL = 'claude-opus-5-5';
+export const DEFAULT_CLAUDE_FAILOVER_MODEL = 'claude-sonnet-5-5';
 
 export interface SeatNodeFailoverInput {
   node: DagNode;
