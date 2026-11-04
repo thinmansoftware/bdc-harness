@@ -2314,6 +2314,30 @@ nodes:
       fi
       # ---- END dprep core ----
 
+      # ---- BEGIN stbase core (byte-identical across lanes; extracted by unit test) ----
+      # rst_base_compare and stb_stamp_base_red live in scripts/lane/stop-tests-base.sh (one
+      # source of truth, WO-HARNESS-STOP-TESTS-BASE-RED-AWARE-01). A failed head run is re-run
+      # on the run's base commit; failures that are already red there report base_red, any
+      # newly broken test stays failed. Resolution order: $BDC_STBASE_SCRIPT (tests), then the
+      # engine's per-node copy ($ARCHON_LANE_SCRIPTS_DIR/stop-tests-base.sh), then the image
+      # copy /app/scripts/lane/stop-tests-base.sh. When none exists the result is unchanged
+      # (a failed head stays failed) and no Base-red tests: line is stamped.
+      STBASE_SCRIPT=""
+      for stbase_candidate in "${BDC_STBASE_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/stop-tests-base.sh}" /app/scripts/lane/stop-tests-base.sh; do
+        if [ -n "$stbase_candidate" ] && [ -f "$stbase_candidate" ]; then STBASE_SCRIPT="$stbase_candidate"; break; fi
+      done
+      if [ -n "$STBASE_SCRIPT" ]; then
+        . "$STBASE_SCRIPT"
+      else
+        rst_base_compare() {
+          printf 'stop-tests-base: stop-tests-base.sh missing (tried BDC_STBASE_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/stop-tests-base.sh), result unchanged\n' "${BDC_STBASE_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}" >&2
+          cat "$1"
+          printf 'TESTS_BASE_COMPARE=script_missing\n'
+        }
+        stb_stamp_base_red() { cat; }
+      fi
+      # ---- END stbase core ----
+
       SPEC=$read-spec.output
       CLASS="$(printf '%s\n' "$SPEC" | rst_class)"
       EVIDENCE_DIR="${ARTIFACTS_DIR:-.}/evidence"
@@ -2417,7 +2441,8 @@ nodes:
         REPORT_SOURCE="${SOURCE%% *}"
         if [ "$REPORT_SOURCE" = "spec_declared" ]; then REPORT_SOURCE="wo-spec"; fi
         rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
-      fi
+      fi > "$EVIDENCE_DIR/stop-tests.report"
+      rst_base_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS"
       echo "TESTS_LOG=$LOG"
       if [ -s "$LOG" ]; then
         echo "--- last 80 lines of test output ---"
@@ -5016,6 +5041,30 @@ nodes:
       }
       # ---- END sme core ----
 
+      # ---- BEGIN stbase core (byte-identical across lanes; extracted by unit test) ----
+      # rst_base_compare and stb_stamp_base_red live in scripts/lane/stop-tests-base.sh (one
+      # source of truth, WO-HARNESS-STOP-TESTS-BASE-RED-AWARE-01). A failed head run is re-run
+      # on the run's base commit; failures that are already red there report base_red, any
+      # newly broken test stays failed. Resolution order: $BDC_STBASE_SCRIPT (tests), then the
+      # engine's per-node copy ($ARCHON_LANE_SCRIPTS_DIR/stop-tests-base.sh), then the image
+      # copy /app/scripts/lane/stop-tests-base.sh. When none exists the result is unchanged
+      # (a failed head stays failed) and no Base-red tests: line is stamped.
+      STBASE_SCRIPT=""
+      for stbase_candidate in "${BDC_STBASE_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/stop-tests-base.sh}" /app/scripts/lane/stop-tests-base.sh; do
+        if [ -n "$stbase_candidate" ] && [ -f "$stbase_candidate" ]; then STBASE_SCRIPT="$stbase_candidate"; break; fi
+      done
+      if [ -n "$STBASE_SCRIPT" ]; then
+        . "$STBASE_SCRIPT"
+      else
+        rst_base_compare() {
+          printf 'stop-tests-base: stop-tests-base.sh missing (tried BDC_STBASE_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/stop-tests-base.sh), result unchanged\n' "${BDC_STBASE_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}" >&2
+          cat "$1"
+          printf 'TESTS_BASE_COMPARE=script_missing\n'
+        }
+        stb_stamp_base_red() { cat; }
+      fi
+      # ---- END stbase core ----
+
       TESTS_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_RUN_STOP_TESTS'
       $run-stop-tests.output
       BDC_NODE_OUTPUT_RUN_STOP_TESTS
@@ -5031,7 +5080,7 @@ nodes:
       printf '%s\n' "$MANIFEST_OUT" | sme_process \
         "$(sme_field TESTS_LINE "$TESTS_OUT")" "$(sme_field TESTS_STATUS "$TESTS_OUT")" \
         "$(sme_field GREP_LINE "$GREPS_OUT")" "$(sme_field GREP_STATUS "$GREPS_OUT")" \
-        "$(sme_field GREP_DROPPED "$GREPS_OUT")"
+        "$(sme_field GREP_DROPPED "$GREPS_OUT")" | stb_stamp_base_red
 
   # bdc-xo #1940. manifest-evidence-check fails CLOSED (exit 1, no PR-body patch) when
   # a CODE or MIXED WO would publish "Tests: N/A ..." (Rule 10 / manifest v2 require

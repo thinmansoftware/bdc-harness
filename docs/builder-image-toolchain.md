@@ -61,6 +61,41 @@ that variable; removed when the node ends), so standalone CLI and source runs wo
 without /app. Only when no candidate exists does the node log "dprep: dprep.sh missing"
 and continue.
 
+Base-red aware stop tests (scripts/lane/stop-tests-base.sh)
+
+A build fails its test stop condition only for tests it newly broke. The second lane
+script, scripts/lane/stop-tests-base.sh, is bundled and resolved the same way as dprep.sh:
+$BDC_STBASE_SCRIPT (tests), $ARCHON_LANE_SCRIPTS_DIR/stop-tests-base.sh, then
+/app/scripts/lane/stop-tests-base.sh. Every bdc-feature-development lane sources it twice,
+through one byte-identical "stbase core" stub in run-stop-tests and in
+stamp-manifest-evidence, and makes one call in each node:
+
+- run-stop-tests writes rst_report's lines to $ARTIFACTS_DIR/evidence/stop-tests.report,
+  then calls rst_base_compare <report> <commands-file> <head-log> <head-counts>.
+  When the head status is not "failed" it prints the report unchanged and never touches
+  the base. When it is "failed", it reads the run's base commit from
+  $ARTIFACTS_DIR/run-start-sha.txt, adds a detached worktree at
+  $ARTIFACTS_DIR/stop-tests-base-wt.<pid>, runs dprep_ensure_js_deps and the same commands
+  there through rst_run_commands (same per-command timeout), logs to
+  $ARTIFACTS_DIR/evidence/stop-tests-base.log, and always removes the worktree.
+  Failing tests are identified from bun "(fail) <name>", node:test "not ok <n> - <name>",
+  jest bullet lines and vitest "FAIL <file> > <name>" lines. If every head failure also
+  fails on base, it prints TESTS_STATUS=base_red and
+  TESTS_LINE=<pass>/<total> (base-red: <k> tests failing on base <sha8>; newly broken: 0)
+  and writes the names to $ARTIFACTS_DIR/base-red-tests.txt. Otherwise the status stays
+  failed (with "newly broken: <names>" when known). A missing or bad base sha, missing
+  counts, failures that cannot be named, a base timeout (exit 124) or a worktree that
+  cannot be created all fail closed. It always appends TESTS_BASE_COMPARE=<outcome>
+  (not_failed, base_red, newly_broken, base_passed, unparsed, no_base_sha, no_counts,
+  base_timeout, base_unrunnable, or script_missing from the fallback stub).
+- stamp-manifest-evidence pipes sme_process's output through stb_stamp_base_red, which
+  adds "Base-red tests: <a>; <b> ..." after the Tests: line when base-red-tests.txt lists
+  names. sme_process and manifest-evidence-check accept base_red because its Tests: line
+  starts with <pass>/<total> and its status is not "failed".
+
+Tests: bash .archon/workflows/defaults/__tests__/run-stop-tests.sh (Tests 1-7 of
+WO-HARNESS-STOP-TESTS-BASE-RED-AWARE-01, against real temporary git repos).
+
 Bumping a version
 
 Change each version and its checksum together, from the publisher checksums.

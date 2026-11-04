@@ -15,6 +15,9 @@
 # across all 13 lanes (this repo has no shared-include mechanism for workflow YAMLs).
 # dprep_ensure_js_deps is called by prep-dependencies and by run-stop-tests. Both
 # copies are extracted from the canonical YAML and parity-checked at each call site.
+# The stbase stub (scripts/lane/stop-tests-base.sh: rst_base_compare, stb_stamp_base_red)
+# is parity-checked the same way and exercised as Tests 1-7 of
+# WO-HARNESS-STOP-TESTS-BASE-RED-AWARE-01 against real temporary git repos.
 #
 # Run: bash .archon/workflows/defaults/__tests__/run-stop-tests.sh
 # Exits 0 on all-pass, 1 on any failure. ASCII only.
@@ -1186,6 +1189,276 @@ unset RST_NPX_BIN RST_NPM_BIN GH_TOKEN
 unset TELEGRAM_BOT_TOKEN TELEGRAM_STREAMING_MODE TELEGRAM_APPROVAL_CHAT_ID TELEGRAM_ALLOWED_USER_IDS TELEGRAM_TEST_FIXTURE
 export PATH="$ORIG_PATH"
 rm -rf "$BIN" "$TMP" "$TMP2" "$TMP3" "$TMP4" "$TMP5" "$TMP6" "$TMP7" "$RST_TG" "$T5" "$T6_EMPTY" "$PBIN" "$PTMP" "$PTMPB" "$PTMPC" "$PTMPD"
+
+# ---------------------------------------------------------------------------
+# WO-HARNESS-STOP-TESTS-BASE-RED-AWARE-01: base-red aware stop tests.
+# rst_base_compare / stb_stamp_base_red live in scripts/lane/stop-tests-base.sh; every
+# lane sources it through the stbase stub (run-stop-tests and stamp-manifest-evidence).
+# Fixtures are real temporary git repos with a base commit and a head commit; the base
+# run happens in a real detached worktree.
+# ---------------------------------------------------------------------------
+STBASE_SHARED="$REPO_ROOT/scripts/lane/stop-tests-base.sh"
+if [ ! -f "$STBASE_SHARED" ]; then
+  echo "FATAL: shared stop-tests-base script missing at $STBASE_SHARED"; exit 1
+fi
+export BDC_STBASE_SCRIPT="$STBASE_SHARED"
+STBASE_CORE="$(extract_core_nth "$CANONICAL_YAML" stbase 1)"
+if [ -z "$STBASE_CORE" ]; then
+  echo "FATAL: could not extract stbase core from $CANONICAL_YAML"; exit 1
+fi
+eval "$STBASE_CORE"
+for fn in rst_base_compare stb_stamp_base_red stb_failed_ids; do
+  if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after sourcing stbase"; exit 1; fi
+done
+
+# stb_fixture <dir> <base-fails> <head-fails> [base-only-file]
+#   Real git repo: tests.txt names A B C D; run.sh prints bun-style "(pass)/(fail)"
+#   lines (or, when plain.txt exists, only a "Passed: Failed: Total:" summary with no
+#   per-test markers) and exits 1 on any failure. The base commit carries
+#   .base-marker (run.sh touches $STB_MARK when it runs at base) plus an optional
+#   extra base-only file; the head commit removes both and changes fails.txt.
+#   Prints the base sha.
+stb_fixture() {
+  local dir="$1" bfails="$2" hfails="$3" extra="${4:-}"
+  (
+    cd "$dir" || exit 1
+    git init -q . && git config user.email t@t && git config user.name t && git config core.autocrlf false
+    printf 'A\nB\nC\nD\n' > tests.txt
+    cat > run.sh <<'RUNSH'
+#!/usr/bin/env bash
+if [ -f .base-marker ] && [ -n "${STB_MARK:-}" ]; then : > "$STB_MARK"; fi
+if [ -f slow.txt ]; then sleep "$(cat slow.txt)"; fi
+p=0; f=0
+while IFS= read -r n; do
+  [ -z "$n" ] && continue
+  if grep -qx "$n" fails.txt 2>/dev/null; then
+    [ -f plain.txt ] || echo "(fail) suite > $n [0.10ms]"
+    f=$((f + 1))
+  else
+    [ -f plain.txt ] || echo "(pass) suite > $n [0.05ms]"
+    p=$((p + 1))
+  fi
+done < tests.txt
+if [ -f plain.txt ]; then
+  echo "Passed: $p  Failed: $f  Total: $((p + f))"
+else
+  echo " $p pass"
+  echo " $f fail"
+fi
+[ "$f" -eq 0 ]
+RUNSH
+    printf '%b' "$bfails" > fails.txt
+    : > .base-marker
+    if [ -n "$extra" ]; then printf '%s\n' "$extra" > "${extra%%=*}.txt"; sed -i 's/^[^=]*=//' "${extra%%=*}.txt"; fi
+    git add -A && git commit -q -m base
+    git rev-parse HEAD > ../base.sha
+    printf '%b' "$hfails" > fails.txt
+    git rm -q .base-marker
+    case "$extra" in slow=*) git rm -q slow.txt ;; esac
+    git add -A && git commit -q -m head
+  ) || return 1
+  cat "$dir/../base.sha"
+}
+
+# stb_head <repo> <art>   runs the head commands with the real rst core, writes
+#   <art>/report and sets STB_COUNTS.
+stb_head() {
+  local repo="$1" art="$2" res ex
+  printf 'bash ./run.sh\n' > "$art/cmds"
+  : > "$art/head.log"
+  res="$(cd "$repo" && rst_run_commands "$art/cmds" "$art/head.log")"
+  ex="${res%% *}"
+  STB_COUNTS="$(printf '%s' "${res#* }" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  SOURCE=spec_declared rst_report CODE "bash ./run.sh" "$ex" "$STB_COUNTS" | sed "s/^TESTS_LINE=.*/& [source: wo-spec]/" > "$art/report"
+}
+
+stb_field() { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1; }
+stb_wt_count() { git -C "$1" worktree list | grep -c .; }
+stb_leftover() { find "$1" -maxdepth 1 -name 'stop-tests-base-wt.*' | grep -c . || true; }
+
+STB_ROOT="$(mktemp -d)"
+
+echo "--- Test 1: base_red_only_passes ---"
+mkdir -p "$STB_ROOT/t1/repo" "$STB_ROOT/t1/art"
+T1_SHA="$(stb_fixture "$STB_ROOT/t1/repo" 'A\nB\n' 'A\nB\n')"
+echo "$T1_SHA" > "$STB_ROOT/t1/art/run-start-sha.txt"
+stb_head "$STB_ROOT/t1/repo" "$STB_ROOT/t1/art"
+assert_eq "Test 1 base_red_only_passes: head is failed before the compare" "failed" "$(stb_field TESTS_STATUS "$(cat "$STB_ROOT/t1/art/report")")"
+T1_OUT="$(cd "$STB_ROOT/t1/repo" && STB_MARK="$STB_ROOT/t1/mark" ARTIFACTS_DIR="$STB_ROOT/t1/art" rst_base_compare "$STB_ROOT/t1/art/report" "$STB_ROOT/t1/art/cmds" "$STB_ROOT/t1/art/head.log" "$STB_COUNTS" 2>/dev/null)"
+assert_eq "Test 1 base_red_only_passes: TESTS_STATUS=base_red" "base_red" "$(stb_field TESTS_STATUS "$T1_OUT")"
+assert_eq "Test 1 base_red_only_passes: TESTS_LINE starts <pass>/<total> with newly broken: 0" \
+  "2/4 (base-red: 2 tests failing on base $(printf '%s' "$T1_SHA" | cut -c1-8); newly broken: 0) (bash ./run.sh) [source: wo-spec]" \
+  "$(stb_field TESTS_LINE "$T1_OUT")"
+assert_eq "Test 1 base_red_only_passes: outcome" "base_red" "$(stb_field TESTS_BASE_COMPARE "$T1_OUT")"
+assert_eq "Test 1 base_red_only_passes: base-red-tests.txt lists A and B" "$(printf 'suite > A\nsuite > B')" "$(cat "$STB_ROOT/t1/art/base-red-tests.txt" 2>/dev/null)"
+assert_eq "Test 1 base_red_only_passes: the base commit really ran" "yes" "$([ -f "$STB_ROOT/t1/mark" ] && echo yes || echo no)"
+assert_eq "Test 1 base_red_only_passes: temporary worktree removed" "1 0" "$(stb_wt_count "$STB_ROOT/t1/repo") $(stb_leftover "$STB_ROOT/t1/art")"
+assert_contains "Test 1 base_red_only_passes: base log kept as evidence" "(fail) suite > A" "$(cat "$STB_ROOT/t1/art/evidence/stop-tests-base.log" 2>/dev/null)"
+
+echo "--- Test 1 (end to end): the rendered run-stop-tests node of the canonical lane ---"
+# Render the real node bash: the engine substitutes $read-spec.output and
+# $resolve-test-command.output; here the spec comes from a file and no map resolves.
+stb_render_node() {
+  tr -d '\r' < "$CANONICAL_YAML" | awk '
+    $0 == "  - id: run-stop-tests" { n = 1; next }
+    n && $0 == "    bash: |" { b = 1; next }
+    b && $0 != "" && substr($0, 1, 6) != "      " { exit }
+    b { print }
+  ' | sed 's/^      //' \
+    | sed 's/^SPEC=\$read-spec\.output$/SPEC="$(cat "$STB_SPEC_FILE")"/; s/^\$resolve-test-command\.output$//'
+}
+STB_NODE="$STB_ROOT/run-stop-tests-node.sh"
+stb_render_node > "$STB_NODE"
+assert_eq "rendered node calls rst_base_compare once" "1" "$(grep -c '^rst_base_compare ' "$STB_NODE")"
+STB_SPEC_FILE="$STB_ROOT/spec.md"
+printf 'WO Class: CODE\n\n## 8. Stop conditions\n\nStop 2 (test suite):\n  bash ./run.sh\n  Expected: all pass\n' > "$STB_SPEC_FILE"
+export STB_SPEC_FILE
+mkdir -p "$STB_ROOT/e1/repo" "$STB_ROOT/e1/art"
+E1_SHA="$(stb_fixture "$STB_ROOT/e1/repo" 'A\nB\n' 'A\nB\n')"
+echo "$E1_SHA" > "$STB_ROOT/e1/art/run-start-sha.txt"
+E1_OUT="$(cd "$STB_ROOT/e1/repo" && STB_MARK="$STB_ROOT/e1/mark" ARTIFACTS_DIR="$STB_ROOT/e1/art" bash "$STB_NODE" 2>/dev/null)"
+assert_eq "Test 1 base_red_only_passes (node): TESTS_STATUS=base_red" "base_red" "$(stb_field TESTS_STATUS "$E1_OUT")"
+assert_contains "Test 1 base_red_only_passes (node): TESTS_LINE" "TESTS_LINE=2/4 (base-red: 2 tests failing on base $(printf '%s' "$E1_SHA" | cut -c1-8); newly broken: 0)" "$E1_OUT"
+assert_eq "Test 1 base_red_only_passes (node): base-red-tests.txt" "$(printf 'suite > A\nsuite > B')" "$(cat "$STB_ROOT/e1/art/base-red-tests.txt" 2>/dev/null)"
+assert_eq "Test 1 base_red_only_passes (node): worktree removed" "1 0" "$(stb_wt_count "$STB_ROOT/e1/repo") $(stb_leftover "$STB_ROOT/e1/art")"
+
+echo "--- Test 2: newly_broken_fails ---"
+mkdir -p "$STB_ROOT/t2/repo" "$STB_ROOT/t2/art"
+T2_SHA="$(stb_fixture "$STB_ROOT/t2/repo" 'A\n' 'A\nC\n')"
+echo "$T2_SHA" > "$STB_ROOT/t2/art/run-start-sha.txt"
+stb_head "$STB_ROOT/t2/repo" "$STB_ROOT/t2/art"
+T2_OUT="$(cd "$STB_ROOT/t2/repo" && STB_MARK="$STB_ROOT/t2/mark" ARTIFACTS_DIR="$STB_ROOT/t2/art" rst_base_compare "$STB_ROOT/t2/art/report" "$STB_ROOT/t2/art/cmds" "$STB_ROOT/t2/art/head.log" "$STB_COUNTS" 2>/dev/null)"
+assert_eq "Test 2 newly_broken_fails: TESTS_STATUS=failed" "failed" "$(stb_field TESTS_STATUS "$T2_OUT")"
+assert_eq "Test 2 newly_broken_fails: TESTS_LINE names C as newly broken" "2/4 (bash ./run.sh) -- FAILED, exit 1; newly broken: suite > C [source: wo-spec]" "$(stb_field TESTS_LINE "$T2_OUT")"
+assert_eq "Test 2 newly_broken_fails: outcome" "newly_broken" "$(stb_field TESTS_BASE_COMPARE "$T2_OUT")"
+assert_eq "Test 2 newly_broken_fails: no base-red-tests.txt" "no" "$([ -e "$STB_ROOT/t2/art/base-red-tests.txt" ] && echo yes || echo no)"
+assert_eq "Test 2 newly_broken_fails: the base commit really ran" "yes" "$([ -f "$STB_ROOT/t2/mark" ] && echo yes || echo no)"
+assert_eq "Test 2 newly_broken_fails: worktree removed" "1 0" "$(stb_wt_count "$STB_ROOT/t2/repo") $(stb_leftover "$STB_ROOT/t2/art")"
+
+echo "--- Test 2b: newly_broken_fails when base is fully green ---"
+mkdir -p "$STB_ROOT/t2b/repo" "$STB_ROOT/t2b/art"
+stb_fixture "$STB_ROOT/t2b/repo" '' 'A\n' > "$STB_ROOT/t2b/art/run-start-sha.txt"
+stb_head "$STB_ROOT/t2b/repo" "$STB_ROOT/t2b/art"
+T2B_OUT="$(cd "$STB_ROOT/t2b/repo" && ARTIFACTS_DIR="$STB_ROOT/t2b/art" rst_base_compare "$STB_ROOT/t2b/art/report" "$STB_ROOT/t2b/art/cmds" "$STB_ROOT/t2b/art/head.log" "$STB_COUNTS" 2>/dev/null)"
+assert_eq "Test 2b newly_broken_fails (green base): TESTS_STATUS=failed" "failed" "$(stb_field TESTS_STATUS "$T2B_OUT")"
+assert_contains "Test 2b newly_broken_fails (green base): newly broken A" "newly broken: suite > A" "$(stb_field TESTS_LINE "$T2B_OUT")"
+assert_eq "Test 2b newly_broken_fails (green base): outcome" "base_passed" "$(stb_field TESTS_BASE_COMPARE "$T2B_OUT")"
+
+echo "--- Test 3: unparseable_fails_closed ---"
+mkdir -p "$STB_ROOT/t3/repo" "$STB_ROOT/t3/art"
+T3_SHA="$(stb_fixture "$STB_ROOT/t3/repo" 'A\nB\n' 'A\nB\n' 'plain=1')"
+echo "$T3_SHA" > "$STB_ROOT/t3/art/run-start-sha.txt"
+stb_head "$STB_ROOT/t3/repo" "$STB_ROOT/t3/art"
+assert_eq "Test 3 unparseable_fails_closed: head counts parsed from the summary" "2 4" "$STB_COUNTS"
+T3_OUT="$(cd "$STB_ROOT/t3/repo" && ARTIFACTS_DIR="$STB_ROOT/t3/art" rst_base_compare "$STB_ROOT/t3/art/report" "$STB_ROOT/t3/art/cmds" "$STB_ROOT/t3/art/head.log" "$STB_COUNTS" 2>/dev/null)"
+assert_eq "Test 3 unparseable_fails_closed: TESTS_STATUS=failed" "failed" "$(stb_field TESTS_STATUS "$T3_OUT")"
+assert_eq "Test 3 unparseable_fails_closed: report unchanged" "$(cat "$STB_ROOT/t3/art/report")" "$(printf '%s\n' "$T3_OUT" | grep -v '^TESTS_BASE_COMPARE=')"
+assert_eq "Test 3 unparseable_fails_closed: outcome" "unparsed" "$(stb_field TESTS_BASE_COMPARE "$T3_OUT")"
+assert_eq "Test 3 unparseable_fails_closed: no base-red-tests.txt" "no" "$([ -e "$STB_ROOT/t3/art/base-red-tests.txt" ] && echo yes || echo no)"
+assert_eq "Test 3 unparseable_fails_closed: no worktree left" "1 0" "$(stb_wt_count "$STB_ROOT/t3/repo") $(stb_leftover "$STB_ROOT/t3/art")"
+assert_eq "Test 3 unparseable_fails_closed: no ids from marker-free output" "" "$(printf 'Passed: 2  Failed: 2  Total: 4\nerror: something\n' | stb_failed_ids)"
+
+echo "--- Test 3b: failing-id parser (bun, node:test, jest, vitest) ---"
+STB_BULLET="$(printf '\342\227\217')"
+assert_eq "Test 3b ids bun with timing and filter prefix" "$(printf '@archon/workflows :: suite > x\nsuite > y')" \
+  "$(printf '@archon/workflows:test | (fail) suite > x [12.50ms]\n(fail) suite > y\n(pass) suite > z [1ms]\n' | stb_failed_ids)"
+assert_eq "Test 3b ids node:test, TODO is not a failure" "$(printf 'adds\nnested sub')" \
+  "$(printf 'ok 1 - fine\nnot ok 2 - adds\n    not ok 1 - nested sub\nnot ok 3 - later # TODO not yet\n' | stb_failed_ids)"
+assert_eq "Test 3b ids jest bullet" "Suite x" "$(printf '  %s Suite x\n' "$STB_BULLET" | stb_failed_ids)"
+assert_eq "Test 3b ids vitest FAIL line" "src/a.test.ts > suite > t" "$(printf ' FAIL  src/a.test.ts > suite > t\n FAIL  src/b.test.ts\n' | stb_failed_ids)"
+
+echo "--- Test 4: base_timeout_or_missing_sha_fails_closed ---"
+mkdir -p "$STB_ROOT/t4/repo" "$STB_ROOT/t4/art"
+stb_fixture "$STB_ROOT/t4/repo" 'A\n' 'A\n' > /dev/null
+stb_head "$STB_ROOT/t4/repo" "$STB_ROOT/t4/art"
+T4_OUT="$(cd "$STB_ROOT/t4/repo" && STB_MARK="$STB_ROOT/t4/mark" ARTIFACTS_DIR="$STB_ROOT/t4/art" rst_base_compare "$STB_ROOT/t4/art/report" "$STB_ROOT/t4/art/cmds" "$STB_ROOT/t4/art/head.log" "$STB_COUNTS" 2>/dev/null)"
+assert_eq "Test 4 base_timeout_or_missing_sha_fails_closed: missing sha -> failed" "failed" "$(stb_field TESTS_STATUS "$T4_OUT")"
+assert_eq "Test 4 base_timeout_or_missing_sha_fails_closed: missing sha outcome" "no_base_sha" "$(stb_field TESTS_BASE_COMPARE "$T4_OUT")"
+assert_eq "Test 4 base_timeout_or_missing_sha_fails_closed: missing sha never ran base" "no" "$([ -f "$STB_ROOT/t4/mark" ] && echo yes || echo no)"
+assert_eq "Test 4 base_timeout_or_missing_sha_fails_closed: missing sha leaves no worktree" "1 0" "$(stb_wt_count "$STB_ROOT/t4/repo") $(stb_leftover "$STB_ROOT/t4/art")"
+echo "not-a-commit-0000" > "$STB_ROOT/t4/art/run-start-sha.txt"
+T4C_OUT="$(cd "$STB_ROOT/t4/repo" && ARTIFACTS_DIR="$STB_ROOT/t4/art" rst_base_compare "$STB_ROOT/t4/art/report" "$STB_ROOT/t4/art/cmds" "$STB_ROOT/t4/art/head.log" "$STB_COUNTS" 2>/dev/null)"
+assert_eq "Test 4 base_timeout_or_missing_sha_fails_closed: bad sha -> failed" "failed no_base_sha" "$(stb_field TESTS_STATUS "$T4C_OUT") $(stb_field TESTS_BASE_COMPARE "$T4C_OUT")"
+
+# Base run timeout: the real timeout binary, shortened to 3 s by a PATH wrapper; the
+# base commit sleeps 20 s (slow.txt exists on base only), the head commit does not.
+mkdir -p "$STB_ROOT/t4t/repo" "$STB_ROOT/t4t/art" "$STB_ROOT/t4t/bin"
+stb_fixture "$STB_ROOT/t4t/repo" 'A\n' 'A\n' 'slow=20' > "$STB_ROOT/t4t/art/run-start-sha.txt"
+STB_REAL_TIMEOUT="$(command -v timeout)"
+printf '#!/usr/bin/env bash\nshift\nexec "%s" 3 "$@"\n' "$STB_REAL_TIMEOUT" > "$STB_ROOT/t4t/bin/timeout"
+chmod +x "$STB_ROOT/t4t/bin/timeout"
+stb_head "$STB_ROOT/t4t/repo" "$STB_ROOT/t4t/art"
+T4T_START="$(date +%s)"
+T4T_OUT="$(cd "$STB_ROOT/t4t/repo" && PATH="$STB_ROOT/t4t/bin:$PATH" STB_MARK="$STB_ROOT/t4t/mark" ARTIFACTS_DIR="$STB_ROOT/t4t/art" rst_base_compare "$STB_ROOT/t4t/art/report" "$STB_ROOT/t4t/art/cmds" "$STB_ROOT/t4t/art/head.log" "$STB_COUNTS" 2>/dev/null)"
+T4T_ELAPSED=$(( $(date +%s) - T4T_START ))
+assert_eq "Test 4 base_timeout_or_missing_sha_fails_closed: timeout -> failed" "failed" "$(stb_field TESTS_STATUS "$T4T_OUT")"
+assert_eq "Test 4 base_timeout_or_missing_sha_fails_closed: timeout outcome" "base_timeout" "$(stb_field TESTS_BASE_COMPARE "$T4T_OUT")"
+assert_eq "Test 4 base_timeout_or_missing_sha_fails_closed: base did start" "yes" "$([ -f "$STB_ROOT/t4t/mark" ] && echo yes || echo no)"
+assert_eq "Test 4 base_timeout_or_missing_sha_fails_closed: timed out well before the 20 s sleep" "yes" "$([ "$T4T_ELAPSED" -lt 18 ] && echo yes || echo "no ($T4T_ELAPSED s)")"
+assert_eq "Test 4 base_timeout_or_missing_sha_fails_closed: timeout worktree removed" "1 0" "$(stb_wt_count "$STB_ROOT/t4t/repo") $(stb_leftover "$STB_ROOT/t4t/art")"
+assert_eq "Test 4 base_timeout_or_missing_sha_fails_closed: no base-red-tests.txt" "no" "$([ -e "$STB_ROOT/t4t/art/base-red-tests.txt" ] && echo yes || echo no)"
+
+echo "--- Test 5: manifest_records_base_red ---"
+SME_CORE="$(extract_core "$CANONICAL_YAML" sme)"
+MEC_CORE="$(extract_core "$CANONICAL_YAML" mec)"
+mkdir -p "$STB_ROOT/t5"
+printf 'suite > A\nsuite > B\n' > "$STB_ROOT/t5/base-red-tests.txt"
+T5_MANIFEST="$(printf 'WO: WO-X\nBuilder: Major Build\nTests: <pass>/<total>\nGrep assertions: <x>\nVALIDATION: PASS\n')"
+T5_LINE="8144/8146 (base-red: 2 tests failing on base abcd1234; newly broken: 0) (bun run test) [source: wo-spec]"
+T5_STAMPED="$( eval "$SME_CORE"; printf '%s\n' "$T5_MANIFEST" | sme_process "$T5_LINE" base_red "grep -c x f => 1" passed 0 | ARTIFACTS_DIR="$STB_ROOT/t5" stb_stamp_base_red )"
+assert_contains "Test 5 manifest_records_base_red: Base-red tests: line with both names" "Base-red tests: suite > A; suite > B" "$T5_STAMPED"
+assert_eq "Test 5 manifest_records_base_red: Base-red line follows Tests:" "Base-red tests:" "$(printf '%s\n' "$T5_STAMPED" | awk '/^Tests:/ { getline; print substr($0, 1, 15); exit }')"
+assert_contains "Test 5 manifest_records_base_red: VALIDATION stays PASS" "VALIDATION: PASS" "$T5_STAMPED"
+assert_not_contains "Test 5 manifest_records_base_red: VALIDATION not FAIL" "VALIDATION: FAIL" "$T5_STAMPED"
+T5_MEC="$( eval "$MEC_CORE"; printf '%s\n' "$T5_STAMPED" | mec_check PROCEED CODE base_red 1 passed 1 1 0 0 0 "" 2>&1; echo "rc=$?" )"
+assert_eq "Test 5 manifest_records_base_red: manifest-evidence-check passes" "$(printf 'OK\nrc=0')" "$T5_MEC"
+# Controls: the same manifest with a failed head is FAIL and blocked; no file -> no line.
+T5_FAIL="$( eval "$SME_CORE"; printf '%s\n' "$T5_MANIFEST" | sme_process "6/8 (bun run test) -- FAILED, exit 1" failed "grep -c x f => 1" passed 0 | ARTIFACTS_DIR="$STB_ROOT/t5-none" stb_stamp_base_red )"
+assert_contains "Test 5 control: failed tests still stamp VALIDATION: FAIL" "VALIDATION: FAIL" "$T5_FAIL"
+assert_not_contains "Test 5 control: no base-red file, no Base-red line" "Base-red tests:" "$T5_FAIL"
+T5_FMEC="$( eval "$MEC_CORE"; printf '%s\n' "$T5_FAIL" | mec_check PROCEED CODE failed 1 passed 1 1 0 0 0 "" >/dev/null 2>&1; echo "rc=$?" )"
+assert_eq "Test 5 control: manifest-evidence-check blocks failed" "rc=1" "$T5_FMEC"
+assert_eq "Test 5 control: short-form manifest passes through" "BLOCKED: x" "$(printf 'BLOCKED: x\n' | ARTIFACTS_DIR="$STB_ROOT/t5" stb_stamp_base_red)"
+
+echo "--- Test 6: passing_head_never_runs_base ---"
+mkdir -p "$STB_ROOT/t6/repo" "$STB_ROOT/t6/art"
+stb_fixture "$STB_ROOT/t6/repo" 'A\n' '' > "$STB_ROOT/t6/art/run-start-sha.txt"
+printf 'stale\n' > "$STB_ROOT/t6/art/base-red-tests.txt"
+T6_OUT="$(cd "$STB_ROOT/t6/repo" && STB_MARK="$STB_ROOT/t6/mark" ARTIFACTS_DIR="$STB_ROOT/t6/art" bash "$STB_NODE" 2>/dev/null)"
+assert_eq "Test 6 passing_head_never_runs_base: TESTS_STATUS=passed" "passed" "$(stb_field TESTS_STATUS "$T6_OUT")"
+assert_eq "Test 6 passing_head_never_runs_base: TESTS_LINE unchanged" "4/4 (bash ./run.sh) [source: wo-spec]" "$(stb_field TESTS_LINE "$T6_OUT")"
+assert_eq "Test 6 passing_head_never_runs_base: outcome" "not_failed" "$(stb_field TESTS_BASE_COMPARE "$T6_OUT")"
+assert_eq "Test 6 passing_head_never_runs_base: base never ran" "no" "$([ -f "$STB_ROOT/t6/mark" ] && echo yes || echo no)"
+assert_eq "Test 6 passing_head_never_runs_base: no base worktree created" "1 0" "$(stb_wt_count "$STB_ROOT/t6/repo") $(stb_leftover "$STB_ROOT/t6/art")"
+assert_eq "Test 6 passing_head_never_runs_base: no base log" "no" "$([ -e "$STB_ROOT/t6/art/evidence/stop-tests-base.log" ] && echo yes || echo no)"
+assert_eq "Test 6 passing_head_never_runs_base: stale base-red-tests.txt cleared" "no" "$([ -e "$STB_ROOT/t6/art/base-red-tests.txt" ] && echo yes || echo no)"
+
+echo "--- Test 7: all_lanes_call_shared_script ---"
+STB_CALL='rst_base_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS"'
+STB_STAMP='"$(sme_field GREP_DROPPED "$GREPS_OUT")" | stb_stamp_base_red'
+STB_N=0
+for lane in $LANES; do
+  STB_N=$((STB_N + 1))
+  lf="$DEFAULTS/$lane"
+  assert_eq "Test 7 all_lanes_call_shared_script: $lane has 2 stbase stubs" "2" "$(grep -c 'BEGIN stbase core' "$lf")"
+  assert_eq "Test 7 all_lanes_call_shared_script: $lane stub 1 identical" "$STBASE_CORE" "$(extract_core_nth "$lf" stbase 1)"
+  assert_eq "Test 7 all_lanes_call_shared_script: $lane stub 2 identical" "$STBASE_CORE" "$(extract_core_nth "$lf" stbase 2)"
+  assert_eq "Test 7 all_lanes_call_shared_script: $lane one rst_base_compare call" "1" "$(tr -d '\r' < "$lf" | grep -cF "      $STB_CALL")"
+  assert_eq "Test 7 all_lanes_call_shared_script: $lane one stamp helper call" "1" "$(tr -d '\r' < "$lf" | grep -cF "$STB_STAMP")"
+  assert_eq "Test 7 all_lanes_call_shared_script: $lane inlines no comparison logic" "0" "$(grep -cE 'stb_failed_ids|worktree add --detach|base-red-tests\.txt|comm -23' "$lf")"
+done
+assert_eq "Test 7 all_lanes_call_shared_script: 13 lanes checked" "13" "$STB_N"
+STB_GEN="$REPO_ROOT/packages/workflows/src/defaults/bundled-defaults.generated.ts"
+assert_eq "Test 7 all_lanes_call_shared_script: bundle carries stop-tests-base.sh" "1" "$(grep -c '"stop-tests-base.sh":' "$STB_GEN")"
+if command -v bun >/dev/null 2>&1; then
+  STB_CHECK="$(cd "$REPO_ROOT" && bun run scripts/generate-bundled-defaults.ts --check 2>&1)"; STB_CHECK_RC=$?
+  assert_eq "Test 7 all_lanes_call_shared_script: bundle check passes" "0" "$STB_CHECK_RC"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL: Test 7 all_lanes_call_shared_script: bun not on PATH, bundle check could not run"
+fi
+
+rm -rf "$STB_ROOT"
+unset BDC_STBASE_SCRIPT STB_SPEC_FILE
 
 echo
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"
