@@ -14,6 +14,11 @@ WORKSPACES_ROOT="/opt/bdc/archon-data/workspaces"
 DRY_RUN="${DRY_RUN:-0}"
 STAGING_MAX_AGE_DAYS=3
 KEEP_LATEST_STAGING_IMAGES=2
+# archon:rollback-<STAMP> pins (one per archon-app-1 rebuild, ~8 GB each) to keep.
+KEEP_ROLLBACK_PINS="${KEEP_ROLLBACK_PINS:-3}"
+# One line naming the pin the last rebuild recorded as its rollback target
+# (written by the rebuild procedure). That tag is never removed.
+ROLLBACK_RECORD_FILE="${ROLLBACK_RECORD_FILE:-/opt/bdc/backups/archon/LAST_ROLLBACK_PIN}"
 
 # Git metadata in the workspaces holds container paths (/.archon/workspaces/...),
 # so git commands for them run inside the harness container.
@@ -42,6 +47,37 @@ is_abandoned() {
   return 0
 }
 
+# Keeps the newest KEEP_ROLLBACK_PINS archon:rollback-<STAMP> pins by image
+# creation time and removes older ones with plain `docker rmi` (no -f). The
+# newest pin is always kept: it is the current rebuild's rollback target. A pin
+# whose image ID is used by any container, running or stopped, is skipped, and so
+# is the tag named in ROLLBACK_RECORD_FILE (when that file is readable). If
+# docker cannot list containers, nothing is removed. DRY_RUN=1 prints the plan.
+prune_rollback_pins() {
+  local keep="$KEEP_ROLLBACK_PINS" ids in_use="" recorded="" i=0 tag id
+  case "$keep" in ''|*[!0-9]*) keep=3;; esac
+  ids=$(docker ps -aq) || { log "skip rollback pins: docker ps failed"; return 0; }
+  if [ -n "$ids" ]; then
+    # shellcheck disable=SC2086
+    in_use=$(docker inspect -f '{{.Image}}' $ids) || { log "skip rollback pins: docker inspect failed"; return 0; }
+  fi
+  if [ -r "$ROLLBACK_RECORD_FILE" ]; then
+    recorded=$(head -n 1 "$ROLLBACK_RECORD_FILE" 2>/dev/null | tr -d '[:space:]')
+  fi
+  while IFS='|' read -r _ tag id; do
+    [ -n "$tag" ] || continue
+    i=$((i + 1))
+    if [ "$i" -eq 1 ]; then log "keep rollback pin: $tag (newest)"; continue; fi
+    if [ "$i" -le "$keep" ]; then log "keep rollback pin: $tag (within newest $keep)"; continue; fi
+    if grep -qxF "$id" <<<"$in_use"; then log "skip rollback pin: $tag (in-use)"; continue; fi
+    if [ -n "$recorded" ] && [ "$tag" = "$recorded" ]; then log "skip rollback pin: $tag (rollback-record)"; continue; fi
+    if [ "$DRY_RUN" = "1" ]; then log "DRY_RUN would remove rollback pin: $tag"; continue; fi
+    log "removing rollback pin: $tag"
+    docker rmi "$tag" >>"$LOG" 2>&1
+  done < <(docker images --no-trunc --format '{{.CreatedAt}}|{{.Repository}}:{{.Tag}}|{{.ID}}' \
+    | grep -E '^[^|]*\|archon:rollback-' | sort -r)
+}
+
 log "=== cauldron-disk-cleanup start ==="
 df -h / | tail -1 | tee -a "$LOG"
 
@@ -58,7 +94,11 @@ for repo_worktrees in "$WORKSPACES_ROOT"/*/*/worktrees/*; do
     sudo rm -rf "$wt"
   done
 done
-if [ "$DRY_RUN" = "1" ]; then echo "DRY_RUN: worktree section only; nothing removed"; exit 0; fi
+
+# --- 1b. archon:rollback-<STAMP> pins (keep newest KEEP_ROLLBACK_PINS). Runs
+# before the DRY_RUN exit so a dry run prints its plan; it removes nothing then.
+prune_rollback_pins
+if [ "$DRY_RUN" = "1" ]; then echo "DRY_RUN: worktree and rollback-pin plan only; nothing removed"; exit 0; fi
 
 # Prune git's own worktree bookkeeping in each repo's source clone. This runs in
 # the container: on the host every recorded worktree path (/.archon/...) looks
