@@ -1,5 +1,15 @@
-import { expect, test } from 'bun:test';
+import { beforeEach, expect, test } from 'bun:test';
+import {
+  createRealFetchExactHeadPullRequestEvidence,
+  type RealGitHubOctokitLike,
+} from '../adapters/github-real-deps.ts';
+import {
+  inMemoryAttemptCounterStore,
+  resetRequiredContextsAttemptCounters,
+  resetRequiredContextsCache,
+} from '../adapters/required-contexts.ts';
 import { latestAttemptPerCheck, namedBlockingChecksAreGreen } from '../pr-review-check-ingest.ts';
+import { listCheckRunsForRefFromOctokit } from '../pr-review-check-wiring.ts';
 import {
   applyRequiredCheckGate,
   partitionChecksByRequired,
@@ -12,6 +22,13 @@ import {
 // Both jobs of one workflow execution share a check suite (ids below are real).
 const GATE = 'CE Promotion Gate';
 const APP = { slug: 'github-actions' };
+const HEAD = 'ca6fa304f66296e99185567de3bc5cf05f2a6f68';
+const BASE = 'b4a37927a9fa0a93294065cef25d6f47b7e06452';
+
+beforeEach(() => {
+  resetRequiredContextsAttemptCounters();
+  resetRequiredContextsCache();
+});
 
 function run(
   id: number,
@@ -120,4 +137,97 @@ test('different check names in one suite are never merged by the twin rule', () 
       .map(c => c.id)
       .sort()
   ).toEqual([126288831019, 126288833084]);
+});
+
+test('same suite, later rerun attempt that legitimately skips: the skip wins', () => {
+  const firstAttemptFail: PrReviewCheck = {
+    ...run(100, 'failure', 1),
+    started_at: '2026-11-03T10:00:00Z',
+    completed_at: '2026-11-03T10:01:00Z',
+  };
+  const rerunSkip: PrReviewCheck = {
+    ...run(200, 'skipped', 1),
+    started_at: '2026-11-03T10:05:00Z',
+    completed_at: '2026-11-03T10:05:00Z',
+  };
+  expect(latestAttemptPerCheck([firstAttemptFail, rerunSkip]).map(c => c.id)).toEqual([200]);
+  expect(namedBlockingChecksAreGreen([firstAttemptFail, rerunSkip], [GATE])).toBe(true);
+});
+
+test('skipped run without a start time is never treated as a twin', () => {
+  const real = run(10, 'failure', 3);
+  const skipped: PrReviewCheck = { ...run(20, 'skipped', 3), started_at: null };
+  expect(latestAttemptPerCheck([real, skipped]).map(c => c.id)).toEqual([20]);
+});
+
+// The real #777 pair from GitHub (filter=all), as the adapters return it.
+const REAL_PAIR = [
+  {
+    id: 126188367041,
+    name: GATE,
+    status: 'completed',
+    conclusion: 'skipped',
+    started_at: '2026-11-03T20:34:16Z',
+    completed_at: '2026-11-03T20:34:16Z',
+    app: APP,
+    check_suite: { id: 113039551793 },
+  },
+  {
+    id: 126188364537,
+    name: GATE,
+    status: 'completed',
+    conclusion: 'failure',
+    started_at: '2026-11-03T20:34:19Z',
+    completed_at: '2026-11-03T20:34:27Z',
+    app: APP,
+    check_suite: { id: 113039551793 },
+  },
+];
+
+test('review evidence adapter requests filter=all and carries check_suite', async () => {
+  const calls: Record<string, unknown>[] = [];
+  const octokit = {
+    pulls: {
+      get: async () => ({ data: { head: { sha: HEAD }, base: { sha: BASE, ref: 'release/ce' } } }),
+    },
+    repos: {
+      compareCommits: async () => ({ data: { files: [] } }),
+      getAllStatusCheckContexts: async () => ({ data: [GATE] }),
+    },
+    checks: {
+      listForRef: async (args: Record<string, unknown>) => {
+        calls.push(args);
+        return { data: { check_runs: REAL_PAIR } };
+      },
+    },
+  } as unknown as RealGitHubOctokitLike;
+  const evidence = await createRealFetchExactHeadPullRequestEvidence(
+    octokit,
+    undefined,
+    inMemoryAttemptCounterStore
+  )({ owner: 'thinmansoftware', repo: 'lspro-react', prNumber: 777, headSha: HEAD });
+
+  expect(calls).toHaveLength(1);
+  expect(calls[0]?.filter).toBe('all');
+  expect(evidence.checks.map(c => c.check_suite?.id)).toEqual([113039551793, 113039551793]);
+  const gating = partitionChecksByRequired(evidence.checks, [GATE]).gating;
+  expect(gating.map(c => c.conclusion)).toEqual(['failure']);
+});
+
+test('recheck adapter requests filter=all and the twin cannot mask the failure', async () => {
+  const calls: Record<string, unknown>[] = [];
+  const listed = await listCheckRunsForRefFromOctokit(
+    {
+      checks: {
+        listForRef: async (args: Record<string, unknown>) => {
+          calls.push(args);
+          return { data: { check_runs: REAL_PAIR } };
+        },
+      },
+    },
+    { owner: 'thinmansoftware', repo: 'lspro-react', headSha: HEAD }
+  );
+  expect(calls[0]?.filter).toBe('all');
+  expect(listed.complete).toBe(true);
+  expect(namedBlockingChecksAreGreen(listed.runs, [GATE])).toBe(false);
 });

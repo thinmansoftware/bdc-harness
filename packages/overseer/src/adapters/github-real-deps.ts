@@ -521,12 +521,9 @@ export function createRealFetchExactHeadPullRequestEvidence(
         base: baseSha,
         head: input.headSha,
       }),
-      octokit.checks.listForRef({
-        owner: input.owner,
-        repo: input.repo,
-        ref: input.headSha,
-        per_page: 100,
-      }),
+      // Every attempt, every page (filter=all): the twin-job reducer needs the
+      // non-skipped sibling of a skipped run, which filter=latest can omit.
+      listEveryCheckRun(octokit, { owner: input.owner, repo: input.repo, ref: input.headSha }),
     ]);
     // Required status-check contexts on the base branch are the authoritative
     // complete-suite signal: without them, one fast check completing before the
@@ -581,7 +578,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
         baseRef: `zero-checks:${baseRef ?? ''}`,
         headSha: input.headSha,
       };
-      if (checkRuns.data.check_runs.length === 0) {
+      if (checkRuns.length === 0) {
         const attempts = await attemptStore.increment(zeroChecksKey, Date.now());
         const maxAttempts = resolveMaxAttempts(process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]);
         if (attempts >= maxAttempts) {
@@ -609,7 +606,7 @@ export function createRealFetchExactHeadPullRequestEvidence(
       diff: (comparison.data.files ?? [])
         .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
         .join('\n'),
-      checks: checkRuns.data.check_runs.map((run, index) => ({
+      checks: checkRuns.map((run, index) => ({
         id: run.id,
         name: run.name?.trim() || `check-${index + 1}`,
         status: run.status,
