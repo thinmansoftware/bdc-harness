@@ -1714,11 +1714,23 @@ export async function mailboxDepthByPrincipal(): Promise<MailboxDepthResult> {
 
 export async function acknowledgeMessage(data: {
   id: string;
+  /** The mailbox principal the row must be addressed to (validated below). */
   principal_id: string;
+  /**
+   * The authenticated principal actually performing the ack, when it differs
+   * from the mailbox (a credential acking for a mailbox in its receive_as).
+   * Recorded in acknowledged_by for audit. The caller is responsible for
+   * having verified receive_as; the mailbox check still runs on principal_id.
+   */
+  acting_principal_id?: string;
   bind?: XoLeaseBind;
 }): Promise<DispatchMailboxResult> {
   const db = getDatabase();
   const principalId = canonicalizePrincipal(data.principal_id);
+  const ackActor =
+    data.acting_principal_id !== undefined
+      ? canonicalizePrincipal(data.acting_principal_id)
+      : principalId;
   const now = nowIso();
   return withRetriedMailboxTransaction(() =>
     db.withTransaction(async txQuery => {
@@ -1729,16 +1741,18 @@ export async function acknowledgeMessage(data: {
       const invalid = await validateMailboxActor(txQuery, message, principalId);
       if (invalid) return invalid;
       if (message.acknowledged_by !== null) {
-        return message.acknowledged_by === principalId
+        return message.acknowledged_by === ackActor
           ? { ok: true, message }
           : { ok: false, reason: 'actor_mismatch' };
       }
 
       const leasePredicate = xoLeaseBindPredicate(principalId, data.bind);
+      // acknowledged_by is bound after the lease params ($4-$8 when present).
+      const ackActorParam = 4 + leasePredicate.params.length;
       const update = await txQuery(
         `UPDATE agent_dispatch_messages
        SET acknowledged_at = $2,
-           acknowledged_by = $3
+           acknowledged_by = $${ackActorParam}
        WHERE id = $1
          AND status = 'queued'
          AND acknowledged_at IS NULL
@@ -1751,7 +1765,7 @@ export async function acknowledgeMessage(data: {
              AND CAST(recipient_principal.active AS TEXT) IN ('1', 'true')
              AND recipient_principal.delivery_mode IN ('drain_on_start', 'notify_only')
          )${leasePredicate.sql}`,
-        [data.id, now, principalId, ...leasePredicate.params]
+        [data.id, now, principalId, ...leasePredicate.params, ackActor]
       );
       if (update.rowCount === 0 && principalId === 'xo') {
         const staleBind = await validateXoLeaseBind(txQuery, principalId, data.bind);
@@ -1761,7 +1775,7 @@ export async function acknowledgeMessage(data: {
       if (!finalMessage) return { ok: false, reason: 'not_found' };
       const finalInvalid = await validateMailboxActor(txQuery, finalMessage, principalId);
       if (finalInvalid) return finalInvalid;
-      if (finalMessage.acknowledged_by === principalId) return { ok: true, message: finalMessage };
+      if (finalMessage.acknowledged_by === ackActor) return { ok: true, message: finalMessage };
       if (update.rowCount === 0 && finalMessage.acknowledged_by === null) {
         return { ok: false, reason: 'actor_mismatch' };
       }

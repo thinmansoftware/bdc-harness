@@ -4160,8 +4160,13 @@ describe('dispatch API', () => {
           headers,
           body: '{}',
         });
+        // A receive_as alias now acks AS the alias mailbox (fix/dispatch-receive-as-ack),
+        // so the refusal here comes from 'aliasbox' not being a registered
+        // mailbox-delivery principal, not from the actor being a different name.
+        // A registered alias (t3-bridge -> t3-desktop) succeeds; see
+        // api.t3-bridge-principal.test.ts.
         expect(aliasAck.status).toBe(409);
-        expect((await readError(aliasAck)).error).toBe('wrong_recipient');
+        expect((await readError(aliasAck)).error).toBe('wrong_mode');
         expect((await storedReceipt(aliasId)).acknowledged_at).toBeNull();
         expect((await storedReceipt(aliasId)).addressed_at).toBeNull();
 

@@ -5284,6 +5284,13 @@ export function registerApiRoutes(
         body.principal_id !== bind?.holder_principal_id
       )
         return apiError(c, 409, 'actor_mismatch');
+      // A principal credential acks AS the mailbox it is allowed to receive for
+      // (receive_as), which may differ from its own principal_id (t3-bridge
+      // receives for t3-desktop). The authenticated principal is recorded as
+      // the acting principal (acknowledged_by). Non-credential callers keep
+      // acking strictly as their resolved actor.
+      let mailboxPrincipal = actor;
+      let actingPrincipal: string | undefined;
       if (principalCredential) {
         const existing = await dispatchDb.getMessage(c.req.param('id') ?? '');
         if (existing) {
@@ -5293,11 +5300,14 @@ export function registerApiRoutes(
           if (!principalCredential.receive_as.includes(mailboxRecipient)) {
             return apiError(c, 403, 'dispatch_principal_forbidden');
           }
+          mailboxPrincipal = mailboxRecipient;
+          actingPrincipal = actor;
         }
       }
       const result = await dispatchDb.acknowledgeMessage({
         id: c.req.param('id') ?? '',
-        principal_id: actor,
+        principal_id: mailboxPrincipal,
+        ...(actingPrincipal !== undefined ? { acting_principal_id: actingPrincipal } : {}),
         bind,
       });
       if (!result.ok) {
