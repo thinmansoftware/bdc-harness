@@ -143,10 +143,15 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         const n = node(nodes, 'run-stop-greps', file);
         expect(n.depends_on).toEqual(['format-autofix']);
         expect(n.timeout).toBe(600000);
-        expect(n.bash).toContain('rsg_tokens_safe');
+        // WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01: the whitespace split and the
+        // per-token charset check were replaced by the shared quote-aware tokenizer
+        // scripts/lane/rsg-argv.sh (rsg_parse_pipeline); the charset now lives there.
+        expect(n.bash).toContain('rsg_parse_pipeline');
+        expect(n.bash).toContain('BDC_RSGARGV_SCRIPT');
+        expect(n.bash).not.toContain('rsg_tokens_safe');
+        expect(n.bash).not.toContain('rsg_strip_arg');
         expect(n.bash).toContain('rsg_exec_pipeline');
         expect(n.bash).toContain('-execdir');
-        expect(n.bash).toContain('^[A-Za-z0-9@%+=:,./_*?-]+$');
         expect(n.bash).not.toContain('bash -c "$1"');
       });
 
@@ -543,7 +548,10 @@ function runStopGrepsNode(opts: {
     );
     const proc = Bun.spawnSync(['bash', '-c', rendered], {
       cwd,
-      env: { ...process.env },
+      env: {
+        ...process.env,
+        BDC_RSGARGV_SCRIPT: join(import.meta.dir, '..', '..', '..', 'scripts/lane/rsg-argv.sh'),
+      },
       stdout: 'pipe',
       stderr: 'pipe',
     });

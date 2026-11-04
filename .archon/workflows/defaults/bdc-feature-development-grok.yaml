@@ -2564,47 +2564,26 @@ nodes:
           }
         '
       }
-      # rsg_strip_arg <token>   (prints inner text when the token is one
-      #   single-quoted argv-charset string; otherwise prints the token
-      #   unchanged. Qualifying: begins and ends with ', length >= 3, no
-      #   embedded ', inner matches ^[A-Za-z0-9@%+=:,./_*?-]+$. Callers strip
-      #   before flag checks and before exec so both see the same argv.)
-      rsg_strip_arg() {
-        local t="$1" inner
-        case "$t" in
-          "'"*"'") ;;
-          *) printf '%s' "$t"; return 0 ;;
-        esac
-        if [ "${#t}" -lt 3 ]; then
-          printf '%s' "$t"
-          return 0
-        fi
-        inner="${t:1:${#t}-2}"
-        case "$inner" in
-          *"'"*) printf '%s' "$t"; return 0 ;;
-        esac
-        if printf '%s' "$inner" | grep -qE '^[A-Za-z0-9@%+=:,./_*?-]+$'; then
-          printf '%s' "$inner"
-        else
-          printf '%s' "$t"
-        fi
-      }
-      # rsg_tokens_safe <tokens...>   (rc 0 when every token is in the argv charset.
-      #   [ and ] are allowed so the test builtin can run. A single-quoted token
-      #   whose inner text matches the charset is accepted. * and ? are literal --
-      #   callers must set -f before splitting. Same shape as rst_tokens_safe.)
-      rsg_tokens_safe() {
-        local t stripped
-        for t in "$@"; do
-          case "$t" in '['|']') continue ;; esac
-          stripped="$(rsg_strip_arg "$t")"
-          if [ "$stripped" != "$t" ]; then
-            continue
-          fi
-          printf '%s' "$t" | grep -qE '^[A-Za-z0-9@%+=:,./_*?-]+$' || return 1
-        done
-        return 0
-      }
+      # rsg_parse_pipeline <command>   (the ONE quote-aware tokenizer, in scripts/lane/rsg-argv.sh,
+      #   WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01. Fills RSG_PARSED: one argv word per
+      #   element, pipeline segments separated by the single element RSG_US (0x1F). Single-quoted
+      #   words (spaces, ; | $( ^ inside them are literal bytes) are one argv word each; double
+      #   quotes, backslashes and every metacharacter outside quotes are rejected. Resolution
+      #   order: $BDC_RSGARGV_SCRIPT (tests), then the engine's per-node copy
+      #   ($ARCHON_LANE_SCRIPTS_DIR/rsg-argv.sh), then the image copy /app/scripts/lane/rsg-argv.sh.
+      #   When none exists rsg_parse_pipeline always returns 1, so every declared grep is
+      #   dropped -- fail closed.)
+      RSGARGV_SCRIPT=""
+      for rsgargv_candidate in "${BDC_RSGARGV_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/rsg-argv.sh}" /app/scripts/lane/rsg-argv.sh; do
+        if [ -n "$rsgargv_candidate" ] && [ -f "$rsgargv_candidate" ]; then RSGARGV_SCRIPT="$rsgargv_candidate"; break; fi
+      done
+      if [ -n "$RSGARGV_SCRIPT" ]; then
+        . "$RSGARGV_SCRIPT"
+      else
+        printf 'run-stop-greps: rsg-argv.sh missing (tried BDC_RSGARGV_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/rsg-argv.sh); every grep stop condition will be dropped (fail closed)\n' "${BDC_RSGARGV_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}" >&2
+        RSG_PARSED=()
+        rsg_parse_pipeline() { RSG_PARSED=(); return 1; }
+      fi
       rsg_has_grep_flag() {
         local t
         for t in "$@"; do
@@ -2632,17 +2611,13 @@ nodes:
         done
         return 1
       }
-      # rsg_argv_looks_readonly <segment>   (rc 0 when the segment tokenizes --
-      #   whitespace split, noglob -- to an allowlisted read-only runner with no
-      #   write/exec options. Leading LC_ALL=* / LANG=* tokens are skipped.
-      #   Qualifying single-quoted tokens are stripped before the charset check
-      #   and the flag checks, matching the argv rsg_exec_pipeline runs.)
+      # rsg_argv_looks_readonly <word...>   (rc 0 when the already-parsed argv words of ONE
+      #   pipeline segment name an allowlisted read-only runner with no write/exec options.
+      #   Leading LC_ALL=* / LANG=* words are skipped. The flag checks run on the PARSED words,
+      #   so a quoted '--file=/etc/passwd' or '-exec' is refused exactly like the bare form.
+      #   There is no tokenizing here: the words come from rsg_parse_pipeline.)
       rsg_argv_looks_readonly() {
-        local runner segment="$1" tok
-        local -a stripped=()
-        set -f
-        set -- $segment
-        set +f
+        local runner
         while [ $# -ge 1 ]; do
           case "$1" in
             LC_ALL=*|LANG=*) shift ;;
@@ -2650,13 +2625,8 @@ nodes:
           esac
         done
         [ $# -ge 1 ] || return 1
-        for tok in "$@"; do
-          stripped+=("$(rsg_strip_arg "$tok")")
-        done
-        set -- "${stripped[@]}"
         runner="$1"
         shift
-        rsg_tokens_safe "$runner" "$@" || return 1
         case "$runner" in
           grep|egrep|fgrep|rg)
             rsg_has_grep_flag "$@" && return 1
@@ -2676,51 +2646,59 @@ nodes:
         esac
         return 1
       }
-      # rsg_allow_cmd <command>   (fail-closed read-only allowlist: reject shell
-      #   operators except |, split on | only, whitespace-tokenize each segment,
-      #   reject write/exec options as whole tokens. awk/sed/xargs and anything
-      #   not listed are rejected. A single quote is not rejected here;
-      #   only a fully quoted charset token is accepted later. Double quote,
-      #   backslash, and every other metacharacter stay rejected.)
+      # rsg_allow_cmd <command>   (fail-closed read-only allowlist. The command is parsed once by
+      #   rsg_parse_pipeline; any parse failure (a metacharacter outside single quotes, a double
+      #   quote, a backslash, ||, an unbalanced / glued / empty quote, a missing rsg-argv.sh)
+      #   rejects. Every parsed segment must then pass rsg_argv_looks_readonly. awk/sed/xargs/git
+      #   and anything not listed are rejected. A | or ; inside single quotes is a literal
+      #   pattern byte, never an operator. Leaves the parse in RSG_PARSED on success.)
       rsg_allow_cmd() {
-        local c="$1" work segment
-        case "$c" in
-          *';'*|*'&'*|*'`'*|*'$('*|*'>'*|*'<'*|*$'\n'*|*'"'*|*'\\'*|*'||'*) return 1 ;;
-        esac
-        work="$c"
-        while :; do
-          case "$work" in
-            *'|'*) segment="${work%%|*}"; work="${work#*|}" ;;
-            *) segment="$work"; work='' ;;
-          esac
-          rsg_argv_looks_readonly "$segment" || return 1
-          [ -z "$work" ] && break
+        local k=0 total
+        local -a seg=() words=()
+        rsg_parse_pipeline "$1" || return 1
+        words=("${RSG_PARSED[@]}")
+        total=${#words[@]}
+        [ "$total" -gt 0 ] || return 1
+        while [ "$k" -lt "$total" ]; do
+          seg=()
+          while [ "$k" -lt "$total" ] && [ "${words[k]}" != "$RSG_US" ]; do
+            seg+=("${words[k]}")
+            k=$((k + 1))
+          done
+          [ "${#seg[@]}" -gt 0 ] || return 1
+          rsg_argv_looks_readonly "${seg[@]}" || return 1
+          k=$((k + 1))
         done
         return 0
       }
-      # rsg_exec_pipeline <command>   (prints stdout of the last | segment; rc of
-      #   the last segment. Intermediate segments are connected with temp files,
-      #   not a shell pipe. Tokenized argv; never a shell -c of the spec string.
-      #   Qualifying single-quoted tokens are stripped the same way as
-      #   rsg_argv_looks_readonly before the runner is invoked.
-      #   Intermediate nonzero exits do not abort -- matches bash -c without
-      #   pipefail, so grep-no-match | wc -l still yields a count.)
+      # rsg_exec_pipeline <command>   (prints stdout of the last | segment; rc of the last
+      #   segment. rsg_allow_cmd parses and checks the command; the SAME RSG_PARSED words are then
+      #   run, so what is checked is exactly what runs. Argv-only ("$@"), never a shell -c of the
+      #   spec string, so a quoted pattern is never glob-expanded or evaluated. Intermediate
+      #   segments are connected with temp files, not a shell pipe. Intermediate nonzero exits do
+      #   not abort -- matches bash -c without pipefail, so grep-no-match | wc -l still yields a
+      #   count. Returns 127 without running anything when the command is not allowed.)
       rsg_exec_pipeline() {
-        local cmd="$1" work segment tmpdir_p="" tmp_in="/dev/null" tmp_out raw="" rc=0
-        local env_lc env_lang tok
-        local -a stripped=()
+        local cmd="$1" tmpdir_p="" tmp_in="/dev/null" tmp_out raw="" rc=0
+        local env_lc env_lang k=0 total last
+        local -a seg=() words=()
         if ! rsg_allow_cmd "$cmd"; then
           return 127
         fi
-        work="$cmd"
-        while :; do
-          case "$work" in
-            *'|'*) segment="${work%%|*}"; work="${work#*|}" ;;
-            *) segment="$work"; work='' ;;
-          esac
-          set -f
-          set -- $segment
-          set +f
+        words=("${RSG_PARSED[@]}")
+        total=${#words[@]}
+        while [ "$k" -lt "$total" ]; do
+          seg=()
+          while [ "$k" -lt "$total" ] && [ "${words[k]}" != "$RSG_US" ]; do
+            seg+=("${words[k]}")
+            k=$((k + 1))
+          done
+          last=1
+          if [ "$k" -lt "$total" ]; then
+            last=0
+            k=$((k + 1))
+          fi
+          set -- "${seg[@]}"
           env_lc=""; env_lang=""
           while [ $# -ge 1 ]; do
             case "$1" in
@@ -2733,12 +2711,7 @@ nodes:
             rc=127
             break
           fi
-          stripped=()
-          for tok in "$@"; do
-            stripped+=("$(rsg_strip_arg "$tok")")
-          done
-          set -- "${stripped[@]}"
-          if [ -n "$work" ]; then
+          if [ "$last" -eq 0 ]; then
             [ -n "$tmpdir_p" ] || tmpdir_p="$(mktemp -d)"
             tmp_out="$tmpdir_p/out"
             (
@@ -2757,7 +2730,6 @@ nodes:
             )"
             rc=$?
           fi
-          [ -z "$work" ] && break
         done
         [ -n "$tmpdir_p" ] && rm -rf "$tmpdir_p"
         printf '%s' "$raw"
