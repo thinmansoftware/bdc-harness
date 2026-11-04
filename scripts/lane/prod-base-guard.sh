@@ -23,9 +23,13 @@ thinmansoftware/shopops-storefront main'
 
 # bdc_refuse_production_base <owner/repo> <base>
 # Returns 1 and prints production_base_refused to stderr when the pair is listed,
-# 0 otherwise. Comparison is exact (case-sensitive, as GitHub refs are).
+# 0 otherwise. The repo is compared case-insensitively (GitHub owner and repo names
+# are, so ThinManSoftware/ShopOps is thinmansoftware/shopops) after dropping a
+# trailing ".git"; the branch is compared exactly (GitHub refs are case-sensitive).
 bdc_refuse_production_base() {
-  local repo="$1"
+  local repo
+  repo="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  repo="${repo%.git}"
   local base="$2"
   local entry
   while IFS= read -r entry; do

@@ -151,6 +151,24 @@ describe('production-base guard (bdc-xo #4469)', () => {
     expect(runGuard(lane, 'thinmansoftware/shopops-api', 'master').exitCode).toBe(0);
   });
 
+  it('a mixed-case or .git-suffixed repo is still refused; branch case stays exact', () => {
+    for (const lane of LANES) {
+      for (const [repo, base] of [
+        ['ThinManSoftware/ShopOps', 'master'],
+        ['THINMANSOFTWARE/LSPRO-REACT', 'main'],
+        ['thinmansoftware/Shopops-Storefront.git', 'main'],
+      ] as const) {
+        const run = runGuard(lane, repo, base);
+        expect(run.exitCode).toBe(1);
+        expect(run.stderr).toContain('production_base_refused');
+        expect(run.stdout).not.toContain('PASSED_GUARD');
+      }
+    }
+    // A branch named Main or MASTER is a different ref; refs are case-sensitive.
+    const lane = LANES[0] ?? '';
+    expect(runGuard(lane, 'thinmansoftware/lspro-react', 'Main').exitCode).toBe(0);
+  });
+
   it('guard_missing_fails_closed (Test 9) in every lane', () => {
     for (const lane of LANES) {
       const run = runGuard(lane, 'thinmansoftware/lspro-react', 'staging', null);
