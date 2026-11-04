@@ -10,7 +10,11 @@ import {
   type OperatorCardView,
 } from '@archon/core/db/overseer-briefing';
 import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
-import { T3_DESKTOP_RECIPIENT } from '@archon/core/db/dispatch-routing';
+import {
+  isXoResponsibleActor,
+  OPERATOR_RECIPIENT,
+  T3_DESKTOP_RECIPIENT,
+} from '@archon/core/db/dispatch-routing';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
 import { buildDispatchRunReportBody } from './escalate';
 import { resolveWoBoardSeatOwner } from './owner-resolution';
@@ -85,8 +89,9 @@ export function createDefaultOperatorCardChannels(
     channel: 'dispatch',
     deliver: async (card, idempotencyKey) => {
       // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: always deliver to the T3 results
-      // queue; the resolved board-seat owner rides in the body as owner_seat so
-      // the desktop bridge can address it (null when unresolved).
+      // queue (plus the operator mailbox for XO-owned reports, below); the
+      // resolved board-seat owner rides in the body as owner_seat so the
+      // desktop bridge can address it (null when unresolved).
       const ownerSeat = (await deps.resolve_owner(card.card.wo_id)) ?? null;
       const body = JSON.stringify({
         ...(JSON.parse(buildDispatchRunReportBody(card.card)) as Record<string, unknown>),
@@ -99,6 +104,24 @@ export function createDefaultOperatorCardChannels(
           sanitized_status: 'dispatch_content_rejected',
           error_class: assessment.reason ?? 'content_guard_rejected',
         };
+      }
+      // Fence 281: a run report whose responsible actor is an XO principal
+      // must ALSO reach the operator mailbox (the XO drain and the
+      // operator-inbox-consumer read it). The T3 copy is kept so the T3
+      // results bridge still sees every report. Both rows share the run id
+      // as correlation_id; the operator copy gets its own idempotency key so
+      // redelivery and reconcile stay exactly-once per mailbox.
+      if (isXoResponsibleActor(card.card.responsible_actor)) {
+        await createAuthenticatedMessage(
+          { kind: 'system', sender: 'overseer' },
+          {
+            correlation_id: card.card.run_id,
+            idempotency_key: `${idempotencyKey}:${OPERATOR_RECIPIENT}`,
+            task_type: 'run_report',
+            recipient: OPERATOR_RECIPIENT,
+            body,
+          }
+        );
       }
       const message = await createAuthenticatedMessage(
         { kind: 'system', sender: 'overseer' },

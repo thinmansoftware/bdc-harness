@@ -594,7 +594,10 @@ describe('default informational channel adapters', () => {
     const messages = await listMessages({ recipient: 't3-desktop' });
     expect(messages).toHaveLength(1);
     expect(JSON.parse(messages[0]?.body ?? '{}').owner_seat).toBeNull();
-    expect(await listMessages({ recipient: 'operator' })).toHaveLength(0);
+    // Fence 281: an acting-xo report also reaches the operator mailbox.
+    const operatorRows = await listMessages({ recipient: 'operator' });
+    expect(operatorRows).toHaveLength(1);
+    expect(operatorRows[0]?.correlation_id).toBe(messages[0]?.correlation_id);
   });
 
   test('default builder-monitor adapter uses injected fetch and frozen payload', async () => {
