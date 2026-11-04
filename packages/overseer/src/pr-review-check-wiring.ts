@@ -22,9 +22,16 @@ import type {
   RecheckIngestDeps,
   StandingVerdict,
 } from './pr-review-check-ingest.ts';
-import type { SubmitOutcome } from './pr-review-submit.ts';
 import { attachWorkflowAttempts, recheckCorrelationId } from './pr-review-check-ingest';
-import { actionsJobAttemptLookup, createRealOctokitClient } from './adapters/github-real-deps';
+import {
+  actionsJobAttemptLookup,
+  createRealOctokitClient,
+  extractReviewSummary,
+} from './adapters/github-real-deps';
+
+// extractReviewSummary lives in adapters/github-real-deps.ts so the merge gate
+// can read review summaries without an import cycle; re-exported for callers.
+export { extractReviewSummary };
 import {
   REVIEW_RECIPIENT,
   REVIEW_SENDER,
@@ -137,44 +144,6 @@ export function foldSubmitReceipts(
       summary: null,
       recordedAt: receipt.created_at,
     };
-  }
-  return null;
-}
-
-/**
- * Recover the review summary the reviewer posted for one head from the review
- * work item's stored result body.
- *
- * THE PERSISTED SHAPE IS A `SubmitOutcome`. The review worker writes
- * `result_body: JSON.stringify(outcome)` when it finishes an item
- * (`review-worker-clock.ts`), so this function parses exactly that type and
- * nothing else -- `summary` is the field `pr-review-submit` puts the reviewer's
- * posted finding text on, for every terminal branch that formed a verdict.
- *
- * `reason` is retained ONLY as a compatibility fallback for outcomes persisted
- * before `SubmitOutcome.summary` existed. It is not where a current
- * `changes_requested` carries its evidence: that branch sets no `reason` at
- * all, which is precisely why reading `reason` alone recovered nothing and the
- * whole recheck path failed closed (#782 review finding, 2026-09-07).
- *
- * Returns null when the body is absent, unparseable, or carries no text; the
- * caller then falls back to the receipt disposition alone and the ingest's
- * fail-closed default applies.
- */
-export function extractReviewSummary(resultBody: string | null): string | null {
-  if (!resultBody) return null;
-  let parsed: Pick<SubmitOutcome, 'summary' | 'reason'>;
-  try {
-    parsed = JSON.parse(resultBody) as Pick<SubmitOutcome, 'summary' | 'reason'>;
-  } catch {
-    return null;
-  }
-  if (typeof parsed?.summary === 'string' && parsed.summary.trim().length > 0) {
-    return parsed.summary;
-  }
-  // Legacy outcomes only -- see the doc comment above.
-  if (typeof parsed?.reason === 'string' && parsed.reason.trim().length > 0) {
-    return parsed.reason;
   }
   return null;
 }

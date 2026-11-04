@@ -42,9 +42,11 @@ import { createDurableAttemptCounterStore } from './required-contexts-store';
 import { classifyRateLimitError } from '../github-rate-limit';
 import {
   attachWorkflowAttempts,
+  blockingFindingsAreCheckScoped,
   latestAttemptPerCheck,
   type WorkflowAttempt,
 } from '../pr-review-check-ingest';
+import type { SubmitOutcome } from '../pr-review-submit.ts';
 
 const log = createLogger('overseer/github-real-deps');
 
@@ -2205,6 +2207,44 @@ export function createRealListOpenPullRequests(
   };
 }
 
+/**
+ * Recover the review summary the reviewer posted for one head from the review
+ * work item's stored result body.
+ *
+ * THE PERSISTED SHAPE IS A `SubmitOutcome`. The review worker writes
+ * `result_body: JSON.stringify(outcome)` when it finishes an item
+ * (`review-worker-clock.ts`), so this function parses exactly that type and
+ * nothing else -- `summary` is the field `pr-review-submit` puts the reviewer's
+ * posted finding text on, for every terminal branch that formed a verdict.
+ *
+ * `reason` is retained ONLY as a compatibility fallback for outcomes persisted
+ * before `SubmitOutcome.summary` existed. It is not where a current
+ * `changes_requested` carries its evidence: that branch sets no `reason` at
+ * all, which is precisely why reading `reason` alone recovered nothing and the
+ * whole recheck path failed closed (#782 review finding, 2026-09-07).
+ *
+ * Returns null when the body is absent, unparseable, or carries no text; the
+ * caller then falls back to the receipt disposition alone and the ingest's
+ * fail-closed default applies.
+ */
+export function extractReviewSummary(resultBody: string | null): string | null {
+  if (!resultBody) return null;
+  let parsed: Pick<SubmitOutcome, 'summary' | 'reason'>;
+  try {
+    parsed = JSON.parse(resultBody) as Pick<SubmitOutcome, 'summary' | 'reason'>;
+  } catch {
+    return null;
+  }
+  if (typeof parsed?.summary === 'string' && parsed.summary.trim().length > 0) {
+    return parsed.summary;
+  }
+  // Legacy outcomes only -- see the doc comment above.
+  if (typeof parsed?.reason === 'string' && parsed.reason.trim().length > 0) {
+    return parsed.reason;
+  }
+  return null;
+}
+
 // Same value as REVIEW_RECIPIENT in pr-review-wiring.ts; not imported because
 // pr-review-wiring already imports this module.
 const REVIEW_REQUEST_RECIPIENT = 'overseer-reviewer';
@@ -2229,22 +2269,73 @@ function bodyAtHead(
 }
 
 /**
+ * The dispatch row's database-assigned insertion order. `SELECT *` carries it
+ * at runtime although DispatchMessage does not declare it; Postgres returns a
+ * bigint as a string. Anything else (absent, null, non-numeric) is null: no
+ * provable order.
+ */
+interface DispatchSeq {
+  seq?: number | string | null;
+}
+type ReviewConflictReceiptRow = Pick<DispatchMessage, 'body'> & DispatchSeq;
+type ReviewConflictRequestRow = Pick<DispatchMessage, 'body' | 'status'> &
+  Partial<Pick<DispatchMessage, 'id' | 'result_body'>> &
+  DispatchSeq;
+
+function rowSeq(row: DispatchSeq): number | null {
+  const { seq } = row;
+  if (typeof seq === 'number') return Number.isSafeInteger(seq) ? seq : null;
+  if (typeof seq === 'string' && /^\d+$/.test(seq)) {
+    const value = Number(seq);
+    return Number.isSafeInteger(value) ? value : null;
+  }
+  return null;
+}
+
+/**
  * Exact-head review conflict from dispatch rows. `receipts` are review submit
  * receipts (pr-review-log and operator); `requests` are review requests to the
  * reviewer. A changes_requested receipt at the head wins; otherwise a request
  * for the head that is still queued or claimed means a review is in flight.
  * When a read came back at its page cap (`truncated`), rows for this head may
  * be missing, so the answer is lookup_failed unless a conflict is already seen.
+ *
+ * CHECK-SCOPED SUPERSEDE (WO-HARNESS-MERGE-GATE-CHECK-SCOPED-SUPERSEDE-01): a
+ * changes_requested receipt stops counting only when BOTH hold: (1) its review
+ * summary -- read from the originating request row whose id is the receipt's
+ * messageId -- has only check-scoped blocking findings
+ * (blockingFindingsAreCheckScoped), and (2) an approved receipt at the same
+ * head has a strictly higher `seq`. A missing or unreadable summary is treated
+ * as code-scoped, a row without seq is never provably earlier or later, and a
+ * changes_requested after the latest approval always conflicts (fail closed).
  */
 export function reviewConflictFromMessages(
   input: PullRequestRef & { headSha: string },
-  receipts: readonly Pick<DispatchMessage, 'body'>[],
-  requests: readonly Pick<DispatchMessage, 'body' | 'status'>[],
+  receipts: readonly ReviewConflictReceiptRow[],
+  requests: readonly ReviewConflictRequestRow[],
   options: { truncated?: boolean } = {}
 ): ReviewConflictAtHead | null {
-  const changesRequested = receipts.some(receipt => {
+  const atHead = receipts.flatMap(receipt => {
     const body = bodyAtHead(receipt, input);
-    return body?.kind === 'pr_review_submit_receipt' && body.disposition === 'changes_requested';
+    return body?.kind === 'pr_review_submit_receipt' ? [{ body, seq: rowSeq(receipt) }] : [];
+  });
+  let latestApprovalSeq: number | null = null;
+  for (const { body, seq } of atHead) {
+    if (body.disposition === 'approved' && seq !== null) {
+      latestApprovalSeq = latestApprovalSeq === null ? seq : Math.max(latestApprovalSeq, seq);
+    }
+  }
+  const changesRequested = atHead.some(({ body, seq }) => {
+    if (body.disposition !== 'changes_requested') return false;
+    const supersededByLaterApproval =
+      seq !== null && latestApprovalSeq !== null && latestApprovalSeq > seq;
+    if (!supersededByLaterApproval) return true;
+    const messageId = typeof body.messageId === 'string' ? body.messageId : null;
+    const request =
+      messageId === null
+        ? undefined
+        : requests.find(row => row.id === messageId && bodyAtHead(row, input) !== null);
+    return !blockingFindingsAreCheckScoped(extractReviewSummary(request?.result_body ?? null));
   });
   if (changesRequested) return 'changes_requested';
   const inFlight = requests.some(
@@ -2260,13 +2351,13 @@ type ReviewConflictListFn = (filters: {
   recipient: string;
   subject_key: string;
   limit: number;
-}) => Promise<Pick<DispatchMessage, 'body' | 'status'>[]>;
+}) => Promise<ReviewConflictRequestRow[]>;
 
 type ReviewConflictLegacyListFn = (filters: {
   recipient: string;
   correlationPrefix: string;
   limit: number;
-}) => Promise<Pick<DispatchMessage, 'body' | 'status'>[]>;
+}) => Promise<ReviewConflictRequestRow[]>;
 
 /**
  * Reads the rows for reviewConflictFromMessages. REQUESTS ARE READ FIRST: a
