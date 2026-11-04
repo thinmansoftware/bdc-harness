@@ -424,6 +424,100 @@ describe('Test 9: t3-bridge principal issuance and blast radius', () => {
     expect(reply.recipient).toBe('t3-desktop');
   });
 
+  async function seedRow(recipient: string, key: string): Promise<DispatchMessage> {
+    return createAuthenticatedMessage(
+      { kind: 'system', sender: 'cauldron-fire' },
+      {
+        correlation_id: key,
+        idempotency_key: key,
+        task_type: 'agent_message',
+        recipient,
+        body: JSON.stringify({ schema: 't3-command-reply/v1', request_id: key, status: 200 }),
+      }
+    );
+  }
+
+  async function ackRow(id: string): Promise<{
+    acknowledged_at: string | null;
+    acknowledged_by: string | null;
+  }> {
+    const rows = await db.query<{ acknowledged_at: string | null; acknowledged_by: string | null }>(
+      'SELECT acknowledged_at, acknowledged_by FROM agent_dispatch_messages WHERE id = $1',
+      [id]
+    );
+    const row = rows.rows[0];
+    if (!row) throw new Error(`row ${id} missing`);
+    return row;
+  }
+
+  test('receive_as ack: t3-bridge acks a real t3-desktop row through the route (200, actor recorded)', async () => {
+    const app = makeApp();
+    const row = await seedRow('t3-desktop', 'receive-as-ack-1');
+    const response = await app.request(`/api/dispatch/messages/${row.id}/ack`, {
+      method: 'POST',
+      headers: T3_HEADERS,
+      body: JSON.stringify({}),
+    });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      id: string;
+      recipient: string;
+      acknowledged_at: string | null;
+      acknowledged_by: string | null;
+    };
+    expect(body.id).toBe(row.id);
+    expect(body.recipient).toBe('t3-desktop');
+    expect(body.acknowledged_at).not.toBeNull();
+    expect(body.acknowledged_by).toBe('t3-bridge');
+
+    const stored = await ackRow(row.id);
+    expect(stored.acknowledged_at).not.toBeNull();
+    expect(stored.acknowledged_by).toBe('t3-bridge');
+
+    // Idempotent: the same principal re-acking the same row is still 200.
+    const again = await app.request(`/api/dispatch/messages/${row.id}/ack`, {
+      method: 'POST',
+      headers: T3_HEADERS,
+      body: JSON.stringify({}),
+    });
+    expect(again.status).toBe(200);
+  });
+
+  test('receive_as ack: t3-bridge acking a mailbox NOT in its receive_as is refused, row untouched', async () => {
+    const app = makeApp();
+    const row = await seedRow('cauldron-fire', 'receive-as-ack-2');
+    const response = await app.request(`/api/dispatch/messages/${row.id}/ack`, {
+      method: 'POST',
+      headers: T3_HEADERS,
+      body: JSON.stringify({}),
+    });
+    expect(response.status).toBe(403);
+    expect(((await response.json()) as { error: string }).error).toBe(
+      'dispatch_principal_forbidden'
+    );
+    const stored = await ackRow(row.id);
+    expect(stored.acknowledged_at).toBeNull();
+    expect(stored.acknowledged_by).toBeNull();
+  });
+
+  test('receive_as ack: a non-principal (operator) ack of a t3-desktop row is still wrong_recipient', async () => {
+    const app = makeApp();
+    const row = await seedRow('t3-desktop', 'receive-as-ack-3');
+    const response = await app.request(`/api/dispatch/messages/${row.id}/ack`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as { error: string }).error).toBe('wrong_recipient');
+    expect((await ackRow(row.id)).acknowledged_by).toBeNull();
+
+    // The DB layer without the route's receive_as grant is unchanged too.
+    const direct = await acknowledgeMessage({ id: row.id, principal_id: 't3-bridge' });
+    expect(direct).toEqual({ ok: false, reason: 'wrong_recipient' });
+    expect((await ackRow(row.id)).acknowledged_by).toBeNull();
+  });
+
   test('Test 25 (A5.5): a same-actor resend of a request_id returns the ORIGINAL command row', async () => {
     const app = makeApp();
     const send = async (woId: string): Promise<{ id: string; body: string }> => {
