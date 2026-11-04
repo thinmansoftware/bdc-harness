@@ -9,7 +9,30 @@ mkdir -p /.archon/workspaces /.archon/worktrees
 # Determine if we need to use gosu for privilege dropping
 if [ "$(id -u)" = "0" ]; then
   # Running as root: fix volume permissions, then drop to appuser
-  if ! chown -Rh appuser:appuser /.archon 2>/dev/null; then
+  # BEGIN ownership-fix (tested by scripts/container/docker-entrypoint-ownership.test.ts)
+  # WO-HARNESS-ENTRYPOINT-CHOWN-NO-CRASH-RESTART-01: /.archon holds every
+  # Cauldron workspace (tens of GB). A blanket recursive chown took minutes and
+  # returned non-zero when a path vanished mid-walk, so the container exited 1
+  # and crash-restarted on boot. Now: chown only entries NOT already owned by
+  # appuser (normally none), warn with a count on partial failure, and fail
+  # hard only if the directory itself is not writable by appuser.
+  # Returns 1 when any chown failed (after printing the WARN line).
+  _chown_wrong_owner() {
+    _cwo_dir="$1"
+    _cwo_failed=0
+    while IFS= read -r -d '' _cwo_path; do
+      if ! chown -h appuser:appuser "$_cwo_path" 2>/dev/null; then
+        _cwo_failed=$((_cwo_failed + 1))
+      fi
+    done < <(find "$_cwo_dir" ! -user appuser -print0 2>/dev/null)
+    if [ "$_cwo_failed" -gt 0 ]; then
+      echo "WARN: could not fix ownership of ${_cwo_failed} paths under ${_cwo_dir} -- continuing" >&2
+      return 1
+    fi
+    return 0
+  }
+  _chown_wrong_owner /.archon || true
+  if ! gosu appuser test -w /.archon; then
     echo "ERROR: Failed to fix ownership of /.archon -- volume may be read-only or mounted with incompatible options" >&2
     exit 1
   fi
@@ -17,10 +40,12 @@ if [ "$(id -u)" = "0" ]; then
   # ARCHON_USER_HOME) so Claude/Codex/Pi config, ~/.gitconfig, shell history,
   # and other user-specific state survive rebuilds. On bind mounts, host UIDs
   # don't map to appuser (1001), so fix ownership the same way we do /.archon.
-  if ! chown -Rh appuser:appuser /home/appuser 2>/dev/null; then
+  _chown_wrong_owner /home/appuser || true
+  if ! gosu appuser test -w /home/appuser; then
     echo "ERROR: Failed to fix ownership of /home/appuser -- volume may be read-only or mounted with incompatible options" >&2
     exit 1
   fi
+  # END ownership-fix
   # Design A: OS permissions are the reviewer's read boundary. Reassert them
   # on every start because these paths may be replaced by bind/named volumes.
   chown appuser:appuser /home/appuser /.archon /.archon/workspaces
@@ -49,7 +74,7 @@ if [ "$(id -u)" = "0" ]; then
   if [ -d /run/secrets/cursor-config ] && [ -n "$(ls -A /run/secrets/cursor-config 2>/dev/null)" ]; then
     mkdir -p /home/appuser/.cursor
     if cp -a /run/secrets/cursor-config/. /home/appuser/.cursor/ 2>/dev/null; then
-      chown -Rh appuser:appuser /home/appuser/.cursor
+      _chown_wrong_owner /home/appuser/.cursor || true
       echo "[archon] cursor-agent auth state seeded from /run/secrets/cursor-config" >&2
     else
       echo "[archon] WARN: failed to copy /run/secrets/cursor-config into /home/appuser/.cursor -- cursor judge rung / provider will report Authentication required unless CURSOR_API_KEY is set" >&2
@@ -60,7 +85,7 @@ if [ "$(id -u)" = "0" ]; then
   # appuser, so we must own it. Best-effort: if the mount is missing
   # (older docker-compose without the new volume), do not block startup.
   if [ -d /host-artifacts ]; then
-    if ! chown -Rh appuser:appuser /host-artifacts 2>/dev/null; then
+    if ! _chown_wrong_owner /host-artifacts; then
       echo "WARN: Failed to chown /host-artifacts -- bundles may fail to write. Check host directory permissions." >&2
     fi
   fi
