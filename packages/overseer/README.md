@@ -139,9 +139,19 @@ are honored and counted separately.
 | `OVERSEER_MERGE_DISCOVERY_REPOS` | (unset = no repos) | Watched `owner/repo` list, shared with merge discovery |
 | `OVERSEER_UNREVIEWED_HEAD_RECONCILE_MINUTES` | `15` | Minutes between passes (positive integer) |
 | `OVERSEER_UNREVIEWED_HEAD_RECONCILE_DRY_RUN` | off | `1`/`true`/`yes`: enqueue nothing; log `reconcile_would_enqueue <owner>/<repo>#<n>@<head>` per PR |
+| `OVERSEER_UNREVIEWED_HEAD_RECONCILE_WINDOW_HOURS` | `48` | Only PRs whose `updated_at` is inside this many hours are considered (positive integer; invalid = 48 with a warn log) |
+| `OVERSEER_UNREVIEWED_HEAD_RECONCILE_MAX_PER_PASS` | `10` | Most enqueues per pass, most recently updated first across all repos; in dry-run it caps `would_enqueue` (positive integer; invalid = 10 with a warn log) |
+
+Window and cap (acting XO ruling, fence 281): the first dry run reported
+`would_enqueue=91`, mostly long-dead PRs, and reviews run one at a time. The ruling
+allows head commit date OR `updated_at`; the open-PR listing does not carry the
+head commit date, so `updated_at` alone is used (a push moves it) and no per-PR
+API call is made. A PR with no readable `updated_at` counts as outside the window.
+Heads left over by the cap are picked up by the next pass.
 
 Each enqueue logs `reconcile_enqueued <owner>/<repo>#<n>@<head>`; each pass logs
-`reconcile_unreviewed_head_pass scanned=N skipped=N already_requested=N enqueued=N ...`.
+`reconcile_unreviewed_head_pass scanned=N skipped=N outside_window=N capped=N already_requested=N enqueued=N ...`.
+`skipped` counts drafts only.
 Run it in dry-run once on a host before the first live pass and read the
 `reconcile_would_enqueue` lines from the container log.
 

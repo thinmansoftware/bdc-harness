@@ -20,6 +20,19 @@
  *    `reconcile:unreviewed_head:<head>`. The UNIQUE idempotency key means a
  *    head the push path already queued can never be double-queued.
  *
+ * WINDOW AND CAP (acting XO ruling, fence 281). The first dry run on the host
+ * reported would_enqueue=91, mostly long-dead PRs, and reviews run one at a
+ * time. So a non-draft PR is considered only if it was updated inside the
+ * window, and real enqueues per pass are capped. The ruling allows head commit
+ * date OR updated_at; the open-PR listing (`fetchAllOpenPullRequests`) does not
+ * carry the head commit date, so updated_at alone is used and no per-PR API
+ * call is added. A push moves updated_at, so a lost-webhook head is inside the
+ * window for WINDOW_HOURS after the push. A PR with no readable updated_at
+ * counts as outside it. All listed PRs are processed most recently updated
+ * first, across repos; once the cap is reached, every further unreviewed head
+ * is counted as `capped` and left for the next pass (no mergeability read is
+ * spent on it). In dry-run the cap applies to would_enqueue the same way.
+ *
  * The intake's other refusals are honored too, so the reconcile never queues a
  * review the push path itself would have refused: a PR authored by the
  * reviewer identity (custody), a PR whose live mergeable_state is `dirty`, and
@@ -37,11 +50,18 @@
  *  - OVERSEER_UNREVIEWED_HEAD_RECONCILE_DRY_RUN=1 (also `true`/`yes`): run full
  *    passes but enqueue nothing; log one line per PR that WOULD be enqueued, as
  *    `reconcile_would_enqueue <owner>/<repo>#<n>@<head>`.
+ *  - OVERSEER_UNREVIEWED_HEAD_RECONCILE_WINDOW_HOURS: eligibility window in
+ *    hours on the PR's updated_at (positive integer; default 48; an invalid
+ *    value falls back to 48 with a warn log).
+ *  - OVERSEER_UNREVIEWED_HEAD_RECONCILE_MAX_PER_PASS: most enqueues (or
+ *    would_enqueues in dry-run) per pass (positive integer; default 10; an
+ *    invalid value falls back to 10 with a warn log).
  *
  * LOGS. One `reconcile_enqueued <owner>/<repo>#<n>@<head>` line per enqueue and
  * one summary per pass:
- * `reconcile_unreviewed_head_pass scanned=N skipped=N already_requested=N
- * enqueued=N ...` (the same counts are also on the structured log object).
+ * `reconcile_unreviewed_head_pass scanned=N skipped=N outside_window=N capped=N
+ * already_requested=N enqueued=N ...` (the same counts are also on the
+ * structured log object). `skipped` counts drafts only.
  */
 import { createLogger } from '@archon/paths';
 import { createRealOctokitClient, fetchAllOpenPullRequests } from './adapters/github-real-deps';
@@ -57,7 +77,13 @@ const defaultLog = createLogger('overseer/unreviewed-head-reconcile');
 
 export const UNREVIEWED_HEAD_RECONCILE_MINUTES_ENV = 'OVERSEER_UNREVIEWED_HEAD_RECONCILE_MINUTES';
 export const UNREVIEWED_HEAD_RECONCILE_DRY_RUN_ENV = 'OVERSEER_UNREVIEWED_HEAD_RECONCILE_DRY_RUN';
+export const UNREVIEWED_HEAD_RECONCILE_WINDOW_HOURS_ENV =
+  'OVERSEER_UNREVIEWED_HEAD_RECONCILE_WINDOW_HOURS';
+export const UNREVIEWED_HEAD_RECONCILE_MAX_PER_PASS_ENV =
+  'OVERSEER_UNREVIEWED_HEAD_RECONCILE_MAX_PER_PASS';
 export const DEFAULT_UNREVIEWED_HEAD_RECONCILE_MINUTES = 15;
+export const DEFAULT_UNREVIEWED_HEAD_RECONCILE_WINDOW_HOURS = 48;
+export const DEFAULT_UNREVIEWED_HEAD_RECONCILE_MAX_PER_PASS = 10;
 
 /** Machine-readable prefix of every repeat_reason this pass writes. */
 export const UNREVIEWED_HEAD_REASON_PREFIX = 'reconcile:unreviewed_head:';
@@ -74,6 +100,47 @@ export function resolveUnreviewedHeadReconcileMinutes(
   return Number.isSafeInteger(value) && value > 0
     ? value
     : DEFAULT_UNREVIEWED_HEAD_RECONCILE_MINUTES;
+}
+
+/**
+ * Parse a positive-integer env value the same way as the minutes env; an
+ * invalid value falls back to the default with a warn log.
+ */
+function resolvePositiveIntEnv(
+  envName: string,
+  raw: string | undefined,
+  fallback: number,
+  logger: Pick<ReconcileLogger, 'warn'>
+): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = Number(raw);
+  if (Number.isSafeInteger(value) && value > 0) return value;
+  logger.warn({ env: envName, value: raw, fallback }, 'reconcile_unreviewed_head_invalid_env');
+  return fallback;
+}
+
+export function resolveUnreviewedHeadReconcileWindowHours(
+  raw: string | undefined = process.env[UNREVIEWED_HEAD_RECONCILE_WINDOW_HOURS_ENV],
+  logger: Pick<ReconcileLogger, 'warn'> = defaultLog
+): number {
+  return resolvePositiveIntEnv(
+    UNREVIEWED_HEAD_RECONCILE_WINDOW_HOURS_ENV,
+    raw,
+    DEFAULT_UNREVIEWED_HEAD_RECONCILE_WINDOW_HOURS,
+    logger
+  );
+}
+
+export function resolveUnreviewedHeadReconcileMaxPerPass(
+  raw: string | undefined = process.env[UNREVIEWED_HEAD_RECONCILE_MAX_PER_PASS_ENV],
+  logger: Pick<ReconcileLogger, 'warn'> = defaultLog
+): number {
+  return resolvePositiveIntEnv(
+    UNREVIEWED_HEAD_RECONCILE_MAX_PER_PASS_ENV,
+    raw,
+    DEFAULT_UNREVIEWED_HEAD_RECONCILE_MAX_PER_PASS,
+    logger
+  );
 }
 
 export function resolveUnreviewedHeadReconcileDryRun(
@@ -95,6 +162,8 @@ export interface ReconcileOpenPullRequest {
   baseRef: string;
   baseSha?: string;
   author: string;
+  /** GitHub `updated_at` (ISO 8601). Missing or unparsable = outside the window. */
+  updatedAt?: string;
 }
 
 export interface ReconcileLogger {
@@ -121,6 +190,12 @@ export interface UnreviewedHeadReconcileOptions {
   repos?: readonly DiscoveryRepoTarget[];
   dryRun?: boolean;
   logger?: ReconcileLogger;
+  /** Eligibility window in hours; default from the env. */
+  windowHours?: number;
+  /** Most enqueues (would_enqueues in dry-run) per pass; default from the env. */
+  maxPerPass?: number;
+  /** Clock seam for tests (epoch ms). */
+  now?: () => number;
 }
 
 export interface UnreviewedHeadReconcileSummary {
@@ -130,6 +205,12 @@ export interface UnreviewedHeadReconcileSummary {
   scanned: number;
   /** Drafts. The ONLY class skip, matching the intake. */
   skipped: number;
+  windowHours: number;
+  maxPerPass: number;
+  /** Not updated inside the window (or no readable updated_at). */
+  outside_window: number;
+  /** Unreviewed heads left for the next pass because the cap was reached. */
+  capped: number;
   already_requested: number;
   enqueued: number;
   would_enqueue: number;
@@ -143,6 +224,13 @@ export interface UnreviewedHeadReconcileSummary {
 
 function subject(pr: { owner: string; repo: string; prNumber: number; headSha: string }): string {
   return `${pr.owner}/${pr.repo}#${pr.prNumber}@${pr.headSha}`;
+}
+
+/** Parsed updated_at in epoch ms, or null when absent or unparsable. */
+function updatedAtMs(pr: ReconcileOpenPullRequest): number | null {
+  if (!pr.updatedAt) return null;
+  const ms = Date.parse(pr.updatedAt);
+  return Number.isFinite(ms) ? ms : null;
 }
 
 function errorMessage(error: unknown): string {
@@ -160,12 +248,21 @@ export async function runUnreviewedHeadReconcilePass(
   const logger = options.logger ?? defaultLog;
   const repos = options.repos ?? resolveDiscoveryRepos();
   const dryRun = options.dryRun ?? resolveUnreviewedHeadReconcileDryRun();
+  const windowHours =
+    options.windowHours ?? resolveUnreviewedHeadReconcileWindowHours(undefined, logger);
+  const maxPerPass =
+    options.maxPerPass ?? resolveUnreviewedHeadReconcileMaxPerPass(undefined, logger);
+  const windowStartMs = (options.now ?? Date.now)() - windowHours * 3_600_000;
   const summary: UnreviewedHeadReconcileSummary = {
     dryRun,
     repos: repos.length,
     failedRepos: [],
     scanned: 0,
     skipped: 0,
+    windowHours,
+    maxPerPass,
+    outside_window: 0,
+    capped: 0,
     already_requested: 0,
     enqueued: 0,
     would_enqueue: 0,
@@ -183,138 +280,155 @@ export async function runUnreviewedHeadReconcilePass(
     );
   }
 
+  // List every watched repo first, so the cap takes the most recently updated
+  // PRs across ALL repos, not the first repo's.
+  const listed: ReconcileOpenPullRequest[] = [];
   for (const target of repos) {
-    let listed: readonly ReconcileOpenPullRequest[];
     try {
-      listed = await deps.listOpenPullRequests({ owner: target.owner, repo: target.repo });
+      listed.push(...(await deps.listOpenPullRequests({ owner: target.owner, repo: target.repo })));
     } catch (error) {
       summary.failedRepos.push(`${target.owner}/${target.repo}`);
       logger.warn(
         { owner: target.owner, repo: target.repo, err: errorMessage(error) },
         'reconcile_unreviewed_head_listing_failed'
       );
+    }
+  }
+  // Most recently updated first; a PR with no readable updated_at sorts last.
+  listed.sort((a, b) => (updatedAtMs(b) ?? -Infinity) - (updatedAtMs(a) ?? -Infinity));
+
+  for (const pr of listed) {
+    summary.scanned += 1;
+    // DRAFTS ONLY -- the intake's single class skip. No title or branch rule.
+    if (pr.draft) {
+      summary.skipped += 1;
       continue;
     }
-
-    for (const pr of listed) {
-      summary.scanned += 1;
-      // DRAFTS ONLY -- the intake's single class skip. No title or branch rule.
-      if (pr.draft) {
-        summary.skipped += 1;
+    // Eligibility window on updated_at (fence 281). Counted apart from drafts.
+    const updated = updatedAtMs(pr);
+    if (updated === null || updated < windowStartMs) {
+      summary.outside_window += 1;
+      continue;
+    }
+    if (!pr.headSha) {
+      summary.failed += 1;
+      logger.warn(
+        { owner: pr.owner, repo: pr.repo, prNumber: pr.prNumber },
+        'reconcile_unreviewed_head_missing_head_sha'
+      );
+      continue;
+    }
+    try {
+      // Any overseer-reviewer row at this exact head, in any status, means a
+      // review was requested here. Leave it alone.
+      const prior = await deps.listPriorReviewWork({
+        owner: pr.owner,
+        repo: pr.repo,
+        prNumber: pr.prNumber,
+      });
+      if (prior.some(work => work.headSha === pr.headSha)) {
+        summary.already_requested += 1;
         continue;
       }
-      if (!pr.headSha) {
-        summary.failed += 1;
-        logger.warn(
-          { owner: pr.owner, repo: pr.repo, prNumber: pr.prNumber },
-          'reconcile_unreviewed_head_missing_head_sha'
+
+      // Intake parity: the push path never reviews the reviewer's own PR.
+      if (pr.author?.toLowerCase() === deps.reviewerIdentity.toLowerCase()) {
+        summary.custody_conflict += 1;
+        continue;
+      }
+
+      // Per-pass cap (fence 281): real enqueues, or would_enqueues in dry-run.
+      // Checked before the mergeability read so a capped head costs no API call.
+      if ((dryRun ? summary.would_enqueue : summary.enqueued) >= maxPerPass) {
+        summary.capped += 1;
+        continue;
+      }
+
+      // Intake parity: while every judge rung is exhausted the push path parks
+      // heads rather than queueing reviews that can only fail code-blind.
+      if (deps.judgeLadderBreaker?.check()) {
+        summary.breaker_deferred += 1;
+        continue;
+      }
+
+      // Intake parity: a head in content conflict with its base is not queued.
+      let baseSha = pr.baseSha;
+      if (deps.fetchPullRequestMergeability) {
+        let mergeableState: string | undefined;
+        try {
+          const live = await deps.fetchPullRequestMergeability({
+            owner: pr.owner,
+            repo: pr.repo,
+            prNumber: pr.prNumber,
+          });
+          mergeableState = live.mergeableState;
+          if (live.baseSha) baseSha = live.baseSha;
+        } catch {
+          // Same as the intake: a lookup failure is not evidence of a conflict.
+        }
+        if (mergeableState === 'dirty') {
+          summary.dirty += 1;
+          continue;
+        }
+      }
+
+      if (dryRun) {
+        summary.would_enqueue += 1;
+        logger.info(
+          { owner: pr.owner, repo: pr.repo, prNumber: pr.prNumber, headSha: pr.headSha },
+          `reconcile_would_enqueue ${subject(pr)}`
         );
         continue;
       }
-      try {
-        // Any overseer-reviewer row at this exact head, in any status, means a
-        // review was requested here. Leave it alone.
-        const prior = await deps.listPriorReviewWork({
-          owner: pr.owner,
-          repo: pr.repo,
-          prNumber: pr.prNumber,
-        });
-        if (prior.some(work => work.headSha === pr.headSha)) {
-          summary.already_requested += 1;
-          continue;
-        }
 
-        // Intake parity: the push path never reviews the reviewer's own PR.
-        if (pr.author?.toLowerCase() === deps.reviewerIdentity.toLowerCase()) {
-          summary.custody_conflict += 1;
-          continue;
-        }
-
-        // Intake parity: while every judge rung is exhausted the push path parks
-        // heads rather than queueing reviews that can only fail code-blind.
-        if (deps.judgeLadderBreaker?.check()) {
-          summary.breaker_deferred += 1;
-          continue;
-        }
-
-        // Intake parity: a head in content conflict with its base is not queued.
-        let baseSha = pr.baseSha;
-        if (deps.fetchPullRequestMergeability) {
-          let mergeableState: string | undefined;
-          try {
-            const live = await deps.fetchPullRequestMergeability({
-              owner: pr.owner,
-              repo: pr.repo,
-              prNumber: pr.prNumber,
-            });
-            mergeableState = live.mergeableState;
-            if (live.baseSha) baseSha = live.baseSha;
-          } catch {
-            // Same as the intake: a lookup failure is not evidence of a conflict.
-          }
-          if (mergeableState === 'dirty') {
-            summary.dirty += 1;
-            continue;
-          }
-        }
-
-        if (dryRun) {
-          summary.would_enqueue += 1;
-          logger.info(
-            { owner: pr.owner, repo: pr.repo, prNumber: pr.prNumber, headSha: pr.headSha },
-            `reconcile_would_enqueue ${subject(pr)}`
-          );
-          continue;
-        }
-
-        const enqueued = await deps.enqueueReviewWork({
-          correlationId: reviewCorrelationId(pr),
-          idempotencyKey: reviewIdempotencyKey(pr),
+      const enqueued = await deps.enqueueReviewWork({
+        correlationId: reviewCorrelationId(pr),
+        idempotencyKey: reviewIdempotencyKey(pr),
+        owner: pr.owner,
+        repo: pr.repo,
+        prNumber: pr.prNumber,
+        headSha: pr.headSha,
+        baseRef: pr.baseRef,
+        ...(baseSha ? { baseSha } : {}),
+        author: pr.author,
+        repeatReason: buildUnreviewedHeadReason(pr.headSha),
+        headCiGreen: false,
+      });
+      if (enqueued.alreadyExisted) {
+        summary.replayed += 1;
+        continue;
+      }
+      summary.enqueued += 1;
+      logger.info(
+        {
           owner: pr.owner,
           repo: pr.repo,
           prNumber: pr.prNumber,
           headSha: pr.headSha,
-          baseRef: pr.baseRef,
-          ...(baseSha ? { baseSha } : {}),
-          author: pr.author,
+          messageId: enqueued.messageId,
           repeatReason: buildUnreviewedHeadReason(pr.headSha),
-          headCiGreen: false,
-        });
-        if (enqueued.alreadyExisted) {
-          summary.replayed += 1;
-          continue;
-        }
-        summary.enqueued += 1;
-        logger.info(
-          {
-            owner: pr.owner,
-            repo: pr.repo,
-            prNumber: pr.prNumber,
-            headSha: pr.headSha,
-            messageId: enqueued.messageId,
-            repeatReason: buildUnreviewedHeadReason(pr.headSha),
-          },
-          `reconcile_enqueued ${subject(pr)}`
-        );
-      } catch (error) {
-        summary.failed += 1;
-        logger.warn(
-          {
-            owner: pr.owner,
-            repo: pr.repo,
-            prNumber: pr.prNumber,
-            headSha: pr.headSha,
-            err: errorMessage(error),
-          },
-          'reconcile_unreviewed_head_pr_failed'
-        );
-      }
+        },
+        `reconcile_enqueued ${subject(pr)}`
+      );
+    } catch (error) {
+      summary.failed += 1;
+      logger.warn(
+        {
+          owner: pr.owner,
+          repo: pr.repo,
+          prNumber: pr.prNumber,
+          headSha: pr.headSha,
+          err: errorMessage(error),
+        },
+        'reconcile_unreviewed_head_pr_failed'
+      );
     }
   }
 
   logger.info(
     { ...summary },
     `reconcile_unreviewed_head_pass scanned=${summary.scanned} skipped=${summary.skipped} ` +
+      `outside_window=${summary.outside_window} capped=${summary.capped} ` +
       `already_requested=${summary.already_requested} enqueued=${summary.enqueued} ` +
       `would_enqueue=${summary.would_enqueue} custody_conflict=${summary.custody_conflict} ` +
       `dirty=${summary.dirty} breaker_deferred=${summary.breaker_deferred} ` +
@@ -336,10 +450,12 @@ export function createRealReconcileListOpenPullRequests(
       );
     }
     return pulls.map(pr => {
-      // The live API carries user and base.sha; the narrow octokit type omits them.
+      // The live API carries user, base.sha and updated_at; the narrow octokit
+      // type omits them.
       const wide = pr as typeof pr & {
         user?: { login?: string | null } | null;
         base?: { ref?: string; sha?: string };
+        updated_at?: string | null;
       };
       return {
         owner,
@@ -352,6 +468,7 @@ export function createRealReconcileListOpenPullRequests(
         baseRef: wide.base?.ref ?? '',
         ...(wide.base?.sha ? { baseSha: wide.base.sha } : {}),
         author: wide.user?.login ?? '',
+        ...(wide.updated_at ? { updatedAt: wide.updated_at } : {}),
       };
     });
   };
@@ -432,6 +549,8 @@ export function startUnreviewedHeadReconcileClock(
     {
       intervalMinutes: minutes,
       dryRun: options.dryRun ?? resolveUnreviewedHeadReconcileDryRun(),
+      windowHours: options.windowHours ?? resolveUnreviewedHeadReconcileWindowHours(),
+      maxPerPass: options.maxPerPass ?? resolveUnreviewedHeadReconcileMaxPerPass(),
     },
     'reconcile_unreviewed_head_clock_started'
   );

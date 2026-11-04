@@ -10,6 +10,10 @@
  * startup pass runs against the same database through
  * createRealUnreviewedHeadReconcileDeps. Only the GitHub reads (open-PR
  * listing, mergeability) are stubbed; the dispatch DAL is real.
+ *
+ * Amendment 2 (48h window, fence 281): the listing now carries updated_at. The
+ * PR 1462 fixture is updated minutes ago (inside the window); a second, stale
+ * PR (updated 30 days ago, unreviewed at its head) must get no row at all.
  */
 import { afterEach, beforeEach, describe, expect, test as bunTest } from 'bun:test';
 import { createHmac } from 'crypto';
@@ -59,6 +63,8 @@ const REPO = 'bdc-harness';
 const PR_NUMBER = 1462;
 const OLD_HEAD = '644b3f61'.padEnd(40, '0');
 const NEW_HEAD = '8b307224'.padEnd(40, '0');
+const STALE_PR_NUMBER = 244;
+const STALE_HEAD = 'e'.repeat(40);
 const CONFIG = {
   webhookSecret: 'reconcile-integration-secret',
   reviewerIdentity: 'thinman-overseer[bot]',
@@ -126,6 +132,20 @@ describe('unreviewed-head reconcile against a real SqliteAdapter', () => {
           baseRef: 'dev',
           baseSha: 'd'.repeat(40),
           author: 'bluedevilcollectibles',
+          updatedAt: new Date(Date.now() - 5 * 60_000).toISOString(),
+        },
+        {
+          owner: OWNER,
+          repo: REPO,
+          prNumber: STALE_PR_NUMBER,
+          title: 'long-dead PR, unreviewed at its head',
+          draft: false,
+          headSha: STALE_HEAD,
+          headRef: 'feat/long-dead',
+          baseRef: 'dev',
+          baseSha: 'd'.repeat(40),
+          author: 'bluedevilcollectibles',
+          updatedAt: new Date(Date.now() - 30 * 24 * 3_600_000).toISOString(),
         },
       ],
     });
@@ -154,6 +174,8 @@ describe('unreviewed-head reconcile against a real SqliteAdapter', () => {
     });
     stopUnreviewedHeadReconcileClock();
     expect(first?.enqueued).toBe(1);
+    expect(first?.outside_window).toBe(1);
+    expect(first?.windowHours).toBe(48);
 
     const afterFirst = await readRows();
     const newHeadRows = afterFirst.filter(
@@ -163,6 +185,9 @@ describe('unreviewed-head reconcile against a real SqliteAdapter', () => {
     expect(newHeadRows[0]?.repeat_reason).toBe(`reconcile:unreviewed_head:${NEW_HEAD}`);
     expect(newHeadRows[0]?.status).toBe('queued');
     expect(afterFirst).toHaveLength(2);
+    expect(afterFirst.some(row => row.idempotency_key.includes(`#${STALE_PR_NUMBER}@`))).toBe(
+      false
+    );
 
     // 4. A second startup pass (another restart) adds nothing.
     const second = await startUnreviewedHeadReconcileClock(CONFIG, {
