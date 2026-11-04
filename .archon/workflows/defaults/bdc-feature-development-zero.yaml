@@ -753,6 +753,11 @@ nodes:
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
     provider: cursor
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
     persona: war-council-architect-opr
     agent: war-council-architect-opr
     # Claude-free recovery (WO-HARNESS-CLAUDE-FREE-LANE-RECOVERY-01): Qwen authors
@@ -2829,6 +2834,11 @@ nodes:
       exit 0
 
   - id: war-council-validator
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
     # DeepSeek judge through the repository-capable OpenRouter tool loop.
     provider: codex-opr
     persona: captain-ci-validator-codex
@@ -2975,6 +2985,12 @@ nodes:
   - id: diff-review
     provider: codex-opr
     model: deepseek/deepseek-v4-pro-0813
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -3235,6 +3251,12 @@ nodes:
   - id: diff-review-final
     provider: codex-opr
     model: deepseek/deepseek-v4-pro-0813
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -3405,6 +3427,12 @@ nodes:
   - id: opus-rereview
     provider: codex-opr
     model: deepseek/deepseek-v4-pro-0813
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -3634,6 +3662,11 @@ nodes:
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
     persona: xo-opr
     depends_on: [block-reclassify]
     trigger_rule: all_done
@@ -3764,6 +3797,12 @@ nodes:
   - id: apply-diff-review-final
     provider: codex-opr
     model: deepseek/deepseek-v4-pro-0813
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done

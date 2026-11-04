@@ -11,7 +11,13 @@
  * WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01 (John Ranson 2026-10-27,
  * "use kimi k3.1 it scored high"): on the claude and fable lanes the four
  * reviewer seats fail over to Kimi K3.1 Pro on openrouter -- never Claude.
- * Every other listed lane keeps no failover at all. No listed seat may ever
+ *
+ * WO-HARNESS-PERSONA-MODEL-DECLARED-01 (acting XO ruling 2026-11-04, "D0 holds.
+ * Add the opr (Kimi) review failover to the other 9 lanes so review seats never
+ * reroute to Claude"): the cursor, codex and codex-only lanes now declare the
+ * same Kimi failover on all seven seats (failover_agent only on the four
+ * code-review seats). Before this, an undeclared seat over the Codex cutoff was
+ * rerouted to Claude by the seat gate (run 8849e767). No listed seat may ever
  * fail over to claude (ruling D0, M-20261021c).
  */
 
@@ -54,19 +60,19 @@ const LANES: ReadonlyArray<{
     file: 'bdc-feature-development-cursor.yaml',
     seats: SEVEN_SEATS,
     terra: 'gpt-6.1-terra',
-    failover: null,
+    failover: KIMI_FAILOVER,
   },
   {
     file: 'bdc-feature-development-codex.yaml',
     seats: SEVEN_SEATS,
     terra: 'gpt-6.1-terra',
-    failover: null,
+    failover: KIMI_FAILOVER,
   },
   {
     file: 'bdc-feature-development-codex-only.yaml',
     seats: SEVEN_SEATS,
     terra: 'gpt-5.6-terra',
-    failover: null,
+    failover: KIMI_FAILOVER,
   },
   {
     file: 'bdc-feature-development-fable.yaml',
@@ -127,7 +133,9 @@ describe('review seats fail closed (no Claude fallback)', () => {
         } else {
           expect(node?.failover_provider, `${id}:failover_provider`).toBe(failover.provider);
           expect(node?.failover_model, `${id}:failover_model`).toBe(failover.model);
-          expect(node?.failover_agent, `${id}:failover_agent`).toBe(failover.agent);
+          // failover_agent rides only on the four code-review seats.
+          const agent = (FOUR_SEATS as readonly string[]).includes(id) ? failover.agent : undefined;
+          expect(node?.failover_agent, `${id}:failover_agent`).toBe(agent);
         }
         if (node?.agent || node?.persona) {
           expect(node?.model, `${id}:model`).toBe(terra);

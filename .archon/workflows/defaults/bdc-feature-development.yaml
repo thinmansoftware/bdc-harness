@@ -798,6 +798,11 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
     idle_timeout: 600000
     persona: war-council-architect
     agent: war-council-architect
@@ -2837,6 +2842,11 @@ nodes:
       exit 0
 
   - id: war-council-validator
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
     # Pin to claude/sonnet: the trusted judge must always be Claude regardless of
     # the lane's top-level default. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
     provider: claude
@@ -3660,6 +3670,11 @@ nodes:
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
     persona: xo
     depends_on: [block-reclassify]
     trigger_rule: all_done

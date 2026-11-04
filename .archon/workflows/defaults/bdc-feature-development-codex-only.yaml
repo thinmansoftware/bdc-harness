@@ -803,6 +803,11 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
     idle_timeout: 600000
     persona: war-council-architect-opr
     # Provider pin: persona war-council-architect declares model: sonnet; the lane
@@ -2837,6 +2842,11 @@ nodes:
       exit 0
 
   - id: war-council-validator
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
     # FABLE TEST SEAT (John 2026-07-02: "add fable in to one for testing for now").
     # Trusted judge upgraded sonnet -> claude-opus-5 on this lane. Persona VARIANT
     # required because persona model WINS over node model on provider claude
@@ -2985,6 +2995,12 @@ nodes:
       echo "DIFF_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
     model: gpt-5.6-terra
@@ -3241,6 +3257,12 @@ nodes:
       echo "DIFF_FINAL_BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)"
 
   - id: diff-review-final
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
     model: gpt-5.6-terra
@@ -3407,6 +3429,12 @@ nodes:
   # repaired build can land as a normal feature-branch PR instead of dead-ending at a
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
     model: gpt-5.6-terra
@@ -3639,6 +3667,11 @@ nodes:
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
     persona: xo-opr
     provider: codex-native-strict
     model: gpt-5.6-terra
@@ -3768,6 +3801,12 @@ nodes:
   # apply-diff-review-final: re-review the fix(es) apply-suggested-fix wrote, BEFORE any commit.
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
+    failover_agent: opr-adversarial-reviewer
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
     model: gpt-5.6-terra

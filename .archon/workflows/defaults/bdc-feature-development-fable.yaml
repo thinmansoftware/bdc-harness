@@ -827,6 +827,11 @@ nodes:
   # plan that `implement` consumes. NOT a human gate -- humans are reached only via the
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
     idle_timeout: 600000
     # FABLE APEX: persona/agent dropped so model: claude-opus-5 is actually served. See header.
     depends_on: [plan, checkout-repair-target]
@@ -2854,6 +2859,11 @@ nodes:
       exit 0
 
   - id: war-council-validator
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
     # FABLE APEX: trusted judge stays provider: claude (always Claude, regardless of the
     # lane default) and serves claude-fable-5 -- this lane's judge is the apex model too.
     # persona captain-ci-validator dropped so the fable model is actually served (the
@@ -3671,6 +3681,11 @@ nodes:
   # AI node (not bash): plan-review emits unstructured prose; diff-review/-final + opus-repair
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
+    # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
+    # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
+    # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    failover_provider: openrouter
+    failover_model: moonshotai/kimi-k3.1-pro
     persona: xo
     depends_on: [block-reclassify]
     trigger_rule: all_done

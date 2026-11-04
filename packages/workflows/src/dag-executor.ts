@@ -144,6 +144,7 @@ import type {
   TerminalWorkflowPersistence,
 } from './reliability/types';
 import { withRunLease } from './run-lease';
+import { DEFAULT_CLAUDE_FAILOVER_MODEL, isReviewNode } from './reliability/seat-node-failover';
 import {
   NODE_TOKEN_ENV,
   describeNodeTeardown,
@@ -2280,9 +2281,15 @@ async function resolveNodeProviderAndModel(
       const personaForResolution = nodeBindingOverride
         ? {
             ...persona,
+            // A NON-review node rerouted to claude falls back to
+            // DEFAULT_CLAUDE_FAILOVER_MODEL; a review node gets no default (D0), so
+            // a model-less review persona on claude still fails closed.
             model:
               provider === 'claude'
-                ? (model ?? assistantModels[provider] ?? persona.model)
+                ? (model ??
+                  assistantModels[provider] ??
+                  persona.model ??
+                  (isReviewNode(node) ? undefined : DEFAULT_CLAUDE_FAILOVER_MODEL))
                 : undefined,
           }
         : persona;
@@ -2297,6 +2304,14 @@ async function resolveNodeProviderAndModel(
         assistantModels,
         modelOverride,
       }).model;
+      // A claude per-node override with no model (a seat reroute with no declared or
+      // configured model) dispatches the model the persona binding resolved above,
+      // which for a NON-review node includes DEFAULT_CLAUDE_FAILOVER_MODEL; otherwise
+      // resolveModelForNode returns the override's empty model and the call would go
+      // out with no model at all.
+      if (effectiveModel === undefined && nodeBindingOverride && provider === 'claude') {
+        effectiveModel = personaResolution.model;
+      }
       // Prepend agent system prompt (agent role comes before node task)
       effectiveSystemPrompt = effectiveSystemPrompt
         ? `${personaResolution.systemPrompt}\n\n${effectiveSystemPrompt}`
@@ -4502,7 +4517,13 @@ async function executeLoopNode(
       const personaForLoop = nodeBindingOverridden
         ? {
             ...persona,
-            model: workflowProvider === 'claude' ? resolvedOptions.model : undefined,
+            // Same fallback as the DAG path: non-review nodes only (D0).
+            model:
+              workflowProvider === 'claude'
+                ? (resolvedOptions.model ??
+                  persona.model ??
+                  (isReviewNode(node) ? undefined : DEFAULT_CLAUDE_FAILOVER_MODEL))
+                : undefined,
           }
         : persona;
       const personaResolution = resolveAgentPersona(
