@@ -401,12 +401,36 @@ function checkAttemptIsNewer(candidate: RecheckCheckRun, current: RecheckCheckRu
   return (candidate.id ?? 0) > (current.id ?? 0);
 }
 
+function isSkippedRun(run: RecheckCheckRun): boolean {
+  return (
+    run.status === 'completed' &&
+    typeof run.conclusion === 'string' &&
+    run.conclusion.toLowerCase() === 'skipped'
+  );
+}
+
+/**
+ * One run per check name (and app). Two jobs in one workflow can share a check
+ * name, one of them `if:`-gated off and therefore SKIPPED on every PR (anchor:
+ * lspro-react ce-promotion-gate.yml, the dead PR #429 exemption twin). The
+ * skipped twin is created after the real job, so newest-id alone picks it and
+ * a required gate that actually ran reads as skipped. A run that was not
+ * skipped therefore always wins over a skipped one; newest attempt decides
+ * among runs on the same side. Only-skipped stays skipped.
+ */
+function checkAttemptSupersedes(candidate: RecheckCheckRun, held: RecheckCheckRun): boolean {
+  const candidateSkipped = isSkippedRun(candidate);
+  const heldSkipped = isSkippedRun(held);
+  if (candidateSkipped !== heldSkipped) return heldSkipped;
+  return checkAttemptIsNewer(candidate, held);
+}
+
 export function latestAttemptPerCheck<T extends RecheckCheckRun>(runs: T[]): T[] {
   const latest = new Map<string, T>();
   for (const run of runs) {
     const key = checkAttemptKey(run);
     const held = latest.get(key);
-    if (!held || checkAttemptIsNewer(run, held)) latest.set(key, run);
+    if (!held || checkAttemptSupersedes(run, held)) latest.set(key, run);
   }
   return [...latest.values()];
 }
