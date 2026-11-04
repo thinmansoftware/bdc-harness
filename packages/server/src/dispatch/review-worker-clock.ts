@@ -115,6 +115,48 @@ const CHECKS_PENDING_BACKOFF_MS = Math.max(
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
 
+// ONE REVIEW PER HEAD AT A TIME (WO-HARNESS-OVERSEER-RECHECK-DEDUPE-PER-HEAD-01).
+// Every check completion still enqueues its own run_review row (#782's per-check
+// keys); none is dropped. A row whose (owner, repo, PR, head) already has a
+// review in flight -- another claimed run_review with a live lease -- is
+// deferred instead of run, so reviews of one head run one after another and a
+// later review reads fresher checks. Coalescing was rejected because it loses
+// evidence (a check that passes while a review is running would be dropped).
+//
+// OVERSEER_REVIEW_SERIALIZE_BACKOFF_MS (default 60000): how long a deferred row
+// waits before it is claimable again.
+// OVERSEER_REVIEW_SERIALIZE_MAX_DEFERS (default 10): after this many defers the
+// row runs anyway and `overseer.pr_review.serialize_cap_reached` is logged, so
+// a stuck claim can never starve a head. The count is kept in this process
+// (the spool lease makes this worker the single writer); a restart resets it,
+// which only delays a row, never drops one.
+export const DEFAULT_REVIEW_SERIALIZE_BACKOFF_MS = 60_000;
+export const DEFAULT_REVIEW_SERIALIZE_MAX_DEFERS = 10;
+const serializeDeferCounts = new Map<string, number>();
+
+export function resolveReviewSerializeBackoffMs(
+  raw: string | undefined = process.env.OVERSEER_REVIEW_SERIALIZE_BACKOFF_MS
+): number {
+  const value = Number(raw);
+  return raw !== undefined && raw.trim() !== '' && Number.isFinite(value) && value >= 1
+    ? value
+    : DEFAULT_REVIEW_SERIALIZE_BACKOFF_MS;
+}
+
+export function resolveReviewSerializeMaxDefers(
+  raw: string | undefined = process.env.OVERSEER_REVIEW_SERIALIZE_MAX_DEFERS
+): number {
+  const value = Number(raw);
+  return raw !== undefined && raw.trim() !== '' && Number.isInteger(value) && value >= 0
+    ? value
+    : DEFAULT_REVIEW_SERIALIZE_MAX_DEFERS;
+}
+
+/** Test seam: forget every per-row defer count. */
+export function resetReviewSerializeDeferCounts(): void {
+  serializeDeferCounts.clear();
+}
+
 export const REVIEW_CHECK_PLAN_PATH = '.github/overseer-review-check-plan.json';
 
 export type TrustedCheckPlan =
@@ -212,6 +254,12 @@ export interface ReviewWorkerDeps {
   /** Optional logger seam for deterministic observability tests. */
   logger?: ReviewWorkerLogger;
   /**
+   * Keyset reader over claimed run_review rows (listMessagesBySeqCursor), used
+   * to serialize reviews of one head (WO-HARNESS-OVERSEER-RECHECK-DEDUPE-PER-HEAD-01).
+   * Optional so a test double can omit it; when absent no row is deferred.
+   */
+  listClaimedReviews?: ReviewCheckoutEvictorDeps['listClaimedReviews'];
+  /**
    * Backstop for lost check-completion deliveries (#782 part 3). Optional so a
    * test double can omit it; when absent the sweep simply does not run and the
    * primary review path is untouched.
@@ -298,6 +346,7 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     releaseMessage,
     deferMessage,
     renewMessageLease,
+    listClaimedReviews: listMessagesBySeqCursor,
     runAndSubmitReview,
     createSubmitDeps: createRealSubmitDeps,
     prepareCheckout: prepareReviewCheckout,
@@ -410,6 +459,9 @@ export async function tickReviewWorkerClock(
           );
           continue;
         }
+        // SERIALIZE (WO-HARNESS-OVERSEER-RECHECK-DEDUPE-PER-HEAD-01): never run a
+        // second review of a head while one is in flight. Defer, never drop.
+        if (await deferBehindInFlightReview(deps, claimed, body)) continue;
         // OPERATOR OVERRIDE (#847): a hand-enqueued run_review whose
         // repeat_reason starts with `operator_request:ladder_restored` clears
         // the judge-ladder breaker before the judge runs; the recovery pass at
@@ -610,6 +662,106 @@ export async function tickReviewWorkerClock(
     await lease.release();
     inFlight = false;
   }
+}
+
+/**
+ * Id of another claimed run_review (live lease) for the same owner/repo/PR/head,
+ * or null. A claim walk that fails returns null: the review runs as it did
+ * before serialization existed (fail open, never park a head on a read error).
+ */
+async function findInFlightSiblingReview(
+  deps: ReviewWorkerDeps,
+  self: DispatchMessage,
+  body: { owner: string; repo: string; prNumber: number; headSha: string }
+): Promise<string | null> {
+  if (!deps.listClaimedReviews) return null;
+  const same = (a: string, b: string): boolean => a.toLowerCase() === b.toLowerCase();
+  try {
+    let afterSeq: number | undefined;
+    for (let page = 0; page < REVIEW_CHECKOUT_CLAIM_MAX_PAGES; page += 1) {
+      const rows = await deps.listClaimedReviews({
+        recipient: REVIEW_RECIPIENT,
+        task_type: REVIEW_TASK_TYPE,
+        status: 'claimed',
+        ...(afterSeq === undefined ? {} : { afterSeq }),
+        limit: REVIEW_CHECKOUT_CLAIM_PAGE_SIZE,
+      });
+      const now = Date.now();
+      for (const row of rows) {
+        if (row.id === self.id || row.status !== 'claimed') continue;
+        if (row.task_type !== REVIEW_TASK_TYPE) continue;
+        if (row.lease_expires_at && Date.parse(row.lease_expires_at) <= now) continue;
+        const other = parseReviewWorkBody(row.body);
+        if (
+          other?.prNumber === body.prNumber &&
+          same(other.owner, body.owner) &&
+          same(other.repo, body.repo) &&
+          same(other.headSha, body.headSha)
+        ) {
+          return row.id;
+        }
+      }
+      if (rows.length < REVIEW_CHECKOUT_CLAIM_PAGE_SIZE) return null;
+      afterSeq = rows[rows.length - 1]?.cursor_seq;
+      if (afterSeq === undefined) return null;
+    }
+  } catch (error) {
+    log.warn(
+      { messageId: self.id, error: error instanceof Error ? error.message : String(error) },
+      'overseer.pr_review.serialize_claim_read_failed'
+    );
+  }
+  return null;
+}
+
+/**
+ * True when the claimed row was deferred because another review of the same
+ * head is in flight. After OVERSEER_REVIEW_SERIALIZE_MAX_DEFERS defers the row
+ * runs anyway (false) and the cap is logged.
+ */
+async function deferBehindInFlightReview(
+  deps: ReviewWorkerDeps,
+  claimed: DispatchMessage,
+  body: { owner: string; repo: string; prNumber: number; headSha: string }
+): Promise<boolean> {
+  const sibling = await findInFlightSiblingReview(deps, claimed, body);
+  const deferCount = serializeDeferCounts.get(claimed.id) ?? 0;
+  if (sibling === null) {
+    serializeDeferCounts.delete(claimed.id);
+    return false;
+  }
+  const context = {
+    messageId: claimed.id,
+    inFlightMessageId: sibling,
+    owner: body.owner,
+    repo: body.repo,
+    prNumber: body.prNumber,
+    headSha: body.headSha,
+    deferCount,
+  };
+  if (deferCount >= resolveReviewSerializeMaxDefers()) {
+    serializeDeferCounts.delete(claimed.id);
+    (deps.logger ?? log).warn(context, 'overseer.pr_review.serialize_cap_reached');
+    return false;
+  }
+  const deferUntil = new Date(Date.now() + resolveReviewSerializeBackoffMs()).toISOString();
+  const deferred = await deps.deferMessage({
+    id: claimed.id,
+    worker_id: REVIEW_WORKER_ID,
+    fencing_token: claimed.fencing_token,
+    defer_until: deferUntil,
+  });
+  serializeDeferCounts.set(claimed.id, deferCount + 1);
+  (deps.logger ?? log).warn(
+    {
+      ...context,
+      deferCount: deferCount + 1,
+      defer_until: deferUntil,
+      deferred: deferred !== null,
+    },
+    'overseer.pr_review.serialize_deferred'
+  );
+  return true;
 }
 
 function resolveReviewSpoolKey(): string {
