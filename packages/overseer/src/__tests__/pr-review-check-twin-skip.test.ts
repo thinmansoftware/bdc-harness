@@ -8,7 +8,11 @@ import {
   resetRequiredContextsAttemptCounters,
   resetRequiredContextsCache,
 } from '../adapters/required-contexts.ts';
-import { latestAttemptPerCheck, namedBlockingChecksAreGreen } from '../pr-review-check-ingest.ts';
+import {
+  attachWorkflowAttempts,
+  latestAttemptPerCheck,
+  namedBlockingChecksAreGreen,
+} from '../pr-review-check-ingest.ts';
 import { listCheckRunsForRefFromOctokit } from '../pr-review-check-wiring.ts';
 import {
   applyRequiredCheckGate,
@@ -229,5 +233,95 @@ test('recheck adapter requests filter=all and the twin cannot mask the failure',
   );
   expect(calls[0]?.filter).toBe('all');
   expect(listed.complete).toBe(true);
+  expect(namedBlockingChecksAreGreen(listed.runs, [GATE])).toBe(false);
+});
+
+// bdc-xo #4567 (WO-HARNESS-OVERSEER-DEPENDENT-TWIN-SKIP-01): a twin that is a
+// `needs:` dependent is evaluated, and skipped, only after the real job ends.
+function dependentPair(
+  realConclusion: string,
+  realAttempt: { run_id: number; run_attempt: number } | null,
+  twinAttempt: { run_id: number; run_attempt: number } | null
+): PrReviewCheck[] {
+  return [
+    {
+      ...run(100, realConclusion, 42),
+      started_at: '2026-11-04T10:00:00Z',
+      completed_at: '2026-11-04T10:00:10Z',
+      workflow_attempt: realAttempt,
+    },
+    {
+      ...run(200, 'skipped', 42),
+      started_at: '2026-11-04T10:00:15Z',
+      completed_at: '2026-11-04T10:00:15Z',
+      workflow_attempt: twinAttempt,
+    },
+  ];
+}
+
+test('dependent_twin_after_finish_keeps_failure', () => {
+  const same = { run_id: 7001, run_attempt: 1 };
+  const runs = dependentPair('failure', same, same);
+  expect(latestAttemptPerCheck(runs).map(c => c.id)).toEqual([100]);
+  expect(namedBlockingChecksAreGreen(runs, [GATE])).toBe(false);
+});
+
+test('dependent_twin_after_finish_keeps_success', () => {
+  const same = { run_id: 7002, run_attempt: 1 };
+  const gating = partitionChecksByRequired(dependentPair('success', same, same), [GATE]).gating;
+  expect(gating).toHaveLength(1);
+  expect(gating[0]?.conclusion).toBe('success');
+});
+
+test('no_attempt_identity_keeps_1458_rule', () => {
+  // Without run/attempt identity the #1458 timestamp rule decides: the
+  // skipped run started after the real one completed, so it is not a twin.
+  expect(latestAttemptPerCheck(dependentPair('failure', null, null)).map(c => c.id)).toEqual([200]);
+  // One side known is not enough either.
+  expect(
+    latestAttemptPerCheck(dependentPair('failure', { run_id: 1, run_attempt: 1 }, null)).map(
+      c => c.id
+    )
+  ).toEqual([200]);
+});
+
+test('later_attempt_skip_supersedes_old_failure', () => {
+  const runs = dependentPair(
+    'failure',
+    { run_id: 7003, run_attempt: 1 },
+    { run_id: 7003, run_attempt: 2 }
+  );
+  expect(latestAttemptPerCheck(runs).map(c => c.id)).toEqual([200]);
+  expect(namedBlockingChecksAreGreen(runs, [GATE])).toBe(true);
+});
+
+test('attempt_lookup_error_falls_back', async () => {
+  const bare = dependentPair('failure', null, null);
+  const lookedUp: number[] = [];
+  const enriched = await attachWorkflowAttempts(bare, async id => {
+    lookedUp.push(id);
+    if (id === 200) throw new Error('404 not an Actions job');
+    return { run_id: 7004, run_attempt: 1 };
+  });
+  expect(lookedUp.sort((x, y) => x - y)).toEqual([100, 200]);
+  expect(enriched.find(c => c.id === 200)?.workflow_attempt ?? null).toBeNull();
+  // Fallback = the #1458 rule, no exception.
+  expect(latestAttemptPerCheck(enriched).map(c => c.id)).toEqual([200]);
+
+  // Through the real recheck adapter with a working Actions lookup, the
+  // dependent twin can no longer mask the failure.
+  const raw = dependentPair('failure', null, null).map(c => ({
+    ...c,
+    workflow_attempt: undefined,
+  }));
+  const listed = await listCheckRunsForRefFromOctokit(
+    {
+      checks: { listForRef: async () => ({ data: { check_runs: raw } }) },
+      actions: {
+        getJobForWorkflowRun: async () => ({ data: { run_id: 7005, run_attempt: 1 } }),
+      },
+    },
+    { owner: 'thinmansoftware', repo: 'lspro-react', headSha: HEAD }
+  );
   expect(namedBlockingChecksAreGreen(listed.runs, [GATE])).toBe(false);
 });

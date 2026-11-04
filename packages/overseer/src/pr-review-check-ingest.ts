@@ -154,6 +154,17 @@ export interface RecheckCheckRun {
   app?: { slug?: string; name?: string };
   /** One workflow execution = one check suite; used to recognise twin jobs. */
   check_suite?: { id?: number } | null;
+  /**
+   * The GitHub Actions run and attempt this check run (= Actions job) belongs
+   * to, when a fetcher looked it up (attachWorkflowAttempts). Absent otherwise.
+   */
+  workflow_attempt?: WorkflowAttempt | null;
+}
+
+/** GitHub Actions identity of one job: its workflow run id and run_attempt. */
+export interface WorkflowAttempt {
+  run_id: number;
+  run_attempt: number;
 }
 
 export interface RecheckIngestDeps {
@@ -507,17 +518,38 @@ function timestampMs(value: string | null | undefined): number | undefined {
   return Number.isFinite(ms) ? ms : undefined;
 }
 
+function workflowAttemptOf(run: RecheckCheckRun): WorkflowAttempt | undefined {
+  const attempt = run.workflow_attempt;
+  if (!attempt) return undefined;
+  const { run_id: runId, run_attempt: runAttempt } = attempt;
+  if (!Number.isFinite(runId) || !Number.isFinite(runAttempt)) return undefined;
+  return attempt;
+}
+
 /**
  * True when `skipped` is a twin job of `ran` from the SAME execution attempt.
  * Same check suite is necessary but not enough: a suite also holds rerun
- * attempts. A rerun can only start after the previous attempt finished, while
- * twin jobs of one attempt overlap in time. So the skipped run is a twin only
- * if it started no later than `ran` completed, or while `ran` is still running.
+ * attempts.
+ *  - When both runs carry their Actions run_id and run_attempt, that decides:
+ *    same run and same attempt = twin, even when the skipped job was evaluated
+ *    after the real one finished (a `needs:` dependent; bdc-xo #4567).
+ *  - Otherwise (not Actions, or the lookup failed): a rerun can only start
+ *    after the previous attempt finished, while twin jobs of one attempt
+ *    overlap in time, so the skipped run is a twin only if it started no later
+ *    than `ran` completed, or while `ran` is still running.
  * Missing suite or timestamps = not a twin (newest-attempt rule applies).
  */
 function isTwinOf(skipped: RecheckCheckRun, ran: RecheckCheckRun): boolean {
   const suite = checkSuiteId(skipped);
   if (suite === undefined || suite !== checkSuiteId(ran)) return false;
+  const skippedAttempt = workflowAttemptOf(skipped);
+  const ranAttempt = workflowAttemptOf(ran);
+  if (skippedAttempt && ranAttempt) {
+    return (
+      skippedAttempt.run_id === ranAttempt.run_id &&
+      skippedAttempt.run_attempt === ranAttempt.run_attempt
+    );
+  }
   const skippedStart = timestampMs(skipped.started_at);
   if (skippedStart === undefined) return false;
   if (ran.status !== 'completed') return true;
@@ -554,6 +586,73 @@ export function latestAttemptPerCheck<T extends RecheckCheckRun>(runs: T[]): T[]
     if (!held || checkAttemptIsNewer(run, held)) latest.set(key, run);
   }
   return [...latest.values()];
+}
+
+/** Most Actions job lookups one reduction may spend; the rest fall back. */
+export const MAX_WORKFLOW_ATTEMPT_LOOKUPS = 20;
+
+/**
+ * Ids of the runs whose Actions attempt can change the twin decision: every
+ * skipped run that shares name, app and check suite with a non-skipped run,
+ * plus those non-skipped siblings. Everything else never needs a lookup.
+ */
+export function twinCandidateRunIds(runs: RecheckCheckRun[]): number[] {
+  const ranBySuiteKey = new Map<string, RecheckCheckRun[]>();
+  for (const run of runs) {
+    const suite = checkSuiteId(run);
+    if (suite === undefined || isSkippedRun(run)) continue;
+    const key = `${checkAttemptKey(run)}#${suite}`;
+    const held = ranBySuiteKey.get(key) ?? [];
+    held.push(run);
+    ranBySuiteKey.set(key, held);
+  }
+  const ids = new Set<number>();
+  for (const run of runs) {
+    const suite = checkSuiteId(run);
+    const id = checkRunId(run);
+    if (suite === undefined || id === undefined || !isSkippedRun(run)) continue;
+    const siblings = ranBySuiteKey.get(`${checkAttemptKey(run)}#${suite}`);
+    if (!siblings) continue;
+    ids.add(id);
+    for (const sibling of siblings) {
+      const siblingId = checkRunId(sibling);
+      if (siblingId !== undefined) ids.add(siblingId);
+    }
+  }
+  return [...ids];
+}
+
+/**
+ * Attach `workflow_attempt` to the twin candidates (see twinCandidateRunIds),
+ * at most MAX_WORKFLOW_ATTEMPT_LOOKUPS lookups. `lookup` maps a check-run id
+ * (= Actions job id) to its run_id/run_attempt, or null. A lookup that throws
+ * or returns null leaves the run without an attempt, so isTwinOf falls back to
+ * the timestamp rule; this never throws. Returns new run objects.
+ */
+export async function attachWorkflowAttempts<T extends RecheckCheckRun>(
+  runs: T[],
+  lookup: (checkRunId: number) => Promise<WorkflowAttempt | null>
+): Promise<T[]> {
+  const wanted = twinCandidateRunIds(runs).slice(0, MAX_WORKFLOW_ATTEMPT_LOOKUPS);
+  if (wanted.length === 0) return runs;
+  const found = new Map<number, WorkflowAttempt>();
+  await Promise.all(
+    wanted.map(async id => {
+      try {
+        const attempt = await lookup(id);
+        if (attempt && Number.isFinite(attempt.run_id) && Number.isFinite(attempt.run_attempt)) {
+          found.set(id, { run_id: attempt.run_id, run_attempt: attempt.run_attempt });
+        }
+      } catch {
+        // Fall back to the timestamp rule for this run.
+      }
+    })
+  );
+  return runs.map(run => {
+    const id = checkRunId(run);
+    const attempt = id === undefined ? undefined : found.get(id);
+    return attempt ? { ...run, workflow_attempt: attempt } : run;
+  });
 }
 
 function latestAttemptIsBlocking(
