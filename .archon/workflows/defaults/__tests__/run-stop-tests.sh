@@ -16,7 +16,7 @@
 # dprep_ensure_js_deps is called by prep-dependencies and by run-stop-tests. Both
 # copies are extracted from the canonical YAML and parity-checked at each call site.
 # The stbase stub (scripts/lane/stop-tests-base.sh: rst_base_compare, stb_stamp_base_red)
-# is parity-checked the same way and exercised as Tests 1-9 of
+# is parity-checked the same way and exercised as Tests 1-10 of
 # WO-HARNESS-STOP-TESTS-BASE-RED-AWARE-01 against real temporary git repos.
 #
 # Run: bash .archon/workflows/defaults/__tests__/run-stop-tests.sh
@@ -1493,6 +1493,45 @@ stb_head "$STB_ROOT/t9d/repo" "$STB_ROOT/t9d/art"
 T9D_OUT="$(cd "$STB_ROOT/t9d/repo" && STB_MARK="$STB_ROOT/t9d/mark" ARTIFACTS_DIR="$STB_ROOT/t9d/art" rst_base_compare "$STB_ROOT/t9d/art/report" "$STB_ROOT/t9d/art/cmds" "$STB_ROOT/t9d/art/head.log" "$STB_COUNTS" 2>/dev/null)"
 assert_eq "Test 9 same_name_different_file_fails_closed: repeated name in one command -> failed unparsed" "failed unparsed" "$(stb_field TESTS_STATUS "$T9D_OUT") $(stb_field TESTS_BASE_COMPARE "$T9D_OUT")"
 assert_eq "Test 9 same_name_different_file_fails_closed: repeated name never ran base" "no" "$([ -f "$STB_ROOT/t9d/mark" ] && echo yes || echo no)"
+
+echo "--- Test 10: absolute_head_path_fails_or_rebases ---"
+# (a) The command cds into the head checkout by absolute path. The base rerun must
+# run BASE code: base passes A, head fails A, so A is newly broken. Without the
+# rebase both runs execute the head script and A would be waived as base_red.
+mkdir -p "$STB_ROOT/t10a/repo" "$STB_ROOT/t10a/art"
+stb_fixture "$STB_ROOT/t10a/repo" '' 'A\n' > "$STB_ROOT/t10a/art/run-start-sha.txt"
+T10A_ABS="$(cd "$STB_ROOT/t10a/repo" && pwd)"
+STB_CMDS="cd $T10A_ABS && bash ./run.sh\n" stb_head "$STB_ROOT/t10a/repo" "$STB_ROOT/t10a/art"
+assert_eq "Test 10 absolute_head_path_fails_or_rebases (a): head failed on A" "failed" "$(stb_field TESTS_STATUS "$(cat "$STB_ROOT/t10a/art/report")")"
+T10A_OUT="$(cd "$STB_ROOT/t10a/repo" && STB_MARK="$STB_ROOT/t10a/mark" ARTIFACTS_DIR="$STB_ROOT/t10a/art" rst_base_compare "$STB_ROOT/t10a/art/report" "$STB_ROOT/t10a/art/cmds" "$STB_ROOT/t10a/art/head.log" "$STB_COUNTS" 2>/dev/null)"
+assert_eq "Test 10 absolute_head_path_fails_or_rebases (a): TESTS_STATUS=failed" "failed" "$(stb_field TESTS_STATUS "$T10A_OUT")"
+assert_contains "Test 10 absolute_head_path_fails_or_rebases (a): newly broken names A" "newly broken: s.test.ts :: suite > A" "$(stb_field TESTS_LINE "$T10A_OUT")"
+assert_eq "Test 10 absolute_head_path_fails_or_rebases (a): base code ran (base marker)" "yes" "$([ -f "$STB_ROOT/t10a/mark" ] && echo yes || echo no)"
+assert_contains "Test 10 absolute_head_path_fails_or_rebases (a): base command cd'd into the base worktree" "### run-stop-tests: cd $(cd "$STB_ROOT/t10a/art" && pwd)/stop-tests-base-wt." "$(cat "$STB_ROOT/t10a/art/evidence/stop-tests-base.log" 2>/dev/null)"
+assert_eq "Test 10 absolute_head_path_fails_or_rebases (a): worktree removed" "1 0" "$(stb_wt_count "$STB_ROOT/t10a/repo") $(stb_leftover "$STB_ROOT/t10a/art")"
+# Root spellings: git form, pwd form, trailing slash.
+T10_ROOTS="$(stb__head_roots "$(cd "$STB_ROOT/t10a/repo" && git rev-parse --show-toplevel)/")"
+assert_contains "Test 10 absolute_head_path_fails_or_rebases: roots include the pwd form" "$T10A_ABS" "$T10_ROOTS"
+assert_not_contains "Test 10 absolute_head_path_fails_or_rebases: roots carry no trailing slash" "$T10A_ABS/" "$T10_ROOTS"
+printf 'cd %s/ && bash ./run.sh\nbash %s/run.sh\n' "$T10A_ABS" "$T10A_ABS" > "$STB_ROOT/t10a/in.cmds"
+printf '%s\n' "$T10_ROOTS" > "$STB_ROOT/t10a/roots"
+stb__rebase_commands "$STB_ROOT/t10a/in.cmds" "$STB_ROOT/t10a/out.cmds" /base/wt "$STB_ROOT/t10a/roots"
+assert_eq "Test 10 absolute_head_path_fails_or_rebases: trailing slash and script path rebased" "$(printf 'cd /base/wt/ && bash ./run.sh\nbash /base/wt/run.sh')" "$(cat "$STB_ROOT/t10a/out.cmds")"
+printf 'bash %s/run.sh\n' "$(printf '%s' "$T10A_ABS" | tr 'a-z' 'A-Z')" > "$STB_ROOT/t10a/case.cmds"
+assert_eq "Test 10 absolute_head_path_fails_or_rebases: a head path in another letter case escapes" "1" "$(stb__rebase_commands "$STB_ROOT/t10a/case.cmds" "$STB_ROOT/t10a/case.out" /base/wt "$STB_ROOT/t10a/roots"; echo $?)"
+
+# (b) The command cds into an unrelated absolute directory (a copy of the head files,
+# not a git checkout). Base would run that directory's code: fail closed, never run base.
+mkdir -p "$STB_ROOT/t10b/repo" "$STB_ROOT/t10b/art" "$STB_ROOT/t10b/other"
+stb_fixture "$STB_ROOT/t10b/repo" 'A\n' 'A\n' > "$STB_ROOT/t10b/art/run-start-sha.txt"
+cp "$STB_ROOT/t10b/repo/run.sh" "$STB_ROOT/t10b/repo/tests.txt" "$STB_ROOT/t10b/repo/fails.txt" "$STB_ROOT/t10b/other/"
+T10B_OTHER="$(cd "$STB_ROOT/t10b/other" && pwd)"
+STB_CMDS="cd $T10B_OTHER && bash ./run.sh\n" stb_head "$STB_ROOT/t10b/repo" "$STB_ROOT/t10b/art"
+T10B_OUT="$(cd "$STB_ROOT/t10b/repo" && STB_MARK="$STB_ROOT/t10b/mark" ARTIFACTS_DIR="$STB_ROOT/t10b/art" rst_base_compare "$STB_ROOT/t10b/art/report" "$STB_ROOT/t10b/art/cmds" "$STB_ROOT/t10b/art/head.log" "$STB_COUNTS" 2>/dev/null)"
+assert_eq "Test 10 absolute_head_path_fails_or_rebases (b): TESTS_STATUS=failed" "failed" "$(stb_field TESTS_STATUS "$T10B_OUT")"
+assert_eq "Test 10 absolute_head_path_fails_or_rebases (b): outcome escapes_worktree" "escapes_worktree" "$(stb_field TESTS_BASE_COMPARE "$T10B_OUT")"
+assert_eq "Test 10 absolute_head_path_fails_or_rebases (b): base never ran (no log, no worktree)" "no 1 0" "$([ -e "$STB_ROOT/t10b/art/evidence/stop-tests-base.log" ] && echo yes || echo no) $(stb_wt_count "$STB_ROOT/t10b/repo") $(stb_leftover "$STB_ROOT/t10b/art")"
+assert_eq "Test 10 absolute_head_path_fails_or_rebases (b): no base-red-tests.txt" "no" "$([ -e "$STB_ROOT/t10b/art/base-red-tests.txt" ] && echo yes || echo no)"
 
 echo "--- Test 7: all_lanes_call_shared_script ---"
 STB_CALL='rst_base_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS"'

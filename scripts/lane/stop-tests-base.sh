@@ -161,6 +161,67 @@ stb__base_identities() {
   return 0
 }
 
+# stb__head_roots <top>   (-> every spelling of the head checkout root, one per line,
+#   longest first, no trailing slash): git's form, the logical and physical (pwd -P)
+#   paths, cygpath forms where cygpath exists, and the /<drive>/ form of a C:/ path.
+stb__head_roots() {
+  local top="$1" r
+  {
+    printf '%s\n' "$top"
+    (cd "$top" 2>/dev/null && pwd)
+    (cd "$top" 2>/dev/null && pwd -P)
+    if command -v cygpath >/dev/null 2>&1; then
+      cygpath -u "$top" 2>/dev/null
+      cygpath -m "$top" 2>/dev/null
+    fi
+  } | while IFS= read -r r; do
+    [ -n "$r" ] || continue
+    while [ "${#r}" -gt 1 ] && [ "${r%/}" != "$r" ]; do r="${r%/}"; done
+    [ "$r" = "/" ] && continue
+    printf '%s\n' "$r"
+    case "$r" in
+      [A-Za-z]:/*) printf '/%s%s\n' "$(printf '%s' "${r%%:*}" | tr 'A-Z' 'a-z')" "${r#?:}" ;;
+    esac
+  done | awk '!seen[$0]++ { print length($0) "\t" $0 }' | sort -rn | cut -f2-
+}
+
+# stb__rebase_commands <in> <out> <wt> <roots-file>   Rewrites each command for the
+#   base run: every head root (followed by "/", a space or the end) becomes <wt>.
+#   Returns 1 (nothing usable written) when a rewritten command still names a head
+#   root in any letter case, or starts with "cd <absolute dir>" outside <wt>.
+stb__rebase_commands() {
+  local in="$1" out="$2" wt="$3" roots="$4"
+  LC_ALL=C awk -v WT="$wt" -v RF="$roots" '
+    BEGIN { S = "\001BASEWT\001"; while ((getline r < RF) > 0) if (r != "") R[++n] = r }
+    function rebase(s, r,   o, i, c) {
+      o = ""
+      while ((i = index(s, r)) > 0) {
+        c = substr(s, i + length(r), 1)
+        if (c == "" || c == "/" || c == " ") { o = o substr(s, 1, i - 1) S; s = substr(s, i + length(r)) }
+        else { o = o substr(s, 1, i + length(r) - 1); s = substr(s, i + length(r)) }
+      }
+      return o s
+    }
+    {
+      line = $0
+      for (k = 1; k <= n; k++) line = rebase(line, R[k])
+      low = tolower(line)
+      for (k = 1; k <= n; k++) if (index(low, tolower(R[k])) > 0) bad = 1
+      if (match(line, /^[ ]*cd[ ]+[^ ]+[ ]+&&/)) {
+        d = line; sub(/^[ ]*cd[ ]+/, "", d); sub(/[ ]+&&.*$/, "", d)
+        if ((d ~ /^\// || d ~ /^[A-Za-z]:/) && !(d == S || index(d, S "/") == 1)) bad = 1
+      }
+      while ((i = index(line, S)) > 0) line = substr(line, 1, i - 1) WT substr(line, i + length(S))
+      out[++m] = line
+    }
+    END {
+      if (bad) exit 1
+      for (k = 1; k <= m; k++) print out[k]
+    }
+  ' "$in" > "$out" || { : > "$out"; return 1; }
+  return 0
+}
+
 # stb__abs <path>   (-> absolute path of an existing file or directory)
 stb__abs() {
   local p="$1"
@@ -245,6 +306,9 @@ stb__base_red_line() {
 #     base_timeout    a base command timed out (exit 124) -> failed
 #     base_passed     the base run did not fail -> failed, every head failure is new
 #     base_unrunnable worktree or runner unavailable -> failed
+#     escapes_worktree a command reaches outside the base worktree after rebasing
+#                     head-checkout paths (an absolute cd elsewhere, or a head path
+#                     spelled another way) -> failed, base never runs
 #   Never returns nonzero.
 rst_base_compare() {
   local report="$1" cmds="$2" head_log="$3" counts="$4"
@@ -293,11 +357,20 @@ rst_base_compare() {
     return 0
   fi
   top="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-  cmds="$(stb__abs "$cmds")"
+  wt="$(stb__abs "$art")/stop-tests-base-wt.$$"
+  # The base run must execute base code: every head-checkout root in a command is
+  # rebased onto the base worktree, and a command that still reaches outside it fails
+  # closed before any base worktree exists.
+  stb__head_roots "$top" > "$work/roots"
+  if ! stb__rebase_commands "$cmds" "$work/base.cmds" "$wt" "$work/roots"; then
+    rm -rf "$work"
+    stb__emit "$report" escapes_worktree
+    return 0
+  fi
+  cmds="$work/base.cmds"
   mkdir -p "$art/evidence" 2>/dev/null || true
   base_log="$(stb__abs "$art/evidence")/stop-tests-base.log"
   : > "$base_log"
-  wt="$(stb__abs "$art")/stop-tests-base-wt.$$"
   stb__remove_worktree "$top" "$wt"
   if ! git -C "$top" worktree add --detach "$wt" "$sha" >> "$base_log" 2>&1; then
     stb__remove_worktree "$top" "$wt"
