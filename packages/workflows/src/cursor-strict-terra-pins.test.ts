@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { clearRegistry, registerBuiltinProviders } from '@archon/providers';
 import { registerCursorAgentProvider } from '../../providers/src/community/cursor/registration';
+import { registerGrokAgentProvider } from '@archon/providers/community/grok';
 import { parseWorkflow } from './loader';
 import { resolveModelForNode } from './model-override';
 import { resolveAgentPersona } from './executor-shared';
@@ -45,6 +46,9 @@ beforeEach(() => {
   clearRegistry();
   registerBuiltinProviders();
   registerCursorAgentProvider();
+  // openrouter: the D0 Kimi review failover target the cursor lane declares
+  // (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+  registerGrokAgentProvider();
 });
 afterEach(clearRegistry);
 
@@ -66,7 +70,10 @@ describe('Cursor strict Terra model selection', () => {
     expect(strict.map(node => node.id)).toEqual(strictIds);
     for (const node of strict) {
       expect(node.model, node.id).toBe('gpt-6.1-terra');
-      expect(node.failover_provider, node.id).toBeUndefined();
+      // D0 (WO-HARNESS-PERSONA-MODEL-DECLARED-01): every review node fails over to
+      // Kimi K3.1 Pro on openrouter, never to Claude.
+      expect(node.failover_provider, node.id).toBe('openrouter');
+      expect(node.failover_model, node.id).toBe('moonshotai/kimi-k3.1-pro');
     }
     expect('loop' in strict[0]!).toBe(true);
   });

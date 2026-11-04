@@ -16,7 +16,7 @@ import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { isRegisteredProvider, getRegisteredProviders, resolveProviderId } from '@archon/providers';
-import { classifyError } from './executor-shared';
+import { classifyError, InfrastructureClassBlock } from './executor-shared';
 import { BUNDLED_POLICIES } from './defaults/bundled-defaults';
 import { resolveEntryLane, DEFAULT_ENGINE_TO_LANE } from './router-dispatcher';
 import { isLaneFullyDark, listDarkEngines } from './engine-availability';
@@ -50,7 +50,12 @@ import {
   type SeatId,
   type SeatReading,
 } from './reliability/seat-usage';
-import { buildSeatRerouteNode } from './reliability/seat-node-failover';
+import {
+  buildSeatRerouteNode,
+  DEFAULT_CLAUDE_FAILOVER_MODEL,
+  isReviewNode,
+  REVIEW_FAILOVER_CLAUDE_REFUSED_D0,
+} from './reliability/seat-node-failover';
 import { resolveWorkflowNodeProviders } from './reliability/resolve-binding';
 import { selectQuotaExhaustionRoute } from './node-failover';
 import {
@@ -1464,6 +1469,10 @@ export async function executeWorkflow(
           // different provider was selected, keep the original persona and fall back to the
           // target provider's configured assistant model. The per-node override carries the
           // selected model so resolveModelForNode (override wins) dispatches it.
+          // A NON-review node rerouted to claude with neither set gets
+          // DEFAULT_CLAUDE_FAILOVER_MODEL, so a model-less persona cannot throw
+          // "must declare a 'model:'" (run 8849e767). A review node never reaches
+          // claude here (D0; selectSeatNodeFailover drops it) -- asserted below.
           const rerouteBinding = (
             node: (typeof executableWorkflow.nodes)[number],
             toProvider: string
@@ -1479,8 +1488,16 @@ export async function executeWorkflow(
             const declaredModel = onDeclaredRoute
               ? (declared.failover_model ?? executableWorkflow.failover_model)
               : undefined;
+            if (toProvider === 'claude' && isReviewNode(node)) {
+              throw new InfrastructureClassBlock(
+                `${REVIEW_FAILOVER_CLAUDE_REFUSED_D0}: review node '${node.id}' was routed to claude; ` +
+                  'board decision D0 (M-20261021c) bars review seats from falling back to Claude.'
+              );
+            }
+            const claudeDefault =
+              toProvider === 'claude' ? DEFAULT_CLAUDE_FAILOVER_MODEL : undefined;
             return {
-              model: declaredModel ?? assistantModels[toProvider],
+              model: declaredModel ?? assistantModels[toProvider] ?? claudeDefault,
               agent: onDeclaredRoute ? declared.failover_agent : undefined,
             };
           };
@@ -1526,7 +1543,13 @@ export async function executeWorkflow(
       }
       if (seatDecision.refused) {
         const role = seatDecision.role ?? 'lane';
-        const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}:lane=${laneName}:role=${role}`;
+        // D0 (WO-HARNESS-PERSONA-MODEL-DECLARED-01): a review node with no non-Claude
+        // route names the reason and the node, so the refusal is not read as a cutoff.
+        const d0 =
+          seatDecision.reason !== undefined
+            ? `:reason=${seatDecision.reason}:node=${seatDecision.reviewNodeId ?? ''}`
+            : '';
+        const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}:lane=${laneName}:role=${role}${d0}`;
         getLog().warn(
           {
             workflowName: executableWorkflow.name,
@@ -1537,6 +1560,9 @@ export async function executeWorkflow(
             cutoffPercent: seatDecision.cutoffPercent,
             lane: laneName,
             role,
+            ...(seatDecision.reason !== undefined
+              ? { reason: seatDecision.reason, reviewNodeId: seatDecision.reviewNodeId }
+              : {}),
           },
           'workflow.seat_usage_refused'
         );
@@ -1549,6 +1575,9 @@ export async function executeWorkflow(
               detail,
               lane: laneName,
               role,
+              ...(seatDecision.reason !== undefined
+                ? { reason_code: seatDecision.reason, review_node_id: seatDecision.reviewNodeId }
+                : {}),
             },
           })
           .catch((err: Error) => {

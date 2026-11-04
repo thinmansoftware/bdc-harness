@@ -24,7 +24,11 @@ import { getOperatorSetting } from '@archon/core/db/operator-settings';
 import { getLatestSeatUsageReading } from '@archon/core/db/seat-usage-readings';
 import { getRegisteredProviders } from '@archon/providers';
 import type { DagNode } from '../schemas/dag-node';
-import { selectSeatNodeFailover } from './seat-node-failover';
+import {
+  isReviewNodeId,
+  REVIEW_FAILOVER_CLAUDE_REFUSED_D0,
+  selectSeatNodeFailover,
+} from './seat-node-failover';
 
 export const SEAT_IDS = ['claude', 'codex', 'cursor'] as const;
 export type SeatId = (typeof SEAT_IDS)[number];
@@ -154,6 +158,14 @@ export interface SeatGateRefuse {
    * refused seat is the lane's own seat, 'node' when it is bound only by nodes.
    */
   role?: 'lane' | 'node';
+  /**
+   * Present only when a REVIEW node on the refused seat has no non-Claude route:
+   * board decision D0 bars rerouting it to Claude, so the run fails closed with
+   * reason review_failover_claude_refused_d0 (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+   */
+  reason?: typeof REVIEW_FAILOVER_CLAUDE_REFUSED_D0;
+  /** The review node that could not be routed; present only with `reason`. */
+  reviewNodeId?: string;
 }
 export type SeatGateDecision = SeatGateAllow | SeatGateRefuse;
 
@@ -941,6 +953,8 @@ function decideScopedSeatGate(
    */
   const pickNodeRoute = (fromSeat: SeatId, binding: SeatGateNodeBinding): string | null => {
     if (binding.node === undefined) {
+      // D0: a review node never reroutes to Claude, even when Claude is declared.
+      if (binding.failoverProvider === 'claude' && isReviewNodeId(binding.nodeId)) return null;
       return binding.failoverProvider !== undefined &&
         failoverHasHeadroom(fromSeat, binding.failoverProvider)
         ? binding.failoverProvider
@@ -981,14 +995,28 @@ function decideScopedSeatGate(
     }
     const nodes = nodeSeats[seat] ?? [];
     const routes: SeatGateNodeRoute[] = [];
+    let unroutedReviewNodeId: string | undefined;
     for (const binding of nodes) {
       const toProvider = pickNodeRoute(seat, binding);
-      if (toProvider === null) break;
+      if (toProvider === null) {
+        if (isReviewNodeId(binding.nodeId)) unroutedReviewNodeId = binding.nodeId;
+        break;
+      }
       routes.push({ nodeId: binding.nodeId, fromProvider: binding.providerId, toProvider });
     }
     const covered = nodes.length > 0 && routes.length === nodes.length;
     if (!covered) {
-      refusal = { ...base, role: 'node' };
+      // A review node with no non-Claude route fails closed and names D0, so the
+      // refusal is not mistaken for an ordinary cutoff refusal.
+      refusal =
+        unroutedReviewNodeId !== undefined
+          ? {
+              ...base,
+              role: 'node',
+              reason: REVIEW_FAILOVER_CLAUDE_REFUSED_D0,
+              reviewNodeId: unroutedReviewNodeId,
+            }
+          : { ...base, role: 'node' };
       continue;
     }
     degradedSeats.push({

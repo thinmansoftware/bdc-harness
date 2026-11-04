@@ -12104,6 +12104,10 @@ describe('agent persona dispatch', () => {
     const { registerCursorAgentProvider } =
       await import('../../providers/src/community/cursor/registration');
     registerCursorAgentProvider();
+    // openrouter: the D0 Kimi review failover target the cursor lane declares
+    // (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+    const { registerGrokAgentProvider } = await import('@archon/providers/community/grok');
+    registerGrokAgentProvider();
     try {
       const repoRoot = join(import.meta.dir, '../../..');
       const file = 'bdc-feature-development-cursor.yaml';
