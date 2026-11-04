@@ -151,6 +151,7 @@ describe('production Docker packaging', () => {
       expect(line).not.toMatch(/\b(?:nodejs|npm)\b/);
     }
     expect(runtime).toContain('"$(npm root -g)/agent-browser"');
+    expect(runtime).toContain('ln -sf /usr/bin/python3 /usr/local/bin/python');
     expect(runtime).toContain('test "$default_node" = "v${NODE26_VERSION}"');
     expect(runtime).toContain('test "$default_path" = "/opt/node26/bin/node"');
     expect(runtime).not.toContain('default node unexpectedly');
@@ -184,6 +185,12 @@ describe('production Docker packaging', () => {
     expect(workflow).not.toContain(staleNode);
     expect(workflow).not.toContain('v26*) exit 1');
     expect(workflow).toContain('scripts/container/node-lts-smoke.sh');
+    const smoke = await readFile(
+      join(import.meta.dir, '..', '..', '..', 'scripts/container/node-lts-smoke.sh'),
+      'utf8'
+    );
+    expect(smoke).toContain('python --version');
+    expect(smoke).toContain('Python 3.');
   });
 
   it('Test 1: production stage stamps the build commit', async () => {

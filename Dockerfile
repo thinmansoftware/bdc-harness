@@ -201,11 +201,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends xz-utils \
 
 # Make the LTS Node the default for every user, and keep it reachable from env -i
 # contexts that use the minimal /usr/local/bin:/usr/bin:/bin PATH (the Overseer
-# reviewer sandbox), which used to find Debian's /usr/bin/node.
+# reviewer sandbox), which used to find Debian's /usr/bin/node. python follows the
+# Debian python-is-python3 convention (builders call bare `python`).
 ENV PATH=/opt/node26/bin:${PATH}
 RUN ln -sf /opt/node26/bin/node /usr/local/bin/node \
     && ln -sf /opt/node26/bin/npm /usr/local/bin/npm \
-    && ln -sf /opt/node26/bin/npx /usr/local/bin/npx
+    && ln -sf /opt/node26/bin/npx /usr/local/bin/npx \n    && ln -sf /usr/bin/python3 /usr/local/bin/python
 
 # Install agent-browser CLI (Vercel Labs) for E2E testing workflows
 # - Uses npm (not bun) because postinstall script downloads the native Rust binary

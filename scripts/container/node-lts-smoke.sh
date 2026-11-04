@@ -39,6 +39,14 @@ check pnpm pnpm --version
 check bun bun --version
 check agent-browser agent-browser --version
 
+py_ver="$(python --version 2>&1 || true)"
+printf 'python: %s
+' "$py_ver"
+case "$py_ver" in
+  "Python 3."*) ;;
+  *) echo "FAIL: python --version is '$py_ver', expected Python 3.x" >&2; fail=1 ;;
+esac
+
 if node -e 'require("node:sqlite"); console.log("sqlite ok")'; then
   :
 else
