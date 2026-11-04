@@ -99,6 +99,14 @@ for fn in rst_class rst_extract_commands rst_command_looks_runnable rst_rescue_s
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
+# The YAML dprep core now only sources the shared scripts/lane/dprep.sh (the image path
+# is /app/scripts/lane/dprep.sh); point it at this checkout's copy.
+REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
+DPREP_SHARED="$REPO_ROOT/scripts/lane/dprep.sh"
+if [ ! -f "$DPREP_SHARED" ]; then
+  echo "FATAL: shared dprep script missing at $DPREP_SHARED"; exit 1
+fi
+export BDC_DPREP_SCRIPT="$DPREP_SHARED"
 DPREP_CORE="$(extract_core_nth "$CANONICAL_YAML" dprep 1)"
 if [ -z "$DPREP_CORE" ]; then
   echo "FATAL: could not extract dprep core from $CANONICAL_YAML"; exit 1
@@ -574,12 +582,12 @@ printf '{}\n' > "$TMP2/package.json"
 out="$(cd "$TMP2" && dprep_ensure_js_deps)"
 rc=$?
 assert_eq "test2 no lock rc" "0" "$rc"
-assert_contains "test2 no lock" "dprep: no package.json with a bun lockfile, skipping" "$out"
+assert_contains "test2 no lock" "dprep: no package.json with a supported lockfile (bun, pnpm, package-lock.json), skipping" "$out"
 TMP3="$(mktemp -d)"
 out="$(cd "$TMP3" && dprep_ensure_js_deps)"
 rc=$?
 assert_eq "test2 empty rc" "0" "$rc"
-assert_contains "test2 empty dir" "dprep: no package.json with a bun lockfile, skipping" "$out"
+assert_contains "test2 empty dir" "dprep: no package.json with a supported lockfile (bun, pnpm, package-lock.json), skipping" "$out"
 assert_eq "test2 bun call count stays 1" "1" "$(wc -l < "$REC" | tr -d ' ')"
 
 echo "--- test 3: missing bun skips cleanly ---"
@@ -820,7 +828,7 @@ assert_eq "t6 first scrub rc" "rc1=0" "$(printf '%s\n' "$T6" | sed -n '1p')"
 assert_eq "t6 second scrub rc" "rc2=0" "$(printf '%s\n' "$T6" | sed -n '2p')"
 assert_eq "t6 repeated scrub identical" "same=yes" "$(printf '%s\n' "$T6" | sed -n '3p')"
 assert_eq "t6 dprep skip rc" "dprep_rc=0" "$(printf '%s\n' "$T6" | sed -n '4p')"
-assert_contains "t6 dprep skip path" "dprep: no package.json with a bun lockfile, skipping" "$(printf '%s\n' "$T6" | sed -n '5p')"
+assert_contains "t6 dprep skip path" "dprep: no package.json with a supported lockfile (bun, pnpm, package-lock.json), skipping" "$(printf '%s\n' "$T6" | sed -n '5p')"
 
 echo "--- dprep pnpm lockfile branch ---"
 PBIN="$(mktemp -d)"
@@ -861,7 +869,7 @@ PTMPB="$(mktemp -d)"
 poutb="$(cd "$PTMPB" && PATH="$PBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
 prcb=$?
 assert_eq "pnpm b rc" "0" "$prcb"
-assert_contains "pnpm b skip" "dprep: no package.json with a bun lockfile, skipping" "$poutb"
+assert_contains "pnpm b skip" "dprep: no package.json with a supported lockfile (bun, pnpm, package-lock.json), skipping" "$poutb"
 if [ -s "$PREC" ]; then FAIL=$((FAIL + 1)); echo "FAIL: pnpm b stub not called"; else PASS=$((PASS + 1)); echo "PASS: pnpm b stub not called"; fi
 
 echo "--- pnpm c: bun.lock only takes the bun path ---"
@@ -888,6 +896,226 @@ prcd=$?
 assert_eq "pnpm d rc" "0" "$prcd"
 assert_contains "pnpm d skip" "dprep: node_modules present, skipping" "$poutd"
 if [ -s "$PREC" ]; then FAIL=$((FAIL + 1)); echo "FAIL: pnpm d stub not called"; else PASS=$((PASS + 1)); echo "PASS: pnpm d stub not called"; fi
+
+echo "--- dprep npm (package-lock.json) branch (Fix A3: comicstoreos-provisioner runs dcb97aeb, 860c61e2) ---"
+NBIN="$(mktemp -d)"
+NREC="$NBIN/npm-argv.txt"
+NENV="$NBIN/npm-env.txt"
+NBREC="$NBIN/bun-argv.txt"
+NPREC="$NBIN/pnpm-argv.txt"
+cat > "$NBIN/npm" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$NREC"
+printf 'GH_TOKEN=%s\\n' "\${GH_TOKEN-unset}" >> "$NENV"
+mkdir -p node_modules
+EOF
+cat > "$NBIN/bun" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$NBREC"
+EOF
+cat > "$NBIN/pnpm" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$NPREC"
+EOF
+chmod +x "$NBIN/npm" "$NBIN/bun" "$NBIN/pnpm"
+export GH_TOKEN=production-shaped-test-value
+nreset() { : > "$NREC"; : > "$NENV"; : > "$NBREC"; : > "$NPREC"; }
+
+echo "--- npm a: package-lock.json only runs npm ci (both YAML call sites) ---"
+for occ in 1 2; do
+  nreset
+  NTMP="$(mktemp -d)"
+  printf '{}\n' > "$NTMP/package.json"
+  printf '{}\n' > "$NTMP/package-lock.json"
+  nout="$(
+    eval "$(extract_core_nth "$CANONICAL_YAML" dprep "$occ")"
+    cd "$NTMP" || exit 1
+    PATH="$NBIN:/usr/bin:/bin" dprep_ensure_js_deps
+  )"
+  nrc=$?
+  assert_eq "npm a occ$occ rc" "0" "$nrc"
+  assert_eq "npm a occ$occ argv" "ci --no-audit --no-fund" "$(cat "$NREC")"
+  assert_contains "npm a occ$occ log line" "dprep: npm ci (package-lock.json)" "$nout"
+  assert_contains "npm a occ$occ install ok" "dprep: install ok (" "$nout"
+  assert_eq "npm a occ$occ GH_TOKEN scrubbed" "GH_TOKEN=unset" "$(head -1 "$NENV")"
+  assert_eq "npm a occ$occ bun not called" "" "$(cat "$NBREC")"
+  assert_eq "npm a occ$occ pnpm not called" "" "$(cat "$NPREC")"
+  if [ -d "$NTMP/node_modules" ]; then PASS=$((PASS + 1)); echo "PASS: npm a occ$occ node_modules exists"; else FAIL=$((FAIL + 1)); echo "FAIL: npm a occ$occ node_modules exists"; fi
+  rm -rf "$NTMP"
+done
+assert_eq "npm a parent GH_TOKEN remains" "production-shaped-test-value" "${GH_TOKEN-unset}"
+
+echo "--- npm b: bun.lock beside package-lock.json keeps the bun path ---"
+nreset
+NTMP="$(mktemp -d)"
+printf '{}\n' > "$NTMP/package.json"
+printf '{}\n' > "$NTMP/package-lock.json"
+: > "$NTMP/bun.lock"
+nout="$(cd "$NTMP" && PATH="$NBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
+assert_eq "npm b bun argv" "install --frozen-lockfile" "$(cat "$NBREC")"
+assert_eq "npm b npm not called" "" "$(cat "$NREC")"
+assert_contains "npm b bun line" "dprep: installing JS dependencies (bun install --frozen-lockfile)" "$nout"
+rm -rf "$NTMP"
+
+echo "--- npm c: pnpm-lock.yaml beside package-lock.json keeps the pnpm path ---"
+nreset
+NTMP="$(mktemp -d)"
+printf '{}\n' > "$NTMP/package.json"
+printf '{}\n' > "$NTMP/package-lock.json"
+: > "$NTMP/pnpm-lock.yaml"
+nout="$(cd "$NTMP" && PATH="$NBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
+assert_eq "npm c pnpm argv" "install --frozen-lockfile" "$(cat "$NPREC")"
+assert_eq "npm c npm not called" "" "$(cat "$NREC")"
+assert_contains "npm c pnpm line" "dprep: installing JS dependencies (pnpm, frozen lockfile)" "$nout"
+rm -rf "$NTMP"
+
+echo "--- npm d: node_modules present skips npm ---"
+nreset
+NTMP="$(mktemp -d)"
+printf '{}\n' > "$NTMP/package.json"
+printf '{}\n' > "$NTMP/package-lock.json"
+mkdir -p "$NTMP/node_modules"
+nout="$(cd "$NTMP" && PATH="$NBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
+assert_contains "npm d skip" "dprep: node_modules present, skipping" "$nout"
+assert_eq "npm d npm not called" "" "$(cat "$NREC")"
+rm -rf "$NTMP"
+
+echo "--- npm e: no lockfile at all still skips; npm not called ---"
+nreset
+NTMP="$(mktemp -d)"
+printf '{}\n' > "$NTMP/package.json"
+nout="$(cd "$NTMP" && PATH="$NBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
+nrc=$?
+assert_eq "npm e rc" "0" "$nrc"
+assert_contains "npm e skip" "dprep: no package.json with a supported lockfile (bun, pnpm, package-lock.json), skipping" "$nout"
+assert_eq "npm e npm not called" "" "$(cat "$NREC")"
+rm -rf "$NTMP"
+
+echo "--- npm f: a failed npm ci never fails the run ---"
+nreset
+cat > "$NBIN/npm" <<EOF
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$NREC"
+exit 7
+EOF
+chmod +x "$NBIN/npm"
+NTMP="$(mktemp -d)"
+printf '{}\n' > "$NTMP/package.json"
+printf '{}\n' > "$NTMP/package-lock.json"
+nout="$(cd "$NTMP" && PATH="$NBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
+nrc=$?
+assert_eq "npm f rc" "0" "$nrc"
+assert_contains "npm f failed install continues" "dprep: install failed rc=7 (continuing" "$nout"
+rm -rf "$NTMP"
+
+echo "--- npm g: npm missing skips cleanly ---"
+if [ -x /usr/bin/npm ] || [ -x /bin/npm ]; then
+  echo "SKIP: npm g (npm is installed in /usr/bin or /bin on this host)"
+else
+  rm -f "$NBIN/npm"
+  NTMP="$(mktemp -d)"
+  printf '{}\n' > "$NTMP/package.json"
+  printf '{}\n' > "$NTMP/package-lock.json"
+  nout="$(cd "$NTMP" && PATH="$NBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
+  nrc=$?
+  assert_eq "npm g rc" "0" "$nrc"
+  assert_contains "npm g npm missing" "dprep: npm not found, skipping" "$nout"
+  rm -rf "$NTMP"
+fi
+
+echo "--- dprep guard: a missing shared script is logged and the run continues ---"
+for occ in 1 2; do
+  gout="$(
+    unset -f dprep_ensure_js_deps dprep__install
+    export BDC_DPREP_SCRIPT="$NBIN/no-such-dir/dprep.sh"
+    eval "$(extract_core_nth "$CANONICAL_YAML" dprep "$occ")"
+    dprep_ensure_js_deps
+  )"
+  grc=$?
+  assert_eq "guard occ$occ rc" "0" "$grc"
+  assert_contains "guard occ$occ message" "dprep: $NBIN/no-such-dir/dprep.sh missing" "$gout"
+done
+if [ ! -e /app/scripts/lane/dprep.sh ]; then
+  gout="$(
+    unset -f dprep_ensure_js_deps dprep__install
+    unset BDC_DPREP_SCRIPT
+    eval "$(extract_core_nth "$CANONICAL_YAML" dprep 1)"
+    dprep_ensure_js_deps
+  )"
+  assert_contains "guard default path message" "dprep: /app/scripts/lane/dprep.sh missing" "$gout"
+fi
+rm -rf "$NBIN"
+
+echo "--- resolve-test-command: origin URL forms map to the right project entry ---"
+# Fix A3 second defect: TESTS_MAP_FALLBACK=invalid-origin. Cauldron clones embed the
+# token in origin (packages/core/src/handlers/clone.ts: https://<token>@github.com/...),
+# which the old normalize() regex rejected. Extract the real node bash and run it with
+# a stub gh serving a fixture project map.
+RTC_BASH="$(tr -d '\r' < "$CANONICAL_YAML" | awk '
+  $0 == "  - id: resolve-test-command" { n = 1; next }
+  n && /^  - id: / { exit }
+  n && $0 == "    bash: |" { b = 1; next }
+  b
+' | sed 's/^      //')"
+if [ -z "$RTC_BASH" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL: could not extract resolve-test-command bash"
+fi
+for lane in $LANES; do
+  lane_rtc="$(tr -d '\r' < "$DEFAULTS/$lane" | awk '
+    $0 == "  - id: resolve-test-command" { n = 1; next }
+    n && /^  - id: / { exit }
+    n && $0 == "    bash: |" { b = 1; next }
+    b
+  ' | sed 's/^      //')"
+  assert_eq "resolve-test-command parity $lane" "$RTC_BASH" "$lane_rtc"
+done
+RBIN="$(mktemp -d)"
+RMAP_JSON='{"comicstoreos-provisioner":{"repo":"thinmansoftware/comicstoreos-provisioner","test_command":"npm test"},"shopops-storefront":{"repo":"thinmansoftware/shopops-storefront","test_command":"bun test lib"},"fuelglass":{"repo":"https://github.com/thinmansoftware/fuelglass.git","test_command":"npm run fuel-test"}}'
+printf '{"sha":"%s","content":"%s"}\n' "0123456789abcdef0123456789abcdef01234567" "$(printf '%s' "$RMAP_JSON" | base64 | tr -d '\n')" > "$RBIN/envelope.json"
+cat > "$RBIN/gh" <<EOF
+#!/usr/bin/env bash
+cat "$RBIN/envelope.json"
+EOF
+chmod +x "$RBIN/gh"
+rtc_run() {
+  # rtc_run <origin url or empty>: run the node in a temp repo with that origin.
+  local repo
+  repo="$(mktemp -d)"
+  (
+    export PATH="$RBIN:$ORIG_PATH"
+    cd "$repo" || exit 1
+    git init -q .
+    if [ -n "$1" ]; then git remote add origin "$1"; fi
+    bash -c "$RTC_BASH"
+  )
+  rm -rf "$repo"
+}
+rtc_field() { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1; }
+rtc_expect() {
+  # rtc_expect <label> <origin> <source> <fallback> <command>
+  local out
+  out="$(rtc_run "$2")"
+  assert_eq "rtc $1 source" "$3" "$(rtc_field TEST_COMMAND_SOURCE "$out")"
+  assert_eq "rtc $1 fallback" "$4" "$(rtc_field TEST_COMMAND_FALLBACK "$out")"
+  assert_eq "rtc $1 command" "$5" "$(rtc_field TEST_COMMAND_B64 "$out" | base64 --decode 2>/dev/null)"
+  assert_not_contains "rtc $1 no credential echoed" "fake-token-value" "$out"
+}
+P=thinmansoftware/comicstoreos-provisioner
+rtc_expect "token userinfo .git" "https://fake-token-value@github.com/$P.git" project-map "" "npm test"
+rtc_expect "x-access-token userinfo" "https://x-access-token:fake-token-value@github.com/$P.git" project-map "" "npm test"
+rtc_expect "plain https .git" "https://github.com/$P.git" project-map "" "npm test"
+rtc_expect "plain https no suffix" "https://github.com/$P" project-map "" "npm test"
+rtc_expect "plain https trailing slash" "https://github.com/$P/" project-map "" "npm test"
+rtc_expect "scp ssh form" "git@github.com:$P.git" project-map "" "npm test"
+rtc_expect "ssh url form" "ssh://git@github.com/$P.git" project-map "" "npm test"
+rtc_expect "mixed case" "https://github.com/ThinmanSoftware/ComicStoreOS-Provisioner.git" project-map "" "npm test"
+rtc_expect "picks storefront not provisioner" "https://fake-token-value@github.com/thinmansoftware/shopops-storefront.git" project-map "" "bun test lib"
+rtc_expect "map repo in url form" "https://x-access-token:fake-token-value@github.com/thinmansoftware/fuelglass" project-map "" "npm run fuel-test"
+rtc_expect "unknown github repo" "https://github.com/thinmansoftware/not-in-map.git" wo-spec missing ""
+rtc_expect "local path origin" "/opt/archon/workspaces/x/source" wo-spec invalid-origin ""
+rtc_expect "non-github host" "https://fake-token-value@gitlab.com/$P.git" wo-spec invalid-origin ""
+rtc_expect "no origin" "" wo-spec invalid-origin ""
+rm -rf "$RBIN"
 
 unset RST_NPX_BIN RST_NPM_BIN GH_TOKEN
 unset TELEGRAM_BOT_TOKEN TELEGRAM_STREAMING_MODE TELEGRAM_APPROVAL_CHAT_ID TELEGRAM_ALLOWED_USER_IDS TELEGRAM_TEST_FIXTURE

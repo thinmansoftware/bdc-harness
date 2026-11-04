@@ -47,6 +47,15 @@ The pnpm dprep branch runs only when there is no bun lock, pnpm-lock.yaml exists
 pnpm is on PATH, and node_modules is absent. It then runs pnpm install --frozen-lockfile
 inside the same credential-scrubbed subshell as the bun branch, and it always returns 0.
 
+The npm dprep branch runs only when there is no bun lock and no pnpm-lock.yaml, and
+package-lock.json exists. It runs npm ci --no-audit --no-fund in the same scrubbed
+subshell and logs "dprep: npm ci (package-lock.json)". Any other package dir skips.
+
+dprep_ensure_js_deps lives in one shared file, scripts/lane/dprep.sh, shipped in the
+image at /app/scripts/lane/dprep.sh. The prep-dependencies and run-stop-tests nodes of
+every bdc-feature-development lane source it (BDC_DPREP_SCRIPT overrides the path for
+tests). If the file is missing the node logs "dprep: <path> missing" and continues.
+
 Bumping a version
 
 Change each version and its checksum together, from the publisher checksums.
