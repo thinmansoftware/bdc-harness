@@ -67,6 +67,22 @@ that variable; removed when the node ends), so standalone CLI and source runs wo
 without /app. Only when no candidate exists does the node log "dprep: dprep.sh missing"
 and continue.
 
+Stop-grep tokenizer (scripts/lane/rsg-argv.sh)
+
+The run-stop-greps node of every bdc-feature-development lane runs the grep stop conditions
+a spec declares, under a read-only allowlist. Both the allowlist check and the execution
+consume ONE parse, rsg_parse_pipeline in scripts/lane/rsg-argv.sh, so a single-quoted
+multi-word pattern such as grep -c 'Grand Comics Database' src/x.tsx is one argv word and
+runs. Inside single quotes a space, ; | $( or ^ is a literal pattern byte. Double quotes,
+backslashes and every metacharacter outside single quotes are still rejected, as are
+unbalanced, glued and empty quotes and a quoted word that is itself a write/exec flag.
+Resolution order: $BDC_RSGARGV_SCRIPT (tests), $ARCHON_LANE_SCRIPTS_DIR/rsg-argv.sh, then
+/app/scripts/lane/rsg-argv.sh. When none exists every declared grep is dropped (fail closed)
+and the node logs "rsg-argv.sh missing". The shared verdict fixture
+.archon/workflows/defaults/__tests__/fixtures/grep-verdicts.tsv (pinned by sha256) is the
+agreement contract with the bdc-xo validator CHECK 14. Test it with:
+bash .archon/workflows/defaults/__tests__/run-stop-greps.sh
+
 Base-red aware stop tests (scripts/lane/stop-tests-base.sh)
 
 A build fails its test stop condition only for tests it newly broke. The second lane

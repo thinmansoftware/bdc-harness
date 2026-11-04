@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run-stop-greps.sh -- unit tests for the run-stop-greps node core (rsg_*) in
 # .archon/workflows/defaults/bdc-feature-development-codex.yaml and its byte-identical
-# mirrors in the other 11 bdc-feature-development lanes.
+# mirrors in the other 12 bdc-feature-development lanes (13 total).
 #
 # bdc-xo #1940: the manifest "Grep assertions:" line was stamped "N/A (no declared
 # mechanical assertions)" for every WO, including specs that declared grep stop
@@ -9,7 +9,9 @@
 # it under the read-only allowlist, and emits OBSERVED counts.
 #
 # Cores are EXTRACTED from the canonical YAML (never re-typed). A parity test asserts
-# the core is byte-identical across all 12 lanes.
+# the core is byte-identical across all 13 lanes. The tokenizer is the shared script
+# scripts/lane/rsg-argv.sh (WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01); every
+# core test runs with BDC_RSGARGV_SCRIPT pointing at it.
 #
 # Run: bash .archon/workflows/defaults/__tests__/run-stop-greps.sh
 # Exits 0 on all-pass, 1 on any failure. ASCII only.
@@ -41,6 +43,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
 LANES="
+bdc-feature-development-astra.yaml
 bdc-feature-development-codex-only.yaml
 bdc-feature-development-codex.yaml
 bdc-feature-development-cursor.yaml
@@ -63,16 +66,20 @@ extract_core() {
   ' | sed 's/^      //'
 }
 
+REPO_ROOT="$(cd "$HERE/../../../.." && pwd)"
+RSGARGV_SOURCE="$REPO_ROOT/scripts/lane/rsg-argv.sh"
+export BDC_RSGARGV_SCRIPT="$RSGARGV_SOURCE"
+
 RSG_CORE="$(extract_core "$CANONICAL_YAML" rsg)"
 if [ -z "$RSG_CORE" ]; then
   echo "FATAL: could not extract rsg core from $CANONICAL_YAML"; exit 1
 fi
 eval "$RSG_CORE"
-for fn in rsg_extract rsg_tokens_safe rsg_argv_looks_readonly rsg_allow_cmd rsg_exec_pipeline rsg_observe rsg_compare rsg_run; do
+for fn in rsg_extract rsg_parse_pipeline rsg_argv_looks_readonly rsg_allow_cmd rsg_exec_pipeline rsg_observe rsg_compare rsg_run; do
   if ! declare -F "$fn" >/dev/null; then echo "FATAL: $fn not defined after eval"; exit 1; fi
 done
 
-echo "--- Parity: rsg core byte-identical across all 12 lanes (parity-all-12-lanes) ---"
+echo "--- Parity: rsg core byte-identical across all 13 lanes ---"
 for lane in $LANES; do
   assert_eq "parity $lane" "$RSG_CORE" "$(extract_core "$DEFAULTS/$lane" rsg)"
 done
@@ -161,8 +168,17 @@ c='grep -c "needle" fixture.txt'
 if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: double-quoted-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: double-quoted-still-dropped: $c"; fi
 
 echo "--- unsafe-quoted-content-still-dropped ---"
-for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f" "grep '--file=/etc/passwd' x" "find . '-exec' rm" "sort '-o' out"; do
+# WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01: a spaced, caret or command-substitution
+# pattern inside single quotes is now a LITERAL pattern and is allowed (see the
+# quoted-literal-patterns-allowed block). What stays dropped: unbalanced or empty quotes
+# and a quoted word that is itself a write/exec flag.
+for c in "grep -c 'x f" "grep -c '' f" "grep '--file=/etc/passwd' x" "find . '-exec' rm" "sort '-o' out"; do
   if rsg_allow_cmd "$c"; then FAIL=$((FAIL+1)); echo "FAIL: unsafe-quoted-content-still-dropped: $c"; else PASS=$((PASS+1)); echo "PASS: unsafe-quoted-content-still-dropped: $c"; fi
+done
+
+echo "--- quoted-literal-patterns-allowed ---"
+for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f"; do
+  if rsg_allow_cmd "$c"; then PASS=$((PASS+1)); echo "PASS: quoted-literal-patterns-allowed: $c"; else FAIL=$((FAIL+1)); echo "FAIL: quoted-literal-patterns-allowed: $c"; fi
 done
 
 echo "--- rsg_observe / rsg_compare ---"
@@ -241,7 +257,7 @@ assert_contains "double-quoted-still-dropped" "GREP_DROPPED=1" "$OUT"
 assert_contains "double-quoted-still-dropped not executed" "GREP_EXECUTED=0" "$OUT"
 
 echo "--- unsafe-quoted-content-still-dropped (run) ---"
-for c in "grep -c 'a b' f" "grep -c '\$(id)' f" "grep -c '^x' f" "grep -c 'x f" "grep -c '' f"; do
+for c in "grep -c 'x f" "grep -c '' f"; do
   OUT="$(printf '%s\teq\t1\nUNPARSED\t0\nDECLARED\t1\n' "$c" | rsg_run)"
   assert_contains "unsafe-quoted-content-still-dropped: $c" "DROPPED (not on read-only allowlist; not executed): $c" "$OUT"
   assert_contains "unsafe-quoted-content-still-dropped not executed: $c" "GREP_EXECUTED=0" "$OUT"
@@ -328,6 +344,143 @@ assert_contains "ASCII absence holds" 'OK: LC_ALL=C grep -n NonAscii shopops-api
 assert_contains "unparsed bullet assertions make evidence incomplete" "GREP_STATUS=incomplete" "$OUT"
 rm -rf "$TMP2"
 
+# ---------------------------------------------------------------------------
+# WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01 named tests. Each prints one
+# "PASS: <name>" line only when every assertion inside it passed.
+# ---------------------------------------------------------------------------
+NAMED_FAIL_MARK=0
+named_begin() { NAMED_FAIL_MARK=$FAIL; }
+named_end() {
+  if [ "$FAIL" -eq "$NAMED_FAIL_MARK" ]; then echo "PASS: $1"; else echo "FAIL: $1"; fi
+}
+assert_rc() {
+  # assert_rc <label> <expected rc> <command...>
+  local label="$1" expected="$2" rc
+  shift 2
+  "$@" >/dev/null 2>&1; rc=$?
+  assert_eq "$label" "$expected" "$rc"
+}
+
+echo "--- multiword_single_quoted_grep_executes ---"
+named_begin
+TMP3="$(mktemp -d)"
+mkdir -p "$TMP3/src/components"
+printf 'const a = 1;\n// Grand Comics Database\nconst b = 2;\n' > "$TMP3/src/components/GcdAttribution.tsx"
+cd "$TMP3"
+assert_rc "multiword allow: grep -c 'Grand Comics Database' src/components/GcdAttribution.tsx" 0 rsg_allow_cmd "grep -c 'Grand Comics Database' src/components/GcdAttribution.tsx"
+assert_eq "multiword observe prints 1" "1" "$(rsg_observe "grep -c 'Grand Comics Database' src/components/GcdAttribution.tsx")"
+MW_OUT="$(printf 'Stop 1 (grep assertion):\n  grep -c '\''Grand Comics Database'\'' src/components/GcdAttribution.tsx\n  Expected: 1\n' | rsg_extract | rsg_run)"
+assert_contains "multiword rsg_run GREP_EXECUTED=1" "GREP_EXECUTED=1" "$MW_OUT"
+assert_contains "multiword rsg_run GREP_DROPPED=0" "GREP_DROPPED=0" "$MW_OUT"
+assert_contains "multiword rsg_run GREP_MISMATCH=0" "GREP_MISMATCH=0" "$MW_OUT"
+assert_contains "multiword rsg_run GREP_STATUS=passed (the engine status word for a fully executed set)" "GREP_STATUS=passed" "$MW_OUT"
+assert_eq "multiword rsg_run has no DROPPED line" "0" "$(printf '%s\n' "$MW_OUT" | grep -c 'DROPPED (' || true)"
+assert_eq "multiword pipeline to wc -l counts the grep -c line" "1" "$(rsg_observe "grep -c 'Grand Comics Database' src/components/GcdAttribution.tsx | wc -l")"
+assert_eq "multiword is one argv word (double-space pattern matches 0)" "0" "$(rsg_observe "grep -c 'Grand  Comics' src/components/GcdAttribution.tsx")"
+cd "$HERE"
+named_end multiword_single_quoted_grep_executes
+
+echo "--- unbalanced_quote_rejected ---"
+named_begin
+for c in "grep -c 'Grand Comics Database src/x.tsx" "grep -c Grand' Comics src/x.tsx" "grep -c 'a b'c f" "grep -c x'a b' f" "grep -c '' f"; do
+  assert_rc "unbalanced/glued/empty rejected: $c" 1 rsg_allow_cmd "$c"
+done
+assert_rc "rsg_exec_pipeline on the unterminated quote returns 127" 127 rsg_exec_pipeline "grep -c 'Grand Comics Database src/x.tsx"
+named_end unbalanced_quote_rejected
+
+echo "--- double_quoted_still_rejected ---"
+named_begin
+for c in 'grep -c "Grand Comics Database" f' 'grep -c "needle" f' 'grep -c a\ b f' 'LC_ALL=C grep -n "[^ -~]" f' "grep -c 'a\"b' f" "grep -c 'a\\b' f"; do
+  assert_rc "double quote / backslash rejected: $c" 1 rsg_allow_cmd "$c"
+done
+named_end double_quoted_still_rejected
+
+echo "--- metachar_inside_single_quotes_not_executed ---"
+named_begin
+TMP4="$(mktemp -d)"
+printf 'a;rm x\na|b\n$(id)\n' > "$TMP4/fixture.txt"
+printf 'sentinel\n' > "$TMP4/x"
+cd "$TMP4"
+assert_eq "semicolon pattern is a literal (observe 1)" "1" "$(rsg_observe "grep -c 'a;rm x' fixture.txt")"
+assert_eq "pipe pattern is a literal (observe 1)" "1" "$(rsg_observe "grep -c 'a|b' fixture.txt")"
+assert_eq "command-substitution pattern is a literal (observe 1)" "1" "$(rsg_observe "grep -c '\$(id)' fixture.txt")"
+for c in "grep -c a;rm x fixture.txt" "grep -c 'a b' f > out" "grep -c 'a b' f | awk x" "grep '--file=/etc/passwd' x"; do
+  assert_rc "unquoted / flag-bearing rejected: $c" 1 rsg_allow_cmd "$c"
+done
+assert_eq "sentinel file x still exists" "1" "$(test -e x && echo 1 || echo 0)"
+assert_eq "no file named out was created" "0" "$(test -e out && echo 1 || echo 0)"
+cd "$HERE"
+named_end metachar_inside_single_quotes_not_executed
+
+echo "--- all_lanes_share_tokenizer ---"
+named_begin
+LANE_COUNT=0
+for lane in $LANES; do LANE_COUNT=$((LANE_COUNT + 1)); done
+assert_eq "LANES names 13 lanes" "13" "$LANE_COUNT"
+assert_contains "LANES includes astra" "bdc-feature-development-astra.yaml" "$LANES"
+assert_eq "the defaults dir carries exactly 13 bdc-feature-development lanes" "13" "$(ls "$DEFAULTS" | grep -cE '^bdc-feature-development(-[a-z0-9-]+)?\.yaml$' || true)"
+for lane in $LANES; do
+  LANE_CORE="$(extract_core "$DEFAULTS/$lane" rsg)"
+  assert_eq "core byte-identical to codex: $lane" "$RSG_CORE" "$LANE_CORE"
+  assert_contains "core uses rsg_parse_pipeline: $lane" "rsg_parse_pipeline" "$LANE_CORE"
+  assert_contains "core names BDC_RSGARGV_SCRIPT: $lane" "BDC_RSGARGV_SCRIPT" "$LANE_CORE"
+  assert_eq "core has no rsg_strip_arg: $lane" "0" "$(printf '%s\n' "$LANE_CORE" | grep -c 'rsg_strip_arg' || true)"
+  assert_eq "core has no whitespace split of the segment: $lane" "0" "$(printf '%s\n' "$LANE_CORE" | grep -c 'set -- \$segment' || true)"
+  assert_eq "core has no rsg_tokens_safe: $lane" "0" "$(printf '%s\n' "$LANE_CORE" | grep -c 'rsg_tokens_safe' || true)"
+done
+named_end all_lanes_share_tokenizer
+
+echo "--- rsg_script_missing_fails_closed ---"
+named_begin
+TMP5="$(mktemp -d)"
+printf 'alpha\nbeta\n' > "$TMP5/fixture.txt"
+printf '%s\n' "$RSG_CORE" > "$TMP5/core.sh"
+printf '. ./core.sh\nif rsg_allow_cmd "grep -c alpha fixture.txt"; then echo ALLOW_RC=0; else echo ALLOW_RC=1; fi\nprintf "grep -c alpha fixture.txt\\teq\\t1\\nUNPARSED\\t0\\nDECLARED\\t1\\n" | rsg_run\nrsg_exec_pipeline "grep -c alpha fixture.txt" >/dev/null 2>&1; echo EXEC_RC=$?\n' > "$TMP5/drive.sh"
+MISSING_OUT="$(cd "$TMP5" && env -u ARCHON_LANE_SCRIPTS_DIR BDC_RSGARGV_SCRIPT=/nonexistent/rsg-argv.sh bash ./drive.sh 2>&1)"
+assert_contains "script missing: rsg_allow_cmd returns 1" "ALLOW_RC=1" "$MISSING_OUT"
+assert_contains "script missing: GREP_DROPPED=1" "GREP_DROPPED=1" "$MISSING_OUT"
+assert_contains "script missing: GREP_EXECUTED=0 (nothing executed)" "GREP_EXECUTED=0" "$MISSING_OUT"
+assert_contains "script missing: GREP_STATUS=all_dropped (nothing was executable)" "GREP_STATUS=all_dropped" "$MISSING_OUT"
+assert_contains "script missing: rsg_exec_pipeline returns 127 and runs nothing" "EXEC_RC=127" "$MISSING_OUT"
+assert_contains "script missing: the tried paths are logged" "rsg-argv.sh missing" "$MISSING_OUT"
+named_end rsg_script_missing_fails_closed
+
+echo "--- harness_grep_verdict_fixtures_match ---"
+named_begin
+VERDICTS="$HERE/fixtures/grep-verdicts.tsv"
+ACCEPT_N=0
+REJECT_N=0
+if [ ! -f "$VERDICTS" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL: verdict fixture missing: $VERDICTS"
+else
+  while IFS= read -r vline || [ -n "$vline" ]; do
+    [ -n "$vline" ] || continue
+    verdict="${vline%%"$TAB"*}"
+    vcmd="${vline#*"$TAB"}"
+    case "$verdict" in
+      accept)
+        ACCEPT_N=$((ACCEPT_N + 1))
+        if rsg_allow_cmd "$vcmd"; then PASS=$((PASS + 1)); echo "PASS: fixture accept: $vcmd"; else FAIL=$((FAIL + 1)); echo "FAIL: fixture accept expected: $vcmd"; fi
+        ;;
+      reject)
+        REJECT_N=$((REJECT_N + 1))
+        if rsg_allow_cmd "$vcmd"; then FAIL=$((FAIL + 1)); echo "FAIL: fixture reject expected: $vcmd"; else PASS=$((PASS + 1)); echo "PASS: fixture reject: $vcmd"; fi
+        ;;
+      *) FAIL=$((FAIL + 1)); echo "FAIL: fixture record has an unknown verdict: $vline" ;;
+    esac
+  done < "$VERDICTS"
+  if [ "$ACCEPT_N" -ge 20 ]; then PASS=$((PASS + 1)); echo "PASS: fixture has at least 20 accept records ($ACCEPT_N)"; else FAIL=$((FAIL + 1)); echo "FAIL: fixture accept records: $ACCEPT_N"; fi
+  if [ "$REJECT_N" -ge 20 ]; then PASS=$((PASS + 1)); echo "PASS: fixture has at least 20 reject records ($REJECT_N)"; else FAIL=$((FAIL + 1)); echo "FAIL: fixture reject records: $REJECT_N"; fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "grep-verdicts.tsv sha256: $(sha256sum "$VERDICTS" | cut -d' ' -f1)"
+  else
+    echo "grep-verdicts.tsv sha256: $(shasum -a 256 "$VERDICTS" | cut -d' ' -f1)"
+  fi
+fi
+named_end harness_grep_verdict_fixtures_match
+
+rm -rf "$TMP3" "$TMP4" "$TMP5"
+
 echo
-echo "run-stop-greps.sh: $PASS passed, $FAIL failed"
+echo "run-stop-greps.sh: $PASS passed, $FAIL failed (PASS=$PASS FAIL=$FAIL)"
 [ "$FAIL" -eq 0 ]
