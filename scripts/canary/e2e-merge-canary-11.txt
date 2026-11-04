@@ -1,0 +1,7 @@
+E2E merge canary 11
+
+E2E_MERGE_CANARY_OK
+Run date: 2026-11-04
+Lane: claude
+
+This canary proves that the claude lane opens a PR, Overseer approves its exact head, and the merge manager merges it into dev without a human or builder merge action.
