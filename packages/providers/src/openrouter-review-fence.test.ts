@@ -302,9 +302,11 @@ describe('scanDiffForOpenRouter patterns', () => {
       console.warn('Test 4 skipped: gitleaks binary absent on runner (Test 7 covers fail-closed)');
       return;
     }
-    const diff = ['+++ b/config.ts', '@@ -0,0 +1,1 @@', '+const k = "AKIAIOSFODNN7EXAMPLE";'].join(
-      '\n'
-    );
+    // Not AWS's published AKIAIOSFODNN7EXAMPLE: gitleaks allowlists keys ending
+    // in EXAMPLE, so that fixture scanned clean and this test failed on every run.
+    // Built at runtime so no AWS-shaped literal sits in the source for scanners.
+    const fakeKey = ['AKIA', 'Z7QW3RTY5UIOP2LK'].join('');
+    const diff = ['+++ b/config.ts', '@@ -0,0 +1,1 @@', `+const k = "${fakeKey}";`].join('\n');
     const result = await scanDiffForOpenRouter(diff, { mode: 'diff', tenantSlugs: SLUGS });
     expect(result.verdict).toBe('hit');
     const gl = result.hits.find(h => h.kind === 'gitleaks');
