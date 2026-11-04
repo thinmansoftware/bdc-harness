@@ -51,7 +51,7 @@ interface CheckRunsForRefClient {
  * Same paginated listForRef walk the stale sweep uses. Incomplete (capped or
  * failed) pages are reported so the ingest can fail closed.
  */
-async function listCheckRunsForRefFromOctokit(
+export async function listCheckRunsForRefFromOctokit(
   octokit: CheckRunsForRefClient,
   input: { owner: string; repo: string; headSha: string }
 ): Promise<{ runs: RecheckCheckRun[]; complete: boolean }> {
@@ -62,6 +62,7 @@ async function listCheckRunsForRefFromOctokit(
         owner: input.owner,
         repo: input.repo,
         ref: input.headSha,
+        filter: 'all',
         per_page: CHECK_RUN_PAGE_SIZE,
         page,
       });
