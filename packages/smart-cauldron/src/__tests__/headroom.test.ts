@@ -607,3 +607,51 @@ describe('entry headroom: codex credits and unmetered cursor', () => {
     expect(rungSeatSkip('zero', { codex: codexAt99() }, 95)).toBeNull();
   });
 });
+
+/**
+ * WO-HARNESS-CODEX-CREDITS-HEADROOM-WHEN-WINDOW-EXHAUSTED-01: the conductor
+ * agrees with the run-start seat gate when Fuelglass reports codex at 100 with
+ * limit_reached true and allowed false while credits are available.
+ */
+describe('entry headroom: codex at limit with credits (allowed=false)', () => {
+  /** The live 2026-11-04 shape: built as a variable, as parsed JSON carries `allowed`. */
+  const codexAtLimit = (credits: { has_credits: boolean; overage_limit_reached?: boolean }) => {
+    const raw = {
+      limit_source: 'measured' as const,
+      windows: [{ name: 'primary', used_percent: 100 }],
+      limit_reached: true,
+      allowed: false,
+      credits,
+    };
+    const reading: SeatReadingLike = raw;
+    return reading;
+  };
+  const coolClaude = measured([{ name: 'seven_day', used_percent: 45 }]);
+
+  test('Test 4: conductor agrees with the gate at allowed false', () => {
+    const codex = codexAtLimit({ has_credits: true, overage_limit_reached: false });
+    expect(rungSeatSkip('codex', { codex }, 95)).toBeNull();
+    const result = choose({
+      picked: 'codex',
+      thresholdPercent: 95,
+      usage: { codex, claude: coolClaude },
+    });
+    expect(result.entry).toBe('codex');
+    expect(result.changed).toBe(false);
+    expect(result.reason.startsWith('seat_credits:codex:')).toBe(true);
+  });
+
+  test('Test 5: exhausted or blocked credits still skip the codex rung', () => {
+    for (const credits of [
+      { has_credits: false, overage_limit_reached: false },
+      { has_credits: true, overage_limit_reached: true },
+    ]) {
+      expect(rungSeatSkip('codex', { codex: codexAtLimit(credits) }, 95)).toEqual({
+        tier: 'codex',
+        seat: 'codex',
+        usedPercent: 100,
+        cutoffPercent: 95,
+      });
+    }
+  });
+});

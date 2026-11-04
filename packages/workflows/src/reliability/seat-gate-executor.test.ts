@@ -412,4 +412,28 @@ describe('executor seat gate', () => {
     expect(warnings.some(entry => entry.msg === 'workflow.seat_usage_refused')).toBe(false);
     expect(alerts).toHaveLength(0);
   });
+
+  test('Test 2: codex node at limit with allowed=false and credits runs on codex, no node_failover', async () => {
+    // WO-HARNESS-CODEX-CREDITS-HEADROOM-WHEN-WINDOW-EXHAUSTED-01: live 2026-11-04 shape.
+    setSeatUsageReaderForTests(async () => ({
+      claude: reading('claude', 'seven_day', 10),
+      codex: {
+        ...reading('codex', 'primary', 100),
+        limit_reached: true,
+        allowed: false,
+        credits: { has_credits: true, unlimited: false, overage_limit_reached: false },
+      },
+    }));
+    setSeatCutoffOverride(95);
+    const { result, store } = await runWorkflow();
+    expect(result.error ?? '').not.toContain('seat_usage_refused');
+    expect(eventTypes(store)).toContain('workflow_started');
+    const failovers = store.createWorkflowEvent.mock.calls
+      .map(call => call[0] as { event_type: string; data?: { reason_code?: string } })
+      .filter(
+        event =>
+          event.event_type === 'node_failover' && event.data?.reason_code === 'seat_over_cutoff'
+      );
+    expect(failovers).toEqual([]);
+  });
 });

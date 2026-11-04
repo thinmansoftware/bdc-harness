@@ -11,6 +11,7 @@ import {
 } from '@archon/core/db/operator-settings';
 import {
   alertUnknownSeat,
+  codexOnCredits,
   decideSeatGate,
   DEFAULT_SEAT_CUTOFF_PERCENT,
   FUELGLASS_SEAT_CUTOFF_SETTING_KEY,
@@ -1042,3 +1043,49 @@ function measured(
     ...extra,
   };
 }
+
+/**
+ * WO-HARNESS-CODEX-CREDITS-HEADROOM-WHEN-WINDOW-EXHAUSTED-01: purchased codex
+ * credits are headroom whatever allowed and limit_reached say (live proof on
+ * bdc-xo issue 4669: the codex CLI served a request at primary 100 with
+ * allowed=false while credits were available).
+ */
+describe('codexOnCredits predicate', () => {
+  const atLimit = (credits: SeatReading['credits']): SeatReading => ({
+    seat: 'codex',
+    limit_source: 'measured',
+    windows: [{ name: 'primary', used_percent: 100, remaining_percent: 0, resets_at: 'UNKNOWN' }],
+    seven_day: { used_percent: 100, remaining_percent: 0, resets_at: 'UNKNOWN' },
+    gate_windows: ['primary', 'secondary'],
+    note: '',
+    probed_at: '2026-11-04T13:25:05.549Z',
+    endpoint: 'https://example.invalid',
+    limit_reached: true,
+    allowed: false,
+    credits,
+  });
+
+  test('Test 1: allowed=false and limit_reached=true with credits is on credits', () => {
+    expect(
+      codexOnCredits(atLimit({ has_credits: true, unlimited: false, overage_limit_reached: false }))
+    ).toBe(true);
+  });
+
+  test('Test 5: exhausted or blocked credits, or a non-codex seat, are not on credits', () => {
+    expect(
+      codexOnCredits(
+        atLimit({ has_credits: false, unlimited: false, overage_limit_reached: false })
+      )
+    ).toBe(false);
+    expect(
+      codexOnCredits(atLimit({ has_credits: true, unlimited: false, overage_limit_reached: true }))
+    ).toBe(false);
+    expect(codexOnCredits(atLimit(undefined))).toBe(false);
+    expect(
+      codexOnCredits({
+        ...atLimit({ has_credits: true, unlimited: false, overage_limit_reached: false }),
+        seat: 'claude',
+      })
+    ).toBe(false);
+  });
+});
