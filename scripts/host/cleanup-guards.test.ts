@@ -133,7 +133,7 @@ function runPrune(
     }
     // Unrelated tags must never be touched.
     const images = [
-      ...pins.map((p) => `${p.created}|${p.tag}|${p.id}`),
+      ...pins.map(p => `${p.created}|${p.tag}|${p.id}`),
       '2026-11-03 09:00:00 +0000 UTC|archon:latest|sha256:latest',
       '2026-10-01 09:00:00 +0000 UTC|archon-rollback:m12|sha256:oldm12',
     ];
@@ -179,12 +179,36 @@ function runPrune(
 
 // Tag stamps deliberately disagree with creation order, so a sort by tag text fails.
 const SIX: Pin[] = [
-  { tag: 'archon:rollback-20261103-0100', created: '2026-10-28 10:00:00 +0000 UTC', id: 'sha256:aaa1' },
-  { tag: 'archon:rollback-20261102-0100', created: '2026-11-03 10:00:00 +0000 UTC', id: 'sha256:aaa2' },
-  { tag: 'archon:rollback-20261101-0100', created: '2026-10-30 10:00:00 +0000 UTC', id: 'sha256:aaa3' },
-  { tag: 'archon:rollback-20261031-0100', created: '2026-11-02 10:00:00 +0000 UTC', id: 'sha256:aaa4' },
-  { tag: 'archon:rollback-20261030-0100', created: '2026-10-25 10:00:00 +0000 UTC', id: 'sha256:aaa5' },
-  { tag: 'archon:rollback-20261029-0100', created: '2026-11-01 10:00:00 +0000 UTC', id: 'sha256:aaa6' },
+  {
+    tag: 'archon:rollback-20261103-0100',
+    created: '2026-10-28 10:00:00 +0000 UTC',
+    id: 'sha256:aaa1',
+  },
+  {
+    tag: 'archon:rollback-20261102-0100',
+    created: '2026-11-03 10:00:00 +0000 UTC',
+    id: 'sha256:aaa2',
+  },
+  {
+    tag: 'archon:rollback-20261101-0100',
+    created: '2026-10-30 10:00:00 +0000 UTC',
+    id: 'sha256:aaa3',
+  },
+  {
+    tag: 'archon:rollback-20261031-0100',
+    created: '2026-11-02 10:00:00 +0000 UTC',
+    id: 'sha256:aaa4',
+  },
+  {
+    tag: 'archon:rollback-20261030-0100',
+    created: '2026-10-25 10:00:00 +0000 UTC',
+    id: 'sha256:aaa5',
+  },
+  {
+    tag: 'archon:rollback-20261029-0100',
+    created: '2026-11-01 10:00:00 +0000 UTC',
+    id: 'sha256:aaa6',
+  },
 ];
 // By creation time, newest first: aaa2, aaa4, aaa6 (kept); aaa3, aaa1, aaa5 (old).
 const OLDEST_THREE = [
@@ -214,8 +238,12 @@ describe('cauldron-disk-cleanup.sh prune_rollback_pins', () => {
     const r = runPrune(SIX, [], { DRY_RUN: '1' });
     expect(r.status).toBe(0);
     expect(r.rmi).toEqual([]);
-    const planned = r.out.split('\n').filter((l) => l.startsWith('DRY_RUN would remove rollback pin: '));
-    expect(planned.map((l) => l.replace('DRY_RUN would remove rollback pin: ', ''))).toEqual(OLDEST_THREE);
+    const planned = r.out
+      .split('\n')
+      .filter(l => l.startsWith('DRY_RUN would remove rollback pin: '));
+    expect(planned.map(l => l.replace('DRY_RUN would remove rollback pin: ', ''))).toEqual(
+      OLDEST_THREE
+    );
   });
 
   it('fewer_than_keep_is_a_noop', () => {
