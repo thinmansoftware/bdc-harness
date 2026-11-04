@@ -18,6 +18,8 @@ import {
   isManagedSourceClone,
   withSyncedManagedSource,
   setDiscoverySyncLoggerForTest,
+  localStateCounts,
+  resolveDiscoveryBaseBranch,
 } from './dispatch-discovery-sync';
 
 const LANE = 'sync-probe-lane';
@@ -217,3 +219,133 @@ describe('dispatch discovery sync (A2 engages all repos)', () => {
     }
   });
 });
+
+describe('dispatch discovery sync honors worktree.baseBranch (A2 round 2)', () => {
+  let root: string;
+  let origin: string;
+  let seed: string;
+  let clone: string;
+
+  function commitFile(rel: string, content: string, msg: string): void {
+    mkdirSync(join(seed, rel, '..'), { recursive: true });
+    writeFileSync(join(seed, rel), content);
+    git(seed, 'add', '-A');
+    git(seed, 'commit', '-q', '-m', msg);
+  }
+
+  /** origin/HEAD = main; dev is a separate branch; clone of it sits on `onBranch`. */
+  function setup(opts: { devConfig: boolean }): void {
+    root = mkdtempSync(join(tmpdir(), 'dds-base-'));
+    origin = join(root, 'origin.git');
+    seed = join(root, 'seed');
+    execFileSync('git', ['init', '-q', '--bare', '-b', 'main', origin]);
+    execFileSync('git', ['init', '-q', '-b', 'main', seed]);
+    git(seed, 'config', 'user.email', 't@t');
+    git(seed, 'config', 'user.name', 't');
+    commitFile(`.archon/workflows/${LANE}.yaml`, laneYaml('MAIN-1'), 'main lane');
+    git(seed, 'remote', 'add', 'origin', origin);
+    git(seed, 'push', '-q', 'origin', 'main');
+    git(origin, 'symbolic-ref', 'HEAD', 'refs/heads/main');
+    git(seed, 'checkout', '-q', '-b', 'dev');
+    if (opts.devConfig) commitFile('.archon/config.yaml', 'worktree:\n  baseBranch: dev\n', 'cfg');
+    commitFile(`.archon/workflows/${LANE}.yaml`, laneYaml('DEV-1'), 'dev lane 1');
+    git(seed, 'push', '-q', 'origin', 'dev');
+
+    const ws = getArchonWorkspacesPath();
+    mkdirSync(join(ws, 'owner'), { recursive: true });
+    clone = join(ws, 'owner', `repo-b-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    execFileSync('git', ['clone', '-q', origin, clone]);
+  }
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(clone, { recursive: true, force: true });
+  });
+
+  test('origin/HEAD=main with worktree.baseBranch=dev: published dev commits are not unpushed, sync targets dev', async () => {
+    setup({ devConfig: true });
+    git(clone, 'checkout', '-q', '-B', 'dev', 'origin/dev'); // clone builds dev, as configured
+    // origin/dev moves one commit ahead of the clone
+    commitFile(`.archon/workflows/${LANE}.yaml`, laneYaml('DEV-2'), 'dev lane 2');
+    git(seed, 'push', '-q', 'origin', 'dev');
+    const devHead = git(origin, 'rev-parse', 'dev');
+
+    // Safety comparison is against origin/dev: nothing unpushed (against origin/main it would be 2+)
+    const counts = await localStateCounts(clone);
+    expect(counts.branch).toBe('dev');
+    expect(counts.unpushedCommits).toBe(0);
+    expect(countCommits(clone, 'origin/main..HEAD')).toBeGreaterThan(0);
+
+    const cap = captureErrors();
+    try {
+      const result = await syncManagedSourceBeforeDiscovery(clone, clone);
+      expect(result).toBeDefined();
+      expect(result?.branch).toBe('dev');
+      expect(git(clone, 'rev-parse', 'HEAD')).toBe(devHead);
+      expect(git(clone, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('dev');
+      expect(cap.errors.find(e => e.msg.includes('refused_local_state'))).toBeUndefined();
+    } finally {
+      cap.restore();
+    }
+    // discovery reads dev's workflows, not main's
+    const description = await discoveredDescription(clone);
+    expect(description).toContain('DEV-2');
+    expect(description).not.toContain('MAIN-1');
+  });
+
+  test('worktree.baseBranch=dev still refuses a genuinely unpushed local commit on dev', async () => {
+    setup({ devConfig: true });
+    git(clone, 'checkout', '-q', '-B', 'dev', 'origin/dev');
+    git(clone, 'config', 'user.email', 't@t');
+    git(clone, 'config', 'user.name', 't');
+    writeFileSync(join(clone, 'local-only.txt'), 'local work');
+    git(clone, 'add', '-A');
+    git(clone, 'commit', '-q', '-m', 'local only');
+    const headBefore = git(clone, 'rev-parse', 'HEAD');
+    const cap = captureErrors();
+    try {
+      expect(await syncManagedSourceBeforeDiscovery(clone, clone)).toBeUndefined();
+      expect(git(clone, 'rev-parse', 'HEAD')).toBe(headBefore);
+      const refused = cap.errors.find(e => e.msg.includes('refused_local_state'));
+      expect(refused?.unpushedCommits).toBe(1);
+      expect(refused?.branch).toBe('dev');
+    } finally {
+      cap.restore();
+    }
+  });
+
+  test('no baseBranch configured: origin/HEAD (main) is still used', async () => {
+    setup({ devConfig: false });
+    expect(await resolveDiscoveryBaseBranch(clone)).toBe('main');
+    // main advances
+    git(seed, 'checkout', '-q', 'main');
+    commitFile(`.archon/workflows/${LANE}.yaml`, laneYaml('MAIN-2'), 'main lane 2');
+    git(seed, 'push', '-q', 'origin', 'main');
+    const mainHead = git(origin, 'rev-parse', 'main');
+
+    const result = await syncManagedSourceBeforeDiscovery(clone, clone);
+    expect(result?.branch).toBe('main');
+    expect(git(clone, 'rev-parse', 'HEAD')).toBe(mainHead);
+    expect(await discoveredDescription(clone)).toContain('MAIN-2');
+  });
+});
+
+function countCommits(repo: string, range: string): number {
+  const out = git(repo, 'rev-list', range);
+  return out === '' ? 0 : out.split('\n').length;
+}
+
+function captureErrors(): {
+  errors: Array<Record<string, unknown> & { msg: string }>;
+  restore: () => void;
+} {
+  const errors: Array<Record<string, unknown> & { msg: string }> = [];
+  const stub = {
+    error: (obj: Record<string, unknown>, msg: string) => errors.push({ ...obj, msg }),
+    warn: () => undefined,
+    info: () => undefined,
+    debug: () => undefined,
+  };
+  setDiscoverySyncLoggerForTest(stub as never);
+  return { errors, restore: () => setDiscoverySyncLoggerForTest(undefined) };
+}

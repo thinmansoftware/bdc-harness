@@ -15,9 +15,16 @@
  * it is. The reset and the discovery read share one per-clone lock. Failure is
  * non-fatal: discovery proceeds against the local state, as it did before.
  */
-import { syncWorkspace, toRepoPath, execFileAsync, getDefaultBranch } from '@archon/git';
+import {
+  syncWorkspace,
+  toRepoPath,
+  toBranchName,
+  execFileAsync,
+  getDefaultBranch,
+} from '@archon/git';
 import type { WorkspaceSyncResult } from '@archon/git';
 import { createLogger, getArchonWorkspacesPath } from '@archon/paths';
+import { loadRepoConfig } from '../config/config-loader';
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -77,15 +84,29 @@ function countLines(out: string): number {
 }
 
 /**
+ * The branch discovery syncs to and compares against: the repo's configured
+ * `worktree.baseBranch` (the same config path isolation sync uses, see
+ * configureIsolation in orchestrator.ts), else origin/HEAD via getDefaultBranch.
+ * Resolved once per sync so the safety comparison and the reset target never diverge.
+ */
+export async function resolveDiscoveryBaseBranch(repo: string): Promise<string> {
+  const config = await loadRepoConfig(repo);
+  const configured = config?.worktree?.baseBranch?.trim();
+  if (configured) return configured;
+  return getDefaultBranch(toRepoPath(repo));
+}
+
+/**
  * Local state a hard reset would destroy: uncommitted changes (git status --porcelain)
- * or commits not on origin/<default branch>. Throws when the state cannot be read
+ * or commits not on origin/<base branch>. Throws when the state cannot be read
  * (the caller treats that as unsafe and refuses).
  */
 export async function localStateCounts(
-  repo: string
+  repo: string,
+  baseBranch?: string
 ): Promise<{ dirtyEntries: number; unpushedCommits: number; branch: string }> {
   const dirtyEntries = countLines(await gitOut(repo, ['status', '--porcelain']));
-  const branch = await getDefaultBranch(toRepoPath(repo));
+  const branch = baseBranch ?? (await resolveDiscoveryBaseBranch(repo));
   const unpushedCommits = countLines(await gitOut(repo, ['rev-list', `origin/${branch}..HEAD`]));
   return { dirtyEntries, unpushedCommits, branch };
 }
@@ -104,8 +125,10 @@ export async function syncManagedSourceBeforeDiscovery(
 ): Promise<WorkspaceSyncResult | undefined> {
   if (!defaultCwd || norm(workflowCwd) !== norm(defaultCwd)) return undefined;
   if (!isManagedSourceClone(defaultCwd)) return undefined;
+  let baseBranch: string;
   try {
-    const counts = await localStateCounts(defaultCwd);
+    baseBranch = await resolveDiscoveryBaseBranch(defaultCwd);
+    const counts = await localStateCounts(defaultCwd, baseBranch);
     if (counts.dirtyEntries > 0 || counts.unpushedCommits > 0) {
       getLog().error(
         { repoPath: defaultCwd, ...counts },
@@ -121,7 +144,7 @@ export async function syncManagedSourceBeforeDiscovery(
     return undefined;
   }
   try {
-    const result = await syncWorkspace(toRepoPath(defaultCwd), undefined, {
+    const result = await syncWorkspace(toRepoPath(defaultCwd), toBranchName(baseBranch), {
       resetAfterFetch: true,
     });
     getLog().debug({ repoPath: defaultCwd, ...result }, 'discovery_sync.completed');
