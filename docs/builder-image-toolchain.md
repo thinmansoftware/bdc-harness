@@ -96,7 +96,8 @@ stamp-manifest-evidence, and makes one call in each node:
   test command is on an allowlist, run from the repo root: bun run <script>, bun test
   [paths], npm test, npm run <script>, pnpm test, pnpm run <script>, node --test [paths],
   yarn test, yarn <script> (<script> is [A-Za-z0-9:_-]+; paths are relative with no ..
-  segment; only --flag or --flag=value flags; no cd, &&, ||, ;, |, redirects, $,
+  segment; no flags at all, since a token like --cwd=.. or -C .. can leave the base
+  checkout; no cd, &&, ||, ;, |, redirects, $,
   backticks, env assignments or absolute paths). Any other command keeps the result
   failed as command_not_comparable, and no base worktree is created. It always appends TESTS_BASE_COMPARE=<outcome>
   (not_failed, base_red, newly_broken, base_passed, unparsed, no_base_sha, no_counts,

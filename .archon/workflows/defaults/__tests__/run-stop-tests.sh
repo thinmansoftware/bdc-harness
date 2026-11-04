@@ -1501,7 +1501,7 @@ echo "--- Test 10: command_allowlist_fail_closed ---"
 # repro (a relative cd that climbs back into the head checkout) and every other shape
 # outside the allowlist stay failed as command_not_comparable, before any git work.
 stb_cmp() { if stb_command_comparable "$1"; then echo yes; else echo no; fi; }
-for c in 'bun run test' 'bun run test:unit' 'bun test' 'bun test src/a.test.ts packages/x' 'bun test --timeout=30000 src' \
+for c in 'bun run test' 'bun run test:unit' 'bun test' 'bun test src/a.test.ts packages/x' \
          'npm test' 'npm run lint:ci' 'pnpm test' 'pnpm run test' 'node --test' 'node --test tests/a.test.js' \
          'yarn test' 'yarn test:ci'; do
   assert_eq "Test 10 command_allowlist_fail_closed: comparable: $c" "yes" "$(stb_cmp "$c")"
@@ -1511,7 +1511,9 @@ for c in 'cd ../../../../../../tmp/fixture/./repo && bash ./run.sh' 'cd /tmp/x &
          'bun run test > out.txt' 'bun run $(echo test)' 'bun run `echo test`' 'FOO=1 bun run test' 'bash ./run.sh' \
          'bun test /abs/a.test.ts' 'bun test ../other/a.test.ts' 'bun test src/../../x' 'bun test C:/x.test.ts' \
          'bun test ~/x.test.ts' 'npm test -- --grep x' 'npm run' 'npx vitest run' 'node tests/a.js' 'pytest' \
-         'npm test --reporter=$X' 'yarn' 'bun test -t name'; do
+         'npm test --reporter=$X' 'yarn' 'bun test -t name' 'bun test --timeout=30000 src' \
+         'bun test --cwd=.. repo' 'npm test -- --prefix ..' 'pnpm -C .. test' 'bun run --cwd .. test' \
+         'yarn --version' 'bun run -x' 'npm run --silent test' 'node --test --test-reporter=tap'; do
   assert_eq "Test 10 command_allowlist_fail_closed: not comparable: $c" "no" "$(stb_cmp "$c")"
 done
 # Round 3's exact shape, end to end: base passes A, head fails A. The relative cd
@@ -1533,6 +1535,31 @@ STB_CMDS='bun run test\n' stb_head "$STB_ROOT/t10/repo" "$STB_ROOT/t10/art"
 T10B_OUT="$(cd "$STB_ROOT/t10/repo" && STB_MARK="$STB_ROOT/t10/mark" ARTIFACTS_DIR="$STB_ROOT/t10/art" rst_base_compare "$STB_ROOT/t10/art/report" "$STB_ROOT/t10/art/cmds" "$STB_ROOT/t10/art/head.log" "$STB_COUNTS" 2>/dev/null)"
 assert_eq "Test 10 command_allowlist_fail_closed: bun run test is compared (base_passed)" "failed base_passed" "$(stb_field TESTS_STATUS "$T10B_OUT") $(stb_field TESTS_BASE_COMPARE "$T10B_OUT")"
 assert_eq "Test 10 command_allowlist_fail_closed: bun run test ran base code" "yes" "$([ -f "$STB_ROOT/t10/mark" ] && echo yes || echo no)"
+
+# Overseer round 4's exact repro, end to end with real bun test: the head checkout
+# and the base worktree are siblings under one parent (ARTIFACTS_DIR is the parent),
+# so from the base worktree "bun test --cwd=.. repo" climbs out and runs the head
+# checkout's tests. Base passes A, head fails A. Flags are never comparable.
+if command -v bun >/dev/null 2>&1; then
+  T10R4="$STB_ROOT/t10r4"
+  mkdir -p "$T10R4/repo"
+  (
+    cd "$T10R4/repo" && git init -q . && git config user.email t@t && git config user.name t && git config core.autocrlf false
+    printf '%s\n' 'import { test, expect } from "bun:test";' 'import { existsSync } from "fs";' \
+      'test("A", () => { expect(existsSync(import.meta.dir + "/fail-a")).toBe(false); });' \
+      'test("B", () => { expect(true).toBe(true); });' > s.test.ts
+    git add -A && git commit -q -m base && git rev-parse HEAD > ../run-start-sha.txt
+    : > fail-a && git add -A && git commit -q -m head
+  )
+  STB_CMDS='bun test --cwd=.. repo\n' stb_head "$T10R4/repo" "$T10R4"
+  assert_eq "Test 10 command_allowlist_fail_closed: round-4 repro is a runnable head command that failed" "failed" "$(stb_field TESTS_STATUS "$(cat "$T10R4/report")")"
+  T10R4_OUT="$(cd "$T10R4/repo" && ARTIFACTS_DIR="$T10R4" rst_base_compare "$T10R4/report" "$T10R4/cmds" "$T10R4/head.log" "$STB_COUNTS" 2>/dev/null)"
+  assert_eq "Test 10 command_allowlist_fail_closed: round-4 repro -> failed command_not_comparable" "failed command_not_comparable" "$(stb_field TESTS_STATUS "$T10R4_OUT") $(stb_field TESTS_BASE_COMPARE "$T10R4_OUT")"
+  assert_eq "Test 10 command_allowlist_fail_closed: round-4 repro created no base worktree" "1 0" "$(stb_wt_count "$T10R4/repo") $(stb_leftover "$T10R4")"
+  assert_eq "Test 10 command_allowlist_fail_closed: round-4 repro wrote no base-red-tests.txt" "no" "$([ -e "$T10R4/base-red-tests.txt" ] && echo yes || echo no)"
+else
+  FAIL=$((FAIL + 1)); echo "FAIL: Test 10 command_allowlist_fail_closed: bun not on PATH, round-4 repro could not run"
+fi
 
 echo "--- Test 7: all_lanes_call_shared_script ---"
 STB_CALL='rst_base_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS"'

@@ -168,8 +168,9 @@ stb__base_identities() {
 #     bun run <script> | bun test [paths]   npm test | npm run <script>
 #     pnpm test | pnpm run <script>         node --test [paths]
 #     yarn test | yarn <script>
-#   <script> is [A-Za-z0-9:_-]+. A path is [A-Za-z0-9._/-]+ with no ".." segment and
-#   no leading "/". Flags are --[a-z-]+ with an optional =[A-Za-z0-9._-]+ value.
+#   <script> is [A-Za-z0-9_][A-Za-z0-9:_-]*. A path is [A-Za-z0-9._/-]+ with no ".." segment and
+#   no leading "/". No flags at all: any token starting with "-" (--cwd=.., -C ..,
+#   --prefix ..) could move the run out of the base checkout.
 #   Nothing else: no cd, no && || ; |, no redirects, no $ or backticks, no env
 #   assignments, no absolute paths.
 stb_command_comparable() {
@@ -182,15 +183,14 @@ stb_command_comparable() {
     "bun run"|"npm run"|"pnpm run") form="script"; shift 2 ;;
     "bun test"|"node --test") form="paths"; shift 2 ;;
     "npm test"|"pnpm test"|"yarn test") form="none"; shift 2 ;;
-    yarn\ *) form="none"; printf '%s' "${2:-}" | grep -qE '^[A-Za-z0-9:_-]+$' || return 1; shift 2 ;;
+    yarn\ *) form="none"; printf '%s' "${2:-}" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9:_-]*$' || return 1; shift 2 ;;
     *) return 1 ;;
   esac
   if [ "$form" = "script" ]; then
-    printf '%s' "${1:-}" | grep -qE '^[A-Za-z0-9:_-]+$' || return 1
+    printf '%s' "${1:-}" | grep -qE '^[A-Za-z0-9_][A-Za-z0-9:_-]*$' || return 1
     shift
   fi
   for arg in "$@"; do
-    if printf '%s' "$arg" | grep -qE '^--[a-z-]+(=[A-Za-z0-9._-]+)?$'; then continue; fi
     [ "$form" = "paths" ] || return 1
     printf '%s' "$arg" | grep -qE '^[A-Za-z0-9._][A-Za-z0-9._/-]*$' || return 1
     case "/$arg/" in */../*) return 1 ;; esac
