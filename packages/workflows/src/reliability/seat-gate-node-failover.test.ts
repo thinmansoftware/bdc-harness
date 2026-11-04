@@ -5,6 +5,7 @@
  * cap; the refusal stays only when no provider has room.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { execFileSync } from 'child_process';
 import { readFileSync } from 'fs';
 import { mkdir, mkdtemp, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
@@ -36,7 +37,11 @@ import {
   unknownSeatReading,
   type SeatReading,
 } from './seat-usage';
-import { selectSeatNodeFailover } from './seat-node-failover';
+import {
+  DEFAULT_CLAUDE_FAILOVER_MODEL,
+  REVIEW_FAILOVER_CLAUDE_REFUSED_D0,
+  selectSeatNodeFailover,
+} from './seat-node-failover';
 import type { ModelOverride } from '../model-override';
 
 const LANE = 'stub-reroute-lane';
@@ -112,7 +117,7 @@ function makeStore(): IWorkflowStore & {
     updateWorkflowRun: mock(async () => {}),
     failWorkflowRun: mock(async () => {}),
     getWorkflowRun: mock(async () => makeRun()),
-    getWorkflowRunStatus: mock(async () => 'pending' as const),
+    getWorkflowRunStatus: mock(async () => 'running' as const),
     createWorkflowEvent: mock(async () => {}),
     listProviderAttempts: mock(async () => []),
     createProviderAttempt: mock(async () => true),
@@ -217,13 +222,23 @@ function stubLane(laneProvider: string, nodes: DagNode[]): WorkflowDefinition {
 
 async function run(
   wf: WorkflowDefinition,
-  options: { modelOverride?: ModelOverride; personaFiles?: Record<string, string> } = {}
+  options: {
+    modelOverride?: ModelOverride;
+    personaFiles?: Record<string, string>;
+    assistants?: Record<string, { model?: string }>;
+    /** Make cwd a git repo with this origin remote (OpenRouter review fence identity). */
+    gitRemote?: string;
+  } = {}
 ): Promise<{
   result: Awaited<ReturnType<typeof executeWorkflow>>;
   store: ReturnType<typeof makeStore>;
 }> {
   const store = makeStore();
   const cwd = await mkdtemp(join(tmpdir(), 'seat-node-failover-'));
+  if (options.gitRemote !== undefined) {
+    execFileSync('git', ['-C', cwd, 'init', '-q']);
+    execFileSync('git', ['-C', cwd, 'remote', 'add', 'origin', options.gitRemote]);
+  }
   for (const [name, body] of Object.entries(options.personaFiles ?? {})) {
     await mkdir(join(cwd, '.archon', 'agents'), { recursive: true });
     await writeFile(join(cwd, '.archon', 'agents', name), body);
@@ -233,7 +248,12 @@ async function run(
     loadConfig: async (): Promise<WorkflowConfig> =>
       ({
         assistant: 'codex',
-        assistants: { claude: { model: 'sonnet' }, codex: {}, cursor: {}, 'lane-stub': {} },
+        assistants: options.assistants ?? {
+          claude: { model: 'sonnet' },
+          codex: {},
+          cursor: {},
+          'lane-stub': {},
+        },
         commands: { folder: '' },
         baseBranch: 'dev',
       }) as WorkflowConfig,
@@ -252,13 +272,12 @@ async function run(
     wf,
     'hello',
     'db-conv-1',
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    makeRun(),
-    undefined,
+    undefined, // codebaseId
+    undefined, // issueContext
+    undefined, // isolationContext
+    undefined, // parentConversationId
+    makeRun(), // preCreatedRun
+    undefined, // authoritySource
     options.modelOverride
   );
   return { result, store };
@@ -608,5 +627,306 @@ describe('codex reviewer nodes at limit with credits', () => {
     ).toEqual([]);
     expect(dispatched).toContain('codex-native-strict');
     expect(dispatched).not.toContain('claude');
+  });
+});
+
+/**
+ * WO-HARNESS-PERSONA-MODEL-DECLARED-01. Board decision D0 (M-20261021c): a
+ * review node never reroutes to Claude. A NON-review node rerouted to Claude
+ * always runs on an allowed Claude model.
+ */
+const MODEL_LESS_PERSONA = [
+  '---',
+  'name: model-less-persona',
+  'tools: [Read, Grep]',
+  'description: persona with no model pin, like captain-ci-validator-codex',
+  '---',
+  '',
+  'MODEL-LESS-PERSONA-INSTRUCTIONS',
+  '',
+].join(LF);
+
+const OPR_REVIEWER_PERSONA = [
+  '---',
+  'name: opr-adversarial-reviewer',
+  'description: stub of the shipped openrouter review persona',
+  '---',
+  '',
+  'OPR-REVIEWER-INSTRUCTIONS',
+  '',
+].join(LF);
+
+const MODEL_DECLARE_ERROR = "Claude persona 'model-less-persona' must declare a 'model:'";
+
+/** Assistants config with NO claude model, like the live config.yaml. */
+const NO_CLAUDE_MODEL = { claude: {}, codex: {}, cursor: {}, 'lane-stub': {} };
+
+function codexNode(id: string, extra: Record<string, unknown> = {}): DagNode {
+  return { id, prompt: `review-${id}`, provider: 'codex', ...extra } as DagNode;
+}
+
+function registerOpenRouterStub(): void {
+  registerProvider({
+    id: 'openrouter',
+    displayName: 'openrouter',
+    factory: provider,
+    capabilities: getProviderCapabilities('codex'),
+    builtIn: false,
+  });
+}
+
+describe('review seats never fall back to claude (D0)', () => {
+  test('review_to_claude_fails_closed', async () => {
+    // Codex over the cutoff, claude with headroom, cursor over the cutoff: the only
+    // admissible target is claude, which D0 bars for a review node.
+    setSeatUsageReaderForTests(async () => ({
+      claude: reading('claude', 'seven_day', 10),
+      codex: reading('codex', 'primary', 96),
+      cursor: reading('cursor', 'monthly', 96),
+    }));
+    const detail =
+      `seat_usage_refused:codex:primary:96:90:lane=${LANE}:role=node` +
+      `:reason=${REVIEW_FAILOVER_CLAUDE_REFUSED_D0}:node=diff-review`;
+    const cases: Record<string, DagNode> = {
+      'A no declared failover': codexNode('diff-review'),
+      'B declared claude failover': codexNode('diff-review', {
+        failover_provider: 'claude',
+        failover_model: 'claude-sonnet-5-5',
+      }),
+    };
+    for (const [label, node] of Object.entries(cases)) {
+      invocations.length = 0;
+      const { result, store } = await run(stubLane('lane-stub', [node]));
+      expect({ label, success: result.success, error: result.error }).toEqual({
+        label,
+        success: false,
+        error: detail,
+      });
+      expect(events(store, 'node_failover')).toEqual([]);
+      const failed = events(store, 'dag_workflow_failed').find(
+        event => event.data.reason === 'seat_usage_refused'
+      );
+      expect(failed?.data).toEqual({
+        reason: 'seat_usage_refused',
+        detail,
+        lane: LANE,
+        role: 'node',
+        reason_code: REVIEW_FAILOVER_CLAUDE_REFUSED_D0,
+        review_node_id: 'diff-review',
+      });
+      // Never dispatched on claude.
+      expect(invocations.filter(call => call.provider === 'claude')).toEqual([]);
+      // The selector itself never returns claude for a review node, even when
+      // claude is the only provider with headroom, or is declared.
+      expect(
+        selectSeatNodeFailover({
+          node,
+          currentProvider: 'codex',
+          hasHeadroom: id => id === 'claude',
+        })
+      ).toBeNull();
+      expect(
+        selectSeatNodeFailover({
+          node,
+          currentProvider: 'codex',
+          workflowFailoverProvider: 'claude',
+          hasHeadroom: () => true,
+        })
+      ).toBe('cursor');
+    }
+  });
+
+  test('review_declared_non_claude_failover_still_routes', async () => {
+    registerOpenRouterStub();
+    setSeatUsageReaderForTests(async () => ({
+      claude: reading('claude', 'seven_day', 10),
+      codex: reading('codex', 'primary', 96),
+      cursor: reading('cursor', 'monthly', 96),
+    }));
+    const node = codexNode('diff-review', {
+      agent: 'model-less-persona',
+      failover_provider: 'openrouter',
+      failover_model: 'moonshotai/kimi-k3.1-pro',
+      failover_agent: 'opr-adversarial-reviewer',
+    });
+    const { result, store } = await run(stubLane('lane-stub', [node]), {
+      assistants: NO_CLAUDE_MODEL,
+      personaFiles: {
+        'model-less-persona.md': MODEL_LESS_PERSONA,
+        'opr-adversarial-reviewer.md': OPR_REVIEWER_PERSONA,
+      },
+      // A non-customer repo: the OpenRouter review fence does not apply, so the
+      // dispatch stays on the declared openrouter route.
+      gitRemote: 'https://github.com/example/not-a-customer-repo.git',
+    });
+    expect(result.error ?? '').not.toContain('seat_usage_refused');
+    const failovers = events(store, 'node_failover');
+    expect(failovers.map(event => event.data)).toEqual([
+      {
+        node_id: 'diff-review',
+        from_provider: 'codex',
+        to_provider: 'openrouter',
+        reason_code: 'seat_over_cutoff',
+      },
+    ]);
+    const review = invocations.filter(call => call.prompt === 'review-diff-review');
+    expect(review.map(call => [call.provider, call.model])).toEqual([
+      ['openrouter', 'moonshotai/kimi-k3.1-pro'],
+    ]);
+    expect(review[0]?.systemPrompt ?? '').toContain('OPR-REVIEWER-INSTRUCTIONS');
+    expect(invocations.filter(call => call.provider === 'claude')).toEqual([]);
+  });
+
+  test('non_review_claude_reroute_gets_default_model', async () => {
+    setSeatUsageReaderForTests(async () => ({
+      claude: reading('claude', 'seven_day', 10),
+      codex: reading('codex', 'primary', 96),
+      cursor: reading('cursor', 'monthly', 96),
+    }));
+    const personaFiles = { 'model-less-persona.md': MODEL_LESS_PERSONA };
+    const cases: Array<{
+      label: string;
+      node: DagNode;
+      assistants: Record<string, { model?: string }>;
+      model: string;
+    }> = [
+      {
+        label: 'A no failover_model, no assistants.claude.model',
+        node: codexNode('plan', { agent: 'model-less-persona' }),
+        assistants: NO_CLAUDE_MODEL,
+        model: DEFAULT_CLAUDE_FAILOVER_MODEL,
+      },
+      {
+        label: 'B declared failover_model wins',
+        node: codexNode('plan', {
+          agent: 'model-less-persona',
+          failover_provider: 'claude',
+          failover_model: 'claude-haiku-5-5',
+        }),
+        assistants: NO_CLAUDE_MODEL,
+        model: 'claude-haiku-5-5',
+      },
+      {
+        label: 'C configured assistants.claude.model wins',
+        node: codexNode('plan', { agent: 'model-less-persona' }),
+        assistants: { ...NO_CLAUDE_MODEL, claude: { model: 'opus' } },
+        model: 'opus',
+      },
+    ];
+    // The default claude lane's model (bdc-feature-development.yaml line 21).
+    expect(DEFAULT_CLAUDE_FAILOVER_MODEL).toBe('claude-sonnet-5-5');
+    for (const entry of cases) {
+      invocations.length = 0;
+      const { result, store } = await run(stubLane('lane-stub', [entry.node]), {
+        assistants: entry.assistants,
+        personaFiles,
+      });
+      expect(result.error ?? '').not.toContain(MODEL_DECLARE_ERROR);
+      expect(result.error ?? '').not.toContain('seat_usage_refused');
+      expect(events(store, 'node_failover').map(event => event.data)).toEqual([
+        {
+          node_id: 'plan',
+          from_provider: 'codex',
+          to_provider: 'claude',
+          reason_code: 'seat_over_cutoff',
+        },
+      ]);
+      const plan = invocations.filter(call => call.prompt === 'review-plan');
+      expect({ label: entry.label, calls: plan.map(call => [call.provider, call.model]) }).toEqual({
+        label: entry.label,
+        calls: [['claude', entry.model]],
+      });
+      expect(plan[0]?.systemPrompt ?? '').toContain('MODEL-LESS-PERSONA-INSTRUCTIONS');
+    }
+
+    // A reroute to a non-claude provider keeps today's model choice (no claude default).
+    invocations.length = 0;
+    setSeatUsageReaderForTests(async () => ({
+      claude: reading('claude', 'seven_day', 96),
+      codex: reading('codex', 'primary', 96),
+      cursor: reading('cursor', 'monthly', 10),
+    }));
+    const { store } = await run(stubLane('lane-stub', [codexNode('plan')]), {
+      assistants: NO_CLAUDE_MODEL,
+    });
+    expect(events(store, 'node_failover')[0]?.data.to_provider).toBe('cursor');
+    const plan = invocations.filter(call => call.prompt === 'review-plan');
+    expect(plan.map(call => [call.provider, call.model])).toEqual([['cursor', undefined]]);
+  });
+
+  test('rerouted_non_review_persona_resolves_a_model_in_both_dispatch_paths', async () => {
+    // No seat is over the cutoff: the per-node override { provider: 'claude' } with
+    // no model reaches the persona binding in dag-executor directly (DAG path and
+    // loop path), with an assistants config that has no claude model.
+    setSeatUsageReaderForTests(async () => ({
+      claude: reading('claude', 'seven_day', 10),
+      codex: reading('codex', 'primary', 10),
+      cursor: reading('cursor', 'monthly', 10),
+    }));
+    const personaFiles = { 'model-less-persona.md': MODEL_LESS_PERSONA };
+    const dagNode = codexNode('plan', { agent: 'model-less-persona' });
+    const loopNode = {
+      id: 'implement',
+      provider: 'codex',
+      agent: 'model-less-persona',
+      loop: { prompt: 'review-loop-implement', until: 'LOOP_DONE', max_iterations: 1 },
+    } as unknown as DagNode;
+    const modelOverride: ModelOverride = {
+      nodes: { plan: { provider: 'claude' }, implement: { provider: 'claude' } },
+    };
+    const { result } = await run(stubLane('lane-stub', [dagNode, loopNode]), {
+      assistants: NO_CLAUDE_MODEL,
+      personaFiles,
+      modelOverride,
+    });
+    expect(result.error ?? '').not.toContain(MODEL_DECLARE_ERROR);
+    const dag = invocations.filter(call => call.prompt === 'review-plan');
+    expect(dag.map(call => [call.provider, call.model])).toEqual([
+      ['claude', DEFAULT_CLAUDE_FAILOVER_MODEL],
+    ]);
+    const loop = invocations.filter(call => call.prompt.startsWith('review-loop-implement'));
+    expect(loop.length).toBeGreaterThan(0);
+    for (const call of loop) {
+      expect([call.provider, call.model]).toEqual(['claude', DEFAULT_CLAUDE_FAILOVER_MODEL]);
+    }
+
+    // A REVIEW node with the same input gets no default: it still fails closed.
+    invocations.length = 0;
+    const review = await run(
+      stubLane('lane-stub', [codexNode('diff-review', { agent: 'model-less-persona' })]),
+      {
+        assistants: NO_CLAUDE_MODEL,
+        personaFiles,
+        modelOverride: { nodes: { 'diff-review': { provider: 'claude' } } },
+      }
+    );
+    expect(invocations.filter(call => call.provider === 'claude')).toEqual([]);
+    const failed = review.store.createWorkflowEvent.mock.calls
+      .map(call => JSON.stringify(call[0]))
+      .join(' ');
+    expect(`${review.result.error ?? ''} ${failed}`).toContain(MODEL_DECLARE_ERROR);
+  });
+
+  test('non_rerouted_claude_node_with_model_less_persona_still_fails_closed', async () => {
+    setSeatUsageReaderForTests(async () => ({
+      claude: reading('claude', 'seven_day', 10),
+      codex: reading('codex', 'primary', 10),
+    }));
+    const node = {
+      id: 'plan',
+      prompt: 'review-plan',
+      provider: 'claude',
+      agent: 'model-less-persona',
+    } as DagNode;
+    const { result, store } = await run(stubLane('lane-stub', [node]), {
+      assistants: NO_CLAUDE_MODEL,
+      personaFiles: { 'model-less-persona.md': MODEL_LESS_PERSONA },
+    });
+    expect(events(store, 'node_failover')).toEqual([]);
+    expect(invocations.filter(call => call.provider === 'claude')).toEqual([]);
+    const failed = store.createWorkflowEvent.mock.calls
+      .map(call => JSON.stringify(call[0]))
+      .join(' ');
+    expect(`${result.error ?? ''} ${failed}`).toContain(MODEL_DECLARE_ERROR);
   });
 });

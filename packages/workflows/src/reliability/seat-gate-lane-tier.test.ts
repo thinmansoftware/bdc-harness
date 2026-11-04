@@ -8,7 +8,12 @@ import { readFileSync } from 'fs';
 import { mkdtemp } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { clearRegistry, registerBuiltinProviders } from '@archon/providers';
+import {
+  clearRegistry,
+  getRegisteredProviders,
+  registerBuiltinProviders,
+  registerProvider,
+} from '@archon/providers';
 import { registerGrokAgentProvider } from '@archon/providers/community/grok';
 import type { IAgentProvider, MessageChunk } from '@archon/providers/types';
 import { rootLogger } from '@archon/paths';
@@ -121,7 +126,10 @@ function stubLane(withFailover: boolean): WorkflowDefinition {
     prompt: 'review',
     provider: 'codex-native-strict',
     model: 'gpt-5.6-terra',
-    ...(withFailover ? { failover_provider: 'claude', failover_model: 'sonnet' } : {}),
+    // The shipped lanes' review failover (D0: never Claude).
+    ...(withFailover
+      ? { failover_provider: 'openrouter', failover_model: 'moonshotai/kimi-k3.1-pro' }
+      : {}),
   } as DagNode;
   return {
     name: LANE,
@@ -212,6 +220,8 @@ afterEach(() => {
 
 describe('seat gate honors the fired lane tier', () => {
   test('claude_lane_dispatches_when_only_reviewer_node_seat_is_over_cutoff', async () => {
+    // openrouter (the shipped review failover target) registers with the grok agent.
+    registerGrokAgentProvider();
     setSeatUsageReaderForTests(async () => ({
       claude: reading('claude', 'seven_day', 30),
       codex: reading('codex', 'primary', 96),
@@ -222,7 +232,7 @@ describe('seat gate honors the fired lane tier', () => {
     const degraded = warnings.find(entry => entry.msg === 'workflow.seat_usage_node_degraded');
     expect(degraded?.obj.seat).toBe('codex');
     expect(degraded?.obj.nodeIds).toEqual(['diff-review']);
-    expect(degraded?.obj.failoverProviders).toEqual(['claude']);
+    expect(degraded?.obj.failoverProviders).toEqual(['openrouter']);
     expect(degraded?.obj.usedPercent).toBe(96);
     expect(degraded?.obj.lane).toBe(LANE);
   });
@@ -245,27 +255,38 @@ describe('seat gate honors the fired lane tier', () => {
     expect(log?.obj.seat).toBe('claude');
   });
 
-  test('node_seat_over_cutoff_without_failover_reroutes_to_a_provider_with_headroom', async () => {
-    // WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01: claude (the lane seat) has room,
-    // so the undeclared codex reviewer node is rerouted instead of refusing the run.
-    // The role=node refusal where no provider has room is covered in
-    // seat-gate-node-failover.test.ts and by the decideSeatGate unit tests below.
+  test('node_seat_over_cutoff_without_failover_refuses_review_node_instead_of_claude', async () => {
+    // WO-HARNESS-PERSONA-MODEL-DECLARED-01 (D0): claude (the lane seat) has room, but
+    // diff-review is a review node, so it must NOT be rerouted to claude. With only
+    // claude and codex-native-strict registered there is no other route, so the run
+    // fails closed and names D0. (Before this WO the node was rerouted to claude.)
+    const keep = getRegisteredProviders().filter(
+      entry => entry.id === 'claude' || entry.id === 'codex-native-strict'
+    );
+    clearRegistry();
+    for (const entry of keep) registerProvider(entry);
     setSeatUsageReaderForTests(async () => ({
       claude: reading('claude', 'seven_day', 30),
       codex: reading('codex', 'primary', 96),
     }));
     const { result, store } = await run(stubLane(false));
-    expect(result.error ?? '').not.toContain('seat_usage_refused');
-    expect(failedEvents(store).some(data => data.reason === 'seat_usage_refused')).toBe(false);
+    const detail =
+      'seat_usage_refused:codex:primary:96:90:lane=stub-claude-lane:role=node' +
+      ':reason=review_failover_claude_refused_d0:node=diff-review';
+    expect(result.success).toBe(false);
+    expect(result.error).toBe(detail);
     const rerouted = store.createWorkflowEvent.mock.calls
-      .map(
-        call => call[0] as { event_type: string; step_name?: string; data: Record<string, string> }
-      )
+      .map(call => call[0] as { event_type: string })
       .filter(event => event.event_type === 'node_failover');
-    expect(rerouted).toHaveLength(1);
-    expect(rerouted[0]?.step_name).toBe('diff-review');
-    expect(rerouted[0]?.data.to_provider).toBe('claude');
-    expect(rerouted[0]?.data.reason_code).toBe('seat_over_cutoff');
+    expect(rerouted).toEqual([]);
+    expect(failedEvents(store).find(data => data.reason === 'seat_usage_refused')).toEqual({
+      reason: 'seat_usage_refused',
+      detail,
+      lane: LANE,
+      role: 'node',
+      reason_code: 'review_failover_claude_refused_d0',
+      review_node_id: 'diff-review',
+    });
   });
 
   test('node seat refuses when the failover target seat is itself over the cutoff', () => {
@@ -285,6 +306,8 @@ describe('seat gate honors the fired lane tier', () => {
         ],
       }
     );
+    // diff-review is a review node: its declared claude failover is never honored
+    // (D0), so the refusal also names the D0 reason and the node.
     expect(decision).toEqual({
       refused: true,
       seat: 'codex',
@@ -293,6 +316,8 @@ describe('seat gate honors the fired lane tier', () => {
       cutoffPercent: 90,
       unknownSeats: [],
       role: 'node',
+      reason: 'review_failover_claude_refused_d0',
+      reviewNodeId: 'diff-review',
     });
   });
 
@@ -601,7 +626,9 @@ describe('codex at limit with credits (allowed=false)', () => {
         codex,
       };
       const bindings = [{ providerId: 'cursor' }, { providerId: 'codex-native-strict' }];
-      const degraded = decideSeatGate(bindings, readings, 95, cursorLaneScope('claude'));
+      // D0 (WO-HARNESS-PERSONA-MODEL-DECLARED-01): diff-review is a review node, so its
+      // degrade route is the shipped openrouter (Kimi) failover, never claude.
+      const degraded = decideSeatGate(bindings, readings, 95, cursorLaneScope('openrouter'));
       expect(degraded.refused).toBe(false);
       if (!degraded.refused) {
         expect(degraded.onCredits).toBeUndefined();
