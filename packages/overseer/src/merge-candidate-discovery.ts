@@ -57,6 +57,11 @@ import {
   unattendedBasesForRepo,
   warnLegacyMergePolicy,
 } from './merge-repo-policy';
+import {
+  resolveRequiredContexts,
+  type RequiredContextsResolution,
+} from './adapters/required-contexts';
+import { partitionBlockingRequiredContexts } from './required-context-gate';
 import type {
   DiscoveredPullRequest,
   MergeCandidateDiscoveryDeps,
@@ -436,21 +441,87 @@ export function classifyDiscoveredPullRequest(
  * Classify the check/mergeability half, which needs the full evidence fetch.
  * Split from the cheap predicates above so a PR that is already excluded on
  * structural grounds costs no extra API call.
+ *
+ * `requiredContexts` is the base branch's required-context resolution, judged
+ * the same way the merge bridge judges it. When it is known and non-empty, only
+ * those contexts decide checks_failing and checks_pending: a red or slow
+ * non-required check no longer keeps the PR out, and a required context
+ * missing from the head counts as pending. When it is absent, unknown,
+ * exhausted, or authoritatively empty, every reported check counts.
  */
 export function classifyPullRequestEvidence(
-  evidence: PullRequestEvidence
+  evidence: PullRequestEvidence,
+  requiredContexts?: RequiredContextsResolution
 ): MergeCandidateExclusionReason | null {
   if (evidence.lookupFailed || !evidence.exists) return 'evidence_lookup_failed';
   if (evidence.state.toLowerCase() !== 'open') return 'not_open';
   if (evidence.checks.total === 0) return 'checks_absent';
-  if (evidence.checks.failed > 0) return 'checks_failing';
-  if (evidence.checks.pending > 0) return 'checks_pending';
+  if (requiredContexts?.state === 'known' && requiredContexts.contexts.length > 0) {
+    const blocking = partitionBlockingRequiredContexts(
+      requiredContexts.contexts,
+      evidence.checkRuns ?? [],
+      evidence.commitStatuses ?? []
+    );
+    if (blocking.failing.length > 0) return 'checks_failing';
+    if (blocking.pending.length > 0) return 'checks_pending';
+  } else {
+    if (evidence.checks.failed > 0) return 'checks_failing';
+    if (evidence.checks.pending > 0) return 'checks_pending';
+  }
   // GitHub computes mergeable asynchronously: `null` is "still computing", NOT
   // "unmergeable". Reporting them under one reason is how a transient state got
   // read as a permanent verdict before (see createRealFindPullRequest).
   if (evidence.mergeable === null || evidence.mergeable === undefined) return 'mergeable_unknown';
   if (!evidence.mergeable) return 'not_mergeable';
   return null;
+}
+
+/**
+ * Resolve the base branch's required contexts exactly as the merge bridge does:
+ * the injected lookups with the process env, or an empty env when no lookups
+ * are wired. An unknown or exhausted result is logged under the bridge's
+ * fallback line, and the caller keeps the all-checks rule.
+ */
+async function resolveDiscoveryRequiredContexts(
+  deps: MergeCandidateDiscoveryDeps,
+  pr: DiscoveredPullRequest,
+  logger: DiscoveryLogger
+): Promise<RequiredContextsResolution> {
+  const lookups = deps.requiredContextsLookups;
+  let resolution: RequiredContextsResolution;
+  try {
+    resolution = await resolveRequiredContexts(
+      {
+        ...(lookups ?? {}),
+        owner: pr.owner,
+        repo: pr.repo,
+        baseRef: pr.baseRef,
+        headSha: pr.headSha,
+      },
+      lookups ? process.env : {}
+    );
+  } catch (error) {
+    // A resolver fault must not take down the sweep. Unknown keeps the
+    // all-checks rule, which is never looser than today.
+    resolution = {
+      state: 'unknown',
+      reason: `resolver_threw: ${errorMessage(error)}`,
+      failureKind: 'transient',
+    };
+  }
+  if (resolution.state !== 'known') {
+    logger.info(
+      {
+        owner: pr.owner,
+        repo: pr.repo,
+        prNumber: pr.prNumber,
+        state: resolution.state,
+        reason: resolution.reason,
+      },
+      'merge-coordinator.required_contexts_fallback'
+    );
+  }
+  return resolution;
 }
 
 /**
@@ -981,7 +1052,8 @@ export async function discoverMergeCandidates(
         continue;
       }
 
-      const evidenceReason = classifyPullRequestEvidence(evidence);
+      const requiredContexts = await resolveDiscoveryRequiredContexts(deps, pr, logger);
+      const evidenceReason = classifyPullRequestEvidence(evidence, requiredContexts);
       if (evidenceReason) {
         exclusions.push({
           owner: pr.owner,

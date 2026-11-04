@@ -26,6 +26,11 @@ import {
   DEFAULT_WATCHED_BASE_BRANCHES,
 } from '../merge-candidate-discovery.ts';
 import type { DiscoveryCursor } from '../merge-candidate-discovery.ts';
+import {
+  resetRequiredContextsAttemptCounters,
+  resetRequiredContextsCache,
+} from '../adapters/required-contexts';
+import type { RecheckCheckRun } from '../pr-review-check-ingest';
 import { watchLoop, watchOnce } from '../watch.ts';
 import { handleRecord } from '../service.ts';
 import type {
@@ -1538,5 +1543,152 @@ describe('watchOnce -- an unavailable sweep is distinct from a healthy empty one
     );
     const heartbeat = logged.find(entry => entry.msg === 'merge-coordinator.heartbeat_evaluated');
     expect(heartbeat?.obj.prDiscoveryUnavailableReason).toBe('not_run');
+  });
+});
+
+describe('merge candidate discovery -- only required checks can exclude', () => {
+  const required = ['docker-build', 'test (ubuntu-latest)'] as const;
+
+  function checkRun(
+    id: number,
+    name: string,
+    status: string,
+    conclusion: string | null
+  ): RecheckCheckRun {
+    return { id, name, status, conclusion, completed_at: `2026-11-0${id}T00:00:00.000Z` };
+  }
+
+  function evidenceWithRuns(prNumber: number, runs: RecheckCheckRun[]): PullRequestEvidence {
+    const failed = runs.filter(
+      run => run.status === 'completed' && run.conclusion !== 'success'
+    ).length;
+    const pending = runs.filter(run => run.status !== 'completed').length;
+    return {
+      ...greenEvidence(prNumber),
+      checks: { total: runs.length, passed: runs.length - failed - pending, failed, pending },
+      checkRuns: runs,
+      commitStatuses: [],
+    };
+  }
+
+  function contextsLookup(
+    contexts: readonly string[]
+  ): NonNullable<MergeCandidateDiscoveryDeps['requiredContextsLookups']> {
+    return { fetchWithAppClient: async () => ({ data: [...contexts] }) };
+  }
+
+  async function discoverOne(
+    evidence: PullRequestEvidence,
+    lookups: MergeCandidateDiscoveryDeps['requiredContextsLookups']
+  ): Promise<{
+    result: Awaited<ReturnType<typeof discoverMergeCandidates>>;
+    logged: { obj: Record<string, unknown>; msg: string }[];
+  }> {
+    const candidate = pr({ prNumber: 4600 });
+    const deps: MergeCandidateDiscoveryDeps = {
+      ...discoveryDeps([candidate], { 4600: evidence }),
+      requiredContextsLookups: lookups,
+    };
+    const logged: { obj: Record<string, unknown>; msg: string }[] = [];
+    const result = await discoverMergeCandidates(deps, {
+      repos: REPOS,
+      watchedBaseBranches: WATCHED_BASES,
+      logger: { info: (obj, msg) => logged.push({ obj, msg }) },
+    });
+    return { result, logged };
+  }
+
+  function fallbackLogged(logged: { msg: string }[]): boolean {
+    return logged.some(line => line.msg === 'merge-coordinator.required_contexts_fallback');
+  }
+
+  beforeEach(() => {
+    resetDiscoveryCursorForTests();
+    resetRequiredContextsCache();
+    resetRequiredContextsAttemptCounters();
+  });
+
+  test('non_required_failure_does_not_exclude', async () => {
+    const evidence = evidenceWithRuns(4600, [
+      checkRun(1, 'docker-build', 'completed', 'success'),
+      checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+      checkRun(3, 'test (windows-latest)', 'completed', 'failure'),
+    ]);
+    expect(evidence.checks.failed).toBe(1);
+    const { result, logged } = await discoverOne(evidence, contextsLookup(required));
+    expect(result.exclusions.map(exclusion => exclusion.reason)).toEqual([]);
+    expect(result.candidates).toHaveLength(1);
+    expect(fallbackLogged(logged)).toBe(false);
+    // Today's all-checks rule is still what an unresolved call gets.
+    expect(classifyPullRequestEvidence(evidence)).toBe('checks_failing');
+  });
+
+  test('required_failure_still_excludes', async () => {
+    const evidence = evidenceWithRuns(4600, [
+      checkRun(1, 'docker-build', 'completed', 'success'),
+      checkRun(2, 'test (ubuntu-latest)', 'completed', 'failure'),
+      checkRun(3, 'test (windows-latest)', 'completed', 'success'),
+    ]);
+    const { result } = await discoverOne(evidence, contextsLookup(required));
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions.map(exclusion => exclusion.reason)).toEqual(['checks_failing']);
+  });
+
+  test('non_required_pending_does_not_hold', async () => {
+    const evidence = evidenceWithRuns(4600, [
+      checkRun(1, 'docker-build', 'completed', 'success'),
+      checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+      checkRun(3, 'test (windows-latest)', 'in_progress', null),
+    ]);
+    expect(evidence.checks.pending).toBe(1);
+    const { result } = await discoverOne(evidence, contextsLookup(required));
+    expect(result.exclusions.map(exclusion => exclusion.reason)).toEqual([]);
+    expect(result.candidates).toHaveLength(1);
+
+    // A required context missing from the head counts as pending, as the bridge treats it.
+    const missing = evidenceWithRuns(4600, [
+      checkRun(1, 'docker-build', 'completed', 'success'),
+      checkRun(3, 'test (windows-latest)', 'completed', 'success'),
+    ]);
+    expect(
+      classifyPullRequestEvidence(missing, {
+        state: 'known',
+        contexts: [...required],
+        source: 'env_override',
+      })
+    ).toBe('checks_pending');
+  });
+
+  test('unknown_required_set_falls_back_to_all_checks', async () => {
+    const evidence = evidenceWithRuns(4600, [
+      checkRun(1, 'docker-build', 'completed', 'success'),
+      checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+      checkRun(3, 'test (windows-latest)', 'completed', 'failure'),
+    ]);
+    const { result, logged } = await discoverOne(evidence, {
+      fetchWithAppClient: async () => {
+        throw new Error('lookup_down');
+      },
+    });
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions.map(exclusion => exclusion.reason)).toEqual(['checks_failing']);
+    const fallback = logged.find(
+      line => line.msg === 'merge-coordinator.required_contexts_fallback'
+    );
+    expect(fallback?.obj).toEqual(
+      expect.objectContaining({ owner: OWNER, repo: REPO, prNumber: 4600 })
+    );
+    expect(['unknown', 'exhausted']).toContain(String(fallback?.obj.state));
+  });
+
+  test('empty_required_set_keeps_all_checks_rule', async () => {
+    const evidence = evidenceWithRuns(4600, [
+      checkRun(1, 'docker-build', 'completed', 'success'),
+      checkRun(2, 'test (windows-latest)', 'completed', 'failure'),
+    ]);
+    const { result, logged } = await discoverOne(evidence, contextsLookup([]));
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions.map(exclusion => exclusion.reason)).toEqual(['checks_failing']);
+    expect(fallbackLogged(logged)).toBe(false);
   });
 });
