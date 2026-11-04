@@ -865,16 +865,31 @@ async function runCheckoutGit(
   options: { trim?: boolean } = {}
 ): Promise<string> {
   const token = process.env.GITHUB_TOKEN?.trim() || process.env.GH_TOKEN?.trim();
+  // core.longpaths: a review checkout's pack files sit at
+  // <root>/<owner>/<repo>/<40-hex>/.git/objects/pack/pack-<40-hex>.promisor,
+  // which passes Windows' 260-character limit under a long temp root
+  // (windows-latest CI: "cannot write promisor file ... Filename too long").
+  // Git for Windows honours it; other platforms ignore it. Passed through
+  // GIT_CONFIG_* so the child processes git starts (index-pack on a lazy
+  // promisor fetch) inherit it, and the sanitized env still needs no global
+  // gitconfig. bdc-xo #4569.
+  const config: [string, string][] = [['core.longpaths', 'true']];
+  if (token) {
+    config.push([
+      'http.https://github.com/.extraheader',
+      `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`,
+    ]);
+  }
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? '/usr/bin:/bin',
     HOME: process.env.HOME ?? '/tmp',
     GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_COUNT: String(config.length),
   };
-  if (token) {
-    env.GIT_CONFIG_COUNT = '1';
-    env.GIT_CONFIG_KEY_0 = 'http.https://github.com/.extraheader';
-    env.GIT_CONFIG_VALUE_0 = `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`;
-  }
+  config.forEach(([key, value], index) => {
+    env[`GIT_CONFIG_KEY_${index}`] = key;
+    env[`GIT_CONFIG_VALUE_${index}`] = value;
+  });
   const child = Bun.spawn(argv, { cwd, env, stdout: 'pipe', stderr: 'pipe' });
   const [exitCode, stdout, stderr] = await Promise.all([
     child.exited,
