@@ -26,6 +26,7 @@ import {
   getOverseerRuntimeStatus,
 } from './overseer-runtime';
 import { createMergeManager } from '../../overseer/src/merge-manager.ts';
+import { handleRecord } from '../../overseer/src/service.ts';
 import { PRODUCTION_EFFECT_HOLD_REASON } from '../../overseer/src/merge-manager.ts';
 
 const getStatus = (now?: () => Date) =>
@@ -528,6 +529,58 @@ describe('overseer-runtime', () => {
     expect(monitorStops).toBeGreaterThanOrEqual(1);
     expect((await getStatus()).watcher).not.toBe('running');
     expect(serviceCalls).toBe(3);
+  });
+
+  // Round 2 (PR 1502), test (iii): once stopOverseerRuntime resolves, a handler that was still
+  // running holds an aborted signal, so no merge, escalation or action can fire.
+  test('after stopOverseerRuntime resolves, a resumed record handler fires no side effect', async () => {
+    setEnabledEnv();
+    let handlerSignal: AbortSignal | undefined;
+    runOverseerServiceMock.mockImplementation(async (opts?: unknown) => {
+      handlerSignal = (opts as { signal: AbortSignal }).signal;
+      await new Promise<void>(resolve => handlerSignal?.addEventListener('abort', () => resolve()));
+    });
+    startOverseerRuntime({
+      runService: runOverseerServiceMock,
+      startLivenessMonitor: () => ({ check: async () => false, stop: () => undefined }),
+    });
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    expect(handlerSignal?.aborted).toBe(false);
+
+    await stopOverseerRuntime();
+    expect(handlerSignal?.aborted).toBe(true);
+
+    const sideEffects: string[] = [];
+    const record = {
+      runId: 'pr-discovery:o/r#1',
+      woId: 'WO-X',
+      action: 'merge_ready',
+      reason: 'x',
+      prEvidence: { exists: true },
+    } as unknown as Parameters<typeof handleRecord>[0];
+    await handleRecord(
+      record,
+      {
+        listRunsForWatch: async () => [],
+        listRunEvents: async () => [],
+        findPullRequest: async () => ({ exists: false }) as never,
+        mergePullRequest: async () => {
+          sideEffects.push('merge');
+          return { merged: true } as never;
+        },
+        insertOverseerAction: async () => {
+          sideEffects.push('action');
+        },
+      },
+      false,
+      'test',
+      async () => {
+        sideEffects.push('coordinator');
+      },
+      undefined,
+      handlerSignal
+    );
+    expect(sideEffects).toEqual([]);
   });
 
   test('Test 4b: stopping during backoff clears the restart timer and never restarts', async () => {

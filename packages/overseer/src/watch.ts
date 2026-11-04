@@ -2,6 +2,7 @@ import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import { createLogger } from '@archon/paths';
 import {
+  BoundedAwaitAbortedError,
   BoundedAwaitTimeoutError,
   resolvePassTimeoutMs,
   resolveRecordTimeoutMs,
@@ -322,6 +323,14 @@ export interface WatchOnceOptions {
   discoveryEnabled?: boolean;
   /** Per-step deadline (MERGE_SWEEP_STEP_TIMEOUT_MS, default 60000). */
   stepTimeoutMs?: number;
+  /**
+   * Aggregate deadline for the whole PR sweep (default stepTimeoutMs * 5). On expiry
+   * the sweep returns the candidates gathered so far, persists the cursor past the
+   * PRs actually evaluated, and cancels the remaining lookups.
+   */
+  discoveryDeadlineMs?: number;
+  /** Cancels the pass (the loop's pass deadline or shutdown). */
+  signal?: AbortSignal;
 }
 
 /**
@@ -410,22 +419,34 @@ export async function watchOnce(
   let discovery: MergeCandidateDiscoveryResult = unavailableDiscoveryResult('not_run');
   if (options.discoveryEnabled !== false) {
     try {
-      // The sweep bounds each of its own awaits; this outer deadline (listing
-      // every repo plus evaluating the budget) is the backstop so a wedge the
-      // inner bounds miss still cannot hold the pass.
-      discovery = await withBoundedAwait(
-        'watch.discoverMergeCandidates',
-        stepTimeoutMs * 5,
-        () =>
-          discoverMergeCandidates(deps, {
-            stepTimeoutMs,
-            logger: heartbeatLogger,
-            ...options.discovery,
-            alreadyCoveredPullRequests:
-              options.discovery?.alreadyCoveredPullRequests ?? coveredPullRequests(outcomes),
-          }),
-        { onTimeout: onStepTimeout }
-      );
+      // Aggregate deadline WITHOUT discarding work: the sweep gets a signal, and on
+      // expiry returns the candidates gathered so far with the cursor advanced only
+      // past evaluated PRs; in-flight lookups are cancelled through the same signal.
+      const discoveryController = new AbortController();
+      const deadlineMs = options.discoveryDeadlineMs ?? stepTimeoutMs * 5;
+      const deadlineTimer = setTimeout(() => {
+        discoveryController.abort(
+          new BoundedAwaitTimeoutError('watch.discoverMergeCandidates', deadlineMs)
+        );
+      }, deadlineMs);
+      const onParentAbort = (): void => {
+        discoveryController.abort(options.signal?.reason);
+      };
+      if (options.signal?.aborted) onParentAbort();
+      else options.signal?.addEventListener('abort', onParentAbort, { once: true });
+      try {
+        discovery = await discoverMergeCandidates(deps, {
+          stepTimeoutMs,
+          logger: heartbeatLogger,
+          ...options.discovery,
+          signal: discoveryController.signal,
+          alreadyCoveredPullRequests:
+            options.discovery?.alreadyCoveredPullRequests ?? coveredPullRequests(outcomes),
+        });
+      } finally {
+        clearTimeout(deadlineTimer);
+        options.signal?.removeEventListener('abort', onParentAbort);
+      }
     } catch (error) {
       // A broken sweep must never take down the watch tick -- the run-derived
       // outcomes above are still valid work.
@@ -521,7 +542,7 @@ export async function watchOnce(
 
 export async function watchLoop(
   deps: OverseerRunStoreDeps & GitHubClientDeps,
-  onRecord: (record: WatchedRunRecord) => Promise<void>,
+  onRecord: (record: WatchedRunRecord, signal?: AbortSignal) => Promise<void>,
   options: {
     intervalMs?: number;
     once?: boolean;
@@ -542,8 +563,13 @@ export async function watchLoop(
     recordTimeoutMs?: number;
     /** Whole-pass deadline; defaults to MERGE_SWEEP_PASS_TIMEOUT_MS (300000). */
     passTimeoutMs?: number;
+    /** Aggregate discovery deadline; defaults to stepTimeoutMs * 5. */
+    discoveryDeadlineMs?: number;
   } = {}
 ): Promise<void> {
+  // Handlers still unwinding, keyed by record id, owned by THIS loop. A record is not
+  // handed to a new handler while its previous one is unfinished.
+  const inFlightRecords = new Map<string, { startedAt: number; done: Promise<void> }>();
   const loopLogger: WatchHeartbeatLogger = options.logger ?? log;
   const recordTimeoutMs = options.recordTimeoutMs ?? resolveRecordTimeoutMs();
   const passTimeoutMs = options.passTimeoutMs ?? resolvePassTimeoutMs();
@@ -551,6 +577,9 @@ export async function watchLoop(
   const watchOptions: WatchOnceOptions = {
     ...(options.logger === undefined ? {} : { logger: options.logger }),
     ...(options.stepTimeoutMs === undefined ? {} : { stepTimeoutMs: options.stepTimeoutMs }),
+    ...(options.discoveryDeadlineMs === undefined
+      ? {}
+      : { discoveryDeadlineMs: options.discoveryDeadlineMs }),
     ...(options.discovery === undefined ? {} : { discovery: options.discovery }),
     ...(options.discoveryEnabled === undefined
       ? {}
@@ -566,7 +595,7 @@ export async function watchLoop(
       const records = await withBoundedAwait(
         'watch.watchOnce',
         passTimeoutMs,
-        () => watchOnce(deps, watchOptions),
+        signal => watchOnce(deps, { ...watchOptions, signal }),
         {
           onTimeout: error => {
             logError(
@@ -579,17 +608,63 @@ export async function watchLoop(
       );
       for (const record of records) {
         if (options.signal?.aborted) return;
+        // Never run two handlers for one record. A handler that timed out is
+        // cancelled (its signal is aborted, so every side effect is fenced) but its
+        // promise may still be unwinding; its record is skipped until it finishes.
+        const running = inFlightRecords.get(record.runId);
+        if (running) {
+          logWarn(
+            loopLogger,
+            {
+              runId: record.runId,
+              reason: 'previous_handler_unfinished',
+              ageMs: Date.now() - running.startedAt,
+            },
+            'merge-coordinator.record_skipped_in_flight'
+          );
+          continue;
+        }
+        const handlerController = new AbortController();
+        const loopSignal = options.signal;
+        const onLoopAbort = (): void => {
+          handlerController.abort(loopSignal?.reason);
+        };
+        if (loopSignal?.aborted) onLoopAbort();
+        else loopSignal?.addEventListener('abort', onLoopAbort, { once: true });
+        let handlerPromise: Promise<void>;
         try {
-          await withBoundedAwait('watch.onRecord', recordTimeoutMs, () => onRecord(record), {
+          handlerPromise = Promise.resolve(onRecord(record, handlerController.signal));
+        } catch (error) {
+          handlerPromise = Promise.reject(
+            error instanceof Error ? error : new Error(String(error))
+          );
+        }
+        const settled = handlerPromise.then(
+          () => undefined,
+          () => undefined
+        );
+        inFlightRecords.set(record.runId, { startedAt: Date.now(), done: settled });
+        void settled.then(() => {
+          inFlightRecords.delete(record.runId);
+          loopSignal?.removeEventListener('abort', onLoopAbort);
+        });
+        try {
+          await withBoundedAwait('watch.onRecord', recordTimeoutMs, () => handlerPromise, {
             onTimeout: error => {
+              // Cancel first: from here on the handler's side effects are fenced.
+              handlerController.abort(error);
               logError(
                 loopLogger,
                 { runId: record.runId, label: error.label, timeoutMs: error.timeoutMs },
                 'merge-coordinator.record_timeout'
               );
             },
+            signal: loopSignal,
           });
         } catch (error) {
+          // The loop was stopped while a handler was running: do not wait for it.
+          // Its signal is aborted, so it can no longer act.
+          if (error instanceof BoundedAwaitAbortedError) return;
           if (!(error instanceof BoundedAwaitTimeoutError)) {
             logError(
               loopLogger,

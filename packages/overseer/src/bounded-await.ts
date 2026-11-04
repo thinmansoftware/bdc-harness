@@ -24,7 +24,23 @@ export class BoundedAwaitTimeoutError extends Error {
   }
 }
 
+/** The caller's own signal aborted (aggregate deadline, shutdown): the wait was cancelled. */
+export class BoundedAwaitAbortedError extends Error {
+  readonly label: string;
+
+  constructor(label: string) {
+    super(`bounded_await_aborted: ${label} was cancelled by its caller`);
+    this.name = 'BoundedAwaitAbortedError';
+    this.label = label;
+  }
+}
+
 export interface BoundedAwaitOptions {
+  /**
+   * Outer cancellation. When it aborts, the wait rejects at once with
+   * BoundedAwaitAbortedError and the signal handed to `fn` is aborted.
+   */
+  readonly signal?: AbortSignal;
   /** Called once, just before the timeout rejection, so the caller can log it. */
   readonly onTimeout?: (error: BoundedAwaitTimeoutError) => void;
 }
@@ -72,6 +88,7 @@ export function withBoundedAwait<T>(
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
+      options.signal?.removeEventListener('abort', onOuterAbort);
       const error = new BoundedAwaitTimeoutError(label, timeoutMs);
       controller.abort(error);
       try {
@@ -82,12 +99,31 @@ export function withBoundedAwait<T>(
       reject(error);
     }, timeoutMs);
 
+    const outer = options.signal;
+    const onOuterAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const error = new BoundedAwaitAbortedError(label);
+      controller.abort(error);
+      reject(error);
+    };
+    if (outer) {
+      if (outer.aborted) {
+        onOuterAbort();
+        return;
+      }
+      outer.addEventListener('abort', onOuterAbort, { once: true });
+    }
+    const cleanup = (): void => outer?.removeEventListener('abort', onOuterAbort);
+
     let pending: Promise<T>;
     try {
       pending = Promise.resolve(fn(controller.signal));
     } catch (error) {
       settled = true;
       clearTimeout(timer);
+      cleanup();
       reject(toError(error));
       return;
     }
@@ -96,12 +132,14 @@ export function withBoundedAwait<T>(
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        cleanup();
         resolve(value);
       },
       (error: unknown) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        cleanup();
         reject(toError(error));
       }
     );

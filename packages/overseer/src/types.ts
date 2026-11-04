@@ -221,6 +221,8 @@ export interface GitHubPullRequestSearchInput {
    */
   prNumber?: number;
   includeChangedFiles?: boolean;
+  /** Cancellation for the lookup (aggregate discovery deadline). Implementations may ignore it. */
+  signal?: AbortSignal;
 }
 
 export interface GitHubPullRequestMergeInput extends PullRequestRef {

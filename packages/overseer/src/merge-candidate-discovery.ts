@@ -48,7 +48,12 @@
  * still the Merge Manager's call, on exactly the rules it had before.
  */
 import { createLogger } from '@archon/paths';
-import { BoundedAwaitTimeoutError, resolveStepTimeoutMs, withBoundedAwait } from './bounded-await';
+import {
+  BoundedAwaitAbortedError,
+  BoundedAwaitTimeoutError,
+  resolveStepTimeoutMs,
+  withBoundedAwait,
+} from './bounded-await';
 import {
   hasRepoPolicyEntry,
   LEGACY_ALLOWED_BASES_ENV,
@@ -498,7 +503,8 @@ async function resolveDiscoveryRequiredContexts(
   deps: MergeCandidateDiscoveryDeps,
   pr: DiscoveredPullRequest,
   logger: DiscoveryLogger,
-  stepTimeoutMs: number
+  stepTimeoutMs: number,
+  signal?: AbortSignal
 ): Promise<RequiredContextsResolution> {
   const lookups = deps.requiredContextsLookups;
   let resolution: RequiredContextsResolution;
@@ -521,9 +527,11 @@ async function resolveDiscoveryRequiredContexts(
         onTimeout: error => {
           logStepTimeout(logger, error);
         },
+        signal,
       }
     );
   } catch (error) {
+    if (error instanceof BoundedAwaitAbortedError) throw error;
     // A resolver fault must not take down the sweep. Unknown keeps the
     // all-checks rule, which is never looser than today.
     resolution = {
@@ -721,6 +729,13 @@ export interface DiscoverMergeCandidatesOptions {
   readonly alreadyCoveredPullRequests?: ReadonlySet<string>;
   /** Per-step deadline for each GitHub-touching await (MERGE_SWEEP_STEP_TIMEOUT_MS, 60000). */
   readonly stepTimeoutMs?: number;
+  /**
+   * Aggregate cancellation (the pass's discovery deadline, or shutdown). On abort,
+   * in-flight lookups are cancelled, no new PR is started, and the result carries
+   * the candidates gathered so far with the cursor advanced ONLY past the PRs
+   * actually evaluated.
+   */
+  readonly signal?: AbortSignal;
   /**
    * Where to resume the rotating evaluation window. Pass the previous tick's
    * `cursorAfter`. Omitted or null starts from the beginning of the population.
@@ -986,6 +1001,7 @@ export async function discoverMergeCandidates(
           onTimeout: error => {
             logStepTimeout(logger, error);
           },
+          signal: options.signal,
         }
       );
       byRepo.set(repoKey(target.owner, target.repo), listed);
@@ -1069,11 +1085,27 @@ export async function discoverMergeCandidates(
   // Where each repo got to this tick, so the next tick resumes per repo rather
   // than rewinding every repo to whichever one happened to be evaluated last.
   const lastPerRepo = new Map<string, number>();
+  // True when the aggregate deadline (options.signal) cut the evaluation short.
+  let deadlineHit = false;
   {
     for (const pr of sequence) {
       if (evaluated >= maxPullRequests) break;
+      if (options.signal?.aborted) {
+        deadlineHit = true;
+        break;
+      }
+      const lastKey = repoKey(pr.owner, pr.repo);
+      const previousLast = lastPerRepo.get(lastKey);
       evaluated += 1;
-      lastPerRepo.set(repoKey(pr.owner, pr.repo), pr.prNumber);
+      lastPerRepo.set(lastKey, pr.prNumber);
+      // A PR whose lookup was CANCELLED was not evaluated: give back its budget
+      // slot and its cursor position so the next pass starts at it, not after it.
+      const abandonCurrent = (): void => {
+        evaluated -= 1;
+        if (previousLast === undefined) lastPerRepo.delete(lastKey);
+        else lastPerRepo.set(lastKey, previousLast);
+        deadlineHit = true;
+      };
 
       let evidence: PullRequestEvidence;
       try {
@@ -1091,14 +1123,20 @@ export async function discoverMergeCandidates(
               // Optional in the contract, so existing implementations that ignore it
               // still work -- and are still caught by the binding check below.
               prNumber: pr.prNumber,
+              signal: options.signal,
             }),
           {
             onTimeout: error => {
               logStepTimeout(logger, error);
             },
+            signal: options.signal,
           }
         );
-      } catch {
+      } catch (error) {
+        if (error instanceof BoundedAwaitAbortedError) {
+          abandonCurrent();
+          break;
+        }
         exclusions.push({
           owner: pr.owner,
           repo: pr.repo,
@@ -1127,12 +1165,22 @@ export async function discoverMergeCandidates(
         continue;
       }
 
-      const requiredContexts = await resolveDiscoveryRequiredContexts(
-        deps,
-        pr,
-        logger,
-        stepTimeoutMs
-      );
+      let requiredContexts: RequiredContextsResolution;
+      try {
+        requiredContexts = await resolveDiscoveryRequiredContexts(
+          deps,
+          pr,
+          logger,
+          stepTimeoutMs,
+          options.signal
+        );
+      } catch (error) {
+        if (error instanceof BoundedAwaitAbortedError) {
+          abandonCurrent();
+          break;
+        }
+        throw error;
+      }
       const evidenceReason = classifyPullRequestEvidence(evidence, requiredContexts);
       if (evidenceReason) {
         exclusions.push({
@@ -1166,9 +1214,14 @@ export async function discoverMergeCandidates(
               onTimeout: error => {
                 logStepTimeout(logger, error);
               },
+              signal: options.signal,
             }
           );
-        } catch {
+        } catch (error) {
+          if (error instanceof BoundedAwaitAbortedError) {
+            abandonCurrent();
+            break;
+          }
           qualificationLookupFailed = true;
         }
       }
@@ -1204,9 +1257,18 @@ export async function discoverMergeCandidates(
   // Truncated when this pass could not finish: PRs nobody has evaluated yet
   // remain. A cursor is carried only then; completing the pass clears it so the
   // next tick starts a fresh pass at the top of every repo.
-  const evaluationWindowTruncated = evaluated < freshTotal;
+  const evaluationWindowTruncated = deadlineHit || evaluated < freshTotal;
+  if (deadlineHit) {
+    warnVia(
+      logger,
+      { evaluated, freshTotal, candidates: candidates.length },
+      'merge-coordinator.discovery_deadline'
+    );
+  }
+  // On a deadline the cursor advances ONLY past evaluated PRs; with zero progress
+  // the previous cursor is kept so the next pass retries from the same place.
   const cursorAfter: DiscoveryCursor | null =
-    evaluationWindowTruncated && lastPerRepo.size > 0
+    evaluationWindowTruncated && (lastPerRepo.size > 0 || (deadlineHit && startCursor))
       ? {
           perRepo: {
             // Repos untouched this tick keep their previous position, or they

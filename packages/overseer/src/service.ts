@@ -232,7 +232,75 @@ const defaultVerdictStore: OverseerVerdictStoreDeps = {
 };
 
 /**
+ * Thrown by a side-effect fence when the record handler's signal has aborted
+ * (record timeout, loop stop, runtime stop). A cancelled handler that resumes
+ * later must perform NO merge, escalation, card or comment; it unwinds instead.
+ */
+export class RecordHandlerCancelledError extends Error {
+  readonly point: string;
+
+  constructor(point: string) {
+    super(`record_handler_cancelled_before_${point}`);
+    this.name = 'RecordHandlerCancelledError';
+    this.point = point;
+  }
+}
+
+function throwIfFenced(signal: AbortSignal | undefined, point: string): void {
+  if (signal?.aborted) throw new RecordHandlerCancelledError(point);
+}
+
+/**
+ * Wrap every mutating dependency so it checks the signal IMMEDIATELY before it
+ * runs. Reads pass through untouched via the prototype chain.
+ */
+function fenceDeps<T extends object>(deps: T, signal: AbortSignal): T {
+  const fenced = Object.create(deps) as Record<string, unknown>;
+  const source = deps as Record<string, unknown>;
+  for (const name of [
+    'insertOverseerAction',
+    'mergePullRequest',
+    'commentOnPullRequest',
+    'approvePullRequest',
+  ]) {
+    const original = source[name];
+    if (typeof original !== 'function') continue;
+    fenced[name] = (...args: unknown[]): unknown => {
+      throwIfFenced(signal, name);
+      return (original as (...a: unknown[]) => unknown).apply(deps, args);
+    };
+  }
+  return fenced as T;
+}
+
+function fenceVerdictStore(
+  store: OverseerVerdictStoreDeps,
+  signal: AbortSignal
+): OverseerVerdictStoreDeps {
+  const fenced = Object.create(store) as Record<string, unknown>;
+  const source = store as unknown as Record<string, unknown>;
+  for (const name of [
+    'claimVerdict',
+    'finalizeVerdict',
+    'promoteObserveOrHealthyVerdict',
+    'promoteObserveOrHealthyVerdictWithReceipt',
+  ]) {
+    const original = source[name];
+    if (typeof original !== 'function') continue;
+    fenced[name] = (...args: unknown[]): unknown => {
+      throwIfFenced(signal, name);
+      return (original as (...a: unknown[]) => unknown).apply(store, args);
+    };
+  }
+  return fenced as unknown as OverseerVerdictStoreDeps;
+}
+
+/**
  * Dispatch a single watched record to its action (merge / escalate / skip).
+ *
+ * With a `signal`, every side effect (merge, escalation, operator card, action
+ * rows, comments) is fenced: it checks the signal immediately before it runs and
+ * a cancelled handler unwinds without acting. Without one, behavior is unchanged.
  *
  * Exported so wiring tests can drive the REAL merge-vs-skip gate
  * (`record.action === 'merge_ready'`) instead of re-implementing it inline: a
@@ -244,7 +312,63 @@ export async function handleRecord(
   dryRun: boolean,
   actor: string,
   mergeCoordinator?: MergeReadyCoordinator,
-  deterministicMergeHandoff?: DeterministicMergeHandoff
+  deterministicMergeHandoff?: DeterministicMergeHandoff,
+  signal?: AbortSignal
+): Promise<void> {
+  if (!signal) {
+    await handleRecordUnfenced(
+      record,
+      deps,
+      dryRun,
+      actor,
+      mergeCoordinator,
+      deterministicMergeHandoff
+    );
+    return;
+  }
+  try {
+    throwIfFenced(signal, 'start');
+    await handleRecordUnfenced(
+      record,
+      fenceDeps(deps, signal),
+      dryRun,
+      actor,
+      mergeCoordinator
+        ? (r): Promise<unknown> => {
+            throwIfFenced(signal, 'mergeCoordinator');
+            return mergeCoordinator(r);
+          }
+        : undefined,
+      deterministicMergeHandoff
+        ? {
+            handoff: (r): Promise<unknown> => {
+              throwIfFenced(signal, 'deterministicMergeHandoff');
+              return deterministicMergeHandoff.handoff(r);
+            },
+          }
+        : undefined,
+      signal
+    );
+  } catch (error) {
+    if (error instanceof RecordHandlerCancelledError) {
+      log.warn(
+        { runId: record.runId, woId: record.woId, point: error.point },
+        'overseer.record_handler_fenced'
+      );
+      return;
+    }
+    throw error;
+  }
+}
+
+async function handleRecordUnfenced(
+  record: WatchedRunRecord,
+  deps: OverseerRunStoreDeps & OverseerActionsDeps & GitHubClientDeps,
+  dryRun: boolean,
+  actor: string,
+  mergeCoordinator?: MergeReadyCoordinator,
+  deterministicMergeHandoff?: DeterministicMergeHandoff,
+  signal?: AbortSignal
 ): Promise<void> {
   if (emergencyStopEngaged()) {
     log.warn({ runId: record.runId }, 'overseer.emergency_stop_engaged');
@@ -262,9 +386,20 @@ export async function handleRecord(
         actor,
         mergeCoordinator,
         deterministicMergeHandoff,
-        verdictStore: defaultVerdictStore,
+        verdictStore: signal ? fenceVerdictStore(defaultVerdictStore, signal) : defaultVerdictStore,
+        ...(signal
+          ? {
+              escalate: (
+                ...args: Parameters<typeof runEscalation>
+              ): ReturnType<typeof runEscalation> => {
+                throwIfFenced(signal, 'runEscalation');
+                return runEscalation(...args);
+              },
+            }
+          : {}),
       });
     } catch (error) {
+      if (error instanceof RecordHandlerCancelledError) throw error;
       log.error(
         { err: error as Error, runId: record.runId, woId: record.woId },
         'overseer.judge_first.record_failed_isolated'
@@ -377,6 +512,7 @@ export async function handleRecord(
     throw new Error('operator_card_non_actionable_error_class');
   }
 
+  throwIfFenced(signal, 'runAuthorizedEscalation');
   const escalation = await runAuthorizedEscalation(record.runId, {
     permit: permitFromMetadata(record.metadata),
     actor,
@@ -386,6 +522,7 @@ export async function handleRecord(
     if (!record.lastEvent?.id || !record.lastEvent.created_at) {
       throw new Error('operator_card_source_event_identity_missing');
     }
+    throwIfFenced(signal, 'runEscalation');
     const card = await runEscalation(
       record.runId,
       record.decision,
@@ -510,14 +647,15 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
   if (options.signal?.aborted) coupledAbort.abort();
   const watcher = watchLoop(
     deps,
-    record =>
+    (record, signal) =>
       handleRecord(
         record,
         deps,
         dryRun,
         'overseer-service',
         options.mergeCoordinator,
-        deterministicMergeHandoff
+        deterministicMergeHandoff,
+        signal
       ),
     {
       intervalMs: options.intervalMs,

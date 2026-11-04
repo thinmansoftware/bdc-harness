@@ -113,6 +113,15 @@ What now protects the sweep:
   the existing per-repo cursor, so an approved green PR is a candidate within one pass regardless of how many PRs
   are open. The heartbeat reports `prsClassified` (whole population) next to `prsEvaluated` (evidence budget).
 
+- A record handler that times out (or is stopped with the loop) is CANCELLED: its `AbortSignal` is aborted and every
+  side effect in `handleRecord` (merge, escalation, operator card, action rows, comments, verdict writes) checks that
+  signal immediately before it runs, so a handler that resumes later unwinds (`overseer.record_handler_fenced`) instead
+  of acting. A record whose previous handler is unfinished is skipped with
+  `merge-coordinator.record_skipped_in_flight` (`reason: previous_handler_unfinished`).
+- The PR sweep has an aggregate deadline (default five times the step timeout). On expiry it keeps the candidates
+  gathered so far, advances the cursor only past PRs actually evaluated, and cancels in-flight lookups
+  (`merge-coordinator.discovery_deadline`); the next pass continues where it stopped.
+
 Environment variables (all optional; defaults shown):
 
 | Variable | Default | Meaning |
