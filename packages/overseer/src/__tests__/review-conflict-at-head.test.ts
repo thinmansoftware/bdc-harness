@@ -5,6 +5,10 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { loadReviewConflictAtHead, reviewConflictFromMessages } from '../adapters/github-real-deps';
+import * as connection from '@archon/core/db/connection';
+import * as dispatch from '@archon/core/db/dispatch';
+import { PR_REVIEW_LOG_RECIPIENT } from '@archon/core/db/dispatch-routing';
+import { withIsolatedDatabase } from './isolated-database';
 
 const PR = { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1453 };
 const H = '68937274ac565096e886e65882cc3a197389c878';
@@ -404,4 +408,91 @@ describe('check-scoped changes_requested superseded by a later approval (WO-HARN
       await loadReviewConflictAtHead({ ...PR, headSha: H }, listFor(pr1453Rows()), noLegacy)
     ).toBe('changes_requested');
   });
+});
+
+// Real SQLite: rows inserted through the real dispatch insert path and read
+// back by the real listMessages / listMessagesByCorrelationPrefixWithoutSubjectKey
+// carry their database-assigned seq, so the supersede fires (or refuses) in
+// production the same way it does on fakes.
+describe('check-scoped supersede against real SQLite (real insert and read path)', () => {
+  const insertRequest = async (ref: Ref, headSha: string, resultBody: string): Promise<string> => {
+    const nonce = Math.random().toString(36).slice(2);
+    const row = await dispatch.createAuthenticatedMessage(
+      { kind: 'system', sender: 'overseer' },
+      {
+        correlation_id: `pr-review:${ref.owner}/${ref.repo}#${ref.number}@${headSha}`,
+        idempotency_key: `req:${nonce}`,
+        repeat_reason: `review_request:${nonce}`,
+        task_type: 'run_review',
+        recipient: 'overseer-reviewer',
+        subject_key: `gh:${ref.owner}/${ref.repo}#${ref.number}`,
+        body: JSON.stringify({ owner: ref.owner, repo: ref.repo, prNumber: ref.number, headSha }),
+      }
+    );
+    if (!row) throw new Error('request insert returned null');
+    // The review worker finishes the item with result_body = SubmitOutcome JSON.
+    await connection
+      .getDatabase()
+      .query("UPDATE agent_dispatch_messages SET status = 'done', result_body = $2 WHERE id = $1", [
+        row.id,
+        resultBody,
+      ]);
+    return row.id;
+  };
+  const insertReceipt = async (
+    ref: Ref,
+    headSha: string,
+    disposition: string,
+    messageId: string
+  ): Promise<void> => {
+    const row = await dispatch.createAuthenticatedMessage(
+      { kind: 'system', sender: 'overseer' },
+      {
+        correlation_id: `pr-review:${ref.owner}/${ref.repo}#${ref.number}@${headSha}`,
+        idempotency_key: `pr-review-submit-receipt:${messageId}:${disposition}`,
+        repeat_reason: `review_verdict_receipt:${messageId}:${disposition}`,
+        task_type: 'run_report',
+        recipient: PR_REVIEW_LOG_RECIPIENT,
+        subject_key: `gh:${ref.owner}/${ref.repo}#${ref.number}`,
+        body: seqReceipt(ref, headSha, disposition, messageId, null).body,
+      }
+    );
+    if (!row) throw new Error('receipt insert returned null');
+  };
+  const realLoad = (ref: Ref, headSha: string) =>
+    loadReviewConflictAtHead(
+      { ...ref, headSha },
+      dispatch.listMessages,
+      dispatch.listMessagesByCorrelationPrefixWithoutSubjectKey
+    );
+
+  test('real_db_pr777_check_caused_then_approved_passes', () =>
+    withIsolatedDatabase(async () => {
+      for (let i = 0; i < 8; i += 1) {
+        const summary = i % 2 === 0 ? PR777_SLASH_SUMMARY : PR777_COLON_SUMMARY;
+        const id = await insertRequest(PR777, H777, outcome('changes_requested', summary));
+        await insertReceipt(PR777, H777, 'changes_requested', id);
+      }
+      const ok = await insertRequest(PR777, H777, outcome('approved', 'No blocking findings.'));
+      await insertReceipt(PR777, H777, 'approved', ok);
+      // seq is present on the rows the real reader returns.
+      const read = await dispatch.listMessages({
+        recipient: PR_REVIEW_LOG_RECIPIENT,
+        subject_key: `gh:${PR777.owner}/${PR777.repo}#${PR777.number}`,
+        limit: 50,
+      });
+      expect(read).toHaveLength(9);
+      for (const row of read) expect(typeof row.seq).toBe('number');
+      expect(await realLoad(PR777, H777)).toBeNull();
+    }));
+
+  test('real_db_pr1453_approve_then_changes_requested_refuses', () =>
+    withIsolatedDatabase(async () => {
+      for (const disposition of ['approved', 'approved', 'changes_requested']) {
+        const summary = disposition === 'approved' ? 'No blocking findings.' : CODE_SUMMARY;
+        const id = await insertRequest(PR, H, outcome(disposition, summary));
+        await insertReceipt(PR, H, disposition, id);
+      }
+      expect(await realLoad(PR, H)).toBe('changes_requested');
+    }));
 });

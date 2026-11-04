@@ -67,6 +67,13 @@ export interface DispatchMessage {
   route_disposed_at: string | null;
   supersedes_id: string | null;
   repeat_reason: string | null;
+  /**
+   * The row's own database-assigned insertion order (migration 047), coerced to
+   * a number by normalizeMessage (Postgres returns BIGINT as a string). Null
+   * when never assigned (raw/fixture/import rows on SQLite). Optional so test
+   * doubles that predate it stay valid.
+   */
+  seq?: number | null;
 }
 
 /**
@@ -79,12 +86,8 @@ export interface DispatchMessage {
  */
 export interface SeqCursorMessage extends DispatchMessage {
   cursor_seq: number;
-  /**
-   * The row's own database-assigned `seq`, or null when it was never assigned
-   * (raw/fixture/import rows on SQLite, where `cursor_seq` falls back to rowid).
-   * Optional so callers and test doubles that predate it stay valid.
-   */
-  seq?: number | null;
+  // `seq` (inherited from DispatchMessage) is the row's own value, null when it
+  // was never assigned (where `cursor_seq` falls back to rowid on SQLite).
 }
 
 /**
@@ -119,10 +122,11 @@ export interface DispatchWorker {
 
 interface DispatchMessageRow extends Omit<
   DispatchMessage,
-  'fencing_token' | 'resolved_xo_fencing_token'
+  'fencing_token' | 'resolved_xo_fencing_token' | 'seq'
 > {
   fencing_token: number | string;
   resolved_xo_fencing_token: number | string | null;
+  seq?: number | string | null;
 }
 
 type CompatibleDispatchMessageRow = DispatchMessageRow & {
@@ -262,6 +266,8 @@ function normalizeMessage(row: DispatchMessageRow): DispatchMessage {
     escalated_tg_at: normalizeNullableTimestamp(row.escalated_tg_at),
     escalated_sms_at: normalizeNullableTimestamp(row.escalated_sms_at),
     route_disposed_at: normalizeNullableTimestamp(row.route_disposed_at),
+    // Postgres returns the BIGINT seq as a string; SQLite as a number.
+    seq: row.seq === null || row.seq === undefined ? null : Number(row.seq),
   };
 }
 
@@ -1017,17 +1023,12 @@ export async function listMessagesBySeqCursor(filters: {
     params
   );
   // `cursor_seq` is selected explicitly rather than read off the row's `seq`:
-  // Postgres returns a BIGINT identity as a STRING through the driver while
-  // SQLite returns a number, and `seq` is not part of the DispatchMessage
-  // contract. Coercing here keeps that dialect difference out of every caller.
-  return result.rows.map(row => {
-    const ownSeq = (row as { seq?: unknown }).seq;
-    return {
-      ...normalizeMessage(row),
-      cursor_seq: Number(row.cursor_seq),
-      seq: ownSeq === null || ownSeq === undefined ? null : Number(ownSeq),
-    };
-  });
+  // it is COALESCE(seq, rowid), never null. The row's own `seq` (null when never
+  // assigned) is coerced to a number by normalizeMessage, like every reader.
+  return result.rows.map(row => ({
+    ...normalizeMessage(row),
+    cursor_seq: Number(row.cursor_seq),
+  }));
 }
 
 export async function listMessages(filters: {
