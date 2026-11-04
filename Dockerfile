@@ -315,6 +315,11 @@ COPY tsconfig*.json ./
 COPY scripts/github-service-token.ts scripts/github-service-exec.ts scripts/github-service-login.ts scripts/run-completion-report.ts ./scripts/
 COPY scripts/overseer-review-sandbox-smoke.ts scripts/overseer-reviewer-broker.ts ./scripts/
 
+# Shared shell cores SOURCED by the bdc-feature-development lane YAMLs
+# (prep-dependencies / run-stop-tests source /app/scripts/lane/dprep.sh).
+COPY scripts/lane/ ./scripts/lane/
+RUN sed -i 's/\r$//' /app/scripts/lane/*.sh
+
 # Fix permissions for appuser
 RUN chown -R appuser:appuser /app
 

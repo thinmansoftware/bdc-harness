@@ -3797,6 +3797,159 @@ describe('executeDagWorkflow -- bash nodes', () => {
     execSpy.mockRestore();
   });
 
+  // Fix A3 review (#1462): dprep moved to scripts/lane/dprep.sh. Standalone CLI and
+  // source runs have no /app/scripts/lane/, so the engine must materialize the
+  // bundled copy and export ARCHON_LANE_SCRIPTS_DIR. This runs the REAL lane prep
+  // stub (the dprep core extracted from the canonical lane YAML) through the engine
+  // with stub bun/pnpm/npm on PATH and BDC_DPREP_SCRIPT unset, and asserts each
+  // lockfile kind installs.
+  it('lane prep stub installs bun/pnpm/npm deps from the bundled dprep.sh without /app', async () => {
+    const laneYaml = (
+      await readFile(
+        join(
+          import.meta.dir,
+          '..',
+          '..',
+          '..',
+          '.archon/workflows/defaults/bdc-feature-development-codex.yaml'
+        ),
+        'utf8'
+      )
+    ).replace(/\r\n/g, '\n');
+    const begin = laneYaml.indexOf('# ---- BEGIN dprep core');
+    const end = laneYaml.indexOf('# ---- END dprep core', begin);
+    expect(begin).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(begin);
+    const stub = laneYaml
+      .slice(laneYaml.indexOf('\n', begin) + 1, end)
+      .split('\n')
+      .map(line => line.replace(/^ {6}/, ''))
+      .join('\n');
+    expect(stub).toContain('ARCHON_LANE_SCRIPTS_DIR');
+
+    const stubBin = join(testDir, 'stub-bin');
+    const record = join(testDir, 'pm-calls.log');
+    await mkdir(stubBin, { recursive: true });
+    for (const pm of ['bun', 'pnpm', 'npm']) {
+      await writeFile(
+        join(stubBin, pm),
+        `#!/usr/bin/env bash\nprintf '${pm} %s\\n' "$*" >> "${record}"\nmkdir -p node_modules\n`,
+        { mode: 0o755 }
+      );
+    }
+    const kinds: Record<string, string> = {
+      bun: 'bun.lock',
+      pnpm: 'pnpm-lock.yaml',
+      npm: 'package-lock.json',
+    };
+    for (const [kind, lock] of Object.entries(kinds)) {
+      await mkdir(join(testDir, kind), { recursive: true });
+      await writeFile(join(testDir, kind, 'package.json'), '{}\n');
+      await writeFile(join(testDir, kind, lock), '{}\n');
+    }
+
+    const seen: { laneDir: string; bundled: string; stdout: string }[] = [];
+    const realBash = !isWindows && !(await stat('/app/scripts/lane/dprep.sh').catch(() => null));
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(
+      async (command: string, args: string[], opts?: { cwd?: string; env?: NodeJS.ProcessEnv }) => {
+        expect(command).toBe('bash');
+        const env = { ...(opts?.env ?? {}) };
+        const laneDir = env.ARCHON_LANE_SCRIPTS_DIR ?? '';
+        const bundled = laneDir ? await readFile(join(laneDir, 'dprep.sh'), 'utf8') : '';
+        let stdout = '';
+        if (realBash) {
+          delete env.BDC_DPREP_SCRIPT;
+          env.PATH = `${stubBin}:${env.PATH ?? ''}`;
+          const proc = Bun.spawnSync(['bash', args[0]], {
+            cwd: opts?.cwd,
+            env,
+            stdout: 'pipe',
+            stderr: 'pipe',
+          });
+          stdout = proc.stdout.toString();
+        }
+        seen.push({ laneDir, bundled, stdout });
+        return { stdout, stderr: '' };
+      }
+    );
+
+    const nodes = Object.keys(kinds).map(kind => ({
+      id: `prep-${kind}`,
+      bash: `cd "$WORKTREE_PATH/${kind}" || exit 1\n${stub}\ndprep_ensure_js_deps\n`,
+    }));
+    await executeDagWorkflow(
+      createMockDeps(),
+      createMockPlatform(),
+      'conv-lane-scripts',
+      testDir,
+      { name: 'lane-scripts-test', nodes },
+      makeWorkflowRun('lane-scripts-run-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    execSpy.mockRestore();
+
+    const { BUNDLED_LANE_SCRIPTS } = await import('./defaults/bundled-defaults');
+    const source = (
+      await readFile(join(import.meta.dir, '..', '..', '..', 'scripts/lane/dprep.sh'), 'utf8')
+    ).replace(/\r\n/g, '\n');
+    expect(BUNDLED_LANE_SCRIPTS['dprep.sh']).toBe(source);
+    expect(seen).toHaveLength(3);
+    for (const s of seen) {
+      expect(s.laneDir).toContain(join(testDir, 'artifacts'));
+      expect(s.bundled).toBe(source);
+      // Per-node copy is removed after the node finishes.
+      expect(await stat(s.laneDir).catch(() => null)).toBeNull();
+    }
+    if (realBash) {
+      const calls = (await readFile(record, 'utf8')).trim().split('\n').sort();
+      expect(calls).toEqual([
+        'bun install --frozen-lockfile',
+        'npm ci --no-audit --no-fund',
+        'pnpm install --frozen-lockfile',
+      ]);
+      const out = seen.map(s => s.stdout).join('\n');
+      expect(out).toContain('dprep: npm ci (package-lock.json)');
+      expect(out).not.toContain('dprep.sh missing');
+      for (const kind of Object.keys(kinds)) {
+        expect((await stat(join(testDir, kind, 'node_modules'))).isDirectory()).toBe(true);
+      }
+    }
+  });
+
+  it('bash nodes that do not read ARCHON_LANE_SCRIPTS_DIR get no lane scripts dir', async () => {
+    const envs: NodeJS.ProcessEnv[] = [];
+    const execSpy = spyOn(git, 'execFileAsync').mockImplementation(
+      async (_command: string, _args: string[], opts?: { env?: NodeJS.ProcessEnv }) => {
+        envs.push(opts?.env ?? {});
+        return { stdout: 'ok\n', stderr: '' };
+      }
+    );
+    await executeDagWorkflow(
+      createMockDeps(),
+      createMockPlatform(),
+      'conv-no-lane-scripts',
+      testDir,
+      { name: 'no-lane-scripts-test', nodes: [{ id: 'step', bash: 'echo ok' }] },
+      makeWorkflowRun('no-lane-scripts-run-id'),
+      'claude',
+      undefined,
+      join(testDir, 'artifacts'),
+      join(testDir, 'logs'),
+      'main',
+      'docs/',
+      minimalConfig
+    );
+    execSpy.mockRestore();
+    expect(envs).toHaveLength(1);
+    expect(envs[0].ARCHON_LANE_SCRIPTS_DIR).toBeUndefined();
+  });
+
   it('undefined ${input.X} token is left unchanged in bash script', async () => {
     const { execSpy, scriptTexts } = mockBashExecWithScriptCapture();
     const mockDeps = createMockDeps();

@@ -47,6 +47,20 @@ The pnpm dprep branch runs only when there is no bun lock, pnpm-lock.yaml exists
 pnpm is on PATH, and node_modules is absent. It then runs pnpm install --frozen-lockfile
 inside the same credential-scrubbed subshell as the bun branch, and it always returns 0.
 
+The npm dprep branch runs only when there is no bun lock and no pnpm-lock.yaml, and
+package-lock.json exists. It runs npm ci --no-audit --no-fund in the same scrubbed
+subshell and logs "dprep: npm ci (package-lock.json)". Any other package dir skips.
+
+dprep_ensure_js_deps lives in one shared file, scripts/lane/dprep.sh. The prep-dependencies
+and run-stop-tests nodes of every bdc-feature-development lane source it, trying in order:
+$BDC_DPREP_SCRIPT (tests), $ARCHON_LANE_SCRIPTS_DIR/dprep.sh, then
+/app/scripts/lane/dprep.sh (the Docker image copy). The bundle generator embeds
+scripts/lane/*.sh as BUNDLED_LANE_SCRIPTS, and the bash node executor writes them into a
+per-node directory exported as ARCHON_LANE_SCRIPTS_DIR (only for nodes whose script reads
+that variable; removed when the node ends), so standalone CLI and source runs work
+without /app. Only when no candidate exists does the node log "dprep: dprep.sh missing"
+and continue.
+
 Bumping a version
 
 Change each version and its checksum together, from the publisher checksums.
