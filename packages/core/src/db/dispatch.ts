@@ -1573,8 +1573,20 @@ export async function disposeMessageByMachine(
   };
 
   if (transactionQuery) return execute(transactionQuery);
-  return withRetriedMailboxTransaction(() => getDatabase().withTransaction(execute));
+  return withRetriedMailboxTransaction(() =>
+    getDatabase().withTransaction(execute, MAILBOX_TRANSACTION_OPTIONS)
+  );
 }
+
+/**
+ * Mailbox receipts read the row, validate it, then UPDATE it. Under a deferred
+ * SQLite BEGIN that UPDATE is a lock upgrade, and SQLite fails an upgrade at
+ * once (no busy_timeout wait) when another process holds or has just taken the
+ * write lock. The retry below then had only about 30ms of budget, which CI load
+ * exceeded (bdc-harness runs 41772183976, 41780148151). Taking the write lock
+ * at BEGIN lets busy_timeout do the waiting.
+ */
+const MAILBOX_TRANSACTION_OPTIONS = { immediate: true } as const;
 
 function isRetriableMailboxTransactionError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
@@ -1766,7 +1778,7 @@ export async function acknowledgeMessage(data: {
         return { ok: false, reason: 'actor_mismatch' };
       }
       return { ok: false, reason: 'actor_mismatch' };
-    })
+    }, MAILBOX_TRANSACTION_OPTIONS)
   );
 }
 
@@ -1830,7 +1842,7 @@ export async function addressMessage(data: {
         return { ok: false, reason: 'actor_mismatch' };
       }
       return { ok: false, reason: 'actor_mismatch' };
-    })
+    }, MAILBOX_TRANSACTION_OPTIONS)
   );
 }
 

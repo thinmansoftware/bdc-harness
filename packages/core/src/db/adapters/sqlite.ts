@@ -325,7 +325,8 @@ export class SqliteAdapter implements IDatabase {
   }
 
   async withTransaction<T>(
-    fn: (query: <U>(sql: string, params?: unknown[]) => Promise<QueryResult<U>>) => Promise<T>
+    fn: (query: <U>(sql: string, params?: unknown[]) => Promise<QueryResult<U>>) => Promise<T>,
+    options?: { immediate?: boolean }
   ): Promise<T> {
     if (this.inSqlTransaction()) {
       throw new Error('nested sqlite transaction');
@@ -335,7 +336,11 @@ export class SqliteAdapter implements IDatabase {
         throw new Error('sqlite transaction mutex inconsistent');
       }
       this.sqlTransactionOpen = true;
-      await this.query('BEGIN');
+      // IMMEDIATE takes the write lock here, where busy_timeout applies. A
+      // deferred BEGIN that reads first cannot wait when it later upgrades to
+      // a write while another process holds the lock: SQLite returns
+      // SQLITE_BUSY at once instead of invoking the busy handler.
+      await this.query(options?.immediate ? 'BEGIN IMMEDIATE' : 'BEGIN');
       try {
         const result = await fn(this.query.bind(this));
         await this.query('COMMIT');
