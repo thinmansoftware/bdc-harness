@@ -106,7 +106,11 @@ export interface CascadeDeps {
    * OPEN non-fork PRs that claim this WO. Used to declare a repair target on a
    * climb fire. Defaults to listOpenWoPullRequests (fails open to []).
    */
-  listOpenWoPullRequests?: (woId: string, project: string) => Promise<OpenWoPullRequest[]>;
+  listOpenWoPullRequests?: (
+    woId: string,
+    project: string,
+    options?: OpenWoPullRequestLookupOptions
+  ) => Promise<OpenWoPullRequest[]>;
   /** Exclusive active-cascade lock per woId+project. */
   acquireWoLock?: typeof acquireWoLock;
   releaseWoLock?: typeof releaseWoLock;
@@ -576,8 +580,12 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       findWoClaim({ woId: id, project: proj }));
   const listOpenWoPullRequestsImpl =
     opts.deps?.listOpenWoPullRequests ??
-    ((id: string, proj: string): Promise<OpenWoPullRequest[]> =>
-      listOpenWoPullRequests({ woId: id, project: proj }));
+    ((
+      id: string,
+      proj: string,
+      lookupOptions?: OpenWoPullRequestLookupOptions
+    ): Promise<OpenWoPullRequest[]> =>
+      listOpenWoPullRequests({ woId: id, project: proj, ...lookupOptions }));
   const acquireWoLockImpl = opts.deps?.acquireWoLock ?? acquireWoLock;
   const releaseWoLockImpl = opts.deps?.releaseWoLock ?? releaseWoLock;
   const readRunDetailImpl =
@@ -1372,7 +1380,32 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       // appends a repair-target line when exactly one declaration is selected.
       let message = buildFireMessage(woId, project, priorContext ?? undefined, opts.expectedSpec);
       if (attempts.length > 1) {
-        const decision = await resolveClimbRepairTarget(woId, project, listOpenWoPullRequestsImpl);
+        const decision = await resolveClimbRepairTarget(
+          woId,
+          project,
+          listOpenWoPullRequestsImpl,
+          attempts.slice(0, -1),
+          readRunDetailImpl
+        );
+        if (decision.held) {
+          // Fail closed: firing without the lookup could open a second PR for this
+          // WO. One operator message, no fire (bdc-xo #4638).
+          attempt.outcome = 'infra-error';
+          attempt.infraErrorReason = `${CLIMB_HELD_REASON_PREFIX} ${woId}: ${decision.held}`;
+          attempt.completedAt = new Date().toISOString();
+          status = 'infra-alert';
+          await emitEscalation({
+            errorClass: 'service_unavailable',
+            woId,
+            reason:
+              `${CLIMB_HELD_REASON_PREFIX} ${woId} on tier ${tier.name}: ${decision.held}. ` +
+              'Not fired, so no second PR was opened. Re-run the cascade once the lookup works.',
+            overseerPermit: opts.overseerPermit,
+            runId: attempts.at(-2)?.runId ?? null,
+          });
+          await checkpoint();
+          break;
+        }
         repairTargetAlternates = decision.alternates;
         if (decision.declaration) message = `${message}\n${decision.declaration}`;
       }
@@ -1803,9 +1836,26 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 export const REPAIR_TARGET_DECLARATION = (prNumber: number, branch: string): string =>
   `Repair target: PR #${String(prNumber)} (branch ${branch})`;
 
+/** Options a climb passes to the open-PR reader (bdc-xo #4638). */
+export interface OpenWoPullRequestLookupOptions {
+  /** Head branches of earlier attempts' runs; a PR on one claims the WO. */
+  readonly headBranches?: readonly string[];
+  /** Throw on a lookup error instead of failing open to []. */
+  readonly failOnError?: boolean;
+}
+
+/**
+ * Start of the single operator message when a climb cannot finish its repair-target
+ * lookup. The climb is held (not fired) so it can never open a second PR for a WO
+ * whose earlier rung already opened one (acting XO 2026-11-04, bdc-xo #4638).
+ */
+export const CLIMB_HELD_REASON_PREFIX = 'climb held: repair-target lookup failed for';
+
 interface ClimbRepairDecision {
   readonly declaration: string | null;
   readonly alternates: CascadeRunRecord['repairTargetAlternates'];
+  /** Set when the lookup could not complete; the climb must not fire. */
+  readonly held?: string;
 }
 
 function isValidRepairCandidate(pr: OpenWoPullRequest): boolean {
@@ -1836,17 +1886,45 @@ function logClimbRepairTarget(woId: string, pr: number | 'none', reason: string)
 async function resolveClimbRepairTarget(
   woId: string,
   project: string,
-  read: (woId: string, project: string) => Promise<OpenWoPullRequest[]>
+  read: (
+    woId: string,
+    project: string,
+    options?: OpenWoPullRequestLookupOptions
+  ) => Promise<OpenWoPullRequest[]>,
+  priorAttempts: readonly { readonly runId: string | null }[] = [],
+  readRunDetail?: (runId: string) => Promise<PriorRunDetail | null>
 ): Promise<ClimbRepairDecision> {
   const none: ClimbRepairDecision = { declaration: null, alternates: undefined };
+  // Earlier runs' head branches find a PR that carries no WO marker (#1476).
+  const headBranches: string[] = [];
+  for (const prior of priorAttempts) {
+    if (!prior.runId || !readRunDetail) continue;
+    let detail: PriorRunDetail | null;
+    try {
+      detail = await readRunDetail(prior.runId);
+    } catch {
+      detail = null;
+    }
+    if (!detail) {
+      logClimbRepairTarget(woId, 'none', `run_detail_unavailable:${prior.runId}`);
+      return { ...none, held: `run detail unavailable for prior run ${prior.runId}` };
+    }
+    const head = detail.metadata?.head_branch;
+    if (typeof head === 'string' && head.length > 0) headBranches.push(head);
+  }
   let opens: OpenWoPullRequest[];
   try {
-    opens = await read(woId, project);
-  } catch {
+    opens = await read(woId, project, { headBranches, failOnError: true });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
     logClimbRepairTarget(woId, 'none', 'reader_error');
-    return none;
+    return { ...none, held: `open-PR lookup failed (${detail.slice(0, 200)})` };
   }
-  if (!Array.isArray(opens) || opens.length === 0) {
+  if (!Array.isArray(opens)) {
+    logClimbRepairTarget(woId, 'none', 'reader_error');
+    return { ...none, held: 'open-PR lookup returned no list' };
+  }
+  if (opens.length === 0) {
     logClimbRepairTarget(woId, 'none', 'none');
     return none;
   }

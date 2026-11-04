@@ -30,6 +30,7 @@ function claimStubs(): Pick<
 > {
   return {
     findWoClaim: async () => null,
+    listOpenWoPullRequests: async () => [],
     acquireWoLock: async (woId, project, cascadeId) => ({
       acquired: true,
       path: 'in-memory-test-lock',

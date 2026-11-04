@@ -129,6 +129,9 @@ function baseOpts(partial: Partial<RunCascadeOptions> = {}): RunCascadeOptions {
         },
       }),
       releaseWoLock: async () => {},
+      // No open PR for the WO unless a test overrides it. A climb's open-PR lookup
+      // fails closed (bdc-xo #4638), so tests must not fall through to real `gh`.
+      listOpenWoPullRequests: async () => [],
       // Prior runs report a confirmed teardown unless a test overrides it.
       readRunDetail: async () => ({
         status: 'failed',
@@ -1410,7 +1413,9 @@ function climbTwiceDeps(partial: {
   let fires = 0;
   return {
     findWoClaim: partial.findWoClaim ?? (async () => null),
-    listOpenWoPullRequests: partial.listOpenWoPullRequests,
+    ...(partial.listOpenWoPullRequests
+      ? { listOpenWoPullRequests: partial.listOpenWoPullRequests }
+      : {}),
     fire: async opts => {
       fires += 1;
       partial.messages.push(opts.message);
@@ -1473,24 +1478,34 @@ describe('climb repair target', () => {
   });
 
   test('no_open_pr_no_declaration', async () => {
-    const readers: Array<CascadeDeps['listOpenWoPullRequests']> = [
-      async () => [],
-      async () => {
-        throw new Error('github down');
-      },
-    ];
-    for (const listOpenWoPullRequests of readers) {
-      const messages: string[] = [];
-      const record = await runCascade(
-        baseOpts({
-          deps: climbTwiceDeps({ messages, listOpenWoPullRequests }),
-        })
-      );
-      expect(record.status).toBe('won');
-      expect(messages.length).toBe(2);
-      expect(declarationLines(messages[0] ?? '')).toEqual([]);
-      expect(declarationLines(messages[1] ?? '')).toEqual([]);
-    }
+    const messages: string[] = [];
+    const record = await runCascade(
+      baseOpts({
+        deps: climbTwiceDeps({ messages, listOpenWoPullRequests: async () => [] }),
+      })
+    );
+    expect(record.status).toBe('won');
+    expect(messages.length).toBe(2);
+    expect(declarationLines(messages[0] ?? '')).toEqual([]);
+    expect(declarationLines(messages[1] ?? '')).toEqual([]);
+  });
+
+  // bdc-xo #4638: a reader error no longer fires blind (it could open a second PR);
+  // the climb is held. Full coverage in climb-repair-target-by-branch.test.ts.
+  test('reader_error_holds_the_climb', async () => {
+    const messages: string[] = [];
+    const record = await runCascade(
+      baseOpts({
+        deps: climbTwiceDeps({
+          messages,
+          listOpenWoPullRequests: async () => {
+            throw new Error('github down');
+          },
+        }),
+      })
+    );
+    expect(record.status).toBe('infra-alert');
+    expect(messages.length).toBe(1);
   });
 
   test('climb_picks_newest_open_wo_pr', async () => {
@@ -1958,7 +1973,9 @@ describe('repair holder teardown (conductor)', () => {
       firesAtRead.push(reads);
       return reads >= 3 ? { metadata: { teardown_confirmed_at: '2026-11-01T00:00:00Z' } } : {};
     }, 2000);
-    expect(reads).toBe(3);
+    // 3 teardown-wait polls, then 1 read of the prior run's head_branch for the
+    // climb's repair-target lookup (bdc-xo #4638).
+    expect(reads).toBe(4);
     expect(case1.fires).toBe(2);
     expect(case1.record.status).toBe('won');
 
