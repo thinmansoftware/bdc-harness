@@ -242,6 +242,40 @@ describe('conductor seat-cutoff rung skip', () => {
     expect(logs.some(line => line.includes('Skipping tier "codex"'))).toBe(false);
   });
 
+  test('Test 4: codex rung at limit with allowed=false and credits is fired, not skipped', async () => {
+    // WO-HARNESS-CODEX-CREDITS-HEADROOM-WHEN-WINDOW-EXHAUSTED-01: the live
+    // 2026-11-04 Fuelglass shape (primary 100, limit_reached true, allowed false).
+    process.env[THRESHOLD_ENV] = '95';
+    const fired: string[] = [];
+    const atLimit = {
+      ...seat(100),
+      limit_reached: true,
+      allowed: false,
+      credits: { has_credits: true, overage_limit_reached: false },
+    };
+    await runCascade({
+      woId: 'WO-SEAT-RUNG-CREDITS-AT-LIMIT',
+      project: 'fixture',
+      outDir,
+      token: 'test-token',
+      deps: {
+        ...claimStubs(),
+        ruleset: ruleset('codex'),
+        seatUsage: async () => ({ codex: atLimit, claude: seat(30, 'seven_day') }),
+        seatCutoff: async () => 95,
+        fetchNodeTimeouts: async () => ({}),
+        fire: async opts => {
+          fired.push(opts.workflowName);
+          return { ok: true, runId: 'run-1', conversationId: 'c', infraError: null };
+        },
+        poll: async () => poll('run-1'),
+        judge: () => verdict(true),
+      },
+    });
+    expect(fired).toEqual(['bdc-feature-development-codex']);
+    expect(logs.some(line => line.includes('Skipping tier "codex"'))).toBe(false);
+  });
+
   test('unknown cutoff never skips a measured hot rung', async () => {
     process.env[THRESHOLD_ENV] = '99';
     const fired: string[] = [];

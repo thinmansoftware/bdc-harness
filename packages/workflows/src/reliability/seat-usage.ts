@@ -339,15 +339,21 @@ export function parseCodexCredits(raw: unknown): SeatCredits | undefined {
 
 /**
  * True when a measured codex seat bills purchased credits past its window
- * (has_credits true, overage not blocked, request still allowed). Such a seat
- * has headroom regardless of window percent (John Ranson, 2026-10-27).
+ * (has_credits true, overage not blocked). Such a seat has headroom regardless
+ * of window percent (John Ranson, 2026-10-27).
+ *
+ * The usage endpoint's `allowed` and `limit_reached` describe the plan window
+ * only, so they are not consulted here
+ * (WO-HARNESS-CODEX-CREDITS-HEADROOM-WHEN-WINDOW-EXHAUSTED-01, ruling of
+ * 2026-11-04 that window percent is not capacity). Live proof on bdc-xo issue
+ * 4669: at primary 100 with allowed false and limit_reached true, the codex
+ * CLI in archon-app-1 served a request (exit 0) on credits.
  */
 export function codexOnCredits(reading: SeatReading): boolean {
   return (
     reading.seat === 'codex' &&
     reading.credits?.has_credits === true &&
-    !reading.credits.overage_limit_reached &&
-    reading.allowed !== false
+    !reading.credits.overage_limit_reached
   );
 }
 

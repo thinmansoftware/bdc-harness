@@ -475,3 +475,147 @@ describe('codex purchased credits', () => {
     expect(parseCodexCredits({ balance: '1' })).toBeUndefined();
   });
 });
+
+/**
+ * WO-HARNESS-CODEX-CREDITS-HEADROOM-WHEN-WINDOW-EXHAUSTED-01: the live Fuelglass
+ * codex reading on 2026-11-04 was primary 100, limit_reached true and allowed
+ * false with credits available, and the codex CLI still served a request in
+ * that state (bdc-xo issue 4669, live proof). Credits count as headroom
+ * whatever allowed and limit_reached say; exhausted or blocked credits still
+ * refuse.
+ */
+describe('codex at limit with credits (allowed=false)', () => {
+  function codexAtLimit(credits: Partial<NonNullable<SeatReading['credits']>>): SeatReading {
+    return {
+      ...reading('codex', 'primary', 100),
+      limit_reached: true,
+      allowed: false,
+      credits: {
+        has_credits: true,
+        unlimited: false,
+        overage_limit_reached: false,
+        balance: '62106.88',
+        ...credits,
+      },
+    };
+  }
+
+  /** Cursor lane whose reviewer nodes run on codex-native-strict. */
+  const cursorLaneScope = (failoverProvider?: string): Parameters<typeof decideSeatGate>[3] => ({
+    laneProvider: 'cursor',
+    nodes: [
+      { nodeId: 'implement', providerId: 'cursor' },
+      {
+        nodeId: 'diff-review',
+        providerId: 'codex-native-strict',
+        ...(failoverProvider ? { failoverProvider } : {}),
+      },
+      {
+        nodeId: 'security-review',
+        providerId: 'codex-native-strict',
+        ...(failoverProvider ? { failoverProvider } : {}),
+      },
+    ],
+  });
+
+  test('Test 1: run-start gate admits codex at limit with credits', () => {
+    const readings = { codex: codexAtLimit({}) };
+    const unscoped = decideSeatGate([{ providerId: 'codex' }], readings, 95);
+    expect(unscoped).toEqual({ refused: false, unknownSeats: [], onCredits: ['codex:on_credits'] });
+    const scoped = decideSeatGate([{ providerId: 'codex' }], readings, 95, {
+      laneProvider: 'codex',
+      nodes: [{ nodeId: 'implement', providerId: 'codex' }],
+    });
+    expect(scoped.refused).toBe(false);
+    expect(scoped.onCredits).toContain('codex:on_credits');
+  });
+
+  test('Test 2: node gate does not fail nodes over when codex is on credits', () => {
+    const decision = decideSeatGate(
+      [{ providerId: 'cursor' }, { providerId: 'codex-native-strict' }],
+      {
+        cursor: reading('cursor', 'monthly', 20),
+        claude: reading('claude', 'seven_day', 10),
+        codex: codexAtLimit({}),
+      },
+      95,
+      cursorLaneScope('claude')
+    );
+    expect(decision).toEqual({
+      refused: false,
+      unknownSeats: [],
+      degradedSeats: [],
+      onCredits: ['codex:on_credits'],
+    });
+  });
+
+  test('Test 3: codex on credits is a valid failover target', () => {
+    const decision = decideSeatGate(
+      [{ providerId: 'cursor' }, { providerId: 'claude' }],
+      {
+        cursor: reading('cursor', 'monthly', 20),
+        claude: reading('claude', 'seven_day', 97),
+        codex: codexAtLimit({}),
+      },
+      95,
+      {
+        laneProvider: 'cursor',
+        nodes: [
+          { nodeId: 'implement', providerId: 'cursor' },
+          { nodeId: 'diff-review', providerId: 'claude', failoverProvider: 'codex-native-strict' },
+        ],
+      }
+    );
+    expect(decision.refused).toBe(false);
+    if (decision.refused) return;
+    expect(decision.degradedSeats?.[0]?.seat).toBe('claude');
+    expect(decision.degradedSeats?.[0]?.routes).toEqual([
+      { nodeId: 'diff-review', fromProvider: 'claude', toProvider: 'codex-native-strict' },
+    ]);
+  });
+
+  for (const [name, credits] of [
+    ['case A has_credits false', { has_credits: false }],
+    ['case B overage_limit_reached true', { overage_limit_reached: true }],
+  ] as const) {
+    test(`Test 5: exhausted or blocked credits still refuse (${name})`, () => {
+      const codex = codexAtLimit(credits);
+      const runStart = decideSeatGate([{ providerId: 'codex' }], { codex }, 95);
+      expect(runStart).toEqual({
+        refused: true,
+        seat: 'codex',
+        window: 'primary',
+        usedPercent: 100,
+        cutoffPercent: 95,
+        unknownSeats: [],
+      });
+      const lane = decideSeatGate([{ providerId: 'codex' }], { codex }, 95, {
+        laneProvider: 'codex',
+        nodes: [{ nodeId: 'implement', providerId: 'codex' }],
+      });
+      expect(lane.refused).toBe(true);
+      if (lane.refused) expect(lane.role).toBe('lane');
+      const readings = {
+        cursor: reading('cursor', 'monthly', 20),
+        claude: reading('claude', 'seven_day', 10),
+        codex,
+      };
+      const bindings = [{ providerId: 'cursor' }, { providerId: 'codex-native-strict' }];
+      const degraded = decideSeatGate(bindings, readings, 95, cursorLaneScope('claude'));
+      expect(degraded.refused).toBe(false);
+      if (!degraded.refused) {
+        expect(degraded.onCredits).toBeUndefined();
+        expect(degraded.degradedSeats?.[0]?.seat).toBe('codex');
+        expect(degraded.degradedSeats?.[0]?.nodeIds).toEqual(['diff-review', 'security-review']);
+      }
+      const refused = decideSeatGate(
+        bindings,
+        { ...readings, claude: reading('claude', 'seven_day', 97) },
+        95,
+        cursorLaneScope('claude')
+      );
+      expect(refused.refused).toBe(true);
+      if (refused.refused) expect(refused.role).toBe('node');
+    });
+  }
+});

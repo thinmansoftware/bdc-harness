@@ -570,3 +570,43 @@ describe('node-level seat reroute', () => {
     expect(invocations.filter(call => call.provider === 'claude')).toEqual([]);
   });
 });
+
+/**
+ * WO-HARNESS-CODEX-CREDITS-HEADROOM-WHEN-WINDOW-EXHAUSTED-01: run 8849e767 on
+ * 2026-11-04 (cursor lane) failed six codex-native-strict nodes over to claude
+ * with seat_over_cutoff while codex had purchased credits. With the live
+ * reading (primary 100, limit_reached true, allowed false, credits) the nodes
+ * stay on codex.
+ */
+describe('codex reviewer nodes at limit with credits', () => {
+  test('Test 2: cursor lane codex-native-strict nodes are not failed over', async () => {
+    registerProvider({
+      id: 'codex-native-strict',
+      displayName: 'codex-native-strict',
+      factory: () => provider('codex-native-strict'),
+      capabilities: getProviderCapabilities('codex'),
+      builtIn: true,
+    });
+    setSeatCutoffOverride(95);
+    setSeatUsageReaderForTests(async () => ({
+      cursor: reading('cursor', 'monthly', 20),
+      claude: reading('claude', 'seven_day', 10),
+      codex: {
+        ...reading('codex', 'primary', 100),
+        limit_reached: true,
+        allowed: false,
+        credits: { has_credits: true, unlimited: false, overage_limit_reached: false },
+      },
+    }));
+    const nodes = ['review-diff', 'review-security'].map(
+      id => ({ id, prompt: id, provider: 'codex-native-strict' }) as DagNode
+    );
+    const { result, store } = await run(stubLane('cursor', nodes));
+    expect(result.error ?? '').not.toContain('seat_usage_refused');
+    expect(
+      events(store, 'node_failover').filter(event => event.data.reason_code === 'seat_over_cutoff')
+    ).toEqual([]);
+    expect(dispatched).toContain('codex-native-strict');
+    expect(dispatched).not.toContain('claude');
+  });
+});
