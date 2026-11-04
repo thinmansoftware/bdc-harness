@@ -289,9 +289,9 @@ const CHECKS_SCOPE_PREFIX = 'checks/';
  */
 function parseReviewFindingLines(
   summary: string | null | undefined
-): { severity: string; scope: string }[] {
+): { severity: string; scope: string; remainder: string }[] {
   if (typeof summary !== 'string' || summary.length === 0) return [];
-  const findings: { severity: string; scope: string }[] = [];
+  const findings: { severity: string; scope: string; remainder: string }[] = [];
   for (const raw of summary.split(/\r?\n/)) {
     const line = raw.trim();
     const match = FINDING_LINE_RE.exec(line);
@@ -301,15 +301,103 @@ function parseReviewFindingLines(
     const colon = rest.indexOf(':');
     const scope = (colon === -1 ? rest : rest.slice(0, colon)).trim();
     if (scope.length === 0) continue;
-    findings.push({ severity: (match[1] ?? '').toLowerCase(), scope });
+    const remainder = colon === -1 ? '' : rest.slice(colon + 1).trim();
+    findings.push({ severity: (match[1] ?? '').toLowerCase(), scope, remainder });
   }
   return findings;
 }
 
+/** Severities that block a verdict; minor and note are advisory. */
+const BLOCKING_SEVERITIES = new Set(['blocker', 'major']);
+
+const REQUIRED_CHECK_WORD = 'required check';
+
+function isAsciiDigits(text: string): boolean {
+  if (text.length === 0) return false;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 48 || code > 57) return false;
+  }
+  return true;
+}
+
 /**
- * Check names the standing verdict actually rejected for, from `checks/`
- * finding lines. Moved here from the stale sweep (round 4) so ingest and
- * sweep share one extractor.
+ * Normalise a check name taken from a finding scope. Every step is linear in
+ * the input (redos-guard.test.ts feeds hostile whitespace runs here; CodeQL
+ * js/polynomial-redos flagged the earlier regex form).
+ */
+function cleanCheckName(raw: string): string | null {
+  let name = raw.trim();
+  const failedAt = name.search(/\sfailed\b/i);
+  if (failedAt !== -1) name = name.slice(0, failedAt).trim();
+  // A trailing numeric check-run id, e.g. "CE Promotion Gate (126186742456)".
+  // A matrix cell such as "(windows-latest)" is part of the name and is kept.
+  if (name.endsWith(')')) {
+    const open = name.lastIndexOf('(');
+    if (open !== -1 && isAsciiDigits(name.slice(open + 1, -1))) name = name.slice(0, open).trim();
+  }
+  return name.length > 0 ? name : null;
+}
+
+/**
+ * The check a finding is scoped to, or null when it is not check-scoped.
+ * Accepts the canonical `checks/<name>` and the free-text forms the reviewer
+ * also writes: `Required checks / <name>`, `Required check <name>`, and
+ * `Required check: <name>: ...` (the parser cuts the scope at the first colon,
+ * so for that form the name is read from `remainder` up to its next colon).
+ * Anchor: lspro-react #777, where "[major] Required checks / CE Promotion Gate"
+ * kept a check-caused rejection from ever being re-reviewed (bdc-xo #4575).
+ */
+export function checkNameFromFindingScope(scope: string, remainder = ''): string | null {
+  const trimmed = scope.trim();
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith(CHECKS_SCOPE_PREFIX)) {
+    return cleanCheckName(trimmed.slice(CHECKS_SCOPE_PREFIX.length));
+  }
+  if (!lower.startsWith(REQUIRED_CHECK_WORD)) return null;
+  let rest = trimmed.slice(REQUIRED_CHECK_WORD.length);
+  if (rest.startsWith('s') || rest.startsWith('S')) rest = rest.slice(1);
+  const afterWord = rest.trimStart();
+  if (afterWord.length === 0) {
+    // Bare "Required check(s)": the name follows the scope's colon.
+    const colon = remainder.indexOf(':');
+    if (colon === -1) return null;
+    return cleanCheckName(remainder.slice(0, colon));
+  }
+  // "Required checksum" and the like are not this form: a separator must follow.
+  if (
+    afterWord.length === rest.length &&
+    !afterWord.startsWith('/') &&
+    !afterWord.startsWith(':')
+  ) {
+    return null;
+  }
+  const separated =
+    afterWord.startsWith('/') || afterWord.startsWith(':') ? afterWord.slice(1) : afterWord;
+  return cleanCheckName(separated);
+}
+
+/**
+ * True only when the summary has at least one BLOCKING finding ([blocker] or
+ * [major]) and every blocking finding is check-scoped (see
+ * checkNameFromFindingScope). [minor] and [note] findings are advisory and are
+ * ignored. Empty or unparseable summaries (no finding lines) return false.
+ * Shared by the recheck ingest and the merge gate; do not fork this logic.
+ */
+export function blockingFindingsAreCheckScoped(summary: string | null | undefined): boolean {
+  const blocking = parseReviewFindingLines(summary).filter(finding =>
+    BLOCKING_SEVERITIES.has(finding.severity)
+  );
+  if (blocking.length === 0) return false;
+  return blocking.every(
+    finding => checkNameFromFindingScope(finding.scope, finding.remainder) !== null
+  );
+}
+
+/**
+ * Check names the standing verdict actually rejected for, from its BLOCKING
+ * check-scoped findings. Moved here from the stale sweep (round 4) so ingest
+ * and sweep share one extractor.
  *
  * Unstructured prose (no finding lines) returns empty: the caller then falls
  * back to every latest attempt when verifying via listForRef. Do not
@@ -319,14 +407,11 @@ export function blockingCheckNamesFromVerdict(summary: string | null | undefined
   const names: string[] = [];
   const seen = new Set<string>();
   for (const finding of parseReviewFindingLines(summary)) {
-    const scope = finding.scope;
-    if (!scope.toLowerCase().startsWith(CHECKS_SCOPE_PREFIX)) continue;
-    let name = scope.slice(CHECKS_SCOPE_PREFIX.length).trim();
-    const failedAt = name.search(/\sfailed\b/i);
-    if (failedAt !== -1) name = name.slice(0, failedAt);
-    name = name.trim();
+    if (!BLOCKING_SEVERITIES.has(finding.severity)) continue;
+    const name = checkNameFromFindingScope(finding.scope, finding.remainder);
+    if (name === null) continue;
     const key = name.toLowerCase();
-    if (name.length === 0 || seen.has(key)) continue;
+    if (seen.has(key)) continue;
     seen.add(key);
     names.push(name);
   }
@@ -695,19 +780,19 @@ export function verdictAuthorizesRecheck(verdict: StandingVerdict | null): boole
  *
  * The reviewer writes findings as `[severity] scope: summary`, and a
  * check-caused rejection carries the check in its scope -- live examples from
- * 2026-09-07: `[major] checks/test (windows-latest) failed`. Matching on the
- * `checks/` scope prefix is the structured discriminator. A mixed summary
- * (any finding whose scope is not `checks/`) does NOT authorize: the code
- * finding still stands after a green rerun. Unstructured prose falls back to
+ * 2026-09-07: `[major] checks/test (windows-latest) failed`, and from
+ * 2026-11-03: `[major] Required checks / CE Promotion Gate`. With finding
+ * lines present this is blockingFindingsAreCheckScoped: only BLOCKING findings
+ * count ([note]/[minor] are advisory), and a mixed summary (any blocking
+ * finding not scoped to a check) does NOT authorize, because the code finding
+ * still stands after a green rerun. Unstructured prose falls back to
  * the small set of phrases the reviewer actually emits; an unrecognized
  * summary is treated as a code finding and does NOT authorize.
  */
 export function summaryNamesACheck(summary: string | null | undefined): boolean {
   if (typeof summary !== 'string' || summary.trim().length === 0) return false;
   const findings = parseReviewFindingLines(summary);
-  if (findings.length > 0) {
-    return findings.every(finding => finding.scope.trim().toLowerCase().startsWith('checks/'));
-  }
+  if (findings.length > 0) return blockingFindingsAreCheckScoped(summary);
   const text = summary.toLowerCase();
   return (
     text.includes('checks/') ||
