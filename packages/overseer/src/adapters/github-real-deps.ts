@@ -22,6 +22,7 @@ import type {
 } from '../types.ts';
 import {
   listMessages as listDispatchMessages,
+  listMessagesByCorrelationPrefixWithoutSubjectKey,
   type DispatchMessage,
 } from '@archon/core/db/dispatch';
 import { PR_REVIEW_LOG_RECIPIENT } from '@archon/core/db/dispatch-routing';
@@ -2224,6 +2225,12 @@ type ReviewConflictListFn = (filters: {
   limit: number;
 }) => Promise<Pick<DispatchMessage, 'body' | 'status'>[]>;
 
+type ReviewConflictLegacyListFn = (filters: {
+  recipient: string;
+  correlationPrefix: string;
+  limit: number;
+}) => Promise<Pick<DispatchMessage, 'body' | 'status'>[]>;
+
 /**
  * Reads the rows for reviewConflictFromMessages. REQUESTS ARE READ FIRST: a
  * review writes its submit receipt inside the handler, and its request becomes
@@ -2231,10 +2238,15 @@ type ReviewConflictListFn = (filters: {
  * is seen as in flight; one that finished before it has already written its
  * receipt, which the later receipt reads include. Reading receipts first lets a
  * review finish between the two reads and look clean in both.
+ *
+ * Receipts written before the 2026-09-07 subject_key cutover have no
+ * subject_key, so they are also read by correlation prefix for this exact head,
+ * the way listPriorReviewWork reads legacy history.
  */
 export async function loadReviewConflictAtHead(
   input: PullRequestRef & { headSha: string },
-  list: ReviewConflictListFn
+  list: ReviewConflictListFn,
+  listLegacy: ReviewConflictLegacyListFn
 ): Promise<ReviewConflictAtHead | null> {
   const subjectKey = `gh:${input.owner}/${input.repo}#${input.number}`;
   try {
@@ -2253,13 +2265,28 @@ export async function loadReviewConflictAtHead(
       subject_key: subjectKey,
       limit: REVIEW_CONFLICT_PAGE_LIMIT,
     });
-    // listMessages has no pagination. A full page may hide older rows for this
+    const correlationPrefix = `pr-review:${input.owner}/${input.repo}#${input.number}@${input.headSha}`;
+    const legacyLog = await listLegacy({
+      recipient: PR_REVIEW_LOG_RECIPIENT,
+      correlationPrefix,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    const legacyOperator = await listLegacy({
+      recipient: 'operator',
+      correlationPrefix,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    // The reads have no pagination. A full page may hide older rows for this
     // head, so a full page is not proof of "no conflict".
-    const truncated =
-      requests.length >= REVIEW_CONFLICT_PAGE_LIMIT ||
-      pr.length >= REVIEW_CONFLICT_PAGE_LIMIT ||
-      operator.length >= REVIEW_CONFLICT_PAGE_LIMIT;
-    return reviewConflictFromMessages(input, [...pr, ...operator], requests, { truncated });
+    const truncated = [requests, pr, operator, legacyLog, legacyOperator].some(
+      rows => rows.length >= REVIEW_CONFLICT_PAGE_LIMIT
+    );
+    return reviewConflictFromMessages(
+      input,
+      [...pr, ...operator, ...legacyLog, ...legacyOperator],
+      requests,
+      { truncated }
+    );
   } catch {
     return 'lookup_failed';
   }
@@ -2361,7 +2388,11 @@ export function createRealGitHubClientDeps(
       });
     },
     reviewConflictAtHead: (input): Promise<ReviewConflictAtHead | null> =>
-      loadReviewConflictAtHead(input, listDispatchMessages),
+      loadReviewConflictAtHead(
+        input,
+        listDispatchMessages,
+        listMessagesByCorrelationPrefixWithoutSubjectKey
+      ),
     findPullRequest: createRealFindPullRequest(octokit),
     // Merge mutations go through the distinct merge identity when configured
     // (M-153: the merger is never the reviewer).

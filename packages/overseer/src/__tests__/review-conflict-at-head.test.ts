@@ -29,6 +29,66 @@ const request = (
   status,
 });
 
+const noLegacy = async (): Promise<{ body: string; status: 'done' }[]> => [];
+
+// Subject-keyed reads: requests and receipts for head H, none conflicting.
+const cleanList = async (filters: { recipient: string }) =>
+  filters.recipient === 'overseer-reviewer'
+    ? [request(H, 'done')]
+    : filters.recipient === 'operator'
+      ? []
+      : [{ ...receipt(H, 'approved'), status: 'done' as const }];
+
+describe('legacy receipts without subject_key (WO-HARNESS-MERGE-GATE-LEGACY-RECEIPT-READ-01)', () => {
+  test('Test 1: legacy_changes_requested_blocks', async () => {
+    const prefixes: string[] = [];
+    const legacy = async (filters: { recipient: string; correlationPrefix: string }) => {
+      prefixes.push(filters.correlationPrefix);
+      return filters.recipient === 'operator'
+        ? [{ ...receipt(H, 'changes_requested'), status: 'done' as const }]
+        : [];
+    };
+    expect(await loadReviewConflictAtHead({ ...PR, headSha: H }, cleanList, legacy)).toBe(
+      'changes_requested'
+    );
+    // Scoped to this exact head, from both receipt recipients.
+    expect(prefixes).toEqual([
+      `pr-review:${PR.owner}/${PR.repo}#${PR.number}@${H}`,
+      `pr-review:${PR.owner}/${PR.repo}#${PR.number}@${H}`,
+    ]);
+  });
+
+  test('Test 2: legacy_other_head_ignored', async () => {
+    const legacy = async () => [{ ...receipt(G, 'changes_requested'), status: 'done' as const }];
+    expect(await loadReviewConflictAtHead({ ...PR, headSha: H }, cleanList, legacy)).toBeNull();
+  });
+
+  test('Test 3: capped_legacy_read_fails_closed', async () => {
+    const full = Array.from({ length: 500 }, () => ({
+      ...receipt(H, 'approved'),
+      status: 'done' as const,
+    }));
+    const legacy = async (filters: { recipient: string }) =>
+      filters.recipient === 'operator' ? full : [];
+    expect(await loadReviewConflictAtHead({ ...PR, headSha: H }, cleanList, legacy)).toBe(
+      'lookup_failed'
+    );
+  });
+
+  test('a failing legacy read fails closed', async () => {
+    const legacy = async (): Promise<never> => {
+      throw new Error('db down');
+    };
+    expect(await loadReviewConflictAtHead({ ...PR, headSha: H }, cleanList, legacy)).toBe(
+      'lookup_failed'
+    );
+  });
+
+  test('no legacy rows and a clean subject-keyed history is not a conflict', async () => {
+    expect(await loadReviewConflictAtHead({ ...PR, headSha: H }, cleanList, noLegacy)).toBeNull();
+  });
+});
+
 describe('reviewConflictFromMessages', () => {
   test('Test 5: real_dep_changes_requested_receipt', () => {
     expect(
@@ -104,7 +164,7 @@ describe('reviewConflictFromMessages', () => {
       if (reads === 1) finished = true;
       return rows;
     };
-    expect(await loadReviewConflictAtHead({ ...PR, headSha: H }, list)).not.toBeNull();
+    expect(await loadReviewConflictAtHead({ ...PR, headSha: H }, list, noLegacy)).not.toBeNull();
     expect(order[0]).toBe('overseer-reviewer');
   });
 
@@ -112,7 +172,9 @@ describe('reviewConflictFromMessages', () => {
     const list = async (): Promise<never> => {
       throw new Error('db down');
     };
-    expect(await loadReviewConflictAtHead({ ...PR, headSha: H }, list)).toBe('lookup_failed');
+    expect(await loadReviewConflictAtHead({ ...PR, headSha: H }, list, noLegacy)).toBe(
+      'lookup_failed'
+    );
   });
 
   test('ignores other PRs and unparseable bodies', () => {
