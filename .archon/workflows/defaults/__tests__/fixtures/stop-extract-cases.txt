@@ -461,3 +461,54 @@ Stop 1 (x):
 UNPARSED	1	grep -c x y
 DECLARED	1
 @@END
+@@CASE stage_ordinal_beyond_the_list_is_counted
+stages:
+  - repo: org/a
+    what: one
+  - repo: org/a
+    what: two
+
+## 8. Stop conditions
+
+Stop 1 (grep assertion, stage 1):
+  grep -c x f
+  Expected: 1
+
+Stop 2 (grep assertion, stage 3):
+  grep -c y f
+  Expected: 2
+@@EXPECT
+grep -c x f	eq	1
+grep -c y f	eq	2
+UNPARSED	0
+DECLARED	2
+@@END
+@@CASE repeated_repo_stages_without_a_current_repo_all_counted
+stages:
+  - repo: org/a
+    what: one
+  - repo: org/a
+    what: two
+  - repo: org/b
+    what: three
+
+## 8. Stop conditions
+
+Stop 1 (grep assertion, stage 1):
+  grep -c a f
+  Expected: 1
+
+Stop 2 (grep assertion, stage 2):
+  grep -c b f
+  Expected: 2
+
+Stop 3 (grep assertion, stage 3):
+  grep -c c f
+  Expected: 3
+@@EXPECT
+grep -c a f	eq	1
+grep -c b f	eq	2
+grep -c c f	eq	3
+UNPARSED	0
+DECLARED	3
+@@END

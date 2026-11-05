@@ -663,7 +663,7 @@ if [ ! -f "$FIXTURE" ]; then
 else
   for cname in $(sed -n 's/^@@CASE //p' "$FIXTURE"); do
     CASE_N=$((CASE_N + 1))
-    assert_eq "fixture case $cname" "$(fixture_part "$cname" expect)" "$(fixture_part "$cname" spec | rsg_extract)"
+    assert_eq "fixture case $cname" "$(fixture_part "$cname" expect)" "$(fixture_part "$cname" spec | ( unset RSG_STAGE_REPO; export GIT_DIR=/nonexistent; rsg_extract ))"
   done
   if [ "$CASE_N" -ge 12 ]; then PASS=$((PASS + 1)); echo "PASS: fixture has at least 12 cases ($CASE_N)"; else FAIL=$((FAIL + 1)); echo "FAIL: fixture case count: $CASE_N"; fi
   if command -v sha256sum >/dev/null 2>&1; then
@@ -916,6 +916,112 @@ done
 BP2="$(printf '## 8. Stop conditions\n\nStop 1 (x):\n  Baseline: nothing yet\n  grep -c x y\n  Expected: 2\n' | RSG_STAGE_REPO=x/y rsg_extract)"
 assert_contains "baseline prose before a command does not hide the command" "grep -c x y${TAB}eq${TAB}2" "$BP2"
 named_end baseline_prose_closes_pending_as_unparsed
+
+# ---------------------------------------------------------------------------
+# Round 6 (Overseer CHANGES_REQUESTED at 3a964c78): the stage list was deduplicated before
+# ordinal stage tags were resolved, so repeated repositories shifted every later stage and
+# a stage's own assertions were skipped as another stage's. The list now keeps EVERY entry of
+# the spec's first "stages:" block, in order; stage N is entry N; an unresolvable tag is
+# counted (fail closed), never skipped.
+# ---------------------------------------------------------------------------
+echo "--- repeated_repo_stages_keep_ordinals ---"
+named_begin
+RS_SPEC='# WO-X
+
+stages:
+  - repo: org/a
+    what: one
+  - repo: org/a
+    what: two
+  - repo: org/b
+    what: three
+
+## 8. Stop conditions (CI-executable)
+
+Stop 1 (grep assertion, stage 1):
+  grep -c alpha f.txt
+  Expected: 1
+
+Stop 2 (grep assertion, stage 2):
+  grep -c needle f.txt
+  Expected: 1
+
+Stop 3 (grep assertion, stage 3):
+  grep -c alpha f.txt
+  Expected: 1
+'
+RST="$(mktemp -d)"
+printf 'alpha\n' > "$RST/f.txt"
+RS_A="$(cd "$RST" && printf '%s\n' "$RS_SPEC" | RSG_STAGE_REPO=org/a rsg_extract)"
+assert_contains "running in org/a: the stage 2 grep is declared (not shifted onto org/b)" "grep -c needle f.txt${TAB}eq${TAB}1" "$RS_A"
+assert_contains "running in org/a: stages 1 and 2 are declared" "DECLARED${TAB}2" "$RS_A"
+assert_contains "running in org/a: the stage 3 grep is skipped visibly as other-stage" "OTHER_STAGE${TAB}grep -c alpha f.txt${TAB}stage repo org/b" "$RS_A"
+RS_AR="$(cd "$RST" && printf '%s\n' "$RS_SPEC" | RSG_STAGE_REPO=org/a rsg_extract | rsg_run 2>/dev/null)"
+assert_eq "running in org/a: both declared greps are executed" "2" "$(kv GREP_EXECUTED "$RS_AR")"
+assert_eq "running in org/a: the stage 2 grep FAILS as it should (needle is absent)" "mismatch" "$(kv GREP_STATUS "$RS_AR")"
+assert_contains "running in org/a: the failure names the stage 2 command" "MISMATCH: grep -c needle f.txt => 0 (expected eq 1)" "$RS_AR"
+assert_eq "running in org/a: one stop is skipped as other-stage" "1" "$(kv GREP_OTHER_STAGE "$RS_AR")"
+RS_B="$(cd "$RST" && printf '%s\n' "$RS_SPEC" | RSG_STAGE_REPO=org/b rsg_extract)"
+assert_contains "running in org/b: only the stage 3 grep is declared" "DECLARED${TAB}1" "$RS_B"
+assert_eq "running in org/b: stages 1 and 2 are both skipped as other-stage" "2" "$(printf '%s\n' "$RS_B" | grep -c '^OTHER_STAGE' || true)"
+RS_BR="$(cd "$RST" && printf '%s\n' "$RS_SPEC" | RSG_STAGE_REPO=org/b rsg_extract | rsg_run 2>/dev/null)"
+assert_eq "running in org/b: the stage 3 grep is executed and passes" "passed" "$(kv GREP_STATUS "$RS_BR")"
+assert_eq "running in org/b: executed 1" "1" "$(kv GREP_EXECUTED "$RS_BR")"
+rm -rf "$RST"
+named_end repeated_repo_stages_keep_ordinals
+
+echo "--- stage_mapping_table_keeps_every_entry ---"
+named_begin
+stage_case() {
+  # stage_case <list "a a b"> <stage n> <current repo>  -> expect: skipped iff entry n exists and differs
+  local list="$1" n="$2" cur="$3" spec="" r out entry="" i=0 want
+  spec="stages:"$'\n'
+  for r in $list; do spec="$spec  - repo: org/$r"$'\n'"    what: x"$'\n'; i=$((i + 1)); [ "$i" -eq "$n" ] && entry="$r"; done
+  spec="$spec"$'\n'"## 8. Stop conditions"$'\n\n'"Stop 1 (grep assertion, stage $n):"$'\n'"  grep -c x f"$'\n'"  Expected: 1"$'\n'
+  out="$(printf '%s' "$spec" | RSG_STAGE_REPO="org/$cur" rsg_extract)"
+  if [ -n "$entry" ] && [ "$entry" != "$cur" ]; then want=skipped; else want=counted; fi
+  if [ "$want" = skipped ]; then
+    assert_eq "stages [$list] stage $n in org/$cur is skipped as other-stage" "1 0" "$(printf '%s\n' "$out" | grep -c '^OTHER_STAGE' || true) $(printf '%s\n' "$out" | grep -c "grep -c x f${TAB}eq" || true)"
+  else
+    assert_eq "stages [$list] stage $n in org/$cur is counted (never skipped)" "0 1" "$(printf '%s\n' "$out" | grep -c '^OTHER_STAGE' || true) $(printf '%s\n' "$out" | grep -c "grep -c x f${TAB}eq" || true)"
+  fi
+}
+for lst in "a a b" "a b a" "a a a" "a b" "b a a b"; do
+  for sn in 1 2 3 4 5; do
+    for cr in a b; do stage_case "$lst" "$sn" "$cr"; done
+  done
+done
+named_end stage_mapping_table_keeps_every_entry
+
+echo "--- a second stages: list (the canonical-stages copy) does not extend the stage list ---"
+named_begin
+DUP_SPEC='stages:
+  - repo: org/a
+    what: one
+  - repo: org/b
+    what: two
+
+## Canonical stages
+
+```yaml
+stages:
+  - id: x
+    repo: org/a
+  - id: y
+    repo: org/b
+```
+
+## 8. Stop conditions
+
+Stop 1 (grep assertion, stage 2):
+  grep -c x f
+  Expected: 1
+'
+DUP_A="$(printf '%s\n' "$DUP_SPEC" | RSG_STAGE_REPO=org/a rsg_extract)"
+assert_eq "stage 2 is org/b in a spec that repeats its stage list: skipped in org/a" "1" "$(printf '%s\n' "$DUP_A" | grep -c '^OTHER_STAGE' || true)"
+DUP_B="$(printf '%s\n' "$DUP_SPEC" | RSG_STAGE_REPO=org/b rsg_extract)"
+assert_contains "and counted in org/b" "DECLARED${TAB}1" "$DUP_B"
+named_end repeated_stage_list_does_not_shift_ordinals
 
 echo "--- every_counted_command_pairs_with_its_own_expected_or_is_unparsed (mixed-sequence table + seeded fuzz) ---"
 named_begin

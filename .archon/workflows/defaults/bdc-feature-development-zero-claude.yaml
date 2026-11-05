@@ -2546,8 +2546,10 @@ nodes:
       #        whose first word is grep, egrep, fgrep, rg, git grep, node, bun, bunx, npm, npx,
       #        wc or "test -" is an uncounted command line: declared and unparsed, so
       #        none_declared can no longer sit next to an uncounted command line.
-      #   STAGE SCOPING (found live, MIXED / multi-stage specs): the stage repos are the "repo:
-      #   <owner/name>" lines of the spec in order of first appearance (stage 1 is the first). The
+      #   STAGE SCOPING (found live, MIXED / multi-stage specs): the stage list is the "repo:
+      #   <owner/name>" entries of the spec's FIRST "stages:" block, every entry kept in order and
+      #   never deduplicated (a repository listed twice is two stages; stage N is entry N; a second
+      #   stages: block, such as the canonical-stages copy, is ignored). The
       #   current repo is $RSG_STAGE_REPO, else the owner/name of this worktree origin remote; when
       #   neither is known nothing is scoped. A counted block whose header names "stage <N>" (N a
       #   known stage) or names a known stage repo (owner/name) belongs to that stage; when that
@@ -2629,9 +2631,17 @@ nodes:
             sub(/^.*\//, "", x); sub(/^.*\//, "", y)
             return (x == y)
           }
+          # Stage N is entry N of the FIRST "stages:" block, every entry kept in order (a repository
+          # listed twice is two stages). A tag that cannot be resolved (no stages block, N beyond the
+          # list) maps to "" and the stop is COUNTED, never skipped. A header that names no stage number
+          # but contains a known repository slug belongs to that repository.
           function stage_of(h,   low, n, i) {
             low = tolower(h)
-            if (match(low, /stage [0-9]+/)) { n = substr(low, RSTART + 6, RLENGTH - 6) + 0; if (n >= 1 && n <= nrepo) return repos[n] }
+            if (match(low, /stage[ \t]+[0-9]+/)) {
+              n = substr(low, RSTART, RLENGTH); sub(/^stage[ \t]+/, "", n); n = n + 0
+              if (n >= 1 && n <= nstg) return stg[n]
+              return ""
+            }
             for (i = 1; i <= nrepo; i++) if (index(low, tolower(repos[i])) > 0) return repos[i]
             return ""
           }
@@ -2642,9 +2652,12 @@ nodes:
             else if (!excl && bcmds == 0 && (legacy || bexp == 0)) { declared++; note_uncounted(hdr) }
             inblk = 0; pending = ""
           }
+          !inblk && !stg_done && /^[ \t]*stages:[ \t]*$/ { stg_open = 1 }
+          stg_open && /^[^ \t]/ && !/^stages:[ \t]*$/ { stg_open = 0; stg_done = 1 }
           !inblk && /^[ \t-]*repo:[ \t]*[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/ {
             r = $0; sub(/^[ \t-]*repo:[ \t]*/, "", r); sub(/[ \t].*$/, "", r)
             if (!repo_known(r)) { nrepo++; repos[nrepo] = r }
+            if (stg_open) { nstg++; stg[nstg] = r }
           }
           /^[ \t]*[*_]*[Ss]top[ \t]+[0-9A-Za-z.]+[ \t]*[(:]/ && (insec || $0 ~ /^[ \t]*[*]*[Ss]top[ \t]+[0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/) {
             flush(); inblk = 1; hdr = clean($0); l = tolower(hdr)
