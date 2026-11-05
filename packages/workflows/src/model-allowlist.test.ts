@@ -66,6 +66,17 @@ function violationsIn(text: string, file: string): string[] {
     .map(({ model, location }) => `${location}: ${model}`);
 }
 
+function claudeViolationsIn(text: string, file: string): string[] {
+  if (file.endsWith('.md')) {
+    const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
+    if (!frontmatter) return [];
+    text = `\n${frontmatter[1]}`;
+  }
+  return modelsIn(text, file)
+    .filter(({ model }) => /^(?:opus|sonnet|haiku)/i.test(model) && !MODEL_ALLOWLIST.has(model))
+    .map(({ model, location }) => `${location}: bare Claude alias ${model}`);
+}
+
 const startThread = mock((_options: unknown) => ({
   id: 'allowlist-test',
   runStreamed: async () => ({
@@ -118,17 +129,7 @@ test('lanes_use_allowlisted_models', () => {
   for (const directory of ['.archon/agents', 'packages/personas', '.archon/workflows']) {
     for (const file of filesUnder(join(root, directory))) {
       if (!/\.(?:md|ya?ml)$/.test(file)) continue;
-      let text = readFileSync(file, 'utf8');
-      if (file.endsWith('.md')) {
-        const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
-        if (!frontmatter) continue;
-        text = `\n${frontmatter[1]}`;
-      }
-      for (const { model, location } of modelsIn(text, relative(root, file))) {
-        if (/^(?:opus|sonnet|haiku)/i.test(model) && !MODEL_ALLOWLIST.has(model)) {
-          violations.push(`${location}: bare Claude alias ${model}`);
-        }
-      }
+      violations.push(...claudeViolationsIn(readFileSync(file, 'utf8'), relative(root, file)));
     }
   }
   expect(violations).toEqual([]);
@@ -174,7 +175,32 @@ test('bundled_defaults_regenerated', () => {
   }
 });
 
+test.each(['fable', 'claude-opus-5', 'claude-opus-4-8', 'claude-sonnet-4-5'])(
+  'Claude scan rejects unlisted %s in frontmatter and flow maps',
+  model => {
+    expect(claudeViolationsIn(`---\nmodel: ${model}\n---\nPrompt.`, 'agent.md')).toHaveLength(1);
+    expect(claudeViolationsIn(`nodes: [{id: x, model: ${model}}]`, 'workflow.yaml')).toHaveLength(
+      1
+    );
+  }
+);
+
+test('Claude scan fails on a BOM before frontmatter', () => {
+  expect(() => claudeViolationsIn('\uFEFF---\nmodel: opus\n---\nPrompt.', 'agent.md')).toThrow(
+    'BOM'
+  );
+});
+
 test('allowlist_rejects_unlisted_model', () => {
+  expect(claudeViolationsIn('---\nmodel: opus[1m]\n---\nPrompt.', 'agent.md')).toEqual([
+    'agent.md:2: bare Claude alias opus[1m]',
+  ]);
+  expect(claudeViolationsIn('nodes: [{id: x, model: sonnet}]', 'workflow.yaml')).toEqual([
+    'workflow.yaml:1: bare Claude alias sonnet',
+  ]);
+  for (const model of MODEL_ALLOWLIST) {
+    expect(claudeViolationsIn(`---\nmodel: "${model}"\n---\nPrompt.`, 'agent.md')).toEqual([]);
+  }
   for (const model of [
     'gpt-5.6-sol',
     'made-up-model-9',

@@ -335,6 +335,33 @@ model: sonnet
 // ---------------------------------------------------------------------------
 
 describe('loadAgentRegistry', () => {
+  test.each(['sonnet', 'opus[1m]', 'fable', 'claude-opus-5'])(
+    'rejects non-allowlisted Claude model %s',
+    async model => {
+      const file = await writeAgent(
+        'unpinned.md',
+        `---\nname: unpinned\nmodel: ${model}\n---\nPrompt.`
+      );
+      await expect(loadAgentFile(file)).rejects.toMatchObject({ code: 'agent_invalid_model' });
+    }
+  );
+  test('loads the real repository agents without rejecting pinned models', async () => {
+    const registry = await loadAgentRegistry(join(import.meta.dir, '../../../../.archon/agents'));
+    expect(registry.size).toBeGreaterThan(0);
+    expect(registry.get('major-build')?.model).toBe('claude-opus-5-5[1m]');
+  });
+
+  test.each(['claude-sonnet-5-5', 'claude-sonnet-5-5[1m]', 'claude-opus-5-5[1m]'])(
+    'accepts pinned model %s',
+    async model => {
+      const file = await writeAgent(
+        'pinned.md',
+        `---\nname: pinned\nmodel: ${model}\n---\nPrompt.`
+      );
+      expect((await loadAgentFile(file)).model).toBe(model);
+    }
+  );
+
   test('loads all valid agents from directory', async () => {
     const agent1 = `---\nname: agent-one\nmodel: sonnet\n---\n\nAgent one prompt.`;
     const agent2 = `---\nname: agent-two\nmodel: opus\n---\n\nAgent two prompt.`;
