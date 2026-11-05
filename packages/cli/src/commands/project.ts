@@ -1,6 +1,7 @@
 import { findCodebaseByName } from '@archon/core/db/codebases';
 import { parseProjectRecord } from '@archon/core/grimoire/project-record';
-import { getRepoBasePolicy, resolveMergeRepoPolicy } from '@archon/overseer/merge-repo-policy';
+import { resolveExecutionMergeRepoPolicy } from '@archon/overseer/merge-execution-bridge';
+import { getRepoBasePolicy } from '@archon/overseer/merge-repo-policy';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -95,9 +96,10 @@ export async function projectCommand(
     record.base_branch,
     row.default_branch
   );
-  // Judge branches with the merge engine's own lookup (trim + lowercase), so verify
-  // can never disagree with what merge execution would actually do.
-  const policy = resolveMergeRepoPolicy();
+  // Judge branches with merge execution's own effective policy (including the
+  // deprecated OVERSEER_MERGE_REPO_CONFIG) and its lookup (trim + lowercase), so
+  // verify can never disagree with what merge execution would actually do.
+  const policy = resolveExecutionMergeRepoPolicy();
   const bases = policy[repo.trim().toLowerCase()] ?? {};
   check(
     'merge_policy.base',

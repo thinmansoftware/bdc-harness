@@ -25,7 +25,12 @@ let root: string;
 let db: SqliteAdapter;
 const repo = 'thinmansoftware/bdc-harness';
 const commandPath = resolve(import.meta.dir, 'project.ts');
-async function run(command = 'verify', extra: string[] = [], policy?: string) {
+async function run(
+  command = 'verify',
+  extra: string[] = [],
+  policy?: string,
+  legacyRepoConfig?: string
+) {
   const proc = Bun.spawn(
     [
       'bun',
@@ -39,7 +44,7 @@ async function run(command = 'verify', extra: string[] = [], policy?: string) {
         DATABASE_URL: '',
         MERGE_MANAGER_REPO_POLICY: policy,
         MERGE_MANAGER_ALLOWED_BASES: undefined,
-        OVERSEER_MERGE_REPO_CONFIG: undefined,
+        OVERSEER_MERGE_REPO_CONFIG: legacyRepoConfig,
         LOG_LEVEL: 'silent',
       },
       stdout: 'pipe',
@@ -200,4 +205,25 @@ test('policy_lookup_matches_merge_engine_case_and_whitespace (Overseer #1423 reg
   expect(result.code).toBe(1);
   expect(result.output).toMatch(/^AGREE merge_policy\.base$/m);
   expect(result.output).toContain('DISAGREE merge_policy.production record=["Main"] live=["Main"]');
+});
+
+test('legacy_overseer_merge_repo_config_is_honored_like_merge_execution (Overseer #1507)', async () => {
+  // Merge execution (merge-execution-bridge configuredPolicy) parses the deprecated
+  // OVERSEER_MERGE_REPO_CONFIG; verify must judge against the same effective policy.
+  const base = await run(
+    'verify',
+    [],
+    undefined,
+    JSON.stringify({ [repo]: { baseBranch: 'dev' } })
+  );
+  expect(base.output).toMatch(/^AGREE merge_policy\.base$/m);
+  expect(base.output).toMatch(/^AGREE merge_policy\.production$/m);
+  const unsafe = await run(
+    'verify',
+    [],
+    undefined,
+    JSON.stringify({ [repo]: { baseBranch: 'Main' } })
+  );
+  expect(unsafe.code).toBe(1);
+  expect(unsafe.output).toContain('DISAGREE merge_policy.production record=["main"] live=["main"]');
 });
