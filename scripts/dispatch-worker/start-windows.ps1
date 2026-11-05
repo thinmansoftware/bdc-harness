@@ -8,6 +8,98 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Wait-DispatchOwnedTunnel {
+    param($Tunnel, $Worker, [scriptblock]$Probe, [scriptblock]$Wait, [int]$Checks = 30)
+    for ($check = 0; $check -lt $Checks; $check++) {
+        if ($null -ne $Worker -and $Worker.HasExited) { return 'worker-exited' }
+        if ($Tunnel.HasExited) { return 'failed' }
+        $listener = & $Probe $Tunnel
+        if ($listener -eq 'foreign') { return 'foreign' }
+        if ($listener -eq 'owned') { return 'ready' }
+        & $Wait
+    }
+    return 'failed'
+}
+
+function Stop-DispatchOwnedTunnel {
+    param($OwnedTunnel)
+    if ($OwnedTunnel.HasExited) { return $true }
+    try {
+        $OwnedTunnel.Kill()
+        return $OwnedTunnel.WaitForExit(5000)
+    } catch { return $false }
+}
+
+function Invoke-DispatchTunnelSupervision {
+    param($Worker, $Tunnel, [scriptblock]$StartTunnel, [scriptblock]$StopTunnel,
+        [scriptblock]$Probe, [scriptblock]$Wait, [scriptblock]$Report, [int]$ReadinessChecks = 30)
+    $attempts = 0
+    $held = $false
+    $uncertain = $false
+    try {
+        while (-not $Worker.HasExited) {
+            if (-not $held -and ($Tunnel.HasExited -or (& $Probe $Tunnel) -ne 'owned')) {
+                if (-not (& $StopTunnel $Tunnel)) {
+                    $uncertain = $true
+                    $held = $true
+                    & $Report 'CLEANUP_UNCERTAIN'
+                } else {
+                    $Tunnel = $null
+                    $ready = $false
+                    while (-not $Worker.HasExited -and $attempts -lt 3) {
+                        if ((& $Probe $null) -ne 'absent') {
+                            $held = $true
+                            & $Report 'FOREIGN_LISTENER_REFUSED'
+                            break
+                        }
+                        $delay = [int][Math]::Pow(2, $attempts)
+                        for ($tick = 0; $tick -lt $delay -and -not $Worker.HasExited; $tick++) { & $Wait }
+                        if ($Worker.HasExited) { break }
+                        $attempts++
+                        & $Report "RECONNECT_ATTEMPT_$attempts"
+                        try { $Tunnel = & $StartTunnel } catch { $Tunnel = $null }
+                        if ($null -eq $Tunnel) { continue }
+                        $state = Wait-DispatchOwnedTunnel $Tunnel $Worker $Probe $Wait $ReadinessChecks
+                        if ($state -eq 'ready') {
+                            $ready = $true
+                            & $Report 'TRANSPORT_RECOVERED'
+                            break
+                        }
+                        if (-not (& $StopTunnel $Tunnel)) {
+                            $uncertain = $true
+                            $held = $true
+                            & $Report 'CLEANUP_UNCERTAIN'
+                            break
+                        }
+                        $Tunnel = $null
+                        if ($state -eq 'foreign') {
+                            $held = $true
+                            & $Report 'FOREIGN_LISTENER_REFUSED'
+                            break
+                        }
+                        if ($state -eq 'worker-exited') { break }
+                    }
+                    if (-not $ready -and -not $Worker.HasExited -and -not $held) {
+                        $held = $true
+                        & $Report 'DEGRADED_EXHAUSTED'
+                    }
+                }
+            }
+            & $Wait
+        }
+        & $Report 'WORKER_EXITED'
+    } finally {
+        if (-not $uncertain -and $null -ne $Tunnel -and -not (& $StopTunnel $Tunnel)) {
+            $uncertain = $true
+            & $Report 'CLEANUP_UNCERTAIN'
+        }
+    }
+    return @{ ReconnectAttempts = $attempts; CleanupUncertain = $uncertain; Held = $held }
+}
+
+# Dot-source only the pure supervision functions for isolated tests.
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
     throw "Dispatch worker config is missing: $ConfigPath"
 }
@@ -17,7 +109,7 @@ $expectedServerUrl = "http://127.0.0.1:$LocalPort"
 if ($config.server_url -ne $expectedServerUrl) {
     throw "config.server_url must be $expectedServerUrl for the managed SSH tunnel"
 }
-if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
+if (-not (Get-Command bun -CommandType Application -ErrorAction SilentlyContinue)) {
     throw 'bun is not available on PATH'
 }
 if (-not (Get-Command ssh -ErrorAction SilentlyContinue)) {
@@ -30,44 +122,59 @@ if ($ValidateOnly) {
 }
 
 $forward = "127.0.0.1:${LocalPort}:127.0.0.1:3090"
-$tunnel = Start-Process -FilePath 'ssh' -ArgumentList @(
+$sshArgs = @(
     '-N',
     '-o', 'ExitOnForwardFailure=yes',
     '-o', 'ServerAliveInterval=30',
     '-o', 'ServerAliveCountMax=3',
     '-L', $forward,
     $SshHost
-) -WindowStyle Hidden -PassThru
+)
+$probe = {
+    param($OwnedTunnel)
+    $listeners = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue)
+    if ($listeners.Count -eq 0) { return 'absent' }
+    if ($null -eq $OwnedTunnel -or $OwnedTunnel.HasExited) { return 'foreign' }
+    foreach ($listener in $listeners) {
+        if ($listener.OwningProcess -ne $OwnedTunnel.Id) { return 'foreign' }
+    }
+    return 'owned'
+}
+$startTunnel = {
+    $process = Start-Process -FilePath 'ssh' -ArgumentList $sshArgs -WindowStyle Hidden -PassThru
+    # Hold the captured process handle, not a later PID lookup.
+    $null = $process.Handle
+    $process
+}
+$stopTunnel = {
+    param($OwnedTunnel)
+    Stop-DispatchOwnedTunnel $OwnedTunnel
+}
+$wait = { Start-Sleep -Seconds 1 }
+$report = { param($State) Write-Host "DISPATCH_TUNNEL_$State" }
+if ((& $probe $null) -ne 'absent') { throw 'DISPATCH_FOREIGN_LISTENER_REFUSED' }
+$tunnel = & $startTunnel
+$supervised = $false
 
 try {
-    $ready = $false
-    for ($attempt = 0; $attempt -lt 30; $attempt++) {
-        if ($tunnel.HasExited) {
-            throw "SSH tunnel exited with code $($tunnel.ExitCode)"
-        }
-        if (Test-NetConnection -ComputerName '127.0.0.1' -Port $LocalPort -InformationLevel Quiet) {
-            $ready = $true
-            break
-        }
-        Start-Sleep -Seconds 1
+    if ((Wait-DispatchOwnedTunnel $tunnel $null $probe $wait) -ne 'ready') {
+        throw "SSH tunnel did not establish its owned local port $LocalPort"
     }
-    if (-not $ready) {
-        throw "SSH tunnel did not open local port $LocalPort"
-    }
-
-    Push-Location (Resolve-Path (Join-Path $PSScriptRoot '..\..'))
-    try {
-        & bun run scripts/dispatch-worker/index.ts --config $ConfigPath
-        if ($LASTEXITCODE -ne 0) {
-            throw "Dispatch worker exited with code $LASTEXITCODE"
-        }
-    }
-    finally {
-        Pop-Location
+    $workingDirectory = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+    $worker = Start-Process -FilePath (Get-Command bun -CommandType Application | Select-Object -First 1).Source `
+        -ArgumentList @('run', 'scripts/dispatch-worker/index.ts', '--config', ('"' + $ConfigPath + '"')) `
+        -WorkingDirectory $workingDirectory -WindowStyle Hidden -PassThru
+    $null = $worker.Handle
+    $supervised = $true
+    $result = Invoke-DispatchTunnelSupervision $worker $tunnel $startTunnel $stopTunnel $probe $wait $report
+    $worker.WaitForExit()
+    if ($result.CleanupUncertain) { throw 'DISPATCH_TUNNEL_CLEANUP_UNCERTAIN' }
+    if ($worker.ExitCode -ne 0) {
+        throw "Dispatch worker exited with code $($worker.ExitCode)"
     }
 }
 finally {
-    if (-not $tunnel.HasExited) {
-        Stop-Process -Id $tunnel.Id -Force
+    if (-not $supervised -and -not (& $stopTunnel $tunnel)) {
+        throw 'DISPATCH_TUNNEL_CLEANUP_UNCERTAIN'
     }
 }

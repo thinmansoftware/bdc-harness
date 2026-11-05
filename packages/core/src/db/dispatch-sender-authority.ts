@@ -23,6 +23,7 @@ export interface DispatchPrincipalCredential {
   readonly send_as: readonly string[];
   readonly receive_as: readonly string[];
   readonly roles: readonly DispatchPrincipalRole[];
+  readonly expires_at?: string;
 }
 
 interface CredentialRecord extends DispatchPrincipalCredential {
@@ -284,6 +285,20 @@ export function parseDispatchPrincipalsRegistry(
 
     const status = record.status;
     const principalId = record.principal_id;
+    const expiresAt = record.expires_at;
+    if (
+      Object.prototype.hasOwnProperty.call(record, 'expires_at') &&
+      (typeof expiresAt !== 'string' ||
+        !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(expiresAt) ||
+        !Number.isFinite(Date.parse(expiresAt)) ||
+        new Date(expiresAt).toISOString() !== expiresAt)
+    ) {
+      throw new DispatchPrincipalAuthError(
+        'dispatch_principal_config_invalid',
+        500,
+        'dispatch_principal_config_invalid_expiry'
+      );
+    }
     if (
       !PRINCIPAL_ID.test(principalId) ||
       RESERVED_PREFIXES.some(prefix => principalId.startsWith(prefix))
@@ -348,6 +363,7 @@ export function parseDispatchPrincipalsRegistry(
       send_as: sendAs,
       receive_as: receiveAs,
       roles,
+      ...(expiresAt === undefined ? {} : { expires_at: expiresAt }),
     });
   }
 
@@ -394,11 +410,17 @@ export function authenticateDispatchPrincipal(input: {
   // Examine every credential for the presented principal with timing-safe compares.
   let matchedActiveOrRetiring: CredentialRecord | null = null;
   let matchedDisabled = false;
+  let matchedExpired = false;
+  const now = Date.now();
   for (const candidate of candidates) {
     const digestMatch = hashEquals(presentedDigest, candidate.token_sha256);
     if (!digestMatch) continue;
     if (candidate.status === 'disabled') {
       matchedDisabled = true;
+      continue;
+    }
+    if (candidate.expires_at !== undefined && now >= Date.parse(candidate.expires_at)) {
+      matchedExpired = true;
       continue;
     }
     matchedActiveOrRetiring = candidate;
@@ -409,6 +431,13 @@ export function authenticateDispatchPrincipal(input: {
         'dispatch_principal_unauthorized',
         401,
         'dispatch_principal_disabled'
+      );
+    }
+    if (matchedExpired) {
+      throw new DispatchPrincipalAuthError(
+        'dispatch_principal_unauthorized',
+        401,
+        'dispatch_principal_expired'
       );
     }
     throw new DispatchPrincipalAuthError(
@@ -445,6 +474,7 @@ export function authenticateDispatchPrincipal(input: {
     send_as: matched.send_as,
     receive_as: matched.receive_as,
     roles: matched.roles,
+    ...(matched.expires_at === undefined ? {} : { expires_at: matched.expires_at }),
   };
 }
 
