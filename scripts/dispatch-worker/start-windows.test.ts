@@ -17,6 +17,43 @@ function powershell(body: string): string {
 }
 
 describe.skipIf(process.platform !== 'win32')('owned Windows Dispatch tunnel supervision', () => {
+  test.each(['unknown', 'throw'])(
+    'uncertain observation holds live worker and tunnel: %s',
+    mode => {
+      const result = JSON.parse(
+        powershell(`
+      $script:ticks=0; $script:stops=0; $script:firstWaitStops=-1;
+      $script:w=[pscustomobject]@{HasExited=$false};
+      $t=[pscustomobject]@{HasExited=$false};
+      $script:events=New-Object 'System.Collections.Generic.List[string]';
+      $probe={param($p) if('${mode}' -eq 'throw'){throw 'synthetic_observation_failure'}; 'unknown'};
+      $stop={param($p) $script:stops++; $p.HasExited=$true; $true};
+      $wait={ $script:ticks++; if($script:ticks -eq 1){$script:firstWaitStops=$script:stops}; if($script:ticks -ge 3){$script:w.HasExited=$true} };
+      $report={param($s) [void]$script:events.Add($s)};
+      $r=Invoke-DispatchTunnelSupervision $script:w $t {throw 'must_not_reconnect'} $stop $probe $wait $report 2;
+      @{firstWaitStops=$script:firstWaitStops; stops=$script:stops; attempts=$r.ReconnectAttempts; events=@($script:events)} | ConvertTo-Json -Compress
+    `)
+      );
+      expect(result.firstWaitStops).toBe(0);
+      expect(result.stops).toBe(1); // Only after the same worker naturally exits.
+      expect(result.attempts).toBe(0);
+      expect(result.events).toEqual(['OBSERVATION_UNCERTAIN', 'WORKER_EXITED']);
+    }
+  );
+
+  test('actual listener adapter distinguishes failed enumeration from verified absence', () => {
+    expect(
+      powershell(`
+      function Get-NetTCPConnection {
+        [CmdletBinding()] param($LocalAddress,$LocalPort,$State)
+        Write-Error -Message 'synthetic_observation_denied' -Category PermissionDenied
+      };
+      if((Get-DispatchOwnedListenerState $null 3900) -ne 'unknown'){throw 'read_error_misclassified'};
+      'OBSERVATION_ERROR_IS_UNKNOWN'
+    `)
+    ).toBe('OBSERVATION_ERROR_IS_UNKNOWN');
+  });
+
   test.each(['recover', 'exhaust', 'foreign', 'uncertain', 'worker-exit', 'flap'])(
     'actual supervisor with injected processes: %s',
     scenario => {

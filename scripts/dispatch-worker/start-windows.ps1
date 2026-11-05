@@ -8,12 +8,40 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Read-DispatchTunnelObservation {
+    param($Tunnel, [scriptblock]$Probe)
+    try {
+        $state = & $Probe $Tunnel
+        if ($state -in @('owned', 'absent', 'foreign')) { return $state }
+    } catch { }
+    return 'unknown'
+}
+
+function Get-DispatchOwnedListenerState {
+    param($OwnedTunnel, [int]$Port)
+    try {
+        $listeners = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $Port -State Listen -ErrorAction Stop)
+        if ($listeners.Count -eq 0) { return 'absent' }
+        if ($null -eq $OwnedTunnel -or $OwnedTunnel.HasExited) { return 'foreign' }
+        foreach ($listener in $listeners) {
+            if ($listener.OwningProcess -ne $OwnedTunnel.Id) { return 'foreign' }
+        }
+        return 'owned'
+    } catch {
+        if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) {
+            return 'absent'
+        }
+        return 'unknown'
+    }
+}
+
 function Wait-DispatchOwnedTunnel {
     param($Tunnel, $Worker, [scriptblock]$Probe, [scriptblock]$Wait, [int]$Checks = 30)
     for ($check = 0; $check -lt $Checks; $check++) {
         if ($null -ne $Worker -and $Worker.HasExited) { return 'worker-exited' }
         if ($Tunnel.HasExited) { return 'failed' }
-        $listener = & $Probe $Tunnel
+        $listener = Read-DispatchTunnelObservation $Tunnel $Probe
+        if ($listener -eq 'unknown') { return 'unknown' }
         if ($listener -eq 'foreign') { return 'foreign' }
         if ($listener -eq 'owned') { return 'ready' }
         & $Wait
@@ -38,7 +66,15 @@ function Invoke-DispatchTunnelSupervision {
     $uncertain = $false
     try {
         while (-not $Worker.HasExited) {
-            if (-not $held -and ($Tunnel.HasExited -or (& $Probe $Tunnel) -ne 'owned')) {
+            $observation = 'unknown'
+            if (-not $held) {
+                $observation = Read-DispatchTunnelObservation $Tunnel $Probe
+                if ($observation -eq 'unknown') {
+                    $held = $true
+                    & $Report 'OBSERVATION_UNCERTAIN'
+                }
+            }
+            if (-not $held -and ($Tunnel.HasExited -or $observation -ne 'owned')) {
                 if (-not (& $StopTunnel $Tunnel)) {
                     $uncertain = $true
                     $held = $true
@@ -47,7 +83,13 @@ function Invoke-DispatchTunnelSupervision {
                     $Tunnel = $null
                     $ready = $false
                     while (-not $Worker.HasExited -and $attempts -lt 3) {
-                        if ((& $Probe $null) -ne 'absent') {
+                        $vacancy = Read-DispatchTunnelObservation $null $Probe
+                        if ($vacancy -eq 'unknown') {
+                            $held = $true
+                            & $Report 'OBSERVATION_UNCERTAIN'
+                            break
+                        }
+                        if ($vacancy -ne 'absent') {
                             $held = $true
                             & $Report 'FOREIGN_LISTENER_REFUSED'
                             break
@@ -63,6 +105,11 @@ function Invoke-DispatchTunnelSupervision {
                         if ($state -eq 'ready') {
                             $ready = $true
                             & $Report 'TRANSPORT_RECOVERED'
+                            break
+                        }
+                        if ($state -eq 'unknown') {
+                            $held = $true
+                            & $Report 'OBSERVATION_UNCERTAIN'
                             break
                         }
                         if (-not (& $StopTunnel $Tunnel)) {
@@ -132,13 +179,7 @@ $sshArgs = @(
 )
 $probe = {
     param($OwnedTunnel)
-    $listeners = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $LocalPort -State Listen -ErrorAction SilentlyContinue)
-    if ($listeners.Count -eq 0) { return 'absent' }
-    if ($null -eq $OwnedTunnel -or $OwnedTunnel.HasExited) { return 'foreign' }
-    foreach ($listener in $listeners) {
-        if ($listener.OwningProcess -ne $OwnedTunnel.Id) { return 'foreign' }
-    }
-    return 'owned'
+    Get-DispatchOwnedListenerState $OwnedTunnel $LocalPort
 }
 $startTunnel = {
     $process = Start-Process -FilePath 'ssh' -ArgumentList $sshArgs -WindowStyle Hidden -PassThru
@@ -152,7 +193,9 @@ $stopTunnel = {
 }
 $wait = { Start-Sleep -Seconds 1 }
 $report = { param($State) Write-Host "DISPATCH_TUNNEL_$State" }
-if ((& $probe $null) -ne 'absent') { throw 'DISPATCH_FOREIGN_LISTENER_REFUSED' }
+$initialObservation = Read-DispatchTunnelObservation $null $probe
+if ($initialObservation -eq 'unknown') { throw 'DISPATCH_TUNNEL_OBSERVATION_UNCERTAIN' }
+if ($initialObservation -ne 'absent') { throw 'DISPATCH_FOREIGN_LISTENER_REFUSED' }
 $tunnel = & $startTunnel
 $supervised = $false
 
