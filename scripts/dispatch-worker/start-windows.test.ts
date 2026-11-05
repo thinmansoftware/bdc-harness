@@ -41,17 +41,30 @@ describe.skipIf(process.platform !== 'win32')('owned Windows Dispatch tunnel sup
     }
   );
 
-  test('actual listener adapter distinguishes failed enumeration from verified absence', () => {
-    expect(
-      powershell(`
+  test.each(['PermissionDenied', 'ObjectNotFound'])(
+    'actual listener adapter refuses enumeration failure: %s',
+    category => {
+      expect(
+        powershell(`
       function Get-NetTCPConnection {
         [CmdletBinding()] param($LocalAddress,$LocalPort,$State)
-        Write-Error -Message 'synthetic_observation_denied' -Category PermissionDenied
+        Write-Error -Message 'synthetic_observation_denied' -Category ${category}
       };
       if((Get-DispatchOwnedListenerState $null 3900) -ne 'unknown'){throw 'read_error_misclassified'};
       'OBSERVATION_ERROR_IS_UNKNOWN'
     `)
-    ).toBe('OBSERVATION_ERROR_IS_UNKNOWN');
+      ).toBe('OBSERVATION_ERROR_IS_UNKNOWN');
+    }
+  );
+
+  test('actual listener adapter verifies absence only after successful empty enumeration', () => {
+    expect(
+      powershell(`
+      function Get-NetTCPConnection { [CmdletBinding()] param() @() };
+      if((Get-DispatchOwnedListenerState $null 3900) -ne 'absent'){throw 'expected_verified_absence'};
+      'SUCCESSFUL_EMPTY_ENUMERATION'
+    `)
+    ).toBe('SUCCESSFUL_EMPTY_ENUMERATION');
   });
 
   test.each(['recover', 'exhaust', 'foreign', 'uncertain', 'worker-exit', 'flap'])(

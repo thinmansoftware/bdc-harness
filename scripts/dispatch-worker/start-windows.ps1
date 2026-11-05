@@ -20,17 +20,18 @@ function Read-DispatchTunnelObservation {
 function Get-DispatchOwnedListenerState {
     param($OwnedTunnel, [int]$Port)
     try {
-        $listeners = @(Get-NetTCPConnection -LocalAddress '127.0.0.1' -LocalPort $Port -State Listen -ErrorAction Stop)
+        # Successful enumeration is required before absence can be established.
+        $listeners = @(Get-NetTCPConnection -ErrorAction Stop | Where-Object {
+            $_.State -eq 'Listen' -and $_.LocalPort -eq $Port -and
+            $_.LocalAddress -in @('127.0.0.1', '0.0.0.0', '::')
+        })
         if ($listeners.Count -eq 0) { return 'absent' }
         if ($null -eq $OwnedTunnel -or $OwnedTunnel.HasExited) { return 'foreign' }
         foreach ($listener in $listeners) {
-            if ($listener.OwningProcess -ne $OwnedTunnel.Id) { return 'foreign' }
+            if ($listener.LocalAddress -ne '127.0.0.1' -or $listener.OwningProcess -ne $OwnedTunnel.Id) { return 'foreign' }
         }
         return 'owned'
     } catch {
-        if ($_.CategoryInfo.Category -eq [System.Management.Automation.ErrorCategory]::ObjectNotFound) {
-            return 'absent'
-        }
         return 'unknown'
     }
 }
