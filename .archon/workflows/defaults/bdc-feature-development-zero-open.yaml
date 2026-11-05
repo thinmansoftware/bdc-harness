@@ -1089,8 +1089,10 @@ nodes:
       cd "$WT"
       # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
       # dprep_ensure_js_deps lives in scripts/lane/dprep.sh (one source of truth). It installs
-      # bun, pnpm or package-lock.json (npm ci) dependencies when node_modules is absent and
-      # always returns 0. Resolution order: $BDC_DPREP_SCRIPT (tests), then the engine's
+      # bun, pnpm or package-lock.json (npm ci) dependencies when node_modules is absent, retries
+      # once without the frozen lockfile, prints the real install output, and returns nonzero
+      # when the install failed (callers continue; the base compare treats it as base_unrunnable).
+      # Resolution order: $BDC_DPREP_SCRIPT (tests), then the engine's
       # per-node copy of the bundled script ($ARCHON_LANE_SCRIPTS_DIR/dprep.sh; works for
       # standalone CLI and source runs), then the image copy /app/scripts/lane/dprep.sh.
       # Only when none exists is it logged and the run continues like a failed install.
@@ -2437,8 +2439,10 @@ nodes:
 
       # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
       # dprep_ensure_js_deps lives in scripts/lane/dprep.sh (one source of truth). It installs
-      # bun, pnpm or package-lock.json (npm ci) dependencies when node_modules is absent and
-      # always returns 0. Resolution order: $BDC_DPREP_SCRIPT (tests), then the engine's
+      # bun, pnpm or package-lock.json (npm ci) dependencies when node_modules is absent, retries
+      # once without the frozen lockfile, prints the real install output, and returns nonzero
+      # when the install failed (callers continue; the base compare treats it as base_unrunnable).
+      # Resolution order: $BDC_DPREP_SCRIPT (tests), then the engine's
       # per-node copy of the bundled script ($ARCHON_LANE_SCRIPTS_DIR/dprep.sh; works for
       # standalone CLI and source runs), then the image copy /app/scripts/lane/dprep.sh.
       # Only when none exists is it logged and the run continues like a failed install.
@@ -5452,13 +5456,20 @@ nodes:
       #   (stamped manifest on stdin -> "OK" rc 0, or "EVIDENCE_ERROR: ..." rc 1)
       #   Only a PROCEED run (real build, real PR) is gated. CODE/MIXED: the Tests: line
       #   must be "<n>/<n> ...". Any class: run-stop-greps must report its declaration
-      #   count and status, and declared greps may not publish N/A. A short manifest is
-      #   the ALREADY_SATISFIED / BLOCKED form and is not gated.
+      #   count and status, and declared greps may not publish N/A. A non-PROCEED run is
+      #   NOT gated and says so: it prints NOT_GATED:<status> (never OK) and, when the tests
+      #   failed, a stderr note naming the status and tests_status. patch-pr-body accepts
+      #   OK or NOT_GATED:BLOCKED / NOT_GATED:ALREADY_SATISFIED / NOT_GATED:UNKNOWN so the
+      #   PR is still stamped (and labelled run:blocked); review-issue never moves an issue
+      #   to review on NOT_GATED:BLOCKED.
       mec_check() {
         local status="$1" class="$2" tests_status="$3" grep_declared="$4" grep_status="$5" tests_exit="${6:-}" grep_executed="${7:-0}" grep_dropped="${8:-0}" grep_unparsed="${9:-0}" grep_mismatch="${10:-0}" grep_detail="${11:-}" manifest tests_line grep_line
         manifest="$(cat)"
         if [ "$status" != "PROCEED" ]; then
-          echo "OK"
+          echo "NOT_GATED:${status:-UNKNOWN}"
+          if [ "$tests_status" = "failed" ]; then
+            echo "NOT_GATED: status=${status:-UNKNOWN} tests_status=failed -- the evidence gate did not gate this non-PROCEED run, so it is not lane-verified (WO-HARNESS-EVIDENCE-GATE-NOT-GATED-AND-BASE-UNRUNNABLE-01)." >&2
+          fi
           return 0
         fi
         if ! printf '%s\n' "$manifest" | grep -qE '^Tests:'; then
@@ -5743,7 +5754,7 @@ nodes:
   - id: patch-pr-body
     persona: major-build
     depends_on: [build-manifest, stamp-manifest-pr, manifest-consistency-check, manifest-evidence-check]
-    when: "$manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'OK' && $open-pr-if-needed.output != ''"
+    when: "$manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'OK' && $open-pr-if-needed.output != '' || $manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'NOT_GATED:BLOCKED' && $open-pr-if-needed.output != '' || $manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'NOT_GATED:ALREADY_SATISFIED' && $open-pr-if-needed.output != '' || $manifest-consistency-check.output == 'OK' && $manifest-evidence-check.output == 'NOT_GATED:UNKNOWN' && $open-pr-if-needed.output != ''"
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -5756,13 +5767,61 @@ nodes:
         python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
       }
 
-      # -- Outcome guard: only patch on PROCEED (a real PR was opened).
+      # ---- BEGIN pbb core (byte-identical across lanes; extracted by unit test) ----
+      # pbb_mark_blocked <status> <pr-url> <repo>   (WO-HARNESS-EVIDENCE-GATE-NOT-GATED-AND-BASE-
+      #   UNRUNNABLE-01). A PR opened or adopted from a non-PROCEED run is not lane-verified: it
+      #   gets the run:blocked label (created when missing, "already exists" tolerated) and a first
+      #   body line "RUN BLOCKED -- not lane-verified". The merge manager refuses a run:blocked PR.
+      #   PROCEED (a real, gated PR) and ALREADY_SATISFIED (nothing was built) are untouched: no gh
+      #   call at all. Never returns nonzero; a failed label or edit is logged to stderr.
+      pbb_mark_blocked() {
+        local status="${1-}" url="${2-}" repo="${3-}" body tmp banner
+        banner='RUN BLOCKED -- not lane-verified'
+        case "$status" in PROCEED|ALREADY_SATISFIED) return 0 ;; esac
+        if [ -z "$url" ] || [ -z "$repo" ]; then
+          echo "pbb: no PR url or repo resolved for status=${status:-unknown}; run:blocked label not applied" >&2
+          return 0
+        fi
+        gh label create run:blocked --repo "$repo" --color B60205 --description "Run ended non-PROCEED: the PR is not lane-verified" >/dev/null 2>&1 || true
+        body="$(gh pr view "$url" --repo "$repo" --json body --jq '.body' 2>/dev/null || true)"
+        tmp="$(mktemp)"
+        case "$body" in
+          "$banner"*) printf '%s\n' "$body" > "$tmp" ;;
+          *) printf '%s\n\n%s\n' "$banner" "$body" > "$tmp" ;;
+        esac
+        if gh pr edit "$url" --repo "$repo" --add-label run:blocked --body-file "$tmp" >/dev/null 2>&1; then
+          echo "pbb: $url labelled run:blocked with the RUN BLOCKED banner (status=$status)"
+        else
+          echo "pbb: could not label/banner $url (status=$status)" >&2
+        fi
+        rm -f "$tmp"
+        return 0
+      }
+      # ---- END pbb core ----
+
+      # -- Outcome guard: the full body patch runs only on PROCEED (a real PR was opened).
+      #    A non-PROCEED run that still produced a PR gets the run:blocked label and banner
+      #    (pbb core above) and no further patch.
       RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
       $block-reclassify.output
       BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
       )
       STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      OPEN_PR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPEN_PR'
+      $open-pr-if-needed.output
+      BDC_NODE_OUTPUT_OPEN_PR
+      )
+      DECIDE_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_DECIDE'
+      $decide-push-target.output
+      BDC_NODE_OUTPUT_DECIDE
+      )
       if [ "$STATUS" != "PROCEED" ]; then
+        NP_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1 || true)
+        if [ -z "$NP_URL" ]; then
+          NP_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1 || true)
+        fi
+        NP_REPO=$(printf '%s\n' "$DECIDE_OUT" | sed -n 's/^repo: //p' | head -1)
+        pbb_mark_blocked "$STATUS" "$NP_URL" "$NP_REPO"
         echo "patch-pr-body: status=$STATUS -- skipping PR body patch (no real PR on this path)."
         exit 0
       fi
@@ -5770,10 +5829,6 @@ nodes:
       # -- Resolve PR URL from open-pr-if-needed output.
       # gh pr create success path prints a bare URL line; the race-recovery path
       # emits "PR_URL=<url>". Handle both.
-      OPEN_PR_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_OPEN_PR'
-      $open-pr-if-needed.output
-      BDC_NODE_OUTPUT_OPEN_PR
-      )
       PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^PR_URL=' | sed 's/^PR_URL=//' | head -1 || true)
       if [ -z "$PR_URL" ]; then
         PR_URL=$(printf '%s\n' "$OPEN_PR_OUT" | grep -E '^https://github\.com/' | head -1 || true)
@@ -5785,10 +5840,6 @@ nodes:
 
       # -- Resolve REPO from decide-push-target output (Rule 29: never let gh
       #    default to the worktree's origin).
-      DECIDE_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_DECIDE'
-      $decide-push-target.output
-      BDC_NODE_OUTPUT_DECIDE
-      )
       REPO=$(printf '%s\n' "$DECIDE_OUT" | sed -n 's/^repo: //p' | head -1)
       if [ -z "$REPO" ] || [ "$REPO" = "unknown" ]; then
         echo "ERROR: REPO not resolved from decide-push-target output." >&2

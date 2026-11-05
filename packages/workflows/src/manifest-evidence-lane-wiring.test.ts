@@ -211,6 +211,25 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
     }
   });
 
+  // WO-HARNESS-EVIDENCE-GATE-NOT-GATED-AND-BASE-UNRUNNABLE-01, Test 10.
+  it('lane_parity_not_gated: the pbb core is byte-identical, mec says NOT_GATED, patch-pr-body accepts it', () => {
+    const canonical = laneNodes('bdc-feature-development-codex.yaml');
+    const expectedPbb = coreOf(node(canonical, 'patch-pr-body', 'canonical').bash ?? '', 'pbb');
+    expect(expectedPbb).toContain('pbb_mark_blocked()');
+    expect(expectedPbb).toContain('RUN BLOCKED -- not lane-verified');
+    expect(expectedPbb).toContain('run:blocked');
+    for (const file of EXPECTED_LANES) {
+      const nodes = laneNodes(file);
+      const patch = node(nodes, 'patch-pr-body', file);
+      expect(coreOf(patch.bash ?? '', 'pbb')).toBe(expectedPbb);
+      expect(patch.bash ?? '').toContain('pbb_mark_blocked "$STATUS" "$NP_URL" "$NP_REPO"');
+      expect(patch.when).toContain("$manifest-evidence-check.output == 'OK'");
+      expect(patch.when).toContain("$manifest-evidence-check.output == 'NOT_GATED:BLOCKED'");
+      const mec = coreOf(node(nodes, 'manifest-evidence-check', file).bash ?? '', 'mec');
+      expect(mec).toContain('NOT_GATED:');
+    }
+  });
+
   it('the placeholder Tests text is still what the engine renders (so the stamp is load-bearing)', () => {
     const collector = readFileSync(
       join(REPO_ROOT, 'packages/workflows/src/reliability/evidence-collector.ts'),
