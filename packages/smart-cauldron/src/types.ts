@@ -5,6 +5,7 @@
  * WO: WO-HARNESS-SMART-CAULDRON-V1-PER-RUN-CASCADE-01
  */
 
+import type { GateMisfire } from './gate-misfire.js';
 import type { EntrySelection } from './headroom.js';
 
 export type TierName = string; // e.g. "zero", "qwen", "codex", "claude", "frontier"
@@ -16,6 +17,7 @@ export type TierOutcome =
   | 'infra-error' // auth/transport failure -- alert, do not count as "too hard"
   | 'progress-timeout' // poll watchdog kill -- run never reached terminal; climb like gate-failed
   | 'cancelled' // externally cancelled; stop, do not climb
+  | 'gate-misfire' // harness gate misfire; stop on this tier, do not climb
   | 'refused'; // already-satisfied guard refused to fire this attempt; distinct from won (bdc-xo#2140)
 
 export interface LadderTier {
@@ -65,6 +67,7 @@ export type CascadeStatus =
   | 'frontier-rejected' // operator rejected the premium-tier climb; terminated as needs-human, no fire
   | 'frontier-approved' // operator approved the premium climb; original record handed off to the resumed cascade (resumeCascadeId)
   | 'cancelled' // an attempt was externally cancelled; cascade stopped
+  | 'gate-misfire' // harness gate misfire; stopped on this tier with one notice, no climb
   | 'refused'; // the already-satisfied guard refused to fire (WO already has a landed PR); attempts stays 0. Distinct from 'won': no tier ran, no gate passed --
 // a refusal is not a win and must never be reported as one (bdc-xo#2140).
 
@@ -167,6 +170,23 @@ export interface CascadeRunRecord {
     prUrl: string;
     checkedAtTier: TierName | null;
   };
+  /**
+   * Populated ONLY when status === 'gate-misfire': a harness-side gate misfire
+   * ended the cascade on this tier. No climb and no SPEC-REPAIR.
+   */
+  gateMisfire?: GateMisfire & {
+    runId: string | null;
+    tier: TierName;
+  };
+  /**
+   * Populated when the cascade stopped blocked for a teardown/checkout reason
+   * (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01): 'checkout_failed_no_climb' or
+   * 'teardown_unconfirmed'; or when a cascade whose entry tier has a
+   * maxClimbsByEntry limit reached that limit and stopped instead of firing
+   * another rung (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01 fence 3):
+   * 'climb_limit_reached'.
+   */
+  blockedReason?: 'checkout_failed_no_climb' | 'teardown_unconfirmed' | 'climb_limit_reached';
   supervisorRecovery?: {
     ownerId: string;
     fencingToken: number;
@@ -180,6 +200,11 @@ export interface CascadeRunRecord {
    * (terminate as needs-human) later. See FrontierApprovalPacket.
    */
   frontierApproval?: FrontierApprovalPacket;
+  /**
+   * Other OPEN WO PRs passed over when a climb selected the newest one.
+   * Absent when the climb had zero or one open PR, or no climb repair decision.
+   */
+  repairTargetAlternates?: readonly { number: number; headRefName: string }[];
 }
 
 export interface GateVerdict {
@@ -211,6 +236,17 @@ export interface PollResult {
   validatorVerdict: 'satisfied' | 'needs_revision' | 'unknown';
   prUrl: string | null;
   prMergeable: boolean | null;
+  /**
+   * Head SHA this run pushed, when read from run metadata (`head_sha` or
+   * `pushed_head_sha`), a `pushed_head=<40 hex>` event line, or the standard
+   * commit-and-push origin verification receipt. Null when absent.
+   */
+  runPushedHeadSha?: string | null;
+  /**
+   * Head SHA of the single open WO PR that matches `runPushedHeadSha`.
+   * Null unless exactly one open WO PR carries that SHA.
+   */
+  openWoPrHeadSha?: string | null;
   servedModelId: string | null;
   /** Last node_completed / node_failed model triple per step. */
   nodeModels?: Record<

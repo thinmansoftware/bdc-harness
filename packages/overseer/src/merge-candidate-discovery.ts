@@ -57,6 +57,11 @@ import {
   unattendedBasesForRepo,
   warnLegacyMergePolicy,
 } from './merge-repo-policy';
+import {
+  resolveRequiredContexts,
+  type RequiredContextsResolution,
+} from './adapters/required-contexts';
+import { partitionBlockingRequiredContexts } from './required-context-gate';
 import type {
   DiscoveredPullRequest,
   MergeCandidateDiscoveryDeps,
@@ -87,12 +92,16 @@ export const DEFAULT_DISCOVERY_MAX_PRS_PER_TICK = 100;
  * distinct from the substantive exclusions -- they mean "we did not learn
  * anything", never "this PR is not mergeable".
  */
+/** Label the lane patch-pr-body node puts on a PR opened from a non-PROCEED run. */
+export const RUN_BLOCKED_LABEL = 'run:blocked';
+
 export type MergeCandidateExclusionReason =
   | 'draft'
   | 'not_open'
   | 'repo_policy_missing'
   | 'base_branch_not_watched'
   | 'review_not_approved'
+  | 'review_execution_unqualified'
   | 'checks_failing'
   | 'checks_pending'
   | 'checks_absent'
@@ -100,7 +109,8 @@ export type MergeCandidateExclusionReason =
   | 'mergeable_unknown'
   | 'evidence_lookup_failed'
   | 'evidence_mismatch'
-  | 'already_a_run_candidate';
+  | 'already_a_run_candidate'
+  | 'run_blocked';
 
 export interface MergeCandidateExclusion {
   readonly owner: string;
@@ -116,8 +126,18 @@ export interface MergeCandidateDiscoveryResult {
   readonly candidates: readonly WatchedRunRecord[];
   /** One entry per PR that was evaluated and NOT included. */
   readonly exclusions: readonly MergeCandidateExclusion[];
-  /** How many PRs were actually looked at this tick. */
+  /**
+   * How many PRs consumed EVIDENCE budget this tick (approved PRs on a watched
+   * base that got the findPullRequest / required-contexts / qualified-review
+   * lookups). Non-approved PRs never consume it; see `structurallyClassified`.
+   */
   readonly evaluated: number;
+  /**
+   * How many listed PRs were classified structurally this tick (zero GitHub
+   * calls). Every listed PR is, every pass, and each non-candidate carries a
+   * named exclusion.
+   */
+  readonly structurallyClassified: number;
   /**
    * How many evaluated PRs had their review decision resolved by the
    * conservative REST fallback instead of GitHub's own aggregate. Non-zero
@@ -235,6 +255,7 @@ export function unavailableDiscoveryResult(
     candidates: [],
     exclusions: [],
     evaluated: 0,
+    structurallyClassified: 0,
     fallbackReviewDecisions: 0,
     unavailable: true,
     unavailableReason: reason,
@@ -266,6 +287,13 @@ export interface DiscoveryConfigurationReport {
   readonly repos: readonly DiscoveryRepoTarget[];
   readonly watchedBases: readonly string[];
   readonly maxPullRequestsPerTick: number;
+  /**
+   * The bases the sweep actually watches per repo, resolved from
+   * MERGE_MANAGER_REPO_POLICY exactly as the sweep does. `watchedBases` is the
+   * legacy global list; on its own it once suggested bdc-xo `main` was unwatched
+   * (WO-HARNESS-MERGE-MANAGER-POST-REBUILD-STALL-01).
+   */
+  readonly perRepoBases: Readonly<Record<string, readonly string[]>>;
   /** False when the sweep would return `no_repos_configured` on every tick. */
   readonly configured: boolean;
 }
@@ -274,9 +302,31 @@ export function describeDiscoveryConfiguration(
   env: NodeJS.ProcessEnv = process.env
 ): DiscoveryConfigurationReport {
   const repos = resolveDiscoveryRepos(env[DISCOVERY_REPOS_ENV]);
+  const explicitPolicy = env[MERGE_MANAGER_REPO_POLICY_ENV];
+  let perRepoBases: Record<string, readonly string[]> = {};
+  try {
+    const policy = resolveMergeRepoPolicy({
+      rawPolicy: explicitPolicy,
+      legacyAllowedBases:
+        explicitPolicy === undefined && env[LEGACY_ALLOWED_BASES_ENV] !== undefined
+          ? resolveWatchedBaseBranches(env[DISCOVERY_BASE_BRANCHES_ENV])
+          : undefined,
+      legacyRepos: repos.map(target => `${target.owner}/${target.repo}`),
+    });
+    perRepoBases = Object.fromEntries(
+      repos.map(target => {
+        const ownerRepo = `${target.owner}/${target.repo}`;
+        return [ownerRepo, resolveWatchedBaseBranchesForRepo(ownerRepo, policy)];
+      })
+    );
+  } catch {
+    // A malformed policy is reported by the sweep itself; the startup report
+    // must never be the thing that throws.
+  }
   return {
     repos,
     watchedBases: resolveWatchedBaseBranches(env[DISCOVERY_BASE_BRANCHES_ENV]),
+    perRepoBases,
     maxPullRequestsPerTick: resolveDiscoveryMaxPrsPerTick(
       env.OVERSEER_MERGE_DISCOVERY_MAX_PRS_PER_TICK
     ),
@@ -296,6 +346,7 @@ export function logDiscoveryConfigurationAtStartup(
   const fields = {
     repos: report.repos.map(target => `${target.owner}/${target.repo}`),
     watchedBases: report.watchedBases,
+    perRepoBases: report.perRepoBases,
     maxPullRequestsPerTick: report.maxPullRequestsPerTick,
     reposEnv: DISCOVERY_REPOS_ENV,
   };
@@ -397,6 +448,7 @@ export function classifyDiscoveredPullRequest(
   }
   const resolvedBases = watchedBases ?? resolveWatchedBaseBranchesForRepo(ownerRepo, policy);
   if (!resolvedBases.includes(pr.baseRef.trim().toLowerCase())) return 'base_branch_not_watched';
+  if (pr.labels?.includes(RUN_BLOCKED_LABEL)) return 'run_blocked';
   if (pr.reviewDecision !== 'APPROVED') return 'review_not_approved';
   return null;
 }
@@ -405,21 +457,87 @@ export function classifyDiscoveredPullRequest(
  * Classify the check/mergeability half, which needs the full evidence fetch.
  * Split from the cheap predicates above so a PR that is already excluded on
  * structural grounds costs no extra API call.
+ *
+ * `requiredContexts` is the base branch's required-context resolution, judged
+ * the same way the merge bridge judges it. When it is known and non-empty, only
+ * those contexts decide checks_failing and checks_pending: a red or slow
+ * non-required check no longer keeps the PR out, and a required context
+ * missing from the head counts as pending. When it is absent, unknown,
+ * exhausted, or authoritatively empty, every reported check counts.
  */
 export function classifyPullRequestEvidence(
-  evidence: PullRequestEvidence
+  evidence: PullRequestEvidence,
+  requiredContexts?: RequiredContextsResolution
 ): MergeCandidateExclusionReason | null {
   if (evidence.lookupFailed || !evidence.exists) return 'evidence_lookup_failed';
   if (evidence.state.toLowerCase() !== 'open') return 'not_open';
   if (evidence.checks.total === 0) return 'checks_absent';
-  if (evidence.checks.failed > 0) return 'checks_failing';
-  if (evidence.checks.pending > 0) return 'checks_pending';
+  if (requiredContexts?.state === 'known' && requiredContexts.contexts.length > 0) {
+    const blocking = partitionBlockingRequiredContexts(
+      requiredContexts.contexts,
+      evidence.checkRuns ?? [],
+      evidence.commitStatuses ?? []
+    );
+    if (blocking.failing.length > 0) return 'checks_failing';
+    if (blocking.pending.length > 0) return 'checks_pending';
+  } else {
+    if (evidence.checks.failed > 0) return 'checks_failing';
+    if (evidence.checks.pending > 0) return 'checks_pending';
+  }
   // GitHub computes mergeable asynchronously: `null` is "still computing", NOT
   // "unmergeable". Reporting them under one reason is how a transient state got
   // read as a permanent verdict before (see createRealFindPullRequest).
   if (evidence.mergeable === null || evidence.mergeable === undefined) return 'mergeable_unknown';
   if (!evidence.mergeable) return 'not_mergeable';
   return null;
+}
+
+/**
+ * Resolve the base branch's required contexts exactly as the merge bridge does:
+ * the injected lookups with the process env, or an empty env when no lookups
+ * are wired. An unknown or exhausted result is logged under the bridge's
+ * fallback line, and the caller keeps the all-checks rule.
+ */
+async function resolveDiscoveryRequiredContexts(
+  deps: MergeCandidateDiscoveryDeps,
+  pr: DiscoveredPullRequest,
+  logger: DiscoveryLogger
+): Promise<RequiredContextsResolution> {
+  const lookups = deps.requiredContextsLookups;
+  let resolution: RequiredContextsResolution;
+  try {
+    resolution = await resolveRequiredContexts(
+      {
+        ...(lookups ?? {}),
+        owner: pr.owner,
+        repo: pr.repo,
+        baseRef: pr.baseRef,
+        headSha: pr.headSha,
+      },
+      lookups ? process.env : {}
+    );
+  } catch (error) {
+    // A resolver fault must not take down the sweep. Unknown keeps the
+    // all-checks rule, which is never looser than today.
+    resolution = {
+      state: 'unknown',
+      reason: `resolver_threw: ${errorMessage(error)}`,
+      failureKind: 'transient',
+    };
+  }
+  if (resolution.state !== 'known') {
+    logger.info(
+      {
+        owner: pr.owner,
+        repo: pr.repo,
+        prNumber: pr.prNumber,
+        state: resolution.state,
+        reason: resolution.reason,
+      },
+      'merge-coordinator.required_contexts_fallback'
+    );
+  }
+  return resolution;
 }
 
 /**
@@ -496,6 +614,8 @@ function detailFor(reason: MergeCandidateExclusionReason, pr: DiscoveredPullRequ
       return `base ${pr.baseRef} is not a watched base branch`;
     case 'review_not_approved':
       return `review decision is ${pr.reviewDecision ?? 'none'}`;
+    case 'run_blocked':
+      return `pull request carries the ${RUN_BLOCKED_LABEL} label: its run ended BLOCKED and is not lane-verified`;
     default:
       return reason;
   }
@@ -863,29 +983,30 @@ export async function discoverMergeCandidates(
   }
 
   const startCursor = options.cursor === undefined ? processCursor : options.cursor;
-  const queues = rotatedQueues(repos, byRepo, startCursor);
-  const totalOpen = queues.reduce((sum, entry) => sum + entry.queue.length, 0);
-  // Unevaluated PRs remaining in THIS pass. `totalOpen` is the whole population,
-  // so comparing evaluated against it would report a pass as truncated even on
-  // the tick that finishes it -- the window is truncated when work is left over.
-  const freshTotal = queues.reduce((sum, entry) => sum + entry.fresh.length, 0);
-  const sequence = interleaveByRepo(queues);
 
-  // Where each repo got to this tick, so the next tick resumes per repo rather
-  // than rewinding every repo to whichever one happened to be evaluated last.
-  const lastPerRepo = new Map<string, number>();
-  {
-    for (const pr of sequence) {
-      if (evaluated >= maxPullRequests) break;
-      evaluated += 1;
-      lastPerRepo.set(repoKey(pr.owner, pr.repo), pr.prNumber);
-      // Counted BEFORE any exclusion `continue`: the PRs this most matters for
-      // are precisely the ones the stricter fallback pushed into
-      // `review_not_approved`. Counting only survivors would hide them.
+  // STRUCTURAL CLASSIFICATION OF EVERY LISTED PR, EVERY PASS, ZERO GITHUB CALLS.
+  //
+  // The approval signal (`reviewDecision`) is already on every listed PR, so the
+  // split between "cannot merge yet" and "worth an evidence lookup" is free.
+  // Non-approved PRs used to consume the 100-slot evidence budget, so with 663
+  // open PRs an approved one waited for the rotation to reach its number (and a
+  // restart reset the rotation). Now each PR is classified here and gets a named
+  // exclusion; only approved PRs on a watched base enter the evidence queue,
+  // which the existing per-repo cursor rotates under `maxPullRequestsPerTick`.
+  let structurallyClassified = 0;
+  let totalOpen = 0;
+  const approvedByRepo = new Map<string, DiscoveredPullRequest[]>();
+  for (const target of repos) {
+    const key = repoKey(target.owner, target.repo);
+    for (const pr of byRepo.get(key) ?? []) {
+      structurallyClassified += 1;
+      totalOpen += 1;
+      // Counted for every classified PR: the PRs this most matters for are the
+      // ones the stricter fallback pushed into `review_not_approved`.
       if (pr.reviewDecisionFromFallback) fallbackReviewDecisions += 1;
 
-      const key = pullRequestKey(pr.owner, pr.repo, pr.prNumber);
-      if (alreadyCovered.has(key)) {
+      const prKey = pullRequestKey(pr.owner, pr.repo, pr.prNumber);
+      if (alreadyCovered.has(prKey)) {
         exclusions.push({
           owner: pr.owner,
           repo: pr.repo,
@@ -895,7 +1016,6 @@ export async function discoverMergeCandidates(
         });
         continue;
       }
-
       const structural = classifyDiscoveredPullRequest(pr, explicitWatchedBases, policy);
       if (structural) {
         exclusions.push({
@@ -907,6 +1027,26 @@ export async function discoverMergeCandidates(
         });
         continue;
       }
+      const bucket = approvedByRepo.get(key) ?? [];
+      bucket.push(pr);
+      approvedByRepo.set(key, bucket);
+    }
+  }
+
+  const queues = rotatedQueues(repos, approvedByRepo, startCursor);
+  // Unevaluated APPROVED PRs remaining in THIS pass. The window is truncated
+  // when approved work is left over, not when merely-listed PRs were skipped.
+  const freshTotal = queues.reduce((sum, entry) => sum + entry.fresh.length, 0);
+  const sequence = interleaveByRepo(queues);
+
+  // Where each repo got to this tick, so the next tick resumes per repo rather
+  // than rewinding every repo to whichever one happened to be evaluated last.
+  const lastPerRepo = new Map<string, number>();
+  {
+    for (const pr of sequence) {
+      if (evaluated >= maxPullRequests) break;
+      evaluated += 1;
+      lastPerRepo.set(repoKey(pr.owner, pr.repo), pr.prNumber);
 
       let evidence: PullRequestEvidence;
       try {
@@ -950,7 +1090,8 @@ export async function discoverMergeCandidates(
         continue;
       }
 
-      const evidenceReason = classifyPullRequestEvidence(evidence);
+      const requiredContexts = await resolveDiscoveryRequiredContexts(deps, pr, logger);
+      const evidenceReason = classifyPullRequestEvidence(evidence, requiredContexts);
       if (evidenceReason) {
         exclusions.push({
           owner: pr.owner,
@@ -958,6 +1099,28 @@ export async function discoverMergeCandidates(
           prNumber: pr.prNumber,
           reason: evidenceReason,
           detail: evidenceDetail(evidenceReason, evidence),
+        });
+        continue;
+      }
+
+      // GitHub's aggregate APPROVED bit is not merge authority. Production
+      // callers must supply the receipt-backed guard. Missing qualification
+      // authority fails closed just like an explicit negative result.
+      if (
+        !deps.hasQualifiedReview ||
+        !(await deps.hasQualifiedReview({
+          owner: pr.owner,
+          repo: pr.repo,
+          number: pr.prNumber,
+          headSha: pr.headSha,
+        }))
+      ) {
+        exclusions.push({
+          owner: pr.owner,
+          repo: pr.repo,
+          prNumber: pr.prNumber,
+          reason: 'review_execution_unqualified',
+          detail: 'no durable exact-head sandbox execution and GitHub response qualification',
         });
         continue;
       }
@@ -992,6 +1155,7 @@ export async function discoverMergeCandidates(
   logger.info(
     {
       evaluated,
+      structurallyClassified,
       totalOpen,
       cursorAfter,
       truncated: evaluationWindowTruncated,
@@ -1003,6 +1167,7 @@ export async function discoverMergeCandidates(
     candidates,
     exclusions,
     evaluated,
+    structurallyClassified,
     fallbackReviewDecisions,
     unavailable: false,
     unavailableReason: null,

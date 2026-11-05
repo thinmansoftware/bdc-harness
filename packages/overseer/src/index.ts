@@ -57,6 +57,11 @@ export type {
 } from './escalation-delivery';
 
 export { watchLoop, watchOnce, DEFAULT_WATCH_INTERVAL_MS } from './watch';
+export {
+  recordSweepProgress,
+  startMergeSweepLivenessMonitor,
+  type MergeSweepLivenessMonitor,
+} from './merge-sweep-liveness';
 export { judgePullRequest, isPrGreen, isPrMergeReady } from './judge-pr';
 export { judgeWithGrok } from './judge-second-opinion';
 export { assembleQualifiedMergeEvidence, coordinateMergeReady } from './merge-coordinator';
@@ -87,16 +92,34 @@ export { createGitHubQualifiedMergeAdapter } from './adapters/github-qualified-m
 export { resolveDefaultDeps, runOverseerService } from './service';
 export {
   buildEvidenceComment,
+  buildLiveProofComment,
+  buildMergedComment,
   classifyPullRequestStems,
+  findLiveProof,
+  liveProofAuthors,
+  LIVE_PROOF_PATTERN,
+  MERGED_LABEL,
+  MERGED_MARKER,
+  RECONCILE_LIVE_PROOF_CLASS,
+  RECONCILE_MERGED_ACTION,
   createDefaultReconcileDeps,
+  deriveTrackerWoId,
+  extractClosingKeywordTrackerRefs,
   extractDeclaredWoStems,
   extractReconcileSkipStems,
   extractWoStems,
+  isWoStem,
   readReconcileCursorFromActions,
   RECONCILE_ACTION,
+  RECONCILE_CLOSES_KEYWORD_CLASS,
+  RECONCILE_HOLD_OPEN_ACTION,
+  RECONCILE_KEYWORD_MISSING_ACTION,
   RECONCILE_SKIP_ACTION,
+  RECONCILE_TRACKER_CLASS,
   runReconcileOnce,
+  searchMergedPullRequests,
 } from './reconcile';
+export { PROJECT_BASES, resolveProjectBase } from './project-bases';
 export type {
   PullRequestStemClassification,
   ReconcileActionRecord,

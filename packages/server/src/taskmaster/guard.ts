@@ -37,6 +37,10 @@ export type TmAllowedActionType = (typeof TM_ALLOWED_ACTION_TYPES)[number];
  * consumer, relaying to the XO. The pairing is enforced in validateProposal:
  * a blocker_report to any other seat, or any other verb to 'duty-officer', is
  * a forbidden EFFECT (not fixable content).
+ *
+ * 't3-desktop' (WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01) is admitted ONLY for
+ * the escalate_p0 verb, and escalate_p0 may ONLY address 't3-desktop' (the
+ * desktop results queue replaced the dead operator mailbox for escalations).
  */
 export const TM_ALLOWED_RECIPIENTS = [
   'xo',
@@ -44,6 +48,7 @@ export const TM_ALLOWED_RECIPIENTS = [
   'captain-ci',
   'operator',
   'duty-officer',
+  't3-desktop',
 ] as const;
 export type TmAllowedRecipient = (typeof TM_ALLOWED_RECIPIENTS)[number];
 
@@ -183,6 +188,26 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
       allowed: false,
       forbiddenEffect: true,
       reason: `duty_officer_recipient_restricted: only blocker_report may address 'duty-officer', not '${proposal.type}'.`,
+    };
+  }
+
+  // escalate_p0 <-> t3-desktop is an exclusive pairing, same shape as the
+  // blocker_report/duty-officer pairing above: any other pairing is a forbidden
+  // EFFECT.
+  const isEscalateP0 = proposal.type.trim().toLowerCase() === 'escalate_p0';
+  const toT3Desktop = proposal.recipient.trim().toLowerCase() === 't3-desktop';
+  if (isEscalateP0 && !toT3Desktop) {
+    return {
+      allowed: false,
+      forbiddenEffect: true,
+      reason: `escalate_p0_recipient_invalid: escalate_p0 must address 't3-desktop', not '${proposal.recipient}'.`,
+    };
+  }
+  if (toT3Desktop && !isEscalateP0) {
+    return {
+      allowed: false,
+      forbiddenEffect: true,
+      reason: `t3_desktop_recipient_restricted: only escalate_p0 may address 't3-desktop', not '${proposal.type}'.`,
     };
   }
 

@@ -85,16 +85,39 @@ describe('statusToExitCode', () => {
       'infra-alert',
       'cancelled',
       'refused',
+      'gate-misfire',
     ];
     for (const status of statuses) {
       expect(Number.isInteger(statusToExitCode(status))).toBe(true);
     }
+    // A harness gate misfire is terminal failure. The exhaustive list above
+    // only proves an integer; this pins the code so a default of 0 cannot pass.
+    const gateMisfire = statusToExitCode('gate-misfire');
+    expect(gateMisfire).toBe(11);
+    expect(gateMisfire).not.toBe(0);
+    expect(gateMisfire).not.toBe(statusToExitCode('won'));
   });
 
   test('refused maps to a distinct non-zero code (bdc-xo#2140: refusal is not a win)', () => {
     const code = statusToExitCode('refused');
     expect(code).not.toBe(0);
     expect(code).not.toBe(statusToExitCode('won'));
+  });
+
+  test('gate-misfire maps to a distinct non-zero code (harness failure is not a win)', () => {
+    const code = statusToExitCode('gate-misfire');
+    expect(code).toBe(11);
+    expect(code).not.toBe(0);
+    expect(code).not.toBe(statusToExitCode('won'));
+    expect(code).not.toBe(statusToExitCode('blocked'));
+    expect(code).not.toBe(statusToExitCode('infra-alert'));
+    expect(code).not.toBe(statusToExitCode('spec-repair'));
+    expect(code).not.toBe(statusToExitCode('running'));
+    expect(code).not.toBe(statusToExitCode('cancelled'));
+    expect(code).not.toBe(statusToExitCode('pending-frontier-approval'));
+    expect(code).not.toBe(statusToExitCode('frontier-rejected'));
+    expect(code).not.toBe(statusToExitCode('frontier-approved'));
+    expect(code).not.toBe(statusToExitCode('refused'));
   });
 });
 

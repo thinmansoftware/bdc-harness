@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { createHash } from 'crypto';
 import { mkdtemp, readFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
@@ -56,9 +56,13 @@ async function withDefaultThreshold<T>(run: () => Promise<T>): Promise<T> {
   }
 }
 
-function claimStubs(): Pick<CascadeDeps, 'findWoClaim' | 'acquireWoLock' | 'releaseWoLock'> {
+function claimStubs(): Pick<
+  CascadeDeps,
+  'findWoClaim' | 'acquireWoLock' | 'releaseWoLock' | 'readRunDetail'
+> {
   return {
     findWoClaim: async () => null,
+    listOpenWoPullRequests: async () => [],
     acquireWoLock: async (woId, project, cascadeId) => ({
       acquired: true,
       path: 'in-memory-test-lock',
@@ -71,11 +75,217 @@ function claimStubs(): Pick<CascadeDeps, 'findWoClaim' | 'acquireWoLock' | 'rele
         updatedAt: new Date(0).toISOString(),
       },
     }),
+    readRunDetail: async () => ({
+      metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+    }),
     releaseWoLock: async () => {},
   };
 }
 
 describe('cascade headroom', () => {
+  test('explicit claude entry admits measured headroom and records the decision', async () => {
+    const outDir = await mkdtemp(join(tmpdir(), 'cascade-claude-admit-'));
+    const workflows: string[] = [];
+    try {
+      const record = await runCascade({
+        woId: 'WO-CLAUDE-ADMIT',
+        entryOverride: 'claude',
+        project: 'fixture',
+        outDir,
+        token: 'test-token',
+        deps: {
+          ...claimStubs(),
+          seatUsage: async () => ({
+            claude: {
+              limit_source: 'measured',
+              windows: [
+                { name: 'seven_day', used_percent: 41 },
+                { name: 'five_hour', used_percent: 62 },
+              ],
+            },
+          }),
+          fetchNodeTimeouts: async () => ({}),
+          fire: async opts => {
+            workflows.push(opts.workflowName);
+            return { ok: true, runId: 'run-claude', conversationId: 'conv', infraError: null };
+          },
+          poll: async () => ({
+            runId: 'run-claude',
+            terminalStatus: 'completed',
+            validatorVerdict: 'satisfied',
+            prUrl: 'https://github.com/org/repo/pull/1',
+            prMergeable: true,
+            servedModelId: 'claude-sonnet-5-5',
+            rawMetadata: {},
+          }),
+          judge: () => ({
+            pass: true,
+            reason: 'passed',
+            cancelled: false,
+            validatorVerdict: 'satisfied',
+            prOpened: true,
+            prMergeable: true,
+            terminalStatus: 'completed',
+          }),
+        },
+      });
+      expect(workflows).toEqual(['bdc-feature-development']);
+      expect(record.entrySelection?.reason).toBe('claude_seat_ok:62:80');
+    } finally {
+      await rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit claude entry refuses over-threshold and unknown before recording', async () => {
+    for (const [usage, reason] of [
+      [
+        {
+          claude: {
+            limit_source: 'measured' as const,
+            windows: [{ name: 'seven_day', used_percent: 91 }],
+          },
+        },
+        'claude_seat_over_threshold:91:80',
+      ],
+      [{ claude: { limit_source: 'UNKNOWN' as const, windows: [] } }, 'claude_seat_unknown'],
+    ] as const) {
+      let fired = false;
+      let recorded = false;
+      await expect(
+        runCascade({
+          woId: 'WO-CLAUDE-DENY',
+          entryOverride: 'claude',
+          project: 'fixture',
+          token: 'test-token',
+          deps: {
+            seatUsage: async () => usage,
+            fire: async () => {
+              fired = true;
+              return { ok: false, runId: null, conversationId: null, infraError: 'unexpected' };
+            },
+            createRecord: async record => {
+              recorded = true;
+              return { created: true, path: 'unexpected', record };
+            },
+          },
+        })
+      ).rejects.toThrow(reason);
+      expect(fired).toBe(false);
+      expect(recorded).toBe(false);
+    }
+  });
+
+  test('automatic climb admits claude under threshold', async () => {
+    const outDir = await mkdtemp(join(tmpdir(), 'cascade-claude-climb-'));
+    const workflows: string[] = [];
+    let judged = 0;
+    const log = spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const record = await withDefaultThreshold(async () =>
+        runCascade({
+          woId: 'WO-CLAUDE-CLIMB',
+          entryOverride: 'codex',
+          project: 'fixture',
+          outDir,
+          token: 'test-token',
+          deps: {
+            ...claimStubs(),
+            seatUsage: async () => ({
+              claude: {
+                limit_source: 'measured',
+                windows: [{ name: 'seven_day', used_percent: 41 }],
+              },
+            }),
+            fetchNodeTimeouts: async () => ({}),
+            fire: async opts => {
+              workflows.push(opts.workflowName);
+              return {
+                ok: true,
+                runId: `run-${workflows.length}`,
+                conversationId: 'conv',
+                infraError: null,
+              };
+            },
+            poll: async () => ({
+              runId: 'run',
+              terminalStatus: 'completed',
+              validatorVerdict: 'satisfied',
+              prUrl: 'https://github.com/org/repo/pull/1',
+              prMergeable: true,
+              servedModelId: null,
+              rawMetadata: {},
+            }),
+            judge: () => {
+              judged++;
+              return {
+                pass: judged === 2,
+                reason: judged === 2 ? 'passed' : 'needs revision',
+                cancelled: false,
+                validatorVerdict: judged === 2 ? 'satisfied' : 'needs_revision',
+                prOpened: judged === 2,
+                prMergeable: judged === 2,
+                terminalStatus: 'completed',
+              };
+            },
+          },
+        })
+      );
+      expect(workflows).toEqual(['bdc-feature-development-codex', 'bdc-feature-development']);
+      expect(record.winningTier).toBe('claude');
+      expect(log.mock.calls.some(call => String(call[0]).includes('claude_seat_ok:41:80'))).toBe(
+        true
+      );
+    } finally {
+      log.mockRestore();
+      await rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  test('default Fuelglass reader parses seats and converts HTTP 500 to unknown', async () => {
+    let status = 200;
+    const server = Bun.serve({
+      port: 0,
+      fetch: () =>
+        status === 200
+          ? Response.json({
+              seats: {
+                claude: {
+                  limit_source: 'measured',
+                  windows: [{ name: 'seven_day', used_percent: 41 }],
+                },
+                codex: { limit_source: 'UNKNOWN', windows: [] },
+                cursor: { limit_source: 'UNKNOWN', windows: [] },
+              },
+            })
+          : new Response('failed', { status }),
+    });
+    try {
+      const measured = await runCascade({
+        woId: 'WO-DEFAULT-SEATS',
+        entryOverride: 'claude',
+        project: 'fixture',
+        dryRun: true,
+        apiBaseUrl: server.url.origin,
+        token: 'test-token',
+      });
+      expect(measured.entrySelection?.reason).toBe('claude_seat_ok:41:80');
+      status = 500;
+      const unavailable = await runCascade({
+        woId: 'WO-DEFAULT-SEATS-500',
+        project: 'fixture',
+        dryRun: true,
+        apiBaseUrl: server.url.origin,
+        token: 'test-token',
+      });
+      // A failed read falls back to all-UNKNOWN seats; an UNKNOWN cursor seat is
+      // unmetered (headroom.ts isUnmeteredSeat), so the entry stays on cursor.
+      expect(unavailable.telemetry.entryTier).toBe('cursor');
+      expect(unavailable.entrySelection?.reason).toBe('seat_unmetered:cursor');
+    } finally {
+      server.stop(true);
+    }
+  });
+
   test('cascade-dry-run-records-entry-selection', async () => {
     const outDir = await mkdtemp(join(tmpdir(), 'cascade-headroom-dry-'));
     try {
@@ -84,6 +294,10 @@ describe('cascade headroom', () => {
         const moved = await runCascade({
           woId: 'WO-HEADROOM-DRY',
           woClass: 'CODE',
+          // 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): plain CODE now
+          // enters the seatless zero lane, so a seat-bearing tag is required to
+          // keep exercising seat-headroom behavior on cursor.
+          tags: ['feature'],
           project: 'fixture',
           dryRun: true,
           outDir,
@@ -138,6 +352,10 @@ describe('cascade headroom', () => {
         const rejected = await runCascade({
           woId: 'WO-HEADROOM-REJECT',
           woClass: 'CODE',
+          // 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): plain CODE now
+          // enters the seatless zero lane, so a seat-bearing tag is required to
+          // keep exercising seat-headroom behavior on cursor.
+          tags: ['feature'],
           project: 'fixture',
           dryRun: true,
           outDir,
@@ -150,12 +368,16 @@ describe('cascade headroom', () => {
           },
         });
         expect(rejected.telemetry.entryTier).toBe('cursor');
-        expect(rejected.entrySelection?.reason).toBe('seat_usage_unavailable');
+        expect(rejected.entrySelection?.reason).toBe('seat_unmetered:cursor');
 
         const started = Date.now();
         const timedOut = await runCascade({
           woId: 'WO-HEADROOM-TIMEOUT',
           woClass: 'CODE',
+          // 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): plain CODE now
+          // enters the seatless zero lane, so a seat-bearing tag is required to
+          // keep exercising seat-headroom behavior on cursor.
+          tags: ['feature'],
           project: 'fixture',
           dryRun: true,
           outDir,
@@ -167,11 +389,15 @@ describe('cascade headroom', () => {
         });
         expect(Date.now() - started).toBeLessThan(8000);
         expect(timedOut.telemetry.entryTier).toBe('cursor');
-        expect(timedOut.entrySelection?.reason).toBe('seat_usage_unavailable');
+        expect(timedOut.entrySelection?.reason).toBe('seat_unmetered:cursor');
 
         const absent = await runCascade({
           woId: 'WO-HEADROOM-ABSENT',
           woClass: 'CODE',
+          // 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): plain CODE now
+          // enters the seatless zero lane, so a seat-bearing tag is required to
+          // keep exercising seat-headroom behavior on cursor.
+          tags: ['feature'],
           project: 'fixture',
           dryRun: true,
           outDir,
@@ -179,7 +405,7 @@ describe('cascade headroom', () => {
           token: 'test-token',
         });
         expect(absent.telemetry.entryTier).toBe('cursor');
-        expect(absent.entrySelection).toBeUndefined();
+        expect(absent.entrySelection?.reason).toBe('seat_unmetered:cursor');
       });
     } finally {
       await rm(outDir, { recursive: true, force: true });

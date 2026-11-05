@@ -11,6 +11,7 @@
 
 import { describe, test, expect } from 'bun:test';
 import { judgeGate, classifyAttemptOutcome } from '../judge.js';
+import { pollForTerminal } from '../poll.js';
 import type { PollResult, FireResult } from '../types.js';
 
 function makePoll(overrides?: Partial<PollResult>): PollResult {
@@ -99,4 +100,147 @@ describe('classifyAttemptOutcome: cancelled', () => {
     const verdict = judgeGate(makePoll());
     expect(classifyAttemptOutcome(makeFireOk(), verdict)).toBe('won');
   });
+});
+
+describe('judgeGate: existing WO PR head', () => {
+  const pushed = 'a'.repeat(40);
+  const other = 'b'.repeat(40);
+
+  test('gate_counts_existing_wo_pr', () => {
+    const matched = judgeGate(
+      makePoll({
+        prUrl: null,
+        prMergeable: null,
+        runPushedHeadSha: pushed,
+        openWoPrHeadSha: pushed.toUpperCase(),
+      })
+    );
+    expect(matched.pass).toBe(true);
+    expect(matched.reason).not.toContain('no PR opened after completed run');
+
+    const differed = judgeGate(
+      makePoll({
+        prUrl: null,
+        prMergeable: null,
+        runPushedHeadSha: pushed,
+        openWoPrHeadSha: other,
+      })
+    );
+    expect(differed.pass).toBe(false);
+    expect(differed.reason).toContain('no PR opened after completed run');
+
+    const short = judgeGate(
+      makePoll({
+        prUrl: null,
+        prMergeable: null,
+        runPushedHeadSha: 'abc',
+        openWoPrHeadSha: 'abc',
+      })
+    );
+    expect(short.reason).toContain('no PR opened after completed run');
+
+    const needsRevision = judgeGate(
+      makePoll({
+        prUrl: null,
+        prMergeable: null,
+        validatorVerdict: 'needs_revision',
+        runPushedHeadSha: pushed,
+        openWoPrHeadSha: pushed,
+      })
+    );
+    expect(needsRevision.pass).toBe(false);
+    expect(needsRevision.reason).toContain('needs_revision');
+    expect(needsRevision.reason).not.toContain('no PR opened after completed run');
+
+    const unmergeable = judgeGate(
+      makePoll({
+        prUrl: null,
+        prMergeable: false,
+        runPushedHeadSha: pushed,
+        openWoPrHeadSha: pushed,
+      })
+    );
+    expect(unmergeable.pass).toBe(false);
+    expect(unmergeable.reason).toContain('not mergeable');
+    expect(unmergeable.reason).not.toContain('no PR opened after completed run');
+  });
+});
+
+describe('poll credit mergeability', () => {
+  test('standard build lane emits the origin verification receipt', async () => {
+    const lane = await Bun.file(
+      new URL(
+        '../../../../.archon/workflows/defaults/bdc-feature-development-zero.yaml',
+        import.meta.url
+      )
+    ).text();
+    expect(lane).toContain(
+      'echo "VERIFIED: origin/${UNIQUE_BRANCH} == local HEAD (${LOCAL_HEAD})"'
+    );
+  });
+  test.each(['output', 'node_output'])(
+    'credits standard push receipt from %s and checks mergeability',
+    async outputField => {
+      const headSha = 'a'.repeat(40);
+      const creditedUrl = 'https://github.com/thinmansoftware/bdc-harness/pull/4422';
+      const checked: string[] = [];
+      const fetchImpl: typeof fetch = async () =>
+        new Response(
+          JSON.stringify({
+            run: {
+              id: 'run-credit',
+              status: 'completed',
+              metadata: {},
+            },
+            events: [
+              {
+                event_type: 'node_completed',
+                step_name: 'commit-and-push',
+                data: {
+                  [outputField]: `VERIFIED: origin/fix/existing-branch == local HEAD (${headSha})\nunique_branch=fix/existing-branch`,
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } }
+        );
+
+      const poll = await pollForTerminal({
+        runId: 'run-credit',
+        apiBaseUrl: 'http://archon.test',
+        fetchImpl,
+        timeoutMs: 30_000,
+        intervalMs: 1,
+        prRetryAttempts: 0,
+        prBranchLookupAttempts: 1,
+        prBranchLookupDelayMs: 0,
+        repo: 'thinmansoftware/bdc-harness',
+        woId: 'WO-XO-BDC-BROWSER-KEEPER-04',
+        ghPrListForBranch: async () => null,
+        listOpenWoPullRequests: async () => [
+          {
+            number: 4422,
+            headRefName: 'archon/task-web-worker-1-abc',
+            headSha,
+            url: creditedUrl,
+            createdAt: '2026-11-03T10:47:06Z',
+            isDraft: false,
+            isFork: false,
+            body: 'WO: WO-XO-BDC-BROWSER-KEEPER-04\n',
+          },
+        ],
+        checkPrMergeable: async (url: string) => {
+          checked.push(url);
+          return false;
+        },
+      });
+
+      expect(poll.prUrl).toBe(creditedUrl);
+      expect(checked).toEqual([creditedUrl]);
+      expect(poll.prMergeable).toBe(false);
+      const verdict = judgeGate(poll);
+      expect(verdict.pass).toBe(false);
+      expect(verdict.reason).not.toContain('no PR opened after completed run');
+    }
+  );
 });

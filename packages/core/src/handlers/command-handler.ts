@@ -8,7 +8,7 @@ import { type Conversation, type CommandResult, ConversationNotFoundError } from
 import * as db from '../db/conversations';
 import * as codebaseDb from '../db/codebases';
 import * as sessionDb from '../db/sessions';
-import { listWorktrees, execFileAsync, toRepoPath } from '@archon/git';
+import { listWorktrees, execFileAsync, toRepoPath, addSafeDirectory } from '@archon/git';
 import { getIsolationProvider } from '@archon/isolation';
 import * as isolationEnvDb from '../db/isolation-environments';
 import {
@@ -280,13 +280,7 @@ async function handleWorktreeCommand(
         });
 
         // Add to git safe.directory
-        await execFileAsync('git', [
-          'config',
-          '--global',
-          '--add',
-          'safe.directory',
-          env.workingPath,
-        ]);
+        await addSafeDirectory(toRepoPath(env.workingPath));
 
         // Create database record for isolation environment
         const dbEnv = await isolationEnvDb.create({

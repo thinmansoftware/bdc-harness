@@ -34,6 +34,14 @@ const LANE_FILES = readdirSync(LANES_DIR)
   .filter(f => f.startsWith('bdc-feature-development') && f.endsWith('.yaml'))
   .sort();
 
+// 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01, Fence 5; John ruling on
+// bdc-xo#4282): the zero-open lane pins allow_issue_fallback FALSE so a zero-tier
+// fire can never fall back to an issue body as spec authority. Every other lane
+// keeps the fallback. Kept parameterized rather than hardcoded so the fence is
+// pinned for the zero-open lane instead of being loosened for all lanes.
+const ZERO_OPEN_LANE = 'bdc-feature-development-zero-open.yaml';
+const expectsIssueFallback = (laneFile: string): boolean => laneFile !== ZERO_OPEN_LANE;
+
 interface NodeDef {
   id: string;
   provider?: string;
@@ -152,7 +160,7 @@ describe('lane registration and war-council-validator pin', () => {
         // Grok 4.7 builds on the Cursor rail; the judge is codex-native-strict
         // pinned to Terra so the lane never grades its own work.
         expect(wcv.provider).toBe('codex-native-strict');
-        expect(wcv.model).toBe('gpt-5.6-terra');
+        expect(wcv.model).toBe('gpt-6.1-terra');
         expect(wcv.persona).toBe('captain-ci-validator-codex');
         return;
       }
@@ -177,11 +185,18 @@ describe('lane registration and war-council-validator pin', () => {
       }
 
       if (file === 'bdc-feature-development-codex.yaml') {
-        // This lane builds with gpt-5.6-sol. The judge is codex-native-strict
-        // pinned to gpt-5.6-terra so the builder never grades its own work.
+        // This lane builds with gpt-6.1-sol. The judge is codex-native-strict
+        // pinned to gpt-6.1-terra so the builder never grades its own work.
         expect(wcv.provider).toBe('codex-native-strict');
-        expect(wcv.model).toBe('gpt-5.6-terra');
+        expect(wcv.model).toBe('gpt-6.1-terra');
         expect(wcv.persona).toBe('captain-ci-validator-codex');
+        return;
+      }
+
+      if (file === 'bdc-feature-development.yaml') {
+        // Claude lane pins the allowlist id. Provider stays claude.
+        expect(wcv.provider).toBe('claude');
+        expect(wcv.model).toBe('claude-sonnet-5-5');
         return;
       }
 
@@ -327,8 +342,8 @@ describe('lane registration and war-council-validator pin', () => {
       const source = codexNode(id);
       expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-native-strict');
       expect(reviewNode?.provider, `${file}:${id}:provider`).toBe(source?.provider);
-      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-5.6-terra');
-      expect(source?.model, `codex:${id}:model`).toBe('gpt-5.6-terra');
+      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-6.1-terra');
+      expect(source?.model, `codex:${id}:model`).toBe('gpt-6.1-terra');
       expect(reviewNode?.persona, `${file}:${id}:persona`).toBe(source?.persona);
       expect(reviewNode?.agent, `${file}:${id}:agent`).toBe(source?.agent);
       expect(REVIEW_PERSONA_ALLOWLIST.has(reviewPersona(reviewNode) ?? '')).toBe(true);
@@ -357,7 +372,7 @@ describe('lane registration and war-council-validator pin', () => {
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = nodes.find(candidate => candidate.id === id);
       expect(reviewNode?.provider, id).toBe('codex-native-strict');
-      expect(reviewNode?.model, id).toBe('gpt-5.6-terra');
+      expect(reviewNode?.model, id).toBe('gpt-6.1-terra');
       expect(reviewNode?.provider, id).not.toBe('claude');
       expect(reviewNode?.provider, id).not.toBe('cursor');
       expect(reviewNode?.model ?? '', id).not.toMatch(/grok/i);
@@ -369,14 +384,14 @@ describe('lane registration and war-council-validator pin', () => {
     }
   });
 
-  it('Test 2: codex-lane review seats are codex-native-strict pinned to gpt-5.6-terra', () => {
+  it('Test 2: codex-lane review seats are codex-native-strict pinned to gpt-6.1-terra', () => {
     const lane = loadLane('bdc-feature-development-codex.yaml');
     const nodes = lane.nodes ?? [];
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = nodes.find(candidate => candidate.id === id);
       expect(reviewNode?.provider, id).toBe('codex-native-strict');
-      expect(reviewNode?.model, id).toBe('gpt-5.6-terra');
-      expect(reviewNode?.model, id).not.toBe('gpt-5.6-sol');
+      expect(reviewNode?.model, id).toBe('gpt-6.1-terra');
+      expect(reviewNode?.model, id).not.toBe('gpt-6.1-sol');
       expect(reviewNode?.provider, id).not.toBe('claude');
       const persona = reviewPersona(reviewNode);
       expect(REVIEW_PERSONA_ALLOWLIST.has(persona ?? ''), id).toBe(true);
@@ -394,19 +409,19 @@ describe('lane registration and war-council-validator pin', () => {
     }
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = (cursor.nodes ?? []).find(candidate => candidate.id === id);
-      expect(reviewNode?.model, `cursor:${id}`).toBe('gpt-5.6-terra');
+      expect(reviewNode?.model, `cursor:${id}`).toBe('gpt-6.1-terra');
       expect(reviewNode?.model, `cursor:${id}`).not.toBe(cursor.model);
     }
 
     for (const id of buildIds) {
       const buildNode = (codex.nodes ?? []).find(candidate => candidate.id === id);
       const model = buildNode?.model ?? codex.model;
-      expect(model, `codex:${id}`).toBe('gpt-5.6-sol');
+      expect(model, `codex:${id}`).toBe('gpt-6.1-sol');
     }
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = (codex.nodes ?? []).find(candidate => candidate.id === id);
-      expect(reviewNode?.model, `codex:${id}`).toBe('gpt-5.6-terra');
-      expect(reviewNode?.model, `codex:${id}`).not.toBe('gpt-5.6-sol');
+      expect(reviewNode?.model, `codex:${id}`).toBe('gpt-6.1-terra');
+      expect(reviewNode?.model, `codex:${id}`).not.toBe('gpt-6.1-sol');
       expect(reviewNode?.model, `codex:${id}`).not.toBe(codex.model);
     }
   });
@@ -478,7 +493,7 @@ describe('lane registration and war-council-validator pin', () => {
         spec_repository: 'thinmansoftware/bdc-xo',
         spec_revision: 'main',
         spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
-        allow_issue_fallback: true,
+        allow_issue_fallback: expectsIssueFallback(file),
       });
       const readSpec = lane.nodes?.find(node => node.id === 'read-spec');
       const authoritativePrefix = readSpec?.bash?.split('exit 0', 1)[0] ?? '';
@@ -503,7 +518,7 @@ describe('lane registration and war-council-validator pin', () => {
         spec_repository: 'thinmansoftware/bdc-xo',
         spec_revision: 'main',
         spec_paths: ['docs/work-orders/{WO_ID}.md', 'docs/superpowers/specs/{WO_ID}.md'],
-        allow_issue_fallback: true,
+        allow_issue_fallback: expectsIssueFallback(file),
       });
     });
 

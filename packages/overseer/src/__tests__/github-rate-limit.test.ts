@@ -385,3 +385,137 @@ describe('runAndSubmitReview under a rate limit', () => {
     expect(outcome.disposition).toBe('rate_limited');
   });
 });
+
+// WO-HARNESS-OVERSEER-REVIEW-TRIGGER-01: the local GitHub pool gate
+// (packages/core/src/github/metering.ts) throws a status-less Error. Before
+// this WO it classified as null, so every caller retired the review. Live
+// anchor 2026-11-01 17:07-17:09Z: eight run_review items failed
+// `head_recheck_failed:github_pool_backoff:app-4574893-153295654/core:1793552986000`.
+describe('local pool-gate backoff (WO-HARNESS-OVERSEER-REVIEW-TRIGGER-01)', () => {
+  const GATE_UNTIL_MS = NOW.getTime() + 125_000;
+  const gateError = (until: number | string = GATE_UNTIL_MS): Error =>
+    new Error(`github_pool_backoff:app-4574893-153295654/core:${until}`);
+
+  test('classifies the gate error as a deferral that ends when the gate opens', () => {
+    const result = classifyRateLimitError(gateError(), NOW);
+    expect(result).toEqual({
+      retryAfterMs: 125_000,
+      retryAfter: new Date(GATE_UNTIL_MS).toISOString(),
+      source: 'pool_backoff_gate',
+      kind: 'pool_gate',
+    });
+    expect(isRateLimitError(gateError())).toBe(true);
+  });
+
+  test('a gate expiry already in the past still defers on the default interval', () => {
+    const result = classifyRateLimitError(gateError(NOW.getTime() - 5_000), NOW);
+    expect(result?.retryAfterMs).toBe(DEFAULT_RATE_LIMIT_RETRY_MS);
+    expect(result?.source).toBe('pool_backoff_gate');
+  });
+
+  test('a far-future gate expiry is clamped to the one-hour ceiling', () => {
+    const result = classifyRateLimitError(gateError(NOW.getTime() + 86_400_000), NOW);
+    expect(result?.retryAfterMs).toBe(MAX_RATE_LIMIT_RETRY_MS);
+  });
+
+  test('an unparseable gate expiry defers on the default interval', () => {
+    const result = classifyRateLimitError(gateError('soon'), NOW);
+    expect(result?.retryAfterMs).toBe(DEFAULT_RATE_LIMIT_RETRY_MS);
+  });
+
+  test('an unrelated status-less error is still not a rate limit', () => {
+    expect(classifyRateLimitError(new Error('socket hang up'), NOW)).toBeNull();
+    expect(classifyRateLimitError(new Error('github_pool_status_unknown'), NOW)).toBeNull();
+  });
+
+  test('a gate refusal on the head re-read defers the review instead of retiring it', async () => {
+    const recorded = { submitted: 0, receipts: [] as { disposition: string }[] };
+    const outcome = await runAndSubmitReview(
+      WORK,
+      submitDeps(
+        {
+          async currentHeadSha() {
+            throw gateError(Date.now() + 125_000);
+          },
+        },
+        recorded
+      )
+    );
+    expect(outcome.disposition).toBe('rate_limited');
+    expect(outcome.reason).toBe('rate_limited:head_recheck:pool_gate:pool_backoff_gate');
+    expect(outcome.retryAfterMs).toBeGreaterThan(100_000);
+    expect(outcome.retryAfterMs).toBeLessThanOrEqual(125_000);
+    expect(recorded.submitted).toBe(0);
+    expect(recorded.receipts.map(r => r.disposition)).toEqual(['rate_limited']);
+  });
+
+  test('a GitHub 403 rate limit on the head re-read also defers', async () => {
+    const recorded = { submitted: 0, receipts: [] as { disposition: string }[] };
+    const outcome = await runAndSubmitReview(
+      WORK,
+      submitDeps(
+        {
+          async currentHeadSha() {
+            throw octokitError(403, { 'x-ratelimit-remaining': '0' });
+          },
+        },
+        recorded
+      )
+    );
+    expect(outcome.disposition).toBe('rate_limited');
+    expect(outcome.reason).toBe('rate_limited:head_recheck:primary:default');
+    expect(recorded.submitted).toBe(0);
+  });
+
+  test('any other head re-read failure stays terminal submission_failed', async () => {
+    const recorded = { submitted: 0, receipts: [] as { disposition: string }[] };
+    const outcome = await runAndSubmitReview(
+      WORK,
+      submitDeps(
+        {
+          async currentHeadSha() {
+            throw new Error('github_500');
+          },
+        },
+        recorded
+      )
+    );
+    expect(outcome.disposition).toBe('submission_failed');
+    expect(outcome.reason).toBe('head_recheck_failed:github_500');
+  });
+
+  test('a gate refusal thrown by the submit call defers instead of failing', async () => {
+    const recorded = { submitted: 0, receipts: [] as { disposition: string }[] };
+    const outcome = await runAndSubmitReview(
+      WORK,
+      submitDeps(
+        {
+          async submitReview() {
+            throw gateError(Date.now() + 60_000);
+          },
+        },
+        recorded
+      )
+    );
+    expect(outcome.disposition).toBe('rate_limited');
+    expect(outcome.reason).toBe('rate_limited:submit:pool_gate:pool_backoff_gate');
+    expect(typeof outcome.retryAfter).toBe('string');
+  });
+
+  test('a gate refusal thrown by the reviewer seam defers instead of reviewer_failed', async () => {
+    const recorded = { submitted: 0, receipts: [] as { disposition: string }[] };
+    const outcome = await runAndSubmitReview(
+      WORK,
+      submitDeps(
+        {
+          async runReviewer() {
+            throw gateError(Date.now() + 60_000);
+          },
+        },
+        recorded
+      )
+    );
+    expect(outcome.disposition).toBe('rate_limited');
+    expect(outcome.reason).toBe('rate_limited:reviewer_threw:pool_gate:pool_backoff_gate');
+  });
+});

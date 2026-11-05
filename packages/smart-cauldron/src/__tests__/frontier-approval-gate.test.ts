@@ -108,6 +108,10 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
         escalateCalls++;
       },
       findWoClaim: async () => null,
+      listOpenWoPullRequests: async () => [],
+      readRunDetail: async () => ({
+        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+      }),
     };
 
     const record = await runCascade(baseOpts({ deps, outDir }));
@@ -146,6 +150,10 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
       judge: () => makeFailVerdict('validator: needs_revision'),
       escalate: async () => undefined,
       findWoClaim: async () => null,
+      listOpenWoPullRequests: async () => [],
+      readRunDetail: async () => ({
+        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+      }),
     };
 
     const record = await runCascade(baseOpts({ deps, outDir }));
@@ -179,6 +187,10 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
         escalateCalls++;
       },
       findWoClaim: async () => null,
+      listOpenWoPullRequests: async () => [],
+      readRunDetail: async () => ({
+        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+      }),
     };
 
     const record = await runCascade(baseOpts({ deps, outDir, entryOverride: 'cursor' }));
@@ -212,6 +224,10 @@ describe('frontier-approval gate (Test 1: auto-climb pauses instead of firing)',
         escalations.push(ctx);
       },
       findWoClaim: async () => null,
+      listOpenWoPullRequests: async () => [],
+      readRunDetail: async () => ({
+        metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+      }),
       ruleset,
     };
 

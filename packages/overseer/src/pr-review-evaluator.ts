@@ -6,6 +6,8 @@ import { conclusionIsPassing, latestAttemptPerCheck } from './pr-review-check-in
 import { createLogger } from '@archon/paths';
 import {
   buildJudgeTransport,
+  buildPrReviewTransport,
+  describeJudgeModel,
   defaultJudgeChildSpawn,
   deliverStdin,
   destroyStdin,
@@ -13,7 +15,9 @@ import {
   type JudgeChild,
   type JudgeChildSpawn,
   type JudgeTransport,
+  type PrReviewTransportContext,
 } from './judge-transport';
+import { submitReviewerBrokerJob } from './reviewer-broker-client';
 
 /**
  * Observability gap found 2026-09-17: this ladder loop classifies a per-rung
@@ -95,6 +99,8 @@ export interface PrReviewCheck {
   started_at?: string | null;
   completed_at?: string | null;
   app?: { slug?: string; name?: string };
+  check_suite?: { id?: number } | null;
+  workflow_attempt?: { run_id: number; run_attempt: number } | null;
 }
 
 export interface PrReviewCheckPartition {
@@ -170,7 +176,13 @@ export interface PrReviewDeps {
     input: PrReviewInput
   ): Promise<{ diff: string; checks: PrReviewCheck[]; requiredContexts?: string[] | null }>;
   fetchAcceptanceCriteria(woId: string): Promise<string | null>;
-  invokeModel(binary: string, prompt: string): Promise<PrReviewModelResult>;
+  invokeModel(
+    binary: string,
+    prompt: string,
+    context?: PrReviewTransportContext
+  ): Promise<PrReviewModelResult>;
+  /** Server-created context only. Its absence preserves legacy/test callers. */
+  executionContext?: PrReviewTransportContext;
   ladder?: readonly string[];
   /**
    * Per-rung outage seam (#847). Called with the classified quota / credit /
@@ -678,7 +690,7 @@ export async function evaluatePullRequest(
       'judge_rung_started'
     );
     try {
-      const result = await deps.invokeModel(binary, prompt);
+      const result = await deps.invokeModel(binary, prompt, deps.executionContext);
       const rungMs = Date.now() - rungStartedAt;
       if (result.timedOut) {
         // A timeout is transport, not judgment: the process started but never
@@ -726,10 +738,13 @@ export async function evaluatePullRequest(
       } catch {
         return indeterminate(input, deps, acceptanceCriteriaAvailable, 'reviewed_head_mismatch');
       }
-      getLog().info({ binary, rungMs, prNumber: input.pr_number }, 'judge_rung_verdict_produced');
+      getLog().info(
+        { binary, model: describeJudgeModel(binary), rungMs, prNumber: input.pr_number },
+        'judge_rung_verdict_produced'
+      );
       return {
         ...applyRequiredCheckGate(parsed, checkPartition),
-        reviewer: { provider: deps.reviewer.provider, model: binary },
+        reviewer: { provider: deps.reviewer.provider, model: describeJudgeModel(binary) },
         acceptance_criteria_available: acceptanceCriteriaAvailable,
       };
     } catch (error) {
@@ -832,18 +847,37 @@ export { DEFAULT_CURSOR_JUDGE_MODEL, resolveCursorJudgeModel } from './judge-tra
 /** Exported for the permission test; not part of the review API surface. */
 export async function buildReviewModelTransport(
   binary: string,
-  prompt: string
+  prompt: string,
+  context?: PrReviewTransportContext
 ): Promise<JudgeTransport> {
-  return buildJudgeTransport(binary, prompt);
+  return context
+    ? buildPrReviewTransport(binary, prompt, context)
+    : buildJudgeTransport(binary, prompt);
 }
 
 export async function invokeConfiguredReviewModel(
   binary: string,
   prompt: string,
+  context?: PrReviewTransportContext,
   timeoutMs = resolveReviewModelTimeoutMs()
 ): Promise<PrReviewModelResult> {
-  const transport = await buildReviewModelTransport(binary, prompt);
+  const transport = await buildReviewModelTransport(binary, prompt, context);
   try {
+    if (context) {
+      if (!transport.brokerJob) throw new Error('reviewer_broker_unavailable');
+      const result = await submitReviewerBrokerJob({
+        ...transport.brokerJob,
+        // The broker accepts 1 ms to 30 min; it starts from env -i, so the
+        // parent supplies its configured model wall clock per job.
+        timeoutMs: Math.max(1, Math.min(Math.floor(timeoutMs), 30 * 60_000)),
+      });
+      const payload = result.stdout.trim().length > 0 ? result.stdout : result.stderr;
+      return {
+        exitCode: result.exitCode,
+        stdout: codexExecJsonlVerdictText(payload),
+        timedOut: result.timedOut === true,
+      };
+    }
     return await runReviewModelProcess(transport, binary, timeoutMs);
   } finally {
     // Always in a finally: the prompt holds the private diff, so it must not
@@ -928,6 +962,33 @@ export async function runReviewModelProcess(
   // parked if the child exited without draining stdin.
   destroyStdin(subprocess.stdin);
   return result;
+}
+
+/**
+ * Text of the last completed agent message in a `codex exec --json` stream.
+ * A stream with no such message returns '' so parseReviewVerdict fails closed.
+ */
+export function codexExecJsonlVerdictText(stdout: string): string {
+  let verdict = '';
+  for (const line of stdout.split(/\r?\n/)) {
+    if (line.trim().length === 0) continue;
+    let event: unknown;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!event || typeof event !== 'object' || Array.isArray(event)) continue;
+    const record = event as Record<string, unknown>;
+    if (record.type !== 'item.completed') continue;
+    const item = record.item;
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const message = item as Record<string, unknown>;
+    if (message.type !== 'agent_message') continue;
+    if (typeof message.text !== 'string' || message.text.trim().length === 0) continue;
+    verdict = message.text;
+  }
+  return verdict;
 }
 
 function normalizeModelOutput(binary: string, stdout: string): string {

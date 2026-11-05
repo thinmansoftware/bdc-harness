@@ -22,6 +22,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
   RECONCILE_ACTION,
+  RECONCILE_MERGED_ACTION,
   RECONCILE_SKIP_ACTION,
   classifyPullRequestStems,
   extractDeclaredWoStems,
@@ -72,6 +73,7 @@ function loadFixturePr(name: string): FixturePr {
       merged: true,
       mergeCommitSha: meta.mergeCommitSha,
       mergedAt: meta.mergedAt,
+      baseRef: meta.baseRefName,
     },
     files: meta.files,
   };
@@ -85,13 +87,15 @@ function prRef(pr: ReconcileMergedPullRequest): string {
   return `${pr.owner}/${pr.repo}#${pr.number}`;
 }
 
-/** Tracker lookup that knows the two real M-157 trackers and nothing else. */
+const M157_TRACKER_NUMBERS: Record<string, number> = { [UI_WO]: 1889, [SERVER_WO]: 1887 };
+const M157_STEM_BY_NUMBER: Record<number, string> = { 1889: UI_WO, 1887: SERVER_WO };
+
+/** By-stem tracker lookup that knows the two real M-157 trackers and nothing else. */
 function m157Trackers(
   open: string[]
 ): (candidate: string) => Promise<ReconcileTrackerIssue | null> {
-  const numbers: Record<string, number> = { [UI_WO]: 1889, [SERVER_WO]: 1887 };
   return async candidate => {
-    const number = numbers[candidate];
+    const number = M157_TRACKER_NUMBERS[candidate];
     if (!number) return null;
     return {
       owner: 'thinmansoftware',
@@ -99,6 +103,23 @@ function m157Trackers(
       number,
       title: candidate,
       state: open.includes(candidate) ? 'open' : 'closed',
+    };
+  };
+}
+
+/** By-number tracker lookup for the keyword-close path (what actually closes now). */
+function m157TrackersByNumber(
+  open: string[]
+): (number: number) => Promise<ReconcileTrackerIssue | null> {
+  return async number => {
+    const stem = M157_STEM_BY_NUMBER[number];
+    if (!stem) return null;
+    return {
+      owner: 'thinmansoftware',
+      repo: 'bdc-xo',
+      number,
+      title: stem,
+      state: open.includes(stem) ? 'open' : 'closed',
     };
   };
 }
@@ -221,11 +242,13 @@ describe('classifyPullRequestStems -- what a merged PR is evidence for', () => {
     expect(classified.incidental).toEqual(['WO-E-F-03']);
   });
 
-  test('legacy PR with no manifest: every mentioned stem is a candidate (unchanged)', () => {
+  test('a PR with no WO: manifest and no title stem makes a prose mention incidental, never evidence (rule 3 removed)', () => {
+    // mergedPr()'s body names the stem in prose ("Implements <stem>.") with no
+    // WO: line and no title stem. A bare mention is never a candidate now.
     expect(classifyPullRequestStems(mergedPr())).toEqual({
-      evidence: [stem],
+      evidence: [],
       skipped: [],
-      incidental: [],
+      incidental: [stem],
     });
   });
 });
@@ -275,23 +298,30 @@ describe('runReconcileOnce -- replay of the 2026-09-02 morning', () => {
     expect(findTracker.mock.calls.map(call => call[0])).not.toContain(UI_WO);
   });
 
-  test('#662 still closes the tracker for the WO it DOES implement (#1887)', async () => {
+  test('#662 still marks the tracker for the WO it DOES implement (#1887) merged -- via its Closes keyword on the staging base', async () => {
     const deps = fakeDeps({ prs: [serverHalf.pr] });
 
     const result = await runReconcileOnce({
       deps: {
         ...deps,
         findTrackerIssueByStem: m157Trackers([SERVER_WO, UI_WO]),
+        findTrackerIssueByNumber: m157TrackersByNumber([SERVER_WO, UI_WO]),
         listPullRequestFiles: filesFromFixtures(serverHalf),
       },
     });
 
-    expect(result.closed).toBe(1);
-    expect(deps.closes).toEqual([1887]);
+    expect(result.closed).toBe(0);
+    expect(deps.closes).toEqual([]);
+    expect(deps.labels).toEqual(['status:merged']);
     expect(deps.comments).toHaveLength(1);
-    expect(deps.comments[0]).toContain(`Overseer reconcile closed tracker for ${SERVER_WO}.`);
+    expect(deps.comments[0]).toContain(`Overseer reconcile: ${SERVER_WO} merged, not done.`);
     expect(deps.actions).toMatchObject([
-      { prRef: 'thinmansoftware/shopops#662', woId: SERVER_WO, action: RECONCILE_ACTION },
+      {
+        prRef: 'thinmansoftware/shopops#662',
+        woId: SERVER_WO,
+        class: 'closes_keyword',
+        action: RECONCILE_MERGED_ACTION,
+      },
     ]);
   });
 
@@ -320,15 +350,21 @@ describe('spec-only guard with the real #1898 fixture', () => {
     expect(isSpecOnlyChangeSet(specAmendment.files)).toBe(true);
   });
 
-  test('even WITHOUT its skip line, #1898 cannot close #1889 (spec-only merge)', async () => {
+  test('even if #1898 carried a Closes keyword on its base, the spec-only guard still leaves #1889 open', async () => {
+    // #1898 is the spec PR that CREATED the WO (touches only docs/work-orders).
+    // Drop its skip line AND give it a closing keyword for #1889 -- the keyword
+    // close path must still be blocked by the spec-only guard, so the WO is not
+    // closed by the very PR that authored it.
     const bodyWithoutSkip = (specAmendment.pr.body ?? '').replace(/^Reconcile-Skip:.*$/gim, '');
     expect(extractReconcileSkipStems(bodyWithoutSkip).size).toBe(0);
-    const deps = fakeDeps({ prs: [{ ...specAmendment.pr, body: bodyWithoutSkip }] });
+    const bodyWithKeyword = `${bodyWithoutSkip}\n\nCloses thinmansoftware/bdc-xo#1889`;
+    const deps = fakeDeps({ prs: [{ ...specAmendment.pr, body: bodyWithKeyword }] });
 
     const result = await runReconcileOnce({
       deps: {
         ...deps,
         findTrackerIssueByStem: m157Trackers([UI_WO]),
+        findTrackerIssueByNumber: m157TrackersByNumber([UI_WO]),
         listPullRequestFiles: filesFromFixtures(specAmendment),
       },
     });
@@ -363,6 +399,7 @@ describe('re-close guard -- a human reopen is not undone by the same PR', () => 
       deps: {
         ...deps,
         findTrackerIssueByStem: m157Trackers([SERVER_WO]),
+        findTrackerIssueByNumber: m157TrackersByNumber([SERVER_WO]),
         listPullRequestFiles: filesFromFixtures(serverHalf),
       },
     });
@@ -372,12 +409,24 @@ describe('re-close guard -- a human reopen is not undone by the same PR', () => 
     expect(deps.warnings).toContain('overseer.reconcile.tracker_reopened_after_close_left_open');
   });
 
-  test('a PR that has never closed this tracker closes it (guard is inert on first sight)', async () => {
+  test('a PR that has never closed this tracker marks it merged (guard is inert on first sight)', async () => {
     const deps = fakeDeps({ closeAlreadyRecorded: false });
 
     const result = await runReconcileOnce({ deps });
 
-    expect(result.closed).toBe(1);
-    expect(deps.closes).toEqual([1044]);
+    expect(result.closed).toBe(0);
+    expect(deps.closes).toEqual([]);
+    expect(deps.labels).toEqual(['status:merged']);
+  });
+
+  test('a PR that already marked this tracker merged does nothing on a rescan', async () => {
+    const deps = fakeDeps({ mergedAlreadyNoted: true });
+
+    const result = await runReconcileOnce({ deps });
+
+    expect(result.closed).toBe(0);
+    expect(deps.labels).toEqual([]);
+    expect(deps.comments).toEqual([]);
+    expect(deps.actions).toEqual([]);
   });
 });

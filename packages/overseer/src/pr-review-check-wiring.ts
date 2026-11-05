@@ -16,14 +16,22 @@
  * / check_suite name cannot be matched to a verdict-named check.
  */
 import * as dispatch from '@archon/core/db/dispatch';
+import { PR_REVIEW_LOG_RECIPIENT } from '@archon/core/db/dispatch-routing';
 import type {
   RecheckCheckRun,
   RecheckIngestDeps,
   StandingVerdict,
 } from './pr-review-check-ingest.ts';
-import type { SubmitOutcome } from './pr-review-submit.ts';
-import { recheckCorrelationId } from './pr-review-check-ingest';
-import { createRealOctokitClient } from './adapters/github-real-deps';
+import { attachWorkflowAttempts, recheckCorrelationId } from './pr-review-check-ingest';
+import {
+  actionsJobAttemptLookup,
+  createRealOctokitClient,
+  extractReviewSummary,
+} from './adapters/github-real-deps';
+
+// extractReviewSummary lives in adapters/github-real-deps.ts so the merge gate
+// can read review summaries without an import cycle; re-exported for callers.
+export { extractReviewSummary };
 import {
   REVIEW_RECIPIENT,
   REVIEW_SENDER,
@@ -33,7 +41,7 @@ import {
 } from './pr-review-wiring';
 
 /** Receipt recipient the submit path writes its verdicts to. */
-const RECEIPT_RECIPIENT = 'operator';
+const RECEIPT_RECIPIENT = PR_REVIEW_LOG_RECIPIENT;
 
 const CHECK_RUN_PAGE_SIZE = 100;
 const MAX_CHECK_RUN_PAGES = 10;
@@ -44,13 +52,18 @@ interface CheckRunsForRefClient {
       data: { check_runs?: unknown[] };
     }>;
   };
+  actions?: {
+    getJobForWorkflowRun?(input: Record<string, unknown>): Promise<{
+      data: { run_id?: number; run_attempt?: number };
+    }>;
+  };
 }
 
 /**
  * Same paginated listForRef walk the stale sweep uses. Incomplete (capped or
  * failed) pages are reported so the ingest can fail closed.
  */
-async function listCheckRunsForRefFromOctokit(
+export async function listCheckRunsForRefFromOctokit(
   octokit: CheckRunsForRefClient,
   input: { owner: string; repo: string; headSha: string }
 ): Promise<{ runs: RecheckCheckRun[]; complete: boolean }> {
@@ -61,12 +74,19 @@ async function listCheckRunsForRefFromOctokit(
         owner: input.owner,
         repo: input.repo,
         ref: input.headSha,
+        filter: 'all',
         per_page: CHECK_RUN_PAGE_SIZE,
         page,
       });
       const pageRuns = (response.data.check_runs ?? []) as RecheckCheckRun[];
       runs.push(...pageRuns);
-      if (pageRuns.length < CHECK_RUN_PAGE_SIZE) return { runs, complete: true };
+      if (pageRuns.length < CHECK_RUN_PAGE_SIZE) {
+        const enriched = await attachWorkflowAttempts(
+          runs,
+          actionsJobAttemptLookup(octokit, { owner: input.owner, repo: input.repo })
+        );
+        return { runs: enriched, complete: true };
+      }
     } catch {
       return { runs, complete: false };
     }
@@ -129,44 +149,6 @@ export function foldSubmitReceipts(
 }
 
 /**
- * Recover the review summary the reviewer posted for one head from the review
- * work item's stored result body.
- *
- * THE PERSISTED SHAPE IS A `SubmitOutcome`. The review worker writes
- * `result_body: JSON.stringify(outcome)` when it finishes an item
- * (`review-worker-clock.ts`), so this function parses exactly that type and
- * nothing else -- `summary` is the field `pr-review-submit` puts the reviewer's
- * posted finding text on, for every terminal branch that formed a verdict.
- *
- * `reason` is retained ONLY as a compatibility fallback for outcomes persisted
- * before `SubmitOutcome.summary` existed. It is not where a current
- * `changes_requested` carries its evidence: that branch sets no `reason` at
- * all, which is precisely why reading `reason` alone recovered nothing and the
- * whole recheck path failed closed (#782 review finding, 2026-09-07).
- *
- * Returns null when the body is absent, unparseable, or carries no text; the
- * caller then falls back to the receipt disposition alone and the ingest's
- * fail-closed default applies.
- */
-export function extractReviewSummary(resultBody: string | null): string | null {
-  if (!resultBody) return null;
-  let parsed: Pick<SubmitOutcome, 'summary' | 'reason'>;
-  try {
-    parsed = JSON.parse(resultBody) as Pick<SubmitOutcome, 'summary' | 'reason'>;
-  } catch {
-    return null;
-  }
-  if (typeof parsed?.summary === 'string' && parsed.summary.trim().length > 0) {
-    return parsed.summary;
-  }
-  // Legacy outcomes only -- see the doc comment above.
-  if (typeof parsed?.reason === 'string' && parsed.reason.trim().length > 0) {
-    return parsed.reason;
-  }
-  return null;
-}
-
-/**
  * Binds the pure recheck ingest dependencies to the live dispatch queue.
  *
  * Reuses `agent_dispatch_messages` with `task_type: 'run_review'` so a queued
@@ -184,10 +166,17 @@ export function createRealRecheckIngestDeps(config: ReviewRouteConfig): RecheckI
       // Exact correlation-id match: head-bound, indexed, and immune to the
       // 500-row page cap that makes a listMessages scan unable to reach an
       // older receipt.
-      const receipts = await dispatch.listMessagesByCorrelationId({
+      // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: log recipient first, then the
+      // pre-cut-off history at `operator` (newest-first overall).
+      const logReceipts = await dispatch.listMessagesByCorrelationId({
         correlationId,
         recipient: RECEIPT_RECIPIENT,
       });
+      const historyReceipts = await dispatch.listMessagesByCorrelationId({
+        correlationId,
+        recipient: 'operator',
+      });
+      const receipts = [...logReceipts, ...historyReceipts];
       const verdict = foldSubmitReceipts(receipts, input.headSha);
       if (!verdict) return null;
 

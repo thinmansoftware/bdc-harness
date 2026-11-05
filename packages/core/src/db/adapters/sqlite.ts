@@ -2,6 +2,7 @@
  * SQLite adapter using bun:sqlite
  */
 import { Database, type SQLQueryBindings } from 'bun:sqlite';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import type { IDatabase, QueryResult, SqlDialect } from './types';
@@ -87,6 +88,19 @@ export class SqliteAdapter implements IDatabase {
   private wave2SchemaPromise: Promise<void> | null = null;
   /** Re-entrancy guard while installers call this.query(). */
   private wave2Installing = false;
+  /** FIFO tail. A rejected predecessor resolves to the next gate so it cannot wedge the chain. */
+  private lockTail: Promise<void> = Promise.resolve();
+  /** Monotonic source of nonzero mutex generations. */
+  private lockSerial = 0;
+  /** Generation of the current holder, or 0 when the mutex is free. */
+  private heldGeneration = 0;
+  /** True from just before BEGIN until the exclusive section releases the mutex. */
+  private sqlTransactionOpen = false;
+  /**
+   * Async context of the holder. Store presence is not ownership: a timer created
+   * inside a finished transaction still carries the store and must take the mutex.
+   */
+  private readonly lockContext = new AsyncLocalStorage<{ lockGeneration: number }>();
 
   constructor(dbPath: string) {
     const bootstrapStartedAt = performance.now();
@@ -147,7 +161,96 @@ export class SqliteAdapter implements IDatabase {
     await this.wave2SchemaPromise;
   }
 
+  /**
+   * True only for the acquisition that currently holds the mutex.
+   * A leftover AsyncLocalStorage store from a completed transaction is not ownership.
+   */
+  private holdsLock(): boolean {
+    const store = this.lockContext.getStore();
+    return store?.lockGeneration === this.heldGeneration && this.heldGeneration !== 0;
+  }
+
+  /** True when this async context is inside this adapter's open SQL transaction. */
+  private inSqlTransaction(): boolean {
+    return this.holdsLock() && this.sqlTransactionOpen;
+  }
+
+  /**
+   * Run fn only after every earlier public query and transaction on this adapter
+   * has finished. The gate is resolved on every exit, including a rejected predecessor.
+   */
+  private async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const prior = this.lockTail;
+    let releaseGate: (() => void) | undefined;
+    const gate = new Promise<void>(resolve => {
+      releaseGate = resolve;
+    });
+    const release = (): void => {
+      if (releaseGate === undefined) {
+        throw new Error('sqlite transaction mutex inconsistent');
+      }
+      const resolveGate = releaseGate;
+      releaseGate = undefined;
+      resolveGate();
+    };
+    this.lockTail = prior.then(
+      () => gate,
+      () => gate
+    );
+
+    const waitStarted = performance.now();
+    try {
+      await prior;
+    } catch (waitError) {
+      release();
+      throw waitError;
+    }
+
+    let generation = 0;
+    let released = false;
+    const finish = (): boolean => {
+      if (released) {
+        return false;
+      }
+      released = true;
+      const mismatched = generation !== 0 && this.heldGeneration !== generation;
+      this.heldGeneration = 0;
+      this.sqlTransactionOpen = false;
+      release();
+      return mismatched;
+    };
+
+    try {
+      const waitMs = performance.now() - waitStarted;
+      if (waitMs > 5000) {
+        getLog().warn({ waitMs }, 'db.sqlite_transaction_lock_wait');
+      }
+      generation = ++this.lockSerial;
+      if (generation === 0) {
+        throw new Error('sqlite transaction mutex inconsistent');
+      }
+      this.heldGeneration = generation;
+      const result = await this.lockContext.run({ lockGeneration: generation }, fn);
+      if (finish()) {
+        throw new Error('sqlite transaction mutex inconsistent');
+      }
+      return result;
+    } catch (error) {
+      if (finish()) {
+        throw new Error('sqlite transaction mutex inconsistent');
+      }
+      throw error;
+    }
+  }
+
   async query<T>(sql: string, params?: unknown[]): Promise<QueryResult<T>> {
+    if (this.holdsLock()) {
+      return this.executeQuery<T>(sql, params);
+    }
+    return this.runExclusive(() => this.executeQuery<T>(sql, params));
+  }
+
+  private async executeQuery<T>(sql: string, params?: unknown[]): Promise<QueryResult<T>> {
     // Register Wave 2 isolated schemas before any application query.
     // Skip while installers themselves are issuing CREATE statements.
     if (!this.wave2Installing) {
@@ -222,21 +325,35 @@ export class SqliteAdapter implements IDatabase {
   }
 
   async withTransaction<T>(
-    fn: (query: <U>(sql: string, params?: unknown[]) => Promise<QueryResult<U>>) => Promise<T>
+    fn: (query: <U>(sql: string, params?: unknown[]) => Promise<QueryResult<U>>) => Promise<T>,
+    options?: { immediate?: boolean }
   ): Promise<T> {
-    await this.query('BEGIN');
-    try {
-      const result = await fn(this.query.bind(this));
-      await this.query('COMMIT');
-      return result;
-    } catch (e) {
-      try {
-        await this.query('ROLLBACK');
-      } catch (rollbackError) {
-        getLog().error({ err: rollbackError as Error }, 'db.sqlite_transaction_rollback_failed');
-      }
-      throw e;
+    if (this.inSqlTransaction()) {
+      throw new Error('nested sqlite transaction');
     }
+    return this.runExclusive(async () => {
+      if (this.sqlTransactionOpen) {
+        throw new Error('sqlite transaction mutex inconsistent');
+      }
+      this.sqlTransactionOpen = true;
+      // IMMEDIATE takes the write lock here, where busy_timeout applies. A
+      // deferred BEGIN that reads first cannot wait when it later upgrades to
+      // a write while another process holds the lock: SQLite returns
+      // SQLITE_BUSY at once instead of invoking the busy handler.
+      await this.query(options?.immediate ? 'BEGIN IMMEDIATE' : 'BEGIN');
+      try {
+        const result = await fn(this.query.bind(this));
+        await this.query('COMMIT');
+        return result;
+      } catch (e) {
+        try {
+          await this.query('ROLLBACK');
+        } catch (rollbackError) {
+          getLog().error({ err: rollbackError as Error }, 'db.sqlite_transaction_rollback_failed');
+        }
+        throw e;
+      }
+    });
   }
 
   async close(): Promise<void> {
@@ -1276,6 +1393,13 @@ export class SqliteAdapter implements IDatabase {
         -- Board/XO seat. drain_on_start (mailbox) like operator/xo -- no worker
         -- ever claims it; the desktop automation reads and addresses it directly.
         ('astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 1),
+        -- WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065 parity)
+        ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', 1),
+        ('pr-review-log', 'PR review receipt log', 'drain_on_start', 1),
+        -- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 067 parity): the
+        -- cauldron-fire command consumer mailbox and the t3-bridge VPS sender.
+        ('cauldron-fire', 'T3 command consumer', 'drain_on_start', 1),
+        ('t3-bridge', 'T3 VPS bridge sender', 'drain_on_start', 1),
         ('operator', 'Operator', 'drain_on_start', 1),
         ('xo', 'XO', 'drain_on_start', 1),
         ('board', 'Board', 'alias_resolved', 1),
@@ -1295,7 +1419,15 @@ export class SqliteAdapter implements IDatabase {
         -- back as remediation candidates addressed to 'taskmaster'. Without
         -- this row createAuthenticatedMessage rejects every one with
         -- missing_principal.
-        ('taskmaster', 'Taskmaster', 'worker_poll', 1)
+        ('taskmaster', 'Taskmaster', 'worker_poll', 1),
+        -- WO-HARNESS-COMPANION-MCP-MAILBOX-01 (migration 065 parity): voice
+        -- companion mailboxes. Hand-maintained mirror of 000_combined.sql.
+        -- grokbot is active; dot, muse and duet stay inactive. No follow-up
+        -- UPDATE: inactive companions must not be switched on by the seed.
+        ('grokbot', 'Grok Bot (voice companion)', 'drain_on_start', 1),
+        ('dot', 'Dot (voice companion)', 'drain_on_start', 0),
+        ('muse', 'Muse (voice companion)', 'drain_on_start', 0),
+        ('duet', 'Duet (voice companion)', 'drain_on_start', 0)
       ON CONFLICT (principal_id) DO NOTHING
     `);
     this.db.run(`
@@ -2604,6 +2736,81 @@ export class SqliteAdapter implements IDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_tm_fire_admissions_day ON tm_fire_admissions(utc_day,state);
 
+      -- Durable T3 command admission ledger (migration 067,
+      -- WO-HARNESS-T3-COMMAND-CONSUMER-01). Hand-maintained mirror of
+      -- migrations/067_t3_command_consumer.sql. Keyed by request_id; rows are
+      -- never deleted so request + run identity survive after completion.
+      CREATE TABLE IF NOT EXISTS t3_command_admissions (
+        request_id TEXT PRIMARY KEY,
+        actor_principal_id TEXT NOT NULL,
+        verb TEXT NOT NULL CHECK (verb IN ('fire','cancel-own','approve')),
+        payload_sha256 TEXT NOT NULL,
+        wo_id TEXT,
+        project TEXT,
+        target_run_id TEXT,
+        pr_ref TEXT,
+        head_sha TEXT,
+        thread_id TEXT,
+        source_message_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('reserved','admitted','refused','unknown')),
+        status_code INTEGER,
+        code TEXT,
+        cascade_id TEXT,
+        run_id TEXT,
+        reply_message_id TEXT,
+        effect_started_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      -- WO fire lock: at most one unresolved (reserved or unknown) fire per WO;
+      -- an unknown fire holds it until operator adjudication (migration 067).
+      DROP INDEX IF EXISTS idx_t3_command_admissions_live_fire;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
+        ON t3_command_admissions(wo_id) WHERE verb = 'fire' AND state IN ('reserved', 'unknown');
+      -- Amendment 5 A5.0: ONE shared WO claim for every in-process cascade caller
+      -- (Taskmaster and the T3 consumer), held through every tier until terminal.
+      CREATE TABLE IF NOT EXISTS cascade_wo_claims (
+        wo_id TEXT NOT NULL,
+        project TEXT NOT NULL,
+        cascade_id TEXT NOT NULL,
+        holder TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'released')),
+        claimed_at TEXT NOT NULL,
+        released_at TEXT,
+        retained_reason TEXT,
+        run_ids_json TEXT NOT NULL DEFAULT '[]'
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_cascade_wo_claims_active
+        ON cascade_wo_claims (wo_id)
+        WHERE state = 'active';
+
+      -- Amendment 5 A5.7: the consumer ticks only while holding this lease.
+      CREATE TABLE IF NOT EXISTS t3_consumer_lease (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        holder TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+
+      -- Amendment 5 A5.12: failed processing attempts per command row.
+      CREATE TABLE IF NOT EXISTS t3_command_attempts (
+        message_id TEXT PRIMARY KEY,
+        attempts INTEGER NOT NULL,
+        last_error TEXT,
+        updated_at TEXT NOT NULL
+      );
+      -- Run custody: every run a fire admission's cascade creates (migration 067).
+      CREATE TABLE IF NOT EXISTS t3_command_run_custody (
+        admission_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        tier TEXT,
+        discovered_at TEXT NOT NULL,
+        UNIQUE (run_id)
+      );
+      -- Run lock: one unresolved cancel-own / approve per target run (migration 067).
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_run_lock
+        ON t3_command_admissions(target_run_id)
+        WHERE verb IN ('cancel-own', 'approve') AND state IN ('reserved', 'unknown');
+
       -- Per-service GitHub API usage and latest quota state (migration 062).
       CREATE TABLE IF NOT EXISTS github_api_usage (
         hour_bucket TEXT NOT NULL,
@@ -2633,6 +2840,27 @@ export class SqliteAdapter implements IDatabase {
         updated_at TEXT NOT NULL,
         updated_by TEXT NOT NULL,
         reason TEXT
+      );
+
+      -- seat usage readings (migration 064).
+      CREATE TABLE IF NOT EXISTS seat_usage_readings (
+        seat TEXT PRIMARY KEY,
+        used_percent REAL NOT NULL,
+        remaining_percent REAL NOT NULL,
+        resets_at TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        source TEXT NOT NULL,
+        received_at TEXT NOT NULL
+      );
+
+      -- review spool single-writer lease (migration 066).
+      CREATE TABLE IF NOT EXISTS review_spool_leases (
+        spool_key TEXT PRIMARY KEY,
+        holder_id TEXT NOT NULL,
+        fencing_token INTEGER NOT NULL CHECK (fencing_token > 0),
+        acquired_at TEXT NOT NULL,
+        heartbeat_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
       );
     `);
     getLog().info('db.sqlite_schema_initialized');

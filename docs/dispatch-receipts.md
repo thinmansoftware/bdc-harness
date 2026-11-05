@@ -55,6 +55,97 @@ curl -X POST "$ARCHON_URL/api/dispatch/messages/$MESSAGE_ID/ack" \
 
 The lease is checked again in the same transaction that writes the receipt. A bare operator
 token always binds the actor to `operator`.
+
+### Operator runbook: xo-mailbox-ack.sh
+
+The live XO seat acknowledges or addresses its mailbox with
+`scripts/dispatch/xo-mailbox-ack.sh`. Run it from a bdc-harness checkout. The production
+image does not copy `docs/` or `scripts/dispatch/`.
+
+```sh
+xo-mailbox-ack.sh <ack|address> <message-id> [message-id...]
+```
+
+`ARCHON_URL` defaults to `http://127.0.0.1:3090`.
+
+Required environment variables. The script never echoes their values:
+
+- `BOARD_PRINCIPAL_TOKEN`
+- `XO_HOLDER_TOKEN`
+
+Optional:
+
+- `XO_ACK_DRY_RUN=1` prints `POST`, the message URL, the four header names
+  (`x-board-principal-token`, `x-xo-holder-token`, `x-xo-lease-id`,
+  `x-xo-fencing-token`), and `body={}`, then exits without calling the network.
+- `ARCHON_OPERATOR_TOKEN`, when set and non-empty, is sent as
+  `x-archon-operator-token` on the lease read and on each receipt write. It is
+  never printed.
+
+The script reads `lease_id` and `fencing_token` from `GET /api/board/xo-lease/current`,
+then POSTs `{}` to `/api/dispatch/messages/<id>/<ack|address>` with the four lease
+headers. It never calls `/cancel`.
+
+| Exit | Meaning |
+|---|---|
+| 0 | Every id returned HTTP 200, or a dry-run finished. |
+| 1 | The lease fetch failed, or at least one id did not return HTTP 200. |
+| 2 | Usage error, or a required variable is missing. The message names that variable. |
+| 3 | `no_live_xo_lease`. The current-lease route returned HTTP 200 JSON `null`, or an object with no `lease_id`. |
+
+Dry-run. The tokens below are fake and exist only in the environment assignments.
+The script must not echo them:
+
+```sh
+ARCHON_URL=http://127.0.0.1:3090 \
+BOARD_PRINCIPAL_TOKEN=bpt-example \
+XO_HOLDER_TOKEN=xht-example \
+XO_ACK_DRY_RUN=1 \
+  bash scripts/dispatch/xo-mailbox-ack.sh ack 11111111-1111-1111-1111-111111111111
+```
+
+`GET /api/dispatch/principals` (operator token) lists every `dispatch_principals` row
+and the ack path for that row. Sample:
+
+```json
+{
+  "principals": [
+    {
+      "principal_id": "codex",
+      "display_name": "Codex",
+      "delivery_mode": "worker_poll",
+      "active": true,
+      "credential_configured": false,
+      "ack_path": "worker_claim"
+    },
+    {
+      "principal_id": "operator",
+      "display_name": "Operator",
+      "delivery_mode": "drain_on_start",
+      "active": true,
+      "credential_configured": false,
+      "ack_path": "operator_token"
+    },
+    {
+      "principal_id": "xo",
+      "display_name": "XO",
+      "delivery_mode": "drain_on_start",
+      "active": true,
+      "credential_configured": false,
+      "ack_path": "xo_lease"
+    },
+    {
+      "principal_id": "xo-fable",
+      "display_name": "XO Fable",
+      "delivery_mode": "drain_on_start",
+      "active": true,
+      "credential_configured": false,
+      "ack_path": "none"
+    }
+  ]
+}
+```
+
 ## Inbox reader
 
 The inbox reader classifies the `xo` mailbox every five minutes and can optionally take ownership
@@ -114,3 +205,53 @@ The reader never acknowledges, addresses or cancels; it only machine-disposes IN
 
 Direct receipt operations and cancellation are prohibited. The legacy non-terminal surface
 disposition remains owned by the existing operator consumer and is not produced by this reader.
+
+## Routing since 2026-11-01
+
+WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01. The cut-off is `OPERATOR_HISTORY_CUTOFF` =
+`2026-11-01T00:00:00.000Z` in `packages/core/src/db/dispatch-routing.ts`.
+
+| Recipient | What lands there | Who reads it |
+|---|---|---|
+| `operator` | History only. Rows queued before the cut-off stay as they are. Low-volume senders not moved by this WO (re-review cap claims, judge-ladder blocker notices, model-resource health, Taskmaster deadman, digest and blocker_report) still write here. | Nothing new. The operator inbox consumer skips every row created before the cut-off. |
+| `pr-review-log` | The three PR-review receipt kinds: `pr_review_ingest_receipt`, `pr_review_submit_receipt`, `pr_review_recheck_ingest_receipt`. | The reviewer, for re-review authorization. It reads `pr-review-log` first, then `operator` for pre-cut-off receipts. Nothing drains it. |
+| `t3-desktop` | `overseer_run_report` rows from operator-card delivery (the resolved board-seat owner is in the body as `owner_seat`, null when unresolved) and Taskmaster `escalate_p0`. | The T3 desktop bridge (WO-XO-T3-RESULTS-BRIDGE-01). |
+
+Rules:
+
+- Fence 281 (2026-11-04): an `overseer_run_report` whose `responsible_actor` is an XO principal
+  (`acting-xo`, `xo`, `operator`, or blank, which the body defaults to `acting-xo`) is written
+  to BOTH `t3-desktop` and `operator`. The two rows share `correlation_id` (the run id) and
+  `card_id`; the operator copy's idempotency key is the T3 key plus `:operator`. An XO-owned run
+  report never reaches only a T3 mailbox. Reports owned by any other actor go to `t3-desktop`
+  only, as before. Helper: `isXoResponsibleActor` in `packages/core/src/db/dispatch-routing.ts`.
+- No code path cancels, deletes, acknowledges or addresses an `operator` row created before
+  the cut-off. The consumer compares `created_at` as an instant, so ISO and SQLite
+  `YYYY-MM-DD HH:MM:SS` text both work. A stamp it cannot parse is treated as history.
+- Taskmaster admits `t3-desktop` only for `escalate_p0`, and `escalate_p0` only to
+  `t3-desktop`. Any other pairing is a forbidden effect.
+- Taskmaster escalates a stalled item at most once per 24 hours, whatever the outcome of the
+  last attempt (sent, failed, rejected). A failed attempt records the error text in the
+  journal row's `proposal_json.failure`.
+- Both principals are seeded in `migrations/065_dispatch_t3_desktop_and_pr_review_log.sql`,
+  `migrations/000_combined.sql` and the SQLite adapter seed.
+- `dispatch_receipt_cutover` (2026-09-24) is a different thing. It only decides which
+  acknowledge and address stamps count as trustworthy in mailbox depth. No writer reads it, so
+  it never moved any traffic.
+
+Post-merge acceptance, on the harness host. Record H0 before the rebuild:
+
+```sh
+sqlite3 /opt/bdc/archon-data/archon.db "select count(*) from agent_dispatch_messages where recipient='operator' and created_at < '2026-11-01'"
+```
+
+24 hours after the rebuild:
+
+```sh
+sqlite3 /opt/bdc/archon-data/archon.db "select count(*) from agent_dispatch_messages where recipient='operator' and created_at < '2026-11-01'"
+sqlite3 /opt/bdc/archon-data/archon.db "select count(*) from agent_dispatch_messages where recipient='operator' and json_extract(body,'$.kind') like 'pr_review_%_receipt' and created_at >= datetime('now','-1 day')"
+sqlite3 /opt/bdc/archon-data/archon.db "select count(*), count(distinct thread_ref) from tm_journal where action_type='escalate_p0' and created_at >= datetime('now','-1 day')"
+```
+
+Expected: the first count equals H0, the second is 0, and in the third the two numbers are
+equal and no larger than the number of stalled items.

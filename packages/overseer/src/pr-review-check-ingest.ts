@@ -152,6 +152,19 @@ export interface RecheckCheckRun {
   started_at?: string | null;
   completed_at?: string | null;
   app?: { slug?: string; name?: string };
+  /** One workflow execution = one check suite; used to recognise twin jobs. */
+  check_suite?: { id?: number } | null;
+  /**
+   * The GitHub Actions run and attempt this check run (= Actions job) belongs
+   * to, when a fetcher looked it up (attachWorkflowAttempts). Absent otherwise.
+   */
+  workflow_attempt?: WorkflowAttempt | null;
+}
+
+/** GitHub Actions identity of one job: its workflow run id and run_attempt. */
+export interface WorkflowAttempt {
+  run_id: number;
+  run_attempt: number;
 }
 
 export interface RecheckIngestDeps {
@@ -287,9 +300,9 @@ const CHECKS_SCOPE_PREFIX = 'checks/';
  */
 function parseReviewFindingLines(
   summary: string | null | undefined
-): { severity: string; scope: string }[] {
+): { severity: string; scope: string; remainder: string }[] {
   if (typeof summary !== 'string' || summary.length === 0) return [];
-  const findings: { severity: string; scope: string }[] = [];
+  const findings: { severity: string; scope: string; remainder: string }[] = [];
   for (const raw of summary.split(/\r?\n/)) {
     const line = raw.trim();
     const match = FINDING_LINE_RE.exec(line);
@@ -299,15 +312,103 @@ function parseReviewFindingLines(
     const colon = rest.indexOf(':');
     const scope = (colon === -1 ? rest : rest.slice(0, colon)).trim();
     if (scope.length === 0) continue;
-    findings.push({ severity: (match[1] ?? '').toLowerCase(), scope });
+    const remainder = colon === -1 ? '' : rest.slice(colon + 1).trim();
+    findings.push({ severity: (match[1] ?? '').toLowerCase(), scope, remainder });
   }
   return findings;
 }
 
+/** Severities that block a verdict; minor and note are advisory. */
+const BLOCKING_SEVERITIES = new Set(['blocker', 'major']);
+
+const REQUIRED_CHECK_WORD = 'required check';
+
+function isAsciiDigits(text: string): boolean {
+  if (text.length === 0) return false;
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code < 48 || code > 57) return false;
+  }
+  return true;
+}
+
 /**
- * Check names the standing verdict actually rejected for, from `checks/`
- * finding lines. Moved here from the stale sweep (round 4) so ingest and
- * sweep share one extractor.
+ * Normalise a check name taken from a finding scope. Every step is linear in
+ * the input (redos-guard.test.ts feeds hostile whitespace runs here; CodeQL
+ * js/polynomial-redos flagged the earlier regex form).
+ */
+function cleanCheckName(raw: string): string | null {
+  let name = raw.trim();
+  const failedAt = name.search(/\sfailed\b/i);
+  if (failedAt !== -1) name = name.slice(0, failedAt).trim();
+  // A trailing numeric check-run id, e.g. "CE Promotion Gate (126186742456)".
+  // A matrix cell such as "(windows-latest)" is part of the name and is kept.
+  if (name.endsWith(')')) {
+    const open = name.lastIndexOf('(');
+    if (open !== -1 && isAsciiDigits(name.slice(open + 1, -1))) name = name.slice(0, open).trim();
+  }
+  return name.length > 0 ? name : null;
+}
+
+/**
+ * The check a finding is scoped to, or null when it is not check-scoped.
+ * Accepts the canonical `checks/<name>` and the free-text forms the reviewer
+ * also writes: `Required checks / <name>`, `Required check <name>`, and
+ * `Required check: <name>: ...` (the parser cuts the scope at the first colon,
+ * so for that form the name is read from `remainder` up to its next colon).
+ * Anchor: lspro-react #777, where "[major] Required checks / CE Promotion Gate"
+ * kept a check-caused rejection from ever being re-reviewed (bdc-xo #4575).
+ */
+export function checkNameFromFindingScope(scope: string, remainder = ''): string | null {
+  const trimmed = scope.trim();
+  const lower = trimmed.toLowerCase();
+  if (lower.startsWith(CHECKS_SCOPE_PREFIX)) {
+    return cleanCheckName(trimmed.slice(CHECKS_SCOPE_PREFIX.length));
+  }
+  if (!lower.startsWith(REQUIRED_CHECK_WORD)) return null;
+  let rest = trimmed.slice(REQUIRED_CHECK_WORD.length);
+  if (rest.startsWith('s') || rest.startsWith('S')) rest = rest.slice(1);
+  const afterWord = rest.trimStart();
+  if (afterWord.length === 0) {
+    // Bare "Required check(s)": the name follows the scope's colon.
+    const colon = remainder.indexOf(':');
+    if (colon === -1) return null;
+    return cleanCheckName(remainder.slice(0, colon));
+  }
+  // "Required checksum" and the like are not this form: a separator must follow.
+  if (
+    afterWord.length === rest.length &&
+    !afterWord.startsWith('/') &&
+    !afterWord.startsWith(':')
+  ) {
+    return null;
+  }
+  const separated =
+    afterWord.startsWith('/') || afterWord.startsWith(':') ? afterWord.slice(1) : afterWord;
+  return cleanCheckName(separated);
+}
+
+/**
+ * True only when the summary has at least one BLOCKING finding ([blocker] or
+ * [major]) and every blocking finding is check-scoped (see
+ * checkNameFromFindingScope). [minor] and [note] findings are advisory and are
+ * ignored. Empty or unparseable summaries (no finding lines) return false.
+ * Shared by the recheck ingest and the merge gate; do not fork this logic.
+ */
+export function blockingFindingsAreCheckScoped(summary: string | null | undefined): boolean {
+  const blocking = parseReviewFindingLines(summary).filter(finding =>
+    BLOCKING_SEVERITIES.has(finding.severity)
+  );
+  if (blocking.length === 0) return false;
+  return blocking.every(
+    finding => checkNameFromFindingScope(finding.scope, finding.remainder) !== null
+  );
+}
+
+/**
+ * Check names the standing verdict actually rejected for, from its BLOCKING
+ * check-scoped findings. Moved here from the stale sweep (round 4) so ingest
+ * and sweep share one extractor.
  *
  * Unstructured prose (no finding lines) returns empty: the caller then falls
  * back to every latest attempt when verifying via listForRef. Do not
@@ -317,14 +418,11 @@ export function blockingCheckNamesFromVerdict(summary: string | null | undefined
   const names: string[] = [];
   const seen = new Set<string>();
   for (const finding of parseReviewFindingLines(summary)) {
-    const scope = finding.scope;
-    if (!scope.toLowerCase().startsWith(CHECKS_SCOPE_PREFIX)) continue;
-    let name = scope.slice(CHECKS_SCOPE_PREFIX.length).trim();
-    const failedAt = name.search(/\sfailed\b/i);
-    if (failedAt !== -1) name = name.slice(0, failedAt);
-    name = name.trim();
+    if (!BLOCKING_SEVERITIES.has(finding.severity)) continue;
+    const name = checkNameFromFindingScope(finding.scope, finding.remainder);
+    if (name === null) continue;
     const key = name.toLowerCase();
-    if (name.length === 0 || seen.has(key)) continue;
+    if (seen.has(key)) continue;
     seen.add(key);
     names.push(name);
   }
@@ -380,21 +478,181 @@ function checkAttemptRank(run: RecheckCheckRun): number {
   return Number.NEGATIVE_INFINITY;
 }
 
+function checkRunId(run: RecheckCheckRun): number | undefined {
+  return typeof run.id === 'number' && Number.isFinite(run.id) ? run.id : undefined;
+}
+
+/**
+ * Newest attempt by creation order. Check-run ids are assigned in creation
+ * order, so a queued rerun (no started_at or completed_at yet) still beats an
+ * older completed attempt. Timestamps decide only when either id is missing.
+ */
 function checkAttemptIsNewer(candidate: RecheckCheckRun, current: RecheckCheckRun): boolean {
+  const candidateId = checkRunId(candidate);
+  const currentId = checkRunId(current);
+  if (candidateId !== undefined && currentId !== undefined && candidateId !== currentId) {
+    return candidateId > currentId;
+  }
   const candidateRank = checkAttemptRank(candidate);
   const currentRank = checkAttemptRank(current);
   if (candidateRank !== currentRank) return candidateRank > currentRank;
   return (candidate.id ?? 0) > (current.id ?? 0);
 }
 
+function isSkippedRun(run: RecheckCheckRun): boolean {
+  return (
+    run.status === 'completed' &&
+    typeof run.conclusion === 'string' &&
+    run.conclusion.toLowerCase() === 'skipped'
+  );
+}
+
+function checkSuiteId(run: RecheckCheckRun): number | undefined {
+  const id = run.check_suite?.id;
+  return typeof id === 'number' && Number.isFinite(id) ? id : undefined;
+}
+
+function timestampMs(value: string | null | undefined): number | undefined {
+  if (typeof value !== 'string') return undefined;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : undefined;
+}
+
+function workflowAttemptOf(run: RecheckCheckRun): WorkflowAttempt | undefined {
+  const attempt = run.workflow_attempt;
+  if (!attempt) return undefined;
+  const { run_id: runId, run_attempt: runAttempt } = attempt;
+  if (!Number.isFinite(runId) || !Number.isFinite(runAttempt)) return undefined;
+  return attempt;
+}
+
+/**
+ * True when `skipped` is a twin job of `ran` from the SAME execution attempt.
+ * Same check suite is necessary but not enough: a suite also holds rerun
+ * attempts.
+ *  - When both runs carry their Actions run_id and run_attempt, that decides:
+ *    same run and same attempt = twin, even when the skipped job was evaluated
+ *    after the real one finished (a `needs:` dependent; bdc-xo #4567).
+ *  - Otherwise (not Actions, or the lookup failed): a rerun can only start
+ *    after the previous attempt finished, while twin jobs of one attempt
+ *    overlap in time, so the skipped run is a twin only if it started no later
+ *    than `ran` completed, or while `ran` is still running.
+ * Missing suite or timestamps = not a twin (newest-attempt rule applies).
+ */
+function isTwinOf(skipped: RecheckCheckRun, ran: RecheckCheckRun): boolean {
+  const suite = checkSuiteId(skipped);
+  if (suite === undefined || suite !== checkSuiteId(ran)) return false;
+  const skippedAttempt = workflowAttemptOf(skipped);
+  const ranAttempt = workflowAttemptOf(ran);
+  if (skippedAttempt && ranAttempt) {
+    return (
+      skippedAttempt.run_id === ranAttempt.run_id &&
+      skippedAttempt.run_attempt === ranAttempt.run_attempt
+    );
+  }
+  const skippedStart = timestampMs(skipped.started_at);
+  if (skippedStart === undefined) return false;
+  if (ran.status !== 'completed') return true;
+  const ranEnd = timestampMs(ran.completed_at);
+  return ranEnd !== undefined && skippedStart <= ranEnd;
+}
+
+/**
+ * One run per check name (and app), newest attempt wins. Exception for twin
+ * jobs: two jobs in ONE workflow execution attempt can share a check name, one
+ * of them `if:`-gated off and therefore SKIPPED (anchor: lspro-react
+ * ce-promotion-gate.yml, the dead PR #429 exemption twin). The skipped twin is
+ * created after the real job, so newest-id alone would pick it and a required
+ * gate that actually ran would read as skipped. A SKIPPED run is therefore set
+ * aside when it is a twin (see isTwinOf) of a non-skipped run of the same name.
+ * Across attempts and suites, recency is unchanged: a later attempt that
+ * legitimately skips the job still supersedes an older failure. Only-skipped
+ * stays skipped.
+ */
 export function latestAttemptPerCheck<T extends RecheckCheckRun>(runs: T[]): T[] {
+  const ranByKey = new Map<string, T[]>();
+  for (const run of runs) {
+    if (isSkippedRun(run)) continue;
+    const key = checkAttemptKey(run);
+    const held = ranByKey.get(key) ?? [];
+    held.push(run);
+    ranByKey.set(key, held);
+  }
   const latest = new Map<string, T>();
   for (const run of runs) {
     const key = checkAttemptKey(run);
+    if (isSkippedRun(run) && (ranByKey.get(key) ?? []).some(ran => isTwinOf(run, ran))) continue;
     const held = latest.get(key);
     if (!held || checkAttemptIsNewer(run, held)) latest.set(key, run);
   }
   return [...latest.values()];
+}
+
+/** Most Actions job lookups one reduction may spend; the rest fall back. */
+export const MAX_WORKFLOW_ATTEMPT_LOOKUPS = 20;
+
+/**
+ * Ids of the runs whose Actions attempt can change the twin decision: every
+ * skipped run that shares name, app and check suite with a non-skipped run,
+ * plus those non-skipped siblings. Everything else never needs a lookup.
+ */
+export function twinCandidateRunIds(runs: RecheckCheckRun[]): number[] {
+  const ranBySuiteKey = new Map<string, RecheckCheckRun[]>();
+  for (const run of runs) {
+    const suite = checkSuiteId(run);
+    if (suite === undefined || isSkippedRun(run)) continue;
+    const key = `${checkAttemptKey(run)}#${suite}`;
+    const held = ranBySuiteKey.get(key) ?? [];
+    held.push(run);
+    ranBySuiteKey.set(key, held);
+  }
+  const ids = new Set<number>();
+  for (const run of runs) {
+    const suite = checkSuiteId(run);
+    const id = checkRunId(run);
+    if (suite === undefined || id === undefined || !isSkippedRun(run)) continue;
+    const siblings = ranBySuiteKey.get(`${checkAttemptKey(run)}#${suite}`);
+    if (!siblings) continue;
+    ids.add(id);
+    for (const sibling of siblings) {
+      const siblingId = checkRunId(sibling);
+      if (siblingId !== undefined) ids.add(siblingId);
+    }
+  }
+  return [...ids];
+}
+
+/**
+ * Attach `workflow_attempt` to the twin candidates (see twinCandidateRunIds),
+ * at most MAX_WORKFLOW_ATTEMPT_LOOKUPS lookups. `lookup` maps a check-run id
+ * (= Actions job id) to its run_id/run_attempt, or null. A lookup that throws
+ * or returns null leaves the run without an attempt, so isTwinOf falls back to
+ * the timestamp rule; this never throws. Returns new run objects.
+ */
+export async function attachWorkflowAttempts<T extends RecheckCheckRun>(
+  runs: T[],
+  lookup: (checkRunId: number) => Promise<WorkflowAttempt | null>
+): Promise<T[]> {
+  const wanted = twinCandidateRunIds(runs).slice(0, MAX_WORKFLOW_ATTEMPT_LOOKUPS);
+  if (wanted.length === 0) return runs;
+  const found = new Map<number, WorkflowAttempt>();
+  await Promise.all(
+    wanted.map(async id => {
+      try {
+        const attempt = await lookup(id);
+        if (attempt && Number.isFinite(attempt.run_id) && Number.isFinite(attempt.run_attempt)) {
+          found.set(id, { run_id: attempt.run_id, run_attempt: attempt.run_attempt });
+        }
+      } catch {
+        // Fall back to the timestamp rule for this run.
+      }
+    })
+  );
+  return runs.map(run => {
+    const id = checkRunId(run);
+    const attempt = id === undefined ? undefined : found.get(id);
+    return attempt ? { ...run, workflow_attempt: attempt } : run;
+  });
 }
 
 function latestAttemptIsBlocking(
@@ -621,19 +879,19 @@ export function verdictAuthorizesRecheck(verdict: StandingVerdict | null): boole
  *
  * The reviewer writes findings as `[severity] scope: summary`, and a
  * check-caused rejection carries the check in its scope -- live examples from
- * 2026-09-07: `[major] checks/test (windows-latest) failed`. Matching on the
- * `checks/` scope prefix is the structured discriminator. A mixed summary
- * (any finding whose scope is not `checks/`) does NOT authorize: the code
- * finding still stands after a green rerun. Unstructured prose falls back to
+ * 2026-09-07: `[major] checks/test (windows-latest) failed`, and from
+ * 2026-11-03: `[major] Required checks / CE Promotion Gate`. With finding
+ * lines present this is blockingFindingsAreCheckScoped: only BLOCKING findings
+ * count ([note]/[minor] are advisory), and a mixed summary (any blocking
+ * finding not scoped to a check) does NOT authorize, because the code finding
+ * still stands after a green rerun. Unstructured prose falls back to
  * the small set of phrases the reviewer actually emits; an unrecognized
  * summary is treated as a code finding and does NOT authorize.
  */
 export function summaryNamesACheck(summary: string | null | undefined): boolean {
   if (typeof summary !== 'string' || summary.trim().length === 0) return false;
   const findings = parseReviewFindingLines(summary);
-  if (findings.length > 0) {
-    return findings.every(finding => finding.scope.trim().toLowerCase().startsWith('checks/'));
-  }
+  if (findings.length > 0) return blockingFindingsAreCheckScoped(summary);
   const text = summary.toLowerCase();
   return (
     text.includes('checks/') ||

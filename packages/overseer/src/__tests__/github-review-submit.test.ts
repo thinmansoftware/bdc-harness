@@ -151,6 +151,41 @@ describe('createRealSubmitPullRequestReview', () => {
     });
   });
 
+  // WO-HARNESS-OVERSEER-REVIEW-TRIGGER-01: a rate limit (or the local pool
+  // gate refusing before any request left) created no review, so it must reach
+  // the submit path as a throw it can defer -- not as transport-ambiguous,
+  // which the worker retires.
+  test('rethrows the local pool-gate refusal so the submit path can defer it', async () => {
+    const gate = new Error('github_pool_backoff:app-4574893-153295654/core:1793552986000');
+    const submit = createRealSubmitPullRequestReview(
+      fakeOctokit(async () => {
+        throw gate;
+      })
+    );
+    await expect(submit({ ...REF, event: 'APPROVE' })).rejects.toBe(gate);
+  });
+
+  test('rethrows a GitHub 429 so the submit path can defer it', async () => {
+    const submit = createRealSubmitPullRequestReview(
+      fakeOctokit(async () => {
+        throw httpError(429, 'Too Many Requests');
+      })
+    );
+    await expect(submit({ ...REF, event: 'APPROVE' })).rejects.toThrow('Too Many Requests');
+  });
+
+  test('a bare 403 is still a terminal ambiguous result, never a deferral', async () => {
+    const submit = createRealSubmitPullRequestReview(
+      fakeOctokit(async () => {
+        throw httpError(403, 'Resource not accessible by integration');
+      })
+    );
+    expect(await submit({ ...REF, event: 'APPROVE' })).toEqual({
+      submitted: false,
+      message: 'github_review_transport_ambiguous',
+    });
+  });
+
   test('throws loudly when the review API is absent', async () => {
     const submit = createRealSubmitPullRequestReview({
       pulls: {},

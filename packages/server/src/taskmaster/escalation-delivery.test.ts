@@ -6,10 +6,12 @@
  * file (two adapters on one file model two processes sharing the DB).
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { generateKeyPairSync } from 'node:crypto';
 import { unlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import { clearServiceGitHubTokenCache } from '@archon/core/github/service-identity';
 import {
   TASKMASTER_ESCALATION_MARKER,
   TASKMASTER_ESCALATION_COOLDOWN_MS,
@@ -887,5 +889,194 @@ describe('marker trust: only the poster identity suppresses', () => {
     expect((await deliverEscalationToIssue(params, deps)).posted).toBe(false);
     expect(userCalls).toBe(2);
     expect(posts).toBe(0);
+  });
+});
+
+// WO-HARNESS-TASKMASTER-ESCALATION-APP-TOKEN-01: the container runs on GitHub
+// App identity only. Delivery must mint an installation token through the
+// shared core path and name its poster via GET /app, never GET /user.
+describe('App identity delivery (WO-HARNESS-TASKMASTER-ESCALATION-APP-TOKEN-01)', () => {
+  const APP_KEY = generateKeyPairSync('rsa', { modulusLength: 2048 })
+    .privateKey.export({ type: 'pkcs8', format: 'pem' })
+    .toString();
+  const APP_ENV: Record<string, string | undefined> = {
+    GITHUB_APP_TASKMASTER_ID: '777',
+    GITHUB_APP_TASKMASTER_INSTALLATION_ID: '888',
+    GITHUB_APP_TASKMASTER_PRIVATE_KEY: APP_KEY,
+  };
+  const MINTED = 'ghs_minted_installation_token';
+  const COMMENTS_PATH = `/repos/${ISSUE.owner}/${ISSUE.repo}/issues/${ISSUE.number}/comments`;
+
+  interface Call {
+    method: string;
+    path: string;
+    auth: string | null;
+  }
+
+  function fakeAppGithub(options: {
+    comments?: EscalationIssueComment[];
+    slug?: string;
+    userLogin?: string;
+  }): { fetchImpl: (input: string, init?: RequestInit) => Promise<Response>; calls: Call[] } {
+    const calls: Call[] = [];
+    const fetchImpl = async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input);
+      const method = init?.method ?? 'GET';
+      const auth = new Headers(init?.headers).get('authorization');
+      calls.push({ method, path: url.pathname, auth });
+      if (method === 'POST' && url.pathname === '/app/installations/888/access_tokens') {
+        return new Response(
+          JSON.stringify({
+            token: MINTED,
+            expires_at: new Date(Date.now() + 3600_000).toISOString(),
+          }),
+          { status: 201 }
+        );
+      }
+      if (method === 'GET' && url.pathname === '/app') {
+        return new Response(JSON.stringify({ slug: options.slug ?? 'thinman-taskmaster' }), {
+          status: 200,
+        });
+      }
+      if (method === 'GET' && url.pathname === '/user') {
+        if (options.userLogin) {
+          return new Response(JSON.stringify({ login: options.userLogin }), { status: 200 });
+        }
+        return new Response('{"message":"Resource not accessible by integration"}', {
+          status: 403,
+        });
+      }
+      if (url.pathname === COMMENTS_PATH && method === 'GET') {
+        const page = (options.comments ?? []).map(c => ({
+          body: c.body,
+          created_at: c.created_at,
+          user: c.authorLogin ? { login: c.authorLogin } : null,
+        }));
+        return new Response(JSON.stringify(page), { status: 200 });
+      }
+      if (url.pathname === COMMENTS_PATH && method === 'POST') {
+        return new Response('{}', { status: 201 });
+      }
+      return new Response('not found', { status: 404 });
+    };
+    return { fetchImpl, calls };
+  }
+
+  beforeEach(() => {
+    clearServiceGitHubTokenCache();
+  });
+  afterEach(() => {
+    clearServiceGitHubTokenCache();
+  });
+
+  test('Test 1: App identity posts with an installation token', async () => {
+    const fake = fakeAppGithub({});
+    const deps = {
+      ...createRealEscalationDeliveryDeps({ fetchImpl: fake.fetchImpl, env: APP_ENV }),
+      now: () => new Date(T0),
+    };
+    const result = await deliverEscalationToIssue(
+      { issue: ISSUE, threadRef: 'gh:thinmansoftware/bdc-harness#194', body: 'escalate' },
+      deps
+    );
+    expect(result).toEqual({ posted: true });
+    const post = fake.calls.find(c => c.method === 'POST' && c.path === COMMENTS_PATH);
+    expect(post).toBeDefined();
+    expect(post?.auth).toBe(`Bearer ${MINTED}`);
+    // The mint itself was signed with an App JWT (three dot-separated parts), not a PAT.
+    const mint = fake.calls.find(c => c.path === '/app/installations/888/access_tokens');
+    expect(mint?.auth?.startsWith('Bearer ')).toBe(true);
+    expect(mint?.auth?.split(' ')[1]?.split('.').length).toBe(3);
+  });
+
+  test('Test 2: the token is minted once across calls', async () => {
+    const fake = fakeAppGithub({});
+    const deps = createRealEscalationDeliveryDeps({ fetchImpl: fake.fetchImpl, env: APP_ENV });
+    await deps.listIssueComments(ISSUE);
+    await deps.postIssueComment(ISSUE, 'escalate');
+    const mints = fake.calls.filter(c => c.path === '/app/installations/888/access_tokens');
+    expect(mints.length).toBe(1);
+    const githubCalls = fake.calls.filter(c => c.path === COMMENTS_PATH);
+    expect(githubCalls.length).toBe(2);
+    for (const call of githubCalls) expect(call.auth).toBe(`Bearer ${MINTED}`);
+  });
+
+  test('Test 3: App poster login is slug[bot]', async () => {
+    const fake = fakeAppGithub({ slug: 'thinman-taskmaster' });
+    const deps = createRealEscalationDeliveryDeps({ fetchImpl: fake.fetchImpl, env: APP_ENV });
+    expect(await deps.posterLogin()).toBe('thinman-taskmaster[bot]');
+    // Cached on the identity pool: a second lookup costs no request.
+    expect(await deps.posterLogin()).toBe('thinman-taskmaster[bot]');
+    expect(fake.calls.filter(c => c.path === '/app').length).toBe(1);
+    expect(fake.calls.some(c => c.path === '/user')).toBe(false);
+
+    // End to end: a marker by the App's own bot login inside the cooldown
+    // suppresses the escalation, and nothing is posted.
+    const withMarker = fakeAppGithub({
+      slug: 'thinman-taskmaster',
+      comments: [
+        {
+          body: `${TASKMASTER_ESCALATION_MARKER}\n\nearlier`,
+          created_at: new Date(T0 - 60 * 60 * 1000).toISOString(),
+          authorLogin: 'thinman-taskmaster[bot]',
+        },
+      ],
+    });
+    const result = await deliverEscalationToIssue(
+      { issue: ISSUE, threadRef: 'gh:thinmansoftware/bdc-harness#194', body: 'x' },
+      {
+        ...createRealEscalationDeliveryDeps({ fetchImpl: withMarker.fetchImpl, env: APP_ENV }),
+        now: () => new Date(T0),
+      }
+    );
+    expect(result).toEqual({ posted: false, suppressedBy: 'cooldown_marker' });
+    expect(withMarker.calls.some(c => c.method === 'POST' && c.path === COMMENTS_PATH)).toBe(false);
+    expect(withMarker.calls.some(c => c.path === '/user')).toBe(false);
+  });
+
+  test('Test 4: PAT poster login unchanged', async () => {
+    const fake = fakeAppGithub({ userLogin: 'pat-user' });
+    const deps = createRealEscalationDeliveryDeps({
+      fetchImpl: fake.fetchImpl,
+      env: { GITHUB_TOKEN: 'pat-token' },
+    });
+    expect(await deps.posterLogin()).toBe('pat-user');
+    const user = fake.calls.filter(c => c.path === '/user');
+    expect(user.length).toBe(1);
+    expect(user[0].auth).toBe('Bearer pat-token');
+    expect(fake.calls.some(c => c.path === '/app')).toBe(false);
+    expect(fake.calls.some(c => c.path.endsWith('/access_tokens'))).toBe(false);
+  });
+
+  test('Test 5: no identity fails with the known text', async () => {
+    const fake = fakeAppGithub({});
+    const none = createRealEscalationDeliveryDeps({ fetchImpl: fake.fetchImpl, env: {} });
+    await expect(none.postIssueComment(ISSUE, 'x')).rejects.toThrow(
+      'taskmaster_github_token_missing'
+    );
+    await expect(none.posterLogin()).rejects.toThrow('taskmaster_github_token_missing');
+    // An incomplete App config (id without installation or key) also fails closed.
+    const partial = createRealEscalationDeliveryDeps({
+      fetchImpl: fake.fetchImpl,
+      env: { GITHUB_APP_TASKMASTER_ID: '777' },
+    });
+    await expect(partial.postIssueComment(ISSUE, 'x')).rejects.toThrow(
+      'taskmaster_github_token_missing'
+    );
+    expect(fake.calls.length).toBe(0);
+  });
+
+  test('Test 6: injected token still wins', async () => {
+    const fake = fakeAppGithub({ userLogin: 'injected-user' });
+    const deps = createRealEscalationDeliveryDeps({
+      fetchImpl: fake.fetchImpl,
+      token: 'test-token',
+      env: APP_ENV,
+    });
+    await deps.postIssueComment(ISSUE, 'x');
+    expect(await deps.posterLogin()).toBe('injected-user');
+    expect(fake.calls.some(c => c.path.endsWith('/access_tokens'))).toBe(false);
+    expect(fake.calls.some(c => c.path === '/app')).toBe(false);
+    for (const call of fake.calls) expect(call.auth).toBe('Bearer test-token');
   });
 });

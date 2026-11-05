@@ -9,7 +9,30 @@ mkdir -p /.archon/workspaces /.archon/worktrees
 # Determine if we need to use gosu for privilege dropping
 if [ "$(id -u)" = "0" ]; then
   # Running as root: fix volume permissions, then drop to appuser
-  if ! chown -Rh appuser:appuser /.archon 2>/dev/null; then
+  # BEGIN ownership-fix (tested by scripts/container/docker-entrypoint-ownership.test.ts)
+  # WO-HARNESS-ENTRYPOINT-CHOWN-NO-CRASH-RESTART-01: /.archon holds every
+  # Cauldron workspace (tens of GB). A blanket recursive chown took minutes and
+  # returned non-zero when a path vanished mid-walk, so the container exited 1
+  # and crash-restarted on boot. Now: chown only entries NOT already owned by
+  # appuser (normally none), warn with a count on partial failure, and fail
+  # hard only if the directory itself is not writable by appuser.
+  # Returns 1 when any chown failed (after printing the WARN line).
+  _chown_wrong_owner() {
+    _cwo_dir="$1"
+    _cwo_failed=0
+    while IFS= read -r -d '' _cwo_path; do
+      if ! chown -h appuser:appuser "$_cwo_path" 2>/dev/null; then
+        _cwo_failed=$((_cwo_failed + 1))
+      fi
+    done < <(find "$_cwo_dir" ! -user appuser -print0 2>/dev/null)
+    if [ "$_cwo_failed" -gt 0 ]; then
+      echo "WARN: could not fix ownership of ${_cwo_failed} paths under ${_cwo_dir} -- continuing" >&2
+      return 1
+    fi
+    return 0
+  }
+  _chown_wrong_owner /.archon || true
+  if ! gosu appuser test -w /.archon; then
     echo "ERROR: Failed to fix ownership of /.archon -- volume may be read-only or mounted with incompatible options" >&2
     exit 1
   fi
@@ -17,9 +40,30 @@ if [ "$(id -u)" = "0" ]; then
   # ARCHON_USER_HOME) so Claude/Codex/Pi config, ~/.gitconfig, shell history,
   # and other user-specific state survive rebuilds. On bind mounts, host UIDs
   # don't map to appuser (1001), so fix ownership the same way we do /.archon.
-  if ! chown -Rh appuser:appuser /home/appuser 2>/dev/null; then
+  _chown_wrong_owner /home/appuser || true
+  if ! gosu appuser test -w /home/appuser; then
     echo "ERROR: Failed to fix ownership of /home/appuser -- volume may be read-only or mounted with incompatible options" >&2
     exit 1
+  fi
+  # END ownership-fix
+  # Design A: OS permissions are the reviewer's read boundary. Reassert them
+  # on every start because these paths may be replaced by bind/named volumes.
+  chown appuser:appuser /home/appuser /.archon /.archon/workspaces
+  chmod 0750 /home/appuser /.archon /.archon/workspaces
+  mkdir -p /home/appuser/.codex /home/appuser/.config/gh /home/appuser/.cursor
+  chown -R appuser:appuser /home/appuser/.codex /home/appuser/.config/gh /home/appuser/.cursor
+  chmod 0700 /home/appuser/.codex /home/appuser/.config/gh /home/appuser/.cursor
+  if [ -d /run/secrets ]; then
+    chown root:appuser /run/secrets
+    chmod 0750 /run/secrets
+  fi
+  mkdir -p /var/lib/overseer-review /home/reviewer/.codex
+  chown appuser:reviewer /var/lib/overseer-review
+  chmod 2770 /var/lib/overseer-review
+  chown reviewer:reviewer /home/reviewer /home/reviewer/.codex
+  chmod 0700 /home/reviewer /home/reviewer/.codex
+  if [ -f /home/appuser/.codex/auth.json ]; then
+    install -o reviewer -g reviewer -m 0600 /home/appuser/.codex/auth.json /home/reviewer/.codex/auth.json
   fi
   # PR #848: seed cursor-agent auth state from the read-only host mount.
   # docker-compose.yml binds ${CURSOR_CONFIG_HOST_PATH:-/dev/null} at
@@ -30,7 +74,7 @@ if [ "$(id -u)" = "0" ]; then
   if [ -d /run/secrets/cursor-config ] && [ -n "$(ls -A /run/secrets/cursor-config 2>/dev/null)" ]; then
     mkdir -p /home/appuser/.cursor
     if cp -a /run/secrets/cursor-config/. /home/appuser/.cursor/ 2>/dev/null; then
-      chown -Rh appuser:appuser /home/appuser/.cursor
+      _chown_wrong_owner /home/appuser/.cursor || true
       echo "[archon] cursor-agent auth state seeded from /run/secrets/cursor-config" >&2
     else
       echo "[archon] WARN: failed to copy /run/secrets/cursor-config into /home/appuser/.cursor -- cursor judge rung / provider will report Authentication required unless CURSOR_API_KEY is set" >&2
@@ -41,7 +85,7 @@ if [ "$(id -u)" = "0" ]; then
   # appuser, so we must own it. Best-effort: if the mount is missing
   # (older docker-compose without the new volume), do not block startup.
   if [ -d /host-artifacts ]; then
-    if ! chown -Rh appuser:appuser /host-artifacts 2>/dev/null; then
+    if ! _chown_wrong_owner /host-artifacts; then
       echo "WARN: Failed to chown /host-artifacts -- bundles may fail to write. Check host directory permissions." >&2
     fi
   fi
@@ -61,22 +105,21 @@ if [ -n "${ARCHON_DATA:-}" ]; then
   echo "[archon] ARCHON_DATA=${ARCHON_DATA} is a host-side compose token; not read inside the container" >&2
 fi
 
-# Register all git repositories under /.archon as safe directories.
+# Trust all repositories under /.archon via a single safe.directory '*' entry.
 # Git 2.35.2+ (CVE-2022-24765) rejects repos owned by a different UID.
 # On macOS bind mounts (VirtioFS), host UIDs don't map to appuser (1001),
 # so git prints "dubious ownership" and refuses all operations.
-# The Dockerfile RUN-layer registers fixed paths, but that gitconfig lives
-# in the image layer -- bind mounts don't inherit it on restart, and
-# worktrees are nested at arbitrary depths unknown at build time.
-# With /home/appuser now persisted, ~/.gitconfig survives across restarts --
-# so we must check before --add or duplicate safe.directory lines accumulate
-# every boot.
-find /.archon -name ".git" -prune -print 2>/dev/null | while IFS= read -r git_dir; do
-  repo_dir="$(dirname "$git_dir")"
-  if ! $RUNNER git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$repo_dir"; then
-    $RUNNER git config --global --add safe.directory "$repo_dir"
-  fi
-done
+# The Dockerfile already sets safe.directory '*' in the image layer, but with
+# /home/appuser bind-mounted that gitconfig does not carry over, and worktrees
+# are nested at arbitrary depths unknown at build time. So ensure exactly one
+# '*' entry here. Per-path entries are redundant once '*' is present and, since
+# ~/.gitconfig persists, they accumulated forever (thousands of lines, O(n^2)
+# boot loop, full-disk lock failures). Prune them on every boot.
+if ! $RUNNER git config --global --get-all safe.directory 2>/dev/null | grep -qxF '*'; then
+  $RUNNER git config --global --add safe.directory '*'
+fi
+# value-regex '^/' matches only path entries; '*' is kept. Exit 5 = nothing to unset.
+$RUNNER git config --global --unset-all safe.directory '^/' || [ $? -eq 5 ]
 
 # Configure git to use a GitHub token for HTTPS clones AND pushes via credential
 # helper. Accept either GH_TOKEN (gh CLI legacy) or GITHUB_TOKEN (compose default
@@ -154,5 +197,33 @@ $RUNNER bun run setup-auth
 # script always exits 0 and the reactive refresh path (PR #48) catches
 # any 401 that slips through.
 $RUNNER bun run verify-auth || true
+
+# The broker is intentionally born in the root phase as UID 1002. Its empty
+# environment prevents server/GitHub/dispatch credentials from crossing the
+# process boundary. There is no appuser fallback.
+if [ "$(id -u)" = "0" ]; then
+  rm -f /var/lib/overseer-review/ready
+  if [ -f /home/appuser/.codex/auth.json ]; then
+    install -o reviewer -g reviewer -m 0600 /home/appuser/.codex/auth.json /home/reviewer/.codex/auth.json
+  fi
+  gosu reviewer env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/home/reviewer \
+    LANG=C.UTF-8 OVERSEER_REVIEW_SPOOL=/var/lib/overseer-review \
+    bun run /app/scripts/overseer-reviewer-broker.ts &
+  _REVIEWER_BROKER_PID=$!
+  _REVIEWER_READY_ATTEMPTS=0
+  while [ ! -f /var/lib/overseer-review/ready ]; do
+    if ! kill -0 "$_REVIEWER_BROKER_PID" 2>/dev/null; then
+      echo "ERROR: reviewer_broker_unavailable" >&2
+      exit 1
+    fi
+    _REVIEWER_READY_ATTEMPTS=$((_REVIEWER_READY_ATTEMPTS + 1))
+    if [ "$_REVIEWER_READY_ATTEMPTS" -ge 100 ]; then
+      echo "ERROR: reviewer_broker_unavailable" >&2
+      exit 1
+    fi
+    sleep 0.05
+  done
+  unset _REVIEWER_READY_ATTEMPTS
+fi
 
 exec $RUNNER bun run start

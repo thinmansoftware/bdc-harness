@@ -614,6 +614,14 @@ VALUES
   -- desktop Board/XO seat. drain_on_start (mailbox) like operator/xo -- no
   -- worker ever claims it; the desktop automation reads and addresses it.
   ('astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', TRUE),
+  -- WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065): T3 results queue and
+  -- PR review receipt log. Both drain_on_start mailboxes; nothing claims them.
+  ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', TRUE),
+  ('pr-review-log', 'PR review receipt log', 'drain_on_start', TRUE),
+  -- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 067): the cauldron-fire
+  -- command consumer mailbox and the t3-bridge VPS sender.
+  ('cauldron-fire', 'T3 command consumer', 'drain_on_start', TRUE),
+  ('t3-bridge', 'T3 VPS bridge sender', 'drain_on_start', TRUE),
   ('operator', 'Operator', 'drain_on_start', TRUE),
   ('xo', 'XO', 'drain_on_start', TRUE),
   ('board', 'Board', 'alias_resolved', TRUE),
@@ -631,7 +639,15 @@ VALUES
   ('overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', TRUE),
   ('overseer-review-route', 'Overseer Review Route', 'notify_only', TRUE),
   ('duty-officer', 'Duty Officer', 'worker_poll', TRUE),
-  ('do', 'Duty Officer alias', 'worker_poll', TRUE)
+  ('do', 'Duty Officer alias', 'worker_poll', TRUE),
+  -- WO-HARNESS-COMPANION-MCP-MAILBOX-01 (migration 065): voice companion
+  -- mailboxes. grokbot is the enabled slot; dot, muse and duet stay inactive
+  -- until that companion is enabled by config. drain_on_start: no worker
+  -- claims this mail.
+  ('grokbot', 'Grok Bot (voice companion)', 'drain_on_start', TRUE),
+  ('dot', 'Dot (voice companion)', 'drain_on_start', FALSE),
+  ('muse', 'Muse (voice companion)', 'drain_on_start', FALSE),
+  ('duet', 'Duet (voice companion)', 'drain_on_start', FALSE)
 ON CONFLICT (principal_id) DO NOTHING;
 
 INSERT INTO dispatch_principals (principal_id, display_name, delivery_mode, active)
@@ -871,3 +887,83 @@ CREATE INDEX IF NOT EXISTS idx_overseer_reconcile_actions_pr_ref
   ON overseer_reconcile_actions(pr_ref);
 CREATE INDEX IF NOT EXISTS idx_overseer_reconcile_actions_action
   ON overseer_reconcile_actions(action);
+
+-- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 067): durable T3 command
+-- admission ledger for the cauldron-fire consumer. Keyed by request_id; rows
+-- are never deleted so request + run identity survive after completion.
+CREATE TABLE IF NOT EXISTS t3_command_admissions (
+  request_id TEXT PRIMARY KEY,
+  actor_principal_id TEXT NOT NULL,
+  verb TEXT NOT NULL CHECK (verb IN ('fire', 'cancel-own', 'approve')),
+  payload_sha256 TEXT NOT NULL,
+  wo_id TEXT,
+  project TEXT,
+  target_run_id TEXT,
+  pr_ref TEXT,
+  head_sha TEXT,
+  thread_id TEXT,
+  source_message_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('reserved', 'admitted', 'refused', 'unknown')),
+  status_code INTEGER,
+  code TEXT,
+  cascade_id TEXT,
+  run_id TEXT,
+  reply_message_id TEXT,
+  effect_started_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+-- WO fire lock: reserved (mid-admission) and unknown (unproven, awaiting
+-- operator adjudication) fires both hold it (migration 067).
+DROP INDEX IF EXISTS idx_t3_command_admissions_live_fire;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_wo_fire_lock
+  ON t3_command_admissions (wo_id)
+  WHERE verb = 'fire' AND state IN ('reserved', 'unknown');
+-- Amendment 5 A5.0: ONE shared WO claim for every in-process cascade caller
+-- (Taskmaster and the T3 consumer), held through every tier until terminal.
+CREATE TABLE IF NOT EXISTS cascade_wo_claims (
+  wo_id TEXT NOT NULL,
+  project TEXT NOT NULL,
+  cascade_id TEXT NOT NULL,
+  holder TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('active', 'released')),
+  claimed_at TEXT NOT NULL,
+  released_at TEXT,
+  -- Set when the cascade exited without a proven-terminal outcome (frontier
+  -- pause, uncertain exception): the claim is RETAINED with its run ids.
+  retained_reason TEXT,
+  run_ids_json TEXT NOT NULL DEFAULT '[]'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cascade_wo_claims_active
+  ON cascade_wo_claims (wo_id)
+  WHERE state = 'active';
+
+-- Amendment 5 A5.7: the consumer ticks only while holding this lease.
+CREATE TABLE IF NOT EXISTS t3_consumer_lease (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  holder TEXT NOT NULL,
+  expires_at TEXT NOT NULL
+);
+
+-- Amendment 5 A5.12: failed processing attempts per command row.
+CREATE TABLE IF NOT EXISTS t3_command_attempts (
+  message_id TEXT PRIMARY KEY,
+  attempts INTEGER NOT NULL,
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
+-- Run custody (Amendment 3 A3.1): an admission owns EVERY run its cascade
+-- creates, on every tier. Append-only; one row per run.
+CREATE TABLE IF NOT EXISTS t3_command_run_custody (
+  admission_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  tier TEXT,
+  discovered_at TEXT NOT NULL,
+  UNIQUE (run_id)
+);
+-- Run lock (Amendment 2 A2.2 rule 2): at most one unresolved cancel-own /
+-- approve per target run. An `unknown` cancel/approve holds it until an
+-- operator adjudicates.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_run_lock
+  ON t3_command_admissions (target_run_id)
+  WHERE verb IN ('cancel-own', 'approve') AND state IN ('reserved', 'unknown');

@@ -9,6 +9,8 @@
  * WO-HARNESS-*-01). Injectable lookup for tests.
  */
 
+import { matchesWoToken } from '@archon/overseer/wo-token';
+
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -94,26 +96,12 @@ function stripExclusionSections(text: string): string {
 /**
  * True when text contains the exact WO_ID as a token (not a longer sibling id),
  * OUTSIDE any "explicitly out of scope" section. "WO-FOO-01" must not match
- * "WO-FOO-010". Branch suffixes like "-thread-abc" after the id are allowed
- * (hyphen is a boundary). Case-insensitive.
+ * "WO-FOO-010". The engine branch suffix "-thread-<id>" after the id is a
+ * boundary; any other hyphen continuation names a longer id (matchesWoToken).
+ * Case-insensitive.
  */
 export function textClaimsWoId(text: string, woId: string): boolean {
-  if (!woId || !text) return false;
-  const hay = stripExclusionSections(text).toLowerCase();
-  const needle = woId.toLowerCase();
-  let from = 0;
-  while (from <= hay.length) {
-    const idx = hay.indexOf(needle, from);
-    if (idx < 0) return false;
-    const before = idx === 0 ? '' : hay[idx - 1];
-    const afterIdx = idx + needle.length;
-    const after = afterIdx >= hay.length ? '' : hay[afterIdx];
-    const beforeOk = idx === 0 || /[^a-z0-9]/.test(before);
-    const afterOk = after === '' || /[^a-z0-9]/.test(after);
-    if (beforeOk && afterOk) return true;
-    from = idx + 1;
-  }
-  return false;
+  return matchesWoToken(stripExclusionSections(text), woId);
 }
 
 interface GhPrRow {
@@ -200,4 +188,181 @@ export async function findWoClaim(opts: FindWoClaimOptions): Promise<WoClaim | n
   const merged = claims.find(c => c.state === 'MERGED');
   if (merged) return merged;
   return claims[0] ?? null;
+}
+
+/**
+ * One-line manifest declaration. A value token-matches via textClaimsWoId.
+ */
+const WO_DECLARATION_LINE = /^WO[ \t]*:[ \t]*(\S.*)$/i;
+
+const OPEN_PR_PAGE_SIZE = 100;
+const OPEN_PR_MAX_PAGES = 10;
+
+/** OPEN pull request in the target repo that claims a WO. Forks are excluded. */
+export interface OpenWoPullRequest {
+  readonly number: number;
+  readonly headRefName: string;
+  readonly headSha: string;
+  readonly url: string;
+  readonly createdAt: string;
+  readonly isDraft: boolean;
+  readonly isFork: boolean;
+  readonly body: string;
+}
+
+interface GhOpenPullRow {
+  number?: number;
+  body?: string | null;
+  html_url?: string;
+  draft?: boolean;
+  created_at?: string;
+  head?: {
+    ref?: string;
+    sha?: string;
+    repo?: { full_name?: string | null } | null;
+  } | null;
+}
+
+export interface ListOpenWoPullRequestsOptions {
+  readonly woId: string;
+  readonly project: string;
+  /**
+   * Head branches of earlier runs for this WO (run metadata.head_branch). A PR on
+   * one of them claims the WO even with no `WO:` line or WO token in its branch:
+   * implement-agent PRs often carry neither (bdc-harness #1476, 2026-11-04).
+   */
+  readonly headBranches?: readonly string[];
+  /**
+   * Throw on a lookup error instead of failing open to []. A climb must tell
+   * "no open PR" from "could not look" (bdc-xo #4638); the first-attempt guard
+   * keeps failing open.
+   */
+  readonly failOnError?: boolean;
+  /** Override the paginated open-PR read (tests). */
+  readonly lookup?: (repo: string) => Promise<GhOpenPullRow[]>;
+  readonly execFn?: typeof execFileAsync;
+}
+
+function bodyLineClaimsWo(body: string, woId: string): boolean {
+  for (const raw of body.split('\n')) {
+    const match = WO_DECLARATION_LINE.exec(raw.trim());
+    const value = match?.[1];
+    if (value && textClaimsWoId(value, woId)) return true;
+  }
+  return false;
+}
+
+function toOpenWoPullRequest(
+  row: GhOpenPullRow,
+  targetRepo: string,
+  woId: string,
+  headBranches: ReadonlySet<string> = new Set()
+): OpenWoPullRequest | null {
+  if (row.draft === true) return null;
+  const fullName = row.head?.repo?.full_name;
+  if (typeof fullName !== 'string' || fullName.length === 0) return null;
+  if (fullName.toLowerCase() !== targetRepo.toLowerCase()) return null;
+  const number = row.number;
+  if (typeof number !== 'number' || !Number.isInteger(number) || number < 1) return null;
+  const headRefName = typeof row.head?.ref === 'string' ? row.head.ref : '';
+  const body = typeof row.body === 'string' ? row.body : '';
+  const branchClaims = matchesWoToken(headRefName, woId) || headBranches.has(headRefName);
+  if (!branchClaims && !bodyLineClaimsWo(body, woId)) return null;
+  return {
+    number,
+    headRefName,
+    headSha: typeof row.head?.sha === 'string' ? row.head.sha : '',
+    url: typeof row.html_url === 'string' ? row.html_url : '',
+    createdAt: typeof row.created_at === 'string' ? row.created_at : '',
+    isDraft: false,
+    isFork: false,
+    body,
+  };
+}
+
+/**
+ * Paginated open-PR listing. Fails open to [] on throw, timeout, a non-array
+ * page, or SMART_CAULDRON_HERMETIC=1 (hermetic mode makes no GitHub call).
+ * A full page at the cap returns the pages already read.
+ */
+async function ghListOpenPullRequestsDefault(
+  repo: string,
+  execFn: typeof execFileAsync = execFileAsync,
+  failOnError = false
+): Promise<GhOpenPullRow[]> {
+  if (process.env.SMART_CAULDRON_HERMETIC === '1') {
+    console.log('[smart-cauldron/already-satisfied] skipping open-PR list in hermetic mode');
+    return [];
+  }
+  try {
+    const out: GhOpenPullRow[] = [];
+    for (let page = 1; page <= OPEN_PR_MAX_PAGES; page++) {
+      const { stdout } = await execFn(
+        'gh',
+        [
+          'api',
+          '--method',
+          'GET',
+          '-H',
+          'Accept: application/vnd.github+json',
+          `repos/${repo}/pulls?state=open&per_page=${String(OPEN_PR_PAGE_SIZE)}&page=${String(page)}`,
+        ],
+        { timeout: 30000 }
+      );
+      const parsed: unknown = JSON.parse(stdout || '[]');
+      if (!Array.isArray(parsed)) {
+        if (failOnError) throw new Error('open_pr_list_not_an_array');
+        return [];
+      }
+      out.push(...(parsed as GhOpenPullRow[]));
+      if (parsed.length < OPEN_PR_PAGE_SIZE) return out;
+    }
+    return out;
+  } catch (error) {
+    if (failOnError) throw error;
+    return [];
+  }
+}
+
+/**
+ * OPEN, non-fork PRs in the target repo whose body has a WO: line token-matching
+ * woId, or whose head branch token-matches woId (matchesWoToken). Drafts excluded.
+ * Head repositories that cannot be verified, and forks, are excluded.
+ */
+export async function listOpenWoPullRequests(
+  opts: ListOpenWoPullRequestsOptions
+): Promise<OpenWoPullRequest[]> {
+  if (!opts.woId) return [];
+  const failOnError = opts.failOnError === true;
+  let repo: string;
+  try {
+    repo = resolveGithubRepo(opts.project);
+  } catch (error) {
+    if (failOnError) throw error;
+    return [];
+  }
+  const lookup =
+    opts.lookup ??
+    ((target: string): Promise<GhOpenPullRow[]> =>
+      ghListOpenPullRequestsDefault(target, opts.execFn, failOnError));
+  let rows: GhOpenPullRow[];
+  try {
+    rows = await lookup(repo);
+  } catch (error) {
+    if (failOnError) throw error;
+    return [];
+  }
+  if (!Array.isArray(rows)) {
+    if (failOnError) throw new Error('open_pr_list_not_an_array');
+    return [];
+  }
+  const headBranches = new Set(
+    (opts.headBranches ?? []).filter(branch => typeof branch === 'string' && branch.length > 0)
+  );
+  const matched: OpenWoPullRequest[] = [];
+  for (const row of rows) {
+    const candidate = toOpenWoPullRequest(row, repo, opts.woId, headBranches);
+    if (candidate) matched.push(candidate);
+  }
+  return matched;
 }

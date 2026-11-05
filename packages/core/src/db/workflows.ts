@@ -25,6 +25,11 @@ import type {
   TerminalWorkflowPersistence,
 } from '@archon/workflows/reliability/types';
 import { createLogger } from '@archon/paths';
+import {
+  RELEASE_TERMINAL_RUN_LEASE_SQL,
+  TERMINAL_RUN_LEASES_SQL,
+  type TerminalRunLeaseRecord,
+} from '@archon/workflows/run-teardown';
 
 /**
  * workflow_name of the synthetic terminal parent rows minted for discovery-sourced
@@ -562,6 +567,54 @@ export async function releaseRunLease(data: {
     [data.runId, data.ownerId, data.leaseToken, data.releasedAt]
   );
   return result.rowCount === 1;
+}
+
+interface TerminalRunLeaseRow {
+  run_id: string;
+  status: string;
+  working_path: string | null;
+  started_at: string | Date;
+  completed_at: string | Date | null;
+}
+
+function timestampText(value: string | Date | null): string | null {
+  if (value === null) return null;
+  return value instanceof Date ? value.toISOString() : value;
+}
+
+/** Unreleased leases on terminal runs (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01, N5). */
+export async function listUnreleasedTerminalRunLeases(): Promise<TerminalRunLeaseRecord[]> {
+  const result = await pool.query<TerminalRunLeaseRow>(TERMINAL_RUN_LEASES_SQL, []);
+  return result.rows.map(row => ({
+    runId: row.run_id,
+    status: row.status,
+    workingPath: row.working_path,
+    startedAt: timestampText(row.started_at) ?? '',
+    completedAt: timestampText(row.completed_at),
+  }));
+}
+
+/** Release a terminal run's lease only while the run is still terminal. */
+export async function releaseTerminalRunLease(data: {
+  runId: string;
+  releasedAt: string;
+}): Promise<boolean> {
+  const result = await pool.query(RELEASE_TERMINAL_RUN_LEASE_SQL, [data.runId, data.releasedAt]);
+  return result.rowCount === 1;
+}
+
+/** Run rows recorded for a working path (repair not_before lookup, N6). */
+export async function listWorkflowRunsByWorkingPath(
+  workingPath: string
+): Promise<{ id: string; status: string; completed_at: string | Date | null }[]> {
+  const result = await pool.query<{
+    id: string;
+    status: string;
+    completed_at: string | Date | null;
+  }>('SELECT id, status, completed_at FROM remote_agent_workflow_runs WHERE working_path = $1', [
+    workingPath,
+  ]);
+  return [...result.rows];
 }
 
 export async function createSupervisorIncident(
@@ -1884,6 +1937,54 @@ export async function updateWorkflowRun(
     getLog().error({ err }, 'db.workflow_run_update_failed');
     throw new Error(`Failed to update workflow run: ${err.message}`);
   }
+}
+
+/**
+ * WO-HARNESS-T3-COMMAND-CONSUMER-01 (Overseer majors on approve): the approval
+ * as ONE transaction. A conditional update flips the run paused -> failed (the
+ * approval hand-off to resume) and merges `metadataUpdate` ONLY while the run is
+ * still paused at the gate `expectedNodeId`; the approval events
+ * (node_completed / approval_received) are inserted in the SAME transaction, so
+ * there is never a `failed` run without its approval event and never a partial
+ * approval. Returns false (nothing written) when the run moved on; any failure
+ * rolls the whole approval back.
+ */
+export async function approvePausedRunAtGate(
+  id: string,
+  expectedNodeId: string,
+  metadataUpdate: Record<string, unknown>,
+  events: { event_type: string; step_name?: string; data?: Record<string, unknown> }[] = [],
+  db: IDatabase = getDatabase()
+): Promise<boolean> {
+  const dialect = getDialect();
+  const gateExpr =
+    db.dialect === 'postgres'
+      ? "metadata->'approval'->>'nodeId'"
+      : "json_extract(metadata, '$.approval.nodeId')";
+  return db.withTransaction(async query => {
+    const result = await query(
+      `UPDATE remote_agent_workflow_runs
+         SET status = 'failed', metadata = ${dialect.jsonMerge('metadata', 2)}
+       WHERE id = $1 AND status = 'paused' AND ${gateExpr} = $3`,
+      [id, JSON.stringify(metadataUpdate), expectedNodeId]
+    );
+    if (result.rowCount === 0) return false;
+    for (const event of events) {
+      await query(
+        `INSERT INTO remote_agent_workflow_events
+           (id, workflow_run_id, event_type, step_index, step_name, data)
+         VALUES ($1, $2, $3, NULL, $4, $5)`,
+        [
+          dialect.generateUuid(),
+          id,
+          event.event_type,
+          event.step_name ?? null,
+          JSON.stringify(event.data ?? {}),
+        ]
+      );
+    }
+    return true;
+  });
 }
 
 async function persistTerminalWorkflowRun(

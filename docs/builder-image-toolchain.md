@@ -1,0 +1,185 @@
+Per-project toolchain (Node LTS + pnpm)
+
+The builder image pins the current Node LTS (v26.13.0, Lithium) and pnpm 12.14.0
+beside the bun 1.3.11 server runtime. One Node serves everything: node, npm and npx
+for root and appuser, bun-run lane scripts, project test commands and pnpm. Debian's
+nodejs and npm are not installed (Debian's Node 20 reached end of life 2026-04-30).
+
+Pins and paths
+
+Three artifacts are downloaded at image build time and verified with sha256sum
+before they are unpacked. Nothing is downloaded again at runtime.
+
+- Node 26.13.0 comes from the official Node linux-x64 archive. NODE26_SHA256
+  verifies node-v26.13.0-linux-x64.tar.xz. It is unpacked at /opt/node26, which
+  leads the global ENV PATH, so node, npm and npx resolve to /opt/node26/bin for
+  every user. /usr/local/bin/node, npm and npx are symlinks to the same binaries so
+  minimal-PATH contexts (the Overseer reviewer sandbox) still find a real Node.
+  pnpm-spawned commands use this same Node. The ARG names keep the NODE26_ prefix
+  for history; the value is whatever the current LTS is.
+- The pnpm 12.14.0 wrapper comes from the pnpm registry archive. PNPM_SHA256
+  verifies pnpm-12.14.0.tgz. It is unpacked at /opt/pnpm-12.14.0 and keeps
+  package.json and dist/.
+- The native linux-x64 pnpm comes from @pnpm/exe.linux-x64.
+  PNPM_NATIVE_SHA256 verifies exe.linux-x64-12.14.0.tgz. Only that archive's
+  package/pnpm is installed over /opt/pnpm-12.14.0/pnpm. The wrapper
+  package.json and dist/ stay in place.
+- The selector is /usr/local/bin/pnpm, installed from
+  scripts/container/project-pnpm.sh (project-pnpm).
+
+How project-pnpm selects
+
+project-pnpm walks upward from the working directory to the nearest package.json
+and reads packageManager with jq.
+
+- pnpm@12.14.0, pnpm@12.14.0 plus a +sha suffix, or no package.json / no
+  packageManager: /usr/local/bin/pnpm executes the native binary at
+  /opt/pnpm-12.14.0/pnpm directly. It prepends /opt/node26/bin only to that
+  process tree's PATH. It does not run pnpm through Node.
+- Any other pnpm@X: exit 1 and write
+  "project-pnpm: unsupported pnpm version X (image provides 12.14.0)" to stderr.
+  A +sha suffix on X is removed before the message is printed. Nothing is downloaded.
+- Any other package manager value, including yarn@4: exit 1 and write
+  "project-pnpm: unsupported packageManager <value> (image provides pnpm@12.14.0)"
+  to stderr.
+- project-pnpm never downloads a package manager and never edits package.json.
+
+Dependency prep
+
+Bun lockfiles win. dprep_ensure_js_deps keeps the existing bun install path when
+bun.lock or bun.lockb is present.
+
+The pnpm dprep branch runs only when there is no bun lock, pnpm-lock.yaml exists,
+pnpm is on PATH, and node_modules is absent. It then runs pnpm install --frozen-lockfile
+inside the same credential-scrubbed subshell as the bun branch, and it always returns 0.
+
+The npm dprep branch runs only when there is no bun lock and no pnpm-lock.yaml, and
+package-lock.json exists. It runs npm ci --no-audit --no-fund in the same scrubbed
+subshell and logs "dprep: npm ci (package-lock.json)". Any other package dir skips.
+
+dprep_ensure_js_deps lives in one shared file, scripts/lane/dprep.sh. The prep-dependencies
+and run-stop-tests nodes of every bdc-feature-development lane source it, trying in order:
+$BDC_DPREP_SCRIPT (tests), $ARCHON_LANE_SCRIPTS_DIR/dprep.sh, then
+/app/scripts/lane/dprep.sh (the Docker image copy). The bundle generator embeds
+scripts/lane/*.sh as BUNDLED_LANE_SCRIPTS, and the bash node executor writes them into a
+per-node directory exported as ARCHON_LANE_SCRIPTS_DIR (only for nodes whose script reads
+that variable; removed when the node ends), so standalone CLI and source runs work
+without /app. Only when no candidate exists does the node log "dprep: dprep.sh missing"
+and continue.
+
+Stop-grep tokenizer (scripts/lane/rsg-argv.sh)
+
+The run-stop-greps node of every bdc-feature-development lane runs the grep stop conditions
+a spec declares, under a read-only allowlist. Both the allowlist check and the execution
+consume ONE parse, rsg_parse_pipeline in scripts/lane/rsg-argv.sh, so a single-quoted
+multi-word pattern such as grep -c 'Grand Comics Database' src/x.tsx is one argv word and
+runs. Inside single quotes a space, ; | $( or ^ is a literal pattern byte. Double quotes,
+backslashes and every metacharacter outside single quotes are still rejected, as are
+unbalanced, glued and empty quotes and a quoted word that is itself a write/exec flag.
+Resolution order: $BDC_RSGARGV_SCRIPT (tests), $ARCHON_LANE_SCRIPTS_DIR/rsg-argv.sh, then
+/app/scripts/lane/rsg-argv.sh. When none exists every declared grep is dropped (fail closed)
+and the node logs "rsg-argv.sh missing". The shared verdict fixture
+.archon/workflows/defaults/__tests__/fixtures/grep-verdicts.tsv (pinned by sha256) is the
+agreement contract with the bdc-xo validator CHECK 14. Test it with:
+bash .archon/workflows/defaults/__tests__/run-stop-greps.sh
+
+Base-red aware stop tests (scripts/lane/stop-tests-base.sh)
+
+A build fails its test stop condition only for tests it newly broke. The second lane
+script, scripts/lane/stop-tests-base.sh, is bundled and resolved the same way as dprep.sh:
+$BDC_STBASE_SCRIPT (tests), $ARCHON_LANE_SCRIPTS_DIR/stop-tests-base.sh, then
+/app/scripts/lane/stop-tests-base.sh. Every bdc-feature-development lane sources it twice,
+through one byte-identical "stbase core" stub in run-stop-tests and in
+stamp-manifest-evidence, and makes one call in each node:
+
+- run-stop-tests writes rst_report's lines to $ARTIFACTS_DIR/evidence/stop-tests.report,
+  then calls rst_base_compare <report> <commands-file> <head-log> <head-counts>.
+  When the head status is not "failed" it prints the report unchanged and never touches
+  the base. When it is "failed", it reads the run's base commit from
+  $ARTIFACTS_DIR/run-start-sha.txt, adds a detached worktree at
+  $ARTIFACTS_DIR/stop-tests-base-wt.<pid>, runs dprep_ensure_js_deps and the same commands
+  there through rst_run_commands (same per-command timeout), logs to
+  $ARTIFACTS_DIR/evidence/stop-tests-base.log, and always removes the worktree.
+  Evidence is judged per command (one "### run-stop-tests:" block of the log each): every
+  head command that exited nonzero or reported a failing test must have its own parsed
+  counts, no timeout, and exactly one file-attributed name per failing test with no name
+  repeated; otherwise the result fails closed before the base runs. A test's identity is
+  command index + file + name, so one command's names never cover another command's
+  failures and equal names in different files never match. Files and names come from bun
+  "<file>:" / "::group::<file>:" headers plus "(fail) <name>", node:test "# Subtest:
+  <file>" plus "not ok <n> - <name>", jest "FAIL <file>" plus bullet lines, and vitest
+  "FAIL <file> > <name>" lines. If every head failure also
+  fails on base, it prints TESTS_STATUS=base_red and
+  TESTS_LINE=<pass>/<total> (base-red: <k> tests failing on base <sha8>; newly broken: 0)
+  and writes the names to $ARTIFACTS_DIR/base-red-tests.txt. Otherwise the status stays
+  failed (with "newly broken: <names>" when known). A missing or bad base sha, missing
+  counts, failures that cannot be named, a base timeout (exit 124) or a worktree that
+  cannot be created all fail closed. The base comparison runs only when every
+  test command is on an allowlist, run from the repo root: bun run <script>, bun test
+  [paths], npm test, npm run <script>, pnpm test, pnpm run <script>, node --test [paths],
+  yarn test, yarn <script> (<script> is [A-Za-z0-9:_-]+; paths are relative with no ..
+  segment; no flags at all, since a token like --cwd=.. or -C .. can leave the base
+  checkout; no cd, &&, ||, ;, |, redirects, $,
+  backticks, env assignments or absolute paths). Any other command keeps the result
+  failed as command_not_comparable, and no base worktree is created. It always appends TESTS_BASE_COMPARE=<outcome>
+  (not_failed, base_red, newly_broken, base_passed, unparsed, no_base_sha, no_counts,
+  base_timeout, base_unrunnable, command_not_comparable, or script_missing from the fallback stub).
+- stamp-manifest-evidence pipes sme_process's output through stb_stamp_base_red, which
+  adds "Base-red tests: <a>; <b> ..." after the Tests: line when base-red-tests.txt lists
+  names. sme_process and manifest-evidence-check accept base_red because its Tests: line
+  starts with <pass>/<total> and its status is not "failed".
+
+Tests: bash .archon/workflows/defaults/__tests__/run-stop-tests.sh (Tests 1-10 of
+WO-HARNESS-STOP-TESTS-BASE-RED-AWARE-01, against real temporary git repos).
+
+Upgrading Node
+
+The Node version and SHA are read live from https://nodejs.org/dist/index.json (the
+first entry whose lts field is not false) and from that version's SHASUMS256.txt,
+never from memory. Re-check the LTS line on every harness rebuild. When the LTS
+moves, change NODE26_VERSION and NODE26_SHA256 in the Dockerfile, the v26.x.y strings
+in .github/workflows/test.yml, and the version assertions in
+packages/server/src/docker-packaging.test.ts together, then run the canary set below.
+
+Verifying the default Node
+
+scripts/container/node-lts-smoke.sh <expected version> runs inside the image (the
+docker-build CI job runs it as appuser and as root, mounting the script). It prints
+command -v node, node, npm, npx, pnpm, bun and agent-browser versions, runs
+node -e 'require("node:sqlite")', and exits nonzero on any mismatch. After an
+archon-app-1 rebuild, XO runs the same script with docker exec --user appuser, and
+checks docker exec archon-app-1 node --version.
+
+Node canary set
+
+scripts/cauldron-canary/node-lts-canary-repos.sh derives the repos that build Node
+code from bdc-xo scripts/cauldron/cauldron-projects.json (package.json at the
+working_subdir on the base branch, or a test_command that names node, npm, npx or
+pnpm), prints them with a count, and exits 1 unless the set is exactly the expected
+15. After a Node upgrade, fire one canary WO per listed repo, one at a time, through
+the normal Cauldron lane. A repo that needs a different Node than the image default
+gets a per-repo override (a pinned second Node selected from cauldron-projects.json)
+rather than holding the image back; none has needed one so far. Offline test:
+bash scripts/cauldron-canary/node-lts-canary-repos.test.sh.
+
+Bumping a version
+
+Change each version and its checksum together, from the publisher checksums.
+All three version/checksum pairs are updated together.
+
+- Node checksum: the node-v<version>-linux-x64.tar.xz line in
+  https://nodejs.org/dist/v<version>/SHASUMS256.txt (NODE26_VERSION and NODE26_SHA256).
+- pnpm wrapper checksum: the SHA-256 of
+  https://registry.npmjs.org/pnpm/-/pnpm-<version>.tgz (PNPM_VERSION and PNPM_SHA256).
+- Native pnpm checksum: the SHA-256 of
+  https://registry.npmjs.org/@pnpm/exe.linux-x64/-/exe.linux-x64-<version>.tgz
+  (PNPM_NATIVE_SHA256). The version matches PNPM_VERSION.
+
+When it goes live
+
+A green docker-build check is image proof. CI builds archon-ci:test and runs the
+offline pnpm probe plus the existing smoke tests. That check does not change the
+running container.
+
+The live container changes only after the next XO-governed Rule 11.5 harness
+rebuild. Stop 9 verifies that rebuild, and it is separate from CI image proof.

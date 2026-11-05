@@ -143,10 +143,15 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         const n = node(nodes, 'run-stop-greps', file);
         expect(n.depends_on).toEqual(['format-autofix']);
         expect(n.timeout).toBe(600000);
-        expect(n.bash).toContain('rsg_tokens_safe');
+        // WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01: the whitespace split and the
+        // per-token charset check were replaced by the shared quote-aware tokenizer
+        // scripts/lane/rsg-argv.sh (rsg_parse_pipeline); the charset now lives there.
+        expect(n.bash).toContain('rsg_parse_pipeline');
+        expect(n.bash).toContain('BDC_RSGARGV_SCRIPT');
+        expect(n.bash).not.toContain('rsg_tokens_safe');
+        expect(n.bash).not.toContain('rsg_strip_arg');
         expect(n.bash).toContain('rsg_exec_pipeline');
         expect(n.bash).toContain('-execdir');
-        expect(n.bash).toContain('^[A-Za-z0-9@%+=:,./_*?-]+$');
         expect(n.bash).not.toContain('bash -c "$1"');
       });
 
@@ -203,6 +208,25 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         const actual = coreOf(node(nodes, id, file).bash ?? '', markers[id]);
         expect(actual).toBe(expected);
       }
+    }
+  });
+
+  // WO-HARNESS-EVIDENCE-GATE-NOT-GATED-AND-BASE-UNRUNNABLE-01, Test 10.
+  it('lane_parity_not_gated: the pbb core is byte-identical, mec says NOT_GATED, patch-pr-body accepts it', () => {
+    const canonical = laneNodes('bdc-feature-development-codex.yaml');
+    const expectedPbb = coreOf(node(canonical, 'patch-pr-body', 'canonical').bash ?? '', 'pbb');
+    expect(expectedPbb).toContain('pbb_mark_blocked()');
+    expect(expectedPbb).toContain('RUN BLOCKED -- not lane-verified');
+    expect(expectedPbb).toContain('run:blocked');
+    for (const file of EXPECTED_LANES) {
+      const nodes = laneNodes(file);
+      const patch = node(nodes, 'patch-pr-body', file);
+      expect(coreOf(patch.bash ?? '', 'pbb')).toBe(expectedPbb);
+      expect(patch.bash ?? '').toContain('pbb_mark_blocked "$STATUS" "$NP_URL" "$NP_REPO"');
+      expect(patch.when).toContain("$manifest-evidence-check.output == 'OK'");
+      expect(patch.when).toContain("$manifest-evidence-check.output == 'NOT_GATED:BLOCKED'");
+      const mec = coreOf(node(nodes, 'manifest-evidence-check', file).bash ?? '', 'mec');
+      expect(mec).toContain('NOT_GATED:');
     }
   });
 
@@ -543,7 +567,10 @@ function runStopGrepsNode(opts: {
     );
     const proc = Bun.spawnSync(['bash', '-c', rendered], {
       cwd,
-      env: { ...process.env },
+      env: {
+        ...process.env,
+        BDC_RSGARGV_SCRIPT: join(import.meta.dir, '..', '..', '..', 'scripts/lane/rsg-argv.sh'),
+      },
       stdout: 'pipe',
       stderr: 'pipe',
     });

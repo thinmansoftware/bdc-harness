@@ -7,7 +7,7 @@
  * Gate conditions:
  *   1. Terminal status: "completed" passes; "failed" or "cancelled" fails.
  *   2. Validator verdict: "satisfied" passes; "needs_revision" fails; "unknown" abstains.
- *   3. PR opened: if completed but no PR URL, fails (work didn't land).
+ *   3. PR opened: if completed but no PR URL and no matching pushed-head SHA, fails.
  *   4. PR mergeable: if prMergeable === false, fails.
  *
  * Integrity separation: infra-errors (auth/transport) are classified separately
@@ -18,6 +18,21 @@
 import { classifyError } from '@archon/overseer/classify';
 import type { GateVerdict, PollResult, FireResult, TierOutcome } from './types.js';
 
+const SHA40 = /^[0-9a-f]{40}$/i;
+
+/**
+ * A completed run counts as having opened a PR when its pushed head SHA equals
+ * the head of exactly one open WO PR. Both values must be 40 hex digits.
+ * Equality does not override any other gate condition.
+ */
+function runPushedShaMatchesOpenPr(poll: PollResult): boolean {
+  const pushed = poll.runPushedHeadSha;
+  const open = poll.openWoPrHeadSha;
+  if (typeof pushed !== 'string' || typeof open !== 'string') return false;
+  if (!SHA40.test(pushed) || !SHA40.test(open)) return false;
+  return pushed.toLowerCase() === open.toLowerCase();
+}
+
 /**
  * Judge whether a run passed the gate.
  *
@@ -27,7 +42,7 @@ import type { GateVerdict, PollResult, FireResult, TierOutcome } from './types.j
 export function judgeGate(poll: PollResult): GateVerdict {
   const { terminalStatus, validatorVerdict, prUrl, prMergeable } = poll;
 
-  const prOpened = prUrl !== null;
+  const prOpened = prUrl !== null || runPushedShaMatchesOpenPr(poll);
 
   // Cancelled is NOT a climb signal (Motion M-86). A human deliberately stopped
   // this run -- climbing to a more expensive tier is the opposite of intent.

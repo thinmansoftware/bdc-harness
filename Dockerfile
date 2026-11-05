@@ -36,6 +36,7 @@ COPY packages/smart-cauldron/package.json ./packages/smart-cauldron/
 COPY packages/web/package.json ./packages/web/
 COPY packages/workflows/package.json ./packages/workflows/
 COPY packages/persona-context-loader/package.json ./packages/persona-context-loader/
+COPY packages/companion-mcp/package.json ./packages/companion-mcp/
 
 # Install ALL dependencies (including devDependencies needed for web build)
 # --linker=hoisted: Bun's default "isolated" linker stores packages in
@@ -70,7 +71,13 @@ LABEL org.opencontainers.image.licenses="MIT"
 ENV DEBIAN_FRONTEND=noninteractive
 ARG ARCHON_BUILD_SHA=unknown
 ENV ARCHON_BUILD_SHA=${ARCHON_BUILD_SHA}
+LABEL org.opencontainers.image.revision="${ARCHON_BUILD_SHA}"
 ARG TERRAFORM_VERSION=1.8.5
+ARG NODE26_VERSION=26.13.0
+ARG NODE26_SHA256=d28a96af6c38596f6d9d97c0ee531c13d238d757742387d1928de822d959e997
+ARG PNPM_VERSION=12.14.0
+ARG PNPM_SHA256=ea206e35474bf87be9564a85ca70ed1c8ebdc45da55aafb0a3bf09d1ba69b179
+ARG PNPM_NATIVE_SHA256=1de98ed2e9621113b0887b06322b461efb9df73d913fc1d151039b10b7117a41
 
 WORKDIR /app
 
@@ -108,6 +115,28 @@ RUN apt-get update && apt-get install -y \
     # package). Agents and docs say `fd`, so expose it under the expected name.
     && ln -sf "$(command -v fdfind)" /usr/local/bin/fd
 
+# bubblewrap for the Overseer reviewer sandbox (WO-HARNESS-REVIEW-SANDBOX-BUBBLEWRAP-01).
+# codex >= 0.159 builds a filesystem-restricted sandbox with bwrap (legacy
+# Landlock refuses it). Pinned to Debian bookworm's bubblewrap 0.8.0-2+deb12u1
+# (sha256-verified), not trixie's 0.12.0: inside Docker a fresh /proc mount is
+# always refused (masked /proc paths), and codex 0.159.2 only falls back to
+# "no new /proc" when bwrap's error names "/newroot/proc", which 0.12 no longer
+# prints. Not setuid; it relies on unprivileged user namespaces, and the
+# AppArmor profile docker/apparmor/archon-bwrap lets only /usr/bin/bwrap mount.
+ARG BUBBLEWRAP_DEB_SNAPSHOT_URL=https://snapshot.debian.org/file/75e7579318581f9d6633957a5482f63b7aa36c7c
+ARG BUBBLEWRAP_DEB_POOL_URL=https://deb.debian.org/debian/pool/main/b/bubblewrap/bubblewrap_0.8.0-2+deb12u1_amd64.deb
+ARG BUBBLEWRAP_DEB_SHA256=3cc9134a3286ad01a323dcd924ba123eb634cefaeec82d774257e06308aeaadb
+RUN { curl -fsSL --retry 3 -o /tmp/bubblewrap.deb "${BUBBLEWRAP_DEB_SNAPSHOT_URL}" \
+      || curl -fsSL --retry 3 -o /tmp/bubblewrap.deb "${BUBBLEWRAP_DEB_POOL_URL}"; } \
+    && echo "${BUBBLEWRAP_DEB_SHA256}  /tmp/bubblewrap.deb" | sha256sum -c - \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends --allow-downgrades /tmp/bubblewrap.deb \
+    && apt-mark hold bubblewrap \
+    && rm -rf /var/lib/apt/lists/* /tmp/bubblewrap.deb \
+    && test "$(command -v bwrap)" = /usr/bin/bwrap \
+    && test ! -u /usr/bin/bwrap \
+    && test "$(bwrap --version)" = "bubblewrap 0.8.0"
+
 # Install GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
@@ -124,6 +153,22 @@ RUN chmod 755 /usr/local/bin/gh \
     && gh --version \
     && if ARCHON_TEST_OUT=$(gh pr merge 1 2>&1); then echo "gh-merge-guard failed to block" && exit 1; else echo "$ARCHON_TEST_OUT" | grep -q 'gh-merge-guard: BLOCKED'; fi
 
+# gitleaks: the OpenRouter review fence (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01)
+# scans the diff + prompt of every customer-repo OpenRouter review before send.
+# Pinned to the same 8.30.1 / default-ruleset the customer CI (lspro-react
+# secrets-scan.yml) runs. Checksum-verified like the bwrap install above; a
+# missing binary makes the fence fail closed (reroute), so assert it at build.
+ARG GITLEAKS_VERSION=8.30.1
+ARG GITLEAKS_LINUX_X64_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+RUN curl -fsSL --retry 3 -o /tmp/gitleaks.tar.gz \
+      "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+    && echo "${GITLEAKS_LINUX_X64_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks \
+    && install -m 755 /tmp/gitleaks /usr/local/bin/gitleaks \
+    && rm -f /tmp/gitleaks.tar.gz /tmp/gitleaks \
+    && test "$(command -v gitleaks)" = /usr/local/bin/gitleaks \
+    && gitleaks version
+
 # Install Terraform for deployment-factory planning workflows.
 RUN curl -fsSLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
     && unzip -o /tmp/terraform.zip -d /usr/local/bin \
@@ -131,14 +176,48 @@ RUN curl -fsSLo /tmp/terraform.zip "https://releases.hashicorp.com/terraform/${T
     && terraform version \
     && rm -f /tmp/terraform.zip
 
+# The current Node LTS (ARG NODE26_VERSION, read live from nodejs.org/dist/index.json,
+# never from memory) is the ONLY Node in the image: Debian nodejs/npm are not installed.
+# /opt/node26/bin leads the global PATH below, so node, npm and npx resolve to it for
+# root and appuser. /usr/local/bin/pnpm still selects the pinned pnpm per project.
+RUN apt-get update && apt-get install -y --no-install-recommends xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSLo /tmp/node26.tar.xz "https://nodejs.org/dist/v${NODE26_VERSION}/node-v${NODE26_VERSION}-linux-x64.tar.xz" \
+    && echo "${NODE26_SHA256}  /tmp/node26.tar.xz" | sha256sum -c - \
+    && mkdir -p /opt/node26 \
+    && tar -xJf /tmp/node26.tar.xz -C /opt/node26 --strip-components=1 \
+    && rm -f /tmp/node26.tar.xz \
+    && curl -fsSLo /tmp/pnpm.tgz "https://registry.npmjs.org/pnpm/-/pnpm-${PNPM_VERSION}.tgz" \
+    && echo "${PNPM_SHA256}  /tmp/pnpm.tgz" | sha256sum -c - \
+    && mkdir -p "/opt/pnpm-${PNPM_VERSION}" \
+    && tar -xzf /tmp/pnpm.tgz -C "/opt/pnpm-${PNPM_VERSION}" --strip-components=1 \
+    && rm -f /tmp/pnpm.tgz \
+    && curl -fsSLo /tmp/pnpm-native.tgz "https://registry.npmjs.org/@pnpm/exe.linux-x64/-/exe.linux-x64-${PNPM_VERSION}.tgz" \
+    && echo "${PNPM_NATIVE_SHA256}  /tmp/pnpm-native.tgz" | sha256sum -c - \
+    && mkdir -p /tmp/pnpm-native \
+    && tar -xzf /tmp/pnpm-native.tgz -C /tmp/pnpm-native \
+    && install -m 755 /tmp/pnpm-native/package/pnpm "/opt/pnpm-${PNPM_VERSION}/pnpm" \
+    && rm -rf /tmp/pnpm-native /tmp/pnpm-native.tgz \
+    && chmod -R a+rX /opt/node26 "/opt/pnpm-${PNPM_VERSION}"
+
+# Make the LTS Node the default for every user, and keep it reachable from env -i
+# contexts that use the minimal /usr/local/bin:/usr/bin:/bin PATH (the Overseer
+# reviewer sandbox), which used to find Debian's /usr/bin/node. python follows the
+# Debian python-is-python3 convention (builders call bare `python`).
+ENV PATH=/opt/node26/bin:${PATH}
+RUN ln -sf /opt/node26/bin/node /usr/local/bin/node \
+    && ln -sf /opt/node26/bin/npm /usr/local/bin/npm \
+    && ln -sf /opt/node26/bin/npx /usr/local/bin/npx \
+    && ln -sf /usr/bin/python3 /usr/local/bin/python
+
 # Install agent-browser CLI (Vercel Labs) for E2E testing workflows
 # - Uses npm (not bun) because postinstall script downloads the native Rust binary
-# - Keep nodejs/npm: WO tests require npm and npx at runtime.
+# - npm and npx come from the LTS Node installed above: WO tests require them at runtime.
 # - The npm entry point is a Node.js wrapper; the native binary works standalone
 # - agent-browser auto-detects Docker (via /.dockerenv) and adds --no-sandbox to Chromium
-RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
-    && npm install -g agent-browser@0.22.1 \
-    && NATIVE_BIN=$(find /usr/local/lib/node_modules/agent-browser -name 'agent-browser-*' -type f -executable 2>/dev/null | head -1) \
+RUN npm install -g agent-browser@0.22.1 \
+    && AB_ROOT="$(npm root -g)/agent-browser" \
+    && NATIVE_BIN=$(find "$AB_ROOT" -name 'agent-browser-*' -type f -executable 2>/dev/null | head -1) \
     && if [ -n "$NATIVE_BIN" ]; then \
          cp "$NATIVE_BIN" /usr/local/bin/agent-browser-native \
          && chmod +x /usr/local/bin/agent-browser-native \
@@ -147,7 +226,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
          echo "ERROR: agent-browser native binary not found after npm install" >&2 && exit 1; \
        fi \
     && npm cache clean --force \
-    && rm -rf /usr/local/lib/node_modules/agent-browser \
+    && rm -rf "$AB_ROOT" /opt/node26/bin/agent-browser \
     && rm -rf /var/lib/apt/lists/*
 
 # Point agent-browser to system Chromium (avoids ~400MB Chrome for Testing download)
@@ -173,12 +252,20 @@ RUN mkdir -p /opt/cursor-agent \
 
 # Create non-root user for running Claude Code
 # Claude Code refuses to run with --dangerously-skip-permissions as root for security
-RUN useradd -m -u 1001 -s /bin/bash appuser \
+RUN groupadd --gid 1002 reviewer \
+    && useradd --create-home --uid 1002 --gid 1002 --shell /usr/sbin/nologin reviewer \
+    && useradd -m -u 1001 -s /bin/bash appuser \
+    && usermod --append --groups reviewer appuser \
     && chown -R appuser:appuser /app
 
 # Create Archon directories
-RUN mkdir -p /.archon/workspaces /.archon/worktrees \
-    && chown -R appuser:appuser /.archon
+RUN mkdir -p /.archon/workspaces /.archon/worktrees /run/secrets /var/lib/overseer-review \
+    && chown -R appuser:appuser /.archon \
+    && chmod 0750 /.archon /.archon/workspaces \
+    && chown root:appuser /run/secrets \
+    && chmod 0750 /run/secrets \
+    && chown appuser:reviewer /var/lib/overseer-review \
+    && chmod 2770 /var/lib/overseer-review
 
 # Copy root package files and lockfile
 COPY package.json bun.lock ./
@@ -206,6 +293,7 @@ COPY packages/smart-cauldron/package.json ./packages/smart-cauldron/
 COPY packages/web/package.json ./packages/web/
 COPY packages/workflows/package.json ./packages/workflows/
 COPY packages/persona-context-loader/package.json ./packages/persona-context-loader/
+COPY packages/companion-mcp/package.json ./packages/companion-mcp/
 
 # Install production dependencies only (--ignore-scripts skips husky prepare hook)
 RUN bun install --frozen-lockfile --production --ignore-scripts --linker=hoisted
@@ -239,18 +327,28 @@ COPY migrations/ ./migrations/
 COPY tsconfig*.json ./
 
 # Entrypoints used by the container GitHub transport and credential preflight.
-COPY scripts/github-service-token.ts scripts/github-service-exec.ts scripts/github-service-login.ts ./scripts/
+COPY scripts/github-service-token.ts scripts/github-service-exec.ts scripts/github-service-login.ts scripts/run-completion-report.ts ./scripts/
+COPY scripts/overseer-review-sandbox-smoke.ts scripts/overseer-reviewer-broker.ts ./scripts/
+
+# Shared shell cores SOURCED by the bdc-feature-development lane YAMLs
+# (prep-dependencies / run-stop-tests source /app/scripts/lane/dprep.sh).
+COPY scripts/lane/ ./scripts/lane/
+RUN sed -i 's/\r$//' /app/scripts/lane/*.sh
 
 # Fix permissions for appuser
 RUN chown -R appuser:appuser /app
 
 # Create .codex directory for Codex authentication
-RUN mkdir -p /home/appuser/.codex && chown appuser:appuser /home/appuser/.codex
+RUN mkdir -p /home/appuser/.codex /home/appuser/.config/gh \
+    && chown -R appuser:appuser /home/appuser \
+    && chmod 0750 /home/appuser \
+    && chmod 0700 /home/appuser/.codex /home/appuser/.config/gh
 
 # Create .cursor directory for cursor-agent authentication. Populated at startup
 # from the read-only host mount /run/secrets/cursor-config (docker-entrypoint.sh)
 # or left empty when CURSOR_API_KEY is used instead.
-RUN mkdir -p /home/appuser/.cursor && chown appuser:appuser /home/appuser/.cursor
+RUN mkdir -p /home/appuser/.cursor && chown appuser:appuser /home/appuser/.cursor \
+    && chmod 0700 /home/appuser/.cursor
 
 # Configure git to trust all directories for both root and appuser.
 # Uses the git-native '*' wildcard (standalone token, not a shell glob) which
@@ -259,13 +357,34 @@ RUN mkdir -p /home/appuser/.cursor && chown appuser:appuser /home/appuser/.curso
 # git only matches them as literal strings, not as filesystem globs. The wildcard
 # covers worktrees created at arbitrary depths after container startup.
 RUN git config --global --add safe.directory '*' && \
-    gosu appuser git config --global --add safe.directory '*'
+    gosu appuser git config --global --add safe.directory '*' && \
+    gosu reviewer git config --global --add safe.directory '*'
+
+COPY scripts/container/project-pnpm.sh /usr/local/bin/pnpm
+RUN sed -i 's/\r$//' /usr/local/bin/pnpm && chmod 755 /usr/local/bin/pnpm
 
 # Fail the image build if the final runtime loses a lane test runner.
 RUN gosu appuser node --version \
     && gosu appuser npm --version \
     && gosu appuser npx --version \
     && gosu appuser pytest --version
+
+# The default node, pnpm exec node and npm/npx all run the pinned LTS Node; bun stays put.
+RUN set -eu; \
+    scratch="$(mktemp -d)"; \
+    printf '%s\n' '{"packageManager":"pnpm@12.14.0"}' > "$scratch/package.json"; \
+    chown -R appuser:appuser "$scratch"; \
+    pnpm_ver="$(gosu appuser sh -c "cd '$scratch' && pnpm --version")"; \
+    node26_ver="$(gosu appuser sh -c "cd '$scratch' && pnpm exec node --version")"; \
+    default_node="$(gosu appuser node --version)"; \
+    default_path="$(gosu appuser sh -c 'command -v node')"; \
+    bun_ver="$(gosu appuser bun --version)"; \
+    test "$pnpm_ver" = "12.14.0"; \
+    test "$node26_ver" = "v${NODE26_VERSION}"; \
+    test "$default_node" = "v${NODE26_VERSION}"; \
+    test "$default_path" = "/opt/node26/bin/node"; \
+    test "$bun_ver" = "1.3.11"; \
+    rm -rf "$scratch"
 
 # Copy entrypoint script (fixes volume permissions, drops to appuser)
 # sed strips Windows CRLF in case .gitattributes eol=lf was bypassed

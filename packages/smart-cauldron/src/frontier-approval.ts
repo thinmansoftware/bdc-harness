@@ -150,6 +150,23 @@ export interface ResumeFrontierOptions {
   deps?: CascadeDeps;
   /** Admission callback passthrough (endpoint returns after the resumed record is durable). */
   onAdmission?: RunCascadeOptions['onAdmission'];
+  /**
+   * Runs BEFORE the resumed cascade dispatches, with the original and the new
+   * cascade ids (WO-HARNESS-T3-COMMAND-CONSUMER-01: the server transfers the
+   * shared WO claim here). Returning false aborts the resume with
+   * FrontierResumeClaimError -- nothing fires and the record is untouched.
+   */
+  beforeDispatch?: (input: {
+    woId: string;
+    project: string;
+    originalCascadeId: string;
+    resumeCascadeId: string;
+  }) => Promise<boolean>;
+}
+
+/** The resume could not take over the WO claim; nothing was dispatched. */
+export class FrontierResumeClaimError extends Error {
+  override readonly name = 'FrontierResumeClaimError';
 }
 
 /**
@@ -196,6 +213,19 @@ export async function resumeFrontierTier(
   // Stable id for the resumed cascade so the back-reference is deterministic and
   // the resumed fire is itself idempotent under replay (dispatchId).
   const resumeCascadeId = randomUUID();
+  if (
+    opts.beforeDispatch &&
+    !(await opts.beforeDispatch({
+      woId: packet.woId,
+      project,
+      originalCascadeId: record.cascadeId,
+      resumeCascadeId,
+    }))
+  ) {
+    throw new FrontierResumeClaimError(
+      `[smart-cauldron/frontier-approval] cannot resume ${record.cascadeId}: the WO claim is held by another cascade`
+    );
+  }
   const result = await runCascade({
     woId: packet.woId,
     woClass: packet.woClass ?? undefined,

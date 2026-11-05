@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { clearRegistry, registerBuiltinProviders } from '@archon/providers';
 import { registerCursorAgentProvider } from '../../providers/src/community/cursor/registration';
+import { registerGrokAgentProvider } from '@archon/providers/community/grok';
 import { parseWorkflow } from './loader';
 import { resolveModelForNode } from './model-override';
 import { resolveAgentPersona } from './executor-shared';
@@ -45,6 +46,9 @@ beforeEach(() => {
   clearRegistry();
   registerBuiltinProviders();
   registerCursorAgentProvider();
+  // openrouter: the D0 Kimi review failover target the cursor lane declares
+  // (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
+  registerGrokAgentProvider();
 });
 afterEach(clearRegistry);
 
@@ -65,8 +69,11 @@ describe('Cursor strict Terra model selection', () => {
     const strict = w.nodes.filter(node => node.provider === 'codex-native-strict');
     expect(strict.map(node => node.id)).toEqual(strictIds);
     for (const node of strict) {
-      expect(node.model, node.id).toBe('gpt-5.6-terra');
-      expect(node.failover_provider, node.id).toBeUndefined();
+      expect(node.model, node.id).toBe('gpt-6.1-terra');
+      // D0 (WO-HARNESS-PERSONA-MODEL-DECLARED-01): every review node fails over to
+      // Kimi K3.1 Pro on openrouter, never to Claude.
+      expect(node.failover_provider, node.id).toBe('openrouter');
+      expect(node.failover_model, node.id).toBe('moonshotai/kimi-k3.1-pro');
     }
     expect('loop' in strict[0]!).toBe(true);
   });
@@ -87,7 +94,7 @@ describe('Cursor strict Terra model selection', () => {
       expect(
         bindings.map(binding => [binding.providerId, binding.modelId]),
         node.id
-      ).toEqual([['codex-native-strict', 'gpt-5.6-terra']]);
+      ).toEqual([['codex-native-strict', 'gpt-6.1-terra']]);
     }
     // Existing discovery deduplicates equivalent keys; six node cases are not
     // six unique keys. Preserve that production behavior rather than replacing it.
@@ -101,7 +108,7 @@ describe('Cursor strict Terra model selection', () => {
       all
         .filter(binding => binding.providerId === 'codex-native-strict')
         .map(binding => binding.modelId)
-    ).toEqual(['gpt-5.6-terra']);
+    ).toEqual(['gpt-6.1-terra']);
   });
 
   test('actual model resolver and actual unmodelled personas retain Terra for all seven nodes', async () => {
@@ -120,7 +127,7 @@ describe('Cursor strict Terra model selection', () => {
         assistantModels: { cursor: 'grok-4.7-high', 'codex-native-strict': undefined },
       });
       const applied = resolveAgentPersona(persona, binding.model, binding.provider);
-      expect(applied.model, node.id).toBe('gpt-5.6-terra');
+      expect(applied.model, node.id).toBe('gpt-6.1-terra');
       expect(applied.systemPrompt).toBe(persona.systemPrompt);
     }
   });

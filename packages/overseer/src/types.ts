@@ -1,5 +1,7 @@
 import type { DecisionResult } from './decide.ts';
 import type { ErrorClass } from './classify.ts';
+import type { ResolveRequiredContextsInput } from './adapters/required-contexts.ts';
+import type { RecheckCheckRun } from './pr-review-check-ingest.ts';
 
 export type WatchedRunStatus = string;
 
@@ -29,6 +31,9 @@ export interface OverseerWorkflowEvent {
   created_at?: string;
 }
 
+/** Reason a reviewed head must not merge yet (see reviewConflictAtHead). */
+export type ReviewConflictAtHead = 'changes_requested' | 'review_in_flight' | 'lookup_failed';
+
 export interface PullRequestRef {
   owner: string;
   repo: string;
@@ -46,6 +51,18 @@ export interface PullRequestCheckSummary {
   failed: number;
   pending: number;
   conclusion?: string;
+}
+
+/**
+ * One GitHub commit status on the PR head. Distinct from a check run: a
+ * required context can be satisfied by a status alone.
+ */
+export interface PullRequestCommitStatus {
+  id?: number;
+  context: string;
+  state: string;
+  createdAt?: string | null;
+  updatedAt?: string | null;
 }
 
 export interface PullRequestEvidence {
@@ -84,6 +101,26 @@ export interface PullRequestEvidence {
    * not loaded.
    */
   otherOpenPrsForWoLookupFailed?: boolean;
+  /**
+   * GitHub label names on this pull request. Absent on older evidence
+   * fixtures. An exact, case-sensitive `merge-hold` name holds the merge.
+   */
+  labels?: readonly string[];
+  /**
+   * Latest check run per name and app, when the evidence source loaded them.
+   * Absent on older fixtures. An empty array means the lookup returned no runs.
+   * The merge gate matches required contexts against these runs and against
+   * `commitStatuses`. When both exist for one context, both must pass.
+   */
+  checkRuns?: readonly RecheckCheckRun[];
+  /**
+   * Commit statuses for the head. Absent when the evidence source did not load
+   * them. An empty array means the lookup returned none. The merge gate treats
+   * the latest status for a context as passing only when its state is success.
+   * A passing check run with the same name does not override a non-success
+   * status.
+   */
+  commitStatuses?: readonly PullRequestCommitStatus[];
 }
 
 export interface GrokJudgeEvidence {
@@ -140,6 +177,14 @@ export interface WatchedRunRecord {
   prEvidence: PullRequestEvidence;
   decision?: DecisionResult;
   lastEvent?: OverseerWorkflowEvent;
+}
+
+/**
+ * Replay handoff into the merge-execution bridge. A method object, not a
+ * MergeReadyCoordinator function, so the two cannot be substituted.
+ */
+export interface DeterministicMergeHandoff {
+  handoff(record: WatchedRunRecord): Promise<unknown>;
 }
 
 export interface OverseerRunStoreDeps {
@@ -212,6 +257,8 @@ export interface DiscoveredPullRequest {
    * from individual reviews here -- an absent decision stays absent.
    */
   reviewDecision: string | null;
+  /** Label names on the PR as listed. Absent means not read; the run:blocked label excludes a PR. */
+  labels?: readonly string[];
   /** WO id when one is recoverable from the PR, used to sharpen evidence lookup. */
   woId?: string;
   /**
@@ -253,10 +300,38 @@ export interface MergeCandidateDiscoveryDeps {
   listOpenPullRequests?(
     input: GitHubOpenPullRequestListInput
   ): Promise<readonly DiscoveredPullRequest[]>;
+  /** Durable sandbox-review qualification. Production wiring must provide it. */
+  hasQualifiedReview?(input: PullRequestRef & { headSha: string }): Promise<boolean>;
+  /**
+   * Branch-protection lookups, the same seam the merge bridge uses. When the
+   * base's required contexts are known and non-empty, only those contexts can
+   * exclude a candidate for checks_failing or checks_pending. When absent,
+   * discovery resolves with an empty env and keeps the all-checks rule.
+   */
+  requiredContextsLookups?: GitHubClientDeps['requiredContextsLookups'];
 }
 
 export interface GitHubClientDeps {
   findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
+  /**
+   * Branch-protection lookups for the merge check gate. Optional so existing
+   * fakes keep compiling. When absent, the bridge resolves required contexts
+   * with an empty env and falls back to the aggregate check summary.
+   */
+  requiredContextsLookups?: Pick<
+    ResolveRequiredContextsInput,
+    'fetchWithAppClient' | 'fetchWithPatClient' | 'fetchBranchRules' | 'fetchBranch'
+  >;
+  /** Receipt-backed exact-head sandbox-review qualification. */
+  hasQualifiedReview?(input: PullRequestRef & { headSha: string }): Promise<boolean>;
+  /**
+   * Why the exact head must not merge even though one review approved it:
+   * another review of the same head requested changes, or is still running.
+   * Null when every review of the head has finished and none requested changes.
+   */
+  reviewConflictAtHead?(
+    input: PullRequestRef & { headSha: string }
+  ): Promise<ReviewConflictAtHead | null>;
   mergePullRequest(
     input: GitHubPullRequestMergeInput
   ): Promise<{ merged: boolean; message?: string; sha?: string; mergeSha?: string }>;
@@ -333,4 +408,23 @@ export interface OverseerVerdictStoreDeps {
     evidenceDigest?: string;
     evidence?: string;
   }): Promise<unknown>;
+  getVerdictByRunHead(input: { runId: string; headSha: string }): Promise<{
+    id: string;
+    verdict: string | null;
+    proposedAction: string | null;
+    actionedAt: string | null;
+  } | null>;
+  promoteObserveOrHealthyVerdict(verdictId: string): Promise<boolean>;
+  /**
+   * Promote an unactioned observe or healthy verdict and insert its
+   * flag_merge_ready receipt in one transaction. Returns true only when both
+   * writes committed. A failed insert must leave the prior action in place.
+   */
+  promoteObserveOrHealthyVerdictWithReceipt(input: {
+    verdictId: string;
+    runId: string;
+    woId: string;
+    class: string;
+    result: string;
+  }): Promise<boolean>;
 }

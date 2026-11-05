@@ -71,6 +71,7 @@ export const OUTCOME_REASON_CODES = [
   'provider_timeout',
   'provider_rate_limited',
   'provider_auth_failed',
+  'provider_model_capacity',
   'provider_config_invalid',
   'sdk_contradiction',
   'progress_timeout',

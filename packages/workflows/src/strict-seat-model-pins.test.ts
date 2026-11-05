@@ -158,7 +158,9 @@ describe('strict seat model pins', () => {
         );
         const binding = await resolveStrictBinding(workflow, node!);
         expect(binding.provider, `${file}:${id}:provider`).toBe('codex-native-strict');
-        expect(binding.model, `${file}:${id}:model`).toBe('gpt-5.6-terra');
+        const expectedTerra =
+          file === 'bdc-feature-development-codex.yaml' ? 'gpt-6.1-terra' : 'gpt-5.6-terra';
+        expect(binding.model, `${file}:${id}:model`).toBe(expectedTerra);
       }
     }
   });
@@ -200,8 +202,10 @@ describe('strict seat model pins', () => {
         expect(binding.modelId, file).not.toBe('');
         expect(binding.modelId, file).toBeDefined();
       }
+      const expectedTerra =
+        file === 'bdc-feature-development-codex.yaml' ? 'gpt-6.1-terra' : 'gpt-5.6-terra';
       expect(
-        strict.some(binding => binding.modelId === 'gpt-5.6-terra'),
+        strict.some(binding => binding.modelId === expectedTerra),
         file
       ).toBe(true);
     }
@@ -218,9 +222,10 @@ describe('strict seat model pins', () => {
       {
         file: 'bdc-feature-development-codex.yaml',
         provider: 'codex',
-        model: 'gpt-5.6-sol',
-        plan: { provider: 'claude', model: 'sonnet' },
-        implement: { provider: 'codex', model: 'gpt-5.6-sol' },
+        model: 'gpt-6.1-sol',
+        // Plan runs the Claude-free -opr persona on Codex gpt-6.1-terra.
+        plan: { provider: 'codex', model: 'gpt-6.1-terra' },
+        implement: { provider: 'codex', model: 'gpt-6.1-sol' },
       },
       {
         file: 'bdc-feature-development-codex-only.yaml',
@@ -232,7 +237,7 @@ describe('strict seat model pins', () => {
       {
         file: 'bdc-feature-development.yaml',
         provider: 'claude',
-        model: 'sonnet',
+        model: 'claude-sonnet-5-5',
         plan: {},
         implement: {},
       },
