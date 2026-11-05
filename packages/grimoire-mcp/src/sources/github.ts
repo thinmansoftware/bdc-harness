@@ -1,11 +1,6 @@
-/* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-return */
 import { createRealReadOnlyPatOctokitClient } from '@archon/overseer/adapters/github-real-deps';
 import { resolveRequiredContexts } from '@archon/overseer/adapters/required-contexts';
-import {
-  latestAttemptPerCheck,
-  conclusionIsPassing,
-  PASSING_CONCLUSIONS,
-} from '@archon/overseer/pr-review-check-ingest';
+import { latestAttemptPerCheck } from '@archon/overseer/pr-review-check-ingest';
 import type {
   CardCheck,
   PrData,
@@ -29,6 +24,38 @@ export interface GitHubSnapshot {
   status: SourceStatus;
 }
 export class GitHubUnavailableError extends Error {}
+
+interface PullData {
+  title?: string | null;
+  body?: string | null;
+  html_url: string;
+  state: string;
+  merged?: boolean | null;
+  draft?: boolean | null;
+  mergeable?: boolean | null;
+  mergeable_state?: string | null;
+  head: { sha: string; ref?: string | null };
+  base?: { ref?: string | null } | null;
+  user?: { login?: string | null } | null;
+}
+type Get<T> = (args: Record<string, unknown>) => Promise<{ data: T }>;
+/** The GET-only Octokit surface the card reads; the metered PAT client satisfies it. */
+export interface CardGitHubClient {
+  pulls: { get: Get<PullData>; listReviews: Get<RawReview[]> };
+  checks: { listForRef: Get<{ check_runs: RawCheckRun[] }> };
+  repos: {
+    listCommitStatusesForRef: Get<RawStatus[]>;
+    getAllStatusCheckContexts: (args: {
+      owner: string;
+      repo: string;
+      branch: string;
+    }) => Promise<{ data: string[] }>;
+  };
+  search: { issuesAndPullRequests: Get<{ items: { number: number }[] }> };
+  issues: {
+    get: Get<{ assignees?: { login: string }[] | null; assignee?: { login: string } | null }>;
+  };
+}
 const woPattern = /WO-[A-Z0-9-]+-[0-9]+/;
 const issuePattern = /closes\s+(?:thinmansoftware\/bdc-xo)?#(\d+)/i;
 
@@ -38,7 +65,9 @@ export async function readGitHub(
   number: number,
   supplied?: unknown
 ): Promise<GitHubSnapshot> {
-  const client: any = supplied ?? createRealReadOnlyPatOctokitClient();
+  // Boundary assertion: tests inject fakes and the real metered client is Octokit-typed;
+  // both expose this read-only surface.
+  const client = (supplied ?? createRealReadOnlyPatOctokitClient()) as CardGitHubClient | null;
   if (!client) throw new GitHubUnavailableError('GitHub authentication unavailable');
   let requests = 0;
   let capHit = false;
@@ -50,19 +79,19 @@ export async function readGitHub(
     requests += 1;
     return fn();
   };
-  const prResponse: any = await call('pull request', () =>
+  const prResponse = await call('pull request', () =>
     client.pulls.get({ owner, repo, pull_number: number })
   );
   const p = prResponse.data;
   const head = p.head.sha;
   const title = p.title ?? '';
   const body = p.body ?? '';
-  const woId = title.match(woPattern)?.[0] ?? body.match(woPattern)?.[0] ?? null;
-  let issue = Number(body.match(issuePattern)?.[1] ?? '') || null;
+  const woId = woPattern.exec(title)?.[0] ?? woPattern.exec(body)?.[0] ?? null;
+  let issue = Number(issuePattern.exec(body)?.[1] ?? '') || null;
   try {
     const reviews: RawReview[] = [];
     for (let page = 1; ; page += 1) {
-      const response: any = await call('reviews', () =>
+      const response = await call('reviews', () =>
         client.pulls.listReviews({ owner, repo, pull_number: number, per_page: 100, page })
       );
       reviews.push(...response.data);
@@ -70,7 +99,7 @@ export async function readGitHub(
     }
     const allCheckRuns: RawCheckRun[] = [];
     for (let page = 1; ; page += 1) {
-      const response: any = await call('check runs', () =>
+      const response = await call('check runs', () =>
         client.checks.listForRef({
           owner,
           repo,
@@ -80,16 +109,16 @@ export async function readGitHub(
           filter: 'latest',
         })
       );
-      const pageRuns = response.data.check_runs as RawCheckRun[];
+      const pageRuns = response.data.check_runs;
       allCheckRuns.push(...pageRuns);
       if (pageRuns.length < 100) break;
     }
     const statuses: RawStatus[] = [];
     for (let page = 1; ; page += 1) {
-      const response: any = await call('statuses', () =>
+      const response = await call('statuses', () =>
         client.repos.listCommitStatusesForRef({ owner, repo, ref: head, per_page: 100, page })
       );
-      statuses.push(...(response.data as RawStatus[]));
+      statuses.push(...response.data);
       if (response.data.length < 100) break;
     }
     const checkRuns = latestAttemptPerCheck(allCheckRuns);
@@ -101,7 +130,7 @@ export async function readGitHub(
       const resolution = await resolveRequiredContexts({
         owner,
         repo,
-        baseRef: p.base?.ref,
+        baseRef: p.base?.ref ?? null,
         headSha: head,
         fetchWithPatClient: async args =>
           call('required contexts', () => client.repos.getAllStatusCheckContexts(args)),
@@ -123,7 +152,7 @@ export async function readGitHub(
     ]);
     const requiredMissing = required ? [...required].filter(ctx => !reported.has(ctx)).sort() : [];
     if (!issue && woId) {
-      const search: any = await call('linked WO search', () =>
+      const search = await call('linked WO search', () =>
         client.search.issuesAndPullRequests({
           q: `repo:thinmansoftware/bdc-xo is:issue in:title ${woId}`,
           per_page: 1,
@@ -133,14 +162,11 @@ export async function readGitHub(
     }
     let issueAssignee: string | null = null;
     if (issue) {
-      const response: any = await call('linked WO issue', () =>
+      const response = await call('linked WO issue', () =>
         client.issues.get({ owner: 'thinmansoftware', repo: 'bdc-xo', issue_number: issue })
       );
       issueAssignee = response.data.assignees?.[0]?.login ?? response.data.assignee?.login ?? null;
     }
-    // These imports are intentional shared policy: latest attempts and accepted conclusions.
-    void conclusionIsPassing;
-    void PASSING_CONCLUSIONS;
     const displayed: CardCheck[] = [
       ...checkRuns.map(c => ({
         name: c.name ?? '?',
@@ -193,7 +219,7 @@ export async function readGitHub(
   }
 
   function makePr(): PrData {
-    const state = p.merged ? 'MERGED' : String(p.state).toUpperCase();
+    const state = p.merged ? 'MERGED' : p.state.toUpperCase();
     return {
       repo: `${owner}/${repo}`,
       number,
