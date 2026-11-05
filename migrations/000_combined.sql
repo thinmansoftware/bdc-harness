@@ -967,3 +967,6 @@ CREATE TABLE IF NOT EXISTS t3_command_run_custody (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_t3_command_admissions_run_lock
   ON t3_command_admissions (target_run_id)
   WHERE verb IN ('cancel-own', 'approve') AND state IN ('reserved', 'unknown');
+
+-- WO-GRIMOIRE-PROJECT-RECORD-01 (migration 068)
+ALTER TABLE remote_agent_codebases ADD COLUMN IF NOT EXISTS project_record TEXT;
