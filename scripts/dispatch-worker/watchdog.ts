@@ -122,9 +122,15 @@ function realTransportAvailable(): Promise<boolean> {
       socket.destroy();
       resolve(ready);
     };
-    socket.setTimeout(1_000, () => finish(false));
-    socket.once('connect', () => finish(true));
-    socket.once('error', () => finish(false));
+    socket.setTimeout(1_000, () => {
+      finish(false);
+    });
+    socket.once('connect', () => {
+      finish(true);
+    });
+    socket.once('error', () => {
+      finish(false);
+    });
   });
 }
 
