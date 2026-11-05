@@ -411,6 +411,72 @@ assert_contains "vitest declared in package.json -> npx vitest run" "npx vitest 
 assert_eq "no test files in diff -> empty" "" "$(cat "$TMP/out3")"
 rm -rf "$TMP"
 
+echo "--- plain-script tests_in_diff regressions (WO #4719) ---"
+PLAIN_ROOT="$(mktemp -d)"
+plain_repo() {
+  mkdir -p "$PLAIN_ROOT/$1/tests"
+  (
+    cd "$PLAIN_ROOT/$1" || exit 1
+    git init -q . && git config user.email t@t && git config user.name t
+    git commit -qm base --allow-empty
+  )
+}
+plain_diff() {
+  (cd "$PLAIN_ROOT/$1" && rst_tests_in_diff HEAD)
+}
+plain_repo plain
+printf 'import sys\nprint("ok")\nsys.exit(0)\n' > "$PLAIN_ROOT/plain/tests/test_plain.py"
+assert_eq "plain Test 1: module exit uses python3" 'python3 tests/test_plain.py' "$(plain_diff plain)"
+plain_repo pytest
+printf 'def test_a():\n    assert True\n' > "$PLAIN_ROOT/pytest/tests/test_a.py"
+printf 'def test_b():\n    assert True\n' > "$PLAIN_ROOT/pytest/tests/test_b.py"
+assert_eq "plain Test 2: pytest modules batched" 'pytest tests/test_a.py tests/test_b.py' "$(plain_diff pytest)"
+plain_repo mixed
+cp "$PLAIN_ROOT/pytest/tests/test_a.py" "$PLAIN_ROOT/mixed/tests/"
+cp "$PLAIN_ROOT/plain/tests/test_plain.py" "$PLAIN_ROOT/mixed/tests/"
+assert_eq "plain Test 3: mixed diff has two commands" "$(printf 'python3 tests/test_plain.py\npytest tests/test_a.py')" "$(plain_diff mixed)"
+printf 'raise SystemExit(0)\n' > "$PLAIN_ROOT/mixed/tests/test_z.py"
+assert_eq "plain Test 3: scripts in file order, pytest last" "$(printf 'python3 tests/test_plain.py\npython3 tests/test_z.py\npytest tests/test_a.py')" "$(plain_diff mixed)"
+plain_repo regression
+mkdir -p "$PLAIN_ROOT/regression/scripts/bdc-browser/tests" "$PLAIN_ROOT/regression/scripts/git"
+cp "$PLAIN_ROOT/pytest/tests/test_a.py" "$PLAIN_ROOT/regression/scripts/bdc-browser/tests/test_bdc_browser.py"
+printf 'import sys\ndef test_unused():\n    assert False\nfailed = False\nsys.exit(1 if failed else 0)\n' > "$PLAIN_ROOT/regression/scripts/git/test_merge_guard_decide.py"
+assert_eq "plain Test 4: eb62889f commands" "$(printf 'python3 scripts/git/test_merge_guard_decide.py\npytest scripts/bdc-browser/tests/test_bdc_browser.py')" "$(plain_diff regression)"
+if python3 -m pytest --version >/dev/null 2>&1; then
+  PLAIN_PYTEST="$(plain_diff regression | sed -n 's/^pytest /python3 -m pytest /p')"
+  (cd "$PLAIN_ROOT/regression" && bash -c "$PLAIN_PYTEST") > "$PLAIN_ROOT/pytest.log" 2>&1
+  assert_eq "plain Test 4: emitted pytest succeeds without SystemExit" '0' "$?"
+else
+  echo "SKIP: plain Test 4 pytest execution (python3 -m pytest unavailable)"
+fi
+plain_repo guarded
+printf 'import sys\ndef test_guarded():\n    assert True\nif __name__ == "__main__":\n    sys.exit(0)\n' > "$PLAIN_ROOT/guarded/tests/test_guarded.py"
+assert_eq "plain Test 5: guarded exit stays pytest" 'pytest tests/test_guarded.py' "$(plain_diff guarded)"
+plain_repo nofuncs
+printf 'assert 1 + 1 == 2\n' > "$PLAIN_ROOT/nofuncs/tests/test_nofuncs.py"
+assert_eq "plain Test 6: top-level asserts use python3" 'python3 tests/test_nofuncs.py' "$(plain_diff nofuncs)"
+plain_repo exits
+printf 'print("ok 1")\n' > "$PLAIN_ROOT/exits/ok.py"
+printf 'raise SystemExit(1)\n' > "$PLAIN_ROOT/exits/bad.py"
+printf 'python3 ok.py\npython3 bad.py\n' > "$PLAIN_ROOT/exits/cmds"
+assert_eq "plain Test 8: first nonzero exit and sibling counts" '1 1 1' "$(cd "$PLAIN_ROOT/exits" && rst_run_commands cmds log)"
+printf 'python3 ok.py\n' > "$PLAIN_ROOT/exits/cmds"
+assert_eq "plain Test 8: green exit and counts" '0 1 1' "$(cd "$PLAIN_ROOT/exits" && rst_run_commands cmds log)"
+plain_repo async
+printf 'async def test_async():\n    assert False\n' > "$PLAIN_ROOT/async/tests/test_async.py"
+assert_eq "plain Test 9: async-only module stays pytest" 'pytest tests/test_async.py' "$(plain_diff async)"
+plain_repo systemexit
+printf 'def test_unused():\n    assert False\nraise SystemExit(0)\n' > "$PLAIN_ROOT/systemexit/tests/test_exit.py"
+assert_eq "plain: module-level raise overrides definitions" 'python3 tests/test_exit.py' "$(plain_diff systemexit)"
+plain_repo node
+mkdir -p "$PLAIN_ROOT/node/n8n/workflows/incomplete-signup-check"
+printf 'console.log("OK stripe");\n' > "$PLAIN_ROOT/node/n8n/workflows/incomplete-signup-check/check-stripe.test.js"
+printf 'const { test } = require("node:test");\ntest("ok", () => {});\n' > "$PLAIN_ROOT/node/tests/native.test.js"
+printf 'import { test as check } from "bun:test";\ncheck("ok", () => {});\n' > "$PLAIN_ROOT/node/tests/bun.test.mjs"
+printf 'describe("suite", () => { it("ok", () => {}); });\n' > "$PLAIN_ROOT/node/tests/framework.spec.cjs"
+assert_eq "comment: plain Node script avoids bun, framework files stay batched" "$(printf 'node n8n/workflows/incomplete-signup-check/check-stripe.test.js\nbun test tests/bun.test.mjs tests/framework.spec.cjs tests/native.test.js')" "$(plain_diff node)"
+rm -rf "$PLAIN_ROOT"
+
 echo "--- rst_repo_test_script (last rung) ---"
 TMP="$(mktemp -d)"
 assert_eq "no package.json -> empty" "" "$(cd "$TMP" && rst_repo_test_script)"
@@ -1345,6 +1411,30 @@ assert_eq "Test 4 report_has_final_verdict: evidence file TESTS_STATUS" "base_re
 assert_eq "Test 4 report_has_final_verdict: evidence file TESTS_BASE_COMPARE" "base_red" "$(stb_field TESTS_BASE_COMPARE "$(cat "$STB_ROOT/e1/art/evidence/stop-tests.report")")"
 assert_eq "Test 4 report_has_final_verdict: evidence TESTS_LINE equals node output" "$(stb_field TESTS_LINE "$E1_OUT")" "$(stb_field TESTS_LINE "$(cat "$STB_ROOT/e1/art/evidence/stop-tests.report")")"
 
+echo "--- declared uncounted Node command retains its evidence (WO #4719 comment) ---"
+mkdir -p "$STB_ROOT/uncounted/repo" "$STB_ROOT/uncounted/art"
+(
+  cd "$STB_ROOT/uncounted/repo" || exit 1
+  git init -q . && git config user.email t@t && git config user.name t
+  git commit -qm base --allow-empty
+  git rev-parse HEAD > "$STB_ROOT/uncounted/art/run-start-sha.txt"
+  printf 'console.log("OK stripe"); process.exit(Number(process.argv[2] || 0));\n' > check-stripe.test.js
+)
+printf 'WO Class: CODE\n\n## 8. Stop conditions\n\nStop 1 (test suite):\n  node check-stripe.test.js\n  Expected: exit 0\n' > "$STB_SPEC_FILE"
+UNCOUNTED_OUT="$(cd "$STB_ROOT/uncounted/repo" && ARTIFACTS_DIR="$STB_ROOT/uncounted/art" bash "$STB_NODE" 2>/dev/null)"
+assert_eq "comment: declared uncounted command passes" 'passed' "$(stb_field TESTS_STATUS "$UNCOUNTED_OUT")"
+assert_eq "comment: declared source retained" 'spec_declared' "$(stb_field TESTS_SOURCE "$UNCOUNTED_OUT")"
+assert_eq "comment: declared command retained" 'node check-stripe.test.js' "$(stb_field TESTS_COMMAND "$UNCOUNTED_OUT")"
+assert_contains "comment: uncounted label is honest" 'passed (exit 0, uncounted; node check-stripe.test.js) [source: wo-spec]' "$UNCOUNTED_OUT"
+assert_eq "comment: no invented count" '' "$(stb_field TESTS_TOTAL "$UNCOUNTED_OUT")"
+assert_not_contains "comment: fallback never executed" '### run-stop-tests: bun' "$(cat "$STB_ROOT/uncounted/art/evidence/stop-tests.log")"
+assert_eq "comment: evidence report agrees" 'passed' "$(stb_field TESTS_STATUS "$(cat "$STB_ROOT/uncounted/art/evidence/stop-tests.report")")"
+printf 'WO Class: CODE\n\n## 8. Stop conditions\n\nStop 1 (test suite):\n  node check-stripe.test.js 1\n  Expected: exit 0\n' > "$STB_SPEC_FILE"
+UNCOUNTED_RED="$(cd "$STB_ROOT/uncounted/repo" && ARTIFACTS_DIR="$STB_ROOT/uncounted/art" bash "$STB_NODE" 2>/dev/null)"
+assert_eq "comment: declared uncounted failure stays failed" 'failed' "$(stb_field TESTS_STATUS "$UNCOUNTED_RED")"
+assert_eq "comment: declared failure exit retained" '1' "$(stb_field TESTS_EXIT "$UNCOUNTED_RED")"
+printf 'WO Class: CODE\n\n## 8. Stop conditions\n\nStop 2 (test suite):\n  bun run test\n  Expected: all pass\n' > "$STB_SPEC_FILE"
+
 echo "--- Test 2: newly_broken_fails ---"
 mkdir -p "$STB_ROOT/t2/repo" "$STB_ROOT/t2/art"
 T2_SHA="$(stb_fixture "$STB_ROOT/t2/repo" 'A\n' 'A\nC\n')"
@@ -1615,8 +1705,7 @@ assert_eq "A2 Test 1 crashed_files_named: files" "/work/tests/worker-concurrency
 CR2_OUT="$(printf '%s\n' '# Subtest: /work/tests/mixed.test.ts' \
   '    # Subtest: first' '    not ok 1 - first' '    # Subtest: second' '    not ok 2 - second' \
   '    # Subtest: third' '    ok 3 - third' 'not ok 1 - /work/tests/mixed.test.ts' | stb_failed_ids)"
-assert_eq "A2 Test 2 nested_not_double_counted: exactly the nested names" "/work/tests/mixed.test.ts	first
-/work/tests/mixed.test.ts	second" "$CR2_OUT"
+assert_eq "A2 Test 2 nested_not_double_counted: exactly the nested names" "$(printf '/work/tests/mixed.test.ts\tfirst\n/work/tests/mixed.test.ts\tsecond')" "$CR2_OUT"
 
 # Test 3: base comparison verdicts for crashed files
 CR3_REPORT_BODY='TESTS_STATUS=failed
