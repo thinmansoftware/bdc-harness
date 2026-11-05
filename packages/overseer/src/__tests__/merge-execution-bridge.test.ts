@@ -1523,6 +1523,68 @@ describe('merge hold', () => {
     expect(h.claimReleases).toEqual([{ verdictId: 'label-hold', reason: 'merge_hold_label' }]);
     expect(reads).toBe(0);
   });
+
+  // WO-HARNESS-EVIDENCE-GATE-NOT-GATED-AND-BASE-UNRUNNABLE-01: the run:blocked label is enforced
+  // in the shared execution guard, so the originating-run path (a merge_ready verdict from a
+  // run, not from PR discovery) cannot merge a PR opened from a BLOCKED run.
+  test('run:blocked on an originating-run merge_ready verdict does not merge (bridge path)', async () => {
+    const row = verdict('orig-run-blocked');
+    expect(String(row.run_id).startsWith('pr-discovery:')).toBe(false);
+    const h = harness(
+      [row],
+      greenPr({
+        labels: ['run:blocked'],
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1 },
+      })
+    );
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes).toEqual([]);
+    expect(h.claimReleases).toEqual([
+      { verdictId: 'orig-run-blocked', reason: 'run_blocked_label' },
+    ]);
+  });
+
+  test('the same originating-run verdict merges when the PR carries no run:blocked label', async () => {
+    const h = harness(
+      [verdict('orig-run-clean')],
+      greenPr({ pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1 } })
+    );
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+    expect(h.claimReleases).toEqual([]);
+  });
+
+  test('run:blocked on a discovered PR does not merge (bridge path)', async () => {
+    const row = {
+      ...verdict('disc-blocked'),
+      run_id: 'pr-discovery:thinmansoftware/bdc-harness#6',
+      wo_id: 'gh:thinmansoftware/bdc-harness#6',
+    };
+    const h = harness(
+      [row],
+      greenPr({
+        labels: ['run:blocked'],
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 6 },
+      })
+    );
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.claimReleases).toEqual([{ verdictId: 'disc-blocked', reason: 'run_blocked_label' }]);
+  });
 });
 
 describe('merge ceiling queue notices', () => {
