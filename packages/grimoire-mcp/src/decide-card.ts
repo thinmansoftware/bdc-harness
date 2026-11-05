@@ -53,6 +53,24 @@ export function checksVerdict(checkRuns: RawCheckRun[], statuses: RawStatus[]): 
   return bad.length ? `checks not green: ${bad.sort().join(', ')}` : OK;
 }
 
+// Card-only addition on top of merge_guard_decide: a branch-protection required
+// context that never reported on the exact head is not evidence of green.
+export function withRequiredContexts(verdict: string, missingRequired: readonly string[]): string {
+  if (!missingRequired.length) return verdict;
+  const missing = `required checks not reported: ${[...missingRequired].sort().join(', ')}`;
+  return verdict === OK ? missing : `${verdict}; ${missing}`;
+}
+
+function checksStillWaiting(verdict: string): boolean {
+  return (
+    verdict.startsWith('no checks reported for head') ||
+    verdict.startsWith('required checks not reported') ||
+    verdict.includes('in_progress') ||
+    verdict.includes('queued') ||
+    verdict.includes('=pending')
+  );
+}
+
 export interface DecisionInput {
   pr: PrData;
   reviewVerdict: string;
@@ -76,15 +94,10 @@ export function decideBlocker(
   else if (input.reviewVerdict.includes('CHANGES_REQUESTED')) kind = 'changes_requested_on_head';
   else if (input.reviewVerdict.startsWith('latest Overseer review is on ')) kind = 'stale_review';
   else if (input.githubAvailable === false) kind = 'no_review';
-  else if (input.reviewVerdict === 'no Overseer review')
-    kind = failed ? 'cauldron_run_failed' : 'no_review';
-  else if (
-    input.checksVerdict !== OK &&
-    !input.checksVerdict.includes('in_progress') &&
-    !input.checksVerdict.includes('queued') &&
-    !input.checksVerdict.includes('=pending') &&
-    input.checksVerdict !== 'no checks reported for head'
-  )
+  // Only an exact-head APPROVED verdict (OK) may reach the checks and merge branches;
+  // COMMENTED, DISMISSED or any other non-OK verdict stays a review blocker.
+  else if (input.reviewVerdict !== OK) kind = failed ? 'cauldron_run_failed' : 'no_review';
+  else if (input.checksVerdict !== OK && !checksStillWaiting(input.checksVerdict))
     kind = 'checks_red';
   else if (input.checksVerdict !== OK) kind = 'checks_pending';
   else if (pr.production_base) kind = 'production_base_needs_motion';
@@ -125,7 +138,9 @@ export function decideBlocker(
       text:
         input.githubAvailable === false
           ? 'GitHub evidence is incomplete; wait for an authoritative review snapshot'
-          : 'wait for Overseer review of the exact head',
+          : input.reviewVerdict === 'no Overseer review'
+            ? 'wait for Overseer review of the exact head'
+            : `${input.reviewVerdict} on the exact head; wait for an approving Overseer review of the exact head`,
       actor: 'overseer',
     },
     cauldron_run_failed: {

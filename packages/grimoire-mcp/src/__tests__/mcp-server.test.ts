@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createGrimoireServer } from '../mcp-server';
+import { fileURLToPath } from 'node:url';
 import fixture from './fixtures/base.json';
 
 test('10 MCP exposes exactly read-only pr_card and handles invalid refs', async () => {
@@ -40,7 +41,8 @@ test('10 MCP exposes exactly read-only pr_card and handles invalid refs', async 
 });
 test('13 CLI bad reference exits 2 with the required diagnostic', async () => {
   const process = Bun.spawn(
-    ['bun', 'run', new URL('../cli.ts', import.meta.url).pathname, 'card', 'nope'],
+    // fileURLToPath, not URL.pathname: on Windows pathname is '/C:/...' and bun cannot run it.
+    ['bun', 'run', fileURLToPath(new URL('../cli.ts', import.meta.url)), 'card', 'nope'],
     {
       stdout: 'pipe',
       stderr: 'pipe',

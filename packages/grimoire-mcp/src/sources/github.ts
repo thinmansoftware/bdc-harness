@@ -21,6 +21,8 @@ export interface GitHubSnapshot {
   checkRuns: RawCheckRun[];
   statuses: RawStatus[];
   checks: CardCheck[];
+  /** Required contexts with no check run or status on the exact head. */
+  requiredMissing?: string[];
   woId: string | null;
   issue: number | null;
   issueAssignee: string | null;
@@ -39,9 +41,12 @@ export async function readGitHub(
   const client: any = supplied ?? createRealReadOnlyPatOctokitClient();
   if (!client) throw new GitHubUnavailableError('GitHub authentication unavailable');
   let requests = 0;
+  let capHit = false;
   const call = async <T>(source: string, fn: () => Promise<T>): Promise<T> => {
-    if (requests >= 10)
+    if (requests >= 10) {
+      capHit = true;
       throw new GitHubUnavailableError(`GitHub request cap exceeded while retrieving ${source}`);
+    }
     requests += 1;
     return fn();
   };
@@ -88,7 +93,10 @@ export async function readGitHub(
       if (response.data.length < 100) break;
     }
     const checkRuns = latestAttemptPerCheck(allCheckRuns);
+    // Fail closed: merge readiness needs a KNOWN required-context set. The resolver
+    // turns fetch errors into state 'unknown', so a cap hit inside it is re-raised here.
     let required: Set<string> | null = null;
+    let requiredStatus: SourceStatus = 'ok';
     try {
       const resolution = await resolveRequiredContexts({
         owner,
@@ -98,10 +106,22 @@ export async function readGitHub(
         fetchWithPatClient: async args =>
           call('required contexts', () => client.repos.getAllStatusCheckContexts(args)),
       });
+      if (capHit)
+        throw new GitHubUnavailableError(
+          'GitHub request cap exceeded while retrieving required contexts'
+        );
       if (resolution.state === 'known') required = new Set(resolution.contexts);
-    } catch {
-      required = null;
+      else
+        requiredStatus = `unavailable: required contexts ${resolution.state}: ${resolution.reason}`;
+    } catch (error) {
+      if (error instanceof GitHubUnavailableError) throw error;
+      requiredStatus = `unavailable: required contexts lookup failed: ${error instanceof Error ? error.message : 'unknown error'}`;
     }
+    const reported = new Set([
+      ...checkRuns.map(c => c.name ?? ''),
+      ...statuses.map(s => s.context ?? ''),
+    ]);
+    const requiredMissing = required ? [...required].filter(ctx => !reported.has(ctx)).sort() : [];
     if (!issue && woId) {
       const search: any = await call('linked WO search', () =>
         client.search.issuesAndPullRequests({
@@ -134,6 +154,12 @@ export async function readGitHub(
         state: s.state ?? 'unknown',
         required: required ? required.has(s.context ?? '') : null,
       })),
+      ...requiredMissing.map(name => ({
+        name,
+        kind: 'run' as const,
+        state: 'missing',
+        required: true,
+      })),
     ];
     return {
       pr: makePr(),
@@ -141,10 +167,11 @@ export async function readGitHub(
       checkRuns,
       statuses,
       checks: displayed,
+      requiredMissing,
       woId,
       issue,
       issueAssignee,
-      status: 'ok',
+      status: requiredStatus,
     };
   } catch (error) {
     if (
