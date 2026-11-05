@@ -1862,12 +1862,83 @@ nodes:
         done
         return 1
       }
-      rst_tokens_safe() {
-        local t
-        for t in "$@"; do
-          printf '%s' "$t" | grep -qE '^[A-Za-z0-9@%+=:,./_-]+$' || return 1
+      # The command check and the execution consume the words of ONE shared quote-aware
+      # tokenizer, scripts/lane/rsg-argv.sh (rsg_parse_chain, WO-HARNESS-GREP-STOP-EXTRACTION-
+      # SILENT-WAIVE-01), the same file the run-stop-greps node sources. Resolution order:
+      # $BDC_RSGARGV_SCRIPT (tests), then the engine per-node copy
+      # $ARCHON_LANE_SCRIPTS_DIR/rsg-argv.sh, then the image copy /app/scripts/lane/rsg-argv.sh.
+      # When none exists a command that contains a quote character is refused (fail closed) and
+      # a command with no quote character is split on whitespace exactly as before.
+      RSGARGV_SCRIPT=""
+      for rsgargv_candidate in "${BDC_RSGARGV_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/rsg-argv.sh}" /app/scripts/lane/rsg-argv.sh; do
+        if [ -n "$rsgargv_candidate" ] && [ -f "$rsgargv_candidate" ]; then RSGARGV_SCRIPT="$rsgargv_candidate"; break; fi
+      done
+      if [ -n "$RSGARGV_SCRIPT" ]; then
+        . "$RSGARGV_SCRIPT"
+      else
+        printf 'run-stop-tests: rsg-argv.sh missing (tried BDC_RSGARGV_SCRIPT=%s, ARCHON_LANE_SCRIPTS_DIR=%s, /app/scripts/lane/rsg-argv.sh); a command containing a quote character will be refused (fail closed)\n' "${BDC_RSGARGV_SCRIPT:-unset}" "${ARCHON_LANE_SCRIPTS_DIR:-unset}" >&2
+        RSG_PARSED=()
+        rsg_parse_chain() { RSG_PARSED=(); return 1; }
+      fi
+      # Segment separator element in RST_WORDS (the one-character string ASCII 0x1E; the same value
+      # as RSG_RS in rsg-argv.sh, defined here so the helper-missing path needs no helper).
+      RST_RS=$'\036'
+      RST_WORDS=()
+      # rst_parse_cmd <cmd>   (rc 0 and RST_WORDS filled: one argv word per element, && segments
+      #   separated by the single element RST_RS; rc 1 rejects the command). With the helper this
+      #   is rsg_parse_chain: single-quoted words are one literal argv word each, double quotes,
+      #   backslashes, ; | & ` $ ( ) > < and {{ outside quotes are refused. The chain scanner also
+      #   accepts glob characters outside quotes; the rst charset never did, so they are refused
+      #   here (checked on the command with its quoted spans removed). Without the helper: any
+      #   quote character is refused, otherwise the legacy whitespace split with the legacy
+      #   charset ^[A-Za-z0-9@%+=:,./_-]+$ per word.
+      rst_parse_cmd() {
+        local LC_ALL=C
+        local cmd="${1-}" rest seg w more
+        local -a out=()
+        RST_WORDS=()
+        if [ -n "$RSGARGV_SCRIPT" ]; then
+          rsg_parse_chain "$cmd" || return 1
+          case "$(printf '%s' "$cmd" | sed "s/'[^']*'//g")" in *'*'*|*'?'*|*'['*|*']'*) return 1 ;; esac
+          RST_WORDS=("${RSG_PARSED[@]}")
+          return 0
+        fi
+        case "$cmd" in *"'"*|*'"'*|*'\'*) return 1 ;; esac
+        case "$cmd" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1 ;; esac
+        case "${cmd//&&/}" in *'&'*) return 1 ;; esac
+        rest="$cmd"
+        while :; do
+          case "$rest" in
+            *'&&'*) seg="${rest%%&&*}"; rest="${rest#*&&}"; more=1 ;;
+            *) seg="$rest"; rest=""; more=0 ;;
+          esac
+          set -f
+          set -- $seg
+          set +f
+          [ $# -gt 0 ] || return 1
+          for w in "$@"; do
+            [[ "$w" =~ ^[A-Za-z0-9@%+=:,./_-]+$ ]] || return 1
+            out+=("$w")
+          done
+          [ "$more" -eq 1 ] || break
+          out+=("$RST_RS")
         done
+        RST_WORDS=("${out[@]}")
         return 0
+      }
+      # rst_has_install_step <word...>   (rc 0 when one parsed segment holds a dependency-install
+      #   step: npm|npm.cmd|pnpm|yarn|bun followed by ci|install|i|add)
+      rst_has_install_step() {
+        local -a a=("$@")
+        local i
+        for ((i = 0; i + 1 < ${#a[@]}; i++)); do
+          case "${a[i]}" in
+            npm|npm.cmd|pnpm|yarn|bun)
+              case "${a[i+1]}" in ci|install|i|add) return 0 ;; esac
+              ;;
+          esac
+        done
+        return 1
       }
       rst_is_repo_script() {
         local p="$1" oldifs seg
@@ -1879,15 +1950,13 @@ nodes:
         done
         return 0
       }
+      # rst_argv_looks_runnable <word...>   (rc 0 when the already-parsed argv words of ONE && segment
+      #   name an allowlisted runner with its safe arguments; there is no tokenizing here)
       rst_argv_looks_runnable() {
-        local runner segment="$1"
-        set -f
-        set -- $segment
-        set +f
+        local runner
         [ $# -ge 2 ] || return 1
         runner="$1"
         shift
-        rst_tokens_safe "$runner" "$@" || return 1
         case "$runner" in
           node|npm|npx|bun|bunx|pytest|python|python3|go|cargo|bash|sh|make) ;;
           *) return 1 ;;
@@ -1942,34 +2011,41 @@ nodes:
         esac
         return 1
       }
-      # rst_command_looks_runnable <cmd>   (rc 0 when the line tokenizes -- whitespace
-      #   split, no shell -- to an allowlisted runner FOLLOWED BY AN ARGUMENT -- a bare
-      #   "node" or "bun" mentioned in prose is not a command (live false positive, run
-      #   f4dabd76) -- with no inline interpreter modes, and is not a dependency-install
-      #   step). Interpreters (node|bun|python|python3|bash|sh) must take a relative
-      #   repo script path (.js .mjs .cjs .ts .tsx .py .sh), not -c/-e/--eval. python -m
-      #   pytest|unittest is the only -m exception. Round-4 metacharacter rejection
-      #   still applies.
+      # rst_command_looks_runnable <cmd>   (rc 0 when the line parses -- through the shared
+      #   quote-aware tokenizer, no shell -- to an allowlisted runner FOLLOWED BY AN ARGUMENT -- a
+      #   bare "node" or "bun" mentioned in prose is not a command (live false positive, run
+      #   f4dabd76) -- with no inline interpreter modes, and is not a dependency-install step).
+      #   Interpreters (node|bun|python|python3|bash|sh) must take a relative repo script path (.js
+      #   .mjs .cjs .ts .tsx .py .sh), not -c/-e/--eval, and a quoted "-e" is refused like a bare
+      #   one because the checks run on the parsed words. python -m pytest|unittest is the only -m
+      #   exception. A single-quoted multi-word argument is one argv word. Round-4 metacharacter
+      #   rejection still applies (see rst_parse_cmd).
       rst_command_looks_runnable() {
-        local cmd="$1"
-        case "$cmd" in *'{{'*|*';'*|*'`'*|*'$('*|*'>'*|*'<'*|*'|'*) return 1 ;; esac
-        # Preserve an optional "cd safe/subdir &&" prefix and declared chains of
-        # test runners. Every remaining && segment must itself be argv-runnable.
-        if printf '%s\n' "$cmd" | grep -qE '^[ ]*cd[ ]+[A-Za-z0-9_./-]+[ ]+&&[ ]+'; then
-          cmd="$(printf '%s\n' "$cmd" | sed -E 's/^[ ]*cd[ ]+[A-Za-z0-9_.\/-]+[ ]+&&[ ]+//')"
+        local cmd="$1" k=0 total
+        local -a words=() seg=()
+        rst_parse_cmd "$cmd" || return 1
+        words=("${RST_WORDS[@]}")
+        total=${#words[@]}
+        [ "$total" -gt 0 ] || return 1
+        # Preserve an optional "cd safe/subdir &&" prefix and declared chains of test runners.
+        # Every remaining && segment must itself be argv-runnable.
+        if [ "${words[0]}" = "cd" ]; then
+          [ "$total" -ge 4 ] && [ "${words[2]}" = "$RST_RS" ] || return 1
+          printf '%s' "${words[1]}" | grep -qE '^[A-Za-z0-9_./-]+$' || return 1
+          k=3
         fi
-        case "${cmd//&&/}" in *'&'*) return 1 ;; esac
-        while :; do
-          local segment
-          case "$cmd" in
-            *'&&'*) segment="${cmd%%&&*}"; cmd="${cmd#*&&}" ;;
-            *) segment="$cmd"; cmd='' ;;
-          esac
-          if printf '%s\n' "$segment" | grep -qE '(^|[ ;])(npm|npm\.cmd|pnpm|yarn|bun)[ ]+(ci|install|i|add)([ ]|$)'; then
+        while [ "$k" -lt "$total" ]; do
+          seg=()
+          while [ "$k" -lt "$total" ] && [ "${words[k]}" != "$RST_RS" ]; do
+            seg+=("${words[k]}")
+            k=$((k + 1))
+          done
+          [ "${#seg[@]}" -gt 0 ] || return 1
+          if rst_has_install_step "${seg[@]}"; then
             return 1
           fi
-          rst_argv_looks_runnable "$segment" || return 1
-          [ -z "$cmd" ] && break
+          rst_argv_looks_runnable "${seg[@]}" || return 1
+          k=$((k + 1))
         done
         return 0
       }
@@ -2015,13 +2091,16 @@ nodes:
       }
       # rst_rescue_subdir <cmd>   (-> cmd, or "cd <dir> && <cmd>" when the command's first
       #   relative path does not exist at the worktree root but exists in exactly one
-      #   depth-1 directory -- shopops specs write "node tests/x.js" meaning shopops-api/)
+      #   depth-1 directory -- shopops specs write "node tests/x.js" meaning shopops-api/).
+      #   Works on the parsed argv words, so a quoted multi-word argument is never split
+      #   or mistaken for a path.
       rst_rescue_subdir() {
         local cmd="$1" tok p="" d hit="" n=0
         case "$cmd" in cd\ *|*'&& cd '*) printf '%s' "$cmd"; return 0 ;; esac
-        for tok in $cmd; do
+        rst_parse_cmd "$cmd" || { printf '%s' "$cmd"; return 0; }
+        for tok in "${RST_WORDS[@]}"; do
           case "$tok" in
-            -*|*://*|*'='*) continue ;;
+            "$RST_RS"|-*|*://*|*'='*|*' '*|*$'\t'*) continue ;;
             */*) p="${tok#./}"; break ;;
           esac
         done
@@ -2130,15 +2209,16 @@ nodes:
         done
       }
       # rst_run_commands <commands-file> <log>   (runs each command line in the CWD under a
-      #   1500 s budget as tokenized argv -- no bash -c -- appends every command's output
-      #   to <log> under a "### run-stop-tests:" header, and prints "<exit> <passed>
-      #   <total>" -- exit is the first nonzero exit, counts are summed across commands;
-      #   "<exit>  " (empty counts) when nothing parsed). Optional "cd <dir> &&" is
+      #   1500 s budget as the parsed argv words of the shared tokenizer -- no bash -c -- appends
+      #   every command's output to <log> under a "### run-stop-tests:" header, and prints
+      #   "<exit> <passed> <total>" -- exit is the first nonzero exit, counts are summed across
+      #   commands; "<exit>  " (empty counts) when nothing parsed). Optional "cd <dir> &&" is
       #   performed in-process; remaining && segments run sequentially. pipefail is
       #   unused (pipes are already rejected).
       rst_run_commands() {
         local cmds="$1" log="$2" cmd seg rc exit_code=0 p=0 t=0 hit=0 c
-        local saved_pwd work segment d
+        local saved_pwd d k total
+        local -a words=() segw=()
         rst_scrub_env
         saved_pwd="$(pwd)"
         seg="$(mktemp)"
@@ -2152,10 +2232,13 @@ nodes:
             printf 'rst_run_commands: refusing non-runnable command\n' > "$seg"
             rc=1
           else
-            work="$cmd"
-            if printf '%s\n' "$work" | grep -qE '^[ ]*cd[ ]+[A-Za-z0-9_./-]+[ ]+&&[ ]+'; then
-              d="$(printf '%s\n' "$work" | sed -E 's/^[ ]*cd[ ]+([A-Za-z0-9_.\/-]+)[ ]+&&[ ]+.*$/\1/')"
-              work="$(printf '%s\n' "$work" | sed -E 's/^[ ]*cd[ ]+[A-Za-z0-9_.\/-]+[ ]+&&[ ]+//')"
+            rst_parse_cmd "$cmd" || true
+            words=("${RST_WORDS[@]}")
+            total=${#words[@]}
+            k=0
+            if [ "$total" -gt 0 ] && [ "${words[0]}" = "cd" ]; then
+              d="${words[1]}"
+              k=3
               if ! cd "$d"; then
                 printf 'rst_run_commands: cd %s failed\n' "$d" > "$seg"
                 rc=1
@@ -2163,13 +2246,12 @@ nodes:
             fi
             if [ "$rc" -eq 0 ]; then
               while :; do
-                case "$work" in
-                  *'&&'*) segment="${work%%&&*}"; work="${work#*&&}" ;;
-                  *) segment="$work"; work='' ;;
-                esac
-                set -f
-                set -- $segment
-                set +f
+                segw=()
+                while [ "$k" -lt "$total" ] && [ "${words[k]}" != "$RST_RS" ]; do
+                  segw+=("${words[k]}")
+                  k=$((k + 1))
+                done
+                set -- "${segw[@]}"
                 if [ $# -eq 0 ]; then rc=1; break; fi
                 # Rewrite npx/npm to bun only after the original argv passed the allowlist.
                 # When the real binary is on PATH, leave the command unchanged.
@@ -2197,7 +2279,8 @@ nodes:
                 timeout 1500 "$@" >> "$seg" 2>&1 < /dev/null
                 rc=$?
                 [ "$rc" -ne 0 ] && break
-                [ -z "$work" ] && break
+                k=$((k + 1))
+                [ "$k" -ge "$total" ] && break
               done
             fi
           fi
@@ -2431,19 +2514,65 @@ nodes:
 
       # ---- BEGIN rsg core (byte-identical across lanes; extracted by unit test) ----
       # POSIX awk only (mawk in the container).
-      # rsg_extract   (spec on stdin -> one "<command>\t<op>\t<n>" line per grep stop)
-      #   Two shapes: (A) the template "Stop N (grep assertion ...)" header, command
-      #   line, "Expected: ..." line; (B) inside a "Stop conditions" section, a line
-      #   carrying a backticked read-only command (grep/rg/find/wc/test/cat/head/tail,
-      #   optional LC_ALL=C prefix) followed by its expectation in prose ("returns 2 or
-      #   greater", "=> 1", "returns nothing"). op is eq (default), ge ("at least", ">=",
-      #   "or more", "or greater"), le ("at most", "<="). "no output" / "nothing" /
-      #   "none" / "empty" mean eq 0. A declared assertion without a parseable
-      #   expectation is counted in GREP_DECLARED but not executed.
+      # rsg_extract   (spec on stdin -> one "<command>\t<op>\t<n>" line per grep stop, then
+      #   "UNPARSED\t<k>[\t<names>]" and "DECLARED\t<n>")
+      #   WO-HARNESS-GREP-STOP-EXTRACTION-SILENT-WAIVE-01 (bdc-xo #4753): block based. Rule, in
+      #   a section whose heading contains "Stop condition":
+      #     R1 a block starts at "Stop <id>" followed by "(" or ":" (any header text, bold or
+      #        italic markers allowed); R2 it ends at the next Stop header, any heading line or
+      #        the end of the section; R3 a header whose text begins with test, unit or suite
+      #        belongs to run-stop-tests and is skipped; R4 every command line (first word in the
+      #        counted set, after optional LC_ALL=/LANG= words and "cd <dir> &&" prefixes) that is
+      #        followed by an "Expected:" line is one assertion, a trailing backslash joins the
+      #        next line, a new command line starts a new assertion, foreign commands (ssh, sh,
+      #        bash, docker, curl, gh, prose) are not counted and not an error; R5 declared is
+      #        counted per command and a command with no parseable Expected is declared and
+      #        unparsed; R6 a counted block with no Expected and no counted command is declared
+      #        and unparsed, named by its header text; R7 a legacy "Stop N (grep" or "Stop N
+      #        (assert" header counts anywhere in the spec and every command-like line before its
+      #        Expected is an assertion whatever its first word; R8 the second shape (a backticked
+      #        read-only command followed by its expectation in prose) is kept; inside a block the
+      #        backticked command starts a command like any other line and is complete only when its
+      #        expectation is on the same line, otherwise it is the pending command for the next
+      #        Expected line; PAIRING IS FAIL-CLOSED: inside a block a pending command is closed ONLY
+      #        by the Expected line directly after it (blank lines and code fences are skipped),
+      #        and ANY other non-blank line (another command of any kind, a bullet, prose, an env-
+      #        or cd-prefixed line, a backticked line, a header) first closes it as unparsed; every
+      #        such start goes through one function, begin_command, so no path can skip the close.
+      #        A foreign command (ssh, curl, ...) is simply not counted, and nothing depends on
+      #        recognising it; command words end at a space OR a tab; there is NO baseline
+      #        filter: baseline prose is ordinary prose (it closes a pending command like any
+      #        other non-blank line) and a command is never excluded for what its arguments say; R9 a bare (not backticked) line in the section but outside any block
+      #        whose first word is grep, egrep, fgrep, rg, git grep, node, bun, bunx, npm, npx,
+      #        wc or "test -" is an uncounted command line: declared and unparsed, so
+      #        none_declared can no longer sit next to an uncounted command line.
+      #   STAGE SCOPING (found live, MIXED / multi-stage specs): the stage list is the "repo:
+      #   <owner/name>" entries of the spec's FIRST "stages:" block, every entry kept in order and
+      #   never deduplicated (a repository listed twice is two stages; stage N is entry N; a second
+      #   stages: block, such as the canonical-stages copy, is ignored). The
+      #   current repo is $RSG_STAGE_REPO, else the owner/name of this worktree origin remote; when
+      #   neither is known nothing is scoped. A counted block whose header names "stage <N>" (N a
+      #   known stage) or names a known stage repo (owner/name) belongs to that stage; when that
+      #   repo is not the current repo its commands are NOT declared and are emitted as
+      #   "OTHER_STAGE<TAB><command><TAB><tag>" records, which rsg_run reports as visible
+      #   "SKIPPED (other-stage: <tag>)" lines and GREP_OTHER_STAGE=<n>; they are never failed and
+      #   never dropped silently. A block with no stage tag belongs to every stage. Deterministic
+      #   and tag-driven: no path probing.
+      #   op is eq (default), ge ("at least", ">=", "or more", "or greater"), le ("at most", "<=").
+      #   "no output" / "nothing" / "none" / "empty" mean eq 0. A declared assertion without a
+      #   parseable expectation is counted in DECLARED but not executed. The shared fixture
+      #   .archon/workflows/defaults/__tests__/fixtures/stop-extract-cases.txt pins the verdicts.
       rsg_extract() {
-        awk '
-          function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); return s }
-          function note_unparsed(name) {
+        local cur="${RSG_STAGE_REPO:-}"
+        if [ -z "$cur" ]; then
+          cur="$(git remote get-url origin 2>/dev/null | sed -E 's#[.]git$##; s#^.*[:/]([^/:]+/[^/]+)$#\1#' || true)"
+        fi
+        awk -v cur="$cur" '
+          # Tabs inside a command become spaces: the output is a tab separated record, and a tab in
+          # the command would cut it short in rsg_run.
+          function clean(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); gsub(/`/, "", s); sub(/^\$ /, "", s); gsub(/\t/, " ", s); return s }
+          function unbullet(s) { sub(/^([-*]|[0-9]+[.)])[ \t]+/, "", s); return s }
+          function note_uncounted(name) {
             if (name == "") name = "unnamed grep stop condition"
             unparsed_names = (unparsed_names == "" ? name : unparsed_names "; " name)
           }
@@ -2456,40 +2585,132 @@ nodes:
             if (n == "") return ""
             return op "\t" n
           }
-          state == 1 {
+          function iscmd(c) {
+            while (c ~ /^cd[ \t]+[^ \t]+[ \t]+&&[ \t]+/) sub(/^cd[ \t]+[^ \t]+[ \t]+&&[ \t]+/, "", c)
+            return (c ~ /^((LC_ALL|LANG)=[^ \t]+[ \t]+)*((grep|egrep|fgrep|rg|find|wc|cat|head|tail|sort|cut|tr|uniq|ls|git|node|bun|bunx|npm|npx)([ \t]|$)|test[ \t]+-|\[[ \t])/)
+          }
+          # A command-like pending line that no Expected line has paired yet.
+          function open_pending() { return (pending != "" && (iscmd(pending) || (legacy && bexp == 0))) }
+          # THE one place a command starts (counted line, foreign line, inline backticked command):
+          # whatever command was still pending is closed as UNPARSED first, so an Expected line can
+          # never be paired with a command other than the one directly before it.
+          function begin_command(c) {
+            if (open_pending()) { declared++; bcmds++; note_uncounted(pending) }
+            pending = c
+          }
+          function handle(cmd, ex,   e) {
+            if (legacy || iscmd(cmd)) {
+              declared++; bcmds++
+              e = expect(ex)
+              if (e != "") { print cmd "\t" e; parsed++ } else note_uncounted(cmd)
+            }
+            bexp++
+          }
+          function second_gate(s) {
+            return (s ~ /`((LC_ALL|LANG)=C[ \t]+)?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)([ \t]|`)/)
+          }
+          # Splits the first backticked read-only command off a line: BTCMD is the command, BTREST
+          # the text after its closing backtick.
+          function bt_split(s) {
+            if (!match(s, /`((LC_ALL|LANG)=C[ \t]+)?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)[^`]*`/)) return 0
+            BTCMD = substr(s, RSTART + 1, RLENGTH - 2); BTREST = substr(s, RSTART + RLENGTH)
+            gsub(/\t/, " ", BTCMD)
+            return 1
+          }
+          function second(s,   e) {
+            if (!bt_split(s)) return 0
+            declared++
+            e = expect(BTREST)
+            if (e != "") { print BTCMD "\t" e; parsed++ } else { note_uncounted(BTCMD) }
+            return 1
+          }
+          function repo_known(r,   i) { for (i = 1; i <= nrepo; i++) if (tolower(repos[i]) == tolower(r)) return 1; return 0 }
+          function same_repo(a, b,   x, y) {
+            x = tolower(a); y = tolower(b)
+            if (x == y) return 1
+            sub(/^.*\//, "", x); sub(/^.*\//, "", y)
+            return (x == y)
+          }
+          # Stage N is entry N of the FIRST "stages:" block, every entry kept in order (a repository
+          # listed twice is two stages). A tag that cannot be resolved (no stages block, N beyond the
+          # list) maps to "" and the stop is COUNTED, never skipped. A header that names no stage number
+          # but contains a known repository slug belongs to that repository.
+          function stage_of(h,   low, n, i) {
+            low = tolower(h)
+            if (match(low, /stage[ \t]+[0-9]+/)) {
+              n = substr(low, RSTART, RLENGTH); sub(/^stage[ \t]+/, "", n); n = n + 0
+              if (n >= 1 && n <= nstg) return stg[n]
+              return ""
+            }
+            for (i = 1; i <= nrepo; i++) if (index(low, tolower(repos[i])) > 0) return repos[i]
+            return ""
+          }
+          function flush() {
+            if (!inblk) return
+            if (oth) { }
+            else if (open_pending()) { declared++; note_uncounted(pending) }
+            else if (!excl && bcmds == 0 && (legacy || bexp == 0)) { declared++; note_uncounted(hdr) }
+            inblk = 0; pending = ""
+          }
+          !inblk && !stg_done && /^[ \t]*stages:[ \t]*$/ { stg_open = 1 }
+          stg_open && /^[^ \t]/ && !/^stages:[ \t]*$/ { stg_open = 0; stg_done = 1 }
+          !inblk && /^[ \t-]*repo:[ \t]*[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/ {
+            r = $0; sub(/^[ \t-]*repo:[ \t]*/, "", r); sub(/[ \t].*$/, "", r)
+            if (!repo_known(r)) { nrepo++; repos[nrepo] = r }
+            if (stg_open) { nstg++; stg[nstg] = r }
+          }
+          /^[ \t]*[*_]*[Ss]top[ \t]+[0-9A-Za-z.]+[ \t]*[(:]/ && (insec || $0 ~ /^[ \t]*[*]*[Ss]top[ \t]+[0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/) {
+            flush(); inblk = 1; hdr = clean($0); l = tolower(hdr)
+            legacy = ($0 ~ /^[ \t]*[*]*[Ss]top[ \t]+[0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/)
+            excl = (l ~ /^[ \t]*[*_]*stop[ \t]+[0-9a-z.]+[ \t]*[(:][ \t]*(test|unit|suite)/)
+            bexp = 0; bcmds = 0; pending = ""
+            oth = 0; othtag = ""
+            if (cur != "" && !excl) {
+              st = stage_of(hdr)
+              if (st != "" && !same_repo(st, cur)) { oth = 1; othtag = "stage repo " st }
+            }
+            next
+          }
+          /^#+ / { flush(); insec = ($0 ~ /[Ss]top [Cc]ondition/) ? 1 : 0; next }
+          inblk && excl { next }
+          inblk && oth {
             if ($0 ~ /^[ \t]*```/) next
+            line = unbullet(clean($0))
+            if (iscmd(line)) print "OTHER_STAGE\t" line "\t" othtag
+            next
+          }
+          inblk {
+            if ($0 ~ /^[ \t]*```/) next
+            if (insec && second_gate($0) && $0 !~ /^[ \t]*([-*][ \t]+)?[Ee]xpected:/) {
+              if (bt_split($0)) {
+                begin_command(BTCMD)
+                e = expect(BTREST)
+                if (e != "") { declared++; bcmds++; print BTCMD "\t" e; parsed++; pending = "" }
+                next
+              }
+            }
             line = clean($0)
             if (line == "") next
+            line = unbullet(line)
             if (line ~ /^[Ee]xpected:/) {
-              ex = line; sub(/^[Ee]xpected:[ \t]*/, "", ex); e = expect(ex)
-              if (cmd != "" && e != "") { print cmd "\t" e; parsed++ }
-              else { note_unparsed(cmd != "" ? cmd : label) }
-              state = 0; cmd = ""; next
+              ex = line; sub(/^[Ee]xpected:[ \t]*/, "", ex)
+              if (pending != "") handle(pending, ex); else bexp++
+              pending = ""; next
             }
-            if (line ~ /^[*]*[Ss]top [0-9A-Za-z.]+/) { note_unparsed(cmd != "" ? cmd : label); state = 0; cmd = "" }
-            else {
-              cmd = (cmd == "" ? line : cmd " " line)
-              sub(/[ \t]*\\$/, "", cmd)
-              next
-            }
+            if (pending != "" && pending ~ /\\$/) { sub(/[ \t]*\\$/, "", pending); pending = pending " " line; next }
+            # Fail closed: a pending command is closed ONLY by the Expected line directly after it
+            # (blank lines and code fences do not count). ANY other non-blank line, whatever it is
+            # (a command of any kind, a bullet, prose, an env- or cd-prefixed line, a backticked
+            # line), closes it as UNPARSED and is then processed as the start of a new line.
+            begin_command(line); next
           }
-          /^[ \t]*[*]*[Ss]top [0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/ { state = 1; cmd = ""; label = clean($0); declared++; next }
-          /^#+ / { insec = ($0 ~ /[Ss]top [Cc]ondition/) ? 1 : 0; bl = 0; next }
-          insec && /^[ \t]*[*_]*[Bb]aseline/ { bl = 1 }
-          insec && bl && (/^[ \t]*$/ || /^[ \t]*([0-9]+[.)]|[-*])[ \t]/) { bl = 0 }
-          insec && !bl && /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)( |`)/ {
-            if (tolower($0) ~ /baseline|untouched tree|before the fix|before this wo/) next
-            s = $0
-            if (match(s, /`(LC_ALL=C |LANG=C )?(grep|egrep|fgrep|rg|find|wc|test|cat|head|tail)[^`]*`/)) {
-              g = substr(s, RSTART + 1, RLENGTH - 2); rest = substr(s, RSTART + RLENGTH)
-              declared++
-              e = expect(rest)
-              if (e != "") { print g "\t" e; parsed++ }
-              else { note_unparsed(g) }
-            }
+          insec && second_gate($0) { second($0) }
+          insec && $0 !~ /`/ {
+            line = unbullet(clean($0))
+            if (line ~ /^(grep|egrep|fgrep|rg|git[ \t]+grep|node|bun|bunx|npm|npx|wc)([ \t]|$)|^test[ \t]+-/) { declared++; note_uncounted(line) }
           }
           END {
-            if (state == 1) note_unparsed(cmd != "" ? cmd : label)
+            flush()
             if (unparsed_names != "") print "UNPARSED\t" (declared - parsed) "\t" unparsed_names
             else print "UNPARSED\t" (declared - parsed)
             print "DECLARED\t" (declared + 0)
@@ -2667,6 +2888,31 @@ nodes:
         printf '%s' "$raw"
         return "$rc"
       }
+      # rsg_last_segment_counts   (rc 0 when the last pipeline segment of the command parsed into
+      #   RSG_PARSED is a grep-class runner with -c / --count. Such a command over several files
+      #   prints one "file:count" line per file; rsg_observe sums those counts (found live: shopops
+      #   #925, a 4-file grep -c read as 4 lines instead of the summed 0).)
+      rsg_last_segment_counts() {
+        local w runner=""
+        local -a seg=()
+        for w in "${RSG_PARSED[@]}"; do
+          if [ "$w" = "$RSG_US" ]; then seg=(); else seg+=("$w"); fi
+        done
+        for w in "${seg[@]}"; do
+          if [ -z "$runner" ]; then
+            case "$w" in LC_ALL=*|LANG=*) continue ;; esac
+            runner="$w"
+            case "$runner" in grep|egrep|fgrep|rg) ;; *) return 1 ;; esac
+            continue
+          fi
+          case "$w" in
+            --count) return 0 ;;
+            --*) ;;
+            -*c*) return 0 ;;
+          esac
+        done
+        return 1
+      }
       # rsg_observe <command>   (-> observed count, or "ERR" on a hard command failure
       #   or a non-allowlisted line). Tokenized argv via rsg_exec_pipeline.
       rsg_observe() {
@@ -2681,6 +2927,8 @@ nodes:
           printf '%s' "$rawtrim"
         elif [ -z "$rawtrim" ]; then
           if [ "$rc" -le 1 ]; then printf '0'; else printf 'ERR'; fi
+        elif rsg_last_segment_counts && ! printf '%s\n' "$raw" | grep -v '^[[:space:]]*$' | grep -qvE '^.+:[0-9]+$'; then
+          printf '%s\n' "$raw" | awk '/[^[:space:]]/ { sub(/^.*:/, ""); s += $1 } END { print s + 0 }'
         else
           printf '%s\n' "$raw" | grep -c . || true
         fi
@@ -2695,7 +2943,7 @@ nodes:
       }
       # rsg_run   (extracted TSV on stdin -> GREP_* summary lines + per-assertion detail)
       rsg_run() {
-        local line cmd op n obs declared=0 executed=0 dropped=0 unparsed=0 unparsed_names="" mismatch=0 out="" detail="" status tab
+        local line cmd op n obs declared=0 executed=0 dropped=0 unparsed=0 unparsed_names="" mismatch=0 out="" detail="" status tab other=0 skipped_out="" ocmd otag
         tab="$(printf '\t')"
         while IFS= read -r line; do
           case "$line" in
@@ -2704,6 +2952,14 @@ nodes:
               line="${line#UNPARSED*"$tab"}"
               unparsed="${line%%"$tab"*}"
               if [ "$line" != "$unparsed" ]; then unparsed_names="${line#*"$tab"}"; fi
+              continue
+              ;;
+            OTHER_STAGE*)
+              line="${line#OTHER_STAGE*"$tab"}"
+              ocmd="${line%%"$tab"*}"; otag="${line#*"$tab"}"
+              other=$((other + 1))
+              detail="${detail}SKIPPED (other-stage: $otag): $ocmd"$'\n'
+              skipped_out="${skipped_out:+$skipped_out; }SKIPPED (other-stage): $ocmd"
               continue
               ;;
             "") continue ;;
@@ -2748,7 +3004,13 @@ nodes:
         else
           status="passed"
         fi
-        printf 'GREP_DECLARED=%s\nGREP_EXECUTED=%s\nGREP_DROPPED=%s\nGREP_UNPARSED=%s\nGREP_MISMATCH=%s\nGREP_STATUS=%s\nGREP_LINE=%s\n' "$declared" "$executed" "$dropped" "$unparsed" "$mismatch" "$status" "$out"
+        if [ "$other" -gt 0 ]; then
+          if [ "$status" = "none_declared" ]; then
+            out="N/A (no grep stop conditions for this stage; $other stop(s) belong to other stages)"
+          fi
+          out="$out; $skipped_out"
+        fi
+        printf 'GREP_DECLARED=%s\nGREP_EXECUTED=%s\nGREP_DROPPED=%s\nGREP_UNPARSED=%s\nGREP_MISMATCH=%s\nGREP_OTHER_STAGE=%s\nGREP_STATUS=%s\nGREP_LINE=%s\n' "$declared" "$executed" "$dropped" "$unparsed" "$mismatch" "$other" "$status" "$out"
         if [ -n "$detail" ]; then
           printf -- '--- per-assertion detail ---\n%s' "$detail"
         fi

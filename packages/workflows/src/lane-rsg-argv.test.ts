@@ -27,17 +27,20 @@ describe('rsg-argv.sh shared tokenizer wiring', () => {
     expect(LANES).toContain('bdc-feature-development-astra.yaml');
   });
 
-  it('ships scripts/lane/rsg-argv.sh defining rsg_parse_pipeline', () => {
+  it('ships scripts/lane/rsg-argv.sh defining rsg_parse_pipeline and rsg_parse_chain', () => {
     expect(existsSync(SOURCE)).toBe(true);
     const body = readFileSync(SOURCE, 'utf-8');
     expect(body).toContain('rsg_parse_pipeline()');
+    expect(body).toContain('rsg_parse_chain()');
     expect(body).toContain("RSG_US=$'\\037'");
+    expect(body).toContain("RSG_RS=$'\\036'");
   });
 
   it('bundles scripts/lane/rsg-argv.sh verbatim for standalone and source runs', async () => {
     const { BUNDLED_LANE_SCRIPTS } = await import('./defaults/bundled-defaults');
     const source = readFileSync(SOURCE, 'utf-8').replace(/\r\n/g, '\n');
     expect(BUNDLED_LANE_SCRIPTS['rsg-argv.sh']).toBe(source);
+    expect(BUNDLED_LANE_SCRIPTS['rsg-argv.sh']).toContain('rsg_parse_chain');
   });
 
   it('every bundled bdc-feature-development lane carries the tokenizer stub', async () => {
@@ -49,8 +52,11 @@ describe('rsg-argv.sh shared tokenizer wiring', () => {
     for (const lane of bundledLanes) {
       const text = BUNDLED_WORKFLOWS[lane];
       expect(text).toContain('rsg_parse_pipeline');
+      expect(text).toContain('rsg_parse_chain');
+      expect(text).toContain('note_uncounted');
       expect(text).toContain('BDC_RSGARGV_SCRIPT');
       expect(text).not.toContain('rsg_strip_arg');
+      expect(text).not.toContain('rst_tokens_safe');
     }
   });
 
@@ -60,16 +66,18 @@ describe('rsg-argv.sh shared tokenizer wiring', () => {
   });
 
   for (const lane of LANES) {
-    it(`${lane} sources the shared tokenizer and carries no inline whitespace split`, () => {
+    it(`${lane} sources the shared tokenizer in both the rst and rsg cores and carries no inline whitespace split`, () => {
       const text = readFileSync(join(LANES_DIR, lane), 'utf-8');
       expect(
         text.split(
           'for rsgargv_candidate in "${BDC_RSGARGV_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/rsg-argv.sh}" /app/scripts/lane/rsg-argv.sh; do'
         ).length - 1
-      ).toBe(1);
-      expect(text.split('. "$RSGARGV_SCRIPT"').length - 1).toBe(1);
+      ).toBe(2);
+      expect(text.split('. "$RSGARGV_SCRIPT"').length - 1).toBe(2);
       expect(text).not.toContain('rsg_strip_arg');
       expect(text).not.toContain('rsg_tokens_safe');
+      expect(text).not.toContain('rst_tokens_safe');
+      expect(text).toContain('rsg_parse_chain');
     });
   }
 });

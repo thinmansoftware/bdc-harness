@@ -39,6 +39,19 @@ assert_contains() {
   fi
 }
 
+NAMED_FAIL_MARK=0
+named_begin() { NAMED_FAIL_MARK=$FAIL; }
+named_end() {
+  if [ "$FAIL" -eq "$NAMED_FAIL_MARK" ]; then echo "PASS: $1"; else echo "FAIL: $1"; fi
+}
+assert_rc() {
+  # assert_rc <label> <expected rc> <command...>
+  local label="$1" expected="$2" rc
+  shift 2
+  "$@" >/dev/null 2>&1; rc=$?
+  assert_eq "$label" "$expected" "$rc"
+}
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULTS="$HERE/.."
 CANONICAL_YAML="$DEFAULTS/bdc-feature-development-codex.yaml"
@@ -130,8 +143,9 @@ assert_contains "eq assertion extracted" "grep -c alpha fixture.txt${TAB}eq${TAB
 assert_contains "ge assertion extracted" "grep -c beta fixture.txt${TAB}ge${TAB}1" "$EXTRACTED"
 assert_contains "'no output' becomes eq 0" "grep -n delta fixture.txt${TAB}eq${TAB}0" "$EXTRACTED"
 assert_contains "awk assertion still extracted (dropped later, not here)" "| awk -F: \"{s+=\$2} END {print s+0}\"${TAB}eq${TAB}0" "$EXTRACTED"
-assert_contains "DECLARED counts every grep header including the one without Expected" "DECLARED${TAB}5" "$EXTRACTED"
-assert_eq "test-suite and ASCII stops are not grep assertions" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c 'bun test\|LC_ALL' || true)"
+assert_contains "DECLARED counts every grep command: the five grep headers plus the ASCII-scan stop that uses a grep command (WO-HARNESS-GREP-STOP-EXTRACTION-SILENT-WAIVE-01)" "DECLARED${TAB}6" "$EXTRACTED"
+assert_eq "test-suite stops are not grep assertions" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c 'bun test' || true)"
+assert_contains "an ASCII-scan stop that uses a grep command is a grep assertion" "LC_ALL=C grep -n \"[^ -~]\" src/a.ts${TAB}eq${TAB}0" "$EXTRACTED"
 assert_eq "header without Expected: emits no executable assertion line" "0" "$(printf '%s\n' "$EXTRACTED" | grep -c "gamma.*${TAB}eq${TAB}" || true)"
 assert_contains "header without Expected is named as unparsed" "UNPARSED${TAB}1${TAB}grep -c gamma fixture.txt" "$EXTRACTED"
 assert_eq "no grep stops -> zero unparsed and declared" "UNPARSED${TAB}0
@@ -194,9 +208,9 @@ if rsg_compare le 3 3; then PASS=$((PASS+1)); echo "PASS: le holds"; else FAIL=$
 
 echo "--- rsg_run: end to end in the fixture worktree ---"
 OUT="$(printf '%s\n' "$SPEC" | rsg_extract | rsg_run)"
-assert_contains "GREP_DECLARED=5" "GREP_DECLARED=5" "$OUT"
+assert_contains "GREP_DECLARED=6 (five grep headers plus the ASCII-scan grep)" "GREP_DECLARED=6" "$OUT"
 assert_contains "GREP_EXECUTED=3" "GREP_EXECUTED=3" "$OUT"
-assert_contains "GREP_DROPPED=1 (the awk one)" "GREP_DROPPED=1" "$OUT"
+assert_contains "GREP_DROPPED=2 (the awk one and the double-quoted ASCII scan)" "GREP_DROPPED=2" "$OUT"
 assert_contains "GREP_UNPARSED=1 (the missing expectation)" "GREP_UNPARSED=1" "$OUT"
 assert_contains "GREP_MISMATCH=0" "GREP_MISMATCH=0" "$OUT"
 assert_contains "partial execution is incomplete" "GREP_STATUS=incomplete" "$OUT"
@@ -308,7 +322,7 @@ assert_eq "bullets outside a Stop conditions section ignored" "0" "$(printf '%s\
 assert_eq "runner commands are not grep assertions" "0" "$(printf '%s\n' "$OUT" | grep -c 'node tests' || true)"
 assert_contains "DECLARED counts every backticked read-only command in the section (5), not the runner" "DECLARED${TAB}5" "$OUT"
 
-echo "--- baseline statements are not stop conditions (live false mismatch, run 3b8aea39, WO-HARNESS-AUTO-REREVIEW-REPEAT-REASON-01) ---"
+echo "--- baseline prose is NOT special any more (round 5: the baseline filter was removed; run 3b8aea39 shape) ---"
 SPEC_BASELINE='# WO-HARNESS-AUTO-REREVIEW-REPEAT-REASON-01
 
 WO Class: CODE
@@ -326,12 +340,13 @@ the fix. `grep -rn "buildRereviewReason"` returns nothing.
 Manifest v2: greps (stop 1), tests (stop 2).
 '
 OUT="$(printf '%s\n' "$SPEC_BASELINE" | rsg_extract)"
-assert_eq "the baseline paragraph grep is skipped" "0" "$(printf '%s\n' "$OUT" | grep -c 'grep -rn "buildRereviewReason"' || true)"
+assert_contains "the grep inside the baseline paragraph is now an ordinary counted line (eq 0)" "grep -rn \"buildRereviewReason\"${TAB}eq${TAB}0" "$OUT"
 assert_contains "the numbered post-fix assertion is kept (ge 1)" "grep -c \"buildRereviewReason\" packages/overseer/src/pr-review-ingest.ts${TAB}ge${TAB}1" "$OUT"
-assert_contains "DECLARED counts only the real stop condition" "DECLARED${TAB}1" "$OUT"
+assert_contains "DECLARED counts both backticked read-only commands (2)" "DECLARED${TAB}2" "$OUT"
 OUT="$(printf '## Stop conditions\n- Baseline: `grep -c x y` returns 0 before this WO.\n- `grep -c x y` returns 2 or greater\n' | rsg_extract)"
-assert_contains "single-line baseline bullet skipped, real bullet kept" "grep -c x y${TAB}ge${TAB}2" "$OUT"
-assert_contains "single-line baseline bullet not counted" "DECLARED${TAB}1" "$OUT"
+assert_contains "the baseline bullet is an ordinary counted line (eq 0)" "grep -c x y${TAB}eq${TAB}0" "$OUT"
+assert_contains "the real bullet is kept (ge 2)" "grep -c x y${TAB}ge${TAB}2" "$OUT"
+assert_contains "both bullets are declared (2)" "DECLARED${TAB}2" "$OUT"
 
 echo "--- rsg_run on bullet-style spec in a fixture worktree ---"
 TMP2="$(mktemp -d)"
@@ -348,18 +363,6 @@ rm -rf "$TMP2"
 # WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01 named tests. Each prints one
 # "PASS: <name>" line only when every assertion inside it passed.
 # ---------------------------------------------------------------------------
-NAMED_FAIL_MARK=0
-named_begin() { NAMED_FAIL_MARK=$FAIL; }
-named_end() {
-  if [ "$FAIL" -eq "$NAMED_FAIL_MARK" ]; then echo "PASS: $1"; else echo "FAIL: $1"; fi
-}
-assert_rc() {
-  # assert_rc <label> <expected rc> <command...>
-  local label="$1" expected="$2" rc
-  shift 2
-  "$@" >/dev/null 2>&1; rc=$?
-  assert_eq "$label" "$expected" "$rc"
-}
 
 echo "--- multiword_single_quoted_grep_executes ---"
 named_begin
@@ -480,6 +483,624 @@ fi
 named_end harness_grep_verdict_fixtures_match
 
 rm -rf "$TMP3" "$TMP4" "$TMP5"
+
+# ---------------------------------------------------------------------------
+# WO-HARNESS-GREP-STOP-EXTRACTION-SILENT-WAIVE-01 named tests (bdc-xo #4753, stage 1).
+# Each prints one "PASS: <name>" line only when every assertion inside it passed.
+# ---------------------------------------------------------------------------
+FIXTURE="$HERE/fixtures/stop-extract-cases.txt"
+fixture_part() {
+  # fixture_part <case name> <spec|expect>  -> that part of the case, verbatim
+  awk -v c="$1" -v part="$2" '
+    /^@@CASE / { cur = substr($0, 8); sect = "spec"; next }
+    /^@@EXPECT$/ { sect = "expect"; next }
+    /^@@END$/ { cur = ""; next }
+    cur == c && sect == part { print }
+  ' "$FIXTURE"
+}
+kv() {
+  # kv <KEY> <text>  -> the value of the first KEY=value line
+  printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -1
+}
+count_records() {
+  # count_records <text>  -> number of "<command> TAB <op> TAB <n>" records
+  printf '%s\n' "$1" | grep -c "${TAB}\(eq\|ge\|le\)${TAB}" || true
+}
+
+echo "--- descriptive_headers_are_counted ---"
+named_begin
+T1="$(printf '## 8. Stop conditions\n\nStop 1 (dashboard no longer mounts the panel):\n  grep -c a f.ts\n  Expected: 0\n\nStop 1 (dashboard no longer mounts the panel):\n  grep -c b f.ts\n  Expected: 2\n\nStop 1 (dashboard no longer mounts the panel):\n  grep -c c f.ts\n  Expected: at least 1\n' | rsg_extract)"
+assert_contains "descriptive header 1 emitted" "grep -c a f.ts${TAB}eq${TAB}0" "$T1"
+assert_contains "descriptive header 2 emitted" "grep -c b f.ts${TAB}eq${TAB}2" "$T1"
+assert_contains "descriptive header 3 emitted" "grep -c c f.ts${TAB}ge${TAB}1" "$T1"
+assert_contains "DECLARED is 3" "DECLARED${TAB}3" "$T1"
+assert_contains "UNPARSED is 0" "UNPARSED${TAB}0" "$T1"
+assert_eq "three command lines are emitted" "3" "$(count_records "$T1")"
+named_end descriptive_headers_are_counted
+
+echo "--- colon_header_form_is_counted ---"
+named_begin
+T2="$(printf '## 8. Stop conditions\n\nStop 2: route is mounted\n  grep -c route src/App.tsx\n  Expected: 1\n\n**Stop 3 (route is mounted):**\n  grep -c page src/App.tsx\n  Expected: 2\n' | rsg_extract)"
+assert_contains "colon header emitted" "grep -c route src/App.tsx${TAB}eq${TAB}1" "$T2"
+assert_contains "bold header emitted" "grep -c page src/App.tsx${TAB}eq${TAB}2" "$T2"
+assert_contains "DECLARED is 2" "DECLARED${TAB}2" "$T2"
+assert_eq "two lines emitted" "2" "$(count_records "$T2")"
+named_end colon_header_form_is_counted
+
+echo "--- multi_command_stop_keeps_every_command ---"
+named_begin
+T3="$(fixture_part multi_command_stop spec | rsg_extract)"
+assert_eq "emitted lines are in order" "grep -c one a.ts${TAB}eq${TAB}1
+grep -c two b.ts${TAB}eq${TAB}2
+grep -c three c.ts${TAB}ge${TAB}3
+grep -c five e.ts${TAB}eq${TAB}5" "$(printf '%s\n' "$T3" | grep "${TAB}\(eq\|ge\|le\)${TAB}")"
+assert_contains "the fourth command with no Expected is named in UNPARSED" "UNPARSED${TAB}1${TAB}grep -c four d.ts" "$T3"
+assert_contains "DECLARED counts all five commands" "DECLARED${TAB}5" "$T3"
+T3B="$(printf '## 8. Stop conditions\n\nStop 2 (three):\n  grep -c a f\n  Expected: 1\n  grep -c b f\n  Expected: 2\n  grep -c c f\n  Expected: 3\n' | rsg_extract)"
+assert_contains "three commands in one block: DECLARED 3" "DECLARED${TAB}3" "$T3B"
+assert_contains "three commands in one block: UNPARSED 0" "UNPARSED${TAB}0" "$T3B"
+named_end multi_command_stop_keeps_every_command
+
+echo "--- cgc_section8_fixture_counts_all_commands ---"
+named_begin
+T4="$(fixture_part cgc_section8 spec | rsg_extract)"
+assert_contains "CGC Section 8: DECLARED 16" "DECLARED${TAB}16" "$T4"
+assert_contains "CGC Section 8: UNPARSED 0" "UNPARSED${TAB}0" "$T4"
+assert_eq "CGC Section 8: 16 emitted lines" "16" "$(count_records "$T4")"
+assert_eq "CGC Section 8: the bun run test stop is test-owned and not counted" "0" "$(printf '%s\n' "$T4" | grep -c 'bun run test' || true)"
+TMP_EMPTY="$(mktemp -d)"
+T4R="$(cd "$TMP_EMPTY" && fixture_part cgc_section8 spec | rsg_extract | rsg_run)"
+rm -rf "$TMP_EMPTY"
+assert_eq "CGC Section 8: GREP_DECLARED=16" "16" "$(kv GREP_DECLARED "$T4R")"
+assert_eq "CGC Section 8: GREP_STATUS is not none_declared" "1" "$([ "$(kv GREP_STATUS "$T4R")" != "none_declared" ] && echo 1 || echo 0)"
+assert_contains "CGC Section 8: node -e is listed as DROPPED" "DROPPED (not on read-only allowlist; not executed): node -e" "$T4R"
+assert_contains "CGC Section 8: git diff is listed as DROPPED" "DROPPED (not on read-only allowlist; not executed): git diff" "$T4R"
+assert_contains "CGC Section 8: bunx tsc is listed as DROPPED" "DROPPED (not on read-only allowlist; not executed): bunx tsc" "$T4R"
+assert_contains "CGC Section 8: bunx playwright is listed as DROPPED" "DROPPED (not on read-only allowlist; not executed): bunx playwright" "$T4R"
+named_end cgc_section8_fixture_counts_all_commands
+
+echo "--- header_without_command_is_declared_unparsed ---"
+named_begin
+T5="$(printf '## 8. Stop conditions\n\nStop 1 (staging works):\n  Open the staging page and confirm it loads.\n' | rsg_extract)"
+assert_contains "header without a command: DECLARED 1" "DECLARED${TAB}1" "$T5"
+assert_contains "header without a command: UNPARSED 1 names the header text" "UNPARSED${TAB}1${TAB}Stop 1 (staging works):" "$T5"
+assert_eq "header without a command: no assertion line is emitted" "0" "$(count_records "$T5")"
+named_end header_without_command_is_declared_unparsed
+
+echo "--- test_owned_and_foreign_blocks_are_not_counted ---"
+named_begin
+SPEC_T6='## 8. Stop conditions
+
+Stop 1 (test suite, stage 1):
+  bun test x
+  Expected: 3 passing
+
+Stop 2 (unit tests):
+  node tests/a.js
+  Expected: 4 passing
+
+Stop 3 (runtime proof):
+  ssh hetzner-prod "docker exec app grep -c x /app/y"
+  Expected: at least 1
+'
+T6="$(printf '%s\n' "$SPEC_T6" | rsg_extract)"
+assert_contains "test-owned and foreign blocks: DECLARED 0" "DECLARED${TAB}0" "$T6"
+assert_contains "test-owned and foreign blocks: UNPARSED 0" "UNPARSED${TAB}0" "$T6"
+T6R="$(printf '%s\n' "$SPEC_T6" | rsg_extract | rsg_run)"
+assert_eq "a spec with no grep-class stop is still truthfully none_declared" "none_declared" "$(kv GREP_STATUS "$T6R")"
+named_end test_owned_and_foreign_blocks_are_not_counted
+
+echo "--- none_declared_with_uncounted_commands_fails ---"
+named_begin
+MEC_CORE_T="$(extract_core "$CANONICAL_YAML" mec)"
+eval "$MEC_CORE_T"
+MEC_MANIFEST='WO: WO-X
+Tests: 3/3 (bun test x)
+Grep assertions: N/A (spec declares no grep stop conditions)'
+mec_for() {
+  # mec_for <rsg_run output>  -> "<rc>|<stderr>"
+  local o="$1" err rc
+  err="$(mktemp)"
+  printf '%s\n' "$MEC_MANIFEST" | mec_check PROCEED CODE passed "$(kv GREP_DECLARED "$o")" "$(kv GREP_STATUS "$o")" 0 "$(kv GREP_EXECUTED "$o")" "$(kv GREP_DROPPED "$o")" "$(kv GREP_UNPARSED "$o")" "$(kv GREP_MISMATCH "$o")" "" >/dev/null 2>"$err"; rc=$?
+  printf '%s|%s' "$rc" "$(cat "$err")"
+  rm -f "$err"
+}
+T7R="$(printf '## 8. Stop conditions\n\ngrep -c x f.ts\nnode -e x\n' | rsg_extract | rsg_run)"
+assert_eq "bare command lines outside any block: GREP_STATUS all_dropped" "all_dropped" "$(kv GREP_STATUS "$T7R")"
+assert_eq "bare command lines: GREP_DECLARED 2" "2" "$(kv GREP_DECLARED "$T7R")"
+assert_eq "bare command lines: GREP_UNPARSED 2" "2" "$(kv GREP_UNPARSED "$T7R")"
+T7M="$(mec_for "$T7R")"
+assert_eq "mec_check returns 1 on the uncounted command lines" "1" "${T7M%%|*}"
+assert_contains "mec_check prints SPEC_DEFECT" "SPEC_DEFECT:" "$T7M"
+T7K="$(printf '## 8. Stop conditions\n\n- `node -e x` exits 0\n' | rsg_extract | rsg_run)"
+assert_eq "a backticked node line alone stays none_declared" "none_declared" "$(kv GREP_STATUS "$T7K")"
+T7KM="$(mec_for "$T7K")"
+assert_eq "a backticked node line alone: mec_check returns 0" "0" "${T7KM%%|*}"
+T7P="$(printf '## 8. Stop conditions\n\nStop 1 (grep assertion):\n  grep -c alpha fixture.txt\n  Expected: 1\n\ngrep -c stray f.ts\n' | rsg_extract)"
+assert_contains "a stray bare command after a block is part of that block and unparsed" "UNPARSED${TAB}1${TAB}grep -c stray f.ts" "$T7P"
+named_end none_declared_with_uncounted_commands_fails
+
+echo "--- existing_extraction_behavior_preserved ---"
+named_begin
+# The pre-existing extraction assertions run above and below this block unchanged except
+# the rewritten ones named in the WO; this block re-pins the shapes the WO lists.
+E1="$(printf 'Stop 2 (test suite):\n  bun test\n  Expected: ok\n' | rsg_extract)"
+assert_eq "a test-suite-only spec stays none_declared (extract)" "UNPARSED${TAB}0
+DECLARED${TAB}0" "$E1"
+assert_eq "a test-suite-only spec stays none_declared (run)" "none_declared" "$(kv GREP_STATUS "$(printf '%s\n' "$E1" | rsg_run)")"
+E2="$(printf 'Stop 1 (grep assertion):\n  grep -rn "a" src \\\n    | wc -l\n  Expected: 4\n' | rsg_extract)"
+assert_contains "backslash continuation still joins" "grep -rn \"a\" src | wc -l${TAB}eq${TAB}4" "$E2"
+E3="$(printf 'Stop 1 (grep assertion):\n  grep -c gamma f\n' | rsg_extract)"
+assert_contains "legacy header without Expected is still declared and unparsed" "UNPARSED${TAB}1${TAB}grep -c gamma f" "$E3"
+E4="$(printf '## Stop conditions\n- Baseline: `grep -c x y` returns 0 before this WO.\n- `grep -c x y` returns 2 or greater\n' | rsg_extract)"
+assert_contains "second shape still counts the real bullet (baseline prose is no longer special)" "grep -c x y${TAB}ge${TAB}2" "$E4"
+assert_contains "second shape declares both bullets (the baseline filter was removed in round 5)" "DECLARED${TAB}2" "$E4"
+E5="$(printf 'Stop 2 (assert the log line):\n  awk x y\n  Expected: 1\n' | rsg_extract)"
+assert_contains "legacy assert header counts any command-like line" "awk x y${TAB}eq${TAB}1" "$E5"
+named_end existing_extraction_behavior_preserved
+
+echo "--- all_lanes_share_extraction_core ---"
+named_begin
+LANE_COUNT2=0
+for lane in $LANES; do LANE_COUNT2=$((LANE_COUNT2 + 1)); done
+assert_eq "LANES names 13 lanes" "13" "$LANE_COUNT2"
+assert_contains "LANES includes astra" "bdc-feature-development-astra.yaml" "$LANES"
+RST_REF_SUM="$(extract_core "$CANONICAL_YAML" rst | cksum)"
+for lane in $LANES; do
+  LANE_CORE2="$(extract_core "$DEFAULTS/$lane" rsg)"
+  assert_eq "rsg core byte-identical to codex: $lane" "$RSG_CORE" "$LANE_CORE2"
+  assert_contains "rsg core carries note_uncounted: $lane" "note_uncounted" "$LANE_CORE2"
+  assert_eq "rsg core has no note_unparsed left: $lane" "0" "$(printf '%s\n' "$LANE_CORE2" | grep -c 'note_unparsed' || true)"
+  assert_eq "rst core byte-identical to codex: $lane" "$RST_REF_SUM" "$(extract_core "$DEFAULTS/$lane" rst | cksum)"
+done
+named_end all_lanes_share_extraction_core
+
+echo "--- shared_fixture_cases_match_in_harness ---"
+named_begin
+CASE_N=0
+if [ ! -f "$FIXTURE" ]; then
+  FAIL=$((FAIL + 1)); echo "FAIL: shared extraction fixture missing: $FIXTURE"
+else
+  for cname in $(sed -n 's/^@@CASE //p' "$FIXTURE"); do
+    CASE_N=$((CASE_N + 1))
+    assert_eq "fixture case $cname" "$(fixture_part "$cname" expect)" "$(fixture_part "$cname" spec | ( unset RSG_STAGE_REPO; export GIT_DIR=/nonexistent; rsg_extract ))"
+  done
+  if [ "$CASE_N" -ge 12 ]; then PASS=$((PASS + 1)); echo "PASS: fixture has at least 12 cases ($CASE_N)"; else FAIL=$((FAIL + 1)); echo "FAIL: fixture case count: $CASE_N"; fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "stop-extract-cases.txt sha256: $(sha256sum "$FIXTURE" | cut -d' ' -f1)"
+  else
+    echo "stop-extract-cases.txt sha256: $(shasum -a 256 "$FIXTURE" | cut -d' ' -f1)"
+  fi
+fi
+named_end shared_fixture_cases_match_in_harness
+
+echo "--- multi_file_grep_count_is_summed ---"
+named_begin
+TMPM="$(mktemp -d)"
+printf 'x\n' > "$TMPM/a.js"; : > "$TMPM/b.js"; : > "$TMPM/c.js"; : > "$TMPM/d.js"
+assert_eq "4-file grep -c with counts 0,0,0,0 gives 0" "0" "$(cd "$TMPM" && rsg_observe 'grep -c zzz a.js b.js c.js d.js')"
+printf 'k\n' > "$TMPM/a.js"; : > "$TMPM/b.js"; printf 'k\nk\n' > "$TMPM/c.js"; : > "$TMPM/d.js"
+assert_eq "4-file grep -c with counts 1,0,2,0 gives 3" "3" "$(cd "$TMPM" && rsg_observe 'grep -c k a.js b.js c.js d.js')"
+assert_eq "4-file grep -c -r style flag cluster is summed" "3" "$(cd "$TMPM" && rsg_observe 'grep -rc k a.js b.js c.js d.js')"
+assert_eq "a single-file grep -c is unchanged" "2" "$(cd "$TMPM" && rsg_observe 'grep -c k c.js')"
+printf '5:123\n7:9\n' > "$TMPM/n.txt"
+assert_eq "grep -n output that looks like path:digits is NOT summed (no -c)" "2" "$(cd "$TMPM" && rsg_observe 'grep -n . n.txt')"
+OUTM="$(cd "$TMPM" && printf 'Stop 1 (grep assertion):\n  grep -c k a.js b.js c.js d.js\n  Expected: 3\n' | rsg_extract | rsg_run)"
+assert_contains "rsg_run reports OK with the summed count" "OK: grep -c k a.js b.js c.js d.js => 3 (expected eq 3)" "$OUTM"
+assert_eq "rsg_run status passed" "passed" "$(kv GREP_STATUS "$OUTM")"
+rm -rf "$TMPM"
+named_end multi_file_grep_count_is_summed
+
+echo "--- other_stage_stops_are_skipped_visibly ---"
+named_begin
+TMPS="$(mktemp -d)"
+printf 'alpha\nalpha\n' > "$TMPS/fixture.txt"
+SPEC_2STAGE='# WO-X
+
+stages:
+  - repo: thinmansoftware/bdc-harness
+    what: harness side
+  - repo: thinmansoftware/bdc-xo
+    what: validator side
+
+## 8. Stop conditions (CI-executable)
+
+Stop 1 (grep assertion, stage 1):
+  grep -c alpha fixture.txt
+  Expected: 2
+
+Stop 2 (grep assertion, stage 2):
+  grep -c check22 scripts/cauldron/validate-wo-spec.sh
+  Expected: at least 1
+
+Stop 3 (test suite, stage 2):
+  bash scripts/cauldron/tests/t.sh
+  Expected: exit 0
+
+Stop 4 (grep assertion, repo thinmansoftware/bdc-xo):
+  grep -c note scripts/cauldron/lib/x.awk
+  Expected: at least 1
+
+Stop 5 (grep assertion, untagged):
+  grep -c alpha fixture.txt
+  Expected: 2
+
+Stop 6 (grep assertion, stage 9):
+  grep -c alpha fixture.txt
+  Expected: 2
+'
+# current repo = stage 1 (bdc-harness)
+OS1="$(cd "$TMPS" && printf '%s\n' "$SPEC_2STAGE" | RSG_STAGE_REPO=thinmansoftware/bdc-harness rsg_extract)"
+assert_contains "stage 2 stop is emitted as OTHER_STAGE with its tag" "OTHER_STAGE${TAB}grep -c check22 scripts/cauldron/validate-wo-spec.sh${TAB}stage repo thinmansoftware/bdc-xo" "$OS1"
+assert_contains "repo-tagged stop is emitted as OTHER_STAGE" "OTHER_STAGE${TAB}grep -c note scripts/cauldron/lib/x.awk${TAB}stage repo thinmansoftware/bdc-xo" "$OS1"
+assert_contains "DECLARED counts only this stage plus untagged plus unknown-stage stops (3)" "DECLARED${TAB}3" "$OS1"
+OS1R="$(cd "$TMPS" && printf '%s\n' "$SPEC_2STAGE" | RSG_STAGE_REPO=thinmansoftware/bdc-harness rsg_extract | rsg_run)"
+assert_eq "stage 1 run: GREP_DECLARED=3" "3" "$(kv GREP_DECLARED "$OS1R")"
+assert_eq "stage 1 run: GREP_EXECUTED=3" "3" "$(kv GREP_EXECUTED "$OS1R")"
+assert_eq "stage 1 run: GREP_OTHER_STAGE=2" "2" "$(kv GREP_OTHER_STAGE "$OS1R")"
+assert_eq "stage 1 run: nothing dropped" "0" "$(kv GREP_DROPPED "$OS1R")"
+assert_eq "stage 1 run: status passed" "passed" "$(kv GREP_STATUS "$OS1R")"
+assert_contains "stage 1 run: skipped stop is visible in GREP_LINE" "SKIPPED (other-stage): grep -c check22 scripts/cauldron/validate-wo-spec.sh" "$OS1R"
+assert_contains "stage 1 run: skipped stop is visible in the detail with its tag" "SKIPPED (other-stage: stage repo thinmansoftware/bdc-xo): grep -c note scripts/cauldron/lib/x.awk" "$OS1R"
+# current repo = stage 2 (bdc-xo): the stage 1 stop is the skipped one
+OS2="$(cd "$TMPS" && printf '%s\n' "$SPEC_2STAGE" | RSG_STAGE_REPO=thinmansoftware/bdc-xo rsg_extract)"
+assert_contains "stage 1 stop is OTHER_STAGE when running as stage 2" "OTHER_STAGE${TAB}grep -c alpha fixture.txt${TAB}stage repo thinmansoftware/bdc-harness" "$OS2"
+assert_contains "stage 2 stops are declared when running as stage 2 (check22, note, untagged, stage 9)" "DECLARED${TAB}4" "$OS2"
+# a stage-only spec with nothing for this stage stays visible
+OS3R="$(cd "$TMPS" && printf '%s\n' "$SPEC_2STAGE" | grep -v 'Stop [3456]' | RSG_STAGE_REPO=thinmansoftware/bdc-other rsg_extract | rsg_run)"
+assert_contains "unknown current repo still skips by tag, and says so" "stop(s) belong to other stages" "$OS3R"
+# no known current repo (no git, no override): nothing is scoped, every stop counts
+OS4="$(cd "$TMPS" && unset RSG_STAGE_REPO && export GIT_DIR=/nonexistent && printf '%s\n' "$SPEC_2STAGE" | rsg_extract)"
+assert_eq "no current repo: no OTHER_STAGE record" "0" "$(printf '%s\n' "$OS4" | grep -c '^OTHER_STAGE' || true)"
+assert_contains "no current repo: every grep stop is declared (5)" "DECLARED${TAB}5" "$OS4"
+rm -rf "$TMPS"
+named_end other_stage_stops_are_skipped_visibly
+
+echo "--- backticked_command_with_separate_expected_is_one_assertion ---"
+named_begin
+R2A="$(printf '## 8. Stop conditions\n\nStop 1 (route check):\n  `grep -c x f`\n  Expected: 2\n' | rsg_extract)"
+assert_contains "backticked command plus a separate Expected: 2 is executable with eq 2" "grep -c x f${TAB}eq${TAB}2" "$R2A"
+assert_contains "UNPARSED is 0" "UNPARSED${TAB}0" "$R2A"
+assert_contains "DECLARED is 1" "DECLARED${TAB}1" "$R2A"
+R2B="$(printf '## 8. Stop conditions\n\nStop 1 (route check):\n- `grep -c x y` returns 2 or greater\n' | rsg_extract)"
+assert_contains "an inline expectation on the same line still uses the inline path" "grep -c x y${TAB}ge${TAB}2" "$R2B"
+named_end backticked_command_with_separate_expected_is_one_assertion
+
+echo "--- foreign_command_closes_a_pending_counted_command ---"
+named_begin
+R2C="$(printf '## 8. Stop conditions\n\nStop 1 (mixed block):\n  grep -c x f\n  curl -s https://example.test/health\n  Expected: 0\n' | rsg_extract)"
+assert_eq "no grep assertion with eq 0 is emitted" "0" "$(printf '%s\n' "$R2C" | grep -c "^grep -c x f${TAB}" || true)"
+assert_contains "the grep is declared and unparsed" "UNPARSED${TAB}1${TAB}grep -c x f" "$R2C"
+assert_contains "DECLARED is 1" "DECLARED${TAB}1" "$R2C"
+R2CR="$(printf '## 8. Stop conditions\n\nStop 1 (mixed block):\n  grep -c x f\n  curl -s https://example.test/health\n  Expected: 0\n' | rsg_extract | rsg_run)"
+assert_eq "such a stop can no longer pass: nothing executed, status all_dropped" "all_dropped" "$(kv GREP_STATUS "$R2CR")"
+named_end foreign_command_closes_a_pending_counted_command
+
+echo "--- counted_then_foreign_each_keep_their_own_expected ---"
+named_begin
+R2D="$(printf '## 8. Stop conditions\n\nStop 1 (mixed block):\n  grep -c x f\n  Expected: 1\n  curl -s https://example.test/health\n  Expected: 200\n' | rsg_extract)"
+assert_contains "the grep is paired with its own Expected" "grep -c x f${TAB}eq${TAB}1" "$R2D"
+assert_eq "the curl is ignored (no record for it)" "0" "$(printf '%s\n' "$R2D" | grep -c 'curl' || true)"
+assert_contains "UNPARSED is 0" "UNPARSED${TAB}0" "$R2D"
+assert_contains "DECLARED is 1" "DECLARED${TAB}1" "$R2D"
+named_end counted_then_foreign_each_keep_their_own_expected
+
+# ---------------------------------------------------------------------------
+# Round 3 (Overseer CHANGES_REQUESTED at e321afc1, two majors): a command word ends at a space
+# OR a tab, and EVERY command start (counted, foreign, inline backticked) closes the pending
+# command as unparsed through the one begin_command function.
+# ---------------------------------------------------------------------------
+echo "--- tab_separated_command_is_counted ---"
+named_begin
+TTAB="$(cd "$HERE" && printf '## 8. Stop conditions\n\nStop 1 (tabbed):\n  grep\t-c x f\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "tab-separated grep is emitted (tab normalised to a space) with eq 1" "grep -c x f${TAB}eq${TAB}1" "$TTAB"
+assert_contains "DECLARED is 1" "DECLARED${TAB}1" "$TTAB"
+assert_contains "UNPARSED is 0" "UNPARSED${TAB}0" "$TTAB"
+TTMP="$(mktemp -d)"
+printf 'x\n' > "$TTMP/f"
+TTABR="$(cd "$TTMP" && printf '## 8. Stop conditions\n\nStop 1 (tabbed):\n  grep\t-c x f\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract | rsg_run)"
+assert_eq "tab-separated grep: GREP_DECLARED=1" "1" "$(kv GREP_DECLARED "$TTABR")"
+assert_eq "tab-separated grep is executed" "1" "$(kv GREP_EXECUTED "$TTABR")"
+assert_eq "tab-separated grep passes" "passed" "$(kv GREP_STATUS "$TTABR")"
+for form in 'LC_ALL=C\tgrep -c x f' 'cd\t.\t&&\tgrep -c x f' 'test\t-f f' '- grep\t-c x f' '`grep\t-c x f`'; do
+  TF="$(printf "## 8. Stop conditions\n\nStop 1 (tabbed):\n  $form\n  Expected: 1\n" | RSG_STAGE_REPO=x/y rsg_extract)"
+  assert_contains "tab form is counted: $form" "DECLARED${TAB}1" "$TF"
+done
+TBK="$(printf '## 8. Stop conditions\n\ngrep\t-c x f.ts\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "a bare tab-separated command outside a block is the uncounted backstop" "UNPARSED${TAB}1${TAB}grep -c x f.ts" "$TBK"
+rm -rf "$TTMP"
+named_end tab_separated_command_is_counted
+
+echo "--- inline_command_closes_a_pending_command ---"
+named_begin
+INL="$(printf '## 8. Stop conditions\n\nStop 1 (inline after pending):\n  grep -c missing f\n- `grep -c x f` returns 1\n  Expected: 0\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "the earlier pending command is UNPARSED" "UNPARSED${TAB}1${TAB}grep -c missing f" "$INL"
+assert_contains "the inline command keeps its own inline expectation" "grep -c x f${TAB}eq${TAB}1" "$INL"
+assert_eq "the final Expected: 0 is not paired with the earlier command" "0" "$(printf '%s\n' "$INL" | grep -c "grep -c missing f${TAB}" || true)"
+assert_contains "DECLARED is 2" "DECLARED${TAB}2" "$INL"
+INL2="$(printf '## 8. Stop conditions\n\nStop 1 (two inlines):\n  grep -c a f\n- `grep -c b f` returns 2\n- `grep -c c f`\n  Expected: 3\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "a backticked command with no inline expectation pairs with the next Expected" "grep -c c f${TAB}eq${TAB}3" "$INL2"
+assert_contains "and the first pending grep is unparsed" "UNPARSED${TAB}1${TAB}grep -c a f" "$INL2"
+named_end inline_command_closes_a_pending_command
+
+# ---------------------------------------------------------------------------
+# Round 4 (Overseer CHANGES_REQUESTED at aa9950d1, rescoped to fail-closed pairing): inside a
+# stop block a pending counted command is closed ONLY by its immediately following Expected
+# line (blank lines between them are allowed); ANY other non-blank line closes it as UNPARSED.
+# ---------------------------------------------------------------------------
+echo "--- env_prefixed_foreign_closes_pending ---"
+named_begin
+ENVF="$(printf '## 8. Stop conditions\n\nStop 1 (env foreign):\n  grep -c missing /dev/null\n  LC_ALL=C curl -s https://example.test/health\n  Expected: 0\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "the grep is declared and unparsed" "UNPARSED${TAB}1${TAB}grep -c missing /dev/null" "$ENVF"
+assert_eq "no grep assertion is emitted" "0" "$(count_records "$ENVF")"
+assert_contains "DECLARED is 1" "DECLARED${TAB}1" "$ENVF"
+ENVFR="$(cd "$HERE" && printf '## 8. Stop conditions\n\nStop 1 (env foreign):\n  grep -c missing /dev/null\n  LC_ALL=C curl -s https://example.test/health\n  Expected: 0\n' | RSG_STAGE_REPO=x/y rsg_extract | rsg_run)"
+assert_eq "the stop can no longer pass (nothing executed)" "all_dropped" "$(kv GREP_STATUS "$ENVFR")"
+for pre in 'FOO=1 BAR=2 ssh host true' 'cd sub && curl -s u' 'sudo -n docker ps' 'env X=1 gh pr view'; do
+  EP="$(printf "## 8. Stop conditions\n\nStop 1 (foreign):\n  grep -c x f\n  $pre\n  Expected: 0\n" | RSG_STAGE_REPO=x/y rsg_extract)"
+  assert_eq "foreign line closes the pending grep: $pre" "0" "$(count_records "$EP")"
+done
+named_end env_prefixed_foreign_closes_pending
+
+echo "--- any_nonblank_line_closes_pending ---"
+named_begin
+for mid in '  (run from the repo root)' '- a bullet note' '  `curl -s https://example.test/health`' '  1. numbered note' '  **bold note**' '  # a comment-looking line' '  cd sub'; do
+  NB="$(printf '## 8. Stop conditions\n\nStop 1 (closed by a line):\n  grep -c x f\n%s\n  Expected: 1\n' "$mid" | RSG_STAGE_REPO=x/y rsg_extract)"
+  assert_contains "the grep is unparsed when this line follows it: $mid" "UNPARSED${TAB}1${TAB}grep -c x f" "$NB"
+  assert_eq "and the Expected pairs with nothing: $mid" "0" "$(count_records "$NB")"
+done
+NBH="$(printf '## 8. Stop conditions\n\nStop 1 (closed by the next header):\n  grep -c x f\n\nStop 2 (next):\n  grep -c y f\n  Expected: 2\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "a following header closes the pending command" "UNPARSED${TAB}1${TAB}grep -c x f" "$NBH"
+assert_contains "and the next block pairs normally" "grep -c y f${TAB}eq${TAB}2" "$NBH"
+named_end any_nonblank_line_closes_pending
+
+echo "--- blank_lines_between_command_and_expected_pair ---"
+named_begin
+BLK="$(printf '## 8. Stop conditions\n\nStop 1 (blank lines):\n  grep -c x f\n\n\n   \n  Expected: 2\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "blank and whitespace-only lines between command and Expected still pair" "grep -c x f${TAB}eq${TAB}2" "$BLK"
+assert_contains "UNPARSED is 0" "UNPARSED${TAB}0" "$BLK"
+BLKF="$(printf '## 8. Stop conditions\n\nStop 1 (fenced):\n```\n  grep -c x f\n```\n  Expected: 2\n```\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "a command wrapped in a code fence still pairs (fence lines are not content)" "grep -c x f${TAB}eq${TAB}2" "$BLKF"
+named_end blank_lines_between_command_and_expected_pair
+
+echo "--- earlier_round_repros_still_hold ---"
+named_begin
+RR1="$(printf '## 8. Stop conditions\n\nStop 1 (route check):\n  `grep -c x f`\n  Expected: 2\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "round 1: backticked command plus a separate Expected is one assertion" "grep -c x f${TAB}eq${TAB}2" "$RR1"
+RR1B="$(printf '## 8. Stop conditions\n\nStop 1 (mixed):\n  grep -c x f\n  curl -s https://example.test/health\n  Expected: 0\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "round 1: grep, curl, Expected: 0 leaves the grep unparsed" "UNPARSED${TAB}1${TAB}grep -c x f" "$RR1B"
+RR2="$(printf '## 8. Stop conditions\n\nStop 1 (tabbed):\n  grep\t-c x f\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "round 2: a tab-separated grep is counted" "grep -c x f${TAB}eq${TAB}1" "$RR2"
+RR2B="$(printf '## 8. Stop conditions\n\nStop 1 (inline):\n  grep -c missing f\n- `grep -c x f` returns 1\n  Expected: 0\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "round 3: an inline command closes the earlier pending command" "UNPARSED${TAB}1${TAB}grep -c missing f" "$RR2B"
+assert_contains "round 3: the inline command keeps its own expectation" "grep -c x f${TAB}eq${TAB}1" "$RR2B"
+named_end earlier_round_repros_still_hold
+
+# ---------------------------------------------------------------------------
+# Round 5 (Overseer CHANGES_REQUESTED at 7b30ac9e; acting XO ruling fence 283): the baseline
+# filter is REMOVED from the rsg core. It scanned the whole line, so a real assertion whose
+# command merely contained the word "baseline" was silently waived. Baseline prose is just
+# prose: inside a stop block it closes a pending command as UNPARSED like any other
+# non-blank non-Expected line.
+# ---------------------------------------------------------------------------
+echo "--- baseline_word_in_command_args_is_run ---"
+named_begin
+BLT="$(mktemp -d)"
+B1="$(printf '## 8. Stop conditions\n\nStop 1 (route check):\n  grep -c baseline /dev/null\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "DECLARED is 1 (the assertion is not waived)" "DECLARED${TAB}1" "$B1"
+assert_contains "the command is emitted with its expectation" "grep -c baseline /dev/null${TAB}eq${TAB}1" "$B1"
+B1R="$(cd "$BLT" && printf '## 8. Stop conditions\n\nStop 1 (route check):\n  grep -c baseline /dev/null\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract | rsg_run)"
+assert_eq "GREP_DECLARED=1" "1" "$(kv GREP_DECLARED "$B1R")"
+assert_eq "the assertion is EXECUTED" "1" "$(kv GREP_EXECUTED "$B1R")"
+assert_eq "and it FAILS: the actual count is 0, not 1" "mismatch" "$(kv GREP_STATUS "$B1R")"
+assert_contains "the observed count is 0" "MISMATCH: grep -c baseline /dev/null => 0 (expected eq 1)" "$B1R"
+B1Q="$(printf '## 8. Stop conditions\n\nStop 1 (route check):\n  `grep -c baseline /dev/null`\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "the backticked form is counted too" "grep -c baseline /dev/null${TAB}eq${TAB}1" "$B1Q"
+B2="$(printf '## 8. Stop conditions\n\nStop 1 (route check):\n- `grep -c baseline f` returns 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "an inline command with baseline in its arguments is counted" "grep -c baseline f${TAB}eq${TAB}1" "$B2"
+B3="$(printf '## 8. Stop conditions\n\n- `grep -c baseline f` returns 1\n- `grep -c before-the-fix f` returns 2\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "outside a block the second shape counts it" "grep -c baseline f${TAB}eq${TAB}1" "$B3"
+assert_contains "and so does a before-the-fix looking argument" "grep -c before-the-fix f${TAB}eq${TAB}2" "$B3"
+rm -rf "$BLT"
+named_end baseline_word_in_command_args_is_run
+
+echo "--- baseline_prose_closes_pending_as_unparsed ---"
+named_begin
+BP1="$(printf '## 8. Stop conditions\n\nStop 1 (x):\n  grep -c x y\n  Baseline: this returned 0 before this WO.\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "the pending command is UNPARSED" "UNPARSED${TAB}1${TAB}grep -c x y" "$BP1"
+assert_eq "the Expected pairs with nothing" "0" "$(count_records "$BP1")"
+for lab in 'Baseline (before): 2' '(baseline 2)' 'Baseline on untouched tree: scenario 1 fails' 'before the fix this was 0'; do
+  BPL="$(printf '## 8. Stop conditions\n\nStop 1 (x):\n  grep -c x y\n  %s\n  Expected: 1\n' "$lab" | RSG_STAGE_REPO=x/y rsg_extract)"
+  assert_contains "baseline-looking line closes the pending command: $lab" "UNPARSED${TAB}1${TAB}grep -c x y" "$BPL"
+done
+BP2="$(printf '## 8. Stop conditions\n\nStop 1 (x):\n  Baseline: nothing yet\n  grep -c x y\n  Expected: 2\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "baseline prose before a command does not hide the command" "grep -c x y${TAB}eq${TAB}2" "$BP2"
+named_end baseline_prose_closes_pending_as_unparsed
+
+# ---------------------------------------------------------------------------
+# Round 6 (Overseer CHANGES_REQUESTED at 3a964c78): the stage list was deduplicated before
+# ordinal stage tags were resolved, so repeated repositories shifted every later stage and
+# a stage's own assertions were skipped as another stage's. The list now keeps EVERY entry of
+# the spec's first "stages:" block, in order; stage N is entry N; an unresolvable tag is
+# counted (fail closed), never skipped.
+# ---------------------------------------------------------------------------
+echo "--- repeated_repo_stages_keep_ordinals ---"
+named_begin
+RS_SPEC='# WO-X
+
+stages:
+  - repo: org/a
+    what: one
+  - repo: org/a
+    what: two
+  - repo: org/b
+    what: three
+
+## 8. Stop conditions (CI-executable)
+
+Stop 1 (grep assertion, stage 1):
+  grep -c alpha f.txt
+  Expected: 1
+
+Stop 2 (grep assertion, stage 2):
+  grep -c needle f.txt
+  Expected: 1
+
+Stop 3 (grep assertion, stage 3):
+  grep -c alpha f.txt
+  Expected: 1
+'
+RST="$(mktemp -d)"
+printf 'alpha\n' > "$RST/f.txt"
+RS_A="$(cd "$RST" && printf '%s\n' "$RS_SPEC" | RSG_STAGE_REPO=org/a rsg_extract)"
+assert_contains "running in org/a: the stage 2 grep is declared (not shifted onto org/b)" "grep -c needle f.txt${TAB}eq${TAB}1" "$RS_A"
+assert_contains "running in org/a: stages 1 and 2 are declared" "DECLARED${TAB}2" "$RS_A"
+assert_contains "running in org/a: the stage 3 grep is skipped visibly as other-stage" "OTHER_STAGE${TAB}grep -c alpha f.txt${TAB}stage repo org/b" "$RS_A"
+RS_AR="$(cd "$RST" && printf '%s\n' "$RS_SPEC" | RSG_STAGE_REPO=org/a rsg_extract | rsg_run 2>/dev/null)"
+assert_eq "running in org/a: both declared greps are executed" "2" "$(kv GREP_EXECUTED "$RS_AR")"
+assert_eq "running in org/a: the stage 2 grep FAILS as it should (needle is absent)" "mismatch" "$(kv GREP_STATUS "$RS_AR")"
+assert_contains "running in org/a: the failure names the stage 2 command" "MISMATCH: grep -c needle f.txt => 0 (expected eq 1)" "$RS_AR"
+assert_eq "running in org/a: one stop is skipped as other-stage" "1" "$(kv GREP_OTHER_STAGE "$RS_AR")"
+RS_B="$(cd "$RST" && printf '%s\n' "$RS_SPEC" | RSG_STAGE_REPO=org/b rsg_extract)"
+assert_contains "running in org/b: only the stage 3 grep is declared" "DECLARED${TAB}1" "$RS_B"
+assert_eq "running in org/b: stages 1 and 2 are both skipped as other-stage" "2" "$(printf '%s\n' "$RS_B" | grep -c '^OTHER_STAGE' || true)"
+RS_BR="$(cd "$RST" && printf '%s\n' "$RS_SPEC" | RSG_STAGE_REPO=org/b rsg_extract | rsg_run 2>/dev/null)"
+assert_eq "running in org/b: the stage 3 grep is executed and passes" "passed" "$(kv GREP_STATUS "$RS_BR")"
+assert_eq "running in org/b: executed 1" "1" "$(kv GREP_EXECUTED "$RS_BR")"
+rm -rf "$RST"
+named_end repeated_repo_stages_keep_ordinals
+
+echo "--- stage_mapping_table_keeps_every_entry ---"
+named_begin
+stage_case() {
+  # stage_case <list "a a b"> <stage n> <current repo>  -> expect: skipped iff entry n exists and differs
+  local list="$1" n="$2" cur="$3" spec="" r out entry="" i=0 want
+  spec="stages:"$'\n'
+  for r in $list; do spec="$spec  - repo: org/$r"$'\n'"    what: x"$'\n'; i=$((i + 1)); [ "$i" -eq "$n" ] && entry="$r"; done
+  spec="$spec"$'\n'"## 8. Stop conditions"$'\n\n'"Stop 1 (grep assertion, stage $n):"$'\n'"  grep -c x f"$'\n'"  Expected: 1"$'\n'
+  out="$(printf '%s' "$spec" | RSG_STAGE_REPO="org/$cur" rsg_extract)"
+  if [ -n "$entry" ] && [ "$entry" != "$cur" ]; then want=skipped; else want=counted; fi
+  if [ "$want" = skipped ]; then
+    assert_eq "stages [$list] stage $n in org/$cur is skipped as other-stage" "1 0" "$(printf '%s\n' "$out" | grep -c '^OTHER_STAGE' || true) $(printf '%s\n' "$out" | grep -c "grep -c x f${TAB}eq" || true)"
+  else
+    assert_eq "stages [$list] stage $n in org/$cur is counted (never skipped)" "0 1" "$(printf '%s\n' "$out" | grep -c '^OTHER_STAGE' || true) $(printf '%s\n' "$out" | grep -c "grep -c x f${TAB}eq" || true)"
+  fi
+}
+for lst in "a a b" "a b a" "a a a" "a b" "b a a b"; do
+  for sn in 1 2 3 4 5; do
+    for cr in a b; do stage_case "$lst" "$sn" "$cr"; done
+  done
+done
+named_end stage_mapping_table_keeps_every_entry
+
+echo "--- a second stages: list (the canonical-stages copy) does not extend the stage list ---"
+named_begin
+DUP_SPEC='stages:
+  - repo: org/a
+    what: one
+  - repo: org/b
+    what: two
+
+## Canonical stages
+
+```yaml
+stages:
+  - id: x
+    repo: org/a
+  - id: y
+    repo: org/b
+```
+
+## 8. Stop conditions
+
+Stop 1 (grep assertion, stage 2):
+  grep -c x f
+  Expected: 1
+'
+DUP_A="$(printf '%s\n' "$DUP_SPEC" | RSG_STAGE_REPO=org/a rsg_extract)"
+assert_eq "stage 2 is org/b in a spec that repeats its stage list: skipped in org/a" "1" "$(printf '%s\n' "$DUP_A" | grep -c '^OTHER_STAGE' || true)"
+DUP_B="$(printf '%s\n' "$DUP_SPEC" | RSG_STAGE_REPO=org/b rsg_extract)"
+assert_contains "and counted in org/b" "DECLARED${TAB}1" "$DUP_B"
+named_end repeated_stage_list_does_not_shift_ordinals
+
+echo "--- every_counted_command_pairs_with_its_own_expected_or_is_unparsed (mixed-sequence table + seeded fuzz) ---"
+named_begin
+export RSG_STAGE_REPO=thinmansoftware/fuzz-none
+fz_close() {
+  # close a pending counted command as unparsed (the invariant under test)
+  case "$FZ_PENDING" in zq*) FZ_UNP="$FZ_UNP $FZ_PENDING"; FZ_ANYC=1 ;; esac
+}
+fz_other() {
+  # any non-blank line that is not a counted command closes a pending counted command too
+  fz_close; FZ_PENDING=OTHER
+}
+fz_check() {
+  # fz_check <tokens...>: render the sequence, compute the oracle, compare with rsg_extract
+  local k=0 t id n spec out expected_paired actual_paired expected_unp actual_unp line hdr_exp="" label="$*"
+  FZ_PENDING=""; FZ_UNP=""; FZ_ANYC=0; FZ_ANYE=0
+  local paired=""
+  spec=$'## 8. Stop conditions\n\nStop 1 (fuzz):\n'
+  for t in "$@"; do
+    k=$((k + 1)); id="zq${k}zq"
+    case "$t" in
+      C)  spec="$spec  grep -c $id f"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      T)  spec="$spec  grep${TAB}-c $id f"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      BL) spec="$spec- grep -c $id f"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      BQ) spec="$spec  \`grep -c $id f\`"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      BQB) spec="$spec  \`grep -c baseline-$id f\`"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      CB) spec="$spec  grep -c baseline-$id f"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      BP) spec="$spec  Baseline: this returned 0 before this WO ($k)."$'\n'; fz_other ;;
+      F)  spec="$spec  curl -s https://x.test/$k"$'\n'; fz_other ;;
+      LF) spec="$spec  LC_ALL=C curl -s https://x.test/$k"$'\n'; fz_other ;;
+      BF) spec="$spec- curl -s https://x.test/$k"$'\n'; fz_other ;;
+      QF) spec="$spec  \`curl -s https://x.test/$k\`"$'\n'; fz_other ;;
+      I)  n=$((100 + k)); spec="$spec- \`grep -c $id f\` returns $n"$'\n'; fz_close; paired="$paired $id=$n"; FZ_ANYC=1; FZ_PENDING="" ;;
+      E)  spec="$spec  Expected: $k"$'\n'; FZ_ANYE=1
+          case "$FZ_PENDING" in zq*) paired="$paired ${FZ_PENDING}=$k"; FZ_ANYC=1 ;; esac
+          FZ_PENDING="" ;;
+      B)  spec="$spec"$'\n' ;;
+      P)  spec="$spec  note that this matters"$'\n'; fz_other ;;
+    esac
+  done
+  case "$FZ_PENDING" in zq*) FZ_UNP="$FZ_UNP $FZ_PENDING"; FZ_ANYC=1 ;; esac
+  if [ "$FZ_ANYC" -eq 0 ] && [ "$FZ_ANYE" -eq 0 ]; then hdr_exp="Stop 1 (fuzz):"; fi
+  out="$(printf '%s' "$spec" | rsg_extract)"
+  expected_paired="$(printf '%s\n' $paired | sort | grep . || true)"
+  actual_paired="$(printf '%s\n' "$out" | while IFS= read -r line; do
+    case "$line" in *"${TAB}eq${TAB}"*)
+      printf '%s=%s\n' "$(printf '%s' "$line" | grep -o 'zq[0-9]*zq' | head -1)" "${line##*"${TAB}"}" ;;
+    esac
+  done | sort | grep . || true)"
+  expected_unp="$(printf '%s\n' $FZ_UNP | sort | grep . || true)"
+  actual_unp="$(printf '%s\n' "$out" | sed -n 's/^UNPARSED\t[0-9]*\t*//p' | grep -o 'zq[0-9]*zq' | sort | grep . || true)"
+  assert_eq "fuzz [$label] paired commands are exactly the oracle's" "$expected_paired" "$actual_paired"
+  assert_eq "fuzz [$label] unparsed commands are exactly the oracle's" "$expected_unp" "$actual_unp"
+  if [ -n "$hdr_exp" ]; then
+    assert_contains "fuzz [$label] a block with no command and no Expected names its header" "$hdr_exp" "$(printf '%s\n' "$out" | sed -n '/^UNPARSED/p')"
+  fi
+  local declared_exp=$(( $(printf '%s\n' $paired | grep -c . || true) + $(printf '%s\n' $FZ_UNP | grep -c . || true) + $([ -n "$hdr_exp" ] && echo 1 || echo 0) ))
+  assert_contains "fuzz [$label] DECLARED is paired + unparsed" "DECLARED${TAB}${declared_exp}" "$out"
+}
+FZ_TABLE=(
+  "C E" "T E" "BL E" "BQ E" "C F E" "C E F E" "I E" "C I E" "C I" "F E C E" "C B E" "C P E"
+  "C LF E" "C BF E" "C QF E" "C B B E" "LF E C E" "C E LF E" "BQ P E" "C B P B E" "T QF E"
+  "BQB E" "CB E" "C BP E" "BQB BP E" "BP C E" "BP E" "C B BP B E" "BP BP CB E" "I BP E" "CB CB E"
+  "C E E" "T I E" "BQ F E I" "E C" "C C E E" "F F E" "P B" "C" "I I E" "BQ BQ E" "T F I E" "B C B E B"
+)
+for seq in "${FZ_TABLE[@]}"; do
+  # shellcheck disable=SC2086
+  fz_check $seq
+done
+FZ_TOKENS=(C T BL BQ BQB CB BP F LF BF QF I E E B P)
+RANDOM=4753
+for ((fzn = 0; fzn < 60; fzn++)); do
+  fzlen=$((RANDOM % 8 + 2)); fzseq=""
+  for ((fzi = 0; fzi < fzlen; fzi++)); do fzseq="$fzseq ${FZ_TOKENS[RANDOM % ${#FZ_TOKENS[@]}]}"; done
+  # shellcheck disable=SC2086
+  fz_check $fzseq
+done
+unset RSG_STAGE_REPO
+named_end every_counted_command_pairs_with_its_own_expected_or_is_unparsed
 
 echo
 echo "run-stop-greps.sh: $PASS passed, $FAIL failed (PASS=$PASS FAIL=$FAIL)"
