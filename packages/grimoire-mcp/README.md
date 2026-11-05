@@ -1,6 +1,10 @@
 # Grimoire blocked PR card
 
-Grimoire renders a read-only joined view of one pull request. It names the blocker and next permitted action but never performs an action, mutation, merge, review, or database write.
+Grimoire renders a read-only joined view of one pull request. It names the blocker and next permitted action but never performs an action, mutation, merge or review.
+
+Database reads are genuinely read-only. The event-store and Taskmaster reads open their own connection and never go through core's `getDatabase()`, whose SQLite adapter creates and migrates the file. With `DATABASE_URL` set, each query runs in its own transaction that starts with `SET TRANSACTION READ ONLY` (transaction-scoped, never a session setting, so nothing outlives the card on a pooled backend). Otherwise `~/.archon/archon.db` is opened by bun:sqlite with `readonly: true`; a missing file is reported unavailable and is never created. The one write a card can cause is outside Grimoire: the shared metered GitHub client (below) records its own API usage in the harness quota meter, as every harness GitHub client does.
+
+stdout carries only protocol output: both entry points import `src/log-to-stderr.ts` first, which sets `ARCHON_LOG_STDERR=1` so `@archon/paths` sends dependency logs to stderr. Keep that import first in any new stdio entry point.
 
 CLI: `bun run packages/grimoire-mcp/src/cli.ts card owner/repo#123 [--json]`
 

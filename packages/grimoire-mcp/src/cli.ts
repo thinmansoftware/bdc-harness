@@ -1,3 +1,5 @@
+// Must stay the first import: routes dependency logs off stdout.
+import './log-to-stderr';
 import { buildBlockedPrCard, InvalidPrRefError } from './build-card';
 import { GitHubUnavailableError } from './sources/github';
 import type { BlockedPrCard } from './card-types';

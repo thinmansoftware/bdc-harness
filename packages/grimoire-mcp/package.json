@@ -9,6 +9,7 @@
   "dependencies": {
     "@archon/core": "workspace:*",
     "@archon/overseer": "workspace:*",
+    "@archon/paths": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.29.0"
   }
 }
