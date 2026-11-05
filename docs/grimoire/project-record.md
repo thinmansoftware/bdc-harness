@@ -62,6 +62,12 @@ AGREE, DISAGREE with record and live values, or UNREADABLE with a reason:
 | xo.repo_canonical_map | scripts/cauldron/repo-canonical-map.json contains repo |
 | xo.cauldron_projects_base | scripts/cauldron/cauldron-projects.json base_branch matches |
 
+The merge_policy surfaces use the policy merge execution itself applies
+(`resolveExecutionMergeRepoPolicy` in `@archon/overseer/merge-execution-bridge`):
+`MERGE_MANAGER_REPO_POLICY` when set, otherwise the deprecated
+`OVERSEER_MERGE_REPO_CONFIG`, otherwise the legacy/default resolution. Branch
+names are matched trimmed and lowercased, as the merge engine does.
+
 XO files are resolved under --xo-root. Without that option both XO surfaces print
 SKIPPED with reason `no --xo-root`. Missing entries disagree; unreadable files or
 invalid JSON report UNREADABLE. JSON output includes the same surfaces, statuses,
