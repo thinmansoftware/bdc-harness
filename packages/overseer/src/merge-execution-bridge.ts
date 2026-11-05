@@ -1133,3 +1133,14 @@ export async function runMergeExecutionBridgeOnce(
     }
   }
 }
+
+/**
+ * The repo/base merge policy that merge execution itself applies: the current
+ * MERGE_MANAGER_REPO_POLICY, else the deprecated OVERSEER_MERGE_REPO_CONFIG
+ * (fail-closed parse), else the legacy/default resolution. Exported so
+ * read-only verifiers (`archon project verify`) judge branches against the
+ * exact effective policy instead of a second, drifting resolution.
+ */
+export function resolveExecutionMergeRepoPolicy(): MergeRepoPolicy {
+  return configuredPolicy();
+}
