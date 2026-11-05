@@ -105,12 +105,18 @@ export function stripCwdEnv(cwd: string = process.cwd()): void {
 
   // Strip debugger vars that crash Claude Code subprocesses
   // See: https://github.com/anthropics/claude-code/issues/4619
-  // NODE_OPTIONS survives ONLY when every flag in it is on SAFE_NODE_OPTIONS_FLAGS
-  // and it did not come from a CWD .env file (pass 1 already deleted those).
-  if (!isSafeNodeOptions(process.env.NODE_OPTIONS)) {
-    Reflect.deleteProperty(process.env, 'NODE_OPTIONS');
+  // NODE_OPTIONS keeps only the flags on SAFE_NODE_OPTIONS_FLAGS (a value from a
+  // CWD .env file was already deleted by pass 1). One unknown flag no longer drops
+  // the safe ones with it, and anything removed is reported, never silent: a
+  // silent all-or-nothing delete is how the Node 26 localStorage fix vanished
+  // from every lane on 2026-11-05 (bdc-harness #1510).
+  filterNodeOptions();
+  if (process.env.VSCODE_INSPECTOR_OPTIONS !== undefined) {
+    Reflect.deleteProperty(process.env, 'VSCODE_INSPECTOR_OPTIONS');
+    process.stderr.write(
+      '[archon] stripped VSCODE_INSPECTOR_OPTIONS (debugger option crashes Claude Code subprocesses)\n'
+    );
   }
-  Reflect.deleteProperty(process.env, 'VSCODE_INSPECTOR_OPTIONS');
 }
 
 /**
@@ -125,9 +131,34 @@ export function stripCwdEnv(cwd: string = process.cwd()): void {
  */
 const SAFE_NODE_OPTIONS_FLAGS: ReadonlySet<string> = new Set(['--no-experimental-webstorage']);
 
-function isSafeNodeOptions(value: string | undefined): boolean {
-  if (value === undefined) return false;
+/** Name of a flag for logging: the part before any '=' so values (paths, ports) are never printed. */
+function flagName(flag: string): string {
+  const eq = flag.indexOf('=');
+  return eq === -1 ? flag : flag.slice(0, eq);
+}
+
+/**
+ * Keep only allowlisted flags in NODE_OPTIONS. A value whose flags are all safe is
+ * left exactly as it was; otherwise the safe flags are kept (space-joined) or the
+ * variable is deleted when none remain. Every removed flag is named on stderr.
+ */
+function filterNodeOptions(): void {
+  const value = process.env.NODE_OPTIONS;
+  if (value === undefined) return;
   const flags = value.split(/\s+/).filter(flag => flag.length > 0);
-  if (flags.length === 0) return false;
-  return flags.every(flag => SAFE_NODE_OPTIONS_FLAGS.has(flag));
+  const kept = flags.filter(flag => SAFE_NODE_OPTIONS_FLAGS.has(flag));
+  const removed = flags.filter(flag => !SAFE_NODE_OPTIONS_FLAGS.has(flag));
+  if (flags.length > 0 && removed.length === 0) return;
+  if (kept.length > 0) {
+    process.env.NODE_OPTIONS = kept.join(' ');
+  } else {
+    Reflect.deleteProperty(process.env, 'NODE_OPTIONS');
+  }
+  if (removed.length > 0) {
+    process.stderr.write(
+      `[archon] NODE_OPTIONS: removed ${removed.length} flag(s) not on the safe list (${removed.map(flagName).join(', ')}); ` +
+        (kept.length > 0 ? `kept ${kept.join(' ')}` : 'NODE_OPTIONS unset') +
+        '. Add a flag to SAFE_NODE_OPTIONS_FLAGS in packages/paths/src/strip-cwd-env.ts to pass it to lanes.\n'
+    );
+  }
 }
