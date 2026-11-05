@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import ts from 'typescript';
 
@@ -61,7 +61,43 @@ test('anthropic_packages_current', () => {
   );
   const lock = readFileSync(join(root, 'bun.lock'), 'utf8');
   expect(lock).toContain('@anthropic-ai/sdk@1.');
-  expect(/@anthropic-ai\/sdk@0\./.test(lock)).toBe(false);
+  // XO decision (a), WO #4895: pi-ai's isolated 0.x copy is allowed.
+  const entries = lock.split('\n').filter(line => /"@anthropic-ai\/sdk": \[/.test(line));
+  expect(entries.length).toBe(1);
+  expect(entries[0]).toContain('@anthropic-ai/sdk@1.5.0');
+  expect(read('packages/providers/package.json').dependencies['@anthropic-ai/sdk']).toBe('^1.5.0');
+  // Resolve from every first-party TypeScript importer, including tests.
+  for (const pkg of readdirSync(join(root, 'packages'))) {
+    const dir = join(root, 'packages', pkg, 'src');
+    const walk = (path: string): string[] =>
+      readdirSync(path, { withFileTypes: true }).flatMap(entry => {
+        const next = join(path, entry.name);
+        return entry.isDirectory() ? walk(next) : /\.tsx?$/.test(next) ? [next] : [];
+      });
+    if (!existsSync(dir)) continue;
+    for (const file of walk(dir)) {
+      const ast = ts.createSourceFile(
+        file,
+        readFileSync(file, 'utf8'),
+        ts.ScriptTarget.Latest,
+        true
+      );
+      const visit = (node: ts.Node): void => {
+        if (
+          ts.isStringLiteral(node) &&
+          node.text === '@anthropic-ai/sdk' &&
+          (ts.isImportDeclaration(node.parent) ||
+            ts.isExportDeclaration(node.parent) ||
+            ts.isCallExpression(node.parent))
+        ) {
+          const resolved = Bun.resolveSync('@anthropic-ai/sdk/package.json', file);
+          expect(JSON.parse(readFileSync(resolved, 'utf8')).version.startsWith('1.')).toBe(true);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(ast);
+    }
+  }
   const [major, minor, patch] = installed.claudeCodeVersion.split('.').map(Number);
   expect(major > 2 || (major === 2 && (minor > 1 || (minor === 1 && patch >= 251)))).toBe(true);
 });
