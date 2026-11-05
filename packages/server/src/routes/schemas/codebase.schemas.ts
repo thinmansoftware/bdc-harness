@@ -1,6 +1,7 @@
 /**
  * Zod schemas for codebase API endpoints.
  */
+import { projectRecordSchema } from '@archon/core/grimoire/project-record';
 import { z } from '@hono/zod-openapi';
 
 /** A single command entry within a codebase. */
@@ -18,6 +19,7 @@ export const codebaseSchema = z
     default_branch: z.string().nullable(),
     ai_assistant_type: z.string(),
     commands: z.record(codebaseCommandSchema),
+    project_record: projectRecordSchema.nullable(),
     created_at: z.string(),
     updated_at: z.string(),
   })
@@ -43,6 +45,7 @@ export const addCodebaseBodySchema = z
 /** PATCH /api/codebases/:id request body. */
 export const updateCodebaseBodySchema = z
   .object({
+    project_record: projectRecordSchema.nullable().optional(),
     name: z.string().min(1).optional(),
     default_branch: z.string().min(1).optional(),
     default_cwd: z.string().min(1).optional(),

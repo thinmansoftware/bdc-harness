@@ -726,6 +726,13 @@ export class SqliteAdapter implements IDatabase {
    * the columns were added to createSchema().
    */
   private migrateColumns(): void {
+    // WO-GRIMOIRE-PROJECT-RECORD-01 (migration 068): additive and idempotent.
+    const codebaseColumns = this.pragmaAll("PRAGMA table_info('remote_agent_codebases')") as {
+      name: string;
+    }[];
+    if (!codebaseColumns.some(column => column.name === 'project_record')) {
+      this.db.run('ALTER TABLE remote_agent_codebases ADD COLUMN project_record TEXT');
+    }
     this.upgradeBoardAuditEvents();
     // Migration 045: SQLite cannot alter CHECK constraints. Rebuild existing
     // four-verb journals transactionally before any fire_cauldron insert.
@@ -1472,6 +1479,7 @@ export class SqliteAdapter implements IDatabase {
         repository_url TEXT,
         default_cwd TEXT NOT NULL,
         default_branch TEXT DEFAULT 'main',
+        project_record TEXT,
         ai_assistant_type TEXT DEFAULT 'claude',
         commands TEXT DEFAULT '{}',
         created_at TEXT DEFAULT (datetime('now')),

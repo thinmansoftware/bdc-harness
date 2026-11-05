@@ -65,6 +65,7 @@ import { setupCommand } from './commands/setup';
 import { skillInstallCommand } from './commands/skill';
 import { validateWorkflowsCommand, validateCommandsCommand } from './commands/validate';
 import { serveCommand } from './commands/serve';
+import { projectCommand } from './commands/project';
 import { doctorCommand } from './commands/doctor';
 import { closeDatabase } from '@archon/core';
 import {
@@ -107,6 +108,7 @@ Commands:
   complete <branch> [...]    Complete branch lifecycle (remove worktree + branches)
   serve                      Start the web UI server (downloads web UI on first run)
   skill install [path]       Install the bundled Archon skill into .claude/skills/archon
+  project show|verify <repo>  Inspect a Grimoire project record
   doctor                     Verify your Archon setup (Claude binary, gh auth, DB, adapters)
   validate workflows [name]  Validate workflow definitions and their references
   validate commands [name]   Validate command files
@@ -226,6 +228,7 @@ async function main(): Promise<number> {
         quiet: { type: 'boolean', short: 'q' },
         verbose: { type: 'boolean', short: 'v' },
         json: { type: 'boolean' },
+        'xo-root': { type: 'string' },
         'run-id': { type: 'string' },
         type: { type: 'string' },
         data: { type: 'string' },
@@ -609,6 +612,13 @@ async function main(): Promise<number> {
         const servePort = values.port !== undefined ? Number(values.port) : undefined;
         const downloadOnly = Boolean(values['download-only']);
         return await serveCommand({ port: servePort, downloadOnly });
+      }
+
+      case 'project': {
+        return await projectCommand(subcommand, positionals[2], {
+          xoRoot: values['xo-root'] as string | undefined,
+          json: jsonFlag,
+        });
       }
 
       case 'doctor': {
