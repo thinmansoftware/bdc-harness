@@ -322,7 +322,7 @@ assert_eq "bullets outside a Stop conditions section ignored" "0" "$(printf '%s\
 assert_eq "runner commands are not grep assertions" "0" "$(printf '%s\n' "$OUT" | grep -c 'node tests' || true)"
 assert_contains "DECLARED counts every backticked read-only command in the section (5), not the runner" "DECLARED${TAB}5" "$OUT"
 
-echo "--- baseline statements are not stop conditions (live false mismatch, run 3b8aea39, WO-HARNESS-AUTO-REREVIEW-REPEAT-REASON-01) ---"
+echo "--- baseline prose is NOT special any more (round 5: the baseline filter was removed; run 3b8aea39 shape) ---"
 SPEC_BASELINE='# WO-HARNESS-AUTO-REREVIEW-REPEAT-REASON-01
 
 WO Class: CODE
@@ -340,12 +340,13 @@ the fix. `grep -rn "buildRereviewReason"` returns nothing.
 Manifest v2: greps (stop 1), tests (stop 2).
 '
 OUT="$(printf '%s\n' "$SPEC_BASELINE" | rsg_extract)"
-assert_eq "the baseline paragraph grep is skipped" "0" "$(printf '%s\n' "$OUT" | grep -c 'grep -rn "buildRereviewReason"' || true)"
+assert_contains "the grep inside the baseline paragraph is now an ordinary counted line (eq 0)" "grep -rn \"buildRereviewReason\"${TAB}eq${TAB}0" "$OUT"
 assert_contains "the numbered post-fix assertion is kept (ge 1)" "grep -c \"buildRereviewReason\" packages/overseer/src/pr-review-ingest.ts${TAB}ge${TAB}1" "$OUT"
-assert_contains "DECLARED counts only the real stop condition" "DECLARED${TAB}1" "$OUT"
+assert_contains "DECLARED counts both backticked read-only commands (2)" "DECLARED${TAB}2" "$OUT"
 OUT="$(printf '## Stop conditions\n- Baseline: `grep -c x y` returns 0 before this WO.\n- `grep -c x y` returns 2 or greater\n' | rsg_extract)"
-assert_contains "single-line baseline bullet skipped, real bullet kept" "grep -c x y${TAB}ge${TAB}2" "$OUT"
-assert_contains "single-line baseline bullet not counted" "DECLARED${TAB}1" "$OUT"
+assert_contains "the baseline bullet is an ordinary counted line (eq 0)" "grep -c x y${TAB}eq${TAB}0" "$OUT"
+assert_contains "the real bullet is kept (ge 2)" "grep -c x y${TAB}ge${TAB}2" "$OUT"
+assert_contains "both bullets are declared (2)" "DECLARED${TAB}2" "$OUT"
 
 echo "--- rsg_run on bullet-style spec in a fixture worktree ---"
 TMP2="$(mktemp -d)"
@@ -632,8 +633,8 @@ assert_contains "backslash continuation still joins" "grep -rn \"a\" src | wc -l
 E3="$(printf 'Stop 1 (grep assertion):\n  grep -c gamma f\n' | rsg_extract)"
 assert_contains "legacy header without Expected is still declared and unparsed" "UNPARSED${TAB}1${TAB}grep -c gamma f" "$E3"
 E4="$(printf '## Stop conditions\n- Baseline: `grep -c x y` returns 0 before this WO.\n- `grep -c x y` returns 2 or greater\n' | rsg_extract)"
-assert_contains "second shape and baseline exclusion unchanged" "grep -c x y${TAB}ge${TAB}2" "$E4"
-assert_contains "second shape declared count unchanged" "DECLARED${TAB}1" "$E4"
+assert_contains "second shape still counts the real bullet (baseline prose is no longer special)" "grep -c x y${TAB}ge${TAB}2" "$E4"
+assert_contains "second shape declares both bullets (the baseline filter was removed in round 5)" "DECLARED${TAB}2" "$E4"
 E5="$(printf 'Stop 2 (assert the log line):\n  awk x y\n  Expected: 1\n' | rsg_extract)"
 assert_contains "legacy assert header counts any command-like line" "awk x y${TAB}eq${TAB}1" "$E5"
 named_end existing_extraction_behavior_preserved
@@ -875,6 +876,47 @@ assert_contains "round 3: an inline command closes the earlier pending command" 
 assert_contains "round 3: the inline command keeps its own expectation" "grep -c x f${TAB}eq${TAB}1" "$RR2B"
 named_end earlier_round_repros_still_hold
 
+# ---------------------------------------------------------------------------
+# Round 5 (Overseer CHANGES_REQUESTED at 7b30ac9e; acting XO ruling fence 283): the baseline
+# filter is REMOVED from the rsg core. It scanned the whole line, so a real assertion whose
+# command merely contained the word "baseline" was silently waived. Baseline prose is just
+# prose: inside a stop block it closes a pending command as UNPARSED like any other
+# non-blank non-Expected line.
+# ---------------------------------------------------------------------------
+echo "--- baseline_word_in_command_args_is_run ---"
+named_begin
+BLT="$(mktemp -d)"
+B1="$(printf '## 8. Stop conditions\n\nStop 1 (route check):\n  grep -c baseline /dev/null\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "DECLARED is 1 (the assertion is not waived)" "DECLARED${TAB}1" "$B1"
+assert_contains "the command is emitted with its expectation" "grep -c baseline /dev/null${TAB}eq${TAB}1" "$B1"
+B1R="$(cd "$BLT" && printf '## 8. Stop conditions\n\nStop 1 (route check):\n  grep -c baseline /dev/null\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract | rsg_run)"
+assert_eq "GREP_DECLARED=1" "1" "$(kv GREP_DECLARED "$B1R")"
+assert_eq "the assertion is EXECUTED" "1" "$(kv GREP_EXECUTED "$B1R")"
+assert_eq "and it FAILS: the actual count is 0, not 1" "mismatch" "$(kv GREP_STATUS "$B1R")"
+assert_contains "the observed count is 0" "MISMATCH: grep -c baseline /dev/null => 0 (expected eq 1)" "$B1R"
+B1Q="$(printf '## 8. Stop conditions\n\nStop 1 (route check):\n  `grep -c baseline /dev/null`\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "the backticked form is counted too" "grep -c baseline /dev/null${TAB}eq${TAB}1" "$B1Q"
+B2="$(printf '## 8. Stop conditions\n\nStop 1 (route check):\n- `grep -c baseline f` returns 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "an inline command with baseline in its arguments is counted" "grep -c baseline f${TAB}eq${TAB}1" "$B2"
+B3="$(printf '## 8. Stop conditions\n\n- `grep -c baseline f` returns 1\n- `grep -c before-the-fix f` returns 2\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "outside a block the second shape counts it" "grep -c baseline f${TAB}eq${TAB}1" "$B3"
+assert_contains "and so does a before-the-fix looking argument" "grep -c before-the-fix f${TAB}eq${TAB}2" "$B3"
+rm -rf "$BLT"
+named_end baseline_word_in_command_args_is_run
+
+echo "--- baseline_prose_closes_pending_as_unparsed ---"
+named_begin
+BP1="$(printf '## 8. Stop conditions\n\nStop 1 (x):\n  grep -c x y\n  Baseline: this returned 0 before this WO.\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "the pending command is UNPARSED" "UNPARSED${TAB}1${TAB}grep -c x y" "$BP1"
+assert_eq "the Expected pairs with nothing" "0" "$(count_records "$BP1")"
+for lab in 'Baseline (before): 2' '(baseline 2)' 'Baseline on untouched tree: scenario 1 fails' 'before the fix this was 0'; do
+  BPL="$(printf '## 8. Stop conditions\n\nStop 1 (x):\n  grep -c x y\n  %s\n  Expected: 1\n' "$lab" | RSG_STAGE_REPO=x/y rsg_extract)"
+  assert_contains "baseline-looking line closes the pending command: $lab" "UNPARSED${TAB}1${TAB}grep -c x y" "$BPL"
+done
+BP2="$(printf '## 8. Stop conditions\n\nStop 1 (x):\n  Baseline: nothing yet\n  grep -c x y\n  Expected: 2\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "baseline prose before a command does not hide the command" "grep -c x y${TAB}eq${TAB}2" "$BP2"
+named_end baseline_prose_closes_pending_as_unparsed
+
 echo "--- every_counted_command_pairs_with_its_own_expected_or_is_unparsed (mixed-sequence table + seeded fuzz) ---"
 named_begin
 export RSG_STAGE_REPO=thinmansoftware/fuzz-none
@@ -899,6 +941,9 @@ fz_check() {
       T)  spec="$spec  grep${TAB}-c $id f"$'\n'; fz_close; FZ_PENDING="$id" ;;
       BL) spec="$spec- grep -c $id f"$'\n'; fz_close; FZ_PENDING="$id" ;;
       BQ) spec="$spec  \`grep -c $id f\`"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      BQB) spec="$spec  \`grep -c baseline-$id f\`"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      CB) spec="$spec  grep -c baseline-$id f"$'\n'; fz_close; FZ_PENDING="$id" ;;
+      BP) spec="$spec  Baseline: this returned 0 before this WO ($k)."$'\n'; fz_other ;;
       F)  spec="$spec  curl -s https://x.test/$k"$'\n'; fz_other ;;
       LF) spec="$spec  LC_ALL=C curl -s https://x.test/$k"$'\n'; fz_other ;;
       BF) spec="$spec- curl -s https://x.test/$k"$'\n'; fz_other ;;
@@ -933,13 +978,14 @@ fz_check() {
 FZ_TABLE=(
   "C E" "T E" "BL E" "BQ E" "C F E" "C E F E" "I E" "C I E" "C I" "F E C E" "C B E" "C P E"
   "C LF E" "C BF E" "C QF E" "C B B E" "LF E C E" "C E LF E" "BQ P E" "C B P B E" "T QF E"
+  "BQB E" "CB E" "C BP E" "BQB BP E" "BP C E" "BP E" "C B BP B E" "BP BP CB E" "I BP E" "CB CB E"
   "C E E" "T I E" "BQ F E I" "E C" "C C E E" "F F E" "P B" "C" "I I E" "BQ BQ E" "T F I E" "B C B E B"
 )
 for seq in "${FZ_TABLE[@]}"; do
   # shellcheck disable=SC2086
   fz_check $seq
 done
-FZ_TOKENS=(C T BL BQ F LF BF QF I E E B P)
+FZ_TOKENS=(C T BL BQ BQB CB BP F LF BF QF I E E B P)
 RANDOM=4753
 for ((fzn = 0; fzn < 60; fzn++)); do
   fzlen=$((RANDOM % 8 + 2)); fzseq=""

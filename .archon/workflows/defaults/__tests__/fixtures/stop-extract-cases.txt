@@ -430,3 +430,34 @@ grep -c x f	eq	2
 UNPARSED	0
 DECLARED	1
 @@END
+@@CASE baseline_word_in_command_args_is_run
+## 8. Stop conditions
+
+Stop 1 (route check):
+  grep -c baseline /dev/null
+  Expected: 1
+
+Stop 2 (backticked):
+  `grep -c baseline /dev/null`
+  Expected: 1
+
+Stop 3 (inline):
+- `grep -c baseline f` returns 2
+@@EXPECT
+grep -c baseline /dev/null	eq	1
+grep -c baseline /dev/null	eq	1
+grep -c baseline f	eq	2
+UNPARSED	0
+DECLARED	3
+@@END
+@@CASE baseline_prose_closes_pending_as_unparsed
+## 8. Stop conditions
+
+Stop 1 (x):
+  grep -c x y
+  Baseline: this returned 0 before this WO.
+  Expected: 1
+@@EXPECT
+UNPARSED	1	grep -c x y
+DECLARED	1
+@@END

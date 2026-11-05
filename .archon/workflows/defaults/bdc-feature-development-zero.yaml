@@ -2591,7 +2591,9 @@ nodes:
       #        or cd-prefixed line, a backticked line, a header) first closes it as unparsed; every
       #        such start goes through one function, begin_command, so no path can skip the close.
       #        A foreign command (ssh, curl, ...) is simply not counted, and nothing depends on
-      #        recognising it; command words end at a space OR a tab; R9 a bare (not backticked) line in the section but outside any block
+      #        recognising it; command words end at a space OR a tab; there is NO baseline
+      #        filter: baseline prose is ordinary prose (it closes a pending command like any
+      #        other non-blank line) and a command is never excluded for what its arguments say; R9 a bare (not backticked) line in the section but outside any block
       #        whose first word is grep, egrep, fgrep, rg, git grep, node, bun, bunx, npm, npx,
       #        wc or "test -" is an uncounted command line: declared and unparsed, so
       #        none_declared can no longer sit next to an uncounted command line.
@@ -2699,7 +2701,7 @@ nodes:
             flush(); inblk = 1; hdr = clean($0); l = tolower(hdr)
             legacy = ($0 ~ /^[ \t]*[*]*[Ss]top[ \t]+[0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/)
             excl = (l ~ /^[ \t]*[*_]*stop[ \t]+[0-9a-z.]+[ \t]*[(:][ \t]*(test|unit|suite)/)
-            bexp = 0; bcmds = 0; pending = ""; bl = 0
+            bexp = 0; bcmds = 0; pending = ""
             oth = 0; othtag = ""
             if (cur != "" && !excl) {
               st = stage_of(hdr)
@@ -2707,7 +2709,7 @@ nodes:
             }
             next
           }
-          /^#+ / { flush(); insec = ($0 ~ /[Ss]top [Cc]ondition/) ? 1 : 0; bl = 0; next }
+          /^#+ / { flush(); insec = ($0 ~ /[Ss]top [Cc]ondition/) ? 1 : 0; next }
           inblk && excl { next }
           inblk && oth {
             if ($0 ~ /^[ \t]*```/) next
@@ -2718,7 +2720,6 @@ nodes:
           inblk {
             if ($0 ~ /^[ \t]*```/) next
             if (insec && second_gate($0) && $0 !~ /^[ \t]*([-*][ \t]+)?[Ee]xpected:/) {
-              if (tolower($0) ~ /baseline|untouched tree|before the fix|before this wo/) { begin_command(""); next }
               if (bt_split($0)) {
                 begin_command(BTCMD)
                 e = expect(BTREST)
@@ -2741,12 +2742,7 @@ nodes:
             # line), closes it as UNPARSED and is then processed as the start of a new line.
             begin_command(line); next
           }
-          insec && /^[ \t]*[*_]*[Bb]aseline/ { bl = 1 }
-          insec && bl && (/^[ \t]*$/ || /^[ \t]*([0-9]+[.)]|[-*])[ \t]/) { bl = 0 }
-          insec && !bl && second_gate($0) {
-            if (tolower($0) ~ /baseline|untouched tree|before the fix|before this wo/) next
-            second($0)
-          }
+          insec && second_gate($0) { second($0) }
           insec && $0 !~ /`/ {
             line = unbullet(clean($0))
             if (line ~ /^(grep|egrep|fgrep|rg|git[ \t]+grep|node|bun|bunx|npm|npx|wc)([ \t]|$)|^test[ \t]+-/) { declared++; note_uncounted(line) }
