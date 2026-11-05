@@ -203,6 +203,47 @@ describe('stripCwdEnv -- nested Claude Code marker stripping', () => {
     expect(process.env.VSCODE_INSPECTOR_OPTIONS).toBeUndefined();
   });
 
+  // Node 26 defines a global localStorage that returns undefined; vitest DOM
+  // environments then cannot install their own and every localStorage test
+  // crashes. The builder image sets NODE_OPTIONS=--no-experimental-webstorage
+  // to prevent that, and it must survive into lane bash nodes (bdc-xo, 2026-11-05).
+  it('keeps NODE_OPTIONS when every flag is on the safe allowlist', () => {
+    process.env.NODE_OPTIONS = '--no-experimental-webstorage';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBe('--no-experimental-webstorage');
+  });
+
+  it('keeps an allowlisted NODE_OPTIONS with surrounding whitespace', () => {
+    process.env.NODE_OPTIONS = '  --no-experimental-webstorage  ';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBe('  --no-experimental-webstorage  ');
+  });
+
+  it('strips NODE_OPTIONS when any flag is not allowlisted', () => {
+    process.env.NODE_OPTIONS = '--no-experimental-webstorage --inspect';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  it('strips NODE_OPTIONS that only looks like the allowlisted flag', () => {
+    process.env.NODE_OPTIONS = '--no-experimental-webstorage=1';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  it('strips an empty NODE_OPTIONS', () => {
+    process.env.NODE_OPTIONS = '   ';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  it('strips an allowlisted NODE_OPTIONS that came from a CWD .env file', () => {
+    writeFileSync(join(tmpDir, '.env'), 'NODE_OPTIONS=--no-experimental-webstorage\n');
+    process.env.NODE_OPTIONS = '--no-experimental-webstorage';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBeUndefined();
+  });
+
   it('handles combined CWD .env + nested session markers in one call', () => {
     writeFileSync(join(tmpDir, '.env'), 'TEST_STRIP_KEY=leaked\n');
     process.env.TEST_STRIP_KEY = 'leaked';

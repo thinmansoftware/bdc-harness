@@ -105,6 +105,29 @@ export function stripCwdEnv(cwd: string = process.cwd()): void {
 
   // Strip debugger vars that crash Claude Code subprocesses
   // See: https://github.com/anthropics/claude-code/issues/4619
-  Reflect.deleteProperty(process.env, 'NODE_OPTIONS');
+  // NODE_OPTIONS survives ONLY when every flag in it is on SAFE_NODE_OPTIONS_FLAGS
+  // and it did not come from a CWD .env file (pass 1 already deleted those).
+  if (!isSafeNodeOptions(process.env.NODE_OPTIONS)) {
+    Reflect.deleteProperty(process.env, 'NODE_OPTIONS');
+  }
   Reflect.deleteProperty(process.env, 'VSCODE_INSPECTOR_OPTIONS');
+}
+
+/**
+ * Node flags that are safe to pass through to every subprocess (lane bash
+ * nodes, test runners, Claude Code). Anything else in NODE_OPTIONS -- notably
+ * --inspect / --require / --import -- is stripped.
+ *
+ * --no-experimental-webstorage: Node 26 defines a global localStorage that
+ * returns undefined unless --localstorage-file is given, so vitest DOM
+ * environments cannot install their own and every localStorage test crashes.
+ * The builder image sets this flag; it must reach lane test runs (bdc-xo, 2026-11-05).
+ */
+const SAFE_NODE_OPTIONS_FLAGS: ReadonlySet<string> = new Set(['--no-experimental-webstorage']);
+
+function isSafeNodeOptions(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const flags = value.split(/\s+/).filter(flag => flag.length > 0);
+  if (flags.length === 0) return false;
+  return flags.every(flag => SAFE_NODE_OPTIONS_FLAGS.has(flag));
 }
