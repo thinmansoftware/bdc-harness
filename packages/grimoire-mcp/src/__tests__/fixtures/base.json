@@ -1,0 +1,13 @@
+{
+  "repo": "thinmansoftware/bdc-harness",
+  "number": 1,
+  "title": "WO-XO-EXAMPLE-01 example",
+  "url": "https://github.com/thinmansoftware/bdc-harness/pull/1",
+  "state": "OPEN",
+  "draft": false,
+  "head_sha": "hhhhhhhhhhhhhhhh",
+  "head_ref": "archon/task-example",
+  "base_ref": "dev",
+  "production_base": false,
+  "author": "author"
+}

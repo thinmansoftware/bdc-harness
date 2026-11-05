@@ -138,6 +138,16 @@
         "typescript": "^5.0.0",
       },
     },
+    "packages/grimoire-mcp": {
+      "name": "@archon/grimoire-mcp",
+      "version": "0.1.0",
+      "dependencies": {
+        "@archon/core": "workspace:*",
+        "@archon/overseer": "workspace:*",
+        "@archon/paths": "workspace:*",
+        "@modelcontextprotocol/sdk": "^1.29.0",
+      },
+    },
     "packages/isolation": {
       "name": "@archon/isolation",
       "version": "0.3.10",
@@ -373,6 +383,8 @@
     "@archon/fusion": ["@archon/fusion@workspace:packages/fusion"],
 
     "@archon/git": ["@archon/git@workspace:packages/git"],
+
+    "@archon/grimoire-mcp": ["@archon/grimoire-mcp@workspace:packages/grimoire-mcp"],
 
     "@archon/isolation": ["@archon/isolation@workspace:packages/isolation"],
 
