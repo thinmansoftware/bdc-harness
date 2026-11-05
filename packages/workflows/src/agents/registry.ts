@@ -12,6 +12,7 @@
 import { readFile, readdir } from 'fs/promises';
 import { join, basename } from 'path';
 import { createLogger } from '@archon/paths';
+import { MODEL_ALLOWLIST } from '../../../providers/src/model-allowlist';
 import { KNOWN_TOOLS } from './tools';
 
 /** Lazy-initialized logger */
@@ -44,27 +45,9 @@ export class AgentRegistryError extends Error {
   }
 }
 
-/** Valid model aliases for agent frontmatter.
- *  These are the Claude model shorthands supported by the Archon harness. */
-export const KNOWN_MODEL_ALIASES: ReadonlySet<string> = new Set([
-  'sonnet',
-  'opus',
-  'haiku',
-  'opus[1m]',
-  'sonnet[1m]',
-  'fable',
-  // Full model IDs are also accepted
-  'claude-opus-5-5',
-  'claude-opus-5',
-  'claude-opus-5[1m]',
-  'claude-opus-4-7',
-  'claude-sonnet-4-6',
-  'claude-sonnet-5',
-  'claude-haiku-4-5',
-  'claude-haiku-4-5-20251001',
-  'claude-haiku-5-5',
-  'claude-fable-5',
-]);
+export const KNOWN_MODEL_ALIASES: ReadonlySet<string> = new Set(
+  [...MODEL_ALLOWLIST].filter(model => model.startsWith('claude-'))
+);
 
 /** Context block configuration for a persona (wiki + oracle lookups) */
 export interface AgentContext {

@@ -56,7 +56,7 @@ async function writeAgent(filename: string, content: string): Promise<string> {
 
 const VALID_AGENT = `---
 name: test-agent
-model: sonnet
+model: claude-sonnet-5-5
 tools: [Read, Grep]
 description: A test agent.
 ---
@@ -70,16 +70,18 @@ You are a test agent. You test things.
 
 describe('parseFrontmatter', () => {
   test('parses simple frontmatter', () => {
-    const result = parseFrontmatter('---\nname: my-agent\nmodel: sonnet\n---\n\nBody here.');
+    const result = parseFrontmatter(
+      '---\nname: my-agent\nmodel: claude-sonnet-5-5\n---\n\nBody here.'
+    );
     expect(result).not.toBeNull();
     expect(result?.frontmatter.name).toBe('my-agent');
-    expect(result?.frontmatter.model).toBe('sonnet');
+    expect(result?.frontmatter.model).toBe('claude-sonnet-5-5');
     expect(result?.body).toBe('Body here.');
   });
 
   test('parses inline array tools', () => {
     const result = parseFrontmatter(
-      '---\nname: a\nmodel: opus\ntools: [Read, Grep, Glob]\n---\n\nPrompt.'
+      '---\nname: a\nmodel: claude-opus-5-5\ntools: [Read, Grep, Glob]\n---\n\nPrompt.'
     );
     expect(result?.frontmatter.tools).toEqual(['Read', 'Grep', 'Glob']);
   });
@@ -87,7 +89,7 @@ describe('parseFrontmatter', () => {
   test('parses block sequence tools', () => {
     const content = `---
 name: a
-model: sonnet
+model: claude-sonnet-5-5
 tools:
   - Read
   - Grep
@@ -118,7 +120,7 @@ describe('loadAgentFile happy path', () => {
     const filePath = await writeAgent('test-agent.md', VALID_AGENT);
     const persona = await loadAgentFile(filePath);
     expect(persona.name).toBe('test-agent');
-    expect(persona.model).toBe('sonnet');
+    expect(persona.model).toBe('claude-sonnet-5-5');
     expect(persona.tools).toEqual(['Read', 'Grep']);
     expect(persona.systemPrompt).toContain('You are a test agent');
   });
@@ -126,7 +128,7 @@ describe('loadAgentFile happy path', () => {
   test('tools field is optional', async () => {
     const content = `---
 name: no-tools-agent
-model: opus
+model: claude-opus-5-5
 ---
 
 System prompt here.
@@ -144,7 +146,7 @@ System prompt here.
 describe('loadAgentFile error codes', () => {
   test('agent_missing_name: frontmatter has no name field', async () => {
     const content = `---
-model: sonnet
+model: claude-sonnet-5-5
 ---
 
 Prompt.
@@ -163,7 +165,7 @@ Prompt.
   test('agent_name_filename_mismatch: frontmatter name does not match filename', async () => {
     const content = `---
 name: different-name
-model: sonnet
+model: claude-sonnet-5-5
 ---
 
 Prompt.
@@ -282,7 +284,7 @@ Prompt.
   test('agent_invalid_tool: tool not in known allowlist', async () => {
     const content = `---
 name: bad-tool
-model: sonnet
+model: claude-sonnet-5-5
 tools: [Read, FakeTool]
 ---
 
@@ -302,7 +304,7 @@ Prompt.
   test('agent_empty_prompt: body is empty after frontmatter', async () => {
     const content = `---
 name: empty-prompt
-model: sonnet
+model: claude-sonnet-5-5
 ---
 `;
     const filePath = await writeAgent('empty-prompt.md', content);
@@ -363,8 +365,8 @@ describe('loadAgentRegistry', () => {
   );
 
   test('loads all valid agents from directory', async () => {
-    const agent1 = `---\nname: agent-one\nmodel: sonnet\n---\n\nAgent one prompt.`;
-    const agent2 = `---\nname: agent-two\nmodel: opus\n---\n\nAgent two prompt.`;
+    const agent1 = `---\nname: agent-one\nmodel: claude-sonnet-5-5\n---\n\nAgent one prompt.`;
+    const agent2 = `---\nname: agent-two\nmodel: claude-opus-5-5\n---\n\nAgent two prompt.`;
     await writeAgent('agent-one.md', agent1);
     await writeAgent('agent-two.md', agent2);
 
@@ -452,7 +454,7 @@ describe('parseFrontmatter nested context:', () => {
     const content = [
       '---',
       'name: a',
-      'model: sonnet',
+      'model: claude-sonnet-5-5',
       'context:',
       '  wiki:',
       '    - docs/arch.md',
@@ -477,7 +479,7 @@ describe('parseFrontmatter nested context:', () => {
     const content = [
       '---',
       'name: a',
-      'model: sonnet',
+      'model: claude-sonnet-5-5',
       'context:',
       '  ad_hoc: allowed',
       '---',
@@ -523,7 +525,7 @@ describe('loadAgentFile context validation', () => {
     const content = [
       '---',
       'name: ctx-agent',
-      'model: sonnet',
+      'model: claude-sonnet-5-5',
       'context:',
       '  wiki:',
       '    - docs/a.md',
@@ -540,7 +542,7 @@ describe('loadAgentFile context validation', () => {
     const content = [
       '---',
       'name: trav-ctx',
-      'model: sonnet',
+      'model: claude-sonnet-5-5',
       'context:',
       '  wiki:',
       '    - ../etc/passwd',
@@ -563,7 +565,7 @@ describe('loadAgentFile context validation', () => {
     const content = [
       '---',
       'name: sec-ctx',
-      'model: sonnet',
+      'model: claude-sonnet-5-5',
       'context:',
       '  wiki:',
       '    - docs/secrets/keys.md',
@@ -586,7 +588,7 @@ describe('loadAgentFile context validation', () => {
     const content = [
       '---',
       'name: adhoc-ctx',
-      'model: sonnet',
+      'model: claude-sonnet-5-5',
       'context:',
       '  ad_hoc: maybe',
       '---',
@@ -608,7 +610,7 @@ describe('loadAgentFile context validation', () => {
     const content = [
       '---',
       'name: cache-ctx',
-      'model: sonnet',
+      'model: claude-sonnet-5-5',
       'context:',
       '  cache_seconds: 3.5',
       '---',

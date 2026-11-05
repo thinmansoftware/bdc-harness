@@ -9,7 +9,7 @@ description: |
 policyFile: harness/policies/agent-behavior.md
 
 # Rule 1 -- model: claude-sonnet-5-5 at root (per-node opus override on implement only)
-model: claude-sonnet-4-5
+model: claude-sonnet-5-5
 
 nodes:
   # ---- 1. Read spec (Rule 4: repo-relative path; Rule 5: date-prefix glob fallback)

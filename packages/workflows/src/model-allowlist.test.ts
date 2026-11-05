@@ -68,13 +68,17 @@ function violationsIn(text: string, file: string): string[] {
 
 function claudeViolationsIn(text: string, file: string): string[] {
   if (file.endsWith('.md')) {
+    if (text.startsWith('\uFEFF')) throw new Error(`${file}: BOM before frontmatter`);
     const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
     if (!frontmatter) return [];
     text = `\n${frontmatter[1]}`;
   }
   return modelsIn(text, file)
-    .filter(({ model }) => /^(?:opus|sonnet|haiku)/i.test(model) && !MODEL_ALLOWLIST.has(model))
-    .map(({ model, location }) => `${location}: bare Claude alias ${model}`);
+    .filter(
+      ({ model }) =>
+        /^(?:claude-|opus|sonnet|haiku|fable)/i.test(model) && !MODEL_ALLOWLIST.has(model)
+    )
+    .map(({ model, location }) => `${location}: unlisted Claude model ${model}`);
 }
 
 const startThread = mock((_options: unknown) => ({
@@ -170,7 +174,7 @@ test('bundled_defaults_regenerated', () => {
   for (const lane of moved) {
     const file = `${lane}.yaml`;
     const text = readFileSync(join(defaults, file), 'utf8');
-    expect(BUNDLED_WORKFLOWS[lane], file).toBe(text);
+    expect(BUNDLED_WORKFLOWS[lane].replace(/\r\n/g, '\n'), file).toBe(text.replace(/\r\n/g, '\n'));
     expect(BUNDLED_WORKFLOWS[lane], file).not.toContain('gpt-5.6');
   }
 });
@@ -193,10 +197,10 @@ test('Claude scan fails on a BOM before frontmatter', () => {
 
 test('allowlist_rejects_unlisted_model', () => {
   expect(claudeViolationsIn('---\nmodel: opus[1m]\n---\nPrompt.', 'agent.md')).toEqual([
-    'agent.md:2: bare Claude alias opus[1m]',
+    'agent.md:2: unlisted Claude model opus[1m]',
   ]);
   expect(claudeViolationsIn('nodes: [{id: x, model: sonnet}]', 'workflow.yaml')).toEqual([
-    'workflow.yaml:1: bare Claude alias sonnet',
+    'workflow.yaml:1: unlisted Claude model sonnet',
   ]);
   for (const model of MODEL_ALLOWLIST) {
     expect(claudeViolationsIn(`---\nmodel: "${model}"\n---\nPrompt.`, 'agent.md')).toEqual([]);
