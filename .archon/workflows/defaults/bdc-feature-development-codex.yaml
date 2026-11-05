@@ -2185,7 +2185,13 @@ nodes:
           || ! grep -qE '^[[:blank:]]*(async[[:blank:]]+)?def[[:blank:]]+test_' "$1"
       }
       rst_is_plain_node_script() {
-        ! grep -qE "['\"](node:test|bun:test|vitest|@jest/globals)['\"]|(^|[^[:alnum:]_$])(test|it|describe|suite)[[:blank:]]*(\\(|\\.)" "$1"
+        local file="$1" name
+        if grep -qE "['\"](node:test|bun:test|vitest|@jest/globals)['\"]" "$file"; then return 1; fi
+        for name in test it describe suite; do
+          if grep -qE "(^|[^[:alnum:]_$])(function[[:blank:]]+${name}[[:blank:]]*\\(|(const|let|var)[[:blank:]]+${name}[[:blank:]]*=)" "$file"; then continue; fi
+          if grep -qE "(^|[^[:alnum:]_$.])${name}[[:blank:]]*(\\(|\\.)" "$file"; then return 1; fi
+        done
+        return 0
       }
       # rst_tests_in_diff <base-sha>   (-> one test command per line derived from the test
       #   files this run created or modified since <base-sha>, plus untracked test files;
@@ -2560,7 +2566,7 @@ nodes:
       echo "TESTS_PASSED=${COUNTS%% *}"
       echo "TESTS_TOTAL=${COUNTS##* }"
       if [ "$SOURCE" = "spec_declared" ] && [ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -eq 0 ] && [ -z "$COUNTS" ]; then
-        printf 'TESTS_STATUS=passed\nTESTS_LINE=passed (exit 0, uncounted; %s) [source: wo-spec]\n' "$CMD_JOINED"
+        printf 'TESTS_STATUS=counts_unparsed\nTESTS_LINE=passed (exit 0, uncounted; %s) [source: wo-spec]\n' "$CMD_JOINED"
       elif [ "$SOURCE" = "project-map" ]; then
         SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/"
       else
