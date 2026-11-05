@@ -175,6 +175,7 @@ export interface RealGitHubOctokitLike {
         draft?: boolean;
         base?: { ref?: string };
         body?: string | null;
+        labels?: { name?: string | null }[];
       }[];
     }>;
     get(input: Record<string, unknown>): Promise<{
@@ -2158,6 +2159,7 @@ export function createRealListOpenPullRequests(
           headRef: pr.head.ref ?? '',
           headSha: pr.head.sha,
           reviewDecision: null,
+          labels: pullRequestLabelNames(pr.labels),
           woId: extractWoId(pr.title, pr.body),
           ...(listingComplete ? {} : { listingTruncated: true }),
         });
@@ -2193,6 +2195,7 @@ export function createRealListOpenPullRequests(
         headRef: pr.head.ref ?? '',
         headSha: pr.head.sha,
         reviewDecision,
+        labels: pullRequestLabelNames(pr.labels),
         woId: extractWoId(pr.title, pr.body),
         // Only meaningful for PRs whose decision was actually resolved: a PR on
         // an unwatched base never consults reviews at all, so it is not a

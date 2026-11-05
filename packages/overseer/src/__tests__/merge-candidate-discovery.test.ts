@@ -1692,3 +1692,33 @@ describe('merge candidate discovery -- only required checks can exclude', () => 
     expect(fallbackLogged(logged)).toBe(false);
   });
 });
+
+// WO-HARNESS-EVIDENCE-GATE-NOT-GATED-AND-BASE-UNRUNNABLE-01 (bdc-xo #4751), Test 9.
+describe('merge candidate discovery -- the run:blocked label refuses a PR', () => {
+  test('merge_manager_refuses_run_blocked_pr: an approved PR labelled run:blocked is run_blocked', () => {
+    const labelled = pr({ prNumber: 900, labels: ['run:blocked'] });
+    expect(classifyDiscoveredPullRequest(labelled, WATCHED_BASES)).toBe('run_blocked');
+    // the same PR without the label is a candidate
+    expect(classifyDiscoveredPullRequest(pr({ prNumber: 901 }), WATCHED_BASES)).toBeNull();
+    expect(
+      classifyDiscoveredPullRequest(pr({ prNumber: 902, labels: ['other'] }), WATCHED_BASES)
+    ).toBeNull();
+  });
+
+  test('run_blocked is the reported reason ahead of the review decision', () => {
+    const labelled = pr({ prNumber: 903, labels: ['run:blocked'], reviewDecision: null });
+    expect(classifyDiscoveredPullRequest(labelled, WATCHED_BASES)).toBe('run_blocked');
+  });
+
+  test('discovery excludes the labelled PR with a detail naming the label', async () => {
+    const pullRequests = [pr({ prNumber: 910, labels: ['run:blocked'] }), pr({ prNumber: 911 })];
+    const result = await discoverMergeCandidates(
+      discoveryDeps(pullRequests, { 910: greenEvidence(910), 911: greenEvidence(911) }),
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+    expect(result.candidates.map(c => c.prEvidence.pr?.number)).toEqual([911]);
+    const excluded = result.exclusions.find(e => e.prNumber === 910);
+    expect(excluded?.reason).toBe('run_blocked');
+    expect(excluded?.detail).toContain('run:blocked');
+  });
+});

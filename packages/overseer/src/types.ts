@@ -257,6 +257,8 @@ export interface DiscoveredPullRequest {
    * from individual reviews here -- an absent decision stays absent.
    */
   reviewDecision: string | null;
+  /** Label names on the PR as listed. Absent means not read; the run:blocked label excludes a PR. */
+  labels?: readonly string[];
   /** WO id when one is recoverable from the PR, used to sharpen evidence lookup. */
   woId?: string;
   /**

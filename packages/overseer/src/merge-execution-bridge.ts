@@ -20,7 +20,7 @@
 import { createLogger } from '@archon/paths';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { readOverseerActionPolicyFromEnv, type OverseerActionPolicy } from './action-policy';
-import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
+import { PR_DISCOVERY_RUN_ID_PREFIX, RUN_BLOCKED_LABEL } from './merge-candidate-discovery';
 import {
   getRepoBasePolicy,
   hasRepoPolicyEntry,
@@ -894,6 +894,26 @@ async function mergeClaimedVerdict(
         prUrl: pr.htmlUrl,
       },
       'merge-coordinator.merge_hold_label'
+    );
+    return undefined;
+  }
+
+  // A PR opened from a non-PROCEED run is labelled run:blocked by the lane's patch-pr-body
+  // node and is not lane-verified. This is the SHARED execution guard: the originating-run
+  // path (watch.ts emits merge_ready for a green PR regardless of run status) and the
+  // discovery path both reach it, so the label is enforced here as well as at discovery.
+  // Like a hold it releases the claim without skip(), attempts or an outcome row; removing
+  // the label (a human decision) frees the PR on the next tick.
+  if (pr.labels?.includes(RUN_BLOCKED_LABEL)) {
+    await options.store.releaseVerdictClaim(verdict.id, 'run_blocked_label');
+    log.info(
+      {
+        verdictId: verdict.id,
+        runId: verdict.run_id,
+        woId: verdict.wo_id,
+        prUrl: pr.htmlUrl,
+      },
+      'merge-coordinator.run_blocked_label'
     );
     return undefined;
   }

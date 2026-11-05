@@ -290,14 +290,20 @@ stb__base_red_line() {
 #     no_counts       head pass/total not parsed -> failed
 #     base_timeout    a base command timed out (exit 124) -> failed
 #     base_passed     the base run did not fail -> failed, every head failure is new
-#     base_unrunnable worktree or runner unavailable -> failed
+#     base_unrunnable the base never ran, so it is not judged -> failed (never a pass,
+#                     never base-red, never newly_broken): the worktree could not be
+#                     created, the runner is missing, the dependency install failed (its
+#                     output is in stop-tests-base.log), the base command exited 126 or
+#                     127, the base counts did not parse, or the base failed with no
+#                     attributable failure names (WO-HARNESS-EVIDENCE-GATE-NOT-GATED-
+#                     AND-BASE-UNRUNNABLE-01)
 #     command_not_comparable a test command is outside the allowlist
 #                     (stb_command_comparable) -> failed, base never runs
 #   Never returns nonzero.
 rst_base_compare() {
   local report="$1" cmds="$2" head_log="$3" counts="$4"
   local status line art sha sha8 top wt base_log base_res base_exit base_counts bp bt
-  local hp ht work ncmd nh nb k names newnames rc c
+  local hp ht work ncmd nh nb k names newnames rc c dprep_rc
   art="${ARTIFACTS_DIR:-}"
   if [ -n "$art" ]; then rm -f "$art/base-red-tests.txt" 2>/dev/null || true; fi
   status="$(sed -n 's/^TESTS_STATUS=//p' "$report" | head -1)"
@@ -361,7 +367,19 @@ rst_base_compare() {
   fi
   printf 'stop-tests-base: head failed; re-running the same commands on base %s in %s\n' "$sha8" "$wt" >&2
   if declare -F dprep_ensure_js_deps >/dev/null 2>&1; then
-    ( cd "$wt" && dprep_ensure_js_deps ) >&2
+    # The install output goes INTO the base log (the evidence file), not only stderr, and a
+    # failed install means the base was never prepared: unrunnable, not judged.
+    dprep_rc=0
+    ( cd "$wt" && dprep_ensure_js_deps ) > "$work/dprep.out" 2>&1 || dprep_rc=$?
+    cat "$work/dprep.out" >> "$base_log"
+    cat "$work/dprep.out" >&2
+    if [ "$dprep_rc" -ne 0 ]; then
+      printf 'stop-tests-base: dependency install failed on base (rc=%s); base is unrunnable\n' "$dprep_rc" >> "$base_log"
+      stb__remove_worktree "$top" "$wt"
+      rm -rf "$work"
+      stb__emit "$report" base_unrunnable
+      return 0
+    fi
   fi
   base_res="$( cd "$wt" && rst_run_commands "$cmds" "$base_log" )"
   stb__remove_worktree "$top" "$wt"
@@ -375,12 +393,22 @@ rst_base_compare() {
     stb__emit "$report" base_timeout
     return 0
   fi
+  bp=""; bt=""
+  case "$base_counts" in *[0-9]\ [0-9]*) bp="${base_counts%% *}"; bt="${base_counts##* }" ;; esac
+  # A base that never ran is not judged. Exit 126/127 is "cannot execute / command not
+  # found"; unparsed counts mean no usable result; a failing base with no attributable
+  # failure names would make every head failure look newly broken (empty base identity set).
+  if [ "$base_exit" = "126" ] || [ "$base_exit" = "127" ] || [ -z "$bt" ] \
+    || { [ "$base_exit" != "0" ] && ! grep -q . "$work/base.ids"; }; then
+    printf 'stop-tests-base: base did not run usably (exit %s, counts "%s"); base_unrunnable\n' "$base_exit" "$base_counts" >&2
+    rm -rf "$work"
+    stb__emit "$report" base_unrunnable
+    return 0
+  fi
   LC_ALL=C sort -u "$work/head.ids" > "$work/head.sorted"
   LC_ALL=C sort -u "$work/base.ids" > "$work/base.sorted"
   LC_ALL=C comm -23 "$work/head.sorted" "$work/base.sorted" > "$work/new.ids"
-  bp=""; bt=""
-  case "$base_counts" in *[0-9]\ [0-9]*) bp="${base_counts%% *}"; bt="${base_counts##* }" ;; esac
-  if [ "$base_exit" = "0" ] && { [ -z "$bt" ] || [ "$bp" -ge "$bt" ]; }; then
+  if [ "$base_exit" = "0" ] && [ "$bp" -ge "$bt" ]; then
     stb__names "$work/head.ids" > "$work/names"
     newnames="$(stb__join "$work/names")"
     rm -rf "$work"

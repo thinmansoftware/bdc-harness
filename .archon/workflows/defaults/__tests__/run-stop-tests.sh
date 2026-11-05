@@ -622,8 +622,9 @@ TMP5="$(mktemp -d)"
   printf '%s\n' "$?" > "$TMP5/rc"
   git status --porcelain --untracked-files=no > "$TMP5/porcelain"
 )
-assert_eq "test4 rc" "0" "$(tr -d '[:space:]' < "$TMP5/rc")"
-assert_contains "test4 failed install continues" "dprep: install failed rc=1 (continuing" "$(cat "$TMP5/out")"
+assert_eq "test4 rc is nonzero when the install fails (WO-HARNESS-EVIDENCE-GATE-NOT-GATED-AND-BASE-UNRUNNABLE-01)" "1" "$(tr -d '[:space:]' < "$TMP5/rc")"
+assert_contains "test4 failed install is reported" "dprep: install failed rc=1" "$(cat "$TMP5/out")"
+assert_contains "test4 the install is retried without the frozen lockfile" "dprep: retrying without --frozen-lockfile (bun install)" "$(cat "$TMP5/out")"
 assert_eq "test4 tracked files untouched" "" "$(cat "$TMP5/porcelain")"
 
 echo "--- test 5: npx becomes bunx when npx is absent ---"
@@ -859,7 +860,8 @@ printf '{}\n' > "$PTMP/package.json"
 : > "$PTMP/pnpm-lock.yaml"
 pout="$(cd "$PTMP" && PATH="$PBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
 prc=$?
-assert_eq "pnpm a rc" "0" "$prc"
+assert_eq "pnpm a rc is 1: the stub reports success but leaves no node_modules" "1" "$prc"
+assert_contains "pnpm a says node_modules is still absent" "install reported success but node_modules is still absent" "$pout"
 assert_eq "pnpm a argv" "install --frozen-lockfile" "$(cat "$PREC")"
 assert_eq "pnpm a GH_TOKEN scrubbed" "GH_TOKEN=unset" "$(head -1 "$PENV")"
 assert_eq "pnpm a parent GH_TOKEN remains" "production-shaped-test-value" "${GH_TOKEN-unset}"
@@ -883,7 +885,7 @@ printf '{}\n' > "$PTMPC/package.json"
 : > "$PTMPC/bun.lock"
 poutc="$(cd "$PTMPC" && PATH="$PBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
 prcc=$?
-assert_eq "pnpm c rc" "0" "$prcc"
+assert_eq "pnpm c rc is 1: the stub reports success but leaves no node_modules" "1" "$prcc"
 assert_eq "pnpm c bun argv" "install --frozen-lockfile" "$(cat "$BREC")"
 assert_contains "pnpm c bun installing line" "dprep: installing JS dependencies (bun install --frozen-lockfile)" "$poutc"
 if [ -s "$PREC" ]; then FAIL=$((FAIL + 1)); echo "FAIL: pnpm c pnpm not called"; else PASS=$((PASS + 1)); echo "PASS: pnpm c pnpm not called"; fi
@@ -994,7 +996,7 @@ assert_contains "npm e skip" "dprep: no package.json with a supported lockfile (
 assert_eq "npm e npm not called" "" "$(cat "$NREC")"
 rm -rf "$NTMP"
 
-echo "--- npm f: a failed npm ci never fails the run ---"
+echo "--- npm f: a failed npm ci is retried with npm install and reported nonzero ---"
 nreset
 cat > "$NBIN/npm" <<EOF
 #!/usr/bin/env bash
@@ -1007,8 +1009,9 @@ printf '{}\n' > "$NTMP/package.json"
 printf '{}\n' > "$NTMP/package-lock.json"
 nout="$(cd "$NTMP" && PATH="$NBIN:/usr/bin:/bin" dprep_ensure_js_deps)"
 nrc=$?
-assert_eq "npm f rc" "0" "$nrc"
-assert_contains "npm f failed install continues" "dprep: install failed rc=7 (continuing" "$nout"
+assert_eq "npm f rc is the failing install rc" "7" "$nrc"
+assert_contains "npm f failed install is reported" "dprep: install failed rc=7" "$nout"
+assert_contains "npm f falls back from npm ci to npm install" "dprep: retrying with npm install (npm ci failed)" "$nout"
 rm -rf "$NTMP"
 
 echo "--- npm g: npm missing skips cleanly ---"
