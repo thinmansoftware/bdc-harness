@@ -126,8 +126,18 @@ export interface MergeCandidateDiscoveryResult {
   readonly candidates: readonly WatchedRunRecord[];
   /** One entry per PR that was evaluated and NOT included. */
   readonly exclusions: readonly MergeCandidateExclusion[];
-  /** How many PRs were actually looked at this tick. */
+  /**
+   * How many PRs consumed EVIDENCE budget this tick (approved PRs on a watched
+   * base that got the findPullRequest / required-contexts / qualified-review
+   * lookups). Non-approved PRs never consume it; see `structurallyClassified`.
+   */
   readonly evaluated: number;
+  /**
+   * How many listed PRs were classified structurally this tick (zero GitHub
+   * calls). Every listed PR is, every pass, and each non-candidate carries a
+   * named exclusion.
+   */
+  readonly structurallyClassified: number;
   /**
    * How many evaluated PRs had their review decision resolved by the
    * conservative REST fallback instead of GitHub's own aggregate. Non-zero
@@ -245,6 +255,7 @@ export function unavailableDiscoveryResult(
     candidates: [],
     exclusions: [],
     evaluated: 0,
+    structurallyClassified: 0,
     fallbackReviewDecisions: 0,
     unavailable: true,
     unavailableReason: reason,
@@ -972,29 +983,30 @@ export async function discoverMergeCandidates(
   }
 
   const startCursor = options.cursor === undefined ? processCursor : options.cursor;
-  const queues = rotatedQueues(repos, byRepo, startCursor);
-  const totalOpen = queues.reduce((sum, entry) => sum + entry.queue.length, 0);
-  // Unevaluated PRs remaining in THIS pass. `totalOpen` is the whole population,
-  // so comparing evaluated against it would report a pass as truncated even on
-  // the tick that finishes it -- the window is truncated when work is left over.
-  const freshTotal = queues.reduce((sum, entry) => sum + entry.fresh.length, 0);
-  const sequence = interleaveByRepo(queues);
 
-  // Where each repo got to this tick, so the next tick resumes per repo rather
-  // than rewinding every repo to whichever one happened to be evaluated last.
-  const lastPerRepo = new Map<string, number>();
-  {
-    for (const pr of sequence) {
-      if (evaluated >= maxPullRequests) break;
-      evaluated += 1;
-      lastPerRepo.set(repoKey(pr.owner, pr.repo), pr.prNumber);
-      // Counted BEFORE any exclusion `continue`: the PRs this most matters for
-      // are precisely the ones the stricter fallback pushed into
-      // `review_not_approved`. Counting only survivors would hide them.
+  // STRUCTURAL CLASSIFICATION OF EVERY LISTED PR, EVERY PASS, ZERO GITHUB CALLS.
+  //
+  // The approval signal (`reviewDecision`) is already on every listed PR, so the
+  // split between "cannot merge yet" and "worth an evidence lookup" is free.
+  // Non-approved PRs used to consume the 100-slot evidence budget, so with 663
+  // open PRs an approved one waited for the rotation to reach its number (and a
+  // restart reset the rotation). Now each PR is classified here and gets a named
+  // exclusion; only approved PRs on a watched base enter the evidence queue,
+  // which the existing per-repo cursor rotates under `maxPullRequestsPerTick`.
+  let structurallyClassified = 0;
+  let totalOpen = 0;
+  const approvedByRepo = new Map<string, DiscoveredPullRequest[]>();
+  for (const target of repos) {
+    const key = repoKey(target.owner, target.repo);
+    for (const pr of byRepo.get(key) ?? []) {
+      structurallyClassified += 1;
+      totalOpen += 1;
+      // Counted for every classified PR: the PRs this most matters for are the
+      // ones the stricter fallback pushed into `review_not_approved`.
       if (pr.reviewDecisionFromFallback) fallbackReviewDecisions += 1;
 
-      const key = pullRequestKey(pr.owner, pr.repo, pr.prNumber);
-      if (alreadyCovered.has(key)) {
+      const prKey = pullRequestKey(pr.owner, pr.repo, pr.prNumber);
+      if (alreadyCovered.has(prKey)) {
         exclusions.push({
           owner: pr.owner,
           repo: pr.repo,
@@ -1004,7 +1016,6 @@ export async function discoverMergeCandidates(
         });
         continue;
       }
-
       const structural = classifyDiscoveredPullRequest(pr, explicitWatchedBases, policy);
       if (structural) {
         exclusions.push({
@@ -1016,6 +1027,26 @@ export async function discoverMergeCandidates(
         });
         continue;
       }
+      const bucket = approvedByRepo.get(key) ?? [];
+      bucket.push(pr);
+      approvedByRepo.set(key, bucket);
+    }
+  }
+
+  const queues = rotatedQueues(repos, approvedByRepo, startCursor);
+  // Unevaluated APPROVED PRs remaining in THIS pass. The window is truncated
+  // when approved work is left over, not when merely-listed PRs were skipped.
+  const freshTotal = queues.reduce((sum, entry) => sum + entry.fresh.length, 0);
+  const sequence = interleaveByRepo(queues);
+
+  // Where each repo got to this tick, so the next tick resumes per repo rather
+  // than rewinding every repo to whichever one happened to be evaluated last.
+  const lastPerRepo = new Map<string, number>();
+  {
+    for (const pr of sequence) {
+      if (evaluated >= maxPullRequests) break;
+      evaluated += 1;
+      lastPerRepo.set(repoKey(pr.owner, pr.repo), pr.prNumber);
 
       let evidence: PullRequestEvidence;
       try {
@@ -1124,6 +1155,7 @@ export async function discoverMergeCandidates(
   logger.info(
     {
       evaluated,
+      structurallyClassified,
       totalOpen,
       cursorAfter,
       truncated: evaluationWindowTruncated,
@@ -1135,6 +1167,7 @@ export async function discoverMergeCandidates(
     candidates,
     exclusions,
     evaluated,
+    structurallyClassified,
     fallbackReviewDecisions,
     unavailable: false,
     unavailableReason: null,

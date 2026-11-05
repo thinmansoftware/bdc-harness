@@ -826,8 +826,13 @@ describe('service', () => {
     expect(settled).toBe(true);
   });
 
-  test('delivery failure aborts and quiesces the watcher before rejecting', async () => {
+  // WO-HARNESS-MERGE-SWEEP-LIVENESS-AND-PAGING-01: this test used to assert that a delivery
+  // failure aborted the watcher and rejected the service -- the exact coupling that stopped the
+  // merge sweep on 2026-11-04. The delivery scheduler now isolates its own failures.
+  test('delivery failure is isolated; the watcher keeps polling', async () => {
+    const controller = new AbortController();
     let watcherPolls = 0;
+    let drains = 0;
     const deps = {
       listRunsForWatch: async () => {
         watcherPolls += 1;
@@ -844,17 +849,19 @@ describe('service', () => {
         enabled: true,
         adapterKind: 'fake',
         deps,
+        signal: controller.signal,
         intervalMs: 1,
         deliveryEnabled: true,
         deliveryIntervalMs: 1,
         deliveryDrain: async () => {
+          drains += 1;
+          if (drains === 2) controller.abort();
           throw new Error('delivery_drain_failed');
         },
       })
-    ).rejects.toThrow('delivery_drain_failed');
-    const pollsAfterReject = watcherPolls;
-    await new Promise<void>(resolve => setTimeout(resolve, 10));
-    expect(watcherPolls).toBe(pollsAfterReject);
+    ).resolves.toBeUndefined();
+    expect(drains).toBe(2);
+    expect(watcherPolls).toBeGreaterThan(0);
   });
 
   test('reconcile failure is isolated and the scheduler retries', async () => {

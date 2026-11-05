@@ -107,6 +107,8 @@ export interface OverseerServiceOptions {
    */
   mergeBridgeRun?: () => Promise<unknown>;
   mergeBridgeEnabled?: boolean;
+  /** Tests inject a spy for the delivery isolation line; defaults to the module logger. */
+  logger?: { error?(obj: Record<string, unknown>, msg: string): void };
 }
 
 export async function runOperatorCardDeliveryScheduler(input: {
@@ -116,6 +118,8 @@ export async function runOperatorCardDeliveryScheduler(input: {
   once?: boolean;
   drain?: () => Promise<unknown>;
   channels?: OperatorCardChannel[];
+  /** Tests inject a spy; defaults to the module logger. */
+  logger?: { error?(obj: Record<string, unknown>, msg: string): void };
 }): Promise<void> {
   const drain =
     input.drain ??
@@ -126,7 +130,19 @@ export async function runOperatorCardDeliveryScheduler(input: {
       }));
   for (;;) {
     if (input.signal?.aborted) return;
-    await drain();
+    // Isolated like the reconcile and merge-bridge schedulers. On 2026-11-04 a
+    // SQLITE_BUSY thrown here went uncaught through abortOnFailure and stopped
+    // the watcher and merge bridge with it, for an hour, with nothing to restart them.
+    try {
+      await drain();
+    } catch (error) {
+      const customLogger = input.logger;
+      const emit = (obj: Record<string, unknown>, msg: string): void => {
+        if (customLogger?.error) customLogger.error(obj, msg);
+        else log.error(obj, msg);
+      };
+      emit({ err: error as Error }, 'overseer.delivery.iteration_failed_isolated');
+    }
     if (input.once || input.signal?.aborted) return;
     await waitForDeliveryInterval(input.intervalMs ?? 30_000, input.signal);
   }
@@ -532,6 +548,7 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
       once: options.once,
       channels: options.deliveryChannels,
       drain: options.deliveryDrain,
+      ...(options.logger === undefined ? {} : { logger: options.logger }),
     });
     tasks.push(delivery);
   }

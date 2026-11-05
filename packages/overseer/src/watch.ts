@@ -2,6 +2,7 @@ import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import { TERMINAL_WORKFLOW_STATUSES } from '@archon/workflows/schemas/workflow-run';
 import { createLogger } from '@archon/paths';
 import { classifyError } from './classify';
+import { recordSweepProgress } from './merge-sweep-liveness';
 import { decide } from './decide';
 import { isPrMergeReady, isPrGreen, judgePullRequest } from './judge-pr';
 import {
@@ -321,6 +322,7 @@ export async function watchOnce(
   options: WatchOnceOptions = {}
 ): Promise<WatchedRunRecord[]> {
   const heartbeatLogger: WatchHeartbeatLogger = options.logger ?? log;
+  recordSweepProgress();
   const runs = await deps.listRunsForWatch();
   // listRunsForWatch is oldest-first. Filter non-terminal rows, then continue the
   // current fair pass so permanently unmerged old rows cannot hide later work.
@@ -435,6 +437,9 @@ export async function watchOnce(
       runsEvaluated: terminalRuns.length,
       runsTotal: runs.length,
       prsEvaluated: discovery.evaluated,
+      // Every listed PR is classified structurally each pass at zero GitHub cost;
+      // only approved ones consume evidence budget (`prsEvaluated`).
+      prsClassified: discovery.structurallyClassified,
       prCandidates: discovery.candidates.length,
       prDiscoveryUnavailable: discovery.unavailable,
       // Null when discovery ran. Otherwise the reason token; the matching warn
@@ -458,6 +463,7 @@ export async function watchOnce(
     },
     'merge-coordinator.heartbeat_evaluated'
   );
+  recordSweepProgress();
   return outcomes;
 }
 
@@ -491,7 +497,9 @@ export async function watchLoop(
     for (const record of records) {
       if (options.signal?.aborted) return;
       await onRecord(record);
+      recordSweepProgress();
     }
+    recordSweepProgress();
     if (options.once) return;
     await new Promise<void>(resolve => {
       const signal = options.signal;
