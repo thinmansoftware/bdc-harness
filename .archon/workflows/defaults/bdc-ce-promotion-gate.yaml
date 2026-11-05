@@ -10,7 +10,7 @@ description: |
   Depends on: WO-RELEASE-CE-BRANCH-MODEL-01 (branch exists), WO-CI-CE-REGRESSION-SUITE-01 (regression check name).
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
   - id: read-spec

@@ -1,6 +1,6 @@
 name: bdc-feature-development-codex-only
 description: |
-  ZERO-CLAUDE Codex lane. All prompt seats on Codex (gpt-5.6-sol). Use when Claude
+  ZERO-CLAUDE Codex lane. All prompt seats on Codex (gpt-6.1-sol). Use when Claude
   usage is exhausted but OpenAI/Codex quota remains. Model-free *-opr / *-codex
   personas only (F1 invariant). Not dual-cap (still needs Codex).
 
@@ -14,10 +14,10 @@ run_authority:
     - docs/work-orders/{WO_ID}.md
     - docs/superpowers/specs/{WO_ID}.md
   allow_issue_fallback: true
-# Codex build lane: Codex/gpt-5.6-sol is the build default. war-council-validator is
+# Codex build lane: Codex/gpt-6.1-sol is the build default. war-council-validator is
 # pinned to claude/sonnet on the node. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
 provider: codex
-model: gpt-5.6-sol
+model: gpt-6.1-sol
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -815,7 +815,7 @@ nodes:
     # which pinned the tail nodes but missed plan/plan-review. Anchor: runs 723842fe,
     # 10f6add0, 28e98197 (2026-07-01) all died at plan with the persona fault.
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     agent: war-council-architect-opr
     depends_on: [plan, checkout-repair-target]
     trigger_rule: all_done
@@ -1143,7 +1143,7 @@ nodes:
   - id: implement
     idle_timeout: 600000
     provider: codex
-    model: gpt-5.6-sol
+    model: gpt-6.1-sol
     depends_on: [prep-dependencies, repair-gate]
     trigger_rule: all_done
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $gate-already-satisfied.output.ALREADY_SATISFIED != 'true'"
@@ -3092,7 +3092,7 @@ nodes:
     # (persona pin law, wiki doctrine/archon-yaml-authoring 2026-07-02).
     # Superseded by the apex-rung WO (bdc-xo issue #575) when it lands.
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     persona: captain-ci-validator-codex
     depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
     task_class: medium_work
@@ -3242,7 +3242,7 @@ nodes:
     failover_agent: opr-adversarial-reviewer
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     agent: codex-adversarial-reviewer
     depends_on: [capture-diff]
     task_class: medium_work
@@ -3298,7 +3298,7 @@ nodes:
 
   - id: diff-repair
     provider: codex
-    model: gpt-5.6-sol
+    model: gpt-6.1-sol
     depends_on: [diff-review, classify-diff-review, resolve-review-base, repair-gate]
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -3504,7 +3504,7 @@ nodes:
     failover_agent: opr-adversarial-reviewer
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     agent: codex-adversarial-reviewer
     depends_on: [diff-review, classify-diff-review, diff-repair, capture-diff-final]
     trigger_rule: all_done
@@ -3609,7 +3609,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: codex
-    model: gpt-5.6-sol
+    model: gpt-6.1-sol
     depends_on: [block-classify, repair-gate]
     when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $block-classify.output.status == 'BLOCKED'"
     prompt: |
@@ -3676,7 +3676,7 @@ nodes:
     failover_agent: opr-adversarial-reviewer
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     agent: codex-adversarial-reviewer
     depends_on: [classify-opus-repair]
     trigger_rule: all_done
@@ -3913,7 +3913,7 @@ nodes:
     failover_model: moonshotai/kimi-k3.1-pro
     persona: xo-opr
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -4048,7 +4048,7 @@ nodes:
     failover_agent: opr-adversarial-reviewer
     persona: codex-adversarial-reviewer
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     agent: codex-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done

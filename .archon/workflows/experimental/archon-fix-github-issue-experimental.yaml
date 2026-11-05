@@ -40,7 +40,7 @@ description: |
   9. Reports results back to the GitHub issue with follow-up suggestions
 
 provider: claude
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
   # ---------------------------------------------------------------
@@ -112,7 +112,7 @@ nodes:
 
       Provide reasoning that covers all three decisions.
     depends_on: [fetch-issue]
-    model: haiku
+    model: claude-haiku-5-5
     allowed_tools: []
     output_format:
       type: object
@@ -260,7 +260,7 @@ nodes:
     command: archon-fix-issue
     depends_on: [bridge-artifacts]
     context: fresh
-    model: opus[1m]
+    model: claude-opus-5-5[1m]
 
   # ---------------------------------------------------------------
   # PHASE 5: VALIDATE
@@ -350,7 +350,7 @@ nodes:
 
       Provide your reasoning for each decision.
     depends_on: [review-scope]
-    model: haiku
+    model: claude-haiku-5-5
     allowed_tools: []
     context: fresh
     output_format:

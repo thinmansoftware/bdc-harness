@@ -46,7 +46,7 @@ description: |
   WO Class: INFRA. parallel_ok: false (touches the deploy script for the shared container).
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 inputs:
   WO_ID:

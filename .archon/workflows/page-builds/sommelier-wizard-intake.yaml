@@ -8,7 +8,7 @@ description: |
 # Rule 6 -- policyFile declared, repo-relative (no BDC_XO/ prefix)
 policyFile: harness/policies/agent-behavior.md
 
-# Rule 1 -- model: sonnet at root (per-node opus override on implement only)
+# Rule 1 -- model: claude-sonnet-5-5 at root (per-node opus override on implement only)
 model: claude-sonnet-4-5
 
 nodes:
@@ -112,7 +112,7 @@ nodes:
   - id: implement
     depends_on: [plan]
     task_class: medium_work
-    model: opus[1m]
+    model: claude-opus-5-5[1m]
     loop:
       prompt: |
         Implement the approved plan for the Sommelier Wizard V2 INTAKE Work Order.

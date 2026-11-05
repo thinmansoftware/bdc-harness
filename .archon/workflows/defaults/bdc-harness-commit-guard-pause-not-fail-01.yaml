@@ -17,7 +17,7 @@
 # EXACTLY THREE loops (plan-review + implement + diff-repair). All three carry
 #   prompt + until + max_iterations + fresh_context per Rule 10.
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time):
-#   R1 model: sonnet root; R2 inputs.WO_ID baked in; R3 fresh_context on all loops;
+#   R1 model: claude-sonnet-5-5 root; R2 inputs.WO_ID baked in; R3 fresh_context on all loops;
 #   R4 repo-root-relative paths (no BDC_XO/ prefix);
 #   R5 docs/work-orders/ -> docs/superpowers/specs/ -> date-prefix glob -> issue body;
 #   R6 policyFile harness/policies/agent-behavior.md;
@@ -49,7 +49,7 @@ description: |
 
 policyFile: harness/policies/agent-behavior.md
 provider: claude
-model: sonnet
+model: claude-sonnet-5-5
 target_repo: thinmansoftware/bdc-harness
 
 # Rule 12 (inputs block): no `type:` field. WO_ID is baked in so the child

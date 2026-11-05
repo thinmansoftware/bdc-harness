@@ -35,7 +35,7 @@ description: |
 
 policyFile: harness/policies/agent-behavior.md
 provider: claude
-model: sonnet
+model: claude-sonnet-5-5
 target_repo: thinmansoftware/bdc-xo
 
 # 2026-05-16 fix v2: Cauldron API ONLY accepts conversationId + message -- the
@@ -354,8 +354,8 @@ nodes:
             || echo "  WARN: $WO_ID spec missing ## 1. Objective header"
           grep -q "## 12. Stop Point" "$SPEC" \
             || echo "  WARN: $WO_ID spec missing ## 12. Stop Point header"
-          grep -q "model: sonnet" "$YAML" \
-            || echo "  WARN: $WO_ID YAML missing model: sonnet (Rule 1)"
+          grep -q "model: claude-sonnet-5-5" "$YAML" \
+            || echo "  WARN: $WO_ID YAML missing model: claude-sonnet-5-5 (Rule 1)"
           grep -q "policyFile:" "$YAML" \
             || echo "  WARN: $WO_ID YAML missing policyFile (Rule 6)"
           echo "PASS: $WO_ID (spec + YAML present)"
@@ -588,7 +588,7 @@ nodes:
       Merge ancestors:
         - bdc-xo main HEAD: [SHA from $commit-and-push.output], behind_by: 0
       Grep assertions:
-        - bdc-xo: grep -c 'model: sonnet' yaml-drafts/<first_passing_WO_ID>.yaml -> 1
+        - bdc-xo: grep -c 'model: claude-sonnet-5-5' yaml-drafts/<first_passing_WO_ID>.yaml -> 1
         - bdc-xo: grep -c '## 12. Stop Point' docs/work-orders/<first_passing_WO_ID>.md -> 1
         - bdc-harness: grep -n 'bdc-author-wo-batch' .archon/workflows/defaults/bdc-author-wo-batch.yaml -> >= 1
         - bdc-harness: grep -n 'adversarial' .archon/workflows/defaults/bdc-author-wo-batch.yaml -> >= 1

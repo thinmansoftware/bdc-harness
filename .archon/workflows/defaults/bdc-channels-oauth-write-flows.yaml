@@ -29,7 +29,7 @@ description: |
   Polish bar: ROUGH OK -- v1 limitations explicit (no token refresh, no validation ping).
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
 

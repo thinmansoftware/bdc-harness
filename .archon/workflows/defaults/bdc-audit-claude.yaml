@@ -32,7 +32,7 @@ description: |
   code-correctness bugs that a report cannot have.
 policyFile: harness/policies/agent-behavior.md
 provider: claude
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (mirrors bdc-feature-development).

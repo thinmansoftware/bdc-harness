@@ -9,7 +9,7 @@ description: |
   NOT for: Theme shell work, PDP/PullList/Wizard rebuilds, generic feature WOs (use bdc-feature-development).
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
   # 1. Read the WO spec from disk (Rule 4 + Rule 5: relative path + date-prefix glob fallback)

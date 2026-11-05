@@ -1,7 +1,7 @@
 schema_version: '1'
 id: deploy-wp-store
 name: deploy-wp-store
-model: sonnet
+model: claude-sonnet-5-5
 description: |
   On-demand WordPress + WooCommerce store provisioning for a single tenant on Hetzner.
   PHASE 1 -- MANUAL John-gated path only.

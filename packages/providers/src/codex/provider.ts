@@ -82,9 +82,9 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
 // The live, API-supported Codex frontier model. Used as the explicit default when
 // no model is resolved from the node/config, so the Codex SDK never falls back to its
 // own stale account default (gpt-5.3-codex), which the ChatGPT-account API rejects (400).
-// Verified live with codex-cli 0.144.5 on 2026-07-17 (slug "gpt-5.6-sol").
+// Verified live on 2026-11-04 (slug "gpt-6.1-sol").
 // Update this one constant if the account's frontier model changes.
-const CODEX_DEFAULT_MODEL = 'gpt-5.6-sol';
+export const CODEX_FALLBACK_MODEL = 'gpt-6.1-sol';
 
 const ANTHROPIC_MODEL_ALIASES: ReadonlySet<string> = new Set([
   'sonnet',
@@ -125,10 +125,15 @@ function buildThreadOptions(
   // pin a known-good live Codex model EXPLICITLY rather than letting the Codex SDK
   // fall back to its own account default -- that default is the stale `gpt-5.3-codex`,
   // which the ChatGPT-account API now rejects with HTTP 400 ("model is not supported").
-  // CODEX_DEFAULT_MODEL is the live, API-supported frontier model. This is the
+  // CODEX_FALLBACK_MODEL is the live, API-supported frontier model. This is the
   // single chokepoint every codex call flows through, so fixing it here fixes
   // unpinned workflow calls at once.
-  const resolvedModel = candidateAfterAliasDrop ?? CODEX_DEFAULT_MODEL;
+  const resolvedModel =
+    candidateAfterAliasDrop === undefined
+      ? CODEX_FALLBACK_MODEL
+      : Object.hasOwn(CODEX_MODEL_FALLBACKS, candidateAfterAliasDrop)
+        ? CODEX_MODEL_FALLBACKS[candidateAfterAliasDrop]
+        : candidateAfterAliasDrop;
   return {
     workingDirectory: cwd,
     skipGitRepoCheck: true,
@@ -154,8 +159,8 @@ function buildCodexEnv(requestEnv: Record<string, string>): Record<string, strin
 // "model not available" help message. Both gpt-5.3-codex and gpt-5.2-codex are
 // dead (not in the account's models_cache.json); point them at the live default.
 const CODEX_MODEL_FALLBACKS: Record<string, string> = {
-  'gpt-5.3-codex': CODEX_DEFAULT_MODEL,
-  'gpt-5.2-codex': CODEX_DEFAULT_MODEL,
+  'gpt-5.3-codex': CODEX_FALLBACK_MODEL,
+  'gpt-5.2-codex': CODEX_FALLBACK_MODEL,
 };
 
 function isModelAccessError(errorMessage: string): boolean {

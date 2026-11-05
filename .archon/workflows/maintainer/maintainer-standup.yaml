@@ -15,7 +15,7 @@ description: |
            (use repo-triage).
 
 provider: claude
-model: sonnet
+model: claude-sonnet-5-5
 
 worktree:
   enabled: false   # Live checkout -- needs to git pull and read .archon/maintainer-standup/

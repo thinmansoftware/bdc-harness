@@ -4001,7 +4001,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).

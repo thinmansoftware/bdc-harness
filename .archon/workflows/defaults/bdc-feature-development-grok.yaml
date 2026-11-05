@@ -3249,7 +3249,7 @@ nodes:
 
   - id: diff-review
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: gpt-6.1-sol
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -3526,7 +3526,7 @@ nodes:
 
   - id: diff-review-final
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: gpt-6.1-sol
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -3698,7 +3698,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: gpt-6.1-sol
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -3935,7 +3935,7 @@ nodes:
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: gpt-6.1-sol
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -4070,7 +4070,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     provider: codex-opr
-    model: gpt-5.6-sol
+    model: gpt-6.1-sol
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).

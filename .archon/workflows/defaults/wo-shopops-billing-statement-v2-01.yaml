@@ -4,7 +4,7 @@
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring verified at draft time
 #
 # Rule compliance checklist (verify before sync):
-#  [x] Rule 1:  model: sonnet at workflow root
+#  [x] Rule 1:  model: claude-sonnet-5-5 at workflow root
 #  [x] Rule 2:  bash blocks use $WORKFLOW_ID (not ${run.id}); branch suffix uses date +%Y%m%d%H%M%S
 #  [x] Rule 3:  implement loop has fresh_context: true
 #  [x] Rule 4:  all paths relative to repo root (no BDC_XO/ prefix)
@@ -72,7 +72,7 @@ description: |
   NOT for: any other WO. Not for /statements/v2 Stripe/Manual path (separate WO).
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 inputs:
   WO_ID:

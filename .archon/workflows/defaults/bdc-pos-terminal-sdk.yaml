@@ -30,7 +30,7 @@ description: |
   parallel_ok: true (POS-lane WO; no schema conflicts with other lanes).
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
 

@@ -29,7 +29,7 @@ run_authority:
 # All OTHER nodes keep their persona bindings unchanged.
 #
 # APEX COMPOSITION -- M-121 (John, 2026-08-04): this lane is the ladder's TOP. It
-# holds BOTH apex models: gpt-5.6-sol (codex seats below) and real claude-fable-5
+# holds BOTH apex models: gpt-6.1-sol (codex seats below) and real claude-fable-5
 # (this root + war-council-validator). Sol attempts first at the seats it holds;
 # Fable is the genuine last resort, which keeps Fable usage rare BY CONSTRUCTION
 # rather than by policy. "If these two models cant do it it cant be done" (John).
@@ -3251,7 +3251,7 @@ nodes:
 
   - id: diff-review
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
     # stands). openrouter is the repository-capable OpenRouter tool loop (opr is
     # text-only and cannot run this read-the-repo reviewer). WO-HARNESS-SEAT-GATE-
@@ -3513,7 +3513,7 @@ nodes:
 
   - id: diff-review-final
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
     # stands). openrouter is the repository-capable OpenRouter tool loop (opr is
     # text-only and cannot run this read-the-repo reviewer). WO-HARNESS-SEAT-GATE-
@@ -3683,7 +3683,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
     # stands). openrouter is the repository-capable OpenRouter tool loop (opr is
     # text-only and cannot run this read-the-repo reviewer). WO-HARNESS-SEAT-GATE-
@@ -4051,7 +4051,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    model: gpt-6.1-terra
     # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
     # stands). openrouter is the repository-capable OpenRouter tool loop (opr is
     # text-only and cannot run this read-the-repo reviewer). WO-HARNESS-SEAT-GATE-

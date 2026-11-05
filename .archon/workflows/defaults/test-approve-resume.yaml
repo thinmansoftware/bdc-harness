@@ -3,7 +3,7 @@ description: |
   Harness-only regression fixture for bdc-xo#86.
   Verifies an interactive approval loop resumes into the next node after Approve.
 
-model: sonnet
+model: claude-sonnet-5-5
 interactive: true
 worktree:
   enabled: false

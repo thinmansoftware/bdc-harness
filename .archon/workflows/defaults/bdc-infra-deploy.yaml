@@ -10,7 +10,7 @@ description: |
        Every WO using this YAML must declare parallel_ok=false.
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
   - id: read-spec
@@ -146,7 +146,7 @@ nodes:
     depends_on: [plan-change]
     loop:
       task_class: medium_work
-      model: opus[1m]
+      model: claude-opus-5-5[1m]
       prompt: |
         Execute the approved infra deployment plan.
 
