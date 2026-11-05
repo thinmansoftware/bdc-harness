@@ -2651,6 +2651,15 @@ nodes:
       #        whose first word is grep, egrep, fgrep, rg, git grep, node, bun, bunx, npm, npx,
       #        wc or "test -" is an uncounted command line: declared and unparsed, so
       #        none_declared can no longer sit next to an uncounted command line.
+      #   OPERATOR CHECKS: a header whose parenthesised tag is EXACTLY "(operator check)",
+      #   case-insensitive (for example "Stop 6 (operator check): sign in on the desktop"), is a
+      #   stop only a person can run; "(operator proof", "(operator)" and "(operator check, x)" are
+      #   not the tag and stay untagged prose. Its block
+      #   is skipped and emitted as one "OPERATOR<TAB><header text>" record, which rsg_run reports
+      #   as a visible "SKIPPED (operator check)" entry and GREP_OPERATOR=<n>. It is never counted,
+      #   never failed and never silently dropped. An UNTAGGED prose stop stays unparsed (fail
+      #   closed); when every stop in the spec is operator-tagged rsg_run reports
+      #   GREP_STATUS=operator_only with a loud stderr warning, never a silent pass.
       #   STAGE SCOPING (found live, MIXED / multi-stage specs): the stage list is the "repo:
       #   <owner/name>" entries of the spec's FIRST "stages:" block, every entry kept in order and
       #   never deduplicated (a repository listed twice is two stages; stage N is entry N; a second
@@ -2768,6 +2777,7 @@ nodes:
             flush(); inblk = 1; hdr = clean($0); l = tolower(hdr)
             legacy = ($0 ~ /^[ \t]*[*]*[Ss]top[ \t]+[0-9A-Za-z.]+[ \t]*\(([Gg]rep|[Aa]ssert)/)
             excl = (l ~ /^[ \t]*[*_]*stop[ \t]+[0-9a-z.]+[ \t]*[(:][ \t]*(test|unit|suite)/)
+            if (l ~ /^[ \t]*[*_]*stop[ \t]+[0-9a-z.]+[ \t]*[(][ \t]*operator[ \t]+check[ \t]*[)]/) { excl = 1; print "OPERATOR\t" hdr }
             bexp = 0; bcmds = 0; pending = ""
             oth = 0; othtag = ""
             if (cur != "" && !excl) {
@@ -3048,7 +3058,7 @@ nodes:
       }
       # rsg_run   (extracted TSV on stdin -> GREP_* summary lines + per-assertion detail)
       rsg_run() {
-        local line cmd op n obs declared=0 executed=0 dropped=0 unparsed=0 unparsed_names="" mismatch=0 out="" detail="" status tab other=0 skipped_out="" ocmd otag
+        local line cmd op n obs declared=0 executed=0 dropped=0 unparsed=0 unparsed_names="" mismatch=0 out="" detail="" status tab other=0 skipped_out="" ocmd otag operator=0 operator_out=""
         tab="$(printf '\t')"
         while IFS= read -r line; do
           case "$line" in
@@ -3065,6 +3075,13 @@ nodes:
               other=$((other + 1))
               detail="${detail}SKIPPED (other-stage: $otag): $ocmd"$'\n'
               skipped_out="${skipped_out:+$skipped_out; }SKIPPED (other-stage): $ocmd"
+              continue
+              ;;
+            OPERATOR*)
+              line="${line#OPERATOR*"$tab"}"
+              operator=$((operator + 1))
+              detail="${detail}SKIPPED (operator check): $line"$'\n'
+              operator_out="${operator_out:+$operator_out; }SKIPPED (operator check): $line"
               continue
               ;;
             "") continue ;;
@@ -3115,7 +3132,16 @@ nodes:
           fi
           out="$out; $skipped_out"
         fi
-        printf 'GREP_DECLARED=%s\nGREP_EXECUTED=%s\nGREP_DROPPED=%s\nGREP_UNPARSED=%s\nGREP_MISMATCH=%s\nGREP_OTHER_STAGE=%s\nGREP_STATUS=%s\nGREP_LINE=%s\n' "$declared" "$executed" "$dropped" "$unparsed" "$mismatch" "$other" "$status" "$out"
+        if [ "$operator" -gt 0 ]; then
+          if [ "$declared" -eq 0 ]; then
+            status="operator_only"
+            out="N/A (all $operator stop condition(s) are operator checks; nothing in this spec was verified mechanically)"
+            if [ "$other" -gt 0 ]; then out="$out; $skipped_out"; fi
+            echo "run-stop-greps: WARNING: GREP_STATUS=operator_only -- no machine gate exists: every stop condition in this spec is an operator check ($operator) and none was verified mechanically: $operator_out" >&2
+          fi
+          out="$out; $operator_out"
+        fi
+        printf 'GREP_DECLARED=%s\nGREP_EXECUTED=%s\nGREP_DROPPED=%s\nGREP_UNPARSED=%s\nGREP_MISMATCH=%s\nGREP_OTHER_STAGE=%s\nGREP_OPERATOR=%s\nGREP_STATUS=%s\nGREP_LINE=%s\n' "$declared" "$executed" "$dropped" "$unparsed" "$mismatch" "$other" "$operator" "$status" "$out"
         if [ -n "$detail" ]; then
           printf -- '--- per-assertion detail ---\n%s' "$detail"
         fi

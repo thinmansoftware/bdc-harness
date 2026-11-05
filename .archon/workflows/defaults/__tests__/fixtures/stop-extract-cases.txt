@@ -206,7 +206,7 @@ Stop 1 (runtime proof):
   ssh hetzner-prod "docker exec app grep -c x /app/y"
   Expected: at least 1
 
-Stop 2 (operator check):
+Stop 2 (live probe):
   curl -s https://example.test/health
   Expected: 200
 
@@ -511,4 +511,45 @@ grep -c b f	eq	2
 grep -c c f	eq	3
 UNPARSED	0
 DECLARED	3
+@@END
+@@CASE operator_check_skipped_visibly
+## 8. Stop conditions
+
+Stop 1 (grep assertion):
+  grep -c x f
+  Expected: 1
+
+Stop 2 (operator check): sign in on the desktop and confirm the page loads.
+  Expected: the page loads.
+@@EXPECT
+grep -c x f	eq	1
+OPERATOR	Stop 2 (operator check): sign in on the desktop and confirm the page loads.
+UNPARSED	0
+DECLARED	1
+@@END
+@@CASE untagged_prose_stop_next_to_operator
+## 8. Stop conditions
+
+Stop 1 (operator check): do X on the desktop.
+  Expected: done.
+
+Stop 2 (staging works): open the page
+@@EXPECT
+OPERATOR	Stop 1 (operator check): do X on the desktop.
+UNPARSED	1	Stop 2 (staging works): open the page
+DECLARED	1
+@@END
+@@CASE all_operator_stops
+## 8. Stop conditions
+
+Stop 1 (operator check): do A.
+  Expected: done.
+
+Stop 2 (Operator Check): do B.
+  Expected: done.
+@@EXPECT
+OPERATOR	Stop 1 (operator check): do A.
+OPERATOR	Stop 2 (Operator Check): do B.
+UNPARSED	0
+DECLARED	0
 @@END
