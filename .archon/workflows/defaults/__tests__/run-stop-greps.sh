@@ -822,12 +822,69 @@ assert_contains "a backticked command with no inline expectation pairs with the 
 assert_contains "and the first pending grep is unparsed" "UNPARSED${TAB}1${TAB}grep -c a f" "$INL2"
 named_end inline_command_closes_a_pending_command
 
+# ---------------------------------------------------------------------------
+# Round 4 (Overseer CHANGES_REQUESTED at aa9950d1, rescoped to fail-closed pairing): inside a
+# stop block a pending counted command is closed ONLY by its immediately following Expected
+# line (blank lines between them are allowed); ANY other non-blank line closes it as UNPARSED.
+# ---------------------------------------------------------------------------
+echo "--- env_prefixed_foreign_closes_pending ---"
+named_begin
+ENVF="$(printf '## 8. Stop conditions\n\nStop 1 (env foreign):\n  grep -c missing /dev/null\n  LC_ALL=C curl -s https://example.test/health\n  Expected: 0\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "the grep is declared and unparsed" "UNPARSED${TAB}1${TAB}grep -c missing /dev/null" "$ENVF"
+assert_eq "no grep assertion is emitted" "0" "$(count_records "$ENVF")"
+assert_contains "DECLARED is 1" "DECLARED${TAB}1" "$ENVF"
+ENVFR="$(cd "$HERE" && printf '## 8. Stop conditions\n\nStop 1 (env foreign):\n  grep -c missing /dev/null\n  LC_ALL=C curl -s https://example.test/health\n  Expected: 0\n' | RSG_STAGE_REPO=x/y rsg_extract | rsg_run)"
+assert_eq "the stop can no longer pass (nothing executed)" "all_dropped" "$(kv GREP_STATUS "$ENVFR")"
+for pre in 'FOO=1 BAR=2 ssh host true' 'cd sub && curl -s u' 'sudo -n docker ps' 'env X=1 gh pr view'; do
+  EP="$(printf "## 8. Stop conditions\n\nStop 1 (foreign):\n  grep -c x f\n  $pre\n  Expected: 0\n" | RSG_STAGE_REPO=x/y rsg_extract)"
+  assert_eq "foreign line closes the pending grep: $pre" "0" "$(count_records "$EP")"
+done
+named_end env_prefixed_foreign_closes_pending
+
+echo "--- any_nonblank_line_closes_pending ---"
+named_begin
+for mid in '  (run from the repo root)' '- a bullet note' '  `curl -s https://example.test/health`' '  1. numbered note' '  **bold note**' '  # a comment-looking line' '  cd sub'; do
+  NB="$(printf '## 8. Stop conditions\n\nStop 1 (closed by a line):\n  grep -c x f\n%s\n  Expected: 1\n' "$mid" | RSG_STAGE_REPO=x/y rsg_extract)"
+  assert_contains "the grep is unparsed when this line follows it: $mid" "UNPARSED${TAB}1${TAB}grep -c x f" "$NB"
+  assert_eq "and the Expected pairs with nothing: $mid" "0" "$(count_records "$NB")"
+done
+NBH="$(printf '## 8. Stop conditions\n\nStop 1 (closed by the next header):\n  grep -c x f\n\nStop 2 (next):\n  grep -c y f\n  Expected: 2\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "a following header closes the pending command" "UNPARSED${TAB}1${TAB}grep -c x f" "$NBH"
+assert_contains "and the next block pairs normally" "grep -c y f${TAB}eq${TAB}2" "$NBH"
+named_end any_nonblank_line_closes_pending
+
+echo "--- blank_lines_between_command_and_expected_pair ---"
+named_begin
+BLK="$(printf '## 8. Stop conditions\n\nStop 1 (blank lines):\n  grep -c x f\n\n\n   \n  Expected: 2\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "blank and whitespace-only lines between command and Expected still pair" "grep -c x f${TAB}eq${TAB}2" "$BLK"
+assert_contains "UNPARSED is 0" "UNPARSED${TAB}0" "$BLK"
+BLKF="$(printf '## 8. Stop conditions\n\nStop 1 (fenced):\n```\n  grep -c x f\n```\n  Expected: 2\n```\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "a command wrapped in a code fence still pairs (fence lines are not content)" "grep -c x f${TAB}eq${TAB}2" "$BLKF"
+named_end blank_lines_between_command_and_expected_pair
+
+echo "--- earlier_round_repros_still_hold ---"
+named_begin
+RR1="$(printf '## 8. Stop conditions\n\nStop 1 (route check):\n  `grep -c x f`\n  Expected: 2\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "round 1: backticked command plus a separate Expected is one assertion" "grep -c x f${TAB}eq${TAB}2" "$RR1"
+RR1B="$(printf '## 8. Stop conditions\n\nStop 1 (mixed):\n  grep -c x f\n  curl -s https://example.test/health\n  Expected: 0\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "round 1: grep, curl, Expected: 0 leaves the grep unparsed" "UNPARSED${TAB}1${TAB}grep -c x f" "$RR1B"
+RR2="$(printf '## 8. Stop conditions\n\nStop 1 (tabbed):\n  grep\t-c x f\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "round 2: a tab-separated grep is counted" "grep -c x f${TAB}eq${TAB}1" "$RR2"
+RR2B="$(printf '## 8. Stop conditions\n\nStop 1 (inline):\n  grep -c missing f\n- `grep -c x f` returns 1\n  Expected: 0\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "round 3: an inline command closes the earlier pending command" "UNPARSED${TAB}1${TAB}grep -c missing f" "$RR2B"
+assert_contains "round 3: the inline command keeps its own expectation" "grep -c x f${TAB}eq${TAB}1" "$RR2B"
+named_end earlier_round_repros_still_hold
+
 echo "--- every_counted_command_pairs_with_its_own_expected_or_is_unparsed (mixed-sequence table + seeded fuzz) ---"
 named_begin
 export RSG_STAGE_REPO=thinmansoftware/fuzz-none
 fz_close() {
   # close a pending counted command as unparsed (the invariant under test)
   case "$FZ_PENDING" in zq*) FZ_UNP="$FZ_UNP $FZ_PENDING"; FZ_ANYC=1 ;; esac
+}
+fz_other() {
+  # any non-blank line that is not a counted command closes a pending counted command too
+  fz_close; FZ_PENDING=OTHER
 }
 fz_check() {
   # fz_check <tokens...>: render the sequence, compute the oracle, compare with rsg_extract
@@ -842,13 +899,16 @@ fz_check() {
       T)  spec="$spec  grep${TAB}-c $id f"$'\n'; fz_close; FZ_PENDING="$id" ;;
       BL) spec="$spec- grep -c $id f"$'\n'; fz_close; FZ_PENDING="$id" ;;
       BQ) spec="$spec  \`grep -c $id f\`"$'\n'; fz_close; FZ_PENDING="$id" ;;
-      F)  spec="$spec  curl -s https://x.test/$k"$'\n'; fz_close; FZ_PENDING=FOREIGN ;;
+      F)  spec="$spec  curl -s https://x.test/$k"$'\n'; fz_other ;;
+      LF) spec="$spec  LC_ALL=C curl -s https://x.test/$k"$'\n'; fz_other ;;
+      BF) spec="$spec- curl -s https://x.test/$k"$'\n'; fz_other ;;
+      QF) spec="$spec  \`curl -s https://x.test/$k\`"$'\n'; fz_other ;;
       I)  n=$((100 + k)); spec="$spec- \`grep -c $id f\` returns $n"$'\n'; fz_close; paired="$paired $id=$n"; FZ_ANYC=1; FZ_PENDING="" ;;
       E)  spec="$spec  Expected: $k"$'\n'; FZ_ANYE=1
           case "$FZ_PENDING" in zq*) paired="$paired ${FZ_PENDING}=$k"; FZ_ANYC=1 ;; esac
           FZ_PENDING="" ;;
       B)  spec="$spec"$'\n' ;;
-      P)  spec="$spec  note that this matters"$'\n' ;;
+      P)  spec="$spec  note that this matters"$'\n'; fz_other ;;
     esac
   done
   case "$FZ_PENDING" in zq*) FZ_UNP="$FZ_UNP $FZ_PENDING"; FZ_ANYC=1 ;; esac
@@ -872,13 +932,14 @@ fz_check() {
 }
 FZ_TABLE=(
   "C E" "T E" "BL E" "BQ E" "C F E" "C E F E" "I E" "C I E" "C I" "F E C E" "C B E" "C P E"
+  "C LF E" "C BF E" "C QF E" "C B B E" "LF E C E" "C E LF E" "BQ P E" "C B P B E" "T QF E"
   "C E E" "T I E" "BQ F E I" "E C" "C C E E" "F F E" "P B" "C" "I I E" "BQ BQ E" "T F I E" "B C B E B"
 )
 for seq in "${FZ_TABLE[@]}"; do
   # shellcheck disable=SC2086
   fz_check $seq
 done
-FZ_TOKENS=(C T BL BQ F I E E B P)
+FZ_TOKENS=(C T BL BQ F LF BF QF I E E B P)
 RANDOM=4753
 for ((fzn = 0; fzn < 60; fzn++)); do
   fzlen=$((RANDOM % 8 + 2)); fzseq=""

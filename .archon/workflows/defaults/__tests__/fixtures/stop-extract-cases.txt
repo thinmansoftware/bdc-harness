@@ -395,3 +395,38 @@ grep -c x f	eq	1
 UNPARSED	1	grep -c missing f
 DECLARED	2
 @@END
+@@CASE env_prefixed_foreign_closes_pending
+## 8. Stop conditions
+
+Stop 1 (env foreign):
+  grep -c missing /dev/null
+  LC_ALL=C curl -s https://example.test/health
+  Expected: 0
+@@EXPECT
+UNPARSED	1	grep -c missing /dev/null
+DECLARED	1
+@@END
+@@CASE prose_between_command_and_expected_closes_pending
+## 8. Stop conditions
+
+Stop 1 (closed by a line):
+  grep -c x f
+  (run from the repo root)
+  Expected: 1
+@@EXPECT
+UNPARSED	1	grep -c x f
+DECLARED	1
+@@END
+@@CASE blank_lines_between_command_and_expected_pair
+## 8. Stop conditions
+
+Stop 1 (blank lines):
+  grep -c x f
+
+
+  Expected: 2
+@@EXPECT
+grep -c x f	eq	2
+UNPARSED	0
+DECLARED	1
+@@END
