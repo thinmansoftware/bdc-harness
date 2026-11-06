@@ -170,6 +170,7 @@ describe('unreviewed-head reconcile', () => {
         repos: REPOS,
         dryRun: false,
         logger,
+        now: () => NOW_MS,
       });
       expect(queue.enqueueCalls).toHaveLength(0);
       expect(queue.rows).toHaveLength(1);
