@@ -20,6 +20,7 @@ export interface PromotionTarget {
   base?: string;
 }
 const NAME = 'm09-promotion-gate';
+class RejectedPromotionCreate extends Error {}
 /** Serializes evaluations, including concurrent deliveries of the same head. */
 export interface PromotionRetryOptions {
   retryDelay?: (milliseconds: number) => Promise<void>;
@@ -40,7 +41,14 @@ export function createPromotionGate(
       try {
         return await request(route, data);
       } catch (error) {
-        if (route.startsWith('POST')) {
+        const http = error as { status?: number; response?: { status?: number } };
+        const status = http.response?.status ?? http.status;
+        // Client rejection confirms no create; timeouts and server/transport
+        // errors remain uncertain and must retain reconciliation state.
+        const rejected = status !== undefined && status >= 400 && status < 500 && status !== 408;
+        const createKey = `${String(data.owner)}/${String(data.repo)}:${String(data.external_id)}`;
+        if (route.startsWith('POST') && !rejected) {
+          ambiguous.add(createKey);
           // A lost create response may still have created the check. Reconcile
           // before another create; never blindly retry a non-idempotent write.
           for (let page = 1; ; page++) {
@@ -72,7 +80,13 @@ export function createPromotionGate(
             if (page >= 100) throw Error('m09 create reconciliation incomplete; redeliver webhook');
           }
         }
-        if (attempt >= 2) throw Error('m09 API unavailable; redeliver webhook or rerequest check');
+        if (attempt >= 2) {
+          if (route.startsWith('POST') && rejected && !ambiguous.has(createKey))
+            throw new RejectedPromotionCreate(
+              'm09 create rejected; redeliver webhook after recovery'
+            );
+          throw Error('m09 API unavailable; redeliver webhook or rerequest check');
+        }
         const retry = error as { response?: { headers?: Record<string, string> } };
         const seconds = Number(retry.response?.headers?.['retry-after']);
         await delay(Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : 1000 * 2 ** attempt);
@@ -161,7 +175,6 @@ export function createPromotionGate(
           if (page >= 100) throw Error('m09 ambiguous create listing incomplete');
         }
       }
-      if (!existing) ambiguous.add(key);
       const response = await call(
         existing
           ? 'PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}'
@@ -195,7 +208,8 @@ export function createPromotionGate(
     // Never inspect approval while an earlier successful check is still current.
     try {
       await publish('in_progress');
-    } catch {
+    } catch (error) {
+      if (error instanceof RejectedPromotionCreate) throw error;
       await publish('completed', unavailable);
       throw Error('m09 invalidation failed; redeliver webhook or rerequest check');
     }

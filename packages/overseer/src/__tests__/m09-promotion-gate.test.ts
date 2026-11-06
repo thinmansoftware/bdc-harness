@@ -479,3 +479,30 @@ test('published_missing_block_output_names_required_reason', async () => {
   expect(f.writes.at(-1)?.data.conclusion).toBe('failure');
   expect(f.writes.at(-1)?.data.output.summary).toContain('no promotion block');
 });
+
+test('three_definitive_create_rejections_allow_recovery_on_redelivery', async () => {
+  const f = fake();
+  let recovered = false;
+  let attempts = 0;
+  let listings = 0;
+  const gate = createPromotionGate(
+    async (route, data) => {
+      if (route.startsWith('GET') && route.includes('/check-runs')) listings++;
+      if (route.startsWith('POST')) {
+        attempts++;
+        if (!recovered) throw { status: 429, response: { status: 429 } };
+      }
+      return f.request(route, data);
+    },
+    4574893,
+    { retryDelay: async () => {} }
+  );
+  const target = { repository: repo, number: 1, head: sha, base: 'master' };
+  await expect(gate(target)).rejects.toThrow();
+  expect(attempts).toBe(3);
+  expect(listings).toBe(1);
+  recovered = true;
+  await gate(target);
+  expect(f.writes.filter(w => w.route.startsWith('POST')).length).toBe(1);
+  expect(f.writes.at(-1)?.data.conclusion).toBe('success');
+});
