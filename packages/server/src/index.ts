@@ -1,5 +1,4 @@
-import { handlePromotionEvent } from '@archon/overseer';
-import { checkGitHubWebhookSignature } from '@archon/adapters/forge/github/webhook-signature';
+import { ingestBeforePromotion, processPromotionWebhook } from '@archon/overseer';
 /**
  * Remote Coding Agent - Main Entry Point
  * Multi-platform AI coding assistant (Telegram, Discord, Slack, GitHub, Gitea)
@@ -647,15 +646,6 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // CRITICAL: raw body, never a re-serialized object -- the HMAC is
         // computed over the exact bytes GitHub sent.
         const rawBody = await c.req.text();
-        if (
-          checkGitHubWebhookSignature(
-            rawBody,
-            c.req.header('x-hub-signature-256'),
-            reviewRouteConfig.webhookSecret
-          ).valid
-        ) {
-          await handlePromotionEvent(eventType, JSON.parse(rawBody));
-        }
         // ONE ENDPOINT, TWO INGESTS (bdc-harness #782). GitHub delivers every
         // subscribed event type to the same URL, so the split is by
         // `x-github-event`, not by path: `pull_request` is the head-MOVED path
@@ -665,25 +655,39 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // over the raw body, so neither trusts the other's dispatch decision.
         const isCheckCompletion =
           eventType === 'check_run' || eventType === 'check_suite' || eventType === 'workflow_run';
-        const result = isCheckCompletion
-          ? await ingestCheckCompletionEvent(
-              {
-                rawBody,
-                signature: c.req.header('x-hub-signature-256'),
-                eventType,
-                deliveryId,
-              },
-              recheckDeps
-            )
-          : await ingestPullRequestEvent(
-              {
-                rawBody,
-                signature: c.req.header('x-hub-signature-256'),
-                eventType,
-                deliveryId,
-              },
-              ingestDeps
-            );
+        const intake = async (): Promise<
+          | Awaited<ReturnType<typeof ingestPullRequestEvent>>
+          | Awaited<ReturnType<typeof ingestCheckCompletionEvent>>
+        > =>
+          isCheckCompletion
+            ? await ingestCheckCompletionEvent(
+                {
+                  rawBody,
+                  signature: c.req.header('x-hub-signature-256'),
+                  eventType,
+                  deliveryId,
+                },
+                recheckDeps
+              )
+            : await ingestPullRequestEvent(
+                {
+                  rawBody,
+                  signature: c.req.header('x-hub-signature-256'),
+                  eventType,
+                  deliveryId,
+                },
+                ingestDeps
+              );
+        const result = await ingestBeforePromotion(intake, () =>
+          processPromotionWebhook(
+            {
+              rawBody,
+              signature: c.req.header('x-hub-signature-256'),
+              eventType,
+            },
+            reviewRouteConfig.webhookSecret
+          )
+        );
         getLog().info(
           {
             eventType,

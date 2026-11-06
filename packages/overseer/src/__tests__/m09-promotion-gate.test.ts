@@ -131,7 +131,8 @@ test('pr_cannot_influence_the_gate', async () => {
     true
   );
   expect(f.reads.some(r => r.includes('/git/trees/') && !r.includes(pin))).toBe(false);
-  expect(f.writes[0]?.data.conclusion).toBe('success');
+  expect(f.writes[0]?.data.status).toBe('in_progress');
+  expect(f.writes.at(-1)?.data.conclusion).toBe('success');
   for (const call of f.calls.filter(c => c.route.startsWith('GET'))) {
     expect(call.route).toMatch(/\/(pulls|compare|git\/ref|git\/trees|contents|commits)\//);
     if (call.route.includes('/git/trees/')) {
@@ -149,7 +150,7 @@ test('one_check_run_per_head_and_non_production_base_ignored', async () => {
   const gate = createPromotionGate(f.request, 4574893);
   await Promise.all([gate({ repository: repo, number: 1 }), gate({ repository: repo, number: 1 })]);
   expect(f.writes.filter(w => w.route.startsWith('POST')).length).toBe(1);
-  expect(f.writes.filter(w => w.route.startsWith('PATCH')).length).toBe(1);
+  expect(f.writes.filter(w => w.route.startsWith('PATCH')).length).toBe(3);
   const other = fake();
   await createPromotionGate(
     async (r, d) =>
@@ -165,4 +166,243 @@ test('production_bases_match_merge_policy', () => {
   for (const [repo, bases] of Object.entries(COVERED_PRODUCTION_BASES))
     for (const base of bases)
       expect(DEFAULT_MERGE_REPO_POLICY[repo]?.[base]?.unattended).toBe(false);
+});
+
+// Independent review regressions: failures must invalidate an old green check.
+test('lookup_and_publication_failures_invalidate_first_and_successful_heads', async () => {
+  for (const prior of [false, true]) {
+    for (const failure of [
+      '/pulls/',
+      '/check-runs',
+      '/git/ref/',
+      '/git/trees/',
+      '/contents/',
+      '/compare/',
+    ]) {
+      const f = fake();
+      let broken = false;
+      const gate = createPromotionGate(
+        async (r, d) => {
+          if (broken && r.startsWith('GET') && r.includes(failure))
+            throw Error('injected lookup failure');
+          return f.request(r, d);
+        },
+        4574893,
+        { retryDelay: async () => {} }
+      );
+      const target = { repository: repo, number: 1, head: sha, base: 'master' };
+      if (prior) await gate(target);
+      broken = true;
+      await gate(target);
+      expect(f.writes.at(-1)?.data.conclusion).toBe('failure');
+      expect(f.writes.at(-1)?.data.status).toBe('completed');
+    }
+  }
+  const f = fake();
+  let rejects = 2;
+  await createPromotionGate(
+    async (r, d) => {
+      if (d.status === 'in_progress' && rejects-- > 0) throw { status: 429 };
+      return f.request(r, d);
+    },
+    4574893,
+    { retryDelay: async () => {} }
+  )({ repository: repo, number: 1, head: sha, base: 'master' });
+  expect(f.writes[0]?.data.status).toBe('in_progress');
+  expect(f.writes.at(-1)?.data.conclusion).toBe('success');
+});
+
+test('pagination_exhaustion_posts_failure_and_later_pages_update_existing', async () => {
+  const f = fake();
+  const gate = createPromotionGate(
+    async (r, d) => {
+      if (r.startsWith('GET') && r.includes('/check-runs'))
+        return {
+          data: {
+            check_runs: Array.from({ length: 100 }, (_, i) => ({ id: i + 10, name: 'other' })),
+          },
+        };
+      return f.request(r, d);
+    },
+    4574893,
+    { retryDelay: async () => {} }
+  );
+  await gate({ repository: repo, number: 1, head: sha, base: 'master' });
+  expect(f.writes.at(-1)?.data.conclusion).toBe('failure');
+  const pages: number[] = [];
+  const g = fake();
+  await createPromotionGate(async (r, d) => {
+    if (r.startsWith('GET') && r.includes('/check-runs')) {
+      pages.push(d.page as number);
+      return {
+        data: {
+          check_runs:
+            d.page === 1
+              ? Array.from({ length: 100 }, () => ({ id: 3, name: 'other' }))
+              : [{ id: 99, name: 'm09-promotion-gate', external_id: sha, app: { id: 4574893 } }],
+        },
+      };
+    }
+    return g.request(r, d);
+  }, 4574893)({ repository: repo, number: 1, head: sha, base: 'master' });
+  expect(pages).toEqual([1, 2]);
+  expect(g.writes[0]?.data.check_run_id).toBe(99);
+});
+
+test('motion_sha_mismatch_missing_and_prose_publish_failure', async () => {
+  for (const motion of [
+    fixture().motion.replace(sha, 'c'.repeat(40)),
+    fixture().motion.replace(`approved_sha: ${sha}`, ''),
+    fixture().motion.replace(`approved_sha: ${sha}`, `Historical approval ${sha}`),
+  ]) {
+    const f = fake();
+    await createPromotionGate(
+      async (r, d) =>
+        r.includes('/contents/')
+          ? { data: { encoding: 'base64', content: Buffer.from(motion).toString('base64') } }
+          : f.request(r, d),
+      4574893
+    )({ repository: repo, number: 1, head: sha, base: 'master' });
+    expect(f.writes.at(-1)?.data.conclusion).toBe('failure');
+  }
+});
+
+test('signed_webhook_and_rerequest_dispatch_failure_without_blocking_review', async () => {
+  const { createHmac } = await import('node:crypto');
+  const { processPromotionWebhook } = await import('../m09-promotion-gate-wiring');
+  const f = fake();
+  const gate = createPromotionGate(
+    async (r, d) => (r.includes('/compare/') ? { data: { behind_by: 1 } } : f.request(r, d)),
+    4574893
+  );
+  const secret = 'unit-test-webhook';
+  for (const [eventType, payload] of [
+    [
+      'pull_request',
+      {
+        action: 'edited',
+        repository: { full_name: repo },
+        pull_request: { number: 1, head: { sha }, base: { ref: 'master' } },
+      },
+    ],
+    [
+      'check_run',
+      {
+        action: 'rerequested',
+        repository: { full_name: repo },
+        check_run: {
+          name: 'm09-promotion-gate',
+          head_sha: sha,
+          pull_requests: [{ number: 1, base: { ref: 'master' } }],
+        },
+      },
+    ],
+  ] as const) {
+    const rawBody = JSON.stringify(payload);
+    const signature = 'sha256=' + createHmac('sha256', secret).update(rawBody).digest('hex');
+    await processPromotionWebhook({ eventType, rawBody, signature }, secret, gate);
+    expect(f.writes.at(-1)?.data.conclusion).toBe('failure');
+  }
+  const before = f.writes.length;
+  await processPromotionWebhook(
+    { eventType: 'pull_request', rawBody: '{}', signature: 'invalid' },
+    secret,
+    gate
+  );
+  expect(f.writes.length).toBe(before);
+  const { ingestBeforePromotion } = await import('../m09-promotion-gate-wiring');
+  const order: string[] = [];
+  await expect(
+    ingestBeforePromotion(
+      async () => {
+        order.push('review');
+        return 1;
+      },
+      async () => {
+        order.push('promotion');
+        throw Error('API');
+      }
+    )
+  ).rejects.toThrow('API');
+  expect(order).toEqual(['review', 'promotion']);
+});
+
+test('publication_failure_turns_old_success_red_and_can_be_retried', async () => {
+  for (const prior of [false, true]) {
+    const f = fake();
+    let fail = false;
+    const gate = createPromotionGate(
+      async (r, d) => {
+        if (fail && d.conclusion === 'success') throw { status: 503 };
+        return f.request(r, d);
+      },
+      4574893,
+      { retryDelay: async () => {} }
+    );
+    const target = { repository: repo, number: 1, head: sha, base: 'master' };
+    if (prior) await gate(target);
+    fail = true;
+    await expect(gate(target)).rejects.toThrow('m09 publication failed');
+    expect(f.writes.at(-1)?.data.conclusion).toBe('failure');
+    fail = false;
+    await gate(target);
+    expect(f.writes.at(-1)?.data.conclusion).toBe('success');
+  }
+});
+
+test('unrelated_heads_and_review_intake_do_not_wait_for_promotion', async () => {
+  const { ingestBeforePromotion } = await import('../m09-promotion-gate-wiring');
+  let release!: () => void;
+  const wait = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  const f = fake();
+  let stalled = false;
+  const gate = createPromotionGate(async (r, d) => {
+    if (r.includes('/pulls/') && d.pull_number === 1) {
+      stalled = true;
+      await wait;
+    }
+    return f.request(r, d);
+  }, 4574893);
+  const first = gate({ repository: repo, number: 1, head: sha, base: 'master' });
+  let reviewed = false;
+  const intake = ingestBeforePromotion(
+    async () => {
+      reviewed = true;
+      return 1;
+    },
+    async () => {
+      await first;
+    }
+  );
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(stalled).toBe(true);
+  expect(reviewed).toBe(true);
+  try {
+    await gate({ repository: repo, number: 2, head: 'c'.repeat(40), base: 'master' });
+  } finally {
+    release();
+  }
+  await intake;
+});
+
+test('ambiguous_create_response_reconciles_before_retry_without_duplicate', async () => {
+  const f = fake();
+  let lose = true;
+  const gate = createPromotionGate(
+    async (r, d) => {
+      const result = await f.request(r, d);
+      if (r.startsWith('POST') && lose) {
+        lose = false;
+        throw Error('response lost');
+      }
+      return result;
+    },
+    4574893,
+    { retryDelay: async () => {} }
+  );
+  await gate({ repository: repo, number: 1, head: sha, base: 'master' });
+  expect(f.writes.filter(w => w.route.startsWith('POST')).length).toBe(1);
+  expect(f.writes.at(-1)?.data.conclusion).toBe('success');
 });

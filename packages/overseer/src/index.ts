@@ -270,4 +270,9 @@ export type {
   OverseerControlPlaneServiceDependencies,
 } from './control-plane';
 
-export { handlePromotionEvent, reevaluatePromotion } from './m09-promotion-gate-wiring';
+export {
+  handlePromotionEvent,
+  reevaluatePromotion,
+  ingestBeforePromotion,
+  processPromotionWebhook,
+} from './m09-promotion-gate-wiring';

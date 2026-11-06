@@ -24,10 +24,27 @@ and review identity configuration must be present. Authentication requires the
 Overseer App installation: Checks write and Pull requests read on covered
 repositories, Contents read on bdc-xo. PAT fallback is refused.
 
-Evaluations serialize in the single service process; multiple active replicas
-would need shared serialization before enabling them. Check lookup paginates
-and matches the configured App and head external_id. Read failures fail the
-decision; PR metadata and check-publication failures return webhook errors.
+Evaluations serialize per repository/head in the single service process; unrelated
+heads do not share that queue. Multiple active replicas still require a shared
+serialization mechanism. The signed webhook supplies the head so an in-progress
+check replaces a previous success before live approval reads. Check lookup is
+paginated. Lookup failures publish failure; if listing is unavailable and no
+check ID is known, a failing safety check may be created instead of trusting an
+old success. Operators should reconcile duplicates after that outage.
+
+Review intake always finishes before promotion IO. Promotion errors cannot skip
+review ingestion; exhausted publication errors return an HTTP error after intake
+so the webhook can be redelivered safely. There is no detached, lossy background
+queue. API calls have a 20-second timeout and up to three attempts, honoring
+Retry-After or exponential backoff. A lost create response is reconciled before
+retrying creation. Re-run failed/pending checks after an outage, or redeliver the
+webhook. GitHub does not automatically redeliver failed webhook deliveries.
+
+If GitHub refuses every write, no service can change an existing remote check;
+the request remains failed for operator redelivery. An operator re-evaluation
+should supply {repository, number, head, base} from verified metadata so PR lookup
+failure can invalidate that head. Without a known head a live PR lookup is needed
+first; failure then returns a retryable error instead of guessing a SHA.
 
 The operator must rebuild Overseer and verify one App-owned check on a real
 storefront master PR. XO separately asks John to require this App check in
