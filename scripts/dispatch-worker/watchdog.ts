@@ -1,6 +1,7 @@
 import { readFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
+import { createConnection } from 'node:net';
 
 /**
  * Desktop watchdog for the Dispatch worker.
@@ -22,6 +23,8 @@ export interface WatchdogDeps {
   readLockPid: (lockFile: string) => Promise<number | null>;
   /** Liveness check for a PID. */
   isAlive: (pid: number) => boolean;
+  /** Port reachability only; never grants recipient or process authority. */
+  isTransportAvailable: () => Promise<boolean>;
   /** Start the worker scheduled task by name. Rejects on failure. */
   startTask: (taskName: string) => Promise<void>;
   /** Structured single-line logger. */
@@ -29,7 +32,7 @@ export interface WatchdogDeps {
 }
 
 export interface WatchdogResult {
-  action: 'started' | 'healthy';
+  action: 'started' | 'healthy' | 'degraded';
 }
 
 export function defaultWatchdogLockFile(workerId: string): string {
@@ -47,7 +50,7 @@ export async function checkWatchdog(
 ): Promise<WatchdogResult> {
   const pid = await deps.readLockPid(options.lockFile);
   if (pid !== null && deps.isAlive(pid)) {
-    return { action: 'healthy' };
+    return { action: (await deps.isTransportAvailable()) ? 'healthy' : 'degraded' };
   }
   // Missing lock OR dead PID: there is no live worker process -> start it.
   await deps.startTask(options.taskName);
@@ -109,6 +112,28 @@ async function realStartTask(taskName: string): Promise<void> {
   }
 }
 
+function realTransportAvailable(): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = createConnection({ host: '127.0.0.1', port: 3900 });
+    let settled = false;
+    const finish = (ready: boolean): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ready);
+    };
+    socket.setTimeout(1_000, () => {
+      finish(false);
+    });
+    socket.once('connect', () => {
+      finish(true);
+    });
+    socket.once('error', () => {
+      finish(false);
+    });
+  });
+}
+
 function argValue(flag: string, fallback: string): string {
   const index = process.argv.indexOf(flag);
   if (index !== -1 && process.argv[index + 1]) return process.argv[index + 1];
@@ -123,6 +148,7 @@ if (import.meta.main) {
     {
       readLockPid: realReadLockPid,
       isAlive: realIsAlive,
+      isTransportAvailable: realTransportAvailable,
       startTask: realStartTask,
       log: (line: string): void => {
         console.error(line);

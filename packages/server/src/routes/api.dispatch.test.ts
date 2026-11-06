@@ -3292,6 +3292,7 @@ describe('dispatch API', () => {
         send_as: string[];
         receive_as: string[];
         roles: string[];
+        expires_at?: string;
       }>
     ): void {
       process.env.DISPATCH_PRINCIPALS_JSON = JSON.stringify(records);
@@ -3388,6 +3389,33 @@ describe('dispatch API', () => {
         }),
       });
     }
+
+    test.each(['off', 'warn', 'enforce'])(
+      'expired Chief credential refuses POST GET and ACK in %s mode',
+      async mode => {
+        useRegistry([fullGrokbot()]);
+        process.env.DISPATCH_SENDER_AUTH_MODE = mode;
+        const app = makeApp('secret-token');
+        const headers = principalHeaders('grokbot', grokbotToken);
+        const created = await postMessage(app, headers, { idempotency_key: `expiry-${mode}` });
+        expect(created.status).toBe(200);
+        const message = (await created.json()) as { id: string };
+        useRegistry([{ ...fullGrokbot(), expires_at: '2000-01-01T00:00:00.000Z' }]);
+        const responses = [
+          await postMessage(app, headers, { idempotency_key: `expired-${mode}` }),
+          await app.request(listUrl({ recipient: 'grokbot' }), { headers }),
+          await app.request(`/api/dispatch/messages/${message.id}/ack`, {
+            method: 'POST',
+            headers,
+            body: '{}',
+          }),
+        ];
+        for (const response of responses) {
+          expect(response.status).toBe(401);
+          expectNoSecret(await response.text(), grokbotToken);
+        }
+      }
+    );
 
     test('principal_only_round_trip', async () => {
       useRegistry([fullGrokbot()]);

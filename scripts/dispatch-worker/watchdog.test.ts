@@ -9,6 +9,7 @@ function deps(overrides: Partial<WatchdogDeps>): WatchdogDeps {
   return {
     readLockPid: mock(async () => null),
     isAlive: mock(() => false),
+    isTransportAvailable: mock(async () => true),
     startTask: mock(async () => {}),
     log: mock(() => {}),
     ...overrides,
@@ -16,6 +17,24 @@ function deps(overrides: Partial<WatchdogDeps>): WatchdogDeps {
 }
 
 describe('dispatch worker watchdog', () => {
+  test('live worker without transport is degraded and never starts another task', async () => {
+    const startTask = mock(async () => {});
+    const lines: string[] = [];
+    const code = await runWatchdogMain(
+      { lockFile: '/tmp/mock.lock', taskName: TASK },
+      deps({
+        readLockPid: mock(async () => 4242),
+        isAlive: mock(() => true),
+        isTransportAvailable: mock(async () => false),
+        startTask,
+        log: line => lines.push(line),
+      })
+    );
+    expect(code).toBe(0);
+    expect(lines[0]).toContain('dispatch_worker_watchdog_degraded');
+    expect(startTask).not.toHaveBeenCalled();
+  });
+
   test('Test 7: watchdog_starts_the_task_when_the_lock_pid_is_dead', async () => {
     const startTask = mock(async () => {});
     const d = deps({
