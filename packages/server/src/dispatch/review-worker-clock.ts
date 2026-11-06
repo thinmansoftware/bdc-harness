@@ -461,8 +461,19 @@ export async function tickReviewWorkerClock(
         } catch (error) {
           checkoutPath = '';
           checkoutFailure = classifyCheckoutFailure(error);
-          log.warn(
-            { messageId: claimed.id, reason: checkoutFailure },
+          (deps.logger ?? log).warn(
+            {
+              messageId: claimed.id,
+              reason: checkoutFailure,
+              repository: `${body.owner}/${body.repo}`,
+              prNumber: body.prNumber,
+              headSha: body.headSha,
+              baseSha:
+                error instanceof Error && error.cause && typeof error.cause === 'object'
+                  ? ((error.cause as CheckoutDiagnostic).baseSha ?? body.baseSha)
+                  : body.baseSha,
+              ...checkoutDiagnostic(error),
+            },
             'overseer_review_checkout_preparation_failed'
           );
         }
@@ -859,10 +870,10 @@ function resolveTrustedCheckoutPath(
   return `${root}/${safe(owner)}/${safe(repo)}/${headSha}`;
 }
 
-async function runCheckoutGit(
+export async function runCheckoutGit(
   argv: string[],
   cwd: string,
-  options: { trim?: boolean } = {}
+  options: { trim?: boolean; step?: string } = {}
 ): Promise<string> {
   const token = process.env.GITHUB_TOKEN?.trim() || process.env.GH_TOKEN?.trim();
   // core.longpaths: a review checkout's pack files sit at
@@ -896,7 +907,14 @@ async function runCheckoutGit(
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
   ]);
-  if (exitCode !== 0) throw new Error(`review_checkout_git_failed:${stderr.slice(0, 300)}`);
+  if (exitCode !== 0) {
+    const detail = {
+      step: options.step ?? argv[1] ?? 'git',
+      gitExitCode: exitCode,
+      stderr: redactCheckoutStderr(stderr),
+    };
+    throw new Error(`review_checkout_git_failed:${detail.stderr}`, { cause: detail });
+  }
   return options.trim === false ? stdout : stdout.trim();
 }
 
@@ -1017,17 +1035,38 @@ async function verifySealedCheckout(
   headSha: string,
   baseSha: string
 ): Promise<void> {
-  const head = await runCheckoutGit(['git', 'rev-parse', 'HEAD'], checkout);
-  const tree = await runCheckoutGit(['git', 'rev-parse', 'HEAD^{tree}'], checkout);
-  const expectedTree = await runCheckoutGit(['git', 'rev-parse', `${headSha}^{tree}`], checkout);
-  if (head !== headSha || tree !== expectedTree) throw new Error(CHECKOUT_IDENTITY_FAILURE);
-  await runCheckoutGit(['git', 'cat-file', '-e', `${baseSha}^{commit}`], checkout);
-  await runCheckoutGit(['git', '-c', 'core.filemode=true', 'diff', '--quiet', 'HEAD'], checkout);
+  const head = await runCheckoutGit(['git', 'rev-parse', 'HEAD'], checkout, {
+    step: 'verify-head',
+  });
+  const tree = await runCheckoutGit(['git', 'rev-parse', 'HEAD^{tree}'], checkout, {
+    step: 'verify-tree',
+  });
+  const expectedTree = await runCheckoutGit(['git', 'rev-parse', `${headSha}^{tree}`], checkout, {
+    step: 'verify-tree',
+  });
+  if (head !== headSha || tree !== expectedTree)
+    throw new Error(CHECKOUT_IDENTITY_FAILURE, {
+      cause: {
+        step: head !== headSha ? 'verify-head' : 'verify-tree',
+        gitExitCode: null,
+        stderr: '',
+      },
+    });
+  await runCheckoutGit(['git', 'cat-file', '-e', `${baseSha}^{commit}`], checkout, {
+    step: 'cat-file-base',
+  });
+  await runCheckoutGit(['git', '-c', 'core.filemode=true', 'diff', '--quiet', 'HEAD'], checkout, {
+    step: 'verify-clean',
+  });
   const status = await runCheckoutGit(
     ['git', '-c', 'core.filemode=true', 'status', '--porcelain=v1', '--untracked-files=all'],
-    checkout
+    checkout,
+    { step: 'verify-clean' }
   );
-  if (status.length > 0) throw new Error(CHECKOUT_IDENTITY_FAILURE);
+  if (status.length > 0)
+    throw new Error(CHECKOUT_IDENTITY_FAILURE, {
+      cause: { step: 'verify-clean', gitExitCode: null, stderr: '' },
+    });
 }
 
 export interface PrepareReviewCheckoutOptions {
@@ -1080,6 +1119,7 @@ export async function prepareReviewCheckout(
   const temporary = `${checkout}.tmp-${randomUUID()}`;
   await mkdir(dirname(checkout), { recursive: true, mode: 0o2770 });
   await rm(temporary, { recursive: true, force: true });
+  let preparationStep = 'mkdir';
   try {
     await mkdir(temporary, { mode: 0o700 });
     await runCheckoutGit(['git', 'init', '--quiet'], temporary);
@@ -1122,25 +1162,48 @@ export async function prepareReviewCheckout(
         ],
         temporary
       );
-      await runCheckoutGit(['git', 'cat-file', '-e', `${headSha}^{commit}`], temporary);
-      await runCheckoutGit(['git', 'cat-file', '-e', `${baseSha}^{commit}`], temporary);
-    } catch {
-      throw new Error(CHECKOUT_IDENTITY_FAILURE);
+      await runCheckoutGit(['git', 'cat-file', '-e', `${headSha}^{commit}`], temporary, {
+        step: 'cat-file-head',
+      });
+      await runCheckoutGit(['git', 'cat-file', '-e', `${baseSha}^{commit}`], temporary, {
+        step: 'cat-file-base',
+      });
+    } catch (error) {
+      throw new Error(CHECKOUT_IDENTITY_FAILURE, { cause: checkoutDiagnostic(error) });
     }
     await runCheckoutGit(['git', 'checkout', '--quiet', '--detach', headSha], temporary);
     // Prefetch both sides of the base..head diff now, while the parent holds
     // the credential, so the reviewer's `git diff <base> <head>` never needs
     // the network.
-    await runCheckoutGit(['git', 'diff', '--stat', baseSha, headSha], temporary);
+    await runCheckoutGit(['git', 'diff', '--stat', baseSha, headSha], temporary, {
+      step: 'prefetch-diff',
+    });
+    preparationStep = 'seal';
     await sealReviewCheckout(temporary, await readTrackedExecutables(temporary));
     await verifySealedCheckout(temporary, headSha, baseSha);
+    preparationStep = 'replace-checkout';
     await rm(checkout, { recursive: true, force: true });
     await rename(temporary, checkout);
+    preparationStep = 'record-use';
     await recordCheckoutUse(checkout, input.prNumber);
+    preparationStep = 'realpath';
     return await realpath(checkout);
   } catch (error) {
     await rm(temporary, { recursive: true, force: true });
-    throw error;
+    throw new Error(
+      error instanceof Error ? redactCheckoutStderr(error.message) : CHECKOUT_IDENTITY_FAILURE,
+      {
+        cause: {
+          repository: `${input.owner}/${input.repo}`,
+          prNumber: input.prNumber,
+          headSha,
+          baseSha,
+          ...checkoutDiagnostic(error),
+          step: checkoutDiagnostic(error).step ?? preparationStep,
+          gitExitCode: checkoutDiagnostic(error).gitExitCode ?? null,
+        },
+      }
+    );
   }
 }
 
@@ -1699,4 +1762,49 @@ export function startReviewWorkerClock(
 export function stopReviewWorkerClock(): void {
   if (timer) clearInterval(timer);
   timer = null;
+}
+
+/** Redact before truncating so a boundary never exposes part of a credential. */
+export function redactCheckoutStderr(stderr: string): string {
+  let clean = stderr;
+  for (const token of [process.env.GITHUB_TOKEN, process.env.GH_TOKEN]) {
+    if (!token) continue;
+    for (const value of [
+      token,
+      encodeURIComponent(token),
+      Buffer.from(`x-access-token:${token}`).toString('base64'),
+    ]) {
+      clean = clean.split(value).join('[REDACTED]');
+    }
+  }
+  return clean
+    .replace(
+      /\b[a-z][a-z0-9+.-]*:\/\/[^\s/]*@/gi,
+      match => `${match.slice(0, match.indexOf('://') + 3)}[REDACTED]@`
+    )
+    .replace(/x-access-token:[^\s@]+/gi, 'x-access-token:[REDACTED]')
+    .replace(/authorization[\s=:]+[^\r\n]*/gi, 'Authorization: [REDACTED]')
+    .replace(/\b(?:gh[pousr]_[a-z0-9_]+|github_pat_[a-z0-9_]+)/gi, '[REDACTED]')
+    .replace(/([?&](?:access_token|token|auth|password)=)[^\s&#]+/gi, '$1[REDACTED]')
+    .slice(0, 2000);
+}
+
+interface CheckoutDiagnostic {
+  repository?: string;
+  prNumber?: number;
+  headSha?: string;
+  baseSha?: string;
+  step?: string;
+  gitExitCode?: number | null;
+  stderr?: string;
+}
+
+function checkoutDiagnostic(error: unknown): CheckoutDiagnostic {
+  if (!(error instanceof Error) || !error.cause || typeof error.cause !== 'object') return {};
+  const detail = error.cause as CheckoutDiagnostic;
+  return {
+    step: detail.step,
+    gitExitCode: detail.gitExitCode,
+    stderr: redactCheckoutStderr(detail.stderr ?? ''),
+  };
 }
