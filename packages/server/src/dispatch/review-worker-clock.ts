@@ -448,6 +448,7 @@ export async function tickReviewWorkerClock(
         // approval. The reason travels in the server-built execution context.
         let checkoutPath = '';
         let checkoutFailure: string | undefined;
+        let checkoutStep: string | undefined;
         // Make room before materializing a new checkout; the head about to be
         // prepared is protected even if it is already cached and over cap.
         await runCheckoutEviction(deps, lease, [
@@ -461,6 +462,7 @@ export async function tickReviewWorkerClock(
         } catch (error) {
           checkoutPath = '';
           checkoutFailure = classifyCheckoutFailure(error);
+          checkoutStep = checkoutDiagnostic(error).step;
           (deps.logger ?? log).warn(
             {
               messageId: claimed.id,
@@ -607,7 +609,12 @@ export async function tickReviewWorkerClock(
           worker_id: REVIEW_WORKER_ID,
           fencing_token: claimed.fencing_token,
           ...result,
-          result_body: JSON.stringify(outcome),
+          result_body: JSON.stringify({
+            ...outcome,
+            ...(checkoutFailure && checkoutStep && outcome.disposition === 'review_incomplete'
+              ? { checkout_step: checkoutStep }
+              : {}),
+          }),
         });
       } catch (error) {
         log.error({ err: error, messageId: message.id }, 'overseer_review_work_item_failed');

@@ -1317,6 +1317,16 @@ describe('checkout failure diagnostics', () => {
       expect(warning).toMatchObject(expected);
       expect(warning?.gitExitCode).toBeGreaterThan(0);
       expect(String(warning?.stderr ?? '')).not.toBe('');
+      const resultBody = JSON.parse(harness.results[0]?.result_body ?? '{}');
+      expect(resultBody.checkout_step).toBe('fetch');
+      expect(resultBody).toMatchObject({
+        disposition: 'review_incomplete',
+        reason: 'review_checkout_identity_failure',
+        event: 'COMMENT',
+      });
+      expect(resultBody).not.toHaveProperty('stderr');
+      expect(resultBody).not.toHaveProperty('headSha');
+      expect(resultBody).not.toHaveProperty('baseSha');
       expect(harness.posts[0]?.body).toStartWith(
         'Review incomplete: review_checkout_identity_failure'
       );
@@ -1396,6 +1406,7 @@ describe('checkout failure diagnostics', () => {
       await tickReviewWorkerClock(WORKER_CONFIG, harness.deps);
       const warning = warnings.find(row => row.reason === 'review_checkout_identity_failure');
       expect(warning).toMatchObject({ step: 'checkout', prNumber: 18 });
+      expect(JSON.parse(harness.results[0]?.result_body ?? '{}').checkout_step).toBe('checkout');
       expect(JSON.stringify(warning)).not.toContain('password');
       expect(JSON.stringify(warning)).not.toContain('alice');
     } finally {
