@@ -31,6 +31,7 @@ export function createPromotionGate(
 ): (target: PromotionTarget) => Promise<PromotionResult | undefined> {
   const tails = new Map<string, Promise<unknown>>();
   const known = new Map<string, number>();
+  const ambiguous = new Set<string>();
   const delay =
     options.retryDelay ??
     ((ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms)));
@@ -45,7 +46,7 @@ export function createPromotionGate(
           for (let page = 1; ; page++) {
             const runs = (
               (
-                await request('GET /repos/{owner}/{repo}/commits/{ref}/check-runs', {
+                await call('GET /repos/{owner}/{repo}/commits/{ref}/check-runs', {
                   owner: data.owner,
                   repo: data.repo,
                   ref: data.head_sha,
@@ -90,17 +91,7 @@ export function createPromotionGate(
     }
     let pr: Pr | undefined;
     // Signed webhook metadata lets us invalidate even when the live PR lookup fails.
-    let head = target.head;
-    if (!head) {
-      pr = (
-        await call('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
-          ...args,
-          pull_number: target.number,
-        })
-      ).data as Pr;
-      if (!bases.includes(pr.base.ref)) return;
-      head = pr.head.sha;
-    }
+    const head = target.head ?? '';
     if (!/^[a-f0-9]{40}$/i.test(head)) throw Error('m09 head unavailable');
     const key = `${target.repository}:${head}`;
     let existing = known.get(key);
@@ -140,6 +131,37 @@ export function createPromotionGate(
       status: 'in_progress' | 'completed',
       result?: PromotionResult
     ): Promise<void> {
+      if (!existing && ambiguous.has(key)) {
+        for (let page = 1; ; page++) {
+          const runs = (
+            (
+              await call('GET /repos/{owner}/{repo}/commits/{ref}/check-runs', {
+                ...args,
+                ref: head,
+                check_name: NAME,
+                filter: 'all',
+                per_page: 100,
+                page,
+              })
+            ).data as {
+              check_runs: { id: number; name: string; external_id: string; app?: { id: number } }[];
+            }
+          ).check_runs;
+          const found = runs.find(
+            r => r.name === NAME && r.external_id === head && r.app?.id === appId
+          );
+          if (found) {
+            existing = found.id;
+            known.set(key, existing);
+            ambiguous.delete(key);
+            break;
+          }
+          if (runs.length < 100)
+            throw Error('m09 ambiguous create unresolved; rerequest after reconciliation');
+          if (page >= 100) throw Error('m09 ambiguous create listing incomplete');
+        }
+      }
+      if (!existing) ambiguous.add(key);
       const response = await call(
         existing
           ? 'PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}'
@@ -155,13 +177,14 @@ export function createPromotionGate(
               ? `M-09 ${result.conclusion}: ${result.rules.map((r, i) => `${i + 1} ${r.pass ? 'PASS' : 'FAIL'}`).join(', ')}`
               : 'M-09 evaluation pending',
             summary: result
-              ? `bdc-xo pinned SHA: ${result.pinnedSha || 'unavailable'}\n${result.rules.map(r => `${r.pass ? 'PASS' : 'FAIL'} ${r.name}`).join('\n')}`
+              ? `${result.reason ? result.reason + '\n' : ''}bdc-xo pinned SHA: ${result.pinnedSha || 'unavailable'}\n${result.rules.map(r => `${r.pass ? 'PASS' : 'FAIL'} ${r.name}`).join('\n')}`
               : 'Approval is being revalidated. This check is not a promotion approval.',
           },
         }
       );
       existing = (response.data as { id: number }).id;
       known.set(key, existing);
+      ambiguous.delete(key);
     }
     const unavailable: PromotionResult = {
       conclusion: 'failure',
@@ -256,8 +279,24 @@ export function createPromotionGate(
     }
     return result;
   }
-  return (target: PromotionTarget) => {
-    const key = `${target.repository}:${target.head ?? target.number}`;
+  return async (target: PromotionTarget): Promise<PromotionResult | undefined> => {
+    if (!COVERED_PRODUCTION_BASES[target.repository]) return undefined;
+    // Discover only identity outside the lock. Approval body is always read again
+    // inside evaluate after every caller has acquired the same repository/head lock.
+    if (!target.head) {
+      const [owner, repo] = target.repository.split('/');
+      const metadata = (
+        await call('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+          owner,
+          repo,
+          pull_number: target.number,
+        })
+      ).data as { head: { sha: string }; base: { ref: string } };
+      if (!COVERED_PRODUCTION_BASES[target.repository]?.includes(metadata.base.ref))
+        return undefined;
+      target = { ...target, head: metadata.head.sha, base: metadata.base.ref };
+    }
+    const key = `${target.repository}:${target.head}`;
     const next = (tails.get(key) ?? Promise.resolve()).then(() => evaluate(target));
     const settled = next.catch(() => undefined);
     tails.set(key, settled);

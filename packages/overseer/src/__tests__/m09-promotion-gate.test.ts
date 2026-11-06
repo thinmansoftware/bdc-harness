@@ -406,3 +406,76 @@ test('ambiguous_create_response_reconciles_before_retry_without_duplicate', asyn
   expect(f.writes.filter(w => w.route.startsWith('POST')).length).toBe(1);
   expect(f.writes.at(-1)?.data.conclusion).toBe('success');
 });
+
+test('operator_and_webhook_share_head_lock_and_refresh_approval_inside_it', async () => {
+  const f = fake();
+  let removed = false;
+  let release!: () => void;
+  let entered!: () => void;
+  const paused = new Promise<void>(r => {
+    release = r;
+  });
+  const started = new Promise<void>(r => {
+    entered = r;
+  });
+  let pause = true;
+  const gate = createPromotionGate(async (r, d) => {
+    if (r.includes('/pulls/'))
+      return {
+        data: { body: removed ? '' : fixture().body, head: { sha }, base: { ref: 'master' } },
+      };
+    if (r.includes('/compare/') && pause) {
+      pause = false;
+      entered();
+      await paused;
+    }
+    return f.request(r, d);
+  }, 4574893);
+  const operator = gate({ repository: repo, number: 1 });
+  await started;
+  removed = true;
+  const webhook = gate({ repository: repo, number: 1, head: sha, base: 'master' });
+  await new Promise(r => setTimeout(r, 10));
+  release();
+  await Promise.all([operator, webhook]);
+  expect(f.writes.at(-1)?.data.conclusion).toBe('failure');
+});
+
+test('lost_create_and_failed_reconciliation_never_issue_second_post', async () => {
+  const f = fake();
+  let lost = false;
+  let failures = 3;
+  const gate = createPromotionGate(
+    async (r, d) => {
+      if (r.startsWith('GET') && r.includes('/check-runs') && lost && failures-- > 0)
+        throw Error('reconciliation unavailable');
+      const response = await f.request(r, d);
+      if (r.startsWith('POST') && !lost) {
+        lost = true;
+        throw Error('lost response');
+      }
+      return response;
+    },
+    4574893,
+    { retryDelay: async () => {} }
+  );
+  try {
+    await gate({ repository: repo, number: 1, head: sha, base: 'master' });
+  } catch {}
+  await gate({ repository: repo, number: 1, head: sha, base: 'master' });
+  expect(f.writes.filter(w => w.route.startsWith('POST')).length).toBe(1);
+  expect(f.writes.at(-1)?.data.status).toBe('completed');
+});
+
+test('published_missing_block_output_names_required_reason', async () => {
+  const f = fake();
+  await createPromotionGate(
+    async (r, d) =>
+      r.includes('/pulls/')
+        ? { data: { body: '', head: { sha }, base: { ref: 'master' } } }
+        : f.request(r, d),
+    4574893
+  )({ repository: repo, number: 1, head: sha, base: 'master' });
+  expect(f.writes.at(-1)?.data.conclusion).toBe('failure');
+  expect(f.writes.at(-1)?.data.output.summary).toContain('no promotion block');
+});
