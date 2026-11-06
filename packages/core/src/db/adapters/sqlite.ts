@@ -1402,6 +1402,7 @@ export class SqliteAdapter implements IDatabase {
         ('astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 1),
         -- WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065 parity)
         ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', 1),
+        ('t3-desk-local', 'PC T3 relay queue', 'worker_poll', 1),
         ('pr-review-log', 'PR review receipt log', 'drain_on_start', 1),
         -- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 067 parity): the
         -- cauldron-fire command consumer mailbox and the t3-bridge VPS sender.

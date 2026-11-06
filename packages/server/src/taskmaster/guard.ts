@@ -12,6 +12,7 @@
  * HARD-PAUSES effects (auto-circuit tightens into pause, never KILL).
  */
 import type { ActionProposal } from './rules';
+import { RECIPIENT_ROUTES } from './recipients';
 
 /** Complete WO tokens: uppercase alphanumeric segments and a 2+ digit ordinal. */
 export const WO_ID_RE = /\b(?<!-)WO-(?:[A-Z0-9]+-)+\d{2,}\b(?!-)/;
@@ -42,15 +43,8 @@ export type TmAllowedActionType = (typeof TM_ALLOWED_ACTION_TYPES)[number];
  * the escalate_p0 verb, and escalate_p0 may ONLY address 't3-desktop' (the
  * desktop results queue replaced the dead operator mailbox for escalations).
  */
-export const TM_ALLOWED_RECIPIENTS = [
-  'xo',
-  'major-build',
-  'captain-ci',
-  'operator',
-  'duty-officer',
-  't3-desktop',
-] as const;
-export type TmAllowedRecipient = (typeof TM_ALLOWED_RECIPIENTS)[number];
+export type TmAllowedRecipient = keyof typeof RECIPIENT_ROUTES;
+export const TM_ALLOWED_RECIPIENTS = Object.keys(RECIPIENT_ROUTES) as TmAllowedRecipient[];
 
 /**
  * Spend/send/deploy verbs, ported from the DO content guard. The Taskmaster
@@ -209,6 +203,28 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
       forbiddenEffect: true,
       reason: `t3_desktop_recipient_restricted: only escalate_p0 may address 't3-desktop', not '${proposal.type}'.`,
     };
+  }
+
+  if (proposal.recipient.trim().toLowerCase() === 't3-desk-local') {
+    try {
+      const body = JSON.parse(proposal.body) as Record<string, unknown>;
+      if (
+        proposal.type !== 'nudge' ||
+        body.schema !== 't3-thread-nudge/v1' ||
+        body.reason !== 'approval-stall' ||
+        !['thread_id', 'request_id', 'text'].every(
+          key => typeof body[key] === 'string' && body[key].trim()
+        )
+      ) {
+        return { allowed: false, reason: 'relay_contract_invalid' };
+      }
+      return {
+        allowed: !!proposal.idempotencyKey?.trim() && proposal.contentIncomplete !== true,
+        reason: undefined,
+      };
+    } catch {
+      return { allowed: false, reason: 'relay_contract_invalid' };
+    }
   }
 
   // M-155 WO 3: a proposal whose body is null/absent or that is flagged

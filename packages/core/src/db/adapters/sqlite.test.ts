@@ -184,6 +184,7 @@ describe('SqliteAdapter', () => {
         // receipt log and the T3 desktop results queue.
         { principal_id: 'pr-review-log', delivery_mode: 'drain_on_start', active: 1 },
         { principal_id: 't3-bridge', delivery_mode: 'drain_on_start', active: 1 },
+        { principal_id: 't3-desk-local', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 't3-desktop', delivery_mode: 'drain_on_start', active: 1 },
         // WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01
         // (migration 046): recipient of Overseer's remediation candidates.
