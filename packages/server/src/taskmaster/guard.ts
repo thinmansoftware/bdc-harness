@@ -253,14 +253,8 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
   // Exclude only complete WO identifiers, quoted or not. Word boundaries and
   // hyphen checks prevent matching part of a longer token. Keep all other
   // content, including title suffixes, visible to the verb scan (#764 round 4).
-  const scanTarget = normalized.replace(new RegExp(WO_ID_RE.source, 'g'), '');
-  const match = SPEND_SEND_DEPLOY_RE.exec(scanTarget);
-  if (match) {
-    return {
-      allowed: false,
-      reason: `spend_send_deploy_verb_rejected: body contains forbidden verb '${match[0]}'. The Taskmaster has zero spend/send/deploy authority (M-15 tier wall).`,
-    };
-  }
+  const contentGuard = validateForbiddenActionContent(normalized);
+  if (!contentGuard.allowed) return contentGuard;
 
   if (proposal.recipient.trim().toLowerCase() === 't3-desk-local') {
     try {
@@ -310,6 +304,21 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
         'content_incomplete: the blocker_report body lacks the required item content ' +
         '(quoted title, owner, Blocked clause, GitHub URL, and a "for <duration>" clause); ' +
         'the item stays on the register.',
+    };
+  }
+
+  return { allowed: true };
+}
+
+/** Shared authority restriction for every outbound Taskmaster transport leg. */
+export function validateForbiddenActionContent(body: string): GuardResult {
+  const normalized = body.replace(/\s+/g, ' ').trim();
+  const scanTarget = normalized.replace(new RegExp(WO_ID_RE.source, 'g'), '');
+  const match = SPEND_SEND_DEPLOY_RE.exec(scanTarget);
+  if (match) {
+    return {
+      allowed: false,
+      reason: `spend_send_deploy_verb_rejected: body contains forbidden verb '${match[0]}'. The Taskmaster has zero spend/send/deploy authority (M-15 tier wall).`,
     };
   }
 

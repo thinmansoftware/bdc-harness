@@ -2,7 +2,7 @@ import { getDatabase } from '@archon/core';
 import { createAuthenticatedMessage, cancelMessage } from '@archon/core/db/dispatch';
 import * as tm from '@archon/core/db/taskmaster';
 import { approvalPass, type ApprovalState } from './approval-stalls';
-import { validateProposal } from './guard';
+import { validateProposal, validateForbiddenActionContent } from './guard';
 
 /** Dispatch remains the sole transport; runtime approval APIs are never called. */
 export async function checkApprovalStalls(now: Date): Promise<void> {
@@ -10,7 +10,7 @@ export async function checkApprovalStalls(now: Date): Promise<void> {
   const control = await tm.getPauseState();
   if (control.pause_state !== 'RUNNING') return;
   const producer = process.env.TASKMASTER_APPROVAL_PRODUCER_PRINCIPAL?.trim();
-  if (!producer) throw new Error('approval_producer_not_configured');
+  if (!producer) return;
   const inbox = await db.query<{ body: string }>(
     "SELECT body FROM agent_dispatch_messages WHERE recipient = 'taskmaster' AND sender_principal_id = $1 AND status = 'queued' ORDER BY created_at ASC",
     [producer]
@@ -48,6 +48,8 @@ export async function checkApprovalStalls(now: Date): Promise<void> {
       const fresh = await tm.getPauseState();
       if (fresh.pause_state !== 'RUNNING' || fresh.epoch !== control.epoch)
         throw new Error('approval_stall_pause_changed');
+      const contentGuard = validateForbiddenActionContent(body);
+      if (!contentGuard.allowed) throw new Error(contentGuard.reason);
       if (recipient === 't3-desk-local') {
         const result = validateProposal({
           type: 'nudge',

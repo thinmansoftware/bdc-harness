@@ -164,5 +164,39 @@ test('untrusted, legacy, and ineligible events cannot create or resolve supervis
 });
 test('missing producer configuration fails closed', async () => {
   delete process.env.TASKMASTER_APPROVAL_PRODUCER_PRINCIPAL;
-  await expect(checkApprovalStalls(new Date())).rejects.toThrow('approval_producer_not_configured');
+  await expect(checkApprovalStalls(new Date())).resolves.toBeUndefined();
+});
+
+test('forbidden command text never reaches the DO or XO escalation path', async () => {
+  process.env.TASKMASTER_APPROVAL_PRODUCER_PRINCIPAL = 'system:taskmaster';
+  await setPauseState({ pause_state: 'RUNNING', pause_actor: 'test' });
+  const now = new Date();
+  const request_id = crypto.randomUUID();
+  await createAuthenticatedMessage(
+    { kind: 'system', sender: 'taskmaster' },
+    {
+      recipient: 'taskmaster',
+      task_type: 'agent_message',
+      correlation_id: request_id,
+      idempotency_key: request_id,
+      body: JSON.stringify({
+        schema: 't3-approval-breach/v1',
+        request_id,
+        thread_id: 'mcp:forbidden',
+        host: 'desktop',
+        kind: 'command',
+        command_head: 'deploy production',
+        created_at: new Date(now.getTime() - 20 * 60000).toISOString(),
+        age_min: 20,
+      }),
+    }
+  );
+  await checkApprovalStalls(now);
+  await expect(checkApprovalStalls(new Date(now.getTime() + 15 * 60000))).rejects.toThrow(
+    'spend_send_deploy_verb_rejected'
+  );
+  for (const recipient of ['duty-officer', 'xo'])
+    expect(
+      (await listMessages({ recipient })).filter(m => m.body.includes(request_id))
+    ).toHaveLength(0);
 });

@@ -1792,6 +1792,12 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
 
   try {
     if (!deps.db) await checkApprovalStalls(new Date(nowMs));
+  } catch (error) {
+    tickFailures += 1;
+    log.warn({ err: error as Error }, 'taskmaster.approval_ingestion_failed');
+  }
+
+  try {
     if (deps.checkExpectations) await deps.checkExpectations(new Date(nowMs));
     else if (!deps.db) await checkExpectations(new Date(nowMs));
   } catch (error) {
