@@ -504,7 +504,7 @@ describe('node-level availability failover (prompt node)', () => {
   });
 
   it('uses a provider-compatible failover agent for a prompt availability failure', async () => {
-    await writeTestAgent('primary-builder', 'opus');
+    await writeTestAgent('primary-builder', 'claude-opus-5-5');
     await writeTestAgent('major-build-opr');
     const node = {
       id: 'author',
@@ -526,7 +526,7 @@ describe('node-level availability failover (prompt node)', () => {
   });
 
   it('uses a provider-compatible failover agent for a loop availability failure', async () => {
-    await writeTestAgent('primary-builder', 'opus');
+    await writeTestAgent('primary-builder', 'claude-opus-5-5');
     await writeTestAgent('major-build-opr');
 
     const node = {
