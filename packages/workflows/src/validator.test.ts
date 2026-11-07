@@ -461,7 +461,7 @@ describe('validateWorkflowResources -- failover persona-pin conflict', () => {
   }
 
   test('rejects failover_provider: codex on a node whose persona pins an Anthropic model', async () => {
-    await createAgentFile('sonnet-architect', { model: 'sonnet' });
+    await createAgentFile('sonnet-architect', { model: 'claude-sonnet-5-5' });
     const workflow = makeWorkflow(
       'test',
       [
@@ -482,7 +482,7 @@ describe('validateWorkflowResources -- failover persona-pin conflict', () => {
   });
 
   test('rejects when the failover_provider is inherited from the workflow level', async () => {
-    await createAgentFile('sonnet-architect-wf', { model: 'sonnet' });
+    await createAgentFile('sonnet-architect-wf', { model: 'claude-sonnet-5-5' });
     const workflow = {
       name: 'test',
       description: 'test workflow',
@@ -514,7 +514,7 @@ describe('validateWorkflowResources -- failover persona-pin conflict', () => {
   });
 
   test('accepts a model-less failover_agent for a Claude-pinned primary persona', async () => {
-    await createAgentFile('primary-sonnet-builder', { model: 'sonnet' });
+    await createAgentFile('primary-sonnet-builder', { model: 'claude-sonnet-5-5' });
     await createAgentFile('major-build-opr', {});
     const workflow = makeWorkflow(
       'test',
@@ -536,7 +536,7 @@ describe('validateWorkflowResources -- failover persona-pin conflict', () => {
   });
 
   test('rejects a missing failover_agent file before dispatch', async () => {
-    await createAgentFile('primary-sonnet-builder', { model: 'sonnet' });
+    await createAgentFile('primary-sonnet-builder', { model: 'claude-sonnet-5-5' });
     const workflow = makeWorkflow(
       'test',
       [
@@ -557,7 +557,7 @@ describe('validateWorkflowResources -- failover persona-pin conflict', () => {
   });
 
   test('no conflict when failover_provider is non-codex even if the persona pins a model', async () => {
-    await createAgentFile('sonnet-architect-2', { model: 'sonnet' });
+    await createAgentFile('sonnet-architect-2', { model: 'claude-sonnet-5-5' });
     const workflow = makeWorkflow(
       'test',
       [
