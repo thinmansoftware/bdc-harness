@@ -85,6 +85,7 @@ function fake() {
       return { data: check };
     }
     reads.push(route.replace('{repo}', data.repo).replace('{tree_sha}', data.tree_sha ?? ''));
+    if (route.includes('/commits/{commit_sha}/pulls')) return { data: [] };
     if (route.includes('/pulls/'))
       return { data: { number: 1, body: fixture().body, head: { sha }, base: { ref: 'master' } } };
     if (route.includes('/compare/')) return { data: { behind_by: 0 } };
@@ -505,4 +506,34 @@ test('three_definitive_create_rejections_allow_recovery_on_redelivery', async ()
   await gate(target);
   expect(f.writes.filter(w => w.route.startsWith('POST')).length).toBe(1);
   expect(f.writes.at(-1)?.data.conclusion).toBe('success');
+});
+
+test('shared_head_release_ce_failure_cannot_be_overwritten_by_main_success', async () => {
+  const f = fake();
+  const repository = 'thinmansoftware/lspro-react';
+  const prs = [
+    { number: 1, state: 'open', body: fixture().body, head: { sha }, base: { ref: 'release/ce' } },
+    { number: 2, state: 'open', body: fixture().body, head: { sha }, base: { ref: 'main' } },
+  ];
+  const gate = createPromotionGate(async (r, d) => {
+    if (r.includes('/commits/{commit_sha}/pulls')) return { data: prs };
+    if (r.includes('/pulls/')) return { data: prs[Number(d.pull_number) - 1] };
+    if (r.includes('/contents/'))
+      return {
+        data: {
+          encoding: 'base64',
+          content: Buffer.from(fixture().motion.replace(repo, repository)).toString('base64'),
+        },
+      };
+    if (r.includes('/compare/'))
+      return { data: { behind_by: String(d.basehead).startsWith('release/ce') ? 1 : 0 } };
+    return f.request(r, d);
+  }, 4574893);
+  await gate({ repository, number: 1, head: sha, base: 'release/ce' });
+  expect(f.writes.at(-1)?.data.conclusion).toBe('failure');
+  await gate({ repository, number: 2, head: sha, base: 'main' });
+  expect(f.writes.at(-1)?.data.conclusion).toBe('failure');
+  prs[0].body = '';
+  await gate({ repository, number: 2, head: sha, base: 'main' });
+  expect(f.writes.at(-1)?.data.output.summary).toContain('no promotion block');
 });

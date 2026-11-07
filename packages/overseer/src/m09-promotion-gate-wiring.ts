@@ -187,7 +187,10 @@ export function createPromotionGate(
           ...(result ? { conclusion: result.conclusion } : { conclusion: null }),
           output: {
             title: result
-              ? `M-09 ${result.conclusion}: ${result.rules.map((r, i) => `${i + 1} ${r.pass ? 'PASS' : 'FAIL'}`).join(', ')}`
+              ? `M-09 ${result.conclusion}: ${result.rules.map((r, i) => `${i + 1} ${r.pass ? 'PASS' : 'FAIL'}`).join(', ')}`.slice(
+                  0,
+                  255
+                )
               : 'M-09 evaluation pending',
             summary: result
               ? `${result.reason ? result.reason + '\n' : ''}bdc-xo pinned SHA: ${result.pinnedSha || 'unavailable'}\n${result.rules.map(r => `${r.pass ? 'PASS' : 'FAIL'} ${r.name}`).join('\n')}`
@@ -229,10 +232,8 @@ export function createPromotionGate(
     }
     const xo = { owner: 'thinmansoftware', repo: 'bdc-xo' };
     let pinnedSha = '',
-      motion = '',
       paths: string[] = [],
-      truncated = true,
-      behindBy = -1;
+      truncated = true;
     try {
       pinnedSha = (
         (await call('GET /repos/{owner}/{repo}/git/ref/{ref}', { ...xo, ref: 'heads/main' }))
@@ -248,42 +249,106 @@ export function createPromotionGate(
       ).data as { truncated?: boolean; tree: { type: string; mode: string; path: string }[] };
       truncated = tree.truncated !== false;
       paths = tree.tree.filter(e => e.type === 'blob' && e.mode === '100644').map(e => e.path);
-      const block = promotionBlock(pr.body ?? '');
-      const matches = motionPaths(paths, block?.id ?? '');
-      if (!truncated && matches.length === 1) {
-        const record = (
-          await call('GET /repos/{owner}/{repo}/contents/{path}', {
-            ...xo,
-            path: matches[0],
-            ref: pinnedSha,
-          })
-        ).data as { encoding: string; content: string };
-        if (record.encoding !== 'base64' || typeof record.content !== 'string')
-          throw Error('invalid record');
-        motion = Buffer.from(record.content, 'base64').toString('utf8');
-      }
-      behindBy = (
-        (
-          await call('GET /repos/{owner}/{repo}/compare/{basehead}', {
-            ...args,
-            basehead: `${pr.base.ref}...${pr.head.sha}`,
-          })
-        ).data as { behind_by: number }
-      ).behind_by;
     } catch {
-      motion = '';
-      behindBy = -1;
+      await publish('completed', unavailable);
+      return unavailable;
     }
-    const result = evaluatePromotion({
-      repository: target.repository,
-      head: pr.head.sha,
-      body: pr.body ?? '',
-      pinnedSha,
-      paths,
-      truncated,
-      motion,
-      behindBy,
-    });
+    async function decide(pr: Pr): Promise<PromotionResult> {
+      let motion = '',
+        behindBy = -1;
+      try {
+        const block = promotionBlock(pr.body ?? '');
+        const matches = motionPaths(paths, block?.id ?? '');
+        if (!truncated && matches.length === 1) {
+          const record = (
+            await call('GET /repos/{owner}/{repo}/contents/{path}', {
+              ...xo,
+              path: matches[0],
+              ref: pinnedSha,
+            })
+          ).data as { encoding: string; content: string };
+          if (record.encoding !== 'base64' || typeof record.content !== 'string')
+            throw Error('invalid record');
+          motion = Buffer.from(record.content, 'base64').toString('utf8');
+        }
+        behindBy = (
+          (
+            await call('GET /repos/{owner}/{repo}/compare/{basehead}', {
+              ...args,
+              basehead: `${pr.base.ref}...${pr.head.sha}`,
+            })
+          ).data as { behind_by: number }
+        ).behind_by;
+      } catch {
+        motion = '';
+        behindBy = -1;
+      }
+      return evaluatePromotion({
+        repository: target.repository,
+        head: pr.head.sha,
+        body: pr.body ?? '',
+        pinnedSha,
+        paths,
+        truncated,
+        motion,
+        behindBy,
+      });
+    }
+    let result: PromotionResult;
+    try {
+      const numbers = new Set<number>([target.number]);
+      for (let page = 1; ; page++) {
+        const associated = (
+          await call('GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls', {
+            ...args,
+            commit_sha: head,
+            per_page: 100,
+            page,
+          })
+        ).data as { number: number }[];
+        for (const item of associated) numbers.add(item.number);
+        if (associated.length < 100) break;
+        if (page >= 100) throw Error('incomplete associated PR listing');
+      }
+      const results: PromotionResult[] = [];
+      for (const number of numbers) {
+        const current =
+          number === target.number
+            ? pr
+            : ((
+                await call('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+                  ...args,
+                  pull_number: number,
+                })
+              ).data as Pr & { state: string });
+        if (
+          number !== target.number &&
+          ((current as Pr & { state: string }).state !== 'open' ||
+            current.head.sha !== head ||
+            !bases.includes(current.base.ref))
+        )
+          continue;
+        const decision = await decide(current);
+        results.push({
+          ...decision,
+          rules: decision.rules.map(rule => ({
+            ...rule,
+            name: `PR #${number} (${current.base.ref}) ${rule.name}`,
+          })),
+        });
+      }
+      result = {
+        conclusion: results.every(r => r.conclusion === 'success') ? 'success' : 'failure',
+        pinnedSha,
+        reason: results
+          .map(r => r.reason)
+          .filter(Boolean)
+          .join('; '),
+        rules: results.flatMap(r => r.rules),
+      };
+    } catch {
+      result = { ...unavailable, pinnedSha };
+    }
     try {
       await publish('completed', result);
     } catch {
