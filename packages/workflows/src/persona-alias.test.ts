@@ -52,7 +52,7 @@ async function createAgentFile(name: string): Promise<void> {
   await mkdir(dir, { recursive: true });
   const content = `---
 name: ${name}
-model: sonnet
+model: claude-sonnet-5-5
 ---
 
 You are the ${name} persona. Test sentinel: PERSONA_LOAD_BEARING.
