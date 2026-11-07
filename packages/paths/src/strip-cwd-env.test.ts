@@ -219,10 +219,19 @@ describe('stripCwdEnv -- nested Claude Code marker stripping', () => {
     expect(process.env.NODE_OPTIONS).toBe('  --no-experimental-webstorage  ');
   });
 
-  it('strips NODE_OPTIONS when any flag is not allowlisted', () => {
+  // One unknown flag must not take the safe flag down with it: an all-or-nothing
+  // delete is how the localStorage fix vanished from every lane on 2026-11-05.
+  it('keeps the allowlisted flags and drops only the unknown ones', () => {
     process.env.NODE_OPTIONS = '--no-experimental-webstorage --inspect';
     stripCwdEnv(tmpDir);
-    expect(process.env.NODE_OPTIONS).toBeUndefined();
+    expect(process.env.NODE_OPTIONS).toBe('--no-experimental-webstorage');
+  });
+
+  it('keeps the allowlisted flag when it is not first', () => {
+    process.env.NODE_OPTIONS =
+      '--max-old-space-size=4096 --no-experimental-webstorage --require=/tmp/x.js';
+    stripCwdEnv(tmpDir);
+    expect(process.env.NODE_OPTIONS).toBe('--no-experimental-webstorage');
   });
 
   it('strips NODE_OPTIONS that only looks like the allowlisted flag', () => {
@@ -255,5 +264,65 @@ describe('stripCwdEnv -- nested Claude Code marker stripping', () => {
     expect(process.env.CLAUDECODE).toBeUndefined();
     expect(process.env.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();
     expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe('keep-me');
+  });
+});
+
+describe('stripCwdEnv -- NODE_OPTIONS removals are reported, never silent', () => {
+  const tmpDir = join(import.meta.dir, '__strip-nodeopts-log-tmp__');
+  let stderrSpy: ReturnType<typeof spyOn>;
+  let stderrWrites: string[];
+
+  beforeEach(() => {
+    mkdirSync(tmpDir, { recursive: true });
+    stderrWrites = [];
+    stderrSpy = spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+      stderrWrites.push(typeof chunk === 'string' ? chunk : String(chunk));
+      return true;
+    });
+  });
+
+  afterEach(() => {
+    stderrSpy.mockRestore();
+    rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.NODE_OPTIONS;
+    delete process.env.VSCODE_INSPECTOR_OPTIONS;
+  });
+
+  it('names each removed flag and what was kept', () => {
+    process.env.NODE_OPTIONS = '--no-experimental-webstorage --inspect --max-old-space-size=4096';
+    stripCwdEnv(tmpDir);
+    const line = stderrWrites.find(w => w.startsWith('[archon] NODE_OPTIONS: removed'));
+    expect(line).toBeDefined();
+    expect(line).toContain('removed 2 flag(s)');
+    expect(line).toContain('--inspect');
+    expect(line).toContain('--max-old-space-size');
+    expect(line).toContain('kept --no-experimental-webstorage');
+  });
+
+  it('never prints a flag value', () => {
+    process.env.NODE_OPTIONS = '--require=/home/secret/preload.js --inspect=0.0.0.0:9229';
+    stripCwdEnv(tmpDir);
+    const line = stderrWrites.find(w => w.startsWith('[archon] NODE_OPTIONS: removed'));
+    expect(line).toBeDefined();
+    expect(line).toContain('--require');
+    expect(line).not.toContain('/home/secret/preload.js');
+    expect(line).not.toContain('9229');
+    expect(line).toContain('NODE_OPTIONS unset');
+    expect(process.env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  it('prints nothing when every flag is allowlisted', () => {
+    process.env.NODE_OPTIONS = '--no-experimental-webstorage';
+    stripCwdEnv(tmpDir);
+    expect(stderrWrites.some(w => w.includes('NODE_OPTIONS'))).toBe(false);
+  });
+
+  it('reports a stripped VSCODE_INSPECTOR_OPTIONS', () => {
+    process.env.VSCODE_INSPECTOR_OPTIONS = '{"port":9229}';
+    stripCwdEnv(tmpDir);
+    expect(stderrWrites.some(w => w.startsWith('[archon] stripped VSCODE_INSPECTOR_OPTIONS'))).toBe(
+      true
+    );
+    expect(stderrWrites.some(w => w.includes('9229'))).toBe(false);
   });
 });
