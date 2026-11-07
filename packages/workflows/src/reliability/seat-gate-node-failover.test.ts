@@ -195,7 +195,7 @@ function useSeatRegistry(): void {
 const PERSONA = [
   '---',
   'name: reroute-claude-persona',
-  'model: sonnet',
+  'model: claude-sonnet-5-5',
   'tools: [Read, Grep]',
   'description: reroute test persona',
   '---',
