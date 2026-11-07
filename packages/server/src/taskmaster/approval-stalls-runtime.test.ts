@@ -191,8 +191,38 @@ test('forbidden command text never reaches the DO or XO escalation path', async 
       }),
     }
   );
+  const goodId = crypto.randomUUID();
+  await createAuthenticatedMessage(
+    { kind: 'system', sender: 'taskmaster' },
+    {
+      recipient: 'taskmaster',
+      task_type: 'agent_message',
+      correlation_id: goodId,
+      idempotency_key: goodId,
+      body: JSON.stringify({
+        schema: 't3-approval-breach/v1',
+        request_id: goodId,
+        thread_id: 'mcp:allowed',
+        host: 'desktop',
+        kind: 'command',
+        command_head: 'bun test',
+        created_at: new Date(now.getTime() - 20 * 60000).toISOString(),
+        age_min: 20,
+      }),
+    }
+  );
   await checkApprovalStalls(now);
-  await expect(checkApprovalStalls(new Date(now.getTime() + 15 * 60000))).rejects.toThrow(
+  await expect(checkApprovalStalls(new Date(now.getTime() + 15 * 60000))).resolves.toBeUndefined();
+  await checkApprovalStalls(new Date(now.getTime() + 30 * 60000));
+  expect(
+    (await listMessages({ recipient: 'duty-officer' })).filter(m => m.body.includes(goodId))
+  ).toHaveLength(1);
+  const rejected = await getDatabase().query<{ outcome: string; proposal_json: string }>(
+    'SELECT outcome, proposal_json FROM tm_journal WHERE idempotency_key = $1',
+    [`tm:pending_approval:${request_id}`]
+  );
+  expect(rejected.rows[0]?.outcome).toBe('rejected');
+  expect(JSON.parse(rejected.rows[0]!.proposal_json).guard_rejected).toContain(
     'spend_send_deploy_verb_rejected'
   );
   for (const recipient of ['duty-officer', 'xo'])

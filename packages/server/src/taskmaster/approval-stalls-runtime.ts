@@ -1,7 +1,7 @@
 import { getDatabase } from '@archon/core';
 import { createAuthenticatedMessage, cancelMessage } from '@archon/core/db/dispatch';
 import * as tm from '@archon/core/db/taskmaster';
-import { approvalPass, type ApprovalState } from './approval-stalls';
+import { approvalPass, ApprovalContentRejection, type ApprovalState } from './approval-stalls';
 import { validateProposal, validateForbiddenActionContent } from './guard';
 
 /** Dispatch remains the sole transport; runtime approval APIs are never called. */
@@ -40,7 +40,7 @@ export async function checkApprovalStalls(now: Date): Promise<void> {
       });
       await tm.updateActionOutcome(
         row.id,
-        state.resolved ? 'expired' : 'pending',
+        state.resolved ? 'expired' : state.guard_rejected ? 'rejected' : 'pending',
         JSON.stringify(state)
       );
     },
@@ -49,7 +49,7 @@ export async function checkApprovalStalls(now: Date): Promise<void> {
       if (fresh.pause_state !== 'RUNNING' || fresh.epoch !== control.epoch)
         throw new Error('approval_stall_pause_changed');
       const contentGuard = validateForbiddenActionContent(body);
-      if (!contentGuard.allowed) throw new Error(contentGuard.reason);
+      if (!contentGuard.allowed) throw new ApprovalContentRejection(contentGuard.reason);
       if (recipient === 't3-desk-local') {
         const result = validateProposal({
           type: 'nudge',
@@ -59,7 +59,7 @@ export async function checkApprovalStalls(now: Date): Promise<void> {
           idempotencyKey: key,
           actsImmediately: true,
         });
-        if (!result.allowed) throw new Error(result.reason);
+        if (!result.allowed) throw new ApprovalContentRejection(result.reason);
       }
       const sent = await createAuthenticatedMessage(
         { kind: 'system', sender: 'taskmaster' },

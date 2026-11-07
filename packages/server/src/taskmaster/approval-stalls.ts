@@ -1,3 +1,6 @@
+/** A content rejection is terminal for automatic sends, not for resolution evidence. */
+export class ApprovalContentRejection extends Error {}
+
 /** Harness-only approval supervision. No prompt approval capability. */
 export interface ApprovalState {
   request_id: string;
@@ -8,6 +11,7 @@ export interface ApprovalState {
   resolved?: boolean;
   nudged?: boolean;
   escalated?: boolean;
+  guard_rejected?: string;
 }
 export interface ApprovalDeps {
   read(): Promise<ApprovalState[]>;
@@ -80,32 +84,38 @@ export async function approvalPass(
     }
   }
   for (const state of states.values()) {
-    if (state.resolved) continue;
-    const key = `tm:pending_approval:${state.request_id}`;
-    if (!state.nudged) {
-      const id = await deps.send(
-        't3-desk-local',
-        JSON.stringify({
-          schema: 't3-thread-nudge/v1',
-          thread_id: state.thread_id,
-          text: `Pending approval ${state.request_id}; awaiting authorized operator review.`,
-          reason: 'approval-stall',
-          request_id: state.request_id,
-        }),
-        `${key}:nudge`
-      );
-      await deps.expect(state, id);
-      state.nudged = true;
-      await deps.save(state);
-    }
-    if (!state.escalated && now.getTime() - Date.parse(state.first_seen) >= 15 * 60000) {
-      const age = Math.floor((now.getTime() - Date.parse(state.created_at)) / 60000);
-      await deps.send(
-        'duty-officer',
-        `pending_approval thread=${state.thread_id} request=${state.request_id} command=${state.command_head} age=${age} min. Authorized operator review required.`,
-        `tm:blocker_report:pending_approval:${state.request_id}`
-      );
-      state.escalated = true;
+    if (state.resolved || state.guard_rejected) continue;
+    try {
+      const key = `tm:pending_approval:${state.request_id}`;
+      if (!state.nudged) {
+        const id = await deps.send(
+          't3-desk-local',
+          JSON.stringify({
+            schema: 't3-thread-nudge/v1',
+            thread_id: state.thread_id,
+            text: `Pending approval ${state.request_id}; awaiting authorized operator review.`,
+            reason: 'approval-stall',
+            request_id: state.request_id,
+          }),
+          `${key}:nudge`
+        );
+        await deps.expect(state, id);
+        state.nudged = true;
+        await deps.save(state);
+      }
+      if (!state.escalated && now.getTime() - Date.parse(state.first_seen) >= 15 * 60000) {
+        const age = Math.floor((now.getTime() - Date.parse(state.created_at)) / 60000);
+        await deps.send(
+          'duty-officer',
+          `pending_approval thread=${state.thread_id} request=${state.request_id} command=${state.command_head} age=${age} min. Authorized operator review required.`,
+          `tm:blocker_report:pending_approval:${state.request_id}`
+        );
+        state.escalated = true;
+        await deps.save(state);
+      }
+    } catch (error) {
+      if (!(error instanceof ApprovalContentRejection)) throw error;
+      state.guard_rejected = error.message;
       await deps.save(state);
     }
   }
