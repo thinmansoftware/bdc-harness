@@ -661,6 +661,15 @@ export async function checkExpectations(now: Date, deps: ExpectationDeps = {}): 
           deps.checkEvidence ??
           ((publicSpec: EvidenceSpec): Promise<EvidenceResult> => checkEvidence(publicSpec, deps))
         )(spec);
+        // Approval absence is handled by the DO clock, never generic give-up.
+        if (
+          !evidence.ok &&
+          spec.kind === 'db_row_exists' &&
+          spec.table === 'tm_journal' &&
+          typeof spec.where.idempotency_key === 'string' &&
+          spec.where.idempotency_key.startsWith('tm:pending_approval:')
+        )
+          continue;
       }
     } catch (error) {
       log.warn(

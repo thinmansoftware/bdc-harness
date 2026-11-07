@@ -1,3 +1,4 @@
+import { checkApprovalStalls } from './approval-stalls-runtime';
 /**
  * Taskmaster Slice 1 loop (WO-HARNESS-TASKMASTER-SLICE1-01, M-133 CARRIED 3-0).
  *
@@ -1190,7 +1191,8 @@ async function reconcilePendingActions(
     if (
       action.outcome !== 'pending' ||
       !action.idempotency_key ||
-      action.action_type === 'fire_cauldron'
+      action.action_type === 'fire_cauldron' ||
+      action.idempotency_key.startsWith('tm:pending_approval:')
     )
       continue;
     const effect = await findEffect(action.idempotency_key);
@@ -1787,6 +1789,13 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   state.tickIndex += 1;
   recordTickAttempt(state.deadman, nowMs);
   let tickFailures = 0;
+
+  try {
+    if (!deps.db) await checkApprovalStalls(new Date(nowMs));
+  } catch (error) {
+    tickFailures += 1;
+    log.warn({ err: error as Error }, 'taskmaster.approval_ingestion_failed');
+  }
 
   try {
     if (deps.checkExpectations) await deps.checkExpectations(new Date(nowMs));
