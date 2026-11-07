@@ -6,7 +6,7 @@ description: |
   NOT for: Code-shipping WOs, feature development, infrastructure deploys, or bug-fix WOs with their own workflow.
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
   - id: read-spec
@@ -102,7 +102,7 @@ nodes:
     persona: major-build
     depends_on: [plan]
     task_class: medium_work
-    model: opus[1m]
+    model: claude-opus-5-5[1m]
     loop:
       prompt: |
         Implement the approved plan for this BDC doctrine Work Order.

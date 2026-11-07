@@ -10,7 +10,7 @@ description: |
   NOT for: any other WO. This workflow is bound to WO-RELEASE-CE-BRANCH-MODEL-01.
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
   - id: read-spec

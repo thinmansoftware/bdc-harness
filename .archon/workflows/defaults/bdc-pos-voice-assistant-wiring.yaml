@@ -28,7 +28,7 @@ description: |
   parallel_ok: true (pos_voice_log is isolated new table).
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
 

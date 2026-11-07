@@ -38,7 +38,7 @@ description: |
   parallel_ok: true (POS-arrival lane; no schema overlap with other lanes today).
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
 

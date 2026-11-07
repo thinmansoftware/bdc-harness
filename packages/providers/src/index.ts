@@ -73,7 +73,8 @@ export * from './probe';
 
 // Provider classes
 export { ClaudeProvider } from './claude/provider';
-export { CodexProvider } from './codex/provider';
+export { CodexProvider, CODEX_FALLBACK_MODEL } from './codex/provider';
+export { MODEL_ALLOWLIST } from './model-allowlist';
 
 // Config parsers
 export { parseClaudeConfig, type ClaudeProviderDefaults } from './claude/config';

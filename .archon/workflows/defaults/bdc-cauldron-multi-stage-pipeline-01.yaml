@@ -11,7 +11,7 @@ description: |
 
 policyFile: harness/policies/agent-behavior.md
 provider: claude
-model: sonnet
+model: claude-sonnet-5-5
 
 inputs:
   WO_ID:

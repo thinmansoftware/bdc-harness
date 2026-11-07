@@ -5,7 +5,7 @@
  * served feature-development review seats fail closed on Codex. They use
  * provider codex-native-strict, carry no failover_provider, and every listed
  * strict seat is pinned to Terra: gpt-6.1-terra on the Codex and Cursor lanes,
- * gpt-5.6-terra on the Codex-only, Fable, and default lanes. No review-family
+ * gpt-6.1-terra on the Codex-only, Fable, and default lanes. No review-family
  * node in these lanes remains on plain provider codex.
  *
  * WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01 (John Ranson 2026-10-27,
@@ -71,19 +71,19 @@ const LANES: ReadonlyArray<{
   {
     file: 'bdc-feature-development-codex-only.yaml',
     seats: SEVEN_SEATS,
-    terra: 'gpt-5.6-terra',
+    terra: 'gpt-6.1-terra',
     failover: KIMI_FAILOVER,
   },
   {
     file: 'bdc-feature-development-fable.yaml',
     seats: FOUR_SEATS,
-    terra: 'gpt-5.6-terra',
+    terra: 'gpt-6.1-terra',
     failover: KIMI_FAILOVER,
   },
   {
     file: 'bdc-feature-development.yaml',
     seats: FOUR_SEATS,
-    terra: 'gpt-5.6-terra',
+    terra: 'gpt-6.1-terra',
     failover: KIMI_FAILOVER,
   },
 ];

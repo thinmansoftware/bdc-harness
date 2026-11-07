@@ -9,7 +9,7 @@
 #   EXACTLY TWO loops (plan-review + diff-repair) -- hard line per project_feature-dev-in-run-review-nodes.
 #   No new councils, no per-WO DAG surgery beyond WO-content injection + flip-notion API rewrite.
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring (verified at draft time):
-#   R1 model: sonnet root; R2 $WORKFLOW_ID only; R3 fresh_context: true on both loops;
+#   R1 model: claude-sonnet-5-5 root; R2 $WORKFLOW_ID only; R3 fresh_context: true on both loops;
 #   R4 repo-root-relative paths; R5 date-prefix glob + issue fallbacks in read-spec;
 #   R6 policyFile harness/policies/agent-behavior.md; R7 flip-notion final node;
 #   R8 codebase pre-flight note below; R9 lives in .archon/workflows/defaults/;
@@ -38,7 +38,7 @@ description: |
 
 policyFile: harness/policies/agent-behavior.md
 provider: claude
-model: sonnet
+model: claude-sonnet-5-5
 target_repo: thinmansoftware/bdc-harness
 
 # Rule 12 (inputs block): no `type:` field; quote any numeric default.

@@ -3,7 +3,7 @@
 # Reference: wo-shopops-billing-statement-v2-01.yaml (proven shopops-api child pattern)
 #
 # Rule compliance checklist:
-#  [x] Rule 1:  model: sonnet at workflow root
+#  [x] Rule 1:  model: claude-sonnet-5-5 at workflow root
 #  [x] Rule 2:  bash blocks use date +%Y%m%d%H%M%S for branch suffix
 #  [x] Rule 3:  implement loop has fresh_context: true
 #  [x] Rule 4:  all paths relative to repo root (no BDC_XO/ prefix)
@@ -40,7 +40,7 @@ description: |
 
 policyFile: harness/policies/agent-behavior.md
 provider: claude
-model: sonnet
+model: claude-sonnet-5-5
 
 inputs:
   WO_ID:

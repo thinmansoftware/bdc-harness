@@ -5,7 +5,7 @@
 # Doctrine compliance: 13 hard rules of archon-yaml-authoring verified at draft time.
 #
 # Rule compliance checklist (verify before sync):
-#  [x] Rule 1:  model: sonnet at workflow root; per-node model: opus on implement loop (live security fix -- capable builder, NOT haiku)
+#  [x] Rule 1:  model: claude-sonnet-5-5 at workflow root; per-node model: claude-opus-5-5 on implement loop (live security fix -- capable builder, NOT haiku)
 #  [x] Rule 2:  bash blocks use $WORKFLOW_ID (not ${run.id}); branch suffix uses date +%Y%m%d%H%M%S
 #  [x] Rule 3:  implement loop has fresh_context: true
 #  [x] Rule 4:  all paths relative to repo root (no BDC_XO/ prefix). Repo root contains shopops-api/ subdir.
@@ -79,7 +79,7 @@ description: |
   NOT for: any other WO. Out of scope: aiCoverPick / /covers/ai-pick; ollamaClient text/OCR path.
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 inputs:
   WO_ID:
@@ -180,13 +180,13 @@ nodes:
   # --- Node 4: Implement (self-review loop) -----------------------------------
   # Rule 3: fresh_context: true (required for self-review loops).
   # Rule 10: ALL FOUR siblings declared: prompt, until, max_iterations, fresh_context.
-  # model: opus per-node override -- this is a LIVE cross-tenant security fix; do NOT run on haiku.
+  # model: claude-opus-5-5 per-node override -- this is a LIVE cross-tenant security fix; do NOT run on haiku.
   # Rule 19: builder MUST note RULE19_FILE + RULE19_GREP in output for runtime-verify node.
   # CRITICAL: do NOT delete ollamaClient.js (still used by slab-OCR + text path).
   #           Only remove the callOllamaVision call from the recognize path.
   - id: implement
     depends_on: [fresh-branch]
-    model: opus
+    model: claude-opus-5-5
     loop:
       fresh_context: true
       until: COMPLETE

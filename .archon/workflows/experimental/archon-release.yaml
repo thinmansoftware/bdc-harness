@@ -23,7 +23,7 @@ description: |
     archon workflow run archon-release "--dry-run"         # dry-run patch (implicit)
 
 provider: claude
-model: sonnet
+model: claude-sonnet-5-5
 interactive: true                       # required: has approval gates
 
 worktree:
@@ -419,7 +419,7 @@ nodes:
       Reply with `/workflow approve <run-id>` to continue, or
       `/workflow reject <run-id> <reason>` to abort.
     depends_on: [format-changelog, collect-commits, bump-version, parse-args]
-    model: haiku
+    model: claude-haiku-5-5
     allowed_tools: []
 
   - id: review-changelog
@@ -589,7 +589,7 @@ nodes:
       Then approve here to continue with tag, GitHub release, dev sync,
       binary wait, and Homebrew formula update.
     depends_on: [create-pr]
-    model: haiku
+    model: claude-haiku-5-5
     allowed_tools: []
     when: "$parse-args.output.dryRun == 'false'"
 

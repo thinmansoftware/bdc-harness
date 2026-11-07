@@ -1,9 +1,9 @@
 ---
 name: claude-adversarial-reviewer
-model: sonnet
+model: claude-sonnet-5-5
 # No model pin: this persona runs via `provider: claude` (diff-review,
 # diff-review-final, opus-rereview, apply-diff-review-final in the Codex lane).
-# The node supplies provider: claude + model: sonnet explicitly in the workflow
+# The node supplies provider: claude + model: claude-sonnet-5-5 explicitly in the workflow
 # YAML. If a model were pinned here, the persona model would win over the node-
 # level model (resolveAgentPersona, executor-shared.ts). Keeping the pin at the
 # node level lets the workflow author control the model without touching this

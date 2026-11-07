@@ -12228,7 +12228,7 @@ describe('agent persona dispatch', () => {
   }
 
   it('prompt node with agent: applies persona allowed_tools to nodeConfig', async () => {
-    await writeAgentFile('read-only-test-agent', 'sonnet', ['Read', 'Grep']);
+    await writeAgentFile('read-only-test-agent', 'claude-sonnet-5-5', ['Read', 'Grep']);
 
     const mockStore = createMockStore();
     const mockDeps = createMockDeps(mockStore);
@@ -12262,7 +12262,7 @@ describe('agent persona dispatch', () => {
   });
 
   it('prompt node with agent: and model: mismatch -- persona model wins', async () => {
-    await writeAgentFile('sonnet-test-agent', 'sonnet');
+    await writeAgentFile('sonnet-test-agent', 'claude-sonnet-5-5');
 
     const mockStore = createMockStore();
     const mockDeps = createMockDeps(mockStore);
@@ -12298,7 +12298,7 @@ describe('agent persona dispatch', () => {
     expect(mockSendQueryDag.mock.calls.length).toBeGreaterThan(0);
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
     // Persona model (sonnet) wins over node model (opus)
-    expect(optionsArg.model).toBe('sonnet');
+    expect(optionsArg.model).toBe('claude-sonnet-5-5');
   });
 
   it('Claude node override supplies the model for a persona without one', async () => {
@@ -12342,7 +12342,7 @@ describe('agent persona dispatch', () => {
   });
 
   it('Claude node override replaces a persona model pin and records the effective binding', async () => {
-    await writeAgentFile('opus-test-agent', 'opus');
+    await writeAgentFile('opus-test-agent', 'claude-opus-5-5');
 
     const mockStore = createMockStore();
     const mockDeps = createMockDeps(mockStore);
@@ -12389,7 +12389,7 @@ describe('agent persona dispatch', () => {
   });
 
   it('non-Claude node override ignores a persona model pin', async () => {
-    await writeAgentFile('claude-pinned-test-agent', 'opus');
+    await writeAgentFile('claude-pinned-test-agent', 'claude-opus-5-5');
 
     const mockStore = createMockStore();
     const mockDeps = createMockDeps(mockStore);
@@ -14689,7 +14689,7 @@ describe('executeDagWorkflow -- WO-HARNESS-PR-STATUS-TRUTH-AND-AUTOMERGE-01', ()
       [
         '---',
         `name: ${name}`,
-        'model: sonnet',
+        'model: claude-sonnet-5-5',
         'context:',
         '  oracle:',
         '    - test query',

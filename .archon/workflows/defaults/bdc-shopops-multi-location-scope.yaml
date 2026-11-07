@@ -34,7 +34,7 @@ description: |
   Polish bar: HIGH (P0 Plan B floor for Mutant Market install).
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
 

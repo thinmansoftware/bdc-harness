@@ -158,8 +158,7 @@ describe('strict seat model pins', () => {
         );
         const binding = await resolveStrictBinding(workflow, node!);
         expect(binding.provider, `${file}:${id}:provider`).toBe('codex-native-strict');
-        const expectedTerra =
-          file === 'bdc-feature-development-codex.yaml' ? 'gpt-6.1-terra' : 'gpt-5.6-terra';
+        const expectedTerra = 'gpt-6.1-terra';
         expect(binding.model, `${file}:${id}:model`).toBe(expectedTerra);
       }
     }
@@ -171,7 +170,7 @@ describe('strict seat model pins', () => {
         'name: bare-strict-guard',
         'description: in-test fixture with one unpinned strict node',
         'provider: codex',
-        'model: gpt-5.6-sol',
+        'model: gpt-6.1-sol',
         'nodes:',
         '  - id: bare-strict',
         '    provider: codex-native-strict',
@@ -202,8 +201,7 @@ describe('strict seat model pins', () => {
         expect(binding.modelId, file).not.toBe('');
         expect(binding.modelId, file).toBeDefined();
       }
-      const expectedTerra =
-        file === 'bdc-feature-development-codex.yaml' ? 'gpt-6.1-terra' : 'gpt-5.6-terra';
+      const expectedTerra = 'gpt-6.1-terra';
       expect(
         strict.some(binding => binding.modelId === expectedTerra),
         file
@@ -230,9 +228,9 @@ describe('strict seat model pins', () => {
       {
         file: 'bdc-feature-development-codex-only.yaml',
         provider: 'codex',
-        model: 'gpt-5.6-sol',
+        model: 'gpt-6.1-sol',
         plan: { provider: 'codex' },
-        implement: { provider: 'codex', model: 'gpt-5.6-sol' },
+        implement: { provider: 'codex', model: 'gpt-6.1-sol' },
       },
       {
         file: 'bdc-feature-development.yaml',

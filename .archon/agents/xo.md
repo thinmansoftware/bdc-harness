@@ -1,6 +1,6 @@
 ---
 name: xo
-model: sonnet
+model: claude-sonnet-5-5
 tools: [Read, Grep, Glob, Edit, WebFetch]
 description: XO orchestration and planning agent. Board management, comms, research, analytics.
 ---

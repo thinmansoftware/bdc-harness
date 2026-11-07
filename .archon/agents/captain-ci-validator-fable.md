@@ -1,6 +1,6 @@
 ---
 name: captain-ci-validator-fable
-model: claude-opus-5
+model: claude-opus-5-5
 tools: [Read, Grep, Glob, Bash]
 description: Manifest-against-reality validator. Verifies files exist, tests pass, manifest is complete.
 ---

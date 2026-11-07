@@ -37,7 +37,7 @@ description: |
     - Reconstructing the design from prose if CD source is missing -- workflow STOPS
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
   - id: read-spec
@@ -191,7 +191,7 @@ nodes:
   - id: implement
     depends_on: [rule10-token-discipline-pass]
     task_class: medium_work
-    model: opus[1m]
+    model: claude-opus-5-5[1m]
     loop:
       prompt: |
         Build the React Theme Shell components from the Rule-10-clean V4 source.

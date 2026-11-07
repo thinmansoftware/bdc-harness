@@ -11,10 +11,10 @@ description: |
 
 policyFile: harness/policies/agent-behavior.md
 
-# Main Claude build lane: model: sonnet is correct -- this IS the Claude build lane.
+# Main Claude build lane: model: claude-sonnet-5-5 is correct -- this IS the Claude build lane.
 # All build + review nodes are intentionally Claude. Do not downgrade to a cheaper model.
 provider: claude
-model: sonnet
+model: claude-sonnet-5-5
 
 inputs:
   WO_ID:
@@ -199,7 +199,7 @@ nodes:
 
   - id: war-council-validator
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     persona: captain-ci-validator
     depends_on: [implement]
     trigger_rule: all_done
@@ -233,7 +233,7 @@ nodes:
   # are skipped (nothing reaches a provider mutation path).
   - id: business-risk-gate
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     persona: captain-ci-validator
     depends_on: [war-council-validator]
     trigger_rule: all_done
