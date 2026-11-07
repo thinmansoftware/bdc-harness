@@ -46,11 +46,14 @@ describe('default merge repo policy -- production bases stay closed', () => {
     });
   });
 
-  test('release/lspro and release/ce have no entry and are not candidates', () => {
+  test('release/lspro is absent and release/ce is explicitly production', () => {
     expect(
       getRepoBasePolicy('thinmansoftware/lspro-react', 'release/lspro', policy)
     ).toBeUndefined();
-    expect(getRepoBasePolicy('thinmansoftware/lspro-react', 'release/ce', policy)).toBeUndefined();
+    expect(getRepoBasePolicy('thinmansoftware/lspro-react', 'release/ce', policy)).toEqual({
+      unattended: false,
+      docsOnly: 'skip',
+    });
   });
 
   test('no release/* base is unattended on either repo', () => {
