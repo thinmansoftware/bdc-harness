@@ -31,3 +31,18 @@ test('Stop 6: relay contract accepted only for relay recipient', () => {
   expect(validateProposal({ ...proposal, recipient: 't3-desk-local', body }).allowed).toBe(true);
   expect(validateProposal({ ...proposal, recipient: 't3-desk-local' }).allowed).toBe(false);
 });
+
+for (const text of ['deploy production', 'charge the customer', 'send the email']) {
+  test(`relay rejects forbidden action: ${text}`, () => {
+    const body = JSON.stringify({
+      schema: 't3-thread-nudge/v1',
+      thread_id: 'mcp:x',
+      request_id: 'r1',
+      reason: 'approval-stall',
+      text,
+    });
+    const result = validateProposal({ ...proposal, recipient: 't3-desk-local', body });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('spend_send_deploy_verb_rejected');
+  });
+}

@@ -9,8 +9,11 @@ export async function checkApprovalStalls(now: Date): Promise<void> {
   const db = getDatabase();
   const control = await tm.getPauseState();
   if (control.pause_state !== 'RUNNING') return;
+  const producer = process.env.TASKMASTER_APPROVAL_PRODUCER_PRINCIPAL?.trim();
+  if (!producer) throw new Error('approval_producer_not_configured');
   const inbox = await db.query<{ body: string }>(
-    "SELECT body FROM agent_dispatch_messages WHERE recipient = 'taskmaster' ORDER BY created_at ASC"
+    "SELECT body FROM agent_dispatch_messages WHERE recipient = 'taskmaster' AND sender_principal_id = $1 AND status = 'queued' ORDER BY created_at ASC",
+    [producer]
   );
   const messages: unknown[] = [];
   for (const row of inbox.rows) {

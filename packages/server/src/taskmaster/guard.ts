@@ -205,28 +205,6 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
     };
   }
 
-  if (proposal.recipient.trim().toLowerCase() === 't3-desk-local') {
-    try {
-      const body = JSON.parse(proposal.body) as Record<string, unknown>;
-      if (
-        proposal.type !== 'nudge' ||
-        body.schema !== 't3-thread-nudge/v1' ||
-        body.reason !== 'approval-stall' ||
-        !['thread_id', 'request_id', 'text'].every(
-          key => typeof body[key] === 'string' && body[key].trim()
-        )
-      ) {
-        return { allowed: false, reason: 'relay_contract_invalid' };
-      }
-      return {
-        allowed: !!proposal.idempotencyKey?.trim() && proposal.contentIncomplete !== true,
-        reason: undefined,
-      };
-    } catch {
-      return { allowed: false, reason: 'relay_contract_invalid' };
-    }
-  }
-
   // M-155 WO 3: a proposal whose body is null/absent or that is flagged
   // content-incomplete is an ORDINARY rejection (journal-only skip), NOT a
   // forbiddenEffect -- the auto HARD_PAUSE circuit is reserved for
@@ -282,6 +260,31 @@ export function validateProposal(proposal: ActionProposal): GuardResult {
       allowed: false,
       reason: `spend_send_deploy_verb_rejected: body contains forbidden verb '${match[0]}'. The Taskmaster has zero spend/send/deploy authority (M-15 tier wall).`,
     };
+  }
+
+  if (proposal.recipient.trim().toLowerCase() === 't3-desk-local') {
+    try {
+      const body = JSON.parse(proposal.body) as Record<string, unknown>;
+      if (
+        proposal.type !== 'nudge' ||
+        body.schema !== 't3-thread-nudge/v1' ||
+        body.reason !== 'approval-stall' ||
+        !['thread_id', 'request_id', 'text'].every(
+          key => typeof body[key] === 'string' && body[key].trim()
+        )
+      ) {
+        return { allowed: false, reason: 'relay_contract_invalid' };
+      }
+      // Scan decoded text too: JSON escapes must not hide forbidden verbs.
+      const textMatch = SPEND_SEND_DEPLOY_RE.exec(
+        (body.text as string).replace(/\s+/g, ' ').replace(new RegExp(WO_ID_RE.source, 'g'), '')
+      );
+      if (textMatch)
+        return { allowed: false, reason: `spend_send_deploy_verb_rejected: '${textMatch[0]}'` };
+      return { allowed: true };
+    } catch {
+      return { allowed: false, reason: 'relay_contract_invalid' };
+    }
   }
 
   // M-155 WO 3: ordinary nudges must be content-complete. Verified
