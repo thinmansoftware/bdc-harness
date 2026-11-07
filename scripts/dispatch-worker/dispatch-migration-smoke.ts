@@ -64,6 +64,7 @@ const KNOWN_PRINCIPALS = [
   ['overseer-reviewer', 'Overseer PR Reviewer', 'worker_poll', 1],
   // Added by migration 065 (WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01).
   ['pr-review-log', 'PR review receipt log', 'drain_on_start', 1],
+  ['t3-desk-local', 'PC T3 relay queue', 'worker_poll', 1],
   ['t3-desktop', 'T3 desktop results queue', 'drain_on_start', 1],
   ['t3-bridge', 'T3 VPS bridge sender', 'drain_on_start', 1],
   // Added by migration 046. This list is a FOURTH hand-maintained mirror of the
