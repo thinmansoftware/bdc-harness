@@ -64,7 +64,7 @@ test('anthropic_packages_current', () => {
   // XO decision (a), WO #4895: pi-ai's isolated 0.x copy is allowed.
   const entries = lock.split('\n').filter(line => /"@anthropic-ai\/sdk": \[/.test(line));
   expect(entries.length).toBe(1);
-  expect(entries[0]).toContain('@anthropic-ai/sdk@1.5.0');
+  expect(entries[0]).toContain('@anthropic-ai/sdk@1.6.0');
   // Amended Stop 17: only SDK copies directly beneath pi-ai are exempt.
   const oldSdkEntries = lock.split('\n').filter(line => /\["@anthropic-ai\/sdk@0\./.test(line));
   expect(oldSdkEntries.length).toBeGreaterThan(0);
@@ -72,7 +72,7 @@ test('anthropic_packages_current', () => {
     const key = /^\s*"([^"]+)":/.exec(entry)?.[1];
     expect(key?.endsWith('@mariozechner/pi-ai/@anthropic-ai/sdk')).toBe(true);
   }
-  expect(read('packages/providers/package.json').dependencies['@anthropic-ai/sdk']).toBe('^1.5.0');
+  expect(read('packages/providers/package.json').dependencies['@anthropic-ai/sdk']).toBe('^1.6.0');
   // Resolve from every first-party TypeScript importer, including tests.
   for (const pkg of readdirSync(join(root, 'packages'))) {
     const dir = join(root, 'packages', pkg, 'src');
