@@ -40,6 +40,7 @@ import type {
   ReviewConflictAtHead,
 } from './types.ts';
 import { recoverHeadBranchFromEvents } from './watch';
+import { mergeRecheckOnApprovalEnabled } from './merge-recheck-on-approval';
 import { resolveRequiredContexts } from './adapters/required-contexts';
 import { createRealOctokitClient } from './adapters/github-real-deps';
 import { blockingRequiredContexts } from './required-context-gate';
@@ -444,6 +445,10 @@ async function resolveRunlessTarget(
     );
     return null;
   }
+  if (pr.lookupFailed) {
+    await skip('pr_context_fetch_failed', pr.htmlUrl);
+    return null;
+  }
   if (!pr.exists || pr.pr?.number !== ref.prNumber) {
     await skip('pr_context_unresolvable', pr.htmlUrl);
     return null;
@@ -504,9 +509,10 @@ async function resolveMergeTarget(
     await skip('repo_not_allowed');
     return null;
   }
-  const recovered = options.store.listRunEvents
-    ? recoverHeadBranchFromEvents(await options.store.listRunEvents(run.id))
-    : undefined;
+  const recovered =
+    mergeRecheckOnApprovalEnabled() && options.store.listRunEvents
+      ? recoverHeadBranchFromEvents(await options.store.listRunEvents(run.id))
+      : undefined;
   const pr = await options.github.findPullRequest({
     owner: run.owner,
     repo: run.repo,

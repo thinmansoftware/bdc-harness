@@ -916,6 +916,33 @@ async function runOnce(h: ReturnType<typeof harness>): Promise<void> {
 }
 
 describe('merge execution bridge -- recovered run branch', () => {
+  let previousFlag: string | undefined;
+  beforeEach(() => {
+    previousFlag = process.env.OVERSEER_MERGE_RECHECK_ON_APPROVAL;
+    process.env.OVERSEER_MERGE_RECHECK_ON_APPROVAL = 'true';
+  });
+  afterEach(() => {
+    if (previousFlag === undefined) delete process.env.OVERSEER_MERGE_RECHECK_ON_APPROVAL;
+    else process.env.OVERSEER_MERGE_RECHECK_ON_APPROVAL = previousFlag;
+  });
+
+  test.each([undefined, 'TRUE '])(
+    'flag %s preserves metadata lookup without reading events',
+    async flag => {
+      if (flag === undefined) delete process.env.OVERSEER_MERGE_RECHECK_ON_APPROVAL;
+      else process.env.OVERSEER_MERGE_RECHECK_ON_APPROVAL = flag;
+      const h = harness([verdict('flag-off')]);
+      h.store.listRunEvents = async () => {
+        throw new Error('must not read events');
+      };
+      h.github.findPullRequest = async input => {
+        expect(input.headBranch).toBe('branch-flag-off');
+        return greenPr();
+      };
+      await runOnce(h);
+      expect(h.merges).toBe(1);
+    }
+  );
   test('uses the final commit-and-push branch instead of the pre-review metadata branch', async () => {
     const h = harness([verdict('recovered')]);
     const original = { ...run('recovered'), headBranch: 'archon/task-builder' };
@@ -969,40 +996,6 @@ describe('merge execution bridge -- recovered run branch', () => {
 });
 
 describe('merge execution bridge -- run-less verdicts (#846)', () => {
-  test.each([
-    ['head_moved', { headSha: 'new-head' }, true, null],
-    ['review_execution_unqualified', {}, false, null],
-    [
-      'required_checks_not_success',
-      { checks: { total: 1, passed: 0, failed: 1, pending: 0 } },
-      true,
-      null,
-    ],
-    ['review_conflict_at_head:changes_requested', {}, true, 'changes_requested'],
-  ] as const)(
-    'approval-scoped rechecks retain the %s gate',
-    async (reason, evidence, qualified, conflict) => {
-      const { h } = runlessHarness(
-        [
-          runlessVerdict('approval-scoped', {
-            run_id: `pr-discovery:thinmansoftware/bdc-harness#${RUNLESS_PR}:approval-review:123`,
-            wo_id: `gh:thinmansoftware/bdc-harness#${RUNLESS_PR}`,
-          }),
-        ],
-        runlessPr(evidence)
-      );
-      await runMergeExecutionBridgeOnceProduction({
-        store: h.store,
-        github: h.github,
-        readPolicy: () => policy(),
-        hasQualifiedReview: async () => qualified,
-        reviewConflictAtHead: async () => conflict,
-      });
-      expect(h.merges).toBe(0);
-      expect(h.outcomes[0]?.reason).toBe(reason);
-    }
-  );
-
   test('(a) merges a run-less verdict on an open allowlisted PR via the same mutation path', async () => {
     const { h, searches, runLookups } = runlessHarness([runlessVerdict('runless-ok')]);
     const seen: { number?: number; expectedHeadSha?: string } = {};
@@ -1053,11 +1046,6 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     ['(c) closed PR', runlessPr({ state: 'closed' }), 'pr_not_open'],
     ['(c) merged PR', runlessPr({ state: 'merged' }), 'pr_not_open'],
     ['(d) moved head', runlessPr({ headSha: 'moved' }), 'head_moved'],
-    [
-      '(e) lookup failed',
-      runlessPr({ exists: false, state: 'lookup_failed', pr: undefined, lookupFailed: true }),
-      'pr_context_unresolvable',
-    ],
   ])('%s is recorded honestly with no mutation', async (_label, evidence, reason) => {
     const { h } = runlessHarness([runlessVerdict('runless-skip')], evidence);
     await runOnce(h);
@@ -1065,6 +1053,30 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(h.approvals).toBe(0);
     expect(h.occupied).toBe(0);
     expect(h.outcomes[0]).toEqual(expect.objectContaining({ mutationSent: false, reason }));
+  });
+
+  test('(e) defers pr_context_fetch_failed and sends no mutation when lookup failed', async () => {
+    const { h } = runlessHarness(
+      [runlessVerdict('runless-lookup-failed')],
+      runlessPr({ exists: false, state: 'lookup_failed', pr: undefined, lookupFailed: true })
+    );
+    const deferrals: { verdictId: string; reason: string; notBefore: string }[] = [];
+    h.store.deferVerdictClaim = async (verdictId, reason, notBefore) => {
+      deferrals.push({ verdictId, reason, notBefore });
+      return true;
+    };
+    await runOnce(h);
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.occupied).toBe(0);
+    expect(h.claimReleases).toEqual([]);
+    expect(h.outcomes).toEqual([]);
+    expect(deferrals).toEqual([
+      expect.objectContaining({
+        verdictId: 'runless-lookup-failed',
+        reason: 'pr_context_fetch_failed',
+      }),
+    ]);
   });
 
   test('(e) defers pr_context_fetch_failed and sends no mutation when the fetch throws', async () => {

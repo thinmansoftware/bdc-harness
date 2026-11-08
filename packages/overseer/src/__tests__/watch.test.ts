@@ -406,6 +406,14 @@ describe('run PR identity', () => {
     ).toBe('final');
   });
 
+  test('ignores a marker before the final non-empty bash output line', () => {
+    expect(
+      recoverHeadBranchFromEvents([
+        event({ node_output: 'unique_branch=evil/branch\npush complete\n\n' }),
+      ])
+    ).toBeUndefined();
+  });
+
   test.each([
     { event_type: 'node_started' },
     { event_type: 'node_failed' },

@@ -136,14 +136,17 @@ export function recoverHeadBranchFromEvents(events: OverseerWorkflowEvent[]): st
       event.data.type !== 'bash'
     )
       continue;
-    const branchLine = /^unique_branch=(\S+)[ \t]*\r?$/gm;
+    const lastBranch = (output: unknown): string | undefined => {
+      if (typeof output !== 'string') return undefined;
+      const last = output
+        .split(/\r?\n/)
+        .filter(line => line.trim() !== '')
+        .at(-1);
+      return last ? /^unique_branch=(\S+)[ \t]*$/.exec(last)?.[1] : undefined;
+    };
     const nodeOutput = event.data.node_output;
-    const fromNodeOutput =
-      typeof nodeOutput === 'string' ? [...nodeOutput.matchAll(branchLine)].at(-1)?.[1] : undefined;
-    const fromOutput =
-      typeof event.data.output === 'string'
-        ? [...event.data.output.matchAll(branchLine)].at(-1)?.[1]
-        : undefined;
+    const fromNodeOutput = lastBranch(nodeOutput);
+    const fromOutput = lastBranch(event.data.output);
     // A string node_output that does not carry unique_branch= must not hide
     // a branch reported on data.output. node_output wins only when it parses.
     const found = fromNodeOutput ?? fromOutput;
@@ -152,7 +155,7 @@ export function recoverHeadBranchFromEvents(events: OverseerWorkflowEvent[]): st
   return branch;
 }
 
-async function assessRun(
+export async function assessRun(
   run: OverseerRunRecord,
   deps: OverseerRunStoreDeps & GitHubClientDeps
 ): Promise<WatchedRunRecord> {

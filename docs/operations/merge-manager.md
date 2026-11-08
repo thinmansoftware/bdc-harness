@@ -130,3 +130,60 @@ Operator response to a liveness alarm message (or a `liveness_alarm` log line):
 4. After recovery a `merge-coordinator.liveness_recovered` line confirms the monitor re-armed.
 
 Merging this code does not update the running source-copy container. XO must rebuild the container before the live outcome check.
+
+## Approval recheck and lookup-failure retry
+
+`OVERSEER_MERGE_RECHECK_ON_APPROVAL=true` opts in to one additional merge
+evaluation when the configured Review Gate identity submits an APPROVED review
+at the exact reviewed head. Only the exact string `true` enables it; the staging
+example defaults to `false`. The submit path launches the recheck after its
+approval receipt is durable and does not wait for it. A recheck failure is logged
+and never changes the submitted review result.
+
+The recheck resolves a real originating run from `overseer_verdicts.pr_url` and
+`head_sha`, refreshes it through the existing watch assessment, and calls the SAME
+Merge Manager handler used by the watcher. No run binding means no recheck;
+runless PRs remain on the bridge's PR-first path. All Merge Manager qualification,
+provenance, production-effect holds and expected-head merge protection remain.
+
+Before evaluation, an atomic insert claims an `overseer_actions` row with action
+`merge_recheck_on_approval`. Its deterministic UUID primary key is derived from
+`<owner>/<repo>#<N>@<head_sha>:review:<review_id>`, making concurrent deliveries
+contend for one existing primary key on both SQLite and PostgreSQL. The result
+starts as `claimed:key=<key>` and is updated in that same row to
+`merged:key=<key>`, `denied:<reason>:key=<key>` or `held:<reason>:key=<key>`.
+Replays and restarts do not run the handler again. A crash or a failed final write
+leaves the claim in place, avoiding a second merge with an ambiguous first outcome.
+
+Inspect the recorded evaluations:
+
+```sql
+SELECT run_id, wo_id, result, created_at
+FROM overseer_actions
+WHERE action = 'merge_recheck_on_approval'
+ORDER BY created_at DESC;
+```
+
+With the flag enabled, run-backed bridge lookups use the same recovered pushed
+branch as the watcher, falling back to metadata when none is available. Shared
+branch recovery always trusts ONLY completed `commit-and-push` bash events whose
+last non-empty output line is `unique_branch=<branch>`; model-written markers and
+non-final marker lines are ignored, with either flag setting.
+
+Runless PR lookups that return `lookupFailed` now defer as
+`pr_context_fetch_failed`, just like thrown lookup failures, through the existing
+10-minute base / 240-minute cap / 8-attempt retry policy. Confirmed missing PRs,
+wrong PR identities and missing PR references still finish as
+`pr_context_unresolvable`. Historical final skips are not reopened automatically.
+
+Lane audit (2026-11-08): 24 default lane YAMLs contain branch markers. These three
+`commit-and-push` scripts emit more output after their marker and therefore may
+fall back to metadata under the narrowed parser; they need a separate owner fix:
+
+- `bdc-harness-overseer-m31-substrate-01.yaml`
+- `bdc-infra-affiliate-n8n-staging-01.yaml`
+- `bdc-infra-deploy.yaml`
+
+No lane YAML, runtime flag, container or live database is changed by this source
+update. The owner rebuilds and enables the flag separately, then records both the
+approval-recheck and deferred-fetch merge outcomes on bdc-xo issue #5029.
