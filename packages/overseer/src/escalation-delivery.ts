@@ -14,10 +14,18 @@ import {
   isXoResponsibleActor,
   OPERATOR_RECIPIENT,
   T3_DESKTOP_RECIPIENT,
+  UNOWNED_RESPONSIBLE_ACTOR,
 } from '@archon/core/db/dispatch-routing';
 import { assessDispatchMessageBody } from '@archon/core/utils/dispatch-content-guard';
+import { createLogger } from '@archon/paths';
 import { buildDispatchRunReportBody } from './escalate';
-import { resolveWoBoardSeatOwner } from './owner-resolution';
+import {
+  readOwnerRoutingMode,
+  resolveWoBoardSeatOwner,
+  type OwnerRoutingMode,
+} from './owner-resolution';
+
+const log = createLogger('overseer/escalation-delivery');
 
 export interface ChannelDeliveryResult {
   outcome: DeliveryOutcome;
@@ -45,6 +53,197 @@ export interface OperatorCardChannelDeps {
   notion_database_id: string;
   builder_monitor_url: string;
   resolve_owner: (woId: string) => Promise<string | null>;
+  /** Defaults to OVERSEER_OWNER_ROUTING (exactly 'shadow' or 'on', else off). */
+  owner_routing_mode: OwnerRoutingMode;
+  /** Defaults to OVERSEER_OWNER_ROUTES_JSON. */
+  owner_routes_json: string | undefined;
+  /** Receives overseer.owner_routing.routes_invalid; defaults to the module logger. */
+  logger: { warn(obj: Record<string, unknown>, msg: string): void };
+}
+
+// ---------------------------------------------------------------------------
+// WO-HARNESS-OVERSEER-OWNER-ROUTING-01: owner routing (mode on only).
+// Contract: docs/operations/overseer-owner-routing.md.
+// ---------------------------------------------------------------------------
+
+/** The only recipient an owner row may target: the T3 desktop relay queue. */
+export const OWNER_ROUTE_RECIPIENT = 't3-desk-local';
+
+export interface OwnerRoute {
+  recipient: typeof OWNER_ROUTE_RECIPIENT;
+  thread_id: string;
+}
+
+export interface OwnerRouteTable {
+  /** Keyed by lower-cased owner handle. */
+  routes: ReadonlyMap<string, OwnerRoute>;
+  /** Why the table was rejected; null for a valid (possibly empty) table. */
+  invalid_reason: string | null;
+}
+
+const EMPTY_ROUTES: ReadonlyMap<string, OwnerRoute> = new Map();
+
+/**
+ * Parse OVERSEER_OWNER_ROUTES_JSON:
+ *   { "<handle>": { "recipient": "t3-desk-local", "thread_id": "<T3 thread id>" } }
+ * Unset or blank is a valid empty table. Fail closed: invalid JSON, a
+ * non-object, an entry whose recipient is not exactly t3-desk-local, or a
+ * missing/blank thread_id rejects the WHOLE table, which then behaves as
+ * empty (no owner rows are written). Worker or model recipients are never
+ * accepted.
+ */
+export function parseOwnerRouteTable(raw: string | undefined): OwnerRouteTable {
+  if (raw === undefined || raw.trim() === '') {
+    return { routes: EMPTY_ROUTES, invalid_reason: null };
+  }
+  const invalid = (reason: string): OwnerRouteTable => ({
+    routes: EMPTY_ROUTES,
+    invalid_reason: reason,
+  });
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return invalid('not_json');
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return invalid('not_an_object');
+  }
+  const routes = new Map<string, OwnerRoute>();
+  for (const [handle, entry] of Object.entries(parsed as Record<string, unknown>)) {
+    const key = handle.trim().toLowerCase();
+    if (!key) return invalid('blank_handle');
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      return invalid('entry_not_an_object');
+    }
+    const { recipient, thread_id: threadId } = entry as Record<string, unknown>;
+    if (recipient !== OWNER_ROUTE_RECIPIENT) return invalid('recipient_not_t3_desk_local');
+    if (typeof threadId !== 'string' || threadId.trim() === '') {
+      return invalid('thread_id_missing');
+    }
+    if (routes.has(key)) return invalid('duplicate_handle');
+    routes.set(key, { recipient: OWNER_ROUTE_RECIPIENT, thread_id: threadId.trim() });
+  }
+  return { routes, invalid_reason: null };
+}
+
+/** Owner-handoff text: ASCII, at most this many characters. */
+export const OWNER_TEXT_MAX_CHARS = 1500;
+
+/** Fixed last line of every owner row (John 2026-11-08, M-20261108b). */
+export const OWNER_ESCALATION_LINE =
+  'You own this as your own developer work. If you need more capability, ' +
+  'escalate to a stronger model or subagent yourself instead of waiting or ' +
+  'escalating to XO or John.';
+
+/**
+ * One line of printable ASCII: control characters become spaces, non-ASCII
+ * and at-signs are dropped (no mention can be forged), whitespace collapses,
+ * and the result is capped at maxChars (truncated text ends in "...").
+ */
+function ownerTextValue(raw: unknown, maxChars: number): string {
+  if (typeof raw !== 'string') return '';
+  let printable = '';
+  for (const ch of raw) {
+    const code = ch.charCodeAt(0);
+    if (code < 0x20 || code === 0x7f) printable += ' ';
+    else if (code > 0x7e || ch === '@') continue;
+    else printable += ch;
+  }
+  const cleaned = printable.replace(/ {2,}/g, ' ').trim();
+  if (cleaned.length <= maxChars) return cleaned;
+  return `${cleaned.slice(0, Math.max(1, maxChars - 3)).trimEnd()}...`;
+}
+
+/**
+ * The owner-handoff text. The WHOLE text is capped at OWNER_TEXT_MAX_CHARS:
+ * the blocker takes whatever budget the other lines leave (up to 600), so
+ * the fixed last line always survives intact.
+ */
+export function buildOwnerEscalationText(card: OperatorCardView['card']): string {
+  const head = [`Overseer escalation for ${ownerTextValue(card.wo_id, 200)}.`];
+  const prUrl = ownerTextValue(card.pr_url, 300);
+  if (prUrl) head.push(`PR: ${prUrl}`);
+  const tail = [`Next: ${ownerTextValue(card.next_permitted_action, 200)}`, OWNER_ESCALATION_LINE];
+  const blockerLabel = 'Blocker: ';
+  const fixedLength =
+    [...head, ...tail].reduce((total, line) => total + line.length + 1, 0) + blockerLabel.length;
+  const blockerBudget = Math.min(600, OWNER_TEXT_MAX_CHARS - fixedLength);
+  const blocker = ownerTextValue(card.blocker, Math.max(4, blockerBudget));
+  return [...head, `${blockerLabel}${blocker}`, ...tail].join('\n');
+}
+
+type OwnerDeliveryPlan =
+  | { kind: 'standard' }
+  | { kind: 'owner_route'; owner: string; route: OwnerRoute; body: string }
+  | {
+      kind: 'needs_owner';
+      reason: 'unowned' | 'owner_route_missing' | 'owner_row_rejected';
+      detail: string;
+    };
+
+function issueUrl(sourceIssue: unknown): string | null {
+  if (typeof sourceIssue !== 'string') return null;
+  const match = /^thinmansoftware\/bdc-xo#([1-9][0-9]*)$/.exec(sourceIssue);
+  return match ? `https://github.com/thinmansoftware/bdc-xo/issues/${match[1]}` : null;
+}
+
+/**
+ * Decide how a card is delivered in mode on. 'standard' is today's path
+ * (operator row for an XO principal, t3-desktop row always). A card whose
+ * actor was passed explicitly by the caller (not derived from the
+ * resolution) also takes the standard path.
+ */
+function planOwnerDelivery(
+  card: OperatorCardView['card'],
+  routes: OwnerRouteTable
+): OwnerDeliveryPlan {
+  const actor = card.responsible_actor.trim();
+  if (isXoResponsibleActor(actor)) return { kind: 'standard' };
+  const assignment = (card.payload as { owner_assignment?: unknown }).owner_assignment;
+  if (!assignment || typeof assignment !== 'object') return { kind: 'standard' };
+  const resolved = assignment as Record<string, unknown>;
+  const url = issueUrl(resolved.source_issue);
+  if (resolved.kind === 'owned' && typeof resolved.owner === 'string') {
+    if (resolved.owner.toLowerCase() !== actor.toLowerCase()) return { kind: 'standard' };
+    const route = routes.routes.get(resolved.owner.toLowerCase());
+    if (route) {
+      // One t3-thread-nudge/v1 row for the owner's T3 thread (the
+      // approval-stalls row shape). The content guard is pure, so both
+      // adapters agree: a rejected body never reaches the owner and the
+      // builder monitor is told needs_owner instead of a silent skip.
+      const body = JSON.stringify({
+        schema: 't3-thread-nudge/v1',
+        thread_id: route.thread_id,
+        text: buildOwnerEscalationText(card),
+        reason: 'owner-escalation',
+        request_id: card.card_id,
+      });
+      if (assessDispatchMessageBody('agent_message', body).allowed) {
+        return { kind: 'owner_route', owner: resolved.owner, route, body };
+      }
+      return {
+        kind: 'needs_owner',
+        reason: 'owner_row_rejected',
+        detail: `${card.blocker} | owner_row_rejected for owner ${resolved.owner}${url ? `: ${url}` : ''}`,
+      };
+    }
+    return {
+      kind: 'needs_owner',
+      reason: 'owner_route_missing',
+      detail: `${card.blocker} | owner_route_missing for owner ${resolved.owner}${url ? `: ${url}` : ''}`,
+    };
+  }
+  if (resolved.kind === 'unowned' && actor === UNOWNED_RESPONSIBLE_ACTOR) {
+    return {
+      kind: 'needs_owner',
+      reason: 'unowned',
+      detail: url
+        ? `${card.blocker} | assign an owner: ${url}`
+        : `${card.blocker} | assign an owner (no WO issue found for ${card.wo_id})`,
+    };
+  }
+  return { kind: 'standard' };
 }
 
 const defaultStore: DeliveryStore = {
@@ -83,7 +282,26 @@ export function createDefaultOperatorCardChannels(
       process.env.BUILDER_MONITOR_WEBHOOK_URL ??
       DEFAULT_BUILDER_MONITOR_URL,
     resolve_owner: overrides.resolve_owner ?? resolveWoBoardSeatOwner,
+    owner_routing_mode: overrides.owner_routing_mode ?? readOwnerRoutingMode(),
+    owner_routes_json:
+      'owner_routes_json' in overrides
+        ? overrides.owner_routes_json
+        : process.env.OVERSEER_OWNER_ROUTES_JSON,
+    logger: overrides.logger,
   };
+  // WO-HARNESS-OVERSEER-OWNER-ROUTING-01: the route table is parsed once per
+  // channel build and only matters in mode on.
+  const ownerRoutes =
+    deps.owner_routing_mode === 'on'
+      ? parseOwnerRouteTable(deps.owner_routes_json)
+      : { routes: EMPTY_ROUTES, invalid_reason: null };
+  if (ownerRoutes.invalid_reason) {
+    reportInvalidRoutes(ownerRoutes.invalid_reason, deps.owner_routes_json ?? '', deps.logger);
+  }
+  const planFor = (card: OperatorCardView): OwnerDeliveryPlan =>
+    deps.owner_routing_mode === 'on'
+      ? planOwnerDelivery(card.card, ownerRoutes)
+      : { kind: 'standard' };
 
   const dispatch: OperatorCardChannel = {
     channel: 'dispatch',
@@ -111,7 +329,27 @@ export function createDefaultOperatorCardChannels(
       // results bridge still sees every report. Both rows share the run id
       // as correlation_id; the operator copy gets its own idempotency key so
       // redelivery and reconcile stay exactly-once per mailbox.
-      if (isXoResponsibleActor(card.card.responsible_actor)) {
+      const plan = planFor(card);
+      if (plan.kind === 'owner_route') {
+        // WO-HARNESS-OVERSEER-OWNER-ROUTING-01: keyed '<key>:owner' so
+        // redelivery and reconcile write no second row.
+        await createAuthenticatedMessage(
+          { kind: 'system', sender: 'overseer' },
+          {
+            correlation_id: card.card.run_id,
+            idempotency_key: `${idempotencyKey}:owner`,
+            task_type: 'agent_message',
+            recipient: plan.route.recipient,
+            body: plan.body,
+          }
+        );
+      } else if (plan.kind === 'needs_owner' && plan.reason === 'owner_row_rejected') {
+        log.warn(
+          { cardId: card.card.card_id, woId: card.card.wo_id },
+          'overseer.owner_routing.owner_row_content_rejected'
+        );
+      }
+      if (plan.kind === 'standard' && isXoResponsibleActor(card.card.responsible_actor)) {
         await createAuthenticatedMessage(
           { kind: 'system', sender: 'overseer' },
           {
@@ -145,14 +383,18 @@ export function createDefaultOperatorCardChannels(
   const builderMonitor: OperatorCardChannel = {
     channel: 'builder_monitor',
     deliver: async card => {
+      // WO-HARNESS-OVERSEER-OWNER-ROUTING-01: in mode on an unowned card, or
+      // an owned card with no route, asks for an owner (needs_owner) with
+      // the WO issue link; everything else is unchanged (needs_human).
+      const plan = planFor(card);
       const response = await deps.fetch(deps.builder_monitor_url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           builder: 'Cauldron',
           wo_id: card.card.wo_id,
-          action: 'needs_human',
-          detail: card.card.blocker,
+          action: plan.kind === 'needs_owner' ? 'needs_owner' : 'needs_human',
+          detail: plan.kind === 'needs_owner' ? plan.detail : card.card.blocker,
           card_id: card.card.card_id,
         }),
       });
@@ -167,6 +409,29 @@ export function createDefaultOperatorCardChannels(
   };
 
   return [dispatch, builderMonitor];
+}
+
+/** Raw OVERSEER_OWNER_ROUTES_JSON values already reported by the module logger. */
+const reportedInvalidRoutes = new Set<string>();
+
+/**
+ * Log an invalid route table. The channels are rebuilt every scheduler tick,
+ * so the module logger reports each distinct invalid value once; an injected
+ * logger (tests) receives every report.
+ */
+function reportInvalidRoutes(
+  reason: string,
+  raw: string,
+  logger: OperatorCardChannelDeps['logger'] | undefined
+): void {
+  const fields = { reason, length: raw.length };
+  if (logger) {
+    logger.warn(fields, 'overseer.owner_routing.routes_invalid');
+    return;
+  }
+  if (reportedInvalidRoutes.has(raw)) return;
+  reportedInvalidRoutes.add(raw);
+  log.warn(fields, 'overseer.owner_routing.routes_invalid');
 }
 
 function normalizeResult(result: ChannelDeliveryResult): ChannelDeliveryResult {
