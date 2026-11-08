@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import type { WorkOwnerResolution } from './owner-resolution';
 
 export const OPERATOR_CARD_IDENTITY_VERSION = 'overseer-actionable-event-v1' as const;
 
@@ -34,6 +35,12 @@ export interface OperatorCardPayload {
   evidence_links: Record<string, unknown>;
   lifecycle_classification: string;
   governance_classification: string;
+  /**
+   * WO-HARNESS-OVERSEER-OWNER-ROUTING-01: the work-owner resolution, present
+   * only when OVERSEER_OWNER_ROUTING is shadow or on. Absent in off mode so
+   * the payload and its digest are unchanged.
+   */
+  owner_assignment?: WorkOwnerResolution;
 }
 
 export interface OperatorCard {

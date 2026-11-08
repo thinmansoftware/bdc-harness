@@ -20,11 +20,15 @@ import {
   type ActionableEventIdentity,
 } from '../operator-card';
 import {
+  buildOwnerEscalationText,
   createDefaultOperatorCardChannels,
+  OWNER_ESCALATION_LINE,
+  parseOwnerRouteTable,
   runDueOperatorCardDeliveries,
   type OperatorCardChannel,
 } from '../escalation-delivery';
 import { runEscalation } from '../escalate';
+import type { WorkOwnerResolution } from '../owner-resolution';
 
 const identity: ActionableEventIdentity = {
   identity_version: 'overseer-actionable-event-v1',
@@ -730,4 +734,313 @@ describe('default informational channel adapters', () => {
       })
     ).rejects.toThrow(/^operator_card_channel_missing:(dispatch|builder_monitor)$/);
   });
+});
+
+// WO-HARNESS-OVERSEER-OWNER-ROUTING-01 Tests 9-13: delivery in mode on.
+describe.serial('owner routing delivery (mode on)', () => {
+  const homes: string[] = [];
+  const oldHome = process.env.ARCHON_HOME;
+  const oldUrl = process.env.DATABASE_URL;
+  const oldMode = process.env.OVERSEER_OWNER_ROUTING;
+  const oldRoutes = process.env.OVERSEER_OWNER_ROUTES_JSON;
+
+  /** Point ARCHON_HOME at a fresh database dir; every dir is removed in afterEach. */
+  async function freshDatabase(): Promise<void> {
+    await closeDatabase();
+    resetDatabase();
+    const home = join(import.meta.dir, `.test-owner-routing-${Date.now()}-${Math.random()}`);
+    homes.push(home);
+    process.env.ARCHON_HOME = home;
+  }
+
+  beforeEach(async () => {
+    await freshDatabase();
+    delete process.env.DATABASE_URL;
+    delete process.env.OVERSEER_OWNER_ROUTING;
+    delete process.env.OVERSEER_OWNER_ROUTES_JSON;
+  });
+
+  afterEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    for (const [key, value] of [
+      ['ARCHON_HOME', oldHome],
+      ['DATABASE_URL', oldUrl],
+      ['OVERSEER_OWNER_ROUTING', oldMode],
+      ['OVERSEER_OWNER_ROUTES_JSON', oldRoutes],
+    ] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    for (const home of homes.splice(0)) removeTempDirWithRetry(home);
+  });
+
+  const VALID_ROUTES = JSON.stringify({
+    codex: { recipient: 't3-desk-local', thread_id: 'thread-codex-1' },
+  });
+  const ownedCodex = {
+    kind: 'owned',
+    owner: 'codex',
+    assigned_by: 'John Ranson',
+    assigned_at: '2026-11-08',
+    quote: 'codex owns this',
+    source_issue: 'thinmansoftware/bdc-xo#4321',
+  } as const;
+  const unownedIssue = {
+    kind: 'unowned',
+    reason: 'no_owner_label',
+    source_issue: 'thinmansoftware/bdc-xo#4321',
+  } as const;
+
+  async function ownerCard(input: {
+    actor: string;
+    next: string;
+    assignment: WorkOwnerResolution;
+    blocker?: string;
+  }) {
+    const built = buildOperatorCard(identity, {
+      repository: 'thinmansoftware/bdc-harness',
+      branch: 'feat/example',
+      pr_url: 'https://github.com/thinmansoftware/bdc-harness/pull/9001',
+      pr_number: 9001,
+      head_sha: null,
+      base_branch: 'dev',
+      base_sha: null,
+      checks: {},
+      mergeability: 'unknown',
+      blocker: input.blocker ?? 'verify failed',
+      mechanical_evidence: {},
+      recovery_attempted: {},
+      proposed_remediation: {},
+      next_permitted_action: input.next,
+      responsible_actor: input.actor,
+      actionable_event_at: identity.event_created_at,
+      required_ruling: null,
+      evidence_links: {},
+      lifecycle_classification: 'recovery',
+      governance_classification: 'information-only',
+      owner_assignment: input.assignment,
+    });
+    await appendOperatorCard({
+      ...built,
+      canonical_event_identity: { ...built.canonical_event_identity },
+      payload: { ...built.payload },
+      ...built.payload,
+      run_id: identity.run_id,
+      wo_id: identity.wo_id,
+    });
+    const view = await getOperatorCard(built.card_id);
+    if (!view) throw new Error('owner_card_missing');
+    return view;
+  }
+
+  const ownedCard = () =>
+    ownerCard({ actor: 'codex', next: 'owner codex acts on this card', assignment: ownedCodex });
+  const unownedCard = () =>
+    ownerCard({
+      actor: 'unowned',
+      next: 'John assigns an owner on bdc-xo#4321',
+      assignment: unownedIssue,
+    });
+
+  function channelsFor(overrides: {
+    routes?: string;
+    useEnv?: boolean;
+    logger?: { warn(obj: Record<string, unknown>, msg: string): void };
+  }) {
+    const monitorBodies: Record<string, unknown>[] = [];
+    const fetchSpy = mock(async (_input: string | URL | Request, init?: RequestInit) => {
+      monitorBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response('ok', { status: 200 });
+    }) as typeof fetch;
+    const channels = createDefaultOperatorCardChannels({
+      fetch: fetchSpy,
+      builder_monitor_url: 'https://monitor.test/status',
+      resolve_owner: async () => null,
+      logger: overrides.logger ?? { warn: () => undefined },
+      ...(overrides.useEnv
+        ? {}
+        : { owner_routing_mode: 'on' as const, owner_routes_json: overrides.routes }),
+    });
+    const dispatch = channels.find(channel => channel.channel === 'dispatch');
+    const builder = channels.find(channel => channel.channel === 'builder_monitor');
+    if (!dispatch || !builder) throw new Error('channels_missing');
+    return { dispatch, builder, monitorBodies };
+  }
+
+  async function rows() {
+    return {
+      owner: await listMessages({ recipient: 't3-desk-local' }),
+      t3: await listMessages({ recipient: 't3-desktop' }),
+      operator: await listMessages({ recipient: 'operator' }),
+    };
+  }
+
+  test('Test 9: an invalid route table writes no owner row and logs routes_invalid', async () => {
+    for (const routes of [
+      '{not json',
+      JSON.stringify({ codex: { recipient: 'codex-worker', thread_id: 'thread-codex-1' } }),
+      JSON.stringify({ codex: { recipient: 't3-desk-local', thread_id: '  ' } }),
+    ]) {
+      await freshDatabase();
+      const warnings: string[] = [];
+      const { dispatch } = channelsFor({
+        routes,
+        logger: { warn: (_obj, msg) => warnings.push(msg) },
+      });
+      const view = await ownedCard();
+      await dispatch.deliver(view, `operator-card:${view.card.card_id}:dispatch`);
+      const after = await rows();
+      expect(warnings).toEqual(['overseer.owner_routing.routes_invalid']);
+      expect(after.owner).toHaveLength(0);
+      expect(after.operator).toHaveLength(0);
+      expect(after.t3).toHaveLength(1);
+    }
+    expect(parseOwnerRouteTable('{not json').invalid_reason).toBe('not_json');
+    expect(parseOwnerRouteTable('[]').invalid_reason).toBe('not_an_object');
+    expect(parseOwnerRouteTable(undefined)).toEqual({
+      routes: new Map(),
+      invalid_reason: null,
+    });
+  }, 30_000);
+
+  test('Test 9 (d): a valid single entry from the environment writes the owner row', async () => {
+    process.env.OVERSEER_OWNER_ROUTING = 'on';
+    process.env.OVERSEER_OWNER_ROUTES_JSON = VALID_ROUTES;
+    const { dispatch } = channelsFor({ useEnv: true });
+    const view = await ownedCard();
+    await dispatch.deliver(view, `operator-card:${view.card.card_id}:dispatch`);
+    const after = await rows();
+    expect(after.owner).toHaveLength(1);
+    expect(after.owner[0]?.recipient).toBe('t3-desk-local');
+  }, 30_000);
+
+  test('Test 10: owned with a route delivers exactly one owner row', async () => {
+    const { dispatch } = channelsFor({ routes: VALID_ROUTES });
+    const view = await ownedCard();
+    const key = `operator-card:${view.card.card_id}:dispatch`;
+    expect((await dispatch.deliver(view, key)).outcome).toBe('succeeded');
+    expect((await dispatch.deliver(view, key)).outcome).toBe('succeeded');
+    expect((await dispatch.reconcile(view, 1)).outcome).toBe('succeeded');
+
+    const after = await rows();
+    expect(after.owner).toHaveLength(1);
+    expect(after.t3).toHaveLength(1);
+    expect(after.operator).toHaveLength(0);
+    const owner = after.owner[0];
+    expect(owner?.task_type).toBe('agent_message');
+    expect(owner?.sender_principal_id).toBe('system:overseer');
+    expect(owner?.idempotency_key).toBe(`${key}:owner`);
+    expect(owner?.idempotency_key.endsWith(':owner')).toBe(true);
+    const body = JSON.parse(owner?.body ?? '{}') as Record<string, string>;
+    expect(body.schema).toBe('t3-thread-nudge/v1');
+    expect(body.thread_id).toBe('thread-codex-1');
+    expect(body.reason).toBe('owner-escalation');
+    expect(body.request_id).toBe(view.card.card_id);
+    const text = body.text ?? '';
+    expect(text.endsWith(OWNER_ESCALATION_LINE)).toBe(true);
+    expect(text).toContain('WO-TEST-123');
+    expect(text).toContain('https://github.com/thinmansoftware/bdc-harness/pull/9001');
+    expect(text).toContain('verify failed');
+    expect(text).toContain('owner codex acts on this card');
+    expect(text).not.toContain('@');
+    expect(text.length).toBeLessThanOrEqual(1500);
+    expect(/^[\x20-\x7e\n]*$/.test(text)).toBe(true);
+  }, 30_000);
+
+  test('Test 10b: owner text stays ASCII, mention-free and capped for hostile input', async () => {
+    const view = await ownerCard({
+      actor: 'codex',
+      next: 'owner codex acts on this card',
+      assignment: ownedCodex,
+      // Non-ASCII (an em-dash, built from its char code so this file stays ASCII).
+      blocker: `@team ping ${String.fromCharCode(0x2014)} ${'x'.repeat(4000)}\nsecond line`,
+    });
+    const text = buildOwnerEscalationText(view.card);
+    expect(text.length).toBeLessThanOrEqual(1500);
+    expect(text).not.toContain('@');
+    expect(/^[\x20-\x7e\n]*$/.test(text)).toBe(true);
+    expect(text.endsWith(OWNER_ESCALATION_LINE)).toBe(true);
+  }, 30_000);
+
+  test('Test 11 (delivery): an explicit acting-xo card reaches the operator, no owner row', async () => {
+    const view = await ownerCard({
+      actor: 'acting-xo',
+      next: 'XO rules on it',
+      assignment: ownedCodex,
+    });
+    const { dispatch, builder, monitorBodies } = channelsFor({ routes: VALID_ROUTES });
+    await dispatch.deliver(view, `operator-card:${view.card.card_id}:dispatch`);
+    await builder.deliver(view, 'unused');
+    const after = await rows();
+    expect(after.operator).toHaveLength(1);
+    expect(after.t3).toHaveLength(1);
+    expect(after.owner).toHaveLength(0);
+    expect(monitorBodies[0]?.action).toBe('needs_human');
+  }, 30_000);
+
+  test('Test 12: an unowned card writes only the t3-desktop row and asks for an owner', async () => {
+    const view = await unownedCard();
+    const { dispatch, builder, monitorBodies } = channelsFor({ routes: VALID_ROUTES });
+    await dispatch.deliver(view, `operator-card:${view.card.card_id}:dispatch`);
+    await builder.deliver(view, 'unused');
+    const after = await rows();
+    expect(after.operator).toHaveLength(0);
+    expect(after.owner).toHaveLength(0);
+    expect(after.t3).toHaveLength(1);
+    expect(monitorBodies).toEqual([
+      {
+        builder: 'Cauldron',
+        wo_id: view.card.wo_id,
+        action: 'needs_owner',
+        detail:
+          'verify failed | assign an owner: https://github.com/thinmansoftware/bdc-xo/issues/4321',
+        card_id: view.card.card_id,
+      },
+    ]);
+  }, 30_000);
+
+  test('Test 13: an owned card with no route asks for an owner (owner_route_missing)', async () => {
+    for (const routes of [undefined, '', '{not json']) {
+      await freshDatabase();
+      const view = await ownedCard();
+      const { dispatch, builder, monitorBodies } = channelsFor({ routes });
+      await dispatch.deliver(view, `operator-card:${view.card.card_id}:dispatch`);
+      await builder.deliver(view, 'unused');
+      const after = await rows();
+      expect(after.operator).toHaveLength(0);
+      expect(after.owner).toHaveLength(0);
+      expect(after.t3).toHaveLength(1);
+      expect(monitorBodies[0]?.action).toBe('needs_owner');
+      expect(String(monitorBodies[0]?.detail)).toContain('owner_route_missing');
+      expect(String(monitorBodies[0]?.detail)).toContain(
+        'https://github.com/thinmansoftware/bdc-xo/issues/4321'
+      );
+    }
+  }, 30_000);
+
+  test('modes off and shadow leave delivery unchanged for the same owned card', async () => {
+    for (const mode of ['off', 'shadow'] as const) {
+      await freshDatabase();
+      const view = await unownedCard();
+      const monitorBodies: Record<string, unknown>[] = [];
+      const channels = createDefaultOperatorCardChannels({
+        fetch: mock(async (_input: string | URL | Request, init?: RequestInit) => {
+          monitorBodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+          return new Response('ok', { status: 200 });
+        }) as typeof fetch,
+        resolve_owner: async () => null,
+        owner_routing_mode: mode,
+        owner_routes_json: VALID_ROUTES,
+      });
+      for (const channel of channels) {
+        await channel.deliver(view, `operator-card:${view.card.card_id}:${channel.channel}`);
+      }
+      const after = await rows();
+      expect(after.owner).toHaveLength(0);
+      expect(after.t3).toHaveLength(1);
+      expect(monitorBodies[0]?.action).toBe('needs_human');
+      expect(monitorBodies[0]?.detail).toBe('verify failed');
+    }
+  }, 30_000);
 });
