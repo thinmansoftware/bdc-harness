@@ -966,11 +966,6 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     ['(c) closed PR', runlessPr({ state: 'closed' }), 'pr_not_open'],
     ['(c) merged PR', runlessPr({ state: 'merged' }), 'pr_not_open'],
     ['(d) moved head', runlessPr({ headSha: 'moved' }), 'head_moved'],
-    [
-      '(e) lookup failed',
-      runlessPr({ exists: false, state: 'lookup_failed', pr: undefined, lookupFailed: true }),
-      'pr_context_unresolvable',
-    ],
   ])('%s is recorded honestly with no mutation', async (_label, evidence, reason) => {
     const { h } = runlessHarness([runlessVerdict('runless-skip')], evidence);
     await runOnce(h);
@@ -978,6 +973,30 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(h.approvals).toBe(0);
     expect(h.occupied).toBe(0);
     expect(h.outcomes[0]).toEqual(expect.objectContaining({ mutationSent: false, reason }));
+  });
+
+  test('(e) defers pr_context_fetch_failed and sends no mutation when lookup failed', async () => {
+    const { h } = runlessHarness(
+      [runlessVerdict('runless-lookup-failed')],
+      runlessPr({ exists: false, state: 'lookup_failed', pr: undefined, lookupFailed: true })
+    );
+    const deferrals: { verdictId: string; reason: string; notBefore: string }[] = [];
+    h.store.deferVerdictClaim = async (verdictId, reason, notBefore) => {
+      deferrals.push({ verdictId, reason, notBefore });
+      return true;
+    };
+    await runOnce(h);
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.occupied).toBe(0);
+    expect(h.claimReleases).toEqual([]);
+    expect(h.outcomes).toEqual([]);
+    expect(deferrals).toEqual([
+      expect.objectContaining({
+        verdictId: 'runless-lookup-failed',
+        reason: 'pr_context_fetch_failed',
+      }),
+    ]);
   });
 
   test('(e) defers pr_context_fetch_failed and sends no mutation when the fetch throws', async () => {
