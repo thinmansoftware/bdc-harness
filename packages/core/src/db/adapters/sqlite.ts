@@ -847,9 +847,9 @@ export class SqliteAdapter implements IDatabase {
     // schema fresh and keep this a separate, independently idempotent block (do
     // not edit the earlier CHECK literals). Only action_type widens; the grade
     // CHECK is carried forward exactly as the prior block left it.
-    const journalSchema5 = this.db
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'")
-      .get() as { sql?: string } | undefined;
+    const journalSchema5 = (this.pragmaAll(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'"
+    )[0] ?? null) as { sql?: string } | undefined;
     if (journalSchema5?.sql && !journalSchema5.sql.includes('remediation_nudge')) {
       this.rebuildTmJournal(`
           CREATE TABLE tm_journal_new (
