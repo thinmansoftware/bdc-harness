@@ -87,6 +87,7 @@ describe('watch head-branch recovery', () => {
     };
     const events = [
       event('event-1', 'node_completed', 'commit-and-push', '2026-07-28T10:00:00.000Z', {
+        type: 'bash',
         output: 'pushed 3 commits\nunique_branch=feat/wo-recover-01-thread-abc\n',
       }),
     ];
@@ -149,6 +150,7 @@ describe('watch head-branch recovery', () => {
     };
     const events = [
       event('event-1', 'node_completed', 'commit-and-push', '2026-07-28T10:00:00.000Z', {
+        type: 'bash',
         output: 'unique_branch=feat/wo-01-thread-abc\n',
       }),
     ];

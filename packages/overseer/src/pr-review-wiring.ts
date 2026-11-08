@@ -30,7 +30,10 @@ import {
   createRealSubmitPullRequestReview,
   summarizeChecks,
 } from './adapters/github-real-deps';
-import type { ExactHeadPullRequestEvidence } from './adapters/github-real-deps.ts';
+import type {
+  ExactHeadPullRequestEvidence,
+  SubmitPullRequestReviewResult,
+} from './adapters/github-real-deps.ts';
 import { UNPROTECTED_BASE_NO_CHECKS_REASON } from './adapters/required-contexts';
 import {
   MAX_REREVIEW_ATTEMPTS_ENV,
@@ -78,6 +81,8 @@ export const REVIEW_WEBHOOK_SECRET_ENV = 'OVERSEER_REVIEW_WEBHOOK_SECRET';
 export const REVIEW_REVIEWER_IDENTITY_ENV = 'OVERSEER_REVIEW_IDENTITY';
 /** Kill switch for recording submitted APPROVE reviews as merge-ready verdicts. */
 export const OVERSEER_REVIEW_RECORDS_VERDICT_ENV = 'OVERSEER_REVIEW_RECORDS_VERDICT';
+/** Opt in to an approval-id-scoped bridge handoff; unset/false keeps the per-head path. */
+export const OVERSEER_MERGE_RECHECK_ON_APPROVAL_ENV = 'OVERSEER_MERGE_RECHECK_ON_APPROVAL';
 const REVIEW_WEBHOOK_SECRET_FALLBACK_ENV = 'WEBHOOK_SECRET';
 const REVIEW_REVIEWER_IDENTITY_FALLBACK_ENV = 'MERGE_MANAGER_REVIEW_GATE_LOGIN';
 const REVIEW_REVIEWER_IDENTITY_DEFAULT = 'thinman-overseer[bot]';
@@ -98,14 +103,33 @@ interface ReviewApprovalVerdictDeps {
 }
 
 export async function recordReviewApprovalVerdict(
-  input: { owner: string; repo: string; prNumber: number; headSha: string; model?: string },
+  input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    model?: string;
+    approvalReviewId?: number;
+  },
   deps: ReviewApprovalVerdictDeps = {
     claimVerdict: claimOverseerVerdict,
     finalizeVerdict: finalizeOverseerVerdict,
   }
 ): Promise<void> {
-  const runId = `${PR_DISCOVERY_RUN_ID_PREFIX}${input.owner}/${input.repo}#${input.prNumber}`;
-  const claim = await deps.claimVerdict({ runId, woId: runId, headSha: input.headSha });
+  const pullRef = `${input.owner}/${input.repo}#${input.prNumber}`;
+  // Reuse the durable (run_id, head_sha) claim, with a separate identity for
+  // each actual GitHub approval. An earlier consumed verdict stays immutable.
+  // The gh: WO reference lets the existing runless bridge resolve this PR by
+  // number; all its live-head, policy, review and merge guards still run.
+  const runId =
+    input.approvalReviewId === undefined
+      ? `${PR_DISCOVERY_RUN_ID_PREFIX}${pullRef}`
+      : `${PR_DISCOVERY_RUN_ID_PREFIX}${pullRef.toLowerCase()}:approval-review:${input.approvalReviewId}`;
+  const claim = await deps.claimVerdict({
+    runId,
+    woId: input.approvalReviewId === undefined ? runId : `gh:${pullRef.toLowerCase()}`,
+    headSha: input.headSha,
+  });
   if (!claim.claimed || !claim.verdictId) return;
   await deps.finalizeVerdict({
     verdictId: claim.verdictId,
@@ -125,15 +149,35 @@ export async function maybeRecordReviewApprovalVerdict(
     prNumber: number;
     headSha: string;
     model?: string;
+    githubReview?: SubmitPullRequestReviewResult['review'];
   },
   options: {
     env?: Record<string, string | undefined>;
     record?: typeof recordReviewApprovalVerdict;
+    currentHeadSha?: (input: { owner: string; repo: string; prNumber: number }) => Promise<string>;
     onError?: (error: unknown) => void;
   } = {}
 ): Promise<void> {
   if (input.disposition !== 'approved' || !reviewRecordsVerdictEnabled(options.env)) return;
   try {
+    const env = options.env ?? process.env;
+    if (env[OVERSEER_MERGE_RECHECK_ON_APPROVAL_ENV]?.trim().toLowerCase() === 'true') {
+      const review = input.githubReview;
+      if (
+        review?.state !== 'APPROVED' ||
+        review.commitSha !== input.headSha ||
+        !Number.isSafeInteger(review.id) ||
+        review.id <= 0 ||
+        !options.currentHeadSha ||
+        (await options.currentHeadSha(input)) !== input.headSha
+      )
+        return;
+      await (options.record ?? recordReviewApprovalVerdict)({
+        ...input,
+        approvalReviewId: review.id,
+      });
+      return;
+    }
     await (options.record ?? recordReviewApprovalVerdict)(input);
   } catch (error) {
     options.onError?.(error);
@@ -1509,6 +1553,14 @@ export function createRealSubmitDeps(
         { ...input, model: modelReviewer.model },
         {
           record: overrides.recordApprovalVerdict,
+          currentHeadSha: async pr =>
+            (
+              await octokit.pulls.get({
+                owner: pr.owner,
+                repo: pr.repo,
+                pull_number: pr.prNumber,
+              })
+            ).data.head.sha,
           onError: error => {
             log.error(
               {

@@ -463,6 +463,7 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
         releaseVerdictClaim: releaseVerdictClaimForMergeExecution,
         deferVerdictClaim: deferVerdictClaimForMergeExecution,
         getRunById: getOverseerWatchRunById,
+        listRunEvents: listRunEventsForOverseer,
         hasActiveRunForWo: (woId: string) => hasActiveRunForWo(woId, listActiveRunUserMessages),
         reserveMergeSlot: reserveOverseerMergeSlot,
         getEarliestMergeSlotReservation: getEarliestOverseerMergeSlotReservation,

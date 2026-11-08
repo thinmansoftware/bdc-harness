@@ -120,22 +120,29 @@ function prNotMergeReadyDetail(evidence: PullRequestEvidence): string {
  *
  * Runs do not record their git identity: the engine writes only cost/token telemetry
  * into run metadata, so `headBranch` is absent on every terminal run in the live store.
- * The commit-and-push node does report its final target as `unique_branch=<name>`, which
- * makes the branch recoverable after the fact. Same signal smart-cauldron's
+ * Completed commit-and-push bash nodes report `unique_branch=<name>` lines,
+ * making the branch recoverable without trusting markers in AI output. Same signal smart-cauldron's
  * findExistingPrForBranch reads (poll.ts). Last writer wins -- a run may push more than
  * once, and the final push is the one a PR would be open against.
  *
- * Returns undefined when no event reports a branch. Absent stays absent.
+ * Returns undefined when no qualifying event reports a branch. Absent stays absent.
  */
 export function recoverHeadBranchFromEvents(events: OverseerWorkflowEvent[]): string | undefined {
   let branch: string | undefined;
   for (const event of events) {
+    if (
+      event.event_type !== 'node_completed' ||
+      event.step_name !== 'commit-and-push' ||
+      event.data.type !== 'bash'
+    )
+      continue;
+    const branchLine = /^unique_branch=(\S+)[ \t]*\r?$/gm;
     const nodeOutput = event.data.node_output;
     const fromNodeOutput =
-      typeof nodeOutput === 'string' ? /unique_branch=(\S+)/.exec(nodeOutput)?.[1] : undefined;
+      typeof nodeOutput === 'string' ? [...nodeOutput.matchAll(branchLine)].at(-1)?.[1] : undefined;
     const fromOutput =
       typeof event.data.output === 'string'
-        ? /unique_branch=(\S+)/.exec(event.data.output)?.[1]
+        ? [...event.data.output.matchAll(branchLine)].at(-1)?.[1]
         : undefined;
     // A string node_output that does not carry unique_branch= must not hide
     // a branch reported on data.output. node_output wins only when it parses.

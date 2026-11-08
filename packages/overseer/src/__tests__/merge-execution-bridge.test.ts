@@ -915,7 +915,94 @@ async function runOnce(h: ReturnType<typeof harness>): Promise<void> {
   });
 }
 
+describe('merge execution bridge -- recovered run branch', () => {
+  test('uses the final commit-and-push branch instead of the pre-review metadata branch', async () => {
+    const h = harness([verdict('recovered')]);
+    const original = { ...run('recovered'), headBranch: 'archon/task-builder' };
+    h.store.getRunById = async () => original;
+    h.store.listRunEvents = async runId => {
+      expect(runId).toBe(original.id);
+      return [
+        {
+          id: 'push',
+          workflow_run_id: runId,
+          event_type: 'node_completed',
+          step_name: 'commit-and-push',
+          data: {
+            type: 'bash',
+            node_output: 'unique_branch=early\nunique_branch=reviewed-branch\n',
+          },
+        },
+      ];
+    };
+    const searches: GitHubPullRequestSearchInput[] = [];
+    h.github.findPullRequest = async input => {
+      searches.push(input);
+      return greenPr({
+        headSha: input.headBranch === 'reviewed-branch' ? 'judged-sha' : 'old-head',
+      });
+    };
+    await runOnce(h);
+    expect(searches).toEqual([expect.objectContaining({ headBranch: 'reviewed-branch' })]);
+    expect(original.headBranch).toBe('archon/task-builder');
+    expect(h.merges).toBe(1);
+  });
+
+  test('retains the metadata branch when only AI text reports unique_branch', async () => {
+    const h = harness([verdict('ai-output')]);
+    h.store.listRunEvents = async runId => [
+      {
+        id: 'ai',
+        workflow_run_id: runId,
+        event_type: 'node_completed',
+        step_name: 'builder',
+        data: { type: 'agent', node_output: 'unique_branch=ai-injected' },
+      },
+    ];
+    h.github.findPullRequest = async input => {
+      expect(input.headBranch).toBe('branch-ai-output');
+      return greenPr();
+    };
+    await runOnce(h);
+    expect(h.merges).toBe(1);
+  });
+});
+
 describe('merge execution bridge -- run-less verdicts (#846)', () => {
+  test.each([
+    ['head_moved', { headSha: 'new-head' }, true, null],
+    ['review_execution_unqualified', {}, false, null],
+    [
+      'required_checks_not_success',
+      { checks: { total: 1, passed: 0, failed: 1, pending: 0 } },
+      true,
+      null,
+    ],
+    ['review_conflict_at_head:changes_requested', {}, true, 'changes_requested'],
+  ] as const)(
+    'approval-scoped rechecks retain the %s gate',
+    async (reason, evidence, qualified, conflict) => {
+      const { h } = runlessHarness(
+        [
+          runlessVerdict('approval-scoped', {
+            run_id: `pr-discovery:thinmansoftware/bdc-harness#${RUNLESS_PR}:approval-review:123`,
+            wo_id: `gh:thinmansoftware/bdc-harness#${RUNLESS_PR}`,
+          }),
+        ],
+        runlessPr(evidence)
+      );
+      await runMergeExecutionBridgeOnceProduction({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+        hasQualifiedReview: async () => qualified,
+        reviewConflictAtHead: async () => conflict,
+      });
+      expect(h.merges).toBe(0);
+      expect(h.outcomes[0]?.reason).toBe(reason);
+    }
+  );
+
   test('(a) merges a run-less verdict on an open allowlisted PR via the same mutation path', async () => {
     const { h, searches, runLookups } = runlessHarness([runlessVerdict('runless-ok')]);
     const seen: { number?: number; expectedHeadSha?: string } = {};
