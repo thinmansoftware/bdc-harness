@@ -7,7 +7,7 @@
  * stale-head invalidation mid-review, reviewer failure, submission failure,
  * and receipt creation. Hermetic -- fake deps only.
  */
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import {
   buildReviewBody,
   runAndSubmitReview,
@@ -80,6 +80,46 @@ describe('approve path', () => {
 });
 
 describe('request-changes path (XO decision 1)', () => {
+  test('hands back a mechanical finding with its WO and records the emitted receipt', async () => {
+    const emit = mock(async () => ({ claimed: true, attempt: 1 }));
+    const resolveWoId = mock(async () => 'WO-HARNESS-TEST-01');
+    const { deps, rec } = makeDeps({
+      runReviewer: async () => ({
+        approved: false,
+        summary: 'The build fails on the renamed column.',
+        reviewedHeadSha: HEAD,
+        findings: [
+          {
+            scope: 'src/x.ts',
+            severity: 'major',
+            summary: 'Build fails.',
+            remediation: 'mechanical',
+          },
+        ],
+      }),
+      resolveWoId,
+      countPriorRemediationAttempts: async () => 0,
+      emitRemediationCandidate: emit,
+    });
+    const outcome = await runAndSubmitReview(WORK, deps);
+    expect(outcome.disposition).toBe('changes_requested');
+    expect(resolveWoId).toHaveBeenCalledWith({
+      owner: WORK.owner,
+      repo: WORK.repo,
+      prNumber: WORK.prNumber,
+      headSha: HEAD,
+    });
+    expect(emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        woId: 'WO-HARNESS-TEST-01',
+        owningLane: null,
+        findingClasses: ['reviewer_mechanical'],
+      })
+    );
+    expect(outcome.remediation).toEqual({ emitted: true, attempt: 1 });
+    expect(rec.receipts[0]?.remediation).toEqual({ emitted: true, attempt: 1 });
+  });
+
   test('a non-approving verdict submits REQUEST_CHANGES, not silence', async () => {
     const { deps, rec } = makeDeps({
       runReviewer: async () => ({

@@ -16,7 +16,6 @@ import { describe, expect, test } from 'bun:test';
 import type { IndependentReviewFinding } from '../independent-review-evidence.ts';
 import {
   AUTO_FIXABLE_CLASSES,
-  LEGACY_PATTERN_CLASSES,
   classifyFinding,
   classifyFindings,
   countPriorRemediationAttempts,
@@ -35,6 +34,7 @@ import { runAndSubmitReview, type ReviewWorkItem, type SubmitDeps } from '../pr-
  * its children, which the composite FK (case_id, tenant_id) rejects.
  */
 const MIGRATION_ORDERING_FINDING: IndependentReviewFinding = {
+  remediation: 'mechanical',
   scope: 'migrations/041_backfill_tenant.sql',
   severity: 'blocker',
   summary:
@@ -42,6 +42,7 @@ const MIGRATION_ORDERING_FINDING: IndependentReviewFinding = {
 };
 
 const TEST_FAILURE_FINDING: IndependentReviewFinding = {
+  remediation: 'mechanical',
   scope: 'packages/core/src/db/cases.test.ts',
   severity: 'major',
   summary: 'Two tests fail against the new column name.',
@@ -70,7 +71,7 @@ function baseInput(overrides: Partial<RemediationCandidateInput> = {}): Remediat
 
 describe('scenario 1: machine-fixable findings produce exactly one candidate', () => {
   test('emits attempt 1 carrying PR ref, head SHA, and the verdict body', () => {
-    const decision = decideRemediation(baseInput(), LEGACY_PATTERN_CLASSES);
+    const decision = decideRemediation(baseInput());
 
     expect(decision.emit).toBe(true);
     if (!decision.emit) throw new Error('unreachable');
@@ -82,7 +83,7 @@ describe('scenario 1: machine-fixable findings produce exactly one candidate', (
     expect(decision.body.headSha).toBe('f868542e0000000000000000000000000000abcd');
     expect(decision.body.attempt).toBe(1);
     expect(decision.body.maxAttempts).toBe(MAX_REMEDIATION_ATTEMPTS);
-    expect(decision.body.findingClasses).toEqual(['migration_ordering']);
+    expect(decision.body.findingClasses).toEqual(['reviewer_mechanical']);
     // The verdict body must TRAVEL, so the builder fixes the named defect
     // rather than rediscovering it.
     expect(decision.body.verdictBody).toContain('Migration ordering violates the FK');
@@ -92,8 +93,7 @@ describe('scenario 1: machine-fixable findings produce exactly one candidate', (
 describe('scenario 2: a non-auto finding among fixable ones blocks remediation', () => {
   test('MIXED case -- one design finding sends the whole verdict to a human', () => {
     const decision = decideRemediation(
-      baseInput({ findings: [MIGRATION_ORDERING_FINDING, TEST_FAILURE_FINDING, DESIGN_FINDING] }),
-      LEGACY_PATTERN_CLASSES
+      baseInput({ findings: [MIGRATION_ORDERING_FINDING, TEST_FAILURE_FINDING, DESIGN_FINDING] })
     );
 
     expect(decision.emit).toBe(false);
@@ -105,14 +105,11 @@ describe('scenario 2: a non-auto finding among fixable ones blocks remediation',
 
   test('a security finding is non-auto even when its text also looks mechanical', () => {
     // Fail-closed tie-break: the non-auto signal overrides a pattern match.
-    const classification = classifyFinding(
-      {
-        scope: 'migrations/041.sql',
-        severity: 'blocker',
-        summary: 'The migration ordering here leaks a credential into the audit log.',
-      },
-      LEGACY_PATTERN_CLASSES
-    );
+    const classification = classifyFinding({
+      scope: 'migrations/041.sql',
+      severity: 'blocker',
+      summary: 'The migration ordering here leaks a credential into the audit log.',
+    });
     expect(classification.autoFixable).toBe(false);
     expect(classification.classId).toBeNull();
   });
@@ -120,10 +117,7 @@ describe('scenario 2: a non-auto finding among fixable ones blocks remediation',
 
 describe('scenario 3: attempt cap', () => {
   test('at the cap, no candidate and the reason is remediation_attempts_exhausted', () => {
-    const decision = decideRemediation(
-      baseInput({ priorAttempts: MAX_REMEDIATION_ATTEMPTS }),
-      LEGACY_PATTERN_CLASSES
-    );
+    const decision = decideRemediation(baseInput({ priorAttempts: MAX_REMEDIATION_ATTEMPTS }));
 
     expect(decision.emit).toBe(false);
     if (decision.emit) throw new Error('unreachable');
@@ -131,10 +125,7 @@ describe('scenario 3: attempt cap', () => {
   });
 
   test('the last attempt under the cap still emits', () => {
-    const decision = decideRemediation(
-      baseInput({ priorAttempts: MAX_REMEDIATION_ATTEMPTS - 1 }),
-      LEGACY_PATTERN_CLASSES
-    );
+    const decision = decideRemediation(baseInput({ priorAttempts: MAX_REMEDIATION_ATTEMPTS - 1 }));
     expect(decision.emit).toBe(true);
     if (!decision.emit) throw new Error('unreachable');
     expect(decision.body.attempt).toBe(MAX_REMEDIATION_ATTEMPTS);
@@ -143,8 +134,8 @@ describe('scenario 3: attempt cap', () => {
 
 describe('scenario 4: idempotency', () => {
   test('the same verdict twice computes the SAME idempotency key', () => {
-    const first = decideRemediation(baseInput(), LEGACY_PATTERN_CLASSES);
-    const second = decideRemediation(baseInput(), LEGACY_PATTERN_CLASSES);
+    const first = decideRemediation(baseInput());
+    const second = decideRemediation(baseInput());
     if (!first.emit || !second.emit) throw new Error('expected both to emit');
 
     const keyOf = (body: typeof first.body) =>
@@ -201,8 +192,7 @@ describe('scenario 4: idempotency', () => {
 
   test('the cap refuses once the count reaches it, whatever the head', () => {
     const third = decideRemediation(
-      baseInput({ priorAttempts: MAX_REMEDIATION_ATTEMPTS, headSha: 'cccc3333' }),
-      LEGACY_PATTERN_CLASSES
+      baseInput({ priorAttempts: MAX_REMEDIATION_ATTEMPTS, headSha: 'cccc3333' })
     );
     expect(third.emit).toBe(false);
     if (third.emit) throw new Error('unreachable');
@@ -212,13 +202,12 @@ describe('scenario 4: idempotency', () => {
 
 describe('scenario 5: a new head SHA permits a second attempt', () => {
   test('attempt 2 is allowed and the key differs from attempt 1', () => {
-    const first = decideRemediation(baseInput(), LEGACY_PATTERN_CLASSES);
+    const first = decideRemediation(baseInput());
     const second = decideRemediation(
       baseInput({
         priorAttempts: 1,
         headSha: 'aaaa11110000000000000000000000000000bbbb',
-      }),
-      LEGACY_PATTERN_CLASSES
+      })
     );
     if (!first.emit || !second.emit) throw new Error('expected both to emit');
 
@@ -260,14 +249,12 @@ describe('scenario 5: a new head SHA permits a second attempt', () => {
  *
  * The root cause was pattern breadth, not a missing keyword: `test_failure`
  * matched "the word test ... then a failure word anywhere after it", which
- * swallowed coverage-gap phrasings. A MISSING test is a judgment call (deciding
- * what it should assert requires knowing what the code ought to do); a FAILING
- * test is mechanical (the runner already named the broken assertion). The
- * classes now require observed failure, so coverage gaps fall through to the
- * fail-closed default and reach a human regardless of wording.
+ * swallowed coverage-gap phrasings. A missing test requires judgment about
+ * what the code ought to do. Even a failing test does not establish mechanical
+ * eligibility; the reviewer must supply the explicit structured signal.
  *
  * A blocklist cannot enumerate every phrasing, so these cases deliberately omit
- * the security keywords entirely -- they must be HUMAN on pattern shape alone.
+ * the security keywords entirely -- absent eligibility still routes to a human.
  */
 describe('regression: security-shaped findings never auto-route (PR #740 major)', () => {
   const mustBeHuman: readonly {
@@ -310,15 +297,12 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
 
   for (const { label, finding } of mustBeHuman) {
     test(`NON-AUTO: ${label}`, () => {
-      expect(classifyFinding(finding, LEGACY_PATTERN_CLASSES).autoFixable).toBe(false);
+      expect(classifyFinding(finding).autoFixable).toBe(false);
     });
   }
 
   test('a verdict containing one of these emits NO candidate', () => {
-    const decision = decideRemediation(
-      baseInput({ findings: [mustBeHuman[2]!.finding] }),
-      LEGACY_PATTERN_CLASSES
-    );
+    const decision = decideRemediation(baseInput({ findings: [mustBeHuman[2]!.finding] }));
     expect(decision.emit).toBe(false);
     if (decision.emit) throw new Error('unreachable');
     expect(decision.reason).toBe('non_auto_finding_present');
@@ -363,10 +347,9 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
 
   for (const { label, summary } of overBroadCases) {
     test(`NON-AUTO: ${label}`, () => {
-      expect(
-        classifyFinding({ scope: 'src/x.ts', severity: 'blocker', summary }, LEGACY_PATTERN_CLASSES)
-          .autoFixable
-      ).toBe(false);
+      expect(classifyFinding({ scope: 'src/x.ts', severity: 'blocker', summary }).autoFixable).toBe(
+        false
+      );
     });
   }
 
@@ -435,7 +418,7 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
 
   for (const { label, finding } of filenameBypassCases) {
     test(`NON-AUTO: ${label}`, () => {
-      expect(classifyFinding(finding, LEGACY_PATTERN_CLASSES).autoFixable).toBe(false);
+      expect(classifyFinding(finding).autoFixable).toBe(false);
     });
   }
 
@@ -474,10 +457,7 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
   for (const { label, summary } of bareMentionCases) {
     test(`NON-AUTO: ${label}`, () => {
       expect(
-        classifyFinding(
-          { scope: 'src/tenants.ts', severity: 'blocker', summary },
-          LEGACY_PATTERN_CLASSES
-        ).autoFixable
+        classifyFinding({ scope: 'src/tenants.ts', severity: 'blocker', summary }).autoFixable
       ).toBe(false);
     });
   }
@@ -487,12 +467,14 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
       'Non-ASCII em-dash breaks PowerShell parsing',
       'The file violates the ascii-only rule and fails the gate',
     ]) {
-      const result = classifyFinding(
-        { scope: 'scripts/x.ps1', severity: 'blocker', summary },
-        LEGACY_PATTERN_CLASSES
-      );
+      const result = classifyFinding({
+        scope: 'scripts/x.ps1',
+        severity: 'blocker',
+        summary,
+        remediation: 'mechanical',
+      });
       expect(result.autoFixable, summary).toBe(true);
-      expect(result.classId, summary).toBe('ascii_violation');
+      expect(result.classId, summary).toBe('reviewer_mechanical');
     }
   });
 
@@ -538,10 +520,7 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
   for (const { label, summary } of impactConsequenceCases) {
     test(`NON-AUTO: ${label}`, () => {
       expect(
-        classifyFinding(
-          { scope: 'src/tenants.ts', severity: 'blocker', summary },
-          LEGACY_PATTERN_CLASSES
-        ).autoFixable
+        classifyFinding({ scope: 'src/tenants.ts', severity: 'blocker', summary }).autoFixable
       ).toBe(false);
     });
 
@@ -549,8 +528,7 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
       const decision = decideRemediation(
         baseInput({
           findings: [{ scope: 'src/tenants.ts', severity: 'blocker', summary }],
-        }),
-        LEGACY_PATTERN_CLASSES
+        })
       );
       expect(decision.emit).toBe(false);
     });
@@ -558,15 +536,17 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
 
   test('the real tool-reported versions of those classes DO auto-route', () => {
     const mechanical: readonly [string, string, string][] = [
-      ['named linter', 'eslint reports 3 errors: prefer-const', 'lint_or_format'],
-      ['named formatter', 'prettier --check fails on this file', 'lint_or_format'],
-      ['ascii rule broken', 'Non-ASCII em-dash breaks PowerShell parsing', 'ascii_violation'],
+      ['named linter', 'eslint reports 3 errors: prefer-const', 'reviewer_mechanical'],
+      ['named formatter', 'prettier --check fails on this file', 'reviewer_mechanical'],
+      ['ascii rule broken', 'Non-ASCII em-dash breaks PowerShell parsing', 'reviewer_mechanical'],
     ];
     for (const [label, summary, expectedClass] of mechanical) {
-      const result = classifyFinding(
-        { scope: 'src/x.ts', severity: 'blocker', summary },
-        LEGACY_PATTERN_CLASSES
-      );
+      const result = classifyFinding({
+        scope: 'src/x.ts',
+        severity: 'blocker',
+        summary,
+        remediation: 'mechanical',
+      });
       expect(result.autoFixable, label).toBe(true);
       expect(result.classId, label).toBe(expectedClass);
     }
@@ -581,7 +561,7 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
           severity: 'major',
           summary: 'Two tests fail against the new column name',
         },
-        'test_failure',
+        'reviewer_mechanical',
       ],
       [
         'build error',
@@ -590,12 +570,12 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
           severity: 'blocker',
           summary: 'The build fails: tsc reports an error on line 40',
         },
-        'build_failure',
+        'reviewer_mechanical',
       ],
-      ['the live shopops#650 anchor', MIGRATION_ORDERING_FINDING, 'migration_ordering'],
+      ['the live shopops#650 anchor', MIGRATION_ORDERING_FINDING, 'reviewer_mechanical'],
     ];
     for (const [label, finding, expectedClass] of mechanical) {
-      const result = classifyFinding(finding, LEGACY_PATTERN_CLASSES);
+      const result = classifyFinding({ ...finding, remediation: 'mechanical' });
       expect(result.autoFixable, `${label} must stay auto-fixable`).toBe(true);
       expect(result.classId, label).toBe(expectedClass);
     }
@@ -603,15 +583,29 @@ describe('regression: security-shaped findings never auto-route (PR #740 major)'
 });
 
 describe('scenario 6: fail-closed classification', () => {
+  test('the round-10 permission-test pair routes by the explicit signal', () => {
+    const mechanical: IndependentReviewFinding = {
+      scope: 'src/permissions.test.ts',
+      severity: 'major',
+      summary: 'The permission test fails: expected 403 but received 200.',
+      remediation: 'mechanical',
+    };
+    const judgment: IndependentReviewFinding = {
+      ...mechanical,
+      summary: 'The permission test fails: a read-only member can delete projects.',
+      remediation: 'judgment',
+    };
+    expect(decideRemediation(baseInput({ findings: [mechanical] })).emit).toBe(true);
+    expect(decideRemediation(baseInput({ findings: [judgment] })).emit).toBe(false);
+    expect(decideRemediation(baseInput({ findings: [mechanical, judgment] })).emit).toBe(false);
+  });
+
   test('a finding matching no known class is NON-AUTO', () => {
-    const classification = classifyFinding(
-      {
-        scope: 'somewhere/unknown.ts',
-        severity: 'blocker',
-        summary: 'The widget frobnicator emits an unfamiliar shape nobody has classified.',
-      },
-      LEGACY_PATTERN_CLASSES
-    );
+    const classification = classifyFinding({
+      scope: 'somewhere/unknown.ts',
+      severity: 'blocker',
+      summary: 'The widget frobnicator emits an unfamiliar shape nobody has classified.',
+    });
     expect(classification.autoFixable).toBe(false);
     expect(classification.classId).toBeNull();
   });
@@ -626,28 +620,53 @@ describe('scenario 6: fail-closed classification', () => {
             summary: 'Entirely novel problem shape.',
           },
         ],
-      }),
-      LEGACY_PATTERN_CLASSES
+      })
     );
     expect(decision.emit).toBe(false);
     if (decision.emit) throw new Error('unreachable');
     expect(decision.reason).toBe('non_auto_finding_present');
   });
 
-  test('every declared auto-fixable class actually matches its own description', () => {
-    // Guards against a class being added with a pattern that never fires,
-    // which would silently shrink the auto-fixable set.
-    expect(LEGACY_PATTERN_CLASSES.length).toBeGreaterThan(0);
-    for (const entry of LEGACY_PATTERN_CLASSES) {
-      expect(entry.id.length).toBeGreaterThan(0);
-      expect(entry.description.length).toBeGreaterThan(0);
+  test('prose alone cannot authorize remediation even with the legacy table empty', () => {
+    expect(AUTO_FIXABLE_CLASSES).toEqual([]);
+    const { remediation: _signal, ...finding } = MIGRATION_ORDERING_FINDING;
+    expect(classifyFinding(finding)).toEqual({ autoFixable: false, classId: null });
+    expect(decideRemediation(baseInput({ findings: [finding] }))).toMatchObject({
+      emit: false,
+      reason: 'non_auto_finding_present',
+    });
+  });
+
+  test('judgment and unrecognized signals fail closed', () => {
+    for (const remediation of ['judgment', 'auto', null, true]) {
+      const finding = {
+        ...MIGRATION_ORDERING_FINDING,
+        remediation,
+      } as unknown as IndependentReviewFinding;
+      expect(classifyFinding(finding)).toEqual({ autoFixable: false, classId: null });
+    }
+  });
+
+  test('a mechanical signal cannot override either prose veto', () => {
+    for (const summary of [
+      'The build fails because credentials are exposed.',
+      'The tenant isolation test fails to cover cross-customer invoice reads',
+    ]) {
+      const finding: IndependentReviewFinding = {
+        scope: 'src/x.ts',
+        severity: 'major',
+        summary,
+        remediation: 'mechanical',
+      };
+      expect(classifyFinding(finding).autoFixable).toBe(false);
+      expect(decideRemediation(baseInput({ findings: [finding] })).emit).toBe(false);
     }
   });
 });
 
 describe('scenario 7: an APPROVED verdict never remediates', () => {
   test('no candidate at all', () => {
-    const decision = decideRemediation(baseInput({ verdict: 'APPROVED' }), LEGACY_PATTERN_CLASSES);
+    const decision = decideRemediation(baseInput({ verdict: 'APPROVED' }));
     expect(decision.emit).toBe(false);
     if (decision.emit) throw new Error('unreachable');
     expect(decision.reason).toBe('verdict_not_changes_requested');
@@ -676,8 +695,7 @@ describe('scenario 9: regression -- advisory-only verdicts still go to a human',
           { scope: 'a.ts', severity: 'minor', summary: 'Lint nit.' },
           { scope: 'b.ts', severity: 'note', summary: 'Consider renaming.' },
         ],
-      }),
-      LEGACY_PATTERN_CLASSES
+      })
     );
     expect(decision.emit).toBe(false);
     if (decision.emit) throw new Error('unreachable');
@@ -693,26 +711,22 @@ describe('scenario 9: regression -- advisory-only verdicts still go to a human',
           MIGRATION_ORDERING_FINDING,
           { scope: 'c.ts', severity: 'note', summary: 'Architecture could be tidier here.' },
         ],
-      }),
-      LEGACY_PATTERN_CLASSES
+      })
     );
     expect(decision.emit).toBe(true);
   });
 
   test('classifyFindings reports both matched classes and non-auto summaries', () => {
-    const result = classifyFindings(
-      [MIGRATION_ORDERING_FINDING, DESIGN_FINDING],
-      LEGACY_PATTERN_CLASSES
-    );
+    const result = classifyFindings([MIGRATION_ORDERING_FINDING, DESIGN_FINDING]);
     expect(result.allAutoFixable).toBe(false);
-    expect(result.classIds).toEqual(['migration_ordering']);
+    expect(result.classIds).toEqual(['reviewer_mechanical']);
     expect(result.nonAutoSummaries).toHaveLength(1);
   });
 });
 
 describe('wire contract parsing fails closed', () => {
   test('round-trips a well-formed candidate', () => {
-    const decision = decideRemediation(baseInput(), LEGACY_PATTERN_CLASSES);
+    const decision = decideRemediation(baseInput());
     if (!decision.emit) throw new Error('expected emit');
     const parsed = parseRemediationCandidateBody(JSON.stringify(decision.body));
     expect(parsed).not.toBeNull();
@@ -851,61 +865,74 @@ describe('submit path hands a rejected verdict back to Taskmaster', () => {
     expect(emitted).toHaveLength(0);
   });
 
-  /**
-   * PRODUCTION IS DISARMED, and that is the behavior under test here.
-   *
-   * AUTO_FIXABLE_CLASSES ships EMPTY (see the comment on it), so no finding is
-   * eligible and the hand-back never fires. runAndSubmitReview reaches
-   * handBackToTaskmaster through the real production path -- it cannot be given
-   * an injected class table -- so these assertions describe what actually
-   * happens today: the review lands, and the verdict goes to a human.
-   *
-   * The four tests that previously asserted a candidate WAS emitted (receipt
-   * shape, emit-failure degradation, lost-slot reporting, owningLane default)
-   * were asserting behavior that is correct in the MECHANISM but unreachable
-   * while the table is empty. Their coverage of the mechanism now lives in the
-   * fixture-injected tests above, which exercise decideRemediation directly.
-   * When a structured eligibility signal lands, restore the end-to-end
-   * assertions here.
-   */
-  test('with no eligible classes the review lands and NOTHING is handed back', async () => {
+  test('a mechanical verdict is handed back and the receipt reports success', async () => {
     const { deps: d, emitted, receipts } = deps();
     const outcome = await runAndSubmitReview(work(), d);
-
-    // The review itself is unaffected -- it is on the PR.
     expect(outcome.disposition).toBe('changes_requested');
-    // And no builder was told to do anything.
-    expect(outcome.remediation?.emitted).toBe(false);
-    expect(emitted).toHaveLength(0);
-    expect((receipts[0]?.remediation as { emitted: boolean }).emitted).toBe(false);
+    expect(outcome.remediation).toEqual({ emitted: true, attempt: 1 });
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]).toMatchObject({
+      woId: null,
+      owningLane: null,
+      findingClasses: ['reviewer_mechanical'],
+    });
+    expect(receipts[0]?.remediation).toEqual({ emitted: true, attempt: 1 });
   });
 
-  test('the hand-back is still WIRED, so re-arming needs no plumbing change', async () => {
-    // Proves the seam is intact rather than removed: a verdict whose findings
-    // ARE eligible under an injected table still produces a candidate body with
-    // the PR ref, the head, and the owning lane. Only AUTO_FIXABLE_CLASSES
-    // stands between this and a live hand-back.
-    const decision = decideRemediation(
-      {
-        owner: 'thinmansoftware',
-        repo: 'shopops',
-        prNumber: 650,
-        headSha: 'f868542e0000000000000000000000000000abcd',
-        verdict: 'CHANGES_REQUESTED',
-        findings: [MIGRATION_ORDERING_FINDING],
-        verdictBody: 'Independent review at head f868542e.',
-        priorAttempts: 0,
-        owningLane: 'cauldron-lane-a',
+  test('an emitter failure preserves the submitted review and reports refusal', async () => {
+    const { deps: d, receipts } = deps({
+      emitRemediationCandidate: async () => {
+        throw new Error('unavailable');
       },
-      LEGACY_PATTERN_CLASSES
-    );
+    });
+    const outcome = await runAndSubmitReview(work(), d);
+    expect(outcome.disposition).toBe('changes_requested');
+    expect(outcome.remediation).toEqual({ emitted: false, reason: 'emit_failed' });
+    expect(receipts[0]?.remediation).toEqual(outcome.remediation);
+  });
 
-    expect(decision.emit).toBe(true);
-    if (!decision.emit) throw new Error('unreachable');
-    expect(decision.body.prNumber).toBe(650);
-    expect(decision.body.headSha).toBe('f868542e0000000000000000000000000000abcd');
-    expect(decision.body.owningLane).toBe('cauldron-lane-a');
-    expect(decision.body.findingClasses).toEqual(['migration_ordering']);
+  test('a lost slot is reported without claiming a candidate was emitted', async () => {
+    const { deps: d } = deps({
+      emitRemediationCandidate: async () => ({ claimed: false, reason: 'cap_exhausted' }),
+    });
+    const outcome = await runAndSubmitReview(work(), d);
+    expect(outcome.remediation).toEqual({ emitted: false, reason: 'attempt_slot_already_claimed' });
+  });
+
+  test('the receipt records the slot actually claimed by the fence', async () => {
+    const { deps: d, receipts } = deps({
+      emitRemediationCandidate: async () => ({ claimed: true, attempt: 2 }),
+    });
+    const outcome = await runAndSubmitReview(work(), d);
+    expect(outcome.remediation).toEqual({ emitted: true, attempt: 2 });
+    expect(receipts[0]?.remediation).toEqual(outcome.remediation);
+  });
+
+  test('a missing signal refuses the hand-back after submitting the review', async () => {
+    const { remediation: _signal, ...finding } = MIGRATION_ORDERING_FINDING;
+    const { deps: d, emitted } = deps({
+      runReviewer: async () => ({
+        approved: false,
+        summary: finding.summary,
+        reviewedHeadSha: work().headSha,
+        findings: [finding],
+      }),
+    });
+    const outcome = await runAndSubmitReview(work(), d);
+    expect(outcome.disposition).toBe('changes_requested');
+    expect(outcome.remediation).toEqual({ emitted: false, reason: 'non_auto_finding_present' });
+    expect(emitted).toHaveLength(0);
+  });
+
+  test('WO lookup failure degrades to an unknown WO without losing the hand-back', async () => {
+    const { deps: d, emitted } = deps({
+      resolveWoId: async () => {
+        throw new Error('unavailable');
+      },
+    });
+    const outcome = await runAndSubmitReview(work(), d);
+    expect(outcome.remediation?.emitted).toBe(true);
+    expect(emitted[0]).toMatchObject({ woId: null, owningLane: null });
   });
 });
 
@@ -918,7 +945,7 @@ function baseCandidateRow() {
     headSha: 'f868542e0000000000000000000000000000abcd',
     attempt: 1,
     maxAttempts: MAX_REMEDIATION_ATTEMPTS,
-    findingClasses: ['migration_ordering'],
+    findingClasses: ['reviewer_mechanical'],
     verdictBody: 'body',
     woId: null,
     owningLane: null,

@@ -58,6 +58,7 @@ import type {
   SubmitDeps,
 } from './pr-review-submit.ts';
 import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
+import { extractDeclaredWoStems } from './reconcile';
 import {
   countPriorRemediationAttempts,
   parseRemediationCandidateBody,
@@ -1431,6 +1432,17 @@ export function createRealSubmitDeps(
       };
     },
     submitReview: createRealSubmitPullRequestReview(octokit),
+    async resolveWoId(input): Promise<string | null> {
+      const pr = await octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.prNumber,
+      });
+      if (pr.data.head.sha !== input.headSha) return null;
+      const declared = extractDeclaredWoStems(pr.data.body ?? '');
+      // Ambiguous declarations cannot identify the owning work order.
+      return declared.length === 1 ? declared[0] : null;
+    },
     async currentHeadSha(input): Promise<string> {
       const pr = await octokit.pulls.get({
         owner: input.owner,
