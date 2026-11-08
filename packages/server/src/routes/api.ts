@@ -2,7 +2,11 @@
  * REST API routes for the Archon Web UI.
  * Provides conversation, codebase, and SSE streaming endpoints.
  */
+import { parseProjectRecord, type ProjectRecord } from '@archon/core/grimoire/project-record';
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
+import { IN_PROCESS_API_ORIGIN, isInProcessServiceRequest } from './in-process-authority';
+import { releaseWoClaim, takeOverWoClaimForResume } from '@archon/core/db/cascade-wo-claims';
+import { cascadeWoClaimDeps } from '../cascade/wo-claim';
 import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
@@ -27,6 +31,8 @@ import {
   registerRepository,
   ConversationNotFoundError,
   generateAndSetTitle,
+  releaseTerminalRunLeasesSweep,
+  withSyncedManagedSource,
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
@@ -65,8 +71,10 @@ import { processDueProviderWaits } from '@archon/workflows/reliability/wait-sche
 import {
   FUELGLASS_SEAT_CUTOFF_SETTING_KEY,
   getSeatCutoff,
+  invalidateSeatUsageCache,
   isValidSeatCutoff,
   readAllSeats,
+  resolvePushedReadingMaxAgeMinutes,
   SEAT_CUTOFF_OUT_OF_RANGE,
   setSeatCutoffOverride,
 } from '@archon/workflows/reliability/seat-usage';
@@ -75,6 +83,10 @@ import {
   getOperatorSetting,
   setOperatorSetting,
 } from '@archon/core/db/operator-settings';
+import {
+  getLatestSeatUsageReading,
+  upsertSeatUsageReading,
+} from '@archon/core/db/seat-usage-readings';
 import { resolveWorkflowProbeBindings } from '@archon/workflows/reliability/resolve-binding';
 import type { ModelOverride } from '@archon/workflows/model-override';
 import { getLoaderErrors, parseWorkflow } from '@archon/workflows/loader';
@@ -87,7 +99,10 @@ import {
 } from '@archon/workflows/schemas/workflow-run';
 import type { ApprovalContext, WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { findMarkdownFilesRecursive } from '@archon/core/utils/commands';
+import { sanitizeCredentials } from '@archon/core/utils/credential-sanitizer';
+import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
 import { startTaskmaster, getTaskmasterRuntime, getTickHealth } from '../taskmaster/loop';
+import { normalizeRepo } from '../taskmaster/fire-eligibility';
 import { startTaskmasterDeadmanChecker } from '@archon/overseer/taskmaster-deadman-check';
 import { startOperatorInboxConsumer } from '../dispatch/operator-inbox-consumer';
 import { startInboxReader, shouldStartOperatorInboxConsumer } from '../dispatch/inbox-reader';
@@ -139,10 +154,13 @@ export const EXPECTATION_DAILY_CAP =
     : 50;
 
 let providerWaitSchedulerTimer: ReturnType<typeof setInterval> | undefined;
+let terminalLeaseSweepTimer: ReturnType<typeof setInterval> | undefined;
 
 export function stopProviderWaitScheduler(): void {
   if (providerWaitSchedulerTimer) clearInterval(providerWaitSchedulerTimer);
   providerWaitSchedulerTimer = undefined;
+  if (terminalLeaseSweepTimer) clearInterval(terminalLeaseSweepTimer);
+  terminalLeaseSweepTimer = undefined;
 }
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -218,6 +236,8 @@ import {
   DispatchNonSystemCapability,
   DispatchPrincipalAuthError,
   authenticateDispatchPrincipal,
+  parseDispatchPrincipalsRegistry,
+  type DispatchPrincipalCredential,
   type DispatchSenderAuthMode,
 } from '../auth/dispatch-principal';
 import { createLogger as createDispatchRouteLogger } from '@archon/paths';
@@ -282,6 +302,7 @@ import {
   codebaseSchema,
   codebaseIdParamsSchema,
   addCodebaseBodySchema,
+  updateCodebaseBodySchema,
   deleteCodebaseResponseSchema,
   codebaseEnvVarsResponseSchema,
   setEnvVarBodySchema,
@@ -309,6 +330,9 @@ import {
 import {
   fuelglassCutoffBodySchema,
   fuelglassCutoffResponseSchema,
+  fuelglassReadingGetResponseSchema,
+  fuelglassReadingPostResponseSchema,
+  fuelglassReadingPushBodySchema,
   fuelglassSeatsResponseSchema,
 } from './schemas/fuelglass.schemas';
 import {
@@ -317,10 +341,11 @@ import {
   supersedeDispatchMessageBodySchema,
   dispatchMailboxPrincipalBodySchema,
   dispatchMessageIdParamsSchema,
-  dispatchMessageListResponseSchema,
+  dispatchMessageListOrCursorResponseSchema,
   dispatchMessageSchema,
   dispatchSenderBodySchema,
   dispatchWorkerSchema,
+  dispatchPrincipalsResponseSchema,
   dispatchStatusQuerySchema,
   dispatchStatusResponseSchema,
   executionHandoffBodySchema,
@@ -729,9 +754,11 @@ const listDispatchMessagesRoute = createRoute({
   request: { query: listDispatchMessagesQuerySchema },
   responses: {
     200: {
-      content: { 'application/json': { schema: dispatchMessageListResponseSchema } },
-      description: 'Dispatch messages',
+      content: { 'application/json': { schema: dispatchMessageListOrCursorResponseSchema } },
+      description:
+        'Dispatch messages. No selector returns the legacy array. after_seq returns one cursor page.',
     },
+    400: jsonError('Invalid dispatch list selector'),
     500: jsonError('Server error'),
   },
 });
@@ -946,6 +973,37 @@ const getDispatchStatusRoute = createRoute({
     200: {
       content: { 'application/json': { schema: dispatchStatusResponseSchema } },
       description: 'Dispatch status',
+    },
+    500: jsonError('Server error'),
+  },
+});
+
+function dispatchPrincipalAckPath(
+  principalId: string,
+  deliveryMode: dispatchDb.DispatchDeliveryMode,
+  credentialConfigured: boolean
+): 'xo_lease' | 'operator_token' | 'principal_credential' | 'worker_claim' | 'none' {
+  if (principalId === 'xo') return 'xo_lease';
+  if (principalId === 'operator') return 'operator_token';
+  if (deliveryMode === 'worker_poll') return 'worker_claim';
+  if (
+    credentialConfigured &&
+    (deliveryMode === 'drain_on_start' || deliveryMode === 'notify_only')
+  ) {
+    return 'principal_credential';
+  }
+  return 'none';
+}
+
+const getDispatchPrincipalsRoute = createRoute({
+  method: 'get',
+  path: '/api/dispatch/principals',
+  tags: ['Dispatch'],
+  summary: 'List dispatch principals and the ack path each one has',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: dispatchPrincipalsResponseSchema } },
+      description: 'Dispatch principals',
     },
     500: jsonError('Server error'),
   },
@@ -1565,6 +1623,32 @@ const addCodebaseRoute = createRoute({
   },
 });
 
+const updateCodebaseRoute = createRoute({
+  method: 'patch',
+  path: '/api/codebases/{id}',
+  tags: ['Codebases'],
+  summary: 'Edit a codebase registration',
+  request: {
+    params: codebaseIdParamsSchema,
+    body: {
+      content: { 'application/json': { schema: updateCodebaseBodySchema } },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: codebaseSchema } },
+      description: 'Updated codebase',
+    },
+    400: jsonError('Bad request'),
+    404: jsonError('Not found'),
+    409: jsonError('Repository URL cannot be resolved to GitHub'),
+    422: jsonError('Branch not found on remote'),
+    502: jsonError('Branch verification unavailable'),
+    500: jsonError('Server error'),
+  },
+});
+
 const deleteCodebaseRoute = createRoute({
   method: 'delete',
   path: '/api/codebases/{id}',
@@ -1931,6 +2015,47 @@ const postFuelglassCutoffRoute = createRoute({
       description: 'Cutoff updated',
     },
     400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const postFuelglassReadingRoute = createRoute({
+  method: 'post',
+  path: '/api/fuelglass/readings',
+  tags: ['Admin'],
+  summary: 'Store a desktop-pushed cursor seat reading',
+  request: {
+    // Ref, not the Zod schema: OpenAPI still publishes the strict six fields,
+    // and no body validator runs before the handler's raw credential scan.
+    body: {
+      content: {
+        'application/json': {
+          schema: { $ref: '#/components/schemas/FuelglassReadingPushBody' },
+        },
+      },
+      required: true,
+    },
+  },
+  responses: {
+    200: {
+      content: { 'application/json': { schema: fuelglassReadingPostResponseSchema } },
+      description: 'Reading stored',
+    },
+    400: jsonError('Bad request'),
+    500: jsonError('Server error'),
+  },
+});
+
+const getFuelglassReadingRoute = createRoute({
+  method: 'get',
+  path: '/api/fuelglass/readings/cursor',
+  tags: ['Admin'],
+  summary: 'Read the latest pushed cursor seat reading',
+  responses: {
+    200: {
+      content: { 'application/json': { schema: fuelglassReadingGetResponseSchema } },
+      description: 'Latest cursor reading and freshness',
+    },
     500: jsonError('Server error'),
   },
 });
@@ -2555,6 +2680,692 @@ const postTaskmasterResumeRoute = createRoute({
   },
 });
 
+const PUSHED_READING_KEYS = new Set([
+  'seat',
+  'used_percent',
+  'remaining_percent',
+  'resets_at',
+  'observed_at',
+  'source',
+]);
+
+const CREDENTIAL_KEY_FRAGMENTS = [
+  'cookie',
+  'token',
+  'session',
+  'secret',
+  'credential',
+  'password',
+  'authorization',
+  'jwt',
+  'bearer',
+];
+
+const JWT_SHAPE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+const OBSERVED_AT_FUTURE_MS = 5 * 60 * 1000;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isCredentialKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return CREDENTIAL_KEY_FRAGMENTS.some(fragment => lower.includes(fragment));
+}
+
+/** True when any key at any depth names a credential. Checked before values. */
+function hasCredentialKey(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(item => hasCredentialKey(item));
+  if (!isPlainRecord(value)) return false;
+  for (const [key, child] of Object.entries(value)) {
+    if (isCredentialKey(key) || hasCredentialKey(child)) return true;
+  }
+  return false;
+}
+
+function isCredentialString(value: string): boolean {
+  return (
+    value.includes('WorkosCursorSessionToken') || (value.length > 100 && JWT_SHAPE.test(value))
+  );
+}
+
+/** True when any string at any depth carries a credential. Checked after keys. */
+function hasCredentialValue(value: unknown): boolean {
+  if (typeof value === 'string') return isCredentialString(value);
+  if (Array.isArray(value)) return value.some(item => hasCredentialValue(item));
+  if (!isPlainRecord(value)) return false;
+  return Object.values(value).some(child => hasCredentialValue(child));
+}
+
+function percentInRange(value: number): boolean {
+  return Number.isFinite(value) && value >= 0 && value <= 100;
+}
+
+function pushedReadingView(row: {
+  seat: string;
+  used_percent: number;
+  remaining_percent: number;
+  resets_at: string;
+  observed_at: string;
+  source: string;
+  received_at: string;
+}): {
+  seat: string;
+  used_percent: number;
+  remaining_percent: number;
+  resets_at: string;
+  observed_at: string;
+  source: string;
+  received_at: string;
+} {
+  return {
+    seat: row.seat,
+    used_percent: row.used_percent,
+    remaining_percent: row.remaining_percent,
+    resets_at: row.resets_at,
+    observed_at: row.observed_at,
+    source: row.source,
+    received_at: row.received_at,
+  };
+}
+
+const DISPATCH_LIST_SELECTOR_KEYS = ['message_id', 'correlation_id', 'after_seq'] as const;
+const DISPATCH_LIST_STATUSES = new Set(['queued', 'claimed', 'done', 'failed', 'cancelled']);
+const COMPLETE_BASE10_INTEGER = /^(0|[1-9][0-9]*)$/;
+
+type DispatchListStatus = 'queued' | 'claimed' | 'done' | 'failed' | 'cancelled';
+
+type DispatchListSelection =
+  | { kind: 'legacy' }
+  | { kind: 'invalid' }
+  | { kind: 'message_id'; recipient: string; messageId: string }
+  | { kind: 'correlation_id'; recipient: string; correlationId: string; limit?: number }
+  | {
+      kind: 'after_seq';
+      recipient: string;
+      afterSeq: number;
+      status?: DispatchListStatus;
+      limit?: number;
+    };
+
+function parseCompleteNonnegativeSafeInteger(value: string): number | null {
+  if (!COMPLETE_BASE10_INTEGER.test(value)) return null;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) return null;
+  return parsed;
+}
+
+function parseSelectedDispatchLimit(value: string): number | null {
+  const parsed = parseCompleteNonnegativeSafeInteger(value);
+  if (parsed === null || parsed < 1 || parsed > 500) return null;
+  return parsed;
+}
+
+function dispatchListKeys(params: URLSearchParams): string[] {
+  const keys: string[] = [];
+  params.forEach((_value, key) => {
+    if (!keys.includes(key)) keys.push(key);
+  });
+  return keys;
+}
+
+function dispatchListKeyRepeated(params: URLSearchParams, keys: readonly string[]): boolean {
+  return keys.some(key => params.getAll(key).length > 1);
+}
+
+function canonicalDispatchListRecipient(params: URLSearchParams): string | null {
+  const values = params.getAll('recipient');
+  if (values.length !== 1) return null;
+  const canonical = (values[0] ?? '').trim().toLowerCase();
+  return canonical.length === 0 ? null : canonical;
+}
+
+/**
+ * Selector key presence opts into a direct read, including after_seq=0.
+ * The legacy path stays in place only when none of those keys appear.
+ */
+function parseDispatchListSelection(requestUrl: string): DispatchListSelection {
+  let params: URLSearchParams;
+  try {
+    params = new URL(requestUrl, 'http://127.0.0.1').searchParams;
+  } catch {
+    return { kind: 'invalid' };
+  }
+  const presentSelectors = DISPATCH_LIST_SELECTOR_KEYS.filter(key => params.has(key));
+  if (presentSelectors.length === 0) return { kind: 'legacy' };
+  if (presentSelectors.length !== 1) return { kind: 'invalid' };
+  const keys = dispatchListKeys(params);
+  if (dispatchListKeyRepeated(params, keys)) return { kind: 'invalid' };
+  const mode = presentSelectors[0];
+  if (mode === undefined) return { kind: 'invalid' };
+  const allowed = new Set<string>(['recipient', mode]);
+  if (mode === 'correlation_id' || mode === 'after_seq') allowed.add('limit');
+  if (mode === 'after_seq') allowed.add('status');
+  if (keys.some(key => !allowed.has(key))) return { kind: 'invalid' };
+  const recipient = canonicalDispatchListRecipient(params);
+  if (recipient === null) return { kind: 'invalid' };
+  let limit: number | undefined;
+  if (params.has('limit')) {
+    const parsedLimit = parseSelectedDispatchLimit(params.get('limit') ?? '');
+    if (parsedLimit === null) return { kind: 'invalid' };
+    limit = parsedLimit;
+  }
+  if (mode === 'message_id') {
+    const messageId = params.get('message_id') ?? '';
+    if (messageId.trim() === '') return { kind: 'invalid' };
+    return { kind: 'message_id', recipient, messageId };
+  }
+  if (mode === 'correlation_id') {
+    const correlationId = params.get('correlation_id') ?? '';
+    if (correlationId.trim() === '') return { kind: 'invalid' };
+    return { kind: 'correlation_id', recipient, correlationId, limit };
+  }
+  const afterSeq = parseCompleteNonnegativeSafeInteger(params.get('after_seq') ?? '');
+  if (afterSeq === null) return { kind: 'invalid' };
+  let status: DispatchListStatus | undefined;
+  if (params.has('status')) {
+    const rawStatus = params.get('status') ?? '';
+    if (!DISPATCH_LIST_STATUSES.has(rawStatus)) return { kind: 'invalid' };
+    status = rawStatus as DispatchListStatus;
+  }
+  return { kind: 'after_seq', recipient, afterSeq, status, limit };
+}
+
+/**
+ * One bounded queued page. Deferred rows stay in the raw page so the cursor
+ * cannot walk past them. The first otherwise-open future not_before stops
+ * the page before that sequence.
+ */
+function walkQueuedDispatchCursorPage(
+  rows: readonly dispatchDb.SeqCursorMessage[],
+  afterSeq: number,
+  dalLimit: number,
+  observedAtMs: number
+): {
+  messages: dispatchDb.DispatchMessage[];
+  next_after_seq: number;
+  page_full: boolean;
+} {
+  const messages: dispatchDb.DispatchMessage[] = [];
+  let safeCursor = afterSeq;
+  for (const row of rows) {
+    if (
+      !Number.isSafeInteger(row.cursor_seq) ||
+      row.cursor_seq < 0 ||
+      row.cursor_seq <= safeCursor
+    ) {
+      throw new Error('dispatch_cursor_not_finite');
+    }
+    const notBeforeMs = row.not_before === null ? null : Date.parse(row.not_before);
+    if (row.not_before !== null && !Number.isFinite(notBeforeMs)) {
+      throw new Error('dispatch_not_before_unparseable');
+    }
+    if (row.addressed_at !== null || row.route_disposition !== null) {
+      safeCursor = row.cursor_seq;
+      continue;
+    }
+    if (notBeforeMs !== null && notBeforeMs > observedAtMs) {
+      return { messages, next_after_seq: safeCursor, page_full: false };
+    }
+    const { cursor_seq: cursorSeq, ...message } = row;
+    messages.push(message);
+    safeCursor = cursorSeq;
+  }
+  return {
+    messages,
+    next_after_seq: safeCursor,
+    page_full: rows.length === dalLimit,
+  };
+}
+
+async function loadSelectedDispatchMessages(
+  selection: Exclude<DispatchListSelection, { kind: 'legacy' | 'invalid' }>
+): Promise<unknown> {
+  if (selection.kind === 'message_id') {
+    const message = await dispatchDb.getMessage(selection.messageId);
+    if (message === null) return [];
+    if (message.recipient.trim().toLowerCase() !== selection.recipient) return [];
+    return [message];
+  }
+  if (selection.kind === 'correlation_id') {
+    return dispatchDb.listMessagesByCorrelationId({
+      correlationId: selection.correlationId,
+      recipient: selection.recipient,
+      ...(selection.limit !== undefined ? { limit: selection.limit } : {}),
+    });
+  }
+  const dalLimit = Math.max(1, Math.min(selection.limit ?? 100, 500));
+  if (selection.status === 'queued') {
+    const rows = await dispatchDb.listMessagesBySeqCursor({
+      recipient: selection.recipient,
+      afterSeq: selection.afterSeq,
+      status: 'queued',
+      limit: dalLimit,
+    });
+    if (rows.length === 0) {
+      return { messages: [], next_after_seq: selection.afterSeq, page_full: false };
+    }
+    const observedAtMs = Date.now();
+    return walkQueuedDispatchCursorPage(rows, selection.afterSeq, dalLimit, observedAtMs);
+  }
+  const rows = await dispatchDb.listMessagesBySeqCursor({
+    recipient: selection.recipient,
+    afterSeq: selection.afterSeq,
+    ...(selection.status !== undefined ? { status: selection.status } : {}),
+    ...(selection.limit !== undefined ? { limit: selection.limit } : {}),
+  });
+  if (rows.length === 0) {
+    return { messages: [], next_after_seq: selection.afterSeq, page_full: false };
+  }
+  const messages: dispatchDb.DispatchMessage[] = [];
+  let nextAfterSeq = selection.afterSeq;
+  for (const row of rows) {
+    // Same contract as walkQueuedDispatchCursorPage: the response schema only
+    // allows a safe nonnegative integer, and each row must advance the cursor.
+    if (
+      !Number.isSafeInteger(row.cursor_seq) ||
+      row.cursor_seq < 0 ||
+      row.cursor_seq <= nextAfterSeq
+    ) {
+      throw new Error('dispatch_cursor_not_finite');
+    }
+    const { cursor_seq: cursorSeq, ...message } = row;
+    messages.push(message);
+    nextAfterSeq = cursorSeq;
+  }
+  return {
+    messages,
+    next_after_seq: nextAfterSeq,
+    page_full: rows.length === dalLimit,
+  };
+}
+
+// WO-HARNESS-T3-COMMAND-CONSUMER-01: run-action primitives shared by the HTTP
+// routes below (behavior unchanged) and the cauldron-fire command consumer.
+// Each returns a discriminated result; the caller maps it to an HTTP response
+// or a Dispatch reply. DB errors throw and are handled by the caller's catch,
+// preserving the routes' existing 500 behavior.
+
+export type CancelWorkflowRunActorResult =
+  | { ok: true; run: WorkflowRun }
+  | { ok: false; status: 400 | 404 | 409 | 422; message: string };
+
+/**
+ * Status-gated cancel used by POST /api/workflows/runs/:runId/cancel (actor
+ * 'api') and the consumer's cancel-own (actor = the principal id). The status
+ * checks, error codes, and the run_cancelled event shape are identical to the
+ * original route body.
+ */
+export async function cancelWorkflowRunAsActor(
+  runId: string,
+  opts: { reason?: string; actor: string }
+): Promise<CancelWorkflowRunActorResult> {
+  const run = await workflowDb.getWorkflowRun(runId);
+  if (!run) {
+    return { ok: false, status: 404, message: 'Workflow run not found' };
+  }
+  if (run.status === 'cancelled') {
+    return { ok: false, status: 409, message: 'Workflow run is already cancelled' };
+  }
+  if (run.status === 'completed' || run.status === 'failed') {
+    return { ok: false, status: 422, message: `Cannot cancel workflow in '${run.status}' status` };
+  }
+  if (run.status !== 'running' && run.status !== 'pending' && run.status !== 'paused') {
+    return { ok: false, status: 400, message: `Cannot cancel workflow in '${run.status}' status` };
+  }
+  const reason = opts.reason?.trim()
+    ? opts.reason
+    : 'API cancellation requested; caller did not supply a reason';
+  await workflowDb.cancelWorkflowRun(runId);
+  // A5.10 (WO-HARNESS-T3-COMMAND-CONSUMER-01): the run_cancelled event is durable
+  // before cancel returns ok, so the consumer's recovery can prove the cancel.
+  await workflowEventDb.createWorkflowEvent({
+    workflow_run_id: runId,
+    event_type: 'run_cancelled',
+    data: { reason, actor: opts.actor },
+  });
+  const updated = await workflowDb.getWorkflowRun(runId);
+  const updatedRun = updated ?? {
+    ...run,
+    status: 'cancelled' as const,
+    completed_at: new Date(),
+  };
+  return { ok: true, run: updatedRun };
+}
+
+/**
+ * The web adapter registered by registerApiRoutes. tryAutoResumeRun (hoisted
+ * to module level so the cauldron-fire consumer's approve can use the same
+ * resume path as the HTTP approve route; WO-HARNESS-T3-COMMAND-CONSUMER-01
+ * Amendment 2 A2.1) dispatches the resumed execution through it.
+ */
+let registeredWebAdapter: WebAdapter | null = null;
+
+export function workflowRunTaskClass(run: WorkflowRun): string | undefined {
+  const rawTaskClass = run.metadata.task_class ?? run.metadata.taskClass;
+  if (typeof rawTaskClass !== 'string') return undefined;
+  const taskClass = rawTaskClass.trim();
+  return taskClass.length > 0 ? taskClass : undefined;
+}
+
+/**
+ * Re-enter the workflow executor directly after a paused approval gate is
+ * resolved, so a web-dispatched workflow continues (approve) or runs its
+ * on_reject prompt (reject) without the user having to re-run the workflow
+ * command. The CLI's `workflowApproveCommand` / `workflowRejectCommand`
+ * already auto-resume via `workflowRunCommand({ resume: true })`; this is the
+ * web-side equivalent without going back through the natural-language
+ * orchestrator.
+ *
+ * Returns `true` when a resume dispatch was initiated, `false` otherwise (no
+ * worker conversation on the run, parent conversation deleted, parent was on
+ * a non-web platform, workflow definition missing, or executor launch threw).
+ * Failures are non-fatal: the gate
+ * decision is recorded regardless; when this returns `false` the response
+ * text instructs the user to re-run the workflow command.
+ *
+ * **Cross-adapter guard**: only web-sourced parents qualify.
+ * `dispatchToOrchestrator` is wired to the web adapter + its lock manager,
+ * so a Slack / Telegram / GitHub / Discord run being approved from the
+ * dashboard must not route through it -- the Slack thread would never see
+ * the resumed output. Non-web parents skip auto-resume and the originating
+ * platform's own re-run flow applies.
+ */
+export async function tryAutoResumeRun(
+  run: WorkflowRun,
+  action: 'approve' | 'reject' | 'provider_wait'
+): Promise<boolean> {
+  const adapter = registeredWebAdapter;
+  if (!adapter) return false;
+  if (!run.parent_conversation_id) return false;
+  if (!run.conversation_id || !run.working_path) return false;
+  // Literal event names per action -- greppable for ops tooling. Keeping the
+  // branch explicit rather than templating avoids the earlier 3-segment
+  // `api.workflow_*.dispatched` shape that broke `{domain}.{action}_{state}`.
+  const events =
+    action === 'approve'
+      ? {
+          dispatched: 'api.workflow_approve_auto_resume_dispatched' as const,
+          skippedNoPlatformConv:
+            'api.workflow_approve_auto_resume_skipped_no_platform_conv' as const,
+          skippedNonWebParent: 'api.workflow_approve_auto_resume_skipped_non_web_parent' as const,
+          failed: 'api.workflow_approve_auto_resume_failed' as const,
+          missingWorker: 'api.workflow_approve_auto_resume_skipped_no_worker_conv' as const,
+          missingWorkflow: 'api.workflow_approve_auto_resume_skipped_missing_workflow' as const,
+          executorStarted: 'api.workflow_approve_direct_resume_started' as const,
+          executorFailed: 'api.workflow_approve_direct_resume_failed' as const,
+        }
+      : action === 'reject'
+        ? {
+            dispatched: 'api.workflow_reject_auto_resume_dispatched' as const,
+            skippedNoPlatformConv:
+              'api.workflow_reject_auto_resume_skipped_no_platform_conv' as const,
+            skippedNonWebParent: 'api.workflow_reject_auto_resume_skipped_non_web_parent' as const,
+            failed: 'api.workflow_reject_auto_resume_failed' as const,
+            missingWorker: 'api.workflow_reject_auto_resume_skipped_no_worker_conv' as const,
+            missingWorkflow: 'api.workflow_reject_auto_resume_skipped_missing_workflow' as const,
+            executorStarted: 'api.workflow_reject_direct_resume_started' as const,
+            executorFailed: 'api.workflow_reject_direct_resume_failed' as const,
+          }
+        : {
+            dispatched: 'api.provider_wait_auto_resume_dispatched' as const,
+            skippedNoPlatformConv:
+              'api.provider_wait_auto_resume_skipped_no_platform_conv' as const,
+            skippedNonWebParent: 'api.provider_wait_auto_resume_skipped_non_web_parent' as const,
+            failed: 'api.provider_wait_auto_resume_failed' as const,
+            missingWorker: 'api.provider_wait_auto_resume_skipped_no_worker_conv' as const,
+            missingWorkflow: 'api.provider_wait_auto_resume_skipped_missing_workflow' as const,
+            executorStarted: 'api.provider_wait_direct_resume_started' as const,
+            executorFailed: 'api.provider_wait_direct_resume_failed' as const,
+          };
+  try {
+    const parentConv = await conversationDb.getConversationById(run.parent_conversation_id);
+    const workerConv = await conversationDb.getConversationById(run.conversation_id);
+    const platformConvId = parentConv?.platform_conversation_id;
+    if (!platformConvId) {
+      // parentConv === null is a data-integrity signal (the parent
+      // conversation was deleted while the run was paused) -- worth
+      // surfacing at info level so operators notice. Missing
+      // platform_conversation_id on an existing row shouldn't happen and
+      // stays at debug.
+      const logFn =
+        parentConv === null ? getLog().info.bind(getLog()) : getLog().debug.bind(getLog());
+      logFn(
+        {
+          runId: run.id,
+          parentConversationId: run.parent_conversation_id,
+          parentDeleted: parentConv === null,
+        },
+        events.skippedNoPlatformConv
+      );
+      return false;
+    }
+    if (parentConv.platform_type !== 'web') {
+      getLog().debug(
+        {
+          runId: run.id,
+          parentConversationId: run.parent_conversation_id,
+          platformType: parentConv.platform_type,
+        },
+        events.skippedNonWebParent
+      );
+      return false;
+    }
+    const workerPlatformConvId = workerConv?.platform_conversation_id;
+    if (!workerConv || !workerPlatformConvId || workerConv.platform_type !== 'web') {
+      getLog().warn(
+        {
+          runId: run.id,
+          workerConversationId: run.conversation_id,
+          workerPlatformType: workerConv?.platform_type,
+        },
+        events.missingWorker
+      );
+      return false;
+    }
+
+    const resolvedWorkflowName =
+      (await resolveWebLane({
+        workflowName: run.workflow_name.trim() || undefined,
+        task_class: workflowRunTaskClass(run),
+        routerYamlPath: join(run.working_path, 'config', 'router.yaml'),
+      })) ?? run.workflow_name;
+
+    const discovery = await discoverWorkflowsWithConfig(run.working_path, loadConfig);
+    const workflow = discovery.workflows.find(
+      item => item.workflow.name === resolvedWorkflowName
+    )?.workflow;
+    if (!workflow) {
+      getLog().warn(
+        {
+          runId: run.id,
+          workflowName: resolvedWorkflowName,
+          workingPath: run.working_path,
+          loaderErrors: discovery.errors,
+        },
+        events.missingWorkflow
+      );
+      return false;
+    }
+
+    adapter.setConversationDbId(workerPlatformConvId, workerConv.id);
+    const unsubscribeBridge = adapter.setupEventBridge(workerPlatformConvId, platformConvId);
+    const execution =
+      action === 'provider_wait'
+        ? executeWorkflow(
+            createWorkflowDeps(),
+            adapter,
+            workerPlatformConvId,
+            run.working_path,
+            workflow,
+            run.user_message ?? '',
+            workerConv.id,
+            run.codebase_id ?? undefined,
+            undefined,
+            undefined,
+            parentConv.id,
+            run
+          )
+        : executeWorkflow(
+            createWorkflowDeps(),
+            adapter,
+            workerPlatformConvId,
+            run.working_path,
+            workflow,
+            run.user_message ?? '',
+            workerConv.id,
+            run.codebase_id ?? undefined,
+            undefined,
+            undefined,
+            parentConv.id
+          );
+    void execution
+      .then(result => {
+        if (result.success && 'summary' in result && result.summary) {
+          return adapter.sendMessage(platformConvId, result.summary, {
+            category: 'workflow_result',
+            segment: 'new',
+            workflowResult: {
+              workflowName: resolvedWorkflowName,
+              runId: run.id,
+            },
+          });
+        }
+        return undefined;
+      })
+      .catch(err => {
+        getLog().warn({ err: err as Error, runId: run.id }, events.executorFailed);
+      })
+      .finally(() => {
+        unsubscribeBridge();
+      });
+    getLog().info(
+      { runId: run.id, workflowName: resolvedWorkflowName, platformConvId, workerPlatformConvId },
+      events.executorStarted
+    );
+    return true;
+  } catch (err) {
+    getLog().warn({ err: err as Error, runId: run.id }, events.failed);
+    return false;
+  }
+}
+
+export type ApprovePausedWorkflowRunResult =
+  | { ok: true; kind: 'approved'; workflowName: string; autoResumed: boolean }
+  | { ok: true; kind: 'already_approved'; workflowName: string }
+  | { ok: false; status: 400 | 404 | 409; message: string };
+
+/**
+ * Approve a paused run used by POST /api/workflows/runs/:runId/approve and the
+ * consumer's approve. Preserves the idempotent already-approved path and the
+ * node_completed / approval_received event shape. `autoResume` is injected:
+ * the route AND the consumer both pass tryAutoResumeRun(run, 'approve') -- the
+ * real resume path. The run row's `failed` status written below is the
+ * hand-off to that resume, not an outcome.
+ */
+export async function approvePausedWorkflowRun(
+  runId: string,
+  opts: {
+    comment: string;
+    decisionVerb: 'approve_as_is' | 'approve_with_fix';
+    authorizedFixIds: string[];
+    autoResume: (run: WorkflowRun) => Promise<boolean>;
+    /**
+     * The gate node the approver reviewed (the cauldron-fire consumer passes
+     * it). When set, the paused -> failed hand-off is ONE conditional update on
+     * (run id, paused, this gate) BEFORE any approval event is written; a gate
+     * that changed meanwhile is refused 409 `gate_changed` with no events. The
+     * HTTP route does not pass it and keeps its original write order.
+     */
+    expectedNodeId?: string;
+  }
+): Promise<ApprovePausedWorkflowRunResult> {
+  const run = await workflowDb.getWorkflowRun(runId);
+  if (!run) {
+    getLog().info({ runId }, 'api.workflow_run_approve_not_found');
+    return { ok: false, status: 404, message: 'Workflow run not found' };
+  }
+  const priorResponse = run.metadata.approval_response as string | undefined;
+  if (run.status !== 'paused') {
+    if (priorResponse === 'approved') {
+      getLog().info(
+        { runId, status: run.status },
+        'api.workflow_run_approve_idempotent_already_approved'
+      );
+      return { ok: true, kind: 'already_approved', workflowName: run.workflow_name };
+    }
+    getLog().info({ runId, status: run.status }, 'api.workflow_run_approve_rejected_bad_status');
+    return { ok: false, status: 400, message: `Cannot approve workflow in '${run.status}' status` };
+  }
+  const comment = opts.comment;
+  const decisionVerb = opts.decisionVerb;
+  const authorizedFixIds = opts.authorizedFixIds;
+  const approval = run.metadata.approval as ApprovalContext | undefined;
+  if (!approval?.nodeId) {
+    getLog().warn({ runId }, 'api.workflow_run_approve_missing_context');
+    return {
+      ok: false,
+      status: 400,
+      message: 'Workflow run is paused but missing approval context',
+    };
+  }
+  const gateMetadataUpdate =
+    approval.type === 'interactive_loop'
+      ? { loop_user_input: opts.comment }
+      : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
+  const approvalEvents: { event_type: string; step_name: string; data: Record<string, unknown> }[] =
+    [];
+  if (approval.type !== 'interactive_loop') {
+    const nodeOutput =
+      approval.captureResponse === true
+        ? JSON.stringify({
+            decision_verb: decisionVerb,
+            authorized_fix_ids: authorizedFixIds,
+            comment,
+          })
+        : '';
+    approvalEvents.push({
+      event_type: 'node_completed',
+      step_name: approval.nodeId,
+      data: { node_output: nodeOutput, approval_decision: 'approved' },
+    });
+  }
+  approvalEvents.push({
+    event_type: 'approval_received',
+    step_name: approval.nodeId,
+    data: { decision: 'approved', comment },
+  });
+  if (opts.expectedNodeId !== undefined) {
+    // Consumer path: gate CAS + approval events in ONE transaction.
+    const gateHeld =
+      approval.nodeId === opts.expectedNodeId &&
+      (await workflowDb.approvePausedRunAtGate(
+        runId,
+        opts.expectedNodeId,
+        gateMetadataUpdate,
+        approvalEvents
+      ));
+    if (!gateHeld) {
+      getLog().info(
+        { runId, expected: opts.expectedNodeId },
+        'api.workflow_run_approve_gate_changed'
+      );
+      return { ok: false, status: 409, message: 'gate_changed' };
+    }
+  } else {
+    // HTTP route: original write order, unchanged.
+    for (const event of approvalEvents) {
+      await workflowEventDb.createWorkflowEvent({ workflow_run_id: runId, ...event });
+    }
+    await workflowDb.updateWorkflowRun(runId, {
+      status: 'failed',
+      metadata: gateMetadataUpdate,
+    });
+  }
+  const autoResumed = await opts.autoResume(run);
+  return { ok: true, kind: 'approved', workflowName: run.workflow_name, autoResumed };
+}
+
 /**
  * Register all /api/* routes on the Hono app.
  */
@@ -2566,13 +3377,19 @@ export function registerApiRoutes(
   canarySnapshotBuilder: typeof buildProductionCanarySnapshot = buildProductionCanarySnapshot,
   dispatchMailboxActorResolvedHook?: () => Promise<void>
 ): void {
+  registeredWebAdapter = webAdapter;
+  const dispatchPrincipalTransportCredentials = new WeakMap<Request, DispatchPrincipalCredential>();
+
+  // The readings route refs this component instead of validating with it.
+  app.openAPIRegistry.register('FuelglassReadingPushBody', fuelglassReadingPushBodySchema);
+
   function apiError(
     c: Context,
     // 429 is here for the expectation front door's per-registrant daily cap
     // (bdc-xo#2007). A cap breach is a rate refusal, not a malformed request:
     // reporting it as 400 would tell a caller to fix a body that is correct,
     // and as 403 would tell it to stop trying rather than to try later.
-    status: 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500 | 503,
+    status: 400 | 401 | 403 | 404 | 409 | 422 | 429 | 500 | 502 | 503,
     message: string,
     detail?: string
   ): Response {
@@ -2894,13 +3711,6 @@ export function registerApiRoutes(
     return [...nodes.values()].slice(0, 8);
   }
 
-  function workflowRunTaskClass(run: WorkflowRun): string | undefined {
-    const rawTaskClass = run.metadata.task_class ?? run.metadata.taskClass;
-    if (typeof rawTaskClass !== 'string') return undefined;
-    const taskClass = rawTaskClass.trim();
-    return taskClass.length > 0 ? taskClass : undefined;
-  }
-
   async function sanitizeWorkflowRunForPublic(run: WorkflowRun): Promise<{
     workflow_label: string;
     status: WorkflowRun['status'];
@@ -2927,14 +3737,94 @@ export function registerApiRoutes(
     };
   }
 
+  function dispatchPrincipalHeaderPresent(c: Context): boolean {
+    const headers = c.req.raw.headers;
+    return headers.has('x-dispatch-principal-id') || headers.has('x-dispatch-principal-token');
+  }
+
+  function isDispatchPrincipalTransportRoute(method: string, path: string): boolean {
+    if (path === '/api/dispatch/messages' && (method === 'GET' || method === 'POST')) return true;
+    return method === 'POST' && /^\/api\/dispatch\/messages\/[^/]+\/ack$/.test(path);
+  }
+
+  function principalTransportListRecipient(
+    c: Context,
+    credential: DispatchPrincipalCredential
+  ): { ok: true; recipient: string } | { ok: false; response: Response } {
+    if (!credential.roles.includes('receive')) {
+      return { ok: false, response: apiError(c, 403, 'dispatch_principal_forbidden') };
+    }
+    let params: URLSearchParams;
+    try {
+      params = new URL(c.req.url, 'http://127.0.0.1').searchParams;
+    } catch {
+      return { ok: false, response: apiError(c, 403, 'dispatch_principal_forbidden') };
+    }
+    const recipient = canonicalDispatchListRecipient(params);
+    if (recipient === null || !credential.receive_as.includes(recipient)) {
+      return { ok: false, response: apiError(c, 403, 'dispatch_principal_forbidden') };
+    }
+    return { ok: true, recipient };
+  }
+
   app.use('/api/*', cors({ origin: process.env.WEB_UI_ORIGIN || '*' }));
 
   app.use('/api/*', async (c, next) => {
-    if (c.req.method === 'OPTIONS' || operatorAuthDisabled() || isPublicApiPath(c.req.path)) {
+    if (c.req.method === 'OPTIONS' || isPublicApiPath(c.req.path)) {
       return next();
     }
 
-    if (!privateApiRequiresOperatorToken()) {
+    // The server's own in-process caller (createInProcessApiFetch). Unforgeable
+    // from the network: only in-process code can add a Request to this set.
+    if (isInProcessServiceRequest(c.req.raw)) {
+      return next();
+    }
+
+    // Strict principal classification applies only when the request does not
+    // present the configured operator token. An exact ARCHON_OPERATOR_TOKEN
+    // match stays on the operator path even if ARCHON_OPERATOR_AUTH_DISABLED
+    // is set or operator-token enforcement is off, including when principal
+    // headers are also present. Absent that exact token, classify every
+    // principal-header request before the operator-auth bypasses so disabled
+    // auth and an unconfigured operator token cannot let empty, partial, or
+    // otherwise malformed principal headers reach legacy handlers. Any
+    // principal header, even empty, is classified before the Access-header
+    // predicate so matching Host and Access-email headers cannot promote
+    // that request.
+    const authDisabled = operatorAuthDisabled();
+    const tokenRequired = privateApiRequiresOperatorToken();
+    const expectedToken = process.env.ARCHON_OPERATOR_TOKEN;
+    if (expectedToken && getPresentedOperatorToken(c) === expectedToken) {
+      return next();
+    }
+
+    if (dispatchPrincipalHeaderPresent(c)) {
+      if (!isDispatchPrincipalTransportRoute(c.req.method, c.req.path)) {
+        return apiError(c, 403, 'dispatch_principal_forbidden');
+      }
+      try {
+        const credential = authenticateDispatchPrincipal({
+          principal_id: c.req.header('x-dispatch-principal-id'),
+          token: c.req.header('x-dispatch-principal-token'),
+          require_send_role: false,
+        });
+        dispatchPrincipalTransportCredentials.set(c.req.raw, credential);
+      } catch (error) {
+        const mapped = mapDispatchPrincipalAuthError(c, error);
+        if (mapped) return mapped;
+        return apiError(c, 401, 'dispatch_principal_unauthorized');
+      }
+      if (c.req.method === 'GET' && c.req.path === '/api/dispatch/messages') {
+        const credential = dispatchPrincipalTransportCredentials.get(c.req.raw);
+        if (credential) {
+          const listed = principalTransportListRecipient(c, credential);
+          if (!listed.ok) return listed.response;
+        }
+      }
+      return next();
+    }
+
+    if (authDisabled || !tokenRequired) {
       return next();
     }
 
@@ -2942,7 +3832,6 @@ export function registerApiRoutes(
       return next();
     }
 
-    const expectedToken = process.env.ARCHON_OPERATOR_TOKEN;
     if (!expectedToken) {
       return apiError(
         c,
@@ -3184,9 +4073,14 @@ export function registerApiRoutes(
     }
     if (!cwd) cwd = getArchonWorkspacesPath();
 
+    // Reset a managed source clone to origin BEFORE discovery, under one lock held across
+    // the reset and the read; discovering first read the lane from the previous sync
+    // (run 8849e767, WO-HARNESS-A2-ENGAGES-ALL-REPOS-01).
     let workflows: WorkflowDefinition[];
     try {
-      const discovery = await discoverWorkflowsWithConfig(cwd, loadConfig);
+      const discovery = await withSyncedManagedSource(cwd, cwd, () =>
+        discoverWorkflowsWithConfig(cwd, loadConfig)
+      );
       workflows = discovery.workflows.map(ws => ws.workflow);
     } catch (error) {
       getLog().warn({ err: error, cwd, workflowName }, 'dispatch_precheck_discovery_failed');
@@ -3328,207 +4222,6 @@ export function registerApiRoutes(
     return { accepted: true, status: result.status };
   }
 
-  /**
-   * Re-enter the workflow executor directly after a paused approval gate is
-   * resolved, so a web-dispatched workflow continues (approve) or runs its
-   * on_reject prompt (reject) without the user having to re-run the workflow
-   * command. The CLI's `workflowApproveCommand` / `workflowRejectCommand`
-   * already auto-resume via `workflowRunCommand({ resume: true })`; this is the
-   * web-side equivalent without going back through the natural-language
-   * orchestrator.
-   *
-   * Returns `true` when a resume dispatch was initiated, `false` otherwise (no
-   * worker conversation on the run, parent conversation deleted, parent was on
-   * a non-web platform, workflow definition missing, or executor launch threw).
-   * Failures are non-fatal: the gate
-   * decision is recorded regardless; when this returns `false` the response
-   * text instructs the user to re-run the workflow command.
-   *
-   * **Cross-adapter guard**: only web-sourced parents qualify.
-   * `dispatchToOrchestrator` is wired to the web adapter + its lock manager,
-   * so a Slack / Telegram / GitHub / Discord run being approved from the
-   * dashboard must not route through it -- the Slack thread would never see
-   * the resumed output. Non-web parents skip auto-resume and the originating
-   * platform's own re-run flow applies.
-   */
-  async function tryAutoResumeRun(
-    run: WorkflowRun,
-    action: 'approve' | 'reject' | 'provider_wait'
-  ): Promise<boolean> {
-    if (!run.parent_conversation_id) return false;
-    if (!run.conversation_id || !run.working_path) return false;
-    // Literal event names per action -- greppable for ops tooling. Keeping the
-    // branch explicit rather than templating avoids the earlier 3-segment
-    // `api.workflow_*.dispatched` shape that broke `{domain}.{action}_{state}`.
-    const events =
-      action === 'approve'
-        ? {
-            dispatched: 'api.workflow_approve_auto_resume_dispatched' as const,
-            skippedNoPlatformConv:
-              'api.workflow_approve_auto_resume_skipped_no_platform_conv' as const,
-            skippedNonWebParent: 'api.workflow_approve_auto_resume_skipped_non_web_parent' as const,
-            failed: 'api.workflow_approve_auto_resume_failed' as const,
-            missingWorker: 'api.workflow_approve_auto_resume_skipped_no_worker_conv' as const,
-            missingWorkflow: 'api.workflow_approve_auto_resume_skipped_missing_workflow' as const,
-            executorStarted: 'api.workflow_approve_direct_resume_started' as const,
-            executorFailed: 'api.workflow_approve_direct_resume_failed' as const,
-          }
-        : action === 'reject'
-          ? {
-              dispatched: 'api.workflow_reject_auto_resume_dispatched' as const,
-              skippedNoPlatformConv:
-                'api.workflow_reject_auto_resume_skipped_no_platform_conv' as const,
-              skippedNonWebParent:
-                'api.workflow_reject_auto_resume_skipped_non_web_parent' as const,
-              failed: 'api.workflow_reject_auto_resume_failed' as const,
-              missingWorker: 'api.workflow_reject_auto_resume_skipped_no_worker_conv' as const,
-              missingWorkflow: 'api.workflow_reject_auto_resume_skipped_missing_workflow' as const,
-              executorStarted: 'api.workflow_reject_direct_resume_started' as const,
-              executorFailed: 'api.workflow_reject_direct_resume_failed' as const,
-            }
-          : {
-              dispatched: 'api.provider_wait_auto_resume_dispatched' as const,
-              skippedNoPlatformConv:
-                'api.provider_wait_auto_resume_skipped_no_platform_conv' as const,
-              skippedNonWebParent: 'api.provider_wait_auto_resume_skipped_non_web_parent' as const,
-              failed: 'api.provider_wait_auto_resume_failed' as const,
-              missingWorker: 'api.provider_wait_auto_resume_skipped_no_worker_conv' as const,
-              missingWorkflow: 'api.provider_wait_auto_resume_skipped_missing_workflow' as const,
-              executorStarted: 'api.provider_wait_direct_resume_started' as const,
-              executorFailed: 'api.provider_wait_direct_resume_failed' as const,
-            };
-    try {
-      const parentConv = await conversationDb.getConversationById(run.parent_conversation_id);
-      const workerConv = await conversationDb.getConversationById(run.conversation_id);
-      const platformConvId = parentConv?.platform_conversation_id;
-      if (!platformConvId) {
-        // parentConv === null is a data-integrity signal (the parent
-        // conversation was deleted while the run was paused) -- worth
-        // surfacing at info level so operators notice. Missing
-        // platform_conversation_id on an existing row shouldn't happen and
-        // stays at debug.
-        const logFn =
-          parentConv === null ? getLog().info.bind(getLog()) : getLog().debug.bind(getLog());
-        logFn(
-          {
-            runId: run.id,
-            parentConversationId: run.parent_conversation_id,
-            parentDeleted: parentConv === null,
-          },
-          events.skippedNoPlatformConv
-        );
-        return false;
-      }
-      if (parentConv.platform_type !== 'web') {
-        getLog().debug(
-          {
-            runId: run.id,
-            parentConversationId: run.parent_conversation_id,
-            platformType: parentConv.platform_type,
-          },
-          events.skippedNonWebParent
-        );
-        return false;
-      }
-      const workerPlatformConvId = workerConv?.platform_conversation_id;
-      if (!workerConv || !workerPlatformConvId || workerConv.platform_type !== 'web') {
-        getLog().warn(
-          {
-            runId: run.id,
-            workerConversationId: run.conversation_id,
-            workerPlatformType: workerConv?.platform_type,
-          },
-          events.missingWorker
-        );
-        return false;
-      }
-
-      const resolvedWorkflowName =
-        (await resolveWebLane({
-          workflowName: run.workflow_name.trim() || undefined,
-          task_class: workflowRunTaskClass(run),
-          routerYamlPath: join(run.working_path, 'config', 'router.yaml'),
-        })) ?? run.workflow_name;
-
-      const discovery = await discoverWorkflowsWithConfig(run.working_path, loadConfig);
-      const workflow = discovery.workflows.find(
-        item => item.workflow.name === resolvedWorkflowName
-      )?.workflow;
-      if (!workflow) {
-        getLog().warn(
-          {
-            runId: run.id,
-            workflowName: resolvedWorkflowName,
-            workingPath: run.working_path,
-            loaderErrors: discovery.errors,
-          },
-          events.missingWorkflow
-        );
-        return false;
-      }
-
-      webAdapter.setConversationDbId(workerPlatformConvId, workerConv.id);
-      const unsubscribeBridge = webAdapter.setupEventBridge(workerPlatformConvId, platformConvId);
-      const execution =
-        action === 'provider_wait'
-          ? executeWorkflow(
-              createWorkflowDeps(),
-              webAdapter,
-              workerPlatformConvId,
-              run.working_path,
-              workflow,
-              run.user_message ?? '',
-              workerConv.id,
-              run.codebase_id ?? undefined,
-              undefined,
-              undefined,
-              parentConv.id,
-              run
-            )
-          : executeWorkflow(
-              createWorkflowDeps(),
-              webAdapter,
-              workerPlatformConvId,
-              run.working_path,
-              workflow,
-              run.user_message ?? '',
-              workerConv.id,
-              run.codebase_id ?? undefined,
-              undefined,
-              undefined,
-              parentConv.id
-            );
-      void execution
-        .then(result => {
-          if (result.success && 'summary' in result && result.summary) {
-            return webAdapter.sendMessage(platformConvId, result.summary, {
-              category: 'workflow_result',
-              segment: 'new',
-              workflowResult: {
-                workflowName: resolvedWorkflowName,
-                runId: run.id,
-              },
-            });
-          }
-          return undefined;
-        })
-        .catch(err => {
-          getLog().warn({ err: err as Error, runId: run.id }, events.executorFailed);
-        })
-        .finally(() => {
-          unsubscribeBridge();
-        });
-      getLog().info(
-        { runId: run.id, workflowName: resolvedWorkflowName, platformConvId, workerPlatformConvId },
-        events.executorStarted
-      );
-      return true;
-    } catch (err) {
-      getLog().warn({ err: err as Error, runId: run.id }, events.failed);
-      return false;
-    }
-  }
-
   if (process.env.NODE_ENV !== 'test' && providerWaitSchedulerTimer === undefined) {
     const schedulerStore = createWorkflowDeps().store;
     const schedulerOwnerId = `provider-wait:${randomUUID()}`;
@@ -3565,6 +4258,33 @@ export function registerApiRoutes(
     providerWaitSchedulerTimer = setInterval(() => void tick(), intervalMs);
     providerWaitSchedulerTimer.unref?.();
     void tick();
+  }
+
+  // Terminal-run lease sweep (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01, N5): release
+  // leases left on terminal runs whose worktree scan is clear. Default every
+  // 10 minutes; ARCHON_TERMINAL_LEASE_SWEEP_MS overrides, 0 disables.
+  if (process.env.NODE_ENV !== 'test' && terminalLeaseSweepTimer === undefined) {
+    const sweepStore = createWorkflowDeps().store;
+    const configuredSweep = Number.parseInt(process.env.ARCHON_TERMINAL_LEASE_SWEEP_MS ?? '', 10);
+    const sweepMs =
+      Number.isInteger(configuredSweep) && configuredSweep >= 0 ? configuredSweep : 600_000;
+    if (sweepMs > 0) {
+      let sweepInFlight = false;
+      const sweep = async (): Promise<void> => {
+        if (sweepInFlight) return;
+        sweepInFlight = true;
+        try {
+          await releaseTerminalRunLeasesSweep(sweepStore);
+        } catch (error) {
+          getLog().error({ err: error as Error }, 'api.terminal_lease_sweep_failed');
+        } finally {
+          sweepInFlight = false;
+        }
+      };
+      terminalLeaseSweepTimer = setInterval(() => void sweep(), sweepMs);
+      terminalLeaseSweepTimer.unref?.();
+      void sweep();
+    }
   }
 
   // Taskmaster Slice 1 loop (WO-HARNESS-TASKMASTER-SLICE1-01, M-133).
@@ -4303,6 +5023,29 @@ export function registerApiRoutes(
         return apiError(c, 400, assessment.reason ?? 'dispatch_message_body_rejected');
       }
       const canonicalBody = { ...body, recipient: body.recipient.trim().toLowerCase() };
+      const principalCredential = dispatchPrincipalTransportCredentials.get(c.req.raw);
+      if (principalCredential) {
+        if (canonicalBody.task_type !== 'agent_message' || canonicalBody.recipient === 'board') {
+          return apiError(c, 403, 'dispatch_principal_forbidden');
+        }
+        const capability = DispatchNonSystemCapability.fromAuthenticatedRequest({
+          principal_id: c.req.header('x-dispatch-principal-id'),
+          token: c.req.header('x-dispatch-principal-token'),
+          requested_sender: canonicalBody.sender,
+        });
+        const message = await dispatchDb.createAuthenticatedMessage(capability, {
+          correlation_id: canonicalBody.correlation_id,
+          idempotency_key: canonicalBody.idempotency_key,
+          task_type: canonicalBody.task_type,
+          recipient: canonicalBody.recipient,
+          body: canonicalBody.body,
+          not_before: canonicalBody.not_before ?? null,
+          priority: canonicalBody.priority,
+          subject_key: canonicalBody.subject_key,
+          repeat_reason: canonicalBody.repeat_reason,
+        });
+        return c.json(message);
+      }
       if (canonicalBody.task_type === 'board_motion') {
         const { capability, principal } = await DispatchNonSystemCapability.fromBoardProof({
           proof: boardPrincipalProofFromHeaders(c),
@@ -4415,6 +5158,56 @@ export function registerApiRoutes(
   });
 
   registerOpenApiRoute(listDispatchMessagesRoute, async c => {
+    const principalCredential = dispatchPrincipalTransportCredentials.get(c.req.raw);
+    if (principalCredential) {
+      const listed = principalTransportListRecipient(c, principalCredential);
+      if (!listed.ok) return listed.response;
+      const selection = parseDispatchListSelection(c.req.url);
+      if (selection.kind === 'invalid') {
+        return apiError(c, 400, 'dispatch_list_selector_invalid');
+      }
+      try {
+        if (selection.kind === 'legacy') {
+          const rawLimit = Number.parseInt(c.req.query('limit') ?? '100', 10);
+          const messages = await dispatchDb.listMessages({
+            recipient: listed.recipient,
+            status: c.req.query('status') as dispatchDb.DispatchMessageStatus | undefined,
+            subject_key: c.req.query('subject_key') ?? undefined,
+            route_disposition: c.req.query('route_disposition') as
+              | dispatchDb.DispatchRouteDisposition
+              | undefined,
+            limit: Number.isFinite(rawLimit) ? rawLimit : 100,
+            allowBoardAlias: false,
+          });
+          return c.json(messages);
+        }
+        if (selection.recipient !== listed.recipient) {
+          return apiError(c, 403, 'dispatch_principal_forbidden');
+        }
+        return c.json(await loadSelectedDispatchMessages(selection));
+      } catch (error) {
+        if (error instanceof Error && error.message === 'dispatch_not_before_unparseable') {
+          return apiError(c, 500, 'dispatch_not_before_unparseable');
+        }
+        getLog().error({ err: error }, 'dispatch_list_messages_failed');
+        return apiError(c, 500, 'Failed to list dispatch messages');
+      }
+    }
+    const selection = parseDispatchListSelection(c.req.url);
+    if (selection.kind === 'invalid') {
+      return apiError(c, 400, 'dispatch_list_selector_invalid');
+    }
+    if (selection.kind !== 'legacy') {
+      try {
+        return c.json(await loadSelectedDispatchMessages(selection));
+      } catch (error) {
+        if (error instanceof Error && error.message === 'dispatch_not_before_unparseable') {
+          return apiError(c, 500, 'dispatch_not_before_unparseable');
+        }
+        getLog().error({ err: error }, 'dispatch_list_messages_failed');
+        return apiError(c, 500, 'Failed to list dispatch messages');
+      }
+    }
     try {
       const rawLimit = Number.parseInt(c.req.query('limit') ?? '100', 10);
       const messages = await dispatchDb.listMessages({
@@ -4487,6 +5280,10 @@ export function registerApiRoutes(
   registerOpenApiRoute(acknowledgeDispatchMessageRoute, async c => {
     try {
       const body = getValidatedBody(c, dispatchMailboxPrincipalBodySchema);
+      const principalCredential = dispatchPrincipalTransportCredentials.get(c.req.raw);
+      if (principalCredential && !principalCredential.roles.includes('receive')) {
+        return apiError(c, 403, 'dispatch_principal_forbidden');
+      }
       const { actor, bind } = await resolveDispatchMailboxActor(c);
       if (
         body.principal_id !== undefined &&
@@ -4494,9 +5291,30 @@ export function registerApiRoutes(
         body.principal_id !== bind?.holder_principal_id
       )
         return apiError(c, 409, 'actor_mismatch');
+      // A principal credential acks AS the mailbox it is allowed to receive for
+      // (receive_as), which may differ from its own principal_id (t3-bridge
+      // receives for t3-desktop). The authenticated principal is recorded as
+      // the acting principal (acknowledged_by). Non-credential callers keep
+      // acking strictly as their resolved actor.
+      let mailboxPrincipal = actor;
+      let actingPrincipal: string | undefined;
+      if (principalCredential) {
+        const existing = await dispatchDb.getMessage(c.req.param('id') ?? '');
+        if (existing) {
+          const mailboxRecipient = (existing.resolved_recipient ?? existing.recipient)
+            .trim()
+            .toLowerCase();
+          if (!principalCredential.receive_as.includes(mailboxRecipient)) {
+            return apiError(c, 403, 'dispatch_principal_forbidden');
+          }
+          mailboxPrincipal = mailboxRecipient;
+          actingPrincipal = actor;
+        }
+      }
       const result = await dispatchDb.acknowledgeMessage({
         id: c.req.param('id') ?? '',
-        principal_id: actor,
+        principal_id: mailboxPrincipal,
+        ...(actingPrincipal !== undefined ? { acting_principal_id: actingPrincipal } : {}),
         bind,
       });
       if (!result.ok) {
@@ -4715,6 +5533,49 @@ export function registerApiRoutes(
     } catch (error) {
       getLog().error({ err: error }, 'dispatch_status_failed');
       return apiError(c, 500, 'Failed to get dispatch status');
+    }
+  });
+
+  registerOpenApiRoute(getDispatchPrincipalsRoute, async c => {
+    try {
+      const rawRegistry = process.env.DISPATCH_PRINCIPALS_JSON;
+      let records: { principal_id: string; receive_as: readonly string[] }[] = [];
+      if (rawRegistry !== undefined && rawRegistry !== '') {
+        try {
+          records = parseDispatchPrincipalsRegistry(rawRegistry).map(record => ({
+            principal_id: record.principal_id,
+            receive_as: record.receive_as,
+          }));
+        } catch (error) {
+          const authMapped = mapDispatchPrincipalAuthError(c, error);
+          if (authMapped) return authMapped;
+          getLog().error({ err: error }, 'dispatch_principals_registry_invalid');
+          return apiError(c, 500, 'dispatch_principal_config_invalid');
+        }
+      }
+      const rows = await dispatchDb.listDispatchPrincipals();
+      const principals = rows.map(row => {
+        const credentialConfigured = records.some(
+          record =>
+            record.principal_id === row.principal_id || record.receive_as.includes(row.principal_id)
+        );
+        return {
+          principal_id: row.principal_id,
+          display_name: row.display_name,
+          delivery_mode: row.delivery_mode,
+          active: row.active,
+          credential_configured: credentialConfigured,
+          ack_path: dispatchPrincipalAckPath(
+            row.principal_id,
+            row.delivery_mode,
+            credentialConfigured
+          ),
+        };
+      });
+      return c.json({ principals });
+    } catch (error) {
+      getLog().error({ err: error }, 'dispatch_principals_failed');
+      return apiError(c, 500, 'Failed to list dispatch principals');
     }
   });
 
@@ -5593,7 +6454,7 @@ export function registerApiRoutes(
               commands = {};
             }
           }
-          return { ...cb, commands };
+          return { ...cb, commands, project_record: readProjectRecord(cb) };
         })
       );
     } catch (error) {
@@ -5618,7 +6479,7 @@ export function registerApiRoutes(
           commands = {};
         }
       }
-      return c.json({ ...codebase, commands });
+      return c.json({ ...codebase, commands, project_record: readProjectRecord(codebase) });
     } catch (error) {
       getLog().error({ err: error }, 'get_codebase_failed');
       return apiError(c, 500, 'Failed to get codebase');
@@ -5641,7 +6502,10 @@ export function registerApiRoutes(
         return apiError(c, 500, 'Codebase created but not found');
       }
 
-      return c.json(codebase, result.alreadyExisted ? 200 : 201);
+      return c.json(
+        { ...codebase, project_record: readProjectRecord(codebase) },
+        result.alreadyExisted ? 200 : 201
+      );
     } catch (error) {
       getLog().error({ err: error }, 'add_codebase_failed');
       return apiError(
@@ -5649,6 +6513,109 @@ export function registerApiRoutes(
         500,
         `Failed to add codebase: ${(error as Error).message ?? 'unknown error'}`
       );
+    }
+  });
+
+  // PATCH /api/codebases/:id - Edit registration metadata
+  registerOpenApiRoute(updateCodebaseRoute, async c => {
+    const id = c.req.param('id') ?? '';
+    const body = getValidatedBody(c, updateCodebaseBodySchema);
+
+    try {
+      const codebase = await codebaseDb.getCodebase(id);
+      if (!codebase) {
+        return apiError(c, 404, 'Codebase not found');
+      }
+
+      if (typeof body.repository_url === 'string') {
+        let repositoryUrl: URL;
+        try {
+          repositoryUrl = new URL(body.repository_url);
+        } catch {
+          return apiError(c, 400, 'repository_url_invalid');
+        }
+        if (repositoryUrl.username || repositoryUrl.password) {
+          return apiError(c, 400, 'repository_url_contains_credential');
+        }
+      }
+
+      if (body.default_branch !== undefined) {
+        const effectiveRepositoryUrl = Object.prototype.hasOwnProperty.call(body, 'repository_url')
+          ? body.repository_url
+          : codebase.repository_url;
+        if (!effectiveRepositoryUrl) {
+          return apiError(c, 409, 'repository_url_not_github');
+        }
+
+        const repoParts = normalizeRepo(effectiveRepositoryUrl).split('/');
+        if (repoParts.length !== 2 || repoParts.some(part => part.length === 0)) {
+          return apiError(c, 409, 'repository_url_not_github');
+        }
+
+        const [owner, repo] = repoParts;
+        const url = `https://api.github.com/repos/${encodeURIComponent(owner ?? '')}/${encodeURIComponent(repo ?? '')}/branches/${encodeURIComponent(body.default_branch)}`;
+        const verificationUnavailable = (): Response =>
+          apiError(c, 502, 'branch_verification_unavailable');
+        let verificationResponse: Response;
+        try {
+          verificationResponse = await serviceGitHubFetchWithPermissionFallback({
+            service: 'smart_cauldron',
+            url,
+          });
+        } catch {
+          return verificationUnavailable();
+        }
+        if (verificationResponse.status === 404) {
+          return apiError(c, 422, 'branch_not_found_on_remote');
+        }
+        if (!verificationResponse.ok) {
+          return verificationUnavailable();
+        }
+      }
+
+      await codebaseDb.updateCodebase(id, {
+        ...body,
+        project_record:
+          body.project_record === undefined
+            ? undefined
+            : body.project_record === null
+              ? null
+              : JSON.stringify(body.project_record),
+      });
+      const updated = await codebaseDb.getCodebase(id);
+      if (!updated) {
+        return apiError(c, 500, 'Codebase updated but not found');
+      }
+
+      let commands = updated.commands;
+      if (typeof commands === 'string') {
+        try {
+          commands = JSON.parse(commands);
+        } catch (parseErr) {
+          getLog().error({ err: parseErr, codebaseId: updated.id }, 'corrupted_commands_json');
+          commands = {};
+        }
+      }
+
+      const changes: Record<string, { from: unknown; to: unknown }> = {};
+      for (const field of ['name', 'default_branch', 'default_cwd', 'repository_url'] as const) {
+        if (!Object.prototype.hasOwnProperty.call(body, field)) continue;
+        const from = codebase[field];
+        const to = body[field];
+        changes[field] =
+          field === 'repository_url'
+            ? {
+                from: typeof from === 'string' ? sanitizeCredentials(from) : from,
+                to: typeof to === 'string' ? sanitizeCredentials(to) : to,
+              }
+            : { from, to };
+      }
+      getLog().info({ codebaseId: id, changes }, 'codebase_updated');
+
+      return c.json({ ...updated, commands, project_record: readProjectRecord(updated) });
+    } catch (error) {
+      getLog().error({ err: error, codebaseId: id }, 'update_codebase_failed');
+      return apiError(c, 500, 'Failed to update codebase');
     }
   });
 
@@ -6146,37 +7113,15 @@ export function registerApiRoutes(
   registerOpenApiRoute(cancelWorkflowRunRoute, async c => {
     try {
       const runId = c.req.param('runId') ?? '';
-      const run = await workflowDb.getWorkflowRun(runId);
-      if (!run) {
-        return apiError(c, 404, 'Workflow run not found');
-      }
-      if (run.status === 'cancelled') {
-        return apiError(c, 409, 'Workflow run is already cancelled');
-      }
-      if (run.status === 'completed' || run.status === 'failed') {
-        return apiError(c, 422, `Cannot cancel workflow in '${run.status}' status`);
-      }
-      if (run.status !== 'running' && run.status !== 'pending' && run.status !== 'paused') {
-        return apiError(c, 400, `Cannot cancel workflow in '${run.status}' status`);
-      }
       const body = (await c.req.json().catch(() => ({}))) as { reason?: string };
-      const reason = body.reason ?? '';
-      await workflowDb.cancelWorkflowRun(runId);
-      void workflowEventDb.createWorkflowEvent({
-        workflow_run_id: runId,
-        event_type: 'run_cancelled',
-        data: { reason, actor: 'api' },
-      });
-      const updated = await workflowDb.getWorkflowRun(runId);
-      const updatedRun = updated ?? {
-        ...run,
-        status: 'cancelled' as const,
-        completed_at: new Date().toISOString(),
-      };
+      const result = await cancelWorkflowRunAsActor(runId, { reason: body.reason, actor: 'api' });
+      if (!result.ok) {
+        return apiError(c, result.status, result.message);
+      }
       return c.json({
         success: true,
-        message: `Cancelled workflow: ${run.workflow_name}`,
-        run: updatedRun,
+        message: `Cancelled workflow: ${result.run.workflow_name}`,
+        run: result.run,
       });
     } catch (error) {
       getLog().error({ err: error }, 'cancel_workflow_run_api_failed');
@@ -6259,6 +7204,21 @@ export function registerApiRoutes(
           alreadyResolved: true,
         });
       }
+      // Scoped out (WO-HARNESS-T3-FRONTIER-RESUME-TRANSPORT-01, bdc-xo issue 4410):
+      // a cascade fired by the T3 consumer runs over the in-process transport
+      // (apiBaseUrl = the in-process origin), which this resume path cannot carry
+      // yet. Refuse explicitly instead of firing against the synthetic host: no
+      // dispatch, the approval rolls back, and the WO claim stays retained.
+      if (record.frontierApproval.apiBaseUrl === IN_PROCESS_API_ORIGIN) {
+        await releaseFrontierClaim(cascadeId);
+        getLog().warn({ cascadeId, woId: record.woId }, 'frontier_approval_t3_resume_unsupported');
+        return apiError(
+          c,
+          409,
+          't3_frontier_resume_unsupported: resuming a T3-fired cascade is scoped to ' +
+            'WO-HARNESS-T3-FRONTIER-RESUME-TRANSPORT-01 (bdc-xo issue 4410); the approval was rolled back.'
+        );
+      }
       const token =
         c.req.header('x-archon-operator-token') ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
       // Resume in the background; return once the resumed record is durable so
@@ -6271,6 +7231,15 @@ export function registerApiRoutes(
       const resumePromise = resumeFrontierTier(record, {
         token,
         onAdmission: r => resolveAdmission?.(r),
+        // WO-HARNESS-T3-COMMAND-CONSUMER-01: the resumed cascade holds the shared
+        // database WO claim, taken over from the paused cascade BEFORE dispatch.
+        deps: { ...cascadeWoClaimDeps('frontier-resume') },
+        beforeDispatch: async input =>
+          takeOverWoClaimForResume({
+            ...input,
+            holder: 'frontier-resume',
+            now: new Date().toISOString(),
+          }),
       });
       void resumePromise.catch((error: unknown) => {
         getLog().error(
@@ -6279,7 +7248,22 @@ export function registerApiRoutes(
         );
       });
       // Race so a synchronous resume failure surfaces as 500 instead of hanging.
-      const admitted = await Promise.race([admission, resumePromise]);
+      let admitted: Awaited<ReturnType<typeof resumeFrontierTier>>;
+      try {
+        admitted = await Promise.race([admission, resumePromise]);
+      } catch (error) {
+        if ((error as Error | null)?.name !== 'FrontierResumeClaimError') throw error;
+        // Another cascade holds the WO claim: nothing fired. Roll the approval
+        // back so the operator can retry once it clears.
+        await releaseFrontierClaim(cascadeId);
+        getLog().warn({ cascadeId, woId: record.woId }, 'frontier_approval_resume_claim_held');
+        return apiError(
+          c,
+          409,
+          `Frontier resume for ${record.woId} could not take over the WO claim: another cascade holds it. ` +
+            'The approval was rolled back -- retry once it clears.'
+        );
+      }
       // A 'blocked' admission means the resumed cascade refused to fire because a
       // duplicate live cascade already holds the WO lock (smart-cauldron
       // acquireWoLock): nothing fired, no premium usage was spent, and the paused
@@ -6466,6 +7450,87 @@ export function registerApiRoutes(
     }
   });
 
+  // Rejected reading bodies are never logged or echoed. Credential checks run
+  // on the raw JSON before the strict schema so the code names the real problem.
+  registerOpenApiRoute(postFuelglassReadingRoute, async c => {
+    let raw: unknown;
+    try {
+      raw = await c.req.json();
+    } catch {
+      return apiError(c, 400, 'invalid_json');
+    }
+    if (hasCredentialKey(raw)) return apiError(c, 400, 'credential_field_rejected');
+    if (hasCredentialValue(raw)) return apiError(c, 400, 'credential_value_rejected');
+    if (!isPlainRecord(raw) || Object.keys(raw).some(key => !PUSHED_READING_KEYS.has(key))) {
+      return apiError(c, 400, 'unknown_field');
+    }
+    const parsed = fuelglassReadingPushBodySchema.safeParse(raw);
+    if (!parsed.success) return apiError(c, 400, 'invalid_reading');
+    const body = parsed.data;
+    if (body.seat !== 'cursor') return apiError(c, 400, 'seat_not_pushable');
+    if (!percentInRange(body.used_percent) || !percentInRange(body.remaining_percent)) {
+      return apiError(c, 400, 'percent_out_of_range');
+    }
+    if (Math.abs(body.remaining_percent - (100 - body.used_percent)) > 0.01) {
+      return apiError(c, 400, 'percent_mismatch');
+    }
+    const resetsMs = Date.parse(body.resets_at);
+    const observedMs = Date.parse(body.observed_at);
+    if (!Number.isFinite(resetsMs) || !Number.isFinite(observedMs)) {
+      return apiError(c, 400, 'timestamp_unparseable');
+    }
+    if (observedMs - Date.now() > OBSERVED_AT_FUTURE_MS) {
+      return apiError(c, 400, 'observed_at_in_future');
+    }
+    try {
+      await upsertSeatUsageReading({
+        seat: body.seat,
+        used_percent: body.used_percent,
+        remaining_percent: body.remaining_percent,
+        resets_at: body.resets_at,
+        observed_at: body.observed_at,
+        source: body.source,
+      });
+      const stored = await getLatestSeatUsageReading('cursor');
+      if (!stored) return apiError(c, 500, 'Failed to store seat reading');
+      invalidateSeatUsageCache('cursor');
+      return c.json({ success: true, reading: pushedReadingView(stored) });
+    } catch (error) {
+      getLog().error({ err: error }, 'fuelglass_reading_push_failed');
+      return apiError(c, 500, 'Failed to store seat reading');
+    }
+  });
+
+  registerOpenApiRoute(getFuelglassReadingRoute, async c => {
+    try {
+      const maxAgeMinutes = resolvePushedReadingMaxAgeMinutes();
+      const row = await getLatestSeatUsageReading('cursor');
+      if (!row) {
+        return c.json({
+          success: true,
+          reading: null,
+          fresh: false,
+          age_seconds: null,
+          max_age_minutes: maxAgeMinutes,
+        });
+      }
+      const observedMs = Date.parse(row.observed_at);
+      const ageMs = Date.now() - observedMs;
+      const fresh = Number.isFinite(observedMs) && ageMs <= maxAgeMinutes * 60_000;
+      const ageSeconds = Number.isFinite(observedMs) ? Math.floor(ageMs / 1000) : null;
+      return c.json({
+        success: true,
+        reading: pushedReadingView(row),
+        fresh,
+        age_seconds: ageSeconds,
+        max_age_minutes: maxAgeMinutes,
+      });
+    } catch (error) {
+      getLog().error({ err: error }, 'fuelglass_reading_get_failed');
+      return apiError(c, 500, 'Failed to read seat reading');
+    }
+  });
+
   registerOpenApiRoute(getAdminDrainRoute, async c => {
     try {
       const state = await workflowDb.getCauldronDrainState();
@@ -6583,108 +7648,35 @@ export function registerApiRoutes(
   registerOpenApiRoute(approveWorkflowRunRoute, async c => {
     const runId = c.req.param('runId') ?? '';
     try {
-      const run = await workflowDb.getWorkflowRun(runId);
-      if (!run) {
-        // WO-MC-APPROVE-GATE-RELIABILITY-01: log early-returns. The 2026-06-09
-        // onramp incident left an 8-minute gap with no server-side trace of the
-        // first click. Logging here turns "did the click arrive?" from a guess
-        // into a fact in the archon logs.
-        getLog().info({ runId }, 'api.workflow_run_approve_not_found');
-        return apiError(c, 404, 'Workflow run not found');
-      }
-      // WO-MC-APPROVE-GATE-RELIABILITY-01: idempotency. Users re-click Approve
-      // when the UI looks stuck. Once the gate is approved the route flips the
-      // run to the 'failed' auto-resume sentinel and sets
-      // metadata.approval_response='approved'. A second click then hit the
-      // status!=='paused' guard and got a confusing 400 -- indistinguishable
-      // from a real failure. Recognize the already-approved state and report
-      // success without writing a duplicate approval_received or re-mutating
-      // the run. Only standard approvals carry approval_response; interactive
-      // loops do not, so they fall through to the normal paused-only path.
-      const priorResponse = run.metadata.approval_response as string | undefined;
-      if (run.status !== 'paused') {
-        if (priorResponse === 'approved') {
-          getLog().info(
-            { runId, status: run.status },
-            'api.workflow_run_approve_idempotent_already_approved'
-          );
-          return c.json({
-            success: true,
-            message: `Workflow already approved: ${run.workflow_name}.`,
-          });
-        }
-        getLog().info(
-          { runId, status: run.status },
-          'api.workflow_run_approve_rejected_bad_status'
-        );
-        return apiError(c, 400, `Cannot approve workflow in '${run.status}' status`);
-      }
       // Validate via the route schema so an invalid decision_verb is rejected with
       // 400 BEFORE anything is persisted. The OpenAPI defaultHook (validationErrorHook)
       // returns 400 on a Zod failure before this handler runs; Zod also applies the
       // .default('approve_as_is') so decision_verb is always a valid enum value here.
       const body = getValidatedBody(c, approveWorkflowRunBodySchema);
-      const comment = body.comment ?? 'Approved';
-      const decisionVerb = body.decision_verb; // schema default already applied
-      const authorizedFixIds = body.authorized_fix_ids ?? [];
-      const approval = run.metadata.approval as ApprovalContext | undefined;
-      if (!approval?.nodeId) {
-        getLog().warn({ runId }, 'api.workflow_run_approve_missing_context');
-        return apiError(c, 400, 'Workflow run is paused but missing approval context');
+      // Auto-resume: dispatch to the orchestrator so the workflow continues
+      // without requiring the user to re-run the workflow command. Mirrors what
+      // `workflowApproveCommand` does in the CLI. Requires parent_conversation_id
+      // and a web-platform parent (guarded in the helper).
+      const result = await approvePausedWorkflowRun(runId, {
+        comment: body.comment ?? 'Approved',
+        decisionVerb: body.decision_verb, // schema default already applied
+        authorizedFixIds: body.authorized_fix_ids ?? [],
+        autoResume: run => tryAutoResumeRun(run, 'approve'),
+      });
+      if (!result.ok) {
+        return apiError(c, result.status, result.message);
       }
-      // For interactive loops, do NOT write node_completed -- the executor writes it when
-      // the AI emits the completion signal (actual loop exit). Writing it here would cause
-      // the resume to skip the loop node entirely via priorCompletedNodes.
-      if (approval.type !== 'interactive_loop') {
-        // Design A: persist the graded decision verb + authorized fix ids INTO the
-        // captured node_output as JSON, so the DAG when: evaluator can route on
-        // $<gate>.output.decision_verb with no evaluator change. When the gate did not
-        // capture a response, keep node_output empty (legacy binary contract).
-        const nodeOutput =
-          approval.captureResponse === true
-            ? JSON.stringify({
-                decision_verb: decisionVerb,
-                authorized_fix_ids: authorizedFixIds,
-                comment,
-              })
-            : '';
-        await workflowEventDb.createWorkflowEvent({
-          workflow_run_id: runId,
-          event_type: 'node_completed',
-          step_name: approval.nodeId,
-          data: { node_output: nodeOutput, approval_decision: 'approved' },
+      if (result.kind === 'already_approved') {
+        return c.json({
+          success: true,
+          message: `Workflow already approved: ${result.workflowName}.`,
         });
       }
-      await workflowEventDb.createWorkflowEvent({
-        workflow_run_id: runId,
-        event_type: 'approval_received',
-        step_name: approval.nodeId,
-        data: { decision: 'approved', comment },
-      });
-      // For interactive loops, store user input; for standard approvals, mark as approved
-      // and clear any rejection state.
-      const metadataUpdate =
-        approval.type === 'interactive_loop'
-          ? { loop_user_input: comment }
-          : { approval_response: 'approved', rejection_reason: '', rejection_count: 0 };
-      await workflowDb.updateWorkflowRun(runId, {
-        status: 'failed',
-        metadata: metadataUpdate,
-      });
-
-      // Auto-resume: dispatch to the orchestrator so the workflow continues
-      // without requiring the user to re-run the workflow command. Mirrors
-      // what `workflowApproveCommand` does in the CLI. Requires
-      // `parent_conversation_id` on the run (set by orchestrator-agent for any
-      // web-dispatched workflow -- foreground, interactive, and background via
-      // the pre-created run) and a web-platform parent (guarded in the helper).
-      const autoResumed = await tryAutoResumeRun(run, 'approve');
-
       return c.json({
         success: true,
-        message: autoResumed
-          ? `Workflow approved: ${run.workflow_name}. Resuming workflow.`
-          : `Workflow approved: ${run.workflow_name}. Send a message to continue.`,
+        message: result.autoResumed
+          ? `Workflow approved: ${result.workflowName}. Resuming workflow.`
+          : `Workflow approved: ${result.workflowName}. Send a message to continue.`,
       });
     } catch (error) {
       getLog().error({ err: error, runId }, 'api.workflow_run_approve_failed');
@@ -6947,6 +7939,32 @@ export function registerApiRoutes(
       getLog().error({ err: error }, 'workflow_run_by_worker_lookup_failed');
       return apiError(c, 500, 'Failed to look up workflow run');
     }
+  });
+
+  // POST /api/cascade-wo-claims/release -- operator release of a RETAINED shared
+  // WO claim (WO-HARNESS-T3-COMMAND-CONSUMER-01). Behind the /api operator auth;
+  // dispatch principals are refused by the middleware (not a transport route).
+  // CAS on (wo_id, cascade_id, active): only the named holder's claim is released.
+  app.post('/api/cascade-wo-claims/release', async c => {
+    let body: { woId?: unknown; cascadeId?: unknown };
+    try {
+      body = await c.req.json();
+    } catch {
+      return apiError(c, 400, 'invalid_body');
+    }
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      return apiError(c, 400, 'invalid_body');
+    }
+    if (typeof body.woId !== 'string' || typeof body.cascadeId !== 'string') {
+      return apiError(c, 400, 'woId and cascadeId are required');
+    }
+    const released = await releaseWoClaim({
+      woId: body.woId,
+      cascadeId: body.cascadeId,
+      now: new Date().toISOString(),
+    });
+    getLog().info({ woId: body.woId, cascadeId: body.cascadeId, released }, 'api.wo_claim_release');
+    return c.json({ released });
   });
 
   // GET /api/workflows/runs/:runId - Get run details with events
@@ -7627,4 +8645,15 @@ export function registerApiRoutes(
     const result = await checkForUpdate(appVersion);
     return c.json(result ?? noUpdate);
   });
+}
+
+function readProjectRecord(codebase: {
+  id: string;
+  project_record?: unknown;
+}): ProjectRecord | null {
+  const parsed = parseProjectRecord(codebase.project_record);
+  if (parsed.status === 'invalid') {
+    getLog().warn({ codebaseId: codebase.id }, 'project_record_unparseable');
+  }
+  return parsed.record;
 }

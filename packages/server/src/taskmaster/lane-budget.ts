@@ -1,7 +1,7 @@
 import type { TmHealthSample, TmHealthState } from '@archon/core/db/taskmaster';
 import type { HeadroomReading } from './ledger';
 
-export type FireLane = 'claude' | 'codex' | 'xai';
+export type FireLane = 'claude' | 'codex' | 'cursor' | 'zero' | 'xai';
 export interface LaneBudgetDecision {
   lane: FireLane | null;
   holding: boolean;
@@ -23,9 +23,11 @@ export function decideFireLane(
   const states: Record<FireLane, TmHealthState> = {
     claude: health.claude?.state ?? claudeState(headroom),
     codex: health.codex?.state ?? 'unknown',
+    cursor: health.cursor?.state ?? 'unknown',
+    zero: health.zero?.state ?? 'unknown',
     xai: health.xai?.state ?? 'unknown',
   };
-  for (const lane of ['claude', 'codex', 'xai'] as const) {
+  for (const lane of ['claude', 'codex', 'cursor', 'zero', 'xai'] as const) {
     const state = states[lane];
     const available =
       overThreshold?.[lane] !== true &&

@@ -8,8 +8,8 @@
 import { expect, mock, test } from 'bun:test';
 import {
   openPullRequestsHoldingTracker,
-  RECONCILE_ACTION,
   RECONCILE_HOLD_OPEN_ACTION,
+  RECONCILE_MERGED_ACTION,
   runReconcileOnce,
   searchOpenPullRequestsReferencingTracker,
   type OctokitLike,
@@ -28,12 +28,13 @@ function mergedPullRequest(): ReconcileMergedPullRequest {
     repo: 'bdc-harness',
     number: 404,
     title: 'BDC feature Work Order implementation',
-    body: `WO: ${stem}`,
+    body: `WO: ${stem}\n\nCloses thinmansoftware/bdc-xo#1044`,
     htmlUrl: 'https://github.com/thinmansoftware/bdc-harness/pull/404',
     state: 'closed',
     merged: true,
     mergeCommitSha: 'abc123merge',
     mergedAt: '2026-09-29T12:00:00Z',
+    baseRef: 'dev',
   };
 }
 
@@ -95,6 +96,10 @@ function harness(
     readCursor: mock(async () => null),
     now: () => new Date('2026-09-29T12:00:00Z'),
     searchMergedPullRequests: mock(async () => [mergedPullRequest()]),
+    findTrackerIssueByNumber: mock(async (number: number) => {
+      if (number !== 1044) return null;
+      return trackerIssue();
+    }),
     findTrackerIssueByStem: mock(async (candidate: string) => {
       if (candidate !== stem) return null;
       return trackerIssue();
@@ -111,6 +116,8 @@ function harness(
     hasSkipBeenNoted: mock(async () => false),
     hasCloseBeenRecorded: mock(async () => false),
     hasHoldBeenNoted: mock(async () => Boolean(input.holdAlreadyNoted)),
+    hasMergedBeenNoted: mock(async () => false),
+    hasKeywordMissingBeenNoted: mock(async () => false),
     insertAction: mock(async (record: ReconcileActionRecord) => {
       actions.push(record);
     }),
@@ -128,17 +135,18 @@ function harness(
 }
 
 function expectNormalClose(deps: ReturnType<typeof harness>, result: { closed: number }): void {
-  expect(result.closed).toBe(1);
-  expect(deps.closes).toEqual([1044]);
-  expect(deps.labels).toEqual(['wo:done']);
+  // Amendment A1: the "normal" keyword outcome is a merged mark, not a close.
+  expect(result.closed).toBe(0);
+  expect(deps.closes).toEqual([]);
+  expect(deps.labels).toEqual(['status:merged']);
   expect(deps.comments).toHaveLength(1);
-  expect(deps.comments[0]).toContain('Overseer reconcile closed tracker');
+  expect(deps.comments[0]).toContain('merged, not done');
   expect(deps.actions).toEqual([
     {
       prRef: 'thinmansoftware/bdc-harness#404',
       woId: stem,
-      class: 'tracker_reconcile',
-      action: RECONCILE_ACTION,
+      class: 'closes_keyword',
+      action: RECONCILE_MERGED_ACTION,
       result: 'https://github.com/thinmansoftware/bdc-harness/pull/404:abc123merge',
     },
   ]);
@@ -335,6 +343,7 @@ function searchItem(number: number) {
     state: 'open',
     pull_request: {},
     repository_url: 'https://api.github.com/repos/thinmansoftware/bdc-harness',
+    html_url: `https://github.com/thinmansoftware/bdc-harness/pull/${number}`,
   };
 }
 
@@ -404,4 +413,141 @@ test('open_pr_search_throws_when_results_exceed_the_retrievable_limit', async ()
   await expect(
     searchOpenPullRequestsReferencingTracker(octokit, { issue: pagedTracker, stem })
   ).rejects.toThrow('exceeds retrievable');
+});
+
+function rawSearchClient(data: unknown): OctokitLike {
+  return { search: { issuesAndPullRequests: async () => ({ data }) } } as unknown as OctokitLike;
+}
+
+const malformedHolderCases: [string, unknown][] = [
+  [
+    'repository trailing LF',
+    { ...searchItem(762), repository_url: searchItem(762).repository_url + '\n' },
+  ],
+  [
+    'repository trailing CRLF',
+    { ...searchItem(762), repository_url: searchItem(762).repository_url + '\r\n' },
+  ],
+  ['missing repository', { ...searchItem(762), repository_url: undefined }],
+  [
+    'foreign repository host',
+    { ...searchItem(762), repository_url: 'https://evil.test/repos/thinmansoftware/bdc-harness' },
+  ],
+  [
+    'foreign organization',
+    { ...searchItem(762), repository_url: 'https://api.github.com/repos/other/bdc-harness' },
+  ],
+  [
+    'mismatched PR URL',
+    { ...searchItem(762), html_url: 'https://github.com/thinmansoftware/bdc-harness/pull/763' },
+  ],
+  ['missing body', { ...searchItem(762), body: undefined }],
+  ['missing title', { ...searchItem(762), title: undefined }],
+  ['not PR', { ...searchItem(762), pull_request: undefined }],
+  ['closed query drift', { ...searchItem(762), state: 'closed' }],
+  ['invalid number', { ...searchItem(762), number: 0 }],
+  ['null row', null],
+];
+for (const [name, row] of malformedHolderCases) {
+  test(`malformed holder ${name} holds tracker without side effects`, async () => {
+    const client = rawSearchClient({ items: [row], total_count: 1, incomplete_results: false });
+    const deps = harness({
+      openPrLookup: () =>
+        searchOpenPullRequestsReferencingTracker(client, { issue: pagedTracker, stem }),
+    });
+    const result = await runReconcileOnce({ deps });
+    expect(result.closed).toBe(0);
+    expect(deps.comments).toEqual([]);
+    expect(deps.labels).toEqual([]);
+    expect(deps.closes).toEqual([]);
+    expect(deps.actions).toEqual([]);
+    expect(deps.warnings).toContain(
+      'overseer.reconcile.open_pr_lookup_failed_leaving_tracker_open'
+    );
+  });
+}
+
+for (const [name, data] of [
+  ['missing total', { items: [], incomplete_results: false }],
+  ['negative total', { items: [], total_count: -1, incomplete_results: false }],
+  ['missing completeness', { items: [], total_count: 0 }],
+  ['non-array items', { items: {}, total_count: 0, incomplete_results: false }],
+  ['more items than total', { items: [searchItem(1)], total_count: 0, incomplete_results: false }],
+] as const) {
+  test(`open holder rejects ${name}`, async () => {
+    await expect(
+      searchOpenPullRequestsReferencingTracker(rawSearchClient(data), { issue: pagedTracker, stem })
+    ).rejects.toThrow();
+  });
+}
+
+test('conflicting holder copy in second query cannot erase hold evidence', async () => {
+  let calls = 0;
+  const client = {
+    search: {
+      issuesAndPullRequests: async () => ({
+        data: {
+          items: [{ ...searchItem(762), body: ++calls === 1 ? '' : `WO: ${stem}` }],
+          total_count: 1,
+          incomplete_results: false,
+        },
+      }),
+    },
+  } as unknown as OctokitLike;
+  await expect(
+    searchOpenPullRequestsReferencingTracker(client, { issue: pagedTracker, stem })
+  ).rejects.toThrow();
+});
+
+test('duplicate page rows cannot count as missing distinct results', async () => {
+  const first = Array.from({ length: 100 }, (_, i) => searchItem(i + 1));
+  const { octokit } = pagedOctokit({
+    1: { items: first, total: 101 },
+    2: { items: [searchItem(1)], total: 101 },
+  });
+  await expect(
+    searchOpenPullRequestsReferencingTracker(octokit, { issue: pagedTracker, stem })
+  ).rejects.toThrow();
+});
+
+test('total drift across pages cannot prove completeness', async () => {
+  const first = Array.from({ length: 100 }, (_, i) => searchItem(i + 1));
+  const { octokit } = pagedOctokit({
+    1: { items: first, total: 101 },
+    2: { items: [searchItem(101)], total: 100 },
+  });
+  await expect(
+    searchOpenPullRequestsReferencingTracker(octokit, { issue: pagedTracker, stem })
+  ).rejects.toThrow();
+});
+
+test('consistent cross-query copies remain one holder', async () => {
+  const { octokit } = pagedOctokit({
+    1: { items: [{ ...searchItem(762), body: `WO: ${stem}` }], total: 1 },
+  });
+  const found = await searchOpenPullRequestsReferencingTracker(octokit, {
+    issue: pagedTracker,
+    stem,
+  });
+  expect(found).toHaveLength(1);
+  expect(found[0]?.body).toBe(`WO: ${stem}`);
+});
+
+test('exactly one thousand distinct holders across ten pages proves the search boundary', async () => {
+  const pages: Record<number, { items: ReturnType<typeof searchItem>[]; total: number }> = {};
+  for (let page = 1; page <= 10; page++) {
+    pages[page] = {
+      items: Array.from({ length: 100 }, (_, i) => searchItem((page - 1) * 100 + i + 1)),
+      total: 1000,
+    };
+  }
+  const { octokit, pagesRequested } = pagedOctokit(pages);
+  const found = await searchOpenPullRequestsReferencingTracker(octokit, {
+    issue: pagedTracker,
+    stem,
+  });
+  expect(found).toHaveLength(1000);
+  // Three queries (stem, owner/repo#N, tracker-repo bare number) each reach page 10.
+  expect(pagesRequested.filter(page => page === 10)).toHaveLength(3);
+  expect(pagesRequested).not.toContain(11);
 });

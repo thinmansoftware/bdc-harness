@@ -3,7 +3,11 @@ import { runOverseerService } from '@archon/overseer/service';
 import type { OverseerServiceOptions, OverseerWiredAdapterKind } from '@archon/overseer/service';
 import { PRODUCTION_EFFECT_HOLD_REASON } from '@archon/overseer/merge-manager';
 import { DEFAULT_WATCH_INTERVAL_MS } from '@archon/overseer/watch';
-import { logDiscoveryConfigurationAtStartup } from '@archon/overseer';
+import {
+  logDiscoveryConfigurationAtStartup,
+  startMergeSweepLivenessMonitor,
+  type MergeSweepLivenessMonitor,
+} from '@archon/overseer';
 
 const log = createLogger('server/overseer-runtime');
 
@@ -36,18 +40,52 @@ interface OverseerRuntimeStatusDeps {
   readonly now?: () => Date;
 }
 
+interface RuntimeLogger {
+  info(obj: Record<string, unknown>, msg: string): void;
+  error(obj: Record<string, unknown>, msg: string): void;
+}
+
+/** Restart backoff for the watcher supervisor. Defaults: 5 s doubling to a 60 s cap. */
+interface OverseerSupervisorOptions {
+  readonly baseDelayMs?: number;
+  readonly maxDelayMs?: number;
+  /** A run this long without failing resets the attempt counter (default 5 minutes). */
+  readonly healthyResetMs?: number;
+  readonly now?: () => number;
+  /** Tests inject a deterministic scheduler; defaults to setTimeout/clearTimeout. */
+  readonly setTimer?: (fn: () => void, ms: number) => unknown;
+  readonly clearTimer?: (handle: unknown) => void;
+}
+
 interface OverseerRuntimeDeps {
   readonly runService?: typeof runOverseerService;
   readonly serviceOptions?: Pick<
     OverseerServiceOptions,
     'deps' | 'mergeCoordinator' | 'mergeBridgeEnabled'
   >;
+  readonly logger?: RuntimeLogger;
+  readonly supervisor?: OverseerSupervisorOptions;
+  /** Tests: replace the liveness monitor starter (default arms the real one). */
+  readonly startLivenessMonitor?: () => MergeSweepLivenessMonitor;
 }
+
+const DEFAULT_RESTART_BASE_MS = 5_000;
+const DEFAULT_RESTART_MAX_MS = 60_000;
+const DEFAULT_HEALTHY_RESET_MS = 5 * 60_000;
 
 let watcherTask: Promise<void> | null = null;
 let watcherAbort: AbortController | null = null;
 let watcherState: OverseerWatcherState = 'stopped';
 let adapterKind: OverseerAdapterKind = 'none';
+let runtimeLog: RuntimeLogger = log;
+let restartTimer: unknown = null;
+let restartClear: (handle: unknown) => void = handle => {
+  clearTimeout(handle as ReturnType<typeof setTimeout>);
+};
+let restartAttempt = 0;
+/** True once stopOverseerRuntime ran: a late rejection must not restart anything. */
+let intentionalStop = false;
+let livenessMonitor: MergeSweepLivenessMonitor | null = null;
 
 function readCapabilityFlag(name: string): boolean {
   const v = process.env[`OVERSEER_${name}_ACTIONS_ENABLED`];
@@ -77,7 +115,7 @@ function resolveAdapterKind(): OverseerAdapterKind {
  * the API process.
  */
 export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
-  if (watcherTask !== null) {
+  if (watcherTask !== null || restartTimer !== null) {
     log.info('overseer_runtime.start_skipped_already_running');
     return;
   }
@@ -109,15 +147,81 @@ export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
     return;
   }
 
-  const controller = new AbortController();
-  watcherAbort = controller;
+  intentionalStop = false;
+  restartAttempt = 0;
+  restartTimer = null;
+  runtimeLog = deps.logger ?? log;
   watcherState = 'running';
 
-  log.info({ adapterKind }, 'overseer_runtime.watcher_starting');
+  runtimeLog.info({ adapterKind }, 'overseer_runtime.watcher_starting');
   // Announce the PR-discovery repo list BEFORE the first tick. An unset
   // OVERSEER_MERGE_DISCOVERY_REPOS left the coordinator blind to every open PR
   // for two weeks (2026-09-08..22) with nothing at startup saying so.
   logDiscoveryConfigurationAtStartup();
+
+  // Independent of the watcher: pages the operator when no sweep pass completes
+  // for 10 minutes, including when the watcher is dead and between restarts.
+  livenessMonitor?.stop();
+  livenessMonitor = (deps.startLivenessMonitor ?? startMergeSweepLivenessMonitor)();
+
+  launchService(deps);
+}
+
+/**
+ * Run the service once and supervise it. When the service promise has SETTLED
+ * (rejected, or resolved unexpectedly) and the runtime was not stopped on purpose,
+ * restart it after a bounded backoff. Restart happens only after settlement.
+ * Before this, a rejection left the watcher, merge bridge and reconcile loop
+ * dead until a human restarted the container (2026-11-04: one hour).
+ */
+function launchService(deps: OverseerRuntimeDeps): void {
+  const supervisor = deps.supervisor ?? {};
+  const now = supervisor.now ?? ((): number => Date.now());
+  const setTimer =
+    supervisor.setTimer ?? ((fn: () => void, ms: number): unknown => setTimeout(fn, ms));
+  restartClear =
+    supervisor.clearTimer ??
+    ((handle: unknown): void => {
+      clearTimeout(handle as ReturnType<typeof setTimeout>);
+    });
+  const baseDelayMs = supervisor.baseDelayMs ?? DEFAULT_RESTART_BASE_MS;
+  const maxDelayMs = supervisor.maxDelayMs ?? DEFAULT_RESTART_MAX_MS;
+  const healthyResetMs = supervisor.healthyResetMs ?? DEFAULT_HEALTHY_RESET_MS;
+
+  const controller = new AbortController();
+  watcherAbort = controller;
+  watcherState = 'running';
+  const startedAt = now();
+
+  // supervisor_settled_guard: the ONLY path that can start another service is the
+  // `settled` handler below, which runs only after this promise has actually
+  // settled (crashed or exited). Nothing else calls runService or aborts the running
+  // service: no timer, watchdog or liveness callback. A HANG never settles, so it
+  // reaches the 10-minute liveness alarm and nothing else.
+  const settled = (outcome: { err: unknown } | null): void => {
+    watcherTask = null;
+    watcherAbort = null;
+    if (outcome === null && intentionalStop) {
+      runtimeLog.info({}, 'overseer_runtime.watcher_stopped');
+      watcherState = 'stopped';
+      return;
+    }
+    controller.abort();
+    const err = outcome === null ? new Error('overseer_service_exited_unexpectedly') : outcome.err;
+    runtimeLog.error({ err }, 'overseer_runtime.watcher_exception_degraded');
+    watcherState = 'degraded';
+    if (intentionalStop) return;
+
+    if (now() - startedAt >= healthyResetMs) restartAttempt = 0;
+    const delayMs = Math.min(baseDelayMs * 2 ** restartAttempt, maxDelayMs);
+    restartAttempt += 1;
+    runtimeLog.error({ attempt: restartAttempt, delayMs }, 'overseer_runtime.watcher_restarting');
+    restartTimer = setTimer(() => {
+      restartTimer = null;
+      if (intentionalStop) return;
+      launchService(deps);
+    }, delayMs);
+  };
 
   const runService = deps.runService ?? runOverseerService;
   watcherTask = runService({
@@ -127,17 +231,10 @@ export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
     deliveryEnabled: true,
   }).then(
     () => {
-      log.info('overseer_runtime.watcher_stopped');
-      watcherState = 'stopped';
-      watcherTask = null;
-      watcherAbort = null;
+      settled(null);
     },
     (err: unknown) => {
-      controller.abort();
-      log.error({ err }, 'overseer_runtime.watcher_exception_degraded');
-      watcherState = 'degraded';
-      watcherTask = null;
-      watcherAbort = null;
+      settled({ err });
     }
   );
 }
@@ -146,7 +243,20 @@ export function startOverseerRuntime(deps: OverseerRuntimeDeps = {}): void {
  * Abort and await the owned watcher task. Safe to call when not started.
  */
 export async function stopOverseerRuntime(): Promise<void> {
+  intentionalStop = true;
+  livenessMonitor?.stop();
+  livenessMonitor = null;
+  const pendingRestart = restartTimer !== null;
+  if (restartTimer !== null) {
+    restartClear(restartTimer);
+    restartTimer = null;
+  }
   if (watcherAbort === null && watcherTask === null) {
+    if (pendingRestart) {
+      watcherState = 'stopped';
+      log.info('overseer_runtime.watcher_stopped_and_awaited');
+      return;
+    }
     log.info('overseer_runtime.stop_skipped_not_running');
     return;
   }

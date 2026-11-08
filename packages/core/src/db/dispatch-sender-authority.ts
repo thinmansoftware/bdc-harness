@@ -50,7 +50,13 @@ export class DispatchPrincipalAuthError extends Error {
   }
 }
 
-export type FixedDispatchSystemSender = 'dispatch' | 'overseer' | 'taskmaster';
+export type FixedDispatchSystemSender =
+  | 'dispatch'
+  | 'overseer'
+  | 'taskmaster'
+  // WO-HARNESS-T3-COMMAND-CONSUMER-01: the cauldron-fire command consumer
+  // replies to the submitting actor as a fixed system sender.
+  | 'cauldron-fire';
 export type DispatchSystemAuthority = Readonly<{
   kind: 'system';
   sender: FixedDispatchSystemSender;

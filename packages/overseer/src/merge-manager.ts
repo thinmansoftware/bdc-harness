@@ -32,17 +32,36 @@ import type {
 export const MERGE_MANAGER_IDENTITY = 'overseer-merge-manager-v1';
 export const PRODUCTION_EFFECT_HOLD_REASON = 'production_effect_held_for_john' as const;
 export const BASE_BRANCH_MISSING_HOLD_REASON = 'base_branch_missing_in_run_metadata' as const;
+export const BASE_BRANCH_MISMATCH_HOLD_REASON = 'base_branch_mismatch' as const;
 /**
  * Sentinel error thrown by defaultAssembleEvidence when the run record carries no
- * base_branch/baseBranch metadata (bdc-xo#2131). Caught by createMergeManager's
- * returned handler and converted into a 'held' result -- never a silent default and
- * never an uncaught throw that would kill the watch loop for every subsequent record.
+ * base_branch/baseBranch metadata and GitHub also reports no base (bdc-xo#2131).
+ * Caught by createMergeManager's returned handler and converted into a 'held'
+ * result -- never a silent default and never an uncaught throw that would kill
+ * the watch loop for every subsequent record.
  */
 export class BaseBranchMissingError extends Error {
   constructor() {
     super(BASE_BRANCH_MISSING_HOLD_REASON);
     this.name = 'BaseBranchMissingError';
   }
+}
+/**
+ * Recorded run base and the PR's GitHub base both exist and disagree.
+ * The merge is refused. The PR base is not edited.
+ */
+export class BaseBranchMismatchError extends Error {
+  constructor() {
+    super(BASE_BRANCH_MISMATCH_HOLD_REASON);
+    this.name = 'BaseBranchMismatchError';
+  }
+}
+
+const DEFAULT_ALLOWED_BASES = 'dev,staging';
+
+export interface MergeManagerLogger {
+  info(bindings: Record<string, unknown>, message?: string): void;
+  warn(bindings: Record<string, unknown>, message?: string): void;
 }
 export const MERGE_MANAGER_MODE_ENV = 'OVERSEER_MERGE_MANAGER_MODE' as const;
 export const MERGE_MANAGER_MUTATIONS_ENABLED_ENV = 'MERGE_MANAGER_MUTATIONS_ENABLED' as const;
@@ -93,6 +112,10 @@ export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps 
    */
   readonly baseEffectOverrides?: ReadonlyMap<string, OverseerDeploymentEffect>;
   readonly reviewGateLogin?: string;
+  /**
+   * Optional logger. Tests inject a spy. Production uses the module logger.
+   */
+  readonly log?: MergeManagerLogger;
 }
 
 export type MergeManagerResult =
@@ -385,14 +408,26 @@ async function defaultAssembleEvidence(
   // up and explicitly documented as the provenance anchor -- is the truth.
   const headSha = metadataString(record, ['head_sha', 'headSha']) ?? prEvidence.headSha ?? '';
   const baseSha = metadataString(record, ['base_sha', 'baseSha']) ?? '';
-  // Fail closed on unknown base branch (bdc-xo#2131): a merge is the one action that
-  // must never land against a branch nobody chose. This used to silently default to
-  // 'dev' whenever run metadata carried no base_branch/baseBranch key, which real run
-  // metadata usually does not -- see BaseBranchMissingError doc comment. A caller that
-  // legitimately wants 'dev' must pass it explicitly via deps.evidenceAssemblyDeps or
-  // record metadata; there is no implicit fallback branch here anymore.
-  const baseBranch = metadataString(record, ['base_branch', 'baseBranch']);
-  if (!baseBranch) {
+  // Fail closed on an unknown base (bdc-xo#2131). Metadata wins when it names a
+  // base. When it does not, GitHub's own base -- already fetched above -- is
+  // used and logged. When the two disagree the merge is refused. When both are
+  // empty there is still no implicit default.
+  const metadataBase = metadataString(record, ['base_branch', 'baseBranch']);
+  const githubBase =
+    trimmedBranch(prEvidence.baseBranch) ?? trimmedBranch(record.prEvidence?.baseBranch);
+  let baseBranch: string;
+  if (metadataBase && githubBase && metadataBase !== githubBase) {
+    throw new BaseBranchMismatchError();
+  } else if (metadataBase) {
+    baseBranch = metadataBase;
+  } else if (githubBase) {
+    const fallbackLog = deps.log ?? log;
+    fallbackLog.info(
+      { runId: record.runId },
+      `merge_manager.base_branch_github_fallback runId=${record.runId}`
+    );
+    baseBranch = githubBase;
+  } else {
     throw new BaseBranchMissingError();
   }
   const changedFiles = metadataString(record, ['changed_files', 'changedFiles'])
@@ -538,10 +573,16 @@ function envFlagEnabled(raw: string | undefined): boolean {
 
 // AGD Keep this DI/legacy parser stable while its values feed the shared synthesized repo policy.
 function allowedBasesFromEnv(raw: string | undefined): readonly string[] {
-  return (raw ?? 'dev,staging')
+  return (raw ?? DEFAULT_ALLOWED_BASES)
     .split(',')
     .map(value => value.trim().toLowerCase())
     .filter(Boolean);
+}
+
+function trimmedBranch(value: string | null | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 async function mergePreconditionMiss(
@@ -649,17 +690,23 @@ export function createMergeManager(
     try {
       assembled = await assembleEvidence(record);
     } catch (error) {
-      if (error instanceof BaseBranchMissingError) {
-        await recordManagerAction(deps, record, 'merge_denied', BASE_BRANCH_MISSING_HOLD_REASON);
+      if (error instanceof BaseBranchMissingError || error instanceof BaseBranchMismatchError) {
+        const reason =
+          error instanceof BaseBranchMismatchError
+            ? BASE_BRANCH_MISMATCH_HOLD_REASON
+            : BASE_BRANCH_MISSING_HOLD_REASON;
+        await recordManagerAction(deps, record, 'merge_denied', reason);
         log.warn(
-          { runId: record.runId, woId: record.woId, mode },
-          'merge_manager.base_branch_missing_held -- run metadata carried no base_branch/baseBranch key'
+          { runId: record.runId, woId: record.woId, mode, reason },
+          error instanceof BaseBranchMismatchError
+            ? 'merge_manager.base_branch_mismatch_held -- recorded base disagrees with the PR base'
+            : 'merge_manager.base_branch_missing_held -- run metadata and GitHub both yielded no base'
         );
         return {
           status: 'held',
           receipt: null,
           execution: null,
-          reason: BASE_BRANCH_MISSING_HOLD_REASON,
+          reason,
           mode,
         };
       }

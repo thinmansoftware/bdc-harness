@@ -38,6 +38,20 @@ export default tseslint.config(
   ...tseslint.configs.strictTypeChecked,
   ...tseslint.configs.stylisticTypeChecked,
 
+  // Untyped Node ESM: lint these two scripts without type-aware rules.
+  {
+    files: ['scripts/verify-seccomp-userns.mjs', 'scripts/verify-seccomp-userns.test.mjs'],
+    extends: [tseslint.configs.disableTypeChecked],
+    languageOptions: {
+      globals: {
+        URL: 'readonly',
+        console: 'readonly',
+        process: 'readonly',
+        structuredClone: 'readonly',
+      },
+    },
+  },
+
   // Prettier integration
   prettierConfig,
 

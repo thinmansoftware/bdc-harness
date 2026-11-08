@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import type { RunAuthorityPolicy } from '@archon/workflows/schemas/workflow';
 import type { FrozenSpecSource } from '@archon/workflows/reliability/run-authority';
+import { parseRepairTarget } from '@archon/workflows/reliability/run-branch-identity';
 
 export interface WorkOrderSourceDependencies {
   readonly fetcher?: typeof fetch;
@@ -63,6 +64,29 @@ async function readJson(response: Response): Promise<Record<string, unknown>> {
   return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {};
 }
 
+/** One climb fire line. Stricter than parseRepairTarget: no whitespace in the branch. */
+const CLIMB_REPAIR_TARGET_LINE = /^Repair target: PR #[0-9]+ \(branch [^ ]+\)$/;
+
+/**
+ * After the canonical hash check, append a single fire-message repair declaration
+ * when the spec has none of its own. Zero or multiple matching lines leave the
+ * canonical bytes unchanged. A spec-declared target always wins.
+ */
+function appendClimbRepairTarget(specBytes: Uint8Array, userMessage: string): Uint8Array {
+  if (parseRepairTarget(specBytes)) return specBytes;
+  const matches: string[] = [];
+  for (const raw of userMessage.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (CLIMB_REPAIR_TARGET_LINE.test(line)) matches.push(line);
+  }
+  if (matches.length !== 1) return specBytes;
+  const declaration = matches[0];
+  if (!declaration) return specBytes;
+  const body = Buffer.from(specBytes).toString('utf8');
+  const separator = body.length === 0 || body.endsWith('\n') ? '' : '\n';
+  return Buffer.from(`${body}${separator}${declaration}\n`, 'utf8');
+}
+
 function readWoId(value: string): string | undefined {
   return /\bWO-[A-Z0-9-]+\b/.exec(value)?.[0];
 }
@@ -114,7 +138,10 @@ export async function freezeWorkOrderSource(
       `sha256:${createHash('sha256').update(source.specBytes).digest('hex')}` !== expected.specHash)
   )
     throw new Error('authority_conflict: canonical spec changed since eligibility');
-  return source;
+  return {
+    ...source,
+    specBytes: appendClimbRepairTarget(source.specBytes, userMessage),
+  };
 }
 
 async function resolveWorkOrderSource(

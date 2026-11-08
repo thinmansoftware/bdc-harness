@@ -18,8 +18,13 @@ import { readFileSync } from 'node:fs';
 import { rm, stat } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import {
+  CODEX_JUDGE_CLI_PACKAGE,
+  DEFAULT_CODEX_JUDGE_MODEL,
   DEFAULT_CURSOR_JUDGE_MODEL,
   buildJudgeTransport,
+  buildPrReviewTransport,
+  describeJudgeModel,
+  resolveCodexJudgeModel,
   removeJudgeTransportFiles,
   type JudgeChild,
   type JudgeChildSpawn,
@@ -34,7 +39,14 @@ const LARGE_PROMPT = `judge this private envelope: ${'e'.repeat(200_000)}`;
 const VERDICT_JSON =
   '{"verdict":"observe","confidence":0.7,"proposed_action":"none","reason":"ok"}';
 const FENCE = '`'.repeat(3);
-const CODEX_ARGV = ['bunx', '@openai/codex', 'exec', '--skip-git-repo-check'];
+const CODEX_ARGV = [
+  'bunx',
+  CODEX_JUDGE_CLI_PACKAGE,
+  'exec',
+  '--skip-git-repo-check',
+  '--model',
+  DEFAULT_CODEX_JUDGE_MODEL,
+];
 
 function largestArgvElementBytes(argv: string[]): number {
   return argv.reduce((max, arg) => Math.max(max, Buffer.byteLength(arg, 'utf8')), 0);
@@ -52,10 +64,13 @@ function expectNothingOversizedInArgv(argv: string[]): void {
 
 const ORIGINAL_ENV = {
   cursorModel: process.env.OVERSEER_CURSOR_JUDGE_MODEL,
+  codexModel: process.env.OVERSEER_CODEX_JUDGE_MODEL,
   ladder: process.env.OVERSEER_JUDGE_LADDER,
 };
 
 function restoreEnv(): void {
+  if (ORIGINAL_ENV.codexModel === undefined) delete process.env.OVERSEER_CODEX_JUDGE_MODEL;
+  else process.env.OVERSEER_CODEX_JUDGE_MODEL = ORIGINAL_ENV.codexModel;
   if (ORIGINAL_ENV.cursorModel === undefined) delete process.env.OVERSEER_CURSOR_JUDGE_MODEL;
   else process.env.OVERSEER_CURSOR_JUDGE_MODEL = ORIGINAL_ENV.cursorModel;
   if (ORIGINAL_ENV.ladder === undefined) delete process.env.OVERSEER_JUDGE_LADDER;
@@ -167,6 +182,43 @@ describe('#852 -- buildJudgeTransport knows the cursor rung', () => {
     process.env.OVERSEER_CURSOR_JUDGE_MODEL = '   ';
     const blank = await buildJudgeTransport('cursor', 'p');
     expect(blank.argv.slice(-2)).toEqual(['--model', DEFAULT_CURSOR_JUDGE_MODEL]);
+  });
+});
+
+describe('WO-HARNESS-CODEX-CLI-GPT6-BUMP-01 -- codex judge rung runs a pinned CLI and GPT-6.1 Sol', () => {
+  test('default model is gpt-6.1-sol, passed last in argv', async () => {
+    delete process.env.OVERSEER_CODEX_JUDGE_MODEL;
+    expect(DEFAULT_CODEX_JUDGE_MODEL).toBe('gpt-6.1-sol');
+    const transport = await buildJudgeTransport('codex', 'p');
+    expect(transport.argv.slice(-2)).toEqual(['--model', 'gpt-6.1-sol']);
+  });
+
+  test('OVERSEER_CODEX_JUDGE_MODEL overrides; blank falls back to the default', async () => {
+    process.env.OVERSEER_CODEX_JUDGE_MODEL = 'gpt-6.1-terra';
+    expect((await buildJudgeTransport('codex', 'p')).argv.slice(-2)).toEqual([
+      '--model',
+      'gpt-6.1-terra',
+    ]);
+    process.env.OVERSEER_CODEX_JUDGE_MODEL = '   ';
+    expect(resolveCodexJudgeModel()).toBe(DEFAULT_CODEX_JUDGE_MODEL);
+  });
+
+  test('the CLI is an exact pin at or above 0.155 and equals the providers SDK pin', () => {
+    const match = /^@openai\/codex@(\d+)\.(\d+)\.(\d+)$/.exec(CODEX_JUDGE_CLI_PACKAGE);
+    expect(match).not.toBeNull();
+    const [major, minor] = [Number(match?.[1]), Number(match?.[2])];
+    expect(major > 0 || minor >= 155).toBe(true);
+    const pkg = JSON.parse(
+      readFileSync(new URL('../../../providers/package.json', import.meta.url), 'utf8')
+    ) as { dependencies: Record<string, string> };
+    expect(CODEX_JUDGE_CLI_PACKAGE).toBe(`@openai/codex@${pkg.dependencies['@openai/codex-sdk']}`);
+  });
+
+  test('describeJudgeModel records the codex model and leaves other rungs bare', () => {
+    expect(describeJudgeModel('codex', {})).toBe('codex:gpt-6.1-sol');
+    expect(describeJudgeModel('codex', { OVERSEER_CODEX_JUDGE_MODEL: 'x' })).toBe('codex:x');
+    expect(describeJudgeModel('cursor', {})).toBe('cursor');
+    expect(describeJudgeModel('grok', {})).toBe('grok');
   });
 });
 
@@ -376,5 +428,23 @@ describe('#852 -- judge-second-opinion seam (spawnGrok) goes through the shared 
     expect(records[0]?.promptFileContents).toBe(LARGE_PROMPT);
     await expect(stat(argv[2] ?? '')).rejects.toThrow();
     expect(parseGrokVerdict(result.stdout)).toBe('hold');
+  });
+});
+
+describe('WO-HARNESS-OVERSEER-REVIEW-JSONL-VERDICT-01 -- sandboxed PR review argv', () => {
+  test('names the shared CLI pin and model and keeps the sandbox flags', async () => {
+    delete process.env.OVERSEER_CODEX_JUDGE_MODEL;
+    const transport = await buildPrReviewTransport('codex', 'review the diff', {
+      kind: 'pr-review',
+      cwd: '/tmp/checkout',
+      expectedHeadSha: 'a'.repeat(40),
+      nativePolicy: 'codex_bubblewrap',
+    });
+    expect(transport.argv).toContain(CODEX_JUDGE_CLI_PACKAGE);
+    const modelAt = transport.argv.indexOf('--model');
+    expect(transport.argv[modelAt + 1]).toBe(resolveCodexJudgeModel());
+    const sandboxAt = transport.argv.indexOf('--sandbox');
+    expect(transport.argv[sandboxAt + 1]).toBe('workspace-write');
+    expect(transport.argv).toContain('sandbox_workspace_write.network_access=false');
   });
 });

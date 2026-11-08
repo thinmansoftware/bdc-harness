@@ -21,18 +21,32 @@ import { randomUUID } from 'crypto';
 import type { ExpectedSpecIdentity } from '@archon/core/workflows/work-order-source';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { loadLadder, loadRefusedTiers, loadPremiumTiers } from './ladder.js';
+import { loadLadder, loadRefusedTiers, loadPremiumTiers, loadMaxClimbsByEntry } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
-import { chooseHeadroomEntry, resolveEntryThreshold } from './headroom.js';
+import {
+  admitClaudeTier,
+  chooseHeadroomEntry,
+  formatRungSeatSkip,
+  resolveEntryThreshold,
+  rungSeatSkip,
+} from './headroom.js';
 import type { EntrySelection, SeatUsageSnapshot } from './headroom.js';
 import { fireTier, buildFireMessage } from './fire.js';
 import { pollForTerminal, TimeoutError, DEFAULT_OPEN_NODE_BUDGET_MS } from './poll.js';
 import { fetchNodeTimeoutsMs } from './node-timeouts.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
+import { classifyGateMisfire } from './gate-misfire.js';
 import { createRecord, writeRecord } from './recorder.js';
+export { readCascadeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
 import { cancelRun } from './cancel.js';
-import { findWoClaim, resolveGithubRepo, type WoClaim } from './already-satisfied.js';
+import {
+  findWoClaim,
+  listOpenWoPullRequests,
+  resolveGithubRepo,
+  type OpenWoPullRequest,
+  type WoClaim,
+} from './already-satisfied.js';
 import { acquireWoLock, releaseWoLock } from './wo-lock.js';
 import { classifyError, type ErrorClass } from '@archon/overseer/classify';
 import { runAuthorizedEscalation } from '@archon/overseer/authorized-escalation';
@@ -88,6 +102,15 @@ export interface CascadeDeps {
    * merged PR that already owns this WO, or null when none / unknown.
    */
   findWoClaim?: (woId: string, project: string) => Promise<WoClaim | null>;
+  /**
+   * OPEN non-fork PRs that claim this WO. Used to declare a repair target on a
+   * climb fire. Defaults to listOpenWoPullRequests (fails open to []).
+   */
+  listOpenWoPullRequests?: (
+    woId: string,
+    project: string,
+    options?: OpenWoPullRequestLookupOptions
+  ) => Promise<OpenWoPullRequest[]>;
   /** Exclusive active-cascade lock per woId+project. */
   acquireWoLock?: typeof acquireWoLock;
   releaseWoLock?: typeof releaseWoLock;
@@ -100,30 +123,256 @@ export interface CascadeDeps {
    */
   ruleset?: ConductorRuleset;
   /**
-   * Live subscription-seat snapshot. Absent means headroom routing is skipped.
-   * A rejection or timeout fails open (usage null) and never holds the fire.
+   * Live subscription-seat snapshot. When absent, the conductor reads its own
+   * Fuelglass seats route. A rejection or timeout becomes an UNKNOWN snapshot.
    */
   seatUsage?: () => Promise<SeatUsageSnapshot>;
+  /**
+   * Run-start seat cutoff percent (the Fuelglass seats route `cutoff.percent`).
+   * When absent, the conductor uses the cutoff from its own seats read. A
+   * rejection, timeout or null means UNKNOWN: no rung is skipped on seat
+   * grounds (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01).
+   */
+  seatCutoff?: () => Promise<number | null>;
+  /**
+   * Read a run's detail for the prior-teardown wait (WO-HARNESS-REPAIR-HOLDER-
+   * TEARDOWN-01). Each read is bounded by the overall wait deadline.
+   */
+  readRunDetail?: (runId: string) => Promise<PriorRunDetail | null>;
+  /** Overall prior-teardown wait (default SMART_CAULDRON_TEARDOWN_WAIT_MS or 180000). */
+  teardownWaitMs?: number;
+  /** Poll interval for the prior-teardown wait (default 5000). */
+  teardownPollMs?: number;
+}
+
+export interface PriorRunDetail {
+  readonly status?: string | null;
+  readonly completed_at?: string | null;
+  readonly metadata?: Record<string, unknown> | null;
+}
+
+const PRE_DEPLOY_CONFIRM_AGE_MS = 600_000;
+
+/**
+ * True when a run's error or terminal cause says the repair checkout failed
+ * (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01 item 8): climbing cannot free a held branch.
+ */
+export function isCheckoutFailedNoClimb(poll: PollResult): boolean {
+  const md = poll.rawMetadata ?? {};
+  if (md.terminal_cause === 'repair_checkout_failed') return true;
+  const error = typeof md.error === 'string' ? md.error : '';
+  return (
+    error.includes('repair_gate_closed: checkout_failed') ||
+    error.includes('repair_target_branch_held')
+  );
+}
+
+export type PriorTeardownVerdict = 'confirmed' | 'survivors' | 'timeout';
+
+function parseUtcMs(value: string): number {
+  const hasTz = /[zZ]$|[+-][0-9]{2}:?[0-9]{2}$/.test(value);
+  return new Date(hasTz ? value : `${value.replace(' ', 'T')}Z`).getTime();
+}
+
+/**
+ * Wait for the prior run's metadata.teardown_confirmed_at before firing the next
+ * tier. Every read is raced against the deadline, so a read whose body never
+ * completes still ends by the deadline. A prior row with neither teardown key
+ * that completed more than 600 s ago counts as confirmed (pre-deploy runs).
+ */
+export async function waitForPriorTeardown(
+  runId: string,
+  opts: {
+    readonly read: (runId: string) => Promise<PriorRunDetail | null>;
+    /** The prior attempt's terminal poll snapshot, checked before any read. */
+    readonly initial?: PriorRunDetail | null;
+    readonly waitMs: number;
+    readonly pollMs: number;
+    readonly now?: () => number;
+    readonly sleep?: (ms: number) => Promise<void>;
+  }
+): Promise<PriorTeardownVerdict> {
+  const now = opts.now ?? ((): number => Date.now());
+  const sleep = opts.sleep ?? ((ms: number): Promise<void> => new Promise(r => setTimeout(r, ms)));
+  const deadline = now() + opts.waitMs;
+  if (opts.initial?.metadata) {
+    const md = opts.initial.metadata;
+    const survivors = md.teardown_survivors;
+    if (Array.isArray(survivors) && survivors.length > 0) return 'survivors';
+    if (typeof md.teardown_confirmed_at === 'string') return 'confirmed';
+  }
+  for (;;) {
+    const remaining = deadline - now();
+    if (remaining <= 0) return 'timeout';
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const detail = await Promise.race([
+      opts.read(runId).catch(() => null),
+      new Promise<'deadline'>(r => {
+        timer = setTimeout(() => {
+          r('deadline');
+        }, remaining);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (detail === 'deadline') return 'timeout';
+    if (detail) {
+      const md = detail.metadata ?? {};
+      const survivors = md.teardown_survivors;
+      if (Array.isArray(survivors) && survivors.length > 0) return 'survivors';
+      if (typeof md.teardown_confirmed_at === 'string') return 'confirmed';
+      if (
+        !('teardown_survivors' in md) &&
+        typeof detail.completed_at === 'string' &&
+        now() - parseUtcMs(detail.completed_at) > PRE_DEPLOY_CONFIRM_AGE_MS
+      ) {
+        return 'confirmed';
+      }
+    }
+    const left = deadline - now();
+    if (left <= 0) return 'timeout';
+    await sleep(Math.min(opts.pollMs, left));
+  }
+}
+
+async function defaultReadRunDetail(
+  runId: string,
+  apiBaseUrl: string,
+  token: string,
+  doFetch: typeof fetch = fetch
+): Promise<PriorRunDetail | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    controller.abort();
+  }, 15_000);
+  try {
+    const res = await doFetch(`${apiBaseUrl}/api/workflows/runs/${encodeURIComponent(runId)}`, {
+      headers: { 'x-archon-operator-token': token },
+      signal: controller.signal,
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { run?: PriorRunDetail };
+    return body.run ?? null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const SEAT_USAGE_READ_TIMEOUT_MS = 5000;
+const DEFAULT_FUELGLASS_TIMEOUT_MS = 12_000;
+
+const UNKNOWN_SEAT_USAGE: SeatUsageSnapshot = {
+  claude: { limit_source: 'UNKNOWN', windows: [] },
+  codex: { limit_source: 'UNKNOWN', windows: [] },
+  cursor: { limit_source: 'UNKNOWN', windows: [] },
+};
+
+function parseFuelglassSeatUsage(value: unknown): SeatUsageSnapshot | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const seats = (value as { seats?: unknown }).seats;
+  if (typeof seats !== 'object' || seats === null) return null;
+  const snapshot: SeatUsageSnapshot = {};
+  for (const seat of ['claude', 'codex', 'cursor'] as const) {
+    const raw = (seats as Record<string, unknown>)[seat];
+    if (typeof raw !== 'object' || raw === null) return null;
+    const reading = raw as Record<string, unknown>;
+    if (reading.limit_source !== 'measured' && reading.limit_source !== 'UNKNOWN') return null;
+    if (!Array.isArray(reading.windows)) return null;
+    const windows = reading.windows.map(window => {
+      if (typeof window !== 'object' || window === null) return null;
+      const candidate = window as Record<string, unknown>;
+      if (
+        typeof candidate.name !== 'string' ||
+        typeof candidate.used_percent !== 'number' ||
+        !Number.isFinite(candidate.used_percent)
+      ) {
+        return null;
+      }
+      return { name: candidate.name, used_percent: candidate.used_percent };
+    });
+    if (windows.some(window => window === null)) return null;
+    if (reading.limit_reached !== undefined && typeof reading.limit_reached !== 'boolean') {
+      return null;
+    }
+    const credits = reading.credits as Record<string, unknown> | undefined;
+    snapshot[seat] = {
+      limit_source: reading.limit_source,
+      windows: windows.filter(window => window !== null),
+      ...(typeof reading.limit_reached === 'boolean'
+        ? { limit_reached: reading.limit_reached }
+        : {}),
+      ...(typeof credits === 'object' &&
+      credits !== null &&
+      typeof credits.has_credits === 'boolean'
+        ? {
+            credits: {
+              has_credits: credits.has_credits,
+              overage_limit_reached: credits.overage_limit_reached === true,
+            },
+          }
+        : {}),
+    };
+  }
+  return snapshot;
+}
+
+/** The run-start cutoff from a Fuelglass seats response, or null when absent/invalid. */
+export function parseFuelglassSeatCutoff(value: unknown): number | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const cutoff = (value as { cutoff?: unknown }).cutoff;
+  if (typeof cutoff !== 'object' || cutoff === null) return null;
+  const percent = (cutoff as { percent?: unknown }).percent;
+  if (typeof percent !== 'number' || !Number.isFinite(percent)) return null;
+  if (percent < 1 || percent > 95) return null;
+  return percent;
+}
+
+function defaultFuelglassSeatReader(
+  apiBaseUrl: string,
+  token: string,
+  onCutoff: (percent: number | null) => void = () => undefined,
+  doFetch: typeof fetch = fetch
+): () => Promise<SeatUsageSnapshot> {
+  return async () => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort();
+    }, DEFAULT_FUELGLASS_TIMEOUT_MS);
+    try {
+      const response = await doFetch(`${apiBaseUrl.replace(/\/$/, '')}/api/fuelglass/seats`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+      });
+      if (!response.ok) return UNKNOWN_SEAT_USAGE;
+      const body: unknown = await response.json();
+      const parsed = parseFuelglassSeatUsage(body);
+      if (parsed) onCutoff(parseFuelglassSeatCutoff(body));
+      return parsed ?? UNKNOWN_SEAT_USAGE;
+    } catch {
+      return UNKNOWN_SEAT_USAGE;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
 
 /**
- * Read seat usage with a fixed timeout. A rejection or timeout becomes null
+ * Read seat usage with a fixed timeout. A rejection or timeout becomes UNKNOWN
  * and logs exactly one failure line. A late reader result after timeout is ignored.
  */
-async function readSeatUsageOrNull(
+async function readSeatUsageOrUnknown(
   read: () => Promise<SeatUsageSnapshot>
-): Promise<SeatUsageSnapshot | null> {
+): Promise<SeatUsageSnapshot> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let settled = false;
   try {
-    return await new Promise<SeatUsageSnapshot | null>(resolve => {
+    return await new Promise<SeatUsageSnapshot>(resolve => {
       timer = setTimeout(() => {
         if (settled) return;
         settled = true;
         console.log('[smart-cauldron] seat usage unavailable: timeout');
-        resolve(null);
+        resolve(UNKNOWN_SEAT_USAGE);
       }, SEAT_USAGE_READ_TIMEOUT_MS);
       Promise.resolve()
         .then(() => read())
@@ -137,7 +386,7 @@ async function readSeatUsageOrNull(
             if (settled) return;
             settled = true;
             console.log('[smart-cauldron] seat usage unavailable: rejected');
-            resolve(null);
+            resolve(UNKNOWN_SEAT_USAGE);
           }
         );
     });
@@ -204,6 +453,21 @@ export interface RunCascadeOptions {
   dispatchId?: string;
   /** Resolves only after the initial record is durable; used by async API dispatch. */
   onAdmission?: (record: CascadeRunRecord, created: boolean) => void;
+  /**
+   * Called the moment a tier's dispatch is proven and its run id discovered,
+   * BEFORE any terminal-state polling. Lets a caller persist run custody while
+   * the run is still running or paused. A throwing callback never affects the
+   * cascade.
+   */
+  onRunDiscovered?: (runId: string, cascadeId: string, tierName: string) => void;
+  /**
+   * Passed through to the poller: a normally-terminal status that is a
+   * transitional hand-off for this run (see pollForTerminal). Absent by default,
+   * so every existing caller behaves exactly as before.
+   */
+  isTransitionalStatus?: (detail: import('./poll.js').PollRunDetail) => boolean;
+  /** Await durable automatic-fire permission after preflight, before admission/effects. */
+  beforeAdmission?: () => Promise<import('@archon/core/db/taskmaster').AutomaticFireProvenance>;
   woClass?: string;
   tags?: string[];
   /** Override the entry tier (skips conductor ruleset). */
@@ -220,6 +484,12 @@ export interface RunCascadeOptions {
   apiBaseUrl?: string;
   /** Operator token for Archon API auth. Defaults to ARCHON_OPERATOR_TOKEN env in callees. */
   token?: string;
+  /**
+   * Transport for Archon API reads/writes. Defaults to global fetch. The
+   * in-process T3 command consumer passes the server's own in-process API
+   * dispatcher here so no network self-call is made.
+   */
+  fetchImpl?: typeof fetch;
   /** Codebase shortname for explicit workflow binding. Required for live fires. */
   project?: string;
   /** Output directory for cascade-runs/ records. Default: ./cascade-runs. */
@@ -278,6 +548,8 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   } = opts;
 
   const apiBaseUrl = opts.apiBaseUrl ?? process.env.ARCHON_API_BASE_URL ?? 'http://localhost:3090';
+  const operatorToken = token ?? process.env.ARCHON_OPERATOR_TOKEN ?? '';
+  const fetchImpl = opts.fetchImpl;
 
   // Inject real implementations unless overridden (for testing)
   const fireImpl = opts.deps?.fire ?? fireTier;
@@ -306,8 +578,30 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     opts.deps?.findWoClaim ??
     ((id: string, proj: string): Promise<WoClaim | null> =>
       findWoClaim({ woId: id, project: proj }));
+  const listOpenWoPullRequestsImpl =
+    opts.deps?.listOpenWoPullRequests ??
+    ((
+      id: string,
+      proj: string,
+      lookupOptions?: OpenWoPullRequestLookupOptions
+    ): Promise<OpenWoPullRequest[]> =>
+      listOpenWoPullRequests({ woId: id, project: proj, ...lookupOptions }));
   const acquireWoLockImpl = opts.deps?.acquireWoLock ?? acquireWoLock;
   const releaseWoLockImpl = opts.deps?.releaseWoLock ?? releaseWoLock;
+  const readRunDetailImpl =
+    opts.deps?.readRunDetail ??
+    ((id: string): Promise<PriorRunDetail | null> =>
+      defaultReadRunDetail(id, apiBaseUrl, operatorToken, fetchImpl));
+  const configuredTeardownWait = Number.parseInt(
+    process.env.SMART_CAULDRON_TEARDOWN_WAIT_MS ?? '',
+    10
+  );
+  const teardownWaitMs =
+    opts.deps?.teardownWaitMs ??
+    (Number.isInteger(configuredTeardownWait) && configuredTeardownWait > 0
+      ? configuredTeardownWait
+      : 180_000);
+  const teardownPollMs = opts.deps?.teardownPollMs ?? 5000;
   const allowClaimed =
     opts.allowClaimed ??
     (process.env.SMART_CAULDRON_ALLOW_CLAIMED === '1' ||
@@ -318,6 +612,9 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   const ruleset = opts.deps?.ruleset ?? loadRuleset();
   const refusedTiers = loadRefusedTiers();
   const premiumTiers = loadPremiumTiers();
+  // Fence 3 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): per-entry climb cap.
+  // Keyed by the cascade's resolved entry tier; a tier absent here has no limit.
+  const maxClimbsByEntry = loadMaxClimbsByEntry();
 
   // Conductor: pick entry tier (ruleset), or honor explicit --entry override
   let entryTierName = entryOverride ?? pickEntryTier({ woClass, tags }, ruleset);
@@ -352,24 +649,124 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     entryTierName = promoted.name;
   }
 
-  let entrySelection: EntrySelection | undefined;
-  if (opts.deps?.seatUsage) {
-    const usage = await readSeatUsageOrNull(opts.deps.seatUsage);
-    entrySelection = chooseHeadroomEntry({
-      picked: entryTierName,
-      tiers,
-      refusedTiers,
-      premiumTiers,
-      usage,
-      thresholdPercent: resolveEntryThreshold(process.env),
-      pinned: entryOverride !== undefined,
-    });
-    entryTierName = entrySelection.entry;
-    console.log(
-      `[smart-cauldron] entry selection: ${entrySelection.reason} ` +
-        `picked=${entrySelection.picked} entry=${entrySelection.entry}`
-    );
+  const thresholdPercent = resolveEntryThreshold(process.env);
+  let seatCutoffPercent: number | null = null;
+  const seatUsage = opts.deps?.seatUsage
+    ? await readSeatUsageOrUnknown(opts.deps.seatUsage)
+    : await defaultFuelglassSeatReader(
+        apiBaseUrl,
+        operatorToken,
+        percent => {
+          seatCutoffPercent = percent;
+        },
+        fetchImpl
+      )();
+  if (opts.deps?.seatCutoff) {
+    try {
+      seatCutoffPercent = await opts.deps.seatCutoff();
+    } catch {
+      seatCutoffPercent = null;
+    }
   }
+  let entrySelection: EntrySelection = chooseHeadroomEntry({
+    picked: entryTierName,
+    tiers,
+    refusedTiers,
+    premiumTiers,
+    usage: seatUsage,
+    thresholdPercent,
+    pinned: entryOverride !== undefined,
+  });
+  entryTierName = entrySelection.entry;
+
+  if (entryTierName === 'claude') {
+    const admission = admitClaudeTier({ usage: seatUsage, thresholdPercent });
+    if (!admission.admitted && entryOverride === 'claude') {
+      throw new Error(
+        `[smart-cauldron/cascade] Refused Claude entry tier "claude": ${admission.reason}. ` +
+          'The Claude seat must be measured below the entry headroom threshold.'
+      );
+    }
+    if (!admission.admitted) {
+      const claudeIndex = tiers.findIndex(tier => tier.name === 'claude');
+      const promoted = tiers.slice(claudeIndex + 1).find(tier => !refusedTiers.includes(tier.name));
+      if (!promoted) {
+        throw new Error(
+          `[smart-cauldron/cascade] Claude entry denied (${admission.reason}) and no ` +
+            'admissible tier exists above it.'
+        );
+      }
+      console.log(
+        `[smart-cauldron] Skipping tier "claude" during entry: ${admission.reason}; ` +
+          `promoting to "${promoted.name}"`
+      );
+      entryTierName = promoted.name;
+      entrySelection = {
+        ...entrySelection,
+        entry: promoted.name,
+        changed: promoted.name !== entrySelection.picked,
+        reason: admission.reason,
+      };
+    } else {
+      entrySelection = { ...entrySelection, reason: admission.reason };
+    }
+  }
+  // Seat-cutoff rung skip at entry (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01):
+  // a rung whose own seat is measured at or over the run-start cutoff would be
+  // refused by the gate. A pinned entry is honored (the gate decides it).
+  if (entryOverride === undefined) {
+    const skipped: string[] = [];
+    let idx = tiers.findIndex(tier => tier.name === entryTierName);
+    while (idx !== -1 && idx < tiers.length) {
+      const tier = tiers[idx];
+      if (!tier) break;
+      if (refusedTiers.includes(tier.name)) {
+        idx++;
+        continue;
+      }
+      const seatSkip = rungSeatSkip(tier.name, seatUsage, seatCutoffPercent);
+      if (seatSkip) {
+        console.log(
+          `[smart-cauldron] Skipping tier "${tier.name}" during entry: ${formatRungSeatSkip(seatSkip)}`
+        );
+        skipped.push(formatRungSeatSkip(seatSkip));
+        idx++;
+        continue;
+      }
+      if (skipped.length > 0 && tier.name === 'claude') {
+        const claudeAdmission = admitClaudeTier({ usage: seatUsage, thresholdPercent });
+        if (!claudeAdmission.admitted) {
+          console.log(
+            `[smart-cauldron] Skipping tier "claude" during entry: ${claudeAdmission.reason}`
+          );
+          skipped.push(claudeAdmission.reason);
+          idx++;
+          continue;
+        }
+      }
+      break;
+    }
+    if (skipped.length > 0) {
+      const landed = idx === -1 ? undefined : tiers[idx];
+      if (!landed) {
+        throw new Error(
+          `[smart-cauldron/cascade] Every rung from "${entryTierName}" up is over the seat ` +
+            `cutoff or denied (${skipped.join(', ')}); no rung can pass the run-start seat gate.`
+        );
+      }
+      entryTierName = landed.name;
+      entrySelection = {
+        ...entrySelection,
+        entry: landed.name,
+        changed: landed.name !== entrySelection.picked,
+        reason: skipped[0] ?? entrySelection.reason,
+      };
+    }
+  }
+  console.log(
+    `[smart-cauldron] entry selection: ${entrySelection.reason} ` +
+      `picked=${entrySelection.picked} entry=${entrySelection.entry}`
+  );
 
   let currentIndex = tiers.findIndex(t => t.name === entryTierName);
   if (currentIndex === -1) {
@@ -412,7 +809,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         climbCount: 0,
         wonCheap: false,
       },
-      ...(entrySelection ? { entrySelection } : {}),
+      entrySelection,
     };
     const admission = await createRecordImpl(record, outDir);
     onAdmission?.(admission.record, admission.created);
@@ -454,6 +851,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         climbCount: 0,
         wonCheap: false,
       },
+      entrySelection,
     };
     onAdmission?.(blocked, false);
     return blocked;
@@ -488,6 +886,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           climbCount: 0,
           wonCheap: false,
         },
+        entrySelection,
         refusalReason: {
           reason: 'already-satisfied',
           prNumber: existingClaim.number,
@@ -532,12 +931,19 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     let supervisorRecoveryRecord: CascadeRunRecord['supervisorRecovery'];
     let frontierApprovalRecord: CascadeRunRecord['frontierApproval'];
     let refusalReason: CascadeRunRecord['refusalReason'];
+    let gateMisfireRecord: CascadeRunRecord['gateMisfire'];
+    let blockedReason: CascadeRunRecord['blockedReason'];
+    let repairTargetAlternates: CascadeRunRecord['repairTargetAlternates'];
+    let priorPollSnapshot: PriorRunDetail | null = null;
+    let currentPollSnapshot: PriorRunDetail | null = null;
+    let automaticPreflightTier: string | null = null;
 
     function buildCurrentRecord(): CascadeRunRecord {
       const entryTier: TierName = attempts[0]?.tier ?? entryTierName;
       const climbed = climbCount > 0;
       return {
         cascadeId,
+        ...(automaticFireAdmission ? { automaticFireAdmission } : {}),
         woId,
         project: project ?? null,
         request: {
@@ -561,7 +967,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(supervisorRecoveryRecord ? { supervisorRecovery: supervisorRecoveryRecord } : {}),
         ...(frontierApprovalRecord ? { frontierApproval: frontierApprovalRecord } : {}),
         ...(refusalReason ? { refusalReason } : {}),
+        ...(gateMisfireRecord ? { gateMisfire: gateMisfireRecord } : {}),
+        ...(blockedReason ? { blockedReason } : {}),
         ...(entrySelection ? { entrySelection } : {}),
+        ...(repairTargetAlternates ? { repairTargetAlternates } : {}),
       };
     }
 
@@ -569,8 +978,51 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       return writeRecordImpl(buildCurrentRecord(), outDir);
     }
 
+    function nextAdmittedTierIndex(fromIndex: number, context: 'climb' | 'peek'): number {
+      let idx = fromIndex + 1;
+      while (idx < tiers.length) {
+        const candidate = tiers[idx];
+        if (!candidate) return tiers.length;
+        if (refusedTiers.includes(candidate.name)) {
+          console.log(
+            `[smart-cauldron] Skipping refused tier "${candidate.name}" during ${context}`
+          );
+          idx++;
+          continue;
+        }
+        const seatSkip = rungSeatSkip(candidate.name, seatUsage, seatCutoffPercent);
+        if (seatSkip) {
+          console.log(
+            `[smart-cauldron] Skipping tier "${candidate.name}" during ${context}: ` +
+              formatRungSeatSkip(seatSkip)
+          );
+          idx++;
+          continue;
+        }
+        if (candidate.name === 'claude') {
+          const admission = admitClaudeTier({ usage: seatUsage, thresholdPercent });
+          console.log(
+            `[smart-cauldron] Claude tier decision during ${context}: ${admission.reason}`
+          );
+          if (!admission.admitted) {
+            idx++;
+            continue;
+          }
+        }
+        return idx;
+      }
+      return tiers.length;
+    }
+
     // Persist admission before any provider lane can be fired. A duplicate dispatch
     // returns the existing record and cannot create a second provider attempt.
+    if (opts.beforeAdmission && preflightImpl) {
+      const firstTier = tiers[currentIndex];
+      if (!firstTier) throw new Error('automatic_fire_entry_tier_missing');
+      await preflightImpl(firstTier);
+      automaticPreflightTier = firstTier.name;
+    }
+    const automaticFireAdmission = await opts.beforeAdmission?.();
     const admission = await createRecordImpl(buildCurrentRecord(), outDir);
     onAdmission?.(admission.record, admission.created);
     if (!admission.created) return admission.record;
@@ -674,14 +1126,40 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         return true;
       }
 
-      // Climb to next tier, skipping refused (dark/retired) rungs
-      currentIndex++;
-      while (currentIndex < tiers.length && refusedTiers.includes(tiers[currentIndex].name)) {
+      // Fence 3 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): one climb, then stop.
+      // If this cascade's ENTRY tier has a maxClimbsByEntry limit and firing the
+      // next rung would push climbCount past it, stop BLOCKED with reason
+      // climb_limit_reached and escalate once -- do NOT fire another rung. A
+      // failing cheap-lane run must not climb into expensive seats (Grok fence 3:
+      // "One climb, then stop... a Codex 429 must not fall through onto Claude.").
+      const entryClimbLimit = maxClimbsByEntry[entryTierName];
+      if (typeof entryClimbLimit === 'number' && climbCount >= entryClimbLimit) {
+        status = 'blocked';
+        blockedReason = 'climb_limit_reached';
         console.log(
-          `[smart-cauldron] Skipping refused tier "${tiers[currentIndex].name}" during climb`
+          `[smart-cauldron] BLOCKED climb_limit_reached: entry tier "${entryTierName}" allows ` +
+            `${entryClimbLimit} climb(s); tier=${currentTier.name} gate-failed and no further ` +
+            `rung will be fired for woId=${woId}`
         );
-        currentIndex++;
+        await emitEscalation({
+          errorClass: 'validator_rejected',
+          woId,
+          reason:
+            `CLIMB LIMIT REACHED -- entry tier "${entryTierName}" allows ${entryClimbLimit} ` +
+            `climb(s). Tier ${currentTier.name} gate-failed: ${failReason}. The cascade stops ` +
+            'instead of firing a more expensive rung (fence 3).',
+          remediation: [
+            `Entry tier "${entryTierName}" is a fenced cheap lane; its one-climb budget is spent.`,
+            'Re-author or re-route the WO; do not re-fire the same lane expecting a different result.',
+          ],
+          runId,
+          overseerPermit: opts.overseerPermit,
+        });
+        return true;
       }
+
+      // Climb to the next admitted tier, skipping dark or headroom-denied rungs.
+      currentIndex = nextAdmittedTierIndex(currentIndex, 'climb');
       climbCount++;
 
       if (currentIndex >= tiers.length) {
@@ -770,8 +1248,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
      * Returns null when the ladder is exhausted above `fromIndex`.
      */
     function peekNextClimbTier(fromIndex: number): LadderTier | null {
-      let idx = fromIndex + 1;
-      while (idx < tiers.length && refusedTiers.includes(tiers[idx].name)) idx++;
+      const idx = nextAdmittedTierIndex(fromIndex, 'peek');
       return idx < tiers.length ? (tiers[idx] ?? null) : null;
     }
 
@@ -804,9 +1281,11 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         completedAt: null,
       };
       attempts.push(attempt);
+      priorPollSnapshot = currentPollSnapshot;
+      currentPollSnapshot = null;
       await checkpoint();
 
-      if (preflightImpl) {
+      if (preflightImpl && !(attempts.length === 1 && automaticPreflightTier === tier.name)) {
         try {
           await preflightImpl(tier);
         } catch (error) {
@@ -833,10 +1312,15 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       );
 
       // Re-check claim before each provider fire (another cascade or human may
-      // have landed a PR while we were climbing).
+      // have landed a PR while we were climbing). The first attempt still
+      // refuses OPEN and MERGED. A climb refuses only MERGED: an OPEN PR is
+      // the repair target, not a reason to stop.
       if (!allowClaimed) {
         const claimBeforeFire = await findWoClaimImpl(woId, project);
-        if (claimBeforeFire) {
+        const climbing = attempts.length > 1;
+        const refuseClaim =
+          claimBeforeFire !== null && (!climbing || claimBeforeFire.state === 'MERGED');
+        if (claimBeforeFire && refuseClaim) {
           console.log(
             `[smart-cauldron] ALREADY SATISFIED before tier=${tier.name}: PR #${claimBeforeFire.number} ` +
               `[${claimBeforeFire.state}] ${claimBeforeFire.url} -- stopping cascade (refused, not won)`
@@ -858,16 +1342,90 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         }
       }
 
-      // Fire the WO on this tier
+      // Before any retry fire, the prior run's processes must be proven gone
+      // (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01 item 8).
+      const priorRunId = attempts.length > 1 ? (attempts.at(-2)?.runId ?? null) : null;
+      if (priorRunId) {
+        const verdictTeardown = await waitForPriorTeardown(priorRunId, {
+          read: readRunDetailImpl,
+          initial: priorPollSnapshot,
+          waitMs: teardownWaitMs,
+          pollMs: teardownPollMs,
+        });
+        if (verdictTeardown !== 'confirmed') {
+          attempt.outcome = 'infra-error';
+          attempt.infraErrorReason = `teardown_unconfirmed: prior run ${priorRunId} (${verdictTeardown})`;
+          attempt.completedAt = new Date().toISOString();
+          status = 'blocked';
+          blockedReason = 'teardown_unconfirmed';
+          console.log(
+            `[smart-cauldron] BLOCKED teardown_unconfirmed before tier=${tier.name}: ` +
+              `prior run ${priorRunId} ${verdictTeardown}`
+          );
+          await emitEscalation({
+            errorClass: 'worktree_collision',
+            woId,
+            reason:
+              `teardown_unconfirmed: prior run ${priorRunId} teardown ${verdictTeardown}; ` +
+              `tier ${tier.name} not fired`,
+            runId: priorRunId,
+            overseerPermit: opts.overseerPermit,
+          });
+          await checkpoint();
+          break;
+        }
+      }
+
+      // Fire the WO on this tier. A climb (attempts already include this one)
+      // appends a repair-target line when exactly one declaration is selected.
+      let message = buildFireMessage(woId, project, priorContext ?? undefined, opts.expectedSpec);
+      if (attempts.length > 1) {
+        const decision = await resolveClimbRepairTarget(
+          woId,
+          project,
+          listOpenWoPullRequestsImpl,
+          attempts.slice(0, -1),
+          readRunDetailImpl
+        );
+        if (decision.held) {
+          // Fail closed: firing without the lookup could open a second PR for this
+          // WO. One operator message, no fire (bdc-xo #4638).
+          attempt.outcome = 'infra-error';
+          attempt.infraErrorReason = `${CLIMB_HELD_REASON_PREFIX} ${woId}: ${decision.held}`;
+          attempt.completedAt = new Date().toISOString();
+          status = 'infra-alert';
+          await emitEscalation({
+            errorClass: 'service_unavailable',
+            woId,
+            reason:
+              `${CLIMB_HELD_REASON_PREFIX} ${woId} on tier ${tier.name}: ${decision.held}. ` +
+              'Not fired, so no second PR was opened. Re-run the cascade once the lookup works.',
+            overseerPermit: opts.overseerPermit,
+            runId: attempts.at(-2)?.runId ?? null,
+          });
+          await checkpoint();
+          break;
+        }
+        repairTargetAlternates = decision.alternates;
+        if (decision.declaration) message = `${message}\n${decision.declaration}`;
+      }
       const fireResult: FireResult = await fireImpl({
         workflowName: tier.workflowName,
         woId,
         project,
-        message: buildFireMessage(woId, project, priorContext ?? undefined, opts.expectedSpec),
+        message,
         apiBaseUrl,
         token,
+        ...(fetchImpl ? { fetchImpl } : {}),
       });
       attempt.runId = fireResult.runId;
+      if (fireResult.ok && fireResult.runId && opts.onRunDiscovered) {
+        try {
+          opts.onRunDiscovered(fireResult.runId, cascadeId, tier.name);
+        } catch {
+          // Observation hook only; never alters the climb.
+        }
+      }
 
       // Infra error: alert + stop (do NOT count as "too hard")
       if (!fireResult.ok) {
@@ -938,6 +1496,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           workflowName: tier.workflowName,
           apiBaseUrl,
           token,
+          ...(fetchImpl ? { fetchImpl } : {}),
           floorMs: DEFAULT_OPEN_NODE_BUDGET_MS,
         });
       } catch (err) {
@@ -954,11 +1513,14 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           runId: resolvedRunId,
           apiBaseUrl,
           token,
+          ...(fetchImpl ? { fetchImpl } : {}),
+          ...(opts.isTransitionalStatus ? { isTransitionalStatus: opts.isTransitionalStatus } : {}),
           timeoutMs: pollTimeoutMs,
           stallTimeoutMs: pollStallTimeoutMs,
           intervalMs: pollIntervalMs,
           nodeTimeoutsMs,
           repo: resolveGithubRepo(project),
+          woId,
         });
       } catch (pollErr) {
         if (pollErr instanceof TimeoutError) {
@@ -1013,6 +1575,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
             runId: resolvedRunId,
             apiBaseUrl,
             token,
+            ...(fetchImpl ? { fetchImpl } : {}),
             reason: `smart-cauldron stall: ${timeoutReason}; cascade ${cascadeId}`,
           }).catch((cancelErr: unknown) => ({
             ok: false,
@@ -1059,6 +1622,11 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         break;
       }
 
+      currentPollSnapshot = {
+        status: pollResult.terminalStatus,
+        metadata: pollResult.rawMetadata ?? {},
+      };
+
       // Judge the gate
       const verdict: GateVerdict = judgeImpl(pollResult);
       const outcome = classifyAttemptOutcome(fireResult, verdict);
@@ -1090,14 +1658,134 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         break;
       }
 
+      // Run-start seat refusal (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01):
+      // the run never dispatched a node, so this is neither a quality failure
+      // nor a gate misfire. Climb to the next rung with headroom without
+      // building informed-climb context and without SPEC-REPAIR.
+      const seatRefusal = seatRefusalDetail(pollResult);
+      if (seatRefusal) {
+        attempt.gateFailReason = `seat_refusal: ${seatRefusal}`;
+        // Fence 3 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01): the one-climb cap
+        // also applies to a seat-refusal climb. If this cascade's ENTRY tier has
+        // a maxClimbsByEntry limit and a further climb would exceed it, stop
+        // BLOCKED (climb_limit_reached) with one escalation rather than firing
+        // another rung.
+        const entryClimbLimitSeat = maxClimbsByEntry[entryTierName];
+        if (typeof entryClimbLimitSeat === 'number' && climbCount >= entryClimbLimitSeat) {
+          status = 'blocked';
+          blockedReason = 'climb_limit_reached';
+          console.log(
+            '[smart-cauldron] BLOCKED climb_limit_reached (seat refusal): entry tier ' +
+              `"${entryTierName}" allows ${entryClimbLimitSeat} climb(s); tier=${tier.name} was ` +
+              `seat-refused and no further rung will be fired for woId=${woId}`
+          );
+          await emitEscalation({
+            errorClass: 'validator_rejected',
+            woId,
+            reason:
+              `CLIMB LIMIT REACHED -- entry tier "${entryTierName}" allows ` +
+              `${entryClimbLimitSeat} climb(s). Tier ${tier.name} was seat-refused ` +
+              `(${seatRefusal}). The cascade stops instead of firing a more expensive rung ` +
+              '(fence 3).',
+            remediation: [
+              `Entry tier "${entryTierName}" is a fenced cheap lane; its one-climb budget is spent.`,
+              'Resolve the seat pressure or re-route the WO; do not auto-climb into a paid seat.',
+            ],
+            runId: fireResult.runId,
+            overseerPermit: opts.overseerPermit,
+          });
+          await checkpoint();
+          break;
+        }
+        console.log(
+          `[smart-cauldron] Seat refusal on tier=${tier.name}: ${seatRefusal} -- ` +
+            'climbing to the next rung with headroom (not a quality failure)'
+        );
+        currentIndex = tier.isFrontier
+          ? tiers.length
+          : nextAdmittedTierIndex(currentIndex, 'climb');
+        climbCount++;
+        if (currentIndex >= tiers.length) {
+          status = 'blocked';
+          console.log(
+            `[smart-cauldron] BLOCKED: no rung above tier=${tier.name} has seat headroom ` +
+              `for woId=${woId}`
+          );
+          await checkpoint();
+          break;
+        }
+        await checkpoint();
+        continue;
+      }
+
+      // Harness gate misfire: the gate failed for a harness-side reason, not
+      // because the implement tier produced bad work. Stop on this tier with
+      // one Dispatch notice. Do not climb and do not post SPEC-REPAIR.
+      if (outcome === 'gate-failed') {
+        const misfire = classifyGateMisfire(pollResult);
+        if (misfire) {
+          attempt.outcome = 'gate-misfire';
+          attempt.gateFailReason = `${misfire.kind}: ${misfire.reason}`;
+          status = 'gate-misfire';
+          winningTier = null;
+          gateMisfireRecord = {
+            kind: misfire.kind,
+            gateNode: misfire.gateNode,
+            failedNodes: misfire.failedNodes,
+            reason: misfire.reason,
+            runId: fireResult.runId,
+            tier: tier.name,
+          };
+          await emitEscalation({
+            errorClass: 'harness_gate_misfire',
+            woId,
+            reason:
+              `GATE MISFIRE (no climb): ${misfire.kind} at ${misfire.gateNode} ` +
+              `on tier ${tier.name} -- ${misfire.reason}`,
+            remediation: [
+              'Fix owner: harness gate (sibling gate WOs, bdc-xo#3743, or bdc-xo#3737). Do not treat this as an implement failure.',
+              'Re-fire the same tier after the harness fix lands; do not escalate',
+            ],
+            runId: fireResult.runId,
+            overseerPermit: opts.overseerPermit,
+          });
+          await checkpoint();
+          break;
+        }
+      }
+
+      // A failed repair checkout (held branch, gate closed on checkout) is not a
+      // quality failure: a bigger model cannot free the branch. Stop blocked with
+      // one escalation (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01 item 8).
+      if (isCheckoutFailedNoClimb(pollResult)) {
+        attempt.gateFailReason = `checkout_failed_no_climb: ${verdict.reason}`;
+        status = 'blocked';
+        blockedReason = 'checkout_failed_no_climb';
+        console.log(
+          `[smart-cauldron] BLOCKED checkout_failed_no_climb on tier=${tier.name} for woId=${woId}`
+        );
+        await emitEscalation({
+          errorClass: 'worktree_collision',
+          woId,
+          reason:
+            `checkout_failed_no_climb: repair checkout failed on tier ${tier.name}; ` +
+            'not climbing (a held branch is not a model-quality failure)',
+          runId: fireResult.runId,
+          overseerPermit: opts.overseerPermit,
+        });
+        await checkpoint();
+        break;
+      }
+
       // Gate failed
       console.log(`[smart-cauldron] Gate failed on tier=${tier.name}: ${verdict.reason}`);
 
       // Before climbing, re-check whether the work already landed under another
       // branch/PR the per-run event feed missed (the classic 5-tier burn).
+      // MERGED still stops the climb. OPEN does not: the climb repairs that PR.
       if (!allowClaimed) {
         const claimBeforeClimb = await findWoClaimImpl(woId, project);
-        if (claimBeforeClimb) {
+        if (claimBeforeClimb?.state === 'MERGED') {
           console.log(
             `[smart-cauldron] ALREADY SATISFIED after gate-fail on tier=${tier.name}: ` +
               `PR #${claimBeforeClimb.number} [${claimBeforeClimb.state}] ${claimBeforeClimb.url} ` +
@@ -1140,6 +1828,137 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Formats `Repair target: PR #<number> (branch <branch>)`.
+ * Caller validates the number and branch before calling.
+ */
+export const REPAIR_TARGET_DECLARATION = (prNumber: number, branch: string): string =>
+  `Repair target: PR #${String(prNumber)} (branch ${branch})`;
+
+/** Options a climb passes to the open-PR reader (bdc-xo #4638). */
+export interface OpenWoPullRequestLookupOptions {
+  /** Head branches of earlier attempts' runs; a PR on one claims the WO. */
+  readonly headBranches?: readonly string[];
+  /** Throw on a lookup error instead of failing open to []. */
+  readonly failOnError?: boolean;
+}
+
+/**
+ * Start of the single operator message when a climb cannot finish its repair-target
+ * lookup. The climb is held (not fired) so it can never open a second PR for a WO
+ * whose earlier rung already opened one (acting XO 2026-11-04, bdc-xo #4638).
+ */
+export const CLIMB_HELD_REASON_PREFIX = 'climb held: repair-target lookup failed for';
+
+interface ClimbRepairDecision {
+  readonly declaration: string | null;
+  readonly alternates: CascadeRunRecord['repairTargetAlternates'];
+  /** Set when the lookup could not complete; the climb must not fire. */
+  readonly held?: string;
+}
+
+function isValidRepairCandidate(pr: OpenWoPullRequest): boolean {
+  return (
+    Number.isInteger(pr.number) &&
+    pr.number > 0 &&
+    pr.headRefName.length > 0 &&
+    !/\s/.test(pr.headRefName)
+  );
+}
+
+/** Newest createdAt first, then higher PR number. */
+function compareOpenPrNewest(a: OpenWoPullRequest, b: OpenWoPullRequest): number {
+  if (a.createdAt !== b.createdAt) return a.createdAt < b.createdAt ? 1 : -1;
+  return b.number - a.number;
+}
+
+function logClimbRepairTarget(woId: string, pr: number | 'none', reason: string): void {
+  console.log(
+    `[smart-cauldron] climb repair-target woId=${woId} pr=${String(pr)} reason=${reason}`
+  );
+}
+
+/**
+ * Select the repair target for a climb fire. Never throws: a reader error,
+ * an empty list, or an invalid selected candidate yields no declaration.
+ */
+async function resolveClimbRepairTarget(
+  woId: string,
+  project: string,
+  read: (
+    woId: string,
+    project: string,
+    options?: OpenWoPullRequestLookupOptions
+  ) => Promise<OpenWoPullRequest[]>,
+  priorAttempts: readonly { readonly runId: string | null }[] = [],
+  readRunDetail?: (runId: string) => Promise<PriorRunDetail | null>
+): Promise<ClimbRepairDecision> {
+  const none: ClimbRepairDecision = { declaration: null, alternates: undefined };
+  // Earlier runs' head branches find a PR that carries no WO marker (#1476).
+  const headBranches: string[] = [];
+  for (const prior of priorAttempts) {
+    if (!prior.runId || !readRunDetail) continue;
+    let detail: PriorRunDetail | null;
+    try {
+      detail = await readRunDetail(prior.runId);
+    } catch {
+      detail = null;
+    }
+    if (!detail) {
+      logClimbRepairTarget(woId, 'none', `run_detail_unavailable:${prior.runId}`);
+      return { ...none, held: `run detail unavailable for prior run ${prior.runId}` };
+    }
+    const head = detail.metadata?.head_branch;
+    if (typeof head === 'string' && head.length > 0) headBranches.push(head);
+  }
+  let opens: OpenWoPullRequest[];
+  try {
+    opens = await read(woId, project, { headBranches, failOnError: true });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    logClimbRepairTarget(woId, 'none', 'reader_error');
+    return { ...none, held: `open-PR lookup failed (${detail.slice(0, 200)})` };
+  }
+  if (!Array.isArray(opens)) {
+    logClimbRepairTarget(woId, 'none', 'reader_error');
+    return { ...none, held: 'open-PR lookup returned no list' };
+  }
+  if (opens.length === 0) {
+    logClimbRepairTarget(woId, 'none', 'none');
+    return none;
+  }
+  const sorted = [...opens].sort(compareOpenPrNewest);
+  const selected = sorted[0];
+  if (!selected || !isValidRepairCandidate(selected)) {
+    const label =
+      selected && Number.isFinite(selected.number) ? `#${String(selected.number)}` : 'unreadable';
+    logClimbRepairTarget(woId, 'none', `invalid_candidate:${label}`);
+    return none;
+  }
+  const alternates =
+    sorted.length > 1
+      ? sorted.slice(1).map(pr => ({ number: pr.number, headRefName: pr.headRefName }))
+      : undefined;
+  const reason = sorted.length === 1 ? 'single_open' : 'newest_of_many';
+  logClimbRepairTarget(woId, selected.number, reason);
+  return {
+    declaration: REPAIR_TARGET_DECLARATION(selected.number, selected.headRefName),
+    alternates,
+  };
+}
+
+/**
+ * The run-start seat refusal detail (`seat_usage_refused:...`) when a fired
+ * run was refused by the seat gate before any node ran, else null. The
+ * executor stores the detail as the run's metadata.error.
+ */
+export function seatRefusalDetail(poll: PollResult): string | null {
+  if (poll.terminalStatus !== 'failed') return null;
+  const error = poll.rawMetadata.error;
+  if (typeof error !== 'string' || !error.startsWith('seat_usage_refused:')) return null;
+  return error;
+}
 
 /**
  * Build informed-climb context to pass to the next tier.

@@ -18,7 +18,7 @@
  *
  * The prompt is NEVER an argv element. Per binary:
  *
- * - `codex`: `bunx @openai/codex exec --skip-git-repo-check`, prompt on stdin.
+ * - `codex`: `bunx @openai/codex@<pin> exec --skip-git-repo-check --model <MODEL>`, prompt on stdin.
  *   With no positional PROMPT, "instructions are read from stdin" (`codex exec
  *   --help`, verified in the container 2026-09-07; matches the board skill's
  *   2026-07-26 finding). 'codex' is not a container binary; the CLI runs via
@@ -57,6 +57,56 @@ export interface JudgeTransport {
   promptFile?: string;
   /** Private 0700 directory containing `promptFile`; removed with it. */
   promptDir?: string;
+  /** PR review jobs are submitted to the UID-1002 broker, never spawned here. */
+  brokerJob?: { checkout: string; expectedHead: string; argv: string[]; prompt: string };
+}
+
+export interface PrReviewTransportContext {
+  readonly kind: 'pr-review';
+  readonly cwd: string;
+  readonly expectedHeadSha: string;
+  readonly nativePolicy: 'codex_bubblewrap';
+}
+
+/** PR-only transport. Shared judge callers continue to use buildJudgeTransport unchanged. */
+export async function buildPrReviewTransport(
+  binary: string,
+  prompt: string,
+  context: PrReviewTransportContext
+): Promise<JudgeTransport> {
+  if (binary !== 'codex') {
+    throw new Error('pr_review_native_sandbox_unsupported_binary');
+  }
+  if (!context.cwd || !context.expectedHeadSha) {
+    throw new Error('pr_review_native_sandbox_context_invalid');
+  }
+  const argv = [
+    'bunx',
+    '--offline',
+    CODEX_JUDGE_CLI_PACKAGE,
+    '-c',
+    'web_search="disabled"',
+    'exec',
+    '--json',
+    '--sandbox',
+    'workspace-write',
+    '-c',
+    'sandbox_workspace_write.network_access=false',
+    '--skip-git-repo-check',
+    '--cd',
+    context.cwd,
+    '--model',
+    resolveCodexJudgeModel(),
+  ];
+  return {
+    argv,
+    brokerJob: {
+      checkout: context.cwd,
+      expectedHead: context.expectedHeadSha,
+      argv,
+      prompt,
+    },
+  };
 }
 
 /** Owner-only directory (rwx------). */
@@ -107,11 +157,61 @@ export function resolveCursorJudgeModel(
     : DEFAULT_CURSOR_JUDGE_MODEL;
 }
 
+/**
+ * Exact Codex CLI pin shared by the judge rung, the reviewer broker, execution
+ * proofs, and the sandbox smoke attestation. GPT-6 models need codex-cli >= 0.155.
+ * The harness SDK pin in packages/providers/package.json is the same version
+ * (a test keeps the two equal).
+ */
+export const CODEX_JUDGE_CLI_VERSION = '0.159.2';
+
+/**
+ * The Codex CLI the `codex` judge rung runs, pinned to an exact version rather
+ * than floating `bunx` latest.
+ */
+export const CODEX_JUDGE_CLI_PACKAGE = `@openai/codex@${CODEX_JUDGE_CLI_VERSION}`;
+
+/**
+ * Default model for the `codex` judge rung (John 2026-11-01: the Overseer judge
+ * runs GPT-6.1 Sol, never the CLI default). Override with
+ * OVERSEER_CODEX_JUDGE_MODEL; a blank value falls back to the default.
+ */
+export const DEFAULT_CODEX_JUDGE_MODEL = 'gpt-6.1-sol';
+
+export function resolveCodexJudgeModel(
+  env: Record<string, string | undefined> = process.env
+): string {
+  const configured = env.OVERSEER_CODEX_JUDGE_MODEL;
+  return typeof configured === 'string' && configured.trim().length > 0
+    ? configured.trim()
+    : DEFAULT_CODEX_JUDGE_MODEL;
+}
+
+/**
+ * The model identity recorded on a verdict for one ladder rung. The codex rung
+ * records `codex:<model>` so a post-deploy check can prove which model ran; other
+ * rungs keep their bare binary name.
+ */
+export function describeJudgeModel(
+  binary: string,
+  env: Record<string, string | undefined> = process.env
+): string {
+  return binary === 'codex' ? `codex:${resolveCodexJudgeModel(env)}` : binary;
+}
+
 /** argv plus prompt delivery for one ladder rung. The prompt is never in argv. */
 export async function buildJudgeTransport(binary: string, prompt: string): Promise<JudgeTransport> {
   if (binary === 'codex') {
     return {
-      argv: ['bunx', '@openai/codex', 'exec', '--skip-git-repo-check'],
+      // --model stays LAST in argv (same shape as the cursor rung).
+      argv: [
+        'bunx',
+        CODEX_JUDGE_CLI_PACKAGE,
+        'exec',
+        '--skip-git-repo-check',
+        '--model',
+        resolveCodexJudgeModel(),
+      ],
       stdinPrompt: prompt,
     };
   }

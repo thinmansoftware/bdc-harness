@@ -121,6 +121,40 @@ bun test
 
 25 tests cover all error classes + decisions. New rules require new tests (fail-closed pattern).
 
+## Unreviewed-head reconcile
+
+`src/unreviewed-head-reconcile.ts` (WO-HARNESS-OVERSEER-UNREVIEWED-HEAD-RECONCILE-01)
+requests a review for every open, non-draft PR on a watched repo whose current
+head has no `overseer-reviewer` row at all -- the case where the push webhook was
+lost (for example while archon-app-1 was being rebuilt). The server starts it next
+to the review worker clock whenever the review route is configured: one pass at
+startup, then one every interval. It enqueues through the push path's own
+`enqueueReviewWork` (key `pr-review:<owner>/<repo>#<n>@<head>`, repeat_reason
+`reconcile:unreviewed_head:<head>`), so it cannot double-queue a head. Drafts are
+the only class skipped; the intake's custody, `dirty` and judge-ladder refusals
+are honored and counted separately.
+
+| Env | Default | Meaning |
+|---|---|---|
+| `OVERSEER_MERGE_DISCOVERY_REPOS` | (unset = no repos) | Watched `owner/repo` list, shared with merge discovery |
+| `OVERSEER_UNREVIEWED_HEAD_RECONCILE_MINUTES` | `15` | Minutes between passes (positive integer) |
+| `OVERSEER_UNREVIEWED_HEAD_RECONCILE_DRY_RUN` | off | `1`/`true`/`yes`: enqueue nothing; log `reconcile_would_enqueue <owner>/<repo>#<n>@<head>` per PR |
+| `OVERSEER_UNREVIEWED_HEAD_RECONCILE_WINDOW_HOURS` | `48` | Only PRs whose `updated_at` is inside this many hours are considered (positive integer; invalid = 48 with a warn log) |
+| `OVERSEER_UNREVIEWED_HEAD_RECONCILE_MAX_PER_PASS` | `10` | Most enqueues per pass, most recently updated first across all repos; in dry-run it caps `would_enqueue` (positive integer; invalid = 10 with a warn log) |
+
+Window and cap (acting XO ruling, fence 281): the first dry run reported
+`would_enqueue=91`, mostly long-dead PRs, and reviews run one at a time. The ruling
+allows head commit date OR `updated_at`; the open-PR listing does not carry the
+head commit date, so `updated_at` alone is used (a push moves it) and no per-PR
+API call is made. A PR with no readable `updated_at` counts as outside the window.
+Heads left over by the cap are picked up by the next pass.
+
+Each enqueue logs `reconcile_enqueued <owner>/<repo>#<n>@<head>`; each pass logs
+`reconcile_unreviewed_head_pass scanned=N skipped=N outside_window=N capped=N already_requested=N enqueued=N ...`.
+`skipped` counts drafts only.
+Run it in dry-run once on a host before the first live pass and read the
+`reconcile_would_enqueue` lines from the container log.
+
 ## Roadmap to v2 (post-Mutant Market install June 15)
 
 - Wire into `dag-executor.ts` per integration shape above

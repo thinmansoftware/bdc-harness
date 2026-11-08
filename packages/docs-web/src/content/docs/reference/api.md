@@ -138,6 +138,7 @@ Performs a soft delete -- the conversation is hidden but not destroyed.
 | GET | `/api/codebases` | List registered codebases |
 | GET | `/api/codebases/{id}` | Get a single codebase |
 | POST | `/api/codebases` | Register a codebase (clone or local path) |
+| PATCH | `/api/codebases/{id}` | Edit a codebase registration |
 | DELETE | `/api/codebases/{id}` | Delete a codebase and clean up resources |
 | GET | `/api/codebases/{id}/environments` | List isolation environments for a codebase |
 
@@ -163,6 +164,15 @@ Register a local path:
 curl -X POST http://localhost:3090/api/codebases \
   -H "Content-Type: application/json" \
   -d '{"path": "/home/user/projects/my-repo"}'
+```
+
+### Edit a Codebase
+
+```bash
+curl -X PATCH http://localhost:3090/api/codebases/{id} \
+  -H 'x-archon-operator-token: ...' \
+  -H 'content-type: application/json' \
+  -d '{"default_branch":"staging"}'
 ```
 
 ### Delete a Codebase

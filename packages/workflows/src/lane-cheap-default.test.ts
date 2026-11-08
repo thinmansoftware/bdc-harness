@@ -49,9 +49,9 @@ describe('lane cheap defaults (no Claude usage leak)', () => {
     }
   });
 
-  it('S3b: exempt main Claude lane retains top-level `model: sonnet`', () => {
+  it('S3b: exempt main Claude lane retains top-level `model: claude-sonnet-5-5`', () => {
     const content = readFileSync(join(LANES_DIR, EXEMPT_LANE), 'utf-8');
-    expect(/^model:\s*sonnet\s*$/m.test(content)).toBe(true);
+    expect(/^model:\s*claude-sonnet-5-5\s*$/m.test(content)).toBe(true);
   });
 
   it('S3c: exempt main Claude lane has the exemption comment', () => {

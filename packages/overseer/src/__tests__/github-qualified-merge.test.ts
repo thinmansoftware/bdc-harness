@@ -1,6 +1,13 @@
-import { describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { join } from 'path';
+import { closeDatabase, resetDatabase } from '@archon/core/db';
+import { createAuthenticatedMessage } from '@archon/core/db/dispatch';
+import { PR_REVIEW_LOG_RECIPIENT } from '@archon/core/db/dispatch-routing';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
 import { createGitHubQualifiedMergeAdapter } from '../adapters/github-qualified-merge.ts';
+import { REVIEW_SENDER, reviewSubjectKey } from '../pr-review-wiring.ts';
 import {
+  createRealGitHubClientDeps,
   createRealFindPullRequest,
   createRealMergePullRequest,
   type RealGitHubOctokitLike,
@@ -117,11 +124,16 @@ describe('real GitHub deps', () => {
       checks: {
         listForRef: async () => ({
           data: {
+            // findPullRequest now keeps only the latest attempt per check name
+            // and app, so each run carries its own name and id, as GitHub's do.
+            // A stale earlier attempt of "lint" must not count.
             check_runs: [
-              { status: 'completed', conclusion: 'success' },
-              { status: 'completed', conclusion: 'neutral' },
-              { status: 'completed', conclusion: 'failure' },
-              { status: 'in_progress', conclusion: null },
+              { id: 1, name: 'lint', status: 'completed', conclusion: 'failure' },
+              { id: 2, name: 'build', status: 'completed', conclusion: 'success' },
+              { id: 3, name: 'docs', status: 'completed', conclusion: 'neutral' },
+              { id: 4, name: 'unit', status: 'completed', conclusion: 'failure' },
+              { id: 5, name: 'e2e', status: 'in_progress', conclusion: null },
+              { id: 6, name: 'lint', status: 'completed', conclusion: 'success' },
             ],
           },
         }),
@@ -142,14 +154,20 @@ describe('real GitHub deps', () => {
       state: 'all',
       per_page: 5,
     });
-    expect(search).toHaveBeenCalledWith({
-      q: 'repo:thinmansoftware/bdc-harness is:pr is:open "WO-42"',
-      per_page: 5,
+    expect(search).not.toHaveBeenCalled();
+    expect(list).toHaveBeenCalledWith({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      state: 'open',
+      per_page: 100,
+      page: 1,
+      sort: 'created',
+      direction: 'asc',
     });
     expect(result).toMatchObject({
       exists: true,
       state: 'open',
-      checks: { total: 4, passed: 2, failed: 1, pending: 1 },
+      checks: { total: 5, passed: 3, failed: 1, pending: 1 },
       pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
     });
   });
@@ -162,15 +180,20 @@ describe('real GitHub deps', () => {
       data: {
         number: 77,
         title: 'WO-FALLBACK-77',
+        body: null,
         state: 'open',
         mergeable: true,
         html_url: 'https://github.test/pull/77',
         changed_files: 1,
-        head: { sha: 'b'.repeat(40) },
+        head: { sha: 'b'.repeat(40), ref: 'fix/fallback' },
       },
     }));
     const octokit = createOctokitMock({
-      pulls: { ...createOctokitMock().pulls, get },
+      pulls: {
+        ...createOctokitMock().pulls,
+        get,
+        list: async request => ({ data: request.head ? [] : [(await get()).data] }),
+      },
       search: { issuesAndPullRequests: search },
     });
 
@@ -181,10 +204,7 @@ describe('real GitHub deps', () => {
       woId: 'WO-FALLBACK-77',
     });
 
-    expect(search).toHaveBeenCalledWith({
-      q: 'repo:thinmansoftware/bdc-harness is:pr is:open "WO-FALLBACK-77"',
-      per_page: 5,
-    });
+    expect(search).not.toHaveBeenCalled();
     expect(get).toHaveBeenCalledWith({
       owner: 'thinmansoftware',
       repo: 'bdc-harness',
@@ -354,5 +374,122 @@ describe('real GitHub deps', () => {
       merged: false,
       message: 'Pull Request is not mergeable',
     });
+  });
+});
+
+/**
+ * WO-HARNESS-MERGE-MANAGER-POST-REBUILD-STALL-01: the merge gate must read
+ * receipts where the submit path writes them. #1390 moved receipts to
+ * PR_REVIEW_LOG_RECIPIENT while hasQualifiedReview still read only `operator`,
+ * so every PR was review_execution_unqualified and nothing merged.
+ */
+describe('hasQualifiedReview reads receipts where the submit path writes them', () => {
+  const owner = 'thinmansoftware';
+  const repo = 'bdc-xo';
+  const number = 4269;
+  const head = 'c'.repeat(40);
+  let home = '';
+  const oldHome = process.env.ARCHON_HOME;
+  const oldUrl = process.env.DATABASE_URL;
+
+  beforeEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    home = join(
+      import.meta.dir,
+      `.test-qualified-receipt-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    );
+    process.env.ARCHON_HOME = home;
+    delete process.env.DATABASE_URL;
+  });
+
+  afterEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    if (oldHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = oldHome;
+    if (oldUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = oldUrl;
+    removeTempDirWithRetry(home);
+  });
+
+  /** Same call shape as the submit-receipt writer in pr-review-wiring.ts. */
+  async function writeReceipt(
+    recipient: string,
+    id: string,
+    overrides: { disposition?: string; headSha?: string; proof?: unknown } = {}
+  ): Promise<void> {
+    const headSha = overrides.headSha ?? head;
+    await createAuthenticatedMessage(
+      { kind: 'system', sender: REVIEW_SENDER },
+      {
+        correlation_id: `pr-review:${owner}/${repo}#${number}@${headSha}`,
+        idempotency_key: `pr-review-submit-receipt:${id}:${overrides.disposition ?? 'approved'}`,
+        task_type: 'run_report',
+        recipient,
+        subject_key: reviewSubjectKey(owner, repo, number),
+        repeat_reason: `review_verdict_receipt:${id}`,
+        body: JSON.stringify({
+          kind: 'pr_review_submit_receipt',
+          owner,
+          repo,
+          prNumber: number,
+          headSha,
+          disposition: overrides.disposition ?? 'approved',
+          event: 'APPROVE',
+          executionProof:
+            overrides.proof === undefined
+              ? {
+                  headSha,
+                  inspectionObserved: true,
+                  check_plan: 'absent',
+                  checks: [],
+                  nativePolicy: 'codex_bubblewrap',
+                  runtimeUid: 1002,
+                }
+              : overrides.proof,
+          githubReview: { id: 5736844687, commitSha: headSha, state: 'APPROVED' },
+        }),
+      }
+    );
+  }
+
+  const qualified = (headSha = head): Promise<boolean> =>
+    createRealGitHubClientDeps({} as RealGitHubOctokitLike).hasQualifiedReview!({
+      owner,
+      repo,
+      number,
+      headSha,
+    });
+
+  test('an approved receipt in the review log qualifies', async () => {
+    await writeReceipt(PR_REVIEW_LOG_RECIPIENT, 'log-approved');
+    expect(await qualified()).toBe(true);
+  });
+
+  test('a pre-cut-off receipt at operator still qualifies', async () => {
+    await writeReceipt('operator', 'legacy-approved');
+    expect(await qualified()).toBe(true);
+  });
+
+  test('the submit writer and the merge gate use the same recipient constant', async () => {
+    const writer = await Bun.file(join(import.meta.dir, '..', 'pr-review-wiring.ts')).text();
+    const submit = writer.slice(writer.indexOf('pr-review-submit-receipt:'));
+    expect(submit.slice(0, 400)).toContain('recipient: PR_REVIEW_LOG_RECIPIENT');
+    const reader = await Bun.file(
+      join(import.meta.dir, '..', 'adapters', 'github-real-deps.ts')
+    ).text();
+    const gate = reader.slice(reader.indexOf('hasQualifiedReview: async'));
+    expect(gate.slice(0, 1200)).toContain('recipient: PR_REVIEW_LOG_RECIPIENT');
+  });
+
+  test('qualification still fails closed in the review log', async () => {
+    await writeReceipt(PR_REVIEW_LOG_RECIPIENT, 'changes', { disposition: 'changes_requested' });
+    await writeReceipt(PR_REVIEW_LOG_RECIPIENT, 'other-head', { headSha: 'd'.repeat(40) });
+    await writeReceipt(PR_REVIEW_LOG_RECIPIENT, 'bad-proof', {
+      proof: { headSha: head, inspectionObserved: false, check_plan: 'absent', checks: [] },
+    });
+    expect(await qualified()).toBe(false);
+    expect(await qualified('e'.repeat(40))).toBe(false);
   });
 });

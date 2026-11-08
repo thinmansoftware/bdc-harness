@@ -11,7 +11,8 @@ function proposal(overrides: Partial<ActionProposal> = {}): ActionProposal {
   return {
     type: 'nudge',
     threadRef: 'gh:thinmansoftware/bdc-harness#7',
-    recipient: 'xo',
+    // escalate_p0 may ONLY address 't3-desktop' (WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01).
+    recipient: overrides.type === 'escalate_p0' ? 't3-desktop' : 'xo',
     // Content-complete per the M-155 WO 3 structural contract: quoted title,
     // owner slot, next-action clause (what composeNudgeBody produces).
     body:
@@ -112,6 +113,11 @@ describe('validateProposal', () => {
       // 'duty-officer' is admitted ONLY for blocker_report (asserted in its own
       // blocker_report: test); an ordinary nudge to it is a forbidden effect.
       if (recipient === 'duty-officer') continue;
+      // 't3-desktop' is admitted ONLY for escalate_p0 (asserted in the
+      // routing-cutoff test file).
+      if (recipient === 't3-desktop') continue;
+      // Relay recipient requires its versioned JSON contract (recipients.test.ts).
+      if (recipient === 't3-desk-local') continue;
       expect(validateProposal(proposal({ recipient })).allowed).toBe(true);
     }
   });
@@ -324,6 +330,50 @@ describe('blocker_report guard (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)',
       ...overrides,
     };
   }
+
+  test.each([
+    'https://evil.example/https://github.com/owner/repo/issues/7',
+    'https://github.com.evil.example/https://github.com/owner/repo/issues/7',
+    'https://evil.example/?next=https://github.com/owner/repo/issues/7',
+    'https://evil.example/#https://github.com/owner/repo/issues/7',
+    'https://github.com@evil.example/https://github.com/owner/repo/issues/7',
+    'xhttps://github.com/owner/repo/issues/7',
+    'https://github.com/owner/repo',
+    'https://github.com/owner/repo/pull/7',
+    'https://github.com/owner/repo/issues/0',
+    'https://github.com/owner/repo/issues/7/extra',
+    'https://user:placeholder@github.com/owner/repo/issues/7',
+    'https://github.com:8443/owner/repo/issues/7',
+    'http://github.com/owner/repo/issues/7',
+    'https://github.com/',
+    'https://github.com:invalid/owner/repo/issues/7',
+    'https://github.com.evil.example/owner/repo/issues/7',
+  ])('blocker_report: rejects an invalid issue URL as ordinary incomplete content: %s', url => {
+    const original = blockerProposal();
+    const result = validateProposal({
+      ...original,
+      body: original.body.replace('https://github.com/thinmansoftware/bdc-harness/issues/7', url),
+    });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain('content_incomplete');
+    expect(result.forbiddenEffect).not.toBe(true);
+  });
+
+  test.each([
+    'https://github.com/thinmansoftware/bdc-harness/issues/7',
+    'https://github.com:443/owner/repo/issues/7',
+    'https://GITHUB.com/owner/repo.name/issues/7#issuecomment-123',
+    'https://github.com/owner/repo_name/issues/7?notification_referrer_id=123',
+    'https://evil.example/ignored https://github.com/owner/repo/issues/7',
+  ])('blocker_report: keeps a real GitHub issue URL eligible: %s', url => {
+    const original = blockerProposal();
+    expect(
+      validateProposal({
+        ...original,
+        body: original.body.replace('https://github.com/thinmansoftware/bdc-harness/issues/7', url),
+      }).allowed
+    ).toBe(true);
+  });
 
   test('blocker_report: guard admits duty-officer only for blocker_report', () => {
     // (1) valid blocker_report to duty-officer -> allowed

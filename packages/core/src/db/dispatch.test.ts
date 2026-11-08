@@ -149,69 +149,118 @@ interface MailboxProcessResult {
 async function runMailboxRace(
   archonHome: string,
   action: 'acknowledge' | 'address',
-  messageId: string
+  messageId: string,
+  beforeStart?: () => Promise<void>
 ): Promise<MailboxProcessResult[]> {
   const dispatchUrl = pathToFileURL(resolve(import.meta.dir, 'dispatch.ts')).href;
   const connectionUrl = pathToFileURL(resolve(import.meta.dir, 'connection.ts')).href;
   const startFile = join(archonHome, `${action}.start`);
   const childScript = `
-    const { acknowledgeMessage, addressMessage } = await import(${JSON.stringify(dispatchUrl)});
-    const { closeDatabase, getDatabase } = await import(${JSON.stringify(connectionUrl)});
-    getDatabase();
-    await Bun.write(process.env.READY_FILE, 'ready');
-    while (!(await Bun.file(process.env.START_FILE).exists())) await Bun.sleep(2);
+    let phase = 'imports';
+    let closeDatabase;
     try {
+      const { acknowledgeMessage, addressMessage } = await import(${JSON.stringify(dispatchUrl)});
+      const connection = await import(${JSON.stringify(connectionUrl)});
+      closeDatabase = connection.closeDatabase;
+      phase = 'schema_ready';
+      const database = connection.getDatabase();
+      if (database.dialect !== 'sqlite') throw new Error('mailbox_fixture_requires_sqlite');
+      // Complete lazy schema installation during sequential startup, not inside
+      // the simultaneous mailbox operation this fixture is intended to test.
+      await database.query('SELECT 1 AS mailbox_schema_ready');
+      phase = 'start_barrier';
+      await Bun.write(process.env.READY_FILE, 'ready');
+      while (!(await Bun.file(process.env.START_FILE).exists())) await Bun.sleep(2);
+      phase = process.env.MAILBOX_ACTION;
       const result = process.env.MAILBOX_ACTION === 'acknowledge'
         ? await acknowledgeMessage({ id: process.env.MESSAGE_ID, principal_id: 'operator' })
         : await addressMessage({ id: process.env.MESSAGE_ID, principal_id: 'operator' });
       process.stdout.write(JSON.stringify(result));
     } catch (error) {
-      process.stderr.write(error instanceof Error ? error.message : 'mailbox_process_failed');
+      process.stderr.write(JSON.stringify({
+        phase,
+        message: error instanceof Error ? error.message : 'mailbox_process_failed',
+        stack: error instanceof Error ? error.stack : undefined,
+      }));
       process.exitCode = 1;
     } finally {
-      await closeDatabase();
+      if (closeDatabase) await closeDatabase();
     }
   `;
   const children: Array<{
     child: ReturnType<typeof Bun.spawn>;
     readyFile: string;
+    output: Promise<MailboxProcessResult>;
   }> = [];
-  for (const index of [0, 1]) {
-    const readyFile = join(archonHome, `${action}-${index}.ready`);
-    const child = Bun.spawn({
-      cmd: [process.execPath, '-e', childScript],
-      cwd: resolve(import.meta.dir, '..', '..', '..'),
-      stdout: 'pipe',
-      stderr: 'pipe',
-      env: {
-        ...process.env,
-        ARCHON_HOME: archonHome,
-        LOG_LEVEL: 'fatal',
-        MAILBOX_ACTION: action,
-        MESSAGE_ID: messageId,
-        READY_FILE: readyFile,
-        START_FILE: startFile,
-      },
-    });
-    children.push({ child, readyFile });
-    for (let attempt = 0; attempt < 1000; attempt += 1) {
-      if (existsSync(readyFile)) break;
-      if (attempt === 999) throw new Error('mailbox_race_process_ready_timeout');
-      await Bun.sleep(5);
-    }
-  }
-  await Bun.write(startFile, 'start');
-
-  return Promise.all(
-    children.map(async ({ child }) => {
-      const [exitCode, stdout, stderr] = await Promise.all([
+  let failure: unknown;
+  let failed = false;
+  let results: MailboxProcessResult[] = [];
+  const cleanupErrors: unknown[] = [];
+  try {
+    for (const index of [0, 1]) {
+      const readyFile = join(archonHome, `${action}-${index}.ready`);
+      const child = Bun.spawn({
+        cmd: [process.execPath, '-e', childScript],
+        cwd: resolve(import.meta.dir, '..', '..', '..'),
+        stdout: 'pipe',
+        stderr: 'pipe',
+        env: {
+          ...process.env,
+          ARCHON_HOME: archonHome,
+          DATABASE_URL: '',
+          LOG_LEVEL: 'fatal',
+          MAILBOX_ACTION: action,
+          MESSAGE_ID: messageId,
+          READY_FILE: readyFile,
+          START_FILE: startFile,
+        },
+      });
+      const output = Promise.all([
         child.exited,
         new Response(child.stdout).text(),
         new Response(child.stderr).text(),
-      ]);
-      return { exitCode, stdout, stderr };
-    })
-  );
+      ]).then(([exitCode, stdout, stderr]) => ({ exitCode, stdout, stderr }));
+      // Attach a handler immediately, including while waiting for READY.
+      children.push({ child, readyFile, output });
+      void output.catch(() => {});
+      for (let attempt = 0; attempt < 1000; attempt += 1) {
+        if (existsSync(readyFile)) break;
+        if (child.exitCode !== null) throw new Error('mailbox_race_process_exited_before_ready');
+        if (attempt === 999) throw new Error('mailbox_race_process_ready_timeout');
+        await Bun.sleep(5);
+      }
+    }
+    if (beforeStart) await beforeStart();
+    await Bun.write(startFile, 'start');
+    results = await Promise.all(children.map(({ output }) => output));
+  } catch (error) {
+    failure = error;
+    failed = true;
+  } finally {
+    for (const { child } of children) {
+      if (child.exitCode !== null) continue;
+      try {
+        child.kill('SIGKILL');
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    const captured = await Promise.allSettled(children.map(({ output }) => output));
+    results = captured.flatMap(result => {
+      if (result.status === 'fulfilled') return [result.value];
+      cleanupErrors.push(result.reason);
+      return [];
+    });
+  }
+  if (failed) {
+    throw new Error(
+      `${failure instanceof Error ? failure.message : 'mailbox_race_failed'}; children=${JSON.stringify(results)}; cleanupErrors=${String(cleanupErrors.length)}`,
+      { cause: failure }
+    );
+  }
+  if (cleanupErrors.length)
+    throw new Error('mailbox_race_cleanup_failed', { cause: cleanupErrors });
+  return results;
 }
 
 async function makeSeparateProcessMailboxFixture(
@@ -902,6 +951,46 @@ describe('dispatch db', () => {
       expect(stored.rows[0]?.acknowledged_at).toBe(processResults[0]?.message.acknowledged_at);
     } finally {
       await inspectionDb.close();
+    }
+  });
+
+  test('separate-process acknowledgement waits out a write lock held by a third process', async () => {
+    // Regression for CI runs 41772183976 and 41780148151: a child exited 1 with
+    // "database is locked". Under a deferred BEGIN the mailbox UPDATE is a lock
+    // upgrade, which SQLite fails at once instead of waiting busy_timeout, and
+    // the mailbox retry only covered about 30ms. Holding the write lock longer
+    // than that budget makes the old path fail every time; with BEGIN IMMEDIATE
+    // the children wait for the lock and both succeed.
+    const { archonHome, messageId } = await makeSeparateProcessMailboxFixture(
+      'idem-ack-separate-processes-held-lock',
+      false
+    );
+    const holder = new SqliteAdapter(join(archonHome, 'archon.db'));
+    await holder.query('SELECT 1 AS holder_schema_ready');
+    let released: Promise<unknown> | undefined;
+    try {
+      const results = await runMailboxRace(archonHome, 'acknowledge', messageId, async () => {
+        await holder.query('BEGIN IMMEDIATE');
+        released = Bun.sleep(400).then(() => holder.query('COMMIT'));
+      });
+
+      expect(results.filter(result => result.exitCode !== 0)).toEqual([]);
+      const processResults = results.map(
+        result =>
+          JSON.parse(result.stdout) as {
+            ok: boolean;
+            message: { acknowledged_at: string | null; acknowledged_by: string | null };
+          }
+      );
+      expect(processResults).toEqual([
+        expect.objectContaining({ ok: true }),
+        expect.objectContaining({ ok: true }),
+      ]);
+      expect(new Set(processResults.map(result => result.message.acknowledged_at)).size).toBe(1);
+      expect(processResults[0]?.message.acknowledged_by).toBe('operator');
+    } finally {
+      await released;
+      await holder.close();
     }
   });
 

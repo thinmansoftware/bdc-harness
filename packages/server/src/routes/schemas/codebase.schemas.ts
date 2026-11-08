@@ -1,6 +1,7 @@
 /**
  * Zod schemas for codebase API endpoints.
  */
+import { projectRecordSchema } from '@archon/core/grimoire/project-record';
 import { z } from '@hono/zod-openapi';
 
 /** A single command entry within a codebase. */
@@ -15,8 +16,10 @@ export const codebaseSchema = z
     name: z.string(),
     repository_url: z.string().nullable(),
     default_cwd: z.string(),
+    default_branch: z.string().nullable(),
     ai_assistant_type: z.string(),
     commands: z.record(codebaseCommandSchema),
+    project_record: projectRecordSchema.nullable(),
     created_at: z.string(),
     updated_at: z.string(),
   })
@@ -38,6 +41,21 @@ export const addCodebaseBodySchema = z
     message: 'Provide either "url" or "path", not both and not neither',
   })
   .openapi('AddCodebaseBody');
+
+/** PATCH /api/codebases/:id request body. */
+export const updateCodebaseBodySchema = z
+  .object({
+    project_record: projectRecordSchema.nullable().optional(),
+    name: z.string().min(1).optional(),
+    default_branch: z.string().min(1).optional(),
+    default_cwd: z.string().min(1).optional(),
+    repository_url: z.string().min(1).nullable().optional(),
+  })
+  .strict()
+  .refine(body => Object.keys(body).length > 0, {
+    message: 'Provide at least one field to update',
+  })
+  .openapi('UpdateCodebaseBody');
 
 /** DELETE /api/codebases/:id response. */
 export const deleteCodebaseResponseSchema = z

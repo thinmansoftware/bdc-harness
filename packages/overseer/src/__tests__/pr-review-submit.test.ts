@@ -219,11 +219,13 @@ describe('checks pending (WO-HARNESS-OVERSEER-REVIEW-WAITS-FOR-CHECKS-01)', () =
         summary: '',
         reviewedHeadSha: HEAD,
         checksPending: true,
+        pendingChecks: ['test (windows-latest)'],
       }),
     });
     const outcome = await runAndSubmitReview(WORK, deps);
     expect(outcome.disposition).toBe('checks_pending');
     expect(outcome.reason).toBe('checks_not_terminal');
+    expect(outcome.pendingChecks).toEqual(['test (windows-latest)']);
     // No REQUEST_CHANGES (or any review) is submitted on checks-pending grounds.
     expect(rec.submitted).toHaveLength(0);
     // A receipt is still recorded so the defer is observable.
@@ -487,14 +489,15 @@ describe('failure handling', () => {
     expect(outcome.reason).toContain('submit_threw');
   });
 
-  test('a receipt failure does not convert an outcome into a throw', async () => {
+  test('an approval receipt failure is nonthrowing but nonqualifying', async () => {
     const { deps } = makeDeps({
       recordReceipt: async () => {
         throw new Error('receipt_down');
       },
     });
     const outcome = await runAndSubmitReview(WORK, deps);
-    expect(outcome.disposition).toBe('approved');
+    expect(outcome.disposition).toBe('review_incomplete');
+    expect(outcome.reason).toBe('github_approval_response_receipt_failed');
   });
 });
 

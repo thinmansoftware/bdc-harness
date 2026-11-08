@@ -1,9 +1,16 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { mkdtempSync } from 'fs';
-import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
-import { tmpdir } from 'os';
-import { join } from 'path';
-import { closeDatabase, getDatabase, resetDatabase } from '@archon/core/db/connection';
+import { afterEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import { getDatabase } from '@archon/core/db/connection';
+import { withIsolatedDatabase } from './isolated-database';
+import {
+  claimOverseerVerdict,
+  finalizeOverseerVerdict,
+  getOverseerActionsForRun,
+  getVerdictByRunHead,
+  insertOverseerAction as insertOverseerActionRow,
+  listRunsForOverseerWatch,
+  listUnactionedFlagMergeReadyVerdicts,
+} from '@archon/core/db/overseer';
+import * as judgeFirst from '../judge-first';
 import { listOverseerCapabilityEvents } from '@archon/core/db/overseer-capabilities';
 import { listOperatorCards } from '@archon/core/db/overseer-briefing';
 import {
@@ -13,23 +20,15 @@ import {
 } from '../service.ts';
 import type { M31ActionPermit, M31ActionProposal } from '../m31-substrate.ts';
 
-const ENV_KEYS = [
-  'ARCHON_HOME',
-  'DATABASE_URL',
-  'OVERSEER_ENABLED',
-  'OVERSEER_EMERGENCY_STOP',
-  'OVERSEER_DRY_RUN',
-  'OVERSEER_USE_FAKE_GITHUB_ADAPTER',
-  'OVERSEER_FAKE_GITHUB_REPOSITORIES',
-  'OVERSEER_ESCALATION_ACTIONS_ENABLED',
-  'OVERSEER_REPAIR_ACTIONS_ENABLED',
-  'OVERSEER_BRANCH_ACTIONS_ENABLED',
-  'OVERSEER_LIFECYCLE_ACTIONS_ENABLED',
-  'OVERSEER_MERGE_ACTIONS_ENABLED',
-  'GITHUB_TOKEN',
-  'GH_TOKEN',
-] as const;
-const oldEnv = new Map(ENV_KEYS.map(key => [key, process.env[key]]));
+const envEdits = new Map<string, { prior: string | undefined; written: string | undefined }>();
+
+function setTestEnv(key: string, value: string | undefined): void {
+  const existing = envEdits.get(key);
+  if (existing) existing.written = value;
+  else envEdits.set(key, { prior: process.env[key], written: value });
+  if (value === undefined) delete process.env[key];
+  else process.env[key] = value;
+}
 
 const POLICY_DIGEST = 'a'.repeat(64);
 const VERIFIER_DIGEST = 'b'.repeat(64);
@@ -77,18 +76,7 @@ function permit(): M31ActionPermit {
 }
 
 async function withTempDatabase<T>(work: () => Promise<T>): Promise<T> {
-  const home = mkdtempSync(join(tmpdir(), 'archon-overseer-service-'));
-  await closeDatabase();
-  resetDatabase();
-  process.env.ARCHON_HOME = home;
-  delete process.env.DATABASE_URL;
-  try {
-    return await work();
-  } finally {
-    await closeDatabase();
-    resetDatabase();
-    removeTempDirWithRetry(home);
-  }
+  return withIsolatedDatabase(work);
 }
 
 async function seedPersistentPermit(
@@ -174,27 +162,20 @@ async function seedPersistentPermit(
 }
 
 function enableFakeCapability(capability: 'merge' | 'escalation'): void {
-  process.env.OVERSEER_ENABLED = 'true';
-  process.env.OVERSEER_EMERGENCY_STOP = 'false';
-  process.env.OVERSEER_DRY_RUN = 'false';
-  process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = '1';
-  process.env.OVERSEER_FAKE_GITHUB_REPOSITORIES = 'thinmansoftware/bdc-harness';
+  setTestEnv('OVERSEER_ENABLED', 'true');
+  setTestEnv('OVERSEER_EMERGENCY_STOP', 'false');
+  setTestEnv('OVERSEER_DRY_RUN', 'false');
+  setTestEnv('OVERSEER_USE_FAKE_GITHUB_ADAPTER', '1');
+  setTestEnv('OVERSEER_FAKE_GITHUB_REPOSITORIES', 'thinmansoftware/bdc-harness');
   for (const name of ['ESCALATION', 'REPAIR', 'BRANCH', 'LIFECYCLE', 'MERGE']) {
-    process.env[`OVERSEER_${name}_ACTIONS_ENABLED`] = 'false';
+    setTestEnv(`OVERSEER_${name}_ACTIONS_ENABLED`, 'false');
   }
-  process.env[`OVERSEER_${capability.toUpperCase()}_ACTIONS_ENABLED`] = 'true';
+  setTestEnv(`OVERSEER_${capability.toUpperCase()}_ACTIONS_ENABLED`, 'true');
 }
 
-// This suite owns process-global database state. Bun runs files concurrently for
-// directory invocations, so execute it in its own process in that invocation
-// shape; direct/package-script runs continue to execute the suite normally.
-const invokedDirectly = process.argv.some(arg => /service\.test\.ts$/.test(arg));
-
-const serviceSuite: typeof describe = invokedDirectly ? describe : (_name, _tests) => undefined;
-
-serviceSuite('service', () => {
+describe('service', () => {
   test('resolveDefaultDeps preserves the fake GitHub adapter behavior', async () => {
-    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'true';
+    setTestEnv('OVERSEER_USE_FAKE_GITHUB_ADAPTER', 'true');
     const realFactory = mock(() => {
       throw new Error('real factory must not run');
     });
@@ -225,7 +206,7 @@ serviceSuite('service', () => {
   });
 
   test('resolveDefaultDeps uses real GitHub deps when fake mode is not requested', async () => {
-    process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER = 'false';
+    setTestEnv('OVERSEER_USE_FAKE_GITHUB_ADAPTER', 'false');
     const findPullRequest = mock(async () => ({
       exists: true as const,
       state: 'open',
@@ -256,23 +237,17 @@ serviceSuite('service', () => {
     expect(realFactory).toHaveBeenCalledTimes(1);
   });
 
-  beforeEach(() => {
-    process.env.GITHUB_TOKEN = '';
-    process.env.GH_TOKEN = '';
-  });
-
-  afterEach(async () => {
-    await closeDatabase();
-    resetDatabase();
-    for (const key of ENV_KEYS) {
-      const value = oldEnv.get(key);
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
+  afterEach(() => {
+    for (const [key, edit] of envEdits) {
+      if ((process.env[key] ?? undefined) !== edit.written) continue;
+      if (edit.prior === undefined) delete process.env[key];
+      else process.env[key] = edit.prior;
     }
+    envEdits.clear();
   });
 
   test('OVERSEER_ENABLED unset exits with no db reads', async () => {
-    delete process.env.OVERSEER_ENABLED;
+    setTestEnv('OVERSEER_ENABLED', undefined);
     const listRunsForWatch = mock(async () => []);
     await runOverseerService({
       once: true,
@@ -381,7 +356,7 @@ serviceSuite('service', () => {
   test('fake adapterKind without injected deps resolves stub -- service completes once', async () => {
     // Verify that adapterKind='fake' without explicit deps wires the internal stub
     // path (no Octokit constructed). Use once=true so the call terminates.
-    delete process.env.OVERSEER_ENABLED;
+    setTestEnv('OVERSEER_ENABLED', undefined);
     // Service skips when not enabled -- but we need to verify stub selection resolves.
     // We rely on the unit test above + type check for the real adapter path.
     // This test exercises the enabled=false early-return path (safe no-op).
@@ -851,8 +826,13 @@ serviceSuite('service', () => {
     expect(settled).toBe(true);
   });
 
-  test('delivery failure aborts and quiesces the watcher before rejecting', async () => {
+  // WO-HARNESS-MERGE-SWEEP-LIVENESS-AND-PAGING-01: this test used to assert that a delivery
+  // failure aborted the watcher and rejected the service -- the exact coupling that stopped the
+  // merge sweep on 2026-11-04. The delivery scheduler now isolates its own failures.
+  test('delivery failure is isolated; the watcher keeps polling', async () => {
+    const controller = new AbortController();
     let watcherPolls = 0;
+    let drains = 0;
     const deps = {
       listRunsForWatch: async () => {
         watcherPolls += 1;
@@ -869,17 +849,19 @@ serviceSuite('service', () => {
         enabled: true,
         adapterKind: 'fake',
         deps,
+        signal: controller.signal,
         intervalMs: 1,
         deliveryEnabled: true,
         deliveryIntervalMs: 1,
         deliveryDrain: async () => {
+          drains += 1;
+          if (drains === 2) controller.abort();
           throw new Error('delivery_drain_failed');
         },
       })
-    ).rejects.toThrow('delivery_drain_failed');
-    const pollsAfterReject = watcherPolls;
-    await new Promise<void>(resolve => setTimeout(resolve, 10));
-    expect(watcherPolls).toBe(pollsAfterReject);
+    ).resolves.toBeUndefined();
+    expect(drains).toBe(2);
+    expect(watcherPolls).toBeGreaterThan(0);
   });
 
   test('reconcile failure is isolated and the scheduler retries', async () => {
@@ -945,17 +927,428 @@ serviceSuite('service', () => {
     await new Promise<void>(resolve => setTimeout(resolve, 10));
     expect(drains).toBe(drainsAfterReject);
   });
-});
 
-if (!invokedDirectly) {
-  test('service suite passes with isolated database state', () => {
-    const child = Bun.spawnSync(['bun', 'test', import.meta.path, '--timeout', '30000'], {
-      cwd: process.cwd(),
-      env: process.env,
-      stdout: 'pipe',
-      stderr: 'pipe',
+  async function seedReplayRun(input: {
+    runId: string;
+    verdict: string;
+    proposedAction: string;
+    comment?: boolean;
+  }): Promise<string> {
+    const db = getDatabase();
+    await db.query(
+      `INSERT INTO remote_agent_conversations (id, platform_type, platform_conversation_id, title)
+       VALUES ($1, 'test', $1, 'Test')`,
+      [`conv-${input.runId}`]
+    );
+    await db.query(
+      `INSERT INTO remote_agent_workflow_runs
+       (id, conversation_id, workflow_name, user_message, status, metadata, completed_at)
+       VALUES ($1, $2, 'bdc-feature-development', $3, 'completed', $4, $5)`,
+      [
+        input.runId,
+        `conv-${input.runId}`,
+        'Implement WO-REPLAY-GREEN-01',
+        JSON.stringify({
+          woId: 'WO-REPLAY-GREEN-01',
+          targetRepo: 'thinmansoftware/bdc-harness',
+          headBranch: `wo/${input.runId}`,
+        }),
+        '2026-10-29T00:00:00.000Z',
+      ]
+    );
+    const claim = await claimOverseerVerdict({
+      runId: input.runId,
+      woId: 'WO-REPLAY-GREEN-01',
+      headSha: 'H',
     });
-    const output = new TextDecoder().decode(child.stdout) + new TextDecoder().decode(child.stderr);
-    expect(child.exitCode, output).toBe(0);
+    if (!claim.verdictId) throw new Error(`claim_failed:${input.runId}`);
+    await finalizeOverseerVerdict({
+      verdictId: claim.verdictId,
+      status: 'verdict',
+      verdict: input.verdict,
+      proposedAction: input.proposedAction,
+    });
+    if (input.comment) {
+      await insertOverseerActionRow({
+        runId: input.runId,
+        woId: 'WO-REPLAY-GREEN-01',
+        class: 'none',
+        action: 'comment_findings',
+        result: 'initial comment',
+      });
+    }
+    return claim.verdictId;
+  }
+
+  function replayEvidence(pending: number) {
+    const total = pending > 0 ? 4 : 2;
+    return {
+      exists: true as const,
+      state: 'open' as const,
+      checks: { total, passed: total - pending, failed: 0, pending },
+      mergeable: true,
+      headSha: 'H',
+      pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1373 },
+    };
+  }
+
+  async function runJudgeFirstReplay(input: {
+    runId: string;
+    pending?: number;
+    dryRun?: boolean;
+    handoff?: ReturnType<typeof mock> | undefined;
+    omitHandoff?: boolean;
+  }): Promise<void> {
+    setTestEnv('OVERSEER_JUDGE_FIRST', '1');
+    const mergeCoordinator = mock(async () => undefined);
+    await runOverseerService({
+      once: true,
+      enabled: true,
+      dryRun: input.dryRun ?? false,
+      adapterKind: 'fake',
+      mergeCoordinator,
+      ...(input.omitHandoff
+        ? { deterministicMergeHandoff: undefined }
+        : { deterministicMergeHandoff: { handoff: input.handoff ?? mock(async () => undefined) } }),
+      deps: {
+        listRunsForWatch: listRunsForOverseerWatch,
+        listRunEvents: async () => [],
+        findPullRequest: async () => replayEvidence(input.pending ?? 0),
+        mergePullRequest: async () => {
+          throw new Error('direct merge must not run');
+        },
+        insertOverseerAction: async record => {
+          await insertOverseerActionRow(record);
+        },
+      },
+    });
+    expect(mergeCoordinator).toHaveBeenCalledTimes(0);
+  }
+
+  test('judge-first replay hands a green observe row to the deterministic bridge once', async () => {
+    const judgeSpy = spyOn(judgeFirst, 'judgeTerminalRun').mockImplementation(async () => {
+      throw new Error('judge must not run');
+    });
+    const spawnSpy = spyOn(judgeFirst, 'spawnJudgeBinary').mockImplementation(async () => {
+      throw new Error('provider must not run');
+    });
+    try {
+      await withTempDatabase(async () => {
+        const runId = 'run-service-green';
+        await seedReplayRun({
+          runId,
+          verdict: 'observe',
+          proposedAction: 'comment_findings',
+          comment: true,
+        });
+        expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain(runId);
+        const handoff = mock(async () => undefined);
+        await runJudgeFirstReplay({ runId, handoff });
+        expect(handoff).toHaveBeenCalledTimes(1);
+        expect(judgeSpy).not.toHaveBeenCalled();
+        expect(spawnSpy).not.toHaveBeenCalled();
+        expect((await getVerdictByRunHead({ runId, headSha: 'H' }))?.proposedAction).toBe(
+          'flag_merge_ready'
+        );
+        await runJudgeFirstReplay({ runId, handoff });
+        expect(handoff).toHaveBeenCalledTimes(1);
+      });
+    } finally {
+      judgeSpy.mockRestore();
+      spawnSpy.mockRestore();
+    }
   });
-}
+
+  test('judge-first replay does not hand off pending, needs_human, dry-run, or a missing bridge', async () => {
+    const judgeSpy = spyOn(judgeFirst, 'judgeTerminalRun').mockImplementation(async () => {
+      throw new Error('judge must not run');
+    });
+    const spawnSpy = spyOn(judgeFirst, 'spawnJudgeBinary').mockImplementation(async () => {
+      throw new Error('provider must not run');
+    });
+    try {
+      await withTempDatabase(async () => {
+        await seedReplayRun({
+          runId: 'run-service-pending',
+          verdict: 'observe',
+          proposedAction: 'comment_findings',
+          comment: true,
+        });
+        const pendingHandoff = mock(async () => undefined);
+        await runJudgeFirstReplay({
+          runId: 'run-service-pending',
+          pending: 1,
+          handoff: pendingHandoff,
+        });
+        expect(pendingHandoff).not.toHaveBeenCalled();
+        expect(
+          (await getVerdictByRunHead({ runId: 'run-service-pending', headSha: 'H' }))
+            ?.proposedAction
+        ).toBe('comment_findings');
+
+        await seedReplayRun({
+          runId: 'run-service-human',
+          verdict: 'needs_human',
+          proposedAction: 'escalate_with_evidence',
+        });
+        const humanHandoff = mock(async () => undefined);
+        await runJudgeFirstReplay({ runId: 'run-service-human', handoff: humanHandoff });
+        expect(humanHandoff).not.toHaveBeenCalled();
+        expect(
+          (await getVerdictByRunHead({ runId: 'run-service-human', headSha: 'H' }))?.proposedAction
+        ).toBe('escalate_with_evidence');
+
+        const dryId = await seedReplayRun({
+          runId: 'run-service-dry',
+          verdict: 'healthy',
+          proposedAction: 'none',
+          comment: true,
+        });
+        const dryHandoff = mock(async () => undefined);
+        await runJudgeFirstReplay({ runId: 'run-service-dry', dryRun: true, handoff: dryHandoff });
+        expect(dryHandoff).not.toHaveBeenCalled();
+        expect(
+          (await getVerdictByRunHead({ runId: 'run-service-dry', headSha: 'H' }))?.proposedAction
+        ).toBe('none');
+        const dryActions = await getOverseerActionsForRun('run-service-dry');
+        expect(
+          dryActions.some(
+            action =>
+              action.action === 'flag_merge_ready' &&
+              action.result === `steward_handoff:replay_green:verdict:${dryId}:dry_run`
+          )
+        ).toBe(true);
+
+        await seedReplayRun({
+          runId: 'run-service-missing',
+          verdict: 'observe',
+          proposedAction: 'verdict_write',
+          comment: true,
+        });
+        await runJudgeFirstReplay({ runId: 'run-service-missing', omitHandoff: true });
+        expect(
+          (await getVerdictByRunHead({ runId: 'run-service-missing', headSha: 'H' }))
+            ?.proposedAction
+        ).toBe('verdict_write');
+        const missingActions = await getOverseerActionsForRun('run-service-missing');
+        expect(missingActions.some(action => action.action === 'flag_merge_ready')).toBe(false);
+        expect(judgeSpy).not.toHaveBeenCalled();
+        expect(spawnSpy).not.toHaveBeenCalled();
+      });
+    } finally {
+      judgeSpy.mockRestore();
+      spawnSpy.mockRestore();
+    }
+  });
+
+  test('judge-first replay default binding calls the merge bridge seam, not the coordinator', async () => {
+    const judgeSpy = spyOn(judgeFirst, 'judgeTerminalRun').mockImplementation(async () => {
+      throw new Error('judge must not run');
+    });
+    const spawnSpy = spyOn(judgeFirst, 'spawnJudgeBinary').mockImplementation(async () => {
+      throw new Error('provider must not run');
+    });
+    try {
+      await withTempDatabase(async () => {
+        const runId = 'run-service-bridge-seam';
+        const verdictId = await seedReplayRun({
+          runId,
+          verdict: 'observe',
+          proposedAction: 'comment_findings',
+          comment: true,
+        });
+        expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain(runId);
+        setTestEnv('OVERSEER_JUDGE_FIRST', '1');
+        const mergeCoordinator = mock(async () => undefined);
+        const bridgeRun = mock(async () => undefined);
+        await runOverseerService({
+          once: true,
+          enabled: true,
+          dryRun: false,
+          adapterKind: 'fake',
+          mergeCoordinator,
+          mergeBridgeEnabled: true,
+          mergeBridgeRun: bridgeRun,
+          deps: {
+            listRunsForWatch: listRunsForOverseerWatch,
+            listRunEvents: async () => [],
+            findPullRequest: async () => replayEvidence(0),
+            mergePullRequest: async () => {
+              throw new Error('direct merge must not run');
+            },
+            insertOverseerAction: async record => {
+              await insertOverseerActionRow(record);
+            },
+          },
+        });
+        expect(bridgeRun).toHaveBeenCalledTimes(2);
+        expect(mergeCoordinator).not.toHaveBeenCalled();
+        expect(judgeSpy).not.toHaveBeenCalled();
+        expect(spawnSpy).not.toHaveBeenCalled();
+        expect((await getVerdictByRunHead({ runId, headSha: 'H' }))?.proposedAction).toBe(
+          'flag_merge_ready'
+        );
+        const readyActions = (await getOverseerActionsForRun(runId)).filter(
+          action => action.action === 'flag_merge_ready'
+        );
+        expect(readyActions).toHaveLength(1);
+        expect(readyActions[0]?.result).toBe(`steward_handoff:replay_green:verdict:${verdictId}`);
+      });
+    } finally {
+      judgeSpy.mockRestore();
+      spawnSpy.mockRestore();
+    }
+  });
+
+  async function runFlagGatedReplay(input: {
+    mergeBridgeRun: () => Promise<unknown>;
+    mergeBridgeEnabled?: boolean;
+    omitBridgeFlag?: boolean;
+  }): Promise<{ mergeCoordinator: ReturnType<typeof mock> }> {
+    setTestEnv('OVERSEER_JUDGE_FIRST', '1');
+    const mergeCoordinator = mock(async () => undefined);
+    await expect(
+      runOverseerService({
+        once: true,
+        enabled: true,
+        dryRun: false,
+        adapterKind: 'fake',
+        mergeCoordinator,
+        mergeBridgeRun: input.mergeBridgeRun,
+        ...(input.omitBridgeFlag ? {} : { mergeBridgeEnabled: input.mergeBridgeEnabled }),
+        deps: {
+          listRunsForWatch: listRunsForOverseerWatch,
+          listRunEvents: async () => [],
+          findPullRequest: async () => replayEvidence(0),
+          mergePullRequest: async () => {
+            throw new Error('direct merge must not run');
+          },
+          insertOverseerAction: async record => {
+            await insertOverseerActionRow(record);
+          },
+        },
+      })
+    ).resolves.toBeUndefined();
+    return { mergeCoordinator };
+  }
+
+  test('Test 9: mergeBridgeEnabled omitted or false fails closed before promotion', async () => {
+    const judgeSpy = spyOn(judgeFirst, 'judgeTerminalRun').mockImplementation(async () => {
+      throw new Error('judge must not run');
+    });
+    const spawnSpy = spyOn(judgeFirst, 'spawnJudgeBinary').mockImplementation(async () => {
+      throw new Error('provider must not run');
+    });
+    try {
+      await withTempDatabase(async () => {
+        const cases: Array<{
+          runId: string;
+          omitBridgeFlag: boolean;
+          mergeBridgeEnabled?: boolean;
+        }> = [
+          { runId: 'run-service-bridge-omitted', omitBridgeFlag: true },
+          {
+            runId: 'run-service-bridge-disabled',
+            omitBridgeFlag: false,
+            mergeBridgeEnabled: false,
+          },
+        ];
+        for (const item of cases) {
+          await seedReplayRun({
+            runId: item.runId,
+            verdict: 'observe',
+            proposedAction: 'comment_findings',
+            comment: true,
+          });
+          expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain(item.runId);
+          const mergeBridgeRun = mock(async () => undefined);
+          const { mergeCoordinator } = await runFlagGatedReplay({
+            omitBridgeFlag: item.omitBridgeFlag,
+            mergeBridgeEnabled: item.mergeBridgeEnabled,
+            mergeBridgeRun,
+          });
+          expect(mergeBridgeRun).toHaveBeenCalledTimes(0);
+          expect(mergeCoordinator).toHaveBeenCalledTimes(0);
+          expect(judgeSpy).not.toHaveBeenCalled();
+          expect(spawnSpy).not.toHaveBeenCalled();
+          const verdict = await getVerdictByRunHead({ runId: item.runId, headSha: 'H' });
+          expect(verdict?.proposedAction).toBe('comment_findings');
+          expect(verdict?.actionedAt).toBeNull();
+          expect(
+            (await getOverseerActionsForRun(item.runId)).some(
+              action => action.action === 'flag_merge_ready'
+            )
+          ).toBe(false);
+        }
+      });
+    } finally {
+      judgeSpy.mockRestore();
+      spawnSpy.mockRestore();
+    }
+  });
+
+  test('Test 10: enabled bridge keeps a throwing handoff retryable once', async () => {
+    const judgeSpy = spyOn(judgeFirst, 'judgeTerminalRun').mockImplementation(async () => {
+      throw new Error('judge must not run');
+    });
+    const spawnSpy = spyOn(judgeFirst, 'spawnJudgeBinary').mockImplementation(async () => {
+      throw new Error('provider must not run');
+    });
+    try {
+      await withTempDatabase(async () => {
+        const runId = 'run-service-bridge-throw';
+        const verdictId = await seedReplayRun({
+          runId,
+          verdict: 'observe',
+          proposedAction: 'comment_findings',
+          comment: true,
+        });
+        expect((await listRunsForOverseerWatch()).map(run => run.id)).toContain(runId);
+        const first = await runFlagGatedReplay({
+          mergeBridgeEnabled: true,
+          mergeBridgeRun: async () => {
+            throw new Error('bridge_handoff_failed');
+          },
+        });
+        const promoted = await getVerdictByRunHead({ runId, headSha: 'H' });
+        expect(promoted?.proposedAction).toBe('flag_merge_ready');
+        expect(promoted?.actionedAt).toBeNull();
+        const readyActions = (await getOverseerActionsForRun(runId)).filter(
+          action => action.action === 'flag_merge_ready'
+        );
+        expect(readyActions).toHaveLength(1);
+        expect(readyActions[0]?.result).toBe(`steward_handoff:replay_green:verdict:${verdictId}`);
+        expect(
+          (await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)
+        ).toBe(true);
+        expect(first.mergeCoordinator).toHaveBeenCalledTimes(0);
+        expect(judgeSpy).not.toHaveBeenCalled();
+        expect(spawnSpy).not.toHaveBeenCalled();
+
+        const second = await runFlagGatedReplay({
+          mergeBridgeEnabled: true,
+          mergeBridgeRun: async () => {
+            throw new Error('bridge_handoff_failed_again');
+          },
+        });
+        const again = await getVerdictByRunHead({ runId, headSha: 'H' });
+        expect(again?.proposedAction).toBe('flag_merge_ready');
+        expect(again?.actionedAt).toBeNull();
+        expect(
+          (await getOverseerActionsForRun(runId)).filter(
+            action => action.action === 'flag_merge_ready'
+          )
+        ).toHaveLength(1);
+        expect(
+          (await listUnactionedFlagMergeReadyVerdicts()).some(row => row.id === verdictId)
+        ).toBe(true);
+        expect(second.mergeCoordinator).toHaveBeenCalledTimes(0);
+        expect(judgeSpy).not.toHaveBeenCalled();
+        expect(spawnSpy).not.toHaveBeenCalled();
+      });
+    } finally {
+      judgeSpy.mockRestore();
+      spawnSpy.mockRestore();
+    }
+  });
+});

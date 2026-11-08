@@ -67,6 +67,13 @@ export interface DispatchMessage {
   route_disposed_at: string | null;
   supersedes_id: string | null;
   repeat_reason: string | null;
+  /**
+   * The row's own database-assigned insertion order (migration 047), coerced to
+   * a number by normalizeMessage (Postgres returns BIGINT as a string). Null
+   * when never assigned (raw/fixture/import rows on SQLite). Optional so test
+   * doubles that predate it stay valid.
+   */
+  seq?: number | null;
 }
 
 /**
@@ -79,6 +86,28 @@ export interface DispatchMessage {
  */
 export interface SeqCursorMessage extends DispatchMessage {
   cursor_seq: number;
+  // `seq` (inherited from DispatchMessage) is the row's own value, null when it
+  // was never assigned (where `cursor_seq` falls back to rowid on SQLite).
+}
+
+/**
+ * A claimed message plus the claim's insertion boundary.
+ *
+ * `claimBoundarySeq` is MAX(seq) of agent_dispatch_messages read INSIDE the
+ * claim transaction, after the claim UPDATE took the write lock. On SQLite
+ * every later insert is serialized behind that lock and assigned
+ * MAX(COALESCE(seq, rowid)) + 1, so any row inserted after the claim has
+ * seq > claimBoundarySeq. Absent when the store returned no value (empty or
+ * all-NULL seq). Optional so existing callers and doubles are unaffected.
+ *
+ * Postgres caveat: an IDENTITY value is drawn at INSERT time, not COMMIT time,
+ * so an insert that drew a lower value in a transaction still open at the
+ * claim can commit later with seq <= the boundary. Callers that act on the
+ * boundary must tolerate that (the review worker only uses it to skip
+ * redundant work).
+ */
+export interface ClaimedDispatchMessage extends DispatchMessage {
+  claimBoundarySeq?: number;
 }
 
 export interface DispatchWorker {
@@ -93,10 +122,11 @@ export interface DispatchWorker {
 
 interface DispatchMessageRow extends Omit<
   DispatchMessage,
-  'fencing_token' | 'resolved_xo_fencing_token'
+  'fencing_token' | 'resolved_xo_fencing_token' | 'seq'
 > {
   fencing_token: number | string;
   resolved_xo_fencing_token: number | string | null;
+  seq?: number | string | null;
 }
 
 type CompatibleDispatchMessageRow = DispatchMessageRow & {
@@ -236,6 +266,8 @@ function normalizeMessage(row: DispatchMessageRow): DispatchMessage {
     escalated_tg_at: normalizeNullableTimestamp(row.escalated_tg_at),
     escalated_sms_at: normalizeNullableTimestamp(row.escalated_sms_at),
     route_disposed_at: normalizeNullableTimestamp(row.route_disposed_at),
+    // Postgres returns the BIGINT seq as a string; SQLite as a number.
+    seq: row.seq === null || row.seq === undefined ? null : Number(row.seq),
   };
 }
 
@@ -276,6 +308,31 @@ async function getDispatchPrincipal(
     [principalId]
   );
   return result.rows[0] ?? null;
+}
+
+interface DispatchPrincipalListRow extends DispatchPrincipalRow {
+  display_name: string;
+}
+
+export interface DispatchPrincipalListing {
+  principal_id: string;
+  display_name: string;
+  delivery_mode: DispatchDeliveryMode;
+  active: boolean;
+}
+
+export async function listDispatchPrincipals(
+  query: DispatchQueryExecutor = (sql, params) => getDatabase().query(sql, params)
+): Promise<DispatchPrincipalListing[]> {
+  const result = await query<DispatchPrincipalListRow>(
+    'SELECT principal_id, display_name, delivery_mode, active FROM dispatch_principals ORDER BY principal_id ASC'
+  );
+  return result.rows.map(row => ({
+    principal_id: row.principal_id,
+    display_name: row.display_name,
+    delivery_mode: row.delivery_mode,
+    active: isActivePrincipal(row),
+  }));
 }
 
 export async function assessDispatchRecipient(
@@ -382,7 +439,15 @@ function bindSenderContext(context: DispatchSenderContext): {
 } {
   if ('kind' in context && context.kind === 'system') {
     const sender = context.sender;
-    if (sender !== 'dispatch' && sender !== 'overseer' && sender !== 'taskmaster') {
+    // Runtime mirror of FixedDispatchSystemSender (dispatch-sender-authority.ts):
+    // 'cauldron-fire' added for WO-HARNESS-T3-COMMAND-CONSUMER-01 so the command
+    // consumer can reply as a fixed system sender.
+    if (
+      sender !== 'dispatch' &&
+      sender !== 'overseer' &&
+      sender !== 'taskmaster' &&
+      sender !== 'cauldron-fire'
+    ) {
       throw new Error('dispatch_internal_sender_invalid');
     }
     return {
@@ -958,9 +1023,8 @@ export async function listMessagesBySeqCursor(filters: {
     params
   );
   // `cursor_seq` is selected explicitly rather than read off the row's `seq`:
-  // Postgres returns a BIGINT identity as a STRING through the driver while
-  // SQLite returns a number, and `seq` is not part of the DispatchMessage
-  // contract. Coercing here keeps that dialect difference out of every caller.
+  // it is COALESCE(seq, rowid), never null. The row's own `seq` (null when never
+  // assigned) is coerced to a number by normalizeMessage, like every reader.
   return result.rows.map(row => ({
     ...normalizeMessage(row),
     cursor_seq: Number(row.cursor_seq),
@@ -974,6 +1038,13 @@ export async function listMessages(filters: {
   allowBoardAlias?: boolean;
   subject_key?: string;
   route_disposition?: DispatchRouteDisposition;
+  /**
+   * Lexical lower bound on created_at (WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01).
+   * Pass a DATE prefix such as '2026-11-01': it orders correctly against both
+   * ISO ('2026-11-01T...') and SQLite datetime ('2026-11-01 ...') text, so the
+   * oldest-first queued page is not filled with fenced history rows.
+   */
+  created_at_gte?: string;
 }): Promise<DispatchMessage[]> {
   const clauses: string[] = [];
   const params: unknown[] = [];
@@ -1008,6 +1079,10 @@ export async function listMessages(filters: {
   if (filters.route_disposition !== undefined) {
     params.push(filters.route_disposition);
     clauses.push(`route_disposition = $${params.length}`);
+  }
+  if (filters.created_at_gte !== undefined) {
+    params.push(filters.created_at_gte);
+    clauses.push(`created_at >= $${params.length}`);
   }
   if (filters.status === 'queued') {
     params.push(nowIso());
@@ -1246,7 +1321,7 @@ export async function claimMessage(data: {
   delivery_principal?: string | null;
   leaseDurationMs?: number;
   workerStaleAfterMs?: number;
-}): Promise<DispatchMessage | null> {
+}): Promise<ClaimedDispatchMessage | null> {
   const db = getDatabase();
   await evaluateWorkerStaleness(data.workerStaleAfterMs ?? DEFAULT_WORKER_STALE_AFTER_MS);
   const now = nowIso();
@@ -1360,6 +1435,18 @@ export async function claimMessage(data: {
       ]
     );
     if (claimUpdate.rowCount !== 1) return null;
+    // CLAIM BOUNDARY: read after the claim UPDATE, in the same transaction, so
+    // the write lock is already held and no insert can land between the claim
+    // and this read (see ClaimedDispatchMessage).
+    const boundaryRow = (
+      await txQuery<{ boundary: unknown }>(
+        'SELECT MAX(seq) AS boundary FROM agent_dispatch_messages'
+      )
+    ).rows[0];
+    const boundary =
+      boundaryRow?.boundary === null || boundaryRow?.boundary === undefined
+        ? Number.NaN
+        : Number(boundaryRow.boundary);
     const claimed = await txQuery<DispatchMessageRow>(
       `SELECT * FROM agent_dispatch_messages
        WHERE id = $1 AND status = 'claimed' AND lease_owner = $2 AND fencing_token = $3`,
@@ -1385,7 +1472,10 @@ export async function claimMessage(data: {
         ]
       );
     }
-    return claimedRow ? normalizeMessage(claimedRow) : null;
+    if (!claimedRow) return null;
+    const message: ClaimedDispatchMessage = normalizeMessage(claimedRow);
+    if (Number.isFinite(boundary)) message.claimBoundarySeq = boundary;
+    return message;
   });
 }
 
@@ -1483,8 +1573,20 @@ export async function disposeMessageByMachine(
   };
 
   if (transactionQuery) return execute(transactionQuery);
-  return withRetriedMailboxTransaction(() => getDatabase().withTransaction(execute));
+  return withRetriedMailboxTransaction(() =>
+    getDatabase().withTransaction(execute, MAILBOX_TRANSACTION_OPTIONS)
+  );
 }
+
+/**
+ * Mailbox receipts read the row, validate it, then UPDATE it. Under a deferred
+ * SQLite BEGIN that UPDATE is a lock upgrade, and SQLite fails an upgrade at
+ * once (no busy_timeout wait) when another process holds or has just taken the
+ * write lock. The retry below then had only about 30ms of budget, which CI load
+ * exceeded (bdc-harness runs 41772183976, 41780148151). Taking the write lock
+ * at BEGIN lets busy_timeout do the waiting.
+ */
+const MAILBOX_TRANSACTION_OPTIONS = { immediate: true } as const;
 
 function isRetriableMailboxTransactionError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
@@ -1624,11 +1726,23 @@ export async function mailboxDepthByPrincipal(): Promise<MailboxDepthResult> {
 
 export async function acknowledgeMessage(data: {
   id: string;
+  /** The mailbox principal the row must be addressed to (validated below). */
   principal_id: string;
+  /**
+   * The authenticated principal actually performing the ack, when it differs
+   * from the mailbox (a credential acking for a mailbox in its receive_as).
+   * Recorded in acknowledged_by for audit. The caller is responsible for
+   * having verified receive_as; the mailbox check still runs on principal_id.
+   */
+  acting_principal_id?: string;
   bind?: XoLeaseBind;
 }): Promise<DispatchMailboxResult> {
   const db = getDatabase();
   const principalId = canonicalizePrincipal(data.principal_id);
+  const ackActor =
+    data.acting_principal_id !== undefined
+      ? canonicalizePrincipal(data.acting_principal_id)
+      : principalId;
   const now = nowIso();
   return withRetriedMailboxTransaction(() =>
     db.withTransaction(async txQuery => {
@@ -1639,16 +1753,18 @@ export async function acknowledgeMessage(data: {
       const invalid = await validateMailboxActor(txQuery, message, principalId);
       if (invalid) return invalid;
       if (message.acknowledged_by !== null) {
-        return message.acknowledged_by === principalId
+        return message.acknowledged_by === ackActor
           ? { ok: true, message }
           : { ok: false, reason: 'actor_mismatch' };
       }
 
       const leasePredicate = xoLeaseBindPredicate(principalId, data.bind);
+      // acknowledged_by is bound after the lease params ($4-$8 when present).
+      const ackActorParam = 4 + leasePredicate.params.length;
       const update = await txQuery(
         `UPDATE agent_dispatch_messages
        SET acknowledged_at = $2,
-           acknowledged_by = $3
+           acknowledged_by = $${ackActorParam}
        WHERE id = $1
          AND status = 'queued'
          AND acknowledged_at IS NULL
@@ -1661,7 +1777,7 @@ export async function acknowledgeMessage(data: {
              AND CAST(recipient_principal.active AS TEXT) IN ('1', 'true')
              AND recipient_principal.delivery_mode IN ('drain_on_start', 'notify_only')
          )${leasePredicate.sql}`,
-        [data.id, now, principalId, ...leasePredicate.params]
+        [data.id, now, principalId, ...leasePredicate.params, ackActor]
       );
       if (update.rowCount === 0 && principalId === 'xo') {
         const staleBind = await validateXoLeaseBind(txQuery, principalId, data.bind);
@@ -1671,12 +1787,12 @@ export async function acknowledgeMessage(data: {
       if (!finalMessage) return { ok: false, reason: 'not_found' };
       const finalInvalid = await validateMailboxActor(txQuery, finalMessage, principalId);
       if (finalInvalid) return finalInvalid;
-      if (finalMessage.acknowledged_by === principalId) return { ok: true, message: finalMessage };
+      if (finalMessage.acknowledged_by === ackActor) return { ok: true, message: finalMessage };
       if (update.rowCount === 0 && finalMessage.acknowledged_by === null) {
         return { ok: false, reason: 'actor_mismatch' };
       }
       return { ok: false, reason: 'actor_mismatch' };
-    })
+    }, MAILBOX_TRANSACTION_OPTIONS)
   );
 }
 
@@ -1740,7 +1856,7 @@ export async function addressMessage(data: {
         return { ok: false, reason: 'actor_mismatch' };
       }
       return { ok: false, reason: 'actor_mismatch' };
-    })
+    }, MAILBOX_TRANSACTION_OPTIONS)
   );
 }
 
@@ -2069,6 +2185,50 @@ export async function supersedeMessage(data: {
     if (update.rowCount !== 1) throw new Error('dispatch_supersede_lost_race');
     return { ok: true, message: replacement };
   });
+}
+
+/**
+ * Retire a QUEUED row because a claimed row already covers its work
+ * (WO-HARNESS-OVERSEER-RECHECK-DEDUPE-PER-HEAD-01: the review worker supersedes
+ * redundant queued reviews of the head it just claimed). Only a row whose own
+ * `seq` is set and <= `boundary_seq` (the claim's `claimBoundarySeq`) is
+ * touched: a NULL-seq row is never provably older than the claim. Unlike
+ * `supersedeMessage` no replacement row is created -- the replacement is the
+ * row that was claimed, named in `reason`. The row is marked
+ * status='cancelled' + route_disposition='superseded' (never a bare cancel)
+ * and `reason` is stored as `result_body` = {"reason": <reason>,
+ * "superseded_by": <claimed id>}. Only a row still 'queued' is touched, so a
+ * row another worker claimed in the meantime is left alone; returns null then.
+ */
+export async function supersedeQueuedMessageByClaim(data: {
+  id: string;
+  claimed_id: string;
+  boundary_seq: number;
+  reason: string;
+}): Promise<DispatchMessage | null> {
+  if (data.id === data.claimed_id || !Number.isFinite(data.boundary_seq)) return null;
+  const db = getDatabase();
+  const resultBody = JSON.stringify({ reason: data.reason, superseded_by: data.claimed_id });
+  const sql = `UPDATE agent_dispatch_messages
+     SET status = 'cancelled',
+         route_disposition = 'superseded',
+         completed_at = $2,
+         result_body = $3,
+         lease_owner = NULL,
+         lease_expires_at = NULL
+     WHERE id = $1
+       AND status = 'queued'
+       AND seq IS NOT NULL
+       AND seq <= $4`;
+  const params = [data.id, nowIso(), resultBody, data.boundary_seq];
+  if (db.dialect === 'postgres') {
+    const result = await db.query<DispatchMessageRow>(`${sql} RETURNING *`, params);
+    const row = result.rows[0];
+    return row ? normalizeMessage(row) : null;
+  }
+  const result = await db.query(sql, params);
+  if (result.rowCount !== 1) return null;
+  return getMessage(data.id);
 }
 
 export type DispatchEscalationLeg = 'telegram' | 'sms';

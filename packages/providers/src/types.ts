@@ -192,6 +192,7 @@ export type MessageChunk =
         | 'provider_unavailable'
         | 'provider_rate_limited'
         | 'provider_auth_failed'
+        | 'provider_model_capacity'
         | 'progress_timeout';
     }
   | {
@@ -229,6 +230,16 @@ export interface AgentRequestOptions {
   forkSession?: boolean;
   /** When false, skip writing session transcript to disk. */
   persistSession?: boolean;
+  /**
+   * OpenRouter privacy pin (WO-HARNESS-OPENROUTER-REVIEW-DIFF-SCAN-01).
+   * Set by the executor's review-fence gate for an OpenRouter route on a
+   * customer-repo run that passed the pre-send scan. When true, the OpenRouter
+   * clients (GlmProvider, GrokAgentProvider) add
+   * `provider: { data_collection: 'deny', zdr: true }` to the request body so
+   * routing is restricted to no-training / zero-retention endpoints. A
+   * cross-cutting executor decision, not a YAML-authored node field.
+   */
+  openrouterPrivacyPin?: boolean;
 }
 
 /**

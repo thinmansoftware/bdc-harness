@@ -135,6 +135,12 @@ export interface FetchNodeTimeoutsOptions {
   token?: string;
   /** Threshold for non-whole-node extensions. See extractNodeTimeoutsMs. */
   floorMs?: number;
+  /**
+   * Transport for Archon API reads/writes. Defaults to global fetch. The
+   * in-process T3 command consumer passes the server's own in-process API
+   * dispatcher here so no network self-call is made.
+   */
+  fetchImpl?: typeof fetch;
 }
 
 /**
@@ -155,9 +161,12 @@ export async function fetchNodeTimeoutsMs(
 
   let res: Response;
   try {
-    res = await fetch(`${apiBaseUrl}/api/workflows/${encodeURIComponent(workflowName)}`, {
-      headers: { 'x-archon-operator-token': token },
-    });
+    res = await (opts.fetchImpl ?? fetch)(
+      `${apiBaseUrl}/api/workflows/${encodeURIComponent(workflowName)}`,
+      {
+        headers: { 'x-archon-operator-token': token },
+      }
+    );
   } catch (err) {
     console.log(
       `[smart-cauldron/node-timeouts] could not read workflow ${workflowName} ` +

@@ -232,13 +232,13 @@ if printf '%s\n' "$R" | grep -Fq 'SPEC_DEFECT'; then FAIL=$((FAIL + 1)); echo "F
 echo "--- Test FP-7: lane parity is deterministic ---"
 assert_eq "FP-7 lane count" "12" "$(printf '%s\n' $LANES | grep -c .)"
 
-echo "--- Test 9: non-PROCEED paths are not gated ---"
+echo "--- Test 9: non-PROCEED paths are not gated and say so (NOT_GATED, never OK) ---"
 R="$(run_check "$NA_TESTS" ALREADY_SATISFIED CODE "" 0 "")"
-assert_eq "ALREADY_SATISFIED OK" "0|OK|" "$R"
+assert_eq "ALREADY_SATISFIED is NOT_GATED" "0|NOT_GATED:ALREADY_SATISFIED|" "$R"
 R="$(run_check "$NA_TESTS" BLOCKED CODE "" 0 "")"
-assert_eq "BLOCKED OK" "0|OK|" "$R"
+assert_eq "BLOCKED is NOT_GATED" "0|NOT_GATED:BLOCKED|" "$R"
 R="$(run_check "$NA_TESTS" "" CODE "" 0 "")"
-assert_eq "empty status OK" "0|OK|" "$R"
+assert_eq "empty status is NOT_GATED:UNKNOWN" "0|NOT_GATED:UNKNOWN|" "$R"
 
 echo "--- Test 10: short manifest (no Tests: line) is not gated ---"
 R="$(run_check "$(printf 'WO: WO-X\nOUTCOME=ALREADY_SATISFIED\nVALIDATION: PASS')" PROCEED CODE "" 0 "")"

@@ -20,7 +20,7 @@
 import { createLogger } from '@archon/paths';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { readOverseerActionPolicyFromEnv, type OverseerActionPolicy } from './action-policy';
-import { PR_DISCOVERY_RUN_ID_PREFIX } from './merge-candidate-discovery';
+import { PR_DISCOVERY_RUN_ID_PREFIX, RUN_BLOCKED_LABEL } from './merge-candidate-discovery';
 import {
   getRepoBasePolicy,
   hasRepoPolicyEntry,
@@ -31,9 +31,12 @@ import {
   type RepoBasePolicy,
   warnLegacyMergePolicy,
 } from './merge-repo-policy';
+import { specDeclaresMergeHold } from './merge-hold';
 import { isSpecOnlyChangeSet } from './reconcile';
-import type { GitHubClientDeps, PullRequestEvidence } from './types.ts';
+import type { GitHubClientDeps, PullRequestEvidence, ReviewConflictAtHead } from './types.ts';
+import { resolveRequiredContexts } from './adapters/required-contexts';
 import { createRealOctokitClient } from './adapters/github-real-deps';
+import { blockingRequiredContexts } from './required-context-gate';
 import { classifyMergeSkip, isRateLimitSkip } from './merge-skip-classification';
 import {
   getScopeApprovalDecision,
@@ -65,6 +68,7 @@ export interface MergeExecutionBridgeStore {
   // behavior (bdc-harness #1046): when absent, no run-in-flight deferral runs.
   hasActiveRunForWo?(woId: string): Promise<boolean>;
   reserveMergeSlot(verdictId: string, since: string, limit: number): Promise<boolean>;
+  getEarliestMergeSlotReservation(since: string): Promise<string | null>;
   releaseMergeSlot(verdictId: string): Promise<void>;
   recordOutcome(input: {
     verdictId: string;
@@ -86,6 +90,25 @@ export interface MergeExecutionBridgeOptions {
   retryMaxAttempts?: number;
   repoConfig?: MergeExecutionRepoConfig;
   ceScopeRecheckDeps?: CeScopeRecheckDeps;
+  /** Receipt-backed exact-head review qualification. */
+  hasQualifiedReview?(input: {
+    owner: string;
+    repo: string;
+    number: number;
+    headSha: string;
+  }): Promise<boolean>;
+  /**
+   * Exact-head review conflict: a review of the same head requested changes, or
+   * one is still running. Checked last before the merge; absent fails closed.
+   */
+  reviewConflictAtHead?(input: {
+    owner: string;
+    repo: string;
+    number: number;
+    headSha: string;
+  }): Promise<ReviewConflictAtHead | null>;
+  // Absent in tests that predate the spec hold. When omitted, no spec is read.
+  readWoSpec?(woId: string): Promise<string>;
 }
 
 export interface MinimalCompareClient {
@@ -255,6 +278,12 @@ function configuredPolicy(override?: MergeExecutionRepoConfig): MergeRepoPolicy 
   if (raw === undefined) return resolveMergeRepoPolicy();
   warnLegacyMergePolicy(LEGACY_REPO_CONFIG_ENV);
   return resolveMergeRepoPolicy({ legacyRepoConfig: parseLegacyRepoConfig(raw) });
+}
+
+function errorStatus(error: unknown): number | undefined {
+  if (typeof error !== 'object' || error === null || !('status' in error)) return undefined;
+  const status = (error as { status: unknown }).status;
+  return typeof status === 'number' ? status : undefined;
 }
 
 function isDocumentationOnly(paths: readonly string[]): boolean {
@@ -560,13 +589,71 @@ async function postMergeReceiptComment(
   }
 }
 
+const CEILING_QUEUE_MARKER = '<!-- overseer:merge-ceiling-queued -->';
+
+function reportedChecksAreBlocking(checks: PullRequestEvidence['checks']): boolean {
+  return checks.total === 0 || checks.failed > 0 || checks.pending > 0;
+}
+
+async function postCeilingQueueNotice(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  pr: PullRequestEvidence,
+  since: string,
+  queuePosition: number,
+  ceiling: number
+): Promise<boolean> {
+  try {
+    if (!pr.pr || !options.github.listPullRequestComments || !options.github.commentOnPullRequest) {
+      throw new Error('queue_notice_comment_api_unavailable');
+    }
+    const reservedAt = await options.store.getEarliestMergeSlotReservation(since);
+    const reservedMs = reservedAt === null ? Number.NaN : Date.parse(reservedAt);
+    if (!Number.isFinite(reservedMs) || reservedMs <= Date.parse(since)) {
+      throw new Error('queue_notice_reservation_unavailable');
+    }
+    const nextSlot = new Date(reservedMs + 60 * 60 * 1000).toISOString();
+    const headLine = `Head: \`${verdict.head_sha}\``;
+    const comments = await options.github.listPullRequestComments(pr.pr);
+    if (
+      comments.some(
+        comment =>
+          comment.body.includes(CEILING_QUEUE_MARKER) &&
+          comment.body.split(/\r?\n/).some(line => line.trim() === headLine)
+      )
+    )
+      return true;
+    await options.github.commentOnPullRequest({
+      ...pr.pr,
+      body: [
+        CEILING_QUEUE_MARKER,
+        headLine,
+        `Queued for merge: position ${queuePosition}, hourly ceiling ${ceiling}. Earliest next merge slot: ${nextSlot}.`,
+      ].join('\n'),
+    });
+    return true;
+  } catch (error) {
+    log.warn(
+      { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
+      'merge-coordinator.ceiling_queue_notice_failed'
+    );
+    return false;
+  }
+}
+
 async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
-  repoPolicy: MergeRepoPolicy
+  repoPolicy: MergeRepoPolicy,
+  queuePosition: number
 ): Promise<'stop' | undefined> {
   let rateLimitDeferred = false;
-  const skip = async (reason: string, prUrl?: string, rateLimited = false): Promise<void> => {
+  const skip = async (
+    reason: string,
+    prUrl?: string,
+    rateLimited = false,
+    details?: Record<string, unknown>
+  ): Promise<void> => {
     if (classifyMergeSkip(reason) === 'transient' && options.store.deferVerdictClaim) {
       const retryMaxAttempts = configuredNonNegativeInteger(
         options.retryMaxAttempts,
@@ -596,6 +683,7 @@ async function mergeClaimedVerdict(
               verdictId: verdict.id,
               runId: verdict.run_id,
               woId: verdict.wo_id,
+              ...(details ?? {}),
               reason,
               prUrl,
               notBefore,
@@ -615,7 +703,14 @@ async function mergeClaimedVerdict(
       prUrl,
     });
     log.info(
-      { verdictId: verdict.id, runId: verdict.run_id, woId: verdict.wo_id, reason, prUrl },
+      {
+        verdictId: verdict.id,
+        runId: verdict.run_id,
+        woId: verdict.wo_id,
+        ...(details ?? {}),
+        reason,
+        prUrl,
+      },
       'merge-coordinator.merge_skipped'
     );
   };
@@ -649,13 +744,66 @@ async function mergeClaimedVerdict(
     await skip('verdict_stale_head', pr.htmlUrl);
     return undefined;
   }
+  if (
+    !options.hasQualifiedReview ||
+    !(await options.hasQualifiedReview({
+      owner: pr.pr.owner,
+      repo: pr.pr.repo,
+      number: pr.pr.number,
+      headSha: verdict.head_sha,
+    }))
+  ) {
+    await skip('review_execution_unqualified', pr.htmlUrl);
+    return undefined;
+  }
   if (pr.state !== 'open') {
     await skip('pr_not_open', pr.htmlUrl);
     return undefined;
   }
-  if (pr.checks.total === 0 || pr.checks.failed > 0 || pr.checks.pending > 0) {
-    await skip('required_checks_not_success', pr.htmlUrl);
-    return undefined;
+  // Known required contexts are the only checks that can block. Unknown and
+  // exhausted lookups keep the aggregate summary, and an authoritative empty
+  // set does too, without the fallback log.
+  const lookups = options.github.requiredContextsLookups;
+  let requiredContextsPassed = false;
+  const resolution = await resolveRequiredContexts(
+    {
+      ...(lookups ?? {}),
+      owner: pr.pr.owner,
+      repo: pr.pr.repo,
+      baseRef: pr.baseBranch,
+      headSha: verdict.head_sha,
+    },
+    lookups ? process.env : {}
+  );
+  if (resolution.state === 'known' && resolution.contexts.length > 0) {
+    const blockingContexts = blockingRequiredContexts(
+      resolution.contexts,
+      pr.checkRuns ?? [],
+      pr.commitStatuses ?? []
+    );
+    if (blockingContexts.length > 0) {
+      await skip('required_checks_not_success', pr.htmlUrl, false, { blockingContexts });
+      return undefined;
+    }
+    requiredContextsPassed = true;
+  } else {
+    if (resolution.state !== 'known') {
+      log.info(
+        {
+          verdictId: verdict.id,
+          runId: verdict.run_id,
+          woId: verdict.wo_id,
+          prUrl: pr.htmlUrl,
+          state: resolution.state,
+          reason: resolution.reason,
+        },
+        'merge-coordinator.required_contexts_fallback'
+      );
+    }
+    if (reportedChecksAreBlocking(pr.checks)) {
+      await skip('required_checks_not_success', pr.htmlUrl);
+      return undefined;
+    }
   }
   // Conflicts are a distinct operator-visible skip: a generic not-clean
   // reason hid DIRTY PRs inside the same bucket as blocked/unstable.
@@ -663,7 +811,12 @@ async function mergeClaimedVerdict(
     await skip('not_mergeable_dirty', pr.htmlUrl);
     return undefined;
   }
-  if (pr.mergeable !== true || pr.mergeableState !== 'clean') {
+  // GitHub reports `unstable` when only non-required checks failed or are
+  // pending. Once every known required context passed, that state is
+  // mergeable; without a known required set, keep requiring `clean`.
+  const mergeableStateAccepted =
+    pr.mergeableState === 'clean' || (requiredContextsPassed && pr.mergeableState === 'unstable');
+  if (pr.mergeable !== true || !mergeableStateAccepted) {
     await skip('mergeable_state_not_clean', pr.htmlUrl);
     return undefined;
   }
@@ -728,6 +881,78 @@ async function mergeClaimedVerdict(
     }
   }
 
+  // Holds release the claim and return. They are not skip() or deferVerdictClaim:
+  // an extended hold must not set actioned_at, increment attempts, or exhaust
+  // the transient retry cap. The next tick re-evaluates after the claim is free.
+  if (pr.labels?.includes('merge-hold')) {
+    await options.store.releaseVerdictClaim(verdict.id, 'merge_hold_label');
+    log.info(
+      {
+        verdictId: verdict.id,
+        runId: verdict.run_id,
+        woId: verdict.wo_id,
+        prUrl: pr.htmlUrl,
+      },
+      'merge-coordinator.merge_hold_label'
+    );
+    return undefined;
+  }
+
+  // A PR opened from a non-PROCEED run is labelled run:blocked by the lane's patch-pr-body
+  // node and is not lane-verified. This is the SHARED execution guard: the originating-run
+  // path (watch.ts emits merge_ready for a green PR regardless of run status) and the
+  // discovery path both reach it, so the label is enforced here as well as at discovery.
+  // Like a hold it releases the claim without skip(), attempts or an outcome row; removing
+  // the label (a human decision) frees the PR on the next tick.
+  if (pr.labels?.includes(RUN_BLOCKED_LABEL)) {
+    await options.store.releaseVerdictClaim(verdict.id, 'run_blocked_label');
+    log.info(
+      {
+        verdictId: verdict.id,
+        runId: verdict.run_id,
+        woId: verdict.wo_id,
+        prUrl: pr.htmlUrl,
+      },
+      'merge-coordinator.run_blocked_label'
+    );
+    return undefined;
+  }
+
+  if (options.readWoSpec && typeof verdict.wo_id === 'string' && verdict.wo_id.startsWith('WO-')) {
+    try {
+      const specText = await options.readWoSpec(verdict.wo_id);
+      if (specDeclaresMergeHold(specText)) {
+        await options.store.releaseVerdictClaim(verdict.id, 'merge_hold');
+        log.info(
+          {
+            verdictId: verdict.id,
+            runId: verdict.run_id,
+            woId: verdict.wo_id,
+            prUrl: pr.htmlUrl,
+          },
+          'merge-coordinator.merge_hold'
+        );
+        return undefined;
+      }
+    } catch (error) {
+      // 404 means the spec file is absent, which is not a hold.
+      if (errorStatus(error) !== 404) {
+        await options.store.releaseVerdictClaim(verdict.id, 'merge_hold_unverified');
+        log.warn(
+          {
+            err: error as Error,
+            verdictId: verdict.id,
+            runId: verdict.run_id,
+            woId: verdict.wo_id,
+            prUrl: pr.htmlUrl,
+          },
+          'merge-coordinator.merge_hold_unverified'
+        );
+        return undefined;
+      }
+    }
+  }
+
   const isCeReleasePr =
     `${pr.pr.owner}/${pr.pr.repo}`.toLowerCase() === 'thinmansoftware/lspro-react' &&
     pr.baseBranch === 'release/ce';
@@ -747,13 +972,8 @@ async function mergeClaimedVerdict(
 
   const now = (options.now ?? ((): Date => new Date()))();
   const since = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
-  if (
-    !(await options.store.reserveMergeSlot(
-      verdict.id,
-      since,
-      configuredLimit(options.maxMergesPerHour)
-    ))
-  ) {
+  const ceiling = configuredLimit(options.maxMergesPerHour);
+  if (!(await options.store.reserveMergeSlot(verdict.id, since, ceiling))) {
     await options.store.releaseVerdictClaim(verdict.id, 'rate_ceiling_deferred');
     log.info(
       {
@@ -764,7 +984,15 @@ async function mergeClaimedVerdict(
       },
       'merge-coordinator.rate_ceiling_deferred'
     );
-    return 'stop';
+    const notified = await postCeilingQueueNotice(
+      options,
+      verdict,
+      pr,
+      since,
+      queuePosition,
+      ceiling
+    );
+    return notified ? 'stop' : undefined;
   }
 
   if (options.github.approvePullRequest) {
@@ -797,6 +1025,32 @@ async function mergeClaimedVerdict(
       await skip(premergeRecheck.reason, pr.htmlUrl);
       return undefined;
     }
+  }
+  // One approval is not enough when the same head has other reviews: every
+  // check event queues its own recheck, and on 2026-11-03 #1453 merged on the
+  // first APPROVED while three reviews of that head were still running; all
+  // three then requested changes. Checked last, right before the merge.
+  let conflict: ReviewConflictAtHead | 'check_unavailable' | null = 'check_unavailable';
+  if (options.reviewConflictAtHead) {
+    try {
+      conflict = await options.reviewConflictAtHead({
+        owner: pr.pr.owner,
+        repo: pr.pr.repo,
+        number: pr.pr.number,
+        headSha: verdict.head_sha,
+      });
+    } catch {
+      conflict = 'lookup_failed';
+    }
+  }
+  if (conflict) {
+    log.warn(
+      { verdictId: verdict.id, woId: verdict.wo_id, prUrl: pr.htmlUrl, conflict },
+      'merge-coordinator.merge_refused_conflicting_reviews'
+    );
+    await options.store.releaseMergeSlot(verdict.id);
+    await skip(`review_conflict_at_head:${conflict}`, pr.htmlUrl);
+    return undefined;
   }
   let merged: Awaited<ReturnType<GitHubClientDeps['mergePullRequest']>>;
   try {
@@ -858,11 +1112,14 @@ export async function runMergeExecutionBridgeOnce(
 ): Promise<void> {
   const repoPolicy = configuredPolicy(options.repoConfig);
   const verdicts = await options.store.listUnactionedVerdicts();
+  let queuePosition = 0;
   for (const verdict of verdicts) {
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
+    queuePosition += 1;
     if (!(await options.store.claimVerdict(verdict.id))) continue;
     try {
-      if ((await mergeClaimedVerdict(options, verdict, repoPolicy)) === 'stop') break;
+      if ((await mergeClaimedVerdict(options, verdict, repoPolicy, queuePosition)) === 'stop')
+        break;
     } catch (error) {
       await options.store.releaseMergeSlot(verdict.id);
       await options.store.releaseVerdictClaim(
@@ -875,4 +1132,15 @@ export async function runMergeExecutionBridgeOnce(
       );
     }
   }
+}
+
+/**
+ * The repo/base merge policy that merge execution itself applies: the current
+ * MERGE_MANAGER_REPO_POLICY, else the deprecated OVERSEER_MERGE_REPO_CONFIG
+ * (fail-closed parse), else the legacy/default resolution. Exported so
+ * read-only verifiers (`archon project verify`) judge branches against the
+ * exact effective policy instead of a second, drifting resolution.
+ */
+export function resolveExecutionMergeRepoPolicy(): MergeRepoPolicy {
+  return configuredPolicy();
 }

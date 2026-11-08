@@ -10,12 +10,13 @@ import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/p
 import { execFileAsync, getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
 import type { WorkflowDefinition, WorkflowRun, WorkflowExecutionResult } from './schemas';
 import { executeDagWorkflow } from './dag-executor';
+import { finalizeRunTeardown, isTerminalRunStatus } from './run-teardown';
 import { resolveModelForNode, type ModelOverride } from './model-override';
 import { logWorkflowStart, logWorkflowError } from './logger';
 import { formatDuration, parseDbTimestamp } from './utils/duration';
 import { getWorkflowEventEmitter } from './event-emitter';
 import { isRegisteredProvider, getRegisteredProviders, resolveProviderId } from '@archon/providers';
-import { classifyError } from './executor-shared';
+import { classifyError, InfrastructureClassBlock } from './executor-shared';
 import { BUNDLED_POLICIES } from './defaults/bundled-defaults';
 import { resolveEntryLane, DEFAULT_ENGINE_TO_LANE } from './router-dispatcher';
 import { isLaneFullyDark, listDarkEngines } from './engine-availability';
@@ -25,6 +26,16 @@ import {
   type RunAuthorityDispatch,
   type RunAuthorityInput,
 } from './reliability/run-authority';
+import {
+  decodeGitHubContentsJson,
+  parseRepairBaseStdout,
+  parseRepairTarget,
+  PROJECT_MAP_API_PATH,
+  repairBaseCommandArgs,
+  resolveRunBranchIdentity,
+  selectProjectMapBranchEntry,
+  type RunBranchIdentity,
+} from './reliability/run-branch-identity';
 import { captureRuntimeRevisions } from './reliability/runtime-revisions';
 import { formatProbeBlock, runFireTimeProbe } from './reliability/fire-time-probe';
 import {
@@ -33,10 +44,20 @@ import {
   getSeatCutoff,
   getSeatUsageReader,
   seatsForBindings,
+  seatsForGateScope,
   unknownSeatReading,
+  type SeatGateScope,
   type SeatId,
   type SeatReading,
 } from './reliability/seat-usage';
+import {
+  buildSeatRerouteNode,
+  DEFAULT_CLAUDE_FAILOVER_MODEL,
+  isReviewNode,
+  REVIEW_FAILOVER_CLAUDE_REFUSED_D0,
+} from './reliability/seat-node-failover';
+import { resolveWorkflowNodeProviders } from './reliability/resolve-binding';
+import { selectQuotaExhaustionRoute } from './node-failover';
 import {
   renderCanaryProbeRed,
   renderCanaryProbeWarn,
@@ -48,6 +69,11 @@ let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
   if (!cachedLog) cachedLog = createLogger('workflow.executor');
   return cachedLog;
+}
+
+/** Test-only. Drops the cached executor logger so the next getLog() rebuilds it. */
+export function resetExecutorLogForTests(): void {
+  cachedLog = undefined;
 }
 
 async function readBoundSeats(
@@ -509,6 +535,188 @@ export async function resolveExecutorLane(opts: {
   return undefined;
 }
 
+async function readCheckoutHead(cwd: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', cwd, 'symbolic-ref', '--short', 'HEAD'], {
+      timeout: 15000,
+    });
+    const branch = stdout.trim();
+    return branch.length > 0 ? branch : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readGhStdout(args: string[]): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync('gh', args, { timeout: 15000 });
+    return stdout;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readRepairBaseRefName(prNumber: number, repo: string): Promise<string | undefined> {
+  const stdout = await readGhStdout(repairBaseCommandArgs(prNumber, repo));
+  return stdout === undefined ? undefined : parseRepairBaseStdout(stdout);
+}
+
+async function readProjectMapBranchEntry(
+  repo: string
+): Promise<{ cauldron_base?: string; base_branch?: string } | undefined> {
+  const stdout = await readGhStdout(['api', PROJECT_MAP_API_PATH]);
+  if (stdout === undefined) return undefined;
+  const decoded = decodeGitHubContentsJson(stdout);
+  return decoded === undefined ? undefined : selectProjectMapBranchEntry(decoded, repo);
+}
+
+/**
+ * Target repo for a branch-identity fetch. Prefer the workflow's target_repo.
+ * Origin lookup is optional because captureRunAuthorityInput also reads origin,
+ * and that read must not be stolen by an earlier identity fetch.
+ */
+async function targetRepoForBranchIdentity(
+  workflow: WorkflowDefinition,
+  cwd: string,
+  spec: Uint8Array,
+  allowRemoteLookup: boolean
+): Promise<string | undefined> {
+  const declared = workflow.target_repo?.trim();
+  if (declared) return declared;
+  const needsFetch = Boolean(parseRepairTarget(spec)) || !parseDeclaredBaseBranch(spec);
+  if (!needsFetch || !allowRemoteLookup) return undefined;
+  try {
+    return (await getRemoteUrl(toRepoPath(cwd))) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function loadRunBranchIdentity(
+  workflow: WorkflowDefinition,
+  cwd: string,
+  spec: Uint8Array | undefined,
+  allowRemoteLookup: boolean
+): Promise<RunBranchIdentity> {
+  if (!spec || spec.byteLength === 0) return {};
+  const targetRepo = await targetRepoForBranchIdentity(workflow, cwd, spec, allowRemoteLookup);
+  const isolationBranch = await readCheckoutHead(cwd);
+  return resolveRunBranchIdentity({
+    spec,
+    isolationBranch,
+    targetRepo,
+    readers: {
+      readRepairBase: readRepairBaseRefName,
+      readProjectMap: readProjectMapBranchEntry,
+    },
+  });
+}
+
+/** Holder wait bound for a repair run (N6): never more than 600 s from admission. */
+export const REPAIR_NOT_BEFORE_SECONDS = 600;
+
+export interface RepairNotBeforeInput {
+  readonly spec: string | Uint8Array | undefined;
+  readonly cwd: string;
+  /** `git worktree list --porcelain` output for the codebase clone. */
+  readonly listWorktrees: (cwd: string) => Promise<string>;
+  /** Run rows recorded for a working path. */
+  readonly listRuns: (
+    workingPath: string
+  ) => Promise<readonly { status: string; completed_at: string | Date | null }[]>;
+  readonly now?: () => Date;
+  readonly sleep?: (ms: number) => Promise<void>;
+  /** Persist metadata.repair_not_before (ISO UTC). */
+  readonly record?: (notBefore: string) => Promise<void>;
+}
+
+export interface RepairNotBeforeResult {
+  readonly holder: string;
+  readonly notBefore: string;
+  readonly waitMs: number;
+}
+
+function normalizeWorktreePath(path: string): string {
+  const resolved = resolve(path).replace(/\\/g, '/');
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+/** Path of the worktree (other than `cwd`) that has `branch` checked out, if any. */
+export function findBranchHolder(porcelain: string, branch: string, cwd: string): string | null {
+  const self = normalizeWorktreePath(cwd);
+  for (const block of porcelain.split(/\n\s*\n/)) {
+    let path: string | null = null;
+    let head: string | null = null;
+    for (const line of block.split('\n')) {
+      if (line.startsWith('worktree ')) path = line.slice('worktree '.length).trim();
+      if (line.startsWith('branch ')) head = line.slice('branch '.length).trim();
+    }
+    if (path && head === `refs/heads/${branch}` && normalizeWorktreePath(path) !== self) {
+      return path;
+    }
+  }
+  return null;
+}
+
+/**
+ * N6: when the spec declares a repair target and another worktree holds that
+ * branch, not_before = latest completed_at among the holder's terminal run rows
+ * + 600 s. Records metadata.repair_not_before and waits (bounded by 600 s) so the
+ * checkout-repair-target node starts no earlier. No holder, a holder with no
+ * terminal row, or a holder with a non-terminal row (the rtw core refuses it at
+ * once) means no wait and nothing recorded.
+ */
+export async function computeRepairNotBefore(
+  input: RepairNotBeforeInput
+): Promise<RepairNotBeforeResult | null> {
+  const target = parseRepairTarget(input.spec);
+  if (!target) return null;
+  let porcelain: string;
+  try {
+    porcelain = await input.listWorktrees(input.cwd);
+  } catch {
+    return null;
+  }
+  const holder = findBranchHolder(porcelain, target.branch, input.cwd);
+  if (!holder) return null;
+  const rows = await input.listRuns(holder);
+  if (rows.length === 0 || rows.some(row => !isTerminalRunStatus(row.status))) return null;
+  let latest = -1;
+  for (const row of rows) {
+    if (row.completed_at === null || row.completed_at === undefined) continue;
+    const ms = parseDbTimestamp(row.completed_at);
+    if (Number.isFinite(ms) && ms > latest) latest = ms;
+  }
+  if (latest < 0) return null;
+  const now = (input.now ?? ((): Date => new Date()))();
+  const notBeforeMs = latest + REPAIR_NOT_BEFORE_SECONDS * 1000;
+  const notBefore = new Date(notBeforeMs).toISOString();
+  const waitMs = Math.max(
+    0,
+    Math.min(notBeforeMs - now.getTime(), REPAIR_NOT_BEFORE_SECONDS * 1000)
+  );
+  if (input.record) await input.record(notBefore);
+  if (waitMs > 0) {
+    const sleep =
+      input.sleep ?? ((ms: number): Promise<void> => new Promise(r => setTimeout(r, ms)));
+    await sleep(waitMs);
+  }
+  return { holder, notBefore, waitMs };
+}
+
+/**
+ * Teardown (N1-N3) before a terminal failure write. The teardown metadata is
+ * written onto the run row first; the failure write itself is unchanged.
+ */
+async function failWorkflowRunWithTeardown(
+  deps: WorkflowDeps,
+  run: WorkflowRun,
+  reason: string
+): Promise<void> {
+  await finalizeRunTeardown(deps.store, run);
+  await deps.store.failWorkflowRun(run.id, reason);
+}
+
 /**
  * Execute a complete DAG-based workflow.
  *
@@ -731,9 +939,19 @@ export async function executeWorkflow(
     }
   }
 
+  let identitySpec: Uint8Array | undefined = authoritySource?.specBytes;
+
   if (!workflowRun) {
-    // Create workflow run record
+    // Create workflow run record. Remote lookup stays off here so a later
+    // authority capture can read origin itself. The post-authority stamp
+    // fills anything this pass could not resolve.
     try {
+      const createdIdentity = await loadRunBranchIdentity(
+        workflow,
+        cwd,
+        authoritySource?.specBytes,
+        false
+      );
       workflowRun = await deps.store.createWorkflowRun({
         workflow_name: workflow.name,
         conversation_id: conversationDbId,
@@ -743,6 +961,7 @@ export async function executeWorkflow(
         metadata: {
           ...(issueContext ? { github_context: issueContext } : {}),
           ...(modelOverride ? { model_override: modelOverride } : {}),
+          ...createdIdentity,
         },
         parent_conversation_id: parentConversationId,
       });
@@ -932,7 +1151,7 @@ export async function executeWorkflow(
             'workflow_event_persist_failed'
           );
         });
-      await deps.store.failWorkflowRun(workflowRun.id, reason);
+      await failWorkflowRunWithTeardown(deps, workflowRun, reason);
       await sendCriticalMessage(
         platform,
         conversationId,
@@ -990,6 +1209,7 @@ export async function executeWorkflow(
         effectiveAuthoritySource = { ...frozen, dispatchId: conversationId };
       }
       if (effectiveAuthoritySource) {
+        identitySpec = effectiveAuthoritySource.specBytes;
         // Single base-lane authority (WO-HARNESS-BASE-LANE-AUTHORITY-01): the WO's
         // declared "Base branch:" overrides the auto-detected repo default so the
         // pinned authority triple (base_branch/base_sha/run_scope_sha) AND the
@@ -1045,6 +1265,23 @@ export async function executeWorkflow(
           );
           baseBranch = existingAuthority.baseBranch;
         }
+      }
+    }
+
+    // Stamp recorded base_branch / head_branch before any node runs. Orchestrator
+    // rows already exist; merge the keys onto that JSON. Executor-created rows
+    // were stamped at insert when the spec was already frozen, and this merge
+    // covers a spec that was only frozen above. Fetch misses stay misses.
+    const stampedIdentity = await loadRunBranchIdentity(workflow, cwd, identitySpec, true);
+    const stampedMetadata: Record<string, unknown> = { ...stampedIdentity };
+    if (workflowRun && Object.keys(stampedMetadata).length > 0) {
+      const currentMetadata = workflowRun.metadata ?? {};
+      const identityChanged = Object.entries(stampedMetadata).some(
+        ([key, value]) => currentMetadata[key] !== value
+      );
+      if (identityChanged) {
+        await deps.store.updateWorkflowRun(workflowRun.id, { metadata: stampedMetadata });
+        workflowRun.metadata = { ...currentMetadata, ...stampedMetadata };
       }
     }
 
@@ -1122,17 +1359,55 @@ export async function executeWorkflow(
             'workflow_event_persist_failed'
           );
         });
-      await deps.store.failWorkflowRun(workflowRun.id, reason);
+      await failWorkflowRunWithTeardown(deps, workflowRun, reason);
       await sendCriticalMessage(platform, conversationId, `[ ] **Workflow blocked**: ${reason}`);
       return { success: false, workflowRunId: workflowRun.id, error: reason };
     }
 
     // Seat gate: always on (John Ranson, 2026-09-24). There is no off switch.
+    // Lane-scoped (WO-HARNESS-SEAT-GATE-HONORS-FIRED-LANE-TIER-01): the lane's
+    // own seat refuses; a seat bound only by reviewer nodes refuses only when
+    // those nodes have no failover target with headroom.
+    const failoverDefaults = {
+      failoverProvider: executableWorkflow.failover_provider,
+      failoverModel: executableWorkflow.failover_model,
+    };
+    const seatScope: SeatGateScope = {
+      laneProvider: writtenProvider,
+      nodes: resolveWorkflowNodeProviders({
+        workflow: executableWorkflow,
+        workflowProvider: writtenProvider,
+        workflowModel: resolvedModel,
+        config,
+        modelOverride,
+      }).map(({ node, providerId }) => {
+        const route = selectQuotaExhaustionRoute(providerId, node, failoverDefaults);
+        return {
+          nodeId: node.id,
+          providerId,
+          node,
+          ...(route.kind === 'failover' ? { failoverProvider: route.provider } : {}),
+        };
+      }),
+      workflowFailoverProvider: executableWorkflow.failover_provider,
+    };
+    // Nodes the seat gate reroutes off an over-cutoff seat dispatch from this
+    // copy of the workflow (WO-HARNESS-NODE-USAGE-REFUSAL-FAILOVER-01).
+    let dispatchWorkflow = executableWorkflow;
+    // Per-node model overrides for the dispatch. A reroute replaces the node's entry:
+    // the override pinned the exhausted provider, so it must not beat the new route.
+    let dispatchModelOverride = modelOverride;
+    const laneName = executableWorkflow.name;
     const seatIds = seatsForBindings(probeDecision.bindings);
     if (seatIds.length > 0) {
-      const readings = await readBoundSeats(seatIds);
+      const readings = await readBoundSeats(seatsForGateScope(probeDecision.bindings, seatScope));
       const cutoff = getSeatCutoff();
-      const seatDecision = decideSeatGate(probeDecision.bindings, readings, cutoff.percent);
+      const seatDecision = decideSeatGate(
+        probeDecision.bindings,
+        readings,
+        cutoff.percent,
+        seatScope
+      );
       // UNKNOWN never refuses on its own (a broken probe must not stop all
       // work), and it is never silent either: log + alert for every bound
       // seat that could not be measured, regardless of whether ANOTHER seat
@@ -1153,8 +1428,128 @@ export async function executeWorkflow(
           workflowRunId: workflowRun.id,
         });
       }
+      for (const detail of seatDecision.onCredits ?? []) {
+        getLog().warn(
+          {
+            workflowName: laneName,
+            workflowRunId: workflowRun.id,
+            lane: laneName,
+            detail,
+            cutoffPercent: cutoff.percent,
+          },
+          'workflow.seat_usage_on_credits'
+        );
+      }
+      if (!seatDecision.refused) {
+        for (const degraded of seatDecision.degradedSeats ?? []) {
+          getLog().warn(
+            {
+              workflowName: laneName,
+              workflowRunId: workflowRun.id,
+              lane: laneName,
+              seat: degraded.seat,
+              window: degraded.window,
+              usedPercent: degraded.usedPercent,
+              cutoffPercent: degraded.cutoffPercent,
+              nodeIds: degraded.nodeIds,
+              failoverProviders: degraded.failoverProviders,
+            },
+            'workflow.seat_usage_node_degraded'
+          );
+        }
+        const routes = new Map<string, { fromProvider: string; toProvider: string }>();
+        for (const degraded of seatDecision.degradedSeats ?? []) {
+          for (const route of degraded.routes ?? []) routes.set(route.nodeId, route);
+        }
+        if (routes.size > 0) {
+          const nodeOverrides: Record<string, { provider?: string; model?: string }> = {
+            ...(modelOverride?.nodes ?? {}),
+          };
+          // failover_model and failover_agent belong to the declared failover route; when a
+          // different provider was selected, keep the original persona and fall back to the
+          // target provider's configured assistant model. The per-node override carries the
+          // selected model so resolveModelForNode (override wins) dispatches it.
+          // A NON-review node rerouted to claude with neither set gets
+          // DEFAULT_CLAUDE_FAILOVER_MODEL, so a model-less persona cannot throw
+          // "must declare a 'model:'" (run 8849e767). A review node never reaches
+          // claude here (D0; selectSeatNodeFailover drops it) -- asserted below.
+          const rerouteBinding = (
+            node: (typeof executableWorkflow.nodes)[number],
+            toProvider: string
+          ): { model: string | undefined; agent: string | undefined } => {
+            const declared = node as {
+              failover_provider?: string;
+              failover_model?: string;
+              failover_agent?: string;
+            };
+            const declaredProvider =
+              declared.failover_provider ?? executableWorkflow.failover_provider;
+            const onDeclaredRoute = toProvider === declaredProvider;
+            const declaredModel = onDeclaredRoute
+              ? (declared.failover_model ?? executableWorkflow.failover_model)
+              : undefined;
+            if (toProvider === 'claude' && isReviewNode(node)) {
+              throw new InfrastructureClassBlock(
+                `${REVIEW_FAILOVER_CLAUDE_REFUSED_D0}: review node '${node.id}' was routed to claude; ` +
+                  'board decision D0 (M-20261021c) bars review seats from falling back to Claude.'
+              );
+            }
+            const claudeDefault =
+              toProvider === 'claude' ? DEFAULT_CLAUDE_FAILOVER_MODEL : undefined;
+            return {
+              model: declaredModel ?? assistantModels[toProvider] ?? claudeDefault,
+              agent: onDeclaredRoute ? declared.failover_agent : undefined,
+            };
+          };
+          for (const node of executableWorkflow.nodes) {
+            const route = routes.get(node.id);
+            if (!route) continue;
+            const { model } = rerouteBinding(node, route.toProvider);
+            nodeOverrides[node.id] = model
+              ? { provider: route.toProvider, model }
+              : { provider: route.toProvider };
+          }
+          dispatchModelOverride = { ...(modelOverride ?? {}), nodes: nodeOverrides };
+          dispatchWorkflow = {
+            ...executableWorkflow,
+            nodes: executableWorkflow.nodes.map(node => {
+              const route = routes.get(node.id);
+              if (!route) return node;
+              const { model, agent } = rerouteBinding(node, route.toProvider);
+              return buildSeatRerouteNode(node, route.toProvider, model, agent);
+            }),
+          };
+          for (const [nodeId, route] of routes) {
+            await deps.store
+              .createWorkflowEvent({
+                workflow_run_id: workflowRun.id,
+                event_type: 'node_failover',
+                step_name: nodeId,
+                data: {
+                  node_id: nodeId,
+                  from_provider: route.fromProvider,
+                  to_provider: route.toProvider,
+                  reason_code: 'seat_over_cutoff',
+                },
+              })
+              .catch((err: Error) => {
+                getLog().error(
+                  { err, workflowRunId: workflowRun.id, eventType: 'node_failover' },
+                  'workflow_event_persist_failed'
+                );
+              });
+          }
+        }
+      }
       if (seatDecision.refused) {
-        const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}`;
+        const role = seatDecision.role ?? 'lane';
+        // D0 (WO-HARNESS-PERSONA-MODEL-DECLARED-01): a review node with no non-Claude
+        // route names the reason and the node, so the refusal is not read as a cutoff.
+        const d0 =
+          seatDecision.reason !== undefined
+            ? `:reason=${seatDecision.reason}:node=${seatDecision.reviewNodeId ?? ''}`
+            : '';
+        const detail = `seat_usage_refused:${seatDecision.seat}:${seatDecision.window}:${seatDecision.usedPercent}:${seatDecision.cutoffPercent}:lane=${laneName}:role=${role}${d0}`;
         getLog().warn(
           {
             workflowName: executableWorkflow.name,
@@ -1163,6 +1558,11 @@ export async function executeWorkflow(
             window: seatDecision.window,
             usedPercent: seatDecision.usedPercent,
             cutoffPercent: seatDecision.cutoffPercent,
+            lane: laneName,
+            role,
+            ...(seatDecision.reason !== undefined
+              ? { reason: seatDecision.reason, reviewNodeId: seatDecision.reviewNodeId }
+              : {}),
           },
           'workflow.seat_usage_refused'
         );
@@ -1173,6 +1573,11 @@ export async function executeWorkflow(
             data: {
               reason: 'seat_usage_refused',
               detail,
+              lane: laneName,
+              role,
+              ...(seatDecision.reason !== undefined
+                ? { reason_code: seatDecision.reason, review_node_id: seatDecision.reviewNodeId }
+                : {}),
             },
           })
           .catch((err: Error) => {
@@ -1181,7 +1586,7 @@ export async function executeWorkflow(
               'workflow_event_persist_failed'
             );
           });
-        await deps.store.failWorkflowRun(workflowRun.id, detail);
+        await failWorkflowRunWithTeardown(deps, workflowRun, detail);
         await sendCriticalMessage(
           platform,
           conversationId,
@@ -1324,13 +1729,52 @@ export async function executeWorkflow(
       // Continue anyway - workflow is already recorded in database
     }
 
+    // N6 (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01): a repair run waits until the
+    // holder's completed_at + 600 s before checkout-repair-target can start.
+    const repairWaitRun = workflowRun;
+    const repairNotBefore = await computeRepairNotBefore({
+      spec: identitySpec,
+      cwd,
+      listWorktrees: async dir =>
+        (await execFileAsync('git', ['worktree', 'list', '--porcelain'], { cwd: dir })).stdout,
+      listRuns: async path =>
+        deps.store.listWorkflowRunsByWorkingPath
+          ? deps.store.listWorkflowRunsByWorkingPath(path)
+          : [],
+      record: async notBefore => {
+        await deps.store.updateWorkflowRun(repairWaitRun.id, {
+          metadata: { repair_not_before: notBefore },
+        });
+      },
+    }).catch((error: unknown) => {
+      getLog().warn(
+        { err: error as Error, workflowRunId: repairWaitRun.id },
+        'workflow.repair_not_before_failed'
+      );
+      return null;
+    });
+    if (repairNotBefore && repairNotBefore.waitMs > 0) {
+      getLog().info(
+        { workflowRunId: workflowRun.id, ...repairNotBefore },
+        'workflow.repair_not_before_waited'
+      );
+      const afterWait = await deps.store.getWorkflowRunStatus(workflowRun.id).catch(() => null);
+      if (afterWait !== null && afterWait !== 'running') {
+        return {
+          success: false,
+          workflowRunId: workflowRun.id,
+          error: `Run left running state (${afterWait}) during repair_not_before wait`,
+        };
+      }
+    }
+
     // Execute the DAG workflow
     const dagSummary = await executeDagWorkflow(
       deps,
       platform,
       conversationId,
       cwd,
-      executableWorkflow,
+      dispatchWorkflow,
       workflowRun,
       writtenProvider,
       resolvedModel,
@@ -1342,7 +1786,7 @@ export async function executeWorkflow(
       configuredCommandFolder,
       issueContext,
       dagPriorCompletedNodes,
-      modelOverride
+      dispatchModelOverride
     );
 
     // executeDagWorkflow throws on fatal errors; check DB status for result
@@ -1368,7 +1812,7 @@ export async function executeWorkflow(
 
     // Record failure in database (non-blocking - log but don't re-throw on DB error)
     try {
-      await deps.store.failWorkflowRun(workflowRun.id, err.message);
+      await failWorkflowRunWithTeardown(deps, workflowRun, err.message);
     } catch (dbError) {
       getLog().error(
         { err: dbError as Error, workflowId: workflowRun.id, originalError: err.message },
@@ -1434,11 +1878,13 @@ export async function executeWorkflow(
       const backstopStatus = await deps.store.getWorkflowRunStatus(runId).catch(() => null);
       if (backstopStatus === 'running') {
         getLog().warn({ workflowRunId: runId }, 'executor.backstop_triggered');
-        await deps.store
-          .failWorkflowRun(runId, 'Workflow exited without finalizing -- see logs')
-          .catch((err: unknown) => {
-            getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
-          });
+        await failWorkflowRunWithTeardown(
+          deps,
+          workflowRun,
+          'Workflow exited without finalizing -- see logs'
+        ).catch((err: unknown) => {
+          getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
+        });
       }
     }
   }

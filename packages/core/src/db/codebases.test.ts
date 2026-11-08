@@ -361,6 +361,28 @@ describe('codebases', () => {
   });
 
   describe('updateCodebase', () => {
+    test('updates default_branch', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateCodebase('codebase-123', { default_branch: 'staging' });
+
+      expect(mockQuery).toHaveBeenCalledWith(
+        'UPDATE remote_agent_codebases SET default_branch = $1, updated_at = NOW() WHERE id = $2',
+        ['staging', 'codebase-123']
+      );
+    });
+
+    test('updates name', async () => {
+      mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
+
+      await updateCodebase('codebase-123', { name: 'thinmansoftware/renamed' });
+
+      expect(mockQuery).toHaveBeenCalledWith(
+        'UPDATE remote_agent_codebases SET name = $1, updated_at = NOW() WHERE id = $2',
+        ['thinmansoftware/renamed', 'codebase-123']
+      );
+    });
+
     test('updates default_cwd only', async () => {
       mockQuery.mockResolvedValueOnce(createQueryResult([], 1));
 
@@ -454,4 +476,84 @@ describe('codebases', () => {
       expect(mockQuery).toHaveBeenCalledTimes(3);
     });
   });
+});
+
+// Isolate the real database/API from this legacy suite's connection mocks.
+test('patch_stores_and_get_returns_project_record with real SQLite, validation and corrupt reads', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join, resolve } = await import('node:path');
+  const root = mkdtempSync(join(tmpdir(), 'grimoire-api-'));
+  const apiPath = resolve(import.meta.dir, '../../../server/src/routes/api.ts');
+  const hookPath = resolve(import.meta.dir, '../../../server/src/routes/openapi-defaults.ts');
+  const code = `
+    import { OpenAPIHono } from '@hono/zod-openapi';
+    import { registerApiRoutes } from ${JSON.stringify(apiPath)};
+    import { validationErrorHook } from ${JSON.stringify(hookPath)};
+    import { createCodebase, getCodebase } from '@archon/core/db/codebases';
+    import { pool, closeDatabase } from '@archon/core/db/connection';
+    const row = await createCodebase({name:'thinmansoftware/learn-a', default_cwd:'/tmp/learn-a'});
+    const app = new OpenAPIHono({defaultHook: validationErrorHook});
+    registerApiRoutes(app, {}, {});
+    const record = {record_version:1,tier:'learning',base_branch:'main',production_branches:['release'],test_command:'bun test',runner_profile:'default',spec_home:'docs',reviewer_role:'reviewer',allowed_providers:[],secret_namespace:'test',github:'off',approver:'operator',rollout:'direct',health_url:null,state:'idea'};
+    const patch = async project_record => app.request('/api/codebases/'+row.id, {method:'PATCH', headers:{'content-type':'application/json'}, body:JSON.stringify({project_record})});
+    const valid = await patch(record);
+    const got = await app.request('/api/codebases/'+row.id);
+    const raw = (await getCodebase(row.id)).project_record;
+    const rejected = [];
+    for (const invalid of [{...record,production_branches:[]},{...record,production_branches:['main']},{...record,merge_now:true}]) {
+      const res = await patch(invalid);
+      rejected.push({status:res.status,body:await res.text(),unchanged:(await getCodebase(row.id)).project_record===raw});
+    }
+    await pool.query('UPDATE remote_agent_codebases SET project_record = $1 WHERE id = $2', ['{not json', row.id]);
+    const corrupt = await app.request('/api/codebases/'+row.id);
+    const corruptBody = await corrupt.json();
+    await pool.query('UPDATE remote_agent_codebases SET project_record = $1 WHERE id = $2', ['{}', row.id]);
+    const invalidObject = await (await app.request('/api/codebases/'+row.id)).json();
+    const cleared = await patch(null);
+    console.log(JSON.stringify({id:row.id,valid:valid.status,got:await got.json(),raw,rejected,corrupt:corrupt.status,corruptBody,invalidObject,cleared:cleared.status,clearedRaw:(await getCodebase(row.id)).project_record}));
+    await closeDatabase();
+  `;
+  try {
+    // One line: on Windows a newline inside a `bun -e` argument truncates the script.
+    const proc = Bun.spawn(['bun', '-e', code.replace(/\s*\n\s*/g, ' ').trim()], {
+      cwd: resolve(import.meta.dir, '../../../server'),
+      env: {
+        ...process.env,
+        ARCHON_HOME: root,
+        DATABASE_URL: '',
+        ARCHON_OPERATOR_TOKEN: '',
+        ARCHON_OPERATOR_ACCESS_HOSTS: '',
+        ARCHON_OPERATOR_EMAILS: '',
+        LOG_LEVEL: 'warn',
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const stdout = await new Response(proc.stdout).text();
+    const stderr = await new Response(proc.stderr).text();
+    expect({ code: await proc.exited, stderr }).toEqual({ code: 0, stderr: expect.any(String) });
+    const lines = stdout.trim().split('\n');
+    const result = JSON.parse(lines[lines.length - 1]);
+    expect(result.valid).toBe(200);
+    expect(result.got.project_record).toEqual(JSON.parse(result.raw));
+    for (const [index, field] of [
+      'production_branches',
+      'production_branches',
+      'merge_now',
+    ].entries()) {
+      expect(result.rejected[index].status).toBe(400);
+      expect(result.rejected[index].body).toContain(field);
+      expect(result.rejected[index].unchanged).toBe(true);
+    }
+    expect(result.corrupt).toBe(200);
+    expect(result.corruptBody.project_record).toBeNull();
+    expect(result.invalidObject.project_record).toBeNull();
+    expect(stdout + stderr).toContain('project_record_unparseable');
+    expect(stdout + stderr).toContain(result.id);
+    expect(result.cleared).toBe(200);
+    expect(result.clearedRaw).toBeNull();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

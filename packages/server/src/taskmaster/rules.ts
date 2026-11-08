@@ -23,10 +23,12 @@
  * until their adoption content hash changes (durable state in tm_suppression).
  */
 import { createHash } from 'crypto';
+import { T3_DESKTOP_RECIPIENT } from '@archon/core/db/dispatch-routing';
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
 import type { RemediationCandidateBody } from '@archon/overseer/remediation-candidate';
 import type { FireEligibilityEvidence } from './fire-eligibility';
 import { WO_ID_RE } from './guard';
+import type { FireLane } from './lane-budget';
 import { canonicalizeThreadRef } from './thread-ref';
 
 export type ThreadPriority = 'P0' | 'P1' | 'P2' | 'P3';
@@ -102,6 +104,13 @@ const HOUR_MS = 60 * MINUTE_MS;
  * host. The 40% useful-rate floor is the guardrail: faster-and-noisy trips
  * it sooner, so frequency cannot silently become flood.
  */
+/**
+ * WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: escalate_p0 fires once per stall per
+ * 24h, not once per NUDGE_CLOCK_MS.P0 (30 min). On 2026-11-01 the 30-minute
+ * bucket produced ~760 escalate_p0 attempts a day for 30 stalled items.
+ */
+export const ESCALATE_P0_CLOCK_MS = 24 * HOUR_MS;
+
 export const NUDGE_CLOCK_MS: Record<ThreadPriority, number> = {
   P0: 30 * MINUTE_MS,
   P1: 2 * HOUR_MS,
@@ -198,7 +207,7 @@ export interface NextActionContext {
   /** Durable tm_suppression row for this thread's canonical ref, if any. */
   suppression?: SuppressionLike;
   fireEligible?: boolean;
-  fireLane?: 'claude' | 'codex' | 'xai' | null;
+  fireLane?: FireLane | null;
   fireHolding?: boolean;
   fireEscalate?: boolean;
   customerP0Exempt?: boolean;
@@ -403,7 +412,7 @@ export function computeNextAction(
   if (classification === 'healthy') return null;
 
   if (thread.isUnclaimedP0) {
-    const bucket = Math.floor(context.nowMs / NUDGE_CLOCK_MS.P0);
+    const bucket = Math.floor(context.nowMs / ESCALATE_P0_CLOCK_MS);
     const woId = adoption?.title?.match(WO_ID_RE);
     const title = woId?.index === 0 ? woId[0] : adoption?.title;
     const titleNote = title ? `"${title}" (${thread.ref})` : thread.ref;
@@ -414,7 +423,7 @@ export function computeNextAction(
     return {
       type: 'escalate_p0',
       threadRef: thread.ref,
-      recipient: 'operator',
+      recipient: T3_DESKTOP_RECIPIENT,
       body:
         `Unclaimed P0: ${titleNote} [${thread.priority}] has no owner. ${age}. ` +
         "This is an escalation for John's attention; no automated assignment " +

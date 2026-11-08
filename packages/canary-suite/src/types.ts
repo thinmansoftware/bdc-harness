@@ -18,7 +18,7 @@ export interface ConductorProbe {
   readonly woClass?: 'CODE' | 'INFRA' | 'MIXED';
   readonly tags: readonly string[];
   readonly expectedTier: string;
-  readonly expectedWorkflow: CanaryLaneName;
+  readonly expectedWorkflow: CanaryProbeWorkflow;
 }
 
 export interface CanaryManifest {
@@ -123,7 +123,7 @@ export interface CanaryDirectRoute {
 export interface CanaryConductorRoute {
   readonly probeId: string;
   readonly expectedTier: string;
-  readonly expectedWorkflow: CanaryLaneName;
+  readonly expectedWorkflow: CanaryProbeWorkflow;
   readonly tier: string;
   readonly workflowName: string | null;
 }
@@ -184,3 +184,7 @@ export const CANARY_LANES = [
 ] as const;
 
 export type CanaryLaneName = (typeof CANARY_LANES)[number];
+
+export const CANARY_PROBE_WORKFLOWS = [...CANARY_LANES, 'bdc-feature-development-cursor'] as const;
+
+export type CanaryProbeWorkflow = (typeof CANARY_PROBE_WORKFLOWS)[number];

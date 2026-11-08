@@ -58,6 +58,14 @@ function getInitialLevel(): string {
  */
 function buildLogger(): Logger {
   const level = getInitialLevel();
+
+  // Opt-in for stdio-protocol entry points (an MCP server, a --json CLI) whose
+  // stdout must carry only their own output. Must be set before this module
+  // loads; synchronous so lines are not lost when the process exits.
+  if (process.env.ARCHON_LOG_STDERR === '1') {
+    return pino({ level }, pino.destination({ fd: 2, sync: true }));
+  }
+
   const usePretty = process.stdout.isTTY && process.env.NODE_ENV !== 'production';
 
   if (usePretty) {

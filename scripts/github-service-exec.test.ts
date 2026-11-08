@@ -8,7 +8,11 @@ import { generateKeyPairSync } from 'node:crypto';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resetGitHubApiMeterForTests } from '../packages/core/src/github/metering';
+import {
+  flushGitHubApiMeter,
+  recordGitHubApiCall,
+  resetGitHubApiMeterForTests,
+} from '../packages/core/src/github/metering';
 import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
 import { execFile } from 'node:child_process';
 
@@ -23,6 +27,209 @@ afterEach(async () => {
 const runGitHubServiceCommand = (
   input: Parameters<typeof runCommand>[0]
 ): ReturnType<typeof runCommand> => runCommand({ ...input, db });
+
+describe('complete REST pull-list quota admission', () => {
+  const args = [
+    'api',
+    'repos/synthetic/test/pulls?state=all&per_page=100&sort=created&direction=asc',
+    '--paginate',
+    '--slurp',
+  ];
+  const identity = {
+    kind: 'pat' as const,
+    service: 'smart_cauldron' as const,
+    token: 'synthetic-pat',
+    poolId: 'user-pat' as const,
+    distinct: false as const,
+  };
+  const exhaust = async (resource: string, poolId: string = identity.poolId): Promise<void> => {
+    recordGitHubApiCall({
+      service: identity.service,
+      poolId,
+      resource,
+      status: 200,
+      remaining: 0,
+      reset: Math.floor(Date.now() / 1000) + 3600,
+    });
+    await flushGitHubApiMeter(db);
+    // Prove admission reads durable quota, not just this process's cache.
+    resetGitHubApiMeterForTests();
+  };
+
+  for (const command of ['gh', '/usr/bin/gh', 'C:\\Program Files\\GitHub CLI\\gh.exe']) {
+    test(`exhausted Search permits explicit REST pulls and meters core (${command})`, async () => {
+      await exhaust('search');
+      let launches = 0;
+      const result = await runGitHubServiceCommand({
+        service: identity.service,
+        identity,
+        command,
+        args,
+        execute: (argv, env) => {
+          launches += 1;
+          expect(argv).toEqual([command, ...args]);
+          expect(env.GH_TOKEN).toBe(identity.token);
+          return {
+            exitCode: 0,
+            stdout: new TextEncoder().encode('[[]]'),
+            stderr: new TextEncoder().encode(
+              '* Request at synthetic\n< HTTP/2 200\n< x-ratelimit-resource: core\n< x-ratelimit-remaining: 4999\n* Request took synthetic\n'
+            ),
+          };
+        },
+      });
+      expect(result.exitCode).toBe(0);
+      expect(launches).toBe(1);
+      const usage = await db.query<{ calls: number }>(
+        "SELECT calls FROM github_api_usage WHERE pool_id = $1 AND resource = 'core'",
+        [identity.poolId]
+      );
+      expect(usage.rows[0]?.calls).toBe(1);
+      const search = await db.query<{ remaining: number }>(
+        "SELECT remaining FROM github_api_pool_state WHERE pool_id = $1 AND resource = 'search'",
+        [identity.poolId]
+      );
+      expect(search.rows[0]?.remaining).toBe(0);
+    });
+  }
+
+  for (const resource of ['core', 'cli']) {
+    test(`exhausted ${resource} still blocks explicit REST pulls before launch`, async () => {
+      await exhaust(resource);
+      let launches = 0;
+      await expect(
+        runGitHubServiceCommand({
+          service: identity.service,
+          identity,
+          command: 'gh',
+          args,
+          execute: () => {
+            launches += 1;
+            throw new Error('must not launch');
+          },
+        })
+      ).rejects.toThrow(`github_pool_backoff:${identity.poolId}/${resource}`);
+      expect(launches).toBe(0);
+    });
+  }
+
+  test('permission retry executes the classified snapshot despite caller mutation during token mint', async () => {
+    await exhaust('search');
+    await exhaust('search', 'app-1-2');
+    const commandArgs = [...args];
+    const commands: string[][] = [];
+    const tokens: (string | undefined)[] = [];
+    const input: Parameters<typeof runCommand>[0] = {
+      service: identity.service,
+      command: '/usr/bin/gh',
+      args: commandArgs,
+      env: { ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN: 'synthetic-fallback' },
+      identity: {
+        kind: 'app',
+        service: identity.service,
+        poolId: 'app-1-2',
+        appId: '1',
+        installationId: '2',
+        privateKey: 'unused',
+        distinct: true,
+      },
+      token: async () => {
+        input.command = 'synthetic-other-command';
+        commandArgs.splice(0, commandArgs.length, 'api', 'search/issues?q=synthetic');
+        return 'synthetic-app';
+      },
+      execute: (command, env) => {
+        commands.push(command);
+        tokens.push(env.GH_TOKEN);
+        return {
+          exitCode: commands.length === 1 ? 1 : 0,
+          stdout: new Uint8Array(),
+          stderr: new TextEncoder().encode(
+            commands.length === 1 ? 'Resource not accessible by integration (HTTP 403)' : ''
+          ),
+        };
+      },
+    };
+    const result = await runGitHubServiceCommand(input);
+    expect(result.exitCode).toBe(0);
+    expect(commands).toEqual([
+      ['/usr/bin/gh', ...args],
+      ['/usr/bin/gh', ...args],
+    ]);
+    expect(tokens).toEqual(['synthetic-app', 'synthetic-fallback']);
+  });
+
+  test('an unexpected traced Search response remains metered and blocks a later unknown command', async () => {
+    await runGitHubServiceCommand({
+      service: identity.service,
+      identity,
+      command: 'gh',
+      args,
+      execute: () => ({
+        exitCode: 1,
+        stdout: new Uint8Array(),
+        stderr: new TextEncoder().encode(
+          `* Request at synthetic\n< HTTP/2 403\n< x-ratelimit-resource: search\n< x-ratelimit-remaining: 0\n< x-ratelimit-reset: ${Math.floor(Date.now() / 1000) + 3600}\n* Request took synthetic\n`
+        ),
+      }),
+    });
+    const usage = await db.query<{ calls: number; rate_limited: number }>(
+      "SELECT calls, rate_limited FROM github_api_usage WHERE pool_id = $1 AND resource = 'search'",
+      [identity.poolId]
+    );
+    expect(usage.rows[0]).toMatchObject({ calls: 1, rate_limited: 1 });
+    await expect(
+      runGitHubServiceCommand({
+        service: identity.service,
+        identity,
+        command: 'gh',
+        args: ['pr', 'list'],
+        execute: () => {
+          throw new Error('must not launch');
+        },
+      })
+    ).rejects.toThrow(`github_pool_backoff:${identity.poolId}/search`);
+  });
+
+  for (const candidate of [
+    { command: 'synthetic-gh', args },
+    { command: 'gh', args: ['api', 'search/issues?q=synthetic'] },
+    { command: 'gh', args: ['pr', 'list', '--search', 'WO-SYNTHETIC'] },
+    { command: 'gh', args: [...args, '--method', 'POST'] },
+    { command: 'gh', args: [...args, '--hostname', 'example.invalid'] },
+    { command: 'gh', args: [...args, '--field', 'x=y'] },
+    { command: 'gh', args: [...args, '--input=-'] },
+    { command: 'gh', args: args.slice(0, -1) },
+    { command: 'gh', args: ['api', 'graphql', '--paginate', '--slurp'] },
+    ...[
+      'repos/synthetic/../pulls?state=all&per_page=100&sort=created&direction=asc',
+      'repos/synthetic/%2e%2e/pulls?state=all&per_page=100&sort=created&direction=asc',
+      'repos/{owner}/{repo}/pulls?state=all&per_page=100&sort=created&direction=asc',
+      'https://api.github.com/repos/synthetic/test/pulls?state=all&per_page=100&sort=created&direction=asc',
+      'repos/synthetic/test/pulls?state=all&per_page=100&sort=created&direction=asc&extra=1',
+      'repos/synthetic/test/pulls/1/merge',
+      'repos/synthetic/test/pulls?state=all&per_page=100&sort=created&direction=asc\n',
+      'repos/synthetic/test repo/pulls?state=all&per_page=100&sort=created&direction=asc',
+    ].map(endpoint => ({ command: 'gh', args: ['api', endpoint, '--paginate', '--slurp'] })),
+  ]) {
+    test(`ambiguous command retains Search gate (${candidate.command} ${candidate.args.join(' ')})`, async () => {
+      await exhaust('search');
+      let launches = 0;
+      await expect(
+        runGitHubServiceCommand({
+          service: identity.service,
+          identity,
+          ...candidate,
+          execute: () => {
+            launches += 1;
+            throw new Error('must not launch');
+          },
+        })
+      ).rejects.toThrow(`github_pool_backoff:${identity.poolId}/search`);
+      expect(launches).toBe(0);
+    });
+  }
+});
 
 describe('operation-scoped GitHub CLI authentication', () => {
   test('buffers declared gh stdin sources and leaves ordinary query arguments alone', () => {
@@ -66,7 +273,9 @@ describe('operation-scoped GitHub CLI authentication', () => {
             'process.stdout.write("synthetic-pr-result")',
           ],
           {
-            timeout: 5000,
+            // This real CLI also initializes its disposable SQLite database.
+            // Keep a finite child limit within the integration-test budget.
+            timeout: 20_000,
             env: {
               PATH: process.env.PATH,
               SystemRoot: process.env.SystemRoot,
@@ -84,7 +293,7 @@ describe('operation-scoped GitHub CLI authentication', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
-  }, 10000);
+  }, 30_000);
   test('command launch failures are persisted as CLI attempts without a permission retry', async () => {
     let launches = 0;
     let caught: unknown;
@@ -309,4 +518,46 @@ describe('operation-scoped GitHub CLI authentication', () => {
       }
     });
   }
+  // WO-HARNESS-OPEN-PR-REFUSES-REVIEWER-AUTHOR-01 regression: the open-pr-if-needed
+  // node sets ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1 so a distinct builder App that
+  // passes the lane's acting-login guard but lacks pr-create permission fails closed
+  // instead of silently opening the PR with the reviewer/user PAT fallback.
+  test('ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1 blocks the permission fallback on App 403', async () => {
+    const used: string[] = [];
+    let mints = 0;
+    const result = await runGitHubServiceCommand({
+      service: 'run_nodes' as const,
+      command: 'gh',
+      args: ['pr', 'create', '--title', 'x'],
+      env: {
+        GH_TOKEN: 'reviewer-pat',
+        GITHUB_TOKEN: 'reviewer-pat',
+        ARCHON_GITHUB_NO_PERMISSION_FALLBACK: '1',
+      },
+      identity: {
+        kind: 'app' as const,
+        service: 'run_nodes' as const,
+        appId: '1',
+        installationId: '2',
+        privateKey: 'unused-synthetic',
+        poolId: 'app-1-2',
+        distinct: true as const,
+      },
+      token: async () => `app-${++mints}`,
+      execute: (_command: string[], env: Record<string, string | undefined>) => {
+        used.push(env.GH_TOKEN ?? '');
+        return {
+          exitCode: 1,
+          stdout: new Uint8Array(),
+          stderr: new TextEncoder().encode('Resource not accessible by integration (HTTP 403)'),
+        };
+      },
+    });
+    // The builder App token is tried exactly once; the reviewer PAT is never used.
+    expect(used).toEqual(['app-1']);
+    expect(used).not.toContain('reviewer-pat');
+    expect(mints).toBe(1);
+    // The App 403 surfaces as a failure rather than a reviewer-authored success.
+    expect(result.exitCode).toBe(1);
+  });
 });

@@ -15,16 +15,38 @@ import type {
   GitHubPullRequestMergeInput,
   GitHubPullRequestSearchInput,
   PullRequestCheckSummary,
+  PullRequestCommitStatus,
   PullRequestEvidence,
   PullRequestRef,
+  ReviewConflictAtHead,
 } from '../types.ts';
-import { resolveRequiredContexts } from './required-contexts';
+import {
+  listMessages as listDispatchMessages,
+  listMessagesByCorrelationPrefixWithoutSubjectKey,
+  type DispatchMessage,
+} from '@archon/core/db/dispatch';
+import { PR_REVIEW_LOG_RECIPIENT } from '@archon/core/db/dispatch-routing';
+import {
+  REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV,
+  UNPROTECTED_BASE_NO_CHECKS_REASON,
+  resolveMaxAttempts,
+  resolveRequiredContexts,
+} from './required-contexts';
 import type {
+  AttemptCounterKey,
   AttemptCounterStore,
   REQUIRED_CONTEXTS_BLOCKED_REASON,
   RequiredContextsFailureKind,
 } from './required-contexts.ts';
 import { createDurableAttemptCounterStore } from './required-contexts-store';
+import { classifyRateLimitError } from '../github-rate-limit';
+import {
+  attachWorkflowAttempts,
+  blockingFindingsAreCheckScoped,
+  latestAttemptPerCheck,
+  type WorkflowAttempt,
+} from '../pr-review-check-ingest';
+import type { SubmitOutcome } from '../pr-review-submit.ts';
 
 const log = createLogger('overseer/github-real-deps');
 
@@ -123,7 +145,7 @@ function otherOpenPrsForWo(
 
 /**
  * One open match is the run's PR even when its head is archon/task-.
- * Several matches: the first non-archon/task- head in search order.
+ * Several matches: the first non-archon/task- head in listing order.
  * Several matches that are all archon/task-: select none.
  */
 function selectWoSearchCandidate(
@@ -153,6 +175,7 @@ export interface RealGitHubOctokitLike {
         draft?: boolean;
         base?: { ref?: string };
         body?: string | null;
+        labels?: { name?: string | null }[];
       }[];
     }>;
     get(input: Record<string, unknown>): Promise<{
@@ -166,11 +189,13 @@ export interface RealGitHubOctokitLike {
         deletions?: number;
         html_url: string;
         changed_files?: number;
+        body?: string | null;
         head: { sha: string; ref?: string };
         user?: { login?: string | null } | null;
         created_at?: string;
         base?: { sha: string; ref?: string };
         mergeable_state?: string;
+        labels?: { name?: string | null }[];
       };
     }>;
     listFiles?(input: Record<string, unknown>): Promise<{
@@ -265,8 +290,23 @@ export interface RealGitHubOctokitLike {
   checks: {
     listForRef(input: Record<string, unknown>): Promise<{
       data: {
-        check_runs: { name?: string; status: string; conclusion: string | null }[];
+        check_runs: {
+          id?: number;
+          name?: string;
+          status: string;
+          conclusion: string | null;
+          started_at?: string | null;
+          completed_at?: string | null;
+          app?: { slug?: string; name?: string };
+          check_suite?: { id?: number } | null;
+        }[];
       };
+    }>;
+  };
+  /** Actions job lookup (job id = check-run id); used only for twin candidates. */
+  actions?: {
+    getJobForWorkflowRun?(input: Record<string, unknown>): Promise<{
+      data: { run_id?: number; run_attempt?: number };
     }>;
   };
   repos?: {
@@ -309,6 +349,26 @@ export interface RealGitHubOctokitLike {
       repo: string;
       branch: string;
     }): Promise<{ data: { protected?: boolean; protection?: { enabled?: boolean } } }>;
+    /**
+     * Optional: commit statuses for a ref (not check runs). Present on the real
+     * Octokit client; omitted by narrow test mocks. The merge gate needs every
+     * page, because a required context may exist only as a status.
+     */
+    listCommitStatusesForRef?(input: {
+      owner: string;
+      repo: string;
+      ref: string;
+      per_page: number;
+      page?: number;
+    }): Promise<{
+      data: {
+        id?: number;
+        context?: string | null;
+        state?: string | null;
+        created_at?: string | null;
+        updated_at?: string | null;
+      }[];
+    }>;
   };
 }
 
@@ -363,6 +423,14 @@ export const BOUND_REPOS_METHODS = [
 ] as const satisfies readonly RealOctokitReposMethodName[];
 
 /**
+ * Commit-status read used by findPullRequest. Kept off BOUND_REPOS_METHODS,
+ * which is the branch-protection probe list, but still pinned to a real
+ * Octokit method so a rename fails typecheck instead of dropping statuses.
+ */
+const LIST_COMMIT_STATUSES_METHOD =
+  'listCommitStatusesForRef' as const satisfies RealOctokitReposMethodName;
+
+/**
  * The bound names, additionally required to exist on our own stand-in so
  * `bindRepoMethod` can index it. Both halves are enforced: `satisfies` above
  * pins them to the real client, this pins them to the interface.
@@ -397,7 +465,7 @@ export interface ExactHeadPullRequestEvidence {
    * reported-checks heuristic.
    */
   requiredContextsBlocked?: {
-    reason: typeof REQUIRED_CONTEXTS_BLOCKED_REASON;
+    reason: typeof REQUIRED_CONTEXTS_BLOCKED_REASON | typeof UNPROTECTED_BASE_NO_CHECKS_REASON;
     attempts: number;
     failureKind: RequiredContextsFailureKind;
   };
@@ -471,12 +539,9 @@ export function createRealFetchExactHeadPullRequestEvidence(
         base: baseSha,
         head: input.headSha,
       }),
-      octokit.checks.listForRef({
-        owner: input.owner,
-        repo: input.repo,
-        ref: input.headSha,
-        per_page: 100,
-      }),
+      // Every attempt, every page (filter=all): the twin-job reducer needs the
+      // non-skipped sibling of a skipped run, which filter=latest can omit.
+      listEveryCheckRun(octokit, { owner: input.owner, repo: input.repo, ref: input.headSha }),
     ]);
     // Required status-check contexts on the base branch are the authoritative
     // complete-suite signal: without them, one fast check completing before the
@@ -519,6 +584,32 @@ export function createRealFetchExactHeadPullRequestEvidence(
     // prevent (#775).
     const requiredContexts: string[] | null =
       resolution.state === 'known' ? resolution.contexts : null;
+    let noChecksBlocked: ExactHeadPullRequestEvidence['requiredContextsBlocked'];
+    if (
+      resolution.state === 'known' &&
+      resolution.source === 'unprotected_branch' &&
+      resolution.contexts.length === 0
+    ) {
+      const zeroChecksKey: AttemptCounterKey = {
+        owner: input.owner,
+        repo: input.repo,
+        baseRef: `zero-checks:${baseRef ?? ''}`,
+        headSha: input.headSha,
+      };
+      if (checkRuns.length === 0) {
+        const attempts = await attemptStore.increment(zeroChecksKey, Date.now());
+        const maxAttempts = resolveMaxAttempts(process.env[REQUIRED_CONTEXTS_MAX_ATTEMPTS_ENV]);
+        if (attempts >= maxAttempts) {
+          noChecksBlocked = {
+            reason: UNPROTECTED_BASE_NO_CHECKS_REASON,
+            attempts,
+            failureKind: 'transient',
+          };
+        }
+      } else {
+        await attemptStore.clear(zeroChecksKey);
+      }
+    }
     return {
       ...(resolution.state === 'exhausted'
         ? {
@@ -529,13 +620,20 @@ export function createRealFetchExactHeadPullRequestEvidence(
             },
           }
         : {}),
+      ...(noChecksBlocked ? { requiredContextsBlocked: noChecksBlocked } : {}),
       diff: (comparison.data.files ?? [])
         .map(file => `--- ${file.filename}\n${file.patch ?? '[binary or patch unavailable]'}`)
         .join('\n'),
-      checks: checkRuns.data.check_runs.map((run, index) => ({
+      checks: checkRuns.map((run, index) => ({
+        id: run.id,
         name: run.name?.trim() || `check-${index + 1}`,
         status: run.status,
         conclusion: run.conclusion,
+        started_at: run.started_at,
+        completed_at: run.completed_at,
+        app: run.app,
+        check_suite: run.check_suite,
+        workflow_attempt: run.workflow_attempt,
       })),
       requiredContexts,
     };
@@ -832,12 +930,124 @@ export function summarizeChecks(
   return { total: checkRuns.length, passed, failed, pending };
 }
 
+function pullRequestLabelNames(labels: { name?: string | null }[] | undefined): string[] {
+  if (!labels) return [];
+  const names: string[] = [];
+  for (const label of labels) {
+    const name = label?.name;
+    if (typeof name === 'string' && name.length > 0) names.push(name);
+  }
+  return names;
+}
+
+/** GitHub REST page size. A short page is the last page. */
+const REQUIRED_EVIDENCE_PAGE_SIZE = 100;
+
+interface ListedCheckRun {
+  id?: number;
+  name?: string;
+  status: string;
+  conclusion: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  app?: { slug?: string; name?: string };
+  check_suite?: { id?: number } | null;
+  workflow_attempt?: WorkflowAttempt | null;
+}
+
+/**
+ * Actions run/attempt of one job, or null when this client cannot look it up
+ * or the id is not an Actions job. Errors propagate to attachWorkflowAttempts,
+ * which treats them as "unknown" (timestamp fallback).
+ */
+export function actionsJobAttemptLookup(
+  octokit: { actions?: RealGitHubOctokitLike['actions'] },
+  input: { owner: string; repo: string }
+): (checkRunId: number) => Promise<WorkflowAttempt | null> {
+  return async checkRunId => {
+    const actions = octokit.actions;
+    if (!actions || typeof actions.getJobForWorkflowRun !== 'function') return null;
+    const response = await actions.getJobForWorkflowRun({
+      owner: input.owner,
+      repo: input.repo,
+      job_id: checkRunId,
+    });
+    const { run_id: runId, run_attempt: runAttempt } = response.data;
+    if (typeof runId !== 'number' || typeof runAttempt !== 'number') return null;
+    return { run_id: runId, run_attempt: runAttempt };
+  };
+}
+
+/**
+ * Every check run for the ref, across pages. `filter=all` is required: the
+ * default `latest` filter is not a complete set once a ref has more than one
+ * page of runs, and the required-context gate treats an unread run as missing.
+ * Callers reduce to the latest attempt per name before evaluating.
+ */
+async function listEveryCheckRun(
+  octokit: RealGitHubOctokitLike,
+  input: { owner: string; repo: string; ref: string }
+): Promise<ListedCheckRun[]> {
+  const runs: ListedCheckRun[] = [];
+  for (let page = 1; ; page += 1) {
+    const response = await octokit.checks.listForRef({
+      owner: input.owner,
+      repo: input.repo,
+      ref: input.ref,
+      filter: 'all',
+      per_page: REQUIRED_EVIDENCE_PAGE_SIZE,
+      page,
+    });
+    const pageRuns = response.data.check_runs ?? [];
+    runs.push(...pageRuns);
+    if (pageRuns.length < REQUIRED_EVIDENCE_PAGE_SIZE) {
+      return attachWorkflowAttempts(runs, actionsJobAttemptLookup(octokit, input));
+    }
+  }
+}
+
+/**
+ * Every commit status for the ref, newest page first. Undefined when this
+ * client has no status API, so callers do not pretend the lookup happened.
+ */
+async function listEveryCommitStatus(
+  octokit: RealGitHubOctokitLike,
+  input: { owner: string; repo: string; ref: string }
+): Promise<PullRequestCommitStatus[] | undefined> {
+  const repos = octokit.repos;
+  const listStatuses = repos?.[LIST_COMMIT_STATUSES_METHOD];
+  if (!repos || typeof listStatuses !== 'function') return undefined;
+  const statuses: PullRequestCommitStatus[] = [];
+  for (let page = 1; ; page += 1) {
+    const response = await listStatuses.call(repos, {
+      owner: input.owner,
+      repo: input.repo,
+      ref: input.ref,
+      per_page: REQUIRED_EVIDENCE_PAGE_SIZE,
+      page,
+    });
+    const pageStatuses = response.data ?? [];
+    for (const status of pageStatuses) {
+      if (typeof status.context !== 'string' || status.context.length === 0) continue;
+      statuses.push({
+        ...(typeof status.id === 'number' ? { id: status.id } : {}),
+        context: status.context,
+        state: typeof status.state === 'string' ? status.state : '',
+        createdAt: status.created_at,
+        updatedAt: status.updated_at,
+      });
+    }
+    if (pageStatuses.length < REQUIRED_EVIDENCE_PAGE_SIZE) return statuses;
+  }
+}
+
 /**
  * Real findPullRequest: looks up an open PR by head branch first (the run's
- * own PR), then a WO-ID title/body search (mirrors reconcile.ts's approach).
- * A recovered head branch still runs the WO search so sibling open PRs
+ * own PR), then complete REST open-PR discovery with exact WO title/body matching.
+ * A recovered head branch still runs WO discovery so sibling open PRs
  * (including archon/task-* pre-review PRs) land in otherOpenPrsForWo. The
- * search selects a PR only when the head branch did not. Evidence fields are
+ * listing selects a PR only when the head branch did not. REST creation order
+ * replaces Search relevance order; selection priority rules stay unchanged. Evidence fields are
  * populated only from live API data -- no invented defaults beyond the
  * documented "missing" shape.
  */
@@ -849,6 +1059,8 @@ export function createRealFindPullRequest(
   const now = options.now ?? Date.now;
   return async (input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence> => {
     if (now() < rateLimitBackoffUntil) return LOOKUP_FAILED_EVIDENCE;
+    const requiresWoDiscovery =
+      input.prNumber == null && Boolean(input.woId && input.woId !== 'unknown');
     try {
       // An explicit number is the only UNIQUE key GitHub offers here. When the
       // caller has it (PR-first discovery always does), address the PR directly
@@ -870,38 +1082,80 @@ export function createRealFindPullRequest(
       }
 
       // Head-branch recovery is the normal path (runs do not store headBranch).
-      // That lookup must not skip the WO search: sibling open PRs are the only
+      // That lookup must not skip WO discovery: sibling open PRs are the only
       // source for otherOpenPrsForWo. An explicit prNumber stays unique and
-      // still skips the search. Selection runs only when the head did not resolve.
+      // still skips the listing. Selection runs only when the head did not resolve.
       const resolvedByHeadBranch =
         input.prNumber == null && Boolean(input.headBranch) && prNumber !== null;
       let siblingLookupFailed = false;
       let preserveRateLimitBackoff = false;
 
       const loadWoSearchCandidates = async (): Promise<void> => {
-        const search = await octokit.search.issuesAndPullRequests({
-          // Title AND body: lanes title PRs freely (anchor: canary PR #705,
-          // 'docs(canary): add e2e merge canary marker' -- WO id only in the
-          // body; in:title returned nothing and the run was wrongly closed as
-          // 'no PR'. 9th canary defect, 2026-08-26).
-          // is:open: a closed PR is not this run's current head.
-          q: `repo:${input.owner}/${input.repo} is:pr is:open "${input.woId}"`,
-          per_page: WO_SEARCH_CANDIDATE_LIMIT,
-        });
-        const items = search.data.items
-          .filter(item => item.pull_request)
-          .slice(0, WO_SEARCH_CANDIDATE_LIMIT);
-        for (const item of items) {
+        const woId = input.woId;
+        if (!woId || woId === 'unknown') throw new Error('wo_pr_identity_required');
+        const listing = await fetchAllOpenPullRequests(octokit, { ...input, strict: true });
+        if (!listing.complete) throw new Error('wo_pr_listing_incomplete');
+        const seen = new Map<number, string>();
+        // Validate every row before filtering or admitting even an early match.
+        for (const item of listing.pulls) {
+          if (
+            !item ||
+            !Number.isSafeInteger(item.number) ||
+            item.number <= 0 ||
+            typeof item.title !== 'string' ||
+            !(item.body === null || typeof item.body === 'string') ||
+            item.state !== 'open' ||
+            !item.head ||
+            typeof item.head.ref !== 'string' ||
+            !item.head.ref.trim() ||
+            typeof item.html_url !== 'string' ||
+            typeof item.head.sha !== 'string' ||
+            !item.head.sha.trim()
+          )
+            throw new Error('wo_pr_listing_invalid');
+          const identity = JSON.stringify([
+            item.title,
+            item.body,
+            item.state,
+            item.head.sha,
+            item.head.ref,
+            item.html_url,
+          ]);
+          if (seen.has(item.number) && seen.get(item.number) !== identity)
+            throw new Error('wo_pr_listing_conflicting_duplicate');
+          seen.set(item.number, identity);
+        }
+        const visited = new Set<number>();
+        for (const item of listing.pulls) {
+          if (visited.has(item.number)) continue;
+          visited.add(item.number);
+          if (!claimsExactWo(item.title, item.body, woId)) continue;
           const fetched = await octokit.pulls.get({
             owner: input.owner,
             repo: input.repo,
             pull_number: item.number,
           });
-          if (fetched.data.state !== 'open') continue;
+          if (
+            fetched.data.number !== item.number ||
+            typeof fetched.data.title !== 'string' ||
+            !(fetched.data.body === null || typeof fetched.data.body === 'string') ||
+            !['open', 'closed'].includes(fetched.data.state) ||
+            !fetched.data.head ||
+            typeof fetched.data.head.ref !== 'string' ||
+            !fetched.data.head.ref.trim() ||
+            typeof fetched.data.head.sha !== 'string' ||
+            !fetched.data.head.sha.trim()
+          )
+            throw new Error('wo_pr_candidate_invalid');
+          if (
+            fetched.data.state !== 'open' ||
+            !claimsExactWo(fetched.data.title, fetched.data.body, woId)
+          )
+            continue;
           const login = fetched.data.user?.login;
           woSearchCandidates.push({
             number: fetched.data.number,
-            headRef: fetched.data.head.ref ?? '',
+            headRef: fetched.data.head.ref,
             author: typeof login === 'string' ? login : '',
             createdAt: fetched.data.created_at ?? '',
           });
@@ -911,7 +1165,7 @@ export function createRealFindPullRequest(
       // 'unknown' is parseWoId's could-not-parse fallback, not a WO id --
       // searching for the literal word would return garbage matches.
       // Primary fallback (no PR yet) still throws into the outer catch.
-      // Sibling search after a head-branch hit is best-effort: a search or
+      // Sibling discovery after a head-branch hit is best-effort: a listing or
       // pulls.get failure must not replace the resolved PR with lookup-failed.
       if (input.woId && input.woId !== 'unknown' && prNumber === null) {
         await loadWoSearchCandidates();
@@ -973,13 +1227,29 @@ export function createRealFindPullRequest(
         });
       }
 
-      const checkRunsResp = await octokit.checks.listForRef({
+      const headSha = pr.data.head.sha;
+      const latestCheckRuns = latestAttemptPerCheck(
+        await listEveryCheckRun(octokit, {
+          owner: input.owner,
+          repo: input.repo,
+          ref: headSha,
+        })
+      );
+      const checks = summarizeChecks(latestCheckRuns);
+      const checkRuns = latestCheckRuns.map(run => ({
+        id: run.id,
+        name: run.name,
+        status: run.status,
+        conclusion: run.conclusion,
+        started_at: run.started_at,
+        completed_at: run.completed_at,
+        app: run.app,
+      }));
+      const commitStatuses = await listEveryCommitStatus(octokit, {
         owner: input.owner,
         repo: input.repo,
-        ref: pr.data.head.sha,
-        per_page: 100,
+        ref: headSha,
       });
-      const checks = summarizeChecks(checkRunsResp.data.check_runs);
       let changedFilePaths: string[] | undefined;
       if (input.includeChangedFiles) {
         if (!octokit.pulls.listFiles) throw new Error('overseer_real_adapter_missing_list_files');
@@ -1010,6 +1280,7 @@ export function createRealFindPullRequest(
         exists: true,
         state,
         checks,
+        checkRuns,
         mergeable: pr.data.mergeable ?? null,
         pr: {
           owner: input.owner,
@@ -1041,10 +1312,12 @@ export function createRealFindPullRequest(
             : undefined,
         htmlUrl: pr.data.html_url,
         // Provenance anchor: GitHub's own view of the PR head, not run metadata.
-        headSha: pr.data.head.sha,
+        headSha,
+        ...(commitStatuses !== undefined ? { commitStatuses } : {}),
         baseBranch: pr.data.base?.ref,
         mergeableState: pr.data.mergeable_state,
         changedFilePaths,
+        labels: pullRequestLabelNames(pr.data.labels),
       };
       if (!preserveRateLimitBackoff) {
         rateLimitBackoffUntil = 0;
@@ -1057,6 +1330,8 @@ export function createRealFindPullRequest(
         noteRateLimitBackoff(error, timestamp, logger, input);
         return LOOKUP_FAILED_EVIDENCE;
       }
+      // WO REST discovery failure never proves absence. Preserve the legacy
+      // direct/head lookup handling below outside primary WO discovery.
       // 422 'cannot be searched' = the repo does not exist or this credential
       // (the App installation) has no access to it. PERMANENT for us: a repo
       // the App cannot read is a repo the Merge Manager could never act on.
@@ -1066,7 +1341,7 @@ export function createRealFindPullRequest(
         typeof error === 'object' && error !== null && 'status' in error
           ? (error as { status?: number }).status
           : undefined;
-      if (status === 422) {
+      if (status === 422 && !requiresWoDiscovery) {
         logger.warn(
           { owner: input.owner, repo: input.repo, woId: input.woId },
           'overseer.github_real_deps.repo_unsearchable_permanent'
@@ -1226,6 +1501,12 @@ export interface SubmitPullRequestReviewInput extends PullRequestRef {
 export interface SubmitPullRequestReviewResult {
   submitted: boolean;
   message?: string;
+  review?: {
+    id: number;
+    url: string;
+    commitSha: string;
+    state: string;
+  };
 }
 
 /**
@@ -1279,7 +1560,29 @@ export function createRealSubmitPullRequestReview(
           message: `github_review_unexpected_state_${response.data.state}`,
         };
       }
-      return { submitted: true };
+      const data = response.data as typeof response.data & {
+        id?: number;
+        html_url?: string;
+        commit_id?: string;
+      };
+      if (
+        typeof data.id !== 'number' ||
+        typeof data.html_url !== 'string' ||
+        typeof data.commit_id !== 'string'
+      ) {
+        // Compatibility for injected/non-Octokit adapters. The governed submit
+        // path still refuses to qualify an approval when this identity is absent.
+        return { submitted: true };
+      }
+      return {
+        submitted: true,
+        review: {
+          id: data.id,
+          url: data.html_url,
+          commitSha: data.commit_id,
+          state: data.state,
+        },
+      };
     } catch (error) {
       const status =
         typeof error === 'object' && error !== null && 'status' in error
@@ -1296,6 +1599,11 @@ export function createRealSubmitPullRequestReview(
       if (status === 422) {
         return { submitted: false, message: 'github_review_unprocessable' };
       }
+      // A rate-limit answer, or the local pool gate refusing before any
+      // request left, means no review was created. Rethrow it so the submit
+      // path defers the item instead of retiring it as transport-ambiguous
+      // (WO-HARNESS-OVERSEER-REVIEW-TRIGGER-01).
+      if (classifyRateLimitError(error)) throw error;
       return { submitted: false, message: 'github_review_transport_ambiguous' };
     }
   };
@@ -1413,6 +1721,39 @@ export function deriveReviewDecision(
   if (approvedOnHead.length === 0) return null;
   if (!approvedOnHead.some(review => review.login.toLowerCase() === gateLogin)) return null;
   return 'APPROVED';
+}
+
+/** Exact title/body token claim, using Cauldron's exclusion-heading semantics.
+ * Kept here to avoid an overseer -> smart-cauldron -> overseer package cycle.
+ */
+function claimsExactWo(title: string, body: string | null | undefined, woId: string): boolean {
+  const exclusion =
+    /^\s{0,3}#{1,6}\s*(files?\s+)?(explicitly\s+)?(out\s+of\s+scope|not\s+in\s+scope|explicitly\s+excluded)\b/i;
+  const matches = (text: string): boolean => {
+    let excluded = false;
+    const kept: string[] = [];
+    for (const line of text.split('\n')) {
+      if (exclusion.test(line)) {
+        excluded = true;
+        continue;
+      }
+      if (excluded && /^\s{0,3}#{1,6}\s+\S/.test(line)) excluded = false;
+      if (!excluded) kept.push(line);
+    }
+    const hay = kept.join('\n').toLowerCase();
+    const needle = woId.toLowerCase();
+    for (let from = 0; needle && from <= hay.length; ) {
+      const index = hay.indexOf(needle, from);
+      if (index < 0) return false;
+      const before = hay[index - 1];
+      const after = hay[index + needle.length];
+      if ((!before || /[^a-z0-9-]/.test(before)) && (!after || /[^a-z0-9-]/.test(after)))
+        return true;
+      from = index + 1;
+    }
+    return false;
+  };
+  return matches(title) || matches(body ?? '');
 }
 
 /** Pull a WO id out of a PR title or body, so evidence lookup can search by it. */
@@ -1671,11 +2012,13 @@ type OpenPullRequestPage = Awaited<ReturnType<RealGitHubOctokitLike['pulls']['li
  * the PRs we DID read are still legitimate candidates, and holding them because
  * a later page was unreachable would stall merges for the same "silence" reason.
  * So the partial list is returned and the flag travels with it, to be logged and
- * carried on every discovered PR rather than dropped.
+ * carried on every discovered PR rather than dropped. The opt-in strict mode
+ * used for WO lookup rejects malformed pages and fixes creation ordering; that
+ * caller additionally requires completeness and validates all rows before selection.
  */
 export async function fetchAllOpenPullRequests(
   octokit: RealGitHubOctokitLike,
-  input: { owner: string; repo: string }
+  input: { owner: string; repo: string; strict?: boolean }
 ): Promise<{ pulls: OpenPullRequestPage; complete: boolean }> {
   const pulls: OpenPullRequestPage = [];
   for (let page = 1; page <= MAX_OPEN_PR_PAGES; page += 1) {
@@ -1687,7 +2030,9 @@ export async function fetchAllOpenPullRequests(
       state: 'open',
       per_page: OPEN_PR_PAGE_SIZE,
       page,
+      ...(input.strict ? { sort: 'created', direction: 'asc' } : {}),
     });
+    if (input.strict && !Array.isArray(batch.data)) throw new Error('open_pr_listing_invalid_page');
     const data = batch.data ?? [];
     pulls.push(...data);
     // A short page is the last page.
@@ -1814,6 +2159,7 @@ export function createRealListOpenPullRequests(
           headRef: pr.head.ref ?? '',
           headSha: pr.head.sha,
           reviewDecision: null,
+          labels: pullRequestLabelNames(pr.labels),
           woId: extractWoId(pr.title, pr.body),
           ...(listingComplete ? {} : { listingTruncated: true }),
         });
@@ -1849,6 +2195,7 @@ export function createRealListOpenPullRequests(
         headRef: pr.head.ref ?? '',
         headSha: pr.head.sha,
         reviewDecision,
+        labels: pullRequestLabelNames(pr.labels),
         woId: extractWoId(pr.title, pr.body),
         // Only meaningful for PRs whose decision was actually resolved: a PR on
         // an unwatched base never consults reviews at all, so it is not a
@@ -1864,6 +2211,219 @@ export function createRealListOpenPullRequests(
 }
 
 /**
+ * Recover the review summary the reviewer posted for one head from the review
+ * work item's stored result body.
+ *
+ * THE PERSISTED SHAPE IS A `SubmitOutcome`. The review worker writes
+ * `result_body: JSON.stringify(outcome)` when it finishes an item
+ * (`review-worker-clock.ts`), so this function parses exactly that type and
+ * nothing else -- `summary` is the field `pr-review-submit` puts the reviewer's
+ * posted finding text on, for every terminal branch that formed a verdict.
+ *
+ * `reason` is retained ONLY as a compatibility fallback for outcomes persisted
+ * before `SubmitOutcome.summary` existed. It is not where a current
+ * `changes_requested` carries its evidence: that branch sets no `reason` at
+ * all, which is precisely why reading `reason` alone recovered nothing and the
+ * whole recheck path failed closed (#782 review finding, 2026-09-07).
+ *
+ * Returns null when the body is absent, unparseable, or carries no text; the
+ * caller then falls back to the receipt disposition alone and the ingest's
+ * fail-closed default applies.
+ */
+export function extractReviewSummary(resultBody: string | null): string | null {
+  if (!resultBody) return null;
+  let parsed: Pick<SubmitOutcome, 'summary' | 'reason'>;
+  try {
+    parsed = JSON.parse(resultBody) as Pick<SubmitOutcome, 'summary' | 'reason'>;
+  } catch {
+    return null;
+  }
+  if (typeof parsed?.summary === 'string' && parsed.summary.trim().length > 0) {
+    return parsed.summary;
+  }
+  // Legacy outcomes only -- see the doc comment above.
+  if (typeof parsed?.reason === 'string' && parsed.reason.trim().length > 0) {
+    return parsed.reason;
+  }
+  return null;
+}
+
+// Same value as REVIEW_RECIPIENT in pr-review-wiring.ts; not imported because
+// pr-review-wiring already imports this module.
+const REVIEW_REQUEST_RECIPIENT = 'overseer-reviewer';
+// listMessages caps a read at 500 rows.
+const REVIEW_CONFLICT_PAGE_LIMIT = 500;
+
+function bodyAtHead(
+  message: Pick<DispatchMessage, 'body'>,
+  input: PullRequestRef & { headSha: string }
+): Record<string, unknown> | null {
+  try {
+    const body = JSON.parse(message.body) as Record<string, unknown>;
+    return body.owner === input.owner &&
+      body.repo === input.repo &&
+      body.prNumber === input.number &&
+      body.headSha === input.headSha
+      ? body
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The dispatch row's database-assigned insertion order. `SELECT *` carries it
+ * at runtime although DispatchMessage does not declare it; Postgres returns a
+ * bigint as a string. Anything else (absent, null, non-numeric) is null: no
+ * provable order.
+ */
+interface DispatchSeq {
+  seq?: number | string | null;
+}
+type ReviewConflictReceiptRow = Pick<DispatchMessage, 'body'> & DispatchSeq;
+type ReviewConflictRequestRow = Pick<DispatchMessage, 'body' | 'status'> &
+  Partial<Pick<DispatchMessage, 'id' | 'result_body'>> &
+  DispatchSeq;
+
+function rowSeq(row: DispatchSeq): number | null {
+  const { seq } = row;
+  if (typeof seq === 'number') return Number.isSafeInteger(seq) ? seq : null;
+  if (typeof seq === 'string' && /^\d+$/.test(seq)) {
+    const value = Number(seq);
+    return Number.isSafeInteger(value) ? value : null;
+  }
+  return null;
+}
+
+/**
+ * Exact-head review conflict from dispatch rows. `receipts` are review submit
+ * receipts (pr-review-log and operator); `requests` are review requests to the
+ * reviewer. A changes_requested receipt at the head wins; otherwise a request
+ * for the head that is still queued or claimed means a review is in flight.
+ * When a read came back at its page cap (`truncated`), rows for this head may
+ * be missing, so the answer is lookup_failed unless a conflict is already seen.
+ *
+ * CHECK-SCOPED SUPERSEDE (WO-HARNESS-MERGE-GATE-CHECK-SCOPED-SUPERSEDE-01): a
+ * changes_requested receipt stops counting only when BOTH hold: (1) its review
+ * summary -- read from the originating request row whose id is the receipt's
+ * messageId -- has only check-scoped blocking findings
+ * (blockingFindingsAreCheckScoped), and (2) an approved receipt at the same
+ * head has a strictly higher `seq`. A missing or unreadable summary is treated
+ * as code-scoped, a row without seq is never provably earlier or later, and a
+ * changes_requested after the latest approval always conflicts (fail closed).
+ */
+export function reviewConflictFromMessages(
+  input: PullRequestRef & { headSha: string },
+  receipts: readonly ReviewConflictReceiptRow[],
+  requests: readonly ReviewConflictRequestRow[],
+  options: { truncated?: boolean } = {}
+): ReviewConflictAtHead | null {
+  const atHead = receipts.flatMap(receipt => {
+    const body = bodyAtHead(receipt, input);
+    return body?.kind === 'pr_review_submit_receipt' ? [{ body, seq: rowSeq(receipt) }] : [];
+  });
+  let latestApprovalSeq: number | null = null;
+  for (const { body, seq } of atHead) {
+    if (body.disposition === 'approved' && seq !== null) {
+      latestApprovalSeq = latestApprovalSeq === null ? seq : Math.max(latestApprovalSeq, seq);
+    }
+  }
+  const changesRequested = atHead.some(({ body, seq }) => {
+    if (body.disposition !== 'changes_requested') return false;
+    const supersededByLaterApproval =
+      seq !== null && latestApprovalSeq !== null && latestApprovalSeq > seq;
+    if (!supersededByLaterApproval) return true;
+    const messageId = typeof body.messageId === 'string' ? body.messageId : null;
+    const request =
+      messageId === null
+        ? undefined
+        : requests.find(row => row.id === messageId && bodyAtHead(row, input) !== null);
+    return !blockingFindingsAreCheckScoped(extractReviewSummary(request?.result_body ?? null));
+  });
+  if (changesRequested) return 'changes_requested';
+  const inFlight = requests.some(
+    request =>
+      (request.status === 'queued' || request.status === 'claimed') &&
+      bodyAtHead(request, input) !== null
+  );
+  if (inFlight) return 'review_in_flight';
+  return options.truncated ? 'lookup_failed' : null;
+}
+
+type ReviewConflictListFn = (filters: {
+  recipient: string;
+  subject_key: string;
+  limit: number;
+}) => Promise<ReviewConflictRequestRow[]>;
+
+type ReviewConflictLegacyListFn = (filters: {
+  recipient: string;
+  correlationPrefix: string;
+  limit: number;
+}) => Promise<ReviewConflictRequestRow[]>;
+
+/**
+ * Reads the rows for reviewConflictFromMessages. REQUESTS ARE READ FIRST: a
+ * review writes its submit receipt inside the handler, and its request becomes
+ * done only after the handler returns. A review still running at the first read
+ * is seen as in flight; one that finished before it has already written its
+ * receipt, which the later receipt reads include. Reading receipts first lets a
+ * review finish between the two reads and look clean in both.
+ *
+ * Receipts written before the 2026-09-07 subject_key cutover have no
+ * subject_key, so they are also read by correlation prefix for this exact head,
+ * the way listPriorReviewWork reads legacy history.
+ */
+export async function loadReviewConflictAtHead(
+  input: PullRequestRef & { headSha: string },
+  list: ReviewConflictListFn,
+  listLegacy: ReviewConflictLegacyListFn
+): Promise<ReviewConflictAtHead | null> {
+  const subjectKey = `gh:${input.owner}/${input.repo}#${input.number}`;
+  try {
+    const requests = await list({
+      recipient: REVIEW_REQUEST_RECIPIENT,
+      subject_key: subjectKey,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    const pr = await list({
+      recipient: PR_REVIEW_LOG_RECIPIENT,
+      subject_key: subjectKey,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    const operator = await list({
+      recipient: 'operator',
+      subject_key: subjectKey,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    const correlationPrefix = `pr-review:${input.owner}/${input.repo}#${input.number}@${input.headSha}`;
+    const legacyLog = await listLegacy({
+      recipient: PR_REVIEW_LOG_RECIPIENT,
+      correlationPrefix,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    const legacyOperator = await listLegacy({
+      recipient: 'operator',
+      correlationPrefix,
+      limit: REVIEW_CONFLICT_PAGE_LIMIT,
+    });
+    // The reads have no pagination. A full page may hide older rows for this
+    // head, so a full page is not proof of "no conflict".
+    const truncated = [requests, pr, operator, legacyLog, legacyOperator].some(
+      rows => rows.length >= REVIEW_CONFLICT_PAGE_LIMIT
+    );
+    return reviewConflictFromMessages(
+      input,
+      [...pr, ...operator, ...legacyLog, ...legacyOperator],
+      requests,
+      { truncated }
+    );
+  } catch {
+    return 'lookup_failed';
+  }
+}
+
+/**
  * Build the real (non-fake) GitHubClientDeps composition for Overseer. Fails
  * loudly at construction time if the token is missing -- never silently
  * degrades to a stub in real mode.
@@ -1872,7 +2432,98 @@ export function createRealGitHubClientDeps(
   octokit: RealGitHubOctokitLike = createRealOctokitClient()
 ): GitHubClientDeps {
   const commentAuthorLogin = resolveReviewGateLogin();
+  // Call-time PAT client, copied from createRealFetchExactHeadPullRequestEvidence.
+  // Used only as the second identity for the required-contexts lookup.
+  const patOctokit = createRealReadOnlyPatOctokitClient() ?? undefined;
   return {
+    requiredContextsLookups: {
+      fetchWithAppClient: bindRepoMethod(octokit, 'getAllStatusCheckContexts'),
+      fetchWithPatClient: bindRepoMethod(patOctokit, 'getAllStatusCheckContexts'),
+      fetchBranchRules:
+        bindRepoMethod(octokit, 'getBranchRules') ?? bindRepoMethod(patOctokit, 'getBranchRules'),
+      fetchBranch: bindRepoMethod(octokit, 'getBranch') ?? bindRepoMethod(patOctokit, 'getBranch'),
+    },
+    hasQualifiedReview: async (input): Promise<boolean> => {
+      // Receipts go to PR_REVIEW_LOG_RECIPIENT since #1390 (dispatch routing
+      // cut-off); pre-cut-off receipts stay at `operator`. Read both, log first,
+      // like every other receipt reader. Reading only `operator` made every PR
+      // review_execution_unqualified, so the merge manager merged nothing
+      // (WO-HARNESS-MERGE-MANAGER-POST-REBUILD-STALL-01).
+      const subjectKey = `gh:${input.owner}/${input.repo}#${input.number}`;
+      const receipts = [
+        ...(await listDispatchMessages({
+          recipient: PR_REVIEW_LOG_RECIPIENT,
+          subject_key: subjectKey,
+          limit: 500,
+        })),
+        ...(await listDispatchMessages({
+          recipient: 'operator',
+          subject_key: subjectKey,
+          limit: 500,
+        })),
+      ];
+      return receipts.some(receipt => {
+        try {
+          const body = JSON.parse(receipt.body) as {
+            kind?: unknown;
+            disposition?: unknown;
+            owner?: unknown;
+            repo?: unknown;
+            prNumber?: unknown;
+            headSha?: unknown;
+            executionProof?: {
+              headSha?: unknown;
+              inspectionObserved?: unknown;
+              check_plan?: unknown;
+              checks?: unknown[];
+            };
+            githubReview?: { id?: unknown; commitSha?: unknown; state?: unknown };
+          };
+          const proof = body.executionProof;
+          const review = body.githubReview;
+          const reviewMatches =
+            typeof review?.id === 'number' &&
+            review?.commitSha === input.headSha &&
+            review?.state === 'APPROVED';
+          // Receipts written before native review execution was activated did
+          // not contain executionProof. Preserve their exact-head GitHub
+          // qualification; once a receipt carries the new field, require the
+          // complete proof contract and never fall back to the legacy shape.
+          const executionQualifies =
+            proof === undefined ||
+            (proof.headSha === input.headSha &&
+              proof.inspectionObserved === true &&
+              Array.isArray(proof.checks) &&
+              ((proof.check_plan === 'absent' && proof.checks.length === 0) ||
+                (proof.check_plan === 'present' && proof.checks.length > 0)) &&
+              proof.checks.every(
+                check =>
+                  typeof check === 'object' &&
+                  check !== null &&
+                  'exitCode' in check &&
+                  check.exitCode === 0
+              ));
+          return (
+            body.kind === 'pr_review_submit_receipt' &&
+            body.disposition === 'approved' &&
+            body.owner === input.owner &&
+            body.repo === input.repo &&
+            body.prNumber === input.number &&
+            body.headSha === input.headSha &&
+            executionQualifies &&
+            reviewMatches
+          );
+        } catch {
+          return false;
+        }
+      });
+    },
+    reviewConflictAtHead: (input): Promise<ReviewConflictAtHead | null> =>
+      loadReviewConflictAtHead(
+        input,
+        listDispatchMessages,
+        listMessagesByCorrelationPrefixWithoutSubjectKey
+      ),
     findPullRequest: createRealFindPullRequest(octokit),
     // Merge mutations go through the distinct merge identity when configured
     // (M-153: the merger is never the reviewer).

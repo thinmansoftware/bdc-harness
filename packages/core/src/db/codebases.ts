@@ -3,7 +3,8 @@
  */
 import { pool, getDialect } from './connection';
 import type { Codebase } from '../types';
-import { createLogger } from '@archon/paths';
+import { createLogger, getArchonHome } from '@archon/paths';
+import { join } from 'node:path';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -118,7 +119,25 @@ export async function findCodebaseByPathPrefix(cwdPath: string): Promise<Codebas
   return result.rows[0] || null;
 }
 
-export async function findCodebaseByName(name: string): Promise<Codebase | null> {
+export async function findCodebaseByName(
+  name: string,
+  options: { readonly?: boolean } = {}
+): Promise<Codebase | null> {
+  // The checker must not initialize or migrate SQLite merely to inspect a row.
+  if (options.readonly && !process.env.DATABASE_URL) {
+    const sqlite = await import('bun:sqlite');
+    const db = new sqlite.Database(join(getArchonHome(), 'archon.db'), { readonly: true });
+    try {
+      return db
+        .query<
+          Codebase,
+          [string]
+        >('SELECT * FROM remote_agent_codebases WHERE name = ? ORDER BY created_at DESC LIMIT 1')
+        .get(name);
+    } finally {
+      db.close();
+    }
+  }
   const result = await pool.query<Codebase>(
     'SELECT * FROM remote_agent_codebases WHERE name = $1 ORDER BY created_at DESC LIMIT 1',
     [name]
@@ -128,12 +147,28 @@ export async function findCodebaseByName(name: string): Promise<Codebase | null>
 
 export async function updateCodebase(
   id: string,
-  data: { default_cwd?: string; repository_url?: string | null }
+  data: {
+    name?: string;
+    default_branch?: string;
+    default_cwd?: string;
+    repository_url?: string | null;
+    project_record?: string | null;
+  }
 ): Promise<void> {
   const dialect = getDialect();
   const updates: string[] = [];
   const values: (string | null)[] = [];
   let paramIndex = 1;
+
+  if (data.name !== undefined) {
+    updates.push(`name = $${paramIndex++}`);
+    values.push(data.name);
+  }
+
+  if (data.default_branch !== undefined) {
+    updates.push(`default_branch = $${paramIndex++}`);
+    values.push(data.default_branch);
+  }
 
   if (data.default_cwd !== undefined) {
     updates.push(`default_cwd = $${paramIndex++}`);
@@ -143,6 +178,11 @@ export async function updateCodebase(
   if (data.repository_url !== undefined) {
     updates.push(`repository_url = $${paramIndex++}`);
     values.push(data.repository_url);
+  }
+
+  if (data.project_record !== undefined) {
+    updates.push(`project_record = $${paramIndex++}`);
+    values.push(data.project_record);
   }
 
   if (updates.length === 0) return;

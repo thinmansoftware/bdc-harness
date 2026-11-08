@@ -28,7 +28,13 @@ export const DEFAULT_MERGE_REPO_POLICY: MergeRepoPolicy = Object.freeze({
   }),
   'thinmansoftware/lspro-react': Object.freeze({
     dev: Object.freeze({ unattended: true, docsOnly: 'skip' }),
+    staging: Object.freeze({ unattended: true, docsOnly: 'skip' }),
     main: Object.freeze({ unattended: false, docsOnly: 'skip' }),
+    'release/ce': Object.freeze({ unattended: false, docsOnly: 'skip' }),
+  }),
+  'thinmansoftware/shopops-storefront': Object.freeze({
+    staging: Object.freeze({ unattended: true, docsOnly: 'skip' }),
+    master: Object.freeze({ unattended: false, docsOnly: 'skip' }),
   }),
   'thinmansoftware/bdc-xo': Object.freeze({
     main: Object.freeze({ unattended: true, docsOnly: 'merge' }),

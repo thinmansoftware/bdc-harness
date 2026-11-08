@@ -564,7 +564,7 @@ describe('default informational channel adapters', () => {
     return view;
   }
 
-  test('default Dispatch adapter routes a guarded run report to the resolved owner', async () => {
+  test('default Dispatch adapter routes a guarded run report to t3-desktop with the owner seat in the body', async () => {
     const view = await defaultCardView();
     const dispatch = createDefaultOperatorCardChannels({
       fetch: globalThis.fetch,
@@ -572,16 +572,18 @@ describe('default informational channel adapters', () => {
     }).find(channel => channel.channel === 'dispatch');
     if (!dispatch) throw new Error('dispatch_channel_missing');
     const result = await dispatch.deliver(view, `operator-card:${view.card.card_id}:dispatch`);
-    const messages = await listMessages({ recipient: 'Grok' });
+    const messages = await listMessages({ recipient: 't3-desktop' });
     expect(result.outcome).toBe('succeeded');
     expect(messages).toHaveLength(1);
+    expect(await listMessages({ recipient: 'Grok' })).toHaveLength(0);
     expect(JSON.parse(messages[0]?.body ?? '{}')).toMatchObject({
       card_id: view.card.card_id,
       payload_digest: view.card.payload_digest,
+      owner_seat: 'Grok',
     });
   });
 
-  test('default Dispatch adapter falls back to operator when owner resolution returns null', async () => {
+  test('default Dispatch adapter still delivers to t3-desktop when owner resolution returns null', async () => {
     const view = await defaultCardView();
     const dispatch = createDefaultOperatorCardChannels({
       fetch: globalThis.fetch,
@@ -589,7 +591,13 @@ describe('default informational channel adapters', () => {
     }).find(channel => channel.channel === 'dispatch');
     if (!dispatch) throw new Error('dispatch_channel_missing');
     await dispatch.deliver(view, `operator-card:${view.card.card_id}:dispatch`);
-    expect(await listMessages({ recipient: 'operator' })).toHaveLength(1);
+    const messages = await listMessages({ recipient: 't3-desktop' });
+    expect(messages).toHaveLength(1);
+    expect(JSON.parse(messages[0]?.body ?? '{}').owner_seat).toBeNull();
+    // Fence 281: an acting-xo report also reaches the operator mailbox.
+    const operatorRows = await listMessages({ recipient: 'operator' });
+    expect(operatorRows).toHaveLength(1);
+    expect(operatorRows[0]?.correlation_id).toBe(messages[0]?.correlation_id);
   });
 
   test('default builder-monitor adapter uses injected fetch and frozen payload', async () => {

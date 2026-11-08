@@ -21,6 +21,7 @@ import type {
   SubmitPullRequestReviewInput,
   SubmitPullRequestReviewResult,
 } from './adapters/github-real-deps.ts';
+import { readFile } from 'node:fs/promises';
 import { hasDistinctMergeIdentity } from './adapters/github-real-deps';
 import { classifyRateLimitError } from './github-rate-limit';
 import { resolveMergeManagerMode } from './merge-manager';
@@ -58,6 +59,8 @@ export interface ReviewerVerdict {
    * fixes). The worker releases and retries the item on a later tick.
    */
   checksPending?: boolean;
+  /** Names of checks still awaited when `checksPending` is true. */
+  pendingChecks?: readonly string[];
   /**
    * Set when the required status-check contexts could not be read after the
    * configured attempt bound (#775). TERMINAL and NON-APPROVING: unlike
@@ -93,6 +96,52 @@ export interface ReviewerVerdict {
   reasonCode?: string;
   /** Milliseconds to wait before the item becomes claimable again. */
   retryAfterMs?: number;
+  /** Supervisor-observed native execution evidence. Model output cannot populate this. */
+  executionProof?: ReviewExecutionProof;
+}
+
+export interface ReviewExecutionContext {
+  readonly requestId: string;
+  readonly workerId: string;
+  readonly fencingToken: number;
+  readonly owner: string;
+  readonly repo: string;
+  readonly prNumber: number;
+  readonly headSha: string;
+  readonly checkoutPath: string;
+  readonly reviewerIdentity: string;
+  readonly rung: string;
+  readonly checkPlanStatus: 'absent' | 'present' | 'unsafe';
+  readonly checkPlan: readonly (readonly string[])[];
+  /**
+   * Set by the trusted worker when the exact-head checkout could not be
+   * prepared or verified (for example review_checkout_identity_failure). The
+   * review is then incomplete before any broker or model call.
+   */
+  readonly checkoutFailure?: string;
+}
+
+export interface ReviewExecutionProof {
+  readonly requestId: string;
+  readonly headSha: string;
+  readonly treeSha: string;
+  readonly cwd: string;
+  readonly nativePolicy: 'codex_bubblewrap';
+  readonly nativeVersion: string;
+  readonly runtimeUid: number;
+  readonly inspectionObserved: boolean;
+  /** Durable receipt marker required when the exact-head repository declares no plan. */
+  readonly check_plan: 'absent' | 'present';
+  readonly checks: readonly {
+    readonly argv: readonly string[];
+    readonly cwd: string;
+    readonly exitCode: number;
+    readonly outputDigest: string;
+    readonly startedAt: string;
+    readonly endedAt: string;
+  }[];
+  readonly startedAt: string;
+  readonly endedAt: string;
 }
 
 export interface ReviewWorkItem {
@@ -104,6 +153,8 @@ export interface ReviewWorkItem {
   /** The exact head this work item is bound to. */
   headSha: string;
   author: string;
+  /** Present on dispatch-worker work only; constructed from the live claim, never its body. */
+  executionContext?: ReviewExecutionContext;
 }
 
 export type SubmitDisposition =
@@ -160,12 +211,15 @@ export type SubmitDisposition =
    * transport failure only has a fixed backoff, and the two are worth telling
    * apart in the receipt when diagnosing why a review did not land.
    */
-  | 'rate_limited';
+  | 'rate_limited'
+  | 'review_incomplete';
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
   reason?: string;
   event?: OverseerReviewEvent;
+  executionProof?: ReviewExecutionProof;
+  githubReview?: SubmitPullRequestReviewResult['review'];
   /**
    * Present only on a changes_requested disposition. Reports whether the
    * verdict was handed back to Taskmaster and, when it was not, why it stopped
@@ -203,6 +257,8 @@ export interface SubmitOutcome {
    * `rate_limited` as the duration form of `retryAfter`.
    */
   retryAfterMs?: number;
+  /** Names of checks still awaited on a checks-pending deferral. */
+  pendingChecks?: readonly string[];
 }
 
 export interface SubmitDeps {
@@ -232,6 +288,17 @@ export interface SubmitDeps {
      * blocking finding needs your judgment".
      */
     remediation?: RemediationOutcome;
+    executionProof?: ReviewExecutionProof;
+    githubReview?: SubmitPullRequestReviewResult['review'];
+  }): Promise<void>;
+
+  /** Revalidates the dispatch fence. Required for execution-context work. */
+  hasCustody?(context: ReviewExecutionContext): Promise<boolean>;
+
+  /** Durable pre-publication write. Approval is refused if this write fails. */
+  recordExecutionProof?(input: {
+    work: ReviewWorkItem;
+    proof: ReviewExecutionProof;
   }): Promise<void>;
 
   /**
@@ -401,6 +468,7 @@ export async function runAndSubmitReview(
     return finish(deps, work, work.headSha, {
       disposition: 'checks_pending',
       reason: 'checks_not_terminal',
+      ...(verdict.pendingChecks ? { pendingChecks: verdict.pendingChecks } : {}),
     });
   }
 
@@ -437,6 +505,14 @@ export async function runAndSubmitReview(
       prNumber: work.prNumber,
     });
   } catch (error) {
+    // A rate limit or the local pool gate on the head re-read is a deferral,
+    // not a failure (WO-HARNESS-OVERSEER-REVIEW-TRIGGER-01). The re-read never
+    // reached a head, so nothing was submitted and the verdict is not lost:
+    // the worker re-queues this item for when the budget refills, and the next
+    // attempt re-evaluates the same bound head. Terminating here retired five
+    // PRs' reviews on 2026-11-01 with nothing to re-arm them.
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) return rateLimitedOutcome(deps, work, 'head_recheck', rateLimit);
     return finish(deps, work, work.headSha, {
       disposition: 'submission_failed',
       reason: `head_recheck_failed:${errorCode(error)}`,
@@ -459,6 +535,29 @@ export async function runAndSubmitReview(
       disposition: 'stale_head',
       reason: 'head_advanced_during_review',
     });
+  }
+
+  // Execution qualification runs AFTER both head gates: an incomplete review
+  // of a head the PR has already moved past is stale, not incomplete, and a
+  // rate-limited or pool-gated head re-read stays a deferral (#1400). Nothing
+  // is published before this point, so the ordering never lets an
+  // unqualified verdict reach GitHub.
+  if (work.executionContext && !qualifiesExecution(work.executionContext, verdict.executionProof)) {
+    return submitIncomplete(
+      work,
+      deps,
+      verdict.reasonCode ?? 'sandbox_execution_proof_missing_or_invalid'
+    );
+  }
+
+  if (work.executionContext) {
+    const ownsFence = deps.hasCustody ? await deps.hasCustody(work.executionContext) : false;
+    if (!ownsFence) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'custody_conflict',
+        reason: 'dispatch_fence_lost_before_publication',
+      });
+    }
   }
 
   // REQUIRED CONTEXTS UNAVAILABLE (#775): bounded deferral has been exhausted,
@@ -497,6 +596,28 @@ export async function runAndSubmitReview(
   const event: OverseerReviewEvent = verdict.approved ? 'APPROVE' : 'REQUEST_CHANGES';
   const body = buildReviewBody(work, verdict);
 
+  if (work.executionContext && (await reviewBodyContainsCredential(body))) {
+    return submitIncomplete(work, deps, 'review_body_credential_leak');
+  }
+
+  if (work.executionContext && verdict.approved) {
+    if (!deps.recordExecutionProof || !verdict.executionProof) {
+      return submitIncomplete(work, deps, 'execution_proof_store_unavailable');
+    }
+    try {
+      await deps.recordExecutionProof({ work, proof: verdict.executionProof });
+    } catch (error) {
+      return submitIncomplete(work, deps, `execution_proof_store_failed:${errorCode(error)}`);
+    }
+    const ownsFence = deps.hasCustody ? await deps.hasCustody(work.executionContext) : false;
+    if (!ownsFence) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'custody_conflict',
+        reason: 'dispatch_fence_lost_immediately_before_post',
+      });
+    }
+  }
+
   // A rejection with no evidence is not actionable; refuse before the call.
   if (!verdict.approved && verdict.summary.trim().length === 0) {
     return finish(deps, work, work.headSha, {
@@ -521,6 +642,11 @@ export async function runAndSubmitReview(
       commitId: work.headSha,
     });
   } catch (error) {
+    // A rate-limit answer (or the local pool gate) means GitHub did not create
+    // the review, so retrying later cannot double-post. Any other throw stays
+    // terminal: its outcome on GitHub is unknown.
+    const rateLimit = classifyRateLimitError(error);
+    if (rateLimit) return rateLimitedOutcome(deps, work, 'submit', rateLimit);
     return finish(deps, work, work.headSha, {
       disposition: 'submission_failed',
       reason: `submit_threw:${errorCode(error)}`,
@@ -536,6 +662,19 @@ export async function runAndSubmitReview(
     });
   }
 
+  if (
+    work.executionContext &&
+    verdict.approved &&
+    (submission.review?.state !== 'APPROVED' || submission.review.commitSha !== work.headSha)
+  ) {
+    return finish(deps, work, work.headSha, {
+      disposition: 'review_incomplete',
+      reason: 'github_approval_response_unqualified',
+      event: 'APPROVE',
+      executionProof: verdict.executionProof,
+    });
+  }
+
   if (verdict.approved) {
     // summaryField is REQUIRED here, not optional polish. Splitting the
     // approved branch out of the shared terminal return dropped it (PR #740
@@ -545,6 +684,8 @@ export async function runAndSubmitReview(
     return finish(deps, work, work.headSha, {
       disposition: 'approved',
       event,
+      executionProof: verdict.executionProof,
+      githubReview: submission.review,
       ...summaryField(verdict),
     });
   }
@@ -564,6 +705,86 @@ export async function runAndSubmitReview(
     ...(!verdict.approved && verdict.reasonCode
       ? { reason: `indeterminate:${verdict.reasonCode}` }
       : {}),
+  });
+}
+
+const GENERIC_CREDENTIAL_SHAPE =
+  /(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|Bearer\s+[A-Za-z0-9._~+/-]{20,})/i;
+
+function collectLongStrings(value: unknown, into: string[]): void {
+  if (typeof value === 'string') {
+    if (value.length >= 20) into.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectLongStrings(item, into);
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const item of Object.values(value as Record<string, unknown>))
+      collectLongStrings(item, into);
+  }
+}
+
+/** Parent-only final egress guard for the reviewer's accepted residual-risk login. */
+async function reviewBodyContainsCredential(body: string): Promise<boolean> {
+  if (GENERIC_CREDENTIAL_SHAPE.test(body)) return true;
+  try {
+    const login = JSON.parse(await readFile('/home/appuser/.codex/auth.json', 'utf8')) as unknown;
+    const values: string[] = [];
+    collectLongStrings(login, values);
+    return values.some(value => body.includes(value));
+  } catch {
+    // Missing reviewer auth is handled by the broker. The generic shape guard
+    // remains active for test and bootstrap environments without this file.
+    return false;
+  }
+}
+
+function qualifiesExecution(
+  context: ReviewExecutionContext,
+  proof: ReviewExecutionProof | undefined
+): proof is ReviewExecutionProof {
+  if (proof?.requestId !== context.requestId || proof.headSha !== context.headSha) return false;
+  if (!proof.inspectionObserved || proof.nativePolicy !== 'codex_bubblewrap') return false;
+  if (!Number.isInteger(proof.runtimeUid) || proof.runtimeUid === 0 || !proof.treeSha || !proof.cwd)
+    return false;
+  if (context.checkPlanStatus === 'unsafe') return false;
+  if (proof.check_plan !== context.checkPlanStatus) return false;
+  if (proof.checks.length !== context.checkPlan.length) return false;
+  return proof.checks.every(
+    (check, index) =>
+      check.exitCode === 0 &&
+      check.outputDigest.length > 0 &&
+      JSON.stringify(check.argv) === JSON.stringify(context.checkPlan[index])
+  );
+}
+
+async function submitIncomplete(
+  work: ReviewWorkItem,
+  deps: SubmitDeps,
+  reason: string
+): Promise<SubmitOutcome> {
+  const body = `Review incomplete: ${reason}. No approval was recorded.`;
+  let suffix = '';
+  try {
+    const result = await deps.submitReview({
+      owner: work.owner,
+      repo: work.repo,
+      number: work.prNumber,
+      event: 'COMMENT',
+      body,
+      commitId: work.headSha,
+    });
+    if (!result.submitted) suffix = `:comment_failed:${result.message ?? 'unknown'}`;
+  } catch (error) {
+    suffix = `:comment_failed:${errorCode(error)}`;
+  }
+  return finish(deps, work, work.headSha, {
+    disposition: 'review_incomplete',
+    reason: `${reason}${suffix}`,
+    event: 'COMMENT',
+    summary: body,
   });
 }
 
@@ -644,6 +865,25 @@ function summaryField(verdict: ReviewerVerdict): { summary?: string } {
   return summary.length > 0 ? { summary } : {};
 }
 
+/**
+ * The non-terminal `rate_limited` outcome for a GitHub call made AFTER the
+ * reviewer ran (head re-read or review submission). The worker defers the
+ * item to `retryAfter`; the reason names which call was refused.
+ */
+function rateLimitedOutcome(
+  deps: SubmitDeps,
+  work: ReviewWorkItem,
+  stage: 'head_recheck' | 'submit',
+  rateLimit: NonNullable<ReturnType<typeof classifyRateLimitError>>
+): Promise<SubmitOutcome> {
+  return finish(deps, work, work.headSha, {
+    disposition: 'rate_limited',
+    reason: `rate_limited:${stage}:${rateLimit.kind}:${rateLimit.source}`,
+    retryAfter: rateLimit.retryAfter,
+    retryAfterMs: rateLimit.retryAfterMs,
+  });
+}
+
 function errorCode(error: unknown): string {
   if (error instanceof Error && error.message) return error.message.slice(0, 120);
   return 'unknown_error';
@@ -667,9 +907,19 @@ async function finish(
       ...(outcome.event ? { event: outcome.event } : {}),
       ...(outcome.reason ? { reason: outcome.reason } : {}),
       ...(outcome.remediation ? { remediation: outcome.remediation } : {}),
+      ...(outcome.executionProof ? { executionProof: outcome.executionProof } : {}),
+      ...(outcome.githubReview ? { githubReview: outcome.githubReview } : {}),
     });
   } catch {
-    // Receipt failure never converts a classified outcome into a throw.
+    // A posted approval whose actual response cannot be made durable is
+    // unknown and must never be presented to downstream code as qualified.
+    if (outcome.disposition === 'approved') {
+      return {
+        ...outcome,
+        disposition: 'review_incomplete',
+        reason: 'github_approval_response_receipt_failed',
+      };
+    }
   }
   // The retry instant is part of the outcome, not the receipt: the worker reads
   // it off the return value to schedule the deferral.

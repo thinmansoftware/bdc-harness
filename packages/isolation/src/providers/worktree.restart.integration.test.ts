@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { execFile } from 'child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile } from 'fs/promises';
+import { rmSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { join, resolve } from 'path';
 import { promisify } from 'util';
 
 import type { IsolationRequest } from '../types';
@@ -28,7 +29,8 @@ afterEach(async () => {
         .split(/\r?\n/)
         .filter(line => line.startsWith('worktree '))
         .map(line => line.slice('worktree '.length))
-        .filter(path => path !== canonicalRepo);
+        // Git porcelain uses forward slashes on Windows; canonicalRepo may not.
+        .filter(path => resolve(path) !== resolve(canonicalRepo));
       for (const worktree of worktrees) {
         await execFileAsync(
           'git',
@@ -41,7 +43,18 @@ afterEach(async () => {
     } catch {
       // Setup may have failed before the repository or worktree existed.
     }
-    await rm(root, { recursive: true, force: true });
+    // Yield between attempts so Windows can release recently used Git handles.
+    // Keep teardown strict: non-transient errors and exhausted retries still fail.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        rmSync(root, { recursive: true, force: true });
+        break;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (attempt >= 5 || !['EBUSY', 'EPERM', 'ENOTEMPTY'].includes(code ?? '')) throw error;
+        await Bun.sleep(100 * (attempt + 1));
+      }
+    }
   }
 });
 

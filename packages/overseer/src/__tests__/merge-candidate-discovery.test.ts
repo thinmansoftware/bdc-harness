@@ -26,6 +26,11 @@ import {
   DEFAULT_WATCHED_BASE_BRANCHES,
 } from '../merge-candidate-discovery.ts';
 import type { DiscoveryCursor } from '../merge-candidate-discovery.ts';
+import {
+  resetRequiredContextsAttemptCounters,
+  resetRequiredContextsCache,
+} from '../adapters/required-contexts';
+import type { RecheckCheckRun } from '../pr-review-check-ingest';
 import { watchLoop, watchOnce } from '../watch.ts';
 import { handleRecord } from '../service.ts';
 import type {
@@ -112,6 +117,7 @@ function discoveryDeps(
 ): MergeCandidateDiscoveryDeps {
   return {
     listOpenPullRequests: async () => pullRequests,
+    hasQualifiedReview: async () => true,
     findPullRequest: async input => {
       const match = pullRequests.find(candidate => candidate.headRef === input.headBranch);
       const evidence = match ? evidenceByNumber[match.prNumber] : undefined;
@@ -122,6 +128,18 @@ function discoveryDeps(
 }
 
 describe('merge candidate discovery -- the #758 candidate set', () => {
+  test('fails closed when exact-head review qualification is not wired', async () => {
+    const candidate = pr({ prNumber: 729 });
+    const deps = discoveryDeps([candidate], { 729: greenEvidence(729) });
+    delete deps.hasQualifiedReview;
+    const result = await discoverMergeCandidates(deps, {
+      repos: REPOS,
+      watchedBaseBranches: WATCHED_BASES,
+    });
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions[0]?.reason).toBe('review_execution_unqualified');
+  });
+
   // THE HEADLINE CASE. A mixed set of five PRs, exactly one of which is the
   // shape #730/#731 had: open, non-draft, APPROVED, checks green, CLEAN. Before
   // the fix none of these could enter the set at all, because the set came from
@@ -147,7 +165,13 @@ describe('merge candidate discovery -- the #758 candidate set', () => {
       repos: REPOS,
     });
 
-    expect(result.evaluated).toBe(5);
+    // Approved-first budgeting (WO-HARNESS-MERGE-SWEEP-LIVENESS-AND-PAGING-01): the draft (733)
+    // and CHANGES_REQUESTED (732) PRs are classified structurally at zero cost and no longer
+    // consume evidence budget, so `evaluated` counts the three approved PRs only. Population
+    // coverage is `structurallyClassified`.
+    expect(result.evaluated).toBe(3);
+    expect(result.structurallyClassified).toBe(5);
+    expect(result.exclusions).toHaveLength(4);
     expect(result.unavailable).toBe(false);
     expect(result.candidates).toHaveLength(1);
     expect(result.candidates[0]?.prEvidence.pr?.number).toBe(730);
@@ -208,7 +232,9 @@ describe('merge candidate discovery -- the #758 candidate set', () => {
       { watchedBases: WATCHED_BASES, repos: REPOS }
     );
 
-    expect(result.evaluated).toBe(1);
+    // Structurally excluded PRs cost no evidence budget (same WO); still classified and named.
+    expect(result.evaluated).toBe(0);
+    expect(result.structurallyClassified).toBe(1);
     expect(result.candidates).toHaveLength(0);
     expect(result.exclusions[0]?.reason).toBe('base_branch_not_watched');
     expect(result.exclusions[0]?.detail).toContain('main');
@@ -259,6 +285,7 @@ describe('merge candidate discovery -- the #758 candidate set', () => {
         return [pr({ prNumber: 806 })];
       },
       findPullRequest: async () => greenEvidence(806),
+      hasQualifiedReview: async () => true,
     };
 
     const result = await discoverMergeCandidates(deps, {
@@ -432,6 +459,7 @@ describe('watchOnce integration -- discovered PRs reach the outcome set', () => 
       ...emptyRunStore,
       findPullRequest: discovery.findPullRequest,
       listOpenPullRequests: discovery.listOpenPullRequests,
+      hasQualifiedReview: discovery.hasQualifiedReview,
       mergePullRequest: async () => ({ merged: true }),
     };
   }
@@ -566,6 +594,7 @@ describe('merge candidate discovery -- evidence binding', () => {
         listOpenPullRequests: async () => [upstream, fork],
         // Branch-keyed lookup: the exact ambiguity the finding describes.
         findPullRequest: async () => greenEvidence(800),
+        hasQualifiedReview: async () => true,
       },
       { watchedBases: WATCHED_BASES, repos: REPOS }
     );
@@ -809,6 +838,7 @@ describe('watchOnce -> handleRecord -- discovered PRs reach the merge manager', 
       ...emptyRunStore,
       findPullRequest: discovery.findPullRequest,
       listOpenPullRequests: discovery.listOpenPullRequests,
+      hasQualifiedReview: discovery.hasQualifiedReview,
       mergePullRequest: async () => ({ merged: true }),
       insertOverseerAction: async () => undefined,
     };
@@ -854,6 +884,7 @@ describe('watchOnce -> handleRecord -- discovered PRs reach the merge manager', 
       // listing it once merged.
       listOpenPullRequests: async input =>
         open.filter(candidate => candidate.owner === input.owner && candidate.repo === input.repo),
+      hasQualifiedReview: async () => true,
       mergePullRequest: async () => ({ merged: true }),
       insertOverseerAction: async () => undefined,
     };
@@ -903,6 +934,7 @@ describe('watchOnce -> handleRecord -- discovered PRs reach the merge manager', 
       listRunEvents: async () => [],
       findPullRequest: discovery.findPullRequest,
       listOpenPullRequests: discovery.listOpenPullRequests,
+      hasQualifiedReview: discovery.hasQualifiedReview,
       mergePullRequest: async () => ({ merged: true }),
       insertOverseerAction: async () => undefined,
     } as unknown as OverseerRunStoreDeps & GitHubClientDeps & OverseerActionsDeps;
@@ -1339,6 +1371,35 @@ describe('merge candidate discovery -- unavailable is never silent', () => {
     expect(set.logged.some(entry => entry.level === 'warn')).toBe(false);
   });
 
+  test('startup logs the per-repo bases the sweep actually watches', () => {
+    // WO-HARNESS-MERGE-MANAGER-POST-REBUILD-STALL-01: the legacy global
+    // `watchedBases` ["dev","staging"] suggested bdc-xo `main` was unwatched.
+    const set = captureLogger();
+    const report = logDiscoveryConfigurationAtStartup(set.logger, {
+      OVERSEER_MERGE_DISCOVERY_REPOS: 'thinmansoftware/bdc-xo,thinmansoftware/bdc-harness',
+      MERGE_MANAGER_REPO_POLICY: JSON.stringify({
+        'thinmansoftware/bdc-xo': { main: { unattended: true, docs_only: 'merge' } },
+        'thinmansoftware/bdc-harness': { dev: { unattended: true, docs_only: 'skip' } },
+      }),
+    } as NodeJS.ProcessEnv);
+    expect(report.perRepoBases['thinmansoftware/bdc-xo']).toEqual(['main']);
+    expect(report.perRepoBases['thinmansoftware/bdc-harness']).toEqual(['dev']);
+    const info = set.logged.find(entry => entry.msg === 'merge-coordinator.discovery_configured');
+    expect(info?.obj.perRepoBases).toEqual({
+      'thinmansoftware/bdc-xo': ['main'],
+      'thinmansoftware/bdc-harness': ['dev'],
+    });
+  });
+
+  test('a malformed repo policy reports no watched bases (fail closed), never throws', () => {
+    const report = describeDiscoveryConfiguration({
+      OVERSEER_MERGE_DISCOVERY_REPOS: 'thinmansoftware/bdc-xo',
+      MERGE_MANAGER_REPO_POLICY: '{not json',
+    } as NodeJS.ProcessEnv);
+    expect(report.configured).toBe(true);
+    expect(report.perRepoBases).toEqual({ 'thinmansoftware/bdc-xo': [] });
+  });
+
   test('a missing list dep reports no_list_dep at warn', async () => {
     const { logged, logger } = captureLogger();
     const result = await discoverMergeCandidates(
@@ -1361,6 +1422,7 @@ describe('merge candidate discovery -- unavailable is never silent', () => {
           return [pr({ prNumber: 2166 })];
         },
         findPullRequest: async () => greenEvidence(2166),
+        hasQualifiedReview: async () => true,
       },
       {
         watchedBases: WATCHED_BASES,
@@ -1489,5 +1551,182 @@ describe('watchOnce -- an unavailable sweep is distinct from a healthy empty one
     );
     const heartbeat = logged.find(entry => entry.msg === 'merge-coordinator.heartbeat_evaluated');
     expect(heartbeat?.obj.prDiscoveryUnavailableReason).toBe('not_run');
+  });
+});
+
+describe('merge candidate discovery -- only required checks can exclude', () => {
+  const required = ['docker-build', 'test (ubuntu-latest)'] as const;
+
+  function checkRun(
+    id: number,
+    name: string,
+    status: string,
+    conclusion: string | null
+  ): RecheckCheckRun {
+    return { id, name, status, conclusion, completed_at: `2026-11-0${id}T00:00:00.000Z` };
+  }
+
+  function evidenceWithRuns(prNumber: number, runs: RecheckCheckRun[]): PullRequestEvidence {
+    const failed = runs.filter(
+      run => run.status === 'completed' && run.conclusion !== 'success'
+    ).length;
+    const pending = runs.filter(run => run.status !== 'completed').length;
+    return {
+      ...greenEvidence(prNumber),
+      checks: { total: runs.length, passed: runs.length - failed - pending, failed, pending },
+      checkRuns: runs,
+      commitStatuses: [],
+    };
+  }
+
+  function contextsLookup(
+    contexts: readonly string[]
+  ): NonNullable<MergeCandidateDiscoveryDeps['requiredContextsLookups']> {
+    return { fetchWithAppClient: async () => ({ data: [...contexts] }) };
+  }
+
+  async function discoverOne(
+    evidence: PullRequestEvidence,
+    lookups: MergeCandidateDiscoveryDeps['requiredContextsLookups']
+  ): Promise<{
+    result: Awaited<ReturnType<typeof discoverMergeCandidates>>;
+    logged: { obj: Record<string, unknown>; msg: string }[];
+  }> {
+    const candidate = pr({ prNumber: 4600 });
+    const deps: MergeCandidateDiscoveryDeps = {
+      ...discoveryDeps([candidate], { 4600: evidence }),
+      requiredContextsLookups: lookups,
+    };
+    const logged: { obj: Record<string, unknown>; msg: string }[] = [];
+    const result = await discoverMergeCandidates(deps, {
+      repos: REPOS,
+      watchedBaseBranches: WATCHED_BASES,
+      logger: { info: (obj, msg) => logged.push({ obj, msg }) },
+    });
+    return { result, logged };
+  }
+
+  function fallbackLogged(logged: { msg: string }[]): boolean {
+    return logged.some(line => line.msg === 'merge-coordinator.required_contexts_fallback');
+  }
+
+  beforeEach(() => {
+    resetDiscoveryCursorForTests();
+    resetRequiredContextsCache();
+    resetRequiredContextsAttemptCounters();
+  });
+
+  test('non_required_failure_does_not_exclude', async () => {
+    const evidence = evidenceWithRuns(4600, [
+      checkRun(1, 'docker-build', 'completed', 'success'),
+      checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+      checkRun(3, 'test (windows-latest)', 'completed', 'failure'),
+    ]);
+    expect(evidence.checks.failed).toBe(1);
+    const { result, logged } = await discoverOne(evidence, contextsLookup(required));
+    expect(result.exclusions.map(exclusion => exclusion.reason)).toEqual([]);
+    expect(result.candidates).toHaveLength(1);
+    expect(fallbackLogged(logged)).toBe(false);
+    // Today's all-checks rule is still what an unresolved call gets.
+    expect(classifyPullRequestEvidence(evidence)).toBe('checks_failing');
+  });
+
+  test('required_failure_still_excludes', async () => {
+    const evidence = evidenceWithRuns(4600, [
+      checkRun(1, 'docker-build', 'completed', 'success'),
+      checkRun(2, 'test (ubuntu-latest)', 'completed', 'failure'),
+      checkRun(3, 'test (windows-latest)', 'completed', 'success'),
+    ]);
+    const { result } = await discoverOne(evidence, contextsLookup(required));
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions.map(exclusion => exclusion.reason)).toEqual(['checks_failing']);
+  });
+
+  test('non_required_pending_does_not_hold', async () => {
+    const evidence = evidenceWithRuns(4600, [
+      checkRun(1, 'docker-build', 'completed', 'success'),
+      checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+      checkRun(3, 'test (windows-latest)', 'in_progress', null),
+    ]);
+    expect(evidence.checks.pending).toBe(1);
+    const { result } = await discoverOne(evidence, contextsLookup(required));
+    expect(result.exclusions.map(exclusion => exclusion.reason)).toEqual([]);
+    expect(result.candidates).toHaveLength(1);
+
+    // A required context missing from the head counts as pending, as the bridge treats it.
+    const missing = evidenceWithRuns(4600, [
+      checkRun(1, 'docker-build', 'completed', 'success'),
+      checkRun(3, 'test (windows-latest)', 'completed', 'success'),
+    ]);
+    expect(
+      classifyPullRequestEvidence(missing, {
+        state: 'known',
+        contexts: [...required],
+        source: 'env_override',
+      })
+    ).toBe('checks_pending');
+  });
+
+  test('unknown_required_set_falls_back_to_all_checks', async () => {
+    const evidence = evidenceWithRuns(4600, [
+      checkRun(1, 'docker-build', 'completed', 'success'),
+      checkRun(2, 'test (ubuntu-latest)', 'completed', 'success'),
+      checkRun(3, 'test (windows-latest)', 'completed', 'failure'),
+    ]);
+    const { result, logged } = await discoverOne(evidence, {
+      fetchWithAppClient: async () => {
+        throw new Error('lookup_down');
+      },
+    });
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions.map(exclusion => exclusion.reason)).toEqual(['checks_failing']);
+    const fallback = logged.find(
+      line => line.msg === 'merge-coordinator.required_contexts_fallback'
+    );
+    expect(fallback?.obj).toEqual(
+      expect.objectContaining({ owner: OWNER, repo: REPO, prNumber: 4600 })
+    );
+    expect(['unknown', 'exhausted']).toContain(String(fallback?.obj.state));
+  });
+
+  test('empty_required_set_keeps_all_checks_rule', async () => {
+    const evidence = evidenceWithRuns(4600, [
+      checkRun(1, 'docker-build', 'completed', 'success'),
+      checkRun(2, 'test (windows-latest)', 'completed', 'failure'),
+    ]);
+    const { result, logged } = await discoverOne(evidence, contextsLookup([]));
+    expect(result.candidates).toHaveLength(0);
+    expect(result.exclusions.map(exclusion => exclusion.reason)).toEqual(['checks_failing']);
+    expect(fallbackLogged(logged)).toBe(false);
+  });
+});
+
+// WO-HARNESS-EVIDENCE-GATE-NOT-GATED-AND-BASE-UNRUNNABLE-01 (bdc-xo #4751), Test 9.
+describe('merge candidate discovery -- the run:blocked label refuses a PR', () => {
+  test('merge_manager_refuses_run_blocked_pr: an approved PR labelled run:blocked is run_blocked', () => {
+    const labelled = pr({ prNumber: 900, labels: ['run:blocked'] });
+    expect(classifyDiscoveredPullRequest(labelled, WATCHED_BASES)).toBe('run_blocked');
+    // the same PR without the label is a candidate
+    expect(classifyDiscoveredPullRequest(pr({ prNumber: 901 }), WATCHED_BASES)).toBeNull();
+    expect(
+      classifyDiscoveredPullRequest(pr({ prNumber: 902, labels: ['other'] }), WATCHED_BASES)
+    ).toBeNull();
+  });
+
+  test('run_blocked is the reported reason ahead of the review decision', () => {
+    const labelled = pr({ prNumber: 903, labels: ['run:blocked'], reviewDecision: null });
+    expect(classifyDiscoveredPullRequest(labelled, WATCHED_BASES)).toBe('run_blocked');
+  });
+
+  test('discovery excludes the labelled PR with a detail naming the label', async () => {
+    const pullRequests = [pr({ prNumber: 910, labels: ['run:blocked'] }), pr({ prNumber: 911 })];
+    const result = await discoverMergeCandidates(
+      discoveryDeps(pullRequests, { 910: greenEvidence(910), 911: greenEvidence(911) }),
+      { watchedBases: WATCHED_BASES, repos: REPOS }
+    );
+    expect(result.candidates.map(c => c.prEvidence.pr?.number)).toEqual([911]);
+    const excluded = result.exclusions.find(e => e.prNumber === 910);
+    expect(excluded?.reason).toBe('run_blocked');
+    expect(excluded?.detail).toContain('run:blocked');
   });
 });

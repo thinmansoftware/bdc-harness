@@ -3,19 +3,20 @@
  *
  * WO-HARNESS-TIER-LADDER-UNIFY-01 done-when #4:
  *   1. mechanical CODE enters zero (live ruleset)
- *   2. INFRA / money route stronger (claude)
+ *   2. INFRA / money / auth / security / feature enter cursor
  *   3. --entry override wins over ruleset
  *   4. dark lane (glm / refusedTiers) is hard-refused
  */
 
-import { describe, test, expect } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { loadLadder, loadRefusedTiers } from '../ladder.js';
+import { loadLadder, loadPremiumTiers, loadRefusedTiers } from '../ladder.js';
 import { loadRuleset, pickEntryTier } from '../conductor.js';
 import { runCascade } from '../cascade.js';
 import type { CascadeDeps } from '../cascade.js';
+import type { FireResult, GateVerdict, PollResult } from '../types.js';
 
 describe('live ladder SOR', () => {
   // 'cursor' inserted below codex by WO-HARNESS-CURSOR-BUILD-SEAT-01; flipped
@@ -39,6 +40,8 @@ describe('live ladder SOR', () => {
     expect(refused).not.toContain('zero');
     expect(refused).toContain('qwen');
     expect(refused).toContain('glm');
+    expect(refused).not.toContain('claude');
+    expect(refused).not.toContain('codex');
     expect([...refused].sort()).toEqual(['glm', 'qwen']);
     const firstLive = loadLadder().find(t => !refused.includes(t.name));
     expect(firstLive?.name).toBe('zero');
@@ -52,32 +55,48 @@ describe('live ruleset routing', () => {
     expect(entry).toBe('zero');
   });
 
-  test('plain CODE and no-match default enter cursor (2026-09-29 default lane)', () => {
+  // 2026-11-02 (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01; John ruling on
+  // bdc-xo#4282 + M-20261027a r6 item 5): plain CODE (no tags) now enters zero
+  // instead of cursor. CODE carrying a tag that matches no earlier rule (e.g.
+  // 'docs') falls through to that same last CODE rule and also enters zero.
+  // THE REVERT IS ONE VALUE: set the last ruleset rule's entry back to cursor.
+  test('plain CODE enters zero (2026-11-02 zero floor)', () => {
     const ruleset = loadRuleset();
-    expect(pickEntryTier({ woClass: 'CODE' }, ruleset)).toBe('cursor');
-    expect(pickEntryTier({ woClass: 'CODE', tags: ['docs'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ woClass: 'CODE' }, ruleset)).toBe('zero');
+    expect(pickEntryTier({ woClass: 'CODE', tags: ['docs'] }, ruleset)).toBe('zero');
+  });
+
+  // defaultEntry is deliberately NOT part of the zero-floor change: a WO that
+  // matches no rule at all still enters cursor, not zero.
+  test('no-match default still enters cursor (defaultEntry unchanged)', () => {
+    const ruleset = loadRuleset();
     expect(ruleset.defaultEntry).toBe('cursor');
+    expect(pickEntryTier({}, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ tags: ['docs'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ woClass: 'DOCS' }, ruleset)).toBe('cursor');
   });
 
-  test('feature-tagged CODE still enters codex', () => {
+  test('feature-tagged CODE enters cursor', () => {
     const ruleset = loadRuleset();
-    expect(pickEntryTier({ woClass: 'CODE', tags: ['feature'] }, ruleset)).toBe('codex');
+    expect(pickEntryTier({ woClass: 'CODE', tags: ['feature'] }, ruleset)).toBe('cursor');
   });
 
-  test('INFRA routes stronger (claude)', () => {
+  test('INFRA enters cursor', () => {
     const ruleset = loadRuleset();
-    expect(pickEntryTier({ woClass: 'INFRA' }, ruleset)).toBe('claude');
+    expect(pickEntryTier({ woClass: 'INFRA' }, ruleset)).toBe('cursor');
   });
 
-  test('money tag routes stronger (claude)', () => {
+  test('money, billing, security, and auth enter cursor', () => {
     const ruleset = loadRuleset();
-    expect(pickEntryTier({ tags: ['money'] }, ruleset)).toBe('claude');
-    expect(pickEntryTier({ tags: ['billing'] }, ruleset)).toBe('claude');
+    expect(pickEntryTier({ tags: ['money'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ tags: ['billing'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ tags: ['security'] }, ruleset)).toBe('cursor');
+    expect(pickEntryTier({ tags: ['auth'] }, ruleset)).toBe('cursor');
   });
 });
 
 describe('cascade entry override and refuse', () => {
-  test('--entry override wins over ruleset (dry-run selects claude)', async () => {
+  test('--entry override wins over ruleset (dry-run selects codex)', async () => {
     const outDir = await mkdtemp(join(tmpdir(), 'sc-ladder-override-'));
     try {
       let fireCalled = false;
@@ -99,7 +118,7 @@ describe('cascade entry override and refuse', () => {
         woId: 'WO-LADDER-ENTRY-OVERRIDE',
         woClass: 'CODE',
         tags: ['mechanical'],
-        entryOverride: 'claude',
+        entryOverride: 'codex',
         dryRun: true,
         outDir,
         project: 'test-project',
@@ -108,8 +127,8 @@ describe('cascade entry override and refuse', () => {
 
       expect(fireCalled).toBe(false);
       expect(record.status).toBe('planned');
-      expect(record.telemetry.entryTier).toBe('claude');
-      expect(record.request.entryOverride).toBe('claude');
+      expect(record.telemetry.entryTier).toBe('codex');
+      expect(record.request.entryOverride).toBe('codex');
     } finally {
       await rm(outDir, { recursive: true, force: true });
     }
@@ -140,4 +159,185 @@ describe('cascade entry override and refuse', () => {
 
     expect(fireCalled).toBe(false);
   });
+
+  test('climb from codex skips claude; next tier is frontier', async () => {
+    const outDir = await mkdtemp(join(tmpdir(), 'sc-ladder-codex-frontier-'));
+    const firedWorkflows: string[] = [];
+    const thresholdEnv = 'SMART_CAULDRON_HEADROOM_THRESHOLD_PERCENT';
+    const previousThreshold = process.env[thresholdEnv];
+    delete process.env[thresholdEnv];
+    const log = spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const deps: CascadeDeps = {
+        fire: async opts => {
+          firedWorkflows.push(opts.workflowName);
+          return makeFireOk(`run-${firedWorkflows.length}`);
+        },
+        poll: async () => makePollResult(),
+        judge: () => makeFailVerdict('validator: needs_revision'),
+        escalate: async () => undefined,
+        findWoClaim: async () => null,
+        readRunDetail: async () => ({
+          metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        }),
+        seatUsage: async () => ({
+          claude: {
+            limit_source: 'measured',
+            windows: [{ name: 'seven_day', used_percent: 91 }],
+          },
+        }),
+      };
+
+      const record = await runCascade({
+        woId: 'WO-LADDER-CODEX-SKIPS-CLAUDE',
+        woClass: 'CODE',
+        tags: ['mechanical'],
+        entryOverride: 'codex',
+        outDir,
+        project: 'test-project',
+        deps,
+      });
+
+      expect(firedWorkflows).toEqual(['bdc-feature-development-codex']);
+      expect(firedWorkflows).not.toContain('bdc-feature-development');
+      expect(firedWorkflows).not.toContain('bdc-feature-development-fable');
+      expect(record.status).toBe('pending-frontier-approval');
+      expect(record.frontierApproval?.tierName).toBe('frontier');
+      expect(record.frontierApproval?.workflowName).toBe('bdc-feature-development-fable');
+      expect(record.attempts.map(a => a.tier)).toEqual(['codex']);
+      expect(loadPremiumTiers()).toContain('frontier');
+      const overThresholdLogs = log.mock.calls.filter(call =>
+        String(call[0]).includes('claude_seat_over_threshold:91:80')
+      );
+      expect(overThresholdLogs).toHaveLength(1);
+    } finally {
+      log.mockRestore();
+      if (previousThreshold === undefined) delete process.env[thresholdEnv];
+      else process.env[thresholdEnv] = previousThreshold;
+      await rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  test('cursor climbs to codex', async () => {
+    const outDir = await mkdtemp(join(tmpdir(), 'sc-ladder-cursor-codex-'));
+    const firedWorkflows: string[] = [];
+    let judgeCall = 0;
+    try {
+      const deps: CascadeDeps = {
+        fire: async opts => {
+          firedWorkflows.push(opts.workflowName);
+          return makeFireOk(`run-${firedWorkflows.length}`);
+        },
+        poll: async () => makePollResult(),
+        judge: () => {
+          judgeCall++;
+          return judgeCall === 1 ? makeFailVerdict('cursor near-miss') : makePassVerdict();
+        },
+        escalate: async () => undefined,
+        findWoClaim: async () => null,
+        // A climb's open-PR lookup fails closed (bdc-xo #4638); no open PR here.
+        listOpenWoPullRequests: async () => [],
+        readRunDetail: async () => ({
+          metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        }),
+      };
+
+      const record = await runCascade({
+        woId: 'WO-LADDER-CURSOR-TO-CODEX',
+        woClass: 'CODE',
+        tags: ['mechanical'],
+        entryOverride: 'cursor',
+        outDir,
+        project: 'test-project',
+        deps,
+      });
+
+      expect(record.status).toBe('won');
+      expect(record.winningTier).toBe('codex');
+      expect(record.frontierApproval).toBeUndefined();
+      expect(record.attempts.map(a => a.tier)).toEqual(['cursor', 'codex']);
+      expect(firedWorkflows).toEqual([
+        'bdc-feature-development-cursor',
+        'bdc-feature-development-codex',
+      ]);
+      expect(firedWorkflows).not.toContain('bdc-feature-development');
+    } finally {
+      await rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  test('entry override claude is refused and does not fire', async () => {
+    let fireCalled = false;
+    const deps: CascadeDeps = {
+      fire: async () => {
+        fireCalled = true;
+        return { ok: false, runId: null, conversationId: null, infraError: 'should-not-fire' };
+      },
+      writeRecord: async (record, _dir) => `/tmp/cascade-record-${record.cascadeId}.json`,
+      seatUsage: async () => ({
+        claude: { limit_source: 'UNKNOWN', windows: [] },
+      }),
+    };
+
+    let thrown: unknown;
+    try {
+      await runCascade({
+        woId: 'WO-LADDER-CLAUDE-REFUSE',
+        woClass: 'CODE',
+        tags: ['mechanical'],
+        entryOverride: 'claude',
+        dryRun: true,
+        outDir: '/tmp/smart-cauldron-claude-refuse',
+        project: 'test-project',
+        deps,
+      });
+    } catch (err) {
+      thrown = err;
+    }
+
+    expect(thrown).toBeInstanceOf(Error);
+    const message = thrown instanceof Error ? thrown.message : '';
+    expect(message).toContain('claude_seat_unknown');
+    expect(fireCalled).toBe(false);
+  });
 });
+
+function makeFireOk(runId: string): FireResult {
+  return { ok: true, runId, conversationId: 'conv-stub', infraError: null };
+}
+
+function makePollResult(): PollResult {
+  return {
+    runId: 'run-stub',
+    terminalStatus: 'failed',
+    validatorVerdict: 'needs_revision',
+    prUrl: null,
+    prMergeable: null,
+    servedModelId: null,
+    rawMetadata: {},
+  };
+}
+
+function makeFailVerdict(reason: string): GateVerdict {
+  return {
+    pass: false,
+    reason,
+    cancelled: false,
+    validatorVerdict: 'needs_revision',
+    prOpened: false,
+    prMergeable: null,
+    terminalStatus: 'failed',
+  };
+}
+
+function makePassVerdict(): GateVerdict {
+  return {
+    pass: true,
+    reason: 'all gate conditions passed',
+    cancelled: false,
+    validatorVerdict: 'satisfied',
+    prOpened: true,
+    prMergeable: true,
+    terminalStatus: 'completed',
+  };
+}

@@ -1,6 +1,7 @@
 export interface ModelBindingOverride {
   readonly provider?: string;
-  readonly model: string;
+  /** Absent for a seat reroute entry: the target provider default applies. */
+  readonly model?: string;
 }
 
 export interface ModelOverride {

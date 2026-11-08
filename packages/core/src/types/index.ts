@@ -56,10 +56,12 @@ export interface HandleMessageContext {
 }
 
 export interface Codebase {
+  project_record?: string | null;
   id: string;
   name: string;
   repository_url: string | null;
   default_cwd: string;
+  default_branch: string | null;
   ai_assistant_type: string;
   commands: Record<string, { path: string; description: string }>;
   created_at: Date;

@@ -3,11 +3,19 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import {
-  runMergeExecutionBridgeOnce,
+  runMergeExecutionBridgeOnce as runMergeExecutionBridgeOnceProduction,
+  type MergeExecutionBridgeOptions,
   type MergeExecutionBridgeStore,
 } from '../merge-execution-bridge';
 import { hasActiveRunForWo, userMessageWoId } from '../active-run-guard';
 import type { GitHubClientDeps, PullRequestEvidence } from '../types.ts';
+
+const runMergeExecutionBridgeOnce = (options: MergeExecutionBridgeOptions): Promise<void> =>
+  runMergeExecutionBridgeOnceProduction({
+    hasQualifiedReview: async () => true,
+    reviewConflictAtHead: async () => null,
+    ...options,
+  });
 
 const HEAD = 'judged-sha';
 
@@ -98,6 +106,8 @@ function harness(rows: OverseerVerdictRow[], opts: HarnessOptions = {}) {
       return true;
     },
     getRunById: async runId => run(runId),
+    getEarliestMergeSlotReservation: async () =>
+      new Date(Date.now() - 50 * 60 * 1000).toISOString(),
     reserveMergeSlot: async (verdictId, _since, limit) => {
       reserveSlotCalls.push(verdictId);
       const existing = slots.get(verdictId);

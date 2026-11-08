@@ -103,6 +103,7 @@ async function producePausedRecord(
     judge: () => makeFailVerdict('validator: needs_revision'),
     escalate: async () => undefined,
     findWoClaim: async () => null,
+    listOpenWoPullRequests: async () => [],
   };
   const opts: RunCascadeOptions = {
     woId,
@@ -138,6 +139,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
           poll: async () => makePassPoll(),
           judge: () => makePassVerdict(),
           findWoClaim: async () => null,
+          listOpenWoPullRequests: async () => [],
         },
       })
     ).rejects.toThrow('authority_conflict');
@@ -167,6 +169,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
         poll: async () => makePassPoll(),
         judge: () => makePassVerdict(),
         findWoClaim: async () => null,
+        listOpenWoPullRequests: async () => [],
       },
     });
     expect(messages).toHaveLength(1);
@@ -195,6 +198,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
       judge: () => makePassVerdict(),
       escalate: async () => undefined,
       findWoClaim: async () => null,
+      listOpenWoPullRequests: async () => [],
     };
 
     // First approve: claim wins, then resume fires the frontier tier once.
@@ -211,7 +215,7 @@ describe('frontier-approval resume (Test 2: approve fires exactly once)', () => 
     expect(resumed.winningTier).toBe('frontier');
     expect(firedWorkflows).toEqual([FABLE_WORKFLOW]);
     // The resumed fire carried the preserved informed-climb context.
-    expect(fireMessages[0]).toContain('Prior tier: claude');
+    expect(fireMessages[0]).toContain('Prior tier: codex');
     // A distinct resumed cascadeId (not the paused one).
     expect(resumed.cascadeId).not.toBe(paused.cascadeId);
 
@@ -273,6 +277,7 @@ describe('frontier-approval reject + direct-entry bypass (Test 3)', () => {
       judge: () => makePassVerdict(),
       escalate: async () => undefined,
       findWoClaim: async () => null,
+      listOpenWoPullRequests: async () => [],
     };
 
     const record = await runCascade({
@@ -311,6 +316,7 @@ describe('frontier-approval resume dead-end guard (Test 2 failure mode: zero fir
       judge: () => makePassVerdict(),
       escalate: async () => undefined,
       findWoClaim: async () => null,
+      listOpenWoPullRequests: async () => [],
       acquireWoLock: async (woId, project, cascadeId): Promise<AcquireWoLockResult> => ({
         acquired: false,
         path: `${outDir}/wo-locks/stub.json`,
