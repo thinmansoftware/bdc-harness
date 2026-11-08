@@ -996,6 +996,27 @@ describe('merge execution bridge -- recovered run branch', () => {
 });
 
 describe('merge execution bridge -- run-less verdicts (#846)', () => {
+  test.each([
+    runlessPr({ exists: false, state: 'missing', pr: undefined }),
+    runlessPr({ pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: RUNLESS_PR + 1 } }),
+  ])('confirmed missing or wrong PR identity stays terminal', async evidence => {
+    const { h } = runlessHarness([runlessVerdict('confirmed-missing')], evidence);
+    let deferrals = 0;
+    h.store.deferVerdictClaim = async () => {
+      deferrals++;
+      return true;
+    };
+    await runOnce(h);
+    expect(h.merges).toBe(0);
+    expect(deferrals).toBe(0);
+    expect(h.outcomes).toEqual([
+      expect.objectContaining({
+        mutationSent: false,
+        reason: 'pr_context_unresolvable',
+      }),
+    ]);
+  });
+
   test('(a) merges a run-less verdict on an open allowlisted PR via the same mutation path', async () => {
     const { h, searches, runLookups } = runlessHarness([runlessVerdict('runless-ok')]);
     const seen: { number?: number; expectedHeadSha?: string } = {};

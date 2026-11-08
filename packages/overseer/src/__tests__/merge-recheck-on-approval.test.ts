@@ -460,14 +460,18 @@ describe('atomic approval recheck and existing manager', () => {
           return manager(record);
         },
       };
-      const winner = runWithBoundDatabase(first, () => runMergeRecheckOnApproval(INPUT, deps));
+      const attempts = [
+        runWithBoundDatabase(first, () => runMergeRecheckOnApproval(INPUT, deps)),
+        ...Array.from({ length: 12 }, () =>
+          runWithBoundDatabase(second!, () => runMergeRecheckOnApproval(INPUT, deps))
+        ),
+      ];
       await started.promise;
-      await runWithBoundDatabase(second, () =>
-        Promise.all(Array.from({ length: 12 }, () => runMergeRecheckOnApproval(INPUT, deps)))
-      );
-      expect(calls).toBe(1);
+      await flush();
+      const concurrentCalls = calls;
       gate.resolve();
-      await winner;
+      await Promise.all(attempts);
+      expect(concurrentCalls).toBe(1);
       await runWithBoundDatabase(second, () => runMergeRecheckOnApproval(INPUT, deps));
       expect(calls).toBe(1);
       const rows = await first.query(
