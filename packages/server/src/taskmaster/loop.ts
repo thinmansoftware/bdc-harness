@@ -26,6 +26,7 @@ import {
   disposeMessageByMachine,
   getMessage,
   listMessages,
+  listMessagesBySeqCursor,
   normalizeDispatchSubjectKey,
   type CreateAuthenticatedMessageData,
   type DispatchMessage,
@@ -314,8 +315,9 @@ export const SEND_REJECTED_PAGE_BUCKET_MS = 60 * 60 * 1000;
  * Map a Taskmaster thread ref to a Dispatch subject_key the core validator
  * (normalizeDispatchSubjectKey: wo:, digest:YYYY-MM-DD, gh:) accepts.
  *
- * gh:, wo: and digest: refs pass through unchanged (canonicalized). Any other
- * ref -- dispatch:<message-id> from undelivered rulings, or a future non-GitHub
+ * gh:, wo: and digest: refs pass through unchanged (canonicalized). Remediation
+ * refs keep their synthetic journal identity but group Dispatch rows by PR.
+ * Any other ref -- dispatch:<message-id> from undelivered rulings, or a future non-GitHub
  * source -- maps deterministically to the documented Taskmaster day thread
  * digest:<UTC date of the send>. The original ref is not lost: it stays on the
  * tm_journal row's thread_ref and inside the message body. The validator is
@@ -327,7 +329,7 @@ export const SEND_REJECTED_PAGE_BUCKET_MS = 60 * 60 * 1000;
 export function dispatchSubjectKeyForThreadRef(threadRef: string, nowMs: number): string {
   const canonical = canonicalizeThreadRef(threadRef);
   try {
-    return normalizeDispatchSubjectKey(canonical);
+    return normalizeDispatchSubjectKey(canonical.replace(/^remediation:/, 'gh:'));
   } catch {
     return `digest:${new Date(nowMs).toISOString().slice(0, 10)}`;
   }
@@ -480,8 +482,8 @@ export interface RemediationCandidate {
  * ('taskmaster') and keeps only those whose body parses as an
  * `overseer_remediation_candidate` via the producer's own parser. A row that
  * does not parse, or carries another kind, is ignored with one log line and
- * NEVER throws the tick. `status: 'queued'` excludes machine-ADDRESSED (disposed)
- * rows -- the queued read adds `route_disposition IS NULL` -- so a candidate whose
+ * NEVER throws the tick. The open-only queued read excludes machine-ADDRESSED
+ * (disposed) rows via `route_disposition IS NULL`, so a candidate whose
  * two-phase lifecycle has reached the address phase is not returned again. The
  * `acknowledged_at IS NULL` filter below matches the spec's "queued, UNACKNOWLEDGED
  * rows" wording and mirrors defaultListUndeliveredRulings; taskmaster is worker_poll
@@ -501,29 +503,39 @@ function isQueuedRemediationEnvelope(message: DispatchMessage | null): message i
 }
 
 export async function defaultListRemediationCandidates(
-  listFn: typeof listMessages = listMessages
+  listFn: typeof listMessagesBySeqCursor = listMessagesBySeqCursor
 ): Promise<RemediationCandidate[]> {
-  const queued: DispatchMessage[] = await listFn({
-    recipient: REMEDIATION_RECIPIENT,
-    status: 'queued',
-    limit: 200,
-  });
   const candidates: RemediationCandidate[] = [];
-  for (const message of queued) {
-    if (!isQueuedRemediationEnvelope(message)) continue;
-    const body = parseRemediationCandidateBody(message.body);
-    if (!body) {
-      log.warn({ messageId: message.id }, 'taskmaster.remediation_candidate_ignored');
-      continue;
+  let afterSeq: number | undefined;
+  // First attempts intentionally remain queued. Walk by insertion sequence so
+  // retained rows cannot hide a later candidate, even while rows are disposed.
+  for (;;) {
+    const queued = await listFn({
+      recipient: REMEDIATION_RECIPIENT,
+      task_type: 'run_review',
+      status: 'queued',
+      openOnly: true,
+      afterSeq,
+      limit: 200,
+    });
+    for (const message of queued) {
+      if (!isQueuedRemediationEnvelope(message)) continue;
+      const body = parseRemediationCandidateBody(message.body);
+      if (!body) {
+        log.warn({ messageId: message.id }, 'taskmaster.remediation_candidate_ignored');
+        continue;
+      }
+      candidates.push({ id: message.id, body });
     }
-    candidates.push({ id: message.id, body });
+    if (queued.length < 200) break;
+    afterSeq = queued[queued.length - 1].cursor_seq;
   }
   return candidates;
 }
 
 export interface RemediationConsumptionDeps {
   getMessage?: typeof getMessage;
-  listMessages?: typeof listMessages;
+  listMessagesBySeqCursor?: typeof listMessagesBySeqCursor;
   disposeMessageByMachine?: typeof disposeMessageByMachine;
 }
 
@@ -533,7 +545,7 @@ export async function defaultConsumeRemediationCandidate(
   deps: RemediationConsumptionDeps = {}
 ): Promise<void> {
   const read = deps.getMessage ?? getMessage;
-  const list = deps.listMessages ?? listMessages;
+  const list = deps.listMessagesBySeqCursor ?? listMessagesBySeqCursor;
   const dispose = deps.disposeMessageByMachine ?? disposeMessageByMachine;
   // Two-phase candidate lifecycle (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01).
   //
@@ -559,16 +571,11 @@ export async function defaultConsumeRemediationCandidate(
   const capReached = body.attempt >= body.maxAttempts;
   let superseded = false;
   if (!capReached) {
-    const siblings = await list({
-      recipient: REMEDIATION_RECIPIENT,
-      status: 'queued',
-      limit: 200,
-    });
+    const siblings = await defaultListRemediationCandidates(list);
     superseded = siblings.some(sibling => {
-      if (sibling.id === id || !isQueuedRemediationEnvelope(sibling)) return false;
-      const other = parseRemediationCandidateBody(sibling.body);
+      if (sibling.id === id) return false;
+      const other = sibling.body;
       return (
-        other !== null &&
         other.owner.toLowerCase() === body.owner.toLowerCase() &&
         other.repo.toLowerCase() === body.repo.toLowerCase() &&
         other.prNumber === body.prNumber &&
@@ -2527,7 +2534,17 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       continue;
     }
     // Backoff withholds new sends, not cleanup of already-confirmed delivery.
-    if (proposal.type === 'escalate_p0' && recentEscalateP0ByThread.has(canonicalProposalRef)) {
+    // A candidate deferred by pause/epoch fencing has not been sent. Retry its
+    // stable journal key under the original deadline instead of blocking resume.
+    if (
+      proposal.type === 'escalate_p0' &&
+      recentEscalateP0ByThread.has(canonicalProposalRef) &&
+      !(
+        proposal.remediationCandidateId &&
+        existingAction &&
+        ['failed', 'deferred'].includes(existingAction.outcome)
+      )
+    ) {
       continue;
     }
     if (existingAction && ['failed', 'deferred'].includes(existingAction.outcome)) {

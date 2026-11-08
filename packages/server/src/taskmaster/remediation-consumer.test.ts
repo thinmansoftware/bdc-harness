@@ -2,9 +2,9 @@
  * Taskmaster remediation-candidate consumer
  * (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01).
  *
- * The 8 Section 7 scenarios. Everything is dependency-injected (fake clock,
- * fake DAL, fake dispatch, fake candidate store); no mock.module, so this file
- * cannot pollute the process-wide module cache for other files in the package.
+ * The 8 Section 7 scenarios use injected clocks and stores. Real-DAL regression
+ * cases bind getDatabase to private in-memory SQLite and restore the binding;
+ * no mock.module, so this file cannot pollute the process-wide module cache.
  *
  * NOTE on recipient fixtures: Section 7's prose names 'codex' as the owner
  * thread's recipient. The real guard allowlist (TM_ALLOWED_RECIPIENTS) does not
@@ -16,8 +16,11 @@
  * resolved recipient) is preserved. TM_ALLOWED_RECIPIENTS is intentionally NOT
  * widened by this WO.
  */
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
 import { rootLogger } from '@archon/paths';
+import { SqliteAdapter } from '@archon/core/db/adapters/sqlite';
+import * as connection from '@archon/core/db/connection';
+import { createAuthenticatedMessage, getMessage, listMessages } from '@archon/core/db/dispatch';
 import {
   createTaskmasterState,
   defaultListRemediationCandidates,
@@ -435,7 +438,7 @@ describe('remediation custody across pause and epoch fences', () => {
         item.idempotency_key.startsWith('tm:remediation_nudge:')
       );
       expect(sends).toHaveLength(1);
-      expect(sends[0]?.recipient).toBe('operator');
+      expect(sends[0]?.recipient).toBe('t3-desktop');
       expect(row.outcome).toBe('sent');
       expect(row.proof_deadline_at).toBe(deadline);
     }
@@ -564,7 +567,7 @@ describe('Test 5: no matching work thread escalates', () => {
     );
     expect(escalations.length).toBe(2);
     for (const escalation of escalations) {
-      expect(escalation.recipient).toBe('operator');
+      expect(escalation.recipient).toBe('t3-desktop');
     }
     expect(escalations.map(e => e.idempotency_key).sort()).toEqual(
       [
@@ -702,7 +705,7 @@ describe('production candidate lifecycle composition', () => {
     const disposals: string[] = [];
     const deps = {
       getMessage: async (id: string) => rows.find(row => row.id === id) ?? null,
-      listMessages: (async () =>
+      listMessagesBySeqCursor: (async () =>
         rows.filter(row => row.status === 'queued' && row.route_disposition === null)) as never,
       disposeMessageByMachine: (async (data: {
         id: string;
@@ -740,7 +743,8 @@ describe('production candidate lifecycle composition', () => {
       const store = dispatchStore(rows);
       const deps = makeDeps(world, {
         listThreads: async () => [ownerThread()],
-        listRemediationCandidates: () => defaultListRemediationCandidates(store.deps.listMessages),
+        listRemediationCandidates: () =>
+          defaultListRemediationCandidates(store.deps.listMessagesBySeqCursor),
         consumeRemediationCandidate: async id => {
           world.consumeCalls.push(id);
           await defaultConsumeRemediationCandidate(id, store.deps);
@@ -798,7 +802,8 @@ describe('production candidate lifecycle composition', () => {
       const store = dispatchStore(rows, true);
       const deps = makeDeps(world, {
         listThreads: async () => [ownerThread()],
-        listRemediationCandidates: () => defaultListRemediationCandidates(store.deps.listMessages),
+        listRemediationCandidates: () =>
+          defaultListRemediationCandidates(store.deps.listMessagesBySeqCursor),
         consumeRemediationCandidate: id => defaultConsumeRemediationCandidate(id, store.deps),
       });
       await tick(createTaskmasterState(60000), deps);
@@ -862,6 +867,110 @@ describe('production candidate lifecycle composition', () => {
     expect(reads).toBe(2);
     expect(store.disposals).toEqual([]);
     expect(target.route_disposition).toBeNull();
+  });
+});
+
+describe('remediation consumer with the real Dispatch DAL', () => {
+  async function withDispatch(work: () => Promise<void>): Promise<void> {
+    const database = new SqliteAdapter(':memory:');
+    const binding = spyOn(connection, 'getDatabase').mockReturnValue(database);
+    try {
+      await work();
+    } finally {
+      binding.mockRestore();
+      await database.close();
+    }
+  }
+
+  test.each([null, 'WO-UNMATCHED-99'])(
+    'unmatched WO %s resumes into one real operator dispatch with a PR subject',
+    async woId => {
+      await withDispatch(async () => {
+        const world = makeWorld();
+        world.control = { ...world.control, pause_state: 'PAUSED', pause_scope: 'effects' };
+        world.candidates.push({
+          id: 'real-unmatched',
+          consumed: false,
+          body: candidateBody({ woId }),
+        });
+        const deps = makeDeps(world, {
+          listThreads: async () => [ownerThread()],
+          createTask: createAuthenticatedMessage,
+          pageOperator: async () => {
+            throw new Error('unexpected operator page');
+          },
+        });
+        const readEscalations = async () =>
+          (await listMessages({ recipient: 't3-desktop', limit: 500 })).filter(row =>
+            row.idempotency_key.startsWith('tm:remediation_nudge:')
+          );
+
+        await tick(createTaskmasterState(60000), deps);
+        expect(await readEscalations()).toHaveLength(0);
+        expect(world.consumeCalls).toEqual([]);
+        const journal = world.journal.find(
+          row => JSON.parse(row.proposal_json).remediationCandidateId === 'real-unmatched'
+        )!;
+        expect(journal.outcome).toBe('deferred');
+        const deadline = journal.proof_deadline_at;
+
+        world.control = { ...world.control, pause_state: 'RUNNING', pause_scope: null };
+        world.nowMs += 60000;
+        await tick(createTaskmasterState(60000), deps);
+        const sent = await readEscalations();
+        expect(sent).toHaveLength(1);
+        expect(sent[0]?.subject_key).toBe('gh:owner/repo#5');
+        expect(sent[0]?.sender_principal_id).toBe('system:taskmaster');
+        expect(sent[0]?.body).toContain('CHANGES_REQUESTED');
+        expect(journal.outcome).toBe('sent');
+        expect(journal.proof_deadline_at).toBe(deadline);
+        expect(world.consumeCalls).toEqual(['real-unmatched']);
+
+        world.nowMs += 60000;
+        await tick(createTaskmasterState(60000), deps);
+        expect(await readEscalations()).toHaveLength(1);
+      });
+    }
+  );
+
+  test('discovery and supersession pass 200 retained first attempts without deleting them', async () => {
+    await withDispatch(async () => {
+      const enqueue = (body: RemediationCandidateBody) =>
+        createAuthenticatedMessage(
+          { kind: 'system', sender: 'overseer' },
+          {
+            correlation_id: `review-${body.prNumber}-${body.attempt}`,
+            idempotency_key: `candidate-${body.prNumber}-${body.attempt}`,
+            recipient: 'taskmaster',
+            task_type: 'run_review',
+            body: JSON.stringify(body),
+          }
+        );
+      const retained: DispatchMessage[] = [];
+      for (let i = 1; i <= 205; i++) {
+        retained.push(await enqueue(candidateBody({ prNumber: i })));
+      }
+      await defaultConsumeRemediationCandidate(retained[0]!.id);
+      expect((await getMessage(retained[0]!.id))?.route_disposition).toBeNull();
+
+      const next = await enqueue(
+        candidateBody({ prNumber: 1, attempt: 2, headSha: 'bbbbbbb2222' })
+      );
+      const firstRead = await defaultListRemediationCandidates();
+      expect(firstRead).toHaveLength(206);
+      expect(firstRead.some(row => row.id === next.id)).toBe(true);
+      // Supersession must find the newer attempt on page two while page one
+      // remains queued. Discovery must also work after that page mutates.
+      await defaultConsumeRemediationCandidate(retained[0]!.id);
+      expect((await getMessage(retained[0]!.id))?.route_disposition).toBe('expired');
+      const secondRead = await defaultListRemediationCandidates();
+      expect(secondRead).toHaveLength(205);
+      expect(secondRead.some(row => row.id === next.id)).toBe(true);
+      expect((await getMessage(retained[1]!.id))?.route_disposition).toBeNull();
+      await defaultConsumeRemediationCandidate(next.id);
+      expect((await getMessage(next.id))?.route_disposition).toBe('expired');
+      expect(await defaultListRemediationCandidates()).toHaveLength(204);
+    });
   });
 });
 

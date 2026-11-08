@@ -681,7 +681,7 @@ export function computeRemediationNudge(
     return {
       type: 'escalate_p0',
       threadRef: `remediation:${prRef}`,
-      recipient: 'operator',
+      recipient: T3_DESKTOP_RECIPIENT,
       body:
         `Unroutable remediation candidate: PR ${prRef} (head ${candidate.headSha}, ` +
         `attempt ${candidate.attempt} of ${candidate.maxAttempts}) was returned ` +
