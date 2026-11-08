@@ -120,9 +120,15 @@ PR URL when present, the blocker and the next action, and ends with:
 > escalate to a stronger model or subagent yourself instead of waiting or
 > escalating to XO or John.
 
-If the Dispatch content guard rejects the body, no owner row is written and
-`overseer.owner_routing.owner_row_content_rejected` is logged; the `t3-desktop`
-row is still written. The consumer is the T3 relay from bdc-xo PR #4979
+The 1500-character cap applies to the whole text: the blocker line gets the
+budget the other lines leave, so the fixed last line is never cut.
+
+If the Dispatch content guard rejects the owner body, no owner row is written,
+`overseer.owner_routing.owner_row_content_rejected` is logged, and the
+builder monitor gets `needs_owner` with `owner_row_rejected for owner <handle>`
+in the detail. Because the owner text is built from the same fields as the run
+report, a rejected owner body normally means the run report itself was
+rejected too (`dispatch_content_rejected`, unchanged behavior). The consumer is the T3 relay from bdc-xo PR #4979
 (`scripts/t3-relay/relay.py`), which claims `t3-thread-nudge/v1` rows and posts
 `text` into `thread_id`.
 

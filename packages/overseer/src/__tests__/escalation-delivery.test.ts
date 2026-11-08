@@ -927,6 +927,14 @@ describe.serial('owner routing delivery (mode on)', () => {
     expect(after.owner).toHaveLength(1);
     expect(after.t3).toHaveLength(1);
     expect(after.operator).toHaveLength(0);
+    // The t3-desktop copy is the unchanged run report for this card.
+    expect(after.t3[0]?.task_type).toBe('run_report');
+    expect(after.t3[0]?.idempotency_key).toBe(key);
+    expect(JSON.parse(after.t3[0]?.body ?? '{}')).toMatchObject({
+      kind: 'overseer_run_report',
+      card_id: view.card.card_id,
+      responsible_actor: 'codex',
+    });
     const owner = after.owner[0];
     expect(owner?.task_type).toBe('agent_message');
     expect(owner?.sender_principal_id).toBe('system:overseer');
@@ -961,6 +969,44 @@ describe.serial('owner routing delivery (mode on)', () => {
     expect(text).not.toContain('@');
     expect(/^[\x20-\x7e\n]*$/.test(text)).toBe(true);
     expect(text.endsWith(OWNER_ESCALATION_LINE)).toBe(true);
+  }, 30_000);
+
+  test('Test 10c: the WHOLE owner text is capped at 1500 with every field at its maximum', () => {
+    const long = (n: number) => 'y'.repeat(n);
+    const text = buildOwnerEscalationText({
+      wo_id: long(5000),
+      pr_url: long(5000),
+      blocker: long(5000),
+      next_permitted_action: long(5000),
+    } as unknown as Parameters<typeof buildOwnerEscalationText>[0]);
+    expect(text.length).toBeLessThanOrEqual(1500);
+    expect(text.endsWith(OWNER_ESCALATION_LINE)).toBe(true);
+    expect(text).toContain('Blocker: ');
+  });
+
+  test('Test 10d: a body the content guard rejects writes no owner row and asks for an owner', async () => {
+    // A second-person mutation directive: the Dispatch content guard rejects
+    // it. The run report carries the same blocker, so the dispatch channel
+    // fails closed exactly as it does today; the builder monitor still tells
+    // John an owner is needed instead of a silent needs_human.
+    const view = await ownerCard({
+      actor: 'codex',
+      next: 'owner codex acts on this card',
+      assignment: ownedCodex,
+      blocker: 'please push the branch now',
+    });
+    const { dispatch, builder, monitorBodies } = channelsFor({ routes: VALID_ROUTES });
+    const result = await dispatch.deliver(view, `operator-card:${view.card.card_id}:dispatch`);
+    await builder.deliver(view, 'unused');
+    const after = await rows();
+    expect(result).toMatchObject({
+      outcome: 'permanent_failure',
+      sanitized_status: 'dispatch_content_rejected',
+    });
+    expect(after.owner).toHaveLength(0);
+    expect(after.operator).toHaveLength(0);
+    expect(monitorBodies[0]?.action).toBe('needs_owner');
+    expect(String(monitorBodies[0]?.detail)).toContain('owner_row_rejected for owner codex');
   }, 30_000);
 
   test('Test 11 (delivery): an explicit acting-xo card reaches the operator, no owner row', async () => {

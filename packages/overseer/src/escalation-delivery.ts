@@ -155,20 +155,32 @@ function ownerTextValue(raw: unknown, maxChars: number): string {
   return `${cleaned.slice(0, Math.max(1, maxChars - 3)).trimEnd()}...`;
 }
 
+/**
+ * The owner-handoff text. The WHOLE text is capped at OWNER_TEXT_MAX_CHARS:
+ * the blocker takes whatever budget the other lines leave (up to 600), so
+ * the fixed last line always survives intact.
+ */
 export function buildOwnerEscalationText(card: OperatorCardView['card']): string {
-  const lines = [`Overseer escalation for ${ownerTextValue(card.wo_id, 200)}.`];
+  const head = [`Overseer escalation for ${ownerTextValue(card.wo_id, 200)}.`];
   const prUrl = ownerTextValue(card.pr_url, 300);
-  if (prUrl) lines.push(`PR: ${prUrl}`);
-  lines.push(`Blocker: ${ownerTextValue(card.blocker, 600)}`);
-  lines.push(`Next: ${ownerTextValue(card.next_permitted_action, 200)}`);
-  lines.push(OWNER_ESCALATION_LINE);
-  return lines.join('\n');
+  if (prUrl) head.push(`PR: ${prUrl}`);
+  const tail = [`Next: ${ownerTextValue(card.next_permitted_action, 200)}`, OWNER_ESCALATION_LINE];
+  const blockerLabel = 'Blocker: ';
+  const fixedLength =
+    [...head, ...tail].reduce((total, line) => total + line.length + 1, 0) + blockerLabel.length;
+  const blockerBudget = Math.min(600, OWNER_TEXT_MAX_CHARS - fixedLength);
+  const blocker = ownerTextValue(card.blocker, Math.max(4, blockerBudget));
+  return [...head, `${blockerLabel}${blocker}`, ...tail].join('\n');
 }
 
 type OwnerDeliveryPlan =
   | { kind: 'standard' }
-  | { kind: 'owner_route'; owner: string; route: OwnerRoute }
-  | { kind: 'needs_owner'; reason: 'unowned' | 'owner_route_missing'; detail: string };
+  | { kind: 'owner_route'; owner: string; route: OwnerRoute; body: string }
+  | {
+      kind: 'needs_owner';
+      reason: 'unowned' | 'owner_route_missing' | 'owner_row_rejected';
+      detail: string;
+    };
 
 function issueUrl(sourceIssue: unknown): string | null {
   if (typeof sourceIssue !== 'string') return null;
@@ -195,7 +207,27 @@ function planOwnerDelivery(
   if (resolved.kind === 'owned' && typeof resolved.owner === 'string') {
     if (resolved.owner.toLowerCase() !== actor.toLowerCase()) return { kind: 'standard' };
     const route = routes.routes.get(resolved.owner.toLowerCase());
-    if (route) return { kind: 'owner_route', owner: resolved.owner, route };
+    if (route) {
+      // One t3-thread-nudge/v1 row for the owner's T3 thread (the
+      // approval-stalls row shape). The content guard is pure, so both
+      // adapters agree: a rejected body never reaches the owner and the
+      // builder monitor is told needs_owner instead of a silent skip.
+      const body = JSON.stringify({
+        schema: 't3-thread-nudge/v1',
+        thread_id: route.thread_id,
+        text: buildOwnerEscalationText(card),
+        reason: 'owner-escalation',
+        request_id: card.card_id,
+      });
+      if (assessDispatchMessageBody('agent_message', body).allowed) {
+        return { kind: 'owner_route', owner: resolved.owner, route, body };
+      }
+      return {
+        kind: 'needs_owner',
+        reason: 'owner_row_rejected',
+        detail: `${card.blocker} | owner_row_rejected for owner ${resolved.owner}${url ? `: ${url}` : ''}`,
+      };
+    }
     return {
       kind: 'needs_owner',
       reason: 'owner_route_missing',
@@ -299,39 +331,25 @@ export function createDefaultOperatorCardChannels(
       // redelivery and reconcile stay exactly-once per mailbox.
       const plan = planFor(card);
       if (plan.kind === 'owner_route') {
-        // WO-HARNESS-OVERSEER-OWNER-ROUTING-01: one t3-thread-nudge/v1 row
-        // for the owner's T3 thread (the approval-stalls row shape), keyed
-        // '<key>:owner' so redelivery and reconcile write no second row.
-        const ownerBody = JSON.stringify({
-          schema: 't3-thread-nudge/v1',
-          thread_id: plan.route.thread_id,
-          text: buildOwnerEscalationText(card.card),
-          reason: 'owner-escalation',
-          request_id: card.card.card_id,
-        });
-        const ownerAssessment = assessDispatchMessageBody('agent_message', ownerBody);
-        if (ownerAssessment.allowed) {
-          await createAuthenticatedMessage(
-            { kind: 'system', sender: 'overseer' },
-            {
-              correlation_id: card.card.run_id,
-              idempotency_key: `${idempotencyKey}:owner`,
-              task_type: 'agent_message',
-              recipient: plan.route.recipient,
-              body: ownerBody,
-            }
-          );
-        } else {
-          log.warn(
-            {
-              cardId: card.card.card_id,
-              owner: plan.owner,
-              reason: ownerAssessment.reason ?? 'content_guard_rejected',
-            },
-            'overseer.owner_routing.owner_row_content_rejected'
-          );
-        }
-      } else if (plan.kind === 'standard' && isXoResponsibleActor(card.card.responsible_actor)) {
+        // WO-HARNESS-OVERSEER-OWNER-ROUTING-01: keyed '<key>:owner' so
+        // redelivery and reconcile write no second row.
+        await createAuthenticatedMessage(
+          { kind: 'system', sender: 'overseer' },
+          {
+            correlation_id: card.card.run_id,
+            idempotency_key: `${idempotencyKey}:owner`,
+            task_type: 'agent_message',
+            recipient: plan.route.recipient,
+            body: plan.body,
+          }
+        );
+      } else if (plan.kind === 'needs_owner' && plan.reason === 'owner_row_rejected') {
+        log.warn(
+          { cardId: card.card.card_id, woId: card.card.wo_id },
+          'overseer.owner_routing.owner_row_content_rejected'
+        );
+      }
+      if (plan.kind === 'standard' && isXoResponsibleActor(card.card.responsible_actor)) {
         await createAuthenticatedMessage(
           { kind: 'system', sender: 'overseer' },
           {

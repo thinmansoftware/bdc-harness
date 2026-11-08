@@ -151,6 +151,10 @@ describe.serial('owner routing on escalation cards', () => {
     source_issue: 'thinmansoftware/bdc-xo#4321',
   };
 
+  const DEV_BASELINE_CARD_ID = '05fad1633aad730dba62d54406db8f09738e4aae1999a612ed3cd126a195c3f3';
+  const DEV_BASELINE_PAYLOAD_DIGEST =
+    'af550721fb55368744dce8cc46b092bed6fb5db8175ceb5ad3963a5bcf12d791';
+
   /** The exact payload dev cda6cb87 wrote for these inputs (no owner_assignment). */
   const devBaselinePayload: OperatorCardPayload = {
     repository: 'thinmansoftware/bdc-harness',
@@ -258,6 +262,10 @@ describe.serial('owner routing on escalation cards', () => {
       expect(card.card_id).toBe(baseline.card_id);
       expect(card.payload).toEqual(baseline.payload as unknown as Record<string, unknown>);
       expect(card.payload_digest).toBe(baseline.payload_digest);
+      // Captured by running dev 1bad06ad's own escalate.ts + operator-card.ts
+      // (unchanged from cda6cb87 in these files) with these exact inputs.
+      expect(card.card_id).toBe(DEV_BASELINE_CARD_ID);
+      expect(card.payload_digest).toBe(DEV_BASELINE_PAYLOAD_DIGEST);
       expect('owner_assignment' in card.payload).toBe(false);
     }
   }, 30_000);
