@@ -868,6 +868,30 @@ describe('production candidate lifecycle composition', () => {
     expect(store.disposals).toEqual([]);
     expect(target.route_disposition).toBeNull();
   });
+
+  test.each(['system:taskmaster', null])(
+    'target provenance changing to %s during observation prevents machine disposal',
+    async senderPrincipalId => {
+      const target = fakeDispatchRow({
+        id: 'capped',
+        recipient: 'taskmaster',
+        task_type: 'run_review',
+        body: JSON.stringify(candidateBody({ attempt: 2 })),
+      });
+      const store = dispatchStore([target]);
+      let reads = 0;
+      await defaultConsumeRemediationCandidate('capped', {
+        ...store.deps,
+        getMessage: async () => {
+          reads++;
+          return reads === 1 ? target : { ...target, sender_principal_id: senderPrincipalId };
+        },
+      });
+      expect(reads).toBe(2);
+      expect(store.disposals).toEqual([]);
+      expect(target.route_disposition).toBeNull();
+    }
+  );
 });
 
 describe('remediation consumer with the real Dispatch DAL', () => {
@@ -881,6 +905,74 @@ describe('remediation consumer with the real Dispatch DAL', () => {
       await database.close();
     }
   }
+
+  async function enqueueCandidate(sender: 'overseer' | 'taskmaster', attempt: number) {
+    return createAuthenticatedMessage(
+      { kind: 'system', sender },
+      {
+        correlation_id: `provenance-${sender}-${attempt}`,
+        idempotency_key: `provenance-${sender}-${attempt}`,
+        recipient: 'taskmaster',
+        task_type: 'run_review',
+        body: JSON.stringify(
+          candidateBody({ attempt, headSha: attempt === 1 ? 'aaaaaaa1111' : 'bbbbbbb2222' })
+        ),
+      }
+    );
+  }
+
+  async function enqueueUntrustedCandidate(senderPrincipalId: string | null) {
+    const message = await enqueueCandidate(
+      senderPrincipalId === null ? 'overseer' : 'taskmaster',
+      2
+    );
+    if (senderPrincipalId === null) {
+      // Legacy rows can retain the Overseer display name without authenticated provenance.
+      await connection
+        .getDatabase()
+        .query('UPDATE agent_dispatch_messages SET sender_principal_id = NULL WHERE id = $1', [
+          message.id,
+        ]);
+    }
+    expect((await getMessage(message.id))?.sender_principal_id).toBe(senderPrincipalId);
+    return message;
+  }
+
+  test.each(['system:taskmaster', null])(
+    'provenance %s cannot enter discovery, produce a nudge, or be directly consumed',
+    async senderPrincipalId => {
+      await withDispatch(async () => {
+        const untrusted = await enqueueUntrustedCandidate(senderPrincipalId);
+        expect(await defaultListRemediationCandidates()).toEqual([]);
+        const world = makeWorld();
+        const deps = makeDeps(world, {
+          listThreads: async () => [ownerThread()],
+          listRemediationCandidates: defaultListRemediationCandidates,
+        });
+        await tick(createTaskmasterState(60000), deps);
+        expect(nudgeSends(world)).toEqual([]);
+        expect(world.consumeCalls).toEqual([]);
+        await defaultConsumeRemediationCandidate(untrusted.id);
+        expect((await getMessage(untrusted.id))?.route_disposition).toBeNull();
+      });
+    }
+  );
+
+  test.each(['system:taskmaster', null])(
+    'higher-attempt provenance %s cannot supersede an authenticated Overseer candidate',
+    async senderPrincipalId => {
+      await withDispatch(async () => {
+        const legitimate = await enqueueCandidate('overseer', 1);
+        const untrusted = await enqueueUntrustedCandidate(senderPrincipalId);
+        expect((await defaultListRemediationCandidates()).map(row => row.id)).toEqual([
+          legitimate.id,
+        ]);
+        await defaultConsumeRemediationCandidate(legitimate.id);
+        expect((await getMessage(legitimate.id))?.route_disposition).toBeNull();
+        expect((await getMessage(untrusted.id))?.route_disposition).toBeNull();
+      });
+    }
+  );
 
   test.each([null, 'WO-UNMATCHED-99'])(
     'unmatched WO %s resumes into one real operator dispatch with a PR subject',

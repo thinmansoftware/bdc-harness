@@ -479,7 +479,7 @@ export interface RemediationCandidate {
  * (WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01).
  *
  * Lists queued `run_review` rows addressed to the remediation recipient
- * ('taskmaster') and keeps only those whose body parses as an
+ * ('taskmaster') and keeps only authenticated `system:overseer` rows whose body parses as an
  * `overseer_remediation_candidate` via the producer's own parser. A row that
  * does not parse, or carries another kind, is ignored with one log line and
  * NEVER throws the tick. The open-only queued read excludes machine-ADDRESSED
@@ -493,6 +493,7 @@ export interface RemediationCandidate {
 function isQueuedRemediationEnvelope(message: DispatchMessage | null): message is DispatchMessage {
   return (
     message !== null &&
+    message.sender_principal_id === 'system:overseer' &&
     message.recipient === REMEDIATION_RECIPIENT &&
     message.status === 'queued' &&
     message.task_type === 'run_review' &&
