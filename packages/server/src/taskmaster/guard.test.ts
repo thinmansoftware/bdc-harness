@@ -116,6 +116,8 @@ describe('validateProposal', () => {
       // 't3-desktop' is admitted ONLY for escalate_p0 (asserted in the
       // routing-cutoff test file).
       if (recipient === 't3-desktop') continue;
+      // Relay recipient requires its versioned JSON contract (recipients.test.ts).
+      if (recipient === 't3-desk-local') continue;
       expect(validateProposal(proposal({ recipient })).allowed).toBe(true);
     }
   });
