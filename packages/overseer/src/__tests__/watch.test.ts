@@ -354,7 +354,7 @@ describe('run PR identity', () => {
       workflow_run_id: 'run-identity',
       event_type: 'node_completed',
       step_name: 'commit-and-push',
-      data,
+      data: { type: 'bash', ...data },
     };
   }
 
@@ -396,6 +396,43 @@ describe('run PR identity', () => {
       event({ node_output: 'unique_branch=second-branch' }, 'evt-b'),
     ]);
     expect(recovered).toBe('second-branch');
+  });
+
+  test('takes the last unique_branch line within the completed bash output', () => {
+    expect(
+      recoverHeadBranchFromEvents([
+        event({ node_output: 'unique_branch=first\r\nunique_branch=final\r\n' }),
+      ])
+    ).toBe('final');
+  });
+
+  test('ignores a marker before the final non-empty bash output line', () => {
+    expect(
+      recoverHeadBranchFromEvents([
+        event({ node_output: 'unique_branch=evil/branch\npush complete\n\n' }),
+      ])
+    ).toBeUndefined();
+  });
+
+  test.each([
+    { event_type: 'node_started' },
+    { event_type: 'node_failed' },
+    { step_name: 'builder' },
+    { data: { type: 'agent', node_output: 'unique_branch=ai-injected' } },
+    { data: { node_output: 'unique_branch=untyped' } },
+  ])('ignores branch markers outside completed commit-and-push bash events: %j', override => {
+    expect(
+      recoverHeadBranchFromEvents([
+        event({ node_output: 'unique_branch=trusted' }),
+        { ...event({ node_output: 'unique_branch=untrusted' }), ...override },
+      ])
+    ).toBe('trusted');
+  });
+
+  test('ignores a branch token quoted inside other output', () => {
+    expect(
+      recoverHeadBranchFromEvents([event({ node_output: 'AI suggested unique_branch=untrusted' })])
+    ).toBeUndefined();
   });
 
   test('eventMessage returns node_output instead of serialized JSON', () => {

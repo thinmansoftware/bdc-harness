@@ -70,7 +70,11 @@ import {
   startDispatchEscalationClock,
   stopDispatchEscalationClock,
 } from './dispatch/escalation-clock';
-import { startReviewWorkerClock, stopReviewWorkerClock } from './dispatch/review-worker-clock';
+import {
+  createRealReviewWorkerDeps,
+  startReviewWorkerClock,
+  stopReviewWorkerClock,
+} from './dispatch/review-worker-clock';
 import { startDutyOfficerClock, stopDutyOfficerClock } from './dispatch/duty-officer-clock';
 import { startOutcomeReportClock, stopOutcomeReportClock } from './dispatch/outcome-report-clock';
 import {
@@ -92,7 +96,7 @@ import {
 } from '@archon/workflows/reliability/seat-usage';
 import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
 import { createMergeManager } from '@archon/overseer/merge-manager';
-import { resolveDefaultDeps } from '@archon/overseer/service';
+import { createApprovalRecheckSubmitDeps, resolveDefaultDeps } from '@archon/overseer/service';
 import { ingestPullRequestEvent } from '@archon/overseer/pr-review-ingest';
 import { createRealIngestDeps, resolveReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
 import {
@@ -204,7 +208,9 @@ function envEnabled(value: string | undefined): boolean {
   return value === '1' || value === 'true' || value === 'yes';
 }
 
-function startOverseerRuntimeWithRealMergeManager(): void {
+function startOverseerRuntimeWithRealMergeManager():
+  | ReturnType<typeof createApprovalRecheckSubmitDeps>
+  | undefined {
   const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN ?? '';
   const realAdapterRequested =
     !envEnabled(process.env.OVERSEER_USE_FAKE_GITHUB_ADAPTER) && token.length > 0;
@@ -217,6 +223,7 @@ function startOverseerRuntimeWithRealMergeManager(): void {
   startOverseerRuntime({
     serviceOptions: { deps, mergeCoordinator: mergeManager, mergeBridgeEnabled: true },
   });
+  return createApprovalRecheckSubmitDeps(deps, mergeManager);
 }
 
 export async function startServer(opts: ServerOptions = {}): Promise<void> {
@@ -314,7 +321,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     process.exit(1);
   }
 
-  startOverseerRuntimeWithRealMergeManager();
+  const approvalRecheckSubmitDeps = startOverseerRuntimeWithRealMergeManager();
 
   const config = await loadConfig();
   logConfig(config);
@@ -712,7 +719,10 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
       }
     });
     getLog().info('overseer_review_route_registered');
-    startReviewWorkerClock(reviewRouteConfig);
+    startReviewWorkerClock(
+      reviewRouteConfig,
+      createRealReviewWorkerDeps(approvalRecheckSubmitDeps)
+    );
     // Unreviewed-head reconcile (WO-HARNESS-OVERSEER-UNREVIEWED-HEAD-RECONCILE-01):
     // a push lost while the app was down (e.g. mid-rebuild) never reaches the
     // route above. One pass now, then every OVERSEER_UNREVIEWED_HEAD_RECONCILE_MINUTES.

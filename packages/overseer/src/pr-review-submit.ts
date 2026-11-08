@@ -25,6 +25,11 @@ import { readFile } from 'node:fs/promises';
 import { hasDistinctMergeIdentity } from './adapters/github-real-deps';
 import { classifyRateLimitError } from './github-rate-limit';
 import { resolveMergeManagerMode } from './merge-manager';
+import { createLogger } from '@archon/paths';
+import {
+  mergeRecheckOnApprovalEnabled,
+  type ApprovalMergeRecheckInput,
+} from './merge-recheck-on-approval';
 import type { IndependentReviewFinding } from './independent-review-evidence.ts';
 import {
   decideRemediation,
@@ -262,6 +267,13 @@ export interface SubmitOutcome {
 }
 
 export interface SubmitDeps {
+  findRunForPullRequest?(input: {
+    owner: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+  }): Promise<{ runId: string; woId: string } | null>;
+  recheckMergeOnApproval?(input: ApprovalMergeRecheckInput): Promise<void>;
   reviewerIdentity: string;
   /** Runs the governed reviewer against an exact head. */
   runReviewer(work: ReviewWorkItem): Promise<ReviewerVerdict>;
@@ -681,13 +693,54 @@ export async function runAndSubmitReview(
     // round 6 [minor]), which silently removed the reviewer's text from every
     // successful approval outcome -- the same text #782 added so the same-head
     // recheck path can tell a CHECK-caused verdict from a CODE finding.
-    return finish(deps, work, work.headSha, {
+    const outcome = await finish(deps, work, work.headSha, {
       disposition: 'approved',
       event,
       executionProof: verdict.executionProof,
       githubReview: submission.review,
       ...summaryField(verdict),
     });
+    const review = submission.review;
+    if (
+      outcome.disposition === 'approved' &&
+      mergeRecheckOnApprovalEnabled() &&
+      review?.state === 'APPROVED' &&
+      review.commitSha === work.headSha &&
+      Number.isSafeInteger(review.id) &&
+      review.id > 0 &&
+      deps.reviewerIdentity.toLowerCase() ===
+        process.env.MERGE_MANAGER_REVIEW_GATE_LOGIN?.toLowerCase() &&
+      deps.findRunForPullRequest &&
+      deps.recheckMergeOnApproval
+    ) {
+      // Queue only after the durable approval receipt. Never wait on the merge
+      // manager or let its failure change a successfully submitted review.
+      void Promise.resolve()
+        .then(async () => {
+          const run = await deps.findRunForPullRequest?.({
+            owner: work.owner,
+            repo: work.repo,
+            prNumber: work.prNumber,
+            headSha: work.headSha,
+          });
+          if (run)
+            await deps.recheckMergeOnApproval?.({
+              ...run,
+              owner: work.owner,
+              repo: work.repo,
+              prNumber: work.prNumber,
+              headSha: work.headSha,
+              reviewId: review.id,
+            });
+        })
+        .catch(() => {
+          createLogger('overseer/pr-review-submit').warn(
+            { prNumber: work.prNumber, headSha: work.headSha },
+            'overseer.merge_recheck_on_approval.failed'
+          );
+        });
+    }
+    return outcome;
   }
 
   // THE MISSING ARROW. The review has landed as REQUEST_CHANGES; without this

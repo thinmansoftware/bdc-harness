@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { createLogger } from '@archon/paths';
 import { getDatabase } from './connection';
 
@@ -370,6 +370,66 @@ export async function getOverseerActionsForRun(runId: string): Promise<OverseerA
     [runId]
   );
   return [...result.rows];
+}
+
+export async function findOverseerRunForPullRequest(input: {
+  owner: string;
+  repo: string;
+  prNumber: number;
+  headSha: string;
+}): Promise<{ runId: string; woId: string } | null> {
+  const result = await getDatabase().query<{ run_id: string; wo_id: string }>(
+    `SELECT v.run_id, v.wo_id FROM overseer_verdicts v
+     JOIN remote_agent_workflow_runs r ON r.id = v.run_id
+     WHERE LOWER(v.pr_url) = LOWER($1) AND v.head_sha = $2
+       AND v.run_id NOT LIKE 'pr-discovery:%'
+     ORDER BY v.updated_at DESC, v.id DESC LIMIT 1`,
+    [`https://github.com/${input.owner}/${input.repo}/pull/${input.prNumber}`, input.headSha]
+  );
+  const row = result.rows[0];
+  return row ? { runId: row.run_id, woId: row.wo_id } : null;
+}
+
+/** A content-addressed UUID lets the existing PK arbitrate across processes/dialects. */
+export async function claimMergeRecheckOnApproval(input: {
+  runId: string;
+  woId: string;
+  key: string;
+}): Promise<string | null> {
+  const hash = createHash('sha256').update(`merge_recheck_on_approval:${input.key}`).digest('hex');
+  const id = [
+    hash.slice(0, 8),
+    hash.slice(8, 12),
+    hash.slice(12, 16),
+    hash.slice(16, 20),
+    hash.slice(20, 32),
+  ].join('-');
+  const suffix = `:key=${input.key}`;
+  const result = await getDatabase().query<{ id: string }>(
+    `INSERT INTO overseer_actions (id, run_id, wo_id, class, action, result, created_at)
+     SELECT $1, $2, $3, 'none', 'merge_recheck_on_approval', $4, $5
+     WHERE NOT EXISTS (
+       SELECT 1 FROM overseer_actions WHERE action = 'merge_recheck_on_approval'
+         AND substr(result, length(result) - length($6) + 1) = $6
+     )
+     ON CONFLICT (id) DO NOTHING RETURNING id`,
+    [id, input.runId, input.woId, `claimed${suffix}`, new Date().toISOString(), suffix]
+  );
+  return result.rows[0]?.id ?? null;
+}
+
+export async function finishMergeRecheckOnApproval(input: {
+  id: string;
+  key: string;
+  outcome: string;
+}): Promise<void> {
+  const suffix = `:key=${input.key}`;
+  const result = await getDatabase().query(
+    `UPDATE overseer_actions SET result = $2
+     WHERE id = $1 AND action = 'merge_recheck_on_approval' AND result = $3`,
+    [input.id, `${input.outcome}${suffix}`, `claimed${suffix}`]
+  );
+  if (result.rowCount !== 1) throw new Error('merge_recheck_claim_lost');
 }
 
 /**

@@ -33,7 +33,14 @@ import {
 } from './merge-repo-policy';
 import { specDeclaresMergeHold } from './merge-hold';
 import { isSpecOnlyChangeSet } from './reconcile';
-import type { GitHubClientDeps, PullRequestEvidence, ReviewConflictAtHead } from './types.ts';
+import type {
+  GitHubClientDeps,
+  OverseerWorkflowEvent,
+  PullRequestEvidence,
+  ReviewConflictAtHead,
+} from './types.ts';
+import { recoverHeadBranchFromEvents } from './watch';
+import { mergeRecheckOnApprovalEnabled } from './merge-recheck-on-approval';
 import { resolveRequiredContexts } from './adapters/required-contexts';
 import { createRealOctokitClient } from './adapters/github-real-deps';
 import { blockingRequiredContexts } from './required-context-gate';
@@ -64,6 +71,7 @@ export interface MergeExecutionBridgeStore {
   releaseVerdictClaim(verdictId: string, reason: string): Promise<boolean>;
   deferVerdictClaim?(verdictId: string, reason: string, notBefore: string): Promise<boolean>;
   getRunById(runId: string): Promise<OverseerWatchRun | null>;
+  listRunEvents?(runId: string): Promise<OverseerWorkflowEvent[]>;
   // Optional so older/test stores that predate the active-run guard keep prior
   // behavior (bdc-harness #1046): when absent, no run-in-flight deferral runs.
   hasActiveRunForWo?(woId: string): Promise<boolean>;
@@ -479,8 +487,8 @@ async function resolveRunlessTarget(
 
 /**
  * Resolve the PR and allowlist entry a verdict points at. Run-backed verdicts
- * keep the run-row path unchanged; `run_context_unresolvable` stays reserved
- * for "a run id is referenced but the row (or its repo identity) is gone".
+ * recover the pushed branch just as the watcher does. `run_context_unresolvable`
+ * stays reserved for "a run id is referenced but the row (or its repo identity) is gone".
  * Everything after this -- slot reservation, claim/release, the expectedHeadSha
  * precondition, the rate ceiling, recordPostMutationOutcome -- is shared.
  */
@@ -501,10 +509,14 @@ async function resolveMergeTarget(
     await skip('repo_not_allowed');
     return null;
   }
+  const recovered =
+    mergeRecheckOnApprovalEnabled() && options.store.listRunEvents
+      ? recoverHeadBranchFromEvents(await options.store.listRunEvents(run.id))
+      : undefined;
   const pr = await options.github.findPullRequest({
     owner: run.owner,
     repo: run.repo,
-    headBranch: run.headBranch,
+    headBranch: recovered ?? run.headBranch,
     woId: run.woId,
     includeChangedFiles: true,
   });

@@ -87,6 +87,7 @@ import {
   type ReviewWorkItem,
   type SubmitDisposition,
   type SubmitOutcome,
+  type SubmitDeps,
 } from '@archon/overseer/pr-review-submit';
 import { createRealOctokitClient } from '@archon/overseer/adapters/github-real-deps';
 import {
@@ -302,7 +303,9 @@ function mapSubmitOutcome(
   }
 }
 
-export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
+export function createRealReviewWorkerDeps(
+  approvalRecheckDeps: Pick<SubmitDeps, 'findRunForPullRequest' | 'recheckMergeOnApproval'> = {}
+): ReviewWorkerDeps {
   // Built once, lazily: createRealIngestDeps logs its configuration at
   // construction and the recovery pass runs every tick.
   let ingestDeps: IngestDeps | undefined;
@@ -318,7 +321,7 @@ export function createRealReviewWorkerDeps(): ReviewWorkerDeps {
     listQueuedReviews: listMessagesBySeqCursor,
     supersedeQueuedReview: supersedeQueuedMessageByClaim,
     runAndSubmitReview,
-    createSubmitDeps: createRealSubmitDeps,
+    createSubmitDeps: identity => ({ ...createRealSubmitDeps(identity), ...approvalRecheckDeps }),
     prepareCheckout: prepareReviewCheckout,
     resolveReviewBase: resolveLiveReviewBase,
     staleVerdictSweep: config =>

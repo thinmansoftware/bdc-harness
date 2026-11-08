@@ -1,6 +1,9 @@
 import { createLogger } from '@archon/paths';
 import {
   claimOverseerVerdict,
+  claimMergeRecheckOnApproval,
+  finishMergeRecheckOnApproval,
+  findOverseerRunForPullRequest,
   claimVerdictForMergeExecution,
   deferVerdictClaimForMergeExecution,
   finalizeOverseerVerdict,
@@ -31,7 +34,10 @@ import {
 } from './escalation-delivery';
 import { permitFromMetadata } from './permit';
 import { runReconcileOnce } from './reconcile';
-import { watchLoop } from './watch';
+import { assessRun, watchLoop } from './watch';
+import { runMergeRecheckOnApproval } from './merge-recheck-on-approval';
+import type { SubmitDeps } from './pr-review-submit';
+import type { MergeManagerResult } from './merge-manager';
 import type {
   DeterministicMergeHandoff,
   GitHubClientDeps,
@@ -64,6 +70,23 @@ export const SLICE8_INTEGRATED_ASSESSORS = Object.freeze({
 });
 
 const log = createLogger('overseer/service');
+
+export function createApprovalRecheckSubmitDeps(
+  deps: OverseerRunStoreDeps & GitHubClientDeps,
+  mergeManager: (record: WatchedRunRecord) => Promise<MergeManagerResult>
+): Pick<SubmitDeps, 'findRunForPullRequest' | 'recheckMergeOnApproval'> {
+  return {
+    findRunForPullRequest: input => findOverseerRunForPullRequest(input),
+    recheckMergeOnApproval: input =>
+      runMergeRecheckOnApproval(input, {
+        claim: claimMergeRecheckOnApproval,
+        finish: finishMergeRecheckOnApproval,
+        getRun: getOverseerWatchRunById,
+        assessRun: run => assessRun(run, deps),
+        mergeManager,
+      }),
+  };
+}
 
 /**
  * Resolved adapter kind for the watcher. Distinct from env-intent: reflects the
@@ -463,6 +486,7 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
         releaseVerdictClaim: releaseVerdictClaimForMergeExecution,
         deferVerdictClaim: deferVerdictClaimForMergeExecution,
         getRunById: getOverseerWatchRunById,
+        listRunEvents: listRunEventsForOverseer,
         hasActiveRunForWo: (woId: string) => hasActiveRunForWo(woId, listActiveRunUserMessages),
         reserveMergeSlot: reserveOverseerMergeSlot,
         getEarliestMergeSlotReservation: getEarliestOverseerMergeSlotReservation,
