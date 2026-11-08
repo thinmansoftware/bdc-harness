@@ -437,6 +437,10 @@ async function resolveRunlessTarget(
     );
     return null;
   }
+  if (pr.lookupFailed) {
+    await skip('pr_context_fetch_failed', pr.htmlUrl);
+    return null;
+  }
   if (!pr.exists || pr.pr?.number !== ref.prNumber) {
     await skip('pr_context_unresolvable', pr.htmlUrl);
     return null;
