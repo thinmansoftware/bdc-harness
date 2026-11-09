@@ -304,10 +304,43 @@ describe('board authority db', () => {
     expect((await db.query('SELECT * FROM board_xo_leases WHERE id = 1')).rows).toEqual(
       leaseBefore.rows
     );
+    // Insertion order is the rowid. created_at has millisecond resolution and the two rows can share a
+    // millisecond; ordering the tie by the random uuid id made this test order-flaky.
     const events = await db.query<{ event_type: string }>(
-      'SELECT event_type FROM board_audit_events ORDER BY created_at, id'
+      'SELECT event_type FROM board_audit_events ORDER BY created_at, rowid'
     );
     expect(events.rows.map(row => row.event_type)).toEqual([
+      'xo_lease_acquired',
+      'xo_lease_acquire_rejected',
+    ]);
+  });
+
+  test('audit rows that share a millisecond read back in insertion order with the rowid tiebreak, not the random id', async () => {
+    // Reproduces the order flake deterministically: identical created_at, ids in REVERSE insertion order.
+    const at = '2026-11-09T17:00:00.000Z';
+    for (const [id, eventType] of [
+      ['zzzzzzzz-first', 'xo_lease_acquired'],
+      ['aaaaaaaa-second', 'xo_lease_acquire_rejected'],
+    ] as const) {
+      await db.query(
+        'INSERT INTO board_audit_events (id, event_type, created_at) VALUES ($1, $2, $3)',
+        [id, eventType, at]
+      );
+    }
+    const byId = await db.query<{ event_type: string }>(
+      'SELECT event_type FROM board_audit_events WHERE created_at = $1 ORDER BY created_at, id',
+      [at]
+    );
+    const byRowid = await db.query<{ event_type: string }>(
+      'SELECT event_type FROM board_audit_events WHERE created_at = $1 ORDER BY created_at, rowid',
+      [at]
+    );
+    // the id tiebreak misorders a same-millisecond pair; the rowid tiebreak is insertion order
+    expect(byId.rows.map(row => row.event_type)).toEqual([
+      'xo_lease_acquire_rejected',
+      'xo_lease_acquired',
+    ]);
+    expect(byRowid.rows.map(row => row.event_type)).toEqual([
       'xo_lease_acquired',
       'xo_lease_acquire_rejected',
     ]);
