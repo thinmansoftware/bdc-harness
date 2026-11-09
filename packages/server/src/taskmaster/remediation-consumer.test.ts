@@ -26,7 +26,9 @@ import {
   defaultListRemediationCandidates,
   defaultConsumeRemediationCandidate,
   tick,
+  type GithubIssueEvidence,
   type ListedThread,
+  type PullRequestState,
   type RemediationCandidate,
   type TaskmasterDeps,
 } from './loop';
@@ -1133,3 +1135,163 @@ function captureLogChunks(): { text: () => string; restore: () => void } {
     },
   };
 }
+
+describe('remediation_nudge grading reads the candidate PR, not the work-item thread', () => {
+  const HOUR = 3_600_000;
+  const REJECTED_HEAD = 'aaaaaaa1111';
+  const NEW_HEAD = 'bbbbbbb2222';
+  const iso = (ms: number): string => new Date(ms).toISOString();
+
+  /** Send the nudge on a real tick, then return deps wired to grade it. */
+  async function sentNudge(
+    getPullRequestState: NonNullable<TaskmasterDeps['getPullRequestState']>,
+    getGithubIssueEvidence: NonNullable<TaskmasterDeps['getGithubIssueEvidence']> = async () => null
+  ): Promise<{
+    world: FakeWorld;
+    row: TmJournalEntry;
+    grade: (atMs: number) => Promise<TmJournalEntry['grade']>;
+  }> {
+    const world = makeWorld();
+    world.candidates.push({ id: 'cand-1', consumed: false, body: candidateBody() });
+    const sendDeps = makeDeps(world, { listThreads: async () => [ownerThread()] });
+    const state = createTaskmasterState(60_000);
+    await tick(state, sendDeps);
+    const row = world.journal.find(j => j.action_type === 'remediation_nudge')!;
+    expect(row.outcome).toBe('sent');
+    expect(JSON.parse(row.proposal_json).remediationEvidence).toEqual({
+      owner: 'owner',
+      repo: 'repo',
+      prNumber: 5,
+      headSha: REJECTED_HEAD,
+    });
+    const gradeDeps = makeDeps(world, {
+      listThreads: async () => [ownerThread()],
+      findEffectByIdempotencyKey: async key =>
+        key === row.idempotency_key ? { id: 'eff-1', status: 'sent', createdAt: iso(T0) } : null,
+      getDispatchMessageById: (async () => ({
+        recipient: OWNER_RECIPIENT,
+        resolved_recipient: OWNER_RECIPIENT,
+        acknowledged_at: iso(T0 + 1_000),
+      })) as unknown as TaskmasterDeps['getDispatchMessageById'],
+      getPullRequestState,
+      getGithubIssueEvidence,
+    });
+    return {
+      world,
+      row,
+      grade: async (atMs: number) => {
+        world.nowMs = atMs;
+        await tick(state, gradeDeps);
+        return row.grade;
+      },
+    };
+  }
+
+  const unchangedPr = async (): Promise<PullRequestState> => ({
+    state: 'open',
+    headSha: REJECTED_HEAD,
+    headCommittedAt: null,
+    closedAt: null,
+    merged: false,
+  });
+
+  test('(a) a new head pushed to the candidate PR after the nudge grades useful', async () => {
+    const calls: unknown[][] = [];
+    const { grade } = await sentNudge(async (...args) => {
+      calls.push(args);
+      return {
+        state: 'open',
+        headSha: NEW_HEAD,
+        headCommittedAt: iso(T0 + HOUR),
+        closedAt: null,
+        merged: false,
+      };
+    });
+    expect(await grade(T0 + 2 * HOUR)).toBe('useful');
+    expect(calls[0]).toEqual(['owner', 'repo', 5, REJECTED_HEAD]);
+  });
+
+  test('(b) the candidate PR closed or merged after the nudge grades useful', async () => {
+    const { grade } = await sentNudge(async () => ({
+      state: 'closed',
+      headSha: REJECTED_HEAD,
+      headCommittedAt: null,
+      closedAt: iso(T0 + HOUR),
+      merged: true,
+    }));
+    expect(await grade(T0 + 2 * HOUR)).toBe('useful');
+  });
+
+  test('(c) deadline expiry with no new head and no closure grades noise', async () => {
+    const { grade } = await sentNudge(unchangedPr);
+    expect(await grade(T0 + 2 * HOUR)).toBeNull();
+    // The proof deadline is created_at + 24h; grading runs while the row is in the 24h window.
+    expect(await grade(T0 + 24 * HOUR)).toBe('noise');
+  });
+
+  test('(d) unrelated work-item activity with the PR unchanged is not useful', async () => {
+    const activity = async (): Promise<GithubIssueEvidence> => ({
+      state: 'closed',
+      updatedAt: iso(T0 + HOUR),
+      labels: ['wo', 'status:building'],
+      assigneeCount: 1,
+      closedAt: iso(T0 + HOUR),
+      assignedAt: iso(T0 + HOUR),
+      activeStatusAt: iso(T0 + HOUR),
+      progressRecordedAt: iso(T0 + HOUR),
+      ownerLogin: 'major-build',
+      latestMarkerKind: 'PROGRESS',
+      latestMarkerText: '[PROGRESS] working',
+      latestMarkerAt: iso(T0 + HOUR),
+      lastMovementAt: iso(T0 + HOUR),
+      lastMovementKind: 'closed',
+    });
+    const { grade } = await sentNudge(unchangedPr, activity);
+    expect(await grade(T0 + 2 * HOUR)).toBeNull();
+    expect(await grade(T0 + 24 * HOUR)).toBe('noise');
+  });
+
+  test('(e) a PR read failure is not useful before the deadline', async () => {
+    const { grade } = await sentNudge(async () => {
+      throw new Error('taskmaster_github_pull_evidence_read_failed:502');
+    });
+    expect(await grade(T0 + 2 * HOUR)).toBeNull();
+    // A null read is likewise unproven, never useful.
+    const nullRead = await sentNudge(async () => null);
+    expect(await nullRead.grade(T0 + 2 * HOUR)).toBeNull();
+  });
+
+  test('(f) a head with no usable date seen only after the deadline is not useful; a dated in-window head is', async () => {
+    const undated = await sentNudge(async () => ({
+      state: 'open',
+      headSha: NEW_HEAD,
+      headCommittedAt: null,
+      closedAt: null,
+      merged: false,
+    }));
+    // Shorten the recorded deadline to T0+3h so grading at T0+5h is after it while
+    // the row is still inside the loop's 24h grading window.
+    undated.row.proof_deadline_at = iso(T0 + 3 * HOUR);
+    expect(await undated.grade(T0 + 5 * HOUR)).toBe('noise');
+    const dated = await sentNudge(async () => ({
+      state: 'open',
+      headSha: NEW_HEAD,
+      headCommittedAt: iso(T0 + 2 * HOUR),
+      closedAt: null,
+      merged: false,
+    }));
+    dated.row.proof_deadline_at = iso(T0 + 3 * HOUR);
+    expect(await dated.grade(T0 + 5 * HOUR)).toBe('useful');
+  });
+
+  test('(g) a PR closed before the nudge was sent does not count', async () => {
+    const { grade } = await sentNudge(async () => ({
+      state: 'closed',
+      headSha: REJECTED_HEAD,
+      headCommittedAt: null,
+      closedAt: iso(T0 - HOUR),
+      merged: false,
+    }));
+    expect(await grade(T0 + 2 * HOUR)).toBeNull();
+  });
+});

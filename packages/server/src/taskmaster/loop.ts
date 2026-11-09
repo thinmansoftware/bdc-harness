@@ -47,6 +47,7 @@ import {
   isSuppressedByNoise,
   MAX_INTERVENTIONS_PER_ITEM_24H,
   type ActionProposal,
+  type RemediationEvidence,
   type ThreadSnapshot,
   type ThreadPriority,
   type TmActionType,
@@ -225,6 +226,20 @@ export interface GithubIssueEvidence {
   lastMovementKind: 'closed' | 'assigned' | 'status_label' | 'progress_comment' | null;
 }
 
+/**
+ * Read-only state of one pull request, the evidence for grading a
+ * remediation_nudge. `headSha` is the PR's current head; `headCommittedAt` is the
+ * committer date of that head when it differs from the rejected head (null when
+ * unknown); `closedAt` is the close or merge time (null while the PR is open).
+ */
+export interface PullRequestState {
+  state: 'open' | 'closed';
+  headSha: string;
+  headCommittedAt: string | null;
+  closedAt: string | null;
+  merged: boolean;
+}
+
 export interface TaskmasterDeps {
   /** Test seam; injected journal DALs never fall through into the live budget DB. */
   fireBudget?: Pick<
@@ -278,6 +293,17 @@ export interface TaskmasterDeps {
     threadRef: string,
     sinceIso: string
   ) => Promise<GithubIssueEvidence | null>;
+  /**
+   * Read the candidate PR a remediation_nudge was about (grading only).
+   * `rejectedHeadSha` is the head recorded at nudge time; the committer date is
+   * looked up only when the current head differs from it.
+   */
+  getPullRequestState?: (
+    owner: string,
+    repo: string,
+    prNumber: number,
+    rejectedHeadSha: string
+  ) => Promise<PullRequestState | null>;
   checkFireEligibility?: (issueTitle: string) => Promise<FireEligibilityResult>;
   runCascade?: typeof runCascade;
   readFireCascadeEvidence?: typeof readCascadeWorkflowEvidence;
@@ -1076,6 +1102,68 @@ export async function defaultGetGithubIssueEvidence(
   };
 }
 
+const GH_SLUG_RE = /^[A-Za-z0-9_.-]+$/;
+
+interface GithubPullDetail {
+  state: 'open' | 'closed';
+  merged?: boolean;
+  merged_at?: string | null;
+  closed_at?: string | null;
+  head?: { sha?: string };
+}
+
+/**
+ * Default PR read for remediation grading: GET the pull request, and only when
+ * its head differs from the rejected head, GET that commit for its committer
+ * date. Read-only; uses the same service GitHub path as the issue evidence.
+ */
+export async function defaultGetPullRequestState(
+  owner: string,
+  repo: string,
+  prNumber: number,
+  rejectedHeadSha: string,
+  fetchImpl: typeof fetch = fetch
+): Promise<PullRequestState | null> {
+  if (!GH_SLUG_RE.test(owner) || !GH_SLUG_RE.test(repo) || !Number.isInteger(prNumber)) {
+    return null;
+  }
+  const pullResponse = await serviceGitHubFetchWithPermissionFallback({
+    service: 'taskmaster',
+    fetch: fetchImpl,
+    url: `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`,
+  });
+  assertGithubRateLimit(pullResponse, `evidence:pull:${owner}/${repo}#${prNumber}`);
+  if (!pullResponse.ok) {
+    throw new Error(`taskmaster_github_pull_evidence_read_failed:${pullResponse.status}`);
+  }
+  const pull = (await pullResponse.json()) as GithubPullDetail;
+  const headSha = pull.head?.sha;
+  if (typeof headSha !== 'string' || !headSha) return null;
+  let headCommittedAt: string | null = null;
+  if (headSha !== rejectedHeadSha && /^[0-9a-f]{7,64}$/i.test(headSha)) {
+    const commitResponse = await serviceGitHubFetchWithPermissionFallback({
+      service: 'taskmaster',
+      fetch: fetchImpl,
+      url: `https://api.github.com/repos/${owner}/${repo}/commits/${headSha}`,
+    });
+    assertGithubRateLimit(commitResponse, `evidence:commit:${owner}/${repo}#${prNumber}`);
+    if (commitResponse.ok) {
+      const commit = (await commitResponse.json()) as {
+        commit?: { committer?: { date?: string } };
+      };
+      headCommittedAt = commit.commit?.committer?.date ?? null;
+    }
+  }
+  const merged = pull.merged === true || Boolean(pull.merged_at);
+  return {
+    state: pull.state,
+    headSha,
+    headCommittedAt,
+    closedAt: pull.state === 'closed' ? (pull.merged_at ?? pull.closed_at ?? null) : null,
+    merged,
+  };
+}
+
 const RESET_COMMAND = "bash scripts/taskmaster/reset.sh --confirm --reason '<why>'";
 
 /** Taskmaster thread of the self-pause notice; mapped to a valid subject key at send. */
@@ -1548,7 +1636,8 @@ async function gradeSentActions(
   nowMs: number,
   getFireRunEvidence: NonNullable<TaskmasterDeps['getFireRunEvidence']>,
   assessRecipient: NonNullable<TaskmasterDeps['assessDispatchRecipient']>,
-  cutoverAt: string | null
+  cutoverAt: string | null,
+  getPullRequestState: NonNullable<TaskmasterDeps['getPullRequestState']>
 ): Promise<number> {
   let failures = 0;
   for (const action of actions) {
@@ -1661,6 +1750,44 @@ async function gradeSentActions(
         ) {
           usefulAtMs = addressedAtMs;
         }
+      } else if (action.action_type === 'remediation_nudge') {
+        // Candidate-specific evidence ONLY: the PR the nudge was about. Activity
+        // on the owner's work-item thread (comments, labels, assignment, issue
+        // close) is never proof that the rejected PR was fixed.
+        const evidence = (JSON.parse(action.proposal_json) as ActionProposal).remediationEvidence;
+        if (evidence && isRemediationEvidence(evidence)) {
+          let pr: PullRequestState | null = null;
+          try {
+            pr = await getPullRequestState(
+              evidence.owner,
+              evidence.repo,
+              evidence.prNumber,
+              evidence.headSha
+            );
+          } catch (error) {
+            // Rate-limit backoff aborts the whole grading pass (outer catch). Any
+            // other read failure is "not yet proven": never useful, and noise only
+            // once the deadline passes (the shared tail below).
+            if (error instanceof GithubRateLimitBackoffError) throw error;
+            failures += 1;
+            log.warn(
+              { err: error as Error, journalId: action.id },
+              'taskmaster.remediation_pr_evidence_read_failed'
+            );
+          }
+          if (pr) {
+            const closedAtMs = pr.closedAt ? Date.parse(pr.closedAt) : NaN;
+            const committedAtMs = pr.headCommittedAt ? Date.parse(pr.headCommittedAt) : NaN;
+            if (pr.state === 'closed' && Number.isFinite(closedAtMs) && closedAtMs >= sentAtMs) {
+              usefulAtMs = closedAtMs;
+            } else if (pr.headSha !== evidence.headSha) {
+              // A new head: dated by its commit when that falls after the send,
+              // else by this observation (an old commit pushed after the nudge).
+              usefulAtMs =
+                Number.isFinite(committedAtMs) && committedAtMs >= sentAtMs ? committedAtMs : nowMs;
+            }
+          }
+        }
       } else {
         const issue = await getIssueEvidence(action.thread_ref, effect.createdAt);
         if (issue) {
@@ -1706,6 +1833,16 @@ async function gradeSentActions(
     }
   }
   return failures;
+}
+
+function isRemediationEvidence(value: RemediationEvidence): boolean {
+  return (
+    typeof value.owner === 'string' &&
+    typeof value.repo === 'string' &&
+    Number.isInteger(value.prNumber) &&
+    typeof value.headSha === 'string' &&
+    value.headSha.length > 0
+  );
 }
 
 function proofPredicate(proposal: ActionProposal): string {
@@ -1942,6 +2079,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   const getDispatchById = deps.getDispatchMessageById ?? getMessage;
   const assessRecipient = deps.assessDispatchRecipient ?? assessDispatchRecipient;
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
+  const getPullRequestState = deps.getPullRequestState ?? defaultGetPullRequestState;
   const eligibilityCheck = deps.checkFireEligibility ?? checkFireEligibility;
   const executeCascade = deps.runCascade ?? runCascade;
   const readFireEvidence = deps.readFireCascadeEvidence ?? readCascadeWorkflowEvidence;
@@ -2130,7 +2268,8 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     nowMs,
     getFireRunEvidence,
     assessRecipient,
-    cutoverAt
+    cutoverAt,
+    getPullRequestState
   );
 
   // M-155 Q3: useful-rate floor with auto-PAUSE. Counted AFTER

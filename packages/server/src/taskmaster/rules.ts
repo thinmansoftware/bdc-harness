@@ -92,6 +92,21 @@ export interface ActionProposal {
    * not re-read on a later tick.
    */
   remediationCandidateId?: string;
+  /**
+   * The candidate PR a remediation_nudge is about, and the head the reviewer
+   * rejected (the head at nudge time). Journaled in proposal_json so grading can
+   * read THIS PR and compare its head; unrelated activity on the work-item
+   * thread is never proof. remediation_nudge only.
+   */
+  remediationEvidence?: RemediationEvidence;
+}
+
+export interface RemediationEvidence {
+  owner: string;
+  repo: string;
+  prNumber: number;
+  /** Head sha recorded at nudge time (the head the reviewer rejected). */
+  headSha: string;
 }
 
 const MINUTE_MS = 60_000;
@@ -707,5 +722,11 @@ export function computeRemediationNudge(
       `${candidate.maxAttempts}.\n\nReviewer verdict:\n${verdict}`,
     idempotencyKey,
     actsImmediately: true,
+    remediationEvidence: {
+      owner: candidate.owner,
+      repo: candidate.repo,
+      prNumber: candidate.prNumber,
+      headSha: candidate.headSha,
+    },
   };
 }
