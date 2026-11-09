@@ -123,7 +123,16 @@ export async function checkFireEligibility(
 
   const codebases = await (deps.codebases ?? listCodebases)();
   const repoKey = normalizeRepo(targetRepo);
-  const codebase = codebases.find(cb => normalizeRepo(cb.repository_url ?? cb.name) === repoKey);
+  // repository_url (else name) first, unchanged. Fallback: a codebase whose
+  // owner/repo NAME equals target_repo, used only when unique -- rows registered
+  // before the 2026-06-29 owner move keep a stale bluedevilcollectibles URL
+  // (bdc-xo#4311). A bare name never matches; ambiguity fails closed.
+  const nameMatches = codebases.filter(
+    cb => cb.name.includes('/') && normalizeRepo(cb.name) === repoKey
+  );
+  const codebase =
+    codebases.find(cb => normalizeRepo(cb.repository_url ?? cb.name) === repoKey) ??
+    (nameMatches.length === 1 ? nameMatches[0] : undefined);
   if (!codebase) return { eligible: false, reason: 'project_not_registered' };
   const project = codebase.name.includes('/') ? codebase.name.split('/').at(-1) : codebase.name;
   if (!project) return { eligible: false, reason: 'project_not_registered' };
