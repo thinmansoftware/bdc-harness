@@ -5,7 +5,7 @@
 name: e2e-claude-smoke
 description: "Smoke test for Claude provider. Verifies prompt response."
 provider: claude
-model: haiku
+model: claude-haiku-5-5
 
 nodes:
   # 1. Simple prompt -- verifies Claude API connectivity via sendQuery

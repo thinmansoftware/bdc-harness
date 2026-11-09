@@ -135,7 +135,7 @@ nodes:
     persona: war-council-architect
     agent: war-council-architect
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     depends_on: [read-spec]
     task_class: clerical
     prompt: |
@@ -192,7 +192,7 @@ nodes:
     depends_on: [gate-already-satisfied]
     agent: war-council-architect
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     task_class: medium_work
     prompt: |
       Read the BDC Work Order spec below and produce a concise implementation plan.
@@ -238,7 +238,7 @@ nodes:
     persona: war-council-architect
     agent: war-council-architect
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     depends_on: [plan]
     task_class: medium_work
     loop:
@@ -705,7 +705,7 @@ nodes:
     # Pin to claude/sonnet: trusted judge always Claude, never GLM.
     # WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     persona: captain-ci-validator
     depends_on: [ascii-gate]
     task_class: medium_work
@@ -829,7 +829,7 @@ nodes:
 
   - id: diff-repair
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     depends_on: [diff-review, classify-diff-review]
     when: "$classify-diff-review.output.verdict == 'needs_revision'"
     task_class: medium_work
@@ -1052,7 +1052,7 @@ nodes:
   # resolve the block, then signals. If it can't fix, the run proceeds to the human pause.
   - id: opus-repair
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     depends_on: [block-classify]
     when: "$block-classify.output.status == 'BLOCKED'"
     prompt: |
@@ -1248,7 +1248,7 @@ nodes:
     # this node inherits the lane default (glm/OpenRouter) and the alias ships as
     # z-ai/sonnet -> 400. Mirror of PR #313's codex-lane fix. Anchor: run 7371997d.
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     depends_on: [block-reclassify]
     trigger_rule: all_done
     task_class: clerical
@@ -1422,7 +1422,7 @@ nodes:
     # Provider pin: persona major-build declares opus[1m]; lane default (glm)
     # would ship it as z-ai/opus[1m] -> 400. Mirror of PR #313. Anchor: 7371997d.
     provider: claude
-    model: opus[1m]
+    model: claude-opus-5-5[1m]
     depends_on: [pause-gate, classify-apply-review]
     trigger_rule: all_done
     when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
@@ -1862,7 +1862,7 @@ nodes:
     persona: major-build
     # Provider pin -- see decide-push-target. Mirror of PR #313. Anchor: 7371997d.
     provider: claude
-    model: opus[1m]
+    model: claude-opus-5-5[1m]
     depends_on: [open-pr-if-needed, block-reclassify, pause-gate]
     trigger_rule: all_done
     task_class: clerical

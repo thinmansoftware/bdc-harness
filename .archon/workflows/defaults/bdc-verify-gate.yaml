@@ -29,7 +29,7 @@ description: |
 # the archon container env file (shopops-storefront-vercel service token values).
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 target_repo: thinmansoftware/bdc-xo
 
 inputs:

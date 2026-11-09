@@ -13,7 +13,7 @@ description: |
 
 policyFile: harness/policies/agent-behavior.md
 provider: claude
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
   - id: read-spec
@@ -136,7 +136,7 @@ nodes:
   - id: implement
     depends_on: [plan]
     task_class: medium_work
-    model: opus[1m]
+    model: claude-opus-5-5[1m]
     loop:
       prompt: |
         Implement the approved plan for WO-STOREFRONT-PULL-LIST-V2-INTAKE-01.

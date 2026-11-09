@@ -5,7 +5,7 @@ description: "Tests Claude and Codex providers in the same workflow with cross-p
 
 # Default provider is claude
 provider: claude
-model: haiku
+model: claude-haiku-5-5
 
 nodes:
   # 1. Claude node -- default provider

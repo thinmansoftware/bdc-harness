@@ -704,7 +704,7 @@ describe('CodexProvider', () => {
       });
 
       for await (const _ of client.sendQuery('test prompt', '/workspace', undefined, {
-        model: 'gpt-5.2-codex',
+        model: 'gpt-6.1-sol',
         assistantConfig: {
           modelReasoningEffort: 'medium',
           webSearchMode: 'live',
@@ -716,7 +716,7 @@ describe('CodexProvider', () => {
 
       expect(mockStartThread).toHaveBeenCalledWith(
         expect.objectContaining({
-          model: 'gpt-5.2-codex',
+          model: 'gpt-6.1-sol',
           modelReasoningEffort: 'medium',
           webSearchMode: 'live',
           additionalDirectories: ['/other/repo'],
@@ -761,7 +761,7 @@ describe('CodexProvider', () => {
     });
 
     test('F1 SDK boundary: a genuine codex model is forwarded to the SDK', async () => {
-      // Codex-native models (gpt-5.2-codex, gpt-5.3-codex, o3, etc.) MUST be
+      // Supported Codex-native models (gpt-6.1-sol, gpt-6.1-terra, etc.) MUST be
       // forwarded so explicit account-level model overrides work.
       mockRunStreamed.mockResolvedValue({
         events: (async function* () {
@@ -770,12 +770,12 @@ describe('CodexProvider', () => {
       });
       mockStartThread.mockClear();
       for await (const _ of client.sendQuery('test', '/workspace', undefined, {
-        model: 'gpt-5.2-codex',
+        model: 'gpt-6.1-sol',
       })) {
         // consume
       }
       const callArg = mockStartThread.mock.calls[0]?.[0] as Record<string, unknown>;
-      expect(callArg).toHaveProperty('model', 'gpt-5.2-codex');
+      expect(callArg).toHaveProperty('model', 'gpt-6.1-sol');
     });
 
     test('F1 SDK boundary: Anthropic alias in assistantConfig.model is also dropped', async () => {
@@ -1307,10 +1307,10 @@ describe('CodexProvider', () => {
         'Model "gpt-5.3-codex" is not available for your account'
       );
       // PR #165 repointed CODEX_MODEL_FALLBACKS['gpt-5.3-codex'] to
-      // CODEX_DEFAULT_MODEL ('gpt-5.6-sol'); this assertion was stale and failed
+      // CODEX_FALLBACK_MODEL ('gpt-6.1-sol'); this assertion was stale and failed
       // against live code -- re-aligned by
       // WO-HARNESS-CODEX-THREAD-RESUME-AND-FAILBACK-01 (test file is in scope).
-      await expect(consumeGenerator()).rejects.toThrow('model: gpt-5.6-sol');
+      await expect(consumeGenerator()).rejects.toThrow('model: gpt-6.1-sol');
     });
 
     test('uses generic dashboard guidance when fallback mapping is unknown', async () => {
@@ -2598,13 +2598,13 @@ describe('CodexProvider capacity failover', () => {
       chunks.push(chunk);
     }
 
-    expect(mockStartThread.mock.calls[0]?.[0]?.model).toBe('gpt-5.6-sol');
+    expect(mockStartThread.mock.calls[0]?.[0]?.model).toBe('gpt-6.1-sol');
     expect(chunks.filter(chunk => chunk.type === 'provider_route')).toEqual([
       {
         type: 'provider_route',
         route: 'failover',
         fromProvider: 'codex',
-        fromModel: 'gpt-5.6-sol',
+        fromModel: 'gpt-6.1-sol',
         toProvider: 'codex',
         toModel: 'gpt-5.6-terra',
         reasonCode: 'provider_model_capacity',

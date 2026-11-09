@@ -7,7 +7,7 @@ description: |
   ADVISORY ONLY: no auto-switching, no auto-compact, no external logging.
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 inputs:
   wo_id:

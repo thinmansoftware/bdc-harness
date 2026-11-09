@@ -1,6 +1,6 @@
 ---
 name: major-build
-model: opus[1m]
+model: claude-opus-5-5[1m]
 description: Code execution builder. Writes code, runs tests, fixes problems. Full toolset.
 ---
 

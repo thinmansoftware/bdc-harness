@@ -25,7 +25,7 @@ description: |
   parallel_ok: false.  # shopops-api routes: serialize to prevent merge conflicts
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 inputs:
   WO_ID:

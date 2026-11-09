@@ -1,0 +1,16 @@
+export const MODEL_ALLOWLIST: ReadonlySet<string> = new Set([
+  'gpt-6.1-sol',
+  'gpt-6.1-terra',
+  'gpt-6-astra',
+  'claude-opus-5-5',
+  'claude-opus-5-5[1m]',
+  'claude-sonnet-5-5',
+  'claude-sonnet-5-5[1m]',
+  'claude-haiku-5-5',
+  'claude-fable-5',
+  'grok-4.7-high',
+  'deepseek/deepseek-v4-pro-0813',
+  'moonshotai/kimi-k2.7-code',
+  'moonshotai/kimi-k3.1-pro',
+  'qwen/qwen3-coder-next',
+]);

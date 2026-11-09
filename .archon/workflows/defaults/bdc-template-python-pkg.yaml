@@ -5,7 +5,7 @@
 #        Deploy via: bash BDC_XO/scripts/archon-bridge/sync-workflows.sh <filename>
 #
 # 13 Hard Rules compliance (2026-05-22):
-#   Rule 1: model: sonnet
+#   Rule 1: model: claude-sonnet-5-5
 #   Rule 2: $WORKFLOW_ID not used inside bash (use date +%s for uniqueness)
 #   Rule 3: implement loop has fresh_context: true
 #   Rule 4: all paths relative to repo root
@@ -38,7 +38,7 @@ description: |
   parallel_ok: true.
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 inputs:
   WO_ID:

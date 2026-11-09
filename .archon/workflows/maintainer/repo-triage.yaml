@@ -19,7 +19,7 @@ nodes:
   # Issue triage -- runs concurrently with pr-link (no depends_on between them).
   # ---------------------------------------------------------------------------
   - id: triage-issues
-    model: sonnet
+    model: claude-sonnet-5-5
     allowed_tools: [Bash, Read, Write, Task]
     agents:
       brief-gen:
@@ -27,7 +27,7 @@ nodes:
           Reads a single GitHub issue and returns a concise JSON brief,
           plus a template-adherence check if the caller provided template
           context. Used for duplicate detection + template-fill reporting.
-        model: haiku
+        model: claude-haiku-5-5
         tools: [Bash, Read]
         prompt: |
           You are a concise GitHub issue summariser. The caller's prompt
@@ -321,14 +321,14 @@ nodes:
   # ---------------------------------------------------------------------------
   - id: closed-dedup-check
     depends_on: [triage-issues]
-    model: sonnet
+    model: claude-sonnet-5-5
     allowed_tools: [Bash, Read, Write, Task]
     agents:
       closed-brief-gen:
         description: >-
           Reads a single recently-CLOSED GitHub issue and returns a JSON
           brief including close reason and any closing PR reference.
-        model: haiku
+        model: claude-haiku-5-5
         tools: [Bash, Read]
         prompt: |
           You are a concise summariser for CLOSED GitHub issues. You will
@@ -567,14 +567,14 @@ nodes:
   # other top-level nodes.
   # ---------------------------------------------------------------------------
   - id: closed-pr-dedup-check
-    model: sonnet
+    model: claude-sonnet-5-5
     allowed_tools: [Bash, Read, Write, Task]
     agents:
       pr-brief-gen:
         description: >-
           Reads a single PR (open OR closed) and returns a compact JSON
           brief suitable for cross-comparison.
-        model: haiku
+        model: claude-haiku-5-5
         tools: [Bash, Read]
         prompt: |
           You summarise a single GitHub PR. You will be given a PR number
@@ -778,7 +778,7 @@ nodes:
   # PR  issue linker -- runs concurrently with triage-issues.
   # ---------------------------------------------------------------------------
   - id: link-prs
-    model: sonnet
+    model: claude-sonnet-5-5
     allowed_tools: [Bash, Read, Write, Task]
     agents:
       pr-issue-matcher:
@@ -787,7 +787,7 @@ nodes:
           issues, returns related-issue matches AND a template-adherence
           check if the caller provided the PR template. Conservative --
           prefers "related" over "fully-addresses" when in doubt.
-        model: haiku
+        model: claude-haiku-5-5
         tools: [Bash, Read]
         prompt: |
           You match a single GitHub PR to the open issues it touches AND
@@ -1153,7 +1153,7 @@ nodes:
   # nudge each item once per quiet period.
   # ---------------------------------------------------------------------------
   - id: stale-nudge
-    model: sonnet
+    model: claude-sonnet-5-5
     allowed_tools: [Bash, Read, Write]
     prompt: |
       You post gentle reminders on GitHub issues and PRs that have gone
@@ -1291,7 +1291,7 @@ nodes:
       - closed-dedup-check
       - closed-pr-dedup-check
       - stale-nudge
-    model: sonnet
+    model: claude-sonnet-5-5
     allowed_tools: [Bash, Read, Write]
     prompt: |
       You synthesise the outputs of all prior nodes in this run into one

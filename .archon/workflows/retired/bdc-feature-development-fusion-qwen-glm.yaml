@@ -658,7 +658,7 @@ nodes:
     # Pin to claude/sonnet: trusted judge always Claude; top-level model: gpt-5.5
     # must not route the validator to Codex. WO-HARNESS-SMART-CAULDRON-LANE-ROSTER-AND-RESILIENCE-01.
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     persona: captain-ci-validator
     depends_on: [ascii-gate]
     task_class: medium_work
@@ -1322,7 +1322,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     agent: claude-adversarial-reviewer
     depends_on: [apply-suggested-fix]
     trigger_rule: all_done

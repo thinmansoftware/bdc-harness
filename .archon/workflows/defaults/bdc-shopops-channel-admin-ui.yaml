@@ -29,7 +29,7 @@ description: |
   NOT for: any other WO.
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
   - id: read-spec

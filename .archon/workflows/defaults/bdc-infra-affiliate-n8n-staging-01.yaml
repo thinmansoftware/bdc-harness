@@ -26,7 +26,7 @@ description: |
   schema (Child 2), or any workflow business-logic change (Child 3/5).
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 inputs:
   WO_ID:
@@ -306,7 +306,7 @@ nodes:
 
   - id: war-council-validator
     provider: claude
-    model: sonnet
+    model: claude-sonnet-5-5
     persona: captain-ci-validator
     depends_on: [implement]
     task_class: medium_work

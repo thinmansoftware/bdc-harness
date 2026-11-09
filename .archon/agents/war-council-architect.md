@@ -1,6 +1,6 @@
 ---
 name: war-council-architect
-model: sonnet
+model: claude-sonnet-5-5
 tools: [Read, Grep, Glob, WebFetch]
 description: Plans implementation from spec + prior art. Suggests, does not execute.
 ---

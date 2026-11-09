@@ -33,7 +33,7 @@ description: |
   Polish bar: HIGH (warehouse staff use daily).
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 nodes:
 

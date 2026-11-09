@@ -1,6 +1,6 @@
 ---
 name: claude-doctrine-reviewer
-model: opus
+model: claude-opus-5-5
 tools: [Read, Grep, Glob]
 description: Doctrine and architecture adversarial reviewer. Read-only. Validates against BDC rules and patterns.
 ---

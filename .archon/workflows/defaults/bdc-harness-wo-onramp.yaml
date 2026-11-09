@@ -16,7 +16,7 @@ description: |
   parallel_ok: false
 
 policyFile: harness/policies/agent-behavior.md
-model: sonnet
+model: claude-sonnet-5-5
 
 interactive: true
 
@@ -274,8 +274,8 @@ nodes:
           ERRORS=$((ERRORS+1))
         fi
 
-        # Rule 1: model: sonnet at root
-        grep -Eq '^model:[[:space:]]*sonnet$' "$DRAFT" || { echo "FAIL Rule 1: missing 'model: sonnet' at root" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
+        # Rule 1: model: claude-sonnet-5-5 at root
+        grep -Eq '^model:[[:space:]]*sonnet$' "$DRAFT" || { echo "FAIL Rule 1: missing 'model: claude-sonnet-5-5' at root" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
 
         # Rule 6: policyFile at root
         grep -Eq '^policyFile:[[:space:]]*harness/policies/agent-behavior\.md$' "$DRAFT" || { echo "FAIL Rule 6: missing 'policyFile: harness/policies/agent-behavior.md' at root" >> "$FEEDBACK"; ERRORS=$((ERRORS+1)); }
@@ -469,7 +469,7 @@ nodes:
            replace underscores with hyphens. Write to <slug>.yaml.draft in CWD.
 
         ## Hard rules the child YAML MUST satisfy (validated by until_bash after you finish)
-        - model: sonnet at root (a real model string -- the structural gate checks root model:)
+        - model: claude-sonnet-5-5 at root (a real model string -- the structural gate checks root model:)
         - policyFile: harness/policies/agent-behavior.md at root
         - every loop: has prompt + until + max_iterations + fresh_context
         - paths repo-root-relative (no BDC_XO/ prefix)
