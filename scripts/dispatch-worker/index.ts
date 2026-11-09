@@ -982,8 +982,10 @@ async function main(): Promise<void> {
   await register(config, token);
   await log.info('registered with drop-box server');
   // WO-HARNESS-DISPATCH-WORKER-STALE-LOCK-01 (2026-11-09 amendment): a worker
-  // that cannot reach the server for CONNECT_FAILURE_EXIT_MS, with nothing
-  // executing, exits so the launcher supervisor or watchdog restarts it.
+  // with no SUCCESSFUL (2xx) poll or heartbeat for CONNECT_FAILURE_EXIT_MS, and
+  // nothing executing, exits so the launcher supervisor or watchdog restarts
+  // it. Both "no connection" and an HTTP error status count as failure; only a
+  // 2xx resets the clock (see connect-failure-clock.ts for the contract).
   const clock = createConnectFailureClock({
     now: Date.now,
     exitAfterMs: CONNECT_FAILURE_EXIT_MS,

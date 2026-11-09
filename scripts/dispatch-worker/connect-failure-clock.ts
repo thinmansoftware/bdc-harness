@@ -1,39 +1,63 @@
 /**
- * Sustained connect-failure clock for the dispatch worker.
+ * Sustained contact-failure clock for the dispatch worker.
  *
  * WO-HARNESS-DISPATCH-WORKER-STALE-LOCK-01, 2026-11-09 amendment. Incident: a
  * worker process stayed alive for days with its SSH tunnel gone and no
  * launcher, catching and logging every poll and heartbeat failure forever.
- * A worker that exits after sustained connect failure becomes the dead-PID
- * case the watchdog and launcher supervisor already recover.
+ * A worker that exits after sustained failure becomes the dead-PID case the
+ * watchdog and launcher supervisor already recover.
+ *
+ * CONTRACT (reachability is not health):
+ * - The clock measures time since the last SUCCESSFUL poll or heartbeat, that
+ *   is, a request that returned a 2xx response. Only a success resets it.
+ * - A request that never produced an HTTP status (connection refused, tunnel
+ *   gone, DNS, timeout) and a request that produced an HTTP error status
+ *   (401, 403, 5xx, anything non-2xx) are BOTH failures. Neither resets the
+ *   clock, so a mix of the two cannot extend the window.
+ * - Why an HTTP error must not count as alive: the worker reads its operator
+ *   token once at startup, so a rotated or wrong token answers 403 forever and
+ *   only a restart can fix it. A server that answers 5xx forever is also not
+ *   serving this worker; restarting is cheap and the server-side heartbeat
+ *   alarm already reports it.
+ * - What keeps the worker alive: a 2xx poll or heartbeat at least once per
+ *   window, an active agent execution (never interrupted), or a stop signal.
+ * - Known limit, deliberate: a 2xx heartbeat resets the clock even while every
+ *   poll fails. A worker whose poll route is broken while its heartbeat route
+ *   works is the poll-progress class that M-186 follow-through and the
+ *   server-side canary own; this clock does not claim to detect it.
+ *
+ * The constant keeps its name from the merged spec; it now bounds any failure
+ * to get a 2xx, not only connect failures.
  *
  * Pure module: the time source and every side effect are injected so the
  * behavior is testable without a network, a lock file or index.ts.
  */
 
-/** Exit after this long with no reachable server and no active execution. */
+/** Exit after this long without a successful poll or heartbeat and with no active execution. */
 export const CONNECT_FAILURE_EXIT_MS = 600_000;
 
 /**
  * requestJson in index.ts turns any HTTP error status into
  * Error('HTTP <status> <path>: <text>'). An error with that shape means the
- * server answered, so it is not a connect failure. Anything else thrown by a
- * request (for example fetch's "Unable to connect") never produced a status.
+ * server answered with a non-2xx status. Anything else thrown by a request
+ * (for example fetch's "Unable to connect") never produced a status.
  */
 export function isHttpStatusError(error: unknown): boolean {
   return error instanceof Error && /^HTTP \d{3} /.test(error.message);
 }
 
+/** What the most recent failed request looked like. 'none' means no failure since the last success. */
+export type FailureKind = 'none' | 'no_http_status' | 'http_status';
+
 export interface ConnectFailureClock {
-  /** A poll or a heartbeat succeeded: the server is reachable. */
+  /** A poll or a heartbeat succeeded (2xx): the only event that resets the clock. */
   recordSuccess(): void;
-  /**
-   * A request failed. A connect failure leaves the clock running. An HTTP
-   * status error means the server answered, so it resets the clock instead.
-   */
+  /** A request failed, with or without an HTTP status. The clock keeps running. */
   recordFailure(error: unknown): void;
-  /** Milliseconds since the server was last reachable (0 right after a reset). */
+  /** Milliseconds since the last success (or since the clock started). */
   failingForMs(): number;
+  /** Kind of the latest failure since the last success, for the exit log line. */
+  lastFailureKind(): FailureKind;
   /** True once the window has passed and no agent execution is active. */
   shouldExit(activeExecutions: number): boolean;
 }
@@ -43,23 +67,26 @@ export function createConnectFailureClock(options: {
   exitAfterMs?: number;
 }): ConnectFailureClock {
   const exitAfterMs = options.exitAfterMs ?? CONNECT_FAILURE_EXIT_MS;
-  let lastReachableAt = options.now();
-  const failingForMs = (): number => Math.max(0, options.now() - lastReachableAt);
+  let lastSuccessAt = options.now();
+  let lastKind: FailureKind = 'none';
+  const failingForMs = (): number => Math.max(0, options.now() - lastSuccessAt);
   return {
     recordSuccess(): void {
-      lastReachableAt = options.now();
+      lastSuccessAt = options.now();
+      lastKind = 'none';
     },
     recordFailure(error: unknown): void {
-      if (isHttpStatusError(error)) lastReachableAt = options.now();
+      lastKind = isHttpStatusError(error) ? 'http_status' : 'no_http_status';
     },
     failingForMs,
+    lastFailureKind: (): FailureKind => lastKind,
     shouldExit(activeExecutions: number): boolean {
       return activeExecutions === 0 && failingForMs() >= exitAfterMs;
     },
   };
 }
 
-export type PollLoopOutcome = 'stopped' | 'sustained_connect_failure';
+export type PollLoopOutcome = 'stopped' | 'sustained_contact_failure';
 
 export interface PollLoopDeps {
   isStopping: () => boolean;
@@ -76,9 +103,10 @@ export interface PollLoopDeps {
 /**
  * The poll loop of main(). Behavior is unchanged except for the exit: poll
  * failures are still caught and logged and the loop keeps going, until the
- * clock says the server has been unreachable for the whole window and nothing
- * is executing. Then it logs ONE line (no token, no prompt text, no error
- * object) and returns so the caller can release the lock and exit.
+ * clock says no request has succeeded for the whole window and nothing is
+ * executing. Then it logs ONE line (no token, no prompt text, no error object,
+ * only the kind of the last failure) and returns so the caller can release the
+ * lock and exit.
  */
 export async function runPollLoop(deps: PollLoopDeps): Promise<PollLoopOutcome> {
   while (!deps.isStopping()) {
@@ -94,9 +122,9 @@ export async function runPollLoop(deps: PollLoopDeps): Promise<PollLoopOutcome> 
     if (deps.clock.shouldExit(deps.activeExecutions())) {
       const seconds = Math.round(deps.clock.failingForMs() / 1000);
       await deps.logError(
-        `sustained connect failure: no successful poll or heartbeat for ${seconds}s; exiting so the supervisor restarts the worker`
+        `sustained contact failure: no successful poll or heartbeat for ${seconds}s (last failure: ${deps.clock.lastFailureKind()}); exiting so the supervisor restarts the worker`
       );
-      return 'sustained_connect_failure';
+      return 'sustained_contact_failure';
     }
     await deps.sleep(deps.pollIntervalMs);
   }
@@ -118,6 +146,6 @@ export async function runWorkerLoop(deps: WorkerLoopDeps): Promise<PollLoopOutco
   } finally {
     await deps.release();
   }
-  if (outcome === 'sustained_connect_failure') deps.exit(1);
+  if (outcome === 'sustained_contact_failure') deps.exit(1);
   return outcome;
 }
