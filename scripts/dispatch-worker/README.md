@@ -364,6 +364,14 @@ The launcher now supervises one SSH tunnel and one worker as a pair:
   minutes resets the count.
 - Losing the launcher's own tunnel (process exit or listener gone) while the worker runs stops
   the worker and restarts the same pair. Never more than one tunnel and one worker.
+- A stop takes down the whole process tree of the worker (taskkill /T /F, then each recorded
+  descendant is checked and force-stopped), because Windows Stop-Process ends one PID only and
+  killing the worker also prevents its own cleanup of the agents it spawned. The launcher then
+  verifies those descendants are gone. If any survives, it logs the count and exits 1 WITHOUT
+  starting a replacement worker in that launcher run (a replacement could reclaim the expired
+  lease while the old agent keeps running). Limit: the launcher keeps no state across runs, so
+  a fresh launcher started by the Task Scheduler restart policy does not remember survivors; a
+  survivor after a force tree kill is expected to be rare and shows in the launcher log.
 - Only processes the launcher started are stopped, and only if the PID still has the recorded
   start time. A listener on the local port that the launcher did not start is never terminated:
   it is a loud bounded failure.

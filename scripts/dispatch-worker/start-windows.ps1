@@ -12,6 +12,11 @@ $ErrorActionPreference = 'Stop'
 # (see EXIT_ALREADY_RUNNING in scripts/dispatch-worker/index.ts). It means "do not retry".
 $script:WorkerAlreadyRunningExit = 75
 
+# Descendant processes of a stopped worker that were still alive after the tree kill. Non-zero
+# means an agent from the previous worker may still be executing work, so the supervisor must
+# not start a replacement (it could reclaim the expired lease while the old agent keeps going).
+$script:DescendantsSurvived = 0
+
 # ---------------------------------------------------------------------------
 # Adapters. Each one is a small function so a test can redefine it after
 # dot-sourcing this file (start-windows.test.ts runs the real supervisor with
@@ -89,8 +94,60 @@ function Start-WorkerProcess {
     return $process
 }
 
+# Every descendant (child, grandchild, ...) of a process, from the live process table, with the
+# creation time recorded so a reused PID is never mistaken for the original.
+function Get-DescendantProcesses {
+    param([int]$RootId)
+    $table = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $found = New-Object System.Collections.ArrayList
+    $queue = New-Object System.Collections.Queue
+    $queue.Enqueue($RootId)
+    $seen = @{}
+    $seen[$RootId] = $true
+    while ($queue.Count -gt 0) {
+        $parent = [int]$queue.Dequeue()
+        foreach ($row in $table) {
+            if ([int]$row.ParentProcessId -ne $parent) { continue }
+            $id = [int]$row.ProcessId
+            if ($seen.ContainsKey($id)) { continue }
+            $seen[$id] = $true
+            [void]$found.Add([pscustomobject]@{ Id = $id; Created = [string]$row.CreationDate })
+            $queue.Enqueue($id)
+        }
+    }
+    return @($found)
+}
+
+function Test-DescendantAlive {
+    param($Descendant)
+    $row = Get-CimInstance Win32_Process -Filter ("ProcessId = " + $Descendant.Id) -ErrorAction SilentlyContinue
+    if ($null -eq $row) { return $false }
+    return ([string]$row.CreationDate -eq $Descendant.Created)
+}
+
+# Stop-Process ends only the one PID, and killing the worker also prevents its own cleanup of
+# the agents it spawned. So the whole tree is taken down (taskkill /T /F) and each recorded
+# descendant is then verified gone. Returns the number still alive after the wait.
+function Stop-ProcessTreeVerified {
+    param([int]$RootId, [int]$WaitSeconds = 10)
+    $descendants = @(Get-DescendantProcesses -RootId $RootId)
+    & taskkill.exe /PID $RootId /T /F *> $null
+    foreach ($d in $descendants) {
+        if (Test-DescendantAlive -Descendant $d) {
+            Stop-Process -Id $d.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
+    while ($true) {
+        $alive = @($descendants | Where-Object { Test-DescendantAlive -Descendant $_ })
+        if ($alive.Count -eq 0 -or [DateTime]::UtcNow -ge $deadline) { return $alive.Count }
+        Start-Sleep -Milliseconds 200
+    }
+}
+
 # Stops ONLY a process object this launcher started, and only if the live PID
 # still has the start time recorded when it was started (a reused PID is left alone).
+# The process and everything it spawned are stopped; survivors are counted, never ignored.
 function Stop-OwnedProcess {
     param($Process)
     if ($null -eq $Process) { return }
@@ -99,7 +156,11 @@ function Stop-OwnedProcess {
         $live = Get-Process -Id $Process.Id -ErrorAction SilentlyContinue
         if ($null -eq $live) { return }
         if ($live.StartTime -ne $Process.StartTime) { return }
-        Stop-Process -Id $Process.Id -Force
+        $survivors = Stop-ProcessTreeVerified -RootId $Process.Id
+        if ($survivors -gt 0) {
+            $script:DescendantsSurvived += $survivors
+            Write-LauncherLog ("$survivors descendant process(es) of owned process " + $Process.Id + " survived the tree stop")
+        }
     }
     catch {
         Write-LauncherLog ("could not stop owned process " + $Process.Id)
@@ -186,6 +247,10 @@ function Invoke-DispatchSupervisor {
     while ($true) {
         $startedAt = Get-LauncherNow
         $result = Invoke-DispatchPairOnce -ConfigPath $ConfigPath -SshHost $SshHost -LocalPort $LocalPort
+        if ($script:DescendantsSurvived -gt 0) {
+            Write-LauncherLog ("refusing to restart: $($script:DescendantsSurvived) process(es) from the previous worker are still alive and may still be executing work; exiting non-zero for the scheduled task restart policy")
+            return 1
+        }
         if ($result.Outcome -eq 'clean') {
             Write-LauncherLog "worker stopped cleanly"
             return 0

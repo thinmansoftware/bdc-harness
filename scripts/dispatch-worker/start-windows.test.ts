@@ -238,6 +238,29 @@ $script:Tick = {
     expect((r.workerStarts[1] ?? 9999) - (r.diedAt[0] ?? 0)).toBeLessThanOrEqual(120);
   });
 
+  test('Overseer finding on df482267a: descendants that survive the stop block a replacement worker', async () => {
+    const r = await runScenario(`
+${TUNNEL_LISTENER}
+function Stop-OwnedProcess {
+    param($Process)
+    if ($null -eq $Process) { return }
+    [void]$script:stopped.Add($Process.Id)
+    if (-not $Process.HasExited) { $Process.HasExited = $true; $Process.ExitCode = -1 }
+    if ($Process.Role -eq 'worker') { $script:DescendantsSurvived += 2 }
+}
+$script:Tick = {
+  $first = $script:tunnels[0]
+  if ($first -and -not $first.HasExited -and ($script:clock - $first.StartedAt) -ge 60) {
+    $first.HasExited = $true; $first.ExitCode = 255
+  }
+}
+`);
+    expect(r.code).toBe(1);
+    expect(r.workers).toBe(1);
+    expect(r.tunnels).toBe(1);
+    expect(r.log.some(l => l.includes('refusing to restart: 2 process(es)'))).toBe(true);
+  });
+
   test('Test 5: a foreign listener on the port is never terminated and fails loudly within a bounded budget', async () => {
     const r = await runScenario(`
 $script:PortOpen = { return $true }
@@ -506,4 +529,112 @@ Write-Output ('EXIT=' + $p.ExitCode)
       }
     }
   });
+});
+
+// Overseer finding on df482267a: tunnel loss stopped only the worker PID, leaving the agents it
+// spawned running. This runs the REAL Stop-OwnedProcess against a real process tree
+// (powershell -> cmd -> ping) and requires every descendant to be gone afterwards.
+suite('start-windows.ps1 real process tree stop', () => {
+  test('Stop-OwnedProcess ends the whole tree of a real child process, not only the worker PID', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-tree-'));
+    try {
+      const script = join(dir, 'tree-scenario.ps1');
+      const q = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+      await writeFile(
+        script,
+        `$ErrorActionPreference = 'Stop'
+. ${q(LAUNCHER)}
+function Write-LauncherLog { param([string]$Message) Write-Output ('LOG=' + $Message) }
+$p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', '"cmd /c ping -n 120 127.0.0.1 | Out-Null"') -WindowStyle Hidden -PassThru
+$null = $p.Handle
+$tree = @()
+for ($i = 0; $i -lt 100; $i++) {
+    $tree = @(Get-DescendantProcesses -RootId $p.Id)
+    if ($tree.Count -ge 2) { break }
+    Start-Sleep -Milliseconds 100
+}
+Write-Output ('TREE_BEFORE=' + $tree.Count)
+Stop-OwnedProcess -Process $p
+Start-Sleep -Milliseconds 500
+$alive = @($tree | Where-Object { Test-DescendantAlive -Descendant $_ })
+Write-Output ('PARENT_ALIVE=' + [bool](Get-Process -Id $p.Id -ErrorAction SilentlyContinue))
+Write-Output ('DESCENDANTS_ALIVE=' + $alive.Count)
+Write-Output ('SURVIVED_FLAG=' + $script:DescendantsSurvived)
+`,
+        'utf8'
+      );
+      const proc = Bun.spawn(
+        [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          script,
+        ],
+        { stdout: 'pipe', stderr: 'pipe' }
+      );
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      const before = Number(/TREE_BEFORE=(\d+)/.exec(stdout)?.[1] ?? '0');
+      expect(before, stdout + stderr).toBeGreaterThanOrEqual(2);
+      expect(stdout, stderr).toContain('PARENT_ALIVE=False');
+      expect(stdout, stderr).toContain('DESCENDANTS_ALIVE=0');
+      expect(stdout, stderr).toContain('SURVIVED_FLAG=0');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a descendant that will not die is counted and logged, never ignored', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-survivor-'));
+    try {
+      const script = join(dir, 'survivor-scenario.ps1');
+      const q = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+      await writeFile(
+        script,
+        `$ErrorActionPreference = 'Stop'
+. ${q(LAUNCHER)}
+function Write-LauncherLog { param([string]$Message) Write-Output ('LOG=' + $Message) }
+$p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', '"cmd /c ping -n 120 127.0.0.1 | Out-Null"') -WindowStyle Hidden -PassThru
+$null = $p.Handle
+for ($i = 0; $i -lt 100; $i++) {
+    if (@(Get-DescendantProcesses -RootId $p.Id).Count -ge 1) { break }
+    Start-Sleep -Milliseconds 100
+}
+# every descendant reports alive no matter what, as a process that resists the kill would
+function Test-DescendantAlive { param($Descendant) return $true }
+Stop-OwnedProcess -Process $p
+Write-Output ('SURVIVED_FLAG=' + $script:DescendantsSurvived)
+`,
+        'utf8'
+      );
+      const proc = Bun.spawn(
+        [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          script,
+        ],
+        { stdout: 'pipe', stderr: 'pipe' }
+      );
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      const flag = Number(/SURVIVED_FLAG=(\d+)/.exec(stdout)?.[1] ?? '0');
+      expect(flag, stdout + stderr).toBeGreaterThanOrEqual(1);
+      expect(stdout).toContain('survived the tree stop');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 60000);
 });
