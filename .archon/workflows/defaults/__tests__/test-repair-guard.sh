@@ -51,6 +51,77 @@ printf 'good\n' > "$WT/product"
 printf 'assert True\n' > "$WT/new.test.py"
 check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 
+# Test 16: declared scripts are frozen even when their names do not match the
+# test-file rule. Reproduce the Overseer's passing-summary rewrite verbatim.
+for location in current stage; do
+  for change in rewrite delete product; do
+    fixture "declared-$location-$change"
+    CURRENT="$WT"
+    TARGET="$WT"
+    if [ "$location" = stage ]; then
+      fixture "declared-target-$change"
+      TARGET="$WT"
+      WT="$CURRENT"; export ARTIFACTS_DIR="$WT/artifacts"
+      export RST_STAGE_WORKTREES="b=$TARGET"
+      export FIX_SPEC=$'WO Class: CODE\n## Canonical stages\n```yaml\nstages:\n  - id: b\n    repo: thinmansoftware/other\n    target_branch: staging\n    in_scope_files: [src]\n    verify_commands: ["bash check.sh"]\n    readiness_bar: {spec_complete: true, scope_complete: true, dependencies_ready: true, acceptance_defined: true}\n```'
+    else
+      export FIX_SPEC=$'WO Class: CODE\nStop 1 (test suite):\n  bash check.sh\nExpected: pass'
+    fi
+    printf 'bad\n' > "$TARGET/product"
+    printf 'if grep -q good product; then echo "Tests: 1/1"; else echo "Tests: 0/1"; exit 1; fi\n' > "$TARGET/check.sh"
+    export FIX_MAP=''
+    export FIX_INITIAL="$(run_node run-stop-tests)"
+    check contains "$FIX_INITIAL" 'TESTS_STATUS=failed'
+    check contains "$(cat "$ARTIFACTS_DIR/evidence/stop-tests.commands")" 'bash check.sh'
+    check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    case "$change" in
+      rewrite) printf 'echo "Tests: 1/1"\n' > "$TARGET/check.sh" ;;
+      delete) rm "$TARGET/check.sh" ;;
+      product) printf 'good\n' > "$TARGET/product" ;;
+    esac
+    if [ "$change" = product ]; then
+      check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    else
+      check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    fi
+    run_node test-repair until_bash >/dev/null
+    out="$(run_node run-stop-tests-final)"
+    if [ "$change" = product ]; then
+      check contains "$out" 'TESTS_STATUS=passed'
+      check contains "$out" 'TESTS_REPAIR_RESULT=repaired'
+    else
+      check contains "$out" 'TESTS_STATUS=blocked'
+      check contains "$out" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+      check contains "$out" 'TESTS_REPAIR_RESULT=guard_violation'
+    fi
+    unset RST_STAGE_WORKTREES
+  done
+done
+
+# Command tokens are relative to the command's cwd, including a leading cd.
+# Existing ignored files are included; directories, flags, interpreters and paths
+# escaping the worktree (including symlinks) are excluded.
+fixture declared-tokens
+mkdir -p "$WT/sub dir"
+printf 'check.sh\n' > "$WT/.gitignore"
+for name in 'sub dir/check.sh' 'sub dir/helper.sh' check.sh bash; do
+  printf 'old\n' > "$WT/$name"
+done
+printf 'old\n' > "$WT/-flag"
+printf 'outside\n' > "$TMP/outside.sh"
+ln -s "$TMP/outside.sh" "$WT/escape.sh"
+printf '%s\n' "cd 'sub dir' && bash check.sh && bash helper.sh" 'bash check.sh -flag bash ../outside.sh escape.sh' > "$ARTIFACTS_DIR/evidence/stop-tests.commands"
+trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+for name in 'sub dir/check.sh' 'sub dir/helper.sh' check.sh; do
+  printf 'changed\n' > "$WT/$name"
+  check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  printf 'old\n' > "$WT/$name"
+done
+printf 'changed\n' > "$WT/bash"
+printf 'changed\n' > "$WT/-flag"
+printf 'changed\n' > "$TMP/outside.sh"
+check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+
 # Test 14: drive a value-only guard violation through all four real consumers.
 fixture guard-reason
 printf 'bad\n' > "$WT/product"
