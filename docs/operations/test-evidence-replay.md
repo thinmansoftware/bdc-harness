@@ -19,6 +19,13 @@ consumers receive grep evidence from the repaired worktree.
 CODE/MIXED blocked evidence fails closed with `TESTS_BLOCKED:`.
 Existing non-PROCEED `NOT_GATED` and base-red behavior remains in place.
 
+The shared `rst_report` arguments are class, command, exit code, counts,
+optional environment reason, and optional log path. A declared capability probe
+that reports `env_unavailable` takes precedence over blocked reasons, including
+across stages and final verification. It never enters repair, stamps
+`VALIDATION: FAIL`, and fails the evidence gate with `ENVIRONMENT_UNAVAILABLE:`
+even on a non-PROCEED run. Without that probe, the existing blocked reasons apply.
+
 ## Saved inputs and stage directories
 
 The evidence directory contains `stop-tests.commands` (one full command per line),

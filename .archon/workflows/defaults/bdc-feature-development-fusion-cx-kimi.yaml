@@ -1122,6 +1122,7 @@ nodes:
     loop:
       prompt: |
         Implement the approved plan for this BDC feature Work Order.
+        Never run `gh pr create`. The harness opens or adopts the run PR.
 
         ## Spec
         $read-spec.output
@@ -2225,6 +2226,22 @@ nodes:
           esac
         done
       }
+      # Split declared semicolon segments outside literal single-quoted arguments.
+      # Each resulting segment still passes the existing argv allowlist (no shell eval).
+      rst_split_segments() {
+        local line c part="" quoted=0 i
+        while IFS= read -r line; do
+          part=""; quoted=0
+          for ((i=0; i<${#line}; i++)); do
+            c="${line:i:1}"
+            if [ "$c" = "'" ]; then quoted=$((1 - quoted)); fi
+            if [ "$c" = ";" ] && [ "$quoted" -eq 0 ]; then
+              printf '%s\n' "$part"; part=""
+            else part+="$c"; fi
+          done
+          printf '%s\n' "$part"
+        done
+      }
       # rst_run_commands <commands-file> <log>   (runs each command line in the CWD under a
       #   1500 s budget as the parsed argv words of the shared tokenizer -- no bash -c -- appends
       #   every command's output to <log> under a "### run-stop-tests:" header, and prints
@@ -2234,7 +2251,7 @@ nodes:
       #   unused (pipes are already rejected).
       rst_run_commands() {
         local cmds="$1" log="$2" cmd seg rc exit_code=0 p=0 t=0 hit=0 c
-        local saved_pwd d k total piece piece_rc piece_counts piece_cmd
+        local saved_pwd d k total piece piece_counts piece_cmd env_reason="" word needs_postgres
         local -a words=() segw=()
         rst_scrub_env
         saved_pwd="$(pwd)"
@@ -2251,6 +2268,15 @@ nodes:
           else
             rst_parse_cmd "$cmd" || true
             words=("${RST_WORDS[@]}")
+            needs_postgres=0
+            for word in "${words[@]}"; do
+              case "$word" in --postgres|--postgres=*) needs_postgres=1 ;; esac
+            done
+            if [ "$needs_postgres" -eq 1 ] && [ "${BDC_BUILDER_POSTGRES:-}" != "1" ]; then
+              env_reason="postgres capability absent in this lane"
+              printf '### skipped: %s\n' "$env_reason" >> "$log"
+              continue
+            fi
             total=${#words[@]}
             k=0
             if [ "$total" -gt 0 ] && [ "${words[0]}" = "cd" ]; then
@@ -2316,8 +2342,12 @@ nodes:
         cd "$saved_pwd" || true
         rm -f "$seg"
         if [ "$hit" -eq 1 ]; then printf '%s %s %s' "$exit_code" "$p" "$t"; else printf '%s  ' "$exit_code"; fi
+        [ -z "$env_reason" ] || printf '\t%s' "$env_reason"
+        return 0
       }
-      # rst_report <class> <cmd> <exit> <counts>   (-> TESTS_STATUS / TESTS_LINE lines)
+      # rst_report <class> <cmd> <exit> <counts> [env_reason] [log_path]
+      #   A declared environment probe wins over blocked reasons; absent capability is
+      #   not repairable, even if another declared command failed or timed out.
       #   Status law: passed only when the command exited 0 AND passed == total > 0.
       #   Any nonzero exit, any failing test, or 0 tests ran is "failed". A
       #   spec-declared command that exited nonzero with no parseable counts is
@@ -2327,8 +2357,14 @@ nodes:
       #   runnable test command AND no test files in the diff is
       #   "no_command_declared" (spec + build defect).
       rst_report() {
-        local class="$1" cmd="$2" exit_code="$3" counts="$4" status line p t reason
-        reason="$(rst_failure_reason "$exit_code" "${5:-/dev/null}" "$cmd")"
+        local class="$1" cmd="$2" exit_code="$3" counts="$4" env_reason="${5:-}" status line p t reason
+        if [ -n "$env_reason" ]; then
+          line="${counts:-0 0}"
+          line="${line/ /\/} ($cmd) -- ENVIRONMENT UNAVAILABLE: $env_reason"
+          printf 'TESTS_ENV_REASON=%s\nTESTS_STATUS=env_unavailable\nTESTS_LINE=%s\n' "$env_reason" "$line"
+          return 0
+        fi
+        reason="$(rst_failure_reason "$exit_code" "${6:-/dev/null}" "$cmd")"
         if [ -n "$reason" ]; then
           printf 'TESTS_STATUS=blocked\nTESTS_LINE=BLOCKED (%s)\nTESTS_BLOCKED_REASON=%s\n' "$reason" "$reason"
           return 0
@@ -2424,7 +2460,7 @@ nodes:
       }
       # Replays only the persisted plan; no spec extraction occurs in a repair or final run.
       rst_execute_saved() {
-        local evidence="$1" class="$2" cmds log result rc counts joined report reason="" overall=passed p=0 t=0
+        local evidence="$1" class="$2" cmds log result rc counts joined report reason="" env_reason="" overall_env_reason="" overall=passed p=0 t=0
         local sid repo cmd dir stage_status stage_line lines="" blocked="" stage_cmds
         cmds="$evidence/stop-tests.commands"; log="$evidence/stop-tests.log"
         if [ -s "$evidence/stop-tests.stages" ]; then
@@ -2441,20 +2477,28 @@ nodes:
               stage_log="$(mktemp)"
               result="$(cd "$dir" && rst_run_commands "$stage_cmds" "$stage_log")"
               cat "$stage_log" >> "$log"
+              env_reason=""
+              case "$result" in *$'\t'*) env_reason="${result#*$'\t'}"; result="${result%%$'\t'*}" ;; esac
               rc="${result%% *}"; counts="${result#* }"; counts="$(echo "$counts" | xargs)"
-              report="$(SOURCE=spec_declared rst_report "$class" "$joined" "$rc" "$counts" "$stage_log")"
+              report="$(SOURCE=spec_declared rst_report "$class" "$joined" "$rc" "$counts" "$env_reason" "$stage_log")"
               stage_status="$(echo "$report" | sed -n 's/^TESTS_STATUS=//p')"
               reason="$(echo "$report" | sed -n 's/^TESTS_BLOCKED_REASON=//p')"
               stage_line="$sid: $(echo "$report" | sed -n 's/^TESTS_LINE=//p')"
               if [ -n "$counts" ]; then p=$((p+${counts%% *})); t=$((t+${counts##* })); fi
               rm -f "$stage_log"
             fi
-            [ "$stage_status" = blocked ] && { overall=blocked; [ -n "$blocked" ] || blocked="$reason"; }
-            if [ "$stage_status" != passed ] && [ "$overall" != blocked ]; then overall=failed; fi
+            if [ "$stage_status" = env_unavailable ]; then
+              overall=env_unavailable
+              [ -n "$overall_env_reason" ] || overall_env_reason="$(echo "$report" | sed -n 's/^TESTS_ENV_REASON=//p')"
+            elif [ "$stage_status" = blocked ]; then
+              [ "$overall" = env_unavailable ] || overall=blocked
+              [ -n "$blocked" ] || blocked="$reason"
+            elif [ "$stage_status" != passed ] && [ "$overall" != blocked ] && [ "$overall" != env_unavailable ]; then overall=failed; fi
             printf 'TESTS_STAGE_LINE=%s\n' "$stage_line"
             lines="${lines:+$lines | }$stage_line"
           done < <(cut -f1 "$evidence/stop-tests.stages" | awk '!seen[$0]++')
           rm -f "$stage_cmds"
+          [ -z "$overall_env_reason" ] || printf 'TESTS_ENV_REASON=%s\n' "$overall_env_reason"
           printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\nTESTS_BLOCKED_REASON=%s\nTESTS_PASSED=%s\nTESTS_TOTAL=%s\nTESTS_EXIT=%s\n' "$overall" "$lines" "$blocked" "$p" "$t" "$([ "$overall" = passed ] && echo 0 || echo 1)"
         else
           joined="$(paste -sd ';' "$cmds" | sed 's/;/; /g')"
@@ -2462,8 +2506,10 @@ nodes:
           command_log="$(mktemp)"
           result="$(rst_run_commands "$cmds" "$command_log")"
           cat "$command_log" >> "$log"
+          env_reason=""
+          case "$result" in *$'\t'*) env_reason="${result#*$'\t'}"; result="${result%%$'\t'*}" ;; esac
           rc="${result%% *}"; counts="${result#* }"; counts="$(echo "$counts" | xargs)"
-          SOURCE=spec_declared rst_report "$class" "$joined" "$rc" "$counts" "$command_log"
+          SOURCE=spec_declared rst_report "$class" "$joined" "$rc" "$counts" "$env_reason" "$command_log"
           printf 'TESTS_EXIT=%s\nTESTS_PASSED=%s\nTESTS_TOTAL=%s\n' "$rc" "${counts%% *}" "${counts##* }"
           rm -f "$command_log"
         fi
@@ -2640,7 +2686,7 @@ nodes:
           echo "run-stop-tests: declared line is not a runnable test command, ignoring: $c" >&2
         fi
       done <<EOF_CMDS
-      $(printf '%s\n' "$SPEC" | rst_extract_commands)
+      $(printf '%s\n' "$SPEC" | rst_extract_commands | rst_split_segments)
       EOF_CMDS
       [ -s "$CMDS" ] && SOURCE="spec_declared"
       RESOLUTION="$(cat <<'BDC_TEST_COMMAND_RESOLUTION' | capture_node_output
@@ -2679,17 +2725,20 @@ nodes:
       echo "TESTS_MAP_FALLBACK=$MAP_FALLBACK"
       EXIT_CODE=0
       COUNTS=""
+      TESTS_ENV_REASON=""
       CMD_JOINED=""
       # rst_try <source-label>: run whatever is in $CMDS; rc 0 when counts were parsed.
       rst_try() {
         [ -s "$CMDS" ] || return 1
         CMD_JOINED="$(grep -v '^$' "$CMDS" | paste -sd ';' - | sed 's/;/; /g')"
         RESULT="$(rst_run_commands "$CMDS" "$LOG")"
+        TESTS_ENV_REASON=""
+        case "$RESULT" in *$'\t'*) TESTS_ENV_REASON="${RESULT#*$'\t'}"; RESULT="${RESULT%%$'\t'*}" ;; esac
         EXIT_CODE="${RESULT%% *}"
         COUNTS="${RESULT#* }"
         COUNTS="$(printf '%s' "$COUNTS" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
         SOURCE="$1"
-        [ -n "$COUNTS" ]
+        [ -n "$COUNTS" ] || [ -n "$TESTS_ENV_REASON" ]
       }
       if [ "$CLASS" != "DOCUMENTATION" ] && [ "$CLASS" != "OPERATOR" ]; then
         # Ladder: spec-declared -> test files in this run's diff -> the repo's own test
@@ -2737,11 +2786,11 @@ nodes:
       echo "TESTS_PASSED=${COUNTS%% *}"
       echo "TESTS_TOTAL=${COUNTS##* }"
       if [ "$SOURCE" = "project-map" ]; then
-        SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$LOG" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/"
+        SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$TESTS_ENV_REASON" "$LOG" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/"
       else
         REPORT_SOURCE="${SOURCE%% *}"
         if [ "$REPORT_SOURCE" = "spec_declared" ]; then REPORT_SOURCE="wo-spec"; fi
-        rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$LOG" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
+        rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$TESTS_ENV_REASON" "$LOG" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
       fi > "$EVIDENCE_DIR/stop-tests.report"
       stb_report_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS" | tee "$EVIDENCE_DIR/stop-tests.initial"
       trg_snapshot "$(pwd)" "$EVIDENCE_DIR/test-guard.json"
@@ -2753,13 +2802,6 @@ nodes:
       fi
       exit 0
 
-  # bdc-xo #1940. run-stop-greps MECHANICALLY executes every grep stop condition the
-  # spec declares ("Stop N (grep assertion ...)" header, command line, "Expected: N")
-  # inside the run worktree, under the same read-only command allowlist as
-  # verify-manifest-assertions, and emits OBSERVED counts in the manifest v2
-  # "<command> => <count>; ..." contract. stamp-manifest-evidence writes GREP_LINE into
-  # the manifest "Grep assertions:" line; the engine's "N/A (no declared mechanical
-  # assertions)" placeholder never reaches a PR body for a spec that declared greps.
 
   - id: classify-test-result
     persona: overseer
@@ -2840,7 +2882,9 @@ nodes:
       rst_execute_saved "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")" > "$EVIDENCE_DIR/stop-tests.final-raw"
       RESULT=repaired
       REASON=""
-      if [ -f "$EVIDENCE_DIR/test-repair.guard" ] || ! trg_check "$(pwd)" "$EVIDENCE_DIR/test-guard.json"; then
+      if grep -q '^TESTS_STATUS=env_unavailable$' "$EVIDENCE_DIR/stop-tests.final-raw"; then
+        RESULT=env_unavailable
+      elif [ -f "$EVIDENCE_DIR/test-repair.guard" ] || ! trg_check "$(pwd)" "$EVIDENCE_DIR/test-guard.json"; then
         RESULT=guard_violation; REASON=tests_failed_after_repair:guard
       elif ! grep -q '^TESTS_STATUS=passed$' "$EVIDENCE_DIR/stop-tests.final-raw"; then
         RESULT=exhausted; REASON=tests_failed_after_repair:exhausted
@@ -4139,8 +4183,10 @@ nodes:
       validate_implementation_counter AHEAD "$AHEAD_RAW" || exit 1
       AHEAD=$AHEAD_RAW
       if [ "$CHANGED" -eq 0 ] && [ "$AHEAD" -eq 0 ]; then echo "SALVAGE=skip (nothing to preserve)"; exit 0; fi
+      RPR_ORIGINAL_RUN_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
       # Branch suffix uses $$ (Rule 2: never $WORKFLOW_ID under set -u).
       BR="salvage/opus-repair-$(basename "$WT")-$$"
+      git switch -c "$BR" || exit 1
       while IFS= read -r -d '' rec; do
         [ -n "$rec" ] || continue
         xy=${rec%"${rec#??}"}
@@ -4171,34 +4217,240 @@ nodes:
           COMMIT_MSG="salvage: opus-repaired build preserved for human review (non-interactive BLOCKED)"
         fi
         git -c user.name="${CAULDRON_GIT_AUTHOR_NAME:-Thinman Cauldron}" -c user.email="${CAULDRON_GIT_AUTHOR_EMAIL:-admin@bluedevilcollectibles.com}" \
-          commit -m "$COMMIT_MSG" -m "Cauldron-Role: salvage" 2>&1 | tail -1 || true
+          commit -m "$COMMIT_MSG" -m "Cauldron-Role: salvage" 2>&1 | tail -1 || { echo "ERROR: salvage_commit_failed" >&2; exit 1; }
       fi
       if [ "$CHANGED" -gt 0 ]; then
         echo "SALVAGE=preserved_uncommitted:${CHANGED}"
       fi
+      # Local preservation is complete before any context, lock, or GitHub dependency.
+      if [ -z "${ARTIFACTS_DIR:-}" ] || [ -z "${WORKFLOW_ID:-}" ] || [ -z "${RECORDED_BASE_BRANCH:-}" ]; then
+        echo "SALVAGE=preserved_local_only reason=missing_run_context branch=$BR"
+        exit 0
+      fi
+      if ! command -v gh >/dev/null 2>&1; then
+        echo "SALVAGE=preserved_local_only reason=gh_missing branch=$BR"
+        exit 0
+      fi
+      if ! mkdir -p "$ARTIFACTS_DIR"; then
+        echo "SALVAGE=preserved_local_only reason=artifacts_unavailable branch=$BR"
+        exit 0
+      fi
+      SALVAGE_GITHUB_LOG=$(mktemp "$ARTIFACTS_DIR/salvage-github.XXXXXX") || {
+        echo "SALVAGE=preserved_local_only reason=artifacts_unavailable branch=$BR"; exit 0
+      }
+      # A subshell isolates the primary node's fail-closed exits. Only an explicit
+      # recorded-PR ownership refusal (42) is a GitHub-side hard failure here.
+      salvage_publish() (
+      REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
+      : "${RECORDED_BASE_BRANCH:?recorded base required}"
+      if [ -n "${BASE_BRANCH:-}" ] && [ "$BASE_BRANCH" != "$RECORDED_BASE_BRANCH" ]; then
+        echo "ERROR: base_branch_mismatch" >&2; exit 1
+      fi
+      BASE_BRANCH="$RECORDED_BASE_BRANCH"
+      # ---- BEGIN rpr core (byte-identical across lanes and PR-creation nodes) ----
+      # Run-scoped ownership is mandatory; an invalid existing record fails closed.
+      # The holder PID is encoded in an empty child directory. Reaping uses rmdir
+      # only: an old waiter cannot unlink a new owner's PID record after a race.
+      rpr_release_lock() {
+        rmdir "$ARTIFACTS_DIR/run-pr.lock/holder-${RPR_LOCK_PID}" 2>/dev/null || true
+        rmdir "$ARTIFACTS_DIR/run-pr.lock" 2>/dev/null || true
+      }
+      rpr_acquire_lock() {
+        local lock="$ARTIFACTS_DIR/run-pr.lock" started=$SECONDS now modified holder pid live other
+        local RPR_LOCK_TIMEOUT=180
+        RPR_LOCK_PID=$BASHPID
+        local -a stale_holders=()
+        while :; do
+          if mkdir "$lock" 2>/dev/null; then
+            if mkdir "$lock/holder-${RPR_LOCK_PID}" 2>/dev/null; then
+              # A concurrent stale reaper may have removed an empty parent during
+              # initialization. Proceed only if this PID is its sole holder.
+              other=0
+              for holder in "$lock"/holder-*; do
+                [ "$holder" = "$lock/holder-${RPR_LOCK_PID}" ] || other=1
+              done
+              if [ "$other" -eq 0 ] && [ -d "$lock/holder-${RPR_LOCK_PID}" ]; then return 0; fi
+              rpr_release_lock
+            fi
+          fi
+          now=$(date +%s)
+          modified=$(stat -c %Y "$lock" 2>/dev/null || printf '%s' "$now")
+          if [ "$((now - modified))" -ge "$RPR_LOCK_TIMEOUT" ]; then
+            live=0
+            stale_holders=()
+            for holder in "$lock"/holder-*; do
+              [ -d "$holder" ] || continue
+              stale_holders+=("$holder")
+              pid="${holder##*/holder-}"
+              case "$pid" in ''|*[!0-9]*) live=1; continue ;; esac
+              if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then live=1; fi
+            done
+            if [ "$live" -eq 0 ]; then
+              for holder in "${stale_holders[@]}"; do
+                pid="${holder##*/holder-}"
+                if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then continue; fi
+                rmdir "$holder" 2>/dev/null || true
+              done
+              rmdir "$lock" 2>/dev/null || true
+              [ -d "$lock" ] || continue
+            fi
+          fi
+          if [ "$((SECONDS - started))" -ge "$RPR_LOCK_TIMEOUT" ]; then
+            echo "ERROR: run_pr_lock_timeout: waited ${RPR_LOCK_TIMEOUT}s; live or unverifiable holder retained" >&2
+            exit 1
+          fi
+          echo "run_pr_guard_waiting: another node holds the run PR lock" >&2
+          sleep 2
+        done
+      }
+      rpr_init() {
+        : "${ARTIFACTS_DIR:?run artifacts required}" "${WORKFLOW_ID:?run id required}"
+        RPR_FILE="$ARTIFACTS_DIR/run-pr.json"
+        mkdir -p "$ARTIFACTS_DIR"
+        rpr_acquire_lock
+        trap 'rm -f "${BODY_FILE:-}" "${RPR_COMMENT:-}"; rpr_release_lock' EXIT
+        RPR_RUN_BRANCH="${RPR_ORIGINAL_RUN_BRANCH:-$(git symbolic-ref --quiet --short HEAD || true)}"
+        case "$RPR_RUN_BRANCH" in archon/task-web-worker-*) ;; *) RPR_RUN_BRANCH="" ;; esac
+        WO_ID="${WO_ID:-}"
+        if [ -z "$WO_ID" ] && [ -f "${ARCHON_NODE_OUT:-}/read-spec.out" ]; then
+          WO_ID="$(sed -n 's/^WO_ID=//p' "$ARCHON_NODE_OUT/read-spec.out" | head -1)"
+        fi
+        : "${WO_ID:?WO identity required}" "${RECORDED_BASE_BRANCH:?recorded base required}"
+        if [ -z "${UNIQUE_BRANCH:-}" ] && [ -f "${ARCHON_NODE_OUT:-}/commit-and-push.out" ]; then
+          UNIQUE_BRANCH="$(sed -n 's/^unique_branch=//p' "$ARCHON_NODE_OUT/commit-and-push.out" | head -1)"
+        fi
+        if [ -z "${ACTING_LOGIN:-}" ]; then
+          if [ -f /app/scripts/github-service-login.ts ]; then
+            ACTING_LOGIN="$(bun /app/scripts/github-service-login.ts "${ARCHON_GITHUB_SERVICE:-run_nodes}")" || exit 1
+          else ACTING_LOGIN="$(gh api user --jq .login)" || exit 1; fi
+        fi
+        : "${ACTING_LOGIN:?acting login required}"
+        export ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1
+        RPR_HEAD="$(git rev-parse HEAD)"
+        RPR_NUMBER=""; RPR_URL=""; RPR_BRANCH=""; RPR_STATE=""
+      }
+      # All four predicates: run branch, ancestor commit, recorded base, acting author.
+      rpr_owned() {
+        local row
+        row="$(RPR_JSON="$1" RPR_ALLOWED="${2:-}" RPR_RUN_BRANCH="$RPR_RUN_BRANCH" RPR_UNIQUE="${UNIQUE_BRANCH:-}" RPR_BASE="$RECORDED_BASE_BRANCH" RPR_ACTOR="$ACTING_LOGIN" python3 -c '
+      import json, os, re
+      try:
+          p = json.loads(os.environ["RPR_JSON"])
+          branch = p["headRefName"]; sha = p["headRefOid"]; n = p["number"]
+          allowed = [os.environ["RPR_RUN_BRANCH"], os.environ["RPR_UNIQUE"], os.environ["RPR_ALLOWED"]]
+          norm = lambda s: s.lower().removeprefix("app/").removesuffix("[bot]")
+          assert branch and branch in allowed
+          assert p["baseRefName"] == os.environ["RPR_BASE"]
+          assert norm(p["author"]["login"]) == norm(os.environ["RPR_ACTOR"])
+          assert type(n) is int and n > 0 and re.fullmatch(r"[0-9a-fA-F]{40}", sha)
+          fields = [str(n), p["url"], branch, sha, p.get("state", "OPEN")]
+          assert all(isinstance(v, str) and v and not any(c in v for c in "\t\r\n") for v in fields)
+          assert re.fullmatch(r"https://github.com/[^/]+/[^/]+/pull/" + str(n), p["url"])
+          print("\t".join(fields))
+      except (ValueError, KeyError, TypeError, AssertionError, AttributeError):
+          raise SystemExit(1)
+      ')" || return 1
+        local sha
+        IFS=$'\t' read -r RPR_NUMBER RPR_URL RPR_BRANCH sha RPR_STATE <<< "$row"
+        git merge-base --is-ancestor "$sha" "$RPR_HEAD" 2>/dev/null || return 1
+      }
+      rpr_record() {
+        RPR_PATH="$RPR_FILE" RPR_NUMBER="$RPR_NUMBER" RPR_URL="$RPR_URL" RPR_BRANCH="$RPR_BRANCH" RPR_BASE="$RECORDED_BASE_BRANCH" RPR_WO="$WO_ID" RPR_RUN="$WORKFLOW_ID" RPR_REPO="$REPO" python3 -c '
+      import json, os
+      e = os.environ
+      record = dict(number=int(e["RPR_NUMBER"]), url=e["RPR_URL"], head_branch=e["RPR_BRANCH"], base=e["RPR_BASE"], wo_id=e["RPR_WO"], run_id=e["RPR_RUN"], repo=e["RPR_REPO"])
+      path = e["RPR_PATH"]
+      if os.path.exists(path):
+          assert json.load(open(path)) == record, "run PR record conflict"
+      else:
+          tmp = path + ".new"
+          try:
+              with open(tmp, "w") as f: json.dump(record, f)
+              os.replace(tmp, path)
+          finally:
+              if os.path.exists(tmp): os.unlink(tmp)
+      ' || { echo "ERROR: run_pr_record_failed" >&2; if [ -e "$RPR_FILE" ]; then exit 42; else exit 1; fi; }
+      }
+      rpr_find() {
+        local number allowed raw candidate
+        if [ -e "$RPR_FILE" ]; then
+          number="$(RPR_PATH="$RPR_FILE" RPR_WO="$WO_ID" RPR_RUN="$WORKFLOW_ID" RPR_REPO="$REPO" RPR_BASE="$RECORDED_BASE_BRANCH" python3 -c '
+      import json, os
+      e = os.environ; p = json.load(open(e["RPR_PATH"]))
+      assert p["wo_id"] == e["RPR_WO"] and p["run_id"] == e["RPR_RUN"] and p["repo"] == e["RPR_REPO"] and p["base"] == e["RPR_BASE"]
+      assert type(p["number"]) is int and p["number"] > 0
+      print(p["number"])
+      ')" || { echo "ERROR: invalid_run_pr_record" >&2; exit 42; }
+          raw="$(gh pr view "$number" --repo "$REPO" --json number,url,headRefName,headRefOid,baseRefName,author,state)" || exit 1
+          # The record can also name the unique salvage branch created by this run.
+          allowed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_branch"])' "$RPR_FILE")" || exit 1
+          case "$allowed" in salvage/opus-repair-*) ;; *) allowed="" ;; esac
+          if ! rpr_owned "$raw" "$allowed"; then
+            echo "ERROR: recorded_pr_ownership_unverified: refusing create or modification" >&2; exit 42
+          fi
+          rpr_record
+          return 0
+        fi
+        local branch
+        for branch in "$RPR_RUN_BRANCH" "${UNIQUE_BRANCH:-}"; do
+          [ -n "$branch" ] || continue
+          raw="$(gh pr list --repo "$REPO" --head "$branch" --state open --limit 200 --json number,url,headRefName,headRefOid,baseRefName,author,state)" || exit 1
+          raw="$(RPR_JSON="$raw" python3 -c 'import json,os; p=json.loads(os.environ["RPR_JSON"]); assert isinstance(p,list); [print(json.dumps(v)) for v in p]')" || exit 1
+          while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
+            if rpr_owned "$candidate"; then rpr_record; return 0; fi
+          done <<< "$raw"
+        done
+        RPR_NUMBER=""; RPR_URL=""; RPR_BRANCH=""; RPR_STATE=""
+        return 1
+      }
+      # ---- END rpr core ----
+      rpr_init
+      RPR_EXISTING=false
+      if rpr_find; then RPR_EXISTING=true; fi
       if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
-        REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
-        RECORDED_BASE_BRANCH="${RECORDED_BASE_BRANCH:-}"
-        ATTEMPTED_BASE="${BASE_BRANCH:-}"
-        if [ -z "$RECORDED_BASE_BRANCH" ]; then
-          echo "ERROR: recorded_base_branch_missing" >&2
-          exit 1
+        if [ "$RPR_EXISTING" = "true" ]; then
+          # duplicate_pr_suppressed: report only; never edit the primary PR or branch.
+          RPR_COMMENT="$ARTIFACTS_DIR/fallback-comment.txt"
+          COMMENT_MARKER="run:${WORKFLOW_ID}:duplicate_pr_suppressed"
+          COMMENTS="$(gh pr view "$RPR_NUMBER" --repo "$REPO" --json comments)" || exit 1
+          if ! RPR_COMMENTS="$COMMENTS" RPR_MARKER="$COMMENT_MARKER" python3 -c 'import json,os; p=json.loads(os.environ["RPR_COMMENTS"]); raise SystemExit(0 if any(os.environ["RPR_MARKER"] in c.get("body", "") for c in p["comments"]) else 1)'; then
+            printf 'Fallback PR suppressed. Salvage commit preserved on branch `%s` (no PR). Existing PR branch and body unchanged.\n<!-- %s -->\n' "$BR" "$COMMENT_MARKER" > "$RPR_COMMENT"
+            gh pr comment "$RPR_NUMBER" --repo "$REPO" --body-file "$RPR_COMMENT" || exit 1
+          fi
+          RPR_NUMBER="$RPR_NUMBER" RPR_URL="$RPR_URL" RPR_SALVAGE="$BR" python3 -c 'import json,os; print("BDC_RUN_EVENT " + json.dumps(dict(event_type="duplicate_pr_suppressed", existing_pr=int(os.environ["RPR_NUMBER"]), existing_pr_url=os.environ["RPR_URL"], kind="fallback", salvage_branch=os.environ["RPR_SALVAGE"])))'
+          echo "SALVAGE=duplicate_pr_suppressed existing_pr=$RPR_URL branch=$BR"
+          exit 0
         fi
-        if [ -n "$ATTEMPTED_BASE" ] && [ "$ATTEMPTED_BASE" != "$RECORDED_BASE_BRANCH" ]; then
-          echo "ERROR: base_branch_mismatch: recorded=${RECORDED_BASE_BRANCH} attempted=${ATTEMPTED_BASE}" >&2
-          exit 1
+        UNIQUE_BRANCH="$BR"
+        RPR_RUN_BRANCH="$BR"
+        RPR_HEAD="$(git rev-parse HEAD)"
+        BODY_FILE="$ARTIFACTS_DIR/fallback-body.txt"
+        printf '%s\n' 'FALLBACK PATH: a BLOCKED build was auto-repaired by opus-repair, but the non-interactive run could not reach a human approval gate. The repair commit is pushed here for human review instead of being stranded in the worktree. See run artifacts for the original block reason.' > "$BODY_FILE"
+        PR_CREATE_RC=0
+        gh pr create --repo "$REPO" --head "$BR" --base "$BASE_BRANCH" \
+          --title "FALLBACK: opus-repaired build needs human review" --body-file "$BODY_FILE" || PR_CREATE_RC=$?
+        if ! rpr_find; then
+          echo "ERROR: fallback_pr_unverified (create exit=$PR_CREATE_RC); refusing another create" >&2; exit 1
         fi
-        if [ -z "$ATTEMPTED_BASE" ]; then
-          BASE_BRANCH="$RECORDED_BASE_BRANCH"
-        fi
-        PR_URL=$(gh pr create --repo "$REPO" --head "$BR" --base "$BASE_BRANCH" \
-          --title "FALLBACK: opus-repaired build needs human review" \
-          --body "FALLBACK PATH: a BLOCKED build was auto-repaired by opus-repair, but the non-interactive run could not reach a human approval gate. The repair commit is pushed here for human review instead of being stranded in the worktree. See run artifacts for the original block reason." \
-          2>&1 | tail -1 || true)
-        echo "SALVAGE=pushed branch ${BR}; PR=${PR_URL}"
+        echo "SALVAGE=pushed branch ${BR}; PR=${RPR_URL}"
       else
         echo "SALVAGE=push-failed (work remains in worktree ${WT})"
+        exit 1
       fi
+
+      )
+      SALVAGE_GITHUB_RC=0
+      salvage_publish > "$SALVAGE_GITHUB_LOG" 2>&1 || SALVAGE_GITHUB_RC=$?
+      cat "$SALVAGE_GITHUB_LOG"
+      rm -f "$SALVAGE_GITHUB_LOG"
+      if [ "$SALVAGE_GITHUB_RC" -eq 42 ]; then
+        echo "SALVAGE=preserved_local_only reason=recorded_pr_ownership_refused branch=$BR"
+        exit 1
+      elif [ "$SALVAGE_GITHUB_RC" -ne 0 ]; then
+        echo "SALVAGE=preserved_local_only reason=github_or_lock_unavailable exit=$SALVAGE_GITHUB_RC branch=$BR"
+      fi
+      exit 0
 
   # findings-consolidate: decompose every review finding into a structured ledger row so the
   # human approval gate can show resolution + a concrete suggested fix per UNRESOLVED finding.
@@ -5064,6 +5316,7 @@ nodes:
     load_bearing: true
     bash: |
       set -euo pipefail
+      RPR_ORIGINAL_RUN_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
       # 2026-05-16 quote-fix: see commit-and-push for rationale.
       DECIDE_OUTPUT=$(cat "$ARCHON_NODE_OUT/decide-push-target.out")
       # Extract ONLY the approved-plan block for the PR title/body (F8 fix) -- keep
@@ -5153,7 +5406,8 @@ nodes:
       if [ -z "$TITLE" ]; then
         TITLE="BDC feature Work Order implementation"
       fi
-      BODY_FILE=$(mktemp)
+      BODY_FILE=$(mktemp "${ARTIFACTS_DIR:?run artifacts required}/pr-body.XXXXXX")
+      trap 'rm -f "$BODY_FILE"' EXIT
       {
         echo "## Summary"
         echo "$PLAN_OUTPUT"
@@ -5212,156 +5466,199 @@ nodes:
       export ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1
       echo "acting_login=${ACTING_LOGIN}"
       # existing-pr-base-guard: begin
-      # Accept an existing open PR only when its real baseRefName equals the
-      # base recorded for this run. A different or missing base is a
-      # base_branch_mismatch refusal. Never retarget.
-      lookup_open_pr() {
-        local raw
-        raw=$(gh pr list --head "$UNIQUE_BRANCH" --repo "$REPO" --state open \
-          --json url,baseRefName 2>/dev/null || true)
-        OPEN_PR_RAW="$raw" python3 -c "$(cat <<'PY'
-      import json, os, sys
-      raw = os.environ.get("OPEN_PR_RAW", "").strip()
-      if not raw:
-          raise SystemExit(0)
-      try:
-          data = json.loads(raw)
-      except Exception:
-          raise SystemExit(0)
-      if not isinstance(data, list) or not data or not isinstance(data[0], dict):
-          raise SystemExit(0)
-      item = data[0]
-      url = item.get("url") or ""
-      base = item.get("baseRefName") or ""
-      if not url:
-          raise SystemExit(0)
-      sys.stdout.write(url + "\t" + base)
-      PY
-      )"
+      # ---- BEGIN rpr core (byte-identical across lanes and PR-creation nodes) ----
+      # Run-scoped ownership is mandatory; an invalid existing record fails closed.
+      # The holder PID is encoded in an empty child directory. Reaping uses rmdir
+      # only: an old waiter cannot unlink a new owner's PID record after a race.
+      rpr_release_lock() {
+        rmdir "$ARTIFACTS_DIR/run-pr.lock/holder-${RPR_LOCK_PID}" 2>/dev/null || true
+        rmdir "$ARTIFACTS_DIR/run-pr.lock" 2>/dev/null || true
       }
-      accept_open_pr_or_refuse() {
-        local row url base
-        row="$1"
-        [ -n "$row" ] || return 1
-        url=$(printf '%s' "$row" | cut -f1)
-        base=$(printf '%s' "$row" | cut -f2)
-        [ -n "$url" ] || return 1
-        if [ "$base" != "$RECORDED_BASE_BRANCH" ]; then
-          echo "ERROR: base_branch_mismatch: recorded=${RECORDED_BASE_BRANCH} attempted=${base:-<unverified>}" >&2
-          exit 1
+      rpr_acquire_lock() {
+        local lock="$ARTIFACTS_DIR/run-pr.lock" started=$SECONDS now modified holder pid live other
+        local RPR_LOCK_TIMEOUT=180
+        RPR_LOCK_PID=$BASHPID
+        local -a stale_holders=()
+        while :; do
+          if mkdir "$lock" 2>/dev/null; then
+            if mkdir "$lock/holder-${RPR_LOCK_PID}" 2>/dev/null; then
+              # A concurrent stale reaper may have removed an empty parent during
+              # initialization. Proceed only if this PID is its sole holder.
+              other=0
+              for holder in "$lock"/holder-*; do
+                [ "$holder" = "$lock/holder-${RPR_LOCK_PID}" ] || other=1
+              done
+              if [ "$other" -eq 0 ] && [ -d "$lock/holder-${RPR_LOCK_PID}" ]; then return 0; fi
+              rpr_release_lock
+            fi
+          fi
+          now=$(date +%s)
+          modified=$(stat -c %Y "$lock" 2>/dev/null || printf '%s' "$now")
+          if [ "$((now - modified))" -ge "$RPR_LOCK_TIMEOUT" ]; then
+            live=0
+            stale_holders=()
+            for holder in "$lock"/holder-*; do
+              [ -d "$holder" ] || continue
+              stale_holders+=("$holder")
+              pid="${holder##*/holder-}"
+              case "$pid" in ''|*[!0-9]*) live=1; continue ;; esac
+              if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then live=1; fi
+            done
+            if [ "$live" -eq 0 ]; then
+              for holder in "${stale_holders[@]}"; do
+                pid="${holder##*/holder-}"
+                if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then continue; fi
+                rmdir "$holder" 2>/dev/null || true
+              done
+              rmdir "$lock" 2>/dev/null || true
+              [ -d "$lock" ] || continue
+            fi
+          fi
+          if [ "$((SECONDS - started))" -ge "$RPR_LOCK_TIMEOUT" ]; then
+            echo "ERROR: run_pr_lock_timeout: waited ${RPR_LOCK_TIMEOUT}s; live or unverifiable holder retained" >&2
+            exit 1
+          fi
+          echo "run_pr_guard_waiting: another node holds the run PR lock" >&2
+          sleep 2
+        done
+      }
+      rpr_init() {
+        : "${ARTIFACTS_DIR:?run artifacts required}" "${WORKFLOW_ID:?run id required}"
+        RPR_FILE="$ARTIFACTS_DIR/run-pr.json"
+        mkdir -p "$ARTIFACTS_DIR"
+        rpr_acquire_lock
+        trap 'rm -f "${BODY_FILE:-}" "${RPR_COMMENT:-}"; rpr_release_lock' EXIT
+        RPR_RUN_BRANCH="${RPR_ORIGINAL_RUN_BRANCH:-$(git symbolic-ref --quiet --short HEAD || true)}"
+        case "$RPR_RUN_BRANCH" in archon/task-web-worker-*) ;; *) RPR_RUN_BRANCH="" ;; esac
+        WO_ID="${WO_ID:-}"
+        if [ -z "$WO_ID" ] && [ -f "${ARCHON_NODE_OUT:-}/read-spec.out" ]; then
+          WO_ID="$(sed -n 's/^WO_ID=//p' "$ARCHON_NODE_OUT/read-spec.out" | head -1)"
         fi
-        EXIST="$url"
-        return 0
+        : "${WO_ID:?WO identity required}" "${RECORDED_BASE_BRANCH:?recorded base required}"
+        if [ -z "${UNIQUE_BRANCH:-}" ] && [ -f "${ARCHON_NODE_OUT:-}/commit-and-push.out" ]; then
+          UNIQUE_BRANCH="$(sed -n 's/^unique_branch=//p' "$ARCHON_NODE_OUT/commit-and-push.out" | head -1)"
+        fi
+        if [ -z "${ACTING_LOGIN:-}" ]; then
+          if [ -f /app/scripts/github-service-login.ts ]; then
+            ACTING_LOGIN="$(bun /app/scripts/github-service-login.ts "${ARCHON_GITHUB_SERVICE:-run_nodes}")" || exit 1
+          else ACTING_LOGIN="$(gh api user --jq .login)" || exit 1; fi
+        fi
+        : "${ACTING_LOGIN:?acting login required}"
+        export ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1
+        RPR_HEAD="$(git rev-parse HEAD)"
+        RPR_NUMBER=""; RPR_URL=""; RPR_BRANCH=""; RPR_STATE=""
       }
+      # All four predicates: run branch, ancestor commit, recorded base, acting author.
+      rpr_owned() {
+        local row
+        row="$(RPR_JSON="$1" RPR_ALLOWED="${2:-}" RPR_RUN_BRANCH="$RPR_RUN_BRANCH" RPR_UNIQUE="${UNIQUE_BRANCH:-}" RPR_BASE="$RECORDED_BASE_BRANCH" RPR_ACTOR="$ACTING_LOGIN" python3 -c '
+      import json, os, re
+      try:
+          p = json.loads(os.environ["RPR_JSON"])
+          branch = p["headRefName"]; sha = p["headRefOid"]; n = p["number"]
+          allowed = [os.environ["RPR_RUN_BRANCH"], os.environ["RPR_UNIQUE"], os.environ["RPR_ALLOWED"]]
+          norm = lambda s: s.lower().removeprefix("app/").removesuffix("[bot]")
+          assert branch and branch in allowed
+          assert p["baseRefName"] == os.environ["RPR_BASE"]
+          assert norm(p["author"]["login"]) == norm(os.environ["RPR_ACTOR"])
+          assert type(n) is int and n > 0 and re.fullmatch(r"[0-9a-fA-F]{40}", sha)
+          fields = [str(n), p["url"], branch, sha, p.get("state", "OPEN")]
+          assert all(isinstance(v, str) and v and not any(c in v for c in "\t\r\n") for v in fields)
+          assert re.fullmatch(r"https://github.com/[^/]+/[^/]+/pull/" + str(n), p["url"])
+          print("\t".join(fields))
+      except (ValueError, KeyError, TypeError, AssertionError, AttributeError):
+          raise SystemExit(1)
+      ')" || return 1
+        local sha
+        IFS=$'\t' read -r RPR_NUMBER RPR_URL RPR_BRANCH sha RPR_STATE <<< "$row"
+        git merge-base --is-ancestor "$sha" "$RPR_HEAD" 2>/dev/null || return 1
+      }
+      rpr_record() {
+        RPR_PATH="$RPR_FILE" RPR_NUMBER="$RPR_NUMBER" RPR_URL="$RPR_URL" RPR_BRANCH="$RPR_BRANCH" RPR_BASE="$RECORDED_BASE_BRANCH" RPR_WO="$WO_ID" RPR_RUN="$WORKFLOW_ID" RPR_REPO="$REPO" python3 -c '
+      import json, os
+      e = os.environ
+      record = dict(number=int(e["RPR_NUMBER"]), url=e["RPR_URL"], head_branch=e["RPR_BRANCH"], base=e["RPR_BASE"], wo_id=e["RPR_WO"], run_id=e["RPR_RUN"], repo=e["RPR_REPO"])
+      path = e["RPR_PATH"]
+      if os.path.exists(path):
+          assert json.load(open(path)) == record, "run PR record conflict"
+      else:
+          tmp = path + ".new"
+          try:
+              with open(tmp, "w") as f: json.dump(record, f)
+              os.replace(tmp, path)
+          finally:
+              if os.path.exists(tmp): os.unlink(tmp)
+      ' || { echo "ERROR: run_pr_record_failed" >&2; if [ -e "$RPR_FILE" ]; then exit 42; else exit 1; fi; }
+      }
+      rpr_find() {
+        local number allowed raw candidate
+        if [ -e "$RPR_FILE" ]; then
+          number="$(RPR_PATH="$RPR_FILE" RPR_WO="$WO_ID" RPR_RUN="$WORKFLOW_ID" RPR_REPO="$REPO" RPR_BASE="$RECORDED_BASE_BRANCH" python3 -c '
+      import json, os
+      e = os.environ; p = json.load(open(e["RPR_PATH"]))
+      assert p["wo_id"] == e["RPR_WO"] and p["run_id"] == e["RPR_RUN"] and p["repo"] == e["RPR_REPO"] and p["base"] == e["RPR_BASE"]
+      assert type(p["number"]) is int and p["number"] > 0
+      print(p["number"])
+      ')" || { echo "ERROR: invalid_run_pr_record" >&2; exit 42; }
+          raw="$(gh pr view "$number" --repo "$REPO" --json number,url,headRefName,headRefOid,baseRefName,author,state)" || exit 1
+          # The record can also name the unique salvage branch created by this run.
+          allowed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_branch"])' "$RPR_FILE")" || exit 1
+          case "$allowed" in salvage/opus-repair-*) ;; *) allowed="" ;; esac
+          if ! rpr_owned "$raw" "$allowed"; then
+            echo "ERROR: recorded_pr_ownership_unverified: refusing create or modification" >&2; exit 42
+          fi
+          rpr_record
+          return 0
+        fi
+        local branch
+        for branch in "$RPR_RUN_BRANCH" "${UNIQUE_BRANCH:-}"; do
+          [ -n "$branch" ] || continue
+          raw="$(gh pr list --repo "$REPO" --head "$branch" --state open --limit 200 --json number,url,headRefName,headRefOid,baseRefName,author,state)" || exit 1
+          raw="$(RPR_JSON="$raw" python3 -c 'import json,os; p=json.loads(os.environ["RPR_JSON"]); assert isinstance(p,list); [print(json.dumps(v)) for v in p]')" || exit 1
+          while IFS= read -r candidate; do
+            [ -n "$candidate" ] || continue
+            if rpr_owned "$candidate"; then rpr_record; return 0; fi
+          done <<< "$raw"
+        done
+        RPR_NUMBER=""; RPR_URL=""; RPR_BRANCH=""; RPR_STATE=""
+        return 1
+      }
+      # ---- END rpr core ----
+      rpr_init
       PR_OK=false
       # same-head-adopt: begin
-      PUSHED_SHA="${LOCAL_HEAD:-}"
-      if [ -z "$PUSHED_SHA" ]; then
-        PUSHED_SHA=$(git rev-parse HEAD 2>/dev/null || true)
-      fi
-      if [ -n "$PUSHED_SHA" ]; then
-        same_head_raw=$(gh pr list --repo "$REPO" --state open --limit 200 \
-          --json number,title,headRefOid,headRefName,baseRefName,url 2>/dev/null || true)
-        same_head_row=$(SAME_HEAD_RAW="$same_head_raw" PUSHED_SHA="$PUSHED_SHA" BASE_BRANCH="$BASE_BRANCH" python3 -c "$(cat <<'PY'
-      import json, os, sys
-      raw = os.environ.get("SAME_HEAD_RAW", "").strip()
-      if not raw:
-          raise SystemExit(0)
-      try:
-          data = json.loads(raw)
-      except Exception:
-          raise SystemExit(0)
-      if not isinstance(data, list):
-          raise SystemExit(0)
-      want = os.environ.get("PUSHED_SHA", "")
-      base_branch = os.environ.get("BASE_BRANCH", "")
-      kept = []
-      for item in data:
-          if not isinstance(item, dict):
-              continue
-          if item.get("headRefOid") != want:
-              continue
-          number = item.get("number")
-          if isinstance(number, bool) or not isinstance(number, int):
-              continue
-          kept.append(item)
-      kept.sort(key=lambda item: item["number"])
-      if not kept:
-          raise SystemExit(0)
-
-      def text_field(item, key):
-          value = item.get(key) or ""
-          if not isinstance(value, str):
-              return ""
-          return value
-
-      eligible = []
-      for item in kept:
-          if text_field(item, "baseRefName") == base_branch:
-              eligible.append(item)
-      if not eligible:
-          item = kept[0]
-          url = text_field(item, "url")
-          base = text_field(item, "baseRefName")
-          if not url:
-              raise SystemExit(0)
-          sys.stdout.write("mismatch\t" + url + "\t" + base)
-          raise SystemExit(0)
-      chosen = eligible[0]
-      url = text_field(chosen, "url")
-      if not url:
-          raise SystemExit(0)
-      title = text_field(chosen, "title").replace("\t", " ").replace("\r", " ").replace("\n", " ")
-      others = []
-      chosen_number = chosen["number"]
-      for item in kept:
-          if item["number"] == chosen_number:
-              continue
-          others.append("#" + str(item["number"]) + " " + text_field(item, "url"))
-      sys.stdout.write("adopt\t" + url + "\t" + title + "\t" + ", ".join(others))
-      PY
-      )")
-        same_head_kind=$(printf '%s' "$same_head_row" | cut -f1)
-        if [ "$same_head_kind" = "mismatch" ]; then
-          same_head_rest=$(printf '%s' "$same_head_row" | cut -f2-)
-          accept_open_pr_or_refuse "$same_head_rest"
-        elif [ "$same_head_kind" = "adopt" ]; then
-          same_head_url=$(printf '%s' "$same_head_row" | cut -f2)
-          same_head_title=$(printf '%s' "$same_head_row" | cut -f3)
-          same_head_others=$(printf '%s' "$same_head_row" | cut -f4-)
-          if [ -n "$same_head_others" ]; then
-            printf '%s\n' "WARN: open-pr: same-head duplicates not adopted: ${same_head_others}" >&2
-          fi
-          printf '%s\n' "PR_URL=${same_head_url}"
-          printf '%s\n' "open-pr: adopted existing PR ${same_head_url} at head ${PUSHED_SHA}"
-          printf '%s\n' "open-pr: adopted PR title: ${same_head_title}"
-          printf '%s\n' "PR already exists (no create needed)."
-          PR_OK=true
+      if rpr_find; then
+        # Only ordinary fast-forward pushes to a verified run-owned branch.
+        if [ "$RPR_STATE" = "OPEN" ]; then
+          git push origin "HEAD:${RPR_BRANCH}"
         fi
+        echo "PR_URL=$RPR_URL"
+        echo "open-pr: adopted existing PR $RPR_URL (no create needed)."
+        PR_OK=true
       fi
       # same-head-adopt: end
       if [ "$PR_OK" = "false" ]; then
-        if accept_open_pr_or_refuse "$(lookup_open_pr)"; then
-          echo "PR_URL=$EXIST"
-          echo "PR already exists (no create needed)."
-          PR_OK=true
-        else
-          for attempt in 1 2 3; do
-            if gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" --base "$BASE_BRANCH" 2>&1; then
-              PR_OK=true
-              break
-            fi
-            # Re-check: gh pr create may have created the PR but returned non-zero.
-            if accept_open_pr_or_refuse "$(lookup_open_pr)"; then
-              echo "PR_URL=$EXIST"
-              echo "PR created despite non-zero exit (gh CLI quirk; PR confirmed via list)."
-              PR_OK=true
-              break
-            fi
-            echo "WARN: gh pr create attempt $attempt failed AND no PR found on origin; retrying after $((attempt * 5))s..." >&2
-            sleep $((attempt * 5))
-          done
-        fi
+        for attempt in 1 2 3; do
+          # Re-check after waiting/backoff, including node replay. All creates
+          # keep the same run-owned head/base; GitHub rejects a duplicate pair.
+          if rpr_find; then
+            echo "PR_URL=$RPR_URL"
+            PR_OK=true
+            break
+          fi
+          CREATE_OUT=""
+          CREATE_RC=0
+          CREATE_OUT=$(gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" --base "$BASE_BRANCH" 2>&1) || CREATE_RC=$?
+          printf '%s\n' "$CREATE_OUT"
+          # Verify and record even when gh reports a nonzero exit after creation.
+          if rpr_find; then
+            echo "PR_URL=$RPR_URL"
+            PR_OK=true
+            break
+          fi
+          echo "WARN: gh pr create attempt $attempt returned $CREATE_RC; no owned PR found." >&2
+          if [ "$attempt" -lt 3 ]; then sleep $((attempt * 5)); fi
+        done
       fi
       # existing-pr-base-guard: end
       if [ "$PR_OK" = "false" ]; then
@@ -5371,7 +5668,7 @@ nodes:
         # the PR manually from the pushed branch. Emit a salvage manifest line so the
         # branch + SHA survive in the run output even though the worktree is cleaned.
         echo "PR_CREATE_FAILED_BUT_BRANCH_SAFE: repo=${REPO} branch=${UNIQUE_BRANCH} sha=$(git rev-parse HEAD)" >&2
-        echo "ERROR: gh pr create failed after 3 attempts -- aborting workflow (load_bearing node)." >&2
+        echo "ERROR: gh pr create failed or remains unverified -- aborting workflow (load_bearing node)." >&2
         echo "RECOVERY: open the PR manually -> gh pr create --repo ${REPO} --head ${UNIQUE_BRANCH} --base ${BASE_BRANCH}" >&2
         exit 1
       fi
@@ -5505,7 +5802,7 @@ nodes:
         [ -n "$grep_line" ] || grep_line="MISSING (run-stop-greps produced no output)"
         [ -n "$grep_status" ] || grep_status="missing"
         verdict="keep"
-        if [ "$tests_status" = "failed" ] || [ "$tests_status" = "blocked" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "missing" ] || [ "$grep_status" = "all_dropped" ]; then
+        if [ "$tests_status" = "failed" ] || [ "$tests_status" = "blocked" ] || [ "$tests_status" = "env_unavailable" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "missing" ] || [ "$grep_status" = "all_dropped" ]; then
           verdict="fail"
         fi
         [ "$tests_status" != blocked ] || stop_detail="; blocked_reason=${tests_reason:-$tests_line}"
@@ -5604,6 +5901,10 @@ nodes:
       mec_check() {
         local status="$1" class="$2" tests_status="$3" grep_declared="$4" grep_status="$5" tests_exit="${6:-}" grep_executed="${7:-0}" grep_dropped="${8:-0}" grep_unparsed="${9:-0}" grep_mismatch="${10:-0}" grep_detail="${11:-}" tests_reason="${12:-}" manifest tests_line grep_line
         manifest="$(cat)"
+        if [ "$tests_status" = "env_unavailable" ]; then
+          echo "ENVIRONMENT_UNAVAILABLE: postgres capability absent in this lane (tests_status=env_unavailable)" >&2
+          return 1
+        fi
         if [ "$status" != "PROCEED" ]; then
           echo "NOT_GATED:${status:-UNKNOWN}"
           if [ "$tests_status" = "failed" ]; then

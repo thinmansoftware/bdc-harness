@@ -3,7 +3,8 @@ import { join } from 'path';
 
 // WO-HARNESS-TEST-LOOP-BEFORE-EVIDENCE-GATE-01 (bdc-xo#3436): the evidence-gate
 // shell suites must run in CI, not only on a builder's machine. run-stop-tests.sh
-// is already covered by lane-dprep-shell-tests.test.ts; these are the other four.
+// is already covered by lane-dprep-shell-tests.test.ts; these cover the other
+// evidence suites and the merged environment/repair contract.
 // On win32 `bash` may resolve to WSL and timing checks are unreliable on loaded
 // Windows hosts; the suites run on POSIX CI (ubuntu-latest).
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..');
@@ -14,6 +15,7 @@ const SUITES = [
   'stamp-manifest-evidence.sh',
   'test-repair-guard.sh',
   'stage-evidence.sh',
+  'env-unavailable-test-loop.sh',
 ] as const;
 
 describe.skipIf(process.platform === 'win32')('evidence gate shell suites', () => {

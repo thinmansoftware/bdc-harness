@@ -1733,13 +1733,22 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
       // Judge the gate
       const verdict: GateVerdict = judgeImpl(pollResult);
-      const outcome = classifyAttemptOutcome(fireResult, verdict);
+      const outcome = classifyAttemptOutcome(fireResult, verdict, pollResult);
 
       attempt.outcome = outcome;
       attempt.gateFailReason = verdict.pass ? null : verdict.reason;
       attempt.servedModelId = pollResult.servedModelId;
       attempt.nodeModels = pollResult.nodeModels;
       attempt.completedAt = new Date().toISOString();
+
+      if (outcome === 'environment-unavailable') {
+        status = 'blocked';
+        blockedReason = 'environment_unavailable';
+        attempt.gateFailReason = String(pollResult.rawMetadata.error);
+        console.log(`[smart-cauldron] BLOCKED environment_unavailable: ${attempt.gateFailReason}`);
+        await checkpoint();
+        break;
+      }
 
       if (verdict.pass) {
         // Gate passed -- cascade stops

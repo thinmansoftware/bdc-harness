@@ -14,6 +14,7 @@ export type TierOutcome =
   | 'running' // attempt intent persisted before the workflow lane is fired
   | 'won' // gate passed -- cascade stops
   | 'gate-failed' // ran, built, gate failed -- climb
+  | 'environment-unavailable' // declared test capability absent -- blocked, no climb
   | 'infra-error' // auth/transport failure -- alert, do not count as "too hard"
   | 'progress-timeout' // poll watchdog kill -- run never reached terminal; climb like gate-failed
   | 'cancelled' // externally cancelled; stop, do not climb
@@ -186,7 +187,11 @@ export interface CascadeRunRecord {
    * another rung (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01 fence 3):
    * 'climb_limit_reached'.
    */
-  blockedReason?: 'checkout_failed_no_climb' | 'teardown_unconfirmed' | 'climb_limit_reached';
+  blockedReason?:
+    | 'checkout_failed_no_climb'
+    | 'teardown_unconfirmed'
+    | 'climb_limit_reached'
+    | 'environment_unavailable';
   supervisorRecovery?: {
     ownerId: string;
     fencingToken: number;

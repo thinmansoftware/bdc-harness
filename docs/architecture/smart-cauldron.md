@@ -324,3 +324,68 @@ work escalated over your head.
   assertions, VALIDATION: PASS). Missing or false manifest = auto-reject.
 - **Served vs declared:** the model that actually answered a call vs the model the lane
   YAML pins for that node. Mismatch = integrity flag.
+
+## Environment failures and the single-PR guard
+
+WO-HARNESS-ENV-FAILURE-STOPS-CASCADE-01 keeps missing builder capabilities out of
+the quality ladder. Declared test commands are split at semicolons outside quoted
+arguments. A segment with the `--postgres` flag is skipped unless
+`BDC_BUILDER_POSTGRES=1`; other segments still run and retain their observed counts.
+The status is `env_unavailable`, with reason `postgres capability absent in this lane`.
+The stamped manifest fails validation and the evidence gate fails with
+`ENVIRONMENT_UNAVAILABLE:` (including BLOCKED runs). The conductor records outcome
+`environment-unavailable`, stops `blocked` with reason `environment_unavailable`,
+and preserves the missing-capability detail without climbing, spec repair or escalation.
+Service-looking assertion output alone never triggers this path. This phase supplies
+no Postgres; capability provisioning and a rebuilt-image live outcome remain separate.
+
+The builder prompt forbids `gh pr create`. The harness owns PR creation and records
+the first created or adopted PR in `ARTIFACTS_DIR/run-pr.json` (number, URL, head
+branch, recorded base, WO, run and repository). Adoption requires this run's worktree
+branch or unique pushed branch, an ancestor head, the recorded base and the acting
+author; updates use an ordinary fast-forward push. Foreign PRs are never changed.
+An invalid record fails closed. A run-scoped lock waits up to 180 seconds, polling
+every two seconds, and is removed on exit. The PID is stored in an empty holder
+directory; only locks older than the timeout with no live holder can be reclaimed.
+Primary creation retries the same head/base up to three times, with 5/10-second
+backoff and an ownership-checked lookup before and after each attempt. A nonzero
+create that already opened the PR is adopted; replay performs the same lookup.
+A closed or merged recorded PR still suppresses creation of a replacement.
+
+BLOCKED salvage switches to its own `salvage/opus-repair-*` branch, stages and
+commits locally, and prints `SALVAGE=preserved_uncommitted:<n>` before any run-context,
+lock or GitHub dependency. Missing context, missing/unreachable GitHub, push failure
+or lock timeout reports `SALVAGE=preserved_local_only reason=...` and exits zero with
+the local commit intact. A recorded-PR ownership refusal keeps that commit but exits
+nonzero, with no push, comment or PR creation. Local stage/commit failures also fail.
+
+After local preservation, salvage acquires the run lock and re-reads `run-pr.json`.
+The first node to acquire the lock owns the single PR: a primary winner causes
+salvage to push only its salvage branch, comment once and suppress its PR; a salvage
+winner creates the sole FALLBACK PR and the primary adopts it. Both orders are
+fixture-tested. The existing PR's body is never changed by salvage.
+
+Bash reports `BDC_RUN_EVENT` JSON. The executor accepts only
+`duplicate_pr_suppressed` lines up to 4,096 UTF-8 bytes and stores only the typed
+fields `event_type`, positive safe-integer `existing_pr`, `existing_pr_url` (up to
+2,048 characters), `kind` (`fallback`) and `salvage_branch` (up to 256 characters).
+Unknown keys are dropped; oversized lines, invalid field types, malformed JSON and
+unknown event types are ignored. Storage failures do not abort a node. This event
+protocol cannot yet be forged-proof against untrusted echoed text beyond these
+caps and shape checks; it is reporting, not an authorization signal.
+
+Invocation (local, hermetic fixtures; no provider writes):
+
+```bash
+bash .archon/workflows/defaults/__tests__/env-unavailable-evidence.sh
+bash .archon/workflows/defaults/__tests__/open-pr-adopt-ancestor.sh
+bash .archon/workflows/defaults/__tests__/fallback-pr-suppressed.sh
+bash .archon/workflows/defaults/__tests__/env-unavailable-lanes.sh
+cd packages/smart-cauldron
+SMART_CAULDRON_HERMETIC=1 bun test src/__tests__/environment-unavailable.test.ts
+bun run test
+bun x tsc --noEmit
+cd ../workflows
+bun test src/dag-executor-run-event.test.ts
+bun x tsc --noEmit
+```
