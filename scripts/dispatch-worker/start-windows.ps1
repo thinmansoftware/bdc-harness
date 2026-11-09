@@ -70,6 +70,183 @@ function Start-TunnelProcess {
     return $process
 }
 
+$script:DispatchJobSource = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public sealed class BdcDispatchJob
+{
+    [StructLayout(LayoutKind.Sequential)]
+    struct IO_COUNTERS { public ulong a, b, c, d, e, f; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+    {
+        public long TotalUserTime;
+        public long TotalKernelTime;
+        public long ThisPeriodTotalUserTime;
+        public long ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount;
+        public uint TotalProcesses;
+        public uint ActiveProcesses;
+        public uint TotalTerminatedProcesses;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO
+    {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateJobObjectW(IntPtr attrs, string name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, int len);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool QueryInformationJobObject(IntPtr job, int infoClass, out JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info, int len, IntPtr returned);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool CreateProcessW(string app, StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool TerminateProcess(IntPtr process, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetStdHandle(int which);
+
+    const uint CREATE_SUSPENDED = 0x00000004;
+    const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+    const int STARTF_USESTDHANDLES = 0x00000100;
+
+    IntPtr job;
+    public int ProcessId;
+
+    public static BdcDispatchJob Start(string commandLine, string workingDirectory)
+    {
+        IntPtr hJob = CreateJobObjectW(IntPtr.Zero, null);
+        if (hJob == IntPtr.Zero) throw new InvalidOperationException("CreateJobObject failed: " + Marshal.GetLastWin32Error());
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(hJob, 9, ref limits, Marshal.SizeOf(typeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION))))
+        {
+            int err = Marshal.GetLastWin32Error();
+            CloseHandle(hJob);
+            throw new InvalidOperationException("SetInformationJobObject failed: " + err);
+        }
+        STARTUPINFO si = new STARTUPINFO();
+        si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = GetStdHandle(-10);
+        si.hStdOutput = GetStdHandle(-11);
+        si.hStdError = GetStdHandle(-12);
+        PROCESS_INFORMATION pi;
+        // Suspended, assigned to the job, THEN resumed: the process cannot spawn a child that
+        // escapes the job, because it has not run a single instruction before the assignment.
+        if (!CreateProcessW(null, new StringBuilder(commandLine), IntPtr.Zero, IntPtr.Zero, true, CREATE_SUSPENDED, IntPtr.Zero, workingDirectory, ref si, out pi))
+        {
+            int err = Marshal.GetLastWin32Error();
+            CloseHandle(hJob);
+            throw new InvalidOperationException("CreateProcess failed: " + err);
+        }
+        if (!AssignProcessToJobObject(hJob, pi.hProcess))
+        {
+            int err = Marshal.GetLastWin32Error();
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            CloseHandle(hJob);
+            throw new InvalidOperationException("AssignProcessToJobObject failed: " + err);
+        }
+        ResumeThread(pi.hThread);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        BdcDispatchJob result = new BdcDispatchJob();
+        result.job = hJob;
+        result.ProcessId = pi.dwProcessId;
+        return result;
+    }
+
+    // Live processes in the job, including every descendant that ever started inside it.
+    public int ActiveProcesses()
+    {
+        if (job == IntPtr.Zero) return 0;
+        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info;
+        if (!QueryInformationJobObject(job, 1, out info, Marshal.SizeOf(typeof(JOBOBJECT_BASIC_ACCOUNTING_INFORMATION)), IntPtr.Zero))
+            throw new InvalidOperationException("QueryInformationJobObject failed: " + Marshal.GetLastWin32Error());
+        return (int)info.ActiveProcesses;
+    }
+
+    public bool Terminate()
+    {
+        return job != IntPtr.Zero && TerminateJobObject(job, 1);
+    }
+
+    // Closing the handle kills anything still in the job (KILL_ON_JOB_CLOSE).
+    public void Close()
+    {
+        if (job != IntPtr.Zero) { CloseHandle(job); job = IntPtr.Zero; }
+    }
+}
+'@
+
+# Compiled on first use so dot-sourcing this file stays cheap.
+function Initialize-DispatchJobType {
+    if (-not ('BdcDispatchJob' -as [type])) {
+        Add-Type -TypeDefinition $script:DispatchJobSource -Language CSharp
+    }
+}
+
 # Start-Process joins ArgumentList elements into ONE command line without preserving argument
 # boundaries (Windows PowerShell 5.1), so a path with a space (C:\Users\Jane Doe\...) would be
 # split and the worker would get a truncated --config. Every path argument is quoted here.
@@ -87,10 +264,22 @@ function Start-WorkerProcess {
     )
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
     if ($Executable) { $bun = $Executable } else { $bun = (Get-Command bun -ErrorAction Stop).Source }
-    $process = Start-Process -FilePath $bun -ArgumentList @(
-        'run', (Format-ProcessArgument -Value $Entry), '--config', (Format-ProcessArgument -Value $ConfigPath)
-    ) -WorkingDirectory $repoRoot -NoNewWindow -PassThru
+    # The worker runs inside a Windows Job Object (kill-on-close), created suspended and assigned
+    # BEFORE its first instruction runs. Every descendant it ever spawns is in the job, whatever the
+    # worker's own lifetime: ownership does not depend on polling or on the worker staying alive.
+    $commandLine = (Format-ProcessArgument -Value $bun) + ' run ' + (Format-ProcessArgument -Value $Entry) +
+        ' --config ' + (Format-ProcessArgument -Value $ConfigPath)
+    try {
+        Initialize-DispatchJobType
+        $job = [BdcDispatchJob]::Start($commandLine, $repoRoot)
+    }
+    catch {
+        # Fail loud and closed: without the job there is no guaranteed ownership of descendants.
+        throw ('could not start the worker inside a job object: ' + $_.Exception.Message)
+    }
+    $process = Get-Process -Id $job.ProcessId -ErrorAction Stop
     $null = $process.Handle
+    Add-Member -InputObject $process -MemberType NoteProperty -Name DispatchJob -Value $job -Force
     return $process
 }
 
@@ -192,6 +381,25 @@ function Stop-OwnedProcess {
     param($Process, [hashtable]$Tracked = $null)
     if ($null -eq $Process) { return }
     try {
+        $jobProp = $Process.PSObject.Properties['DispatchJob']
+        if ($null -ne $jobProp -and $null -ne $jobProp.Value) {
+            $job = $jobProp.Value
+            $null = $job.Terminate()
+            $deadline = [DateTime]::UtcNow.AddSeconds(10)
+            while ($true) {
+                $active = [int]$job.ActiveProcesses()
+                if ($active -eq 0 -or [DateTime]::UtcNow -ge $deadline) { break }
+                Start-Sleep -Milliseconds 200
+            }
+            if ($active -gt 0) {
+                $script:DescendantsSurvived += $active
+                Write-LauncherLog ("$active process(es) in the job of owned process " + $Process.Id + " survived the job terminate")
+            }
+            else {
+                $job.Close()
+            }
+            return
+        }
         $rootStart = $null
         try { $rootStart = $Process.StartTime } catch { }
         $survivors = Stop-ProcessTreeVerified -RootId $Process.Id -RootStartTime $rootStart -Tracked $Tracked

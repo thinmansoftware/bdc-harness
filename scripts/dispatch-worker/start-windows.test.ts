@@ -735,3 +735,80 @@ Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     expect(out).toContain('cannot be verified; treated as blocking');
   }, 90000);
 });
+
+// Overseer finding on 6d4733fc5: a worker can spawn a long-running agent and exit BEFORE any
+// supervision poll records it. Ownership must not depend on polling or on the worker staying
+// alive, so the worker runs inside a kill-on-close Windows Job Object assigned before its first
+// instruction. This runs the REAL Start-WorkerProcess and Stop-OwnedProcess with no tracking at all.
+suite('start-windows.ps1 job object ownership', () => {
+  test('an agent spawned by a worker that exits immediately, before any poll, is still stopped and verified', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-job-'));
+    try {
+      const probe = join(dir, 'spawn-agent-and-exit.ts');
+      // `start /b` leaves the ping running after cmd and the worker are gone: a real orphan.
+      await writeFile(
+        probe,
+        [
+          "const c = Bun.spawn(['cmd', '/c', 'start', '/b', 'ping', '-n', '120', '127.0.0.1'], { stdio: ['ignore', 'ignore', 'ignore'] });",
+          'await c.exited;',
+          'process.exit(0);',
+          '',
+        ].join('\n'),
+        'utf8'
+      );
+      const script = join(dir, 'job-scenario.ps1');
+      const q = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+      await writeFile(
+        script,
+        `$ErrorActionPreference = 'Stop'
+. ${q(LAUNCHER)}
+function Write-LauncherLog { param([string]$Message) Write-Output ('LOG=' + $Message) }
+$p = Start-WorkerProcess -ConfigPath ${q(join(dir, 'config.local.json'))} -Executable ${q(process.execPath)} -Entry ${q(probe)}
+$null = $p.WaitForExit(30000)
+Write-Output ('WORKER_EXITED=' + $p.HasExited)
+Start-Sleep -Milliseconds 500
+Write-Output ('JOB_ACTIVE_BEFORE=' + $p.DispatchJob.ActiveProcesses())
+Stop-OwnedProcess -Process $p
+Write-Output ('JOB_ACTIVE_AFTER=' + $p.DispatchJob.ActiveProcesses())
+Write-Output ('SURVIVED_FLAG=' + $script:DescendantsSurvived)
+`,
+        'utf8'
+      );
+      const proc = Bun.spawn(
+        [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          script,
+        ],
+        { stdout: 'pipe', stderr: 'pipe' }
+      );
+      const [out, err] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      expect(out, err).toContain('WORKER_EXITED=True');
+      // the orphaned agent is alive INSIDE THE JOB after the worker exited, and gone after the stop
+      expect(
+        Number(/JOB_ACTIVE_BEFORE=(\d+)/.exec(out)?.[1] ?? '0'),
+        out + err
+      ).toBeGreaterThanOrEqual(1);
+      expect(out, err).toContain('JOB_ACTIVE_AFTER=0');
+      expect(out, err).toContain('SURVIVED_FLAG=0');
+    } finally {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await rm(dir, { recursive: true, force: true });
+          break;
+        } catch (error) {
+          if (attempt >= 20) throw error;
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
+    }
+  }, 90000);
+});

@@ -372,10 +372,14 @@ The launcher now supervises one SSH tunnel and one worker as a pair:
   lease while the old agent keeps running). Limit: the launcher keeps no state across runs, so
   a fresh launcher started by the Task Scheduler restart policy does not remember survivors; a
   survivor after a force tree kill is expected to be rare and shows in the launcher log.
-  The launcher records the worker's descendants on every supervision poll (5 s), so agents are
-  still known after the worker exits and are stopped and verified then; an agent that starts and
-  exits between two polls is not recorded. The root process is verified stopped as well, and a
-  failed kill or any cleanup error counts as a survivor (it blocks a replacement), never as stopped.
+  The worker runs inside a Windows Job Object (kill-on-close): the launcher creates the worker
+  process suspended, assigns it to the job, and only then resumes it, so no descendant can ever
+  escape the job, whatever the worker's own lifetime (a worker that exits immediately after
+  spawning an agent leaves that agent in the job). Stopping the pair terminates the job and
+  verifies the job's active process count reaches zero; closing the launcher kills the job too.
+  If the job cannot be created the worker is not started (fail closed). The tunnel (one ssh
+  process) uses the process-tree stop with root verification. Any survivor, failed kill or cleanup
+  error counts as a survivor and blocks a replacement in that launcher run.
 - Only processes the launcher started are stopped, and only if the PID still has the recorded
   start time. A listener on the local port that the launcher did not start is never terminated:
   it is a loud bounded failure.
