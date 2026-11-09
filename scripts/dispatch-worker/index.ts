@@ -930,6 +930,9 @@ async function main(): Promise<void> {
     lock = await acquireInstanceLock({
       lockFile: defaultLockFile(config.worker_id),
       deathLogFile: defaultDeathLogFile(config.worker_id),
+      log: (line: string): void => {
+        void log.info(line);
+      },
     });
   } catch (error) {
     await log.error('startup refused: another instance appears to be running', error);
