@@ -7,7 +7,7 @@
  * suite is skipped and the launcher behavior must be verified operator-side.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -442,6 +442,68 @@ Write-Output ('RESULT_JSON=' + (ConvertTo-Json -Compress -Depth 6 -InputObject @
     for (const r of regs) {
       expect(r.LogonType).toBe('Interactive');
       expect(r.RunLevel).toBe('Limited');
+    }
+  });
+});
+
+// Overseer finding on 9ac8b51e8: Start-Process joins ArgumentList elements into one command line
+// without preserving argument boundaries, so a config path with a space was split and the worker
+// got a truncated --config. This test runs the REAL Start-WorkerProcess (not a stub) against a
+// probe that records the arguments it receives.
+suite('start-windows.ps1 real worker process adapter', () => {
+  test('a config path and an entry path with spaces each arrive as ONE argument', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch launcher spaces '));
+    try {
+      const probe = join(dir, 'probe entry.ts');
+      const out = join(dir, 'argv out.json');
+      await writeFile(
+        probe,
+        "import { writeFileSync } from 'fs'; writeFileSync(process.env.PROBE_OUT as string, JSON.stringify(process.argv.slice(2)));\n",
+        'utf8'
+      );
+      const spacedConfig = join(dir, 'Jane Doe', 'config.local.json');
+      const script = join(dir, 'adapter-scenario.ps1');
+      const q = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+      await writeFile(
+        script,
+        `$ErrorActionPreference = 'Stop'
+. ${q(LAUNCHER)}
+$p = Start-WorkerProcess -ConfigPath ${q(spacedConfig)} -Executable ${q(process.execPath)} -Entry ${q(probe)}
+$null = $p.WaitForExit(30000)
+Write-Output ('EXIT=' + $p.ExitCode)
+`,
+        'utf8'
+      );
+      const proc = Bun.spawn(
+        [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          script,
+        ],
+        { stdout: 'pipe', stderr: 'pipe', env: { ...process.env, PROBE_OUT: out } }
+      );
+      const [stdout, stderr] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      expect(stdout, stderr).toContain('EXIT=0');
+      const received = JSON.parse(await readFile(out, 'utf8')) as string[];
+      expect(received).toEqual(['--config', spacedConfig]);
+    } finally {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await rm(dir, { recursive: true, force: true });
+          break;
+        } catch (error) {
+          if (attempt >= 20) throw error;
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+      }
     }
   });
 });

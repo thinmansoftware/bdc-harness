@@ -29,8 +29,15 @@ describe('dispatch worker instance lock', () => {
     const lockFile = join(dir, 'worker.lock');
     try {
       await acquireInstanceLock({ lockFile, pid: 222, isAlive: () => true });
+      // unknown identity never counts as proof, so a live holder still blocks; injected so this
+      // test does not spawn the real (slow on Windows) process lookup
       await expect(
-        acquireInstanceLock({ lockFile, pid: 333, isAlive: () => true })
+        acquireInstanceLock({
+          lockFile,
+          pid: 333,
+          isAlive: () => true,
+          lookupIdentity: () => null,
+        })
       ).rejects.toThrow('dispatch_worker_already_running');
     } finally {
       await rm(dir, { recursive: true, force: true });
@@ -276,11 +283,17 @@ describe('dispatch worker instance lock: process identity', () => {
       expect(lock.start_time).not.toBeNull();
       expect(lock.executable).not.toBeNull();
       const observed = defaultLookupIdentity(process.pid);
-      expect(observed).not.toBeNull();
-      expect(classifyAliveHolder(lock, observed)).toEqual({ stale: false });
+      if (observed === null) {
+        // Only a non-Windows sandbox without ps may have no real lookup. The lock above was
+        // still written from the uptime fallback, and an unknown identity never counts as proof.
+        expect(process.platform).not.toBe('win32');
+        expect(classifyAliveHolder(lock, null)).toEqual({ stale: false });
+      } else {
+        expect(classifyAliveHolder(lock, observed)).toEqual({ stale: false });
+      }
       await handle.release();
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 });

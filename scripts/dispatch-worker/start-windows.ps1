@@ -65,12 +65,25 @@ function Start-TunnelProcess {
     return $process
 }
 
+# Start-Process joins ArgumentList elements into ONE command line without preserving argument
+# boundaries (Windows PowerShell 5.1), so a path with a space (C:\Users\Jane Doe\...) would be
+# split and the worker would get a truncated --config. Every path argument is quoted here.
+# -Executable and -Entry exist so a test can run the REAL process adapter against a probe.
+function Format-ProcessArgument {
+    param([string]$Value)
+    return '"' + $Value + '"'
+}
+
 function Start-WorkerProcess {
-    param([string]$ConfigPath)
+    param(
+        [string]$ConfigPath,
+        [string]$Executable = '',
+        [string]$Entry = 'scripts/dispatch-worker/index.ts'
+    )
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-    $bun = (Get-Command bun -ErrorAction Stop).Source
+    if ($Executable) { $bun = $Executable } else { $bun = (Get-Command bun -ErrorAction Stop).Source }
     $process = Start-Process -FilePath $bun -ArgumentList @(
-        'run', 'scripts/dispatch-worker/index.ts', '--config', $ConfigPath
+        'run', (Format-ProcessArgument -Value $Entry), '--config', (Format-ProcessArgument -Value $ConfigPath)
     ) -WorkingDirectory $repoRoot -NoNewWindow -PassThru
     $null = $process.Handle
     return $process
