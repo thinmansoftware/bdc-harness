@@ -10,6 +10,7 @@ import {
   listActiveRunUserMessages,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
+  listMergedVerdictsSince,
   listUnactionedFlagMergeReadyVerdicts,
   promoteObserveOrHealthyVerdict,
   promoteObserveOrHealthyVerdictWithReceipt,
@@ -47,7 +48,8 @@ import { assessBranchRefreshCandidate } from './actions/refresh-rebase';
 import { assessLifecycleCandidate } from './actions/lifecycle';
 import { assessQualifiedMerge } from './actions/merge-ready';
 import { assertOverseerDefaultOff } from './integration-scenarios';
-import { createRealGitHubClientDeps } from './adapters/github-real-deps';
+import { createRealGitHubClientDeps, createRealOctokitClient } from './adapters/github-real-deps';
+import { createStrayBranchReader, runPostMergeStraySweepOnce } from './post-merge-stray-sweep';
 import { runMergeExecutionBridgeOnce } from './merge-execution-bridge';
 import { readWoSpecForMergeHold } from './merge-hold';
 
@@ -107,6 +109,13 @@ export interface OverseerServiceOptions {
    */
   mergeBridgeRun?: () => Promise<unknown>;
   mergeBridgeEnabled?: boolean;
+  /**
+   * Post-merge stray-push sweep (rule (d) of WO-HARNESS-MERGE-OWNER-REWORKING-GUARD-01).
+   * Off unless this is true or OVERSEER_POST_MERGE_SWEEP is 1/true/yes. Hourly by default.
+   */
+  postMergeSweepEnabled?: boolean;
+  postMergeSweepIntervalMs?: number;
+  postMergeSweepRun?: () => Promise<unknown>;
   /** Tests inject a spy for the delivery isolation line; defaults to the module logger. */
   logger?: { error?(obj: Record<string, unknown>, msg: string): void };
 }
@@ -473,6 +482,39 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
     });
 }
 
+const POST_MERGE_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+
+/** Never throws: a sweep failure is logged and the next tick tries again. */
+function createPostMergeStraySweepRun(): (() => Promise<void>) | undefined {
+  const octokit = createRealOctokitClient();
+  const git = octokit.git;
+  if (!git) {
+    log.error({}, 'overseer.post_merge_sweep.bind_failed');
+    return undefined;
+  }
+  const reader = createStrayBranchReader({ pulls: octokit.pulls, git });
+  return async (): Promise<void> => {
+    try {
+      const result = await runPostMergeStraySweepOnce({
+        listMerged: listMergedVerdictsSince,
+        reader,
+      });
+      log.info(
+        {
+          examined: result.examined,
+          alerted: result.alerted.length,
+          alreadyAlerted: result.alreadyAlerted,
+          noStray: result.noStray,
+          unreadable: result.unreadable,
+        },
+        'overseer.post_merge_sweep.tick'
+      );
+    } catch (error) {
+      log.error({ err: error as Error }, 'overseer.post_merge_sweep.iteration_failed_isolated');
+    }
+  };
+}
+
 function resolveDeterministicMergeHandoff(
   options: OverseerServiceOptions,
   bridgeRun: (() => Promise<unknown>) | undefined
@@ -536,6 +578,19 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
           intervalMs: options.mergeBridgeIntervalMs,
           once: options.once,
           run: mergeBridgeRun,
+        })
+      );
+    }
+  }
+  if (options.postMergeSweepEnabled ?? envEnabled(process.env.OVERSEER_POST_MERGE_SWEEP)) {
+    const sweepRun = options.postMergeSweepRun ?? createPostMergeStraySweepRun();
+    if (sweepRun) {
+      tasks.push(
+        runMergeBridgeScheduler({
+          signal: coupledAbort.signal,
+          intervalMs: options.postMergeSweepIntervalMs ?? POST_MERGE_SWEEP_INTERVAL_MS,
+          once: options.once,
+          run: sweepRun,
         })
       );
     }

@@ -20,7 +20,11 @@
 import { createLogger } from '@archon/paths';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { readOverseerActionPolicyFromEnv, type OverseerActionPolicy } from './action-policy';
-import { PR_DISCOVERY_RUN_ID_PREFIX, RUN_BLOCKED_LABEL } from './merge-candidate-discovery';
+import {
+  OWNER_REWORKING_LABEL,
+  PR_DISCOVERY_RUN_ID_PREFIX,
+  RUN_BLOCKED_LABEL,
+} from './merge-candidate-discovery';
 import {
   getRepoBasePolicy,
   hasRepoPolicyEntry,
@@ -918,6 +922,24 @@ async function mergeClaimedVerdict(
         prUrl: pr.htmlUrl,
       },
       'merge-coordinator.run_blocked_label'
+    );
+    return undefined;
+  }
+
+  // The owner marks a PR owner:reworking while the design is being redone. Like a hold it
+  // releases the claim without skip(), attempts or an outcome row, so the next tick
+  // re-evaluates after the owner clears the label. It is NOT HOLD (John's); nothing here sets
+  // or clears it.
+  if (pr.labels?.includes(OWNER_REWORKING_LABEL)) {
+    await options.store.releaseVerdictClaim(verdict.id, 'owner_reworking_label');
+    log.info(
+      {
+        verdictId: verdict.id,
+        runId: verdict.run_id,
+        woId: verdict.wo_id,
+        prUrl: pr.htmlUrl,
+      },
+      'merge-coordinator.owner_reworking_label'
     );
     return undefined;
   }

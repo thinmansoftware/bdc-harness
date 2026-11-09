@@ -309,6 +309,10 @@ export interface RealGitHubOctokitLike {
       data: { run_id?: number; run_attempt?: number };
     }>;
   };
+  /** Optional: branch ref lookup (git.getRef) used by the post-merge stray-push sweep. */
+  git?: {
+    getRef(input: Record<string, unknown>): Promise<{ data: { object: { sha: string } } }>;
+  };
   repos?: {
     compareCommits(input: {
       owner: string;
