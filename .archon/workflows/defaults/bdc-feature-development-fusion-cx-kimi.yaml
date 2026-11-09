@@ -3794,6 +3794,64 @@ nodes:
       validate_implementation_counter AHEAD "$AHEAD_RAW" || exit 1
       AHEAD=$AHEAD_RAW
       if [ "$CHANGED" -eq 0 ] && [ "$AHEAD" -eq 0 ]; then echo "SALVAGE=skip (nothing to preserve)"; exit 0; fi
+      RPR_ORIGINAL_RUN_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
+      # Branch suffix uses $$ (Rule 2: never $WORKFLOW_ID under set -u).
+      BR="salvage/opus-repair-$(basename "$WT")-$$"
+      git switch -c "$BR" || exit 1
+      while IFS= read -r -d '' rec; do
+        [ -n "$rec" ] || continue
+        xy=${rec%"${rec#??}"}
+        path=${rec#???}
+        orig=
+        case "$xy" in
+          R*|C*|?R|?C)
+            IFS= read -r -d '' orig || orig=
+            ;;
+        esac
+        if [ -n "$orig" ]; then
+          if [ -e "$orig" ]; then orig_ok=$(git add -- "$orig" && echo yes); else orig_ok=$(git rm -q --cached --ignore-unmatch -- "$orig" && echo yes); fi
+          if [ "${orig_ok:-}" != "yes" ] || ! git add -- "$path"; then
+            printf 'SALVAGE=stage_failed path=%s\n' "$path"
+            exit 1
+          fi
+        else
+          if ! git add -- "$path"; then
+            printf 'SALVAGE=stage_failed path=%s\n' "$path"
+            exit 1
+          fi
+        fi
+      done < <(git status --porcelain=v1 -z 2>/dev/null || true)
+      if ! git diff --cached --quiet 2>/dev/null; then
+        if [ "$CHANGED" -gt 0 ]; then
+          COMMIT_MSG="salvage(uncommitted): ${CHANGED} files"
+        else
+          COMMIT_MSG="salvage: opus-repaired build preserved for human review (non-interactive BLOCKED)"
+        fi
+        git -c user.name="${CAULDRON_GIT_AUTHOR_NAME:-Thinman Cauldron}" -c user.email="${CAULDRON_GIT_AUTHOR_EMAIL:-admin@bluedevilcollectibles.com}" \
+          commit -m "$COMMIT_MSG" -m "Cauldron-Role: salvage" 2>&1 | tail -1 || { echo "ERROR: salvage_commit_failed" >&2; exit 1; }
+      fi
+      if [ "$CHANGED" -gt 0 ]; then
+        echo "SALVAGE=preserved_uncommitted:${CHANGED}"
+      fi
+      # Local preservation is complete before any context, lock, or GitHub dependency.
+      if [ -z "${ARTIFACTS_DIR:-}" ] || [ -z "${WORKFLOW_ID:-}" ] || [ -z "${RECORDED_BASE_BRANCH:-}" ]; then
+        echo "SALVAGE=preserved_local_only reason=missing_run_context branch=$BR"
+        exit 0
+      fi
+      if ! command -v gh >/dev/null 2>&1; then
+        echo "SALVAGE=preserved_local_only reason=gh_missing branch=$BR"
+        exit 0
+      fi
+      if ! mkdir -p "$ARTIFACTS_DIR"; then
+        echo "SALVAGE=preserved_local_only reason=artifacts_unavailable branch=$BR"
+        exit 0
+      fi
+      SALVAGE_GITHUB_LOG=$(mktemp "$ARTIFACTS_DIR/salvage-github.XXXXXX") || {
+        echo "SALVAGE=preserved_local_only reason=artifacts_unavailable branch=$BR"; exit 0
+      }
+      # A subshell isolates the primary node's fail-closed exits. Only an explicit
+      # recorded-PR ownership refusal (42) is a GitHub-side hard failure here.
+      salvage_publish() (
       REPO=$(git config --get remote.origin.url | sed -E 's#.*github.com[:/]##; s#\.git$##')
       : "${RECORDED_BASE_BRANCH:?recorded base required}"
       if [ -n "${BASE_BRANCH:-}" ] && [ "$BASE_BRANCH" != "$RECORDED_BASE_BRANCH" ]; then
@@ -3802,15 +3860,67 @@ nodes:
       BASE_BRANCH="$RECORDED_BASE_BRANCH"
       # ---- BEGIN rpr core (byte-identical across lanes and PR-creation nodes) ----
       # Run-scoped ownership is mandatory; an invalid existing record fails closed.
+      # The holder PID is encoded in an empty child directory. Reaping uses rmdir
+      # only: an old waiter cannot unlink a new owner's PID record after a race.
+      rpr_release_lock() {
+        rmdir "$ARTIFACTS_DIR/run-pr.lock/holder-${RPR_LOCK_PID}" 2>/dev/null || true
+        rmdir "$ARTIFACTS_DIR/run-pr.lock" 2>/dev/null || true
+      }
+      rpr_acquire_lock() {
+        local lock="$ARTIFACTS_DIR/run-pr.lock" started=$SECONDS now modified holder pid live other
+        local RPR_LOCK_TIMEOUT=180
+        RPR_LOCK_PID=$BASHPID
+        local -a stale_holders=()
+        while :; do
+          if mkdir "$lock" 2>/dev/null; then
+            if mkdir "$lock/holder-${RPR_LOCK_PID}" 2>/dev/null; then
+              # A concurrent stale reaper may have removed an empty parent during
+              # initialization. Proceed only if this PID is its sole holder.
+              other=0
+              for holder in "$lock"/holder-*; do
+                [ "$holder" = "$lock/holder-${RPR_LOCK_PID}" ] || other=1
+              done
+              if [ "$other" -eq 0 ] && [ -d "$lock/holder-${RPR_LOCK_PID}" ]; then return 0; fi
+              rpr_release_lock
+            fi
+          fi
+          now=$(date +%s)
+          modified=$(stat -c %Y "$lock" 2>/dev/null || printf '%s' "$now")
+          if [ "$((now - modified))" -ge "$RPR_LOCK_TIMEOUT" ]; then
+            live=0
+            stale_holders=()
+            for holder in "$lock"/holder-*; do
+              [ -d "$holder" ] || continue
+              stale_holders+=("$holder")
+              pid="${holder##*/holder-}"
+              case "$pid" in ''|*[!0-9]*) live=1; continue ;; esac
+              if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then live=1; fi
+            done
+            if [ "$live" -eq 0 ]; then
+              for holder in "${stale_holders[@]}"; do
+                pid="${holder##*/holder-}"
+                if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then continue; fi
+                rmdir "$holder" 2>/dev/null || true
+              done
+              rmdir "$lock" 2>/dev/null || true
+              [ -d "$lock" ] || continue
+            fi
+          fi
+          if [ "$((SECONDS - started))" -ge "$RPR_LOCK_TIMEOUT" ]; then
+            echo "ERROR: run_pr_lock_timeout: waited ${RPR_LOCK_TIMEOUT}s; live or unverifiable holder retained" >&2
+            exit 1
+          fi
+          echo "run_pr_guard_waiting: another node holds the run PR lock" >&2
+          sleep 2
+        done
+      }
       rpr_init() {
         : "${ARTIFACTS_DIR:?run artifacts required}" "${WORKFLOW_ID:?run id required}"
         RPR_FILE="$ARTIFACTS_DIR/run-pr.json"
         mkdir -p "$ARTIFACTS_DIR"
-        if ! mkdir "$ARTIFACTS_DIR/run-pr.lock" 2>/dev/null; then
-          echo "ERROR: run_pr_guard_busy: refusing concurrent PR creation" >&2; exit 1
-        fi
-        trap 'rm -f "${BODY_FILE:-}" "${RPR_COMMENT:-}"; rmdir "$ARTIFACTS_DIR/run-pr.lock" 2>/dev/null || true' EXIT
-        RPR_RUN_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
+        rpr_acquire_lock
+        trap 'rm -f "${BODY_FILE:-}" "${RPR_COMMENT:-}"; rpr_release_lock' EXIT
+        RPR_RUN_BRANCH="${RPR_ORIGINAL_RUN_BRANCH:-$(git symbolic-ref --quiet --short HEAD || true)}"
         case "$RPR_RUN_BRANCH" in archon/task-web-worker-*) ;; *) RPR_RUN_BRANCH="" ;; esac
         WO_ID="${WO_ID:-}"
         if [ -z "$WO_ID" ] && [ -f "${ARCHON_NODE_OUT:-}/read-spec.out" ]; then
@@ -3870,7 +3980,7 @@ nodes:
               os.replace(tmp, path)
           finally:
               if os.path.exists(tmp): os.unlink(tmp)
-      ' || { echo "ERROR: run_pr_record_failed" >&2; exit 1; }
+      ' || { echo "ERROR: run_pr_record_failed" >&2; if [ -e "$RPR_FILE" ]; then exit 42; else exit 1; fi; }
       }
       rpr_find() {
         local number allowed raw candidate
@@ -3881,13 +3991,13 @@ nodes:
       assert p["wo_id"] == e["RPR_WO"] and p["run_id"] == e["RPR_RUN"] and p["repo"] == e["RPR_REPO"] and p["base"] == e["RPR_BASE"]
       assert type(p["number"]) is int and p["number"] > 0
       print(p["number"])
-      ')" || { echo "ERROR: invalid_run_pr_record" >&2; exit 1; }
+      ')" || { echo "ERROR: invalid_run_pr_record" >&2; exit 42; }
           raw="$(gh pr view "$number" --repo "$REPO" --json number,url,headRefName,headRefOid,baseRefName,author,state)" || exit 1
           # The record can also name the unique salvage branch created by this run.
           allowed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_branch"])' "$RPR_FILE")" || exit 1
           case "$allowed" in salvage/opus-repair-*) ;; *) allowed="" ;; esac
           if ! rpr_owned "$raw" "$allowed"; then
-            echo "ERROR: recorded_pr_ownership_unverified: refusing create or modification" >&2; exit 1
+            echo "ERROR: recorded_pr_ownership_unverified: refusing create or modification" >&2; exit 42
           fi
           rpr_record
           return 0
@@ -3905,54 +4015,10 @@ nodes:
         RPR_NUMBER=""; RPR_URL=""; RPR_BRANCH=""; RPR_STATE=""
         return 1
       }
-      # An ambiguous create is never repeated, including after node replay.
-      rpr_begin_create() {
-        python3 -c 'import sys; open(sys.argv[1], "x").close()' "$ARTIFACTS_DIR/run-pr-create-attempted" || {
-          echo "ERROR: run_pr_create_already_attempted: reconcile provider receipt before retry" >&2; exit 1
-        }
-      }
       # ---- END rpr core ----
       rpr_init
       RPR_EXISTING=false
       if rpr_find; then RPR_EXISTING=true; fi
-      # Branch suffix uses $$ (Rule 2: never $WORKFLOW_ID under set -u).
-      BR="salvage/opus-repair-$(basename "$WT")-$$"
-      git switch -c "$BR" || exit 1
-      while IFS= read -r -d '' rec; do
-        [ -n "$rec" ] || continue
-        xy=${rec%"${rec#??}"}
-        path=${rec#???}
-        orig=
-        case "$xy" in
-          R*|C*|?R|?C)
-            IFS= read -r -d '' orig || orig=
-            ;;
-        esac
-        if [ -n "$orig" ]; then
-          if [ -e "$orig" ]; then orig_ok=$(git add -- "$orig" && echo yes); else orig_ok=$(git rm -q --cached --ignore-unmatch -- "$orig" && echo yes); fi
-          if [ "${orig_ok:-}" != "yes" ] || ! git add -- "$path"; then
-            printf 'SALVAGE=stage_failed path=%s\n' "$path"
-            exit 1
-          fi
-        else
-          if ! git add -- "$path"; then
-            printf 'SALVAGE=stage_failed path=%s\n' "$path"
-            exit 1
-          fi
-        fi
-      done < <(git status --porcelain=v1 -z 2>/dev/null || true)
-      if ! git diff --cached --quiet 2>/dev/null; then
-        if [ "$CHANGED" -gt 0 ]; then
-          COMMIT_MSG="salvage(uncommitted): ${CHANGED} files"
-        else
-          COMMIT_MSG="salvage: opus-repaired build preserved for human review (non-interactive BLOCKED)"
-        fi
-        git -c user.name="${CAULDRON_GIT_AUTHOR_NAME:-Thinman Cauldron}" -c user.email="${CAULDRON_GIT_AUTHOR_EMAIL:-admin@bluedevilcollectibles.com}" \
-          commit -m "$COMMIT_MSG" -m "Cauldron-Role: salvage" 2>&1 | tail -1 || { echo "ERROR: salvage_commit_failed" >&2; exit 1; }
-      fi
-      if [ "$CHANGED" -gt 0 ]; then
-        echo "SALVAGE=preserved_uncommitted:${CHANGED}"
-      fi
       if git push -u origin "HEAD:${BR}" 2>&1 | tail -2; then
         if [ "$RPR_EXISTING" = "true" ]; then
           # duplicate_pr_suppressed: report only; never edit the primary PR or branch.
@@ -3972,7 +4038,6 @@ nodes:
         RPR_HEAD="$(git rev-parse HEAD)"
         BODY_FILE="$ARTIFACTS_DIR/fallback-body.txt"
         printf '%s\n' 'FALLBACK PATH: a BLOCKED build was auto-repaired by opus-repair, but the non-interactive run could not reach a human approval gate. The repair commit is pushed here for human review instead of being stranded in the worktree. See run artifacts for the original block reason.' > "$BODY_FILE"
-        rpr_begin_create
         PR_CREATE_RC=0
         gh pr create --repo "$REPO" --head "$BR" --base "$BASE_BRANCH" \
           --title "FALLBACK: opus-repaired build needs human review" --body-file "$BODY_FILE" || PR_CREATE_RC=$?
@@ -3982,7 +4047,21 @@ nodes:
         echo "SALVAGE=pushed branch ${BR}; PR=${RPR_URL}"
       else
         echo "SALVAGE=push-failed (work remains in worktree ${WT})"
+        exit 1
       fi
+
+      )
+      SALVAGE_GITHUB_RC=0
+      salvage_publish > "$SALVAGE_GITHUB_LOG" 2>&1 || SALVAGE_GITHUB_RC=$?
+      cat "$SALVAGE_GITHUB_LOG"
+      rm -f "$SALVAGE_GITHUB_LOG"
+      if [ "$SALVAGE_GITHUB_RC" -eq 42 ]; then
+        echo "SALVAGE=preserved_local_only reason=recorded_pr_ownership_refused branch=$BR"
+        exit 1
+      elif [ "$SALVAGE_GITHUB_RC" -ne 0 ]; then
+        echo "SALVAGE=preserved_local_only reason=github_or_lock_unavailable exit=$SALVAGE_GITHUB_RC branch=$BR"
+      fi
+      exit 0
 
   # findings-consolidate: decompose every review finding into a structured ledger row so the
   # human approval gate can show resolution + a concrete suggested fix per UNRESOLVED finding.
@@ -4848,6 +4927,7 @@ nodes:
     load_bearing: true
     bash: |
       set -euo pipefail
+      RPR_ORIGINAL_RUN_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
       # 2026-05-16 quote-fix: see commit-and-push for rationale.
       DECIDE_OUTPUT=$(cat "$ARCHON_NODE_OUT/decide-push-target.out")
       # Extract ONLY the approved-plan block for the PR title/body (F8 fix) -- keep
@@ -4999,15 +5079,67 @@ nodes:
       # existing-pr-base-guard: begin
       # ---- BEGIN rpr core (byte-identical across lanes and PR-creation nodes) ----
       # Run-scoped ownership is mandatory; an invalid existing record fails closed.
+      # The holder PID is encoded in an empty child directory. Reaping uses rmdir
+      # only: an old waiter cannot unlink a new owner's PID record after a race.
+      rpr_release_lock() {
+        rmdir "$ARTIFACTS_DIR/run-pr.lock/holder-${RPR_LOCK_PID}" 2>/dev/null || true
+        rmdir "$ARTIFACTS_DIR/run-pr.lock" 2>/dev/null || true
+      }
+      rpr_acquire_lock() {
+        local lock="$ARTIFACTS_DIR/run-pr.lock" started=$SECONDS now modified holder pid live other
+        local RPR_LOCK_TIMEOUT=180
+        RPR_LOCK_PID=$BASHPID
+        local -a stale_holders=()
+        while :; do
+          if mkdir "$lock" 2>/dev/null; then
+            if mkdir "$lock/holder-${RPR_LOCK_PID}" 2>/dev/null; then
+              # A concurrent stale reaper may have removed an empty parent during
+              # initialization. Proceed only if this PID is its sole holder.
+              other=0
+              for holder in "$lock"/holder-*; do
+                [ "$holder" = "$lock/holder-${RPR_LOCK_PID}" ] || other=1
+              done
+              if [ "$other" -eq 0 ] && [ -d "$lock/holder-${RPR_LOCK_PID}" ]; then return 0; fi
+              rpr_release_lock
+            fi
+          fi
+          now=$(date +%s)
+          modified=$(stat -c %Y "$lock" 2>/dev/null || printf '%s' "$now")
+          if [ "$((now - modified))" -ge "$RPR_LOCK_TIMEOUT" ]; then
+            live=0
+            stale_holders=()
+            for holder in "$lock"/holder-*; do
+              [ -d "$holder" ] || continue
+              stale_holders+=("$holder")
+              pid="${holder##*/holder-}"
+              case "$pid" in ''|*[!0-9]*) live=1; continue ;; esac
+              if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then live=1; fi
+            done
+            if [ "$live" -eq 0 ]; then
+              for holder in "${stale_holders[@]}"; do
+                pid="${holder##*/holder-}"
+                if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then continue; fi
+                rmdir "$holder" 2>/dev/null || true
+              done
+              rmdir "$lock" 2>/dev/null || true
+              [ -d "$lock" ] || continue
+            fi
+          fi
+          if [ "$((SECONDS - started))" -ge "$RPR_LOCK_TIMEOUT" ]; then
+            echo "ERROR: run_pr_lock_timeout: waited ${RPR_LOCK_TIMEOUT}s; live or unverifiable holder retained" >&2
+            exit 1
+          fi
+          echo "run_pr_guard_waiting: another node holds the run PR lock" >&2
+          sleep 2
+        done
+      }
       rpr_init() {
         : "${ARTIFACTS_DIR:?run artifacts required}" "${WORKFLOW_ID:?run id required}"
         RPR_FILE="$ARTIFACTS_DIR/run-pr.json"
         mkdir -p "$ARTIFACTS_DIR"
-        if ! mkdir "$ARTIFACTS_DIR/run-pr.lock" 2>/dev/null; then
-          echo "ERROR: run_pr_guard_busy: refusing concurrent PR creation" >&2; exit 1
-        fi
-        trap 'rm -f "${BODY_FILE:-}" "${RPR_COMMENT:-}"; rmdir "$ARTIFACTS_DIR/run-pr.lock" 2>/dev/null || true' EXIT
-        RPR_RUN_BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
+        rpr_acquire_lock
+        trap 'rm -f "${BODY_FILE:-}" "${RPR_COMMENT:-}"; rpr_release_lock' EXIT
+        RPR_RUN_BRANCH="${RPR_ORIGINAL_RUN_BRANCH:-$(git symbolic-ref --quiet --short HEAD || true)}"
         case "$RPR_RUN_BRANCH" in archon/task-web-worker-*) ;; *) RPR_RUN_BRANCH="" ;; esac
         WO_ID="${WO_ID:-}"
         if [ -z "$WO_ID" ] && [ -f "${ARCHON_NODE_OUT:-}/read-spec.out" ]; then
@@ -5067,7 +5199,7 @@ nodes:
               os.replace(tmp, path)
           finally:
               if os.path.exists(tmp): os.unlink(tmp)
-      ' || { echo "ERROR: run_pr_record_failed" >&2; exit 1; }
+      ' || { echo "ERROR: run_pr_record_failed" >&2; if [ -e "$RPR_FILE" ]; then exit 42; else exit 1; fi; }
       }
       rpr_find() {
         local number allowed raw candidate
@@ -5078,13 +5210,13 @@ nodes:
       assert p["wo_id"] == e["RPR_WO"] and p["run_id"] == e["RPR_RUN"] and p["repo"] == e["RPR_REPO"] and p["base"] == e["RPR_BASE"]
       assert type(p["number"]) is int and p["number"] > 0
       print(p["number"])
-      ')" || { echo "ERROR: invalid_run_pr_record" >&2; exit 1; }
+      ')" || { echo "ERROR: invalid_run_pr_record" >&2; exit 42; }
           raw="$(gh pr view "$number" --repo "$REPO" --json number,url,headRefName,headRefOid,baseRefName,author,state)" || exit 1
           # The record can also name the unique salvage branch created by this run.
           allowed="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_branch"])' "$RPR_FILE")" || exit 1
           case "$allowed" in salvage/opus-repair-*) ;; *) allowed="" ;; esac
           if ! rpr_owned "$raw" "$allowed"; then
-            echo "ERROR: recorded_pr_ownership_unverified: refusing create or modification" >&2; exit 1
+            echo "ERROR: recorded_pr_ownership_unverified: refusing create or modification" >&2; exit 42
           fi
           rpr_record
           return 0
@@ -5102,12 +5234,6 @@ nodes:
         RPR_NUMBER=""; RPR_URL=""; RPR_BRANCH=""; RPR_STATE=""
         return 1
       }
-      # An ambiguous create is never repeated, including after node replay.
-      rpr_begin_create() {
-        python3 -c 'import sys; open(sys.argv[1], "x").close()' "$ARTIFACTS_DIR/run-pr-create-attempted" || {
-          echo "ERROR: run_pr_create_already_attempted: reconcile provider receipt before retry" >&2; exit 1
-        }
-      }
       # ---- END rpr core ----
       rpr_init
       PR_OK=false
@@ -5123,8 +5249,14 @@ nodes:
       fi
       # same-head-adopt: end
       if [ "$PR_OK" = "false" ]; then
-        rpr_begin_create
-        for attempt in 1; do
+        for attempt in 1 2 3; do
+          # Re-check after waiting/backoff, including node replay. All creates
+          # keep the same run-owned head/base; GitHub rejects a duplicate pair.
+          if rpr_find; then
+            echo "PR_URL=$RPR_URL"
+            PR_OK=true
+            break
+          fi
           CREATE_OUT=""
           CREATE_RC=0
           CREATE_OUT=$(gh pr create --repo "$REPO" --title "$TITLE" --body-file "$BODY_FILE" --head "$UNIQUE_BRANCH" --base "$BASE_BRANCH" 2>&1) || CREATE_RC=$?
@@ -5135,13 +5267,8 @@ nodes:
             PR_OK=true
             break
           fi
-          # A successful create with delayed read visibility is never retried:
-          # stop rather than risking another PR while its identity is unknown.
-          if [ "$CREATE_RC" -eq 0 ]; then
-            echo "ERROR: created_pr_not_yet_verifiable: refusing another create" >&2
-            exit 1
-          fi
-          echo "ERROR: gh pr create failed; no owned PR found. Refusing another create." >&2
+          echo "WARN: gh pr create attempt $attempt returned $CREATE_RC; no owned PR found." >&2
+          if [ "$attempt" -lt 3 ]; then sleep $((attempt * 5)); fi
         done
       fi
       # existing-pr-base-guard: end

@@ -3706,17 +3706,42 @@ async function persistBashRunEvents(
   output: string
 ): Promise<void> {
   for (const line of output.split(/\r?\n/)) {
-    if (!line.startsWith('BDC_RUN_EVENT ')) continue;
+    if (!line.startsWith('BDC_RUN_EVENT ') || Buffer.byteLength(line, 'utf8') > 4096) continue;
     try {
       const value: unknown = JSON.parse(line.slice('BDC_RUN_EVENT '.length));
       if (typeof value !== 'object' || value === null || Array.isArray(value)) continue;
       const data = value as Record<string, unknown>;
       if (data.event_type !== 'duplicate_pr_suppressed') continue;
+      const {
+        existing_pr: existingPr,
+        existing_pr_url: existingPrUrl,
+        kind,
+        salvage_branch: salvageBranch,
+      } = data;
+      if (
+        typeof existingPr !== 'number' ||
+        !Number.isSafeInteger(existingPr) ||
+        existingPr <= 0 ||
+        typeof existingPrUrl !== 'string' ||
+        existingPrUrl.length === 0 ||
+        existingPrUrl.length > 2048 ||
+        kind !== 'fallback' ||
+        typeof salvageBranch !== 'string' ||
+        salvageBranch.length === 0 ||
+        salvageBranch.length > 256
+      )
+        continue;
       await deps.store.createWorkflowEvent({
         workflow_run_id: runId,
         event_type: 'duplicate_pr_suppressed',
         step_name: nodeId,
-        data,
+        data: {
+          event_type: 'duplicate_pr_suppressed',
+          existing_pr: existingPr,
+          existing_pr_url: existingPrUrl,
+          kind,
+          salvage_branch: salvageBranch,
+        },
       });
     } catch {
       // Invalid JSON or unavailable event storage must never change node outcome.

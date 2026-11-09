@@ -12,12 +12,22 @@ test('bash execution persists only allowlisted events, and never aborts on bad l
   const event = {
     event_type: 'duplicate_pr_suppressed',
     existing_pr: 7,
+    existing_pr_url: 'https://github.com/fixture/repo/pull/7',
     kind: 'fallback',
     salvage_branch: 'salvage/fixture',
   };
   const output = [
     'normal output',
-    `BDC_RUN_EVENT ${JSON.stringify(event)}`,
+    `BDC_RUN_EVENT ${JSON.stringify({ ...event, untrusted_extra: 'must be dropped' })}`,
+    `BDC_RUN_EVENT ${JSON.stringify({ ...event, extra: 'x'.repeat(4096) })}`,
+    `BDC_RUN_EVENT ${JSON.stringify({ ...event, existing_pr: '7' })}`,
+    `BDC_RUN_EVENT ${JSON.stringify({ ...event, existing_pr: 0 })}`,
+    `BDC_RUN_EVENT ${JSON.stringify({ ...event, kind: 1 })}`,
+    `BDC_RUN_EVENT ${JSON.stringify({ ...event, kind: 'other' })}`,
+    `BDC_RUN_EVENT ${JSON.stringify({ ...event, existing_pr_url: {} })}`,
+    `BDC_RUN_EVENT ${JSON.stringify({ ...event, existing_pr_url: 'x'.repeat(2049) })}`,
+    `BDC_RUN_EVENT ${JSON.stringify({ ...event, salvage_branch: false })}`,
+    `BDC_RUN_EVENT ${JSON.stringify({ ...event, salvage_branch: 's'.repeat(257) })}`,
     'BDC_RUN_EVENT {"event_type":"node_completed","passed":true}',
     'BDC_RUN_EVENT {broken',
     'BDC_RUN_EVENT null',
