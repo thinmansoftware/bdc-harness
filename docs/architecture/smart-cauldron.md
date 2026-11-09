@@ -119,6 +119,20 @@ Read `cascade-runs/<slug>/cascade-record.json`:
 - `attempts[].nodeModels` maps each node id to `{ provider, declared, served }`
   from the last `node_completed` or `node_failed` event for that step.
 
+## WO lock orphan recovery (WO-HARNESS-WO-LOCK-RELEASE-ON-CANCEL-01)
+
+The conductor holds one file lock per WO and project at `<out-dir>/wo-locks/wo-<hash>.json` (`/app/cascade-runs/wo-locks/` for the supervised fire, which runs `cd /app`). Only the owning cascade's `finally` released it, so killing the conductor left `status: running` and every later fire was refused as a duplicate.
+
+What happens now (`packages/smart-cauldron/src/wo-lock.ts`):
+
+- The lock records its owner (`pid`, `host`) and a `heartbeatAt` that the running cascade refreshes every 60 seconds.
+- On the next fire a `running` lock is taken over when its owner is provably gone (same-host pid not running) or silent (no heartbeat for `SMART_CAULDRON_WO_LOCK_STALE_MS`, default 300000). The log line is `RECLAIMING stale WO lock ... from cascadeId=...: <reason>`. A live owner is never taken over.
+- Takeover is exclusive: every read-check-write runs under a per-lock `.mutex` file created with an exclusive write, so two fires cannot both claim the same stale lock. A mutex left by a dead process is cleared after 10 seconds; a busy mutex never deletes a lock.
+- The lock also stores the workflow run ids the cascade fired. `POST /api/workflows/runs/:runId/cancel` releases the lock that run belongs to (`releaseWoLocksForRun`). The cascade's own stall-timeout cancel is marked first (`selfCancelRunIds`) so it does not release the lock while the cascade climbs to the next tier.
+- The server finds the directory with `SMART_CAULDRON_OUT_DIR`, defaulting to `<app root>/cascade-runs`; it must equal the conductor's `--out-dir`.
+
+The in-process callers (Taskmaster, the T3 consumer) use the database claim in `packages/server/src/cascade/wo-claim.ts`, which is unchanged. Hand-editing a lock file is never needed; if one is stuck, cancel its run or wait for the heartbeat window.
+
 ## Honest gates are the foundation (unchanged, one addition)
 
 The cascade's whole decision engine is gate verdicts. A lying gate poisons routing:

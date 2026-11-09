@@ -47,7 +47,13 @@ import {
   type OpenWoPullRequest,
   type WoClaim,
 } from './already-satisfied.js';
-import { acquireWoLock, releaseWoLock } from './wo-lock.js';
+import {
+  acquireWoLock,
+  markSelfCancelOnWoLock,
+  recordRunOnWoLock,
+  releaseWoLock,
+  startWoLockHeartbeat,
+} from './wo-lock.js';
 import { classifyError, type ErrorClass } from '@archon/overseer/classify';
 import { runAuthorizedEscalation } from '@archon/overseer/authorized-escalation';
 import { runEscalation } from '@archon/overseer';
@@ -857,6 +863,14 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     return blocked;
   }
 
+  // Orphan recovery (WO-HARNESS-WO-LOCK-RELEASE-ON-CANCEL-01): keep the file
+  // lock's heartbeat fresh while this cascade runs, so a killed conductor is
+  // detectable on the next fire. Callers that inject their own lock (the
+  // database claim) own their liveness, so no file heartbeat is started for them.
+  const stopWoLockHeartbeat: () => void = opts.deps?.acquireWoLock
+    ? (): void => undefined
+    : startWoLockHeartbeat(woId, project, cascadeId, outDir);
+
   // Already-satisfied / claim check before any provider spend (M-123 Q5 / #1546).
   if (!allowClaimed) {
     const existingClaim = await findWoClaimImpl(woId, project);
@@ -897,6 +911,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       };
       const admissionEarly = await createRecordImpl(refused, outDir);
       onAdmission?.(admissionEarly.record, admissionEarly.created);
+      stopWoLockHeartbeat();
       await releaseWoLockImpl(woId, project, cascadeId, outDir);
       return admissionEarly.record;
     }
@@ -1419,6 +1434,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(fetchImpl ? { fetchImpl } : {}),
       });
       attempt.runId = fireResult.runId;
+      // Map the run to this cascade's file lock so a run cancel can release it.
+      if (fireResult.ok && fireResult.runId && !opts.deps?.acquireWoLock) {
+        await recordRunOnWoLock(woId, project, cascadeId, fireResult.runId, outDir);
+      }
       if (fireResult.ok && fireResult.runId && opts.onRunDiscovered) {
         try {
           opts.onRunDiscovered(fireResult.runId, cascadeId, tier.name);
@@ -1571,6 +1590,11 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           // climb) and climb via the same logic used for gate-fail. Every
           // conductor cancel carries a non-empty reason (Scope IN item 4) so
           // run_cancelled.data.reason is never "".
+          // Mark it first: the API cancel releases the file lock of the run it
+          // cancels, but this cascade is alive and is about to climb.
+          if (!opts.deps?.acquireWoLock) {
+            await markSelfCancelOnWoLock(woId, project, cascadeId, resolvedRunId, outDir);
+          }
           const cancelResult = await cancelImpl({
             runId: resolvedRunId,
             apiBaseUrl,
@@ -1821,6 +1845,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
     return record;
   } finally {
+    stopWoLockHeartbeat();
     await releaseWoLockImpl(woId, project, cascadeId, outDir);
   }
 }
