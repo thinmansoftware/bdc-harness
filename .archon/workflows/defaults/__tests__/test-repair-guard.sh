@@ -2,6 +2,87 @@
 . "$(dirname "${BASH_SOURCE[0]}")/evidence-test-lib.sh"
 eval "$(core rst)"
 eval "$(core trg)"
+eval "$(core sme)"
+eval "$(core mec)"
+
+# Amended Tests 2/13: every byte of an existing test is frozen, even without
+# assertion syntax. Track both index entries and files not yet added to git.
+for location in current stage; do
+  for tracking in tracked untracked; do
+    for change in truth whitespace newline binary; do
+      fixture "freeze-$location-$tracking-$change"
+      CURRENT="$WT"
+      TARGET="$WT"
+      if [ "$location" = stage ]; then
+        fixture "freeze-target-$tracking-$change"
+        TARGET="$WT"
+        WT="$CURRENT"; export ARTIFACTS_DIR="$WT/artifacts"
+        printf 'b\tthinmansoftware/other\tbash test_b.sh\n' > "$ARTIFACTS_DIR/evidence/stop-tests.stages"
+        export RST_STAGE_WORKTREES="b=$TARGET"
+      fi
+      printf 'assert False\n' > "$TARGET/test_frozen.py"
+      if [ "$tracking" = tracked ]; then git -C "$TARGET" add test_frozen.py; fi
+      trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+      check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+      case "$change" in
+        truth) printf 'assert True\n' > "$TARGET/test_frozen.py" ;;
+        whitespace) printf 'assert  False\n' > "$TARGET/test_frozen.py" ;;
+        newline) printf 'assert False\r\n' > "$TARGET/test_frozen.py" ;;
+        binary) printf 'assert False\n\000' > "$TARGET/test_frozen.py" ;;
+      esac
+      check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+      unset RST_STAGE_WORKTREES
+    done
+  done
+done
+
+# New tests are allowed, but every forbidden marker is refused even in a new file.
+for marker in 'test.skip(x)' 'it.only(x)' 'xit(x)' 'xdescribe(x)' 'it.todo' 'test.todo' '@pytest.mark.skip' 'unittest.skip'; do
+  fixture "new-marker-$PASS"
+  trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  printf '%s\n' "$marker" > "$WT/new.test.ts"
+  check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+done
+fixture new-test-allowed
+printf 'assert True\n' > "$WT/test_existing.py"
+printf 'bad\n' > "$WT/product"
+trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+printf 'good\n' > "$WT/product"
+printf 'assert True\n' > "$WT/new.test.py"
+check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+
+# Test 14: drive a value-only guard violation through all four real consumers.
+fixture guard-reason
+printf 'bad\n' > "$WT/product"
+printf 'true '\''assert False'\''\nif grep -q good product; then echo "Tests: 1/1"; else echo "Tests: 0/1"; exit 1; fi\n' > "$WT/test_reason.sh"
+export FIX_SPEC=$'WO Class: CODE\nWO_ID=WO-TEST\nSPEC_PATH=bdc-xo:issues/123\nStop 1 (test suite):\n  bash test_reason.sh\nExpected: pass'
+export FIX_MAP=''
+export FIX_INITIAL="$(run_node run-stop-tests)"
+printf 'good\n' > "$WT/product"
+sed -i 's/assert False/assert True/' "$WT/test_reason.sh"
+run_node test-repair until_bash >/dev/null
+export FIX_FINAL="$(run_node run-stop-tests-final)"
+check contains "$FIX_FINAL" 'TESTS_STATUS=blocked'
+check contains "$FIX_FINAL" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+check contains "$FIX_FINAL" 'TESTS_REPAIR_RESULT=guard_violation'
+stamped="$(printf 'Tests: placeholder\nGrep assertions: placeholder\nVALIDATION: PASS\n' | sme_process "$(sme_field TESTS_LINE "$FIX_FINAL")" "$(sme_field TESTS_STATUS "$FIX_FINAL")" N/A not_required 0 "$(sme_field TESTS_BLOCKED_REASON "$FIX_FINAL")")"
+check contains "$(printf '%s\n' "$stamped" | grep '^Stop conditions:')" 'tests_failed_after_repair:guard'
+check contains "$stamped" 'VALIDATION: FAIL'
+printf '%s\n' "$stamped" | mec_check PROCEED CODE "$(mec_field TESTS_STATUS "$FIX_FINAL")" 0 not_required 0 0 0 0 0 '' "$(mec_field TESTS_BLOCKED_REASON "$FIX_FINAL")" > "$TMP/guard-mec-out" 2> "$TMP/guard-mec-err"
+check test "$?" = 1
+check contains "$(cat "$TMP/guard-mec-err")" 'TESTS_BLOCKED: tests_failed_after_repair:guard'
+mkdir -p "$TMP/guard-bin"
+cat > "$TMP/guard-bin/gh" <<'SH'
+#!/usr/bin/env bash
+while [ $# -gt 0 ]; do
+  if [ "$1" = --body-file ]; then cat "$2" > "$ARTIFACTS_DIR/guard-comment"; break; fi
+  shift
+done
+SH
+chmod +x "$TMP/guard-bin/gh"
+PATH="$TMP/guard-bin:$PATH" run_node tests-blocked-report >/dev/null
+check contains "$(cat "$ARTIFACTS_DIR/guard-comment" 2>/dev/null)" 'tests_failed_after_repair:guard'
+
 fixture repaired
 printf 'bad\n' > "$WT/product"
 cat > "$WT/test_value.sh" <<'SH'
