@@ -122,6 +122,26 @@ printf 'changed\n' > "$WT/-flag"
 printf 'changed\n' > "$TMP/outside.sh"
 check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 
+# A foreign stage's command must not freeze a same-named product file in the
+# current worktree: resolve tokens only where that command actually runs.
+fixture declared-scope-current
+CURRENT="$WT"
+printf 'old product\n' > "$WT/check.sh"
+fixture declared-scope-stage
+TARGET="$WT"
+printf 'echo "Tests: 1/1"\n' > "$TARGET/check.sh"
+WT="$CURRENT"; export ARTIFACTS_DIR="$WT/artifacts"
+printf 'bash check.sh\n' > "$ARTIFACTS_DIR/evidence/stop-tests.commands"
+printf 'b\tthinmansoftware/other\tbash check.sh\n' > "$ARTIFACTS_DIR/evidence/stop-tests.stages"
+export RST_STAGE_WORKTREES="b=$TARGET"
+trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+printf 'new product\n' > "$CURRENT/check.sh"
+check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+printf 'old product\n' > "$CURRENT/check.sh"
+printf 'echo "Tests: 2/2"\n' > "$TARGET/check.sh"
+check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+unset RST_STAGE_WORKTREES
+
 # Test 14: drive a value-only guard violation through all four real consumers.
 fixture guard-reason
 printf 'bad\n' > "$WT/product"
