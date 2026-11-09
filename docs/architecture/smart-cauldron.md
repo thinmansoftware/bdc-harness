@@ -324,3 +324,51 @@ work escalated over your head.
   assertions, VALIDATION: PASS). Missing or false manifest = auto-reject.
 - **Served vs declared:** the model that actually answered a call vs the model the lane
   YAML pins for that node. Mismatch = integrity flag.
+
+## Environment failures and the single-PR guard
+
+WO-HARNESS-ENV-FAILURE-STOPS-CASCADE-01 keeps missing builder capabilities out of
+the quality ladder. Declared test commands are split at semicolons outside quoted
+arguments. A segment with the `--postgres` flag is skipped unless
+`BDC_BUILDER_POSTGRES=1`; other segments still run and retain their observed counts.
+The status is `env_unavailable`, with reason `postgres capability absent in this lane`.
+The stamped manifest fails validation and the evidence gate fails with
+`ENVIRONMENT_UNAVAILABLE:` (including BLOCKED runs). The conductor records outcome
+`environment-unavailable`, stops `blocked` with reason `environment_unavailable`,
+and preserves the missing-capability detail without climbing, spec repair or escalation.
+Service-looking assertion output alone never triggers this path. This phase supplies
+no Postgres; capability provisioning and a rebuilt-image live outcome remain separate.
+
+The builder prompt forbids `gh pr create`. The harness owns PR creation and records
+the first created or adopted PR in `ARTIFACTS_DIR/run-pr.json` (number, URL, head
+branch, recorded base, WO, run and repository). Adoption requires this run's worktree
+branch or unique pushed branch, an ancestor head, the recorded base and the acting
+author; updates use an ordinary fast-forward push. Foreign PRs are never changed.
+An invalid record fails closed. A run-scoped lock prevents concurrent creation and
+is removed on exit. An ambiguous create is attempted only once, including replay;
+its receipt must be reconciled before retrying. A closed or merged recorded PR
+still suppresses creation of a replacement.
+
+When BLOCKED salvage finds a recorded or provably owned PR, it switches to its own
+`salvage/opus-repair-*` branch before committing and pushes only that branch. It
+opens no PR, never changes the original branch or body, and posts one comment
+identifying the salvage branch. With no existing PR it opens and records the normal
+FALLBACK PR. Bash reports `BDC_RUN_EVENT` JSON; the executor persists only
+`duplicate_pr_suppressed`, with existing PR, kind `fallback` and salvage branch.
+Malformed JSON, unknown event types and persistence failures do not abort a node.
+
+Invocation (local, hermetic fixtures; no provider writes):
+
+```bash
+bash .archon/workflows/defaults/__tests__/env-unavailable-evidence.sh
+bash .archon/workflows/defaults/__tests__/open-pr-adopt-ancestor.sh
+bash .archon/workflows/defaults/__tests__/fallback-pr-suppressed.sh
+bash .archon/workflows/defaults/__tests__/env-unavailable-lanes.sh
+cd packages/smart-cauldron
+SMART_CAULDRON_HERMETIC=1 bun test src/__tests__/environment-unavailable.test.ts
+bun run test
+bun x tsc --noEmit
+cd ../workflows
+bun test src/dag-executor-run-event.test.ts
+bun x tsc --noEmit
+```

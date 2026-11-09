@@ -3698,6 +3698,32 @@ function recordedBaseBranchEnv(metadata: Record<string, unknown> | null | undefi
   return value.trim();
 }
 
+/** Persist only the bash event protocol's explicit allowlist. Best-effort always. */
+async function persistBashRunEvents(
+  deps: WorkflowDeps,
+  runId: string,
+  nodeId: string,
+  output: string
+): Promise<void> {
+  for (const line of output.split(/\r?\n/)) {
+    if (!line.startsWith('BDC_RUN_EVENT ')) continue;
+    try {
+      const value: unknown = JSON.parse(line.slice('BDC_RUN_EVENT '.length));
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) continue;
+      const data = value as Record<string, unknown>;
+      if (data.event_type !== 'duplicate_pr_suppressed') continue;
+      await deps.store.createWorkflowEvent({
+        workflow_run_id: runId,
+        event_type: 'duplicate_pr_suppressed',
+        step_name: nodeId,
+        data,
+      });
+    } catch {
+      // Invalid JSON or unavailable event storage must never change node outcome.
+    }
+  }
+}
+
 /**
  * Execute a bash (shell script) DAG node.
  * Runs the script via a temp file, captures stdout as node output.
@@ -3867,6 +3893,8 @@ async function executeBashNode(
     // Trim trailing newline from stdout (common shell behavior)
     const output = stdout.replace(/\n$/, '');
 
+    await persistBashRunEvents(deps, workflowRun.id, node.id, output);
+
     if (stderr.trim()) {
       getLog().warn({ nodeId: node.id, stderr: stderr.trim() }, 'bash_node_stderr');
       await safeSendMessage(
@@ -3987,10 +4015,13 @@ async function executeBashNode(
     const err = error as Error & {
       killed?: boolean;
       code?: number | string;
+      stdout?: string;
       stderr?: string;
       scriptFile?: string;
       scriptPreparationFailed?: boolean;
     };
+    // A bash node may report an event before exiting nonzero.
+    await persistBashRunEvents(deps, workflowRun.id, node.id, err.stdout ?? '');
     const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
     const label = `Bash node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
