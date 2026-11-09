@@ -13,6 +13,15 @@
  */
 const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
 
+/**
+ * Suffixes of owner:<suffix> labels that are STATE labels, not people. owner:reworking is the
+ * label an owner sets while redoing the design (WO-HARNESS-MERGE-OWNER-REWORKING-GUARD-01);
+ * it matches the login pattern, so it is excluded here or owner routing would read it as a
+ * person named reworking. Consequence: a GitHub user literally named reworking can never be
+ * an owner by label.
+ */
+const OWNER_STATE_LABEL_SUFFIXES: readonly string[] = ['reworking'];
+
 /** True only for a string that is exactly one valid GitHub login. */
 export function isValidGithubLogin(login: string | null | undefined): login is string {
   return typeof login === 'string' && GITHUB_LOGIN.test(login);
@@ -26,6 +35,7 @@ export function isValidGithubLogin(login: string | null | undefined): login is s
 function ownerLabelLogin(label: string): string | null {
   if (!label.toLowerCase().startsWith('owner:')) return null;
   const login = label.slice('owner:'.length).replace(/^ +| +$/g, '');
+  if (OWNER_STATE_LABEL_SUFFIXES.includes(login.toLowerCase())) return null;
   return isValidGithubLogin(login) ? login : null;
 }
 
