@@ -613,6 +613,31 @@ export async function recordVerdictMergeOutcome(input: {
   return row;
 }
 
+export interface MergedVerdictRow {
+  id: string;
+  run_id: string;
+  wo_id: string;
+  pr_url: string | null;
+  head_sha: string;
+  updated_at: string;
+}
+
+/**
+ * Verdict rows the merge-execution bridge merged since `sinceIso`
+ * (action_reason 'merge_executed'). updated_at is the time the merge outcome
+ * was recorded, which does not change afterwards. Read-only; used by the
+ * post-merge stray-push sweep.
+ */
+export async function listMergedVerdictsSince(sinceIso: string): Promise<MergedVerdictRow[]> {
+  const result = await getDatabase().query<MergedVerdictRow>(
+    `SELECT id, run_id, wo_id, pr_url, head_sha, updated_at FROM overseer_verdicts
+     WHERE action_reason = 'merge_executed' AND pr_url IS NOT NULL AND updated_at >= $1
+     ORDER BY updated_at ASC`,
+    [sinceIso]
+  );
+  return result.rows.map(row => ({ ...row, updated_at: new Date(row.updated_at).toISOString() }));
+}
+
 export interface OverseerVerdictClaim {
   claimed: boolean;
   verdictId?: string;
