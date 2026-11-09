@@ -95,15 +95,26 @@ Where the output goes: the script itself prints to stdout only (text, or the `ou
 | `taskmaster_escalate_p0` | tm_journal escalate_p0 proposals | proposals with outcome `sent` |
 | `overseer_review` | run_review messages to `overseer-reviewer` | `pr_review_submit_receipt` bodies with disposition `approved` or `changes_requested` (any recipient: `operator` before the 2026-11-01 cut-off, `pr-review-log` after) |
 | `overseer_repair` | overseer_actions `escalate_with_evidence` | overseer_actions whose action contains `repair` or `refire` |
-| `overseer_merge` | overseer_actions `flag_merge_ready` | overseer_actions `merged` (all bases: the store does not record the PR base, so production bases are not separated) |
+| `overseer_merge` | overseer_verdicts with `proposed_action` `flag_merge_ready` created in the window | overseer_verdicts with `action_reason` `merge_executed` updated in the window (the merge bridge's merge) PLUS overseer_actions `merged` in the window (the run-linked merge manager's merge); all bases: the store does not record the PR base, so production bases are not separated |
 | `cauldron_runs` | build-lane runs started | of those, status `completed` |
 | `mailbox_<r>` for `operator`, `xo`, `t3-desktop` | rows queued to r | rows to r acknowledged in the window |
 
 Mailbox depth: for each of those recipients, all `queued` rows with no `acknowledged_at` (`depth`), the live part of it (`depth_live`; for `operator`, rows created on or after `OPERATOR_HISTORY_CUTOFF` 2026-11-01T00:00:00.000Z only, because older rows are fenced history), the oldest live row, and its age in hours.
 
+A mailbox outcome is a person acknowledging a row, not activity: nobody acknowledges `operator`, `xo` or `t3-desktop` mail as a workflow. So a `mailbox_<r>` row is printed but NEVER raises `dead_mechanism` (the text output carries a one-line note saying so); unread age is covered by `stale_mailbox`.
+
 Flags:
-- `dead_mechanism:<name>` when input > 0 and outcome = 0.
+- `dead_mechanism:<name>` when input > 0 and outcome = 0, for every mechanism except the `mailbox_<r>` rows.
 - `stale_mailbox:<recipient>` when the oldest live unacknowledged row is more than 24 hours old.
+
+### Activity context (never flagged)
+
+Added by WO-HARNESS-OUTCOME-REPORT-MEASURE-FIX-01. `outcomes.activity` (and an `activity` block in the text output) carries what the event store cannot show, so a quiet store is not read as no work:
+
+- `t3_activity`: always `not_measured`, with `t3_activity_reason` `T3 threads do not write to the event store`. It is never reported as zero.
+- `github_merged_prs_24h`: PRs merged in the 24h window, per repository (`bdc-harness`, `bdc-xo`, `lspro-react`, `shopops`, `shopops-storefront`), read through the report's existing read-only GitHub join (`gh pr list --state merged`, metered to a throwaway in-memory sink, nothing written to `archon.db`). It is `not_measured` under `--no-github` or when any repository cannot be read; the report still exits 0.
+
+No flag is ever derived from this block.
 
 ### Fixture SQL O1-O7 (the contract)
 
@@ -127,9 +138,13 @@ Shown with AS_OF = '2026-11-01 14:30:00'; WS = '2026-10-31T14:30:00.000Z', WE = 
            coalesce(sum(action like '%repair%' or action like '%refire%'),0) as outcome
     from overseer_actions where created_at >= WS and created_at < WE;
 
-    -- O4 overseer_merge (all bases)
-    select coalesce(sum(action='flag_merge_ready'),0) as input, coalesce(sum(action='merged'),0) as outcome
-    from overseer_actions where created_at >= WS and created_at < WE;
+    -- O4 overseer_merge (all bases): the bridge's merge_executed verdicts plus the manager's merged actions
+    select (select count(*) from overseer_verdicts
+            where proposed_action='flag_merge_ready' and created_at >= WS and created_at < WE) as input,
+           ((select count(*) from overseer_verdicts
+             where action_reason='merge_executed' and updated_at >= WS and updated_at < WE)
+            + (select count(*) from overseer_actions
+               where action='merged' and created_at >= WS and created_at < WE)) as outcome;
 
     -- O5 cauldron_runs
     select count(*) as input, coalesce(sum(status='completed'),0) as outcome
