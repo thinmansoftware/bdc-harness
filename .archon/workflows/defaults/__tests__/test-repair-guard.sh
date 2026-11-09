@@ -38,7 +38,7 @@ done
 
 # Round 7 forbids new tests; markers are also forbidden in new product helpers.
 for marker in 'test.skip(x)' 'it.only(x)' 'xit(x)' 'xdescribe(x)' 'it.todo' 'test.todo' '@pytest.mark.skip' 'unittest.skip'; do
-  fixture "new-marker-$PASS"
+  fixture "new-marker-$((PASS+FAIL))"
   trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
   printf '%s\n' "$marker" > "$WT/new-helper.ts"
   check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
@@ -75,6 +75,8 @@ for location in current stage; do
     fixture "allowlist-$location-$change"
     build_fixture run-base
     export BASE_BRANCH=run-base
+    # npm defaults to cmd.exe on Windows; production uses POSIX shell quoting.
+    export npm_config_script_shell=bash
     CURRENT="$WT"; TARGET="$WT"
     export FIX_SPEC=$'WO Class: CODE\nStop 1 (test suite):\n  npm test\nExpected: pass'
     if [ "$location" = stage ]; then
@@ -92,7 +94,10 @@ for location in current stage; do
     check contains "$FIX_INITIAL" 'TESTS_STATUS=failed'
     check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
     case "$change" in
-      package) printf '{"scripts":{"test":"echo \\"Tests: 1/1\\""}}\n' > "$TARGET/package.json" ;;
+      package)
+        printf '{"scripts":{"test":"echo \\"Tests: 1/1\\""}}\n' > "$TARGET/package.json"
+        check test "$(cd "$TARGET" && npm test | rst_parse_counts)" = '1 1'
+        ;;
       untouched) printf 'repair\n' > "$TARGET/b.js" ;;
       delete) rm "$TARGET/b.js" ;;
       untrack) git -C "$TARGET" rm --cached -q b.js; printf 'repair\n' > "$TARGET/b.js" ;;
@@ -117,7 +122,7 @@ for location in current stage; do
       check contains "$out" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
       check contains "$out" 'TESTS_REPAIR_RESULT=guard_violation'
     fi
-    unset RST_STAGE_WORKTREES BASE_BRANCH
+    unset RST_STAGE_WORKTREES BASE_BRANCH npm_config_script_shell
   done
 done
 
