@@ -166,6 +166,56 @@ describe('checkFireEligibility', () => {
     expect(result.eligible).toBe(true);
     expect(result.evidence?.project).toBe('other');
   });
+  // Live 2026-11-09 (bdc-xo#4311): for a WO that TARGETS bdc-xo, author-wo.sh's own
+  // spec PR ("WO: <id>", touching only docs/work-orders/<id>.md) lives in the target
+  // repo, so the WO was refused pr_exists forever once its spec merged.
+  function specDeps(files: Record<number, string[] | 'error'>, prs: unknown[]) {
+    const base = deps(SPEC, prs);
+    const inner = base.fetchImpl;
+    base.fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const m = /\/pulls\/(\d+)\/files/.exec(url);
+      if (m) {
+        const entry = files[Number(m[1])];
+        if (entry === 'error' || entry === undefined) return response({ message: 'boom' }, 500);
+        return response(entry.map(filename => ({ filename, status: 'added' })));
+      }
+      return inner(input, init);
+    }) as typeof fetch;
+    return base;
+  }
+  test('a WO whose only matching PR is its own spec PR is eligible', async () => {
+    const configured = specDeps({ 1: ['docs/work-orders/WO-HARNESS-EXAMPLE-01.md'] }, [
+      { title: 'WO: WO-HARNESS-EXAMPLE-01', state: 'closed', merged_at: '2026-11-09T10:00:00Z' },
+    ]);
+    const result = await checkFireEligibility(TITLE, configured);
+    expect(result.eligible).toBe(true);
+  });
+  test('the superpowers spec path also counts as spec-only', async () => {
+    const configured = specDeps({ 1: ['docs/superpowers/specs/WO-HARNESS-EXAMPLE-01.md'] }, [
+      { title: 'spec WO-HARNESS-EXAMPLE-01', state: 'open' },
+    ]);
+    expect((await checkFireEligibility(TITLE, configured)).eligible).toBe(true);
+  });
+  test('a matching PR touching any non-spec path is still pr_exists', async () => {
+    const configured = specDeps(
+      { 1: ['docs/work-orders/WO-HARNESS-EXAMPLE-01.md', 'src/feature.ts'] },
+      [{ title: 'WO-HARNESS-EXAMPLE-01 build', state: 'open' }]
+    );
+    expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
+  });
+  test('a spec path for a different WO id (prefix collision) is not this WO spec', async () => {
+    const configured = specDeps({ 1: ['docs/work-orders/WO-HARNESS-EXAMPLE-010.md'] }, [
+      { title: 'WO: WO-HARNESS-EXAMPLE-01 and -010', state: 'open' },
+    ]);
+    expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
+  });
+  test('an unreadable PR file list fails closed as pr_exists', async () => {
+    const configured = specDeps({ 1: 'error' }, [
+      { title: 'WO: WO-HARNESS-EXAMPLE-01', state: 'open' },
+    ]);
+    expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
+  });
   test('backs off at the shared GitHub rate-limit floor', async () => {
     const configured = deps();
     configured.fetchImpl = async () => response({}, 200, '4');
