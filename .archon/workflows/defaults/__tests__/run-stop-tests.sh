@@ -465,6 +465,27 @@ assert_eq "plain Test 8: green exit and counts" '0 1 1' "$(cd "$PLAIN_ROOT/exits
 plain_repo async
 printf 'async def test_async():\n    assert False\n' > "$PLAIN_ROOT/async/tests/test_async.py"
 assert_eq "plain Test 9: async-only module stays pytest" 'pytest tests/test_async.py' "$(plain_diff async)"
+plain_repo unittestcase
+printf 'import unittest\n\nclass T(unittest.TestCase):\n    def testFailure(self):\n        self.assertTrue(False)\n' > "$PLAIN_ROOT/unittestcase/tests/test_ut.py"
+assert_eq "plain: unittest TestCase with camelCase testFailure stays pytest" 'pytest tests/test_ut.py' "$(plain_diff unittestcase)"
+if python3 -m pytest --version >/dev/null 2>&1; then
+  (cd "$PLAIN_ROOT/unittestcase" && python3 -m pytest tests/test_ut.py) > "$PLAIN_ROOT/ut.log" 2>&1
+  assert_eq "plain: routed camelCase unittest failure FAILS under pytest (not silently skipped)" '1' "$?"
+else
+  echo "SKIP: plain unittest pytest execution (python3 -m pytest unavailable)"
+fi
+plain_repo unittestmain
+printf 'import unittest\n\nclass T(unittest.TestCase):\n    def testOk(self):\n        pass\n\nif __name__ == "__main__":\n    unittest.main()\n    raise SystemExit(0)\n' > "$PLAIN_ROOT/unittestmain/tests/test_main.py"
+assert_eq "plain: unittest module with guarded main stays pytest" 'pytest tests/test_main.py' "$(plain_diff unittestmain)"
+plain_repo unittestfrom
+printf 'from unittest import TestCase\n\nclass T(TestCase):\n    def checkIt(self):\n        pass\nraise SystemExit(0)\n' > "$PLAIN_ROOT/unittestfrom/tests/test_from.py"
+assert_eq "plain: TestCase subclass beats module-level exit" 'pytest tests/test_from.py' "$(plain_diff unittestfrom)"
+plain_repo camelfunc
+printf 'def testFoo():\n    assert False\n' > "$PLAIN_ROOT/camelfunc/tests/test_camel.py"
+assert_eq "plain: camelCase pytest function stays pytest" 'pytest tests/test_camel.py' "$(plain_diff camelfunc)"
+plain_repo mockplain
+printf 'import sys\nimport unittest.mock\nprint("ok")\nsys.exit(0)\n' > "$PLAIN_ROOT/mockplain/tests/test_mock.py"
+assert_eq "plain: unittest.mock-only script still runs with python3" 'python3 tests/test_mock.py' "$(plain_diff mockplain)"
 plain_repo systemexit
 printf 'def test_unused():\n    assert False\nraise SystemExit(0)\n' > "$PLAIN_ROOT/systemexit/tests/test_exit.py"
 assert_eq "plain: module-level raise overrides definitions" 'python3 tests/test_exit.py' "$(plain_diff systemexit)"

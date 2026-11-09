@@ -2190,8 +2190,12 @@ nodes:
         if [ "$n" -eq 1 ]; then printf 'cd %s && %s' "$hit" "$cmd"; else printf '%s' "$cmd"; fi
       }
       rst_is_plain_script() {
+        # Framework markers win: a module with a TestCase subclass (any method naming, e.g.
+        # testFailure) or a pytest/unittest import keeps pytest routing; python3 would exit 0
+        # without running unittest cases when unittest.main() is absent.
+        if grep -qE '^[[:blank:]]*(import[[:blank:]]+unittest([[:blank:]]*(,|#|$))|(import|from)[[:blank:]]+pytest([[:blank:].]|$)|class[[:blank:]]+[A-Za-z_][A-Za-z0-9_]*[[:blank:]]*\([^)]*TestCase)' "$1"; then return 1; fi
         grep -qE '^(sys\.exit[[:blank:]]*\(|raise[[:blank:]]+SystemExit([[:blank:](]|$))' "$1" \
-          || ! grep -qE '^[[:blank:]]*(async[[:blank:]]+)?def[[:blank:]]+test_' "$1"
+          || ! grep -qE '^[[:blank:]]*(async[[:blank:]]+)?def[[:blank:]]+test' "$1"
       }
       rst_is_plain_node_script() {
         local file="$1" name
