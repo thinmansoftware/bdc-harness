@@ -20,7 +20,12 @@ import { createCancelController, runAcpAgent, type AcpRunResult } from './acp/se
 import { createMcpCancelController, runMcpAgent, type McpRunResult } from './mcp/session';
 import { resolveOperatorToken } from './credentials';
 import { realSeatPreflightDeps, runSeatPreflight, type SeatConfig } from './seat-preflight';
-import { acquireInstanceLock, readRestartEvidence, type InstanceLockHandle } from './instance-lock';
+import {
+  acquireInstanceLock,
+  EXIT_ALREADY_RUNNING,
+  readRestartEvidence,
+  type InstanceLockHandle,
+} from './instance-lock';
 import { createWorkerLog, type WorkerLog } from './worker-log';
 import {
   CONNECT_FAILURE_EXIT_MS,
@@ -937,7 +942,9 @@ async function main(): Promise<void> {
   } catch (error) {
     await log.error('startup refused: another instance appears to be running', error);
     console.error(String(error));
-    process.exit(1);
+    process.exit(
+      String(error).includes('dispatch_worker_already_running') ? EXIT_ALREADY_RUNNING : 1
+    );
     return;
   }
   await log.info(`startup: acquired instance lock for worker_id=${config.worker_id}`);

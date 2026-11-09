@@ -26,6 +26,12 @@ import { basename, dirname } from 'path';
  *   kind of local-machine state, so the lockfile follows the same pattern.
  */
 
+/**
+ * Process exit code when a GENUINE live instance already holds the lock. The Windows
+ * launcher (start-windows.ps1) reads it to stop retrying instead of looping.
+ */
+export const EXIT_ALREADY_RUNNING = 75;
+
 export interface InstanceLockOptions {
   lockFile: string;
   /** Injected for tests; defaults to process.pid. */
