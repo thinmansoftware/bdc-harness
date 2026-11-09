@@ -14,7 +14,9 @@ are refused. A guard violation terminates repair as BLOCKED with
 the evidence gate's stderr and the blocked-report comment.
 
 `run-stop-tests-final` supplies evidence to the validator, manifest stamp and
-evidence gate. CODE/MIXED blocked evidence fails closed with `TESTS_BLOCKED:`.
+evidence gate. `run-stop-greps` waits for that final test run, so all three
+consumers receive grep evidence from the repaired worktree.
+CODE/MIXED blocked evidence fails closed with `TESTS_BLOCKED:`.
 Existing non-PROCEED `NOT_GATED` and base-red behavior remains in place.
 
 ## Saved inputs and stage directories
@@ -27,6 +29,10 @@ keyed by absolute directory and records raw-byte SHA-256 hashes of tracked and
 untracked test files in the current checkout plus every available stage worktree
 resolved from the saved plan. Checks revisit those saved roots even
 if a mapping disappears; a missing snapshotted directory fails closed.
+The freeze also includes existing regular files named by saved command tokens,
+including ignored scripts such as `check.sh`. Paths resolve in the command's
+worktree and honor a leading `cd`; flags, interpreter names and paths outside
+that worktree are excluded.
 
 When canonical stages are declared, their verify commands supersede Stop test
 blocks and the project-map command. Each stage executes in its declared worktree.
