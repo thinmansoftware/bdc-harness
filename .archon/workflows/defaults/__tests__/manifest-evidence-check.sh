@@ -250,5 +250,12 @@ assert_eq "GREP_DECLARED" "9" "$(mec_field GREP_DECLARED "$(printf 'GREP_DECLARE
 assert_eq "missing -> empty" "" "$(mec_field GREP_DECLARED "")"
 
 echo
+# WO #3436: blocked status must fail closed even with a numeric Tests line.
+OUT="$(printf 'Tests: 1/1 (bash x.sh)\nGrep assertions: N/A\n' | mec_check PROCEED CODE blocked 0 not_required 127 0 0 0 0 '' missing_tool:pytest 2>&1)"
+RC=$?
+assert_eq "blocked numeric evidence exits 1" "1" "$RC"
+assert_contains "blocked has named prefix" "TESTS_BLOCKED: missing_tool:pytest" "$OUT"
+OUT="$(printf 'Tests: one: 1/1 (bash a.sh) | two: 2/2 (bash b.sh)\nGrep assertions: N/A\n' | mec_check PROCEED MIXED passed 0 not_required 0 2>&1)"
+assert_eq "stage PASS is accepted" "OK" "$OUT"
 echo "manifest-evidence-check.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
