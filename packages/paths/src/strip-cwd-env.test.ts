@@ -311,6 +311,123 @@ describe('stripCwdEnv -- NODE_OPTIONS removals are reported, never silent', () =
     expect(process.env.NODE_OPTIONS).toBeUndefined();
   });
 
+  const nodeOptionsLine = (): string => {
+    const line = stderrWrites.find(w => w.startsWith('[archon] NODE_OPTIONS: removed'));
+    expect(line).toBeDefined();
+    return line ?? '';
+  };
+
+  const TAIL =
+    '. Add a flag to SAFE_NODE_OPTIONS_FLAGS in packages/paths/src/strip-cwd-env.ts to pass it to lanes.\n';
+
+  it('never prints a space-separated value (--require /path)', () => {
+    process.env.NODE_OPTIONS = '--require /home/secret/preload.js --no-experimental-webstorage';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 1 flag(s) not on the safe list (--require); kept --no-experimental-webstorage' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+    expect(nodeOptionsLine()).not.toContain('preload');
+    expect(nodeOptionsLine()).not.toContain('/home');
+    expect(process.env.NODE_OPTIONS).toBe('--no-experimental-webstorage');
+  });
+
+  it('never prints a double-quoted value that contains spaces', () => {
+    process.env.NODE_OPTIONS = '--require "/home/my secret/pre load.js" --inspect';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 2 flag(s) not on the safe list (--require, --inspect); NODE_OPTIONS unset' +
+        TAIL
+    );
+    for (const fragment of ['secret', 'my', 'pre', 'load', '/home', '"']) {
+      expect(nodeOptionsLine()).not.toContain(fragment);
+    }
+    expect(process.env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  it('keeps an escaped quote inside a quoted value from splitting it', () => {
+    process.env.NODE_OPTIONS = '--require "a\\" b secret" --no-experimental-webstorage';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 1 flag(s) not on the safe list (--require); kept --no-experimental-webstorage' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+  });
+
+  it('never prints a single-quoted value that contains spaces', () => {
+    process.env.NODE_OPTIONS =
+      "--import 'file:///c:/my secret/hook.mjs' --no-experimental-webstorage";
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 1 flag(s) not on the safe list (--import); kept --no-experimental-webstorage' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+    expect(nodeOptionsLine()).not.toContain('hook');
+    expect(nodeOptionsLine()).not.toContain('file:');
+  });
+
+  it('never prints a quoted value attached with equals', () => {
+    process.env.NODE_OPTIONS = '--require="/home/my secret/x.js" --no-experimental-webstorage';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 1 flag(s) not on the safe list (--require); kept --no-experimental-webstorage' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+    expect(nodeOptionsLine()).not.toContain('x.js');
+  });
+
+  it('logs only the name for the equals form, mixed with a safe flag', () => {
+    process.env.NODE_OPTIONS =
+      '--require=/home/secret/preload.js --no-experimental-webstorage --inspect=0.0.0.0:9229';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 2 flag(s) not on the safe list (--require, --inspect); kept --no-experimental-webstorage' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+    expect(nodeOptionsLine()).not.toContain('9229');
+    expect(process.env.NODE_OPTIONS).toBe('--no-experimental-webstorage');
+  });
+
+  it('logs a placeholder for unrecognized tokens and never echoes them', () => {
+    process.env.NODE_OPTIONS =
+      'hunter2-token --no-experimental-webstorage /home/secret/stray.js --pass=word';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 3 flag(s) not on the safe list (<unrecognized>, <unrecognized>, --pass); kept --no-experimental-webstorage' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('hunter2');
+    expect(nodeOptionsLine()).not.toContain('secret');
+    expect(nodeOptionsLine()).not.toContain('word');
+    expect(process.env.NODE_OPTIONS).toBe('--no-experimental-webstorage');
+  });
+
+  it('logs a placeholder for an unquoted value with spaces after an equals flag', () => {
+    process.env.NODE_OPTIONS = '--require=/home/my secret/x.js';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 2 flag(s) not on the safe list (--require, <unrecognized>); NODE_OPTIONS unset' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+    expect(nodeOptionsLine()).not.toContain('x.js');
+  });
+
+  it('logs a placeholder when a whole flag-and-value is quoted as one token', () => {
+    process.env.NODE_OPTIONS = '"--require /home/secret/x.js"';
+    stripCwdEnv(tmpDir);
+    expect(nodeOptionsLine()).toBe(
+      '[archon] NODE_OPTIONS: removed 1 flag(s) not on the safe list (<unrecognized>); NODE_OPTIONS unset' +
+        TAIL
+    );
+    expect(nodeOptionsLine()).not.toContain('secret');
+  });
+
   it('prints nothing when every flag is allowlisted', () => {
     process.env.NODE_OPTIONS = '--no-experimental-webstorage';
     stripCwdEnv(tmpDir);
