@@ -20,6 +20,10 @@ A missing spec (HTTP 404) is not a hold. Any other spec-read failure, including 
 
 A pull request label named exactly `merge-hold` (case-sensitive) holds any pull request, including ones that are not tied to a work order. The bridge records `merge_hold_label` and does not read a spec. Removing the label lets the next tick merge through the existing guards.
 
+## Owner reworking label
+
+A pull request label named exactly `owner:reworking` (case-sensitive) stops an otherwise mergeable pull request while its owner redoes the design. The bridge releases the verdict claim with the reason `owner_reworking_label` and logs `merge-coordinator.owner_reworking_label`, with no skip, no retry attempt and no outcome row, like `merge_hold_label`. Candidate discovery excludes the PR with the named exclusion `owner_reworking_label`, and the run-linked merge manager holds it with the same reason. Only the owner sets and clears the label; nothing in the harness does, and removing it lets the next tick merge through the existing guards. It is NOT HOLD: HOLD stays John's. `owner:reworking` is a state, not a person: owner routing never reads the suffix `reworking` as a login.
+
 | Variable | Default | Meaning |
 | --- | ---: | --- |
 | `OVERSEER_MERGE_RETRY_BASE_MINUTES` | 10 | Initial retry delay |
