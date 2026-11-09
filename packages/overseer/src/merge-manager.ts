@@ -10,6 +10,7 @@ import {
   verifyMergeProvenance,
   type MergeProvenanceResult,
 } from './merge-provenance';
+import { OWNER_REWORKING_LABEL } from './merge-candidate-discovery';
 import type { QualifiedMergeEvidence } from './actions/merge-ready';
 import {
   getRepoBasePolicy,
@@ -594,6 +595,11 @@ async function mergePreconditionMiss(
 ): Promise<string | null> {
   const headSha = evidence.head_sha;
   const checks = evidence.required_checks;
+  // The owner marks a PR owner:reworking while redoing the design; it must not merge.
+  // This is NOT HOLD (John's): nothing here sets or clears the label.
+  if (evidence.record.prEvidence.labels?.includes(OWNER_REWORKING_LABEL)) {
+    return 'owner_reworking_label';
+  }
   if (
     checks.length === 0 ||
     checks.some(check => check.conclusion !== 'success' || check.head_sha !== headSha)

@@ -250,6 +250,92 @@ describe('board authority db', () => {
     expect(nonholderRelease).toEqual({ ok: false, reason: 'stale_xo_lease_token' });
   });
 
+  // The XO lease client (bdc-xo scripts/xo-lease/xo-lease.ps1) verifies its holder proof on every
+  // ensure by calling acquire with the same holder_id and token. That is only safe because the
+  // server treats it as a read: same holder_id + token hash on an ACTIVE lease returns the existing
+  // lease with no UPDATE and no audit row (acquireXoLease, the early return before any write).
+  test('re-acquire by the same holder and token on an active lease changes nothing and writes no audit row', async () => {
+    const first = await acquireXoLease({
+      principal: XO,
+      holder_id: 'holder-a',
+      holder_token: 'token-a',
+      lease_duration_ms: 60_000,
+    });
+    expect(first.ok).toBe(true);
+    const leaseBefore = await db.query('SELECT * FROM board_xo_leases WHERE id = 1');
+    const auditBefore = await db.query('SELECT * FROM board_audit_events ORDER BY created_at, id');
+    expect(auditBefore.rows).toHaveLength(1);
+
+    // a different (longer) duration must not extend an existing lease either
+    const again = await acquireXoLease({
+      principal: XO,
+      holder_id: 'holder-a',
+      holder_token: 'token-a',
+      lease_duration_ms: 3_600_000,
+    });
+
+    expect(again.ok).toBe(true);
+    expect(again.lease).toEqual(first.lease);
+    expect((await db.query('SELECT * FROM board_xo_leases WHERE id = 1')).rows).toEqual(
+      leaseBefore.rows
+    );
+    expect(
+      (await db.query('SELECT * FROM board_audit_events ORDER BY created_at, id')).rows
+    ).toEqual(auditBefore.rows);
+  });
+
+  test('re-acquire with the right holder_id but a wrong token is rejected and only adds the rejection audit row', async () => {
+    const first = await acquireXoLease({
+      principal: XO,
+      holder_id: 'holder-a',
+      holder_token: 'token-a',
+      lease_duration_ms: 60_000,
+    });
+    expect(first.ok).toBe(true);
+    const leaseBefore = await db.query('SELECT * FROM board_xo_leases WHERE id = 1');
+
+    const wrong = await acquireXoLease({
+      principal: XO,
+      holder_id: 'holder-a',
+      holder_token: 'token-WRONG',
+    });
+
+    expect(wrong).toEqual({ ok: false, reason: 'active_xo_lease_exists' });
+    expect((await db.query('SELECT * FROM board_xo_leases WHERE id = 1')).rows).toEqual(
+      leaseBefore.rows
+    );
+    const events = await db.query<{ event_type: string }>(
+      'SELECT event_type FROM board_audit_events ORDER BY created_at, id'
+    );
+    expect(events.rows.map(row => row.event_type)).toEqual([
+      'xo_lease_acquired',
+      'xo_lease_acquire_rejected',
+    ]);
+  });
+
+  test('the same holder re-acquiring an EXPIRED lease takes it over with fence plus one and a new lease id', async () => {
+    const first = await acquireXoLease({
+      principal: XO,
+      holder_id: 'holder-a',
+      holder_token: 'token-a',
+      lease_duration_ms: 1,
+    });
+    expect(first.lease?.fencing_token).toBe(1);
+
+    await Bun.sleep(10);
+    const second = await acquireXoLease({
+      principal: XO,
+      holder_id: 'holder-a',
+      holder_token: 'token-a',
+      lease_duration_ms: 60_000,
+    });
+
+    expect(second.ok).toBe(true);
+    expect(second.lease?.fencing_token).toBe(2);
+    expect(second.lease?.lease_id).not.toBe(first.lease?.lease_id);
+    expect(second.lease?.holder_id).toBe('holder-a');
+  });
+
   test('injected principal resolver authenticates eligible principals only', async () => {
     const dependencies = {
       resolvePrincipal: mock(async ({ principal_token }: { principal_token?: string }) =>

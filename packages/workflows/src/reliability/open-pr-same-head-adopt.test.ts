@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
-import { tmpdir } from 'os';
-import { delimiter, join } from 'path';
+import { readdirSync, readFileSync } from 'fs';
+import { join } from 'path';
+import { runLanePrFixture } from './run-pr.test-fixture';
 
 const LANE_FILES = [
   'bdc-feature-development.yaml',
@@ -24,30 +24,6 @@ const BUNDLE_PATH = join(import.meta.dir, '../defaults/bundled-defaults.generate
 const GUARD_BEGIN = '# existing-pr-base-guard: begin';
 const GUARD_END = '# existing-pr-base-guard: end';
 
-/** Fixed head SHA S used by every same-head scenario. */
-const HEAD_SHA = '0123456789abcdef0123456789abcdef01234567';
-const OTHER_SHA = 'fedcba9876543210fedcba9876543210fedcba98';
-const UNIQUE_BRANCH = 'feat/wo-x-thread-abc';
-const PR_URL_10 = 'https://github.com/acme/widgets/pull/10';
-const PR_URL_11 = 'https://github.com/acme/widgets/pull/11';
-
-interface OpenPr {
-  number: number;
-  title: string;
-  headRefOid: string;
-  headRefName: string;
-  baseRefName: string;
-  url: string;
-}
-
-function openPr(input: OpenPr): OpenPr {
-  return input;
-}
-
-/**
- * YAML block-scalar dedent of the shipped existing-PR guard, matching
- * run-branch-identity.test.ts. The bytes executed are the workflow's, not a retype.
- */
 function existingPrGuard(yaml: string): string {
   const text = yaml.replace(/\r\n/g, '\n');
   const at = text.indexOf(GUARD_BEGIN);
@@ -70,221 +46,24 @@ function laneGuard(file: string): string {
   return existingPrGuard(readFileSync(join(DEFAULTS_DIR, file), 'utf8'));
 }
 
-/**
- * Git Bash form of a Windows directory. `C:\foo` and `C:/foo` both become `/c/foo`.
- */
-function toGitBashDir(dir: string): string {
-  return dir
-    .replace(/\\/g, '/')
-    .replace(/^([A-Za-z]):/, (_match, drive: string) => `/${drive.toLowerCase()}`);
-}
-
-interface GuardRun {
-  code: number;
-  stdout: string;
-  stderr: string;
-  args: string;
-  createArgs: string;
-  creates: number;
-}
-
-function runOpenPrGuard(guard: string, sameHeadJson: string, sameHeadRc: number): GuardRun {
-  const dir = mkdtempSync(join(tmpdir(), 'same-head-adopt-'));
-  try {
-    const sameHeadPath = join(dir, 'same-head.json');
-    const argsLog = join(dir, 'args.log');
-    const createArgs = join(dir, 'create.args');
-    const createCount = join(dir, 'create.count');
-    writeFileSync(sameHeadPath, sameHeadJson);
-    writeFileSync(argsLog, '');
-    writeFileSync(createArgs, '');
-    writeFileSync(createCount, '0');
-    const gh = join(dir, 'gh');
-    writeFileSync(
-      gh,
-      [
-        '#!/bin/bash',
-        'printf \'%s\\n\' "$*" >> "$GH_ARGS_LOG"',
-        'if [ "$1" = "pr" ] && [ "$2" = "list" ]; then',
-        '  case "$*" in',
-        '    *headRefOid*)',
-        '      if [ "$GH_SAME_HEAD_RC" -ne 0 ]; then',
-        '        exit "$GH_SAME_HEAD_RC"',
-        '      fi',
-        '      cat "$GH_SAME_HEAD_JSON"',
-        '      exit 0',
-        '      ;;',
-        '  esac',
-        "  printf '%s\\n' '[]'",
-        '  exit 0',
-        'fi',
-        'if [ "$1" = "pr" ] && [ "$2" = "create" ]; then',
-        '  n=$(cat "$GH_CREATE_COUNT")',
-        '  n=$((n + 1))',
-        '  printf \'%s\' "$n" > "$GH_CREATE_COUNT"',
-        '  printf \'%s\\n\' "$*" >> "$GH_CREATE_ARGS"',
-        "  printf '%s\\n' 'https://github.com/acme/widgets/pull/created'",
-        '  exit 0',
-        'fi',
-        'echo "unexpected gh: $*" >&2',
-        'exit 96',
-        '',
-      ].join('\n')
+describe('open-pr owned ancestor adoption', () => {
+  for (const [name, fixtureCase] of [
+    ['adopts an owned ancestor PR without a duplicate', 'own-ancestor'],
+    ['an unrelated same-head branch is never adopted or modified', 'unrelated-branch'],
+    ['an unrecorded wrong-base candidate is ignored without retargeting', 'wrong-base'],
+    ['a different author is never adopted or modified', 'other-author'],
+    ['a PR list failure refuses creation after acting identity resolves', 'api-failure'],
+  ]) {
+    test(
+      name!,
+      () => {
+        const result = runLanePrFixture(fixtureCase!);
+        expect(result.code, result.stdout + result.stderr).toBe(0);
+        expect(result.stdout).toContain('PASS:');
+      },
+      60000
     );
-    chmodSync(gh, 0o755);
-    const sleep = join(dir, 'sleep');
-    writeFileSync(sleep, '#!/bin/bash\nexit 0\n');
-    chmodSync(sleep, 0o755);
-    const bashDir = process.platform === 'win32' ? toGitBashDir(dir) : dir;
-    const script = join(dir, 'guard.sh');
-    writeFileSync(
-      script,
-      ['set -euo pipefail', `export PATH='${bashDir}':"$PATH"`, guard, ''].join('\n')
-    );
-    const env: Record<string, string | undefined> = {
-      ...process.env,
-      PATH: `${dir}${delimiter}${process.env.PATH ?? ''}`,
-      GH_ARGS_LOG: argsLog,
-      GH_CREATE_ARGS: createArgs,
-      GH_CREATE_COUNT: createCount,
-      GH_SAME_HEAD_JSON: sameHeadPath,
-      GH_SAME_HEAD_RC: String(sameHeadRc),
-      REPO: 'acme/widgets',
-      TITLE: 't',
-      BODY_FILE: '/dev/null',
-      BASE_BRANCH: 'dev',
-      RECORDED_BASE_BRANCH: 'dev',
-      UNIQUE_BRANCH,
-      LOCAL_HEAD: HEAD_SHA,
-    };
-    if (process.platform === 'win32') {
-      for (const key of Object.keys(env)) {
-        if (key !== 'PATH' && key.toUpperCase() === 'PATH') delete env[key];
-      }
-    }
-    const result = Bun.spawnSync(['bash', script], {
-      env,
-      stdout: 'pipe',
-      stderr: 'pipe',
-    });
-    return {
-      code: result.exitCode ?? -1,
-      stdout: new TextDecoder().decode(result.stdout),
-      stderr: new TextDecoder().decode(result.stderr),
-      args: readFileSync(argsLog, 'utf8'),
-      createArgs: readFileSync(createArgs, 'utf8'),
-      creates: Number(readFileSync(createCount, 'utf8')),
-    };
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
   }
-}
-
-describe('open-pr same-head adopt', () => {
-  const guard = laneGuard('bdc-feature-development-cursor.yaml');
-
-  test('Test 1: same-head PR on another branch is adopted', () => {
-    const result = runOpenPrGuard(
-      guard,
-      JSON.stringify([
-        openPr({
-          number: 10,
-          title: 'Already open',
-          headRefOid: HEAD_SHA,
-          headRefName: 'archon/task-web-worker-x',
-          baseRefName: 'dev',
-          url: PR_URL_10,
-        }),
-      ]),
-      0
-    );
-    expect(result.code, result.stderr).toBe(0);
-    expect(result.creates).toBe(0);
-    expect(result.args).not.toContain('pr create');
-    expect(result.stdout).toContain(`PR_URL=${PR_URL_10}`);
-    expect(result.stdout).toContain(
-      `open-pr: adopted existing PR ${PR_URL_10} at head ${HEAD_SHA}`
-    );
-    expect(result.stdout).toContain('open-pr: adopted PR title: Already open');
-    expect(result.stdout).toContain('PR already exists (no create needed).');
-  });
-
-  test('Test 2: no same-head PR creates one PR as today', () => {
-    const result = runOpenPrGuard(
-      guard,
-      JSON.stringify([
-        openPr({
-          number: 10,
-          title: 'Other work',
-          headRefOid: OTHER_SHA,
-          headRefName: 'archon/task-web-worker-x',
-          baseRefName: 'dev',
-          url: PR_URL_10,
-        }),
-      ]),
-      0
-    );
-    expect(result.code, result.stderr).toBe(0);
-    expect(result.creates).toBe(1);
-    expect(result.createArgs).toContain(`--head ${UNIQUE_BRANCH}`);
-    expect(result.createArgs).toContain('--base dev');
-    expect(result.stdout).not.toContain('open-pr: adopted');
-  });
-
-  test('Test 3: same head but different base is not adopted', () => {
-    const result = runOpenPrGuard(
-      guard,
-      JSON.stringify([
-        openPr({
-          number: 10,
-          title: 'Wrong base',
-          headRefOid: HEAD_SHA,
-          headRefName: 'archon/task-web-worker-x',
-          baseRefName: 'main',
-          url: PR_URL_10,
-        }),
-      ]),
-      0
-    );
-    expect(result.code, result.stderr).toBe(1);
-    expect(result.creates).toBe(0);
-    expect(result.args).not.toContain('pr create');
-    expect(result.stderr).toContain('ERROR: base_branch_mismatch: recorded=dev attempted=main');
-    expect(result.stdout).not.toContain('open-pr: adopted');
-    expect(result.stdout).not.toContain('PR_URL=');
-  });
-
-  test('Test 4: multiple same-head PRs adopt the lowest number, create none', () => {
-    const result = runOpenPrGuard(
-      guard,
-      JSON.stringify([
-        openPr({
-          number: 11,
-          title: 'Later duplicate',
-          headRefOid: HEAD_SHA,
-          headRefName: 'feat/wo-x-thread-abc',
-          baseRefName: 'dev',
-          url: PR_URL_11,
-        }),
-        openPr({
-          number: 10,
-          title: 'First duplicate',
-          headRefOid: HEAD_SHA,
-          headRefName: 'archon/task-web-worker-x',
-          baseRefName: 'dev',
-          url: PR_URL_10,
-        }),
-      ]),
-      0
-    );
-    expect(result.code, result.stderr).toBe(0);
-    expect(result.creates).toBe(0);
-    expect(result.args).not.toContain('pr create');
-    expect(result.stdout).toContain(`PR_URL=${PR_URL_10}`);
-    expect(result.stdout).not.toContain(`PR_URL=${PR_URL_11}`);
-    expect(result.stderr).toContain('WARN: open-pr: same-head duplicates not adopted:');
-    expect(result.stderr).toContain(`#11 ${PR_URL_11}`);
-  });
 
   test('Test 5: all lanes carry the guard and the bundle is regenerated', () => {
     expect(LANE_FILES.length).toBe(13);
@@ -311,14 +90,5 @@ describe('open-pr same-head adopt', () => {
     const bundle = readFileSync(BUNDLE_PATH, 'utf8');
     expect(bundle.split('same-head-adopt').length - 1).toBeGreaterThan(0);
     expect(bundle).toContain('# same-head-adopt: begin');
-  });
-
-  test('gh list failure fails open to the create path', () => {
-    const result = runOpenPrGuard(guard, 'not-json', 1);
-    expect(result.code, result.stderr).toBe(0);
-    expect(result.creates).toBe(1);
-    expect(result.createArgs).toContain(`--head ${UNIQUE_BRANCH}`);
-    expect(result.createArgs).toContain('--base dev');
-    expect(result.stdout).not.toContain('open-pr: adopted');
   });
 });

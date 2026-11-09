@@ -103,7 +103,8 @@ export interface PullRequestEvidence {
   otherOpenPrsForWoLookupFailed?: boolean;
   /**
    * GitHub label names on this pull request. Absent on older evidence
-   * fixtures. An exact, case-sensitive `merge-hold` name holds the merge.
+   * fixtures. An exact, case-sensitive `merge-hold` name holds the merge, and so does an
+   * exact `owner:reworking` (set and cleared only by the owner; it is not HOLD).
    */
   labels?: readonly string[];
   /**

@@ -168,8 +168,13 @@ export interface RealGitHubOctokitLike {
         title: string;
         state: string;
         merged_at?: string | null;
+        updated_at?: string;
         html_url: string;
-        head: { sha: string; ref?: string };
+        head: {
+          sha: string;
+          ref?: string;
+          repo?: { name?: string; owner?: { login?: string } | null } | null;
+        };
         // Present on the real API; optional here so existing narrow mocks that
         // only exercise the head-branch fast path keep type-checking.
         draft?: boolean;
@@ -308,6 +313,10 @@ export interface RealGitHubOctokitLike {
     getJobForWorkflowRun?(input: Record<string, unknown>): Promise<{
       data: { run_id?: number; run_attempt?: number };
     }>;
+  };
+  /** Optional: branch ref lookup (git.getRef) used by the post-merge stray-push sweep. */
+  git?: {
+    getRef(input: Record<string, unknown>): Promise<{ data: { object: { sha: string } } }>;
   };
   repos?: {
     compareCommits(input: {
