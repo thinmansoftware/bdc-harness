@@ -119,6 +119,19 @@ Read `cascade-runs/<slug>/cascade-record.json`:
 - `attempts[].nodeModels` maps each node id to `{ provider, declared, served }`
   from the last `node_completed` or `node_failed` event for that step.
 
+## WO routing signals (WO-HARNESS-CONDUCTOR-RISK-ROUTING-01)
+
+The conductor used to route only on `--class` and `--tags`, and the caller supplied both. A fire with no tags fell to the plain-CODE rule and entered `zero` (open models, no paid review seat) even when the WO touched migrations, roles, RLS, auth or money -- the work the ladder file says must stay off zero.
+
+Now `runCascade` reads the WO itself before it picks an entry tier (`packages/smart-cauldron/src/wo-signals.ts`):
+
+- It fetches `docs/work-orders/<WO-ID>.md` from bdc-xo main with `gh api` (nothing is fetched under `SMART_CAULDRON_HERMETIC=1`; an unreadable spec logs and keeps the ruleset pick).
+- Risk words in the spec add tags: money/billing/Stripe -> `money`; auth/JWT/roles/RLS/permissions -> `auth`; migrations/alter table/create policy -> `migration`. A `Rung classification: billing/auth/infra` line adds `money` and `auth`. The Rung line itself is not scanned, so an unfilled template line does not make a clean WO look risky. Issue labels passed as `labels` add the same tags.
+- Those tags are merged with the caller's tags and handed to `config/ruleset.config.json`, which still decides where risk goes (billing/auth/migration/INFRA/feature all enter `cursor`). Plain CODE with no risk signal still enters `zero`.
+- A WO can pin its entry tier with an `entry_tier: <tier>` line in its spec. A pin behaves like `--entry` (refused tiers and the seat gate still apply) but can only raise the tier: a pin below the risk floor of the WO's detected risk (for example `entry_tier: zero` on a migration spec) is ignored with a log line. A spec cannot pin a premium tier (`frontier`): that needs operator approval or an explicit `--entry`. An unknown tier name is ignored with a log line. An explicit `--entry` always wins and the spec is not read.
+
+The cascade log shows `WO routing signals for <WO-ID>: ...` with the reasons.
+
 ## Honest gates are the foundation (unchanged, one addition)
 
 The cascade's whole decision engine is gate verdicts. A lying gate poisons routing:
