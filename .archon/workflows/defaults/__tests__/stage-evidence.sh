@@ -138,4 +138,43 @@ assert 'DISABLED-evidence-replay' in b['checkout-replay']['bash']
 PY
   check test "$?" = 0
 fi
+# Run the real checkout node against local refs only. A linked worktree shares
+# its source config, so the old remote set-url corrupts both source and sibling.
+for pushurl in unset original-push-url; do
+  fixture "replay-source-$pushurl"
+  SOURCE_REPO="$WT"
+  printf 'echo "Tests: 1/1"\n' > "$WT/test_replay.sh"
+  git -C "$WT" add test_replay.sh
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm seed
+  REPLAY_SHA="$(git -C "$WT" rev-parse HEAD)"
+  git -C "$WT" update-ref refs/pull/42/head "$REPLAY_SHA"
+  git -C "$WT" remote set-url origin "$SOURCE_REPO"
+  if [ "$pushurl" != unset ]; then git -C "$WT" config remote.origin.pushurl "$pushurl"; fi
+  before_push="$(git -C "$WT" config --get remote.origin.pushurl || true)"
+  WT="$TMP/replay-linked-$pushurl"
+  git -C "$SOURCE_REPO" worktree add --detach "$WT" HEAD >/dev/null
+  export ARTIFACTS_DIR="$WT/artifacts"
+  mkdir -p "$ARTIFACTS_DIR/evidence"
+  cat > "$TOOLS/gh" <<SH
+#!/usr/bin/env bash
+printf '%s\n' '{"body":"WO: WO-REPLAY-FIXTURE","headRefOid":"$REPLAY_SHA"}'
+SH
+  chmod +x "$TOOLS/gh"
+  export PR_NUMBER=42
+  checkout="$(LANE="$HERE/../bdc-evidence-replay.yaml" PATH="$TOOLS:$PATH" run_node checkout-replay)"
+  check test "$?" = 0
+  check test "$(git -C "$SOURCE_REPO" config --get remote.origin.pushurl || true)" = "$before_push"
+  check test "$(git -C "$WT" config --get remote.origin.pushurl || true)" = "$before_push"
+  REPLAY_WT="$(cat "$ARTIFACTS_DIR/evidence/replay-checkout" 2>/dev/null || printf '%s' "$WT")"
+  check test "$(git -C "$REPLAY_WT" config --get remote.origin.pushurl)" = DISABLED-evidence-replay
+  check test "$(git -C "$REPLAY_WT" rev-parse HEAD)" = "$REPLAY_SHA"
+  check rejects git -C "$REPLAY_WT" symbolic-ref -q HEAD
+  # Subsequent nodes start in the engine worktree but must test the clone.
+  printf 'echo "Tests: 0/1"; exit 1\n' > "$WT/test_replay.sh"
+  export FIX_SPEC=$'WO Class: CODE\nStop 1 (test suite):\n  bash test_replay.sh\nExpected: pass'
+  export FIX_MAP=''
+  out="$(LANE="$HERE/../bdc-evidence-replay.yaml" run_node run-stop-tests)"
+  check contains "$out" 'TESTS_STATUS=passed'
+  unset PR_NUMBER
+done
 finish stage-evidence.sh

@@ -82,6 +82,55 @@ for violation in delete_assert skip; do
   check contains "$out" 'TESTS_REPAIR_RESULT=guard_violation'
 done
 
+# The persisted stage plan can execute tests outside the current repository.
+# Guard every such directory, including one that disappears after the snapshot.
+for change in unchanged delete_assert skip comment delete_file missing_dir; do
+  fixture "stage-a-$change"
+  STAGE_A="$WT"
+  printf 'expect(a).toBe(1)\n' > "$WT/test_a.ts"
+  fixture "stage-b-$change"
+  STAGE_B="$WT"
+  printf 'expect(b).toBe(1)\nassert b\n' > "$WT/test_b.ts"
+  git -C "$WT" add test_b.ts
+  WT="$STAGE_A"; export ARTIFACTS_DIR="$WT/artifacts"
+  printf 'a\tthinmansoftware/shopops\tbash test_a.sh\nb\tthinmansoftware/other\tbash test_b.sh\n' > "$ARTIFACTS_DIR/evidence/stop-tests.stages"
+  export RST_STAGE_WORKTREES="b=$STAGE_B"
+  trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  case "$change" in
+    delete_assert) printf 'assert b\n' > "$STAGE_B/test_b.ts" ;;
+    skip) printf 'expect(b).toBe(1)\nassert b\ntest.skip(b)\n' > "$STAGE_B/test_b.ts" ;;
+    comment) printf '// expect(b).toBe(1)\nassert b\n' > "$STAGE_B/test_b.ts" ;;
+    delete_file) rm "$STAGE_B/test_b.ts" ;;
+    missing_dir) mv "$STAGE_B" "$STAGE_B-moved" ;;
+  esac
+  if [ "$change" = unchanged ]; then
+    check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  else
+    check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  fi
+  unset RST_STAGE_WORKTREES
+done
+
+# A repair that makes both stage commands pass by deleting B's assertion is blocked.
+fixture final-stage-a
+STAGE_A="$WT"
+printf 'echo "Tests: 1/1"\n' > "$WT/test_a.sh"
+fixture final-stage-b
+STAGE_B="$WT"
+printf 'echo "Tests: 0/1"; exit 1\ntrue '\''expect(b).toBe(1)'\''\n' > "$WT/test_b.sh"
+WT="$STAGE_A"; export ARTIFACTS_DIR="$WT/artifacts"
+export RST_STAGE_WORKTREES="a=$STAGE_A;b=$STAGE_B"
+export FIX_SPEC=$'WO Class: MIXED\n## Canonical stages\n```yaml\nstages:\n  - id: a\n    repo: thinmansoftware/shopops\n    target_branch: staging\n    in_scope_files: [src]\n    verify_commands: ["bash test_a.sh"]\n    readiness_bar: {spec_complete: true, scope_complete: true, dependencies_ready: true, acceptance_defined: true}\n  - id: b\n    repo: thinmansoftware/other\n    target_branch: staging\n    in_scope_files: [src]\n    verify_commands: ["bash test_b.sh"]\n    readiness_bar: {spec_complete: true, scope_complete: true, dependencies_ready: true, acceptance_defined: true}\n```'
+export FIX_INITIAL="$(run_node run-stop-tests)"
+check contains "$FIX_INITIAL" 'TESTS_STATUS=failed'
+printf 'echo "Tests: 1/1"\n' > "$STAGE_B/test_b.sh"
+run_node test-repair until_bash >/dev/null
+out="$(run_node run-stop-tests-final)"
+check contains "$out" 'TESTS_STATUS=blocked'
+check contains "$out" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+check contains "$out" 'TESTS_REPAIR_RESULT=guard_violation'
+unset RST_STAGE_WORKTREES
+
 fixture exhausted
 printf 'echo "Tests: 0/1"; exit 1\ntrue '\''expect(x).toBe(1)'\''\n' > "$WT/test_bad.sh"
 export FIX_SPEC=$'WO Class: CODE\nWO_ID=WO-TEST\nSPEC_PATH=bdc-xo:issues/123\nStop 1 (test suite):\n  bash test_bad.sh\nExpected: pass'
