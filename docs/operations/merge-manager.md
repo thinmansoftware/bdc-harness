@@ -20,6 +20,14 @@ A missing spec (HTTP 404) is not a hold. Any other spec-read failure, including 
 
 A pull request label named exactly `merge-hold` (case-sensitive) holds any pull request, including ones that are not tied to a work order. The bridge records `merge_hold_label` and does not read a spec. Removing the label lets the next tick merge through the existing guards.
 
+## Policy skip comment
+
+When the bridge records a terminal POLICY skip with the pull request in hand, it posts ONE comment on that pull request saying why the merge manager will not merge it and that a person does (exact-head approval and green required checks still apply). Reasons covered: `spec_only` (documentation-only into a base whose `docsOnly` policy is skip), `integration_base_mismatch` and `base_not_allowlisted`. The skip itself is unchanged: same outcome row, still terminal, claimed once per run and head. `repo_not_allowed` has no pull request in hand at its skip sites, so it posts nothing and stays a silent skip.
+
+The comment is three lines: the marker `<!-- merge-policy-skip:v1 -->`, a key line `<!-- merge-policy-skip-key:<verdict id>:<reason> -->`, and one plain sentence for the reason. It is idempotent: before posting, the bridge looks for a comment by its own author login that already carries the key line and posts nothing if found (a key line from another author does not count). A comment failure is logged as `merge-coordinator.policy_skip_comment_failed` and never changes the recorded skip or stops the cycle; a missing comment API logs `merge-coordinator.policy_skip_comment_unavailable`. A pull request that merges normally gets only the merge receipt, never this comment.
+
+The interactive Duty Officer reads this marker: an approved, green, unmerged pull request carrying `merge-policy-skip:v1` was skipped on purpose, so the Duty Officer does not nudge the merge manager or report a stall, and cues the owner or the XO to merge it by hand once (skill file `Duty-Officer/SKILL.md`, rule under "A PR is stale, superseded, or unmerged?").
+
 ## Owner reworking label
 
 A pull request label named exactly `owner:reworking` (case-sensitive) stops an otherwise mergeable pull request while its owner redoes the design. The bridge releases the verdict claim with the reason `owner_reworking_label` and logs `merge-coordinator.owner_reworking_label`, with no skip, no retry attempt and no outcome row, like `merge_hold_label`. Candidate discovery excludes the PR with the named exclusion `owner_reworking_label`, and the run-linked merge manager holds it with the same reason. Only the owner sets and clears the label; nothing in the harness does, and removing it lets the next tick merge through the existing guards. It is NOT HOLD: HOLD stays John's. `owner:reworking` is a state, not a person: owner routing never reads the suffix `reworking` as a login.
