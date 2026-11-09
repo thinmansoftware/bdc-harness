@@ -2549,7 +2549,7 @@ nodes:
         local mode="$1" root="$2" snapshot="$3" sid repo command dir
         local -a roots=("$root")
         local -a declared=()
-        if [ -f "$(dirname "$snapshot")/stop-tests.commands" ]; then
+        if [ ! -s "$(dirname "$snapshot")/stop-tests.stages" ] && [ -f "$(dirname "$snapshot")/stop-tests.commands" ]; then
           while IFS= read -r command; do
             declared+=("$root" "$command")
           done < "$(dirname "$snapshot")/stop-tests.commands"
