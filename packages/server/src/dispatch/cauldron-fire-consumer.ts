@@ -38,6 +38,7 @@ import { runCascade, readCascadeRecord } from '@archon/smart-cauldron/cascade';
 import * as admissions from '@archon/core/db/t3-command-admissions';
 import type { T3CommandAdmissionRow, T3CommandVerb } from '@archon/core/db/t3-command-admissions';
 import { checkFireEligibility as checkFireEligibilityImpl } from '../taskmaster/fire-eligibility';
+import { matchProjectCodebase } from './project-codebase-match';
 import { IN_PROCESS_API_ORIGIN } from '../routes/in-process-authority';
 import { findActiveWoClaim } from '@archon/core/db/cascade-wo-claims';
 import { cascadeWoClaimDeps, reconcileRetainedWoClaims } from '../cascade/wo-claim';
@@ -1768,7 +1769,9 @@ export function createRealCauldronFireConsumerDeps(
     },
     resolveProjectRepository: async (project): Promise<string | null | undefined> => {
       const codebases = await codebasesDb.listCodebases();
-      const match = codebases.find(entry => entry.name === project);
+      // Bare repo names ('bdc-xo') resolve to the unique owner/repo codebase, the
+      // same naming fire-eligibility uses (bdc-xo#4311 Test 10).
+      const match = matchProjectCodebase(codebases, project);
       if (!match) return undefined;
       return match.repository_url ? normalizeRepo(match.repository_url) : null;
     },
