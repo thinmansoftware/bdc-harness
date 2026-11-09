@@ -177,4 +177,41 @@ SH
   check contains "$out" 'TESTS_STATUS=passed'
   unset PR_NUMBER
 done
+# Test 17: follow the parsed lane dependency when scheduling grep evidence. On
+# the old wiring the passing pre-repair result survives a grep-breaking repair.
+eval "$(core rsg)"
+eval "$(core sme)"
+eval "$(core mec)"
+fixture grep-after-repair
+printf 'bad required\n' > "$WT/product"
+printf 'if grep -q good product; then echo "Tests: 1/1"; else echo "Tests: 0/1"; exit 1; fi\n' > "$WT/test_product.sh"
+export FIX_SPEC=$'WO Class: CODE\nStop 1 (test suite):\n  bash test_product.sh\nExpected: pass\nStop 2 (grep assertion):\n  grep -c required product\nExpected: 1'
+export FIX_MAP=''
+before_greps="$(run_node run-stop-greps)"
+check contains "$before_greps" 'GREP_STATUS=passed'
+export FIX_INITIAL="$(run_node run-stop-tests)"
+check contains "$FIX_INITIAL" 'TESTS_STATUS=failed'
+after_repair="$(python3 - "$LANE" <<'PY'
+import sys, yaml
+nodes = yaml.safe_load(open(sys.argv[1]))['nodes']
+greps = next(n for n in nodes if n['id'] == 'run-stop-greps')
+print('yes' if 'run-stop-tests-final' in greps.get('depends_on', []) else 'no')
+PY
+)"
+greps="$before_greps"
+# Stub product repair: fixes the test while removing the required grep token.
+printf 'good\n' > "$WT/product"
+run_node test-repair until_bash >/dev/null
+final="$(run_node run-stop-tests-final)"
+check contains "$final" 'TESTS_STATUS=passed'
+check contains "$final" 'TESTS_REPAIR_RESULT=repaired'
+if [ "$after_repair" = yes ]; then greps="$(run_node run-stop-greps)"; fi
+check contains "$greps" 'GREP_STATUS=mismatch'
+check contains "$greps" 'GREP_LINE=grep -c required product => 0'
+stamped="$(printf 'Tests: placeholder\nGrep assertions: placeholder\nVALIDATION: PASS\n' | sme_process "$(sme_field TESTS_LINE "$final")" "$(sme_field TESTS_STATUS "$final")" "$(sme_field GREP_LINE "$greps")" "$(sme_field GREP_STATUS "$greps")")"
+check contains "$stamped" 'VALIDATION: FAIL'
+printf '%s\n' "$stamped" | mec_check PROCEED CODE "$(mec_field TESTS_STATUS "$final")" "$(mec_field GREP_DECLARED "$greps")" "$(mec_field GREP_STATUS "$greps")" 0 "$(mec_field GREP_EXECUTED "$greps")" "$(mec_field GREP_DROPPED "$greps")" "$(mec_field GREP_UNPARSED "$greps")" "$(mec_field GREP_MISMATCH "$greps")" '' > "$TMP/grep-mec-out" 2> "$TMP/grep-mec-err"
+check test "$?" = 1
+check test "$(cat "$TMP/grep-mec-out")" != OK
+check contains "$(cat "$TMP/grep-mec-err")" 'EVIDENCE_ERROR:'
 finish stage-evidence.sh

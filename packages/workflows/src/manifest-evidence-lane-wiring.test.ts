@@ -141,7 +141,7 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
 
       it('run-stop-greps tokenizes argv pipelines and rejects find -execdir', () => {
         const n = node(nodes, 'run-stop-greps', file);
-        expect(n.depends_on).toEqual(['format-autofix']);
+        expect(n.depends_on).toEqual(['format-autofix', 'run-stop-tests-final']);
         expect(n.timeout).toBe(600000);
         // WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01: the whitespace split and the
         // per-token charset check were replaced by the shared quote-aware tokenizer
