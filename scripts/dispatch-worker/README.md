@@ -319,6 +319,117 @@ Run focused proof with:
 bun test ./scripts/dispatch-worker/stdin-prompt.test.ts ./scripts/dispatch-worker/acp/kill-tree.test.ts ./scripts/dispatch-worker/acp/session.test.ts ./scripts/dispatch-worker/mcp/session.test.ts ./scripts/dispatch-worker/outcome-transcript.test.ts
 ```
 
+## Stale lock, launcher supervision and sustained connect failure (WO-HARNESS-DISPATCH-WORKER-STALE-LOCK-01)
+
+This section is the operations note for the reused-PID incident (2026-10-19), the launcher and
+installer changes, and the sustained-connect-failure exit. Nothing here has been installed or
+run against the live worker; the source changes take effect only after the operator steps at
+the end.
+
+### Lock file contents
+
+`~/.config/bdc/dispatch-worker-<worker_id>.lock` holds
+`{ "pid", "started_at", "start_time", "executable" }`. `start_time` (ISO, UTC) and `executable`
+(for example `bun.exe`) are the holder's process creation time and image name. A lock written
+before this change has only `pid` and `started_at` (a legacy lock).
+
+### When a live PID still counts as the holder
+
+Windows reuses PIDs after a reboot (PID 4220 became `atkexComSvc.exe` and blocked every start for
+ten hours). A lock whose PID is alive is a genuine holder unless there is positive proof it is a
+different process:
+
+- `start_time` differs from the live process by more than 30 s, or
+- `executable` differs (case-insensitive), or
+- a legacy lock whose live holder started more than 2 s after `started_at` (it cannot be the
+  process that wrote the lock).
+
+Proven stale: the new start reclaims the lock, journals the death to the death log and writes one
+log line `dispatch_worker_lock_reclaimed_reused_pid: pid=... reason=...`. Unreadable identity
+(lookup failed) is never proof: the lock still blocks, so a genuine worker is never displaced.
+The lookup is one PowerShell CIM query on Windows and `ps` elsewhere; no new dependency.
+
+### Watchdog
+
+`watchdog.ts` uses the same rule: a lock PID that is alive but proven to be a different process
+is treated as no worker, the existing worker task is started and
+`dispatch_worker_watchdog_reused_pid` is logged. The watchdog never stops any process.
+
+### Launcher (`start-windows.ps1`)
+
+The launcher now supervises one SSH tunnel and one worker as a pair:
+
+- A worker or tunnel that fails is restarted with backoff 10, 30, 60, 120 s. Five consecutive
+  failures exit 1 so Task Scheduler's own restart policy takes over. A run that stays up 10
+  minutes resets the count.
+- Losing the launcher's own tunnel (process exit or listener gone) while the worker runs stops
+  the worker and restarts the same pair. Never more than one tunnel and one worker.
+- A stop takes down the whole process tree of the worker (taskkill /T /F, then each recorded
+  descendant is checked and force-stopped), because Windows Stop-Process ends one PID only and
+  killing the worker also prevents its own cleanup of the agents it spawned. The launcher then
+  verifies those descendants are gone. If any survives, it logs the count and exits 1 WITHOUT
+  starting a replacement worker in that launcher run (a replacement could reclaim the expired
+  lease while the old agent keeps running). Limit: the launcher keeps no state across runs, so
+  a fresh launcher started by the Task Scheduler restart policy does not remember survivors; a
+  survivor after a force tree kill is expected to be rare and shows in the launcher log.
+  The worker runs inside a Windows Job Object (kill-on-close): the launcher creates the worker
+  process suspended, assigns it to the job, and only then resumes it, so no descendant can ever
+  escape the job, whatever the worker's own lifetime (a worker that exits immediately after
+  spawning an agent leaves that agent in the job). Stopping the pair terminates the job and
+  verifies the job's active process count reaches zero; closing the launcher kills the job too.
+  If the job cannot be created the worker is not started (fail closed). The tunnel (one ssh
+  process) uses the process-tree stop with root verification. Any survivor, failed kill or cleanup
+  error counts as a survivor and blocks a replacement in that launcher run.
+- Only processes the launcher started are stopped, and only if the PID still has the recorded
+  start time. A listener on the local port that the launcher did not start is never terminated:
+  it is a loud bounded failure.
+- Worker exit code 75 means a genuine live worker already holds the lock: the launcher stops
+  retrying and exits 0.
+- Log lines carry exit codes and port numbers only; never the config, a token or prompt text.
+
+### Installer (`install-windows.ps1`)
+
+The worker task no longer has an execution time limit (zero, unlimited), replacing the old one
+day (the live task had drifted to PT72H). Restart 5 at 1 minute, `IgnoreNew`, the single worker
+task and the repeating five-minute watchdog task are unchanged. Applying the installer to the
+real Task Scheduler is a separate attended operator action.
+
+### Sustained connect failure
+
+A worker that is alive but cannot get a 2xx from the server for `CONNECT_FAILURE_EXIT_MS`
+(600000 ms) with no agent execution active logs one line, releases the lock and exits 1, which the
+launcher and watchdog then recover. Only a successful (2xx) poll or heartbeat resets the clock;
+an HTTP error status (401, 403, 5xx) does not. See `connect-failure-clock.ts`.
+
+### Heartbeat freshness check (read-only, selected source only)
+
+```
+bun run packages/canary-suite/src/cli.ts dispatch-worker --db-path <readonly-sqlite-file> --worker-id <worker_id>
+```
+
+Exit 0 only means this one row in this one file is no older than 600000 ms. Exit 2 is stale,
+missing, malformed or future data; exit 3 is an unreadable database or missing arguments. Every
+result says `assessment_scope=selected_source_heartbeat_freshness` and
+`runtime_health=not_assessed`: it does not prove the running worker or backend is healthy, and a
+fresh row in an unrelated file passes. It sends nothing and changes no alarm.
+
+### Tests
+
+```
+bun test ./scripts/dispatch-worker/instance-lock.test.ts ./scripts/dispatch-worker/watchdog.test.ts ./scripts/dispatch-worker/restart-evidence.test.ts ./scripts/dispatch-worker/worker-log.test.ts ./scripts/dispatch-worker/connect-failure-clock.test.ts ./scripts/dispatch-worker/start-windows.test.ts
+bun test ./packages/canary-suite/src/dispatch-worker-canary.test.ts ./packages/canary-suite/src/cli.test.ts
+```
+
+`start-windows.test.ts` runs the real launcher and installer in Windows PowerShell with stub
+processes, a fake clock and stubbed Task Scheduler cmdlets; it is skipped on non-Windows hosts,
+where the launcher behavior needs operator-side verification.
+
+### Operator acceptance (not part of the code build)
+
+Applying the installer, restarting the live worker and any failure injection are attended
+operator steps with a recovery and canary plan agreed first. Source tests and a merge do not
+prove the installed worker recovered or that an alert reached anyone.
+
 ## Phase 1.5 sender authentication (capability shipped dark)
 
 Phase 1.5 binds every newly created Dispatch message to an authenticated or
