@@ -469,4 +469,20 @@ for lane in "$HERE"/../bdc-feature-development*.yaml "$HERE"/../bdc-evidence-rep
     check test "$(core "$name")" = "$(sed -n "/# ---- BEGIN $name core /,/# ---- END $name core /p" "$lane" | sed 's/^      //')"
   done
 done
+# Ignored paths are still untracked files: the always-frozen and marker rules
+# apply there too. Existing ignored helpers must not hide newly added siblings.
+for name in new.test.ts package.json helper.js marker.js; do
+  fixture "ignored-new-$name"
+  printf 'cache/\n' > "$WT/.gitignore"
+  mkdir -p "$WT/cache"
+  printf 'old helper\n' > "$WT/cache/existing.js"
+  trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  printf 'new helper\n' > "$WT/cache/$name"
+  if [ "$name" = marker.js ]; then printf 'test.skip(x)\n' > "$WT/cache/$name"; fi
+  if [ "$name" = helper.js ]; then
+    check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  else
+    check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  fi
+done
 finish test-repair-guard.sh
