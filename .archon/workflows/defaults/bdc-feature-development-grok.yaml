@@ -2520,7 +2520,7 @@ nodes:
           if not isinstance(commands,list) or not commands: sys.exit("stage_plan_invalid: empty verify_commands")
           for cmd in commands:
               if not isinstance(cmd,str) or not cmd.strip() or any(c in cmd for c in "\t\r\n\x00"): sys.exit("stage_plan_invalid: invalid command")
-              lines.append("\t".join([sid,repo,cmd]))
+              lines.append("\t".join([sid,repo,cmd,str(st["target_branch"])]))
       print("\n".join(lines))' | sed 's/\r$//'
       }
       # Shared directory resolution for execution and assertion-guard coverage.
@@ -2597,12 +2597,11 @@ nodes:
       # ---- END rst core ----
 
       # ---- BEGIN trg core (byte-identical across lanes; extracted by unit test) ----
-      # Snapshot tracked AND untracked tests plus declared command files in every
-      # persisted-plan directory, including ignored scripts with non-test names.
-      # Freeze raw bytes by sha256; existing test files cannot change or disappear.
+      # Allow only the snapshot's build-changed product paths and new non-test files.
+      # Freeze every other tracked file, tests, runner settings and declared scripts.
       trg_guard() {
-        local mode="$1" root="$2" snapshot="$3" sid repo command dir
-        local -a roots=("$root")
+        local mode="$1" root="$2" snapshot="$3" sid repo command target dir
+        local -a roots=("$root" "${BASE_BRANCH:-master}")
         local -a declared=()
         if [ ! -s "$(dirname "$snapshot")/stop-tests.stages" ] && [ -f "$(dirname "$snapshot")/stop-tests.commands" ]; then
           while IFS= read -r command; do
@@ -2610,31 +2609,42 @@ nodes:
           done < "$(dirname "$snapshot")/stop-tests.commands"
         fi
         if [ -s "$(dirname "$snapshot")/stop-tests.stages" ]; then
-          while IFS=$'\t' read -r sid repo command; do
+          while IFS=$'\t' read -r sid repo command target; do
             dir="$(cd "$root" && rst_stage_dir "$sid" "$repo")" || return 1
-            # Unavailable stages are already BLOCKED. Remember all present roots;
-            # the checker also revisits saved roots if a mapping/directory vanishes.
+            # Remember present roots; checks revisit saved roots if mappings vanish.
             if [ -n "$dir" ]; then
               dir="$(cd "$root" && cd "$dir" 2>/dev/null && pwd)" || continue
-              roots+=("$dir")
+              roots+=("$dir" "$target")
               declared+=("$dir" "$command")
             fi
           done < "$(dirname "$snapshot")/stop-tests.stages"
         fi
-        python3 - "$mode" "$snapshot" "${#roots[@]}" "${roots[@]}" "${declared[@]}" <<'TRG_PY'
-      import hashlib, json, pathlib, re, shlex, subprocess, sys
-      mode, snapshot = sys.argv[1:3]
-      count = int(sys.argv[3])
-      roots = {str(pathlib.Path(p).resolve()) for p in sys.argv[4:4+count]}
-      declared = sys.argv[4+count:]
+        python3 - "$mode" "$snapshot" "${SPEC:-}" "${#roots[@]}" "${roots[@]}" "${declared[@]}" <<'TRG_PY'
+      import fnmatch, hashlib, json, os, pathlib, re, shlex, subprocess, sys
+      mode, snapshot, spec = sys.argv[1:4]
+      count = int(sys.argv[4])
+      pairs = sys.argv[5:5+count]
+      run_root, run_base = str(pathlib.Path(pairs[0]).resolve()), pairs[1]
+      # Match resolve-review-base's declared-header priority, without network access.
+      for pattern in [r"^Base branch:\s*([A-Za-z0-9_./-]+)",r"\*\*Base branch:\*\*\s*`([A-Za-z0-9_./-]+)`",r"^base_branch:\s*([A-Za-z0-9_./-]+)"]:
+          match = re.search(pattern,spec,re.M)
+          if match:
+              run_base = match[1]
+              break
+      roots = {}
+      for directory, base in zip(pairs[2::2],pairs[3::2]):
+          roots.setdefault(str(pathlib.Path(directory).resolve()),set()).add(base)
+      # A stage executing in the run directory uses its own persisted target branch.
+      roots.setdefault(run_root,{run_base})
+      declared = sys.argv[5+count:]
       markers = [r"\.skip\s*\(",r"\.only\s*\(",r"\bxit\s*\(",r"\bxdescribe\s*\(",r"\bit\.todo\b",r"\btest\.todo\b",r"@pytest\.mark\.skip",r"unittest\.skip"]
       before = {} if mode == "snapshot" else json.loads(pathlib.Path(snapshot).read_text())
       command_files = {}
-      for directory, command in zip(declared[::2], declared[1::2]):
+      for directory, command in zip(declared[::2],declared[1::2]):
           root = pathlib.Path(directory).resolve()
           cwd = root
           try:
-              lexer = shlex.shlex(command, posix=True, punctuation_chars="&")
+              lexer = shlex.shlex(command,posix=True,punctuation_chars="&")
               lexer.whitespace_split = True
               lexer.commenters = ""
               tokens = list(lexer)
@@ -2650,32 +2660,57 @@ nodes:
               path = cwd/token
               if path.is_file() and path.resolve().is_relative_to(root):
                   command_files.setdefault(str(root),set()).add(path.relative_to(root).as_posix())
-      def inspect(directory):
+      def git_paths(root,*args):
+          return {os.fsdecode(name) for name in subprocess.check_output(["git",*args],cwd=root).split(b"\x00") if name}
+      def test_file(name):
+          return bool(re.search(r"(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.|(^|/)test_[^/]+|(^|/)[^/]+_test[.]",name))
+      def always_frozen(name):
+          patterns = ["package.json","bun.lock","bun.lockb","package-lock.json","pnpm-lock.yaml","yarn.lock","bunfig.toml","jest.config.*","vitest.config.*","vitest.workspace.*","playwright.config.*","pytest.ini","conftest.py","pyproject.toml","setup.cfg","tox.ini","Makefile","tsconfig*",".github"]
+          return test_file(name) or any(fnmatch.fnmatchcase(part,pattern) for part in pathlib.PurePosixPath(name).parts for pattern in patterns)
+      def allowed_paths(root,bases):
+          allowed = None
+          for base in bases:
+              changed = set()
+              if base:
+                  for ref in ["origin/"+base,base]:
+                      if subprocess.run(["git","rev-parse","--verify","--quiet",ref+"^{commit}"],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode: continue
+                      try:
+                          changed = git_paths(root,"diff","--no-renames","--name-only","-z",ref+"...HEAD","--")
+                      except subprocess.CalledProcessError:
+                          pass
+                      break
+              allowed = changed if allowed is None else allowed & changed
+          return {name for name in allowed or set() if not always_frozen(name)}
+      def content(path):
+          # Hash symlink bytes without following targets outside the worktree.
+          if path.is_symlink(): return os.fsencode(os.readlink(path))
+          return path.read_bytes() if path.is_file() else None
+      def digest(path):
+          raw = content(path)
+          return hashlib.sha256(raw).hexdigest() if raw is not None else None
+      now = {}
+      for directory in sorted(roots.keys() | before.keys()):
           root = pathlib.Path(directory)
           if not root.is_dir(): sys.exit("test guard: missing stage directory: "+directory)
-          files = subprocess.check_output(["git","ls-files","-z","--cached","--others","--exclude-standard"],cwd=root).decode().split("\x00")
-          data = {}
-          # Revisit saved paths even if a repair untracks or ignores a frozen file.
-          selected = command_files.get(directory,set()) | before.get(directory, {}).keys()
-          selected.update(name for name in files if name and re.search(r"(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.|(^|/)test_[^/]+|(^|/)[^/]+_test[.]",name))
-          for name in selected:
-              path = root/name
-              if not path.is_file() or not path.resolve().is_relative_to(root): continue
-              content = path.read_bytes()
-              data[name] = hashlib.sha256(content).hexdigest()
-              if mode != "snapshot" and data[name] != before.get(directory, {}).get(name):
-                  if any(re.search(t,content.decode(errors="replace")) for t in markers):
-                      sys.exit("test guard: skip/only/todo in new or changed test: "+directory+"/"+name)
-          return data
-      now = {directory: inspect(directory) for directory in sorted(roots | before.keys())}
+          tracked = git_paths(root,"ls-files","-z","--cached")
+          files = tracked | git_paths(root,"ls-files","-z","--others") | command_files.get(directory,set())
+          if mode == "snapshot":
+              allowed = allowed_paths(root,roots[directory]) - command_files.get(directory,set())
+              frozen = (tracked - allowed) | {name for name in files if always_frozen(name)} | command_files.get(directory,set())
+              now[directory] = dict(allowed=sorted(allowed),known=sorted(files),frozen={name:digest(root/name) for name in sorted(frozen)})
+              continue
+          if directory not in before: sys.exit("test guard: unsnapshotted stage directory: "+directory)
+          saved = before[directory]
+          for name, sha in saved["frozen"].items():
+              if digest(root/name) != sha: sys.exit("test guard: changed or deleted frozen file: "+directory+"/"+name)
+          for name in files - set(saved["known"]):
+              if always_frozen(name) or name in command_files.get(directory,set()):
+                  sys.exit("test guard: new frozen file: "+directory+"/"+name)
+              raw = content(root/name)
+              if raw is not None and any(re.search(t,raw.decode(errors="replace")) for t in markers):
+                  sys.exit("test guard: skip/only/todo in new file: "+directory+"/"+name)
       if mode == "snapshot":
           pathlib.Path(snapshot).write_text(json.dumps(now,sort_keys=True),encoding="ascii")
-          sys.exit(0)
-      for directory, files in now.items():
-          saved = before.get(directory, {})
-          for name, digest in saved.items():
-              if name not in files: sys.exit("test guard: deleted test file: "+directory+"/"+name)
-              if files[name] != digest: sys.exit("test guard: changed test file: "+directory+"/"+name)
       TRG_PY
       }
       trg_snapshot() { trg_guard snapshot "$1" "$2"; }
@@ -2911,10 +2946,13 @@ nodes:
         export RST_TIMEOUT_SECONDS="$(cat "$EVIDENCE_DIR/stop-tests.timeout")"
         trg_attempt "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")"
       prompt: |
-        Repair the real test failure by fixing product code. Existing test files
-        are frozen: never edit or delete them. New test files may be added.
-        Never add skip/only/todo markers. Never emit
-        __NEVER_EMIT_USE_UNTIL_BASH__. The deterministic rerun and test-freeze guard
+        Repair the real test failure only within the snapshot's allowed product
+        paths (test-guard.json), or add new non-test, non-frozen helper files.
+        Every other tracked file is frozen. Tests, declared test scripts,
+        package.json, lockfiles, bunfig.toml, runner configs, Makefile,
+        tsconfig* and .github paths are always frozen, even in the build diff.
+        Never add test files or skip/only/todo markers. Never emit
+        __NEVER_EMIT_USE_UNTIL_BASH__. The deterministic rerun and allowlist guard
         are the only completion authority, with at most two attempts.
 
         Read the failing commands verbatim from

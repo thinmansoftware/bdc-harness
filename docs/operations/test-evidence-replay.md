@@ -6,10 +6,13 @@ The feature lanes execute declared tests before the manifest evidence gate. Real
 test failures may receive at most two Overseer repair attempts. Missing tools,
 the Bun node shim, timeouts and absent stage repositories are BLOCKED immediately.
 The test-repair node uses the lane's builder provider/model without a persona.
-Repairs may change product code and add new test files. Every existing test file
-is frozen by SHA-256: any byte change or deletion is refused, including setup,
-whitespace and line-ending changes. Skip/only/todo markers in new or changed tests
-are refused. A guard violation terminates repair as BLOCKED with
+Repairs may change only product files already in the build diff against the base
+at the snapshot, plus new non-test, non-frozen files. Every other tracked file is
+frozen by SHA-256: any byte change or deletion is refused. Test files, declared
+test scripts, package.json, lockfiles, bunfig.toml, runner configurations,
+Makefile, tsconfig* and .github paths are always frozen, even when the build
+changed them. New test or frozen-name files and skip/only/todo markers in any new
+file are refused. A guard violation terminates repair as BLOCKED with
 `tests_failed_after_repair:guard` in final evidence, the manifest audit line,
 the evidence gate's stderr and the blocked-report comment.
 
@@ -29,17 +32,24 @@ even on a non-PROCEED run. Without that probe, the existing blocked reasons appl
 ## Saved inputs and stage directories
 
 The evidence directory contains `stop-tests.commands` (one full command per line),
-`stop-tests.stages` (stage ID, TAB, repository slug, TAB, command), the test log,
+`stop-tests.stages` (stage ID, TAB, repository slug, TAB, command, TAB, target branch), the test log,
 guard snapshot, attempt count and final evidence. Repair and final verification
 use these saved files rather than reading the spec again. The guard snapshot is
-keyed by absolute directory and records raw-byte SHA-256 hashes of tracked and
-untracked test files in the current checkout plus every available stage worktree
-resolved from the saved plan. Checks revisit those saved roots even
+keyed by absolute directory and saves the allowlist, known paths and raw-byte
+SHA-256 hashes of frozen files in the current checkout plus every available stage
+worktree resolved from the saved plan. The run base follows the lane's declared
+base branch or BASE_BRANCH (otherwise master); each stage uses its saved target
+branch. Local origin refs take precedence over local branches. An unresolved
+base or missing merge base allows no tracked product files. The allowed set is
+fixed at the snapshot and does not grow when repair commits move HEAD.
+Checks revisit those saved roots even
 if a mapping disappears; a missing snapshotted directory fails closed.
 The freeze also includes existing regular files named by saved command tokens,
 including ignored scripts such as `check.sh`. Paths resolve in the command's
 worktree and honor a leading `cd`; flags, interpreter names and paths outside
 that worktree are excluded.
+Ignored paths obey the same freeze and new-file rules; an ignore pattern does
+not exempt new tests, runner configuration or marker-bearing helpers.
 
 When canonical stages are declared, their verify commands supersede Stop test
 blocks and the project-map command. Each stage executes in its declared worktree.
