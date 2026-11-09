@@ -7,9 +7,12 @@
  * amendments pushed after the merge, never on main). This sweep finds those
  * branches and raises ONE operator card per PR and stray sha.
  *
- * Scope: PRs the merge-execution bridge merged (overseer_verdicts rows with
- * action_reason 'merge_executed') in the last 7 days. Merges by the run-linked
- * merge manager are recorded only as overseer_actions rows and are not read here.
+ * Scope (WO-HARNESS-POST-MERGE-SWEEP-COVERAGE-01): merges by any path. The candidates are
+ * the pull requests GitHub reports as merged in the last 7 days in the repositories the
+ * merge policy covers (createGitHubMergedSource), so a merge the bridge or the run-linked
+ * manager never recorded, or a hand merge, is covered too. GitHub keeps pull.head.sha at the
+ * merged head while the branch moves, so no event-store row is needed. The earlier
+ * verdict-store source stays only as an injectable test seam (listMerged).
  *
  * Once per PR and stray sha: the card id is derived from a deterministic event
  * identity (PR + stray sha + merge time), and appendOperatorCard is
@@ -152,8 +155,153 @@ export function parsePullRequestUrl(
   return { owner: match[1], repo: match[2], number: Number(match[3]) };
 }
 
+/**
+ * One merged pull request to examine. Both candidate sources produce this shape.
+ * `head` is the PR's head branch and repository when the source already knows it,
+ * 'unreadable' when it cannot be known (a deleted fork), and undefined to have the
+ * reader look it up.
+ */
+export interface SweepCandidate {
+  pr: { owner: string; repo: string; number: number };
+  runId: string;
+  woId: string;
+  /** The head that was merged. */
+  mergedHeadSha: string;
+  /** When the PR merged; stable, so the card identity is stable. */
+  eventAt: string;
+  head?: PullRequestHead | 'unreadable';
+}
+
+/** The verdict-store seam (kept for tests): the run id and time are the verdict's. */
+function candidateFromVerdict(verdict: MergedVerdictForSweep): SweepCandidate | null {
+  const pr = verdict.pr_url ? parsePullRequestUrl(verdict.pr_url) : null;
+  if (!pr || !verdict.head_sha) return null;
+  return {
+    pr,
+    runId: verdict.run_id,
+    woId: verdict.wo_id,
+    mergedHeadSha: verdict.head_sha,
+    eventAt: verdict.updated_at,
+  };
+}
+
+/**
+ * The first WO id in a pull request title or head branch (titles first), or null. WO ids
+ * end in a short counter, so the lazy match stops at the counter and does not swallow a
+ * trailing thread suffix such as -thread-12345678.
+ */
+const WO_TOKEN = /\bWO-[A-Z0-9]+(?:-[A-Z0-9]+)*?-\d{1,3}\b/i;
+export function extractWoId(title: string, branch: string): string | null {
+  for (const text of [title, branch]) {
+    const match = WO_TOKEN.exec(text);
+    if (match) return match[0].toUpperCase();
+  }
+  return null;
+}
+
+export const POST_MERGE_SWEEP_MAX_PAGES = 10;
+const LIST_PAGE_SIZE = 100;
+
+interface ListedPull {
+  number: number;
+  title?: string;
+  merged_at?: string | null;
+  updated_at?: string;
+  head: {
+    ref?: string;
+    sha?: string;
+    repo?: { name?: string; owner?: { login?: string } | null } | null;
+  };
+}
+
+export interface GitHubMergedListOctokitLike {
+  pulls: {
+    list(input: Record<string, unknown>): Promise<{ data: ListedPull[] }>;
+  };
+}
+
+/**
+ * Candidates from GitHub: for each repository, closed pull requests sorted by updated
+ * descending, paged until a page is short or wholly older than the window (a PR merged in
+ * the window was updated at or after its merge, so nothing older can qualify), at most
+ * POST_MERGE_SWEEP_MAX_PAGES pages. Reaching the cap is logged and never raises an alert.
+ * A repository that cannot be listed is skipped and logged; it never throws.
+ */
+export function createGitHubMergedSource(
+  octokit: GitHubMergedListOctokitLike,
+  repos: readonly { owner: string; repo: string }[]
+): (sinceIso: string) => Promise<SweepCandidate[]> {
+  return async (sinceIso): Promise<SweepCandidate[]> => {
+    const since = Date.parse(sinceIso);
+    const out: SweepCandidate[] = [];
+    for (const { owner, repo } of repos) {
+      let capped = true;
+      try {
+        for (let page = 1; page <= POST_MERGE_SWEEP_MAX_PAGES; page++) {
+          const listed = await octokit.pulls.list({
+            owner,
+            repo,
+            state: 'closed',
+            sort: 'updated',
+            direction: 'desc',
+            per_page: LIST_PAGE_SIZE,
+            page,
+          });
+          const items = listed.data;
+          for (const item of items) {
+            const mergedAtMs = item.merged_at ? Date.parse(item.merged_at) : Number.NaN;
+            if (!Number.isFinite(mergedAtMs) || mergedAtMs < since) continue;
+            const branch = item.head.ref;
+            const headOwner = item.head.repo?.owner?.login;
+            const headRepo = item.head.repo?.name;
+            const sha = item.head.sha;
+            const hasHead =
+              typeof branch === 'string' &&
+              branch.length > 0 &&
+              typeof headOwner === 'string' &&
+              headOwner.length > 0 &&
+              typeof headRepo === 'string' &&
+              headRepo.length > 0;
+            if (typeof sha !== 'string' || sha.length === 0) continue;
+            const slug = `${owner}/${repo}#${item.number}`;
+            out.push({
+              pr: { owner, repo, number: item.number },
+              runId: `post-merge-sweep:${slug}`,
+              woId: extractWoId(item.title ?? '', branch ?? '') ?? `PR-${slug}`,
+              mergedHeadSha: sha,
+              eventAt: new Date(mergedAtMs).toISOString(),
+              head: hasHead ? { branch, owner: headOwner, repo: headRepo } : 'unreadable',
+            });
+          }
+          const last = items[items.length - 1];
+          const lastUpdated = last?.updated_at ? Date.parse(last.updated_at) : Number.NaN;
+          if (
+            items.length < LIST_PAGE_SIZE ||
+            (Number.isFinite(lastUpdated) && lastUpdated < since)
+          ) {
+            capped = false;
+            break;
+          }
+        }
+        if (capped) {
+          log.warn(
+            { owner, repo, pages: POST_MERGE_SWEEP_MAX_PAGES },
+            'overseer.post_merge_sweep.page_cap_reached'
+          );
+        }
+      } catch (error) {
+        log.warn({ owner, repo, err: error as Error }, 'overseer.post_merge_sweep.list_failed');
+      }
+    }
+    return out;
+  };
+}
+
 export interface PostMergeSweepOptions {
-  listMerged: (sinceIso: string) => Promise<readonly MergedVerdictForSweep[]>;
+  /** The candidate source: merged pull requests from GitHub. Give this or listMerged. */
+  listCandidates?: (sinceIso: string) => Promise<readonly SweepCandidate[]>;
+  /** Test seam: bridge merge verdicts from the event store. Give this or listCandidates. */
+  listMerged?: (sinceIso: string) => Promise<readonly MergedVerdictForSweep[]>;
   reader: StrayBranchReader;
   now?: Date;
   windowMs?: number;
@@ -173,19 +321,16 @@ export interface PostMergeSweepResult {
   unreadable: number;
 }
 
-function strayIdentity(
-  verdict: MergedVerdictForSweep,
-  pr: { owner: string; repo: string; number: number },
-  straySha: string
-): ActionableEventIdentity {
+function strayIdentity(candidate: SweepCandidate, straySha: string): ActionableEventIdentity {
+  const pr = candidate.pr;
   return {
     identity_version: OPERATOR_CARD_IDENTITY_VERSION,
     source_event_id: `post-merge-stray:${pr.owner}/${pr.repo}#${pr.number}:${straySha}`,
-    run_id: verdict.run_id,
-    wo_id: verdict.wo_id,
+    run_id: candidate.runId,
+    wo_id: candidate.woId,
     event_type: POST_MERGE_STRAY_EVENT_TYPE,
     step_name: POST_MERGE_STRAY_STEP_NAME,
-    event_created_at: new Date(verdict.updated_at).toISOString(),
+    event_created_at: new Date(candidate.eventAt).toISOString(),
     error_class: 'unknown',
   };
 }
@@ -199,22 +344,38 @@ export async function runPostMergeStraySweepOnce(
   ).toISOString();
   const escalate = options.escalate ?? runEscalation;
   const lookupCard = options.lookupCard ?? getOperatorCard;
-  const merged = await options.listMerged(sinceIso);
+  const listMerged = options.listMerged;
+  if ((options.listCandidates === undefined) === (listMerged === undefined)) {
+    throw new Error('post_merge_sweep_needs_exactly_one_candidate_source');
+  }
+  let unreadableSources = 0;
+  let candidates: readonly SweepCandidate[] = [];
+  if (options.listCandidates) {
+    candidates = await options.listCandidates(sinceIso);
+  } else if (listMerged) {
+    const rows = await listMerged(sinceIso);
+    const converted: SweepCandidate[] = [];
+    for (const row of rows) {
+      const candidate = candidateFromVerdict(row);
+      if (candidate) converted.push(candidate);
+      else unreadableSources += 1;
+    }
+    candidates = converted;
+  }
   const result: PostMergeSweepResult = {
-    examined: merged.length,
+    examined: candidates.length + unreadableSources,
     alerted: [],
     alreadyAlerted: 0,
     noStray: 0,
-    unreadable: 0,
+    unreadable: unreadableSources,
   };
 
-  for (const verdict of merged) {
-    const pr = verdict.pr_url ? parsePullRequestUrl(verdict.pr_url) : null;
-    if (!pr || !verdict.head_sha) {
-      result.unreadable += 1;
-      continue;
-    }
-    const head = await options.reader.readPullRequestHead(pr);
+  for (const candidate of candidates) {
+    const pr = candidate.pr;
+    const head =
+      candidate.head === 'unreadable'
+        ? undefined
+        : (candidate.head ?? (await options.reader.readPullRequestHead(pr)));
     if (!head) {
       result.unreadable += 1;
       continue;
@@ -229,12 +390,12 @@ export async function runPostMergeStraySweepOnce(
       continue;
     }
     // Gone, or still exactly at the merged head: nothing was pushed after the merge.
-    if (state.state === 'gone' || state.sha === verdict.head_sha) {
+    if (state.state === 'gone' || state.sha === candidate.mergedHeadSha) {
       result.noStray += 1;
       continue;
     }
 
-    const identity = strayIdentity(verdict, pr, state.sha);
+    const identity = strayIdentity(candidate, state.sha);
     const cardId = deriveOperatorCardId(identity);
     if (await lookupCard(cardId)) {
       result.alreadyAlerted += 1;
@@ -250,16 +411,16 @@ export async function runPostMergeStraySweepOnce(
         ? head.branch
         : `${headRepository}:${head.branch}`;
     const card: OperatorCardRecord = await escalate(
-      verdict.run_id,
+      candidate.runId,
       {
         decision: 'escalate',
         reason:
           `post-merge stray push: branch ${branch} of ${prUrl} is at ${state.sha}, ` +
-          `not the merged head ${verdict.head_sha}; that work is not on the base branch`,
+          `not the merged head ${candidate.mergedHeadSha}; that work is not on the base branch`,
       },
       {
         errorClass: 'unknown',
-        woId: verdict.wo_id,
+        woId: candidate.woId,
         repository,
         branch,
         prUrl,
@@ -267,13 +428,13 @@ export async function runPostMergeStraySweepOnce(
         headSha: state.sha,
         mergeability: 'merged',
         remediation: [
-          `Compare ${verdict.head_sha}..${state.sha} on branch ${branch}.`,
+          `Compare ${candidate.mergedHeadSha}..${state.sha} on branch ${branch}.`,
           'Open a follow-up PR with the stray commits, or confirm they are disposable.',
         ],
         evidenceLinks: {
           pull_request: prUrl,
           head_repository: headRepository,
-          merged_head_sha: verdict.head_sha,
+          merged_head_sha: candidate.mergedHeadSha,
           stray_sha: state.sha,
         },
       },
@@ -286,7 +447,13 @@ export async function runPostMergeStraySweepOnce(
       options.escalationDeps
     );
     log.info(
-      { prUrl, branch, straySha: state.sha, mergedHead: verdict.head_sha, cardId: card.card_id },
+      {
+        prUrl,
+        branch,
+        straySha: state.sha,
+        mergedHead: candidate.mergedHeadSha,
+        cardId: card.card_id,
+      },
       'merge-sweep.stray_push_alert'
     );
     result.alerted.push({ prUrl, branch, straySha: state.sha, cardId: card.card_id });

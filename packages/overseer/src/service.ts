@@ -10,7 +10,6 @@ import {
   listActiveRunUserMessages,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
-  listMergedVerdictsSince,
   listUnactionedFlagMergeReadyVerdicts,
   promoteObserveOrHealthyVerdict,
   promoteObserveOrHealthyVerdictWithReceipt,
@@ -49,7 +48,15 @@ import { assessLifecycleCandidate } from './actions/lifecycle';
 import { assessQualifiedMerge } from './actions/merge-ready';
 import { assertOverseerDefaultOff } from './integration-scenarios';
 import { createRealGitHubClientDeps, createRealOctokitClient } from './adapters/github-real-deps';
-import { createStrayBranchReader, runPostMergeStraySweepOnce } from './post-merge-stray-sweep';
+import {
+  createGitHubMergedSource,
+  createStrayBranchReader,
+  runPostMergeStraySweepOnce,
+  type GitHubMergedListOctokitLike,
+  type StrayBranchOctokitLike,
+} from './post-merge-stray-sweep';
+import { resolveDiscoveryRepos } from './merge-candidate-discovery';
+import { resolveMergeRepoPolicy } from './merge-repo-policy';
 import { runMergeExecutionBridgeOnce } from './merge-execution-bridge';
 import { readWoSpecForMergeHold } from './merge-hold';
 
@@ -116,6 +123,8 @@ export interface OverseerServiceOptions {
   postMergeSweepEnabled?: boolean;
   postMergeSweepIntervalMs?: number;
   postMergeSweepRun?: () => Promise<unknown>;
+  /** Test seam: the GitHub client the default sweep uses (pulls.list and git.getRef). */
+  postMergeSweepOctokit?: GitHubMergedListOctokitLike & StrayBranchOctokitLike;
   /** Tests inject a spy for the delivery isolation line; defaults to the module logger. */
   logger?: { error?(obj: Record<string, unknown>, msg: string): void };
 }
@@ -485,18 +494,49 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
 const POST_MERGE_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 
 /** Never throws: a sweep failure is logged and the next tick tries again. */
-function createPostMergeStraySweepRun(): (() => Promise<void>) | undefined {
-  const octokit = createRealOctokitClient();
-  const git = octokit.git;
-  if (!git) {
-    log.error({}, 'overseer.post_merge_sweep.bind_failed');
-    return undefined;
+/**
+ * The repositories the sweep covers: every repository in the merge policy plus those in
+ * OVERSEER_MERGE_DISCOVERY_REPOS, each once, read through the existing policy helpers.
+ */
+export function postMergeSweepRepos(
+  discoveryRaw: string | undefined = process.env.OVERSEER_MERGE_DISCOVERY_REPOS
+): { owner: string; repo: string }[] {
+  const seen = new Set<string>();
+  const repos: { owner: string; repo: string }[] = [];
+  const add = (owner: string, repo: string): void => {
+    const key = `${owner}/${repo}`.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    repos.push({ owner, repo });
+  };
+  for (const key of Object.keys(resolveMergeRepoPolicy())) {
+    const slash = key.indexOf('/');
+    if (slash > 0 && slash < key.length - 1) add(key.slice(0, slash), key.slice(slash + 1));
   }
-  const reader = createStrayBranchReader({ pulls: octokit.pulls, git });
+  for (const target of resolveDiscoveryRepos(discoveryRaw)) add(target.owner, target.repo);
+  return repos;
+}
+
+function createPostMergeStraySweepRun(
+  injected?: GitHubMergedListOctokitLike & StrayBranchOctokitLike
+): (() => Promise<void>) | undefined {
+  let octokit: GitHubMergedListOctokitLike & StrayBranchOctokitLike;
+  if (injected) {
+    octokit = injected;
+  } else {
+    const real = createRealOctokitClient();
+    if (!real.git) {
+      log.error({}, 'overseer.post_merge_sweep.bind_failed');
+      return undefined;
+    }
+    octokit = { pulls: real.pulls, git: real.git } as GitHubMergedListOctokitLike &
+      StrayBranchOctokitLike;
+  }
+  const reader = createStrayBranchReader(octokit);
   return async (): Promise<void> => {
     try {
       const result = await runPostMergeStraySweepOnce({
-        listMerged: listMergedVerdictsSince,
+        listCandidates: createGitHubMergedSource(octokit, postMergeSweepRepos()),
         reader,
       });
       log.info(
@@ -583,7 +623,8 @@ export async function runOverseerService(options: OverseerServiceOptions = {}): 
     }
   }
   if (options.postMergeSweepEnabled ?? envEnabled(process.env.OVERSEER_POST_MERGE_SWEEP)) {
-    const sweepRun = options.postMergeSweepRun ?? createPostMergeStraySweepRun();
+    const sweepRun =
+      options.postMergeSweepRun ?? createPostMergeStraySweepRun(options.postMergeSweepOctokit);
     if (sweepRun) {
       tasks.push(
         runMergeBridgeScheduler({
