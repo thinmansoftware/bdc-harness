@@ -125,13 +125,50 @@ function Test-DescendantAlive {
     return ([string]$row.CreationDate -eq $Descendant.Created)
 }
 
+# Taskkill wrapper, a separate function so a test can make the kill a no-op.
+function Invoke-TaskKillTree {
+    param([int]$Id)
+    & taskkill.exe /PID $Id /T /F *> $null
+}
+
+function Test-RootAlive {
+    param([int]$Id, $StartTime)
+    $live = Get-Process -Id $Id -ErrorAction SilentlyContinue
+    if ($null -eq $live) { return $false }
+    if ($null -ne $StartTime -and $live.StartTime -ne $StartTime) { return $false }
+    return $true
+}
+
+# Adds every current descendant of the worker to the tracked set (id -> descendant). Called on
+# every supervision poll while the worker runs, so agents it spawned are still known after the
+# worker exits (an exited parent has no live children to enumerate).
+function Update-TrackedDescendants {
+    param($Process, [hashtable]$Tracked)
+    if ($null -eq $Process -or $null -eq $Tracked) { return }
+    if ($Process.HasExited) { return }
+    try {
+        foreach ($d in @(Get-DescendantProcesses -RootId $Process.Id)) {
+            $Tracked[[int]$d.Id] = $d
+        }
+    }
+    catch { }
+}
+
 # Stop-Process ends only the one PID, and killing the worker also prevents its own cleanup of
-# the agents it spawned. So the whole tree is taken down (taskkill /T /F) and each recorded
-# descendant is then verified gone. Returns the number still alive after the wait.
+# the agents it spawned. So the whole tree is taken down (taskkill /T /F), then the root AND every
+# recorded descendant (live snapshot plus the tracked set) is verified gone. Returns the number
+# of processes still alive after the wait; the root counts. A failed kill is not an excuse to pass.
 function Stop-ProcessTreeVerified {
-    param([int]$RootId, [int]$WaitSeconds = 10)
-    $descendants = @(Get-DescendantProcesses -RootId $RootId)
-    & taskkill.exe /PID $RootId /T /F *> $null
+    param([int]$RootId, $RootStartTime = $null, [hashtable]$Tracked = $null, [int]$WaitSeconds = 10)
+    $byId = @{}
+    if (Test-RootAlive -Id $RootId -StartTime $RootStartTime) {
+        foreach ($d in @(Get-DescendantProcesses -RootId $RootId)) { $byId[[int]$d.Id] = $d }
+    }
+    if ($null -ne $Tracked) {
+        foreach ($k in @($Tracked.Keys)) { if (-not $byId.ContainsKey([int]$k)) { $byId[[int]$k] = $Tracked[$k] } }
+    }
+    $descendants = @($byId.Values)
+    if (Test-RootAlive -Id $RootId -StartTime $RootStartTime) { Invoke-TaskKillTree -Id $RootId }
     foreach ($d in $descendants) {
         if (Test-DescendantAlive -Descendant $d) {
             Stop-Process -Id $d.Id -Force -ErrorAction SilentlyContinue
@@ -139,31 +176,33 @@ function Stop-ProcessTreeVerified {
     }
     $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
     while ($true) {
-        $alive = @($descendants | Where-Object { Test-DescendantAlive -Descendant $_ })
-        if ($alive.Count -eq 0 -or [DateTime]::UtcNow -ge $deadline) { return $alive.Count }
+        $alive = @($descendants | Where-Object { Test-DescendantAlive -Descendant $_ }).Count
+        if (Test-RootAlive -Id $RootId -StartTime $RootStartTime) { $alive++ }
+        if ($alive -eq 0 -or [DateTime]::UtcNow -ge $deadline) { return $alive }
         Start-Sleep -Milliseconds 200
     }
 }
 
-# Stops ONLY a process object this launcher started, and only if the live PID
-# still has the start time recorded when it was started (a reused PID is left alone).
-# The process and everything it spawned are stopped; survivors are counted, never ignored.
+# Stops ONLY a process object this launcher started, and only if the live PID still has the
+# start time recorded when it was started (a reused PID is left alone). The process and
+# everything it spawned (live children and the descendants tracked while it ran, even if it has
+# already exited) are stopped and verified. Fail closed: survivors, a failed kill or any
+# cleanup error all raise the restart-blocking flag; nothing is ever treated as stopped on faith.
 function Stop-OwnedProcess {
-    param($Process)
+    param($Process, [hashtable]$Tracked = $null)
     if ($null -eq $Process) { return }
     try {
-        if ($Process.HasExited) { return }
-        $live = Get-Process -Id $Process.Id -ErrorAction SilentlyContinue
-        if ($null -eq $live) { return }
-        if ($live.StartTime -ne $Process.StartTime) { return }
-        $survivors = Stop-ProcessTreeVerified -RootId $Process.Id
+        $rootStart = $null
+        try { $rootStart = $Process.StartTime } catch { }
+        $survivors = Stop-ProcessTreeVerified -RootId $Process.Id -RootStartTime $rootStart -Tracked $Tracked
         if ($survivors -gt 0) {
             $script:DescendantsSurvived += $survivors
-            Write-LauncherLog ("$survivors descendant process(es) of owned process " + $Process.Id + " survived the tree stop")
+            Write-LauncherLog ("$survivors process(es) of owned process " + $Process.Id + " (the process or its descendants) survived the tree stop")
         }
     }
     catch {
-        Write-LauncherLog ("could not stop owned process " + $Process.Id)
+        $script:DescendantsSurvived += 1
+        Write-LauncherLog ("cleanup of owned process " + $Process.Id + " failed and cannot be verified; treated as blocking")
     }
 }
 
@@ -189,6 +228,7 @@ function Invoke-DispatchPairOnce {
 
     $tunnel = Start-TunnelProcess -SshHost $SshHost -LocalPort $LocalPort
     $worker = $null
+    $trackedWorkerTree = @{}
     try {
         $ready = $false
         for ($waited = 0; $waited -lt $ReadySeconds; $waited++) {
@@ -205,6 +245,7 @@ function Invoke-DispatchPairOnce {
         $worker = Start-WorkerProcess -ConfigPath $ConfigPath
         while ($true) {
             Invoke-LauncherSleep -Seconds $PollSeconds
+            Update-TrackedDescendants -Process $worker -Tracked $trackedWorkerTree
             if ($worker.HasExited) {
                 $code = $worker.ExitCode
                 if ($code -eq 0) { return @{ Outcome = 'clean'; Reason = 'worker exited 0' } }
@@ -223,7 +264,7 @@ function Invoke-DispatchPairOnce {
     }
     finally {
         # Our own pair only: the worker first, then the tunnel.
-        Stop-OwnedProcess -Process $worker
+        Stop-OwnedProcess -Process $worker -Tracked $trackedWorkerTree
         Stop-OwnedProcess -Process $tunnel
     }
 }

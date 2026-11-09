@@ -83,8 +83,9 @@ function Start-WorkerProcess {
     if ($script:OnWorkerStart) { $null = & $script:OnWorkerStart $p }
     return $p
 }
+function Update-TrackedDescendants { param($Process, $Tracked) }
 function Stop-OwnedProcess {
-    param($Process)
+    param($Process, $Tracked)
     if ($null -eq $Process) { return }
     $known = @(@($script:tunnels) + @($script:workers) | Where-Object { $_.Id -eq $Process.Id })
     if ($known.Count -eq 0) { [void]$script:violations.Add('stopped a process the launcher did not start') }
@@ -242,7 +243,7 @@ $script:Tick = {
     const r = await runScenario(`
 ${TUNNEL_LISTENER}
 function Stop-OwnedProcess {
-    param($Process)
+    param($Process, $Tracked)
     if ($null -eq $Process) { return }
     [void]$script:stopped.Add($Process.Id)
     if (-not $Process.HasExited) { $Process.HasExited = $true; $Process.ExitCode = -1 }
@@ -637,4 +638,100 @@ Write-Output ('SURVIVED_FLAG=' + $script:DescendantsSurvived)
       await rm(dir, { recursive: true, force: true });
     }
   }, 60000);
+});
+
+// Overseer findings on 6db5fc81f: cleanup returned immediately when the worker had already exited
+// (leaving orphaned agents), and it failed open (root never verified, errors swallowed).
+suite('start-windows.ps1 tree stop fails closed', () => {
+  const q = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+  async function runPs(body: string): Promise<{ out: string; err: string }> {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-fc-'));
+    try {
+      const script = join(dir, 'scenario.ps1');
+      await writeFile(
+        script,
+        `$ErrorActionPreference = 'Stop'
+. ${q(LAUNCHER)}
+function Write-LauncherLog { param([string]$Message) Write-Output ('LOG=' + $Message) }
+${body}
+`,
+        'utf8'
+      );
+      const proc = Bun.spawn(
+        [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          script,
+        ],
+        { stdout: 'pipe', stderr: 'pipe' }
+      );
+      const [out, err] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      return { out, err };
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('an agent orphaned by an already-exited worker is still stopped, using the descendants tracked while it ran', async () => {
+    const { out, err } = await runPs(`
+$p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', '"Start-Process -FilePath cmd.exe -ArgumentList ''/c ping -n 120 127.0.0.1'' -WindowStyle Hidden; Start-Sleep 5"') -WindowStyle Hidden -PassThru
+$null = $p.Handle
+$tracked = @{}
+for ($i = 0; $i -lt 100; $i++) {
+    Update-TrackedDescendants -Process $p -Tracked $tracked
+    if ($tracked.Count -ge 2) { break }
+    Start-Sleep -Milliseconds 100
+}
+Write-Output ('TRACKED=' + $tracked.Count)
+$null = $p.WaitForExit(30000)
+Write-Output ('PARENT_EXITED=' + $p.HasExited)
+$orphans = @($tracked.Values | Where-Object { Test-DescendantAlive -Descendant $_ })
+Write-Output ('ORPHANS_BEFORE=' + $orphans.Count)
+Stop-OwnedProcess -Process $p -Tracked $tracked
+$after = @($tracked.Values | Where-Object { Test-DescendantAlive -Descendant $_ })
+Write-Output ('ORPHANS_AFTER=' + $after.Count)
+Write-Output ('SURVIVED_FLAG=' + $script:DescendantsSurvived)
+`);
+    const num = (key: string): number => Number(new RegExp(`${key}=(\\d+)`).exec(out)?.[1] ?? '-1');
+    expect(num('TRACKED'), out + err).toBeGreaterThanOrEqual(1);
+    expect(out, err).toContain('PARENT_EXITED=True');
+    expect(num('ORPHANS_BEFORE'), out + err).toBeGreaterThanOrEqual(1);
+    expect(num('ORPHANS_AFTER'), out + err).toBe(0);
+    expect(num('SURVIVED_FLAG'), out + err).toBe(0);
+  }, 90000);
+
+  test('a kill that does not stop the root is a survivor: the root is verified, not assumed stopped', async () => {
+    const { out, err } = await runPs(`
+$p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 120') -WindowStyle Hidden -PassThru
+$null = $p.Handle
+function Invoke-TaskKillTree { param([int]$Id) }   # the kill silently does nothing
+Stop-OwnedProcess -Process $p
+Write-Output ('SURVIVED_FLAG=' + $script:DescendantsSurvived)
+Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+`);
+    const flag = Number(/SURVIVED_FLAG=(\d+)/.exec(out)?.[1] ?? '0');
+    expect(flag, out + err).toBeGreaterThanOrEqual(1);
+    expect(out).toContain('survived the tree stop');
+  }, 90000);
+
+  test('a cleanup that throws is treated as blocking, never as stopped', async () => {
+    const { out, err } = await runPs(`
+$p = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -WindowStyle Hidden -PassThru
+$null = $p.Handle
+function Stop-ProcessTreeVerified { throw 'cleanup exploded' }
+Stop-OwnedProcess -Process $p
+Write-Output ('SURVIVED_FLAG=' + $script:DescendantsSurvived)
+Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+`);
+    expect(out, err).toContain('SURVIVED_FLAG=1');
+    expect(out).toContain('cannot be verified; treated as blocking');
+  }, 90000);
 });
