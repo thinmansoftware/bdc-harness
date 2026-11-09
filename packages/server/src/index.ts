@@ -1,3 +1,4 @@
+import { ingestBeforePromotion, processPromotionWebhook } from '@archon/overseer';
 /**
  * Remote Coding Agent - Main Entry Point
  * Multi-platform AI coding assistant (Telegram, Discord, Slack, GitHub, Gitea)
@@ -654,25 +655,39 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // over the raw body, so neither trusts the other's dispatch decision.
         const isCheckCompletion =
           eventType === 'check_run' || eventType === 'check_suite' || eventType === 'workflow_run';
-        const result = isCheckCompletion
-          ? await ingestCheckCompletionEvent(
-              {
-                rawBody,
-                signature: c.req.header('x-hub-signature-256'),
-                eventType,
-                deliveryId,
-              },
-              recheckDeps
-            )
-          : await ingestPullRequestEvent(
-              {
-                rawBody,
-                signature: c.req.header('x-hub-signature-256'),
-                eventType,
-                deliveryId,
-              },
-              ingestDeps
-            );
+        const intake = async (): Promise<
+          | Awaited<ReturnType<typeof ingestPullRequestEvent>>
+          | Awaited<ReturnType<typeof ingestCheckCompletionEvent>>
+        > =>
+          isCheckCompletion
+            ? await ingestCheckCompletionEvent(
+                {
+                  rawBody,
+                  signature: c.req.header('x-hub-signature-256'),
+                  eventType,
+                  deliveryId,
+                },
+                recheckDeps
+              )
+            : await ingestPullRequestEvent(
+                {
+                  rawBody,
+                  signature: c.req.header('x-hub-signature-256'),
+                  eventType,
+                  deliveryId,
+                },
+                ingestDeps
+              );
+        const result = await ingestBeforePromotion(intake, () =>
+          processPromotionWebhook(
+            {
+              rawBody,
+              signature: c.req.header('x-hub-signature-256'),
+              eventType,
+            },
+            reviewRouteConfig.webhookSecret
+          )
+        );
         getLog().info(
           {
             eventType,

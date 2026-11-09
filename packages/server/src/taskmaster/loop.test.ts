@@ -5196,6 +5196,8 @@ describe('M-155 exception push (loop)', () => {
       'operator',
       'duty-officer',
       't3-desktop',
+      'codex-mcp',
+      't3-desk-local',
     ]);
   });
 

@@ -880,6 +880,47 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     expect(actions).toContain('merged');
   });
 
+  // WO-HARNESS-MERGE-OWNER-REWORKING-GUARD-01: the owner marks a PR owner:reworking while
+  // redoing the design. The run-linked manager (a second merge path next to the bridge) must
+  // hold it, never execute it, and record the denial. This is NOT HOLD (John's).
+  test('a PR labelled owner:reworking is held, never executed, and recorded as denied', async () => {
+    const labelledRecord: WatchedRunRecord = {
+      ...discoveredRecord,
+      prEvidence: { ...discoveredRecord.prEvidence, labels: ['owner:reworking'] },
+    };
+    const assembled = discoveredEvidence({ record: labelledRecord });
+    const insertOverseerAction = mock(async () => undefined);
+    const execute = mock(async () => ({ merged: true, message: 'must_not_run' }));
+
+    const manager = createMergeManager({
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-overseer[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: PR_HEAD_SHA },
+      ],
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'e'.repeat(64) }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => labelledRecord.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha: worktreeMustNotBeRead,
+    });
+
+    const result = await manager(labelledRecord);
+
+    expect(result.status).toBe('held');
+    expect(result).toEqual(expect.objectContaining({ reason: 'owner_reworking_label' }));
+    expect(execute).not.toHaveBeenCalled();
+    const actions = insertOverseerAction.mock.calls.map(
+      call => (call[0] as { action: string }).action
+    );
+    expect(actions).toContain('merge_denied');
+    expect(actions).not.toContain('merged');
+  });
+
   // The same PR against master is refused BEFORE provenance is ever consulted:
   // a main/master base is a production effect and holds for John.
   test('the same PR against master is still refused on the production hold', async () => {

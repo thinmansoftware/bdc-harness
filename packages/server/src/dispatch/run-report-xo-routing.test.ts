@@ -184,9 +184,16 @@ describe('fence 281: XO-owned run reports reach the operator mailbox', () => {
     );
     expect(rows[0]?.id).not.toBe(rows[1]?.id);
 
-    // Every XO principal spelling and a blank actor (body default acting-xo).
-    for (const actor of ['acting-xo', 'xo', 'operator', ' Acting-XO ', '']) {
+    // Every explicit XO principal spelling.
+    for (const actor of ['acting-xo', 'xo', 'operator', ' Acting-XO ']) {
       expect(isXoResponsibleActor(actor)).toBe(true);
+    }
+    // WO-HARNESS-OVERSEER-OWNER-ROUTING-01 (M-93 clause 2): XO is never
+    // automatically assigned, so a blank actor and the explicit unowned
+    // bucket are NOT XO principals. Cards always carry an explicit actor
+    // (responsible_actor is NOT NULL and runEscalation always sets one).
+    for (const actor of ['', '  ', 'unowned']) {
+      expect(isXoResponsibleActor(actor)).toBe(false);
     }
   });
 

@@ -95,6 +95,13 @@ export const DEFAULT_DISCOVERY_MAX_PRS_PER_TICK = 100;
 /** Label the lane patch-pr-body node puts on a PR opened from a non-PROCEED run. */
 export const RUN_BLOCKED_LABEL = 'run:blocked';
 
+/**
+ * Label the work's owner sets while reworking the design
+ * (WO-HARNESS-MERGE-OWNER-REWORKING-GUARD-01). Set and cleared only by the owner.
+ * Not merge-hold: HOLD stays John's.
+ */
+export const OWNER_REWORKING_LABEL = 'owner:reworking';
+
 export type MergeCandidateExclusionReason =
   | 'draft'
   | 'not_open'
@@ -110,7 +117,8 @@ export type MergeCandidateExclusionReason =
   | 'evidence_lookup_failed'
   | 'evidence_mismatch'
   | 'already_a_run_candidate'
-  | 'run_blocked';
+  | 'run_blocked'
+  | 'owner_reworking_label';
 
 export interface MergeCandidateExclusion {
   readonly owner: string;
@@ -449,6 +457,7 @@ export function classifyDiscoveredPullRequest(
   const resolvedBases = watchedBases ?? resolveWatchedBaseBranchesForRepo(ownerRepo, policy);
   if (!resolvedBases.includes(pr.baseRef.trim().toLowerCase())) return 'base_branch_not_watched';
   if (pr.labels?.includes(RUN_BLOCKED_LABEL)) return 'run_blocked';
+  if (pr.labels?.includes(OWNER_REWORKING_LABEL)) return 'owner_reworking_label';
   if (pr.reviewDecision !== 'APPROVED') return 'review_not_approved';
   return null;
 }
@@ -616,6 +625,8 @@ function detailFor(reason: MergeCandidateExclusionReason, pr: DiscoveredPullRequ
       return `review decision is ${pr.reviewDecision ?? 'none'}`;
     case 'run_blocked':
       return `pull request carries the ${RUN_BLOCKED_LABEL} label: its run ended BLOCKED and is not lane-verified`;
+    case 'owner_reworking_label':
+      return `pull request carries the ${OWNER_REWORKING_LABEL} label: its owner is reworking the design and has not cleared it`;
     default:
       return reason;
   }
