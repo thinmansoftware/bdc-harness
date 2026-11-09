@@ -169,7 +169,8 @@ describe('checkFireEligibility', () => {
   // Live 2026-11-09 (bdc-xo#4311): for a WO that TARGETS bdc-xo, author-wo.sh's own
   // spec PR ("WO: <id>", touching only docs/work-orders/<id>.md) lives in the target
   // repo, so the WO was refused pr_exists forever once its spec merged.
-  function specDeps(files: Record<number, string[] | 'error'>, prs: unknown[]) {
+  type FileEntry = string | { filename: string; status: string; previous_filename?: string };
+  function specDeps(files: Record<number, FileEntry[] | 'error'>, prs: unknown[]) {
     const base = deps(SPEC, prs);
     const inner = base.fetchImpl;
     base.fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
@@ -178,7 +179,9 @@ describe('checkFireEligibility', () => {
       if (m) {
         const entry = files[Number(m[1])];
         if (entry === 'error' || entry === undefined) return response({ message: 'boom' }, 500);
-        return response(entry.map(filename => ({ filename, status: 'added' })));
+        return response(
+          entry.map(item => (typeof item === 'string' ? { filename: item, status: 'added' } : item))
+        );
       }
       return inner(input, init);
     }) as typeof fetch;
@@ -209,6 +212,37 @@ describe('checkFireEligibility', () => {
       { title: 'WO: WO-HARNESS-EXAMPLE-01 and -010', state: 'open' },
     ]);
     expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
+  });
+  // Overseer minor on #1541: a rename INTO the spec path must not qualify.
+  test('a rename from a non-spec path into the spec path still counts as pr_exists', async () => {
+    const configured = specDeps(
+      {
+        1: [
+          {
+            filename: 'docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
+            status: 'renamed',
+            previous_filename: 'src/feature.ts',
+          },
+        ],
+      },
+      [{ title: 'WO: WO-HARNESS-EXAMPLE-01', state: 'open' }]
+    );
+    expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
+  });
+  test('a rename between this WO spec paths stays spec-only', async () => {
+    const configured = specDeps(
+      {
+        1: [
+          {
+            filename: 'docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
+            status: 'renamed',
+            previous_filename: 'docs/superpowers/specs/WO-HARNESS-EXAMPLE-01.md',
+          },
+        ],
+      },
+      [{ title: 'WO: WO-HARNESS-EXAMPLE-01', state: 'open' }]
+    );
+    expect((await checkFireEligibility(TITLE, configured)).eligible).toBe(true);
   });
   test('an unreadable PR file list fails closed as pr_exists', async () => {
     const configured = specDeps({ 1: 'error' }, [
