@@ -36,20 +36,144 @@ for location in current stage; do
   done
 done
 
-# New tests are allowed, but every forbidden marker is refused even in a new file.
+# Round 7 forbids new tests; markers are also forbidden in new product helpers.
 for marker in 'test.skip(x)' 'it.only(x)' 'xit(x)' 'xdescribe(x)' 'it.todo' 'test.todo' '@pytest.mark.skip' 'unittest.skip'; do
   fixture "new-marker-$PASS"
   trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
-  printf '%s\n' "$marker" > "$WT/new.test.ts"
+  printf '%s\n' "$marker" > "$WT/new-helper.ts"
   check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 done
-fixture new-test-allowed
+fixture new-test-forbidden
 printf 'assert True\n' > "$WT/test_existing.py"
 printf 'bad\n' > "$WT/product"
 trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 printf 'good\n' > "$WT/product"
 printf 'assert True\n' > "$WT/new.test.py"
-check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+
+# Test 18: real base/build commits, with a different stage target branch. Neither
+# the run base nor a moved HEAD may widen the snapshot's stage allowlist.
+build_fixture() {
+  local base="$1"
+  printf 'base\n' > "$WT/a.js"
+  printf 'untouched\n' > "$WT/b.js"
+  printf '{"scripts":{"test":"bash test_value.sh"}}\n' > "$WT/package.json"
+  printf 'if grep -q good a.js; then echo "Tests: 1/1"; else echo "Tests: 0/1"; exit 1; fi\n' > "$WT/test_value.sh"
+  printf '[test]\n' > "$WT/bunfig.toml"
+  printf '{}\n' > "$WT/tsconfig.json"
+  git -C "$WT" add a.js b.js package.json test_value.sh bunfig.toml tsconfig.json
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm base
+  git -C "$WT" branch "$base"
+  printf 'bad build\n' > "$WT/a.js"
+  printf '{"private":true,"scripts":{"test":"bash test_value.sh"}}\n' > "$WT/package.json"
+  git -C "$WT" add a.js package.json
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm build
+}
+for location in current stage; do
+  for change in package untouched delete untrack bunfig tsconfig new_test product helper; do
+    echo "Test 18: $location/$change"
+    fixture "allowlist-$location-$change"
+    build_fixture run-base
+    export BASE_BRANCH=run-base
+    CURRENT="$WT"; TARGET="$WT"
+    export FIX_SPEC=$'WO Class: CODE\nStop 1 (test suite):\n  npm test\nExpected: pass'
+    if [ "$location" = stage ]; then
+      fixture "allowlist-target-$change"
+      build_fixture stage-base
+      # The run branch exists here but has no build diff: using it would reject a.js.
+      git -C "$WT" branch run-base
+      TARGET="$WT"
+      WT="$CURRENT"; export ARTIFACTS_DIR="$WT/artifacts"
+      export RST_STAGE_WORKTREES="b=$TARGET"
+      export FIX_SPEC=$'WO Class: CODE\n## Canonical stages\n```yaml\nstages:\n  - id: b\n    repo: thinmansoftware/other\n    target_branch: stage-base\n    in_scope_files: [src]\n    verify_commands: ["npm test"]\n    readiness_bar: {spec_complete: true, scope_complete: true, dependencies_ready: true, acceptance_defined: true}\n```'
+    fi
+    export FIX_MAP=''
+    export FIX_INITIAL="$(run_node run-stop-tests)"
+    check contains "$FIX_INITIAL" 'TESTS_STATUS=failed'
+    check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    case "$change" in
+      package) printf '{"scripts":{"test":"echo \\"Tests: 1/1\\""}}\n' > "$TARGET/package.json" ;;
+      untouched) printf 'repair\n' > "$TARGET/b.js" ;;
+      delete) rm "$TARGET/b.js" ;;
+      untrack) git -C "$TARGET" rm --cached -q b.js; printf 'repair\n' > "$TARGET/b.js" ;;
+      bunfig) printf '[test]\nroot = "elsewhere"\n' > "$TARGET/bunfig.toml" ;;
+      tsconfig) printf '{"exclude":["tests"]}\n' > "$TARGET/tsconfig.json" ;;
+      new_test) printf 'assert True\n' > "$TARGET/new.test.py" ;;
+      product) printf 'good\n' > "$TARGET/a.js" ;;
+      helper) printf 'export const helper = 1;\n' > "$TARGET/helper.js"; printf 'good\n' > "$TARGET/a.js" ;;
+    esac
+    if [ "$change" = product ] || [ "$change" = helper ]; then
+      check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    else
+      check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    fi
+    run_node test-repair until_bash >/dev/null
+    out="$(run_node run-stop-tests-final)"
+    if [ "$change" = product ] || [ "$change" = helper ]; then
+      check contains "$out" 'TESTS_STATUS=passed'
+      check contains "$out" 'TESTS_REPAIR_RESULT=repaired'
+    else
+      check contains "$out" 'TESTS_STATUS=blocked'
+      check contains "$out" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+      check contains "$out" 'TESTS_REPAIR_RESULT=guard_violation'
+    fi
+    unset RST_STAGE_WORKTREES BASE_BRANCH
+  done
+done
+
+# Always-frozen names at depth, even when the build changed them. Exercise both
+# tracked edits and new untracked additions without relying on marker syntax.
+for name in package.json bun.lock bun.lockb package-lock.json pnpm-lock.yaml yarn.lock bunfig.toml jest.config.js vitest.config.ts vitest.workspace.ts playwright.config.js pytest.ini conftest.py pyproject.toml setup.cfg tox.ini Makefile tsconfig.build.json .github/workflows/check.yaml test_value.py src/value.test.ts; do
+  fixture "frozen-name-$PASS"
+  mkdir -p "$WT/packages/x/$(dirname "$name")"
+  path="packages/x/$name"
+  printf 'base\n' > "$WT/$path"
+  git -C "$WT" add "$path"
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm base
+  git -C "$WT" branch run-base
+  printf 'build\n' > "$WT/$path"
+  git -C "$WT" add "$path"
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm build
+  export BASE_BRANCH=run-base
+  trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  printf 'repair\n' > "$WT/$path"
+  check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  printf 'build\n' > "$WT/$path"
+  check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  mkdir -p "$WT/new/$(dirname "$path")"
+  printf 'new\n' > "$WT/new/$path"
+  check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  unset BASE_BRANCH
+done
+
+# Unresolved bases freeze all tracked product code; helper additions still pass.
+for base in missing-base unrelated-base; do
+  fixture "unresolved-$base"
+  build_fixture run-base
+  if [ "$base" = unrelated-base ]; then
+    empty_tree="$(git -C "$WT" hash-object -t tree /dev/null)"
+    orphan="$(printf 'orphan\n' | git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit-tree "$empty_tree")"
+    git -C "$WT" branch "$base" "$orphan"
+  fi
+  export BASE_BRANCH="$base"
+  trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  printf 'helper\n' > "$WT/helper.js"
+  check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  printf 'good\n' > "$WT/a.js"
+  check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  unset BASE_BRANCH
+done
+
+# The allowed set is fixed at snapshot time, even if the repair commits b.js.
+fixture snapshot-scope
+build_fixture run-base
+export BASE_BRANCH=run-base
+trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+printf 'repair\n' > "$WT/b.js"
+git -C "$WT" add b.js
+git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm repair
+check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+unset BASE_BRANCH
 
 # Test 16: declared scripts are frozen even when their names do not match the
 # test-file rule. Reproduce the Overseer's passing-summary rewrite verbatim.
