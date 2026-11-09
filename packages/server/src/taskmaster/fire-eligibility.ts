@@ -218,9 +218,15 @@ export async function checkFireEligibility(
       const rows: unknown = await response.json();
       if (!Array.isArray(rows) || rows.length > 100) return false;
       for (const row of rows) {
-        const filename = (row as { filename?: unknown } | null)?.filename;
+        const entry = row as { filename?: unknown; previous_filename?: unknown } | null;
+        const filename = entry?.filename;
         if (typeof filename !== 'string') return false;
         seen.push(filename);
+        // A rename INTO a spec path still touches its source path (#1541 review).
+        if (entry?.previous_filename !== undefined) {
+          if (typeof entry.previous_filename !== 'string') return false;
+          seen.push(entry.previous_filename);
+        }
       }
       if (rows.length < 100) return seen.length > 0 && seen.every(f => specPaths.has(f));
     }
