@@ -5,6 +5,10 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+    # ready_for_review is not in GitHub's default pull_request types. Without it a draft PR that is
+    # flipped to ready gets no fresh run, so its required checks can stay unrun or stale until someone
+    # pushes a commit (bdc-harness 1538, 2026-11-09).
+    types: [opened, synchronize, reopened, ready_for_review]
   schedule:
     - cron: '17 7 * * *'
   workflow_dispatch:
