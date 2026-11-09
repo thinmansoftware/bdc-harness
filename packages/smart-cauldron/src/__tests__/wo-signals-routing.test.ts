@@ -55,6 +55,7 @@ async function entryFor(opts: {
   spec: string | null;
   tags?: string[];
   labels?: string[];
+  woClass?: string;
   entryOverride?: string;
   onRead?: () => void;
 }): Promise<{ entry: string; requestEntryOverride: string | null }> {
@@ -76,7 +77,7 @@ async function entryFor(opts: {
     };
     const record = await runCascade({
       woId: opts.woId,
-      woClass: 'CODE',
+      woClass: opts.woClass ?? 'CODE',
       tags: opts.tags,
       labels: opts.labels,
       entryOverride: opts.entryOverride,
@@ -176,6 +177,20 @@ describe('entry pin', () => {
   test('a risky spec cannot pin itself below the risk floor (entry_tier: zero is ignored)', async () => {
     const spec = `${INVENTORY_SPEC}\nentry_tier: zero\n`;
     const result = await entryFor({ woId: 'WO-PIN-ZERO-RISKY-01', spec });
+    expect(result.entry).toBe('cursor');
+    expect(result.requestEntryOverride).toBeNull();
+  });
+
+  test('caller risk tags also set the floor: --tags auth with a clean spec pinning zero enters cursor', async () => {
+    const spec = `${CLEAN_SPEC}\nentry_tier: zero\n`;
+    const result = await entryFor({ woId: 'WO-PIN-ZERO-TAGGED-01', spec, tags: ['auth'] });
+    expect(result.entry).toBe('cursor');
+    expect(result.requestEntryOverride).toBeNull();
+  });
+
+  test('the class sets the floor: an INFRA WO cannot pin itself to zero', async () => {
+    const spec = `${CLEAN_SPEC}\nentry_tier: zero\n`;
+    const result = await entryFor({ woId: 'WO-PIN-ZERO-INFRA-01', spec, woClass: 'INFRA' });
     expect(result.entry).toBe('cursor');
     expect(result.requestEntryOverride).toBeNull();
   });

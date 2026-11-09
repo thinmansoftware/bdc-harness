@@ -662,15 +662,16 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       );
     } else if (tiers.some(t => t.name === woSignals.entryPin)) {
       // A pin may raise the entry tier but never lower it below what the ruleset
-      // gives the WO's detected risk: a billing/auth/migration spec pinning zero
-      // would otherwise defeat the routing this exists for.
+      // gives the WO: its class, the caller's tags AND the risk detected in the
+      // spec. A billing/auth/migration spec, a caller-tagged auth WO or an INFRA WO
+      // pinning zero would otherwise defeat the routing this exists for.
       const riskFloor = pickEntryTier({ woClass, tags: riskRoutingTags }, ruleset);
       const pinIndex = tiers.findIndex(t => t.name === woSignals.entryPin);
       const floorIndex = tiers.findIndex(t => t.name === riskFloor);
-      if (woSignals.riskTags.length > 0 && floorIndex !== -1 && pinIndex < floorIndex) {
+      if (floorIndex !== -1 && pinIndex < floorIndex) {
         console.log(
           `[smart-cauldron] Ignoring spec entry pin "${woSignals.entryPin}": below the risk ` +
-            `floor "${riskFloor}" for detected risk (${woSignals.riskTags.join(',')})`
+            `floor "${riskFloor}" for this WO's class, tags and detected risk`
         );
       } else {
         specPin = woSignals.entryPin;
