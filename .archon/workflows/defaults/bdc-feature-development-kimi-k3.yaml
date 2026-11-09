@@ -1785,6 +1785,10 @@ nodes:
     timeout: 60000
     bash: |
       set -uo pipefail
+      # Replay consumers run in the owned clone; feature lanes keep their cwd.
+      if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then
+        cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1
+      fi
       ORIGIN="$(git remote get-url origin 2>/dev/null || true)"
       if ! MAP_RESPONSE="$(timeout 30 gh api 'repos/thinmansoftware/bdc-xo/contents/scripts/cauldron/cauldron-projects.json?ref=main' 2>/dev/null)"; then
         printf 'TEST_COMMAND_SOURCE=wo-spec\nTEST_COMMAND_FALLBACK=unavailable\nTEST_COMMAND_MAP_SHA=\nTEST_COMMAND_B64=\nTEST_TIMEOUT_SECONDS=1500\n'
@@ -1846,6 +1850,10 @@ nodes:
     timeout: 1800000
     bash: |
       set -uo pipefail
+      # Replay consumers run in the owned clone; feature lanes keep their cwd.
+      if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then
+        cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1
+      fi
 
       capture_node_output() {
         python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
@@ -2409,19 +2417,25 @@ nodes:
               lines.append("\t".join([sid,repo,cmd]))
       print("\n".join(lines))' | sed 's/\r$//'
       }
+      # Shared directory resolution for execution and assertion-guard coverage.
+      rst_stage_dir() {
+        local sid="$1" repo="$2" dir origin
+        dir="$(printf '%s\n' "${RST_STAGE_WORKTREES:-}" | tr ';' '\n' | sed -n "s/^${sid}=//p" | head -1)"
+        origin="$(git remote get-url origin 2>/dev/null | sed -E 's#.*github.com[:/]##; s/[.]git$//')"
+        if [ -z "$dir" ] && [ "$repo" = "$origin" ]; then dir="$(pwd)"; fi
+        printf '%s\n' "$dir"
+      }
       # Replays only the persisted plan; no spec extraction occurs in a repair or final run.
       rst_execute_saved() {
         local evidence="$1" class="$2" cmds log result rc counts joined report reason="" overall=passed p=0 t=0
-        local sid repo cmd dir origin stage_status stage_line lines="" blocked="" stage_cmds
+        local sid repo cmd dir stage_status stage_line lines="" blocked="" stage_cmds
         cmds="$evidence/stop-tests.commands"; log="$evidence/stop-tests.log"
         if [ -s "$evidence/stop-tests.stages" ]; then
-          origin="$(git remote get-url origin 2>/dev/null | sed -E 's#.*github.com[:/]##; s/[.]git$//')"
           stage_cmds="$(mktemp)"
           while IFS= read -r sid; do
             repo="$(awk -F '\t' -v id="$sid" '$1==id {print $2; exit}' "$evidence/stop-tests.stages")"
             awk -F '\t' -v id="$sid" '$1==id {print $3}' "$evidence/stop-tests.stages" > "$stage_cmds"
-            dir="$(printf '%s\n' "${RST_STAGE_WORKTREES:-}" | tr ';' '\n' | sed -n "s/^${sid}=//p" | head -1)"
-            if [ -z "$dir" ] && [ "$repo" = "$origin" ]; then dir="$(pwd)"; fi
+            dir="$(rst_stage_dir "$sid" "$repo")"
             if [ -z "$dir" ] || [ ! -d "$dir" ]; then
               stage_status=blocked; reason="stage_repo_absent:$repo"; stage_line="$sid: BLOCKED ($reason)"
             else
@@ -2467,16 +2481,31 @@ nodes:
       # ---- END rst core ----
 
       # ---- BEGIN trg core (byte-identical across lanes; extracted by unit test) ----
-      # Snapshot tracked AND untracked tests before any repair. Token counts are per
-      # file and per token: replacing expect with assert cannot hide a decrease.
+      # Snapshot tracked AND untracked tests in every persisted-plan directory.
+      # Counts are per directory, file and token; directories cannot mask each other.
       trg_guard() {
-        python3 - "$1" "$2" "$3" <<'TRG_PY'
+        local mode="$1" root="$2" snapshot="$3" sid repo command dir
+        local -a roots=("$root")
+        if [ -s "$(dirname "$snapshot")/stop-tests.stages" ]; then
+          while IFS=$'\t' read -r sid repo command; do
+            dir="$(cd "$root" && rst_stage_dir "$sid" "$repo")" || return 1
+            # Unavailable stages are already BLOCKED. Remember all present roots;
+            # the checker also revisits saved roots if a mapping/directory vanishes.
+            if [ -n "$dir" ]; then
+              dir="$(cd "$root" && cd "$dir" 2>/dev/null && pwd)" || continue
+              roots+=("$dir")
+            fi
+          done < "$(dirname "$snapshot")/stop-tests.stages"
+        fi
+        python3 - "$mode" "$snapshot" "${roots[@]}" <<'TRG_PY'
       import json, pathlib, re, subprocess, sys
-      mode, root, snapshot = sys.argv[1:]
-      root = pathlib.Path(root)
+      mode, snapshot = sys.argv[1:3]
+      roots = {str(pathlib.Path(p).resolve()) for p in sys.argv[3:]}
       tokens = [r"expect\s*\(", r"assert", r"\.toBe", r"\.toEqual", r"\bt\.is\b", r"\bok\s*\("]
       markers = [r"\.skip\s*\(",r"\.only\s*\(",r"\bxit\s*\(",r"\bxdescribe\s*\(",r"\bit\.todo\b",r"\btest\.todo\b",r"@pytest\.mark\.skip",r"unittest\.skip"]
-      def inspect():
+      def inspect(directory):
+          root = pathlib.Path(directory)
+          if not root.is_dir(): sys.exit("test guard: missing stage directory: "+directory)
           files = subprocess.check_output(["git","ls-files","-z","--cached","--others","--exclude-standard"],cwd=root).decode().split("\x00")
           data = {}
           for name in set(files):
@@ -2489,17 +2518,19 @@ nodes:
               text = "\n".join(l for l in text.splitlines() if not re.match(r"\s*(#|//|\*)", l))
               data[name] = [[len(re.findall(t,text)) for t in tokens], [len(re.findall(t,text)) for t in markers]]
           return data
-      now = inspect()
+      before = {} if mode == "snapshot" else json.loads(pathlib.Path(snapshot).read_text())
+      now = {directory: inspect(directory) for directory in sorted(roots | before.keys())}
       if mode == "snapshot":
           pathlib.Path(snapshot).write_text(json.dumps(now,sort_keys=True),encoding="ascii")
           sys.exit(0)
-      before = json.loads(pathlib.Path(snapshot).read_text())
-      for name, (asserts, skips) in before.items():
-          if name not in now: sys.exit("test guard: deleted test file: "+name)
-          if any(a<b for a,b in zip(now[name][0],asserts)): sys.exit("test guard: fewer assertions: "+name)
-      for name, (_, skips) in now.items():
-          old = before.get(name, [[],[0]*len(markers)])[1]
-          if any(a>b for a,b in zip(skips,old)): sys.exit("test guard: skip/only/todo added: "+name)
+      for directory, files in now.items():
+          saved = before.get(directory, {})
+          for name, (asserts, skips) in saved.items():
+              if name not in files: sys.exit("test guard: deleted test file: "+directory+"/"+name)
+              if any(a<b for a,b in zip(files[name][0],asserts)): sys.exit("test guard: fewer assertions: "+directory+"/"+name)
+          for name, (_, skips) in files.items():
+              old = saved.get(name, [[],[0]*len(markers)])[1]
+              if any(a>b for a,b in zip(skips,old)): sys.exit("test guard: skip/only/todo added: "+directory+"/"+name)
       TRG_PY
       }
       trg_snapshot() { trg_guard snapshot "$1" "$2"; }
@@ -2732,6 +2763,10 @@ nodes:
       max_iterations: 2
       until_bash: |
         set -uo pipefail
+        # Replay consumers run in the owned clone; feature lanes keep their cwd.
+        if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then
+          cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1
+        fi
         EVIDENCE_DIR="$ARTIFACTS_DIR/evidence"
         . "$EVIDENCE_DIR/stop-tests.core.sh"
         export RST_TIMEOUT_SECONDS="$(cat "$EVIDENCE_DIR/stop-tests.timeout")"
@@ -2751,6 +2786,9 @@ nodes:
         Do not commit, push, open a PR, label or comment. This path also runs in
         the read-only evidence replay lane; product repairs remain local.
 
+        If $ARTIFACTS_DIR/evidence/replay-checkout exists, read its absolute
+        path and edit only that isolated clone, not the engine worktree.
+
         Original failure:
         $run-stop-tests.output
 
@@ -2762,6 +2800,10 @@ nodes:
     timeout: 1800000
     bash: |
       set -uo pipefail
+      # Replay consumers run in the owned clone; feature lanes keep their cwd.
+      if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then
+        cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1
+      fi
       EVIDENCE_DIR="$ARTIFACTS_DIR/evidence"
       INITIAL=$run-stop-tests.output
       ATTEMPTS="$(cat "$EVIDENCE_DIR/test-repair.attempts" 2>/dev/null || echo 0)"

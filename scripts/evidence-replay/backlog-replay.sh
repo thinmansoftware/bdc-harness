@@ -60,7 +60,8 @@ for pr in sample:
         with tempfile.TemporaryDirectory(prefix="bdc-replay-verify-") as tmp:
             # Own detached worktree only; apply observed local repair, never publish it.
             wt=str(pathlib.Path(tmp)/"verify")
-            subprocess.check_call(["git","worktree","add","--detach",wt,before],stdout=subprocess.DEVNULL)
+            replay_repo=str(e.parent/"replay-checkout")
+            subprocess.check_call(["git","-C",replay_repo,"worktree","add","--detach",wt,before],stdout=subprocess.DEVNULL)
             try:
                 patch=e/"replay-repair.patch"
                 if patch.stat().st_size:
@@ -73,7 +74,7 @@ for pr in sample:
                 verify=subprocess.check_output(["bash",str(driver),str(e),report["wo_class"],str(pathlib.Path.cwd())],cwd=wt,env=env,text=True)
                 if "TESTS_STATUS=passed\n" not in verify: counts["false_pass"]+=1
             finally:
-                subprocess.check_call(["git","worktree","remove","--force",wt])
+                subprocess.check_call(["git","-C",replay_repo,"worktree","remove","--force",wt])
         outcome="repaired" if report["repair_result"]=="repaired" else "passed"
     elif status=="blocked": outcome="blocked"
     else: outcome="failed"

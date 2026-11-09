@@ -17,7 +17,10 @@ Existing non-PROCEED `NOT_GATED` and base-red behavior remains in place.
 The evidence directory contains `stop-tests.commands` (one full command per line),
 `stop-tests.stages` (stage ID, TAB, repository slug, TAB, command), the test log,
 guard snapshot, attempt count and final evidence. Repair and final verification
-use these saved files rather than reading the spec again.
+use these saved files rather than reading the spec again. The guard snapshot is
+keyed by absolute directory and covers the current checkout plus every available
+stage worktree resolved from the saved plan. Checks revisit those saved roots even
+if a mapping disappears; a missing snapshotted directory fails closed.
 
 When canonical stages are declared, their verify commands supersede Stop test
 blocks and the project-map command. Each stage executes in its declared worktree.
@@ -38,11 +41,15 @@ After merge and an operator-authorized runtime rebuild, from the serving checkou
 bun run cli workflow run bdc-evidence-replay 'PR_NUMBER=1234'
 ```
 
-The workflow requires worktree isolation, disables origin pushing before fetching
-the PR ref, checks out that ref detached, resolves the WO spec using the standard
+The workflow creates its own isolated clone at `$ARTIFACTS_DIR/replay-checkout`.
+Only that clone's config receives the disabled origin push URL; the serving
+checkout and its linked worktrees keep their existing config. It fetches and
+checks out the PR ref detached, resolves the WO spec using the standard
 read-spec fallbacks and executes the same resolver, runner and guarded repair
 nodes as the feature lane. `WO_ID` may be supplied in the environment to override
 the PR body's `WO:` line. An unresolved spec is empty and does not fabricate one.
+The path saved in `evidence/replay-checkout` directs resolver, test, repair and
+report steps to the owned clone. The repair agent must edit that clone as well.
 
 The lane has no commit, push, PR, label or comment node. Repairs remain local.
 Its `replay-report` node prints `REPLAY_REPORT_PATH=...`; that JSON records PR, WO,
@@ -75,7 +82,8 @@ environment. `--db` is optional: the default follows `ARCHON_HOME/archon.db`,
 The CLI waits synchronously. Each run is correlated by a unique
 user-message token, and its completed replay-report event locates the JSON file.
 The script reads the event store in read-only mode, verifies every PASS again in
-a fresh detached worktree (including the recorded local repair), checks that PR
+a fresh detached worktree of the replay clone (including the recorded local
+repair), checks that PR
 heads did not move and prints per-PR outcomes and:
 
 ```text
