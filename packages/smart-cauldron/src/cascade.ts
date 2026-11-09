@@ -23,6 +23,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { loadLadder, loadRefusedTiers, loadPremiumTiers, loadMaxClimbsByEntry } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
+import { resolveWoSignals } from './wo-signals.js';
 import {
   admitClaudeTier,
   chooseHeadroomEntry,
@@ -120,6 +121,12 @@ export interface CascadeDeps {
   /** Exclusive active-cascade lock per woId+project. */
   acquireWoLock?: typeof acquireWoLock;
   releaseWoLock?: typeof releaseWoLock;
+  /**
+   * WO spec reader for routing signals (risk tags, Rung classification, entry
+   * pin). Defaults to a `gh api` read of docs/work-orders/<WO-ID>.md on bdc-xo
+   * main; returns null when unreadable (the ruleset pick then stands).
+   */
+  readWoSpec?: (woId: string) => Promise<string | null>;
   /**
    * Conductor ruleset override (skips loadRuleset() config read). Used to
    * exercise entry-tier selection deterministically -- e.g. a ruleset that
@@ -476,6 +483,13 @@ export interface RunCascadeOptions {
   beforeAdmission?: () => Promise<import('@archon/core/db/taskmaster').AutomaticFireProvenance>;
   woClass?: string;
   tags?: string[];
+  /**
+   * GitHub issue labels for this WO. Labels that name money/billing, auth/
+   * security/RLS/roles or migrations add the matching risk tag to the conductor
+   * ruleset input (WO-HARNESS-CONDUCTOR-RISK-ROUTING-01), keeping the WO off
+   * the zero tier.
+   */
+  labels?: string[];
   /** Override the entry tier (skips conductor ruleset). */
   entryOverride?: TierName;
   /**
@@ -543,7 +557,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     onAdmission,
     woClass,
     tags,
-    entryOverride,
+    entryOverride: callerEntryOverride,
     dryRun = false,
     outDir = './cascade-runs',
     pollTimeoutMs = 14_400_000,
@@ -622,8 +636,64 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   // Keyed by the cascade's resolved entry tier; a tier absent here has no limit.
   const maxClimbsByEntry = loadMaxClimbsByEntry();
 
+  // Routing signals the WO declares about itself (WO-HARNESS-CONDUCTOR-RISK-
+  // ROUTING-01): risk tags from labels + spec text, and an optional entry-tier
+  // pin in the spec frontmatter. An explicit --entry skips this read entirely.
+  const woSignals = callerEntryOverride
+    ? null
+    : await resolveWoSignals({
+        woId,
+        labels: opts.labels,
+        readSpec: opts.deps?.readWoSpec,
+      });
+  if (woSignals && woSignals.reasons.length > 0) {
+    console.log(`[smart-cauldron] WO routing signals for ${woId}: ${woSignals.reasons.join('; ')}`);
+  } else if (woSignals && !woSignals.specRead) {
+    console.log(
+      `[smart-cauldron] WO routing signals for ${woId}: spec unreadable, using caller class/tags only`
+    );
+  }
+  // A spec pin is a human-authored entry choice and behaves like --entry (the
+  // refused-tier check and the seat gate treat it as pinned). Unknown tier names
+  // are ignored with a log rather than silently routing somewhere unintended.
+  let specPin: TierName | undefined;
+  const riskRoutingTags = [...new Set([...(tags ?? []), ...(woSignals?.riskTags ?? [])])];
+  if (woSignals?.entryPin) {
+    if (premiumTiers.includes(woSignals.entryPin)) {
+      // A pin onto a premium tier would skip the frontier-approval gate, which
+      // only an explicit operator --entry may do. A spec cannot approve itself.
+      console.log(
+        `[smart-cauldron] Ignoring spec entry pin "${woSignals.entryPin}": premium tiers need ` +
+          'operator approval or an explicit --entry'
+      );
+    } else if (tiers.some(t => t.name === woSignals.entryPin)) {
+      // A pin may raise the entry tier but never lower it below what the ruleset
+      // gives the WO: its class, the caller's tags AND the risk detected in the
+      // spec. A billing/auth/migration spec, a caller-tagged auth WO or an INFRA WO
+      // pinning zero would otherwise defeat the routing this exists for.
+      const riskFloor = pickEntryTier({ woClass, tags: riskRoutingTags }, ruleset);
+      const pinIndex = tiers.findIndex(t => t.name === woSignals.entryPin);
+      const floorIndex = tiers.findIndex(t => t.name === riskFloor);
+      if (floorIndex !== -1 && pinIndex < floorIndex) {
+        console.log(
+          `[smart-cauldron] Ignoring spec entry pin "${woSignals.entryPin}": below the risk ` +
+            `floor "${riskFloor}" for this WO's class, tags and detected risk`
+        );
+      } else {
+        specPin = woSignals.entryPin;
+      }
+    } else {
+      console.log(
+        `[smart-cauldron] Ignoring spec entry pin "${woSignals.entryPin}": not a ladder tier ` +
+          `(${tiers.map(t => t.name).join(', ')})`
+      );
+    }
+  }
+  const entryOverride: TierName | undefined = callerEntryOverride ?? specPin;
+  const routingTags = riskRoutingTags;
+
   // Conductor: pick entry tier (ruleset), or honor explicit --entry override
-  let entryTierName = entryOverride ?? pickEntryTier({ woClass, tags }, ruleset);
+  let entryTierName = entryOverride ?? pickEntryTier({ woClass, tags: routingTags }, ruleset);
 
   // Dark/retired lanes are never live entry points. An explicit --entry onto a
   // refused tier is an operator error and throws; a RULESET pick that lands on a

@@ -23,13 +23,13 @@ One sentence: **cheap first, gates judge, climb only when the gates say so.**
 
 ## The five layers (from the Cauldron 2.0 brief)
 
-| Layer | Name | What it does |
-|---|---|---|
-| 1 | Spine | System of record: every WO is a GitHub issue; evidence ledger; gate registry |
-| 2 | Router | Picks the entry tier per WO (ruleset in v1; learned later) and climbs on gate-fail |
-| 3 | Engine | The lanes: DAG workflows that plan, build, review, repair, and open the PR |
-| 4 | Validation | GitHub is the only quality authority: CI checks, manifest gate, adversarial review |
-| 5 | Deck | The human view: cascade trace, cost + savings, integrity flags, waiting-on-John |
+| Layer | Name       | What it does                                                                       |
+| ----- | ---------- | ---------------------------------------------------------------------------------- |
+| 1     | Spine      | System of record: every WO is a GitHub issue; evidence ledger; gate registry       |
+| 2     | Router     | Picks the entry tier per WO (ruleset in v1; learned later) and climbs on gate-fail |
+| 3     | Engine     | The lanes: DAG workflows that plan, build, review, repair, and open the PR         |
+| 4     | Validation | GitHub is the only quality authority: CI checks, manifest gate, adversarial review |
+| 5     | Deck       | The human view: cascade trace, cost + savings, integrity flags, waiting-on-John    |
 
 ## The roster is a ROLE MATRIX, not a model ladder (v1.1 amendment)
 
@@ -37,12 +37,12 @@ The original design treated each model as one rung: GLM = cheap, Codex = mid,
 Claude = high, Fable = top. Live data (2026-07-01) proved that is the wrong grain.
 A model's competence differs BY ROLE:
 
-| Model | Plan (agentic repo search) | Build (execute a plan) | Review | Repair loops |
-|---|---|---|---|---|
+| Model                        | Plan (agentic repo search)            | Build (execute a plan)              | Review               | Repair loops          |
+| ---------------------------- | ------------------------------------- | ----------------------------------- | -------------------- | --------------------- |
 | GLM (glm-5.2 via OpenRouter) | NO -- hangs (runs 818d4b62, d3f1b36c) | YES -- 10/12 on deterministic specs | untested as reviewer | NO -- cannot converge |
-| Codex (gpt-5.5) | untested | YES | YES (adversarial) | YES |
-| Claude Sonnet | YES | YES | YES | YES |
-| Fable / frontier | top rung | top rung | top rung | top rung |
+| Codex (gpt-5.5)              | untested                              | YES                                 | YES (adversarial)    | YES                   |
+| Claude Sonnet                | YES                                   | YES                                 | YES                  | YES                   |
+| Fable / frontier             | top rung                              | top rung                            | top rung             | top rung              |
 
 So a LANE is a composition of roles, each pinned to the cheapest model PROVEN for
 that role. The current hardened GLM lane is the reference primitive:
@@ -59,11 +59,11 @@ by assumption. (Trust gate, design sec 8.6; roster-seat doctrine 2026-06-29.)
 
 ## The three failure classes (v1.1 -- there are three, not two)
 
-| Class | Signature | Correct response |
-|---|---|---|
-| Availability | model did not respond: timeout, 429, 500 | FAILOVER sideways: retry on next available model, same tier |
-| Quality | model responded, build FAILED the gate | CLIMB: escalate the role one tier up |
-| **Progress** | model responds, no error, burns tokens, NEVER reaches the gate (repeated output, no tool calls) | WATCHDOG kill: treat as quality-fail at that node, climb |
+| Class        | Signature                                                                                       | Correct response                                            |
+| ------------ | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| Availability | model did not respond: timeout, 429, 500                                                        | FAILOVER sideways: retry on next available model, same tier |
+| Quality      | model responded, build FAILED the gate                                                          | CLIMB: escalate the role one tier up                        |
+| **Progress** | model responds, no error, burns tokens, NEVER reaches the gate (repeated output, no tool calls) | WATCHDOG kill: treat as quality-fail at that node, climb    |
 
 Progress failure is the 2026-07-01 discovery: run 818d4b62 emitted the same
 preamble for 34 minutes; run d3f1b36c for 6. No gate ever fired because the work
@@ -119,6 +119,18 @@ Read `cascade-runs/<slug>/cascade-record.json`:
 - `attempts[].nodeModels` maps each node id to `{ provider, declared, served }`
   from the last `node_completed` or `node_failed` event for that step.
 
+## WO routing signals (WO-HARNESS-CONDUCTOR-RISK-ROUTING-01)
+
+The conductor used to route only on `--class` and `--tags`, and the caller supplied both. A fire with no tags fell to the plain-CODE rule and entered `zero` (open models, no paid review seat) even when the WO touched migrations, roles, RLS, auth or money -- the work the ladder file says must stay off zero.
+
+Now `runCascade` reads the WO itself before it picks an entry tier (`packages/smart-cauldron/src/wo-signals.ts`):
+
+- It fetches `docs/work-orders/<WO-ID>.md` from bdc-xo main with `gh api` (nothing is fetched under `SMART_CAULDRON_HERMETIC=1`; an unreadable spec logs and keeps the ruleset pick).
+- Risk words in the spec add tags: money/billing/Stripe -> `money`; auth/JWT/roles/RLS/permissions -> `auth`; migrations/alter table/create policy -> `migration`. A `Rung classification: billing/auth/infra` line adds `money` and `auth`. The Rung line itself is not scanned, so an unfilled template line does not make a clean WO look risky. Issue labels passed as `labels` add the same tags.
+- Those tags are merged with the caller's tags and handed to `config/ruleset.config.json`, which still decides where risk goes (billing/auth/migration/INFRA/feature all enter `cursor`). Plain CODE with no risk signal still enters `zero`.
+- A WO can pin its entry tier with an `entry_tier: <tier>` line in its spec. A pin behaves like `--entry` (refused tiers and the seat gate still apply) but can only raise the tier: a pin below the ruleset's pick for the WO (its class, the caller's tags and the risk detected in the spec; for example `entry_tier: zero` on a migration spec, on a WO fired with `--tags auth`, or on an INFRA WO) is ignored with a log line. A spec cannot pin a premium tier (`frontier`): that needs operator approval or an explicit `--entry`. An unknown tier name is ignored with a log line. An explicit `--entry` always wins and the spec is not read.
+
+The cascade log shows `WO routing signals for <WO-ID>: ...` with the reasons.
 ## WO lock orphan recovery (WO-HARNESS-WO-LOCK-RELEASE-ON-CANCEL-01)
 
 The conductor holds one file lock per WO and project at `<out-dir>/wo-locks/wo-<hash>.json` (`/app/cascade-runs/wo-locks/` for the supervised fire, which runs `cd /app`). Only the owning cascade's `finally` released it, so killing the conductor left `status: running` and every later fire was refused as a duplicate.
