@@ -60,12 +60,14 @@
       "version": "0.3.10",
       "bin": {
         "archon": "./src/cli.ts",
+        "thinman": "./src/cli.ts",
       },
       "dependencies": {
         "@archon/adapters": "workspace:*",
         "@archon/core": "workspace:*",
         "@archon/git": "workspace:*",
         "@archon/isolation": "workspace:*",
+        "@archon/overseer": "workspace:*",
         "@archon/paths": "workspace:*",
         "@archon/providers": "workspace:*",
         "@archon/server": "workspace:*",

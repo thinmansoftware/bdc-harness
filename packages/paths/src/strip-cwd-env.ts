@@ -105,6 +105,129 @@ export function stripCwdEnv(cwd: string = process.cwd()): void {
 
   // Strip debugger vars that crash Claude Code subprocesses
   // See: https://github.com/anthropics/claude-code/issues/4619
-  Reflect.deleteProperty(process.env, 'NODE_OPTIONS');
-  Reflect.deleteProperty(process.env, 'VSCODE_INSPECTOR_OPTIONS');
+  // NODE_OPTIONS keeps only the flags on SAFE_NODE_OPTIONS_FLAGS (a value from a
+  // CWD .env file was already deleted by pass 1). One unknown flag no longer drops
+  // the safe ones with it, and anything removed is reported, never silent: a
+  // silent all-or-nothing delete is how the Node 26 localStorage fix vanished
+  // from every lane on 2026-11-05 (bdc-harness #1510).
+  filterNodeOptions();
+  if (process.env.VSCODE_INSPECTOR_OPTIONS !== undefined) {
+    Reflect.deleteProperty(process.env, 'VSCODE_INSPECTOR_OPTIONS');
+    process.stderr.write(
+      '[archon] stripped VSCODE_INSPECTOR_OPTIONS (debugger option crashes Claude Code subprocesses)\n'
+    );
+  }
+}
+
+/**
+ * Node flags that are safe to pass through to every subprocess (lane bash
+ * nodes, test runners, Claude Code). Anything else in NODE_OPTIONS -- notably
+ * --inspect / --require / --import -- is stripped.
+ *
+ * --no-experimental-webstorage: Node 26 defines a global localStorage that
+ * returns undefined unless --localstorage-file is given, so vitest DOM
+ * environments cannot install their own and every localStorage test crashes.
+ * The builder image sets this flag; it must reach lane test runs (bdc-xo, 2026-11-05).
+ */
+const SAFE_NODE_OPTIONS_FLAGS: ReadonlySet<string> = new Set(['--no-experimental-webstorage']);
+
+/** Placeholder logged for any removed token that cannot be identified as a flag name. */
+const UNRECOGNIZED_PLACEHOLDER = '<unrecognized>';
+
+/** Shape of a flag name that is safe to log: --name or -n, no '=', no whitespace, no values. */
+const LOGGABLE_FLAG_NAME = /^--?[A-Za-z][A-Za-z0-9-]{0,63}$/;
+
+/**
+ * Split NODE_OPTIONS into tokens the way Node does: whitespace separates tokens,
+ * and single- or double-quoted segments (which may contain whitespace) stay inside
+ * one token with the quotes removed. A backslash inside a double-quoted segment
+ * escapes the next character. An unterminated quote runs to the end of the value.
+ */
+function tokenizeNodeOptions(value: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let inToken = false;
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value.charAt(i);
+    if (quote !== null) {
+      if (ch === quote) {
+        quote = null;
+      } else if (ch === '\\' && quote === '"' && i + 1 < value.length) {
+        i++;
+        current += value.charAt(i);
+      } else {
+        current += ch;
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      inToken = true;
+    } else if (/\s/.test(ch)) {
+      if (inToken) {
+        tokens.push(current);
+        current = '';
+        inToken = false;
+      }
+    } else {
+      current += ch;
+      inToken = true;
+    }
+  }
+  if (inToken) tokens.push(current);
+  return tokens;
+}
+
+/**
+ * Name of a flag token for logging: the part before any '=', and only when it has
+ * the shape of a flag name. Anything else (a stray value, a quoted fragment, a
+ * path) is reported as a fixed placeholder, never echoed.
+ */
+function flagName(token: string): string {
+  const eq = token.indexOf('=');
+  const name = eq === -1 ? token : token.slice(0, eq);
+  return LOGGABLE_FLAG_NAME.test(name) ? name : UNRECOGNIZED_PLACEHOLDER;
+}
+
+/**
+ * Keep only allowlisted flags in NODE_OPTIONS. A value whose flags are all safe is
+ * left exactly as it was; otherwise the safe flags are kept (space-joined) or the
+ * variable is deleted when none remain. Every removed option is reported on stderr
+ * by flag NAME only: option values (including the space-separated form
+ * `--require /path` and quoted values) are consumed with their flag and never
+ * printed, and tokens that are not flag-shaped are logged as a placeholder.
+ */
+function filterNodeOptions(): void {
+  const value = process.env.NODE_OPTIONS;
+  if (value === undefined) return;
+  const tokens = tokenizeNodeOptions(value);
+  const kept: string[] = [];
+  const removedNames: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (SAFE_NODE_OPTIONS_FLAGS.has(token)) {
+      kept.push(token);
+      continue;
+    }
+    removedNames.push(flagName(token));
+    // `--flag value`: a removed flag without '=' owns the next token when that token
+    // does not itself start with '-'. The value is dropped with the flag, never logged.
+    const isFlag = token.startsWith('-');
+    const next = tokens[i + 1];
+    if (isFlag && !token.includes('=') && next !== undefined && !next.startsWith('-')) {
+      i++;
+    }
+  }
+  if (tokens.length > 0 && removedNames.length === 0) return;
+  if (kept.length > 0) {
+    process.env.NODE_OPTIONS = kept.join(' ');
+  } else {
+    Reflect.deleteProperty(process.env, 'NODE_OPTIONS');
+  }
+  if (removedNames.length > 0) {
+    process.stderr.write(
+      `[archon] NODE_OPTIONS: removed ${removedNames.length} flag(s) not on the safe list (${removedNames.join(', ')}); ` +
+        (kept.length > 0 ? `kept ${kept.join(' ')}` : 'NODE_OPTIONS unset') +
+        '. Add a flag to SAFE_NODE_OPTIONS_FLAGS in packages/paths/src/strip-cwd-env.ts to pass it to lanes.\n'
+    );
+  }
 }

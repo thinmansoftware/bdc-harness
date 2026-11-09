@@ -14,6 +14,8 @@ import {
 } from '@archon/overseer/pr-review-wiring';
 import { brokerLimits, processJob } from '../../../../scripts/overseer-reviewer-broker';
 import {
+  runCheckoutGit,
+  redactCheckoutStderr,
   parseTrustedCheckPlan,
   prepareReviewCheckout,
   readTrustedCheckPlan,
@@ -1261,3 +1263,154 @@ describe.serial(
     );
   }
 );
+
+describe('checkout failure diagnostics', () => {
+  test('fetch failure logs exact review identity and retains stable error code', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'review-diagnostic-'));
+    try {
+      const { remote, head } = await createRemote(root);
+      const base = 'e'.repeat(40);
+      let failure: unknown;
+      const harness = workerHarness({
+        head,
+        prepareCheckout: async request => {
+          try {
+            return await prepareReviewCheckout(request, {
+              remoteUrl: remote,
+              checkoutRoot: join(root, 'checkouts'),
+            });
+          } catch (error) {
+            failure = error;
+            throw error;
+          }
+        },
+      });
+      const warnings: Record<string, unknown>[] = [];
+      harness.deps.logger = {
+        warn: data => {
+          warnings.push(data);
+        },
+      };
+      harness.queue.push(
+        queuedReview('diagnostic-fetch', {
+          owner: 'o',
+          repo: 'r',
+          prNumber: 17,
+          headSha: head,
+          baseRef: 'main',
+          baseSha: base,
+          author: 'contributor',
+        })
+      );
+      await tickReviewWorkerClock(WORKER_CONFIG, harness.deps);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe('review_checkout_identity_failure');
+      const expected = {
+        repository: 'o/r',
+        prNumber: 17,
+        headSha: head,
+        baseSha: base,
+        step: 'fetch',
+      };
+      expect((failure as Error).cause).toMatchObject(expected);
+      const warning = warnings.find(row => row.reason === 'review_checkout_identity_failure');
+      expect(warning).toMatchObject(expected);
+      expect(warning?.gitExitCode).toBeGreaterThan(0);
+      expect(String(warning?.stderr ?? '')).not.toBe('');
+      const resultBody = JSON.parse(harness.results[0]?.result_body ?? '{}');
+      expect(resultBody.checkout_step).toBe('fetch');
+      expect(resultBody).toMatchObject({
+        disposition: 'review_incomplete',
+        reason: 'review_checkout_identity_failure',
+        event: 'COMMENT',
+      });
+      expect(resultBody).not.toHaveProperty('stderr');
+      expect(resultBody).not.toHaveProperty('headSha');
+      expect(resultBody).not.toHaveProperty('baseSha');
+      expect(harness.posts[0]?.body).toStartWith(
+        'Review incomplete: review_checkout_identity_failure'
+      );
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('redacts credentials before bounding stderr', () => {
+    const fake = 'test-only-credential-value';
+    const previous = process.env.GITHUB_TOKEN;
+    process.env.GITHUB_TOKEN = fake;
+    try {
+      const clean = redactCheckoutStderr(
+        `${fake} https://alice:password@example.invalid/repo https://x-access-token:secret@example.invalid Authorization: Basic abc123\nAuthorization: Bearer xyz789\nghp_abcdefghijklmnopqrstuvwxyz0123456789 ${'z'.repeat(3000)}`
+      );
+      for (const secret of [
+        fake,
+        'alice',
+        'password',
+        'secret',
+        'abc123',
+        'xyz789',
+        'ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+      ])
+        expect(clean).not.toContain(secret);
+      expect(clean.length).toBeLessThanOrEqual(2000);
+    } finally {
+      if (previous === undefined) delete process.env.GITHUB_TOKEN;
+      else process.env.GITHUB_TOKEN = previous;
+    }
+  });
+
+  test('later checkout failure preserves step, exit code and sanitized stderr in error', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'review-diagnostic-later-'));
+    try {
+      await git(root, ['init', '-q']);
+      let failure: unknown;
+      try {
+        await runCheckoutGit(
+          ['git', 'checkout', '--detach', 'https://alice:password@example.invalid/missing'],
+          root
+        );
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(Error);
+      expect(String(failure)).not.toContain('password');
+      expect(JSON.stringify((failure as Error).cause)).not.toContain('alice');
+      expect((failure as Error).cause).toMatchObject({ step: 'checkout' });
+      expect(((failure as Error).cause as { gitExitCode: number }).gitExitCode).toBeGreaterThan(0);
+      expect(((failure as Error).cause as { stderr: string }).stderr.length).toBeGreaterThan(0);
+      const head = 'a'.repeat(40);
+      const harness = workerHarness({
+        head,
+        prepareCheckout: async () => {
+          throw failure;
+        },
+      });
+      const warnings: Record<string, unknown>[] = [];
+      harness.deps.logger = {
+        warn: data => {
+          warnings.push(data);
+        },
+      };
+      harness.queue.push(
+        queuedReview('diagnostic-redaction', {
+          owner: 'o',
+          repo: 'r',
+          prNumber: 18,
+          headSha: head,
+          baseRef: 'main',
+          baseSha: 'b'.repeat(40),
+          author: 'contributor',
+        })
+      );
+      await tickReviewWorkerClock(WORKER_CONFIG, harness.deps);
+      const warning = warnings.find(row => row.reason === 'review_checkout_identity_failure');
+      expect(warning).toMatchObject({ step: 'checkout', prNumber: 18 });
+      expect(JSON.parse(harness.results[0]?.result_body ?? '{}').checkout_step).toBe('checkout');
+      expect(JSON.stringify(warning)).not.toContain('password');
+      expect(JSON.stringify(warning)).not.toContain('alice');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});

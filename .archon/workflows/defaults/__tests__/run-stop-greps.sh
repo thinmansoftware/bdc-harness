@@ -1023,6 +1023,98 @@ DUP_B="$(printf '%s\n' "$DUP_SPEC" | RSG_STAGE_REPO=org/b rsg_extract)"
 assert_contains "and counted in org/b" "DECLARED${TAB}1" "$DUP_B"
 named_end repeated_stage_list_does_not_shift_ordinals
 
+# ---------------------------------------------------------------------------
+# Operator-check tag (stage 1 follow-up, acting XO ruling fence 283): a stop header
+# "Stop N (operator check): ..." is skipped VISIBLY as OPERATOR; untagged prose stops stay
+# UNPARSED (fail closed); a spec whose stops are ALL operator-tagged reports operator_only
+# with a loud stderr warning.
+# ---------------------------------------------------------------------------
+echo "--- operator_tagged_stop_is_skipped_visibly ---"
+named_begin
+OPT="$(mktemp -d)"
+printf 'x\n' > "$OPT/f"
+OP1X="$(fixture_part operator_check_skipped_visibly spec | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "the operator stop is emitted as an OPERATOR record" "OPERATOR${TAB}Stop 2 (operator check): sign in on the desktop and confirm the page loads." "$OP1X"
+assert_contains "it is not declared: DECLARED counts only the grep stop" "DECLARED${TAB}1" "$OP1X"
+assert_contains "and not unparsed" "UNPARSED${TAB}0" "$OP1X"
+OP1R="$(cd "$OPT" && fixture_part operator_check_skipped_visibly spec | RSG_STAGE_REPO=x/y rsg_extract | rsg_run 2>/dev/null)"
+assert_eq "GREP_OPERATOR=1" "1" "$(kv GREP_OPERATOR "$OP1R")"
+assert_contains "GREP_LINE shows SKIPPED (operator check)" "SKIPPED (operator check): Stop 2 (operator check)" "$OP1R"
+assert_eq "the grep stop still runs and the spec passes (the operator stop never fails)" "passed" "$(kv GREP_STATUS "$OP1R")"
+assert_eq "nothing is dropped" "0" "$(kv GREP_DROPPED "$OP1R")"
+assert_contains "the detail lists it too" "SKIPPED (operator check): Stop 2 (operator check)" "$(printf '%s\n' "$OP1R" | sed -n '/per-assertion detail/,$p')"
+OPC="$(printf '## 8. Stop conditions\n\nStop 1 (Operator Check): do A\n  Expected: done\n\nStop 2 (grep assertion):\n  grep -c x f\n  Expected: 1\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "the tag is case-insensitive" "OPERATOR${TAB}Stop 1 (Operator Check): do A" "$OPC"
+OPS="$(printf '## 8. Stop conditions\n\nStop 1 (  operator   check  ): do A\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "spaces inside the parentheses are tolerated" "OPERATOR${TAB}" "$OPS"
+rm -rf "$OPT"
+named_end operator_tagged_stop_is_skipped_visibly
+
+echo "--- untagged_prose_stop_is_unparsed_next_to_operator ---"
+named_begin
+OP2="$(fixture_part untagged_prose_stop_next_to_operator spec | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "the operator stop is skipped visibly" "OPERATOR${TAB}Stop 1 (operator check): do X on the desktop." "$OP2"
+assert_contains "the untagged prose stop is declared and unparsed" "UNPARSED${TAB}1${TAB}Stop 2 (staging works): open the page" "$OP2"
+OP2R="$(fixture_part untagged_prose_stop_next_to_operator spec | RSG_STAGE_REPO=x/y rsg_extract | rsg_run 2>/dev/null)"
+assert_eq "an untagged prose stop can never pass (all_dropped, not operator_only)" "all_dropped" "$(kv GREP_STATUS "$OP2R")"
+OP2M="$(printf '## 8. Stop conditions\n\nStop 3 (staging operator check works):\n  Open the page.\n' | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_eq "operator check in the middle of the header text is not the tag" "0" "$(printf '%s\n' "$OP2M" | grep -c '^OPERATOR' || true)"
+assert_contains "so that header is unparsed" "UNPARSED${TAB}1" "$OP2M"
+named_end untagged_prose_stop_is_unparsed_next_to_operator
+
+echo "--- untagged_prose_stop_still_fails (spec Test 22: only the exact tag counts) ---"
+named_begin
+OP22SPEC='## 8. Stop conditions
+
+Stop 1 (staging works):
+  Given the staging page, when it loads, then the header shows.
+
+Stop 2 (operator proof): sign in on the desktop and look.
+
+Stop 3 (operator): sign in on the desktop and look.
+
+Stop 4 (operator check, John desktop): sign in and look.
+'
+OP22="$(printf '%s\n' "$OP22SPEC" | RSG_STAGE_REPO=x/y rsg_extract)"
+assert_contains "DECLARED is 4: none of the four is the exact tag" "DECLARED${TAB}4" "$OP22"
+assert_contains "UNPARSED is 4" "UNPARSED${TAB}4${TAB}" "$OP22"
+assert_eq "no OPERATOR line is emitted" "0" "$(printf '%s\n' "$OP22" | grep -c '^OPERATOR' || true)"
+assert_contains "(operator proof is named" "Stop 2 (operator proof): sign in on the desktop and look." "$OP22"
+assert_contains "(operator) is named" "Stop 3 (operator): sign in on the desktop and look." "$OP22"
+assert_contains "(operator check, x) is named" "Stop 4 (operator check, John desktop): sign in and look." "$OP22"
+OP22R="$(printf '%s\n' "$OP22SPEC" | RSG_STAGE_REPO=x/y rsg_extract | rsg_run 2>/dev/null)"
+OP22M="$(mec_for "$OP22R")"
+assert_eq "the run fails through mec_check" "1" "${OP22M%%|*}"
+assert_contains "as SPEC_DEFECT" "SPEC_DEFECT:" "$OP22M"
+named_end untagged_prose_stop_still_fails
+
+echo "--- all_operator_spec_warns ---"
+named_begin
+OP3ERR="$(mktemp)"
+OP3="$(fixture_part all_operator_stops spec | RSG_STAGE_REPO=x/y rsg_extract | rsg_run 2>"$OP3ERR")"
+assert_eq "GREP_STATUS=operator_only" "operator_only" "$(kv GREP_STATUS "$OP3")"
+assert_eq "GREP_OPERATOR=2" "2" "$(kv GREP_OPERATOR "$OP3")"
+assert_eq "GREP_DECLARED=0" "0" "$(kv GREP_DECLARED "$OP3")"
+assert_contains "GREP_LINE names the operator checks" "SKIPPED (operator check): Stop 1 (operator check): do A." "$OP3"
+assert_contains "a loud stderr warning" "WARNING: GREP_STATUS=operator_only" "$(cat "$OP3ERR")"
+assert_eq "no warning when some stop is verified mechanically" "" "$(cd "$HERE" && fixture_part operator_check_skipped_visibly spec | RSG_STAGE_REPO=x/y rsg_extract | rsg_run 2>&1 >/dev/null | grep WARNING || true)"
+assert_contains "the warning names every operator stop" "Stop 2 (Operator Check): do B." "$(cat "$OP3ERR")"
+rm -f "$OP3ERR"
+# mec_check and sme_process: operator_only is a visible N/A, never a pass line
+OP3M="$(mec_for "$OP3")"
+assert_eq "mec_check does not fail an operator_only spec (declared 0)" "0" "${OP3M%%|*}"
+SME_CORE_T="$(extract_core "$CANONICAL_YAML" sme)"
+eval "$SME_CORE_T"
+SME_IN='WO: WO-X
+Tests: 3/3 (bun test x)
+Grep assertions: N/A (placeholder)
+VALIDATION: PASS'
+SME_OUT="$(printf '%s\n' "$SME_IN" | sme_process "3/3 (bun test x)" passed "$(kv GREP_LINE "$OP3")" "$(kv GREP_STATUS "$OP3")" 0)"
+assert_contains "the manifest carries a visible N/A for the Grep assertions line" "Grep assertions: N/A (all 2 stop condition(s) are operator checks" "$SME_OUT"
+assert_contains "and the audit line says operator_only, not passed" "greps=operator_only" "$SME_OUT"
+assert_not_contains "never a pass line for the greps" "greps=passed" "$SME_OUT"
+named_end all_operator_spec_warns
+
 echo "--- every_counted_command_pairs_with_its_own_expected_or_is_unparsed (mixed-sequence table + seeded fuzz) ---"
 named_begin
 export RSG_STAGE_REPO=thinmansoftware/fuzz-none

@@ -2,6 +2,7 @@
  * REST API routes for the Archon Web UI.
  * Provides conversation, codebase, and SSE streaming endpoints.
  */
+import { parseProjectRecord, type ProjectRecord } from '@archon/core/grimoire/project-record';
 import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
 import { IN_PROCESS_API_ORIGIN, isInProcessServiceRequest } from './in-process-authority';
 import { releaseWoClaim, takeOverWoClaimForResume } from '@archon/core/db/cascade-wo-claims';
@@ -35,6 +36,7 @@ import {
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
+import { releaseWoLocksForRun } from '@archon/smart-cauldron/wo-lock';
 import { conductorSeatUsage } from '../services/conductor-seat-usage';
 import {
   readCascadeRecordById,
@@ -2990,6 +2992,20 @@ export type CancelWorkflowRunActorResult =
   | { ok: false; status: 400 | 404 | 409 | 422; message: string };
 
 /**
+ * Directory the conductor writes its cascade records and WO locks to. The
+ * supervised fire wrapper runs `cd /app && bun /tmp/fire-supervised.mjs`, so its
+ * default ./cascade-runs is <app root>/cascade-runs, while this server runs from
+ * packages/server -- a bare ./cascade-runs here would look in the wrong place and
+ * silently release nothing. SMART_CAULDRON_OUT_DIR overrides (it must equal the
+ * conductor's --out-dir).
+ */
+function conductorLockOutDir(): string {
+  const configured = process.env.SMART_CAULDRON_OUT_DIR?.trim();
+  if (configured) return configured;
+  return join(import.meta.dir, '..', '..', '..', '..', 'cascade-runs');
+}
+
+/**
  * Status-gated cancel used by POST /api/workflows/runs/:runId/cancel (actor
  * 'api') and the consumer's cancel-own (actor = the principal id). The status
  * checks, error codes, and the run_cancelled event shape are identical to the
@@ -3023,6 +3039,16 @@ export async function cancelWorkflowRunAsActor(
     event_type: 'run_cancelled',
     data: { reason, actor: opts.actor },
   });
+  // WO-HARNESS-WO-LOCK-RELEASE-ON-CANCEL-01: a cancelled run leaves its WO with
+  // no live run, so release the smart-cauldron file lock that run belongs to --
+  // otherwise a killed or cancelled conductor leaves status=running and the next
+  // fire is refused as a duplicate. Best-effort: the cancel itself already
+  // succeeded and must not fail on lock cleanup.
+  try {
+    await releaseWoLocksForRun(runId, conductorLockOutDir());
+  } catch (error) {
+    getLog().warn({ err: error, runId }, 'wo_lock.release_on_cancel_failed');
+  }
   const updated = await workflowDb.getWorkflowRun(runId);
   const updatedRun = updated ?? {
     ...run,
@@ -6453,7 +6479,7 @@ export function registerApiRoutes(
               commands = {};
             }
           }
-          return { ...cb, commands };
+          return { ...cb, commands, project_record: readProjectRecord(cb) };
         })
       );
     } catch (error) {
@@ -6478,7 +6504,7 @@ export function registerApiRoutes(
           commands = {};
         }
       }
-      return c.json({ ...codebase, commands });
+      return c.json({ ...codebase, commands, project_record: readProjectRecord(codebase) });
     } catch (error) {
       getLog().error({ err: error }, 'get_codebase_failed');
       return apiError(c, 500, 'Failed to get codebase');
@@ -6501,7 +6527,10 @@ export function registerApiRoutes(
         return apiError(c, 500, 'Codebase created but not found');
       }
 
-      return c.json(codebase, result.alreadyExisted ? 200 : 201);
+      return c.json(
+        { ...codebase, project_record: readProjectRecord(codebase) },
+        result.alreadyExisted ? 200 : 201
+      );
     } catch (error) {
       getLog().error({ err: error }, 'add_codebase_failed');
       return apiError(
@@ -6569,7 +6598,15 @@ export function registerApiRoutes(
         }
       }
 
-      await codebaseDb.updateCodebase(id, body);
+      await codebaseDb.updateCodebase(id, {
+        ...body,
+        project_record:
+          body.project_record === undefined
+            ? undefined
+            : body.project_record === null
+              ? null
+              : JSON.stringify(body.project_record),
+      });
       const updated = await codebaseDb.getCodebase(id);
       if (!updated) {
         return apiError(c, 500, 'Codebase updated but not found');
@@ -6600,7 +6637,7 @@ export function registerApiRoutes(
       }
       getLog().info({ codebaseId: id, changes }, 'codebase_updated');
 
-      return c.json({ ...updated, commands });
+      return c.json({ ...updated, commands, project_record: readProjectRecord(updated) });
     } catch (error) {
       getLog().error({ err: error, codebaseId: id }, 'update_codebase_failed');
       return apiError(c, 500, 'Failed to update codebase');
@@ -8633,4 +8670,15 @@ export function registerApiRoutes(
     const result = await checkForUpdate(appVersion);
     return c.json(result ?? noUpdate);
   });
+}
+
+function readProjectRecord(codebase: {
+  id: string;
+  project_record?: unknown;
+}): ProjectRecord | null {
+  const parsed = parseProjectRecord(codebase.project_record);
+  if (parsed.status === 'invalid') {
+    getLog().warn({ codebaseId: codebase.id }, 'project_record_unparseable');
+  }
+  return parsed.record;
 }

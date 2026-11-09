@@ -726,6 +726,13 @@ export class SqliteAdapter implements IDatabase {
    * the columns were added to createSchema().
    */
   private migrateColumns(): void {
+    // WO-GRIMOIRE-PROJECT-RECORD-01 (migration 068): additive and idempotent.
+    const codebaseColumns = this.pragmaAll("PRAGMA table_info('remote_agent_codebases')") as {
+      name: string;
+    }[];
+    if (!codebaseColumns.some(column => column.name === 'project_record')) {
+      this.db.run('ALTER TABLE remote_agent_codebases ADD COLUMN project_record TEXT');
+    }
     this.upgradeBoardAuditEvents();
     // Migration 045: SQLite cannot alter CHECK constraints. Rebuild existing
     // four-verb journals transactionally before any fire_cauldron insert.
@@ -1395,6 +1402,7 @@ export class SqliteAdapter implements IDatabase {
         ('astra', 'Astra (Codex desktop Board/XO seat)', 'drain_on_start', 1),
         -- WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 (migration 065 parity)
         ('t3-desktop', 'T3 desktop results queue', 'drain_on_start', 1),
+        ('t3-desk-local', 'PC T3 relay queue', 'worker_poll', 1),
         ('pr-review-log', 'PR review receipt log', 'drain_on_start', 1),
         -- WO-HARNESS-T3-COMMAND-CONSUMER-01 (migration 067 parity): the
         -- cauldron-fire command consumer mailbox and the t3-bridge VPS sender.
@@ -1472,6 +1480,7 @@ export class SqliteAdapter implements IDatabase {
         repository_url TEXT,
         default_cwd TEXT NOT NULL,
         default_branch TEXT DEFAULT 'main',
+        project_record TEXT,
         ai_assistant_type TEXT DEFAULT 'claude',
         commands TEXT DEFAULT '{}',
         created_at TEXT DEFAULT (datetime('now')),

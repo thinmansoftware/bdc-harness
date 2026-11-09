@@ -78,6 +78,7 @@ export const WORKFLOW_EVENT_TYPES = [
   // (rerouted to a Claude/Codex seat). data carries locations as file:line
   // only -- never the matched customer value.
   'openrouter_diff_scan',
+  'duplicate_pr_suppressed',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];

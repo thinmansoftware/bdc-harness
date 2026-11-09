@@ -263,6 +263,96 @@ describe('board authority API', () => {
     expect(body.holder_token_hash).toBeUndefined();
   });
 
+  // WO-HARNESS-XO-LEASE-8H-CAP-01: the XO lease may last up to 8 hours, no more.
+  const EIGHT_HOURS_MS = 28_800_000;
+  const xoHeaders = {
+    'Content-Type': 'application/json',
+    'x-archon-operator-token': 'secret-token',
+  };
+  const acquireXoLease = async (
+    app: OpenAPIHono,
+    extra: Record<string, unknown> = {}
+  ): Promise<Response> =>
+    app.request('/api/board/xo-lease/acquire', {
+      method: 'POST',
+      headers: xoHeaders,
+      body: JSON.stringify({ holder_id: 'holder-1', holder_token: 'session-secret', ...extra }),
+    });
+  const renewXoLease = async (
+    app: OpenAPIHono,
+    extra: Record<string, unknown> = {}
+  ): Promise<Response> =>
+    app.request('/api/board/xo-lease/renew', {
+      method: 'POST',
+      headers: xoHeaders,
+      body: JSON.stringify({
+        holder_id: 'holder-1',
+        holder_token: 'session-secret',
+        fencing_token: 1,
+        ...extra,
+      }),
+    });
+  const msUntil = (iso: string): number => Date.parse(iso) - Date.now();
+  const storedExpiry = async (): Promise<string> => {
+    const result = await db.query<{ expires_at: string }>(
+      'SELECT expires_at FROM board_xo_leases WHERE id = 1'
+    );
+    return String(result.rows[0].expires_at);
+  };
+
+  test('acquire accepts exactly the 8 hour XO lease cap', async () => {
+    const response = await acquireXoLease(makeApp('secret-token'), {
+      lease_duration_ms: EIGHT_HOURS_MS,
+    });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { expires_at: string };
+    expect(msUntil(body.expires_at)).toBeGreaterThan(EIGHT_HOURS_MS - 10_000);
+    expect(msUntil(body.expires_at)).toBeLessThanOrEqual(EIGHT_HOURS_MS);
+  });
+
+  test('acquire rejects an XO lease longer than 8 hours and writes nothing', async () => {
+    const response = await acquireXoLease(makeApp('secret-token'), {
+      lease_duration_ms: EIGHT_HOURS_MS + 1,
+    });
+
+    expect(response.status).toBe(400);
+    const rows = await db.query('SELECT id FROM board_xo_leases');
+    expect(rows.rowCount).toBe(0);
+  });
+
+  test('renew accepts exactly the 8 hour XO lease cap', async () => {
+    const app = makeApp('secret-token');
+    expect((await acquireXoLease(app)).status).toBe(200);
+
+    const response = await renewXoLease(app, { lease_duration_ms: EIGHT_HOURS_MS });
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { expires_at: string };
+    expect(msUntil(body.expires_at)).toBeGreaterThan(EIGHT_HOURS_MS - 10_000);
+    expect(msUntil(body.expires_at)).toBeLessThanOrEqual(EIGHT_HOURS_MS);
+  });
+
+  test('renew rejects an XO lease longer than 8 hours and leaves the lease untouched', async () => {
+    const app = makeApp('secret-token');
+    expect((await acquireXoLease(app)).status).toBe(200);
+    const before = await storedExpiry();
+
+    const response = await renewXoLease(app, { lease_duration_ms: EIGHT_HOURS_MS + 1 });
+
+    expect(response.status).toBe(400);
+    expect(await storedExpiry()).toBe(before);
+  });
+
+  test('acquire without a duration still grants the 5 minute core default', async () => {
+    const response = await acquireXoLease(makeApp('secret-token'));
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { expires_at: string };
+    expect(msUntil(body.expires_at)).toBeGreaterThan(300_000 - 10_000);
+    expect(msUntil(body.expires_at)).toBeLessThanOrEqual(300_000);
+  });
+
   test('recipient route returns typed deferral', async () => {
     const app = makeApp();
     const response = await app.request('/api/board/recipient');
