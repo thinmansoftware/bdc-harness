@@ -21,6 +21,7 @@ import {
   releaseWoLock,
   releaseWoLocksForRun,
   touchWoLockHeartbeat,
+  tryEnterMutexGen,
   withWoLockMutex,
 } from '../wo-lock.js';
 import type { WoLockRecord } from '../wo-lock.js';
@@ -361,7 +362,7 @@ describe('exclusive takeover (Overseer review of the earlier stale-recovery PRs)
     expect(maxInside).toBe(1);
   });
 
-  test('mutex generation numbers are never reused (tombstone stays, next caller increments)', async () => {
+  test('the mutex keeps one tombstone and generations increase across callers', async () => {
     const outDir = await makeOutDir();
     const lock = lockFile(outDir);
     await acquireWoLock(WO, PROJECT, 'first', outDir); // creates the lock directory
@@ -372,6 +373,74 @@ describe('exclusive takeover (Overseer review of the earlier stale-recovery PRs)
     const after = await mutexGens(outDir);
     expect(after).toHaveLength(1); // older generations are pruned, one tombstone remains
     expect(after[0]).toBeGreaterThan(Math.max(0, ...before));
+  });
+});
+
+describe('delayed contender cannot enter beside a newer holder (Overseer round 2 of #1529)', () => {
+  test('sustained contention with pruning never admits two holders (16 callers x 3 rounds)', async () => {
+    const outDir = await makeOutDir();
+    await acquireWoLock(WO, PROJECT, 'first', outDir); // creates the lock directory
+    await releaseWoLock(WO, PROJECT, 'first', outDir);
+    let inside = 0;
+    let maxInside = 0;
+    let completed = 0;
+    await Promise.all(
+      Array.from({ length: 16 }, async () => {
+        for (let round = 0; round < 3; round += 1) {
+          await withWoLockMutex(lockFile(outDir), async () => {
+            inside += 1;
+            maxInside = Math.max(maxInside, inside);
+            await new Promise(resolve => setTimeout(resolve, 2));
+            inside -= 1;
+            completed += 1;
+          });
+        }
+      })
+    );
+    expect(completed).toBe(48);
+    expect(maxInside).toBe(1);
+  }, 60_000);
+
+  test('a stale contender recreating a pruned generation backs off and removes its own file', async () => {
+    const outDir = await makeOutDir();
+    await acquireWoLock(WO, PROJECT, 'first', outDir); // creates the lock directory
+    await releaseWoLock(WO, PROJECT, 'first', outDir);
+    // State after callers moved on and pruned generations 1 and 2: only a LIVE holder at generation 3.
+    for (const gen of await mutexGens(outDir)) {
+      await rm(`${lockFile(outDir)}.mutex.${gen}`, { force: true });
+    }
+    await plantMutexGen(outDir, 3, { pid: process.pid, host: hostname() });
+
+    // The delayed contender observed released generation 1 earlier and now creates generation 2.
+    const entered = await tryEnterMutexGen(lockFile(outDir), 2);
+    expect(entered).toBe(false);
+    expect(await mutexGens(outDir)).toEqual([3]); // its file is gone, the live holder is untouched
+  });
+
+  test('a caller creating the next generation while it is the highest enters normally', async () => {
+    const outDir = await makeOutDir();
+    await acquireWoLock(WO, PROJECT, 'first', outDir);
+    await releaseWoLock(WO, PROJECT, 'first', outDir);
+    const top = Math.max(...(await mutexGens(outDir)));
+    expect(await tryEnterMutexGen(lockFile(outDir), top + 1)).toBe(true);
+    expect(await mutexGens(outDir)).toContain(top + 1);
+  });
+
+  test('two stale contenders and a live newer holder: nobody enters until the holder releases', async () => {
+    const outDir = await makeOutDir();
+    await acquireWoLock(WO, PROJECT, 'first', outDir);
+    await releaseWoLock(WO, PROJECT, 'first', outDir);
+    for (const gen of await mutexGens(outDir)) {
+      await rm(`${lockFile(outDir)}.mutex.${gen}`, { force: true });
+    }
+    await plantMutexGen(outDir, 5, { pid: process.pid, host: hostname() });
+    const results = await Promise.all([
+      tryEnterMutexGen(lockFile(outDir), 2),
+      tryEnterMutexGen(lockFile(outDir), 3),
+      tryEnterMutexGen(lockFile(outDir), 4),
+    ]);
+    expect(results).toEqual([false, false, false]);
+    expect(await mutexGens(outDir)).toEqual([5]);
   });
 });
 

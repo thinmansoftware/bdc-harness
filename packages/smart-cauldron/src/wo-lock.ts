@@ -202,6 +202,22 @@ async function tryCreateMutexGen(filePath: string, gen: number): Promise<boolean
   }
 }
 
+/**
+ * Create generation `gen` and enter only if it is STILL the highest generation
+ * afterwards (exported for tests). A caller holding a stale view can create a
+ * number that was already used and pruned; such a number is always below a
+ * generation that still exists (pruning deletes a number only when a higher one
+ * is present and the top is never deleted), so this check fails and the caller
+ * removes its own file and retries. That is what keeps pruning safe.
+ */
+export async function tryEnterMutexGen(filePath: string, gen: number): Promise<boolean> {
+  if (!(await tryCreateMutexGen(filePath, gen))) return false;
+  const after = await listMutexGens(filePath);
+  if (after[after.length - 1] === gen) return true;
+  await unlink(mutexGenPath(filePath, gen)).catch(() => undefined);
+  return false;
+}
+
 /** 'free' = released or holder provably gone; 'live' = holder may still be inside; 'gone' = file vanished. */
 async function assessMutexGen(path: string): Promise<'free' | 'live' | 'gone'> {
   let owner: MutexOwner | null = null;
@@ -238,10 +254,11 @@ async function assessMutexGen(path: string): Promise<'free' | 'live' | 'gone'> {
  * highest existing generation and is free (released, or its holder provably dead);
  * the filesystem lets exactly one caller create any given generation. NOBODY ever
  * deletes another caller's file, so a contender that judged an old holder dead can
- * never remove a live holder's mutex. Generation numbers are never reused: release
- * marks the caller's own file released (a tombstone) instead of removing it, so a
- * slow contender holding a stale view cannot create a number that was already
- * used and enter alongside a new holder. Winners prune older generations.
+ * never remove a live holder's mutex. Release marks the caller's own file released
+ * (a tombstone) instead of removing it, and winners prune only OLDER generations.
+ * A slow contender with a stale view may therefore recreate a pruned number, but it
+ * enters only if that number is still the highest after creation (see
+ * tryEnterMutexGen), which it never is while a newer holder's file exists.
  * Throws WoLockMutexTimeoutError if the mutex stays held.
  */
 export async function withWoLockMutex<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
@@ -251,14 +268,14 @@ export async function withWoLockMutex<T>(filePath: string, fn: () => Promise<T>)
   while (mine === 0) {
     const gens = await listMutexGens(filePath);
     if (gens.length === 0) {
-      if (await tryCreateMutexGen(filePath, 1)) mine = 1;
+      if (await tryEnterMutexGen(filePath, 1)) mine = 1;
       continue;
     }
     const top = gens[gens.length - 1];
     const state = await assessMutexGen(mutexGenPath(filePath, top));
     if (state === 'gone') continue;
     if (state === 'free') {
-      if (await tryCreateMutexGen(filePath, top + 1)) {
+      if (await tryEnterMutexGen(filePath, top + 1)) {
         mine = top + 1;
         olderGens = gens;
       }
