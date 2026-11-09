@@ -5,7 +5,7 @@ eval "$(core trg)"
 fixture repaired
 printf 'bad\n' > "$WT/product"
 cat > "$WT/test_value.sh" <<'SH'
-# expect(product).toBe(good)
+true 'expect(product).toBe(good)'
 if grep -q good product; then echo 'Tests: 1/1'; else echo 'Tests: 0/1'; exit 1; fi
 SH
 export FIX_SPEC=$'WO Class: CODE\nStop 1 (test suite):\n  bash test_value.sh\nExpected: pass'
@@ -46,16 +46,34 @@ for token in assertTrue .toBeTruthy; do
   check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 done
 
+# Commenting an assertion out is a removal, not a kept assertion (Overseer review of
+# bdc-harness#1532 at 3a54e3b8: `assert False` -> `# assert False` passed the guard).
+for form in py_hash ts_line ts_block; do
+  fixture "commented-$form"
+  case "$form" in
+    py_hash) printf 'def test_x():\n    assert False\n' > "$WT/test_x.py" ;;
+    ts_line|ts_block) printf 'it("x", () => {\n  expect(x).toBe(1)\n})\n' > "$WT/x.test.ts" ;;
+  esac
+  git -C "$WT" add -A
+  trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  case "$form" in
+    py_hash) printf 'def test_x():\n    # assert False\n    pass\n' > "$WT/test_x.py" ;;
+    ts_line) printf 'it("x", () => {\n  // expect(x).toBe(1)\n})\n' > "$WT/x.test.ts" ;;
+    ts_block) printf 'it("x", () => {\n  /* expect(x).toBe(1) */\n})\n' > "$WT/x.test.ts" ;;
+  esac
+  check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+done
+
 # Guard violations terminate repair and can never become a final PASS.
 for violation in delete_assert skip; do
   fixture "final-$violation"
-  printf 'echo "Tests: 0/1"; exit 1\n# expect(x).toBe(1)\n' > "$WT/test_bad.sh"
+  printf 'echo "Tests: 0/1"; exit 1\ntrue '\''expect(x).toBe(1)'\''\n' > "$WT/test_bad.sh"
   export FIX_SPEC=$'WO Class: CODE\nStop 1 (test suite):\n  bash test_bad.sh\nExpected: pass'
   export FIX_INITIAL="$(run_node run-stop-tests)"
   if [ "$violation" = delete_assert ]; then
     printf 'echo "Tests: 1/1"\n' > "$WT/test_bad.sh"
   else
-    printf 'echo "Tests: 1/1"\n# expect(x).toBe(1)\n# test.skip(x)\n' > "$WT/test_bad.sh"
+    printf 'echo "Tests: 1/1"\ntrue '\''expect(x).toBe(1)'\''\ntrue '\''test.skip(x)'\''\n' > "$WT/test_bad.sh"
   fi
   run_node test-repair until_bash >/dev/null
   out="$(run_node run-stop-tests-final)"
@@ -65,7 +83,7 @@ for violation in delete_assert skip; do
 done
 
 fixture exhausted
-printf 'echo "Tests: 0/1"; exit 1\n# expect(x).toBe(1)\n' > "$WT/test_bad.sh"
+printf 'echo "Tests: 0/1"; exit 1\ntrue '\''expect(x).toBe(1)'\''\n' > "$WT/test_bad.sh"
 export FIX_SPEC=$'WO Class: CODE\nWO_ID=WO-TEST\nSPEC_PATH=bdc-xo:issues/123\nStop 1 (test suite):\n  bash test_bad.sh\nExpected: pass'
 export FIX_INITIAL="$(run_node run-stop-tests)"
 export FIX_CLASSIFY="$(run_node classify-test-result)"
