@@ -199,6 +199,7 @@ create table remote_agent_workflow_runs (id text primary key, workflow_name text
 create table remote_agent_workflow_events (id text primary key, workflow_run_id text not null, event_type text not null, step_index integer, step_name text, data text, created_at text);
 create table remote_agent_run_outcomes (run_id text primary key, execution_state text);
 create table overseer_actions (id text primary key, run_id text, wo_id text, class text, action text, result text not null, created_at text not null);
+create table overseer_verdicts (id text primary key, run_id text, wo_id text, head_sha text, proposed_action text, action_reason text, created_at text not null, updated_at text not null);
 create table tm_journal (id text primary key, created_at text not null, thread_ref text not null, action_type text not null, proposal_json text not null, outcome text not null);
 create table agent_dispatch_messages (id text primary key, correlation_id text not null, idempotency_key text not null, task_type text not null, sender text not null, recipient text not null, body text not null, status text not null default 'queued', created_at text not null, acknowledged_at text);
 `);
