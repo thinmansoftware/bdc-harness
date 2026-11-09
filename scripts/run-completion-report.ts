@@ -133,7 +133,15 @@ interface MailboxRow {
   oldest_live_age_hours: number | null;
 }
 
+/** Context only, never flagged: what the event store cannot show (WO-HARNESS-OUTCOME-REPORT-MEASURE-FIX-01). */
+interface ActivityBlock {
+  t3_activity: 'not_measured';
+  t3_activity_reason: string;
+  github_merged_prs_24h: Record<string, number> | 'not_measured';
+}
+
 interface Outcomes {
+  activity?: ActivityBlock;
   window: { start: string; end: string };
   mechanisms: Mechanism[];
   mailboxes: MailboxRow[];
@@ -202,14 +210,22 @@ function readOutcomes(db: Database, asOf: string): Outcomes {
       )
       .get(p) as IO
   );
-  // O4 Overseer merges, all bases (the event store does not record the PR base).
+  // O4 Overseer merges, all bases (the event store does not record the PR base). The merge
+  // bridge records its merge on overseer_verdicts (action_reason 'merge_executed'), and only the
+  // run-linked merge manager writes overseer_actions 'merged', so BOTH are counted
+  // (WO-HARNESS-OUTCOME-REPORT-MEASURE-FIX-01). Input is the merge-ready verdicts the bridge consumes.
   push(
     'overseer_merge',
     db
       .query(
-        `select coalesce(sum(action='flag_merge_ready'),0) as input,
-                coalesce(sum(action='merged'),0) as outcome
-         from overseer_actions where created_at >= $ws and created_at < $we`
+        `select (select count(*) from overseer_verdicts
+                 where proposed_action='flag_merge_ready'
+                   and created_at >= $ws and created_at < $we) as input,
+                ((select count(*) from overseer_verdicts
+                  where action_reason='merge_executed'
+                    and updated_at >= $ws and updated_at < $we)
+                 + (select count(*) from overseer_actions
+                    where action='merged' and created_at >= $ws and created_at < $we)) as outcome`
       )
       .get(p) as IO
   );
@@ -273,6 +289,10 @@ function readOutcomes(db: Database, asOf: string): Outcomes {
 
   const flags: string[] = [];
   for (const m of mechanisms) {
+    // A mailbox row's outcome is a person acknowledging a row, not activity: nobody acknowledges
+    // operator, xo or t3-desktop mail as a workflow, so it never means "dead". stale_mailbox
+    // (oldest unread older than 24 hours) is the signal for unread work.
+    if (m.name.startsWith('mailbox_')) continue;
     if (m.input > 0 && m.outcome === 0) flags.push(`dead_mechanism:${m.name}`);
   }
   for (const m of mailboxes) {
@@ -534,6 +554,83 @@ function hasOwner(issue: GhIssue): boolean {
   return false;
 }
 
+/** Repositories the merge path covers (the DEFAULT_MERGE_REPO_POLICY keys in packages/overseer). */
+const ACTIVITY_REPOS = [
+  'bdc-harness',
+  'bdc-xo',
+  'lspro-react',
+  'shopops',
+  'shopops-storefront',
+] as const;
+
+/**
+ * Activity context for the last 24 hours. T3 threads write nothing to the event store, so T3 activity
+ * is reported as not_measured with the reason, never as zero. GitHub-merged PR counts per repository
+ * are context so a quiet event store is not read as no work; they come through the report's existing
+ * read-only GitHub join and are not_measured under --no-github or when any repository cannot be read.
+ */
+export async function computeActivity(
+  window: { start: string; end: string },
+  opts: { noGithub: boolean } & GitHubInjection
+): Promise<ActivityBlock> {
+  const block: ActivityBlock = {
+    t3_activity: 'not_measured',
+    t3_activity_reason: 'T3 threads do not write to the event store',
+    github_merged_prs_24h: 'not_measured',
+  };
+  if (opts.noGithub) return block;
+  const startMs = Date.parse(window.start);
+  const endMs = Date.parse(window.end);
+  const counts: Record<string, number> = {};
+  // Same read-only contract as computeWoCompletion: GitHub calls are metered, and left to default the
+  // meter would write github_api_usage rows to the production archon.db. Route metering to a throwaway
+  // in-memory sink (unless the caller injected one) and silence its info logs, which the root logger
+  // writes to stdout and would break --json.
+  const ownsMeterDb = opts.db === undefined;
+  const prevLogLevel = rootLogger.level;
+  if (ownsMeterDb) rootLogger.level = 'silent';
+  const meterDb = opts.db ?? new SqliteAdapter(':memory:');
+  const inj: GitHubInjection = {
+    ...(opts.execute ? { execute: opts.execute } : {}),
+    ...(opts.identity ? { identity: opts.identity } : {}),
+    db: meterDb,
+  };
+  try {
+    for (const repo of ACTIVITY_REPOS) {
+      const text = (
+        await ghCommand(
+          [
+            'pr',
+            'list',
+            '--repo',
+            `thinmansoftware/${repo}`,
+            '--state',
+            'merged',
+            '--search',
+            `merged:>=${window.start.slice(0, 10)}`,
+            '--limit',
+            '300',
+            '--json',
+            'number,mergedAt',
+          ],
+          inj
+        )
+      ).trim();
+      const list = JSON.parse(text || '[]') as { mergedAt?: string | null }[];
+      counts[`thinmansoftware/${repo}`] = list.filter(pr => {
+        const at = pr.mergedAt ? Date.parse(pr.mergedAt) : Number.NaN;
+        return Number.isFinite(at) && at >= startMs && at < endMs;
+      }).length;
+    }
+  } catch {
+    return block;
+  } finally {
+    rootLogger.level = prevLogLevel;
+    if (ownsMeterDb) await meterDb.close();
+  }
+  return { ...block, github_merged_prs_24h: counts };
+}
+
 /**
  * Merged-or-owned WO completion, joined to GitHub via runGitHubServiceCommand.
  * Numerator = merged (a merged PR in one of the WO's projects names the WO ID in
@@ -752,6 +849,7 @@ async function main(): Promise<void> {
   }
 
   const woCompletion = await computeWoCompletion(attribution.units, asOf, { noGithub });
+  outcomes.activity = await computeActivity(outcomes.window, { noGithub });
   const asOfMs = Date.parse(asOf.replace(' ', 'T') + 'Z');
   const legacyUntilMs = Date.parse(LEGACY_OVERALL_UNTIL + 'T00:00:00Z');
   const showLegacy = asOfMs < legacyUntilMs;
@@ -819,6 +917,25 @@ async function main(): Promise<void> {
       `  mailbox ${m.recipient}: depth ${m.depth}, live ${m.depth_live}, ` +
         `oldest_live ${m.oldest_live ?? 'none'}, age_h ${m.oldest_live_age_hours ?? 'none'}`
     );
+  out.push(
+    '  note: mailbox outcomes are people acknowledging rows, not activity; a mailbox never raises ' +
+      'dead_mechanism (stale_mailbox covers unread age)'
+  );
+  if (outcomes.activity) {
+    out.push('activity (context only, never flagged):');
+    out.push(
+      `  t3_activity: ${outcomes.activity.t3_activity} (${outcomes.activity.t3_activity_reason})`
+    );
+    const gh = outcomes.activity.github_merged_prs_24h;
+    out.push(
+      '  github_merged_prs_24h: ' +
+        (gh === 'not_measured'
+          ? 'not_measured'
+          : Object.entries(gh)
+              .map(([repo, n]) => `${repo}=${n}`)
+              .join(', '))
+    );
+  }
   if (zeroTier) {
     out.push(`zero_tier (since ${zeroTier.since}):`);
     out.push('zero_tier_first10:');

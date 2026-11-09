@@ -4,7 +4,12 @@ import { createHash } from 'crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { attributeRuns, computeWoCompletion, LEGACY_OVERALL_UNTIL } from './run-completion-report';
+import {
+  attributeRuns,
+  computeActivity,
+  computeWoCompletion,
+  LEGACY_OVERALL_UNTIL,
+} from './run-completion-report';
 import { SqliteAdapter } from '../packages/core/src/db/adapters/sqlite';
 import { resetGitHubApiMeterForTests } from '../packages/core/src/github/metering';
 import * as dbConnection from '../packages/core/src/db/connection';
@@ -21,11 +26,12 @@ create table remote_agent_workflow_runs (id text primary key, workflow_name text
 create table remote_agent_workflow_events (id text primary key, workflow_run_id text not null, event_type text not null, step_index integer, step_name text, data text, created_at text);
 create table remote_agent_run_outcomes (run_id text primary key, execution_state text);
 create table overseer_actions (id text primary key, run_id text, wo_id text, class text, action text, result text not null, created_at text not null);
+create table overseer_verdicts (id text primary key, run_id text, wo_id text, head_sha text, proposed_action text, action_reason text, created_at text not null, updated_at text not null);
 create table tm_journal (id text primary key, created_at text not null, thread_ref text not null, action_type text not null, proposal_json text not null, outcome text not null);
 create table agent_dispatch_messages (id text primary key, correlation_id text not null, idempotency_key text not null, task_type text not null, sender text not null, recipient text not null, body text not null, status text not null default 'queued', created_at text not null, acknowledged_at text);
 `;
 const SCHEMA_NO_OVERSEER = SCHEMA.split('\n')
-  .filter(l => !l.includes('overseer_actions'))
+  .filter(l => !l.includes('overseer_actions') && !l.includes('overseer_verdicts'))
   .join('\n');
 
 function newDb(withOverseer = true): { path: string; db: Database } {
@@ -56,8 +62,41 @@ function act(db: Database, action: string, createdAt: string): void {
   ).run(`a${++seq}`, action, createdAt);
 }
 
+/** A bridge verdict row: proposed_action and, once actioned, action_reason (merge_executed = merged). */
+function verdict(
+  db: Database,
+  proposedAction: string,
+  actionReason: string | null,
+  createdAt: string,
+  updatedAt: string = createdAt
+): void {
+  db.query(
+    'insert into overseer_verdicts (id, run_id, wo_id, head_sha, proposed_action, action_reason, created_at, updated_at) values (?,?,?,?,?,?,?,?)'
+  ).run(
+    `v${++seq}`,
+    `run${seq}`,
+    'WO-X-01',
+    `h${seq}`,
+    proposedAction,
+    actionReason,
+    createdAt,
+    updatedAt
+  );
+}
+
+/** The DEFAULT path (no --no-github) with the network blocked: PATH is emptied so gh cannot run. */
+function execDefault(args: string[]): { code: number; out: string; err: string } {
+  const p = Bun.spawnSync([process.execPath, 'run', SCRIPT, ...args], {
+    env: { PATH: '', HOME: process.env.HOME ?? '', USERPROFILE: process.env.USERPROFILE ?? '' },
+  });
+  return { code: p.exitCode ?? -1, out: p.stdout.toString(), err: p.stderr.toString() };
+}
+
 function exec(args: string[]): { code: number; out: string; err: string } {
-  const p = Bun.spawnSync(['bun', 'run', SCRIPT, ...args]);
+  // Hermetic by default: the report's GitHub reads (WO completion, activity context) must never make a
+  // network call from these subprocess tests. A test that needs the default GitHub path spawns itself.
+  const withNoGithub = args.includes('--no-github') ? args : [...args, '--no-github'];
+  const p = Bun.spawnSync(['bun', 'run', SCRIPT, ...withNoGithub]);
   return { code: p.exitCode ?? -1, out: p.stdout.toString(), err: p.stderr.toString() };
 }
 const base = (path: string, extra: string[] = []): string[] => [
@@ -347,7 +386,7 @@ function outcomeFixtures(path: string): { mechanisms: any[]; mailboxes: any[] } 
   m.push({
     name: 'overseer_merge',
     ...io(
-      "select coalesce(sum(action='flag_merge_ready'),0) as input, coalesce(sum(action='merged'),0) as outcome from overseer_actions where created_at >= $ws and created_at < $we"
+      "select (select count(*) from overseer_verdicts where proposed_action='flag_merge_ready' and created_at >= $ws and created_at < $we) as input, ((select count(*) from overseer_verdicts where action_reason='merge_executed' and updated_at >= $ws and updated_at < $we) + (select count(*) from overseer_actions where action='merged' and created_at >= $ws and created_at < $we)) as outcome"
     ),
   });
   m.push({
@@ -409,6 +448,9 @@ describe('run-completion-report outcomes (last 24h)', () => {
     act(db, 'flag_merge_ready', IN_W);
     act(db, 'merged', IN_W);
     act(db, 'verdict_write', IN_W);
+    verdict(db, 'flag_merge_ready', 'merge_executed', IN_W);
+    verdict(db, 'flag_merge_ready', 'merge_executed', IN_W);
+    verdict(db, 'flag_merge_ready', 'spec_only', IN_W);
     run(db, LANES[0]!, 'completed', '2026-11-01 09:00:00');
     run(db, LANES[1]!, 'failed', '2026-11-01 09:00:00');
     run(db, LANES[1]!, 'completed', '2026-10-30 09:00:00');
@@ -432,7 +474,8 @@ describe('run-completion-report outcomes (last 24h)', () => {
     });
     expect(byName.overseer_review).toEqual({ name: 'overseer_review', input: 4, outcome: 2 });
     expect(byName.overseer_repair).toEqual({ name: 'overseer_repair', input: 2, outcome: 0 });
-    expect(byName.overseer_merge).toEqual({ name: 'overseer_merge', input: 3, outcome: 1 });
+    // 3 merge-ready verdicts in; 2 bridge merges (verdict merge_executed) + 1 manager merged action out
+    expect(byName.overseer_merge).toEqual({ name: 'overseer_merge', input: 3, outcome: 3 });
     expect(byName.cauldron_runs).toEqual({ name: 'cauldron_runs', input: 2, outcome: 1 });
     expect(
       o.mailboxes.map((m: any) => ({
@@ -453,8 +496,9 @@ describe('run-completion-report outcomes (last 24h)', () => {
     expect(j.outcomes.flags).not.toContain('dead_mechanism:taskmaster_escalate_p0');
     expect(j.outcomes.flags).not.toContain('dead_mechanism:overseer_review');
     expect(j.outcomes.flags).not.toContain('dead_mechanism:overseer_merge');
-    // mailbox_operator: one receipt queued in the window, none acknowledged
-    expect(j.outcomes.flags).toContain('dead_mechanism:mailbox_operator');
+    // mailbox_operator: one receipt queued in the window, none acknowledged: an ack is a person
+    // reading, not activity, so a mailbox is never a dead mechanism
+    expect(j.outcomes.flags).not.toContain('dead_mechanism:mailbox_operator');
     expect(j.outcome_flag_line).toBe(
       `outcome_flags: ${j.outcomes.flags.length} (${j.outcomes.flags.join(', ')})`
     );
@@ -849,13 +893,13 @@ describe('run-completion-report merged-or-owned', () => {
     runMsg(db, LANES[0]!, 'failed', '2026-10-30 10:01:00', 'also not a wo message');
     runMsg(db, LANES[0]!, 'completed', '2026-10-30 10:02:00', '');
     db.close();
-    const r = exec(base(path, ['--json']));
+    const r = execDefault(base(path, ['--json']));
     expect(r.code).toBe(0);
     const j = JSON.parse(r.out);
     expect(j.unattributed_runs).toBe(3);
     expect(j.wo_completion.available).toBe(true);
     expect(j.wo_completion.den).toBe(0);
-    expect(exec(base(path)).out).toContain('unattributed_runs: 3');
+    expect(execDefault(base(path)).out).toContain('unattributed_runs: 3');
   });
 
   test('Test 5: read-only kept with the new section', () => {
@@ -1065,3 +1109,162 @@ describe('run-completion-report merged-or-owned', () => {
     expect(jr.wo_completion.reason).not.toBe('no-github');
   });
 });
+
+// --- WO-HARNESS-OUTCOME-REPORT-MEASURE-FIX-01: merges by the bridge, mailbox acks, activity context ---
+describe('run-completion-report measure fix', () => {
+  const merge = (json: any): any =>
+    json.outcomes.mechanisms.find((m: any) => m.name === 'overseer_merge');
+
+  test('Test 1: bridge merges are counted as the merge outcome', () => {
+    const { path, db } = newDb();
+    verdict(db, 'flag_merge_ready', 'merge_executed', IN_W);
+    verdict(db, 'flag_merge_ready', 'merge_executed', IN_W);
+    verdict(db, 'flag_merge_ready', 'spec_only', IN_W);
+    db.close();
+    const j = JSON.parse(exec(base(path, ['--json'])).out);
+    expect(merge(j)).toEqual({ name: 'overseer_merge', input: 3, outcome: 2 });
+    expect(j.outcomes.flags).not.toContain('dead_mechanism:overseer_merge');
+  });
+
+  test('Test 2: both merge paths add up and an idle bridge still flags', () => {
+    const both = newDb();
+    verdict(both.db, 'flag_merge_ready', 'merge_executed', IN_W);
+    act(both.db, 'merged', IN_W);
+    both.db.close();
+    expect(merge(JSON.parse(exec(base(both.path, ['--json'])).out)).outcome).toBe(2);
+
+    const idle = newDb();
+    verdict(idle.db, 'flag_merge_ready', 'spec_only', IN_W);
+    verdict(idle.db, 'flag_merge_ready', null, IN_W);
+    idle.db.close();
+    const j = JSON.parse(exec(base(idle.path, ['--json'])).out);
+    expect(merge(j)).toEqual({ name: 'overseer_merge', input: 2, outcome: 0 });
+    expect(j.outcomes.flags).toContain('dead_mechanism:overseer_merge');
+  });
+
+  test('a merge outside the 24h window is not counted', () => {
+    const { path, db } = newDb();
+    verdict(db, 'flag_merge_ready', 'merge_executed', OUT_W, OUT_W);
+    verdict(db, 'flag_merge_ready', 'merge_executed', OUT_W, IN_W); // created before, merged inside
+    db.close();
+    const j = JSON.parse(exec(base(path, ['--json'])).out);
+    expect(merge(j)).toEqual({ name: 'overseer_merge', input: 0, outcome: 1 });
+  });
+
+  test('Test 3: mailbox acknowledgements never raise a dead flag, and stale_mailbox still does', () => {
+    const { path, db } = newDb();
+    for (const r of ['operator', 'xo', 't3-desktop']) msg(db, { recipient: r, created_at: IN_W });
+    // an unread row from more than 24 hours before the report window ends
+    msg(db, { recipient: 'xo', created_at: '2026-10-20T00:00:00.000Z' });
+    db.close();
+    const j = JSON.parse(exec(base(path, ['--json'])).out);
+    const dead = j.outcomes.flags.filter((f: string) => f.startsWith('dead_mechanism:mailbox_'));
+    expect(dead).toEqual([]);
+    expect(j.outcomes.flags).toContain('stale_mailbox:xo');
+    const mb = j.outcomes.mechanisms.filter((m: any) => m.name.startsWith('mailbox_'));
+    expect(mb.map((m: any) => m.name)).toEqual([
+      'mailbox_operator',
+      'mailbox_xo',
+      'mailbox_t3-desktop',
+    ]);
+    expect(mb.every((m: any) => m.outcome === 0)).toBe(true);
+  });
+
+  test('Test 4: the JSON shape of mechanisms and mailboxes is unchanged, and the text carries the ack note', () => {
+    const { path, db } = newDb();
+    seedForShape(db);
+    db.close();
+    const j = JSON.parse(exec(base(path, ['--json'])).out);
+    for (const m of j.outcomes.mechanisms)
+      expect(Object.keys(m).sort()).toEqual(['input', 'name', 'outcome']);
+    for (const m of j.outcomes.mailboxes)
+      expect(Object.keys(m).sort()).toEqual([
+        'depth',
+        'depth_live',
+        'oldest_live',
+        'oldest_live_age_hours',
+        'recipient',
+      ]);
+    expect(exec(base(path)).out).toContain(
+      'mailbox outcomes are people acknowledging rows, not activity'
+    );
+  });
+
+  test('Test 5: T3 activity is not measured, GitHub merges are context only, and nothing is flagged from them', async () => {
+    const meterDb = new SqliteAdapter(':memory:');
+    const calls: Argv[] = [];
+    const execute = (argv: Argv, _env: Env): ExecResult => {
+      calls.push(argv);
+      const repoArg = argv[argv.indexOf('--repo') + 1] ?? '';
+      if (repoArg === 'thinmansoftware/bdc-xo')
+        return ok([
+          { number: 1, mergedAt: '2026-11-01T10:00:00Z' }, // inside the window
+          { number: 2, mergedAt: '2026-11-01T11:00:00Z' }, // inside
+          { number: 3, mergedAt: '2026-10-30T11:00:00Z' }, // before the window
+        ]);
+      if (repoArg === 'thinmansoftware/bdc-harness')
+        return ok([{ number: 9, mergedAt: '2026-11-01T12:00:00Z' }]);
+      return ok([]);
+    };
+    const activity = await computeActivity(
+      { start: '2026-10-31T14:30:00.000Z', end: '2026-11-01T14:30:00.000Z' },
+      { noGithub: false, execute, identity: PAT, db: meterDb }
+    );
+    await meterDb.close();
+    resetGitHubApiMeterForTests();
+    expect(activity.t3_activity).toBe('not_measured');
+    expect(activity.t3_activity_reason).toContain('do not write to the event store');
+    expect(activity.github_merged_prs_24h).toEqual({
+      'thinmansoftware/bdc-harness': 1,
+      'thinmansoftware/bdc-xo': 2,
+      'thinmansoftware/lspro-react': 0,
+      'thinmansoftware/shopops': 0,
+      'thinmansoftware/shopops-storefront': 0,
+    });
+    expect(calls).toHaveLength(5);
+
+    // the report itself: activity is present, outside the flags, and the flag line never mentions it
+    const { path, db } = newDb();
+    seedForShape(db);
+    db.close();
+    const j = JSON.parse(exec(base(path, ['--json'])).out);
+    expect(j.outcomes.activity.t3_activity).toBe('not_measured');
+    expect(j.outcomes.flags.some((f: string) => /activity|t3|github/i.test(f))).toBe(false);
+    expect(j.outcome_flag_line).not.toMatch(/activity|t3_|github/i);
+  });
+
+  test('Test 6: the GitHub join is optional and changes nothing else', async () => {
+    const { path, db } = newDb();
+    seedForShape(db);
+    db.close();
+    const withFlag = JSON.parse(exec(base(path, ['--json', '--no-github'])).out);
+    expect(withFlag.outcomes.activity.github_merged_prs_24h).toBe('not_measured');
+    expect(withFlag.outcomes.activity.t3_activity).toBe('not_measured');
+
+    const boom = (_argv: Argv, _env: Env): ExecResult => {
+      throw new Error('gh exploded');
+    };
+    const meterDb = new SqliteAdapter(':memory:');
+    const broken = await computeActivity(
+      { start: '2026-10-31T14:30:00.000Z', end: '2026-11-01T14:30:00.000Z' },
+      { noGithub: false, execute: boom, identity: PAT, db: meterDb }
+    );
+    await meterDb.close();
+    resetGitHubApiMeterForTests();
+    expect(broken.github_merged_prs_24h).toBe('not_measured');
+
+    // every other value is identical to a second run, and the exit code is 0
+    const again = exec(base(path, ['--json', '--no-github']));
+    expect(again.code).toBe(0);
+    const second = JSON.parse(again.out);
+    expect(second.outcomes.mechanisms).toEqual(withFlag.outcomes.mechanisms);
+    expect(second.outcomes.mailboxes).toEqual(withFlag.outcomes.mailboxes);
+    expect(second.outcomes.flags).toEqual(withFlag.outcomes.flags);
+  });
+});
+
+function seedForShape(db: Database): void {
+  tm(db, 'escalate_p0', 'sent', IN_W);
+  verdict(db, 'flag_merge_ready', 'merge_executed', IN_W);
+  msg(db, { recipient: 'operator', created_at: IN_W });
+}
