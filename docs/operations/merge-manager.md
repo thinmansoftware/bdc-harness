@@ -24,6 +24,15 @@ A pull request label named exactly `merge-hold` (case-sensitive) holds any pull 
 
 A pull request label named exactly `owner:reworking` (case-sensitive) stops an otherwise mergeable pull request while its owner redoes the design. The bridge releases the verdict claim with the reason `owner_reworking_label` and logs `merge-coordinator.owner_reworking_label`, with no skip, no retry attempt and no outcome row, like `merge_hold_label`. Candidate discovery excludes the PR with the named exclusion `owner_reworking_label`, and the run-linked merge manager holds it with the same reason. Only the owner sets and clears the label; nothing in the harness does, and removing it lets the next tick merge through the existing guards. It is NOT HOLD: HOLD stays John's. `owner:reworking` is a state, not a person: owner routing never reads the suffix `reworking` as a login.
 
+## Post-merge stray-push alert
+
+A squash merge lands the head the Overseer approved. If the PR branch still exists afterwards at a different sha, someone pushed after the merge and that work never reached the base branch. The post-merge sweep (`packages/overseer/src/post-merge-stray-sweep.ts`) reads, for every PR the merge bridge merged in the last 7 days (`overseer_verdicts` rows with `action_reason = 'merge_executed'`), the PR head branch ref on GitHub. When the ref exists at a sha other than the merged head it raises ONE operator card through the existing escalation path (`runEscalation`: owner routing, delivery jobs), naming the PR, the branch and the stray sha. No alert when the branch is gone (404) or still at the merged head, and none when GitHub cannot be read (any other error).
+
+- Once per PR and stray sha: the card id is derived from the event identity `post-merge-stray:<owner>/<repo>#<n>:<stray sha>` plus the merge time, the sweep looks the card up before escalating, and card insert is `ON CONFLICT DO NOTHING`. A second push after an alert gives a new stray sha and a new card. No new table and no migration.
+- Log tokens: `merge-sweep.stray_push_alert` (one per new card), `overseer.post_merge_sweep.tick` (per sweep: examined, alerted, alreadyAlerted, noStray, unreadable), `overseer.post_merge_sweep.iteration_failed_isolated` and `overseer.post_merge_sweep.bind_failed`.
+- Off by default. Set `OVERSEER_POST_MERGE_SWEEP=1` (or `true`, `yes`) on archon-app-1 to run it; it then runs hourly. Alerts are addressed to the work owner when `OVERSEER_OWNER_ROUTING=on`, and to the acting XO otherwise.
+- Not covered: PRs merged by the run-linked merge manager (`createMergeManager`), which records only `overseer_actions` rows, and PRs merged by hand.
+
 | Variable | Default | Meaning |
 | --- | ---: | --- |
 | `OVERSEER_MERGE_RETRY_BASE_MINUTES` | 10 | Initial retry delay |

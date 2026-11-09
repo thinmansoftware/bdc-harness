@@ -9,6 +9,9 @@
  * merge-execution-bridge.test.ts, so that 2,281-line file stays untouched.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { removeTempDirWithRetry } from '@archon/core/test/temp-dir';
+import { join } from 'path';
+import { closeDatabase, getDatabase, getOperatorCard, resetDatabase } from '@archon/core/db';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { listOwnerLabels, parseOwnerLabel } from '@archon/core/github/owner-label';
 import { rootLogger } from '@archon/paths';
@@ -28,6 +31,12 @@ import {
   type MergeExecutionBridgeOptions,
   type MergeExecutionBridgeStore,
 } from '../merge-execution-bridge';
+import { runEscalation } from '../escalate';
+import {
+  runPostMergeStraySweepOnce,
+  type BranchState,
+  type StrayBranchReader,
+} from '../post-merge-stray-sweep';
 import type { RecheckCheckRun } from '../pr-review-check-ingest.ts';
 import type {
   DiscoveredPullRequest,
@@ -412,5 +421,124 @@ describe('owner:reworking merge guard', () => {
     expect(pinned).toEqual(['judged-sha']);
     expect(moved.merges).toBe(0);
     expect(moved.outcomes.some(o => o.reason === 'merge_executed')).toBe(false);
+  });
+});
+
+// Rule (d): a push after the squash merge raises ONE alert per PR and stray sha.
+describe.serial('post-merge stray-push sweep', () => {
+  let home = '';
+  const originalHome = process.env.ARCHON_HOME;
+  const originalUrl = process.env.DATABASE_URL;
+  const originalMode = process.env.OVERSEER_OWNER_ROUTING;
+
+  beforeEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    home = join(import.meta.dir, `.archon-merge-sweep-${Date.now()}-${Math.random()}`);
+    process.env.ARCHON_HOME = home;
+    delete process.env.DATABASE_URL;
+    delete process.env.OVERSEER_OWNER_ROUTING;
+  });
+
+  afterEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    if (originalHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalHome;
+    if (originalUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalUrl;
+    if (originalMode === undefined) delete process.env.OVERSEER_OWNER_ROUTING;
+    else process.env.OVERSEER_OWNER_ROUTING = originalMode;
+    removeTempDirWithRetry(home);
+  });
+
+  test('Test 7: a push after the squash merge raises one alert, and a second sweep raises none', async () => {
+    const mergedHead = 'aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111';
+    const strayHead = 'bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222';
+    const base = {
+      run_id: 'run-stray',
+      wo_id: 'WO-STRAY-01',
+      updated_at: '2026-11-08T10:00:00.000Z',
+    };
+    const rows = [
+      {
+        ...base,
+        id: 'v1',
+        pr_url: 'https://github.com/thinmansoftware/bdc-xo/pull/101',
+        head_sha: mergedHead,
+      },
+      {
+        ...base,
+        id: 'v2',
+        pr_url: 'https://github.com/thinmansoftware/bdc-xo/pull/102',
+        head_sha: 'cccc3333',
+      },
+      {
+        ...base,
+        id: 'v3',
+        pr_url: 'https://github.com/thinmansoftware/bdc-xo/pull/103',
+        head_sha: 'dddd4444',
+      },
+    ];
+    const headRefs: Record<number, string> = {
+      101: 'fix/stray-one',
+      102: 'fix/gone-two',
+      103: 'fix/same-three',
+    };
+    const branches: Record<string, BranchState> = {
+      'fix/stray-one': { state: 'exists', sha: strayHead },
+      'fix/gone-two': { state: 'gone' },
+      'fix/same-three': { state: 'exists', sha: 'dddd4444' },
+    };
+    const reader: StrayBranchReader = {
+      readPullRequestHeadRef: async ({ number }) => headRefs[number],
+      readBranch: async ({ branch }) => branches[branch] ?? { state: 'unknown' },
+    };
+    const sinces: string[] = [];
+    let escalations = 0;
+    const options = {
+      listMerged: async (sinceIso: string) => {
+        sinces.push(sinceIso);
+        return rows;
+      },
+      reader,
+      now: new Date('2026-11-09T12:00:00.000Z'),
+      escalate: ((...args: Parameters<typeof runEscalation>) => {
+        escalations += 1;
+        return runEscalation(...args);
+      }) as typeof runEscalation,
+    };
+
+    const first = await runPostMergeStraySweepOnce(options);
+    const second = await runPostMergeStraySweepOnce(options);
+
+    // only the merged-in-the-last-7-days window is asked for
+    expect(sinces).toEqual(['2026-11-02T12:00:00.000Z', '2026-11-02T12:00:00.000Z']);
+    // exactly one alert, for the first PR and the stray sha, naming PR, branch and sha
+    expect(first.examined).toBe(3);
+    expect(first.alerted).toHaveLength(1);
+    expect(first.alerted[0]).toMatchObject({
+      prUrl: 'https://github.com/thinmansoftware/bdc-xo/pull/101',
+      branch: 'fix/stray-one',
+      straySha: strayHead,
+    });
+    expect(first.noStray).toBe(2);
+    // the second sweep raises nothing and never re-enters the escalation path
+    expect(second.alerted).toHaveLength(0);
+    expect(second.alreadyAlerted).toBe(1);
+    expect(escalations).toBe(1);
+
+    const cards = await getDatabase().query<{ n: number | string }>(
+      'SELECT COUNT(*) AS n FROM overseer_operator_cards'
+    );
+    expect(Number(cards.rows[0]?.n)).toBe(1);
+    const view = await getOperatorCard(first.alerted[0]!.cardId);
+    expect(view?.jobs).toHaveLength(2);
+    expect(view?.card.pr_url).toBe('https://github.com/thinmansoftware/bdc-xo/pull/101');
+    expect(view?.card.branch).toBe('fix/stray-one');
+    expect(view?.card.head_sha).toBe(strayHead);
+    expect(view?.card.blocker).toContain('fix/stray-one');
+    expect(view?.card.blocker).toContain(strayHead);
+    expect(view?.card.blocker).toContain('pull/101');
   });
 });
