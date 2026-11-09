@@ -255,3 +255,9 @@ sqlite3 /opt/bdc/archon-data/archon.db "select count(*), count(distinct thread_r
 
 Expected: the first count equals H0, the second is 0, and in the third the two numbers are
 equal and no larger than the number of stalled items.
+
+## Recheck standing verdict: which work item supplies the review text
+
+WO-HARNESS-RECHECK-STANDING-VERDICT-SELECTION-01. When a required check completes green at a head, the check-completion recheck decides whether the standing verdict was CAUSED by a check (and so is auto-re-reviewed) from the review text. `readStandingVerdict` (packages/overseer/src/pr-review-check-wiring.ts) takes the disposition and the work item id from the newest `pr_review_submit_receipt` at the head (the receipt carries `messageId`), then reads the finding text from THAT work item's `result_body` (`selectReviewSummary`). If the named item is absent or has no summary it falls back to the newest non-cancelled work item at the head with a summary. A cancelled row (for example a duplicate recheck row cancelled as `superseded_by_claim`) never supplies text. Before this rule the newest row at the head was used, which after repeated rechecks was a superseded duplicate with no summary, so a check-caused CHANGES_REQUESTED looked code-caused (bdc-harness#1537 at head 76abd7a3).
+
+The recheck webhook result's top-level `reason` when nothing was queued is `no_pull_request_had_a_check_caused_verdict:` followed by the per-PR reasons (`#<N>:verdict_not_check_caused:<disposition>`, `#<N>:no_standing_verdict_at_head`, `#<N>:rereview_skipped_check_not_success:<check>:<conclusion>`, `#<N>:rereview_skipped_check_not_relevant:<check>`). The per-PR `pr_review_recheck_ingest_receipt` rows in `pr-review-log` carry the same reasons.
