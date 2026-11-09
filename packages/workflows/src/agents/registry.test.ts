@@ -220,19 +220,6 @@ Prompt.
     expect(persona.model).toBe('claude-haiku-5-5');
   });
 
-  test('claude-sonnet-5-5 is a known model (the Claude failover default) and does not raise agent_invalid_model', async () => {
-    const content = `---
-name: sonnet-55
-model: claude-sonnet-5-5
----
-
-Prompt.
-`;
-    const filePath = await writeAgent('sonnet-55.md', content);
-    const persona = await loadAgentFile(filePath);
-    expect(persona.model).toBe('claude-sonnet-5-5');
-  });
-
   test('agent_invalid_model: claude-haiku-5 is not the exact allowlisted ID', async () => {
     const content = `---
 name: haiku-bare

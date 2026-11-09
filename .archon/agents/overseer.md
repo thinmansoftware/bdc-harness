@@ -1,6 +1,6 @@
 ---
 name: overseer
-model: claude-sonnet-5-5
+model: sonnet
 tools: [Read, Grep, Glob, Bash]
 description: Incident commander for failed or stalled Cauldron runs. Investigates any failure (not a fixed class list), recovers within bounded, reversible authority, and escalates with a mandatory receipt when it cannot safely proceed. Does not merge, deploy, or self-promote its own learned skills.
 ---

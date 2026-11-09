@@ -2552,7 +2552,7 @@ nodes:
 
       # ---- BEGIN trg core (byte-identical across lanes; extracted by unit test) ----
       # Snapshot tracked AND untracked tests in every persisted-plan directory.
-      # Counts are per directory, file and token; directories cannot mask each other.
+      # Freeze raw bytes by sha256; existing test files cannot change or disappear.
       trg_guard() {
         local mode="$1" root="$2" snapshot="$3" sid repo command dir
         local -a roots=("$root")
@@ -2568,39 +2568,36 @@ nodes:
           done < "$(dirname "$snapshot")/stop-tests.stages"
         fi
         python3 - "$mode" "$snapshot" "${roots[@]}" <<'TRG_PY'
-      import json, pathlib, re, subprocess, sys
+      import hashlib, json, pathlib, re, subprocess, sys
       mode, snapshot = sys.argv[1:3]
       roots = {str(pathlib.Path(p).resolve()) for p in sys.argv[3:]}
-      tokens = [r"expect\s*\(", r"assert", r"\.toBe", r"\.toEqual", r"\bt\.is\b", r"\bok\s*\("]
       markers = [r"\.skip\s*\(",r"\.only\s*\(",r"\bxit\s*\(",r"\bxdescribe\s*\(",r"\bit\.todo\b",r"\btest\.todo\b",r"@pytest\.mark\.skip",r"unittest\.skip"]
+      before = {} if mode == "snapshot" else json.loads(pathlib.Path(snapshot).read_text())
       def inspect(directory):
           root = pathlib.Path(directory)
           if not root.is_dir(): sys.exit("test guard: missing stage directory: "+directory)
           files = subprocess.check_output(["git","ls-files","-z","--cached","--others","--exclude-standard"],cwd=root).decode().split("\x00")
           data = {}
-          for name in set(files):
+          # Revisit saved paths even if a repair untracks or ignores a frozen file.
+          for name in set(files) | before.get(directory, {}).keys():
               if not name or not re.search(r"(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.|(^|/)test_[^/]+|(^|/)[^/]+_test[.]",name): continue
               path = root/name
               if not path.is_file(): continue
-              text = path.read_text(errors="replace")
-              # Count only code: a commented-out assertion or skip is not live (#1532 review).
-              text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-              text = "\n".join(l for l in text.splitlines() if not re.match(r"\s*(#|//|\*)", l))
-              data[name] = [[len(re.findall(t,text)) for t in tokens], [len(re.findall(t,text)) for t in markers]]
+              content = path.read_bytes()
+              data[name] = hashlib.sha256(content).hexdigest()
+              if mode != "snapshot" and data[name] != before.get(directory, {}).get(name):
+                  if any(re.search(t,content.decode(errors="replace")) for t in markers):
+                      sys.exit("test guard: skip/only/todo in new or changed test: "+directory+"/"+name)
           return data
-      before = {} if mode == "snapshot" else json.loads(pathlib.Path(snapshot).read_text())
       now = {directory: inspect(directory) for directory in sorted(roots | before.keys())}
       if mode == "snapshot":
           pathlib.Path(snapshot).write_text(json.dumps(now,sort_keys=True),encoding="ascii")
           sys.exit(0)
       for directory, files in now.items():
           saved = before.get(directory, {})
-          for name, (asserts, skips) in saved.items():
+          for name, digest in saved.items():
               if name not in files: sys.exit("test guard: deleted test file: "+directory+"/"+name)
-              if any(a<b for a,b in zip(files[name][0],asserts)): sys.exit("test guard: fewer assertions: "+directory+"/"+name)
-          for name, (_, skips) in files.items():
-              old = saved.get(name, [[],[0]*len(markers)])[1]
-              if any(a>b for a,b in zip(skips,old)): sys.exit("test guard: skip/only/todo added: "+directory+"/"+name)
+              if files[name] != digest: sys.exit("test guard: changed test file: "+directory+"/"+name)
       TRG_PY
       }
       trg_snapshot() { trg_guard snapshot "$1" "$2"; }
@@ -2822,8 +2819,6 @@ nodes:
   - id: test-repair
     provider: cursor
     model: grok-4.7-high
-    persona: overseer
-    agent: overseer
     depends_on: [classify-test-result]
     when: "$classify-test-result.output.repairable == 'true'"
     task_class: medium_work
@@ -2842,10 +2837,10 @@ nodes:
         export RST_TIMEOUT_SECONDS="$(cat "$EVIDENCE_DIR/stop-tests.timeout")"
         trg_attempt "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")"
       prompt: |
-        You are the Overseer repairing a real test failure. Fix product code or test
-        setup only. Never delete, skip, weaken or comment out an assertion. Never
-        delete a test file. Never add skip/only/todo markers. Never emit
-        __NEVER_EMIT_USE_UNTIL_BASH__. The deterministic rerun and assertion guard
+        Repair the real test failure by fixing product code. Existing test files
+        are frozen: never edit or delete them. New test files may be added.
+        Never add skip/only/todo markers. Never emit
+        __NEVER_EMIT_USE_UNTIL_BASH__. The deterministic rerun and test-freeze guard
         are the only completion authority, with at most two attempts.
 
         Read the failing commands verbatim from

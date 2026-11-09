@@ -5,8 +5,13 @@ WO: WO-HARNESS-TEST-LOOP-BEFORE-EVIDENCE-GATE-01
 The feature lanes execute declared tests before the manifest evidence gate. Real
 test failures may receive at most two Overseer repair attempts. Missing tools,
 the Bun node shim, timeouts and absent stage repositories are BLOCKED immediately.
-Repairs may change product code or setup, but must preserve assertions, test files
-and skip/only/todo markers. A guard violation terminates repair as BLOCKED.
+The test-repair node uses the lane's builder provider/model without a persona.
+Repairs may change product code and add new test files. Every existing test file
+is frozen by SHA-256: any byte change or deletion is refused, including setup,
+whitespace and line-ending changes. Skip/only/todo markers in new or changed tests
+are refused. A guard violation terminates repair as BLOCKED with
+`tests_failed_after_repair:guard` in final evidence, the manifest audit line,
+the evidence gate's stderr and the blocked-report comment.
 
 `run-stop-tests-final` supplies evidence to the validator, manifest stamp and
 evidence gate. CODE/MIXED blocked evidence fails closed with `TESTS_BLOCKED:`.
@@ -18,8 +23,9 @@ The evidence directory contains `stop-tests.commands` (one full command per line
 `stop-tests.stages` (stage ID, TAB, repository slug, TAB, command), the test log,
 guard snapshot, attempt count and final evidence. Repair and final verification
 use these saved files rather than reading the spec again. The guard snapshot is
-keyed by absolute directory and covers the current checkout plus every available
-stage worktree resolved from the saved plan. Checks revisit those saved roots even
+keyed by absolute directory and records raw-byte SHA-256 hashes of tracked and
+untracked test files in the current checkout plus every available stage worktree
+resolved from the saved plan. Checks revisit those saved roots even
 if a mapping disappears; a missing snapshotted directory fails closed.
 
 When canonical stages are declared, their verify commands supersede Stop test
