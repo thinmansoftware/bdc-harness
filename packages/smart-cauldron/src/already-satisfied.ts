@@ -13,6 +13,7 @@ import { matchesWoToken } from '@archon/overseer/wo-token';
 
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { isSpecOnlyFileList } from './spec-only-pr.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -31,6 +32,7 @@ export interface FindWoClaimOptions {
   readonly project: string;
   /** Override gh lookup (tests). */
   readonly lookup?: (repo: string, woId: string) => Promise<WoClaim[]>;
+  readonly execFn?: typeof execFileAsync;
 }
 
 /**
@@ -176,18 +178,47 @@ export async function ghPrSearchDefault(
   }
 }
 
+async function isSpecOnlyClaim(
+  repo: string,
+  number: number,
+  woId: string,
+  execFn: typeof execFileAsync = execFileAsync
+): Promise<boolean> {
+  if (process.env.SMART_CAULDRON_HERMETIC === '1') return false;
+  try {
+    const { stdout } = await execFn(
+      'gh',
+      ['api', `repos/${repo}/pulls/${String(number)}/files?per_page=100`, '--paginate', '--slurp'],
+      { timeout: 30000 }
+    );
+    const pages: unknown = JSON.parse(stdout);
+    if (!Array.isArray(pages) || !pages.every(Array.isArray)) return false;
+    return isSpecOnlyFileList(woId, pages.flat());
+  } catch {
+    // An unreadable or malformed file list cannot disprove an existing claim.
+    return false;
+  }
+}
+
 /**
  * Find an open or merged PR that already claims this WO in the target repo.
- * Returns the strongest claim (MERGED preferred over OPEN), or null.
+ * Spec-only PRs are not build claims. Returns the strongest remaining claim
+ * (MERGED preferred over OPEN), or null.
  */
 export async function findWoClaim(opts: FindWoClaimOptions): Promise<WoClaim | null> {
   const repo = resolveGithubRepo(opts.project);
-  const lookup = opts.lookup ?? ghPrSearchDefault;
+  const lookup =
+    opts.lookup ??
+    ((target: string, woId: string): Promise<WoClaim[]> =>
+      ghPrSearchDefault(target, woId, opts.execFn));
   const claims = await lookup(repo, opts.woId);
-  if (claims.length === 0) return null;
-  const merged = claims.find(c => c.state === 'MERGED');
+  const remaining: WoClaim[] = [];
+  for (const claim of claims) {
+    if (!(await isSpecOnlyClaim(repo, claim.number, opts.woId, opts.execFn))) remaining.push(claim);
+  }
+  const merged = remaining.find(c => c.state === 'MERGED');
   if (merged) return merged;
-  return claims[0] ?? null;
+  return remaining[0] ?? null;
 }
 
 /**
