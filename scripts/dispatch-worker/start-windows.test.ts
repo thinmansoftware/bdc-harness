@@ -327,3 +327,121 @@ $script:Tick = {
     }
   });
 });
+
+// Test 6 (installer part): the real install-windows.ps1 runs against STUBBED Task Scheduler
+// cmdlets, so nothing is registered, stopped or changed on the machine.
+suite('install-windows.ps1 (stubbed Task Scheduler)', () => {
+  interface Registration {
+    TaskName: string;
+    TriggerKind: string;
+    TriggerRepetitionInterval: string | null;
+    TriggerRepetitionDuration: string | null;
+    RestartCount: number | null;
+    RestartInterval: string | null;
+    MultipleInstances: string | null;
+    ExecutionTimeLimit: string | null;
+    LogonType: string | null;
+    RunLevel: string | null;
+  }
+
+  const INSTALLER = join(import.meta.dir, 'install-windows.ps1');
+
+  async function runInstaller(): Promise<Registration[]> {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-installer-'));
+    try {
+      const file = join(dir, 'installer-scenario.ps1');
+      const script = `
+$ErrorActionPreference = 'Stop'
+$global:registrations = New-Object System.Collections.ArrayList
+function New-ScheduledTaskAction { param($Execute, $Argument) return [pscustomobject]@{ Kind = 'action'; Execute = $Execute; Argument = $Argument } }
+function New-ScheduledTaskTrigger {
+    param([switch]$AtLogOn, [switch]$Once, $User, $At, $RepetitionInterval, $RepetitionDuration)
+    $kind = 'other'
+    if ($AtLogOn) { $kind = 'AtLogOn' }
+    if ($Once) { $kind = 'Once' }
+    return [pscustomobject]@{ Kind = $kind; RepetitionInterval = $RepetitionInterval; Repetition = [pscustomobject]@{ Duration = $(if ($RepetitionDuration) { $RepetitionDuration.ToString() } else { $null }) } }
+}
+function New-ScheduledTaskSettingsSet {
+    param($MultipleInstances, $RestartCount, $RestartInterval, $ExecutionTimeLimit)
+    return [pscustomobject]@{ MultipleInstances = $MultipleInstances; RestartCount = $RestartCount; RestartInterval = $RestartInterval; ExecutionTimeLimit = $ExecutionTimeLimit }
+}
+function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) return [pscustomobject]@{ LogonType = $LogonType; RunLevel = $RunLevel } }
+function Register-ScheduledTask {
+    param($TaskName, $Action, $Trigger, $Settings, $Principal, [switch]$Force)
+    [void]$global:registrations.Add([pscustomobject]@{
+        TaskName = $TaskName
+        TriggerKind = $Trigger.Kind
+        TriggerRepetitionInterval = $(if ($Trigger.RepetitionInterval) { $Trigger.RepetitionInterval.ToString() } else { $null })
+        TriggerRepetitionDuration = $Trigger.Repetition.Duration
+        RestartCount = $Settings.RestartCount
+        RestartInterval = $(if ($Settings.RestartInterval) { $Settings.RestartInterval.ToString() } else { $null })
+        MultipleInstances = [string]$Settings.MultipleInstances
+        ExecutionTimeLimit = $(if ($null -ne $Settings.ExecutionTimeLimit) { $Settings.ExecutionTimeLimit.ToString() } else { $null })
+        LogonType = [string]$Principal.LogonType
+        RunLevel = [string]$Principal.RunLevel
+    })
+}
+function Stop-Process { throw 'the installer must not stop any process' }
+function Unregister-ScheduledTask { throw 'the installer must not unregister any task' }
+$null = & '${INSTALLER.replace(/'/g, "''")}' -WorkerId 'dispatch-worker-STUB' -ConfigPath 'stub-config.json'
+Write-Output ('RESULT_JSON=' + (ConvertTo-Json -Compress -Depth 6 -InputObject @($global:registrations)))
+`;
+      await writeFile(file, script, 'utf8');
+      const proc = Bun.spawn(
+        [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          file,
+        ],
+        { stdout: 'pipe', stderr: 'pipe' }
+      );
+      const [out, err] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      const line = out.split(/\r?\n/).find(l => l.startsWith('RESULT_JSON='));
+      if (!line)
+        throw new Error(`installer scenario produced no result. stdout=${out} stderr=${err}`);
+      return JSON.parse(line.slice('RESULT_JSON='.length)) as Registration[];
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('Test 6: registers exactly one worker task and the existing watchdog task, nothing else', async () => {
+    const regs = await runInstaller();
+    expect(regs.map(r => r.TaskName)).toEqual([
+      'BlueDevil-Dispatch-Worker',
+      'BlueDevil-Dispatch-Worker-Watchdog',
+    ]);
+  });
+
+  test('Test 6: the worker task restarts 5 times at 1 minute, ignores a second instance, and has no lifetime cap', async () => {
+    const worker = (await runInstaller())[0] as Registration;
+    expect(worker.TriggerKind).toBe('AtLogOn');
+    expect(worker.RestartCount).toBe(5);
+    expect(worker.RestartInterval).toBe('00:01:00');
+    expect(worker.MultipleInstances).toBe('IgnoreNew');
+    // zero means unlimited in Task Scheduler: not the old one-day cap, not PT72H
+    expect(worker.ExecutionTimeLimit).toBe('00:00:00');
+  });
+
+  test('Test 6: the watchdog repeats every 5 minutes indefinitely, ignores a second instance, and keeps the limited interactive user', async () => {
+    const regs = await runInstaller();
+    const watchdog = regs[1] as Registration;
+    expect(watchdog.TriggerKind).toBe('Once');
+    expect(watchdog.TriggerRepetitionInterval).toBe('00:05:00');
+    // cleared after construction: an empty duration is an indefinite repetition
+    expect(watchdog.TriggerRepetitionDuration).toBe('');
+    expect(watchdog.MultipleInstances).toBe('IgnoreNew');
+    for (const r of regs) {
+      expect(r.LogonType).toBe('Interactive');
+      expect(r.RunLevel).toBe('Limited');
+    }
+  });
+});
