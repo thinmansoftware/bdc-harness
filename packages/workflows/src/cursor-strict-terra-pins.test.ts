@@ -29,6 +29,9 @@ const cursorIds = [
   'check-already-satisfied',
   'plan',
   'implement',
+  // WO-HARNESS-TEST-LOOP-BEFORE-EVIDENCE-GATE-01: guarded test repair runs on the
+  // lane's builder binding, like diff-repair and opus-repair.
+  'test-repair',
   'diff-repair',
   'opus-repair',
   'apply-suggested-fix',

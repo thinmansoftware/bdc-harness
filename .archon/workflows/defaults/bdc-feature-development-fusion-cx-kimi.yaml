@@ -2481,6 +2481,9 @@ nodes:
               path = root/name
               if not path.is_file(): continue
               text = path.read_text(errors="replace")
+              # Count only code: a commented-out assertion or skip is not live (#1532 review).
+              text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+              text = "\n".join(l for l in text.splitlines() if not re.match(r"\s*(#|//|\*)", l))
               data[name] = [[len(re.findall(t,text)) for t in tokens], [len(re.findall(t,text)) for t in markers]]
           return data
       now = inspect()

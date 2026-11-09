@@ -34,9 +34,8 @@ describe.skipIf(process.platform === 'win32')('evidence gate shell suites', () =
           .join('\n');
         throw new Error(`${summary}\n${failures}\n${proc.stderr.toString().slice(0, 2000)}`);
       }
-      expect(summary).toMatch(
-        new RegExp(`^${suite.replace(/\./g, '\\.')}: \\d+ passed, 0 failed$`)
-      );
+      expect(summary.startsWith(`${suite}: `)).toBe(true);
+      expect(summary.slice(suite.length)).toMatch(/^: \d+ passed, 0 failed$/);
     }, 600000);
   }
 });
