@@ -43,7 +43,11 @@ describe('stray branch reader', () => {
   }): StrayBranchOctokitLike {
     return {
       pulls: {
-        get: overrides.get ?? (async () => ({ data: { head: { ref: 'fix/x' } } })),
+        get:
+          overrides.get ??
+          (async () => ({
+            data: { head: { ref: 'fix/x', repo: { name: 'r', owner: { login: 'o' } } } },
+          })),
       },
       git: {
         getRef: overrides.getRef ?? (async () => ({ data: { object: { sha: 'abc123' } } })),
@@ -98,9 +102,42 @@ describe('stray branch reader', () => {
         },
       })
     );
-    expect(
-      await reader.readPullRequestHeadRef({ owner: 'o', repo: 'r', number: 1 })
-    ).toBeUndefined();
+    expect(await reader.readPullRequestHead({ owner: 'o', repo: 'r', number: 1 })).toBeUndefined();
+  });
+
+  test('the head repository comes from the pull request, not the base repository (fork PR)', async () => {
+    const seen: Record<string, unknown>[] = [];
+    const reader = createStrayBranchReader(
+      octokit({
+        get: async () => ({
+          data: {
+            head: {
+              ref: 'feature',
+              repo: { name: 'bdc-harness-fork', owner: { login: 'someone' } },
+            },
+          },
+        }),
+        getRef: async input => {
+          seen.push(input);
+          return { data: { object: { sha: 'abc123' } } };
+        },
+      })
+    );
+    const head = await reader.readPullRequestHead({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 7,
+    });
+    expect(head).toEqual({ branch: 'feature', owner: 'someone', repo: 'bdc-harness-fork' });
+    await reader.readBranch({ owner: head!.owner, repo: head!.repo, branch: head!.branch });
+    expect(seen).toEqual([{ owner: 'someone', repo: 'bdc-harness-fork', ref: 'heads/feature' }]);
+  });
+
+  test('a deleted head repository (null head.repo) is unreadable, never a guess at the base repository', async () => {
+    const reader = createStrayBranchReader(
+      octokit({ get: async () => ({ data: { head: { ref: 'feature', repo: null } } }) })
+    );
+    expect(await reader.readPullRequestHead({ owner: 'o', repo: 'r', number: 1 })).toBeUndefined();
   });
 });
 
@@ -126,7 +163,10 @@ describe('sweep never alerts on anything it cannot read', () => {
       const result = await runPostMergeStraySweepOnce({
         listMerged: async () => [verdict()],
         reader: {
-          readPullRequestHeadRef: async () => (state === 'no-head-ref' ? undefined : 'fix/x'),
+          readPullRequestHead: async () =>
+            state === 'no-head-ref'
+              ? undefined
+              : { branch: 'fix/x', owner: 'thinmansoftware', repo: 'bdc-harness' },
           readBranch: async () => (state === 'no-head-ref' ? { state: 'gone' } : state),
         },
         escalate: neverEscalate,
@@ -141,7 +181,11 @@ describe('sweep never alerts on anything it cannot read', () => {
     const result = await runPostMergeStraySweepOnce({
       listMerged: async () => [verdict({ pr_url: null }), verdict({ head_sha: '' })],
       reader: {
-        readPullRequestHeadRef: async () => 'fix/x',
+        readPullRequestHead: async () => ({
+          branch: 'fix/x',
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+        }),
         readBranch: async () => ({ state: 'exists', sha: 'zzzz' }),
       },
       escalate: neverEscalate,
@@ -149,6 +193,73 @@ describe('sweep never alerts on anything it cannot read', () => {
     });
     expect(result.alerted).toHaveLength(0);
     expect(result.unreadable).toBe(2);
+  });
+});
+
+describe.serial('fork pull requests', () => {
+  let home = '';
+  const originalHome = process.env.ARCHON_HOME;
+  const originalUrl = process.env.DATABASE_URL;
+
+  beforeEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    home = join(import.meta.dir, `.archon-sweep-fork-${Date.now()}-${Math.random()}`);
+    process.env.ARCHON_HOME = home;
+    delete process.env.DATABASE_URL;
+  });
+
+  afterEach(async () => {
+    await closeDatabase();
+    resetDatabase();
+    if (originalHome === undefined) delete process.env.ARCHON_HOME;
+    else process.env.ARCHON_HOME = originalHome;
+    if (originalUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = originalUrl;
+    removeTempDirWithRetry(home);
+  });
+
+  const forkHead = { branch: 'feature', owner: 'someone', repo: 'bdc-harness-fork' };
+
+  test('a push to the FORK branch after the merge alerts, naming the fork repository', async () => {
+    const reads: string[] = [];
+    const result = await runPostMergeStraySweepOnce({
+      listMerged: async () => [verdict()],
+      reader: {
+        readPullRequestHead: async () => forkHead,
+        readBranch: async ({ owner, repo, branch }) => {
+          reads.push(`${owner}/${repo}:${branch}`);
+          return owner === 'someone'
+            ? { state: 'exists', sha: 'bbbb2222' }
+            : { state: 'exists', sha: 'upstream-unrelated' };
+        },
+      },
+    });
+    expect(reads).toEqual(['someone/bdc-harness-fork:feature']);
+    expect(result.alerted).toHaveLength(1);
+    expect(result.alerted[0]).toMatchObject({
+      branch: 'someone/bdc-harness-fork:feature',
+      straySha: 'bbbb2222',
+    });
+    const view = await getOperatorCard(result.alerted[0]!.cardId);
+    expect(view?.card.branch).toBe('someone/bdc-harness-fork:feature');
+    expect(view?.card.repository).toBe('thinmansoftware/bdc-harness');
+  });
+
+  test('an unrelated UPSTREAM branch with the same name never raises an alert for a fork PR', async () => {
+    const result = await runPostMergeStraySweepOnce({
+      listMerged: async () => [verdict()],
+      reader: {
+        readPullRequestHead: async () => forkHead,
+        // the fork branch is gone; an upstream branch of the same name exists elsewhere
+        readBranch: async ({ owner }) =>
+          owner === 'someone' ? { state: 'gone' } : { state: 'exists', sha: 'upstream-unrelated' },
+      },
+      escalate: neverEscalate,
+      lookupCard: async () => null,
+    });
+    expect(result.alerted).toHaveLength(0);
+    expect(result.noStray).toBe(1);
   });
 });
 
@@ -192,7 +303,11 @@ describe.serial('sweep alert reaches the work owner through owner routing', () =
     const result = await runPostMergeStraySweepOnce({
       listMerged: async () => [verdict()],
       reader: {
-        readPullRequestHeadRef: async () => 'fix/x',
+        readPullRequestHead: async () => ({
+          branch: 'fix/x',
+          owner: 'thinmansoftware',
+          repo: 'bdc-harness',
+        }),
         readBranch: async () => ({ state: 'exists', sha: 'bbbb2222' }),
       },
       escalationDeps: {

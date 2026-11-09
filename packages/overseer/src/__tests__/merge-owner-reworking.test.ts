@@ -491,7 +491,10 @@ describe.serial('post-merge stray-push sweep', () => {
       'fix/same-three': { state: 'exists', sha: 'dddd4444' },
     };
     const reader: StrayBranchReader = {
-      readPullRequestHeadRef: async ({ number }) => headRefs[number],
+      readPullRequestHead: async ({ number, owner, repo }) => {
+        const branch = headRefs[number];
+        return branch === undefined ? undefined : { branch, owner, repo };
+      },
       readBranch: async ({ branch }) => branches[branch] ?? { state: 'unknown' },
     };
     const sinces: string[] = [];

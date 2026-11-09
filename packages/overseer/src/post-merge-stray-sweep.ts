@@ -51,19 +51,40 @@ export type BranchState =
   | { state: 'gone' }
   | { state: 'unknown' };
 
+/**
+ * Where a PR's head branch lives. For a fork PR the head repository is NOT the base
+ * repository, so the branch must be read there; reading the base repository would miss a
+ * push to the fork, or alert on an unrelated upstream branch of the same name.
+ */
+export interface PullRequestHead {
+  branch: string;
+  owner: string;
+  repo: string;
+}
+
 export interface StrayBranchReader {
-  /** The PR's head branch name, or undefined when it cannot be read. */
-  readPullRequestHeadRef(input: {
+  /**
+   * The PR's head branch and the repository it lives in, or undefined when it cannot be
+   * read (including a deleted head repository).
+   */
+  readPullRequestHead(input: {
     owner: string;
     repo: string;
     number: number;
-  }): Promise<string | undefined>;
+  }): Promise<PullRequestHead | undefined>;
   readBranch(input: { owner: string; repo: string; branch: string }): Promise<BranchState>;
 }
 
 export interface StrayBranchOctokitLike {
   pulls: {
-    get(input: Record<string, unknown>): Promise<{ data: { head: { ref?: string } } }>;
+    get(input: Record<string, unknown>): Promise<{
+      data: {
+        head: {
+          ref?: string;
+          repo?: { name?: string; owner?: { login?: string } | null } | null;
+        };
+      };
+    }>;
   };
   git: {
     getRef(input: Record<string, unknown>): Promise<{ data: { object: { sha: string } } }>;
@@ -72,15 +93,29 @@ export interface StrayBranchOctokitLike {
 
 export function createStrayBranchReader(octokit: StrayBranchOctokitLike): StrayBranchReader {
   return {
-    async readPullRequestHeadRef(input): Promise<string | undefined> {
+    async readPullRequestHead(input): Promise<PullRequestHead | undefined> {
       try {
         const pr = await octokit.pulls.get({
           owner: input.owner,
           repo: input.repo,
           pull_number: input.number,
         });
-        const ref = pr.data.head.ref;
-        return typeof ref === 'string' && ref.length > 0 ? ref : undefined;
+        const head = pr.data.head;
+        const branch = head.ref;
+        const owner = head.repo?.owner?.login;
+        const repo = head.repo?.name;
+        // A null head.repo is a deleted fork: unreadable, never a guess at the base repo.
+        if (
+          typeof branch !== 'string' ||
+          branch.length === 0 ||
+          typeof owner !== 'string' ||
+          owner.length === 0 ||
+          typeof repo !== 'string' ||
+          repo.length === 0
+        ) {
+          return undefined;
+        }
+        return { branch, owner, repo };
       } catch {
         return undefined;
       }
@@ -179,12 +214,16 @@ export async function runPostMergeStraySweepOnce(
       result.unreadable += 1;
       continue;
     }
-    const branch = await options.reader.readPullRequestHeadRef(pr);
-    if (!branch) {
+    const head = await options.reader.readPullRequestHead(pr);
+    if (!head) {
       result.unreadable += 1;
       continue;
     }
-    const state = await options.reader.readBranch({ owner: pr.owner, repo: pr.repo, branch });
+    const state = await options.reader.readBranch({
+      owner: head.owner,
+      repo: head.repo,
+      branch: head.branch,
+    });
     if (state.state === 'unknown') {
       result.unreadable += 1;
       continue;
@@ -204,6 +243,12 @@ export async function runPostMergeStraySweepOnce(
 
     const prUrl = `https://github.com/${pr.owner}/${pr.repo}/pull/${pr.number}`;
     const repository = `${pr.owner}/${pr.repo}`;
+    const headRepository = `${head.owner}/${head.repo}`;
+    // A fork branch is named with its repository so the owner looks in the right place.
+    const branch =
+      headRepository.toLowerCase() === repository.toLowerCase()
+        ? head.branch
+        : `${headRepository}:${head.branch}`;
     const card: OperatorCardRecord = await escalate(
       verdict.run_id,
       {
@@ -227,6 +272,7 @@ export async function runPostMergeStraySweepOnce(
         ],
         evidenceLinks: {
           pull_request: prUrl,
+          head_repository: headRepository,
           merged_head_sha: verdict.head_sha,
           stray_sha: state.sha,
         },
