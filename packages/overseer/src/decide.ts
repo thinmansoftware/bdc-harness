@@ -333,6 +333,13 @@ export function decide(input: DecideInput): DecisionResult {
         reason: 'loop iteration exceeded idle or wall timeout; runtime budget review needed',
       };
 
+    case 'test_env_missing_tool':
+    case 'test_runner_mismatch':
+    case 'test_timeout':
+    case 'stage_repo_absent':
+    case 'tests_failed_after_repair':
+      return { decision: 'escalate', reason: 'test evidence blocked -- requires operator triage' };
+
     case 'unknown':
     default:
       return {
