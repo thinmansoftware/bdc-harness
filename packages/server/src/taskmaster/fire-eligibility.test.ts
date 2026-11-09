@@ -112,6 +112,60 @@ describe('checkFireEligibility', () => {
       ).eligible
     ).toBe(true);
   });
+  // Live 2026-11-09 (bdc-xo#4311): codebase rows registered before the 2026-06-29
+  // owner move still carry repository_url = github.com/bluedevilcollectibles/<repo>,
+  // so the target_repo thinmansoftware/<repo> never matched and every fire was
+  // refused project_not_registered. The owner/repo codebase NAME is current.
+  test('falls back to a unique owner/repo codebase name when repository_url is stale', async () => {
+    const configured = deps();
+    configured.codebases = async () => [
+      {
+        name: 'thinmansoftware/bdc-harness',
+        repository_url: 'https://github.com/bluedevilcollectibles/bdc-harness.git',
+      },
+    ];
+    const result = await checkFireEligibility(TITLE, configured);
+    expect(result.eligible).toBe(true);
+    expect(result.evidence?.project).toBe('bdc-harness');
+  });
+  test('the name fallback never matches a bare name and fails closed when ambiguous', async () => {
+    const bare = deps();
+    bare.codebases = async () => [
+      {
+        name: 'bdc-harness',
+        repository_url: 'https://github.com/bluedevilcollectibles/bdc-harness',
+      },
+    ];
+    expect((await checkFireEligibility(TITLE, bare)).reason).toBe('project_not_registered');
+    const twice = deps();
+    twice.codebases = async () => [
+      {
+        name: 'thinmansoftware/bdc-harness',
+        repository_url: 'https://github.com/bluedevilcollectibles/bdc-harness',
+      },
+      {
+        name: 'THINMANSOFTWARE/bdc-harness',
+        repository_url: 'https://github.com/someone-else/bdc-harness',
+      },
+    ];
+    expect((await checkFireEligibility(TITLE, twice)).reason).toBe('project_not_registered');
+  });
+  test('a repository_url match still wins over a different name match', async () => {
+    const configured = deps();
+    configured.codebases = async () => [
+      {
+        name: 'thinmansoftware/other',
+        repository_url: 'https://github.com/thinmansoftware/bdc-harness',
+      },
+      {
+        name: 'thinmansoftware/bdc-harness',
+        repository_url: 'https://github.com/bluedevilcollectibles/bdc-harness',
+      },
+    ];
+    const result = await checkFireEligibility(TITLE, configured);
+    expect(result.eligible).toBe(true);
+    expect(result.evidence?.project).toBe('other');
+  });
   test('backs off at the shared GitHub rate-limit floor', async () => {
     const configured = deps();
     configured.fetchImpl = async () => response({}, 200, '4');
