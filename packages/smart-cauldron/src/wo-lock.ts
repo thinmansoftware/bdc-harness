@@ -23,7 +23,7 @@
 import { createHash, randomUUID } from 'crypto';
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'fs/promises';
 import { hostname } from 'os';
-import { join } from 'path';
+import { basename, dirname, join } from 'path';
 
 export type WoLockStatus = 'running' | 'released';
 
@@ -64,8 +64,16 @@ export interface AcquireWoLockResult {
 export const DEFAULT_WO_LOCK_STALE_MS = 300_000;
 /** The owning cascade refreshes its heartbeat this often (well inside the stale window). */
 export const DEFAULT_WO_LOCK_HEARTBEAT_MS = 60_000;
-/** A mutex file older than this was left by a process that died mid-operation. */
-const MUTEX_STALE_MS = 10_000;
+/**
+ * Mutex staleness. A holder is judged gone only on proof or a long silence:
+ * a same-host owner pid that is not running is proof; an owner we cannot probe
+ * (another host) or cannot read must be silent for a window; a same-host owner
+ * whose pid is alive is trusted for up to MUTEX_HARD_STALE_MS (a critical section
+ * is microseconds, so this only bounds pid reuse).
+ */
+const MUTEX_UNREADABLE_STALE_MS = 10_000;
+const MUTEX_FOREIGN_STALE_MS = 60_000;
+const MUTEX_HARD_STALE_MS = 300_000;
 /** How long a caller waits for the mutex before giving up. */
 const MUTEX_WAIT_MS = 5_000;
 const MUTEX_POLL_MS = 15;
@@ -151,43 +159,136 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+interface MutexOwner {
+  readonly pid: number;
+  readonly host: string;
+  readonly at: string;
+  readonly released?: boolean;
+}
+
+function mutexGenPath(filePath: string, gen: number): string {
+  return `${filePath}.mutex.${gen}`;
+}
+
+/** Generations of every mutex file for this lock, ascending. Temp files never match. */
+async function listMutexGens(filePath: string): Promise<number[]> {
+  const prefix = `${basename(filePath)}.mutex.`;
+  let names: string[];
+  try {
+    names = await readdir(dirname(filePath));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  return names
+    .filter(name => name.startsWith(prefix) && /^\d+$/.test(name.slice(prefix.length)))
+    .map(name => Number.parseInt(name.slice(prefix.length), 10))
+    .filter(gen => gen > 0)
+    .sort((a, b) => a - b);
+}
+
+/** Create generation `gen` exclusively. Exactly one caller can ever create a given generation. */
+async function tryCreateMutexGen(filePath: string, gen: number): Promise<boolean> {
+  const owner: MutexOwner = { pid: process.pid, host: hostname(), at: new Date().toISOString() };
+  try {
+    await writeFile(mutexGenPath(filePath, gen), JSON.stringify(owner) + '\n', {
+      encoding: 'utf8',
+      flag: 'wx',
+    });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw error;
+  }
+}
+
+/** 'free' = released or holder provably gone; 'live' = holder may still be inside; 'gone' = file vanished. */
+async function assessMutexGen(path: string): Promise<'free' | 'live' | 'gone'> {
+  let owner: MutexOwner | null = null;
+  try {
+    owner = JSON.parse(await readFile(path, 'utf8')) as MutexOwner;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'gone';
+    owner = null; // mid-write or corrupt: a contender just waits and re-reads; only a long silence frees it
+  }
+  if (owner && typeof owner.pid === 'number' && typeof owner.host === 'string') {
+    if (owner.released === true) return 'free';
+    if (owner.host === hostname() && !pidAlive(owner.pid)) return 'free';
+  }
+  // Remaining cases depend on how long the file has been silent.
+  let ageMs: number;
+  try {
+    ageMs = Date.now() - (await stat(path)).mtimeMs;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'gone';
+    throw error;
+  }
+  if (!owner || typeof owner.pid !== 'number' || typeof owner.host !== 'string') {
+    return ageMs > MUTEX_UNREADABLE_STALE_MS ? 'free' : 'live';
+  }
+  if (owner.host === hostname()) return ageMs > MUTEX_HARD_STALE_MS ? 'free' : 'live';
+  return ageMs > MUTEX_FOREIGN_STALE_MS ? 'free' : 'live';
+}
+
 /**
- * Run `fn` while holding the per-lock mutex. The mutex is a sibling file
- * created with an exclusive write, so only one caller in any process can be
- * inside at a time. A mutex file older than MUTEX_STALE_MS belongs to a process
- * that died mid-operation and is removed (only if it is still the same file
- * we judged stale). Throws WoLockMutexTimeoutError if the mutex stays busy.
+ * Run `fn` while holding the per-lock mutex (exported for tests).
+ *
+ * The mutex is a series of generation-numbered files `<lock>.mutex.<N>`. A caller
+ * enters by creating generation top+1 with an exclusive write, where `top` is the
+ * highest existing generation and is free (released, or its holder provably dead);
+ * the filesystem lets exactly one caller create any given generation. NOBODY ever
+ * deletes another caller's file, so a contender that judged an old holder dead can
+ * never remove a live holder's mutex. Generation numbers are never reused: release
+ * marks the caller's own file released (a tombstone) instead of removing it, so a
+ * slow contender holding a stale view cannot create a number that was already
+ * used and enter alongside a new holder. Winners prune older generations.
+ * Throws WoLockMutexTimeoutError if the mutex stays held.
  */
-async function withLockMutex<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
-  const mutexPath = `${filePath}.mutex`;
+export async function withWoLockMutex<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
   const deadline = Date.now() + MUTEX_WAIT_MS;
-  for (;;) {
-    try {
-      await writeFile(mutexPath, `${process.pid}\n`, { encoding: 'utf8', flag: 'wx' });
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      try {
-        const seen = await stat(mutexPath);
-        if (Date.now() - seen.mtimeMs > MUTEX_STALE_MS) {
-          const again = await stat(mutexPath);
-          if (again.ino === seen.ino && again.mtimeMs === seen.mtimeMs) {
-            await unlink(mutexPath).catch(() => undefined);
-          }
-          continue;
-        }
-      } catch (statError) {
-        if ((statError as NodeJS.ErrnoException).code === 'ENOENT') continue; // released meanwhile
-        throw statError;
-      }
-      if (Date.now() > deadline) throw new WoLockMutexTimeoutError(mutexPath);
-      await sleep(MUTEX_POLL_MS);
+  let mine = 0;
+  let olderGens: number[] = [];
+  while (mine === 0) {
+    const gens = await listMutexGens(filePath);
+    if (gens.length === 0) {
+      if (await tryCreateMutexGen(filePath, 1)) mine = 1;
+      continue;
     }
+    const top = gens[gens.length - 1];
+    const state = await assessMutexGen(mutexGenPath(filePath, top));
+    if (state === 'gone') continue;
+    if (state === 'free') {
+      if (await tryCreateMutexGen(filePath, top + 1)) {
+        mine = top + 1;
+        olderGens = gens;
+      }
+      continue;
+    }
+    if (Date.now() > deadline) throw new WoLockMutexTimeoutError(mutexGenPath(filePath, top));
+    await sleep(MUTEX_POLL_MS);
   }
   try {
+    // Only the winner of generation `mine` prunes: every older file belongs to a
+    // released or provably dead holder.
+    for (const gen of olderGens) {
+      await unlink(mutexGenPath(filePath, gen)).catch(() => undefined);
+    }
     return await fn();
   } finally {
-    await unlink(mutexPath).catch(() => undefined);
+    const released: MutexOwner = {
+      pid: process.pid,
+      host: hostname(),
+      at: new Date().toISOString(),
+      released: true,
+    };
+    const tombstone = mutexGenPath(filePath, mine);
+    try {
+      await writeFile(tombstone, JSON.stringify(released) + '\n', { encoding: 'utf8' });
+    } catch {
+      // Could not write the tombstone: remove our own file rather than leave a
+      // live-looking mutex that would block contenders until the hard-stale bound.
+      await unlink(tombstone).catch(() => undefined);
+    }
   }
 }
 
@@ -228,7 +329,7 @@ export async function acquireWoLock(
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
 
-    const outcome = await withLockMutex<AcquireWoLockResult | 'retry'>(filePath, async () => {
+    const outcome = await withWoLockMutex<AcquireWoLockResult | 'retry'>(filePath, async () => {
       const existing = await readLock(filePath);
       if (!existing) return 'retry';
       if (existing.status !== 'running') {
@@ -269,7 +370,7 @@ export async function releaseWoLock(
 ): Promise<void> {
   const filePath = lockPath(outDir, woId, project);
   try {
-    await withLockMutex(filePath, async () => {
+    await withWoLockMutex(filePath, async () => {
       const existing = await readLock(filePath);
       if (existing?.cascadeId !== cascadeId) return;
       await replaceLockFile(filePath, {
@@ -305,7 +406,7 @@ export async function touchWoLockHeartbeat(
 ): Promise<boolean> {
   const filePath = lockPath(outDir, woId, project);
   try {
-    return await withLockMutex(filePath, async () => {
+    return await withWoLockMutex(filePath, async () => {
       const existing = await readLock(filePath);
       if (existing?.status !== 'running' || existing.cascadeId !== cascadeId) return false;
       const now = new Date().toISOString();
@@ -347,7 +448,7 @@ async function updateOwnedLock(
 ): Promise<void> {
   const filePath = lockPath(outDir, woId, project);
   try {
-    await withLockMutex(filePath, async () => {
+    await withWoLockMutex(filePath, async () => {
       const existing = await readLock(filePath);
       if (existing?.status !== 'running' || existing.cascadeId !== cascadeId) return;
       const next = update(existing);
@@ -422,7 +523,7 @@ export async function releaseWoLocksForRun(
     if (!name.endsWith('.json')) continue;
     const filePath = join(dir, name);
     try {
-      await withLockMutex(filePath, async () => {
+      await withWoLockMutex(filePath, async () => {
         const existing = await readLock(filePath);
         if (existing?.status !== 'running') return;
         if (!(existing.runIds ?? []).includes(runId)) return;

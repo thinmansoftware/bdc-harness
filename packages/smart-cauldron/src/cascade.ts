@@ -872,49 +872,59 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     : startWoLockHeartbeat(woId, project, cascadeId, outDir);
 
   // Already-satisfied / claim check before any provider spend (M-123 Q5 / #1546).
-  if (!allowClaimed) {
-    const existingClaim = await findWoClaimImpl(woId, project);
-    if (existingClaim) {
-      console.log(
-        `[smart-cauldron] ALREADY SATISFIED woId=${woId}: PR #${existingClaim.number} ` +
-          `[${existingClaim.state}] ${existingClaim.url} -- skipping cascade`
-      );
-      const refused: CascadeRunRecord = {
-        cascadeId,
-        woId,
-        project,
-        request: {
-          woClass: woClass ?? null,
-          tags: [...(tags ?? [])].sort(),
-          entryOverride: entryOverride ?? null,
-          dryRun: false,
-        },
-        createdAt,
-        status: 'refused',
-        winningTier: null,
-        attempts: [],
-        totalCostUsd: null,
-        telemetry: {
-          entryTier: entryTierName,
-          climbed: false,
-          climbCount: 0,
-          wonCheap: false,
-        },
-        entrySelection,
-        refusalReason: {
-          reason: 'already-satisfied',
-          prNumber: existingClaim.number,
-          prState: existingClaim.state,
-          prUrl: existingClaim.url,
-          checkedAtTier: null,
-        },
-      };
-      const admissionEarly = await createRecordImpl(refused, outDir);
-      onAdmission?.(admissionEarly.record, admissionEarly.created);
-      stopWoLockHeartbeat();
-      await releaseWoLockImpl(woId, project, cascadeId, outDir);
-      return admissionEarly.record;
+  // Any throw between acquiring the lock and entering the cleanup try/finally
+  // below (claim lookup, refused-record creation, onAdmission) must still stop the
+  // heartbeat and release the lock: in a persistent conductor process a leaked
+  // heartbeat keeps the lock fresh forever and blocks every later fire.
+  try {
+    if (!allowClaimed) {
+      const existingClaim = await findWoClaimImpl(woId, project);
+      if (existingClaim) {
+        console.log(
+          `[smart-cauldron] ALREADY SATISFIED woId=${woId}: PR #${existingClaim.number} ` +
+            `[${existingClaim.state}] ${existingClaim.url} -- skipping cascade`
+        );
+        const refused: CascadeRunRecord = {
+          cascadeId,
+          woId,
+          project,
+          request: {
+            woClass: woClass ?? null,
+            tags: [...(tags ?? [])].sort(),
+            entryOverride: entryOverride ?? null,
+            dryRun: false,
+          },
+          createdAt,
+          status: 'refused',
+          winningTier: null,
+          attempts: [],
+          totalCostUsd: null,
+          telemetry: {
+            entryTier: entryTierName,
+            climbed: false,
+            climbCount: 0,
+            wonCheap: false,
+          },
+          entrySelection,
+          refusalReason: {
+            reason: 'already-satisfied',
+            prNumber: existingClaim.number,
+            prState: existingClaim.state,
+            prUrl: existingClaim.url,
+            checkedAtTier: null,
+          },
+        };
+        const admissionEarly = await createRecordImpl(refused, outDir);
+        onAdmission?.(admissionEarly.record, admissionEarly.created);
+        stopWoLockHeartbeat();
+        await releaseWoLockImpl(woId, project, cascadeId, outDir);
+        return admissionEarly.record;
+      }
     }
+  } catch (error) {
+    stopWoLockHeartbeat();
+    await releaseWoLockImpl(woId, project, cascadeId, outDir);
+    throw error;
   }
 
   // Cascade loop

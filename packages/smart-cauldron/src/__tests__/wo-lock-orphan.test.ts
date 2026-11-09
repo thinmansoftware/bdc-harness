@@ -8,11 +8,11 @@
  *   - cancel-releases-lock: cancelling a run releases the lock that run belongs to
  */
 
-import { afterEach, describe, expect, test } from 'bun:test';
+import { afterEach, describe, expect, spyOn, test } from 'bun:test';
 import { createHash } from 'crypto';
-import { mkdtemp, readFile, rm, utimes, writeFile } from 'fs/promises';
+import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'fs/promises';
 import { hostname, tmpdir } from 'os';
-import { join } from 'path';
+import { basename, dirname, join } from 'path';
 import {
   acquireWoLock,
   assessWoLockStaleness,
@@ -21,8 +21,10 @@ import {
   releaseWoLock,
   releaseWoLocksForRun,
   touchWoLockHeartbeat,
+  withWoLockMutex,
 } from '../wo-lock.js';
 import type { WoLockRecord } from '../wo-lock.js';
+import { runCascade } from '../cascade.js';
 
 const WO = 'WO-ORPHAN-01';
 const PROJECT = 'shopops';
@@ -70,6 +72,38 @@ async function plantLock(
   };
   await acquireWoLock(WO, PROJECT, 'seed', outDir); // creates the wo-locks dir
   await writeFile(lockFile(outDir), JSON.stringify(record, null, 2));
+}
+
+/** Plant a mutex generation file as a (possibly dead) prior holder would have left it. */
+async function plantMutexGen(
+  outDir: string,
+  gen: number,
+  owner: { pid: number; host: string },
+  ageMs = 0,
+  released = false
+): Promise<void> {
+  const path = `${lockFile(outDir)}.mutex.${gen}`;
+  await writeFile(
+    path,
+    JSON.stringify({
+      ...owner,
+      at: new Date().toISOString(),
+      ...(released ? { released: true } : {}),
+    }) + '\n'
+  );
+  if (ageMs > 0) {
+    const old = new Date(Date.now() - ageMs);
+    await utimes(path, old, old);
+  }
+}
+
+async function mutexGens(outDir: string): Promise<number[]> {
+  const prefix = `${basename(lockFile(outDir))}.mutex.`;
+  const names = await readdir(dirname(lockFile(outDir)));
+  return names
+    .filter(n => n.startsWith(prefix) && /^\d+$/.test(n.slice(prefix.length)))
+    .map(n => Number.parseInt(n.slice(prefix.length), 10))
+    .sort((a, b) => a - b);
 }
 
 describe('stale-lock-reclaimed', () => {
@@ -269,17 +303,102 @@ describe('exclusive takeover (Overseer review of the earlier stale-recovery PRs)
     expect((await readLockFile(outDir)).cascadeId).toBe('fast');
   });
 
-  test('a mutex file abandoned by a dead process does not wedge acquisition', async () => {
+  test('a mutex abandoned by a dead process does not wedge acquisition', async () => {
     const outDir = await makeOutDir();
     await acquireWoLock(WO, PROJECT, 'first', outDir);
     await releaseWoLock(WO, PROJECT, 'first', outDir);
-    const mutex = `${lockFile(outDir)}.mutex`;
-    await writeFile(mutex, '99999\n');
-    const old = new Date(Date.now() - 60_000);
-    await utimes(mutex, old, old);
+    await plantMutexGen(outDir, 9, { pid: await deadPid(), host: hostname() });
 
     const next = await acquireWoLock(WO, PROJECT, 'second', outDir);
     expect(next.acquired).toBe(true);
     expect(next.record.cascadeId).toBe('second');
+  });
+
+  test('a mutex held by a LIVE same-host process is waited for, never taken', async () => {
+    const outDir = await makeOutDir();
+    await acquireWoLock(WO, PROJECT, 'first', outDir);
+    await releaseWoLock(WO, PROJECT, 'first', outDir);
+    // Our own pid is alive; an old file must not be mistaken for a dead holder.
+    await plantMutexGen(outDir, 9, { pid: process.pid, host: hostname() }, 60_000);
+
+    let entered = false;
+    const attempt = withWoLockMutex(lockFile(outDir), async () => {
+      entered = true;
+    });
+    const raced = await Promise.race([
+      attempt.then(() => 'entered'),
+      new Promise(resolve => setTimeout(() => resolve('still-waiting'), 250)),
+    ]);
+    expect(raced).toBe('still-waiting');
+    expect(entered).toBe(false);
+    // Free the holder (tombstone) so the waiter can finish cleanly.
+    await plantMutexGen(outDir, 9, { pid: process.pid, host: hostname() }, 0, true);
+    await attempt;
+    expect(entered).toBe(true);
+  });
+
+  test('concurrent recovery of one abandoned mutex never admits two holders', async () => {
+    const outDir = await makeOutDir();
+    await acquireWoLock(WO, PROJECT, 'first', outDir);
+    await releaseWoLock(WO, PROJECT, 'first', outDir);
+    await plantMutexGen(outDir, 4, { pid: await deadPid(), host: hostname() });
+
+    let inside = 0;
+    let maxInside = 0;
+    let completed = 0;
+    await Promise.all(
+      Array.from({ length: 12 }, async () => {
+        await withWoLockMutex(lockFile(outDir), async () => {
+          inside += 1;
+          maxInside = Math.max(maxInside, inside);
+          await new Promise(resolve => setTimeout(resolve, 5));
+          inside -= 1;
+          completed += 1;
+        });
+      })
+    );
+    expect(completed).toBe(12);
+    expect(maxInside).toBe(1);
+  });
+
+  test('mutex generation numbers are never reused (tombstone stays, next caller increments)', async () => {
+    const outDir = await makeOutDir();
+    const lock = lockFile(outDir);
+    await acquireWoLock(WO, PROJECT, 'first', outDir); // creates the lock directory
+    await releaseWoLock(WO, PROJECT, 'first', outDir);
+    const before = await mutexGens(outDir);
+    await withWoLockMutex(lock, async () => undefined);
+    await withWoLockMutex(lock, async () => undefined);
+    const after = await mutexGens(outDir);
+    expect(after).toHaveLength(1); // older generations are pruned, one tombstone remains
+    expect(after[0]).toBeGreaterThan(Math.max(0, ...before));
+  });
+});
+
+describe('cleanup on early failure (Overseer review of #1529)', () => {
+  test('a throw after the lock is acquired (claim lookup) releases it and the next fire acquires', async () => {
+    const outDir = await makeOutDir();
+    const log = spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      await expect(
+        runCascade({
+          woId: WO,
+          woClass: 'CODE',
+          entryOverride: 'cursor',
+          outDir,
+          project: PROJECT,
+          deps: {
+            findWoClaim: async () => {
+              throw new Error('claim lookup failed');
+            },
+          },
+        })
+      ).rejects.toThrow('claim lookup failed');
+    } finally {
+      log.mockRestore();
+    }
+    expect((await readLockFile(outDir)).status).toBe('released');
+    const next = await acquireWoLock(WO, PROJECT, 'next-cascade', outDir);
+    expect(next.acquired).toBe(true);
   });
 });
