@@ -24,7 +24,12 @@ import {
   type SubmitDeps,
   type SubmitOutcome,
 } from '../pr-review-submit.ts';
-import { extractReviewSummary, foldSubmitReceipts } from '../pr-review-check-wiring.ts';
+import {
+  extractReviewSummary,
+  foldSubmitReceipts,
+  selectReviewSummary,
+  type ReviewWorkRow,
+} from '../pr-review-check-wiring.ts';
 import {
   ingestCheckCompletionEvent,
   verdictAuthorizesRecheck,
@@ -245,6 +250,21 @@ describe('foldSubmitReceipts establishes WHICH verdict stands at a head', () => 
     // The receipt never carries the finding text; that is readStandingVerdict's
     // second read. Pinned so a future change cannot quietly start trusting it.
     expect(verdict?.summary).toBeNull();
+  });
+
+  test('the receipt messageId is carried so the summary is read from the right work item', () => {
+    const body = (extra: Record<string, unknown>) =>
+      JSON.stringify({
+        kind: 'pr_review_submit_receipt',
+        disposition: 'changes_requested',
+        headSha: HEAD,
+        ...extra,
+      });
+    expect(
+      foldSubmitReceipts([{ body: body({ messageId: 'done-row' }), created_at: 'x' }], HEAD)
+        ?.messageId
+    ).toBe('done-row');
+    expect(foldSubmitReceipts([{ body: body({}), created_at: 'x' }], HEAD)?.messageId).toBeNull();
   });
 
   test('receipts bound to a different head are skipped', () => {
@@ -560,5 +580,161 @@ describe('integration: stored outcome -> check_run completed -> exactly one re-r
     );
     expect(result.disposition).toBe('ignored_no_authorizing_verdict');
     expect(enqueued).toHaveLength(0);
+  });
+});
+
+/**
+ * WO-HARNESS-RECHECK-STANDING-VERDICT-SELECTION-01. bdc-harness#1537 @76abd7a3: the
+ * head carried the DONE review row (summary in result_body) and three LATER
+ * duplicates cancelled as superseded_by_claim with no summary. Newest-first, the
+ * old code picked the newest duplicate, read no finding text, and never queued the
+ * re-review after the required check went green.
+ */
+describe('standing verdict selection with superseded duplicate work items at the head', () => {
+  const OTHER = 'c'.repeat(40);
+  const supersededBody = JSON.stringify({
+    reason: 'superseded_by_claim done-row',
+    superseded_by: 'done-row',
+  });
+  const row = (
+    id: string,
+    status: string,
+    result_body: string | null,
+    headSha = HEAD
+  ): ReviewWorkRow => ({
+    id,
+    status,
+    result_body,
+    body: JSON.stringify({ owner: OWNER, repo: REPO, prNumber: PR_NUMBER, headSha }),
+  });
+
+  async function doneBody(): Promise<string> {
+    const { body } = await persistedResultBody({
+      approved: false,
+      summary: `${CHECK_FINDING}\n[major] checks/test (ubuntu-latest): Required check failed.`,
+      reviewedHeadSha: HEAD,
+    });
+    return body;
+  }
+
+  test('Test 1: the summary is read from the work item the submit receipt names', async () => {
+    const done = await doneBody();
+    // newest first: three superseded duplicates, then the row that made the verdict
+    const work = [
+      row('dup-3', 'cancelled', supersededBody),
+      row('dup-2', 'cancelled', supersededBody),
+      row('dup-1', 'cancelled', supersededBody),
+      row('done-row', 'done', done),
+    ];
+    const summary = selectReviewSummary(work, HEAD, 'done-row');
+    expect(summary).toContain('checks/test (ubuntu-latest)');
+    expect(
+      verdictAuthorizesRecheck({ headSha: HEAD, disposition: 'changes_requested', summary })
+    ).toBe(true);
+  });
+
+  test('Test 2: no messageId falls back to the newest row with a summary; a superseded row never supplies text', async () => {
+    const done = await doneBody();
+    const work = [
+      row('dup-3', 'cancelled', supersededBody),
+      row('done-row', 'done', done),
+      row('other-head', 'done', done, OTHER),
+    ];
+    expect(selectReviewSummary(work, HEAD, null)).toContain('checks/test (ubuntu-latest)');
+    expect(selectReviewSummary(work, HEAD, 'a-row-that-is-gone')).toContain(
+      'checks/test (ubuntu-latest)'
+    );
+    // only superseded duplicates at the head: no summary, NOT the duplicate's reason text
+    expect(
+      selectReviewSummary([row('dup-3', 'cancelled', supersededBody)], HEAD, 'dup-3')
+    ).toBeNull();
+    // a done row of ANOTHER head never leaks in
+    expect(selectReviewSummary([row('other-head', 'done', done, OTHER)], HEAD, null)).toBeNull();
+  });
+
+  test('Test 2b: with two finished rows at the head the one the receipt names wins, not the newest', async () => {
+    const done = await doneBody();
+    const otherBody = (
+      await persistedResultBody({ approved: false, summary: CODE_FINDING, reviewedHeadSha: HEAD })
+    ).body;
+    const work = [row('newer-done', 'done', otherBody), row('done-row', 'done', done)];
+    expect(selectReviewSummary(work, HEAD, 'done-row')).toContain('checks/test (ubuntu-latest)');
+    // without the receipt id the newest finished row is used
+    expect(selectReviewSummary(work, HEAD, null)).toContain('null guard');
+  });
+
+  test('Test 3: a green completion queues the re-review for the check-caused verdict; a code-caused one reports why', async () => {
+    const done = await doneBody();
+    const codeBody = (
+      await persistedResultBody({ approved: false, summary: CODE_FINDING, reviewedHeadSha: HEAD })
+    ).body;
+    const payload = JSON.stringify({
+      action: 'completed',
+      check_run: {
+        id: 129304057191,
+        name: 'test (ubuntu-latest)',
+        status: 'completed',
+        conclusion: 'success',
+        head_sha: HEAD,
+        pull_requests: [{ number: PR_NUMBER, head: { sha: HEAD } }],
+      },
+      repository: { name: REPO, owner: { login: OWNER } },
+    });
+    const signature = `sha256=${createHmac('sha256', SECRET).update(payload).digest('hex')}`;
+    const run = async (doneRowBody: string) => {
+      const queued: { correlationId: string; headSha: string }[] = [];
+      const work = [
+        row('dup-2', 'cancelled', supersededBody),
+        row('dup-1', 'cancelled', supersededBody),
+        row('done-row', 'done', doneRowBody),
+      ];
+      const result = await ingestCheckCompletionEvent(
+        { rawBody: payload, signature, eventType: 'check_run', deliveryId: 'delivery-1537' },
+        {
+          webhookSecret: SECRET,
+          async readStandingVerdict(input) {
+            const verdict = foldSubmitReceipts(
+              [
+                {
+                  body: JSON.stringify({
+                    kind: 'pr_review_submit_receipt',
+                    disposition: 'changes_requested',
+                    headSha: input.headSha,
+                    messageId: 'done-row',
+                  }),
+                  created_at: '2026-11-09T16:57:54Z',
+                },
+              ],
+              input.headSha
+            );
+            if (!verdict) return null;
+            return {
+              ...verdict,
+              summary: selectReviewSummary(work, input.headSha, verdict.messageId),
+            };
+          },
+          async enqueueRecheckWork(input) {
+            queued.push({ correlationId: input.correlationId, headSha: input.headSha });
+            return { messageId: 'new-row', alreadyExisted: false };
+          },
+          async recordReceipt() {},
+        }
+      );
+      return { result, queued };
+    };
+
+    const checkCaused = await run(done);
+    expect(checkCaused.result.disposition).toBe('queued');
+    expect(checkCaused.queued).toEqual([
+      { correlationId: `pr-review:${OWNER}/${REPO}#${PR_NUMBER}@${HEAD}`, headSha: HEAD },
+    ]);
+
+    const codeCaused = await run(codeBody);
+    expect(codeCaused.result.disposition).toBe('ignored_no_authorizing_verdict');
+    expect(codeCaused.queued).toEqual([]);
+    // the top-level reason now names the per-PR cause instead of one fixed string
+    expect(codeCaused.result.reason).toContain(
+      `#${PR_NUMBER}:verdict_not_check_caused:changes_requested`
+    );
   });
 });

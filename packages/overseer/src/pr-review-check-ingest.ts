@@ -127,6 +127,11 @@ export interface StandingVerdict {
   summary?: string | null;
   /** When the verdict was recorded (ISO-8601), for the stale sweep. */
   recordedAt?: string | null;
+  /**
+   * The review work item the submit receipt names. The summary is read from THIS
+   * item (a head can carry later superseded duplicates with no summary).
+   */
+  messageId?: string | null;
 }
 
 /**
@@ -995,6 +1000,7 @@ export async function ingestCheckCompletionEvent(
   }
 
   const queuedPrNumbers: number[] = [];
+  const perPrReasons: string[] = [];
   let lastCorrelationId: string | undefined;
   let lastMessageId: string | undefined;
   let anyAuthorized = false;
@@ -1030,6 +1036,9 @@ export async function ingestCheckCompletionEvent(
     }
 
     if (!verdictAuthorizesRecheck(verdict)) {
+      const noVerdictReason = verdict
+        ? `verdict_not_check_caused:${verdict.disposition}`
+        : 'no_standing_verdict_at_head';
       await safeReceipt(deps, {
         correlationId,
         deliveryId,
@@ -1038,10 +1047,9 @@ export async function ingestCheckCompletionEvent(
         prNumber,
         headSha: completion.headSha,
         disposition: 'ignored_no_authorizing_verdict',
-        reason: verdict
-          ? `verdict_not_check_caused:${verdict.disposition}`
-          : 'no_standing_verdict_at_head',
+        reason: noVerdictReason,
       });
+      perPrReasons.push(`#${prNumber}:${noVerdictReason}`);
       continue;
     }
 
@@ -1062,6 +1070,9 @@ export async function ingestCheckCompletionEvent(
         disposition: 'ignored_check_not_actionable',
         reason: `rereview_skipped_check_not_success:${completion.checkName}:${completion.conclusion ?? 'null'}`,
       });
+      perPrReasons.push(
+        `#${prNumber}:rereview_skipped_check_not_success:${completion.checkName}:${completion.conclusion ?? 'null'}`
+      );
       continue;
     }
 
@@ -1094,6 +1105,9 @@ export async function ingestCheckCompletionEvent(
           disposition: 'ignored_check_not_actionable',
           reason: `rereview_skipped_check_not_relevant:${completion.checkName}`,
         });
+        perPrReasons.push(
+          `#${prNumber}:rereview_skipped_check_not_relevant:${completion.checkName}`
+        );
         continue;
       }
     }
@@ -1150,7 +1164,12 @@ export async function ingestCheckCompletionEvent(
     return {
       disposition: 'ignored_no_authorizing_verdict',
       status: 200,
-      reason: 'no_pull_request_had_a_check_caused_verdict',
+      // The per-PR reasons are the real diagnosis (verdict absent, not check-caused,
+      // check not success, check not relevant); one fixed string hid them in the log.
+      reason:
+        perPrReasons.length > 0
+          ? `no_pull_request_had_a_check_caused_verdict:${perPrReasons.join(',')}`
+          : 'no_pull_request_had_a_check_caused_verdict',
       headSha: completion.headSha,
     };
   }
