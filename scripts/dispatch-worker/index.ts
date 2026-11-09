@@ -22,6 +22,11 @@ import { resolveOperatorToken } from './credentials';
 import { realSeatPreflightDeps, runSeatPreflight, type SeatConfig } from './seat-preflight';
 import { acquireInstanceLock, readRestartEvidence, type InstanceLockHandle } from './instance-lock';
 import { createWorkerLog, type WorkerLog } from './worker-log';
+import {
+  CONNECT_FAILURE_EXIT_MS,
+  createConnectFailureClock,
+  runWorkerLoop,
+} from './connect-failure-clock';
 import { enumerateProcessTree, killProcessTree, waitForTreeDeath } from './acp/kill-tree';
 
 type DispatchTaskType =
@@ -976,26 +981,41 @@ async function main(): Promise<void> {
 
   await register(config, token);
   await log.info('registered with drop-box server');
+  // WO-HARNESS-DISPATCH-WORKER-STALE-LOCK-01 (2026-11-09 amendment): a worker
+  // that cannot reach the server for CONNECT_FAILURE_EXIT_MS, with nothing
+  // executing, exits so the launcher supervisor or watchdog restarts it.
+  const clock = createConnectFailureClock({
+    now: Date.now,
+    exitAfterMs: CONNECT_FAILURE_EXIT_MS,
+  });
   const heartbeatTimer = setInterval(() => {
     if (!state.stopping)
-      void heartbeat(config, token).catch(error => {
-        void log.error('heartbeat failed', error);
-      });
+      void heartbeat(config, token)
+        .then(() => {
+          clock.recordSuccess();
+        })
+        .catch(error => {
+          clock.recordFailure(error);
+          void log.error('heartbeat failed', error);
+        });
   }, config.heartbeat_interval_ms);
   heartbeatTimer.unref?.();
 
-  try {
-    while (!state.stopping) {
-      await poll(config, token, state, log).catch(error => {
-        void log.error('poll failed', error);
-      });
-      await Bun.sleep(config.poll_interval_ms);
-    }
-  } finally {
-    clearInterval(heartbeatTimer);
-    await log.info('shutting down: releasing instance lock');
-    await lock.release();
-  }
+  await runWorkerLoop({
+    isStopping: () => state.stopping,
+    poll: () => poll(config, token, state, log),
+    sleep: ms => Bun.sleep(ms),
+    pollIntervalMs: config.poll_interval_ms,
+    activeExecutions: () => [...state.activeByAgent.values()].reduce((sum, n) => sum + n, 0),
+    clock,
+    logError: (message, error) => log.error(message, error),
+    release: async () => {
+      clearInterval(heartbeatTimer);
+      await log.info('shutting down: releasing instance lock');
+      await lock.release();
+    },
+    exit: code => process.exit(code),
+  });
 }
 
 if (import.meta.main) {
