@@ -1095,3 +1095,121 @@ Start-Sleep -Seconds 300
     expect(tunnel).not.toMatch(/Start-Process\s+-FilePath/);
   });
 });
+
+suite('start-windows.ps1 launcher event log (the unexplained 2026-11-10 stop)', () => {
+  const q = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+  async function runHost(
+    body: string,
+    env: Record<string, string>
+  ): Promise<{ out: string; err: string }> {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-log-'));
+    try {
+      const script = join(dir, 'scenario.ps1');
+      await writeFile(
+        script,
+        `$ErrorActionPreference = 'Stop'
+. ${q(LAUNCHER)}
+${body}
+`,
+        'utf8'
+      );
+      const proc = Bun.spawn(
+        [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          script,
+        ],
+        { stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ...env } }
+      );
+      const [out, err] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      return { out, err };
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('Write-LauncherLog appends a timestamped, pid-tagged line to the launcher log file', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-logfile-'));
+    try {
+      const log = join(dir, 'sub', 'dispatch-launcher.log');
+      const { err } = await runHost(
+        `Write-LauncherLog 'attempt 1 of 5 failed: ssh tunnel exited (exit code -1)'`,
+        {
+          BDC_DISPATCH_LAUNCHER_LOG: log,
+        }
+      );
+      expect(err).toBe('');
+      const text = await readFile(log, 'utf8');
+      expect(text).toMatch(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z \[pid \d+\] dispatch_launcher: attempt 1 of 5 failed: ssh tunnel exited \(exit code -1\)/
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('the log is capped: past the limit it rotates to .1 and the live file stays small', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-logcap-'));
+    try {
+      const log = join(dir, 'dispatch-launcher.log');
+      const { err } = await runHost(
+        `$script:LauncherLogMaxBytes = 300
+1..30 | ForEach-Object { Write-LauncherLog ('line number ' + $_ + ' padding padding padding') }`,
+        { BDC_DISPATCH_LAUNCHER_LOG: log }
+      );
+      expect(err).toBe('');
+      const live = await readFile(log, 'utf8');
+      const rotated = await readFile(log + '.1', 'utf8');
+      expect(live.length).toBeLessThan(700);
+      expect(rotated.length).toBeGreaterThan(0);
+      expect(live + rotated).toContain('line number 30');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('an unwritable log path never stops the launcher', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-lognowrite-'));
+    try {
+      const blocker = join(dir, 'a-file');
+      await writeFile(blocker, 'x', 'utf8');
+      const { out, err } = await runHost(
+        `Write-LauncherLog 'still running'
+Write-Output 'SURVIVED'`,
+        {
+          BDC_DISPATCH_LAUNCHER_LOG: join(blocker, 'not-a-dir', 'dispatch-launcher.log'),
+        }
+      );
+      expect(err).toBe('');
+      expect(out).toContain('SURVIVED');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('Get-OwnedProcessSummary reports the raw exit code of an exited process and pid of a running one', async () => {
+    const { out, err } = await runHost(
+      `$e = [pscustomobject]@{ Id = 4242; HasExited = $true; ExitCode = -1 }
+$r = [pscustomobject]@{ Id = 77; HasExited = $false; ExitCode = $null }
+Write-Output (Get-OwnedProcessSummary -Name 'tunnel' -Process $e)
+Write-Output (Get-OwnedProcessSummary -Name 'worker' -Process $r)
+Write-Output (Get-OwnedProcessSummary -Name 'worker' -Process $null)`,
+      {}
+    );
+    expect(err).toBe('');
+    const lines = out.split(/\r?\n/).filter(Boolean);
+    expect(lines).toEqual([
+      'tunnel pid=4242 exited code=-1',
+      'worker pid=77 running',
+      'worker not started',
+    ]);
+  });
+});
