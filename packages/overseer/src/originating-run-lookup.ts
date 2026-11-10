@@ -1,0 +1,97 @@
+/**
+ * Trace a pull request back to the Cauldron run that opened it (bdc-harness 5308).
+ *
+ * Why: the merge hold of WO-HARNESS-MERGE-HOLD-FAILED-EVIDENCE-01 keys on the
+ * originating run. A PR discovered by the PR-first sweep carries a synthetic
+ * `pr-discovery:` run id, so without this lookup a PR the run itself opened
+ * (the agent pushing the run's worktree branch mid-run) or whose head was later
+ * hand-fixed merges on the run-less path with no hold. Two independent traces:
+ *   1. the PR head branch equals the tail of a run's own worktree path
+ *      (`.../worktrees/archon/task-web-worker-<id>`), and
+ *   2. the PR URL appears in the run's open-pr-if-needed / patch-pr-body output.
+ * The branch name carries a thread suffix that is NOT the run id, so it is never
+ * parsed for an id.
+ *
+ * A pull request no run opened (a human PR) yields null and keeps the 2026-09-07
+ * "proceed on green" rule. The most recent matching run governs.
+ */
+
+export interface OriginatingRunCandidate {
+  readonly id: string;
+  readonly status: string;
+  readonly started_at: string | null;
+  readonly working_path: string | null;
+  readonly event_data: string | null;
+}
+
+export interface OriginatingRun {
+  readonly runId: string;
+  readonly status: string;
+}
+
+export interface OriginatingRunLookupInput {
+  readonly owner: string;
+  readonly repo: string;
+  readonly number: number;
+  readonly headRef?: string;
+}
+
+export type ListOriginatingRunCandidates = (
+  input: OriginatingRunLookupInput
+) => Promise<readonly OriginatingRunCandidate[]>;
+
+/** Statuses after which a run's evidence gate has had its chance to run. */
+const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled', 'escalated']);
+
+export function isRunTerminal(status: string): boolean {
+  return TERMINAL_RUN_STATUSES.has(status.trim().toLowerCase());
+}
+
+const REGEXP_SPECIALS = /[.*+?^${}()|[\]\\]/g;
+
+function escapeRegExp(value: string): string {
+  return value.replace(REGEXP_SPECIALS, '\\$&');
+}
+
+function mentionsPullRequest(eventData: string, input: OriginatingRunLookupInput): boolean {
+  const owner = escapeRegExp(input.owner);
+  const repo = escapeRegExp(input.repo);
+  const pattern = new RegExp(
+    'github\\.com/' + owner + '/' + repo + '/pull/' + String(input.number) + '(?!\\d)',
+    'i'
+  );
+  return pattern.test(eventData);
+}
+
+function worktreeEndsWithBranch(workingPath: string, headRef: string): boolean {
+  const normalized = workingPath.split('\\').join('/').replace(/\/+$/, '');
+  return normalized === headRef || normalized.endsWith('/' + headRef);
+}
+
+/**
+ * Return the most recent run that opened the pull request, or null when none
+ * did. A rejection from `list` propagates: the caller must fail closed.
+ */
+export async function findOriginatingRunForPullRequest(
+  input: OriginatingRunLookupInput,
+  list: ListOriginatingRunCandidates
+): Promise<OriginatingRun | null> {
+  const candidates = await list(input);
+  const headRef = (input.headRef ?? '').trim();
+  const matches = new Map<string, OriginatingRunCandidate>();
+  for (const candidate of candidates) {
+    const byBranch =
+      headRef !== '' &&
+      typeof candidate.working_path === 'string' &&
+      worktreeEndsWithBranch(candidate.working_path, headRef);
+    const byUrl =
+      typeof candidate.event_data === 'string' && mentionsPullRequest(candidate.event_data, input);
+    if (!byBranch && !byUrl) continue;
+    if (!matches.has(candidate.id)) matches.set(candidate.id, candidate);
+  }
+  const ordered = [...matches.values()].sort((a, b) =>
+    (b.started_at ?? '').localeCompare(a.started_at ?? '')
+  );
+  const latest = ordered[0];
+  return latest ? { runId: latest.id, status: latest.status } : null;
+}

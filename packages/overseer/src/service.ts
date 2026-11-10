@@ -8,6 +8,7 @@ import {
   getVerdictByRunHead,
   insertOverseerAction,
   listActiveRunUserMessages,
+  listOriginatingRunCandidates,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
@@ -20,6 +21,8 @@ import {
   getEarliestOverseerMergeSlotReservation,
 } from '@archon/core/db/overseer';
 import { hasActiveRunForWo } from './active-run-guard';
+import { findOriginatingRunForPullRequest } from './originating-run-lookup';
+import type { OriginatingRun } from './originating-run-lookup';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
 import type { OverseerVerdictStoreDeps } from './types.ts';
 import { runAuthorizedEscalation } from './authorized-escalation';
@@ -462,6 +465,8 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
     runMergeExecutionBridgeOnce({
       github,
       readRunEvents: listRunEventsForOverseer,
+      findOriginatingRun: (input): Promise<OriginatingRun | null> =>
+        findOriginatingRunForPullRequest(input, listOriginatingRunCandidates),
       ...(github.hasQualifiedReview
         ? {
             hasQualifiedReview: (input): Promise<boolean> =>

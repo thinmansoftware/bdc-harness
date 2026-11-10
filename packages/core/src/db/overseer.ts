@@ -296,6 +296,55 @@ export async function listActiveRunUserMessages(): Promise<string[]> {
     .filter(message => message.length > 0);
 }
 
+/**
+ * Raw candidates for "which run opened this pull request" (bdc-harness 5308).
+ * A candidate is either a run whose own worktree path ends with the PR head
+ * branch (the agent pushed the run's worktree branch), or a run whose
+ * open-pr / patch-pr-body node output mentions the PR URL. Exact matching is
+ * done by the caller; the LIKE patterns here only narrow the scan.
+ */
+export interface OriginatingRunCandidateRow {
+  id: string;
+  status: string;
+  started_at: string | null;
+  working_path: string | null;
+  event_data: string | null;
+}
+
+export async function listOriginatingRunCandidates(input: {
+  owner: string;
+  repo: string;
+  number: number;
+  headRef?: string;
+}): Promise<OriginatingRunCandidateRow[]> {
+  const db = getDatabase();
+  const rows: OriginatingRunCandidateRow[] = [];
+  const headRef = (input.headRef ?? '').trim();
+  if (headRef) {
+    const byBranch = await db.query<OriginatingRunCandidateRow>(
+      `SELECT id, status, started_at, working_path, NULL AS event_data
+       FROM remote_agent_workflow_runs
+       WHERE workflow_name != 'pr-discovery'
+         AND working_path LIKE $1`,
+      [`%/${headRef}`]
+    );
+    rows.push(...byBranch.rows);
+  }
+  const byUrl = await db.query<OriginatingRunCandidateRow>(
+    `SELECT r.id AS id, r.status AS status, r.started_at AS started_at,
+            r.working_path AS working_path, CAST(e.data AS TEXT) AS event_data
+     FROM remote_agent_workflow_events e
+     JOIN remote_agent_workflow_runs r ON r.id = e.workflow_run_id
+     WHERE e.event_type = 'node_completed'
+       AND e.step_name IN ('open-pr-if-needed', 'patch-pr-body')
+       AND r.workflow_name != 'pr-discovery'
+       AND CAST(e.data AS TEXT) LIKE $1`,
+    [`%${input.owner}/${input.repo}/pull/${input.number}%`]
+  );
+  rows.push(...byUrl.rows);
+  return rows;
+}
+
 interface OverseerEffectTimestampRow {
   last_effect_at: string | null;
 }

@@ -47,9 +47,12 @@ import {
   originatingEvidenceFailure,
   evidenceAdjudicated,
   postEvidenceHold,
+  runlessOriginatingEvidenceHold,
   ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON,
+  ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON,
   ORIGINATING_RUN_UNREADABLE_HOLD_REASON,
 } from './merge-manager';
+import type { OriginatingRun, OriginatingRunLookupInput } from './originating-run-lookup';
 import { resolveRequiredContexts } from './adapters/required-contexts';
 import { createRealOctokitClient } from './adapters/github-real-deps';
 import { blockingRequiredContexts } from './required-context-gate';
@@ -99,6 +102,11 @@ export interface MergeExecutionBridgeStore {
 
 export interface MergeExecutionBridgeOptions {
   readRunEvents?: (runId: string) => Promise<OverseerWorkflowEvent[]>;
+  /**
+   * Trace a run-less verdict's PR to the run that opened it (bdc-harness 5308).
+   * Absent keeps the run-less path unchanged; a rejection holds as unreadable.
+   */
+  findOriginatingRun?: (input: OriginatingRunLookupInput) => Promise<OriginatingRun | null>;
   store: MergeExecutionBridgeStore;
   github: GitHubClientDeps;
   readPolicy?: () => OverseerActionPolicy;
@@ -759,6 +767,7 @@ async function mergeClaimedVerdict(
   ): Promise<void> => {
     if (
       reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON ||
+      reason === ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON ||
       reason === ORIGINATING_RUN_UNREADABLE_HOLD_REASON
     ) {
       // Evidence holds must remain eligible for repair/adjudication on the next tick.
@@ -1187,6 +1196,37 @@ async function mergeClaimedVerdict(
     await options.store.releaseMergeSlot(verdict.id);
     await skip(`review_conflict_at_head:${conflict}`, pr.htmlUrl);
     return undefined;
+  }
+  if (isRunlessVerdict(verdict) && options.findOriginatingRun) {
+    const traced = await runlessOriginatingEvidenceHold(
+      {
+        owner: pr.pr.owner,
+        repo: pr.pr.repo,
+        number: pr.pr.number,
+        headRef: pr.pr.headRef,
+      },
+      options.findOriginatingRun,
+      options.readRunEvents
+    );
+    if (
+      traced &&
+      !(
+        traced.failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON &&
+        (await evidenceAdjudicated(options.github, { ...pr.pr, headSha: verdict.head_sha }))
+      )
+    ) {
+      await options.store.releaseMergeSlot(verdict.id);
+      await postEvidenceHold(
+        options.github,
+        traced.runId,
+        { ...pr.pr, headSha: verdict.head_sha },
+        traced.failure,
+        'execute',
+        true
+      );
+      await skip(traced.failure.reason, pr.htmlUrl);
+      return undefined;
+    }
   }
   if (!isRunlessVerdict(verdict)) {
     const failure = await originatingEvidenceFailure(
