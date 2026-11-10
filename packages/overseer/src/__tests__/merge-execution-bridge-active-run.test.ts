@@ -12,6 +12,7 @@ import type { GitHubClientDeps, PullRequestEvidence } from '../types.ts';
 
 const runMergeExecutionBridgeOnce = (options: MergeExecutionBridgeOptions): Promise<void> =>
   runMergeExecutionBridgeOnceProduction({
+    readRunEvents: async () => [],
     hasQualifiedReview: async () => true,
     reviewConflictAtHead: async () => null,
     ...options,

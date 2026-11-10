@@ -39,10 +39,17 @@ jobs:
       - name: Check bundled skill
         run: bun run check:bundled-skill
 
+      - name: Check installed Claude version and image guard
+        run: |
+          bun test ./scripts/claude-version-guard.test.ts
+          bun run scripts/claude-version-guard.ts
+
       - name: Type check
         run: bun run type-check
 
       - name: Lint
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
         run: bun run lint --max-warnings 0
 
       - name: Check formatting

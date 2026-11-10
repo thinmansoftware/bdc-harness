@@ -298,6 +298,10 @@ COPY packages/companion-mcp/package.json ./packages/companion-mcp/
 # Install production dependencies only (--ignore-scripts skips husky prepare hook)
 RUN bun install --frozen-lockfile --production --ignore-scripts --linker=hoisted
 
+# Execute the lockfile-installed native CLI, not just its package metadata.
+COPY scripts/claude-version-guard.ts scripts/claude-model-probe.ts ./scripts/
+RUN bun run scripts/claude-version-guard.ts
+
 # Copy application source (Bun runs TypeScript directly, no compile step needed)
 COPY packages/adapters/ ./packages/adapters/
 COPY packages/canary-suite/ ./packages/canary-suite/

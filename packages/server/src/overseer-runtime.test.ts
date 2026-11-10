@@ -24,8 +24,9 @@ import {
   startOverseerRuntime,
   stopOverseerRuntime,
   getOverseerRuntimeStatus,
+  createRuntimeMergeManager,
 } from './overseer-runtime';
-import { createMergeManager } from '../../overseer/src/merge-manager.ts';
+import type { WatchedRunRecord } from '../../overseer/src/types';
 import { startMergeSweepLivenessMonitor } from '../../overseer/src/merge-sweep-liveness.ts';
 import { PRODUCTION_EFFECT_HOLD_REASON } from '../../overseer/src/merge-manager.ts';
 
@@ -67,6 +68,64 @@ function setEnabledEnv(): void {
 }
 
 describe('overseer-runtime', () => {
+  test('runtime manager reads originating events and holds failed evidence or a missing run', async () => {
+    const headSha = 'a'.repeat(40);
+    const record: WatchedRunRecord = {
+      runId: 'run-runtime-evidence',
+      woId: 'WO-EVIDENCE',
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      status: 'failed',
+      action: 'merge_ready',
+      reason: 'green PR',
+      workingPath: '/worktree/run',
+      metadata: { base_branch: 'dev' },
+      prEvidence: {
+        exists: true,
+        state: 'open',
+        checks: { total: 1, passed: 1, failed: 0, pending: 0 },
+        mergeable: true,
+        headSha,
+        baseBranch: 'dev',
+        pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 42 },
+      },
+    };
+    const listRunEvents = mock(async (runId: string) => [
+      {
+        id: 'event-runtime',
+        workflow_run_id: runId,
+        event_type: 'node_failed',
+        step_name: 'manifest-evidence-check',
+        data: { error: 'EVIDENCE_ERROR: no tests' },
+      },
+    ]);
+    const findRun = mock(async (id: string): Promise<{ id: string } | null> => ({ id }));
+    const mergePullRequest = mock(async () => ({ merged: true }));
+    const deps = {
+      mode: 'execute',
+      mutationsEnabled: true,
+      listRunEvents,
+      findPullRequest: async () => record.prEvidence,
+      readWorktreeHeadSha: async () => headSha,
+      mergePullRequest,
+      insertOverseerAction: async () => undefined,
+    };
+    const manager = createRuntimeMergeManager(deps, findRun);
+    expect(await manager(record)).toMatchObject({
+      status: 'held',
+      reason: 'originating_run_failed_evidence_gate',
+    });
+    expect(findRun).toHaveBeenCalledWith('run-runtime-evidence');
+    expect(listRunEvents).toHaveBeenCalledWith('run-runtime-evidence');
+    findRun.mockImplementation(async () => null);
+    expect(await manager(record)).toMatchObject({
+      status: 'held',
+      reason: 'originating_run_unreadable',
+    });
+    expect(listRunEvents).toHaveBeenCalledTimes(1);
+    expect(mergePullRequest).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     runOverseerServiceMock.mockReset();
     // Re-apply base capture impl after reset (mockReset clears implementation).
@@ -397,7 +456,7 @@ describe('overseer-runtime', () => {
       mergePullRequest: async () => ({ merged: false }),
       insertOverseerAction: async () => undefined,
     };
-    const mergeManager = createMergeManager(deps);
+    const mergeManager = createRuntimeMergeManager(deps);
     // A real service stays up until stopped. (With a mock that exits at once, the supervisor
     // now treats the exit as unexpected and reports 'degraded' while it backs off to restart.)
     runOverseerServiceMock.mockImplementation(async (opts?: unknown) => {

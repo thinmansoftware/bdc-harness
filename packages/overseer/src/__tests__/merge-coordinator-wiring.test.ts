@@ -270,6 +270,7 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     const judge = mock(async input => approveReceipt(input));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],

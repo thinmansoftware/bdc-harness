@@ -461,6 +461,7 @@ function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<
   return (): Promise<void> =>
     runMergeExecutionBridgeOnce({
       github,
+      readRunEvents: listRunEventsForOverseer,
       ...(github.hasQualifiedReview
         ? {
             hasQualifiedReview: (input): Promise<boolean> =>
