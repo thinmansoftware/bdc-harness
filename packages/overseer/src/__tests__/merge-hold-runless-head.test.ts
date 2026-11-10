@@ -109,6 +109,22 @@ describe('findOriginatingRunForPullRequest', () => {
     expect(lookalike).toBeNull();
   });
 
+  test('a Windows backslash worktree path still matches by branch and repository', async () => {
+    const bs = String.fromCharCode(92);
+    const winPath = [
+      'C:',
+      'ws',
+      'thinmansoftware',
+      'bdc-harness',
+      'worktrees',
+      ...BRANCH.split('/'),
+    ].join(bs);
+    const found = await findOriginatingRunForPullRequest(input, async () => [
+      candidate({ id: 'win-run', status: 'running', working_path: winPath }),
+    ]);
+    expect(found).toEqual({ runId: 'win-run', status: 'running' });
+  });
+
   test('a worktree branch only matches a run of the SAME repository', async () => {
     const path = '/ws/worktrees/' + BRANCH;
     // newer completed run of ANOTHER repo with the same branch name must not supersede

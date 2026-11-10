@@ -147,6 +147,21 @@ describe('overseer db', () => {
     expect(rows.find(row => row.id === 'run-by-url')?.event_data).toContain(url);
   });
 
+  test('listOriginatingRunCandidates matches a Windows backslash worktree path by branch', async () => {
+    await seedRun('run-windows', 'running');
+    await db.query('UPDATE remote_agent_workflow_runs SET working_path = $1 WHERE id = $2', [
+      ['C:', 'ws', 'worktrees', 'archon', 'task-web-worker-9-xyz'].join(String.fromCharCode(92)),
+      'run-windows',
+    ]);
+    const rows = await listOriginatingRunCandidates({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 7,
+      headRef: 'archon/task-web-worker-9-xyz',
+    });
+    expect(rows.map(row => row.id)).toEqual(['run-windows']);
+  });
+
   test('lists terminal runs, events, and records overseer_actions rows', async () => {
     await seedRun('run-overseer');
     await db.query(

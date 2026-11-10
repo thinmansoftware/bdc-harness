@@ -329,8 +329,9 @@ export async function listOriginatingRunCandidates(input: {
        FROM remote_agent_workflow_runs r
        LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
        WHERE r.workflow_name != 'pr-discovery'
-         AND r.working_path LIKE $1`,
-      [`%/${headRef}`]
+         AND replace(r.working_path, $2, '/') LIKE $1`,
+      // a Windows worktree path uses backslashes: normalise them in SQL before matching
+      [`%/${headRef}`, String.fromCharCode(92)]
     );
     rows.push(...byBranch.rows);
   }
