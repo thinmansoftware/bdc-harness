@@ -296,6 +296,15 @@ export function decide(input: DecideInput): DecisionResult {
         reason: 'commit-and-push blocked without required authorization; harness review needed',
       };
 
+    case 'build_blocked':
+      // Escalate only: the build's own reviews still said needs_revision after the automatic
+      // repair. Re-firing the same build blindly would repeat it; a stronger rung or a human owns it.
+      return {
+        decision: 'escalate',
+        reason:
+          'build ended BLOCKED (reviews still need revision after the automatic repair); stronger-rung retry or human review needed',
+      };
+
     case 'plan_review_source_unreachable':
       return {
         decision: 'escalate',

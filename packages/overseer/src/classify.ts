@@ -33,6 +33,7 @@ export type ErrorClass =
   // Failure Classes E-J (2026-07-17): six doctrine classes split into eight code values
   | 'scope_dirty_at_capture'
   | 'commit_blocked_no_authorization'
+  | 'build_blocked'
   | 'plan_review_source_unreachable'
   | typeof READ_SPEC_SCOPE_AUTHORITY_MISSING
   | 'read_spec_command_not_found'
@@ -199,6 +200,12 @@ export function classifyError(input: ClassifyInput): ErrorClass {
     )
   ) {
     return 'commit_blocked_no_authorization';
+  }
+
+  // WO-HARNESS-BLOCKED-BUILD-NOT-COMPLETED-01: the terminal blocked-terminal-gate node fails a
+  // run whose build ended BLOCKED with `build_blocked: <status> <note>`.
+  if (rawMessage.includes('build_blocked:')) {
+    return 'build_blocked';
   }
 
   if (
