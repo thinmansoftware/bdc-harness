@@ -683,4 +683,142 @@ for name in bunfig.toml frozen-alias.txt; do
   check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
   unset BASE_BRANCH
 done
+# Round 9: package entrypoints are frozen even when regular, build-changed files.
+# Exercise the actual saved-command, snapshot, repair and final-evidence paths.
+mkdir -p "$TMP/r9-bin"
+for manager in yarn pnpm; do
+  cat > "$TMP/r9-bin/$manager" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = run ]; then shift; fi
+exec npm run "$@"
+SH
+  chmod +x "$TMP/r9-bin/$manager"
+done
+cat > "$TMP/r9-bin/npx" <<'SH'
+#!/usr/bin/env bash
+# Local fixture tool; no dependency installation or network access.
+shift
+exec bash "$@"
+SH
+chmod +x "$TMP/r9-bin/npx"
+export PATH="$TMP/r9-bin:$PATH"
+export npm_config_script_shell=bash
+r9_build() {
+  local kind="$1" package='.' script='bash check.sh' extra='{}'
+  R9_COMMAND='npm test'; R9_ENTRY=check.sh; R9_JS=0
+  case "$kind" in
+    node) script='node scripts/check.js'; R9_ENTRY=scripts/check.js; R9_JS=1 ;;
+    direct) script='./run-checks.sh'; R9_ENTRY=run-checks.sh ;;
+    named) R9_COMMAND='npm run test:unit'; script='bash scripts/unit.sh'; R9_ENTRY=scripts/unit.sh ;;
+    and) script='bash lint.sh && bash check.sh' ;;
+    pipe) script='bash lint.sh | bash check.sh' ;;
+    semicolon) script='bash lint.sh;bash check.sh' ;;
+    or) script='false || bash check.sh' ;;
+    bun) R9_COMMAND='bun run test' ;;
+    yarn) R9_COMMAND='yarn test' ;;
+    pnpm) R9_COMMAND='pnpm test' ;;
+    npm_recursive|bun_recursive|yarn_recursive|pnpm_recursive)
+      script="${kind%_recursive} run unit"; extra='{"unit":"bash scripts/unit.sh"}'; R9_ENTRY=scripts/unit.sh ;;
+    cd) R9_COMMAND="cd 'package dir' && npm test"; package='package dir'; R9_ENTRY='package dir/check.sh' ;;
+    script_cd) script="cd 'scripts dir' && bash check.sh"; R9_ENTRY='scripts dir/check.sh' ;;
+    npx) script='npx fixture-tool scripts/check.sh'; R9_ENTRY=scripts/check.sh ;;
+    bun_file) script='bun run scripts/check.ts'; R9_ENTRY=scripts/check.ts; R9_JS=1 ;;
+    plain) script='scripts/check.sh'; R9_ENTRY=scripts/check.sh ;;
+    cycle) script='npm run a'; extra='{"a":"npm run test"}' ;;
+    depth) script='npm run a'; extra='{"a":"npm run b","b":"npm run c","c":"npm run d","d":"npm run e","e":"npm run f","f":"bash check.sh"}' ;;
+  esac
+  mkdir -p "$WT/$(dirname "$R9_ENTRY")" "$WT/$package"
+  printf 'base\n' > "$WT/a.js"
+  if [ "$R9_JS" = 1 ]; then
+    printf 'const fs = require("fs"); const ok = fs.readFileSync("a.js", "utf8").includes("good"); console.log(ok ? "Tests: 1/1" : "Tests: 0/1"); process.exit(ok ? 0 : 1);\n' > "$WT/$R9_ENTRY"
+  else
+    printf '#!/usr/bin/env bash\nif grep -q good a.js; then echo "Tests: 1/1"; else echo "Tests: 0/1"; exit 1; fi\n' > "$WT/$R9_ENTRY"
+    chmod +x "$WT/$R9_ENTRY"
+  fi
+  printf 'echo lint\n' > "$WT/lint.sh"
+  python3 - "$WT/$package/package.json" "$script" "$extra" "$kind" <<'PY'
+import json, pathlib, sys
+path, script, extra, kind = sys.argv[1:]
+scripts = json.loads(extra)
+scripts['test:unit' if kind == 'named' else 'test'] = script
+pathlib.Path(path).write_text(json.dumps({'scripts': scripts}), encoding='ascii')
+PY
+  git -C "$WT" add a.js "$R9_ENTRY" lint.sh "$package/package.json"
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm base
+  git -C "$WT" branch run-base
+  printf 'bad build\n' > "$WT/a.js"
+  if [ "$kind" != product ]; then
+    if [ "$R9_JS" = 1 ]; then printf '// build changed entrypoint\n' >> "$WT/$R9_ENTRY"
+    else printf '# build changed entrypoint\n' >> "$WT/$R9_ENTRY"; fi
+  fi
+  git -C "$WT" add a.js "$R9_ENTRY"
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm build
+}
+for location in current stage; do
+  for kind in shell node direct named and pipe semicolon or bun yarn pnpm npm_recursive bun_recursive yarn_recursive pnpm_recursive cd script_cd npx bun_file plain product invalid missing unreadable cycle depth; do
+    echo "Round 9: $location/$kind"
+    fixture "r9-$location-$kind"
+    CURRENT="$WT"
+    if [ "$location" = stage ]; then fixture "r9-target-$kind"; fi
+    r9_build "$kind"
+    TARGET="$WT"
+    entry="$TARGET/$R9_ENTRY"
+    check test -f "$entry"
+    check test ! -L "$entry"
+    if [ "$kind" = invalid ]; then printf '{invalid\n' > "$TARGET/package.json"; fi
+    if [ "$kind" = missing ] || [ "$kind" = unreadable ]; then rm "$TARGET/package.json"; fi
+    # A directory produces an actual read error on Windows too (chmod does not).
+    if [ "$kind" = unreadable ]; then mkdir "$TARGET/package.json"; fi
+    WT="$CURRENT"; export ARTIFACTS_DIR="$WT/artifacts" BASE_BRANCH=run-base
+    printf '%s\n' "$R9_COMMAND" > "$ARTIFACTS_DIR/evidence/stop-tests.commands"
+    if [ "$location" = stage ]; then
+      export RST_STAGE_WORKTREES="b=$TARGET"
+      printf 'b\tthinmansoftware/other\t%s\trun-base\n' "$R9_COMMAND" > "$ARTIFACTS_DIR/evidence/stop-tests.stages"
+    fi
+    export FIX_SPEC='WO Class: CODE'
+    case "$kind" in
+      invalid|missing|unreadable|cycle|depth)
+        # Do not execute a cyclic script: snapshot must stop before any attempt.
+        printf 'TESTS_STATUS=failed\nTESTS_LINE=0/1 (%s)\n' "$R9_COMMAND" > "$ARTIFACTS_DIR/evidence/stop-tests.initial"
+        trg_snapshot_report "$WT" "$ARTIFACTS_DIR/evidence"
+        export FIX_INITIAL="$(cat "$ARTIFACTS_DIR/evidence/stop-tests.initial")"
+        check contains "$FIX_INITIAL" 'TESTS_STATUS=blocked'
+        check contains "$FIX_INITIAL" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+        check contains "$(run_node classify-test-result)" '"repairable":"false"'
+        check test ! -e "$ARTIFACTS_DIR/evidence/test-repair.attempts"
+        ;;
+      *)
+        export FIX_INITIAL="$(cd "$WT" && rst_execute_saved "$ARTIFACTS_DIR/evidence" CODE)"
+        check contains "$FIX_INITIAL" 'TESTS_STATUS=failed'
+        printf '%s\n' "$FIX_INITIAL" > "$ARTIFACTS_DIR/evidence/stop-tests.initial"
+        trg_snapshot_report "$WT" "$ARTIFACTS_DIR/evidence"
+        rst_save_core "$ARTIFACTS_DIR/evidence"
+        printf '1500\n' > "$ARTIFACTS_DIR/evidence/stop-tests.timeout"
+        printf 'CODE\n' > "$ARTIFACTS_DIR/evidence/stop-tests.class"
+        check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+        if [ "$kind" = product ]; then
+          printf 'good\n' > "$TARGET/a.js"
+          check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+        else
+          if [ "$R9_JS" = 1 ]; then printf 'console.log("Tests: 1/1");\n' > "$entry"
+          else printf '#!/usr/bin/env bash\necho "Tests: 1/1"\n' > "$entry"; fi
+          check test "$(cd "$TARGET" && bash -c "$R9_COMMAND" | rst_parse_counts)" = '1 1'
+          check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+        fi
+        (cd "$WT" && trg_attempt "$ARTIFACTS_DIR/evidence" CODE) >/dev/null
+        out="$(run_node run-stop-tests-final)"
+        if [ "$kind" = product ]; then
+          check contains "$out" 'TESTS_STATUS=passed'
+          check contains "$out" 'TESTS_REPAIR_RESULT=repaired'
+        else
+          check contains "$out" 'TESTS_STATUS=blocked'
+          check contains "$out" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+          check contains "$out" 'TESTS_REPAIR_RESULT=guard_violation'
+        fi
+        ;;
+    esac
+    unset RST_STAGE_WORKTREES BASE_BRANCH
+  done
+done
+unset npm_config_script_shell
 finish test-repair-guard.sh
