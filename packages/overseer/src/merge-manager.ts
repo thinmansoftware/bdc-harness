@@ -101,6 +101,8 @@ export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps 
    * Trace a PR-discovered (run-less) candidate to the run that opened it
    * (bdc-harness 5308). Absent keeps the run-less path unchanged; a rejection
    * fails closed with originating_run_unreadable.
+   * Production wiring is findOriginatingRunForPullRequest over listOriginatingRunCandidates
+   * (originating-run-lookup.ts), set in createRuntimeMergeManager.
    */
   readonly findOriginatingRun?: (
     input: OriginatingRunLookupInput
