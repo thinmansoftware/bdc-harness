@@ -8,7 +8,7 @@ directory_link() {
   python3 - "$1" "$2" <<'PY'
 import os, pathlib, sys
 path = pathlib.Path(sys.argv[1])
-os.symlink(sys.argv[2], path, target_is_directory=True)
+os.symlink(str(pathlib.Path(sys.argv[2])), path, target_is_directory=True)
 assert path.is_symlink() and path.is_dir()
 PY
 }
@@ -30,7 +30,7 @@ for location in current stage; do
   printf 'good build\n' > "$WT/packages/lib/value.js"
   git -C "$WT" add packages/lib/value.js
   git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm build
-  directory_link "$WT/node_modules/lib" ../packages/lib
+  check directory_link "$WT/node_modules/lib" ../packages/lib
   TARGET="$WT"; WT="$CURRENT"
   export ARTIFACTS_DIR="$WT/artifacts" BASE_BRANCH=run-base FIX_MAP=''
   export FIX_SPEC=$'WO Class: CODE\nStop 1 (test suite):\n  bash check.sh\nExpected: pass'
@@ -96,13 +96,19 @@ check trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 printf 'echo "Tests: 2/2"\n' > "$WT/node_modules/.bin/check.sh"
 check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 
+printf '{"scripts":{"test":"bash .bin/check.sh"}}\n' > "$WT/node_modules/package.json"
+printf 'cd node_modules && npm test\n' > "$ARTIFACTS_DIR/evidence/stop-tests.commands"
+check trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+printf 'changed\n' > "$WT/node_modules/package.json"
+check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+
 for command in 'node alias/check.js' 'npm test'; do
   fixture "directory-entry-$PASS"
   mkdir -p "$WT/packages/lib" "$WT/scripts/bin"
   chmod +x "$WT/scripts/bin"
   printf 'base\n' > "$WT/packages/lib/check.js"
-  directory_link "$WT/alias" packages/lib
-  directory_link "$WT/scripts/lib" ../packages/lib
+  check directory_link "$WT/alias" packages/lib
+  check directory_link "$WT/scripts/lib" ../packages/lib
   printf '{"scripts":{"test":"node alias/check.js"}}\n' > "$WT/package.json"
   git -C "$WT" add packages/lib/check.js package.json
   git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm base
@@ -124,7 +130,7 @@ done
 for name in product scripts; do
   fixture "outside-directory-$name"
   mkdir -p "$TMP/outside"
-  directory_link "$WT/$name" "$TMP/outside"
+  check directory_link "$WT/$name" "$TMP/outside"
   if [ "$name" = product ]; then
     check trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
   else
