@@ -64,8 +64,17 @@ or invalid required package.json blocks repair with
 `tests_failed_after_repair:guard`. Both regular entrypoints and symlink targets
 are removed from the product allowlist in the run and persisted stage worktrees.
 This resolves command strings only; it does not trace entrypoint file contents.
-Ignored paths obey the same freeze and new-file rules; an ignore pattern does
-not exempt new tests, runner configuration or marker-bearing helpers.
+Dependency and VCS trees are excluded from guard enumeration and classification:
+any path containing a node_modules, .git, .venv, venv, __pycache__, .bun or
+.pnpm-store segment, at any depth. This also excludes declared commands and
+package scripts inside those trees, including `bash node_modules/.bin/check.sh`.
+Other ignored paths obey the same freeze and new-file rules; an ignore pattern
+does not exempt new tests, runner configuration or marker-bearing helpers.
+Only regular files can be executable test infrastructure. Directory symlinks
+inside the worktree are not file entrypoints and are not frozen. A declared
+file outside the excluded trees reached through a directory link is frozen
+along with its resolved file target. External targets still block when the
+link is itself a declared entrypoint, test file or test-infrastructure path.
 
 When canonical stages are declared, their verify commands supersede Stop test
 blocks and the project-map command. Each stage executes in its declared worktree.
