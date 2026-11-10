@@ -2562,27 +2562,29 @@ nodes:
       declared = sys.argv[5+count:]
       markers = [r"\.skip\s*\(",r"\.only\s*\(",r"\bxit\s*\(",r"\bxdescribe\s*\(",r"\bit\.todo\b",r"\btest\.todo\b",r"@pytest\.mark\.skip",r"unittest\.skip"]
       before = {} if mode == "snapshot" else json.loads(pathlib.Path(snapshot).read_text())
+      touched = set()
       command_files = {}
-      for directory, command in zip(declared[::2],declared[1::2]):
-          root = pathlib.Path(directory).resolve()
-          cwd = root
+      def declared_paths(root, command, cwd=None):
+          cwd = root if cwd is None else cwd
           try:
               lexer = shlex.shlex(command,posix=True,punctuation_chars="&")
               lexer.whitespace_split = True
               lexer.commenters = ""
               tokens = list(lexer)
           except ValueError:
-              continue
+              return
           if len(tokens) >= 3 and tokens[0] == "cd" and tokens[2] == "&&":
-              cwd = (root/tokens[1]).resolve()
-              if not cwd.is_relative_to(root): continue
+              cwd = (cwd/tokens[1]).resolve()
+              if not cwd.is_relative_to(root): return
               tokens = tokens[3:]
           for token in tokens:
               if token.startswith("-") or token == "&&": continue
               if re.fullmatch(r"(?:ba|z|da|k)?sh|python(?:[0-9.]+)?|node(?:js)?|bunx?|npm|npx|pnpm|yarn|pytest",pathlib.Path(token).name): continue
-              path = cwd/token
-              if path.is_file() and path.resolve().is_relative_to(root):
+              path = pathlib.Path(os.path.abspath(cwd/token))
+              if (path.is_file() or path.is_symlink()) and path.is_relative_to(root):
                   command_files.setdefault(str(root),set()).add(path.relative_to(root).as_posix())
+      for directory, command in zip(declared[::2],declared[1::2]):
+          declared_paths(pathlib.Path(directory).resolve(),command)
       def git_paths(root,*args):
           return {os.fsdecode(name) for name in subprocess.check_output(["git",*args],cwd=root).split(b"\x00") if name}
       def test_file(name):
@@ -2611,19 +2613,75 @@ nodes:
       def digest(path):
           raw = content(path)
           return hashlib.sha256(raw).hexdigest() if raw is not None else None
+      def executable(path):
+          # Git's index preserves executable mode on hosts without POSIX chmod.
+          return path.relative_to(root).as_posix() in executable_index or (path.exists() and bool(path.stat().st_mode & 0o111))
+      def infrastructure(root,name):
+          parts = pathlib.PurePosixPath(name).parts
+          return (always_frozen(name) or name in command_files.get(str(root),set())
+                  or pathlib.PurePosixPath(name).suffix.lower() in {".sh",".bash",".ps1"}
+                  or any(part in {"scripts","test","tests","__tests__","spec","specs",".circleci",".buildkite"} for part in parts)
+                  or any(fnmatch.fnmatchcase(parts[-1],pattern) for pattern in [".gitlab-ci.*",".travis.yml","Jenkinsfile","azure-pipelines.*",".mocharc*",".nycrc*",".taprc*",".coveragerc","karma.conf.*","cypress.config.*","ava.config.*","test.config.*","runner.config.*","phpunit.xml*"])
+                  or executable(root/name))
+      def fingerprint(path):
+          return [digest(path),executable(path)] if path.exists() or path.is_symlink() else None
       now = {}
       for directory in sorted(roots.keys() | before.keys()):
           root = pathlib.Path(directory)
+          if mode == "report" and not root.is_dir():
+              touched.update(before.get(directory,{}).get("infrastructure",{}))
+              continue
           if not root.is_dir(): sys.exit("test guard: missing stage directory: "+directory)
-          tracked = git_paths(root,"ls-files","-z","--cached")
+          index = git_paths(root,"ls-files","--stage","-z")
+          tracked = {entry.split("\t",1)[1] for entry in index}
+          executable_index = {entry.split("\t",1)[1] for entry in index if entry.startswith("100755 ")}
           files = tracked | git_paths(root,"ls-files","-z","--others") | command_files.get(directory,set())
           if mode == "snapshot":
-              allowed = allowed_paths(root,roots[directory]) - command_files.get(directory,set())
-              frozen = (tracked - allowed) | {name for name in files if always_frozen(name)} | command_files.get(directory,set())
-              now[directory] = dict(allowed=sorted(allowed),known=sorted(files),frozen={name:digest(root/name) for name in sorted(frozen)})
+              links = {}
+              def freeze_link(name):
+                  path = root/name
+                  if not path.is_symlink(): return
+                  try:
+                      target = path.resolve(strict=True)
+                      if not target.is_relative_to(root) or not target.is_file(): raise ValueError("outside worktree or not a file")
+                  except (OSError,RuntimeError,ValueError) as error:
+                      print("test guard: unresolved or outside symlink: "+str(path)+": "+str(error),file=sys.stderr)
+                      sys.exit(42)
+                  links[name] = target.relative_to(root).as_posix()
+              build_allowed = allowed_paths(root,roots[directory])
+              fixed_paths = tracked - build_allowed
+              for name in files:
+                  if name in fixed_paths or always_frozen(name) or name in command_files.get(directory,set()): freeze_link(name)
+              declared_set = set(command_files.get(directory,set()))
+              # Inspect package test entries, without tracing any called/sourced helpers.
+              for name in files:
+                  if pathlib.PurePosixPath(name).name != "package.json": continue
+                  try:
+                      command = json.loads((root/name).read_text()).get("scripts",{}).get("test","")
+                      if isinstance(command,str): declared_paths(root,command,(root/name).parent)
+                  except (OSError,ValueError,AttributeError): pass
+              for name in command_files.get(directory,set()) - declared_set:
+                  if (root/name).is_symlink():
+                      freeze_link(name)
+                      declared_set.add(name)
+              command_files[directory] = declared_set
+              targets = set(links.values())
+              allowed = build_allowed - declared_set - targets
+              frozen = (tracked - allowed) | {name for name in files if always_frozen(name)} | declared_set | targets
+              now[directory] = dict(allowed=sorted(allowed),known=sorted(files),links=links,frozen={name:digest(root/name) for name in sorted(frozen)},infrastructure={name:fingerprint(root/name) for name in sorted(files | targets) if infrastructure(root,name)})
               continue
           if directory not in before: sys.exit("test guard: unsnapshotted stage directory: "+directory)
           saved = before[directory]
+          if mode == "report":
+              previous = saved.get("infrastructure",{})
+              candidates = set(previous) | {name for name in files if infrastructure(root,name)}
+              touched.update(name for name in candidates if fingerprint(root/name) != previous.get(name))
+              continue
+          for name, target in saved.get("links",{}).items():
+              try:
+                  if (root/name).resolve(strict=True) != root/target: raise ValueError("repointed")
+              except (OSError,RuntimeError,ValueError):
+                  sys.exit("test guard: changed or deleted symlink target: "+directory+"/"+name)
           for name, sha in saved["frozen"].items():
               if digest(root/name) != sha: sys.exit("test guard: changed or deleted frozen file: "+directory+"/"+name)
           for name in files - set(saved["known"]):
@@ -2634,10 +2692,29 @@ nodes:
                   sys.exit("test guard: skip/only/todo in new file: "+directory+"/"+name)
       if mode == "snapshot":
           pathlib.Path(snapshot).write_text(json.dumps(now,sort_keys=True),encoding="ascii")
+      if mode == "report":
+          sys.stdout.reconfigure(newline="\n")
+          print("Repair touched test infrastructure" if touched else "Repair touched test infrastructure: none")
+          for name in sorted(touched): print(name)
       TRG_PY
       }
       trg_snapshot() { trg_guard snapshot "$1" "$2"; }
       trg_check() { trg_guard check "$1" "$2"; }
+      trg_infrastructure() { trg_guard report "$1" "$2"; }
+      # Snapshot failures block repair before the classifier can admit an attempt.
+      trg_snapshot_report() {
+        local previous result
+        if trg_snapshot "$1" "$2/test-guard.json"; then return 0; else result=$?; fi
+        : > "$2/test-repair.guard"
+        previous="$(cat "$2/stop-tests.initial")"
+        # A known symlink violation (42) takes precedence. An unavailable guard
+        # tool must not replace an already non-repairable environment reason.
+        if [ "$result" -ne 42 ] && printf '%s\n' "$previous" | grep -E '^TESTS_STATUS=(blocked|env_unavailable)$' >/dev/null; then return 0; fi
+        {
+          printf '%s\n' "$previous" | grep -vE '^TESTS_(STATUS|BLOCKED_REASON|LINE)=' || true
+          printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=tests_failed_after_repair:guard\nTESTS_LINE=BLOCKED (tests_failed_after_repair:guard)\n'
+        } > "$2/stop-tests.initial"
+      }
       # A guard violation returns success to END the loop; final evidence stays BLOCKED.
       trg_attempt() {
         local e="$1" class="$2" n
@@ -2739,8 +2816,9 @@ nodes:
       if [ -s "$EVIDENCE_DIR/stop-tests.stages" ]; then
         printf 'canonical stages: Stop test-suite blocks and project-map command superseded\n' | tee -a "$LOG"
         cut -f3 "$EVIDENCE_DIR/stop-tests.stages" > "$CMDS"
-        rst_execute_saved "$EVIDENCE_DIR" "$CLASS" | tee "$EVIDENCE_DIR/stop-tests.initial"
-        trg_snapshot "$(pwd)" "$EVIDENCE_DIR/test-guard.json"
+        rst_execute_saved "$EVIDENCE_DIR" "$CLASS" > "$EVIDENCE_DIR/stop-tests.initial"
+        trg_snapshot_report "$(pwd)" "$EVIDENCE_DIR"
+        cat "$EVIDENCE_DIR/stop-tests.initial"
         exit 0
       fi
       SELECTED_SOURCE="spec_declared"
@@ -2823,8 +2901,9 @@ nodes:
         if [ "$REPORT_SOURCE" = "spec_declared" ]; then REPORT_SOURCE="wo-spec"; fi
         rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$TESTS_ENV_REASON" "$LOG" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
       fi > "$EVIDENCE_DIR/stop-tests.report"
-      stb_report_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS" | tee "$EVIDENCE_DIR/stop-tests.initial"
-      trg_snapshot "$(pwd)" "$EVIDENCE_DIR/test-guard.json"
+      stb_report_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS" > "$EVIDENCE_DIR/stop-tests.initial"
+      trg_snapshot_report "$(pwd)" "$EVIDENCE_DIR"
+      cat "$EVIDENCE_DIR/stop-tests.initial"
       grep '^TESTS_COMMAND_RESULT=' "$LOG" || true
       echo "TESTS_LOG=$LOG"
       if [ -s "$LOG" ]; then
@@ -2874,6 +2953,9 @@ nodes:
         Every other tracked file is frozen. Tests, declared test scripts,
         package.json, lockfiles, bunfig.toml, runner configs, Makefile,
         tsconfig* and .github paths are always frozen, even in the build diff.
+        Resolved in-worktree symlink targets of test entrypoints are frozen too.
+        Called/sourced build-changed helpers are an accepted residual; any test
+        infrastructure touched by repair is listed for review.
         Never add test files or skip/only/todo markers. Never emit
         __NEVER_EMIT_USE_UNTIL_BASH__. The deterministic rerun and allowlist guard
         are the only completion authority, with at most two attempts.
@@ -2907,13 +2989,15 @@ nodes:
       EVIDENCE_DIR="$ARTIFACTS_DIR/evidence"
       INITIAL=$run-stop-tests.output
       ATTEMPTS="$(cat "$EVIDENCE_DIR/test-repair.attempts" 2>/dev/null || echo 0)"
+      printf 'Repair touched test infrastructure: none\n' > "$EVIDENCE_DIR/test-repair.infrastructure"
       if [ "$ATTEMPTS" = 0 ]; then
-        printf '%s\nTESTS_REPAIR_ATTEMPTS=0\n' "$INITIAL" | tee "$EVIDENCE_DIR/stop-tests.final"
+        { printf '%s\nTESTS_REPAIR_ATTEMPTS=0\n' "$INITIAL"; cat "$EVIDENCE_DIR/test-repair.infrastructure"; } | tee "$EVIDENCE_DIR/stop-tests.final"
         exit 0
       fi
       . "$EVIDENCE_DIR/stop-tests.core.sh"
       export RST_TIMEOUT_SECONDS="$(cat "$EVIDENCE_DIR/stop-tests.timeout")"
       rst_execute_saved "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")" > "$EVIDENCE_DIR/stop-tests.final-raw"
+      trg_infrastructure "$(pwd)" "$EVIDENCE_DIR/test-guard.json" > "$EVIDENCE_DIR/test-repair.infrastructure"
       RESULT=repaired
       REASON=""
       if grep -q '^TESTS_STATUS=env_unavailable$' "$EVIDENCE_DIR/stop-tests.final-raw"; then
@@ -2929,6 +3013,7 @@ nodes:
           printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=%s\n' "$REASON"
         else cat "$EVIDENCE_DIR/stop-tests.final-raw"; fi
         printf 'TESTS_REPAIR_ATTEMPTS=%s\nTESTS_REPAIR_RESULT=%s\n' "$ATTEMPTS" "$RESULT"
+        cat "$EVIDENCE_DIR/test-repair.infrastructure"
       } | tee "$EVIDENCE_DIR/stop-tests.final"
 
   - id: tests-blocked-report
@@ -6190,10 +6275,24 @@ nodes:
         gh label create run:blocked --repo "$repo" --color B60205 --description "Run ended non-PROCEED: the PR is not lane-verified" >/dev/null 2>&1 || true
         body="$(gh pr view "$url" --repo "$repo" --json body --jq '.body' 2>/dev/null || true)"
         tmp="$(mktemp)"
-        case "$body" in
-          "$banner"*) printf '%s\n' "$body" > "$tmp" ;;
-          *) printf '%s\n\n%s\n' "$banner" "$body" > "$tmp" ;;
-        esac
+        body="$(printf '%s\n' "$body" | awk '
+          /^<!-- bdc-repair-infrastructure-start -->$/ {omit=1; next}
+          /^<!-- bdc-repair-infrastructure-end -->$/ {omit=0; next}
+          !omit {print}
+        ')"
+        {
+          case "$body" in
+            "$banner"*) printf '%s\n' "$body" ;;
+            *) printf '%s\n\n%s\n' "$banner" "$body" ;;
+          esac
+          printf '\n<!-- bdc-repair-infrastructure-start -->\n'
+          if [ -s "${ARTIFACTS_DIR:-.}/evidence/test-repair.infrastructure" ]; then
+            cat "${ARTIFACTS_DIR:-.}/evidence/test-repair.infrastructure"
+          else
+            printf 'Repair touched test infrastructure: none\n'
+          fi
+          printf '<!-- bdc-repair-infrastructure-end -->\n'
+        } > "$tmp"
         if gh pr edit "$url" --repo "$repo" --add-label run:blocked --body-file "$tmp" >/dev/null 2>&1; then
           echo "pbb: $url labelled run:blocked with the RUN BLOCKED banner (status=$status)"
         else
@@ -6389,6 +6488,11 @@ nodes:
         echo ""
         echo "<!-- bdc-manifest-start -->"
         printf '%s\n' "$MANIFEST_BLOCK"
+        if [ -s "${ARTIFACTS_DIR:-.}/evidence/test-repair.infrastructure" ]; then
+          cat "${ARTIFACTS_DIR:-.}/evidence/test-repair.infrastructure"
+        else
+          printf 'Repair touched test infrastructure: none\n'
+        fi
         echo "<!-- bdc-manifest-end -->"
       } > "$BODY_FILE"
 

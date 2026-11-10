@@ -64,6 +64,23 @@ may be below 60; positive values above 1700 are capped at 1700.
 
 ## Invoke the replay lane
 
+The guard also freezes the resolved in-worktree targets of symlinked declared
+scripts, test files and package test entries. A missing target or a target outside
+its worktree blocks repair with `tests_failed_after_repair:guard`. Repointing the
+link, editing the resolved target or deleting it is a frozen-file violation in
+both the run worktree and persisted stage worktrees.
+The same target freeze applies to symlinks elsewhere in the frozen-file set.
+
+The guard does not trace helpers called or sourced by a frozen entrypoint. A
+build-changed helper may remain in the product allowlist; this is the round-8
+accepted residual. Final run output and the PR's stamped manifest section list
+repair changes to shell scripts, test/runner configuration, CI files, scripts or
+test directories, declared command files and executable files under
+`Repair touched test infrastructure`, one path per line. Product-only repairs
+and runs without repair print `Repair touched test infrastructure: none`.
+The shared guard core computes this disclosure against the snapshot, including
+new files and stage worktrees. It does not change the test verdict.
+
 After merge and an operator-authorized runtime rebuild, from the serving checkout:
 
 ```bash
