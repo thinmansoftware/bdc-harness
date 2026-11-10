@@ -657,4 +657,23 @@ for change in helper product no_repair; do
   fi
   unset BASE_BRANCH
 done
+# The governing boundary also includes symlinks in the always-frozen set and
+# tracked paths outside the build allowlist. Neither is execution tracing.
+for name in bunfig.toml frozen-alias.txt; do
+  fixture "r8-frozen-alias-$name"
+  printf 'base\n' > "$WT/a.js"
+  link_file "$WT" "$name" a.js
+  git -C "$WT" add a.js "$name"
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm base
+  git -C "$WT" branch run-base
+  printf 'build\n' > "$WT/a.js"
+  git -C "$WT" add a.js
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm build
+  export BASE_BRANCH=run-base
+  trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  printf 'repair\n' > "$WT/a.js"
+  check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  unset BASE_BRANCH
+done
 finish test-repair-guard.sh
