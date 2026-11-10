@@ -54,7 +54,15 @@ import {
   usefulRateFloorBreached,
 } from './rules';
 import { dutyOfficerClockEnabled } from '../dispatch/duty-officer-clock';
-import { validateProposal, WO_ID_RE, type TmAllowedRecipient } from './guard';
+import {
+  escalationReason,
+  planEscalateDelivery,
+  resolveEscalateP0CooldownMs,
+  validateProposal,
+  WO_ID_RE,
+  type EscalateJournalRow,
+  type TmAllowedRecipient,
+} from './guard';
 import {
   buildEscalationCommentBody,
   createDbEscalationDeliveryClaim,
@@ -2047,6 +2055,40 @@ export async function refreshAdoption(
 
 let tickQueue: Promise<void> = Promise.resolve();
 
+function escalateP0ReasonKey(threadRef: string, proposal: unknown): string {
+  return `${canonicalizeThreadRef(threadRef)}\0${escalationReason(proposal, threadRef)}`;
+}
+
+/**
+ * Any same-reason journal row inside the cooldown blocks another send.
+ * A failed or expired attempt must not be re-proposed every tick; only a
+ * different reason, or a row older than the cooldown, may send.
+ */
+function escalateReasonBlocked(
+  rows: readonly EscalateJournalRow[],
+  threadRef: string,
+  reason: string,
+  nowMs: number,
+  cooldownMs: number
+): boolean {
+  const canonical = canonicalizeThreadRef(threadRef);
+  for (const row of rows) {
+    if (row.action_type !== 'escalate_p0') continue;
+    if (canonicalizeThreadRef(row.thread_ref) !== canonical) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.proposal_json);
+    } catch {
+      parsed = undefined;
+    }
+    if (escalationReason(parsed, row.thread_ref) !== reason) continue;
+    const atMs = Date.parse(row.created_at);
+    if (!Number.isFinite(atMs)) continue;
+    if (nowMs - atMs < cooldownMs) return true;
+  }
+  return false;
+}
+
 export function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
   const result = tickQueue.then(() => runTick(state, deps));
   tickQueue = result.then(
@@ -2176,7 +2218,12 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   }
 
   // 4. Journal lookback: dedupe set + per-item 24h intervention counts.
-  const lookback = await dal.getActionsSince(new Date(nowMs - JOURNAL_LOOKBACK_MS).toISOString());
+  // The escalate_p0 scan uses the same configured cooldown as the decision.
+  // A longer cooldown must still see the prior sent row; the 7-day lookback
+  // stays the floor for every other journal consumer.
+  const escalateCooldownMs = resolveEscalateP0CooldownMs();
+  const journalWindowMs = Math.max(JOURNAL_LOOKBACK_MS, escalateCooldownMs);
+  const lookback = await dal.getActionsSince(new Date(nowMs - journalWindowMs).toISOString());
   const actionsByKey = new Map<string, taskmasterDb.TmJournalEntry>();
   const interventions24hByThread = new Map<string, number>();
   // Most recent 'sent' blocker_report per canonical ref (72h cooldown input).
@@ -2205,16 +2252,21 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     }
   }
   const actions24h = lookback.filter(a => Date.parse(a.created_at) >= since24h);
-  // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: ANY escalate_p0 journal action in
-  // the trailing 24h (sent, failed, rejected, expired...) counts, so a failed
-  // delivery is not re-proposed on every tick. Before this, only 'sent' and
-  // suppressed expiries were remembered and failed rows re-proposed on each
-  // 30-minute bucket (5,319 failed rows over 30 issues in 7 days, board evidence 2026-11-01).
-  const recentEscalateP0ByThread = new Set(
-    actions24h
-      .filter(action => action.action_type === 'escalate_p0')
-      .map(action => canonicalizeThreadRef(action.thread_ref))
-  );
+  // Per (thread, reason) cooldown for escalate_p0. Only a sent row inside
+  // escalateCooldownMs suppresses; failed and pending rows do not. Rows
+  // journaled earlier in this tick are not in `lookback` yet, so
+  // handledEscalateP0Reasons closes that gap without a second send.
+  const escalateJournalRows: EscalateJournalRow[] = lookback
+    .filter(action => action.action_type === 'escalate_p0')
+    .map(action => ({
+      thread_ref: action.thread_ref,
+      action_type: action.action_type,
+      proposal_json: action.proposal_json,
+      idempotency_key: action.idempotency_key,
+      outcome: action.outcome,
+      created_at: action.created_at,
+    }));
+  const handledEscalateP0Reasons = new Set<string>();
   try {
     if (deps.refreshLaneHealth) await deps.refreshLaneHealth();
     else if (!deps.db) await refreshLaneHealth();
@@ -2678,14 +2730,70 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
     // stable journal key under the original deadline instead of blocking resume.
     if (
       proposal.type === 'escalate_p0' &&
-      recentEscalateP0ByThread.has(canonicalProposalRef) &&
       !(
         proposal.remediationCandidateId &&
         existingAction &&
         ['failed', 'deferred'].includes(existingAction.outcome)
       )
     ) {
-      continue;
+      const reasonKey = escalateP0ReasonKey(proposal.threadRef, proposal);
+      // A failed or deferred row for this key must not look terminal. The
+      // cooldown decision below either retries it or leaves it untouched.
+      const rowsForPlan = escalateJournalRows.filter(
+        row =>
+          row.idempotency_key !== proposal.idempotencyKey ||
+          (row.outcome !== 'failed' && row.outcome !== 'deferred')
+      );
+      let plan = planEscalateDelivery({
+        rows: rowsForPlan,
+        threadRef: proposal.threadRef,
+        reason: escalationReason(proposal, proposal.threadRef),
+        idempotencyKey: proposal.idempotencyKey,
+        nowMs,
+        cooldownMs: escalateCooldownMs,
+      });
+      if (plan === 'send' && handledEscalateP0Reasons.has(reasonKey)) plan = 'suppress';
+      if (
+        plan === 'send' &&
+        escalateReasonBlocked(
+          escalateJournalRows,
+          proposal.threadRef,
+          escalationReason(proposal, proposal.threadRef),
+          nowMs,
+          escalateCooldownMs
+        )
+      ) {
+        plan = 'suppress';
+      }
+      // wait: another key for this thread and reason is still being delivered.
+      // skip: this key is already terminal. Neither path rewrites that row.
+      if (plan === 'wait' || plan === 'skip') continue;
+      if (plan === 'suppress') {
+        // A new idempotency key inside the cooldown is journaled expired.
+        // The same key, and any pending/sent/failed row, is left as it is.
+        if (!actionsByKey.has(proposal.idempotencyKey)) {
+          const proposalJson = JSON.stringify({ ...proposal, suppressed: 'cooldown' });
+          const recorded = await dal.recordAction({
+            thread_ref: proposal.threadRef,
+            action_type: proposal.type,
+            proposal_json: proposalJson,
+            idempotency_key: proposal.idempotencyKey,
+            before_hash: sha256(proposal.body),
+            outcome: 'expired',
+          });
+          const ownedByDelivery =
+            recorded.outcome === 'pending' ||
+            recorded.outcome === 'sent' ||
+            recorded.outcome === 'failed';
+          if (!ownedByDelivery && recorded.outcome !== 'expired') {
+            await dal.updateActionOutcome(recorded.id, 'expired', proposalJson);
+          }
+          if (!ownedByDelivery) result.expired += 1;
+          actionsByKey.set(proposal.idempotencyKey, recorded);
+        }
+        handledEscalateP0Reasons.add(reasonKey);
+        continue;
+      }
     }
     if (existingAction && ['failed', 'deferred'].includes(existingAction.outcome)) {
       const deadlineMs = existingAction.proof_deadline_at
@@ -2958,7 +3066,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             JSON.stringify({ ...proposal, suppressed })
           );
           journalRow.outcome = 'expired';
-          recentEscalateP0ByThread.add(canonicalProposalRef);
+          handledEscalateP0Reasons.add(escalateP0ReasonKey(proposal.threadRef, proposal));
           result.expired += 1;
           log.info(
             {
@@ -3187,7 +3295,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       }
       journalRow.outcome = 'sent';
       if (proposal.type === 'escalate_p0') {
-        recentEscalateP0ByThread.add(canonicalProposalRef);
+        handledEscalateP0Reasons.add(escalateP0ReasonKey(proposal.threadRef, proposal));
       }
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
@@ -3236,7 +3344,9 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             : undefined
       );
       journalRow.outcome = 'failed';
-      if (proposal.type === 'escalate_p0') recentEscalateP0ByThread.add(canonicalProposalRef);
+      if (proposal.type === 'escalate_p0') {
+        handledEscalateP0Reasons.add(escalateP0ReasonKey(proposal.threadRef, proposal));
+      }
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');
       if (dispatchSendRejected) {

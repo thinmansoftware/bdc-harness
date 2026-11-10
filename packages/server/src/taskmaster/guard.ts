@@ -334,6 +334,12 @@ export function validateForbiddenActionContent(body: string): GuardResult {
 
 export {
   decideEscalateP0,
+  escalateP0CutoffIso,
   escalationReason,
+  planEscalateDelivery,
+  resolveEscalateP0CooldownMs,
   DEFAULT_ESCALATE_P0_COOLDOWN_MS,
+  ESCALATE_CLAIM_IN_FLIGHT_MS,
+  ESCALATE_P0_COOLDOWN_ENV,
 } from './escalation-dedupe';
+export type { EscalateJournalRow } from './escalation-dedupe';

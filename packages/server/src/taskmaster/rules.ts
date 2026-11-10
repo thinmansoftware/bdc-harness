@@ -27,7 +27,7 @@ import { T3_DESKTOP_RECIPIENT } from '@archon/core/db/dispatch-routing';
 import type { TmAdoptionRow } from '@archon/core/db/taskmaster';
 import type { RemediationCandidateBody } from '@archon/overseer/remediation-candidate';
 import type { FireEligibilityEvidence } from './fire-eligibility';
-import { WO_ID_RE } from './guard';
+import { escalationReason, WO_ID_RE } from './guard';
 import type { FireLane } from './lane-budget';
 import { canonicalizeThreadRef } from './thread-ref';
 
@@ -435,17 +435,25 @@ export function computeNextAction(
       adoption?.last_movement_at ?? thread.lastActivityAt,
       context.nowMs
     );
-    return {
-      type: 'escalate_p0',
+    const body =
+      `Unclaimed P0: ${titleNote} [${thread.priority}] has no owner. ${age}. ` +
+      "This is an escalation for John's attention; no automated assignment " +
+      'is made (Slice 1 has no assignment authority).' +
+      (adoption ? ` ${adoptionIssueUrl(adoption)}` : '');
+    const proposal = {
+      type: 'escalate_p0' as const,
       threadRef: thread.ref,
       recipient: T3_DESKTOP_RECIPIENT,
-      body:
-        `Unclaimed P0: ${titleNote} [${thread.priority}] has no owner. ${age}. ` +
-        "This is an escalation for John's attention; no automated assignment " +
-        'is made (Slice 1 has no assignment authority).' +
-        (adoption ? ` ${adoptionIssueUrl(adoption)}` : ''),
-      idempotencyKey: `tm:escalate_p0:${thread.ref}:${bucket}`,
-      actsImmediately: true,
+      body,
+      idempotencyKey: '',
+      actsImmediately: true as const,
+    };
+    // The bucket alone collapses every reason on this thread into one row.
+    // A probe (or any other reason) needs its own key or the idempotency
+    // skip drops it before the cooldown can tell the reasons apart.
+    return {
+      ...proposal,
+      idempotencyKey: `tm:escalate_p0:${thread.ref}:${escalationReason(proposal, thread.ref)}:${bucket}`,
     };
   }
 

@@ -1,3 +1,5 @@
+import { randomUUID } from 'crypto';
+import { getDatabase } from '@archon/core/db/connection';
 import { getWorker, type DispatchWorker } from '@archon/core/db/dispatch';
 import {
   getActionsSince,
@@ -15,9 +17,11 @@ import {
 } from './duty-officer-clock';
 import { sendCanaryTelegramAlert } from '../services/canary-telegram-alert';
 import {
-  decideEscalateP0,
-  DEFAULT_ESCALATE_P0_COOLDOWN_MS,
+  escalateP0CutoffIso,
   escalationReason,
+  planEscalateDelivery,
+  resolveEscalateP0CooldownMs,
+  type EscalateJournalRow,
 } from '../taskmaster/guard';
 
 const log = createLogger('dispatch/worker-heartbeat-alarm');
@@ -72,7 +76,28 @@ export interface WorkerHeartbeatAlarmJournal {
    * keeps its hourly idempotency key and does not apply the cooldown.
    */
   listActions?: (threadRef: string) => Promise<WorkerHeartbeatEscalationRow[]>;
+  /**
+   * Cross-process cooldown claim. The read of sent/pending rows and the insert
+   * of this attempt commit in one writer transaction. pageOnce sends only after
+   * that claim returns disposition 'send'.
+   */
+  commitCooldownDecision?: (input: EscalateClaimInput) => Promise<EscalateClaimDisposition>;
 }
+
+export interface EscalateClaimInput {
+  threadRef: string;
+  reason: string;
+  idempotencyKey: string;
+  proposal: unknown;
+  nowMs: number;
+  cooldownMs: number;
+}
+
+export type EscalateClaimDisposition =
+  | { disposition: 'send'; id: string }
+  | { disposition: 'suppressed' }
+  | { disposition: 'wait' }
+  | { disposition: 'skip' };
 
 export interface WorkerHeartbeatAlarmDeps {
   getWorker: (workerId: string) => Promise<DispatchWorker | null>;
@@ -310,10 +335,8 @@ export function createRealWorkerHeartbeatAlarmDeps(): WorkerHeartbeatAlarmDeps {
       recordAction,
       updateActionOutcome,
       listActions: (threadRef: string): Promise<WorkerHeartbeatEscalationRow[]> =>
-        getActionsSince(
-          new Date(Date.now() - DEFAULT_ESCALATE_P0_COOLDOWN_MS).toISOString(),
-          threadRef
-        ),
+        getActionsSince(escalateP0CutoffIso(Date.now()), threadRef),
+      commitCooldownDecision: input => commitCooldownDecisionAtomic(input),
     },
   };
 }
@@ -363,33 +386,184 @@ function proposalJsonWithCooldown(proposal: unknown): string {
   return JSON.stringify({ suppressed: 'cooldown' });
 }
 
-/**
- * Latest created_at among sent escalate_p0 rows with the same reason.
- * Invalid JSON and unparseable timestamps are skipped. failed and pending
- * rows do not start a cooldown.
- */
-function latestMatchingSentAtMs(
-  rows: readonly WorkerHeartbeatEscalationRow[],
-  threadRef: string,
-  reason: string
-): number | null {
-  let latest: number | null = null;
-  for (const row of rows) {
-    if (row.thread_ref !== threadRef) continue;
-    if (row.action_type !== 'escalate_p0') continue;
-    if (row.outcome !== 'sent') continue;
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(row.proposal_json);
-    } catch {
-      continue;
-    }
-    if (escalationReason(parsed, row.thread_ref) !== reason) continue;
-    const sentAtMs = Date.parse(row.created_at);
-    if (!Number.isFinite(sentAtMs)) continue;
-    if (latest === null || sentAtMs > latest) latest = sentAtMs;
+interface JournalIdRow {
+  id: string;
+  outcome: TmActionOutcome;
+}
+
+type JournalQuery = (sql: string, params?: unknown[]) => Promise<{ rows: readonly JournalIdRow[] }>;
+
+/** Postgres serializes cooldown claims; SQLite uses BEGIN IMMEDIATE instead. */
+const ESCALATE_COOLDOWN_ADVISORY_LOCK = 88145001;
+
+const escalateLocks = new Map<string, Promise<void>>();
+
+async function withEscalateLock(key: string, fn: () => Promise<void>): Promise<void> {
+  const previous = escalateLocks.get(key) ?? Promise.resolve();
+  let release: (() => void) | undefined;
+  const current = new Promise<void>(resolve => {
+    release = resolve;
+  });
+  const tail = previous.then(
+    () => current,
+    () => current
+  );
+  escalateLocks.set(key, tail);
+  await previous.then(
+    () => undefined,
+    () => undefined
+  );
+  try {
+    await fn();
+  } finally {
+    if (release) release();
+    if (escalateLocks.get(key) === tail) escalateLocks.delete(key);
   }
-  return latest;
+}
+
+async function insertJournalRow(
+  query: JournalQuery,
+  data: {
+    thread_ref: string;
+    action_type: TmActionType;
+    proposal_json: string;
+    idempotency_key: string;
+    outcome: TmActionOutcome;
+  },
+  nowMs: number
+): Promise<{ id: string; outcome: TmActionOutcome }> {
+  const inserted = await query(
+    `INSERT INTO tm_journal
+     (id, created_at, thread_ref, action_type, proposal_json, idempotency_key,
+      before_hash, proof_predicate, proof_deadline_at, outcome)
+     SELECT $1, $2, $3, $4, $5, $6, NULL, NULL, NULL, $7
+     WHERE NOT EXISTS (SELECT 1 FROM tm_journal WHERE idempotency_key = $6)
+     RETURNING id, outcome`,
+    [
+      randomUUID(),
+      new Date(nowMs).toISOString(),
+      data.thread_ref,
+      data.action_type,
+      data.proposal_json,
+      data.idempotency_key,
+      data.outcome,
+    ]
+  );
+  const created = inserted.rows[0];
+  if (created) return { id: created.id, outcome: created.outcome };
+  const existing = await query(
+    'SELECT id, outcome FROM tm_journal WHERE idempotency_key = $1 ORDER BY created_at ASC LIMIT 1',
+    [data.idempotency_key]
+  );
+  const found = existing.rows[0];
+  if (!found) throw new Error('worker_heartbeat_page_journal_missing');
+  return { id: found.id, outcome: found.outcome };
+}
+
+/**
+ * Journal a cooldown suppression. A pending, sent, or failed row already
+ * belongs to a delivery or a retry, so it is left unchanged.
+ */
+async function journalCooldownSuppression(
+  journal: Pick<WorkerHeartbeatAlarmJournal, 'recordAction' | 'updateActionOutcome'>,
+  input: EscalateClaimInput
+): Promise<void> {
+  const proposalJson = proposalJsonWithCooldown(input.proposal);
+  const row = await journal.recordAction({
+    thread_ref: input.threadRef,
+    action_type: 'escalate_p0',
+    proposal_json: proposalJson,
+    idempotency_key: input.idempotencyKey,
+    outcome: 'expired',
+  });
+  if (
+    row.outcome === 'pending' ||
+    row.outcome === 'sent' ||
+    row.outcome === 'failed' ||
+    row.outcome === 'expired'
+  ) {
+    return;
+  }
+  await journal.updateActionOutcome(row.id, 'expired', proposalJson);
+}
+
+async function finishEscalateClaim(
+  journal: Pick<WorkerHeartbeatAlarmJournal, 'recordAction' | 'updateActionOutcome'>,
+  rows: readonly EscalateJournalRow[],
+  input: EscalateClaimInput
+): Promise<EscalateClaimDisposition> {
+  const plan = planEscalateDelivery({
+    rows,
+    threadRef: input.threadRef,
+    reason: input.reason,
+    idempotencyKey: input.idempotencyKey,
+    nowMs: input.nowMs,
+    cooldownMs: input.cooldownMs,
+  });
+  if (plan === 'wait') return { disposition: 'wait' };
+  if (plan === 'skip') return { disposition: 'skip' };
+  if (plan === 'suppress') {
+    await journalCooldownSuppression(journal, input);
+    return { disposition: 'suppressed' };
+  }
+  const entry = await journal.recordAction({
+    thread_ref: input.threadRef,
+    action_type: 'escalate_p0',
+    proposal_json: JSON.stringify(input.proposal),
+    idempotency_key: input.idempotencyKey,
+    outcome: 'pending',
+  });
+  if (entry.outcome === 'pending' || entry.outcome === 'failed') {
+    return { disposition: 'send', id: entry.id };
+  }
+  return { disposition: 'skip' };
+}
+
+/**
+ * Read the cooldown window and insert this attempt in one writer transaction.
+ * A second process cannot also observe "no sent row" and insert a sendable claim.
+ */
+async function commitCooldownDecisionAtomic(
+  input: EscalateClaimInput
+): Promise<EscalateClaimDisposition> {
+  const db = getDatabase();
+  const sinceIso = escalateP0CutoffIso(input.nowMs, input.cooldownMs);
+  return db.withTransaction(
+    async query => {
+      if (db.dialect === 'postgres') {
+        await query('SELECT pg_advisory_xact_lock($1)', [ESCALATE_COOLDOWN_ADVISORY_LOCK]);
+      }
+      const selected = await query<WorkerHeartbeatEscalationRow>(
+        `SELECT id, thread_ref, action_type, proposal_json, idempotency_key, outcome, created_at
+         FROM tm_journal
+         WHERE thread_ref = $1 AND action_type = 'escalate_p0' AND created_at >= $2
+         ORDER BY created_at ASC`,
+        [input.threadRef, sinceIso]
+      );
+      const store: Pick<WorkerHeartbeatAlarmJournal, 'recordAction' | 'updateActionOutcome'> = {
+        recordAction: data => insertJournalRow(query, data, input.nowMs),
+        updateActionOutcome: async (id, outcome, proposalJson) => {
+          // Never let a suppression overwrite a live or finished delivery.
+          if (proposalJson === undefined) {
+            await query(
+              `UPDATE tm_journal SET outcome = $1
+               WHERE id = $2 AND outcome NOT IN ('pending', 'sent', 'failed')`,
+              [outcome, id]
+            );
+          } else {
+            await query(
+              `UPDATE tm_journal SET outcome = $1, proposal_json = $2
+               WHERE id = $3 AND outcome NOT IN ('pending', 'sent', 'failed')`,
+              [outcome, proposalJson, id]
+            );
+          }
+          return null;
+        },
+      };
+      return finishEscalateClaim(store, selected.rows, input);
+    },
+    { immediate: true }
+  );
 }
 
 /**
@@ -399,11 +573,14 @@ function latestMatchingSentAtMs(
  * a 'pending'/'failed' row is retried. The alarm therefore holds no state -- a
  * restart mid-drain simply re-reads the row and continues.
  *
- * When the journal supplies listActions, a new key for the same thread and
- * reason inside the cooldown is journaled outcome=expired with
- * suppressed=cooldown and is not paged. The lookup and the send are separate
- * calls; this is not a cross-process atomic claim. Without listActions the
- * cooldown is skipped and the idempotency key alone dedupes.
+ * The in-process lock is held across the claim and the send, so two alarm runs
+ * in this process cannot both page the same thread and reason. The production
+ * journal's commitCooldownDecision repeats that claim inside one writer
+ * transaction, so a second process sees the pending row and does not page.
+ * A suppression never rewrites a pending, sent, or failed row.
+ *
+ * Without listActions and without commitCooldownDecision the cooldown is
+ * skipped and the idempotency key alone dedupes.
  *
  * Exported so the Taskmaster's rejected-send alarm pages through this same
  * journal-first path (one row per idempotency key, so one page per key).
@@ -414,50 +591,57 @@ export async function pageOnce(
   nowMs: number = Date.now()
 ): Promise<void> {
   const reason = escalationReason(args.proposal, args.threadRef);
-  const priorSentAtMs = deps.journal.listActions
-    ? latestMatchingSentAtMs(await deps.journal.listActions(args.threadRef), args.threadRef, reason)
-    : null;
-  const decision = decideEscalateP0({
+  const cooldownMs = resolveEscalateP0CooldownMs();
+  const claimInput: EscalateClaimInput = {
     threadRef: args.threadRef,
     reason,
+    idempotencyKey: args.idempotencyKey,
+    proposal: args.proposal,
     nowMs,
-    priorSentAtMs,
-  });
-  if (decision.suppressed === 'cooldown') {
-    const proposalJson = proposalJsonWithCooldown(args.proposal);
-    const suppressed = await deps.journal.recordAction({
-      thread_ref: args.threadRef,
-      action_type: 'escalate_p0',
-      proposal_json: proposalJson,
-      idempotency_key: args.idempotencyKey,
-      outcome: 'expired',
-    });
-    if (suppressed.outcome === 'sent') return;
-    if (suppressed.outcome !== 'expired') {
-      await deps.journal.updateActionOutcome(suppressed.id, 'expired', proposalJson);
+    cooldownMs,
+  };
+  await withEscalateLock(`${args.threadRef}\0${reason}`, async () => {
+    const claim = await claimEscalateAttempt(deps.journal, claimInput);
+    if (claim.disposition === 'suppressed') {
+      log.info(
+        { threadRef: args.threadRef, reason, idempotencyKey: args.idempotencyKey },
+        'worker_heartbeat_page_suppressed'
+      );
     }
-    log.info(
-      { threadRef: args.threadRef, reason, idempotencyKey: args.idempotencyKey },
-      'worker_heartbeat_page_suppressed'
-    );
-    return;
-  }
-
-  const entry = await deps.journal.recordAction({
-    thread_ref: args.threadRef,
-    action_type: 'escalate_p0',
-    proposal_json: JSON.stringify(args.proposal),
-    idempotency_key: args.idempotencyKey,
-    outcome: 'pending',
+    if (claim.disposition !== 'send') return;
+    try {
+      await deps.pageOperator(args.text);
+      await deps.journal.updateActionOutcome(claim.id, 'sent');
+    } catch (error) {
+      log.error(
+        { err: error, idempotencyKey: args.idempotencyKey },
+        'worker_heartbeat_page_failed'
+      );
+      await deps.journal.updateActionOutcome(claim.id, 'failed');
+    }
   });
-  if (entry.outcome === 'sent') return;
-  try {
-    await deps.pageOperator(args.text);
-    await deps.journal.updateActionOutcome(entry.id, 'sent');
-  } catch (error) {
-    log.error({ err: error, idempotencyKey: args.idempotencyKey }, 'worker_heartbeat_page_failed');
-    await deps.journal.updateActionOutcome(entry.id, 'failed');
+}
+
+async function claimEscalateAttempt(
+  journal: WorkerHeartbeatAlarmJournal,
+  input: EscalateClaimInput
+): Promise<EscalateClaimDisposition> {
+  if (journal.commitCooldownDecision) return journal.commitCooldownDecision(input);
+  if (!journal.listActions) {
+    const entry = await journal.recordAction({
+      thread_ref: input.threadRef,
+      action_type: 'escalate_p0',
+      proposal_json: JSON.stringify(input.proposal),
+      idempotency_key: input.idempotencyKey,
+      outcome: 'pending',
+    });
+    if (entry.outcome === 'pending' || entry.outcome === 'failed') {
+      return { disposition: 'send', id: entry.id };
+    }
+    return { disposition: 'skip' };
   }
+  const rows = await journal.listActions(input.threadRef);
+  return finishEscalateClaim(journal, rows, input);
 }
 
 /**

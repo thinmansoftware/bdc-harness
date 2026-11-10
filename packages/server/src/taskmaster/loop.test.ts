@@ -5278,9 +5278,13 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
 
     expect(result.effects).toBe(0);
     expect(gh.posts()).toBe(0);
-    expect(
-      world.journal.filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
-    ).toHaveLength(1);
+    const rows = world.journal.filter(
+      row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
+    );
+    expect(rows).toHaveLength(2);
+    expect(rows.filter(row => row.outcome === 'sent')).toHaveLength(0);
+    const journaled = rows.find(row => row.idempotency_key !== 'tm:escalate_p0:seed');
+    expect(JSON.parse(journaled?.proposal_json ?? '{}').suppressed).toBe('cooldown');
   });
 
   test('adopt_fixup_pending_and_suppressed_dedupe_boundaries', async () => {
@@ -5297,11 +5301,19 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     await tick(createTaskmasterState(60_000), pendingDeps);
 
     expect(pendingGh.posts()).toBe(0);
+    const pendingRows = pendingWorld.journal.filter(
+      row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
+    );
+    // The unmatched pending seed is reconciled to expired, and the new key is
+    // journaled suppressed instead of sent.
+    expect(pendingRows).toHaveLength(2);
+    expect(pendingRows.filter(row => row.outcome === 'sent')).toHaveLength(0);
     expect(
-      pendingWorld.journal.filter(
-        row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
-      )
-    ).toHaveLength(1);
+      pendingRows.some(row => {
+        if (row.idempotency_key === 'tm:escalate_p0:seed') return false;
+        return JSON.parse(row.proposal_json).suppressed === 'cooldown';
+      })
+    ).toBe(true);
 
     const suppressedWorld = makeWorld();
     seedDigestSent(suppressedWorld);
@@ -5319,11 +5331,11 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     await tick(createTaskmasterState(60_000), suppressedDeps);
 
     expect(suppressedGh.posts()).toBe(0);
-    expect(
-      suppressedWorld.journal.filter(
-        row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
-      )
-    ).toHaveLength(1);
+    const suppressedRows = suppressedWorld.journal.filter(
+      row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
+    );
+    expect(suppressedRows).toHaveLength(2);
+    expect(suppressedRows.filter(row => row.outcome === 'sent')).toHaveLength(0);
   });
 
   // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01, Tests 5 and 6 (tick level).
