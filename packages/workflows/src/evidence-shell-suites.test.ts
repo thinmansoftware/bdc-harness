@@ -14,6 +14,7 @@ const SUITES = [
   'manifest-evidence-check.sh',
   'stamp-manifest-evidence.sh',
   'test-repair-guard.sh',
+  'test-guard-dependencies.sh',
   'stage-evidence.sh',
   'env-unavailable-test-loop.sh',
 ] as const;
