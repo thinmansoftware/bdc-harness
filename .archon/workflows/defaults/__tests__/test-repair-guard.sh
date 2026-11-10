@@ -541,7 +541,10 @@ for location in current stage; do
         printf 'echo "Tests: 0/1"; exit 1\n' > "$TMP/outside.sh"
         link_file "$TARGET" check.sh "$TMP/outside.sh" ;;
       broken) link_file "$TARGET" check.sh absent.sh ;;
-      test_file) link_file "$TARGET" test_hidden.sh runner.sh ;;
+      test_file)
+        rm "$TARGET/check.sh"
+        printf 'bash runner.sh\n' > "$TARGET/check.sh"
+        link_file "$TARGET" test_hidden.sh runner.sh ;;
     esac
     export FIX_INITIAL="$(run_node run-stop-tests)"
     if [ "$change" = outside ] || [ "$change" = broken ]; then
