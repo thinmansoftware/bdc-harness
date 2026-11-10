@@ -107,6 +107,9 @@ RUN apt-get update && apt-get install -y \
     postgresql-client \
     # Required by Python WO tests; keep the distro-managed pytest runtime.
     python3-pytest \
+    # PyYAML for the lanes' canonical-stage parser (bdc-harness#1532); system-wide so it
+    # does not depend on a per-user pip install on the mounted appuser home.
+    python3-yaml \
     unzip \
     # Chromium for agent-browser E2E testing (drives browser via CDP)
     chromium \
