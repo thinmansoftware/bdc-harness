@@ -229,7 +229,11 @@ done
 
 # Command tokens are relative to the command's cwd, including a leading cd.
 # Existing ignored files are included; directories, flags, interpreters and paths
-# escaping the worktree (including symlinks) are excluded.
+# escaping the worktree are excluded. A declared symlink whose target escapes the
+# worktree is no longer excluded: since round 8 it blocks (Test 19 outside, which
+# makes a real symlink through python). This fixture used `ln -s`, which in Git
+# Bash on Windows (no symlink privilege) silently COPIES the file, so the old
+# "escaping symlink is excluded" check passed on Windows and failed on Linux CI.
 fixture declared-tokens
 mkdir -p "$WT/sub dir"
 printf 'check.sh\n' > "$WT/.gitignore"
@@ -238,8 +242,7 @@ for name in 'sub dir/check.sh' 'sub dir/helper.sh' check.sh bash; do
 done
 printf 'old\n' > "$WT/-flag"
 printf 'outside\n' > "$TMP/outside.sh"
-ln -s "$TMP/outside.sh" "$WT/escape.sh"
-printf '%s\n' "cd 'sub dir' && bash check.sh && bash helper.sh" 'bash check.sh -flag bash ../outside.sh escape.sh' > "$ARTIFACTS_DIR/evidence/stop-tests.commands"
+printf '%s\n' "cd 'sub dir' && bash check.sh && bash helper.sh" 'bash check.sh -flag bash ../outside.sh' > "$ARTIFACTS_DIR/evidence/stop-tests.commands"
 trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 for name in 'sub dir/check.sh' 'sub dir/helper.sh' check.sh; do
   printf 'changed\n' > "$WT/$name"
