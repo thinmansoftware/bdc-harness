@@ -23,10 +23,49 @@ $script:DescendantsSurvived = 0
 # stub processes, a fake clock and no real sleep).
 # ---------------------------------------------------------------------------
 
+# The launcher's own file log. Task Scheduler runs the launcher with no console anyone reads, so
+# Write-Host alone left no record of why a pair stopped (2026-11-10: the worker died at ~12:00Z and
+# nothing explained it). Best effort: a log failure never stops the launcher. Capped: the file is
+# rotated to .1 (the older .1 is replaced) once it passes $script:LauncherLogMaxBytes. Messages carry
+# pids, exit codes, ports and reasons only: never config, token or prompt text.
+$script:LauncherLogMaxBytes = 1048576
+function Get-LauncherLogPath {
+    if ($env:BDC_DISPATCH_LAUNCHER_LOG) { return $env:BDC_DISPATCH_LAUNCHER_LOG }
+    return (Join-Path $env:USERPROFILE '.config\bdc\logs\dispatch-launcher.log')
+}
+
+function Write-LauncherLogFile {
+    param([string]$Line)
+    try {
+        $path = Get-LauncherLogPath
+        $dir = Split-Path -Parent $path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        if ((Test-Path -LiteralPath $path) -and ((Get-Item -LiteralPath $path).Length -gt $script:LauncherLogMaxBytes)) {
+            Move-Item -LiteralPath $path -Destination ($path + '.1') -Force
+        }
+        Add-Content -LiteralPath $path -Value $Line -Encoding ASCII
+    }
+    catch { }
+}
+
 function Write-LauncherLog {
     param([string]$Message)
     # Write-Host, not Write-Output: callers return values and must not be polluted.
-    Write-Host ("dispatch_launcher: " + $Message)
+    $line = ("dispatch_launcher: " + $Message)
+    Write-Host $line
+    Write-LauncherLogFile -Line ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + ' [pid ' + $PID + '] ' + $line)
+}
+
+# "<name> pid=N running" or "<name> pid=N exited code=C": the raw exit reason of a process the
+# launcher owns, read from the handle it kept.
+function Get-OwnedProcessSummary {
+    param([string]$Name, $Process)
+    if ($null -eq $Process) { return ($Name + ' not started') }
+    try {
+        if ($Process.HasExited) { return ($Name + ' pid=' + $Process.Id + ' exited code=' + $Process.ExitCode) }
+        return ($Name + ' pid=' + $Process.Id + ' running')
+    }
+    catch { return ($Name + ' pid=' + $Process.Id + ' state unreadable') }
 }
 
 function Invoke-LauncherSleep {
@@ -56,18 +95,17 @@ function Test-LocalPortOpen {
 }
 
 function Start-TunnelProcess {
-    param([string]$SshHost, [int]$LocalPort)
+    param([string]$SshHost, [int]$LocalPort, [string]$Executable = '')
     $forward = "127.0.0.1:${LocalPort}:127.0.0.1:3090"
-    $process = Start-Process -FilePath 'ssh' -ArgumentList @(
-        '-N',
-        '-o', 'ExitOnForwardFailure=yes',
-        '-o', 'ServerAliveInterval=30',
-        '-o', 'ServerAliveCountMax=3',
-        '-L', $forward,
-        $SshHost
-    ) -WindowStyle Hidden -PassThru
-    $null = $process.Handle
-    return $process
+    if ($Executable) { $ssh = $Executable }
+    else { $ssh = (Get-Command ssh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
+    $arguments = @('-N', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3', '-L', $forward, $SshHost)
+    $commandLine = (Format-ProcessArgument -Value $ssh) + ' ' + (($arguments | ForEach-Object { Format-ProcessArgument -Value $_ }) -join ' ')
+    # The tunnel is launcher-owned, so it lives in its own kill-on-close job object, exactly like the
+    # worker. A Start-Process tunnel was NOT in a job: when Task Scheduler stopped the task (or the
+    # launcher died any other way) the ssh process survived, kept the local port, and every restart
+    # failed with "port is held by a process this launcher did not start" (2026-11-10, #3418).
+    return Start-JobOwnedProcess -CommandLine $commandLine -WorkingDirectory ((Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path)
 }
 
 $script:DispatchJobSource = @'
@@ -273,6 +311,25 @@ function Resolve-BunLauncher {
     throw ("bun resolved to '" + $path + "', which cannot be started as a process (not .exe, .cmd or .bat)")
 }
 
+# Starts a process inside its own Windows Job Object (kill-on-close), created suspended and assigned
+# BEFORE its first instruction runs, so every descendant it ever spawns is in the job and the whole
+# set dies with the launcher. Used for the worker and for the ssh tunnel.
+function Start-JobOwnedProcess {
+    param([string]$CommandLine, [string]$WorkingDirectory, [string]$Label = 'process')
+    try {
+        Initialize-DispatchJobType
+        $job = [BdcDispatchJob]::Start($CommandLine, $WorkingDirectory)
+    }
+    catch {
+        # Fail loud and closed: without the job there is no guaranteed ownership of descendants.
+        throw ("could not start the $Label inside a job object: " + $_.Exception.Message)
+    }
+    $process = Get-Process -Id $job.ProcessId -ErrorAction Stop
+    $null = $process.Handle
+    Add-Member -InputObject $process -MemberType NoteProperty -Name DispatchJob -Value $job -Force
+    return $process
+}
+
 function Start-WorkerProcess {
     param(
         [string]$ConfigPath,
@@ -288,18 +345,7 @@ function Start-WorkerProcess {
         ' --config ' + (Format-ProcessArgument -Value $ConfigPath)
     # A .cmd shim must be run by cmd.exe (/d no AutoRun, /s keeps the outer quotes, /c run and exit).
     if ($launcher.ViaCmd) { $commandLine = 'cmd.exe /d /s /c "' + $commandLine + '"' }
-    try {
-        Initialize-DispatchJobType
-        $job = [BdcDispatchJob]::Start($commandLine, $repoRoot)
-    }
-    catch {
-        # Fail loud and closed: without the job there is no guaranteed ownership of descendants.
-        throw ('could not start the worker inside a job object: ' + $_.Exception.Message)
-    }
-    $process = Get-Process -Id $job.ProcessId -ErrorAction Stop
-    $null = $process.Handle
-    Add-Member -InputObject $process -MemberType NoteProperty -Name DispatchJob -Value $job -Force
-    return $process
+    return Start-JobOwnedProcess -CommandLine $commandLine -WorkingDirectory $repoRoot -Label 'worker'
 }
 
 # Every descendant (child, grandchild, ...) of a process, from the live process table, with the
@@ -454,6 +500,7 @@ function Invoke-DispatchPairOnce {
     }
 
     $tunnel = Start-TunnelProcess -SshHost $SshHost -LocalPort $LocalPort
+    Write-LauncherLog (Get-OwnedProcessSummary -Name 'tunnel started:' -Process $tunnel)
     $worker = $null
     $trackedWorkerTree = @{}
     try {
@@ -470,6 +517,7 @@ function Invoke-DispatchPairOnce {
         }
 
         $worker = Start-WorkerProcess -ConfigPath $ConfigPath
+        Write-LauncherLog (Get-OwnedProcessSummary -Name 'worker started:' -Process $worker)
         while ($true) {
             Invoke-LauncherSleep -Seconds $PollSeconds
             Update-TrackedDescendants -Process $worker -Tracked $trackedWorkerTree
@@ -490,6 +538,8 @@ function Invoke-DispatchPairOnce {
         }
     }
     finally {
+        # Record the raw state of both BEFORE they are stopped, so the log shows which one ended the pair.
+        Write-LauncherLog ('pair ending: ' + (Get-OwnedProcessSummary -Name 'worker' -Process $worker) + '; ' + (Get-OwnedProcessSummary -Name 'tunnel' -Process $tunnel))
         # Our own pair only: the worker first, then the tunnel.
         Stop-OwnedProcess -Process $worker -Tracked $trackedWorkerTree
         Stop-OwnedProcess -Process $tunnel
@@ -566,4 +616,17 @@ if ($ValidateOnly) {
     exit 0
 }
 
-exit (Invoke-DispatchSupervisor -ConfigPath $ConfigPath -SshHost $SshHost -LocalPort $LocalPort)
+Write-LauncherLog ('launcher starting, port ' + $LocalPort + ', host ' + $SshHost)
+$launcherExit = 1
+try {
+    $launcherExit = Invoke-DispatchSupervisor -ConfigPath $ConfigPath -SshHost $SshHost -LocalPort $LocalPort
+}
+catch {
+    Write-LauncherLog ('launcher crashed: ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message)
+    throw
+}
+finally {
+    Write-LauncherLog ('launcher exiting')
+}
+Write-LauncherLog ('launcher exit code ' + $launcherExit)
+exit $launcherExit

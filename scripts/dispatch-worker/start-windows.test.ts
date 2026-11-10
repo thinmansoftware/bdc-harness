@@ -366,6 +366,8 @@ suite('install-windows.ps1 (stubbed Task Scheduler)', () => {
     ExecutionTimeLimit: string | null;
     LogonType: string | null;
     RunLevel: string | null;
+    Execute: string | null;
+    Argument: string | null;
   }
 
   const INSTALLER = join(import.meta.dir, 'install-windows.ps1');
@@ -403,6 +405,8 @@ function Register-ScheduledTask {
         ExecutionTimeLimit = $(if ($null -ne $Settings.ExecutionTimeLimit) { $Settings.ExecutionTimeLimit.ToString() } else { $null })
         LogonType = [string]$Principal.LogonType
         RunLevel = [string]$Principal.RunLevel
+        Execute = [string]$Action.Execute
+        Argument = [string]$Action.Argument
     })
 }
 function Stop-Process { throw 'the installer must not stop any process' }
@@ -453,6 +457,17 @@ Write-Output ('RESULT_JSON=' + (ConvertTo-Json -Compress -Depth 6 -InputObject @
     expect(worker.MultipleInstances).toBe('IgnoreNew');
     // zero means unlimited in Task Scheduler: not the old one-day cap, not PT72H
     expect(worker.ExecutionTimeLimit).toBe('00:00:00');
+  });
+
+  test('both tasks run through conhost.exe --headless so no console window ever appears (2026-11-10, John: "this windows kept popping up")', async () => {
+    const regs = await runInstaller();
+    expect(regs.length).toBe(2);
+    for (const r of regs) {
+      expect(r.Execute, r.TaskName).toBe('conhost.exe');
+      expect(r.Argument ?? '', r.TaskName).toMatch(/^--headless powershell\.exe -NoProfile /);
+    }
+    expect(regs[0]?.Argument).toContain('start-windows.ps1');
+    expect(regs[1]?.Argument).toContain('watchdog-windows.ps1');
   });
 
   test('Test 6: the watchdog repeats every 5 minutes indefinitely, ignores a second instance, and keeps the limited interactive user', async () => {
@@ -960,4 +975,241 @@ suite('preflight-launcher.ps1 dry start under Windows PowerShell', () => {
       await rm(dir, { recursive: true, force: true });
     }
   }, 90000);
+});
+
+suite('start-windows.ps1 tunnel ownership (the orphaned-tunnel outage, 2026-11-10)', () => {
+  const q = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+  async function runHost(body: string): Promise<{ out: string; err: string; dir: string }> {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-tunnel-'));
+    const script = join(dir, 'scenario.ps1');
+    await writeFile(
+      script,
+      `$ErrorActionPreference = 'Stop'
+. ${q(LAUNCHER)}
+${body}
+`,
+      'utf8'
+    );
+    const proc = Bun.spawn(
+      [
+        'powershell.exe',
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        script,
+      ],
+      { stdout: 'pipe', stderr: 'pipe' }
+    );
+    const [out, err] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ]);
+    await proc.exited;
+    return { out, err, dir };
+  }
+
+  test('Start-TunnelProcess hands the launcher-owned ssh to the job object with the forward, keepalive and host intact', async () => {
+    const { out, err, dir } = await runHost(`
+function Start-JobOwnedProcess { param([string]$CommandLine, [string]$WorkingDirectory, [string]$Label = 'process') [Console]::Out.WriteLine('CAPTURED=' + $CommandLine); return [pscustomobject]@{ Id = 1 } }
+$null = Start-TunnelProcess -SshHost 'hetzner-prod' -LocalPort 3900 -Executable 'C:/Windows/System32/OpenSSH/ssh.exe'
+`);
+    try {
+      expect(err).toBe('');
+      const line = out.split(/\r?\n/).find(l => l.startsWith('CAPTURED=')) ?? '';
+      expect(line).toContain('ssh.exe');
+      expect(line).toContain('"-N"');
+      expect(line).toContain('ExitOnForwardFailure=yes');
+      expect(line).toContain('ServerAliveInterval=30');
+      expect(line).toContain('"-L" "127.0.0.1:3900:127.0.0.1:3090"');
+      expect(line.trim().endsWith('"hetzner-prod"')).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a launcher killed abruptly (what Task Scheduler stop does) takes its job-owned child with it: no orphan holds the port', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-tunnel-kill-'));
+    try {
+      const script = join(dir, 'host.ps1');
+      await writeFile(
+        script,
+        `$ErrorActionPreference = 'Stop'
+. ${q(LAUNCHER)}
+$p = Start-JobOwnedProcess -CommandLine 'ping -n 300 127.0.0.1' -WorkingDirectory ${q(dir)}
+Write-Output ('CHILD=' + $p.Id)
+[Console]::Out.Flush()
+Start-Sleep -Seconds 300
+`,
+        'utf8'
+      );
+      const host = Bun.spawn(
+        [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          script,
+        ],
+        { stdout: 'pipe', stderr: 'pipe' }
+      );
+      const reader = host.stdout.getReader();
+      let seen = '';
+      const decoder = new TextDecoder();
+      const t0 = Date.now();
+      let childPid = 0;
+      while (Date.now() - t0 < 60000 && childPid === 0) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        seen += decoder.decode(value);
+        const m = /CHILD=(\d+)/.exec(seen);
+        if (m) childPid = Number(m[1]);
+      }
+      expect(childPid, `host output: ${seen}`).toBeGreaterThan(0);
+      const alive = (pid: number): boolean => {
+        const r = Bun.spawnSync(['tasklist', '/FI', `PID eq ${pid}`, '/NH']);
+        return new TextDecoder().decode(r.stdout).includes(String(pid));
+      };
+      expect(alive(childPid)).toBe(true);
+      host.kill(); // TerminateProcess on the launcher: no finally block, no cleanup code runs
+      await host.exited;
+      let gone = false;
+      for (let i = 0; i < 40 && !gone; i++) {
+        gone = !alive(childPid);
+        if (!gone) await new Promise(r => setTimeout(r, 250));
+      }
+      expect(gone, 'the job-owned child must die with the launcher').toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('the launcher no longer starts the tunnel with Start-Process (which left it outside any job)', async () => {
+    const source = await readFile(LAUNCHER, 'utf8');
+    const tunnel = /function Start-TunnelProcess \{[^]*?\r?\n\}\r?\n/.exec(source)?.[0] ?? '';
+    expect(tunnel.length).toBeGreaterThan(0);
+    expect(tunnel).toContain('Start-JobOwnedProcess');
+    expect(tunnel).not.toMatch(/Start-Process\s+-FilePath/);
+  });
+});
+
+suite('start-windows.ps1 launcher event log (the unexplained 2026-11-10 stop)', () => {
+  const q = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+  async function runHost(
+    body: string,
+    env: Record<string, string>
+  ): Promise<{ out: string; err: string }> {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-log-'));
+    try {
+      const script = join(dir, 'scenario.ps1');
+      await writeFile(
+        script,
+        `$ErrorActionPreference = 'Stop'
+. ${q(LAUNCHER)}
+${body}
+`,
+        'utf8'
+      );
+      const proc = Bun.spawn(
+        [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          script,
+        ],
+        { stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ...env } }
+      );
+      const [out, err] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      return { out, err };
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('Write-LauncherLog appends a timestamped, pid-tagged line to the launcher log file', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-logfile-'));
+    try {
+      const log = join(dir, 'sub', 'dispatch-launcher.log');
+      const { err } = await runHost(
+        `Write-LauncherLog 'attempt 1 of 5 failed: ssh tunnel exited (exit code -1)'`,
+        {
+          BDC_DISPATCH_LAUNCHER_LOG: log,
+        }
+      );
+      expect(err).toBe('');
+      const text = await readFile(log, 'utf8');
+      expect(text).toMatch(
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z \[pid \d+\] dispatch_launcher: attempt 1 of 5 failed: ssh tunnel exited \(exit code -1\)/
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('the log is capped: past the limit it rotates to .1 and the live file stays small', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-logcap-'));
+    try {
+      const log = join(dir, 'dispatch-launcher.log');
+      const { err } = await runHost(
+        `$script:LauncherLogMaxBytes = 300
+1..30 | ForEach-Object { Write-LauncherLog ('line number ' + $_ + ' padding padding padding') }`,
+        { BDC_DISPATCH_LAUNCHER_LOG: log }
+      );
+      expect(err).toBe('');
+      const live = await readFile(log, 'utf8');
+      const rotated = await readFile(log + '.1', 'utf8');
+      expect(live.length).toBeLessThan(700);
+      expect(rotated.length).toBeGreaterThan(0);
+      expect(live + rotated).toContain('line number 30');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('an unwritable log path never stops the launcher', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-lognowrite-'));
+    try {
+      const blocker = join(dir, 'a-file');
+      await writeFile(blocker, 'x', 'utf8');
+      const { out, err } = await runHost(
+        `Write-LauncherLog 'still running'
+Write-Output 'SURVIVED'`,
+        {
+          BDC_DISPATCH_LAUNCHER_LOG: join(blocker, 'not-a-dir', 'dispatch-launcher.log'),
+        }
+      );
+      expect(err).toBe('');
+      expect(out).toContain('SURVIVED');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('Get-OwnedProcessSummary reports the raw exit code of an exited process and pid of a running one', async () => {
+    const { out, err } = await runHost(
+      `$e = [pscustomobject]@{ Id = 4242; HasExited = $true; ExitCode = -1 }
+$r = [pscustomobject]@{ Id = 77; HasExited = $false; ExitCode = $null }
+Write-Output (Get-OwnedProcessSummary -Name 'tunnel' -Process $e)
+Write-Output (Get-OwnedProcessSummary -Name 'worker' -Process $r)
+Write-Output (Get-OwnedProcessSummary -Name 'worker' -Process $null)`,
+      {}
+    );
+    expect(err).toBe('');
+    const lines = out.split(/\r?\n/).filter(Boolean);
+    expect(lines).toEqual([
+      'tunnel pid=4242 exited code=-1',
+      'worker pid=77 running',
+      'worker not started',
+    ]);
+  });
 });
