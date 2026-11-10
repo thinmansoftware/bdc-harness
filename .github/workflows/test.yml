@@ -226,6 +226,14 @@ jobs:
             test "$(bun --version)" = "1.3.11"
           '
 
+      - name: Python YAML in the image (canonical-stage parser, bdc-harness#1532)
+        run: |
+          # -s ignores user site-packages: PyYAML must come from the image itself, not from
+          # a per-user pip install on a mounted home volume.
+          for user in appuser root; do
+            docker run --rm --user "$user" --entrypoint python3 archon-ci:test -s -c 'import yaml; print(yaml.__file__)'
+          done
+
       - name: Node LTS smoke (default node, npm, npx, pnpm, bun, node:sqlite, agent-browser)
         run: |
           for user in appuser root; do
