@@ -48,6 +48,16 @@ The freeze also includes existing regular files named by saved command tokens,
 including ignored scripts such as `check.sh`. Paths resolve in the command's
 worktree and honor a leading `cd`; flags, interpreter names and paths outside
 that worktree are excluded.
+Saved npm, Bun, Yarn and pnpm package-script commands resolve their script in
+the command's package directory, including a leading `cd`. The guard freezes
+every existing in-worktree file token named by that script, including regular
+entrypoints changed by the build and files in `&&`, `||`, `;` and `|` chains.
+Nested package-script calls resolve recursively, with at most five script
+expansions per call chain. A cycle, depth overflow, missing script or unreadable
+or invalid required package.json blocks repair with
+`tests_failed_after_repair:guard`. Both regular entrypoints and symlink targets
+are removed from the product allowlist in the run and persisted stage worktrees.
+This resolves command strings only; it does not trace entrypoint file contents.
 Ignored paths obey the same freeze and new-file rules; an ignore pattern does
 not exempt new tests, runner configuration or marker-bearing helpers.
 

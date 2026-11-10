@@ -2623,25 +2623,68 @@ nodes:
       before = {} if mode == "snapshot" else json.loads(pathlib.Path(snapshot).read_text())
       touched = set()
       command_files = {}
-      def declared_paths(root, command, cwd=None):
+      def package_script(root, cwd, name, stack):
+          key = (str(cwd),name)
+          try:
+              if key in stack or len(stack) >= 5: raise ValueError("package script cycle or depth limit")
+              package = cwd/"package.json"
+              if not package.resolve(strict=True).is_relative_to(root): raise ValueError("package outside worktree")
+              command = json.loads(package.read_text())["scripts"][name]
+              if not isinstance(command,str) or not command.strip(): raise ValueError("missing package script")
+          except (OSError,RuntimeError,ValueError,KeyError,TypeError) as error:
+              print("test guard: cannot resolve package script: "+str(cwd)+"/"+name+": "+str(error),file=sys.stderr)
+              sys.exit(42)
+          command_files.setdefault(str(root),set()).add(package.relative_to(root).as_posix())
+          declared_paths(root,command,cwd,stack+(key,))
+      def declared_paths(root, command, cwd=None, stack=(), expand=True):
           cwd = root if cwd is None else cwd
           try:
-              lexer = shlex.shlex(command,posix=True,punctuation_chars="&")
+              lexer = shlex.shlex(command,posix=True,punctuation_chars="&|;")
               lexer.whitespace_split = True
               lexer.commenters = ""
               tokens = list(lexer)
           except ValueError:
+              if expand: sys.exit(42)
               return
-          if len(tokens) >= 3 and tokens[0] == "cd" and tokens[2] == "&&":
-              cwd = (cwd/tokens[1]).resolve()
-              if not cwd.is_relative_to(root): return
-              tokens = tokens[3:]
+          # Resolve each chained segment in its own command cwd.
+          segments = []
+          segment = []
           for token in tokens:
-              if token.startswith("-") or token == "&&": continue
-              if re.fullmatch(r"(?:ba|z|da|k)?sh|python(?:[0-9.]+)?|node(?:js)?|bunx?|npm|npx|pnpm|yarn|pytest",pathlib.Path(token).name): continue
-              path = pathlib.Path(os.path.abspath(cwd/token))
-              if (path.is_file() or path.is_symlink()) and path.is_relative_to(root):
-                  command_files.setdefault(str(root),set()).add(path.relative_to(root).as_posix())
+              if token in {"&&","||",";","|"}:
+                  segments.append(segment); segment = []
+              else: segment.append(token)
+          segments.append(segment)
+          for segment in segments:
+              if not segment: continue
+              if segment[0] == "cd" and len(segment) == 2:
+                  cwd = (cwd/segment[1]).resolve()
+                  if not cwd.is_relative_to(root): return
+                  continue
+              manager = pathlib.Path(segment[0]).name
+              args = segment[1:]
+              name = None
+              if manager == "npm":
+                  if args and args[0] == "test": name = "test"
+                  elif len(args) >= 2 and args[0] == "run": name = args[1]
+              elif manager in {"bun","yarn","pnpm"} and args:
+                  if len(args) >= 2 and args[0] == "run": name = args[1]
+                  elif manager != "bun" and not args[0].startswith("-"): name = args[0]
+                  # Bun prefers package scripts over same-named files. Only
+                  # treat bun run x.ts as a file when no such script is declared.
+                  if manager == "bun" and name and (cwd/name).is_file():
+                      try:
+                          scripts = json.loads((cwd/"package.json").read_text()).get("scripts",{})
+                          if not isinstance(scripts,dict): scripts = {}
+                      except (OSError,ValueError,AttributeError): scripts = {}
+                      if name not in scripts: name = None
+              if mode == "snapshot" and expand and name is not None:
+                  package_script(root,cwd,name,stack)
+              for token in segment:
+                  if token.startswith("-"): continue
+                  if re.fullmatch(r"(?:ba|z|da|k)?sh|python(?:[0-9.]+)?|node(?:js)?|bunx?|npm|npx|pnpm|yarn|pytest",pathlib.Path(token).name): continue
+                  path = pathlib.Path(os.path.abspath(cwd/token))
+                  if (path.is_file() or path.is_symlink()) and path.is_relative_to(root):
+                      command_files.setdefault(str(root),set()).add(path.relative_to(root).as_posix())
       for directory, command in zip(declared[::2],declared[1::2]):
           declared_paths(pathlib.Path(directory).resolve(),command)
       def git_paths(root,*args):
@@ -2712,12 +2755,13 @@ nodes:
               for name in files:
                   if name in fixed_paths or always_frozen(name) or name in command_files.get(directory,set()): freeze_link(name)
               declared_set = set(command_files.get(directory,set()))
-              # Inspect package test entries, without tracing any called/sourced helpers.
+              # Preserve the round-8 freeze of symlinked test entries in other
+              # packages, without requiring or expanding their undeclared scripts.
               for name in files:
                   if pathlib.PurePosixPath(name).name != "package.json": continue
                   try:
                       command = json.loads((root/name).read_text()).get("scripts",{}).get("test","")
-                      if isinstance(command,str): declared_paths(root,command,(root/name).parent)
+                      if isinstance(command,str): declared_paths(root,command,(root/name).parent,expand=False)
                   except (OSError,ValueError,AttributeError): pass
               for name in command_files.get(directory,set()) - declared_set:
                   if (root/name).is_symlink():
@@ -2766,7 +2810,7 @@ nodes:
         if trg_snapshot "$1" "$2/test-guard.json"; then return 0; else result=$?; fi
         : > "$2/test-repair.guard"
         previous="$(cat "$2/stop-tests.initial")"
-        # A known symlink violation (42) takes precedence. An unavailable guard
+        # A known boundary violation (42) takes precedence. An unavailable guard
         # tool must not replace an already non-repairable environment reason.
         if [ "$result" -ne 42 ] && printf '%s\n' "$previous" | grep -E '^TESTS_STATUS=(blocked|env_unavailable)$' >/dev/null; then return 0; fi
         {
