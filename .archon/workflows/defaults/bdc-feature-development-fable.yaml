@@ -3889,7 +3889,8 @@ nodes:
 
   - id: diff-review
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    # Reviewer seat = gpt-6.1-sol (acting XO 2026-11-10; replay 9/10, wiki models/model-testing-results T13).
+    model: gpt-6.1-sol
     # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
     # stands). openrouter is the repository-capable OpenRouter tool loop (opr is
     # text-only and cannot run this read-the-repo reviewer). WO-HARNESS-SEAT-GATE-
@@ -4151,7 +4152,8 @@ nodes:
 
   - id: diff-review-final
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    # Reviewer seat = gpt-6.1-sol (acting XO 2026-11-10; replay 9/10, wiki models/model-testing-results T13).
+    model: gpt-6.1-sol
     # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
     # stands). openrouter is the repository-capable OpenRouter tool loop (opr is
     # text-only and cannot run this read-the-repo reviewer). WO-HARNESS-SEAT-GATE-
@@ -4321,7 +4323,8 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: codex-native-strict
-    model: gpt-5.6-terra
+    # Reviewer seat = gpt-6.1-sol (acting XO 2026-11-10; replay 9/10, wiki models/model-testing-results T13).
+    model: gpt-6.1-sol
     # Quota failover to Kimi K3.1 Pro, never Claude (John 2026-10-27; D0 M-20261021c
     # stands). openrouter is the repository-capable OpenRouter tool loop (opr is
     # text-only and cannot run this read-the-repo reviewer). WO-HARNESS-SEAT-GATE-
