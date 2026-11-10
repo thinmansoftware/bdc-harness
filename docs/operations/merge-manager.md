@@ -20,6 +20,24 @@ A missing spec (HTTP 404) is not a hold. Any other spec-read failure, including 
 
 A pull request label named exactly `merge-hold` (case-sensitive) holds any pull request, including ones that are not tied to a work order. The bridge records `merge_hold_label` and does not read a spec. Removing the label lets the next tick merge through the existing guards.
 
+## Originating run evidence hold
+
+The run-linked manager checks the provenance-bound `WatchedRunRecord.runId` before judging or merging. A `node_failed` event for `manifest-evidence-check`, or a failed run whose failure names that node, holds with `originating_run_failed_evidence_gate`. A missing originating run, missing events reader, or failed event lookup holds with `originating_run_unreadable`. The runtime resolves the run row before reading its events. The existing provenance `no_run` case (PR-first human candidates) skips this gate and follows the existing merge path.
+
+The hold action and receipt record the same reason. In execute mode with mutations enabled, the manager posts one author-bound comment per current head SHA, marked `<!-- merge-evidence-hold:<head SHA> -->`, and applies `merge:held-evidence`. The failure comment contains `Merge held: originating run <run id> failed manifest-evidence-check` and the first 300 characters of the node error. An unreadable run instead says `Merge held: originating run <run id> unreadable` with the lookup error. Visibility failures are logged and never lift the hold. The label is informational; removing it cannot lift the hold, and adjudication does not remove it. `hold-canary` makes no GitHub writes. `comment_findings` may post the hold comment but cannot apply labels or merge. Execute mode with mutations disabled makes no GitHub writes.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MERGE_MANAGER_EVIDENCE_ADJUDICATORS` | unset (nobody) | Comma-separated GitHub logins permitted to adjudicate a known evidence failure; whitespace is trimmed and logins are case-insensitive |
+
+An allowlisted person lifts a known failure by posting a PR issue comment with this whole line (replace the SHA with the full current 40-character head SHA):
+
+```text
+Evidence-Adjudication: docs canary <current head SHA>
+```
+
+The reason and SHA must occur on the same line. An old or abbreviated SHA cannot authorize a new head. The run PR's builder author, the Review Gate login, the configured comment/Overseer and merge-manager identities, and every login ending in `[bot]` are rejected even if allowlisted. Unset or empty configuration permits nobody. Missing or unreadable comments do not authorize a merge. Unreadable run state cannot be adjudicated; restore the run/events reader first. Valid adjudication only clears this gate: the existing judge, exact-head approval, green checks, base policy and production holds still apply. Overseer verdict code is unchanged.
+
 ## Policy skip comment
 
 When the bridge records a terminal POLICY skip with the pull request in hand, it posts ONE comment on that pull request saying why the merge manager will not merge it and that a person does (exact-head approval and green required checks still apply). Reasons covered: `spec_only` (documentation-only into a base whose `docsOnly` policy is skip), `integration_base_mismatch` and `base_not_allowlisted`. The skip itself is unchanged: same outcome row, still terminal, claimed once per run and head. `repo_not_allowed` has no pull request in hand at its skip sites, so it posts nothing and stays a silent skip.
