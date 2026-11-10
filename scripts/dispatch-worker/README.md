@@ -578,3 +578,28 @@ Recipients that are mailboxes:
   then acts in its own thread and acks/addresses the row as `astra`. Because
   `astra` is `drain_on_start`, the desktop dispatch worker's generic `codex`
   leg can never claim it -- the message reaches only the Astra seat.
+
+## Swapping the worker launcher (operator procedure, bdc-xo #3418)
+
+Run on the worker machine, in order. Every step prints raw output; a blank result is a failure. Any failure
+after S1 means run the saved fallback (restore the exported task XML, check the worktree back out at the
+previous commit) and stop. Prechecks P1 and P2 run BEFORE the old worker is stopped, so a bad swap never
+takes a running worker down.
+
+- **P1 worktree clean.** In the worker worktree, `git status --porcelain --untracked-files=all` must print
+  nothing. A leftover staged or modified file aborts `git checkout --detach <pin>` (2026-11-10: a six-week-old
+  staged copy of one workflow file aborted S2). If it is not empty, back the file up byte for byte
+  (`git cat-file blob <blob> > file`, then compare `git hash-object --no-filters`) and clear exactly that path,
+  or stop and ask the XO.
+- **P2 launcher dry start under Windows PowerShell 5.1.** From the checkout at the pin, run
+  `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\dispatch-worker\preflight-launcher.ps1`.
+  It must print `LAUNCHER_DRY_START_OK`. It runs the real `Start-WorkerProcess` (job object, `bun` resolved through
+  PATH exactly as Task Scheduler resolves it) against a probe entry and never starts the worker. This catches
+  what the first job-object launcher missed (2026-11-10, S4): under 5.1 `Get-Command bun` is the npm shim
+  `bun.ps1`, and `CreateProcess` cannot start a `.ps1` (error 193). `Resolve-BunLauncher` now picks a real
+  `bun.exe`, or runs a `.cmd` through `cmd.exe`, and refuses anything else.
+- **S1** stop the old worker by identity (pid, parent, start time, command line). **S2** `git checkout --detach <pin>`,
+  head must equal the pin. **S3** run `install-windows.ps1` and read back the tasks. **S4** run the task and verify
+  one worker, one tunnel owned by the launcher, the listener on the tunnel port, a new lock, a server-side
+  heartbeat under 120 seconds, and one real message carried end to end. **S5** the two injections (tunnel kill,
+  foreign-PID lock).

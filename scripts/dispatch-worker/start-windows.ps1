@@ -256,6 +256,23 @@ function Format-ProcessArgument {
     return '"' + $Value + '"'
 }
 
+# CreateProcess can start an .exe (and a .cmd/.bat through cmd.exe) but NOT a .ps1. Under Windows
+# PowerShell 5.1, the Task Scheduler shell, Get-Command bun returns the npm shim bun.ps1 (an
+# ExternalScript), which made the first real run of the job-object launcher fail with CreateProcess
+# error 193 (2026-11-10, #3418 S4). So resolve an APPLICATION, prefer a real bun.exe (the one next to the
+# shim in node_modules\bun\bin), fall back to a .cmd run through cmd.exe, and refuse anything else loudly.
+function Resolve-BunLauncher {
+    param([string]$Executable = '')
+    if ($Executable) { $path = $Executable }
+    else { $path = (Get-Command bun -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
+    $ext = [System.IO.Path]::GetExtension($path).ToLowerInvariant()
+    if ($ext -eq '.exe') { return @{ Path = $path; ViaCmd = $false } }
+    $sibling = Join-Path (Split-Path -Parent $path) 'node_modules\bun\bin\bun.exe'
+    if (Test-Path -LiteralPath $sibling -PathType Leaf) { return @{ Path = $sibling; ViaCmd = $false } }
+    if ($ext -eq '.cmd' -or $ext -eq '.bat') { return @{ Path = $path; ViaCmd = $true } }
+    throw ("bun resolved to '" + $path + "', which cannot be started as a process (not .exe, .cmd or .bat)")
+}
+
 function Start-WorkerProcess {
     param(
         [string]$ConfigPath,
@@ -263,12 +280,14 @@ function Start-WorkerProcess {
         [string]$Entry = 'scripts/dispatch-worker/index.ts'
     )
     $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-    if ($Executable) { $bun = $Executable } else { $bun = (Get-Command bun -ErrorAction Stop).Source }
+    $launcher = Resolve-BunLauncher -Executable $Executable
     # The worker runs inside a Windows Job Object (kill-on-close), created suspended and assigned
     # BEFORE its first instruction runs. Every descendant it ever spawns is in the job, whatever the
     # worker's own lifetime: ownership does not depend on polling or on the worker staying alive.
-    $commandLine = (Format-ProcessArgument -Value $bun) + ' run ' + (Format-ProcessArgument -Value $Entry) +
+    $commandLine = (Format-ProcessArgument -Value $launcher.Path) + ' run ' + (Format-ProcessArgument -Value $Entry) +
         ' --config ' + (Format-ProcessArgument -Value $ConfigPath)
+    # A .cmd shim must be run by cmd.exe (/d no AutoRun, /s keeps the outer quotes, /c run and exit).
+    if ($launcher.ViaCmd) { $commandLine = 'cmd.exe /d /s /c "' + $commandLine + '"' }
     try {
         Initialize-DispatchJobType
         $job = [BdcDispatchJob]::Start($commandLine, $repoRoot)
