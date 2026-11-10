@@ -254,8 +254,7 @@ printf 'changed\n' > "$WT/-flag"
 printf 'changed\n' > "$TMP/outside.sh"
 check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 
-# A foreign stage's command must not freeze a same-named product file in the
-# current worktree: resolve tokens only where that command actually runs.
+# A shell script is infrastructure even when only a foreign stage declares it.
 fixture declared-scope-current
 CURRENT="$WT"
 printf 'old product\n' > "$WT/check.sh"
@@ -268,7 +267,7 @@ printf 'b\tthinmansoftware/other\tbash check.sh\n' > "$ARTIFACTS_DIR/evidence/st
 export RST_STAGE_WORKTREES="b=$TARGET"
 trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 printf 'new product\n' > "$CURRENT/check.sh"
-check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 printf 'old product\n' > "$CURRENT/check.sh"
 printf 'echo "Tests: 2/2"\n' > "$TARGET/check.sh"
 check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
@@ -625,13 +624,13 @@ PY
   (cd "$WT" && PATH="$TMP/r8-bin:$PATH" bash "$TMP/r8-pr-node.sh")
 }
 
-# Tests 20/21: accepted helper residual is disclosed in both real output paths.
-for change in helper product no_repair; do
+# Tests 20/21: infrastructure is frozen; product-only repairs disclose none.
+for change in helper helper_only product no_repair; do
   echo "Test 20/21: $change"
   fixture "r8-disclosure-$change"
   r8_build
   export BASE_BRANCH=run-base FIX_MAP=''
-  # A frozen entrypoint may source a build-changed helper: do not trace it.
+  # Classify the shell helper without tracing the entrypoint's execution.
   rm "$WT/check.sh"
   printf '. scripts/helper.sh\nif grep -q good a.js; then echo "Tests: 1/1"; else echo "Tests: 0/1"; exit 1; fi\n' > "$WT/check.sh"
   printf 'true # build helper\n' > "$WT/scripts/helper.sh"
@@ -640,17 +639,27 @@ for change in helper product no_repair; do
   export FIX_INITIAL="$(run_node run-stop-tests)"
   if [ "$change" != no_repair ]; then
     check contains "$FIX_INITIAL" 'TESTS_STATUS=failed'
-    printf 'good\n' > "$WT/a.js"
-    if [ "$change" = helper ]; then printf 'true # repaired helper\n' > "$WT/scripts/helper.sh"; fi
-    check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    if [ "$change" != helper_only ]; then printf 'good\n' > "$WT/a.js"; fi
+    if [[ "$change" = helper* ]]; then
+      printf 'true # repaired helper\n' > "$WT/scripts/helper.sh"
+      check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    else
+      check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    fi
     run_node test-repair until_bash >/dev/null
   fi
   export FIX_FINAL="$(run_node run-stop-tests-final)"
-  check contains "$FIX_FINAL" 'TESTS_STATUS=passed'
+  if [[ "$change" = helper* ]]; then
+    check contains "$FIX_FINAL" 'TESTS_STATUS=blocked'
+    check contains "$FIX_FINAL" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+    check contains "$FIX_FINAL" 'test guard: repair changed test infrastructure: scripts/helper.sh (frozen; a human must change it)'
+  else
+    check contains "$FIX_FINAL" 'TESTS_STATUS=passed'
+  fi
   check r8_pr_body
   body="$(cat "$ARTIFACTS_DIR/pr-body" 2>/dev/null)"
   for text in "$FIX_FINAL" "$body"; do
-    if [ "$change" = helper ]; then
+    if [[ "$change" = helper* ]]; then
       check contains "$text" $'Repair touched test infrastructure\nscripts/helper.sh'
       check rejects contains "$text" $'\na.js\n'
     else
@@ -658,7 +667,7 @@ for change in helper product no_repair; do
       check rejects contains "$text" $'Repair touched test infrastructure\n'
     fi
   done
-  if [ "$change" = helper ]; then
+  if [[ "$change" = helper* ]]; then
     check r8_pr_body BLOCKED
     check contains "$(cat "$ARTIFACTS_DIR/pr-body")" $'Repair touched test infrastructure\nscripts/helper.sh'
   fi
@@ -821,4 +830,102 @@ for location in current stage; do
   done
 done
 unset npm_config_script_shell
+
+# Test 22: freeze by class in both the run and mapped stage worktrees. Lifecycle
+# JS helpers outside scripts/ exercise the resolver, rather than shell suffixes.
+export npm_config_script_shell=bash
+for location in current stage; do
+  for kind in pretest posttest nested_lifecycle nested_post ci config scripts bash ps1 executable delete bypass; do
+    echo "Test 22: $location/$kind"
+    fixture "rs2-$location-$kind"
+    CURRENT="$WT"
+    if [ "$location" = stage ]; then fixture "rs2-target-$kind"; fi
+    path=scripts/run.js
+    command='bash check.sh'
+    case "$kind" in
+      pretest) path=prepare.sh; command='npm test' ;;
+      posttest) path=finish.js; command='npm test' ;;
+      nested_lifecycle) path=prepare.js; command='npm test' ;;
+      nested_post) path=finish.js; command='npm test' ;;
+      ci) path=.github/workflows/ci.yml ;;
+      config) path=vitest.config.ts ;;
+      bash) path=prepare.bash ;;
+      ps1) path=prepare.ps1 ;;
+      executable) path=runner ;;
+    esac
+    mkdir -p "$WT/$(dirname "$path")"
+    printf 'base\n' > "$WT/a.js"
+    script='if grep -q good a.js; then echo "Tests: 1/1"; else echo "Tests: 0/1"; exit 1; fi'
+    printf '%s\n' "$script" > "$WT/$path"
+    printf 'bash %s\n' "$path" > "$WT/check.sh"
+    case "$kind" in
+      pretest) printf '{"scripts":{"pretest":"bash prepare.sh","test":"echo done"}}\n' > "$WT/package.json" ;;
+      posttest|nested_post|nested_lifecycle)
+        printf 'const fs = require("fs"); const ok = fs.readFileSync("a.js", "utf8").includes("good"); console.log(ok ? "Tests: 1/1" : "Tests: 0/1"); process.exit(ok ? 0 : 1);\n' > "$WT/$path"
+        if [ "$kind" = posttest ]; then
+          printf '{"scripts":{"test":"echo done","posttest":"node finish.js"}}\n' > "$WT/package.json"
+        elif [ "$kind" = nested_post ]; then
+          printf '{"scripts":{"test":"npm run unit","unit":"echo done","postunit":"echo chain && node finish.js"}}\n' > "$WT/package.json"
+        else
+          printf '{"scripts":{"test":"npm run unit","preunit":"echo chain && node prepare.js","unit":"echo done"}}\n' > "$WT/package.json"
+        fi ;;
+    esac
+    git -C "$WT" add a.js check.sh "$path"
+    if [ -f "$WT/package.json" ]; then git -C "$WT" add package.json; fi
+    # On Windows use the index mode; the classifier must honor both sources.
+    if [ "$kind" = executable ]; then git -C "$WT" update-index --chmod=+x "$path"; fi
+    git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm base
+    git -C "$WT" branch run-base
+    printf 'bad build\n' > "$WT/a.js"
+    printf '\n' >> "$WT/$path"
+    git -C "$WT" add a.js "$path"
+    git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm build
+    TARGET="$WT"; WT="$CURRENT"; export ARTIFACTS_DIR="$WT/artifacts" BASE_BRANCH=run-base FIX_MAP=''
+    export FIX_SPEC="$(printf 'WO Class: CODE\nStop 1 (test suite):\n  %s\nExpected: pass' "$command")"
+    if [ "$location" = stage ]; then
+      export RST_STAGE_WORKTREES="b=$TARGET"
+      export FIX_SPEC="$(printf 'WO Class: CODE\n## Canonical stages\n```yaml\nstages:\n  - id: b\n    repo: thinmansoftware/other\n    target_branch: run-base\n    in_scope_files: [src]\n    verify_commands: ["%s"]\n    readiness_bar: {spec_complete: true, scope_complete: true, dependencies_ready: true, acceptance_defined: true}\n```' "$command")"
+    fi
+    export FIX_INITIAL="$(run_node run-stop-tests)"
+    check contains "$FIX_INITIAL" 'TESTS_STATUS=failed'
+    check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    if [ "$kind" = bypass ]; then
+      # The listing must fail closed even if the frozen entry was bypassed.
+      python3 - "$ARTIFACTS_DIR/evidence/test-guard.json" "$path" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text())
+for saved in data.values(): saved['frozen'].pop(sys.argv[2], None)
+path.write_text(json.dumps(data), encoding='ascii')
+PY
+    fi
+    if [[ "$kind" = *post* || "$kind" = nested_lifecycle ]]; then
+      printf 'console.log("Tests: 2/2");\n' > "$TARGET/$path"
+    else
+      printf 'echo "Tests: 2/2"\n' > "$TARGET/$path"
+    fi
+    check test "$(cd "$TARGET" && bash -c "$command" | rst_parse_counts)" = '2 2'
+    if [ "$kind" = delete ]; then rm "$TARGET/$path"; fi
+    check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    run_node test-repair until_bash >/dev/null
+    export FIX_FINAL="$(run_node run-stop-tests-final)"
+    check contains "$FIX_FINAL" 'TESTS_STATUS=blocked'
+    check contains "$FIX_FINAL" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+    check contains "$FIX_FINAL" 'TESTS_REPAIR_RESULT=guard_violation'
+    check contains "$FIX_FINAL" "test guard: repair changed test infrastructure: $path (frozen; a human must change it)"
+    check contains "$FIX_FINAL" "$(printf 'Repair touched test infrastructure\n%s' "$path")"
+    unset RST_STAGE_WORKTREES BASE_BRANCH
+  done
+done
+unset npm_config_script_shell
+
+# New helpers must be product code too, including ignored paths.
+for name in helper.sh helper.bash helper.ps1 scripts/run.js specs/helper.js runner; do
+  fixture "rs2-new-$PASS"
+  trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+  mkdir -p "$WT/$(dirname "$name")"
+  printf 'new\n' > "$WT/$name"
+  if [ "$name" = runner ]; then git -C "$WT" add runner; git -C "$WT" update-index --chmod=+x runner; fi
+  check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+done
 finish test-repair-guard.sh
