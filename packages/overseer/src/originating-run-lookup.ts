@@ -22,6 +22,8 @@ export interface OriginatingRunCandidate {
   /** SQLite yields a string; PostgreSQL yields a Date (TIMESTAMPTZ) through the pg adapter. */
   readonly started_at: string | Date | null;
   readonly working_path: string | null;
+  /** Engine-written codebase name (owner/repo) from the run's codebase FK; null when unlinked. */
+  readonly codebase_name?: string | null;
   readonly event_data: string | null;
 }
 
@@ -82,6 +84,23 @@ function mentionsPullRequest(eventData: string, input: OriginatingRunLookupInput
   return pattern.test(eventData);
 }
 
+/**
+ * A worktree branch is only unique within one repository: two repos can use the same
+ * `archon/task-web-worker-<id>` shape. Bind the candidate to the target repo through the
+ * engine-written codebase name, or, when the run has no codebase link, through the
+ * `/<owner>/<repo>/` segment of its engine-written worktree path.
+ */
+function belongsToRepo(
+  candidate: OriginatingRunCandidate,
+  input: OriginatingRunLookupInput
+): boolean {
+  const want = (input.owner + '/' + input.repo).toLowerCase();
+  const name = (candidate.codebase_name ?? '').trim().toLowerCase();
+  if (name !== '') return name === want || name.endsWith('/' + want);
+  const path = (candidate.working_path ?? '').split('\\').join('/').toLowerCase();
+  return path.includes('/' + want + '/');
+}
+
 function worktreeEndsWithBranch(workingPath: string, headRef: string): boolean {
   const normalized = workingPath.split('\\').join('/').replace(/\/+$/, '');
   return normalized === headRef || normalized.endsWith('/' + headRef);
@@ -102,7 +121,8 @@ export async function findOriginatingRunForPullRequest(
     const byBranch =
       headRef !== '' &&
       typeof candidate.working_path === 'string' &&
-      worktreeEndsWithBranch(candidate.working_path, headRef);
+      worktreeEndsWithBranch(candidate.working_path, headRef) &&
+      belongsToRepo(candidate, input);
     const byUrl =
       typeof candidate.event_data === 'string' && mentionsPullRequest(candidate.event_data, input);
     if (!byBranch && !byUrl) continue;

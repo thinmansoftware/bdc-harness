@@ -42,6 +42,7 @@ function candidate(overrides: Partial<OriginatingRunCandidate>): OriginatingRunC
     status: 'completed',
     started_at: '2026-11-10 10:00:00',
     working_path: null,
+    codebase_name: null,
     event_data: null,
     ...overrides,
   };
@@ -85,7 +86,12 @@ describe('findOriginatingRunForPullRequest', () => {
     ]);
     expect(byUrl?.runId).toBe('newer');
     const byBranch = await findOriginatingRunForPullRequest(input, async () => [
-      candidate({ id: 'worktree-run', working_path: `/ws/worktrees/${BRANCH}`, status: 'running' }),
+      candidate({
+        id: 'worktree-run',
+        codebase_name: 'thinmansoftware/bdc-harness',
+        working_path: `/ws/worktrees/${BRANCH}`,
+        status: 'running',
+      }),
     ]);
     expect(byBranch).toEqual({ runId: 'worktree-run', status: 'running' });
   });
@@ -101,6 +107,48 @@ describe('findOriginatingRunForPullRequest', () => {
       candidate({ id: 'longer-branch', working_path: `/ws/worktrees/${BRANCH}-2` }),
     ]);
     expect(lookalike).toBeNull();
+  });
+
+  test('a worktree branch only matches a run of the SAME repository', async () => {
+    const path = '/ws/worktrees/' + BRANCH;
+    // newer completed run of ANOTHER repo with the same branch name must not supersede
+    const bound = await findOriginatingRunForPullRequest(input, async () => [
+      candidate({
+        id: 'target-failed',
+        status: 'failed',
+        started_at: '2026-11-10 09:00:00',
+        working_path: path,
+        codebase_name: 'thinmansoftware/bdc-harness',
+      }),
+      candidate({
+        id: 'other-repo-newer',
+        status: 'completed',
+        started_at: '2026-11-10 11:00:00',
+        working_path: path,
+        codebase_name: 'thinmansoftware/shopops',
+      }),
+    ]);
+    expect(bound).toEqual({ runId: 'target-failed', status: 'failed' });
+    // no codebase link: fall back to the owner/repo segment of the worktree path
+    const byPath = await findOriginatingRunForPullRequest(input, async () => [
+      candidate({
+        id: 'shopops-path',
+        started_at: '2026-11-10 11:00:00',
+        working_path: '/.archon/workspaces/thinmansoftware/shopops/worktrees/' + BRANCH,
+      }),
+      candidate({
+        id: 'harness-path',
+        started_at: '2026-11-10 09:00:00',
+        working_path: '/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/' + BRANCH,
+      }),
+    ]);
+    expect(byPath?.runId).toBe('harness-path');
+    // another repo only: no match at all
+    expect(
+      await findOriginatingRunForPullRequest(input, async () => [
+        candidate({ id: 'x', working_path: path, codebase_name: 'thinmansoftware/shopops' }),
+      ])
+    ).toBeNull();
   });
 
   test('most recent run wins for Date values (PostgreSQL), ISO strings and SQLite strings, mixed', async () => {

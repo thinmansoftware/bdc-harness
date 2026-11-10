@@ -140,6 +140,7 @@ describe('overseer db', () => {
     // the longer PR number (420) is narrowed by LIKE and filtered by the caller; the
     // implement-step mention and the pr-discovery parent row are never candidates
     expect(ids).toEqual(['run-by-branch', 'run-by-url', 'run-unrelated']);
+    expect(rows.every(row => 'codebase_name' in row)).toBe(true);
     const byBranch = rows.find(row => row.id === 'run-by-branch');
     expect(byBranch?.status).toBe('running');
     expect(byBranch?.working_path).toBe('/ws/worktrees/archon/task-web-worker-1-abc');
