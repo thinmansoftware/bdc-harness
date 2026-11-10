@@ -56,18 +56,17 @@ function Test-LocalPortOpen {
 }
 
 function Start-TunnelProcess {
-    param([string]$SshHost, [int]$LocalPort)
+    param([string]$SshHost, [int]$LocalPort, [string]$Executable = '')
     $forward = "127.0.0.1:${LocalPort}:127.0.0.1:3090"
-    $process = Start-Process -FilePath 'ssh' -ArgumentList @(
-        '-N',
-        '-o', 'ExitOnForwardFailure=yes',
-        '-o', 'ServerAliveInterval=30',
-        '-o', 'ServerAliveCountMax=3',
-        '-L', $forward,
-        $SshHost
-    ) -WindowStyle Hidden -PassThru
-    $null = $process.Handle
-    return $process
+    if ($Executable) { $ssh = $Executable }
+    else { $ssh = (Get-Command ssh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
+    $arguments = @('-N', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=30', '-o', 'ServerAliveCountMax=3', '-L', $forward, $SshHost)
+    $commandLine = (Format-ProcessArgument -Value $ssh) + ' ' + (($arguments | ForEach-Object { Format-ProcessArgument -Value $_ }) -join ' ')
+    # The tunnel is launcher-owned, so it lives in its own kill-on-close job object, exactly like the
+    # worker. A Start-Process tunnel was NOT in a job: when Task Scheduler stopped the task (or the
+    # launcher died any other way) the ssh process survived, kept the local port, and every restart
+    # failed with "port is held by a process this launcher did not start" (2026-11-10, #3418).
+    return Start-JobOwnedProcess -CommandLine $commandLine -WorkingDirectory ((Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path)
 }
 
 $script:DispatchJobSource = @'
@@ -273,6 +272,25 @@ function Resolve-BunLauncher {
     throw ("bun resolved to '" + $path + "', which cannot be started as a process (not .exe, .cmd or .bat)")
 }
 
+# Starts a process inside its own Windows Job Object (kill-on-close), created suspended and assigned
+# BEFORE its first instruction runs, so every descendant it ever spawns is in the job and the whole
+# set dies with the launcher. Used for the worker and for the ssh tunnel.
+function Start-JobOwnedProcess {
+    param([string]$CommandLine, [string]$WorkingDirectory, [string]$Label = 'process')
+    try {
+        Initialize-DispatchJobType
+        $job = [BdcDispatchJob]::Start($CommandLine, $WorkingDirectory)
+    }
+    catch {
+        # Fail loud and closed: without the job there is no guaranteed ownership of descendants.
+        throw ("could not start the $Label inside a job object: " + $_.Exception.Message)
+    }
+    $process = Get-Process -Id $job.ProcessId -ErrorAction Stop
+    $null = $process.Handle
+    Add-Member -InputObject $process -MemberType NoteProperty -Name DispatchJob -Value $job -Force
+    return $process
+}
+
 function Start-WorkerProcess {
     param(
         [string]$ConfigPath,
@@ -288,18 +306,7 @@ function Start-WorkerProcess {
         ' --config ' + (Format-ProcessArgument -Value $ConfigPath)
     # A .cmd shim must be run by cmd.exe (/d no AutoRun, /s keeps the outer quotes, /c run and exit).
     if ($launcher.ViaCmd) { $commandLine = 'cmd.exe /d /s /c "' + $commandLine + '"' }
-    try {
-        Initialize-DispatchJobType
-        $job = [BdcDispatchJob]::Start($commandLine, $repoRoot)
-    }
-    catch {
-        # Fail loud and closed: without the job there is no guaranteed ownership of descendants.
-        throw ('could not start the worker inside a job object: ' + $_.Exception.Message)
-    }
-    $process = Get-Process -Id $job.ProcessId -ErrorAction Stop
-    $null = $process.Handle
-    Add-Member -InputObject $process -MemberType NoteProperty -Name DispatchJob -Value $job -Force
-    return $process
+    return Start-JobOwnedProcess -CommandLine $commandLine -WorkingDirectory $repoRoot -Label 'worker'
 }
 
 # Every descendant (child, grandchild, ...) of a process, from the live process table, with the

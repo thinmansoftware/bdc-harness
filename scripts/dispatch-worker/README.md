@@ -603,3 +603,21 @@ takes a running worker down.
   one worker, one tunnel owned by the launcher, the listener on the tunnel port, a new lock, a server-side
   heartbeat under 120 seconds, and one real message carried end to end. **S5** the two injections (tunnel kill,
   foreign-PID lock).
+
+Pass criteria added after the 2026-11-10 swap (each is a command with raw output, a blank result fails):
+
+- **S3 no window.** Both registered actions are `conhost.exe` with arguments that start `--headless powershell.exe`
+  (`(Get-ScheduledTask -TaskName 'BlueDevil-Dispatch-Worker*').Actions | Select Execute,Arguments`). Start each
+  task by hand (`schtasks /Run /TN <name>`) and confirm no window appears on the desktop:
+  `Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.Id -in <launcher/watchdog/bun/ssh pids> }`
+  prints nothing, and no `conhost.exe` window is visible. `powershell.exe -WindowStyle Hidden` is NOT enough: it
+  still flashes a console, and a plain `powershell.exe` action holds a console open for the life of the worker
+  (2026-11-10, John: "this windows kept popping up").
+- **S3 stop is clean.** `Stop-ScheduledTask -TaskName BlueDevil-Dispatch-Worker` leaves no `bun.exe` for the
+  worker and no `ssh.exe` with the tunnel forward on the worker's port, and the port is free. The worker AND the
+  tunnel each live in a kill-on-close job object; before that fix the tunnel survived a task stop and every
+  restart failed with "port is held by a process this launcher did not start" until it was killed by hand.
+- **S5 timing.** The launcher restarts after a failure with backoff 10, 30, 60, then 120 seconds, and the failure
+  counter resets only after the pair has run 600 seconds. A recovery bar is therefore 180 seconds (an
+  injection right after other restarts lands on the 120 second step), not 120; run injections on a pair that
+  has been stable for 10 minutes and ONE AT A TIME, never in the background while another step can stop the task.

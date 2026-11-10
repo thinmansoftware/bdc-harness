@@ -14,7 +14,13 @@ if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
     throw "Launcher is missing: $launcher"
 }
 
+# Both tasks run through conhost.exe --headless so NO console window ever appears on the interactive
+# desktop, not even a flash (powershell.exe -WindowStyle Hidden still flashes). Task Scheduler runs an
+# Interactive-logon task in the user's session, and a plain powershell.exe action holds a visible
+# console open for the life of the worker (2026-11-10, John: "this windows kept popping up").
 $arguments = @(
+    '--headless',
+    'powershell.exe',
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
     '-File', ('"' + $launcher + '"'),
@@ -24,7 +30,7 @@ $arguments = @(
 ) -join ' '
 
 if ($PSCmdlet.ShouldProcess($TaskName, 'Register logon dispatch worker task')) {
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
+    $action = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument $arguments
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     # Bounded watchdog restart (M-51 AMEND-9 gap 2): Task Scheduler restarts the
     # task up to RestartCount times, spaced RestartInterval apart, on ANY
@@ -53,6 +59,8 @@ if (-not (Test-Path -LiteralPath $watchdogWrapper -PathType Leaf)) {
 }
 
 $watchdogArguments = @(
+    '--headless',
+    'powershell.exe',
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
     '-File', ('"' + $watchdogWrapper + '"'),
@@ -61,7 +69,7 @@ $watchdogArguments = @(
 ) -join ' '
 
 if ($PSCmdlet.ShouldProcess($WatchdogTaskName, 'Register repeating dispatch worker watchdog task')) {
-    $watchdogAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $watchdogArguments
+    $watchdogAction = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument $watchdogArguments
     # -Once anchored to now, repeating every 5 minutes indefinitely. The cmdlet
     # requires a duration alongside an interval, and the TimeSpan max duration is
     # rejected by modern Task Scheduler. Build with a finite duration, then clear
