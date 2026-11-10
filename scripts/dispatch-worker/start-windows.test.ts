@@ -7,7 +7,7 @@
  * suite is skipped and the launcher behavior must be verified operator-side.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -809,6 +809,155 @@ Write-Output ('SURVIVED_FLAG=' + $script:DescendantsSurvived)
           await new Promise(resolve => setTimeout(resolve, 100));
         }
       }
+    }
+  }, 90000);
+});
+
+// 2026-11-10: the first real run of the job-object launcher failed at S4 of the #3418 swap. Under Windows
+// PowerShell 5.1 (the Task Scheduler shell) Get-Command bun returns the npm shim bun.ps1, and CreateProcess
+// cannot start a .ps1 (error 193). The earlier tests always passed bun.exe explicitly, so PATH resolution was
+// never exercised. These run the REAL Start-WorkerProcess / Resolve-BunLauncher through powershell.exe.
+suite('start-windows.ps1 bun resolution (the S4 failure)', () => {
+  const q = (value: string): string => `'${value.replace(/'/g, "''")}'`;
+  async function runPs(
+    body: string,
+    env: Record<string, string> = {}
+  ): Promise<{ out: string; err: string }> {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-bun-'));
+    try {
+      const script = join(dir, 'scenario.ps1');
+      await writeFile(
+        script,
+        `$ErrorActionPreference = 'Stop'
+. ${q(LAUNCHER)}
+${body}
+`,
+        'utf8'
+      );
+      const proc = Bun.spawn(
+        [
+          'powershell.exe',
+          '-NoProfile',
+          '-NonInteractive',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-File',
+          script,
+        ],
+        { stdout: 'pipe', stderr: 'pipe', env: { ...process.env, ...env } }
+      );
+      const [out, err] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      await proc.exited;
+      return { out, err };
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('Start-WorkerProcess with NO -Executable starts the worker through PATH resolution', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch launcher path '));
+    try {
+      const probe = join(dir, 'probe entry.ts');
+      const outFile = join(dir, 'argv out.json');
+      await writeFile(
+        probe,
+        "import { writeFileSync } from 'fs'; writeFileSync(process.env.PROBE_OUT as string, JSON.stringify(process.argv.slice(2)));\n",
+        'utf8'
+      );
+      const config = join(dir, 'config.local.json');
+      const { out, err } = await runPs(
+        `$p = Start-WorkerProcess -ConfigPath ${q(config)} -Entry ${q(probe)}
+$null = $p.WaitForExit(30000)
+Write-Output ('EXIT=' + $p.ExitCode)`,
+        { PROBE_OUT: outFile }
+      );
+      expect(out, err).toContain('EXIT=0');
+      expect(JSON.parse(await readFile(outFile, 'utf8'))).toEqual(['--config', config]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 90000);
+
+  test('Resolve-BunLauncher never returns a .ps1 shim: a sibling bun.exe wins, a lone .cmd is run through cmd.exe', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-launcher-resolve-'));
+    try {
+      const withExe = join(dir, 'with-exe');
+      const cmdOnly = join(dir, 'cmd-only');
+      const ps1Only = join(dir, 'ps1-only');
+      for (const d of [withExe, cmdOnly, ps1Only]) await mkdir(d, { recursive: true });
+      await mkdir(join(withExe, 'node_modules', 'bun', 'bin'), { recursive: true });
+      await copyFile(process.execPath, join(withExe, 'node_modules', 'bun', 'bin', 'bun.exe'));
+      for (const d of [withExe, cmdOnly, ps1Only])
+        await writeFile(join(d, 'bun.ps1'), 'exit 0\n', 'utf8');
+      for (const d of [withExe, cmdOnly])
+        await writeFile(join(d, 'bun.cmd'), '@echo off\r\n', 'utf8');
+      const { out, err } = await runPs(`
+foreach ($d in @(${q(withExe)}, ${q(cmdOnly)}, ${q(ps1Only)})) {
+    $env:PATH = $d + ';' + $env:SystemRoot + '\System32'
+    try {
+        $r = Resolve-BunLauncher
+        Write-Output ((Split-Path $d -Leaf) + '=' + $r.Path + '|viacmd=' + $r.ViaCmd)
+    } catch { Write-Output ((Split-Path $d -Leaf) + '=THROWS ' + $_.Exception.Message) }
+}`);
+      const line = (name: string): string =>
+        out.split(/\r?\n/).find(l => l.startsWith(`${name}=`)) ?? '';
+      expect(line('with-exe'), out + err).toContain(join('node_modules', 'bun', 'bin', 'bun.exe'));
+      expect(line('with-exe')).toContain('viacmd=False');
+      expect(line('cmd-only'), out + err).toContain('bun.cmd');
+      expect(line('cmd-only')).toContain('viacmd=True');
+      expect(line('ps1-only'), out + err).toContain('THROWS');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }, 90000);
+});
+
+// The precheck script every launcher swap runs BEFORE touching the task (README "Swapping the worker launcher").
+suite('preflight-launcher.ps1 dry start under Windows PowerShell', () => {
+  const PRECHECK = join(import.meta.dir, 'preflight-launcher.ps1');
+  async function runPrecheck(extra: string[] = []): Promise<{ out: string; code: number }> {
+    const proc = Bun.spawn(
+      [
+        'powershell.exe',
+        '-NoProfile',
+        '-NonInteractive',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        PRECHECK,
+        ...extra,
+      ],
+      { stdout: 'pipe', stderr: 'pipe' }
+    );
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    return { out, code: proc.exitCode ?? -1 };
+  }
+
+  test('the current launcher passes the dry start', async () => {
+    const r = await runPrecheck();
+    expect(r.out).toContain('LAUNCHER_DRY_START_OK');
+    expect(r.code).toBe(0);
+  }, 90000);
+
+  test('a launcher that cannot start its worker fails the dry start loudly and exits 1', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'dispatch-preflight-bad-'));
+    try {
+      const bad = join(dir, 'start-windows.ps1');
+      await writeFile(
+        bad,
+        "function Start-WorkerProcess { param([string]$ConfigPath, [string]$Executable = '', [string]$Entry = '') throw 'could not start the worker inside a job object: CreateProcess failed: 193' }\n",
+        'utf8'
+      );
+      const r = await runPrecheck(['-Launcher', bad]);
+      expect(r.out).toContain('LAUNCHER_DRY_START_FAIL');
+      expect(r.out).toContain('CreateProcess failed: 193');
+      expect(r.code).toBe(1);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   }, 90000);
 });
