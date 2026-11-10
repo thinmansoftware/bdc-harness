@@ -874,8 +874,10 @@ for location in current stage; do
     esac
     git -C "$WT" add a.js check.sh "$path"
     if [ -f "$WT/package.json" ]; then git -C "$WT" add package.json; fi
-    # On Windows use the index mode; the classifier must honor both sources.
-    if [ "$kind" = executable ]; then git -C "$WT" update-index --chmod=+x "$path"; fi
+    # Set the bit on disk AND in the index; the classifier must honor both sources.
+    # With core.filemode=true (Linux) the later build-commit `git add` re-reads the
+    # worktree mode, so an index-only +x would silently revert to 644 there.
+    if [ "$kind" = executable ]; then chmod +x "$WT/$path"; git -C "$WT" update-index --chmod=+x "$path"; fi
     git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm base
     git -C "$WT" branch run-base
     printf 'bad build\n' > "$WT/a.js"
