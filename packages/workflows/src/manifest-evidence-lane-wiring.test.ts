@@ -266,6 +266,11 @@ function runStopTestsNode(opts: {
   const artifacts = join(cwd, 'artifacts');
   mkdirSync(artifacts);
   try {
+    // The repair snapshot requires a real Git worktree, including in fixtures.
+    const gitInit = Bun.spawnSync(['git', 'init', '-q'], { cwd });
+    if (gitInit.exitCode !== 0) {
+      throw new Error(`Fixture git init failed: ${gitInit.stderr.toString()}`);
+    }
     writeFileSync(
       join(cwd, 'package.json'),
       `${JSON.stringify({ name: 'x', scripts: { test: 'bash ./repo-pass.sh' } })}\n`
