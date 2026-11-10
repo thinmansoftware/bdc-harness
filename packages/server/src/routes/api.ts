@@ -7,6 +7,7 @@ import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
 import { IN_PROCESS_API_ORIGIN, isInProcessServiceRequest } from './in-process-authority';
 import { releaseWoClaim, takeOverWoClaimForResume } from '@archon/core/db/cascade-wo-claims';
 import { cascadeWoClaimDeps } from '../cascade/wo-claim';
+import { notePrincipalPoll } from '../dispatch/workroom-drainer-stall';
 import { streamSSE } from 'hono/streaming';
 import { cors } from 'hono/cors';
 import type { WebAdapter } from '../adapters/web';
@@ -5204,12 +5205,15 @@ export function registerApiRoutes(
             limit: Number.isFinite(rawLimit) ? rawLimit : 100,
             allowBoardAlias: false,
           });
+          notePrincipalPoll(principalCredential.principal_id);
           return c.json(messages);
         }
         if (selection.recipient !== listed.recipient) {
           return apiError(c, 403, 'dispatch_principal_forbidden');
         }
-        return c.json(await loadSelectedDispatchMessages(selection));
+        const messages = await loadSelectedDispatchMessages(selection);
+        notePrincipalPoll(principalCredential.principal_id);
+        return c.json(messages);
       } catch (error) {
         if (error instanceof Error && error.message === 'dispatch_not_before_unparseable') {
           return apiError(c, 500, 'dispatch_not_before_unparseable');
