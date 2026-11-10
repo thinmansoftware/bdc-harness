@@ -293,12 +293,19 @@ describe('run-completion-report', () => {
 
   test('Test 6: script is packaged into the image', () => {
     const df = readFileSync(join(import.meta.dir, '..', 'Dockerfile'), 'utf8');
-    const line = df
-      .split('\n')
-      .find(l => l.startsWith('COPY scripts/') && l.endsWith('./scripts/'));
+    const production = df.split('AS production')[1];
+    expect(production).toBeDefined();
+    const line = production
+      .split(/\r?\n/)
+      .find(
+        l =>
+          l.startsWith('COPY scripts/') &&
+          l.endsWith('./scripts/') &&
+          l.split(/\s+/).includes('scripts/run-completion-report.ts')
+      );
     expect(line).toBeDefined();
     expect(line).toContain('scripts/run-completion-report.ts');
-    expect(df.split('AS production')[1]).toContain('scripts/run-completion-report.ts');
+    expect(production).toContain('scripts/run-completion-report.ts');
   });
 });
 
