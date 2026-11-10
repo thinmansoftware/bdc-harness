@@ -12,6 +12,8 @@ import {
 } from './merge-provenance';
 import { OWNER_REWORKING_LABEL } from './merge-candidate-discovery';
 import { eventMessage } from './watch';
+import { isRunTerminal } from './originating-run-lookup';
+import type { OriginatingRun, OriginatingRunLookupInput } from './originating-run-lookup';
 import type { QualifiedMergeEvidence } from './actions/merge-ready';
 import {
   getRepoBasePolicy,
@@ -40,6 +42,8 @@ export const BASE_BRANCH_MISMATCH_HOLD_REASON = 'base_branch_mismatch' as const;
 export const ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON =
   'originating_run_failed_evidence_gate' as const;
 export const ORIGINATING_RUN_UNREADABLE_HOLD_REASON = 'originating_run_unreadable' as const;
+/** A run-opened PR is held while its run has not finished: the evidence gate has not run yet. */
+export const ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON = 'originating_run_in_progress' as const;
 export const MERGE_MANAGER_EVIDENCE_ADJUDICATORS_ENV =
   'MERGE_MANAGER_EVIDENCE_ADJUDICATORS' as const;
 const EVIDENCE_HOLD_LABEL = 'merge:held-evidence';
@@ -93,6 +97,16 @@ const log = createLogger('overseer/merge-manager');
 export interface MergeManagerDeps extends OverseerActionsDeps, GitHubClientDeps {
   /** Read the provenance-bound run's events; absent or throwing fails closed. */
   readonly readRunEvents?: (runId: string) => Promise<OverseerWorkflowEvent[]>;
+  /**
+   * Trace a PR-discovered (run-less) candidate to the run that opened it
+   * (bdc-harness 5308). Absent keeps the run-less path unchanged; a rejection
+   * fails closed with originating_run_unreadable.
+   * Production wiring is findOriginatingRunForPullRequest over listOriginatingRunCandidates
+   * (originating-run-lookup.ts), set in createRuntimeMergeManager.
+   */
+  readonly findOriginatingRun?: (
+    input: OriginatingRunLookupInput
+  ) => Promise<OriginatingRun | null>;
   readonly assembleEvidence?: (
     record: WatchedRunRecord
   ) => Promise<AssembledQualifiedMergeEvidence>;
@@ -599,7 +613,8 @@ function trimmedBranch(value: string | null | undefined): string | null {
 
 export type EvidenceHoldReason =
   | typeof ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON
-  | typeof ORIGINATING_RUN_UNREADABLE_HOLD_REASON;
+  | typeof ORIGINATING_RUN_UNREADABLE_HOLD_REASON
+  | typeof ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON;
 
 export interface OriginatingEvidenceRun {
   runId: string;
@@ -662,6 +677,52 @@ export async function originatingEvidenceFailure(
   }
 }
 
+/**
+ * Evidence hold for a run-less (PR-discovered or run-less verdict) candidate.
+ * Traces the PR to the run that opened it. Returns null when no run opened it
+ * (a human PR proceeds on green, John 2026-09-07) or when the run's gate did
+ * not fail. Fails closed: a lookup error holds as originating_run_unreadable.
+ * A run that has not finished holds as originating_run_in_progress, because its
+ * evidence gate has not run yet (the 2026-11-10 canary merged such a PR 5 minutes
+ * before the gate failed).
+ */
+export async function runlessOriginatingEvidenceHold(
+  input: OriginatingRunLookupInput,
+  findOriginatingRun: (input: OriginatingRunLookupInput) => Promise<OriginatingRun | null>,
+  readRunEvents?: (runId: string) => Promise<OverseerWorkflowEvent[]>
+): Promise<{
+  runId: string;
+  failure: { reason: EvidenceHoldReason; error: string };
+} | null> {
+  let run: OriginatingRun | null;
+  try {
+    run = await findOriginatingRun(input);
+  } catch (error) {
+    return {
+      runId: `pr-discovery:${input.owner}/${input.repo}#${String(input.number)}`,
+      failure: {
+        reason: ORIGINATING_RUN_UNREADABLE_HOLD_REASON,
+        error: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+  if (!run) return null;
+  if (!isRunTerminal(run.status)) {
+    return {
+      runId: run.runId,
+      failure: {
+        reason: ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON,
+        error: `originating run ${run.runId} is ${run.status}; its evidence gate has not run yet`,
+      },
+    };
+  }
+  const failure = await originatingEvidenceFailure(
+    { runId: run.runId, status: run.status },
+    readRunEvents
+  );
+  return failure ? { runId: run.runId, failure } : null;
+}
+
 export async function evidenceAdjudicated(
   deps: EvidenceGitHubDeps,
   target: EvidenceHoldTarget,
@@ -720,7 +781,10 @@ export async function postEvidenceHold(
 ): Promise<void> {
   if (mode === 'hold-canary' || (mode === 'execute' && !mutationsEnabled)) return;
   const pr = { owner: target.owner, repo: target.repo, number: target.number };
-  const marker = `<!-- merge-evidence-hold:${target.headSha} -->`;
+  const inProgress = failure.reason === ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON;
+  const marker = inProgress
+    ? `<!-- merge-evidence-hold-in-progress:${target.headSha} -->`
+    : `<!-- merge-evidence-hold:${target.headSha} -->`;
   try {
     // Author-bound persistent marker, following postPolicySkipComment. No scan means
     // no safe once-per-head write; keep the hold and report the unavailable channel.
@@ -741,7 +805,9 @@ export async function postEvidenceHold(
           marker,
           failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON
             ? `Merge held: originating run ${runId} failed manifest-evidence-check`
-            : `Merge held: originating run ${runId} unreadable`,
+            : inProgress
+              ? `Merge held: originating run ${runId} has not finished`
+              : `Merge held: originating run ${runId} unreadable`,
           `headSha=${target.headSha}`,
           `reason=${failure.reason}`,
           failure.error.slice(0, 300),
@@ -755,7 +821,8 @@ export async function postEvidenceHold(
     );
   }
   // comment_findings only permits a comment, never a label mutation.
-  if (mode === 'execute' && mutationsEnabled) {
+  // The in-progress hold carries no label: it lifts by itself when the run ends.
+  if (mode === 'execute' && mutationsEnabled && !inProgress) {
     try {
       if (!deps.addPullRequestLabels) throw new Error('evidence hold label channel unavailable');
       await deps.addPullRequestLabels({ ...pr, labels: [EVIDENCE_HOLD_LABEL] });
@@ -966,8 +1033,27 @@ export function createMergeManager(
       };
     }
 
-    if (provenance.reason !== 'no_run') {
-      const failure = await originatingEvidenceFailure(record, deps.readRunEvents);
+    {
+      const runless = provenance.reason === 'no_run';
+      // Run-less candidates are traced to the run that opened the PR (bdc-harness 5308);
+      // with no lookup wired, or no run found, the run-less path is unchanged.
+      const traced =
+        runless && deps.findOriginatingRun
+          ? await runlessOriginatingEvidenceHold(
+              {
+                owner: evidence.owner,
+                repo: evidence.repository,
+                number: evidence.pr_number,
+                headRef: evidence.record.prEvidence.pr?.headRef ?? record.headBranch,
+              },
+              deps.findOriginatingRun,
+              deps.readRunEvents
+            )
+          : null;
+      const holdRunId = traced ? traced.runId : record.runId;
+      const failure = runless
+        ? (traced?.failure ?? null)
+        : await originatingEvidenceFailure(record, deps.readRunEvents);
       const target: EvidenceHoldTarget = {
         owner: evidence.owner,
         repo: evidence.repository,
@@ -993,7 +1079,7 @@ export function createMergeManager(
           { runId: record.runId, woId: record.woId, mode, reason: failure.reason },
           'merge_manager.originating_evidence_held'
         );
-        await postEvidenceHold(deps, record.runId, target, failure, mode, mutationsEnabled);
+        await postEvidenceHold(deps, holdRunId, target, failure, mode, mutationsEnabled);
         return {
           status: 'held',
           receipt: holdReceipt(evidence, evidenceDigest, failure.reason),

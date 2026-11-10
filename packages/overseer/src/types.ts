@@ -154,7 +154,8 @@ export interface GrokDispositionReceipt {
     | 'judge_exit_nonzero'
     | 'judge_error'
     | 'originating_run_failed_evidence_gate'
-    | 'originating_run_unreadable';
+    | 'originating_run_unreadable'
+    | 'originating_run_in_progress';
   woId: string;
   prNumber: number;
   headSha: string;

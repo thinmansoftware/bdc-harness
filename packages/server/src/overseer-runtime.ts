@@ -4,7 +4,8 @@ import type { OverseerServiceOptions, OverseerWiredAdapterKind } from '@archon/o
 import { createMergeManager, PRODUCTION_EFFECT_HOLD_REASON } from '@archon/overseer/merge-manager';
 import type { MergeManagerDeps } from '@archon/overseer/merge-manager';
 import type { OverseerRunStoreDeps } from '@archon/overseer';
-import { getOverseerWatchRunById } from '@archon/core/db/overseer';
+import { getOverseerWatchRunById, listOriginatingRunCandidates } from '@archon/core/db/overseer';
+import { findOriginatingRunForPullRequest } from '@archon/overseer/originating-run-lookup';
 import { DEFAULT_WATCH_INTERVAL_MS } from '@archon/overseer/watch';
 import {
   logDiscoveryConfigurationAtStartup,
@@ -21,6 +22,10 @@ export function createRuntimeMergeManager(
 ): ReturnType<typeof createMergeManager> {
   return createMergeManager({
     ...deps,
+    findOriginatingRun:
+      deps.findOriginatingRun ??
+      ((input): ReturnType<typeof findOriginatingRunForPullRequest> =>
+        findOriginatingRunForPullRequest(input, listOriginatingRunCandidates)),
     readRunEvents: async runId => {
       const run = await findRun(runId);
       if (run?.id !== runId) throw new Error(`originating run ${runId} not found`);

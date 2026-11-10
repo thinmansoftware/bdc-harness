@@ -16,6 +16,7 @@
     "./merge-coordinator": "./src/merge-coordinator.ts",
     "./merge-manager": "./src/merge-manager.ts",
     "./merge-execution-bridge": "./src/merge-execution-bridge.ts",
+    "./originating-run-lookup": "./src/originating-run-lookup.ts",
     "./service": "./src/service.ts",
     "./m31-substrate": "./src/m31-substrate.ts",
     "./action-policy": "./src/action-policy.ts",
