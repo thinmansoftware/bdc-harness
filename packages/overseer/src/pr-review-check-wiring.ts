@@ -105,6 +105,8 @@ interface SubmitReceiptBody {
   headSha?: string;
   reason?: string;
   event?: string;
+  /** The review work item this verdict was submitted for (the receipt always carries it). */
+  messageId?: string;
 }
 
 /**
@@ -143,7 +145,55 @@ export function foldSubmitReceipts(
       disposition: body.disposition,
       summary: null,
       recordedAt: receipt.created_at,
+      messageId: typeof body.messageId === 'string' ? body.messageId : null,
     };
+  }
+  return null;
+}
+
+/** The fields of a review work item that the summary selection reads. */
+export interface ReviewWorkRow {
+  id: string;
+  body: string;
+  status: string;
+  result_body: string | null;
+}
+
+/**
+ * Pick the review text for the verdict standing at `headSha`.
+ *
+ * WO-HARNESS-RECHECK-STANDING-VERDICT-SELECTION-01. A head can carry several
+ * `run_review` rows: the one that produced the verdict (done, result_body holds
+ * the summary) and LATER duplicates created by repeated rechecks, each
+ * cancelled as `superseded_by_claim` with a result_body that has a reason and
+ * no summary. The list is newest-first, so taking the first row at the head
+ * picked a duplicate, returned no finding text, and classified a check-caused
+ * CHANGES_REQUESTED as not check-caused (bdc-harness#1537 @76abd7a3).
+ *
+ * Order: the work item the submit receipt names; else the newest row at the head
+ * whose result_body has a summary. A cancelled row never supplies the text.
+ */
+export function selectReviewSummary(
+  work: readonly ReviewWorkRow[],
+  headSha: string,
+  receiptMessageId: string | null | undefined
+): string | null {
+  const atHead = work.filter(message => {
+    if (message.status === 'cancelled') return false;
+    try {
+      return (JSON.parse(message.body) as Partial<ReviewWorkBody>).headSha === headSha;
+    } catch {
+      return false;
+    }
+  });
+  if (receiptMessageId) {
+    const named = atHead.find(message => message.id === receiptMessageId);
+    const summary = named ? extractReviewSummary(named.result_body ?? null) : null;
+    if (summary !== null) return summary;
+  }
+  for (const message of atHead) {
+    const summary = extractReviewSummary(message.result_body ?? null);
+    if (summary !== null) return summary;
   }
   return null;
 }
@@ -187,15 +237,10 @@ export function createRealRecheckIngestDeps(config: ReviewRouteConfig): RecheckI
         recipient: REVIEW_RECIPIENT,
         subject_key: reviewSubjectKey(input.owner, input.repo, input.prNumber),
       });
-      const atHead = work.find(message => {
-        try {
-          const body = JSON.parse(message.body) as Partial<ReviewWorkBody>;
-          return body.headSha === input.headSha;
-        } catch {
-          return false;
-        }
-      });
-      return { ...verdict, summary: extractReviewSummary(atHead?.result_body ?? null) };
+      return {
+        ...verdict,
+        summary: selectReviewSummary(work, input.headSha, verdict.messageId),
+      };
     },
 
     async enqueueRecheckWork(input): Promise<{ messageId: string; alreadyExisted: boolean }> {

@@ -31,10 +31,12 @@ if ($PSCmdlet.ShouldProcess($TaskName, 'Register logon dispatch worker task')) {
     # trigger type including AtLogOn -- this is not limited to scheduled-time
     # triggers. RestartCount=5 / RestartInterval=1 minute bounds it to at most
     # 5 restarts total rather than an infinite tight crash-restart loop.
-    # ExecutionTimeLimit bounds a hung/wedged instance to a finite lifetime
-    # (1 day) so Task Scheduler will terminate and restart it instead of
-    # letting a stuck process sit forever consuming the single-instance slot.
-    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 1)
+    # No arbitrary worker lifetime cap (M-186, WO-HARNESS-DISPATCH-WORKER-STALE-LOCK-01):
+    # ExecutionTimeLimit is zero, meaning unlimited. A time cap killed a healthy worker on a
+    # schedule and was already out of step with the live task (PT72H vs this file's 1 day).
+    # Hung-worker recovery is a separate concern; the launcher supervises the tunnel and the
+    # worker, and the watchdog task below restarts a dead worker.
+    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
     Write-Output "DISPATCH_WINDOWS_TASK_REGISTERED=$TaskName"

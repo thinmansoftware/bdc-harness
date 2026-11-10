@@ -36,6 +36,7 @@ import {
 } from '@archon/core';
 import { createWorkflowDeps } from '@archon/core/workflows';
 import { runCascade } from '@archon/smart-cauldron/cascade';
+import { releaseWoLocksForRun } from '@archon/smart-cauldron/wo-lock';
 import { conductorSeatUsage } from '../services/conductor-seat-usage';
 import {
   readCascadeRecordById,
@@ -2991,6 +2992,20 @@ export type CancelWorkflowRunActorResult =
   | { ok: false; status: 400 | 404 | 409 | 422; message: string };
 
 /**
+ * Directory the conductor writes its cascade records and WO locks to. The
+ * supervised fire wrapper runs `cd /app && bun /tmp/fire-supervised.mjs`, so its
+ * default ./cascade-runs is <app root>/cascade-runs, while this server runs from
+ * packages/server -- a bare ./cascade-runs here would look in the wrong place and
+ * silently release nothing. SMART_CAULDRON_OUT_DIR overrides (it must equal the
+ * conductor's --out-dir).
+ */
+function conductorLockOutDir(): string {
+  const configured = process.env.SMART_CAULDRON_OUT_DIR?.trim();
+  if (configured) return configured;
+  return join(import.meta.dir, '..', '..', '..', '..', 'cascade-runs');
+}
+
+/**
  * Status-gated cancel used by POST /api/workflows/runs/:runId/cancel (actor
  * 'api') and the consumer's cancel-own (actor = the principal id). The status
  * checks, error codes, and the run_cancelled event shape are identical to the
@@ -3024,6 +3039,16 @@ export async function cancelWorkflowRunAsActor(
     event_type: 'run_cancelled',
     data: { reason, actor: opts.actor },
   });
+  // WO-HARNESS-WO-LOCK-RELEASE-ON-CANCEL-01: a cancelled run leaves its WO with
+  // no live run, so release the smart-cauldron file lock that run belongs to --
+  // otherwise a killed or cancelled conductor leaves status=running and the next
+  // fire is refused as a duplicate. Best-effort: the cancel itself already
+  // succeeded and must not fail on lock cleanup.
+  try {
+    await releaseWoLocksForRun(runId, conductorLockOutDir());
+  } catch (error) {
+    getLog().warn({ err: error, runId }, 'wo_lock.release_on_cancel_failed');
+  }
   const updated = await workflowDb.getWorkflowRun(runId);
   const updatedRun = updated ?? {
     ...run,

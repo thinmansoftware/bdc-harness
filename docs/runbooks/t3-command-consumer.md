@@ -19,7 +19,7 @@ the t3-bridge principal, and sets the allowlists (all below, all John's go).
 | `T3_COMMAND_CONSUMER_ENABLED` | unset (off) | Set to `1` to start the clock. Off = no reads, no writes. |
 | `T3_COMMAND_POLL_MS` | `15000` | Poll interval in ms (minimum 1000). |
 | `T3_COMMAND_ACTORS` | unset | Comma list of principal ids allowed to send commands. Unset or empty = every actor refused 403 `actor_not_allowed`. |
-| `T3_COMMAND_PROJECTS` | unset | Comma list of allowed project (codebase) names. Unset = every command refused 403 `project_not_allowed`. A project must also be a registered codebase. |
+| `T3_COMMAND_PROJECTS` | unset | Comma list of allowed project names, as the command sends them (the bare repo name, for example `bdc-xo`, the same naming as `fire.ps1 -Project` and fire-eligibility). Unset = every command refused 403 `project_not_allowed`. A project must also resolve to a registered codebase: an exact codebase name, or a bare repo name that matches exactly one `owner/repo` codebase (two or more matches = 400 `project_not_registered`, fail closed). |
 | `T3_COMMAND_APPROVE_BASES` | unset | Comma list of allowed PR bases as `owner/repo:branch`. Unset = every approve refused 403 `base_not_allowed`. NEVER list a production base (M-09). |
 | `T3_COMMAND_MAX_AGE_S` | `900` | A NEW command (no existing admission) older than this is refused 409 `expired` (Amendment 5 A5.6). |
 | `T3_APPROVAL_HANDOFF_S` | `120` | An approval's `failed` hand-off counts as live/transitional only this long after `approval_received` (A5.9). |

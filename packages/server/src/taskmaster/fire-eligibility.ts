@@ -5,6 +5,7 @@ import {
   resolveServiceGitHubAuth,
 } from '@archon/core/github/service-identity';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
+import { isSpecOnlyFileList } from '@archon/smart-cauldron/spec-only-pr';
 import {
   freezeWorkOrderSource,
   type ExpectedSpecIdentity,
@@ -123,7 +124,16 @@ export async function checkFireEligibility(
 
   const codebases = await (deps.codebases ?? listCodebases)();
   const repoKey = normalizeRepo(targetRepo);
-  const codebase = codebases.find(cb => normalizeRepo(cb.repository_url ?? cb.name) === repoKey);
+  // repository_url (else name) first, unchanged. Fallback: a codebase whose
+  // owner/repo NAME equals target_repo, used only when unique -- rows registered
+  // before the 2026-06-29 owner move keep a stale bluedevilcollectibles URL
+  // (bdc-xo#4311). A bare name never matches; ambiguity fails closed.
+  const nameMatches = codebases.filter(
+    cb => cb.name.includes('/') && normalizeRepo(cb.name) === repoKey
+  );
+  const codebase =
+    codebases.find(cb => normalizeRepo(cb.repository_url ?? cb.name) === repoKey) ??
+    (nameMatches.length === 1 ? nameMatches[0] : undefined);
   if (!codebase) return { eligible: false, reason: 'project_not_registered' };
   const project = codebase.name.includes('/') ? codebase.name.split('/').at(-1) : codebase.name;
   if (!project) return { eligible: false, reason: 'project_not_registered' };
@@ -133,7 +143,7 @@ export async function checkFireEligibility(
   const escaped = woId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const exactWo = new RegExp(`(?:^|[^A-Za-z0-9-])${escaped}(?:[^A-Za-z0-9-]|$)`);
   const identities = new Map<number, string>();
-  let satisfying = false;
+  const matching: number[] = [];
   let complete = false;
   const maxPages = 100;
   for (let page = 1; page <= maxPages; page++) {
@@ -178,7 +188,7 @@ export async function checkFireEligibility(
         exactWo.test(`${pr.title}\n${pr.body ?? ''}`) &&
         (pr.state === 'open' || pr.merged_at !== null)
       )
-        satisfying = true;
+        matching.push(number);
     }
     if (rows.length < 100) {
       complete = true;
@@ -186,7 +196,44 @@ export async function checkFireEligibility(
     }
   }
   if (!complete) throw new Error('taskmaster_fire_pr_listing_incomplete');
-  if (satisfying) return { eligible: false, reason: 'pr_exists' };
+  // A WO whose target repo is bdc-xo has its own spec PR (author-wo.sh: "WO: <id>",
+  // only docs/work-orders/<id>.md) in that same repo; it is not the build PR
+  // (bdc-xo#4311). Exact paths for this exact WO id; an unreadable or empty file
+  // list fails closed and still counts as pr_exists.
+  const isSpecOnlyPr = async (number: number): Promise<boolean> => {
+    const seen: unknown[] = [];
+    for (let page = 1; page <= 30; page++) {
+      const url = `https://api.github.com/repos/${targetRepo}/pulls/${String(number)}/files?per_page=100&page=${String(page)}`;
+      const response = deps.githubToken
+        ? await fetchImpl(url, { headers: headers(token) })
+        : await serviceGitHubFetchWithPermissionFallback({
+            service: 'taskmaster',
+            fetch: fetchImpl,
+            resource: 'core',
+            identity,
+            url,
+          });
+      assertRateLimit(response);
+      if (!response.ok) return false;
+      const rows: unknown = await response.json();
+      if (!Array.isArray(rows) || rows.length > 100) return false;
+      for (const row of rows) {
+        const entry = row as { filename?: unknown; previous_filename?: unknown } | null;
+        const filename = entry?.filename;
+        if (typeof filename !== 'string') return false;
+        // A rename INTO a spec path still touches its source path (#1541 review).
+        if (entry?.previous_filename !== undefined) {
+          if (typeof entry.previous_filename !== 'string') return false;
+        }
+        seen.push(entry);
+      }
+      if (rows.length < 100) return isSpecOnlyFileList(woId, seen);
+    }
+    return false;
+  };
+  for (const number of matching) {
+    if (!(await isSpecOnlyPr(number))) return { eligible: false, reason: 'pr_exists' };
+  }
 
   return {
     eligible: true,

@@ -20,7 +20,11 @@
 import { createLogger } from '@archon/paths';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { readOverseerActionPolicyFromEnv, type OverseerActionPolicy } from './action-policy';
-import { PR_DISCOVERY_RUN_ID_PREFIX, RUN_BLOCKED_LABEL } from './merge-candidate-discovery';
+import {
+  OWNER_REWORKING_LABEL,
+  PR_DISCOVERY_RUN_ID_PREFIX,
+  RUN_BLOCKED_LABEL,
+} from './merge-candidate-discovery';
 import {
   getRepoBasePolicy,
   hasRepoPolicyEntry,
@@ -56,6 +60,8 @@ const DEFAULT_MERGE_RETRY_MAX_ATTEMPTS = 8;
 const FLAG_MERGE_READY = 'flag_merge_ready';
 const RECEIPT_MARKER = '<!-- merge-manager-receipt -->';
 const RECEIPT_KEY_PREFIX = '<!-- merge-manager-receipt-key';
+const POLICY_SKIP_MARKER = '<!-- merge-policy-skip:v1 -->';
+const POLICY_SKIP_KEY_PREFIX = '<!-- merge-policy-skip-key';
 export type MergeExecutionRepoConfig = Readonly<Record<string, { readonly baseBranch: string }>>;
 
 export interface MergeExecutionBridgeStore {
@@ -472,6 +478,7 @@ async function resolveRunlessTarget(
   const basePolicy = getRepoBasePolicy(ownerRepo, pr.baseBranch ?? '', repoPolicy);
   if (!basePolicy?.unattended) {
     await skip('base_not_allowlisted', pr.htmlUrl);
+    await postPolicySkipComment(options, verdict, pr, 'base_not_allowlisted');
     return null;
   }
   return { pr, basePolicy };
@@ -589,6 +596,83 @@ async function postMergeReceiptComment(
     log.warn(
       { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
       'merge-coordinator.receipt_comment_failed'
+    );
+  }
+}
+
+/**
+ * WO-HARNESS-MERGE-POLICY-SKIP-VISIBLE-01: a pull request the bridge skips by
+ * POLICY (terminal: spec_only, integration_base_mismatch, base_not_allowlisted)
+ * used to sit unmerged with no sign on it of why -- bdc-harness #1371 waited
+ * 11 days APPROVED and green while the Duty Officer nudged the merge manager
+ * about a skip that was deliberate. The skip stays a skip; this posts ONE
+ * comment saying why the manager will not merge it and that a person does.
+ * Idempotent on a key line (verdict id + reason), same pattern as the merge
+ * receipt. Never throws: a comment failure is logged and the skip outcome
+ * already recorded is unchanged. repo_not_allowed has no pull request in hand
+ * and posts nothing.
+ */
+export type PolicySkipReason = 'spec_only' | 'integration_base_mismatch' | 'base_not_allowlisted';
+
+function policySkipSentence(reason: PolicySkipReason, baseBranch: string): string {
+  const tail =
+    'a person merges it when ready (exact-head approval and green required checks still apply).';
+  switch (reason) {
+    case 'spec_only':
+      return `The merge manager does not merge documentation-only pull requests into ${baseBranch} by policy, so it skipped this one on purpose; ${tail}`;
+    case 'integration_base_mismatch':
+      return `${baseBranch} is not a base the merge manager merges unattended, so it skipped this pull request on purpose; ${tail}`;
+    case 'base_not_allowlisted':
+      return `${baseBranch} is not on the merge manager's allowlist for this repository, so it skipped this pull request on purpose; ${tail}`;
+  }
+}
+
+function policySkipKey(verdict: OverseerVerdictRow, reason: PolicySkipReason): string {
+  const keyField = (value: string): string =>
+    sanitizeReceiptField(value).replace(/[^A-Za-z0-9._:-]/g, '_');
+  return `${POLICY_SKIP_KEY_PREFIX}:${keyField(verdict.id)}:${keyField(reason)} -->`;
+}
+
+export async function postPolicySkipComment(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  pr: PullRequestEvidence,
+  reason: PolicySkipReason
+): Promise<void> {
+  if (!options.github.commentOnPullRequest) {
+    log.warn(
+      { verdictId: verdict.id, prUrl: pr.htmlUrl, reason },
+      'merge-coordinator.policy_skip_comment_unavailable'
+    );
+    return;
+  }
+  if (!pr.pr) return;
+  try {
+    const expectedKey = policySkipKey(verdict, reason);
+    const commentAuthorLogin = options.github.commentAuthorLogin?.trim().toLowerCase();
+    if (options.github.listPullRequestComments && commentAuthorLogin) {
+      const existing = await options.github.listPullRequestComments(pr.pr);
+      if (
+        existing.some(
+          comment =>
+            comment.authorLogin.trim().toLowerCase() === commentAuthorLogin &&
+            comment.body.split(/\r?\n/).some(line => line.trim() === expectedKey)
+        )
+      ) {
+        return;
+      }
+    }
+    const baseBranch = sanitizeReceiptField(
+      pr.baseBranch && pr.baseBranch.length > 0 ? pr.baseBranch : 'its base'
+    );
+    const body = [POLICY_SKIP_MARKER, expectedKey, policySkipSentence(reason, baseBranch)].join(
+      '\n'
+    );
+    await options.github.commentOnPullRequest({ ...pr.pr, body });
+  } catch (error) {
+    log.warn(
+      { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl, reason },
+      'merge-coordinator.policy_skip_comment_failed'
     );
   }
 }
@@ -830,10 +914,12 @@ async function mergeClaimedVerdict(
   }
   if (isDocumentationOnly(pr.changedFilePaths) && (basePolicy?.docsOnly ?? 'skip') === 'skip') {
     await skip('spec_only', pr.htmlUrl);
+    await postPolicySkipComment(options, verdict, pr, 'spec_only');
     return undefined;
   }
   if (!basePolicy?.unattended) {
     await skip('integration_base_mismatch', pr.htmlUrl);
+    await postPolicySkipComment(options, verdict, pr, 'integration_base_mismatch');
     return undefined;
   }
 
@@ -918,6 +1004,24 @@ async function mergeClaimedVerdict(
         prUrl: pr.htmlUrl,
       },
       'merge-coordinator.run_blocked_label'
+    );
+    return undefined;
+  }
+
+  // The owner marks a PR owner:reworking while the design is being redone. Like a hold it
+  // releases the claim without skip(), attempts or an outcome row, so the next tick
+  // re-evaluates after the owner clears the label. It is NOT HOLD (John's); nothing here sets
+  // or clears it.
+  if (pr.labels?.includes(OWNER_REWORKING_LABEL)) {
+    await options.store.releaseVerdictClaim(verdict.id, 'owner_reworking_label');
+    log.info(
+      {
+        verdictId: verdict.id,
+        runId: verdict.run_id,
+        woId: verdict.wo_id,
+        prUrl: pr.htmlUrl,
+      },
+      'merge-coordinator.owner_reworking_label'
     );
     return undefined;
   }

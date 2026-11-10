@@ -112,6 +112,144 @@ describe('checkFireEligibility', () => {
       ).eligible
     ).toBe(true);
   });
+  // Live 2026-11-09 (bdc-xo#4311): codebase rows registered before the 2026-06-29
+  // owner move still carry repository_url = github.com/bluedevilcollectibles/<repo>,
+  // so the target_repo thinmansoftware/<repo> never matched and every fire was
+  // refused project_not_registered. The owner/repo codebase NAME is current.
+  test('falls back to a unique owner/repo codebase name when repository_url is stale', async () => {
+    const configured = deps();
+    configured.codebases = async () => [
+      {
+        name: 'thinmansoftware/bdc-harness',
+        repository_url: 'https://github.com/bluedevilcollectibles/bdc-harness.git',
+      },
+    ];
+    const result = await checkFireEligibility(TITLE, configured);
+    expect(result.eligible).toBe(true);
+    expect(result.evidence?.project).toBe('bdc-harness');
+  });
+  test('the name fallback never matches a bare name and fails closed when ambiguous', async () => {
+    const bare = deps();
+    bare.codebases = async () => [
+      {
+        name: 'bdc-harness',
+        repository_url: 'https://github.com/bluedevilcollectibles/bdc-harness',
+      },
+    ];
+    expect((await checkFireEligibility(TITLE, bare)).reason).toBe('project_not_registered');
+    const twice = deps();
+    twice.codebases = async () => [
+      {
+        name: 'thinmansoftware/bdc-harness',
+        repository_url: 'https://github.com/bluedevilcollectibles/bdc-harness',
+      },
+      {
+        name: 'THINMANSOFTWARE/bdc-harness',
+        repository_url: 'https://github.com/someone-else/bdc-harness',
+      },
+    ];
+    expect((await checkFireEligibility(TITLE, twice)).reason).toBe('project_not_registered');
+  });
+  test('a repository_url match still wins over a different name match', async () => {
+    const configured = deps();
+    configured.codebases = async () => [
+      {
+        name: 'thinmansoftware/other',
+        repository_url: 'https://github.com/thinmansoftware/bdc-harness',
+      },
+      {
+        name: 'thinmansoftware/bdc-harness',
+        repository_url: 'https://github.com/bluedevilcollectibles/bdc-harness',
+      },
+    ];
+    const result = await checkFireEligibility(TITLE, configured);
+    expect(result.eligible).toBe(true);
+    expect(result.evidence?.project).toBe('other');
+  });
+  // Live 2026-11-09 (bdc-xo#4311): for a WO that TARGETS bdc-xo, author-wo.sh's own
+  // spec PR ("WO: <id>", touching only docs/work-orders/<id>.md) lives in the target
+  // repo, so the WO was refused pr_exists forever once its spec merged.
+  type FileEntry = string | { filename: string; status: string; previous_filename?: string };
+  function specDeps(files: Record<number, FileEntry[] | 'error'>, prs: unknown[]) {
+    const base = deps(SPEC, prs);
+    const inner = base.fetchImpl;
+    base.fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const m = /\/pulls\/(\d+)\/files/.exec(url);
+      if (m) {
+        const entry = files[Number(m[1])];
+        if (entry === 'error' || entry === undefined) return response({ message: 'boom' }, 500);
+        return response(
+          entry.map(item => (typeof item === 'string' ? { filename: item, status: 'added' } : item))
+        );
+      }
+      return inner(input, init);
+    }) as typeof fetch;
+    return base;
+  }
+  test('a WO whose only matching PR is its own spec PR is eligible', async () => {
+    const configured = specDeps({ 1: ['docs/work-orders/WO-HARNESS-EXAMPLE-01.md'] }, [
+      { title: 'WO: WO-HARNESS-EXAMPLE-01', state: 'closed', merged_at: '2026-11-09T10:00:00Z' },
+    ]);
+    const result = await checkFireEligibility(TITLE, configured);
+    expect(result.eligible).toBe(true);
+  });
+  test('the superpowers spec path also counts as spec-only', async () => {
+    const configured = specDeps({ 1: ['docs/superpowers/specs/WO-HARNESS-EXAMPLE-01.md'] }, [
+      { title: 'spec WO-HARNESS-EXAMPLE-01', state: 'open' },
+    ]);
+    expect((await checkFireEligibility(TITLE, configured)).eligible).toBe(true);
+  });
+  test('a matching PR touching any non-spec path is still pr_exists', async () => {
+    const configured = specDeps(
+      { 1: ['docs/work-orders/WO-HARNESS-EXAMPLE-01.md', 'src/feature.ts'] },
+      [{ title: 'WO-HARNESS-EXAMPLE-01 build', state: 'open' }]
+    );
+    expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
+  });
+  test('a spec path for a different WO id (prefix collision) is not this WO spec', async () => {
+    const configured = specDeps({ 1: ['docs/work-orders/WO-HARNESS-EXAMPLE-010.md'] }, [
+      { title: 'WO: WO-HARNESS-EXAMPLE-01 and -010', state: 'open' },
+    ]);
+    expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
+  });
+  // Overseer minor on #1541: a rename INTO the spec path must not qualify.
+  test('a rename from a non-spec path into the spec path still counts as pr_exists', async () => {
+    const configured = specDeps(
+      {
+        1: [
+          {
+            filename: 'docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
+            status: 'renamed',
+            previous_filename: 'src/feature.ts',
+          },
+        ],
+      },
+      [{ title: 'WO: WO-HARNESS-EXAMPLE-01', state: 'open' }]
+    );
+    expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
+  });
+  test('a rename between this WO spec paths stays spec-only', async () => {
+    const configured = specDeps(
+      {
+        1: [
+          {
+            filename: 'docs/work-orders/WO-HARNESS-EXAMPLE-01.md',
+            status: 'renamed',
+            previous_filename: 'docs/superpowers/specs/WO-HARNESS-EXAMPLE-01.md',
+          },
+        ],
+      },
+      [{ title: 'WO: WO-HARNESS-EXAMPLE-01', state: 'open' }]
+    );
+    expect((await checkFireEligibility(TITLE, configured)).eligible).toBe(true);
+  });
+  test('an unreadable PR file list fails closed as pr_exists', async () => {
+    const configured = specDeps({ 1: 'error' }, [
+      { title: 'WO: WO-HARNESS-EXAMPLE-01', state: 'open' },
+    ]);
+    expect((await checkFireEligibility(TITLE, configured)).reason).toBe('pr_exists');
+  });
   test('backs off at the shared GitHub rate-limit floor', async () => {
     const configured = deps();
     configured.fetchImpl = async () => response({}, 200, '4');

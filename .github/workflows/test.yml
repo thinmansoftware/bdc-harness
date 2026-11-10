@@ -5,6 +5,10 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+    # ready_for_review is not in GitHub's default pull_request types. Without it a draft PR that is
+    # flipped to ready gets no fresh run, so its required checks can stay unrun or stale until someone
+    # pushes a commit (bdc-harness 1538, 2026-11-09).
+    types: [opened, synchronize, reopened, ready_for_review]
   schedule:
     - cron: '17 7 * * *'
   workflow_dispatch:
@@ -82,7 +86,10 @@ jobs:
   test-windows:
     name: test (windows-latest)
     runs-on: windows-latest
-    timeout-minutes: 45
+    # 60, not 45: on 2026-11-04 the job passed in 40.7 min (run 41772837326) and hit
+    # the old 45-min limit at 45.1 min (run 41773774729, reported as "cancelled"),
+    # so dev Test Suite flipped on timing alone. Sharding/speed-up is a separate WO.
+    timeout-minutes: 60
     needs: windows-gate
     if: >-
       github.event_name == 'push' ||

@@ -627,6 +627,22 @@ export class SqliteAdapter implements IDatabase {
    * replayed, so an INSERT trigger never fires on the copy.
    */
   private rebuildTmJournal(createNewTableSql: string): void {
+    // tm_fire_admissions.journal_id REFERENCES tm_journal(id) (migration 063). With foreign keys ON,
+    // DROP TABLE tm_journal does an implicit DELETE and fails with FOREIGN KEY constraint failed as
+    // soon as that table holds a row, which crash-looped the container on the production database
+    // (2026-11-09, the first tm_journal rebuild since 063 had rows). The SQLite table-rebuild
+    // procedure turns foreign keys OFF outside the transaction (the setting is a no-op inside one),
+    // rebuilds, runs foreign_key_check before COMMIT, and turns them back ON. Same pattern as the
+    // dispatch phase-15 rebuild above.
+    this.db.run('PRAGMA foreign_keys = OFF');
+    try {
+      this.rebuildTmJournalInTransaction(createNewTableSql);
+    } finally {
+      this.db.run('PRAGMA foreign_keys = ON');
+    }
+  }
+
+  private rebuildTmJournalInTransaction(createNewTableSql: string): void {
     this.db.run('BEGIN IMMEDIATE');
     try {
       const dependents = this.pragmaAll(`SELECT type, name, sql FROM sqlite_master
@@ -642,6 +658,8 @@ export class SqliteAdapter implements IDatabase {
       this.db.run('ALTER TABLE tm_journal_new RENAME TO tm_journal');
       for (const dependent of dependents) this.db.run(dependent.sql);
       for (const indexSql of TM_JOURNAL_INDEXES) this.db.run(indexSql);
+      const fkCheck = this.pragmaAll('PRAGMA foreign_key_check');
+      if (fkCheck.length > 0) throw new Error('tm_journal_rebuild_foreign_key_check_failed');
       this.db.run('COMMIT');
     } catch (error: unknown) {
       this.db.run('ROLLBACK');
@@ -830,6 +848,33 @@ export class SqliteAdapter implements IDatabase {
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
             thread_ref TEXT NOT NULL,
             action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report')),
+            proposal_json TEXT NOT NULL,
+            idempotency_key TEXT,
+            before_hash TEXT,
+            proof_predicate TEXT,
+            proof_deadline_at TEXT,
+            outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+            graded_at TEXT,
+            grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+          )
+        `);
+    }
+    // WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01: widen tm_journal.action_type
+    // CHECK to accept the seventh verb 'remediation_nudge'. Same transactional
+    // rebuild the sixth verb used (SQLite cannot ALTER a CHECK). Re-read the
+    // schema fresh and keep this a separate, independently idempotent block (do
+    // not edit the earlier CHECK literals). Only action_type widens; the grade
+    // CHECK is carried forward exactly as the prior block left it.
+    const journalSchema5 = (this.pragmaAll(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'"
+    )[0] ?? null) as { sql?: string } | undefined;
+    if (journalSchema5?.sql && !journalSchema5.sql.includes('remediation_nudge')) {
+      this.rebuildTmJournal(`
+          CREATE TABLE tm_journal_new (
+            id TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            thread_ref TEXT NOT NULL,
+            action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report', 'remediation_nudge')),
             proposal_json TEXT NOT NULL,
             idempotency_key TEXT,
             before_hash TEXT,
@@ -2570,7 +2615,7 @@ export class SqliteAdapter implements IDatabase {
         created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
         thread_ref TEXT NOT NULL,
         action_type TEXT NOT NULL CHECK (
-          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report')
+          action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report', 'remediation_nudge')
         ),
         proposal_json TEXT NOT NULL,
         idempotency_key TEXT,

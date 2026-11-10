@@ -1,5 +1,13 @@
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
 import { OpenAPIHono } from '@hono/zod-openapi';
+import { mkdtemp, rm } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
+import {
+  acquireWoLock,
+  recordRunOnWoLock,
+  releaseWoLocksForRun,
+} from '@archon/smart-cauldron/wo-lock';
 import type { ConversationLockManager } from '@archon/core';
 import type { WebAdapter } from '../adapters/web';
 import { validationErrorHook } from './openapi-defaults';
@@ -283,6 +291,55 @@ describe('POST /api/workflows/runs/:runId/cancel', () => {
     expect(body.message).toContain('deploy');
     expect(body.run.status).toBe('cancelled');
     expect(mockCancelWorkflowRun).toHaveBeenCalledWith('run-uuid-1');
+  });
+
+  // WO-HARNESS-WO-LOCK-RELEASE-ON-CANCEL-01 (cancel-releases-lock): killing or
+  // cancelling a conductor run left the smart-cauldron file lock at
+  // status=running, so the next fire was refused as a duplicate and the API
+  // cancel did not release it.
+  test('cancel releases the WO file lock the cancelled run belongs to', async () => {
+    const workDir = await mkdtemp(join(tmpdir(), 'cancel-lock-'));
+    const originalOutDir = process.env.SMART_CAULDRON_OUT_DIR;
+    // The cancel handler resolves the conductor's directory from this variable.
+    process.env.SMART_CAULDRON_OUT_DIR = workDir;
+    try {
+      await acquireWoLock('WO-CANCEL-LOCK-01', 'shopops', 'cascade-dead', workDir);
+      await recordRunOnWoLock(
+        'WO-CANCEL-LOCK-01',
+        'shopops',
+        'cascade-dead',
+        'run-uuid-1',
+        workDir
+      );
+      const refused = await acquireWoLock('WO-CANCEL-LOCK-01', 'shopops', 'cascade-next', workDir);
+      expect(refused.acquired).toBe(false);
+
+      mockGetWorkflowRun.mockImplementationOnce(async () => MOCK_RUNNING_RUN);
+      mockGetWorkflowRun.mockImplementationOnce(async () => ({
+        ...MOCK_RUNNING_RUN,
+        status: 'cancelled' as const,
+        completed_at: NOW,
+      }));
+      mockCancelWorkflowRun.mockImplementationOnce(async () => {});
+
+      const { app } = makeApp();
+      const response = await app.request('/api/workflows/runs/run-uuid-1/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'operator cancel' }),
+      });
+      expect(response.status).toBe(200);
+
+      const next = await acquireWoLock('WO-CANCEL-LOCK-01', 'shopops', 'cascade-next', workDir);
+      expect(next.acquired).toBe(true);
+      expect(next.record.cascadeId).toBe('cascade-next');
+      // Idempotent: nothing left to release for that run.
+      expect(await releaseWoLocksForRun('run-uuid-1', workDir)).toEqual([]);
+    } finally {
+      if (originalOutDir === undefined) delete process.env.SMART_CAULDRON_OUT_DIR;
+      else process.env.SMART_CAULDRON_OUT_DIR = originalOutDir;
+      await rm(workDir, { recursive: true, force: true });
+    }
   });
 
   test.each([
