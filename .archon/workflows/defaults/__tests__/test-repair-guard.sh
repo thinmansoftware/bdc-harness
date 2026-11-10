@@ -800,10 +800,12 @@ for location in current stage; do
         export FIX_INITIAL="$(cd "$WT" && rst_execute_saved "$ARTIFACTS_DIR/evidence" CODE)"
         check contains "$FIX_INITIAL" 'TESTS_STATUS=failed'
         printf '%s\n' "$FIX_INITIAL" > "$ARTIFACTS_DIR/evidence/stop-tests.initial"
-        trg_snapshot_report "$WT" "$ARTIFACTS_DIR/evidence"
+        # Match the shipped node: persist the harness before freezing files, so
+        # creating stop-tests.core.sh is not mistaken for a repair's new script.
         rst_save_core "$ARTIFACTS_DIR/evidence"
         printf '1500\n' > "$ARTIFACTS_DIR/evidence/stop-tests.timeout"
         printf 'CODE\n' > "$ARTIFACTS_DIR/evidence/stop-tests.class"
+        trg_snapshot_report "$WT" "$ARTIFACTS_DIR/evidence"
         check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
         if [ "$kind" = product ]; then
           printf 'good\n' > "$TARGET/a.js"

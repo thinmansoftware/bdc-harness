@@ -11,8 +11,10 @@ at the snapshot, plus new non-test, non-frozen files. Every other tracked file i
 frozen by SHA-256: any byte change or deletion is refused. Test files, declared
 test scripts, package.json, lockfiles, bunfig.toml, runner configurations,
 Makefile, tsconfig* and .github paths are always frozen, even when the build
-changed them. New test or frozen-name files and skip/only/todo markers in any new
-file are refused. A guard violation terminates repair as BLOCKED with
+changed them. The same classifier freezes shell scripts (*.sh, *.bash, *.ps1),
+files under scripts/ or test directories, reachable package-script entrypoints
+and executable files. New files in that class and skip/only/todo markers in any
+new file are refused. A guard violation terminates repair as BLOCKED with
 `tests_failed_after_repair:guard` in final evidence, the manifest audit line,
 the evidence gate's stderr and the blocked-report comment.
 
@@ -24,8 +26,10 @@ Existing non-PROCEED `NOT_GATED` and base-red behavior remains in place.
 
 The shared `rst_report` arguments are class, command, exit code, counts,
 optional environment reason, and optional log path. A declared capability probe
-that reports `env_unavailable` takes precedence over blocked reasons, including
-across stages and final verification. It never enters repair, stamps
+that reports `env_unavailable` takes precedence over test-execution blocked
+reasons, including across stages and final verification. An infrastructure guard
+violation still blocks repair even if a capability later becomes unavailable.
+An initial unavailable capability never enters repair, stamps
 `VALIDATION: FAIL`, and fails the evidence gate with `ENVIRONMENT_UNAVAILABLE:`
 even on a non-PROCEED run. Without that probe, the existing blocked reasons apply.
 
@@ -52,6 +56,8 @@ Saved npm, Bun, Yarn and pnpm package-script commands resolve their script in
 the command's package directory, including a leading `cd`. The guard freezes
 every existing in-worktree file token named by that script, including regular
 entrypoints changed by the build and files in `&&`, `||`, `;` and `|` chains.
+Npm pre<name> and post<name> lifecycle hooks resolve alongside the requested
+script, including hooks on nested npm package-script calls and chained segments.
 Nested package-script calls resolve recursively, with at most five script
 expansions per call chain. A cycle, depth overflow, missing script or unreadable
 or invalid required package.json blocks repair with
@@ -81,13 +87,18 @@ link, editing the resolved target or deleting it is a frozen-file violation in
 both the run worktree and persisted stage worktrees.
 The same target freeze applies to symlinks elsewhere in the frozen-file set.
 
-The guard does not trace helpers called or sourced by a frozen entrypoint. A
-build-changed helper may remain in the product allowlist; this is the round-8
-accepted residual. Final run output and the PR's stamped manifest section list
+The guard does not trace helpers called or sourced by a frozen entrypoint.
+Every build-changed file in the test-infrastructure class is removed from the
+allowlist and frozen by SHA-256. The remaining accepted residual is product
+source outside that class executed as test infrastructure (bdc-xo#5217).
+Final run output and the PR's stamped manifest section list
 repair changes to shell scripts, test/runner configuration, CI files, scripts or
 test directories, declared command files and executable files under
 `Repair touched test infrastructure`, one path per line. Product-only repairs
 and runs without repair print `Repair touched test infrastructure: none`.
+A non-empty listing fails closed with `tests_failed_after_repair:guard`, even
+if a frozen-file check was bypassed. Each file also has a plain diagnostic:
+`test guard: repair changed test infrastructure: <path> (frozen; a human must change it)`.
 The shared guard core computes this disclosure against the snapshot, including
 new files and stage worktrees. It does not change the test verdict.
 
