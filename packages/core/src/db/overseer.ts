@@ -306,7 +306,7 @@ export async function listActiveRunUserMessages(): Promise<string[]> {
 export interface OriginatingRunCandidateRow {
   id: string;
   status: string;
-  started_at: string | null;
+  started_at: string | Date | null;
   working_path: string | null;
   event_data: string | null;
 }

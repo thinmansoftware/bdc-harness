@@ -19,7 +19,8 @@
 export interface OriginatingRunCandidate {
   readonly id: string;
   readonly status: string;
-  readonly started_at: string | null;
+  /** SQLite yields a string; PostgreSQL yields a Date (TIMESTAMPTZ) through the pg adapter. */
+  readonly started_at: string | Date | null;
   readonly working_path: string | null;
   readonly event_data: string | null;
 }
@@ -45,6 +46,24 @@ const TERMINAL_RUN_STATUSES = new Set(['completed', 'failed', 'cancelled', 'esca
 
 export function isRunTerminal(status: string): boolean {
   return TERMINAL_RUN_STATUSES.has(status.trim().toLowerCase());
+}
+
+/**
+ * Epoch milliseconds for a run start. A SQLite `YYYY-MM-DD HH:MM:SS` string carries no zone
+ * and is UTC; a Date is used as is; anything unparseable sorts oldest.
+ */
+export function startedAtEpoch(value: string | Date | null | undefined): number {
+  if (value === null || value === undefined) return 0;
+  if (value instanceof Date) {
+    const ms = value.getTime();
+    return Number.isNaN(ms) ? 0 : ms;
+  }
+  const text = value.trim();
+  if (text === '') return 0;
+  const hasZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+  const iso = text.includes('T') ? text : text.replace(' ', 'T');
+  const ms = Date.parse(hasZone ? iso : iso + 'Z');
+  return Number.isNaN(ms) ? 0 : ms;
 }
 
 const REGEXP_SPECIALS = /[.*+?^${}()|[\]\\]/g;
@@ -89,8 +108,8 @@ export async function findOriginatingRunForPullRequest(
     if (!byBranch && !byUrl) continue;
     if (!matches.has(candidate.id)) matches.set(candidate.id, candidate);
   }
-  const ordered = [...matches.values()].sort((a, b) =>
-    (b.started_at ?? '').localeCompare(a.started_at ?? '')
+  const ordered = [...matches.values()].sort(
+    (a, b) => startedAtEpoch(b.started_at) - startedAtEpoch(a.started_at)
   );
   const latest = ordered[0];
   return latest ? { runId: latest.id, status: latest.status } : null;

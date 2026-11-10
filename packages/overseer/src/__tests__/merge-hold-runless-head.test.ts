@@ -7,6 +7,7 @@ import {
 } from '../merge-execution-bridge';
 import {
   findOriginatingRunForPullRequest,
+  startedAtEpoch,
   type OriginatingRun,
   type OriginatingRunCandidate,
 } from '../originating-run-lookup';
@@ -100,6 +101,30 @@ describe('findOriginatingRunForPullRequest', () => {
       candidate({ id: 'longer-branch', working_path: `/ws/worktrees/${BRANCH}-2` }),
     ]);
     expect(lookalike).toBeNull();
+  });
+
+  test('most recent run wins for Date values (PostgreSQL), ISO strings and SQLite strings, mixed', async () => {
+    const asDate = await findOriginatingRunForPullRequest(input, async () => [
+      candidate({ id: 'older', started_at: new Date('2026-11-10T09:00:00Z'), event_data: PR_URL }),
+      candidate({ id: 'newer', started_at: new Date('2026-11-10T11:00:00Z'), event_data: PR_URL }),
+    ]);
+    expect(asDate?.runId).toBe('newer');
+    const mixed = await findOriginatingRunForPullRequest(input, async () => [
+      candidate({ id: 'sqlite-old', started_at: '2026-11-10 09:00:00', event_data: PR_URL }),
+      candidate({ id: 'iso-mid', started_at: '2026-11-10T10:00:00.000Z', event_data: PR_URL }),
+      candidate({
+        id: 'date-new',
+        started_at: new Date('2026-11-10T12:00:00Z'),
+        event_data: PR_URL,
+      }),
+      candidate({ id: 'null-start', started_at: null, event_data: PR_URL }),
+    ]);
+    expect(mixed?.runId).toBe('date-new');
+    // a SQLite string has no zone and is UTC, so it compares equal to the same instant as a Date
+    expect(startedAtEpoch('2026-11-10 12:00:00')).toBe(new Date('2026-11-10T12:00:00Z').getTime());
+    expect(startedAtEpoch(new Date('invalid'))).toBe(0);
+    expect(startedAtEpoch('not a date')).toBe(0);
+    expect(startedAtEpoch(null)).toBe(0);
   });
 
   test('a rejecting list propagates so callers can fail closed', async () => {
