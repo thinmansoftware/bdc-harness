@@ -486,6 +486,7 @@ for name in new.test.ts package.json helper.js marker.js; do
   fi
 done
 # Round 8: use native symlinks (MSYS ln can silently copy on Windows).
+eval "$(core trg)"
 link_file() {
   python3 - "$1" "$2" "$3" <<'PY'
 import os, pathlib, sys
@@ -550,6 +551,9 @@ for location in current stage; do
     if [ "$change" = outside ] || [ "$change" = broken ]; then
       check contains "$FIX_INITIAL" 'TESTS_STATUS=blocked'
       check contains "$FIX_INITIAL" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+      check test "$(printf '%s\n' "$FIX_INITIAL" | grep -c '^TESTS_STATUS=')" = 1
+      check test "$(printf '%s\n' "$FIX_INITIAL" | sed -n 's/^TESTS_STATUS=//p' | head -1)" = blocked
+      check test "$(printf '%s\n' "$FIX_INITIAL" | sed -n 's/^TESTS_BLOCKED_REASON=//p' | head -1)" = tests_failed_after_repair:guard
       export FIX_CLASSIFY="$(run_node classify-test-result)"
       check contains "$FIX_CLASSIFY" '"repairable":"false"'
       check test ! -e "$ARTIFACTS_DIR/evidence/test-repair.attempts"
