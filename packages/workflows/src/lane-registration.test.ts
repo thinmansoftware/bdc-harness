@@ -174,7 +174,7 @@ describe('lane registration and war-council-validator pin', () => {
 
       if (file === 'bdc-feature-development-astra.yaml') {
         expect(wcv.provider).toBe('claude');
-        expect(wcv.model).toBe('claude-fable-5');
+        expect(wcv.model).toBe('claude-fable-5-2');
         return;
       }
 
@@ -206,7 +206,7 @@ describe('lane registration and war-council-validator pin', () => {
       // and stays on the CLOSER rung (see the codex-lane branch above, which
       // is correct and unchanged).
       const expectedModel =
-        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5' : 'sonnet';
+        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5-2' : 'sonnet';
       expect(wcv.provider).toBe('claude');
       expect(wcv.model).toBe(expectedModel);
     });
