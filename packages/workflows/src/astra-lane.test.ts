@@ -60,7 +60,7 @@ const attributionChanges = [
   ['Diff review (Codex,', 'Diff review (Fable,'],
   [
     'diff-review provider used (codex cross-model, OR claude-fallback with\n  CROSS_MODEL_REVIEW=false disclosed)',
-    'diff-review provider/model used (claude/claude-fable-5, independent of Astra;\n  any substitution or unverified served identity must be disclosed)',
+    'diff-review provider/model used (claude/claude-fable-5-2, independent of Astra;\n  any substitution or unverified served identity must be disclosed)',
   ],
 ];
 
@@ -92,7 +92,7 @@ describe('Astra build / Fable review lane', () => {
     for (const seat of seats) {
       const review = reviewIds.includes(seat.id);
       expect(seat.provider, seat.id).toBe(review ? 'claude' : 'codex-native-strict');
-      expect(seat.model, seat.id).toBe(review ? 'claude-fable-5' : 'gpt-6-astra');
+      expect(seat.model, seat.id).toBe(review ? 'claude-fable-5-2' : 'gpt-6-astra');
       expect(seat.fallbackModel).toBeUndefined();
       // D0 (WO-HARNESS-PERSONA-MODEL-DECLARED-01, acting XO fence 282): review seats
       // fail over to Kimi K3.1 Pro on openrouter, never Claude; build seats declare none.
@@ -101,7 +101,7 @@ describe('Astra build / Fable review lane', () => {
       const personaName = seat.persona ?? seat.agent;
       if (personaName) {
         const header = parseYaml(read(`.archon/agents/${personaName}.md`).split(/^---\s*$/m)[1]);
-        expect(header.model, personaName).toBe(review ? 'claude-fable-5' : undefined);
+        expect(header.model, personaName).toBe(review ? 'claude-fable-5-2' : undefined);
       }
     }
   });

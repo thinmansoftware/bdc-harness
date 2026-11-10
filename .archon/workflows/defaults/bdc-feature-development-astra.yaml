@@ -802,7 +802,7 @@ nodes:
   # async escalation payload, and only at the irreversible-action boundary downstream.
   - id: plan-review
     provider: claude
-    model: claude-fable-5
+    model: claude-fable-5-2
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -3725,7 +3725,7 @@ nodes:
 
   - id: war-council-validator
     provider: claude
-    model: claude-fable-5
+    model: claude-fable-5-2
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -3873,7 +3873,7 @@ nodes:
 
   - id: diff-review
     provider: claude
-    model: claude-fable-5
+    model: claude-fable-5-2
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -4139,7 +4139,7 @@ nodes:
 
   - id: diff-review-final
     provider: claude
-    model: claude-fable-5
+    model: claude-fable-5-2
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -4310,7 +4310,7 @@ nodes:
   # terminal-BLOCKED on a non-interactive run.
   - id: opus-rereview
     provider: claude
-    model: claude-fable-5
+    model: claude-fable-5-2
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -4755,7 +4755,7 @@ nodes:
   # emit sentinels. Only an AI pass normalizes all of them into the per-row JSON ledger.
   - id: findings-consolidate
     provider: claude
-    model: claude-fable-5
+    model: claude-fable-5-2
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -4889,7 +4889,7 @@ nodes:
   # Distinct id (diff-review-final already ran upstream). Only meaningful on the APPROVE-WITH-FIX path.
   - id: apply-diff-review-final
     provider: claude
-    model: claude-fable-5
+    model: claude-fable-5-2
     # D0 (M-20261021c): review seats never fall back to Claude. Quota/seat failover
     # to Kimi K3.1 Pro on the repository-capable openrouter tool loop, the same
     # declaration as the default lane (WO-HARNESS-PERSONA-MODEL-DECLARED-01).
@@ -6171,7 +6171,7 @@ nodes:
       self-repair-review-loops)
       - plan-review verdict (PLAN_REVIEW_PASS + RISK)
       - diff-review-final verdict (DIFF_REVIEW_FINAL)
-      - diff-review provider/model used (claude/claude-fable-5, independent of Astra;
+      - diff-review provider/model used (claude/claude-fable-5-2, independent of Astra;
         any substitution or unverified served identity must be disclosed)
       If any in-run review was skipped or ended needs_revision, VALIDATION cannot be PASS.
 

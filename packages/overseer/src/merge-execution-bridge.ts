@@ -37,7 +37,19 @@ import {
 } from './merge-repo-policy';
 import { specDeclaresMergeHold } from './merge-hold';
 import { isSpecOnlyChangeSet } from './reconcile';
-import type { GitHubClientDeps, PullRequestEvidence, ReviewConflictAtHead } from './types.ts';
+import type {
+  GitHubClientDeps,
+  OverseerWorkflowEvent,
+  PullRequestEvidence,
+  ReviewConflictAtHead,
+} from './types.ts';
+import {
+  originatingEvidenceFailure,
+  evidenceAdjudicated,
+  postEvidenceHold,
+  ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON,
+  ORIGINATING_RUN_UNREADABLE_HOLD_REASON,
+} from './merge-manager';
 import { resolveRequiredContexts } from './adapters/required-contexts';
 import { createRealOctokitClient } from './adapters/github-real-deps';
 import { blockingRequiredContexts } from './required-context-gate';
@@ -86,6 +98,7 @@ export interface MergeExecutionBridgeStore {
 }
 
 export interface MergeExecutionBridgeOptions {
+  readRunEvents?: (runId: string) => Promise<OverseerWorkflowEvent[]>;
   store: MergeExecutionBridgeStore;
   github: GitHubClientDeps;
   readPolicy?: () => OverseerActionPolicy;
@@ -348,6 +361,7 @@ type SkipVerdict = (reason: string, prUrl?: string, rateLimited?: boolean) => Pr
 interface MergeTarget {
   pr: PullRequestEvidence;
   basePolicy?: RepoBasePolicy;
+  run?: OverseerWatchRun;
 }
 
 interface RunlessPullRef {
@@ -517,6 +531,7 @@ async function resolveMergeTarget(
   });
   return {
     pr,
+    run,
     basePolicy: getRepoBasePolicy(ownerRepo, pr.baseBranch ?? '', repoPolicy),
   };
 }
@@ -742,6 +757,19 @@ async function mergeClaimedVerdict(
     rateLimited = false,
     details?: Record<string, unknown>
   ): Promise<void> => {
+    if (
+      reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON ||
+      reason === ORIGINATING_RUN_UNREADABLE_HOLD_REASON
+    ) {
+      // Evidence holds must remain eligible for repair/adjudication on the next tick.
+      // recordOutcome finalizes a verdict; transient retries consume a bounded budget.
+      await options.store.releaseVerdictClaim(verdict.id, reason);
+      log.info(
+        { verdictId: verdict.id, runId: verdict.run_id, woId: verdict.wo_id, reason, prUrl },
+        'merge-coordinator.originating_evidence_held'
+      );
+      return;
+    }
     if (classifyMergeSkip(reason) === 'transient' && options.store.deferVerdictClaim) {
       const retryMaxAttempts = configuredNonNegativeInteger(
         options.retryMaxAttempts,
@@ -1159,6 +1187,31 @@ async function mergeClaimedVerdict(
     await options.store.releaseMergeSlot(verdict.id);
     await skip(`review_conflict_at_head:${conflict}`, pr.htmlUrl);
     return undefined;
+  }
+  if (!isRunlessVerdict(verdict)) {
+    const failure = await originatingEvidenceFailure(
+      { runId: verdict.run_id, status: target.run?.status ?? '' },
+      target.run?.id === verdict.run_id ? options.readRunEvents : undefined
+    );
+    if (
+      failure &&
+      !(
+        failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON &&
+        (await evidenceAdjudicated(options.github, { ...pr.pr, headSha: verdict.head_sha }))
+      )
+    ) {
+      await options.store.releaseMergeSlot(verdict.id);
+      await postEvidenceHold(
+        options.github,
+        verdict.run_id,
+        { ...pr.pr, headSha: verdict.head_sha },
+        failure,
+        'execute',
+        true
+      );
+      await skip(failure.reason, pr.htmlUrl);
+      return undefined;
+    }
   }
   let merged: Awaited<ReturnType<GitHubClientDeps['mergePullRequest']>>;
   try {

@@ -47,7 +47,7 @@ run_authority:
 # silently repinning apex to a lesser model, which converts a visible outage into an
 # invisible capability downgrade (it did, undetected, for 8 days).
 provider: claude
-model: claude-fable-5
+model: claude-fable-5-2
 
 nodes:
   # Pre-flight: fail closed if container lacks GITHUB auth (WO-169, 2026-05-16).
@@ -3747,7 +3747,7 @@ nodes:
     # persona pins sonnet and would shadow it). See header + WO-HARNESS-CASCADE-FABLE-APEX-RUNG-01.
     # Repinned opus-5 -> fable-5 by M-121 (John 2026-08-04); see header for the M-87 relationship.
     provider: claude
-    model: claude-fable-5
+    model: claude-fable-5-2
     depends_on: [ascii-gate, run-stop-tests-final, run-stop-greps]
     task_class: medium_work
     prompt: |

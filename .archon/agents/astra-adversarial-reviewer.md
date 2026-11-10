@@ -1,6 +1,6 @@
 ---
 name: astra-adversarial-reviewer
-model: claude-fable-5
+model: claude-fable-5-2
 tools: [Read, Grep, Glob]
 description: Schema and code adversarial reviewer. Read-only. Finds gaps, inconsistencies, type errors. Runs via Claude (Anthropic provider).
 ---

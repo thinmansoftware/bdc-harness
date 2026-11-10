@@ -244,7 +244,7 @@ describe('strict seat model pins', () => {
       {
         file: 'bdc-feature-development-fable.yaml',
         provider: 'claude',
-        model: 'claude-fable-5',
+        model: 'claude-fable-5-2',
         plan: {},
         implement: {},
       },

@@ -112,6 +112,7 @@ describe('merge manager', () => {
     const execute = mock(async () => ({ merged: true, message: 'fake_merge_accepted' }));
     const mergePullRequest = mock(async () => ({ merged: false }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -150,6 +151,7 @@ describe('merge manager', () => {
     const mergePullRequest = mock(async () => ({ merged: true }));
     const commentOnPullRequest = mock(async () => ({ commented: true }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'hold-canary',
       assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: digest }),
       judge: async input => approveReceipt(input),
@@ -192,6 +194,7 @@ describe('merge manager', () => {
     const execute = mock(async () => ({ merged: true }));
     const mergePullRequest = mock(async () => ({ merged: true }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       assembleEvidence: async () => ({
         evidence: evidence({ resulting_deployment_effect: 'none' }),
         evidenceDigest: 'c'.repeat(64),
@@ -223,6 +226,7 @@ describe('merge manager', () => {
       url: 'https://example.test/comment/1',
     }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'comment_findings',
       assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: digest }),
       judge: async input => approveReceipt(input),
@@ -269,6 +273,7 @@ describe('merge manager', () => {
     const execute = mock(async () => ({ merged: true }));
     const mergePullRequest = mock(async () => ({ merged: true }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'comment_findings',
       assembleEvidence: async () => ({
         evidence: evidence({ resulting_deployment_effect: 'none' }),
@@ -302,6 +307,7 @@ describe('merge manager', () => {
     const commentOnPullRequest = mock(async () => ({ commented: true }));
     const insertOverseerAction = mock(async () => undefined);
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'soft-merge-please',
       assembleEvidence: async () => ({
         evidence: evidence({ resulting_deployment_effect: 'none' }),
@@ -330,6 +336,7 @@ describe('merge manager', () => {
     const execute = mock(async () => ({ merged: true }));
     const commentOnPullRequest = mock(async () => ({ commented: true }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'comment_findings',
       assembleEvidence: async () => ({
         evidence: evidence({ resulting_deployment_effect: 'production' }),
@@ -377,6 +384,7 @@ describe('merge manager', () => {
     const judge = mock(async input => approveReceipt(input));
     const execute = mock(async () => ({ merged: true }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -421,6 +429,7 @@ describe('merge manager', () => {
     const insertOverseerAction = mock(async () => undefined);
     const execute = mock(async () => ({ merged: true, message: 'other_repo_merged' }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -473,6 +482,7 @@ describe('merge manager', () => {
         sha: 'd'.repeat(40),
       }));
       const manager = createMergeManager({
+        readRunEvents: async () => [],
         mode: 'execute',
         mutationsEnabled: options.mutationsEnabled ?? true,
         allowedBases: ['dev', 'staging'],
@@ -569,6 +579,7 @@ describe('merge manager', () => {
     const commentOnPullRequest = mock(async () => ({ commented: true }));
     const insertOverseerAction = mock(async () => undefined);
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'comment_findings',
       assembleEvidence: async () => ({
         evidence: evidence({ resulting_deployment_effect: 'none' }),
@@ -617,6 +628,7 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
     };
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       insertOverseerAction,
@@ -650,6 +662,7 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
     };
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -686,6 +699,7 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
     };
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -729,6 +743,7 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
     };
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging', 'main'],
@@ -759,6 +774,7 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
     };
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       insertOverseerAction,
@@ -849,6 +865,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'fake_merge_accepted' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -893,6 +910,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'must_not_run' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -932,6 +950,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -965,6 +984,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -995,6 +1015,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -1028,6 +1049,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -1065,6 +1087,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -1132,6 +1155,7 @@ describe('per-repo base effect overrides', () => {
     }
   ): ReturnType<typeof createMergeManager> {
     return createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       // `main` is allowed as a BASE here so the test isolates the EFFECT classification;
@@ -1263,6 +1287,7 @@ describe('per-repo merge base policy', () => {
       allowedBases?: readonly string[]
     ): ReturnType<typeof createMergeManager> =>
       createMergeManager({
+        readRunEvents: async () => [],
         mode: 'execute',
         mutationsEnabled: true,
         allowedBases,

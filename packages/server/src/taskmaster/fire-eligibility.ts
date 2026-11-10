@@ -5,6 +5,7 @@ import {
   resolveServiceGitHubAuth,
 } from '@archon/core/github/service-identity';
 import { serviceGitHubFetchWithPermissionFallback } from '@archon/core/github/request';
+import { isSpecOnlyFileList } from '@archon/smart-cauldron/spec-only-pr';
 import {
   freezeWorkOrderSource,
   type ExpectedSpecIdentity,
@@ -199,9 +200,8 @@ export async function checkFireEligibility(
   // only docs/work-orders/<id>.md) in that same repo; it is not the build PR
   // (bdc-xo#4311). Exact paths for this exact WO id; an unreadable or empty file
   // list fails closed and still counts as pr_exists.
-  const specPaths = new Set([`docs/work-orders/${woId}.md`, `docs/superpowers/specs/${woId}.md`]);
   const isSpecOnlyPr = async (number: number): Promise<boolean> => {
-    const seen: string[] = [];
+    const seen: unknown[] = [];
     for (let page = 1; page <= 30; page++) {
       const url = `https://api.github.com/repos/${targetRepo}/pulls/${String(number)}/files?per_page=100&page=${String(page)}`;
       const response = deps.githubToken
@@ -218,11 +218,16 @@ export async function checkFireEligibility(
       const rows: unknown = await response.json();
       if (!Array.isArray(rows) || rows.length > 100) return false;
       for (const row of rows) {
-        const filename = (row as { filename?: unknown } | null)?.filename;
+        const entry = row as { filename?: unknown; previous_filename?: unknown } | null;
+        const filename = entry?.filename;
         if (typeof filename !== 'string') return false;
-        seen.push(filename);
+        // A rename INTO a spec path still touches its source path (#1541 review).
+        if (entry?.previous_filename !== undefined) {
+          if (typeof entry.previous_filename !== 'string') return false;
+        }
+        seen.push(entry);
       }
-      if (rows.length < 100) return seen.length > 0 && seen.every(f => specPaths.has(f));
+      if (rows.length < 100) return isSpecOnlyFileList(woId, seen);
     }
     return false;
   };
