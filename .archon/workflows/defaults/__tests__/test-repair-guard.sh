@@ -462,7 +462,7 @@ fixture passthrough
 export FIX_INITIAL=$'TESTS_STATUS=passed\nTESTS_LINE=1/1 (bash original.sh)'
 out="$(run_node run-stop-tests-final)"
 check test "$out" = "$(run_node run-stop-tests-final)"
-check test "$out" = "$FIX_INITIAL"$'\nTESTS_REPAIR_ATTEMPTS=0'
+check test "$out" = "$FIX_INITIAL"$'\nTESTS_REPAIR_ATTEMPTS=0\nRepair touched test infrastructure: none'
 for lane in "$HERE"/../bdc-feature-development*.yaml "$HERE"/../bdc-evidence-replay.yaml; do
   check test -f "$lane"
   for name in rst trg; do
@@ -484,5 +484,168 @@ for name in new.test.ts package.json helper.js marker.js; do
   else
     check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
   fi
+done
+# Round 8: use native symlinks (MSYS ln can silently copy on Windows).
+link_file() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import os, pathlib, sys
+root, name, target = sys.argv[1:]
+path = pathlib.Path(root)/name
+if path.is_symlink() or path.exists(): path.unlink()
+os.symlink(target, path)
+assert path.is_symlink()
+PY
+}
+r8_build() {
+  mkdir -p "$WT/scripts"
+  printf 'base\n' > "$WT/a.js"
+  printf 'base helper\n' > "$WT/scripts/helper.sh"
+  printf 'if grep -q good a.js; then echo "Tests: 1/1"; else echo "Tests: 0/1"; exit 1; fi\n' > "$WT/runner.sh"
+  printf '{"scripts":{"test":"bash check.sh"}}\n' > "$WT/package.json"
+  link_file "$WT" check.sh runner.sh
+  git -C "$WT" add a.js scripts/helper.sh runner.sh check.sh package.json
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm base
+  git -C "$WT" branch run-base
+  printf 'bad build\n' > "$WT/a.js"
+  printf 'build helper\n' > "$WT/scripts/helper.sh"
+  printf '# build changed runner\n' >> "$WT/runner.sh"
+  git -C "$WT" add a.js scripts/helper.sh runner.sh
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm build
+}
+
+# Test 19: freeze resolved targets of declarations, package test entries and tests.
+for location in current stage; do
+  for change in target repoint delete outside broken product package test_file; do
+    echo "Test 19: $location/$change"
+    fixture "r8-$location-$change"
+    r8_build
+    CURRENT="$WT"; TARGET="$WT"
+    export BASE_BRANCH=run-base FIX_MAP=''
+    export FIX_SPEC=$'WO Class: CODE\nStop 1 (test suite):\n  bash check.sh\nExpected: pass'
+    command='bash check.sh'
+    if [ "$change" = package ]; then
+      command='npm test'
+      export npm_config_script_shell=bash
+      export FIX_SPEC=$'WO Class: CODE\nStop 1 (test suite):\n  npm test\nExpected: pass'
+    fi
+    if [ "$location" = stage ]; then
+      fixture "r8-target-$change"
+      r8_build
+      git -C "$WT" branch stage-base run-base
+      TARGET="$WT"; WT="$CURRENT"; export ARTIFACTS_DIR="$WT/artifacts"
+      export RST_STAGE_WORKTREES="b=$TARGET"
+      export FIX_SPEC="$(printf 'WO Class: CODE\n## Canonical stages\n```yaml\nstages:\n  - id: b\n    repo: thinmansoftware/other\n    target_branch: stage-base\n    in_scope_files: [src]\n    verify_commands: ["%s"]\n    readiness_bar: {spec_complete: true, scope_complete: true, dependencies_ready: true, acceptance_defined: true}\n```' "$command")"
+    fi
+    case "$change" in
+      outside)
+        printf 'echo "Tests: 0/1"; exit 1\n' > "$TMP/outside.sh"
+        link_file "$TARGET" check.sh "$TMP/outside.sh" ;;
+      broken) link_file "$TARGET" check.sh absent.sh ;;
+      test_file) link_file "$TARGET" test_hidden.sh runner.sh ;;
+    esac
+    export FIX_INITIAL="$(run_node run-stop-tests)"
+    if [ "$change" = outside ] || [ "$change" = broken ]; then
+      check contains "$FIX_INITIAL" 'TESTS_STATUS=blocked'
+      check contains "$FIX_INITIAL" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+      export FIX_CLASSIFY="$(run_node classify-test-result)"
+      check contains "$FIX_CLASSIFY" '"repairable":"false"'
+      check test ! -e "$ARTIFACTS_DIR/evidence/test-repair.attempts"
+    else
+      check contains "$FIX_INITIAL" 'TESTS_STATUS=failed'
+      check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+      case "$change" in
+        target|package|test_file) printf 'echo "Tests: 1/1"\n' > "$TARGET/runner.sh" ;;
+        repoint)
+          printf 'echo "Tests: 1/1"\n' > "$TARGET/new-runner.sh"
+          link_file "$TARGET" check.sh new-runner.sh ;;
+        delete) rm "$TARGET/runner.sh" ;;
+        product) printf 'good\n' > "$TARGET/a.js" ;;
+      esac
+      if [ "$change" = product ]; then
+        check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+      else
+        check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+      fi
+      run_node test-repair until_bash >/dev/null
+      out="$(run_node run-stop-tests-final)"
+      if [ "$change" = product ]; then
+        check contains "$out" 'TESTS_STATUS=passed'
+        check contains "$out" 'TESTS_REPAIR_RESULT=repaired'
+      else
+        check contains "$out" 'TESTS_STATUS=blocked'
+        check contains "$out" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+        check contains "$out" 'TESTS_REPAIR_RESULT=guard_violation'
+      fi
+    fi
+    unset RST_STAGE_WORKTREES BASE_BRANCH npm_config_script_shell
+  done
+done
+
+# Capture the real patch-pr-body node with both external commands stubbed.
+r8_pr_body() {
+  mkdir -p "$TMP/r8-bin"
+  export R8_REAL_GIT="$(command -v git)"
+  cat > "$TMP/r8-bin/git" <<'SH'
+#!/usr/bin/env bash
+if [ "${1:-}" = fetch ]; then exit 0; fi
+exec "$R8_REAL_GIT" "$@"
+SH
+  cat > "$TMP/r8-bin/gh" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *--json\ baseRefName*) echo run-base ;;
+  *--json\ body*) echo 'Fixture PR prose' ;;
+  *--body-file*)
+    while [ "$1" != --body-file ]; do shift; done
+    cp "$2" "$ARTIFACTS_DIR/pr-body" ;;
+  *) echo "unexpected gh: $*" >&2; exit 1 ;;
+esac
+SH
+  chmod +x "$TMP/r8-bin/git" "$TMP/r8-bin/gh"
+  git -C "$WT" update-ref refs/remotes/origin/run-base run-base
+  python3 - "$LANE" > "$TMP/r8-pr-node.sh" <<'PY'
+import os, re, shlex, sys, yaml
+body = next(n for n in yaml.safe_load(open(sys.argv[1]))['nodes'] if n['id']=='patch-pr-body')['bash']
+values = {'block-reclassify':'{"status":"PROCEED"}', 'open-pr-if-needed':'https://github.com/fixture/repo/pull/1', 'decide-push-target':'repo: fixture/repo', 'stamp-manifest-pr':'WO: WO-TEST\nTests: 1/1\nVALIDATION: PASS', 'read-spec':'', 'build-manifest':'', 'run-stop-tests-final':os.environ['FIX_FINAL']}
+body = re.sub(r'\$([a-z][a-z0-9-]*)\.output',lambda m:shlex.quote(values.get(m[1],'')),body)
+print(body)
+PY
+  (cd "$WT" && PATH="$TMP/r8-bin:$PATH" bash "$TMP/r8-pr-node.sh")
+}
+
+# Tests 20/21: accepted helper residual is disclosed in both real output paths.
+for change in helper product no_repair; do
+  echo "Test 20/21: $change"
+  fixture "r8-disclosure-$change"
+  r8_build
+  export BASE_BRANCH=run-base FIX_MAP=''
+  # A frozen entrypoint may source a build-changed helper: do not trace it.
+  rm "$WT/check.sh"
+  printf '. scripts/helper.sh\nif grep -q good a.js; then echo "Tests: 1/1"; else echo "Tests: 0/1"; exit 1; fi\n' > "$WT/check.sh"
+  printf 'true # build helper\n' > "$WT/scripts/helper.sh"
+  if [ "$change" = no_repair ]; then printf 'good\n' > "$WT/a.js"; fi
+  export FIX_SPEC=$'WO Class: CODE\nStop 1 (test suite):\n  bash check.sh\nExpected: pass'
+  export FIX_INITIAL="$(run_node run-stop-tests)"
+  if [ "$change" != no_repair ]; then
+    check contains "$FIX_INITIAL" 'TESTS_STATUS=failed'
+    printf 'good\n' > "$WT/a.js"
+    if [ "$change" = helper ]; then printf 'true # repaired helper\n' > "$WT/scripts/helper.sh"; fi
+    check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    run_node test-repair until_bash >/dev/null
+  fi
+  export FIX_FINAL="$(run_node run-stop-tests-final)"
+  check contains "$FIX_FINAL" 'TESTS_STATUS=passed'
+  check r8_pr_body
+  body="$(cat "$ARTIFACTS_DIR/pr-body" 2>/dev/null)"
+  for text in "$FIX_FINAL" "$body"; do
+    if [ "$change" = helper ]; then
+      check contains "$text" $'Repair touched test infrastructure\nscripts/helper.sh'
+      check rejects contains "$text" $'\na.js\n'
+    else
+      check test "$(printf '%s\n' "$text" | grep -c '^Repair touched test infrastructure: none$')" = 1
+      check rejects contains "$text" $'Repair touched test infrastructure\n'
+    fi
+  done
+  unset BASE_BRANCH
 done
 finish test-repair-guard.sh
