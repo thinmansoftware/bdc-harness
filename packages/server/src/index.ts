@@ -82,6 +82,10 @@ import {
   stopWorkerHeartbeatAlarmTimer,
 } from './dispatch/worker-heartbeat-alarm';
 import {
+  startWorkroomDrainerStallTimer,
+  stopWorkroomDrainerStallTimer,
+} from './dispatch/workroom-drainer-stall';
+import {
   observeStartupRecovery,
   reconcilePendingRunsAtBoot,
   reconcileRunningRunsAtBoot,
@@ -736,6 +740,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // Dedicated fast timer (default 60s) that pages John for a dead/restarted
   // Dispatch worker, independent of the 15-minute Duty Officer tick.
   startWorkerHeartbeatAlarmTimer();
+  startWorkroomDrainerStallTimer();
 
   // Gitea webhook endpoint
   if (gitea) {
@@ -897,6 +902,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stopOutcomeReportClock();
     stopCauldronFireConsumer();
     stopWorkerHeartbeatAlarmTimer();
+    stopWorkroomDrainerStallTimer();
     persistence.stopPeriodicFlush();
 
     // Await overseer watcher abort before flushing; bounded by the watcher's own
