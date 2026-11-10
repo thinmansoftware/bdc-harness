@@ -135,13 +135,13 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
         expect(n.bash).toContain(
           'inline-flag rejection: -c -e --eval -p --print -r --require -i -m'
         );
-        expect(n.bash).toContain('timeout 1500 "$@"');
+        expect(n.bash).toContain('timeout "$(rst_timeout)" "$@"');
         expect(n.bash).toContain('[ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -ne 0 ]');
       });
 
       it('run-stop-greps tokenizes argv pipelines and rejects find -execdir', () => {
         const n = node(nodes, 'run-stop-greps', file);
-        expect(n.depends_on).toEqual(['format-autofix']);
+        expect(n.depends_on).toEqual(['format-autofix', 'run-stop-tests-final']);
         expect(n.timeout).toBe(600000);
         // WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01: the whitespace split and the
         // per-token charset check were replaced by the shared quote-aware tokenizer
@@ -157,8 +157,8 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
 
       it('war-council-validator depends on both evidence nodes and carries the executed-command contract', () => {
         const n = node(nodes, 'war-council-validator', file);
-        expect(n.depends_on).toEqual(['ascii-gate', 'run-stop-tests', 'run-stop-greps']);
-        expect(n.prompt).toContain('$run-stop-tests.output');
+        expect(n.depends_on).toEqual(['ascii-gate', 'run-stop-tests-final', 'run-stop-greps']);
+        expect(n.prompt).toContain('$run-stop-tests-final.output');
         expect(n.prompt).toContain('$run-stop-greps.output');
         expect(n.prompt).toContain('TESTS_OBSERVED: <passed>/<total> (<command you executed>)');
         expect(n.prompt).toContain('TESTS_OBSERVED: not_run (<reason>)');
@@ -168,9 +168,9 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
 
       it('stamp-manifest-evidence rewrites the raw engine manifest from both evidence nodes', () => {
         const n = node(nodes, 'stamp-manifest-evidence', file);
-        expect(n.depends_on).toEqual(['build-manifest', 'run-stop-tests', 'run-stop-greps']);
+        expect(n.depends_on).toEqual(['build-manifest', 'run-stop-tests-final', 'run-stop-greps']);
         expect(n.bash).toContain('$build-manifest.output');
-        expect(n.bash).toContain('$run-stop-tests.output');
+        expect(n.bash).toContain('$run-stop-tests-final.output');
         expect(n.bash).toContain('$run-stop-greps.output');
       });
 
@@ -266,6 +266,11 @@ function runStopTestsNode(opts: {
   const artifacts = join(cwd, 'artifacts');
   mkdirSync(artifacts);
   try {
+    // The repair snapshot requires a real Git worktree, including in fixtures.
+    const gitInit = Bun.spawnSync(['git', 'init', '-q'], { cwd });
+    if (gitInit.exitCode !== 0) {
+      throw new Error(`Fixture git init failed: ${gitInit.stderr.toString()}`);
+    }
     writeFileSync(
       join(cwd, 'package.json'),
       `${JSON.stringify({ name: 'x', scripts: { test: 'bash ./repo-pass.sh' } })}\n`

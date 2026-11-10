@@ -1847,9 +1847,13 @@ nodes:
     timeout: 60000
     bash: |
       set -uo pipefail
+      # Replay consumers run in the owned clone; feature lanes keep their cwd.
+      if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then
+        cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1
+      fi
       ORIGIN="$(git remote get-url origin 2>/dev/null || true)"
       if ! MAP_RESPONSE="$(timeout 30 gh api 'repos/thinmansoftware/bdc-xo/contents/scripts/cauldron/cauldron-projects.json?ref=main' 2>/dev/null)"; then
-        printf 'TEST_COMMAND_SOURCE=wo-spec\nTEST_COMMAND_FALLBACK=unavailable\nTEST_COMMAND_MAP_SHA=\nTEST_COMMAND_B64=\n'
+        printf 'TEST_COMMAND_SOURCE=wo-spec\nTEST_COMMAND_FALLBACK=unavailable\nTEST_COMMAND_MAP_SHA=\nTEST_COMMAND_B64=\nTEST_TIMEOUT_SECONDS=1500\n'
         exit 0
       fi
       # Structured data only: no shell evaluation or command execution here.
@@ -1869,6 +1873,7 @@ nodes:
       reason = "malformed"
       sha = ""
       command = ""
+      timeout_seconds = 1500
       try:
           envelope = json.load(sys.stdin)
           revision = envelope.get("sha", "")
@@ -1883,12 +1888,16 @@ nodes:
           matches = [value for value in projects.values() if isinstance(value, dict) and slug is not None and normalize(value.get("repo"), True) == slug]
           reason = "invalid-origin" if slug is None else "missing" if not matches else "ambiguous" if len(matches) != 1 else "invalid-command"
           if len(matches) == 1:
+              value = matches[0].get("test_timeout_seconds")
+              if type(value) is int:
+                  timeout_seconds = max(60, min(1700, value))
               candidate = matches[0].get("test_command")
               if isinstance(candidate, str) and candidate.strip() and len(candidate) <= 4096 and "\n" not in candidate and "\r" not in candidate and "\x00" not in candidate:
                   command = candidate
                   reason = ""
       except (ValueError, TypeError, KeyError, AttributeError):
           reason = "malformed"
+      print("TEST_TIMEOUT_SECONDS=" + str(timeout_seconds))
       print("TEST_COMMAND_SOURCE=" + ("project-map" if command else "wo-spec"))
       print("TEST_COMMAND_FALLBACK=" + reason)
       print("TEST_COMMAND_MAP_SHA=" + sha)
@@ -1903,6 +1912,10 @@ nodes:
     timeout: 1800000
     bash: |
       set -uo pipefail
+      # Replay consumers run in the owned clone; feature lanes keep their cwd.
+      if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then
+        cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1
+      fi
 
       capture_node_output() {
         python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
@@ -2302,7 +2315,7 @@ nodes:
       #   unused (pipes are already rejected).
       rst_run_commands() {
         local cmds="$1" log="$2" cmd seg rc exit_code=0 p=0 t=0 hit=0 c
-        local saved_pwd d k total env_reason="" word needs_postgres
+        local saved_pwd d k total piece piece_counts piece_cmd env_reason="" word needs_postgres
         local -a words=() segw=()
         rst_scrub_env
         saved_pwd="$(pwd)"
@@ -2370,8 +2383,14 @@ nodes:
                     printf 'rst_run_commands: npm not found, running as: %s\n' "$*" >> "$seg"
                   fi
                 fi
-                timeout 1500 "$@" >> "$seg" 2>&1 < /dev/null
+                piece="$(mktemp)"
+                piece_cmd="${segw[*]}"
+                timeout "$(rst_timeout)" "$@" > "$piece" 2>&1 < /dev/null
                 rc=$?
+                piece_counts="$(rst_parse_counts < "$piece")"
+                cat "$piece" >> "$seg"
+                printf 'TESTS_COMMAND_RESULT=%s => exit %s, %s/%s\n' "$piece_cmd" "$rc" "${piece_counts%% *}" "${piece_counts##* }" >> "$log"
+                rm -f "$piece"
                 [ "$rc" -ne 0 ] && break
                 k=$((k + 1))
                 [ "$k" -ge "$total" ] && break
@@ -2390,7 +2409,9 @@ nodes:
         [ -z "$env_reason" ] || printf '\t%s' "$env_reason"
         return 0
       }
-      # rst_report <class> <cmd> <exit> <counts>   (-> TESTS_STATUS / TESTS_LINE lines)
+      # rst_report <class> <cmd> <exit> <counts> [env_reason] [log_path]
+      #   A declared environment probe wins over blocked reasons; absent capability is
+      #   not repairable, even if another declared command failed or timed out.
       #   Status law: passed only when the command exited 0 AND passed == total > 0.
       #   Any nonzero exit, any failing test, or 0 tests ran is "failed". A
       #   spec-declared command that exited nonzero with no parseable counts is
@@ -2400,13 +2421,19 @@ nodes:
       #   runnable test command AND no test files in the diff is
       #   "no_command_declared" (spec + build defect).
       rst_report() {
-        local class="$1" cmd="$2" exit_code="$3" counts="$4" env_reason="${5:-}" status line p t
+        local class="$1" cmd="$2" exit_code="$3" counts="$4" env_reason="${5:-}" status line p t reason
         if [ -n "$env_reason" ]; then
-          status="env_unavailable"
           line="${counts:-0 0}"
           line="${line/ /\/} ($cmd) -- ENVIRONMENT UNAVAILABLE: $env_reason"
-          printf 'TESTS_ENV_REASON=%s\n' "$env_reason"
-        elif [ -z "$cmd" ]; then
+          printf 'TESTS_ENV_REASON=%s\nTESTS_STATUS=env_unavailable\nTESTS_LINE=%s\n' "$env_reason" "$line"
+          return 0
+        fi
+        reason="$(rst_failure_reason "$exit_code" "${6:-/dev/null}" "$cmd")"
+        if [ -n "$reason" ]; then
+          printf 'TESTS_STATUS=blocked\nTESTS_LINE=BLOCKED (%s)\nTESTS_BLOCKED_REASON=%s\n' "$reason" "$reason"
+          return 0
+        fi
+        if [ -z "$cmd" ]; then
           case "$class" in
             CODE|MIXED) status="no_command_declared"; line="N/A ($class spec declares no executable test command and the diff touched no test files -- Rule 10 defect)" ;;
             *) status="not_required"; line="N/A ($class class, no test command declared)" ;;
@@ -2431,7 +2458,408 @@ nodes:
         fi
         printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\n' "$status" "$line"
       }
+
+      # Project-map values are clamped separately; direct fixture overrides may be <60.
+      rst_timeout() {
+        local value="${RST_TIMEOUT_SECONDS:-1500}"
+        if ! [[ "$value" =~ ^[0-9]+$ ]]; then value=1500; fi
+        value="$(printf '%s' "$value" | sed 's/^0*//')"
+        if [ -z "$value" ]; then value=1500
+        elif [ "${#value}" -gt 4 ] || [ "$value" -gt 1700 ]; then value=1700; fi
+        printf '%s' "$value"
+      }
+      rst_failure_reason() {
+        local rc="$1" log="${2:-/dev/null}" cmd="${3:-}" tool
+        if [ "$rc" -eq 124 ]; then printf 'timeout:%ss' "$(rst_timeout)"; return; fi
+        if grep -q 'outside of the test runner' "$log" && [[ "$(command -v node)" == *bun-node-fallback-bin/* || "$(command -v node)" == */bun ]]; then
+          printf 'runner_mismatch:node-is-bun'; return
+        fi
+        if [ "$rc" -eq 127 ] || grep -q 'failed to run command' "$log"; then
+          tool="$(sed -nE 's/.*failed to run command [^A-Za-z0-9_/.-]*([A-Za-z0-9_/.-]+).*/\1/p' "$log" | head -1)"
+          [ -n "$tool" ] || tool="${cmd%% *}"
+          printf 'missing_tool:%s' "${tool:-unknown}"
+        fi
+      }
+      # Same canonical-block selection and required stage keys as parse-stages.
+      # An absent plan is empty; an ambiguous or invalid declared plan fails closed.
+      rst_stage_plan() {
+        python3 -c '
+      import re, sys
+      spec = sys.stdin.read()
+      candidates = [(m.start(), m.group(1)) for m in re.finditer(r"```ya?ml\s*\n(.*?)\n```", spec, re.S) if re.search(r"^stages:", m.group(1), re.M)]
+      if not candidates:
+          m = re.search(r"^stages:[^\n]*(?:\n(?:[ \t-][^\n]*|))*(?:\n|$)", spec, re.M)
+          if m: candidates = [(0, m.group())]
+      if not candidates: sys.exit(0)
+      markers = [r"^\s*##+\s+Canonical\s+stages\b", r"^\s*##+\s+Stages\b", r"<!--\s*canonical-stages\s*-->", r"<!--\s*stages:\s*canonical\s*-->"]
+      chosen = next((body for marker in markers for offset, body in candidates if re.search(marker, spec[max(0, offset-600):offset], re.I|re.M)), None)
+      if chosen is None:
+          if len(candidates) != 1: sys.exit("stage_plan_invalid: ambiguous canonical stages")
+          chosen = candidates[0][1]
+      import yaml
+      data = yaml.safe_load(chosen)
+      stages = data.get("stages") if isinstance(data, dict) else None
+      if not isinstance(stages, list) or not stages: sys.exit("stage_plan_invalid: empty stages")
+      seen = set()
+      lines = []
+      for st in stages:
+          if not isinstance(st, dict) or any(k not in st for k in ["id","repo","target_branch","in_scope_files","verify_commands","readiness_bar"]): sys.exit("stage_plan_invalid: required key missing")
+          sid, repo, commands = st["id"], st["repo"], st["verify_commands"]
+          if not isinstance(sid,str) or not re.fullmatch(r"[A-Za-z0-9_.-]+",sid) or sid in seen: sys.exit("stage_plan_invalid: invalid or duplicate id")
+          seen.add(sid)
+          if not isinstance(repo,str) or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+",repo): sys.exit("stage_plan_invalid: invalid repo")
+          if not isinstance(commands,list) or not commands: sys.exit("stage_plan_invalid: empty verify_commands")
+          for cmd in commands:
+              if not isinstance(cmd,str) or not cmd.strip() or any(c in cmd for c in "\t\r\n\x00"): sys.exit("stage_plan_invalid: invalid command")
+              lines.append("\t".join([sid,repo,cmd,str(st["target_branch"])]))
+      print("\n".join(lines))' | sed 's/\r$//'
+      }
+      # Shared directory resolution for execution and assertion-guard coverage.
+      rst_stage_dir() {
+        local sid="$1" repo="$2" dir origin
+        dir="$(printf '%s\n' "${RST_STAGE_WORKTREES:-}" | tr ';' '\n' | sed -n "s/^${sid}=//p" | head -1)"
+        origin="$(git remote get-url origin 2>/dev/null | sed -E 's#.*github.com[:/]##; s/[.]git$//')"
+        if [ -z "$dir" ] && [ "$repo" = "$origin" ]; then dir="$(pwd)"; fi
+        printf '%s\n' "$dir"
+      }
+      # Replays only the persisted plan; no spec extraction occurs in a repair or final run.
+      rst_execute_saved() {
+        local evidence="$1" class="$2" cmds log result rc counts joined report reason="" env_reason="" overall_env_reason="" overall=passed p=0 t=0
+        local sid repo cmd dir stage_status stage_line lines="" blocked="" stage_cmds
+        cmds="$evidence/stop-tests.commands"; log="$evidence/stop-tests.log"
+        if [ -s "$evidence/stop-tests.stages" ]; then
+          stage_cmds="$(mktemp)"
+          while IFS= read -r sid; do
+            repo="$(awk -F '\t' -v id="$sid" '$1==id {print $2; exit}' "$evidence/stop-tests.stages")"
+            awk -F '\t' -v id="$sid" '$1==id {print $3}' "$evidence/stop-tests.stages" > "$stage_cmds"
+            dir="$(rst_stage_dir "$sid" "$repo")"
+            if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+              stage_status=blocked; reason="stage_repo_absent:$repo"; stage_line="$sid: BLOCKED ($reason)"
+            else
+              joined="$(paste -sd ';' "$stage_cmds" | sed 's/;/; /g')"
+              local stage_log
+              stage_log="$(mktemp)"
+              result="$(cd "$dir" && rst_run_commands "$stage_cmds" "$stage_log")"
+              cat "$stage_log" >> "$log"
+              env_reason=""
+              case "$result" in *$'\t'*) env_reason="${result#*$'\t'}"; result="${result%%$'\t'*}" ;; esac
+              rc="${result%% *}"; counts="${result#* }"; counts="$(echo "$counts" | xargs)"
+              report="$(SOURCE=spec_declared rst_report "$class" "$joined" "$rc" "$counts" "$env_reason" "$stage_log")"
+              stage_status="$(echo "$report" | sed -n 's/^TESTS_STATUS=//p')"
+              reason="$(echo "$report" | sed -n 's/^TESTS_BLOCKED_REASON=//p')"
+              stage_line="$sid: $(echo "$report" | sed -n 's/^TESTS_LINE=//p')"
+              if [ -n "$counts" ]; then p=$((p+${counts%% *})); t=$((t+${counts##* })); fi
+              rm -f "$stage_log"
+            fi
+            if [ "$stage_status" = env_unavailable ]; then
+              overall=env_unavailable
+              [ -n "$overall_env_reason" ] || overall_env_reason="$(echo "$report" | sed -n 's/^TESTS_ENV_REASON=//p')"
+            elif [ "$stage_status" = blocked ]; then
+              [ "$overall" = env_unavailable ] || overall=blocked
+              [ -n "$blocked" ] || blocked="$reason"
+            elif [ "$stage_status" != passed ] && [ "$overall" != blocked ] && [ "$overall" != env_unavailable ]; then overall=failed; fi
+            printf 'TESTS_STAGE_LINE=%s\n' "$stage_line"
+            lines="${lines:+$lines | }$stage_line"
+          done < <(cut -f1 "$evidence/stop-tests.stages" | awk '!seen[$0]++')
+          rm -f "$stage_cmds"
+          [ -z "$overall_env_reason" ] || printf 'TESTS_ENV_REASON=%s\n' "$overall_env_reason"
+          printf 'TESTS_STATUS=%s\nTESTS_LINE=%s\nTESTS_BLOCKED_REASON=%s\nTESTS_PASSED=%s\nTESTS_TOTAL=%s\nTESTS_EXIT=%s\n' "$overall" "$lines" "$blocked" "$p" "$t" "$([ "$overall" = passed ] && echo 0 || echo 1)"
+        else
+          joined="$(paste -sd ';' "$cmds" | sed 's/;/; /g')"
+          local command_log
+          command_log="$(mktemp)"
+          result="$(rst_run_commands "$cmds" "$command_log")"
+          cat "$command_log" >> "$log"
+          env_reason=""
+          case "$result" in *$'\t'*) env_reason="${result#*$'\t'}"; result="${result%%$'\t'*}" ;; esac
+          rc="${result%% *}"; counts="${result#* }"; counts="$(echo "$counts" | xargs)"
+          SOURCE=spec_declared rst_report "$class" "$joined" "$rc" "$counts" "$env_reason" "$command_log"
+          printf 'TESTS_EXIT=%s\nTESTS_PASSED=%s\nTESTS_TOTAL=%s\n' "$rc" "${counts%% *}" "${counts##* }"
+          rm -f "$command_log"
+        fi
+        printf 'TESTS_CLASS=%s\n' "$class"
+        grep '^TESTS_COMMAND_RESULT=' "$log" || true
+      }
+      # Persist executable functions before the agent runs. Both consumers source this
+      # snapshot, so the embedded rst/trg cores have one byte-identical copy per lane.
+      rst_save_core() {
+        { declare -f $(compgen -A function | grep -E '^(rst_|trg_|_?rsg_)'); declare -p RSGARGV_SCRIPT RST_RS RST_WORDS RSG_US RSG_RS RSG_PARSED; } > "$1/stop-tests.core.sh"
+      }
       # ---- END rst core ----
+
+      # ---- BEGIN trg core (byte-identical across lanes; extracted by unit test) ----
+      # Allow only build-changed product source and new product helpers.
+      # One infrastructure classifier governs the freeze, new files and listing.
+      trg_guard() {
+        local mode="$1" root="$2" snapshot="$3" sid repo command target dir
+        local -a roots=("$root" "${BASE_BRANCH:-master}")
+        local -a declared=()
+        if [ ! -s "$(dirname "$snapshot")/stop-tests.stages" ] && [ -f "$(dirname "$snapshot")/stop-tests.commands" ]; then
+          while IFS= read -r command; do
+            declared+=("$root" "$command")
+          done < "$(dirname "$snapshot")/stop-tests.commands"
+        fi
+        if [ -s "$(dirname "$snapshot")/stop-tests.stages" ]; then
+          while IFS=$'\t' read -r sid repo command target; do
+            dir="$(cd "$root" && rst_stage_dir "$sid" "$repo")" || return 1
+            # Remember present roots; checks revisit saved roots if mappings vanish.
+            if [ -n "$dir" ]; then
+              dir="$(cd "$root" && cd "$dir" 2>/dev/null && pwd)" || continue
+              roots+=("$dir" "$target")
+              declared+=("$dir" "$command")
+            fi
+          done < "$(dirname "$snapshot")/stop-tests.stages"
+        fi
+        python3 - "$mode" "$snapshot" "${SPEC:-}" "${#roots[@]}" "${roots[@]}" "${declared[@]}" <<'TRG_PY'
+      import fnmatch, hashlib, json, os, pathlib, re, shlex, subprocess, sys
+      mode, snapshot, spec = sys.argv[1:4]
+      count = int(sys.argv[4])
+      pairs = sys.argv[5:5+count]
+      run_root, run_base = str(pathlib.Path(pairs[0]).resolve()), pairs[1]
+      # Match resolve-review-base's declared-header priority, without network access.
+      for pattern in [r"^Base branch:\s*([A-Za-z0-9_./-]+)",r"\*\*Base branch:\*\*\s*`([A-Za-z0-9_./-]+)`",r"^base_branch:\s*([A-Za-z0-9_./-]+)"]:
+          match = re.search(pattern,spec,re.M)
+          if match:
+              run_base = match[1]
+              break
+      roots = {}
+      for directory, base in zip(pairs[2::2],pairs[3::2]):
+          roots.setdefault(str(pathlib.Path(directory).resolve()),set()).add(base)
+      # A stage executing in the run directory uses its own persisted target branch.
+      roots.setdefault(run_root,{run_base})
+      declared = sys.argv[5+count:]
+      markers = [r"\.skip\s*\(",r"\.only\s*\(",r"\bxit\s*\(",r"\bxdescribe\s*\(",r"\bit\.todo\b",r"\btest\.todo\b",r"@pytest\.mark\.skip",r"unittest\.skip"]
+      before = {} if mode == "snapshot" else json.loads(pathlib.Path(snapshot).read_text())
+      touched = set()
+      violations = []
+      command_files = {}
+      def excluded(name):
+          return any(part in {"node_modules",".git",".venv","venv","__pycache__",".bun",".pnpm-store"} for part in pathlib.PurePosixPath(name).parts)
+      def directory_in_tree(root,name):
+          path = root/name
+          return path.is_dir() and path.resolve().is_relative_to(root)
+      def package_script(root, cwd, name, stack, lifecycle=False):
+          if excluded(cwd.relative_to(root).as_posix()): return
+          key = (str(cwd),name)
+          try:
+              if key in stack or len(stack) >= 5: raise ValueError("package script cycle or depth limit")
+              package = cwd/"package.json"
+              if not package.resolve(strict=True).is_relative_to(root): raise ValueError("package outside worktree")
+              scripts = json.loads(package.read_text())["scripts"]
+              command = scripts[name]
+              names = (["pre"+name] if lifecycle and "pre"+name in scripts else []) + [name] + (["post"+name] if lifecycle and "post"+name in scripts else [])
+              commands = [scripts[entry] for entry in names]
+              if any(not isinstance(value,str) or not value.strip() for value in commands): raise ValueError("missing package script")
+          except (OSError,RuntimeError,ValueError,KeyError,TypeError) as error:
+              print("test guard: cannot resolve package script: "+str(cwd)+"/"+name+": "+str(error),file=sys.stderr)
+              sys.exit(42)
+          command_files.setdefault(str(root),set()).add(package.relative_to(root).as_posix())
+          for command in commands: declared_paths(root,command,cwd,stack+(key,))
+      def declared_paths(root, command, cwd=None, stack=(), expand=True):
+          cwd = root if cwd is None else cwd
+          try:
+              lexer = shlex.shlex(command,posix=True,punctuation_chars="&|;")
+              lexer.whitespace_split = True
+              lexer.commenters = ""
+              tokens = list(lexer)
+          except ValueError:
+              if expand: sys.exit(42)
+              return
+          # Resolve each chained segment in its own command cwd.
+          segments = []
+          segment = []
+          for token in tokens:
+              if token in {"&&","||",";","|"}:
+                  segments.append(segment); segment = []
+              else: segment.append(token)
+          segments.append(segment)
+          for segment in segments:
+              if not segment: continue
+              if segment[0] == "cd" and len(segment) == 2:
+                  cwd = (cwd/segment[1]).resolve()
+                  if not cwd.is_relative_to(root): return
+                  continue
+              manager = pathlib.Path(segment[0]).name
+              args = segment[1:]
+              name = None
+              if manager == "npm":
+                  if args and args[0] == "test": name = "test"
+                  elif len(args) >= 2 and args[0] == "run": name = args[1]
+              elif manager in {"bun","yarn","pnpm"} and args:
+                  if len(args) >= 2 and args[0] == "run": name = args[1]
+                  elif manager != "bun" and not args[0].startswith("-"): name = args[0]
+                  # Bun prefers package scripts over same-named files. Only
+                  # treat bun run x.ts as a file when no such script is declared.
+                  if manager == "bun" and name and (cwd/name).is_file():
+                      try:
+                          scripts = json.loads((cwd/"package.json").read_text()).get("scripts",{})
+                          if not isinstance(scripts,dict): scripts = {}
+                      except (OSError,ValueError,AttributeError): scripts = {}
+                      if name not in scripts: name = None
+              if mode == "snapshot" and expand and name is not None:
+                  package_script(root,cwd,name,stack,lifecycle=manager == "npm")
+              for token in segment:
+                  if token.startswith("-"): continue
+                  if re.fullmatch(r"(?:ba|z|da|k)?sh|python(?:[0-9.]+)?|node(?:js)?|bunx?|npm|npx|pnpm|yarn|pytest",pathlib.Path(token).name): continue
+                  path = pathlib.Path(os.path.abspath(cwd/token))
+                  if (path.is_file() or path.is_symlink()) and path.is_relative_to(root):
+                      name = path.relative_to(root).as_posix()
+                      if not excluded(name) and not directory_in_tree(root,name):
+                          command_files.setdefault(str(root),set()).add(name)
+      for directory, command in zip(declared[::2],declared[1::2]):
+          declared_paths(pathlib.Path(directory).resolve(),command)
+      def git_paths(root,*args):
+          return {os.fsdecode(name) for name in subprocess.check_output(["git",*args],cwd=root).split(b"\x00") if name}
+      def test_file(name):
+          return bool(re.search(r"(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.|(^|/)test_[^/]+|(^|/)[^/]+_test[.]",name))
+      def allowed_paths(root,bases):
+          allowed = None
+          for base in bases:
+              changed = set()
+              if base:
+                  for ref in ["origin/"+base,base]:
+                      if subprocess.run(["git","rev-parse","--verify","--quiet",ref+"^{commit}"],cwd=root,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode: continue
+                      try:
+                          changed = git_paths(root,"diff","--no-renames","--name-only","-z",ref+"...HEAD","--")
+                      except subprocess.CalledProcessError:
+                          pass
+                      break
+              allowed = changed if allowed is None else allowed & changed
+          return {name for name in allowed or set() if not excluded(name) and not directory_in_tree(root,name) and not infrastructure(root,name)}
+      def content(path):
+          # Hash symlink bytes without following targets outside the worktree.
+          if path.is_symlink(): return os.fsencode(os.readlink(path))
+          return path.read_bytes() if path.is_file() else None
+      def digest(path):
+          raw = content(path)
+          return hashlib.sha256(raw).hexdigest() if raw is not None else None
+      def executable(path):
+          # Git's index preserves executable mode on hosts without POSIX chmod.
+          return path.is_file() and (path.relative_to(root).as_posix() in executable_index or bool(path.stat().st_mode & 0o111))
+      def infrastructure(root,name):
+          if excluded(name) or directory_in_tree(root,name): return False
+          parts = pathlib.PurePosixPath(name).parts
+          patterns = ["package.json","bun.lock","bun.lockb","package-lock.json","pnpm-lock.yaml","yarn.lock","bunfig.toml","jest.config.*","vitest.config.*","vitest.workspace.*","playwright.config.*","pytest.ini","conftest.py","pyproject.toml","setup.cfg","tox.ini","Makefile","tsconfig*",".github"]
+          return (test_file(name) or any(fnmatch.fnmatchcase(part,pattern) for part in parts for pattern in patterns)
+                  or name in command_files.get(str(root),set())
+                  or pathlib.PurePosixPath(name).suffix.lower() in {".sh",".bash",".ps1"}
+                  or any(part in {"scripts","test","tests","__tests__","spec","specs",".circleci",".buildkite"} for part in parts)
+                  or any(fnmatch.fnmatchcase(parts[-1],pattern) for pattern in [".gitlab-ci.*",".travis.yml","Jenkinsfile","azure-pipelines.*",".mocharc*",".nycrc*",".taprc*",".coveragerc","karma.conf.*","cypress.config.*","ava.config.*","test.config.*","runner.config.*","phpunit.xml*"])
+                  or executable(root/name))
+      def fingerprint(path):
+          return [digest(path),executable(path)] if path.exists() or path.is_symlink() else None
+      now = {}
+      for directory in sorted(roots.keys() | before.keys()):
+          root = pathlib.Path(directory)
+          if mode == "report" and not root.is_dir():
+              touched.update(before.get(directory,{}).get("infrastructure",{}))
+              continue
+          if not root.is_dir(): sys.exit("test guard: missing stage directory: "+directory)
+          index = git_paths(root,"ls-files","--stage","-z")
+          tracked = {entry.split("\t",1)[1] for entry in index}
+          tracked = {name for name in tracked if not excluded(name) and not directory_in_tree(root,name)}
+          executable_index = {entry.split("\t",1)[1] for entry in index if entry.startswith("100755 ")}
+          files = {name for name in tracked | git_paths(root,"ls-files","-z","--others") | command_files.get(directory,set()) if not excluded(name) and not directory_in_tree(root,name)}
+          if mode == "snapshot":
+              links = {}
+              def freeze_link(name):
+                  path = root/name
+                  # Resolve file tokens through directory links as well as leaf links.
+                  if not path.is_symlink() and path.resolve() == path: return
+                  try:
+                      target = path.resolve(strict=True)
+                      if not target.is_relative_to(root) and not infrastructure(root,name): return
+                      if not target.is_relative_to(root) or not target.is_file(): raise ValueError("outside worktree or not a file")
+                  except (OSError,RuntimeError,ValueError) as error:
+                      print("test guard: unresolved or outside symlink: "+str(path)+": "+str(error),file=sys.stderr)
+                      sys.exit(42)
+                  target_name = target.relative_to(root).as_posix()
+                  if not excluded(target_name): links[name] = target_name
+              build_allowed = allowed_paths(root,roots[directory])
+              fixed_paths = tracked - build_allowed
+              for name in files:
+                  if name in fixed_paths or infrastructure(root,name): freeze_link(name)
+              declared_set = set(command_files.get(directory,set()))
+              # Preserve the round-8 freeze of symlinked test entries in other
+              # packages, without requiring or expanding their undeclared scripts.
+              for name in files:
+                  if pathlib.PurePosixPath(name).name != "package.json": continue
+                  try:
+                      command = json.loads((root/name).read_text()).get("scripts",{}).get("test","")
+                      if isinstance(command,str): declared_paths(root,command,(root/name).parent,expand=False)
+                  except (OSError,ValueError,AttributeError): pass
+              for name in command_files.get(directory,set()) - declared_set:
+                  if (root/name).is_symlink() or (root/name).resolve() != root/name:
+                      freeze_link(name)
+                      declared_set.add(name)
+              command_files[directory] = declared_set
+              targets = set(links.values())
+              allowed = build_allowed - declared_set - targets
+              frozen = (tracked - allowed) | {name for name in files if infrastructure(root,name)} | declared_set | targets
+              now[directory] = dict(allowed=sorted(allowed),known=sorted(files),links=links,frozen={name:digest(root/name) for name in sorted(frozen)},infrastructure={name:fingerprint(root/name) for name in sorted(files | targets) if infrastructure(root,name)})
+              continue
+          if directory not in before: sys.exit("test guard: unsnapshotted stage directory: "+directory)
+          saved = before[directory]
+          previous = saved.get("infrastructure",{})
+          candidates = set(previous) | {name for name in files if infrastructure(root,name)}
+          touched.update(name for name in candidates if fingerprint(root/name) != previous.get(name))
+          if mode == "report": continue
+          for name, target in saved.get("links",{}).items():
+              try:
+                  if (root/name).resolve(strict=True) != root/target: raise ValueError("repointed")
+              except (OSError,RuntimeError,ValueError):
+                  violations.append("test guard: changed or deleted symlink target: "+directory+"/"+name)
+          for name, sha in saved["frozen"].items():
+              if digest(root/name) != sha: violations.append("test guard: changed or deleted frozen file: "+directory+"/"+name)
+          for name in files - set(saved["known"]):
+              if infrastructure(root,name):
+                  violations.append("test guard: new frozen file: "+directory+"/"+name)
+              raw = content(root/name)
+              if raw is not None and any(re.search(t,raw.decode(errors="replace")) for t in markers):
+                  violations.append("test guard: skip/only/todo in new file: "+directory+"/"+name)
+      if mode == "snapshot":
+          pathlib.Path(snapshot).write_text(json.dumps(now,sort_keys=True),encoding="ascii")
+      if mode == "report":
+          sys.stdout.reconfigure(newline="\n")
+          print("Repair touched test infrastructure" if touched else "Repair touched test infrastructure: none")
+          for name in sorted(touched): print(name)
+      for name in sorted(touched):
+          print("test guard: repair changed test infrastructure: "+name+" (frozen; a human must change it)",file=sys.stdout if mode == "report" else sys.stderr)
+      for message in violations: print(message,file=sys.stderr)
+      if touched or violations: sys.exit(1)
+      TRG_PY
+      }
+      trg_snapshot() { trg_guard snapshot "$1" "$2"; }
+      trg_check() { trg_guard check "$1" "$2"; }
+      trg_infrastructure() { trg_guard report "$1" "$2"; }
+      # Snapshot failures block repair before the classifier can admit an attempt.
+      trg_snapshot_report() {
+        local previous result
+        if trg_snapshot "$1" "$2/test-guard.json"; then return 0; else result=$?; fi
+        : > "$2/test-repair.guard"
+        previous="$(cat "$2/stop-tests.initial")"
+        # A known boundary violation (42) takes precedence. An unavailable guard
+        # tool must not replace an already non-repairable environment reason.
+        if [ "$result" -ne 42 ] && printf '%s\n' "$previous" | grep -E '^TESTS_STATUS=(blocked|env_unavailable)$' >/dev/null; then return 0; fi
+        {
+          printf '%s\n' "$previous" | grep -vE '^TESTS_(STATUS|BLOCKED_REASON|LINE)=' || true
+          printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=tests_failed_after_repair:guard\nTESTS_LINE=BLOCKED (tests_failed_after_repair:guard)\n'
+        } > "$2/stop-tests.initial"
+      }
+      # A guard violation returns success to END the loop; final evidence stays BLOCKED.
+      trg_attempt() {
+        local e="$1" class="$2" n
+        n="$(cat "$e/test-repair.attempts" 2>/dev/null || echo 0)"
+        n=$((n+1)); printf '%s\n' "$n" > "$e/test-repair.attempts"
+        rst_execute_saved "$e" "$class" > "$e/test-repair.report"
+        if ! trg_check "$(pwd)" "$e/test-guard.json"; then
+          : > "$e/test-repair.guard"
+          return 0
+        fi
+        grep -q '^TESTS_STATUS=passed$' "$e/test-repair.report"
+      }
+      # ---- END trg core ----
+
 
       # ---- BEGIN dprep core (byte-identical across lanes; extracted by unit test) ----
       # dprep_ensure_js_deps lives in scripts/lane/dprep.sh (one source of truth). It installs
@@ -2508,6 +2936,22 @@ nodes:
       MAP_SHA="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_MAP_SHA=//p' | head -1)"
       MAP_FALLBACK="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_FALLBACK=//p' | head -1)"
       MAP_COMMAND="$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_COMMAND_B64=//p' | head -1 | base64 --decode 2>/dev/null || true)"
+      export RST_TIMEOUT_SECONDS="${RST_TIMEOUT_SECONDS:-$(printf '%s\n' "$RESOLUTION" | sed -n 's/^TEST_TIMEOUT_SECONDS=//p' | head -1)}"
+      printf '%s\n' "$CLASS" > "$EVIDENCE_DIR/stop-tests.class"
+      printf '%s\n' "${RST_TIMEOUT_SECONDS:-1500}" > "$EVIDENCE_DIR/stop-tests.timeout"
+      rst_save_core "$EVIDENCE_DIR"
+      if ! printf '%s\n' "$SPEC" | rst_stage_plan > "$EVIDENCE_DIR/stop-tests.stages"; then
+        printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=stage_plan_invalid\nTESTS_LINE=BLOCKED (stage_plan_invalid)\n' | tee "$EVIDENCE_DIR/stop-tests.initial"
+        exit 0
+      fi
+      if [ -s "$EVIDENCE_DIR/stop-tests.stages" ]; then
+        printf 'canonical stages: Stop test-suite blocks and project-map command superseded\n' | tee -a "$LOG"
+        cut -f3 "$EVIDENCE_DIR/stop-tests.stages" > "$CMDS"
+        rst_execute_saved "$EVIDENCE_DIR" "$CLASS" > "$EVIDENCE_DIR/stop-tests.initial"
+        trg_snapshot_report "$(pwd)" "$EVIDENCE_DIR"
+        cat "$EVIDENCE_DIR/stop-tests.initial"
+        exit 0
+      fi
       SELECTED_SOURCE="spec_declared"
       if [ "$MAP_SOURCE" = "project-map" ] && [ -n "$MAP_COMMAND" ]; then
         if rst_command_looks_runnable "$MAP_COMMAND"; then
@@ -2582,13 +3026,16 @@ nodes:
       echo "TESTS_PASSED=${COUNTS%% *}"
       echo "TESTS_TOTAL=${COUNTS##* }"
       if [ "$SOURCE" = "project-map" ]; then
-        SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$TESTS_ENV_REASON" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/"
+        SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$TESTS_ENV_REASON" "$LOG" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/"
       else
         REPORT_SOURCE="${SOURCE%% *}"
         if [ "$REPORT_SOURCE" = "spec_declared" ]; then REPORT_SOURCE="wo-spec"; fi
-        rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$TESTS_ENV_REASON" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
+        rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$TESTS_ENV_REASON" "$LOG" | sed "s/^TESTS_LINE=.*/& [source: $REPORT_SOURCE]/"
       fi > "$EVIDENCE_DIR/stop-tests.report"
-      stb_report_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS"
+      stb_report_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS" > "$EVIDENCE_DIR/stop-tests.initial"
+      trg_snapshot_report "$(pwd)" "$EVIDENCE_DIR"
+      cat "$EVIDENCE_DIR/stop-tests.initial"
+      grep '^TESTS_COMMAND_RESULT=' "$LOG" || true
       echo "TESTS_LOG=$LOG"
       if [ -s "$LOG" ]; then
         echo "--- last 80 lines of test output ---"
@@ -2596,17 +3043,148 @@ nodes:
       fi
       exit 0
 
-  # bdc-xo #1940. run-stop-greps MECHANICALLY executes every grep stop condition the
-  # spec declares ("Stop N (grep assertion ...)" header, command line, "Expected: N")
-  # inside the run worktree, under the same read-only command allowlist as
-  # verify-manifest-assertions, and emits OBSERVED counts in the manifest v2
-  # "<command> => <count>; ..." contract. stamp-manifest-evidence writes GREP_LINE into
-  # the manifest "Grep assertions:" line; the engine's "N/A (no declared mechanical
-  # assertions)" placeholder never reaches a PR body for a spec that declared greps.
+
+  - id: classify-test-result
+    persona: overseer
+    depends_on: [run-stop-tests]
+    task_class: clerical
+    bash: |
+      set -uo pipefail
+      INITIAL=$run-stop-tests.output
+      printf '%s\n' "$INITIAL" | python3 -c '
+      import json,sys
+      fields=dict(line.split("=",1) for line in sys.stdin.read().splitlines() if line.startswith("TESTS_") and "=" in line)
+      status=fields.get("TESTS_STATUS", "missing")
+      reason=fields.get("TESTS_BLOCKED_REASON", "")
+      print(json.dumps(dict(status=status,repairable="true" if status=="failed" and not reason else "false",reason=reason),separators=(",",":")))'
+
+  - id: test-repair
+    provider: codex
+    model: gpt-6.1-sol
+    depends_on: [classify-test-result]
+    when: "$classify-test-result.output.repairable == 'true'"
+    task_class: medium_work
+    loop:
+      fresh_context: true
+      until: __NEVER_EMIT_USE_UNTIL_BASH__
+      max_iterations: 2
+      until_bash: |
+        set -uo pipefail
+        # Replay consumers run in the owned clone; feature lanes keep their cwd.
+        if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then
+          cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1
+        fi
+        EVIDENCE_DIR="$ARTIFACTS_DIR/evidence"
+        . "$EVIDENCE_DIR/stop-tests.core.sh"
+        export RST_TIMEOUT_SECONDS="$(cat "$EVIDENCE_DIR/stop-tests.timeout")"
+        trg_attempt "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")"
+      prompt: |
+        Repair the real test failure only within the snapshot's allowed product
+        paths (test-guard.json), or add new non-test, non-infrastructure helpers.
+        Every other tracked file and all test infrastructure are frozen, even
+        in the build diff: tests, shell scripts, scripts/ and test directories,
+        declared commands and reachable package scripts (including npm pre/post
+        hooks), executable files, package.json, lockfiles, runner configs,
+        Makefile, tsconfig* and .github paths.
+        Resolved in-worktree symlink targets of test entrypoints are frozen too.
+        Product source executed as infrastructure is the accepted residual.
+        Any repair-touched infrastructure blocks and is listed for a human.
+        Never add test files or skip/only/todo markers. Never emit
+        __NEVER_EMIT_USE_UNTIL_BASH__. The deterministic rerun and allowlist guard
+        are the only completion authority, with at most two attempts.
+
+        Read the failing commands verbatim from
+        $ARTIFACTS_DIR/evidence/stop-tests.commands and the stage mapping from
+        $ARTIFACTS_DIR/evidence/stop-tests.stages. Read the last 80 lines of
+        $ARTIFACTS_DIR/evidence/stop-tests.log before editing. Reuse exactly this
+        persisted plan. Do not modify artifacts, commands, snapshots or maps.
+        Do not commit, push, open a PR, label or comment. This path also runs in
+        the read-only evidence replay lane; product repairs remain local.
+
+        If $ARTIFACTS_DIR/evidence/replay-checkout exists, read its absolute
+        path and edit only that isolated clone, not the engine worktree.
+
+        Original failure:
+        $run-stop-tests.output
+
+  - id: run-stop-tests-final
+    persona: overseer
+    depends_on: [run-stop-tests, test-repair]
+    trigger_rule: all_done
+    task_class: clerical
+    timeout: 1800000
+    bash: |
+      set -uo pipefail
+      # Replay consumers run in the owned clone; feature lanes keep their cwd.
+      if [ -n "${ARTIFACTS_DIR:-}" ] && [ -f "$ARTIFACTS_DIR/evidence/replay-checkout" ]; then
+        cd "$(cat "$ARTIFACTS_DIR/evidence/replay-checkout")" || exit 1
+      fi
+      EVIDENCE_DIR="$ARTIFACTS_DIR/evidence"
+      INITIAL=$run-stop-tests.output
+      ATTEMPTS="$(cat "$EVIDENCE_DIR/test-repair.attempts" 2>/dev/null || echo 0)"
+      printf 'Repair touched test infrastructure: none\n' > "$EVIDENCE_DIR/test-repair.infrastructure"
+      if [ "$ATTEMPTS" = 0 ]; then
+        { printf '%s\nTESTS_REPAIR_ATTEMPTS=0\n' "$INITIAL"; cat "$EVIDENCE_DIR/test-repair.infrastructure"; } | tee "$EVIDENCE_DIR/stop-tests.final"
+        exit 0
+      fi
+      . "$EVIDENCE_DIR/stop-tests.core.sh"
+      export RST_TIMEOUT_SECONDS="$(cat "$EVIDENCE_DIR/stop-tests.timeout")"
+      rst_execute_saved "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")" > "$EVIDENCE_DIR/stop-tests.final-raw"
+      INFRA_FAILURE=0
+      trg_infrastructure "$(pwd)" "$EVIDENCE_DIR/test-guard.json" > "$EVIDENCE_DIR/test-repair.infrastructure" || INFRA_FAILURE=1
+      RESULT=repaired
+      REASON=""
+      if [ "$INFRA_FAILURE" = 1 ] || [ "$(cat "$EVIDENCE_DIR/test-repair.infrastructure")" != 'Repair touched test infrastructure: none' ] || [ -f "$EVIDENCE_DIR/test-repair.guard" ] || ! trg_check "$(pwd)" "$EVIDENCE_DIR/test-guard.json"; then
+        RESULT=guard_violation; REASON=tests_failed_after_repair:guard
+      elif grep -q '^TESTS_STATUS=env_unavailable$' "$EVIDENCE_DIR/stop-tests.final-raw"; then
+        RESULT=env_unavailable
+      elif ! grep -q '^TESTS_STATUS=passed$' "$EVIDENCE_DIR/stop-tests.final-raw"; then
+        RESULT=exhausted; REASON=tests_failed_after_repair:exhausted
+      fi
+      {
+        if [ -n "$REASON" ]; then
+          grep -vE '^TESTS_(STATUS|BLOCKED_REASON)=' "$EVIDENCE_DIR/stop-tests.final-raw"
+          printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=%s\n' "$REASON"
+        else cat "$EVIDENCE_DIR/stop-tests.final-raw"; fi
+        printf 'TESTS_REPAIR_ATTEMPTS=%s\nTESTS_REPAIR_RESULT=%s\n' "$ATTEMPTS" "$RESULT"
+        cat "$EVIDENCE_DIR/test-repair.infrastructure"
+      } | tee "$EVIDENCE_DIR/stop-tests.final"
+
+  - id: tests-blocked-report
+    persona: overseer
+    depends_on: [run-stop-tests-final]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      # Fail-soft bookkeeping, as in record-wo-completion-candidate.
+      set -uo pipefail
+      EVIDENCE_DIR="$ARTIFACTS_DIR/evidence"
+      REPORT=$run-stop-tests-final.output
+      if ! printf '%s\n' "$REPORT" | grep -q '^TESTS_STATUS=blocked$'; then exit 0; fi
+      READ_SPEC_OUT=$read-spec.output
+      ISSUE_REPO="${ISSUE_REPO:-thinmansoftware/bdc-xo}"
+      ISSUE_NUM=$(printf '%s\n' "${USER_MESSAGE:-}" | grep -Eo 'issue=[0-9]+' | head -1 | cut -d= -f2 || true)
+      if [ -z "$ISSUE_NUM" ]; then
+        ISSUE_NUM=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^SPEC_PATH=.*issues\/\([0-9][0-9]*\).*/\1/p' | head -1)
+      fi
+      if [ -z "$ISSUE_NUM" ]; then
+        WO_ID_FROM_SPEC=$(printf '%s\n' "$READ_SPEC_OUT" | sed -n 's/^WO_ID=//p' | head -1)
+        if [ -n "$WO_ID_FROM_SPEC" ]; then
+          ISSUE_NUM=$(gh issue list --repo "$ISSUE_REPO" --search "$WO_ID_FROM_SPEC in:title" --json number --jq '.[0].number // empty' 2>/dev/null || true)
+        fi
+      fi
+      if [ -z "$ISSUE_NUM" ]; then echo 'WARN: tests-blocked-report: no issue resolved'; exit 0; fi
+      gh label create status:blocked --repo "$ISSUE_REPO" --color B60205 --description 'BDC workflow tests blocked' 2>/dev/null || true
+      gh issue edit "$ISSUE_NUM" --repo "$ISSUE_REPO" --add-label status:blocked || echo 'WARN: blocked label failed'
+      COMMENT="$EVIDENCE_DIR/tests-blocked-comment.md"
+      { printf '%s\n' "$REPORT"; printf '\nLast 80 lines of stop-tests.log:\n'; tail -n 80 "$EVIDENCE_DIR/stop-tests.log"; } > "$COMMENT"
+      gh issue comment "$ISSUE_NUM" --repo "$ISSUE_REPO" --body-file "$COMMENT" || echo 'WARN: blocked comment failed'
+      exit 0
+
   - id: run-stop-greps
     persona: major-build
     load_bearing: true
-    depends_on: [format-autofix]
+    depends_on: [format-autofix, run-stop-tests-final]
     task_class: clerical
     timeout: 600000
     bash: |
@@ -3160,7 +3738,7 @@ nodes:
     failover_provider: openrouter
     failover_model: moonshotai/kimi-k3.1-pro
     persona: captain-ci-validator-codex
-    depends_on: [ascii-gate, run-stop-tests, run-stop-greps]
+    depends_on: [ascii-gate, run-stop-tests-final, run-stop-greps]
     task_class: medium_work
     prompt: |
       Invoke or emulate the war-council-validator review for this Work Order.
@@ -3181,7 +3759,7 @@ nodes:
       Stop-condition evidence (MECHANICAL -- executed by the run-stop-tests and
       run-stop-greps nodes in THIS worktree; this is the ground truth for every test
       or grep claim in your verdict, bdc-xo #1940):
-      $run-stop-tests.output
+      $run-stop-tests-final.output
 
       $run-stop-greps.output
 
@@ -5621,7 +6199,7 @@ nodes:
   - id: stamp-manifest-evidence
     persona: major-build
     load_bearing: true
-    depends_on: [build-manifest, run-stop-tests, run-stop-greps]
+    depends_on: [build-manifest, run-stop-tests-final, run-stop-greps]
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -5646,7 +6224,7 @@ nodes:
       #   audit line is inserted after VALIDATION: (a non-label line there is outside
       #   every bdc-ci section; OUTCOME: already lives there).
       sme_process() {
-        local tests_line="$1" tests_status="$2" grep_line="$3" grep_status="$4" grep_dropped="${5:-0}" manifest verdict stop_detail=""
+        local tests_line="$1" tests_status="$2" grep_line="$3" grep_status="$4" grep_dropped="${5:-0}" tests_reason="${6:-}" manifest verdict stop_detail=""
         manifest="$(cat)"
         if ! printf '%s\n' "$manifest" | grep -qE '^Tests:'; then
           printf '%s\n' "$manifest"
@@ -5657,9 +6235,10 @@ nodes:
         [ -n "$grep_line" ] || grep_line="MISSING (run-stop-greps produced no output)"
         [ -n "$grep_status" ] || grep_status="missing"
         verdict="keep"
-        if [ "$tests_status" = "failed" ] || [ "$tests_status" = "env_unavailable" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "missing" ] || [ "$grep_status" = "all_dropped" ]; then
+        if [ "$tests_status" = "failed" ] || [ "$tests_status" = "blocked" ] || [ "$tests_status" = "env_unavailable" ] || [ "$grep_status" = "mismatch" ] || [ "$grep_status" = "missing" ] || [ "$grep_status" = "all_dropped" ]; then
           verdict="fail"
         fi
+        [ "$tests_status" != blocked ] || stop_detail="; blocked_reason=${tests_reason:-$tests_line}"
         if [ "$grep_status" = "incomplete" ]; then
           stop_detail="; unparsed=$(printf '%s\n' "$grep_line" | sed -n 's/.*UNVERIFIED (unparsed): //p'); dropped=${grep_dropped:-0}"
         fi
@@ -5703,7 +6282,7 @@ nodes:
       # ---- END stbase core ----
 
       TESTS_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_RUN_STOP_TESTS'
-      $run-stop-tests.output
+      $run-stop-tests-final.output
       BDC_NODE_OUTPUT_RUN_STOP_TESTS
       )
       GREPS_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_RUN_STOP_GREPS'
@@ -5727,7 +6306,7 @@ nodes:
   - id: manifest-evidence-check
     persona: major-build
     load_bearing: true
-    depends_on: [stamp-manifest-evidence, run-stop-tests, run-stop-greps, block-reclassify]
+    depends_on: [stamp-manifest-evidence, run-stop-tests-final, run-stop-greps, block-reclassify]
     trigger_rule: all_done
     task_class: clerical
     bash: |
@@ -5753,7 +6332,7 @@ nodes:
       #   PR is still stamped (and labelled run:blocked); review-issue never moves an issue
       #   to review on NOT_GATED:BLOCKED.
       mec_check() {
-        local status="$1" class="$2" tests_status="$3" grep_declared="$4" grep_status="$5" tests_exit="${6:-}" grep_executed="${7:-0}" grep_dropped="${8:-0}" grep_unparsed="${9:-0}" grep_mismatch="${10:-0}" grep_detail="${11:-}" manifest tests_line grep_line
+        local status="$1" class="$2" tests_status="$3" grep_declared="$4" grep_status="$5" tests_exit="${6:-}" grep_executed="${7:-0}" grep_dropped="${8:-0}" grep_unparsed="${9:-0}" grep_mismatch="${10:-0}" grep_detail="${11:-}" tests_reason="${12:-}" manifest tests_line grep_line
         manifest="$(cat)"
         if [ "$tests_status" = "env_unavailable" ]; then
           echo "ENVIRONMENT_UNAVAILABLE: postgres capability absent in this lane (tests_status=env_unavailable)" >&2
@@ -5766,6 +6345,10 @@ nodes:
           fi
           return 0
         fi
+        if { [ "${class:-CODE}" = CODE ] || [ "$class" = MIXED ]; } && [ "$tests_status" = blocked ]; then
+          echo "TESTS_BLOCKED: ${tests_reason:-unknown}" >&2
+          return 1
+        fi
         if ! printf '%s\n' "$manifest" | grep -qE '^Tests:'; then
           echo "OK"
           return 0
@@ -5775,7 +6358,7 @@ nodes:
         [ -n "$class" ] || class="CODE"
         case "$class" in
           CODE|MIXED)
-            if [ "$tests_status" = "failed" ] || { ! printf '%s\n' "$tests_line" | grep -qE '^[0-9]+/[0-9]+' && ! { [ "$tests_status" = "counts_unparsed" ] && [ "${tests_exit:-1}" -eq 0 ] 2>/dev/null; }; }; then
+            if [ "$tests_status" = "failed" ] || { ! printf '%s\n' "$tests_line" | grep -qE '^[0-9]+/[0-9]+' && ! { [ "$tests_status" = passed ] && printf '%s\n' "$tests_line" | python3 -c 'import re,sys; parts=sys.stdin.read().strip().split(" | "); sys.exit(0 if all((m:=re.match(r"[A-Za-z0-9_.-]+: ([0-9]+)/([0-9]+) ",p)) and int(m[1])==int(m[2]) and int(m[2])>0 for p in parts) else 1)'; } && ! { [ "$tests_status" = "counts_unparsed" ] && [ "${tests_exit:-1}" -eq 0 ] 2>/dev/null; }; }; then
               echo "EVIDENCE_ERROR: Tests: \"${tests_line}\" on a ${class} WO (tests_status=${tests_status:-missing}). Manifest v2 / Rule 10 require \"Tests: <pass>/<total> (<command>)\" from an executed command; N/A is not admissible on a ${class} WO (bdc-xo #1940)." >&2
               return 1
             fi
@@ -5827,7 +6410,7 @@ nodes:
       )
       STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
       TESTS_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_RUN_STOP_TESTS'
-      $run-stop-tests.output
+      $run-stop-tests-final.output
       BDC_NODE_OUTPUT_RUN_STOP_TESTS
       )
       GREPS_OUT=$(capture_node_output <<'BDC_NODE_OUTPUT_RUN_STOP_GREPS'
@@ -5844,7 +6427,7 @@ nodes:
         "$(mec_field TESTS_EXIT "$TESTS_OUT")" "$(mec_field GREP_EXECUTED "$GREPS_OUT")" \
         "$(mec_field GREP_DROPPED "$GREPS_OUT")" "$(mec_field GREP_UNPARSED "$GREPS_OUT")" \
         "$(mec_field GREP_MISMATCH "$GREPS_OUT")" \
-        "$(printf '%s\n' "$GREPS_OUT" | sed -n '/^--- per-assertion detail ---$/,$p' | grep '^DROPPED' || true)"
+        "$(printf '%s\n' "$GREPS_OUT" | sed -n '/^--- per-assertion detail ---$/,$p' | grep '^DROPPED' || true)" "$(mec_field TESTS_BLOCKED_REASON "$TESTS_OUT")"
 
   - id: verify-manifest-assertions
     persona: major-build
@@ -6254,10 +6837,24 @@ nodes:
         gh label create run:blocked --repo "$repo" --color B60205 --description "Run ended non-PROCEED: the PR is not lane-verified" >/dev/null 2>&1 || true
         body="$(gh pr view "$url" --repo "$repo" --json body --jq '.body' 2>/dev/null || true)"
         tmp="$(mktemp)"
-        case "$body" in
-          "$banner"*) printf '%s\n' "$body" > "$tmp" ;;
-          *) printf '%s\n\n%s\n' "$banner" "$body" > "$tmp" ;;
-        esac
+        body="$(printf '%s\n' "$body" | awk '
+          /^<!-- bdc-repair-infrastructure-start -->$/ {omit=1; next}
+          /^<!-- bdc-repair-infrastructure-end -->$/ {omit=0; next}
+          !omit {print}
+        ')"
+        {
+          case "$body" in
+            "$banner"*) printf '%s\n' "$body" ;;
+            *) printf '%s\n\n%s\n' "$banner" "$body" ;;
+          esac
+          printf '\n<!-- bdc-repair-infrastructure-start -->\n'
+          if [ -s "${ARTIFACTS_DIR:-.}/evidence/test-repair.infrastructure" ]; then
+            cat "${ARTIFACTS_DIR:-.}/evidence/test-repair.infrastructure"
+          else
+            printf 'Repair touched test infrastructure: none\n'
+          fi
+          printf '<!-- bdc-repair-infrastructure-end -->\n'
+        } > "$tmp"
         if gh pr edit "$url" --repo "$repo" --add-label run:blocked --body-file "$tmp" >/dev/null 2>&1; then
           echo "pbb: $url labelled run:blocked with the RUN BLOCKED banner (status=$status)"
         else
@@ -6477,6 +7074,11 @@ nodes:
         echo ""
         echo "<!-- bdc-manifest-start -->"
         printf '%s\n' "$MANIFEST_BLOCK"
+        if [ -s "${ARTIFACTS_DIR:-.}/evidence/test-repair.infrastructure" ]; then
+          cat "${ARTIFACTS_DIR:-.}/evidence/test-repair.infrastructure"
+        else
+          printf 'Repair touched test infrastructure: none\n'
+        fi
         echo "<!-- bdc-manifest-end -->"
       } > "$BODY_FILE"
 

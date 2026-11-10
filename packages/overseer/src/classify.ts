@@ -49,6 +49,11 @@ export type ErrorClass =
   | 'validator_sdk_contradiction' // non-loop node (e.g. war-council-validator): Anthropic SDK returned isError=true + errorSubtype='success' (bdc-harness#344), previously fell through to unknown with no escalation
   // Set explicitly by the smart-cauldron cascade. classifyError does not match this class.
   | 'harness_gate_misfire'
+  | 'test_env_missing_tool'
+  | 'test_runner_mismatch'
+  | 'test_timeout'
+  | 'stage_repo_absent'
+  | 'tests_failed_after_repair'
   // Fallback
   | 'unknown';
 
@@ -96,6 +101,13 @@ export function classifyError(input: ClassifyInput): ErrorClass {
   const status = input.statusCode;
   const exit = input.exitCode;
   const validatorText = input.validatorOutput ?? '';
+
+  if (/^TESTS_BLOCKED: missing_tool:/m.test(rawMessage)) return 'test_env_missing_tool';
+  if (/^TESTS_BLOCKED: runner_mismatch:/m.test(rawMessage)) return 'test_runner_mismatch';
+  if (/^TESTS_BLOCKED: timeout:/m.test(rawMessage)) return 'test_timeout';
+  if (/^TESTS_BLOCKED: stage_repo_absent:/m.test(rawMessage)) return 'stage_repo_absent';
+  if (/^TESTS_BLOCKED: tests_failed_after_repair:/m.test(rawMessage))
+    return 'tests_failed_after_repair';
 
   // --- Silent-dead-end classes (BDC-specific, 2026-05-18 Wave A anchor incidents) ---
   //

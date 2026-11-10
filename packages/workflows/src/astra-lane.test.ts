@@ -87,7 +87,7 @@ describe('Astra build / Fable review lane', () => {
 
   it('binds every prompt and loop seat, preserving different-family review', () => {
     const seats = astra.nodes.filter(node => node.prompt || node.loop);
-    expect(seats).toHaveLength(14);
+    expect(seats).toHaveLength(15);
     expect(seats.filter(node => reviewIds.includes(node.id))).toHaveLength(7);
     for (const seat of seats) {
       const review = reviewIds.includes(seat.id);
