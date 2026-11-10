@@ -4468,6 +4468,39 @@ nodes:
         printf '{"status":"BLOCKED","note":"opus-could-not-resolve"}\n'
       fi
 
+  # WO-HARNESS-BLOCKED-BUILD-NOT-COMPLETED-01: a build that ended BLOCKED must not end the run
+  # as `completed`. Runs after every terminal node (salvage, issue label, ledger notes) so those
+  # have already happened; fails the run with `build_blocked: <status> <note>`.
+  - id: blocked-terminal-gate
+    depends_on: [repair-gate-fail, tests-blocked-report, block-reclassify, noninteractive-salvage, review-issue, blocked-issue]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -uo pipefail
+
+      capture_node_output() {
+        python3 -c 'import shlex, sys; s=sys.stdin.read(); sys.stdout.write((lambda p: p[0] if len(p)==1 else s)(shlex.split(s)) if len(s)>=2 and s[0]=="'"'"'" and s.rstrip("\n").endswith("'"'"'") else s)'
+      }
+
+      # ---- BEGIN blocked gate core (byte-identical across lanes; extracted by unit test) ----
+      RECLASSIFY=$(capture_node_output <<'BDC_NODE_OUTPUT_BLOCK_RECLASSIFY'
+      $block-reclassify.output
+      BDC_NODE_OUTPUT_BLOCK_RECLASSIFY
+      )
+      STATUS=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"status":"\([A-Z_]*\)".*/\1/p' | head -1)
+      NOTE=$(printf '%s\n' "$RECLASSIFY" | sed -n 's/.*"note":"\([^"]*\)".*/\1/p' | head -1)
+      if [ "$STATUS" = "PROCEED" ] || [ "$STATUS" = "ALREADY_SATISFIED" ]; then
+        echo "blocked-terminal-gate: status=$STATUS -- run may complete."
+        exit 0
+      fi
+      if [ -z "$STATUS" ]; then
+        echo "blocked-terminal-gate: no block status (block-reclassify did not run) -- not failing the run."
+        exit 0
+      fi
+      echo "build_blocked: $STATUS ${NOTE:-no-note}" >&2
+      exit 1
+      # ---- END blocked gate core ----
+
   # noninteractive-salvage (WO-HARNESS-OPUS-REPAIR-REREVIEW-AND-NONINTERACTIVE-SALVAGE-01, 2026-06-25):
   # Defect B fix. When a run is BLOCKED but the worktree holds REAL work (e.g. an opus-repair commit),
   # and the run is NON-INTERACTIVE (CAULDRON_INTERACTIVE != true so pause-gate auto-skips and never
