@@ -183,3 +183,26 @@ running container.
 
 The live container changes only after the next XO-governed Rule 11.5 harness
 rebuild. Stop 9 verifies that rebuild, and it is separate from CI image proof.
+
+Tests-in-diff runner routing (rst_tests_in_diff, WO-HARNESS-TESTS-IN-DIFF-PLAIN-SCRIPT-01)
+
+When a run's spec declares no runnable test command, run-stop-tests falls back to
+rst_tests_in_diff, which picks a runner for each test file in the diff. The helpers live in
+the byte-identical rst core of every bdc-feature-development lane YAML:
+
+- Python (*.py test paths): rst_is_plain_script <file> is true when the file has a
+  column-zero sys.exit( or raise SystemExit, or defines no sync or async test_ functions.
+  Such files run as "python3 <file>" in file order; every other module stays in one final
+  pytest batch. A module with only async test_ functions stays on pytest.
+- Node (*.test / *.spec .js/.mjs/.cjs and __tests__ scripts): rst_is_plain_node_script
+  <file> is true when the file imports no node:test, bun:test, vitest or @jest/globals and
+  calls no global test/it/describe/suite (locally declared helpers of those names and
+  regex .test() calls do not count). Such files run as "node <file>"; framework files keep
+  their previous runner.
+- A command the spec declares and that exits 0 is never overridden by a different-runner
+  fallback. When its counts cannot be parsed, the report line reads
+  "passed (exit 0, uncounted; <command>)" and TESTS_STATUS stays counts_unparsed, the
+  exit-only status manifest-evidence-check already admits. No counts are invented.
+
+Tests: bash .archon/workflows/defaults/__tests__/run-stop-tests.sh (the "plain Test N",
+"comment:" and FP-* cases).

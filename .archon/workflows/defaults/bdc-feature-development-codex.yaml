@@ -2181,11 +2181,28 @@ nodes:
         done
         if [ "$n" -eq 1 ]; then printf 'cd %s && %s' "$hit" "$cmd"; else printf '%s' "$cmd"; fi
       }
+      rst_is_plain_script() {
+        # Framework markers win: a module with a TestCase subclass (any method naming, e.g.
+        # testFailure) or a pytest/unittest import keeps pytest routing; python3 would exit 0
+        # without running unittest cases when unittest.main() is absent.
+        if grep -qE '^[[:blank:]]*(import[[:blank:]]+unittest([[:blank:]]*(,|#|$))|(import|from)[[:blank:]]+pytest([[:blank:].]|$)|class[[:blank:]]+[A-Za-z_][A-Za-z0-9_]*[[:blank:]]*\([^)]*TestCase)' "$1"; then return 1; fi
+        grep -qE '^(sys\.exit[[:blank:]]*\(|raise[[:blank:]]+SystemExit([[:blank:](]|$))' "$1" \
+          || ! grep -qE '^[[:blank:]]*(async[[:blank:]]+)?def[[:blank:]]+test' "$1"
+      }
+      rst_is_plain_node_script() {
+        local file="$1" name
+        if grep -qE "['\"](node:test|bun:test|vitest|@jest/globals)['\"]" "$file"; then return 1; fi
+        for name in test it describe suite; do
+          if grep -qE "(^|[^[:alnum:]_$])(function[[:blank:]]+${name}[[:blank:]]*\\(|(const|let|var)[[:blank:]]+${name}[[:blank:]]*=)" "$file"; then continue; fi
+          if grep -qE "(^|[^[:alnum:]_$.])${name}[[:blank:]]*(\\(|\\.)" "$file"; then return 1; fi
+        done
+        return 0
+      }
       # rst_tests_in_diff <base-sha>   (-> one test command per line derived from the test
       #   files this run created or modified since <base-sha>, plus untracked test files;
       #   empty when the diff touched no test files). Runner choice: *.test.* / *.spec.* /
       #   __tests__/ -> vitest if the root package.json declares vitest, jest if jest, else
-      #   bun test; <dir>/tests/test_*.js -> "cd <dir> && node tests/<file>"; *.py -> pytest.
+      #   bun test (plain JS scripts use node); Python scripts use python3, modules pytest.
       #   Fixtures, helpers, run_all.js, snapshots and data files are excluded.
       rst_tests_in_diff() {
         local base="$1" files f js_runner="" bun_files="" py_files=""
@@ -2203,7 +2220,14 @@ nodes:
           [ -z "$f" ] && continue
           [ -e "$f" ] || continue
           case "$f" in
-            *.py) py_files="${py_files:+$py_files }$f" ;;
+            *.py)
+              if rst_is_plain_script "$f"; then printf 'python3 %s\n' "$f"
+              else py_files="${py_files:+$py_files }$f"
+              fi ;;
+            *.test.js|*.test.mjs|*.test.cjs|*.spec.js|*.spec.mjs|*.spec.cjs|*__tests__/*.js|*__tests__/*.mjs|*__tests__/*.cjs)
+              if rst_is_plain_node_script "$f"; then printf 'node %s\n' "$f"
+              else bun_files="${bun_files:+$bun_files }$f"
+              fi ;;
             *.test.*|*.spec.*|*__tests__/*) bun_files="${bun_files:+$bun_files }$f" ;;
             */tests/test_*.js|*/tests/test_*.mjs|*/tests/test_*.cjs) printf 'cd %s && node tests/%s\n' "${f%%/tests/*}" "${f##*/tests/}" ;;
             tests/test_*.js|tests/test_*.mjs|tests/test_*.cjs) printf 'node %s\n' "$f" ;;
@@ -2523,7 +2547,7 @@ nodes:
       COUNTS=""
       TESTS_ENV_REASON=""
       CMD_JOINED=""
-      # rst_try <source-label>: run whatever is in $CMDS; rc 0 when counts were parsed.
+      # rst_try <source-label>: counts parsed, or a declared command exited 0.
       rst_try() {
         [ -s "$CMDS" ] || return 1
         CMD_JOINED="$(grep -v '^$' "$CMDS" | paste -sd ';' - | sed 's/;/; /g')"
@@ -2534,14 +2558,14 @@ nodes:
         COUNTS="${RESULT#* }"
         COUNTS="$(printf '%s' "$COUNTS" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
         SOURCE="$1"
-        [ -n "$COUNTS" ] || [ -n "$TESTS_ENV_REASON" ]
+        [ -n "$COUNTS" ] || [ -n "$TESTS_ENV_REASON" ] || { [ "$SOURCE" = "spec_declared" ] && [ "$EXIT_CODE" -eq 0 ]; }
       }
       if [ "$CLASS" != "DOCUMENTATION" ] && [ "$CLASS" != "OPERATOR" ]; then
         # Ladder: spec-declared -> test files in this run's diff -> the repo's own test
         # script. A spec-declared command that ran and exited nonzero is failed even
         # with no parseable counts -- do not replace it with fallback evidence. A rung
-        # that exited 0 with no parseable counts (or no command at all) falls through;
-        # the earlier attempt stays in the log and in TESTS_SOURCE.
+        # with no command falls through; successful declared commands keep exit-only
+        # evidence, without substituting a different runner or inventing counts.
         TRIED=""
         (
           cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" && dprep_ensure_js_deps
@@ -2581,7 +2605,9 @@ nodes:
       echo "TESTS_EXIT=$EXIT_CODE"
       echo "TESTS_PASSED=${COUNTS%% *}"
       echo "TESTS_TOTAL=${COUNTS##* }"
-      if [ "$SOURCE" = "project-map" ]; then
+      if [ "$SOURCE" = "spec_declared" ] && [ -n "$CMD_JOINED" ] && [ "$EXIT_CODE" -eq 0 ] && [ -z "$COUNTS" ] && [ -z "$TESTS_ENV_REASON" ]; then
+        printf 'TESTS_STATUS=counts_unparsed\nTESTS_LINE=passed (exit 0, uncounted; %s) [source: wo-spec]\n' "$CMD_JOINED"
+      elif [ "$SOURCE" = "project-map" ]; then
         SOURCE=spec_declared rst_report "$CLASS" "$CMD_JOINED" "$EXIT_CODE" "$COUNTS" "$TESTS_ENV_REASON" | sed "s/spec-declared test command/project-map test command/; s/^TESTS_LINE=.*/& [source: project-map; map: $MAP_SHA]/"
       else
         REPORT_SOURCE="${SOURCE%% *}"

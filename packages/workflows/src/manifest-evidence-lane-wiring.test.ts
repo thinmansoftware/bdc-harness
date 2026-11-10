@@ -334,17 +334,18 @@ describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral
     expect(stdout).not.toContain('repo_test_script');
   });
 
-  it('a spec-declared command that exits 0 with no counts still falls through to repo_test_script', () => {
+  it('a spec-declared command that exits 0 with no counts keeps its own exit-only evidence (WO-HARNESS-TESTS-IN-DIFF-PLAIN-SCRIPT-01)', () => {
     const { stdout, log } = runStopTestsNode({
       spec: rstSpec('bash ./noop.sh'),
       files: { 'noop.sh': 'exit 0\n' },
     });
-    expect(rstField(stdout, 'TESTS_STATUS')).toBe('passed');
-    expect(rstField(stdout, 'TESTS_SOURCE')).toContain('repo_test_script');
-    expect(rstField(stdout, 'TESTS_SOURCE')).toContain('after: spec_declared');
+    expect(rstField(stdout, 'TESTS_STATUS')).toBe('counts_unparsed');
+    expect(rstField(stdout, 'TESTS_SOURCE')).toBe('spec_declared');
+    expect(rstField(stdout, 'TESTS_LINE')).toBe(
+      'passed (exit 0, uncounted; bash ./noop.sh) [source: wo-spec]'
+    );
     expect(log).toContain('### run-stop-tests: bash ./noop.sh');
-    expect(log).toContain('### run-stop-tests: bun run test');
-    expect(rstField(stdout, 'TESTS_LINE')).toBe('1/1 (bun run test) [source: repo_test_script]');
+    expect(log).not.toContain('### run-stop-tests: bun run test');
   });
 
   it('parsed passing counts from a spec-declared command still report passed', () => {
