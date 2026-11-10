@@ -310,6 +310,8 @@ export interface OriginatingRunCandidateRow {
   working_path: string | null;
   /** Engine-written codebase name (owner/repo) from the run's codebase FK; null when unlinked. */
   codebase_name: string | null;
+  /** Codebase repository_url (an authoritative owner/repo when set). */
+  codebase_url: string | null;
   event_data: string | null;
 }
 
@@ -325,7 +327,8 @@ export async function listOriginatingRunCandidates(input: {
   if (headRef) {
     const byBranch = await db.query<OriginatingRunCandidateRow>(
       `SELECT r.id AS id, r.status AS status, r.started_at AS started_at,
-              r.working_path AS working_path, c.name AS codebase_name, NULL AS event_data
+              r.working_path AS working_path, c.name AS codebase_name,
+              c.repository_url AS codebase_url, NULL AS event_data
        FROM remote_agent_workflow_runs r
        LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
        WHERE r.workflow_name != 'pr-discovery'
@@ -338,7 +341,7 @@ export async function listOriginatingRunCandidates(input: {
   const byUrl = await db.query<OriginatingRunCandidateRow>(
     `SELECT r.id AS id, r.status AS status, r.started_at AS started_at,
             r.working_path AS working_path, c.name AS codebase_name,
-            CAST(e.data AS TEXT) AS event_data
+            c.repository_url AS codebase_url, CAST(e.data AS TEXT) AS event_data
      FROM remote_agent_workflow_events e
      JOIN remote_agent_workflow_runs r ON r.id = e.workflow_run_id
      LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id

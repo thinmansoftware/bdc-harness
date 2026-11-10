@@ -24,6 +24,8 @@ export interface OriginatingRunCandidate {
   readonly working_path: string | null;
   /** Engine-written codebase name (owner/repo) from the run's codebase FK; null when unlinked. */
   readonly codebase_name?: string | null;
+  /** Codebase repository_url (for example https://github.com/owner/repo.git); null when unset. */
+  readonly codebase_url?: string | null;
   readonly event_data: string | null;
 }
 
@@ -87,17 +89,37 @@ function mentionsPullRequest(eventData: string, input: OriginatingRunLookupInput
 /**
  * A worktree branch is only unique within one repository: two repos can use the same
  * `archon/task-web-worker-<id>` shape. Bind the candidate to the target repo through the
- * engine-written codebase name, or, when the run has no codebase link, through the
- * `/<owner>/<repo>/` segment of its engine-written worktree path.
+ * engine-written codebase link, strongest source first:
+ *   1. the codebase `repository_url` (an authoritative owner/repo when it parses),
+ *   2. the codebase name: `owner/repo`, or a BARE repo name (existing registrations use both),
+ *   3. the `/<owner>/<repo>/` segment of the engine-written worktree path.
+ * The first source that yields an identity decides; a bare name matches on the repo part only.
  */
 function belongsToRepo(
   candidate: OriginatingRunCandidate,
   input: OriginatingRunLookupInput
 ): boolean {
-  const want = (input.owner + '/' + input.repo).toLowerCase();
+  const owner = input.owner.toLowerCase();
+  const repo = input.repo.toLowerCase();
+  const want = owner + '/' + repo;
+
+  const url = (candidate.codebase_url ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/\.git$/, '');
+  const urlMatch = /[:/]([^/:]+)\/([^/]+)$/.exec(url);
+  if (urlMatch) return urlMatch[1] === owner && urlMatch[2] === repo;
+
   const name = (candidate.codebase_name ?? '').trim().toLowerCase();
-  if (name !== '') return name === want || name.endsWith('/' + want);
-  const path = (candidate.working_path ?? '').split('\\').join('/').toLowerCase();
+  if (name !== '') {
+    if (name.includes('/')) return name === want || name.endsWith('/' + want);
+    return name === repo;
+  }
+
+  const path = (candidate.working_path ?? '')
+    .split(String.fromCharCode(92))
+    .join('/')
+    .toLowerCase();
   return path.includes('/' + want + '/');
 }
 

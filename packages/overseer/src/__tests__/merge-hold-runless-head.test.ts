@@ -43,6 +43,7 @@ function candidate(overrides: Partial<OriginatingRunCandidate>): OriginatingRunC
     started_at: '2026-11-10 10:00:00',
     working_path: null,
     codebase_name: null,
+    codebase_url: null,
     event_data: null,
     ...overrides,
   };
@@ -107,6 +108,48 @@ describe('findOriginatingRunForPullRequest', () => {
       candidate({ id: 'longer-branch', working_path: `/ws/worktrees/${BRANCH}-2` }),
     ]);
     expect(lookalike).toBeNull();
+  });
+
+  test('bare codebase names (existing registrations) and repository_url bind the repository', async () => {
+    const path = '/.archon/workspaces/thinmansoftware/bdc-harness/worktrees/' + BRANCH;
+    // bare name equal to the repo, with an explicit owner/repo worktree path: matches
+    const bare = await findOriginatingRunForPullRequest(input, async () => [
+      candidate({
+        id: 'bare',
+        status: 'running',
+        working_path: path,
+        codebase_name: 'bdc-harness',
+      }),
+    ]);
+    expect(bare).toEqual({ runId: 'bare', status: 'running' });
+    // bare name of a DIFFERENT repo never matches, even with the same branch name
+    expect(
+      await findOriginatingRunForPullRequest(input, async () => [
+        candidate({ id: 'other', working_path: path, codebase_name: 'shopops' }),
+      ])
+    ).toBeNull();
+    // repository_url is authoritative: the https and ssh forms of the target repo match ...
+    for (const url of [
+      'https://github.com/thinmansoftware/bdc-harness.git',
+      'https://github.com/thinmansoftware/bdc-harness',
+      'git@github.com:thinmansoftware/bdc-harness.git',
+    ]) {
+      const hit = await findOriginatingRunForPullRequest(input, async () => [
+        candidate({ id: 'url', status: 'running', working_path: path, codebase_url: url }),
+      ]);
+      expect(hit?.runId, url).toBe('url');
+    }
+    // ... and a url of another repo wins over a matching bare name
+    expect(
+      await findOriginatingRunForPullRequest(input, async () => [
+        candidate({
+          id: 'url-other',
+          working_path: path,
+          codebase_name: 'bdc-harness',
+          codebase_url: 'https://github.com/thinmansoftware/shopops.git',
+        }),
+      ])
+    ).toBeNull();
   });
 
   test('a Windows backslash worktree path still matches by branch and repository', async () => {
