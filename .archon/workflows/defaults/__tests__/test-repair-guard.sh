@@ -593,6 +593,7 @@ SH
   cat > "$TMP/r8-bin/gh" <<'SH'
 #!/usr/bin/env bash
 case "$*" in
+  label\ create*) exit 0 ;;
   *--json\ baseRefName*) echo run-base ;;
   *--json\ body*) echo 'Fixture PR prose' ;;
   *--body-file*)
@@ -603,10 +604,11 @@ esac
 SH
   chmod +x "$TMP/r8-bin/git" "$TMP/r8-bin/gh"
   git -C "$WT" update-ref refs/remotes/origin/run-base run-base
-  python3 - "$LANE" > "$TMP/r8-pr-node.sh" <<'PY'
+  python3 - "$LANE" "${1:-PROCEED}" > "$TMP/r8-pr-node.sh" <<'PY'
 import os, re, shlex, sys, yaml
 body = next(n for n in yaml.safe_load(open(sys.argv[1]))['nodes'] if n['id']=='patch-pr-body')['bash']
 values = {'block-reclassify':'{"status":"PROCEED"}', 'open-pr-if-needed':'https://github.com/fixture/repo/pull/1', 'decide-push-target':'repo: fixture/repo', 'stamp-manifest-pr':'WO: WO-TEST\nTests: 1/1\nVALIDATION: PASS', 'read-spec':'', 'build-manifest':'', 'run-stop-tests-final':os.environ['FIX_FINAL']}
+values['block-reclassify'] = '{"status":"'+sys.argv[2]+'"}'
 body = re.sub(r'\$([a-z][a-z0-9-]*)\.output',lambda m:shlex.quote(values.get(m[1],'')),body)
 print(body)
 PY
@@ -646,6 +648,10 @@ for change in helper product no_repair; do
       check rejects contains "$text" $'Repair touched test infrastructure\n'
     fi
   done
+  if [ "$change" = helper ]; then
+    check r8_pr_body BLOCKED
+    check contains "$(cat "$ARTIFACTS_DIR/pr-body")" $'Repair touched test infrastructure\nscripts/helper.sh'
+  fi
   unset BASE_BRANCH
 done
 finish test-repair-guard.sh
