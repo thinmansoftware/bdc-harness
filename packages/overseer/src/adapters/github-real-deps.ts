@@ -282,6 +282,12 @@ export interface RealGitHubOctokitLike {
      * notice idempotent by searching for its marker (#797) -- a caller that
      * cannot read comments must NOT post blind, or a redelivery duplicates it.
      */
+    addLabels?(input: {
+      owner: string;
+      repo: string;
+      issue_number: number;
+      labels: string[];
+    }): Promise<unknown>;
     listComments?(input: {
       owner: string;
       repo: string;
@@ -2572,6 +2578,17 @@ export function createRealGitHubClientDeps(
       return { commented: true, url: response.data.html_url };
     },
     commentAuthorLogin,
+    addPullRequestLabels: async (input): Promise<void> => {
+      if (!octokit.issues?.addLabels) {
+        throw new Error('overseer_real_adapter_missing_add_labels_api');
+      }
+      await octokit.issues.addLabels({
+        owner: input.owner,
+        repo: input.repo,
+        issue_number: input.number,
+        labels: input.labels,
+      });
+    },
     listPullRequestComments: async (
       input
     ): Promise<readonly { body: string; authorLogin: string }[]> => {

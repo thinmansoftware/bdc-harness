@@ -102,6 +102,7 @@ function makeHarness(rows: OverseerVerdictRow[], evidence: () => PullRequestEvid
     },
   };
   const options: MergeExecutionBridgeOptions = {
+    readRunEvents: async () => [],
     store,
     github,
     hasQualifiedReview: async () => true,

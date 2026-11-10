@@ -90,8 +90,11 @@ import {
   loadPersistedSeatCutoff,
   restoreSeatCutoffOverride,
 } from '@archon/workflows/reliability/seat-usage';
-import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
-import { createMergeManager } from '@archon/overseer/merge-manager';
+import {
+  createRuntimeMergeManager,
+  startOverseerRuntime,
+  stopOverseerRuntime,
+} from './overseer-runtime';
 import { resolveDefaultDeps } from '@archon/overseer/service';
 import { ingestPullRequestEvent } from '@archon/overseer/pr-review-ingest';
 import { createRealIngestDeps, resolveReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
@@ -213,7 +216,7 @@ function startOverseerRuntimeWithRealMergeManager(): void {
     return;
   }
   const deps = resolveDefaultDeps();
-  const mergeManager = createMergeManager(deps);
+  const mergeManager = createRuntimeMergeManager(deps);
   startOverseerRuntime({
     serviceOptions: { deps, mergeCoordinator: mergeManager, mergeBridgeEnabled: true },
   });

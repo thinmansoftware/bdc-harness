@@ -152,7 +152,9 @@ export interface GrokDispositionReceipt {
     | 'judge_output_invalid'
     | 'judge_timeout'
     | 'judge_exit_nonzero'
-    | 'judge_error';
+    | 'judge_error'
+    | 'originating_run_failed_evidence_gate'
+    | 'originating_run_unreadable';
   woId: string;
   prNumber: number;
   headSha: string;
@@ -350,6 +352,8 @@ export interface GitHubClientDeps {
   ): Promise<{ commented: boolean; url?: string }>;
   /** Login expected to own comments created through `commentOnPullRequest`. */
   commentAuthorLogin?: string;
+  /** Apply merge hold labels through the same GitHub identity as PR comments. */
+  addPullRequestLabels?(input: PullRequestRef & { labels: string[] }): Promise<void>;
   /**
    * Existing PR issue comments, used to keep the merge-manager receipt
    * idempotent. Optional so existing fakes and compositions keep compiling.
