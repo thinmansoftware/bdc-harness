@@ -2060,9 +2060,10 @@ function escalateP0ReasonKey(threadRef: string, proposal: unknown): string {
 }
 
 /**
- * Any same-reason journal row inside the cooldown blocks another send.
- * A failed or expired attempt must not be re-proposed every tick; only a
- * different reason, or a row older than the cooldown, may send.
+ * Only a sent escalate_p0 for the same thread and reason opens the cooldown.
+ * Failed, expired, and pending rows do not: counting them lets every
+ * suppression slide the window past the last real send, and a failed row
+ * would block its own retry.
  */
 function escalateReasonBlocked(
   rows: readonly EscalateJournalRow[],
@@ -2072,7 +2073,9 @@ function escalateReasonBlocked(
   cooldownMs: number
 ): boolean {
   const canonical = canonicalizeThreadRef(threadRef);
+  let latestSentAtMs: number | null = null;
   for (const row of rows) {
+    if (row.outcome !== 'sent') continue;
     if (row.action_type !== 'escalate_p0') continue;
     if (canonicalizeThreadRef(row.thread_ref) !== canonical) continue;
     let parsed: unknown;
@@ -2084,9 +2087,10 @@ function escalateReasonBlocked(
     if (escalationReason(parsed, row.thread_ref) !== reason) continue;
     const atMs = Date.parse(row.created_at);
     if (!Number.isFinite(atMs)) continue;
-    if (nowMs - atMs < cooldownMs) return true;
+    if (latestSentAtMs === null || atMs > latestSentAtMs) latestSentAtMs = atMs;
   }
-  return false;
+  if (latestSentAtMs === null) return false;
+  return nowMs - latestSentAtMs < cooldownMs;
 }
 
 export function tick(state: TaskmasterState, deps: TaskmasterDeps = {}): Promise<TickResult> {
@@ -2765,9 +2769,39 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
       ) {
         plan = 'suppress';
       }
-      // wait: another key for this thread and reason is still being delivered.
-      // skip: this key is already terminal. Neither path rewrites that row.
-      if (plan === 'wait' || plan === 'skip') continue;
+      // wait: this key, or another key for this thread and reason, is still
+      // being delivered. Do not rewrite a live pending row. A different key
+      // still gets an expired journal row so a successful in-flight send does
+      // not drop the attempt. skip: this key is already terminal.
+      if (plan === 'wait') {
+        const ownPending =
+          existingAction?.outcome === 'pending' ||
+          escalateJournalRows.some(
+            row => row.idempotency_key === proposal.idempotencyKey && row.outcome === 'pending'
+          );
+        if (!ownPending && !actionsByKey.has(proposal.idempotencyKey)) {
+          const proposalJson = JSON.stringify({ ...proposal, suppressed: 'in_flight' });
+          const recorded = await dal.recordAction({
+            thread_ref: proposal.threadRef,
+            action_type: proposal.type,
+            proposal_json: proposalJson,
+            idempotency_key: proposal.idempotencyKey,
+            before_hash: sha256(proposal.body),
+            outcome: 'expired',
+          });
+          const ownedByDelivery =
+            recorded.outcome === 'pending' ||
+            recorded.outcome === 'sent' ||
+            recorded.outcome === 'failed';
+          if (!ownedByDelivery && recorded.outcome !== 'expired') {
+            await dal.updateActionOutcome(recorded.id, 'expired', proposalJson);
+          }
+          if (!ownedByDelivery) result.expired += 1;
+          actionsByKey.set(proposal.idempotencyKey, recorded);
+        }
+        continue;
+      }
+      if (plan === 'skip') continue;
       if (plan === 'suppress') {
         // A new idempotency key inside the cooldown is journaled expired.
         // The same key, and any pending/sent/failed row, is left as it is.

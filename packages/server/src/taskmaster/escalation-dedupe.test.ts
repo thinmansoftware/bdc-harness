@@ -146,8 +146,79 @@ describe('escalate_p0 cooldown dedupe', () => {
       ]);
       const claimSends = [firstClaim, secondClaim].filter(claim => claim.disposition === 'send');
       expect(claimSends).toHaveLength(1);
+      const raceRows = await getDatabase().query<{
+        outcome: string;
+        proposal_json: string;
+        idempotency_key: string | null;
+      }>(
+        `SELECT outcome, proposal_json, idempotency_key
+         FROM tm_journal WHERE thread_ref = 'dispatch-worker:race'`
+      );
+      expect(raceRows.rows).toHaveLength(2);
+      expect(raceRows.rows.filter(row => row.outcome === 'pending')).toHaveLength(1);
+      const raceWait = raceRows.rows.find(row => row.outcome === 'expired');
+      expect(raceWait).toBeDefined();
+      expect(JSON.parse(raceWait?.proposal_json ?? '{}').suppressed).toBe('in_flight');
 
-      // A suppression must not expire a pending row another delivery still owns.
+      // The same idempotency key must not page twice. The loser waits on the
+      // winner's pending row and does not treat that row as its own send.
+      const [sameA, sameB] = await Promise.all([
+        journal.commitCooldownDecision({
+          threadRef: 'dispatch-worker:same',
+          reason: 'worker_down',
+          idempotencyKey: 'same-key',
+          proposal: { kind: 'worker_down', worker_id: 'same' },
+          nowMs: claimNow,
+          cooldownMs,
+        }),
+        journal.commitCooldownDecision({
+          threadRef: 'dispatch-worker:same',
+          reason: 'worker_down',
+          idempotencyKey: 'same-key',
+          proposal: { kind: 'worker_down', worker_id: 'same' },
+          nowMs: claimNow,
+          cooldownMs,
+        }),
+      ]);
+      expect([sameA, sameB].filter(claim => claim.disposition === 'send')).toHaveLength(1);
+      expect([sameA, sameB].filter(claim => claim.disposition === 'wait')).toHaveLength(1);
+
+      // A stale pending row is retried by one claimant. The other waits.
+      const staleKey = 'stale-same-key';
+      const staleThread = 'dispatch-worker:stale-claim';
+      await journal.recordAction({
+        thread_ref: staleThread,
+        action_type: 'escalate_p0',
+        proposal_json: JSON.stringify({ kind: 'worker_down', worker_id: 'stale' }),
+        idempotency_key: staleKey,
+        outcome: 'pending',
+      });
+      await getDatabase().query(
+        'UPDATE tm_journal SET created_at = $1, proof_deadline_at = NULL WHERE idempotency_key = $2',
+        [new Date(claimNow - 10 * 60 * 1000).toISOString(), staleKey]
+      );
+      const [staleA, staleB] = await Promise.all([
+        journal.commitCooldownDecision({
+          threadRef: staleThread,
+          reason: 'worker_down',
+          idempotencyKey: staleKey,
+          proposal: { kind: 'worker_down', worker_id: 'stale' },
+          nowMs: claimNow,
+          cooldownMs,
+        }),
+        journal.commitCooldownDecision({
+          threadRef: staleThread,
+          reason: 'worker_down',
+          idempotencyKey: staleKey,
+          proposal: { kind: 'worker_down', worker_id: 'stale' },
+          nowMs: claimNow,
+          cooldownMs,
+        }),
+      ]);
+      expect([staleA, staleB].filter(claim => claim.disposition === 'send')).toHaveLength(1);
+      expect([staleA, staleB].filter(claim => claim.disposition === 'wait')).toHaveLength(1);
+
+      // A live pending row is not expired by a second claim for the same key.
       const pending = await journal.recordAction({
         thread_ref: THREAD,
         action_type: 'escalate_p0',
@@ -155,7 +226,7 @@ describe('escalate_p0 cooldown dedupe', () => {
         idempotency_key: 'quiet:inflight',
         outcome: 'pending',
       });
-      const suppressedClaim = await journal.commitCooldownDecision({
+      const inflightClaim = await journal.commitCooldownDecision({
         threadRef: THREAD,
         reason: 'worker_down',
         idempotencyKey: 'quiet:inflight',
@@ -163,7 +234,7 @@ describe('escalate_p0 cooldown dedupe', () => {
         nowMs: startMs + 24 * stepMs,
         cooldownMs,
       });
-      expect(suppressedClaim.disposition).toBe('suppressed');
+      expect(inflightClaim.disposition).toBe('wait');
       const pendingRow = await getDatabase().query<{ outcome: string }>(
         'SELECT outcome FROM tm_journal WHERE id = $1',
         [pending.id]
@@ -241,6 +312,20 @@ describe('escalate_p0 cooldown dedupe', () => {
       });
       expect(taskmasterSent).toHaveLength(1);
       expect(taskmasterSuppressed.length).toBeGreaterThanOrEqual(1);
+      // The suppression row is only 24h old here, inside the 48h cooldown.
+      // The sent row is 49h old. A later proposal must send: suppressed rows
+      // do not slide the window past the last successful send.
+      clock.nowMs = wall + 49 * hourMs;
+      await tick(state, deps('Unclaimed P0 item'));
+      const afterSlide = await getDatabase().query<{
+        thread_ref: string;
+        outcome: string;
+      }>(
+        `SELECT thread_ref, outcome FROM tm_journal
+         WHERE action_type = 'escalate_p0' AND thread_ref = $1`,
+        [threadRef]
+      );
+      expect(afterSlide.rows.filter(row => row.outcome === 'sent')).toHaveLength(2);
       expect(pages.filter(text => text.startsWith('page quiet:'))).toHaveLength(2);
     } finally {
       await closeDatabase();
@@ -346,5 +431,68 @@ describe('escalate_p0 cooldown dedupe', () => {
         nowMs: aliasNow,
       })
     ).toBe('wait');
+    expect(
+      planEscalateDelivery({
+        rows: [
+          {
+            thread_ref: THREAD,
+            action_type: 'escalate_p0',
+            proposal_json: JSON.stringify({ kind: 'worker_down' }),
+            idempotency_key: 'own-live',
+            outcome: 'pending',
+            created_at: new Date(aliasNow - 1000).toISOString(),
+          },
+        ],
+        threadRef: THREAD,
+        reason: 'worker_down',
+        idempotencyKey: 'own-live',
+        nowMs: aliasNow,
+      })
+    ).toBe('wait');
+    expect(
+      planEscalateDelivery({
+        rows: [
+          {
+            thread_ref: THREAD,
+            action_type: 'escalate_p0',
+            proposal_json: JSON.stringify({ kind: 'worker_down' }),
+            idempotency_key: 'own-stale',
+            outcome: 'pending',
+            created_at: new Date(aliasNow - 10 * 60 * 1000).toISOString(),
+          },
+        ],
+        threadRef: THREAD,
+        reason: 'worker_down',
+        idempotencyKey: 'own-stale',
+        nowMs: aliasNow,
+      })
+    ).toBe('send');
+    expect(
+      planEscalateDelivery({
+        rows: [
+          {
+            thread_ref: THREAD,
+            action_type: 'escalate_p0',
+            proposal_json: JSON.stringify({ kind: 'worker_down' }),
+            idempotency_key: 'failed-recent',
+            outcome: 'failed',
+            created_at: new Date(aliasNow - 60_000).toISOString(),
+          },
+          {
+            thread_ref: THREAD,
+            action_type: 'escalate_p0',
+            proposal_json: JSON.stringify({ kind: 'worker_down', suppressed: 'cooldown' }),
+            idempotency_key: 'suppressed-recent',
+            outcome: 'expired',
+            created_at: new Date(aliasNow - 30_000).toISOString(),
+          },
+        ],
+        threadRef: THREAD,
+        reason: 'worker_down',
+        idempotencyKey: 'retry-after-failure',
+        nowMs: aliasNow,
+        cooldownMs: 60 * 60 * 1000,
+      })
+    ).toBe('send');
   });
 });

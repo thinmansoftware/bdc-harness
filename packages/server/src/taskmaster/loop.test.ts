@@ -5260,10 +5260,9 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     });
   }
 
-  // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: ANY escalate_p0 journal outcome in the
-  // trailing 24h suppresses a re-proposal (expired, pending, failed...), so a
-  // failed or expired attempt is not retried every tick.
-  test('adopt_fixup_stale_epoch_expired_within_24h_suppresses', async () => {
+  // The cooldown is the latest sent row only. An expired row must not block
+  // a real P0, and repeated suppressions must not slide that window.
+  test('expired_escalate_row_does_not_block_a_real_p0', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     seedEscalation(world, 'expired', { type: 'escalate_p0' });
@@ -5276,15 +5275,16 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
 
     const result = await tick(createTaskmasterState(60_000), deps);
 
-    expect(result.effects).toBe(0);
-    expect(gh.posts()).toBe(0);
+    expect(result.effects).toBe(1);
+    expect(gh.posts()).toBe(1);
     const rows = world.journal.filter(
       row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
     );
     expect(rows).toHaveLength(2);
-    expect(rows.filter(row => row.outcome === 'sent')).toHaveLength(0);
+    expect(rows.filter(row => row.outcome === 'sent')).toHaveLength(1);
     const journaled = rows.find(row => row.idempotency_key !== 'tm:escalate_p0:seed');
-    expect(JSON.parse(journaled?.proposal_json ?? '{}').suppressed).toBe('cooldown');
+    expect(journaled?.outcome).toBe('sent');
+    expect(JSON.parse(journaled?.proposal_json ?? '{}').suppressed).toBeUndefined();
   });
 
   test('adopt_fixup_pending_and_suppressed_dedupe_boundaries', async () => {
@@ -5300,19 +5300,18 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
 
     await tick(createTaskmasterState(60_000), pendingDeps);
 
-    expect(pendingGh.posts()).toBe(0);
     const pendingRows = pendingWorld.journal.filter(
       row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
     );
-    // The unmatched pending seed is reconciled to expired, and the new key is
-    // journaled suppressed instead of sent.
+    // The unmatched pending seed is reconciled to expired. That expired row
+    // is not a send, so the new key still pages.
     expect(pendingRows).toHaveLength(2);
-    expect(pendingRows.filter(row => row.outcome === 'sent')).toHaveLength(0);
+    expect(pendingRows.filter(row => row.outcome === 'sent')).toHaveLength(1);
+    expect(pendingGh.posts()).toBe(1);
     expect(
-      pendingRows.some(row => {
-        if (row.idempotency_key === 'tm:escalate_p0:seed') return false;
-        return JSON.parse(row.proposal_json).suppressed === 'cooldown';
-      })
+      pendingRows.some(
+        row => row.idempotency_key === 'tm:escalate_p0:seed' && row.outcome === 'expired'
+      )
     ).toBe(true);
 
     const suppressedWorld = makeWorld();
@@ -5330,12 +5329,12 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
 
     await tick(createTaskmasterState(60_000), suppressedDeps);
 
-    expect(suppressedGh.posts()).toBe(0);
     const suppressedRows = suppressedWorld.journal.filter(
       row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
     );
     expect(suppressedRows).toHaveLength(2);
-    expect(suppressedRows.filter(row => row.outcome === 'sent')).toHaveLength(0);
+    expect(suppressedRows.filter(row => row.outcome === 'sent')).toHaveLength(1);
+    expect(suppressedGh.posts()).toBe(1);
   });
 
   // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01, Tests 5 and 6 (tick level).
@@ -5355,7 +5354,7 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     return deps;
   }
 
-  test('Test 5: one escalate_p0 per stall, even when delivery fails', async () => {
+  test('Test 5: a failed escalate_p0 stays retryable inside the proof deadline', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     const attempts: string[] = [];
@@ -5377,7 +5376,8 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
       recipient: 't3-desktop',
       failure: 'dispatch_send_failed_for_test',
     });
-    expect(attempts).toEqual(['t3-desktop']);
+    // The failed row does not open a cooldown, so each later tick retries it.
+    expect(attempts).toEqual(['t3-desktop', 't3-desktop', 't3-desktop', 't3-desktop']);
   });
 
   test('Test 6: a stall unmoved after 24 hours escalates once more', async () => {
@@ -5396,7 +5396,8 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
 
     world.nowMs += 30 * 60_000;
     await tick(state, deps);
-    expect(attempts).toHaveLength(2);
+    // The new bucket's failed row is retried. It does not count as a cooldown.
+    expect(attempts).toHaveLength(3);
     expect(
       world.journal.filter(
         j => j.thread_ref === 'dispatch:orphan-p0-1' && j.action_type === 'escalate_p0'

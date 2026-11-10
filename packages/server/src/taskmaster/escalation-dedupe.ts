@@ -131,10 +131,13 @@ function rowReason(row: EscalateJournalRow, threadRef: string): string | null {
 
 /**
  * Decide one delivery attempt from the journal rows already read.
- * `wait` means another key for this thread and reason is still being delivered:
- * do not page, and do not rewrite that row. `skip` means this key is already
- * terminal. `suppress` means the cooldown is open and the caller must journal
- * an expired row without touching a pending, sent, or failed row.
+ * `wait` means this key's pending row, or another key for this thread and
+ * reason, is still in flight. Do not page, and do not rewrite that pending
+ * row. The caller journals a different key that waits so the attempt is not
+ * dropped if the in-flight send succeeds. `skip` means this key is already
+ * terminal. `suppress` means a sent row is still inside the cooldown. Failed
+ * and expired rows do not open or extend that window. The caller journals the
+ * suppression without touching a pending, sent, or failed row.
  */
 export function planEscalateDelivery(input: {
   rows: readonly EscalateJournalRow[];
@@ -156,6 +159,13 @@ export function planEscalateDelivery(input: {
       own.outcome === 'deferred')
   ) {
     return 'skip';
+  }
+
+  // An in-flight row for this same key is already being delivered. It is not
+  // permission for a second process to send.
+  if (own?.outcome === 'pending') {
+    const ownAtMs = Date.parse(own.created_at);
+    if (Number.isFinite(ownAtMs) && input.nowMs - ownAtMs < inFlightMs) return 'wait';
   }
 
   for (const row of input.rows) {

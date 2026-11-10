@@ -17,6 +17,7 @@ import {
 } from './duty-officer-clock';
 import { sendCanaryTelegramAlert } from '../services/canary-telegram-alert';
 import {
+  ESCALATE_CLAIM_IN_FLIGHT_MS,
   escalateP0CutoffIso,
   escalationReason,
   planEscalateDelivery,
@@ -372,18 +373,18 @@ function isProposalRecord(proposal: unknown): proposal is Record<string, unknown
   return typeof proposal === 'object' && proposal !== null && !Array.isArray(proposal);
 }
 
-/** Journal marker for a repeat suppressed inside the cooldown. */
-function proposalJsonWithCooldown(proposal: unknown): string {
+/** Journal marker for an attempt that did not page. */
+function proposalJsonWithMarker(proposal: unknown, marker: 'cooldown' | 'in_flight'): string {
   try {
     const marked: Record<string, unknown> = isProposalRecord(proposal)
-      ? { ...proposal, suppressed: 'cooldown' }
-      : { proposal, suppressed: 'cooldown' };
+      ? { ...proposal, suppressed: marker }
+      : { proposal, suppressed: marker };
     const text = JSON.stringify(marked);
     if (typeof text === 'string') return text;
   } catch {
     // A circular proposal still has to leave a journal row.
   }
-  return JSON.stringify({ suppressed: 'cooldown' });
+  return JSON.stringify({ suppressed: marker });
 }
 
 interface JournalIdRow {
@@ -391,7 +392,22 @@ interface JournalIdRow {
   outcome: TmActionOutcome;
 }
 
-type JournalQuery = (sql: string, params?: unknown[]) => Promise<{ rows: readonly JournalIdRow[] }>;
+type JournalQuery = (
+  sql: string,
+  params?: unknown[]
+) => Promise<{ rows: readonly JournalIdRow[]; rowCount: number }>;
+
+interface EscalateClaimStore {
+  recordAction: WorkerHeartbeatAlarmJournal['recordAction'];
+  updateActionOutcome: WorkerHeartbeatAlarmJournal['updateActionOutcome'];
+  /**
+   * Cross-process lease for an existing pending or failed row. Absent on the
+   * in-memory journal; the production claim sets it inside the writer
+   * transaction. False means another process owns the row.
+   */
+  exclusivePendingSend?: (id: string) => Promise<boolean>;
+  exclusiveFailedRetry?: (id: string) => Promise<boolean>;
+}
 
 /** Postgres serializes cooldown claims; SQLite uses BEGIN IMMEDIATE instead. */
 const ESCALATE_COOLDOWN_ADVISORY_LOCK = 88145001;
@@ -431,7 +447,7 @@ async function insertJournalRow(
     outcome: TmActionOutcome;
   },
   nowMs: number
-): Promise<{ id: string; outcome: TmActionOutcome }> {
+): Promise<{ id: string; outcome: TmActionOutcome; inserted: boolean }> {
   const inserted = await query(
     `INSERT INTO tm_journal
      (id, created_at, thread_ref, action_type, proposal_json, idempotency_key,
@@ -450,25 +466,26 @@ async function insertJournalRow(
     ]
   );
   const created = inserted.rows[0];
-  if (created) return { id: created.id, outcome: created.outcome };
+  if (created) return { id: created.id, outcome: created.outcome, inserted: true };
   const existing = await query(
     'SELECT id, outcome FROM tm_journal WHERE idempotency_key = $1 ORDER BY created_at ASC LIMIT 1',
     [data.idempotency_key]
   );
   const found = existing.rows[0];
   if (!found) throw new Error('worker_heartbeat_page_journal_missing');
-  return { id: found.id, outcome: found.outcome };
+  return { id: found.id, outcome: found.outcome, inserted: false };
 }
 
 /**
- * Journal a cooldown suppression. A pending, sent, or failed row already
- * belongs to a delivery or a retry, so it is left unchanged.
+ * Journal a suppression. A pending, sent, or failed row already belongs to a
+ * delivery or a retry, so it is left unchanged.
  */
-async function journalCooldownSuppression(
+async function journalMarkedSuppression(
   journal: Pick<WorkerHeartbeatAlarmJournal, 'recordAction' | 'updateActionOutcome'>,
-  input: EscalateClaimInput
+  input: EscalateClaimInput,
+  marker: 'cooldown' | 'in_flight'
 ): Promise<void> {
-  const proposalJson = proposalJsonWithCooldown(input.proposal);
+  const proposalJson = proposalJsonWithMarker(input.proposal, marker);
   const row = await journal.recordAction({
     thread_ref: input.threadRef,
     action_type: 'escalate_p0',
@@ -488,7 +505,7 @@ async function journalCooldownSuppression(
 }
 
 async function finishEscalateClaim(
-  journal: Pick<WorkerHeartbeatAlarmJournal, 'recordAction' | 'updateActionOutcome'>,
+  journal: EscalateClaimStore,
   rows: readonly EscalateJournalRow[],
   input: EscalateClaimInput
 ): Promise<EscalateClaimDisposition> {
@@ -500,10 +517,17 @@ async function finishEscalateClaim(
     nowMs: input.nowMs,
     cooldownMs: input.cooldownMs,
   });
-  if (plan === 'wait') return { disposition: 'wait' };
+  if (plan === 'wait') {
+    const own = rows.find(row => row.idempotency_key === input.idempotencyKey);
+    // The live pending row is the record. A different key must be journaled
+    // or the attempt disappears when the in-flight send succeeds.
+    if (own?.outcome === 'pending') return { disposition: 'wait' };
+    await journalMarkedSuppression(journal, input, 'in_flight');
+    return { disposition: 'suppressed' };
+  }
   if (plan === 'skip') return { disposition: 'skip' };
   if (plan === 'suppress') {
-    await journalCooldownSuppression(journal, input);
+    await journalMarkedSuppression(journal, input, 'cooldown');
     return { disposition: 'suppressed' };
   }
   const entry = await journal.recordAction({
@@ -513,7 +537,25 @@ async function finishEscalateClaim(
     idempotency_key: input.idempotencyKey,
     outcome: 'pending',
   });
-  if (entry.outcome === 'pending' || entry.outcome === 'failed') {
+  if (entry.outcome === 'pending') {
+    // Inserting the pending row wins the claim. An existing pending row is
+    // not permission to send: only a stale-lease update that this transaction
+    // wins may retry it. Anyone else waits.
+    if (journal.exclusivePendingSend && !(await journal.exclusivePendingSend(entry.id))) {
+      return { disposition: 'wait' };
+    }
+    const preexisting = rows.find(row => row.idempotency_key === input.idempotencyKey);
+    if (!journal.exclusivePendingSend && preexisting?.outcome === 'pending') {
+      const atMs = Date.parse(preexisting.created_at);
+      const inFlight = Number.isFinite(atMs) && input.nowMs - atMs < ESCALATE_CLAIM_IN_FLIGHT_MS;
+      if (inFlight) return { disposition: 'wait' };
+    }
+    return { disposition: 'send', id: entry.id };
+  }
+  if (entry.outcome === 'failed') {
+    if (journal.exclusiveFailedRetry && !(await journal.exclusiveFailedRetry(entry.id))) {
+      return { disposition: 'wait' };
+    }
     return { disposition: 'send', id: entry.id };
   }
   return { disposition: 'skip' };
@@ -540,8 +582,15 @@ async function commitCooldownDecisionAtomic(
          ORDER BY created_at ASC`,
         [input.threadRef, sinceIso]
       );
-      const store: Pick<WorkerHeartbeatAlarmJournal, 'recordAction' | 'updateActionOutcome'> = {
-        recordAction: data => insertJournalRow(query, data, input.nowMs),
+      const leaseUntil = new Date(input.nowMs + ESCALATE_CLAIM_IN_FLIGHT_MS).toISOString();
+      const nowIso = new Date(input.nowMs).toISOString();
+      let claimedByInsert = false;
+      const store: EscalateClaimStore = {
+        recordAction: async data => {
+          const row = await insertJournalRow(query, data, input.nowMs);
+          if (row.inserted && row.outcome === 'pending') claimedByInsert = true;
+          return row;
+        },
         updateActionOutcome: async (id, outcome, proposalJson) => {
           // Never let a suppression overwrite a live or finished delivery.
           if (proposalJson === undefined) {
@@ -559,6 +608,27 @@ async function commitCooldownDecisionAtomic(
           }
           return null;
         },
+        // One writer wins the lease. A pending row this transaction did not
+        // insert, or a failed row another process already claimed, does not send.
+        exclusivePendingSend: async (id: string): Promise<boolean> => {
+          if (claimedByInsert) return true;
+          const updated = await query(
+            `UPDATE tm_journal SET proof_deadline_at = $1
+             WHERE id = $2 AND outcome = 'pending'
+               AND (proof_deadline_at IS NULL OR proof_deadline_at <= $3)`,
+            [leaseUntil, id, nowIso]
+          );
+          return updated.rowCount === 1;
+        },
+        exclusiveFailedRetry: async (id: string): Promise<boolean> => {
+          const updated = await query(
+            `UPDATE tm_journal SET proof_deadline_at = $1
+             WHERE id = $2 AND outcome = 'failed'
+               AND (proof_deadline_at IS NULL OR proof_deadline_at <= $3)`,
+            [leaseUntil, id, nowIso]
+          );
+          return updated.rowCount === 1;
+        },
       };
       return finishEscalateClaim(store, selected.rows, input);
     },
@@ -569,9 +639,11 @@ async function commitCooldownDecisionAtomic(
 /**
  * Journal one page attempt ROW-FIRST, then page, then flip the outcome. The row
  * is keyed by idempotencyKey: recordAction returns the existing row when the key
- * is already present, so a row already 'sent' is skipped (no duplicate page) and
- * a 'pending'/'failed' row is retried. The alarm therefore holds no state -- a
- * restart mid-drain simply re-reads the row and continues.
+ * is already present, so a row already 'sent' is skipped (no duplicate page).
+ * A pending row still inside the in-flight window belongs to the process that
+ * inserted it; a second process waits. A stale pending row or a failed row is
+ * retried by whichever transaction wins the lease. The alarm therefore holds
+ * no state -- a restart after the lease simply re-reads the row and continues.
  *
  * The in-process lock is held across the claim and the send, so two alarm runs
  * in this process cannot both page the same thread and reason. The production
