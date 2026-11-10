@@ -16,6 +16,7 @@ const BOT = 'thinman-overseer[bot]';
 
 const runOnce = (options: MergeExecutionBridgeOptions): Promise<void> =>
   runMergeExecutionBridgeOnceProduction({
+    readRunEvents: async () => [],
     hasQualifiedReview: async () => true,
     reviewConflictAtHead: async () => null,
     ...options,

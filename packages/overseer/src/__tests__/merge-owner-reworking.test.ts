@@ -47,6 +47,7 @@ import type {
 
 const runMergeExecutionBridgeOnce = (options: MergeExecutionBridgeOptions): Promise<void> =>
   runMergeExecutionBridgeOnceProduction({
+    readRunEvents: async () => [],
     hasQualifiedReview: async () => true,
     reviewConflictAtHead: async () => null,
     ...options,

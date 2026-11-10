@@ -29,6 +29,7 @@ import type {
   MergeOperatorIdentity,
   OverseerActionsDeps,
   OverseerWorkflowEvent,
+  PullRequestRef,
   WatchedRunRecord,
 } from './types.ts';
 
@@ -596,19 +597,35 @@ function trimmedBranch(value: string | null | undefined): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-type EvidenceHoldReason =
+export type EvidenceHoldReason =
   | typeof ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON
   | typeof ORIGINATING_RUN_UNREADABLE_HOLD_REASON;
 
-async function originatingEvidenceFailure(
-  deps: MergeManagerDeps,
-  record: WatchedRunRecord
+export interface OriginatingEvidenceRun {
+  runId: string;
+  status: string;
+  reason?: string;
+  lastEvent?: OverseerWorkflowEvent;
+}
+
+export interface EvidenceHoldTarget extends PullRequestRef {
+  headSha: string;
+}
+
+type EvidenceGitHubDeps = Pick<
+  GitHubClientDeps,
+  'listPullRequestComments' | 'commentOnPullRequest' | 'commentAuthorLogin' | 'addPullRequestLabels'
+>;
+
+export async function originatingEvidenceFailure(
+  record: OriginatingEvidenceRun,
+  readRunEvents?: (runId: string) => Promise<OverseerWorkflowEvent[]>
 ): Promise<{ reason: EvidenceHoldReason; error: string } | null> {
   try {
-    if (!record.runId.trim() || !deps.readRunEvents) {
+    if (!record.runId.trim() || !readRunEvents) {
       throw new Error('originating run events reader unavailable');
     }
-    const events = await deps.readRunEvents(record.runId);
+    const events = await readRunEvents(record.runId);
     // Reject a malformed/cross-run response rather than treating it as a passing gate.
     if (!Array.isArray(events) || events.some(event => event.workflow_run_id !== record.runId)) {
       throw new Error('originating run events could not be resolved');
@@ -629,10 +646,10 @@ async function originatingEvidenceFailure(
           (event.step_name === 'manifest-evidence-check' ||
             JSON.stringify(event.data).includes('manifest-evidence-check'))
       );
-      if (failure || record.reason.includes('manifest-evidence-check')) {
+      if (failure || record.reason?.includes('manifest-evidence-check')) {
         return {
           reason: ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON,
-          error: failure ? eventMessage(failure) : record.reason,
+          error: failure ? eventMessage(failure) : (record.reason ?? ''),
         };
       }
     }
@@ -645,10 +662,10 @@ async function originatingEvidenceFailure(
   }
 }
 
-async function evidenceAdjudicated(
-  deps: MergeManagerDeps,
-  evidence: QualifiedMergeEvidence,
-  reviewGateLogin: string
+export async function evidenceAdjudicated(
+  deps: EvidenceGitHubDeps,
+  target: EvidenceHoldTarget,
+  blockedLogins: readonly (string | undefined)[] = []
 ): Promise<boolean> {
   const allowed = (process.env[MERGE_MANAGER_EVIDENCE_ADJUDICATORS_ENV] ?? '')
     .split(',')
@@ -661,20 +678,18 @@ async function evidenceAdjudicated(
       'thinman-overseer',
       'thinman-review-gate',
       deps.commentAuthorLogin,
-      reviewGateLogin,
-      deps.operator?.identity,
-      evidence.operator.identity,
-      evidence.credential_principal,
-      evidence.record.prEvidence.pr?.author,
+      target.author,
+      process.env[MERGE_MANAGER_REVIEW_GATE_LOGIN_ENV],
+      ...blockedLogins,
     ]
       .filter((login): login is string => Boolean(login))
       .map(login => login.trim().toLowerCase())
   );
   try {
     const comments = await deps.listPullRequestComments({
-      owner: evidence.owner,
-      repo: evidence.repository,
-      number: evidence.pr_number,
+      owner: target.owner,
+      repo: target.repo,
+      number: target.number,
     });
     return comments.some(comment => {
       const login = comment.authorLogin.trim().toLowerCase();
@@ -686,7 +701,7 @@ async function evidenceAdjudicated(
         return (
           match[1]
             ?.match(/\b[0-9a-f]{40}\b/gi)
-            ?.some(sha => sha.toLowerCase() === evidence.head_sha.toLowerCase()) ?? false
+            ?.some(sha => sha.toLowerCase() === target.headSha.toLowerCase()) ?? false
         );
       });
     });
@@ -695,17 +710,17 @@ async function evidenceAdjudicated(
   }
 }
 
-async function postEvidenceHold(
-  deps: MergeManagerDeps,
-  record: WatchedRunRecord,
-  evidence: QualifiedMergeEvidence,
+export async function postEvidenceHold(
+  deps: EvidenceGitHubDeps,
+  runId: string,
+  target: EvidenceHoldTarget,
   failure: { reason: EvidenceHoldReason; error: string },
   mode: MergeManagerMode,
   mutationsEnabled: boolean
 ): Promise<void> {
   if (mode === 'hold-canary' || (mode === 'execute' && !mutationsEnabled)) return;
-  const pr = { owner: evidence.owner, repo: evidence.repository, number: evidence.pr_number };
-  const marker = `<!-- merge-evidence-hold:${evidence.head_sha} -->`;
+  const pr = { owner: target.owner, repo: target.repo, number: target.number };
+  const marker = `<!-- merge-evidence-hold:${target.headSha} -->`;
   try {
     // Author-bound persistent marker, following postPolicySkipComment. No scan means
     // no safe once-per-head write; keep the hold and report the unavailable channel.
@@ -725,9 +740,9 @@ async function postEvidenceHold(
         body: [
           marker,
           failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON
-            ? `Merge held: originating run ${record.runId} failed manifest-evidence-check`
-            : `Merge held: originating run ${record.runId} unreadable`,
-          `headSha=${evidence.head_sha}`,
+            ? `Merge held: originating run ${runId} failed manifest-evidence-check`
+            : `Merge held: originating run ${runId} unreadable`,
+          `headSha=${target.headSha}`,
           `reason=${failure.reason}`,
           failure.error.slice(0, 300),
         ].join('\n'),
@@ -735,7 +750,7 @@ async function postEvidenceHold(
     }
   } catch (error) {
     log.warn(
-      { runId: record.runId, error, reason: failure.reason },
+      { runId, error, reason: failure.reason },
       'merge_manager.evidence_hold_comment_failed'
     );
   }
@@ -746,7 +761,7 @@ async function postEvidenceHold(
       await deps.addPullRequestLabels({ ...pr, labels: [EVIDENCE_HOLD_LABEL] });
     } catch (error) {
       log.warn(
-        { runId: record.runId, error, reason: failure.reason },
+        { runId, error, reason: failure.reason },
         'merge_manager.evidence_hold_label_failed'
       );
     }
@@ -952,13 +967,25 @@ export function createMergeManager(
     }
 
     if (provenance.reason !== 'no_run') {
-      const failure = await originatingEvidenceFailure(deps, record);
+      const failure = await originatingEvidenceFailure(record, deps.readRunEvents);
+      const target: EvidenceHoldTarget = {
+        owner: evidence.owner,
+        repo: evidence.repository,
+        number: evidence.pr_number,
+        headSha: evidence.head_sha,
+        author: evidence.record.prEvidence.pr?.author,
+      };
       // Unreadable state cannot be adjudicated as if it were a known failed gate.
       if (
         failure &&
         !(
           failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON &&
-          (await evidenceAdjudicated(deps, evidence, reviewGateLogin))
+          (await evidenceAdjudicated(deps, target, [
+            reviewGateLogin,
+            deps.operator?.identity,
+            evidence.operator.identity,
+            evidence.credential_principal,
+          ]))
         )
       ) {
         await recordManagerAction(deps, record, 'merge_denied', failure.reason);
@@ -966,7 +993,7 @@ export function createMergeManager(
           { runId: record.runId, woId: record.woId, mode, reason: failure.reason },
           'merge_manager.originating_evidence_held'
         );
-        await postEvidenceHold(deps, record, evidence, failure, mode, mutationsEnabled);
+        await postEvidenceHold(deps, record.runId, target, failure, mode, mutationsEnabled);
         return {
           status: 'held',
           receipt: holdReceipt(evidence, evidenceDigest, failure.reason),
