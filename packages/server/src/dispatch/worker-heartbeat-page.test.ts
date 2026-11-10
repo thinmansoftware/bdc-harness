@@ -419,4 +419,70 @@ describe('worker heartbeat page path', () => {
     expect(journal.rows.has('dispatch-worker-death:W_valid:7:2026-09-28T21:00:00.000Z')).toBe(true);
     expect(journal.rows.has('dispatch-worker-death:W_valid:8:2026-09-28T21:05:00.000Z')).toBe(true);
   });
+
+  test('Test 17: repeated worker_down inside 24h is suppressed and journaled', async () => {
+    delete process.env.GITHUB_TOKEN;
+    delete process.env.GH_TOKEN;
+    process.env.DISPATCH_WORKER_ALARM_WORKERS = 'A';
+    const nowMs = Date.parse('2026-09-28T12:00:00.000Z');
+    const firstHeartbeat = nowMs - 6 * MINUTE;
+    const secondHeartbeat = nowMs - 40 * MINUTE;
+    const pages: string[] = [];
+    const rows: Array<{
+      id: string;
+      thread_ref: string;
+      action_type: 'escalate_p0';
+      proposal_json: string;
+      idempotency_key: string;
+      outcome: TmActionOutcome;
+      created_at: string;
+    }> = [];
+    let counter = 0;
+    const journal: WorkerHeartbeatAlarmJournal = {
+      recordAction: async data => {
+        const existing = rows.find(row => row.idempotency_key === data.idempotency_key);
+        if (existing) return { id: existing.id, outcome: existing.outcome };
+        counter += 1;
+        const row = {
+          id: `row-${String(counter)}`,
+          thread_ref: data.thread_ref,
+          action_type: 'escalate_p0' as const,
+          proposal_json: data.proposal_json,
+          idempotency_key: data.idempotency_key,
+          outcome: data.outcome,
+          created_at: new Date(nowMs).toISOString(),
+        };
+        rows.push(row);
+        return { id: row.id, outcome: row.outcome };
+      },
+      updateActionOutcome: async (id, outcome, proposalJson) => {
+        const row = rows.find(entry => entry.id === id);
+        if (!row) return null;
+        row.outcome = outcome;
+        if (proposalJson !== undefined) row.proposal_json = proposalJson;
+        return null;
+      },
+      listActions: async threadRef =>
+        rows.filter(row => row.thread_ref === threadRef).map(row => ({ ...row })),
+    };
+    const depsFor = (heartbeatMs: number): WorkerHeartbeatAlarmDeps => ({
+      getWorker: getWorkerStub({ A: worker('A', heartbeatMs) }),
+      pageOperator: mock(async (text: string) => {
+        pages.push(text);
+      }),
+      journal,
+      now: () => new Date(nowMs),
+    });
+
+    await runWorkerHeartbeatAlarm(depsFor(firstHeartbeat));
+    await runWorkerHeartbeatAlarm(depsFor(secondHeartbeat));
+
+    expect(pages.length).toBe(1);
+    expect(rows.length).toBe(2);
+    expect(rows[0]?.outcome).toBe('sent');
+    expect(rows[1]?.outcome).toBe('expired');
+    expect(rows[0]?.idempotency_key).not.toBe(rows[1]?.idempotency_key);
+    const secondProposal: unknown = JSON.parse(rows[1]?.proposal_json ?? '');
+    expect(secondProposal).toMatchObject({ kind: 'worker_down', suppressed: 'cooldown' });
+  });
 });

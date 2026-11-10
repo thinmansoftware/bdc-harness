@@ -1,5 +1,6 @@
 import { getWorker, type DispatchWorker } from '@archon/core/db/dispatch';
 import {
+  getActionsSince,
   recordAction,
   updateActionOutcome,
   type TmActionType,
@@ -13,6 +14,11 @@ import {
   type DutyOfficerStaleIssue,
 } from './duty-officer-clock';
 import { sendCanaryTelegramAlert } from '../services/canary-telegram-alert';
+import {
+  decideEscalateP0,
+  DEFAULT_ESCALATE_P0_COOLDOWN_MS,
+  escalationReason,
+} from '../taskmaster/guard';
 
 const log = createLogger('dispatch/worker-heartbeat-alarm');
 
@@ -32,6 +38,17 @@ export interface WorkerRestartEvidenceEntry {
   previous_started_at: string;
 }
 
+/** Journal row shape the escalate_p0 cooldown scan reads. */
+export interface WorkerHeartbeatEscalationRow {
+  id: string;
+  thread_ref: string;
+  action_type: TmActionType;
+  proposal_json: string;
+  idempotency_key: string | null;
+  outcome: TmActionOutcome;
+  created_at: string;
+}
+
 /**
  * Row-first journal used by the page path. Structurally a subset of
  * packages/core/src/db/taskmaster.ts recordAction / updateActionOutcome so the
@@ -45,7 +62,16 @@ export interface WorkerHeartbeatAlarmJournal {
     idempotency_key: string;
     outcome: TmActionOutcome;
   }) => Promise<{ id: string; outcome: TmActionOutcome }>;
-  updateActionOutcome: (id: string, outcome: TmActionOutcome) => Promise<unknown>;
+  updateActionOutcome: (
+    id: string,
+    outcome: TmActionOutcome,
+    proposalJson?: string
+  ) => Promise<unknown>;
+  /**
+   * Recent actions for one thread. Omitted by the rejected-send caller, which
+   * keeps its hourly idempotency key and does not apply the cooldown.
+   */
+  listActions?: (threadRef: string) => Promise<WorkerHeartbeatEscalationRow[]>;
 }
 
 export interface WorkerHeartbeatAlarmDeps {
@@ -280,7 +306,15 @@ export function createRealWorkerHeartbeatAlarmDeps(): WorkerHeartbeatAlarmDeps {
     getWorker,
     now: () => new Date(),
     pageOperator: (text: string) => sendCanaryTelegramAlert(text),
-    journal: { recordAction, updateActionOutcome },
+    journal: {
+      recordAction,
+      updateActionOutcome,
+      listActions: (threadRef: string): Promise<WorkerHeartbeatEscalationRow[]> =>
+        getActionsSince(
+          new Date(Date.now() - DEFAULT_ESCALATE_P0_COOLDOWN_MS).toISOString(),
+          threadRef
+        ),
+    },
   };
 }
 
@@ -311,6 +345,53 @@ export function parseWorkerRestartEvidence(
   return entries;
 }
 
+function isProposalRecord(proposal: unknown): proposal is Record<string, unknown> {
+  return typeof proposal === 'object' && proposal !== null && !Array.isArray(proposal);
+}
+
+/** Journal marker for a repeat suppressed inside the cooldown. */
+function proposalJsonWithCooldown(proposal: unknown): string {
+  try {
+    const marked: Record<string, unknown> = isProposalRecord(proposal)
+      ? { ...proposal, suppressed: 'cooldown' }
+      : { proposal, suppressed: 'cooldown' };
+    const text = JSON.stringify(marked);
+    if (typeof text === 'string') return text;
+  } catch {
+    // A circular proposal still has to leave a journal row.
+  }
+  return JSON.stringify({ suppressed: 'cooldown' });
+}
+
+/**
+ * Latest created_at among sent escalate_p0 rows with the same reason.
+ * Invalid JSON and unparseable timestamps are skipped. failed and pending
+ * rows do not start a cooldown.
+ */
+function latestMatchingSentAtMs(
+  rows: readonly WorkerHeartbeatEscalationRow[],
+  threadRef: string,
+  reason: string
+): number | null {
+  let latest: number | null = null;
+  for (const row of rows) {
+    if (row.thread_ref !== threadRef) continue;
+    if (row.action_type !== 'escalate_p0') continue;
+    if (row.outcome !== 'sent') continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.proposal_json);
+    } catch {
+      continue;
+    }
+    if (escalationReason(parsed, row.thread_ref) !== reason) continue;
+    const sentAtMs = Date.parse(row.created_at);
+    if (!Number.isFinite(sentAtMs)) continue;
+    if (latest === null || sentAtMs > latest) latest = sentAtMs;
+  }
+  return latest;
+}
+
 /**
  * Journal one page attempt ROW-FIRST, then page, then flip the outcome. The row
  * is keyed by idempotencyKey: recordAction returns the existing row when the key
@@ -318,13 +399,50 @@ export function parseWorkerRestartEvidence(
  * a 'pending'/'failed' row is retried. The alarm therefore holds no state -- a
  * restart mid-drain simply re-reads the row and continues.
  *
+ * When the journal supplies listActions, a new key for the same thread and
+ * reason inside the cooldown is journaled outcome=expired with
+ * suppressed=cooldown and is not paged. The lookup and the send are separate
+ * calls; this is not a cross-process atomic claim. Without listActions the
+ * cooldown is skipped and the idempotency key alone dedupes.
+ *
  * Exported so the Taskmaster's rejected-send alarm pages through this same
  * journal-first path (one row per idempotency key, so one page per key).
  */
 export async function pageOnce(
   deps: { pageOperator: (text: string) => Promise<void>; journal: WorkerHeartbeatAlarmJournal },
-  args: { idempotencyKey: string; threadRef: string; text: string; proposal: unknown }
+  args: { idempotencyKey: string; threadRef: string; text: string; proposal: unknown },
+  nowMs: number = Date.now()
 ): Promise<void> {
+  const reason = escalationReason(args.proposal, args.threadRef);
+  const priorSentAtMs = deps.journal.listActions
+    ? latestMatchingSentAtMs(await deps.journal.listActions(args.threadRef), args.threadRef, reason)
+    : null;
+  const decision = decideEscalateP0({
+    threadRef: args.threadRef,
+    reason,
+    nowMs,
+    priorSentAtMs,
+  });
+  if (decision.suppressed === 'cooldown') {
+    const proposalJson = proposalJsonWithCooldown(args.proposal);
+    const suppressed = await deps.journal.recordAction({
+      thread_ref: args.threadRef,
+      action_type: 'escalate_p0',
+      proposal_json: proposalJson,
+      idempotency_key: args.idempotencyKey,
+      outcome: 'expired',
+    });
+    if (suppressed.outcome === 'sent') return;
+    if (suppressed.outcome !== 'expired') {
+      await deps.journal.updateActionOutcome(suppressed.id, 'expired', proposalJson);
+    }
+    log.info(
+      { threadRef: args.threadRef, reason, idempotencyKey: args.idempotencyKey },
+      'worker_heartbeat_page_suppressed'
+    );
+    return;
+  }
+
   const entry = await deps.journal.recordAction({
     thread_ref: args.threadRef,
     action_type: 'escalate_p0',
@@ -373,19 +491,23 @@ async function runWorkerPagePath(
     // 1) Restart-evidence deaths: paged regardless of heartbeat freshness. Each
     //    death is keyed only by previous_pid + previous_started_at.
     for (const entry of parseWorkerRestartEvidence(row?.capabilities)) {
-      await pageOnce(deps, {
-        idempotencyKey: `dispatch-worker-death:${workerId}:${entry.previous_pid}:${entry.previous_started_at}`,
-        threadRef,
-        text:
-          `[DISPATCH WORKER DEATH] ${workerId} pid ${entry.previous_pid} ` +
-          `(started ${entry.previous_started_at}) died and was reclaimed on restart.`,
-        proposal: {
-          kind: 'worker_death',
-          worker_id: workerId,
-          previous_pid: entry.previous_pid,
-          previous_started_at: entry.previous_started_at,
+      await pageOnce(
+        deps,
+        {
+          idempotencyKey: `dispatch-worker-death:${workerId}:${entry.previous_pid}:${entry.previous_started_at}`,
+          threadRef,
+          text:
+            `[DISPATCH WORKER DEATH] ${workerId} pid ${entry.previous_pid} ` +
+            `(started ${entry.previous_started_at}) died and was reclaimed on restart.`,
+          proposal: {
+            kind: 'worker_death',
+            worker_id: workerId,
+            previous_pid: entry.previous_pid,
+            previous_started_at: entry.previous_started_at,
+          },
         },
-      });
+        nowMs
+      );
     }
 
     // 2) Heartbeat-age page: a worker whose last heartbeat is older than the
@@ -397,19 +519,23 @@ async function runWorkerPagePath(
     if (nowMs - last <= pageStaleMs) continue;
     const bucket = Math.floor((nowMs - last) / repeatMs);
     const minutesSilent = Math.max(0, Math.floor((nowMs - last) / 60_000));
-    await pageOnce(deps, {
-      idempotencyKey: `dispatch-worker-page:${workerId}:${row.last_heartbeat_at}:${bucket}`,
-      threadRef,
-      text:
-        `[DISPATCH WORKER DOWN] ${workerId} silent for ${minutesSilent} minutes ` +
-        `(last heartbeat ${row.last_heartbeat_at}). No heartbeat past the ${config.pageStaleMinutes} minute page threshold.`,
-      proposal: {
-        kind: 'worker_down',
-        worker_id: workerId,
-        last_heartbeat_at: row.last_heartbeat_at,
-        minutes_silent: minutesSilent,
+    await pageOnce(
+      deps,
+      {
+        idempotencyKey: `dispatch-worker-page:${workerId}:${row.last_heartbeat_at}:${bucket}`,
+        threadRef,
+        text:
+          `[DISPATCH WORKER DOWN] ${workerId} silent for ${minutesSilent} minutes ` +
+          `(last heartbeat ${row.last_heartbeat_at}). No heartbeat past the ${config.pageStaleMinutes} minute page threshold.`,
+        proposal: {
+          kind: 'worker_down',
+          worker_id: workerId,
+          last_heartbeat_at: row.last_heartbeat_at,
+          minutes_silent: minutesSilent,
+        },
       },
-    });
+      nowMs
+    );
   }
 }
 

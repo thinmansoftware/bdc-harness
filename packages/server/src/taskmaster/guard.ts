@@ -331,3 +331,9 @@ export function validateForbiddenActionContent(body: string): GuardResult {
 
   return { allowed: true };
 }
+
+export {
+  decideEscalateP0,
+  escalationReason,
+  DEFAULT_ESCALATE_P0_COOLDOWN_MS,
+} from './escalation-dedupe';
