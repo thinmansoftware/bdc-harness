@@ -6,6 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
+import { laneEnv } from '@archon/paths';
 
 const execFileAsync = promisify(execFile);
 
@@ -133,7 +134,8 @@ export async function executeGrokTool(
             cwd,
             timeout,
             maxBuffer: 8 * 1024 * 1024,
-            env: process.env,
+            // No personal GitHub token names for the bash tool (bdc-xo#5464).
+            env: laneEnv(),
             windowsHide: true,
           });
           const out = `${stdout ?? ''}${stderr ? `\nSTDERR:\n${stderr}` : ''}`.trim();

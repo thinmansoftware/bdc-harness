@@ -94,6 +94,43 @@ describe('CursorAgentProvider', () => {
     expect(writes).toEqual([]);
   });
 
+  test('the cursor-agent child env has none of the personal GitHub token names, even from request env (bdc-xo#5464)', async () => {
+    const names = [
+      'GH_TOKEN',
+      'GITHUB_TOKEN',
+      'MERGE_MANAGER_GH_TOKEN',
+      'GH_AUTH_TOKEN_INTERNAL',
+      'ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN',
+    ];
+    const saved = Object.fromEntries(names.map(n => [n, process.env[n]]));
+    for (const n of names) process.env[n] = 'ghp_synthetic';
+    let seenEnv: Record<string, string | undefined> = {};
+    const { child } = fakeChild({
+      stdout: streamJson([assistantEvent('ok\nCOMPLETE\n'), successResult('ok\nCOMPLETE\n')]),
+    });
+    const provider = new CursorAgentProvider({
+      spawn: (_argv, options) => {
+        seenEnv = options.env as Record<string, string | undefined>;
+        return child;
+      },
+    });
+    try {
+      await collect(
+        provider.sendQuery('p', '/work/tree', undefined, {
+          env: { GITHUB_TOKEN: 'ghp_from_request', MY_SECRET: 'abc123' },
+        })
+      );
+    } finally {
+      for (const n of names) {
+        if (saved[n] === undefined) delete process.env[n];
+        else process.env[n] = saved[n];
+      }
+    }
+    for (const n of names) expect(n in seenEnv).toBe(false);
+    expect(seenEnv.MY_SECRET).toBe('abc123');
+    expect(seenEnv.ARCHON_GITHUB_NO_PERMISSION_FALLBACK).toBe('1');
+  });
+
   test('spawns cursor-agent with --workspace <cwd> and the configured model; prompt on stdin', async () => {
     let seenArgv: string[] = [];
     let seenCwd = '';

@@ -2601,11 +2601,11 @@ nodes:
             fi
           done < "$(dirname "$snapshot")/stop-tests.stages"
         fi
-        python3 - "$mode" "$snapshot" "${SPEC:-}" "${#roots[@]}" "${roots[@]}" "${declared[@]}" <<'TRG_PY'
-      import fnmatch, hashlib, json, os, pathlib, re, shlex, subprocess, sys
-      mode, snapshot, spec = sys.argv[1:4]
-      count = int(sys.argv[4])
-      pairs = sys.argv[5:5+count]
+        python3 - "$mode" "$snapshot" "${SPEC:-}" "${ARTIFACTS_DIR:-}" "${#roots[@]}" "${roots[@]}" "${declared[@]}" <<'TRG_PY'
+      import collections, fnmatch, hashlib, json, os, pathlib, re, shlex, subprocess, sys
+      mode, snapshot, spec, artifacts = sys.argv[1:5]
+      count = int(sys.argv[5])
+      pairs = sys.argv[6:6+count]
       run_root, run_base = str(pathlib.Path(pairs[0]).resolve()), pairs[1]
       # Match resolve-review-base's declared-header priority, without network access.
       for pattern in [r"^Base branch:\s*([A-Za-z0-9_./-]+)",r"\*\*Base branch:\*\*\s*`([A-Za-z0-9_./-]+)`",r"^base_branch:\s*([A-Za-z0-9_./-]+)"]:
@@ -2618,19 +2618,36 @@ nodes:
           roots.setdefault(str(pathlib.Path(directory).resolve()),set()).add(base)
       # A stage executing in the run directory uses its own persisted target branch.
       roots.setdefault(run_root,{run_base})
-      declared = sys.argv[5+count:]
+      declared = sys.argv[6+count:]
       markers = [r"\.skip\s*\(",r"\.only\s*\(",r"\bxit\s*\(",r"\bxdescribe\s*\(",r"\bit\.todo\b",r"\btest\.todo\b",r"@pytest\.mark\.skip",r"unittest\.skip"]
       before = {} if mode == "snapshot" else json.loads(pathlib.Path(snapshot).read_text())
       touched = set()
       violations = []
       command_files = {}
-      def excluded(name):
-          return any(part in {"node_modules",".git",".venv","venv","__pycache__",".bun",".pnpm-store"} for part in pathlib.PurePosixPath(name).parts)
+      entry_cwds = {}
+      absolute_references = {}
+      def live_absolute_reference(token):
+          path = pathlib.Path(token)
+          if not path.is_absolute(): return None
+          path = pathlib.Path(os.path.abspath(path))
+          # Harness output retains its existing exclusion from project capture.
+          if any(path.is_relative_to(directory) for directory in artifact_roots): return None
+          if any(path.is_relative_to(pathlib.Path(directory)) or path.resolve().is_relative_to(pathlib.Path(directory)) for directory in roots):
+              return path
+          return None
+      def absolute_reference_message(name,path):
+          return "test guard: absolute reference into the live worktree cannot be verified from the trusted copy: "+name+" -> "+path.as_posix()
+      # Lane evidence is harness output, including when it lives in a project.
+      artifact_roots = {pathlib.Path(snapshot).resolve().parent}
+      if artifacts: artifact_roots.add(pathlib.Path(artifacts).resolve())
+      def excluded(root,name):
+          return (any(part in {"node_modules",".git",".venv","venv","__pycache__",".bun",".pnpm-store"} for part in pathlib.PurePosixPath(name).parts)
+                  or any((root/name).is_relative_to(path) for path in artifact_roots))
       def directory_in_tree(root,name):
           path = root/name
           return path.is_dir() and path.resolve().is_relative_to(root)
       def package_script(root, cwd, name, stack, lifecycle=False):
-          if excluded(cwd.relative_to(root).as_posix()): return
+          if excluded(root,cwd.relative_to(root).as_posix()): return
           key = (str(cwd),name)
           try:
               if key in stack or len(stack) >= 5: raise ValueError("package script cycle or depth limit")
@@ -2645,8 +2662,8 @@ nodes:
               print("test guard: cannot resolve package script: "+str(cwd)+"/"+name+": "+str(error),file=sys.stderr)
               sys.exit(42)
           command_files.setdefault(str(root),set()).add(package.relative_to(root).as_posix())
-          for command in commands: declared_paths(root,command,cwd,stack+(key,))
-      def declared_paths(root, command, cwd=None, stack=(), expand=True):
+          for command in commands: declared_paths(root,command,cwd,stack+(key,),entry=package.relative_to(root).as_posix())
+      def declared_paths(root, command, cwd=None, stack=(), expand=True, entry="stop-tests.commands"):
           cwd = root if cwd is None else cwd
           try:
               lexer = shlex.shlex(command,posix=True,punctuation_chars="&|;")
@@ -2690,15 +2707,131 @@ nodes:
               if mode == "snapshot" and expand and name is not None:
                   package_script(root,cwd,name,stack,lifecycle=manager == "npm")
               for token in segment:
+                  if mode == "snapshot" and expand:
+                      absolute = live_absolute_reference(token)
+                      if absolute is not None:
+                          absolute_references.setdefault(str(root),set()).add(absolute_reference_message(entry,absolute))
                   if token.startswith("-"): continue
                   if re.fullmatch(r"(?:ba|z|da|k)?sh|python(?:[0-9.]+)?|node(?:js)?|bunx?|npm|npx|pnpm|yarn|pytest",pathlib.Path(token).name): continue
                   path = pathlib.Path(os.path.abspath(cwd/token))
                   if (path.is_file() or path.is_symlink()) and path.is_relative_to(root):
                       name = path.relative_to(root).as_posix()
-                      if not excluded(name) and not directory_in_tree(root,name):
+                      if not excluded(root,name) and not directory_in_tree(root,name):
                           command_files.setdefault(str(root),set()).add(name)
+                          if expand: entry_cwds.setdefault((str(root),name),set()).add(str(cwd))
       for directory, command in zip(declared[::2],declared[1::2]):
           declared_paths(pathlib.Path(directory).resolve(),command)
+      def named_helpers(root,body,cwd,name,entry):
+          found = set()
+          parent = (root/name).resolve().parent
+          def blocked(reason):
+              if trusted_boundary(root,name):
+                  raise ValueError("test guard: cannot resolve trusted helper: "+entry+" ("+name+": "+reason+")")
+          def resolve(token,base,required=False,module=False):
+              if any(c in token for c in "$`{}*?[]"):
+                  if required: blocked("dynamic script reference")
+                  return
+              absolute = live_absolute_reference(token)
+              if absolute is not None and trusted_boundary(root,name):
+                  raise ValueError(absolute_reference_message(name,absolute))
+              candidates = [base/token]
+              if not module and base == cwd and parent != base: candidates.append(parent/token)
+              if module:
+                  extensions = [".py"] if module == "python" else [".js",".cjs",".mjs",".ts"]
+                  leaves = ["__init__.py"] if module == "python" else ["index.js","index.ts"]
+                  candidates += [base/(token+ext) for ext in extensions]
+                  candidates += [base/token/leaf for leaf in leaves]
+              resolved = False
+              for path in candidates:
+                  path = pathlib.Path(os.path.abspath(path))
+                  if excluded(root,path):
+                      resolved = True
+                      continue
+                  if not path.is_relative_to(root): continue
+                  relative = path.relative_to(root).as_posix()
+                  if path.is_file():
+                      if not path.resolve().is_relative_to(root):
+                          blocked("script outside worktree")
+                          continue
+                      found.add((relative,str(cwd)))
+                      resolved = True
+                      if module == "python":
+                          package = path.parent
+                          while package.is_relative_to(root) and package != root:
+                              init = package/"__init__.py"
+                              if init.is_file(): found.add((init.relative_to(root).as_posix(),str(cwd)))
+                              package = package.parent
+              if required and not resolved: blocked("missing script: "+token)
+          # Imports resolve against the importing file, unlike shell commands.
+          for match in re.finditer(r"\b(?:require|import)\s*\(([^)\n]*)\)",body):
+              literal = re.fullmatch(r"\s*(['\"])([^'\"]+)\1\s*",match[1])
+              if not literal:
+                  blocked("computed import")
+                  continue
+              if literal[2].startswith(".") or live_absolute_reference(literal[2]) is not None: resolve(literal[2],parent,True,True)
+          body = re.sub(r"\b(?:require|import)\s*\([^\n)]*\)","",body)
+          for match in re.finditer(r"\b(?:from\s*|import\s*)(['\"])([^'\"]+)\1",body):
+              if match[2].startswith(".") or live_absolute_reference(match[2]) is not None: resolve(match[2],parent,True,True)
+          if pathlib.Path(name).suffix == ".py":
+              for match in re.finditer(r"^\s*(?:from\s+([.\w]+)\s+import\s+([^\n]+)|import\s+([^\n]+))",body,re.M):
+                  modules = [match[1]] if match[1] else [part.strip().split()[0] for part in match[3].split(",") if part.strip()]
+                  for module in modules:
+                      dots = len(module)-len(module.lstrip("."))
+                      base = parent
+                      for _ in range(max(0,dots-1)): base = base.parent
+                      token = module.lstrip(".").replace(".","/")
+                      resolve(token,base,module="python")
+                      if match[1]:
+                          for part in match[2].split(","):
+                              child = part.strip().split()[0]
+                              if child.isidentifier(): resolve((token+"/" if token else "")+child,base,module="python")
+          # Follow literal command/source positions, not data arguments such as
+          # `grep good a.js`. Product inputs must retain their repaired bytes.
+          lexer = shlex.shlex(body,posix=True,punctuation_chars="&|;()\n")
+          lexer.whitespace = " \t\r"
+          lexer.whitespace_split = True
+          lexer.commenters = "#"
+          try: tokens = list(lexer)
+          except ValueError:
+              if re.search(r"(?:^|[;\n])\s*(?:source|\.|bash|sh|node|bun|python)\s",body): blocked("unparseable script reference")
+              return found
+          segments, segment = [], []
+          for token in tokens+["\n"]:
+              if token and all(c in "&|;()\n" for c in token):
+                  segments.append(segment); segment = []
+              else: segment.append(token)
+          for segment in segments:
+              while segment and (segment[0] in {"if","then","else","elif","do","!","exec","command","env"} or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=",segment[0])):
+                  segment = segment[1:]
+              if not segment: continue
+              if segment[0] == "cd" and len(segment) == 2:
+                  cwd = pathlib.Path(os.path.abspath(cwd/segment[1]))
+                  if not cwd.is_relative_to(root): return found
+                  continue
+              head = segment[0] if segment[0] == "." else pathlib.Path(segment[0]).name
+              runner = head in {".","source"} or re.fullmatch(r"(?:ba|z|da|k)?sh|python(?:[0-9.]+)?|node(?:js)?|bun",head)
+              if runner:
+                  args = segment[1:]
+                  # Inline programs are not filenames. Inspect their references too.
+                  if args and args[0] in {"-c","-e","--eval","-m"}:
+                      if len(args) < 2:
+                          blocked("missing inline program")
+                          continue
+                      if args[0] == "-m": resolve(args[1].replace(".","/"),cwd,module="python")
+                      else: found.update(named_helpers(root,args[1],cwd,name,entry))
+                      continue
+                  args = [token for token in args if not token.startswith("-")]
+                  if head == "bun" and args[:1] == ["run"]: args = args[1:]
+                  if args: resolve(args[0],cwd,True)
+              else:
+                  token = segment[0]
+                  resolve(token,cwd,token.startswith(("./","../")))
+                  # Literal relative tokens can carry helper arguments to a
+                  # custom runner. Ordinary data-reader arguments are not code.
+                  if head not in {"grep","cat","echo","printf","test","[","read","sed","awk"}:
+                      for token in segment[1:]:
+                          if not token.startswith("-"): resolve(token.rstrip(","),cwd)
+          return found
       def git_paths(root,*args):
           return {os.fsdecode(name) for name in subprocess.check_output(["git",*args],cwd=root).split(b"\x00") if name}
       def test_file(name):
@@ -2716,7 +2849,7 @@ nodes:
                           pass
                       break
               allowed = changed if allowed is None else allowed & changed
-          return {name for name in allowed or set() if not excluded(name) and not directory_in_tree(root,name) and not infrastructure(root,name)}
+          return {name for name in allowed or set() if not excluded(root,name) and not directory_in_tree(root,name) and not infrastructure(root,name)}
       def content(path):
           # Hash symlink bytes without following targets outside the worktree.
           if path.is_symlink(): return os.fsencode(os.readlink(path))
@@ -2728,7 +2861,7 @@ nodes:
           # Git's index preserves executable mode on hosts without POSIX chmod.
           return path.is_file() and (path.relative_to(root).as_posix() in executable_index or bool(path.stat().st_mode & 0o111))
       def infrastructure(root,name):
-          if excluded(name) or directory_in_tree(root,name): return False
+          if excluded(root,name) or directory_in_tree(root,name): return False
           parts = pathlib.PurePosixPath(name).parts
           patterns = ["package.json","bun.lock","bun.lockb","package-lock.json","pnpm-lock.yaml","yarn.lock","bunfig.toml","jest.config.*","vitest.config.*","vitest.workspace.*","playwright.config.*","pytest.ini","conftest.py","pyproject.toml","setup.cfg","tox.ini","Makefile","tsconfig*",".github"]
           return (test_file(name) or any(fnmatch.fnmatchcase(part,pattern) for part in parts for pattern in patterns)
@@ -2737,6 +2870,11 @@ nodes:
                   or any(part in {"scripts","test","tests","__tests__","spec","specs",".circleci",".buildkite"} for part in parts)
                   or any(fnmatch.fnmatchcase(parts[-1],pattern) for pattern in [".gitlab-ci.*",".travis.yml","Jenkinsfile","azure-pipelines.*",".mocharc*",".nycrc*",".taprc*",".coveragerc","karma.conf.*","cypress.config.*","ava.config.*","test.config.*","runner.config.*","phpunit.xml*"])
                   or executable(root/name))
+      def trusted_boundary(root,name):
+          path = pathlib.PurePosixPath(name)
+          return (infrastructure(root,name)
+                  or any(part in {"test","tests","spec","specs","fixtures","__tests__","mocks"} for part in path.parts)
+                  or any(marker in path.name.lower() for marker in {"test","spec","fixture","mock","helper","setup","conftest"}))
       def fingerprint(path):
           return [digest(path),executable(path)] if path.exists() or path.is_symlink() else None
       now = {}
@@ -2748,9 +2886,9 @@ nodes:
           if not root.is_dir(): sys.exit("test guard: missing stage directory: "+directory)
           index = git_paths(root,"ls-files","--stage","-z")
           tracked = {entry.split("\t",1)[1] for entry in index}
-          tracked = {name for name in tracked if not excluded(name) and not directory_in_tree(root,name)}
+          tracked = {name for name in tracked if not excluded(root,name) and not directory_in_tree(root,name)}
           executable_index = {entry.split("\t",1)[1] for entry in index if entry.startswith("100755 ")}
-          files = {name for name in tracked | git_paths(root,"ls-files","-z","--others") | command_files.get(directory,set()) if not excluded(name) and not directory_in_tree(root,name)}
+          files = {name for name in tracked | git_paths(root,"ls-files","-z","--others") | command_files.get(directory,set()) if not excluded(root,name) and not directory_in_tree(root,name)}
           if mode == "snapshot":
               links = {}
               def freeze_link(name):
@@ -2765,7 +2903,7 @@ nodes:
                       print("test guard: unresolved or outside symlink: "+str(path)+": "+str(error),file=sys.stderr)
                       sys.exit(42)
                   target_name = target.relative_to(root).as_posix()
-                  if not excluded(target_name): links[name] = target_name
+                  if not excluded(root,target_name): links[name] = target_name
               build_allowed = allowed_paths(root,roots[directory])
               fixed_paths = tracked - build_allowed
               for name in files:
@@ -2788,6 +2926,50 @@ nodes:
               allowed = build_allowed - declared_set - targets
               frozen = (tracked - allowed) | {name for name in files if infrastructure(root,name)} | declared_set | targets
               now[directory] = dict(allowed=sorted(allowed),known=sorted(files),links=links,frozen={name:digest(root/name) for name in sorted(frozen)},infrastructure={name:fingerprint(root/name) for name in sorted(files | targets) if infrastructure(root,name)})
+              # Walk through product imports, but save only the named test-support
+              # boundary. Keep the guard's frozen set and product allowlist intact.
+              try:
+                  if absolute_references.get(directory):
+                      raise ValueError(sorted(absolute_references[directory])[0])
+                  trusted = {name for name in files | targets if infrastructure(root,name)} | declared_set
+                  pending = collections.deque((name,cwd,0,name) for name in sorted(trusted) for cwd in entry_cwds.get((directory,name),{directory}))
+                  visited = set()
+                  while pending:
+                      name, cwd, depth, entry = pending.popleft()
+                      if (name,cwd) in visited: continue
+                      if depth > 8:
+                          raise ValueError("test guard: cannot resolve trusted helper: "+entry+" (depth limit 8: "+name+")")
+                      visited.add((name,cwd))
+                      if trusted_boundary(root,name): trusted.add(name)
+                      if pathlib.PurePosixPath(name).name == "package.json": continue
+                      try: body = (root/name).read_text()
+                      except (OSError,UnicodeError): continue
+                      if "\x00" in body: continue
+                      for helper, helper_cwd in sorted(named_helpers(root,body,pathlib.Path(cwd),name,entry)):
+                          pending.append((helper,helper_cwd,depth+1,entry))
+                  for name in list(trusted):
+                      path = root/name
+                      if path.is_symlink() or path.resolve() != path:
+                          target = path.resolve(strict=True)
+                          if not target.is_relative_to(root) or not target.is_file():
+                              raise ValueError("test guard: trusted file outside worktree: "+str(path))
+                          target_name = target.relative_to(root).as_posix()
+                          if trusted_boundary(root,target_name): trusted.add(target_name)
+                  store = pathlib.Path(snapshot).parent/"trusted-infra"/hashlib.sha256(os.fsencode(directory)).hexdigest()
+                  saved = {}
+                  for name in sorted(trusted):
+                      path = root/name
+                      raw = content(path)
+                      if raw is None: continue
+                      dest = store/name
+                      dest.parent.mkdir(parents=True,exist_ok=True)
+                      dest.write_bytes(raw)
+                      saved[name] = dict(sha=hashlib.sha256(raw).hexdigest(),executable=executable(path),link=os.readlink(path) if path.is_symlink() else None)
+                  now[directory]["trusted"] = saved
+              except (OSError,ValueError,RuntimeError) as error:
+                  # Keep the frozen snapshot usable when trusted capture fails.
+                  now[directory]["trusted_error"] = str(error)
+                  violations.append(str(error))
               continue
           if directory not in before: sys.exit("test guard: unsnapshotted stage directory: "+directory)
           saved = before[directory]
@@ -2823,15 +3005,124 @@ nodes:
       trg_snapshot() { trg_guard snapshot "$1" "$2"; }
       trg_check() { trg_guard check "$1" "$2"; }
       trg_infrastructure() { trg_guard report "$1" "$2"; }
-      # Snapshot failures block repair before the classifier can admit an attempt.
+      # Run only final verification in disposable copies. Git metadata is private;
+      # object alternates are read-only inputs, and dependencies are copied too.
+      trg_execute_trusted() (
+        local e="$1" class="$2" scratch sid repo command target dir prepared
+        local -a stages=()
+        e="$(cd "$e" && pwd)" || return 1
+        scratch="$(mktemp -d)" || return 1
+        trap 'rm -rf "$scratch"' EXIT
+        if [ -s "$e/stop-tests.stages" ]; then
+          while IFS=$'\t' read -r sid repo command target; do
+            dir="$(rst_stage_dir "$sid" "$repo")"
+            stages+=("$sid" "$dir")
+          done < "$e/stop-tests.stages"
+        fi
+        python3 - "$e/test-guard.json" "$scratch" "$(pwd)" "${ARTIFACTS_DIR:-}" "${stages[@]}" <<'TRUSTED_PY'
+      import hashlib, json, os, pathlib, shutil, subprocess, sys
+      snapshot, scratch, current, artifacts = map(pathlib.Path,sys.argv[1:5])
+      scratch, current = scratch.resolve(), current.resolve()
+      saved = json.loads(snapshot.read_text())
+      copies = {}
+      def remove(path):
+          if path.is_symlink() or path.is_file(): path.unlink()
+          elif path.exists(): shutil.rmtree(path)
+      def ignore(directory,names):
+          return [name for name in names if name == ".git" or (artifacts and (pathlib.Path(directory)/name).resolve() == artifacts.resolve())]
+      try:
+          for directory, state in saved.items():
+              root = pathlib.Path(directory)
+              key = hashlib.sha256(os.fsencode(directory)).hexdigest()
+              dest = scratch/key
+              if "trusted_error" in state: sys.exit(state["trusted_error"])
+              trusted = state["trusted"]
+              store = snapshot.parent/"trusted-infra"/key
+              # Verify all trusted bytes before allowing any command to execute.
+              for name, entry in trusted.items():
+                  path = pathlib.PurePosixPath(name)
+                  if path.is_absolute() or ".." in path.parts: raise ValueError("unsafe trusted path")
+                  if hashlib.sha256((store/name).read_bytes()).hexdigest() != entry["sha"]:
+                      raise ValueError("damaged trusted file: "+name)
+              subprocess.run(["git","clone","--shared","--no-checkout","--quiet",str(root),str(dest)],check=True)
+              # Clone metadata is private. Preserve the live tracked set (also
+              # for linked/split indexes), without refreshing the source index.
+              def git_path(base,name):
+                  value = subprocess.check_output(["git","rev-parse","--git-path",name],cwd=base,text=True).strip()
+                  return base/value
+              source_index = git_path(root,"index")
+              if source_index.is_file():
+                  shutil.copy2(source_index,git_path(dest,"index"))
+                  shared = subprocess.check_output(["git","rev-parse","--shared-index-path"],cwd=root,text=True).strip()
+                  if shared:
+                      shutil.copy2(root/shared,git_path(dest,pathlib.Path(shared).name))
+                  tree = subprocess.check_output(["git","write-tree"],cwd=dest,text=True).strip()
+                  # Staged repairs belong to working-file verification, not a
+                  # phantom cached diff. Anchor only the private HEAD to its index.
+                  head_tree = subprocess.run(["git","rev-parse","HEAD^{tree}"],cwd=dest,text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+                  if head_tree.returncode or head_tree.stdout.strip() != tree:
+                      parents = [] if head_tree.returncode else ["-p","HEAD"]
+                      commit = subprocess.check_output(["git","commit-tree",tree,*parents,"-m","Trusted verification index"],cwd=dest,text=True,env={**os.environ,"GIT_AUTHOR_NAME":os.environ.get("CAULDRON_GIT_AUTHOR_NAME","Thinman Cauldron"),"GIT_AUTHOR_EMAIL":os.environ.get("CAULDRON_GIT_AUTHOR_EMAIL","admin@bluedevilcollectibles.com"),"GIT_COMMITTER_NAME":os.environ.get("CAULDRON_GIT_AUTHOR_NAME","Thinman Cauldron"),"GIT_COMMITTER_EMAIL":os.environ.get("CAULDRON_GIT_AUTHOR_EMAIL","admin@bluedevilcollectibles.com")}).strip()
+                      subprocess.run(["git","update-ref","HEAD",commit],cwd=dest,check=True)
+              origin = subprocess.check_output(["git","remote","get-url","origin"],cwd=root,text=True).strip()
+              subprocess.run(["git","remote","set-url","origin",origin],cwd=dest,check=True)
+              shutil.copytree(root,dest,symlinks=True,dirs_exist_ok=True,ignore=ignore)
+              # Internal links stay internal; materialize external links so a
+              # command cannot write through a copied link into the live checkout.
+              for base, dirs, files in os.walk(dest):
+                  dirs[:] = [name for name in dirs if name != ".git"]
+                  for name in dirs + files:
+                      path = pathlib.Path(base)/name
+                      if not path.is_symlink(): continue
+                      original = root/path.relative_to(dest)
+                      resolved = original.resolve(strict=True)
+                      path.unlink()
+                      if resolved.is_relative_to(root):
+                          path.symlink_to(os.path.relpath(dest/resolved.relative_to(root),path.parent),target_is_directory=resolved.is_dir())
+                      elif resolved.is_dir(): shutil.copytree(resolved,path,symlinks=False,ignore=ignore)
+                      else: shutil.copy2(resolved,path)
+              for name, entry in trusted.items():
+                  path = dest/name
+                  parent = dest
+                  for part in pathlib.PurePosixPath(name).parts[:-1]:
+                      parent = parent/part
+                      if parent.is_symlink() or (parent.exists() and not parent.is_dir()): remove(parent)
+                      parent.mkdir(exist_ok=True)
+                  remove(path)
+                  if entry["link"] is not None:
+                      target = pathlib.Path(os.path.abspath(root/pathlib.Path(name).parent/entry["link"]))
+                      if not target.is_relative_to(root): raise ValueError("external trusted link")
+                      path.symlink_to(os.path.relpath(dest/target.relative_to(root),path.parent))
+                  else:
+                      shutil.copyfile(store/name,path)
+                      path.chmod(0o755 if entry["executable"] else 0o644)
+              copies[str(root.resolve())] = str(dest)
+          (scratch/"current").write_text(copies[str(current)],encoding="utf-8")
+          stages = []
+          for sid, directory in zip(sys.argv[5::2],sys.argv[6::2]):
+              mapped = copies[str(pathlib.Path(directory).resolve())] if directory else ""
+              stages.append(sid+"="+mapped)
+          (scratch/"stages").write_text("\n".join(stages),encoding="utf-8")
+      except (OSError,ValueError,KeyError,RuntimeError,subprocess.CalledProcessError) as error:
+          sys.exit("test guard: cannot prepare trusted final run: "+str(error))
+      TRUSTED_PY
+        prepared=$?
+        if [ "$prepared" -ne 0 ]; then
+          printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=tests_failed_after_repair:trusted_infra\nTESTS_LINE=BLOCKED (trusted infrastructure unavailable)\nTESTS_CLASS=%s\n' "$class"
+          return 0
+        fi
+        export RST_STAGE_WORKTREES="$(cat "$scratch/stages")"
+        cd "$(cat "$scratch/current")" || return 1
+        rst_execute_saved "$e" "$class"
+      )
+      # Explicit snapshot boundaries (42) block before repair, as in round 8.
+      # Trusted-capture failures defer to final evidence after a repair attempt.
       trg_snapshot_report() {
         local previous result
         if trg_snapshot "$1" "$2/test-guard.json"; then return 0; else result=$?; fi
         : > "$2/test-repair.guard"
+        [ "$result" -eq 42 ] || return 0
         previous="$(cat "$2/stop-tests.initial")"
-        # A known boundary violation (42) takes precedence. An unavailable guard
-        # tool must not replace an already non-repairable environment reason.
-        if [ "$result" -ne 42 ] && printf '%s\n' "$previous" | grep -E '^TESTS_STATUS=(blocked|env_unavailable)$' >/dev/null; then return 0; fi
         {
           printf '%s\n' "$previous" | grep -vE '^TESTS_(STATUS|BLOCKED_REASON|LINE)=' || true
           printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=tests_failed_after_repair:guard\nTESTS_LINE=BLOCKED (tests_failed_after_repair:guard)\n'
@@ -3078,7 +3369,7 @@ nodes:
         hooks), executable files, package.json, lockfiles, runner configs,
         Makefile, tsconfig* and .github paths.
         Resolved in-worktree symlink targets of test entrypoints are frozen too.
-        Product source executed as infrastructure is the accepted residual.
+        Final verification restores named infrastructure helpers from the snapshot.
         Any repair-touched infrastructure blocks and is listed for a human.
         Never add test files or skip/only/todo markers. Never emit
         __NEVER_EMIT_USE_UNTIL_BASH__. The deterministic rerun and allowlist guard
@@ -3120,7 +3411,7 @@ nodes:
       fi
       . "$EVIDENCE_DIR/stop-tests.core.sh"
       export RST_TIMEOUT_SECONDS="$(cat "$EVIDENCE_DIR/stop-tests.timeout")"
-      rst_execute_saved "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")" > "$EVIDENCE_DIR/stop-tests.final-raw"
+      trg_execute_trusted "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")" > "$EVIDENCE_DIR/stop-tests.final-raw"
       INFRA_FAILURE=0
       trg_infrastructure "$(pwd)" "$EVIDENCE_DIR/test-guard.json" > "$EVIDENCE_DIR/test-repair.infrastructure" || INFRA_FAILURE=1
       RESULT=repaired
@@ -3137,7 +3428,7 @@ nodes:
           grep -vE '^TESTS_(STATUS|BLOCKED_REASON)=' "$EVIDENCE_DIR/stop-tests.final-raw"
           printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=%s\n' "$REASON"
         else cat "$EVIDENCE_DIR/stop-tests.final-raw"; fi
-        printf 'TESTS_REPAIR_ATTEMPTS=%s\nTESTS_REPAIR_RESULT=%s\n' "$ATTEMPTS" "$RESULT"
+        printf 'TESTS_FINAL_INFRA=trusted\nTESTS_REPAIR_ATTEMPTS=%s\nTESTS_REPAIR_RESULT=%s\n' "$ATTEMPTS" "$RESULT"
         cat "$EVIDENCE_DIR/test-repair.infrastructure"
       } | tee "$EVIDENCE_DIR/stop-tests.final"
 
@@ -6238,10 +6529,11 @@ nodes:
       #   audit line is inserted after VALIDATION: (a non-label line there is outside
       #   every bdc-ci section; OUTCOME: already lives there).
       sme_process() {
-        local tests_line="$1" tests_status="$2" grep_line="$3" grep_status="$4" grep_dropped="${5:-0}" tests_reason="${6:-}" manifest verdict stop_detail=""
+        local tests_line="$1" tests_status="$2" grep_line="$3" grep_status="$4" grep_dropped="${5:-0}" tests_reason="${6:-}" final_infra="${7:-}" manifest verdict stop_detail=""
         manifest="$(cat)"
         if ! printf '%s\n' "$manifest" | grep -qE '^Tests:'; then
           printf '%s\n' "$manifest"
+          [ "$final_infra" != trusted ] || printf 'TESTS_FINAL_INFRA=trusted\n'
           return 0
         fi
         [ -n "$tests_line" ] || tests_line="N/A (evidence node run-stop-tests did not run)"
@@ -6267,6 +6559,7 @@ nodes:
           { print }
           END { if (!gs) print ENVIRON["G_LINE"]; if (!vs) print ENVIRON["S_LINE"] }
         '
+        [ "$final_infra" != trusted ] || printf 'TESTS_FINAL_INFRA=trusted\n'
       }
       # ---- END sme core ----
 
@@ -6310,7 +6603,8 @@ nodes:
       printf '%s\n' "$MANIFEST_OUT" | sme_process \
         "$(sme_field TESTS_LINE "$TESTS_OUT")" "$(sme_field TESTS_STATUS "$TESTS_OUT")" \
         "$(sme_field GREP_LINE "$GREPS_OUT")" "$(sme_field GREP_STATUS "$GREPS_OUT")" \
-        "$(sme_field GREP_DROPPED "$GREPS_OUT")" | stb_stamp_base_red
+        "$(sme_field GREP_DROPPED "$GREPS_OUT")" "$(sme_field TESTS_BLOCKED_REASON "$TESTS_OUT")" \
+        "$(sme_field TESTS_FINAL_INFRA "$TESTS_OUT")" | stb_stamp_base_red
 
   # bdc-xo #1940. manifest-evidence-check fails CLOSED (exit 1, no PR-body patch) when
   # a CODE or MIXED WO would publish "Tests: N/A ..." (Rule 10 / manifest v2 require

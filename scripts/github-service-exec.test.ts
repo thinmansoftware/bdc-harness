@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import {
+  consumeGitHubTrace,
   githubCommandReadsStdin,
   runGitHubServiceCommand as runCommand,
 } from './github-service-exec';
@@ -559,5 +560,28 @@ describe('operation-scoped GitHub CLI authentication', () => {
     expect(mints).toBe(1);
     // The App 403 surfaces as a failure rather than a reviewer-authored success.
     expect(result.exitCode).toBe(1);
+  });
+});
+
+describe('gh trace endpoint (bdc-xo#5449)', () => {
+  test('carries the request line of each traced call as the observation endpoint (Test 5)', () => {
+    const raw = [
+      '* Request at 2026-11-11 13:00:00.000 +0000 UTC',
+      '* Request to https://api.github.com/repos/o/r/pulls',
+      '> GET /repos/o/r/pulls HTTP/1.1',
+      '> Host: api.github.com',
+      '< HTTP/2.0 200 OK',
+      '< x-ratelimit-resource: core',
+      '* Request took 120ms',
+      '* Request at 2026-11-11 13:00:01.000 +0000 UTC',
+      '> GET /repos/o/r/pulls/12/reviews?per_page=100 HTTP/1.1',
+      '< HTTP/2.0 200 OK',
+      '* Request took 90ms',
+    ].join('\n');
+    const trace = consumeGitHubTrace(raw, 'overseer', 'app', false);
+    expect(trace.observations.map(o => o.endpoint)).toEqual([
+      'GET /repos/{o}/{r}/pulls',
+      'GET /repos/{o}/{r}/pulls/:n/reviews',
+    ]);
   });
 });
