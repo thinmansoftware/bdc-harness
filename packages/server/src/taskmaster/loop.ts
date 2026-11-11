@@ -65,7 +65,12 @@ import {
   resolveEscalateToIssueEnabled,
   type EscalationDeliveryDeps,
 } from './escalation-delivery';
-import { checkFireEligibility, type FireEligibilityResult } from './fire-eligibility';
+import {
+  checkFireEligibility,
+  type FireEligibilityDeps,
+  type FireEligibilityResult,
+  type PullListingMemo,
+} from './fire-eligibility';
 import { currentHeadroom, type HeadroomReading } from './ledger';
 import { decideFireLane } from './lane-budget';
 import { refreshLaneHealth } from './lane-health';
@@ -304,7 +309,10 @@ export interface TaskmasterDeps {
     prNumber: number,
     rejectedHeadSha: string
   ) => Promise<PullRequestState | null>;
-  checkFireEligibility?: (issueTitle: string) => Promise<FireEligibilityResult>;
+  checkFireEligibility?: (
+    issueTitle: string,
+    eligibilityDeps?: FireEligibilityDeps
+  ) => Promise<FireEligibilityResult>;
   runCascade?: typeof runCascade;
   readFireCascadeEvidence?: typeof readCascadeWorkflowEvidence;
   getFireRunEvidence?: (
@@ -2080,7 +2088,11 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   const assessRecipient = deps.assessDispatchRecipient ?? assessDispatchRecipient;
   const getIssueEvidence = deps.getGithubIssueEvidence ?? defaultGetGithubIssueEvidence;
   const getPullRequestState = deps.getPullRequestState ?? defaultGetPullRequestState;
-  const eligibilityCheck = deps.checkFireEligibility ?? checkFireEligibility;
+  // One all-state pull request listing per repository per tick: every eligibility check of this tick
+  // shares it, and it is dropped when the tick ends (WO-HARNESS-TASKMASTER-ELIGIBILITY-LISTING-SHARE-01).
+  const listingMemo: PullListingMemo = new Map();
+  const eligibilityCheck = (issueTitle: string): Promise<FireEligibilityResult> =>
+    (deps.checkFireEligibility ?? checkFireEligibility)(issueTitle, { listingMemo });
   const executeCascade = deps.runCascade ?? runCascade;
   const readFireEvidence = deps.readFireCascadeEvidence ?? readCascadeWorkflowEvidence;
   const getFireRunEvidence = deps.getFireRunEvidence ?? defaultGetFireRunEvidence;

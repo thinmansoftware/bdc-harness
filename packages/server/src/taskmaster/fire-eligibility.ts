@@ -35,6 +35,11 @@ export interface FireEligibilityDeps {
   codebases?: () => Promise<readonly { name: string; repository_url: string | null }[]>;
   /** Overrides GITHUB_TOKEN/GH_TOKEN resolution; canonical reads are never anonymous. */
   githubToken?: string;
+  /**
+   * Per-tick memo of all-state pull request listings (one traversal per repository per tick). Omit
+   * it and every check reads the listing itself, as before. Never keep one across ticks.
+   */
+  listingMemo?: PullListingMemo;
 }
 
 const WO_ID_RE = /\b(WO-[A-Z][A-Z0-9-]*-\d+)\b/;
@@ -61,6 +66,107 @@ export function normalizeRepo(value: string): string {
     .replace(/\.git$/i, '')
     .replace(/^\/+|\/+$/g, '')
     .toLowerCase();
+}
+
+/** One pull request of a repository's all-state listing, validated. */
+export interface PullListingRow {
+  number: number;
+  title: string;
+  body: string | null;
+  state: 'open' | 'closed';
+  merged_at: string | null;
+}
+
+/**
+ * Per-tick memo of complete, validated all-state pull request listings, keyed by normalized
+ * repository. A rejected listing is removed so the next check retries; nothing is kept across
+ * ticks (the caller creates a new Map per tick).
+ */
+export type PullListingMemo = Map<string, Promise<readonly PullListingRow[]>>;
+
+function readSharedPullListing(
+  memo: PullListingMemo | undefined,
+  repoKey: string,
+  load: () => Promise<readonly PullListingRow[]>
+): Promise<readonly PullListingRow[]> {
+  if (!memo) return load();
+  const hit = memo.get(repoKey);
+  if (hit) return hit;
+  const pending = load().catch((error: unknown) => {
+    if (memo.get(repoKey) === pending) memo.delete(repoKey);
+    throw error;
+  });
+  memo.set(repoKey, pending);
+  return pending;
+}
+
+async function fetchPullListing(input: {
+  targetRepo: string;
+  fetchImpl: typeof fetch;
+  token: string;
+  identity: ReturnType<typeof resolveServiceGitHubAuth>;
+  githubToken?: string;
+}): Promise<readonly PullListingRow[]> {
+  const { targetRepo, fetchImpl, token, identity } = input;
+  // Complete all-state history is required before asserting that a WO has no open or merged PR.
+  // Search has an independent, scarce resource budget.
+  const identities = new Map<number, string>();
+  const rowsOut: PullListingRow[] = [];
+  let complete = false;
+  const maxPages = 100;
+  for (let page = 1; page <= maxPages; page++) {
+    const url = `https://api.github.com/repos/${targetRepo}/pulls?state=all&per_page=100&sort=created&direction=asc&page=${page}`;
+    const response = input.githubToken
+      ? await fetchImpl(url, { headers: headers(token) })
+      : await serviceGitHubFetchWithPermissionFallback({
+          service: 'taskmaster',
+          fetch: fetchImpl,
+          resource: 'core',
+          identity,
+          url,
+        });
+    assertRateLimit(response);
+    if (!response.ok) throw new Error(`taskmaster_fire_pr_listing_failed:${response.status}`);
+    const rows: unknown = await response.json();
+    if (!Array.isArray(rows) || rows.length > 100)
+      throw new Error('taskmaster_fire_pr_listing_invalid_page');
+    for (const value of rows) {
+      if (!value || typeof value !== 'object')
+        throw new Error('taskmaster_fire_pr_listing_invalid_row');
+      const pr = value as Record<string, unknown>;
+      if (
+        !Number.isSafeInteger(pr.number) ||
+        (pr.number as number) <= 0 ||
+        typeof pr.title !== 'string' ||
+        !(pr.body === null || typeof pr.body === 'string') ||
+        !['open', 'closed'].includes(pr.state as string) ||
+        !(
+          pr.merged_at === null ||
+          (typeof pr.merged_at === 'string' && Number.isFinite(Date.parse(pr.merged_at)))
+        ) ||
+        (pr.state === 'open' && pr.merged_at !== null)
+      )
+        throw new Error('taskmaster_fire_pr_listing_invalid_row');
+      const identityKey = JSON.stringify([pr.title, pr.body, pr.state, pr.merged_at]);
+      const number = pr.number as number;
+      if (identities.has(number) && identities.get(number) !== identityKey)
+        throw new Error('taskmaster_fire_pr_listing_conflicting_duplicate');
+      identities.set(number, identityKey);
+      rowsOut.push({
+        number,
+        title: pr.title,
+        body: pr.body,
+        state: pr.state as 'open' | 'closed',
+        merged_at: pr.merged_at,
+      });
+    }
+    if (rows.length < 100) {
+      complete = true;
+      break;
+    }
+  }
+  if (!complete) throw new Error('taskmaster_fire_pr_listing_incomplete');
+  return rowsOut;
 }
 
 export async function checkFireEligibility(
@@ -142,60 +248,20 @@ export async function checkFireEligibility(
   // no open or merged PR. Search has an independent, scarce resource budget.
   const escaped = woId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const exactWo = new RegExp(`(?:^|[^A-Za-z0-9-])${escaped}(?:[^A-Za-z0-9-]|$)`);
-  const identities = new Map<number, string>();
+  // The all-state listing is the same for every work order of one repository: one tick reads it
+  // once and every check in that tick reuses it (WO-HARNESS-TASKMASTER-ELIGIBILITY-LISTING-SHARE-01).
+  const listing = await readSharedPullListing(deps.listingMemo, normalizeRepo(targetRepo), () =>
+    fetchPullListing({ targetRepo, fetchImpl, token, identity, githubToken: deps.githubToken })
+  );
   const matching: number[] = [];
-  let complete = false;
-  const maxPages = 100;
-  for (let page = 1; page <= maxPages; page++) {
-    const url = `https://api.github.com/repos/${targetRepo}/pulls?state=all&per_page=100&sort=created&direction=asc&page=${page}`;
-    const response = deps.githubToken
-      ? await fetchImpl(url, { headers: headers(token) })
-      : await serviceGitHubFetchWithPermissionFallback({
-          service: 'taskmaster',
-          fetch: fetchImpl,
-          resource: 'core',
-          identity,
-          url,
-        });
-    assertRateLimit(response);
-    if (!response.ok) throw new Error(`taskmaster_fire_pr_listing_failed:${response.status}`);
-    const rows: unknown = await response.json();
-    if (!Array.isArray(rows) || rows.length > 100)
-      throw new Error('taskmaster_fire_pr_listing_invalid_page');
-    for (const value of rows) {
-      if (!value || typeof value !== 'object')
-        throw new Error('taskmaster_fire_pr_listing_invalid_row');
-      const pr = value as Record<string, unknown>;
-      if (
-        !Number.isSafeInteger(pr.number) ||
-        (pr.number as number) <= 0 ||
-        typeof pr.title !== 'string' ||
-        !(pr.body === null || typeof pr.body === 'string') ||
-        !['open', 'closed'].includes(pr.state as string) ||
-        !(
-          pr.merged_at === null ||
-          (typeof pr.merged_at === 'string' && Number.isFinite(Date.parse(pr.merged_at)))
-        ) ||
-        (pr.state === 'open' && pr.merged_at !== null)
-      )
-        throw new Error('taskmaster_fire_pr_listing_invalid_row');
-      const identity = JSON.stringify([pr.title, pr.body, pr.state, pr.merged_at]);
-      const number = pr.number as number;
-      if (identities.has(number) && identities.get(number) !== identity)
-        throw new Error('taskmaster_fire_pr_listing_conflicting_duplicate');
-      identities.set(number, identity);
-      if (
-        exactWo.test(`${pr.title}\n${pr.body ?? ''}`) &&
-        (pr.state === 'open' || pr.merged_at !== null)
-      )
-        matching.push(number);
-    }
-    if (rows.length < 100) {
-      complete = true;
-      break;
-    }
+  for (const pr of listing) {
+    if (
+      exactWo.test(`${pr.title}
+${pr.body ?? ''}`) &&
+      (pr.state === 'open' || pr.merged_at !== null)
+    )
+      matching.push(pr.number);
   }
-  if (!complete) throw new Error('taskmaster_fire_pr_listing_incomplete');
   // A WO whose target repo is bdc-xo has its own spec PR (author-wo.sh: "WO: <id>",
   // only docs/work-orders/<id>.md) in that same repo; it is not the build PR
   // (bdc-xo#4311). Exact paths for this exact WO id; an unreadable or empty file
