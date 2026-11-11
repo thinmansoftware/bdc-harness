@@ -4,6 +4,7 @@ export const COVERED_PRODUCTION_BASES: Readonly<Record<string, readonly string[]
   'thinmansoftware/shopops': ['master'],
   'thinmansoftware/lspro-react': ['main', 'release/ce'],
   'thinmansoftware/bdc-harness': ['main'],
+  'thinmansoftware/bdc-shopify-app': ['main'],
 });
 export interface PromotionInput {
   repository: string;
