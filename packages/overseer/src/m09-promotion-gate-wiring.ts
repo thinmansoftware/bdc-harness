@@ -184,7 +184,9 @@ export function createPromotionGate(
           ...(existing ? { check_run_id: existing } : { name: NAME, head_sha: head }),
           external_id: head,
           status,
-          ...(result ? { conclusion: result.conclusion } : { conclusion: null }),
+          // GitHub rejects `conclusion: null` (HTTP 422, "nil is not a string"); an in-progress
+          // publish must omit the key entirely (WO-HARNESS-M09-GATE-POSTS-NO-CHECK-01, bdc-xo#5533).
+          ...(result ? { conclusion: result.conclusion } : {}),
           output: {
             title: result
               ? `M-09 ${result.conclusion}: ${result.rules.map((r, i) => `${i + 1} ${r.pass ? 'PASS' : 'FAIL'}`).join(', ')}`.slice(

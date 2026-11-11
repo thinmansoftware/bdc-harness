@@ -39,6 +39,10 @@ export const DEFAULT_MERGE_REPO_POLICY: MergeRepoPolicy = Object.freeze({
   'thinmansoftware/bdc-xo': Object.freeze({
     main: Object.freeze({ unattended: true, docsOnly: 'merge' }),
   }),
+  // Merging main deploys the Vercel production project shopops-pull-list (bdc-xo#5469).
+  'thinmansoftware/bdc-shopify-app': Object.freeze({
+    main: Object.freeze({ unattended: false, docsOnly: 'skip' }),
+  }),
 });
 
 export interface MergeRepoPolicyOptions {

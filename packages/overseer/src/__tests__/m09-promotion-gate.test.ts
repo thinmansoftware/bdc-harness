@@ -75,6 +75,19 @@ function fake() {
   const request = async (route: string, data: any) => {
     calls.push({ route, data });
     if (route.startsWith('POST') || route.startsWith('PATCH')) {
+      // Behave like GitHub: a null or non-string conclusion is HTTP 422, and a completed check run
+      // needs one. The earlier fake accepted null and hid the silent gate (bdc-xo#5533).
+      if (
+        ('conclusion' in data && typeof data.conclusion !== 'string') ||
+        (data.status === 'completed' && typeof data.conclusion !== 'string')
+      )
+        throw Object.assign(
+          Error('Invalid request. For properties/conclusion, nil is not a string.'),
+          {
+            status: 422,
+            response: { status: 422 },
+          }
+        );
       writes.push({ route, data });
       check = {
         id: 1,
@@ -536,4 +549,20 @@ test('shared_head_release_ce_failure_cannot_be_overwritten_by_main_success', asy
   prs[0].body = '';
   await gate({ repository, number: 2, head: sha, base: 'main' });
   expect(f.writes.at(-1)?.data.output.summary).toContain('no promotion block');
+});
+
+test('in_progress publication never sends a null conclusion (bdc-xo#5533)', async () => {
+  const f = fake();
+  await createPromotionGate(f.request, 4574893)({ repository: repo, number: 1 });
+  expect(f.writes.length).toBeGreaterThan(0);
+  for (const w of f.writes) {
+    if (w.data.status === 'in_progress') expect('conclusion' in w.data).toBe(false);
+    else expect(typeof w.data.conclusion).toBe('string');
+  }
+  expect(f.writes[0]?.data.status).toBe('in_progress');
+  expect(f.writes.at(-1)?.data.conclusion).toBe('success');
+});
+
+test('bdc_shopify_app_main_is_a_covered_production_base', () => {
+  expect(COVERED_PRODUCTION_BASES['thinmansoftware/bdc-shopify-app']).toEqual(['main']);
 });

@@ -46,6 +46,15 @@ describe('default merge repo policy -- production bases stay closed', () => {
     });
   });
 
+  test('bdc-shopify-app main is a known production base and is never unattended (Tests 1, 2)', () => {
+    expect(getRepoBasePolicy('thinmansoftware/bdc-shopify-app', 'main', policy)).toEqual({
+      unattended: false,
+      docsOnly: 'skip',
+    });
+    expect(hasRepoPolicyEntry('thinmansoftware/bdc-shopify-app', policy)).toBe(true);
+    expect([...unattendedBasesForRepo('thinmansoftware/bdc-shopify-app', policy)]).toEqual([]);
+  });
+
   test('release/lspro is absent and release/ce is explicitly production', () => {
     expect(
       getRepoBasePolicy('thinmansoftware/lspro-react', 'release/lspro', policy)
