@@ -76,9 +76,10 @@ function toPosix(path: string): string {
  * different branch with an older copy, and overwriting would dirty the worktree (the run-scope
  * gate then fails) and let a later `git add -A` commit the older text (bdc-xo WO
  * WO-HARNESS-WORKTREE-SYNC-NO-TRACKED-OVERWRITE-01). Returns an empty set when `destRoot` is not a
- * git checkout or git cannot list it, so the copy then behaves exactly as before.
+ * git checkout, so the copy then behaves exactly as before; when it IS a git checkout and the
+ * listing fails the result is null and nothing is copied (fail closed).
  */
-async function listTrackedPaths(destRoot: string, relPath: string): Promise<Set<string>> {
+async function listTrackedPaths(destRoot: string, relPath: string): Promise<Set<string> | null> {
   try {
     const { stdout } = await execFileAsync(
       'git',
@@ -86,7 +87,13 @@ async function listTrackedPaths(destRoot: string, relPath: string): Promise<Set<
       { timeout: 15000, maxBuffer: 64 * 1024 * 1024 }
     );
     return new Set(stdout.split('\0').filter(entry => entry.length > 0));
-  } catch {
+  } catch (error) {
+    // A git checkout whose listing failed (timeout, corrupt index, ...): the protection cannot be
+    // proven, so the caller must not copy. A directory that is not a git checkout has nothing tracked.
+    if (await pathExists(join(destRoot, '.git'))) {
+      getLog().error({ destRoot, relPath, err: error }, 'tracked_listing_failed');
+      return null;
+    }
     return new Set();
   }
 }
@@ -223,11 +230,14 @@ export async function copyWorktreeFile(
       return true;
     }
     const tracked = await listTrackedPaths(destRoot, destRelative);
+    if (tracked === null) return false;
 
     if (stats.isDirectory()) {
-      if (!(await pathExists(destPath))) {
-        // Nothing exists at the destination yet: nothing to overwrite and no link to follow, so the
-        // plain recursive copy is safe. Any existing destination is walked entry by entry.
+      if (tracked.size === 0 && !(await pathExists(destPath))) {
+        // Nothing is tracked under the destination and nothing exists there: nothing to overwrite,
+        // restore or follow, so the plain recursive copy is safe. Anything else is walked entry by
+        // entry (an existing destination may hold links; a tracked path that was deleted locally must
+        // not be restored from the canonical branch).
         await cp(sourcePath, destPath, { recursive: true });
       } else {
         skippedTracked = await copyDirectorySkippingTracked(

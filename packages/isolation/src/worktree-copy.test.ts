@@ -3,7 +3,15 @@ import * as fs from 'fs/promises';
 import type { Stats } from 'fs';
 import { join } from 'path';
 import { execFileSync } from 'child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { dirname } from 'path';
 
@@ -515,6 +523,29 @@ describe('worktree-copy never overwrites a tracked path (WO-HARNESS-WORKTREE-SYN
     expect(git(worktree, 'status', '--porcelain', '--untracked-files=all')).not.toContain(
       'actual/a.yaml'
     );
+  });
+
+  test('a tracked directory deleted locally is not restored from the canonical branch (Overseer finding 3 on bdc-harness#1565)', async () => {
+    // .archon/workflows/a.yaml is tracked in the worktree (NEW); the local checkout deleted the folder.
+    rmSync(join(worktree, '.archon'), { recursive: true, force: true });
+
+    await copyWorktreeFiles(canonical, worktree, ['.archon']);
+
+    // a tracked file must not reappear with the canonical branch's older text
+    expect(existsSync(join(worktree, '.archon/workflows/a.yaml'))).toBe(false);
+    expect(existsSync(join(worktree, '.archon/workflows/c.yaml'))).toBe(false);
+  });
+
+  test('a git checkout whose tracked listing fails gets no copy at all (fail closed)', async () => {
+    const broken = join(root, 'broken');
+    mkdirSync(broken, { recursive: true });
+    // a .git entry that git cannot read: this is a checkout, but its tracked paths cannot be listed
+    writeFileSync(join(broken, '.git'), 'gitdir: ' + join(root, 'does-not-exist') + '\n');
+
+    const copied = await copyWorktreeFiles(canonical, broken, ['.archon']);
+
+    expect(copied).toEqual([]);
+    expect(existsSync(join(broken, '.archon'))).toBe(false);
   });
 
   test('a destination that is not a git checkout is copied as before', async () => {
