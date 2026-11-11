@@ -339,6 +339,9 @@ COPY scripts/overseer-review-sandbox-smoke.ts scripts/overseer-reviewer-broker.t
 # Live proof tool for the worktree copy rule (WO-HARNESS-WORKTREE-SYNC-NO-TRACKED-OVERWRITE-01, bdc-xo#5527):
 # docker exec archon-app-1 bun run /app/scripts/worktree-copy-proof.ts
 COPY scripts/worktree-copy-proof.ts ./scripts/
+# Operator command: re-enqueue one exact head whose newest review row failed
+# (docs/operations/overseer-re-review.md; WO-HARNESS-OVERSEER-REREVIEW-FAILED-HEAD-COMMAND-01).
+COPY scripts/overseer/re-enqueue-review.ts ./scripts/overseer/
 
 # Shared shell cores SOURCED by the bdc-feature-development lane YAMLs
 # (prep-dependencies / run-stop-tests source /app/scripts/lane/dprep.sh).

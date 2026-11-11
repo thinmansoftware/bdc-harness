@@ -61,6 +61,9 @@ jobs:
       - name: Host cleanup deletion guards
         run: bun test --timeout 30000 ./scripts/host/cleanup-guards.test.ts
 
+      - name: Overseer operator commands
+        run: bun test --timeout 30000 ./scripts/overseer/re-enqueue-review.test.ts
+
       - name: Zero-tier fences and first-10 measurement (Spec Stop 6)
         run: bun run test:zero-tier-fences
 
