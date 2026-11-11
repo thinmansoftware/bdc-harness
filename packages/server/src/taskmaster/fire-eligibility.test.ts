@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { checkFireEligibility } from './fire-eligibility';
+import { checkFireEligibility, type PullListingMemo } from './fire-eligibility';
 const TITLE = 'P1: WO-HARNESS-EXAMPLE-01 needs building';
 const SPEC = 'cauldron_compatible: true\ntarget_repo: thinmansoftware/bdc-harness\n';
 const SHA = 'a'.repeat(40);
@@ -539,4 +539,92 @@ test('default service path meters paginated core reads while Search is exhausted
     }
     removeTempDirWithRetry(home);
   }
+});
+
+describe('fire eligibility shares one PR listing per repository per tick (WO-HARNESS-TASKMASTER-ELIGIBILITY-LISTING-SHARE-01)', () => {
+  const TITLE_A = 'P1: WO-HARNESS-EXAMPLE-01 needs building';
+  const TITLE_B = 'P1: WO-HARNESS-EXAMPLE-02 needs building';
+  function row(number: number, override: Record<string, unknown> = {}) {
+    return {
+      number,
+      title: 'unrelated',
+      body: null,
+      state: 'closed',
+      merged_at: null,
+      ...override,
+    };
+  }
+  /** `serve(page, call)` answers one listing request; `call` counts the requests made so far. */
+  function counting(serve: (page: number, call: number) => Response) {
+    const configured = deps();
+    const original = configured.fetchImpl;
+    const state = { listing: 0 };
+    configured.fetchImpl = async (input, init) => {
+      const url = String(input);
+      if (url.includes('/pulls?')) {
+        state.listing += 1;
+        return serve(Number(new URL(url).searchParams.get('page')), state.listing);
+      }
+      return original(input, init);
+    };
+    return { configured, state };
+  }
+  const threePages = (page: number): Response =>
+    response(
+      Array.from({ length: page === 3 ? 40 : 100 }, (_, i) => row((page - 1) * 100 + i + 1))
+    );
+
+  test('two checks in one tick read a three page history once (Test 1)', async () => {
+    const f = counting(threePages);
+    const memo: PullListingMemo = new Map();
+    const a = await checkFireEligibility(TITLE_A, { ...f.configured, listingMemo: memo });
+    const b = await checkFireEligibility(TITLE_B, { ...f.configured, listingMemo: memo });
+    expect(a.eligible).toBe(true);
+    expect(b.eligible).toBe(true);
+    expect(f.state.listing).toBe(3);
+    // without a memo each check reads the history itself, as before
+    const g = counting(threePages);
+    await checkFireEligibility(TITLE_A, g.configured);
+    await checkFireEligibility(TITLE_B, g.configured);
+    expect(g.state.listing).toBe(6);
+  });
+
+  test('the shared listing does not change either decision (Test 2)', async () => {
+    const f = counting(() => response([row(1, { title: 'WO-HARNESS-EXAMPLE-01', state: 'open' })]));
+    const memo: PullListingMemo = new Map();
+    const a = await checkFireEligibility(TITLE_A, { ...f.configured, listingMemo: memo });
+    const b = await checkFireEligibility(TITLE_B, { ...f.configured, listingMemo: memo });
+    expect(a.reason).toBe('pr_exists');
+    expect(b.eligible).toBe(true);
+    expect(f.state.listing).toBe(1);
+  });
+
+  test('a failed or incomplete listing is not remembered (Test 3)', async () => {
+    const flaky = counting((page, call) =>
+      call === 2
+        ? response({}, 502)
+        : response(Array.from({ length: page === 1 ? 100 : 5 }, (_, i) => row(page * 1000 + i + 1)))
+    );
+    const memo: PullListingMemo = new Map();
+    await expect(
+      checkFireEligibility(TITLE_A, { ...flaky.configured, listingMemo: memo })
+    ).rejects.toThrow('listing_failed');
+    expect(memo.size).toBe(0);
+    const second = await checkFireEligibility(TITLE_A, { ...flaky.configured, listingMemo: memo });
+    expect(second.eligible).toBe(true);
+    // 2 requests in the failed traversal (page 1, then the 502) plus a fresh traversal of 2 pages
+    expect(flaky.state.listing).toBe(4);
+
+    const ceiling = counting(page =>
+      response(Array.from({ length: 100 }, (_, i) => row((page - 1) * 100 + i + 1)))
+    );
+    const memo2: PullListingMemo = new Map();
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await expect(
+        checkFireEligibility(TITLE_A, { ...ceiling.configured, listingMemo: memo2 })
+      ).rejects.toThrow('listing_incomplete');
+    }
+    expect(memo2.size).toBe(0);
+    expect(ceiling.state.listing).toBe(200);
+  });
 });
