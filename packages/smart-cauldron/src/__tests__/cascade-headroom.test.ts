@@ -1,9 +1,10 @@
-import { describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import { createHash } from 'crypto';
 import { mkdtemp, readFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { runCascade, type CascadeDeps } from '../cascade.js';
+import { openClaudeTier } from './claude-tier-open.js';
 import type { SeatUsageSnapshot } from '../headroom.js';
 import type { CascadeRunRecord } from '../types.js';
 
@@ -83,6 +84,15 @@ function claimStubs(): Pick<
 }
 
 describe('cascade headroom', () => {
+  // The live ladder refuses claude; this file tests the admission machinery, so open the tier.
+  let restoreLadder: (() => void) | undefined;
+  beforeEach(() => {
+    restoreLadder = openClaudeTier();
+  });
+  afterEach(() => {
+    restoreLadder?.();
+  });
+
   test('explicit claude entry admits measured headroom and records the decision', async () => {
     const outDir = await mkdtemp(join(tmpdir(), 'cascade-claude-admit-'));
     const workflows: string[] = [];

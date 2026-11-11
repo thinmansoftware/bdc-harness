@@ -11,7 +11,8 @@
  * Test 6: WRAPPER -- cascade does not touch DAG/workflow internals
  */
 
-import { describe, test, expect, afterAll } from 'bun:test';
+import { describe, test, expect, afterAll, afterEach } from 'bun:test';
+import { openClaudeTier } from './claude-tier-open.js';
 import { createHash, randomUUID } from 'crypto';
 import { mkdtemp, readFile, rm } from 'fs/promises';
 import { tmpdir } from 'os';
@@ -2032,6 +2033,12 @@ describe('repair holder teardown (conductor)', () => {
 // ---------------------------------------------------------------------------
 
 describe('Zero-tier fence 3: one climb then stop', () => {
+  let restoreLadder: (() => void) | undefined;
+  afterEach(() => {
+    restoreLadder?.();
+    restoreLadder = undefined;
+  });
+
   test('config carries the zero=1 climb limit (SOR)', () => {
     expect(loadMaxClimbsByEntry().zero).toBe(1);
   });
@@ -2135,6 +2142,8 @@ describe('Zero-tier fence 3: one climb then stop', () => {
   });
 
   test('Test 4: cursor entry with the same failures climbs normally -- the zero limit does not apply', async () => {
+    // The live ladder refuses claude; this test needs the climb to reach it, so open the tier.
+    restoreLadder = openClaudeTier();
     const fireCalls: string[] = [];
     let escalateCalls = 0;
 
