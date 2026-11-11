@@ -1234,6 +1234,47 @@ describe('fire_cauldron loop', () => {
     }
   });
 
+  test('eligibility listing: one memo per tick, shared by every check, dropped after (WO-HARNESS-TASKMASTER-ELIGIBILITY-LISTING-SHARE-01)', async () => {
+    const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
+    process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
+    try {
+      const seenMemos: unknown[] = [];
+      const run = async (): Promise<void> => {
+        const world = makeWorld();
+        seedDigestSent(world);
+        const threads = [531, 532, 533].map(number =>
+          makeListedThread({
+            ref: `gh:thinmansoftware/bdc-harness#${number}`,
+            priority: 'P1',
+            isUnclaimed: true,
+            title: `WO-HARNESS-EXAMPLE-${number} build`,
+          })
+        );
+        const deps = makeDeps(world, {
+          listThreads: async () => threads,
+          checkFireEligibility: async (_title, eligibilityDeps) => {
+            seenMemos.push(eligibilityDeps?.listingMemo);
+            return { eligible: false, reason: 'missing_spec' };
+          },
+        });
+        await tick(createTaskmasterState(60_000), deps);
+      };
+      await run();
+      await run();
+      expect(seenMemos).toHaveLength(6);
+      // all three checks of a tick get the same Map, and the next tick gets a different one
+      expect(seenMemos[0]).toBeInstanceOf(Map);
+      expect(seenMemos[1]).toBe(seenMemos[0]);
+      expect(seenMemos[2]).toBe(seenMemos[0]);
+      expect(seenMemos[3]).toBeInstanceOf(Map);
+      expect(seenMemos[3]).not.toBe(seenMemos[0]);
+      expect(seenMemos[4]).toBe(seenMemos[3]);
+    } finally {
+      if (prior === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
+      else process.env.TASKMASTER_FIRE_VERB_ENABLED = prior;
+    }
+  });
+
   test('mixed immediate proposals keep exceptions ahead of priority-ordered fires', async () => {
     const prior = process.env.TASKMASTER_FIRE_VERB_ENABLED;
     process.env.TASKMASTER_FIRE_VERB_ENABLED = 'true';
