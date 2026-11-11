@@ -49,7 +49,10 @@ declared entrypoints and saved infrastructure, including relative JavaScript
 imports and local Python imports. Discovery follows at most eight helper hops
 and tracks visited files and command directories to terminate cycles. Dynamic
 script references, unresolved script paths and a depth overflow fail closed with
-`tests_failed_after_repair:guard` and a diagnostic naming the entrypoint.
+`tests_failed_after_repair:guard` after a repair attempt and a diagnostic naming
+the entrypoint. Capture failures are recorded for repair without changing the
+initial test verdict or the no-repair final evidence, including in fixtures
+without a Git repository.
 Product data read by those entrypoints remains repairable.
 The guard's product allowlist and freeze rules remain unchanged. After a repair,
 final verification copies the repaired checkouts into temporary directories,

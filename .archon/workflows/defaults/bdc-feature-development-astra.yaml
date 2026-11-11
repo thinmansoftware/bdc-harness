@@ -3091,19 +3091,12 @@ nodes:
         cd "$(cat "$scratch/current")" || return 1
         rst_execute_saved "$e" "$class"
       )
-      # Snapshot failures block repair before the classifier can admit an attempt.
+      # Capture is a repair prerequisite, not part of the initial test verdict.
+      # Keep failures for the post-repair guard without rewriting initial evidence.
       trg_snapshot_report() {
-        local previous result
-        if trg_snapshot "$1" "$2/test-guard.json"; then return 0; else result=$?; fi
-        : > "$2/test-repair.guard"
-        previous="$(cat "$2/stop-tests.initial")"
-        # A known boundary violation (42) takes precedence. An unavailable guard
-        # tool must not replace an already non-repairable environment reason.
-        if [ "$result" -ne 42 ] && printf '%s\n' "$previous" | grep -E '^TESTS_STATUS=(blocked|env_unavailable)$' >/dev/null; then return 0; fi
-        {
-          printf '%s\n' "$previous" | grep -vE '^TESTS_(STATUS|BLOCKED_REASON|LINE)=' || true
-          printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=tests_failed_after_repair:guard\nTESTS_LINE=BLOCKED (tests_failed_after_repair:guard)\n'
-        } > "$2/stop-tests.initial"
+        if ! trg_snapshot "$1" "$2/test-guard.json"; then
+          : > "$2/test-repair.guard"
+        fi
       }
       # A guard violation returns success to END the loop; final evidence stays BLOCKED.
       trg_attempt() {
