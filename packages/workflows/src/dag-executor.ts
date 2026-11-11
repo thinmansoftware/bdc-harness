@@ -76,7 +76,7 @@ import {
 } from './schemas';
 import { collectRuntimeEvidence, renderManifestV2 } from './reliability/evidence-collector';
 import { formatToolCall } from './utils/tool-formatter';
-import { createLogger } from '@archon/paths';
+import { createLogger, laneEnv } from '@archon/paths';
 import { getWorkflowEventEmitter, buildGateResultField } from './event-emitter';
 import type { GateResult } from './event-emitter';
 import type { IWorkflowStore } from './store';
@@ -3824,7 +3824,8 @@ async function executeBashNode(
       )
     : {};
   const subprocessEnv: NodeJS.ProcessEnv = {
-    ...process.env,
+    // laneEnv: no personal GitHub token names for lane-run code (bdc-xo#5464).
+    ...laneEnv(),
     ARTIFACTS_DIR: artifactsDir,
     LOG_DIR: logDir,
     // BASE_BRANCH carries the SINGLE base-lane authority
@@ -4176,7 +4177,7 @@ async function executeScriptNode(
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
   const scriptNodeToken = `${workflowRun.id}:${node.id}`;
   const subprocessEnv: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...laneEnv(),
     ...(envVars ?? {}),
     // Node-specific ownership for timeout teardown: inherited by every descendant.
     [NODE_TOKEN_ENV]: scriptNodeToken,
@@ -5509,7 +5510,7 @@ async function executeLoopNode(
           nodeOutputs,
           true // escapedForBash
         );
-        await execFileAsync('bash', ['-c', substitutedBash], { cwd });
+        await execFileAsync('bash', ['-c', substitutedBash], { cwd, env: laneEnv() });
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
@@ -6133,6 +6134,7 @@ async function executeEvidenceNode(
       const result = await execFileAsync(command, [...args], {
         cwd: commandCwd,
         timeout: 30000,
+        env: laneEnv(),
       });
       return { stdout: result.stdout, stderr: result.stderr };
     },

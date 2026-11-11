@@ -3392,6 +3392,69 @@ describe('executeDagWorkflow -- bash nodes', () => {
     expect(mockSendQueryDag.mock.calls.length).toBe(0);
   });
 
+  it('bash and script nodes do not inherit the personal GitHub token names (bdc-xo#5464)', async () => {
+    const names = [
+      'GH_TOKEN',
+      'GITHUB_TOKEN',
+      'MERGE_MANAGER_GH_TOKEN',
+      'GH_AUTH_TOKEN_INTERNAL',
+      'ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN',
+    ];
+    const saved = Object.fromEntries(names.map(n => [n, process.env[n]]));
+    for (const n of names) process.env[n] = 'ghp_synthetic_lane_env_test';
+    try {
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+      const workflowRun = makeWorkflowRun('lane-env-run-id', {
+        workflow_name: 'lane-env-test',
+        conversation_id: 'conv-lane-env',
+        user_message: 'lane env test',
+      });
+      const artifactsDir = join(testDir, 'artifacts');
+      await mkdir(artifactsDir, { recursive: true });
+      const nodes: DagNode[] = [
+        { id: 'bash-env', bash: 'env | cut -d= -f1 > "$ARTIFACTS_DIR/bash-env-names.txt"' },
+        {
+          id: 'script-env',
+          script:
+            'require("fs").writeFileSync("script-env-names.txt", Object.keys(process.env).join(String.fromCharCode(10)))',
+          runtime: 'bun',
+        },
+      ];
+      await executeDagWorkflow(
+        mockDeps,
+        platform,
+        'conv-lane-env',
+        testDir,
+        { name: 'lane-env', nodes },
+        workflowRun,
+        'claude',
+        undefined,
+        artifactsDir,
+        join(testDir, 'logs'),
+        'main',
+        'docs/',
+        minimalConfig
+      );
+      for (const file of [
+        join(artifactsDir, 'bash-env-names.txt'),
+        join(testDir, 'script-env-names.txt'),
+      ]) {
+        const listed = (await readFile(file, 'utf8')).split(/\r?\n/);
+        expect(listed.length).toBeGreaterThan(3);
+        for (const n of names) expect(listed).not.toContain(n);
+        // the permission fallback is off for the lane
+        expect(process.env.ARCHON_GITHUB_NO_PERMISSION_FALLBACK).toBeUndefined();
+        expect(listed).toContain('ARCHON_GITHUB_NO_PERMISSION_FALLBACK');
+      }
+    } finally {
+      for (const n of names) {
+        if (saved[n] === undefined) delete process.env[n];
+        else process.env[n] = saved[n];
+      }
+    }
+  });
+
   it('bash node stdout is available for downstream $nodeId.output substitution', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();

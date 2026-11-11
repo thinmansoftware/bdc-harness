@@ -47,7 +47,7 @@ import {
   isTerminalRefreshReason,
   refreshIfAuthFailed,
 } from '../auth-refresh/index.js';
-import { createLogger } from '@archon/paths';
+import { createLogger, laneEnv, stripPersonalTokens } from '@archon/paths';
 import { readFile } from 'fs/promises';
 import { resolve, isAbsolute } from 'path';
 
@@ -103,7 +103,8 @@ function buildSubprocessEnv(): NodeJS.ProcessEnv {
     { authMode },
     authMode === 'global' ? 'using_global_auth' : 'using_explicit_tokens'
   );
-  return { ...process.env };
+  // laneEnv: the Claude CLI and its tools must not inherit the personal GitHub token (bdc-xo#5464).
+  return laneEnv();
 }
 
 /** Max retries for transient subprocess failures */
@@ -980,7 +981,9 @@ export class ClaudeProvider implements IAgentProvider {
 
     // Build subprocess env once (avoids re-logging auth mode per retry)
     const subprocessEnv = buildSubprocessEnv();
-    const env = requestOptions?.env ? { ...subprocessEnv, ...requestOptions.env } : subprocessEnv;
+    const env = requestOptions?.env
+      ? stripPersonalTokens({ ...subprocessEnv, ...requestOptions.env })
+      : subprocessEnv;
 
     // Apply nodeConfig translation once (deterministic, not retry-dependent)
     // We need a throwaway Options to extract warnings from applyNodeConfig,
