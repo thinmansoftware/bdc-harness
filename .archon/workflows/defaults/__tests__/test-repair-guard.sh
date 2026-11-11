@@ -913,13 +913,13 @@ for location in current stage; do
     export FIX_SPEC='WO Class: CODE'
     case "$kind" in
       invalid|missing|unreadable|cycle|depth)
-        # Do not execute a cyclic script. Failed capture must preserve initial
-        # evidence and block final evidence if a repair was attempted.
+        # These are pre-existing snapshot boundaries, not #5217 capture errors.
+        # Stop before repair, including when the declared package script cycles.
         printf 'TESTS_STATUS=failed\nTESTS_LINE=0/1 (%s)\n' "$R9_COMMAND" > "$ARTIFACTS_DIR/evidence/stop-tests.initial"
         trg_snapshot_report "$WT" "$ARTIFACTS_DIR/evidence"
         export FIX_INITIAL="$(cat "$ARTIFACTS_DIR/evidence/stop-tests.initial")"
-        check test "$FIX_INITIAL" = "$(printf 'TESTS_STATUS=failed\nTESTS_LINE=0/1 (%s)\n' "$R9_COMMAND")"
-        check contains "$(run_node classify-test-result)" '"repairable":"true"'
+        check test "$FIX_INITIAL" = "$(printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=tests_failed_after_repair:guard\nTESTS_LINE=BLOCKED (tests_failed_after_repair:guard)\n')"
+        check contains "$(run_node classify-test-result)" '"repairable":"false"'
         check test ! -e "$ARTIFACTS_DIR/evidence/test-repair.attempts"
         rst_save_core "$ARTIFACTS_DIR/evidence"
         printf '1500\n' > "$ARTIFACTS_DIR/evidence/stop-tests.timeout"
