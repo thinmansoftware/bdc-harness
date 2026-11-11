@@ -336,6 +336,9 @@ COPY tsconfig*.json ./
 # Entrypoints used by the container GitHub transport and credential preflight.
 COPY scripts/github-service-token.ts scripts/github-service-exec.ts scripts/github-service-login.ts scripts/run-completion-report.ts ./scripts/
 COPY scripts/overseer-review-sandbox-smoke.ts scripts/overseer-reviewer-broker.ts ./scripts/
+# Live proof tool for the worktree copy rule (WO-HARNESS-WORKTREE-SYNC-NO-TRACKED-OVERWRITE-01, bdc-xo#5527):
+# docker exec archon-app-1 bun run /app/scripts/worktree-copy-proof.ts
+COPY scripts/worktree-copy-proof.ts ./scripts/
 
 # Shared shell cores SOURCED by the bdc-feature-development lane YAMLs
 # (prep-dependencies / run-stop-tests source /app/scripts/lane/dprep.sh).
