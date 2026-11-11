@@ -4,7 +4,7 @@ The harness meters GitHub calls per service and hour in `github_api_usage` (and 
 
 ## What the log line holds
 
-Every time the meter flushes (about once a minute while calls are being made, and at once after a rate-limited response) the server logs one line, module `github/metering`, message `github_call_sites`:
+Every time the meter flushes (about once a minute while calls are being made, and at once after a rate-limited response) the server process logs one line (CLI scripts do not: the line goes to stdout, where scripts print JSON), module `github/metering`, message `github_call_sites`:
 
 | Field | Meaning |
 |---|---|
