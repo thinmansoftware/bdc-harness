@@ -5,7 +5,7 @@ eval "$(core rst)"
 eval "$(core trg)"
 
 if [ "$#" -eq 0 ]; then
-  scenarios=(current/chain stage/chain current/product stage/product current/dynamic-product stage/dynamic-product current/dynamic-helper stage/dynamic-helper current/names current/absolute stage/absolute current/absolute-import stage/absolute-import current/absolute-no-repair-failed stage/absolute-no-repair-failed current/absolute-no-repair-passed stage/absolute-no-repair-passed current/absolute-system stage/absolute-system)
+  scenarios=(current/chain stage/chain current/product stage/product current/dynamic-product stage/dynamic-product current/dynamic-helper stage/dynamic-helper current/names current/absolute stage/absolute current/absolute-import stage/absolute-import current/absolute-package stage/absolute-package current/absolute-no-repair-failed stage/absolute-no-repair-failed current/absolute-no-repair-passed stage/absolute-no-repair-passed current/absolute-system stage/absolute-system)
 elif [ "$#" -eq 2 ]; then
   scenarios=("$1/$2")
 else
@@ -15,7 +15,7 @@ for selection in "${scenarios[@]}"; do
 location="${selection%%/*}"
 scenario="${selection#*/}"
 case "$location/$scenario" in
-  current/chain|stage/chain|current/product|stage/product|current/dynamic-product|stage/dynamic-product|current/dynamic-helper|stage/dynamic-helper|current/names|current/absolute|stage/absolute|current/absolute-import|stage/absolute-import|current/absolute-no-repair-failed|stage/absolute-no-repair-failed|current/absolute-no-repair-passed|stage/absolute-no-repair-passed|current/absolute-system|stage/absolute-system) ;;
+  current/chain|stage/chain|current/product|stage/product|current/dynamic-product|stage/dynamic-product|current/dynamic-helper|stage/dynamic-helper|current/names|current/absolute|stage/absolute|current/absolute-import|stage/absolute-import|current/absolute-package|stage/absolute-package|current/absolute-no-repair-failed|stage/absolute-no-repair-failed|current/absolute-no-repair-passed|stage/absolute-no-repair-passed|current/absolute-system|stage/absolute-system) ;;
   *) echo 'Specify current or stage and a supported r3 scenario; or current names' >&2; exit 2 ;;
 esac
 
@@ -46,9 +46,18 @@ PY
     reference='./helper.js'; command='bash wrapper.sh'
     printf '/usr/bin/env bash check.sh\n' > "$WT/wrapper.sh"
   fi
-  if [ "$scenario" = absolute-import ]; then
-    entry=check.js; command='node check.js'
-    printf "require('%s');\n" "$reference" > "$WT/$entry"
+  if [ "$scenario" = absolute-package ]; then
+    entry=package.json; command='bun run test'
+    python3 - "$WT/package.json" "$reference" <<'PY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps(dict(type='commonjs', scripts=dict(test='node "'+sys.argv[2]+'"'))))
+PY
+  fi
+  if [ "$scenario" = absolute-import ] || [ "$scenario" = absolute-package ]; then
+    if [ "$scenario" = absolute-import ]; then
+      entry=check.js; command='node check.js'
+      printf "require('%s');\n" "$reference" > "$WT/$entry"
+    fi
     printf 'if (!require("fs").readFileSync("product.txt", "utf8").includes("good")) { console.log("Tests: 0/1"); process.exit(1); }\nconsole.log("Tests: 1/1");\n' > "$WT/helper.js"
   else
     printf 'source "%s"\n' "$reference" > "$WT/$entry"
@@ -65,7 +74,8 @@ PY
     git -C "$WT" worktree add --detach -q "$TARGET" HEAD
     # Only the mapped stage uses an absolute reference. Keep the run checkout's
     # entry relative, so it cannot mask a stage bypass with a different error.
-    if [ "$scenario" = absolute-import ]; then printf "require('./helper.js');\n" > "$WT/$entry"
+    if [ "$scenario" = absolute-package ]; then printf '{"type":"commonjs","scripts":{"test":"node helper.js"}}\n' > "$WT/$entry"
+    elif [ "$scenario" = absolute-import ]; then printf "require('./helper.js');\n" > "$WT/$entry"
     else printf 'source ./helper.js\n' > "$WT/$entry"; fi
   fi
   export BASE_BRANCH=run-base ARTIFACTS_DIR="$TMP/r4-evidence-$location-$scenario"
@@ -98,7 +108,9 @@ PY
     check rejects contains "$out" 'TESTS_FINAL_INFRA=trusted'
     check rejects contains "$out" 'tests_failed_after_repair:guard'
   else
-    if [ "$scenario" = absolute-system ]; then printf 'good repair\n' > "$TARGET/product.txt"
+    # A package script's direct target is frozen already. Use a legitimate
+    # product repair to prove the absolute reference itself prevents trust.
+    if [ "$scenario" = absolute-system ] || [ "$scenario" = absolute-package ]; then printf 'good repair\n' > "$TARGET/product.txt"
     elif [ "$scenario" = absolute-import ]; then printf 'console.log("Tests: 1/1");\n' > "$TARGET/helper.js"
     else printf 'echo "Tests: 1/1"\n' > "$TARGET/helper.js"; fi
     check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
