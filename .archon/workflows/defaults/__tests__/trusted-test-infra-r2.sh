@@ -85,7 +85,7 @@ done
 
 # These all name existing helpers. Missing recursion, imports or relative-token
 # support leaves helper.js out of the snapshot. The helper cycle must terminate.
-for form in source dot bash sh node bun python direct require import js_nested py_from py_import py_dotted py_package token token_bare cycle infra; do
+for form in source dot bash sh node bun python direct require import js_nested py_from py_import py_dotted py_package token token_bare cycle infra infra_root; do
   echo "Round 2 discovery: $form"
   fixture "r2-discovery-$form"
   prepare_evidence "discovery-$form"
@@ -123,11 +123,12 @@ for form in source dot bash sh node bun python direct require import js_nested p
     token) printf 'runner --helper ./helper.js\n' > "$WT/wrapper.js" ;;
     token_bare) printf 'runner --helper helper.js\n' > "$WT/wrapper.js" ;;
     cycle) printf '. ./helper.js\n' > "$WT/wrapper.js"; printf '. ./wrapper.js\n' > "$WT/helper.js" ;;
-    infra)
+    infra|infra_root)
       # Discovery must also start from saved infrastructure, not just entries.
       printf 'echo "Tests: 1/1"\n' > "$WT/check.sh"
       mkdir -p "$WT/scripts"
       printf 'node ../wrapper.js\n' > "$WT/scripts/runner.sh"
+      if [ "$form" = infra_root ]; then printf 'node wrapper.js\n' > "$WT/scripts/runner.sh"; fi
       printf "require('./helper.js');\n" > "$WT/wrapper.js" ;;
   esac
   check trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
@@ -165,8 +166,9 @@ check contains "$diagnostic" 'test guard: cannot resolve trusted helper: check.s
 
 # Four tracked files, one staged product repair, and a Git-discovered test. An
 # empty scratch index previously skipped the only case and fabricated 0/0.
-fixture r2-index
-prepare_evidence index
+for index_mode in normal split; do
+fixture "r2-index-$index_mode"
+prepare_evidence "index-$index_mode"
 printf 'base\n' > "$WT/product.txt"
 printf 'case\n' > "$WT/case.txt"
 printf 'tracked\n' > "$WT/README.md"
@@ -190,6 +192,7 @@ export BASE_BRANCH=run-base
 check trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 printf 'good repair\n' > "$WT/product.txt"
 git -C "$WT" add product.txt
+if [ "$index_mode" = split ]; then git -C "$WT" update-index --split-index; fi
 before="$(index_bytes "$WT")"
 out="$(cd "$WT" && trg_execute_trusted "$ARTIFACTS_DIR/evidence" CODE)"
 check contains "$out" 'TESTS_STATUS=passed'
@@ -197,4 +200,5 @@ check contains "$out" 'TESTS_TOTAL=1'
 check contains "$(cat "$ARTIFACTS_DIR/evidence/stop-tests.log")" 'TRACKED=4'
 check test "$before" = "$(index_bytes "$WT")"
 unset BASE_BRANCH
+done
 finish trusted-test-infra-r2
