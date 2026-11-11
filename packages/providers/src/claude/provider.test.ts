@@ -933,6 +933,38 @@ describe('ClaudeProvider', () => {
       expect(env.HOME).toBe('/custom/home');
     });
 
+    test('the Claude CLI env has none of the personal GitHub token names, even from request env (bdc-xo#5464)', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+      const names = [
+        'GH_TOKEN',
+        'GITHUB_TOKEN',
+        'MERGE_MANAGER_GH_TOKEN',
+        'GH_AUTH_TOKEN_INTERNAL',
+        'ARCHON_GITHUB_PERMISSION_FALLBACK_TOKEN',
+      ];
+      const saved = Object.fromEntries(names.map(n => [n, process.env[n]]));
+      for (const n of names) process.env[n] = 'ghp_synthetic';
+      try {
+        for await (const _ of client.sendQuery('test', '/tmp', undefined, {
+          env: { GITHUB_TOKEN: 'ghp_from_request', MY_SECRET: 'abc123' },
+        })) {
+          // consume
+        }
+      } finally {
+        for (const n of names) {
+          if (saved[n] === undefined) delete process.env[n];
+          else process.env[n] = saved[n];
+        }
+      }
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      const env = callArgs.options.env as Record<string, string>;
+      for (const n of names) expect(n in env).toBe(false);
+      expect(env.MY_SECRET).toBe('abc123');
+      expect(env.ARCHON_GITHUB_NO_PERMISSION_FALLBACK).toBe('1');
+    });
+
     test('passes effort to SDK via nodeConfig', async () => {
       mockQuery.mockImplementation(async function* () {
         yield { type: 'result', session_id: 'sid' };

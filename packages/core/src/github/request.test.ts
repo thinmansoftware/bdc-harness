@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it } from 'bun:test';
 import { generateKeyPairSync } from 'node:crypto';
-import { serviceGitHubFetchWithPermissionFallback } from './request';
+import { serviceGitHubFetch, serviceGitHubFetchWithPermissionFallback } from './request';
 import {
   assertGitHubPoolAvailable,
   recordGitHubApiCall,
   flushGitHubApiMeter,
   resetGitHubApiMeterForTests,
+  takeGitHubCallSiteSummary,
 } from './metering';
 
 afterEach(resetGitHubApiMeterForTests);
@@ -95,4 +96,31 @@ describe('Test 5: App permission fallback', () => {
     }
     void flushGitHubApiMeter;
   });
+});
+
+it('tags the call with its normalized endpoint (Test 4)', async () => {
+  resetGitHubApiMeterForTests();
+  const response = await serviceGitHubFetch({
+    service: 'overseer',
+    url: 'https://api.github.com/repos/thinmansoftware/bdc-xo/pulls/12',
+    identity: {
+      kind: 'pat',
+      service: 'overseer',
+      token: 'synthetic',
+      poolId: 'user-pat',
+      distinct: false,
+    },
+    fetch: (async () => Response.json({ ok: true })) as typeof fetch,
+  });
+  expect(response.status).toBe(200);
+  const summary = takeGitHubCallSiteSummary();
+  expect(summary.top).toEqual([
+    {
+      service: 'overseer',
+      pool: 'user-pat',
+      endpoint: 'GET /repos/{o}/{r}/pulls/:n',
+      calls: 1,
+      rateLimited: 0,
+    },
+  ]);
 });

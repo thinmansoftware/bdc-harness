@@ -1,4 +1,5 @@
 // Archon path resolution utilities
+export { PERSONAL_TOKEN_ENV_NAMES, laneEnv, stripPersonalTokens } from './lane-env';
 export {
   expandTilde,
   isDocker,

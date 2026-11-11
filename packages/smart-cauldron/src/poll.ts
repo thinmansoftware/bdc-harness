@@ -776,6 +776,7 @@ export async function ghPrListForBranchDefault(
       poolId: auth.poolId,
       resource: 'core',
       status: 0,
+      endpoint: 'cli:gh pr list --head',
     });
     const url = stdout.trim();
     return url.length > 0 ? url : null;
@@ -847,6 +848,7 @@ async function checkPrMergeableDefault(prUrl: string): Promise<boolean | null> {
       poolId: auth.poolId,
       resource: 'core',
       status: 0,
+      endpoint: 'cli:gh pr view --json mergeable',
     });
     const val = stdout.trim().toUpperCase();
     if (val === 'MERGEABLE') return true;

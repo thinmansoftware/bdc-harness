@@ -33,6 +33,57 @@ An initial unavailable capability never enters repair, stamps
 `VALIDATION: FAIL`, and fails the evidence gate with `ENVIRONMENT_UNAVAILABLE:`
 even on a non-PROCEED run. Without that probe, the existing blocked reasons apply.
 
+## Trusted final verification (WO #5217)
+
+Option A, the snapshot tree, was approved by the acting XO on 2026-11-11
+(bdc-xo#5217, fence 308). The trusted source is post-build and pre-repair, at
+the existing guard snapshot. This keeps legitimate build-time test changes
+and uses the same pre-repair evidence boundary the gate already accepts.
+Option B, restoring infrastructure from the base commit, is deferred; revisit
+it only if the Overseer finds build-time helper faking in practice.
+
+The snapshot saves byte copies under `evidence/trusted-infra/`, separately for
+the run checkout and each available stage checkout. The boundary approved by the
+acting XO on 2026-11-11 (bdc-xo#5217, fence 313) includes the existing
+test-infrastructure class and reached files marked as test support: a path
+segment `test`, `tests`, `spec`, `specs`, `fixtures`, `__tests__` or `mocks`, or
+a basename containing `test`, `spec`, `fixture`, `mock`, `helper`, `setup` or
+`conftest` (case-insensitive). Other product modules are never saved or restored,
+even when imported. Discovery may walk through them to reach marked helpers,
+including relative JavaScript imports and local Python imports. It follows at
+most eight helper hops and tracks visited files and command directories to
+terminate cycles. Dynamic or unresolved references fail closed only when they
+occur inside the boundary. Those failures and a depth overflow report
+`tests_failed_after_repair:guard` after a repair attempt and a diagnostic naming
+the entrypoint. Capture failures are recorded for repair without changing the
+initial test verdict or the no-repair final evidence, including in fixtures
+without a Git repository.
+An absolute executable or helper reference from a boundary file (including a
+reachable package script) into any run or stage worktree cannot use the trusted
+scratch copy. Snapshot discovery records this as a capture failure. After a
+repair, final evidence is BLOCKED with `tests_failed_after_repair:guard` and the
+plain diagnostic `test guard: absolute reference into the live worktree cannot
+be verified from the trusted copy: <file> -> <path>`. Without repair the initial
+evidence remains unchanged. Absolute references outside those worktrees, such as
+`/usr/bin/env bash check.sh`, are unaffected.
+Harness-owned evidence retains its existing exclusion from project capture.
+Product modules and data outside the boundary remain repairable. The accepted
+residual is a build-changed product file with a non-test name executed as a helper;
+the infrastructure-change listing and the Overseer's diff review are backstops.
+The guard's product allowlist and freeze rules remain unchanged. After a repair,
+final verification copies the repaired checkouts into temporary directories,
+restores their saved infrastructure, and executes the persisted commands there.
+Product fixes remain present; a repair's fabricated helper bytes do not run.
+Each scratch checkout has private Git metadata and a copy of the live index,
+including its tracked set. If a repair was staged, only the private HEAD is
+anchored to that index so `git diff --cached` remains empty during verification.
+The source index and Git metadata are never written by scratch preparation.
+Command side effects remain in the scratch copies. Evidence files still go to
+the run's artifact directory. Scratch copies are removed after final verification.
+Missing or damaged trusted inputs fail closed. Final output and the stamped
+manifest record `TESTS_FINAL_INFRA=trusted`. Runs with no repair use the original
+evidence without creating a scratch copy or recording that mode.
+
 ## Saved inputs and stage directories
 
 The evidence directory contains `stop-tests.commands` (one full command per line),
@@ -98,8 +149,10 @@ The same target freeze applies to symlinks elsewhere in the frozen-file set.
 
 The guard does not trace helpers called or sourced by a frozen entrypoint.
 Every build-changed file in the test-infrastructure class is removed from the
-allowlist and frozen by SHA-256. The remaining accepted residual is product
-source outside that class executed as test infrastructure (bdc-xo#5217).
+allowlist and frozen by SHA-256. Product source outside that class remains
+allowed by the guard. Named helpers invoked or sourced by declared entrypoints
+use their snapshot bytes during trusted final verification (bdc-xo#5217);
+this is not runtime execution tracing.
 Final run output and the PR's stamped manifest section list
 repair changes to shell scripts, test/runner configuration, CI files, scripts or
 test directories, declared command files and executable files under

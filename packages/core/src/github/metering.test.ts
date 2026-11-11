@@ -4,9 +4,13 @@ import {
   assertGitHubPoolAvailable,
   assertPersistedGitHubPoolAvailable,
   flushGitHubApiMeter,
+  enableGitHubCallSiteLog,
+  isGitHubCallSiteLogEnabled,
+  normalizeGitHubEndpoint,
   recordGitHubApiCall,
   resetGitHubApiMeterForTests,
   observationFromResponse,
+  takeGitHubCallSiteSummary,
 } from './metering';
 import { SqliteAdapter } from '../db/adapters/sqlite';
 
@@ -139,4 +143,66 @@ it('a fresh process sees secondary backoff without corrupting measured quota or 
   } finally {
     await db.close();
   }
+});
+
+describe('call-site attribution (bdc-xo#5449)', () => {
+  it('normalizes expanded urls, route templates and shas (Test 1)', () => {
+    expect(
+      normalizeGitHubEndpoint(
+        'get',
+        'https://api.github.com/repos/thinmansoftware/bdc-xo/pulls/5436/reviews?per_page=100'
+      )
+    ).toBe('GET /repos/{o}/{r}/pulls/:n/reviews');
+    expect(normalizeGitHubEndpoint('GET', '/repos/{owner}/{repo}/pulls/{pull_number}')).toBe(
+      'GET /repos/{owner}/{repo}/pulls/{pull_number}'
+    );
+    const sha = 'a'.repeat(40);
+    expect(normalizeGitHubEndpoint('GET', `/repos/o/r/commits/${sha}/check-runs`)).toBe(
+      'GET /repos/{o}/{r}/commits/:sha/check-runs'
+    );
+    expect(normalizeGitHubEndpoint(undefined, '/graphql')).toBe('GET /graphql');
+  });
+
+  it('counts and ranks endpoints per service and keeps unlabelled calls (Test 2)', () => {
+    resetGitHubApiMeterForTests();
+    const call = (service: 'overseer' | 'taskmaster', endpoint?: string): void =>
+      recordGitHubApiCall({ service, poolId: 'app', resource: 'core', status: 200, endpoint });
+    for (let i = 0; i < 5; i++) call('overseer', 'GET /a');
+    for (let i = 0; i < 2; i++) call('overseer', 'GET /b');
+    for (let i = 0; i < 3; i++) call('taskmaster', 'GET /c');
+    call('taskmaster');
+    const summary = takeGitHubCallSiteSummary();
+    expect(summary.total).toBe(11);
+    expect(summary.byService).toEqual({ overseer: 7, taskmaster: 4 });
+    expect(summary.top.map(row => [row.endpoint, row.calls])).toEqual([
+      ['GET /a', 5],
+      ['GET /c', 3],
+      ['GET /b', 2],
+      ['unlabelled', 1],
+    ]);
+  });
+
+  it('starts a new interval after each take (Test 3)', () => {
+    resetGitHubApiMeterForTests();
+    recordGitHubApiCall({
+      service: 'overseer',
+      poolId: 'app',
+      resource: 'core',
+      status: 200,
+      endpoint: 'GET /a',
+    });
+    expect(takeGitHubCallSiteSummary().total).toBe(1);
+    const again = takeGitHubCallSiteSummary();
+    expect(again.total).toBe(0);
+    expect(again.top).toEqual([]);
+  });
+
+  it('logs the summary only in the server process, which opts in (stdout stays pure JSON in scripts)', () => {
+    resetGitHubApiMeterForTests();
+    expect(isGitHubCallSiteLogEnabled()).toBe(false);
+    enableGitHubCallSiteLog();
+    expect(isGitHubCallSiteLogEnabled()).toBe(true);
+    resetGitHubApiMeterForTests();
+    expect(isGitHubCallSiteLogEnabled()).toBe(false);
+  });
 });
