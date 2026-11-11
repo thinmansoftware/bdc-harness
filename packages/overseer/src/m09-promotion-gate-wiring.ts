@@ -175,6 +175,12 @@ export function createPromotionGate(
           if (page >= 100) throw Error('m09 ambiguous create listing incomplete');
         }
       }
+      // GitHub accepts a PATCH of a COMPLETED check run back to `in_progress` (HTTP 200) and ignores
+      // it: the run stays completed with its old conclusion, so a held `success` would stay visible
+      // while the gate decides again. When a run already exists, invalidate it with a completed,
+      // non-passing conclusion instead (`action_required`; `neutral` and `skipped` count as passing
+      // for required checks). WO-HARNESS-M09-GATE-INVALIDATE-COMPLETED-CHECK-01.
+      const invalidate = status === 'in_progress' && existing !== undefined;
       const response = await call(
         existing
           ? 'PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}'
@@ -183,10 +189,14 @@ export function createPromotionGate(
           ...args,
           ...(existing ? { check_run_id: existing } : { name: NAME, head_sha: head }),
           external_id: head,
-          status,
+          status: invalidate ? 'completed' : status,
           // GitHub rejects `conclusion: null` (HTTP 422, "nil is not a string"); an in-progress
           // publish must omit the key entirely (WO-HARNESS-M09-GATE-POSTS-NO-CHECK-01, bdc-xo#5533).
-          ...(result ? { conclusion: result.conclusion } : {}),
+          ...(result
+            ? { conclusion: result.conclusion }
+            : invalidate
+              ? { conclusion: 'action_required' }
+              : {}),
           output: {
             title: result
               ? `M-09 ${result.conclusion}: ${result.rules.map((r, i) => `${i + 1} ${r.pass ? 'PASS' : 'FAIL'}`).join(', ')}`.slice(
