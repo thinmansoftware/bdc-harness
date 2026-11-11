@@ -3029,12 +3029,18 @@ nodes:
         cd "$(cat "$scratch/current")" || return 1
         rst_execute_saved "$e" "$class"
       )
-      # Capture is a repair prerequisite, not part of the initial test verdict.
-      # Keep failures for the post-repair guard without rewriting initial evidence.
+      # Explicit snapshot boundaries (42) block before repair, as in round 8.
+      # Trusted-capture failures defer to final evidence after a repair attempt.
       trg_snapshot_report() {
-        if ! trg_snapshot "$1" "$2/test-guard.json"; then
-          : > "$2/test-repair.guard"
-        fi
+        local previous result
+        if trg_snapshot "$1" "$2/test-guard.json"; then return 0; else result=$?; fi
+        : > "$2/test-repair.guard"
+        [ "$result" -eq 42 ] || return 0
+        previous="$(cat "$2/stop-tests.initial")"
+        {
+          printf '%s\n' "$previous" | grep -vE '^TESTS_(STATUS|BLOCKED_REASON|LINE)=' || true
+          printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=tests_failed_after_repair:guard\nTESTS_LINE=BLOCKED (tests_failed_after_repair:guard)\n'
+        } > "$2/stop-tests.initial"
       }
       # A guard violation returns success to END the loop; final evidence stays BLOCKED.
       trg_attempt() {
