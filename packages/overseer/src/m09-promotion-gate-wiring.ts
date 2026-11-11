@@ -195,7 +195,7 @@ export function createPromotionGate(
                 )
               : 'M-09 evaluation pending',
             summary: result
-              ? `${result.reason ? result.reason + '\n' : ''}bdc-xo pinned SHA: ${result.pinnedSha || 'unavailable'}\n${result.rules.map(r => `${r.pass ? 'PASS' : 'FAIL'} ${r.name}`).join('\n')}`
+              ? `${result.reason ? result.reason + '\n' : ''}bdc-xo pinned SHA: ${result.pinnedSha || 'unavailable'}\n${result.rules.map(r => `${r.pass ? 'PASS' : 'FAIL'} ${r.name}${r.detail ? ` -- ${r.detail}` : ''}`).join('\n')}`
               : 'Approval is being revalidated. This check is not a promotion approval.',
           },
         }
@@ -257,7 +257,8 @@ export function createPromotionGate(
     }
     async function decide(pr: Pr): Promise<PromotionResult> {
       let motion = '',
-        behindBy = -1;
+        behindBy = -1,
+        headTree = '';
       try {
         const block = promotionBlock(pr.body ?? '');
         const matches = motionPaths(paths, block?.id ?? '');
@@ -273,6 +274,16 @@ export function createPromotionGate(
             throw Error('invalid record');
           motion = Buffer.from(record.content, 'base64').toString('utf8');
         }
+        // One extra read, only for a block that pins by tree: the head commit's tree.
+        if (block?.tree)
+          headTree = (
+            (
+              await call('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+                ...args,
+                commit_sha: pr.head.sha,
+              })
+            ).data as { tree: { sha: string } }
+          ).tree.sha;
         behindBy = (
           (
             await call('GET /repos/{owner}/{repo}/compare/{basehead}', {
@@ -284,6 +295,7 @@ export function createPromotionGate(
       } catch {
         motion = '';
         behindBy = -1;
+        headTree = '';
       }
       return evaluatePromotion({
         repository: target.repository,
@@ -294,6 +306,7 @@ export function createPromotionGate(
         truncated,
         motion,
         behindBy,
+        headTree,
       });
     }
     let result: PromotionResult;
