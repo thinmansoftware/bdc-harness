@@ -496,6 +496,27 @@ describe('worktree-copy never overwrites a tracked path (WO-HARNESS-WORKTREE-SYN
     expect(readFileSync(join(elsewhere, 'a.yaml'), 'utf8')).toBe('precious: yes\n');
   });
 
+  test('an untracked symlink under an untracked .archon is not followed when nothing under .archon is tracked (Overseer finding 2 on bdc-harness#1565)', async () => {
+    // Only actual/a.yaml is tracked; .archon holds nothing tracked, and .archon/workflows is an untracked link.
+    rmSync(join(worktree, '.archon'), { recursive: true, force: true });
+    write(worktree, 'actual/a.yaml', NEW);
+    git(worktree, 'add', '-A');
+    git(worktree, 'commit', '-q', '-m', 'only actual is tracked');
+    mkdirSync(join(worktree, '.archon'), { recursive: true });
+    try {
+      symlinkSync(join('..', 'actual'), join(worktree, '.archon/workflows'), 'dir');
+    } catch {
+      return; // symlinks unavailable here
+    }
+
+    await copyWorktreeFiles(canonical, worktree, ['.archon']);
+
+    expect(readFileSync(join(worktree, 'actual/a.yaml'), 'utf8')).toBe(NEW);
+    expect(git(worktree, 'status', '--porcelain', '--untracked-files=all')).not.toContain(
+      'actual/a.yaml'
+    );
+  });
+
   test('a destination that is not a git checkout is copied as before', async () => {
     const plain = join(root, 'plain');
     mkdirSync(plain, { recursive: true });

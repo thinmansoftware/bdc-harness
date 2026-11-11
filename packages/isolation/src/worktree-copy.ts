@@ -91,6 +91,16 @@ async function listTrackedPaths(destRoot: string, relPath: string): Promise<Set<
   }
 }
 
+/** True when anything (including a dangling link) exists at `path`. */
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * True when `path` is a symbolic link. A missing path is not one. Any other error counts as one
  * (fail safe: the copy skips the path).
@@ -215,8 +225,9 @@ export async function copyWorktreeFile(
     const tracked = await listTrackedPaths(destRoot, destRelative);
 
     if (stats.isDirectory()) {
-      if (tracked.size === 0) {
-        // Copy directory recursively
+      if (!(await pathExists(destPath))) {
+        // Nothing exists at the destination yet: nothing to overwrite and no link to follow, so the
+        // plain recursive copy is safe. Any existing destination is walked entry by entry.
         await cp(sourcePath, destPath, { recursive: true });
       } else {
         skippedTracked = await copyDirectorySkippingTracked(
