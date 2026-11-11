@@ -85,7 +85,7 @@ done
 
 # These all name existing helpers. Missing recursion, imports or relative-token
 # support leaves helper.js out of the snapshot. The helper cycle must terminate.
-for form in source dot bash sh node bun python direct require import js_nested py_from py_import py_dotted token cycle infra; do
+for form in source dot bash sh node bun python direct require import js_nested py_from py_import py_dotted py_package token token_bare cycle infra; do
   echo "Round 2 discovery: $form"
   fixture "r2-discovery-$form"
   prepare_evidence "discovery-$form"
@@ -113,7 +113,15 @@ for form in source dot bash sh node bun python direct require import js_nested p
       printf 'python wrapper.py\n' > "$WT/check.sh"
       printf 'import pkg.helper\n' > "$WT/wrapper.py"
       printf '# leaf\n' > "$WT/pkg/helper.py" ;;
+    py_package)
+      mkdir -p "$WT/pkg"
+      printf 'python wrapper.py\n' > "$WT/check.sh"
+      printf 'import pkg.module\n' > "$WT/wrapper.py"
+      printf 'from . import helper\n' > "$WT/pkg/__init__.py"
+      printf '# module\n' > "$WT/pkg/module.py"
+      printf '# leaf\n' > "$WT/pkg/helper.py" ;;
     token) printf 'runner --helper ./helper.js\n' > "$WT/wrapper.js" ;;
+    token_bare) printf 'runner --helper helper.js\n' > "$WT/wrapper.js" ;;
     cycle) printf '. ./helper.js\n' > "$WT/wrapper.js"; printf '. ./wrapper.js\n' > "$WT/helper.js" ;;
     infra)
       # Discovery must also start from saved infrastructure, not just entries.
