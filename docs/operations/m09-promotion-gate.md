@@ -32,6 +32,10 @@ From its merge on 2026-11-07 (bdc-harness #1516) the gate posted nothing on any 
 2. No log line at all for the pull request: the webhook did not reach the server or the repository is not in `COVERED_PRODUCTION_BASES`.
 3. A throwaway probe: open a pull request to a covered base from a branch with one doc-only commit, read the check run with the command above within ten minutes, then close it unmerged and delete the branch.
 
+## Re-evaluation and the held verdict (bdc-xo WO-HARNESS-M09-GATE-INVALIDATE-COMPLETED-CHECK-01)
+
+A pull request body edit, a re-delivered webhook or a rerequested check makes the gate evaluate a head that already has a completed `m09-promotion-gate` run. GitHub accepts a PATCH of a COMPLETED check run back to `in_progress` (HTTP 200) and ignores it: the run stays `completed` with its old conclusion. So the gate invalidates an existing run by PATCHing it to `completed` with the conclusion `action_required` ("M-09 evaluation pending"), then PATCHes the real verdict. `neutral` and `skipped` would count as passing for a required check, so they are not used for this; `action_required` and `failure` are accepted on a completed run (tested 2026-11-11). A PATCH of a completed run does not change its `completed_at`. A head with no run still starts with a POST in progress and no `conclusion` key.
+
 ## The motion record the gate reads (WO-HARNESS-M09-GATE-MOTION-FORMAT-01, bdc-xo#5559)
 
 The Board desk's template is `docs/board/templates/deploy-motion.md` in bdc-xo (PR 5558, merge commit 5f2b6bfe8e5b5f39e92add6c481f0012e74873e6). A copy is the test fixture `packages/overseer/src/__tests__/fixtures/deploy-motion-template.md`; the real header of production motion M-20261111b is the fixture `m-20261111b-head.md`. Past motions are not rewritten.
