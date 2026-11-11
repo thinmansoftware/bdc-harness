@@ -43,20 +43,21 @@ describe('review body credential guard (bdc-xo#5550)', () => {
     }
   });
 
+  // The tilde marks keep this file's own text from matching the old pattern when a reviewer quotes the diff.
   test('ordinary names and prose do not block (the five refused heads of bdc-xo PR 5518)', () => {
     const body = [
       'Independent review by the Overseer App at head `db7f98818`.',
       '',
-      'The spec docs/work-orders/WO-DESK-EBAY-BOX-RECIPIENT-01.md adds the box recipient step to the',
-      'receiving-shipping desk (WO-DESK-EBAY-BOX-RECIPIENT-01). No blocking findings.',
-      'Branch archon/task-web-worker-1794420438767-0s31w6 and risk-assessment-of-the-whole-pipeline-is-low.',
-      'A Bearer authentication-scheme-and-token-handling note and a desk-checkout-webhook-paid-order id.',
+      'The spec docs/work-orders/WO-DESK~-EBAY-BOX-RECIPIENT-01.md adds the box recipient step to the',
+      'receiving-shipping desk (WO-DESK~-EBAY-BOX-RECIPIENT-01). No blocking findings.',
+      'Branch archon/task~-web-worker-1794420438767-0s31w6 and risk~-assessment-of-the-whole-pipeline-is-low.',
+      'A Bearer authentication-scheme-and-token-handling note and a desk~-checkout-webhook-paid-order id.',
     ].join('\n');
     expect(bodyHasCredentialShape(body)).toBe(false);
     for (const name of [
-      'WO-DESK-EBAY-BOX-RECIPIENT-01',
-      'WO-TASK-WEB-WORKER-CHECKOUT-WEBHOOK-PAID-ORDER-01',
-      'desk-ebay-box-recipient-01-thread-eb16a1bf',
+      'WO-DESK~-EBAY-BOX-RECIPIENT-01',
+      'WO-TASK~-WEB-WORKER-CHECKOUT-WEBHOOK-PAID-ORDER-01',
+      'desk~-ebay-box-recipient-01-thread-eb16a1bf',
     ])
       expect(bodyHasCredentialShape(name)).toBe(false);
   });

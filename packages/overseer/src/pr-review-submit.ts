@@ -723,8 +723,9 @@ export async function runAndSubmitReview(
  * Credential shapes that must never appear in a review body (bdc-xo#5550 narrowed the guard).
  *
  * The earlier pattern, `sk-[A-Za-z0-9_-]{20,}` with the case-insensitive flag and no left
- * boundary, matched inside ordinary names: "WO-DESK-EBAY-BOX-RECIPIENT-01" contains
- * "SK-EBAY-BOX-RECIPIENT-01", so the Overseer refused its own review of any pull request that
+ * boundary, matched inside ordinary names: any work-order id or branch name containing the
+ * letters "sk" followed by a hyphen and 20 more name characters (for example a desk or task id
+ * with a long kebab-case tail), so the Overseer refused its own review of any pull request that
  * named that work order (five heads of bdc-xo PR 5518). A real token is matched by its prefix, a
  * left boundary, a realistic minimum length and, where the prefix is ambiguous, its character mix:
  *
