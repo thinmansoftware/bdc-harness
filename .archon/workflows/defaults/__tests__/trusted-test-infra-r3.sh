@@ -5,7 +5,7 @@ eval "$(core rst)"
 eval "$(core trg)"
 
 if [ "$#" -eq 0 ]; then
-  scenarios=(current/chain stage/chain current/product stage/product current/dynamic-product stage/dynamic-product current/dynamic-helper stage/dynamic-helper current/names current/absolute stage/absolute current/absolute-import stage/absolute-import current/absolute-package stage/absolute-package current/absolute-no-repair-failed stage/absolute-no-repair-failed current/absolute-no-repair-passed stage/absolute-no-repair-passed current/absolute-system stage/absolute-system)
+  scenarios=(current/chain stage/chain current/product stage/product current/dynamic-product stage/dynamic-product current/dynamic-helper stage/dynamic-helper current/names current/absolute stage/absolute current/absolute-import stage/absolute-import current/absolute-package stage/absolute-package current/absolute-no-repair-failed stage/absolute-no-repair-failed current/absolute-no-repair-passed stage/absolute-no-repair-passed current/absolute-system stage/absolute-system current/absolute-external-import stage/absolute-external-import)
 elif [ "$#" -eq 2 ]; then
   scenarios=("$1/$2")
 else
@@ -15,7 +15,7 @@ for selection in "${scenarios[@]}"; do
 location="${selection%%/*}"
 scenario="${selection#*/}"
 case "$location/$scenario" in
-  current/chain|stage/chain|current/product|stage/product|current/dynamic-product|stage/dynamic-product|current/dynamic-helper|stage/dynamic-helper|current/names|current/absolute|stage/absolute|current/absolute-import|stage/absolute-import|current/absolute-package|stage/absolute-package|current/absolute-no-repair-failed|stage/absolute-no-repair-failed|current/absolute-no-repair-passed|stage/absolute-no-repair-passed|current/absolute-system|stage/absolute-system) ;;
+  current/chain|stage/chain|current/product|stage/product|current/dynamic-product|stage/dynamic-product|current/dynamic-helper|stage/dynamic-helper|current/names|current/absolute|stage/absolute|current/absolute-import|stage/absolute-import|current/absolute-package|stage/absolute-package|current/absolute-no-repair-failed|stage/absolute-no-repair-failed|current/absolute-no-repair-passed|stage/absolute-no-repair-passed|current/absolute-system|stage/absolute-system|current/absolute-external-import|stage/absolute-external-import) ;;
   *) echo 'Specify current or stage and a supported r3 scenario; or current names' >&2; exit 2 ;;
 esac
 
@@ -42,6 +42,9 @@ print(pathlib.Path(sys.argv[1]).resolve().as_posix())
 PY
 )"
   reference="$absolute"; entry=check.sh; command='bash check.sh'
+  if [ "$scenario" = absolute-external-import ]; then
+    reference="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve().as_posix())' "$TMP/external-helper.cjs")"
+  fi
   if [ "$scenario" = absolute-system ]; then
     reference='./helper.js'; command='bash wrapper.sh'
     printf '/usr/bin/env bash check.sh\n' > "$WT/wrapper.sh"
@@ -53,12 +56,13 @@ import json, pathlib, sys
 pathlib.Path(sys.argv[1]).write_text(json.dumps(dict(type='commonjs', scripts=dict(test='node "'+sys.argv[2]+'"'))))
 PY
   fi
-  if [ "$scenario" = absolute-import ] || [ "$scenario" = absolute-package ]; then
-    if [ "$scenario" = absolute-import ]; then
+  if [ "$scenario" = absolute-import ] || [ "$scenario" = absolute-external-import ] || [ "$scenario" = absolute-package ]; then
+    if [ "$scenario" != absolute-package ]; then
       entry=check.js; command='node check.js'
       printf "require('%s');\n" "$reference" > "$WT/$entry"
     fi
     printf 'if (!require("fs").readFileSync("product.txt", "utf8").includes("good")) { console.log("Tests: 0/1"); process.exit(1); }\nconsole.log("Tests: 1/1");\n' > "$WT/helper.js"
+    if [ "$scenario" = absolute-external-import ]; then cp "$WT/helper.js" "$TMP/external-helper.cjs"; fi
   else
     printf 'source "%s"\n' "$reference" > "$WT/$entry"
     printf 'if grep -q good product.txt; then echo "Tests: 1/1"; else echo "Tests: 0/1"; exit 1; fi\n' > "$WT/helper.js"
@@ -75,7 +79,7 @@ PY
     # Only the mapped stage uses an absolute reference. Keep the run checkout's
     # entry relative, so it cannot mask a stage bypass with a different error.
     if [ "$scenario" = absolute-package ]; then printf '{"type":"commonjs","scripts":{"test":"node helper.js"}}\n' > "$WT/$entry"
-    elif [ "$scenario" = absolute-import ]; then printf "require('./helper.js');\n" > "$WT/$entry"
+    elif [ "$scenario" = absolute-import ] || [ "$scenario" = absolute-external-import ]; then printf "require('./helper.js');\n" > "$WT/$entry"
     else printf 'source ./helper.js\n' > "$WT/$entry"; fi
   fi
   export BASE_BRANCH=run-base ARTIFACTS_DIR="$TMP/r4-evidence-$location-$scenario"
@@ -93,7 +97,7 @@ PY
   check contains "$FIX_INITIAL" "TESTS_STATUS=$expected"
   diagnostic="$(trg_snapshot_report "$WT" "$ARTIFACTS_DIR/evidence" 2>&1)"
   message="test guard: absolute reference into the live worktree cannot be verified from the trusted copy: $entry -> $absolute"
-  if [ "$scenario" = absolute-system ]; then
+  if [ "$scenario" = absolute-system ] || [ "$scenario" = absolute-external-import ]; then
     check rejects contains "$diagnostic" 'absolute reference into the live worktree'
     check test ! -f "$ARTIFACTS_DIR/evidence/test-repair.guard"
   else
@@ -110,7 +114,7 @@ PY
   else
     # A package script's direct target is frozen already. Use a legitimate
     # product repair to prove the absolute reference itself prevents trust.
-    if [ "$scenario" = absolute-system ] || [ "$scenario" = absolute-package ]; then printf 'good repair\n' > "$TARGET/product.txt"
+    if [ "$scenario" = absolute-system ] || [ "$scenario" = absolute-external-import ] || [ "$scenario" = absolute-package ]; then printf 'good repair\n' > "$TARGET/product.txt"
     elif [ "$scenario" = absolute-import ]; then printf 'console.log("Tests: 1/1");\n' > "$TARGET/helper.js"
     else printf 'echo "Tests: 1/1"\n' > "$TARGET/helper.js"; fi
     check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
@@ -121,7 +125,7 @@ PY
     printf '1\n' > "$ARTIFACTS_DIR/evidence/test-repair.attempts"
     out="$(run_node run-stop-tests-final 2> "$TMP/r4-final-diagnostic")"
     check contains "$out" 'TESTS_FINAL_INFRA=trusted'
-    if [ "$scenario" = absolute-system ]; then
+    if [ "$scenario" = absolute-system ] || [ "$scenario" = absolute-external-import ]; then
       check contains "$out" 'TESTS_STATUS=passed'
       check contains "$out" 'TESTS_REPAIR_RESULT=repaired'
     else
