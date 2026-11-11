@@ -43,17 +43,24 @@ Option B, restoring infrastructure from the base commit, is deferred; revisit
 it only if the Overseer finds build-time helper faking in practice.
 
 The snapshot saves byte copies under `evidence/trusted-infra/`, separately for
-the run checkout and each available stage checkout. It includes the existing
-test-infrastructure class and recursively resolved literal helper references in
-declared entrypoints and saved infrastructure, including relative JavaScript
-imports and local Python imports. Discovery follows at most eight helper hops
-and tracks visited files and command directories to terminate cycles. Dynamic
-script references, unresolved script paths and a depth overflow fail closed with
+the run checkout and each available stage checkout. The boundary approved by the
+acting XO on 2026-11-11 (bdc-xo#5217, fence 313) includes the existing
+test-infrastructure class and reached files marked as test support: a path
+segment `test`, `tests`, `spec`, `specs`, `fixtures`, `__tests__` or `mocks`, or
+a basename containing `test`, `spec`, `fixture`, `mock`, `helper`, `setup` or
+`conftest` (case-insensitive). Other product modules are never saved or restored,
+even when imported. Discovery may walk through them to reach marked helpers,
+including relative JavaScript imports and local Python imports. It follows at
+most eight helper hops and tracks visited files and command directories to
+terminate cycles. Dynamic or unresolved references fail closed only when they
+occur inside the boundary. Those failures and a depth overflow report
 `tests_failed_after_repair:guard` after a repair attempt and a diagnostic naming
 the entrypoint. Capture failures are recorded for repair without changing the
 initial test verdict or the no-repair final evidence, including in fixtures
 without a Git repository.
-Product data read by those entrypoints remains repairable.
+Product modules and data outside the boundary remain repairable. The accepted
+residual is a build-changed product file with a non-test name executed as a helper;
+the infrastructure-change listing and the Overseer's diff review are backstops.
 The guard's product allowlist and freeze rules remain unchanged. After a repair,
 final verification copies the repaired checkouts into temporary directories,
 restores their saved infrastructure, and executes the persisted commands there.

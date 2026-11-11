@@ -2755,7 +2755,8 @@ nodes:
           found = set()
           parent = (root/name).resolve().parent
           def blocked(reason):
-              raise ValueError("test guard: cannot resolve trusted helper: "+entry+" ("+name+": "+reason+")")
+              if trusted_boundary(root,name):
+                  raise ValueError("test guard: cannot resolve trusted helper: "+entry+" ("+name+": "+reason+")")
           def resolve(token,base,required=False,module=False):
               if any(c in token for c in "$`{}*?[]"):
                   if required: blocked("dynamic script reference")
@@ -2776,7 +2777,9 @@ nodes:
                   if not path.is_relative_to(root): continue
                   relative = path.relative_to(root).as_posix()
                   if path.is_file():
-                      if not path.resolve().is_relative_to(root): blocked("script outside worktree")
+                      if not path.resolve().is_relative_to(root):
+                          blocked("script outside worktree")
+                          continue
                       found.add((relative,str(cwd)))
                       resolved = True
                       if module == "python":
@@ -2789,7 +2792,9 @@ nodes:
           # Imports resolve against the importing file, unlike shell commands.
           for match in re.finditer(r"\b(?:require|import)\s*\(([^)\n]*)\)",body):
               literal = re.fullmatch(r"\s*(['\"])([^'\"]+)\1\s*",match[1])
-              if not literal: blocked("computed import")
+              if not literal:
+                  blocked("computed import")
+                  continue
               if literal[2].startswith("."): resolve(literal[2],parent,True,True)
           body = re.sub(r"\b(?:require|import)\s*\([^\n)]*\)","",body)
           for match in re.finditer(r"\b(?:from\s*|import\s*)(['\"])(\.[^'\"]+)\1",body):
@@ -2836,7 +2841,9 @@ nodes:
                   args = segment[1:]
                   # Inline programs are not filenames. Inspect their references too.
                   if args and args[0] in {"-c","-e","--eval","-m"}:
-                      if len(args) < 2: blocked("missing inline program")
+                      if len(args) < 2:
+                          blocked("missing inline program")
+                          continue
                       if args[0] == "-m": resolve(args[1].replace(".","/"),cwd,module="python")
                       else: found.update(named_helpers(root,args[1],cwd,name,entry))
                       continue
@@ -2890,6 +2897,11 @@ nodes:
                   or any(part in {"scripts","test","tests","__tests__","spec","specs",".circleci",".buildkite"} for part in parts)
                   or any(fnmatch.fnmatchcase(parts[-1],pattern) for pattern in [".gitlab-ci.*",".travis.yml","Jenkinsfile","azure-pipelines.*",".mocharc*",".nycrc*",".taprc*",".coveragerc","karma.conf.*","cypress.config.*","ava.config.*","test.config.*","runner.config.*","phpunit.xml*"])
                   or executable(root/name))
+      def trusted_boundary(root,name):
+          path = pathlib.PurePosixPath(name)
+          return (infrastructure(root,name)
+                  or any(part in {"test","tests","spec","specs","fixtures","__tests__","mocks"} for part in path.parts)
+                  or any(marker in path.name.lower() for marker in {"test","spec","fixture","mock","helper","setup","conftest"}))
       def fingerprint(path):
           return [digest(path),executable(path)] if path.exists() or path.is_symlink() else None
       now = {}
@@ -2941,8 +2953,8 @@ nodes:
               allowed = build_allowed - declared_set - targets
               frozen = (tracked - allowed) | {name for name in files if infrastructure(root,name)} | declared_set | targets
               now[directory] = dict(allowed=sorted(allowed),known=sorted(files),links=links,frozen={name:digest(root/name) for name in sorted(frozen)},infrastructure={name:fingerprint(root/name) for name in sorted(files | targets) if infrastructure(root,name)})
-              # Save bytes without widening the guard's frozen set. Literal helper
-              # references belong to trusted execution, even when product-allowed.
+              # Walk through product imports, but save only the named test-support
+              # boundary. Keep the guard's frozen set and product allowlist intact.
               try:
                   trusted = {name for name in files | targets if infrastructure(root,name)} | declared_set
                   pending = collections.deque((name,cwd,0,name) for name in sorted(trusted) for cwd in entry_cwds.get((directory,name),{directory}))
@@ -2953,7 +2965,7 @@ nodes:
                       if depth > 8:
                           raise ValueError("test guard: cannot resolve trusted helper: "+entry+" (depth limit 8: "+name+")")
                       visited.add((name,cwd))
-                      trusted.add(name)
+                      if trusted_boundary(root,name): trusted.add(name)
                       if pathlib.PurePosixPath(name).name == "package.json": continue
                       try: body = (root/name).read_text()
                       except (OSError,UnicodeError): continue
@@ -2966,7 +2978,8 @@ nodes:
                           target = path.resolve(strict=True)
                           if not target.is_relative_to(root) or not target.is_file():
                               raise ValueError("test guard: trusted file outside worktree: "+str(path))
-                          trusted.add(target.relative_to(root).as_posix())
+                          target_name = target.relative_to(root).as_posix()
+                          if trusted_boundary(root,target_name): trusted.add(target_name)
                   store = pathlib.Path(snapshot).parent/"trusted-infra"/hashlib.sha256(os.fsencode(directory)).hexdigest()
                   saved = {}
                   for name in sorted(trusted):
