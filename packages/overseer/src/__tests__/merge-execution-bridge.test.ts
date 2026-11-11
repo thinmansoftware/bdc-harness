@@ -291,6 +291,8 @@ describe('merge execution bridge', () => {
         github: h.github,
         readPolicy: () => policy(),
         hasQualifiedReview: async () => true,
+        // the evidence hold now runs before the conflict check; give it a readable, passing run
+        readRunEvents: async () => [],
       });
       expect(h.merges).toBe(0);
       expect(h.outcomes[0]?.reason).toBe('review_conflict_at_head:check_unavailable');

@@ -519,6 +519,8 @@ function bridgeFixture(runless: { originating: OriginatingRun | null | 'throw' }
   });
   const releaseVerdictClaim = mock(async () => true);
   const releaseMergeSlot = mock(async () => undefined);
+  const reserveMergeSlot = mock(async () => true);
+  const approvePullRequest = mock(async () => ({ approved: true }));
   const mergePullRequest = mock(async () => ({ merged: true, sha: 'c'.repeat(40) }));
   const commentOnPullRequest = mock(async ({ body }: { body: string }) => {
     comments.push({ body, authorLogin: 'thinman-overseer' });
@@ -537,13 +539,14 @@ function bridgeFixture(runless: { originating: OriginatingRun | null | 'throw' }
       releaseVerdictClaim,
       recordOutcome,
       getRunById: async (): Promise<OverseerWatchRun | null> => null,
-      reserveMergeSlot: async () => true,
+      reserveMergeSlot,
       releaseMergeSlot,
       getEarliestMergeSlotReservation: async () => null,
     },
     github: {
       findPullRequest: async () => pr,
       mergePullRequest,
+      approvePullRequest,
       commentAuthorLogin: 'thinman-overseer',
       listPullRequestComments: async () => comments,
       commentOnPullRequest,
@@ -569,9 +572,12 @@ function bridgeFixture(runless: { originating: OriginatingRun | null | 'throw' }
   };
   return {
     options,
+    verdict,
     comments,
     mergePullRequest,
     releaseMergeSlot,
+    reserveMergeSlot,
+    approvePullRequest,
     releaseVerdictClaim,
     recordOutcome,
     addPullRequestLabels,
@@ -584,7 +590,8 @@ describe('merge bridge: run-less verdict traced to its originating run', () => {
     const f = bridgeFixture({ originating: { runId: RUN_ID, status: 'failed' } });
     await runMergeExecutionBridgeOnce(f.options);
     expect(f.mergePullRequest).not.toHaveBeenCalled();
-    expect(f.releaseMergeSlot).toHaveBeenCalledWith('verdict-runless');
+    expect(f.reserveMergeSlot).not.toHaveBeenCalled();
+    expect(f.approvePullRequest).not.toHaveBeenCalled();
     expect(f.releaseVerdictClaim).toHaveBeenCalledWith(
       'verdict-runless',
       'originating_run_failed_evidence_gate'
@@ -613,6 +620,16 @@ describe('merge bridge: run-less verdict traced to its originating run', () => {
       'verdict-runless',
       'originating_run_unreadable'
     );
+  });
+
+  test('Test 2 (#5358): five passes over a run-less verdict whose run is running post no approval and take no slot', async () => {
+    const f = bridgeFixture({ originating: { runId: RUN_ID, status: 'running' } });
+    f.options.store.listUnactionedVerdicts = async () => [f.verdict];
+    for (let pass = 0; pass < 5; pass += 1) await runMergeExecutionBridgeOnce(f.options);
+    expect(f.approvePullRequest).not.toHaveBeenCalled();
+    expect(f.reserveMergeSlot).not.toHaveBeenCalled();
+    expect(f.mergePullRequest).not.toHaveBeenCalled();
+    expect(f.comments).toHaveLength(1);
   });
 
   test('Test 8 (bridge): a run still running holds as originating_run_in_progress with no label', async () => {

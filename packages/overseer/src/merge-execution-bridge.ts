@@ -706,6 +706,44 @@ function reportedChecksAreBlocking(checks: PullRequestEvidence['checks']): boole
   return checks.total === 0 || checks.failed > 0 || checks.pending > 0;
 }
 
+/**
+ * Approval memo (bdc-xo#5358): the bridge posts at most one approving review per exact head SHA per
+ * ten minutes. In-process and bounded; a restart or a new head posts again, which is correct.
+ */
+const APPROVAL_MEMO_TTL_MS = 10 * 60 * 1000;
+const APPROVAL_MEMO_MAX = 512;
+// One memo per GitHub client object: the service reuses its client across passes, a test builds its own.
+const approvalMemos = new WeakMap<object, Map<string, number>>();
+
+function approvalMemoFor(github: object): Map<string, number> {
+  let memo = approvalMemos.get(github);
+  if (!memo) {
+    memo = new Map<string, number>();
+    approvalMemos.set(github, memo);
+  }
+  return memo;
+}
+
+function approvalRecentlyPosted(github: object, key: string, nowMs: number): boolean {
+  const at = approvalMemoFor(github).get(key);
+  return at !== undefined && nowMs - at < APPROVAL_MEMO_TTL_MS;
+}
+
+function noteApprovalPosted(github: object, key: string, nowMs: number): void {
+  const memo = approvalMemoFor(github);
+  if (memo.size >= APPROVAL_MEMO_MAX) {
+    for (const [k, at] of memo) {
+      if (nowMs - at >= APPROVAL_MEMO_TTL_MS) memo.delete(k);
+    }
+    while (memo.size >= APPROVAL_MEMO_MAX) {
+      const oldest = memo.keys().next().value;
+      if (oldest === undefined) break;
+      memo.delete(oldest);
+    }
+  }
+  memo.set(key, nowMs);
+}
+
 async function postCeilingQueueNotice(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
@@ -1115,6 +1153,64 @@ async function mergeClaimedVerdict(
     }
   }
 
+  // Evidence holds run FIRST: before the merge slot is reserved and before any approval is posted
+  // (bdc-xo#5358). A held pull request used to reserve a slot, post a fresh empty APPROVED review and
+  // only then find the hold, once per pass (27 approvals in 15 minutes on one held PR). Now a held
+  // verdict takes no slot and posts no approval; the next pass re-evaluates it for free of writes.
+  if (isRunlessVerdict(verdict) && options.findOriginatingRun) {
+    const traced = await runlessOriginatingEvidenceHold(
+      {
+        owner: pr.pr.owner,
+        repo: pr.pr.repo,
+        number: pr.pr.number,
+        headRef: pr.pr.headRef,
+      },
+      options.findOriginatingRun,
+      options.readRunEvents
+    );
+    if (
+      traced &&
+      !(
+        traced.failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON &&
+        (await evidenceAdjudicated(options.github, { ...pr.pr, headSha: verdict.head_sha }))
+      )
+    ) {
+      await postEvidenceHold(
+        options.github,
+        traced.runId,
+        { ...pr.pr, headSha: verdict.head_sha },
+        traced.failure,
+        'execute',
+        true
+      );
+      await skip(traced.failure.reason, pr.htmlUrl);
+      return undefined;
+    }
+  }
+  if (!isRunlessVerdict(verdict)) {
+    const failure = await originatingEvidenceFailure(
+      { runId: verdict.run_id, status: target.run?.status ?? '' },
+      target.run?.id === verdict.run_id ? options.readRunEvents : undefined
+    );
+    if (
+      failure &&
+      !(
+        failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON &&
+        (await evidenceAdjudicated(options.github, { ...pr.pr, headSha: verdict.head_sha }))
+      )
+    ) {
+      await postEvidenceHold(
+        options.github,
+        verdict.run_id,
+        { ...pr.pr, headSha: verdict.head_sha },
+        failure,
+        'execute',
+        true
+      );
+      await skip(failure.reason, pr.htmlUrl);
+      return undefined;
+    }
+  }
   const now = (options.now ?? ((): Date => new Date()))();
   const since = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
   const ceiling = configuredLimit(options.maxMergesPerHour);
@@ -1141,16 +1237,22 @@ async function mergeClaimedVerdict(
   }
 
   if (options.github.approvePullRequest) {
-    try {
-      await options.github.approvePullRequest({
-        ...pr.pr,
-        expectedHeadSha: verdict.head_sha,
-      });
-    } catch (error) {
-      log.warn(
-        { err: error as Error, verdictId: verdict.id },
-        'merge-coordinator.approval_failed_nonfatal'
-      );
+    // At most one approval per exact head per APPROVAL_MEMO_TTL_MS: a pass that returns before the merge
+    // (review in flight, changes requested, merge failure) must not post another approval on the next pass.
+    const approvalKey = `${pr.pr.owner}/${pr.pr.repo}#${String(pr.pr.number)}@${verdict.head_sha}`;
+    if (!approvalRecentlyPosted(options.github, approvalKey, now.getTime())) {
+      try {
+        await options.github.approvePullRequest({
+          ...pr.pr,
+          expectedHeadSha: verdict.head_sha,
+        });
+        noteApprovalPosted(options.github, approvalKey, now.getTime());
+      } catch (error) {
+        log.warn(
+          { err: error as Error, verdictId: verdict.id },
+          'merge-coordinator.approval_failed_nonfatal'
+        );
+      }
     }
   }
   // Fail-closed re-verify of the CE approval/gate immediately before merge.
@@ -1196,62 +1298,6 @@ async function mergeClaimedVerdict(
     await options.store.releaseMergeSlot(verdict.id);
     await skip(`review_conflict_at_head:${conflict}`, pr.htmlUrl);
     return undefined;
-  }
-  if (isRunlessVerdict(verdict) && options.findOriginatingRun) {
-    const traced = await runlessOriginatingEvidenceHold(
-      {
-        owner: pr.pr.owner,
-        repo: pr.pr.repo,
-        number: pr.pr.number,
-        headRef: pr.pr.headRef,
-      },
-      options.findOriginatingRun,
-      options.readRunEvents
-    );
-    if (
-      traced &&
-      !(
-        traced.failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON &&
-        (await evidenceAdjudicated(options.github, { ...pr.pr, headSha: verdict.head_sha }))
-      )
-    ) {
-      await options.store.releaseMergeSlot(verdict.id);
-      await postEvidenceHold(
-        options.github,
-        traced.runId,
-        { ...pr.pr, headSha: verdict.head_sha },
-        traced.failure,
-        'execute',
-        true
-      );
-      await skip(traced.failure.reason, pr.htmlUrl);
-      return undefined;
-    }
-  }
-  if (!isRunlessVerdict(verdict)) {
-    const failure = await originatingEvidenceFailure(
-      { runId: verdict.run_id, status: target.run?.status ?? '' },
-      target.run?.id === verdict.run_id ? options.readRunEvents : undefined
-    );
-    if (
-      failure &&
-      !(
-        failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON &&
-        (await evidenceAdjudicated(options.github, { ...pr.pr, headSha: verdict.head_sha }))
-      )
-    ) {
-      await options.store.releaseMergeSlot(verdict.id);
-      await postEvidenceHold(
-        options.github,
-        verdict.run_id,
-        { ...pr.pr, headSha: verdict.head_sha },
-        failure,
-        'execute',
-        true
-      );
-      await skip(failure.reason, pr.htmlUrl);
-      return undefined;
-    }
   }
   let merged: Awaited<ReturnType<GitHubClientDeps['mergePullRequest']>>;
   try {

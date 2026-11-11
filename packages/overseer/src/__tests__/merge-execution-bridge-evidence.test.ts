@@ -64,6 +64,8 @@ function fixture() {
   });
   const releaseVerdictClaim = mock(async () => true);
   const releaseMergeSlot = mock(async () => undefined);
+  const reserveMergeSlot = mock(async () => true);
+  const approvePullRequest = mock(async () => ({ approved: true }));
   const mergePullRequest = mock(async () => ({ merged: true, sha: 'c'.repeat(40) }));
   const commentOnPullRequest = mock(async ({ body }: { body: string }) => {
     comments.push({ body, authorLogin: 'thinman-overseer' });
@@ -89,13 +91,14 @@ function fixture() {
       releaseVerdictClaim,
       recordOutcome,
       getRunById,
-      reserveMergeSlot: async () => true,
+      reserveMergeSlot,
       releaseMergeSlot,
       getEarliestMergeSlotReservation: async () => null,
     },
     github: {
       findPullRequest: async () => pr,
       mergePullRequest,
+      approvePullRequest,
       commentAuthorLogin: 'thinman-overseer',
       listPullRequestComments: async () => comments,
       commentOnPullRequest,
@@ -127,6 +130,8 @@ function fixture() {
     readRunEvents,
     mergePullRequest,
     releaseMergeSlot,
+    reserveMergeSlot,
+    approvePullRequest,
     releaseVerdictClaim,
     recordOutcome,
     commentOnPullRequest,
@@ -140,7 +145,10 @@ describe('verdict-driven originating-run evidence gate', () => {
     const f = fixture();
     await runMergeExecutionBridgeOnce(f.options);
     expect(f.mergePullRequest).not.toHaveBeenCalled();
-    expect(f.releaseMergeSlot).toHaveBeenCalledWith('verdict-evidence');
+    // #5358: a held verdict takes no merge slot and posts no approval
+    expect(f.reserveMergeSlot).not.toHaveBeenCalled();
+    expect(f.releaseMergeSlot).not.toHaveBeenCalled();
+    expect(f.approvePullRequest).not.toHaveBeenCalled();
     expect(f.releaseVerdictClaim).toHaveBeenCalledWith(
       'verdict-evidence',
       'originating_run_failed_evidence_gate'
@@ -201,9 +209,44 @@ describe('verdict-driven originating-run evidence gate', () => {
         'verdict-evidence',
         'originating_run_unreadable'
       );
-      expect(f.releaseMergeSlot).toHaveBeenCalledWith('verdict-evidence');
+      expect(f.reserveMergeSlot).not.toHaveBeenCalled();
+      expect(f.approvePullRequest).not.toHaveBeenCalled();
       expect(f.comments[0]?.body).toContain('Merge held: originating run run-evidence unreadable');
     }
+  });
+
+  test('Test 1 (#5358): five passes over a held verdict post no approval, take no slot, comment once', async () => {
+    const f = fixture();
+    f.options.store.listUnactionedVerdicts = async () => [f.verdict];
+    for (let pass = 0; pass < 5; pass += 1) await runMergeExecutionBridgeOnce(f.options);
+    expect(f.approvePullRequest).not.toHaveBeenCalled();
+    expect(f.reserveMergeSlot).not.toHaveBeenCalled();
+    expect(f.mergePullRequest).not.toHaveBeenCalled();
+    expect(f.comments).toHaveLength(1);
+    expect(f.readRunEvents.mock.calls.length).toBeGreaterThanOrEqual(5);
+  });
+
+  test('Test 3 (#5358): an unchanged head collects at most one approval across passes that stop before the merge', async () => {
+    const f = fixture();
+    f.readRunEvents.mockImplementation(async () => [
+      {
+        id: 'pass',
+        workflow_run_id: 'run-evidence',
+        event_type: 'node_completed',
+        step_name: 'manifest-evidence-check',
+        data: {},
+      },
+    ]);
+    f.options.reviewConflictAtHead = async () => 'review_in_flight';
+    f.options.store.listUnactionedVerdicts = async () => [f.verdict];
+    for (let pass = 0; pass < 3; pass += 1) await runMergeExecutionBridgeOnce(f.options);
+    expect(f.mergePullRequest).not.toHaveBeenCalled();
+    expect(f.approvePullRequest).toHaveBeenCalledTimes(1);
+    // a different head is a different approval
+    f.verdict.head_sha = 'f'.repeat(40);
+    f.pr.headSha = 'f'.repeat(40);
+    await runMergeExecutionBridgeOnce(f.options);
+    expect(f.approvePullRequest).toHaveBeenCalledTimes(2);
   });
 
   test('bridge evidence (d): runless verdicts merge without reading run rows or events', async () => {
