@@ -2588,6 +2588,8 @@ nodes:
       touched = set()
       violations = []
       command_files = {}
+      entry_cwds = {}
+      trusted_root = pathlib.Path(snapshot).resolve().parent/"trusted-infra"
       def excluded(name):
           return any(part in {"node_modules",".git",".venv","venv","__pycache__",".bun",".pnpm-store"} for part in pathlib.PurePosixPath(name).parts)
       def directory_in_tree(root,name):
@@ -2661,8 +2663,41 @@ nodes:
                       name = path.relative_to(root).as_posix()
                       if not excluded(name) and not directory_in_tree(root,name):
                           command_files.setdefault(str(root),set()).add(name)
+                          if expand: entry_cwds.setdefault((str(root),name),set()).add(str(cwd))
       for directory, command in zip(declared[::2],declared[1::2]):
           declared_paths(pathlib.Path(directory).resolve(),command)
+      def named_helpers(root,body,cwd):
+          # Follow literal command/source positions, not data arguments such as
+          # `grep good a.js`. Product inputs must retain their repaired bytes.
+          lexer = shlex.shlex(body,posix=True,punctuation_chars="&|;()\n")
+          lexer.whitespace = " \t\r"
+          lexer.whitespace_split = True
+          lexer.commenters = "#"
+          try: tokens = list(lexer)
+          except ValueError: return set()
+          segments, segment, found = [], [], set()
+          for token in tokens+["\n"]:
+              if token and all(c in "&|;()\n" for c in token):
+                  segments.append(segment); segment = []
+              else: segment.append(token)
+          for segment in segments:
+              while segment and (segment[0] in {"if","then","else","elif","do","!","exec","command","env"} or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=",segment[0])):
+                  segment = segment[1:]
+              if not segment: continue
+              if segment[0] == "cd" and len(segment) == 2:
+                  cwd = pathlib.Path(os.path.abspath(cwd/segment[1]))
+                  if not cwd.is_relative_to(root): return found
+                  continue
+              head = segment[0] if segment[0] == "." else pathlib.Path(segment[0]).name
+              arguments = segment[1:] if head in {".","source"} or re.fullmatch(r"(?:ba|z|da|k)?sh|python(?:[0-9.]+)?|node(?:js)?|bun",head) else segment[:1]
+              for token in arguments:
+                  if token.startswith("-"): continue
+                  path = pathlib.Path(os.path.abspath(cwd/token))
+                  if path.is_relative_to(root) and path.is_file():
+                      name = path.relative_to(root).as_posix()
+                      if not excluded(name): found.add(name)
+                      break
+          return found
       def git_paths(root,*args):
           return {os.fsdecode(name) for name in subprocess.check_output(["git",*args],cwd=root).split(b"\x00") if name}
       def test_file(name):
@@ -2716,6 +2751,8 @@ nodes:
           executable_index = {entry.split("\t",1)[1] for entry in index if entry.startswith("100755 ")}
           files = {name for name in tracked | git_paths(root,"ls-files","-z","--others") | command_files.get(directory,set()) if not excluded(name) and not directory_in_tree(root,name)}
           if mode == "snapshot":
+              # The output of an earlier snapshot is not another test input.
+              files = {name for name in files if not (root/name).is_relative_to(trusted_root)}
               links = {}
               def freeze_link(name):
                   path = root/name
@@ -2752,6 +2789,33 @@ nodes:
               allowed = build_allowed - declared_set - targets
               frozen = (tracked - allowed) | {name for name in files if infrastructure(root,name)} | declared_set | targets
               now[directory] = dict(allowed=sorted(allowed),known=sorted(files),links=links,frozen={name:digest(root/name) for name in sorted(frozen)},infrastructure={name:fingerprint(root/name) for name in sorted(files | targets) if infrastructure(root,name)})
+              # Save bytes without widening the guard's frozen set. Literal helper
+              # references belong to trusted execution, even when product-allowed.
+              trusted = {name for name in files | targets if infrastructure(root,name)} | declared_set
+              for name in sorted(declared_set):
+                  if pathlib.PurePosixPath(name).name == "package.json": continue
+                  try: body = (root/name).read_text()
+                  except (OSError,UnicodeError): continue
+                  for cwd in entry_cwds.get((directory,name),{directory}):
+                      trusted.update(named_helpers(root,body,pathlib.Path(cwd)))
+              for name in list(trusted):
+                  path = root/name
+                  if path.is_symlink() or path.resolve() != path:
+                      target = path.resolve(strict=True)
+                      if not target.is_relative_to(root) or not target.is_file():
+                          sys.exit("test guard: trusted file outside worktree: "+str(path))
+                      trusted.add(target.relative_to(root).as_posix())
+              store = pathlib.Path(snapshot).parent/"trusted-infra"/hashlib.sha256(os.fsencode(directory)).hexdigest()
+              saved = {}
+              for name in sorted(trusted):
+                  path = root/name
+                  raw = content(path)
+                  if raw is None: continue
+                  dest = store/name
+                  dest.parent.mkdir(parents=True,exist_ok=True)
+                  dest.write_bytes(raw)
+                  saved[name] = dict(sha=hashlib.sha256(raw).hexdigest(),executable=executable(path),link=os.readlink(path) if path.is_symlink() else None)
+              now[directory]["trusted"] = saved
               continue
           if directory not in before: sys.exit("test guard: unsnapshotted stage directory: "+directory)
           saved = before[directory]
@@ -2773,6 +2837,18 @@ nodes:
               if raw is not None and any(re.search(t,raw.decode(errors="replace")) for t in markers):
                   violations.append("test guard: skip/only/todo in new file: "+directory+"/"+name)
       if mode == "snapshot":
+          # Artifacts can live inside a checkout. Inventory our generated bytes at
+          # the same snapshot boundary, before any repair can create new files.
+          for directory, state in now.items():
+              root = pathlib.Path(directory)
+              if not trusted_root.is_relative_to(root): continue
+              executable_index = set()
+              generated = {path.relative_to(root).as_posix() for path in trusted_root.rglob("*") if path.is_file()}
+              state["known"] = sorted(set(state["known"]) | generated)
+              for name in generated:
+                  if infrastructure(root,name):
+                      state["frozen"][name] = digest(root/name)
+                      state["infrastructure"][name] = fingerprint(root/name)
           pathlib.Path(snapshot).write_text(json.dumps(now,sort_keys=True),encoding="ascii")
       if mode == "report":
           sys.stdout.reconfigure(newline="\n")
@@ -2787,6 +2863,96 @@ nodes:
       trg_snapshot() { trg_guard snapshot "$1" "$2"; }
       trg_check() { trg_guard check "$1" "$2"; }
       trg_infrastructure() { trg_guard report "$1" "$2"; }
+      # Run only final verification in disposable copies. Git metadata is private;
+      # object alternates are read-only inputs, and dependencies are copied too.
+      trg_execute_trusted() (
+        local e="$1" class="$2" scratch sid repo command target dir prepared
+        local -a stages=()
+        e="$(cd "$e" && pwd)" || return 1
+        scratch="$(mktemp -d)" || return 1
+        trap 'rm -rf "$scratch"' EXIT
+        if [ -s "$e/stop-tests.stages" ]; then
+          while IFS=$'\t' read -r sid repo command target; do
+            dir="$(rst_stage_dir "$sid" "$repo")"
+            stages+=("$sid" "$dir")
+          done < "$e/stop-tests.stages"
+        fi
+        python3 - "$e/test-guard.json" "$scratch" "$(pwd)" "${ARTIFACTS_DIR:-}" "${stages[@]}" <<'TRUSTED_PY'
+      import hashlib, json, os, pathlib, shutil, subprocess, sys
+      snapshot, scratch, current, artifacts = map(pathlib.Path,sys.argv[1:5])
+      scratch, current = scratch.resolve(), current.resolve()
+      saved = json.loads(snapshot.read_text())
+      copies = {}
+      def remove(path):
+          if path.is_symlink() or path.is_file(): path.unlink()
+          elif path.exists(): shutil.rmtree(path)
+      def ignore(directory,names):
+          return [name for name in names if name == ".git" or (artifacts and (pathlib.Path(directory)/name).resolve() == artifacts.resolve())]
+      try:
+          for directory, state in saved.items():
+              root = pathlib.Path(directory)
+              key = hashlib.sha256(os.fsencode(directory)).hexdigest()
+              dest = scratch/key
+              trusted = state["trusted"]
+              store = snapshot.parent/"trusted-infra"/key
+              # Verify all trusted bytes before allowing any command to execute.
+              for name, entry in trusted.items():
+                  path = pathlib.PurePosixPath(name)
+                  if path.is_absolute() or ".." in path.parts: raise ValueError("unsafe trusted path")
+                  if hashlib.sha256((store/name).read_bytes()).hexdigest() != entry["sha"]:
+                      raise ValueError("damaged trusted file: "+name)
+              subprocess.run(["git","clone","--shared","--no-checkout","--quiet",str(root),str(dest)],check=True)
+              origin = subprocess.check_output(["git","remote","get-url","origin"],cwd=root,text=True).strip()
+              subprocess.run(["git","remote","set-url","origin",origin],cwd=dest,check=True)
+              shutil.copytree(root,dest,symlinks=True,dirs_exist_ok=True,ignore=ignore)
+              # Internal links stay internal; materialize external links so a
+              # command cannot write through a copied link into the live checkout.
+              for base, dirs, files in os.walk(dest):
+                  dirs[:] = [name for name in dirs if name != ".git"]
+                  for name in dirs + files:
+                      path = pathlib.Path(base)/name
+                      if not path.is_symlink(): continue
+                      original = root/path.relative_to(dest)
+                      resolved = original.resolve(strict=True)
+                      path.unlink()
+                      if resolved.is_relative_to(root):
+                          path.symlink_to(os.path.relpath(dest/resolved.relative_to(root),path.parent),target_is_directory=resolved.is_dir())
+                      elif resolved.is_dir(): shutil.copytree(resolved,path,symlinks=False,ignore=ignore)
+                      else: shutil.copy2(resolved,path)
+              for name, entry in trusted.items():
+                  path = dest/name
+                  parent = dest
+                  for part in pathlib.PurePosixPath(name).parts[:-1]:
+                      parent = parent/part
+                      if parent.is_symlink() or (parent.exists() and not parent.is_dir()): remove(parent)
+                      parent.mkdir(exist_ok=True)
+                  remove(path)
+                  if entry["link"] is not None:
+                      target = pathlib.Path(os.path.abspath(root/pathlib.Path(name).parent/entry["link"]))
+                      if not target.is_relative_to(root): raise ValueError("external trusted link")
+                      path.symlink_to(os.path.relpath(dest/target.relative_to(root),path.parent))
+                  else:
+                      shutil.copyfile(store/name,path)
+                      path.chmod(0o755 if entry["executable"] else 0o644)
+              copies[str(root.resolve())] = str(dest)
+          (scratch/"current").write_text(copies[str(current)],encoding="utf-8")
+          stages = []
+          for sid, directory in zip(sys.argv[5::2],sys.argv[6::2]):
+              mapped = copies[str(pathlib.Path(directory).resolve())] if directory else ""
+              stages.append(sid+"="+mapped)
+          (scratch/"stages").write_text("\n".join(stages),encoding="utf-8")
+      except (OSError,ValueError,KeyError,RuntimeError,subprocess.CalledProcessError) as error:
+          sys.exit("test guard: cannot prepare trusted final run: "+str(error))
+      TRUSTED_PY
+        prepared=$?
+        if [ "$prepared" -ne 0 ]; then
+          printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=tests_failed_after_repair:trusted_infra\nTESTS_LINE=BLOCKED (trusted infrastructure unavailable)\nTESTS_CLASS=%s\n' "$class"
+          return 0
+        fi
+        export RST_STAGE_WORKTREES="$(cat "$scratch/stages")"
+        cd "$(cat "$scratch/current")" || return 1
+        rst_execute_saved "$e" "$class"
+      )
       # Snapshot failures block repair before the classifier can admit an attempt.
       trg_snapshot_report() {
         local previous result
@@ -3042,7 +3208,7 @@ nodes:
         hooks), executable files, package.json, lockfiles, runner configs,
         Makefile, tsconfig* and .github paths.
         Resolved in-worktree symlink targets of test entrypoints are frozen too.
-        Product source executed as infrastructure is the accepted residual.
+        Final verification restores named infrastructure helpers from the snapshot.
         Any repair-touched infrastructure blocks and is listed for a human.
         Never add test files or skip/only/todo markers. Never emit
         __NEVER_EMIT_USE_UNTIL_BASH__. The deterministic rerun and allowlist guard
@@ -3084,7 +3250,7 @@ nodes:
       fi
       . "$EVIDENCE_DIR/stop-tests.core.sh"
       export RST_TIMEOUT_SECONDS="$(cat "$EVIDENCE_DIR/stop-tests.timeout")"
-      rst_execute_saved "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")" > "$EVIDENCE_DIR/stop-tests.final-raw"
+      trg_execute_trusted "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")" > "$EVIDENCE_DIR/stop-tests.final-raw"
       INFRA_FAILURE=0
       trg_infrastructure "$(pwd)" "$EVIDENCE_DIR/test-guard.json" > "$EVIDENCE_DIR/test-repair.infrastructure" || INFRA_FAILURE=1
       RESULT=repaired
@@ -3101,7 +3267,7 @@ nodes:
           grep -vE '^TESTS_(STATUS|BLOCKED_REASON)=' "$EVIDENCE_DIR/stop-tests.final-raw"
           printf 'TESTS_STATUS=blocked\nTESTS_BLOCKED_REASON=%s\n' "$REASON"
         else cat "$EVIDENCE_DIR/stop-tests.final-raw"; fi
-        printf 'TESTS_REPAIR_ATTEMPTS=%s\nTESTS_REPAIR_RESULT=%s\n' "$ATTEMPTS" "$RESULT"
+        printf 'TESTS_FINAL_INFRA=trusted\nTESTS_REPAIR_ATTEMPTS=%s\nTESTS_REPAIR_RESULT=%s\n' "$ATTEMPTS" "$RESULT"
         cat "$EVIDENCE_DIR/test-repair.infrastructure"
       } | tee "$EVIDENCE_DIR/stop-tests.final"
 
@@ -6200,10 +6366,11 @@ nodes:
       #   audit line is inserted after VALIDATION: (a non-label line there is outside
       #   every bdc-ci section; OUTCOME: already lives there).
       sme_process() {
-        local tests_line="$1" tests_status="$2" grep_line="$3" grep_status="$4" grep_dropped="${5:-0}" tests_reason="${6:-}" manifest verdict stop_detail=""
+        local tests_line="$1" tests_status="$2" grep_line="$3" grep_status="$4" grep_dropped="${5:-0}" tests_reason="${6:-}" final_infra="${7:-}" manifest verdict stop_detail=""
         manifest="$(cat)"
         if ! printf '%s\n' "$manifest" | grep -qE '^Tests:'; then
           printf '%s\n' "$manifest"
+          [ "$final_infra" != trusted ] || printf 'TESTS_FINAL_INFRA=trusted\n'
           return 0
         fi
         [ -n "$tests_line" ] || tests_line="N/A (evidence node run-stop-tests did not run)"
@@ -6229,6 +6396,7 @@ nodes:
           { print }
           END { if (!gs) print ENVIRON["G_LINE"]; if (!vs) print ENVIRON["S_LINE"] }
         '
+        [ "$final_infra" != trusted ] || printf 'TESTS_FINAL_INFRA=trusted\n'
       }
       # ---- END sme core ----
 
@@ -6272,7 +6440,8 @@ nodes:
       printf '%s\n' "$MANIFEST_OUT" | sme_process \
         "$(sme_field TESTS_LINE "$TESTS_OUT")" "$(sme_field TESTS_STATUS "$TESTS_OUT")" \
         "$(sme_field GREP_LINE "$GREPS_OUT")" "$(sme_field GREP_STATUS "$GREPS_OUT")" \
-        "$(sme_field GREP_DROPPED "$GREPS_OUT")" | stb_stamp_base_red
+        "$(sme_field GREP_DROPPED "$GREPS_OUT")" "$(sme_field TESTS_BLOCKED_REASON "$TESTS_OUT")" \
+        "$(sme_field TESTS_FINAL_INFRA "$TESTS_OUT")" | stb_stamp_base_red
 
   # bdc-xo #1940. manifest-evidence-check fails CLOSED (exit 1, no PR-body patch) when
   # a CODE or MIXED WO would publish "Tests: N/A ..." (Rule 10 / manifest v2 require

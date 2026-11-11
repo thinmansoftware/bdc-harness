@@ -33,6 +33,29 @@ An initial unavailable capability never enters repair, stamps
 `VALIDATION: FAIL`, and fails the evidence gate with `ENVIRONMENT_UNAVAILABLE:`
 even on a non-PROCEED run. Without that probe, the existing blocked reasons apply.
 
+## Trusted final verification (WO #5217)
+
+Option A, the snapshot tree, was approved by the acting XO on 2026-11-11
+(bdc-xo#5217, fence 308). The trusted source is post-build and pre-repair, at
+the existing guard snapshot. This keeps legitimate build-time test changes
+and uses the same pre-repair evidence boundary the gate already accepts.
+Option B, restoring infrastructure from the base commit, is deferred; revisit
+it only if the Overseer finds build-time helper faking in practice.
+
+The snapshot saves byte copies under `evidence/trusted-infra/`, separately for
+the run checkout and each available stage checkout. It includes the existing
+test-infrastructure class and literal invoked or sourced file references in
+declared entrypoints. Product data read by those entrypoints remains repairable.
+The guard's product allowlist and freeze rules remain unchanged. After a repair,
+final verification copies the repaired checkouts into temporary directories,
+restores their saved infrastructure, and executes the persisted commands there.
+Product fixes remain present; a repair's fabricated helper bytes do not run.
+Command side effects remain in the scratch copies. Evidence files still go to
+the run's artifact directory. Scratch copies are removed after final verification.
+Missing or damaged trusted inputs fail closed. Final output and the stamped
+manifest record `TESTS_FINAL_INFRA=trusted`. Runs with no repair use the original
+evidence without creating a scratch copy or recording that mode.
+
 ## Saved inputs and stage directories
 
 The evidence directory contains `stop-tests.commands` (one full command per line),
@@ -98,8 +121,10 @@ The same target freeze applies to symlinks elsewhere in the frozen-file set.
 
 The guard does not trace helpers called or sourced by a frozen entrypoint.
 Every build-changed file in the test-infrastructure class is removed from the
-allowlist and frozen by SHA-256. The remaining accepted residual is product
-source outside that class executed as test infrastructure (bdc-xo#5217).
+allowlist and frozen by SHA-256. Product source outside that class remains
+allowed by the guard. Named helpers invoked or sourced by declared entrypoints
+use their snapshot bytes during trusted final verification (bdc-xo#5217);
+this is not runtime execution tracing.
 Final run output and the PR's stamped manifest section list
 repair changes to shell scripts, test/runner configuration, CI files, scripts or
 test directories, declared command files and executable files under
