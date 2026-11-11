@@ -7,7 +7,7 @@
 #   4 the new container failed to start or was not healthy and the pinned image was restored; 5 the image BUILD FAILED and the old
 #   container is still running (the checkout is put back on the starting commit; bdc-xo#5444).
 #   Exit 3 also covers: drain not confirmed (ABORT_DRAIN) or never drained, a failed git fetch (ABORT_FETCH), no database backup (ABORT_BACKUP), no pin (ABORT_PIN).
-#   Exit 6: the lanes could not be published and verified identical (ABORT_LANES; the container is up, drain left ON). Exit 7: drain would not clear (DRAIN_STUCK).
+#   Exit 8: the rollback itself failed or the restored container is not healthy (ROLLBACK_FAILED; drain left ON). Exit 6: the lanes could not be published and verified identical (ABORT_LANES; the container is up, drain left ON). Exit 7: drain would not clear (DRAIN_STUCK).
 # Overrides for tests: ARCHON_DIR, DB, SCRIPTS_DIR (defaults are the host paths). Runbook: docs/operations/rebuild-xo.md
 # Replaces the /tmp/rebuild-892.sh + /tmp/after-*.sh scripts lost in the 2026-09-24 reboot.
 set -uo pipefail
@@ -52,7 +52,23 @@ TOKEN=$(docker exec archon-app-1 printenv ARCHON_OPERATOR_TOKEN 2>/dev/null)
 API=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:3090/api/workflows -H "x-archon-operator-token: $TOKEN" || echo 000)
 echo "health=$S api=$API"
 if [ "$URC" -ne 0 ] || [ "$S" != healthy ] || [ "$API" != 200 ]; then
-  echo "=== ROLLBACK to archon:rollback-$STAMP (up rc=$URC health=$S api=$API) ==="; git checkout -q "$PREV" || echo "WARN: could not restore the checkout to $PREV"; docker tag "archon:rollback-$STAMP" archon:latest; docker compose up -d --no-build --force-recreate "$SVC" 2>&1 | tail -2; sleep 30; undrain; exit 4
+  echo "=== ROLLBACK to archon:rollback-$STAMP (up rc=$URC health=$S api=$API) ==="
+  # Every rollback step is checked. If any step fails, or the restored container is not healthy,
+  # drain is left ON (no work starts on a broken container) and the script exits 8.
+  RBF=0
+  git checkout -q "$PREV" || { echo "ROLLBACK_STEP_FAILED: could not restore the checkout to $PREV"; RBF=1; }
+  docker tag "archon:rollback-$STAMP" archon:latest || { echo "ROLLBACK_STEP_FAILED: could not retag the pinned image"; RBF=1; }
+  docker compose up -d --no-build --force-recreate "$SVC" 2>&1 | tail -2
+  [ "${PIPESTATUS[0]}" -eq 0 ] || { echo "ROLLBACK_STEP_FAILED: could not recreate the container from the pinned image"; RBF=1; }
+  i=0; RS=unknown
+  while [ $i -lt 30 ]; do RS=$(docker inspect --format '{{.State.Health.Status}}' archon-app-1 2>/dev/null || echo missing); [ "$RS" = healthy ] && break; i=$((i+1)); sleep 5; done
+  TOKEN=$(docker exec archon-app-1 printenv ARCHON_OPERATOR_TOKEN 2>/dev/null)
+  RAPI=$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' http://127.0.0.1:3090/api/workflows -H "x-archon-operator-token: $TOKEN" || echo 000)
+  echo "rollback health=$RS api=$RAPI"
+  { [ "$RS" = healthy ] && [ "$RAPI" = 200 ]; } || { echo "ROLLBACK_STEP_FAILED: the restored container is not healthy (health=$RS api=$RAPI)"; RBF=1; }
+  if [ "$RBF" -ne 0 ]; then echo "ROLLBACK_FAILED (drain left ON so no work starts; fix the container, then clear drain by hand)"; exit 8; fi
+  undrain || echo "ALERT DRAIN_STUCK (drain mode is not normal after the rollback; every fire is refused; clear it now)"
+  exit 4
 fi
 echo "=== L: serve lanes (publish, then verify every baked lane is served identical) ==="
 sh "$SCRIPTS_DIR/serve-lanes.sh" --apply > /dev/null 2>&1; LRC=$?

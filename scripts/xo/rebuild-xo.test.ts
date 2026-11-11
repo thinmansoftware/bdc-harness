@@ -5,7 +5,7 @@
  * `sudo`, `df` and `sleep` commands placed first on PATH. Each stub appends its
  * arguments to one call log, so the test can assert what the script did and in
  * what order without a Docker daemon or a host checkout. Environment knobs make
- * one step fail at a time: STUB_BUILD_RC, STUB_UP_RC, STUB_TAG_RC, STUB_BACKUP_RC,
+ * one step fail at a time: STUB_BUILD_RC, STUB_UP_RC, STUB_ROLLBACK_UP_RC, STUB_ROLLBACK_UNHEALTHY, STUB_TAG_RC, STUB_BACKUP_RC,
  * STUB_CURL_FAIL, and STUB_CMP_RC for serve-lanes.sh.
  */
 import { describe, expect, it } from 'bun:test';
@@ -29,7 +29,11 @@ echo "docker $*" >> "$STUB_LOG"
 case "$1 $2" in
   "compose config") echo app ;;
   "compose build") exit "\${STUB_BUILD_RC:-0}" ;;
-  "compose up") exit "\${STUB_UP_RC:-0}" ;;
+  "compose up")
+    case "$*" in
+      *--force-recreate*) touch "$STUB_LOG.rolled"; exit "\${STUB_ROLLBACK_UP_RC:-0}" ;;
+    esac
+    exit "\${STUB_UP_RC:-0}" ;;
   "exec archon-app-1")
     case "$3" in
       printenv) echo tok ;;
@@ -37,7 +41,11 @@ case "$1 $2" in
       cmp) exit "\${STUB_CMP_RC:-0}" ;;
     esac ;;
   "inspect --format")
-    case "$3" in *Health*) echo healthy ;; *RestartCount*) echo 0 ;; esac ;;
+    case "$3" in
+      *Health*)
+        if [ "\${STUB_ROLLBACK_UNHEALTHY:-0}" = 1 ] && [ -e "$STUB_LOG.rolled" ]; then echo unhealthy; else echo healthy; fi ;;
+      *RestartCount*) echo 0 ;;
+    esac ;;
   "inspect -f") echo created ;;
 esac
 [ "$1" = tag ] && exit "\${STUB_TAG_RC:-0}"
@@ -211,6 +219,34 @@ describe('rebuild-xo.sh', () => {
     expect(r.calls.some(c => c.includes('--no-build --force-recreate'))).toBe(true);
     const checkouts = r.calls.filter(c => c.startsWith('git checkout'));
     expect(checkouts[checkouts.length - 1]).toContain(PREV);
+  }, 60_000);
+
+  it('leaves drain ON and exits 8 when the rollback recreate fails (bdc-xo#5444 review)', () => {
+    const r = runScript({ STUB_UP_RC: '1', STUB_ROLLBACK_UP_RC: '1' });
+    expect(r.status).toBe(8);
+    expect(r.out).toContain('ROLLBACK_STEP_FAILED: could not recreate the container');
+    expect(r.out).toContain('ROLLBACK_FAILED');
+    expect(r.out).not.toContain('=== DONE');
+    // drain was turned on before the build and is never cleared after the failed rollback
+    expect(r.calls.some(c => c.includes('"draining":true'))).toBe(true);
+    expect(r.calls.some(c => c.includes('"draining":false'))).toBe(false);
+  }, 60_000);
+
+  it('leaves drain ON and exits 8 when the restored container is not healthy (bdc-xo#5444 review)', () => {
+    const r = runScript({ STUB_UP_RC: '1', STUB_ROLLBACK_UNHEALTHY: '1' });
+    expect(r.status).toBe(8);
+    expect(r.out).toContain('rollback health=unhealthy');
+    expect(r.out).toContain('ROLLBACK_FAILED');
+    expect(r.calls.some(c => c.includes('"draining":false'))).toBe(false);
+  }, 60_000);
+
+  it('clears drain after a rollback only when every step worked and the container is healthy (bdc-xo#5444 review)', () => {
+    const r = runScript({ STUB_UP_RC: '1' });
+    expect(r.status).toBe(4);
+    expect(r.out).toContain('rollback health=healthy api=200');
+    expect(r.out).not.toContain('ROLLBACK_FAILED');
+    const lastDrain = r.calls.filter(c => c.includes('"draining"')).pop() ?? '';
+    expect(lastDrain).toContain('"draining":false');
   }, 60_000);
 
   it('waits for the drain API to report drained, not for a narrower run count (Test 13)', () => {
