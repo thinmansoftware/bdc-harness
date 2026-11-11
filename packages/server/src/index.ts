@@ -127,6 +127,7 @@ import {
   validateAppDefaultsPaths,
   shutdownTelemetry,
 } from '@archon/paths';
+import { enableGitHubCallSiteLog } from '@archon/core/github/metering';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -228,6 +229,8 @@ function startOverseerRuntimeWithRealMergeManager(): void {
 
 export async function startServer(opts: ServerOptions = {}): Promise<void> {
   getLog().info('server_starting');
+  // Name the endpoints that spend the GitHub quota in the log (bdc-xo#5449). Server only: see metering.ts.
+  enableGitHubCallSiteLog();
 
   // Database auto-detected: SQLite (default) or PostgreSQL (if DATABASE_URL set)
   // No required environment variables - SQLite works out of the box
