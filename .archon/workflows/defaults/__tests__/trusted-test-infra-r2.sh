@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
-# WO #5217 round 2: bounded regressions only; safe for the operator desktop.
+# WO #5217 round 2: no arguments run all cases; arguments select one fixture.
 . "$(dirname "${BASH_SOURCE[0]}")/evidence-test-lib.sh"
 eval "$(core rst)"
 eval "$(core trg)"
+
+selection="$*" selection_count=$# selected_any=0
+selected() {
+  if [ "$selection_count" -eq 0 ] || [ "$selection" = "$*" ]; then
+    selected_any=1
+    return 0
+  fi
+  return 1
+}
 
 commit_fixture() {
   git -C "$WT" add -- "$@"
@@ -31,6 +40,7 @@ PY
 # repair. Only recursively restoring trusted bytes can reject the fake pass.
 for location in current stage; do
   for repair in fake product; do
+    selected chain "$location" "$repair" || continue
     echo "Round 2 chain: $location/$repair"
     fixture "r2-chain-$location-$repair"
     printf 'base\n' > "$WT/product.txt"
@@ -86,6 +96,7 @@ done
 # These all name existing helpers. Missing recursion, imports or relative-token
 # support leaves helper.js out of the snapshot. The helper cycle must terminate.
 for form in source dot bash sh node bun python direct require import js_nested py_from py_import py_dotted py_package token token_bare cycle infra infra_root; do
+  selected discovery "$form" || continue
   echo "Round 2 discovery: $form"
   fixture "r2-discovery-$form"
   prepare_evidence "discovery-$form"
@@ -140,8 +151,9 @@ done
 # to execute repair-modified bytes. Check blocking after an attempted repair.
 dynamic_case=0
 for expression in 'node "$HELPER"' 'source "${DIR}/helper.js"' 'node "$(cat helper-path).js"' 'require("./" + name + ".js");' 'import(name + ".js");' './$DIR/helper.js'; do
-  echo "Round 2 dynamic: $expression"
   dynamic_case=$((dynamic_case+1))
+  selected dynamic "$dynamic_case" || continue
+  echo "Round 2 dynamic: $expression"
   fixture "r2-dynamic-$dynamic_case"
   prepare_evidence "dynamic-$dynamic_case"
   printf '%s\n' "$expression" > "$WT/check.sh"
@@ -158,6 +170,7 @@ for expression in 'node "$HELPER"' 'source "${DIR}/helper.js"' 'node "$(cat help
 done
 
 # The depth cap cannot silently trust an unexamined ninth hop.
+if selected depth; then
 fixture r2-depth
 prepare_evidence depth
 printf '. ./h1.js\n' > "$WT/check.sh"
@@ -171,10 +184,12 @@ printf '1\n' > "$ARTIFACTS_DIR/evidence/test-repair.attempts"
 out="$(run_node run-stop-tests-final)"
 check contains "$out" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
 check contains "$diagnostic" 'test guard: cannot resolve trusted helper: check.sh'
+fi
 
 # Four tracked files, one staged product repair, and a Git-discovered test. An
 # empty scratch index previously skipped the only case and fabricated 0/0.
 for index_mode in normal split; do
+selected index "$index_mode" || continue
 fixture "r2-index-$index_mode"
 prepare_evidence "index-$index_mode"
 printf 'base\n' > "$WT/product.txt"
@@ -209,4 +224,8 @@ check contains "$(cat "$ARTIFACTS_DIR/evidence/stop-tests.log")" 'TRACKED=4'
 check test "$before" = "$(index_bytes "$WT")"
 unset BASE_BRANCH
 done
-finish trusted-test-infra-r2
+if [ "$selected_any" -eq 0 ]; then
+  echo 'Specify chain <current|stage> <fake|product>, discovery <form>, dynamic <1-6>, depth or index <normal|split>' >&2
+  exit 2
+fi
+finish trusted-test-infra-r2.sh

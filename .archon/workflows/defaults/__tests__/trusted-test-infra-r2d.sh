@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
-# WO #5217 round 2d: run one existing Test 19 boundary fixture unchanged.
+# WO #5217 round 2d: no arguments run all cases; use <location> <change> to focus.
 . "$(dirname "${BASH_SOURCE[0]}")/evidence-test-lib.sh"
 eval "$(core rst)"
 eval "$(core trg)"
 
-case "${1:-}/${2:-}" in
+if [ "$#" -eq 0 ]; then
+  scenarios=(current/outside current/broken stage/outside stage/broken)
+elif [ "$#" -eq 2 ]; then
+  scenarios=("$1/$2")
+else
+  echo 'Specify current or stage, then outside or broken' >&2; exit 2
+fi
+for scenario in "${scenarios[@]}"; do
+set -- "${scenario%%/*}" "${scenario#*/}"
+case "$1/$2" in
   current/outside|current/broken|stage/outside|stage/broken) ;;
   *) echo 'Specify current or stage, then outside or broken' >&2; exit 2 ;;
 esac
@@ -27,4 +36,5 @@ print(body)
 PY
 )" || exit 1
 eval "$focused"
-finish "trusted-test-infra-r2d/$1/$2"
+done
+finish trusted-test-infra-r2d.sh

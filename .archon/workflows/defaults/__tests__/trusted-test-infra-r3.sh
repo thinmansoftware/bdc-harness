@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# WO #5217 rescope: one focused boundary fixture per invocation.
+# WO #5217 rescope: no arguments run all cases; use <location> <scenario> to focus.
 . "$(dirname "${BASH_SOURCE[0]}")/evidence-test-lib.sh"
 eval "$(core rst)"
 eval "$(core trg)"
 
-location="${1:-}"
-scenario="${2:-}"
+if [ "$#" -eq 0 ]; then
+  scenarios=(current/chain stage/chain current/product stage/product current/dynamic-product stage/dynamic-product current/dynamic-helper stage/dynamic-helper current/names)
+elif [ "$#" -eq 2 ]; then
+  scenarios=("$1/$2")
+else
+  echo 'Specify current or stage and a scenario, or no arguments for all scenarios' >&2; exit 2
+fi
+for selection in "${scenarios[@]}"; do
+location="${selection%%/*}"
+scenario="${selection#*/}"
 case "$location/$scenario" in
   current/chain|stage/chain|current/product|stage/product|current/dynamic-product|stage/dynamic-product|current/dynamic-helper|stage/dynamic-helper|current/names) ;;
   *) echo 'Specify current or stage, then chain, product, dynamic-product or dynamic-helper; or current names' >&2; exit 2 ;;
@@ -139,4 +147,6 @@ else
   check test "$status" = "$(git -C "$TARGET" status --porcelain=v1)"
   check test "$bytes" = "$(git -C "$TARGET" diff --binary)"
 fi
-finish "trusted-test-infra-r3/$location/$scenario"
+unset RST_STAGE_WORKTREES BASE_BRANCH
+done
+finish trusted-test-infra-r3.sh

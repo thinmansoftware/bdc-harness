@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# WO #5217 round 2c: run one focused fixture per invocation.
+# WO #5217 round 2c: no arguments run all cases; use <scenario> to focus.
 . "$(dirname "${BASH_SOURCE[0]}")/evidence-test-lib.sh"
 eval "$(core rst)"
 eval "$(core trg)"
 
-case "${1:-}" in
-  artifacts-current|artifacts-stage|artifacts-custom|capture-current|capture-stage) scenario="$1" ;;
+if [ "$#" -eq 0 ]; then
+  scenarios=(artifacts-current artifacts-stage artifacts-custom capture-current capture-stage)
+elif [ "$#" -eq 1 ]; then
+  scenarios=("$1")
+else
+  echo 'Specify one scenario or no arguments for all scenarios' >&2; exit 2
+fi
+for scenario in "${scenarios[@]}"; do
+case "$scenario" in
+  artifacts-current|artifacts-stage|artifacts-custom|capture-current|capture-stage) ;;
   *) echo 'Specify artifacts-current, artifacts-stage, artifacts-custom, capture-current or capture-stage' >&2; exit 2 ;;
 esac
 fixture "r2c-$scenario"
@@ -105,4 +113,6 @@ fi
 # A capture error must never suppress a real frozen-file violation either.
 printf '# changed frozen project entrypoint\n' >> "$TARGET/check.sh"
 check rejects trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
-finish "trusted-test-infra-r2c/$scenario"
+unset RST_STAGE_WORKTREES BASE_BRANCH
+done
+finish trusted-test-infra-r2c.sh

@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# WO #5217 round 2b: capture failures affect repair evidence only.
+# WO #5217 round 2b: no arguments run all cases; use <location> <result> to focus.
 . "$(dirname "${BASH_SOURCE[0]}")/evidence-test-lib.sh"
 eval "$(core rst)"
 eval "$(core trg)"
 
+selection="$*"
+case "$#:$selection" in
+  0:|'2:no-git passed'|'2:no-git failed'|'2:current passed'|'2:current failed'|'2:stage passed'|'2:stage failed') ;;
+  *) echo 'Specify no-git, current or stage, then passed or failed' >&2; exit 2 ;;
+esac
+
 for location in no-git current stage; do
   for result in passed failed; do
+    if [ "$#" -gt 0 ] && [ "$selection" != "$location $result" ]; then continue; fi
     echo "Round 2b initial evidence: $location/$result"
     fixture "r2b-$location-$result"
     CURRENT="$WT"; TARGET="$WT"
@@ -66,4 +73,4 @@ stages:
     unset RST_STAGE_WORKTREES
   done
 done
-finish trusted-test-infra-r2b
+finish trusted-test-infra-r2b.sh
