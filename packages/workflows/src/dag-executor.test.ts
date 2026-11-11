@@ -3392,7 +3392,7 @@ describe('executeDagWorkflow -- bash nodes', () => {
     expect(mockSendQueryDag.mock.calls.length).toBe(0);
   });
 
-  it('bash and script nodes do not inherit the personal GitHub token names (bdc-xo#5464)', async () => {
+  it('bash and script nodes do not inherit the personal GitHub token names, even from config.envVars (bdc-xo#5464)', async () => {
     const names = [
       'GH_TOKEN',
       'GITHUB_TOKEN',
@@ -3412,12 +3412,25 @@ describe('executeDagWorkflow -- bash nodes', () => {
       });
       const artifactsDir = join(testDir, 'artifacts');
       await mkdir(artifactsDir, { recursive: true });
+      // Configuration tries to put every name back and to switch the fallback off.
+      const configEnv: Record<string, string> = {
+        ...Object.fromEntries(names.map(n => [n, 'ghp_from_config'])),
+        ARCHON_GITHUB_NO_PERMISSION_FALLBACK: '0',
+        LANE_TEST_KEEP: 'kept',
+      };
+      const pattern =
+        '^(' + names.join('|') + '|ARCHON_GITHUB_NO_PERMISSION_FALLBACK|LANE_TEST_KEEP)=';
       const nodes: DagNode[] = [
-        { id: 'bash-env', bash: 'env | cut -d= -f1 > "$ARTIFACTS_DIR/bash-env-names.txt"' },
+        {
+          id: 'bash-env',
+          bash: `env | grep -E '${pattern}' | sort > "$ARTIFACTS_DIR/bash-env.txt" || true`,
+        },
         {
           id: 'script-env',
           script:
-            'require("fs").writeFileSync("script-env-names.txt", Object.keys(process.env).join(String.fromCharCode(10)))',
+            'require("fs").writeFileSync("script-env.txt", Object.entries(process.env).filter(([k]) => /' +
+            pattern +
+            '/.test(k + "=")).map(([k, v]) => k + "=" + v).sort().join(String.fromCharCode(10)))',
           runtime: 'bun',
         },
       ];
@@ -3434,18 +3447,15 @@ describe('executeDagWorkflow -- bash nodes', () => {
         join(testDir, 'logs'),
         'main',
         'docs/',
-        minimalConfig
+        { ...minimalConfig, envVars: configEnv }
       );
-      for (const file of [
-        join(artifactsDir, 'bash-env-names.txt'),
-        join(testDir, 'script-env-names.txt'),
-      ]) {
-        const listed = (await readFile(file, 'utf8')).split(/\r?\n/);
-        expect(listed.length).toBeGreaterThan(3);
-        for (const n of names) expect(listed).not.toContain(n);
-        // the permission fallback is off for the lane
-        expect(process.env.ARCHON_GITHUB_NO_PERMISSION_FALLBACK).toBeUndefined();
-        expect(listed).toContain('ARCHON_GITHUB_NO_PERMISSION_FALLBACK');
+      for (const file of [join(artifactsDir, 'bash-env.txt'), join(testDir, 'script-env.txt')]) {
+        const listed = (await readFile(file, 'utf8'))
+          .split(/\r?\n/)
+          .map(l => l.trim())
+          .filter(Boolean);
+        // Only the two safe names remain, and the fallback is forced on after config.
+        expect(listed).toEqual(['ARCHON_GITHUB_NO_PERMISSION_FALLBACK=1', 'LANE_TEST_KEEP=kept']);
       }
     } finally {
       for (const n of names) {

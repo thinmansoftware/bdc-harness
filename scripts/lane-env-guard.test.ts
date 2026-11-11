@@ -13,7 +13,7 @@ const read = (path: string): string => readFileSync(new URL(path, root), 'utf8')
 const SITES: { file: string; mustContain: string[]; what: string }[] = [
   {
     file: 'packages/workflows/src/dag-executor.ts',
-    mustContain: ['...laneEnv(),', '{ cwd, env: laneEnv() }', 'env: laneEnv(),'],
+    mustContain: ['laneEnv({', '{ cwd, env: laneEnv() }', 'env: laneEnv(),'],
     what: 'bash node, script node, loop until-bash and evidence commands',
   },
   {
@@ -54,7 +54,8 @@ describe('lane start sites use the lane environment (bdc-xo#5464)', () => {
   test('no lane start site passes process.env straight to a child', () => {
     const dag = read('packages/workflows/src/dag-executor.ts');
     expect(dag).not.toMatch(/env:\s*process\.env/);
-    expect(dag).not.toMatch(/\.\.\.process\.env,\s*\n\s*ARTIFACTS_DIR/);
+    // bash and script nodes wrap the whole merged environment, config envVars included
+    expect(dag.split('laneEnv({').length - 1).toBeGreaterThanOrEqual(2);
     expect(read('packages/providers/src/community/grok/tools.ts')).not.toMatch(
       /env:\s*process\.env/
     );
