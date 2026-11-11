@@ -2628,6 +2628,18 @@ nodes:
       violations = []
       command_files = {}
       entry_cwds = {}
+      absolute_references = {}
+      def live_absolute_reference(token):
+          path = pathlib.Path(token)
+          if not path.is_absolute(): return None
+          path = pathlib.Path(os.path.abspath(path))
+          # Harness output retains its existing exclusion from project capture.
+          if any(path.is_relative_to(directory) for directory in artifact_roots): return None
+          if any(path.is_relative_to(pathlib.Path(directory)) or path.resolve().is_relative_to(pathlib.Path(directory)) for directory in roots):
+              return path
+          return None
+      def absolute_reference_message(name,path):
+          return "test guard: absolute reference into the live worktree cannot be verified from the trusted copy: "+name+" -> "+path.as_posix()
       # Lane evidence is harness output, including when it lives in a project.
       artifact_roots = {pathlib.Path(snapshot).resolve().parent}
       if artifacts: artifact_roots.add(pathlib.Path(artifacts).resolve())
@@ -2653,8 +2665,8 @@ nodes:
               print("test guard: cannot resolve package script: "+str(cwd)+"/"+name+": "+str(error),file=sys.stderr)
               sys.exit(42)
           command_files.setdefault(str(root),set()).add(package.relative_to(root).as_posix())
-          for command in commands: declared_paths(root,command,cwd,stack+(key,))
-      def declared_paths(root, command, cwd=None, stack=(), expand=True):
+          for command in commands: declared_paths(root,command,cwd,stack+(key,),entry=package.relative_to(root).as_posix())
+      def declared_paths(root, command, cwd=None, stack=(), expand=True, entry="stop-tests.commands"):
           cwd = root if cwd is None else cwd
           try:
               lexer = shlex.shlex(command,posix=True,punctuation_chars="&|;")
@@ -2698,6 +2710,10 @@ nodes:
               if mode == "snapshot" and expand and name is not None:
                   package_script(root,cwd,name,stack,lifecycle=manager == "npm")
               for token in segment:
+                  if mode == "snapshot" and expand:
+                      absolute = live_absolute_reference(token)
+                      if absolute is not None:
+                          absolute_references.setdefault(str(root),set()).add(absolute_reference_message(entry,absolute))
                   if token.startswith("-"): continue
                   if re.fullmatch(r"(?:ba|z|da|k)?sh|python(?:[0-9.]+)?|node(?:js)?|bunx?|npm|npx|pnpm|yarn|pytest",pathlib.Path(token).name): continue
                   path = pathlib.Path(os.path.abspath(cwd/token))
@@ -2718,6 +2734,9 @@ nodes:
               if any(c in token for c in "$`{}*?[]"):
                   if required: blocked("dynamic script reference")
                   return
+              absolute = live_absolute_reference(token)
+              if absolute is not None and trusted_boundary(root,name):
+                  raise ValueError(absolute_reference_message(name,absolute))
               candidates = [base/token]
               if not module and base == cwd and parent != base: candidates.append(parent/token)
               if module:
@@ -2752,10 +2771,10 @@ nodes:
               if not literal:
                   blocked("computed import")
                   continue
-              if literal[2].startswith("."): resolve(literal[2],parent,True,True)
+              if literal[2].startswith(".") or live_absolute_reference(literal[2]) is not None: resolve(literal[2],parent,True,True)
           body = re.sub(r"\b(?:require|import)\s*\([^\n)]*\)","",body)
-          for match in re.finditer(r"\b(?:from\s*|import\s*)(['\"])(\.[^'\"]+)\1",body):
-              resolve(match[2],parent,True,True)
+          for match in re.finditer(r"\b(?:from\s*|import\s*)(['\"])([^'\"]+)\1",body):
+              if match[2].startswith(".") or live_absolute_reference(match[2]) is not None: resolve(match[2],parent,True,True)
           if pathlib.Path(name).suffix == ".py":
               for match in re.finditer(r"^\s*(?:from\s+([.\w]+)\s+import\s+([^\n]+)|import\s+([^\n]+))",body,re.M):
                   modules = [match[1]] if match[1] else [part.strip().split()[0] for part in match[3].split(",") if part.strip()]
@@ -2913,6 +2932,8 @@ nodes:
               # Walk through product imports, but save only the named test-support
               # boundary. Keep the guard's frozen set and product allowlist intact.
               try:
+                  if absolute_references.get(directory):
+                      raise ValueError(sorted(absolute_references[directory])[0])
                   trusted = {name for name in files | targets if infrastructure(root,name)} | declared_set
                   pending = collections.deque((name,cwd,0,name) for name in sorted(trusted) for cwd in entry_cwds.get((directory,name),{directory}))
                   visited = set()
@@ -3017,7 +3038,7 @@ nodes:
               root = pathlib.Path(directory)
               key = hashlib.sha256(os.fsencode(directory)).hexdigest()
               dest = scratch/key
-              if "trusted_error" in state: raise ValueError(state["trusted_error"])
+              if "trusted_error" in state: sys.exit(state["trusted_error"])
               trusted = state["trusted"]
               store = snapshot.parent/"trusted-infra"/key
               # Verify all trusted bytes before allowing any command to execute.

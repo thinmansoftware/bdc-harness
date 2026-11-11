@@ -58,6 +58,15 @@ occur inside the boundary. Those failures and a depth overflow report
 the entrypoint. Capture failures are recorded for repair without changing the
 initial test verdict or the no-repair final evidence, including in fixtures
 without a Git repository.
+An absolute executable or helper reference from a boundary file (including a
+reachable package script) into any run or stage worktree cannot use the trusted
+scratch copy. Snapshot discovery records this as a capture failure. After a
+repair, final evidence is BLOCKED with `tests_failed_after_repair:guard` and the
+plain diagnostic `test guard: absolute reference into the live worktree cannot
+be verified from the trusted copy: <file> -> <path>`. Without repair the initial
+evidence remains unchanged. Absolute references outside those worktrees, such as
+`/usr/bin/env bash check.sh`, are unaffected.
+Harness-owned evidence retains its existing exclusion from project capture.
 Product modules and data outside the boundary remain repairable. The accepted
 residual is a build-changed product file with a non-test name executed as a helper;
 the infrastructure-change listing and the Overseer's diff review are backstops.
