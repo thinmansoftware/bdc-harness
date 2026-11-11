@@ -76,7 +76,7 @@ import {
 } from './schemas';
 import { collectRuntimeEvidence, renderManifestV2 } from './reliability/evidence-collector';
 import { formatToolCall } from './utils/tool-formatter';
-import { createLogger } from '@archon/paths';
+import { createLogger, laneEnv } from '@archon/paths';
 import { getWorkflowEventEmitter, buildGateResultField } from './event-emitter';
 import type { GateResult } from './event-emitter';
 import type { IWorkflowStore } from './store';
@@ -3823,7 +3823,10 @@ async function executeBashNode(
         Object.entries(resolvedInputs).map(([k, v]) => [`INPUT_${k.toUpperCase()}`, v])
       )
     : {};
-  const subprocessEnv: NodeJS.ProcessEnv = {
+  // laneEnv wraps the FULLY merged environment (including workflow and project envVars), so a
+  // personal GitHub token name or a fallback override added by configuration cannot reach a
+  // lane child (bdc-xo#5464).
+  const subprocessEnv: NodeJS.ProcessEnv = laneEnv({
     ...process.env,
     ARTIFACTS_DIR: artifactsDir,
     LOG_DIR: logDir,
@@ -3851,7 +3854,7 @@ async function executeBashNode(
     ...(envVars ?? {}),
     // Node-specific ownership for timeout teardown: inherited by every descendant.
     [NODE_TOKEN_ENV]: bashNodeToken,
-  };
+  });
 
   const safeNodeId = node.id.replace(/[^A-Za-z0-9._-]/g, '_');
   const safeRunId = workflowRun.id.replace(/[^A-Za-z0-9._-]/g, '_');
@@ -4175,12 +4178,12 @@ async function executeScriptNode(
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
   const scriptNodeToken = `${workflowRun.id}:${node.id}`;
-  const subprocessEnv: NodeJS.ProcessEnv = {
+  const subprocessEnv: NodeJS.ProcessEnv = laneEnv({
     ...process.env,
     ...(envVars ?? {}),
     // Node-specific ownership for timeout teardown: inherited by every descendant.
     [NODE_TOKEN_ENV]: scriptNodeToken,
-  };
+  });
 
   // Build the command and args based on runtime and inline vs named
   let cmd = '';
@@ -5509,7 +5512,7 @@ async function executeLoopNode(
           nodeOutputs,
           true // escapedForBash
         );
-        await execFileAsync('bash', ['-c', substitutedBash], { cwd });
+        await execFileAsync('bash', ['-c', substitutedBash], { cwd, env: laneEnv() });
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
@@ -6133,6 +6136,7 @@ async function executeEvidenceNode(
       const result = await execFileAsync(command, [...args], {
         cwd: commandCwd,
         timeout: 30000,
+        env: laneEnv(),
       });
       return { stdout: result.stdout, stderr: result.stderr };
     },

@@ -33,7 +33,7 @@ import {
   isTerminalRefreshReason,
   refreshIfAuthFailed,
 } from '../auth-refresh/index.js';
-import { createLogger } from '@archon/paths';
+import { createLogger, stripPersonalTokens } from '@archon/paths';
 import { classifyProbeError } from '../probe/probe-classifier';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -62,7 +62,7 @@ async function getCodex(configCodexBinaryPath?: string): Promise<Codex> {
   if (!codexInitPromise) {
     codexInitPromise = (async (): Promise<Codex> => {
       const codexPathOverride = await resolveCodexBinaryPath(configCodexBinaryPath);
-      const instance = new Codex({ codexPathOverride });
+      const instance = new Codex({ codexPathOverride, env: buildCodexEnv({}) });
       codexInstance = instance;
       return instance;
     })().catch(err => {
@@ -147,7 +147,9 @@ function buildCodexEnv(requestEnv: Record<string, string>): Record<string, strin
     Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)
   );
   // Managed project env intentionally overrides inherited process env for project-scoped execution.
-  return { ...baseEnv, ...requestEnv };
+  // No personal GitHub token names reach the Codex CLI or its tools (bdc-xo#5464).
+  const merged = stripPersonalTokens({ ...baseEnv, ...requestEnv });
+  return { ...merged, ARCHON_GITHUB_NO_PERMISSION_FALLBACK: '1' };
 }
 
 // Maps stale/dead model slugs to the live default for the human-readable

@@ -15,6 +15,7 @@ import {
   type BashSpawnHook,
 } from '@mariozechner/pi-coding-agent';
 import type { ThinkingLevel } from '@mariozechner/pi-ai';
+import { stripPersonalTokens } from '@archon/paths';
 
 /**
  * Pi's exported `Tool` type is structurally `AgentTool<TSchema>` and isn't
@@ -118,14 +119,18 @@ export type PiToolName = (typeof PI_TOOL_NAMES)[number];
 /**
  * Build a Pi `spawnHook` that merges managed env vars into every bash
  * subprocess. Matches Claude/Codex precedence: caller-provided env keys
- * override Pi's inherited baseline. Returns undefined when `env` is empty
- * so bash spawns without an unnecessary hook allocation.
+ * override Pi's inherited baseline. It also removes the personal GitHub token
+ * names, so it is always installed.
  */
-function buildBashSpawnHook(env: Record<string, string> | undefined): BashSpawnHook | undefined {
-  if (!env || Object.keys(env).length === 0) return undefined;
+function buildBashSpawnHook(env: Record<string, string> | undefined): BashSpawnHook {
+  // Always installed: it also removes the personal GitHub token names from every bash
+  // subprocess, whatever the caller env is (bdc-xo#5464).
   return (context: BashSpawnContext): BashSpawnContext => ({
     ...context,
-    env: { ...context.env, ...env },
+    env: {
+      ...stripPersonalTokens({ ...context.env, ...(env ?? {}) }),
+      ARCHON_GITHUB_NO_PERMISSION_FALLBACK: '1',
+    },
   });
 }
 
@@ -197,10 +202,9 @@ export function resolvePiTools(
   const spawnHook = buildBashSpawnHook(env);
 
   if (allowed === undefined && denied === undefined) {
-    // No restrictions. Match Pi's default tool set unless env injection forces
-    // a custom bash tool (Pi's default bashTool is pre-constructed with no
+    // No restrictions: Pi's default tool set (read/bash/edit/write), built here so the
+    // bash tool carries the spawnHook (Pi's default bashTool is pre-constructed with no
     // spawnHook and there's no way to retrofit env onto it).
-    if (!spawnHook) return { tools: undefined, unknownTools: [] };
     return {
       tools: PI_DEFAULT_TOOL_NAMES.map(n => buildPiTool(n, cwd, spawnHook)),
       unknownTools: [],
