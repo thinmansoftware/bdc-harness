@@ -913,14 +913,23 @@ for location in current stage; do
     export FIX_SPEC='WO Class: CODE'
     case "$kind" in
       invalid|missing|unreadable|cycle|depth)
-        # Do not execute a cyclic script: snapshot must stop before any attempt.
+        # Do not execute a cyclic script. Failed capture must preserve initial
+        # evidence and block final evidence if a repair was attempted.
         printf 'TESTS_STATUS=failed\nTESTS_LINE=0/1 (%s)\n' "$R9_COMMAND" > "$ARTIFACTS_DIR/evidence/stop-tests.initial"
         trg_snapshot_report "$WT" "$ARTIFACTS_DIR/evidence"
         export FIX_INITIAL="$(cat "$ARTIFACTS_DIR/evidence/stop-tests.initial")"
-        check contains "$FIX_INITIAL" 'TESTS_STATUS=blocked'
-        check contains "$FIX_INITIAL" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
-        check contains "$(run_node classify-test-result)" '"repairable":"false"'
+        check test "$FIX_INITIAL" = "$(printf 'TESTS_STATUS=failed\nTESTS_LINE=0/1 (%s)\n' "$R9_COMMAND")"
+        check contains "$(run_node classify-test-result)" '"repairable":"true"'
         check test ! -e "$ARTIFACTS_DIR/evidence/test-repair.attempts"
+        rst_save_core "$ARTIFACTS_DIR/evidence"
+        printf '1500\n' > "$ARTIFACTS_DIR/evidence/stop-tests.timeout"
+        printf 'CODE\n' > "$ARTIFACTS_DIR/evidence/stop-tests.class"
+        printf '1\n' > "$ARTIFACTS_DIR/evidence/test-repair.attempts"
+        out="$(run_node run-stop-tests-final)"
+        check contains "$out" 'TESTS_STATUS=blocked'
+        check contains "$out" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+        export FIX_INITIAL="$out"
+        check contains "$(run_node classify-test-result)" '"repairable":"false"'
         ;;
       *)
         export FIX_INITIAL="$(cd "$WT" && rst_execute_saved "$ARTIFACTS_DIR/evidence" CODE)"

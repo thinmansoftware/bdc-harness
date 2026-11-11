@@ -137,7 +137,7 @@ for form in source dot bash sh node bun python direct require import js_nested p
 done
 
 # A script-looking computed reference is a guard boundary, never an invitation
-# to execute repair-modified bytes. Check the actual snapshot-report path.
+# to execute repair-modified bytes. Check blocking after an attempted repair.
 dynamic_case=0
 for expression in 'node "$HELPER"' 'source "${DIR}/helper.js"' 'node "$(cat helper-path).js"' 'require("./" + name + ".js");' 'import(name + ".js");' './$DIR/helper.js'; do
   echo "Round 2 dynamic: $expression"
@@ -147,8 +147,12 @@ for expression in 'node "$HELPER"' 'source "${DIR}/helper.js"' 'node "$(cat help
   printf '%s\n' "$expression" > "$WT/check.sh"
   printf 'TESTS_STATUS=failed\nTESTS_LINE=0/1\n' > "$ARTIFACTS_DIR/evidence/stop-tests.initial"
   diagnostic="$(trg_snapshot_report "$WT" "$ARTIFACTS_DIR/evidence" 2>&1)"
-  check contains "$(cat "$ARTIFACTS_DIR/evidence/stop-tests.initial")" 'TESTS_STATUS=blocked'
-  check contains "$(cat "$ARTIFACTS_DIR/evidence/stop-tests.initial")" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+  export FIX_INITIAL="$(cat "$ARTIFACTS_DIR/evidence/stop-tests.initial")"
+  rst_save_core "$ARTIFACTS_DIR/evidence"
+  printf '1\n' > "$ARTIFACTS_DIR/evidence/test-repair.attempts"
+  out="$(run_node run-stop-tests-final)"
+  check contains "$out" 'TESTS_STATUS=blocked'
+  check contains "$out" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
   check contains "$diagnostic" 'test guard: cannot resolve trusted helper: check.sh'
   check test -f "$ARTIFACTS_DIR/evidence/test-repair.guard"
 done
@@ -161,7 +165,11 @@ for n in {1..9}; do printf '. ./h%s.js\n' "$((n+1))" > "$WT/h$n.js"; done
 printf 'echo "Tests: 1/1"\n' > "$WT/h10.js"
 printf 'TESTS_STATUS=failed\n' > "$ARTIFACTS_DIR/evidence/stop-tests.initial"
 diagnostic="$(trg_snapshot_report "$WT" "$ARTIFACTS_DIR/evidence" 2>&1)"
-check contains "$(cat "$ARTIFACTS_DIR/evidence/stop-tests.initial")" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
+export FIX_INITIAL="$(cat "$ARTIFACTS_DIR/evidence/stop-tests.initial")"
+rst_save_core "$ARTIFACTS_DIR/evidence"
+printf '1\n' > "$ARTIFACTS_DIR/evidence/test-repair.attempts"
+out="$(run_node run-stop-tests-final)"
+check contains "$out" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:guard'
 check contains "$diagnostic" 'test guard: cannot resolve trusted helper: check.sh'
 
 # Four tracked files, one staged product repair, and a Git-discovered test. An
