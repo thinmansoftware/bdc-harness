@@ -51,7 +51,8 @@ fi
 rst_save_core "$ARTIFACTS_DIR/evidence"
 if [[ "$scenario" = artifacts-* ]]; then
   # Exercise an explicit reference as well as the infrastructure inventory.
-  printf '. "%s/evidence/stop-tests.core.sh"\n' "$ARTIFACTS_DIR" >> "$TARGET/check.sh"
+  harness="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).as_posix())' "$ARTIFACTS_DIR/evidence/stop-tests.core.sh")"
+  printf '. "%s"\n' "$harness" >> "$TARGET/check.sh"
   git -C "$TARGET" add check.sh
   git -C "$TARGET" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm harness-reference
 fi
@@ -68,13 +69,14 @@ fi
 check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
 check test "$(trg_infrastructure "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json")" = 'Repair touched test infrastructure: none'
 if [[ "$scenario" = artifacts-* ]]; then
-  check python3 - "$ARTIFACTS_DIR/evidence/test-guard.json" "$ARTIFACTS_DIR" <<'PY'
+  check python3 - "$ARTIFACTS_DIR/evidence/test-guard.json" "$ARTIFACTS_DIR" "$TARGET" <<'PY'
 import json, pathlib, sys
 snapshot, artifacts = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2]).resolve()
-for directory, state in json.loads(snapshot.read_text()).items():
+states = json.loads(snapshot.read_text())
+assert 'check.sh' in states[str(pathlib.Path(sys.argv[3]).resolve())]['trusted']
+for directory, state in states.items():
     for name in state['trusted']:
         assert not (pathlib.Path(directory)/name).resolve().is_relative_to(artifacts), name
-    assert 'check.sh' in state['trusted'] or directory != str(artifacts.parent.resolve())
 for path in (snapshot.parent/'trusted-infra').rglob('*'):
     assert 'stop-tests.core.sh' != path.name, path
 PY
