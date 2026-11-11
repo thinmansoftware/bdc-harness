@@ -5,7 +5,7 @@
  * based on configuration in .archon/config.yaml
  */
 
-import { copyFile, cp, stat, mkdir, readdir } from 'fs/promises';
+import { copyFile, cp, lstat, stat, mkdir, readdir } from 'fs/promises';
 import { join, dirname, relative, isAbsolute, normalize } from 'path';
 import { execFileAsync } from '@archon/git';
 import { createLogger } from '@archon/paths';
@@ -92,7 +92,42 @@ async function listTrackedPaths(destRoot: string, relPath: string): Promise<Set<
 }
 
 /**
- * Copy a directory file by file, leaving every path in `tracked` untouched.
+ * True when `path` is a symbolic link. A missing path is not one. Any other error counts as one
+ * (fail safe: the copy skips the path).
+ */
+async function isSymbolicLink(path: string): Promise<boolean> {
+  try {
+    return (await lstat(path)).isSymbolicLink();
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ENOENT';
+  }
+}
+
+/**
+ * True when `destPath`, or any directory between `destRoot` and it, is a symbolic link: writing
+ * there would follow the link and could overwrite a tracked file outside the copied folder (the
+ * worktree may track `.archon/workflows` as a symlink to another directory).
+ */
+async function destinationTraversesSymlink(destRoot: string, destPath: string): Promise<boolean> {
+  const segments = relative(destRoot, destPath)
+    .split(/[\\/]+/)
+    .filter(Boolean);
+  let current = destRoot;
+  for (const segment of segments) {
+    current = join(current, segment);
+    if (await isSymbolicLink(current)) return true;
+    try {
+      await lstat(current);
+    } catch {
+      return false; // the rest of the path does not exist yet, so there is nothing to follow
+    }
+  }
+  return false;
+}
+
+/**
+ * Copy a directory file by file, leaving every path in `tracked` untouched and never following a
+ * destination symbolic link.
  *
  * @returns the number of tracked paths skipped
  */
@@ -107,10 +142,11 @@ async function copyDirectorySkippingTracked(
   for (const dirent of await readdir(sourceDir, { withFileTypes: true })) {
     const sourceEntry = join(sourceDir, dirent.name);
     const destEntry = join(destDir, dirent.name);
-    if (dirent.isDirectory()) {
-      skipped += await copyDirectorySkippingTracked(sourceEntry, destEntry, destRoot, tracked);
-    } else if (tracked.has(toPosix(relative(destRoot, destEntry)))) {
+    if (tracked.has(toPosix(relative(destRoot, destEntry))) || (await isSymbolicLink(destEntry))) {
+      // tracked in the worktree (a file, or a directory the worktree tracks as a link), or a link
       skipped += 1;
+    } else if (dirent.isDirectory()) {
+      skipped += await copyDirectorySkippingTracked(sourceEntry, destEntry, destRoot, tracked);
     } else {
       await cp(sourceEntry, destEntry);
     }
@@ -168,8 +204,15 @@ export async function copyWorktreeFile(
     await mkdir(dirname(destPath), { recursive: true });
 
     const destRelative = toPosix(relative(destRoot, destPath));
-    const tracked = await listTrackedPaths(destRoot, destRelative);
     let skippedTracked = 0;
+    if (await destinationTraversesSymlink(destRoot, destPath)) {
+      getLog().info(
+        { source: entry.source, destination: entry.destination },
+        'file_copy_skipped_symlink'
+      );
+      return true;
+    }
+    const tracked = await listTrackedPaths(destRoot, destRelative);
 
     if (stats.isDirectory()) {
       if (tracked.size === 0) {

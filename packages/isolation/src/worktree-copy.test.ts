@@ -3,7 +3,7 @@ import * as fs from 'fs/promises';
 import type { Stats } from 'fs';
 import { join } from 'path';
 import { execFileSync } from 'child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname } from 'path';
 
@@ -455,6 +455,45 @@ describe('worktree-copy never overwrites a tracked path (WO-HARNESS-WORKTREE-SYN
     expect(readFileSync(join(worktree, '.archon/workflows/new-only.yaml'), 'utf8')).toBe(
       'only: canonical\n'
     );
+  });
+
+  test('never follows a tracked destination symlink to overwrite a tracked file outside the folder (Overseer finding on bdc-harness#1565)', async () => {
+    // The worktree tracks .archon/workflows as a symlink to ../actual, and actual/a.yaml is tracked.
+    rmSync(join(worktree, '.archon/workflows'), { recursive: true, force: true });
+    write(worktree, 'actual/a.yaml', NEW);
+    git(worktree, 'config', 'core.symlinks', 'true');
+    symlinkSync(join('..', 'actual'), join(worktree, '.archon/workflows'), 'dir');
+    git(worktree, 'add', '-A');
+    git(worktree, 'commit', '-q', '-m', 'workflows is a symlink');
+    const mode = git(worktree, 'ls-files', '-s', '.archon/workflows').split(' ')[0];
+    if (mode !== '120000') return; // this platform cannot store the symlink; nothing to prove here
+
+    await copyWorktreeFiles(canonical, worktree, ['.archon']);
+    expect(readFileSync(join(worktree, 'actual/a.yaml'), 'utf8')).toBe(NEW);
+    expect(git(worktree, 'status', '--porcelain').trim()).toBe('');
+
+    const single = await copyWorktreeFile(canonical, worktree, {
+      source: '.archon/workflows/a.yaml',
+      destination: '.archon/workflows/a.yaml',
+    });
+    expect(single).toBe(true);
+    expect(readFileSync(join(worktree, 'actual/a.yaml'), 'utf8')).toBe(NEW);
+    expect(git(worktree, 'status', '--porcelain').trim()).toBe('');
+  });
+
+  test('never follows an untracked destination symlink either', async () => {
+    const elsewhere = join(root, 'elsewhere');
+    write(elsewhere, 'a.yaml', 'precious: yes\n');
+    rmSync(join(worktree, '.archon/workflows'), { recursive: true, force: true });
+    try {
+      symlinkSync(elsewhere, join(worktree, '.archon/workflows'), 'dir');
+    } catch {
+      return; // symlinks unavailable here
+    }
+
+    await copyWorktreeFiles(canonical, worktree, ['.archon']);
+
+    expect(readFileSync(join(elsewhere, 'a.yaml'), 'utf8')).toBe('precious: yes\n');
   });
 
   test('a destination that is not a git checkout is copied as before', async () => {
