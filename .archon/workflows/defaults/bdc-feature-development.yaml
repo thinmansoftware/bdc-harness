@@ -2602,7 +2602,7 @@ nodes:
           done < "$(dirname "$snapshot")/stop-tests.stages"
         fi
         python3 - "$mode" "$snapshot" "${SPEC:-}" "${#roots[@]}" "${roots[@]}" "${declared[@]}" <<'TRG_PY'
-      import fnmatch, hashlib, json, os, pathlib, re, shlex, subprocess, sys
+      import collections, fnmatch, hashlib, json, os, pathlib, re, shlex, subprocess, sys
       mode, snapshot, spec = sys.argv[1:4]
       count = int(sys.argv[4])
       pairs = sys.argv[5:5+count]
@@ -2702,7 +2702,63 @@ nodes:
                           if expand: entry_cwds.setdefault((str(root),name),set()).add(str(cwd))
       for directory, command in zip(declared[::2],declared[1::2]):
           declared_paths(pathlib.Path(directory).resolve(),command)
-      def named_helpers(root,body,cwd):
+      def named_helpers(root,body,cwd,name,entry):
+          found = set()
+          parent = (root/name).resolve().parent
+          def blocked(reason):
+              print("test guard: cannot resolve trusted helper: "+entry+" ("+name+": "+reason+")",file=sys.stderr)
+              sys.exit(42)
+          def resolve(token,base,required=False,module=False):
+              if any(c in token for c in "$`{}*?[]"):
+                  if required: blocked("dynamic script reference")
+                  return
+              candidates = [base/token]
+              if not module and base == cwd and parent != base: candidates.append(parent/token)
+              if module:
+                  extensions = [".py"] if module == "python" else [".js",".cjs",".mjs",".ts"]
+                  leaves = ["__init__.py"] if module == "python" else ["index.js","index.ts"]
+                  candidates += [base/(token+ext) for ext in extensions]
+                  candidates += [base/token/leaf for leaf in leaves]
+              resolved = False
+              for path in candidates:
+                  path = pathlib.Path(os.path.abspath(path))
+                  if not path.is_relative_to(root): continue
+                  relative = path.relative_to(root).as_posix()
+                  if excluded(relative):
+                      resolved = True
+                      continue
+                  if path.is_file():
+                      if not path.resolve().is_relative_to(root): blocked("script outside worktree")
+                      found.add((relative,str(cwd)))
+                      resolved = True
+                      if module == "python":
+                          package = path.parent
+                          while package.is_relative_to(root) and package != root:
+                              init = package/"__init__.py"
+                              if init.is_file(): found.add((init.relative_to(root).as_posix(),str(cwd)))
+                              package = package.parent
+              if required and not resolved: blocked("missing script: "+token)
+          # Imports resolve against the importing file, unlike shell commands.
+          for match in re.finditer(r"\b(?:require|import)\s*\(([^)\n]*)\)",body):
+              literal = re.fullmatch(r"\s*(['\"])([^'\"]+)\1\s*",match[1])
+              if not literal: blocked("computed import")
+              if literal[2].startswith("."): resolve(literal[2],parent,True,True)
+          body = re.sub(r"\b(?:require|import)\s*\([^\n)]*\)","",body)
+          for match in re.finditer(r"\b(?:from\s*|import\s*)(['\"])(\.[^'\"]+)\1",body):
+              resolve(match[2],parent,True,True)
+          if pathlib.Path(name).suffix == ".py":
+              for match in re.finditer(r"^\s*(?:from\s+([.\w]+)\s+import\s+([^\n]+)|import\s+([^\n]+))",body,re.M):
+                  modules = [match[1]] if match[1] else [part.strip().split()[0] for part in match[3].split(",") if part.strip()]
+                  for module in modules:
+                      dots = len(module)-len(module.lstrip("."))
+                      base = parent
+                      for _ in range(max(0,dots-1)): base = base.parent
+                      token = module.lstrip(".").replace(".","/")
+                      resolve(token,base,module="python")
+                      if match[1]:
+                          for part in match[2].split(","):
+                              child = part.strip().split()[0]
+                              if child.isidentifier(): resolve((token+"/" if token else "")+child,base,module="python")
           # Follow literal command/source positions, not data arguments such as
           # `grep good a.js`. Product inputs must retain their repaired bytes.
           lexer = shlex.shlex(body,posix=True,punctuation_chars="&|;()\n")
@@ -2710,8 +2766,10 @@ nodes:
           lexer.whitespace_split = True
           lexer.commenters = "#"
           try: tokens = list(lexer)
-          except ValueError: return set()
-          segments, segment, found = [], [], set()
+          except ValueError:
+              if re.search(r"(?:^|[;\n])\s*(?:source|\.|bash|sh|node|bun|python)\s",body): blocked("unparseable script reference")
+              return found
+          segments, segment = [], []
           for token in tokens+["\n"]:
               if token and all(c in "&|;()\n" for c in token):
                   segments.append(segment); segment = []
@@ -2725,14 +2783,26 @@ nodes:
                   if not cwd.is_relative_to(root): return found
                   continue
               head = segment[0] if segment[0] == "." else pathlib.Path(segment[0]).name
-              arguments = segment[1:] if head in {".","source"} or re.fullmatch(r"(?:ba|z|da|k)?sh|python(?:[0-9.]+)?|node(?:js)?|bun",head) else segment[:1]
-              for token in arguments:
-                  if token.startswith("-"): continue
-                  path = pathlib.Path(os.path.abspath(cwd/token))
-                  if path.is_relative_to(root) and path.is_file():
-                      name = path.relative_to(root).as_posix()
-                      if not excluded(name): found.add(name)
-                      break
+              runner = head in {".","source"} or re.fullmatch(r"(?:ba|z|da|k)?sh|python(?:[0-9.]+)?|node(?:js)?|bun",head)
+              if runner:
+                  args = segment[1:]
+                  # Inline programs are not filenames. Inspect their references too.
+                  if args and args[0] in {"-c","-e","--eval","-m"}:
+                      if len(args) < 2: blocked("missing inline program")
+                      if args[0] == "-m": resolve(args[1].replace(".","/"),cwd,module="python")
+                      else: found.update(named_helpers(root,args[1],cwd,name,entry))
+                      continue
+                  args = [token for token in args if not token.startswith("-")]
+                  if head == "bun" and args[:1] == ["run"]: args = args[1:]
+                  if args: resolve(args[0],cwd,True)
+              else:
+                  token = segment[0]
+                  resolve(token,cwd,token.startswith(("./","../")))
+                  # Literal relative tokens can carry helper arguments to a
+                  # custom runner. Ordinary data-reader arguments are not code.
+                  if head not in {"grep","cat","echo","printf","test","[","read","sed","awk"}:
+                      for token in segment[1:]:
+                          if not token.startswith("-"): resolve(token.rstrip(","),cwd)
           return found
       def git_paths(root,*args):
           return {os.fsdecode(name) for name in subprocess.check_output(["git",*args],cwd=root).split(b"\x00") if name}
@@ -2828,12 +2898,22 @@ nodes:
               # Save bytes without widening the guard's frozen set. Literal helper
               # references belong to trusted execution, even when product-allowed.
               trusted = {name for name in files | targets if infrastructure(root,name)} | declared_set
-              for name in sorted(declared_set):
+              pending = collections.deque((name,cwd,0,name) for name in sorted(trusted) for cwd in entry_cwds.get((directory,name),{directory}))
+              visited = set()
+              while pending:
+                  name, cwd, depth, entry = pending.popleft()
+                  if (name,cwd) in visited: continue
+                  if depth > 8:
+                      print("test guard: cannot resolve trusted helper: "+entry+" (depth limit 8: "+name+")",file=sys.stderr)
+                      sys.exit(42)
+                  visited.add((name,cwd))
+                  trusted.add(name)
                   if pathlib.PurePosixPath(name).name == "package.json": continue
                   try: body = (root/name).read_text()
                   except (OSError,UnicodeError): continue
-                  for cwd in entry_cwds.get((directory,name),{directory}):
-                      trusted.update(named_helpers(root,body,pathlib.Path(cwd)))
+                  if "\x00" in body: continue
+                  for helper, helper_cwd in sorted(named_helpers(root,body,pathlib.Path(cwd),name,entry)):
+                      pending.append((helper,helper_cwd,depth+1,entry))
               for name in list(trusted):
                   path = root/name
                   if path.is_symlink() or path.resolve() != path:
@@ -2938,6 +3018,25 @@ nodes:
                   if hashlib.sha256((store/name).read_bytes()).hexdigest() != entry["sha"]:
                       raise ValueError("damaged trusted file: "+name)
               subprocess.run(["git","clone","--shared","--no-checkout","--quiet",str(root),str(dest)],check=True)
+              # Clone metadata is private. Preserve the live tracked set (also
+              # for linked/split indexes), without refreshing the source index.
+              def git_path(base,name):
+                  value = subprocess.check_output(["git","rev-parse","--git-path",name],cwd=base,text=True).strip()
+                  return base/value
+              source_index = git_path(root,"index")
+              if source_index.is_file():
+                  shutil.copy2(source_index,git_path(dest,"index"))
+                  shared = subprocess.check_output(["git","rev-parse","--shared-index-path"],cwd=root,text=True).strip()
+                  if shared:
+                      shutil.copy2(root/shared,git_path(dest,pathlib.Path(shared).name))
+                  tree = subprocess.check_output(["git","write-tree"],cwd=dest,text=True).strip()
+                  # Staged repairs belong to working-file verification, not a
+                  # phantom cached diff. Anchor only the private HEAD to its index.
+                  head_tree = subprocess.run(["git","rev-parse","HEAD^{tree}"],cwd=dest,text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+                  if head_tree.returncode or head_tree.stdout.strip() != tree:
+                      parents = [] if head_tree.returncode else ["-p","HEAD"]
+                      commit = subprocess.check_output(["git","-c","user.name=Trusted verification","-c","user.email=trusted@example.invalid","commit-tree",tree,*parents,"-m","Trusted verification index"],cwd=dest,text=True).strip()
+                      subprocess.run(["git","update-ref","HEAD",commit],cwd=dest,check=True)
               origin = subprocess.check_output(["git","remote","get-url","origin"],cwd=root,text=True).strip()
               subprocess.run(["git","remote","set-url","origin",origin],cwd=dest,check=True)
               shutil.copytree(root,dest,symlinks=True,dirs_exist_ok=True,ignore=ignore)

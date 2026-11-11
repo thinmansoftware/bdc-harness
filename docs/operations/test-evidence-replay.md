@@ -44,12 +44,21 @@ it only if the Overseer finds build-time helper faking in practice.
 
 The snapshot saves byte copies under `evidence/trusted-infra/`, separately for
 the run checkout and each available stage checkout. It includes the existing
-test-infrastructure class and literal invoked or sourced file references in
-declared entrypoints. Product data read by those entrypoints remains repairable.
+test-infrastructure class and recursively resolved literal helper references in
+declared entrypoints and saved infrastructure, including relative JavaScript
+imports and local Python imports. Discovery follows at most eight helper hops
+and tracks visited files and command directories to terminate cycles. Dynamic
+script references, unresolved script paths and a depth overflow fail closed with
+`tests_failed_after_repair:guard` and a diagnostic naming the entrypoint.
+Product data read by those entrypoints remains repairable.
 The guard's product allowlist and freeze rules remain unchanged. After a repair,
 final verification copies the repaired checkouts into temporary directories,
 restores their saved infrastructure, and executes the persisted commands there.
 Product fixes remain present; a repair's fabricated helper bytes do not run.
+Each scratch checkout has private Git metadata and a copy of the live index,
+including its tracked set. If a repair was staged, only the private HEAD is
+anchored to that index so `git diff --cached` remains empty during verification.
+The source index and Git metadata are never written by scratch preparation.
 Command side effects remain in the scratch copies. Evidence files still go to
 the run's artifact directory. Scratch copies are removed after final verification.
 Missing or damaged trusted inputs fail closed. Final output and the stamped
