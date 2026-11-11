@@ -5,6 +5,7 @@ import { resolveServiceGitHubAuth, type GitHubService } from '@archon/core/githu
 import {
   assertPersistedGitHubPoolAvailable,
   flushGitHubApiMeter,
+  normalizeGitHubEndpoint,
   observationFromResponse,
   recordGitHubApiCall,
 } from '@archon/core/github/metering';
@@ -822,7 +823,8 @@ export function attachGitHubQuotaHooks(
       status: number;
       headers: Record<string, string | number | undefined>;
     },
-    url: string
+    url: string,
+    method?: string
   ): Promise<void> => {
     const headers = new Headers();
     for (const [name, value] of Object.entries(response.headers)) {
@@ -834,6 +836,7 @@ export function attachGitHubQuotaHooks(
       new Response(null, { status: response.status, headers })
     );
     if (!headers.has('x-ratelimit-resource')) observation.resource = resourceFor(url);
+    observation.endpoint = normalizeGitHubEndpoint(method, url);
     recordGitHubApiCall(observation);
     if (observation.rateLimited) await flushGitHubApiMeter();
   };
@@ -841,13 +844,13 @@ export function attachGitHubQuotaHooks(
     await assertPersistedGitHubPoolAvailable(poolId, [resourceFor(options.url)]);
   });
   client.hook.after('request', async (response, options) => {
-    await record(response, options.url);
+    await record(response, options.url, options.method);
   });
   client.hook.error('request', async (error, options) => {
     const failure = error as Error & {
       response?: { status: number; headers: Record<string, string | number | undefined> };
     };
-    if (failure.response) await record(failure.response, options.url);
+    if (failure.response) await record(failure.response, options.url, options.method);
     throw error;
   });
 }

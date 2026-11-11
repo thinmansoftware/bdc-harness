@@ -4,6 +4,7 @@ import { attachGitHubQuotaHooks } from '../adapters/github-real-deps';
 import {
   assertGitHubPoolAvailable,
   resetGitHubApiMeterForTests,
+  takeGitHubCallSiteSummary,
 } from '@archon/core/github/metering';
 
 // Aggregate runs can enter with leftover shared-app backoff from another file.
@@ -51,4 +52,22 @@ describe('Octokit shared installation quota', () => {
       expect(() => assertGitHubPoolAvailable('different-pool', resource)).not.toThrow();
     });
   }
+});
+
+describe('Octokit call-site tagging (bdc-xo#5449)', () => {
+  test('records the route template of each request under its service (Test 6)', async () => {
+    const client = new Octokit({
+      request: { fetch: (async () => Response.json([], { status: 200 })) as typeof fetch },
+    });
+    attachGitHubQuotaHooks(client, 'overseer', 'tag-app');
+    await client.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews', {
+      owner: 'o',
+      repo: 'r',
+      pull_number: 12,
+    });
+    const summary = takeGitHubCallSiteSummary();
+    expect(summary.top.map(row => [row.service, row.endpoint, row.calls])).toEqual([
+      ['overseer', 'GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews', 1],
+    ]);
+  });
 });
