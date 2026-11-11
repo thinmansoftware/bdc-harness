@@ -5,6 +5,132 @@ eval "$(core trg)"
 eval "$(core sme)"
 eval "$(core mec)"
 
+# WO #5217, Tests 1-5. Run only this bounded block on the operator desktop:
+# TRUSTED_INFRA_ONLY=1 bash .archon/workflows/defaults/__tests__/test-repair-guard.sh
+# The helper deliberately has a product extension, is non-executable, and was
+# changed by the build. The guard must still allow it; final evidence must use
+# its snapshot bytes rather than a repair's fabricated passing summary.
+trusted_build() {
+  printf 'base\n' > "$WT/a.js"
+  printf 'if grep -q good a.js; then echo "Tests: 1/1"; else echo "Tests: 0/1"; exit 1; fi\n' > "$WT/helper.js"
+  cat > "$WT/check.sh" <<'SH'
+if [ "${TRUSTED_FINAL_PROBE:-0}" = 1 ]; then echo scratch-only > final-probe.txt; fi
+cat a.js >/dev/null
+. ./helper.js
+SH
+  printf 'artifacts/\nfinal-probe.txt\n' > "$WT/.gitignore"
+  printf 'trusted-untracked\n' > "$WT/ignored-check.ps1"
+  printf 'ignored-check.ps1\n' >> "$WT/.gitignore"
+  git -C "$WT" add a.js helper.js check.sh .gitignore
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm base
+  git -C "$WT" branch trusted-base
+  printf 'bad build\n' > "$WT/a.js"
+  printf '# build helper\n' >> "$WT/helper.js"
+  git -C "$WT" add a.js helper.js
+  git -C "$WT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm build
+}
+trusted_bytes() {
+  python3 - "$1" <<'PY'
+import hashlib, os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+for base, dirs, files in os.walk(root):
+    dirs[:] = sorted(d for d in dirs if d not in {'.git', 'artifacts'})
+    for name in sorted(files):
+        path = pathlib.Path(base)/name
+        raw = os.fsencode(os.readlink(path)) if path.is_symlink() else path.read_bytes()
+        print(path.relative_to(root).as_posix(), hashlib.sha256(raw).hexdigest())
+PY
+}
+trusted_stamp() {
+  python3 - "$LANE" > "$TMP/trusted-stamp.sh" <<'PY'
+import os, shlex, sys, yaml
+body = next(n['bash'] for n in yaml.safe_load(open(sys.argv[1]))['nodes'] if n['id'] == 'stamp-manifest-evidence')
+for name, value in [('run-stop-tests-final', os.environ['FIX_FINAL']),
+                    ('run-stop-greps', 'GREP_STATUS=none_declared\nGREP_LINE=N/A (no declared greps)'),
+                    ('build-manifest', 'WO: WO-5217\nTests: placeholder\nGrep assertions: placeholder\nVALIDATION: PASS')]:
+    body = body.replace('$'+name+'.output', shlex.quote(value))
+print(body)
+PY
+  bash "$TMP/trusted-stamp.sh"
+}
+for location in current stage; do
+  for repair in fake product; do
+    echo "Trusted infrastructure: $location/$repair"
+    fixture "trusted-$location-$repair"
+    CURRENT="$WT"; TARGET="$WT"
+    export ARTIFACTS_DIR="$TMP/trusted-artifacts-$location-$repair"
+    mkdir -p "$ARTIFACTS_DIR/evidence"
+    EVIDENCE="$ARTIFACTS_DIR"
+    if [ "$location" = stage ]; then
+      fixture "trusted-target-$repair"
+      trusted_build
+      TARGET="$WT"
+      WT="$CURRENT"; export ARTIFACTS_DIR="$EVIDENCE"
+      printf 's\tthinmansoftware/other\tbash check.sh\ttrusted-base\n' > "$ARTIFACTS_DIR/evidence/stop-tests.stages"
+      export RST_STAGE_WORKTREES="s=$TARGET"
+    else
+      trusted_build
+    fi
+    export BASE_BRANCH=trusted-base
+    printf 'bash check.sh\n' > "$ARTIFACTS_DIR/evidence/stop-tests.commands"
+    printf 'CODE\n' > "$ARTIFACTS_DIR/evidence/stop-tests.class"
+    printf '30\n' > "$ARTIFACTS_DIR/evidence/stop-tests.timeout"
+    export FIX_INITIAL="$(cd "$WT" && rst_execute_saved "$ARTIFACTS_DIR/evidence" CODE)"
+    check contains "$FIX_INITIAL" 'TESTS_STATUS=failed'
+    trg_snapshot "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    rst_save_core "$ARTIFACTS_DIR/evidence"
+    # Both the general class (ignored .ps1) and the named helper need byte copies.
+    check test -d "$ARTIFACTS_DIR/evidence/trusted-infra"
+    check contains "$(find "$ARTIFACTS_DIR/evidence/trusted-infra" -type f -name ignored-check.ps1 -exec cat {} \; 2>/dev/null)" 'trusted-untracked'
+    check contains "$(find "$ARTIFACTS_DIR/evidence/trusted-infra" -type f -name helper.js -exec cat {} \; 2>/dev/null)" '# build helper'
+    if [ "$repair" = fake ]; then
+      printf 'echo "Tests: 1/1"\n' > "$TARGET/helper.js"
+    else
+      printf 'good repair\n' > "$TARGET/a.js"
+    fi
+    check trg_check "$WT" "$ARTIFACTS_DIR/evidence/test-guard.json"
+    printf '1\n' > "$ARTIFACTS_DIR/evidence/test-repair.attempts"
+    status_before="$(git -C "$TARGET" status --porcelain=v1 --untracked-files=all)"
+    bytes_before="$(trusted_bytes "$TARGET")"
+    export TRUSTED_FINAL_PROBE=1
+    out="$(run_node run-stop-tests-final)"
+    unset TRUSTED_FINAL_PROBE
+    if [ "$repair" = fake ]; then
+      check contains "$out" 'TESTS_STATUS=blocked'
+      check contains "$out" 'TESTS_BLOCKED_REASON=tests_failed_after_repair:exhausted'
+      check contains "$out" '0/1'
+    else
+      check contains "$out" 'TESTS_STATUS=passed'
+      check contains "$out" '1/1'
+    fi
+    check contains "$out" 'TESTS_FINAL_INFRA=trusted'
+    check test "$status_before" = "$(git -C "$TARGET" status --porcelain=v1 --untracked-files=all)"
+    check test "$bytes_before" = "$(trusted_bytes "$TARGET")"
+    check test ! -f "$TARGET/final-probe.txt"
+    export FIX_FINAL="$out"
+    stamped="$(trusted_stamp)"
+    check contains "$stamped" 'TESTS_FINAL_INFRA=trusted'
+    if [ "$repair" = fake ]; then check contains "$stamped" 'VALIDATION: FAIL'; fi
+    if [ "$location/$repair" = current/product ]; then
+      # Damaged trusted bytes cannot fall back to the live repaired helper.
+      find "$ARTIFACTS_DIR/evidence/trusted-infra" -type f -name helper.js -exec sh -c 'echo damaged > "$1"' sh {} \;
+      damaged="$(run_node run-stop-tests-final)"
+      check contains "$damaged" 'TESTS_STATUS=blocked'
+      check rejects contains "$damaged" 'TESTS_STATUS=passed'
+    fi
+    # No-repair runs preserve the first run and do not claim trusted execution.
+    printf '0\n' > "$ARTIFACTS_DIR/evidence/test-repair.attempts"
+    out="$(run_node run-stop-tests-final)"
+    check contains "$out" "$FIX_INITIAL"
+    check rejects contains "$out" 'TESTS_FINAL_INFRA=trusted'
+    unset RST_STAGE_WORKTREES BASE_BRANCH
+  done
+done
+if [ "${TRUSTED_INFRA_ONLY:-0}" = 1 ]; then
+  finish trusted-test-infra
+  exit "$?"
+fi
+
 # Amended Tests 2/13: every byte of an existing test is frozen, even without
 # assertion syntax. Track both index entries and files not yet added to git.
 for location in current stage; do
