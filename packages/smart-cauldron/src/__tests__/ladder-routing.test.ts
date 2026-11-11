@@ -33,16 +33,17 @@ describe('live ladder SOR', () => {
   });
 
   // M-20260929h: cursor and zero are live; qwen and glm stay refused. zero is
-  // first in the ladder, so it is the entry floor.
-  test('cursor and zero are live, glm/qwen stay refused, zero is the entry floor', () => {
+  // first in the ladder, so it is the entry floor. claude is refused again since
+  // WO-HARNESS-REFUSE-CLAUDE-LADDER-TIER-01 (the acting XO's ruling, 2026-11-11).
+  test('cursor and zero are live, glm/qwen/claude stay refused, zero is the entry floor', () => {
     const refused = loadRefusedTiers();
     expect(refused).not.toContain('cursor');
     expect(refused).not.toContain('zero');
     expect(refused).toContain('qwen');
     expect(refused).toContain('glm');
-    expect(refused).not.toContain('claude');
+    expect(refused).toContain('claude');
     expect(refused).not.toContain('codex');
-    expect([...refused].sort()).toEqual(['glm', 'qwen']);
+    expect([...refused].sort()).toEqual(['claude', 'glm', 'qwen']);
     const firstLive = loadLadder().find(t => !refused.includes(t.name));
     expect(firstLive?.name).toBe('zero');
   });
@@ -206,10 +207,65 @@ describe('cascade entry override and refuse', () => {
       expect(record.frontierApproval?.workflowName).toBe('bdc-feature-development-fable');
       expect(record.attempts.map(a => a.tier)).toEqual(['codex']);
       expect(loadPremiumTiers()).toContain('frontier');
+      // claude is refused outright, so its seat is never even read for admission
       const overThresholdLogs = log.mock.calls.filter(call =>
-        String(call[0]).includes('claude_seat_over_threshold:91:80')
+        String(call[0]).includes('claude_seat_over_threshold')
       );
-      expect(overThresholdLogs).toHaveLength(1);
+      expect(overThresholdLogs).toHaveLength(0);
+    } finally {
+      log.mockRestore();
+      if (previousThreshold === undefined) delete process.env[thresholdEnv];
+      else process.env[thresholdEnv] = previousThreshold;
+      await rm(outDir, { recursive: true, force: true });
+    }
+  });
+
+  test('a climb after a codex gate-fail stops at codex even when the claude seat reads cool (claude refused)', async () => {
+    const outDir = await mkdtemp(join(tmpdir(), 'sc-ladder-codex-cool-claude-'));
+    const firedWorkflows: string[] = [];
+    const thresholdEnv = 'SMART_CAULDRON_HEADROOM_THRESHOLD_PERCENT';
+    const previousThreshold = process.env[thresholdEnv];
+    delete process.env[thresholdEnv];
+    const log = spyOn(console, 'log').mockImplementation(() => undefined);
+    try {
+      const deps: CascadeDeps = {
+        fire: async opts => {
+          firedWorkflows.push(opts.workflowName);
+          return makeFireOk(`run-${firedWorkflows.length}`);
+        },
+        poll: async () => makePollResult(),
+        judge: () => makeFailVerdict('validator: needs_revision'),
+        escalate: async () => undefined,
+        findWoClaim: async () => null,
+        readRunDetail: async () => ({
+          metadata: { teardown_confirmed_at: '2026-11-01T00:00:00.000Z' },
+        }),
+        // the case that let a climb land on the claude lane on 2026-11-11: the seat reads cool
+        seatUsage: async () => ({
+          claude: {
+            limit_source: 'measured',
+            windows: [
+              { name: 'five_hour', used_percent: 11 },
+              { name: 'seven_day', used_percent: 45 },
+            ],
+          },
+        }),
+      };
+
+      const record = await runCascade({
+        woId: 'WO-LADDER-CODEX-COOL-CLAUDE',
+        woClass: 'CODE',
+        tags: ['mechanical'],
+        entryOverride: 'codex',
+        outDir,
+        project: 'test-project',
+        deps,
+      });
+
+      expect(firedWorkflows).toEqual(['bdc-feature-development-codex']);
+      expect(firedWorkflows).not.toContain('bdc-feature-development');
+      expect(record.attempts.map(a => a.tier)).toEqual(['codex']);
+      expect(record.status).toBe('pending-frontier-approval');
     } finally {
       log.mockRestore();
       if (previousThreshold === undefined) delete process.env[thresholdEnv];
@@ -297,7 +353,8 @@ describe('cascade entry override and refuse', () => {
 
     expect(thrown).toBeInstanceOf(Error);
     const message = thrown instanceof Error ? thrown.message : '';
-    expect(message).toContain('claude_seat_unknown');
+    expect(message).toContain('Refused dark/retired entry tier "claude"');
+    expect(message).toContain('refusedTiers');
     expect(fireCalled).toBe(false);
   });
 });
