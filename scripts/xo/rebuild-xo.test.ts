@@ -47,7 +47,7 @@ exit 0
 echo "git $*" >> "$STUB_LOG"
 case "$1" in
   status) ;;
-  fetch) ;;
+  fetch) exit "\${STUB_FETCH_RC:-0}" ;;
   rev-parse)
     if [ "$2" = "--short" ]; then echo "\${3:0:7}"
     elif [ "$2" = "origin/dev" ]; then echo "${TARGET}"
@@ -63,11 +63,14 @@ echo "curl $*" >> "$STUB_LOG"
 STATE="$STUB_LOG.drain"
 case "$*" in
   *'"draining":true'*) echo draining > "$STATE" ;;
-  *'"draining":false'*) echo normal > "$STATE" ;;
+  *'"draining":false'*) [ "\${STUB_STICKY_DRAIN:-0}" = 1 ] || echo normal > "$STATE" ;;
 esac
+MODE=$(cat "$STATE" 2>/dev/null || echo normal)
+DRAINED=false
+[ "$MODE" = draining ] && [ "\${STUB_NOT_DRAINED:-0}" != 1 ] && DRAINED=true
 case "$*" in
   *"%{http_code}"*) printf 200 ;;
-  *) echo "{\\"mode\\":\\"$(cat "$STATE" 2>/dev/null || echo normal)\\",\\"activeRunCount\\":0}" ;;
+  *) echo "{\\"mode\\":\\"$MODE\\",\\"drained\\":$DRAINED,\\"activeRunCount\\":0}" ;;
 esac
 exit 0
 `,
@@ -113,7 +116,12 @@ function runScript(
       writeFileSync(`${bin}/${name}`, body, { mode: 0o755 });
       chmodSync(`${bin}/${name}`, 0o755);
     }
-    writeFileSync(`${root}/serve-lanes.sh`, '#!/bin/sh\nexit 0\n');
+    // Stub lane sync for the rebuild script (the real serve-lanes.sh is exercised by its own tests):
+    // STUB_LANES=differs reports a lane that stays different, STUB_LANES=none reports nothing.
+    writeFileSync(
+      `${root}/serve-lanes.sh`,
+      '#!/bin/sh\ncase "${STUB_LANES:-same}" in\n  differs) echo "a.yaml DIFFERS" ;;\n  none) ;;\n  *) echo "a.yaml SAME" ;;\nesac\nexit 0\n'
+    );
     const log = `${root}/calls.log`;
     writeFileSync(log, '');
     const res = spawnSync('bash', [target.replace(/\\/g, '/'), ...args], {
@@ -203,6 +211,46 @@ describe('rebuild-xo.sh', () => {
     expect(r.calls.some(c => c.includes('--no-build --force-recreate'))).toBe(true);
     const checkouts = r.calls.filter(c => c.startsWith('git checkout'));
     expect(checkouts[checkouts.length - 1]).toContain(PREV);
+  }, 60_000);
+
+  it('waits for the drain API to report drained, not for a narrower run count (Test 13)', () => {
+    const r = runScript({ STUB_NOT_DRAINED: '1' });
+    expect(r.status).toBe(3);
+    expect(r.out).toContain('ABORT: not drained');
+    expect(has(r, 'docker tag')).toBe(false);
+    expect(has(r, 'docker compose build')).toBe(false);
+    expect(r.calls.some(c => c.includes('"draining":false'))).toBe(true);
+    expect(r.out).not.toContain('=== DONE');
+  }, 60_000);
+
+  it('does not build a stale commit when git fetch fails (Test 14)', () => {
+    const r = runScript({ STUB_FETCH_RC: '1' });
+    expect(r.status).toBe(3);
+    expect(r.out).toContain('ABORT_FETCH');
+    expect(has(r, 'docker compose build')).toBe(false);
+    expect(has(r, 'docker compose up')).toBe(false);
+    expect(r.calls.some(c => c.includes('"draining":false'))).toBe(true);
+    expect(r.out).not.toContain('=== DONE');
+  }, 60_000);
+
+  it('fails and leaves drain on when the lanes cannot be verified identical (Test 15)', () => {
+    for (const lanes of ['differs', 'none']) {
+      const r = runScript({ STUB_LANES: lanes });
+      expect(r.status).toBe(6);
+      expect(r.out).toContain('ABORT_LANES');
+      expect(r.out).not.toContain('=== DONE');
+      const drainPosts = r.calls.filter(
+        c => c.includes('/api/admin/drain') && c.includes('draining')
+      );
+      expect(drainPosts[drainPosts.length - 1]).toContain('"draining":true');
+    }
+  }, 120_000);
+
+  it('fails loudly when drain will not clear after the rebuild (Test 16)', () => {
+    const r = runScript({ STUB_STICKY_DRAIN: '1' });
+    expect(r.status).toBe(7);
+    expect(r.out).toContain('DRAIN_STUCK');
+    expect(r.out).not.toContain('=== DONE');
   }, 60_000);
 });
 

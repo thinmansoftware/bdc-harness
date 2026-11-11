@@ -22,11 +22,13 @@ Test overrides (not needed on the host): `ARCHON_DIR`, `DB`, `SCRIPTS_DIR`.
 |---|---|
 | 0 | Rebuilt and healthy |
 | 2 | No archon checkout at `ARCHON_DIR` |
-| 3 | Stopped before the build, nothing replaced: drain not confirmed (`ABORT_DRAIN`: the drain POST must return HTTP 200 and a GET must show a mode other than normal), runs never went idle, low disk, dirty tree, no database backup (`ABORT_BACKUP`), no rollback image pinned (`ABORT_PIN`), or checkout failed. Drain is switched off again |
+| 3 | Stopped before the build, nothing replaced: drain not confirmed (`ABORT_DRAIN`: the drain POST must return HTTP 200 and a GET must show a mode other than normal), the drain API never reported `drained` (it counts pending, running, waiting_provider and paused runs and live leases) within the wait, a failed `git fetch` (`ABORT_FETCH`: a stale local `origin/dev` is never built), low disk, dirty tree, no database backup (`ABORT_BACKUP`), no rollback image pinned (`ABORT_PIN`), or checkout failed. Drain is switched off again |
+| 6 | The new container is up and healthy but the lanes could not be published and verified identical (`ABORT_LANES`: the lane sync failed, a baked lane still differs from the served one, or nothing could be compared). Drain is left ON so no work starts on stale lanes; fix, run `serve-lanes.sh --apply`, then clear drain |
+| 7 | Drain would not read back as normal after the rebuild (`DRAIN_STUCK`: every fire is refused until it is cleared) |
 | 4 | `docker compose up` failed, or the new container was not healthy; the pinned image was restored and the checkout put back on the starting commit |
 | 5 | The image BUILD FAILED. The output has `ABORT_BUILD rc=<n>`. The old container is still running, the checkout is put back on the commit it started from, drain is switched off. Nothing was replaced |
 
-Before bdc-xo#5444 a failed build was piped through `tail`, so the script carried on, ran `up -d` on the old image and passed the health gate. Exit 5 is the guard against that. The Overseer review of the pull request found three more silent carry-ons of the same kind, now guarded the same way: an unconfirmed drain, a missing backup or pin, and a failed `up` that left the old container looking healthy.
+Before bdc-xo#5444 a failed build was piped through `tail`, so the script carried on, ran `up -d` on the old image and passed the health gate. Exit 5 is the guard against that. The Overseer review of the pull request found three more silent carry-ons of the same kind, now guarded the same way: an unconfirmed drain, a missing backup or pin, and a failed `up` that left the old container looking healthy. A second review found three more: an idle gate narrower than the drain API's own (it ignored waiting_provider and paused runs), an ignored `git fetch` failure, and ignored failures of the lane publication and of the final undrain.
 
 ## Rollback
 
