@@ -21,8 +21,9 @@ import {
 } from '../m09-promotion-gate';
 import { createPromotionGate } from '../m09-promotion-gate-wiring';
 
+// A Windows checkout with autocrlf turns the fixtures into CRLF; the tests compare exact LF text.
 const fixture = (name: string): string =>
-  readFileSync(join(import.meta.dir, 'fixtures', name), 'utf8');
+  readFileSync(join(import.meta.dir, 'fixtures', name), 'utf8').replace(/\r\n/g, '\n');
 const TEMPLATE = fixture('deploy-motion-template.md');
 const REAL_HEAD = fixture('m-20261111b-head.md');
 const repo = 'thinmansoftware/lspro-react';
