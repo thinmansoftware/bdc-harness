@@ -4,7 +4,9 @@
  * Runs the real script with bash against stub `docker`, `git`, `curl`, `sqlite3`,
  * `sudo`, `df` and `sleep` commands placed first on PATH. Each stub appends its
  * arguments to one call log, so the test can assert what the script did and in
- * what order without a Docker daemon or a host checkout.
+ * what order without a Docker daemon or a host checkout. Environment knobs make
+ * one step fail at a time: STUB_BUILD_RC, STUB_UP_RC, STUB_TAG_RC, STUB_BACKUP_RC,
+ * STUB_CURL_FAIL, and STUB_CMP_RC for serve-lanes.sh.
  */
 import { describe, expect, it } from 'bun:test';
 import { spawnSync } from 'node:child_process';
@@ -13,6 +15,10 @@ import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 
 const script = new URL('./rebuild-xo.sh', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+const serveLanes = new URL('./serve-lanes.sh', import.meta.url).pathname.replace(
+  /^\/([A-Za-z]:)/,
+  '$1'
+);
 
 const PREV = 'a'.repeat(40);
 const TARGET = 'b'.repeat(40);
@@ -23,11 +29,18 @@ echo "docker $*" >> "$STUB_LOG"
 case "$1 $2" in
   "compose config") echo app ;;
   "compose build") exit "\${STUB_BUILD_RC:-0}" ;;
-  "exec archon-app-1") [ "$3" = printenv ] && echo tok ;;
+  "compose up") exit "\${STUB_UP_RC:-0}" ;;
+  "exec archon-app-1")
+    case "$3" in
+      printenv) echo tok ;;
+      sh) echo /app/.archon/workflows/defaults/bdc-feature-development-x.yaml ;;
+      cmp) exit "\${STUB_CMP_RC:-0}" ;;
+    esac ;;
   "inspect --format")
     case "$3" in *Health*) echo healthy ;; *RestartCount*) echo 0 ;; esac ;;
   "inspect -f") echo created ;;
 esac
+[ "$1" = tag ] && exit "\${STUB_TAG_RC:-0}"
 exit 0
 `,
   git: `#!/bin/bash
@@ -42,17 +55,30 @@ case "$1" in
 esac
 exit 0
 `,
+  // Stateful drain: POST draining:true sets the state, draining:false clears it,
+  // GET and POST bodies report the mode. STUB_CURL_FAIL=1 makes every call exit 7.
   curl: `#!/bin/bash
 echo "curl $*" >> "$STUB_LOG"
+[ "\${STUB_CURL_FAIL:-0}" = 1 ] && exit 7
+STATE="$STUB_LOG.drain"
+case "$*" in
+  *'"draining":true'*) echo draining > "$STATE" ;;
+  *'"draining":false'*) echo normal > "$STATE" ;;
+esac
 case "$*" in
   *"%{http_code}"*) printf 200 ;;
-  *) echo '{"mode":"normal","activeRunCount":0}' ;;
+  *) echo "{\\"mode\\":\\"$(cat "$STATE" 2>/dev/null || echo normal)\\",\\"activeRunCount\\":0}" ;;
 esac
 exit 0
 `,
   sqlite3: `#!/bin/bash
 echo "sqlite3 $*" >> "$STUB_LOG"
-case "$*" in *"select count"*) echo 0 ;; esac
+case "$*" in
+  *"select count"*) echo 0 ;;
+  *".backup"*)
+    [ "\${STUB_BACKUP_RC:-0}" -ne 0 ] && exit "\${STUB_BACKUP_RC}"
+    dest="\${2#.backup }"; echo backup > "$dest" ;;
+esac
 exit 0
 `,
   sudo: `#!/bin/bash
@@ -73,7 +99,11 @@ interface RunResult {
   calls: string[];
 }
 
-function runScript(buildRc: number): RunResult {
+function runScript(
+  extraEnv: Record<string, string> = {},
+  target: string = script,
+  args: string[] = ['1']
+): RunResult {
   const dir = mkdtempSync(join(tmpdir(), 'rebuild-xo-'));
   try {
     const root = dir.replace(/\\/g, '/');
@@ -86,7 +116,7 @@ function runScript(buildRc: number): RunResult {
     writeFileSync(`${root}/serve-lanes.sh`, '#!/bin/sh\nexit 0\n');
     const log = `${root}/calls.log`;
     writeFileSync(log, '');
-    const res = spawnSync('bash', [script.replace(/\\/g, '/'), '1'], {
+    const res = spawnSync('bash', [target.replace(/\\/g, '/'), ...args], {
       encoding: 'utf8',
       env: {
         ...process.env,
@@ -95,7 +125,7 @@ function runScript(buildRc: number): RunResult {
         DB: `${root}/archon.db`,
         SCRIPTS_DIR: root,
         STUB_LOG: log,
-        STUB_BUILD_RC: String(buildRc),
+        ...extraEnv,
       },
     });
     return {
@@ -108,13 +138,15 @@ function runScript(buildRc: number): RunResult {
   }
 }
 
+const has = (r: RunResult, prefix: string): boolean => r.calls.some(c => c.startsWith(prefix));
+
 describe('rebuild-xo.sh', () => {
   it('stops when the image build fails, keeps the old container, undrains and restores the checkout (Test 3)', () => {
-    const r = runScript(1);
+    const r = runScript({ STUB_BUILD_RC: '1' });
     expect(r.status).toBe(5);
     expect(r.out).toContain('ABORT_BUILD rc=1');
-    expect(r.calls.some(c => c.startsWith('docker compose up'))).toBe(false);
-    expect(r.calls.some(c => c.startsWith('docker tag archon:latest archon:rollback-'))).toBe(true);
+    expect(has(r, 'docker compose up')).toBe(false);
+    expect(has(r, 'docker tag archon:latest archon:rollback-')).toBe(true);
     expect(r.calls.some(c => c.includes('"draining":false'))).toBe(true);
     const checkouts = r.calls.filter(c => c.startsWith('git checkout'));
     expect(checkouts.length).toBe(2);
@@ -123,13 +155,71 @@ describe('rebuild-xo.sh', () => {
   }, 60_000);
 
   it('a good build still reaches up and finishes (Test 4)', () => {
-    const r = runScript(0);
+    const r = runScript();
     expect(r.status).toBe(0);
     expect(r.out).toContain('=== DONE');
     const build = r.calls.findIndex(c => c.startsWith('docker compose build'));
     const up = r.calls.findIndex(c => c.startsWith('docker compose up'));
     expect(build).toBeGreaterThanOrEqual(0);
     expect(up).toBeGreaterThan(build);
-    expect(r.out).not.toContain('ABORT_BUILD');
+    expect(r.out).not.toContain('ABORT_');
+  }, 60_000);
+
+  it('does not proceed when drain is not confirmed (Test 7)', () => {
+    const r = runScript({ STUB_CURL_FAIL: '1' });
+    expect(r.status).toBe(3);
+    expect(r.out).toContain('ABORT_DRAIN');
+    expect(has(r, 'docker compose build')).toBe(false);
+    expect(has(r, 'docker compose up')).toBe(false);
+    expect(has(r, 'docker tag')).toBe(false);
+    expect(r.out).not.toContain('=== DONE');
+  }, 60_000);
+
+  it('does not rebuild without a database backup (Test 8)', () => {
+    const r = runScript({ STUB_BACKUP_RC: '1' });
+    expect(r.status).toBe(3);
+    expect(r.out).toContain('ABORT_BACKUP');
+    expect(has(r, 'docker compose build')).toBe(false);
+    expect(has(r, 'docker compose up')).toBe(false);
+    expect(r.calls.some(c => c.includes('"draining":false'))).toBe(true);
+    expect(r.out).not.toContain('=== DONE');
+  }, 60_000);
+
+  it('does not rebuild without a pinned rollback image (Test 9)', () => {
+    const r = runScript({ STUB_TAG_RC: '1' });
+    expect(r.status).toBe(3);
+    expect(r.out).toContain('ABORT_PIN');
+    expect(has(r, 'docker compose build')).toBe(false);
+    expect(has(r, 'docker compose up')).toBe(false);
+    expect(r.out).not.toContain('=== DONE');
+  }, 60_000);
+
+  it('rolls back when compose up fails even if the old container looks healthy (Test 10)', () => {
+    const r = runScript({ STUB_UP_RC: '1' });
+    expect(r.status).toBe(4);
+    expect(r.out).toContain('=== ROLLBACK');
+    expect(r.out).not.toContain('=== DONE');
+    expect(r.calls.some(c => /^docker tag archon:rollback-\S+ archon:latest$/.test(c))).toBe(true);
+    expect(r.calls.some(c => c.includes('--no-build --force-recreate'))).toBe(true);
+    const checkouts = r.calls.filter(c => c.startsWith('git checkout'));
+    expect(checkouts[checkouts.length - 1]).toContain(PREV);
+  }, 60_000);
+});
+
+describe('serve-lanes.sh', () => {
+  it('reports SAME and copies nothing when the served lane equals the baked one (Test 11)', () => {
+    const r = runScript({ STUB_CMP_RC: '0' }, serveLanes, ['--apply']);
+    expect(r.status).toBe(0);
+    expect(r.out).toContain('bdc-feature-development-x.yaml SAME');
+    expect(r.calls.some(c => c.startsWith('docker exec archon-app-1 cp'))).toBe(false);
+  }, 60_000);
+
+  it('copies the baked lane over a differing served one only with --apply (Test 12)', () => {
+    const dry = runScript({ STUB_CMP_RC: '1' }, serveLanes, []);
+    expect(dry.out).toContain('bdc-feature-development-x.yaml DIFFERS');
+    expect(dry.calls.some(c => c.startsWith('docker exec archon-app-1 cp'))).toBe(false);
+    const applied = runScript({ STUB_CMP_RC: '1' }, serveLanes, ['--apply']);
+    expect(applied.out).toContain('applied');
+    expect(applied.calls.some(c => c.startsWith('docker exec archon-app-1 cp'))).toBe(true);
   }, 60_000);
 });
