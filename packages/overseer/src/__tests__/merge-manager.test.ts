@@ -1355,4 +1355,37 @@ describe('per-repo merge base policy', () => {
       delete process.env.MERGE_MANAGER_ALLOWED_BASES;
     }
   });
+
+  test('an approved green pull request on bdc-shopify-app main is skipped by the default policy (Test 3)', async () => {
+    const mergePullRequest = mock(async () => ({ merged: true, message: 'merged' }));
+    const execute = mock(async () => ({ merged: true, message: 'merged' }));
+    const assembled = evidence({
+      repository: 'bdc-shopify-app',
+      base_branch: 'main',
+      resulting_deployment_effect: 'none',
+    });
+    // No allowedBases and no policy env: the shipped DEFAULT_MERGE_REPO_POLICY decides.
+    delete process.env.MERGE_MANAGER_REPO_POLICY;
+    delete process.env.MERGE_MANAGER_ALLOWED_BASES;
+    const result = await createMergeManager({
+      readRunEvents: async () => [],
+      mode: 'execute',
+      mutationsEnabled: true,
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'e'.repeat(64) }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction: async () => undefined,
+      findPullRequest: async () => record.prEvidence,
+      mergePullRequest,
+      readWorktreeHeadSha,
+    })(record);
+
+    expect(result).toMatchObject({ status: 'held', reason: 'base_branch_not_allowed' });
+    expect(mergePullRequest).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+  });
 });
