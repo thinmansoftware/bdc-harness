@@ -44,6 +44,7 @@ interface SiteAggregate {
 }
 
 const UNLABELLED = 'unlabelled';
+let callSiteLogEnabled = false;
 const CALL_SITE_TOP = 25;
 
 const usage = new Map<string, UsageAggregate>();
@@ -94,6 +95,19 @@ export interface GitHubCallSiteSummary {
     calls: number;
     rateLimited: number;
   }[];
+}
+
+/**
+ * Turn on the `github_call_sites` log line. Only the long-running server calls this: the
+ * line goes to stdout, and the CLI scripts that flush the meter print JSON on the same
+ * stream (run-completion-report --json must stay pure JSON).
+ */
+export function enableGitHubCallSiteLog(): void {
+  callSiteLogEnabled = true;
+}
+
+export function isGitHubCallSiteLogEnabled(): boolean {
+  return callSiteLogEnabled;
 }
 
 /** Take the call-site counts since the last take (or process start) and start a new interval. */
@@ -282,7 +296,7 @@ async function flushBatch(db: IDatabase): Promise<void> {
   poolState.clear();
   // One line per flush: which endpoints spent the calls since the last flush (bdc-xo#5449).
   const callSites = takeGitHubCallSiteSummary();
-  if (callSites.total > 0) log.info(callSites, 'github_call_sites');
+  if (callSiteLogEnabled && callSites.total > 0) log.info(callSites, 'github_call_sites');
   try {
     await db.withTransaction(async query => {
       for (const row of usageRows) {
@@ -346,6 +360,7 @@ export function resetGitHubApiMeterForTests(): void {
   usage.clear();
   sites.clear();
   sitesIntervalStartedAt = Date.now();
+  callSiteLogEnabled = false;
   poolState.clear();
   backoff.clear();
   if (flushTimer) clearTimeout(flushTimer);

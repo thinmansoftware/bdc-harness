@@ -4,6 +4,8 @@ import {
   assertGitHubPoolAvailable,
   assertPersistedGitHubPoolAvailable,
   flushGitHubApiMeter,
+  enableGitHubCallSiteLog,
+  isGitHubCallSiteLogEnabled,
   normalizeGitHubEndpoint,
   recordGitHubApiCall,
   resetGitHubApiMeterForTests,
@@ -193,5 +195,14 @@ describe('call-site attribution (bdc-xo#5449)', () => {
     const again = takeGitHubCallSiteSummary();
     expect(again.total).toBe(0);
     expect(again.top).toEqual([]);
+  });
+
+  it('logs the summary only in the server process, which opts in (stdout stays pure JSON in scripts)', () => {
+    resetGitHubApiMeterForTests();
+    expect(isGitHubCallSiteLogEnabled()).toBe(false);
+    enableGitHubCallSiteLog();
+    expect(isGitHubCallSiteLogEnabled()).toBe(true);
+    resetGitHubApiMeterForTests();
+    expect(isGitHubCallSiteLogEnabled()).toBe(false);
   });
 });
