@@ -2,6 +2,10 @@ import { describe, test, expect, beforeEach, afterEach, spyOn, type Mock } from 
 import * as fs from 'fs/promises';
 import type { Stats } from 'fs';
 import { join } from 'path';
+import { execFileSync } from 'child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { dirname } from 'path';
 
 import {
   parseCopyFileEntry,
@@ -364,5 +368,101 @@ describe('worktree-copy', () => {
       expect(result[0]).toEqual({ source: '.env', destination: '.env' });
       expect(result[1]).toEqual({ source: 'data/config.json', destination: 'data/config.json' });
     });
+  });
+});
+
+describe('worktree-copy never overwrites a tracked path (WO-HARNESS-WORKTREE-SYNC-NO-TRACKED-OVERWRITE-01)', () => {
+  const NEW = 'text: new staging wording\n';
+  const OLD = 'text: old master wording\n';
+  let root: string;
+  let canonical: string;
+  let worktree: string;
+
+  function git(cwd: string, ...args: string[]): string {
+    return execFileSync('git', args, { cwd, encoding: 'utf8' });
+  }
+
+  function write(base: string, rel: string, content: string): void {
+    const full = join(base, rel);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, content);
+  }
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'wt-copy-tracked-'));
+    canonical = join(root, 'canonical');
+    worktree = join(root, 'worktree');
+    mkdirSync(canonical, { recursive: true });
+    mkdirSync(worktree, { recursive: true });
+    // The worktree is a real git checkout whose tracked .archon files hold the NEW text.
+    git(worktree, 'init', '-q');
+    git(worktree, 'config', 'user.email', 't@example.com');
+    git(worktree, 'config', 'user.name', 't');
+    git(worktree, 'config', 'core.autocrlf', 'false');
+    write(worktree, '.archon/workflows/a.yaml', NEW);
+    write(worktree, '.archon/workflows/c.yaml', NEW);
+    git(worktree, 'add', '-A');
+    git(worktree, 'commit', '-q', '-m', 'base');
+    // The canonical source checkout is on another branch: its copy of a.yaml is OLD.
+    write(canonical, '.archon/workflows/a.yaml', OLD);
+    write(canonical, '.archon/workflows/c.yaml', NEW);
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test('a tracked file keeps the worktree content and the worktree stays clean (Test 1)', async () => {
+    await copyWorktreeFiles(canonical, worktree, ['.archon']);
+
+    expect(readFileSync(join(worktree, '.archon/workflows/a.yaml'), 'utf8')).toBe(NEW);
+    expect(git(worktree, 'status', '--porcelain')).toBe('');
+  });
+
+  test('untracked and new files are still copied (Test 2)', async () => {
+    write(canonical, '.archon/config.yaml', 'local: only\n');
+    write(canonical, '.archon/extra/b.yaml', 'extra: yes\n');
+
+    await copyWorktreeFiles(canonical, worktree, ['.archon']);
+
+    expect(readFileSync(join(worktree, '.archon/config.yaml'), 'utf8')).toBe('local: only\n');
+    expect(readFileSync(join(worktree, '.archon/extra/b.yaml'), 'utf8')).toBe('extra: yes\n');
+    expect(readFileSync(join(worktree, '.archon/workflows/a.yaml'), 'utf8')).toBe(NEW);
+    const status = git(worktree, 'status', '--porcelain', '--untracked-files=all')
+      .trim()
+      .split('\n');
+    // only the two copied local-only files are new; no tracked file shows as modified
+    expect(status.filter(line => line.startsWith(' M') || line.startsWith('M '))).toEqual([]);
+    expect(status.length).toBe(2);
+  });
+
+  test('a tracked single-file entry and a mixed directory entry (Test 3)', async () => {
+    write(canonical, '.archon/workflows/new-only.yaml', 'only: canonical\n');
+
+    const single = await copyWorktreeFile(canonical, worktree, {
+      source: '.archon/workflows/a.yaml',
+      destination: '.archon/workflows/a.yaml',
+    });
+    expect(single).toBe(true);
+    expect(readFileSync(join(worktree, '.archon/workflows/a.yaml'), 'utf8')).toBe(NEW);
+
+    const dir = await copyWorktreeFile(canonical, worktree, {
+      source: '.archon/workflows',
+      destination: '.archon/workflows',
+    });
+    expect(dir).toBe(true);
+    expect(readFileSync(join(worktree, '.archon/workflows/a.yaml'), 'utf8')).toBe(NEW);
+    expect(readFileSync(join(worktree, '.archon/workflows/new-only.yaml'), 'utf8')).toBe(
+      'only: canonical\n'
+    );
+  });
+
+  test('a destination that is not a git checkout is copied as before', async () => {
+    const plain = join(root, 'plain');
+    mkdirSync(plain, { recursive: true });
+
+    await copyWorktreeFiles(canonical, plain, ['.archon']);
+
+    expect(readFileSync(join(plain, '.archon/workflows/a.yaml'), 'utf8')).toBe(OLD);
   });
 });

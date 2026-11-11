@@ -4,6 +4,10 @@ import * as worktreeCopy from '@archon/isolation';
 import * as configLoader from '../config/config-loader';
 import * as fs from 'fs/promises';
 import type { Stats } from 'fs';
+import { execFileSync } from 'child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { dirname, join } from 'path';
 import type { RepoConfig } from '../config/config-types';
 import type { CopyFileEntry } from '@archon/isolation';
 import { createMockLogger } from '../test/mocks/logger';
@@ -395,5 +399,70 @@ describe('syncArchonToWorktree', () => {
       }),
       'archon_sync_failed'
     );
+  });
+});
+
+describe('syncArchonToWorktree with real repositories (WO-HARNESS-WORKTREE-SYNC-NO-TRACKED-OVERWRITE-01)', () => {
+  const NEW = 'text: new staging wording\n';
+  const OLD = 'text: old master wording\n';
+  let root: string;
+  let canonical: string;
+  let worktree: string;
+
+  function run(cwd: string, ...args: string[]): string {
+    return execFileSync('git', args, { cwd, encoding: 'utf8' });
+  }
+
+  function write(base: string, rel: string, content: string): void {
+    const full = join(base, rel);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, content);
+  }
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'wt-sync-tracked-'));
+    canonical = join(root, 'canonical');
+    worktree = join(root, 'worktree');
+    mkdirSync(canonical, { recursive: true });
+    run(canonical, 'init', '-q', '-b', 'master');
+    run(canonical, 'config', 'user.email', 't@example.com');
+    run(canonical, 'config', 'user.name', 't');
+    run(canonical, 'config', 'core.autocrlf', 'false');
+    write(canonical, '.archon/workflows/a.yaml', OLD);
+    run(canonical, 'add', '-A');
+    run(canonical, 'commit', '-q', '-m', 'master has the old text');
+    // The run worktree is on another branch whose tracked a.yaml holds the new text.
+    run(canonical, 'worktree', 'add', '-q', '-b', 'staging', worktree);
+    write(worktree, '.archon/workflows/a.yaml', NEW);
+    run(worktree, 'add', '-A');
+    run(worktree, 'commit', '-q', '-m', 'staging has the new text');
+    // Make the canonical .archon newer so the mtime gate lets the sync run.
+    const future = new Date(Date.now() + 60_000);
+    utimesSync(join(canonical, '.archon'), future, future);
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test('the sync runs and a tracked file keeps the worktree content (Test 4)', async () => {
+    write(canonical, '.archon/config.yaml', 'local: only\n');
+    utimesSync(
+      join(canonical, '.archon'),
+      new Date(Date.now() + 60_000),
+      new Date(Date.now() + 60_000)
+    );
+
+    const ran = await syncArchonToWorktree(worktree);
+
+    expect(ran).toBe(true);
+    expect(readFileSync(join(worktree, '.archon/workflows/a.yaml'), 'utf8')).toBe(NEW);
+    // the untracked local-only file is still copied; no tracked file shows as modified
+    expect(readFileSync(join(worktree, '.archon/config.yaml'), 'utf8')).toBe('local: only\n');
+    const status = run(worktree, 'status', '--porcelain', '--untracked-files=all')
+      .trim()
+      .split('\n')
+      .filter(Boolean);
+    expect(status.filter(line => line.startsWith(' M') || line.startsWith('M '))).toEqual([]);
   });
 });

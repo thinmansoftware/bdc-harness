@@ -5,8 +5,9 @@
  * based on configuration in .archon/config.yaml
  */
 
-import { copyFile, cp, stat, mkdir } from 'fs/promises';
+import { copyFile, cp, stat, mkdir, readdir } from 'fs/promises';
 import { join, dirname, relative, isAbsolute, normalize } from 'path';
+import { execFileAsync } from '@archon/git';
 import { createLogger } from '@archon/paths';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
@@ -64,8 +65,64 @@ export function isPathWithinRoot(root: string, filePath: string): boolean {
   return true;
 }
 
+/** Forward-slash form of a path, as git prints it. */
+function toPosix(path: string): string {
+  return path.replace(/\\/g, '/');
+}
+
+/**
+ * Paths under `relPath` that git tracks in the destination worktree (forward slashes, relative
+ * to `destRoot`). A tracked path keeps the worktree's own content: the canonical repo may be on a
+ * different branch with an older copy, and overwriting would dirty the worktree (the run-scope
+ * gate then fails) and let a later `git add -A` commit the older text (bdc-xo WO
+ * WO-HARNESS-WORKTREE-SYNC-NO-TRACKED-OVERWRITE-01). Returns an empty set when `destRoot` is not a
+ * git checkout or git cannot list it, so the copy then behaves exactly as before.
+ */
+async function listTrackedPaths(destRoot: string, relPath: string): Promise<Set<string>> {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['-C', destRoot, 'ls-files', '-z', '--', relPath || '.'],
+      { timeout: 15000, maxBuffer: 64 * 1024 * 1024 }
+    );
+    return new Set(stdout.split('\0').filter(entry => entry.length > 0));
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Copy a directory file by file, leaving every path in `tracked` untouched.
+ *
+ * @returns the number of tracked paths skipped
+ */
+async function copyDirectorySkippingTracked(
+  sourceDir: string,
+  destDir: string,
+  destRoot: string,
+  tracked: ReadonlySet<string>
+): Promise<number> {
+  await mkdir(destDir, { recursive: true });
+  let skipped = 0;
+  for (const dirent of await readdir(sourceDir, { withFileTypes: true })) {
+    const sourceEntry = join(sourceDir, dirent.name);
+    const destEntry = join(destDir, dirent.name);
+    if (dirent.isDirectory()) {
+      skipped += await copyDirectorySkippingTracked(sourceEntry, destEntry, destRoot, tracked);
+    } else if (tracked.has(toPosix(relative(destRoot, destEntry)))) {
+      skipped += 1;
+    } else {
+      await cp(sourceEntry, destEntry);
+    }
+  }
+  return skipped;
+}
+
 /**
  * Copy a single file or directory from source repo to worktree
+ *
+ * A path that git tracks in the destination worktree is never overwritten; untracked,
+ * ignored and missing destination paths are copied as before.
  *
  * @param sourceRoot - Canonical repo path
  * @param destRoot - Worktree path
@@ -110,14 +167,35 @@ export async function copyWorktreeFile(
     // Ensure destination directory exists
     await mkdir(dirname(destPath), { recursive: true });
 
+    const destRelative = toPosix(relative(destRoot, destPath));
+    const tracked = await listTrackedPaths(destRoot, destRelative);
+    let skippedTracked = 0;
+
     if (stats.isDirectory()) {
-      // Copy directory recursively
-      await cp(sourcePath, destPath, { recursive: true });
+      if (tracked.size === 0) {
+        // Copy directory recursively
+        await cp(sourcePath, destPath, { recursive: true });
+      } else {
+        skippedTracked = await copyDirectorySkippingTracked(
+          sourcePath,
+          destPath,
+          destRoot,
+          tracked
+        );
+      }
+    } else if (tracked.has(destRelative)) {
+      skippedTracked = 1;
     } else {
       // Copy single file
       await copyFile(sourcePath, destPath);
     }
 
+    if (skippedTracked > 0) {
+      getLog().info(
+        { source: entry.source, destination: entry.destination, skippedTracked },
+        'file_copy_skipped_tracked'
+      );
+    }
     getLog().debug({ source: entry.source, destination: entry.destination }, 'file_copied');
     return true;
   } catch (error) {
