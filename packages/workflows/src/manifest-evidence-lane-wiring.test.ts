@@ -266,11 +266,7 @@ function runStopTestsNode(opts: {
   const artifacts = join(cwd, 'artifacts');
   mkdirSync(artifacts);
   try {
-    // The repair snapshot requires a real Git worktree, including in fixtures.
-    const gitInit = Bun.spawnSync(['git', 'init', '-q'], { cwd });
-    if (gitInit.exitCode !== 0) {
-      throw new Error(`Fixture git init failed: ${gitInit.stderr.toString()}`);
-    }
+    // Initial evidence must not require a Git repair snapshot.
     writeFileSync(
       join(cwd, 'package.json'),
       `${JSON.stringify({ name: 'x', scripts: { test: 'bash ./repo-pass.sh' } })}\n`
@@ -320,9 +316,9 @@ function runStopTestsNode(opts: {
   }
 }
 
-// The behavioral cases spawn the node's bash; on win32 `bash` resolves to WSL and
-// produces nothing, so they run on POSIX CI only (ubuntu-latest).
-describe.skipIf(process.platform === 'win32')('run-stop-tests ladder (behavioral)', () => {
+// Use the same real bash as the project-map and workspace cases below, including
+// Git Bash on Windows. These regressions must exercise the initial runner too.
+describe('run-stop-tests ladder (behavioral)', () => {
   it('a spec-declared command that exits nonzero with no counts stays failed; repo_test_script is not run', () => {
     const { stdout, log } = runStopTestsNode({
       spec: rstSpec('bash ./exit3.sh'),

@@ -1572,7 +1572,7 @@ fi
 
 echo "--- Test 7: all_lanes_call_shared_script ---"
 STB_CALL='stb_report_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS"'
-STB_STAMP='"$(sme_field GREP_DROPPED "$GREPS_OUT")" | stb_stamp_base_red'
+STB_STAMP='"$(sme_field TESTS_FINAL_INFRA "$TESTS_OUT")" | stb_stamp_base_red'
 STB_N=0
 for lane in $LANES; do
   STB_N=$((STB_N + 1))

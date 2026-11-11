@@ -17,6 +17,11 @@ const SUITES = [
   'test-guard-dependencies.sh',
   'stage-evidence.sh',
   'env-unavailable-test-loop.sh',
+  'trusted-test-infra-r2.sh',
+  'trusted-test-infra-r2b.sh',
+  'trusted-test-infra-r2c.sh',
+  'trusted-test-infra-r2d.sh',
+  'trusted-test-infra-r3.sh',
 ] as const;
 
 describe.skipIf(process.platform === 'win32')('evidence gate shell suites', () => {
