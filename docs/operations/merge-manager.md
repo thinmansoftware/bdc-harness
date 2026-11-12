@@ -83,10 +83,21 @@ A squash merge lands the head the Overseer approved. If the PR branch still exis
 | `thinmansoftware/lspro-react` | `main` | no | skip |
 | `thinmansoftware/shopops-storefront` | `staging` | yes | skip |
 | `thinmansoftware/shopops-storefront` | `master` | no | skip |
+| `thinmansoftware/comicstoreos-provisioner` | `main` | yes | skip |
 
 `release/lspro`, `release/ce`, `main` and `master` are production lanes and are never unattended candidates: `release/*` has no entry at all.
 
-### Operator step after this lands on dev (not part of the code change)
+The provisioner row (WO-HARNESS-MERGE-POLICY-PROVISIONER-AND-REPO-SKIP-LINE-01, bdc-xo#5581) holds ONLY while merging to its `main` deploys nothing but the staging Vercel project `comicstoreos-provisioner-staging` (evidence: bdc-xo#5576 comment 6810214724, read 2026-11-11 23:58Z: one linked Vercel project, the GitHub "Production" deployments point at the staging project, no workflow runs `vercel deploy`, `--prod`, `ssh` or `docker push`). If a production provisioner project, domain or workflow ever deploys from `main`, first move that base to `COVERED_PRODUCTION_BASES` in `packages/overseer/src/m09-promotion-gate.ts` and set its entry to `unattended: false`; the guard test `production_bases_match_merge_policy` fails when the two tables disagree.
+
+### The environment value ADDS to the default
+
+`MERGE_MANAGER_REPO_POLICY` no longer replaces the default policy: a parseable value is merged OVER `DEFAULT_MERGE_REPO_POLICY` per repository. A repository in the default and absent from the value keeps its default entry, so a repository added to the code default (the provisioner) ships with the next rebuild without editing the host. A repository present in the value replaces that repository's default entry; `{"owner/repo":{}}` lists a repository with no bases, so nothing is allowed for it. A malformed value is still the EMPTY policy (fail closed): a configuration error never broadens merge authority.
+
+### A skipped repository is a warning that names it
+
+When an Overseer-approved verdict is skipped because its repository has no policy entry, the bridge records `repo_not_allowed` as before and logs `merge-coordinator.merge_skipped` at WARN (it was info) with `owner`, `repo`, `prNumber` (run-less verdicts), `verdictId`, `env: MERGE_MANAGER_REPO_POLICY` and `hint: add_repo_to_merge_policy`, once per verdict id per process (a replay of the same verdict stays info). Read it with `docker logs archon-app-1 --since 1h 2>&1 | grep merge_skipped | grep repo_not_allowed`. The fix is to add the repository to the in-code default in `packages/overseer/src/merge-repo-policy.ts` (not to the host environment).
+
+### FALLBACK ONLY, ask-first (John): host environment edit after this lands on dev (not part of the code change; since the environment value is additive, a repository added to the code default does not need it)
 
 Edit `/opt/bdc/archon/.env`, then run the governed rebuild of `archon-app-1`:
 
