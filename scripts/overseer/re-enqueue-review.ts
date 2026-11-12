@@ -209,6 +209,9 @@ export async function reEnqueue(
   };
 }
 
+/** Safety bound for the failed-row listing (500 rows a page); reaching it is an error, not a truncation. */
+const LIST_FAILED_MAX_PAGES = 2000;
+
 /** The reason the sweep sends with every row it re-enqueues. */
 export const EDGE_SWEEP_REASON = 'failed at the rebuild edge';
 
@@ -349,7 +352,14 @@ export function createHttpPort(
       // The cursor form of the list route: pages of failed rows, oldest first.
       const rows: ReviewRow[] = [];
       let afterSeq = 0;
-      for (let page = 0; page < 40; page += 1) {
+      // Read EVERY page: a silent cap would drop the newest failures (the oldest come first) while the
+      // sweep reported success (Overseer review of PR 1584). The cursor must advance on every full page,
+      // and a runaway history is an error, never a quiet truncation.
+      for (let page = 0; ; page += 1) {
+        if (page >= LIST_FAILED_MAX_PAGES)
+          throw new Error(
+            `the failed-row history exceeds ${LIST_FAILED_MAX_PAGES} pages; not read in full`
+          );
         const url = `${baseUrl}/api/dispatch/messages?recipient=${REVIEW_RECIPIENT}&after_seq=${afterSeq}&status=failed&limit=500`;
         const response = await doFetch(url, { headers });
         if (!response.ok) throw new Error(`list returned HTTP ${response.status}`);
@@ -360,12 +370,9 @@ export function createHttpPort(
         };
         if (!Array.isArray(data.messages)) throw new Error('list did not return a page');
         rows.push(...data.messages);
-        if (
-          !data.page_full ||
-          typeof data.next_after_seq !== 'number' ||
-          data.next_after_seq <= afterSeq
-        )
-          break;
+        if (!data.page_full) break;
+        if (typeof data.next_after_seq !== 'number' || data.next_after_seq <= afterSeq)
+          throw new Error('the list cursor did not advance on a full page; not read in full');
         afterSeq = data.next_after_seq;
       }
       return rows;

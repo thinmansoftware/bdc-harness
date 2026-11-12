@@ -542,4 +542,29 @@ describe('rebuild-edge sweep', () => {
     expect(urls[0]).toContain('recipient=overseer-reviewer&after_seq=0&status=failed&limit=500');
     expect(urls[1]).toContain('after_seq=7&status=failed');
   });
+
+  test('it reads past 40 pages and refuses a cursor that does not advance (Overseer review of PR 1584)', async () => {
+    let calls = 0;
+    const manyPages = (async () => {
+      calls += 1;
+      const last = calls === 45;
+      return new Response(
+        JSON.stringify({ messages: [row('failed')], next_after_seq: calls, page_full: !last }),
+        { status: 200 }
+      );
+    }) as unknown as typeof fetch;
+    const rows = await createHttpPort('http://x', 'tok', manyPages).listFailed?.();
+    expect(rows).toHaveLength(45);
+
+    const stuck = (async () =>
+      new Response(
+        JSON.stringify({ messages: [row('failed')], next_after_seq: 0, page_full: true }),
+        {
+          status: 200,
+        }
+      )) as unknown as typeof fetch;
+    await expect(createHttpPort('http://x', 'tok', stuck).listFailed?.()).rejects.toThrow(
+      'cursor did not advance'
+    );
+  });
 });
