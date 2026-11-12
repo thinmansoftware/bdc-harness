@@ -831,6 +831,30 @@ function nonEmptyModelField(value: unknown): string | null {
 }
 
 /**
+ * Read `gh pr view --json mergeable,mergeStateStatus` output. Only a merge CONFLICT is "not
+ * mergeable": `mergeable` CONFLICTING or `mergeStateStatus` DIRTY. A pull request that is merely
+ * waiting for a review (`mergeStateStatus` BLOCKED), behind its base (BEHIND), unstable (UNSTABLE)
+ * or still being computed (`mergeable` UNKNOWN) is NOT a conflict. GitHub's `mergeable` field has
+ * the values MERGEABLE, CONFLICTING and UNKNOWN; BLOCKED belongs to `mergeStateStatus`, so the old
+ * `mergeable === BLOCKED` branch could never fire (WO-HARNESS-CONFLICT-ONLY-GATE-NO-TIER-CLIMB-01).
+ * Returns true, false or null (unknown or unreadable).
+ */
+export function prMergeabilityFromGh(stdout: string): boolean | null {
+  let parsed: { mergeable?: unknown; mergeStateStatus?: unknown };
+  try {
+    parsed = JSON.parse(stdout) as { mergeable?: unknown; mergeStateStatus?: unknown };
+  } catch {
+    return null;
+  }
+  const mergeable = typeof parsed.mergeable === 'string' ? parsed.mergeable.toUpperCase() : '';
+  const state =
+    typeof parsed.mergeStateStatus === 'string' ? parsed.mergeStateStatus.toUpperCase() : '';
+  if (mergeable === 'CONFLICTING' || state === 'DIRTY') return false;
+  if (mergeable === 'MERGEABLE') return true;
+  return null;
+}
+
+/**
  * Check if a PR is mergeable via the gh CLI.
  * Returns null if gh is unavailable or returns non-zero.
  */
@@ -840,7 +864,7 @@ async function checkPrMergeableDefault(prUrl: string): Promise<boolean | null> {
     assertGitHubPoolAvailable(auth.poolId, 'core');
     const { stdout } = await execFileAsync(
       'gh',
-      ['pr', 'view', prUrl, '--json', 'mergeable', '--jq', '.mergeable'],
+      ['pr', 'view', prUrl, '--json', 'mergeable,mergeStateStatus'],
       { env: auth.env }
     );
     recordGitHubApiCall({
@@ -848,12 +872,9 @@ async function checkPrMergeableDefault(prUrl: string): Promise<boolean | null> {
       poolId: auth.poolId,
       resource: 'core',
       status: 0,
-      endpoint: 'cli:gh pr view --json mergeable',
+      endpoint: 'cli:gh pr view --json mergeable,mergeStateStatus',
     });
-    const val = stdout.trim().toUpperCase();
-    if (val === 'MERGEABLE') return true;
-    if (val === 'CONFLICTING' || val === 'BLOCKED') return false;
-    return null;
+    return prMergeabilityFromGh(stdout);
   } catch (err) {
     const stderr = (err as { stderr?: string }).stderr;
     const firstLine = (stderr ?? (err as Error).message ?? '').split('\n')[0];
