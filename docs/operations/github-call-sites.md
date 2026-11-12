@@ -49,3 +49,17 @@ Part 2 (static, from code reading; the live effect is measured after the next re
 - Only the top 25 endpoints per interval are logged; the rest are in `total` and `byService` but not named.
 - The endpoint names the call, not the code that made it. Find the code with a search for the route (for example `pulls.listReviews`).
 - No cut, cache or interval is changed by this counter. It exists so a cut is aimed at a measured spender.
+
+## Reconcile per-pass sharing and call counts (bdc-xo#5571 part 3, 2026-11-12)
+
+Measured after PR 1578 went live (hour 15:02Z to 16:03Z): the Overseer made 8,549 calls (8,693 an hour, from 11,608), reconcile `pulls/:n` fell from 3,887 to 301, but the reconcile spelling `GET /repos/{o}/{r}/pulls` rose from 866 to 1,580 and `GET /repos/{o}/{r}/issues` from 798 to 1,288. The pull list is read from the code, not yet proven: the supersede pass asked for the repository's OPEN pull requests once PER MERGED pull request that carries WO stems, inside one pass.
+
+Change: `runReconcileOnce` now shares the open-PR list of a repository across the merged pull requests of ONE pass (a pull request closed earlier in the pass is hidden from the shared list so it cannot be matched again), and logs one line per pass, `overseer.reconcile.call_counts`, with `counts`:
+
+| key | meaning |
+|---|---|
+| `calls:<dependency>` | how many times the pass called that dependency (`searchMergedPullRequests`, `findTrackerIssueByStem`, `listPullRequestFiles`, `closePullRequest`, ...) |
+| `open_pr_list:reads` / `open_pr_list:cache_hits` | repository open-PR lists that reached GitHub vs answered from the pass cache; `calls:listOpenPullRequestsInRepo` is their sum |
+| `pages:<reader>` | GitHub pages read per reader: `open_prs_in_repo`, `merged_trackers`, `tracker_close_events`, `tracker_comments`, `merged_pr_files` |
+
+How to read it (after the rebuild that carries it): `ssh hetzner-prod 'docker logs archon-app-1 --since 60m 2>&1 | grep overseer.reconcile.call_counts'`. Compare the sum of `pages:*` per hour with the `github_call_sites` lines for the reconcile spellings to attribute them; `open_pr_list:cache_hits` shows what the sharing removed. The tracker snapshot (`findTrackerIssueByStem`) was already shared per pass.

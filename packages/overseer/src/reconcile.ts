@@ -358,7 +358,86 @@ export interface ReconcileResult {
   skipped: boolean;
 }
 
+/**
+ * One reconcile pass with per-pass read sharing and accounting (bdc-xo#5571 part 3): the repository's
+ * OPEN pull request list is read ONCE per repository per pass (the supersede pass asked for it once per
+ * merged pull request), and every dependency call and every GitHub page is counted by name and logged
+ * at the end as `overseer.reconcile.call_counts`.
+ */
 export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<ReconcileResult> {
+  const baseDeps = input.deps ?? createDefaultReconcileDeps();
+  const counts: Record<string, number> = {};
+  const deps = withPassSharing(baseDeps, counts);
+  const logger = baseDeps.log ?? log;
+  const previous = activeReadCounts;
+  activeReadCounts = counts;
+  try {
+    return await runReconcilePass({ ...input, deps });
+  } finally {
+    activeReadCounts = previous;
+    logger.info?.({ counts }, 'overseer.reconcile.call_counts');
+  }
+}
+
+/**
+ * The dependencies for one pass: calls counted by name, and the open-PR list of a repository shared
+ * across the merged pull requests of the pass. A pull request this pass already closed is hidden from
+ * the shared list so a second merged PR cannot match (and comment on) it again.
+ */
+function withPassSharing(deps: ReconcileDeps, counts: Record<string, number>): ReconcileDeps {
+  const wrapped: Record<string, unknown> = { ...deps };
+  for (const [name, value] of Object.entries(deps)) {
+    if (typeof value !== 'function' || name === 'log' || name === 'now') continue;
+    const fn = value as (...args: unknown[]) => unknown;
+    wrapped[name] = (...args: unknown[]): unknown => {
+      counts[`calls:${name}`] = (counts[`calls:${name}`] ?? 0) + 1;
+      return fn(...args);
+    };
+  }
+  const result = wrapped as unknown as ReconcileDeps;
+  const closedThisPass = new Set<string>();
+  if (deps.listOpenPullRequestsInRepo) {
+    const list = deps.listOpenPullRequestsInRepo;
+    const lists = new Map<string, ReturnType<typeof list>>();
+    result.listOpenPullRequestsInRepo = async (
+      input
+    ): Promise<PagedRead<ReconcileRepoOpenPullRequest>> => {
+      const key = `${input.owner}/${input.repo}`.toLowerCase();
+      counts['calls:listOpenPullRequestsInRepo'] =
+        (counts['calls:listOpenPullRequestsInRepo'] ?? 0) + 1;
+      let pending = lists.get(key);
+      if (pending) {
+        counts['open_pr_list:cache_hits'] = (counts['open_pr_list:cache_hits'] ?? 0) + 1;
+      } else {
+        counts['open_pr_list:reads'] = (counts['open_pr_list:reads'] ?? 0) + 1;
+        pending = list(input);
+        lists.set(key, pending);
+      }
+      let read: PagedRead<ReconcileRepoOpenPullRequest>;
+      try {
+        read = asPagedRead(await pending);
+      } catch (error) {
+        lists.delete(key);
+        throw error;
+      }
+      return {
+        items: read.items.filter(item => !closedThisPass.has(`${key}#${item.number}`)),
+        truncated: read.truncated,
+      };
+    };
+  }
+  if (deps.closePullRequest) {
+    const close = deps.closePullRequest;
+    const counted = result.closePullRequest;
+    result.closePullRequest = async (input): Promise<void> => {
+      await (counted ?? close)(input);
+      closedThisPass.add(`${input.owner}/${input.repo}#${String(input.number)}`.toLowerCase());
+    };
+  }
+  return result;
+}
+
+async function runReconcilePass(input: RunReconcileInput = {}): Promise<ReconcileResult> {
   const deps = input.deps ?? createDefaultReconcileDeps();
   const trackerLookupScope = {};
   const successfullyClosedTrackers = new Set<string>();
@@ -1718,14 +1797,27 @@ const PR_FILES_MAX_PAGES = 30;
  * THE one paginator for capped reconcile reads. Complete only when a short page is
  * seen; a full page at the cap, or a malformed page, is `truncated: true`.
  */
+/**
+ * Per-pass read accounting (bdc-xo#5571 part 3). Set by runReconcileOnce for the duration of one pass
+ * and logged once at its end as `overseer.reconcile.call_counts`, so a measurement can name which
+ * reader owns which GitHub calls instead of reading it from the code. Pages are counted per label.
+ */
+let activeReadCounts: Record<string, number> | null = null;
+
+function countRead(label: string): void {
+  if (activeReadCounts) activeReadCounts[label] = (activeReadCounts[label] ?? 0) + 1;
+}
+
 async function readPages<T>(
   fetchPage: (page: number) => Promise<unknown>,
   map: (row: Record<string, unknown>) => T | null,
-  maxPages: number = READ_MAX_PAGES
+  maxPages: number = READ_MAX_PAGES,
+  label = 'unlabelled'
 ): Promise<PagedRead<T>> {
   const items: T[] = [];
   for (let page = 1; page <= maxPages; page++) {
     const data = await fetchPage(page);
+    countRead(`pages:${label}`);
     if (!Array.isArray(data)) return { items, truncated: true };
     for (const row of data as Record<string, unknown>[]) {
       const value = map(row);
@@ -1780,7 +1872,9 @@ async function listRepoOpenPullRequests(
           page,
         })
       )?.data,
-    mapRepoOpenPullRequest
+    mapRepoOpenPullRequest,
+    READ_MAX_PAGES,
+    'open_prs_in_repo'
   );
 }
 
@@ -1812,7 +1906,9 @@ export async function listOpenMergedTrackers(
         state: row.state === 'closed' ? 'closed' : 'open',
         createdAt: typeof row.created_at === 'string' ? row.created_at : null,
       };
-    }
+    },
+    READ_MAX_PAGES,
+    'merged_trackers'
   );
 }
 
@@ -1836,7 +1932,9 @@ export async function readLatestCloseEvent(
     row =>
       row.event === 'closed'
         ? { sha: typeof row.commit_id === 'string' ? row.commit_id : null }
-        : null
+        : null,
+    READ_MAX_PAGES,
+    'tracker_close_events'
   );
   const last = read.items[read.items.length - 1];
   return { sha: last ? last.sha : null, truncated: read.truncated };
@@ -1867,7 +1965,9 @@ export async function listIssueComments(
         htmlUrl: typeof row.html_url === 'string' ? row.html_url : '',
         createdAt: typeof row.created_at === 'string' ? row.created_at : '',
       };
-    }
+    },
+    READ_MAX_PAGES,
+    'tracker_comments'
   );
 }
 
@@ -1911,7 +2011,8 @@ export async function listPullRequestFilePaths(
         })
       ).data,
     row => (typeof row.filename === 'string' ? row.filename : null),
-    PR_FILES_MAX_PAGES
+    PR_FILES_MAX_PAGES,
+    'merged_pr_files'
   );
   if (cacheKey && !read.truncated) {
     mergedPullRequestFilesCache.delete(cacheKey);
