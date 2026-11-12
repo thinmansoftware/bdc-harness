@@ -21,6 +21,7 @@ import type {
   PullRequestEvidence,
   PullRequestRef,
   ReviewConflictAtHead,
+  SiblingMergeContextData,
 } from '../types.ts';
 import {
   listMessages as listDispatchMessages,
@@ -2694,5 +2695,49 @@ export function createRealGitHubClientDeps(
     },
     approvePullRequest: createRealApprovePullRequest(octokit),
     listOpenPullRequests: createRealListOpenPullRequests(octokit),
+    // Sibling check of the merge gate (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01): two reads per
+    // merge candidate (the PR itself and the 30 most recently updated closed PRs of its repository).
+    readSiblingMergeContext: async (input): Promise<SiblingMergeContextData> => {
+      const own = await octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.number,
+      });
+      const closed = await octokit.pulls.list({
+        owner: input.owner,
+        repo: input.repo,
+        state: 'closed',
+        sort: 'updated',
+        direction: 'desc',
+        per_page: 30,
+      });
+      return {
+        headRefName: own.data.head.ref ?? '',
+        createdAt: own.data.created_at ?? '',
+        recentMerged: closed.data.flatMap(candidate =>
+          candidate.merged_at
+            ? [
+                {
+                  number: candidate.number,
+                  url: candidate.html_url,
+                  mergedAt: candidate.merged_at,
+                  body: candidate.body ?? '',
+                },
+              ]
+            : []
+        ),
+      };
+    },
+    listMergedPullRequestFiles: async (input): Promise<readonly string[] | null> => {
+      if (!octokit.pulls.listFiles) throw new Error('overseer_real_adapter_missing_list_files');
+      const response = await octokit.pulls.listFiles({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.number,
+        per_page: 100,
+      });
+      // A full page may hide more files: unreadable, so the caller treats the merge as not spec-only.
+      return response.data.length >= 100 ? null : response.data.map(file => file.filename);
+    },
   };
 }
