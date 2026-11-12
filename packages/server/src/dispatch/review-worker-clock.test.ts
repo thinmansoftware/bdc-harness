@@ -354,9 +354,13 @@ describe('review worker clock', () => {
 
   test('logs no_checks_reported when a checks-pending outcome has no names', async () => {
     const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
-    const deps = fakeDeps([message('no-checks')], () => ({
-      disposition: 'checks_pending',
-    }));
+    // A fresh row: older than the bound it would end as no_checks_reported (see review-worker-no-checks.test.ts).
+    const deps = fakeDeps(
+      [{ ...message('no-checks'), created_at: new Date().toISOString() }],
+      () => ({
+        disposition: 'checks_pending',
+      })
+    );
     deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
     await tickReviewWorkerClock(CONFIG, deps);
     expect(warnings[0]).toEqual({
@@ -521,7 +525,8 @@ describe('review worker clock', () => {
   test('retries a released item on a later tick until it reaches a terminal disposition', async () => {
     let disposition: SubmitOutcome['disposition'] = 'checks_pending';
     const deps = fakeDeps(
-      [message('retry', 'exact-head')],
+      // A fresh row: an epoch-old row with no reported checks would end as no_checks_reported.
+      [{ ...message('retry', 'exact-head'), created_at: new Date().toISOString() }],
       () => ({ disposition }) as SubmitOutcome
     );
 

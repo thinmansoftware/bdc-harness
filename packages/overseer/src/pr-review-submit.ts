@@ -847,7 +847,7 @@ function qualifiesExecution(
   );
 }
 
-async function submitIncomplete(
+export async function submitIncomplete(
   work: ReviewWorkItem,
   deps: SubmitDeps,
   reason: string
