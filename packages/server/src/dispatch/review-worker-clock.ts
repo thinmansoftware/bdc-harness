@@ -84,6 +84,7 @@ import {
 } from '@archon/overseer/pr-review-wiring';
 import {
   runAndSubmitReview,
+  submitIncomplete,
   type ReviewWorkItem,
   type SubmitDisposition,
   type SubmitOutcome,
@@ -114,6 +115,30 @@ const CHECKS_PENDING_BACKOFF_MS = Math.max(
   1_000,
   Number(process.env.OVERSEER_REVIEW_CHECKS_PENDING_BACKOFF_MS) || 60_000
 );
+// WO-HARNESS-OVERSEER-NO-CHECKS-DEFERRAL-BOUND-01 (bdc-xo#5575): a head that reports ZERO check
+// runs used to be deferred and claimed again every minute forever (GitHub Actions did not run for
+// the push). After this long, measured from the review row's created_at, the review ends with the
+// visible outcome `review_incomplete` / `no_checks_reported` instead.
+export const NO_CHECKS_MAX_WAIT_ENV = 'OVERSEER_REVIEW_NO_CHECKS_MAX_WAIT_MS';
+export const DEFAULT_NO_CHECKS_MAX_WAIT_MS = 1_800_000;
+export const MIN_NO_CHECKS_MAX_WAIT_MS = 60_000;
+
+/** Positive integer milliseconds, floor one minute; an unset value is the default, a bad one warns. */
+export function resolveNoChecksMaxWaitMs(
+  raw: string | undefined = process.env[NO_CHECKS_MAX_WAIT_ENV],
+  logger: ReviewWorkerLogger = log
+): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_NO_CHECKS_MAX_WAIT_MS;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    logger.warn(
+      { env: NO_CHECKS_MAX_WAIT_ENV, value: raw, fallbackMs: DEFAULT_NO_CHECKS_MAX_WAIT_MS },
+      'overseer_review_no_checks_bound_invalid'
+    );
+    return DEFAULT_NO_CHECKS_MAX_WAIT_MS;
+  }
+  return Math.max(MIN_NO_CHECKS_MAX_WAIT_MS, value);
+}
 let timer: ReturnType<typeof setInterval> | null = null;
 let inFlight = false;
 
@@ -533,6 +558,40 @@ export async function tickReviewWorkerClock(
         // dead, the payload still names that dead SHA, and a release would spin
         // the item forever -- see mapSubmitOutcome for the full reasoning.
         if (outcome.disposition === 'checks_pending') {
+          // ZERO check runs reported on the head AND the row is older than the bound: stop
+          // deferring. Post the standard incomplete COMMENT on this exact head and end the row
+          // (failed / blocked, like every review_incomplete row) so the pull request has a visible
+          // outcome and the claim-defer loop ends. A head with ANY reported check
+          // (pendingChecks set, even empty) keeps the deferral below.
+          const ageMs = Date.now() - Date.parse(claimed.created_at);
+          const boundMs = resolveNoChecksMaxWaitMs(undefined, deps.logger ?? log);
+          if (outcome.pendingChecks === undefined && Number.isFinite(ageMs) && ageMs >= boundMs) {
+            (deps.logger ?? log).warn(
+              {
+                messageId: claimed.id,
+                owner: work.owner,
+                repo: work.repo,
+                prNumber: work.prNumber,
+                headSha: work.headSha,
+                ageMs,
+                boundMs,
+              },
+              'overseer_review_no_checks_bound_reached'
+            );
+            const incomplete = await submitIncomplete(
+              work,
+              deps.createSubmitDeps(config.reviewerIdentity),
+              'no_checks_reported'
+            );
+            await deps.postResult({
+              id: claimed.id,
+              worker_id: REVIEW_WORKER_ID,
+              fencing_token: claimed.fencing_token,
+              ...mapSubmitOutcome('review_incomplete'),
+              result_body: JSON.stringify(incomplete),
+            });
+            continue;
+          }
           // WO-HARNESS-OVERSEER-REVIEW-CHECK-DEFERRAL-01 Section 7 names this
           // transition `deferMessage`; it is the same fenced claimed->queued
           // transition, called by its WO name.
