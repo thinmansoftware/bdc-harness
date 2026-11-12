@@ -849,6 +849,22 @@ async function postCeilingQueueNotice(
 const REPO_NOT_ALLOWED_WARN_MAX = 2000;
 const warnedRepoNotAllowed = new Set<string>();
 
+/**
+ * WO-HARNESS-MERGE-QUEUE-NOTE-ALL-QUEUED-01 (bdc-xo#5697): when the hourly ceiling is full, every merge-ready
+ * pull request waiting behind the head of the queue gets the `merge-queued` label and one position comment,
+ * not only the head. At most this many notes per sweep (each note reads the pull request), and each verdict
+ * is noted once per process; a restart repeats a note at most once and the marker and label guards keep it
+ * from duplicating.
+ */
+export const QUEUE_NOTE_MAX_PER_SWEEP = 10;
+const QUEUE_NOTED_MAX = 2000;
+const queueNoted = new Set<string>();
+
+/** Test hook: forget which verdicts were already noted. */
+export function resetMergeQueueNotesForTests(): void {
+  queueNoted.clear();
+}
+
 function repoNotInPolicyDetails(owner: string, repo: string): Record<string, unknown> {
   return {
     owner,
@@ -863,7 +879,7 @@ async function mergeClaimedVerdict(
   verdict: OverseerVerdictRow,
   repoPolicy: MergeRepoPolicy,
   queuePosition: number
-): Promise<'stop' | undefined> {
+): Promise<'stop' | 'ceiling_full' | undefined> {
   let rateLimitDeferred = false;
   const skip = async (
     reason: string,
@@ -1339,7 +1355,12 @@ async function mergeClaimedVerdict(
       ceiling
     );
     await markMergeQueued(options, verdict, pr);
-    return notified ? 'stop' : undefined;
+    // The ceiling is full for everything behind the head: when the head's own notice posted, the sweep
+    // continues in note-only mode (no claim, no reservation, no merge) instead of stopping at the head. When
+    // the notice failed the sweep keeps its earlier behavior (visit the next verdict normally).
+    if (queueNoted.size >= QUEUE_NOTED_MAX) queueNoted.clear();
+    if (notified) queueNoted.add(verdict.id);
+    return notified ? 'ceiling_full' : undefined;
   }
 
   if (options.github.approvePullRequest) {
@@ -1470,19 +1491,90 @@ async function mergeClaimedVerdict(
   return undefined;
 }
 
+/**
+ * Note-only visit of a verdict that is waiting behind a full ceiling: read its pull request and, only when it
+ * is still a plausible merge candidate, post the position comment and the label. It never claims the verdict,
+ * reserves a slot or merges, and it records no outcome: a pull request that fails a later check is released
+ * by the normal path when it reaches the head, which already says why. Returns true when it spent a read.
+ */
+async function noteQueuedVerdict(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  repoPolicy: MergeRepoPolicy,
+  queuePosition: number
+): Promise<boolean> {
+  if (queueNoted.has(verdict.id)) return false;
+  let target: MergeTarget | null;
+  try {
+    target = await resolveMergeTarget(options, verdict, repoPolicy, async () => undefined);
+  } catch (error) {
+    log.warn(
+      { err: error as Error, verdictId: verdict.id, runId: verdict.run_id },
+      'merge-coordinator.queue_note_read_failed'
+    );
+    return true;
+  }
+  if (!target) return true;
+  const { pr, basePolicy } = target;
+  if (!pr.exists || !pr.pr || pr.state !== 'open' || pr.headSha !== verdict.head_sha) return true;
+  const labels = pr.labels ?? [];
+  if (
+    labels.includes('merge-hold') ||
+    labels.includes(RUN_BLOCKED_LABEL) ||
+    labels.includes(OWNER_REWORKING_LABEL)
+  ) {
+    return true;
+  }
+  if (reportedChecksAreBlocking(pr.checks) || pr.mergeableState === 'dirty') return true;
+  // A pull request the manager will never merge (a base that is not unattended, a docs-only change under a
+  // skip policy) is not waiting for a slot: no "queued" claim on it.
+  if (!basePolicy?.unattended) return true;
+  if (
+    pr.changedFilePaths &&
+    isDocumentationOnly(pr.changedFilePaths) &&
+    (basePolicy.docsOnly ?? 'skip') === 'skip'
+  ) {
+    return true;
+  }
+  const now = (options.now ?? ((): Date => new Date()))();
+  const since = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
+  const notified = await postCeilingQueueNotice(
+    options,
+    verdict,
+    pr,
+    since,
+    queuePosition,
+    configuredLimit(options.maxMergesPerHour)
+  );
+  await markMergeQueued(options, verdict, pr);
+  if (notified) {
+    if (queueNoted.size >= QUEUE_NOTED_MAX) queueNoted.clear();
+    queueNoted.add(verdict.id);
+  }
+  return true;
+}
+
 export async function runMergeExecutionBridgeOnce(
   options: MergeExecutionBridgeOptions
 ): Promise<void> {
   const repoPolicy = configuredPolicy(options.repoConfig);
   const verdicts = await options.store.listUnactionedVerdicts();
   let queuePosition = 0;
+  let noteOnly = false;
+  let notesThisSweep = 0;
   for (const verdict of verdicts) {
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
     queuePosition += 1;
+    if (noteOnly) {
+      if (notesThisSweep >= QUEUE_NOTE_MAX_PER_SWEEP) break;
+      if (await noteQueuedVerdict(options, verdict, repoPolicy, queuePosition)) notesThisSweep += 1;
+      continue;
+    }
     if (!(await options.store.claimVerdict(verdict.id))) continue;
     try {
-      if ((await mergeClaimedVerdict(options, verdict, repoPolicy, queuePosition)) === 'stop')
-        break;
+      const outcome = await mergeClaimedVerdict(options, verdict, repoPolicy, queuePosition);
+      if (outcome === 'stop') break;
+      if (outcome === 'ceiling_full') noteOnly = true;
     } catch (error) {
       await options.store.releaseMergeSlot(verdict.id);
       await options.store.releaseVerdictClaim(
