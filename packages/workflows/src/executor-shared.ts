@@ -91,6 +91,26 @@ export function isPaperworkNode(nodeId: string): boolean {
 }
 
 /**
+ * Advisory pre-check node IDs (WO-HARNESS-ADVISORY-NODE-FAILURE-NOT-RUN-FAILURE-01).
+ * These run FIRST and only try to short-circuit a build ("is the work already
+ * done?"). Their own prompts default to "proceed with the build" on any doubt, so a
+ * failure of one (for example a provider that exits 0 with empty output) is not
+ * evidence that the run's work failed. When every failed node is advisory and the
+ * run's terminal gate passed, the run is finalized completed (degraded) instead of
+ * failed (see dag-executor.ts). A failed required node, or a gate that did not
+ * pass, still fails the run exactly as before.
+ *
+ * Kept as a named list beside PAPERWORK_NODES on purpose: a YAML property would
+ * change the workflow schema, which is out of scope for that work order.
+ */
+export const ADVISORY_NODES = ['check-already-satisfied'] as const;
+
+/** True when a node ID is a declared advisory pre-check node. */
+export function isAdvisoryNode(nodeId: string): boolean {
+  return (ADVISORY_NODES as readonly string[]).includes(nodeId);
+}
+
+/**
  * Detect a pushed-branch / PR-creation artifact in a node's captured output.
  * Matches the markers the commit-and-push / open-pr bash nodes actually emit:
  *   - a real GitHub PR URL: `https://github.com/<owner>/<repo>/pull/<n>`
