@@ -346,9 +346,10 @@ describe('merged sibling finder (the merge gate)', () => {
     recentMerged: [
       {
         number: 102,
-        url: 'https://github.com/o/r/pull/102',
+        url: 'https://github.com/thinmansoftware/bdc-harness/pull/102',
         mergedAt: '2026-11-12T14:14:22Z',
         body: `WO: ${WO}\n`,
+        baseRef: 'dev',
       },
     ],
     ...overrides,
@@ -363,14 +364,51 @@ describe('merged sibling finder (the merge gate)', () => {
       resolve: async () => resolution,
       listMergedFiles: async () => files,
     });
-  const ref = { owner: 'o', repo: 'r', number: 103 };
+  const ref = { owner: 'thinmansoftware', repo: 'bdc-harness', number: 103 };
 
   test('finds a same-work-order PR merged after this one was created', async () => {
     expect(await finder(context(), { kind: 'one', woId: WO })(ref)).toEqual({
       number: 102,
-      url: 'https://github.com/o/r/pull/102',
+      url: 'https://github.com/thinmansoftware/bdc-harness/pull/102',
       woId: WO,
     });
+  });
+
+  test('a merge into a branch other than the project base is not completion evidence (Overseer review of PR 1581)', async () => {
+    const intoFeature = context({
+      recentMerged: [
+        {
+          number: 102,
+          url: 'https://github.com/thinmansoftware/bdc-harness/pull/102',
+          mergedAt: '2026-11-12T14:14:22Z',
+          body: `WO: ${WO}\n`,
+          baseRef: 'feat/integration-branch',
+        },
+      ],
+    });
+    expect(await finder(intoFeature, { kind: 'one', woId: WO })(ref)).toBeNull();
+    const unknownBase = context({
+      recentMerged: [
+        {
+          number: 102,
+          url: 'https://github.com/thinmansoftware/bdc-harness/pull/102',
+          mergedAt: '2026-11-12T14:14:22Z',
+          body: `WO: ${WO}\n`,
+          baseRef: '',
+        },
+      ],
+    });
+    expect(await finder(unknownBase, { kind: 'one', woId: WO })(ref)).toBeNull();
+  });
+
+  test('a repository with no known project base never blocks', async () => {
+    expect(
+      await finder(context(), { kind: 'one', woId: WO })({
+        owner: 'someone',
+        repo: 'unknown-repo',
+        number: 103,
+      })
+    ).toBeNull();
   });
 
   test('ignores a merge before this PR existed, a spec-only merge, another work order, itself and any doubt', async () => {
@@ -389,5 +427,56 @@ describe('merged sibling finder (the merge gate)', () => {
     expect(
       await finder(context({ createdAt: 'not a date' }), { kind: 'one', woId: WO })(ref)
     ).toBeNull();
+  });
+});
+
+describe('real GitHub client: sibling merge context', () => {
+  test('reads the PR head and creation time, and the base branch of each merged PR', async () => {
+    const { createRealGitHubClientDeps } = await import('./adapters/github-real-deps');
+    const calls: string[] = [];
+    const octokit = {
+      pulls: {
+        get: async (input: Record<string, unknown>) => {
+          calls.push(`get:${String(input.pull_number)}`);
+          return { data: { head: { ref: SALVAGE_BRANCH }, created_at: '2026-11-12T14:07:12Z' } };
+        },
+        list: async (input: Record<string, unknown>) => {
+          calls.push(`list:${String(input.state)}:${String(input.per_page)}`);
+          return {
+            data: [
+              {
+                number: 102,
+                merged_at: '2026-11-12T14:14:22Z',
+                html_url: 'https://github.com/thinmansoftware/bdc-harness/pull/102',
+                body: `WO: ${WO}`,
+                base: { ref: 'dev' },
+              },
+              { number: 90, merged_at: null, html_url: 'x', body: null, base: { ref: 'dev' } },
+              {
+                number: 91,
+                merged_at: '2026-11-12T10:00:00Z',
+                html_url: 'y',
+                body: null,
+                base: { ref: 'feat/other' },
+              },
+            ],
+          };
+        },
+      },
+    };
+    const deps = createRealGitHubClientDeps(octokit as never);
+    const context = await deps.readSiblingMergeContext?.({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 103,
+    });
+    expect(calls).toEqual(['get:103', 'list:closed:30']);
+    expect(context?.headRefName).toBe(SALVAGE_BRANCH);
+    expect(context?.createdAt).toBe('2026-11-12T14:07:12Z');
+    // Only merged PRs; each carries its base branch (the gate compares it with the project base).
+    expect(context?.recentMerged.map(merged => [merged.number, merged.baseRef])).toEqual([
+      [102, 'dev'],
+      [91, 'feat/other'],
+    ]);
   });
 });

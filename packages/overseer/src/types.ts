@@ -319,7 +319,14 @@ export interface MergeCandidateDiscoveryDeps {
 export interface SiblingMergeContextData {
   headRefName: string;
   createdAt: string;
-  recentMerged: readonly { number: number; url: string; mergedAt: string; body: string }[];
+  recentMerged: readonly {
+    number: number;
+    url: string;
+    mergedAt: string;
+    body: string;
+    /** The branch the merged PR targeted ('' when unknown). */
+    baseRef: string;
+  }[];
 }
 
 export interface GitHubClientDeps {

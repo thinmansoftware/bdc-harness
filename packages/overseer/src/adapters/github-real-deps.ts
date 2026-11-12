@@ -2722,6 +2722,7 @@ export function createRealGitHubClientDeps(
                   url: candidate.html_url,
                   mergedAt: candidate.merged_at,
                   body: candidate.body ?? '',
+                  baseRef: candidate.base?.ref ?? '',
                 },
               ]
             : []

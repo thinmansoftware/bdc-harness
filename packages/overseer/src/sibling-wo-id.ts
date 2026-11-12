@@ -18,6 +18,7 @@ import {
   findOriginatingRunsForPullRequest,
   type ListOriginatingRunCandidates,
 } from './originating-run-lookup';
+import { resolveProjectBase } from './project-bases';
 import {
   extractDeclaredWoStems,
   extractReconcileSkipStems,
@@ -90,6 +91,8 @@ export interface RecentMergedPullRequest {
   readonly url: string;
   readonly mergedAt: string;
   readonly body: string;
+  /** The branch the merged PR targeted ('' when unknown). */
+  readonly baseRef: string;
 }
 
 /** What the merge gate reads from GitHub about one candidate pull request and its repository. */
@@ -131,6 +134,11 @@ export function createMergedSiblingFinder(
   deps: MergedSiblingFinderDeps
 ): (input: { owner: string; repo: string; number: number }) => Promise<MergedSibling | null> {
   return async (input): Promise<MergedSibling | null> => {
+    // Same eligibility rule as the reconcile supersede pass: a merge counts as completion evidence only
+    // when it landed on the project's base branch. A merge into an intermediate feature or integration
+    // branch, or into a repository with no known project base, never blocks a PR.
+    const projectBase = resolveProjectBase(input.owner, input.repo);
+    if (projectBase === null) return null;
     const context = await deps.readContext(input);
     const resolved = await deps.resolve({ ...input, headRefName: context.headRefName });
     if (resolved.kind !== 'one') return null;
@@ -138,6 +146,7 @@ export function createMergedSiblingFinder(
     if (Number.isNaN(createdAt)) return null;
     for (const merged of context.recentMerged) {
       if (merged.number === input.number) continue;
+      if (merged.baseRef !== projectBase) continue;
       const mergedAt = Date.parse(merged.mergedAt);
       if (Number.isNaN(mergedAt) || !(createdAt < mergedAt)) continue;
       const skipped = extractReconcileSkipStems(merged.body);
