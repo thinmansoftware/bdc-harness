@@ -858,9 +858,27 @@ const warnedRepoNotAllowed = new Set<string>();
  */
 export const QUEUE_NOTE_MAX_PER_SWEEP = 10;
 const QUEUE_NOTED_MAX = 2000;
-const queueNoted = new Set<string>();
+/**
+ * A verdict whose pull request was visited and judged not eligible (held, stale, failing, conflicting, a base
+ * the manager never merges) or whose read failed is not read again for this long, so unsuccessful visits
+ * cannot keep using the per-sweep budget and starve the eligible pull requests behind them (Overseer review
+ * of PR 1590). A verdict that WAS noted is remembered for the life of the process.
+ */
+export const QUEUE_NOTE_RECHECK_MS = 5 * 60 * 1000;
+// verdict id -> epoch ms until which the verdict is skipped (Infinity once noted)
+const queueNoted = new Map<string, number>();
 
-/** Test hook: forget which verdicts were already noted. */
+function queueNoteSkipped(verdictId: string, nowMs: number): boolean {
+  const until = queueNoted.get(verdictId);
+  return until !== undefined && until > nowMs;
+}
+
+function rememberQueueVisit(verdictId: string, until: number): void {
+  if (queueNoted.size >= QUEUE_NOTED_MAX) queueNoted.clear();
+  queueNoted.set(verdictId, until);
+}
+
+/** Test hook: forget which verdicts were already noted or visited. */
 export function resetMergeQueueNotesForTests(): void {
   queueNoted.clear();
 }
@@ -1358,8 +1376,7 @@ async function mergeClaimedVerdict(
     // The ceiling is full for everything behind the head: when the head's own notice posted, the sweep
     // continues in note-only mode (no claim, no reservation, no merge) instead of stopping at the head. When
     // the notice failed the sweep keeps its earlier behavior (visit the next verdict normally).
-    if (queueNoted.size >= QUEUE_NOTED_MAX) queueNoted.clear();
-    if (notified) queueNoted.add(verdict.id);
+    if (notified) rememberQueueVisit(verdict.id, Number.POSITIVE_INFINITY);
     return notified ? 'ceiling_full' : undefined;
   }
 
@@ -1503,7 +1520,13 @@ async function noteQueuedVerdict(
   repoPolicy: MergeRepoPolicy,
   queuePosition: number
 ): Promise<boolean> {
-  if (queueNoted.has(verdict.id)) return false;
+  const now = (options.now ?? ((): Date => new Date()))();
+  if (queueNoteSkipped(verdict.id, now.getTime())) return false;
+  // Every visit below that does not end in a note is remembered for QUEUE_NOTE_RECHECK_MS.
+  const notEligible = (): true => {
+    rememberQueueVisit(verdict.id, now.getTime() + QUEUE_NOTE_RECHECK_MS);
+    return true;
+  };
   let target: MergeTarget | null;
   try {
     target = await resolveMergeTarget(options, verdict, repoPolicy, async () => undefined);
@@ -1512,31 +1535,32 @@ async function noteQueuedVerdict(
       { err: error as Error, verdictId: verdict.id, runId: verdict.run_id },
       'merge-coordinator.queue_note_read_failed'
     );
-    return true;
+    return notEligible();
   }
-  if (!target) return true;
+  if (!target) return notEligible();
   const { pr, basePolicy } = target;
-  if (!pr.exists || !pr.pr || pr.state !== 'open' || pr.headSha !== verdict.head_sha) return true;
+  if (!pr.exists || !pr.pr || pr.state !== 'open' || pr.headSha !== verdict.head_sha) {
+    return notEligible();
+  }
   const labels = pr.labels ?? [];
   if (
     labels.includes('merge-hold') ||
     labels.includes(RUN_BLOCKED_LABEL) ||
     labels.includes(OWNER_REWORKING_LABEL)
   ) {
-    return true;
+    return notEligible();
   }
-  if (reportedChecksAreBlocking(pr.checks) || pr.mergeableState === 'dirty') return true;
+  if (reportedChecksAreBlocking(pr.checks) || pr.mergeableState === 'dirty') return notEligible();
   // A pull request the manager will never merge (a base that is not unattended, a docs-only change under a
   // skip policy) is not waiting for a slot: no "queued" claim on it.
-  if (!basePolicy?.unattended) return true;
+  if (!basePolicy?.unattended) return notEligible();
   if (
     pr.changedFilePaths &&
     isDocumentationOnly(pr.changedFilePaths) &&
     (basePolicy.docsOnly ?? 'skip') === 'skip'
   ) {
-    return true;
+    return notEligible();
   }
-  const now = (options.now ?? ((): Date => new Date()))();
   const since = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
   const notified = await postCeilingQueueNotice(
     options,
@@ -1547,10 +1571,11 @@ async function noteQueuedVerdict(
     configuredLimit(options.maxMergesPerHour)
   );
   await markMergeQueued(options, verdict, pr);
-  if (notified) {
-    if (queueNoted.size >= QUEUE_NOTED_MAX) queueNoted.clear();
-    queueNoted.add(verdict.id);
-  }
+  // A note that did not post (comment API down) is retried after the recheck window, not on every sweep.
+  rememberQueueVisit(
+    verdict.id,
+    notified ? Number.POSITIVE_INFINITY : now.getTime() + QUEUE_NOTE_RECHECK_MS
+  );
   return true;
 }
 

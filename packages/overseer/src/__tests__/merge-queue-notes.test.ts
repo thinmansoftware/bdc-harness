@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import {
   QUEUE_NOTE_MAX_PER_SWEEP,
+  QUEUE_NOTE_RECHECK_MS,
   resetMergeQueueNotesForTests,
   runMergeExecutionBridgeOnce as runBridge,
   type MergeExecutionBridgeOptions,
@@ -49,7 +50,7 @@ interface Queue {
   reads: Map<number, number>;
   merges: number[];
   evidence: Map<number, Partial<PullRequestEvidence>>;
-  sweep: () => Promise<void>;
+  sweep: (at?: Date) => Promise<void>;
 }
 
 // Verdict i has head `head-i`, run branch `branch-i` and pull request number 100 + i.
@@ -153,11 +154,11 @@ function queue(count: number, ceilingUsed = 2, ceiling = 2): Queue {
     reads,
     merges,
     evidence,
-    sweep: () =>
+    sweep: (at = NOW) =>
       run({
         store,
         github,
-        now: () => NOW,
+        now: () => at,
         maxMergesPerHour: ceiling,
         readPolicy: () => policy(),
       }),
@@ -273,5 +274,40 @@ describe('merge queue notes: every queued pull request is labelled and commented
     }
     expect(q.claims).toEqual(['v1', 'v1']);
     expect(q.merges).toEqual([]);
+  });
+
+  test('Test 7: ineligible pull requests do not starve the eligible ones behind them (Overseer review of PR 1590)', async () => {
+    // head, ten held pull requests (102 to 111), then an eligible one (112)
+    const q = queue(12);
+    for (let number = 102; number <= 111; number += 1)
+      q.evidence.set(number, { labels: ['merge-hold'] });
+
+    await q.sweep();
+    // the first sweep spends its ten reads on the held ones and notes nothing behind the head
+    expect(q.comments.get(112)).toBeUndefined();
+    for (let number = 102; number <= 111; number += 1) expect(q.reads.get(number)).toBe(1);
+
+    await q.sweep();
+    // the second sweep skips the held ones without reading them and reaches the eligible one
+    for (let number = 102; number <= 111; number += 1) expect(q.reads.get(number)).toBe(1);
+    expect(q.comments.get(112)).toHaveLength(1);
+    expect(q.labels.get(112)).toEqual(['merge-queued']);
+  });
+
+  test('Test 8: a held pull request is re-read after the recheck window and noted once the hold is lifted', async () => {
+    const q = queue(3);
+    q.evidence.set(102, { labels: ['merge-hold'] });
+
+    await q.sweep();
+    expect(q.comments.get(102)).toBeUndefined();
+    expect(q.reads.get(102)).toBe(1);
+
+    // hold lifted; inside the window nothing is read, after it the pull request is noted
+    q.evidence.delete(102);
+    await q.sweep(new Date(NOW.getTime() + QUEUE_NOTE_RECHECK_MS - 1000));
+    expect(q.reads.get(102)).toBe(1);
+    await q.sweep(new Date(NOW.getTime() + QUEUE_NOTE_RECHECK_MS + 1000));
+    expect(q.reads.get(102)).toBe(2);
+    expect(q.comments.get(102)).toHaveLength(1);
   });
 });
