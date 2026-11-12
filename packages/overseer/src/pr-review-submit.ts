@@ -22,6 +22,7 @@ import type {
   SubmitPullRequestReviewResult,
 } from './adapters/github-real-deps.ts';
 import { readFile } from 'node:fs/promises';
+import { createLogger } from '@archon/paths';
 import { hasDistinctMergeIdentity } from './adapters/github-real-deps';
 import { classifyRateLimitError } from './github-rate-limit';
 import { resolveMergeManagerMode } from './merge-manager';
@@ -32,6 +33,8 @@ import {
   type RemediationEmitResult,
   type RemediationRefusalReason,
 } from './remediation-candidate';
+
+const credentialLog = createLogger('overseer/pr-review-submit');
 
 /** What the governed reviewer returns. */
 export interface ReviewerVerdict {
@@ -596,8 +599,16 @@ export async function runAndSubmitReview(
   const event: OverseerReviewEvent = verdict.approved ? 'APPROVE' : 'REQUEST_CHANGES';
   const body = buildReviewBody(work, verdict);
 
-  if (work.executionContext && (await reviewBodyContainsCredential(body))) {
-    return submitIncomplete(work, deps, 'review_body_credential_leak');
+  if (work.executionContext) {
+    const leak = await findCredentialInReviewBody(body);
+    if (leak) {
+      // Name the matched kind and field, never the value (bdc-xo#5550).
+      credentialLog.warn(
+        { prNumber: work.prNumber, repo: work.repo, kind: leak.kind, field: leak.field },
+        'review_body_credential_leak'
+      );
+      return submitIncomplete(work, deps, 'review_body_credential_leak');
+    }
   }
 
   if (work.executionContext && verdict.approved) {
@@ -708,36 +719,112 @@ export async function runAndSubmitReview(
   });
 }
 
-const GENERIC_CREDENTIAL_SHAPE =
-  /(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|Bearer\s+[A-Za-z0-9._~+/-]{20,})/i;
+/**
+ * Credential shapes that must never appear in a review body (bdc-xo#5550 narrowed the guard).
+ *
+ * The earlier pattern, `sk-[A-Za-z0-9_-]{20,}` with the case-insensitive flag and no left
+ * boundary, matched inside ordinary names: any work-order id or branch name containing the
+ * letters "sk" followed by a hyphen and 20 more name characters (for example a desk or task id
+ * with a long kebab-case tail), so the Overseer refused its own review of any pull request that
+ * named that work order (five heads of bdc-xo PR 5518). A real token is matched by its prefix, a
+ * left boundary, a realistic minimum length and, where the prefix is ambiguous, its character mix:
+ *
+ * - `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` (36 characters in reality) and `github_pat_` (82):
+ *   distinctive prefixes, at least 30 characters after them;
+ * - `sk-` (OpenAI and Anthropic keys are 40 characters or more): at least 32 characters after the
+ *   prefix, a digit and a letter, and Shannon entropy of at least 4.1 bits per character (random
+ *   base62 is 4.4 and up; kebab-case words and work-order ids are below 4.0);
+ * - `Bearer <value>`: at least 24 characters, a digit and a letter, entropy of at least 3.3 (a
+ *   hex secret is about 3.9).
+ */
+const PREFIXED_TOKEN_SHAPE =
+  /(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{30,})/;
+const SK_KEY_CANDIDATE = /(?<![A-Za-z0-9])sk-([A-Za-z0-9_-]{32,})/g;
+const BEARER_CANDIDATE = /(?<![A-Za-z0-9])Bearer\s+([A-Za-z0-9._~+/-]{24,})/gi;
 
-function collectLongStrings(value: unknown, into: string[]): void {
+function shannonEntropy(value: string): number {
+  const counts = new Map<string, number>();
+  for (const char of value) counts.set(char, (counts.get(char) ?? 0) + 1);
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const p = count / value.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+function hasDigitAndLetter(value: string): boolean {
+  return /[0-9]/.test(value) && /[A-Za-z]/.test(value);
+}
+
+/** True when `body` holds a string shaped like a real credential. Exported for tests. */
+export function bodyHasCredentialShape(body: string): boolean {
+  if (PREFIXED_TOKEN_SHAPE.test(body)) return true;
+  for (const match of body.matchAll(SK_KEY_CANDIDATE)) {
+    const candidate = match[1] ?? '';
+    if (hasDigitAndLetter(candidate) && shannonEntropy(candidate) >= 4.1) return true;
+  }
+  for (const match of body.matchAll(BEARER_CANDIDATE)) {
+    const candidate = match[1] ?? '';
+    if (hasDigitAndLetter(candidate) && shannonEntropy(candidate) >= 3.3) return true;
+  }
+  return false;
+}
+
+/** A login-file field whose NAME says it holds a secret (tokens, keys, passwords), or a JWT. */
+const SECRET_FIELD_NAME = /(?:token|secret|key|password|credential)/i;
+const JWT_SHAPE = /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+
+/**
+ * Collect the secret-valued strings of the login file with their field paths. Identifiers that are
+ * not secrets (issuer URL, client id, account id, refresh timestamp) are skipped: before bdc-xo#5550
+ * every string of 20 characters or more counted, so ordinary repeated text could trip the guard.
+ */
+function collectSecretStrings(
+  value: unknown,
+  path: string,
+  into: { field: string; value: string }[]
+): void {
   if (typeof value === 'string') {
-    if (value.length >= 20) into.push(value);
+    const leaf = path.split('.').pop() ?? '';
+    if (value.length >= 20 && (SECRET_FIELD_NAME.test(leaf) || JWT_SHAPE.test(value)))
+      into.push({ field: path, value });
     return;
   }
   if (Array.isArray(value)) {
-    for (const item of value) collectLongStrings(item, into);
+    value.forEach((item, index) => {
+      collectSecretStrings(item, `${path}[${index}]`, into);
+    });
     return;
   }
   if (value && typeof value === 'object') {
-    for (const item of Object.values(value as Record<string, unknown>))
-      collectLongStrings(item, into);
+    for (const [key, item] of Object.entries(value as Record<string, unknown>))
+      collectSecretStrings(item, path ? `${path}.${key}` : key, into);
   }
 }
 
+export interface CredentialMatch {
+  kind: 'generic_shape' | 'login_field';
+  /** The login-file field NAME that matched; never the value. */
+  field?: string;
+}
+
 /** Parent-only final egress guard for the reviewer's accepted residual-risk login. */
-async function reviewBodyContainsCredential(body: string): Promise<boolean> {
-  if (GENERIC_CREDENTIAL_SHAPE.test(body)) return true;
+export async function findCredentialInReviewBody(
+  body: string,
+  loginPath = '/home/appuser/.codex/auth.json'
+): Promise<CredentialMatch | null> {
+  if (bodyHasCredentialShape(body)) return { kind: 'generic_shape' };
   try {
-    const login = JSON.parse(await readFile('/home/appuser/.codex/auth.json', 'utf8')) as unknown;
-    const values: string[] = [];
-    collectLongStrings(login, values);
-    return values.some(value => body.includes(value));
+    const login = JSON.parse(await readFile(loginPath, 'utf8')) as unknown;
+    const secrets: { field: string; value: string }[] = [];
+    collectSecretStrings(login, '', secrets);
+    const hit = secrets.find(secret => body.includes(secret.value));
+    return hit ? { kind: 'login_field', field: hit.field } : null;
   } catch {
     // Missing reviewer auth is handled by the broker. The generic shape guard
     // remains active for test and bootstrap environments without this file.
-    return false;
+    return null;
   }
 }
 
@@ -760,7 +847,7 @@ function qualifiesExecution(
   );
 }
 
-async function submitIncomplete(
+export async function submitIncomplete(
   work: ReviewWorkItem,
   deps: SubmitDeps,
   reason: string

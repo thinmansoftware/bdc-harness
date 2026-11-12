@@ -321,3 +321,33 @@ existing table was altered.
 - Each logical effect has one journal row. A failed or deferred attempt reuses
   that row on the next eligible tick; retries are bounded by the original
   deadline, and expired rows are terminal.
+
+## Remediation candidate pause and disposal
+
+A candidate-bearing proposal retains its stable action key while Taskmaster is
+paused, including the operator escalation used when no owner thread matches.
+Both pause checks withhold these proposals; a pause or epoch change after journal
+creation leaves them deferred for a fresh gated tick. Noncandidate canary and P0
+exemptions remain unchanged. The original 24-hour proof deadline is preserved;
+a longer pause expires the action rather than extending its delivery authority.
+
+A sent journal row proves delivery for deduplication. Production consumption
+retains the candidate below its attempt cap until a later eligible candidate for
+the same PR supersedes it. Sent reconciliation runs before the existing P0
+cooldown, so cleanup can retry without authorizing another send. New unmatched
+escalations still respect that cooldown.
+
+Only queued, unacknowledged, unaddressed, undisposed `run_review` messages in the
+Taskmaster mailbox can provide candidate or supersession evidence. Disposal uses
+the existing unregistered machine actor and the `requireNoReceipt` conditional
+update, preserving a receipt that races observation. A failed disposal leaves the
+sent journal and candidate available for later reconciliation. This shape check
+does not authenticate sender provenance; the existing 200-row discovery bound
+also remains a limitation.
+
+Migration 067 widens the existing migrated PostgreSQL journal to accept
+`remediation_nudge` alongside the six existing verbs. It is a necessary correction
+to the original WO's contradictory no-migration exclusion. It does not reconstruct
+Taskmaster tables in `000_combined.sql`, which does not contain them. Fresh-schema
+parity and accepted M-129 lineage remain separate work. No runtime migration or
+deployment is authorized by these source changes.

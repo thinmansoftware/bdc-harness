@@ -17,14 +17,22 @@ export const OPERATOR_HISTORY_CUTOFF = '2026-11-01T00:00:00.000Z';
 export const OPERATOR_RECIPIENT = 'operator';
 
 /**
+ * WO-HARNESS-OVERSEER-OWNER-ROUTING-01: the responsible actor of a card whose
+ * work has no recorded owner. It is NOT an XO principal; an unowned card is
+ * an explicit bucket for John to assign (M-93 clause 2).
+ */
+export const UNOWNED_RESPONSIBLE_ACTOR = 'unowned';
+
+/**
  * Responsible-actor values that name an XO principal. A run report owned by
  * any of these must reach the operator mailbox; a T3-only copy is invisible
- * to the XO. `acting-xo` is also the default buildDispatchRunReportBody
- * writes when the card carries no actor, so a blank actor counts too.
+ * to the XO. Only an EXPLICIT XO principal counts (M-93 clause 3): a blank
+ * actor is no longer treated as XO, because XO is never automatically
+ * assigned (M-93 clause 2).
  */
 const XO_RESPONSIBLE_ACTORS: ReadonlySet<string> = new Set(['acting-xo', 'xo', 'operator']);
 
 export function isXoResponsibleActor(actor: string | null | undefined): boolean {
   const normalized = (actor ?? '').trim().toLowerCase();
-  return normalized === '' || XO_RESPONSIBLE_ACTORS.has(normalized);
+  return XO_RESPONSIBLE_ACTORS.has(normalized);
 }

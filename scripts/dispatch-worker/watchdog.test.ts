@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from 'bun:test';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { checkWatchdog, runWatchdogMain, type WatchdogDeps } from './watchdog';
+import type { LockContents, ProcessIdentity } from './instance-lock';
 
 const TASK = 'BlueDevil-Dispatch-Worker';
 
@@ -9,7 +10,15 @@ function deps(overrides: Partial<WatchdogDeps>): WatchdogDeps {
   return {
     readLockPid: mock(async () => null),
     isAlive: mock(() => false),
-    isTransportAvailable: mock(async () => true),
+    readLock: mock(
+      async (): Promise<LockContents> => ({
+        pid: null,
+        started_at: null,
+        start_time: null,
+        executable: null,
+      })
+    ),
+    lookupIdentity: mock((): ProcessIdentity | null => null),
     startTask: mock(async () => {}),
     log: mock(() => {}),
     ...overrides,
@@ -17,24 +26,6 @@ function deps(overrides: Partial<WatchdogDeps>): WatchdogDeps {
 }
 
 describe('dispatch worker watchdog', () => {
-  test('live worker without transport is degraded and never starts another task', async () => {
-    const startTask = mock(async () => {});
-    const lines: string[] = [];
-    const code = await runWatchdogMain(
-      { lockFile: '/tmp/mock.lock', taskName: TASK },
-      deps({
-        readLockPid: mock(async () => 4242),
-        isAlive: mock(() => true),
-        isTransportAvailable: mock(async () => false),
-        startTask,
-        log: line => lines.push(line),
-      })
-    );
-    expect(code).toBe(0);
-    expect(lines[0]).toContain('dispatch_worker_watchdog_degraded');
-    expect(startTask).not.toHaveBeenCalled();
-  });
-
   test('Test 7: watchdog_starts_the_task_when_the_lock_pid_is_dead', async () => {
     const startTask = mock(async () => {});
     const d = deps({
@@ -112,5 +103,107 @@ describe('dispatch worker watchdog', () => {
     expect(ps1).toMatch(/New-TimeSpan -Minutes 5/);
     // The original worker task's AtLogOn trigger is still present.
     expect(ps1).toContain('-AtLogOn');
+  });
+});
+
+describe('dispatch worker watchdog: process identity (WO-HARNESS-DISPATCH-WORKER-STALE-LOCK-01 Test 6)', () => {
+  const lock: LockContents = {
+    pid: 4220,
+    started_at: '2026-10-15T02:32:00.543Z',
+    start_time: '2026-10-15T02:32:00.000Z',
+    executable: 'bun.exe',
+  };
+
+  test('a lock PID reused by an unrelated process is treated as no worker: the task is started, the reason is logged', async () => {
+    const startTask = mock(async () => {});
+    const lines: string[] = [];
+    const d = deps({
+      readLockPid: mock(async () => 4220),
+      isAlive: mock(() => true),
+      readLock: mock(async () => lock),
+      lookupIdentity: mock(() => ({
+        start_time: '2026-10-19T07:49:00.000Z',
+        executable: 'atkexComSvc.exe',
+      })),
+      startTask,
+      log: (line: string) => lines.push(line),
+    });
+
+    const result = await checkWatchdog({ lockFile: '/tmp/x.lock', taskName: TASK }, d);
+
+    expect(result.action).toBe('started');
+    expect(startTask).toHaveBeenCalledTimes(1);
+    expect(startTask).toHaveBeenCalledWith(TASK);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('dispatch_worker_watchdog_reused_pid');
+    expect(lines[0]).toContain('pid=4220');
+  });
+
+  test('a genuine live holder (same start time and executable) is left alone', async () => {
+    const startTask = mock(async () => {});
+    const d = deps({
+      readLockPid: mock(async () => 4220),
+      isAlive: mock(() => true),
+      readLock: mock(async () => lock),
+      lookupIdentity: mock(() => ({
+        start_time: '2026-10-15T02:32:00.400Z',
+        executable: 'bun.exe',
+      })),
+      startTask,
+    });
+
+    const result = await checkWatchdog({ lockFile: '/tmp/x.lock', taskName: TASK }, d);
+
+    expect(result.action).toBe('healthy');
+    expect(startTask).not.toHaveBeenCalled();
+  });
+
+  test('an unreadable identity is not proof: a live holder is left alone', async () => {
+    const startTask = mock(async () => {});
+    const d = deps({
+      readLockPid: mock(async () => 4220),
+      isAlive: mock(() => true),
+      readLock: mock(async () => lock),
+      lookupIdentity: mock(() => null),
+      startTask,
+    });
+
+    const result = await checkWatchdog({ lockFile: '/tmp/x.lock', taskName: TASK }, d);
+
+    expect(result.action).toBe('healthy');
+    expect(startTask).not.toHaveBeenCalled();
+  });
+
+  test('a legacy lock whose live holder started after the lock was written is treated as stale', async () => {
+    const startTask = mock(async () => {});
+    const d = deps({
+      readLockPid: mock(async () => 4220),
+      isAlive: mock(() => true),
+      readLock: mock(async () => ({ ...lock, start_time: null, executable: null })),
+      lookupIdentity: mock(() => ({
+        start_time: '2026-10-19T07:49:00.000Z',
+        executable: 'atkexComSvc.exe',
+      })),
+      startTask,
+    });
+
+    const result = await checkWatchdog({ lockFile: '/tmp/x.lock', taskName: TASK }, d);
+
+    expect(result.action).toBe('started');
+    expect(startTask).toHaveBeenCalledTimes(1);
+  });
+
+  test('the watchdog never consults identity for a dead or missing lock PID', async () => {
+    const lookupIdentity = mock((): ProcessIdentity | null => null);
+    const d = deps({
+      readLockPid: mock(async () => 999999),
+      isAlive: mock(() => false),
+      lookupIdentity,
+    });
+
+    const result = await checkWatchdog({ lockFile: '/tmp/x.lock', taskName: TASK }, d);
+
+    expect(result.action).toBe('started');
+    expect(lookupIdentity).not.toHaveBeenCalled();
   });
 });

@@ -273,7 +273,7 @@ const PROVIDER_MODEL_TO_ROUTER_ENGINE: readonly {
   model: string;
   engine: string;
 }[] = [
-  { provider: 'claude', model: 'claude-fable-5', engine: 'fable-session' },
+  { provider: 'claude', model: 'claude-fable-*', engine: 'fable-session' },
   { provider: 'claude', model: 'claude-sonnet-*', engine: 'sonnet-subscription' },
   { provider: 'claude', model: 'sonnet', engine: 'sonnet-subscription' },
   { provider: 'claude', model: 'claude-opus-*', engine: 'opus-api' },

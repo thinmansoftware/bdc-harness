@@ -184,6 +184,7 @@ describe('SqliteAdapter', () => {
         // receipt log and the T3 desktop results queue.
         { principal_id: 'pr-review-log', delivery_mode: 'drain_on_start', active: 1 },
         { principal_id: 't3-bridge', delivery_mode: 'drain_on_start', active: 1 },
+        { principal_id: 't3-desk-local', delivery_mode: 'worker_poll', active: 1 },
         { principal_id: 't3-desktop', delivery_mode: 'drain_on_start', active: 1 },
         // WO-HARNESS-OVERSEER-VERDICT-TO-TASKMASTER-REMEDIATION-01
         // (migration 046): recipient of Overseer's remediation candidates.
@@ -499,6 +500,87 @@ describe('SqliteAdapter', () => {
         `SELECT grade FROM tm_journal WHERE id = 'legacy-journal-2'`
       );
       expect(graded.rows).toEqual([{ grade: 'unheard' }]);
+    });
+  });
+
+  describe('tm_journal rebuild with tm_fire_admissions rows referencing it (2026-11-09 crash loop)', () => {
+    test('a pre-remediation_nudge tm_journal referenced by tm_fire_admissions rows is rebuilt without a foreign key failure', async () => {
+      currentDbPath = join(
+        import.meta.dir,
+        `.test-sqlite-adapter-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+      );
+      const legacy = new Database(currentDbPath);
+      // The production shape before WO-HARNESS-TASKMASTER-REMEDIATION-CONSUMER-01: six verbs, no
+      // remediation_nudge, and a child table (migration 063) whose journal_id REFERENCES tm_journal(id).
+      legacy.run(`
+        CREATE TABLE tm_journal (
+          id TEXT PRIMARY KEY,
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+          thread_ref TEXT NOT NULL,
+          action_type TEXT NOT NULL CHECK (action_type IN ('deliver_ruling', 'nudge', 'escalate_p0', 'digest', 'fire_cauldron', 'blocker_report')),
+          proposal_json TEXT NOT NULL,
+          idempotency_key TEXT,
+          before_hash TEXT,
+          proof_predicate TEXT,
+          proof_deadline_at TEXT,
+          outcome TEXT NOT NULL CHECK (outcome IN ('pending', 'sent', 'parked', 'deferred', 'rejected', 'expired', 'failed')),
+          graded_at TEXT,
+          grade TEXT CHECK (grade IS NULL OR grade IN ('useful', 'noise', 'harmful', 'unheard', 'delivered_to_issue'))
+        )
+      `);
+      legacy.run(`
+        CREATE TABLE tm_fire_admissions (
+          action_key TEXT PRIMARY KEY,
+          journal_id TEXT NOT NULL UNIQUE REFERENCES tm_journal(id),
+          source TEXT NOT NULL DEFAULT 'taskmaster' CHECK (source = 'taskmaster'),
+          source_thread_ref TEXT NOT NULL,
+          owner_token TEXT NOT NULL,
+          cascade_id TEXT NOT NULL,
+          utc_day TEXT NOT NULL CHECK (length(utc_day) = 10),
+          state TEXT NOT NULL CHECK (state IN ('reserved','admitted','released','unknown')),
+          reserved_at TEXT NOT NULL,
+          admitted_at TEXT,
+          updated_at TEXT NOT NULL,
+          run_ids_json TEXT NOT NULL DEFAULT '[]',
+          CHECK (state <> 'admitted' OR admitted_at IS NOT NULL)
+        )
+      `);
+      legacy.run(`
+        INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome)
+        VALUES ('fire-journal-1', '2026-11-01T00:00:00.000Z', 'gh:thinmansoftware/bdc-xo#1', 'fire_cauldron', '{}', 'sent')
+      `);
+      legacy.run(`
+        INSERT INTO tm_fire_admissions (action_key, journal_id, source_thread_ref, owner_token, cascade_id, utc_day, state, reserved_at, updated_at)
+        VALUES ('fire:1', 'fire-journal-1', 'gh:thinmansoftware/bdc-xo#1', 'tok', 'cascade-1', '2026-11-01', 'reserved', '2026-11-01T00:00:00.000Z', '2026-11-01T00:00:00.000Z')
+      `);
+      legacy.close();
+
+      // Reopening runs the migration. Before the fix this threw
+      // SQLiteError: FOREIGN KEY constraint failed from DROP TABLE tm_journal.
+      db = new SqliteAdapter(currentDbPath);
+
+      const schema = await db.query<{ sql: string }>(
+        `SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tm_journal'`
+      );
+      expect(schema.rows[0]?.sql).toContain('remediation_nudge');
+
+      // the journal row and the child row that references it both survive, and still match
+      const journal = await db.query<{ id: string }>(`SELECT id FROM tm_journal`);
+      expect(journal.rows).toEqual([{ id: 'fire-journal-1' }]);
+      const admission = await db.query<{ journal_id: string }>(
+        `SELECT journal_id FROM tm_fire_admissions`
+      );
+      expect(admission.rows).toEqual([{ journal_id: 'fire-journal-1' }]);
+      const fkViolations = await db.query(`PRAGMA foreign_key_check`);
+      expect(fkViolations.rows).toEqual([]);
+
+      // foreign keys are enforced again after the rebuild, and the new verb is accepted
+      const fk = await db.query<{ foreign_keys: number }>(`PRAGMA foreign_keys`);
+      expect(fk.rows[0]?.foreign_keys).toBe(1);
+      await db.query(
+        `INSERT INTO tm_journal (id, created_at, thread_ref, action_type, proposal_json, outcome)
+         VALUES ('remediation-1', '2026-11-09T00:00:00.000Z', 'gh:thinmansoftware/bdc-harness#1', 'remediation_nudge', '{}', 'sent')`
+      );
     });
   });
 

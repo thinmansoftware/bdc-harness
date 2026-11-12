@@ -50,6 +50,19 @@ const KIMI_FAILOVER = {
   agent: 'opr-adversarial-reviewer',
 } as const;
 
+// Acting XO 2026-11-10: the three reviewer nodes run on gpt-6.1-sol on lanes whose builder is a
+// different model (cursor, default, fable). The codex and codex-only lanes build on Sol and keep Terra.
+const REVIEWER_SOL_IDS: ReadonlySet<string> = new Set([
+  'diff-review',
+  'diff-review-final',
+  'opus-rereview',
+]);
+const REVIEWER_SOL_LANES: ReadonlySet<string> = new Set([
+  'bdc-feature-development-cursor.yaml',
+  'bdc-feature-development-fable.yaml',
+  'bdc-feature-development.yaml',
+]);
+
 const LANES: ReadonlyArray<{
   file: string;
   seats: readonly string[];
@@ -138,7 +151,9 @@ describe('review seats fail closed (no Claude fallback)', () => {
           expect(node?.failover_agent, `${id}:failover_agent`).toBe(agent);
         }
         if (node?.agent || node?.persona) {
-          expect(node?.model, `${id}:model`).toBe(terra);
+          expect(node?.model, `${id}:model`).toBe(
+            REVIEWER_SOL_IDS.has(id) && REVIEWER_SOL_LANES.has(file) ? 'gpt-6.1-sol' : terra
+          );
         }
       }
     });

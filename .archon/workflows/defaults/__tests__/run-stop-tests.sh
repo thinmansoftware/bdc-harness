@@ -252,7 +252,7 @@ assert_eq "passed" "$(printf 'TESTS_STATUS=passed\nTESTS_LINE=27/27 (bun test x)
 assert_eq "nonzero exit is failed even when counts agree" "$(printf 'TESTS_STATUS=failed\nTESTS_LINE=8/8 (node t.js) -- FAILED, exit 1')" "$(rst_report CODE 'node t.js' 1 '8 8')"
 assert_eq "passed < total is failed" "$(printf 'TESTS_STATUS=failed\nTESTS_LINE=6/8 (node t.js) -- FAILED, exit 0')" "$(rst_report CODE 'node t.js' 0 '6 8')"
 assert_eq "zero tests ran is failed" "$(printf 'TESTS_STATUS=failed\nTESTS_LINE=0/0 (node t.js) -- FAILED, exit 0')" "$(rst_report CODE 'node t.js' 0 '0 0')"
-assert_eq "timeout exit 124 is failed" "$(printf 'TESTS_STATUS=failed\nTESTS_LINE=3/3 (node t.js) -- FAILED, exit 124')" "$(rst_report CODE 'node t.js' 124 '3 3')"
+assert_eq "timeout exit 124 is blocked with a named reason" "$(printf 'TESTS_STATUS=blocked\nTESTS_LINE=BLOCKED (timeout:1500s)\nTESTS_BLOCKED_REASON=timeout:1500s')" "$(rst_report CODE 'node t.js' 124 '3 3')"
 assert_contains "counts_unparsed" "TESTS_STATUS=counts_unparsed" "$(rst_report CODE 'node t.js' 0 '')"
 assert_contains "counts_unparsed line is N/A with the command" "TESTS_LINE=N/A (test command exited 0 but pass/total could not be parsed from its output: node t.js)" "$(rst_report CODE 'node t.js' 0 '')"
 assert_contains "CODE with no command is no_command_declared" "TESTS_STATUS=no_command_declared" "$(rst_report CODE '' 0 '')"
@@ -1572,7 +1572,7 @@ fi
 
 echo "--- Test 7: all_lanes_call_shared_script ---"
 STB_CALL='stb_report_compare "$EVIDENCE_DIR/stop-tests.report" "$CMDS" "$LOG" "$COUNTS"'
-STB_STAMP='"$(sme_field GREP_DROPPED "$GREPS_OUT")" | stb_stamp_base_red'
+STB_STAMP='"$(sme_field TESTS_FINAL_INFRA "$TESTS_OUT")" | stb_stamp_base_red'
 STB_N=0
 for lane in $LANES; do
   STB_N=$((STB_N + 1))
@@ -1842,5 +1842,12 @@ named_end rst_core_imports_the_shared_tokenizer
 rm -rf "$RSTQ"
 
 echo
+# WO #3436: environment failures and individual chain segments retain their cause.
+SOURCE=spec_declared
+assert_contains "exit 127 is blocked" "TESTS_STATUS=blocked" "$(rst_report CODE 'pytest tests/x.py' 127 '')"
+assert_contains "timeout 2 is named" "TESTS_BLOCKED_REASON=timeout:2s" "$(RST_TIMEOUT_SECONDS=2 rst_report CODE 'bash tests/sleep.sh' 124 '')"
+assert_eq "huge positive timeout caps to 1700" "1700" "$(RST_TIMEOUT_SECONDS=999999999999 rst_timeout)"
+assert_eq "zero timeout retains default" "1500" "$(RST_TIMEOUT_SECONDS=0 rst_timeout)"
+assert_eq "non-integer timeout retains default" "1500" "$(RST_TIMEOUT_SECONDS=abc rst_timeout)"
 echo "run-stop-tests.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

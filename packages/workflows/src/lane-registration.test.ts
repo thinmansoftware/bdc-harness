@@ -76,6 +76,17 @@ function loadLane(filename: string): LaneDef {
   return (Bun as unknown as { YAML: { parse(s: string): unknown } }).YAML.parse(content) as LaneDef;
 }
 
+// Acting XO 2026-11-10: the three reviewer nodes run on gpt-6.1-sol on the cursor lane (builder
+// grok-4.7, so no self-review); every other review seat keeps Terra.
+const CURSOR_REVIEWER_SOL_IDS: ReadonlySet<string> = new Set([
+  'diff-review',
+  'diff-review-final',
+  'opus-rereview',
+]);
+function cursorReviewModel(id: string): string {
+  return CURSOR_REVIEWER_SOL_IDS.has(id) ? 'gpt-6.1-sol' : 'gpt-6.1-terra';
+}
+
 describe('lane registration and war-council-validator pin', () => {
   it('S4: enumerates exactly the twelve governed feature lanes', () => {
     // Kimi canary lanes added 2026-07-20 (WO-HARNESS-KIMI-QWEN-CANARY-LANES-01).
@@ -174,7 +185,7 @@ describe('lane registration and war-council-validator pin', () => {
 
       if (file === 'bdc-feature-development-astra.yaml') {
         expect(wcv.provider).toBe('claude');
-        expect(wcv.model).toBe('claude-fable-5');
+        expect(wcv.model).toBe('claude-fable-5-2');
         return;
       }
 
@@ -206,7 +217,7 @@ describe('lane registration and war-council-validator pin', () => {
       // and stays on the CLOSER rung (see the codex-lane branch above, which
       // is correct and unchanged).
       const expectedModel =
-        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5' : 'sonnet';
+        file === 'bdc-feature-development-fable.yaml' ? 'claude-fable-5-2' : 'sonnet';
       expect(wcv.provider).toBe('claude');
       expect(wcv.model).toBe(expectedModel);
     });
@@ -342,7 +353,7 @@ describe('lane registration and war-council-validator pin', () => {
       const source = codexNode(id);
       expect(reviewNode?.provider, `${file}:${id}:provider`).toBe('codex-native-strict');
       expect(reviewNode?.provider, `${file}:${id}:provider`).toBe(source?.provider);
-      expect(reviewNode?.model, `${file}:${id}:model`).toBe('gpt-6.1-terra');
+      expect(reviewNode?.model, `${file}:${id}:model`).toBe(cursorReviewModel(id));
       expect(source?.model, `codex:${id}:model`).toBe('gpt-6.1-terra');
       expect(reviewNode?.persona, `${file}:${id}:persona`).toBe(source?.persona);
       expect(reviewNode?.agent, `${file}:${id}:agent`).toBe(source?.agent);
@@ -366,13 +377,13 @@ describe('lane registration and war-council-validator pin', () => {
     expect(content).not.toMatch(/^\s*provider:\s*(grok|codex-opr)\b/m);
   });
 
-  it('Test 1: cursor-lane review seats pin Terra on codex-native-strict with model-free personas', () => {
+  it('Test 1: cursor-lane review seats pin Terra (reviewer nodes Sol) on codex-native-strict with model-free personas', () => {
     const lane = loadLane('bdc-feature-development-cursor.yaml');
     const nodes = lane.nodes ?? [];
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = nodes.find(candidate => candidate.id === id);
       expect(reviewNode?.provider, id).toBe('codex-native-strict');
-      expect(reviewNode?.model, id).toBe('gpt-6.1-terra');
+      expect(reviewNode?.model, id).toBe(cursorReviewModel(id));
       expect(reviewNode?.provider, id).not.toBe('claude');
       expect(reviewNode?.provider, id).not.toBe('cursor');
       expect(reviewNode?.model ?? '', id).not.toMatch(/grok/i);
@@ -409,7 +420,7 @@ describe('lane registration and war-council-validator pin', () => {
     }
     for (const id of REVIEW_SEAT_IDS) {
       const reviewNode = (cursor.nodes ?? []).find(candidate => candidate.id === id);
-      expect(reviewNode?.model, `cursor:${id}`).toBe('gpt-6.1-terra');
+      expect(reviewNode?.model, `cursor:${id}`).toBe(cursorReviewModel(id));
       expect(reviewNode?.model, `cursor:${id}`).not.toBe(cursor.model);
     }
 

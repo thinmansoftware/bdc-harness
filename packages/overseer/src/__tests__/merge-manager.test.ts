@@ -112,6 +112,7 @@ describe('merge manager', () => {
     const execute = mock(async () => ({ merged: true, message: 'fake_merge_accepted' }));
     const mergePullRequest = mock(async () => ({ merged: false }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -150,6 +151,7 @@ describe('merge manager', () => {
     const mergePullRequest = mock(async () => ({ merged: true }));
     const commentOnPullRequest = mock(async () => ({ commented: true }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'hold-canary',
       assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: digest }),
       judge: async input => approveReceipt(input),
@@ -192,6 +194,7 @@ describe('merge manager', () => {
     const execute = mock(async () => ({ merged: true }));
     const mergePullRequest = mock(async () => ({ merged: true }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       assembleEvidence: async () => ({
         evidence: evidence({ resulting_deployment_effect: 'none' }),
         evidenceDigest: 'c'.repeat(64),
@@ -223,6 +226,7 @@ describe('merge manager', () => {
       url: 'https://example.test/comment/1',
     }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'comment_findings',
       assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: digest }),
       judge: async input => approveReceipt(input),
@@ -269,6 +273,7 @@ describe('merge manager', () => {
     const execute = mock(async () => ({ merged: true }));
     const mergePullRequest = mock(async () => ({ merged: true }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'comment_findings',
       assembleEvidence: async () => ({
         evidence: evidence({ resulting_deployment_effect: 'none' }),
@@ -302,6 +307,7 @@ describe('merge manager', () => {
     const commentOnPullRequest = mock(async () => ({ commented: true }));
     const insertOverseerAction = mock(async () => undefined);
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'soft-merge-please',
       assembleEvidence: async () => ({
         evidence: evidence({ resulting_deployment_effect: 'none' }),
@@ -330,6 +336,7 @@ describe('merge manager', () => {
     const execute = mock(async () => ({ merged: true }));
     const commentOnPullRequest = mock(async () => ({ commented: true }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'comment_findings',
       assembleEvidence: async () => ({
         evidence: evidence({ resulting_deployment_effect: 'production' }),
@@ -377,6 +384,7 @@ describe('merge manager', () => {
     const judge = mock(async input => approveReceipt(input));
     const execute = mock(async () => ({ merged: true }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -421,6 +429,7 @@ describe('merge manager', () => {
     const insertOverseerAction = mock(async () => undefined);
     const execute = mock(async () => ({ merged: true, message: 'other_repo_merged' }));
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -473,6 +482,7 @@ describe('merge manager', () => {
         sha: 'd'.repeat(40),
       }));
       const manager = createMergeManager({
+        readRunEvents: async () => [],
         mode: 'execute',
         mutationsEnabled: options.mutationsEnabled ?? true,
         allowedBases: ['dev', 'staging'],
@@ -569,6 +579,7 @@ describe('merge manager', () => {
     const commentOnPullRequest = mock(async () => ({ commented: true }));
     const insertOverseerAction = mock(async () => undefined);
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'comment_findings',
       assembleEvidence: async () => ({
         evidence: evidence({ resulting_deployment_effect: 'none' }),
@@ -617,6 +628,7 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
     };
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       insertOverseerAction,
@@ -650,6 +662,7 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
     };
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -686,6 +699,7 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
     };
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -729,6 +743,7 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
     };
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging', 'main'],
@@ -759,6 +774,7 @@ describe('merge manager -- base branch fail-closed (bdc-xo#2131)', () => {
     };
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       insertOverseerAction,
@@ -849,6 +865,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'fake_merge_accepted' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -880,6 +897,48 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     expect(actions).toContain('merged');
   });
 
+  // WO-HARNESS-MERGE-OWNER-REWORKING-GUARD-01: the owner marks a PR owner:reworking while
+  // redoing the design. The run-linked manager (a second merge path next to the bridge) must
+  // hold it, never execute it, and record the denial. This is NOT HOLD (John's).
+  test('a PR labelled owner:reworking is held, never executed, and recorded as denied', async () => {
+    const labelledRecord: WatchedRunRecord = {
+      ...discoveredRecord,
+      prEvidence: { ...discoveredRecord.prEvidence, labels: ['owner:reworking'] },
+    };
+    const assembled = discoveredEvidence({ record: labelledRecord });
+    const insertOverseerAction = mock(async () => undefined);
+    const execute = mock(async () => ({ merged: true, message: 'must_not_run' }));
+
+    const manager = createMergeManager({
+      readRunEvents: async () => [],
+      mode: 'execute',
+      mutationsEnabled: true,
+      allowedBases: ['dev', 'staging'],
+      reviewGateLogin: 'thinman-overseer[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-overseer[bot]', state: 'APPROVED', commitId: PR_HEAD_SHA },
+      ],
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'e'.repeat(64) }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction,
+      findPullRequest: async () => labelledRecord.prEvidence,
+      mergePullRequest: async () => ({ merged: false }),
+      readWorktreeHeadSha: worktreeMustNotBeRead,
+    });
+
+    const result = await manager(labelledRecord);
+
+    expect(result.status).toBe('held');
+    expect(result).toEqual(expect.objectContaining({ reason: 'owner_reworking_label' }));
+    expect(execute).not.toHaveBeenCalled();
+    const actions = insertOverseerAction.mock.calls.map(
+      call => (call[0] as { action: string }).action
+    );
+    expect(actions).toContain('merge_denied');
+    expect(actions).not.toContain('merged');
+  });
+
   // The same PR against master is refused BEFORE provenance is ever consulted:
   // a main/master base is a production effect and holds for John.
   test('the same PR against master is still refused on the production hold', async () => {
@@ -891,6 +950,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -924,6 +984,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -954,6 +1015,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -987,6 +1049,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -1024,6 +1087,7 @@ describe('merge manager -- PR-discovered candidates with no originating run', ()
     const execute = mock(async () => ({ merged: true, message: 'should_not_run' }));
 
     const manager = createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       allowedBases: ['dev', 'staging'],
@@ -1091,6 +1155,7 @@ describe('per-repo base effect overrides', () => {
     }
   ): ReturnType<typeof createMergeManager> {
     return createMergeManager({
+      readRunEvents: async () => [],
       mode: 'execute',
       mutationsEnabled: true,
       // `main` is allowed as a BASE here so the test isolates the EFFECT classification;
@@ -1222,6 +1287,7 @@ describe('per-repo merge base policy', () => {
       allowedBases?: readonly string[]
     ): ReturnType<typeof createMergeManager> =>
       createMergeManager({
+        readRunEvents: async () => [],
         mode: 'execute',
         mutationsEnabled: true,
         allowedBases,
@@ -1288,5 +1354,38 @@ describe('per-repo merge base policy', () => {
     } finally {
       delete process.env.MERGE_MANAGER_ALLOWED_BASES;
     }
+  });
+
+  test('an approved green pull request on bdc-shopify-app main is skipped by the default policy (Test 3)', async () => {
+    const mergePullRequest = mock(async () => ({ merged: true, message: 'merged' }));
+    const execute = mock(async () => ({ merged: true, message: 'merged' }));
+    const assembled = evidence({
+      repository: 'bdc-shopify-app',
+      base_branch: 'main',
+      resulting_deployment_effect: 'none',
+    });
+    // No allowedBases and no policy env: the shipped DEFAULT_MERGE_REPO_POLICY decides.
+    delete process.env.MERGE_MANAGER_REPO_POLICY;
+    delete process.env.MERGE_MANAGER_ALLOWED_BASES;
+    const result = await createMergeManager({
+      readRunEvents: async () => [],
+      mode: 'execute',
+      mutationsEnabled: true,
+      reviewGateLogin: 'thinman-review-gate[bot]',
+      listPullRequestReviews: async () => [
+        { login: 'thinman-review-gate[bot]', state: 'APPROVED', commitId: RUN_HEAD_SHA },
+      ],
+      assembleEvidence: async () => ({ evidence: assembled, evidenceDigest: 'e'.repeat(64) }),
+      judge: async input => approveReceipt(input),
+      execute,
+      insertOverseerAction: async () => undefined,
+      findPullRequest: async () => record.prEvidence,
+      mergePullRequest,
+      readWorktreeHeadSha,
+    })(record);
+
+    expect(result).toMatchObject({ status: 'held', reason: 'base_branch_not_allowed' });
+    expect(mergePullRequest).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
   });
 });

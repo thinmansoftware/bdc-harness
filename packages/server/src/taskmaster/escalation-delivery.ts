@@ -41,6 +41,12 @@ import {
   resolveServiceGitHubAuth,
   type ServiceGitHubAuth,
 } from '@archon/core/github/service-identity';
+import { isValidGithubLogin } from '@archon/core/github/owner-label';
+
+// WO-HARNESS-OVERSEER-OWNER-ROUTING-01: owner-label parsing moved to
+// @archon/core so the Overseer can share it; re-exported here so Taskmaster
+// callers and their tests are unchanged.
+export { isValidGithubLogin, parseOwnerLabel } from '@archon/core/github/owner-label';
 
 const log = createLogger('taskmaster/escalation-delivery');
 
@@ -83,17 +89,6 @@ export function resolveEscalateToIssueEnabled(
   return raw.trim().toLowerCase() !== 'false';
 }
 
-/**
- * A single GitHub login: 1-39 chars, ASCII alphanumerics or single hyphens,
- * not starting or ending with a hyphen.
- */
-const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
-
-/** True only for a string that is exactly one valid GitHub login. */
-export function isValidGithubLogin(login: string | null | undefined): login is string {
-  return typeof login === 'string' && GITHUB_LOGIN.test(login);
-}
-
 /** Length caps for externally sourced text placed in the comment body. */
 export const ESCALATION_TITLE_MAX_CHARS = 200;
 export const ESCALATION_NEXT_ACTION_MAX_CHARS = 300;
@@ -130,35 +125,6 @@ export function sanitizeExternalText(
   if (cleaned.length <= maxChars) return cleaned;
   const cap = Math.max(1, maxChars - 3);
   return `${cleaned.slice(0, cap).trimEnd()}...`;
-}
-
-/**
- * Extract a single owner login from an `owner:<login>` LABEL (not a GitHub
- * assignee). labelsJson is TmAdoptionRow.labels_json, a JSON array of strings.
- * The suffix (surrounding spaces only trimmed) must be exactly one valid GitHub
- * login; anything else -- `owner:user @team`, a suffix containing a newline,
- * punctuation, or over-length -- is ignored so it can never produce an
- * unintended mention. Returns the first valid login, or null when there is none
- * or the JSON is absent/malformed.
- */
-export function parseOwnerLabel(labelsJson: string | null | undefined): string | null {
-  if (!labelsJson) return null;
-  let labels: unknown;
-  try {
-    labels = JSON.parse(labelsJson);
-  } catch {
-    return null;
-  }
-  if (!Array.isArray(labels)) return null;
-  for (const label of labels) {
-    if (typeof label !== 'string') continue;
-    const lower = label.toLowerCase();
-    if (lower.startsWith('owner:')) {
-      const login = label.slice('owner:'.length).replace(/^ +| +$/g, '');
-      if (isValidGithubLogin(login)) return login;
-    }
-  }
-  return null;
 }
 
 function describeSince(sinceIso: string | null, nowMs: number): string | null {

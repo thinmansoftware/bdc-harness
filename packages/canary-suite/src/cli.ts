@@ -8,6 +8,11 @@ import {
   type TaskmasterCanaryResult,
 } from './taskmaster-canary';
 import { runProbeBindingCommand, type ProbeBindingCommandDeps } from './probe-binding';
+import {
+  runDispatchWorkerHeartbeatCheck,
+  type DispatchWorkerCanaryDeps,
+  type DispatchWorkerCanaryResult,
+} from './dispatch-worker-canary';
 
 interface CanaryCliDeps {
   readonly runner: (options: RunCanaryOptions) => Promise<RunCanaryResult>;
@@ -19,6 +24,9 @@ interface CanaryCliDeps {
     report: TaskmasterCanaryResult
   ) => Promise<readonly string[]>;
   readonly probeBinding?: ProbeBindingCommandDeps;
+  readonly dispatchWorkerRunner?: (
+    options: DispatchWorkerCanaryDeps
+  ) => Promise<DispatchWorkerCanaryResult>;
 }
 
 function flag(args: readonly string[], name: string): string | undefined {
@@ -56,6 +64,22 @@ export async function runCanaryCli(
     else deps.stderr(result.output);
     return result.exitCode;
   }
+  if (command === 'dispatch-worker') {
+    // Read-only selected-source heartbeat freshness. No provider call, no message probe, no
+    // status-mutating request, no alert. Exit 0 means ONLY that this one row is fresh.
+    const dbPath = flag(args, '--db-path');
+    const workerId = flag(args, '--worker-id');
+    if (!dbPath || !workerId) {
+      deps.stderr('dispatch_worker_canary_missing_or_invalid_required_argument');
+      return 3;
+    }
+    const report = await (deps.dispatchWorkerRunner ?? runDispatchWorkerHeartbeatCheck)({
+      dbPath,
+      workerId,
+    });
+    deps.stdout(JSON.stringify(report, null, 2));
+    return exitFor(report.verdict);
+  }
   if (command === 'taskmaster') {
     const dbPath = flag(args, '--db-path');
     const statusUrl = flag(args, '--status-url');
@@ -91,7 +115,9 @@ export async function runCanaryCli(
   }
   const level = command === 'check' ? 0 : command === 'plan' ? 1 : null;
   if (level === null) {
-    deps.stderr('Usage: archon-canary <check|plan|taskmaster|probe-binding> [options]');
+    deps.stderr(
+      'Usage: archon-canary <check|plan|taskmaster|dispatch-worker|probe-binding> [options]'
+    );
     return 3;
   }
   const manifestPath = flag(args, '--manifest');

@@ -1,4 +1,6 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
+import * as drainerStall from '../dispatch/workroom-drainer-stall';
+import * as dispatchDatabase from '@archon/core/db/dispatch';
 import { createHash } from 'crypto';
 import { unlinkSync } from 'fs';
 import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
@@ -3242,6 +3244,64 @@ describe('dispatch API', () => {
   });
 
   describe('principal-only ordinary mail transport', () => {
+    test('T8: only a successful authenticated principal list records a drainer poll', async () => {
+      const poll = spyOn(drainerStall, 'notePrincipalPoll');
+      try {
+        useRegistry([
+          record({
+            credential_id: 'workroom-drainer-1',
+            principal_id: 'workroom-drainer',
+            token: 'workroom-test-token',
+            send_as: ['workroom-drainer'],
+            receive_as: ['workroom-drainer'],
+            roles: ['receive'],
+          }),
+        ]);
+        const app = makeApp('secret-token');
+        const valid = principalHeaders('workroom-drainer', 'workroom-test-token');
+        const invalid = await app.request('/api/dispatch/messages?recipient=workroom-drainer', {
+          headers: principalHeaders('workroom-drainer', 'wrong-token'),
+        });
+        expect(invalid.status).toBe(401);
+        expect(poll).not.toHaveBeenCalled();
+        const denied = await app.request('/api/dispatch/messages?recipient=xo', { headers: valid });
+        expect(denied.status).toBe(403);
+        expect(poll).not.toHaveBeenCalled();
+        const successful = await app.request('/api/dispatch/messages?recipient=workroom-drainer', {
+          headers: valid,
+        });
+        expect(successful.status).toBe(200);
+        expect(poll).toHaveBeenCalledTimes(1);
+        expect(poll).toHaveBeenCalledWith('workroom-drainer');
+        const selected = await app.request(
+          '/api/dispatch/messages?recipient=workroom-drainer&after_seq=0',
+          { headers: valid }
+        );
+        expect(selected.status).toBe(200);
+        expect(poll).toHaveBeenCalledTimes(2);
+        const invalidSelector = await app.request(
+          '/api/dispatch/messages?recipient=workroom-drainer&after_seq=bad',
+          { headers: valid }
+        );
+        expect(invalidSelector.status).toBe(400);
+        expect(poll).toHaveBeenCalledTimes(2);
+        const read = spyOn(dispatchDatabase, 'listMessages').mockImplementation(async () => {
+          throw new Error('database unavailable');
+        });
+        try {
+          const failed = await app.request('/api/dispatch/messages?recipient=workroom-drainer', {
+            headers: valid,
+          });
+          expect(failed.status).toBe(500);
+          expect(poll).toHaveBeenCalledTimes(2);
+        } finally {
+          read.mockRestore();
+        }
+      } finally {
+        poll.mockRestore();
+      }
+    });
+
     const grokbotToken = 'grokbot-token';
     const sendOnlyToken = 'grokbot-send-only-token';
     const receiveOnlyToken = 'grokbot-receive-only-token';

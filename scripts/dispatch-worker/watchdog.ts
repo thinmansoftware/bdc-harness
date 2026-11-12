@@ -1,7 +1,13 @@
 import { readFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
-import { createConnection } from 'node:net';
+import {
+  classifyAliveHolder,
+  defaultLookupIdentity,
+  readLockContents,
+  type LockContents,
+  type ProcessIdentity,
+} from './instance-lock';
 
 /**
  * Desktop watchdog for the Dispatch worker.
@@ -23,8 +29,10 @@ export interface WatchdogDeps {
   readLockPid: (lockFile: string) => Promise<number | null>;
   /** Liveness check for a PID. */
   isAlive: (pid: number) => boolean;
-  /** Port reachability only; never grants recipient or process authority. */
-  isTransportAvailable: () => Promise<boolean>;
+  /** Read the whole lock (pid, start_time, executable) for the identity check. */
+  readLock: (lockFile: string) => Promise<LockContents>;
+  /** Start time and executable of a live PID; null when unreadable. */
+  lookupIdentity: (pid: number) => ProcessIdentity | null;
   /** Start the worker scheduled task by name. Rejects on failure. */
   startTask: (taskName: string) => Promise<void>;
   /** Structured single-line logger. */
@@ -32,7 +40,7 @@ export interface WatchdogDeps {
 }
 
 export interface WatchdogResult {
-  action: 'started' | 'healthy' | 'degraded';
+  action: 'started' | 'healthy';
 }
 
 export function defaultWatchdogLockFile(workerId: string): string {
@@ -50,9 +58,21 @@ export async function checkWatchdog(
 ): Promise<WatchdogResult> {
   const pid = await deps.readLockPid(options.lockFile);
   if (pid !== null && deps.isAlive(pid)) {
-    return { action: (await deps.isTransportAvailable()) ? 'healthy' : 'degraded' };
+    // A live PID is only the worker if it is still the process that wrote the lock:
+    // Windows reuses PIDs after a reboot (2026-10-19, PID 4220 became an ASUS service).
+    // Unknown identity is never proof of a mismatch, so a genuine worker is left alone.
+    // Nothing here ever stops that PID; the worker's own start reclaims the stale lock.
+    const verdict = classifyAliveHolder(
+      await deps.readLock(options.lockFile),
+      deps.lookupIdentity(pid)
+    );
+    if (!verdict.stale) {
+      return { action: 'healthy' };
+    }
+    deps.log(`dispatch_worker_watchdog_reused_pid: pid=${pid} reason=${verdict.reason}`);
   }
-  // Missing lock OR dead PID: there is no live worker process -> start it.
+  // Missing lock, dead PID, or a PID proven to belong to a different process:
+  // there is no live worker process -> start it.
   await deps.startTask(options.taskName);
   return { action: 'started' };
 }
@@ -112,28 +132,6 @@ async function realStartTask(taskName: string): Promise<void> {
   }
 }
 
-function realTransportAvailable(): Promise<boolean> {
-  return new Promise(resolve => {
-    const socket = createConnection({ host: '127.0.0.1', port: 3900 });
-    let settled = false;
-    const finish = (ready: boolean): void => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(ready);
-    };
-    socket.setTimeout(1_000, () => {
-      finish(false);
-    });
-    socket.once('connect', () => {
-      finish(true);
-    });
-    socket.once('error', () => {
-      finish(false);
-    });
-  });
-}
-
 function argValue(flag: string, fallback: string): string {
   const index = process.argv.indexOf(flag);
   if (index !== -1 && process.argv[index + 1]) return process.argv[index + 1];
@@ -148,7 +146,8 @@ if (import.meta.main) {
     {
       readLockPid: realReadLockPid,
       isAlive: realIsAlive,
-      isTransportAvailable: realTransportAvailable,
+      readLock: readLockContents,
+      lookupIdentity: defaultLookupIdentity,
       startTask: realStartTask,
       log: (line: string): void => {
         console.error(line);

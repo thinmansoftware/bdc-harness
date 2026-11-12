@@ -1,3 +1,4 @@
+import { ingestBeforePromotion, processPromotionWebhook } from '@archon/overseer';
 /**
  * Remote Coding Agent - Main Entry Point
  * Multi-platform AI coding assistant (Telegram, Discord, Slack, GitHub, Gitea)
@@ -81,6 +82,10 @@ import {
   stopWorkerHeartbeatAlarmTimer,
 } from './dispatch/worker-heartbeat-alarm';
 import {
+  startWorkroomDrainerStallTimer,
+  stopWorkroomDrainerStallTimer,
+} from './dispatch/workroom-drainer-stall';
+import {
   observeStartupRecovery,
   reconcilePendingRunsAtBoot,
   reconcileRunningRunsAtBoot,
@@ -89,8 +94,11 @@ import {
   loadPersistedSeatCutoff,
   restoreSeatCutoffOverride,
 } from '@archon/workflows/reliability/seat-usage';
-import { startOverseerRuntime, stopOverseerRuntime } from './overseer-runtime';
-import { createMergeManager } from '@archon/overseer/merge-manager';
+import {
+  createRuntimeMergeManager,
+  startOverseerRuntime,
+  stopOverseerRuntime,
+} from './overseer-runtime';
 import { resolveDefaultDeps } from '@archon/overseer/service';
 import { ingestPullRequestEvent } from '@archon/overseer/pr-review-ingest';
 import { createRealIngestDeps, resolveReviewRouteConfig } from '@archon/overseer/pr-review-wiring';
@@ -119,6 +127,7 @@ import {
   validateAppDefaultsPaths,
   shutdownTelemetry,
 } from '@archon/paths';
+import { enableGitHubCallSiteLog } from '@archon/core/github/metering';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -212,7 +221,7 @@ function startOverseerRuntimeWithRealMergeManager(): void {
     return;
   }
   const deps = resolveDefaultDeps();
-  const mergeManager = createMergeManager(deps);
+  const mergeManager = createRuntimeMergeManager(deps);
   startOverseerRuntime({
     serviceOptions: { deps, mergeCoordinator: mergeManager, mergeBridgeEnabled: true },
   });
@@ -220,6 +229,8 @@ function startOverseerRuntimeWithRealMergeManager(): void {
 
 export async function startServer(opts: ServerOptions = {}): Promise<void> {
   getLog().info('server_starting');
+  // Name the endpoints that spend the GitHub quota in the log (bdc-xo#5449). Server only: see metering.ts.
+  enableGitHubCallSiteLog();
 
   // Database auto-detected: SQLite (default) or PostgreSQL (if DATABASE_URL set)
   // No required environment variables - SQLite works out of the box
@@ -654,25 +665,39 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         // over the raw body, so neither trusts the other's dispatch decision.
         const isCheckCompletion =
           eventType === 'check_run' || eventType === 'check_suite' || eventType === 'workflow_run';
-        const result = isCheckCompletion
-          ? await ingestCheckCompletionEvent(
-              {
-                rawBody,
-                signature: c.req.header('x-hub-signature-256'),
-                eventType,
-                deliveryId,
-              },
-              recheckDeps
-            )
-          : await ingestPullRequestEvent(
-              {
-                rawBody,
-                signature: c.req.header('x-hub-signature-256'),
-                eventType,
-                deliveryId,
-              },
-              ingestDeps
-            );
+        const intake = async (): Promise<
+          | Awaited<ReturnType<typeof ingestPullRequestEvent>>
+          | Awaited<ReturnType<typeof ingestCheckCompletionEvent>>
+        > =>
+          isCheckCompletion
+            ? await ingestCheckCompletionEvent(
+                {
+                  rawBody,
+                  signature: c.req.header('x-hub-signature-256'),
+                  eventType,
+                  deliveryId,
+                },
+                recheckDeps
+              )
+            : await ingestPullRequestEvent(
+                {
+                  rawBody,
+                  signature: c.req.header('x-hub-signature-256'),
+                  eventType,
+                  deliveryId,
+                },
+                ingestDeps
+              );
+        const result = await ingestBeforePromotion(intake, () =>
+          processPromotionWebhook(
+            {
+              rawBody,
+              signature: c.req.header('x-hub-signature-256'),
+              eventType,
+            },
+            reviewRouteConfig.webhookSecret
+          )
+        );
         getLog().info(
           {
             eventType,
@@ -718,6 +743,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   // Dedicated fast timer (default 60s) that pages John for a dead/restarted
   // Dispatch worker, independent of the 15-minute Duty Officer tick.
   startWorkerHeartbeatAlarmTimer();
+  startWorkroomDrainerStallTimer();
 
   // Gitea webhook endpoint
   if (gitea) {
@@ -879,6 +905,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     stopOutcomeReportClock();
     stopCauldronFireConsumer();
     stopWorkerHeartbeatAlarmTimer();
+    stopWorkroomDrainerStallTimer();
     persistence.stopPeriodicFlush();
 
     // Await overseer watcher abort before flushing; bounded by the watcher's own

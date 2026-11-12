@@ -1108,7 +1108,7 @@ describe('fable apex lane -- build-critical nodes serve claude-fable-5 (M-121 ap
     // + refusal to fire a lane with known-dead models -- is retained and is
     // what makes this safe. The lane NAME and the persona-drop mechanism
     // (described above) are unchanged.
-    expect(lane.model).toBe('claude-fable-5');
+    expect(lane.model).toBe('claude-fable-5-2');
   });
 
   for (const id of buildCriticalNodes) {
@@ -1117,7 +1117,7 @@ describe('fable apex lane -- build-critical nodes serve claude-fable-5 (M-121 ap
       expect(node).toBeDefined();
       expect(node!.agent).toBeUndefined();
       expect(node!.persona).toBeUndefined();
-      expect(effectiveModel(node!)).toBe('claude-fable-5');
+      expect(effectiveModel(node!)).toBe('claude-fable-5-2');
     });
   }
 
@@ -1129,6 +1129,6 @@ describe('fable apex lane -- build-critical nodes serve claude-fable-5 (M-121 ap
     expect(byId('commit-and-push')?.persona).toBe('overseer');
     const diffReview = byId('diff-review');
     expect(diffReview?.provider).toBe('codex-native-strict');
-    expect(diffReview?.model).toBe('gpt-5.6-terra');
+    expect(diffReview?.model).toBe('gpt-6.1-sol');
   });
 });

@@ -25,6 +25,7 @@ import type {
 
 const runMergeExecutionBridgeOnce = (options: MergeExecutionBridgeOptions): Promise<void> =>
   runMergeExecutionBridgeOnceProduction({
+    readRunEvents: async () => [],
     hasQualifiedReview: async () => true,
     reviewConflictAtHead: async () => null,
     ...options,
@@ -290,6 +291,8 @@ describe('merge execution bridge', () => {
         github: h.github,
         readPolicy: () => policy(),
         hasQualifiedReview: async () => true,
+        // the evidence hold now runs before the conflict check; give it a readable, passing run
+        readRunEvents: async () => [],
       });
       expect(h.merges).toBe(0);
       expect(h.outcomes[0]?.reason).toBe('review_conflict_at_head:check_unavailable');
@@ -966,11 +969,6 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     ['(c) closed PR', runlessPr({ state: 'closed' }), 'pr_not_open'],
     ['(c) merged PR', runlessPr({ state: 'merged' }), 'pr_not_open'],
     ['(d) moved head', runlessPr({ headSha: 'moved' }), 'head_moved'],
-    [
-      '(e) lookup failed',
-      runlessPr({ exists: false, state: 'lookup_failed', pr: undefined, lookupFailed: true }),
-      'pr_context_unresolvable',
-    ],
   ])('%s is recorded honestly with no mutation', async (_label, evidence, reason) => {
     const { h } = runlessHarness([runlessVerdict('runless-skip')], evidence);
     await runOnce(h);
@@ -978,6 +976,30 @@ describe('merge execution bridge -- run-less verdicts (#846)', () => {
     expect(h.approvals).toBe(0);
     expect(h.occupied).toBe(0);
     expect(h.outcomes[0]).toEqual(expect.objectContaining({ mutationSent: false, reason }));
+  });
+
+  test('(e) defers pr_context_fetch_failed and sends no mutation when lookup failed', async () => {
+    const { h } = runlessHarness(
+      [runlessVerdict('runless-lookup-failed')],
+      runlessPr({ exists: false, state: 'lookup_failed', pr: undefined, lookupFailed: true })
+    );
+    const deferrals: { verdictId: string; reason: string; notBefore: string }[] = [];
+    h.store.deferVerdictClaim = async (verdictId, reason, notBefore) => {
+      deferrals.push({ verdictId, reason, notBefore });
+      return true;
+    };
+    await runOnce(h);
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.occupied).toBe(0);
+    expect(h.claimReleases).toEqual([]);
+    expect(h.outcomes).toEqual([]);
+    expect(deferrals).toEqual([
+      expect.objectContaining({
+        verdictId: 'runless-lookup-failed',
+        reason: 'pr_context_fetch_failed',
+      }),
+    ]);
   });
 
   test('(e) defers pr_context_fetch_failed and sends no mutation when the fetch throws', async () => {
@@ -2258,5 +2280,136 @@ describe('merge execution bridge required contexts', () => {
     expect(h.outcomes[0]).toEqual(
       expect.objectContaining({ mutationSent: true, reason: 'merge_executed' })
     );
+  });
+});
+
+// WO-HARNESS-MERGE-POLICY-PROVISIONER-AND-REPO-SKIP-LINE-01 (bdc-xo#5581): the skip for a repository with
+// no policy entry is a warning that names the repository and the pull request, once per verdict.
+describe('merge execution bridge -- repo_not_allowed skip line', () => {
+  type Line = { level: 'info' | 'warn'; obj: Record<string, unknown>; msg: string };
+  const capture = (): {
+    lines: Line[];
+    logger: NonNullable<MergeExecutionBridgeOptions['logger']>;
+  } => {
+    const lines: Line[] = [];
+    return {
+      lines,
+      logger: {
+        info: (obj, msg) => lines.push({ level: 'info', obj, msg }),
+        warn: (obj, msg) => lines.push({ level: 'warn', obj, msg }),
+      },
+    };
+  };
+  const skipLines = (lines: Line[]): Line[] =>
+    lines.filter(line => line.msg === 'merge-coordinator.merge_skipped');
+
+  test('3: an unlisted repository logs ONE warn line with repo and number; a replay of the verdict stays info', async () => {
+    const first = capture();
+    const { h } = runlessHarness([
+      runlessVerdict('skipline-3', {
+        run_id: 'pr-discovery:thinmansoftware/not-listed#7',
+        wo_id: 'gh:thinmansoftware/not-listed#7',
+      }),
+    ]);
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      logger: first.logger,
+    });
+    expect(h.outcomes[0]?.reason).toBe('repo_not_allowed');
+    const lines = skipLines(first.lines);
+    expect(lines.length).toBe(1);
+    expect(lines[0]?.level).toBe('warn');
+    expect(lines[0]?.obj).toEqual(
+      expect.objectContaining({
+        verdictId: 'skipline-3',
+        reason: 'repo_not_allowed',
+        owner: 'thinmansoftware',
+        repo: 'not-listed',
+        prNumber: 7,
+        env: 'MERGE_MANAGER_REPO_POLICY',
+        hint: 'add_repo_to_merge_policy',
+      })
+    );
+    // The same verdict handled again in this process is recorded again but not warned again.
+    const second = capture();
+    const again = runlessHarness([
+      runlessVerdict('skipline-3', {
+        run_id: 'pr-discovery:thinmansoftware/not-listed#7',
+        wo_id: 'gh:thinmansoftware/not-listed#7',
+      }),
+    ]);
+    await runMergeExecutionBridgeOnce({
+      store: again.h.store,
+      github: again.h.github,
+      readPolicy: () => policy(),
+      logger: second.logger,
+    });
+    expect(again.h.outcomes[0]?.reason).toBe('repo_not_allowed');
+    expect(skipLines(second.lines).map(line => line.level)).toEqual(['info']);
+  });
+
+  test('4: the provisioner is listed in the default policy, so it is not skipped for the repository', async () => {
+    const cap = capture();
+    const { h } = runlessHarness([
+      runlessVerdict('skipline-4', {
+        run_id: 'pr-discovery:thinmansoftware/comicstoreos-provisioner#95',
+        wo_id: 'gh:thinmansoftware/comicstoreos-provisioner#95',
+      }),
+    ]);
+    const saved = process.env.MERGE_MANAGER_REPO_POLICY;
+    delete process.env.MERGE_MANAGER_REPO_POLICY;
+    try {
+      await runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+        logger: cap.logger,
+      });
+    } finally {
+      if (saved !== undefined) process.env.MERGE_MANAGER_REPO_POLICY = saved;
+    }
+    expect(h.outcomes[0]?.reason).not.toBe('repo_not_allowed');
+    expect(skipLines(cap.lines).filter(line => line.obj.reason === 'repo_not_allowed')).toEqual([]);
+  });
+
+  test('5: the run-bound path warns too, with the run owner and repo', async () => {
+    const cap = capture();
+    const h = harness([verdict('skipline-5')]);
+    h.store.getRunById = async () => ({ ...run('skipline-5'), repo: 'not-allowed' });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      logger: cap.logger,
+    });
+    expect(h.outcomes[0]?.reason).toBe('repo_not_allowed');
+    const lines = skipLines(cap.lines);
+    expect(lines.length).toBe(1);
+    expect(lines[0]?.level).toBe('warn');
+    expect(lines[0]?.obj).toEqual(
+      expect.objectContaining({
+        owner: 'thinmansoftware',
+        repo: 'not-allowed',
+        hint: 'add_repo_to_merge_policy',
+      })
+    );
+  });
+
+  test('6: other skip reasons keep their level and shape', async () => {
+    const cap = capture();
+    const h = harness([verdict('skipline-6')]);
+    h.store.getRunById = async () => null;
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      logger: cap.logger,
+    });
+    const lines = skipLines(cap.lines);
+    expect(h.outcomes[0]?.reason).toBe('run_context_unresolvable');
+    expect(lines.map(line => line.level)).toEqual(['info']);
+    expect(lines[0]?.obj).not.toHaveProperty('hint');
   });
 });

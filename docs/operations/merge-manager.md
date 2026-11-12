@@ -20,6 +20,52 @@ A missing spec (HTTP 404) is not a hold. Any other spec-read failure, including 
 
 A pull request label named exactly `merge-hold` (case-sensitive) holds any pull request, including ones that are not tied to a work order. The bridge records `merge_hold_label` and does not read a spec. Removing the label lets the next tick merge through the existing guards.
 
+## Originating run evidence hold
+
+Both merge paths use the same exported evidence gate in `merge-manager.ts`: the run-linked manager checks the provenance-bound `WatchedRunRecord.runId` before judging, and the verdict-driven bridge checks its resolved originating run immediately before the merge API call. A `node_failed` event for `manifest-evidence-check`, or a failed run whose failure names that node, holds with `originating_run_failed_evidence_gate`. A missing events reader or failed event lookup holds with `originating_run_unreadable`. The manager runtime resolves the run row before reading its events; the bridge retains the row from `store.getRunById(verdict.run_id)`. Both readers use `listRunEventsForOverseer`; the bridge wires it in `service.ts`. **Order of the bridge pass and at most one approval (bdc-xo#5358).** In `mergeClaimedVerdict` the evidence holds (run-less trace and run-bound check) now run BEFORE the merge slot is reserved and BEFORE any approval is posted. A held verdict therefore takes no slot and posts no approval on any pass; it only re-reads the run's events and, once per head SHA, posts the hold comment. Before this, every pass of a held verdict reserved a slot, posted a fresh empty APPROVED review and then found the hold (27 approvals in 15 minutes on one held PR, about 105 review calls an hour). The bridge also posts at most one approval per exact head SHA per ten minutes per GitHub client (an in-process memo): a pass that stops before the merge (a review still in flight, changes requested, a merge failure) does not post another. A new head is a new approval. The one review a held pull request keeps is the Overseer model review itself.
+
+Run-less candidates (the provenance `no_run` case and bridge verdicts whose run id is `pr-discovery:`) are traced to the run that opened the pull request with `findOriginatingRunForPullRequest` (`originating-run-lookup.ts`, SQL in `listOriginatingRunCandidates`, wired in `service.ts` and `overseer-runtime.ts`). Two traces, most recent run wins: the PR head branch equals the tail of a run's own `working_path` (the agent pushed the run's worktree branch), or the PR URL appears in a run's `open-pr-if-needed` / `patch-pr-body` node output. The branch name is never parsed for a run id. No run found (a human PR) keeps the proceed-on-green rule. A found run that is not finished (`running`, `pending` or any non-terminal status) holds with `originating_run_in_progress`, because its evidence gate has not run yet: one comment per head SHA marked `<!-- merge-evidence-hold-in-progress:<head SHA> -->` saying `Merge held: originating run <run id> has not finished`, no label, and the hold lifts by itself when the run ends. A finished run then follows the failed-evidence rule above, including adjudication that names the current head SHA. A failing lookup holds with `originating_run_unreadable`. With no lookup wired (tests, older callers) the run-less path is unchanged. Anchor: 2026-11-10 canary run 4e6fefea, whose PR was opened from its worktree branch and merged on the run-less path five minutes before its evidence gate failed (bdc-harness 5308).
+
+On an evidence hold the bridge releases its merge slot and calls its skip helper with the evidence reason. These two reasons release the verdict claim without a terminal outcome or a bounded transient retry. The hold reason is logged and visible on the PR. The next tick re-evaluates the same verdict, so a restored reader or valid adjudication can clear the hold without requeueing. Other skip classifications are unchanged.
+
+The manager hold action and receipt record the same reason. Both paths use one shared poster: one author-bound comment per current head SHA, marked `<!-- merge-evidence-hold:<head SHA> -->`, and label `merge:held-evidence`. The failure comment contains `Merge held: originating run <run id> failed manifest-evidence-check` and the first 300 characters of the node error. An unreadable run instead says `Merge held: originating run <run id> unreadable` with the lookup error. Visibility failures are logged and never lift the hold. The label is informational; removing it cannot lift the hold, and adjudication does not remove it. For the manager, `hold-canary` makes no GitHub writes; `comment_findings` may post the hold comment but cannot apply labels or merge; execute mode with mutations disabled makes no GitHub writes. The bridge reaches its poster only after its existing service-enabled, emergency-stop, dry-run and merge-capability execution checks pass.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MERGE_MANAGER_EVIDENCE_ADJUDICATORS` | unset (nobody) | Comma-separated GitHub logins permitted to adjudicate a known evidence failure; whitespace is trimmed and logins are case-insensitive |
+
+An allowlisted person lifts a known failure by posting a PR issue comment with this whole line (replace the SHA with the full current 40-character head SHA):
+
+```text
+Evidence-Adjudication: docs canary <current head SHA>
+```
+
+The reason and SHA must occur on the same line. An old or abbreviated SHA cannot authorize a new head. The run PR's builder author, the Review Gate login, the configured comment/Overseer and merge-manager identities, and every login ending in `[bot]` are rejected even if allowlisted. Unset or empty configuration permits nobody. Missing or unreadable comments do not authorize a merge. Unreadable run state cannot be adjudicated; restore the run/events reader first. Valid adjudication only clears this gate: the existing judge, exact-head approval, green checks, base policy and production holds still apply. Overseer verdict code is unchanged.
+
+## Policy skip comment
+
+When the bridge records a terminal POLICY skip with the pull request in hand, it posts ONE comment on that pull request saying why the merge manager will not merge it and that a person does (exact-head approval and green required checks still apply). Reasons covered: `spec_only` (documentation-only into a base whose `docsOnly` policy is skip), `integration_base_mismatch` and `base_not_allowlisted`. The skip itself is unchanged: same outcome row, still terminal, claimed once per run and head. `repo_not_allowed` has no pull request in hand at its skip sites, so it posts nothing and stays a silent skip.
+
+The comment is three lines: the marker `<!-- merge-policy-skip:v1 -->`, a key line `<!-- merge-policy-skip-key:<verdict id>:<reason> -->`, and one plain sentence for the reason. It is idempotent: before posting, the bridge looks for a comment by its own author login that already carries the key line and posts nothing if found (a key line from another author does not count). A comment failure is logged as `merge-coordinator.policy_skip_comment_failed` and never changes the recorded skip or stops the cycle; a missing comment API logs `merge-coordinator.policy_skip_comment_unavailable`. A pull request that merges normally gets only the merge receipt, never this comment.
+
+The interactive Duty Officer reads this marker: an approved, green, unmerged pull request carrying `merge-policy-skip:v1` was skipped on purpose, so the Duty Officer does not nudge the merge manager or report a stall, and cues the owner or the XO to merge it by hand once (skill file `Duty-Officer/SKILL.md`, rule under "A PR is stale, superseded, or unmerged?").
+
+## Owner reworking label
+
+A pull request label named exactly `owner:reworking` (case-sensitive) stops an otherwise mergeable pull request while its owner redoes the design. The bridge releases the verdict claim with the reason `owner_reworking_label` and logs `merge-coordinator.owner_reworking_label`, with no skip, no retry attempt and no outcome row, like `merge_hold_label`. Candidate discovery excludes the PR with the named exclusion `owner_reworking_label`, and the run-linked merge manager holds it with the same reason. Only the owner sets and clears the label; nothing in the harness does, and removing it lets the next tick merge through the existing guards. It is NOT HOLD: HOLD stays John's. `owner:reworking` is a state, not a person: owner routing never reads the suffix `reworking` as a login.
+
+## Post-merge stray-push alert
+
+A squash merge lands the head the Overseer approved. If the PR branch still exists afterwards at a different sha, someone pushed after the merge and that work never reached the base branch. The post-merge sweep (`packages/overseer/src/post-merge-stray-sweep.ts`) finds those branches for merges by any path: it lists, from GitHub, the pull requests merged in the last 7 days in every repository the merge policy covers, and reads each PR's head branch ref (in the head repository, so a fork PR is read in the fork). When the ref exists at a sha other than the merged head it raises ONE operator card through the existing escalation path (`runEscalation`: owner routing, delivery jobs), naming the PR, the branch and the stray sha. No alert when the branch is gone (404) or still at the merged head, and none when GitHub cannot be read (any other error, or a deleted fork).
+
+- Merges by any path: the candidate list is GitHub's own merged list keyed on `merged_at`, not the bridge's or the merge manager's records, so a spec-landing lane merge, a hand merge, a bridge merge and a run-linked manager merge are all covered. GitHub keeps `head.sha` at the merged head while the branch moves, so no event-store row is read.
+- Repositories: every repository in the merge policy (`DEFAULT_MERGE_REPO_POLICY`, or `MERGE_MANAGER_REPO_POLICY` when set) plus `OVERSEER_MERGE_DISCOVERY_REPOS`, each once. Paging: closed PRs sorted by updated descending, stopping when a page is short or wholly older than the window, at most 10 pages per repository. Reaching the cap logs `overseer.post_merge_sweep.page_cap_reached` and never raises an alert; a repository that cannot be listed logs `overseer.post_merge_sweep.list_failed` and is skipped.
+- Once per PR and stray sha: the card id is derived from the event identity: run id `post-merge-sweep:<owner>/<repo>#<n>`, source event `post-merge-stray:<owner>/<repo>#<n>:<stray sha>` and the PR's `merged_at` as the event time. The sweep looks the card up before escalating, and card insert is `ON CONFLICT DO NOTHING`. A second push after an alert gives a new stray sha and a new card. No new table and no migration.
+- Work id: the first WO id in the PR title (then the head branch). A PR with no WO token gets the work id `PR-<owner>/<repo>#<n>`, so owner routing reports it unowned (a person assigns an owner); expect many unowned cards for direct merges.
+- Log tokens: `merge-sweep.stray_push_alert` (one per new card), `overseer.post_merge_sweep.tick` (per sweep: examined, alerted, alreadyAlerted, noStray, unreadable), `overseer.post_merge_sweep.page_cap_reached`, `overseer.post_merge_sweep.list_failed`, `overseer.post_merge_sweep.iteration_failed_isolated` and `overseer.post_merge_sweep.bind_failed`.
+- Off by default in code. Set `OVERSEER_POST_MERGE_SWEEP=1` (or `true`, `yes`) on archon-app-1 to run it; it then runs hourly. Alerts are addressed to the work owner when `OVERSEER_OWNER_ROUTING=on`, and to the acting XO otherwise.
+- Earlier version: until WO-HARNESS-POST-MERGE-SWEEP-COVERAGE-01 the candidates were only the bridge's `overseer_verdicts` rows (`action_reason = 'merge_executed'`), about 55 percent of merges; that source remains only as a test seam (`listMerged`).
+
 | Variable | Default | Meaning |
 | --- | ---: | --- |
 | `OVERSEER_MERGE_RETRY_BASE_MINUTES` | 10 | Initial retry delay |
@@ -37,10 +83,21 @@ A pull request label named exactly `merge-hold` (case-sensitive) holds any pull 
 | `thinmansoftware/lspro-react` | `main` | no | skip |
 | `thinmansoftware/shopops-storefront` | `staging` | yes | skip |
 | `thinmansoftware/shopops-storefront` | `master` | no | skip |
+| `thinmansoftware/comicstoreos-provisioner` | `main` | yes | skip |
 
 `release/lspro`, `release/ce`, `main` and `master` are production lanes and are never unattended candidates: `release/*` has no entry at all.
 
-### Operator step after this lands on dev (not part of the code change)
+The provisioner row (WO-HARNESS-MERGE-POLICY-PROVISIONER-AND-REPO-SKIP-LINE-01, bdc-xo#5581) holds ONLY while merging to its `main` deploys nothing but the staging Vercel project `comicstoreos-provisioner-staging` (evidence: bdc-xo#5576 comment 6810214724, read 2026-11-11 23:58Z: one linked Vercel project, the GitHub "Production" deployments point at the staging project, no workflow runs `vercel deploy`, `--prod`, `ssh` or `docker push`). If a production provisioner project, domain or workflow ever deploys from `main`, first move that base to `COVERED_PRODUCTION_BASES` in `packages/overseer/src/m09-promotion-gate.ts` and set its entry to `unattended: false`; the guard test `production_bases_match_merge_policy` fails when the two tables disagree.
+
+### The environment value ADDS to the default
+
+`MERGE_MANAGER_REPO_POLICY` no longer replaces the default policy: a parseable value is merged OVER `DEFAULT_MERGE_REPO_POLICY` per repository. A repository in the default and absent from the value keeps its default entry, so a repository added to the code default (the provisioner) ships with the next rebuild without editing the host. A repository present in the value replaces that repository's default entry; `{"owner/repo":{}}` lists a repository with no bases, so nothing is allowed for it. A malformed value is still the EMPTY policy (fail closed): a configuration error never broadens merge authority.
+
+### A skipped repository is a warning that names it
+
+When an Overseer-approved verdict is skipped because its repository has no policy entry, the bridge records `repo_not_allowed` as before and logs `merge-coordinator.merge_skipped` at WARN (it was info) with `owner`, `repo`, `prNumber` (run-less verdicts), `verdictId`, `env: MERGE_MANAGER_REPO_POLICY` and `hint: add_repo_to_merge_policy`, once per verdict id per process (a replay of the same verdict stays info). Read it with `docker logs archon-app-1 --since 1h 2>&1 | grep merge_skipped | grep repo_not_allowed`. The fix is to add the repository to the in-code default in `packages/overseer/src/merge-repo-policy.ts` (not to the host environment).
+
+### FALLBACK ONLY, ask-first (John): host environment edit after this lands on dev (not part of the code change; since the environment value is additive, a repository added to the code default does not need it)
 
 Edit `/opt/bdc/archon/.env`, then run the governed rebuild of `archon-app-1`:
 

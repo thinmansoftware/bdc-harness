@@ -7,6 +7,7 @@ import {
 import {
   assertPersistedGitHubPoolAvailable,
   flushGitHubApiMeter,
+  normalizeGitHubEndpoint,
   observationFromResponse,
   recordGitHubApiCall,
 } from './metering';
@@ -42,6 +43,7 @@ export async function serviceGitHubFetch(options: ServiceGitHubRequestOptions): 
     permissionFallback: options.permissionFallback,
   });
   if (!response.headers.has('x-ratelimit-resource')) observation.resource = resource;
+  observation.endpoint = normalizeGitHubEndpoint(options.init?.method, String(options.url));
   recordGitHubApiCall(observation);
   if (observation.rateLimited) await flushGitHubApiMeter();
   return response;

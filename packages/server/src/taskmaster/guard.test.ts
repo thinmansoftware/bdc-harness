@@ -58,7 +58,7 @@ describe('validateProposal', () => {
   });
 
   test('every Slice 1 verb passes the action-type allowlist', () => {
-    expect(TM_ALLOWED_ACTION_TYPES).toHaveLength(6);
+    expect(TM_ALLOWED_ACTION_TYPES).toHaveLength(7);
     for (const type of TM_ALLOWED_ACTION_TYPES) {
       // fire_cauldron needs mechanical evidence and blocker_report needs the
       // duty-officer recipient + its own body shape; both are asserted in their
@@ -116,6 +116,8 @@ describe('validateProposal', () => {
       // 't3-desktop' is admitted ONLY for escalate_p0 (asserted in the
       // routing-cutoff test file).
       if (recipient === 't3-desktop') continue;
+      // Relay recipient requires its versioned JSON contract (recipients.test.ts).
+      if (recipient === 't3-desk-local') continue;
       expect(validateProposal(proposal({ recipient })).allowed).toBe(true);
     }
   });

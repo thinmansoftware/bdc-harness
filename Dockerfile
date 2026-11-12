@@ -107,6 +107,9 @@ RUN apt-get update && apt-get install -y \
     postgresql-client \
     # Required by Python WO tests; keep the distro-managed pytest runtime.
     python3-pytest \
+    # PyYAML for the lanes' canonical-stage parser (bdc-harness#1532); system-wide so it
+    # does not depend on a per-user pip install on the mounted appuser home.
+    python3-yaml \
     unzip \
     # Chromium for agent-browser E2E testing (drives browser via CDP)
     chromium \
@@ -298,6 +301,10 @@ COPY packages/companion-mcp/package.json ./packages/companion-mcp/
 # Install production dependencies only (--ignore-scripts skips husky prepare hook)
 RUN bun install --frozen-lockfile --production --ignore-scripts --linker=hoisted
 
+# Execute the lockfile-installed native CLI, not just its package metadata.
+COPY scripts/claude-version-guard.ts scripts/claude-model-probe.ts ./scripts/
+RUN bun run scripts/claude-version-guard.ts
+
 # Copy application source (Bun runs TypeScript directly, no compile step needed)
 COPY packages/adapters/ ./packages/adapters/
 COPY packages/canary-suite/ ./packages/canary-suite/
@@ -329,6 +336,12 @@ COPY tsconfig*.json ./
 # Entrypoints used by the container GitHub transport and credential preflight.
 COPY scripts/github-service-token.ts scripts/github-service-exec.ts scripts/github-service-login.ts scripts/run-completion-report.ts ./scripts/
 COPY scripts/overseer-review-sandbox-smoke.ts scripts/overseer-reviewer-broker.ts ./scripts/
+# Live proof tool for the worktree copy rule (WO-HARNESS-WORKTREE-SYNC-NO-TRACKED-OVERWRITE-01, bdc-xo#5527):
+# docker exec archon-app-1 bun run /app/scripts/worktree-copy-proof.ts
+COPY scripts/worktree-copy-proof.ts ./scripts/
+# Operator command: re-enqueue one exact head whose newest review row failed
+# (docs/operations/overseer-re-review.md; WO-HARNESS-OVERSEER-REREVIEW-FAILED-HEAD-COMMAND-01).
+COPY scripts/overseer/re-enqueue-review.ts ./scripts/overseer/
 
 # Shared shell cores SOURCED by the bdc-feature-development lane YAMLs
 # (prep-dependencies / run-stop-tests source /app/scripts/lane/dprep.sh).
