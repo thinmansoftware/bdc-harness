@@ -2486,3 +2486,115 @@ describe('merge gate: sibling of a merged pull request', () => {
     expect(h.outcomes.some(outcome => outcome.reason === 'sibling_pr_already_merged')).toBe(false);
   });
 });
+
+// bdc-xo#5571 follow-up (acting XO ruling 2026-11-12): a green PR waiting for the hourly ceiling carries
+// the `merge-queued` label, so it does not look stuck (the queue comment alone was missed on PR 5662).
+describe('merge-queued label', () => {
+  const now = new Date('2026-11-03T12:00:00.000Z');
+  const ref = { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1439 };
+
+  function deferred(
+    labels: string[] | undefined,
+    extras: Partial<GitHubClientDeps> = {}
+  ): { run: () => Promise<void>; h: ReturnType<typeof harness> } {
+    const h = harness(
+      [verdict('queued', 'abc')],
+      greenPr({ headSha: 'abc', pr: ref, ...(labels ? { labels } : {}) }),
+      4,
+      {
+        commentOnPullRequest: async () => ({ commented: true }),
+        listPullRequestComments: async () => [],
+        ...extras,
+      }
+    );
+    h.store.getEarliestMergeSlotReservation = async () => '2026-11-03T11:10:00.000Z';
+    return {
+      h,
+      run: () =>
+        runMergeExecutionBridgeOnce({
+          store: h.store,
+          github: h.github,
+          now: () => now,
+          maxMergesPerHour: 4,
+          readPolicy: () => policy(),
+        }),
+    };
+  }
+
+  test('a deferral labels the PR merge-queued once', async () => {
+    const add = mock(async (_input: { number: number; labels: string[] }) => undefined);
+    const { run, h } = deferred(undefined, { addPullRequestLabels: add });
+    await run();
+    expect(add).toHaveBeenCalledTimes(1);
+    expect(add).toHaveBeenCalledWith(
+      expect.objectContaining({ number: 1439, labels: ['merge-queued'] })
+    );
+    expect(h.claimReleases).toEqual([{ verdictId: 'queued', reason: 'rate_ceiling_deferred' }]);
+  });
+
+  test('a PR that already carries the label costs no extra call', async () => {
+    const add = mock(async () => undefined);
+    const { run } = deferred(['merge-queued'], { addPullRequestLabels: add });
+    await run();
+    expect(add).not.toHaveBeenCalled();
+  });
+
+  test('a label failure never breaks the deferral and is logged', async () => {
+    const lines = captureRootLogLines();
+    try {
+      const { run, h } = deferred(undefined, {
+        addPullRequestLabels: async () => {
+          throw new Error('labels refused');
+        },
+      });
+      await run();
+      expect(h.claimReleases).toEqual([{ verdictId: 'queued', reason: 'rate_ceiling_deferred' }]);
+      expect(lines.lines.some(line => line.includes('merge-coordinator.queued_label_failed'))).toBe(
+        true
+      );
+    } finally {
+      lines.restore();
+    }
+  });
+
+  test('merging a PR that carries the label removes it', async () => {
+    const remove = mock(async (_input: { label: string; number: number }) => undefined);
+    const h = harness([verdict('merge-it')], greenPr({ labels: ['merge-queued'] }), 0, {
+      removePullRequestLabel: remove,
+    });
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(1);
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith(
+      expect.objectContaining({ label: 'merge-queued', number: 1 })
+    );
+  });
+
+  test('merging a PR without the label makes no label call, and a removal failure never undoes the merge', async () => {
+    const remove = mock(async () => undefined);
+    const plain = harness([verdict('plain')], greenPr(), 0, { removePullRequestLabel: remove });
+    await runMergeExecutionBridgeOnce({
+      store: plain.store,
+      github: plain.github,
+      readPolicy: () => policy(),
+    });
+    expect(plain.merges).toBe(1);
+    expect(remove).not.toHaveBeenCalled();
+
+    const failing = harness([verdict('fail-remove')], greenPr({ labels: ['merge-queued'] }), 0, {
+      removePullRequestLabel: async () => {
+        throw new Error('label api down');
+      },
+    });
+    await runMergeExecutionBridgeOnce({
+      store: failing.store,
+      github: failing.github,
+      readPolicy: () => policy(),
+    });
+    expect(failing.merges).toBe(1);
+  });
+});

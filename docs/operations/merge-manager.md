@@ -50,6 +50,17 @@ The comment is three lines: the marker `<!-- merge-policy-skip:v1 -->`, a key li
 
 The interactive Duty Officer reads this marker: an approved, green, unmerged pull request carrying `merge-policy-skip:v1` was skipped on purpose, so the Duty Officer does not nudge the merge manager or report a stall, and cues the owner or the XO to merge it by hand once (skill file `Duty-Officer/SKILL.md`, rule under "A PR is stale, superseded, or unmerged?").
 
+## Hourly merge ceiling and the `merge-queued` label
+
+The merge manager reserves one merge slot per merge in durable storage before it merges; `OVERSEER_MAX_MERGES_PER_HOUR` (12 on hetzner-prod, code default 4) is the number of merges in a rolling 60 minutes, counted across every repository and every kind of pull request (specs, diary rows and code alike). It is a separate budget from GitHub API calls. When the ceiling is full a green, approved pull request is not stuck, it is queued: the verdict claim is released with `rate_ceiling_deferred` and each later pass tries again.
+
+Two signals say so on the pull request itself:
+
+- a comment (marker `<!-- overseer:merge-ceiling-queued -->`) with the head, the queue position, the ceiling and the earliest next merge slot, posted once per head;
+- the label `merge-queued`, added at the first deferral (one call, never one per pass; a PR that already carries it costs nothing) and removed by the bridge when it merges the PR. A pull request merged by hand keeps the label, which is cosmetic. The label is a signal only: nothing in the merge path treats it as a hold, and removing it does not release or hold anything.
+
+Added 2026-11-12 after bdc-xo PR 5662 (position 5, earliest slot 17:02Z, merged by hand 16:56Z by someone who had read the log but not the comment). Both signals are best effort: a comment or label failure is logged (`merge-coordinator.ceiling_queue_notice_failed`, `merge-coordinator.queued_label_failed`, `merge-coordinator.queued_label_remove_failed`) and never changes the deferral or the merge.
+
 ## Owner reworking label
 
 A pull request label named exactly `owner:reworking` (case-sensitive) stops an otherwise mergeable pull request while its owner redoes the design. The bridge releases the verdict claim with the reason `owner_reworking_label` and logs `merge-coordinator.owner_reworking_label`, with no skip, no retry attempt and no outcome row, like `merge_hold_label`. Candidate discovery excludes the PR with the named exclusion `owner_reworking_label`, and the run-linked merge manager holds it with the same reason. Only the owner sets and clears the label; nothing in the harness does, and removing it lets the next tick merge through the existing guards. It is NOT HOLD: HOLD stays John's. `owner:reworking` is a state, not a person: owner routing never reads the suffix `reworking` as a login.

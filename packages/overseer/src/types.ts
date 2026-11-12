@@ -370,6 +370,11 @@ export interface GitHubClientDeps {
   /** Apply merge hold labels through the same GitHub identity as PR comments. */
   addPullRequestLabels?(input: PullRequestRef & { labels: string[] }): Promise<void>;
   /**
+   * Remove one label (the `merge-queued` label once the merge happened). Optional so existing fakes keep
+   * compiling; a label that is not on the PR is not an error.
+   */
+  removePullRequestLabel?(input: PullRequestRef & { label: string }): Promise<void>;
+  /**
    * Existing PR issue comments, used to keep the merge-manager receipt
    * idempotent. Optional so existing fakes and compositions keep compiling.
    * When absent, the bridge posts without a marker scan.
