@@ -37,6 +37,11 @@ import { pollForTerminal, TimeoutError, DEFAULT_OPEN_NODE_BUDGET_MS } from './po
 import { fetchNodeTimeoutsMs } from './node-timeouts.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { classifyGateMisfire } from './gate-misfire.js';
+import {
+  createGhConflictOnlyDeps,
+  handleConflictOnly,
+  type ConflictOnlyResult,
+} from './conflict-only.js';
 import { createRecord, writeRecord } from './recorder.js';
 export { readCascadeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
@@ -102,6 +107,12 @@ export interface CascadeDeps {
    * an issue is surfaced via `posted: false` (caller falls back to escalate).
    */
   specRepair?: (context: SpecRepairCallContext) => Promise<SpecRepairResult>;
+  /**
+   * Conflict-only gate verdict (WO-HARNESS-CONFLICT-ONLY-GATE-NO-TIER-CLIMB-01): one branch update
+   * from the base, or one comment naming the files changed on both sides. Never fires a rung.
+   * Injectable for tests; defaults to the real `gh` implementation.
+   */
+  handleConflictOnly?: (prUrl: string) => Promise<ConflictOnlyResult>;
   /** Optional dual-supervisor control plane. Absent by default; never starts a live worker. */
   superviseFailure?: (context: SupervisorFailureContext) => Promise<SupervisorFailureResult>;
   /**
@@ -593,6 +604,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       : createRecord);
   const cancelImpl = opts.deps?.cancel ?? cancelRun;
   const specRepairImpl = opts.deps?.specRepair ?? defaultSpecRepair;
+  const conflictOnlyImpl =
+    opts.deps?.handleConflictOnly ??
+    ((prUrl: string): Promise<ConflictOnlyResult> =>
+      handleConflictOnly(prUrl, createGhConflictOnlyDeps()));
   const superviseFailureImpl = opts.deps?.superviseFailure;
   const findWoClaimImpl =
     opts.deps?.findWoClaim ??
@@ -1027,6 +1042,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     let frontierApprovalRecord: CascadeRunRecord['frontierApproval'];
     let refusalReason: CascadeRunRecord['refusalReason'];
     let gateMisfireRecord: CascadeRunRecord['gateMisfire'];
+    let conflictOnlyRecord: CascadeRunRecord['conflictOnly'];
     let blockedReason: CascadeRunRecord['blockedReason'];
     let repairTargetAlternates: CascadeRunRecord['repairTargetAlternates'];
     let priorPollSnapshot: PriorRunDetail | null = null;
@@ -1063,6 +1079,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(frontierApprovalRecord ? { frontierApproval: frontierApprovalRecord } : {}),
         ...(refusalReason ? { refusalReason } : {}),
         ...(gateMisfireRecord ? { gateMisfire: gateMisfireRecord } : {}),
+        ...(conflictOnlyRecord ? { conflictOnly: conflictOnlyRecord } : {}),
         ...(blockedReason ? { blockedReason } : {}),
         ...(entrySelection ? { entrySelection } : {}),
         ...(repairTargetAlternates ? { repairTargetAlternates } : {}),
@@ -1865,6 +1882,54 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           await checkpoint();
           break;
         }
+      }
+
+      // Conflict-only (WO-HARNESS-CONFLICT-ONLY-GATE-NO-TIER-CLIMB-01): the run completed, a PR was
+      // opened, nothing rejected it, and the only failing condition is that the PR cannot be merged
+      // (the base moved during a long run). A bigger model is not the fix for a mechanical merge:
+      // try ONE branch update from the base; a clean update leaves the new head to the normal
+      // checks and review, a conflict gets one comment naming the files. Never fires a rung.
+      if (outcome === 'gate-failed' && verdict.conflictOnly === true && pollResult.prUrl) {
+        let handled: ConflictOnlyResult;
+        try {
+          handled = await conflictOnlyImpl(pollResult.prUrl);
+        } catch (conflictErr) {
+          handled = {
+            outcome: 'conflict_only',
+            prUrl: pollResult.prUrl,
+            headSha: null,
+            baseRef: null,
+            updateStatus: null,
+            files: [],
+            commented: false,
+            alreadyRecorded: false,
+            note: `conflict-only handler threw: ${(conflictErr as Error).message}`,
+          };
+        }
+        attempt.gateFailReason = `${handled.outcome}: ${verdict.reason}`;
+        status = 'blocked';
+        winningTier = null;
+        blockedReason =
+          handled.outcome === 'updated' ? 'conflict_resolved_by_update' : 'conflict_only';
+        conflictOnlyRecord = {
+          outcome: handled.outcome,
+          runId: fireResult.runId,
+          tier: tier.name,
+          prUrl: handled.prUrl,
+          headSha: handled.headSha,
+          baseRef: handled.baseRef,
+          updateStatus: handled.updateStatus,
+          files: handled.files,
+          commented: handled.commented,
+          alreadyRecorded: handled.alreadyRecorded,
+          note: handled.note,
+        };
+        console.log(
+          `[smart-cauldron] ${blockedReason} on tier=${tier.name} for woId=${woId}: ${handled.note} ` +
+            '-- NOT climbing'
+        );
+        await checkpoint();
+        break;
       }
 
       // A failed repair checkout (held branch, gate closed on checkout) is not a

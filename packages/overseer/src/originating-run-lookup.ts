@@ -39,6 +39,8 @@ export interface OriginatingRunLookupInput {
   readonly repo: string;
   readonly number: number;
   readonly headRef?: string;
+  /** See listOriginatingRunCandidates: the worktree basename inside a salvage branch name. */
+  readonly salvageWorktree?: string;
 }
 
 export type ListOriginatingRunCandidates = (
@@ -126,6 +128,53 @@ function belongsToRepo(
 function worktreeEndsWithBranch(workingPath: string, headRef: string): boolean {
   const normalized = workingPath.split('\\').join('/').replace(/\/+$/, '');
   return normalized === headRef || normalized.endsWith('/' + headRef);
+}
+
+const SALVAGE_BRANCH_PATTERN = /^salvage\/opus-repair-(.+)-\d+$/;
+
+/**
+ * The worktree basename inside a fallback-PR head branch `salvage/opus-repair-<worktree>-<pid>`
+ * (the lanes build it as `salvage/opus-repair-$(basename "$WT")-$$`), or null for any other branch.
+ */
+export function salvageWorktreeFromBranch(headRef: string | undefined): string | null {
+  const match = SALVAGE_BRANCH_PATTERN.exec((headRef ?? '').trim());
+  return match?.[1] ?? null;
+}
+
+/**
+ * EVERY run that opened the pull request, newest first (empty when none did). Unlike
+ * findOriginatingRunForPullRequest it also recognises a salvage fallback PR through the
+ * worktree basename in its branch name, and it returns all matches so a caller can tell an
+ * unambiguous origin from an ambiguous one. A rejection from `list` propagates.
+ */
+export async function findOriginatingRunsForPullRequest(
+  input: OriginatingRunLookupInput,
+  list: ListOriginatingRunCandidates
+): Promise<OriginatingRun[]> {
+  const salvageWorktree =
+    input.salvageWorktree ?? salvageWorktreeFromBranch(input.headRef) ?? undefined;
+  const candidates = await list(salvageWorktree ? { ...input, salvageWorktree } : input);
+  const headRef = (input.headRef ?? '').trim();
+  const matches = new Map<string, OriginatingRunCandidate>();
+  for (const candidate of candidates) {
+    const byBranch =
+      headRef !== '' &&
+      typeof candidate.working_path === 'string' &&
+      worktreeEndsWithBranch(candidate.working_path, headRef) &&
+      belongsToRepo(candidate, input);
+    const bySalvage =
+      salvageWorktree !== undefined &&
+      typeof candidate.working_path === 'string' &&
+      worktreeEndsWithBranch(candidate.working_path, salvageWorktree) &&
+      belongsToRepo(candidate, input);
+    const byUrl =
+      typeof candidate.event_data === 'string' && mentionsPullRequest(candidate.event_data, input);
+    if (!byBranch && !bySalvage && !byUrl) continue;
+    if (!matches.has(candidate.id)) matches.set(candidate.id, candidate);
+  }
+  return [...matches.values()]
+    .sort((a, b) => startedAtEpoch(b.started_at) - startedAtEpoch(a.started_at))
+    .map(candidate => ({ runId: candidate.id, status: candidate.status }));
 }
 
 /**

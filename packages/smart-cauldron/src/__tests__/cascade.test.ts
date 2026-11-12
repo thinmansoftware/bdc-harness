@@ -21,6 +21,7 @@ import { runCascade } from '../cascade.js';
 import type { CascadeDeps, RunCascadeOptions } from '../cascade.js';
 import type { OpenWoPullRequest } from '../already-satisfied.js';
 import { classifyGateMisfire } from '../gate-misfire.js';
+import type { ConflictOnlyResult } from '../conflict-only.js';
 import type { FireResult, PollResult, GateVerdict, CascadeRunRecord } from '../types.js';
 import { loadLadder, loadRefusedTiers } from '../ladder.js';
 
@@ -2234,5 +2235,144 @@ describe('Zero-tier fence 4: one run row per rung (fire only after terminal)', (
     // No second fire on either rung.
     expect(fireCalls.filter(w => w === zeroWf).length).toBe(1);
     expect(fireCalls.filter(w => w === cursorWf).length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Conflict-only gate verdict (WO-HARNESS-CONFLICT-ONLY-GATE-NO-TIER-CLIMB-01, bdc-xo#5658).
+// Run 17b2d1c3 completed and opened PR 106; 21 seconds later a codex rung started because the PR
+// conflicted with a moved main. Real judgeGate (deps.judge is not stubbed).
+// ---------------------------------------------------------------------------
+
+describe('conflict-only gate verdict never climbs', () => {
+  const conflictingPoll = (): PollResult =>
+    makePollResult({
+      terminalStatus: 'completed',
+      validatorVerdict: 'unknown',
+      prUrl: 'https://github.com/org/repo/pull/106',
+      prMergeable: false,
+    });
+
+  function conflictResult(overrides: Partial<ConflictOnlyResult> = {}): ConflictOnlyResult {
+    return {
+      outcome: 'conflict_only',
+      prUrl: 'https://github.com/org/repo/pull/106',
+      headSha: 'a'.repeat(40),
+      baseRef: 'main',
+      updateStatus: 422,
+      files: ['staging/package.json'],
+      commented: true,
+      alreadyRecorded: false,
+      note: 'conflicts (HTTP 422)',
+      ...overrides,
+    };
+  }
+
+  function run(
+    handler: (prUrl: string) => Promise<ConflictOnlyResult>,
+    poll: () => PollResult = conflictingPoll
+  ) {
+    const fireCalls: string[] = [];
+    const handled: string[] = [];
+    const escalations: string[] = [];
+    const deps: CascadeDeps = {
+      fire: async opts => {
+        fireCalls.push(opts.workflowName);
+        return makeFireOk(`run-${fireCalls.length}`);
+      },
+      poll: async () => (fireCalls.length === 1 ? poll() : makePollResult()),
+      handleConflictOnly: async prUrl => {
+        handled.push(prUrl);
+        return handler(prUrl);
+      },
+      escalate: async ctx => {
+        escalations.push(ctx.errorClass);
+      },
+      writeRecord: async record => `/tmp/cascade-record-${record.cascadeId}.json`,
+    };
+    return { fireCalls, handled, escalations, result: runCascade(baseOpts({ deps })) };
+  }
+
+  test('Test 5: a clean branch update means no climb, no escalation and a recorded outcome', async () => {
+    const h = run(async () =>
+      conflictResult({ outcome: 'updated', updateStatus: 202, files: [], commented: false })
+    );
+    const record = await h.result;
+    expect(h.fireCalls).toHaveLength(1);
+    expect(h.handled).toEqual(['https://github.com/org/repo/pull/106']);
+    expect(h.escalations).toEqual([]);
+    expect(record.status).toBe('blocked');
+    expect(record.blockedReason).toBe('conflict_resolved_by_update');
+    expect(record.winningTier).toBeNull();
+    expect(record.attempts[0]?.gateFailReason?.startsWith('updated: ')).toBe(true);
+    expect(record.conflictOnly?.outcome).toBe('updated');
+    expect(record.telemetry.climbed).toBe(false);
+    expect(record.telemetry.climbCount).toBe(0);
+  });
+
+  test('Test 6: a conflict stops with conflict_only and the file list, and fires no rung', async () => {
+    const h = run(async () => conflictResult());
+    const record = await h.result;
+    expect(h.fireCalls).toHaveLength(1);
+    expect(h.escalations).toEqual([]);
+    expect(record.status).toBe('blocked');
+    expect(record.blockedReason).toBe('conflict_only');
+    expect(record.conflictOnly).toMatchObject({
+      outcome: 'conflict_only',
+      tier: record.attempts[0]?.tier,
+      runId: 'run-1',
+      files: ['staging/package.json'],
+      commented: true,
+      updateStatus: 422,
+    });
+    expect(record.telemetry.climbed).toBe(false);
+  });
+
+  test('Test 7: a handler that throws still does not climb and says so', async () => {
+    const h = run(async () => {
+      throw new Error('gh unavailable');
+    });
+    const record = await h.result;
+    expect(h.fireCalls).toHaveLength(1);
+    expect(record.status).toBe('blocked');
+    expect(record.blockedReason).toBe('conflict_only');
+    expect(record.conflictOnly?.note).toContain('gh unavailable');
+    expect(record.conflictOnly?.commented).toBe(false);
+  });
+
+  test('Test 8: a rejected rung (needs_revision) still climbs and never calls the handler', async () => {
+    const h = run(
+      async () => conflictResult(),
+      () =>
+        makePollResult({
+          terminalStatus: 'completed',
+          validatorVerdict: 'needs_revision',
+          prUrl: 'https://github.com/org/repo/pull/106',
+          prMergeable: false,
+        })
+    );
+    const record = await h.result;
+    expect(h.fireCalls).toHaveLength(2);
+    expect(h.handled).toEqual([]);
+    expect(record.attempts[0]?.outcome).toBe('gate-failed');
+    expect(record.status).toBe('won');
+    expect(record.telemetry.climbed).toBe(true);
+  });
+
+  test('Test 2: a PR that is not provably conflicting never reaches the handler (waiting for review reads as unknown)', async () => {
+    const h = run(
+      async () => conflictResult(),
+      () =>
+        makePollResult({
+          terminalStatus: 'completed',
+          validatorVerdict: 'unknown',
+          prUrl: 'https://github.com/org/repo/pull/106',
+          prMergeable: null,
+        })
+    );
+    const record = await h.result;
+    expect(h.fireCalls).toHaveLength(1);
+    expect(h.handled).toEqual([]);
+    expect(record.status).toBe('won');
   });
 });

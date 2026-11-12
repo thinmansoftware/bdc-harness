@@ -36,6 +36,7 @@ import {
   warnLegacyMergePolicy,
 } from './merge-repo-policy';
 import { specDeclaresMergeHold } from './merge-hold';
+import type { MergedSibling } from './sibling-wo-id';
 import { isSpecOnlyChangeSet } from './reconcile';
 import type {
   GitHubClientDeps,
@@ -141,6 +142,16 @@ export interface MergeExecutionBridgeOptions {
   }): Promise<ReviewConflictAtHead | null>;
   // Absent in tests that predate the spec hold. When omitted, no spec is read.
   readWoSpec?(woId: string): Promise<string>;
+  /**
+   * Another pull request of the same work order, in the same repository, already merged after this
+   * one was created (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01). Absent keeps the bridge unchanged.
+   * A rejection never blocks a merge: it is logged and the pull request follows the normal path.
+   */
+  findMergedSibling?(input: {
+    owner: string;
+    repo: string;
+    number: number;
+  }): Promise<MergedSibling | null>;
 }
 
 export interface MinimalCompareClient {
@@ -905,7 +916,10 @@ async function mergeClaimedVerdict(
       reason,
       prUrl,
     };
-    if (reason === 'repo_not_allowed' && !warnedRepoNotAllowed.has(verdict.id)) {
+    if (
+      (reason === 'repo_not_allowed' || reason === 'sibling_pr_already_merged') &&
+      !warnedRepoNotAllowed.has(verdict.id)
+    ) {
       if (warnedRepoNotAllowed.size >= REPO_NOT_ALLOWED_WARN_MAX) warnedRepoNotAllowed.clear();
       warnedRepoNotAllowed.add(verdict.id);
       (options.logger ?? log).warn(skipFields, 'merge-coordinator.merge_skipped');
@@ -1169,6 +1183,36 @@ async function mergeClaimedVerdict(
         );
         return undefined;
       }
+    }
+  }
+
+  // A second implementation of an already-merged work order must never land on top of the first
+  // (provisioner PR 103 after PR 102, 2026-11-12). The reconcile pass closes such siblings; this is
+  // the safety net for the window before it runs. Fails open: a failed lookup blocks nothing.
+  if (options.findMergedSibling) {
+    let sibling: MergedSibling | null = null;
+    try {
+      sibling = await options.findMergedSibling({
+        owner: pr.pr.owner,
+        repo: pr.pr.repo,
+        number: pr.pr.number,
+      });
+    } catch (error) {
+      (options.logger ?? log).warn(
+        { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
+        'merge-coordinator.sibling_lookup_failed'
+      );
+    }
+    if (sibling) {
+      await skip('sibling_pr_already_merged', pr.htmlUrl, false, {
+        owner: pr.pr.owner,
+        repo: pr.pr.repo,
+        prNumber: pr.pr.number,
+        mergedPrNumber: sibling.number,
+        mergedPrUrl: sibling.url,
+        siblingWoId: sibling.woId,
+      });
+      return undefined;
     }
   }
 

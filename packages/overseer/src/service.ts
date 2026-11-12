@@ -9,6 +9,7 @@ import {
   insertOverseerAction,
   listActiveRunUserMessages,
   listOriginatingRunCandidates,
+  getWorkflowRunUserMessage,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
@@ -22,6 +23,7 @@ import {
 } from '@archon/core/db/overseer';
 import { hasActiveRunForWo } from './active-run-guard';
 import { findOriginatingRunForPullRequest } from './originating-run-lookup';
+import { createMergedSiblingFinder, createOriginatingWoResolver } from './sibling-wo-id';
 import type { OriginatingRun } from './originating-run-lookup';
 import { handleRecordJudgeFirst } from './judge-first-pipeline';
 import type { OverseerVerdictStoreDeps } from './types.ts';
@@ -461,12 +463,26 @@ function githubCanDriveMergeBridge(github: GitHubClientDeps): boolean {
 }
 
 function createMergeExecutionBridgeRun(github: GitHubClientDeps): () => Promise<void> {
+  const readSiblingContext = github.readSiblingMergeContext?.bind(github);
+  const listMergedFiles = github.listMergedPullRequestFiles?.bind(github);
   return (): Promise<void> =>
     runMergeExecutionBridgeOnce({
       github,
       readRunEvents: listRunEventsForOverseer,
       findOriginatingRun: (input): Promise<OriginatingRun | null> =>
         findOriginatingRunForPullRequest(input, listOriginatingRunCandidates),
+      ...(readSiblingContext && listMergedFiles
+        ? {
+            findMergedSibling: createMergedSiblingFinder({
+              readContext: readSiblingContext,
+              resolve: createOriginatingWoResolver({
+                list: listOriginatingRunCandidates,
+                readUserMessage: getWorkflowRunUserMessage,
+              }),
+              listMergedFiles,
+            }),
+          }
+        : {}),
       ...(github.hasQualifiedReview
         ? {
             hasQualifiedReview: (input): Promise<boolean> =>
