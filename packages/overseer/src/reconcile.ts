@@ -1,4 +1,5 @@
 import { matchesWoToken } from './wo-token';
+import type { ResolveOriginatingWoId } from './sibling-wo-id';
 import { resolveProjectBase } from './project-bases';
 
 const log: ReconcileLogger = {
@@ -283,6 +284,14 @@ export interface ReconcileDeps {
    * this WO. Defaults to the existing action lookup.
    */
   hasSupersedeBeenRecorded?: (input: { prRef: string; woId: string }) => Promise<boolean>;
+  /**
+   * Which work order was an open PR's originating run fired for
+   * (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01). Optional: when absent the supersede pass matches
+   * siblings by body and branch only, exactly as before. Used ONLY for a candidate those two rules
+   * did not match. A throw, an empty answer, an ambiguous answer or an id that is not a stem of the
+   * merged PR all leave the candidate open.
+   */
+  resolveOriginatingWoId?: ResolveOriginatingWoId;
   now?: () => Date;
   log?: ReconcileLogger;
 }
@@ -1131,6 +1140,60 @@ function siblingCreatedBeforeMerge(
 }
 
 /**
+ * The work order of a candidate PR through its originating run, when exactly one such work order is
+ * known and it is one of the merged PR's eligible stems; null in every other case. A throw or an
+ * ambiguous answer is logged at warn; an empty answer or another work order's id is the ordinary case
+ * for any PR that Cauldron did not open for this work order and is logged at info.
+ */
+async function matchThroughOriginatingRun(
+  candidate: ReconcileRepoOpenPullRequest,
+  pr: ReconcileMergedPullRequest,
+  stems: readonly string[],
+  resolve: ResolveOriginatingWoId,
+  logger: ReconcileLogger
+): Promise<string | null> {
+  const prRef = `${pr.owner}/${pr.repo}#${candidate.number}`;
+  let resolution: Awaited<ReturnType<ResolveOriginatingWoId>>;
+  try {
+    resolution = await resolve({
+      owner: pr.owner,
+      repo: pr.repo,
+      number: candidate.number,
+      headRefName: candidate.headRefName,
+    });
+  } catch (error) {
+    logger.warn(
+      { err: error as Error, prRef, reason: 'lookup_failed' },
+      'overseer.reconcile.supersede_lookup_unmatched'
+    );
+    return null;
+  }
+  if (resolution.kind === 'ambiguous') {
+    logger.warn(
+      { prRef, reason: 'ambiguous', woIds: resolution.woIds },
+      'overseer.reconcile.supersede_lookup_unmatched'
+    );
+    return null;
+  }
+  if (resolution.kind === 'none') {
+    logger.info?.(
+      { prRef, reason: 'no_originating_run' },
+      'overseer.reconcile.supersede_lookup_unmatched'
+    );
+    return null;
+  }
+  const woId = resolution.woId.toUpperCase();
+  if (!stems.includes(woId)) {
+    logger.info?.(
+      { prRef, reason: 'other_work_order', woId },
+      'overseer.reconcile.supersede_lookup_unmatched'
+    );
+    return null;
+  }
+  return woId;
+}
+
+/**
  * Close OPEN non-draft, non-fork PRs in the merged PR's repo that declare one
  * of its eligible WO stems and were created strictly before mergedAt.
  * Eligible stems are manifest `WO:` lines minus `Reconcile-Skip:` stems.
@@ -1203,8 +1266,23 @@ async function closeSupersededSiblingPullRequests(
     if (candidate.number === pr.number) continue;
     if (candidate.isDraft) continue;
     if (!headIsTargetRepo(candidate, pr.owner, pr.repo)) continue;
-    const woId = firstMatchedSupersedeStem(candidate, stems);
-    if (!woId) continue;
+    let woId = firstMatchedSupersedeStem(candidate, stems);
+    let matchedThroughRun = false;
+    if (!woId) {
+      // Neither the body nor the branch names the work order (a salvage fallback PR). Ask the
+      // originating run, but only for a candidate that could be a sibling at all (cheap guards first).
+      if (!deps.resolveOriginatingWoId) continue;
+      if (!siblingCreatedBeforeMerge(candidate.createdAt, pr.mergedAt)) continue;
+      woId = await matchThroughOriginatingRun(
+        candidate,
+        pr,
+        stems,
+        deps.resolveOriginatingWoId,
+        logger
+      );
+      if (!woId) continue;
+      matchedThroughRun = true;
+    }
     if (!siblingCreatedBeforeMerge(candidate.createdAt, pr.mergedAt)) continue;
     const siblingRef = `${pr.owner}/${pr.repo}#${candidate.number}`;
     const already = await (deps.hasSupersedeBeenRecorded ?? hasDefaultSupersedeBeenRecorded)({
@@ -1212,7 +1290,10 @@ async function closeSupersededSiblingPullRequests(
       woId,
     });
     if (already) continue;
-    const comment = `Superseded by #${String(pr.number)}`;
+    const comment = matchedThroughRun
+      ? `Superseded by #${String(pr.number)}: the same work order (${woId}) merged there. ` +
+        `This PR's branch ${candidate.headRefName} is kept; reopen the PR if it is still wanted.`
+      : `Superseded by #${String(pr.number)}`;
     try {
       await deps.closePullRequest({
         owner: pr.owner,
@@ -1508,6 +1589,18 @@ async function hasDefaultSupersedeBeenRecorded(input: {
   });
 }
 
+/** The real originating-run resolver, built lazily on the event store (no GitHub calls). */
+const resolveDefaultOriginatingWoId: ResolveOriginatingWoId = async input => {
+  const [
+    { listOriginatingRunCandidates, getWorkflowRunUserMessage },
+    { createOriginatingWoResolver },
+  ] = await Promise.all([import('@archon/core/db/overseer'), import('./sibling-wo-id')]);
+  return createOriginatingWoResolver({
+    list: listOriginatingRunCandidates,
+    readUserMessage: getWorkflowRunUserMessage,
+  })(input);
+};
+
 export function createDefaultReconcileDeps(): ReconcileDeps {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const appConfigured = ['GITHUB_APP_', 'GITHUB_APP_OVERSEER_'].some(prefix =>
@@ -1654,6 +1747,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       });
     },
     hasSupersedeBeenRecorded: hasDefaultSupersedeBeenRecorded,
+    resolveOriginatingWoId: resolveDefaultOriginatingWoId,
     removeTrackerLabel: async (input): Promise<void> => {
       const client = await getOctokit();
       if (!client.issues.removeLabel) return;

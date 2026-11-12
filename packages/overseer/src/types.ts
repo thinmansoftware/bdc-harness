@@ -315,6 +315,20 @@ export interface MergeCandidateDiscoveryDeps {
   requiredContextsLookups?: GitHubClientDeps['requiredContextsLookups'];
 }
 
+/** What the merge gate's sibling check reads about one pull request and its repository. */
+export interface SiblingMergeContextData {
+  headRefName: string;
+  createdAt: string;
+  recentMerged: readonly {
+    number: number;
+    url: string;
+    mergedAt: string;
+    body: string;
+    /** The branch the merged PR targeted ('' when unknown). */
+    baseRef: string;
+  }[];
+}
+
 export interface GitHubClientDeps {
   findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
   /**
@@ -383,6 +397,14 @@ export interface GitHubClientDeps {
   listOpenPullRequests?(
     input: GitHubOpenPullRequestListInput
   ): Promise<readonly DiscoveredPullRequest[]>;
+  /**
+   * The merge gate's sibling check (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01): the pull
+   * request's head branch and creation time, and the repository's most recently merged pull
+   * requests. Optional so existing fakes keep compiling; absent disables the check.
+   */
+  readSiblingMergeContext?(input: PullRequestRef): Promise<SiblingMergeContextData>;
+  /** File paths of one merged pull request; null when the list is truncated. */
+  listMergedPullRequestFiles?(input: PullRequestRef): Promise<readonly string[] | null>;
 }
 
 /**

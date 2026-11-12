@@ -2413,3 +2413,76 @@ describe('merge execution bridge -- repo_not_allowed skip line', () => {
     expect(lines[0]?.obj).not.toHaveProperty('hint');
   });
 });
+
+// WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01 (bdc-xo#5654): the merge gate's sibling check. A second
+// implementation of an already-merged work order must not merge (provisioner PR 103 after PR 102).
+describe('merge gate: sibling of a merged pull request', () => {
+  const siblingOptions = (
+    findMergedSibling: NonNullable<MergeExecutionBridgeOptions['findMergedSibling']>,
+    warns: Array<Record<string, unknown>> = []
+  ): Partial<MergeExecutionBridgeOptions> => ({
+    findMergedSibling,
+    logger: {
+      info: () => undefined,
+      warn: (fields, message) => {
+        warns.push({ ...fields, message });
+      },
+    },
+  });
+
+  test('skips with sibling_pr_already_merged, does not merge, and warns once with both PR numbers', async () => {
+    const h = harness([verdict('sibling')], greenPr());
+    const asked: Array<{ owner: string; repo: string; number: number }> = [];
+    const warns: Array<Record<string, unknown>> = [];
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      ...siblingOptions(async input => {
+        asked.push(input);
+        return { number: 102, url: 'https://github.test/pr/102', woId: 'WO-TEST' };
+      }, warns),
+    });
+    expect(h.merges).toBe(0);
+    expect(h.approvals).toBe(0);
+    expect(h.outcomes[0]?.reason).toBe('sibling_pr_already_merged');
+    expect(asked).toEqual([{ owner: 'thinmansoftware', repo: 'bdc-harness', number: 1 }]);
+    const warned = warns.filter(line => line.reason === 'sibling_pr_already_merged');
+    expect(warned).toHaveLength(1);
+    expect(warned[0]).toMatchObject({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      prNumber: 1,
+      mergedPrNumber: 102,
+    });
+  });
+
+  test('no sibling found merges as before', async () => {
+    const h = harness([verdict('no-sibling')], greenPr());
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      ...siblingOptions(async () => null),
+    });
+    expect(h.merges).toBe(1);
+  });
+
+  test('a failing lookup never blocks an unrelated merge', async () => {
+    const h = harness([verdict('lookup-fails')], greenPr());
+    const warns: Array<Record<string, unknown>> = [];
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      ...siblingOptions(async () => {
+        throw new Error('event store unavailable');
+      }, warns),
+    });
+    expect(h.merges).toBe(1);
+    expect(warns.some(line => line.message === 'merge-coordinator.sibling_lookup_failed')).toBe(
+      true
+    );
+    expect(h.outcomes.some(outcome => outcome.reason === 'sibling_pr_already_merged')).toBe(false);
+  });
+});
