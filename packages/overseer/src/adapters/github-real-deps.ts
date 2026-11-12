@@ -291,6 +291,12 @@ export interface RealGitHubOctokitLike {
       issue_number: number;
       labels: string[];
     }): Promise<unknown>;
+    removeLabel?(input: {
+      owner: string;
+      repo: string;
+      issue_number: number;
+      name: string;
+    }): Promise<unknown>;
     listComments?(input: {
       owner: string;
       repo: string;
@@ -2652,6 +2658,23 @@ export function createRealGitHubClientDeps(
         issue_number: input.number,
         labels: input.labels,
       });
+    },
+    removePullRequestLabel: async (input): Promise<void> => {
+      if (!octokit.issues?.removeLabel) {
+        throw new Error('overseer_real_adapter_missing_remove_label_api');
+      }
+      try {
+        await octokit.issues.removeLabel({
+          owner: input.owner,
+          repo: input.repo,
+          issue_number: input.number,
+          name: input.label,
+        });
+      } catch (error) {
+        // A label that is not on the PR (already removed by a person) is the outcome we wanted.
+        if ((error as { status?: number }).status === 404) return;
+        throw error;
+      }
     },
     listPullRequestComments: async (
       input

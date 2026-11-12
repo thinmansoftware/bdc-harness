@@ -726,6 +726,13 @@ export async function postPolicySkipComment(
 
 const CEILING_QUEUE_MARKER = '<!-- overseer:merge-ceiling-queued -->';
 
+/**
+ * Label a pull request carries while it waits for a merge slot (the hourly ceiling). It is a signal
+ * only: nothing in the merge path reads it as a hold. Added once at the first deferral, removed when
+ * the bridge merges the PR (a PR merged by hand keeps it, which is cosmetic).
+ */
+export const MERGE_QUEUED_LABEL = 'merge-queued';
+
 function reportedChecksAreBlocking(checks: PullRequestEvidence['checks']): boolean {
   return checks.total === 0 || checks.failed > 0 || checks.pending > 0;
 }
@@ -766,6 +773,24 @@ function noteApprovalPosted(github: object, key: string, nowMs: number): void {
     }
   }
   memo.set(key, nowMs);
+}
+
+/** A green PR waiting for the ceiling must not look stuck: label it once (never an extra call per pass). */
+async function markMergeQueued(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  pr: PullRequestEvidence
+): Promise<void> {
+  if (!pr.pr || !options.github.addPullRequestLabels) return;
+  if (pr.labels?.includes(MERGE_QUEUED_LABEL)) return;
+  try {
+    await options.github.addPullRequestLabels({ ...pr.pr, labels: [MERGE_QUEUED_LABEL] });
+  } catch (error) {
+    log.warn(
+      { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
+      'merge-coordinator.queued_label_failed'
+    );
+  }
 }
 
 async function postCeilingQueueNotice(
@@ -1313,6 +1338,7 @@ async function mergeClaimedVerdict(
       queuePosition,
       ceiling
     );
+    await markMergeQueued(options, verdict, pr);
     return notified ? 'stop' : undefined;
   }
 
@@ -1425,6 +1451,16 @@ async function mergeClaimedVerdict(
     },
     'merge-coordinator.merge_executed'
   );
+  if (pr.pr && pr.labels?.includes(MERGE_QUEUED_LABEL) && options.github.removePullRequestLabel) {
+    try {
+      await options.github.removePullRequestLabel({ ...pr.pr, label: MERGE_QUEUED_LABEL });
+    } catch (error) {
+      log.warn(
+        { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
+        'merge-coordinator.queued_label_remove_failed'
+      );
+    }
+  }
   const ownerRepo = pr.pr !== undefined ? `${pr.pr.owner}/${pr.pr.repo}` : 'unknown';
   await postMergeReceiptComment(options, verdict, pr, {
     mergeSha: merged.mergeSha ?? merged.sha,
