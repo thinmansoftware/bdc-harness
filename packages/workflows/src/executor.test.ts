@@ -70,6 +70,7 @@ registerBuiltinProviders();
 // --- Import after mocks ---
 import { executeWorkflow, resolveExecutorLane, LaneAvailabilityRefusedError } from './executor';
 import { markEngineDarkIfZeroUsage, resetEngineAvailabilityForTests } from './engine-availability';
+import { clearRunLeaseLossesForTests, recordRunLeaseLoss } from './run-lease';
 import {
   resetSeatUsageCacheForTests,
   setSeatUsageReaderForTests,
@@ -1771,6 +1772,70 @@ describe('finally backstop', () => {
       c => typeof c[1] === 'string' && (c[1] as string).includes('exited without finalizing')
     );
     expect(backstopCall).toBeUndefined();
+  });
+
+  // WO-HARNESS-RUN-LEASE-LOST-SAYS-SO-01 (bdc-xo#5695)
+  it('Test 5a: a run that lost its lease is failed with the lease-lost message', async () => {
+    clearRunLeaseLossesForTests();
+    recordRunLeaseLoss('run-123', {
+      reason: 'renewal_refused',
+      lastRenewedAt: '2026-11-12T17:56:45.209Z',
+      expiresAt: '2026-11-12T17:57:45.209Z',
+      detectedAt: '2026-11-12T17:59:15.209Z',
+      stoppedAt: 'layer_boundary',
+    });
+    const failSpy = mock(async () => {});
+    const store = makeStore({
+      getWorkflowRunStatus: mock(async () => 'running' as const),
+      failWorkflowRun: failSpy,
+    });
+
+    await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'test',
+      'db-conv-1'
+    );
+    clearRunLeaseLossesForTests();
+
+    const messages = (failSpy.mock.calls as unknown[][]).map(c => String(c[1]));
+    const lost = messages.find(m => m.startsWith('Run lease lost:'));
+    expect(lost).toBeDefined();
+    for (const part of [
+      '2026-11-12T17:56:45.209Z',
+      '2026-11-12T17:57:45.209Z',
+      '2026-11-12T17:59:15.209Z',
+      'gap 90 s after expiry',
+      'stopped at a layer boundary',
+    ]) {
+      expect(lost).toContain(part);
+    }
+    expect(messages.some(m => m.includes('exited without finalizing'))).toBe(false);
+  });
+
+  it('Test 5b: with no recorded loss the backstop text is unchanged', async () => {
+    clearRunLeaseLossesForTests();
+    const failSpy = mock(async () => {});
+    const store = makeStore({
+      getWorkflowRunStatus: mock(async () => 'running' as const),
+      failWorkflowRun: failSpy,
+    });
+
+    await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-1',
+      '/tmp',
+      makeWorkflow(),
+      'test',
+      'db-conv-1'
+    );
+
+    const messages = (failSpy.mock.calls as unknown[][]).map(c => String(c[1]));
+    expect(messages).toContain('Workflow exited without finalizing -- see logs');
   });
 });
 
