@@ -1,8 +1,9 @@
 import { createHash } from 'crypto';
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import {
   authenticateDispatchPrincipal,
   DispatchPrincipalAuthError,
+  DispatchNonSystemCapability,
   parseDispatchPrincipalsRegistry,
   resolveAuthenticatedSender,
   resolveDispatchSenderAuthMode,
@@ -27,6 +28,95 @@ const baseClaude = {
 };
 
 describe('dispatch principal registry', () => {
+  test.each(['active', 'retiring'] as const)(
+    'expiry boundary is enforced for %s credentials',
+    status => {
+      const now = Date.parse('2035-01-01T00:00:00.000Z');
+      const clock = spyOn(Date, 'now').mockReturnValue(now);
+      try {
+        for (const offset of [-1, 0, 1]) {
+          const credentialsJson = registry([
+            {
+              ...baseClaude,
+              status,
+              expires_at: new Date(now + offset).toISOString(),
+            },
+          ]);
+          const authenticate = () =>
+            authenticateDispatchPrincipal({
+              principal_id: 'claude',
+              token: 'claude-token-active',
+              credentialsJson,
+            });
+          if (offset <= 0) expect(authenticate).toThrow('dispatch_principal_expired');
+          else expect(authenticate().expires_at).toBe(new Date(now + offset).toISOString());
+        }
+      } finally {
+        clock.mockRestore();
+      }
+    }
+  );
+
+  test.each([
+    null,
+    '',
+    123,
+    '2035-01-01',
+    '2035-02-30T00:00:00.000Z',
+    '2035-01-01T00:00:00.000+00:00',
+    'not-a-date',
+  ])('explicit malformed expiry fails closed: %s', expires_at => {
+    expect(() =>
+      parseDispatchPrincipalsRegistry(registry([{ ...baseClaude, expires_at }]))
+    ).toThrow('dispatch_principal_config_invalid_expiry');
+  });
+
+  test('rotation permits distinct expiry dates and omission retains legacy behavior', () => {
+    const credentialsJson = registry([
+      baseClaude,
+      {
+        ...baseClaude,
+        credential_id: 'rotation',
+        token_sha256: digest('rotation-token'),
+        expires_at: '2099-01-01T00:00:00.000Z',
+      },
+    ]);
+    expect(
+      authenticateDispatchPrincipal({
+        principal_id: 'claude',
+        token: 'claude-token-active',
+        credentialsJson,
+      }).expires_at
+    ).toBeUndefined();
+    expect(
+      authenticateDispatchPrincipal({
+        principal_id: 'claude',
+        token: 'rotation-token',
+        credentialsJson,
+      }).credential_id
+    ).toBe('rotation');
+  });
+
+  test.each(['off', 'warn', 'enforce'])(
+    'expired header credential cannot fall through %s mode',
+    mode => {
+      process.env.DISPATCH_SENDER_AUTH_MODE = mode;
+      process.env.DISPATCH_PRINCIPALS_JSON = registry([
+        {
+          ...baseClaude,
+          expires_at: '2000-01-01T00:00:00.000Z',
+        },
+      ]);
+      expect(() =>
+        DispatchNonSystemCapability.fromHttpRequest({
+          principal_id: 'claude',
+          token: 'claude-token-active',
+          requested_sender: 'claude',
+        })
+      ).toThrow('dispatch_principal_expired');
+    }
+  );
+
   beforeEach(() => {
     delete process.env.DISPATCH_SENDER_AUTH_MODE;
     delete process.env.DISPATCH_PRINCIPALS_JSON;

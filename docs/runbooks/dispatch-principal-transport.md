@@ -96,6 +96,14 @@ cursor fields, and the stored delay stays in place.
 Other recipients are unaffected. Legacy list, `message_id`, `correlation_id`,
 and non-queued `after_seq` keep their existing behavior.
 
+## Credential expiry
+
+A credential record may carry an optional `expires_at`. The value must be an exact UTC timestamp in the form `YYYY-MM-DDTHH:MM:SS.sssZ`, for example `2026-12-12T14:00:00.000Z`. Anything else is rejected when the principal config is loaded, with `dispatch_principal_config_invalid_expiry`. That includes a malformed, empty, null, non-string or impossible date, or a value that does not round-trip through `toISOString()`.
+
+When the current server time is at or after `expires_at`, a matching token is rejected with 401 and the diagnostic `dispatch_principal_expired`. An expired matching record never falls through to legacy authentication in any sender-auth mode. A record without `expires_at` keeps the previous behavior.
+
+For rotation, add the new record with a later `expires_at` beside the old one; each record expires on its own. A new Chief (`grokbot`) credential is issued with `expires_at` no later than 30 days after issuance (WO-HARNESS-COMPANION-MCP-MAILBOX-01).
+
 ## Preserved limitation
 
 When both principal headers are omitted, a matching `Host` and
