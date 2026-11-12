@@ -10,10 +10,73 @@ const PROCESS_WORKER_ID =
   process.env.ARCHON_WORKER_ID ?? `${hostname()}:${String(process.pid)}:${randomUUID()}`;
 const log = createLogger('workflow.run-lease');
 
+/**
+ * Why and when a run lost its lease (WO-HARNESS-RUN-LEASE-LOST-SAYS-SO-01, bdc-xo#5695). The lease stays lost
+ * for the rest of the run (one refused heartbeat is final), so this is recorded once, when it happens.
+ */
+export interface RunLeaseLoss {
+  /** `renewal_refused`: the store said no (the lease had expired); `renewal_error`: the renewal threw. */
+  reason: 'renewal_refused' | 'renewal_error';
+  /** Last successful renewal (or the acquire time), ISO. */
+  lastRenewedAt: string;
+  /** The expiry that was in force, ISO. */
+  expiresAt: string;
+  /** When the heartbeat callback saw the refusal, ISO. */
+  detectedAt: string;
+  /** Where the executor stopped the run because of it; set by the executor. */
+  stoppedAt?: 'layer_boundary' | 'before_terminal';
+}
+
+const LOSS_REGISTRY_MAX = 200;
+const lossByRun = new Map<string, RunLeaseLoss>();
+
+/** Remember a loss for a run (the lease wrapper calls this; tests call it to stage a loss). */
+export function recordRunLeaseLoss(runId: string, loss: RunLeaseLoss): void {
+  if (!lossByRun.has(runId) && lossByRun.size >= LOSS_REGISTRY_MAX) {
+    const oldest = lossByRun.keys().next().value;
+    if (oldest !== undefined) lossByRun.delete(oldest);
+  }
+  lossByRun.set(runId, loss);
+}
+
+/** Test hook: forget every recorded loss. */
+export function clearRunLeaseLossesForTests(): void {
+  lossByRun.clear();
+}
+
+/** The recorded loss for a run in this process, or null. Read by the executor's backstop. */
+export function getRunLeaseLoss(runId: string): RunLeaseLoss | null {
+  return lossByRun.get(runId) ?? null;
+}
+
+/** Seconds from the lease expiry to `at` (never negative). */
+export function runLeaseGapSeconds(loss: RunLeaseLoss, at: Date): number {
+  const expires = Date.parse(loss.expiresAt);
+  if (Number.isNaN(expires)) return 0;
+  return Math.max(0, Math.round((at.getTime() - expires) / 1000));
+}
+
+/**
+ * The failure message for a run that ended because its lease was lost, or null when no loss was recorded
+ * (the caller then keeps its generic text). Names the three times and the measured gap.
+ */
+export function runLeaseLostMessage(runId: string): string | null {
+  const loss = getRunLeaseLoss(runId);
+  if (!loss) return null;
+  const gap = runLeaseGapSeconds(loss, new Date(loss.detectedAt));
+  const stopped =
+    loss.stoppedAt === 'before_terminal'
+      ? 'the run was stopped before the terminal write'
+      : loss.stoppedAt === 'layer_boundary'
+        ? 'the run was stopped at a layer boundary'
+        : 'the run ended without finalizing';
+  return `Run lease lost: last renewed ${loss.lastRenewedAt}, expired ${loss.expiresAt}, noticed ${loss.detectedAt}, gap ${String(gap)} s after expiry; ${stopped}`;
+}
+
 export async function withRunLease<T>(
   store: IWorkflowStore,
   runId: string,
-  operation: (isLeaseValid: () => boolean) => Promise<T>,
+  operation: (isLeaseValid: () => boolean, getLoss: () => RunLeaseLoss | null) => Promise<T>,
   options: {
     ownerId?: string;
     leaseToken?: string;
@@ -23,7 +86,12 @@ export async function withRunLease<T>(
   } = {}
 ): Promise<T> {
   const authority = await store.getRunAuthority(runId);
-  if (!authority) return operation(() => true);
+  if (!authority) {
+    return operation(
+      () => true,
+      () => null
+    );
+  }
 
   const now = options.now ?? ((): Date => new Date());
   const ownerId = options.ownerId ?? PROCESS_WORKER_ID;
@@ -43,6 +111,21 @@ export async function withRunLease<T>(
   if (!claimed) throw new Error(`run_lease_conflict: active worker owns run ${runId}`);
 
   let leaseValid = true;
+  let loss: RunLeaseLoss | null = null;
+  let lastRenewedAt = acquiredAt.toISOString();
+  let currentExpiresAt = new Date(acquiredAt.getTime() + leaseDurationMs).toISOString();
+  const markLost = (reason: RunLeaseLoss['reason']): void => {
+    leaseValid = false;
+    if (loss) return;
+    loss = {
+      reason,
+      lastRenewedAt,
+      expiresAt: currentExpiresAt,
+      detectedAt: now().toISOString(),
+    };
+    recordRunLeaseLoss(runId, loss);
+    log.warn({ runId, ownerId, ...loss }, 'run_lease_lost_recorded');
+  };
   let heartbeatInFlight = false;
   const timer = setInterval(() => {
     if (heartbeatInFlight || !leaseValid) return;
@@ -57,10 +140,15 @@ export async function withRunLease<T>(
         expiresAt: new Date(heartbeatAt.getTime() + leaseDurationMs).toISOString(),
       })
       .then(renewed => {
-        if (!renewed) leaseValid = false;
+        if (renewed) {
+          lastRenewedAt = heartbeatAt.toISOString();
+          currentExpiresAt = new Date(heartbeatAt.getTime() + leaseDurationMs).toISOString();
+        } else {
+          markLost('renewal_refused');
+        }
       })
       .catch(() => {
-        leaseValid = false;
+        markLost('renewal_error');
       })
       .finally(() => {
         heartbeatInFlight = false;
@@ -69,7 +157,10 @@ export async function withRunLease<T>(
   timer.unref?.();
 
   try {
-    return await operation(() => leaseValid);
+    return await operation(
+      () => leaseValid,
+      () => loss
+    );
   } finally {
     clearInterval(timer);
     // N5 (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01): a terminal run whose teardown is

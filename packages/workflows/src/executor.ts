@@ -5,6 +5,7 @@ import { mkdir, readFile } from 'fs/promises';
 import { join, resolve } from 'path';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps, WorkflowConfig } from './deps';
+import { runLeaseLostMessage } from './run-lease';
 import * as archonPaths from '@archon/paths';
 import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/paths';
 import { execFileAsync, getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
@@ -1881,7 +1882,7 @@ export async function executeWorkflow(
         await failWorkflowRunWithTeardown(
           deps,
           workflowRun,
-          'Workflow exited without finalizing -- see logs'
+          runLeaseLostMessage(runId) ?? 'Workflow exited without finalizing -- see logs'
         ).catch((err: unknown) => {
           getLog().error({ err, workflowRunId: runId }, 'executor.backstop_fail_failed');
         });
