@@ -38,6 +38,8 @@ import {
   InfrastructureClassBlock,
   PAPERWORK_NODES,
   isPaperworkNode,
+  ADVISORY_NODES,
+  isAdvisoryNode,
   hasPushArtifact,
 } from './executor-shared';
 
@@ -1032,6 +1034,27 @@ describe('PAPERWORK_NODES', () => {
     expect(isPaperworkNode('implement')).toBe(false);
     expect(isPaperworkNode('open-pr-if-needed')).toBe(false);
     expect(isPaperworkNode('commit-and-push')).toBe(false);
+  });
+});
+
+describe('ADVISORY_NODES (WO-HARNESS-ADVISORY-NODE-FAILURE-NOT-RUN-FAILURE-01)', () => {
+  it('names the check-already-satisfied pre-check and nothing else', () => {
+    expect([...ADVISORY_NODES]).toEqual(['check-already-satisfied']);
+  });
+
+  it('isAdvisoryNode is true for every advisory node and false for required nodes', () => {
+    for (const id of ADVISORY_NODES) {
+      expect(isAdvisoryNode(id)).toBe(true);
+    }
+    expect(isAdvisoryNode('implement')).toBe(false);
+    expect(isAdvisoryNode('blocked-terminal-gate')).toBe(false);
+    expect(isAdvisoryNode('manifest-evidence-check')).toBe(false);
+  });
+
+  it('is disjoint from the paperwork list', () => {
+    for (const id of ADVISORY_NODES) {
+      expect(isPaperworkNode(id)).toBe(false);
+    }
   });
 });
 
