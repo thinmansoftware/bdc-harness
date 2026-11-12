@@ -1713,7 +1713,9 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
         // Store before awaiting: concurrent lookups share completion or failure.
         // A direct no-scope call always reads anew; reused factories cannot cache
         // tracker state across runReconcileOnce invocations.
-        snapshot = getOctokit().then(client => readTrackerIssueSnapshot(client));
+        snapshot = getOctokit().then(client =>
+          readTrackerIssueSnapshot(client, processTrackerSnapshotContext)
+        );
         if (scope) trackerSnapshots.set(scope, snapshot);
       }
       return findTrackerIssueByStem(await snapshot, stem);
@@ -1723,7 +1725,9 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       // so a reconcile pass makes ONE tracker REST scan for both lookups.
       let snapshot = scope ? trackerSnapshots.get(scope) : undefined;
       if (!snapshot) {
-        snapshot = getOctokit().then(client => readTrackerIssueSnapshot(client));
+        snapshot = getOctokit().then(client =>
+          readTrackerIssueSnapshot(client, processTrackerSnapshotContext)
+        );
         if (scope) trackerSnapshots.set(scope, snapshot);
       }
       return findTrackerIssueByNumber(await snapshot, number);
@@ -2323,7 +2327,15 @@ function validatedOpenSearchPullRequest(item: unknown): ReconcileOpenPullRequest
 }
 
 const TRACKER_ISSUE_PAGE_SIZE = 100;
-const TRACKER_ISSUE_MAX_PAGES = 100;
+// WO-HARNESS-RECONCILE-TRACKER-SNAPSHOT-INCREMENTAL-01 (bdc-xo#5701): the snapshot is kept for the life of the
+// process and refreshed with only what changed; the full scan (first pass, every 6 hours, or after a long
+// outage) has a 400-page budget, and the old 100-page cliff (10,000 issues and pull requests) is gone.
+const TRACKER_ISSUE_FULL_SCAN_MAX_PAGES = 400;
+const TRACKER_ISSUE_NEAR_BUDGET_PAGES = 320;
+const TRACKER_ISSUE_INCREMENTAL_MAX_PAGES = 20;
+const TRACKER_ISSUE_FULL_REFRESH_MS = 6 * 60 * 60 * 1000;
+const TRACKER_ISSUE_SINCE_OVERLAP_MS = 120_000;
+const TRACKER_BUDGET_ALERT_WINDOW_MS = 6 * 60 * 60 * 1000;
 export interface TrackerSnapshotRow {
   readonly number: number;
   readonly title: string;
@@ -2334,48 +2346,230 @@ export interface TrackerSnapshotRow {
 }
 export type TrackerIssueSnapshot = ReadonlyMap<number, TrackerSnapshotRow>;
 
-async function readTrackerIssueSnapshot(octokit: OctokitLike): Promise<TrackerIssueSnapshot> {
+/** What a refresh needs: the cache, a clock, and the way to tell the operator (all injectable for tests). */
+export interface TrackerSnapshotContext {
+  cache: { current: TrackerSnapshotCache | undefined };
+  nowMs: () => number;
+  alertOperator: (input: { key: string; body: string }) => Promise<void>;
+  alertedAtMs: { near: number; exceeded: number };
+}
+
+export interface TrackerSnapshotCache {
+  readonly rows: Map<number, TrackerSnapshotRow>;
+  /** When the last FULL scan started. */
+  readonly fullAtMs: number;
+  /** When the last refresh (full or incremental) started: the `since` cursor for the next one. */
+  refreshStartedAtMs: number;
+}
+
+async function defaultTrackerAlert(input: { key: string; body: string }): Promise<void> {
+  const { createAuthenticatedMessage } = await import('@archon/core/db/dispatch');
+  await createAuthenticatedMessage(
+    { kind: 'system', sender: 'overseer' },
+    {
+      correlation_id: input.key,
+      idempotency_key: `overseer:${input.key}`,
+      task_type: 'agent_message',
+      recipient: 'operator',
+      priority: 'blocker',
+      body: input.body,
+    }
+  );
+}
+
+/** The process-level snapshot: createDefaultReconcileDeps() runs once per pass, so the cache cannot live there. */
+const processTrackerSnapshotContext: TrackerSnapshotContext = {
+  cache: { current: undefined },
+  nowMs: (): number => Date.now(),
+  alertOperator: defaultTrackerAlert,
+  alertedAtMs: { near: Number.NEGATIVE_INFINITY, exceeded: Number.NEGATIVE_INFINITY },
+};
+
+/** Test hook: forget the process-level snapshot and its alert marker. */
+export function resetTrackerSnapshotStateForTests(): void {
+  processTrackerSnapshotContext.cache.current = undefined;
+  processTrackerSnapshotContext.alertedAtMs.near = Number.NEGATIVE_INFINITY;
+  processTrackerSnapshotContext.alertedAtMs.exceeded = Number.NEGATIVE_INFINITY;
+}
+
+async function readTrackerPage(
+  octokit: OctokitLike,
+  extra: Record<string, unknown>,
+  page: number,
+  label: string
+): Promise<unknown[]> {
   const issues = octokit.issues;
   if (!issues.listForRepo) throw failClosedError('tracker issue REST listing is unavailable');
-  const rows = new Map<number, TrackerSnapshotRow>();
-  // At most 100 logical core reads per invocation. Created order reduces churn;
-  // REST pagination is not an atomic snapshot and issue numbers need not increase.
-  for (let page = 1; page <= TRACKER_ISSUE_MAX_PAGES; page++) {
-    const response = await issues.listForRepo({
-      owner: DEFAULT_ORG,
-      repo: DEFAULT_TRACKER_REPO,
-      state: 'all',
-      sort: 'created',
-      direction: 'asc',
-      per_page: TRACKER_ISSUE_PAGE_SIZE,
-      page,
-    });
+  const response = await issues.listForRepo({
+    owner: DEFAULT_ORG,
+    repo: DEFAULT_TRACKER_REPO,
+    state: 'all',
+    ...extra,
+    per_page: TRACKER_ISSUE_PAGE_SIZE,
+    page,
+  });
+  countRead(label);
+  if (
+    !response ||
+    !Array.isArray(response.data) ||
+    response.data.length > TRACKER_ISSUE_PAGE_SIZE
+  ) {
+    throw failClosedError('tracker issue REST listing returned a malformed page');
+  }
+  return response.data as unknown[];
+}
+
+function mergeTrackerPage(rows: Map<number, TrackerSnapshotRow>, data: unknown[]): void {
+  for (const value of data) {
+    const row = validatedTrackerSnapshotRow(value);
+    const prior = rows.get(row.number);
     if (
-      !response ||
-      !Array.isArray(response.data) ||
-      response.data.length > TRACKER_ISSUE_PAGE_SIZE
+      prior &&
+      (prior.title !== row.title ||
+        prior.state !== row.state ||
+        prior.htmlUrl.toLowerCase() !== row.htmlUrl.toLowerCase() ||
+        prior.pullRequest !== row.pullRequest)
     ) {
-      throw failClosedError('tracker issue REST listing returned a malformed page');
+      throw failClosedError(
+        `tracker issue REST listing returned conflicting copies of ${row.number}`
+      );
     }
-    for (const value of response.data) {
-      const row = validatedTrackerSnapshotRow(value);
-      const prior = rows.get(row.number);
-      if (
-        prior &&
-        (prior.title !== row.title ||
-          prior.state !== row.state ||
-          prior.htmlUrl.toLowerCase() !== row.htmlUrl.toLowerCase() ||
-          prior.pullRequest !== row.pullRequest)
-      ) {
-        throw failClosedError(
-          `tracker issue REST listing returned conflicting copies of ${row.number}`
+    rows.set(row.number, row);
+  }
+}
+
+async function fullTrackerScan(
+  octokit: OctokitLike,
+  ctx: TrackerSnapshotContext | undefined
+): Promise<Map<number, TrackerSnapshotRow>> {
+  const rows = new Map<number, TrackerSnapshotRow>();
+  // REST pagination is not an atomic snapshot and issue numbers need not increase; created order reduces churn.
+  for (let page = 1; page <= TRACKER_ISSUE_FULL_SCAN_MAX_PAGES; page++) {
+    const data = await readTrackerPage(
+      octokit,
+      { sort: 'created', direction: 'asc' },
+      page,
+      'pages:tracker_snapshot_full'
+    );
+    mergeTrackerPage(rows, data);
+    if (data.length < TRACKER_ISSUE_PAGE_SIZE) {
+      if (page >= TRACKER_ISSUE_NEAR_BUDGET_PAGES) {
+        log.warn(
+          { items: rows.size, pages: page, budgetPages: TRACKER_ISSUE_FULL_SCAN_MAX_PAGES },
+          'overseer.reconcile.tracker_snapshot_near_budget'
+        );
+        await alertTrackerBudget(
+          ctx,
+          'near',
+          `bdc-xo has ${String(rows.size)} issues and pull requests (${String(page)} pages of ` +
+            `${String(TRACKER_ISSUE_PAGE_SIZE)}); the reconcile full-scan budget is ` +
+            `${String(TRACKER_ISSUE_FULL_SCAN_MAX_PAGES)} pages.`
         );
       }
-      rows.set(row.number, row);
+      return rows;
     }
-    if (response.data.length < TRACKER_ISSUE_PAGE_SIZE) return rows;
   }
+  // The budget stops the read, so the exact total is not observable: report the lower bound.
+  const atLeast = TRACKER_ISSUE_FULL_SCAN_MAX_PAGES * TRACKER_ISSUE_PAGE_SIZE;
+  // The reconcile logger has no error level: the severity travels in the fields, and the operator alert below
+  // is the loud part.
+  log.warn(
+    {
+      severity: 'error',
+      observedAtLeast: atLeast,
+      budgetPages: TRACKER_ISSUE_FULL_SCAN_MAX_PAGES,
+    },
+    'overseer.reconcile.tracker_snapshot_page_budget_exceeded'
+  );
+  await alertTrackerBudget(
+    ctx,
+    'exceeded',
+    `The reconcile tracker scan hit its budget: at least ${String(atLeast)} items read, budget ` +
+      `${String(TRACKER_ISSUE_FULL_SCAN_MAX_PAGES)} pages of ${String(TRACKER_ISSUE_PAGE_SIZE)}. ` +
+      'Reconcile passes fail closed until the budget is raised (packages/overseer/src/reconcile.ts, ' +
+      'TRACKER_ISSUE_FULL_SCAN_MAX_PAGES).'
+  );
   throw failClosedError('tracker issue REST listing exceeded its complete-page budget');
+}
+
+/** At most one operator alert of each kind per process per 6 hours; never throws. */
+async function alertTrackerBudget(
+  ctx: TrackerSnapshotContext | undefined,
+  kind: 'near' | 'exceeded',
+  detail: string
+): Promise<void> {
+  if (!ctx) return;
+  const now = ctx.nowMs();
+  if (now - ctx.alertedAtMs[kind] < TRACKER_BUDGET_ALERT_WINDOW_MS) return;
+  ctx.alertedAtMs[kind] = now;
+  const bucket = Math.floor(now / TRACKER_BUDGET_ALERT_WINDOW_MS);
+  try {
+    await ctx.alertOperator({
+      key: `reconcile-tracker-snapshot-${kind}:${String(bucket)}`,
+      body: `Overseer reconcile tracker snapshot (${kind === 'near' ? 'near its budget' : 'budget exceeded'}): ${detail}`,
+    });
+  } catch (error) {
+    ctx.alertedAtMs[kind] = Number.NEGATIVE_INFINITY;
+    log.warn({ err: error as Error, kind }, 'overseer.reconcile.tracker_snapshot_alert_failed');
+  }
+}
+
+/** Merge what changed since `sinceMs` into `cache.rows`; false (nothing merged) when it needs too many pages. */
+async function incrementalTrackerRefresh(
+  octokit: OctokitLike,
+  cache: TrackerSnapshotCache,
+  sinceMs: number
+): Promise<boolean> {
+  const since = new Date(sinceMs).toISOString();
+  const fresh = new Map<number, TrackerSnapshotRow>();
+  for (let page = 1; page <= TRACKER_ISSUE_INCREMENTAL_MAX_PAGES; page++) {
+    const data = await readTrackerPage(
+      octokit,
+      { sort: 'updated', direction: 'asc', since },
+      page,
+      'pages:tracker_snapshot_incremental'
+    );
+    mergeTrackerPage(fresh, data);
+    if (data.length < TRACKER_ISSUE_PAGE_SIZE) {
+      for (const [number, row] of fresh) cache.rows.set(number, row);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The tracker snapshot for one reconcile pass. With a context: the first call (and every 6 hours, and after
+ * an incremental read that needs more than 20 pages) does a full scan; every other call reads only what
+ * changed since the last refresh (`since`, with a 120 s overlap) and merges it into the cached rows. A read
+ * error leaves the cache untouched and fails the pass closed. Without a context: a plain full scan.
+ * Permitted staleness: an issue or pull request deleted or transferred out of bdc-xo stays in the cache until
+ * the next full scan (at most 6 hours); every new, changed, closed or reopened item is seen on the next pass.
+ */
+export async function readTrackerIssueSnapshot(
+  octokit: OctokitLike,
+  ctx?: TrackerSnapshotContext
+): Promise<TrackerIssueSnapshot> {
+  if (!ctx) return fullTrackerScan(octokit, undefined);
+  const startedAtMs = ctx.nowMs();
+  const cache = ctx.cache.current;
+  if (cache && startedAtMs - cache.fullAtMs < TRACKER_ISSUE_FULL_REFRESH_MS) {
+    if (
+      await incrementalTrackerRefresh(
+        octokit,
+        cache,
+        cache.refreshStartedAtMs - TRACKER_ISSUE_SINCE_OVERLAP_MS
+      )
+    ) {
+      cache.refreshStartedAtMs = startedAtMs;
+      countRead('tracker_snapshot:incremental');
+      return new Map(cache.rows);
+    }
+  }
+  const rows = await fullTrackerScan(octokit, ctx);
+  ctx.cache.current = { rows, fullAtMs: startedAtMs, refreshStartedAtMs: startedAtMs };
+  countRead('tracker_snapshot:full');
+  return new Map(rows);
 }
 
 function validatedTrackerSnapshotRow(value: unknown): TrackerSnapshotRow {

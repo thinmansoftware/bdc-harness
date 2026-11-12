@@ -10,6 +10,7 @@ import {
 } from '@archon/core/github/metering';
 import {
   createDefaultReconcileDeps,
+  resetTrackerSnapshotStateForTests,
   runReconcileOnce,
   type ReconcileDeps,
   type ReconcileMergedPullRequest,
@@ -55,6 +56,8 @@ function test(name: string, fn: () => Promise<void>): void {
     withIsolatedDatabase(async () => {
       clearServiceGitHubTokenCache();
       resetGitHubApiMeterForTests();
+      // the tracker snapshot is a process-level cache: every case starts without one
+      resetTrackerSnapshotStateForTests();
       for (const keyName of envNames) delete process.env[keyName];
       calls = [];
       try {
@@ -488,7 +491,7 @@ test('tracker REST lookup never acts on an early match before a malformed later 
   expect(effects).toEqual([]);
 });
 
-test('tracker REST lookup holds a full final page as unknown within the 100-read budget', async () => {
+test('tracker REST lookup holds a full final page as unknown within the 400-read budget', async () => {
   app();
   transport((_auth, _method, url) => {
     const page = Number(new URL(url).searchParams.get('page'));
@@ -499,7 +502,7 @@ test('tracker REST lookup holds a full final page as unknown within the 100-read
   const effects: string[] = [];
   const deps = trackerRunDeps(createDefaultReconcileDeps(), [mergedTrackerPr(601)], effects);
   await expect(runReconcileOnce({ deps })).rejects.toThrow('complete-page budget');
-  expect(calls).toHaveLength(100);
+  expect(calls).toHaveLength(400);
   expect(effects).toEqual([]);
 });
 

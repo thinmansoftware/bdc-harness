@@ -63,3 +63,13 @@ Change: `runReconcileOnce` now shares the open-PR list of a repository across th
 | `pages:<reader>` | GitHub pages read per reader: `open_prs_in_repo`, `merged_trackers`, `tracker_close_events`, `tracker_comments`, `merged_pr_files` |
 
 How to read it (after the rebuild that carries it): `ssh hetzner-prod 'docker logs archon-app-1 --since 60m 2>&1 | grep overseer.reconcile.call_counts'`. Compare the sum of `pages:*` per hour with the `github_call_sites` lines for the reconcile spellings to attribute them; `open_pr_list:cache_hits` shows what the sharing removed. The tracker snapshot (`findTrackerIssueByStem`) was already shared per pass.
+
+## Tracker snapshot is incremental (bdc-xo#5701, 2026-11-12)
+
+Measured on e3d9bcd7e (30-minute and 60-minute readings, container started 19:44:58Z): `GET /repos/{o}/{r}/issues` was the top Overseer site, 855 calls in 29 minutes and 1,805 in 59 minutes, exactly 57 per reconcile pass: `readTrackerIssueSnapshot` (`reconcile.ts`) listed every issue and pull request of `thinmansoftware/bdc-xo` (5,695 at 20:19Z, 100 per page) on every pass, and failed closed at 100 pages (10,000 items).
+
+Now the snapshot is kept for the life of the process: the first pass (and every 6 hours, and after an incremental read that needs more than 20 pages) does a full scan with a 400-page budget; every other pass reads only the issues updated since the previous refresh (`since`, 120 s overlap, `sort=updated`) and merges them into the cache, which is a handful of pages. Expected rate after the first pass: about 1 to 3 calls per pass instead of 57 (the issues site falls from about 1,800 an hour to about 100). Counters in `overseer.reconcile.call_counts`: `pages:tracker_snapshot_full`, `pages:tracker_snapshot_incremental`, `tracker_snapshot:full`, `tracker_snapshot:incremental`.
+
+Permitted staleness: an issue or pull request deleted or transferred out of bdc-xo stays in the cache until the next full scan (at most 6 hours). A read error leaves the cache untouched and fails the pass closed as before.
+
+Alerts: at 320 pages (32,000 items) the full scan logs `overseer.reconcile.tracker_snapshot_near_budget` and sends one operator alert naming the exact count; if the 400-page budget is hit the pass fails closed, logs `overseer.reconcile.tracker_snapshot_page_budget_exceeded` (with `severity: error`; the reconcile logger has no error level) and sends one operator alert naming the observed lower bound (`at least 40000 items read`, never an exact total it could not read). At most one alert of each kind per process per 6 hours.
