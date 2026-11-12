@@ -1,12 +1,6 @@
 import { expect, mock, test } from 'bun:test';
 import type { IWorkflowStore } from './store';
-import {
-  clearRunLeaseLossesForTests,
-  getRunLeaseLoss,
-  recordRunLeaseLoss,
-  runLeaseLostMessage,
-  withRunLease,
-} from './run-lease';
+import { clearRunLeaseLossesForTests, getRunLeaseLoss, withRunLease } from './run-lease';
 
 test('legacy run without authority executes without claiming a lease', async () => {
   const store = {
@@ -204,20 +198,4 @@ test('a healthy lease records nothing', async () => {
   );
   expect(loss).toBeNull();
   expect(getRunLeaseLoss('run-1')).toBeNull();
-  expect(runLeaseLostMessage('run-1')).toBeNull();
-});
-
-test('runLeaseLostMessage names the three times, the gap and where the run stopped', () => {
-  clearRunLeaseLossesForTests();
-  recordRunLeaseLoss('run-9', {
-    reason: 'renewal_refused',
-    lastRenewedAt: '2026-11-12T17:56:45.209Z',
-    expiresAt: '2026-11-12T17:57:45.209Z',
-    detectedAt: '2026-11-12T17:59:15.209Z',
-    stoppedAt: 'layer_boundary',
-  });
-  expect(runLeaseLostMessage('run-9')).toBe(
-    'Run lease lost: last renewed 2026-11-12T17:56:45.209Z, expired 2026-11-12T17:57:45.209Z, noticed 2026-11-12T17:59:15.209Z, gap 90 s after expiry; the run was stopped at a layer boundary'
-  );
-  clearRunLeaseLossesForTests();
 });

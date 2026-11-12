@@ -56,23 +56,6 @@ export function runLeaseGapSeconds(loss: RunLeaseLoss, at: Date): number {
   return Math.max(0, Math.round((at.getTime() - expires) / 1000));
 }
 
-/**
- * The failure message for a run that ended because its lease was lost, or null when no loss was recorded
- * (the caller then keeps its generic text). Names the three times and the measured gap.
- */
-export function runLeaseLostMessage(runId: string): string | null {
-  const loss = getRunLeaseLoss(runId);
-  if (!loss) return null;
-  const gap = runLeaseGapSeconds(loss, new Date(loss.detectedAt));
-  const stopped =
-    loss.stoppedAt === 'before_terminal'
-      ? 'the run was stopped before the terminal write'
-      : loss.stoppedAt === 'layer_boundary'
-        ? 'the run was stopped at a layer boundary'
-        : 'the run ended without finalizing';
-  return `Run lease lost: last renewed ${loss.lastRenewedAt}, expired ${loss.expiresAt}, noticed ${loss.detectedAt}, gap ${String(gap)} s after expiry; ${stopped}`;
-}
-
 export async function withRunLease<T>(
   store: IWorkflowStore,
   runId: string,

@@ -5,7 +5,7 @@ import { mkdir, readFile } from 'fs/promises';
 import { join, resolve } from 'path';
 import type { IWorkflowPlatform, WorkflowMessageMetadata } from './deps';
 import type { WorkflowDeps, WorkflowConfig } from './deps';
-import { runLeaseLostMessage } from './run-lease';
+import { getRunLeaseLoss, runLeaseGapSeconds } from './run-lease';
 import * as archonPaths from '@archon/paths';
 import { createLogger, captureWorkflowInvoked, BUNDLED_VERSION } from '@archon/paths';
 import { execFileAsync, getDefaultBranch, getRemoteUrl, toRepoPath } from '@archon/git';
@@ -735,6 +735,23 @@ async function failWorkflowRunWithTeardown(
  *   - Appended to prompts if no context variables are present (to ensure AI receives context)
  *   Expected format: Markdown with issue title, author, labels, and body
  */
+/**
+ * The failure message for a run that ended because its lease was lost, or null when no loss was recorded
+ * (the caller then keeps its generic text). Names the three times and the measured gap.
+ */
+export function runLeaseLostMessage(runId: string): string | null {
+  const loss = getRunLeaseLoss(runId);
+  if (!loss) return null;
+  const gap = runLeaseGapSeconds(loss, new Date(loss.detectedAt));
+  const stopped =
+    loss.stoppedAt === 'before_terminal'
+      ? 'the run was stopped before the terminal write'
+      : loss.stoppedAt === 'layer_boundary'
+        ? 'the run was stopped at a layer boundary'
+        : 'the run ended without finalizing';
+  return `Run lease lost: last renewed ${loss.lastRenewedAt}, expired ${loss.expiresAt}, noticed ${loss.detectedAt}, gap ${String(gap)} s after expiry; ${stopped}`;
+}
+
 export async function executeWorkflow(
   deps: WorkflowDeps,
   platform: IWorkflowPlatform,
