@@ -117,6 +117,7 @@ import {
   resolveAgentPersona,
   InfrastructureClassBlock,
   isPaperworkNode,
+  isAdvisoryNode,
   hasPushArtifact,
 } from './executor-shared';
 import {
@@ -7603,11 +7604,42 @@ async function executeDagWorkflowInternal(
     const failedNodeIds = [...nodeOutputs.entries()]
       .filter(([, o]) => o.state === 'failed')
       .map(([id]) => id);
-    const allFailuresArePaperwork = failedNodeIds.every(id => isPaperworkNode(id));
-    if (!hasMechanicalEvidenceNode && allFailuresArePaperwork && pushArtifactPresent) {
+    // Advisory pre-check nodes (WO-HARNESS-ADVISORY-NODE-FAILURE-NOT-RUN-FAILURE-01): when
+    // every failed node is advisory (or paperwork) the run's substantive work is judged by the
+    // rest of the DAG. Advisory failures need the run's terminal gate to have PASSED (the node
+    // `blocked-terminal-gate`, when the workflow declares it, must have completed; a workflow
+    // without it needs a pushed artifact instead). A failed or skipped terminal gate, or a failed
+    // required node, keeps the run failed exactly as before. Mechanical evidence nodes (for example
+    // the lane's build-manifest) must have COMPLETED for the advisory path: a lane that has them is
+    // the common case (the cursor lane), so the paperwork rule's "no evidence node" guard is not
+    // reused here; the evidence nodes passing is the equivalent proof.
+    const failedAdvisoryNodeIds = failedNodeIds.filter(id => isAdvisoryNode(id));
+    const failedPaperworkNodeIds = failedNodeIds.filter(id => isPaperworkNode(id));
+    const allFailuresAreKnownDegradable = failedNodeIds.every(
+      id => isPaperworkNode(id) || isAdvisoryNode(id)
+    );
+    const terminalGateDeclared = workflow.nodes.some(n => n.id === 'blocked-terminal-gate');
+    const terminalGatePassed = terminalGateDeclared
+      ? nodeOutputs.get('blocked-terminal-gate')?.state === 'completed'
+      : pushArtifactPresent;
+    const advisoryDegraded = failedAdvisoryNodeIds.length > 0;
+    const evidenceNodesCompleted = workflow.nodes
+      .filter(isEvidenceNode)
+      .every(n => nodeOutputs.get(n.id)?.state === 'completed');
+    const paperworkAllowsDegrade =
+      failedPaperworkNodeIds.length === 0 || (!hasMechanicalEvidenceNode && pushArtifactPresent);
+    const advisoryAllowsDegrade =
+      !advisoryDegraded || (terminalGatePassed && evidenceNodesCompleted);
+    if (allFailuresAreKnownDegradable && paperworkAllowsDegrade && advisoryAllowsDegrade) {
       getLog().warn(
-        { workflowRunId: workflowRun.id, degradedPaperworkNodes: failedNodeIds },
-        'dag.workflow_completed_paperwork_degraded'
+        {
+          workflowRunId: workflowRun.id,
+          degradedPaperworkNodes: failedPaperworkNodeIds,
+          degradedAdvisoryNodes: failedAdvisoryNodeIds,
+        },
+        advisoryDegraded
+          ? 'dag.workflow_completed_advisory_degraded'
+          : 'dag.workflow_completed_paperwork_degraded'
       );
       const degradedDuration = Date.now() - dagStartTime;
       const degradedOutcome = await makeTerminalOutcome('completed');
@@ -7620,14 +7652,18 @@ async function executeDagWorkflowInternal(
             node_counts: nodeCounts,
             // Degraded-success signal consumed by the dashboard (Section 5 of the
             // WO): status 'completed' + paperwork_degraded=true, no new enum value.
-            paperwork_degraded: true,
-            degraded_paperwork_nodes: failedNodeIds,
+            ...(failedPaperworkNodeIds.length > 0
+              ? { paperwork_degraded: true, degraded_paperwork_nodes: failedPaperworkNodeIds }
+              : {}),
+            ...(advisoryDegraded
+              ? { advisory_degraded: true, failed_advisory_nodes: failedAdvisoryNodeIds }
+              : {}),
             ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
             ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
             ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
             ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
             ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
-            terminal_cause: 'paperwork_degraded',
+            terminal_cause: advisoryDegraded ? 'advisory_degraded' : 'paperwork_degraded',
           },
           {
             outcome: degradedOutcome,
@@ -7635,9 +7671,13 @@ async function executeDagWorkflowInternal(
             eventData: {
               duration_ms: degradedDuration,
               node_counts: nodeCounts,
-              terminal_cause: 'paperwork_degraded',
-              paperwork_degraded: true,
-              degraded_paperwork_nodes: failedNodeIds,
+              terminal_cause: advisoryDegraded ? 'advisory_degraded' : 'paperwork_degraded',
+              ...(failedPaperworkNodeIds.length > 0
+                ? { paperwork_degraded: true, degraded_paperwork_nodes: failedPaperworkNodeIds }
+                : {}),
+              ...(advisoryDegraded
+                ? { advisory_degraded: true, failed_advisory_nodes: failedAdvisoryNodeIds }
+                : {}),
             },
           }
         );
@@ -7664,7 +7704,9 @@ async function executeDagWorkflowInternal(
       await safeSendMessage(
         platform,
         conversationId,
-        `\u26a0\ufe0f Workflow '${workflow.name}' completed (degraded): the build landed (branch/PR artifact present) but paperwork node(s) failed: ${failedNodeIds.join(', ')}. Run marked completed with paperwork_degraded=true.`,
+        advisoryDegraded
+          ? `\u26a0\ufe0f Workflow '${workflow.name}' completed (degraded): advisory pre-check node(s) failed (${failedAdvisoryNodeIds.join(', ')}) but every required node and the terminal gate passed. Run marked completed with advisory_degraded=true.`
+          : `\u26a0\ufe0f Workflow '${workflow.name}' completed (degraded): the build landed (branch/PR artifact present) but paperwork node(s) failed: ${failedNodeIds.join(', ')}. Run marked completed with paperwork_degraded=true.`,
         { workflowId: workflowRun.id }
       );
       return;
