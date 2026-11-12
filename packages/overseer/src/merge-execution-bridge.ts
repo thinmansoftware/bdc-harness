@@ -109,6 +109,11 @@ export interface MergeExecutionBridgeOptions {
   findOriginatingRun?: (input: OriginatingRunLookupInput) => Promise<OriginatingRun | null>;
   store: MergeExecutionBridgeStore;
   github: GitHubClientDeps;
+  /** Optional logger seam for the skip line (tests); defaults to the module logger. */
+  logger?: {
+    info(obj: Record<string, unknown>, msg: string): void;
+    warn(obj: Record<string, unknown>, msg: string): void;
+  };
   readPolicy?: () => OverseerActionPolicy;
   now?: () => Date;
   maxMergesPerHour?: number;
@@ -364,7 +369,12 @@ async function recordPostMutationOutcome(
   }
 }
 
-type SkipVerdict = (reason: string, prUrl?: string, rateLimited?: boolean) => Promise<void>;
+type SkipVerdict = (
+  reason: string,
+  prUrl?: string,
+  rateLimited?: boolean,
+  details?: Record<string, unknown>
+) => Promise<void>;
 
 interface MergeTarget {
   pr: PullRequestEvidence;
@@ -434,7 +444,10 @@ async function resolveRunlessTarget(
   }
   const ownerRepo = `${ref.owner}/${ref.repo}`.toLowerCase();
   if (!hasRepoPolicyEntry(ownerRepo, repoPolicy)) {
-    await skip('repo_not_allowed');
+    await skip('repo_not_allowed', undefined, false, {
+      ...repoNotInPolicyDetails(ref.owner, ref.repo),
+      prNumber: ref.prNumber,
+    });
     return null;
   }
   let pr: PullRequestEvidence;
@@ -527,7 +540,7 @@ async function resolveMergeTarget(
   }
   const ownerRepo = `${run.owner}/${run.repo}`.toLowerCase();
   if (!hasRepoPolicyEntry(ownerRepo, repoPolicy)) {
-    await skip('repo_not_allowed');
+    await skip('repo_not_allowed', undefined, false, repoNotInPolicyDetails(run.owner, run.repo));
     return null;
   }
   const pr = await options.github.findPullRequest({
@@ -790,6 +803,25 @@ async function postCeilingQueueNotice(
   }
 }
 
+/**
+ * WO-HARNESS-MERGE-POLICY-PROVISIONER-AND-REPO-SKIP-LINE-01 (bdc-xo#5581): a skip because the repository
+ * has no policy entry used to be an info line with only the run id (no repository or number field, no
+ * hint) and posts no comment, so nobody saw why a pull request was not merged. The skip line for
+ * `repo_not_allowed` is now a WARN carrying the repository, the pull request number when known, the
+ * variable to read and one hint, once per verdict id per process (replays of the same verdict stay info).
+ */
+const REPO_NOT_ALLOWED_WARN_MAX = 2000;
+const warnedRepoNotAllowed = new Set<string>();
+
+function repoNotInPolicyDetails(owner: string, repo: string): Record<string, unknown> {
+  return {
+    owner,
+    repo,
+    env: 'MERGE_MANAGER_REPO_POLICY',
+    hint: 'add_repo_to_merge_policy',
+  };
+}
+
 async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
@@ -865,17 +897,21 @@ async function mergeClaimedVerdict(
       reason,
       prUrl,
     });
-    log.info(
-      {
-        verdictId: verdict.id,
-        runId: verdict.run_id,
-        woId: verdict.wo_id,
-        ...(details ?? {}),
-        reason,
-        prUrl,
-      },
-      'merge-coordinator.merge_skipped'
-    );
+    const skipFields = {
+      verdictId: verdict.id,
+      runId: verdict.run_id,
+      woId: verdict.wo_id,
+      ...(details ?? {}),
+      reason,
+      prUrl,
+    };
+    if (reason === 'repo_not_allowed' && !warnedRepoNotAllowed.has(verdict.id)) {
+      if (warnedRepoNotAllowed.size >= REPO_NOT_ALLOWED_WARN_MAX) warnedRepoNotAllowed.clear();
+      warnedRepoNotAllowed.add(verdict.id);
+      (options.logger ?? log).warn(skipFields, 'merge-coordinator.merge_skipped');
+    } else {
+      (options.logger ?? log).info(skipFields, 'merge-coordinator.merge_skipped');
+    }
   };
 
   const policy = (options.readPolicy ?? readOverseerActionPolicyFromEnv)();

@@ -3,6 +3,7 @@ import {
   DEFAULT_MERGE_REPO_POLICY,
   getRepoBasePolicy,
   hasRepoPolicyEntry,
+  resolveMergeRepoPolicy,
   unattendedBasesForRepo,
 } from '../merge-repo-policy.ts';
 
@@ -72,6 +73,72 @@ describe('default merge repo policy -- production bases stay closed', () => {
         expect(base).not.toBe('main');
         expect(base).not.toBe('master');
       }
+    }
+  });
+});
+
+// WO-HARNESS-MERGE-POLICY-PROVISIONER-AND-REPO-SKIP-LINE-01 (bdc-xo#5581)
+describe('provisioner main and the additive environment value', () => {
+  const PROV = 'thinmansoftware/comicstoreos-provisioner';
+  const quiet = { warn: (): void => undefined };
+
+  test('1: the default policy lists the provisioner main as unattended, nothing else for it', () => {
+    expect(getRepoBasePolicy(PROV, 'main', policy)).toEqual({ unattended: true, docsOnly: 'skip' });
+    expect(getRepoBasePolicy(PROV, 'staging', policy)).toBeUndefined();
+    expect(getRepoBasePolicy(PROV, 'release/x', policy)).toBeUndefined();
+    // every other repository keeps exactly the entries it had
+    expect(Object.keys(policy).sort()).toEqual(
+      [
+        'thinmansoftware/bdc-harness',
+        'thinmansoftware/bdc-shopify-app',
+        'thinmansoftware/bdc-xo',
+        'thinmansoftware/comicstoreos-provisioner',
+        'thinmansoftware/lspro-react',
+        'thinmansoftware/shopops',
+        'thinmansoftware/shopops-storefront',
+      ].sort()
+    );
+  });
+
+  test('7a: an environment value that omits the provisioner still lists it (additive)', () => {
+    const live =
+      '{"thinmansoftware/bdc-harness":{"dev":{"unattended":true,"docs_only":"skip"}},"thinmansoftware/bdc-ci":{"main":{"unattended":true,"docs_only":"merge"}}}';
+    const resolved = resolveMergeRepoPolicy({ rawPolicy: live });
+    expect(getRepoBasePolicy(PROV, 'main', resolved)?.unattended).toBe(true);
+    // the value wins for the repositories it names (bdc-harness has only dev here) and adds bdc-ci
+    expect(getRepoBasePolicy('thinmansoftware/bdc-harness', 'dev', resolved)?.unattended).toBe(
+      true
+    );
+    expect(getRepoBasePolicy('thinmansoftware/bdc-harness', 'staging', resolved)).toBeUndefined();
+    expect(hasRepoPolicyEntry('thinmansoftware/bdc-ci', resolved)).toBe(true);
+  });
+
+  test('7b: an empty object for a default repository lists it with nothing allowed; others unchanged', () => {
+    const resolved = resolveMergeRepoPolicy({ rawPolicy: '{"thinmansoftware/shopops":{}}' });
+    expect(hasRepoPolicyEntry('thinmansoftware/shopops', resolved)).toBe(true);
+    expect([...unattendedBasesForRepo('thinmansoftware/shopops', resolved)]).toEqual([]);
+    expect(getRepoBasePolicy('thinmansoftware/shopops', 'staging', resolved)).toBeUndefined();
+    expect(getRepoBasePolicy(PROV, 'main', resolved)?.unattended).toBe(true);
+    expect(getRepoBasePolicy('thinmansoftware/bdc-xo', 'main', resolved)).toEqual(
+      DEFAULT_MERGE_REPO_POLICY['thinmansoftware/bdc-xo']?.main
+    );
+  });
+
+  test('7c: a malformed environment value is still the EMPTY policy (fails closed)', () => {
+    expect(resolveMergeRepoPolicy({ rawPolicy: 'not json' })).toEqual({});
+    expect(resolveMergeRepoPolicy({ rawPolicy: '{"thinmansoftware/bdc-xo":{"main":nope' })).toEqual(
+      {}
+    );
+    expect(quiet.warn).toBeDefined();
+  });
+
+  test('without the environment value the default policy is used unchanged', () => {
+    const saved = process.env.MERGE_MANAGER_REPO_POLICY;
+    delete process.env.MERGE_MANAGER_REPO_POLICY;
+    try {
+      expect(resolveMergeRepoPolicy({})).toEqual(DEFAULT_MERGE_REPO_POLICY);
+    } finally {
+      if (saved !== undefined) process.env.MERGE_MANAGER_REPO_POLICY = saved;
     }
   });
 });
