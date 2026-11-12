@@ -277,6 +277,19 @@ export async function getOverseerWatchRunById(runId: string): Promise<OverseerWa
 }
 
 /**
+ * The user_message of one workflow run (null when the run does not exist). The work order of a run
+ * lives on a `WO_ID=<id>` line of this message; callers parse it with `userMessageWoId`
+ * (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01).
+ */
+export async function getWorkflowRunUserMessage(runId: string): Promise<string | null> {
+  const result = await getDatabase().query<{ user_message: string | null }>(
+    'SELECT user_message FROM remote_agent_workflow_runs WHERE id = $1',
+    [runId]
+  );
+  return result.rows[0]?.user_message ?? null;
+}
+
+/**
  * The user_message of every currently ACTIVE workflow run, so the merge bridge
  * can defer merging a PR while a run for the same WO is still executing
  * (bdc-harness #1046). Active statuses match the in-flight set used elsewhere
@@ -320,10 +333,32 @@ export async function listOriginatingRunCandidates(input: {
   repo: string;
   number: number;
   headRef?: string;
+  /**
+   * Basename of a run worktree (for example `task-web-worker-1794491823473-n2cbqh`), taken from a
+   * salvage branch name `salvage/opus-repair-<basename>-<pid>`. A salvage fallback PR is pushed from
+   * the run's worktree under that branch, so neither the branch-ends-the-path match nor the
+   * open-pr node output names it (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01). Optional: absent
+   * keeps the query exactly as before.
+   */
+  salvageWorktree?: string;
 }): Promise<OriginatingRunCandidateRow[]> {
   const db = getDatabase();
   const rows: OriginatingRunCandidateRow[] = [];
   const headRef = (input.headRef ?? '').trim();
+  const salvageWorktree = (input.salvageWorktree ?? '').trim();
+  if (salvageWorktree) {
+    const bySalvage = await db.query<OriginatingRunCandidateRow>(
+      `SELECT r.id AS id, r.status AS status, r.started_at AS started_at,
+              r.working_path AS working_path, c.name AS codebase_name,
+              c.repository_url AS codebase_url, NULL AS event_data
+       FROM remote_agent_workflow_runs r
+       LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
+       WHERE r.workflow_name != 'pr-discovery'
+         AND replace(r.working_path, $2, '/') LIKE $1`,
+      [`%/${salvageWorktree}`, String.fromCharCode(92)]
+    );
+    rows.push(...bySalvage.rows);
+  }
   if (headRef) {
     const byBranch = await db.query<OriginatingRunCandidateRow>(
       `SELECT r.id AS id, r.status AS status, r.started_at AS started_at,
