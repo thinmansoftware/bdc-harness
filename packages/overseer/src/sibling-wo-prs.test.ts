@@ -155,9 +155,20 @@ describe('reconcile supersede: a sibling that does not name the work order', () 
         deps.actions.filter(action => action.action === RECONCILE_SUPERSEDE_ACTION),
         doubt.name
       ).toEqual([]);
-      expect(deps[doubt.level], doubt.name).toContain(
-        'overseer.reconcile.supersede_lookup_unmatched'
-      );
+      if (doubt.level === 'warnings') {
+        expect(deps.warnings, doubt.name).toContain(
+          'overseer.reconcile.supersede_lookup_unmatched'
+        );
+      } else {
+        // "no originating run" and "another work order" are the ordinary case: counted per pass in
+        // overseer.reconcile.call_counts, never one log line per pull request (15,918 lines in 24 minutes).
+        expect(deps.warnings, doubt.name).not.toContain(
+          'overseer.reconcile.supersede_lookup_unmatched'
+        );
+        expect(deps.infos, doubt.name).not.toContain(
+          'overseer.reconcile.supersede_lookup_unmatched'
+        );
+      }
     }
   });
 
@@ -223,7 +234,8 @@ describe('reconcile supersede: a sibling that does not name the work order', () 
     await runReconcileOnce({ deps });
 
     expect(deps.pullCloses).toEqual([]);
-    expect(deps.resolveCalls.sort()).toEqual([106, 107]);
+    // 107 is a person's branch: it never reaches the resolver (the bound that keeps the pass cheap).
+    expect(deps.resolveCalls.sort()).toEqual([106]);
   });
 });
 

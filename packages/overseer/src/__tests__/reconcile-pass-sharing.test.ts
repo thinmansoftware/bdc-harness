@@ -176,3 +176,61 @@ describe('reconcile pass: one open-PR list per repository', () => {
     expect(countsOf(deps.logs)['pages:merged_trackers']).toBe(1);
   });
 });
+
+describe('reconcile pass: the originating-run lookup is bounded (health stall, 2026-11-12)', () => {
+  test("N merged PRs x M open PRs ask the resolver once per Cauldron-branch PR, never for a person's branch", async () => {
+    const wos = ['AAA', 'BBB', 'CCC', 'DDD', 'EEE', 'FFF'];
+    const merged = wos.map((wo, index) =>
+      mergedPr({ number: 201 + index, body: `WO: WO-${wo}-01\n`, baseRef: 'dev' })
+    );
+    const opens = [
+      ...[301, 302, 303, 304].map(n =>
+        openPr(n, 'fallback text', 'bdc-harness', `salvage/opus-repair-task-${n}-1`)
+      ),
+      openPr(305, "a person's PR", 'bdc-harness', 'someone/fix-typo'),
+      openPr(306, "another person's PR", 'bdc-harness', 'feat/something-else'),
+    ];
+    const deps = sharingDeps({ merged, opens: { 'bdc-harness': opens } });
+    const asked: number[] = [];
+    deps.resolveOriginatingWoId = async request => {
+      asked.push(request.number);
+      return { kind: 'none' };
+    };
+
+    await runReconcileOnce({ deps });
+
+    // 6 merged x 6 open = 36 pairs would have been 36 lookups; now 4 (one per salvage PR), 0 for people.
+    expect(asked.sort()).toEqual([301, 302, 303, 304]);
+    const counts = countsOf(deps.logs);
+    expect(counts['calls:resolveOriginatingWoId']).toBe(24);
+    expect(counts['supersede_lookup:reads']).toBe(4);
+    expect(counts['supersede_lookup:memo_hits']).toBe(20);
+    expect(counts['supersede_lookup:skipped_branch']).toBe(12);
+    expect(counts['supersede_lookup:no_originating_run']).toBe(24);
+    expect(typeof counts.pass_ms).toBe('number');
+    expect(deps.closes).toEqual([]);
+  });
+
+  test('a failed lookup is not remembered inside the pass', async () => {
+    const deps = sharingDeps({
+      merged: [
+        mergedPr({ number: 201, body: 'WO: WO-AAA-01\n', baseRef: 'dev' }),
+        mergedPr({ number: 202, body: 'WO: WO-BBB-01\n', baseRef: 'dev' }),
+      ],
+      opens: {
+        'bdc-harness': [openPr(301, 'fallback', 'bdc-harness', 'salvage/opus-repair-task-301-1')],
+      },
+    });
+    let calls = 0;
+    deps.resolveOriginatingWoId = async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('event store busy');
+      return { kind: 'one', woId: 'WO-BBB-01' };
+    };
+
+    await runReconcileOnce({ deps });
+
+    expect(calls).toBe(2);
+    expect(deps.closes.map(close => close.number)).toEqual([301]);
+  });
+});

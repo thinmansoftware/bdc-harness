@@ -371,10 +371,12 @@ export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<R
   const logger = baseDeps.log ?? log;
   const previous = activeReadCounts;
   activeReadCounts = counts;
+  const startedAt = Date.now();
   try {
     return await runReconcilePass({ ...input, deps });
   } finally {
     activeReadCounts = previous;
+    counts.pass_ms = Date.now() - startedAt;
     logger.info?.({ counts }, 'overseer.reconcile.call_counts');
   }
 }
@@ -424,6 +426,28 @@ function withPassSharing(deps: ReconcileDeps, counts: Record<string, number>): R
         items: read.items.filter(item => !closedThisPass.has(`${key}#${item.number}`)),
         truncated: read.truncated,
       };
+    };
+  }
+  if (deps.resolveOriginatingWoId) {
+    // One resolution per pull request per pass: the supersede pass asks once per MERGED pull request,
+    // and the answer for a given open pull request does not change inside one pass.
+    const resolve = deps.resolveOriginatingWoId;
+    const memo = new Map<string, ReturnType<typeof resolve>>();
+    result.resolveOriginatingWoId = (input): ReturnType<typeof resolve> => {
+      const key =
+        `${input.owner}/${input.repo}#${String(input.number)}@${input.headRefName}`.toLowerCase();
+      counts['calls:resolveOriginatingWoId'] = (counts['calls:resolveOriginatingWoId'] ?? 0) + 1;
+      let pending = memo.get(key);
+      if (pending) {
+        counts['supersede_lookup:memo_hits'] = (counts['supersede_lookup:memo_hits'] ?? 0) + 1;
+        return pending;
+      }
+      counts['supersede_lookup:reads'] = (counts['supersede_lookup:reads'] ?? 0) + 1;
+      pending = resolve(input);
+      memo.set(key, pending);
+      // A failed lookup is not remembered: the next merged PR asks again.
+      pending.catch(() => memo.delete(key));
+      return pending;
     };
   }
   if (deps.closePullRequest) {
@@ -1145,6 +1169,9 @@ function siblingCreatedBeforeMerge(
  * ambiguous answer is logged at warn; an empty answer or another work order's id is the ordinary case
  * for any PR that Cauldron did not open for this work order and is logged at info.
  */
+/** Engine-made branch names: a salvage fallback PR, or a bare run branch. */
+const CAULDRON_RUN_BRANCH = /^(?:salvage\/opus-repair-|archon\/)/;
+
 async function matchThroughOriginatingRun(
   candidate: ReconcileRepoOpenPullRequest,
   pr: ReconcileMergedPullRequest,
@@ -1153,6 +1180,16 @@ async function matchThroughOriginatingRun(
   logger: ReconcileLogger
 ): Promise<string | null> {
   const prRef = `${pr.owner}/${pr.repo}#${candidate.number}`;
+  // Only a pull request a Cauldron run opened under an engine branch can have an originating run the
+  // body and branch rules could not see: a salvage fallback PR (`salvage/opus-repair-<worktree>-<pid>`)
+  // or a bare run branch (`archon/...`). Every other branch (a person's, a work-order token branch the
+  // earlier rules already matched) never reaches the event store. Without this bound the pass asked for
+  // every open PR once per merged PR (5,265 synchronous SQLite lookups a pass on 2026-11-12, which
+  // starved the container's health check).
+  if (!CAULDRON_RUN_BRANCH.test(candidate.headRefName)) {
+    countRead('supersede_lookup:skipped_branch');
+    return null;
+  }
   let resolution: Awaited<ReturnType<ResolveOriginatingWoId>>;
   try {
     resolution = await resolve({
@@ -1176,18 +1213,13 @@ async function matchThroughOriginatingRun(
     return null;
   }
   if (resolution.kind === 'none') {
-    logger.info?.(
-      { prRef, reason: 'no_originating_run' },
-      'overseer.reconcile.supersede_lookup_unmatched'
-    );
+    // The ordinary case: counted per pass (call_counts), not logged per pull request.
+    countRead('supersede_lookup:no_originating_run');
     return null;
   }
   const woId = resolution.woId.toUpperCase();
   if (!stems.includes(woId)) {
-    logger.info?.(
-      { prRef, reason: 'other_work_order', woId },
-      'overseer.reconcile.supersede_lookup_unmatched'
-    );
+    countRead('supersede_lookup:other_work_order');
     return null;
   }
   return woId;
