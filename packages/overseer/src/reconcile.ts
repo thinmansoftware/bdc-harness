@@ -301,6 +301,7 @@ export interface OctokitLike {
           state: string;
           pull_request?: unknown;
           repository_url?: string;
+          updated_at?: string;
         }[];
       };
     }>;
@@ -1776,12 +1777,35 @@ export async function listIssueComments(
   );
 }
 
+/**
+ * Cross-run cache of the changed file paths of a MERGED pull request, keyed by repository, number and
+ * merge commit (WO-HARNESS-OVERSEER-GITHUB-READ-BUDGET-01 part 2, bdc-xo#5571). The list of a merged
+ * pull request never changes once its merge commit exists, and the reconcile pass re-read it on every run
+ * for the same pull requests (the interpolated `pulls/:n/files` rows of the call-site log). A truncated
+ * or failed read is never cached; a pull request without a merge commit is never cached.
+ */
+const MERGED_PR_FILES_CACHE_MAX = 2000;
+const mergedPullRequestFilesCache = new Map<string, readonly string[]>();
+
+/** Test seam: forget the cross-run reconcile caches. */
+export function resetReconcileReadCaches(): void {
+  mergedPullRequestFilesCache.clear();
+  mergedPullRequestCache.clear();
+}
+
 /** Reader 4: changed file paths of a merged PR (spec-only guard input). */
 export async function listPullRequestFilePaths(
   octokit: OctokitLike,
-  pr: Pick<ReconcileMergedPullRequest, 'owner' | 'repo' | 'number'>
+  pr: Pick<ReconcileMergedPullRequest, 'owner' | 'repo' | 'number'> & {
+    mergeCommitSha?: string | null;
+  }
 ): Promise<PagedRead<string>> {
-  return readPages(
+  const cacheKey = pr.mergeCommitSha
+    ? `${pr.owner}/${pr.repo}#${pr.number}@${pr.mergeCommitSha}`.toLowerCase()
+    : '';
+  const cached = cacheKey ? mergedPullRequestFilesCache.get(cacheKey) : undefined;
+  if (cached) return { items: [...cached], truncated: false };
+  const read = await readPages(
     async page =>
       (
         await octokit.pulls.listFiles({
@@ -1795,6 +1819,15 @@ export async function listPullRequestFilePaths(
     row => (typeof row.filename === 'string' ? row.filename : null),
     PR_FILES_MAX_PAGES
   );
+  if (cacheKey && !read.truncated) {
+    mergedPullRequestFilesCache.delete(cacheKey);
+    mergedPullRequestFilesCache.set(cacheKey, [...read.items]);
+    if (mergedPullRequestFilesCache.size > MERGED_PR_FILES_CACHE_MAX) {
+      const oldest = mergedPullRequestFilesCache.keys().next().value;
+      if (oldest !== undefined) mergedPullRequestFilesCache.delete(oldest);
+    }
+  }
+  return read;
 }
 
 async function resolveSearchSince(input: RunReconcileInput, deps: ReconcileDeps): Promise<string> {
@@ -1825,6 +1858,21 @@ export async function searchMergedPullRequests(
 ): Promise<ReconcileMergedPullRequest[]> {
   return (await searchMergedPullRequestsPaged(octokit, input)).items;
 }
+
+/**
+ * Cross-run cache of merged pull request details (WO-HARNESS-OVERSEER-GITHUB-READ-BUDGET-01 part 2,
+ * bdc-xo#5571). Every reconcile run rescans the last RECONCILE_MIN_LOOKBACK_DAYS (7) days of merged pull
+ * requests and read each one with `pulls.get`: the interpolated `pulls/:n` rows, 4,654 calls in the hour
+ * 2026-11-12 01:15Z to 02:15Z. A merged pull request's data changes only when GitHub bumps its
+ * `updated_at`, and the search item already carries it, so a cached entry is reused only while the
+ * search item's `updated_at` equals the cached one; any change re-reads it. Only merged pull requests
+ * are cached; an item with no `updated_at` is never served from the cache.
+ */
+const MERGED_PR_CACHE_MAX = 5000;
+const mergedPullRequestCache = new Map<
+  string,
+  { updatedAt: string; value: ReconcileMergedPullRequest }
+>();
 
 export async function searchMergedPullRequestsPaged(
   octokit: OctokitLike,
@@ -1865,12 +1913,19 @@ export async function searchMergedPullRequestsPaged(
         if (!repo) continue;
         const refKey = `${repo.owner}/${repo.repo}#${item.number}`;
         if (results.has(refKey)) continue;
+        const updatedAt = typeof item.updated_at === 'string' ? item.updated_at : '';
+        const cacheKey = refKey.toLowerCase();
+        const cached = updatedAt ? mergedPullRequestCache.get(cacheKey) : undefined;
+        if (cached?.updatedAt === updatedAt) {
+          results.set(refKey, { ...cached.value });
+          continue;
+        }
         const pr = await octokit.pulls.get({
           owner: repo.owner,
           repo: repo.repo,
           pull_number: item.number,
         });
-        results.set(refKey, {
+        const value: ReconcileMergedPullRequest = {
           owner: repo.owner,
           repo: repo.repo,
           number: item.number,
@@ -1882,7 +1937,16 @@ export async function searchMergedPullRequestsPaged(
           mergeCommitSha: pr.data.merge_commit_sha,
           mergedAt: pr.data.merged_at,
           baseRef: pr.data.base?.ref ?? null,
-        });
+        };
+        results.set(refKey, value);
+        if (updatedAt && value.merged) {
+          mergedPullRequestCache.delete(cacheKey);
+          mergedPullRequestCache.set(cacheKey, { updatedAt, value: { ...value } });
+          if (mergedPullRequestCache.size > MERGED_PR_CACHE_MAX) {
+            const oldest = mergedPullRequestCache.keys().next().value;
+            if (oldest !== undefined) mergedPullRequestCache.delete(oldest);
+          }
+        }
       }
       // Fewer than a full page means the query is exhausted.
       if (items.length < OPEN_PR_SEARCH_PAGE_SIZE) {
