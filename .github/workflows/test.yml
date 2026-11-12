@@ -147,6 +147,7 @@ jobs:
           ./scripts/dispatch-worker/restart-evidence.test.ts
           ./scripts/dispatch-worker/seat-preflight.cursor.test.ts
           ./scripts/dispatch-worker/seat-preflight.test.ts
+          ./scripts/dispatch-worker/start-windows.test.ts
           ./scripts/dispatch-worker/stdin-prompt.test.ts
           ./scripts/dispatch-worker/watchdog.test.ts
           ./scripts/dispatch-worker/worker-log.test.ts
