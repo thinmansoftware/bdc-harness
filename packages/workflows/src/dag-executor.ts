@@ -144,7 +144,7 @@ import type {
   RunOutcome,
   TerminalWorkflowPersistence,
 } from './reliability/types';
-import { withRunLease } from './run-lease';
+import { runLeaseGapSeconds, withRunLease } from './run-lease';
 import { DEFAULT_CLAUDE_FAILOVER_MODEL, isReviewNode } from './reliability/seat-node-failover';
 import {
   NODE_TOKEN_ENV,
@@ -6304,6 +6304,7 @@ async function executeDagWorkflowInternal(
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
     if (deps.isRunLeaseValid?.() === false) {
       getLog().warn({ workflowRunId: workflowRun.id }, 'dag.run_lease_lost');
+      await writeRunLeaseLostEvent(deps, workflowRun.id, 'layer_boundary');
       return;
     }
     const layer = layers[layerIdx];
@@ -7330,6 +7331,7 @@ async function executeDagWorkflowInternal(
 
   if (deps.isRunLeaseValid?.() === false) {
     getLog().warn({ workflowRunId: workflowRun.id }, 'dag.run_lease_lost_before_terminal');
+    await writeRunLeaseLostEvent(deps, workflowRun.id, 'before_terminal');
     return;
   }
 
@@ -7831,11 +7833,47 @@ async function executeDagWorkflowInternal(
   return terminalOutput;
 }
 
+/**
+ * WO-HARNESS-RUN-LEASE-LOST-SAYS-SO-01: the executor stops a run whose lease was lost at two points. Before
+ * this, nothing was written, so the run ended with the backstop's generic message. Now one `run_lease_lost`
+ * event says where it stopped and the measured numbers, and the loss descriptor remembers where, for the
+ * backstop's failure message. Never throws: the event is a note, the stop itself is unchanged.
+ */
+async function writeRunLeaseLostEvent(
+  deps: WorkflowDeps,
+  runId: string,
+  where: 'layer_boundary' | 'before_terminal'
+): Promise<void> {
+  const loss = deps.getRunLeaseLoss?.() ?? null;
+  if (loss) loss.stoppedAt = where;
+  const leaseClock = deps.runLeaseTiming?.now ?? ((): Date => new Date());
+  try {
+    await deps.store.createWorkflowEvent({
+      workflow_run_id: runId,
+      event_type: 'run_lease_lost',
+      data: {
+        where,
+        reason: loss?.reason ?? 'unknown',
+        last_renewed_at: loss?.lastRenewedAt ?? null,
+        expires_at: loss?.expiresAt ?? null,
+        detected_at: loss?.detectedAt ?? null,
+        gap_seconds: loss ? runLeaseGapSeconds(loss, leaseClock()) : null,
+      },
+    });
+  } catch (err) {
+    getLog().warn({ err: err as Error, workflowRunId: runId }, 'dag.run_lease_lost_event_failed');
+  }
+}
+
 export const executeDagWorkflow: typeof executeDagWorkflowInternal = (...args) => {
   const [deps, , , , , workflowRun] = args;
   const [, ...executionArgs] = args;
-  return withRunLease(deps.store, workflowRun.id, isRunLeaseValid =>
-    executeDagWorkflowInternal({ ...deps, isRunLeaseValid }, ...executionArgs)
+  return withRunLease(
+    deps.store,
+    workflowRun.id,
+    (isRunLeaseValid, getRunLeaseLoss) =>
+      executeDagWorkflowInternal({ ...deps, isRunLeaseValid, getRunLeaseLoss }, ...executionArgs),
+    deps.runLeaseTiming
   );
 };
 interface BunRuntimeResolutionOptions {
