@@ -16,16 +16,18 @@ A salvage fallback PR has neither (fixed body text, branch `salvage/opus-repair-
 
 The branch is never deleted. Reopen the PR if the salvage commit is still wanted.
 
-## The guard: any doubt leaves the PR open
+## The guard: any doubt leaves the PR open, and the lookup is bounded
 
-The lookup must return exactly one WO id, from every run that opened the PR, and that id must be a declared work order of the merged PR. Otherwise the PR is left open and one line `overseer.reconcile.supersede_lookup_unmatched` is logged with a `reason`:
+The lookup must return exactly one WO id, from every run that opened the PR, and that id must be a declared work order of the merged PR. Otherwise the PR is left open.
 
-| reason | level | meaning |
+Bound (2026-11-12, after the rebuild at 17:44Z made the container miss health checks): the question is asked ONLY for a pull request whose head branch is an engine branch, `salvage/opus-repair-*` (a salvage fallback PR) or `archon/*` (a bare run branch), and ONCE per pull request per reconcile pass (a per-pass memo; a failed lookup is not remembered). A person's branch, or a work-order token branch the body and branch rules already match, never reaches the event store. Before the bound the pass asked for every open PR of the repository once per merged PR: 5,252 to 5,265 synchronous SQLite lookups a pass; bun:sqlite blocks the event loop, and the container's metering tick came 4.8 to 51.9 seconds late in 13 of 21 minutes. Yield (2026-11-12, after the forward rebuild showed health probes of 4.05 s with the bound in place): each real read first waits one macrotask (`setImmediate`), because reads that settle in the same tick only yield microtasks and N of them in a row hold the loop for N times the cost of one; the loop is never blocked longer than a single read.
+
+| signal | level | meaning |
 |---|---|---|
-| `lookup_failed` | warn | the event store read threw |
-| `ambiguous` | warn | several runs, different WO ids, or a run without one |
-| `no_originating_run` | info | Cauldron did not open this PR (the ordinary case for a human PR) |
-| `other_work_order` | info | the PR belongs to a different work order |
+| `overseer.reconcile.supersede_lookup_unmatched`, `reason: lookup_failed` | warn | the event store read threw |
+| `overseer.reconcile.supersede_lookup_unmatched`, `reason: ambiguous` | warn | several runs, different WO ids, or a run without one |
+| `supersede_lookup:no_originating_run`, `:other_work_order`, `:skipped_branch` | counted in `overseer.reconcile.call_counts` | the ordinary cases; not logged per pull request (15,918 lines in 24 minutes) |
+| `supersede_lookup:reads` and `:memo_hits`, `calls:resolveOriginatingWoId`, `pass_ms` | counted in `overseer.reconcile.call_counts` | how many lookups reached the store, how many the memo answered, the lookups asked for, and the pass duration in milliseconds |
 
 A salvage PR is found through the worktree basename inside its branch name (`salvage/opus-repair-<worktree>-<pid>`).
 
