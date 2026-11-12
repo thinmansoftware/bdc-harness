@@ -310,4 +310,46 @@ describe('merge queue notes: every queued pull request is labelled and commented
     expect(q.reads.get(102)).toBe(2);
     expect(q.comments.get(102)).toHaveLength(1);
   });
+
+  test('Test 9: a label that failed to land is retried after the recheck window, without a second comment', async () => {
+    const q = queue(3);
+    let labelFailures = 1;
+    const add = q.github.addPullRequestLabels!;
+    q.github.addPullRequestLabels = async input => {
+      if (input.number === 102 && labelFailures > 0) {
+        labelFailures -= 1;
+        throw new Error('label api down');
+      }
+      return add(input);
+    };
+
+    let at = NOW;
+    // the earliest reservation moves with the clock, so the head's own notice keeps posting on later sweeps
+    q.store.getEarliestMergeSlotReservation = async () =>
+      new Date(at.getTime() - 50 * 60 * 1000).toISOString();
+    const sweepAt = (when: Date): Promise<void> => {
+      at = when;
+      return q.sweep(when);
+    };
+
+    await sweepAt(NOW);
+    // the comment landed, the label did not
+    expect(q.comments.get(102)).toHaveLength(1);
+    expect(q.labels.get(102)).toBeUndefined();
+    expect(q.reads.get(102)).toBe(1);
+
+    // inside the window nothing is re-read
+    await sweepAt(new Date(NOW.getTime() + QUEUE_NOTE_RECHECK_MS - 1000));
+    expect(q.reads.get(102)).toBe(1);
+
+    // after the window the label is retried and the comment is not repeated
+    await sweepAt(new Date(NOW.getTime() + QUEUE_NOTE_RECHECK_MS + 1000));
+    expect(q.reads.get(102)).toBe(2);
+    expect(q.labels.get(102)).toEqual(['merge-queued']);
+    expect(q.comments.get(102)).toHaveLength(1);
+
+    // and now it is final: no further read
+    await sweepAt(new Date(NOW.getTime() + 3 * QUEUE_NOTE_RECHECK_MS));
+    expect(q.reads.get(102)).toBe(2);
+  });
 });

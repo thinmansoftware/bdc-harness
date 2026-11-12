@@ -780,16 +780,18 @@ async function markMergeQueued(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
   pr: PullRequestEvidence
-): Promise<void> {
-  if (!pr.pr || !options.github.addPullRequestLabels) return;
-  if (pr.labels?.includes(MERGE_QUEUED_LABEL)) return;
+): Promise<boolean> {
+  if (!pr.pr || !options.github.addPullRequestLabels) return false;
+  if (pr.labels?.includes(MERGE_QUEUED_LABEL)) return true;
   try {
     await options.github.addPullRequestLabels({ ...pr.pr, labels: [MERGE_QUEUED_LABEL] });
+    return true;
   } catch (error) {
     log.warn(
       { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
       'merge-coordinator.queued_label_failed'
     );
+    return false;
   }
 }
 
@@ -1570,11 +1572,14 @@ async function noteQueuedVerdict(
     queuePosition,
     configuredLimit(options.maxMergesPerHour)
   );
-  await markMergeQueued(options, verdict, pr);
-  // A note that did not post (comment API down) is retried after the recheck window, not on every sweep.
+  const labelled = await markMergeQueued(options, verdict, pr);
+  // A note is final only when BOTH the comment and the label are in place. A comment or label that did not
+  // land (API down) is retried after the recheck window, not on every sweep and not never (Overseer review of
+  // PR 1590, minor); the comment is guarded by its marker and head line, the label by the label list, so a
+  // retry never duplicates either.
   rememberQueueVisit(
     verdict.id,
-    notified ? Number.POSITIVE_INFINITY : now.getTime() + QUEUE_NOTE_RECHECK_MS
+    notified && labelled ? Number.POSITIVE_INFINITY : now.getTime() + QUEUE_NOTE_RECHECK_MS
   );
   return true;
 }
