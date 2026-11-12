@@ -443,7 +443,11 @@ function withPassSharing(deps: ReconcileDeps, counts: Record<string, number>): R
         return pending;
       }
       counts['supersede_lookup:reads'] = (counts['supersede_lookup:reads'] ?? 0) + 1;
-      pending = resolve(input);
+      // Each real read is synchronous SQLite plus a regex scan. Awaiting a promise that settles in the
+      // same tick only yields microtasks, so N reads in a row hold the event loop for N x (cost of one):
+      // the forward rebuild of 2026-11-12 showed health probes of 4 s. Yield to the macrotask queue
+      // (HTTP, timers, the metering tick) before every read so the loop is never blocked longer than one.
+      pending = new Promise<void>(settle => setImmediate(settle)).then(() => resolve(input));
       memo.set(key, pending);
       // A failed lookup is not remembered: the next merged PR asks again.
       pending.catch(() => memo.delete(key));

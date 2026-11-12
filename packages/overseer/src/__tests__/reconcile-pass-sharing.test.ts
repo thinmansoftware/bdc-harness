@@ -234,3 +234,41 @@ describe('reconcile pass: the originating-run lookup is bounded (health stall, 2
     expect(deps.closes.map(close => close.number)).toEqual([301]);
   });
 });
+
+describe('reconcile pass: the lookup never holds the event loop across reads (forward rebuild probes of 4 s)', () => {
+  test('a macrotask runs between two consecutive real reads', async () => {
+    const deps = sharingDeps({
+      merged: [mergedPr({ number: 201, body: 'WO: WO-AAA-01\n', baseRef: 'dev' })],
+      opens: {
+        'bdc-harness': [301, 302, 303, 304, 305].map(n =>
+          openPr(n, 'fallback', 'bdc-harness', `salvage/opus-repair-task-${n}-1`)
+        ),
+      },
+    });
+    let macrotasks = 0;
+    let running = true;
+    const pump = (): void => {
+      if (!running) return;
+      macrotasks += 1;
+      setImmediate(pump);
+    };
+    setImmediate(pump);
+    const seen: number[] = [];
+    deps.resolveOriginatingWoId = async () => {
+      // synchronous work, like the SQLite read: no await inside
+      seen.push(macrotasks);
+      return { kind: 'none' };
+    };
+
+    await runReconcileOnce({ deps });
+    running = false;
+
+    expect(seen.length).toBe(5);
+    // Without the yield all five reads start inside one macrotask (all values equal).
+    for (let i = 1; i < seen.length; i += 1) {
+      expect(seen[i], `read ${i + 1} ran in the same macrotask as read ${i}`).toBeGreaterThan(
+        seen[i - 1]
+      );
+    }
+  });
+});
