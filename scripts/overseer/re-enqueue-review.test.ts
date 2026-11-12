@@ -16,6 +16,8 @@ import { reviewSubjectKey } from '../../packages/overseer/src/pr-review-wiring';
 import {
   createHttpPort,
   decide,
+  edgeSweep,
+  EDGE_SWEEP_REASON,
   reEnqueue,
   show,
   type DispatchPort,
@@ -416,5 +418,128 @@ describe('packaging', () => {
   test('8: the image carries the script', () => {
     const dockerfile = readFileSync(join(import.meta.dir, '..', '..', 'Dockerfile'), 'utf8');
     expect(dockerfile).toContain('scripts/overseer/re-enqueue-review.ts');
+  });
+});
+
+describe('rebuild-edge sweep', () => {
+  const since = '2026-11-12T14:58:52.000Z';
+  const until = '2026-11-12T15:03:31.000Z';
+  const transport = JSON.stringify({
+    disposition: 'submission_failed',
+    reason: 'head_recheck_failed:Service Unavailable',
+  });
+
+  function failedRow(
+    headSha: string,
+    completedAt: string,
+    resultBody: string,
+    id: string
+  ): ReviewRow {
+    counter += 1;
+    return {
+      id,
+      status: 'failed',
+      body: body(headSha),
+      created_at: new Date(Date.UTC(2026, 10, 12, 14, 58, counter)).toISOString(),
+      seq: counter,
+      task_type: 'run_review',
+      completed_at: completedAt,
+      result_body: resultBody,
+    };
+  }
+
+  function sweepPort(all: ReviewRow[]): { port: DispatchPort; sent: OutgoingMessage[] } {
+    const sent: OutgoingMessage[] = [];
+    const port: DispatchPort = {
+      list: async subjectKey => all.filter(() => subjectKey === subject),
+      listFailed: async () => all.filter(row => row.status === 'failed'),
+      send: async message => {
+        sent.push(message);
+        return { id: `new-${sent.length}`, status: 'queued' };
+      },
+    };
+    return { port, sent };
+  }
+
+  test('re-enqueues a head that failed on a transport reason inside the window, once, with the edge reason', async () => {
+    // The shape read from PR 101: a failed row, then cancelled duplicates created after it.
+    const failed = failedRow(head, '2026-11-12T15:01:51.732Z', transport, 'failed-1');
+    const duplicates = Array.from({ length: 3 }, () => row('cancelled', head));
+    const { port, sent } = sweepPort([failed, ...duplicates]);
+
+    const result = await edgeSweep(port, { since, until }, { dryRun: false });
+
+    expect(result.code).toBe(0);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].repeat_reason).toContain(EDGE_SWEEP_REASON);
+    expect(sent[0].body).toBe(failed.body);
+    expect(result.lines.at(-1)).toBe(
+      `EDGE_SWEEP window=${since}..${until} candidates=1 reenqueued=1 refused=0 errors=0`
+    );
+  });
+
+  test('ignores a failure outside the window and a failure that is a verdict, not transport', async () => {
+    const before = failedRow(head, '2026-11-12T14:00:00.000Z', transport, 'before');
+    const after = failedRow('c'.repeat(40), '2026-11-12T16:00:00.000Z', transport, 'after');
+    const verdict = failedRow(
+      'd'.repeat(40),
+      '2026-11-12T15:01:00.000Z',
+      JSON.stringify({ disposition: 'review_incomplete', reason: 'review_body_credential_leak' }),
+      'verdict'
+    );
+    const { port, sent } = sweepPort([before, after, verdict]);
+    const result = await edgeSweep(port, { since, until }, { dryRun: false });
+    expect(sent).toHaveLength(0);
+    expect(result.lines.at(-1)).toContain('candidates=0 reenqueued=0');
+  });
+
+  test('a head that already has a newer finished review is refused and left alone', async () => {
+    const failed = failedRow(head, '2026-11-12T15:01:51.732Z', transport, 'failed-2');
+    const newer = row('done', head);
+    const { port, sent } = sweepPort([failed, newer]);
+    const result = await edgeSweep(port, { since, until }, { dryRun: false });
+    expect(sent).toHaveLength(0);
+    expect(result.code).toBe(0);
+    expect(result.lines.at(-1)).toContain('candidates=1 reenqueued=0 refused=1 errors=0');
+  });
+
+  test('the same head failing twice is swept once, and a dry run sends nothing', async () => {
+    const a = failedRow(head, '2026-11-12T15:00:00.000Z', transport, 'a');
+    const b = failedRow(head, '2026-11-12T15:01:00.000Z', transport, 'b');
+    const real = sweepPort([a, b]);
+    await edgeSweep(real.port, { since, until }, { dryRun: false });
+    expect(real.sent).toHaveLength(1);
+    const dry = sweepPort([a, b]);
+    const result = await edgeSweep(dry.port, { since, until }, { dryRun: true });
+    expect(dry.sent).toHaveLength(0);
+    expect(result.lines.at(-1)).toContain('(dry run)');
+  });
+
+  test('a bad window or a port that cannot list failed rows stops with a plain line', async () => {
+    const { port } = sweepPort([]);
+    expect((await edgeSweep(port, { since: 'x', until }, { dryRun: false })).code).toBe(2);
+    expect((await edgeSweep(port, { since: until, until: since }, { dryRun: false })).code).toBe(2);
+    const noList: DispatchPort = {
+      list: async () => [],
+      send: async () => ({ id: 'x', status: 'queued' }),
+    };
+    expect((await edgeSweep(noList, { since, until }, { dryRun: false })).code).toBe(1);
+  });
+
+  test('the http port pages through the cursor form of the list route', async () => {
+    const urls: string[] = [];
+    const pages = [
+      { messages: [row('failed')], next_after_seq: 7, page_full: true },
+      { messages: [row('failed')], next_after_seq: 9, page_full: false },
+    ];
+    const fetchStub = (async (url: string) => {
+      urls.push(url);
+      return new Response(JSON.stringify(pages[urls.length - 1]), { status: 200 });
+    }) as unknown as typeof fetch;
+    const port = createHttpPort('http://x', 'tok', fetchStub);
+    const rows = await port.listFailed?.();
+    expect(rows).toHaveLength(2);
+    expect(urls[0]).toContain('recipient=overseer-reviewer&after_seq=0&status=failed&limit=500');
+    expect(urls[1]).toContain('after_seq=7&status=failed');
   });
 });

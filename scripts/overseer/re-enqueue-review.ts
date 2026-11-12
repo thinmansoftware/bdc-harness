@@ -55,6 +55,8 @@ export interface OutgoingMessage {
 export interface DispatchPort {
   /** Every review row of the subject, any order. */
   list(subjectKey: string): Promise<ReviewRow[]>;
+  /** Every FAILED review row of every pull request (the rebuild-edge sweep). */
+  listFailed?(): Promise<ReviewRow[]>;
   send(message: OutgoingMessage): Promise<{ id: string; status: string }>;
 }
 
@@ -207,6 +209,106 @@ export async function reEnqueue(
   };
 }
 
+/** The reason the sweep sends with every row it re-enqueues. */
+export const EDGE_SWEEP_REASON = 'failed at the rebuild edge';
+
+/** A transport-level failure reason (not a verdict): the service was briefly unavailable. */
+const TRANSPORT_FAILURE =
+  /submission_failed|Service Unavailable|rate_limited|head_recheck_failed|ECONNRESET|ETIMEDOUT/i;
+
+export interface EdgeSweepWindow {
+  /** ISO time the rebuild started draining. */
+  since: string;
+  /** ISO time the new container started (plus any slack the caller wants). */
+  until: string;
+}
+
+function edgeTarget(
+  row: ReviewRow
+): { repository: string; prNumber: number; head: string } | undefined {
+  try {
+    const parsed = JSON.parse(row.body) as {
+      owner?: unknown;
+      repo?: unknown;
+      prNumber?: unknown;
+      headSha?: unknown;
+    };
+    if (
+      typeof parsed.owner === 'string' &&
+      typeof parsed.repo === 'string' &&
+      typeof parsed.prNumber === 'number' &&
+      typeof parsed.headSha === 'string'
+    )
+      return {
+        repository: `${parsed.owner}/${parsed.repo}`,
+        prNumber: parsed.prNumber,
+        head: parsed.headSha.toLowerCase(),
+      };
+  } catch {
+    /* an unreadable body is not a candidate */
+  }
+  return undefined;
+}
+
+/**
+ * After a rebuild: re-enqueue, once, every head whose review FAILED between the start of the drain and
+ * the start of the new container with a transport reason (submission_failed, Service Unavailable,
+ * rate_limited ...). The failure is the restart's, not the pull request's (PR 101, 2026-11-12: a review
+ * claimed during the drain failed with "Service Unavailable" 40 seconds before the restart and nothing
+ * else would ever have reviewed that head). Each head goes through the same decision as a hand
+ * re-enqueue, so a head that already has a newer review, or pending work, is refused and left alone.
+ */
+export async function edgeSweep(
+  port: DispatchPort,
+  window: EdgeSweepWindow,
+  options: { dryRun: boolean }
+): Promise<{ code: number; lines: string[] }> {
+  const since = Date.parse(window.since);
+  const until = Date.parse(window.until);
+  if (Number.isNaN(since) || Number.isNaN(until) || until < since)
+    return { code: 2, lines: ['REFUSED the window must be two ISO times, since <= until'] };
+  if (!port.listFailed)
+    return { code: 1, lines: ['could not read Dispatch: no failed-row listing'] };
+  let failed: ReviewRow[];
+  try {
+    failed = await port.listFailed();
+  } catch (error) {
+    return { code: 1, lines: [`could not read Dispatch: ${errorText(error)}`] };
+  }
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  let candidates = 0;
+  let reenqueued = 0;
+  let refused = 0;
+  let errors = 0;
+  for (const row of failed) {
+    if (row.task_type !== undefined && row.task_type !== 'run_review') continue;
+    const done = Date.parse(row.completed_at ?? '');
+    if (Number.isNaN(done) || done < since || done > until) continue;
+    if (!TRANSPORT_FAILURE.test(row.result_body ?? '')) continue;
+    const target = edgeTarget(row);
+    if (!target) continue;
+    const key = `${target.repository}#${target.prNumber}@${target.head}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates += 1;
+    const result = await reEnqueue(
+      port,
+      { ...target, reason: EDGE_SWEEP_REASON },
+      { dryRun: options.dryRun }
+    );
+    if (result.code === 0 && result.lines.some(line => line.startsWith('REENQUEUED')))
+      reenqueued += 1;
+    else if (result.code === 2) refused += 1;
+    else if (result.code !== 0) errors += 1;
+    lines.push(`${key} ${result.lines[0] ?? ''}`);
+  }
+  lines.push(
+    `EDGE_SWEEP window=${window.since}..${window.until} candidates=${candidates} reenqueued=${reenqueued} refused=${refused} errors=${errors}${options.dryRun ? ' (dry run)' : ''}`
+  );
+  return { code: errors > 0 ? 1 : 0, lines };
+}
+
 export async function show(
   port: DispatchPort,
   repository: string,
@@ -243,6 +345,31 @@ export function createHttpPort(
       if (!Array.isArray(data)) throw new Error('list did not return an array');
       return data as ReviewRow[];
     },
+    async listFailed(): Promise<ReviewRow[]> {
+      // The cursor form of the list route: pages of failed rows, oldest first.
+      const rows: ReviewRow[] = [];
+      let afterSeq = 0;
+      for (let page = 0; page < 40; page += 1) {
+        const url = `${baseUrl}/api/dispatch/messages?recipient=${REVIEW_RECIPIENT}&after_seq=${afterSeq}&status=failed&limit=500`;
+        const response = await doFetch(url, { headers });
+        if (!response.ok) throw new Error(`list returned HTTP ${response.status}`);
+        const data = (await response.json()) as {
+          messages?: ReviewRow[];
+          next_after_seq?: number;
+          page_full?: boolean;
+        };
+        if (!Array.isArray(data.messages)) throw new Error('list did not return a page');
+        rows.push(...data.messages);
+        if (
+          !data.page_full ||
+          typeof data.next_after_seq !== 'number' ||
+          data.next_after_seq <= afterSeq
+        )
+          break;
+        afterSeq = data.next_after_seq;
+      }
+      return rows;
+    },
     async send(message): Promise<{ id: string; status: string }> {
       const response = await doFetch(`${baseUrl}/api/dispatch/messages`, {
         method: 'POST',
@@ -264,7 +391,8 @@ export function createHttpPort(
 function usage(): never {
   console.error(
     'usage: re-enqueue-review.ts <owner/repo> <pr-number> <head-sha> <reason words...> [--dry-run]\n' +
-      '       re-enqueue-review.ts --show <owner/repo> <pr-number> [head-sha]'
+      '       re-enqueue-review.ts --show <owner/repo> <pr-number> [head-sha]\n' +
+      '       re-enqueue-review.ts --edge-sweep <since-iso> <until-iso> [--dry-run]'
   );
   process.exit(2);
 }
@@ -283,6 +411,13 @@ export async function main(argv: string[]): Promise<number> {
       console.error(`could not read Dispatch: ${errorText(error)}`);
       return 1;
     }
+  }
+  if (args[0] === '--edge-sweep') {
+    const [, since, until] = args;
+    if (!since || !until) usage();
+    const swept = await edgeSweep(port, { since, until }, { dryRun });
+    for (const line of swept.lines) (swept.code === 0 ? console.log : console.error)(line);
+    return swept.code;
   }
   const [repository, pr, head, ...reason] = args;
   if (!repository || !/^[^/\s]+\/[^/\s]+$/.test(repository) || !/^\d+$/.test(pr ?? '') || !head)
