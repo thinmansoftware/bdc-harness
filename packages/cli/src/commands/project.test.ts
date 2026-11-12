@@ -121,7 +121,9 @@ test('unreadable, skipped, JSON and exit precedence', async () => {
     JSON.parse(skipped.output).surfaces.filter((s: { status: string }) => s.status === 'SKIPPED')
       .length
   ).toBe(2);
-  expect((await run('verify', ['xo'], '{}')).code).toBe(1);
+  // A DISAGREE (exit 1) outranks an unreadable surface (exit 3). The environment policy is ADDITIVE to the
+  // in-code default (bdc-xo#5581), so '{}' no longer empties the policy; list the repository with no bases.
+  expect((await run('verify', ['xo'], JSON.stringify({ [repo]: {} }))).code).toBe(1);
 });
 test('thinman_alias_and_redaction', async () => {
   const pkg = await Bun.file(resolve(import.meta.dir, '../../package.json')).json();
