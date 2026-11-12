@@ -47,7 +47,8 @@ One `run_review` message to `overseer-reviewer`:
 - the head is not 40 hex characters, or the reason is shorter than 10 characters;
 - there is no review row at that head;
 - a review is already `queued` or `claimed` at that head (the line names the row);
-- the newest row at that head (highest `seq`) is not `failed` (use the push, recheck or reconcile path instead).
+- the newest NON-cancelled row at that head (highest `seq`) is not `failed` (use the push, recheck or reconcile path instead). Cancelled rows are skipped on purpose: when a claim wins, Dispatch cancels the other deliveries of the same head as `superseded_by_claim`, and those can be created AFTER the row that failed (PR 101, 2026-11-12: row 97be1431 failed, then six duplicates were cancelled; the first version of this command refused with "the newest row is cancelled, not failed").
+- every row at that head is cancelled (nothing failed to re-run).
 
 ## Proof it worked
 

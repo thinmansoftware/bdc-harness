@@ -111,7 +111,18 @@ export function decide(rows: ReviewRow[], input: ReEnqueueInput): Decision {
       ok: false,
       refusal: `a review is already pending at this head: row ${pending.id} is ${pending.status}`,
     };
-  const newest = atHead[atHead.length - 1];
+  // A CANCELLED row is never the verdict of a review: when a claim wins, Dispatch cancels the other
+  // deliveries of the same head as `superseded_by_claim`, and those can be CREATED after the row that
+  // failed (PR 101, 2026-11-12: row 97be1431 failed, then six duplicate deliveries were cancelled).
+  // Judging the newest row by position made that failure look "cancelled, not failed" and the command
+  // refused. Judge the newest row that is not cancelled.
+  const decisive = atHead.filter(row => row.status !== 'cancelled');
+  const newest = decisive[decisive.length - 1];
+  if (newest === undefined)
+    return {
+      ok: false,
+      refusal: `every review row at this head is cancelled (latest row ${atHead[atHead.length - 1].id}); nothing failed to re-run, use the push, recheck or reconcile path`,
+    };
   if (newest.status !== 'failed')
     return {
       ok: false,

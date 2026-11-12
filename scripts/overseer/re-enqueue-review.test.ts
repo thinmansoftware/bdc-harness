@@ -111,13 +111,49 @@ describe('decision', () => {
 
   test('4: only a failed newest row at the head qualifies', () => {
     expect(refusal([row('done')])).toContain('is done, not failed');
-    expect(refusal([row('cancelled')])).toContain('is cancelled, not failed');
+    expect(refusal([row('cancelled')])).toContain('every review row at this head is cancelled');
     expect(refusal([row('failed'), row('done')])).toContain('is done, not failed');
     expect(refusal([row('done'), row('failed')])).toBeNull();
     // Newest is decided by seq even when created_at is out of order.
     const older = row('done', head, { seq: 1, created_at: '2026-11-11T20:00:00.000Z' });
     const newer = row('failed', head, { seq: 2, created_at: '2026-11-11T19:00:00.000Z' });
     expect(refusal([newer, older])).toBeNull();
+  });
+
+  test('4b: a failed row followed by superseded_by_claim cancels is still failed (PR 101, 2026-11-12)', () => {
+    // The exact shape read from hetzner-prod: one claim failed, then six duplicate deliveries created
+    // AFTER it were cancelled as superseded_by_claim. Every one of them has a later seq and created_at.
+    const failedRow = row('failed', head, {
+      result_body: JSON.stringify({
+        disposition: 'submission_failed',
+        reason: 'head_recheck_failed:Service Unavailable',
+      }),
+    });
+    const superseded = Array.from({ length: 6 }, () =>
+      row('cancelled', head, {
+        result_body: JSON.stringify({
+          disposition: 'cancelled',
+          reason: `superseded_by_claim ${failedRow.id}`,
+        }),
+      })
+    );
+    // A review of an older head is not part of this head's history.
+    const olderHead = row('done', other);
+    const d = decide([olderHead, failedRow, ...superseded], input);
+    expect(d.ok).toBe(true);
+    if (d.ok) {
+      expect(d.prior.id).toBe(failedRow.id);
+      expect(d.rowsAtHead).toBe(7);
+      // k counts every row at the head (cancelled included), so the key stays distinct per state.
+      expect(d.message.idempotency_key).toBe(`pr-rereview:${repository}#${pr}@${head}:8`);
+      expect(d.message.body).toBe(failedRow.body);
+    }
+    // A DONE row after the failure still wins: a review finished, so there is nothing to re-run.
+    expect(refusal([failedRow, ...superseded, row('done')])).toContain('is done, not failed');
+    // Cancelled rows alone are not a failure.
+    expect(refusal(superseded)).toContain('every review row at this head is cancelled');
+    // Pending work still refuses first.
+    expect(refusal([failedRow, ...superseded, row('queued')])).toContain('already pending');
   });
 
   test('7: the reason is not an automatic re-review reason, and the message matches the intake naming', () => {
