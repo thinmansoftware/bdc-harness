@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
@@ -855,10 +856,56 @@ export function attachGitHubQuotaHooks(
   });
 }
 
+/**
+ * One Octokit client per identity, shared by every caller in the process
+ * (WO-HARNESS-OVERSEER-GITHUB-READ-BUDGET-01, finding 3, bdc-xo#5571).
+ *
+ * `createAppAuth` keeps its installation token inside the client it belongs to, so a client built
+ * per call mints a fresh installation token on its first request: 225 mints an hour for the
+ * Overseer on 2026-11-11 (one per review, merge and reconcile call). A shared client mints once per
+ * token lifetime (about an hour) and refreshes it itself. The cache key names the service, the
+ * identity kind, the pool and a fingerprint of the credential, so a rotated key or token, the
+ * merge identity and the review identity each get their own client (review and merge stay separate
+ * actors, M-153). Nothing secret is kept in the key.
+ */
+const sharedClients = new Map<string, RealGitHubOctokitLike>();
+
+/** Test seam: forget every shared client (the next call builds a new one). */
+export function resetSharedGitHubClients(): void {
+  sharedClients.clear();
+}
+
+export interface SharedClientOptions {
+  /** Honored only when the client is first built (tests: count the token mint requests). */
+  fetch?: typeof fetch;
+}
+
+function fingerprint(secret: string): string {
+  return createHash('sha256').update(secret).digest('hex').slice(0, 16);
+}
+
+function buildOctokit(
+  options: RealOctokitAuthOptions,
+  clientOptions: SharedClientOptions
+): Octokit {
+  return new Octokit(
+    clientOptions.fetch ? { ...options, request: { fetch: clientOptions.fetch } } : options
+  );
+}
+
 export function createRealOctokitClient(
-  service: Extract<GitHubService, 'overseer' | 'pr_discovery'> = 'overseer'
+  service: Extract<GitHubService, 'overseer' | 'pr_discovery'> = 'overseer',
+  clientOptions: SharedClientOptions = {}
 ): RealGitHubOctokitLike {
   const identity = resolveServiceGitHubAuth(service);
+  const token =
+    identity.kind === 'app' ? '' : identity.kind === 'pat' ? identity.token : resolveGitHubToken();
+  const key =
+    identity.kind === 'app'
+      ? `${service}|app|${identity.poolId}|${fingerprint(identity.privateKey)}`
+      : `${service}|token|${identity.poolId}|${fingerprint(token)}`;
+  const shared = sharedClients.get(key);
+  if (shared) return shared;
   const options: RealOctokitAuthOptions =
     identity.kind === 'app'
       ? {
@@ -869,10 +916,12 @@ export function createRealOctokitClient(
             installationId: identity.installationId,
           },
         }
-      : { auth: identity.kind === 'pat' ? identity.token : resolveGitHubToken() };
-  const client = new Octokit(options);
+      : { auth: token };
+  const client = buildOctokit(options, clientOptions);
   attachGitHubQuotaHooks(client, service, identity.poolId);
-  return client as unknown as RealGitHubOctokitLike;
+  const real = client as unknown as RealGitHubOctokitLike;
+  sharedClients.set(key, real);
+  return real;
 }
 
 /**
@@ -905,9 +954,18 @@ export function hasDistinctMergeIdentity(): boolean {
   return resolveServiceGitHubAuth('merge_manager').distinct;
 }
 
-export function createRealMergeOctokitClient(): RealGitHubOctokitLike {
+export function createRealMergeOctokitClient(
+  clientOptions: SharedClientOptions = {}
+): RealGitHubOctokitLike {
   const identity = resolveServiceGitHubAuth('merge_manager');
   if (identity.kind === 'none') throw new Error('merge_manager_identity_not_distinct');
+  // Shared like the review client (see sharedClients), under its own key: never the same object.
+  const key =
+    identity.kind === 'app'
+      ? `merge_manager|app|${identity.poolId}|${fingerprint(identity.privateKey)}`
+      : `merge_manager|token|${identity.poolId}|${fingerprint(identity.token)}`;
+  const shared = sharedClients.get(key);
+  if (shared) return shared;
   const options: RealOctokitAuthOptions =
     identity.kind === 'app'
       ? {
@@ -919,9 +977,11 @@ export function createRealMergeOctokitClient(): RealGitHubOctokitLike {
           },
         }
       : { auth: identity.token };
-  const client = new Octokit(options);
+  const client = buildOctokit(options, clientOptions);
   attachGitHubQuotaHooks(client, 'merge_manager', identity.poolId);
-  return client as unknown as RealGitHubOctokitLike;
+  const real = client as unknown as RealGitHubOctokitLike;
+  sharedClients.set(key, real);
+  return real;
 }
 
 export function summarizeChecks(

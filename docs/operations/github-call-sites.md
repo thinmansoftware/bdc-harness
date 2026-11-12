@@ -31,6 +31,16 @@ ssh hetzner-prod 'docker logs archon-app-1 --since 60m 2>&1' | grep github_call_
 
 Compare it with the metered figure: `SELECT service, SUM(calls) FROM github_api_usage WHERE hour_bucket = '<hour>' GROUP BY service` through `scripts/cauldron/inspect-run.ps1 -Sql`.
 
+## The Overseer baseline of 2026-11-11 and what moved (WO-HARNESS-OVERSEER-GITHUB-READ-BUDGET-01, bdc-xo#5571)
+
+Baseline, from the `github_call_sites` lines of archon-app-1 for 19:16:12Z to 20:16:12Z (59 one-minute lines): overseer 11,863 calls an hour of 12,142 in total (pool `app-4574893-153295654` 11,851, `user-pat` 12), of them 225 installation-token mints (`POST /app/installations/{installation_id}/access_tokens`). The pool's core limit is 15,000 an hour. Target for the whole work order: overseer below 6,000 calls and below 30 mints in one fixed hour with no container restart.
+
+Two spellings of the same endpoint are two kinds of caller, not one: a route written with braces (`/repos/{owner}/{repo}/pulls/{pull_number}`) is an Octokit client with the metering hooks (`attachGitHubQuotaHooks`); a route written `{o}/{r}/pulls/:n` is a request that reached the meter with the real URL: the reconcile pass's Octokit (`packages/overseer/src/reconcile.ts`, `getOctokit`, which sends every request through `serviceGitHubFetch`) and the second and later pages of paginated lists.
+
+Finding 3, mints (done in the first pull request of this work order): `createRealOctokitClient` and `createRealMergeOctokitClient` return ONE shared client per identity (service, identity kind, pool and a fingerprint of the credential). `createAppAuth` keeps the installation token in its own client, so a client built per call minted a token on its first request; the shared client mints once per token lifetime (about an hour) and refreshes itself. The review and merge identities keep separate clients (M-153); a rotated key or token gets a new client. Expect the one-hour mint count to fall from 225 to about 2 per process start (one per service identity). Measure it with the one-hour command above, fixed timestamps, at least 55 lines, no restart inside the hour.
+
+Still to do under the same work order (not in the first pull request): the call-site caller trace, and the removal of repeated pull reads and list walks in the reconcile pass and the discovery loops, aimed by that trace.
+
 ## Limits
 
 - The counts live in memory and in the container log. A rebuild or recreate wipes the log, so measure after a rebuild, not across one.
