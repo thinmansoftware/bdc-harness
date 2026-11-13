@@ -3095,7 +3095,6 @@ nodes:
         fi
         export RST_STAGE_WORKTREES="$(cat "$scratch/stages")"
         cd "$(cat "$scratch/current")" || return 1
-        if declare -F dprep_ensure_js_deps >/dev/null 2>&1; then ( dprep_ensure_js_deps ) >&2; fi
         rst_execute_saved "$e" "$class"
       )
       # Explicit snapshot boundaries (42) block before repair, as in round 8.
@@ -3393,16 +3392,6 @@ nodes:
         exit 0
       fi
       . "$EVIDENCE_DIR/stop-tests.core.sh"
-      # Package-folder dependency prep for the trusted scratch copy (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01):
-      # the copy skips node_modules, so trg_execute_trusted calls dprep_ensure_js_deps inside it. Same
-      # resolution order as prep-dependencies; when no script is found the trusted run goes on without it.
-      DPREP_SCRIPT=""
-      for dprep_candidate in "${BDC_DPREP_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/dprep.sh}" /app/scripts/lane/dprep.sh; do
-        if [ -n "$dprep_candidate" ] && [ -f "$dprep_candidate" ]; then DPREP_SCRIPT="$dprep_candidate"; break; fi
-      done
-      if [ -n "$DPREP_SCRIPT" ]; then
-        . "$DPREP_SCRIPT"
-      fi
       export RST_TIMEOUT_SECONDS="$(cat "$EVIDENCE_DIR/stop-tests.timeout")"
       trg_execute_trusted "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")" > "$EVIDENCE_DIR/stop-tests.final-raw"
       INFRA_FAILURE=0

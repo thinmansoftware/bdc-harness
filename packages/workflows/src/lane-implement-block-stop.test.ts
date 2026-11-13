@@ -204,7 +204,7 @@ for (const lane of LANES) {
 // On win32 `bash` may resolve to WSL; the suites run on POSIX CI (ubuntu-latest).
 const SUITES = [
   'dprep-package-folder.sh',
-  'trusted-final-dprep.sh',
+  'trusted-copy-node-modules.sh',
   'implement-block-gate.sh',
   // Test 8: the existing suites that read these nodes still pass unchanged.
   'run-stop-tests.sh',

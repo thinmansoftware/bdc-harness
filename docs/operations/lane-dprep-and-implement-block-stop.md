@@ -1,9 +1,7 @@
 # Lane dependency prep in package folders, and the implement-block gate
 
 Work order: WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01 (bdc-xo #5970).
-Applies to the 13 `bdc-feature-development*.yaml` lanes. The `bdc-evidence-replay.yaml` lane carries only
-the two trusted-step edits below, because a parity test requires its test nodes to be byte-identical to
-the feature lanes.
+Applies to the 13 `bdc-feature-development*.yaml` lanes. The `bdc-evidence-replay.yaml` lane is unchanged.
 
 ## Why
 
@@ -12,8 +10,9 @@ wrote code and opened a pull request after its implement step had declared BLOCK
 
 1. `dprep_ensure_js_deps` looked only at the top folder of the worktree. shopops keeps its lockfiles in
    `shopops-api/`, so prep printed "no package.json with a supported lockfile ... skipping" and installed
-   nothing, and the final trusted test run (a scratch copy that skips `node_modules`) never installed anything
-   either. Run 6c722c87 passed only because its implement step ran `npm ci` itself.
+   nothing. Run 6c722c87 passed only because its implement step ran `npm ci` itself. (The exact cause of the
+   "trusted infrastructure unavailable" line in f1656d75 is not recoverable from the event store: stderr is not
+   stored. Missing dependencies are the cause the first test run reported; it is not proven for the final run.)
 2. Nothing read an implement BLOCKED as terminal: the repair, push, commit and pull request nodes were gated only
    by `repair-gate` (which concerns PR-repair targets) and by review verdicts.
 
@@ -32,17 +31,19 @@ that have a `package.json` plus a supported lockfile. It prints `dprep: package 
   `package-lock.json`. Otherwise the order above applies.
 - The install must not change what the repo tracks. The folder's `package.json` and lockfiles are copied aside
   first and any that differs afterwards is copied back. Inside a git work tree any other tracked file that was
-  clean before the install and changed by it is restored with `git checkout -- <file>`. A file that was already
-  modified before the install (for example an implement edit) is never touched. Each restore prints
-  `dprep: restored <path>`. (Reason: `commit-and-push` tolerates lockfile changes only at the top level, so a
+  clean before the install and changed by it is restored with `git checkout -- <file>`. A tracked file that was
+  ALREADY modified before the install (an unstaged implement edit, or a deletion) has its exact bytes (or its
+  absence) saved first and put back if the install changed it; a staged edit comes back from the index. Each
+  restore prints `dprep: restored <path>`. (Reason: `commit-and-push` tolerates lockfile changes only at the top level, so a
   rewritten `shopops-api/bun.lock` could otherwise ship in the build PR.)
 - A failed install in one folder does not stop the others; the return code is nonzero when any attempted
   install failed.
 
-The trusted final test run now installs too: `run-stop-tests-final` sources the shared dprep script (same
-resolution order as `prep-dependencies`), and `trg_execute_trusted` calls `dprep_ensure_js_deps` inside the
-scratch copy after changing into it and before the saved test commands run. When no dprep script is found the
-trusted run goes on without it.
+The trusted final test run installs nothing (Amendment 3). `trg_execute_trusted` copies the worktree to a scratch
+folder excluding only `.git` and the artifacts folder, so the `node_modules` that prep installed in the real
+worktree (package folders included) is in the copy when the saved test commands run. An install inside the
+trusted context would run lifecycle scripts after the trusted test files were restored and verified, which could
+rewrite them; so none runs there.
 
 ## The implement-block gate
 
@@ -86,7 +87,8 @@ labeled `status:blocked`. That was already the case and is not changed here.
 
 - `bash .archon/workflows/defaults/__tests__/dprep-package-folder.sh` (package-folder rules, installer choice,
   tracked files unchanged)
-- `bash .archon/workflows/defaults/__tests__/trusted-final-dprep.sh` (dprep inside the trusted scratch copy)
+- `bash .archon/workflows/defaults/__tests__/trusted-copy-node-modules.sh` (no dprep in the trusted context;
+  worktree node_modules reaches the trusted copy)
 - `bash .archon/workflows/defaults/__tests__/implement-block-gate.sh` (gate output, block-classify,
   block-reclassify, blocked-issue and blocked-terminal-gate for all 13 lanes)
 - `bun test ./packages/workflows/src/lane-implement-block-stop.test.ts` (gate wiring and fail-closed conditions

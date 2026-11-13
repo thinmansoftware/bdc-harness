@@ -49,16 +49,16 @@ describe('lane dprep shared script wiring', () => {
   for (const lane of LANES) {
     it(`${lane} sources the shared script and carries no inline dprep body`, () => {
       const text = readFileSync(join(LANES_DIR, lane), 'utf-8');
-      // One sourcing stub per call site: prep-dependencies, run-stop-tests and (since
-      // WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01) run-stop-tests-final,
-      // whose trusted scratch copy skips node_modules and installs through dprep itself.
+      // One sourcing stub per call site: prep-dependencies and run-stop-tests. The final trusted run
+      // installs nothing (Amendment 3 of WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01):
+      // its scratch copy carries the node_modules that prep installed in the real worktree.
       // Resolution order: BDC_DPREP_SCRIPT, engine-materialized bundle, image copy.
       expect(
         text.split(
           'for dprep_candidate in "${BDC_DPREP_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/dprep.sh}" /app/scripts/lane/dprep.sh; do'
         ).length - 1
-      ).toBe(3);
-      expect(text.split('. "$DPREP_SCRIPT"').length - 1).toBe(3);
+      ).toBe(2);
+      expect(text.split('. "$DPREP_SCRIPT"').length - 1).toBe(2);
       expect(text).not.toContain('dprep_ensure_js_deps() {\n        if [ ! -f package.json ]');
       expect(text).not.toContain('no package.json with a bun lockfile');
       expect(text).toContain('ssh://git@github[.]com/');
