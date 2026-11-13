@@ -45,6 +45,7 @@ case "$1" in
   ci)
     [ -n "${STUB_NPM_FAIL_CI:-}" ] && exit 1
     failhere && exit 1
+    if [ -n "${STUB_TOUCH_SOURCE:-}" ]; then mkdir -p routes; echo "install clobbered" > routes/x.js; fi
     mkdir -p node_modules; exit 0 ;;
   install)
     failhere && exit 1
@@ -233,6 +234,39 @@ run_dprep "$T9D" STUB_NPM_FAIL_CI=1 STUB_REWRITE=1
 AFTER="$(sums "$T9D" shopops-api/package.json)"
 check "T9d the implement edit of package.json survives a rewriting install" "$BEFORE" "$AFTER"
 has "T9d the restore is reported" "dprep: restored shopops-api/package.json" "$OUT"
+
+# (3c) the install overwrites a tracked SOURCE file (not a manifest or lockfile) that an earlier step had
+#      edited but not staged: the earlier edit must come back byte for byte (Overseer finding on PR 1597)
+T9F="$WORK/t9f"; mkrepo "$T9F"; mkpkg "$T9F"; mkpkg "$T9F/shopops-api" package-lock.json
+mkdir -p "$T9F/shopops-api/routes"; echo "v1" > "$T9F/shopops-api/routes/x.js"
+gitq "$T9F" add -A; gitq "$T9F" commit -m init
+echo "v2 unstaged implement edit" > "$T9F/shopops-api/routes/x.js"
+BEFORE="$(sums "$T9F" shopops-api/routes/x.js)"
+run_dprep "$T9F" STUB_TOUCH_SOURCE=1
+AFTER="$(sums "$T9F" shopops-api/routes/x.js)"
+check "T9f an unstaged edit of a source file survives an install that overwrites it" "$BEFORE" "$AFTER"
+has "T9f the restore is reported" "dprep: restored shopops-api/routes/x.js" "$OUT"
+has "T9f the install did run" "npm ci --no-audit" "$(cat "$REC")"
+
+# (3d) the same overwrite on a STAGED edit: the staged content comes back
+T9G="$WORK/t9g"; mkrepo "$T9G"; mkpkg "$T9G"; mkpkg "$T9G/shopops-api" package-lock.json
+mkdir -p "$T9G/shopops-api/routes"; echo "v1" > "$T9G/shopops-api/routes/x.js"
+gitq "$T9G" add -A; gitq "$T9G" commit -m init
+echo "v2 staged implement edit" > "$T9G/shopops-api/routes/x.js"
+gitq "$T9G" add shopops-api/routes/x.js
+BEFORE="$(sums "$T9G" shopops-api/routes/x.js)"
+run_dprep "$T9G" STUB_TOUCH_SOURCE=1
+AFTER="$(sums "$T9G" shopops-api/routes/x.js)"
+check "T9g a staged edit of a source file survives an install that overwrites it" "$BEFORE" "$AFTER"
+check "T9g git still sees the staged edit and nothing else" "shopops-api/routes/x.js" "$(git -C "$T9G" diff --cached --name-only)"
+
+# (3e) the install recreates a tracked file the implement step had deleted: it is deleted again
+T9H="$WORK/t9h"; mkrepo "$T9H"; mkpkg "$T9H"; mkpkg "$T9H/shopops-api" package-lock.json
+mkdir -p "$T9H/shopops-api/routes"; echo "v1" > "$T9H/shopops-api/routes/x.js"
+gitq "$T9H" add -A; gitq "$T9H" commit -m init
+rm "$T9H/shopops-api/routes/x.js"
+run_dprep "$T9H" STUB_TOUCH_SOURCE=1
+[ ! -e "$T9H/shopops-api/routes/x.js" ] && ok "T9h a deleted tracked file stays deleted" || bad "T9h the install resurrected a deleted tracked file"
 
 # (4) outside a git work tree the lockfile and package.json are still restored
 T9E="$WORK/t9e"; mkpkg "$T9E"; mkpkg "$T9E/shopops-api" package-lock.json

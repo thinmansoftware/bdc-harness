@@ -158,7 +158,7 @@ dprep__candidates() {
 # dprep__guarded_install_in <folder>: install in one package folder and leave its tracked files
 # exactly as they were (see the PACKAGE FOLDERS note above). Returns the install's return code.
 dprep__guarded_install_in() {
-  local dir="$1" kind rc=0 saved f top before after path
+  local dir="$1" kind rc=0 saved f top before after path nmod
   printf 'dprep: package folder %s\n' "$dir"
   kind="$(cd "$dir" && dprep__kind 1)"
   if [ -d "$dir/node_modules" ]; then
@@ -173,9 +173,24 @@ dprep__guarded_install_in() {
   fi
   top=""
   before=""
+  nmod=0
   if git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)"
-    before="$(git -C "$dir" diff --name-only -- . 2>/dev/null)"
+    before="$(git -C "$dir" -c core.quotepath=off diff --name-only -- . 2>/dev/null)"
+    # Snapshot the bytes of every tracked file that is ALREADY modified (unstaged edit or deletion), so an
+    # install that rewrites one of them cannot lose that earlier work.
+    if [ -n "$saved" ]; then
+      mkdir -p "$saved/mod"
+      : > "$saved/mod.list"
+      while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        nmod=$((nmod + 1))
+        printf '%s\n' "$path" >> "$saved/mod.list"
+        if [ -f "$top/$path" ]; then cp -p "$top/$path" "$saved/mod/$nmod"; fi
+      done <<EOF
+$before
+EOF
+    fi
   fi
   (cd "$dir" && dprep__install_here "$kind") || rc=$?
   if [ -n "$saved" ]; then
@@ -185,10 +200,10 @@ dprep__guarded_install_in() {
         printf 'dprep: restored %s/%s\n' "$dir" "$f"
       fi
     done
-    rm -rf "$saved"
   fi
   if [ -n "$top" ]; then
-    after="$(git -C "$dir" diff --name-only -- . 2>/dev/null)"
+    after="$(git -C "$dir" -c core.quotepath=off diff --name-only -- . 2>/dev/null)"
+    # Files the install newly modified go back to their indexed content.
     while IFS= read -r path; do
       [ -n "$path" ] || continue
       if ! printf '%s\n' "$before" | grep -qxF -- "$path"; then
@@ -197,7 +212,23 @@ dprep__guarded_install_in() {
     done <<EOF
 $after
 EOF
+    # Files that were already modified before the install go back to the exact bytes they had.
+    if [ -n "$saved" ] && [ -f "$saved/mod.list" ]; then
+      nmod=0
+      while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        nmod=$((nmod + 1))
+        if [ -f "$saved/mod/$nmod" ]; then
+          if ! cmp -s "$saved/mod/$nmod" "$top/$path"; then
+            cp -p "$saved/mod/$nmod" "$top/$path" && printf 'dprep: restored %s\n' "$path"
+          fi
+        elif [ -e "$top/$path" ]; then
+          rm -f "$top/$path" && printf 'dprep: restored %s\n' "$path"
+        fi
+      done < "$saved/mod.list"
+    fi
   fi
+  if [ -n "$saved" ]; then rm -rf "$saved"; fi
   return "$rc"
 }
 
