@@ -770,6 +770,24 @@ describe('overseer db', () => {
     expect(await mergeSlotRow('verdict-active')).toEqual(first);
   });
 
+  test('accepts an infinite merge slot limit and still refuses a second active reserve', async () => {
+    const since = '2026-09-14T00:00:00.000Z';
+    const id = 'verdict-infinite';
+    expect(await reserveOverseerMergeSlot(id, since, Number.POSITIVE_INFINITY)).toBe(true);
+    expect(await reserveOverseerMergeSlot(id, since, Number.POSITIVE_INFINITY)).toBe(false);
+    const others: boolean[] = [];
+    for (let n = 0; n < 20; n += 1) {
+      others.push(
+        await reserveOverseerMergeSlot(
+          `verdict-infinite-${String(n)}`,
+          since,
+          Number.POSITIVE_INFINITY
+        )
+      );
+    }
+    expect(others).toEqual(Array<boolean>(20).fill(true));
+  });
+
   test('counts a revived reservation toward occupancy again', async () => {
     const since = '2026-09-14T00:00:00.000Z';
     expect(await reserveOverseerMergeSlot('verdict-a', since, 1)).toBe(true);

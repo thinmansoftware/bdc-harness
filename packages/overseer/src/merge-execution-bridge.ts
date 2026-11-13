@@ -13,9 +13,10 @@
  * are `pr_context_unresolvable`, `pr_not_open`, `head_moved`, `base_not_allowlisted`;
  * `run_context_unresolvable` stays reserved for a real run id whose row is gone.
  *
- * Ceiling (OVERSEER_MAX_MERGES_PER_HOUR, default 4): occupancy is reserved
- * atomically in durable storage before any GitHub merge mutation. A failed
- * merge releases its reservation; a successful merge keeps it for the window.
+ * Ceiling: there is no global merge ceiling unless OVERSEER_MAX_MERGES_PER_HOUR
+ * is set. Occupancy is still reserved atomically in durable storage before any
+ * GitHub merge mutation. A failed merge releases its reservation; a successful
+ * merge keeps it for the window. An invalid value fails closed to 4.
  */
 import { createLogger } from '@archon/paths';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
@@ -69,7 +70,8 @@ import {
 } from './ce-scope-premerge-recheck';
 
 const log = createLogger('overseer/merge-coordinator');
-const DEFAULT_MAX_MERGES_PER_HOUR = 4;
+const FALLBACK_INVALID_MAX_MERGES_PER_HOUR = 4;
+const warnedInvalidMaxMergesPerHour = new Set<string>();
 const DEFAULT_MERGE_RETRY_BASE_MINUTES = 10;
 const DEFAULT_MERGE_RETRY_MAX_DELAY_MINUTES = 240;
 const DEFAULT_MERGE_RETRY_MAX_ATTEMPTS = 8;
@@ -266,9 +268,23 @@ function productionCeScopeRecheckDeps(): CeScopeRecheckDeps {
 
 function configuredLimit(override?: number): number {
   if (override !== undefined) return override;
-  const raw = process.env.OVERSEER_MAX_MERGES_PER_HOUR ?? '';
+  const raw = process.env.OVERSEER_MAX_MERGES_PER_HOUR;
+  if (raw === undefined || raw === '') return Number.POSITIVE_INFINITY;
+  // Number.isInteger(Infinity) is true; a digit string that overflows must fail closed.
   const parsed = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
-  return Number.isInteger(parsed) && parsed >= 0 ? parsed : DEFAULT_MAX_MERGES_PER_HOUR;
+  if (Number.isFinite(parsed) && Number.isInteger(parsed) && parsed >= 0) return parsed;
+  if (!warnedInvalidMaxMergesPerHour.has(raw)) {
+    warnedInvalidMaxMergesPerHour.add(raw);
+    log.warn(
+      {
+        env: 'OVERSEER_MAX_MERGES_PER_HOUR',
+        raw,
+        fallback: FALLBACK_INVALID_MAX_MERGES_PER_HOUR,
+      },
+      'merge-coordinator.max_merges_per_hour_invalid'
+    );
+  }
+  return FALLBACK_INVALID_MAX_MERGES_PER_HOUR;
 }
 
 function configuredNonNegativeInteger(

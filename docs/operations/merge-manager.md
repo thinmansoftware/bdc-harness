@@ -52,9 +52,9 @@ The interactive Duty Officer reads this marker: an approved, green, unmerged pul
 
 ## Hourly merge ceiling and the `merge-queued` label
 
-The merge manager reserves one merge slot per merge in durable storage before it merges; `OVERSEER_MAX_MERGES_PER_HOUR` (12 on hetzner-prod, code default 4) is the number of merges in a rolling 60 minutes, counted across every repository and every kind of pull request (specs, diary rows and code alike). It is a separate budget from GitHub API calls. When the ceiling is full a green, approved pull request is not stuck, it is queued: the verdict claim is released with `rate_ceiling_deferred` and each later pass tries again.
+The merge manager reserves one merge slot per merge in durable storage before it merges. There is no global ceiling by default. `OVERSEER_MAX_MERGES_PER_HOUR` is an optional non-negative integer throttle: the number of merges in a rolling 60 minutes, counted across every repository and every kind of pull request (specs, diary rows and code alike). It is a separate budget from GitHub API calls. Unset or empty means no ceiling. A value that is not a non-negative integer falls back to four. Zero prevents merges. When a configured ceiling is full, a green, approved pull request is not stuck, it is queued: the verdict claim is released with `rate_ceiling_deferred` and each later pass tries again.
 
-Two signals say so on the pull request itself:
+When a ceiling is configured, two signals say so on the pull request itself:
 
 - a comment (marker `<!-- overseer:merge-ceiling-queued -->`) with the head, the queue position, the ceiling and the earliest next merge slot, posted once per head;
 - the label `merge-queued`, added at the first deferral (one call, never one per pass; a PR that already carries it costs nothing) and removed by the bridge when it merges the PR. A pull request merged by hand keeps the label, which is cosmetic. The label is a signal only: nothing in the merge path treats it as a hold, and removing it does not release or hold anything.

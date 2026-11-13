@@ -671,6 +671,7 @@ describe('merge execution bridge', () => {
       store: h.store,
       github: h.github,
       readPolicy: () => policy(),
+      maxMergesPerHour: 4,
     });
     expect(claims).toBe(1);
     expect(h.merges).toBe(0);
@@ -2596,5 +2597,198 @@ describe('merge-queued label', () => {
       readPolicy: () => policy(),
     });
     expect(failing.merges).toBe(1);
+  });
+});
+
+describe('no global hourly merge ceiling', () => {
+  const ceilingMarker = '<!-- overseer:merge-ceiling-queued -->';
+
+  function readyRows(count: number): ReturnType<typeof verdict>[] {
+    return Array.from({ length: count }, (_, index) => verdict(`ready-${String(index)}`));
+  }
+
+  test('merges every ready verdict in one sweep when no ceiling is set', async () => {
+    delete process.env.OVERSEER_MAX_MERGES_PER_HOUR;
+    const comments: string[] = [];
+    const addPullRequestLabels = mock(async () => undefined);
+    const heads: string[] = [];
+    const h = harness(readyRows(15), greenPr(), 0, {
+      addPullRequestLabels,
+      commentOnPullRequest: async input => {
+        comments.push(input.body);
+        return { commented: true };
+      },
+    });
+    h.github.mergePullRequest = async input => {
+      heads.push(input.expectedHeadSha);
+      return { merged: true, mergeSha: 'merge-sha' };
+    };
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(heads).toEqual(Array<string>(15).fill('judged-sha'));
+    expect(h.claimReleases.some(row => row.reason === 'rate_ceiling_deferred')).toBe(false);
+    expect(addPullRequestLabels).not.toHaveBeenCalled();
+    expect(comments.some(body => body.includes(ceilingMarker))).toBe(false);
+  });
+
+  test('keeps the sweep serial when no ceiling is set', async () => {
+    delete process.env.OVERSEER_MAX_MERGES_PER_HOUR;
+    const h = harness(readyRows(15));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const heads: string[] = [];
+    h.github.mergePullRequest = async input => {
+      heads.push(input.expectedHeadSha);
+      inFlight += 1;
+      if (inFlight > maxInFlight) maxInFlight = inFlight;
+      await new Promise(resolve => {
+        setTimeout(resolve, 0);
+      });
+      inFlight -= 1;
+      return { merged: true, mergeSha: 'merge-sha' };
+    };
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(heads).toHaveLength(15);
+    expect(maxInFlight).toBe(1);
+  });
+
+  test('still honors an explicit OVERSEER_MAX_MERGES_PER_HOUR ceiling', async () => {
+    process.env.OVERSEER_MAX_MERGES_PER_HOUR = '12';
+    const h = harness(readyRows(15));
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(12);
+    expect(h.claimReleases).toContainEqual({
+      verdictId: 'ready-12',
+      reason: 'rate_ceiling_deferred',
+    });
+  });
+
+  test('fails closed to 4 and warns once when the ceiling value is invalid', async () => {
+    process.env.OVERSEER_MAX_MERGES_PER_HOUR = 'abc';
+    const h = harness(readyRows(6));
+    const captured = captureRootLogLines();
+    try {
+      await runMergeExecutionBridgeOnce({
+        store: h.store,
+        github: h.github,
+        readPolicy: () => policy(),
+      });
+      const invalid = captured.lines.filter(line => {
+        const start = line.indexOf('{');
+        if (start < 0) return false;
+        try {
+          const parsed = JSON.parse(line.slice(start)) as { msg?: unknown };
+          return parsed.msg === 'merge-coordinator.max_merges_per_hour_invalid';
+        } catch {
+          return false;
+        }
+      });
+      expect(h.merges).toBe(4);
+      expect(h.claimReleases).toContainEqual({
+        verdictId: 'ready-4',
+        reason: 'rate_ceiling_deferred',
+      });
+      expect(invalid).toHaveLength(1);
+    } finally {
+      captured.restore();
+    }
+  });
+
+  test('treats an empty OVERSEER_MAX_MERGES_PER_HOUR as no ceiling', async () => {
+    process.env.OVERSEER_MAX_MERGES_PER_HOUR = '';
+    const h = harness(readyRows(6));
+    await runMergeExecutionBridgeOnce({
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+    });
+    expect(h.merges).toBe(6);
+  });
+
+  test('merges a clean verdict once and still applies the other gates with no ceiling', async () => {
+    delete process.env.OVERSEER_MAX_MERGES_PER_HOUR;
+    const rows = [
+      verdict('head-moved'),
+      verdict('reworking'),
+      verdict('red'),
+      verdict('evidence'),
+      verdict('clean'),
+    ];
+    const h = harness(rows);
+    h.github.findPullRequest = async input => {
+      switch (input.headBranch) {
+        case 'branch-head-moved':
+          return greenPr({ headSha: 'moved-sha' });
+        case 'branch-reworking':
+          return greenPr({ labels: ['owner:reworking'] });
+        case 'branch-red':
+          return greenPr({ checks: { total: 2, passed: 1, failed: 1, pending: 0 } });
+        case 'branch-evidence':
+        case 'branch-clean':
+          return greenPr();
+        default:
+          throw new Error(`unexpected branch ${input.headBranch ?? ''}`);
+      }
+    };
+    const mergedHeads: string[] = [];
+    h.github.mergePullRequest = async input => {
+      mergedHeads.push(input.expectedHeadSha);
+      return { merged: true, mergeSha: 'merge-sha' };
+    };
+    const claimed = new Set<string>();
+    const claimVerdict = h.store.claimVerdict;
+    h.store.claimVerdict = async verdictId => {
+      if (claimed.has(verdictId)) return false;
+      claimed.add(verdictId);
+      return claimVerdict(verdictId);
+    };
+    const options = {
+      store: h.store,
+      github: h.github,
+      readPolicy: () => policy(),
+      readRunEvents: async (runId: string) => {
+        if (runId !== 'run-evidence') return [];
+        return [
+          {
+            id: 'evidence-failed',
+            workflow_run_id: 'run-evidence',
+            event_type: 'node_failed',
+            step_name: 'manifest-evidence-check',
+            data: {},
+          },
+        ];
+      },
+    };
+    await Promise.all([runMergeExecutionBridgeOnce(options), runMergeExecutionBridgeOnce(options)]);
+    expect(mergedHeads).toEqual(['judged-sha']);
+    expect(h.outcomes).toContainEqual(
+      expect.objectContaining({ verdictId: 'head-moved', reason: 'verdict_stale_head' })
+    );
+    expect(h.outcomes.some(row => row.verdictId === 'reworking')).toBe(false);
+    expect(h.claimReleases).toContainEqual({
+      verdictId: 'reworking',
+      reason: 'owner_reworking_label',
+    });
+    expect(h.outcomes).toContainEqual(
+      expect.objectContaining({ verdictId: 'red', reason: 'required_checks_not_success' })
+    );
+    expect(h.outcomes.some(row => row.verdictId === 'evidence')).toBe(false);
+    expect(h.claimReleases).toContainEqual({
+      verdictId: 'evidence',
+      reason: 'originating_run_failed_evidence_gate',
+    });
+    expect(h.claimReleases.some(row => row.reason === 'rate_ceiling_deferred')).toBe(false);
+    expect(mergedHeads).toHaveLength(1);
   });
 });
