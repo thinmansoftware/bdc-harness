@@ -1177,6 +1177,57 @@ describe('tm_journal DAL', () => {
     expect(Number(audits.rows[0]?.cnt)).toBe(2);
   });
 
+  // WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01 Test 8a: the REAL resume expiry
+  // pass (EXPIRE_UNSENT_PROPOSALS) turns parked and pending escalate_p0 rows into
+  // 'expired', which the escalate_p0 dedupe window then ignores (loop Test 8b).
+  test('escalate_p0 dedupe resume expiry: real resetTaskmaster expires parked and pending escalate_p0', async () => {
+    await setPauseState({
+      pause_state: 'PAUSED',
+      pause_scope: 'effects',
+      pause_reason: 'test',
+      pause_actor: 'operator',
+    });
+    const parked = await recordAction({
+      thread_ref: 'gh:test/repo#8',
+      action_type: 'escalate_p0',
+      proposal_json: '{"reason":"paused"}',
+      idempotency_key: 'tm:escalate_p0:gh:test/repo#8:1',
+      outcome: 'parked',
+    });
+    const pending = await recordAction({
+      thread_ref: 'gh:test/repo#9',
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      idempotency_key: 'tm:escalate_p0:gh:test/repo#9:1',
+      outcome: 'pending',
+    });
+    const fire = await recordAction({
+      thread_ref: 'gh:test/repo#10',
+      action_type: 'fire_cauldron',
+      proposal_json: '{}',
+      idempotency_key: 'tm:fire:gh:test/repo#10:1',
+      outcome: 'pending',
+    });
+    const sent = await recordAction({
+      thread_ref: 'gh:test/repo#11',
+      action_type: 'escalate_p0',
+      proposal_json: '{}',
+      idempotency_key: 'tm:escalate_p0:gh:test/repo#11:1',
+      outcome: 'sent',
+    });
+
+    const reset = await resetTaskmaster({ actor: 'operator', reason: 'resume' });
+
+    expect(reset.expiredProposals).toBe(2);
+    const outcomeOf = async (id: string): Promise<string | undefined> =>
+      (await db.query<{ outcome: string }>('SELECT outcome FROM tm_journal WHERE id = $1', [id]))
+        .rows[0]?.outcome;
+    expect(await outcomeOf(parked.id)).toBe('expired');
+    expect(await outcomeOf(pending.id)).toBe('expired');
+    expect(await outcomeOf(fire.id)).toBe('pending');
+    expect(await outcomeOf(sent.id)).toBe('sent');
+  });
+
   test('already-running reset preserves the epoch window and accumulated noise grades', async () => {
     const epochStart = new Date(Date.now() - 3_600_000).toISOString();
     const evidenceAt = new Date(Date.now() - 1_800_000).toISOString();

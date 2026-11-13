@@ -1616,7 +1616,7 @@ function equalHexDigest(left: string, right: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-async function validateXoLeaseBind(
+export async function validateXoLeaseBind(
   query: DispatchQueryExecutor,
   principalId: string,
   bind?: XoLeaseBind
@@ -1648,7 +1648,7 @@ async function validateXoLeaseBind(
   return null;
 }
 
-function xoLeaseBindPredicate(
+export function xoLeaseBindPredicate(
   principalId: string,
   bind?: XoLeaseBind
 ): { sql: string; params: unknown[] } {
