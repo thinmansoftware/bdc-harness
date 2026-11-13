@@ -7,6 +7,12 @@
 #   2. Stale staging/rollback Docker images+containers from concluded deploy
 #      rounds. This is RETENTION, not a bug -- age-gated with a keep-latest-N floor
 #      so an active rollback target is never pruned out from under John.
+#   3. archon.db pre-rebuild snapshot retention (WO-HARNESS-REBUILD-BACKUP-RETENTION-01):
+#      this script runs archon-db-backup-retention.sh, which REPORTS by default and
+#      deletes only when KEEP_NEWEST_SNAPSHOTS or DELETE_AFTER_DAYS is set in this
+#      environment (they are not set; deletion waits on John's recorded answer).
+#      `cauldron-disk-cleanup.sh --pressure-check` (hourly root cron) runs ONLY that
+#      step, and only when PRESSURE_MOUNT is at or above PRESSURE_PCT used.
 set -uo pipefail
 LOG="/opt/bdc/backups/cauldron-cleanup.log"
 # 2026-11-03: every owner (was bluedevilcollectibles only; work moved to thinmansoftware).
@@ -78,6 +84,46 @@ prune_rollback_pins() {
     | grep -E '^[^|]*\|archon:rollback-' | sort -r)
 }
 
+# --- archon.db pre-rebuild snapshot retention + hourly pressure check ---
+# The retention script reports by default. It deletes only when KEEP_NEWEST_SNAPSHOTS or
+# DELETE_AFTER_DAYS is set in THIS environment; this script never sets either, so a nightly
+# or hourly run is report-only until John's recorded answer puts one in the root cron
+# environment. Its low-disk, refused or failed results are logged and never stop the sweep.
+RETENTION_SCRIPT="${RETENTION_SCRIPT:-/usr/local/sbin/archon-db-backup-retention.sh}"
+PRESSURE_MOUNT="${PRESSURE_MOUNT:-/mnt/bdc-builds}"
+PRESSURE_PCT="${PRESSURE_PCT:-85}"
+
+run_db_retention() {
+  local rc
+  if [ ! -x "$RETENTION_SCRIPT" ]; then
+    log "skip db snapshot retention: $RETENTION_SCRIPT is not installed"
+    return 0
+  fi
+  log "db snapshot retention: running $RETENTION_SCRIPT"
+  "$RETENTION_SCRIPT" 2>&1 | sed 's/^/[retention] /' | tee -a "$LOG"
+  rc=${PIPESTATUS[0]}
+  log "db snapshot retention exit=$rc"
+  return 0
+}
+
+# Hourly, only when needed: quiet unless PRESSURE_MOUNT is at or above PRESSURE_PCT used.
+pressure_check() {
+  local pct
+  pct=$(df --output=pcent "$PRESSURE_MOUNT" 2>/dev/null | tail -1 | tr -dc '0-9')
+  if [ -z "$pct" ]; then
+    log "pressure check: cannot read $PRESSURE_MOUNT; skipped"
+    return 0
+  fi
+  [ "$pct" -ge "$PRESSURE_PCT" ] || return 0
+  log "pressure check: $PRESSURE_MOUNT at ${pct}% (>= ${PRESSURE_PCT}%): running db snapshot retention only"
+  run_db_retention
+}
+
+if [ "${1:-}" = "--pressure-check" ]; then
+  pressure_check
+  exit 0
+fi
+
 log "=== cauldron-disk-cleanup start ==="
 df -h / | tail -1 | tee -a "$LOG"
 
@@ -98,7 +144,10 @@ done
 # --- 1b. archon:rollback-<STAMP> pins (keep newest KEEP_ROLLBACK_PINS). Runs
 # before the DRY_RUN exit so a dry run prints its plan; it removes nothing then.
 prune_rollback_pins
-if [ "$DRY_RUN" = "1" ]; then echo "DRY_RUN: worktree and rollback-pin plan only; nothing removed"; exit 0; fi
+
+# --- 1c. archon.db pre-rebuild snapshot retention (report-only unless a retention variable is set) ---
+run_db_retention
+if [ "$DRY_RUN" = "1" ]; then echo "DRY_RUN: worktree, rollback-pin and snapshot-retention plan only; nothing removed"; exit 0; fi
 
 # Prune git's own worktree bookkeeping in each repo's source clone. This runs in
 # the container: on the host every recorded worktree path (/.archon/...) looks
