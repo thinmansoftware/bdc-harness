@@ -94,6 +94,35 @@ function Test-LocalPortOpen {
     }
 }
 
+# Ownership comes from the captured process handle and a successful listener enumeration.
+# A TCP connect alone cannot distinguish our forward from a foreign listener or a reused PID.
+function Get-OwnedTunnelListenerState {
+    param($Tunnel, [int]$Port)
+    try {
+        $listeners = @(Get-NetTCPConnection -ErrorAction Stop | Where-Object {
+            $_.State -eq 'Listen' -and $_.LocalPort -eq $Port -and
+            $_.LocalAddress -in @('127.0.0.1', '0.0.0.0', '::', '::1')
+        })
+        if ($listeners.Count -eq 0) { return 'absent' }
+        if ($null -eq $Tunnel -or $Tunnel.HasExited) { return 'foreign' }
+        foreach ($listener in $listeners) {
+            if ($listener.LocalAddress -ne '127.0.0.1' -or $listener.OwningProcess -ne $Tunnel.Id) { return 'foreign' }
+        }
+        return 'owned'
+    }
+    catch { return 'unknown' }
+}
+
+function Read-OwnedTunnelListenerState {
+    param($Tunnel, [int]$Port)
+    try {
+        $state = Get-OwnedTunnelListenerState -Tunnel $Tunnel -Port $Port
+        if ($state -in @('owned', 'absent', 'foreign')) { return $state }
+    }
+    catch { }
+    return 'unknown'
+}
+
 function Start-TunnelProcess {
     param([string]$SshHost, [int]$LocalPort, [string]$Executable = '')
     $forward = "127.0.0.1:${LocalPort}:127.0.0.1:3090"
@@ -484,6 +513,21 @@ function Stop-OwnedProcess {
 # Returns @{ Outcome = 'clean'|'holder'|'failed'; Reason = '...' }.
 # Reasons carry exit codes and port numbers only: never config, token or prompt text.
 # ---------------------------------------------------------------------------
+function Stop-RecoveryTunnelVerified {
+    param($Tunnel)
+    if ($null -eq $Tunnel) { return $true }
+    $before = $script:DescendantsSurvived
+    try {
+        # Keep the existing job-object termination and verification path. Even an exited
+        # root may still have a live job member, so HasExited alone is not cleanup proof.
+        Stop-OwnedProcess -Process $Tunnel
+        if ($script:DescendantsSurvived -eq $before -and $Tunnel.HasExited) { return $true }
+    }
+    catch { }
+    if ($script:DescendantsSurvived -eq $before) { $script:DescendantsSurvived++ }
+    return $false
+}
+
 function Invoke-DispatchPairOnce {
     param(
         [string]$ConfigPath,
@@ -503,6 +547,9 @@ function Invoke-DispatchPairOnce {
     Write-LauncherLog (Get-OwnedProcessSummary -Name 'tunnel started:' -Process $tunnel)
     $worker = $null
     $trackedWorkerTree = @{}
+    $reconnectAttempts = 0
+    $transportHeld = $false
+    $tunnelCleanupUncertain = $false
     try {
         $ready = $false
         for ($waited = 0; $waited -lt $ReadySeconds; $waited++) {
@@ -519,7 +566,7 @@ function Invoke-DispatchPairOnce {
         $worker = Start-WorkerProcess -ConfigPath $ConfigPath
         Write-LauncherLog (Get-OwnedProcessSummary -Name 'worker started:' -Process $worker)
         while ($true) {
-            Invoke-LauncherSleep -Seconds $PollSeconds
+            if (-not $worker.HasExited) { Invoke-LauncherSleep -Seconds $PollSeconds }
             Update-TrackedDescendants -Process $worker -Tracked $trackedWorkerTree
             if ($worker.HasExited) {
                 $code = $worker.ExitCode
@@ -529,11 +576,102 @@ function Invoke-DispatchPairOnce {
                 }
                 return @{ Outcome = 'failed'; Reason = "worker exited with code $code" }
             }
-            if ($tunnel.HasExited) {
-                return @{ Outcome = 'failed'; Reason = "ssh tunnel exited while the worker ran (exit code $($tunnel.ExitCode))" }
+            # Tunnel failure must never end this pair while its worker is still executing.
+            # The budget belongs to this worker lifetime, including successful reconnects.
+            if ($transportHeld) { continue }
+            try {
+                $state = Read-OwnedTunnelListenerState -Tunnel $tunnel -Port $LocalPort
+                if ($state -eq 'unknown') {
+                    $transportHeld = $true
+                    Write-LauncherLog 'OBSERVATION_UNCERTAIN; holding the same worker'
+                    continue
+                }
+                if ($state -eq 'owned' -and -not $tunnel.HasExited) { continue }
+                if ($state -eq 'foreign') {
+                    $transportHeld = $true
+                    Write-LauncherLog 'FOREIGN_LISTENER_REFUSED; holding the same worker'
+                    continue
+                }
+                if (-not (Stop-RecoveryTunnelVerified -Tunnel $tunnel)) {
+                    $tunnelCleanupUncertain = $true
+                    $transportHeld = $true
+                    Write-LauncherLog 'CLEANUP_UNCERTAIN; holding the same worker without retries'
+                    continue
+                }
+                $tunnel = $null
+                $recovered = $false
+                while (-not $worker.HasExited -and $reconnectAttempts -lt 3 -and -not $transportHeld) {
+                    $state = Read-OwnedTunnelListenerState -Tunnel $null -Port $LocalPort
+                    if ($state -ne 'absent') {
+                        $transportHeld = $true
+                        if ($state -eq 'foreign') { Write-LauncherLog 'FOREIGN_LISTENER_REFUSED; holding the same worker' }
+                        else { Write-LauncherLog 'OBSERVATION_UNCERTAIN; holding the same worker' }
+                        break
+                    }
+                    $delay = [int][Math]::Pow(2, $reconnectAttempts)
+                    for ($tick = 0; $tick -lt $delay -and -not $worker.HasExited; $tick++) {
+                        Invoke-LauncherSleep -Seconds 1
+                        Update-TrackedDescendants -Process $worker -Tracked $trackedWorkerTree
+                    }
+                    if ($worker.HasExited) { break }
+                    # A foreign process may bind during backoff. Never borrow that listener.
+                    $state = Read-OwnedTunnelListenerState -Tunnel $null -Port $LocalPort
+                    if ($state -ne 'absent') {
+                        $transportHeld = $true
+                        if ($state -eq 'foreign') { Write-LauncherLog 'FOREIGN_LISTENER_REFUSED; holding the same worker' }
+                        else { Write-LauncherLog 'OBSERVATION_UNCERTAIN; holding the same worker' }
+                        break
+                    }
+                    if ($worker.HasExited) { break }
+                    $reconnectAttempts++
+                    Write-LauncherLog "RECONNECT_ATTEMPT_$reconnectAttempts; backoff $delay s"
+                    try {
+                        $tunnel = Start-TunnelProcess -SshHost $SshHost -LocalPort $LocalPort
+                    }
+                    catch {
+                        # A failed start may have created a job before handle capture failed.
+                        # Without its handle cleanup cannot be proved; do not start another.
+                        $tunnelCleanupUncertain = $true
+                        $transportHeld = $true
+                        $script:DescendantsSurvived++
+                        Write-LauncherLog 'CLEANUP_UNCERTAIN after tunnel start; holding the same worker without retries'
+                        break
+                    }
+                    Write-LauncherLog (Get-OwnedProcessSummary -Name 'tunnel started:' -Process $tunnel)
+                    for ($check = 0; $check -lt [Math]::Min(30, $ReadySeconds); $check++) {
+                        if ($worker.HasExited -or $tunnel.HasExited) { break }
+                        $state = Read-OwnedTunnelListenerState -Tunnel $tunnel -Port $LocalPort
+                        if ($state -eq 'owned') { $recovered = $true; break }
+                        if ($state -ne 'absent') {
+                            $transportHeld = $true
+                            if ($state -eq 'foreign') { Write-LauncherLog 'FOREIGN_LISTENER_REFUSED; holding the same worker' }
+                            else { Write-LauncherLog 'OBSERVATION_UNCERTAIN; holding the same worker' }
+                            break
+                        }
+                        Invoke-LauncherSleep -Seconds 1
+                        Update-TrackedDescendants -Process $worker -Tracked $trackedWorkerTree
+                    }
+                    if ($worker.HasExited) { break }
+                    if ($recovered) { Write-LauncherLog 'TRANSPORT_RECOVERED; same worker retained'; break }
+                    if ($transportHeld) { break }
+                    if (-not (Stop-RecoveryTunnelVerified -Tunnel $tunnel)) {
+                        $tunnelCleanupUncertain = $true
+                        $transportHeld = $true
+                        Write-LauncherLog 'CLEANUP_UNCERTAIN; holding the same worker without retries'
+                        break
+                    }
+                    $tunnel = $null
+                }
+                if (-not $worker.HasExited -and -not $recovered -and -not $transportHeld) {
+                    $transportHeld = $true
+                    Write-LauncherLog 'DEGRADED_EXHAUSTED; holding the same worker until operator reset'
+                }
             }
-            if (-not (Test-LocalPortOpen -Port $LocalPort)) {
-                return @{ Outcome = 'failed'; Reason = "tunnel listener on port $LocalPort was lost while the worker ran" }
+            catch {
+                # An unreadable captured handle is not permission to signal the worker,
+                # release its lock, borrow another process, or create a replacement.
+                $transportHeld = $true
+                Write-LauncherLog 'OBSERVATION_UNCERTAIN; holding the same worker'
             }
         }
     }
@@ -542,7 +680,7 @@ function Invoke-DispatchPairOnce {
         Write-LauncherLog ('pair ending: ' + (Get-OwnedProcessSummary -Name 'worker' -Process $worker) + '; ' + (Get-OwnedProcessSummary -Name 'tunnel' -Process $tunnel))
         # Our own pair only: the worker first, then the tunnel.
         Stop-OwnedProcess -Process $worker -Tracked $trackedWorkerTree
-        Stop-OwnedProcess -Process $tunnel
+        if (-not $tunnelCleanupUncertain) { Stop-OwnedProcess -Process $tunnel }
     }
 }
 

@@ -30,6 +30,8 @@ interface ScenarioResult {
   workerStarts: number[];
   diedAt: number[];
   clock: number;
+  workerSignals: number;
+  events: { message: string; at: number; liveWorkers: number[]; workerSignals: number }[];
 }
 
 const HEADER = `
@@ -50,14 +52,22 @@ $script:Tick = $null
 $script:OnTunnelStart = $null
 $script:OnWorkerStart = $null
 $script:PortOpen = $null
+$script:ListenerState = $null
+$script:workerSignals = 0
+$script:events = New-Object System.Collections.ArrayList
 
-function Write-LauncherLog { param([string]$Message) [void]$script:log.Add($Message) }
+function Write-LauncherLog {
+    param([string]$Message)
+    [void]$script:log.Add($Message)
+    [void]$script:events.Add(@{ message = $Message; at = $script:clock; liveWorkers = @($script:workers | Where-Object { -not $_.HasExited } | ForEach-Object { $_.Id }); workerSignals = $script:workerSignals })
+}
 function Get-LauncherNow { return ([DateTime]'2026-11-09T00:00:00Z').AddSeconds($script:clock) }
 function Invoke-LauncherSleep {
     param([int]$Seconds)
     [void]$script:sleeps.Add($Seconds)
     $script:clock += $Seconds
     if ($script:Tick) { $null = & $script:Tick }
+    if ($script:clock -gt 5000) { throw 'synthetic scenario exceeded its fake-clock bound' }
 }
 function New-StubProcess {
     param([string]$Role)
@@ -90,12 +100,20 @@ function Stop-OwnedProcess {
     $known = @(@($script:tunnels) + @($script:workers) | Where-Object { $_.Id -eq $Process.Id })
     if ($known.Count -eq 0) { [void]$script:violations.Add('stopped a process the launcher did not start') }
     [void]$script:stopped.Add($Process.Id)
+    if ($Process.Role -eq 'worker' -and -not $Process.HasExited) { $script:workerSignals++ }
     if (-not $Process.HasExited) { $Process.HasExited = $true; $Process.ExitCode = -1 }
 }
 function Test-LocalPortOpen {
     param([int]$Port)
     if ($script:PortOpen) { return [bool](& $script:PortOpen) }
     return $false
+}
+function Get-OwnedTunnelListenerState {
+    param($Tunnel, [int]$Port)
+    if ($script:ListenerState) { return (& $script:ListenerState $Tunnel) }
+    if (-not (Test-LocalPortOpen -Port $Port)) { return 'absent' }
+    if ($null -ne $Tunnel -and -not $Tunnel.HasExited) { return 'owned' }
+    return 'foreign'
 }
 `;
 
@@ -115,6 +133,8 @@ $result = [pscustomobject]@{
     workerStarts = @($script:workers | ForEach-Object { $_.StartedAt })
     diedAt = @($script:diedAt)
     clock = $script:clock
+    workerSignals = $script:workerSignals
+    events = @($script:events)
 }
 Write-Output ('RESULT_JSON=' + ($result | ConvertTo-Json -Compress -Depth 6))
 `;
@@ -212,7 +232,7 @@ $script:OnTunnelStart = { param($p) $script:tunnelCount++; if ($script:tunnelCou
     expect(r.violations).toEqual([]);
   });
 
-  test('Test 5: a tunnel lost after the worker started restarts the same pair, never two of either', async () => {
+  test('recovery Tests 1 and 5: tunnel loss reconnects only the forward and preserves the in-flight worker', async () => {
     const r = await runScenario(`
 ${TUNNEL_LISTENER}
 $script:Tick = {
@@ -226,17 +246,20 @@ $script:Tick = {
 }
 `);
     expect(r.code).toBe(0);
-    expect(r.workers).toBe(2);
+    expect(r.workers).toBe(1);
     expect(r.tunnels).toBe(2);
     expect(r.maxAliveWorkers).toBe(1);
     expect(r.maxAliveTunnels).toBe(1);
-    expect(
-      r.log.some(l => l.includes('ssh tunnel exited while the worker ran (exit code 255)'))
-    ).toBe(true);
-    // the first worker was stopped by the launcher (it started it), and nothing else was
+    expect(r.log.some(l => l.includes('TRANSPORT_RECOVERED'))).toBe(true);
+    // Cleanup runs only after the original worker naturally completes its five-minute task.
     expect(r.stopped).toContain(1002);
+    expect(r.workerSignals).toBe(0);
+    expect(r.clock).toBeGreaterThanOrEqual(300);
+    expect(r.events.find(e => e.message.includes('TRANSPORT_RECOVERED'))?.liveWorkers).toEqual([
+      1002,
+    ]);
     expect(r.violations).toEqual([]);
-    expect((r.workerStarts[1] ?? 9999) - (r.diedAt[0] ?? 0)).toBeLessThanOrEqual(120);
+    expect((r.tunnelStarts[1] ?? 9999) - (r.diedAt[0] ?? 0)).toBe(1);
   });
 
   test('Overseer finding on df482267a: descendants that survive the stop block a replacement worker', async () => {
@@ -250,9 +273,9 @@ function Stop-OwnedProcess {
     if ($Process.Role -eq 'worker') { $script:DescendantsSurvived += 2 }
 }
 $script:Tick = {
-  $first = $script:tunnels[0]
+  $first = $script:workers[0]
   if ($first -and -not $first.HasExited -and ($script:clock - $first.StartedAt) -ge 60) {
-    $first.HasExited = $true; $first.ExitCode = 255
+    $first.HasExited = $true; $first.ExitCode = 1
   }
 }
 `);
@@ -350,6 +373,136 @@ $script:Tick = {
       await rm(dir, { recursive: true, force: true });
     }
   });
+});
+
+// Recovery runs through the existing supervisor. All clocks and processes here are synthetic;
+// the real PowerShell launcher is executed only on the hosted Windows runner, never the desktop.
+const RECOVERY_SCENARIO = `
+${TUNNEL_LISTENER}
+$script:WorkerExitAt = 1200
+$script:DuringTick = $null
+$script:Tick = {
+  $first = $script:tunnels[0]
+  if ($first -and -not $first.HasExited -and $script:clock -ge 5) {
+    $first.HasExited = $true; $first.ExitCode = 255; [void]$script:diedAt.Add($script:clock)
+  }
+  if ($script:DuringTick) { $null = & $script:DuringTick }
+  foreach ($w in $script:workers) {
+    if (-not $w.HasExited -and $script:clock -ge $script:WorkerExitAt) { $w.HasExited = $true; $w.ExitCode = 0 }
+  }
+}
+`;
+
+function expectPreservedWorker(r: ScenarioResult): void {
+  expect(r.code).toBe(0);
+  expect(r.workers).toBe(1);
+  expect(r.workerStarts).toEqual([0]);
+  expect(r.workerSignals).toBe(0);
+  expect(r.maxAliveWorkers).toBe(1);
+  expect(r.maxAliveTunnels).toBeLessThanOrEqual(1);
+  expect(r.violations).toEqual([]);
+}
+
+suite('owned tunnel recovery inside the current supervisor', () => {
+  test('Test 2: exactly three reconnects use 1/2/4 seconds and exhaustion holds beyond the stable reset window', async () => {
+    const r = await runScenario(`${RECOVERY_SCENARIO}
+$script:OnTunnelStart = { param($p) if ($script:tunnels.Count -gt 1) { $p.HasExited = $true; $p.ExitCode = 255 } }
+`);
+    expectPreservedWorker(r);
+    expect(r.tunnelStarts).toEqual([0, 6, 8, 12]);
+    expect(r.events.filter(e => e.message.startsWith('RECONNECT_ATTEMPT_')).map(e => e.at)).toEqual(
+      [6, 8, 12]
+    );
+    const exhausted = r.events.filter(e => e.message.includes('DEGRADED_EXHAUSTED'));
+    expect(exhausted).toHaveLength(1);
+    expect(exhausted[0]?.liveWorkers).toEqual([1002]);
+    expect(exhausted[0]?.workerSignals).toBe(0);
+    expect(r.clock).toBeGreaterThanOrEqual(1200);
+  });
+
+  test('readiness is bounded to 30 one-second checks per attempt with verified cleanup before replacement', async () => {
+    const r = await runScenario(`${RECOVERY_SCENARIO}
+$script:PortOpen = { return $script:tunnels.Count -eq 1 -and -not $script:tunnels[0].HasExited }
+`);
+    expectPreservedWorker(r);
+    expect(r.tunnelStarts).toEqual([0, 6, 38, 72]);
+    expect(r.sleeps.filter(s => s === 1)).toHaveLength(97); // 90 readiness + 1/2/4 backoff ticks
+    expect(r.events.find(e => e.message.includes('DEGRADED_EXHAUSTED'))?.at).toBe(102);
+    expect(r.tunnels).toBe(4);
+  });
+
+  test('successful reconnects do not reset the three-attempt budget on repeated drops', async () => {
+    const r = await runScenario(`${RECOVERY_SCENARIO}
+$script:DuringTick = {
+  foreach ($p in $script:tunnels) {
+    if (-not $p.HasExited -and ($script:clock - $p.StartedAt) -ge 5) { $p.HasExited = $true; $p.ExitCode = 255 }
+  }
+}
+`);
+    expectPreservedWorker(r);
+    expect(r.tunnels).toBe(4);
+    expect(r.log.filter(l => l.startsWith('RECONNECT_ATTEMPT_'))).toHaveLength(3);
+    expect(r.log.filter(l => l.includes('TRANSPORT_RECOVERED'))).toHaveLength(3);
+    expect(r.log.filter(l => l.includes('DEGRADED_EXHAUSTED'))).toHaveLength(1);
+  });
+
+  test.each([5, 6])(
+    'Test 3: a foreign listener arriving at second %s is held without killing or borrowing it',
+    async foreignAt => {
+      const r = await runScenario(`${RECOVERY_SCENARIO}
+$script:ListenerState = { param($p) if ($script:clock -ge ${foreignAt}) { return 'foreign' }; return 'absent' }
+`);
+      expectPreservedWorker(r);
+      expect(r.tunnels).toBe(1);
+      expect(r.stopped.every(pid => pid === 1001 || pid === 1002)).toBe(true);
+      expect(r.log.some(l => l.includes('FOREIGN_LISTENER_REFUSED'))).toBe(true);
+    }
+  );
+
+  test.each([6, 8])(
+    'Test 4: worker exit at second %s stops recovery during backoff or readiness',
+    async exitAt => {
+      const r = await runScenario(`${RECOVERY_SCENARIO}
+$script:WorkerExitAt = ${exitAt}
+$script:PortOpen = { return $script:tunnels.Count -eq 1 -and -not $script:tunnels[0].HasExited }
+`);
+      expectPreservedWorker(r);
+      expect(r.tunnels).toBe(exitAt === 6 ? 1 : 2);
+      expect(r.log).toContain('worker stopped cleanly');
+      expect(r.log.some(l => l.includes('DEGRADED_EXHAUSTED'))).toBe(false);
+    }
+  );
+
+  test('cleanup uncertainty holds the same worker without a reconnect or repeat cleanup while it lives', async () => {
+    const r = await runScenario(`${RECOVERY_SCENARIO}
+function Stop-OwnedProcess {
+  param($Process, $Tracked)
+  if ($null -eq $Process) { return }
+  [void]$script:stopped.Add($Process.Id)
+  if ($Process.Role -eq 'tunnel') { $script:DescendantsSurvived++; return }
+  if (-not $Process.HasExited) { $script:workerSignals++; $Process.HasExited = $true; $Process.ExitCode = -1 }
+}
+`);
+    expect(r.workers).toBe(1);
+    expect(r.workerSignals).toBe(0);
+    expect(r.tunnels).toBe(1);
+    expect(r.log.some(l => l.includes('CLEANUP_UNCERTAIN'))).toBe(true);
+    expect(r.log.some(l => l.startsWith('RECONNECT_ATTEMPT_'))).toBe(false);
+    expect(r.clock).toBeGreaterThanOrEqual(1200);
+  });
+
+  test.each(['unknown', 'throw'])(
+    'observation uncertainty (%s) holds without another tunnel or worker signal',
+    async mode => {
+      const r = await runScenario(`${RECOVERY_SCENARIO}
+$script:ListenerState = { param($p) ${mode === 'throw' ? "throw 'synthetic_observation_error'" : "return 'unknown'"} }
+`);
+      expectPreservedWorker(r);
+      expect(r.tunnels).toBe(1);
+      expect(r.log.some(l => l.includes('OBSERVATION_UNCERTAIN'))).toBe(true);
+      expect(r.log.some(l => l.startsWith('RECONNECT_ATTEMPT_'))).toBe(false);
+    }
+  );
 });
 
 // Test 6 (installer part): the real install-windows.ps1 runs against STUBBED Task Scheduler
@@ -1009,6 +1162,58 @@ ${body}
     await proc.exited;
     return { out, err, dir };
   }
+
+  test.each([
+    ['absent', '@()', 'absent', false],
+    [
+      'owned',
+      "[pscustomobject]@{ LocalAddress='127.0.0.1'; LocalPort=3900; State='Listen'; OwningProcess=1001 }",
+      'owned',
+      false,
+    ],
+    [
+      'foreign PID',
+      "[pscustomobject]@{ LocalAddress='127.0.0.1'; LocalPort=3900; State='Listen'; OwningProcess=4242 }",
+      'foreign',
+      false,
+    ],
+    [
+      'wildcard bind',
+      "[pscustomobject]@{ LocalAddress='0.0.0.0'; LocalPort=3900; State='Listen'; OwningProcess=1001 }",
+      'foreign',
+      false,
+    ],
+    [
+      'reused exited PID',
+      "[pscustomobject]@{ LocalAddress='127.0.0.1'; LocalPort=3900; State='Listen'; OwningProcess=1001 }",
+      'foreign',
+      true,
+    ],
+    [
+      'permission denied',
+      "Write-Error -Message 'synthetic_denied' -Category PermissionDenied",
+      'unknown',
+      false,
+    ],
+    [
+      'enumeration failed',
+      "Write-Error -Message 'synthetic_missing' -Category ObjectNotFound",
+      'unknown',
+      false,
+    ],
+  ] as const)('listener identity adapter: %s', async (_name, enumeration, expected, exited) => {
+    const { out, err, dir } = await runHost(`
+function Get-NetTCPConnection { [CmdletBinding()] param() ${enumeration} }
+$p = [pscustomobject]@{ Id=1001; HasExited=$${exited ? 'true' : 'false'} }
+Write-Output ('LISTENER=' + (Get-OwnedTunnelListenerState -Tunnel $p -Port 3900))
+`);
+    try {
+      expect(err).toBe('');
+      expect(out.trim()).toBe(`LISTENER=${expected}`);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 
   test('Start-TunnelProcess hands the launcher-owned ssh to the job object with the forward, keepalive and host intact', async () => {
     const { out, err, dir } = await runHost(`

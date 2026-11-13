@@ -1,6 +1,7 @@
 import { readFile } from 'fs/promises';
 import { homedir } from 'os';
 import { join } from 'path';
+import { createConnection } from 'node:net';
 import {
   classifyAliveHolder,
   defaultLookupIdentity,
@@ -33,6 +34,8 @@ export interface WatchdogDeps {
   readLock: (lockFile: string) => Promise<LockContents>;
   /** Start time and executable of a live PID; null when unreadable. */
   lookupIdentity: (pid: number) => ProcessIdentity | null;
+  /** Loopback port reachability only; it does not prove authenticated delivery. */
+  isTransportAvailable: () => Promise<boolean>;
   /** Start the worker scheduled task by name. Rejects on failure. */
   startTask: (taskName: string) => Promise<void>;
   /** Structured single-line logger. */
@@ -40,7 +43,7 @@ export interface WatchdogDeps {
 }
 
 export interface WatchdogResult {
-  action: 'started' | 'healthy';
+  action: 'started' | 'healthy' | 'degraded';
 }
 
 export function defaultWatchdogLockFile(workerId: string): string {
@@ -49,7 +52,8 @@ export function defaultWatchdogLockFile(workerId: string): string {
 
 /**
  * Decide and act: if the worker lock is missing or its PID is dead, start the
- * task; otherwise report healthy. Any startTask failure propagates to the
+ * task; otherwise report healthy or degraded without starting another task.
+ * Any startTask failure propagates to the
  * caller (runWatchdogMain), which turns it into a loud nonzero exit.
  */
 export async function checkWatchdog(
@@ -67,7 +71,13 @@ export async function checkWatchdog(
       deps.lookupIdentity(pid)
     );
     if (!verdict.stale) {
-      return { action: 'healthy' };
+      let available = false;
+      try {
+        available = await deps.isTransportAvailable();
+      } catch {
+        // An unreadable transport is never a reason to replace a live worker.
+      }
+      return { action: available ? 'healthy' : 'degraded' };
     }
     deps.log(`dispatch_worker_watchdog_reused_pid: pid=${pid} reason=${verdict.reason}`);
   }
@@ -78,7 +88,7 @@ export async function checkWatchdog(
 }
 
 /**
- * Main entry. Returns a process exit code: 0 on healthy/started, 1 when the
+ * Main entry. Returns a process exit code: 0 on healthy/degraded/started, 1 when the
  * restart attempt itself failed (logged loudly, never silent).
  */
 export async function runWatchdogMain(
@@ -132,6 +142,28 @@ async function realStartTask(taskName: string): Promise<void> {
   }
 }
 
+function realTransportAvailable(): Promise<boolean> {
+  return new Promise(resolve => {
+    const socket = createConnection({ host: '127.0.0.1', port: 3900 });
+    let settled = false;
+    const finish = (available: boolean): void => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(available);
+    };
+    socket.setTimeout(1_000, () => {
+      finish(false);
+    });
+    socket.once('connect', () => {
+      finish(true);
+    });
+    socket.once('error', () => {
+      finish(false);
+    });
+  });
+}
+
 function argValue(flag: string, fallback: string): string {
   const index = process.argv.indexOf(flag);
   if (index !== -1 && process.argv[index + 1]) return process.argv[index + 1];
@@ -148,6 +180,7 @@ if (import.meta.main) {
       isAlive: realIsAlive,
       readLock: readLockContents,
       lookupIdentity: defaultLookupIdentity,
+      isTransportAvailable: realTransportAvailable,
       startTask: realStartTask,
       log: (line: string): void => {
         console.error(line);

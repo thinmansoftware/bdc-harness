@@ -6,10 +6,13 @@ import type { LockContents, ProcessIdentity } from './instance-lock';
 
 const TASK = 'BlueDevil-Dispatch-Worker';
 
-function deps(overrides: Partial<WatchdogDeps>): WatchdogDeps {
+type TransportDeps = WatchdogDeps & { isTransportAvailable: () => Promise<boolean> };
+
+function deps(overrides: Partial<TransportDeps>): TransportDeps {
   return {
     readLockPid: mock(async () => null),
     isAlive: mock(() => false),
+    isTransportAvailable: mock(async () => true),
     readLock: mock(
       async (): Promise<LockContents> => ({
         pid: null,
@@ -26,6 +29,51 @@ function deps(overrides: Partial<WatchdogDeps>): WatchdogDeps {
 }
 
 describe('dispatch worker watchdog', () => {
+  test('recovery Test 6: a live worker without transport reports degraded without starting a task', async () => {
+    const lines: string[] = [];
+    const d = deps({
+      readLockPid: mock(async () => 4242),
+      isAlive: mock(() => true),
+      isTransportAvailable: mock(async () => false),
+      log: line => lines.push(line),
+    });
+    expect(await runWatchdogMain({ lockFile: '/tmp/x.lock', taskName: TASK }, d)).toBe(0);
+    expect(lines).toEqual([`dispatch_worker_watchdog_degraded: task=${TASK}`]);
+    expect(d.isTransportAvailable).toHaveBeenCalledTimes(1);
+    expect(d.startTask).not.toHaveBeenCalled();
+  });
+
+  test('transport observation failure preserves a live worker and reports degraded', async () => {
+    const d = deps({
+      readLockPid: mock(async () => 4242),
+      isAlive: mock(() => true),
+      isTransportAvailable: mock(async () => {
+        throw new Error('synthetic_probe_failure');
+      }),
+    });
+    expect((await checkWatchdog({ lockFile: '/tmp/x.lock', taskName: TASK }, d)).action).toBe(
+      'degraded'
+    );
+    expect(d.startTask).not.toHaveBeenCalled();
+  });
+
+  test('transport recovery reports healthy while keeping the same worker', async () => {
+    let available = false;
+    const d = deps({
+      readLockPid: mock(async () => 4242),
+      isAlive: mock(() => true),
+      isTransportAvailable: mock(async () => available),
+    });
+    expect((await checkWatchdog({ lockFile: '/tmp/x.lock', taskName: TASK }, d)).action).toBe(
+      'degraded'
+    );
+    available = true;
+    expect((await checkWatchdog({ lockFile: '/tmp/x.lock', taskName: TASK }, d)).action).toBe(
+      'healthy'
+    );
+    expect(d.startTask).not.toHaveBeenCalled();
+  });
+
   test('Test 7: watchdog_starts_the_task_when_the_lock_pid_is_dead', async () => {
     const startTask = mock(async () => {});
     const d = deps({
@@ -205,5 +253,6 @@ describe('dispatch worker watchdog: process identity (WO-HARNESS-DISPATCH-WORKER
 
     expect(result.action).toBe('started');
     expect(lookupIdentity).not.toHaveBeenCalled();
+    expect(d.isTransportAvailable).not.toHaveBeenCalled();
   });
 });
