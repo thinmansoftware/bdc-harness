@@ -163,10 +163,14 @@ dprep__candidates() {
 # and nothing is installed or touched: no snapshot, no restore, so there is no restore logic to get wrong.
 # This costs nothing on the normal path: prep-dependencies installs on the clean tree BEFORE implement, so a
 # later call finds node_modules present and skips. On a clean tree every tracked change after the install is
-# the install's own doing, and is put back with git checkout (`dprep: restored <path>`). Outside a git work
+# the install's own doing (a lifecycle script may rewrite a file, stage it, add a new file to the index or even
+# commit), so the restore is COMPLETE BY CONSTRUCTION rather than path by path: the commit and ref saved before
+# the install are the pre-install state, and `git reset --hard` to that commit puts the index and every tracked
+# file back (`dprep: restored <path>` per path). Nothing of value can be lost because the tree was proven clean.
+# If the install changed the checked-out ref, nothing is touched and the return code is 1. Outside a git work
 # tree the folder's package.json and lockfiles are copied aside and restored.
 dprep__guarded_install_in() {
-  local dir="$1" kind rc=0 saved="" f top dirty changed path
+  local dir="$1" kind rc=0 saved="" f top dirty changed path head_before ref_before ref_after
   printf 'dprep: package folder %s\n' "$dir"
   kind="$(cd "$dir" && dprep__kind 1)"
   if [ -d "$dir/node_modules" ]; then
@@ -186,6 +190,12 @@ dprep__guarded_install_in() {
       printf 'dprep: working tree has uncommitted changes; install skipped in %s (refuse-on-dirty: nothing installed, nothing touched)\n' "$dir"
       return 1
     fi
+    head_before="$(git -C "$top" rev-parse --verify -q HEAD 2>/dev/null)" || head_before=""
+    if [ -z "$head_before" ]; then
+      printf 'dprep: the repository has no commit to restore to; install skipped in %s\n' "$dir"
+      return 1
+    fi
+    ref_before="$(git -C "$top" symbolic-ref -q HEAD 2>/dev/null || echo detached)"
   else
     saved="$(mktemp -d 2>/dev/null)" || saved=""
     if [ -z "$saved" ]; then
@@ -203,18 +213,46 @@ dprep__guarded_install_in() {
   fi
   (cd "$dir" && dprep__install_here "$kind") || rc=$?
   if [ -n "$top" ]; then
-    changed="$(git -C "$top" -c core.quotepath=off diff --name-only 2>/dev/null)"
-    while IFS= read -r path; do
-      [ -n "$path" ] || continue
-      if git -C "$top" checkout -- "$path" 2>/dev/null; then
-        printf 'dprep: restored %s\n' "$path"
-      else
-        printf 'dprep: RESTORE FAILED %s\n' "$path"
-        [ "$rc" -eq 0 ] && rc=1
-      fi
-    done <<EOF
+    ref_after="$(git -C "$top" symbolic-ref -q HEAD 2>/dev/null || echo detached)"
+    if [ "$ref_after" != "$ref_before" ]; then
+      printf 'dprep: the install changed the checked-out ref (%s -> %s); nothing restored in %s\n' "$ref_before" "$ref_after" "$dir"
+      [ "$rc" -eq 0 ] && rc=1
+    elif [ "$(git -C "$top" rev-parse --verify -q HEAD 2>/dev/null)" != "$head_before" ] \
+      || ! git -C "$top" diff --quiet "$head_before" 2>/dev/null \
+      || ! git -C "$top" diff --cached --quiet "$head_before" 2>/dev/null; then
+      # Differs from the pre-install commit in the worktree, the index or HEAD itself (staged edits, staged new
+      # files, an install commit, deletions). List the paths, then put everything back.
+      changed="$(
+        { git -C "$top" -c core.quotepath=off diff --name-only "$head_before" 2>/dev/null
+          git -C "$top" -c core.quotepath=off diff --cached --name-only "$head_before" 2>/dev/null
+          git -C "$top" -c core.quotepath=off diff --name-only "$head_before" HEAD 2>/dev/null
+        } | LC_ALL=C sort -u
+      )"
+      # Log what differed BEFORE the reset, so the evidence exists even if the reset itself fails.
+      while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        printf 'dprep: install changed %s
+' "$path"
+      done <<EOF
 $changed
 EOF
+      # WHY A HARD RESET IS SAFE HERE: it runs only on a tree that refuse-on-dirty above proved CLEAN before
+      # the install (nothing modified, staged, deleted or untracked except node_modules), and only when the
+      # ref is unchanged. So everything that differs from the saved commit is the install's own doing, and
+      # nothing of anyone's work can be lost. `git reset --hard` never touches untracked files, so what the
+      # install created (node_modules) stays and nothing else is deleted.
+      if git -C "$top" reset -q --hard "$head_before" 2>/dev/null; then
+        while IFS= read -r path; do
+          [ -n "$path" ] || continue
+          printf 'dprep: restored %s\n' "$path"
+        done <<EOF
+$changed
+EOF
+      else
+        printf 'dprep: RESTORE FAILED (git reset --hard %s) in %s\n' "$head_before" "$dir"
+        [ "$rc" -eq 0 ] && rc=1
+      fi
+    fi
   else
     for f in package.json bun.lock bun.lockb pnpm-lock.yaml package-lock.json yarn.lock; do
       if [ -f "$saved/$f" ] && ! cmp -s "$saved/$f" "$dir/$f"; then

@@ -36,8 +36,13 @@ that have a `package.json` plus a supported lockfile. It prints `dprep: package 
   skipped in <folder> (refuse-on-dirty: nothing installed, nothing touched)`, returns 1 for that folder, and does
   nothing else: no snapshot, no restore, so no earlier edit can be lost. This costs nothing on the normal path:
   `prep-dependencies` installs on the clean tree BEFORE implement, so a later call (`run-stop-tests`) finds
-  `node_modules` and skips. On a clean tree every tracked change after the install is the install's own, and each
-  is put back with `git checkout -- <file>` (`dprep: restored <path>`). Outside a git work tree the folder's
+  `node_modules` and skips. On a clean tree everything that differs afterwards is the install's own (a lifecycle script may rewrite a
+  file, stage it, stage a new file, or even commit), so the restore is complete by construction: dprep saves the
+  commit and ref before the install and, after it, logs `dprep: install changed <path>` for every path that
+  differs from that commit (worktree, index or HEAD), then runs `git reset --hard` to the saved commit and
+  reports `dprep: restored <path>`. This is safe only because refuse-on-dirty proved the tree clean first, and
+  `git reset --hard` never touches untracked files. If the install changed the checked-out ref, nothing is
+  touched and dprep returns 1. Outside a git work tree the folder's
   `package.json` and lockfiles are copied aside and restored (a failed copy skips the install). (Reason:
   `commit-and-push` tolerates lockfile changes only at the top level, so a rewritten `shopops-api/bun.lock` could
   otherwise ship in the build PR.)

@@ -46,6 +46,11 @@ case "$1" in
     [ -n "${STUB_NPM_FAIL_CI:-}" ] && exit 1
     failhere && exit 1
     if [ -n "${STUB_TOUCH_SOURCE:-}" ]; then mkdir -p routes; echo "install clobbered" > routes/x.js; fi
+    if [ -n "${STUB_STAGE_SOURCE:-}" ]; then mkdir -p routes; echo "install staged rewrite" > routes/x.js; git add routes/x.js; fi
+    if [ -n "${STUB_STAGE_NEWFILE:-}" ]; then mkdir -p routes; echo "staged new" > routes/staged-new.js; git add routes/staged-new.js; fi
+    if [ -n "${STUB_COMMIT:-}" ]; then mkdir -p routes; echo "install committed" > routes/x.js; git add routes/x.js; git -c user.email=t@e.com -c user.name=t commit -qm install-commit; fi
+    if [ -n "${STUB_SWITCH_BRANCH:-}" ]; then git checkout -q -b install-branch; fi
+    if [ -n "${STUB_UNTRACKED:-}" ]; then echo "install output" > generated-untracked.txt; fi
     mkdir -p node_modules; exit 0 ;;
   install)
     failhere && exit 1
@@ -296,6 +301,44 @@ check "T9m return code 0 (node_modules present)" 0 "$RC"
 has "T9m skipped, not refused" "node_modules present" "$OUT"
 hasnt "T9m not refused" "refuse-on-dirty" "$OUT"
 check "T9m no install ran" 0 "$(reclines)"
+
+# ---- Complete restore on a clean tree (PR 1597 review round 4): reset to the saved pre-install commit ---------
+# A lifecycle script may stage a rewrite, stage a NEW file, commit, or leave untracked output.
+T9N="$(mkdirty t9n)"; BEFORE="$(sums "$T9N" shopops-api/routes/x.js)"; HEAD0="$(git -C "$T9N" rev-parse HEAD)"
+run_dprep "$T9N" STUB_STAGE_SOURCE=1
+check "T9n staged rewrite: return code 0" 0 "$RC"
+check "T9n the staged rewrite is back byte for byte" "$BEFORE" "$(sums "$T9N" shopops-api/routes/x.js)"
+check "T9n nothing is left staged" "" "$(git -C "$T9N" diff --cached --name-only)"
+check "T9n git sees no modified tracked file" "" "$(git -C "$T9N" diff --name-only)"
+has "T9n the list of what differed was logged first" "dprep: install changed shopops-api/routes/x.js" "$OUT"
+has "T9n the restore is reported" "dprep: restored shopops-api/routes/x.js" "$OUT"
+check "T9n HEAD is unchanged" "$HEAD0" "$(git -C "$T9N" rev-parse HEAD)"
+
+T9O="$(mkdirty t9o)"
+run_dprep "$T9O" STUB_STAGE_NEWFILE=1
+check "T9o staged new file: return code 0" 0 "$RC"
+check "T9o the new file is no longer staged" "" "$(git -C "$T9O" diff --cached --name-only)"
+# The install created AND staged it, so pre-install it did not exist: the reset removes it (a file staged by the
+# install is the install's own); a file that is merely untracked is never touched (T9r).
+[ ! -e "$T9O/shopops-api/routes/staged-new.js" ] && ok "T9o the file the install created and staged is gone (pre-install it did not exist)" || bad "T9o the install's staged new file is still there"
+
+T9P="$(mkdirty t9p)"; BEFORE="$(sums "$T9P" shopops-api/routes/x.js)"; HEAD0="$(git -C "$T9P" rev-parse HEAD)"
+run_dprep "$T9P" STUB_COMMIT=1
+check "T9p install commit: return code 0" 0 "$RC"
+check "T9p HEAD is back at the pre-install commit" "$HEAD0" "$(git -C "$T9P" rev-parse HEAD)"
+check "T9p the file is back byte for byte" "$BEFORE" "$(sums "$T9P" shopops-api/routes/x.js)"
+
+T9Q="$(mkdirty t9q)"
+run_dprep "$T9Q" STUB_TOUCH_SOURCE=1 STUB_SWITCH_BRANCH=1
+check "T9q ref changed: return code 1" 1 "$RC"
+has "T9q the ref change is reported" "changed the checked-out ref" "$OUT"
+hasnt "T9q nothing was restored" "dprep: restored" "$OUT"
+check "T9q the install's own branch was NOT reset" "install clobbered" "$(cat "$T9Q/shopops-api/routes/x.js")"
+
+T9R="$(mkdirty t9r)"
+run_dprep "$T9R" STUB_UNTRACKED=1
+check "T9r untracked output: return code 0" 0 "$RC"
+[ -f "$T9R/shopops-api/generated-untracked.txt" ] && ok "T9r what the install created stays (reset never touches untracked files)" || bad "T9r an untracked file was removed"
 
 # (4) outside a git work tree the lockfile and package.json are still restored
 T9E="$WORK/t9e"; mkpkg "$T9E"; mkpkg "$T9E/shopops-api" package-lock.json
