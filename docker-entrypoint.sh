@@ -17,21 +17,38 @@ if [ "$(id -u)" = "0" ]; then
   # appuser (normally none), warn with a count on partial failure, and fail
   # hard only if the directory itself is not writable by appuser.
   # Returns 1 when any chown failed (after printing the WARN line).
+  # WO-HARNESS-BOOT-CHOWN-WALK-AND-REBUILD-EVIDENCE-01: an optional second argument is a -path
+  # pattern whose matches are CHECKED but not descended into. GNU find's comma operator runs both
+  # branches on every entry, so a pruned entry is still fixed when it has the wrong owner (the form
+  # "-path P -prune -o ..." would skip it). /.archon prunes the run workspaces below their top two
+  # levels: walking all ~1.5M workspace entries on a cold cache after an image build outlasted the
+  # health window and hung boot with no output (2026-11-13, bdc-xo #5970). Each walk is announced
+  # before it starts and timed, so a slow walk is visible in the log.
   _chown_wrong_owner() {
     _cwo_dir="$1"
+    _cwo_prune="${2:-}"
     _cwo_failed=0
+    _cwo_start=$(date +%s)
+    echo "[archon] ownership check: ${_cwo_dir} ..." >&2
     while IFS= read -r -d '' _cwo_path; do
       if ! chown -h appuser:appuser "$_cwo_path" 2>/dev/null; then
         _cwo_failed=$((_cwo_failed + 1))
       fi
-    done < <(find "$_cwo_dir" ! -user appuser -print0 2>/dev/null)
+    done < <(
+      if [ -n "$_cwo_prune" ]; then
+        find "$_cwo_dir" \( ! -user appuser -print0 \) , \( -path "$_cwo_prune" -prune \) 2>/dev/null
+      else
+        find "$_cwo_dir" ! -user appuser -print0 2>/dev/null
+      fi
+    )
+    echo "[archon] ownership check: ${_cwo_dir} done in $(( $(date +%s) - _cwo_start ))s" >&2
     if [ "$_cwo_failed" -gt 0 ]; then
       echo "WARN: could not fix ownership of ${_cwo_failed} paths under ${_cwo_dir} -- continuing" >&2
       return 1
     fi
     return 0
   }
-  _chown_wrong_owner /.archon || true
+  _chown_wrong_owner /.archon "/.archon/workspaces/*/*" || true
   if ! gosu appuser test -w /.archon; then
     echo "ERROR: Failed to fix ownership of /.archon -- volume may be read-only or mounted with incompatible options" >&2
     exit 1
