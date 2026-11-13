@@ -60,12 +60,15 @@ async function insertMessage(
 }
 
 async function rows(): Promise<Row[]> {
-  return (
-    await db.query<Row>(
-      `SELECT id, addressed_at, addressed_by, acknowledged_at, acknowledged_by, status
+  // QueryResult.rows is readonly; copy it so callers get a plain Row[] (TS4104).
+  return [
+    ...(
+      await db.query<Row>(
+        `SELECT id, addressed_at, addressed_by, acknowledged_at, acknowledged_by, status
        FROM agent_dispatch_messages ORDER BY id`
-    )
-  ).rows;
+      )
+    ).rows,
+  ];
 }
 
 function auditLines(): Array<Record<string, unknown>> {
@@ -90,7 +93,7 @@ const FILTERS = [
 async function run(
   argv: string[],
   beforeUpdateForTests?: (
-    query: <T>(sql: string, params?: unknown[]) => Promise<unknown>
+    query: (sql: string, params?: unknown[]) => Promise<unknown>
   ) => Promise<void>
 ): Promise<{ code: number; out: string[]; err: string[] }> {
   const out: string[] = [];
