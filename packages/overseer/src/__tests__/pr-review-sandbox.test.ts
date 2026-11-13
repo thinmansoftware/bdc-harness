@@ -636,6 +636,8 @@ async function reviewObservedCheckout(input: {
     const result = await runAndSubmitReview(item, {
       ...wired,
       currentHeadSha: async () => input.head,
+      // The stub octokit has no pulls.get; the PR is not a draft (WO-HARNESS-MERGE-GATES-01 Amendment 1).
+      isDraft: async () => false,
       hasCustody: async () => true,
       recordExecutionProof: async () => {
         proofRecords += 1;

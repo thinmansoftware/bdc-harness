@@ -31,7 +31,9 @@ function octokitReturning(data: Record<string, unknown>) {
         },
       }),
       merge,
+      listReviews: async () => ({ data: [] }),
     },
+    issues: { listEventsForTimeline: async () => ({ data: [] }) },
   } as unknown as RealGitHubOctokitLike;
   return { octokit, merge };
 }

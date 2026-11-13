@@ -18,6 +18,8 @@ all call it. A PR with any of these reasons is not approved and not merged by an
 | `pr_is_draft` | the PR is a draft | mark it ready for review |
 | `fallback_pr_title` | the title starts with `FALLBACK:` (a lane's salvage PR from a failed run) | a person edits the title once the PR is judged good |
 | `pr_labels_unknown`, `pr_draft_unknown` | the merge function's fresh response lacked the labels or the draft field (fails closed, never assumed clean) | none needed; it clears when GitHub returns the field |
+| `approval_given_while_draft` | the Overseer's latest approval at the head was submitted while the PR was a draft (Amendment 1) | none: a fresh Overseer review or the coordinator's approval after the PR is ready replaces it |
+| `pr_approval_state_unknown` | the draft/ready timeline or the reviews could not be read through every page (fails closed) | none needed; it clears when the reads complete |
 
 Before this change `merge-hold` held only the coordinator. The manager checked `owner:reworking` alone, so a
 run-backed PR carrying `merge-hold` was merged by the manager (shopops-storefront PR 239, 2026-11-13:
@@ -31,9 +33,23 @@ counted). As a second line of defence, GitHub's refusal text "Pull Request is st
 reason are classified transient (`merge-skip-classification.ts`), and a hold that reaches `skip()` releases the
 claim instead of consuming the retry budget. Before this change that 405 was recorded as a FINAL outcome, so
 marking the PR ready later did nothing (11 verdicts between 2026-11-12 and 2026-11-13, bdc-xo #6036).
-A PR that was a draft when the Overseer approved it now merges on the first coordinator tick after it is marked
-ready, with no manual requeue. Consequence for people: "mark ready" can be the merge itself. Mark a PR ready
-only at a head that is cleared.
+A PR that is marked ready is picked up again on the next coordinator tick, with no manual requeue: the
+coordinator posts its own approval at the ready head and then merges. Consequence for people: "mark ready" can
+be the merge itself. Mark a PR ready only at a head that is cleared.
+
+## No review on a draft, and a draft-era approval is void (Amendment 1)
+
+The review worker re-reads the draft state immediately before it submits any review
+(`runAndSubmitReview`, `pr-review-submit.ts`). A draft, or a draft state that cannot be read, submits nothing
+and finishes `pr_is_draft`, a non-terminal deferral like `checks_pending`; `ready_for_review` queues a fresh
+review. Before this, a review queued while the PR was open could land on it after it was drafted
+(comicstoreos-provisioner PR 112, approved at 19:21:40Z on 2026-11-13 while a draft).
+
+As a second line, the merge function (`createRealMergePullRequest`) reads the PR's `convert_to_draft` and
+`ready_for_review` events and the Overseer's reviews through EVERY page, and refuses
+`approval_given_while_draft` when the Overseer's latest approval at the head was submitted while the PR was a
+draft. An approval at exactly an event's time counts as given while a draft. A failed or partial read refuses
+`pr_approval_state_unknown`. An approval given before the PR was drafted stays valid.
 
 ## A failed run is held at ANY node
 
@@ -58,7 +74,7 @@ it; a person marks it ready.
 ## Checks
 
 ```
-cd packages/overseer && bun test src/merge-holds.test.ts src/merge-manager-holds.test.ts src/merge-execution-bridge-holds.test.ts src/adapters/github-real-merge-holds.test.ts src/merge-skip-classification-draft.test.ts src/merge-holds-run-backed.test.ts
+cd packages/overseer && bun test src/merge-holds.test.ts src/merge-manager-holds.test.ts src/merge-execution-bridge-holds.test.ts src/adapters/github-real-merge-holds.test.ts src/merge-skip-classification-draft.test.ts src/merge-holds-run-backed.test.ts src/pr-review-submit-draft.test.ts src/merge-approval-draft-void.test.ts
 bun test ./packages/workflows/src/lane-fallback-draft.test.ts
 ```
 

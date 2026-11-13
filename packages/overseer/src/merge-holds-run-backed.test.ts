@@ -66,7 +66,10 @@ function fakeGitHub(initialLabels: string[]) {
         state.mergesSucceeded += 1;
         return { data: { merged: true, sha: 'f'.repeat(40), message: 'merged' } };
       },
+      // Amendment 1: no review and no draft/ready event, so no draft-era approval to void.
+      listReviews: async () => ({ data: [] }),
     },
+    issues: { listEventsForTimeline: async () => ({ data: [] }) },
   } as unknown as RealGitHubOctokitLike;
   return { state, octokit };
 }

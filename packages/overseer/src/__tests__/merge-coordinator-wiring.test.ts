@@ -268,6 +268,13 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
     const pullsMerge = mock(async () => ({ data: { merged: true, sha: RUN_HEAD_SHA } }));
     octokit.pulls.get = pullsGet as unknown as RealGitHubOctokitLike['pulls']['get'];
     octokit.pulls.merge = pullsMerge as unknown as RealGitHubOctokitLike['pulls']['merge'];
+    // WO-HARNESS-MERGE-GATES-01 Amendment 1: the merge function reads every review and the
+    // draft/ready timeline before merging; empty lists here (no network).
+    octokit.pulls.listReviews = (async () => ({
+      data: [],
+    })) as unknown as RealGitHubOctokitLike['pulls']['listReviews'];
+    (octokit as unknown as { issues: Record<string, unknown> }).issues.listEventsForTimeline =
+      async () => ({ data: [] });
 
     const insertOverseerAction = mock(async () => undefined);
     const judge = mock(async input => approveReceipt(input));

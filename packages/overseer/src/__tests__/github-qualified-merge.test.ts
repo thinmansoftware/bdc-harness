@@ -93,7 +93,15 @@ function createOctokitMock(overrides: Partial<RealGitHubOctokitLike> = {}): Real
         },
       }),
       merge: async () => ({ data: { merged: true, sha: 'a'.repeat(40) } }),
+      // Amendment 1 of WO-HARNESS-MERGE-GATES-01: the merge function reads every review and the
+      // draft/ready timeline; empty lists mean no draft-era approval.
+      listReviews: async () => ({ data: [] }),
       ...overrides.pulls,
+    },
+    issues: {
+      createComment: async () => ({ data: {} }),
+      listEventsForTimeline: async () => ({ data: [] }),
+      ...overrides.issues,
     },
     search: {
       issuesAndPullRequests: async () => ({ data: { items: [] } }),

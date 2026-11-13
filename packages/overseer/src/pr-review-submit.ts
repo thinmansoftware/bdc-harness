@@ -215,7 +215,14 @@ export type SubmitDisposition =
    * apart in the receipt when diagnosing why a review did not land.
    */
   | 'rate_limited'
-  | 'review_incomplete';
+  | 'review_incomplete'
+  /**
+   * NON-TERMINAL (WO-HARNESS-MERGE-GATES-01 Amendment 1). The PR is a draft at submit time (or its
+   * draft state could not be read), so NO review is submitted: a review queued before the PR was
+   * drafted must not land on the draft (comicstoreos-provisioner PR 112, 2026-11-13). Deferred like
+   * `checks_pending`; nothing is retired, and ready_for_review queues a fresh review.
+   */
+  | 'pr_is_draft';
 
 export interface SubmitOutcome {
   disposition: SubmitDisposition;
@@ -275,6 +282,12 @@ export interface SubmitDeps {
    * must never land on a head the reviewer did not examine.
    */
   currentHeadSha(input: { owner: string; repo: string; prNumber: number }): Promise<string>;
+  /**
+   * Whether the PR is a draft, re-read immediately before any review is submitted
+   * (WO-HARNESS-MERGE-GATES-01 Amendment 1). The real wiring always provides it and throws when the
+   * draft field is missing; a throw is a non-terminal deferral and nothing is submitted.
+   */
+  isDraft?(input: { owner: string; repo: string; prNumber: number }): Promise<boolean>;
   recordReceipt(input: {
     correlationId: string;
     messageId: string;
@@ -538,6 +551,30 @@ export async function runAndSubmitReview(
       disposition: 'stale_head',
       reason: 'head_advanced_during_review',
     });
+  }
+
+  // NO REVIEW ON A DRAFT (WO-HARNESS-MERGE-GATES-01 Amendment 1). The draft check at ingest
+  // (pr-review-ingest.ts) reads the webhook payload when the review is QUEUED; a PR drafted while the
+  // review waited would otherwise receive it. Re-read here, after both head gates and before EVERY
+  // submit below. A draft, or a draft state that cannot be read, submits nothing and defers.
+  if (deps.isDraft) {
+    let draft: boolean;
+    try {
+      draft = await deps.isDraft({ owner: work.owner, repo: work.repo, prNumber: work.prNumber });
+    } catch (error) {
+      const rateLimit = classifyRateLimitError(error);
+      if (rateLimit) return rateLimitedOutcome(deps, work, 'draft_recheck', rateLimit);
+      return finish(deps, work, work.headSha, {
+        disposition: 'pr_is_draft',
+        reason: `draft_recheck_failed:${errorCode(error)}`,
+      });
+    }
+    if (draft) {
+      return finish(deps, work, work.headSha, {
+        disposition: 'pr_is_draft',
+        reason: 'pr_is_draft_at_submit',
+      });
+    }
   }
 
   // Execution qualification runs AFTER both head gates: an incomplete review
@@ -960,7 +997,7 @@ function summaryField(verdict: ReviewerVerdict): { summary?: string } {
 function rateLimitedOutcome(
   deps: SubmitDeps,
   work: ReviewWorkItem,
-  stage: 'head_recheck' | 'submit',
+  stage: 'head_recheck' | 'draft_recheck' | 'submit',
   rateLimit: NonNullable<ReturnType<typeof classifyRateLimitError>>
 ): Promise<SubmitOutcome> {
   return finish(deps, work, work.headSha, {

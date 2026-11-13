@@ -303,6 +303,12 @@ function octokitWithReview(
       }),
       merge: async () => ({ data: { merged: true, sha: 'a'.repeat(40) } }),
       createReview,
+      // Amendment 1 of WO-HARNESS-MERGE-GATES-01: empty review and timeline lists = no draft-era approval.
+      listReviews: async () => ({ data: [] }),
+    },
+    issues: {
+      createComment: async () => ({ data: {} }),
+      listEventsForTimeline: async () => ({ data: [] }),
     },
     search: { issuesAndPullRequests: async () => ({ data: { items: [] } }) },
     checks: { listForRef: async () => ({ data: { check_runs: [] } }) },

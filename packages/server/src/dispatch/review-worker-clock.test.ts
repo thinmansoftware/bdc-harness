@@ -352,6 +352,35 @@ describe('review worker clock', () => {
     expect(deps.postResult).not.toHaveBeenCalled();
   });
 
+  // WO-HARNESS-MERGE-GATES-01 Amendment 1: a PR that is a draft at submit time gets no review, and the
+  // item is DEFERRED, never retired (pr_is_draft is non-terminal like checks_pending).
+  test('defers (never posts) a pr_is_draft item with a future defer_until', async () => {
+    const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
+    const deps = fakeDeps([message('drafted', 'exact-head')], () => ({
+      disposition: 'pr_is_draft',
+      reason: 'pr_is_draft_at_submit',
+    }));
+    deps.logger = { warn: (data, logMessage) => warnings.push({ data, message: logMessage }) };
+
+    const before = Date.now();
+    await tickReviewWorkerClock(CONFIG, deps);
+
+    expect(deps.deferMessage).toHaveBeenCalledTimes(1);
+    const deferArg = (deps.deferMessage as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+      id: string;
+      defer_until: string;
+    };
+    expect(deferArg.id).toBe('drafted');
+    expect(new Date(deferArg.defer_until).getTime()).toBeGreaterThan(before);
+    expect(warnings).toEqual([
+      expect.objectContaining({
+        message: 'overseer_review_pr_is_draft_deferred',
+        data: expect.objectContaining({ messageId: 'drafted', reason: 'pr_is_draft_at_submit' }),
+      }),
+    ]);
+    expect(deps.postResult).not.toHaveBeenCalled();
+  });
+
   test('logs no_checks_reported when a checks-pending outcome has no names', async () => {
     const warnings: Array<{ data: Record<string, unknown>; message: string }> = [];
     // A fresh row: older than the bound it would end as no_checks_reported (see review-worker-no-checks.test.ts).

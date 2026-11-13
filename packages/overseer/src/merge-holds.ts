@@ -21,7 +21,11 @@ export type MergeHoldReason =
   | 'pr_is_draft'
   | 'fallback_pr_title'
   | 'pr_labels_unknown'
-  | 'pr_draft_unknown';
+  | 'pr_draft_unknown'
+  /** Amendment 1: the Overseer's latest approval at the head was given while the PR was a draft. */
+  | 'approval_given_while_draft'
+  /** Amendment 1: the draft/ready events or the reviews could not be read completely (fail closed). */
+  | 'pr_approval_state_unknown';
 
 export interface MergeHoldInput {
   /** GitHub label names. Undefined means "not loaded", which is not the same as "no labels". */
@@ -48,6 +52,8 @@ export const MERGE_HOLD_REASONS: ReadonlySet<string> = new Set<MergeHoldReason>(
   'fallback_pr_title',
   'pr_labels_unknown',
   'pr_draft_unknown',
+  'approval_given_while_draft',
+  'pr_approval_state_unknown',
 ]);
 
 const FALLBACK_TITLE = /^\s*FALLBACK:/i;
