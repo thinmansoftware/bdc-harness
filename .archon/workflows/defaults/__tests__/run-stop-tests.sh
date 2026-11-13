@@ -1804,9 +1804,7 @@ named_end rst_quoted_andand_is_one_word_and_cd_chain_works
 echo "--- rst_missing_helper_refuses_quotes_only ---"
 named_begin
 W14="$RSTQ/w14"; mkdir -p "$W14"
-# This case is "the helper is missing". Drop the image fallback so a builder
-# image that already has /app/scripts/lane/rsg-argv.sh still exercises that path.
-printf '%s\n' "$RST_CORE" | sed 's| /app/scripts/lane/rsg-argv.sh||' > "$RSTQ/core14.sh"
+printf '%s\n' "$RST_CORE" > "$RSTQ/core14.sh"
 cat > "$RSTQ/drive14.sh" <<'DRIVE'
 #!/usr/bin/env bash
 . "$1"

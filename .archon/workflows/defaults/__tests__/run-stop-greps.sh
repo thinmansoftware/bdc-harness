@@ -39,15 +39,6 @@ assert_contains() {
   fi
 }
 
-assert_not_contains() {
-  local label="$1" needle="$2" haystack="$3"
-  if printf '%s\n' "$haystack" | grep -Fq "$needle"; then
-    FAIL=$((FAIL + 1)); echo "FAIL: $label"; echo "  needle present: $needle"
-  else
-    PASS=$((PASS + 1)); echo "PASS: $label"
-  fi
-}
-
 NAMED_FAIL_MARK=0
 named_begin() { NAMED_FAIL_MARK=$FAIL; }
 named_end() {
@@ -446,9 +437,7 @@ echo "--- rsg_script_missing_fails_closed ---"
 named_begin
 TMP5="$(mktemp -d)"
 printf 'alpha\nbeta\n' > "$TMP5/fixture.txt"
-# This case is "the helper is missing". Drop the image fallback so a builder
-# image that already has /app/scripts/lane/rsg-argv.sh still exercises that path.
-printf '%s\n' "$RSG_CORE" | sed 's| /app/scripts/lane/rsg-argv.sh||' > "$TMP5/core.sh"
+printf '%s\n' "$RSG_CORE" > "$TMP5/core.sh"
 printf '. ./core.sh\nif rsg_allow_cmd "grep -c alpha fixture.txt"; then echo ALLOW_RC=0; else echo ALLOW_RC=1; fi\nprintf "grep -c alpha fixture.txt\\teq\\t1\\nUNPARSED\\t0\\nDECLARED\\t1\\n" | rsg_run\nrsg_exec_pipeline "grep -c alpha fixture.txt" >/dev/null 2>&1; echo EXEC_RC=$?\n' > "$TMP5/drive.sh"
 MISSING_OUT="$(cd "$TMP5" && env -u ARCHON_LANE_SCRIPTS_DIR BDC_RSGARGV_SCRIPT=/nonexistent/rsg-argv.sh bash ./drive.sh 2>&1)"
 assert_contains "script missing: rsg_allow_cmd returns 1" "ALLOW_RC=1" "$MISSING_OUT"

@@ -70,12 +70,8 @@ const DEFAULT_LOOKBACK_DAYS = 14;
  * cursor (date of the newest reconcile_close) and today minus this floor, so a PR
  * that merged a few days before the newest close is still re-scanned. The existing
  * re-close / already-closed guards make the rescan idempotent. Env-overridable.
- * Read on each pass so a test can pin the floor without a process restart.
  */
-function reconcileMinLookbackDays(): number {
-  const parsed = Number(process.env.RECONCILE_MIN_LOOKBACK_DAYS ?? 7);
-  return Number.isFinite(parsed) ? parsed : 7;
-}
+const RECONCILE_MIN_LOOKBACK_DAYS = Number(process.env.RECONCILE_MIN_LOOKBACK_DAYS ?? 7);
 const DONE_LABEL = 'wo:done';
 
 export interface ReconcileMergedPullRequest {
@@ -2072,10 +2068,10 @@ export async function listPullRequestFilePaths(
 async function resolveSearchSince(input: RunReconcileInput, deps: ReconcileDeps): Promise<string> {
   const now = deps.now?.() ?? new Date();
   const dayMs = 24 * 60 * 60 * 1000;
-  // Floor: always rescan at least the last reconcileMinLookbackDays() so a PR
+  // Floor: always rescan at least the last RECONCILE_MIN_LOOKBACK_DAYS so a PR
   // that merged shortly BEFORE the newest reconcile_close is not skipped. The
   // re-close / already-closed guards make the overlap idempotent.
-  const floorDays = reconcileMinLookbackDays();
+  const floorDays = Number.isFinite(RECONCILE_MIN_LOOKBACK_DAYS) ? RECONCILE_MIN_LOOKBACK_DAYS : 7;
   const floor = new Date(now.getTime() - floorDays * dayMs).toISOString().slice(0, 10);
 
   const cursor = await (deps.readCursor ?? readReconcileCursorFromActions)();
@@ -2100,7 +2096,7 @@ export async function searchMergedPullRequests(
 
 /**
  * Cross-run cache of merged pull request details (WO-HARNESS-OVERSEER-GITHUB-READ-BUDGET-01 part 2,
- * bdc-xo#5571). Every reconcile run rescans the last lookback floor (default 7 days) of merged pull
+ * bdc-xo#5571). Every reconcile run rescans the last RECONCILE_MIN_LOOKBACK_DAYS (7) days of merged pull
  * requests and read each one with `pulls.get`: the interpolated `pulls/:n` rows, 4,654 calls in the hour
  * 2026-11-12 01:15Z to 02:15Z. A merged pull request's data changes only when GitHub bumps its
  * `updated_at`, and the search item already carries it, so a cached entry is reused only while the
