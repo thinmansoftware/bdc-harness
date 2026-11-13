@@ -141,12 +141,13 @@ T2C="$WORK/t2c"; mkpkg "$T2C"; mkpkg "$T2C/api"
 run_dprep "$T2C"
 check "T2c no stub ran" 0 "$(reclines)"
 check "T2c return code 0" 0 "$RC"
-# (d) five qualifying folders -> first three in name order
+# (d) eight qualifying folders and no work order -> the first six in name order (cap 6; it was 3, which
+# skipped shopops-api, the 4th of shopops's 4 package folders: CE refire e69566fe, 2026-11-13)
 T2D="$WORK/t2d"; mkpkg "$T2D"
-for n in e5 e3 e1 e4 e2; do mkpkg "$T2D/$n" package-lock.json; done
+for n in e5 e3 e1 e4 e2 e8 e6 e7; do mkpkg "$T2D/$n" package-lock.json; done
 run_dprep "$T2D"
-check "T2d exactly three installs" 3 "$(reclines)"
-check "T2d the first three folders in name order" "e1 e2 e3" "$(sed 's#.*/##' "$REC" | tr '\n' ' ' | sed 's/ $//')"
+check "T2d exactly six installs" 6 "$(reclines)"
+check "T2d the first six folders in name order" "e1 e2 e3 e4 e5 e6" "$(sed 's#.*/##' "$REC" | tr '\n' ' ' | sed 's/ $//')"
 # (e) ignored names and depth two
 T2E="$WORK/t2e"; mkpkg "$T2E"
 mkpkg "$T2E/.hidden" package-lock.json; mkpkg "$T2E/node_modules" package-lock.json; mkpkg "$T2E/dist" package-lock.json; mkpkg "$T2E/build" package-lock.json
@@ -169,6 +170,42 @@ T2H="$WORK/t2h"; mkpkg "$T2H" bun.lock package-lock.json
 run_dprep "$T2H"
 has "T2h top-level precedence is unchanged (bun first)" "bun install --frozen-lockfile | " "$(cat "$REC")"
 hasnt "T2h npm did not run at the top" "npm " "$(cat "$REC")"
+
+# ---- Test 10: the WO's own package folder is installed even when it is the 4th or later -----------
+# (a) shopops's real layout, no work order: the 4th folder in name order is installed
+T10A="$WORK/t10a"; mkpkg "$T10A"
+mkpkg "$T10A/mutation-engine" package-lock.json; mkpkg "$T10A/pull-list-api" bun.lock
+mkpkg "$T10A/scout-service" package-lock.json; mkpkg "$T10A/shopops-api" bun.lock package-lock.json
+run_dprep "$T10A"
+check "T10a all four package folders installed" 4 "$(reclines)"
+check "T10a shopops-api (4th in name order) installed" 1 "$(grep -c '/shopops-api$' "$REC")"
+has "T10a output names shopops-api" "dprep: package folder shopops-api" "$OUT"
+# (b) eight folders, the WO's folder sorts LAST, the work order names it: it is installed FIRST and the cap holds
+T10B="$WORK/t10b"; mkpkg "$T10B"
+for n in a1 a2 a3 a4 a5 a6 a7; do mkpkg "$T10B/$n" package-lock.json; done
+mkpkg "$T10B/zz-target" package-lock.json
+printf '## 4. Scope IN\n- zz-target/src/routes/pull.js: the fix (Test 1)\n' > "$WORK/t10b-wo.md"
+run_dprep "$T10B" BDC_DPREP_SPEC_FILE="$WORK/t10b-wo.md"
+check "T10b exactly six installs (cap)" 6 "$(reclines)"
+check "T10b the WO's folder first, then name order" "zz-target a1 a2 a3 a4 a5" "$(sed 's#.*/##' "$REC" | tr '\n' ' ' | sed 's/ $//')"
+# (c) the default work-order path ($ARTIFACTS_DIR/authority/work-order.md) is read when BDC_DPREP_SPEC_FILE is unset
+T10C="$WORK/t10c"; mkpkg "$T10C"
+for n in b1 b2 b3 b4 b5 b6 b7; do mkpkg "$T10C/$n" package-lock.json; done
+mkpkg "$T10C/zz-target" package-lock.json
+mkdir -p "$WORK/t10c-art/authority"; printf 'Files modified: zz-target/package.json\n' > "$WORK/t10c-art/authority/work-order.md"
+run_dprep "$T10C" ARTIFACTS_DIR="$WORK/t10c-art"
+check "T10c the WO's folder first via ARTIFACTS_DIR" "zz-target" "$(head -1 "$REC" | sed 's#.*/##')"
+# (d) a path-boundary match only: a folder named "api" is NOT preferred because the WO names "shopops-api/"
+T10D="$WORK/t10d"; mkpkg "$T10D"
+mkpkg "$T10D/api" package-lock.json; mkpkg "$T10D/shopops-api" package-lock.json
+printf 'shopops-api/routes/x.js\n' > "$WORK/t10d-wo.md"
+run_dprep "$T10D" BDC_DPREP_SPEC_FILE="$WORK/t10d-wo.md"
+check "T10d shopops-api preferred, api after it" "shopops-api api" "$(sed 's#.*/##' "$REC" | tr '\n' ' ' | sed 's/ $//')"
+# (e) a work-order path that does not exist: plain name order, no error
+T10E="$WORK/t10e"; mkpkg "$T10E"; mkpkg "$T10E/c2" package-lock.json; mkpkg "$T10E/c1" package-lock.json
+run_dprep "$T10E" BDC_DPREP_SPEC_FILE="$WORK/missing-wo.md"
+check "T10e missing work order: name order" "c1 c2" "$(sed 's#.*/##' "$REC" | tr '\n' ' ' | sed 's/ $//')"
+check "T10e return code 0" 0 "$RC"
 
 # ---- Test 3: a failed package folder install returns nonzero and the rest still run ----------
 T3="$WORK/t3"; mkpkg "$T3"; mkpkg "$T3/a-api" package-lock.json; mkpkg "$T3/b-api" package-lock.json
