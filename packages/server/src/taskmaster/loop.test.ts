@@ -5302,10 +5302,13 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     });
   }
 
-  // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01: ANY escalate_p0 journal outcome in the
-  // trailing 24h suppresses a re-proposal (expired, pending, failed...), so a
-  // failed or expired attempt is not retried every tick.
-  test('adopt_fixup_stale_epoch_expired_within_24h_suppresses', async () => {
+  // WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01 (Amendments 3 and 7) replaces the
+  // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01 rule ("ANY escalate_p0 outcome in the
+  // trailing 24h suppresses"): only a 'sent' row starts the window and a 'failed'
+  // row starts the 6h retry backoff. An expired, pending or claim_held row under
+  // ANOTHER key no longer silences a real P0. The same bucket key is still caught
+  // by the unchanged same-key skip, and GitHub posts by the claim and the marker.
+  test('adopt_fixup_stale_epoch_expired_within_24h_does_not_suppress', async () => {
     const world = makeWorld();
     seedDigestSent(world);
     seedEscalation(world, 'expired', { type: 'escalate_p0' });
@@ -5318,14 +5321,15 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
 
     const result = await tick(createTaskmasterState(60_000), deps);
 
-    expect(result.effects).toBe(0);
-    expect(gh.posts()).toBe(0);
-    expect(
-      world.journal.filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
-    ).toHaveLength(1);
+    expect(result.effects).toBe(1);
+    expect(gh.posts()).toBe(1);
+    const rows = world.journal.filter(
+      row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
+    );
+    expect(rows.map(row => row.outcome).sort()).toEqual(['expired', 'sent']);
   });
 
-  test('adopt_fixup_pending_and_suppressed_dedupe_boundaries', async () => {
+  test('adopt_fixup_pending_and_suppressed_dedupe_boundaries_does_not_suppress', async () => {
     const pendingWorld = makeWorld();
     seedDigestSent(pendingWorld);
     seedEscalation(pendingWorld, 'pending', { type: 'escalate_p0' });
@@ -5338,12 +5342,16 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
 
     await tick(createTaskmasterState(60_000), pendingDeps);
 
-    expect(pendingGh.posts()).toBe(0);
+    expect(pendingGh.posts()).toBe(1);
+    // The tick's existing reconcile step (taskmaster.reconcile_pending_expired)
+    // expires the stale pending seed before the dedupe check; the real P0 is
+    // still sent, which is what this boundary asserts.
     expect(
-      pendingWorld.journal.filter(
-        row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
-      )
-    ).toHaveLength(1);
+      pendingWorld.journal
+        .filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
+        .map(row => row.outcome)
+        .sort()
+    ).toEqual(['expired', 'sent']);
 
     const suppressedWorld = makeWorld();
     seedDigestSent(suppressedWorld);
@@ -5360,15 +5368,21 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
 
     await tick(createTaskmasterState(60_000), suppressedDeps);
 
-    expect(suppressedGh.posts()).toBe(0);
+    expect(suppressedGh.posts()).toBe(1);
     expect(
-      suppressedWorld.journal.filter(
-        row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
-      )
-    ).toHaveLength(1);
+      suppressedWorld.journal
+        .filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
+        .map(row => row.outcome)
+        .sort()
+    ).toEqual(['expired', 'sent']);
   });
 
-  // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01, Tests 5 and 6 (tick level).
+  // WO-HARNESS-DISPATCH-ROUTING-CUTOFF-01, Tests 5 and 6 (tick level), updated by
+  // WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01 Amendment 7: a failed delivery is
+  // still attempted once per stall, and the first suppressed re-proposal inside
+  // the 6h retry backoff is journaled once (one skip row) instead of dropped.
+  const isSkipRow = (row: TmJournalEntry): boolean =>
+    row.proposal_json.includes('"suppressed":"recent_escalation"');
   function failingDispatchDeps(world: FakeWorld, attempts: string[]): TaskmasterDeps {
     const deps = makeDeps(world, {
       listThreads: async () => [unclaimedP0('dispatch:orphan-p0-1')],
@@ -5397,9 +5411,11 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
       world.nowMs += 9 * 60_000;
     }
 
-    const rows = world.journal.filter(
+    const all = world.journal.filter(
       j => j.thread_ref === 'dispatch:orphan-p0-1' && j.action_type === 'escalate_p0'
     );
+    const rows = all.filter(row => !isSkipRow(row));
+    expect(all.filter(isSkipRow)).toHaveLength(1);
     expect(rows).toHaveLength(1);
     expect(rows[0]?.outcome).toBe('failed');
     // The failure reason is now recorded on the row instead of only logged.
@@ -5427,11 +5443,11 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
     world.nowMs += 30 * 60_000;
     await tick(state, deps);
     expect(attempts).toHaveLength(2);
-    expect(
-      world.journal.filter(
-        j => j.thread_ref === 'dispatch:orphan-p0-1' && j.action_type === 'escalate_p0'
-      )
-    ).toHaveLength(2);
+    const all = world.journal.filter(
+      j => j.thread_ref === 'dispatch:orphan-p0-1' && j.action_type === 'escalate_p0'
+    );
+    expect(all.filter(row => !isSkipRow(row))).toHaveLength(2);
+    expect(all.filter(isSkipRow)).toHaveLength(1);
   });
 
   test('adopt_fixup_concurrent_ticks_journal_one_escalation', async () => {
@@ -5468,9 +5484,13 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
       releaseLookback?.();
     }
 
-    expect(
-      world.journal.filter(row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0')
-    ).toHaveLength(1);
+    // Amendment 7: still exactly one post and one escalation row; a tick that
+    // reads the first tick's sent row journals at most one skip row.
+    const rows = world.journal.filter(
+      row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
+    );
+    expect(rows.filter(row => !isSkipRow(row))).toHaveLength(1);
+    expect(rows.filter(isSkipRow).length).toBeLessThanOrEqual(1);
     expect(gh.posts()).toBe(1);
   });
 
