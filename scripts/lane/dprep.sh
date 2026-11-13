@@ -279,8 +279,8 @@ EOF
       # WHY A HARD RESET IS SAFE HERE: it runs only on a tree that refuse-on-dirty above proved CLEAN before
       # the install (nothing modified, staged, deleted or untracked except node_modules), and only once HEAD
       # is on the saved ref again. So everything that differs from the saved commit is the install's own doing, and
-      # nothing of anyone's work can be lost. `git reset --hard` never touches untracked files, so what the
-      # install created (node_modules) stays and nothing else is deleted.
+      # nothing of anyone's work can be lost. `git reset --hard` leaves untracked files (node_modules) in place, with
+      # one exception: untracked install output that sits where the saved commit has a tracked path is replaced by it.
       if git -C "$top" reset -q --hard "$head_before" 2>/dev/null; then
         while IFS= read -r path; do
           [ -n "$path" ] || continue
