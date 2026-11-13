@@ -41,6 +41,7 @@ import {
   type AdoptionRefreshResult,
 } from './loop';
 import { checkEvidence, checkExpectations } from './expectations';
+import { MAX_EFFECTS_ENV, SENT_WINDOW_ENV } from './escalation-dedupe';
 import {
   TASKMASTER_ESCALATION_MARKER,
   TASKMASTER_ESCALATION_COOLDOWN_MS,
@@ -6166,5 +6167,325 @@ describe('blocker_report loop (WO-HARNESS-TASKMASTER-BLOCKER-REPORT-TO-DO-01)', 
       if (priorFire === undefined) delete process.env.TASKMASTER_FIRE_VERB_ENABLED;
       else process.env.TASKMASTER_FIRE_VERB_ENABLED = priorFire;
     }
+  });
+});
+
+describe('escalate_p0 dedupe per (thread, reason) (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01)', () => {
+  const HOUR = 3_600_000;
+  const DAY = 24 * HOUR;
+  const REF = 'gh:thinmansoftware/bdc-xo#4932';
+  const ENV_KEYS = ['TASKMASTER_ESCALATE_TO_ISSUE', SENT_WINDOW_ENV, MAX_EFFECTS_ENV] as const;
+  const priorEnv = new Map<string, string | undefined>();
+
+  // The dispatch path (not the GitHub-issue path) so the dedupe is observed
+  // alone, without the separate 72h issue-marker cooldown.
+  beforeEach(() => {
+    for (const key of ENV_KEYS) priorEnv.set(key, process.env[key]);
+    process.env.TASKMASTER_ESCALATE_TO_ISSUE = 'false';
+    delete process.env[SENT_WINDOW_ENV];
+    delete process.env[MAX_EFFECTS_ENV];
+  });
+  afterEach(() => {
+    for (const key of ENV_KEYS) {
+      const prior = priorEnv.get(key);
+      if (prior === undefined) delete process.env[key];
+      else process.env[key] = prior;
+    }
+  });
+
+  function p0(ref = REF): ListedThread {
+    return makeListedThread({
+      ref,
+      priority: 'P0',
+      isUnclaimed: true,
+      isUnclaimedP0: true,
+      lastActivityAt: new Date(T0 - 6 * HOUR).toISOString(),
+      title: 'WO-HARNESS-EXAMPLE-4932 stuck P0',
+    });
+  }
+
+  function depsFor(
+    world: FakeWorld,
+    threads: () => ListedThread[],
+    overrides: Partial<TaskmasterDeps> = {}
+  ): TaskmasterDeps {
+    return makeDeps(world, {
+      listThreads: async () => threads(),
+      checkFireEligibility: async () => ({ eligible: false, reason: 'test_no_fire' }),
+      ...overrides,
+    });
+  }
+
+  const sendsFor = (world: FakeWorld, ref?: string) =>
+    world.sentMessages.filter(m =>
+      m.idempotency_key.startsWith(ref ? `tm:escalate_p0:${ref}:` : 'tm:escalate_p0:')
+    );
+  const skipRows = (world: FakeWorld, ref = REF) =>
+    world.journal.filter(
+      j =>
+        j.action_type === 'escalate_p0' &&
+        j.thread_ref === ref &&
+        j.outcome === 'expired' &&
+        j.proposal_json.includes('"suppressed":"recent_escalation"')
+    );
+  const bucketKey = (ref: string, atMs: number): string =>
+    `tm:escalate_p0:${ref}:${Math.floor(atMs / DAY)}`;
+
+  function seedRow(world: FakeWorld, outcome: TmActionOutcome, hoursAgo: number): TmJournalEntry {
+    const createdMs = world.nowMs - hoursAgo * HOUR;
+    const row: TmJournalEntry = {
+      id: `journal-dedupe-seed-${world.journal.length}`,
+      created_at: new Date(createdMs).toISOString(),
+      thread_ref: REF,
+      action_type: 'escalate_p0',
+      proposal_json: JSON.stringify({ type: 'escalate_p0', reason: 'unclaimed_p0' }),
+      idempotency_key: bucketKey(REF, world.nowMs),
+      before_hash: null,
+      proof_predicate: null,
+      // Amendment 6, F5: a failed row is retried in place until its proof deadline.
+      proof_deadline_at: new Date(createdMs + DAY).toISOString(),
+      outcome,
+      graded_at: null,
+      grade: null,
+    };
+    world.journal.push(row);
+    return row;
+  }
+
+  /** Run `hours` hourly ticks (hour 0 at the current clock) and report the hours that sent. */
+  async function sendHoursOver(
+    world: FakeWorld,
+    deps: TaskmasterDeps,
+    hours: number
+  ): Promise<number[]> {
+    const state = createTaskmasterState(60_000);
+    const sendHours: number[] = [];
+    let seen = 0;
+    for (let hour = 0; hour < hours; hour += 1) {
+      if (hour > 0) world.nowMs += HOUR;
+      await tick(state, deps);
+      const now = sendsFor(world).length;
+      if (now > seen) sendHours.push(hour);
+      seen = now;
+    }
+    return sendHours;
+  }
+
+  test('escalate_p0 dedupe: skip is journaled once through the tick', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    seedRow(world, 'sent', 2);
+    const deps = depsFor(world, () => [p0()]);
+    const state = createTaskmasterState(60_000);
+    const rowsAfter: number[] = [];
+
+    for (let i = 0; i < 3; i += 1) {
+      if (i > 0) world.nowMs += HOUR;
+      await tick(state, deps);
+      rowsAfter.push(world.journal.filter(j => j.thread_ref === REF).length);
+    }
+
+    expect(sendsFor(world)).toHaveLength(0);
+    expect(skipRows(world)).toHaveLength(1);
+    // Seed + one skip row after tick 1; ticks 2 and 3 write nothing.
+    expect(rowsAfter).toEqual([2, 2, 2]);
+    // The silent skip of the old 24h any-outcome set is gone from the loop.
+    const source = readFileSync(join(import.meta.dir, 'loop.ts'), 'utf8');
+    expect(source).not.toContain('recentEscalateP0ByThread.has(canonicalProposalRef) &&');
+  });
+
+  test('escalate_p0 dedupe: real P0 fires after the window over 25 hourly ticks', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const sendHours = await sendHoursOver(
+      world,
+      depsFor(world, () => [p0()]),
+      25
+    );
+
+    expect(sendHours).toEqual([0, 24]);
+    const skips = skipRows(world);
+    expect(skips).toHaveLength(1);
+    expect(skips[0]?.created_at).toBe(new Date(T0 + HOUR).toISOString());
+  });
+
+  test('escalate_p0 dedupe: quiet day under 10 sends and an injected P0 is sent', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    const refs = [1, 2, 3, 4, 5].map(n => `gh:thinmansoftware/bdc-xo#${9000 + n}`);
+    const injected = 'gh:thinmansoftware/bdc-xo#9100';
+    let injectNow = false;
+    const deps = depsFor(world, () => [
+      ...refs.map(ref => p0(ref)),
+      ...(injectNow ? [p0(injected)] : []),
+    ]);
+    const state = createTaskmasterState(60_000);
+
+    for (let hour = 0; hour < 24; hour += 1) {
+      if (hour > 0) world.nowMs += HOUR;
+      if (hour === 12) injectNow = true;
+      await tick(state, deps);
+    }
+
+    expect(sendsFor(world).length).toBeLessThan(10);
+    expect(sendsFor(world)).toHaveLength(6);
+    expect(sendsFor(world, injected)).toHaveLength(1);
+  });
+
+  test('escalate_p0 dedupe: effect cap is settable and lowers only', async () => {
+    const refs = [1, 2, 3, 4, 5].map(n => `gh:thinmansoftware/bdc-xo#${9200 + n}`);
+
+    process.env[MAX_EFFECTS_ENV] = '3';
+    const capped = makeWorld();
+    seedDigestSent(capped);
+    await tick(
+      createTaskmasterState(60_000),
+      depsFor(capped, () => refs.map(ref => p0(ref)))
+    );
+    expect(sendsFor(capped)).toHaveLength(3);
+    const deferred = capped.journal.filter(
+      j => j.action_type === 'escalate_p0' && j.outcome === 'deferred'
+    );
+    expect(deferred).toHaveLength(2);
+
+    for (const raw of ['0', '11', 'abc']) {
+      process.env[MAX_EFFECTS_ENV] = raw;
+      const world = makeWorld();
+      seedDigestSent(world);
+      const warnings: Array<{ variable: string; raw: string; fallback: number }> = [];
+      const deps = depsFor(world, () => refs.map(ref => p0(ref)), {
+        onConfigWarning: (variable, value, fallback) =>
+          warnings.push({ variable, raw: value, fallback }),
+      });
+      await tick(createTaskmasterState(60_000), deps);
+      expect(sendsFor(world)).toHaveLength(5);
+      expect(warnings).toEqual([{ variable: MAX_EFFECTS_ENV, raw, fallback: 10 }]);
+    }
+
+    delete process.env[MAX_EFFECTS_ENV];
+    const unset = makeWorld();
+    seedDigestSent(unset);
+    const unsetWarnings: string[] = [];
+    await tick(
+      createTaskmasterState(60_000),
+      depsFor(unset, () => refs.map(ref => p0(ref)), {
+        onConfigWarning: variable => unsetWarnings.push(variable),
+      })
+    );
+    expect(sendsFor(unset)).toHaveLength(5);
+    expect(unsetWarnings).toEqual([]);
+  });
+
+  test('escalate_p0 dedupe: parked rows do not start the window after resume expiry', async () => {
+    const world = makeWorld();
+    seedDigestSent(world);
+    world.control.pause_state = 'PAUSED';
+    world.control.pause_scope = 'effects';
+    world.control.pause_actor = 'john';
+    const deps = depsFor(world, () => [p0()]);
+    const state = createTaskmasterState(60_000);
+
+    await tick(state, deps);
+    expect(world.journal.filter(j => j.thread_ref === REF && j.outcome === 'parked')).toHaveLength(
+      1
+    );
+    const parkedBucket = Math.floor(world.nowMs / DAY);
+
+    // Resume by the SAME rule as EXPIRE_UNSENT_PROPOSALS in
+    // packages/core/src/db/taskmaster.ts (parked, and pending that is not
+    // fire_cauldron, become expired); Test 8a runs the real query.
+    for (const row of world.journal) {
+      if (
+        row.outcome === 'parked' ||
+        (row.outcome === 'pending' && row.action_type !== 'fire_cauldron')
+      ) {
+        row.outcome = 'expired';
+      }
+    }
+    world.control = {
+      ...world.control,
+      pause_state: 'RUNNING',
+      pause_scope: null,
+      epoch: world.control.epoch + 1,
+    };
+
+    // Hourly ticks until the first tick in bucket B+1 (T0 is 12:00Z, so 12 ticks).
+    let sendsAtFirstNextBucketTick = -1;
+    for (let hour = 1; hour <= 12; hour += 1) {
+      world.nowMs += HOUR;
+      await tick(state, deps);
+      const inNextBucket = Math.floor(world.nowMs / DAY) === parkedBucket + 1;
+      if (!inNextBucket) expect(sendsFor(world)).toHaveLength(0);
+      else if (sendsAtFirstNextBucketTick < 0) sendsAtFirstNextBucketTick = sendsFor(world).length;
+    }
+
+    expect(skipRows(world)).toHaveLength(0);
+    expect(sendsAtFirstNextBucketTick).toBe(1);
+    expect(sendsFor(world)[0]?.idempotency_key).toBe(`tm:escalate_p0:${REF}:${parkedBucket + 1}`);
+  });
+
+  test('escalate_p0 dedupe: failed delivery retries after the backoff', async () => {
+    const early = makeWorld();
+    seedDigestSent(early);
+    seedRow(early, 'failed', 3);
+    const earlyHours = await sendHoursOver(
+      early,
+      depsFor(early, () => [p0()]),
+      2
+    );
+    expect(earlyHours).toEqual([]);
+    expect(skipRows(early)).toHaveLength(1);
+    expect(JSON.parse(skipRows(early)[0]!.proposal_json)).toMatchObject({
+      window_basis: 'failed_backoff',
+    });
+
+    const late = makeWorld();
+    seedDigestSent(late);
+    const failed = seedRow(late, 'failed', 7);
+    await tick(
+      createTaskmasterState(60_000),
+      depsFor(late, () => [p0()])
+    );
+    expect(sendsFor(late)).toHaveLength(1);
+    expect(failed.outcome).toBe('sent');
+    expect(skipRows(late)).toHaveLength(0);
+  });
+
+  test('escalate_p0 dedupe: a 36 h sent window holds across a 24 h bucket boundary', async () => {
+    process.env[SENT_WINDOW_ENV] = '36';
+    const world = makeWorld();
+    seedDigestSent(world);
+    // First tick 10 minutes before a 24 h bucket boundary.
+    world.nowMs = (Math.floor(T0 / DAY) + 1) * DAY - 10 * 60_000;
+    const start = world.nowMs;
+
+    const sendHours = await sendHoursOver(
+      world,
+      depsFor(world, () => [p0()]),
+      37
+    );
+
+    expect(sendHours).toEqual([0, 36]);
+    const keys = sendsFor(world).map(m => m.idempotency_key);
+    expect(keys[0]).toBe(bucketKey(REF, start));
+    // The key bucket changed at 10 minutes past hour 0, yet hours 1 to 35 did not send.
+    expect(bucketKey(REF, start + HOUR)).not.toBe(keys[0]);
+    expect(skipRows(world)).toHaveLength(1);
+  });
+
+  test('escalate_p0 dedupe: a sent window below 24 h falls back to 24 h', async () => {
+    process.env[SENT_WINDOW_ENV] = '6';
+    const world = makeWorld();
+    seedDigestSent(world);
+    const warnings: string[] = [];
+    const deps = depsFor(world, () => [p0()], {
+      onConfigWarning: variable => warnings.push(variable),
+    });
+
+    const sendHours = await sendHoursOver(world, deps, 25);
+
+    expect(sendHours).toEqual([0, 24]);
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(new Set(warnings)).toEqual(new Set([SENT_WINDOW_ENV]));
   });
 });
