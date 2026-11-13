@@ -251,23 +251,35 @@ export async function runAddressBatch(
         ]
       );
       if (update.rowCount !== ids.length) throw new BatchRefusal(3, 'count_mismatch_rolled_back');
-      // The audit line is written INSIDE the transaction, before COMMIT: if the
-      // append fails, the update rolls back, so no row is ever addressed
-      // without its confirm line.
+      // Two audit lines bracket the COMMIT. 'confirm_pending' is written INSIDE
+      // the transaction: if that append fails, the update rolls back, so no row
+      // is ever addressed without an audit line. 'confirm' is written after the
+      // COMMIT: a pending line with no confirm line means the COMMIT (or the
+      // second append) did not complete, and the rows say which.
       audit({
-        type: 'confirm',
+        type: 'confirm_pending',
         at: nowIso,
         actor,
         reason,
         filter,
         dry_run_id: expectedId,
         dry_run_ids: ids,
-        confirmed_ids: ids,
         count: update.rowCount,
       });
       return ids;
     });
 
+    audit({
+      type: 'confirm',
+      at: nowIso,
+      actor,
+      reason,
+      filter,
+      dry_run_id: expectedId,
+      dry_run_ids: confirmed,
+      confirmed_ids: confirmed,
+      count: confirmed.length,
+    });
     out(`addressed: ${confirmed.length}`);
     return 0;
   } catch (error) {

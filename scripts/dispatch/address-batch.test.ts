@@ -303,6 +303,8 @@ describe('scripts/dispatch/address-batch.ts', () => {
     }
     const confirm = auditLines().filter(line => line.type === 'confirm');
     expect(confirm).toHaveLength(1);
+    // The pending line is written inside the transaction, the confirm line after COMMIT.
+    expect(auditLines().filter(line => line.type === 'confirm_pending')).toHaveLength(1);
     expect(confirm[0]).toMatchObject({
       actor: 'xo-test',
       reason: 'flood',
@@ -338,6 +340,7 @@ describe('scripts/dispatch/address-batch.ts', () => {
       );
     });
     expect(raced.code).toBe(3);
+    expect(auditLines().filter(line => line.type === 'confirm_pending')).toEqual([]);
     expect(raced.err.join('\n')).toContain('count_mismatch_rolled_back');
     expect(await rows()).toEqual(before);
     expect(auditLines().filter(line => line.type === 'confirm')).toEqual([]);
