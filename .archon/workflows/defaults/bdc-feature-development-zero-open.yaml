@@ -1536,6 +1536,40 @@ nodes:
       echo "This is a false/fraudulent completion (anchor 04daeafc). Downstream gate will PAUSE for correction, not commit." >&2
       exit 0
 
+  # implement-block-gate (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01): reads the
+  # executor's own terminal-BLOCKED record of the implement loop and prints ONE JSON line,
+  # {"terminal":"yes","reason":"..."} or {"terminal":"no"}. The executor writes
+  # $ARTIFACTS_DIR/blocked-preserve/implement-iter-<N>/blocked-reason.txt when the implement loop
+  # emits a declared BLOCKED (WO-HARNESS-BLOCKED-BUILDER-STOPS-01); nothing else reads it. The
+  # nodes that repair, push, commit or open a pull request run only when terminal is "no" (a
+  # missing or failed gate output skips them, fail closed), and block-classify turns "yes" or a
+  # missing output into BLOCKED with a reason. Always exits 0 and reads no other file.
+  - id: implement-block-gate
+    depends_on: [assert-implement-produced-work]
+    trigger_rule: all_done
+    task_class: clerical
+    bash: |
+      set -uo pipefail
+      FOUND=0
+      REASON=""
+      if [ -n "${ARTIFACTS_DIR:-}" ] && [ -d "${ARTIFACTS_DIR}/blocked-preserve" ]; then
+        for f in "${ARTIFACTS_DIR}"/blocked-preserve/implement-iter-*/blocked-reason.txt; do
+          [ -f "$f" ] || continue
+          FOUND=1
+          R=$(sed -n 's/^blocked_reason=//p' "$f" 2>/dev/null | head -n 1)
+          if [ -n "$R" ]; then REASON="$R"; fi
+        done
+      fi
+      if [ "$FOUND" = "1" ]; then
+        # JSON-safe, shell-safe reason: drop double and single quotes, backslash, backtick, dollar and
+        # control characters, then cap the length.
+        REASON=$(printf '%s' "$REASON" | tr -d '\042\047\134\140\044' | tr -d '[:cntrl:]' | cut -c1-300)
+        printf '{"terminal":"yes","reason":"%s"}\n' "$REASON"
+      else
+        printf '{"terminal":"no"}\n'
+      fi
+      exit 0
+
   # ascii-autofix (WO-HARNESS-ASCII-AUTOFIX-WIRE-AND-CLEANUP-01, 2026-06-24).
   # TOTAL fixer that runs BEFORE ascii-gate. Two tiers: SUBS (semantic map: em-dash,
   # arrows, box-drawing, etc.) then STRIP fallback (any remaining codepoint >= 0x80
@@ -3159,6 +3193,7 @@ nodes:
         fi
         export RST_STAGE_WORKTREES="$(cat "$scratch/stages")"
         cd "$(cat "$scratch/current")" || return 1
+        if declare -F dprep_ensure_js_deps >/dev/null 2>&1; then ( dprep_ensure_js_deps ) >&2; fi
         rst_execute_saved "$e" "$class"
       )
       # Explicit snapshot boundaries (42) block before repair, as in round 8.
@@ -3389,8 +3424,8 @@ nodes:
   - id: test-repair
     provider: cursor
     model: grok-4.7-high
-    depends_on: [classify-test-result]
-    when: "$classify-test-result.output.repairable == 'true'"
+    depends_on: [classify-test-result, implement-block-gate]
+    when: "$classify-test-result.output.repairable == 'true' && $implement-block-gate.output.terminal == 'no'"
     task_class: medium_work
     loop:
       fresh_context: true
@@ -3456,6 +3491,16 @@ nodes:
         exit 0
       fi
       . "$EVIDENCE_DIR/stop-tests.core.sh"
+      # Package-folder dependency prep for the trusted scratch copy (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01):
+      # the copy skips node_modules, so trg_execute_trusted calls dprep_ensure_js_deps inside it. Same
+      # resolution order as prep-dependencies; when no script is found the trusted run goes on without it.
+      DPREP_SCRIPT=""
+      for dprep_candidate in "${BDC_DPREP_SCRIPT:-}" "${ARCHON_LANE_SCRIPTS_DIR:+${ARCHON_LANE_SCRIPTS_DIR}/dprep.sh}" /app/scripts/lane/dprep.sh; do
+        if [ -n "$dprep_candidate" ] && [ -f "$dprep_candidate" ]; then DPREP_SCRIPT="$dprep_candidate"; break; fi
+      done
+      if [ -n "$DPREP_SCRIPT" ]; then
+        . "$DPREP_SCRIPT"
+      fi
       export RST_TIMEOUT_SECONDS="$(cat "$EVIDENCE_DIR/stop-tests.timeout")"
       trg_execute_trusted "$EVIDENCE_DIR" "$(cat "$EVIDENCE_DIR/stop-tests.class")" > "$EVIDENCE_DIR/stop-tests.final-raw"
       INFRA_FAILURE=0
@@ -3512,7 +3557,8 @@ nodes:
   - id: run-stop-greps
     persona: major-build
     load_bearing: true
-    depends_on: [format-autofix, run-stop-tests-final]
+    depends_on: [format-autofix, run-stop-tests-final, implement-block-gate]
+    when: "$implement-block-gate.output.terminal == 'no'"
     task_class: clerical
     timeout: 600000
     bash: |
@@ -4272,8 +4318,8 @@ nodes:
     provider: cursor
     model: grok-4.7-high
     persona: major-build-opr
-    depends_on: [diff-review, classify-diff-review, resolve-review-base, repair-gate]
-    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-diff-review.output.verdict == 'needs_revision'"
+    depends_on: [diff-review, classify-diff-review, resolve-review-base, implement-block-gate, repair-gate]
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-diff-review.output.verdict == 'needs_revision' && $implement-block-gate.output.terminal == 'no'"
     task_class: medium_work
     idle_timeout: 570000
     wall_timeout_ms: 1230000
@@ -4404,8 +4450,8 @@ nodes:
   # judged the stale committed HEAD at 11 locations, block-classify->BLOCKED, and the fix
   # was lost. WO-HARNESS-DIFF-REPAIR-COMMITS-BEFORE-FINAL-REVIEW-01.
   - id: checkpoint-diff-repair
-    depends_on: [diff-repair, repair-gate]
-    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'"
+    depends_on: [diff-repair, implement-block-gate, repair-gate]
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $implement-block-gate.output.terminal == 'no'"
     trigger_rule: all_done
     bash: |
       set -uo pipefail
@@ -4553,7 +4599,7 @@ nodes:
   #   ALREADY_SATISFIED -- no work needed, worktree clean, legitimately done -> success no-op
   #   BLOCKED           -- false-completion OR diff-review-final=needs_revision -> repair/pause
   - id: block-classify
-    depends_on: [diff-review-final]
+    depends_on: [diff-review-final, implement-block-gate]
     trigger_rule: all_done
     bash: |
       set -uo pipefail
@@ -4569,6 +4615,16 @@ nodes:
       $gate-already-satisfied.output
       BDC_FEATURE_DEV_PRECHECK_GATE_ALREADY_SATISFIED_20260719_005
       )
+      GATE=$(cat <<'BDC_FEATURE_DEV_IMPLEMENT_BLOCK_GATE_20261113_001'
+      $implement-block-gate.output
+      BDC_FEATURE_DEV_IMPLEMENT_BLOCK_GATE_20261113_001
+      )
+      GATE_TERMINAL=""
+      if printf '%s\n' "$GATE" | grep -q '"terminal":"yes"'; then
+        GATE_TERMINAL=yes
+      elif printf '%s\n' "$GATE" | grep -q '"terminal":"no"'; then
+        GATE_TERMINAL=no
+      fi
       final_ok=false
       # Anchor-free parse: diff-review-final is Codex prose; sentinel appears inline,
       # not at column 0. Take LAST occurrence so the final verdict always wins.
@@ -4588,8 +4644,25 @@ nodes:
         # FALSE_COMPLETE, unknown outcome, or final review not satisfied -> block.
         STATUS=BLOCKED
       fi
+      # implement-block-gate (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01): a declared
+      # implement BLOCKED, or a gate that produced no usable output, overrides the build and review
+      # verdicts. The repair, push, commit and PR nodes skip in both cases, so the run must say BLOCKED
+      # and why; block-reclassify keeps this note.
+      NOTE=""
+      if [ "$GATE_TERMINAL" = "yes" ]; then
+        GATE_REASON=$(printf '%s\n' "$GATE" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p' | head -n 1)
+        STATUS=BLOCKED
+        NOTE="implement_blocked: ${GATE_REASON:-no reason recorded}"
+      elif [ "$GATE_TERMINAL" != "no" ]; then
+        STATUS=BLOCKED
+        NOTE="implement_block_gate_missing"
+      fi
       # single JSON line = the entire stdout, so $block-classify.output.status parses
-      printf '{"status":"%s","final_satisfied":%s,"build_outcome":"%s"}\n' "$STATUS" "$final_ok" "${outcome:-unknown}"
+      if [ -n "$NOTE" ]; then
+        printf '{"status":"%s","final_satisfied":%s,"build_outcome":"%s","note":"%s"}\n' "$STATUS" "$final_ok" "${outcome:-unknown}" "$NOTE"
+      else
+        printf '{"status":"%s","final_satisfied":%s,"build_outcome":"%s"}\n' "$STATUS" "$final_ok" "${outcome:-unknown}"
+      fi
 
   # opus-repair: one harder AUTONOMOUS fix pass by the Opus overseer when BLOCKED, BEFORE
   # bothering a human (autonomy ladder step 2). Read-only-ish: it may edit in-scope files to
@@ -4598,8 +4671,8 @@ nodes:
     provider: cursor
     model: grok-4.7-high
     persona: major-build-opr
-    depends_on: [block-classify, repair-gate]
-    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $block-classify.output.status == 'BLOCKED'"
+    depends_on: [block-classify, implement-block-gate, repair-gate]
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $block-classify.output.status == 'BLOCKED' && $implement-block-gate.output.terminal == 'no'"
     prompt: |
       The bdc-feature-development run is BLOCKED before the irreversible commit. Before a
       human is paused, you get ONE autonomous repair pass. Diagnose and, if you can,
@@ -4740,6 +4813,17 @@ nodes:
         exit 0
       fi
 
+      # implement-block-gate (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01): a prior note that
+      # begins with implement_block (a declared implement BLOCKED, or a missing gate output) is the
+      # reason this run is blocked; keep it as it is instead of replacing it.
+      prior_note=$(printf '%s\n' "$PRIOR" | sed -n 's/.*"note":"\([^"]*\)".*/\1/p' | head -1)
+      case "$prior_note" in
+        implement_block*)
+          printf '{"status":"BLOCKED","note":"%s"}\n' "$prior_note"
+          exit 0
+          ;;
+      esac
+
       # It was blocked: did Opus fix it? Re-check the worktree for real work.
       WT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
       validate_implementation_counter() {
@@ -4823,7 +4907,8 @@ nodes:
   # Purely ADDITIVE: it reads block-reclassify, never blocks the existing pause-gate / commit-and-push
   # path (trigger_rule all_done; no-ops on interactive runs and on runs with nothing to salvage).
   - id: noninteractive-salvage
-    depends_on: [block-reclassify]
+    depends_on: [block-reclassify, implement-block-gate]
+    when: "$implement-block-gate.output.terminal == 'no'"
     trigger_rule: all_done
     bash: |
       set -uo pipefail
@@ -5235,9 +5320,9 @@ nodes:
     agent: major-build-opr
     effort: xhigh
     context: fresh
-    depends_on: [pause-gate, repair-gate]
+    depends_on: [pause-gate, implement-block-gate, repair-gate]
     trigger_rule: all_done
-    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $pause-gate.output.decision_verb == 'approve_with_fix'"
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $pause-gate.output.decision_verb == 'approve_with_fix' && $implement-block-gate.output.terminal == 'no'"
     prompt: |
       The operator authorized specific fixes at the approval gate. Apply ONLY the fixes whose
       ids appear in authorized_fix_ids. Do NOT apply any other finding.
@@ -5322,9 +5407,9 @@ nodes:
 
   - id: decide-push-target
     persona: major-build-opr
-    depends_on: [pause-gate, classify-apply-review]
+    depends_on: [pause-gate, classify-apply-review, implement-block-gate]
     trigger_rule: all_done
-    when: "$pause-gate.output.decision_verb != 'approve_with_fix' || $classify-apply-review.output.verdict == 'satisfied'"
+    when: "$pause-gate.output.decision_verb != 'approve_with_fix' && $implement-block-gate.output.terminal == 'no' || $classify-apply-review.output.verdict == 'satisfied' && $implement-block-gate.output.terminal == 'no'"
     task_class: clerical
     allowed_tools: []
     prompt: |
@@ -5455,10 +5540,10 @@ nodes:
   # backoff) and node fails closed if all attempts fail.
   - id: commit-and-push
     persona: overseer
-    depends_on: [decide-push-target, classify-apply-review, classify-opus-rereview, repair-gate]
+    depends_on: [decide-push-target, classify-apply-review, classify-opus-rereview, implement-block-gate, repair-gate]
     trigger_rule: all_done
     when: >-
-      $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $block-reclassify.output.status == 'PROCEED' || $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-apply-review.output.verdict == 'satisfied' || $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-opus-rereview.output.verdict == 'satisfied'
+      $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $block-reclassify.output.status == 'PROCEED' && $implement-block-gate.output.terminal == 'no' || $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-apply-review.output.verdict == 'satisfied' && $implement-block-gate.output.terminal == 'no' || $repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $classify-opus-rereview.output.verdict == 'satisfied' && $implement-block-gate.output.terminal == 'no'
     load_bearing: true
     bash: |
       set -euo pipefail
@@ -6020,8 +6105,8 @@ nodes:
   # load_bearing: true (WO-167 doctrine, WO-169 anchor)
   - id: open-pr-if-needed
     persona: major-build
-    depends_on: [commit-and-push, repair-gate]
-    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes'"
+    depends_on: [commit-and-push, implement-block-gate, repair-gate]
+    when: "$repair-gate.output.REPAIR_GATE_ALLOW == 'yes' && $implement-block-gate.output.terminal == 'no'"
     task_class: clerical
     load_bearing: true
     bash: |
