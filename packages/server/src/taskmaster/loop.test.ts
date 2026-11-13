@@ -5484,13 +5484,14 @@ describe('escalate_p0 GitHub-issue delivery (WO-HARNESS-TASKMASTER-ESCALATE-TO-I
       releaseLookback?.();
     }
 
-    // Amendment 7: still exactly one post and one escalation row; a tick that
-    // reads the first tick's sent row journals at most one skip row.
+    // Amendment 7: still exactly one post and one escalation row. The second
+    // tick reads the first tick's sent row and journals exactly ONE skip row
+    // (the old 24h rule dropped it silently, so a regression fails here).
     const rows = world.journal.filter(
       row => row.thread_ref === P0_REF && row.action_type === 'escalate_p0'
     );
     expect(rows.filter(row => !isSkipRow(row))).toHaveLength(1);
-    expect(rows.filter(isSkipRow).length).toBeLessThanOrEqual(1);
+    expect(rows.filter(isSkipRow)).toHaveLength(1);
     expect(gh.posts()).toBe(1);
   });
 
