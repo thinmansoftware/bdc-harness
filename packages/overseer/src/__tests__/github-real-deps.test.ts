@@ -796,6 +796,27 @@ dNull('mergeable:null retry', () => {
 // comment 101 was invisible to the idempotency check, letting a redelivery
 // duplicate the merge receipt on any PR with a busy comment thread.
 describe('createRealGitHubClientDeps listPullRequestComments -- pagination', () => {
+  test('evidence hold labels use the injected GitHub issue API', async () => {
+    process.env.GH_TOKEN = 'ghp_pat_token_value';
+    const { octokit } = octokitWithComments([]);
+    const addLabels = mock(async () => ({ data: [] }));
+    if (!octokit.issues) throw new Error('fixture issues API missing');
+    octokit.issues.addLabels = addLabels;
+    const deps = createRealGitHubClientDeps(octokit);
+    await deps.addPullRequestLabels?.({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 42,
+      labels: ['merge:held-evidence'],
+    });
+    expect(addLabels).toHaveBeenCalledWith({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      issue_number: 42,
+      labels: ['merge:held-evidence'],
+    });
+  });
+
   function octokitWithComments(bodies: string[]): {
     octokit: RealGitHubOctokitLike;
     pageLog: number[];

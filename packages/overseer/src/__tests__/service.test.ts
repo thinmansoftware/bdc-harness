@@ -11,6 +11,7 @@ import {
   listUnactionedFlagMergeReadyVerdicts,
 } from '@archon/core/db/overseer';
 import * as judgeFirst from '../judge-first';
+import * as mergeBridge from '../merge-execution-bridge';
 import { listOverseerCapabilityEvents } from '@archon/core/db/overseer-capabilities';
 import { listOperatorCards } from '@archon/core/db/overseer-briefing';
 import {
@@ -991,6 +992,52 @@ describe('service', () => {
       pr: { owner: 'thinmansoftware', repo: 'bdc-harness', number: 1373 },
     };
   }
+
+  test('default merge bridge composition reads the real originating-run event store', async () => {
+    let captured: mergeBridge.MergeExecutionBridgeOptions | undefined;
+    const bridgeSpy = spyOn(mergeBridge, 'runMergeExecutionBridgeOnce').mockImplementation(
+      async options => {
+        captured = options;
+      }
+    );
+    try {
+      await withTempDatabase(async () => {
+        const runId = 'run-bridge-evidence-wiring';
+        await seedReplayRun({ runId, verdict: 'healthy', proposedAction: 'none' });
+        await getDatabase().query(
+          `INSERT INTO remote_agent_workflow_events (id, workflow_run_id, event_type, step_name, data)
+           VALUES ($1, $2, 'node_failed', 'manifest-evidence-check', $3)`,
+          ['event-bridge-evidence', runId, JSON.stringify({ error: 'EVIDENCE_ERROR: no tests' })]
+        );
+        await runOverseerService({
+          enabled: true,
+          adapterKind: 'fake',
+          once: true,
+          mergeBridgeEnabled: true,
+          deps: {
+            listRunsForWatch: async () => [],
+            listRunEvents: async () => [],
+            findPullRequest: async () => replayEvidence(0),
+            mergePullRequest: async () => {
+              throw new Error('test must not merge');
+            },
+            insertOverseerAction: async () => undefined,
+          },
+        });
+        expect(captured?.readRunEvents).toBeDefined();
+        expect(await captured?.readRunEvents?.(runId)).toEqual([
+          expect.objectContaining({
+            workflow_run_id: runId,
+            event_type: 'node_failed',
+            step_name: 'manifest-evidence-check',
+            data: { error: 'EVIDENCE_ERROR: no tests' },
+          }),
+        ]);
+      });
+    } finally {
+      bridgeSpy.mockRestore();
+    }
+  });
 
   async function runJudgeFirstReplay(input: {
     runId: string;

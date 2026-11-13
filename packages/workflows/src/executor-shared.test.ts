@@ -38,6 +38,8 @@ import {
   InfrastructureClassBlock,
   PAPERWORK_NODES,
   isPaperworkNode,
+  ADVISORY_NODES,
+  isAdvisoryNode,
   hasPushArtifact,
 } from './executor-shared';
 
@@ -1035,6 +1037,27 @@ describe('PAPERWORK_NODES', () => {
   });
 });
 
+describe('ADVISORY_NODES (WO-HARNESS-ADVISORY-NODE-FAILURE-NOT-RUN-FAILURE-01)', () => {
+  it('names the check-already-satisfied pre-check and nothing else', () => {
+    expect([...ADVISORY_NODES]).toEqual(['check-already-satisfied']);
+  });
+
+  it('isAdvisoryNode is true for every advisory node and false for required nodes', () => {
+    for (const id of ADVISORY_NODES) {
+      expect(isAdvisoryNode(id)).toBe(true);
+    }
+    expect(isAdvisoryNode('implement')).toBe(false);
+    expect(isAdvisoryNode('blocked-terminal-gate')).toBe(false);
+    expect(isAdvisoryNode('manifest-evidence-check')).toBe(false);
+  });
+
+  it('is disjoint from the paperwork list', () => {
+    for (const id of ADVISORY_NODES) {
+      expect(isPaperworkNode(id)).toBe(false);
+    }
+  });
+});
+
 describe('hasPushArtifact', () => {
   it('detects a real GitHub PR URL', () => {
     expect(hasPushArtifact('PR_URL=https://github.com/foo/bar/pull/463')).toBe(true);
@@ -1108,7 +1131,7 @@ describe('fable apex lane -- build-critical nodes serve claude-fable-5 (M-121 ap
     // + refusal to fire a lane with known-dead models -- is retained and is
     // what makes this safe. The lane NAME and the persona-drop mechanism
     // (described above) are unchanged.
-    expect(lane.model).toBe('claude-fable-5');
+    expect(lane.model).toBe('claude-fable-5-2');
   });
 
   for (const id of buildCriticalNodes) {
@@ -1117,7 +1140,7 @@ describe('fable apex lane -- build-critical nodes serve claude-fable-5 (M-121 ap
       expect(node).toBeDefined();
       expect(node!.agent).toBeUndefined();
       expect(node!.persona).toBeUndefined();
-      expect(effectiveModel(node!)).toBe('claude-fable-5');
+      expect(effectiveModel(node!)).toBe('claude-fable-5-2');
     });
   }
 
@@ -1129,6 +1152,6 @@ describe('fable apex lane -- build-critical nodes serve claude-fable-5 (M-121 ap
     expect(byId('commit-and-push')?.persona).toBe('overseer');
     const diffReview = byId('diff-review');
     expect(diffReview?.provider).toBe('codex-native-strict');
-    expect(diffReview?.model).toBe('gpt-5.6-terra');
+    expect(diffReview?.model).toBe('gpt-6.1-sol');
   });
 });

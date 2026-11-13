@@ -39,6 +39,20 @@ export const DEFAULT_MERGE_REPO_POLICY: MergeRepoPolicy = Object.freeze({
   'thinmansoftware/bdc-xo': Object.freeze({
     main: Object.freeze({ unattended: true, docsOnly: 'merge' }),
   }),
+  // Merging main deploys the Vercel production project shopops-pull-list (bdc-xo#5469).
+  'thinmansoftware/bdc-shopify-app': Object.freeze({
+    main: Object.freeze({ unattended: false, docsOnly: 'skip' }),
+  }),
+  // WO-HARNESS-MERGE-POLICY-PROVISIONER-AND-REPO-SKIP-LINE-01 (bdc-xo#5581). Merging main here deploys
+  // ONLY the staging Vercel project comicstoreos-provisioner-staging (evidence: bdc-xo#5576, comment
+  // 6810214724, read 2026-11-11 23:58Z: one linked project, "Production" deployments point at it, no
+  // workflow runs vercel deploy, --prod, ssh or docker push). THIS ENTRY HOLDS ONLY WHILE THAT IS TRUE:
+  // if a production provisioner project, domain or workflow ever deploys from main, move this base to
+  // COVERED_PRODUCTION_BASES (m09-promotion-gate.ts) and set unattended to false BEFORE any further
+  // unattended merge; the guard test production_bases_match_merge_policy fails when the tables disagree.
+  'thinmansoftware/comicstoreos-provisioner': Object.freeze({
+    main: Object.freeze({ unattended: true, docsOnly: 'skip' }),
+  }),
 });
 
 export interface MergeRepoPolicyOptions {
@@ -67,6 +81,14 @@ function stringList(value: readonly string[] | string | undefined): readonly str
 
 // AGD Malformed policy always becomes an empty policy: configuration errors may never broaden merge authority.
 export function parseMergeRepoPolicy(raw: string, logger: PolicyLogger = log): MergeRepoPolicy {
+  return tryParseMergeRepoPolicy(raw, logger) ?? {};
+}
+
+/** The parsed policy, or null when the value is malformed (a warning is logged). */
+export function tryParseMergeRepoPolicy(
+  raw: string,
+  logger: PolicyLogger = log
+): MergeRepoPolicy | null {
   try {
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
@@ -115,7 +137,7 @@ export function parseMergeRepoPolicy(raw: string, logger: PolicyLogger = log): M
       },
       'merge_manager.repo_policy_malformed -- failing closed with an empty policy'
     );
-    return {};
+    return null;
   }
 }
 
@@ -142,7 +164,15 @@ function legacyPolicy(options: MergeRepoPolicyOptions): MergeRepoPolicy {
 
 export function resolveMergeRepoPolicy(options: MergeRepoPolicyOptions = {}): MergeRepoPolicy {
   const rawPolicy = options.rawPolicy ?? process.env[MERGE_MANAGER_REPO_POLICY_ENV];
-  if (rawPolicy !== undefined) return parseMergeRepoPolicy(rawPolicy);
+  if (rawPolicy !== undefined) {
+    // ADDITIVE (WO-HARNESS-MERGE-POLICY-PROVISIONER-AND-REPO-SKIP-LINE-01, bdc-xo#5581): a parseable value
+    // is merged OVER the in-code default per repository, so a repository added to the default ships with
+    // the next rebuild without editing the host environment. A repository present in the value replaces
+    // that repository's default entry (an empty object lists it with no bases: nothing is allowed). A
+    // malformed value is still the EMPTY policy: a configuration error never broadens merge authority.
+    const parsed = tryParseMergeRepoPolicy(rawPolicy);
+    return parsed === null ? {} : { ...DEFAULT_MERGE_REPO_POLICY, ...parsed };
+  }
   const legacyConfigured =
     options.legacyAllowedBases !== undefined ||
     options.legacyRepoConfig !== undefined ||

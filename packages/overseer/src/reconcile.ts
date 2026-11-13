@@ -1,4 +1,5 @@
 import { matchesWoToken } from './wo-token';
+import type { ResolveOriginatingWoId } from './sibling-wo-id';
 import { resolveProjectBase } from './project-bases';
 
 const log: ReconcileLogger = {
@@ -283,6 +284,14 @@ export interface ReconcileDeps {
    * this WO. Defaults to the existing action lookup.
    */
   hasSupersedeBeenRecorded?: (input: { prRef: string; woId: string }) => Promise<boolean>;
+  /**
+   * Which work order was an open PR's originating run fired for
+   * (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01). Optional: when absent the supersede pass matches
+   * siblings by body and branch only, exactly as before. Used ONLY for a candidate those two rules
+   * did not match. A throw, an empty answer, an ambiguous answer or an id that is not a stem of the
+   * merged PR all leave the candidate open.
+   */
+  resolveOriginatingWoId?: ResolveOriginatingWoId;
   now?: () => Date;
   log?: ReconcileLogger;
 }
@@ -301,6 +310,7 @@ export interface OctokitLike {
           state: string;
           pull_request?: unknown;
           repository_url?: string;
+          updated_at?: string;
         }[];
       };
     }>;
@@ -348,7 +358,114 @@ export interface ReconcileResult {
   skipped: boolean;
 }
 
+/**
+ * One reconcile pass with per-pass read sharing and accounting (bdc-xo#5571 part 3): the repository's
+ * OPEN pull request list is read ONCE per repository per pass (the supersede pass asked for it once per
+ * merged pull request), and every dependency call and every GitHub page is counted by name and logged
+ * at the end as `overseer.reconcile.call_counts`.
+ */
 export async function runReconcileOnce(input: RunReconcileInput = {}): Promise<ReconcileResult> {
+  const baseDeps = input.deps ?? createDefaultReconcileDeps();
+  const counts: Record<string, number> = {};
+  const deps = withPassSharing(baseDeps, counts);
+  const logger = baseDeps.log ?? log;
+  const previous = activeReadCounts;
+  activeReadCounts = counts;
+  const startedAt = Date.now();
+  try {
+    return await runReconcilePass({ ...input, deps });
+  } finally {
+    activeReadCounts = previous;
+    counts.pass_ms = Date.now() - startedAt;
+    logger.info?.({ counts }, 'overseer.reconcile.call_counts');
+  }
+}
+
+/**
+ * The dependencies for one pass: calls counted by name, and the open-PR list of a repository shared
+ * across the merged pull requests of the pass. A pull request this pass already closed is hidden from
+ * the shared list so a second merged PR cannot match (and comment on) it again.
+ */
+function withPassSharing(deps: ReconcileDeps, counts: Record<string, number>): ReconcileDeps {
+  const wrapped: Record<string, unknown> = { ...deps };
+  for (const [name, value] of Object.entries(deps)) {
+    if (typeof value !== 'function' || name === 'log' || name === 'now') continue;
+    const fn = value as (...args: unknown[]) => unknown;
+    wrapped[name] = (...args: unknown[]): unknown => {
+      counts[`calls:${name}`] = (counts[`calls:${name}`] ?? 0) + 1;
+      return fn(...args);
+    };
+  }
+  const result = wrapped as unknown as ReconcileDeps;
+  const closedThisPass = new Set<string>();
+  if (deps.listOpenPullRequestsInRepo) {
+    const list = deps.listOpenPullRequestsInRepo;
+    const lists = new Map<string, ReturnType<typeof list>>();
+    result.listOpenPullRequestsInRepo = async (
+      input
+    ): Promise<PagedRead<ReconcileRepoOpenPullRequest>> => {
+      const key = `${input.owner}/${input.repo}`.toLowerCase();
+      counts['calls:listOpenPullRequestsInRepo'] =
+        (counts['calls:listOpenPullRequestsInRepo'] ?? 0) + 1;
+      let pending = lists.get(key);
+      if (pending) {
+        counts['open_pr_list:cache_hits'] = (counts['open_pr_list:cache_hits'] ?? 0) + 1;
+      } else {
+        counts['open_pr_list:reads'] = (counts['open_pr_list:reads'] ?? 0) + 1;
+        pending = list(input);
+        lists.set(key, pending);
+      }
+      let read: PagedRead<ReconcileRepoOpenPullRequest>;
+      try {
+        read = asPagedRead(await pending);
+      } catch (error) {
+        lists.delete(key);
+        throw error;
+      }
+      return {
+        items: read.items.filter(item => !closedThisPass.has(`${key}#${item.number}`)),
+        truncated: read.truncated,
+      };
+    };
+  }
+  if (deps.resolveOriginatingWoId) {
+    // One resolution per pull request per pass: the supersede pass asks once per MERGED pull request,
+    // and the answer for a given open pull request does not change inside one pass.
+    const resolve = deps.resolveOriginatingWoId;
+    const memo = new Map<string, ReturnType<typeof resolve>>();
+    result.resolveOriginatingWoId = (input): ReturnType<typeof resolve> => {
+      const key =
+        `${input.owner}/${input.repo}#${String(input.number)}@${input.headRefName}`.toLowerCase();
+      counts['calls:resolveOriginatingWoId'] = (counts['calls:resolveOriginatingWoId'] ?? 0) + 1;
+      let pending = memo.get(key);
+      if (pending) {
+        counts['supersede_lookup:memo_hits'] = (counts['supersede_lookup:memo_hits'] ?? 0) + 1;
+        return pending;
+      }
+      counts['supersede_lookup:reads'] = (counts['supersede_lookup:reads'] ?? 0) + 1;
+      // Each real read is synchronous SQLite plus a regex scan. Awaiting a promise that settles in the
+      // same tick only yields microtasks, so N reads in a row hold the event loop for N x (cost of one):
+      // the forward rebuild of 2026-11-12 showed health probes of 4 s. Yield to the macrotask queue
+      // (HTTP, timers, the metering tick) before every read so the loop is never blocked longer than one.
+      pending = new Promise<void>(settle => setImmediate(settle)).then(() => resolve(input));
+      memo.set(key, pending);
+      // A failed lookup is not remembered: the next merged PR asks again.
+      pending.catch(() => memo.delete(key));
+      return pending;
+    };
+  }
+  if (deps.closePullRequest) {
+    const close = deps.closePullRequest;
+    const counted = result.closePullRequest;
+    result.closePullRequest = async (input): Promise<void> => {
+      await (counted ?? close)(input);
+      closedThisPass.add(`${input.owner}/${input.repo}#${String(input.number)}`.toLowerCase());
+    };
+  }
+  return result;
+}
+
+async function runReconcilePass(input: RunReconcileInput = {}): Promise<ReconcileResult> {
   const deps = input.deps ?? createDefaultReconcileDeps();
   const trackerLookupScope = {};
   const successfullyClosedTrackers = new Set<string>();
@@ -1051,6 +1168,68 @@ function siblingCreatedBeforeMerge(
 }
 
 /**
+ * The work order of a candidate PR through its originating run, when exactly one such work order is
+ * known and it is one of the merged PR's eligible stems; null in every other case. A throw or an
+ * ambiguous answer is logged at warn; an empty answer or another work order's id is the ordinary case
+ * for any PR that Cauldron did not open for this work order and is logged at info.
+ */
+/** Engine-made branch names: a salvage fallback PR, or a bare run branch. */
+const CAULDRON_RUN_BRANCH = /^(?:salvage\/opus-repair-|archon\/)/;
+
+async function matchThroughOriginatingRun(
+  candidate: ReconcileRepoOpenPullRequest,
+  pr: ReconcileMergedPullRequest,
+  stems: readonly string[],
+  resolve: ResolveOriginatingWoId,
+  logger: ReconcileLogger
+): Promise<string | null> {
+  const prRef = `${pr.owner}/${pr.repo}#${candidate.number}`;
+  // Only a pull request a Cauldron run opened under an engine branch can have an originating run the
+  // body and branch rules could not see: a salvage fallback PR (`salvage/opus-repair-<worktree>-<pid>`)
+  // or a bare run branch (`archon/...`). Every other branch (a person's, a work-order token branch the
+  // earlier rules already matched) never reaches the event store. Without this bound the pass asked for
+  // every open PR once per merged PR (5,265 synchronous SQLite lookups a pass on 2026-11-12, which
+  // starved the container's health check).
+  if (!CAULDRON_RUN_BRANCH.test(candidate.headRefName)) {
+    countRead('supersede_lookup:skipped_branch');
+    return null;
+  }
+  let resolution: Awaited<ReturnType<ResolveOriginatingWoId>>;
+  try {
+    resolution = await resolve({
+      owner: pr.owner,
+      repo: pr.repo,
+      number: candidate.number,
+      headRefName: candidate.headRefName,
+    });
+  } catch (error) {
+    logger.warn(
+      { err: error as Error, prRef, reason: 'lookup_failed' },
+      'overseer.reconcile.supersede_lookup_unmatched'
+    );
+    return null;
+  }
+  if (resolution.kind === 'ambiguous') {
+    logger.warn(
+      { prRef, reason: 'ambiguous', woIds: resolution.woIds },
+      'overseer.reconcile.supersede_lookup_unmatched'
+    );
+    return null;
+  }
+  if (resolution.kind === 'none') {
+    // The ordinary case: counted per pass (call_counts), not logged per pull request.
+    countRead('supersede_lookup:no_originating_run');
+    return null;
+  }
+  const woId = resolution.woId.toUpperCase();
+  if (!stems.includes(woId)) {
+    countRead('supersede_lookup:other_work_order');
+    return null;
+  }
+  return woId;
+}
+
+/**
  * Close OPEN non-draft, non-fork PRs in the merged PR's repo that declare one
  * of its eligible WO stems and were created strictly before mergedAt.
  * Eligible stems are manifest `WO:` lines minus `Reconcile-Skip:` stems.
@@ -1123,8 +1302,23 @@ async function closeSupersededSiblingPullRequests(
     if (candidate.number === pr.number) continue;
     if (candidate.isDraft) continue;
     if (!headIsTargetRepo(candidate, pr.owner, pr.repo)) continue;
-    const woId = firstMatchedSupersedeStem(candidate, stems);
-    if (!woId) continue;
+    let woId = firstMatchedSupersedeStem(candidate, stems);
+    let matchedThroughRun = false;
+    if (!woId) {
+      // Neither the body nor the branch names the work order (a salvage fallback PR). Ask the
+      // originating run, but only for a candidate that could be a sibling at all (cheap guards first).
+      if (!deps.resolveOriginatingWoId) continue;
+      if (!siblingCreatedBeforeMerge(candidate.createdAt, pr.mergedAt)) continue;
+      woId = await matchThroughOriginatingRun(
+        candidate,
+        pr,
+        stems,
+        deps.resolveOriginatingWoId,
+        logger
+      );
+      if (!woId) continue;
+      matchedThroughRun = true;
+    }
     if (!siblingCreatedBeforeMerge(candidate.createdAt, pr.mergedAt)) continue;
     const siblingRef = `${pr.owner}/${pr.repo}#${candidate.number}`;
     const already = await (deps.hasSupersedeBeenRecorded ?? hasDefaultSupersedeBeenRecorded)({
@@ -1132,7 +1326,10 @@ async function closeSupersededSiblingPullRequests(
       woId,
     });
     if (already) continue;
-    const comment = `Superseded by #${String(pr.number)}`;
+    const comment = matchedThroughRun
+      ? `Superseded by #${String(pr.number)}: the same work order (${woId}) merged there. ` +
+        `This PR's branch ${candidate.headRefName} is kept; reopen the PR if it is still wanted.`
+      : `Superseded by #${String(pr.number)}`;
     try {
       await deps.closePullRequest({
         owner: pr.owner,
@@ -1428,6 +1625,18 @@ async function hasDefaultSupersedeBeenRecorded(input: {
   });
 }
 
+/** The real originating-run resolver, built lazily on the event store (no GitHub calls). */
+const resolveDefaultOriginatingWoId: ResolveOriginatingWoId = async input => {
+  const [
+    { listOriginatingRunCandidates, getWorkflowRunUserMessage },
+    { createOriginatingWoResolver },
+  ] = await Promise.all([import('@archon/core/db/overseer'), import('./sibling-wo-id')]);
+  return createOriginatingWoResolver({
+    list: listOriginatingRunCandidates,
+    readUserMessage: getWorkflowRunUserMessage,
+  })(input);
+};
+
 export function createDefaultReconcileDeps(): ReconcileDeps {
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const appConfigured = ['GITHUB_APP_', 'GITHUB_APP_OVERSEER_'].some(prefix =>
@@ -1504,7 +1713,9 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
         // Store before awaiting: concurrent lookups share completion or failure.
         // A direct no-scope call always reads anew; reused factories cannot cache
         // tracker state across runReconcileOnce invocations.
-        snapshot = getOctokit().then(client => readTrackerIssueSnapshot(client));
+        snapshot = getOctokit().then(client =>
+          readTrackerIssueSnapshot(client, processTrackerSnapshotContext)
+        );
         if (scope) trackerSnapshots.set(scope, snapshot);
       }
       return findTrackerIssueByStem(await snapshot, stem);
@@ -1514,7 +1725,9 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       // so a reconcile pass makes ONE tracker REST scan for both lookups.
       let snapshot = scope ? trackerSnapshots.get(scope) : undefined;
       if (!snapshot) {
-        snapshot = getOctokit().then(client => readTrackerIssueSnapshot(client));
+        snapshot = getOctokit().then(client =>
+          readTrackerIssueSnapshot(client, processTrackerSnapshotContext)
+        );
         if (scope) trackerSnapshots.set(scope, snapshot);
       }
       return findTrackerIssueByNumber(await snapshot, number);
@@ -1574,6 +1787,7 @@ export function createDefaultReconcileDeps(): ReconcileDeps {
       });
     },
     hasSupersedeBeenRecorded: hasDefaultSupersedeBeenRecorded,
+    resolveOriginatingWoId: resolveDefaultOriginatingWoId,
     removeTrackerLabel: async (input): Promise<void> => {
       const client = await getOctokit();
       if (!client.issues.removeLabel) return;
@@ -1623,14 +1837,27 @@ const PR_FILES_MAX_PAGES = 30;
  * THE one paginator for capped reconcile reads. Complete only when a short page is
  * seen; a full page at the cap, or a malformed page, is `truncated: true`.
  */
+/**
+ * Per-pass read accounting (bdc-xo#5571 part 3). Set by runReconcileOnce for the duration of one pass
+ * and logged once at its end as `overseer.reconcile.call_counts`, so a measurement can name which
+ * reader owns which GitHub calls instead of reading it from the code. Pages are counted per label.
+ */
+let activeReadCounts: Record<string, number> | null = null;
+
+function countRead(label: string): void {
+  if (activeReadCounts) activeReadCounts[label] = (activeReadCounts[label] ?? 0) + 1;
+}
+
 async function readPages<T>(
   fetchPage: (page: number) => Promise<unknown>,
   map: (row: Record<string, unknown>) => T | null,
-  maxPages: number = READ_MAX_PAGES
+  maxPages: number = READ_MAX_PAGES,
+  label = 'unlabelled'
 ): Promise<PagedRead<T>> {
   const items: T[] = [];
   for (let page = 1; page <= maxPages; page++) {
     const data = await fetchPage(page);
+    countRead(`pages:${label}`);
     if (!Array.isArray(data)) return { items, truncated: true };
     for (const row of data as Record<string, unknown>[]) {
       const value = map(row);
@@ -1685,7 +1912,9 @@ async function listRepoOpenPullRequests(
           page,
         })
       )?.data,
-    mapRepoOpenPullRequest
+    mapRepoOpenPullRequest,
+    READ_MAX_PAGES,
+    'open_prs_in_repo'
   );
 }
 
@@ -1717,7 +1946,9 @@ export async function listOpenMergedTrackers(
         state: row.state === 'closed' ? 'closed' : 'open',
         createdAt: typeof row.created_at === 'string' ? row.created_at : null,
       };
-    }
+    },
+    READ_MAX_PAGES,
+    'merged_trackers'
   );
 }
 
@@ -1741,7 +1972,9 @@ export async function readLatestCloseEvent(
     row =>
       row.event === 'closed'
         ? { sha: typeof row.commit_id === 'string' ? row.commit_id : null }
-        : null
+        : null,
+    READ_MAX_PAGES,
+    'tracker_close_events'
   );
   const last = read.items[read.items.length - 1];
   return { sha: last ? last.sha : null, truncated: read.truncated };
@@ -1772,16 +2005,41 @@ export async function listIssueComments(
         htmlUrl: typeof row.html_url === 'string' ? row.html_url : '',
         createdAt: typeof row.created_at === 'string' ? row.created_at : '',
       };
-    }
+    },
+    READ_MAX_PAGES,
+    'tracker_comments'
   );
+}
+
+/**
+ * Cross-run cache of the changed file paths of a MERGED pull request, keyed by repository, number and
+ * merge commit (WO-HARNESS-OVERSEER-GITHUB-READ-BUDGET-01 part 2, bdc-xo#5571). The list of a merged
+ * pull request never changes once its merge commit exists, and the reconcile pass re-read it on every run
+ * for the same pull requests (the interpolated `pulls/:n/files` rows of the call-site log). A truncated
+ * or failed read is never cached; a pull request without a merge commit is never cached.
+ */
+const MERGED_PR_FILES_CACHE_MAX = 2000;
+const mergedPullRequestFilesCache = new Map<string, readonly string[]>();
+
+/** Test seam: forget the cross-run reconcile caches. */
+export function resetReconcileReadCaches(): void {
+  mergedPullRequestFilesCache.clear();
+  mergedPullRequestCache.clear();
 }
 
 /** Reader 4: changed file paths of a merged PR (spec-only guard input). */
 export async function listPullRequestFilePaths(
   octokit: OctokitLike,
-  pr: Pick<ReconcileMergedPullRequest, 'owner' | 'repo' | 'number'>
+  pr: Pick<ReconcileMergedPullRequest, 'owner' | 'repo' | 'number'> & {
+    mergeCommitSha?: string | null;
+  }
 ): Promise<PagedRead<string>> {
-  return readPages(
+  const cacheKey = pr.mergeCommitSha
+    ? `${pr.owner}/${pr.repo}#${pr.number}@${pr.mergeCommitSha}`.toLowerCase()
+    : '';
+  const cached = cacheKey ? mergedPullRequestFilesCache.get(cacheKey) : undefined;
+  if (cached) return { items: [...cached], truncated: false };
+  const read = await readPages(
     async page =>
       (
         await octokit.pulls.listFiles({
@@ -1793,8 +2051,18 @@ export async function listPullRequestFilePaths(
         })
       ).data,
     row => (typeof row.filename === 'string' ? row.filename : null),
-    PR_FILES_MAX_PAGES
+    PR_FILES_MAX_PAGES,
+    'merged_pr_files'
   );
+  if (cacheKey && !read.truncated) {
+    mergedPullRequestFilesCache.delete(cacheKey);
+    mergedPullRequestFilesCache.set(cacheKey, [...read.items]);
+    if (mergedPullRequestFilesCache.size > MERGED_PR_FILES_CACHE_MAX) {
+      const oldest = mergedPullRequestFilesCache.keys().next().value;
+      if (oldest !== undefined) mergedPullRequestFilesCache.delete(oldest);
+    }
+  }
+  return read;
 }
 
 async function resolveSearchSince(input: RunReconcileInput, deps: ReconcileDeps): Promise<string> {
@@ -1825,6 +2093,21 @@ export async function searchMergedPullRequests(
 ): Promise<ReconcileMergedPullRequest[]> {
   return (await searchMergedPullRequestsPaged(octokit, input)).items;
 }
+
+/**
+ * Cross-run cache of merged pull request details (WO-HARNESS-OVERSEER-GITHUB-READ-BUDGET-01 part 2,
+ * bdc-xo#5571). Every reconcile run rescans the last RECONCILE_MIN_LOOKBACK_DAYS (7) days of merged pull
+ * requests and read each one with `pulls.get`: the interpolated `pulls/:n` rows, 4,654 calls in the hour
+ * 2026-11-12 01:15Z to 02:15Z. A merged pull request's data changes only when GitHub bumps its
+ * `updated_at`, and the search item already carries it, so a cached entry is reused only while the
+ * search item's `updated_at` equals the cached one; any change re-reads it. Only merged pull requests
+ * are cached; an item with no `updated_at` is never served from the cache.
+ */
+const MERGED_PR_CACHE_MAX = 5000;
+const mergedPullRequestCache = new Map<
+  string,
+  { updatedAt: string; value: ReconcileMergedPullRequest }
+>();
 
 export async function searchMergedPullRequestsPaged(
   octokit: OctokitLike,
@@ -1865,12 +2148,19 @@ export async function searchMergedPullRequestsPaged(
         if (!repo) continue;
         const refKey = `${repo.owner}/${repo.repo}#${item.number}`;
         if (results.has(refKey)) continue;
+        const updatedAt = typeof item.updated_at === 'string' ? item.updated_at : '';
+        const cacheKey = refKey.toLowerCase();
+        const cached = updatedAt ? mergedPullRequestCache.get(cacheKey) : undefined;
+        if (cached?.updatedAt === updatedAt) {
+          results.set(refKey, { ...cached.value });
+          continue;
+        }
         const pr = await octokit.pulls.get({
           owner: repo.owner,
           repo: repo.repo,
           pull_number: item.number,
         });
-        results.set(refKey, {
+        const value: ReconcileMergedPullRequest = {
           owner: repo.owner,
           repo: repo.repo,
           number: item.number,
@@ -1882,7 +2172,16 @@ export async function searchMergedPullRequestsPaged(
           mergeCommitSha: pr.data.merge_commit_sha,
           mergedAt: pr.data.merged_at,
           baseRef: pr.data.base?.ref ?? null,
-        });
+        };
+        results.set(refKey, value);
+        if (updatedAt && value.merged) {
+          mergedPullRequestCache.delete(cacheKey);
+          mergedPullRequestCache.set(cacheKey, { updatedAt, value: { ...value } });
+          if (mergedPullRequestCache.size > MERGED_PR_CACHE_MAX) {
+            const oldest = mergedPullRequestCache.keys().next().value;
+            if (oldest !== undefined) mergedPullRequestCache.delete(oldest);
+          }
+        }
       }
       // Fewer than a full page means the query is exhausted.
       if (items.length < OPEN_PR_SEARCH_PAGE_SIZE) {
@@ -2028,7 +2327,15 @@ function validatedOpenSearchPullRequest(item: unknown): ReconcileOpenPullRequest
 }
 
 const TRACKER_ISSUE_PAGE_SIZE = 100;
-const TRACKER_ISSUE_MAX_PAGES = 100;
+// WO-HARNESS-RECONCILE-TRACKER-SNAPSHOT-INCREMENTAL-01 (bdc-xo#5701): the snapshot is kept for the life of the
+// process and refreshed with only what changed; the full scan (first pass, every 6 hours, or after a long
+// outage) has a 400-page budget, and the old 100-page cliff (10,000 issues and pull requests) is gone.
+const TRACKER_ISSUE_FULL_SCAN_MAX_PAGES = 400;
+const TRACKER_ISSUE_NEAR_BUDGET_PAGES = 320;
+const TRACKER_ISSUE_INCREMENTAL_MAX_PAGES = 20;
+const TRACKER_ISSUE_FULL_REFRESH_MS = 6 * 60 * 60 * 1000;
+const TRACKER_ISSUE_SINCE_OVERLAP_MS = 120_000;
+const TRACKER_BUDGET_ALERT_WINDOW_MS = 6 * 60 * 60 * 1000;
 export interface TrackerSnapshotRow {
   readonly number: number;
   readonly title: string;
@@ -2039,48 +2346,230 @@ export interface TrackerSnapshotRow {
 }
 export type TrackerIssueSnapshot = ReadonlyMap<number, TrackerSnapshotRow>;
 
-async function readTrackerIssueSnapshot(octokit: OctokitLike): Promise<TrackerIssueSnapshot> {
+/** What a refresh needs: the cache, a clock, and the way to tell the operator (all injectable for tests). */
+export interface TrackerSnapshotContext {
+  cache: { current: TrackerSnapshotCache | undefined };
+  nowMs: () => number;
+  alertOperator: (input: { key: string; body: string }) => Promise<void>;
+  alertedAtMs: { near: number; exceeded: number };
+}
+
+export interface TrackerSnapshotCache {
+  readonly rows: Map<number, TrackerSnapshotRow>;
+  /** When the last FULL scan started. */
+  readonly fullAtMs: number;
+  /** When the last refresh (full or incremental) started: the `since` cursor for the next one. */
+  refreshStartedAtMs: number;
+}
+
+async function defaultTrackerAlert(input: { key: string; body: string }): Promise<void> {
+  const { createAuthenticatedMessage } = await import('@archon/core/db/dispatch');
+  await createAuthenticatedMessage(
+    { kind: 'system', sender: 'overseer' },
+    {
+      correlation_id: input.key,
+      idempotency_key: `overseer:${input.key}`,
+      task_type: 'agent_message',
+      recipient: 'operator',
+      priority: 'blocker',
+      body: input.body,
+    }
+  );
+}
+
+/** The process-level snapshot: createDefaultReconcileDeps() runs once per pass, so the cache cannot live there. */
+const processTrackerSnapshotContext: TrackerSnapshotContext = {
+  cache: { current: undefined },
+  nowMs: (): number => Date.now(),
+  alertOperator: defaultTrackerAlert,
+  alertedAtMs: { near: Number.NEGATIVE_INFINITY, exceeded: Number.NEGATIVE_INFINITY },
+};
+
+/** Test hook: forget the process-level snapshot and its alert marker. */
+export function resetTrackerSnapshotStateForTests(): void {
+  processTrackerSnapshotContext.cache.current = undefined;
+  processTrackerSnapshotContext.alertedAtMs.near = Number.NEGATIVE_INFINITY;
+  processTrackerSnapshotContext.alertedAtMs.exceeded = Number.NEGATIVE_INFINITY;
+}
+
+async function readTrackerPage(
+  octokit: OctokitLike,
+  extra: Record<string, unknown>,
+  page: number,
+  label: string
+): Promise<unknown[]> {
   const issues = octokit.issues;
   if (!issues.listForRepo) throw failClosedError('tracker issue REST listing is unavailable');
-  const rows = new Map<number, TrackerSnapshotRow>();
-  // At most 100 logical core reads per invocation. Created order reduces churn;
-  // REST pagination is not an atomic snapshot and issue numbers need not increase.
-  for (let page = 1; page <= TRACKER_ISSUE_MAX_PAGES; page++) {
-    const response = await issues.listForRepo({
-      owner: DEFAULT_ORG,
-      repo: DEFAULT_TRACKER_REPO,
-      state: 'all',
-      sort: 'created',
-      direction: 'asc',
-      per_page: TRACKER_ISSUE_PAGE_SIZE,
-      page,
-    });
+  const response = await issues.listForRepo({
+    owner: DEFAULT_ORG,
+    repo: DEFAULT_TRACKER_REPO,
+    state: 'all',
+    ...extra,
+    per_page: TRACKER_ISSUE_PAGE_SIZE,
+    page,
+  });
+  countRead(label);
+  if (
+    !response ||
+    !Array.isArray(response.data) ||
+    response.data.length > TRACKER_ISSUE_PAGE_SIZE
+  ) {
+    throw failClosedError('tracker issue REST listing returned a malformed page');
+  }
+  return response.data as unknown[];
+}
+
+function mergeTrackerPage(rows: Map<number, TrackerSnapshotRow>, data: unknown[]): void {
+  for (const value of data) {
+    const row = validatedTrackerSnapshotRow(value);
+    const prior = rows.get(row.number);
     if (
-      !response ||
-      !Array.isArray(response.data) ||
-      response.data.length > TRACKER_ISSUE_PAGE_SIZE
+      prior &&
+      (prior.title !== row.title ||
+        prior.state !== row.state ||
+        prior.htmlUrl.toLowerCase() !== row.htmlUrl.toLowerCase() ||
+        prior.pullRequest !== row.pullRequest)
     ) {
-      throw failClosedError('tracker issue REST listing returned a malformed page');
+      throw failClosedError(
+        `tracker issue REST listing returned conflicting copies of ${row.number}`
+      );
     }
-    for (const value of response.data) {
-      const row = validatedTrackerSnapshotRow(value);
-      const prior = rows.get(row.number);
-      if (
-        prior &&
-        (prior.title !== row.title ||
-          prior.state !== row.state ||
-          prior.htmlUrl.toLowerCase() !== row.htmlUrl.toLowerCase() ||
-          prior.pullRequest !== row.pullRequest)
-      ) {
-        throw failClosedError(
-          `tracker issue REST listing returned conflicting copies of ${row.number}`
+    rows.set(row.number, row);
+  }
+}
+
+async function fullTrackerScan(
+  octokit: OctokitLike,
+  ctx: TrackerSnapshotContext | undefined
+): Promise<Map<number, TrackerSnapshotRow>> {
+  const rows = new Map<number, TrackerSnapshotRow>();
+  // REST pagination is not an atomic snapshot and issue numbers need not increase; created order reduces churn.
+  for (let page = 1; page <= TRACKER_ISSUE_FULL_SCAN_MAX_PAGES; page++) {
+    const data = await readTrackerPage(
+      octokit,
+      { sort: 'created', direction: 'asc' },
+      page,
+      'pages:tracker_snapshot_full'
+    );
+    mergeTrackerPage(rows, data);
+    if (data.length < TRACKER_ISSUE_PAGE_SIZE) {
+      if (page >= TRACKER_ISSUE_NEAR_BUDGET_PAGES) {
+        log.warn(
+          { items: rows.size, pages: page, budgetPages: TRACKER_ISSUE_FULL_SCAN_MAX_PAGES },
+          'overseer.reconcile.tracker_snapshot_near_budget'
+        );
+        await alertTrackerBudget(
+          ctx,
+          'near',
+          `bdc-xo has ${String(rows.size)} issues and pull requests (${String(page)} pages of ` +
+            `${String(TRACKER_ISSUE_PAGE_SIZE)}); the reconcile full-scan budget is ` +
+            `${String(TRACKER_ISSUE_FULL_SCAN_MAX_PAGES)} pages.`
         );
       }
-      rows.set(row.number, row);
+      return rows;
     }
-    if (response.data.length < TRACKER_ISSUE_PAGE_SIZE) return rows;
   }
+  // The budget stops the read, so the exact total is not observable: report the lower bound.
+  const atLeast = TRACKER_ISSUE_FULL_SCAN_MAX_PAGES * TRACKER_ISSUE_PAGE_SIZE;
+  // The reconcile logger has no error level: the severity travels in the fields, and the operator alert below
+  // is the loud part.
+  log.warn(
+    {
+      severity: 'error',
+      observedAtLeast: atLeast,
+      budgetPages: TRACKER_ISSUE_FULL_SCAN_MAX_PAGES,
+    },
+    'overseer.reconcile.tracker_snapshot_page_budget_exceeded'
+  );
+  await alertTrackerBudget(
+    ctx,
+    'exceeded',
+    `The reconcile tracker scan hit its budget: at least ${String(atLeast)} items read, budget ` +
+      `${String(TRACKER_ISSUE_FULL_SCAN_MAX_PAGES)} pages of ${String(TRACKER_ISSUE_PAGE_SIZE)}. ` +
+      'Reconcile passes fail closed until the budget is raised (packages/overseer/src/reconcile.ts, ' +
+      'TRACKER_ISSUE_FULL_SCAN_MAX_PAGES).'
+  );
   throw failClosedError('tracker issue REST listing exceeded its complete-page budget');
+}
+
+/** At most one operator alert of each kind per process per 6 hours; never throws. */
+async function alertTrackerBudget(
+  ctx: TrackerSnapshotContext | undefined,
+  kind: 'near' | 'exceeded',
+  detail: string
+): Promise<void> {
+  if (!ctx) return;
+  const now = ctx.nowMs();
+  if (now - ctx.alertedAtMs[kind] < TRACKER_BUDGET_ALERT_WINDOW_MS) return;
+  ctx.alertedAtMs[kind] = now;
+  const bucket = Math.floor(now / TRACKER_BUDGET_ALERT_WINDOW_MS);
+  try {
+    await ctx.alertOperator({
+      key: `reconcile-tracker-snapshot-${kind}:${String(bucket)}`,
+      body: `Overseer reconcile tracker snapshot (${kind === 'near' ? 'near its budget' : 'budget exceeded'}): ${detail}`,
+    });
+  } catch (error) {
+    ctx.alertedAtMs[kind] = Number.NEGATIVE_INFINITY;
+    log.warn({ err: error as Error, kind }, 'overseer.reconcile.tracker_snapshot_alert_failed');
+  }
+}
+
+/** Merge what changed since `sinceMs` into `cache.rows`; false (nothing merged) when it needs too many pages. */
+async function incrementalTrackerRefresh(
+  octokit: OctokitLike,
+  cache: TrackerSnapshotCache,
+  sinceMs: number
+): Promise<boolean> {
+  const since = new Date(sinceMs).toISOString();
+  const fresh = new Map<number, TrackerSnapshotRow>();
+  for (let page = 1; page <= TRACKER_ISSUE_INCREMENTAL_MAX_PAGES; page++) {
+    const data = await readTrackerPage(
+      octokit,
+      { sort: 'updated', direction: 'asc', since },
+      page,
+      'pages:tracker_snapshot_incremental'
+    );
+    mergeTrackerPage(fresh, data);
+    if (data.length < TRACKER_ISSUE_PAGE_SIZE) {
+      for (const [number, row] of fresh) cache.rows.set(number, row);
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The tracker snapshot for one reconcile pass. With a context: the first call (and every 6 hours, and after
+ * an incremental read that needs more than 20 pages) does a full scan; every other call reads only what
+ * changed since the last refresh (`since`, with a 120 s overlap) and merges it into the cached rows. A read
+ * error leaves the cache untouched and fails the pass closed. Without a context: a plain full scan.
+ * Permitted staleness: an issue or pull request deleted or transferred out of bdc-xo stays in the cache until
+ * the next full scan (at most 6 hours); every new, changed, closed or reopened item is seen on the next pass.
+ */
+export async function readTrackerIssueSnapshot(
+  octokit: OctokitLike,
+  ctx?: TrackerSnapshotContext
+): Promise<TrackerIssueSnapshot> {
+  if (!ctx) return fullTrackerScan(octokit, undefined);
+  const startedAtMs = ctx.nowMs();
+  const cache = ctx.cache.current;
+  if (cache && startedAtMs - cache.fullAtMs < TRACKER_ISSUE_FULL_REFRESH_MS) {
+    if (
+      await incrementalTrackerRefresh(
+        octokit,
+        cache,
+        cache.refreshStartedAtMs - TRACKER_ISSUE_SINCE_OVERLAP_MS
+      )
+    ) {
+      cache.refreshStartedAtMs = startedAtMs;
+      countRead('tracker_snapshot:incremental');
+      return new Map(cache.rows);
+    }
+  }
+  const rows = await fullTrackerScan(octokit, ctx);
+  ctx.cache.current = { rows, fullAtMs: startedAtMs, refreshStartedAtMs: startedAtMs };
+  countRead('tracker_snapshot:full');
+  return new Map(rows);
 }
 
 function validatedTrackerSnapshotRow(value: unknown): TrackerSnapshotRow {

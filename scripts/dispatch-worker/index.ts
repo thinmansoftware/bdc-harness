@@ -20,8 +20,18 @@ import { createCancelController, runAcpAgent, type AcpRunResult } from './acp/se
 import { createMcpCancelController, runMcpAgent, type McpRunResult } from './mcp/session';
 import { resolveOperatorToken } from './credentials';
 import { realSeatPreflightDeps, runSeatPreflight, type SeatConfig } from './seat-preflight';
-import { acquireInstanceLock, readRestartEvidence, type InstanceLockHandle } from './instance-lock';
+import {
+  acquireInstanceLock,
+  EXIT_ALREADY_RUNNING,
+  readRestartEvidence,
+  type InstanceLockHandle,
+} from './instance-lock';
 import { createWorkerLog, type WorkerLog } from './worker-log';
+import {
+  CONNECT_FAILURE_EXIT_MS,
+  createConnectFailureClock,
+  runWorkerLoop,
+} from './connect-failure-clock';
 import { enumerateProcessTree, killProcessTree, waitForTreeDeath } from './acp/kill-tree';
 
 type DispatchTaskType =
@@ -925,11 +935,16 @@ async function main(): Promise<void> {
     lock = await acquireInstanceLock({
       lockFile: defaultLockFile(config.worker_id),
       deathLogFile: defaultDeathLogFile(config.worker_id),
+      log: (line: string): void => {
+        void log.info(line);
+      },
     });
   } catch (error) {
     await log.error('startup refused: another instance appears to be running', error);
     console.error(String(error));
-    process.exit(1);
+    process.exit(
+      String(error).includes('dispatch_worker_already_running') ? EXIT_ALREADY_RUNNING : 1
+    );
     return;
   }
   await log.info(`startup: acquired instance lock for worker_id=${config.worker_id}`);
@@ -976,26 +991,43 @@ async function main(): Promise<void> {
 
   await register(config, token);
   await log.info('registered with drop-box server');
+  // WO-HARNESS-DISPATCH-WORKER-STALE-LOCK-01 (2026-11-09 amendment): a worker
+  // with no SUCCESSFUL (2xx) poll or heartbeat for CONNECT_FAILURE_EXIT_MS, and
+  // nothing executing, exits so the launcher supervisor or watchdog restarts
+  // it. Both "no connection" and an HTTP error status count as failure; only a
+  // 2xx resets the clock (see connect-failure-clock.ts for the contract).
+  const clock = createConnectFailureClock({
+    now: Date.now,
+    exitAfterMs: CONNECT_FAILURE_EXIT_MS,
+  });
   const heartbeatTimer = setInterval(() => {
     if (!state.stopping)
-      void heartbeat(config, token).catch(error => {
-        void log.error('heartbeat failed', error);
-      });
+      void heartbeat(config, token)
+        .then(() => {
+          clock.recordSuccess();
+        })
+        .catch(error => {
+          clock.recordFailure(error);
+          void log.error('heartbeat failed', error);
+        });
   }, config.heartbeat_interval_ms);
   heartbeatTimer.unref?.();
 
-  try {
-    while (!state.stopping) {
-      await poll(config, token, state, log).catch(error => {
-        void log.error('poll failed', error);
-      });
-      await Bun.sleep(config.poll_interval_ms);
-    }
-  } finally {
-    clearInterval(heartbeatTimer);
-    await log.info('shutting down: releasing instance lock');
-    await lock.release();
-  }
+  await runWorkerLoop({
+    isStopping: () => state.stopping,
+    poll: () => poll(config, token, state, log),
+    sleep: ms => Bun.sleep(ms),
+    pollIntervalMs: config.poll_interval_ms,
+    activeExecutions: () => [...state.activeByAgent.values()].reduce((sum, n) => sum + n, 0),
+    clock,
+    logError: (message, error) => log.error(message, error),
+    release: async () => {
+      clearInterval(heartbeatTimer);
+      await log.info('shutting down: releasing instance lock');
+      await lock.release();
+    },
+    exit: code => process.exit(code),
+  });
 }
 
 if (import.meta.main) {

@@ -25,6 +25,7 @@ import {
   hasReconcileActionForPr,
   insertOverseerAction,
   insertReconcileAction,
+  listOriginatingRunCandidates,
   listRunEventsForOverseer,
   listRunsForOverseerWatch,
   listUnactionedFlagMergeReadyVerdicts,
@@ -98,6 +99,67 @@ describe('overseer db', () => {
   afterEach(async () => {
     await db.close();
     cleanupDb(currentDbPath);
+  });
+
+  test('listOriginatingRunCandidates finds runs by worktree branch and by PR URL in open-pr output', async () => {
+    await seedRun('run-by-branch', 'running');
+    await seedRun('run-by-url', 'failed');
+    await seedRun('run-unrelated', 'failed');
+    await seedRun('run-discovery', 'completed');
+    await db.query('UPDATE remote_agent_workflow_runs SET working_path = $1 WHERE id = $2', [
+      '/ws/worktrees/archon/task-web-worker-1-abc',
+      'run-by-branch',
+    ]);
+    await db.query('UPDATE remote_agent_workflow_runs SET workflow_name = $1 WHERE id = $2', [
+      'pr-discovery',
+      'run-discovery',
+    ]);
+    await db.query('UPDATE remote_agent_workflow_runs SET working_path = $1 WHERE id = $2', [
+      '/ws/worktrees/archon/task-web-worker-1-abc',
+      'run-discovery',
+    ]);
+    const url = 'https://github.com/thinmansoftware/bdc-harness/pull/42';
+    for (const [run, step, data] of [
+      ['run-by-url', 'open-pr-if-needed', { node_output: 'PR_URL=' + url }],
+      ['run-unrelated', 'open-pr-if-needed', { node_output: 'PR_URL=' + url + '0' }],
+      ['run-unrelated', 'implement', { node_output: url }],
+    ] as const) {
+      await db.query(
+        `INSERT INTO remote_agent_workflow_events (workflow_run_id, event_type, step_name, data)
+         VALUES ($1, 'node_completed', $2, $3)`,
+        [run, step, JSON.stringify(data)]
+      );
+    }
+    const rows = await listOriginatingRunCandidates({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 42,
+      headRef: 'archon/task-web-worker-1-abc',
+    });
+    const ids = rows.map(row => row.id).sort();
+    // the longer PR number (420) is narrowed by LIKE and filtered by the caller; the
+    // implement-step mention and the pr-discovery parent row are never candidates
+    expect(ids).toEqual(['run-by-branch', 'run-by-url', 'run-unrelated']);
+    expect(rows.every(row => 'codebase_name' in row && 'codebase_url' in row)).toBe(true);
+    const byBranch = rows.find(row => row.id === 'run-by-branch');
+    expect(byBranch?.status).toBe('running');
+    expect(byBranch?.working_path).toBe('/ws/worktrees/archon/task-web-worker-1-abc');
+    expect(rows.find(row => row.id === 'run-by-url')?.event_data).toContain(url);
+  });
+
+  test('listOriginatingRunCandidates matches a Windows backslash worktree path by branch', async () => {
+    await seedRun('run-windows', 'running');
+    await db.query('UPDATE remote_agent_workflow_runs SET working_path = $1 WHERE id = $2', [
+      ['C:', 'ws', 'worktrees', 'archon', 'task-web-worker-9-xyz'].join(String.fromCharCode(92)),
+      'run-windows',
+    ]);
+    const rows = await listOriginatingRunCandidates({
+      owner: 'thinmansoftware',
+      repo: 'bdc-harness',
+      number: 7,
+      headRef: 'archon/task-web-worker-9-xyz',
+    });
+    expect(rows.map(row => row.id)).toEqual(['run-windows']);
   });
 
   test('lists terminal runs, events, and records overseer_actions rows', async () => {

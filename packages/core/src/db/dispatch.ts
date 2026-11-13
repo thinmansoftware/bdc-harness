@@ -2324,11 +2324,25 @@ export async function listEligibleXoEscalations(activatedAt: string): Promise<Di
   return result.rows.map(normalizeMessage);
 }
 
+function isChiefSuccessfulReply(source: DispatchMessage): boolean {
+  return (
+    source.sender_principal_id === 'grokbot' &&
+    source.sender === 'grokbot' &&
+    source.task_type === 'agent_message' &&
+    source.status === 'done' &&
+    source.task_outcome === 'succeeded' &&
+    source.result_body !== null &&
+    source.result_body.trim() !== ''
+  );
+}
+
 /** Deterministic crash-gap owner; `outcome-notice:<id>` prevents duplicate notices. */
 async function attemptDispatchOutcomeNotice(
   source: DispatchMessage,
-  activatedAt: string | undefined
+  activatedAt: string | undefined,
+  scope: 'all' | 'chief-success' = 'all'
 ): Promise<boolean> {
+  const chiefReply = isChiefSuccessfulReply(source);
   if (
     !activatedAt ||
     !Number.isFinite(Date.parse(activatedAt)) ||
@@ -2336,7 +2350,8 @@ async function attemptDispatchOutcomeNotice(
     source.sender === 'dispatch' ||
     source.sender_principal_id == null ||
     !(['done', 'failed'] as DispatchMessageStatus[]).includes(source.status) ||
-    source.task_outcome === 'succeeded'
+    (scope === 'chief-success' && !chiefReply) ||
+    (source.task_outcome === 'succeeded' && !chiefReply)
   )
     return false;
   try {
@@ -2347,13 +2362,21 @@ async function attemptDispatchOutcomeNotice(
         idempotency_key: `outcome-notice:${source.id}`,
         task_type: 'agent_message',
         recipient: source.sender,
-        priority: 'blocker',
+        priority: chiefReply ? 'normal' : 'blocker',
         subject_key: source.subject_key,
         repeat_reason: source.subject_key ? 'system outcome notice' : null,
         body: JSON.stringify({
           source_id: source.id,
           status: source.status,
           task_outcome: source.task_outcome,
+          ...(chiefReply
+            ? {
+                kind: 'companion_worker_reply',
+                result_body: source.result_body,
+                worker_recipient: source.recipient,
+                untrusted: true,
+              }
+            : {}),
         }),
       }
     );
@@ -2367,14 +2390,27 @@ async function attemptDispatchOutcomeNotice(
   }
 }
 
-export async function reconcileDispatchOutcomeNotices(activatedAt: string): Promise<number> {
+export async function reconcileDispatchOutcomeNotices(
+  activatedAt: string,
+  scope: 'all' | 'chief-success' = 'all'
+): Promise<number> {
+  if (scope !== 'all' && scope !== 'chief-success')
+    throw new Error('dispatch_notice_scope_invalid');
   if (!Number.isFinite(Date.parse(activatedAt))) return 0;
+  const chiefSuccess = `(source.sender_principal_id = 'grokbot'
+    AND source.sender = 'grokbot' AND source.task_type = 'agent_message'
+    AND source.status = 'done' AND source.task_outcome = 'succeeded'
+    AND TRIM(COALESCE(source.result_body, '')) <> '')`;
+  const outcomePredicate =
+    scope === 'chief-success'
+      ? chiefSuccess
+      : `((source.task_outcome IS NULL OR source.task_outcome IN ('failed', 'blocked')) OR ${chiefSuccess})`;
   const candidates = await getDatabase().query<DispatchMessageRow>(
     `SELECT source.* FROM agent_dispatch_messages source WHERE source.created_at >= $1
      AND source.sender <> 'dispatch'
      AND source.sender_principal_id IS NOT NULL
      AND source.status IN ('done', 'failed')
-     AND (source.task_outcome IS NULL OR source.task_outcome IN ('failed', 'blocked'))
+     AND ${outcomePredicate}
      AND NOT EXISTS (SELECT 1 FROM agent_dispatch_messages notice
        WHERE notice.idempotency_key = 'outcome-notice:' || source.id
          AND notice.sender_principal_id = 'system:dispatch') LIMIT 100`,
@@ -2382,7 +2418,7 @@ export async function reconcileDispatchOutcomeNotices(activatedAt: string): Prom
   );
   let created = 0;
   for (const row of candidates.rows) {
-    if (await attemptDispatchOutcomeNotice(normalizeMessage(row), activatedAt)) created++;
+    if (await attemptDispatchOutcomeNotice(normalizeMessage(row), activatedAt, scope)) created++;
   }
   return created;
 }

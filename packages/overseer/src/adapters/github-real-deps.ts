@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
 import { createLogger } from '@archon/paths';
@@ -5,6 +6,7 @@ import { resolveServiceGitHubAuth, type GitHubService } from '@archon/core/githu
 import {
   assertPersistedGitHubPoolAvailable,
   flushGitHubApiMeter,
+  normalizeGitHubEndpoint,
   observationFromResponse,
   recordGitHubApiCall,
 } from '@archon/core/github/metering';
@@ -19,6 +21,7 @@ import type {
   PullRequestEvidence,
   PullRequestRef,
   ReviewConflictAtHead,
+  SiblingMergeContextData,
 } from '../types.ts';
 import {
   listMessages as listDispatchMessages,
@@ -168,8 +171,13 @@ export interface RealGitHubOctokitLike {
         title: string;
         state: string;
         merged_at?: string | null;
+        updated_at?: string;
         html_url: string;
-        head: { sha: string; ref?: string };
+        head: {
+          sha: string;
+          ref?: string;
+          repo?: { name?: string; owner?: { login?: string } | null } | null;
+        };
         // Present on the real API; optional here so existing narrow mocks that
         // only exercise the head-branch fast path keep type-checking.
         draft?: boolean;
@@ -277,6 +285,18 @@ export interface RealGitHubOctokitLike {
      * notice idempotent by searching for its marker (#797) -- a caller that
      * cannot read comments must NOT post blind, or a redelivery duplicates it.
      */
+    addLabels?(input: {
+      owner: string;
+      repo: string;
+      issue_number: number;
+      labels: string[];
+    }): Promise<unknown>;
+    removeLabel?(input: {
+      owner: string;
+      repo: string;
+      issue_number: number;
+      name: string;
+    }): Promise<unknown>;
     listComments?(input: {
       owner: string;
       repo: string;
@@ -308,6 +328,10 @@ export interface RealGitHubOctokitLike {
     getJobForWorkflowRun?(input: Record<string, unknown>): Promise<{
       data: { run_id?: number; run_attempt?: number };
     }>;
+  };
+  /** Optional: branch ref lookup (git.getRef) used by the post-merge stray-push sweep. */
+  git?: {
+    getRef(input: Record<string, unknown>): Promise<{ data: { object: { sha: string } } }>;
   };
   repos?: {
     compareCommits(input: {
@@ -807,7 +831,8 @@ export function attachGitHubQuotaHooks(
       status: number;
       headers: Record<string, string | number | undefined>;
     },
-    url: string
+    url: string,
+    method?: string
   ): Promise<void> => {
     const headers = new Headers();
     for (const [name, value] of Object.entries(response.headers)) {
@@ -819,6 +844,7 @@ export function attachGitHubQuotaHooks(
       new Response(null, { status: response.status, headers })
     );
     if (!headers.has('x-ratelimit-resource')) observation.resource = resourceFor(url);
+    observation.endpoint = normalizeGitHubEndpoint(method, url);
     recordGitHubApiCall(observation);
     if (observation.rateLimited) await flushGitHubApiMeter();
   };
@@ -826,21 +852,67 @@ export function attachGitHubQuotaHooks(
     await assertPersistedGitHubPoolAvailable(poolId, [resourceFor(options.url)]);
   });
   client.hook.after('request', async (response, options) => {
-    await record(response, options.url);
+    await record(response, options.url, options.method);
   });
   client.hook.error('request', async (error, options) => {
     const failure = error as Error & {
       response?: { status: number; headers: Record<string, string | number | undefined> };
     };
-    if (failure.response) await record(failure.response, options.url);
+    if (failure.response) await record(failure.response, options.url, options.method);
     throw error;
   });
 }
 
+/**
+ * One Octokit client per identity, shared by every caller in the process
+ * (WO-HARNESS-OVERSEER-GITHUB-READ-BUDGET-01, finding 3, bdc-xo#5571).
+ *
+ * `createAppAuth` keeps its installation token inside the client it belongs to, so a client built
+ * per call mints a fresh installation token on its first request: 225 mints an hour for the
+ * Overseer on 2026-11-11 (one per review, merge and reconcile call). A shared client mints once per
+ * token lifetime (about an hour) and refreshes it itself. The cache key names the service, the
+ * identity kind, the pool and a fingerprint of the credential, so a rotated key or token, the
+ * merge identity and the review identity each get their own client (review and merge stay separate
+ * actors, M-153). Nothing secret is kept in the key.
+ */
+const sharedClients = new Map<string, RealGitHubOctokitLike>();
+
+/** Test seam: forget every shared client (the next call builds a new one). */
+export function resetSharedGitHubClients(): void {
+  sharedClients.clear();
+}
+
+export interface SharedClientOptions {
+  /** Honored only when the client is first built (tests: count the token mint requests). */
+  fetch?: typeof fetch;
+}
+
+function fingerprint(secret: string): string {
+  return createHash('sha256').update(secret).digest('hex').slice(0, 16);
+}
+
+function buildOctokit(
+  options: RealOctokitAuthOptions,
+  clientOptions: SharedClientOptions
+): Octokit {
+  return new Octokit(
+    clientOptions.fetch ? { ...options, request: { fetch: clientOptions.fetch } } : options
+  );
+}
+
 export function createRealOctokitClient(
-  service: Extract<GitHubService, 'overseer' | 'pr_discovery'> = 'overseer'
+  service: Extract<GitHubService, 'overseer' | 'pr_discovery'> = 'overseer',
+  clientOptions: SharedClientOptions = {}
 ): RealGitHubOctokitLike {
   const identity = resolveServiceGitHubAuth(service);
+  const token =
+    identity.kind === 'app' ? '' : identity.kind === 'pat' ? identity.token : resolveGitHubToken();
+  const key =
+    identity.kind === 'app'
+      ? `${service}|app|${identity.poolId}|${fingerprint(identity.privateKey)}`
+      : `${service}|token|${identity.poolId}|${fingerprint(token)}`;
+  const shared = sharedClients.get(key);
+  if (shared) return shared;
   const options: RealOctokitAuthOptions =
     identity.kind === 'app'
       ? {
@@ -851,10 +923,12 @@ export function createRealOctokitClient(
             installationId: identity.installationId,
           },
         }
-      : { auth: identity.kind === 'pat' ? identity.token : resolveGitHubToken() };
-  const client = new Octokit(options);
+      : { auth: token };
+  const client = buildOctokit(options, clientOptions);
   attachGitHubQuotaHooks(client, service, identity.poolId);
-  return client as unknown as RealGitHubOctokitLike;
+  const real = client as unknown as RealGitHubOctokitLike;
+  sharedClients.set(key, real);
+  return real;
 }
 
 /**
@@ -887,9 +961,18 @@ export function hasDistinctMergeIdentity(): boolean {
   return resolveServiceGitHubAuth('merge_manager').distinct;
 }
 
-export function createRealMergeOctokitClient(): RealGitHubOctokitLike {
+export function createRealMergeOctokitClient(
+  clientOptions: SharedClientOptions = {}
+): RealGitHubOctokitLike {
   const identity = resolveServiceGitHubAuth('merge_manager');
   if (identity.kind === 'none') throw new Error('merge_manager_identity_not_distinct');
+  // Shared like the review client (see sharedClients), under its own key: never the same object.
+  const key =
+    identity.kind === 'app'
+      ? `merge_manager|app|${identity.poolId}|${fingerprint(identity.privateKey)}`
+      : `merge_manager|token|${identity.poolId}|${fingerprint(identity.token)}`;
+  const shared = sharedClients.get(key);
+  if (shared) return shared;
   const options: RealOctokitAuthOptions =
     identity.kind === 'app'
       ? {
@@ -901,9 +984,11 @@ export function createRealMergeOctokitClient(): RealGitHubOctokitLike {
           },
         }
       : { auth: identity.token };
-  const client = new Octokit(options);
+  const client = buildOctokit(options, clientOptions);
   attachGitHubQuotaHooks(client, 'merge_manager', identity.poolId);
-  return client as unknown as RealGitHubOctokitLike;
+  const real = client as unknown as RealGitHubOctokitLike;
+  sharedClients.set(key, real);
+  return real;
 }
 
 export function summarizeChecks(
@@ -2563,6 +2648,34 @@ export function createRealGitHubClientDeps(
       return { commented: true, url: response.data.html_url };
     },
     commentAuthorLogin,
+    addPullRequestLabels: async (input): Promise<void> => {
+      if (!octokit.issues?.addLabels) {
+        throw new Error('overseer_real_adapter_missing_add_labels_api');
+      }
+      await octokit.issues.addLabels({
+        owner: input.owner,
+        repo: input.repo,
+        issue_number: input.number,
+        labels: input.labels,
+      });
+    },
+    removePullRequestLabel: async (input): Promise<void> => {
+      if (!octokit.issues?.removeLabel) {
+        throw new Error('overseer_real_adapter_missing_remove_label_api');
+      }
+      try {
+        await octokit.issues.removeLabel({
+          owner: input.owner,
+          repo: input.repo,
+          issue_number: input.number,
+          name: input.label,
+        });
+      } catch (error) {
+        // A label that is not on the PR (already removed by a person) is the outcome we wanted.
+        if ((error as { status?: number }).status === 404) return;
+        throw error;
+      }
+    },
     listPullRequestComments: async (
       input
     ): Promise<readonly { body: string; authorLogin: string }[]> => {
@@ -2605,5 +2718,50 @@ export function createRealGitHubClientDeps(
     },
     approvePullRequest: createRealApprovePullRequest(octokit),
     listOpenPullRequests: createRealListOpenPullRequests(octokit),
+    // Sibling check of the merge gate (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01): two reads per
+    // merge candidate (the PR itself and the 30 most recently updated closed PRs of its repository).
+    readSiblingMergeContext: async (input): Promise<SiblingMergeContextData> => {
+      const own = await octokit.pulls.get({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.number,
+      });
+      const closed = await octokit.pulls.list({
+        owner: input.owner,
+        repo: input.repo,
+        state: 'closed',
+        sort: 'updated',
+        direction: 'desc',
+        per_page: 30,
+      });
+      return {
+        headRefName: own.data.head.ref ?? '',
+        createdAt: own.data.created_at ?? '',
+        recentMerged: closed.data.flatMap(candidate =>
+          candidate.merged_at
+            ? [
+                {
+                  number: candidate.number,
+                  url: candidate.html_url,
+                  mergedAt: candidate.merged_at,
+                  body: candidate.body ?? '',
+                  baseRef: candidate.base?.ref ?? '',
+                },
+              ]
+            : []
+        ),
+      };
+    },
+    listMergedPullRequestFiles: async (input): Promise<readonly string[] | null> => {
+      if (!octokit.pulls.listFiles) throw new Error('overseer_real_adapter_missing_list_files');
+      const response = await octokit.pulls.listFiles({
+        owner: input.owner,
+        repo: input.repo,
+        pull_number: input.number,
+        per_page: 100,
+      });
+      // A full page may hide more files: unreadable, so the caller treats the merge as not spec-only.
+      return response.data.length >= 100 ? null : response.data.map(file => file.filename);
+    },
   };
 }

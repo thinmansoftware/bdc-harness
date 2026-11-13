@@ -32,11 +32,18 @@ describe('production Docker packaging', () => {
       join(import.meta.dir, '..', '..', '..', 'Dockerfile'),
       'utf8'
     );
-    const copyLine = dockerfile
+    const production = dockerfile.split('AS production')[1];
+    expect(production).toBeDefined();
+    const copyLine = production
       .split(/\r?\n/)
-      .find(l => l.startsWith('COPY scripts/') && l.endsWith('./scripts/'));
+      .find(
+        l =>
+          l.startsWith('COPY scripts/') &&
+          l.endsWith('./scripts/') &&
+          l.split(/\s+/).includes('scripts/run-completion-report.ts')
+      );
     expect(copyLine).toContain('scripts/run-completion-report.ts');
-    expect(dockerfile.split('AS production')[1]).toContain('scripts/run-completion-report.ts');
+    expect(production).toContain('scripts/run-completion-report.ts');
   });
 
   /**

@@ -45,6 +45,22 @@ const TERRA_LANES: ReadonlyArray<{ file: string; seats: readonly string[] }> = [
 
 const UNPINNED_MODELS = new Set(['', 'default', 'provider-default']);
 
+// Acting XO 2026-11-10: the three reviewer seats run on gpt-6.1-sol (replay 9/10, wiki
+// models/model-testing-results T13) on the lanes whose builder is a different model family.
+// The codex and codex-only lanes build on Sol, so their reviewers stay on Terra: a review seat
+// must not share its lane build model (lane-registration.test.ts Test 3). The other strict
+// seats stay on Terra everywhere.
+const REVIEWER_SOL_SEATS: ReadonlySet<string> = new Set([
+  'diff-review',
+  'diff-review-final',
+  'opus-rereview',
+]);
+const REVIEWER_SOL_LANES: readonly string[] = [
+  'bdc-feature-development.yaml',
+  'bdc-feature-development-cursor.yaml',
+  'bdc-feature-development-fable.yaml',
+];
+
 const probeConfig: WorkflowConfig = {
   assistant: 'codex',
   commands: {},
@@ -160,7 +176,42 @@ describe('strict seat model pins', () => {
         expect(binding.provider, `${file}:${id}:provider`).toBe('codex-native-strict');
         const expectedTerra =
           file === 'bdc-feature-development-codex.yaml' ? 'gpt-6.1-terra' : 'gpt-5.6-terra';
-        expect(binding.model, `${file}:${id}:model`).toBe(expectedTerra);
+        expect(binding.model, `${file}:${id}:model`).toBe(
+          REVIEWER_SOL_SEATS.has(id) && REVIEWER_SOL_LANES.includes(file)
+            ? 'gpt-6.1-sol'
+            : expectedTerra
+        );
+      }
+    }
+  });
+
+  test('reviewer_seats_resolve_gpt_61_sol_on_non_sol_builder_lanes_and_terra_on_sol_builder_lanes', async () => {
+    for (const file of REVIEWER_SOL_LANES) {
+      const workflow = loadWorkflow(readFileSync(join(defaultsDir, file), 'utf8'), file);
+      for (const id of REVIEWER_SOL_SEATS) {
+        const node = workflow.nodes.find(candidate => candidate.id === id);
+        expect(node, `${file}:${id}`).toBeDefined();
+        const binding = await resolveStrictBinding(workflow, node!);
+        expect(binding.provider, `${file}:${id}:provider`).toBe('codex-native-strict');
+        expect(binding.model, `${file}:${id}:model`).toBe('gpt-6.1-sol');
+      }
+      // apply-diff-review-final is NOT a reviewer seat and keeps its pin.
+      const apply = workflow.nodes.find(candidate => candidate.id === 'apply-diff-review-final');
+      if (apply) {
+        const binding = await resolveStrictBinding(workflow, apply);
+        expect(binding.model, `${file}:apply-diff-review-final`).not.toBe('gpt-6.1-sol');
+      }
+    }
+    // Sol-builder lanes keep Terra reviewers (no self-review).
+    for (const file of [
+      'bdc-feature-development-codex.yaml',
+      'bdc-feature-development-codex-only.yaml',
+    ]) {
+      const workflow = loadWorkflow(readFileSync(join(defaultsDir, file), 'utf8'), file);
+      for (const id of REVIEWER_SOL_SEATS) {
+        const node = workflow.nodes.find(candidate => candidate.id === id);
+        const binding = await resolveStrictBinding(workflow, node!);
+        expect(binding.model, `${file}:${id}`).not.toBe('gpt-6.1-sol');
       }
     }
   });
@@ -244,7 +295,7 @@ describe('strict seat model pins', () => {
       {
         file: 'bdc-feature-development-fable.yaml',
         provider: 'claude',
-        model: 'claude-fable-5',
+        model: 'claude-fable-5-2',
         plan: {},
         implement: {},
       },

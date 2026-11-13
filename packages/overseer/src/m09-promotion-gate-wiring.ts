@@ -175,6 +175,12 @@ export function createPromotionGate(
           if (page >= 100) throw Error('m09 ambiguous create listing incomplete');
         }
       }
+      // GitHub accepts a PATCH of a COMPLETED check run back to `in_progress` (HTTP 200) and ignores
+      // it: the run stays completed with its old conclusion, so a held `success` would stay visible
+      // while the gate decides again. When a run already exists, invalidate it with a completed,
+      // non-passing conclusion instead (`action_required`; `neutral` and `skipped` count as passing
+      // for required checks). WO-HARNESS-M09-GATE-INVALIDATE-COMPLETED-CHECK-01.
+      const invalidate = status === 'in_progress' && existing !== undefined;
       const response = await call(
         existing
           ? 'PATCH /repos/{owner}/{repo}/check-runs/{check_run_id}'
@@ -183,8 +189,14 @@ export function createPromotionGate(
           ...args,
           ...(existing ? { check_run_id: existing } : { name: NAME, head_sha: head }),
           external_id: head,
-          status,
-          ...(result ? { conclusion: result.conclusion } : { conclusion: null }),
+          status: invalidate ? 'completed' : status,
+          // GitHub rejects `conclusion: null` (HTTP 422, "nil is not a string"); an in-progress
+          // publish must omit the key entirely (WO-HARNESS-M09-GATE-POSTS-NO-CHECK-01, bdc-xo#5533).
+          ...(result
+            ? { conclusion: result.conclusion }
+            : invalidate
+              ? { conclusion: 'action_required' }
+              : {}),
           output: {
             title: result
               ? `M-09 ${result.conclusion}: ${result.rules.map((r, i) => `${i + 1} ${r.pass ? 'PASS' : 'FAIL'}`).join(', ')}`.slice(
@@ -193,7 +205,7 @@ export function createPromotionGate(
                 )
               : 'M-09 evaluation pending',
             summary: result
-              ? `${result.reason ? result.reason + '\n' : ''}bdc-xo pinned SHA: ${result.pinnedSha || 'unavailable'}\n${result.rules.map(r => `${r.pass ? 'PASS' : 'FAIL'} ${r.name}`).join('\n')}`
+              ? `${result.reason ? result.reason + '\n' : ''}bdc-xo pinned SHA: ${result.pinnedSha || 'unavailable'}\n${result.rules.map(r => `${r.pass ? 'PASS' : 'FAIL'} ${r.name}${r.detail ? ` -- ${r.detail}` : ''}`).join('\n')}`
               : 'Approval is being revalidated. This check is not a promotion approval.',
           },
         }
@@ -255,7 +267,8 @@ export function createPromotionGate(
     }
     async function decide(pr: Pr): Promise<PromotionResult> {
       let motion = '',
-        behindBy = -1;
+        behindBy = -1,
+        headTree = '';
       try {
         const block = promotionBlock(pr.body ?? '');
         const matches = motionPaths(paths, block?.id ?? '');
@@ -271,6 +284,16 @@ export function createPromotionGate(
             throw Error('invalid record');
           motion = Buffer.from(record.content, 'base64').toString('utf8');
         }
+        // One extra read, only for a block that pins by tree: the head commit's tree.
+        if (block?.tree)
+          headTree = (
+            (
+              await call('GET /repos/{owner}/{repo}/git/commits/{commit_sha}', {
+                ...args,
+                commit_sha: pr.head.sha,
+              })
+            ).data as { tree: { sha: string } }
+          ).tree.sha;
         behindBy = (
           (
             await call('GET /repos/{owner}/{repo}/compare/{basehead}', {
@@ -282,6 +305,7 @@ export function createPromotionGate(
       } catch {
         motion = '';
         behindBy = -1;
+        headTree = '';
       }
       return evaluatePromotion({
         repository: target.repository,
@@ -292,6 +316,7 @@ export function createPromotionGate(
         truncated,
         motion,
         behindBy,
+        headTree,
       });
     }
     let result: PromotionResult;

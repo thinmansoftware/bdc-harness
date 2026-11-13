@@ -20,7 +20,11 @@
 import { createLogger } from '@archon/paths';
 import type { OverseerVerdictRow, OverseerWatchRun } from '@archon/core/db/overseer';
 import { readOverseerActionPolicyFromEnv, type OverseerActionPolicy } from './action-policy';
-import { PR_DISCOVERY_RUN_ID_PREFIX, RUN_BLOCKED_LABEL } from './merge-candidate-discovery';
+import {
+  OWNER_REWORKING_LABEL,
+  PR_DISCOVERY_RUN_ID_PREFIX,
+  RUN_BLOCKED_LABEL,
+} from './merge-candidate-discovery';
 import {
   getRepoBasePolicy,
   hasRepoPolicyEntry,
@@ -32,8 +36,24 @@ import {
   warnLegacyMergePolicy,
 } from './merge-repo-policy';
 import { specDeclaresMergeHold } from './merge-hold';
+import type { MergedSibling } from './sibling-wo-id';
 import { isSpecOnlyChangeSet } from './reconcile';
-import type { GitHubClientDeps, PullRequestEvidence, ReviewConflictAtHead } from './types.ts';
+import type {
+  GitHubClientDeps,
+  OverseerWorkflowEvent,
+  PullRequestEvidence,
+  ReviewConflictAtHead,
+} from './types.ts';
+import {
+  originatingEvidenceFailure,
+  evidenceAdjudicated,
+  postEvidenceHold,
+  runlessOriginatingEvidenceHold,
+  ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON,
+  ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON,
+  ORIGINATING_RUN_UNREADABLE_HOLD_REASON,
+} from './merge-manager';
+import type { OriginatingRun, OriginatingRunLookupInput } from './originating-run-lookup';
 import { resolveRequiredContexts } from './adapters/required-contexts';
 import { createRealOctokitClient } from './adapters/github-real-deps';
 import { blockingRequiredContexts } from './required-context-gate';
@@ -56,6 +76,8 @@ const DEFAULT_MERGE_RETRY_MAX_ATTEMPTS = 8;
 const FLAG_MERGE_READY = 'flag_merge_ready';
 const RECEIPT_MARKER = '<!-- merge-manager-receipt -->';
 const RECEIPT_KEY_PREFIX = '<!-- merge-manager-receipt-key';
+const POLICY_SKIP_MARKER = '<!-- merge-policy-skip:v1 -->';
+const POLICY_SKIP_KEY_PREFIX = '<!-- merge-policy-skip-key';
 export type MergeExecutionRepoConfig = Readonly<Record<string, { readonly baseBranch: string }>>;
 
 export interface MergeExecutionBridgeStore {
@@ -80,8 +102,19 @@ export interface MergeExecutionBridgeStore {
 }
 
 export interface MergeExecutionBridgeOptions {
+  readRunEvents?: (runId: string) => Promise<OverseerWorkflowEvent[]>;
+  /**
+   * Trace a run-less verdict's PR to the run that opened it (bdc-harness 5308).
+   * Absent keeps the run-less path unchanged; a rejection holds as unreadable.
+   */
+  findOriginatingRun?: (input: OriginatingRunLookupInput) => Promise<OriginatingRun | null>;
   store: MergeExecutionBridgeStore;
   github: GitHubClientDeps;
+  /** Optional logger seam for the skip line (tests); defaults to the module logger. */
+  logger?: {
+    info(obj: Record<string, unknown>, msg: string): void;
+    warn(obj: Record<string, unknown>, msg: string): void;
+  };
   readPolicy?: () => OverseerActionPolicy;
   now?: () => Date;
   maxMergesPerHour?: number;
@@ -109,6 +142,16 @@ export interface MergeExecutionBridgeOptions {
   }): Promise<ReviewConflictAtHead | null>;
   // Absent in tests that predate the spec hold. When omitted, no spec is read.
   readWoSpec?(woId: string): Promise<string>;
+  /**
+   * Another pull request of the same work order, in the same repository, already merged after this
+   * one was created (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01). Absent keeps the bridge unchanged.
+   * A rejection never blocks a merge: it is logged and the pull request follows the normal path.
+   */
+  findMergedSibling?(input: {
+    owner: string;
+    repo: string;
+    number: number;
+  }): Promise<MergedSibling | null>;
 }
 
 export interface MinimalCompareClient {
@@ -337,11 +380,17 @@ async function recordPostMutationOutcome(
   }
 }
 
-type SkipVerdict = (reason: string, prUrl?: string, rateLimited?: boolean) => Promise<void>;
+type SkipVerdict = (
+  reason: string,
+  prUrl?: string,
+  rateLimited?: boolean,
+  details?: Record<string, unknown>
+) => Promise<void>;
 
 interface MergeTarget {
   pr: PullRequestEvidence;
   basePolicy?: RepoBasePolicy;
+  run?: OverseerWatchRun;
 }
 
 interface RunlessPullRef {
@@ -406,7 +455,10 @@ async function resolveRunlessTarget(
   }
   const ownerRepo = `${ref.owner}/${ref.repo}`.toLowerCase();
   if (!hasRepoPolicyEntry(ownerRepo, repoPolicy)) {
-    await skip('repo_not_allowed');
+    await skip('repo_not_allowed', undefined, false, {
+      ...repoNotInPolicyDetails(ref.owner, ref.repo),
+      prNumber: ref.prNumber,
+    });
     return null;
   }
   let pr: PullRequestEvidence;
@@ -435,6 +487,10 @@ async function resolveRunlessTarget(
       undefined,
       isRateLimitSkip(error instanceof Error ? error.message : '')
     );
+    return null;
+  }
+  if (pr.lookupFailed) {
+    await skip('pr_context_fetch_failed', pr.htmlUrl);
     return null;
   }
   if (!pr.exists || pr.pr?.number !== ref.prNumber) {
@@ -468,6 +524,7 @@ async function resolveRunlessTarget(
   const basePolicy = getRepoBasePolicy(ownerRepo, pr.baseBranch ?? '', repoPolicy);
   if (!basePolicy?.unattended) {
     await skip('base_not_allowlisted', pr.htmlUrl);
+    await postPolicySkipComment(options, verdict, pr, 'base_not_allowlisted');
     return null;
   }
   return { pr, basePolicy };
@@ -494,7 +551,7 @@ async function resolveMergeTarget(
   }
   const ownerRepo = `${run.owner}/${run.repo}`.toLowerCase();
   if (!hasRepoPolicyEntry(ownerRepo, repoPolicy)) {
-    await skip('repo_not_allowed');
+    await skip('repo_not_allowed', undefined, false, repoNotInPolicyDetails(run.owner, run.repo));
     return null;
   }
   const pr = await options.github.findPullRequest({
@@ -506,6 +563,7 @@ async function resolveMergeTarget(
   });
   return {
     pr,
+    run,
     basePolicy: getRepoBasePolicy(ownerRepo, pr.baseBranch ?? '', repoPolicy),
   };
 }
@@ -589,10 +647,152 @@ async function postMergeReceiptComment(
   }
 }
 
+/**
+ * WO-HARNESS-MERGE-POLICY-SKIP-VISIBLE-01: a pull request the bridge skips by
+ * POLICY (terminal: spec_only, integration_base_mismatch, base_not_allowlisted)
+ * used to sit unmerged with no sign on it of why -- bdc-harness #1371 waited
+ * 11 days APPROVED and green while the Duty Officer nudged the merge manager
+ * about a skip that was deliberate. The skip stays a skip; this posts ONE
+ * comment saying why the manager will not merge it and that a person does.
+ * Idempotent on a key line (verdict id + reason), same pattern as the merge
+ * receipt. Never throws: a comment failure is logged and the skip outcome
+ * already recorded is unchanged. repo_not_allowed has no pull request in hand
+ * and posts nothing.
+ */
+export type PolicySkipReason = 'spec_only' | 'integration_base_mismatch' | 'base_not_allowlisted';
+
+function policySkipSentence(reason: PolicySkipReason, baseBranch: string): string {
+  const tail =
+    'a person merges it when ready (exact-head approval and green required checks still apply).';
+  switch (reason) {
+    case 'spec_only':
+      return `The merge manager does not merge documentation-only pull requests into ${baseBranch} by policy, so it skipped this one on purpose; ${tail}`;
+    case 'integration_base_mismatch':
+      return `${baseBranch} is not a base the merge manager merges unattended, so it skipped this pull request on purpose; ${tail}`;
+    case 'base_not_allowlisted':
+      return `${baseBranch} is not on the merge manager's allowlist for this repository, so it skipped this pull request on purpose; ${tail}`;
+  }
+}
+
+function policySkipKey(verdict: OverseerVerdictRow, reason: PolicySkipReason): string {
+  const keyField = (value: string): string =>
+    sanitizeReceiptField(value).replace(/[^A-Za-z0-9._:-]/g, '_');
+  return `${POLICY_SKIP_KEY_PREFIX}:${keyField(verdict.id)}:${keyField(reason)} -->`;
+}
+
+export async function postPolicySkipComment(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  pr: PullRequestEvidence,
+  reason: PolicySkipReason
+): Promise<void> {
+  if (!options.github.commentOnPullRequest) {
+    log.warn(
+      { verdictId: verdict.id, prUrl: pr.htmlUrl, reason },
+      'merge-coordinator.policy_skip_comment_unavailable'
+    );
+    return;
+  }
+  if (!pr.pr) return;
+  try {
+    const expectedKey = policySkipKey(verdict, reason);
+    const commentAuthorLogin = options.github.commentAuthorLogin?.trim().toLowerCase();
+    if (options.github.listPullRequestComments && commentAuthorLogin) {
+      const existing = await options.github.listPullRequestComments(pr.pr);
+      if (
+        existing.some(
+          comment =>
+            comment.authorLogin.trim().toLowerCase() === commentAuthorLogin &&
+            comment.body.split(/\r?\n/).some(line => line.trim() === expectedKey)
+        )
+      ) {
+        return;
+      }
+    }
+    const baseBranch = sanitizeReceiptField(
+      pr.baseBranch && pr.baseBranch.length > 0 ? pr.baseBranch : 'its base'
+    );
+    const body = [POLICY_SKIP_MARKER, expectedKey, policySkipSentence(reason, baseBranch)].join(
+      '\n'
+    );
+    await options.github.commentOnPullRequest({ ...pr.pr, body });
+  } catch (error) {
+    log.warn(
+      { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl, reason },
+      'merge-coordinator.policy_skip_comment_failed'
+    );
+  }
+}
+
 const CEILING_QUEUE_MARKER = '<!-- overseer:merge-ceiling-queued -->';
+
+/**
+ * Label a pull request carries while it waits for a merge slot (the hourly ceiling). It is a signal
+ * only: nothing in the merge path reads it as a hold. Added once at the first deferral, removed when
+ * the bridge merges the PR (a PR merged by hand keeps it, which is cosmetic).
+ */
+export const MERGE_QUEUED_LABEL = 'merge-queued';
 
 function reportedChecksAreBlocking(checks: PullRequestEvidence['checks']): boolean {
   return checks.total === 0 || checks.failed > 0 || checks.pending > 0;
+}
+
+/**
+ * Approval memo (bdc-xo#5358): the bridge posts at most one approving review per exact head SHA per
+ * ten minutes. In-process and bounded; a restart or a new head posts again, which is correct.
+ */
+const APPROVAL_MEMO_TTL_MS = 10 * 60 * 1000;
+const APPROVAL_MEMO_MAX = 512;
+// One memo per GitHub client object: the service reuses its client across passes, a test builds its own.
+const approvalMemos = new WeakMap<object, Map<string, number>>();
+
+function approvalMemoFor(github: object): Map<string, number> {
+  let memo = approvalMemos.get(github);
+  if (!memo) {
+    memo = new Map<string, number>();
+    approvalMemos.set(github, memo);
+  }
+  return memo;
+}
+
+function approvalRecentlyPosted(github: object, key: string, nowMs: number): boolean {
+  const at = approvalMemoFor(github).get(key);
+  return at !== undefined && nowMs - at < APPROVAL_MEMO_TTL_MS;
+}
+
+function noteApprovalPosted(github: object, key: string, nowMs: number): void {
+  const memo = approvalMemoFor(github);
+  if (memo.size >= APPROVAL_MEMO_MAX) {
+    for (const [k, at] of memo) {
+      if (nowMs - at >= APPROVAL_MEMO_TTL_MS) memo.delete(k);
+    }
+    while (memo.size >= APPROVAL_MEMO_MAX) {
+      const oldest = memo.keys().next().value;
+      if (oldest === undefined) break;
+      memo.delete(oldest);
+    }
+  }
+  memo.set(key, nowMs);
+}
+
+/** A green PR waiting for the ceiling must not look stuck: label it once (never an extra call per pass). */
+async function markMergeQueued(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  pr: PullRequestEvidence
+): Promise<boolean> {
+  if (!pr.pr || !options.github.addPullRequestLabels) return false;
+  if (pr.labels?.includes(MERGE_QUEUED_LABEL)) return true;
+  try {
+    await options.github.addPullRequestLabels({ ...pr.pr, labels: [MERGE_QUEUED_LABEL] });
+    return true;
+  } catch (error) {
+    log.warn(
+      { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
+      'merge-coordinator.queued_label_failed'
+    );
+    return false;
+  }
 }
 
 async function postCeilingQueueNotice(
@@ -641,12 +841,65 @@ async function postCeilingQueueNotice(
   }
 }
 
+/**
+ * WO-HARNESS-MERGE-POLICY-PROVISIONER-AND-REPO-SKIP-LINE-01 (bdc-xo#5581): a skip because the repository
+ * has no policy entry used to be an info line with only the run id (no repository or number field, no
+ * hint) and posts no comment, so nobody saw why a pull request was not merged. The skip line for
+ * `repo_not_allowed` is now a WARN carrying the repository, the pull request number when known, the
+ * variable to read and one hint, once per verdict id per process (replays of the same verdict stay info).
+ */
+const REPO_NOT_ALLOWED_WARN_MAX = 2000;
+const warnedRepoNotAllowed = new Set<string>();
+
+/**
+ * WO-HARNESS-MERGE-QUEUE-NOTE-ALL-QUEUED-01 (bdc-xo#5697): when the hourly ceiling is full, every merge-ready
+ * pull request waiting behind the head of the queue gets the `merge-queued` label and one position comment,
+ * not only the head. At most this many notes per sweep (each note reads the pull request), and each verdict
+ * is noted once per process; a restart repeats a note at most once and the marker and label guards keep it
+ * from duplicating.
+ */
+export const QUEUE_NOTE_MAX_PER_SWEEP = 10;
+const QUEUE_NOTED_MAX = 2000;
+/**
+ * A verdict whose pull request was visited and judged not eligible (held, stale, failing, conflicting, a base
+ * the manager never merges) or whose read failed is not read again for this long, so unsuccessful visits
+ * cannot keep using the per-sweep budget and starve the eligible pull requests behind them (Overseer review
+ * of PR 1590). A verdict that WAS noted is remembered for the life of the process.
+ */
+export const QUEUE_NOTE_RECHECK_MS = 5 * 60 * 1000;
+// verdict id -> epoch ms until which the verdict is skipped (Infinity once noted)
+const queueNoted = new Map<string, number>();
+
+function queueNoteSkipped(verdictId: string, nowMs: number): boolean {
+  const until = queueNoted.get(verdictId);
+  return until !== undefined && until > nowMs;
+}
+
+function rememberQueueVisit(verdictId: string, until: number): void {
+  if (queueNoted.size >= QUEUE_NOTED_MAX) queueNoted.clear();
+  queueNoted.set(verdictId, until);
+}
+
+/** Test hook: forget which verdicts were already noted or visited. */
+export function resetMergeQueueNotesForTests(): void {
+  queueNoted.clear();
+}
+
+function repoNotInPolicyDetails(owner: string, repo: string): Record<string, unknown> {
+  return {
+    owner,
+    repo,
+    env: 'MERGE_MANAGER_REPO_POLICY',
+    hint: 'add_repo_to_merge_policy',
+  };
+}
+
 async function mergeClaimedVerdict(
   options: MergeExecutionBridgeOptions,
   verdict: OverseerVerdictRow,
   repoPolicy: MergeRepoPolicy,
   queuePosition: number
-): Promise<'stop' | undefined> {
+): Promise<'stop' | 'ceiling_full' | undefined> {
   let rateLimitDeferred = false;
   const skip = async (
     reason: string,
@@ -654,6 +907,20 @@ async function mergeClaimedVerdict(
     rateLimited = false,
     details?: Record<string, unknown>
   ): Promise<void> => {
+    if (
+      reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON ||
+      reason === ORIGINATING_RUN_IN_PROGRESS_HOLD_REASON ||
+      reason === ORIGINATING_RUN_UNREADABLE_HOLD_REASON
+    ) {
+      // Evidence holds must remain eligible for repair/adjudication on the next tick.
+      // recordOutcome finalizes a verdict; transient retries consume a bounded budget.
+      await options.store.releaseVerdictClaim(verdict.id, reason);
+      log.info(
+        { verdictId: verdict.id, runId: verdict.run_id, woId: verdict.wo_id, reason, prUrl },
+        'merge-coordinator.originating_evidence_held'
+      );
+      return;
+    }
     if (classifyMergeSkip(reason) === 'transient' && options.store.deferVerdictClaim) {
       const retryMaxAttempts = configuredNonNegativeInteger(
         options.retryMaxAttempts,
@@ -702,17 +969,24 @@ async function mergeClaimedVerdict(
       reason,
       prUrl,
     });
-    log.info(
-      {
-        verdictId: verdict.id,
-        runId: verdict.run_id,
-        woId: verdict.wo_id,
-        ...(details ?? {}),
-        reason,
-        prUrl,
-      },
-      'merge-coordinator.merge_skipped'
-    );
+    const skipFields = {
+      verdictId: verdict.id,
+      runId: verdict.run_id,
+      woId: verdict.wo_id,
+      ...(details ?? {}),
+      reason,
+      prUrl,
+    };
+    if (
+      (reason === 'repo_not_allowed' || reason === 'sibling_pr_already_merged') &&
+      !warnedRepoNotAllowed.has(verdict.id)
+    ) {
+      if (warnedRepoNotAllowed.size >= REPO_NOT_ALLOWED_WARN_MAX) warnedRepoNotAllowed.clear();
+      warnedRepoNotAllowed.add(verdict.id);
+      (options.logger ?? log).warn(skipFields, 'merge-coordinator.merge_skipped');
+    } else {
+      (options.logger ?? log).info(skipFields, 'merge-coordinator.merge_skipped');
+    }
   };
 
   const policy = (options.readPolicy ?? readOverseerActionPolicyFromEnv)();
@@ -826,10 +1100,12 @@ async function mergeClaimedVerdict(
   }
   if (isDocumentationOnly(pr.changedFilePaths) && (basePolicy?.docsOnly ?? 'skip') === 'skip') {
     await skip('spec_only', pr.htmlUrl);
+    await postPolicySkipComment(options, verdict, pr, 'spec_only');
     return undefined;
   }
   if (!basePolicy?.unattended) {
     await skip('integration_base_mismatch', pr.htmlUrl);
+    await postPolicySkipComment(options, verdict, pr, 'integration_base_mismatch');
     return undefined;
   }
 
@@ -918,6 +1194,24 @@ async function mergeClaimedVerdict(
     return undefined;
   }
 
+  // The owner marks a PR owner:reworking while the design is being redone. Like a hold it
+  // releases the claim without skip(), attempts or an outcome row, so the next tick
+  // re-evaluates after the owner clears the label. It is NOT HOLD (John's); nothing here sets
+  // or clears it.
+  if (pr.labels?.includes(OWNER_REWORKING_LABEL)) {
+    await options.store.releaseVerdictClaim(verdict.id, 'owner_reworking_label');
+    log.info(
+      {
+        verdictId: verdict.id,
+        runId: verdict.run_id,
+        woId: verdict.wo_id,
+        prUrl: pr.htmlUrl,
+      },
+      'merge-coordinator.owner_reworking_label'
+    );
+    return undefined;
+  }
+
   if (options.readWoSpec && typeof verdict.wo_id === 'string' && verdict.wo_id.startsWith('WO-')) {
     try {
       const specText = await options.readWoSpec(verdict.wo_id);
@@ -953,6 +1247,36 @@ async function mergeClaimedVerdict(
     }
   }
 
+  // A second implementation of an already-merged work order must never land on top of the first
+  // (provisioner PR 103 after PR 102, 2026-11-12). The reconcile pass closes such siblings; this is
+  // the safety net for the window before it runs. Fails open: a failed lookup blocks nothing.
+  if (options.findMergedSibling) {
+    let sibling: MergedSibling | null = null;
+    try {
+      sibling = await options.findMergedSibling({
+        owner: pr.pr.owner,
+        repo: pr.pr.repo,
+        number: pr.pr.number,
+      });
+    } catch (error) {
+      (options.logger ?? log).warn(
+        { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
+        'merge-coordinator.sibling_lookup_failed'
+      );
+    }
+    if (sibling) {
+      await skip('sibling_pr_already_merged', pr.htmlUrl, false, {
+        owner: pr.pr.owner,
+        repo: pr.pr.repo,
+        prNumber: pr.pr.number,
+        mergedPrNumber: sibling.number,
+        mergedPrUrl: sibling.url,
+        siblingWoId: sibling.woId,
+      });
+      return undefined;
+    }
+  }
+
   const isCeReleasePr =
     `${pr.pr.owner}/${pr.pr.repo}`.toLowerCase() === 'thinmansoftware/lspro-react' &&
     pr.baseBranch === 'release/ce';
@@ -970,6 +1294,64 @@ async function mergeClaimedVerdict(
     }
   }
 
+  // Evidence holds run FIRST: before the merge slot is reserved and before any approval is posted
+  // (bdc-xo#5358). A held pull request used to reserve a slot, post a fresh empty APPROVED review and
+  // only then find the hold, once per pass (27 approvals in 15 minutes on one held PR). Now a held
+  // verdict takes no slot and posts no approval; the next pass re-evaluates it for free of writes.
+  if (isRunlessVerdict(verdict) && options.findOriginatingRun) {
+    const traced = await runlessOriginatingEvidenceHold(
+      {
+        owner: pr.pr.owner,
+        repo: pr.pr.repo,
+        number: pr.pr.number,
+        headRef: pr.pr.headRef,
+      },
+      options.findOriginatingRun,
+      options.readRunEvents
+    );
+    if (
+      traced &&
+      !(
+        traced.failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON &&
+        (await evidenceAdjudicated(options.github, { ...pr.pr, headSha: verdict.head_sha }))
+      )
+    ) {
+      await postEvidenceHold(
+        options.github,
+        traced.runId,
+        { ...pr.pr, headSha: verdict.head_sha },
+        traced.failure,
+        'execute',
+        true
+      );
+      await skip(traced.failure.reason, pr.htmlUrl);
+      return undefined;
+    }
+  }
+  if (!isRunlessVerdict(verdict)) {
+    const failure = await originatingEvidenceFailure(
+      { runId: verdict.run_id, status: target.run?.status ?? '' },
+      target.run?.id === verdict.run_id ? options.readRunEvents : undefined
+    );
+    if (
+      failure &&
+      !(
+        failure.reason === ORIGINATING_RUN_FAILED_EVIDENCE_HOLD_REASON &&
+        (await evidenceAdjudicated(options.github, { ...pr.pr, headSha: verdict.head_sha }))
+      )
+    ) {
+      await postEvidenceHold(
+        options.github,
+        verdict.run_id,
+        { ...pr.pr, headSha: verdict.head_sha },
+        failure,
+        'execute',
+        true
+      );
+      await skip(failure.reason, pr.htmlUrl);
+      return undefined;
+    }
+  }
   const now = (options.now ?? ((): Date => new Date()))();
   const since = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
   const ceiling = configuredLimit(options.maxMergesPerHour);
@@ -992,20 +1374,31 @@ async function mergeClaimedVerdict(
       queuePosition,
       ceiling
     );
-    return notified ? 'stop' : undefined;
+    await markMergeQueued(options, verdict, pr);
+    // The ceiling is full for everything behind the head: when the head's own notice posted, the sweep
+    // continues in note-only mode (no claim, no reservation, no merge) instead of stopping at the head. When
+    // the notice failed the sweep keeps its earlier behavior (visit the next verdict normally).
+    if (notified) rememberQueueVisit(verdict.id, Number.POSITIVE_INFINITY);
+    return notified ? 'ceiling_full' : undefined;
   }
 
   if (options.github.approvePullRequest) {
-    try {
-      await options.github.approvePullRequest({
-        ...pr.pr,
-        expectedHeadSha: verdict.head_sha,
-      });
-    } catch (error) {
-      log.warn(
-        { err: error as Error, verdictId: verdict.id },
-        'merge-coordinator.approval_failed_nonfatal'
-      );
+    // At most one approval per exact head per APPROVAL_MEMO_TTL_MS: a pass that returns before the merge
+    // (review in flight, changes requested, merge failure) must not post another approval on the next pass.
+    const approvalKey = `${pr.pr.owner}/${pr.pr.repo}#${String(pr.pr.number)}@${verdict.head_sha}`;
+    if (!approvalRecentlyPosted(options.github, approvalKey, now.getTime())) {
+      try {
+        await options.github.approvePullRequest({
+          ...pr.pr,
+          expectedHeadSha: verdict.head_sha,
+        });
+        noteApprovalPosted(options.github, approvalKey, now.getTime());
+      } catch (error) {
+        log.warn(
+          { err: error as Error, verdictId: verdict.id },
+          'merge-coordinator.approval_failed_nonfatal'
+        );
+      }
     }
   }
   // Fail-closed re-verify of the CE approval/gate immediately before merge.
@@ -1098,6 +1491,16 @@ async function mergeClaimedVerdict(
     },
     'merge-coordinator.merge_executed'
   );
+  if (pr.pr && pr.labels?.includes(MERGE_QUEUED_LABEL) && options.github.removePullRequestLabel) {
+    try {
+      await options.github.removePullRequestLabel({ ...pr.pr, label: MERGE_QUEUED_LABEL });
+    } catch (error) {
+      log.warn(
+        { err: error as Error, verdictId: verdict.id, prUrl: pr.htmlUrl },
+        'merge-coordinator.queued_label_remove_failed'
+      );
+    }
+  }
   const ownerRepo = pr.pr !== undefined ? `${pr.pr.owner}/${pr.pr.repo}` : 'unknown';
   await postMergeReceiptComment(options, verdict, pr, {
     mergeSha: merged.mergeSha ?? merged.sha,
@@ -1107,19 +1510,101 @@ async function mergeClaimedVerdict(
   return undefined;
 }
 
+/**
+ * Note-only visit of a verdict that is waiting behind a full ceiling: read its pull request and, only when it
+ * is still a plausible merge candidate, post the position comment and the label. It never claims the verdict,
+ * reserves a slot or merges, and it records no outcome: a pull request that fails a later check is released
+ * by the normal path when it reaches the head, which already says why. Returns true when it spent a read.
+ */
+async function noteQueuedVerdict(
+  options: MergeExecutionBridgeOptions,
+  verdict: OverseerVerdictRow,
+  repoPolicy: MergeRepoPolicy,
+  queuePosition: number
+): Promise<boolean> {
+  const now = (options.now ?? ((): Date => new Date()))();
+  if (queueNoteSkipped(verdict.id, now.getTime())) return false;
+  // Every visit below that does not end in a note is remembered for QUEUE_NOTE_RECHECK_MS.
+  const notEligible = (): true => {
+    rememberQueueVisit(verdict.id, now.getTime() + QUEUE_NOTE_RECHECK_MS);
+    return true;
+  };
+  let target: MergeTarget | null;
+  try {
+    target = await resolveMergeTarget(options, verdict, repoPolicy, async () => undefined);
+  } catch (error) {
+    log.warn(
+      { err: error as Error, verdictId: verdict.id, runId: verdict.run_id },
+      'merge-coordinator.queue_note_read_failed'
+    );
+    return notEligible();
+  }
+  if (!target) return notEligible();
+  const { pr, basePolicy } = target;
+  if (!pr.exists || !pr.pr || pr.state !== 'open' || pr.headSha !== verdict.head_sha) {
+    return notEligible();
+  }
+  const labels = pr.labels ?? [];
+  if (
+    labels.includes('merge-hold') ||
+    labels.includes(RUN_BLOCKED_LABEL) ||
+    labels.includes(OWNER_REWORKING_LABEL)
+  ) {
+    return notEligible();
+  }
+  if (reportedChecksAreBlocking(pr.checks) || pr.mergeableState === 'dirty') return notEligible();
+  // A pull request the manager will never merge (a base that is not unattended, a docs-only change under a
+  // skip policy) is not waiting for a slot: no "queued" claim on it.
+  if (!basePolicy?.unattended) return notEligible();
+  if (
+    pr.changedFilePaths &&
+    isDocumentationOnly(pr.changedFilePaths) &&
+    (basePolicy.docsOnly ?? 'skip') === 'skip'
+  ) {
+    return notEligible();
+  }
+  const since = new Date(now.getTime() - 60 * 60 * 1000).toISOString();
+  const notified = await postCeilingQueueNotice(
+    options,
+    verdict,
+    pr,
+    since,
+    queuePosition,
+    configuredLimit(options.maxMergesPerHour)
+  );
+  const labelled = await markMergeQueued(options, verdict, pr);
+  // A note is final only when BOTH the comment and the label are in place. A comment or label that did not
+  // land (API down) is retried after the recheck window, not on every sweep and not never (Overseer review of
+  // PR 1590, minor); the comment is guarded by its marker and head line, the label by the label list, so a
+  // retry never duplicates either.
+  rememberQueueVisit(
+    verdict.id,
+    notified && labelled ? Number.POSITIVE_INFINITY : now.getTime() + QUEUE_NOTE_RECHECK_MS
+  );
+  return true;
+}
+
 export async function runMergeExecutionBridgeOnce(
   options: MergeExecutionBridgeOptions
 ): Promise<void> {
   const repoPolicy = configuredPolicy(options.repoConfig);
   const verdicts = await options.store.listUnactionedVerdicts();
   let queuePosition = 0;
+  let noteOnly = false;
+  let notesThisSweep = 0;
   for (const verdict of verdicts) {
     if (verdict.proposed_action !== FLAG_MERGE_READY) continue;
     queuePosition += 1;
+    if (noteOnly) {
+      if (notesThisSweep >= QUEUE_NOTE_MAX_PER_SWEEP) break;
+      if (await noteQueuedVerdict(options, verdict, repoPolicy, queuePosition)) notesThisSweep += 1;
+      continue;
+    }
     if (!(await options.store.claimVerdict(verdict.id))) continue;
     try {
-      if ((await mergeClaimedVerdict(options, verdict, repoPolicy, queuePosition)) === 'stop')
-        break;
+      const outcome = await mergeClaimedVerdict(options, verdict, repoPolicy, queuePosition);
+      if (outcome === 'stop') break;
+      if (outcome === 'ceiling_full') noteOnly = true;
     } catch (error) {
       await options.store.releaseMergeSlot(verdict.id);
       await options.store.releaseVerdictClaim(

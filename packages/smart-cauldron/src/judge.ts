@@ -20,6 +20,9 @@ import type { GateVerdict, PollResult, FireResult, TierOutcome } from './types.j
 
 const SHA40 = /^[0-9a-f]{40}$/i;
 
+/** The one gate reason that a conflict-only verdict consists of (condition 4 below). */
+const NOT_MERGEABLE_REASON = 'PR is not mergeable';
+
 /**
  * A completed run counts as having opened a PR when its pushed head SHA equals
  * the head of exactly one open WO PR. Both values must be 40 hex digits.
@@ -86,11 +89,18 @@ export function judgeGate(poll: PollResult): GateVerdict {
 
   // Condition 4: PR mergeable
   if (prMergeable === false) {
-    failingReasons.push('PR is not mergeable');
+    failingReasons.push(NOT_MERGEABLE_REASON);
   }
 
   const pass = failingReasons.length === 0;
   const reason = pass ? 'all gate conditions passed' : failingReasons.join('; ');
+  const conflictOnly =
+    !pass &&
+    terminalStatus === 'completed' &&
+    prOpened &&
+    validatorVerdict !== 'needs_revision' &&
+    failingReasons.length === 1 &&
+    failingReasons[0] === NOT_MERGEABLE_REASON;
 
   return {
     pass,
@@ -100,6 +110,7 @@ export function judgeGate(poll: PollResult): GateVerdict {
     prOpened,
     prMergeable: prMergeable ?? null,
     terminalStatus,
+    ...(conflictOnly ? { conflictOnly: true } : {}),
   };
 }
 
@@ -115,7 +126,8 @@ export function judgeGate(poll: PollResult): GateVerdict {
  */
 export function classifyAttemptOutcome(
   fireResult: FireResult,
-  gateVerdict: GateVerdict | null
+  gateVerdict: GateVerdict | null,
+  pollResult?: PollResult
 ): TierOutcome {
   // Check for infra-error first (fire failed to produce a run)
   if (!fireResult.ok && fireResult.infraError !== null) {
@@ -154,6 +166,16 @@ export function classifyAttemptOutcome(
   // guarantees pass:false for a cancelled verdict.
   if (gateVerdict.cancelled) {
     return 'cancelled';
+  }
+
+  // Only the evidence gate emits ENVIRONMENT_UNAVAILABLE: after checking a
+  // declared capability. Never infer missing services from test output text.
+  if (
+    pollResult?.terminalStatus === 'failed' &&
+    typeof pollResult.rawMetadata.error === 'string' &&
+    pollResult.rawMetadata.error.includes('ENVIRONMENT_UNAVAILABLE:')
+  ) {
+    return 'environment-unavailable';
   }
 
   return gateVerdict.pass ? 'won' : 'gate-failed';

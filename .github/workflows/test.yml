@@ -5,6 +5,10 @@ on:
     branches: [main, dev]
   pull_request:
     branches: [main, dev]
+    # ready_for_review is not in GitHub's default pull_request types. Without it a draft PR that is
+    # flipped to ready gets no fresh run, so its required checks can stay unrun or stale until someone
+    # pushes a commit (bdc-harness 1538, 2026-11-09).
+    types: [opened, synchronize, reopened, ready_for_review]
   schedule:
     - cron: '17 7 * * *'
   workflow_dispatch:
@@ -35,10 +39,17 @@ jobs:
       - name: Check bundled skill
         run: bun run check:bundled-skill
 
+      - name: Check installed Claude version and image guard
+        run: |
+          bun test ./scripts/claude-version-guard.test.ts
+          bun run scripts/claude-version-guard.ts
+
       - name: Type check
         run: bun run type-check
 
       - name: Lint
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
         run: bun run lint --max-warnings 0
 
       - name: Check formatting
@@ -49,6 +60,9 @@ jobs:
 
       - name: Host cleanup deletion guards
         run: bun test --timeout 30000 ./scripts/host/cleanup-guards.test.ts
+
+      - name: Overseer operator commands
+        run: bun test --timeout 30000 ./scripts/overseer/re-enqueue-review.test.ts
 
       - name: Zero-tier fences and first-10 measurement (Spec Stop 6)
         run: bun run test:zero-tier-fences
@@ -82,7 +96,10 @@ jobs:
   test-windows:
     name: test (windows-latest)
     runs-on: windows-latest
-    timeout-minutes: 45
+    # 60, not 45: on 2026-11-04 the job passed in 40.7 min (run 41772837326) and hit
+    # the old 45-min limit at 45.1 min (run 41773774729, reported as "cancelled"),
+    # so dev Test Suite flipped on timing alone. Sharding/speed-up is a separate WO.
+    timeout-minutes: 60
     needs: windows-gate
     if: >-
       github.event_name == 'push' ||
@@ -130,6 +147,7 @@ jobs:
           ./scripts/dispatch-worker/restart-evidence.test.ts
           ./scripts/dispatch-worker/seat-preflight.cursor.test.ts
           ./scripts/dispatch-worker/seat-preflight.test.ts
+          ./scripts/dispatch-worker/start-windows.test.ts
           ./scripts/dispatch-worker/stdin-prompt.test.ts
           ./scripts/dispatch-worker/watchdog.test.ts
           ./scripts/dispatch-worker/worker-log.test.ts
@@ -211,6 +229,14 @@ jobs:
             test "$(command -v node)" = "/opt/node26/bin/node"
             test "$(bun --version)" = "1.3.11"
           '
+
+      - name: Python YAML in the image (canonical-stage parser, bdc-harness#1532)
+        run: |
+          # -s ignores user site-packages: PyYAML must come from the image itself, not from
+          # a per-user pip install on a mounted home volume.
+          for user in appuser root; do
+            docker run --rm --user "$user" --entrypoint python3 archon-ci:test -s -c 'import yaml; print(yaml.__file__)'
+          done
 
       - name: Node LTS smoke (default node, npm, npx, pnpm, bun, node:sqlite, agent-browser)
         run: |

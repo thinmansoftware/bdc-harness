@@ -27,9 +27,11 @@ export async function tickDispatchEscalationClock(
   if (inFlight) return;
   inFlight = true;
   try {
-    if (process.env.DISPATCH_SENDER_AUTH_MODE !== 'enforce') return;
     const activatedAt = process.env.DISPATCH_PHASE1_ACTIVATED_AT;
     if (!activatedAt || !Number.isFinite(Date.parse(activatedAt))) return;
+    // Only authenticated Chief success replies may recover before global enforcement.
+    await reconcileDispatchOutcomeNotices(activatedAt, 'chief-success');
+    if (process.env.DISPATCH_SENDER_AUTH_MODE !== 'enforce') return;
     await reconcileDispatchOutcomeNotices(activatedAt);
     await ensureXoEscalationHandoffs(activatedAt);
     const now = (dependencies.now ?? ((): Date => new Date()))().toISOString();

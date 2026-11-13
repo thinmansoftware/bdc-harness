@@ -46,6 +46,8 @@ const {
   acknowledgeMessage,
   addressMessage,
   getMessage,
+  postResult,
+  reconcileDispatchOutcomeNotices,
 } = await import('./dispatch');
 import type { DispatchQueryExecutor, XoLeaseBind } from './dispatch';
 
@@ -192,6 +194,61 @@ afterAll(async () => {
 });
 
 describe('dispatch Phase 1.5 PostgreSQL integration', () => {
+  test('authenticated Chief successful fenced result and reconciliation create one reply', async () => {
+    const cutoff = '2000-01-01T00:00:00.000Z';
+    process.env.DISPATCH_PHASE1_ACTIVATED_AT = cutoff;
+    try {
+      await db.query(
+        "INSERT INTO dispatch_principals (principal_id,display_name,delivery_mode,active) VALUES ('grokbot','Synthetic Chief','drain_on_start',TRUE) ON CONFLICT DO NOTHING"
+      );
+      const source = await createAuthenticatedMessage(
+        testAuthenticatedCapability('grokbot', 'grokbot'),
+        {
+          correlation_id: randomUUID(),
+          idempotency_key: randomUUID(),
+          task_type: 'agent_message',
+          recipient: 'codex',
+          body: 'Synthetic Chief request',
+        }
+      );
+      await db.query(
+        "UPDATE agent_dispatch_messages SET status='claimed', lease_owner='synthetic-chief-worker', fencing_token=1 WHERE id=$1",
+        [source.id]
+      );
+      expect(
+        await postResult({
+          id: source.id,
+          worker_id: 'synthetic-chief-worker',
+          fencing_token: 0,
+          result_body: 'stale',
+        })
+      ).toBeNull();
+      expect(
+        (
+          await postResult({
+            id: source.id,
+            worker_id: 'synthetic-chief-worker',
+            fencing_token: 1,
+            status: 'done',
+            task_outcome: 'succeeded',
+            result_body: 'Synthetic PG reply',
+          })
+        )?.status
+      ).toBe('done');
+      expect(await reconcileDispatchOutcomeNotices(cutoff, 'chief-success')).toBe(0);
+      const replies = await db.query<{ recipient: string; priority: string; body: string }>(
+        'SELECT recipient,priority,body FROM agent_dispatch_messages WHERE idempotency_key=$1 AND sender_principal_id=$2',
+        [`outcome-notice:${source.id}`, 'system:dispatch']
+      );
+      expect(replies.rows).toHaveLength(1);
+      expect(replies.rows[0]?.recipient).toBe('grokbot');
+      expect(replies.rows[0]?.priority).toBe('normal');
+      expect(JSON.parse(replies.rows[0]!.body).result_body).toBe('Synthetic PG reply');
+    } finally {
+      delete process.env.DISPATCH_PHASE1_ACTIVATED_AT;
+    }
+  });
+
   test('refuses non-loopback and non-test database targets', () => {
     expect(() => requireLoopbackUrl('postgresql://postgres@db:5432/phase15')).toThrow(
       'must target loopback only'

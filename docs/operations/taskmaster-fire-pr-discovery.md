@@ -22,10 +22,22 @@ noOpenOrMergedPr evidence.
 
 The ceiling is 100 pages / 10,000 rows. A full final page is incomplete and throws;
 a short final page proves traversal complete. Normal histories beyond 1,000 PRs
-are supported. This can cost up to 100 sequential core API calls per eligibility
-check, in addition to existing spec reads. The existing service transport meters
-core, preserves authentication and the rate-limit floor; no new meter, cache,
-controller or credential fallback is added. Removing Search here does not prove
+are supported. This can cost up to 100 sequential core API calls per repository history read, in addition to existing spec reads. The existing service transport meters
+core, preserves authentication and the rate-limit floor; no new meter,
+controller or credential fallback is added.
+
+One tick reads each repository's all-state history once per repository per tick
+(WO-HARNESS-TASKMASTER-ELIGIBILITY-LISTING-SHARE-01, bdc-xo#5509). The
+Taskmaster tick creates one memo, `listingMemo`, and every eligibility check of
+that tick shares it: the first check for a repository performs the traversal
+above and the rest reuse the validated rows (the exact work-order matching is
+still done per check). A traversal that throws or is incomplete is not stored,
+so the next check retries, and the memo is dropped when the tick ends. Before
+this, each unclaimed thread walked the whole history by itself, which made a
+tick (including the one that runs immediately at container start) cost about
+2,340 calls an hour in the measurement of 2026-11-11. Check it with the
+`github_call_sites` log lines (docs/operations/github-call-sites.md): the
+taskmaster total for the hour after a container start. Removing Search here does not prove
 lower total traffic or an acceptable live call rate.
 
 The deterministic integration test seeds an exhausted Search resource in the

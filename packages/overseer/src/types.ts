@@ -103,7 +103,8 @@ export interface PullRequestEvidence {
   otherOpenPrsForWoLookupFailed?: boolean;
   /**
    * GitHub label names on this pull request. Absent on older evidence
-   * fixtures. An exact, case-sensitive `merge-hold` name holds the merge.
+   * fixtures. An exact, case-sensitive `merge-hold` name holds the merge, and so does an
+   * exact `owner:reworking` (set and cleared only by the owner; it is not HOLD).
    */
   labels?: readonly string[];
   /**
@@ -151,7 +152,10 @@ export interface GrokDispositionReceipt {
     | 'judge_output_invalid'
     | 'judge_timeout'
     | 'judge_exit_nonzero'
-    | 'judge_error';
+    | 'judge_error'
+    | 'originating_run_failed_evidence_gate'
+    | 'originating_run_unreadable'
+    | 'originating_run_in_progress';
   woId: string;
   prNumber: number;
   headSha: string;
@@ -311,6 +315,20 @@ export interface MergeCandidateDiscoveryDeps {
   requiredContextsLookups?: GitHubClientDeps['requiredContextsLookups'];
 }
 
+/** What the merge gate's sibling check reads about one pull request and its repository. */
+export interface SiblingMergeContextData {
+  headRefName: string;
+  createdAt: string;
+  recentMerged: readonly {
+    number: number;
+    url: string;
+    mergedAt: string;
+    body: string;
+    /** The branch the merged PR targeted ('' when unknown). */
+    baseRef: string;
+  }[];
+}
+
 export interface GitHubClientDeps {
   findPullRequest(input: GitHubPullRequestSearchInput): Promise<PullRequestEvidence>;
   /**
@@ -349,6 +367,13 @@ export interface GitHubClientDeps {
   ): Promise<{ commented: boolean; url?: string }>;
   /** Login expected to own comments created through `commentOnPullRequest`. */
   commentAuthorLogin?: string;
+  /** Apply merge hold labels through the same GitHub identity as PR comments. */
+  addPullRequestLabels?(input: PullRequestRef & { labels: string[] }): Promise<void>;
+  /**
+   * Remove one label (the `merge-queued` label once the merge happened). Optional so existing fakes keep
+   * compiling; a label that is not on the PR is not an error.
+   */
+  removePullRequestLabel?(input: PullRequestRef & { label: string }): Promise<void>;
   /**
    * Existing PR issue comments, used to keep the merge-manager receipt
    * idempotent. Optional so existing fakes and compositions keep compiling.
@@ -377,6 +402,14 @@ export interface GitHubClientDeps {
   listOpenPullRequests?(
     input: GitHubOpenPullRequestListInput
   ): Promise<readonly DiscoveredPullRequest[]>;
+  /**
+   * The merge gate's sibling check (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01): the pull
+   * request's head branch and creation time, and the repository's most recently merged pull
+   * requests. Optional so existing fakes keep compiling; absent disables the check.
+   */
+  readSiblingMergeContext?(input: PullRequestRef): Promise<SiblingMergeContextData>;
+  /** File paths of one merged pull request; null when the list is truncated. */
+  listMergedPullRequestFiles?(input: PullRequestRef): Promise<readonly string[] | null>;
 }
 
 /**

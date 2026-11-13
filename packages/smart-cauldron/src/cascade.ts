@@ -23,6 +23,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { loadLadder, loadRefusedTiers, loadPremiumTiers, loadMaxClimbsByEntry } from './ladder.js';
 import { loadRuleset, pickEntryTier } from './conductor.js';
+import { resolveWoSignals } from './wo-signals.js';
 import {
   admitClaudeTier,
   chooseHeadroomEntry,
@@ -36,6 +37,11 @@ import { pollForTerminal, TimeoutError, DEFAULT_OPEN_NODE_BUDGET_MS } from './po
 import { fetchNodeTimeoutsMs } from './node-timeouts.js';
 import { judgeGate, classifyAttemptOutcome } from './judge.js';
 import { classifyGateMisfire } from './gate-misfire.js';
+import {
+  createGhConflictOnlyDeps,
+  handleConflictOnly,
+  type ConflictOnlyResult,
+} from './conflict-only.js';
 import { createRecord, writeRecord } from './recorder.js';
 export { readCascadeRecord } from './recorder.js';
 import type { CreateCascadeRecordResult } from './recorder.js';
@@ -47,7 +53,13 @@ import {
   type OpenWoPullRequest,
   type WoClaim,
 } from './already-satisfied.js';
-import { acquireWoLock, releaseWoLock } from './wo-lock.js';
+import {
+  acquireWoLock,
+  markSelfCancelOnWoLock,
+  recordRunOnWoLock,
+  releaseWoLock,
+  startWoLockHeartbeat,
+} from './wo-lock.js';
 import { classifyError, type ErrorClass } from '@archon/overseer/classify';
 import { runAuthorizedEscalation } from '@archon/overseer/authorized-escalation';
 import { runEscalation } from '@archon/overseer';
@@ -95,6 +107,12 @@ export interface CascadeDeps {
    * an issue is surfaced via `posted: false` (caller falls back to escalate).
    */
   specRepair?: (context: SpecRepairCallContext) => Promise<SpecRepairResult>;
+  /**
+   * Conflict-only gate verdict (WO-HARNESS-CONFLICT-ONLY-GATE-NO-TIER-CLIMB-01): one branch update
+   * from the base, or one comment naming the files changed on both sides. Never fires a rung.
+   * Injectable for tests; defaults to the real `gh` implementation.
+   */
+  handleConflictOnly?: (prUrl: string) => Promise<ConflictOnlyResult>;
   /** Optional dual-supervisor control plane. Absent by default; never starts a live worker. */
   superviseFailure?: (context: SupervisorFailureContext) => Promise<SupervisorFailureResult>;
   /**
@@ -114,6 +132,12 @@ export interface CascadeDeps {
   /** Exclusive active-cascade lock per woId+project. */
   acquireWoLock?: typeof acquireWoLock;
   releaseWoLock?: typeof releaseWoLock;
+  /**
+   * WO spec reader for routing signals (risk tags, Rung classification, entry
+   * pin). Defaults to a `gh api` read of docs/work-orders/<WO-ID>.md on bdc-xo
+   * main; returns null when unreadable (the ruleset pick then stands).
+   */
+  readWoSpec?: (woId: string) => Promise<string | null>;
   /**
    * Conductor ruleset override (skips loadRuleset() config read). Used to
    * exercise entry-tier selection deterministically -- e.g. a ruleset that
@@ -470,6 +494,13 @@ export interface RunCascadeOptions {
   beforeAdmission?: () => Promise<import('@archon/core/db/taskmaster').AutomaticFireProvenance>;
   woClass?: string;
   tags?: string[];
+  /**
+   * GitHub issue labels for this WO. Labels that name money/billing, auth/
+   * security/RLS/roles or migrations add the matching risk tag to the conductor
+   * ruleset input (WO-HARNESS-CONDUCTOR-RISK-ROUTING-01), keeping the WO off
+   * the zero tier.
+   */
+  labels?: string[];
   /** Override the entry tier (skips conductor ruleset). */
   entryOverride?: TierName;
   /**
@@ -537,7 +568,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     onAdmission,
     woClass,
     tags,
-    entryOverride,
+    entryOverride: callerEntryOverride,
     dryRun = false,
     outDir = './cascade-runs',
     pollTimeoutMs = 14_400_000,
@@ -573,6 +604,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
       : createRecord);
   const cancelImpl = opts.deps?.cancel ?? cancelRun;
   const specRepairImpl = opts.deps?.specRepair ?? defaultSpecRepair;
+  const conflictOnlyImpl =
+    opts.deps?.handleConflictOnly ??
+    ((prUrl: string): Promise<ConflictOnlyResult> =>
+      handleConflictOnly(prUrl, createGhConflictOnlyDeps()));
   const superviseFailureImpl = opts.deps?.superviseFailure;
   const findWoClaimImpl =
     opts.deps?.findWoClaim ??
@@ -616,8 +651,64 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
   // Keyed by the cascade's resolved entry tier; a tier absent here has no limit.
   const maxClimbsByEntry = loadMaxClimbsByEntry();
 
+  // Routing signals the WO declares about itself (WO-HARNESS-CONDUCTOR-RISK-
+  // ROUTING-01): risk tags from labels + spec text, and an optional entry-tier
+  // pin in the spec frontmatter. An explicit --entry skips this read entirely.
+  const woSignals = callerEntryOverride
+    ? null
+    : await resolveWoSignals({
+        woId,
+        labels: opts.labels,
+        readSpec: opts.deps?.readWoSpec,
+      });
+  if (woSignals && woSignals.reasons.length > 0) {
+    console.log(`[smart-cauldron] WO routing signals for ${woId}: ${woSignals.reasons.join('; ')}`);
+  } else if (woSignals && !woSignals.specRead) {
+    console.log(
+      `[smart-cauldron] WO routing signals for ${woId}: spec unreadable, using caller class/tags only`
+    );
+  }
+  // A spec pin is a human-authored entry choice and behaves like --entry (the
+  // refused-tier check and the seat gate treat it as pinned). Unknown tier names
+  // are ignored with a log rather than silently routing somewhere unintended.
+  let specPin: TierName | undefined;
+  const riskRoutingTags = [...new Set([...(tags ?? []), ...(woSignals?.riskTags ?? [])])];
+  if (woSignals?.entryPin) {
+    if (premiumTiers.includes(woSignals.entryPin)) {
+      // A pin onto a premium tier would skip the frontier-approval gate, which
+      // only an explicit operator --entry may do. A spec cannot approve itself.
+      console.log(
+        `[smart-cauldron] Ignoring spec entry pin "${woSignals.entryPin}": premium tiers need ` +
+          'operator approval or an explicit --entry'
+      );
+    } else if (tiers.some(t => t.name === woSignals.entryPin)) {
+      // A pin may raise the entry tier but never lower it below what the ruleset
+      // gives the WO: its class, the caller's tags AND the risk detected in the
+      // spec. A billing/auth/migration spec, a caller-tagged auth WO or an INFRA WO
+      // pinning zero would otherwise defeat the routing this exists for.
+      const riskFloor = pickEntryTier({ woClass, tags: riskRoutingTags }, ruleset);
+      const pinIndex = tiers.findIndex(t => t.name === woSignals.entryPin);
+      const floorIndex = tiers.findIndex(t => t.name === riskFloor);
+      if (floorIndex !== -1 && pinIndex < floorIndex) {
+        console.log(
+          `[smart-cauldron] Ignoring spec entry pin "${woSignals.entryPin}": below the risk ` +
+            `floor "${riskFloor}" for this WO's class, tags and detected risk`
+        );
+      } else {
+        specPin = woSignals.entryPin;
+      }
+    } else {
+      console.log(
+        `[smart-cauldron] Ignoring spec entry pin "${woSignals.entryPin}": not a ladder tier ` +
+          `(${tiers.map(t => t.name).join(', ')})`
+      );
+    }
+  }
+  const entryOverride: TierName | undefined = callerEntryOverride ?? specPin;
+  const routingTags = riskRoutingTags;
+
   // Conductor: pick entry tier (ruleset), or honor explicit --entry override
-  let entryTierName = entryOverride ?? pickEntryTier({ woClass, tags }, ruleset);
+  let entryTierName = entryOverride ?? pickEntryTier({ woClass, tags: routingTags }, ruleset);
 
   // Dark/retired lanes are never live entry points. An explicit --entry onto a
   // refused tier is an operator error and throws; a RULESET pick that lands on a
@@ -857,49 +948,68 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     return blocked;
   }
 
+  // Orphan recovery (WO-HARNESS-WO-LOCK-RELEASE-ON-CANCEL-01): keep the file
+  // lock's heartbeat fresh while this cascade runs, so a killed conductor is
+  // detectable on the next fire. Callers that inject their own lock (the
+  // database claim) own their liveness, so no file heartbeat is started for them.
+  const stopWoLockHeartbeat: () => void = opts.deps?.acquireWoLock
+    ? (): void => undefined
+    : startWoLockHeartbeat(woId, project, cascadeId, outDir);
+
   // Already-satisfied / claim check before any provider spend (M-123 Q5 / #1546).
-  if (!allowClaimed) {
-    const existingClaim = await findWoClaimImpl(woId, project);
-    if (existingClaim) {
-      console.log(
-        `[smart-cauldron] ALREADY SATISFIED woId=${woId}: PR #${existingClaim.number} ` +
-          `[${existingClaim.state}] ${existingClaim.url} -- skipping cascade`
-      );
-      const refused: CascadeRunRecord = {
-        cascadeId,
-        woId,
-        project,
-        request: {
-          woClass: woClass ?? null,
-          tags: [...(tags ?? [])].sort(),
-          entryOverride: entryOverride ?? null,
-          dryRun: false,
-        },
-        createdAt,
-        status: 'refused',
-        winningTier: null,
-        attempts: [],
-        totalCostUsd: null,
-        telemetry: {
-          entryTier: entryTierName,
-          climbed: false,
-          climbCount: 0,
-          wonCheap: false,
-        },
-        entrySelection,
-        refusalReason: {
-          reason: 'already-satisfied',
-          prNumber: existingClaim.number,
-          prState: existingClaim.state,
-          prUrl: existingClaim.url,
-          checkedAtTier: null,
-        },
-      };
-      const admissionEarly = await createRecordImpl(refused, outDir);
-      onAdmission?.(admissionEarly.record, admissionEarly.created);
-      await releaseWoLockImpl(woId, project, cascadeId, outDir);
-      return admissionEarly.record;
+  // Any throw between acquiring the lock and entering the cleanup try/finally
+  // below (claim lookup, refused-record creation, onAdmission) must still stop the
+  // heartbeat and release the lock: in a persistent conductor process a leaked
+  // heartbeat keeps the lock fresh forever and blocks every later fire.
+  try {
+    if (!allowClaimed) {
+      const existingClaim = await findWoClaimImpl(woId, project);
+      if (existingClaim) {
+        console.log(
+          `[smart-cauldron] ALREADY SATISFIED woId=${woId}: PR #${existingClaim.number} ` +
+            `[${existingClaim.state}] ${existingClaim.url} -- skipping cascade`
+        );
+        const refused: CascadeRunRecord = {
+          cascadeId,
+          woId,
+          project,
+          request: {
+            woClass: woClass ?? null,
+            tags: [...(tags ?? [])].sort(),
+            entryOverride: entryOverride ?? null,
+            dryRun: false,
+          },
+          createdAt,
+          status: 'refused',
+          winningTier: null,
+          attempts: [],
+          totalCostUsd: null,
+          telemetry: {
+            entryTier: entryTierName,
+            climbed: false,
+            climbCount: 0,
+            wonCheap: false,
+          },
+          entrySelection,
+          refusalReason: {
+            reason: 'already-satisfied',
+            prNumber: existingClaim.number,
+            prState: existingClaim.state,
+            prUrl: existingClaim.url,
+            checkedAtTier: null,
+          },
+        };
+        const admissionEarly = await createRecordImpl(refused, outDir);
+        onAdmission?.(admissionEarly.record, admissionEarly.created);
+        stopWoLockHeartbeat();
+        await releaseWoLockImpl(woId, project, cascadeId, outDir);
+        return admissionEarly.record;
+      }
     }
+  } catch (error) {
+    stopWoLockHeartbeat();
+    await releaseWoLockImpl(woId, project, cascadeId, outDir);
+    throw error;
   }
 
   // Cascade loop
@@ -932,6 +1042,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
     let frontierApprovalRecord: CascadeRunRecord['frontierApproval'];
     let refusalReason: CascadeRunRecord['refusalReason'];
     let gateMisfireRecord: CascadeRunRecord['gateMisfire'];
+    let conflictOnlyRecord: CascadeRunRecord['conflictOnly'];
     let blockedReason: CascadeRunRecord['blockedReason'];
     let repairTargetAlternates: CascadeRunRecord['repairTargetAlternates'];
     let priorPollSnapshot: PriorRunDetail | null = null;
@@ -968,6 +1079,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(frontierApprovalRecord ? { frontierApproval: frontierApprovalRecord } : {}),
         ...(refusalReason ? { refusalReason } : {}),
         ...(gateMisfireRecord ? { gateMisfire: gateMisfireRecord } : {}),
+        ...(conflictOnlyRecord ? { conflictOnly: conflictOnlyRecord } : {}),
         ...(blockedReason ? { blockedReason } : {}),
         ...(entrySelection ? { entrySelection } : {}),
         ...(repairTargetAlternates ? { repairTargetAlternates } : {}),
@@ -1419,6 +1531,10 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         ...(fetchImpl ? { fetchImpl } : {}),
       });
       attempt.runId = fireResult.runId;
+      // Map the run to this cascade's file lock so a run cancel can release it.
+      if (fireResult.ok && fireResult.runId && !opts.deps?.acquireWoLock) {
+        await recordRunOnWoLock(woId, project, cascadeId, fireResult.runId, outDir);
+      }
       if (fireResult.ok && fireResult.runId && opts.onRunDiscovered) {
         try {
           opts.onRunDiscovered(fireResult.runId, cascadeId, tier.name);
@@ -1571,6 +1687,11 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
           // climb) and climb via the same logic used for gate-fail. Every
           // conductor cancel carries a non-empty reason (Scope IN item 4) so
           // run_cancelled.data.reason is never "".
+          // Mark it first: the API cancel releases the file lock of the run it
+          // cancels, but this cascade is alive and is about to climb.
+          if (!opts.deps?.acquireWoLock) {
+            await markSelfCancelOnWoLock(woId, project, cascadeId, resolvedRunId, outDir);
+          }
           const cancelResult = await cancelImpl({
             runId: resolvedRunId,
             apiBaseUrl,
@@ -1629,13 +1750,22 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
       // Judge the gate
       const verdict: GateVerdict = judgeImpl(pollResult);
-      const outcome = classifyAttemptOutcome(fireResult, verdict);
+      const outcome = classifyAttemptOutcome(fireResult, verdict, pollResult);
 
       attempt.outcome = outcome;
       attempt.gateFailReason = verdict.pass ? null : verdict.reason;
       attempt.servedModelId = pollResult.servedModelId;
       attempt.nodeModels = pollResult.nodeModels;
       attempt.completedAt = new Date().toISOString();
+
+      if (outcome === 'environment-unavailable') {
+        status = 'blocked';
+        blockedReason = 'environment_unavailable';
+        attempt.gateFailReason = String(pollResult.rawMetadata.error);
+        console.log(`[smart-cauldron] BLOCKED environment_unavailable: ${attempt.gateFailReason}`);
+        await checkpoint();
+        break;
+      }
 
       if (verdict.pass) {
         // Gate passed -- cascade stops
@@ -1754,6 +1884,54 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
         }
       }
 
+      // Conflict-only (WO-HARNESS-CONFLICT-ONLY-GATE-NO-TIER-CLIMB-01): the run completed, a PR was
+      // opened, nothing rejected it, and the only failing condition is that the PR cannot be merged
+      // (the base moved during a long run). A bigger model is not the fix for a mechanical merge:
+      // try ONE branch update from the base; a clean update leaves the new head to the normal
+      // checks and review, a conflict gets one comment naming the files. Never fires a rung.
+      if (outcome === 'gate-failed' && verdict.conflictOnly === true && pollResult.prUrl) {
+        let handled: ConflictOnlyResult;
+        try {
+          handled = await conflictOnlyImpl(pollResult.prUrl);
+        } catch (conflictErr) {
+          handled = {
+            outcome: 'conflict_only',
+            prUrl: pollResult.prUrl,
+            headSha: null,
+            baseRef: null,
+            updateStatus: null,
+            files: [],
+            commented: false,
+            alreadyRecorded: false,
+            note: `conflict-only handler threw: ${(conflictErr as Error).message}`,
+          };
+        }
+        attempt.gateFailReason = `${handled.outcome}: ${verdict.reason}`;
+        status = 'blocked';
+        winningTier = null;
+        blockedReason =
+          handled.outcome === 'updated' ? 'conflict_resolved_by_update' : 'conflict_only';
+        conflictOnlyRecord = {
+          outcome: handled.outcome,
+          runId: fireResult.runId,
+          tier: tier.name,
+          prUrl: handled.prUrl,
+          headSha: handled.headSha,
+          baseRef: handled.baseRef,
+          updateStatus: handled.updateStatus,
+          files: handled.files,
+          commented: handled.commented,
+          alreadyRecorded: handled.alreadyRecorded,
+          note: handled.note,
+        };
+        console.log(
+          `[smart-cauldron] ${blockedReason} on tier=${tier.name} for woId=${woId}: ${handled.note} ` +
+            '-- NOT climbing'
+        );
+        await checkpoint();
+        break;
+      }
+
       // A failed repair checkout (held branch, gate closed on checkout) is not a
       // quality failure: a bigger model cannot free the branch. Stop blocked with
       // one escalation (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01 item 8).
@@ -1821,6 +1999,7 @@ export async function runCascade(opts: RunCascadeOptions): Promise<CascadeRunRec
 
     return record;
   } finally {
+    stopWoLockHeartbeat();
     await releaseWoLockImpl(woId, project, cascadeId, outDir);
   }
 }

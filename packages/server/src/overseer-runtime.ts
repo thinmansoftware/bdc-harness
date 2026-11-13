@@ -1,7 +1,11 @@
 import { createLogger } from '@archon/paths';
 import { runOverseerService } from '@archon/overseer/service';
 import type { OverseerServiceOptions, OverseerWiredAdapterKind } from '@archon/overseer/service';
-import { PRODUCTION_EFFECT_HOLD_REASON } from '@archon/overseer/merge-manager';
+import { createMergeManager, PRODUCTION_EFFECT_HOLD_REASON } from '@archon/overseer/merge-manager';
+import type { MergeManagerDeps } from '@archon/overseer/merge-manager';
+import type { OverseerRunStoreDeps } from '@archon/overseer';
+import { getOverseerWatchRunById, listOriginatingRunCandidates } from '@archon/core/db/overseer';
+import { findOriginatingRunForPullRequest } from '@archon/overseer/originating-run-lookup';
 import { DEFAULT_WATCH_INTERVAL_MS } from '@archon/overseer/watch';
 import {
   logDiscoveryConfigurationAtStartup,
@@ -10,6 +14,25 @@ import {
 } from '@archon/overseer';
 
 const log = createLogger('server/overseer-runtime');
+
+/** Bind the merge gate to the real run/event store, including missing-row detection. */
+export function createRuntimeMergeManager(
+  deps: MergeManagerDeps & Pick<OverseerRunStoreDeps, 'listRunEvents'>,
+  findRun: (runId: string) => Promise<{ id: string } | null> = getOverseerWatchRunById
+): ReturnType<typeof createMergeManager> {
+  return createMergeManager({
+    ...deps,
+    findOriginatingRun:
+      deps.findOriginatingRun ??
+      ((input): ReturnType<typeof findOriginatingRunForPullRequest> =>
+        findOriginatingRunForPullRequest(input, listOriginatingRunCandidates)),
+    readRunEvents: async runId => {
+      const run = await findRun(runId);
+      if (run?.id !== runId) throw new Error(`originating run ${runId} not found`);
+      return deps.listRunEvents(runId);
+    },
+  });
+}
 
 type OverseerAdapterKind = OverseerWiredAdapterKind;
 type OverseerWatcherState = 'stopped' | 'running' | 'degraded';

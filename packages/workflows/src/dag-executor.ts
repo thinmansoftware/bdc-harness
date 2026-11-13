@@ -76,7 +76,7 @@ import {
 } from './schemas';
 import { collectRuntimeEvidence, renderManifestV2 } from './reliability/evidence-collector';
 import { formatToolCall } from './utils/tool-formatter';
-import { createLogger } from '@archon/paths';
+import { createLogger, laneEnv } from '@archon/paths';
 import { getWorkflowEventEmitter, buildGateResultField } from './event-emitter';
 import type { GateResult } from './event-emitter';
 import type { IWorkflowStore } from './store';
@@ -117,6 +117,7 @@ import {
   resolveAgentPersona,
   InfrastructureClassBlock,
   isPaperworkNode,
+  isAdvisoryNode,
   hasPushArtifact,
 } from './executor-shared';
 import {
@@ -143,7 +144,7 @@ import type {
   RunOutcome,
   TerminalWorkflowPersistence,
 } from './reliability/types';
-import { withRunLease } from './run-lease';
+import { runLeaseGapSeconds, withRunLease } from './run-lease';
 import { DEFAULT_CLAUDE_FAILOVER_MODEL, isReviewNode } from './reliability/seat-node-failover';
 import {
   NODE_TOKEN_ENV,
@@ -3698,6 +3699,57 @@ function recordedBaseBranchEnv(metadata: Record<string, unknown> | null | undefi
   return value.trim();
 }
 
+/** Persist only the bash event protocol's explicit allowlist. Best-effort always. */
+async function persistBashRunEvents(
+  deps: WorkflowDeps,
+  runId: string,
+  nodeId: string,
+  output: string
+): Promise<void> {
+  for (const line of output.split(/\r?\n/)) {
+    if (!line.startsWith('BDC_RUN_EVENT ') || Buffer.byteLength(line, 'utf8') > 4096) continue;
+    try {
+      const value: unknown = JSON.parse(line.slice('BDC_RUN_EVENT '.length));
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) continue;
+      const data = value as Record<string, unknown>;
+      if (data.event_type !== 'duplicate_pr_suppressed') continue;
+      const {
+        existing_pr: existingPr,
+        existing_pr_url: existingPrUrl,
+        kind,
+        salvage_branch: salvageBranch,
+      } = data;
+      if (
+        typeof existingPr !== 'number' ||
+        !Number.isSafeInteger(existingPr) ||
+        existingPr <= 0 ||
+        typeof existingPrUrl !== 'string' ||
+        existingPrUrl.length === 0 ||
+        existingPrUrl.length > 2048 ||
+        kind !== 'fallback' ||
+        typeof salvageBranch !== 'string' ||
+        salvageBranch.length === 0 ||
+        salvageBranch.length > 256
+      )
+        continue;
+      await deps.store.createWorkflowEvent({
+        workflow_run_id: runId,
+        event_type: 'duplicate_pr_suppressed',
+        step_name: nodeId,
+        data: {
+          event_type: 'duplicate_pr_suppressed',
+          existing_pr: existingPr,
+          existing_pr_url: existingPrUrl,
+          kind,
+          salvage_branch: salvageBranch,
+        },
+      });
+    } catch {
+      // Invalid JSON or unavailable event storage must never change node outcome.
+    }
+  }
+}
+
 /**
  * Execute a bash (shell script) DAG node.
  * Runs the script via a temp file, captures stdout as node output.
@@ -3772,7 +3824,10 @@ async function executeBashNode(
         Object.entries(resolvedInputs).map(([k, v]) => [`INPUT_${k.toUpperCase()}`, v])
       )
     : {};
-  const subprocessEnv: NodeJS.ProcessEnv = {
+  // laneEnv wraps the FULLY merged environment (including workflow and project envVars), so a
+  // personal GitHub token name or a fallback override added by configuration cannot reach a
+  // lane child (bdc-xo#5464).
+  const subprocessEnv: NodeJS.ProcessEnv = laneEnv({
     ...process.env,
     ARTIFACTS_DIR: artifactsDir,
     LOG_DIR: logDir,
@@ -3800,7 +3855,7 @@ async function executeBashNode(
     ...(envVars ?? {}),
     // Node-specific ownership for timeout teardown: inherited by every descendant.
     [NODE_TOKEN_ENV]: bashNodeToken,
-  };
+  });
 
   const safeNodeId = node.id.replace(/[^A-Za-z0-9._-]/g, '_');
   const safeRunId = workflowRun.id.replace(/[^A-Za-z0-9._-]/g, '_');
@@ -3866,6 +3921,8 @@ async function executeBashNode(
 
     // Trim trailing newline from stdout (common shell behavior)
     const output = stdout.replace(/\n$/, '');
+
+    await persistBashRunEvents(deps, workflowRun.id, node.id, output);
 
     if (stderr.trim()) {
       getLog().warn({ nodeId: node.id, stderr: stderr.trim() }, 'bash_node_stderr');
@@ -3987,10 +4044,13 @@ async function executeBashNode(
     const err = error as Error & {
       killed?: boolean;
       code?: number | string;
+      stdout?: string;
       stderr?: string;
       scriptFile?: string;
       scriptPreparationFailed?: boolean;
     };
+    // A bash node may report an event before exiting nonzero.
+    await persistBashRunEvents(deps, workflowRun.id, node.id, err.stdout ?? '');
     const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
     const label = `Bash node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
@@ -4119,12 +4179,12 @@ async function executeScriptNode(
 
   const timeout = node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT;
   const scriptNodeToken = `${workflowRun.id}:${node.id}`;
-  const subprocessEnv: NodeJS.ProcessEnv = {
+  const subprocessEnv: NodeJS.ProcessEnv = laneEnv({
     ...process.env,
     ...(envVars ?? {}),
     // Node-specific ownership for timeout teardown: inherited by every descendant.
     [NODE_TOKEN_ENV]: scriptNodeToken,
-  };
+  });
 
   // Build the command and args based on runtime and inline vs named
   let cmd = '';
@@ -5453,7 +5513,7 @@ async function executeLoopNode(
           nodeOutputs,
           true // escapedForBash
         );
-        await execFileAsync('bash', ['-c', substitutedBash], { cwd });
+        await execFileAsync('bash', ['-c', substitutedBash], { cwd, env: laneEnv() });
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
@@ -6077,6 +6137,7 @@ async function executeEvidenceNode(
       const result = await execFileAsync(command, [...args], {
         cwd: commandCwd,
         timeout: 30000,
+        env: laneEnv(),
       });
       return { stdout: result.stdout, stderr: result.stderr };
     },
@@ -6243,6 +6304,7 @@ async function executeDagWorkflowInternal(
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
     if (deps.isRunLeaseValid?.() === false) {
       getLog().warn({ workflowRunId: workflowRun.id }, 'dag.run_lease_lost');
+      await writeRunLeaseLostEvent(deps, workflowRun.id, 'layer_boundary');
       return;
     }
     const layer = layers[layerIdx];
@@ -7269,6 +7331,7 @@ async function executeDagWorkflowInternal(
 
   if (deps.isRunLeaseValid?.() === false) {
     getLog().warn({ workflowRunId: workflowRun.id }, 'dag.run_lease_lost_before_terminal');
+    await writeRunLeaseLostEvent(deps, workflowRun.id, 'before_terminal');
     return;
   }
 
@@ -7543,11 +7606,42 @@ async function executeDagWorkflowInternal(
     const failedNodeIds = [...nodeOutputs.entries()]
       .filter(([, o]) => o.state === 'failed')
       .map(([id]) => id);
-    const allFailuresArePaperwork = failedNodeIds.every(id => isPaperworkNode(id));
-    if (!hasMechanicalEvidenceNode && allFailuresArePaperwork && pushArtifactPresent) {
+    // Advisory pre-check nodes (WO-HARNESS-ADVISORY-NODE-FAILURE-NOT-RUN-FAILURE-01): when
+    // every failed node is advisory (or paperwork) the run's substantive work is judged by the
+    // rest of the DAG. Advisory failures need the run's terminal gate to have PASSED (the node
+    // `blocked-terminal-gate`, when the workflow declares it, must have completed; a workflow
+    // without it needs a pushed artifact instead). A failed or skipped terminal gate, or a failed
+    // required node, keeps the run failed exactly as before. Mechanical evidence nodes (for example
+    // the lane's build-manifest) must have COMPLETED for the advisory path: a lane that has them is
+    // the common case (the cursor lane), so the paperwork rule's "no evidence node" guard is not
+    // reused here; the evidence nodes passing is the equivalent proof.
+    const failedAdvisoryNodeIds = failedNodeIds.filter(id => isAdvisoryNode(id));
+    const failedPaperworkNodeIds = failedNodeIds.filter(id => isPaperworkNode(id));
+    const allFailuresAreKnownDegradable = failedNodeIds.every(
+      id => isPaperworkNode(id) || isAdvisoryNode(id)
+    );
+    const terminalGateDeclared = workflow.nodes.some(n => n.id === 'blocked-terminal-gate');
+    const terminalGatePassed = terminalGateDeclared
+      ? nodeOutputs.get('blocked-terminal-gate')?.state === 'completed'
+      : pushArtifactPresent;
+    const advisoryDegraded = failedAdvisoryNodeIds.length > 0;
+    const evidenceNodesCompleted = workflow.nodes
+      .filter(isEvidenceNode)
+      .every(n => nodeOutputs.get(n.id)?.state === 'completed');
+    const paperworkAllowsDegrade =
+      failedPaperworkNodeIds.length === 0 || (!hasMechanicalEvidenceNode && pushArtifactPresent);
+    const advisoryAllowsDegrade =
+      !advisoryDegraded || (terminalGatePassed && evidenceNodesCompleted);
+    if (allFailuresAreKnownDegradable && paperworkAllowsDegrade && advisoryAllowsDegrade) {
       getLog().warn(
-        { workflowRunId: workflowRun.id, degradedPaperworkNodes: failedNodeIds },
-        'dag.workflow_completed_paperwork_degraded'
+        {
+          workflowRunId: workflowRun.id,
+          degradedPaperworkNodes: failedPaperworkNodeIds,
+          degradedAdvisoryNodes: failedAdvisoryNodeIds,
+        },
+        advisoryDegraded
+          ? 'dag.workflow_completed_advisory_degraded'
+          : 'dag.workflow_completed_paperwork_degraded'
       );
       const degradedDuration = Date.now() - dagStartTime;
       const degradedOutcome = await makeTerminalOutcome('completed');
@@ -7560,14 +7654,18 @@ async function executeDagWorkflowInternal(
             node_counts: nodeCounts,
             // Degraded-success signal consumed by the dashboard (Section 5 of the
             // WO): status 'completed' + paperwork_degraded=true, no new enum value.
-            paperwork_degraded: true,
-            degraded_paperwork_nodes: failedNodeIds,
+            ...(failedPaperworkNodeIds.length > 0
+              ? { paperwork_degraded: true, degraded_paperwork_nodes: failedPaperworkNodeIds }
+              : {}),
+            ...(advisoryDegraded
+              ? { advisory_degraded: true, failed_advisory_nodes: failedAdvisoryNodeIds }
+              : {}),
             ...(totalCostUsd > 0 ? { total_cost_usd: totalCostUsd } : {}),
             ...(totalTokens > 0 ? { total_tokens: totalTokens } : {}),
             ...(totalFrontierCostUsd > 0 ? { total_frontier_cost_usd: totalFrontierCostUsd } : {}),
             ...(nodeModelSummary.length > 0 ? { node_model_summary: nodeModelSummary } : {}),
             ...(modelMismatchCount > 0 ? { model_mismatch_count: modelMismatchCount } : {}),
-            terminal_cause: 'paperwork_degraded',
+            terminal_cause: advisoryDegraded ? 'advisory_degraded' : 'paperwork_degraded',
           },
           {
             outcome: degradedOutcome,
@@ -7575,9 +7673,13 @@ async function executeDagWorkflowInternal(
             eventData: {
               duration_ms: degradedDuration,
               node_counts: nodeCounts,
-              terminal_cause: 'paperwork_degraded',
-              paperwork_degraded: true,
-              degraded_paperwork_nodes: failedNodeIds,
+              terminal_cause: advisoryDegraded ? 'advisory_degraded' : 'paperwork_degraded',
+              ...(failedPaperworkNodeIds.length > 0
+                ? { paperwork_degraded: true, degraded_paperwork_nodes: failedPaperworkNodeIds }
+                : {}),
+              ...(advisoryDegraded
+                ? { advisory_degraded: true, failed_advisory_nodes: failedAdvisoryNodeIds }
+                : {}),
             },
           }
         );
@@ -7604,7 +7706,9 @@ async function executeDagWorkflowInternal(
       await safeSendMessage(
         platform,
         conversationId,
-        `\u26a0\ufe0f Workflow '${workflow.name}' completed (degraded): the build landed (branch/PR artifact present) but paperwork node(s) failed: ${failedNodeIds.join(', ')}. Run marked completed with paperwork_degraded=true.`,
+        advisoryDegraded
+          ? `\u26a0\ufe0f Workflow '${workflow.name}' completed (degraded): advisory pre-check node(s) failed (${failedAdvisoryNodeIds.join(', ')}) but every required node and the terminal gate passed. Run marked completed with advisory_degraded=true.`
+          : `\u26a0\ufe0f Workflow '${workflow.name}' completed (degraded): the build landed (branch/PR artifact present) but paperwork node(s) failed: ${failedNodeIds.join(', ')}. Run marked completed with paperwork_degraded=true.`,
         { workflowId: workflowRun.id }
       );
       return;
@@ -7729,11 +7833,47 @@ async function executeDagWorkflowInternal(
   return terminalOutput;
 }
 
+/**
+ * WO-HARNESS-RUN-LEASE-LOST-SAYS-SO-01: the executor stops a run whose lease was lost at two points. Before
+ * this, nothing was written, so the run ended with the backstop's generic message. Now one `run_lease_lost`
+ * event says where it stopped and the measured numbers, and the loss descriptor remembers where, for the
+ * backstop's failure message. Never throws: the event is a note, the stop itself is unchanged.
+ */
+async function writeRunLeaseLostEvent(
+  deps: WorkflowDeps,
+  runId: string,
+  where: 'layer_boundary' | 'before_terminal'
+): Promise<void> {
+  const loss = deps.getRunLeaseLoss?.() ?? null;
+  if (loss) loss.stoppedAt = where;
+  const leaseClock = deps.runLeaseTiming?.now ?? ((): Date => new Date());
+  try {
+    await deps.store.createWorkflowEvent({
+      workflow_run_id: runId,
+      event_type: 'run_lease_lost',
+      data: {
+        where,
+        reason: loss?.reason ?? 'unknown',
+        last_renewed_at: loss?.lastRenewedAt ?? null,
+        expires_at: loss?.expiresAt ?? null,
+        detected_at: loss?.detectedAt ?? null,
+        gap_seconds: loss ? runLeaseGapSeconds(loss, leaseClock()) : null,
+      },
+    });
+  } catch (err) {
+    getLog().warn({ err: err as Error, workflowRunId: runId }, 'dag.run_lease_lost_event_failed');
+  }
+}
+
 export const executeDagWorkflow: typeof executeDagWorkflowInternal = (...args) => {
   const [deps, , , , , workflowRun] = args;
   const [, ...executionArgs] = args;
-  return withRunLease(deps.store, workflowRun.id, isRunLeaseValid =>
-    executeDagWorkflowInternal({ ...deps, isRunLeaseValid }, ...executionArgs)
+  return withRunLease(
+    deps.store,
+    workflowRun.id,
+    (isRunLeaseValid, getRunLeaseLoss) =>
+      executeDagWorkflowInternal({ ...deps, isRunLeaseValid, getRunLeaseLoss }, ...executionArgs),
+    deps.runLeaseTiming
   );
 };
 interface BunRuntimeResolutionOptions {

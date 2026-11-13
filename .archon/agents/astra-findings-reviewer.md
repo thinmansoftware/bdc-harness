@@ -1,6 +1,6 @@
 ---
 name: astra-findings-reviewer
-model: claude-fable-5
+model: claude-fable-5-2
 tools: [Read, Grep, Glob, Edit, WebFetch]
 description: XO orchestration and planning agent. Board management, comms, research, analytics.
 ---

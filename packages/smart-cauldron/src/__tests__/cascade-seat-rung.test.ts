@@ -9,6 +9,7 @@ import { mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { runCascade, type CascadeDeps } from '../cascade.js';
+import { openClaudeTier } from './claude-tier-open.js';
 import type { SeatUsageSnapshot } from '../headroom.js';
 import type { ConductorRuleset, GateVerdict, PollResult } from '../types.js';
 
@@ -82,8 +83,11 @@ let previousThreshold: string | undefined;
 let outDir = '';
 let logs: string[] = [];
 let logSpy: ReturnType<typeof spyOn> | null = null;
+// The live ladder refuses claude; this file tests the seat-cutoff machinery, so open the tier.
+let restoreLadder: (() => void) | undefined;
 
 beforeEach(async () => {
+  restoreLadder = openClaudeTier();
   previousThreshold = process.env[THRESHOLD_ENV];
   delete process.env[THRESHOLD_ENV];
   outDir = await mkdtemp(join(tmpdir(), 'cascade-seat-rung-'));
@@ -94,6 +98,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  restoreLadder?.();
   logSpy?.mockRestore();
   if (previousThreshold === undefined) delete process.env[THRESHOLD_ENV];
   else process.env[THRESHOLD_ENV] = previousThreshold;

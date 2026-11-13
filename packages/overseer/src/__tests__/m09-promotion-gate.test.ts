@@ -72,10 +72,32 @@ function fake() {
   const reads: string[] = [],
     writes: { route: string; data: any }[] = [];
   let check: any;
+  // What GitHub would show for the run after each write (bdc-xo WO-HARNESS-M09-GATE-INVALIDATE-
+  // COMPLETED-CHECK-01): a PATCH of a COMPLETED run back to in_progress returns 200 and is ignored.
+  let stored: { status: string; conclusion?: string } | undefined;
+  const states: { status: string; conclusion?: string }[] = [];
   const request = async (route: string, data: any) => {
     calls.push({ route, data });
     if (route.startsWith('POST') || route.startsWith('PATCH')) {
+      // Behave like GitHub: a null or non-string conclusion is HTTP 422, and a completed check run
+      // needs one. The earlier fake accepted null and hid the silent gate (bdc-xo#5533).
+      if (
+        ('conclusion' in data && typeof data.conclusion !== 'string') ||
+        (data.status === 'completed' && typeof data.conclusion !== 'string')
+      )
+        throw Object.assign(
+          Error('Invalid request. For properties/conclusion, nil is not a string.'),
+          {
+            status: 422,
+            response: { status: 422 },
+          }
+        );
       writes.push({ route, data });
+      if (route.startsWith('POST')) stored = { status: data.status, conclusion: data.conclusion };
+      else if (stored?.status === 'completed' && data.status !== 'completed') {
+        // ignored by GitHub: the run stays completed with its old conclusion
+      } else stored = { status: data.status, conclusion: data.conclusion ?? stored?.conclusion };
+      states.push({ ...stored! });
       check = {
         id: 1,
         name: data.name ?? 'm09-promotion-gate',
@@ -107,7 +129,7 @@ function fake() {
       return { data: { total_count: check ? 1 : 0, check_runs: check ? [check] : [] } };
     throw Error('unexpected read');
   };
-  return { calls, reads, writes, request };
+  return { calls, reads, writes, request, states };
 }
 test('pr_cannot_influence_the_gate', async () => {
   const priorToken = process.env.GH_TOKEN;
@@ -536,4 +558,70 @@ test('shared_head_release_ce_failure_cannot_be_overwritten_by_main_success', asy
   prs[0].body = '';
   await gate({ repository, number: 2, head: sha, base: 'main' });
   expect(f.writes.at(-1)?.data.output.summary).toContain('no promotion block');
+});
+
+test('in_progress publication never sends a null conclusion (bdc-xo#5533)', async () => {
+  const f = fake();
+  await createPromotionGate(f.request, 4574893)({ repository: repo, number: 1 });
+  expect(f.writes.length).toBeGreaterThan(0);
+  for (const w of f.writes) {
+    if (w.data.status === 'in_progress') expect('conclusion' in w.data).toBe(false);
+    else expect(typeof w.data.conclusion).toBe('string');
+  }
+  expect(f.writes[0]?.data.status).toBe('in_progress');
+  expect(f.writes.at(-1)?.data.conclusion).toBe('success');
+});
+
+test('bdc_shopify_app_main_is_a_covered_production_base', () => {
+  expect(COVERED_PRODUCTION_BASES['thinmansoftware/bdc-shopify-app']).toEqual(['main']);
+});
+
+test('re_evaluation_replaces_a_held_success_with_a_non_passing_conclusion (invalidate completed check)', async () => {
+  const f = fake();
+  const gate = createPromotionGate(f.request, 4574893, { retryDelay: async () => {} });
+  await gate({ repository: repo, number: 1 });
+  expect(f.states.at(-1)?.conclusion).toBe('success'); // a held, passing verdict
+  const before = f.writes.length;
+  await gate({ repository: repo, number: 1 });
+  const second = f.writes.slice(before);
+  // the first write of the re-evaluation invalidates: completed + action_required, no in_progress
+  expect(second[0]?.route.startsWith('PATCH')).toBe(true);
+  expect(second[0]?.data.status).toBe('completed');
+  expect(second[0]?.data.conclusion).toBe('action_required');
+  // what GitHub shows between that write and the final one is never the old success
+  const visible = f.states.slice(before);
+  expect(visible[0]?.conclusion).toBe('action_required');
+  for (const s of visible.slice(0, -1)) expect(s.conclusion).not.toBe('success');
+  expect(visible.at(-1)?.conclusion).toBe('success');
+});
+
+test('first_evaluation_still_starts_in_progress_without_a_conclusion (invalidate completed check)', async () => {
+  const f = fake();
+  await createPromotionGate(f.request, 4574893)({ repository: repo, number: 1 });
+  expect(f.writes[0]?.route.startsWith('POST')).toBe(true);
+  expect(f.writes[0]?.data.status).toBe('in_progress');
+  expect('conclusion' in (f.writes[0]?.data ?? {})).toBe(false);
+  expect(f.writes.at(-1)?.data.conclusion).toBe('success');
+});
+
+test('a_failure_mid_re_evaluation_after_invalidation_ends_in_failure (invalidate completed check)', async () => {
+  const f = fake();
+  const gate = createPromotionGate(f.request, 4574893, { retryDelay: async () => {} });
+  const target = { repository: repo, number: 1, head: sha, base: 'master' };
+  await gate(target);
+  expect(f.states.at(-1)?.conclusion).toBe('success');
+  const base = f.request;
+  // the pull request lookup fails during the re-evaluation
+  const failing = async (route: string, data: any) => {
+    if (route.startsWith('GET') && route.includes('/pulls/{pull_number}'))
+      throw Object.assign(Error('boom'), { status: 500, response: { status: 500 } });
+    return base(route, data);
+  };
+  const gate2 = createPromotionGate(failing, 4574893, { retryDelay: async () => {} });
+  const before = f.states.length;
+  await gate2(target);
+  const visible = f.states.slice(before);
+  // the held success is gone from the first write on, and the run ends failed, never green again
+  for (const s of visible) expect(s.conclusion).not.toBe('success');
+  expect(visible.at(-1)?.conclusion).toBe('failure');
 });

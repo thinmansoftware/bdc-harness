@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'bun:test';
 import type { IWorkflowStore } from './store';
-import { withRunLease } from './run-lease';
+import { clearRunLeaseLossesForTests, getRunLeaseLoss, withRunLease } from './run-lease';
 
 test('legacy run without authority executes without claiming a lease', async () => {
   const store = {
@@ -114,4 +114,88 @@ test('unknown final run state keeps the lease (WO-HARNESS-REPAIR-HOLDER-TEARDOWN
     expect(getWorkflowRun).toHaveBeenCalled();
     expect(releaseRunLease).not.toHaveBeenCalled();
   }
+});
+
+// WO-HARNESS-RUN-LEASE-LOST-SAYS-SO-01 (bdc-xo#5695): a lost lease is recorded with the measured numbers.
+const BASE = Date.parse('2026-11-12T17:50:41.372Z');
+
+function leaseStore(heartbeat: () => Promise<boolean>): IWorkflowStore {
+  return {
+    getRunAuthority: mock(async () => ({ runId: 'run-1' })),
+    claimRunLease: mock(async lease => lease),
+    heartbeatRunLease: mock(heartbeat),
+    releaseRunLease: mock(async () => true),
+    getWorkflowRun: mock(async () => ({ id: 'run-1', status: 'running', metadata: {} })),
+  } as unknown as IWorkflowStore;
+}
+
+async function untilInvalid(isValid: () => boolean): Promise<void> {
+  for (let i = 0; i < 200 && isValid(); i += 1)
+    await new Promise(resolve => setTimeout(resolve, 5));
+}
+
+test('a refused renewal records reason, last renewal, expiry and detection time', async () => {
+  clearRunLeaseLossesForTests();
+  let heartbeats = 0;
+  const store = leaseStore(async () => {
+    heartbeats += 1;
+    return heartbeats === 1;
+  });
+  // The clock moves 20 s on every read: acquire = BASE, first heartbeat = BASE + 20 s (renewed, expiry
+  // BASE + 80 s), second heartbeat = BASE + 40 s (refused), detection read = BASE + 60 s.
+  let reads = 0;
+  const now = (): Date => new Date(BASE + 20_000 * reads++);
+
+  const loss = await withRunLease(
+    store,
+    'run-1',
+    async (isValid, getLoss) => {
+      await untilInvalid(isValid);
+      return getLoss();
+    },
+    { ownerId: 'w', leaseToken: 't', heartbeatIntervalMs: 5, now }
+  );
+
+  expect(loss).toEqual({
+    reason: 'renewal_refused',
+    lastRenewedAt: new Date(BASE + 20_000).toISOString(),
+    expiresAt: new Date(BASE + 80_000).toISOString(),
+    detectedAt: new Date(BASE + 60_000).toISOString(),
+  });
+  expect(getRunLeaseLoss('run-1')).toEqual(loss);
+});
+
+test('a renewal that throws records reason renewal_error', async () => {
+  clearRunLeaseLossesForTests();
+  const store = leaseStore(async () => {
+    throw new Error('store down');
+  });
+
+  const loss = await withRunLease(
+    store,
+    'run-1',
+    async (isValid, getLoss) => {
+      await untilInvalid(isValid);
+      return getLoss();
+    },
+    { ownerId: 'w', leaseToken: 't', heartbeatIntervalMs: 5 }
+  );
+
+  expect(loss?.reason).toBe('renewal_error');
+});
+
+test('a healthy lease records nothing', async () => {
+  clearRunLeaseLossesForTests();
+  const store = leaseStore(async () => true);
+  const loss = await withRunLease(
+    store,
+    'run-1',
+    async (_isValid, getLoss) => {
+      await new Promise(resolve => setTimeout(resolve, 30));
+      return getLoss();
+    },
+    { ownerId: 'w', leaseToken: 't', heartbeatIntervalMs: 5 }
+  );
+  expect(loss).toBeNull();
+  expect(getRunLeaseLoss('run-1')).toBeNull();
 });

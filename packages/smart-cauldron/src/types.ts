@@ -14,6 +14,7 @@ export type TierOutcome =
   | 'running' // attempt intent persisted before the workflow lane is fired
   | 'won' // gate passed -- cascade stops
   | 'gate-failed' // ran, built, gate failed -- climb
+  | 'environment-unavailable' // declared test capability absent -- blocked, no climb
   | 'infra-error' // auth/transport failure -- alert, do not count as "too hard"
   | 'progress-timeout' // poll watchdog kill -- run never reached terminal; climb like gate-failed
   | 'cancelled' // externally cancelled; stop, do not climb
@@ -179,6 +180,24 @@ export interface CascadeRunRecord {
     tier: TierName;
   };
   /**
+   * Populated ONLY when the cascade stopped on a conflict-only gate verdict
+   * (blockedReason 'conflict_only' or 'conflict_resolved_by_update'): what the conductor did instead
+   * of climbing. See conflict-only.ts.
+   */
+  conflictOnly?: {
+    outcome: 'updated' | 'conflict_only';
+    runId: string | null;
+    tier: TierName;
+    prUrl: string;
+    headSha: string | null;
+    baseRef: string | null;
+    updateStatus: number | null;
+    files: string[];
+    commented: boolean;
+    alreadyRecorded: boolean;
+    note: string;
+  };
+  /**
    * Populated when the cascade stopped blocked for a teardown/checkout reason
    * (WO-HARNESS-REPAIR-HOLDER-TEARDOWN-01): 'checkout_failed_no_climb' or
    * 'teardown_unconfirmed'; or when a cascade whose entry tier has a
@@ -186,7 +205,13 @@ export interface CascadeRunRecord {
    * another rung (WO-HARNESS-ZERO-TIER-FENCES-AND-FLOOR-01 fence 3):
    * 'climb_limit_reached'.
    */
-  blockedReason?: 'checkout_failed_no_climb' | 'teardown_unconfirmed' | 'climb_limit_reached';
+  blockedReason?:
+    | 'checkout_failed_no_climb'
+    | 'teardown_unconfirmed'
+    | 'climb_limit_reached'
+    | 'environment_unavailable'
+    | 'conflict_only' // completed run, PR opened, the only failing condition is a merge conflict: no climb
+    | 'conflict_resolved_by_update'; // the same, and the branch update merged the base cleanly: no climb
   supervisorRecovery?: {
     ownerId: string;
     fencingToken: number;
@@ -215,6 +240,12 @@ export interface GateVerdict {
   prOpened: boolean;
   prMergeable: boolean | null;
   terminalStatus: string;
+  /**
+   * True ONLY when the run completed, a PR was opened, the validator did not say needs_revision and
+   * the one failing condition is that the PR cannot be merged (WO-HARNESS-CONFLICT-ONLY-GATE-NO-TIER-
+   * CLIMB-01). Such a verdict never climbs. Absent otherwise, so existing verdict shapes are unchanged.
+   */
+  conflictOnly?: boolean;
 }
 
 /**

@@ -1,0 +1,274 @@
+// bdc-xo#5571 part 3: one open-PR list per repository per reconcile pass, and a per-pass call count.
+// After PR 1578 the reconcile-spelling `{o}/{r}/pulls` rose from 866 to 1,580 calls an hour: the supersede
+// pass listed the repository's OPEN pull requests once per merged pull request. These cases pin the
+// sharing and the counts that let the next reading PROVE which reader owns which calls.
+import { describe, expect, test } from 'bun:test';
+import {
+  RECONCILE_SUPERSEDE_ACTION,
+  listOpenMergedTrackers,
+  runReconcileOnce,
+  type OctokitLike,
+  type ReconcileDeps,
+  type ReconcileRepoOpenPullRequest,
+} from '../reconcile';
+import { fakeDeps, mergedPr } from './reconcile.test';
+
+function openPr(
+  number: number,
+  body: string,
+  repo = 'bdc-harness',
+  headRefName = `archon/task-${number}`
+): ReconcileRepoOpenPullRequest {
+  return {
+    number,
+    body,
+    headRefName,
+    isDraft: false,
+    headRepository: { owner: 'thinmansoftware', repo },
+    createdAt: '2026-07-17T11:00:00Z',
+  };
+}
+
+function sharingDeps(input: {
+  merged: ReturnType<typeof mergedPr>[];
+  opens: Record<string, ReconcileRepoOpenPullRequest[]>;
+  listError?: (call: number) => boolean;
+}) {
+  const deps = fakeDeps({ prs: input.merged });
+  const listed: string[] = [];
+  const closes: Array<{ repo: string; number: number; comment: string }> = [];
+  const logs: Array<{ level: string; message: string; fields: Record<string, unknown> }> = [];
+  let calls = 0;
+  deps.listOpenPullRequestsInRepo = async request => {
+    calls += 1;
+    listed.push(`${request.owner}/${request.repo}`);
+    if (input.listError?.(calls)) throw new Error('list failed');
+    return input.opens[request.repo] ?? [];
+  };
+  deps.closePullRequest = async request => {
+    closes.push({ repo: request.repo, number: request.number, comment: request.comment });
+  };
+  deps.hasSupersedeBeenRecorded = async ({ prRef, woId }) =>
+    deps.actions.some(
+      action =>
+        action.action === RECONCILE_SUPERSEDE_ACTION &&
+        action.prRef === prRef &&
+        action.woId === woId
+    );
+  deps.log = {
+    warn: (fields, message) => {
+      logs.push({ level: 'warn', message, fields: fields as Record<string, unknown> });
+    },
+    info: (fields, message) => {
+      logs.push({ level: 'info', message, fields: fields as Record<string, unknown> });
+    },
+  };
+  return Object.assign(deps, { listed, closes, logs });
+}
+
+const countsOf = (logs: Array<{ message: string; fields: Record<string, unknown> }>) => {
+  const line = logs.filter(entry => entry.message === 'overseer.reconcile.call_counts');
+  expect(line).toHaveLength(1);
+  return line[0]?.fields.counts as Record<string, number>;
+};
+
+describe('reconcile pass: one open-PR list per repository', () => {
+  test('two merged PRs in one repository read the open-PR list once and still close each sibling', async () => {
+    const deps = sharingDeps({
+      merged: [
+        mergedPr({ number: 201, body: 'WO: WO-AAA-01\n', baseRef: 'dev' }),
+        mergedPr({ number: 202, body: 'WO: WO-BBB-01\n', baseRef: 'dev' }),
+      ],
+      opens: {
+        'bdc-harness': [openPr(301, 'WO: WO-AAA-01\n'), openPr(302, 'WO: WO-BBB-01\n')],
+      },
+    });
+
+    await runReconcileOnce({ deps });
+
+    expect(deps.listed).toEqual(['thinmansoftware/bdc-harness']);
+    expect(deps.closes.map(close => [close.number, close.comment]).sort()).toEqual([
+      [301, 'Superseded by #201'],
+      [302, 'Superseded by #202'],
+    ]);
+    const counts = countsOf(deps.logs);
+    expect(counts['open_pr_list:reads']).toBe(1);
+    expect(counts['open_pr_list:cache_hits']).toBe(1);
+    // The dependency itself was asked twice (once per merged PR); only the first reached GitHub.
+    expect(counts['calls:listOpenPullRequestsInRepo']).toBe(2);
+    expect(counts['calls:searchMergedPullRequests']).toBe(1);
+  });
+
+  test('a sibling closed by the first merged PR is not matched and commented on again by the second', async () => {
+    const deps = sharingDeps({
+      merged: [
+        mergedPr({ number: 201, body: 'WO: WO-AAA-01\n', baseRef: 'dev' }),
+        mergedPr({ number: 202, body: 'WO: WO-BBB-01\n', baseRef: 'dev' }),
+      ],
+      // 301 names BOTH work orders: before the sharing, the first close removed it from the second list.
+      opens: { 'bdc-harness': [openPr(301, 'WO: WO-AAA-01\nWO: WO-BBB-01\n')] },
+    });
+
+    await runReconcileOnce({ deps });
+
+    expect(deps.closes.map(close => close.number)).toEqual([301]);
+    expect(deps.listed).toHaveLength(1);
+  });
+
+  test('different repositories are listed separately', async () => {
+    const deps = sharingDeps({
+      merged: [
+        mergedPr({ number: 201, body: 'WO: WO-AAA-01\n', baseRef: 'dev' }),
+        mergedPr({
+          number: 202,
+          repo: 'bdc-xo',
+          body: 'WO: WO-BBB-01\n',
+          baseRef: 'main',
+          htmlUrl: 'https://github.com/thinmansoftware/bdc-xo/pull/202',
+        }),
+      ],
+      opens: {},
+    });
+
+    await runReconcileOnce({ deps });
+
+    expect(deps.listed.sort()).toEqual(['thinmansoftware/bdc-harness', 'thinmansoftware/bdc-xo']);
+    const counts = countsOf(deps.logs);
+    expect(counts['open_pr_list:reads']).toBe(2);
+    expect(counts['open_pr_list:cache_hits'] ?? 0).toBe(0);
+  });
+
+  test('a failed list is not cached: the next merged PR of the repository reads it again', async () => {
+    const deps = sharingDeps({
+      merged: [
+        mergedPr({ number: 201, body: 'WO: WO-AAA-01\n', baseRef: 'dev' }),
+        mergedPr({ number: 202, body: 'WO: WO-BBB-01\n', baseRef: 'dev' }),
+      ],
+      opens: { 'bdc-harness': [openPr(302, 'WO: WO-BBB-01\n')] },
+      listError: call => call === 1,
+    });
+
+    await runReconcileOnce({ deps });
+
+    expect(deps.listed).toHaveLength(2);
+    expect(deps.closes.map(close => close.number)).toEqual([302]);
+    expect(
+      deps.logs.some(entry => entry.message === 'overseer.reconcile.supersede_list_failed')
+    ).toBe(true);
+  });
+
+  test('GitHub pages are counted by reader inside the pass', async () => {
+    const deps = sharingDeps({
+      merged: [mergedPr({ number: 201, body: 'WO: WO-AAA-01\n', baseRef: 'dev' })],
+      opens: {},
+    });
+    const octokit = {
+      issues: { listForRepo: async () => ({ data: [] }) },
+    } as unknown as OctokitLike;
+    const inner: NonNullable<ReconcileDeps['listOpenPullRequestsInRepo']> = async () => {
+      await listOpenMergedTrackers(octokit);
+      return [];
+    };
+    deps.listOpenPullRequestsInRepo = inner;
+
+    await runReconcileOnce({ deps });
+
+    expect(countsOf(deps.logs)['pages:merged_trackers']).toBe(1);
+  });
+});
+
+describe('reconcile pass: the originating-run lookup is bounded (health stall, 2026-11-12)', () => {
+  test("N merged PRs x M open PRs ask the resolver once per Cauldron-branch PR, never for a person's branch", async () => {
+    const wos = ['AAA', 'BBB', 'CCC', 'DDD', 'EEE', 'FFF'];
+    const merged = wos.map((wo, index) =>
+      mergedPr({ number: 201 + index, body: `WO: WO-${wo}-01\n`, baseRef: 'dev' })
+    );
+    const opens = [
+      ...[301, 302, 303, 304].map(n =>
+        openPr(n, 'fallback text', 'bdc-harness', `salvage/opus-repair-task-${n}-1`)
+      ),
+      openPr(305, "a person's PR", 'bdc-harness', 'someone/fix-typo'),
+      openPr(306, "another person's PR", 'bdc-harness', 'feat/something-else'),
+    ];
+    const deps = sharingDeps({ merged, opens: { 'bdc-harness': opens } });
+    const asked: number[] = [];
+    deps.resolveOriginatingWoId = async request => {
+      asked.push(request.number);
+      return { kind: 'none' };
+    };
+
+    await runReconcileOnce({ deps });
+
+    // 6 merged x 6 open = 36 pairs would have been 36 lookups; now 4 (one per salvage PR), 0 for people.
+    expect(asked.sort()).toEqual([301, 302, 303, 304]);
+    const counts = countsOf(deps.logs);
+    expect(counts['calls:resolveOriginatingWoId']).toBe(24);
+    expect(counts['supersede_lookup:reads']).toBe(4);
+    expect(counts['supersede_lookup:memo_hits']).toBe(20);
+    expect(counts['supersede_lookup:skipped_branch']).toBe(12);
+    expect(counts['supersede_lookup:no_originating_run']).toBe(24);
+    expect(typeof counts.pass_ms).toBe('number');
+    expect(deps.closes).toEqual([]);
+  });
+
+  test('a failed lookup is not remembered inside the pass', async () => {
+    const deps = sharingDeps({
+      merged: [
+        mergedPr({ number: 201, body: 'WO: WO-AAA-01\n', baseRef: 'dev' }),
+        mergedPr({ number: 202, body: 'WO: WO-BBB-01\n', baseRef: 'dev' }),
+      ],
+      opens: {
+        'bdc-harness': [openPr(301, 'fallback', 'bdc-harness', 'salvage/opus-repair-task-301-1')],
+      },
+    });
+    let calls = 0;
+    deps.resolveOriginatingWoId = async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('event store busy');
+      return { kind: 'one', woId: 'WO-BBB-01' };
+    };
+
+    await runReconcileOnce({ deps });
+
+    expect(calls).toBe(2);
+    expect(deps.closes.map(close => close.number)).toEqual([301]);
+  });
+});
+
+describe('reconcile pass: the lookup never holds the event loop across reads (forward rebuild probes of 4 s)', () => {
+  test('a macrotask runs between two consecutive real reads', async () => {
+    const deps = sharingDeps({
+      merged: [mergedPr({ number: 201, body: 'WO: WO-AAA-01\n', baseRef: 'dev' })],
+      opens: {
+        'bdc-harness': [301, 302, 303, 304, 305].map(n =>
+          openPr(n, 'fallback', 'bdc-harness', `salvage/opus-repair-task-${n}-1`)
+        ),
+      },
+    });
+    let macrotasks = 0;
+    let running = true;
+    const pump = (): void => {
+      if (!running) return;
+      macrotasks += 1;
+      setImmediate(pump);
+    };
+    setImmediate(pump);
+    const seen: number[] = [];
+    deps.resolveOriginatingWoId = async () => {
+      // synchronous work, like the SQLite read: no await inside
+      seen.push(macrotasks);
+      return { kind: 'none' };
+    };
+
+    await runReconcileOnce({ deps });
+    running = false;
+
+    expect(seen.length).toBe(5);
+    // Without the yield all five reads start inside one macrotask (all values equal).
+    for (let i = 1; i < seen.length; i += 1) {
+      expect(seen[i], `read ${i + 1} ran in the same macrotask as read ${i}`).toBeGreaterThan(
+        seen[i - 1]
+      );
+    }
+  });
+});

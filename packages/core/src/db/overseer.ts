@@ -277,6 +277,19 @@ export async function getOverseerWatchRunById(runId: string): Promise<OverseerWa
 }
 
 /**
+ * The user_message of one workflow run (null when the run does not exist). The work order of a run
+ * lives on a `WO_ID=<id>` line of this message; callers parse it with `userMessageWoId`
+ * (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01).
+ */
+export async function getWorkflowRunUserMessage(runId: string): Promise<string | null> {
+  const result = await getDatabase().query<{ user_message: string | null }>(
+    'SELECT user_message FROM remote_agent_workflow_runs WHERE id = $1',
+    [runId]
+  );
+  return result.rows[0]?.user_message ?? null;
+}
+
+/**
  * The user_message of every currently ACTIVE workflow run, so the merge bridge
  * can defer merging a PR while a run for the same WO is still executing
  * (bdc-harness #1046). Active statuses match the in-flight set used elsewhere
@@ -294,6 +307,87 @@ export async function listActiveRunUserMessages(): Promise<string[]> {
   return result.rows
     .map(row => (typeof row.user_message === 'string' ? row.user_message : ''))
     .filter(message => message.length > 0);
+}
+
+/**
+ * Raw candidates for "which run opened this pull request" (bdc-harness 5308).
+ * A candidate is either a run whose own worktree path ends with the PR head
+ * branch (the agent pushed the run's worktree branch), or a run whose
+ * open-pr / patch-pr-body node output mentions the PR URL. Exact matching is
+ * done by the caller; the LIKE patterns here only narrow the scan.
+ */
+export interface OriginatingRunCandidateRow {
+  id: string;
+  status: string;
+  started_at: string | Date | null;
+  working_path: string | null;
+  /** Engine-written codebase name (owner/repo) from the run's codebase FK; null when unlinked. */
+  codebase_name: string | null;
+  /** Codebase repository_url (an authoritative owner/repo when set). */
+  codebase_url: string | null;
+  event_data: string | null;
+}
+
+export async function listOriginatingRunCandidates(input: {
+  owner: string;
+  repo: string;
+  number: number;
+  headRef?: string;
+  /**
+   * Basename of a run worktree (for example `task-web-worker-1794491823473-n2cbqh`), taken from a
+   * salvage branch name `salvage/opus-repair-<basename>-<pid>`. A salvage fallback PR is pushed from
+   * the run's worktree under that branch, so neither the branch-ends-the-path match nor the
+   * open-pr node output names it (WO-HARNESS-SIBLING-WO-PR-HOLD-AFTER-MERGE-01). Optional: absent
+   * keeps the query exactly as before.
+   */
+  salvageWorktree?: string;
+}): Promise<OriginatingRunCandidateRow[]> {
+  const db = getDatabase();
+  const rows: OriginatingRunCandidateRow[] = [];
+  const headRef = (input.headRef ?? '').trim();
+  const salvageWorktree = (input.salvageWorktree ?? '').trim();
+  if (salvageWorktree) {
+    const bySalvage = await db.query<OriginatingRunCandidateRow>(
+      `SELECT r.id AS id, r.status AS status, r.started_at AS started_at,
+              r.working_path AS working_path, c.name AS codebase_name,
+              c.repository_url AS codebase_url, NULL AS event_data
+       FROM remote_agent_workflow_runs r
+       LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
+       WHERE r.workflow_name != 'pr-discovery'
+         AND replace(r.working_path, $2, '/') LIKE $1`,
+      [`%/${salvageWorktree}`, String.fromCharCode(92)]
+    );
+    rows.push(...bySalvage.rows);
+  }
+  if (headRef) {
+    const byBranch = await db.query<OriginatingRunCandidateRow>(
+      `SELECT r.id AS id, r.status AS status, r.started_at AS started_at,
+              r.working_path AS working_path, c.name AS codebase_name,
+              c.repository_url AS codebase_url, NULL AS event_data
+       FROM remote_agent_workflow_runs r
+       LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
+       WHERE r.workflow_name != 'pr-discovery'
+         AND replace(r.working_path, $2, '/') LIKE $1`,
+      // a Windows worktree path uses backslashes: normalise them in SQL before matching
+      [`%/${headRef}`, String.fromCharCode(92)]
+    );
+    rows.push(...byBranch.rows);
+  }
+  const byUrl = await db.query<OriginatingRunCandidateRow>(
+    `SELECT r.id AS id, r.status AS status, r.started_at AS started_at,
+            r.working_path AS working_path, c.name AS codebase_name,
+            c.repository_url AS codebase_url, CAST(e.data AS TEXT) AS event_data
+     FROM remote_agent_workflow_events e
+     JOIN remote_agent_workflow_runs r ON r.id = e.workflow_run_id
+     LEFT JOIN remote_agent_codebases c ON c.id = r.codebase_id
+     WHERE e.event_type = 'node_completed'
+       AND e.step_name IN ('open-pr-if-needed', 'patch-pr-body')
+       AND r.workflow_name != 'pr-discovery'
+       AND CAST(e.data AS TEXT) LIKE $1`,
+    [`%${input.owner}/${input.repo}/pull/${input.number}%`]
+  );
+  rows.push(...byUrl.rows);
+  return rows;
 }
 
 interface OverseerEffectTimestampRow {
@@ -611,6 +705,31 @@ export async function recordVerdictMergeOutcome(input: {
   const row = result.rows[0];
   if (!row) throw new Error(`overseer_verdict_merge_outcome_missing_row:${input.verdictId}`);
   return row;
+}
+
+export interface MergedVerdictRow {
+  id: string;
+  run_id: string;
+  wo_id: string;
+  pr_url: string | null;
+  head_sha: string;
+  updated_at: string;
+}
+
+/**
+ * Verdict rows the merge-execution bridge merged since `sinceIso`
+ * (action_reason 'merge_executed'). updated_at is the time the merge outcome
+ * was recorded, which does not change afterwards. Read-only; used by the
+ * post-merge stray-push sweep.
+ */
+export async function listMergedVerdictsSince(sinceIso: string): Promise<MergedVerdictRow[]> {
+  const result = await getDatabase().query<MergedVerdictRow>(
+    `SELECT id, run_id, wo_id, pr_url, head_sha, updated_at FROM overseer_verdicts
+     WHERE action_reason = 'merge_executed' AND pr_url IS NOT NULL AND updated_at >= $1
+     ORDER BY updated_at ASC`,
+    [sinceIso]
+  );
+  return result.rows.map(row => ({ ...row, updated_at: new Date(row.updated_at).toISOString() }));
 }
 
 export interface OverseerVerdictClaim {
