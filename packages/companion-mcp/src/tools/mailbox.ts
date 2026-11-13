@@ -1,8 +1,10 @@
+import { Buffer } from 'node:buffer';
 import { randomUUID } from 'node:crypto';
 
-import { DISPATCH_LIST_LIMIT, utcCompact } from '../constants';
+import { DISPATCH_LIST_LIMIT, MAILBOX_TEXT_MAX_BYTES, utcCompact } from '../constants';
 import { DispatchClient } from '../dispatch-client';
 import { ToolFailure } from '../errors';
+import { processSendLimiter, type SendLimiter } from '../send-limit';
 import type { CompanionSlot, DispatchCursorPage, DispatchWireMessage } from '../types';
 
 export async function mailboxSend(
@@ -10,7 +12,9 @@ export async function mailboxSend(
   slot: CompanionSlot,
   recipient: string,
   text: string,
-  correlationId: string | undefined
+  correlationId: string | undefined,
+  limiter: SendLimiter = processSendLimiter,
+  nowMs: number = Date.now()
 ): Promise<{ correlation_id: string }> {
   if (text.trim() === '') {
     throw new ToolFailure('refused', 'text_required');
@@ -19,10 +23,17 @@ export async function mailboxSend(
   if (!slot.allowed_recipients.includes(canonical)) {
     throw new ToolFailure('refused', 'recipient_not_allowed');
   }
+  if (Buffer.byteLength(text, 'utf8') > MAILBOX_TEXT_MAX_BYTES) {
+    throw new ToolFailure('refused', 'text_too_long');
+  }
   const correlation =
     correlationId !== undefined && correlationId.trim() !== ''
       ? correlationId.trim()
       : `companion-${slot.companion_id}-${randomUUID()}`;
+  const decision = limiter.tryAcquire(slot.companion_id, nowMs);
+  if (!decision.allowed) {
+    throw new ToolFailure('refused', 'send_rate_limited');
+  }
   await dispatch.send(slot, {
     recipient: canonical,
     text,
