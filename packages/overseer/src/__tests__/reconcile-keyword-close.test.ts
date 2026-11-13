@@ -562,8 +562,17 @@ test('Test 9: a cursor newer than the 7-day floor still rescans back to the floo
   });
   // Cursor one day before `now` (2026-11-02T12:00:00Z) -- well inside the 7-day floor.
   state.deps.readCursor = async () => '2026-11-01T09:00:00Z';
-
-  await runReconcileOnce({ deps: state.deps });
+  const previousLookback = process.env.RECONCILE_MIN_LOOKBACK_DAYS;
+  process.env.RECONCILE_MIN_LOOKBACK_DAYS = '7';
+  try {
+    await runReconcileOnce({ deps: state.deps });
+  } finally {
+    if (previousLookback === undefined) {
+      delete process.env.RECONCILE_MIN_LOOKBACK_DAYS;
+    } else {
+      process.env.RECONCILE_MIN_LOOKBACK_DAYS = previousLookback;
+    }
+  }
 
   // Floor = now - 7 days = 2026-10-26. Without the floor, `since` would be the
   // newer cursor date (2026-11-01) and the pre-cursor merge window would be missed.

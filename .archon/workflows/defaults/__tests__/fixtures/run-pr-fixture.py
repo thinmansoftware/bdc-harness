@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 import sys
@@ -115,6 +116,18 @@ def fixture(t):
     (bindir / 'gh').write_text('#!/usr/bin/env bash\nexec python3 "' + (t / 'gh.py').as_posix() + '" "$@"\n')
     (t / 'gh.py').write_text(STUB)
     (bindir / 'gh').chmod(0o755)
+    # Images that ship /app/scripts/github-service-login.ts make the lane skip
+    # `gh api user`. Answer that call with the fixture builder login.
+    real_bun = shutil.which('bun') or 'bun'
+    (bindir / 'bun').write_text(
+        '#!/usr/bin/env bash\n'
+        'if [ "$1" = "/app/scripts/github-service-login.ts" ]; then\n'
+        '  echo builder\n'
+        '  exit 0\n'
+        'fi\n'
+        'exec ' + shlex.quote(real_bun) + ' "$@"\n'
+    )
+    (bindir / 'bun').chmod(0o755)
     state = t / 'state.json'
     env = dict(os.environ, PATH=str(bindir) + os.pathsep + os.environ['PATH'], ARTIFACTS_DIR=str(artifacts), ARCHON_NODE_OUT=str(out), WORKFLOW_ID='fixture-run', WO_ID=WO, USER_MESSAGE=WO, RECORDED_BASE_BRANCH='dev', BASE_BRANCH='dev', PR_FIXTURE_STATE=str(state), CAULDRON_INTERACTIVE='false', TMPDIR=str(t), TEMP=str(t), TMP=str(t))
     return wt, bare, artifacts, state, env, branch, unique, ancestor, head, base

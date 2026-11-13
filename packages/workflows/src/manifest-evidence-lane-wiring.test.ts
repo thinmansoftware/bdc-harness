@@ -272,6 +272,10 @@ function runStopTestsNode(opts: {
       `${JSON.stringify({ name: 'x', scripts: { test: 'bash ./repo-pass.sh' } })}\n`
     );
     writeFileSync(join(cwd, 'bun.lock'), '{}\n');
+    // bun 1.3 deletes an empty lockfile on `bun install`. Lane prep skips that
+    // install when node_modules is already present, so bun.lock still selects
+    // `bun run test` as the repo test script.
+    mkdirSync(join(cwd, 'node_modules'));
     writeFileSync(join(cwd, 'repo-pass.sh'), 'echo "Tests: 1/1"\nexit 0\n');
     for (const [rel, body] of Object.entries(opts.files ?? {})) {
       mkdirSync(dirname(join(cwd, rel)), { recursive: true });

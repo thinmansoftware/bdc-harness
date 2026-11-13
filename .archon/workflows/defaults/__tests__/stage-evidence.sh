@@ -55,6 +55,15 @@ mkdir -p "$WT/tests" "$TMP/toolbin/bun-node-fallback-bin"
 TOOLS="$TMP/toolbin"
 PYTHON_DIR="$(dirname "$(command -v python3)")"
 export FIX_SPEC=$'WO Class: CODE\nStop 1 (test suite):\n  pytest tests/x.py\nExpected: pass'
+# The case is a missing pytest. Some builder images ship /usr/bin/pytest, which
+# this PATH includes. A stub that exits 127 stands in for command-not-found.
+if PATH="$TOOLS:/usr/bin:/bin:$PYTHON_DIR" command -v pytest >/dev/null 2>&1; then
+  cat > "$TOOLS/pytest" <<'SH'
+#!/usr/bin/env bash
+exit 127
+SH
+  chmod +x "$TOOLS/pytest"
+fi
 out="$(PATH="$TOOLS:/usr/bin:/bin:$PYTHON_DIR" run_node run-stop-tests)"
 check contains "$out" 'TESTS_STATUS=blocked'
 check contains "$out" 'TESTS_BLOCKED_REASON=missing_tool:pytest'
