@@ -33,8 +33,10 @@ that have a `package.json` plus a supported lockfile. It prints `dprep: package 
   first and any that differs afterwards is copied back. Inside a git work tree any other tracked file that was
   clean before the install and changed by it is restored with `git checkout -- <file>`. A tracked file that was
   ALREADY modified before the install (an unstaged implement edit, or a deletion) has its exact bytes (or its
-  absence) saved first and put back if the install changed it; a staged edit comes back from the index. Each
-  restore prints `dprep: restored <path>`. (Reason: `commit-and-push` tolerates lockfile changes only at the top level, so a
+  absence) saved first and put back if the install changed it, recreating the file's folder when the install removed
+  it; a staged edit comes back from the index. Each restore prints `dprep: restored <path>`. If a restore cannot be
+  done, dprep prints `dprep: RESTORE FAILED <path>`, returns nonzero for that folder, and KEEPS the snapshot folder
+  (its path is printed) instead of deleting the only copy of the edit. (Reason: `commit-and-push` tolerates lockfile changes only at the top level, so a
   rewritten `shopops-api/bun.lock` could otherwise ship in the build PR.)
 - A failed install in one folder does not stop the others; the return code is nonzero when any attempted
   install failed.

@@ -158,7 +158,7 @@ dprep__candidates() {
 # dprep__guarded_install_in <folder>: install in one package folder and leave its tracked files
 # exactly as they were (see the PACKAGE FOLDERS note above). Returns the install's return code.
 dprep__guarded_install_in() {
-  local dir="$1" kind rc=0 saved f top before after path nmod
+  local dir="$1" kind rc=0 saved f top before after path nmod rfail=0
   printf 'dprep: package folder %s\n' "$dir"
   kind="$(cd "$dir" && dprep__kind 1)"
   if [ -d "$dir/node_modules" ]; then
@@ -196,8 +196,12 @@ EOF
   if [ -n "$saved" ]; then
     for f in package.json bun.lock bun.lockb pnpm-lock.yaml package-lock.json yarn.lock; do
       if [ -f "$saved/$f" ] && ! cmp -s "$saved/$f" "$dir/$f"; then
-        cp -p "$saved/$f" "$dir/$f"
-        printf 'dprep: restored %s/%s\n' "$dir" "$f"
+        if cp -p "$saved/$f" "$dir/$f"; then
+          printf 'dprep: restored %s/%s\n' "$dir" "$f"
+        else
+          printf 'dprep: RESTORE FAILED %s/%s\n' "$dir" "$f"
+          rfail=1
+        fi
       fi
     done
   fi
@@ -207,7 +211,12 @@ EOF
     while IFS= read -r path; do
       [ -n "$path" ] || continue
       if ! printf '%s\n' "$before" | grep -qxF -- "$path"; then
-        git -C "$top" checkout -- "$path" 2>/dev/null && printf 'dprep: restored %s\n' "$path"
+        if git -C "$top" checkout -- "$path" 2>/dev/null; then
+          printf 'dprep: restored %s\n' "$path"
+        else
+          printf 'dprep: RESTORE FAILED %s\n' "$path"
+          rfail=1
+        fi
       fi
     done <<EOF
 $after
@@ -220,15 +229,32 @@ EOF
         nmod=$((nmod + 1))
         if [ -f "$saved/mod/$nmod" ]; then
           if ! cmp -s "$saved/mod/$nmod" "$top/$path"; then
-            cp -p "$saved/mod/$nmod" "$top/$path" && printf 'dprep: restored %s\n' "$path"
+            # The install may have removed the parent folder of an edited file: recreate it first.
+            if mkdir -p "$(dirname "$top/$path")" && cp -p "$saved/mod/$nmod" "$top/$path"; then
+              printf 'dprep: restored %s\n' "$path"
+            else
+              printf 'dprep: RESTORE FAILED %s\n' "$path"
+              rfail=1
+            fi
           fi
         elif [ -e "$top/$path" ]; then
-          rm -f "$top/$path" && printf 'dprep: restored %s\n' "$path"
+          if rm -f "$top/$path"; then
+            printf 'dprep: restored %s\n' "$path"
+          else
+            printf 'dprep: RESTORE FAILED %s\n' "$path"
+            rfail=1
+          fi
         fi
       done < "$saved/mod.list"
     fi
   fi
-  if [ -n "$saved" ]; then rm -rf "$saved"; fi
+  if [ "$rfail" -ne 0 ]; then
+    # Never delete the only copy of an earlier edit: keep the snapshots and say where they are.
+    printf 'dprep: restore failed in %s; snapshots kept in %s\n' "$dir" "${saved:-none}"
+    [ "$rc" -eq 0 ] && rc=1
+  elif [ -n "$saved" ]; then
+    rm -rf "$saved"
+  fi
   return "$rc"
 }
 

@@ -46,6 +46,8 @@ case "$1" in
     [ -n "${STUB_NPM_FAIL_CI:-}" ] && exit 1
     failhere && exit 1
     if [ -n "${STUB_TOUCH_SOURCE:-}" ]; then mkdir -p routes; echo "install clobbered" > routes/x.js; fi
+    if [ -n "${STUB_REMOVE_DIR:-}" ]; then rm -rf routes; fi
+    if [ -n "${STUB_BLOCK_DIR:-}" ]; then rm -rf routes; echo "not a folder" > routes; fi
     mkdir -p node_modules; exit 0 ;;
   install)
     failhere && exit 1
@@ -267,6 +269,33 @@ gitq "$T9H" add -A; gitq "$T9H" commit -m init
 rm "$T9H/shopops-api/routes/x.js"
 run_dprep "$T9H" STUB_TOUCH_SOURCE=1
 [ ! -e "$T9H/shopops-api/routes/x.js" ] && ok "T9h a deleted tracked file stays deleted" || bad "T9h the install resurrected a deleted tracked file"
+
+# (3f) the install REMOVES the folder that holds an edited tracked file (Overseer finding 2 on PR 1597):
+#      the folder is recreated and the unstaged edit comes back byte for byte, return code 0
+T9I="$WORK/t9i"; mkrepo "$T9I"; mkpkg "$T9I"; mkpkg "$T9I/shopops-api" package-lock.json
+mkdir -p "$T9I/shopops-api/routes"; echo "v1" > "$T9I/shopops-api/routes/x.js"
+gitq "$T9I" add -A; gitq "$T9I" commit -m init
+echo "v2 unstaged edit under a folder the install deletes" > "$T9I/shopops-api/routes/x.js"
+BEFORE="$(sums "$T9I" shopops-api/routes/x.js)"
+run_dprep "$T9I" STUB_REMOVE_DIR=1
+AFTER="$(sums "$T9I" shopops-api/routes/x.js)"
+check "T9i an edit under a folder the install removed comes back byte for byte" "$BEFORE" "$AFTER"
+has "T9i the restore is reported" "dprep: restored shopops-api/routes/x.js" "$OUT"
+hasnt "T9i no restore failure" "RESTORE FAILED" "$OUT"
+check "T9i return code 0" 0 "$RC"
+
+# (3g) the restore itself cannot succeed (the install leaves a FILE where the folder was): the failure is
+#      reported, the return code is nonzero and the snapshot of the edit is KEPT, never deleted
+T9J="$WORK/t9j"; mkrepo "$T9J"; mkpkg "$T9J"; mkpkg "$T9J/shopops-api" package-lock.json
+mkdir -p "$T9J/shopops-api/routes"; echo "v1" > "$T9J/shopops-api/routes/x.js"
+gitq "$T9J" add -A; gitq "$T9J" commit -m init
+echo "v2 unstaged edit that cannot be put back" > "$T9J/shopops-api/routes/x.js"
+run_dprep "$T9J" STUB_BLOCK_DIR=1
+has "T9j the failure is reported" "dprep: RESTORE FAILED shopops-api/routes/x.js" "$OUT"
+has "T9j the snapshot location is printed" "snapshots kept in " "$OUT"
+check "T9j return code is nonzero" 1 "$RC"
+KEPT="$(printf '%s\n' "$OUT" | sed -n 's/.*snapshots kept in //p' | head -1)"
+[ -n "$KEPT" ] && [ -f "$KEPT/mod/1" ] && grep -q "v2 unstaged edit that cannot be put back" "$KEPT/mod/1" && ok "T9j the snapshot still holds the edit" || bad "T9j the snapshot was deleted or lost the edit"
 
 # (4) outside a git work tree the lockfile and package.json are still restored
 T9E="$WORK/t9e"; mkpkg "$T9E"; mkpkg "$T9E/shopops-api" package-lock.json
