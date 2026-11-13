@@ -43,6 +43,7 @@ import type {
 } from './required-contexts.ts';
 import { createDurableAttemptCounterStore } from './required-contexts-store';
 import { classifyRateLimitError } from '../github-rate-limit';
+import { mergeHoldReason } from '../merge-holds';
 import {
   attachWorkflowAttempts,
   blockingFindingsAreCheckScoped,
@@ -204,6 +205,7 @@ export interface RealGitHubOctokitLike {
         base?: { sha: string; ref?: string };
         mergeable_state?: string;
         labels?: { name?: string | null }[];
+        draft?: boolean;
       };
     }>;
     listFiles?(input: Record<string, unknown>): Promise<{
@@ -1403,6 +1405,7 @@ export function createRealFindPullRequest(
         mergeableState: pr.data.mergeable_state,
         changedFilePaths,
         labels: pullRequestLabelNames(pr.data.labels),
+        ...(typeof pr.data.draft === 'boolean' ? { draft: pr.data.draft } : {}),
       };
       if (!preserveRateLimitBackoff) {
         rateLimitBackoffUntil = 0;
@@ -1473,6 +1476,19 @@ export function createRealMergePullRequest(
     if (seenHead !== input.expectedHeadSha) {
       return { merged: false, message: `head_moved:${seenHead}` };
     }
+    // The last check before GitHub's merge API, for EVERY caller (merge manager, merge coordinator, any
+    // future path), on the fresh pulls.get response: a hold label added after the evidence was assembled
+    // still stops the merge, and a response without labels or without the draft field is refused, never
+    // assumed clean (WO-HARNESS-MERGE-GATES-01).
+    const holdReason = mergeHoldReason(
+      {
+        labels: pr.data.labels === undefined ? undefined : pullRequestLabelNames(pr.data.labels),
+        draft: pr.data.draft,
+        title: pr.data.title,
+      },
+      { failClosed: true }
+    );
+    if (holdReason) return { merged: false, message: holdReason };
     try {
       const mergeInput = {
         owner: input.owner,

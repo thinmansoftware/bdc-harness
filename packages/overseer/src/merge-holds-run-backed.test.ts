@@ -310,7 +310,11 @@ describe('Test 9: a run-backed PR carrying merge-hold is merged by neither path'
     expect(result.status).toBe('held');
     expect(manager.actions.filter(a => a.action === 'merged')).toEqual([]);
     expect(
-      manager.actions.some(a => a.action === 'merge_denied' && a.result === 'merge_hold_label')
+      manager.actions.some(
+        a =>
+          a.action === 'merge_denied' &&
+          a.result.includes('"precondition_miss_reason":"merge_hold_label"')
+      )
     ).toBe(true);
   });
 

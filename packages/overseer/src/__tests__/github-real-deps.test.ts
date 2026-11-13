@@ -427,6 +427,8 @@ describe('createRealMergePullRequest expected head SHA', () => {
         state: 'open',
         html_url: 'u',
         head: { sha: reviewed },
+        labels: [],
+        draft: false,
       },
     });
     octokit.pulls.merge = merge;
@@ -472,6 +474,8 @@ describe('createRealMergePullRequest expected head SHA', () => {
         state: 'open',
         html_url: 'u',
         head: { sha: reviewed },
+        labels: [],
+        draft: false,
       },
     });
     octokit.pulls.merge = merge;

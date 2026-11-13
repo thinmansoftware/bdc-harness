@@ -4944,7 +4944,7 @@ nodes:
         BODY_FILE="$ARTIFACTS_DIR/fallback-body.txt"
         printf '%s\n' 'FALLBACK PATH: a BLOCKED build was auto-repaired by opus-repair, but the non-interactive run could not reach a human approval gate. The repair commit is pushed here for human review instead of being stranded in the worktree. See run artifacts for the original block reason.' > "$BODY_FILE"
         PR_CREATE_RC=0
-        gh pr create --repo "$REPO" --head "$BR" --base "$BASE_BRANCH" \
+        gh pr create --repo "$REPO" --head "$BR" --base "$BASE_BRANCH" --draft \
           --title "FALLBACK: opus-repaired build needs human review" --body-file "$BODY_FILE" || PR_CREATE_RC=$?
         if ! rpr_find; then
           echo "ERROR: fallback_pr_unverified (create exit=$PR_CREATE_RC); refusing another create" >&2; exit 1
