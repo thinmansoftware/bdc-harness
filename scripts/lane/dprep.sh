@@ -167,7 +167,8 @@ dprep__candidates() {
 # commit), so the restore is COMPLETE BY CONSTRUCTION rather than path by path: the commit and ref saved before
 # the install are the pre-install state, and `git reset --hard` to that commit puts the index and every tracked
 # file back (`dprep: restored <path>` per path). Nothing of value can be lost because the tree was proven clean.
-# If the install changed the checked-out ref, nothing is touched and the return code is 1. Outside a git work
+# If the install changed the checked-out ref, HEAD is pointed back at the saved ref and the same reset runs, so
+# implement never builds on the install's ref; the return code is 1 to flag it. Outside a git work
 # tree the folder's package.json and lockfiles are copied aside and restored.
 dprep__guarded_install_in() {
   local dir="$1" kind rc=0 saved="" f top dirty changed path head_before ref_before ref_after
@@ -215,7 +216,21 @@ dprep__guarded_install_in() {
   if [ -n "$top" ]; then
     ref_after="$(git -C "$top" symbolic-ref -q HEAD 2>/dev/null || echo detached)"
     if [ "$ref_after" != "$ref_before" ]; then
-      printf 'dprep: the install changed the checked-out ref (%s -> %s); nothing restored in %s\n' "$ref_before" "$ref_after" "$dir"
+      # The install switched the checkout to another ref. prep-dependencies ends "exit 0" and implement runs
+      # with trigger_rule all_done, so leaving the tree there would make implement build on the install's ref
+      # (Board desk, PR 1597 round 5). Point HEAD back at the saved ref WITHOUT touching the tree or index
+      # (symbolic-ref for a branch, update-ref --no-deref for a detached HEAD), so the reset below logs every
+      # path the install changed and then puts index and files back at the saved commit. rc stays 1 to flag it.
+      printf 'dprep: the install changed the checked-out ref (%s -> %s); restoring %s in %s\n' "$ref_before" "$ref_after" "$ref_before" "$dir"
+      [ "$rc" -eq 0 ] && rc=1
+      if [ "$ref_before" = "detached" ]; then
+        git -C "$top" update-ref --no-deref HEAD "$head_before" 2>/dev/null
+      else
+        git -C "$top" symbolic-ref HEAD "$ref_before" 2>/dev/null
+      fi || printf 'dprep: RESTORE FAILED (could not point HEAD back at %s) in %s\n' "$ref_before" "$dir"
+    fi
+    if [ "$(git -C "$top" symbolic-ref -q HEAD 2>/dev/null || echo detached)" != "$ref_before" ]; then
+      printf 'dprep: RESTORE FAILED (HEAD is not on %s); nothing reset in %s\n' "$ref_before" "$dir"
       [ "$rc" -eq 0 ] && rc=1
     elif [ "$(git -C "$top" rev-parse --verify -q HEAD 2>/dev/null)" != "$head_before" ] \
       || ! git -C "$top" diff --quiet "$head_before" 2>/dev/null \
@@ -237,8 +252,8 @@ dprep__guarded_install_in() {
 $changed
 EOF
       # WHY A HARD RESET IS SAFE HERE: it runs only on a tree that refuse-on-dirty above proved CLEAN before
-      # the install (nothing modified, staged, deleted or untracked except node_modules), and only when the
-      # ref is unchanged. So everything that differs from the saved commit is the install's own doing, and
+      # the install (nothing modified, staged, deleted or untracked except node_modules), and only once HEAD
+      # is on the saved ref again. So everything that differs from the saved commit is the install's own doing, and
       # nothing of anyone's work can be lost. `git reset --hard` never touches untracked files, so what the
       # install created (node_modules) stays and nothing else is deleted.
       if git -C "$top" reset -q --hard "$head_before" 2>/dev/null; then

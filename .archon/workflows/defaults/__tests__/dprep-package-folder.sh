@@ -328,12 +328,30 @@ check "T9p install commit: return code 0" 0 "$RC"
 check "T9p HEAD is back at the pre-install commit" "$HEAD0" "$(git -C "$T9P" rev-parse HEAD)"
 check "T9p the file is back byte for byte" "$BEFORE" "$(sums "$T9P" shopops-api/routes/x.js)"
 
-T9Q="$(mkdirty t9q)"
+# The install switches to its own branch (PR 1597 round 5, Board desk): prep-dependencies exits 0 and implement
+# runs with trigger_rule all_done, so dprep must put the checkout back on the SAVED ref, never leave it on the
+# install's ref.
+T9Q="$(mkdirty t9q)"; BEFORE="$(sums "$T9Q" shopops-api/routes/x.js)"; HEAD0="$(git -C "$T9Q" rev-parse HEAD)"
+REF0="$(git -C "$T9Q" symbolic-ref -q HEAD)"
 run_dprep "$T9Q" STUB_TOUCH_SOURCE=1 STUB_SWITCH_BRANCH=1
-check "T9q ref changed: return code 1" 1 "$RC"
+check "T9q ref changed: return code 1 (flagged)" 1 "$RC"
 has "T9q the ref change is reported" "changed the checked-out ref" "$OUT"
-hasnt "T9q nothing was restored" "dprep: restored" "$OUT"
-check "T9q the install's own branch was NOT reset" "install clobbered" "$(cat "$T9Q/shopops-api/routes/x.js")"
+check "T9q HEAD is back on the saved branch" "$REF0" "$(git -C "$T9Q" symbolic-ref -q HEAD)"
+check "T9q HEAD is at the saved commit" "$HEAD0" "$(git -C "$T9Q" rev-parse HEAD)"
+has "T9q what the install changed was logged" "dprep: install changed shopops-api/routes/x.js" "$OUT"
+has "T9q the restore is reported" "dprep: restored shopops-api/routes/x.js" "$OUT"
+check "T9q the file is back byte for byte" "$BEFORE" "$(sums "$T9Q" shopops-api/routes/x.js)"
+check "T9q git sees no modified or staged tracked file" "" "$(git -C "$T9Q" status --porcelain --untracked-files=no)"
+
+# Same, from a DETACHED checkout (the lane's repair-in-place and pinned-sha runs): HEAD is detached again at the
+# saved commit, not left on the install's branch.
+T9QD="$(mkdirty t9qd)"; gitq "$T9QD" checkout --detach; BEFORE="$(sums "$T9QD" shopops-api/routes/x.js)"; HEAD0="$(git -C "$T9QD" rev-parse HEAD)"
+run_dprep "$T9QD" STUB_TOUCH_SOURCE=1 STUB_SWITCH_BRANCH=1
+check "T9q detached: return code 1 (flagged)" 1 "$RC"
+check "T9q detached: HEAD is detached again" "" "$(git -C "$T9QD" symbolic-ref -q HEAD || true)"
+check "T9q detached: HEAD is at the saved commit" "$HEAD0" "$(git -C "$T9QD" rev-parse HEAD)"
+check "T9q detached: the file is back byte for byte" "$BEFORE" "$(sums "$T9QD" shopops-api/routes/x.js)"
+check "T9q detached: git sees no modified or staged tracked file" "" "$(git -C "$T9QD" status --porcelain --untracked-files=no)"
 
 T9R="$(mkdirty t9r)"
 run_dprep "$T9R" STUB_UNTRACKED=1
