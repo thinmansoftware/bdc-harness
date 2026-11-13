@@ -46,8 +46,6 @@ case "$1" in
     [ -n "${STUB_NPM_FAIL_CI:-}" ] && exit 1
     failhere && exit 1
     if [ -n "${STUB_TOUCH_SOURCE:-}" ]; then mkdir -p routes; echo "install clobbered" > routes/x.js; fi
-    if [ -n "${STUB_REMOVE_DIR:-}" ]; then rm -rf routes; fi
-    if [ -n "${STUB_BLOCK_DIR:-}" ]; then rm -rf routes; echo "not a folder" > routes; fi
     mkdir -p node_modules; exit 0 ;;
   install)
     failhere && exit 1
@@ -226,76 +224,78 @@ AFTER="$(sums "$T9C" shopops-api/routes/x.js shopops-api/package.json)"
 check "T9c uncommitted edits are still present and unchanged" "$BEFORE" "$AFTER"
 hasnt "T9c nothing was restored" "dprep: restored" "$OUT"
 
-# (3b) the install rewrites a package.json the implement step had already edited: the pre-install
-#      (implement) version comes back, not the committed one
-T9D="$WORK/t9d"; mkrepo "$T9D"; mkpkg "$T9D"; mkpkg "$T9D/shopops-api" package-lock.json
-gitq "$T9D" add -A; gitq "$T9D" commit -m init
-echo '{"name":"t","dependencies":{"added":"1"}}' > "$T9D/shopops-api/package.json"
-BEFORE="$(sums "$T9D" shopops-api/package.json)"
-run_dprep "$T9D" STUB_NPM_FAIL_CI=1 STUB_REWRITE=1
-AFTER="$(sums "$T9D" shopops-api/package.json)"
-check "T9d the implement edit of package.json survives a rewriting install" "$BEFORE" "$AFTER"
-has "T9d the restore is reported" "dprep: restored shopops-api/package.json" "$OUT"
+# ---- Refuse-on-dirty (PR 1597 review rounds 1 to 3): a dirty tree gets NO install, NO snapshot, NO restore ----
+# Each case: earlier work is in the checkout; dprep returns 1, no stub ran, every byte is as it was.
+refuse_case() { # refuse_case <name> <repo> <expected status line fragment, "" to skip>
+  local name="$1" repo="$2"
+  has "$name: the refusal is printed" "refuse-on-dirty" "$OUT"
+  check "$name: return code 1" 1 "$RC"
+  check "$name: no install ran" 0 "$(reclines)"
+  [ ! -d "$repo/shopops-api/node_modules" ] && ok "$name: no node_modules appeared" || bad "$name: node_modules appeared"
+  hasnt "$name: nothing was restored (nothing was touched)" "dprep: restored" "$OUT"
+}
+mkdirty() { # mkdirty <name>: a committed repo with shopops-api/routes/x.js and a clean tree
+  local d="$WORK/$1"; mkrepo "$d"; mkpkg "$d"; mkpkg "$d/shopops-api" package-lock.json
+  mkdir -p "$d/shopops-api/routes"; echo "v1" > "$d/shopops-api/routes/x.js"
+  gitq "$d" add -A; gitq "$d" commit -m init
+  printf '%s' "$d"
+}
 
-# (3c) the install overwrites a tracked SOURCE file (not a manifest or lockfile) that an earlier step had
-#      edited but not staged: the earlier edit must come back byte for byte (Overseer finding on PR 1597)
-T9F="$WORK/t9f"; mkrepo "$T9F"; mkpkg "$T9F"; mkpkg "$T9F/shopops-api" package-lock.json
-mkdir -p "$T9F/shopops-api/routes"; echo "v1" > "$T9F/shopops-api/routes/x.js"
-gitq "$T9F" add -A; gitq "$T9F" commit -m init
-echo "v2 unstaged implement edit" > "$T9F/shopops-api/routes/x.js"
+# (a) an unstaged edit to a source file
+T9F="$(mkdirty t9f)"; echo "v2 unstaged implement edit" > "$T9F/shopops-api/routes/x.js"
 BEFORE="$(sums "$T9F" shopops-api/routes/x.js)"
 run_dprep "$T9F" STUB_TOUCH_SOURCE=1
-AFTER="$(sums "$T9F" shopops-api/routes/x.js)"
-check "T9f an unstaged edit of a source file survives an install that overwrites it" "$BEFORE" "$AFTER"
-has "T9f the restore is reported" "dprep: restored shopops-api/routes/x.js" "$OUT"
-has "T9f the install did run" "npm ci --no-audit" "$(cat "$REC")"
+refuse_case "T9f unstaged edit" "$T9F"
+check "T9f the edit is byte-identical" "$BEFORE" "$(sums "$T9F" shopops-api/routes/x.js)"
 
-# (3d) the same overwrite on a STAGED edit: the staged content comes back
-T9G="$WORK/t9g"; mkrepo "$T9G"; mkpkg "$T9G"; mkpkg "$T9G/shopops-api" package-lock.json
-mkdir -p "$T9G/shopops-api/routes"; echo "v1" > "$T9G/shopops-api/routes/x.js"
-gitq "$T9G" add -A; gitq "$T9G" commit -m init
-echo "v2 staged implement edit" > "$T9G/shopops-api/routes/x.js"
-gitq "$T9G" add shopops-api/routes/x.js
-BEFORE="$(sums "$T9G" shopops-api/routes/x.js)"
+# (b) a staged edit
+T9G="$(mkdirty t9g)"; echo "v2 staged implement edit" > "$T9G/shopops-api/routes/x.js"; gitq "$T9G" add shopops-api/routes/x.js
 run_dprep "$T9G" STUB_TOUCH_SOURCE=1
-AFTER="$(sums "$T9G" shopops-api/routes/x.js)"
-check "T9g a staged edit of a source file survives an install that overwrites it" "$BEFORE" "$AFTER"
-check "T9g git still sees the staged edit and nothing else" "shopops-api/routes/x.js" "$(git -C "$T9G" diff --cached --name-only)"
+refuse_case "T9g staged edit" "$T9G"
+check "T9g the staged edit is still staged" "shopops-api/routes/x.js" "$(git -C "$T9G" diff --cached --name-only)"
 
-# (3e) the install recreates a tracked file the implement step had deleted: it is deleted again
-T9H="$WORK/t9h"; mkrepo "$T9H"; mkpkg "$T9H"; mkpkg "$T9H/shopops-api" package-lock.json
-mkdir -p "$T9H/shopops-api/routes"; echo "v1" > "$T9H/shopops-api/routes/x.js"
-gitq "$T9H" add -A; gitq "$T9H" commit -m init
-rm "$T9H/shopops-api/routes/x.js"
+# (c) an unstaged deletion (the Overseer's first reproduction class)
+T9H="$(mkdirty t9h)"; rm "$T9H/shopops-api/routes/x.js"
 run_dprep "$T9H" STUB_TOUCH_SOURCE=1
-[ ! -e "$T9H/shopops-api/routes/x.js" ] && ok "T9h a deleted tracked file stays deleted" || bad "T9h the install resurrected a deleted tracked file"
+refuse_case "T9h unstaged deletion" "$T9H"
+[ ! -e "$T9H/shopops-api/routes/x.js" ] && ok "T9h the deleted file was not resurrected" || bad "T9h a deleted file was resurrected"
 
-# (3f) the install REMOVES the folder that holds an edited tracked file (Overseer finding 2 on PR 1597):
-#      the folder is recreated and the unstaged edit comes back byte for byte, return code 0
-T9I="$WORK/t9i"; mkrepo "$T9I"; mkpkg "$T9I"; mkpkg "$T9I/shopops-api" package-lock.json
-mkdir -p "$T9I/shopops-api/routes"; echo "v1" > "$T9I/shopops-api/routes/x.js"
-gitq "$T9I" add -A; gitq "$T9I" commit -m init
-echo "v2 unstaged edit under a folder the install deletes" > "$T9I/shopops-api/routes/x.js"
-BEFORE="$(sums "$T9I" shopops-api/routes/x.js)"
-run_dprep "$T9I" STUB_REMOVE_DIR=1
-AFTER="$(sums "$T9I" shopops-api/routes/x.js)"
-check "T9i an edit under a folder the install removed comes back byte for byte" "$BEFORE" "$AFTER"
-has "T9i the restore is reported" "dprep: restored shopops-api/routes/x.js" "$OUT"
-hasnt "T9i no restore failure" "RESTORE FAILED" "$OUT"
-check "T9i return code 0" 0 "$RC"
+# (d) a STAGED deletion (git rm): invisible to git diff, the Overseer's round-3 finding
+T9I="$(mkdirty t9i)"; gitq "$T9I" rm -q shopops-api/routes/x.js
+run_dprep "$T9I" STUB_TOUCH_SOURCE=1
+refuse_case "T9i staged deletion" "$T9I"
+[ ! -e "$T9I/shopops-api/routes/x.js" ] && ok "T9i the staged-deleted file was not recreated" || bad "T9i a staged-deleted file was recreated"
 
-# (3g) the restore itself cannot succeed (the install leaves a FILE where the folder was): the failure is
-#      reported, the return code is nonzero and the snapshot of the edit is KEPT, never deleted
-T9J="$WORK/t9j"; mkrepo "$T9J"; mkpkg "$T9J"; mkpkg "$T9J/shopops-api" package-lock.json
-mkdir -p "$T9J/shopops-api/routes"; echo "v1" > "$T9J/shopops-api/routes/x.js"
-gitq "$T9J" add -A; gitq "$T9J" commit -m init
-echo "v2 unstaged edit that cannot be put back" > "$T9J/shopops-api/routes/x.js"
-run_dprep "$T9J" STUB_BLOCK_DIR=1
-has "T9j the failure is reported" "dprep: RESTORE FAILED shopops-api/routes/x.js" "$OUT"
-has "T9j the snapshot location is printed" "snapshots kept in " "$OUT"
-check "T9j return code is nonzero" 1 "$RC"
-KEPT="$(printf '%s\n' "$OUT" | sed -n 's/.*snapshots kept in //p' | head -1)"
-[ -n "$KEPT" ] && [ -f "$KEPT/mod/1" ] && grep -q "v2 unstaged edit that cannot be put back" "$KEPT/mod/1" && ok "T9j the snapshot still holds the edit" || bad "T9j the snapshot was deleted or lost the edit"
+# (e) an untracked file (new work not yet added)
+T9J="$(mkdirty t9j)"; echo "new work" > "$T9J/shopops-api/routes/new.js"
+run_dprep "$T9J" STUB_TOUCH_SOURCE=1
+refuse_case "T9j untracked file" "$T9J"
+check "T9j the untracked file is still there" "new work" "$(cat "$T9J/shopops-api/routes/new.js")"
+
+# (f) an edit to the folder's own package.json (earlier T9d): refused, the edit untouched
+T9K="$(mkdirty t9k)"; echo '{"name":"t","dependencies":{"added":"1"}}' > "$T9K/shopops-api/package.json"
+BEFORE="$(sums "$T9K" shopops-api/package.json)"
+run_dprep "$T9K" STUB_NPM_FAIL_CI=1 STUB_REWRITE=1
+refuse_case "T9k edited package.json" "$T9K"
+check "T9k the edited package.json is byte-identical" "$BEFORE" "$(sums "$T9K" shopops-api/package.json)"
+
+# (g) a CLEAN tree is installed normally, and a tracked source file the install rewrites is put back
+T9L="$(mkdirty t9l)"
+BEFORE="$(sums "$T9L" shopops-api/routes/x.js)"
+run_dprep "$T9L" STUB_TOUCH_SOURCE=1
+check "T9l return code 0 on a clean tree" 0 "$RC"
+check "T9l the source file the install rewrote is back byte for byte" "$BEFORE" "$(sums "$T9L" shopops-api/routes/x.js)"
+has "T9l the restore is reported" "dprep: restored shopops-api/routes/x.js" "$OUT"
+[ -d "$T9L/shopops-api/node_modules" ] && ok "T9l node_modules exists" || bad "T9l no node_modules after a clean-tree install"
+check "T9l git sees no modified tracked file" "" "$(git -C "$T9L" diff --name-only)"
+
+# (h) node_modules present: a dirty tree is NOT refused, the install is simply skipped (the normal later call)
+T9M="$(mkdirty t9m)"; mkdir -p "$T9M/shopops-api/node_modules"; echo "v2 edit" > "$T9M/shopops-api/routes/x.js"
+run_dprep "$T9M" STUB_TOUCH_SOURCE=1
+check "T9m return code 0 (node_modules present)" 0 "$RC"
+has "T9m skipped, not refused" "node_modules present" "$OUT"
+hasnt "T9m not refused" "refuse-on-dirty" "$OUT"
+check "T9m no install ran" 0 "$(reclines)"
 
 # (4) outside a git work tree the lockfile and package.json are still restored
 T9E="$WORK/t9e"; mkpkg "$T9E"; mkpkg "$T9E/shopops-api" package-lock.json

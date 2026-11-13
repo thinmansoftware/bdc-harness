@@ -155,104 +155,77 @@ dprep__candidates() {
   return 0
 }
 
-# dprep__guarded_install_in <folder>: install in one package folder and leave its tracked files
-# exactly as they were (see the PACKAGE FOLDERS note above). Returns the install's return code.
+# dprep__guarded_install_in <folder>: install in one package folder and leave every tracked file as it was.
+#
+# REFUSE-ON-DIRTY (PR 1597 review rounds 1 to 3, acting XO ruling 2026-11-13): inside a git work tree the
+# install runs ONLY on a clean tree (nothing modified, staged, deleted or untracked other than node_modules).
+# A dirty tree means earlier work is in the checkout (an implement edit); the install is refused, rc 1,
+# and nothing is installed or touched: no snapshot, no restore, so there is no restore logic to get wrong.
+# This costs nothing on the normal path: prep-dependencies installs on the clean tree BEFORE implement, so a
+# later call finds node_modules present and skips. On a clean tree every tracked change after the install is
+# the install's own doing, and is put back with git checkout (`dprep: restored <path>`). Outside a git work
+# tree the folder's package.json and lockfiles are copied aside and restored.
 dprep__guarded_install_in() {
-  local dir="$1" kind rc=0 saved f top before after path nmod rfail=0
+  local dir="$1" kind rc=0 saved="" f top dirty changed path
   printf 'dprep: package folder %s\n' "$dir"
   kind="$(cd "$dir" && dprep__kind 1)"
   if [ -d "$dir/node_modules" ]; then
     printf 'dprep: node_modules present, skipping\n'
     return 0
   fi
-  saved="$(mktemp -d 2>/dev/null)" || saved=""
-  if [ -n "$saved" ]; then
-    for f in package.json bun.lock bun.lockb pnpm-lock.yaml package-lock.json yarn.lock; do
-      [ -f "$dir/$f" ] && cp -p "$dir/$f" "$saved/$f"
-    done
-  fi
   top=""
-  before=""
-  nmod=0
   if git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)"
-    before="$(git -C "$dir" -c core.quotepath=off diff --name-only -- . 2>/dev/null)"
-    # Snapshot the bytes of every tracked file that is ALREADY modified (unstaged edit or deletion), so an
-    # install that rewrites one of them cannot lose that earlier work.
-    if [ -n "$saved" ]; then
-      mkdir -p "$saved/mod"
-      : > "$saved/mod.list"
-      while IFS= read -r path; do
-        [ -n "$path" ] || continue
-        nmod=$((nmod + 1))
-        printf '%s\n' "$path" >> "$saved/mod.list"
-        if [ -f "$top/$path" ]; then cp -p "$top/$path" "$saved/mod/$nmod"; fi
-      done <<EOF
-$before
-EOF
+    if ! dirty="$(git -C "$top" -c core.quotepath=off status --porcelain --untracked-files=normal 2>/dev/null)"; then
+      dirty="git status failed"
     fi
+    # An install in an earlier package folder leaves an untracked node_modules when the repo does not ignore
+    # it: that is not earlier work.
+    dirty="$(printf '%s\n' "$dirty" | grep -v '^?? .*node_modules/$' || true)"
+    if [ -n "$dirty" ]; then
+      printf 'dprep: working tree has uncommitted changes; install skipped in %s (refuse-on-dirty: nothing installed, nothing touched)\n' "$dir"
+      return 1
+    fi
+  else
+    saved="$(mktemp -d 2>/dev/null)" || saved=""
+    if [ -z "$saved" ]; then
+      printf 'dprep: no temporary folder; install skipped in %s (cannot protect package.json and lockfiles)\n' "$dir"
+      return 1
+    fi
+    for f in package.json bun.lock bun.lockb pnpm-lock.yaml package-lock.json yarn.lock; do
+      [ -f "$dir/$f" ] || continue
+      if ! cp -p "$dir/$f" "$saved/$f"; then
+        printf 'dprep: SNAPSHOT FAILED %s/%s; install skipped\n' "$dir" "$f"
+        rm -rf "$saved"
+        return 1
+      fi
+    done
   fi
   (cd "$dir" && dprep__install_here "$kind") || rc=$?
-  if [ -n "$saved" ]; then
+  if [ -n "$top" ]; then
+    changed="$(git -C "$top" -c core.quotepath=off diff --name-only 2>/dev/null)"
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      if git -C "$top" checkout -- "$path" 2>/dev/null; then
+        printf 'dprep: restored %s\n' "$path"
+      else
+        printf 'dprep: RESTORE FAILED %s\n' "$path"
+        [ "$rc" -eq 0 ] && rc=1
+      fi
+    done <<EOF
+$changed
+EOF
+  else
     for f in package.json bun.lock bun.lockb pnpm-lock.yaml package-lock.json yarn.lock; do
       if [ -f "$saved/$f" ] && ! cmp -s "$saved/$f" "$dir/$f"; then
         if cp -p "$saved/$f" "$dir/$f"; then
           printf 'dprep: restored %s/%s\n' "$dir" "$f"
         else
-          printf 'dprep: RESTORE FAILED %s/%s\n' "$dir" "$f"
-          rfail=1
+          printf 'dprep: RESTORE FAILED %s/%s; copies kept in %s\n' "$dir" "$f" "$saved"
+          return 1
         fi
       fi
     done
-  fi
-  if [ -n "$top" ]; then
-    after="$(git -C "$dir" -c core.quotepath=off diff --name-only -- . 2>/dev/null)"
-    # Files the install newly modified go back to their indexed content.
-    while IFS= read -r path; do
-      [ -n "$path" ] || continue
-      if ! printf '%s\n' "$before" | grep -qxF -- "$path"; then
-        if git -C "$top" checkout -- "$path" 2>/dev/null; then
-          printf 'dprep: restored %s\n' "$path"
-        else
-          printf 'dprep: RESTORE FAILED %s\n' "$path"
-          rfail=1
-        fi
-      fi
-    done <<EOF
-$after
-EOF
-    # Files that were already modified before the install go back to the exact bytes they had.
-    if [ -n "$saved" ] && [ -f "$saved/mod.list" ]; then
-      nmod=0
-      while IFS= read -r path; do
-        [ -n "$path" ] || continue
-        nmod=$((nmod + 1))
-        if [ -f "$saved/mod/$nmod" ]; then
-          if ! cmp -s "$saved/mod/$nmod" "$top/$path"; then
-            # The install may have removed the parent folder of an edited file: recreate it first.
-            if mkdir -p "$(dirname "$top/$path")" && cp -p "$saved/mod/$nmod" "$top/$path"; then
-              printf 'dprep: restored %s\n' "$path"
-            else
-              printf 'dprep: RESTORE FAILED %s\n' "$path"
-              rfail=1
-            fi
-          fi
-        elif [ -e "$top/$path" ]; then
-          if rm -f "$top/$path"; then
-            printf 'dprep: restored %s\n' "$path"
-          else
-            printf 'dprep: RESTORE FAILED %s\n' "$path"
-            rfail=1
-          fi
-        fi
-      done < "$saved/mod.list"
-    fi
-  fi
-  if [ "$rfail" -ne 0 ]; then
-    # Never delete the only copy of an earlier edit: keep the snapshots and say where they are.
-    printf 'dprep: restore failed in %s; snapshots kept in %s\n' "$dir" "${saved:-none}"
-    [ "$rc" -eq 0 ] && rc=1
-  elif [ -n "$saved" ]; then
     rm -rf "$saved"
   fi
   return "$rc"
