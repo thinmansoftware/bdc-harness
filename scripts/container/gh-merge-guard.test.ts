@@ -31,6 +31,34 @@ async function runGuard(
   return { exitCode, stderr };
 }
 
+async function readArgvLog(): Promise<string | null> {
+  try {
+    return await readFile(argvLog, 'utf8');
+  } catch (error: unknown) {
+    if (error instanceof Error && 'code' in error && error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+async function expectBlocked(
+  args: string[],
+  stderrIncludes: string[],
+  extraEnv: Record<string, string> = {}
+): Promise<void> {
+  const before = await readArgvLog();
+  const { exitCode, stderr } = await runGuard(args, extraEnv);
+  expect(exitCode).toBe(86);
+  for (const text of stderrIncludes) expect(stderr).toContain(text);
+  expect(await readArgvLog()).toBe(before);
+}
+
+async function expectPassed(args: string[], extraEnv: Record<string, string> = {}): Promise<void> {
+  const { exitCode } = await runGuard(args, extraEnv);
+  expect(exitCode).toBe(0);
+  const logged = (await readFile(argvLog, 'utf8')).trim().split('\n');
+  expect(logged).toEqual(args);
+}
+
 beforeAll(async () => {
   dir = await mkdtemp(join(tmpdir(), 'gh-guard-'));
   stubGh = join(dir, 'stub-gh.sh');
@@ -99,5 +127,85 @@ describe('gh-merge-guard (bdc-xo#1491)', () => {
     expect(exitCode).toBe(0);
     const logged = (await readFile(argvLog, 'utf8')).trim().split('\n');
     expect(logged).toEqual(['pr', 'merge', '1']);
+  });
+
+  it('blocks gh pr review in every flag order', async () => {
+    const reviewLine =
+      'Submitting PR reviews from inside the build container is forbidden (builders build, the reviewer reviews).';
+    for (const args of [
+      ['pr', 'review', '12', '--approve'],
+      ['pr', 'review', '--request-changes', '12'],
+      ['pr', '-R', 'o/r', 'review', '12', '-a'],
+      ['pr', 'review', '12', '--comment', '-b', 'x'],
+    ]) {
+      await expectBlocked(args, ['gh-merge-guard: BLOCKED', reviewLine]);
+    }
+  });
+
+  it('blocks REST and GraphQL review submission', async () => {
+    for (const args of [
+      ['api', 'repos/o/r/pulls/12/reviews', '-f', 'event=APPROVE'],
+      ['api', 'repos/o/r/pulls/12/reviews', '-X', 'POST'],
+      ['api', '--method', 'POST', 'repos/o/r/pulls/12/reviews'],
+      [
+        'api',
+        'graphql',
+        '-f',
+        'query=mutation { addPullRequestReview(input: {}) { clientMutationId } }',
+      ],
+      [
+        'api',
+        'graphql',
+        '-f',
+        'query=mutation { submitPullRequestReview(input: {}) { clientMutationId } }',
+      ],
+    ]) {
+      await expectBlocked(args, ['gh-merge-guard: BLOCKED']);
+    }
+  });
+
+  it('still allows reading reviews and checks', async () => {
+    for (const args of [
+      ['api', 'repos/o/r/pulls/12/reviews'],
+      ['api', '--paginate', 'repos/o/r/pulls/12/reviews'],
+      ['api', 'repos/o/r/pulls/12/reviews', '-X', 'GET'],
+      ['pr', 'view', '12', '--json', 'reviews'],
+      ['pr', 'checks', '12'],
+    ]) {
+      await expectPassed(args);
+    }
+  });
+
+  it('keeps the existing merge rules', async () => {
+    await expectBlocked(
+      ['pr', 'merge', '639', '--squash', '--auto'],
+      ['gh-merge-guard: BLOCKED', 'bdc-xo#1491']
+    );
+    await expectBlocked(
+      ['api', 'repos/thinmansoftware/bdc-harness/pulls/639/merge', '-X', 'PUT'],
+      ['gh-merge-guard: BLOCKED']
+    );
+    for (const mutation of ['mergePullRequest', 'enablePullRequestAutoMerge']) {
+      await expectBlocked(
+        ['api', 'graphql', '-f', `query=mutation { ${mutation}(input: {}) { clientMutationId } }`],
+        ['gh-merge-guard: BLOCKED']
+      );
+    }
+    await expectPassed(['pr', 'view', '639', '--json', 'mergeable,mergeStateStatus']);
+    for (const args of [
+      ['pr', 'view', '--json', 'mergeable'],
+      ['pr', 'checks', '639', '--watch'],
+      ['run', 'list', '--branch', 'feat/merge-tooling'],
+    ]) {
+      await expectPassed(args);
+    }
+    await expectPassed(['pr', 'merge', '1'], { ARCHON_ALLOW_PR_MERGE: '1' });
+  });
+
+  it('review escape hatch does not unlock merge', async () => {
+    await expectPassed(['pr', 'review', '12', '--approve'], { ARCHON_ALLOW_PR_REVIEW: '1' });
+    await expectBlocked(['pr', 'merge', '12'], ['gh-merge-guard: BLOCKED', 'bdc-xo#1491'], {
+      ARCHON_ALLOW_PR_REVIEW: '1',
+    });
   });
 });
