@@ -22,8 +22,11 @@ wrote code and opened a pull request after its implement step had declared BLOCK
 `bun.lockb`, `pnpm-lock.yaml`, `package-lock.json`): bun first, then pnpm, then npm, and no subfolder is scanned.
 
 When the current folder holds NO lockfile file it scans the immediate subfolders in bytewise name order,
-skipping names that start with a dot, `node_modules`, `dist` and `build`, and installs in each of the first 3
-that have a `package.json` plus a supported lockfile. It prints `dprep: package folder <name>` before each.
+skipping names that start with a dot, `node_modules`, `dist` and `build`, and installs in each of up to 6
+that have a `package.json` plus a supported lockfile. Folders the run's work order names as `<folder>/` (the
+file in `BDC_DPREP_SPEC_FILE`, else `$ARTIFACTS_DIR/authority/work-order.md`) are installed first, then the rest
+in name order. The cap was 3 until 2026-11-13, which skipped `shopops-api`, the 4th of shopops's 4 package
+folders. It prints `dprep: package folder <name>` before each.
 
 - Installer in a package folder: `package-lock.json` wins over a bun lockfile when npm is on PATH
   (`npm ci --no-audit --no-fund`, retry `npm install --no-audit --no-fund`). So `shopops-api`, which holds both,
