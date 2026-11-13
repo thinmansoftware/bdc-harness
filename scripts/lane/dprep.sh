@@ -26,7 +26,8 @@
 # current folder holds NO lockfile at all (none of bun.lock, bun.lockb, pnpm-lock.yaml,
 # package-lock.json), the function scans the IMMEDIATE subfolders in bytewise name order,
 # skipping names that start with a dot, node_modules, dist and build, and installs in each of
-# the first 3 that hold a package.json plus a supported lockfile, printing one line
+# up to 6 that hold a package.json plus a supported lockfile (folders the run's work order names
+# as "<folder>/" first, then the rest in name order; see dprep__candidates), printing one line
 # "dprep: package folder <name>" first (shopops keeps its lockfiles in shopops-api/). In a
 # package folder package-lock.json wins over a bun lockfile when npm is on PATH (shopops-api
 # holds both; its maintained lockfile is package-lock.json and its own workflows use npm ci);
@@ -137,9 +138,18 @@ dprep__has_lockfile_file() {
   [ -f bun.lock ] || [ -f bun.lockb ] || [ -f pnpm-lock.yaml ] || [ -f package-lock.json ]
 }
 
-# dprep__candidates: print up to 3 immediate subfolder names that qualify, one per line.
+# dprep__candidates: print up to DPREP_MAX_PACKAGE_FOLDERS (6) immediate subfolder names that qualify, one per
+# line. Folders the run's work order names as "<folder>/" come FIRST (in name order), then the others in name
+# order. The work order is BDC_DPREP_SPEC_FILE when set, else $ARTIFACTS_DIR/authority/work-order.md (written by
+# read-spec on the authority path); with neither, plain name order. A cap of 3 skipped shopops-api, the 4th of
+# shopops's 4 package folders in name order (CE refire e69566fe, 2026-11-13), so the WO's own folder never
+# installed. A folder name matches only at a path boundary, so "api" does not match "shopops-api/".
+DPREP_MAX_PACKAGE_FOLDERS=6
 dprep__candidates() {
-  local name count=0 kind
+  local name kind spec pattern count=0 preferred="" rest=""
+  spec="${BDC_DPREP_SPEC_FILE:-}"
+  if [ -z "$spec" ] && [ -n "${ARTIFACTS_DIR:-}" ]; then spec="$ARTIFACTS_DIR/authority/work-order.md"; fi
+  [ -n "$spec" ] && [ -f "$spec" ] || spec=""
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     case "$name" in
@@ -148,10 +158,25 @@ dprep__candidates() {
     [ -f "$name/package.json" ] || continue
     kind="$(cd "$name" 2>/dev/null && dprep__kind 1)"
     [ -n "$kind" ] || continue
+    if [ -n "$spec" ]; then
+      pattern="(^|[^A-Za-z0-9._-])$(printf '%s' "$name" | sed 's/[.[\*^$+?(){}|]/\\&/g')/"
+      if grep -Eq -- "$pattern" "$spec" 2>/dev/null; then
+        preferred="$preferred$name
+"
+        continue
+      fi
+    fi
+    rest="$rest$name
+"
+  done < <(find . -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
     printf '%s\n' "$name"
     count=$((count + 1))
-    [ "$count" -ge 3 ] && break
-  done < <(find . -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | LC_ALL=C sort)
+    [ "$count" -ge "$DPREP_MAX_PACKAGE_FOLDERS" ] && break
+  done <<EOF
+$preferred$rest
+EOF
   return 0
 }
 
