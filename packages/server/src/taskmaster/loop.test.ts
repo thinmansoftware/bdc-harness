@@ -6311,7 +6311,18 @@ describe('escalate_p0 dedupe per (thread, reason) (WO-HARNESS-TASKMASTER-ESCALAT
     expect(rowsAfter).toEqual([2, 2, 2]);
     // The silent skip of the old 24h any-outcome set is gone from the loop.
     const source = readFileSync(join(import.meta.dir, 'loop.ts'), 'utf8');
-    expect(source).not.toContain('recentEscalateP0ByThread.has(canonicalProposalRef) &&');
+    // A duplicate proposal for the same thread in the SAME tick is journaled
+    // once as well (validator finding 1): one send, one skip row.
+    const sameTick = makeWorld();
+    seedDigestSent(sameTick);
+    await tick(
+      createTaskmasterState(60_000),
+      depsFor(sameTick, () => [p0(), p0()])
+    );
+    expect(sendsFor(sameTick)).toHaveLength(1);
+    expect(skipRows(sameTick)).toHaveLength(1);
+    // No thread-only set can drop a duplicate without a row any more.
+    expect(source).not.toContain('recentEscalateP0ByThread');
   });
 
   test('escalate_p0 dedupe: real P0 fires after the window over 25 hourly ticks', async () => {
@@ -6354,6 +6365,8 @@ describe('escalate_p0 dedupe per (thread, reason) (WO-HARNESS-TASKMASTER-ESCALAT
 
   test('escalate_p0 dedupe: effect cap is settable and lowers only', async () => {
     const refs = [1, 2, 3, 4, 5].map(n => `gh:thinmansoftware/bdc-xo#${9200 + n}`);
+    // 11 proposals for the fallback cases, so a cap of 10 is told apart from any smaller one.
+    const refs11 = Array.from({ length: 11 }, (_, n) => `gh:thinmansoftware/bdc-xo#${9300 + n}`);
 
     process.env[MAX_EFFECTS_ENV] = '3';
     const capped = makeWorld();
@@ -6373,12 +6386,12 @@ describe('escalate_p0 dedupe per (thread, reason) (WO-HARNESS-TASKMASTER-ESCALAT
       const world = makeWorld();
       seedDigestSent(world);
       const warnings: Array<{ variable: string; raw: string; fallback: number }> = [];
-      const deps = depsFor(world, () => refs.map(ref => p0(ref)), {
+      const deps = depsFor(world, () => refs11.map(ref => p0(ref)), {
         onConfigWarning: (variable, value, fallback) =>
           warnings.push({ variable, raw: value, fallback }),
       });
       await tick(createTaskmasterState(60_000), deps);
-      expect(sendsFor(world)).toHaveLength(5);
+      expect(sendsFor(world)).toHaveLength(10);
       expect(warnings).toEqual([{ variable: MAX_EFFECTS_ENV, raw, fallback: 10 }]);
     }
 
@@ -6388,11 +6401,11 @@ describe('escalate_p0 dedupe per (thread, reason) (WO-HARNESS-TASKMASTER-ESCALAT
     const unsetWarnings: string[] = [];
     await tick(
       createTaskmasterState(60_000),
-      depsFor(unset, () => refs.map(ref => p0(ref)), {
+      depsFor(unset, () => refs11.map(ref => p0(ref)), {
         onConfigWarning: variable => unsetWarnings.push(variable),
       })
     );
-    expect(sendsFor(unset)).toHaveLength(5);
+    expect(sendsFor(unset)).toHaveLength(10);
     expect(unsetWarnings).toEqual([]);
   });
 

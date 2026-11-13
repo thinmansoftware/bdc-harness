@@ -86,7 +86,6 @@ import {
   decideEscalation,
   DEFAULT_MAX_EFFECTS_PER_TICK,
   escalationSkipKey,
-  MAX_EFFECTS_ENV,
   reasonForThreadRef,
   resolveEscalationCooldowns,
   resolveMaxEffectsPerTick,
@@ -2254,10 +2253,14 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
   // The 7-day lookback covers the longest settable window (168 h).
   const configWarn = deps.onConfigWarning ?? defaultConfigWarn;
   const escalationCooldowns = resolveEscalationCooldowns(process.env, configWarn);
-  const maxEffectsPerTick = resolveMaxEffectsPerTick(process.env[MAX_EFFECTS_ENV], configWarn);
+  const maxEffectsPerTick = resolveMaxEffectsPerTick(
+    process.env.TASKMASTER_MAX_EFFECTS_PER_TICK,
+    configWarn
+  );
+  // escalate_p0 rows the dedupe reads. A row written earlier in THIS tick is
+  // appended once its outcome is known, so a same-tick duplicate is journaled
+  // once like any other, never dropped silently.
   const escalateP0Rows = lookback.filter(action => action.action_type === 'escalate_p0');
-  // Threads already escalated (sent, failed or suppressed) earlier in THIS tick.
-  const recentEscalateP0ByThread = new Set<string>();
   try {
     if (deps.refreshLaneHealth) await deps.refreshLaneHealth();
     else if (!deps.db) await refreshLaneHealth();
@@ -2703,7 +2706,6 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         ['failed', 'deferred'].includes(existingAction.outcome)
       );
       if (!retryInPlace) {
-        if (recentEscalateP0ByThread.has(canonicalProposalRef)) continue;
         const reason = proposal.reason ?? reasonForThreadRef(canonicalProposalRef);
         if (reason) {
           const decision = decideEscalation({
@@ -3042,7 +3044,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             JSON.stringify({ ...proposal, suppressed })
           );
           journalRow.outcome = 'expired';
-          recentEscalateP0ByThread.add(canonicalProposalRef);
+          escalateP0Rows.push(journalRow);
           result.expired += 1;
           log.info(
             {
@@ -3270,9 +3272,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
         await dal.updateActionOutcome(journalRow.id, 'sent');
       }
       journalRow.outcome = 'sent';
-      if (proposal.type === 'escalate_p0') {
-        recentEscalateP0ByThread.add(canonicalProposalRef);
-      }
+      if (proposal.type === 'escalate_p0') escalateP0Rows.push(journalRow);
       touchedThisTick.add(proposal.threadRef);
       result.effects += 1;
       if (proposal.type === 'blocker_report') blockerReportsThisTick += 1;
@@ -3320,7 +3320,7 @@ async function runTick(state: TaskmasterState, deps: TaskmasterDeps): Promise<Ti
             : undefined
       );
       journalRow.outcome = 'failed';
-      if (proposal.type === 'escalate_p0') recentEscalateP0ByThread.add(canonicalProposalRef);
+      if (proposal.type === 'escalate_p0') escalateP0Rows.push(journalRow);
       tickFailures += 1;
       log.error({ err: error as Error, threadRef: proposal.threadRef }, 'taskmaster.effect_failed');
       if (dispatchSendRejected) {

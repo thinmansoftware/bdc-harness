@@ -58,6 +58,12 @@ export interface AddressBatchOptions {
   env?: Record<string, string | undefined>;
   out?: (line: string) => void;
   err?: (line: string) => void;
+  /**
+   * Test seam only: runs inside the confirm transaction after the dry-run
+   * re-check and before the UPDATE, so a test can make the update count differ
+   * and prove the rollback (exit 3).
+   */
+  beforeUpdateForTests?: (query: DispatchQueryExecutor) => Promise<void>;
 }
 
 class BatchRefusal extends Error {
@@ -205,6 +211,9 @@ export async function runAddressBatch(
     const bindFile = stringArg(args, 'xo-bind-file');
     if (!expectedId) throw new BatchRefusal(2, 'dry_run_id_required');
     if (!actor || !reason) throw new BatchRefusal(2, 'actor_and_reason_required');
+    // Only a still-queued row can be addressed (the UPDATE's own guard), so a
+    // confirm on any other status could never match its dry run.
+    if (filter.status !== 'queued') throw new BatchRefusal(2, 'confirm_requires_status_queued');
     if (filter.recipient === 'xo' && !bindFile) throw new BatchRefusal(2, 'xo_bind_required');
     // A bind is accepted for the xo mailbox only (validateXoLeaseBind returns
     // lease_fence_stale for a bind given to another principal).
@@ -217,7 +226,7 @@ export async function runAddressBatch(
       if (dryRunId(filter, ids) !== expectedId) throw new BatchRefusal(2, 'dry_run_mismatch');
       const stale = await validateXoLeaseBind(query, filter.recipient, bind);
       if (stale) throw new BatchRefusal(2, stale.reason);
-      if (ids.length === 0) return ids;
+      if (options.beforeUpdateForTests) await options.beforeUpdateForTests(query);
       const predicate = xoLeaseBindPredicate(filter.recipient, bind);
       // $1-$3 are the update's own; the lease predicate owns $4-$8 (padded with
       // nulls when it is empty); the filters start at $9.
@@ -242,20 +251,23 @@ export async function runAddressBatch(
         ]
       );
       if (update.rowCount !== ids.length) throw new BatchRefusal(3, 'count_mismatch_rolled_back');
+      // The audit line is written INSIDE the transaction, before COMMIT: if the
+      // append fails, the update rolls back, so no row is ever addressed
+      // without its confirm line.
+      audit({
+        type: 'confirm',
+        at: nowIso,
+        actor,
+        reason,
+        filter,
+        dry_run_id: expectedId,
+        dry_run_ids: ids,
+        confirmed_ids: ids,
+        count: update.rowCount,
+      });
       return ids;
     });
 
-    audit({
-      type: 'confirm',
-      at: nowIso,
-      actor,
-      reason,
-      filter,
-      dry_run_id: expectedId,
-      dry_run_ids: confirmed,
-      confirmed_ids: confirmed,
-      count: confirmed.length,
-    });
     out(`addressed: ${confirmed.length}`);
     return 0;
   } catch (error) {

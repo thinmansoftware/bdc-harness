@@ -87,7 +87,12 @@ const FILTERS = [
   '72',
 ];
 
-async function run(argv: string[]): Promise<{ code: number; out: string[]; err: string[] }> {
+async function run(
+  argv: string[],
+  beforeUpdateForTests?: (
+    query: <T>(sql: string, params?: unknown[]) => Promise<unknown>
+  ) => Promise<void>
+): Promise<{ code: number; out: string[]; err: string[] }> {
   const out: string[] = [];
   const err: string[] = [];
   const code = await runAddressBatch([...argv, '--audit-file', auditFile], {
@@ -96,6 +101,7 @@ async function run(argv: string[]): Promise<{ code: number; out: string[]; err: 
     env: {},
     out: line => out.push(line),
     err: line => err.push(line),
+    beforeUpdateForTests: beforeUpdateForTests as never,
   });
   return { code, out, err };
 }
@@ -205,6 +211,28 @@ describe('scripts/dispatch/address-batch.ts', () => {
       const result = await run(argv);
       expect(result.code).toBe(2);
     }
+    // A confirm on any status but queued can never match its UPDATE: refused up front.
+    const notQueued = await run([
+      '--recipient',
+      'xo',
+      '--status',
+      'done',
+      '--kind',
+      'duty_officer_escalation',
+      '--min-age-hours',
+      '72',
+      '--confirm',
+      '--dry-run-id',
+      id,
+      '--actor',
+      'xo-test',
+      '--reason',
+      'flood',
+      '--xo-bind-file',
+      bindFile,
+    ]);
+    expect(notQueued.code).toBe(2);
+    expect(notQueued.err.join('\n')).toContain('confirm_requires_status_queued');
     expect(await rows()).toEqual(before);
     expect(auditLines().filter(line => line.type === 'confirm')).toEqual([]);
   });
@@ -285,6 +313,37 @@ describe('scripts/dispatch/address-batch.ts', () => {
   });
 
   test('address-batch: rolls back when the count differs', async () => {
+    const confirmArgs = (dryRunIdValue: string): string[] => [
+      ...FILTERS,
+      '--confirm',
+      '--dry-run-id',
+      dryRunIdValue,
+      '--actor',
+      'xo-test',
+      '--reason',
+      'flood',
+      '--xo-bind-file',
+      bindFile,
+    ];
+    // (1) The UPDATE itself matches fewer rows than the dry run: another writer
+    // addresses one row INSIDE the transaction, after the dry-run re-check. The
+    // count differs, exit 3, and the whole transaction rolls back -- including
+    // that writer's change, which proves the rollback.
+    const firstId = await dryRun();
+    const before = await rows();
+    const raced = await run(confirmArgs(firstId), async query => {
+      await query(
+        "UPDATE agent_dispatch_messages SET addressed_at = $1, addressed_by = 'someone-else' WHERE id = $2",
+        [NOW.toISOString(), OLD_IDS[1]]
+      );
+    });
+    expect(raced.code).toBe(3);
+    expect(raced.err.join('\n')).toContain('count_mismatch_rolled_back');
+    expect(await rows()).toEqual(before);
+    expect(auditLines().filter(line => line.type === 'confirm')).toEqual([]);
+
+    // (2) A row changed BETWEEN the dry run and the confirm is caught by the
+    // dry-run re-check before any update: exit 2.
     const id = await dryRun();
     // Another actor addresses one of the three after the dry run.
     await db.query(
@@ -303,7 +362,8 @@ describe('scripts/dispatch/address-batch.ts', () => {
       '--xo-bind-file',
       bindFile,
     ]);
-    expect([2, 3]).toContain(result.code);
+    expect(result.code).toBe(2);
+    expect(result.err.join('\n')).toContain('dry_run_mismatch');
     const after = await rows();
     expect(after.filter(row => row.addressed_by === 'bulk-address:xo-test')).toEqual([]);
     expect(auditLines().filter(line => line.type === 'confirm')).toEqual([]);
