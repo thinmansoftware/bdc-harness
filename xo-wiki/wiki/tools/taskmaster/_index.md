@@ -304,6 +304,11 @@ An existing compatible unique index makes the repair a no-op. This allows
 `/api/taskmaster/status` headroom to reflect recorded spawn evidence after
 the separately governed runtime rollout.
 
+Accepted residual (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01, Board desk read of PR 1598):
+a failed `escalate_p0` retried in place keeps its original `created_at`, so the 24 h sent
+window counts from the failure rather than the actual send, and a repeat escalation can come
+at most 6 h early (never sooner than 18 h after the real send).
+
 ## Kill / rollback
 
 Set `TASKMASTER_INTERVAL_MS=0` in compose and restart the container. The
