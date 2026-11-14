@@ -25,7 +25,7 @@
  * cancels or deletes. The builder does not run --confirm on a live mailbox;
  * that is an operator act on a recorded dry run.
  *
- * SQLite only: the kind filter is json_extract(body, '$.kind').
+ * SQLite only: the kind filter reads $.kind only from valid JSON bodies.
  */
 import { createHash } from 'crypto';
 import { appendFileSync, readFileSync } from 'fs';
@@ -38,7 +38,8 @@ import {
 } from '../../packages/core/src/db/dispatch';
 
 export const DEFAULT_AUDIT_FILE = '/.archon/inbox-reader/bulk-address-audit.jsonl';
-export const KIND_EXPRESSION = "json_extract(body, '$.kind')";
+export const KIND_EXPRESSION =
+  "CASE WHEN json_valid(body) THEN json_extract(body, '$.kind') ELSE NULL END";
 const RECIPIENT_EXPRESSION = 'LOWER(TRIM(COALESCE(resolved_recipient, recipient)))';
 
 const USAGE =

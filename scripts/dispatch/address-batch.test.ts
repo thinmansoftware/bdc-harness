@@ -42,7 +42,8 @@ async function insertMessage(
   id: string,
   kind: string,
   hoursOld: number,
-  acked: boolean
+  acked: boolean,
+  body: string = JSON.stringify({ kind, text: 'test row' })
 ): Promise<void> {
   await db.query(
     `INSERT INTO agent_dispatch_messages
@@ -51,7 +52,7 @@ async function insertMessage(
      VALUES ($1, $1, $1, 'agent_message', 'system:dispatch', 'xo', $2, 'queued', $3, $4, $5)`,
     [
       id,
-      JSON.stringify({ kind, text: 'test row' }),
+      body,
       new Date(NOW.getTime() - hoursOld * HOUR).toISOString(),
       acked ? new Date(NOW.getTime() - HOUR).toISOString() : null,
       acked ? 'xo' : null,
@@ -140,6 +141,18 @@ beforeEach(async () => {
   await insertMessage(OLD_IDS[1]!, 'duty_officer_escalation', 90, false);
   await insertMessage(OLD_IDS[2]!, 'duty_officer_escalation', 80, false);
   for (const id of NEW_IDS) await insertMessage(id, 'agent_message', 2, false);
+  // Ordinary text, malformed JSON and valid non-kind bodies coexist with the
+  // escalation flood. Every row is old enough and in the selected mailbox.
+  for (const [id, body] of [
+    ['m-plain', 'duty_officer_escalation: ordinary text message'],
+    ['m-malformed', '{"kind":'],
+    ['m-empty', ''],
+    ['m-json-null', 'null'],
+    ['m-json-string', '"duty_officer_escalation"'],
+    ['m-json-other-kind', '{"kind":"agent_message"}'],
+  ]) {
+    await insertMessage(id!, 'agent_message', 100, false, body!);
+  }
   await db.query(
     `INSERT INTO board_xo_leases
        (id, lease_id, principal_id, seat_id, holder_id, holder_token_hash, fencing_token,
@@ -177,7 +190,9 @@ describe('scripts/dispatch/address-batch.ts', () => {
     expect(
       result.out.some(line => line.startsWith('filter: ') && line.includes('created_at <='))
     ).toBe(true);
-    expect(result.out).toContain("kind expression: json_extract(body, '$.kind')");
+    expect(result.out).toContain(
+      "kind expression: CASE WHEN json_valid(body) THEN json_extract(body, '$.kind') ELSE NULL END"
+    );
     expect(await rows()).toEqual(before);
     const lines = auditLines();
     expect(lines).toHaveLength(1);
@@ -347,6 +362,30 @@ describe('scripts/dispatch/address-batch.ts', () => {
     expect(raced.err.join('\n')).toContain('count_mismatch_rolled_back');
     expect(await rows()).toEqual(before);
     expect(auditLines().filter(line => line.type === 'confirm')).toEqual([]);
+
+    // A selected body can become non-JSON after the transactional re-check.
+    // The guarded UPDATE excludes it; the count mismatch rolls everything back.
+    const bodyBefore = await db.query<{ body: string }>(
+      'SELECT body FROM agent_dispatch_messages WHERE id = $1',
+      [OLD_IDS[0]]
+    );
+    const malformed = await run(confirmArgs(await dryRun()), async query => {
+      await query('UPDATE agent_dispatch_messages SET body = $1 WHERE id = $2', [
+        'ordinary text after re-check',
+        OLD_IDS[0],
+      ]);
+    });
+    expect(malformed.code).toBe(3);
+    expect(malformed.err.join('\n')).toContain('count_mismatch_rolled_back');
+    expect(await rows()).toEqual(before);
+    expect(
+      (
+        await db.query<{ body: string }>('SELECT body FROM agent_dispatch_messages WHERE id = $1', [
+          OLD_IDS[0],
+        ])
+      ).rows
+    ).toEqual(bodyBefore.rows);
+    expect(auditLines().filter(line => line.type === 'confirm_pending')).toEqual([]);
 
     // (2) A row changed BETWEEN the dry run and the confirm is caught by the
     // dry-run re-check before any update: exit 2.

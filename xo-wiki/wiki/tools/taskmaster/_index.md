@@ -308,7 +308,7 @@ An operator command (WO-HARNESS-TASKMASTER-ESCALATE-P0-FLOOD-01, Amendments 1 E 
      --kind duty_officer_escalation --min-age-hours 72
    ```
 
-   It prints the filter expression, the kind expression (`json_extract(body, '$.kind')`), each matching id, the count and a `dry_run_id`, and appends one `dry_run` line to the audit file. Record the output on the work order's issue.
+   It prints the filter expression, the kind expression (`CASE WHEN json_valid(body) THEN json_extract(body, '$.kind') ELSE NULL END`), which ignores plain-text or malformed bodies, each matching id, the count and a `dry_run_id`, and appends one `dry_run` line to the audit file. Record the output on the work order's issue.
 
 2. **Confirm** (same filters, plus the dry run's id, an actor and a reason). For `--recipient xo`, add `--xo-bind-file <path>`, a JSON lease bind made by the XO lease procedure; the script never prints it:
 
