@@ -124,6 +124,12 @@ jobs:
       - name: Check bundled skill
         run: bun run check:bundled-skill
 
+      - name: PR adoption real-lane fixtures (Windows)
+        run: >
+          bun test --timeout 60000
+          ./packages/workflows/src/reliability/open-pr-same-head-adopt.test.ts
+          ./packages/workflows/src/reliability/run-branch-identity.test.ts
+
       - name: GitHub service command and credential routing regressions
         run: bun test --timeout 30000 ./scripts/github-service-exec.test.ts packages/overseer/src/__tests__/github-command-durable-metering.test.ts ./scripts/github-service-token.test.ts ./scripts/container/gh-merge-guard.test.ts ./scripts/container/docker-entrypoint-app-helper.test.ts ./scripts/container/docker-entrypoint-safe-directory.test.ts ./scripts/container/docker-entrypoint-ownership.test.ts ./scripts/github-service-login.test.ts
 
