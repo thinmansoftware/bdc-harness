@@ -883,7 +883,7 @@ describe('Lane consistency: all feature-development lanes share review-base wiri
       expect(yaml).toContain('  - id: resolve-review-base\n');
       expect(yaml).toContain('depends_on: [war-council-validator, resolve-review-base]');
       expect(yaml).toContain(
-        'depends_on: [diff-review, classify-diff-review, resolve-review-base, repair-gate]'
+        'depends_on: [diff-review, classify-diff-review, resolve-review-base, implement-block-gate, repair-gate]'
       );
       expect(yaml).toContain('depends_on: [checkpoint-diff-repair, resolve-review-base]');
       expect(yaml).not.toContain('BASE_REF="origin/${BASE_BRANCH:-main}"');

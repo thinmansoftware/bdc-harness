@@ -141,7 +141,13 @@ describe('manifest evidence lane wiring (bdc-xo #1940)', () => {
 
       it('run-stop-greps tokenizes argv pipelines and rejects find -execdir', () => {
         const n = node(nodes, 'run-stop-greps', file);
-        expect(n.depends_on).toEqual(['format-autofix', 'run-stop-tests-final']);
+        // implement-block-gate (WO-HARNESS-LANE-DPREP-PACKAGE-FOLDER-AND-IMPLEMENT-BLOCK-STOP-01): the
+        // stop greps do not run after a declared implement BLOCKED, so the node waits on the gate.
+        expect(n.depends_on).toEqual([
+          'format-autofix',
+          'run-stop-tests-final',
+          'implement-block-gate',
+        ]);
         expect(n.timeout).toBe(600000);
         // WO-HARNESS-GREP-ALLOWLIST-QUOTED-MULTIWORD-01: the whitespace split and the
         // per-token charset check were replaced by the shared quote-aware tokenizer

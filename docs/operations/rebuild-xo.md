@@ -12,7 +12,7 @@ When merged harness code is not yet running in the container (compare `git rev-p
 bash /opt/bdc/scripts/xo/rebuild-xo.sh [max_wait_minutes]
 ```
 
-Steps, in order: drain on; wait for zero active runs (default 120 minutes); disk at least 15G free; clean tree; database backup; pin the current image as `archon:rollback-<stamp>`; fetch and check out `origin/dev`; build; up; health wait (150 seconds); serve lanes; drain off; prune old backups and pins.
+Steps, in order: drain on; wait for zero active runs (default 120 minutes); disk at least 15G free; clean tree; database backup; pin the current image as `archon:rollback-<stamp>`; fetch and check out `origin/dev`; build; warm the directory cache (W); up; health wait (up to 360 seconds); serve lanes; drain off; prune old backups and pins.
 
 Test overrides (not needed on the host): `ARCHON_DIR`, `DB`, `SCRIPTS_DIR`.
 
@@ -38,6 +38,16 @@ docker tag archon:rollback-<stamp> archon:latest && cd /opt/bdc/archon && git ch
 ```
 
 The previous sha and the stamp are printed by the script at the pin and fetch steps.
+
+## Boot evidence and the cold-cache walk (WO-HARNESS-BOOT-CHOWN-WALK-AND-REBUILD-EVIDENCE-01)
+
+On 2026-11-13 two rebuilds hung before the container printed a single line and were rolled back (bdc-xo #5970). The entrypoint's ownership check walks `/.archon` and `/home/appuser` on every start; on a cold cache, right after the image build, walking the ~1.5M run-workspace entries outlasted the health window. Now:
+
+- The ownership check prunes `/.archon/workspaces` below its top two levels (those two levels are still checked and fixed), and prints `[archon] ownership check: <dir> ...` before each walk and `... done in <N>s` after it, so a slow walk shows in `docker logs`.
+- **W: warm directory cache** runs `sudo timeout 600 find /opt/bdc/archon-data /opt/bdc/archon-user-home -xdev` just before `up` and prints its duration. A timeout or error is printed and never aborts the rebuild.
+- **V** waits up to 360 seconds. Docker's `unhealthy` does not end the wait (Docker keeps checking); only `healthy`, a restart count above 1, or the bound do.
+- **Before any rollback** the script saves `docker logs --timestamps archon-app-1`, the health log and `docker top archon-app-1` to `$HOME/rebuild-fail-<stamp>.log`, `.health.json` and `.top.txt` (or `$REBUILD_FAIL_DIR` when set) and prints the three paths. The rollback removes the container and its output, so read these files first when a rebuild exits 4.
+- **P4** checks the backup with `sudo test -s`, and the backup **prune** runs inside one `sudo sh -c` with the folder as an argument: `/opt/bdc/archon-data` is mode 750 owned by the app user, so a plain `[ -s ]` or `ls` as the ssh user saw nothing (bdc-xo #6097).
 
 ## Keys are not part of a build
 

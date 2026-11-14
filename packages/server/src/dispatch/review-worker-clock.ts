@@ -290,7 +290,10 @@ interface ResultMapping {
 }
 
 function mapSubmitOutcome(
-  disposition: Exclude<SubmitDisposition, 'checks_pending' | 'transport_error' | 'rate_limited'>
+  disposition: Exclude<
+    SubmitDisposition,
+    'checks_pending' | 'transport_error' | 'rate_limited' | 'pr_is_draft'
+  >
 ): ResultMapping {
   switch (disposition) {
     // `stale_head` and `superseded_head` both mean the head this item is BOUND
@@ -609,6 +612,31 @@ export async function tickReviewWorkerClock(
               ...(outcome.pendingChecks === undefined ? { reason: 'no_checks_reported' } : {}),
             },
             'overseer_review_checks_pending_deferred'
+          );
+          await deps.deferMessage({
+            id: claimed.id,
+            worker_id: REVIEW_WORKER_ID,
+            fencing_token: claimed.fencing_token,
+            defer_until: deferUntil,
+          });
+          continue;
+        }
+        // PR IS A DRAFT (WO-HARNESS-MERGE-GATES-01 Amendment 1) is non-terminal: no review was submitted
+        // on the draft and nothing about the verdict is lost. Deferred with the checks-pending backoff,
+        // never retired; ready_for_review also queues a fresh review.
+        if (outcome.disposition === 'pr_is_draft') {
+          const deferUntil = new Date(Date.now() + CHECKS_PENDING_BACKOFF_MS).toISOString();
+          (deps.logger ?? log).warn(
+            {
+              messageId: claimed.id,
+              owner: work.owner,
+              repo: work.repo,
+              prNumber: work.prNumber,
+              headSha: work.headSha,
+              reason: outcome.reason,
+              defer_until: deferUntil,
+            },
+            'overseer_review_pr_is_draft_deferred'
           );
           await deps.deferMessage({
             id: claimed.id,

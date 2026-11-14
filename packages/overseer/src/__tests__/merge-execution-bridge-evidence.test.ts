@@ -41,7 +41,8 @@ function fixture() {
     woId: 'WO-EVIDENCE',
     owner: 'thinmansoftware',
     repo: 'bdc-harness',
-    status: 'failed',
+    // WO-HARNESS-MERGE-GATES-01: a run recorded failed at any node is held; the fixture is a passed run.
+    status: 'completed',
     metadata: {},
     headBranch: 'archon/evidence',
   };

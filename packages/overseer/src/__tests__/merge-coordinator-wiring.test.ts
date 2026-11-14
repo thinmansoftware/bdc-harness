@@ -151,10 +151,10 @@ const mergeCandidateRecord: WatchedRunRecord = {
   woId: 'WO-COORDINATOR-WIRING-01',
   owner: 'thinmansoftware',
   repo: 'bdc-harness',
-  status: 'failed',
+  // WO-HARNESS-MERGE-GATES-01: a run recorded failed is held at any node; this candidate is a passed run.
+  status: 'completed',
   action: 'merge_ready',
   reason: 'green PR',
-  errorClass: 'tail_node_false_fail',
   workingPath: '/archon/worktrees/run-coordinator-wiring-1',
   prEvidence: {
     exists: true,
@@ -260,11 +260,21 @@ describe('merge coordinator wiring (WO-HARNESS-MERGE-MANAGER-WIRING-LAND-01)', (
         title: 'Ready to merge',
         state: 'open',
         head: { sha: RUN_HEAD_SHA },
+        // A real response always carries these; the merge function refuses one that lacks them.
+        labels: [],
+        draft: false,
       },
     }));
     const pullsMerge = mock(async () => ({ data: { merged: true, sha: RUN_HEAD_SHA } }));
     octokit.pulls.get = pullsGet as unknown as RealGitHubOctokitLike['pulls']['get'];
     octokit.pulls.merge = pullsMerge as unknown as RealGitHubOctokitLike['pulls']['merge'];
+    // WO-HARNESS-MERGE-GATES-01 Amendment 1: the merge function reads every review and the
+    // draft/ready timeline before merging; empty lists here (no network).
+    octokit.pulls.listReviews = (async () => ({
+      data: [],
+    })) as unknown as RealGitHubOctokitLike['pulls']['listReviews'];
+    (octokit as unknown as { issues: Record<string, unknown> }).issues.listEventsForTimeline =
+      async () => ({ data: [] });
 
     const insertOverseerAction = mock(async () => undefined);
     const judge = mock(async input => approveReceipt(input));
